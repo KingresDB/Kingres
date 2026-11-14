@@ -84,6 +84,15 @@ func (s *Server) serveOp(op contract.Operation, h handlerFunc) http.Handler {
 		} else if c.viaSetupToken {
 			st.actor = "setup"
 		}
+		if done, err := s.tryForward(c, rec, r); done {
+			if err != nil {
+				var p *problem.Problem
+				if errors.As(err, &p) {
+					writeProblem(rec, r, p)
+				}
+			}
+			return
+		}
 		if err := h(c, rec, r); err != nil {
 			var p *problem.Problem
 			if !errors.As(err, &p) {
@@ -206,6 +215,21 @@ func isLoopback(host string) bool {
 // cookie, applies the CSRF check for cookie sessions on state-changing
 // requests, and enforces the required role.
 func (s *Server) checkSession(c *call, r *http.Request) *problem.Problem {
+	if f := forwardedOf(r); f != nil {
+		// Identity verified by the forwarding server and delivered through the
+		// internal API (mutual TLS); there is no cookie, token or CSRF here.
+		sess := forwardedSession(f)
+		c.session = &sess
+		c.audit = contract.IsAuditAction(c.op.ID)
+		c.details = map[string]any{"forwardedBy": f.peer, "originRequestId": f.requestID}
+		if f.sourceAddress != "" {
+			c.ip = f.sourceAddress
+		}
+		if !auth.Allows(sess.ClusterRoles, c.op.Role) {
+			return problem.New(problem.Forbidden, "This operation requires the "+c.op.Role+" cluster role.")
+		}
+		return nil
+	}
 	sess, cred, p := s.authenticate(r)
 	if p != nil {
 		return p
@@ -293,6 +317,9 @@ func (s *Server) recordAudit(c *call, r *http.Request, status int) {
 			ev.Source = "panel"
 		} else {
 			ev.Source = "cli"
+		}
+		if f := forwardedOf(r); f != nil && (f.source == "panel" || f.source == "cli") {
+			ev.Source = f.source
 		}
 	case c.viaSetupToken:
 		ev.Actor = "setup"

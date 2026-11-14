@@ -129,6 +129,10 @@ type Store interface {
 	Servers(ctx context.Context) ([]api.Server, error)
 	Server(ctx context.Context, id string) (api.ServerDetail, error)
 	LocalServerID(ctx context.Context) (string, error)
+	// ManagerLeader is the id of the server that holds the primary of shard
+	// group 0 (design control-plane-3.md, D6); "" when there is none or no
+	// catalog yet.
+	ManagerLeader(ctx context.Context) (string, error)
 	// ServerGroups lists the server groups.
 	ServerGroups(ctx context.Context) ([]api.ServerGroup, error)
 	// ReplicationTopology reads the shard groups and pg_stat_replication.

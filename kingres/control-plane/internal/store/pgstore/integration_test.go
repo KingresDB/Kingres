@@ -132,7 +132,7 @@ func TestIntegrationClusterSummaryAndSettings(t *testing.T) {
 	if sum.Buckets.Total != 12 || sum.Buckets.Moving != 1 || sum.Buckets.Orphan != 1 || sum.Buckets.UnderReplicated != 1 || sum.Buckets.Unavailable != 0 {
 		t.Errorf("buckets = %+v", sum.Buckets)
 	}
-	if sum.DatabaseCount < 3 || sum.Health != "degraded" {
+	if sum.DatabaseCount != 3 || sum.Health != "degraded" {
 		t.Errorf("databaseCount=%d health=%s", sum.DatabaseCount, sum.Health)
 	}
 	st, err := s.ClusterSettings(ctx(t))
@@ -256,7 +256,7 @@ func TestIntegrationTables(t *testing.T) {
 	if al := got["public.audit_log"]; al.EstimatedRows != nil || al.SizeBytes == nil {
 		t.Errorf("audit_log estimate = %+v", al)
 	}
-	if al := got["public.audit_log"]; len(al.Classes) != 2 || al.Classes[0] != "plain" || al.Classes[1] != "ledger" || al.Ledger == nil ||
+	if al := got["public.audit_log"]; len(al.Classes) != 1 || al.Classes[0] != "ledger" || al.Ledger == nil ||
 		al.Ledger.Mode != "appendOnly" || al.HomeShardGroupID == nil || *al.HomeShardGroupID != 0 {
 		t.Errorf("audit_log = %+v", al)
 	}
@@ -652,5 +652,35 @@ func TestIntegrationDatabaseCreateOptions(t *testing.T) {
 		o.LedgerDigestIntervalSeconds != (api.IntegerRange{Default: 3600, Minimum: 60, Maximum: 86400}) ||
 		o.ReplicaCount != 1 || o.DefaultDurability != "sync" {
 		t.Errorf("options = %+v", o)
+	}
+}
+
+// The system database kingres_system exists in every real cluster. It is not
+// listed by Databases, so nothing that reports on "the databases" may count
+// or visit it: the ledger list and the grant list (without filters) answered
+// 404 because they visited it, and the cluster summary counted it.
+func TestIntegrationSystemDatabaseIsHiddenEverywhere(t *testing.T) {
+	s := newTestStore(t)
+	dbs, err := s.Databases(ctx(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range dbs {
+		if d.Name == "kingres_system" {
+			t.Fatal("kingres_system is listed")
+		}
+	}
+	sum, err := s.ClusterSummary(ctx(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.DatabaseCount != len(dbs) {
+		t.Errorf("databaseCount = %d, listed databases = %d", sum.DatabaseCount, len(dbs))
+	}
+	if _, err := s.LedgerStatuses(ctx(t)); err != nil {
+		t.Errorf("LedgerStatuses: %v", err)
+	}
+	if _, err := s.Grants(ctx(t), store.GrantFilter{}, store.Page{Limit: 50}); err != nil {
+		t.Errorf("Grants without filters: %v", err)
 	}
 }

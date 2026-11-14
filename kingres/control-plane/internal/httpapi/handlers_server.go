@@ -31,7 +31,7 @@ func (s *Server) getThisServer(_ *call, w http.ResponseWriter, r *http.Request) 
 	out := api.LocalServerInfo{
 		Address: s.advertisedAddress(), Hostname: s.deps.Hostname, Version: s.deps.Version,
 		NodeState: string(snap.State), UptimeSeconds: int64(s.now().Sub(started).Seconds()),
-		IsManagerLeader: snap.State == setup.Clustered, // the only server is its own leader
+		IsManagerLeader: false, // set below from the catalog
 		Services:        []api.ServiceStatus{},
 	}
 	if v, err := s.deps.Store.PostgresVersion(r.Context()); err == nil {
@@ -41,6 +41,11 @@ func (s *Server) getThisServer(_ *call, w http.ResponseWriter, r *http.Request) 
 		out.ServerID = s.localServerID(r.Context())
 	}
 	out.ClusterID = optStr(snap.ClusterID)
+	if out.ServerID != nil {
+		if l := s.managerLeader(r.Context()); l != nil && l.ServerID == *out.ServerID {
+			out.IsManagerLeader = true
+		}
+	}
 	since := started.UTC()
 	out.Services = append(out.Services, api.ServiceStatus{Name: "api", State: "running", Since: &since})
 	pg := "stopped"

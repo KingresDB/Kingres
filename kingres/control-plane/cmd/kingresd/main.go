@@ -27,8 +27,11 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/cluster"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/config"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/httpapi"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/leader"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/monitor"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ops"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/peerclient"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/peers"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sdnotify"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/setup"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/store/pgstore"
@@ -193,6 +196,22 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	if proxy != nil {
 		deps.Proxy = proxy
 	}
+	leaders := leader.New(pg.ManagerLeader, 2*time.Second, nil)
+	peerDir, err := peers.Open(cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	if cfg.InternalListen != "" && svc.Enabled() {
+		_, iport, perr := net.SplitHostPort(cfg.InternalListen)
+		if perr != nil {
+			return fmt.Errorf("internal-listen: %w", perr)
+		}
+		if err := peerDir.Put(peers.Peer{ServerID: serverHost, InternalAddr: net.JoinHostPort(serverHost, iport)}); err != nil {
+			return fmt.Errorf("recording this server in the peer directory: %w", err)
+		}
+		deps.Forwarder = &peerclient.Forwarder{Self: serverHost, Leaders: leaders,
+			Client: peerclient.New(peerclient.Config{PKIDir: svc.PKIDir(), Peers: peerDir})}
+	}
 	api, err := httpapi.New(deps)
 	if err != nil {
 		return err
@@ -284,7 +303,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		go func() {
 			defer wg.Done()
 			serveInternal(bgCtx, internalDeps{addr: cfg.InternalListen, svc: svc, node: node, ring: ring, log: log, started: started,
-				serverHost: serverHost, version: version, dataDir: cfg.DataDir})
+				serverHost: serverHost, version: version, dataDir: cfg.DataDir, leaders: leaders, forward: api.ServeForwarded})
 		}()
 	}
 

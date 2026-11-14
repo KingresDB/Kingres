@@ -41,6 +41,7 @@ version 1, the caller \"2\"."}` when the number is missing or different.
 | `GET /internal/v1/logs` | leader | local log entries (query: `level`, `from`, `to`, `limit`, `cursor`) |
 | `GET /internal/v1/metrics` | leader | latest metric samples |
 | `POST /internal/v1/exec` | leader | one statement on a local database through the local socket |
+| `POST /internal/v1/forward` | any peer, answered only by the leader | one operation of the public contract, run as the identity the forwarding server verified |
 
 "Leader" means the caller's certificate names the server that holds the primary of
 shard group 0, read from the catalog; while that is unknown no leader-only call is
@@ -52,6 +53,34 @@ body is `{"database": "...", "sql": "...", "rowLimit": 1000}` (SQL at most 1,000
 bytes, row limit at most 10,000); the server logs the caller, the database, the
 length and a hash prefix of the statement, never its text.
 
+## Forwarding an operation to the leader
+
+`POST /internal/v1/forward` is how a server that is not the manager leader hands a cluster operation to
+the leader (design D6). Any server of the cluster may call it; a server that is not the leader answers `409
+not_leader` whoever asks. The body is
+
+```
+{"operationId": "createRole", "pathParams": {"roleName": "x"}, "query": "", "contentType": "application/json",
+ "body": "<base64 of the request body>", "identity": {"username": "alice", "clusterRoles": ["kingres_admin"]},
+ "requestId": "...", "sourceAddress": "203.0.113.5", "source": "panel"}
+```
+
+and the answer `{"status": 201, "header": {"Content-Type": "..."}, "body": "<base64>"}`, which the
+forwarding server relays unchanged (only Content-Type, Location, Retry-After, Allow and Content-Language are
+passed on).
+
+What the leader does with it: it looks the operation up by id (a path is never accepted), refuses an operation
+that is not leader-bound (sign-in and sign-out, setup, the operations on this very server, the query workbench,
+and reads other than listTasks, getTask, listAlerts and getClusterSettings), requires the path parameters to be
+exactly the operation's, rebuilds the URL from the contract's template with escaped values, checks the identity
+(user name, only the four cluster roles), and runs the request through the same pipeline as a public one: query
+validation, the role the operation requires (so a server cannot raise an identity's privileges beyond what it
+claims, but it can claim any identity: every server is fully trusted by every other), the handler and the audit.
+The audit event is written by the leader, once, with the details `forwardedBy` (the server id in the caller's
+certificate) and `originRequestId`; the forwarding server writes none, unless the leader could not be reached
+(then it answers 503 and audits the failure itself). The leader makes the role connectable for its own
+connections (the same step as a sign-in) because the forwarding server verified the password.
+
 ## Errors
 
 JSON `{"error": "<code>", "message": "..."}`. Codes: `no_certificate`,
@@ -61,5 +90,6 @@ JSON `{"error": "<code>", "message": "..."}`. Codes: `no_certificate`,
 ## Not in version 1
 
 The calls that create, configure, start, stop and remove instances, that apply
-network rules and that sign certificate requests (join and add) are specified with
-the join and add operations; they are not implemented in this version.
+network rules, that sign certificate requests (join and add) and that distribute the
+peer directory and the revocation list are specified with the join and add operations;
+they are not implemented in this version.

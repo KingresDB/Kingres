@@ -27,6 +27,7 @@ export KINGRES_TEST_ROOT="$ROOT"
 export KINGRES_FIXTURES="$BIN/fixtures"
 export KINGRES_OPERATIONS_GEN="$BIN/operations_gen.go.txt"
 export KINGRES_CONTRACT="$BIN/openapi.yaml"
+export KINGRES_README="$BIN/README.md"
 export LD_LIBRARY_PATH="$INSTALL/lib/x86_64-linux-gnu:$INSTALL/lib:${LD_LIBRARY_PATH:-}"
 export PATH="$INSTALL/bin:$PATH"
 

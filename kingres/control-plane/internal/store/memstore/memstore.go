@@ -27,6 +27,7 @@ type Store struct {
 	ServerList    []api.Server
 	ServerDetails map[string][]api.DatabaseBucketCount
 	LocalServer   *string
+	Leader        string
 	Groups        []api.ServerGroup
 	Topology      api.ReplicationTopology
 	DBs           []api.Database
@@ -95,7 +96,11 @@ func (s *Store) ClusterSettings(context.Context) (api.ClusterSettings, error) {
 
 // Servers implements store.Store.
 func (s *Store) Servers(context.Context) ([]api.Server, error) {
-	return append([]api.Server{}, s.ServerList...), s.Err
+	out := append([]api.Server{}, s.ServerList...)
+	for i := range out {
+		out[i].IsManagerLeader = s.Leader != "" && out[i].ID == s.Leader
+	}
+	return out, s.Err
 }
 
 // Server implements store.Store.
@@ -109,6 +114,7 @@ func (s *Store) Server(_ context.Context, id string) (api.ServerDetail, error) {
 			if d == nil {
 				d = []api.DatabaseBucketCount{}
 			}
+			sv.IsManagerLeader = s.Leader != "" && sv.ID == s.Leader
 			return api.ServerDetail{Server: sv, BucketsByDatabase: d}, nil
 		}
 	}
@@ -450,3 +456,11 @@ func contains(list []string, v string) bool {
 }
 
 func strPtr(s string) *string { return &s }
+
+// ManagerLeader implements store.Store.
+func (s *Store) ManagerLeader(context.Context) (string, error) {
+	if s.Err != nil {
+		return "", s.Err
+	}
+	return s.Leader, nil
+}

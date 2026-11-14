@@ -178,14 +178,16 @@ func (s *Store) shardDatabases(ctx context.Context) ([]string, error) {
 }
 
 // databaseNames lists the databases that accept connections and are not
-// templates.
+// templates, without the system database kingres_system: it is not listed by
+// GET /databases, so it is neither counted nor visited by anything that
+// reports on "the databases" (the same set everywhere).
 func (s *Store) databaseNames(ctx context.Context) ([]string, error) {
 	p, err := s.pool(ctx, "")
 	if err != nil {
 		return nil, err
 	}
 	rows, err := p.Query(ctx, `SELECT datname FROM pg_database
-		WHERE NOT datistemplate AND datallowconn ORDER BY datname`)
+		WHERE NOT datistemplate AND datallowconn AND datname <> 'kingres_system' ORDER BY datname`)
 	if err != nil {
 		return nil, s.wrap("listing databases", err)
 	}
@@ -351,7 +353,7 @@ func (s *Store) Servers(ctx context.Context) ([]api.Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return s.buildServers(ctx, cat, hold, len(perDB) > 0), nil
+	return s.buildServers(ctx, cat, hold, anyHeld(perDB)), nil
 }
 
 func (s *Store) buildServers(ctx context.Context, cat *catalog, hold map[string]*api.BucketHolding, anyBuckets bool) []api.Server {
@@ -369,6 +371,9 @@ func (s *Store) buildServers(ctx context.Context, cat *catalog, hold map[string]
 		if sv.Host == localHost && localHost != "" {
 			up := int64(s.now().Sub(s.opts.Started).Seconds())
 			server.UptimeSeconds = &up
+		}
+		if n, ok := cat.activePrimary(0); ok && cat.byNode[n.ID] == sv {
+			server.IsManagerLeader = true
 		}
 		for _, n := range sv.Nodes {
 			server.Instances = append(server.Instances, cat.instanceOf(n))
@@ -444,7 +449,7 @@ func (s *Store) Server(ctx context.Context, id string) (api.ServerDetail, error)
 		return api.ServerDetail{}, err
 	}
 	var found *api.Server
-	all := s.buildServers(ctx, cat, hold, len(perDB) > 0)
+	all := s.buildServers(ctx, cat, hold, anyHeld(perDB))
 	for i := range all {
 		if all[i].ID == id {
 			found = &all[i]
@@ -528,7 +533,7 @@ func (s *Store) ClusterSummary(ctx context.Context) (store.ClusterSummary, error
 	for _, sv := range cat.servers {
 		h := hold[sv.ID]
 		sum.Servers.Total++
-		switch statusOf(sv, h.Primary+h.Replica, len(perDB) > 0) {
+		switch statusOf(sv, h.Primary+h.Replica, anyHeld(perDB)) {
 		case "live":
 			sum.Servers.Live++
 		case "draining":
@@ -595,4 +600,33 @@ func versionPtr(v string) *string {
 		return nil
 	}
 	return &v
+}
+
+// ManagerLeader implements store.Store: the server that holds the active
+// primary of catalog group 0, "" when there is none.
+func (s *Store) ManagerLeader(ctx context.Context) (string, error) {
+	cat, err := s.loadCatalog(ctx)
+	if err != nil {
+		return "", err
+	}
+	n, ok := cat.activePrimary(0)
+	if !ok {
+		return "", nil
+	}
+	return cat.byNode[n.ID].ID, nil
+}
+
+// anyHeld tells whether any shard group serves a bucket in any database. A
+// cluster with a sharded database but no distributed table has a bucket map
+// and no buckets: a server that owns nothing then is not waiting for a
+// rebalance, because there is nothing to move.
+func anyHeld(perDB map[string]map[int32]*groupBuckets) bool {
+	for _, stats := range perDB {
+		for _, gb := range stats {
+			if gb.held() > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }

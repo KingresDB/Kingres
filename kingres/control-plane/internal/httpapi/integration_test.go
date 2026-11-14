@@ -201,7 +201,7 @@ func TestIntegrationResponsesValidateAgainstContract(t *testing.T) {
 	t.Run("cluster overview content", func(t *testing.T) {
 		m := decode(t, e.do(req{method: "GET", path: "/api/v1/cluster", cookie: cookie}))
 		if m["mapVersion"] != float64(7) || m["health"] != "degraded" || m["clusterId"] != "7d1f2c0e-3b2a-4d58-9c51-2f6f0a1b9e11" ||
-			m["managerLeader"] != nil || m["mapGroupAvailable"] != true {
+			m["mapGroupAvailable"] != true || m["managerLeader"] == nil {
 			t.Errorf("overview = %v", m)
 		}
 	})
@@ -279,7 +279,6 @@ var noSource = map[string][]string{
 	"/api/v1/servers/127.0.0.1": {
 		"bucketsByDatabase[].primarySizeBytes", "bucketsByDatabase[].replicaSizeBytes", "instances[].sizeBytes",
 	},
-	"/api/v1/cluster":               {"managerLeader"},
 	"/api/v1/this-server/instances": {"items[].sizeBytes"},
 	"/api/v1/databases": {
 		"items[].ledger.digestIntervalSeconds", "items[].stats.transactionsPerSecond",

@@ -36,6 +36,11 @@ internal/
   instance/               instance manager: initdb, pg_hba.conf/pg_ident.conf/managed config rendering, pg_ctl
   task/                   task engine (leases, resumable steps) with PostgreSQL, file and memory stores
   cluster/                init-cluster, service credentials, proxy connections as signed-in roles
+  pki/                    cluster certificate authority, server certificates, revocation list, CRL
+  internalapi/             the server-to-server API on its own mutual-TLS listener (see internal-api.md)
+  peerclient/             client of the internal API; forwarding to the leader
+  peers/                  directory of the other servers' internal addresses (peers.json)
+  leader/                 the manager leader read from the catalog, cached
   ops/                    operations that change the cluster (roles, grants, databases, tables, network, workbench)
   sdnotify/               systemd readiness notification
   pgtest/, contracttest/  test helpers (real instances; contract response validation)
@@ -168,34 +173,33 @@ paths). "Real" means the operation works against PostgreSQL or the local node
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **64 of 86 operations are real; 22
-answer "not yet".**
+authenticated operation lists in 0.2.0. **64 of 86 operations are real; 22 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
-| Health | `getHealth`, `getReadiness` | |
-| Auth | `login`, `logout`, `getSession` | |
-| Setup | `getNodeState` (with `setupTask`), `checkSetupToken`, `initCluster` | `joinCluster` |
-| This server | `listThisServerInstances`, `getThisServerInstance`, `getThisServer`, `getThisServerResources`, `listThisServerLogs`, `restartThisServerInstance` | `getThisServer`, `getThisServerResources`, instance `start`/`stop`/`restart`, local settings, `leaveCluster`, local logs |
-| Cluster | `getCluster`, `getClusterSummary` | |
-| Servers | `listServers`, `getServer` | `addServer`, `updateServer`, `removeServer`, `failoverServer` |
-| Server groups | `listServerGroups` | `createServerGroup`, `deleteServerGroup` |
-| Databases | `listDatabases`, `getDatabase`, `getDatabaseCreateOptions`, `createDatabase`, `updateDatabase`, `dropDatabase` | |
-| Tables | `listTables`, `getTable` (with `columns`), `distributeTable`, `enableTableLedger` | |
-| Shards | `listColocationGroups`, `listBuckets`, `getBucketDistribution` | |
+| Alerts | `listAlerts`, `acknowledgeAlert` |  |
+| Audit | `listAuditEvents` |  |
+| Auth | `login`, `logout`, `getSession` |  |
+| Cluster | `getCluster`, `getClusterSummary` |  |
+| Roles | `listClusterRoles`, `listRoles`, `createRole`, `getRole`, `deleteRole`, `updateRole`, `setRoleClusterRoles`, `setRoleMemberships` |  |
+| Databases | `getDatabaseCreateOptions`, `listDatabases`, `createDatabase`, `getDatabase`, `dropDatabase`, `updateDatabase` |  |
+| Shards | `getBucketDistribution`, `listColocationGroups`, `listBuckets` |  |
+| Ledger | `getLedgerStatus`, `listLedgerBlocks`, `listLedgerDigests`, `generateLedgerDigest`, `startLedgerVerification`, `listLedgerStatus` | `createInclusionProof`, `listLedgerVerifications`, `getLedgerVerification` |
+| Tables | `getTable`, `distributeTable`, `enableTableLedger`, `listTables` |  |
+| Grants | `listGrants`, `createGrant`, `revokeGrants`, `applyGrantTemplate` |  |
+| Health | `getHealth`, `getReadiness` |  |
+| Logs | `listLogs` |  |
+| Metrics | `queryMetrics` |  |
+| Query | `executeQuery` |  |
+| Rebalance |  | `getRebalanceStatus`, `startRebalance`, `previewRebalancePlan`, `listRebalanceReports`, `getRebalanceReport`, `stopRebalance` |
 | Replication | `getReplicationTopology` | `restorePreferredPrimaries` |
-| Rebalance | | all six operations |
-| Tasks | `listTasks`, `getTask` (from `kingres_cp.task`), `cancelTask` | |
-| Roles | `listRoles`, `getRole`, `listClusterRoles`, `createRole`, `updateRole`, `deleteRole`, `setRoleMemberships`, `setRoleClusterRoles` | |
-| Grants | `listGrants`, `createGrant`, `revokeGrants`, `applyGrantTemplate` | |
-| Network access | `getNetworkAccess`, `replaceNetworkAccess` | |
-| Audit | `listAuditEvents` | |
-| Settings | `getClusterSettings`, `updateClusterSettings` | |
-| Ledger | `listLedgerStatus`, `getLedgerStatus`, `listLedgerBlocks`, `listLedgerDigests`, `generateLedgerDigest`, `startLedgerVerification` | `listLedgerVerifications`, `getLedgerVerification`, `createInclusionProof` |
-| Query | `executeQuery` | |
-| Alerts | `listAlerts`, `acknowledgeAlert` | |
-| Logs | `listLogs`, `listThisServerLogs` (the local instance log only) | |
-| Metrics | `queryMetrics`, and `/metrics` in the Prometheus text format (outside the contract) | |
+| Server groups | `listServerGroups` | `createServerGroup`, `deleteServerGroup` |
+| Servers | `listServers`, `getServer` | `addServer`, `removeServer`, `updateServer`, `failoverServer` |
+| Settings | `getClusterSettings`, `updateClusterSettings` |  |
+| Network access | `getNetworkAccess`, `replaceNetworkAccess` |  |
+| Setup | `initCluster`, `getNodeState`, `checkSetupToken` | `joinCluster` |
+| Tasks | `listTasks`, `getTask`, `cancelTask` |  |
+| This server | `getThisServer`, `listThisServerInstances`, `getThisServerInstance`, `restartThisServerInstance`, `listThisServerLogs`, `getThisServerResources` | `startThisServerInstance`, `stopThisServerInstance`, `leaveCluster`, `getThisServerSettings`, `updateThisServerSettings` |
 
 ### How the catalog maps to the contract
 
@@ -431,9 +435,14 @@ local settings; `leaveCluster`.
 ## Third increment (several servers): what exists so far
 
 Specification: `kingres/docs/design/control-plane-3.md`. Done: the certificate authority (D1), the internal API
-(D2) and the cluster settings update (part of D7). **Not done:** forwarding to the leader, join, add and remove of
-servers, certificate trust between PostgreSQL instances (D3), server groups, contract 0.4.0 and what depends on it;
-every one of them still answers "not supported yet".
+(D2), the cluster settings update (part of D7), the manager leader and forwarding to it (D6), and the fixes of the
+mismatches the web panel's end-to-end run found (see "Corrections after the panel's end-to-end run"). **Not done:**
+server groups and the cluster-wide logs, alerts and metrics, join, add and remove of servers (D4, D5), the renewal
+job, "every primary" operations on every server, certificate trust between PostgreSQL instances (D3), the
+three-process integration tests and contract 0.4.0 with what depends on it (inclusion proofs, verifications list and
+detail, instance start/stop, leave-cluster, the new alert kinds); every one of them still answers "not supported yet",
+and a cluster still has exactly one server. Nothing half-working is switched on: the join and add operations are not
+routed, and `kingres_shard` 0.2 (needed by D3) was not committed when this was written.
 
 **CA and server certificates (`internal/pki`).** `init-cluster` creates the CA in `<data-dir>/pki/` (ECDSA P-256, ten
 years, `ca.key` mode 0600, written with an exclusive create) and this server's certificate (one year). The server key
@@ -450,12 +459,46 @@ D2:** the spec says "the same listener"; a separate port keeps the public listen
 operator's own certificate. A client certificate must be signed by the cluster CA, valid and not revoked; the version
 header must match (the error names both versions); the call must be in the authorization table (any peer, or leader
 only). The statement-execution call is leader-only and is logged with its length and hash. The server certificate
-names are `server-host`, `localhost` and `127.0.0.1`. With one server the leader is this server; reading the leader
-from the catalog is not written yet.
+names are `server-host`, `localhost` and `127.0.0.1`. The leader is read from the catalog (below).
+
+**The manager leader and forwarding (D6).** The leader is the server whose node holds the active primary of catalog
+group 0 (`Store.ManagerLeader`, cached for two seconds by `internal/leader`; an error or an unknown leader is never
+answered from a stale value, because leader-only internal calls are authorized with it). `ClusterOverview.managerLeader`,
+`Server.isManagerLeader` and `LocalServerInfo.isManagerLeader` all derive from that one answer (a test asserts they
+agree). A server that is not the leader forwards a mutating cluster operation (and the reads of data that only the
+leader has: `listTasks`, `getTask`, `listAlerts`, `getClusterSettings`) over `POST /internal/v1/forward` after it has
+authenticated the caller, checked CSRF and the required role itself; the leader re-checks the operation, the identity
+and the role and writes the audit event, once (`forwardedBy`, `originRequestId`). Not forwarded: sign-in/out, setup,
+operations on this server, the query workbench. If the leader is unknown or unreachable the answer is 503 and nothing
+runs locally. The internal address of every server is kept in `<data-dir>/peers.json` (`internal/peers`), because the
+shard catalog knows only hosts and PostgreSQL ports; each server records itself at start when `internal-listen` is set,
+and the join task (not written yet) distributes the file. The leader is also the only server that runs the task engine
+and holds `kingres_cp`; a follower's copy of `kingres_system` (created when a server joins) is not used for state.
+Specification of the call: `internal-api.md`.
 
 **Cluster settings update (`updateClusterSettings`).** The values are stored in `kingres_cp.cluster_setting` and win over
 the defaults the read side derives from the catalogs; a feature flag can only be turned on (the extension is then
 installed in the system database).
+
+### Corrections after the panel's end-to-end run
+
+The panel's engineer found these mismatches against the contract; each has a regression test.
+
+1. `GET /ledger/status` and an unfiltered `GET /grants` answered 404: they visited the system database
+   `kingres_system`, which `GET /databases` does not list, so the existence check failed. **Decision:** the system
+   database is hidden everywhere (the list, the count, the ledger list, the grant list, the shard-holdings scan);
+   `postgres` and every other connectable non-template database is listed and counted. One function
+   (`databaseNames`) defines the set.
+2. `ClusterSummary.databaseCount` counted the system database; it now counts the same set as the list.
+3. A table with a ledger that is neither distributed nor a reference table has `classes: ["ledger"]` (not
+   `["plain","ledger"]`): `plain` is never combined with another class. The contract's wording only excluded
+   `distributed` and `reference`; contract 0.4.0 must say it (not yet changed, see below).
+4. The manager leader is derived once from the catalog (above).
+5. A server that owns no buckets is `pendingRebalance` only while buckets are held by some server; a sharded
+   database with no distributed table has none, so the server is `live` and the cluster `healthy`.
+6. The table of implemented operations is checked by `TestReadmeTableMatchesTheRegistry` against the handler
+   registry (and the count sentence), so it cannot lag the binary; the table was regenerated from it. Note that
+   `getThisServer` and `getThisServerResources` were wrongly in the "not yet" column.
 
 ## Verification of this increment
 
@@ -575,7 +618,7 @@ Things a reviewer should look at first:
 setup addresses; `TableColumn.type`). `Database.createdAt/By`, ledger mode and digest interval, bucket count and
 durability now come from `kingres_cp.database_setting` for databases created through the API and are null for others.
 The lists above that say "always null in this version" are otherwise unchanged except `ClusterOverview.managerLeader`,
-which is still null (no election yet; the leader is the single server).
+which is now filled from the catalog (it is null only while the map group has no primary).
 
 The 0.1.0 defects (missing 422/429/503/405 responses, no 405 code, no server
 identity, "map group has id 1", unstored database settings answered with

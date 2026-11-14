@@ -19,11 +19,12 @@ import (
 )
 
 type env struct {
-	srv    *httptest.Server
-	ca     *pki.CA
-	t      *testing.T
-	leader string
-	execd  []ExecRequest
+	srv       *httptest.Server
+	ca        *pki.CA
+	t         *testing.T
+	leader    string
+	execd     []ExecRequest
+	forwarded []string
 }
 
 // cert issues a certificate for cn from ca and returns it as a TLS pair.
@@ -56,7 +57,12 @@ func newEnv(t *testing.T) *env {
 		State: func(context.Context) State {
 			return State{ServerID: "leader", NodeState: "clustered", InternalVersion: Version}
 		},
-		Leader:    func() string { return e.leader },
+		Leader: func() string { return e.leader },
+		Self:   "leader",
+		Forward: func(_ context.Context, peer string, r ForwardRequest) (ForwardResponse, error) {
+			e.forwarded = append(e.forwarded, peer+":"+r.OperationID+":"+r.Identity.Username)
+			return ForwardResponse{Status: 201, Header: map[string]string{"Content-Type": "application/json"}, Body: []byte(`{"ok":true}`)}, nil
+		},
 		Revoked:   ca.Revoked,
 		Resources: func(context.Context) (any, error) { return map[string]int{"cores": 4}, nil },
 		Logs:      func(context.Context, map[string]string) (any, error) { return map[string]any{"items": []any{}}, nil },

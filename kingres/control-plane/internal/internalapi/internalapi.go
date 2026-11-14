@@ -43,6 +43,9 @@ const (
 	AnyPeer Policy = iota
 	// LeaderOnly: only the server that is the manager leader.
 	LeaderOnly
+	// ToLeader: any peer may call, but only the manager leader answers; a
+	// server that is not the leader refuses with not_leader.
+	ToLeader
 )
 
 // Calls is the authorization table. A path that is not in it does not exist.
@@ -54,6 +57,7 @@ var Calls = map[string]Policy{
 	"POST /exec":     LeaderOnly,
 	"GET /revoked":   AnyPeer,
 	"GET /leader":    AnyPeer,
+	"POST /forward":  ToLeader,
 }
 
 // PeerVerifier accepts or refuses a peer certificate and returns the server
@@ -87,8 +91,44 @@ type ExecResult struct {
 	Tag     string   `json:"commandTag"`
 }
 
+// ForwardIdentity is the authenticated identity of the user whose request is
+// forwarded: the role that signed in and the cluster roles it had.
+type ForwardIdentity struct {
+	Username     string   `json:"username"`
+	ClusterRoles []string `json:"clusterRoles"`
+}
+
+// ForwardRequest is the body of POST /forward: one operation of the public
+// contract, by operation id and path parameters (never a path), with its query
+// string and body and the identity the forwarding server verified.
+type ForwardRequest struct {
+	OperationID   string            `json:"operationId"`
+	PathParams    map[string]string `json:"pathParams,omitempty"`
+	Query         string            `json:"query,omitempty"`
+	ContentType   string            `json:"contentType,omitempty"`
+	Body          []byte            `json:"body,omitempty"`
+	Identity      ForwardIdentity   `json:"identity"`
+	RequestID     string            `json:"requestId,omitempty"`
+	SourceAddress string            `json:"sourceAddress,omitempty"`
+	// Source is "panel" or "cli".
+	Source string `json:"source,omitempty"`
+}
+
+// ForwardResponse is the answer of the leader to a forwarded operation, to be
+// relayed unchanged.
+type ForwardResponse struct {
+	Status int               `json:"status"`
+	Header map[string]string `json:"header,omitempty"`
+	Body   []byte            `json:"body,omitempty"`
+}
+
 // Backend is what the server provides to the internal API.
 type Backend struct {
+	// Self is the server id of this server.
+	Self string
+	// Forward runs a forwarded operation as the identity in the request; peer is
+	// the verified server id of the caller. It is only called on the leader.
+	Forward func(ctx context.Context, peer string, req ForwardRequest) (ForwardResponse, error)
 	// State reports this server.
 	State func(ctx context.Context) State
 	// Leader returns the server id of the manager leader, "" when unknown (then
@@ -178,6 +218,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusNotFound, "not_found", "No such call.")
 		return
 	}
+	if policy == ToLeader {
+		if l := s.be.Leader(); l == "" || l != s.be.Self || s.be.Forward == nil {
+			fail(w, http.StatusConflict, "not_leader", "This server is not the manager leader.")
+			return
+		}
+	}
 	if policy == LeaderOnly {
 		if l := s.be.Leader(); l == "" || l != peer {
 			s.log.Warn("internal call refused", "reason", "not the leader", "call", key, "peer", peer)
@@ -185,7 +231,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	limit := int64(1 << 20)
+	if policy == ToLeader {
+		limit = 16 << 20
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	ctx := r.Context()
 	switch key {
 	case "GET /state":
@@ -208,6 +258,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.answer(w, func() (any, error) { return s.be.Logs(ctx, q) })
 	case "POST /exec":
 		s.exec(w, r, peer)
+	case "POST /forward":
+		s.forward(w, r, peer)
 	}
 }
 

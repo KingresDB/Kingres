@@ -125,7 +125,12 @@ func (s *Store) readTables(ctx context.Context, h *dbHandle, schema, name string
 			t.HomeShardGroupID = &g
 		}
 		if isLedger {
-			t.Classes = append(t.Classes, "ledger")
+			// plain is never combined with another class.
+			if len(t.Classes) == 1 && t.Classes[0] == "plain" {
+				t.Classes = []string{"ledger"}
+			} else {
+				t.Classes = append(t.Classes, "ledger")
+			}
 			t.Ledger = &api.TableLedger{Mode: "appendOnly", HistoryTable: lhistory}
 			if lmode != nil && *lmode == "updatable" {
 				t.Ledger.Mode = "updatable"

@@ -3,7 +3,9 @@
 package httpapi
 
 import (
+	"context"
 	"net/http"
+	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/auth"
@@ -27,8 +29,7 @@ func (s *Server) getCluster(_ *call, w http.ResponseWriter, r *http.Request) err
 	out := api.ClusterOverview{
 		ClusterID: optStr(snap.ClusterID), Name: optStr(snap.ClusterName), Health: sum.Health,
 		Version: s.deps.Version, MapVersion: sum.MapVersion, MapGroupAvailable: sum.MapGroupAvailable,
-		// The manager does not exist yet, so there is no elected leader.
-		ManagerLeader: nil,
+		ManagerLeader: s.managerLeader(r.Context()),
 		Servers:       sum.Servers, Buckets: sum.Buckets, DatabaseCount: sum.DatabaseCount,
 		Rebalance: api.RebalanceSummary{Needed: sum.RebalanceNeeded, Reasons: sum.RebalanceReasons},
 		AutoFailover: api.AutoFailoverSummary{Enabled: settings.AutoFailover.Enabled,
@@ -426,4 +427,23 @@ func optStr(s string) *string {
 		return nil
 	}
 	return &s
+}
+
+// managerLeader describes the manager leader: the server that holds the
+// primary of shard group 0 (design control-plane-3.md, D6). It is nil while
+// the catalog has none or cannot be read. The same catalog answer feeds
+// ClusterOverview.managerLeader, Server.isManagerLeader and
+// LocalServerInfo.isManagerLeader, so the three always agree.
+func (s *Server) managerLeader(ctx context.Context) *api.ManagerLeader {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	id, err := s.deps.Store.ManagerLeader(ctx)
+	if err != nil || id == "" {
+		return nil
+	}
+	l := &api.ManagerLeader{ServerID: id, Address: id}
+	if srv, err := s.deps.Store.Server(ctx, id); err == nil {
+		l.Address = srv.Address
+	}
+	return l
 }

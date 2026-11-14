@@ -18,6 +18,7 @@ import (
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/cluster"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/leader"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/monitor"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pki"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/serverinfo"
@@ -35,6 +36,10 @@ type internalDeps struct {
 	serverHost string
 	version    string
 	dataDir    string
+	// leaders reads the manager leader from the catalog; forward runs a
+	// forwarded operation (only ever called on the leader).
+	leaders *leader.Resolver
+	forward func(ctx context.Context, peer string, req internalapi.ForwardRequest) (internalapi.ForwardResponse, error)
 }
 
 // serveInternal waits until the server certificate exists (it is created by
@@ -83,9 +88,10 @@ func serveInternal(ctx context.Context, d internalDeps) {
 			return internalapi.State{ServerID: me, NodeState: string(d.node.State()), Version: d.version,
 				InternalVersion: internalapi.Version, UptimeSeconds: int64(time.Since(d.started).Seconds())}
 		},
-		// A one-server cluster is its own leader; with several servers the
-		// leader is read from the catalog (not implemented yet).
-		Leader:  func() string { return me },
+		// The leader is the server holding the primary of shard group 0.
+		Leader:  d.leaders.Current,
+		Self:    me,
+		Forward: d.forward,
 		Revoked: revoked,
 		Resources: func(context.Context) (any, error) {
 			return serverinfo.Resources(map[string]string{"data": filepath.Join(d.dataDir, "instances")}, nil), nil

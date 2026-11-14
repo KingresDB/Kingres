@@ -38,3 +38,4 @@ GRANT kingres_admin TO cp_disabled;
 CREATE DATABASE kingres_cp OWNER cp_admin;
 CREATE DATABASE plain_cp OWNER cp_admin;
 ALTER DATABASE plain_cp SET synchronous_commit = 'remote_apply';
+CREATE DATABASE kingres_system OWNER cp_admin;
