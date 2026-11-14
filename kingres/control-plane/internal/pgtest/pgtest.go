@@ -61,7 +61,10 @@ func (i *Instance) Connect(t testing.TB, db string) *pgx.Conn {
 	return c
 }
 
-var portMu sync.Mutex
+var (
+	portMu    sync.Mutex
+	usedPorts = map[int]bool{}
+)
 
 // BinDir returns KINGRES_PG_BIN or "".
 func BinDir() string { return os.Getenv("KINGRES_PG_BIN") }
@@ -76,11 +79,15 @@ func FreePort(t testing.TB) int {
 	defer portMu.Unlock()
 	lo, hi := envInt("KINGRES_TEST_PORT_BASE", 56000), envInt("KINGRES_TEST_PORT_END", 56199)
 	for p := lo; p <= hi; p++ {
+		if usedPorts[p] {
+			continue
+		}
 		l, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(p))
 		if err != nil {
 			continue
 		}
 		_ = l.Close()
+		usedPorts[p] = true // never hand out the same port twice in one test binary
 		return p
 	}
 	t.Fatalf("no free port in %d..%d", lo, hi)

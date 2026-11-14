@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"os"
 
 	"path/filepath"
 	"regexp"
@@ -19,6 +21,7 @@ import (
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/instance"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pki"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/scram"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/setup"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sqlx"
@@ -151,6 +154,7 @@ func paramsOf(t task.Task) (initParams, error) {
 
 func (s *Service) initDefinition() task.Definition {
 	return task.Definition{Kind: KindInit, Steps: []task.Step{
+		{Name: "Create the cluster certificate authority", Run: s.stepPKI},
 		{Name: "Create the PostgreSQL instance", Run: s.stepInstance},
 		{Name: "Create cluster roles and the administrator", NeedsSecret: "adminPassword", Run: s.stepRoles},
 		{Name: "Create the system database", Run: s.stepSystemDB},
@@ -175,6 +179,53 @@ func HBARules(rules []api.NetworkAccessRule) []instance.HBARule {
 		out[i] = instance.HBARule{Type: r.Type, Databases: r.Databases, Users: r.Users, Address: r.Address, Method: r.Method}
 	}
 	return out
+}
+
+// PKIDir is the directory of the certificate authority and the server key.
+func (s *Service) PKIDir() string { return filepath.Join(s.cfg.DataDir, "pki") }
+
+// File names of the server's own certificate material in the pki directory.
+const (
+	ServerCertFile = "server.crt"
+	ServerKeyFile  = "server.key"
+)
+
+// ServerNames are the names the certificate of this server carries.
+func (s *Service) ServerNames() pki.Names {
+	n := pki.Names{CommonName: s.cfg.ServerHost, DNS: []string{"localhost"}, IPs: []net.IP{net.ParseIP("127.0.0.1")}}
+	return n
+}
+
+// stepPKI creates the CA of the cluster and this server's certificate: the key
+// is generated here and only the request goes to the CA, which lives in the
+// same process on the first server.
+func (s *Service) stepPKI(_ context.Context, _ *task.Env) error {
+	dir := s.PKIDir()
+	ca, err := pki.LoadCA(dir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("loading the CA: %w", err)
+		}
+		if ca, err = pki.CreateCA(dir, "", time.Now()); err != nil {
+			return fmt.Errorf("creating the CA: %w", err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, ServerCertFile)); err == nil {
+		return nil
+	}
+	names := s.ServerNames()
+	key, csr, err := pki.NewKeyAndCSR(names)
+	if err != nil {
+		return err
+	}
+	crt, _, err := ca.Sign(csr, names, time.Now())
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(dir, ServerKeyFile), key, 0o600); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, ServerCertFile), crt, 0o644) //nolint:gosec // a certificate is public
 }
 
 func (s *Service) stepInstance(ctx context.Context, env *task.Env) error {

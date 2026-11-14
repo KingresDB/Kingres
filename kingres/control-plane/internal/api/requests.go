@@ -125,3 +125,21 @@ type LedgerVerifyRequest struct {
 	Scope    string `json:"scope,omitempty"`
 	DigestID *int64 `json:"digestId,omitempty"`
 }
+
+// ClusterSettingsUpdateRequest is the body of PATCH /settings/cluster.
+type ClusterSettingsUpdateRequest struct {
+	DefaultReplicaCount *int    `json:"defaultReplicaCount,omitempty"`
+	DefaultDurability   *string `json:"defaultDurability,omitempty"`
+	AutoFailover        *struct {
+		Enabled        *bool `json:"enabled,omitempty"`
+		TimeoutSeconds *int  `json:"timeoutSeconds,omitempty"`
+		MaxCount       *int  `json:"maxCount,omitempty"`
+	} `json:"autoFailover,omitempty"`
+	Rebalance *struct {
+		MaxConcurrentMoves *int `json:"maxConcurrentMoves,omitempty"`
+	} `json:"rebalance,omitempty"`
+	Features *struct {
+		Sharding *bool `json:"sharding,omitempty"`
+		Ledger   *bool `json:"ledger,omitempty"`
+	} `json:"features,omitempty"`
+}

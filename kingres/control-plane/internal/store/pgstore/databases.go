@@ -4,6 +4,7 @@ package pgstore
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -229,14 +230,63 @@ func (s *Store) ClusterSettings(ctx context.Context) (api.ClusterSettings, error
 		to_regclass('kingres.ledger_blocks') IS NOT NULL`).Scan(&shard, &ledger); err != nil {
 		return api.ClusterSettings{}, s.wrap("checking features", err)
 	}
-	return api.ClusterSettings{
+	out := api.ClusterSettings{
 		DefaultReplicaCount: cat.replicaCount(),
 		DefaultDurability:   durabilityOf(sc),
 		AutoFailover:        api.AutoFailoverSettings{Enabled: false, TimeoutSeconds: 120, MaxCount: 1},
 		Rebalance:           api.RebalanceSettings{MaxConcurrentMoves: 4},
 		Features:            api.FeatureFlags{Sharding: shard, Ledger: ledger},
 		Restart:             api.RestartState{ServerIDs: []string{}},
-	}, nil
+	}
+	// Values the administrator set (kingres_cp.cluster_setting) win over the
+	// defaults derived from the catalogs.
+	if ok, _ := s.regclassExists(ctx, p, "kingres_cp.cluster_setting"); ok {
+		rows, err := p.Query(ctx, "SELECT key, value FROM kingres_cp.cluster_setting")
+		if err != nil {
+			return out, s.wrap("reading kingres_cp.cluster_setting", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var k string
+			var v []byte
+			if err := rows.Scan(&k, &v); err != nil {
+				return out, s.wrap("reading kingres_cp.cluster_setting", err)
+			}
+			var n int
+			var str string
+			var b bool
+			switch k {
+			case "replica.default":
+				if json.Unmarshal(v, &n) == nil {
+					out.DefaultReplicaCount = n
+				}
+			case "durability.default":
+				if json.Unmarshal(v, &str) == nil {
+					out.DefaultDurability = str
+				}
+			case "autoFailover.enabled":
+				if json.Unmarshal(v, &b) == nil {
+					out.AutoFailover.Enabled = b
+				}
+			case "autoFailover.timeoutSeconds":
+				if json.Unmarshal(v, &n) == nil {
+					out.AutoFailover.TimeoutSeconds = n
+				}
+			case "autoFailover.maxCount":
+				if json.Unmarshal(v, &n) == nil {
+					out.AutoFailover.MaxCount = n
+				}
+			case "rebalance.maxConcurrentMoves":
+				if json.Unmarshal(v, &n) == nil {
+					out.Rebalance.MaxConcurrentMoves = n
+				}
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return out, s.wrap("reading kingres_cp.cluster_setting", err)
+		}
+	}
+	return out, nil
 }
 
 // newDatabase builds the response for one database. Values that no catalog

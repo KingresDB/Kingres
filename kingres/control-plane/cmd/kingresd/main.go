@@ -279,6 +279,15 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		rcancel()
 	}
 
+	if cfg.InternalListen != "" && svc.Enabled() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			serveInternal(bgCtx, internalDeps{addr: cfg.InternalListen, svc: svc, node: node, ring: ring, log: log, started: started,
+				serverHost: serverHost, version: version, dataDir: cfg.DataDir})
+		}()
+	}
+
 	serveErr := make(chan error, 1)
 	go func() {
 		var err error

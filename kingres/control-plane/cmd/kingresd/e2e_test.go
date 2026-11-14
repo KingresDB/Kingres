@@ -46,6 +46,8 @@ type cp struct {
 	token   string // bearer token of the administrator
 	client  *http.Client
 	args    []string
+	// internal is the address of the internal API listener.
+	internal string
 }
 
 var (
@@ -80,8 +82,9 @@ func newServer(t testing.TB) *cp {
 	ready := make(chan string, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	e.cancel = cancel
+	e.internal = fmt.Sprintf("127.0.0.1:%d", pgtest.FreePort(t))
 	args := []string{"-listen", "127.0.0.1:0", "-data-dir", e.dataDir, "-log-format", "json",
-		"-login-rate-limit", "1000", "-pg-bin-dir", pgtest.BinDir(), "-pg-port", fmt.Sprint(e.pgPort), "-server-host", "127.0.0.1"}
+		"-login-rate-limit", "1000", "-internal-listen", e.internal, "-pg-bin-dir", pgtest.BinDir(), "-pg-port", fmt.Sprint(e.pgPort), "-server-host", "127.0.0.1"}
 	e.args = args
 	go func() { e.done <- run(ctx, args, noEnv, e.logs, ready) }()
 	select {
@@ -258,7 +261,7 @@ func TestInitClusterEndToEnd(t *testing.T) {
 		t.Fatalf("setupTask %v", state["setupTask"])
 	}
 	steps, _ := tk["steps"].([]any)
-	if len(steps) != 5 {
+	if len(steps) != 6 {
 		t.Errorf("steps %v", steps)
 	}
 	for _, s := range steps {

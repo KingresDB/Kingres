@@ -42,6 +42,7 @@ func (s *Server) opsHandlers() map[string]handlerFunc {
 		"executeQuery":              s.executeQuery,
 		"cancelTask":                s.cancelTask,
 		"restartThisServerInstance": s.restartThisServerInstance,
+		"updateClusterSettings":     s.updateClusterSettings,
 		"getClusterSummary":         s.getClusterSummary,
 		"listLedgerDigests":         s.listLedgerDigests,
 		"generateLedgerDigest":      s.generateLedgerDigest,
@@ -577,5 +578,25 @@ func (s *Server) restartThisServerInstance(c *call, w http.ResponseWriter, r *ht
 		return s.taskProblem(r, err)
 	}
 	s.accepted(w, r, t)
+	return nil
+}
+
+func (s *Server) updateClusterSettings(c *call, w http.ResponseWriter, r *http.Request) error {
+	o, err := s.needOps()
+	if err != nil {
+		return err
+	}
+	var req api.ClusterSettingsUpdateRequest
+	if err := s.body(w, r, &req); err != nil {
+		return err
+	}
+	if err := o.UpdateClusterSettings(r.Context(), c.session.Username, req); err != nil {
+		return err
+	}
+	out, err := s.deps.Store.ClusterSettings(r.Context())
+	if err != nil {
+		return s.storeProblem(r, err, "")
+	}
+	s.writeJSON(w, r, http.StatusOK, out)
 	return nil
 }

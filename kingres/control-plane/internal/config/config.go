@@ -80,6 +80,9 @@ type Config struct {
 	// AllowRemoteSetup lets setup operations come from non-loopback
 	// addresses while the node is uninitialized (default false: safe).
 	AllowRemoteSetup bool
+	// InternalListen is the address of the mutual-TLS listener of the internal
+	// API; empty disables it.
+	InternalListen string
 	// MetricsToken is the optional scrape token of /metrics.
 	MetricsToken string
 	// StopInstances is not a setting: it is set by the -stop-instances mode.
@@ -217,6 +220,8 @@ var settings = []setting{
 		}},
 	{key: "metrics-token", env: "KINGRES_METRICS_TOKEN", secret: true, usage: "bearer token that may scrape /metrics (default none: a session token of a kingres_stats account is required)",
 		apply: str(func(c *Config) *string { return &c.MetricsToken })},
+	{key: "internal-listen", env: "KINGRES_INTERNAL_LISTEN", usage: "host:port of the mutual-TLS listener of the internal server-to-server API (empty: off)",
+		apply: str(func(c *Config) *string { return &c.InternalListen })},
 	{key: "server-host", env: "KINGRES_SERVER_HOST", usage: "host name this server registers in the cluster catalog (default: the machine's host name)",
 		apply: str(func(c *Config) *string { return &c.ServerHost })},
 }
