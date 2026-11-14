@@ -107,6 +107,13 @@ cmd_regress() {
         echo "max_prepared_transactions = 20"
         echo "fsync = off"
     } >>"${data_dir}/postgresql.conf"
+    # The in-tree (meson) run of the same tests starts its server with the
+    # extension's own settings file.  Apply it here too, after the defaults
+    # above, so that both ways of running the tests see the same settings and
+    # share one set of expected outputs.
+    if [ -f "${ext_dir}/${ext}.conf" ]; then
+        cat "${ext_dir}/${ext}.conf" >>"${data_dir}/postgresql.conf"
+    fi
     trap stop_server EXIT
     "${install_dir}/bin/pg_ctl" -D "${data_dir}" -l "${data_dir}/server.log" -w start >/dev/null
     local status=0
