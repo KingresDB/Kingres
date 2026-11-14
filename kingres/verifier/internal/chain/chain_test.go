@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -13,6 +14,10 @@ import (
 )
 
 const fixtureDir = "../../testdata/fixtures"
+
+// closedAtRe matches the block time member of an exported header, whatever its
+// value, so that the tests do not depend on the numbers in the fixtures.
+var closedAtRe = regexp.MustCompile(`"closed_at_us" : -?[0-9]+`)
 
 func fixture(t testing.TB, rel string) []byte {
 	t.Helper()
@@ -174,11 +179,15 @@ func TestParseBlocksRejects(t *testing.T) {
 		{"array", "[]"},
 		{"missing field", strings.Replace(first, `"tx_count"`, `"tx_countx"`, 1)},
 		{"height fraction", strings.Replace(first, `"height" : 0`, `"height" : 0.5`, 1)},
-		{"closed_at_us huge", strings.Replace(first, `"closed_at_us" : 847984104663947`, `"closed_at_us" : 9223372036854775808`, 1)},
+		{"closed_at_us huge", closedAtRe.ReplaceAllString(first, `"closed_at_us" : 9223372036854775808`)},
 		{"tx_count zero", strings.Replace(first, `"tx_count" : 2`, `"tx_count" : 0`, 1)},
 		{"two objects on a line", first + first},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			// A mutation that did not change the header would test nothing.
+			if tt.in == first {
+				t.Fatal("the mutation left the fixture header unchanged")
+			}
 			if _, err := ParseBlocks([]byte(tt.in)); err == nil {
 				t.Error("want an error")
 			}
