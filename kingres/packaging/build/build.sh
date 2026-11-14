@@ -249,7 +249,7 @@ go_build() { # go_build MODULE_DIR OUTPUT PACKAGE
     ( cd "$1"
       go mod download
       go build -trimpath -buildvcs=false -buildmode=pie \
-          -ldflags "-s -w -X main.version=${version}" \
+          -ldflags "-s -w -X main.version=${version} -X main.commit=${commit}" \
           -o "$2" "$3" )
 }
 
@@ -308,6 +308,7 @@ for f in kingres_shard kingres_ledger; do
     [ -f "${stage}${prefix}/share/postgresql/extension/${f}.control" ] || die "control file of ${f} was not installed"
 done
 readelf -d "${bin}/postgres" | grep -q BIND_NOW || die "the server was not linked with immediate binding"
+"${bin}/kingresd" -version | grep -q "${commit}" || die "kingresd -version does not show the build commit"
 ldd "${bin}/kingresd" 2>&1 | grep -Eq 'statically linked|not a dynamic' ||
     die "kingresd is dynamically linked"
 if grep -q "^#define USE_ASSERT_CHECKING" "${build_dir}/src/include/pg_config.h"; then
@@ -329,7 +330,7 @@ mkdir -p "$(dirname "${bi}")"
     echo "libc: $(ldd --version | head -1)"
     echo "SOURCE_DATE_EPOCH: ${SOURCE_DATE_EPOCH}"
     echo "meson options: ${meson_opts[*]}"
-    echo "go flags: CGO_ENABLED=0 -trimpath -buildmode=pie -ldflags '-s -w -X main.version=${version}'"
+    echo "go flags: CGO_ENABLED=0 -trimpath -buildmode=pie -ldflags '-s -w -X main.version=${version} -X main.commit=${commit}'"
 } >"${bi}"
 cp "${bi}" "${info}/BUILD-INFO"
 

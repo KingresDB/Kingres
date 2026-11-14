@@ -66,7 +66,20 @@ RUN chmod 0755 /usr/local/bin/kingres-entrypoint /usr/local/bin/kingres-healthch
 
 # No secrets here: the setup token is created at first start in the volume,
 # the administrator is created in the wizard.
+#   KINGRES_ALLOW_REMOTE_SETUP  the panel listens on 0.0.0.0 (a published port
+#                               must reach it), so setup calls from other
+#                               addresses are allowed; the setup token is still
+#                               required.  Publish the port to 127.0.0.1 unless
+#                               you mean otherwise.
+#   KINGRES_PG_LISTEN           the instance accepts TCP on all interfaces of
+#                               the container; pg_hba.conf (managed by kingresd)
+#                               decides who may log in.
+# The instance's data and Unix sockets live in the volume
+# (/var/lib/kingres/instances/1/pgdata, /var/lib/kingres/run/1).
 ENV KINGRES_LISTEN=0.0.0.0:8091 \
+    KINGRES_ALLOW_REMOTE_SETUP=true \
+    KINGRES_PG_LISTEN=0.0.0.0 \
+    KINGRES_PG_PORT=5432 \
     KINGRES_DATA_DIR=/var/lib/kingres \
     KINGRES_LOG_FORMAT=json \
     KINGRES_PG_BIN_DIR=/opt/kingres/bin \
@@ -84,7 +97,9 @@ LABEL org.opencontainers.image.title="KingresDB" \
 USER kingres:kingres
 WORKDIR /var/lib/kingres
 VOLUME ["/var/lib/kingres"]
-EXPOSE 8091
+EXPOSE 8091 5432
+# Stopping shuts the database down first (see entrypoint.sh): give it time,
+# e.g. docker run --stop-timeout 120 (compose.yaml does).
 STOPSIGNAL SIGTERM
 HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 \
     CMD ["/usr/local/bin/kingres-healthcheck"]

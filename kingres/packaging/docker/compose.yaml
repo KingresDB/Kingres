@@ -5,9 +5,10 @@
 # names, one published panel port and one volume each.  The nodes start
 # uninitialized, each with its own setup token (read them with ./tokens.sh).
 #
-# Joining the nodes into one cluster is NOT implemented in kingresd yet: today
-# each node is an independent uninitialized node.  This file only prepares the
-# topology (names, network, ports, volumes) that the join feature will use.
+# Each node starts uninitialized.  Create a cluster in the panel of one node
+# and join the others from their own panels, or make each its own one-server
+# cluster.  The test of this file (test/test-compose.sh) does the latter; a
+# join test is still to be written.
 #
 # Usage (from this directory):
 #   docker compose up --build -d     build the image (clean snapshot advised,
@@ -22,6 +23,8 @@
 #                           to build only committed files.
 #   KINGRES_IMAGE           image name, default kingres:dev
 #   KINGRES_PANEL_PORT_1/2/3  host ports of the panels, default 8091/8092/8093
+#   KINGRES_PG_PORT_1/2/3     host ports of the databases, default 5432/5433/5434
+#                           (stop a local PostgreSQL or change them)
 #   KINGRES_PANEL_BIND      host address the ports are bound to, default
 #                           127.0.0.1 (the setup token protects an
 #                           uninitialized node, but it is not a reason to
@@ -32,6 +35,12 @@ name: kingres-dev
 x-node: &node
   image: ${KINGRES_IMAGE:-kingres:dev}
   restart: unless-stopped
+  # "docker stop" shuts the database down first (entrypoint.sh): allow it time.
+  stop_grace_period: 120s
+  environment:
+    # The mutual-TLS port of the server-to-server API, used when nodes are
+    # joined into one cluster.  It is not published to the host.
+    KINGRES_INTERNAL_LISTEN: "0.0.0.0:8191"
   pull_policy: never    # the image is built by kingres-1 (or already present)
   read_only: true
   tmpfs:
@@ -54,6 +63,7 @@ services:
     hostname: kingres-1
     ports:
       - "${KINGRES_PANEL_BIND:-127.0.0.1}:${KINGRES_PANEL_PORT_1:-8091}:8091"
+      - "${KINGRES_PANEL_BIND:-127.0.0.1}:${KINGRES_PG_PORT_1:-5432}:5432"
     volumes:
       - kingres-1-data:/var/lib/kingres
 
@@ -63,6 +73,7 @@ services:
     hostname: kingres-2
     ports:
       - "${KINGRES_PANEL_BIND:-127.0.0.1}:${KINGRES_PANEL_PORT_2:-8092}:8091"
+      - "${KINGRES_PANEL_BIND:-127.0.0.1}:${KINGRES_PG_PORT_2:-5433}:5432"
     volumes:
       - kingres-2-data:/var/lib/kingres
 
@@ -72,6 +83,7 @@ services:
     hostname: kingres-3
     ports:
       - "${KINGRES_PANEL_BIND:-127.0.0.1}:${KINGRES_PANEL_PORT_3:-8093}:8091"
+      - "${KINGRES_PANEL_BIND:-127.0.0.1}:${KINGRES_PG_PORT_3:-5434}:5432"
     volumes:
       - kingres-3-data:/var/lib/kingres
 

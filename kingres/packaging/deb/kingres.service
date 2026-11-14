@@ -1,11 +1,23 @@
 # SPDX-License-Identifier: PostgreSQL
 # Copyright (c) 2026, RooyeKhat Media Co
 #
-# The one KingresDB service of a node: kingresd serves the panel and the REST
-# API and, as the control plane matures, starts and supervises the local
-# PostgreSQL instances (they are child processes of this unit and live in its
-# cgroup).  Configuration: /etc/kingres/kingresd.json and
-# /etc/kingres/kingresd.env.  Data: /var/lib/kingres.
+# The one KingresDB service of a node.  kingresd serves the panel and the REST
+# API and manages the local PostgreSQL instance: it runs initdb, starts the
+# instance with pg_ctl and re-adopts it when kingresd itself restarts.  The
+# instance is an independent process (not a child that dies with kingresd), so
+# two kinds of restart exist:
+#
+#   restart the manager only (the database keeps running):
+#       systemctl kill --kill-whom=main --signal=SIGTERM kingres
+#     kingresd exits cleanly, Restart=always starts it again, and it adopts the
+#     running instance.  ExecStop is not run, because the unit is not stopped.
+#
+#   restart everything (the database restarts too):
+#       systemctl restart kingres
+#     ExecStop stops the instance with a fast shutdown, then the unit starts.
+#
+# Settings: /etc/kingres/kingresd.json and /etc/kingres/kingresd.env.
+# Data: /var/lib/kingres.  Sockets: /run/kingres.
 
 [Unit]
 Description=KingresDB node (management panel, REST API and instance manager)
@@ -14,34 +26,51 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+# kingresd sends READY=1 once its API listens and STOPPING=1 when it stops.
+Type=notify
+NotifyAccess=main
 User=kingres
 Group=kingres
 UMask=0027
-# Secrets (for example KINGRES_PG_DSN with a password) go in the env file,
-# which is root-only and read by systemd before privileges are dropped.
+# Secrets (for example KINGRES_METRICS_TOKEN) go in the env file, which is
+# root-only and read by systemd before privileges are dropped.
 EnvironmentFile=-/etc/kingres/kingresd.env
-Environment=KINGRES_PG_BIN_DIR=/opt/kingres/bin
 Environment=PATH=/opt/kingres/bin:/usr/bin:/bin
 ExecStart=/opt/kingres/bin/kingresd -config /etc/kingres/kingresd.json
-Restart=on-failure
-RestartSec=5s
-# A PostgreSQL instance needs time to checkpoint on a clean stop; after this it
-# is killed and crash recovery repairs it at the next start.
+ExecStop=/opt/kingres/bin/kingresd -config /etc/kingres/kingresd.json -stop-instances
+# Only the main process is signalled: the database must not be killed with the
+# manager.  ExecStop has already stopped it when the unit is stopped for real.
+KillMode=process
+Restart=always
+RestartSec=3s
+# A fast shutdown of PostgreSQL checkpoints first; after this the unit gives up
+# and crash recovery repairs the instance at the next start.
 TimeoutStopSec=120s
 LimitNOFILE=65536
+# PostgreSQL creates one process per connection and workers: a generous but
+# finite bound.
+TasksMax=16384
+# Under memory pressure prefer to kill other services before the database
+# (a moderate value: the unit is not exempt, and backends inherit it).
+OOMScoreAdjust=-100
 
-# Directories.  /run/kingres is for the instances' Unix sockets; /var/lib/kingres
-# (created by the package) is the only place the service may write.
-RuntimeDirectory=kingres
+# Directories.  /run/kingres/1 holds the Unix socket of instance 1 (kingresd does
+# not create the per-instance directory itself when it starts an existing
+# instance, so the unit creates it) and survives a
+# restart of the unit (the instance keeps running); /var/lib/kingres (created
+# by the package) is the only other place the service may write.
+RuntimeDirectory=kingres kingres/1
 RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=restart
 ReadWritePaths=/var/lib/kingres
 
-# Sandboxing.  Everything here was chosen so that PostgreSQL still works:
-# no MemoryDenyWriteExecute (extensions and future JIT map executable memory),
-# no PrivateNetwork (clients connect over TCP), no ProtectProc, and a system
-# call filter of the generic "system-service" set, which includes the SysV and
-# POSIX IPC and the memory calls PostgreSQL uses.
+# Sandboxing.  Chosen so that PostgreSQL (initdb, pg_ctl, postgres and its
+# workers) still works: no MemoryDenyWriteExecute (extensions map executable
+# memory), no PrivateNetwork (clients connect over TCP), no ProtectProc, no
+# PrivateIPC (System V shared memory of the postmaster must stay visible), and
+# a system call filter of the generic "system-service" set.  PrivateTmp is safe
+# because sockets live in /run/kingres, never in /tmp.  PrivateDevices still
+# provides /dev/shm for PostgreSQL's dynamic shared memory.
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=

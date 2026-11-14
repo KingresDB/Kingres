@@ -39,3 +39,6 @@ summary() {
     printf '\n%s passed, %s failed\n' "${passed}" "${failed}"
     [ "${failed}" -eq 0 ]
 }
+
+pass() { printf 'PASS  %s\n' "$1"; passed=$((passed + 1)); }
+fail() { printf 'FAIL  %s\n' "$1"; failed=$((failed + 1)); }

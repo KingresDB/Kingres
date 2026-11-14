@@ -36,6 +36,8 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 . "${here}/lib.sh"
+# shellcheck source=flow.sh
+. "${here}/flow.sh"
 
 context=""
 port=58001
@@ -92,7 +94,7 @@ echo "image size: $(docker image inspect "${tag}" --format '{{.Size}}') bytes"
 
 # ------------------------------------------------------------------- run
 note "starting the container"
-docker run --detach --name "${name}" --read-only --tmpfs /tmp \
+docker run --detach --name "${name}" --read-only --tmpfs /tmp --stop-timeout 120 \
     --cap-drop ALL --security-opt no-new-privileges \
     --publish "127.0.0.1:${port}:8091" --volume "${volume}:/var/lib/kingres" \
     "${tag}" >/dev/null
@@ -101,7 +103,7 @@ check_eq "container health" healthy "$(wait_healthy)"
 
 base="http://127.0.0.1:${port}"
 state="$(curl -fsS "${base}/api/v1/setup/state" || true)"
-check_eq "setup state" uninitialized "$(printf '%s' "${state}" | sed -n 's/.*"state":"\([a-z]*\)".*/\1/p')"
+check_eq "setup state" uninitialized "$(printf '%s' "${state}" | sed -n 's/^{"state":"\([a-z]*\)".*/\1/p')"
 check_eq "readiness endpoint" 200 "$(curl -s -o /dev/null -w '%{http_code}' "${base}/api/v1/readyz")"
 index="$(curl -fsS "${base}/" || true)"
 check "index page is the panel (HTML with a script)" grep -q '<script' <<<"${index}"
@@ -144,10 +146,84 @@ env_dump="$(docker image inspect "${tag}" --format '{{json .Config.Env}}')"
 check "image environment holds no password or token" bash -c '! grep -Eiq "password|secret|token=" <<<"$1"' _ "${env_dump}"
 check "image contains no setup token" bash -c '! docker run --rm --entrypoint sh "$1" -c "test -e /var/lib/kingres/setup-token"' _ "${tag}"
 
-note "graceful stop"
+# ----------------------------------------------------- the real thing: a cluster
+# The panel's port is published, so these requests reach kingresd from the
+# Docker bridge address, not from loopback: this also proves that
+# KINGRES_ALLOW_REMOTE_SETUP=true works.
+API_CURL=(curl)
+API_BASE="${base}/api/v1"
+DATA_DIR=/var/lib/kingres
+TOKEN_CMD=read_token
+read_token() { docker exec "${name}" cat /var/lib/kingres/setup-token; }
+PSQL_CMD=(docker exec -e "PGPASSWORD=${FLOW_PASSWORD}" "${name}" psql -X -h 127.0.0.1 -p 5432 -U "${FLOW_ADMIN}")
+db_up() { psql_run -d postgres -Atc 'select 1' >/dev/null 2>&1; }
+postmaster_pid() { docker exec "${name}" head -1 /var/lib/kingres/instances/1/pgdata/postmaster.pid 2>/dev/null || echo none; }
+# PIDs repeat in a fresh container, so the start time (line 3) identifies a postmaster.
+postmaster_start() { docker exec "${name}" sed -n 3p /var/lib/kingres/instances/1/pgdata/postmaster.pid 2>/dev/null || echo none; }
+volume_logs() { docker run --rm --entrypoint sh --volume "${volume}:/var/lib/kingres:ro" "${tag}" -c 'cat /var/lib/kingres/instances/1/pgdata/log/* 2>/dev/null'; }
+wait_api() { wait_for "API answers" 60 curl -fsS "${base}/api/v1/readyz"; }
+
+note "create a cluster through the API"
+flow_init_cluster image-test
+check "setup token removed after setup" bash -c '! docker exec "$1" test -e /var/lib/kingres/setup-token' _ "${name}"
+check_eq "container stays healthy" healthy "$(wait_healthy)"
+flow_login
+check_eq "instance process user id" 10001 "$(docker exec "${name}" sh -c 'ps -o uid= -C postgres | sort -u | tr -d " "')"
+check "instance socket is in the volume" docker exec "${name}" test -S /var/lib/kingres/run/1/.s.PGSQL.5432
+flow_create_data
+flow_check_data "after setup"
+pm1="$(postmaster_pid)"
+
+note "docker stop: clean shutdown within the grace period"
 start=$SECONDS
 docker stop "${name}" >/dev/null
-echo "stop time: $((SECONDS - start)) s"
+stop_time=$((SECONDS - start))
+echo "stop time: ${stop_time} s"
+check "stopped within the grace period (120 s)" test "${stop_time}" -lt 120
 check_eq "exit code after docker stop" 0 "$(docker inspect --format '{{.State.ExitCode}}' "${name}")"
+logs="$(volume_logs)"
+check "instance log: database system is shut down" grep -q 'database system is shut down' <<<"${logs}"
+check "no postmaster.pid left in the volume" bash -c '! docker run --rm --entrypoint sh --volume "$1:/v:ro" "$2" -c "test -e /v/instances/1/pgdata/postmaster.pid"' _ "${volume}" "${tag}"
+
+note "docker start: the same database comes back"
+docker start "${name}" >/dev/null
+check_eq "healthy again" healthy "$(wait_healthy)"
+wait_for "database is back" 60 db_up
+check_eq "node state: no wizard" clustered "$(curl -fsS "${base}/api/v1/setup/state" | sed -n 's/^{"state":"\([a-z]*\)".*/\1/p')"
+flow_check_api "after docker start"
+flow_check_data "after docker start"
+logs="$(volume_logs)"
+check "no crash recovery was needed" bash -c '! grep -qi "automatic recovery in progress\|not properly shut down" <<<"$1"' _ "${logs}"
+
+note "docker restart"
+pm2="$(postmaster_start)"
+start=$SECONDS
+docker restart "${name}" >/dev/null
+echo "restart time: $((SECONDS - start)) s"
+check_eq "healthy again" healthy "$(wait_healthy)"
+wait_for "database is back" 60 db_up
+check "postmaster was restarted (start time ${pm2} -> $(postmaster_start))" test "$(postmaster_start)" != "${pm2}"
+flow_check_api "after docker restart"
+flow_check_data "after docker restart"
+logs="$(volume_logs)"
+check "still no crash recovery" bash -c '! grep -qi "automatic recovery in progress\|not properly shut down" <<<"$1"' _ "${logs}"
+: "${pm1}"
+
+note "a new container on the same volume"
+docker stop "${name}" >/dev/null
+docker rm "${name}" >/dev/null
+docker run --detach --name "${name}" --read-only --tmpfs /tmp --stop-timeout 120 \
+    --cap-drop ALL --security-opt no-new-privileges \
+    --publish "127.0.0.1:${port}:8091" --volume "${volume}:/var/lib/kingres" \
+    "${tag}" >/dev/null
+check_eq "healthy" healthy "$(wait_healthy)"
+wait_for "database is back" 60 db_up
+check_eq "node state: no wizard, no new token" clustered "$(curl -fsS "${base}/api/v1/setup/state" | sed -n 's/^{"state":"\([a-z]*\)".*/\1/p')"
+flow_check_api "new container"
+flow_check_data "new container"
+logs="$(volume_logs)"
+check "no crash recovery after removing the container with the database running" \
+    bash -c '! grep -qi "automatic recovery in progress\|not properly shut down" <<<"$1"' _ "${logs}"
+docker stop "${name}" >/dev/null
 
 summary

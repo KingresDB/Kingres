@@ -1,6 +1,10 @@
 {
   "listen": "127.0.0.1:8091",
   "data-dir": "/var/lib/kingres",
+  "pg-bin-dir": "/opt/kingres/bin",
+  "socket-dir": "/run/kingres",
+  "pg-port": 5432,
+  "pg-listen": "127.0.0.1",
   "log-format": "text",
   "log-level": "info"
 }

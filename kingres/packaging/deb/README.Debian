@@ -5,7 +5,10 @@ Layout
 ------
   /opt/kingres/            the product: bin/ lib/ share/ (server, clients, kingresd)
   /etc/kingres/            kingresd.json (settings), kingresd.env (secrets, root only)
-  /var/lib/kingres/        node state, setup token, audit log, database instances
+  /var/lib/kingres/        node state, setup token, audit log, certificates (pki/),
+                           and the database instance in instances/1/pgdata
+                           (instance logs in instances/1/pgdata/log)
+  /run/kingres/            Unix sockets of the instances (/run/kingres/1)
   /usr/lib/systemd/system/kingres.service   the one service of the node
   /usr/bin/kingres-*       client programs (see below)
 
@@ -26,11 +29,33 @@ the service user and root:
 
 Open http://127.0.0.1:8091/ on the server (from another machine use an SSH
 tunnel:  ssh -L 8091:127.0.0.1:8091 server) and enter the token in the setup
-wizard.  To listen on another address edit /etc/kingres/kingresd.json and run
-"systemctl restart kingres"; use TLS when you do.
+wizard; choose "create cluster" and give the administrator account.  kingresd
+then creates the database instance, the administrator role and the system
+database, and starts the instance.
+
+Connecting to the database
+--------------------------
+The instance listens on 127.0.0.1:5432 (settings pg-port and pg-listen).  Log in
+as the administrator role created in the wizard:
+
+    kingres-psql -h 127.0.0.1 -p 5432 -U ADMIN postgres
+
+The Unix socket is /run/kingres/1/.s.PGSQL.5432, but local connections on it use
+"peer" authentication mapped to the kingresd process only, so use TCP.
+
+Restarting
+----------
+  restart only the manager (the database keeps running):
+      sudo systemctl kill --kill-whom=main --signal=SIGTERM kingres
+  restart everything, the database too:
+      sudo systemctl restart kingres
+  stop everything (the database is shut down with a fast shutdown):
+      sudo systemctl stop kingres
+After a reboot or "systemctl start" the node comes back as a cluster, without
+the wizard.
 
 Removal
 -------
-  apt remove kingres   stops the service; data and settings stay.
+  apt remove kingres   stops the service and the database; data and settings stay.
   apt purge kingres    ALSO DELETES /var/lib/kingres (all databases of this
                        node), /etc/kingres and the kingres user.
