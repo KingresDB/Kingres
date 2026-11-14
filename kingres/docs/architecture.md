@@ -6,6 +6,23 @@
 
 This document separates three kinds of statements. Statements that have a source (URL) are "documented fact". Statements marked **[Recommendation]** are the author's inferences and design decisions and have no direct source. Statements marked **[Needs verification]** are either background knowledge that was not confirmed in the research notes, or known gaps; they must be checked against code or documentation before being relied on. None of the "needs verification" items should be treated as fact. This document is not legal advice.
 
+## Where the implementation departs from this document
+
+This document is the research and the original design. Decisions taken while building are recorded as ADRs and design notes, and where they contradict a paragraph below, they win. The departures so far:
+
+| Topic | This document proposed | What was built | Record |
+|---|---|---|---|
+| Failover engine | Patroni bundled in the package, with an etcd member embedded in `kingresd` | Standby management and failover inside `kingresd`, fenced by leases granted by a majority of the cluster's servers. Neither Patroni nor etcd is shipped | [ADR 0021](adr/0021-failover-in-kingresd.md), [design/ha-phase5.md](design/ha-phase5.md) |
+| Manager leader election | Taken from etcd | The manager leader is the `kingresd` on the server that hosts the primary of the map group | [ADR 0018](adr/0018-manager-leader-follows-the-map-group-primary.md) |
+| Where cluster state is kept | Catalog tables of the map group and etcd | A system database, `kingres_system`, on the map group | [ADR 0019](adr/0019-cluster-state-in-a-system-database.md) |
+| Metrics | A bundled single-binary store (Prometheus or VictoriaMetrics) | No bundled store: `kingresd` keeps a short in-memory history for the panel's charts and exposes `/metrics` for an external Prometheus | [ADR 0020](adr/0020-no-bundled-metrics-store.md) |
+| Panel framework | React | Vue 3 | [ADR 0017](adr/0017-vue-for-the-web-panel.md) |
+| Package and unit name | `kingresdb`, `kingresdb.service` | Package `kingres`, unit `kingres.service`; client programs carry a `kingres-` prefix | [packaging/README.md](../packaging/README.md) |
+| Internal traffic between servers | Decided when needed | An internal HTTP API with mutual TLS on its own port, under a cluster certificate authority created at cluster creation | [design/control-plane-3.md](design/control-plane-3.md) |
+| Placement of standbys | Chained: every server hosts one primary and the standby of a neighbor | As proposed; details, including what a two-server cluster can and cannot do, are in the phase 5 design | [design/ha-phase5.md](design/ha-phase5.md) |
+
+Paragraphs below that mention Patroni, etcd or a bundled metrics store are kept as the record of what was considered.
+
 ## Fork and rebrand: a stable branch, a limited patch set, and a name without "Postgres"
 
 ### Branch choice and mirror mechanics
@@ -214,16 +231,16 @@ Engine data: `pg_stat_replication`, `pg_stat_wal_receiver`, `pg_replication_slot
 
 **[Recommendation]** This subsection is a design decision. The goal is the Couchbase experience: install one package on a server and that node has everything it needs; open that server's own panel to create a cluster or join one. In Couchbase, every node runs the same cluster-manager processes and the Web Console and CLI are both clients of the node's REST API (see "The Couchbase reference pattern" above); CockroachDB likewise serves its DB Console from every node.
 
-**What the package contains.** One package named `kingresdb`, built as `.deb`, `.rpm` and a Docker image (Linux first; a Windows server package is out of scope for the first releases, and development on Windows uses WSL2 or Docker):
+**What the package contains.** One package (named `kingres` as built), built as `.deb`, `.rpm` and a Docker image (Linux first; a Windows server package is out of scope for the first releases, and development on Windows uses WSL2 or Docker):
 
 - The PostgreSQL fork binaries and the `kingres_shard` and `kingres_ledger` extensions.
 - `kingresd`, one Go binary that contains the agent (instance lifecycle), the manager, the client router, the REST API, and the web panel as embedded static files. `kingres-agent` and `kingres-manager` in the architecture above are roles inside this one binary, not separate installs.
 - `kingres-cli` and the standalone ledger verifier.
-- An etcd member embedded in `kingresd`, so that no separate etcd install is needed; etcd publishes a Go package for embedding a server ([etcd embed package](https://pkg.go.dev/go.etcd.io/etcd/server/v3/embed)).
-- Patroni with its Python runtime, bundled inside the package. The alternative is to implement failover natively in the agent and drop the Python dependency; that is more work and is only worth doing if bundling Python proves to be a packaging problem.
-- A single-binary metrics store (Prometheus or VictoriaMetrics) for the panel's charts.
+- *(Not built; superseded by [ADR 0021](adr/0021-failover-in-kingresd.md).)* An etcd member embedded in `kingresd`, so that no separate etcd install is needed; etcd publishes a Go package for embedding a server ([etcd embed package](https://pkg.go.dev/go.etcd.io/etcd/server/v3/embed)).
+- *(Not built; superseded by [ADR 0021](adr/0021-failover-in-kingresd.md).)* Patroni with its Python runtime, bundled inside the package. The alternative is to implement failover natively in the agent and drop the Python dependency; that is more work and is only worth doing if bundling Python proves to be a packaging problem.
+- *(Not built; superseded by [ADR 0020](adr/0020-no-bundled-metrics-store.md).)* A single-binary metrics store (Prometheus or VictoriaMetrics) for the panel's charts.
 
-One systemd unit, `kingresdb.service`, runs `kingresd`, which starts and supervises the local PostgreSQL instances, Patroni and the metrics store. The node exposes one panel/REST port, one read-write client port and one optional read-only client port; instance, etcd and metrics ports are internal.
+One systemd unit (`kingres.service` as built) runs `kingresd`, which starts and supervises the local PostgreSQL instances. The node exposes one panel/REST port, one read-write client port and one optional read-only client port; instance, etcd and metrics ports are internal.
 
 **First run.**
 
@@ -374,7 +391,7 @@ This is the layout that was adopted when implementation started (2026-11-14); it
     control-plane/           # Go: agent, manager, client router, REST API, CLI
     web/                     # Vue 3 + TypeScript panel
     verifier/                # standalone CLI for verifying digests and proofs
-    packaging/               # the single kingresdb package: deb, rpm, Docker image, systemd unit
+    packaging/               # the single kingres package: deb, rpm, Docker image, systemd unit
     dev/                     # build and test scripts
     docs/                    # architecture.md, design/, adr/, dev/, research/, worklog.md
 ```
@@ -413,7 +430,7 @@ The table is kept as the record of the options that were considered.
 | 4 | Build environment on the developer's Windows machine | WSL2 (Ubuntu); Docker | WSL2 for daily work, Docker for CI images | Phase 0 |
 | 5 | What to build first after phase 0 | Sharding MVP; ledger; panel | Sharding MVP, following the roadmap. The ledger does not depend on sharding and can be moved earlier | Phase 1 |
 | 6 | Replica count: per database or per cluster | Per cluster, with a per-database durability level; per database, using logical replication or separate node pools | Per cluster. Physical replication copies a whole PostgreSQL instance, so a per-database count needs logical replication, which is slower and does not carry DDL | Phase 4 |
-| 7 | Failover engine | Patroni bundled in the package; failover implemented in the agent | Patroni bundled | Phase 5 |
+| 7 | Failover engine | Patroni bundled in the package; failover implemented in the agent | Patroni bundled. **Changed later:** failover is implemented in `kingresd` ([ADR 0021](adr/0021-failover-in-kingresd.md)) | Phase 5 |
 | 8 | Blockchain scope | Ledger tables and external anchoring only; also multi-node consensus | Ledger and anchoring only, unless there is a concrete consortium use case | Phase 6 |
 | 9 | First operating system for the package | Ubuntu/Debian; RHEL family | Ubuntu 24.04 LTS and Debian first | Phase 3 |
 | 10 | Panel accounts | PostgreSQL roles; a separate panel user store | PostgreSQL roles, one user list | Phase 4 |
