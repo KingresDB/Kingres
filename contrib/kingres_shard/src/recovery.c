@@ -144,7 +144,26 @@ parse_gid(const char *gid, int *origin, int *pid, uint64 *fxid)
 			break;
 		*p++ = '\0';
 	}
-	ok = (n >= 5 && strcmp(tok[0], "kingres") == 0);
+	/*
+	 * kingres_<origin>_<pid>_<full xid>_<target>[_<n>], every field a number:
+	 * a prepared transaction of a user that merely starts with "kingres_" is not
+	 * ours and is never touched (review finding S2-20).
+	 */
+	ok = ((n == 5 || n == 6) && strcmp(tok[0], "kingres") == 0);
+	{
+		int			t;
+
+		for (t = 1; ok && t < n; t++)
+		{
+			const char *c;
+
+			if (tok[t][0] == '\0')
+				ok = false;
+			for (c = tok[t]; ok && *c != '\0'; c++)
+				if (*c < '0' || *c > '9')
+					ok = false;
+		}
+	}
 	if (ok)
 	{
 		*origin = atoi(tok[1]);
@@ -155,7 +174,15 @@ parse_gid(const char *gid, int *origin, int *pid, uint64 *fxid)
 	return ok;
 }
 
-/* Does the local dtx_log hold a row for the gid? */
+/*
+ * Does the local dtx_log hold a row for the gid?
+ *
+ * The caller has already established that the origin transaction is over (see
+ * origin_decision), and the row is looked up with a snapshot taken now, after
+ * that fact, never with the snapshot that was active when recovery began: a
+ * read-only SPI call would use that older one, which cannot see a decision
+ * that became visible in between (review finding S2-01).
+ */
 static bool
 decision_logged(const char *gid)
 {
@@ -164,16 +191,45 @@ decision_logged(const char *gid)
 	bool		found;
 
 	values[0] = CStringGetTextDatum(gid);
+	PushActiveSnapshot(GetLatestSnapshot());
 	if (SPI_execute_with_args("SELECT 1 FROM " KINGRES_SHARD_SCHEMA ".dtx_log WHERE gid OPERATOR(pg_catalog.=) $1",
 							  1, argtypes, values, NULL, true, 1) != SPI_OK_SELECT)
 		elog(ERROR, "could not read kingres.dtx_log");
+	PopActiveSnapshot();
 	found = (SPI_processed > 0);
 	return found;
 }
 
+/*
+ * origin_decision
+ *
+ * THE INVARIANT OF RECOVERY.  A prepared transaction may be rolled back only
+ * if (a) the origin transaction is no longer in progress, established first,
+ * and then (b) a decision row looked up with a snapshot taken after (a) is
+ * absent.  The origin makes the row visible by committing; the commit removes
+ * its transaction id from the proc array only after the commit record is
+ * written, so a snapshot taken after (a) saw "not in progress" sees the row of
+ * a transaction that committed.  A snapshot taken before (a) may not, which is
+ * why the order is the code's structure here and not two calls a caller could
+ * swap.
+ *
+ * Returns false while the origin transaction may still be running (leave the
+ * prepared transaction alone); otherwise true and *commit says what to do.
+ */
+static bool
+origin_decision(const char *gid, uint64 fxid, int pid, bool *commit)
+{
+	/* (a) */
+	if (xid_possibly_running(fxid, pid))
+		return false;
+	/* (b), strictly after (a) */
+	*commit = decision_logged(gid);
+	return true;
+}
+
 /* Delete the rows of a node that are no longer prepared there. */
 static void
-purge_log(int node_id, TimestampTz listed_at, List *still_prepared)
+purge_log(int node_id, TimestampTz listed_at, List *still_prepared, List *listed)
 {
 	Oid			argtypes[3] = {INT4OID, TIMESTAMPTZOID, TEXTARRAYOID};
 	Datum		values[3];
@@ -194,6 +250,32 @@ purge_log(int node_id, TimestampTz listed_at, List *still_prepared)
 							  "AND NOT (gid OPERATOR(pg_catalog.=) ANY ($3))",
 							  3, argtypes, values, NULL, false, 0) != SPI_OK_DELETE)
 		elog(ERROR, "could not clean kingres.dtx_log");
+
+	/*
+	 * A decision made when the target node was not registered yet (node_id 0,
+	 * add_node) is removed when the transaction it names is gone from the node
+	 * that is now registered (S2-20).
+	 */
+	if (node_id != 0)
+	{
+		Datum	   *lelems;
+		int			ln = list_length(listed);
+		int			j = 0;
+		Oid			a2[2] = {TEXTARRAYOID, TEXTARRAYOID};
+		Datum		v2[2];
+
+		lelems = palloc(sizeof(Datum) * Max(ln, 1));
+		foreach(lc, listed)
+			lelems[j++] = CStringGetTextDatum((char *) lfirst(lc));
+		v2[0] = PointerGetDatum(construct_array_builtin(lelems, ln, TEXTOID));
+		v2[1] = values[2];
+		if (SPI_execute_with_args("DELETE FROM " KINGRES_SHARD_SCHEMA ".dtx_log "
+								  "WHERE node_id OPERATOR(pg_catalog.=) 0 "
+								  "AND gid OPERATOR(pg_catalog.=) ANY ($1) "
+								  "AND NOT (gid OPERATOR(pg_catalog.=) ANY ($2))",
+								  2, a2, v2, NULL, false, 0) != SPI_OK_DELETE)
+			elog(ERROR, "could not clean kingres.dtx_log");
+	}
 }
 
 /*
@@ -299,6 +381,14 @@ kingres_shard_recover_prepared(void)
 					(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 					 errmsg("recover_prepared_transactions() cannot run in a transaction that has operated on remote nodes")));
 
+		/* In the worker (its connections end with it), not in the session of a user whose connection is reused. */
+		if (MyBackendType == B_BG_WORKER)
+		{
+			char	   *lim = psprintf("SET statement_timeout = %d; SET lock_timeout = %d",
+									  kingres_shard_node_timeout * 1000, kingres_shard_node_timeout * 1000);
+
+			PQclear(kingres_shard_exec_params(kc, lim, 0, NULL, NULL, false));
+		}
 		listed_at = GetCurrentTimestamp();
 		params[0] = psprintf("kingres\\_%d\\_%%", origin);
 		res = kingres_shard_exec_params(kc,
@@ -334,12 +424,11 @@ kingres_shard_recover_prepared(void)
 			if (!parse_gid(gid, &g_origin, &g_pid, &fxid) || g_origin != origin)
 				continue;
 
-			if (xid_possibly_running(fxid, g_pid))
+			if (!origin_decision(gid, fxid, g_pid, &commit))
 			{
 				still_prepared = lappend(still_prepared, gid);
 				continue;
 			}
-			commit = decision_logged(gid);
 			sql = psprintf("%s PREPARED %s", commit ? "COMMIT" : "ROLLBACK",
 						   quote_literal_cstr(gid));
 			res = kingres_shard_exec_params(kc, sql, 0, NULL, NULL, false);
@@ -366,7 +455,7 @@ kingres_shard_recover_prepared(void)
 			PQclear(res);
 		}
 
-		purge_log(r->node_id, listed_at, still_prepared);
+		purge_log(r->node_id, listed_at, still_prepared, gids);
 	}
 
 	/* Rows of nodes that left the cluster have nothing left to resolve. */
@@ -492,7 +581,35 @@ launch_workers(void)
 			break;
 		}
 		if (WaitForBackgroundWorkerStartup(handle, &pid) == BGWH_STARTED)
-			(void) WaitForBackgroundWorkerShutdown(handle);
+		{
+			/*
+			 * One worker that does not finish (a node that stopped answering)
+			 * must not stall the recovery of the other databases: after a
+			 * deadline the worker is terminated and the pass goes on.
+			 */
+			TimestampTz deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+															   (int64) 5 * kingres_shard_node_timeout * 1000);
+
+			for (;;)
+			{
+				pid_t		wpid;
+
+				if (GetBackgroundWorkerPid(handle, &wpid) == BGWH_STOPPED)
+					break;
+				if (GetCurrentTimestamp() >= deadline)
+				{
+					ereport(LOG,
+							(errmsg("kingres_shard recovery: a worker did not finish in time and is terminated")));
+					TerminateBackgroundWorker(handle);
+					(void) WaitForBackgroundWorkerShutdown(handle);
+					break;
+				}
+				(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+								 500, PG_WAIT_EXTENSION);
+				ResetLatch(MyLatch);
+				CHECK_FOR_INTERRUPTS();
+			}
+		}
 	}
 	MemoryContextDelete(cxt);
 }
@@ -530,6 +647,40 @@ kingres_shard_recovery_launcher_main(Datum main_arg)
 	}
 }
 
+/*
+ * Settings of the database or of the role of the worker (ALTER DATABASE ...
+ * SET, ALTER ROLE ... SET) must not be able to make a pass fail, stall or
+ * behave differently (review finding S2-11): every setting that can is fixed
+ * here, at a level (PGC_S_OVERRIDE) that nothing stored can beat.
+ */
+static void
+fix_worker_settings(void)
+{
+	static const char *const settings[][2] = {
+		{"default_transaction_isolation", "read committed"},
+		{"default_transaction_read_only", "off"},
+		{"default_transaction_deferrable", "off"},
+		{"statement_timeout", "0"},
+		{"lock_timeout", "0"},
+		{"idle_in_transaction_session_timeout", "0"},
+		{"idle_session_timeout", "0"},
+		{"transaction_timeout", "0"},
+		{"session_replication_role", "origin"},
+		{"role", "none"},
+		{"check_function_bodies", "off"},
+		{"synchronous_commit", "on"},
+		{"kingres_shard.enable_routing", "on"},
+		{"kingres_shard.enable_distributed_scan", "off"},
+		{"search_path", "pg_catalog, kingres, pg_temp"},
+		{NULL, NULL}
+	};
+	int			i;
+
+	for (i = 0; settings[i][0] != NULL; i++)
+		(void) set_config_option(settings[i][0], settings[i][1],
+								 PGC_SUSET, PGC_S_OVERRIDE, GUC_ACTION_SET, true, 0, false);
+}
+
 void
 kingres_shard_recovery_worker_main(Datum main_arg)
 {
@@ -539,11 +690,10 @@ kingres_shard_recovery_worker_main(Datum main_arg)
 	BackgroundWorkerUnblockSignals();
 	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, 0);
 
+	/* Before the transaction starts: the isolation level and the access mode are read at its start. */
+	fix_worker_settings();
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
-	/* Names are resolved with the pinned path whatever the database default is. */
-	(void) set_config_option("search_path", "pg_catalog, kingres, pg_temp",
-							 PGC_SUSET, PGC_S_OVERRIDE, GUC_ACTION_SAVE, true, 0, false);
 	if (!RecoveryInProgress() &&
 		OidIsValid(get_extension_oid("kingres_shard", true)))
 	{

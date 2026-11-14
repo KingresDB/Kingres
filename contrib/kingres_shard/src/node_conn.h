@@ -88,6 +88,18 @@ extern void kingres_shard_conn_quiesce(KsConn *kc);
 /* The node id of the registered node at host:port, or 0. */
 extern int	kingres_shard_conn_node_id(const char *host, int port);
 
+/*
+ * Run a command on a connection and wait for its last result for at most
+ * kingres_shard.node_timeout seconds (S2-12).  Returns NULL when the wait ran
+ * out or the connection failed; the connection is then not usable.  With
+ * interruptible false (the commit and abort callbacks) the wait ignores
+ * interrupts, which is why it is bounded.
+ */
+extern PGresult *kingres_shard_bounded_exec(PGconn *conn, const char *sql, bool interruptible);
+
+/* The id add_node() is about to give the node at host:port (see forward_auth.c). */
+extern void kingres_shard_conn_expect_node(const char *host, int port, int node_id);
+
 /* Failure injection for tests (fault.c). */
 extern void kingres_shard_fault_init(void);
 extern void kingres_shard_fault_point(const char *point);

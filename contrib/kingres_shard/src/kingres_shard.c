@@ -43,6 +43,7 @@
 #include "catalog.h"
 #include "dist_scan.h"
 #include "fanout.h"
+#include "forward_auth.h"
 #include "kingres_shard.h"
 #include "node_conn.h"
 #include "planner.h"
@@ -62,6 +63,7 @@ int			kingres_shard_default_bucket_count = 128;
 bool		kingres_shard_enable_routing = true;
 bool		kingres_shard_forwarded = false;
 int			kingres_shard_node_connect_timeout = 5;
+int			kingres_shard_node_timeout = 60;
 char	   *kingres_shard_node_conninfo = NULL;
 int			kingres_shard_recovery_interval = 30;
 bool		kingres_shard_enable_distributed_scan = true;
@@ -123,6 +125,23 @@ _PG_init(void)
 							 PGC_BACKEND, GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
 
+	kingres_shard_forward_auth_init();
+
+	/*
+	 * The longest a wait on a node may last where nothing may be left waiting
+	 * (the second phase of two-phase commit, the cleanup of an aborted
+	 * transaction, the recovery worker), and the time after which the
+	 * connection to a node that does not answer at all is declared dead
+	 * (tcp_user_timeout, keepalives).  Review findings S2-11 and S2-12.
+	 */
+	DefineCustomIntVariable("kingres_shard.node_timeout",
+							"Seconds after which a node that does not answer is given up on.",
+							"Bounds COMMIT PREPARED, the cleanup of aborted transactions and every wait of the recovery worker; also the time a connection to an unresponsive node survives.",
+							&kingres_shard_node_timeout,
+							60, 1, 3600,
+							PGC_USERSET, GUC_UNIT_S,
+							NULL, NULL, NULL);
+
 	DefineCustomIntVariable("kingres_shard.node_connect_timeout",
 							"Connection timeout between nodes.",
 							NULL,
@@ -133,7 +152,7 @@ _PG_init(void)
 
 	/*
 	 * Appended to every node-to-node connection string (sslmode, sslcert,
-	 * sslkey, sslrootcert, ...).  Superusers only: it can name key files.
+	 * sslkey, sslrootcert, ...).  Server configuration only (postgresql.conf, ALTER SYSTEM; PGC_SIGHUP): a value set per role or per database would be stored in pg_db_role_setting, which every role can read (review finding S2-16).  It can name key files.
 	 * The keywords the extension controls are rejected when it is set, and
 	 * the value never appears in the messages of the extension.
 	 */
@@ -142,7 +161,7 @@ _PG_init(void)
 							   "A libpq connection string such as \"sslmode=verify-full sslrootcert=...\"; host, port, dbname, user, password and options are not allowed.",
 							   &kingres_shard_node_conninfo,
 							   "",
-							   PGC_SUSET, GUC_SUPERUSER_ONLY,
+							   PGC_SIGHUP, GUC_SUPERUSER_ONLY,
 							   kingres_shard_check_node_conninfo, NULL, NULL);
 
 	DefineCustomIntVariable("kingres_shard.recovery_interval",

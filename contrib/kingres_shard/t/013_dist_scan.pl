@@ -178,7 +178,7 @@ $c->compare('LIMIT without ORDER BY returns only existing rows',
 $c->compare('a second statement after a LIMIT in one transaction',
 	"BEGIN;\nSELECT count(*) FROM (SELECT * FROM public.t1 LIMIT 2) s;\nSELECT count(*), sum(n) FROM public.t1;\nSELECT count(*) FROM (SELECT * FROM public.t1 WHERE g = 1 LIMIT 3) s;\nSELECT count(*) FROM public.t2;\nCOMMIT;");
 $c->compare('a plain-SQL function expanded into the statement',
-	"CREATE FUNCTION public.sql_rows(p int) RETURNS SETOF int LANGUAGE sql STABLE AS 'SELECT id FROM public.t1 WHERE g = p';\nSELECT count(*) FROM public.sql_rows(4);");
+	"CREATE OR REPLACE FUNCTION public.sql_rows(p int) RETURNS SETOF int LANGUAGE sql STABLE AS 'SELECT id FROM public.t1 WHERE g = p';\nSELECT count(*) FROM public.sql_rows(4);");
 
 # EXPLAIN on the cluster only.
 {

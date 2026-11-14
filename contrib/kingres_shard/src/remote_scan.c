@@ -40,6 +40,7 @@
  */
 #include "postgres.h"
 
+#include "access/parallel.h"
 #include "access/xact.h"
 #include "catalog/pg_type_d.h"
 #include "commands/explain.h"
@@ -317,6 +318,12 @@ ks_begin_scan(CustomScanState *node, EState *estate, int eflags)
 
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return;
+
+	if (IsParallelWorker())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a statement for another shard group cannot run in a parallel worker"),
+				 errhint("Mark the function that runs the statement PARALLEL RESTRICTED or PARALLEL UNSAFE.")));
 
 	if (s->deferred)
 		ereport(ERROR,

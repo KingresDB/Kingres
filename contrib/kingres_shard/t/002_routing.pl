@@ -500,7 +500,8 @@ sub rowcount
 	# A forwarded session is one that was opened as such: the flag is fixed at
 	# connection time (kingres_shard.forwarded cannot be set afterwards).
 	{
-		local $ENV{PGOPTIONS} = '-c kingres_shard.forwarded=on';
+		my $tok = $n2->safe_psql('postgres', 'SELECT kingres.internal_forward_token(current_user, 2)');
+		local $ENV{PGOPTIONS} = "-c kingres_shard.forwarded=on -c kingres_shard.forward_token=$tok";
 		($rc, $out, $err) = run_sql($n2,
 			"\\set VERBOSITY verbose\nSELECT * FROM public.kv WHERE id = $k;");
 		like($err, qr/ERROR:\s+KS001: bucket $b of public\.kv is not on this node \(stale map version \d+\)/,

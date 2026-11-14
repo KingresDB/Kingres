@@ -146,7 +146,8 @@ sub is_super
 	# A session that was opened as forwarded never runs what it cannot place.
 	my $kl = $keys{1}[0];    # local on node 2
 	my $kr = $keys{0}[0];    # not on node 2
-	local $ENV{PGOPTIONS} = '-c kingres_shard.forwarded=on';
+	my $tok = $n2->safe_psql('postgres', 'SELECT kingres.internal_forward_token(current_user, 2)');
+	local $ENV{PGOPTIONS} = "-c kingres_shard.forwarded=on -c kingres_shard.forward_token=$tok";
 	for my $case (
 		[ 'a statement without a key', "SELECT * FROM public.kv" ],
 		[ 'an aggregate without a key', "SELECT count(*) FROM public.kv" ],

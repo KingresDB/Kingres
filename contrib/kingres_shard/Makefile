@@ -13,6 +13,7 @@ OBJS = \
 	src/dist_table.o \
 	src/fanout.o \
 	src/fault.o \
+	src/forward_auth.o \
 	src/hashing.o \
 	src/kingres_shard.o \
 	src/node_admin.o \

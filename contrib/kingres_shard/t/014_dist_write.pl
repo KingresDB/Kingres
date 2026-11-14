@@ -146,7 +146,7 @@ is($c->on_cluster('SELECT md5(string_agg(t::text, \',\' ORDER BY id)) FROM publi
 	check_state('with the constraint');
 	# A key of the last group (node 3): the groups before it have applied the change when it fails.
 	my ($k) = keys_of_group($nodes[0], 1, 2, 1, 1);
-	$c->compare_dml('a failure on the last group', "UPDATE public.t1 SET n = n + 1, v = 'changed' || (CASE WHEN id = $k THEN 1/0 ELSE 0 END)::text",
+	$c->compare_dml('a failure on the last group', "UPDATE public.t1 SET n = n + 1, g = g + (CASE WHEN id = $k THEN 1/0 ELSE 0 END)",
 		expect_error => qr/division by zero/, single_fails => 1);
 	check_state('after the failed UPDATE');
 	is(prepared_count($_), '0', "nothing is prepared on $_->name") for @nodes;
@@ -193,7 +193,8 @@ is($c->on_cluster('SELECT md5(string_agg(t::text, \',\' ORDER BY id)) FROM publi
 {
 	my $psql = sub {
 		my ($sql) = @_;
-		local $ENV{PGOPTIONS} = '-c kingres_shard.forwarded=on';
+		my $tok = $nodes[1]->safe_psql('postgres', 'SELECT kingres.internal_forward_token(current_user, 2)');
+		local $ENV{PGOPTIONS} = "-c kingres_shard.forwarded=on -c kingres_shard.forward_token=$tok";
 		return run_sql($nodes[1], $sql);
 	};
 	my ($rc, $out, $err) = $psql->('UPDATE public.t1 SET n = 0');

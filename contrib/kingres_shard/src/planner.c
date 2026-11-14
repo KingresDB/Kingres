@@ -62,13 +62,16 @@
 #include "access/hash.h"
 #include "access/xact.h"
 #include "commands/extension.h"
+#include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/params.h"
 #include "nodes/pathnodes.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/planner.h"
+#include "parser/parse_relation.h"
 #include "parser/parsetree.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
@@ -78,6 +81,7 @@
 #include "catalog.h"
 #include "dist_scan.h"
 #include "fanout.h"
+#include "forward_auth.h"
 #include "hashing.h"
 #include "kingres_shard.h"
 #include "node_conn.h"
@@ -463,6 +467,33 @@ error_spans_groups(DistRef *ref, const char *detail)
 }
 
 /*
+ * kingres_shard_refuse_view_owner
+ *
+ * PostgreSQL checks the rights on the table of a view with the owner of the
+ * view (the range table entry carries it in checkAsUser), unless the view is a
+ * security_invoker view.  A fragment that is run on another node runs as the
+ * role of the session, so the owner's rights would be lost there: the case is
+ * refused with a clear message instead of failing with a permission error on
+ * the other node or, worse, running with the wrong rights (review finding
+ * S2-15).  Called wherever work is sent to another node.
+ */
+void
+kingres_shard_refuse_view_owner(Query *q, RangeTblEntry *rte)
+{
+	Oid			owner = InvalidOid;
+
+	if (rte->perminfoindex > 0)
+		owner = getRTEPermissionInfo(q->rteperminfos, rte)->checkAsUser;
+	if (OidIsValid(owner) && owner != GetUserId())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("distributed table \"%s\" is read through a view owned by role \"%s\" and the statement needs another shard group",
+						get_rel_name(rte->relid), GetUserNameFromId(owner, false)),
+				 errdetail("The rights on the table are those of the owner of the view, and a statement run on another node uses the rights of the session role."),
+				 errhint("Create the view WITH (security_invoker = true), or run the statement as the owner of the view.")));
+}
+
+/*
  * error_write_spans_groups
  *
  * An UPDATE or DELETE that spans shard groups and cannot be run group by group.
@@ -521,6 +552,7 @@ plan_distributed_write(Query *parse, DistRef *ref, const KsCatalog *cat, List *r
 		!kingres_shard_stmt_shippable(parse, ref->dt->relid, &reason))
 		error_write_spans_groups(parse, ref,
 								 reason ? psprintf("The statement is not shippable: %s.", reason) : NULL);
+	kingres_shard_refuse_view_owner(ref->query, rt_fetch(ref->rti, ref->query->rtable));
 	if (IsInParallelMode())
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -563,7 +595,7 @@ plan_distributed_write(Query *parse, DistRef *ref, const KsCatalog *cat, List *r
 	}
 
 	sql = psprintf("%s%s", KS_WRITE_MARKER, deparse_for_remote(parse));
-	return kingres_shard_make_fanout_plan(parse, sql, targets, true, relids);
+	return kingres_shard_make_fanout_plan(parse, sql, targets, true, relids, NIL);
 }
 
 /*
@@ -649,7 +681,7 @@ check_plan_dist_rtes(PlannedStmt *pstmt, int expected)
 	if (found <= expected)
 		return;
 
-	if (kingres_shard_forwarded)
+	if (kingres_shard_session_forwarded())
 		ereport(ERROR,
 				(errcode(ERRCODE_KINGRES_STALE_MAP),
 				 errmsg("cannot prove that the statement touches only buckets of this node"),
@@ -820,6 +852,59 @@ compare_nodes_by_id(const ListCell *a, const ListCell *b)
 	return na->node_id - nb->node_id;
 }
 
+/* The relations a statement reads or writes, in nested queries too. */
+static bool
+collect_relids_walker(Node *node, List **relids)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Query))
+	{
+		Query	   *q = (Query *) node;
+		ListCell   *lc;
+
+		foreach(lc, q->rtable)
+		{
+			RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+			if (rte->rtekind == RTE_RELATION)
+				*relids = list_append_unique_oid(*relids, rte->relid);
+		}
+		return query_tree_walker(q, collect_relids_walker, relids, 0);
+	}
+	return expression_tree_walker(node, collect_relids_walker, relids);
+}
+
+static int
+compare_cstrings(const ListCell *a, const ListCell *b)
+{
+	return strcmp((char *) lfirst(a), (char *) lfirst(b));
+}
+
+/*
+ * The qualified names of the reference tables a statement uses, sorted: the
+ * writers of each of them are serialized on every node (S2-06).
+ */
+static List *
+reference_lock_names(Query *parse)
+{
+	List	   *relids = NIL;
+	List	   *names = NIL;
+	ListCell   *lc;
+
+	(void) collect_relids_walker((Node *) parse, &relids);
+	foreach(lc, relids)
+	{
+		Oid			relid = lfirst_oid(lc);
+
+		names = lappend(names,
+						quote_qualified_identifier(get_namespace_name(get_rel_namespace(relid)),
+												   get_rel_name(relid)));
+	}
+	list_sort(names, compare_cstrings);
+	return names;
+}
+
 /*
  * plan_reference_write
  *
@@ -876,7 +961,8 @@ plan_reference_write(Query *parse, Oid target, const KsCatalog *cat)
 
 	sql = deparse_for_remote(parse);
 	return kingres_shard_make_fanout_plan(parse, sql, targets, false,
-										   list_make1_oid(target));
+										   list_make1_oid(target),
+										   reference_lock_names(parse));
 }
 
 /*
@@ -1060,11 +1146,14 @@ planner_hook_body(Query *parse, const char *query_string,
 	List	   *relids = NIL;
 	bool		is_write;
 
+	/* A session that claims to be forwarded must prove it before anything runs. */
+	(void) kingres_shard_session_forwarded();
+
 	/* The local part of a fanned-out statement is planned for this node only. */
 	if (kingres_shard_in_fanout_local(query_string))
 		return pass_through(parse, query_string, cursorOptions, boundParams);
 	/* The statements PostgreSQL runs for a propagated DDL work on this node's buckets. */
-	if (kingres_shard_in_authorized_ddl())
+	if (kingres_shard_in_authorized_ddl(query_string))
 		return pass_through(parse, query_string, cursorOptions, boundParams);
 	if (!kingres_shard_enable_routing || creating_extension)
 		return pass_through(parse, query_string, cursorOptions, boundParams);
@@ -1078,7 +1167,7 @@ planner_hook_body(Query *parse, const char *query_string,
 		return pass_through(parse, query_string, cursorOptions, boundParams);
 
 	/* With one shard group every bucket is local. */
-	if (cat->ngroups <= 1 && !kingres_shard_forwarded)
+	if (cat->ngroups <= 1 && !kingres_shard_session_forwarded())
 		return pass_through(parse, query_string, cursorOptions, boundParams);
 
 	memset(&a, 0, sizeof(a));
@@ -1092,7 +1181,7 @@ planner_hook_body(Query *parse, const char *query_string,
 	 * A write to a reference table runs on every node; it takes no part in the
 	 * routing by key, and it cannot be combined with a distributed table.
 	 */
-	if (a.has_ref && !kingres_shard_forwarded)
+	if (a.has_ref && !kingres_shard_session_forwarded())
 	{
 		Oid			reftarget = reference_write_target(parse, cat);
 
@@ -1114,13 +1203,13 @@ planner_hook_body(Query *parse, const char *query_string,
 		 * still find one (it expands a SQL-language function into the
 		 * statement).  The distributed scan reads such a table correctly.
 		 */
-		if (!kingres_shard_forwarded && kingres_shard_enable_distributed_scan)
+		if (!kingres_shard_session_forwarded() && kingres_shard_enable_distributed_scan)
 			return plan_with_scan(parse, query_string, cursorOptions, boundParams);
 		return plan_locally(parse, query_string, cursorOptions, boundParams,
 							cat, a.ndist_rtes);
 	}
 
-	if (kingres_shard_forwarded)
+	if (kingres_shard_session_forwarded())
 		return plan_forwarded(parse, query_string, cursorOptions, boundParams,
 							  &a, cat);
 
@@ -1263,8 +1352,16 @@ planner_hook_body(Query *parse, const char *query_string,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("shard group %d has no active primary node", group)));
 
+		foreach(lc, a.refs)
+		{
+			DistRef    *vr = (DistRef *) lfirst(lc);
+
+			kingres_shard_refuse_view_owner(vr->query, rt_fetch(vr->rti, vr->query->rtable));
+		}
+		/* A routed SELECT that calls a volatile function may write on the other node: it is a writer (S2-19). */
 		is_write = parse->commandType != CMD_SELECT || parse->rowMarks != NIL ||
-			parse->hasModifyingCTE;
+			parse->hasModifyingCTE ||
+			contain_volatile_functions((Node *) parse);
 		sql = deparse_for_remote(parse);
 		return kingres_shard_make_remote_plan(parse, sql, node->host,
 											   node->port, group, bucket,

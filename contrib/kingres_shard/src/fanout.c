@@ -34,8 +34,10 @@
  */
 #include "postgres.h"
 
+#include "access/parallel.h"
 #include "access/xact.h"
 #include "catalog/pg_type_d.h"
+#include "catalog.h"
 #include "commands/explain.h"
 #include "commands/explain_format.h"
 #include "executor/executor.h"
@@ -60,7 +62,8 @@
 #define FO_PRIV_SQL			0
 #define FO_PRIV_RETURNS		1
 #define FO_PRIV_ALL_ROWS	2
-#define FO_PRIV_TARGETS		3
+#define FO_PRIV_NLOCKS		3
+/* then the lock names, then (host, port, local) per target */
 
 /* The statement text whose local execution is in progress, or NULL. */
 static const char *fanout_local_sql = NULL;
@@ -72,6 +75,7 @@ typedef struct KsFanoutState
 	bool		returns_rows;
 	bool		all_rows;
 	List	   *targets;		/* of KsFanTarget * */
+	List	   *locknames;		/* reference tables to lock on every node first */
 	bool		done;
 	bool		counted;
 	uint64		processed;
@@ -119,7 +123,7 @@ kingres_shard_in_fanout_local(const char *query_string)
 
 PlannedStmt *
 kingres_shard_make_fanout_plan(Query *parse, char *sql, List *targets,
-								bool all_rows, List *relids)
+								bool all_rows, List *relids, List *locknames)
 {
 	bool		returns_rows = (parse->returningList != NIL);
 	List	   *private;
@@ -128,6 +132,9 @@ kingres_shard_make_fanout_plan(Query *parse, char *sql, List *targets,
 
 	private = list_make3(makeString(sql), makeInteger(returns_rows ? 1 : 0),
 						 makeInteger(all_rows ? 1 : 0));
+	private = lappend(private, makeInteger(list_length(locknames)));
+	foreach(lc, locknames)
+		private = lappend(private, makeString(pstrdup((char *) lfirst(lc))));
 	foreach(lc, targets)
 	{
 		KsFanTarget *t = (KsFanTarget *) lfirst(lc);
@@ -147,6 +154,7 @@ fo_create_scan_state(CustomScan *cscan)
 	KsFanoutState *s = palloc0(sizeof(KsFanoutState));
 	List	   *p = cscan->custom_private;
 	int			i;
+	int			nlocks;
 
 	NodeSetTag(&s->css, T_CustomScanState);
 	s->css.methods = &fo_exec_methods;
@@ -155,7 +163,10 @@ fo_create_scan_state(CustomScan *cscan)
 	s->sql = pstrdup(strVal(list_nth(p, FO_PRIV_SQL)));
 	s->returns_rows = intVal(list_nth(p, FO_PRIV_RETURNS)) != 0;
 	s->all_rows = intVal(list_nth(p, FO_PRIV_ALL_ROWS)) != 0;
-	for (i = FO_PRIV_TARGETS; i + 2 < list_length(p); i += 3)
+	nlocks = intVal(list_nth(p, FO_PRIV_NLOCKS));
+	for (i = 0; i < nlocks; i++)
+		s->locknames = lappend(s->locknames, pstrdup(strVal(list_nth(p, FO_PRIV_NLOCKS + 1 + i))));
+	for (i = FO_PRIV_NLOCKS + 1 + nlocks; i + 2 < list_length(p); i += 3)
 	{
 		KsFanTarget *t = palloc(sizeof(KsFanTarget));
 
@@ -176,6 +187,11 @@ fo_begin_scan(CustomScanState *node, EState *estate, int eflags)
 
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return;
+	if (IsParallelWorker())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a write to several nodes cannot run in a parallel worker"),
+				 errhint("Mark the function that runs the statement PARALLEL RESTRICTED or PARALLEL UNSAFE.")));
 	if (XactReadOnly)
 		ereport(ERROR,
 				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
@@ -310,6 +326,190 @@ run_local(KsFanoutState *s, ParamListInfo params, bool keep_rows)
 	return processed;
 }
 
+static int
+compare_node_ids(const ListCell *a, const ListCell *b)
+{
+	return ((KsNode *) lfirst(a))->node_id - ((KsNode *) lfirst(b))->node_id;
+}
+
+static int
+compare_names(const ListCell *a, const ListCell *b)
+{
+	return strcmp((char *) lfirst(a), (char *) lfirst(b));
+}
+
+/* The active primary nodes of the catalog, in node id order. */
+static List *
+active_primaries(const KsCatalog *cat)
+{
+	List	   *result = NIL;
+	ListCell   *lc;
+
+	foreach(lc, cat->nodes)
+	{
+		KsNode	   *n = (KsNode *) lfirst(lc);
+
+		if (n->is_active && n->is_primary)
+			result = lappend(result, n);
+	}
+	list_sort(result, compare_node_ids);
+	return result;
+}
+
+/*
+ * kingres_shard_lock_all_reference_tables
+ *
+ * For add_node() (review finding S2-07): take, on every active primary node
+ * and for every reference table, the lock that writers of the table take (see
+ * lock_reference_tables), so that the copies made on the new node include
+ * every committed write and a writer that has planned its statement with the
+ * old list of nodes waits until the registration is committed (and then finds
+ * that the list changed, see check_node_set).  Held to the end of the
+ * transaction.
+ */
+void
+kingres_shard_lock_all_reference_tables(void)
+{
+	const KsCatalog *cat = kingres_shard_catalog();
+	List	   *names = NIL;
+	List	   *nodes;
+	ListCell   *lc;
+	HASH_SEQ_STATUS scan;
+	KsDistTable *dt;
+
+	if (cat->dist_tables == NULL)
+		return;
+	hash_seq_init(&scan, cat->dist_tables);
+	while ((dt = (KsDistTable *) hash_seq_search(&scan)) != NULL)
+	{
+		if (dt->is_reference)
+			names = lappend(names,
+							quote_qualified_identifier(get_namespace_name(get_rel_namespace(dt->relid)),
+													   get_rel_name(dt->relid)));
+	}
+	if (names == NIL)
+		return;
+	list_sort(names, compare_names);
+	nodes = active_primaries(cat);
+	foreach(lc, nodes)
+	{
+		KsNode	   *n = (KsNode *) lfirst(lc);
+		ListCell   *lc2;
+
+		if (n->node_id == cat->local_node_id)
+		{
+			if (SPI_connect() != SPI_OK_CONNECT)
+				elog(ERROR, "SPI_connect failed");
+			foreach(lc2, names)
+				if (SPI_execute(kingres_shard_refwrite_lock_sql((char *) lfirst(lc2)), false, 0) != SPI_OK_SELECT)
+					elog(ERROR, "could not lock a reference table");
+			SPI_finish();
+		}
+		else
+		{
+			KsConn	   *kc = kingres_shard_get_conn(n->host, n->port, false, NULL);
+
+			kingres_shard_begin_write_xact(kc);
+			foreach(lc2, names)
+				PQclear(kingres_shard_exec(kc, kingres_shard_refwrite_lock_sql((char *) lfirst(lc2))));
+		}
+	}
+}
+
+/*
+ * After the locks of a reference-table write are held, the nodes the statement
+ * was planned for must still be the nodes of the cluster: if an add_node()
+ * committed while the statement waited, a write to the old list would miss the
+ * new node.
+ */
+static void
+check_node_set(KsFanoutState *s)
+{
+	List	   *current = active_primaries(kingres_shard_catalog());
+	ListCell   *lc;
+	bool		same = (list_length(current) == list_length(s->targets));
+
+	foreach(lc, current)
+	{
+		KsNode	   *n = (KsNode *) lfirst(lc);
+		ListCell   *lc2;
+		bool		found = false;
+
+		foreach(lc2, s->targets)
+		{
+			KsFanTarget *t = (KsFanTarget *) lfirst(lc2);
+
+			if (t->port == n->port && strcmp(t->host, n->host) == 0)
+				found = true;
+		}
+		if (!found)
+			same = false;
+	}
+	if (!same)
+		ereport(ERROR,
+				(errcode(ERRCODE_KINGRES_STALE_MAP),
+				 errmsg("the set of nodes changed while a write to a reference table waited"),
+				 errhint("Repeat the statement.")));
+}
+
+/*
+ * kingres_shard_refwrite_lock_sql
+ *
+ * The statement that makes a writer of the reference table named by the
+ * qualified name wait for the other writers of it, on the node it is sent to.
+ * An advisory transaction lock, not LOCK TABLE: LOCK TABLE in a mode that
+ * conflicts with itself needs the UPDATE, DELETE or TRUNCATE privilege, which
+ * a role that may only INSERT does not have.  Readers are never blocked.  The
+ * key is made of the name (the same on every node, unlike an OID).
+ */
+char *
+kingres_shard_refwrite_lock_sql(const char *qualified_name)
+{
+	return psprintf("SELECT pg_catalog.pg_advisory_xact_lock(%d, pg_catalog.hashtext(%s))",
+					KS_REFWRITE_LOCK_CLASS, quote_literal_cstr(qualified_name));
+}
+
+/*
+ * Serialize the writers of the reference tables a statement uses (review
+ * finding S2-06): on every target, in the order of the list (node id order),
+ * take the lock of each table in name order.  The same order everywhere makes
+ * such writers wait for each other without a deadlock, and a writer that gets
+ * all its locks runs after the commit of every earlier writer on every node,
+ * so the statement sees the same rows on each node.  The locks are held to the
+ * end of the distributed transaction.
+ */
+static void
+lock_reference_tables(KsFanoutState *s)
+{
+	ListCell   *lc;
+
+	foreach(lc, s->targets)
+	{
+		KsFanTarget *t = (KsFanTarget *) lfirst(lc);
+		ListCell   *lc2;
+
+		if (t->is_local)
+		{
+			if (SPI_connect() != SPI_OK_CONNECT)
+				elog(ERROR, "SPI_connect failed");
+			foreach(lc2, s->locknames)
+			{
+				if (SPI_execute(kingres_shard_refwrite_lock_sql((char *) lfirst(lc2)), false, 0) != SPI_OK_SELECT)
+					elog(ERROR, "could not lock a reference table");
+			}
+			SPI_finish();
+		}
+		else
+		{
+			KsConn	   *kc = kingres_shard_get_conn(t->host, t->port, false, NULL);
+
+			kingres_shard_begin_write_xact(kc);
+			foreach(lc2, s->locknames)
+				kingres_shard_exec(kc, kingres_shard_refwrite_lock_sql((char *) lfirst(lc2)));
+		}
+	}
+}
+
 static void
 run_all(KsFanoutState *s)
 {
@@ -334,6 +534,12 @@ run_all(KsFanoutState *s)
 									  "kingres_shard fanout rows",
 									  ALLOCSET_DEFAULT_SIZES);
 	MemoryContextSwitchTo(old);
+
+	if (s->locknames != NIL)
+	{
+		lock_reference_tables(s);
+		check_node_set(s);
+	}
 
 	foreach(lc, s->targets)
 	{

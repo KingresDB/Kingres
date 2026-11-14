@@ -40,6 +40,7 @@
 #include "catalog.h"
 #include "kingres_shard.h"
 #include "dist_table.h"
+#include "fanout.h"
 #include "node_admin.h"
 #include "node_conn.h"
 #include "remote_scan.h"
@@ -204,14 +205,77 @@ kingres_shard_sync_catalog_internal(void)
 }
 
 /*
+ * push_secret
+ *
+ * Install the cluster secret on the node of kc, in the remote transaction that
+ * commits with the local one.  The value is an argument of a statement, which
+ * a server may log with its arguments: the session is told not to
+ * (log_parameter_max_length = 0 for this transaction), so the secret reaches no
+ * log.
+ */
+static void
+push_secret(KsConn *kc)
+{
+	unsigned char secret[128];
+	int			len = 0;
+	char		hex[2 * sizeof(secret) + 1];
+	const char *params[1];
+	PGresult   *res;
+
+	if (!kingres_shard_cluster_secret(secret, sizeof(secret), &len))
+		return;
+	(void) hex_encode((const char *) secret, len, hex);
+	hex[2 * len] = '\0';
+	params[0] = hex;
+	kingres_shard_begin_write_xact(kc);
+	res = kingres_shard_exec(kc, "SET LOCAL log_parameter_max_length = 0");
+	PQclear(res);
+	res = kingres_shard_exec_params(kc,
+									 "SELECT " KINGRES_SHARD_SCHEMA ".internal_apply_secret($1::pg_catalog.text)",
+									 1, NULL, params, true);
+	PQclear(res);
+	explicit_bzero(secret, sizeof(secret));
+	explicit_bzero(hex, sizeof(hex));
+}
+
+/*
  * kingres.sync_catalog() returns void
  *
- * Push the catalog of the map group primary to every active node.
+ * Push the catalog of the map group primary to every active node, and the
+ * cluster secret with it (made first if this node has none: the step that
+ * secures a cluster upgraded from 0.1).
  */
 Datum
 kingres_sync_catalog(PG_FUNCTION_ARGS)
 {
+	const KsCatalog *cat;
+	ListCell   *lc;
+	List	   *targets = NIL;
+
+	kingres_shard_lock_catalog();
+	kingres_shard_require_map_group();
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	spi_run("SELECT " KINGRES_SHARD_SCHEMA ".internal_ensure_secret()", SPI_OK_SELECT, 0, NULL, NULL);
+	SPI_finish();
+
 	kingres_shard_sync_catalog_internal();
+
+	cat = kingres_shard_catalog();
+	foreach(lc, cat->nodes)
+	{
+		KsNode	   *n = (KsNode *) lfirst(lc);
+
+		if (n->node_id == cat->local_node_id || !n->is_active || !n->is_primary)
+			continue;
+		targets = lappend(targets, n);
+	}
+	foreach(lc, targets)
+	{
+		KsNode	   *n = (KsNode *) lfirst(lc);
+
+		push_secret(kingres_shard_get_conn(n->host, n->port, false, NULL));
+	}
 	PG_RETURN_VOID();
 }
 
@@ -300,6 +364,12 @@ record_pending_node(const char *host, int port)
 	const char *params[2];
 	char		portstr[16];
 	PGresult   *res;
+
+	if (!OidIsValid(kingres_shard_catalog_relid("pending_node")))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 errmsg("the table kingres.pending_node does not exist"),
+				 errhint("Run ALTER EXTENSION kingres_shard UPDATE.")));
 
 	if (self == NULL)
 		return;
@@ -421,6 +491,15 @@ kingres_add_node(PG_FUNCTION_ARGS)
 	spi_run("SELECT coalesce(max(node_id), 0) + 1 FROM " KINGRES_SHARD_SCHEMA ".node",
 			SPI_OK_SELECT, 0, NULL, NULL);
 	node_id = spi_first_int(1);
+	kingres_shard_conn_expect_node(host, port, node_id);
+
+	/*
+	 * Writers of the reference tables must neither miss the rows copied to the
+	 * new node nor write to a list of nodes without it (review finding S2-07):
+	 * take their lock on every existing node until this transaction ends.
+	 */
+	if (is_primary)
+		kingres_shard_lock_all_reference_tables();
 
 	/*
 	 * Prepare the remote node before touching the local catalog, so that an
@@ -444,6 +523,66 @@ kingres_add_node(PG_FUNCTION_ARGS)
 					 errmsg("node %s:%d already belongs to a cluster", host, port)));
 		}
 		PQclear(res);
+		/*
+		 * The nodes must agree on the encoding, the default collation and its
+		 * library version, and run the same version of the extension: shipped
+		 * comparisons assume it (review finding S2-20).
+		 */
+		{
+			static const char *const idq =
+				"SELECT COALESCE(d.datcollate, '') OPERATOR(pg_catalog.||) '/' OPERATOR(pg_catalog.||) "
+				"COALESCE(d.datctype, '') OPERATOR(pg_catalog.||) '/' OPERATOR(pg_catalog.||) "
+				"d.datlocprovider::pg_catalog.text OPERATOR(pg_catalog.||) '/' OPERATOR(pg_catalog.||) "
+				"COALESCE(d.datcollversion, '') "
+				"FROM pg_catalog.pg_database d WHERE d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database()";
+			static const char *const encq =
+				"SELECT pg_catalog.pg_encoding_to_char(d.encoding) FROM pg_catalog.pg_database d "
+				"WHERE d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database()";
+			static const char *const verq =
+				"SELECT COALESCE((SELECT e.extversion FROM pg_catalog.pg_extension e "
+				"WHERE e.extname OPERATOR(pg_catalog.=) 'kingres_shard'), '')";
+			char	   *remote_id;
+			char	   *local_id;
+			char	   *remote_ver;
+			char	   *local_ver;
+			char	   *remote_enc;
+			char	   *local_enc;
+
+			res = kingres_shard_exec(kc, idq);
+			remote_id = pstrdup(PQgetvalue(res, 0, 0));
+			PQclear(res);
+			res = kingres_shard_exec(kc, encq);
+			remote_enc = pstrdup(PQgetvalue(res, 0, 0));
+			PQclear(res);
+			res = kingres_shard_exec(kc, verq);
+			remote_ver = pstrdup(PQgetvalue(res, 0, 0));
+			PQclear(res);
+			spi_run(idq, SPI_OK_SELECT, 0, NULL, NULL);
+			local_id = pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
+			spi_run(encq, SPI_OK_SELECT, 0, NULL, NULL);
+			local_enc = pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
+			spi_run(verq, SPI_OK_SELECT, 0, NULL, NULL);
+			local_ver = pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
+			if (strcmp(remote_ver, local_ver) != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("node %s:%d has kingres_shard version \"%s\", this node has \"%s\"",
+								host, port, remote_ver, local_ver),
+						 errhint("Run ALTER EXTENSION kingres_shard UPDATE on the node, or DROP EXTENSION kingres_shard there, before add_node().")));
+			if (strcmp(remote_id, local_id) != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("node %s:%d differs from this node in default collation or its library version",
+								host, port),
+						 errdetail("This node: %s; the new node: %s (datcollate, datctype, provider, collation version).",
+								   local_id, remote_id),
+						 errhint("Create the database of the new node with the same encoding and collation as this one.")));
+			if (strcmp(remote_enc, local_enc) != 0)
+				ereport(WARNING,
+						(errmsg("node %s:%d has database encoding %s, this node has %s",
+								host, port, remote_enc, local_enc),
+						 errdetail("Statements are converted between the encodings, but comparisons of text outside ASCII can differ between nodes.")));
+		}
 	}
 
 	argtypes[0] = INT4OID;
@@ -473,6 +612,8 @@ kingres_add_node(PG_FUNCTION_ARGS)
 	}
 
 	kingres_shard_sync_catalog_internal();
+	if (is_primary)
+		push_secret(kc);
 
 	PG_RETURN_INT32(node_id);
 }

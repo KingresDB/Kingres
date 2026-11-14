@@ -474,3 +474,54 @@ of `sslcert`, `sslkey`, `sslrootcert`, `sslcrl`, `sslcrldir`, `sslpassword`,
 `postgresql.conf` in full when the file is reloaded; the README says so. `sslmode`
 and the other SSL options apply to TCP connections only (libpq ignores them on Unix
 sockets), which the test accounts for.
+
+## Fix round for the review of 2026-11-14 (S2-01 to S2-20), implementation notes
+
+Written during the fix round of `reviews/2026-11-14-kingres-shard-0.2.md`. These notes
+override the text above where they differ.
+
+**Recovery (S2-01, S2-02).** The invariant: a prepared transaction is rolled back only if
+(a) the origin transaction is established as no longer in progress, and then (b) a lookup of
+its decision row with a snapshot taken after (a) finds nothing. `recovery.c` has one
+function, `origin_decision()`, that performs (a) then (b); (b) pushes
+`GetLatestSnapshot()` around its SPI call, because a read-only SPI call uses the snapshot
+that was active when the statement (or the worker's transaction) began. A stress test runs
+two recoveries at once against concurrent multi-node commits (it lost 128 participants
+before the fix, far more often than the review's estimate). The other reads of the path
+were examined: the listing of prepared transactions needs no snapshot ordering (a
+transaction prepared after it is simply not listed; the purge removes only rows older than
+the listing); two recoveries at once decide the same way from the same facts, and a
+`COMMIT PREPARED` or `ROLLBACK PREPARED` of a transaction the other run resolved fails
+with "does not exist", which is ignored; the decision row of a gid is deleted only after
+its prepared transaction is gone. `log_decision()` calls `ForceSyncCommit()` so the commit
+that carries the decision rows is flushed before any `COMMIT PREPARED`.
+
+**Pushdown (S2-03, S2-05).** `shippable.c` no longer ships `CoerceViaIO`; the walker refuses
+system columns, `LIMIT`/`OFFSET`, `DISTINCT ON`, `TABLESAMPLE`, window functions,
+order-sensitive aggregates and an `UPDATE ... FROM` not matched through a unique key, in
+one place (`query_ok`, `ship_walker`, `agg_order_sensitive`, `matches_at_most_one`). The
+harness `KingresShardCompare.pm` repeats every `compare()` under four session profiles.
+
+**Reference writes (S2-06, S2-07).** Writers serialize with advisory transaction locks
+`(KS_REFWRITE_LOCK_CLASS, hashtext(qualified name))`, taken on every node in node-id order
+and table-name order (LOCK TABLE ... SHARE ROW EXCLUSIVE would need UPDATE/DELETE/TRUNCATE).
+After the locks are held the statement checks that the node set is unchanged;
+`add_node()` takes the same locks first.
+
+**Forwarded sessions (S2-04).** `forward_auth.c`: `kingres.cluster_secret`, the token
+`HMAC-SHA-256(secret, "kingres-forward-v1" NUL role NUL target node id)` sent as the
+connection option `kingres_shard.forward_token` (rewritten to `<hidden>` by its check hook),
+verified at the first statement with catalog snapshots only (a transaction snapshot taken
+there would break `SET TRANSACTION ISOLATION LEVEL`). `add_node()` tells the connection layer
+the id the new node will get. A node without a secret accepts the claim (bootstrap and
+rolling upgrade); `sync_catalog()` makes and distributes the secret.
+
+**Parallel (S2-08).** Routed statements for local buckets still plan and run in workers
+(they only read local partitions); the scan path sets `consider_parallel = false` on the
+relation and every path that sends work to another node refuses in a worker.
+
+**Other fixes.** S2-11/12: `kingres_shard.node_timeout`, `kingres_shard_bounded_exec()` for
+every wait that cannot throw, a per-database deadline in the launcher, fixed worker settings.
+S2-13: `change_partition_owners()`. S2-14: three separate counters in `utility.c`; only the
+foreign-key validation join (`SELECT fk.`) is planned without routing. S2-15: refused, not
+emulated (`kingres_shard_refuse_view_owner`). S2-16: `PGC_SIGHUP`, no `sslpassword`.

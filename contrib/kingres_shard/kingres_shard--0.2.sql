@@ -413,6 +413,7 @@ DELETE FROM kingres.local_node;
 DELETE FROM kingres.bucket_map;
 DELETE FROM kingres.dist_table;
 DELETE FROM kingres.colocation;
+DELETE FROM kingres.cluster_secret;
 DELETE FROM kingres.node;
 UPDATE kingres.map_version SET version = 0;
 $$;
@@ -439,6 +440,7 @@ BEGIN
     INSERT INTO kingres.node (node_id, group_id, host, port, role)
         VALUES (1, 0, host, port, 'primary');
     INSERT INTO kingres.local_node VALUES (1);
+    PERFORM kingres.internal_ensure_secret();
 END;
 $$;
 
@@ -878,3 +880,60 @@ GRANT USAGE ON SCHEMA kingres TO PUBLIC;
 GRANT SELECT ON kingres.node, kingres.colocation, kingres.dist_table,
     kingres.bucket_map, kingres.map_version, kingres.local_node,
     kingres.nodes, kingres.buckets TO PUBLIC;
+
+-- ---------------------------------------------------------------------------
+-- The cluster secret (review finding S2-04)
+-- ---------------------------------------------------------------------------
+
+-- Single-row table: the random value from which the nodes derive the tokens
+-- that prove a node-to-node session (src/forward_auth.c).  Made by
+-- init_cluster(), copied to a new node by add_node() and by sync_catalog(),
+-- never part of the catalog snapshot.  No role has any privilege on it: the
+-- extension's C code reads it with the heap API.
+CREATE TABLE kingres.cluster_secret (
+    secret bytea NOT NULL,
+    CONSTRAINT cluster_secret_length_check CHECK (pg_catalog.length(secret) >= 32)
+);
+CREATE UNIQUE INDEX cluster_secret_single_row_idx ON kingres.cluster_secret ((true));
+REVOKE ALL ON kingres.cluster_secret FROM PUBLIC;
+
+COMMENT ON TABLE kingres.cluster_secret IS
+    'The cluster secret behind the tokens of node-to-node sessions; no privilege is granted on it to anyone';
+
+-- Make the secret if this node has none.
+CREATE FUNCTION kingres.internal_ensure_secret()
+    RETURNS pg_catalog.void
+    LANGUAGE sql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+INSERT INTO kingres.cluster_secret
+SELECT pg_catalog.decode(pg_catalog.replace(pg_catalog.gen_random_uuid()::pg_catalog.text
+                                            OPERATOR(pg_catalog.||)
+                                            pg_catalog.gen_random_uuid()::pg_catalog.text,
+                                            '-', ''), 'hex')
+ WHERE NOT EXISTS (SELECT 1 FROM kingres.cluster_secret);
+$$;
+
+-- Install the secret of the cluster on this node (the hex form of its bytes).
+CREATE FUNCTION kingres.internal_apply_secret(secret_hex pg_catalog.text)
+    RETURNS pg_catalog.void
+    LANGUAGE sql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DELETE FROM kingres.cluster_secret;
+INSERT INTO kingres.cluster_secret VALUES (pg_catalog.decode(secret_hex, 'hex'));
+$$;
+
+-- The token this node would accept from a session of the role on the node with
+-- that id; for the tests of the rule, superusers only.
+CREATE FUNCTION kingres.internal_forward_token(role_name text, node_id int)
+    RETURNS text
+    AS 'MODULE_PATHNAME', 'kingres_internal_forward_token'
+    LANGUAGE C STRICT STABLE
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+REVOKE ALL ON FUNCTION
+    kingres.internal_ensure_secret(),
+    kingres.internal_apply_secret(text),
+    kingres.internal_forward_token(text, int)
+    FROM PUBLIC;

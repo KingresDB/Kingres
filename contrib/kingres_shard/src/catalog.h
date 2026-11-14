@@ -76,6 +76,8 @@ typedef struct KsCatalog
 
 extern void kingres_shard_catalog_init(void);
 extern const KsCatalog *kingres_shard_catalog(void);
+extern bool kingres_shard_cluster_secret(unsigned char *buf, int bufsize, int *len);
+extern int kingres_shard_local_node_id_raw(void);
 extern void kingres_shard_catalog_invalidate(void);
 extern const KsDistTable *kingres_shard_lookup_dist_table(Oid relid);
 extern const KsColocation *kingres_shard_lookup_colocation(int colocation_id);

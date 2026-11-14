@@ -66,6 +66,7 @@
 #include "catalog/indexing.h"
 #include "commands/dbcommands.h"
 #include "libpq/libpq-be-fe-helpers.h"
+#include "storage/latch.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
@@ -78,6 +79,7 @@
 #include "utils/wait_classes.h"
 
 #include "catalog.h"
+#include "forward_auth.h"
 #include "kingres_shard.h"
 #include "node_conn.h"
 
@@ -103,7 +105,7 @@ static HTAB *conn_hash = NULL;
 static const char *const forbidden_conninfo_keys[] = {
 	"host", "hostaddr", "port", "dbname", "user", "password", "options",
 	"service", "client_encoding", "application_name", "connect_timeout",
-	"replication", NULL
+	"replication", "sslpassword", NULL
 };
 
 /*
@@ -280,6 +282,50 @@ kingres_shard_scrub_conn_error(const char *msg)
 	return result;
 }
 
+/* The nodes that add_node() is about to register: their ids are not in the catalog yet. */
+#define KS_MAX_EXPECTED 4
+static struct
+{
+	char		host[KS_CONN_HOST_LEN];
+	int			port;
+	int			node_id;
+} expected_nodes[KS_MAX_EXPECTED];
+static int	nexpected = 0;
+
+void
+kingres_shard_conn_expect_node(const char *host, int port, int node_id)
+{
+	int			i;
+
+	for (i = 0; i < nexpected; i++)
+		if (expected_nodes[i].port == port && strcmp(expected_nodes[i].host, host) == 0)
+			break;
+	if (i == nexpected)
+	{
+		if (nexpected == KS_MAX_EXPECTED)
+			i = --nexpected;
+		nexpected++;
+	}
+	strlcpy(expected_nodes[i].host, host, sizeof(expected_nodes[i].host));
+	expected_nodes[i].port = port;
+	expected_nodes[i].node_id = node_id;
+}
+
+/* The id of the node a connection goes to, as the node knows itself. */
+static int
+target_node_id(const char *host, int port)
+{
+	int			id = kingres_shard_conn_node_id(host, port);
+	int			i;
+
+	if (id != 0)
+		return id;
+	for (i = 0; i < nexpected; i++)
+		if (expected_nodes[i].port == port && strcmp(expected_nodes[i].host, host) == 0)
+			return expected_nodes[i].node_id;
+	return 0;
+}
+
 /*
  * connect_to_node
  *
@@ -293,13 +339,27 @@ connect_to_node(const char *host, int port, const char *user, char **errmsg_out)
 	const char *values[64];
 	char		portstr[16];
 	char		timeoutstr[16];
+	char		keepidlestr[16];
+	char		keepintstr[16];
+	char		usertimeoutstr[32];
 	PGconn	   *conn;
 	int			n = 0;
 	PQconninfoOption *extra = NULL;
+	char	   *token;
+	char	   *options;
 
 	snprintf(portstr, sizeof(portstr), "%d", port);
 	snprintf(timeoutstr, sizeof(timeoutstr), "%d",
 			 kingres_shard_node_connect_timeout);
+
+	/*
+	 * A node that stops answering without closing the connection (a partition,
+	 * a stopped machine) is found out by the keepalives and by the limit on
+	 * unacknowledged data, within kingres_shard.node_timeout (S2-12).
+	 */
+	snprintf(keepidlestr, sizeof(keepidlestr), "%d", Max(kingres_shard_node_timeout / 3, 1));
+	snprintf(keepintstr, sizeof(keepintstr), "%d", Max(kingres_shard_node_timeout / 6, 1));
+	snprintf(usertimeoutstr, sizeof(usertimeoutstr), "%d", kingres_shard_node_timeout * 1000);
 
 	keywords[n] = "host";
 	values[n++] = host;
@@ -311,15 +371,33 @@ connect_to_node(const char *host, int port, const char *user, char **errmsg_out)
 	values[n++] = user;
 	keywords[n] = "connect_timeout";
 	values[n++] = timeoutstr;
+	keywords[n] = "keepalives";
+	values[n++] = "1";
+	keywords[n] = "keepalives_idle";
+	values[n++] = keepidlestr;
+	keywords[n] = "keepalives_interval";
+	values[n++] = keepintstr;
+	keywords[n] = "keepalives_count";
+	values[n++] = "3";
+	keywords[n] = "tcp_user_timeout";
+	values[n++] = usertimeoutstr;
 	keywords[n] = "application_name";
 	values[n++] = "kingres_shard";
 	keywords[n] = "client_encoding";
 	values[n++] = GetDatabaseEncodingName();
+	/*
+	 * The token proves to the other node that this session comes from a node
+	 * of the cluster (forward_auth.c): it is made for this role and for the id
+	 * of the node that receives it.
+	 */
+	token = kingres_shard_forward_token(user, target_node_id(host, port));
+	options = psprintf("-c kingres_shard.forwarded=on%s%s -c DateStyle=ISO,MDY "
+					   "-c IntervalStyle=postgres -c extra_float_digits=3 "
+					   "-c standard_conforming_strings=on -c bytea_output=hex "
+					   "-c search_path=pg_catalog",
+					   token ? " -c kingres_shard.forward_token=" : "", token ? token : "");
 	keywords[n] = "options";
-	values[n++] = "-c kingres_shard.forwarded=on -c DateStyle=ISO,MDY "
-		"-c IntervalStyle=postgres -c extra_float_digits=3 "
-		"-c standard_conforming_strings=on -c bytea_output=hex "
-		"-c search_path=pg_catalog";
+	values[n++] = options;
 
 	/*
 	 * The administrator's connection options (sslmode, sslcert, ...) come
@@ -354,6 +432,8 @@ connect_to_node(const char *host, int port, const char *user, char **errmsg_out)
 	values[n] = NULL;
 
 	conn = PQconnectdbParams(keywords, values, false);
+	if (token != NULL)
+		explicit_bzero(options, strlen(options));
 	if (extra != NULL)
 		PQconninfoFree(extra);
 	if (conn == NULL || PQstatus(conn) != CONNECTION_OK)
@@ -718,6 +798,84 @@ kingres_shard_reset_transmission_modes(int nestlevel)
 	AtEOXact_GUC(true, nestlevel);
 }
 
+/* Ask the node to stop what it is doing; the answer is not awaited. */
+static bool
+PQcancel_best_effort(PGconn *conn)
+{
+	PGcancel   *cancel = PQgetCancel(conn);
+	char		errbuf[256];
+	bool		ok;
+
+	if (cancel == NULL)
+		return false;
+	ok = PQcancel(cancel, errbuf, sizeof(errbuf)) != 0;
+	PQfreeCancel(cancel);
+	return ok;
+}
+
+/*
+ * kingres_shard_bounded_exec
+ *
+ * PQexec without the unbounded wait: send the command, then wait on the latch
+ * and the socket until the result is complete or kingres_shard.node_timeout
+ * seconds have passed.  On a timeout the running command is cancelled
+ * (best effort) and NULL is returned; the caller closes the connection.
+ */
+PGresult *
+kingres_shard_bounded_exec(PGconn *conn, const char *sql, bool interruptible)
+{
+	TimestampTz deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+													   (int64) kingres_shard_node_timeout * 1000);
+	PGresult   *last = NULL;
+
+	if (conn == NULL || PQstatus(conn) != CONNECTION_OK || !PQsendQuery(conn, sql))
+		return NULL;
+	for (;;)
+	{
+		PGresult   *res;
+
+		while (PQisBusy(conn))
+		{
+			long		secs;
+			int			usecs;
+			long		ms;
+			int			rc;
+
+			TimestampDifference(GetCurrentTimestamp(), deadline, &secs, &usecs);
+			ms = secs * 1000L + usecs / 1000;
+			if (GetCurrentTimestamp() >= deadline || ms <= 0)
+			{
+				(void) PQcancel_best_effort(conn);
+				PQclear(last);
+				return NULL;
+			}
+			rc = WaitLatchOrSocket(MyLatch,
+								   WL_LATCH_SET | WL_SOCKET_READABLE | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+								   PQsocket(conn), Min(ms, 1000L), PG_WAIT_EXTENSION);
+			if (rc & WL_LATCH_SET)
+			{
+				ResetLatch(MyLatch);
+				if (interruptible)
+					CHECK_FOR_INTERRUPTS();
+			}
+			if (!PQconsumeInput(conn))
+			{
+				PQclear(last);
+				return NULL;
+			}
+		}
+		res = PQgetResult(conn);
+		if (res == NULL)
+			break;
+		PQclear(last);
+		last = res;
+		if (PQresultStatus(res) == PGRES_COPY_IN || PQresultStatus(res) == PGRES_COPY_OUT ||
+			PQresultStatus(res) == PGRES_COPY_BOTH)
+			break;
+	}
+	return last;
+}
+
 /*
  * exec_internal
  *
@@ -969,7 +1127,7 @@ abort_connection(KsConn *kc)
 		PGresult   *res;
 
 		snprintf(sql, sizeof(sql), "ROLLBACK PREPARED '%s'", kc->gid);
-		res = PQexec(kc->conn, sql);
+		res = kingres_shard_bounded_exec(kc->conn, sql, false);
 		if (res == NULL || PQresultStatus(res) != PGRES_COMMAND_OK)
 		{
 			ereport(WARNING,
@@ -985,7 +1143,7 @@ abort_connection(KsConn *kc)
 	}
 	else if (PQtransactionStatus(kc->conn) != PQTRANS_IDLE)
 	{
-		PGresult   *res = PQexec(kc->conn, "ROLLBACK TRANSACTION");
+		PGresult   *res = kingres_shard_bounded_exec(kc->conn, "ROLLBACK TRANSACTION", false);
 
 		if (res == NULL || PQresultStatus(res) != PGRES_COMMAND_OK)
 		{
@@ -1073,6 +1231,15 @@ log_decision(void)
 				(errcode(ERRCODE_UNDEFINED_TABLE),
 				 errmsg("the table kingres.dtx_log does not exist"),
 				 errhint("Run ALTER EXTENSION kingres_shard UPDATE.")));
+	/*
+	 * The participants commit as soon as this transaction has, and their
+	 * COMMIT PREPARED is always flushed: the local commit record, which makes
+	 * the rows below durable, must be flushed first whatever
+	 * synchronous_commit says (review finding S2-02).  This also makes the
+	 * commit wait for synchronous standbys.
+	 */
+	ForceSyncCommit();
+
 	/* The unique-index check of the insert needs a snapshot. */
 	PushActiveSnapshot(GetTransactionSnapshot());
 	rel = table_open(relid, RowExclusiveLock);
@@ -1135,13 +1302,27 @@ precommit(bool parallel)
 			continue;
 		if (kc->xact_depth > 1)
 			elog(ERROR, "unexpected nested remote transaction at commit");
-		if (use_2pc && kc->wrote)
+		if (kc->wrote)
 			continue;
 		exec_internal(kc, "COMMIT TRANSACTION");
 		reset_xact_state(kc);
 	}
 	if (!use_2pc)
+	{
+		/*
+		 * The one writer is committed after every reader: if a reader's commit
+		 * fails, the client gets an error and nothing is durable (S2-19).
+		 */
+		hash_seq_init(&scan, conn_hash);
+		while ((kc = (KsConn *) hash_seq_search(&scan)) != NULL)
+		{
+			if (kc->xact_depth <= 0 || !kc->wrote)
+				continue;
+			exec_internal(kc, "COMMIT TRANSACTION");
+			reset_xact_state(kc);
+		}
 		return;
+	}
 
 	/* The global transaction id needs the local transaction id. */
 	(void) GetTopTransactionId();
@@ -1236,7 +1417,7 @@ postcommit(void)
 			continue;
 		}
 		snprintf(sql, sizeof(sql), "COMMIT PREPARED '%s'", kc->gid);
-		res = PQexec(kc->conn, sql);
+		res = kingres_shard_bounded_exec(kc->conn, sql, false);
 		if (res == NULL || PQresultStatus(res) != PGRES_COMMAND_OK)
 		{
 			ereport(WARNING,
@@ -1361,14 +1542,14 @@ conn_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 				continue;
 			}
 			snprintf(sql, sizeof(sql), "ROLLBACK TO SAVEPOINT s%d", curlevel);
-			res = PQexec(kc->conn, sql);
+			res = kingres_shard_bounded_exec(kc->conn, sql, false);
 			if (res == NULL || PQresultStatus(res) != PGRES_COMMAND_OK)
 				kc->have_error = true;
 			PQclear(res);
 			if (!kc->have_error)
 			{
 				snprintf(sql, sizeof(sql), "RELEASE SAVEPOINT s%d", curlevel);
-				res = PQexec(kc->conn, sql);
+				res = kingres_shard_bounded_exec(kc->conn, sql, false);
 				if (res == NULL || PQresultStatus(res) != PGRES_COMMAND_OK)
 					kc->have_error = true;
 				PQclear(res);

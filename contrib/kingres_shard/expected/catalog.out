@@ -4,9 +4,10 @@ SELECT c.relname
   FROM pg_class c
   WHERE c.relnamespace = 'kingres'::regnamespace AND c.relkind = 'r'
   ORDER BY 1;
-   relname    
---------------
+    relname     
+----------------
  bucket_map
+ cluster_secret
  colocation
  dist_table
  dtx_log
@@ -14,33 +15,34 @@ SELECT c.relname
  map_version
  node
  pending_node
-(8 rows)
+(9 rows)
 
 SELECT conrelid::regclass AS tbl, conname, contype
   FROM pg_constraint
   WHERE connamespace = 'kingres'::regnamespace AND contype <> 'n'
   ORDER BY 1::text, 2;
-     tbl      |            conname            | contype 
---------------+-------------------------------+---------
- bucket_map   | bucket_map_bucket_check       | c
- bucket_map   | bucket_map_colocation_id_fkey | f
- bucket_map   | bucket_map_group_id_check     | c
- bucket_map   | bucket_map_pkey               | p
- bucket_map   | bucket_map_state_check        | c
- colocation   | colocation_bucket_count_check | c
- colocation   | colocation_pkey               | p
- dist_table   | dist_table_colocation_id_fkey | f
- dist_table   | dist_table_method_check       | c
- dist_table   | dist_table_pkey               | p
- dist_table   | dist_table_shape_check        | c
- dtx_log      | dtx_log_pkey                  | p
- node         | node_group_id_check           | c
- node         | node_host_port_key            | u
- node         | node_pkey                     | p
- node         | node_port_check               | c
- node         | node_role_check               | c
- pending_node | pending_node_pkey             | p
-(18 rows)
+      tbl       |            conname            | contype 
+----------------+-------------------------------+---------
+ bucket_map     | bucket_map_bucket_check       | c
+ bucket_map     | bucket_map_colocation_id_fkey | f
+ bucket_map     | bucket_map_group_id_check     | c
+ bucket_map     | bucket_map_pkey               | p
+ bucket_map     | bucket_map_state_check        | c
+ cluster_secret | cluster_secret_length_check   | c
+ colocation     | colocation_bucket_count_check | c
+ colocation     | colocation_pkey               | p
+ dist_table     | dist_table_colocation_id_fkey | f
+ dist_table     | dist_table_method_check       | c
+ dist_table     | dist_table_pkey               | p
+ dist_table     | dist_table_shape_check        | c
+ dtx_log        | dtx_log_pkey                  | p
+ node           | node_group_id_check           | c
+ node           | node_host_port_key            | u
+ node           | node_pkey                     | p
+ node           | node_port_check               | c
+ node           | node_role_check               | c
+ pending_node   | pending_node_pkey             | p
+(19 rows)
 
 -- Nothing is created outside the kingres schema.
 SELECT count(*) AS tables_outside_kingres
@@ -174,10 +176,11 @@ SELECT name, setting, unit, context
  kingres_shard.fault_injection         |         |      | superuser
  kingres_shard.forwarded               | off     |      | backend
  kingres_shard.node_connect_timeout    | 5       | s    | user
- kingres_shard.node_conninfo           |         |      | superuser
+ kingres_shard.node_conninfo           |         |      | sighup
+ kingres_shard.node_timeout            | 60      | s    | user
  kingres_shard.recovery_interval       | 0       | s    | sighup
  kingres_shard.scan_fetch_size         | 1000    |      | user
-(9 rows)
+(10 rows)
 
 SET kingres_shard.default_bucket_count = 0;
 ERROR:  0 is outside the valid range for parameter "kingres_shard.default_bucket_count" (1 .. 4096)

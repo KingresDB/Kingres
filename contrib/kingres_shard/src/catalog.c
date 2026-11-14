@@ -197,6 +197,91 @@ catscan_end(CatScan *cs)
 }
 
 /*
+ * kingres_shard_cluster_secret
+ *
+ * Read the cluster secret (review finding S2-04) into buf.  False when the
+ * table or its row does not exist.  The table is read with the heap API: no
+ * role has a privilege on it, and the caller is the extension's own code.
+ */
+bool
+kingres_shard_cluster_secret(unsigned char *buf, int bufsize, int *len)
+{
+	Oid			relid = kingres_shard_catalog_relid("cluster_secret");
+	Relation	rel;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	bool		found = false;
+
+	if (!OidIsValid(relid))
+		return false;
+	rel = table_open(relid, AccessShareLock);
+
+	/*
+	 * A catalog snapshot, not the snapshot of the transaction: the first
+	 * statement of a session is checked before anything else runs, and taking
+	 * the transaction snapshot there would make a SET TRANSACTION ISOLATION
+	 * LEVEL that follows an error.  It sees the changes of this transaction.
+	 */
+	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	tup = systable_getnext(scan);
+	if (tup != NULL)
+	{
+		bool		isnull;
+		Datum		d = heap_getattr(tup, 1, RelationGetDescr(rel), &isnull);
+
+		if (!isnull)
+		{
+			bytea	   *b = DatumGetByteaPP(d);
+			int			n = VARSIZE_ANY_EXHDR(b);
+
+			if (n > 0 && n <= bufsize)
+			{
+				memcpy(buf, VARDATA_ANY(b), n);
+				*len = n;
+				found = true;
+			}
+		}
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	return found;
+}
+
+/*
+ * kingres_shard_local_node_id_raw
+ *
+ * The id of this node, read like the cluster secret (with a catalog snapshot,
+ * without the catalog cache, so that it can run before the transaction
+ * snapshot is taken); 0 when there is none.
+ */
+int
+kingres_shard_local_node_id_raw(void)
+{
+	Oid			relid = kingres_shard_catalog_relid("local_node");
+	Relation	rel;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	int			id = 0;
+
+	if (!OidIsValid(relid))
+		return 0;
+	rel = table_open(relid, AccessShareLock);
+	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	tup = systable_getnext(scan);
+	if (tup != NULL)
+	{
+		bool		isnull;
+		Datum		d = heap_getattr(tup, 1, RelationGetDescr(rel), &isnull);
+
+		if (!isnull)
+			id = DatumGetInt32(d);
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	return id;
+}
+
+/*
  * catalog_load
  *
  * Rebuild the cache from the catalog tables.  Everything is allocated in a

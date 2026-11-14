@@ -45,6 +45,7 @@
  */
 #include "postgres.h"
 
+#include "access/parallel.h"
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/pg_type_d.h"
@@ -75,6 +76,7 @@
 #include "catalog.h"
 #include "dist_scan.h"
 #include "kingres_shard.h"
+#include "planner.h"
 #include "node_conn.h"
 #include "shippable.h"
 
@@ -291,6 +293,19 @@ ds_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	if (remote == NIL)
 		return;					/* every bucket is here: the local paths are right */
 
+	/*
+	 * From here on the relation is read through connections of this backend
+	 * and the snapshots of its remote transactions: no parallel worker may do
+	 * it (review finding S2-08), and no plan above it may be parallel.
+	 */
+	kingres_shard_refuse_view_owner(root->parse, rte);
+	if (IsParallelWorker())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("distributed table \"%s\" cannot be read from a parallel worker", get_rel_name(rte->relid)),
+				 errhint("Mark the function that runs the statement PARALLEL RESTRICTED or PARALLEL UNSAFE.")));
+	rel->consider_parallel = false;
+
 	foreach(lc, rel->pathlist)
 	{
 		Path	   *p = (Path *) lfirst(lc);
@@ -388,6 +403,27 @@ renumber_params(Node *node, ParamRenumber *ctx)
 }
 
 /*
+ * A system column of a distributed table was asked for.  In an UPDATE or
+ * DELETE ... FROM / USING a distributed table this is the row identifier
+ * (ctid) that PostgreSQL wants of every table it does not modify (S2-18).
+ */
+static void
+ds_error_system_columns(PlannerInfo *root, const char *relname)
+{
+	if (root->parse->commandType == CMD_UPDATE || root->parse->commandType == CMD_DELETE ||
+		root->parse->commandType == CMD_MERGE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("UPDATE, DELETE and MERGE that read distributed table \"%s\" (FROM, USING) are not supported in a statement that spans shard groups",
+						relname),
+				 errhint("Read the rows with a SELECT first, or restrict the statement by the distribution column.")));
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("system columns of distributed table \"%s\" are not supported in a statement that spans shard groups",
+					relname)));
+}
+
+/*
  * ds_plan_custom_path
  *
  * Build the CustomScan: its columns, the fragment that the other groups run,
@@ -435,10 +471,7 @@ ds_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			Var		   *v = (Var *) e;
 
 			if (v->varattno < 0)
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("system columns of distributed table \"%s\" are not supported in a statement that spans shard groups",
-								relname)));
+				ds_error_system_columns(root, relname);
 			scan_tlist = lappend(scan_tlist,
 								 makeTargetEntry((Expr *) copyObject(v), ++resno, NULL, false));
 			attnos = lappend_int(attnos, v->varattno);
@@ -497,10 +530,7 @@ ds_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		if (v->varno != rel->relid || v->varlevelsup != 0)
 			continue;
 		if (v->varattno < 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("system columns of distributed table \"%s\" are not supported in a statement that spans shard groups",
-							relname)));
+			ds_error_system_columns(root, relname);
 		foreach(lc2, attnos)
 			if (lfirst_int(lc2) == v->varattno)
 				have = true;
@@ -633,6 +663,28 @@ rewrite_for_scan(Node *node, ExprRewrite *ctx)
 	return expression_tree_mutator(node, rewrite_for_scan, ctx);
 }
 
+/*
+ * The batches of a scan that an error ended are libpq memory (malloc), which
+ * the memory context machinery does not know: a reset callback of the context
+ * of the query clears them (review finding S2-17); an error never reaches
+ * ExecEndNode.
+ */
+static void
+ds_reset_callback(void *arg)
+{
+	KsDistScanState *s = (KsDistScanState *) arg;
+	ListCell   *lc;
+
+	foreach(lc, s->frags)
+	{
+		DsFrag	   *f = (DsFrag *) lfirst(lc);
+
+		if (f->res != NULL)
+			PQclear(f->res);
+		f->res = NULL;
+	}
+}
+
 static void
 ds_begin_scan(CustomScanState *node, EState *estate, int eflags)
 {
@@ -642,6 +694,18 @@ ds_begin_scan(CustomScanState *node, EState *estate, int eflags)
 	int			i;
 	ExprRewrite rw;
 
+	if (IsParallelWorker())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a distributed scan cannot run in a parallel worker"),
+				 errhint("Mark the function that runs the statement PARALLEL RESTRICTED or PARALLEL UNSAFE.")));
+	{
+		MemoryContextCallback *cb = MemoryContextAlloc(estate->es_query_cxt, sizeof(MemoryContextCallback));
+
+		cb->func = ds_reset_callback;
+		cb->arg = s;
+		MemoryContextRegisterResetCallback(estate->es_query_cxt, cb);
+	}
 	s->child = ExecInitNode((Plan *) linitial(cscan->custom_plans), estate, eflags);
 	node->custom_ps = list_make1(s->child);
 
@@ -898,7 +962,7 @@ ds_stop(KsDistScanState *s, bool close_cursors)
 
 			kingres_shard_conn_quiesce(f->kc);
 			snprintf(sql, sizeof(sql), "CLOSE %s", f->cursor);
-			res = PQexec(f->kc->conn, sql);
+			res = kingres_shard_bounded_exec(f->kc->conn, sql, false);
 			PQclear(res);
 		}
 		f->declared = false;

@@ -67,6 +67,7 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_inherits.h"
 #include "commands/extension.h"
+#include "commands/tablecmds.h"
 #include "executor/spi.h"
 #include "nodes/makefuncs.h"
 #include "nodes/parsenodes.h"
@@ -74,12 +75,14 @@
 #include "storage/lockdefs.h"
 #include "tcop/cmdtag.h"
 #include "tcop/utility.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 
 #include "catalog.h"
+#include "forward_auth.h"
 #include "kingres_shard.h"
 #include "node_admin.h"
 #include "node_conn.h"
@@ -90,6 +93,28 @@ static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 PG_FUNCTION_INFO_V1(kingres_internal_ddl_authorized);
 
 /* > 0 while the hook runs a statement that it propagates or that arrived propagated. */
+/*
+ * The bypass flags are scoped to what the extension itself issues (review
+ * finding S2-14), never to the user code that runs while an authorized
+ * statement executes (a function in a CHECK constraint or an index
+ * expression, a trigger):
+ *
+ *	ddl_authorized_depth		an authorized DDL statement is executing; only
+ *								the statements PostgreSQL generates for it
+ *								(the validation join of a foreign key) are
+ *								planned without routing (planner.c)
+ *	ddl_drop_authorized			the statement that is executing was authorized
+ *								by the hook (a DROP or ALTER it runs or
+ *								propagates): the drop guard lets what it drops
+ *								go.  It is set for each statement the hook
+ *								handles and restored afterwards, so a statement
+ *								that user code runs inside it does not inherit it
+ *	ddl_internal_depth			the extension's own SPI statements (the rename
+ *								of bucket partitions) are executing, and the
+ *								hook leaves them alone
+ */
+static int	ddl_internal_depth = 0;
+static bool ddl_drop_authorized = false;
 static int	ddl_authorized_depth = 0;
 
 /*
@@ -101,7 +126,7 @@ static int	ddl_authorized_depth = 0;
 Datum
 kingres_internal_ddl_authorized(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_BOOL(ddl_authorized_depth > 0);
+	PG_RETURN_BOOL(ddl_drop_authorized);
 }
 
 /* What the hook decided about one statement. */
@@ -110,6 +135,8 @@ typedef struct UtilDecision
 	bool		propagate;		/* run on the other nodes too */
 	bool		authorize;		/* let the drop guard pass */
 	Oid			rename_relid;	/* a hash table renamed: rename its partitions */
+	Oid			owner_relid;	/* a hash table whose owner changes: change its partitions' owner too */
+	Oid			owner_role;
 } UtilDecision;
 
 static void kingres_shard_process_utility(PlannedStmt *pstmt,
@@ -283,6 +310,45 @@ check_foreign_key(Node *parsetree, const KsCatalog *cat, const KsDistTable *src,
 	}
 }
 
+/*
+ * Is the node a string constant that the date and time input functions turn
+ * into the current time or date ('now', 'today', 'tomorrow', 'yesterday',
+ * 'allballs')?  PostgreSQL evaluates it when the ALTER TABLE runs, on each node
+ * at its own moment, so the existing rows would get different values on
+ * different nodes (review finding S2-10).
+ */
+static bool
+is_special_datetime_string(Node *n)
+{
+	static const char *const special[] = {"now", "today", "tomorrow", "yesterday", "allballs", NULL};
+	A_Const    *c;
+	char	   *p;
+	int			i;
+
+	if (n == NULL || !IsA(n, A_Const))
+		return false;
+	c = (A_Const *) n;
+	if (c->isnull || nodeTag(&c->val) != T_String)
+		return false;
+	for (p = c->val.sval.sval; *p == ' '; p++)
+		;
+	for (i = 0; special[i] != NULL; i++)
+	{
+		size_t		len = strlen(special[i]);
+
+		if (pg_strncasecmp(p, special[i], len) == 0)
+		{
+			const char *rest = p + len;
+
+			while (*rest == ' ')
+				rest++;
+			if (*rest == '\0')
+				return true;
+		}
+	}
+	return false;
+}
+
 static bool
 is_serial_type(TypeName *tn)
 {
@@ -354,6 +420,9 @@ check_alter_table(AlterTableStmt *stmt, const KsCatalog *cat,
 						{
 							case CONSTR_DEFAULT:
 								/* A default is evaluated for every row on every node: it must be a constant. */
+								if (is_special_datetime_string(c->raw_expr) ||
+									(IsA(c->raw_expr, TypeCast) && is_special_datetime_string(((TypeCast *) c->raw_expr)->arg)))
+									reject((Node *) stmt, dt, false, "ADD COLUMN with a default such as 'now' or 'today' would give different values on different nodes.");
 								if (!(c->raw_expr != NULL &&
 									  (IsA(c->raw_expr, A_Const) ||
 									   (IsA(c->raw_expr, TypeCast) &&
@@ -567,6 +636,21 @@ decide(Node *parsetree, const KsCatalog *cat, UtilDecision *d)
 				check_alter_table(stmt, cat, dt, multi, &structural);
 				if (structural)
 					reject(parsetree, dt, true, NULL);
+				if (!dt->is_reference)
+				{
+					ListCell   *lcc;
+
+					foreach(lcc, stmt->cmds)
+					{
+						AlterTableCmd *oc = lfirst_node(AlterTableCmd, lcc);
+
+						if (oc->subtype == AT_ChangeOwner)
+						{
+							d->owner_relid = dt->relid;
+							d->owner_role = get_rolespec_oid(oc->newowner, false);
+						}
+					}
+				}
 				if (multi)
 				{
 					d->propagate = true;
@@ -991,6 +1075,24 @@ rename_partitions(Oid relid)
 }
 
 /*
+ * After the owner of a distributed table changed, change the owner of its
+ * bucket partitions (and their indexes) on this node: PostgreSQL does not
+ * recurse OWNER TO to partitions, and the owner of the table could otherwise
+ * not run any DDL that touches the partitions (review finding S2-13).  The
+ * statement is propagated to every node and each node runs this.
+ */
+static void
+change_partition_owners(Oid relid, Oid newowner)
+{
+	List	   *children = find_inheritance_children(relid, AccessExclusiveLock);
+	ListCell   *lc;
+
+	CommandCounterIncrement();
+	foreach(lc, children)
+		ATExecChangeOwner(lfirst_oid(lc), newowner, false, AccessExclusiveLock);
+}
+
+/*
  * Does the hook have to look at this kind of statement?  The catalog cache
  * takes a snapshot, so it must not be read for statements that never concern
  * it: BEGIN ISOLATION LEVEL ... would fail after a snapshot was taken.
@@ -1044,19 +1146,24 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 	List	   *targets = NIL;
 	char	   *text = NULL;
 	bool		authorized;
+	bool		saved_drop_authorized;
+	volatile bool internal_active = false;
+
+	/* A session that claims to be forwarded must prove it before anything runs. */
+	(void) kingres_shard_session_forwarded();
 
 	memset(&d, 0, sizeof(d));
 
 	if (kingres_shard_enable_routing && !creating_extension &&
 		statement_is_of_interest(parsetree) &&
-		ddl_authorized_depth == 0 && context != PROCESS_UTILITY_SUBCOMMAND)
+		ddl_internal_depth == 0 && context != PROCESS_UTILITY_SUBCOMMAND)
 	{
 		cat = kingres_shard_catalog();
 		if (cat->present && cat->ndist_tables > 0)
 		{
 			decide(parsetree, cat, &d);
 
-			if (d.propagate && !kingres_shard_forwarded)
+			if (d.propagate && !kingres_shard_session_forwarded())
 			{
 				const KsNode *self;
 				ListCell   *lc;
@@ -1095,6 +1202,8 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 	}
 
 	authorized = d.authorize || OidIsValid(d.rename_relid);
+	saved_drop_authorized = ddl_drop_authorized;
+	ddl_drop_authorized = authorized;
 	if (authorized)
 		ddl_authorized_depth++;
 	PG_TRY();
@@ -1106,10 +1215,19 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 			standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
 									params, queryEnv, dest, qc);
 		if (OidIsValid(d.rename_relid))
+		{
+			internal_active = true;
+			ddl_internal_depth++;
 			rename_partitions(d.rename_relid);
+		}
+		if (OidIsValid(d.owner_relid))
+			change_partition_owners(d.owner_relid, d.owner_role);
 	}
 	PG_FINALLY();
 	{
+		if (internal_active)
+			ddl_internal_depth--;
+		ddl_drop_authorized = saved_drop_authorized;
 		if (authorized)
 			ddl_authorized_depth--;
 	}
@@ -1142,7 +1260,9 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
  * not apply the routing checks to them.
  */
 bool
-kingres_shard_in_authorized_ddl(void)
+kingres_shard_in_authorized_ddl(const char *query_string)
 {
-	return ddl_authorized_depth > 0;
+	/* Only the validation join of a foreign key, which PostgreSQL generates (ri_triggers.c), not user code. */
+	return ddl_authorized_depth > 0 && query_string != NULL &&
+		strncmp(query_string, "SELECT fk.", strlen("SELECT fk.")) == 0;
 }

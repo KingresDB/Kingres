@@ -489,7 +489,9 @@ RESET debug_parallel_query;
 -- can touch is local; otherwise KS001.  The flag is set by the connection
 -- options of a forwarded session and cannot be changed later.
 -- ---------------------------------------------------------------------------
-\c -reuse-previous=on "options='-c kingres_shard.forwarded=on'"
+-- The session proves that it is forwarded with a token made from the cluster secret.
+SELECT format('options=''-c kingres_shard.forwarded=on -c kingres_shard.forward_token=%s''', kingres.internal_forward_token(current_user, 1)) AS fwd_opts \gset
+\c -reuse-previous=on :fwd_opts
 SET search_path = public;
 SHOW kingres_shard.forwarded;
  kingres_shard.forwarded 

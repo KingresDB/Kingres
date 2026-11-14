@@ -33,10 +33,19 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
+#include "access/table.h"
 #include "access/transam.h"
+#include "catalog/pg_index.h"
+#include "catalog/pg_type_d.h"
 #include "catalog/pg_collation_d.h"
 #include "catalog/pg_proc.h"
+#include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "optimizer/optimizer.h"
+#include "utils/rel.h"
+#include "utils/relcache.h"
+#include "utils/syscache.h"
 #include "utils/lsyscache.h"
 
 #include "catalog.h"
@@ -111,6 +120,154 @@ relation_ok(Oid relid, ShipCtx *ctx, Query *q, int rtindex)
 	return false;
 }
 
+/*
+ * An aggregate whose result can differ between two nodes that hold the same
+ * rows in a different physical order: the ones that build a list or pick a row
+ * in input order, and those that add floating point numbers (the sum depends
+ * on the order of the additions).
+ */
+static bool
+agg_order_sensitive(Aggref *a)
+{
+	static const char *const names[] = {
+		"array_agg", "string_agg", "json_agg", "jsonb_agg", "json_object_agg",
+		"jsonb_object_agg", "json_object_agg_unique", "jsonb_object_agg_unique",
+		"json_object_agg_strict", "jsonb_object_agg_strict",
+		"json_object_agg_unique_strict", "jsonb_object_agg_unique_strict",
+		"xmlagg", "any_value", NULL
+	};
+	char	   *name = get_func_name(a->aggfnoid);
+	ListCell   *lc;
+	int			i;
+
+	if (name != NULL)
+	{
+		for (i = 0; names[i] != NULL; i++)
+			if (strcmp(name, names[i]) == 0)
+				return true;
+	}
+	if (a->aggtype == FLOAT4OID || a->aggtype == FLOAT8OID)
+		return true;
+	foreach(lc, a->args)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		Oid			t = exprType((Node *) te->expr);
+
+		if (t == FLOAT4OID || t == FLOAT8OID)
+			return true;
+	}
+	return false;
+}
+
+/* The top-level conditions of a join tree that every result row satisfies. */
+static void
+collect_inner_quals(Node *n, List **quals)
+{
+	if (n == NULL)
+		return;
+	if (IsA(n, FromExpr))
+	{
+		FromExpr   *f = (FromExpr *) n;
+		ListCell   *lc;
+
+		if (f->quals != NULL)
+			*quals = list_concat(*quals, make_ands_implicit((Expr *) f->quals));
+		foreach(lc, f->fromlist)
+			collect_inner_quals((Node *) lfirst(lc), quals);
+	}
+	else if (IsA(n, JoinExpr))
+	{
+		JoinExpr   *j = (JoinExpr *) n;
+
+		if (j->jointype == JOIN_INNER)
+		{
+			if (j->quals != NULL)
+				*quals = list_concat(*quals, make_ands_implicit((Expr *) j->quals));
+			collect_inner_quals(j->larg, quals);
+			collect_inner_quals(j->rarg, quals);
+		}
+	}
+}
+
+/*
+ * Does the relation (range table index rti) match at most one row for each
+ * combination of the other relations, because the conditions equate all the
+ * columns of one of its unique indexes with expressions that do not use the
+ * relation itself?
+ */
+static bool
+matches_at_most_one(int rti, List *quals, Oid relid)
+{
+	Bitmapset  *cols = NULL;
+	ListCell   *lc;
+	Relation	rel;
+	List	   *indexes;
+	bool		ok = false;
+
+	foreach(lc, quals)
+	{
+		Node	   *qual = (Node *) lfirst(lc);
+		OpExpr	   *op;
+		int			side;
+
+		if (!IsA(qual, OpExpr))
+			continue;
+		op = (OpExpr *) qual;
+		if (list_length(op->args) != 2 ||
+			!op_mergejoinable(op->opno, exprType(linitial(op->args))))
+			continue;
+		for (side = 0; side < 2; side++)
+		{
+			Node	   *mine = (Node *) list_nth(op->args, side);
+			Node	   *other = (Node *) list_nth(op->args, 1 - side);
+
+			while (IsA(mine, RelabelType))
+				mine = (Node *) ((RelabelType *) mine)->arg;
+			if (IsA(mine, Var) && ((Var *) mine)->varno == (Index) rti &&
+				((Var *) mine)->varlevelsup == 0 && ((Var *) mine)->varattno > 0 &&
+				!bms_is_member(rti, pull_varnos(NULL, other)))
+				cols = bms_add_member(cols, ((Var *) mine)->varattno);
+		}
+	}
+	if (bms_is_empty(cols))
+		return false;
+
+	rel = table_open(relid, AccessShareLock);
+	indexes = RelationGetIndexList(rel);
+	foreach(lc, indexes)
+	{
+		HeapTuple	tup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(lfirst_oid(lc)));
+		Form_pg_index ix;
+		int			k;
+		bool		all = true;
+
+		if (!HeapTupleIsValid(tup))
+			continue;
+		ix = (Form_pg_index) GETSTRUCT(tup);
+		if (ix->indisunique && ix->indisvalid && ix->indimmediate &&
+			heap_attisnull(tup, Anum_pg_index_indpred, NULL) &&
+			heap_attisnull(tup, Anum_pg_index_indexprs, NULL))
+		{
+			for (k = 0; k < ix->indnkeyatts; k++)
+			{
+				if (ix->indkey.values[k] <= 0 || !bms_is_member(ix->indkey.values[k], cols))
+				{
+					all = false;
+					break;
+				}
+			}
+			if (all)
+				ok = true;
+		}
+		ReleaseSysCache(tup);
+		if (ok)
+			break;
+	}
+	list_free(indexes);
+	table_close(rel, NoLock);
+	return ok;
+}
+
 static bool
 query_ok(Query *q, ShipCtx *ctx)
 {
@@ -123,6 +280,21 @@ query_ok(Query *q, ShipCtx *ctx)
 		return fail(ctx, "it is a MERGE or a utility statement");
 	if (q->rowMarks != NIL)
 		return fail(ctx, "it has a row locking clause");
+	/*
+	 * The rule of review finding S2-05, in one place: nothing whose result can
+	 * differ between two nodes that hold the same set of rows.  LIMIT and
+	 * OFFSET (which rows come first depends on the physical order unless the
+	 * order is total, and that cannot be proved here) and DISTINCT ON (an
+	 * arbitrary row of each group) are refused outright, so are window
+	 * functions, system columns, order-sensitive aggregates, table sampling and
+	 * an UPDATE ... FROM that can match several rows to one target row.
+	 */
+	if (q->limitCount != NULL || q->limitOffset != NULL)
+		return fail(ctx, "it has LIMIT or OFFSET, which picks rows by their order");
+	if (q->hasDistinctOn)
+		return fail(ctx, "it has DISTINCT ON, which picks an arbitrary row of each group");
+	if (q->hasWindowFuncs)
+		return fail(ctx, "it has a window function, whose result can depend on the order of the rows");
 
 	foreach(lc, q->rtable)
 	{
@@ -132,6 +304,8 @@ query_ok(Query *q, ShipCtx *ctx)
 		switch (rte->rtekind)
 		{
 			case RTE_RELATION:
+				if (rte->tablesample != NULL)
+					return fail(ctx, "it samples a table at random");
 				if (!relation_ok(rte->relid, ctx, q, rtindex))
 					return fail(ctx, "it reads a table that is not a reference table");
 				break;
@@ -145,6 +319,34 @@ query_ok(Query *q, ShipCtx *ctx)
 				break;
 			default:
 				return fail(ctx, "it uses a table function or another kind of relation that cannot be shipped");
+		}
+	}
+	/*
+	 * UPDATE ... FROM (and DELETE ... USING ... RETURNING): when several rows
+	 * of the FROM relations match one target row, which of them supplies the
+	 * values is arbitrary and depends on the physical order.  Accepted only if
+	 * every FROM relation is a table matched through a unique key.
+	 */
+	if (q == ctx->top &&
+		(q->commandType == CMD_UPDATE ||
+		 (q->commandType == CMD_DELETE && q->returningList != NIL)))
+	{
+		List	   *quals = NIL;
+		int			i = 0;
+
+		collect_inner_quals((Node *) q->jointree, &quals);
+		foreach(lc, q->rtable)
+		{
+			RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+			i++;
+			if (i == q->resultRelation || !rte->inFromCl)
+				continue;
+			if (rte->rtekind == RTE_JOIN || rte->rtekind == RTE_GROUP ||
+				rte->rtekind == RTE_RESULT)
+				continue;
+			if (rte->rtekind != RTE_RELATION || !matches_at_most_one(i, quals, rte->relid))
+				return fail(ctx, "it joins a table that can match several rows to one row of the target (the one that is used is arbitrary)");
 		}
 	}
 	return query_tree_walker(q, ship_walker, ctx, 0);
@@ -161,6 +363,14 @@ ship_walker(Node *node, ShipCtx *ctx)
 		case T_Var:
 			{
 				Var		   *v = (Var *) node;
+
+				/*
+				 * A system column (ctid, xmin, tableoid and the others) names the
+				 * physical layout of one node, which differs between two nodes
+				 * holding the same rows (review finding S2-05).
+				 */
+				if (v->varattno < 0)
+					return fail(ctx, "it uses a system column, whose value depends on the physical layout of one node");
 
 				if (!ctx->statement &&
 					(v->varno != ctx->varno || v->varlevelsup != 0 || v->varattno <= 0))
@@ -240,14 +450,15 @@ ship_walker(Node *node, ShipCtx *ctx)
 			}
 
 		case T_CoerceViaIO:
-			{
-				CoerceViaIO *c = (CoerceViaIO *) node;
-
-				if (!type_ok(c->resulttype) || !collation_ok(c->resultcollid) ||
-					!type_ok(exprType((Node *) c->arg)))
-					return fail(ctx, "it converts through a type that is not built in");
-				break;
-			}
+			/*
+			 * A conversion through the text input and output functions of the
+			 * two types: those functions of date, time, interval, float, bytea
+			 * and others depend on session settings (DateStyle, IntervalStyle,
+			 * extra_float_digits, bytea_output, TimeZone), which are not the
+			 * settings of the node that receives the fragment.  postgres_fdw
+			 * refuses it too (review finding S2-03).
+			 */
+			return fail(ctx, "it converts a value through its text form, which depends on session settings");
 
 		case T_ArrayExpr:
 			{
@@ -311,6 +522,8 @@ ship_walker(Node *node, ShipCtx *ctx)
 					!collation_ok(a->aggcollid) || !collation_ok(a->inputcollid) ||
 					a->aggorder != NIL)
 					return fail(ctx, "it uses an aggregate that cannot be shipped");
+				if (agg_order_sensitive(a))
+					return fail(ctx, "it uses an aggregate whose result can depend on the order of the rows");
 				break;
 			}
 
@@ -320,6 +533,8 @@ ship_walker(Node *node, ShipCtx *ctx)
 
 				if (!ctx->statement)
 					return fail(ctx, "it has a window function");
+				/* row_number() and friends depend on the order of the rows (S2-05) */
+				return fail(ctx, "it has a window function, whose result can depend on the order of the rows");
 				if (!func_ok(w->winfnoid) || !type_ok(w->wintype) ||
 					!collation_ok(w->wincollid) || !collation_ok(w->inputcollid))
 					return fail(ctx, "it uses a window function that cannot be shipped");

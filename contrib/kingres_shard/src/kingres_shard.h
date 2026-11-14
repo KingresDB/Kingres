@@ -47,11 +47,19 @@
 /* The same for the statement of a write that is run on every shard group (fanout.c). */
 #define KS_WRITE_MARKER "/* kingres:write-fragment */ "
 
+/*
+ * The first key of the advisory transaction locks that serialize the writers of
+ * a reference table (fanout.c); the second is a hash of the qualified name.
+ * "KSRF".
+ */
+#define KS_REFWRITE_LOCK_CLASS 0x4B535246
+
 /* GUC variables (defined in kingres_shard.c). */
 extern PGDLLIMPORT int kingres_shard_default_bucket_count;
 extern PGDLLIMPORT bool kingres_shard_enable_routing;
 extern PGDLLIMPORT bool kingres_shard_forwarded;
 extern PGDLLIMPORT int kingres_shard_node_connect_timeout;
+extern PGDLLIMPORT int kingres_shard_node_timeout;
 extern PGDLLIMPORT char *kingres_shard_node_conninfo;
 extern PGDLLIMPORT int kingres_shard_recovery_interval;
 extern PGDLLIMPORT bool kingres_shard_enable_distributed_scan;
