@@ -1,0 +1,42 @@
+#!/bin/sh
+# SPDX-License-Identifier: PostgreSQL
+# Copyright (c) 2026, RooyeKhat Media Co
+#
+# kingres postrm.
+#   remove  the service is already stopped (prerm); data and settings stay.
+#   purge   deletes the data directory (all databases of this node), the
+#           settings, and the service user.  This is the standard meaning of
+#           "apt purge": a deliberate request to discard everything.
+
+set -e
+
+case "$1" in
+    remove)
+        if [ -d /run/systemd/system ]; then
+            systemctl --system daemon-reload >/dev/null || true
+        fi
+        ;;
+    purge)
+        deb-systemd-helper purge 'kingres.service' >/dev/null || true
+        deb-systemd-helper unmask 'kingres.service' >/dev/null || true
+        if [ -d /run/systemd/system ]; then
+            systemctl --system daemon-reload >/dev/null || true
+        fi
+        rm -rf /var/lib/kingres
+        rm -f /etc/kingres/kingresd.json.dpkg-* /etc/kingres/kingresd.env.dpkg-*
+        rmdir /etc/kingres 2>/dev/null || true
+        if getent passwd kingres >/dev/null; then
+            deluser --system --quiet kingres || true
+        fi
+        if getent group kingres >/dev/null; then
+            delgroup --system --quiet kingres || true
+        fi
+        ;;
+    upgrade | failed-upgrade | abort-install | abort-upgrade | disappear) ;;
+    *)
+        echo "postrm called with unknown argument '$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

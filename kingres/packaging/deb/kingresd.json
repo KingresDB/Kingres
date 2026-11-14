@@ -1,0 +1,6 @@
+{
+  "listen": "127.0.0.1:8091",
+  "data-dir": "/var/lib/kingres",
+  "log-format": "text",
+  "log-level": "info"
+}

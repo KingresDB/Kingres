@@ -1,0 +1,36 @@
+KingresDB for Debian and Ubuntu
+===============================
+
+Layout
+------
+  /opt/kingres/            the product: bin/ lib/ share/ (server, clients, kingresd)
+  /etc/kingres/            kingresd.json (settings), kingresd.env (secrets, root only)
+  /var/lib/kingres/        node state, setup token, audit log, database instances
+  /usr/lib/systemd/system/kingres.service   the one service of the node
+  /usr/bin/kingres-*       client programs (see below)
+
+Client programs are linked into /usr/bin with a "kingres-" prefix so that they
+cannot collide with the files of the distribution's postgresql-client
+packages: kingres-psql, kingres-pg_dump, kingres-pg_dumpall, kingres-pg_restore,
+kingres-pg_basebackup, kingres-pg_isready, kingres-pg_config.  The server
+programs (postgres, initdb, pg_ctl) are not on the PATH; kingresd uses them
+from /opt/kingres/bin.  Also linked: kingresd and kingres-verify.
+
+First run
+---------
+The service starts after installation in the "uninitialized" state and listens
+on 127.0.0.1:8091 only.  A one-time setup token is in a file readable only by
+the service user and root:
+
+    sudo cat /var/lib/kingres/setup-token
+
+Open http://127.0.0.1:8091/ on the server (from another machine use an SSH
+tunnel:  ssh -L 8091:127.0.0.1:8091 server) and enter the token in the setup
+wizard.  To listen on another address edit /etc/kingres/kingresd.json and run
+"systemctl restart kingres"; use TLS when you do.
+
+Removal
+-------
+  apt remove kingres   stops the service; data and settings stay.
+  apt purge kingres    ALSO DELETES /var/lib/kingres (all databases of this
+                       node), /etc/kingres and the kingres user.

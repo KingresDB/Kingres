@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: PostgreSQL
+# Copyright (c) 2026, RooyeKhat Media Co
+#
+# The one KingresDB service of a node: kingresd serves the panel and the REST
+# API and, as the control plane matures, starts and supervises the local
+# PostgreSQL instances (they are child processes of this unit and live in its
+# cgroup).  Configuration: /etc/kingres/kingresd.json and
+# /etc/kingres/kingresd.env.  Data: /var/lib/kingres.
+
+[Unit]
+Description=KingresDB node (management panel, REST API and instance manager)
+Documentation=file:///usr/share/doc/kingres/README.Debian
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kingres
+Group=kingres
+UMask=0027
+# Secrets (for example KINGRES_PG_DSN with a password) go in the env file,
+# which is root-only and read by systemd before privileges are dropped.
+EnvironmentFile=-/etc/kingres/kingresd.env
+Environment=KINGRES_PG_BIN_DIR=/opt/kingres/bin
+Environment=PATH=/opt/kingres/bin:/usr/bin:/bin
+ExecStart=/opt/kingres/bin/kingresd -config /etc/kingres/kingresd.json
+Restart=on-failure
+RestartSec=5s
+# A PostgreSQL instance needs time to checkpoint on a clean stop; after this it
+# is killed and crash recovery repairs it at the next start.
+TimeoutStopSec=120s
+LimitNOFILE=65536
+
+# Directories.  /run/kingres is for the instances' Unix sockets; /var/lib/kingres
+# (created by the package) is the only place the service may write.
+RuntimeDirectory=kingres
+RuntimeDirectoryMode=0750
+ReadWritePaths=/var/lib/kingres
+
+# Sandboxing.  Everything here was chosen so that PostgreSQL still works:
+# no MemoryDenyWriteExecute (extensions and future JIT map executable memory),
+# no PrivateNetwork (clients connect over TCP), no ProtectProc, and a system
+# call filter of the generic "system-service" set, which includes the SysV and
+# POSIX IPC and the memory calls PostgreSQL uses.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=no
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

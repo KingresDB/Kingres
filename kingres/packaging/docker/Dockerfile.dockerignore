@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: PostgreSQL
+# Copyright (c) 2026, RooyeKhat Media Co
+#
+# Build-context filter for kingres/packaging/docker/Dockerfile (BuildKit reads
+# <Dockerfile>.dockerignore).  The context is the repository root or, better,
+# a clean snapshot made by kingres/packaging/build/snapshot.sh.
+.git
+.github
+**/node_modules
+kingres/web/dist
+kingres/docs
+kingres/packaging/out
+**/*.log

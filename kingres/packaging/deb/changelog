@@ -1,0 +1,7 @@
+kingres (0.1.0-1) noble; urgency=medium
+
+  * First packaging of KingresDB: the PostgreSQL 18.7 based server with the
+    kingres_shard and kingres_ledger extensions, kingresd with the embedded
+    management panel, kingres-verify, and the kingres.service unit.
+
+ -- Mohammad Rasoul Kazemi (RooyeKhat) <rooyekhat.media@gmail.com>  Sat, 14 Nov 2026 18:43:06 +0330
