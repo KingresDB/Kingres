@@ -176,14 +176,53 @@ docker compose down --volumes
 Three nodes `kingres-1..3` (host names and container names), network
 `kingres-net`, volumes `kingres-N-data`, panels on `127.0.0.1:8091/8092/8093`
 and databases on `127.0.0.1:5432/5433/5434` (`KINGRES_PANEL_PORT_N`,
-`KINGRES_PG_PORT_N`, `KINGRES_PANEL_BIND`). The mutual-TLS port of the internal
-server-to-server API (`KINGRES_INTERNAL_LISTEN=0.0.0.0:8191`) is switched on inside
-the network and not published. **The test of this topology does not join the
-nodes into one cluster yet:** it initializes each node as an independent
-one-server cluster. `kingresd` can join servers (see
-[../control-plane/README.md](../control-plane/README.md)), and the file provides
-what joining needs (names that resolve, one network, the internal port, a volume
-per node); a join test for this topology is still to be written.
+`KINGRES_PG_PORT_N`, `KINGRES_PANEL_BIND`).
+
+### Making the three nodes one cluster
+
+Every node starts uninitialized with its own setup token. What joining needs is
+set in `compose.yaml` (see [../control-plane/README.md](../control-plane/README.md),
+"Running several servers"):
+
+| Setting | Value here | Why |
+|---|---|---|
+| `KINGRES_INTERNAL_LISTEN` | `0.0.0.0:8092` | the mutual-TLS port of the server-to-server API, **the port above the REST port** (`KINGRES_LISTEN` is `0.0.0.0:8091`): a server is known to the others by its REST address and the internal API is looked up at the next port. Not published to the host; the nodes reach it over `kingres-net`. (The file said `8191` before the join test; `kingresd` expects the port above the REST port and warns otherwise.) |
+| `KINGRES_SERVER_HOST` | `kingres-N` | the server id: its certificate names it, the other nodes and the sharding extension connect to it. It is the container host name and resolves on the network |
+| `KINGRES_PG_LISTEN` | `0.0.0.0` (image default) | the other nodes' instances connect to the database port |
+| `KINGRES_ALLOW_REMOTE_SETUP` | `true` (image default) | the setup calls reach the panel port through the published port |
+| volume `kingres-N-data` | `/var/lib/kingres` | key, certificates, instance; a node keeps its membership across `docker compose restart` and `stop`/`start` |
+
+There are two ways to make a node a member (both are in `test/test-compose.sh`):
+
+1. **The cluster adds the node** (`addServer`). On kingres-1, signed in as
+   `kingres_ops` or better, with the setup token of the new node and the
+   SHA-256 fingerprint of the new node's self-signed internal certificate in
+   `X-Kingres-Pin-Sha256` (it is in the log line "internal API bootstrap
+   certificate" and is the SHA-256 of `/var/lib/kingres/pki/bootstrap.crt`):
+   ```
+   POST http://127.0.0.1:8091/api/v1/servers
+   {"address":"kingres-2:8091","setupToken":"<token of kingres-2>"}
+   ```
+   The answer is the task `server.add` (`GET /tasks/{id}`).
+2. **The node joins** (`joinCluster`). On the new node, with its own setup
+   token, the address of any member, the administrator of the cluster and the
+   fingerprint of the member's cluster certificate (`pki/server.crt` of
+   kingres-1) pinned:
+   ```
+   POST http://127.0.0.1:8093/api/v1/setup/join-cluster
+   {"existingNodeAddress":"kingres-1:8091","admin":{"username":"...","password":"..."},
+    "dataPaths":{"dataDirectory":"/var/lib/kingres"},"memoryQuota":{"totalMegabytes":1024}}
+   ```
+   Progress is `setupTask` of `GET /setup/state` on the new node. A wrong pin
+   leaves the node uninitialized with `setupTask.state = failed` and the same
+   setup token.
+
+A session is held in the memory of the server that issued it: a bearer token
+of one node is not used on another, sign in on each node (same administrator).
+DDL of a sharded database (`create table`) runs on kingres-1, the map group
+primary; the table is distributed through the API (any node), and rows can be
+written and read on any node (one row per `INSERT`: a statement that spans
+shard groups is not supported yet).
 
 ## Debian package
 
@@ -340,12 +379,13 @@ Overridden, with the reason in `deb/lintian-overrides`: `dir-or-file-in-opt`
 
 ```
 test/test-image.sh   [--port 58001]            # build the image, run it, full cluster flow
-test/test-compose.sh [--port-base 58100]       # three nodes, each its own cluster
+test/test-compose.sh [--port-base 58100]       # three nodes joined into one cluster
 test/test-deb.sh --deb FILE --work WORK        # install ... purge under systemd
 ```
 
 All three build from a clean snapshot of `HEAD` plus the working-tree
-`kingres/packaging` (`--context DIR` overrides). `test/flow.sh` is the shared
+`kingres/packaging` (`--context DIR` overrides; `test-compose.sh --rev REV` takes
+another commit). `test/flow.sh` is the shared
 "real thing": it creates a cluster through the REST API with the setup token
 (`POST /setup/init-cluster`, polling `/setup/state`), signs in, creates a role and
 a database with sharding and the ledger, creates two tables with `psql`,
@@ -376,10 +416,28 @@ after every restart.
   on the same volume, each with the same data and no crash recovery; no secrets
   in the image.
 - **`test-compose.sh`**: three nodes healthy and uninitialized on their ports;
-  three different tokens; names resolve; each node becomes its own cluster (node 1
-  with the full flow); database ports published to loopback; a database login
-  across the network is refused (no access rule yet); `docker compose stop`
-  (clean) and `start` bring the data back without crash recovery.
+  three different tokens; the fingerprint in the log is the SHA-256 of
+  `pki/bootstrap.crt`. Then one cluster of three servers, through the REST API
+  only: kingres-1 is initialized (the full flow of `flow.sh`, with a role, a
+  sharded database with the ledger and rows); kingres-2 is added by
+  `addServer` on kingres-1 and kingres-3 joins by `joinCluster`, both with the
+  certificate fingerprint pinned (a join with a wrong pin is refused first and
+  leaves the node uninitialized with the same setup token). Checks: `listServers`
+  on every node shows three healthy servers (`live` or `pendingRebalance`), one
+  manager leader, the pin recorded; the administrator signs in on every node (a
+  session is per server: the token of kingres-1 is only reported on the others);
+  the role, the database and the distributed table of kingres-1 exist on the new
+  servers; a sharded database `mesh` created through kingres-2 is ready on all
+  three; a table created on kingres-1, distributed through kingres-3, written
+  row by row on kingres-3, counted on all three; `docker compose restart` of
+  kingres-2 (a follower) and, separately, a stop with rows written on kingres-3
+  meanwhile (a row whose bucket is on the stopped server is refused, the others
+  must be there after the start); stop and start of all nodes (exit code 0, data
+  back, no crash recovery); ports bound to loopback; tear down. Two checks are
+  *known failures* (`KNOWN` in the output, not counted as failed; see
+  `check_known` in `lib.sh`): a follower answers `sharding.bucketCount: null`, and a
+  stopped follower stays listed as healthy (no heartbeat yet). `--keep` leaves
+  the nodes running for a look.
 
 ## Facts about `kingresd` the packaging depends on
 
@@ -399,7 +457,9 @@ Verified by the tests against the commit built:
    socket by default (PostgreSQL's compiled-in default is `/tmp`, and the socket is
    in `/run/kingres/1`); administrators connect over TCP (see above). Local socket
    logins are peer-authenticated for `kingresd`'s OS user only.
-6. The compose test does not exercise joining yet (see "Development cluster").
+6. A cluster of the three compose nodes forms through `addServer` and `joinCluster` with
+   pinned fingerprints (see "Development cluster"); the internal API must be on the port
+   above the REST port.
 7. `systemctl restart` restarts the database too (by design of `ExecStop`); the
    manager-only restart is a signal.
 
@@ -407,7 +467,8 @@ Verified by the tests against the commit built:
 
 - **No Patroni, no etcd, no metrics store** (decided: they arrive with the
   high-availability phase; `kingresd` exposes Prometheus-format metrics itself).
-- Joining nodes (the compose file prepares the topology), `kingres-cli`.
+- `kingres-cli`; removing or leaving servers, rebalancing and failover in the compose test
+  (not written; `kingresd` has no heartbeat or failover yet).
 - RPM, arm64, Windows; package signing and an apt repository; image signing and
   publishing; SBOM; debug symbols package (`-dbgsym`); a `kingres-dev` package;
   man pages beyond one-page stubs; the licences of every compiled-in Go and npm
@@ -427,6 +488,10 @@ later commits that add joining to `kingresd` (`ce970614b3` for the image and
 compose tests, `2668e604d9` for the package): the image and compose counts were
 the same, and the package test gave 156 checks passed, 0 failed.
 
+The join test of the compose topology was run twice in a row from a clean state on commit
+`a35bf950e3` plus the working-tree `kingres/packaging`: 138 passed, 0 failed, 2 known
+failures each time; `test-image.sh` on the same commit: 79 passed, 0 failed.
+
 | Measurement | Value |
 |---|---|
 | Release recipe, warm Go/npm caches, 24 cores | 28 s |
@@ -437,13 +502,13 @@ the same, and the package test gave 156 checks passed, 0 failed.
 | `docker stop` of a running cluster | 2 s; `docker restart` 1 s |
 | Package test (install to purge) | 77 s |
 | Image test (build included) | 180 s |
-| Compose test | 27 s (images cached) |
+| Compose test (single-node-clusters version) | 27 s (images cached) |
 
 | Check | Result |
 |---|---|
 | `test/test-deb.sh` (clean ubuntu:24.04, systemd) | 150 checks passed, 0 failed |
 | `test/test-image.sh` | 79 passed, 0 failed |
-| `test/test-compose.sh` | 58 passed, 0 failed |
+| `test/test-compose.sh` (three nodes joined into one cluster; two known failures) | 138 passed, 0 failed, 2 known failures (two runs in a row) |
 | `lintian --fail-on error` (2.117) | 0 errors, 0 warnings; 140 information tags (listed above, plus two spelling false positives in `postgres`) |
 | `shellcheck -x -P SCRIPTDIR` on every script | clean |
 | `actionlint` 1.7.12 (with shellcheck) on `ci.yml` | clean; **the workflow was not executed on GitHub** |

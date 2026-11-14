@@ -5,10 +5,14 @@
 # names, one published panel port and one volume each.  The nodes start
 # uninitialized, each with its own setup token (read them with ./tokens.sh).
 #
-# Each node starts uninitialized.  Create a cluster in the panel of one node
-# and join the others from their own panels, or make each its own one-server
-# cluster.  The test of this file (test/test-compose.sh) does the latter; a
-# join test is still to be written.
+# Each node starts uninitialized.  Create a cluster on one node (panel or
+# setup API) and make the others members of it, either from the cluster
+# (addServer) or from the new node (joinCluster); test/test-compose.sh does
+# both through the REST API with the certificate fingerprints pinned.  What
+# joining needs is set below: the mutual-TLS internal API on the port above the
+# REST port (8092), the host name of each node as its server id (it must
+# resolve, from every other node, to that node on the shared network), a
+# database listening on all addresses and one volume per node.
 #
 # Usage (from this directory):
 #   docker compose up --build -d     build the image (clean snapshot advised,
@@ -32,15 +36,19 @@
 
 name: kingres-dev
 
+x-node-environment: &node-environment
+  # The mutual-TLS port of the server-to-server API, used when nodes are
+  # joined into one cluster.  It must be the port above the REST port
+  # (KINGRES_LISTEN, 8091): a server is known to the others by its REST
+  # address and its internal API is looked up at the next port.  It is not
+  # published to the host.
+  KINGRES_INTERNAL_LISTEN: "0.0.0.0:8092"
+
 x-node: &node
   image: ${KINGRES_IMAGE:-kingres:dev}
   restart: unless-stopped
   # "docker stop" shuts the database down first (entrypoint.sh): allow it time.
   stop_grace_period: 120s
-  environment:
-    # The mutual-TLS port of the server-to-server API, used when nodes are
-    # joined into one cluster.  It is not published to the host.
-    KINGRES_INTERNAL_LISTEN: "0.0.0.0:8191"
   pull_policy: never    # the image is built by kingres-1 (or already present)
   read_only: true
   tmpfs:
@@ -61,6 +69,12 @@ services:
     pull_policy: build
     container_name: kingres-1
     hostname: kingres-1
+    environment:
+      <<: *node-environment
+      # The server id: its certificate names it and the other nodes connect to
+      # it by this name (the host name of the container, which must resolve to
+      # this node from every other node).
+      KINGRES_SERVER_HOST: kingres-1
     ports:
       - "${KINGRES_PANEL_BIND:-127.0.0.1}:${KINGRES_PANEL_PORT_1:-8091}:8091"
       - "${KINGRES_PANEL_BIND:-127.0.0.1}:${KINGRES_PG_PORT_1:-5432}:5432"
@@ -71,6 +85,12 @@ services:
     <<: *node
     container_name: kingres-2
     hostname: kingres-2
+    environment:
+      <<: *node-environment
+      # The server id: its certificate names it and the other nodes connect to
+      # it by this name (the host name of the container, which must resolve to
+      # this node from every other node).
+      KINGRES_SERVER_HOST: kingres-2
     ports:
       - "${KINGRES_PANEL_BIND:-127.0.0.1}:${KINGRES_PANEL_PORT_2:-8092}:8091"
       - "${KINGRES_PANEL_BIND:-127.0.0.1}:${KINGRES_PG_PORT_2:-5433}:5432"
@@ -81,6 +101,12 @@ services:
     <<: *node
     container_name: kingres-3
     hostname: kingres-3
+    environment:
+      <<: *node-environment
+      # The server id: its certificate names it and the other nodes connect to
+      # it by this name (the host name of the container, which must resolve to
+      # this node from every other node).
+      KINGRES_SERVER_HOST: kingres-3
     ports:
       - "${KINGRES_PANEL_BIND:-127.0.0.1}:${KINGRES_PANEL_PORT_3:-8093}:8091"
       - "${KINGRES_PANEL_BIND:-127.0.0.1}:${KINGRES_PG_PORT_3:-5434}:5432"

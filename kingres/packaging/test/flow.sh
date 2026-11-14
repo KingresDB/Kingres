@@ -130,3 +130,24 @@ flow_check_api() { # flow_check_api PREFIX: sign in again, read what the API kno
 flow_orders_distributed() {
     api GET /databases/shop/schemas/public/tables/orders | grep -Eq '"(hash|distributed)"'
 }
+
+# flow_task_state ID: the state of a task as the node at API_BASE reports it.
+flow_task_state() {
+    api GET "/tasks/$1" | sed -n 's/^{"id":[0-9]*,"kind":"[^"]*","state":"\([a-z]*\)".*/\1/p'
+}
+
+# flow_wait_task DESCRIPTION ID SECONDS: wait until the task is done (pass) or
+# failed (fail, with the task's error).  Uses the signed-in node (FLOW_TOKEN).
+flow_wait_task() {
+    local what="$1" id="$2" secs="$3" s=""
+    for _ in $(seq 1 $((secs * 2))); do
+        s="$(flow_task_state "${id}")"
+        case "${s}" in done | failed | cancelled) break ;; esac
+        sleep 0.5
+    done
+    if [ "${s}" = "done" ]; then
+        pass "${what}"
+    else
+        fail "${what} (task ${id} is '${s}'): $(api GET "/tasks/${id}" | sed -n 's/.*"error":\({[^}]*}\).*/\1/p' | cut -c1-300)"
+    fi
+}
