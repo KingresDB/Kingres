@@ -7,6 +7,151 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-15: Several servers in one cluster, four independent reviews and their fix rounds, contract 0.4.0
+
+### What was done
+
+- **Control plane, several servers**
+  ([design/control-plane-3.md](design/control-plane-3.md)): cluster
+  operations are forwarded to the manager leader; a server joins a cluster,
+  and servers are added and removed, with certificate trust between the
+  instances (`hostssl` with client certificates mapped through
+  `kingres_nodes`). Seven mismatches with the contract found by the panel's
+  end-to-end run were fixed.
+- **Independent reviews**, each by a reviewer who did not write the code and
+  who had to reproduce what was claimed:
+  - `kingres_shard` 0.2
+    ([reviews/2026-11-14-kingres-shard-0.2.md](reviews/2026-11-14-kingres-shard-0.2.md)),
+    then a second review of its fix round
+    ([reviews/2026-11-14-kingres-shard-0.2-fixes.md](reviews/2026-11-14-kingres-shard-0.2-fixes.md));
+  - `kingresd`, as a security review
+    ([reviews/2026-11-14-kingresd-control-plane.md](reviews/2026-11-14-kingresd-control-plane.md),
+    findings CP-01 to CP-07, two of them critical);
+  - the web panel
+    ([reviews/2026-11-14-web-panel.md](reviews/2026-11-14-web-panel.md),
+    findings W-01 to W-18, none critical).
+- **Fix rounds**, every fix with a test that fails without it:
+  - `kingres_shard` 0.2: the findings of the first review (the recovery
+    ordering rule, comparison of session settings, serialized writers of
+    reference tables, authentication of forwarded sessions with a token
+    derived from a cluster secret, bounded waits).
+  - `kingres_ledger` 0.2 and the verifier: the eight findings of the review.
+  - `kingresd`: CP-01 to CP-07. Connection strings are built in one place
+    that quotes every value; the roles of a session are derived again on
+    every request and a role change ends that role's sessions on every
+    server; failed statements are not written to the log; workbench results
+    are bounded; dangerous memberships and attributes are refused.
+  - Web panel: W-01 to W-18, plus nine defects found in pages the review
+    had not examined.
+- **REST contract 0.4.0** (first part): reading logs needs `kingres_ops`,
+  `Task.detail`, `expectedFingerprint` on the join and add-server requests,
+  the `replicate.apply` task kind, three alert kinds.
+- **Packaging** for the `kingresd` that manages instances: the unit is
+  `Type=notify` with `KillMode=process`, so restarting the manager leaves
+  the database running; the three artifact tests now create a real cluster
+  through the API and restart it in every mode.
+- **Brand**: the project's logos are used in the panel (sign-in page, top
+  bar, favicon) and in the top-level README; the sources are in
+  `kingres/brand`.
+- **Design**: phase 5, high availability
+  ([design/ha-phase5.md](design/ha-phase5.md)), with
+  [ADR 0021](adr/0021-failover-in-kingresd.md): failover is part of
+  `kingresd` and is fenced by leases granted by a majority of servers;
+  Patroni and etcd are not shipped. Phase 2b of sharding
+  ([design/shard-phase2b.md](design/shard-phase2b.md)): pushdown of
+  aggregates, sort and limit, joins of colocated tables, and row routing
+  for bulk writes.
+- **Architecture document**: a table near its top lists where the
+  implementation departs from the original design, with the ADR of each.
+
+### How it was verified
+
+Everything below was run by the integrator on the tree that was committed,
+unless it says otherwise.
+
+- `kingres_shard` 0.2 after its fix round: 11 pg_regress tests and 4405 TAP
+  subtests in 24 files out of tree, and both extension suites in tree (39 of
+  39). The second reviewer reverted 17 fixes one at a time and saw the
+  guarding test fail each time, and ran 16 crashes under load with no
+  half-committed and no lost acknowledged transaction (reviewer's run).
+- `kingres_ledger` 0.2 after its fix rounds: 11 pg_regress tests and 281 TAP
+  subtests in 10 files; in tree 30 of 30 at that commit.
+- Control plane: Windows and Linux builds, `go vet`, `gofmt -l`, `go test`
+  (27 packages), and the WSL integration run with real PostgreSQL (27 test
+  binaries, no failure, no skipped test), after each commit.
+- Contract 0.4.0: the rule checker passes (69 paths, 86 operations).
+- Packaging, built from a clean snapshot of the commit: image test 79
+  checks, compose test 58, package test under systemd 158, none failed.
+- Panel: typecheck, lint, build and brand check clean; 291 of 292 unit and
+  component tests; 17 tests in a headless browser (layout at 1366, 683 and
+  320 px, axe in light and dark, and a run of every page under the
+  Content-Security-Policy the README prescribes). The one failing test is
+  the guard that compares the generated API types with the contract: the
+  contract moved to 0.4.0 while the fix round was running, and the panel
+  is adapted in the next change.
+- The panel's end-to-end run against the real server was run by its author
+  only (28 of 28 steps mid-work; a later run stopped at a step that expects
+  an operation to be unsupported which the server meanwhile implements).
+
+### Needs-verification items checked
+
+- "The fencing design and the persistence of in-doubt transactions after
+  failover come from background knowledge": designed in
+  [design/ha-phase5.md](design/ha-phase5.md); not implemented or tested
+  yet.
+- "Bundling Patroni with a Python runtime; embedded etcd membership": no
+  longer applies; see ADR 0021.
+- "Node-to-node traffic uses mutual TLS with a cluster CA created at cluster
+  init": implemented and tested with three servers.
+
+### Decisions and deviations
+
+- ADR 0021 supersedes ADR 0012 (see above). Automatic failover will be off
+  by default, and needs three servers to survive the loss of one.
+- A session's roles are re-derived on every request with a cache of three
+  seconds; a server that cannot ask its database answers 503 instead of
+  trusting the session.
+- Any change to a role, including the role changing its own password, ends
+  that role's sessions.
+- The managed PostgreSQL configuration never logs the text of a failed
+  statement, and local settings cannot switch that back on.
+- The panel refuses to address objects named `.` or `..`: a browser removes
+  such path segments even when they are percent-encoded. The contract needs
+  an escape for them or the server must refuse to create them.
+- The package's unit restarts the database on `systemctl restart`; a
+  restart of the manager alone is `systemctl kill --kill-whom=main
+  --signal=SIGTERM kingres`.
+
+### Still open
+
+- **`kingres_shard`**: the second review found eighteen new defects (S3-01
+  to S3-18). Two are critical and leave the copies of a reference table
+  different without an error: a write made by a function or trigger inside
+  a routed statement reaches one copy only, and a cached plan of a write
+  keeps writing the local copy after the table becomes a reference table.
+  Their fix round has not started. Phase 4 (moving buckets) is being
+  implemented; phases 2b and 5 are designed only.
+- **Control plane**: 19 of 86 operations still answer "not supported yet"
+  (server groups, inclusion proofs, the verification list, instance start
+  and stop, leave-cluster, local settings, rebalance, failover). The
+  certificate revoke and renew operations and their renewal job, cluster-
+  wide gathering of logs, alerts and metrics, and the security headers the
+  panel's review asks for are not written.
+- **Panel**: not yet adapted to contract 0.4.0; the workbench cannot cancel
+  a statement on the server (the contract has no such operation).
+- **Packaging**: the compose test does not join the three nodes into one
+  cluster yet.
+- **CI**: still on a local branch only, for the reason given in the
+  previous entry.
+- The fix rounds of `kingresd` and of the panel have not had a second
+  independent review.
+
+### Core patches
+
+None added in this entry.
+
+---
+
 ## 2026-11-14: Sharding 0.2, ledger 0.2, the verifier, packaging, and the control plane up to one real server
 
 ### What was done
