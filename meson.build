@@ -154,6 +154,22 @@ cdata.set('PG_VERSION_NUM', pg_version_num)
 # PG_VERSION_STR is built later, it depends on compiler test results
 cdata.set_quoted('CONFIGURE_ARGS', '')
 
+# KingresDB: the product version, independent of the PostgreSQL version this
+# tree is based on.  It is exported through pg_config.h (so extensions can
+# test it at compile time) and appended to PG_VERSION_STR further down.  All
+# PostgreSQL version symbols above are deliberately left untouched, because
+# drivers, extensions and PGXS rely on them.
+# See kingres/docs/dev/core-patches.md, patch KP-0001.
+kingres_version = '0.1.0'
+kingres_version_arr = kingres_version.split('.')
+kingres_version_num = (
+  kingres_version_arr[0].to_int() * 10000
+  + kingres_version_arr[1].to_int() * 100
+  + kingres_version_arr[2].to_int()
+)
+cdata.set_quoted('KINGRES_VERSION', kingres_version)
+cdata.set('KINGRES_VERSION_NUM', kingres_version_num)
+
 
 
 ###############################################################
@@ -3003,10 +3019,15 @@ cdata.set_quoted('DLSUFFIX', dlsuffix)
 
 
 # built later than the rest of the version metadata, we need SIZEOF_VOID_P
+#
+# KingresDB: the string keeps its upstream "PostgreSQL <version> on ..."
+# prefix, which client libraries parse, and gains a "(KingresDB <version>)"
+# suffix.  See kingres/docs/dev/core-patches.md, patch KP-0001.
 cdata.set_quoted('PG_VERSION_STR',
-  'PostgreSQL @0@ on @1@-@2@, compiled by @3@-@4@, @5@-bit'.format(
+  'PostgreSQL @0@ on @1@-@2@, compiled by @3@-@4@, @5@-bit (KingresDB @6@)'.format(
     pg_version, host_machine.cpu_family(), host_system,
     cc.get_id(), cc.version(), cdata.get('SIZEOF_VOID_P') * 8,
+    kingres_version,
   )
 )
 
