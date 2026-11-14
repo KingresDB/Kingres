@@ -1,0 +1,222 @@
+-- ledger_privs: the privilege model and the catalog hygiene of the functions of
+-- the extension.  Scans pg_proc for the members of the extension and fails (a
+-- row in the output) when one of them breaks a rule:
+--   * every function that looks anything up has "SET search_path = pg_catalog,
+--     pg_temp", with pg_temp last; the only functions without a search_path
+--     are the C primitives that compute on their arguments, listed below;
+--   * SECURITY DEFINER is used only by the functions that have to write or
+--     read what the caller may not;
+--   * every reference to an object of the extension in a SQL or PL/pgSQL body
+--     is qualified with the schema;
+--   * what PUBLIC may execute and read.
+--
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+-- SPDX-License-Identifier: PostgreSQL
+SET search_path = public;
+\set VERBOSITY terse
+CREATE TEMP VIEW members AS
+SELECT p.*
+FROM pg_proc p
+JOIN pg_depend d ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid
+                AND d.refclassid = 'pg_extension'::regclass AND d.deptype = 'e'
+JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'kingres_ledger';
+SELECT count(*) > 30 AS functions_found FROM members;
+ functions_found 
+-----------------
+ t
+(1 row)
+
+-- C primitives that look nothing up and run no SQL.
+CREATE TEMP TABLE pure_primitives (name text PRIMARY KEY);
+INSERT INTO pure_primitives VALUES
+    ('ledger_leaf_hash'), ('ledger_node_hash'), ('ledger_merkle_accum'),
+    ('ledger_merkle_final'), ('ledger_merkle_path'), ('ledger_tx_leaf'),
+    ('ledger_block_tx_leaf'), ('ledger_block_hash'), ('ledger_genesis_hash'),
+    ('ledger_timestamptz_us'), ('ledger_verify_proof'), ('ledger_hook_active'),
+    ('ledger_outer_user');
+-- A function without a fixed search_path that is not on the list.
+SELECT m.oid::regprocedure AS function_without_fixed_search_path
+FROM members m
+WHERE m.prokind <> 'a'
+  AND NOT EXISTS (SELECT 1 FROM unnest(m.proconfig) c WHERE c = 'search_path=pg_catalog, pg_temp')
+  AND m.proname NOT IN (SELECT name FROM pure_primitives)
+ORDER BY 1;
+ function_without_fixed_search_path 
+------------------------------------
+(0 rows)
+
+-- Any search_path of the extension that does not end with pg_temp.
+SELECT m.oid::regprocedure AS search_path_not_ending_with_pg_temp
+FROM members m, unnest(m.proconfig) c
+WHERE c LIKE 'search_path=%' AND c !~ ', pg_temp$'
+ORDER BY 1;
+ search_path_not_ending_with_pg_temp 
+-------------------------------------
+(0 rows)
+
+-- The exempt functions really are plain C functions without privileges of their own.
+SELECT m.oid::regprocedure AS exempt_function_that_is_not_plain_c
+FROM members m JOIN pure_primitives pp ON pp.name = m.proname
+WHERE m.prolang <> (SELECT oid FROM pg_language WHERE lanname = 'c') OR m.prosecdef
+ORDER BY 1;
+ exempt_function_that_is_not_plain_c 
+-------------------------------------
+(0 rows)
+
+-- Every listed primitive exists (a typo in the list would hide a function).
+SELECT pp.name AS listed_but_missing
+FROM pure_primitives pp WHERE NOT EXISTS (SELECT 1 FROM members m WHERE m.proname = pp.name);
+ listed_but_missing 
+--------------------
+(0 rows)
+
+-- The functions that run as the extension owner, and only those.
+SELECT m.proname, pg_get_function_identity_arguments(m.oid) AS args
+FROM members m WHERE m.prosecdef ORDER BY 1, 2;
+        proname         |                 args                 
+------------------------+--------------------------------------
+ ledger_build_block     | 
+ ledger_capture         | 
+ ledger_enable          | relation regclass, mode text
+ ledger_generate_digest | 
+ ledger_guard           | 
+ ledger_inclusion_proof | relation regclass, row_hash bytea
+ ledger_record_row      | table_id integer, row_data record
+ ledger_verify          | from_height bigint, to_height bigint
+(8 rows)
+
+-- Unqualified references in the SQL and PL/pgSQL functions: a table of the
+-- extension after FROM, JOIN, INTO, UPDATE or TABLE, or a call of a function
+-- of the extension, without "kingres.".  Comments are not looked at.
+SELECT m.oid::regprocedure AS function_with_unqualified_reference
+FROM members m
+WHERE m.prolang <> (SELECT oid FROM pg_language WHERE lanname = 'c')
+  AND (regexp_replace(m.prosrc, '--[^\n]*', '', 'g')
+           ~* '\y(from|join|into|update|table)\s+(only\s+)?ledger_'
+       OR regexp_replace(m.prosrc, '--[^\n]*', '', 'g')
+           ~ '(^|[^.a-z_"])ledger_[a-z_]+\s*\(')
+ORDER BY 1;
+ function_with_unqualified_reference 
+-------------------------------------
+(0 rows)
+
+-- The default privilege model: which function PUBLIC can execute.
+SELECT m.proname,
+       pg_get_function_identity_arguments(m.oid) AS args,
+       (m.proacl IS NULL OR EXISTS (SELECT 1 FROM aclexplode(m.proacl) a
+                                     WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE')) AS public_can_execute
+FROM members m
+WHERE m.prokind <> 'a'
+ORDER BY 1, 2;
+        proname         |                                                               args                                                                | public_can_execute 
+------------------------+-----------------------------------------------------------------------------------------------------------------------------------+--------------------
+ ledger_all_defects     |                                                                                                                                   | t
+ ledger_block_hash      | hash_version smallint, height bigint, prev_hash bytea, tx_merkle_root bytea, tx_count integer, closed_at timestamp with time zone | t
+ ledger_block_modify    |                                                                                                                                   | t
+ ledger_block_tx_leaf   | ledger_txid bigint, entry_count integer, merkle_root bytea, user_name name                                                        | t
+ ledger_build_block     |                                                                                                                                   | f
+ ledger_capture         |                                                                                                                                   | f
+ ledger_catalog_defects |                                                                                                                                   | t
+ ledger_enable          | relation regclass, mode text                                                                                                      | f
+ ledger_generate_digest |                                                                                                                                   | f
+ ledger_genesis_hash    | chain_id bytea                                                                                                                    | t
+ ledger_guard           |                                                                                                                                   | t
+ ledger_hook_active     |                                                                                                                                   | t
+ ledger_inclusion_proof | relation regclass, row_hash bytea                                                                                                 | f
+ ledger_is_member       | p_classid oid, p_objid oid                                                                                                        | t
+ ledger_leaf_hash       | data bytea                                                                                                                        | t
+ ledger_lock_table      | relation regclass                                                                                                                 | f
+ ledger_merkle_accum    | internal, bytea                                                                                                                   | t
+ ledger_merkle_final    | internal                                                                                                                          | t
+ ledger_merkle_path     | leaf_hashes bytea[], leaf_index integer                                                                                           | t
+ ledger_node_hash       | left_hash bytea, right_hash bytea                                                                                                 | t
+ ledger_outer_user      |                                                                                                                                   | t
+ ledger_record_row      | table_id integer, row_data record                                                                                                 | f
+ ledger_row_hash        | record                                                                                                                            | t
+ ledger_table_defects   | p_relid oid, p_table_id integer                                                                                                   | t
+ ledger_timestamptz_us  | ts timestamp with time zone                                                                                                       | t
+ ledger_trigger_ok      | p_relid oid, p_name name, p_symbol text, p_secdef boolean, p_type integer, p_args bytea                                           | t
+ ledger_tx_leaf         | seq integer, table_id integer, op "char", row_hash bytea                                                                          | t
+ ledger_type_problem    | p_typid oid                                                                                                                       | t
+ ledger_verify          | from_height bigint, to_height bigint                                                                                              | f
+ ledger_verify_digest   | digest jsonb                                                                                                                      | f
+ ledger_verify_proof    | proof jsonb, digest jsonb                                                                                                         | t
+ ledger_verify_proof    | proof jsonb, digest jsonb, expected_table_id integer, expected_row_hash bytea                                                     | t
+(32 rows)
+
+-- ... and which table PUBLIC can read or write.
+SELECT c.relname,
+       (c.relacl IS NULL OR EXISTS (SELECT 1 FROM aclexplode(c.relacl) a
+                                     WHERE a.grantee = 0 AND a.privilege_type = 'SELECT')) AS public_can_select,
+       EXISTS (SELECT 1 FROM aclexplode(c.relacl) a
+                WHERE a.grantee = 0 AND a.privilege_type <> 'SELECT') AS public_can_do_more
+FROM pg_class c
+JOIN pg_depend d ON d.classid = 'pg_class'::regclass AND d.objid = c.oid
+                AND d.refclassid = 'pg_extension'::regclass AND d.deptype = 'e'
+JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'kingres_ledger'
+WHERE c.relkind = 'r'
+ORDER BY 1;
+    relname     | public_can_select | public_can_do_more 
+----------------+-------------------+--------------------
+ ledger_blocks  | t                 | f
+ ledger_chain   | t                 | f
+ ledger_entry   | f                 | f
+ ledger_pending | f                 | f
+ ledger_table   | t                 | f
+ ledger_tx      | f                 | f
+(6 rows)
+
+-- The event triggers of the extension are in place and ENABLE ALWAYS.
+SELECT e.evtevent, e.evtenabled
+FROM pg_event_trigger e
+WHERE EXISTS (SELECT 1 FROM members m WHERE m.oid = e.evtfoid)
+ORDER BY 1;
+    evtevent     | evtenabled 
+-----------------+------------
+ ddl_command_end | A
+ sql_drop        | A
+ table_rewrite   | A
+(3 rows)
+
+--------------------------------------------------------------------------
+-- A caller cannot shadow anything the functions use
+--------------------------------------------------------------------------
+-- Temporary objects with the names of the objects of the extension, and of
+-- the functions it calls, in front of everything in the search path.
+CREATE TEMP TABLE ledger_chain (singleton boolean, chain_id bytea);
+INSERT INTO ledger_chain VALUES (true, '\x00');
+CREATE TEMP TABLE ledger_blocks (height bigint);
+CREATE FUNCTION pg_temp.encode(bytea, text) RETURNS text LANGUAGE sql AS $$ SELECT 'hijacked' $$;
+CREATE FUNCTION pg_temp.count(anyelement) RETURNS bigint LANGUAGE sql AS $$ SELECT 42::bigint $$;
+CREATE FUNCTION pg_temp.format(text, VARIADIC text[]) RETURNS text LANGUAGE sql AS $$ SELECT 'hijacked' $$;
+SET search_path = pg_temp, public;
+SELECT count(*) AS problems_with_shadows FROM kingres.ledger_verify();
+ problems_with_shadows 
+-----------------------
+                     0
+(1 row)
+
+INSERT INTO docs VALUES (600, 'shadow', NULL);
+SELECT kingres.ledger_generate_digest() ->> 'chain_id' = encode((SELECT c.chain_id FROM kingres.ledger_chain c), 'hex')
+       AS digest_uses_the_real_chain_id;
+ digest_uses_the_real_chain_id 
+-------------------------------
+ t
+(1 row)
+
+SELECT kingres.ledger_verify_digest(kingres.ledger_generate_digest()) AS digest_verifies;
+ digest_verifies 
+-----------------
+ t
+(1 row)
+
+SELECT kingres.ledger_inclusion_proof('docs', kingres.ledger_row_hash(d.*)) IS NOT NULL AS proof_built
+FROM docs d WHERE d.id = 600;
+ proof_built 
+-------------
+ t
+(1 row)
+
+SET search_path = public;
+DROP TABLE pg_temp.ledger_chain;
+DROP TABLE pg_temp.ledger_blocks;

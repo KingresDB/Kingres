@@ -1,0 +1,429 @@
+-- ledger_protect: the ProcessUtility hook.  Every statement that would switch
+-- the ledger off is rejected with SQLSTATE KL002, also for superusers and for
+-- the owner of the table; ordinary DDL keeps working.
+SET search_path = public;
+\set VERBOSITY terse
+CREATE TABLE lp (id int PRIMARY KEY, a int, note text);
+SELECT kingres.ledger_enable('lp');
+ ledger_enable 
+---------------
+ 
+(1 row)
+
+INSERT INTO lp VALUES (1, 10, 'x');
+CREATE TABLE plain (id int, a int);
+CREATE TABLE parent_p (a int) PARTITION BY RANGE (a);
+CREATE SCHEMA ledger_s;
+CREATE TABLE ledger_s.ls (a int);
+SELECT kingres.ledger_enable('ledger_s.ls');
+ ledger_enable 
+---------------
+ 
+(1 row)
+
+CREATE DOMAIN dflt AS int DEFAULT 5;
+CREATE DOMAIN nodflt AS int;
+CREATE TABLE cascade_target (id int);
+-- Statements that must be rejected.  Each runs in its own subtransaction and
+-- its outcome is reported.  A statement that is accepted is an explicit
+-- failure: a WARNING line that starts with "FAIL", and an error at the end of
+-- the call, so that a wrongly accepted statement cannot hide among the lines
+-- of the expected output.  An accepted statement is undone.
+CREATE FUNCTION pg_temp.try(stmts text[]) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    stmt text;
+    accepted int := 0;
+BEGIN
+    FOREACH stmt IN ARRAY stmts LOOP
+        BEGIN
+            EXECUTE stmt;
+            RAISE WARNING 'FAIL (accepted, must be rejected): %', stmt;
+            accepted := accepted + 1;
+            RAISE EXCEPTION 'undo' USING ERRCODE = 'KL999';
+        EXCEPTION WHEN SQLSTATE 'KL999' THEN
+            NULL;
+        WHEN OTHERS THEN
+            RAISE NOTICE '% -> % %', stmt, SQLSTATE, SQLERRM;
+        END;
+    END LOOP;
+    IF accepted > 0 THEN
+        RAISE EXCEPTION 'FAIL: % statement(s) were accepted that must be rejected', accepted
+            USING ERRCODE = 'KL998';
+    END IF;
+END $$;
+-- Rules of the specification, on a table under ledger control.
+SELECT pg_temp.try(ARRAY[
+    'DROP TABLE lp',
+    'DROP TABLE IF EXISTS plain, lp',
+    'DROP TABLE lp CASCADE',
+    'ALTER TABLE lp DISABLE TRIGGER kingres_ledger_capture',
+    'ALTER TABLE lp DISABLE TRIGGER kingres_ledger_block_modify',
+    'ALTER TABLE lp DISABLE TRIGGER ALL',
+    'ALTER TABLE lp DISABLE TRIGGER USER',
+    'ALTER TABLE lp ENABLE TRIGGER kingres_ledger_capture',
+    'ALTER TABLE lp ENABLE REPLICA TRIGGER kingres_ledger_capture',
+    'ALTER TABLE lp ENABLE ALWAYS TRIGGER kingres_ledger_capture',
+    'ALTER TABLE lp ENABLE TRIGGER ALL',
+    'ALTER TABLE lp DROP COLUMN a',
+    'ALTER TABLE lp ALTER COLUMN a TYPE bigint',
+    'ALTER TABLE lp RENAME COLUMN a TO z',
+    'ALTER TABLE lp SET SCHEMA ledger_s',
+    'ALTER TABLE ledger_s.ls SET SCHEMA public',
+    'DROP TRIGGER kingres_ledger_capture ON lp',
+    'DROP TRIGGER kingres_ledger_block_modify ON lp',
+    'DROP TRIGGER kingres_ledger_block_truncate ON lp',
+    'DROP TRIGGER IF EXISTS kingres_ledger_capture ON lp',
+    'ALTER TRIGGER kingres_ledger_capture ON lp RENAME TO harmless',
+    'CREATE OR REPLACE TRIGGER kingres_ledger_capture AFTER INSERT ON lp FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify()',
+    'ALTER TABLE parent_p ATTACH PARTITION lp FOR VALUES FROM (0) TO (10)',
+    'CREATE TABLE child_of_lp () INHERITS (lp)',
+    'ALTER TABLE plain INHERIT lp',
+    'ALTER TABLE lp INHERIT plain',
+    'ALTER TABLE lp SET UNLOGGED',
+    'CREATE RULE r1 AS ON INSERT TO lp DO INSTEAD NOTHING',
+    'DROP SCHEMA ledger_s CASCADE',
+    'DROP OWNED BY CURRENT_USER',
+    'DROP EXTENSION kingres_ledger',
+    'DROP EXTENSION IF EXISTS kingres_ledger CASCADE',
+    'DROP SCHEMA kingres CASCADE',
+    'ALTER SCHEMA kingres RENAME TO kingres_old']);
+NOTICE:  DROP TABLE lp -> KL002 cannot drop table "lp": it is a ledger table
+NOTICE:  DROP TABLE IF EXISTS plain, lp -> KL002 cannot drop table "lp": it is a ledger table
+NOTICE:  DROP TABLE lp CASCADE -> KL002 cannot drop table "lp": it is a ledger table
+NOTICE:  ALTER TABLE lp DISABLE TRIGGER kingres_ledger_capture -> KL002 cannot change the triggers of table "lp": it is a ledger table
+NOTICE:  ALTER TABLE lp DISABLE TRIGGER kingres_ledger_block_modify -> KL002 cannot change the triggers of table "lp": it is a ledger table
+NOTICE:  ALTER TABLE lp DISABLE TRIGGER ALL -> KL002 cannot change the triggers of table "lp": it is a ledger table
+NOTICE:  ALTER TABLE lp DISABLE TRIGGER USER -> KL002 cannot change the triggers of table "lp": it is a ledger table
+NOTICE:  ALTER TABLE lp ENABLE TRIGGER kingres_ledger_capture -> KL002 cannot change the triggers of table "lp": it is a ledger table
+NOTICE:  ALTER TABLE lp ENABLE REPLICA TRIGGER kingres_ledger_capture -> KL002 cannot change the triggers of table "lp": it is a ledger table
+NOTICE:  ALTER TABLE lp ENABLE ALWAYS TRIGGER kingres_ledger_capture -> KL002 cannot change the triggers of table "lp": it is a ledger table
+NOTICE:  ALTER TABLE lp ENABLE TRIGGER ALL -> KL002 cannot change the triggers of table "lp": it is a ledger table
+NOTICE:  ALTER TABLE lp DROP COLUMN a -> KL002 cannot drop a column of table "lp": it is a ledger table
+NOTICE:  ALTER TABLE lp ALTER COLUMN a TYPE bigint -> KL002 cannot change the type of a column of table "lp": it is a ledger table
+NOTICE:  ALTER TABLE lp RENAME COLUMN a TO z -> KL002 cannot rename a column of table "lp": it is a ledger table
+NOTICE:  ALTER TABLE lp SET SCHEMA ledger_s -> KL002 cannot move to another schema table "lp": it is a ledger table
+NOTICE:  ALTER TABLE ledger_s.ls SET SCHEMA public -> KL002 cannot move to another schema table "ls": it is a ledger table
+NOTICE:  DROP TRIGGER kingres_ledger_capture ON lp -> KL002 cannot drop a trigger, rule or policy of table "lp": it is a ledger table
+NOTICE:  DROP TRIGGER kingres_ledger_block_modify ON lp -> KL002 cannot drop a trigger, rule or policy of table "lp": it is a ledger table
+NOTICE:  DROP TRIGGER kingres_ledger_block_truncate ON lp -> KL002 cannot drop a trigger, rule or policy of table "lp": it is a ledger table
+NOTICE:  DROP TRIGGER IF EXISTS kingres_ledger_capture ON lp -> KL002 cannot drop a trigger, rule or policy of table "lp": it is a ledger table
+NOTICE:  ALTER TRIGGER kingres_ledger_capture ON lp RENAME TO harmless -> KL002 cannot rename a trigger of table "lp": it is a ledger table
+NOTICE:  CREATE OR REPLACE TRIGGER kingres_ledger_capture AFTER INSERT ON lp FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify() -> KL002 cannot create a trigger on table "lp": it is a ledger table
+NOTICE:  ALTER TABLE parent_p ATTACH PARTITION lp FOR VALUES FROM (0) TO (10) -> KL002 cannot attach or detach partition "lp": it is a ledger table
+NOTICE:  CREATE TABLE child_of_lp () INHERITS (lp) -> KL002 cannot inherit from table "lp": it is a ledger table
+NOTICE:  ALTER TABLE plain INHERIT lp -> KL002 cannot inherit from table "lp": it is a ledger table
+NOTICE:  ALTER TABLE lp INHERIT plain -> KL002 cannot change the inheritance or the type of table "lp": it is a ledger table
+NOTICE:  ALTER TABLE lp SET UNLOGGED -> KL002 cannot change the persistence of table "lp": it is a ledger table
+NOTICE:  CREATE RULE r1 AS ON INSERT TO lp DO INSTEAD NOTHING -> KL002 cannot create a rule on table "lp": it is a ledger table
+NOTICE:  DROP SCHEMA ledger_s CASCADE -> KL002 cannot drop schema containing table "ls": it is a ledger table
+NOTICE:  DROP OWNED BY CURRENT_USER -> KL002 cannot drop objects owned by the owner of table "accounts": it is a ledger table
+NOTICE:  DROP EXTENSION kingres_ledger -> KL002 cannot drop extension "kingres_ledger" while ledger tables exist
+NOTICE:  DROP EXTENSION IF EXISTS kingres_ledger CASCADE -> KL002 cannot drop extension "kingres_ledger" while ledger tables exist
+NOTICE:  DROP SCHEMA kingres CASCADE -> KL002 cannot drop schema "kingres": it is part of the ledger
+NOTICE:  ALTER SCHEMA kingres RENAME TO kingres_old -> KL002 cannot rename schema "kingres": it is part of the ledger
+ try 
+-----
+ 
+(1 row)
+
+-- ADD COLUMN: only nullable columns without a default.
+SELECT pg_temp.try(ARRAY[
+    'ALTER TABLE lp ADD COLUMN c1 int DEFAULT 5',
+    'ALTER TABLE lp ADD COLUMN c2 int NOT NULL',
+    'ALTER TABLE lp ADD COLUMN c3 int GENERATED ALWAYS AS (a + 1) STORED',
+    'ALTER TABLE lp ADD COLUMN c4 int GENERATED ALWAYS AS IDENTITY',
+    'ALTER TABLE lp ADD COLUMN c5 dflt',
+    'ALTER TABLE lp ADD COLUMN c6 int CHECK (c6 > 0)',
+    'ALTER TABLE lp ADD COLUMN c7 int UNIQUE',
+    'ALTER TABLE lp ALTER COLUMN a SET EXPRESSION AS (1)']);
+NOTICE:  ALTER TABLE lp ADD COLUMN c1 int DEFAULT 5 -> KL002 cannot add a column with a default or a constraint to table "lp": it is a ledger table
+NOTICE:  ALTER TABLE lp ADD COLUMN c2 int NOT NULL -> KL002 cannot add a column with a default or a constraint to table "lp": it is a ledger table
+NOTICE:  ALTER TABLE lp ADD COLUMN c3 int GENERATED ALWAYS AS (a + 1) STORED -> KL002 cannot add a column with a default or a constraint to table "lp": it is a ledger table
+NOTICE:  ALTER TABLE lp ADD COLUMN c4 int GENERATED ALWAYS AS IDENTITY -> KL002 cannot add a column with a default or a constraint to table "lp": it is a ledger table
+NOTICE:  ALTER TABLE lp ADD COLUMN c5 dflt -> KL002 cannot add a column of a domain with a default to table "lp": it is a ledger table
+NOTICE:  ALTER TABLE lp ADD COLUMN c6 int CHECK (c6 > 0) -> KL002 cannot add a column with a default or a constraint to table "lp": it is a ledger table
+NOTICE:  ALTER TABLE lp ADD COLUMN c7 int UNIQUE -> KL002 cannot add a column with a default or a constraint to table "lp": it is a ledger table
+NOTICE:  ALTER TABLE lp ALTER COLUMN a SET EXPRESSION AS (1) -> KL002 cannot change the generation expression of a column of table "lp": it is a ledger table
+ try 
+-----
+ 
+(1 row)
+
+-- The ledger catalog tables: any DDL.
+SELECT pg_temp.try(ARRAY[
+    'ALTER TABLE kingres.ledger_entry ADD COLUMN x int',
+    'ALTER TABLE kingres.ledger_chain ADD COLUMN x int',
+    'ALTER TABLE kingres.ledger_chain DISABLE TRIGGER ALL',
+    'DROP TABLE kingres.ledger_chain',
+    'CREATE TRIGGER evil2 AFTER INSERT ON kingres.ledger_chain FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify()',
+    'ALTER TABLE kingres.ledger_entry DISABLE TRIGGER ALL',
+    'ALTER TABLE kingres.ledger_entry DROP CONSTRAINT ledger_entry_pkey',
+    'ALTER TABLE kingres.ledger_blocks RENAME TO blocks_old',
+    'ALTER TABLE kingres.ledger_blocks RENAME COLUMN height TO h',
+    'ALTER TABLE kingres.ledger_blocks RENAME CONSTRAINT ledger_blocks_pkey TO pk',
+    'ALTER INDEX kingres.ledger_blocks_pkey RENAME TO pk',
+    'ALTER TABLE kingres.ledger_tx SET SCHEMA public',
+    'ALTER TABLE kingres.ledger_pending OWNER TO CURRENT_USER',
+    'DROP TABLE kingres.ledger_blocks',
+    'DROP TABLE kingres.ledger_blocks CASCADE',
+    'DROP INDEX kingres.ledger_entry_row_hash_idx',
+    'CREATE INDEX ON kingres.ledger_blocks (closed_at)',
+    'CREATE TRIGGER evil AFTER INSERT ON kingres.ledger_tx FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify()',
+    'DROP TRIGGER kingres_ledger_block_modify ON kingres.ledger_blocks',
+    'DROP TRIGGER kingres_ledger_block_truncate ON kingres.ledger_blocks',
+    'ALTER TRIGGER kingres_ledger_block_modify ON kingres.ledger_blocks RENAME TO x',
+    'CREATE RULE r2 AS ON INSERT TO kingres.ledger_entry DO INSTEAD NOTHING',
+    'CREATE POLICY p1 ON kingres.ledger_entry USING (false)',
+    'ALTER TABLE kingres.ledger_entry ENABLE ROW LEVEL SECURITY']);
+NOTICE:  ALTER TABLE kingres.ledger_entry ADD COLUMN x int -> KL002 cannot alter table "ledger_entry": it is part of the ledger
+NOTICE:  ALTER TABLE kingres.ledger_chain ADD COLUMN x int -> KL002 cannot alter table "ledger_chain": it is part of the ledger
+NOTICE:  ALTER TABLE kingres.ledger_chain DISABLE TRIGGER ALL -> KL002 cannot alter table "ledger_chain": it is part of the ledger
+NOTICE:  DROP TABLE kingres.ledger_chain -> KL002 cannot drop table "ledger_chain": it is part of the ledger
+NOTICE:  CREATE TRIGGER evil2 AFTER INSERT ON kingres.ledger_chain FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify() -> KL002 cannot create a trigger on table "ledger_chain": it is part of the ledger
+NOTICE:  ALTER TABLE kingres.ledger_entry DISABLE TRIGGER ALL -> KL002 cannot alter table "ledger_entry": it is part of the ledger
+NOTICE:  ALTER TABLE kingres.ledger_entry DROP CONSTRAINT ledger_entry_pkey -> KL002 cannot alter table "ledger_entry": it is part of the ledger
+NOTICE:  ALTER TABLE kingres.ledger_blocks RENAME TO blocks_old -> KL002 cannot rename an object of table "ledger_blocks": it is part of the ledger
+NOTICE:  ALTER TABLE kingres.ledger_blocks RENAME COLUMN height TO h -> KL002 cannot rename a column of table "ledger_blocks": it is part of the ledger
+NOTICE:  ALTER TABLE kingres.ledger_blocks RENAME CONSTRAINT ledger_blocks_pkey TO pk -> KL002 cannot rename an object of table "ledger_blocks": it is part of the ledger
+NOTICE:  ALTER INDEX kingres.ledger_blocks_pkey RENAME TO pk -> KL002 cannot rename an object of table "ledger_blocks_pkey": it is part of the ledger
+NOTICE:  ALTER TABLE kingres.ledger_tx SET SCHEMA public -> KL002 cannot move to another schema table "ledger_tx": it is part of the ledger
+NOTICE:  ALTER TABLE kingres.ledger_pending OWNER TO CURRENT_USER -> KL002 cannot alter table "ledger_pending": it is part of the ledger
+NOTICE:  DROP TABLE kingres.ledger_blocks -> KL002 cannot drop table "ledger_blocks": it is part of the ledger
+NOTICE:  DROP TABLE kingres.ledger_blocks CASCADE -> KL002 cannot drop table "ledger_blocks": it is part of the ledger
+NOTICE:  DROP INDEX kingres.ledger_entry_row_hash_idx -> KL002 cannot drop an index of table "ledger_entry": it is part of the ledger
+NOTICE:  CREATE INDEX ON kingres.ledger_blocks (closed_at) -> KL002 cannot create an index on table "ledger_blocks": it is part of the ledger
+NOTICE:  CREATE TRIGGER evil AFTER INSERT ON kingres.ledger_tx FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify() -> KL002 cannot create a trigger on table "ledger_tx": it is part of the ledger
+NOTICE:  DROP TRIGGER kingres_ledger_block_modify ON kingres.ledger_blocks -> KL002 cannot drop a trigger, rule or policy of table "ledger_blocks": it is part of the ledger
+NOTICE:  DROP TRIGGER kingres_ledger_block_truncate ON kingres.ledger_blocks -> KL002 cannot drop a trigger, rule or policy of table "ledger_blocks": it is part of the ledger
+NOTICE:  ALTER TRIGGER kingres_ledger_block_modify ON kingres.ledger_blocks RENAME TO x -> KL002 cannot rename a trigger of table "ledger_blocks": it is part of the ledger
+NOTICE:  CREATE RULE r2 AS ON INSERT TO kingres.ledger_entry DO INSTEAD NOTHING -> KL002 cannot create a rule on table "ledger_entry": it is part of the ledger
+NOTICE:  CREATE POLICY p1 ON kingres.ledger_entry USING (false) -> KL002 cannot create a policy on table "ledger_entry": it is part of the ledger
+NOTICE:  ALTER TABLE kingres.ledger_entry ENABLE ROW LEVEL SECURITY -> KL002 cannot alter table "ledger_entry": it is part of the ledger
+ try 
+-----
+ 
+(1 row)
+
+-- The functions and the extension.
+SELECT pg_temp.try(ARRAY[
+    'CREATE OR REPLACE FUNCTION kingres.ledger_capture() RETURNS trigger LANGUAGE plpgsql AS ''BEGIN RETURN NULL; END''',
+    'CREATE OR REPLACE FUNCTION kingres.ledger_build_block() RETURNS bigint LANGUAGE sql AS ''SELECT NULL::bigint''',
+    'ALTER FUNCTION kingres.ledger_capture() SECURITY INVOKER',
+    'ALTER FUNCTION kingres.ledger_capture() SET search_path = public',
+    'ALTER FUNCTION kingres.ledger_capture() SET SCHEMA public',
+    'DROP FUNCTION kingres.ledger_capture()',
+    'DROP AGGREGATE kingres.ledger_merkle_root(bytea)',
+    'ALTER EXTENSION kingres_ledger DROP TABLE kingres.ledger_entry',
+    'ALTER EXTENSION kingres_ledger SET SCHEMA public']);
+NOTICE:  CREATE OR REPLACE FUNCTION kingres.ledger_capture() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END' -> KL002 cannot replace function "ledger_capture": it belongs to the ledger
+NOTICE:  CREATE OR REPLACE FUNCTION kingres.ledger_build_block() RETURNS bigint LANGUAGE sql AS 'SELECT NULL::bigint' -> KL002 cannot replace function "ledger_build_block": it belongs to the ledger
+NOTICE:  ALTER FUNCTION kingres.ledger_capture() SECURITY INVOKER -> KL002 cannot alter a function of the ledger
+NOTICE:  ALTER FUNCTION kingres.ledger_capture() SET search_path = public -> KL002 cannot alter a function of the ledger
+NOTICE:  ALTER FUNCTION kingres.ledger_capture() SET SCHEMA public -> KL002 cannot move a function of the ledger to another schema
+NOTICE:  DROP FUNCTION kingres.ledger_capture() -> 2BP01 cannot drop function kingres.ledger_capture() because extension kingres_ledger requires it
+NOTICE:  DROP AGGREGATE kingres.ledger_merkle_root(bytea) -> 2BP01 cannot drop function kingres.ledger_merkle_root(bytea) because extension kingres_ledger requires it
+NOTICE:  ALTER EXTENSION kingres_ledger DROP TABLE kingres.ledger_entry -> KL002 cannot change the members of extension "kingres_ledger"
+NOTICE:  ALTER EXTENSION kingres_ledger SET SCHEMA public -> KL002 cannot move extension "kingres_ledger" to another schema
+ try 
+-----
+ 
+(1 row)
+
+-- DROP TYPE ... CASCADE would drop the column of a ledger table.
+SELECT pg_temp.try(ARRAY[
+    'DROP TYPE color CASCADE',
+    'DROP TYPE color',
+    'DROP TYPE _color CASCADE']);
+NOTICE:  DROP TYPE color CASCADE -> KL002 cannot drop type "color" with CASCADE: a ledger table has a column of this type
+NOTICE:  DROP TYPE color -> 2BP01 cannot drop type color because other objects depend on it
+NOTICE:  DROP TYPE _color CASCADE -> 2BP01 cannot drop type color[] because type color requires it
+ try 
+-----
+ 
+(1 row)
+
+-- The same rules apply to the owner of the table.
+SET ROLE kl_owner;
+SELECT pg_temp.try(ARRAY[
+    'DROP TABLE with_enum',
+    'ALTER TABLE with_enum DISABLE TRIGGER ALL',
+    'ALTER TABLE with_enum DROP COLUMN c',
+    'DROP TRIGGER kingres_ledger_capture ON with_enum',
+    'ALTER TABLE with_enum ADD COLUMN extra int DEFAULT 1']);
+NOTICE:  DROP TABLE with_enum -> KL002 cannot drop table "with_enum": it is a ledger table
+NOTICE:  ALTER TABLE with_enum DISABLE TRIGGER ALL -> KL002 cannot change the triggers of table "with_enum": it is a ledger table
+NOTICE:  ALTER TABLE with_enum DROP COLUMN c -> KL002 cannot drop a column of table "with_enum": it is a ledger table
+NOTICE:  DROP TRIGGER kingres_ledger_capture ON with_enum -> KL002 cannot drop a trigger, rule or policy of table "with_enum": it is a ledger table
+NOTICE:  ALTER TABLE with_enum ADD COLUMN extra int DEFAULT 1 -> KL002 cannot add a column with a default or a constraint to table "with_enum": it is a ledger table
+ try 
+-----
+ 
+(1 row)
+
+RESET ROLE;
+-- The state is unchanged: the ledger tables still exist, verification is clean.
+SELECT count(*) AS problems FROM kingres.ledger_verify();
+ problems 
+----------
+        0
+(1 row)
+
+SELECT count(*) AS armed_triggers FROM pg_trigger
+WHERE tgname = 'kingres_ledger_capture' AND tgenabled = 'A';
+ armed_triggers 
+----------------
+              5
+(1 row)
+
+--------------------------------------------------------------------------
+-- Allowed operations
+--------------------------------------------------------------------------
+-- Ordinary tables are not touched by the hook.
+ALTER TABLE plain ADD COLUMN b int DEFAULT 1;
+ALTER TABLE plain DROP COLUMN b;
+CREATE TRIGGER kingres_ledger_capture AFTER INSERT ON plain FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify();
+ALTER TABLE plain DISABLE TRIGGER kingres_ledger_capture;
+DROP TRIGGER kingres_ledger_capture ON plain;
+DROP TABLE plain;
+-- Harmless changes of a ledger table.
+ALTER TABLE lp ADD COLUMN extra1 text;
+ALTER TABLE lp ADD COLUMN extra2 nodflt NULL;
+ALTER TABLE lp ALTER COLUMN a SET DEFAULT 7;
+ALTER TABLE lp ADD CONSTRAINT lp_a_check CHECK (a > 0) NOT VALID;
+CREATE INDEX lp_a_idx ON lp (a);
+DROP INDEX lp_a_idx;
+CREATE TRIGGER user_trigger AFTER INSERT ON lp FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify();
+SELECT pg_temp.try(ARRAY['ALTER TABLE lp DISABLE TRIGGER user_trigger', 'DROP DOMAIN nodflt CASCADE']);
+NOTICE:  ALTER TABLE lp DISABLE TRIGGER user_trigger -> KL002 cannot change the triggers of table "lp": it is a ledger table
+NOTICE:  DROP DOMAIN nodflt CASCADE -> KL002 cannot drop type "nodflt" with CASCADE: a ledger table has a column of this type
+ try 
+-----
+ 
+(1 row)
+
+DROP TRIGGER user_trigger ON lp;
+ALTER TABLE lp SET (fillfactor = 90);
+ALTER TABLE lp OWNER TO CURRENT_USER;
+ALTER TABLE lp RENAME TO lp2;
+ALTER TABLE lp2 RENAME TO lp;
+-- A new nullable column does not change the hashes of existing rows, and new
+-- rows are captured with the new column.
+SELECT count(*) AS problems_after_add_column FROM kingres.ledger_verify();
+ problems_after_add_column 
+---------------------------
+                         0
+(1 row)
+
+INSERT INTO lp (id, a, note, extra1) VALUES (2, 20, 'y', 'with extra');
+INSERT INTO lp (id, a, note) VALUES (3, 30, 'z');
+SELECT count(*) AS problems_after_inserts FROM kingres.ledger_verify();
+ problems_after_inserts 
+------------------------
+                      0
+(1 row)
+
+SELECT kingres.ledger_generate_digest() IS NOT NULL AS digest_ok;
+ digest_ok 
+-----------
+ t
+(1 row)
+
+SELECT count(*) AS problems_after_block FROM kingres.ledger_verify();
+ problems_after_block 
+----------------------
+                    0
+(1 row)
+
+-- Types that ledger columns use: an extension that provides the type cannot
+-- be dropped with CASCADE, and an enum label, which is part of the row hash,
+-- cannot be renamed; adding a label is harmless.
+CREATE EXTENSION citext;
+CREATE TABLE ci (a citext);
+SELECT kingres.ledger_enable('ci');
+ ledger_enable 
+---------------
+ 
+(1 row)
+
+INSERT INTO ci VALUES ('Mixed');
+SELECT pg_temp.try(ARRAY['DROP EXTENSION citext CASCADE',
+                         'ALTER TYPE color RENAME VALUE ''red'' TO ''crimson''']);
+NOTICE:  DROP EXTENSION citext CASCADE -> KL002 cannot drop extension "citext" with CASCADE: a ledger table has a column of a type it provides
+NOTICE:  ALTER TYPE color RENAME VALUE 'red' TO 'crimson' -> KL002 cannot rename a value of enum type "color": a ledger table has a column of this type
+ try 
+-----
+ 
+(1 row)
+
+ALTER TYPE color ADD VALUE 'blue';
+ALTER TYPE color RENAME TO colour;
+ALTER TYPE colour RENAME TO color;
+SELECT count(*) AS problems_after_type_changes FROM kingres.ledger_verify();
+ problems_after_type_changes 
+-----------------------------
+                           0
+(1 row)
+
+-- A table enabled in the transaction that tries to drop it.
+BEGIN;
+CREATE TABLE in_tx (a int);
+SELECT kingres.ledger_enable('in_tx');
+ ledger_enable 
+---------------
+ 
+(1 row)
+
+SELECT pg_temp.try(ARRAY['DROP TABLE in_tx', 'ALTER TABLE in_tx DISABLE TRIGGER ALL',
+                         'DROP EXTENSION kingres_ledger', 'DROP SCHEMA public CASCADE']);
+NOTICE:  DROP TABLE in_tx -> KL002 cannot drop table "in_tx": it is a ledger table
+NOTICE:  ALTER TABLE in_tx DISABLE TRIGGER ALL -> KL002 cannot change the triggers of table "in_tx": it is a ledger table
+NOTICE:  DROP EXTENSION kingres_ledger -> KL002 cannot drop extension "kingres_ledger" while ledger tables exist
+NOTICE:  DROP SCHEMA public CASCADE -> KL002 cannot drop schema containing table "with_enum": it is a ledger table
+ try 
+-----
+ 
+(1 row)
+
+ROLLBACK;
+--------------------------------------------------------------------------
+-- Catalog checks of the extension itself
+--------------------------------------------------------------------------
+-- Every SQL or PL/pgSQL function and every SECURITY DEFINER function has a
+-- fixed search_path.
+SELECT p.proname AS function_without_search_path
+FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'kingres' AND p.prokind = 'f'
+  AND (p.prosecdef OR p.prolang <> (SELECT oid FROM pg_language WHERE lanname = 'c'))
+  AND NOT COALESCE(p.proconfig::text LIKE '%search_path=%', false)
+ORDER BY 1;
+ function_without_search_path 
+------------------------------
+(0 rows)
+
+-- Every object of the extension is in schema kingres and named ledger_*.
+SELECT count(*) AS members_outside_schema
+FROM pg_depend d
+JOIN pg_extension e ON e.oid = d.refobjid AND d.refclassid = 'pg_extension'::regclass
+WHERE e.extname = 'kingres_ledger' AND d.deptype = 'e'
+  AND ((d.classid = 'pg_proc'::regclass AND
+        (SELECT pronamespace FROM pg_proc WHERE oid = d.objid) <> 'kingres'::regnamespace)
+    OR (d.classid = 'pg_class'::regclass AND
+        (SELECT relnamespace FROM pg_class WHERE oid = d.objid) <> 'kingres'::regnamespace));
+ members_outside_schema 
+------------------------
+                      0
+(1 row)
+
+SELECT count(*) AS members_not_named_ledger
+FROM pg_depend d
+JOIN pg_extension e ON e.oid = d.refobjid AND d.refclassid = 'pg_extension'::regclass
+WHERE e.extname = 'kingres_ledger' AND d.deptype = 'e'
+  AND ((d.classid = 'pg_proc'::regclass AND
+        (SELECT proname FROM pg_proc WHERE oid = d.objid) NOT LIKE 'ledger\_%')
+    OR (d.classid = 'pg_class'::regclass AND
+        (SELECT relname FROM pg_class WHERE oid = d.objid) NOT LIKE 'ledger\_%'));
+ members_not_named_ledger 
+--------------------------
+                        0
+(1 row)
+

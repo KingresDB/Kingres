@@ -1,0 +1,116 @@
+/*-------------------------------------------------------------------------
+ *
+ * kingres_ledger.h
+ *	  Declarations shared by the files of the kingres_ledger extension.
+ *
+ * The extension implements the ledger described in
+ * kingres/docs/design/ledger-mvp.md: canonical row hashing, RFC 6962
+ * Merkle trees, the insert trigger, the ProcessUtility protection hook and
+ * the offline proof check.  This header holds the constants, the SQLSTATE
+ * codes, the big-endian helpers used to build hash inputs, and the
+ * cross-file entry points.
+ *
+ * Portions Copyright (c) 2026, RooyeKhat Media Co
+ * SPDX-License-Identifier: PostgreSQL
+ *
+ * IDENTIFICATION
+ *	  contrib/kingres_ledger/src/kingres_ledger.h
+ *
+ *-------------------------------------------------------------------------
+ */
+#ifndef KINGRES_LEDGER_KINGRES_LEDGER_H
+#define KINGRES_LEDGER_KINGRES_LEDGER_H
+
+/* Version of the hash formats implemented by this code (see README). */
+#define KL_HASH_VERSION 1
+
+/* Length of a SHA-256 value in bytes. */
+#define KL_HASH_LEN 32
+
+/* Longest user name in UTF-8 that is hashed (NAMEDATALEN - 1 bytes of up to 4 bytes each). */
+#define KL_MAX_USER_NAME_BYTES 255
+
+/*
+ * Domain tags of hash format version 1.  Every kind of hashed data starts
+ * with its own tag, so that data of one kind can never be mistaken for data
+ * of another: the first byte of the leaf data of a row, of an entry of a
+ * transaction tree and of a transaction in a block tree, the first byte of the
+ * input of a block hash, and the first byte of the input of the hash that
+ * derives the previous-block hash of block 0 from the chain identity.  The
+ * values avoid 0x00 and 0x01, the RFC 6962 prefixes of leaves and nodes.
+ * The README has the same table.
+ */
+#define KL_TAG_ROW			0x10
+#define KL_TAG_TX_ENTRY		0x11
+#define KL_TAG_BLOCK_TX		0x12
+#define KL_TAG_BLOCK		0x13
+#define KL_TAG_CHAIN		0x14
+
+/* Length of the random identity of a chain, in bytes. */
+#define KL_CHAIN_ID_LEN 32
+
+/*
+ * SQLSTATE codes of the extension.  "KL" is not a class used by PostgreSQL;
+ * class names starting with a letter other than 0-4 and A-H are free for
+ * user-defined codes.
+ */
+#define ERRCODE_KL_APPEND_ONLY	MAKE_SQLSTATE('K','L','0','0','1')
+#define ERRCODE_KL_PROTECTED	MAKE_SQLSTATE('K','L','0','0','2')
+#define ERRCODE_KL_NOT_PRELOADED MAKE_SQLSTATE('K','L','0','0','3')
+
+/*
+ * Names used to find the extension and the objects it creates.  Functions and
+ * triggers of the extension are never recognised by these names alone: the
+ * protection code uses extension membership (pg_depend) and, to tell the
+ * functions apart, the name of the C symbol (prosrc), which a rename of the
+ * SQL function does not change.
+ */
+#define KL_EXTENSION_NAME		"kingres_ledger"
+#define KL_SCHEMA_NAME			"kingres"
+#define KL_TRIGGER_CAPTURE		"kingres_ledger_capture"
+#define KL_TRIGGER_BLOCK_MODIFY	"kingres_ledger_block_modify"
+#define KL_TRIGGER_BLOCK_TRUNCATE "kingres_ledger_block_truncate"
+
+/* C symbols of the functions that the protection code has to recognise. */
+#define KL_SYM_CAPTURE			"kingres_ledger_capture"
+#define KL_SYM_BLOCK_MODIFY		"kingres_ledger_block_modify"
+#define KL_SYM_RECORD_ROW		"kingres_ledger_record_row"
+#define KL_SYM_LOCK_TABLE		"kingres_ledger_lock_table"
+
+/* GUC, see kingres_ledger.c. */
+extern int	kl_max_block_transactions;
+
+/* True when the library was loaded through shared_preload_libraries. */
+extern bool kl_preloaded;
+
+/* Big-endian encoders used for every hash input. */
+static inline void
+kl_put_u16(uint8 *p, uint16 v)
+{
+	p[0] = (uint8) (v >> 8);
+	p[1] = (uint8) v;
+}
+
+static inline void
+kl_put_u32(uint8 *p, uint32 v)
+{
+	p[0] = (uint8) (v >> 24);
+	p[1] = (uint8) (v >> 16);
+	p[2] = (uint8) (v >> 8);
+	p[3] = (uint8) v;
+}
+
+static inline void
+kl_put_u64(uint8 *p, uint64 v)
+{
+	kl_put_u32(p, (uint32) (v >> 32));
+	kl_put_u32(p + 4, (uint32) v);
+}
+
+/* capture.c */
+extern void kl_capture_init(void);
+
+/* protect.c */
+extern void kl_protect_init(void);
+
+#endif							/* KINGRES_LEDGER_KINGRES_LEDGER_H */
