@@ -158,7 +158,15 @@ func execLocal(ctx context.Context, svc *cluster.Service, r internalapi.ExecRequ
 	for _, fd := range rows.FieldDescriptions() {
 		res.Columns = append(res.Columns, fd.Name)
 	}
+	total := 0
 	for rows.Next() && len(res.Rows) < limit {
+		// The size of a result is bounded (CP-04): 1 MiB per value, 16 MiB in all.
+		for _, raw := range rows.RawValues() {
+			total += len(raw) + 8
+			if len(raw) > 1<<20 || total > 16<<20 {
+				return res, errors.New("the result is too large")
+			}
+		}
 		v, err := rows.Values()
 		if err != nil {
 			return res, errors.New("the statement failed")

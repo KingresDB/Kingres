@@ -58,7 +58,7 @@ func TestNodeConninfoAndTLSSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, w := range []string{"sslmode=verify-full", "sslcert='/p/server.crt'", "sslkey='/p/server.key'", "sslrootcert='/p/ca.crt'", "sslcrl='/p/revoked.crl'"} {
+	for _, w := range []string{"sslmode='verify-full'", "sslcert='/p/server.crt'", "sslkey='/p/server.key'", "sslrootcert='/p/ca.crt'", "sslcrl='/p/revoked.crl'"} {
 		if !strings.Contains(ci, w) {
 			t.Errorf("node_conninfo lacks %q: %s", w, ci)
 		}

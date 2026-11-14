@@ -28,12 +28,14 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/cluster"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/config"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/httpapi"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/leader"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/membership"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/monitor"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ops"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/peerclient"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/peers"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pgconninfo"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sdnotify"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/setup"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/store/pgstore"
@@ -167,7 +169,10 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		if d := svc.ServiceDSN("kingres_system"); d != "" {
 			dsn = d
 		} else {
-			dsn = fmt.Sprintf("host=127.0.0.1 port=%d dbname=kingres_system user=kingresd", cfg.PGPort)
+			dsn, err = pgconninfo.Format(pgconninfo.Pair{Key: "host", Value: "127.0.0.1"}, pgconninfo.Pair{Key: "port", Value: strconv.Itoa(cfg.PGPort)}, pgconninfo.Pair{Key: "dbname", Value: "kingres_system"}, pgconninfo.Pair{Key: "user", Value: "kingresd"})
+			if err != nil {
+				return err
+			}
 		}
 	}
 	pg, err := pgstore.New(pgstore.Options{
@@ -241,6 +246,9 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	api, err := httpapi.New(deps)
 	if err != nil {
 		return err
+	}
+	if opsSvc != nil {
+		opsSvc.SessionEnder = api.RoleChanged
 	}
 
 	srv := &http.Server{
@@ -337,7 +345,14 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		go func() {
 			defer wg.Done()
 			serveInternal(bgCtx, internalDeps{addr: cfg.InternalListen, svc: svc, node: node, ring: ring, log: log, started: started,
-				serverHost: serverHost, version: version, dataDir: cfg.DataDir, leaders: leaders, forward: api.ServeForwarded, receiver: receiver})
+				serverHost: serverHost, version: version, dataDir: cfg.DataDir, leaders: leaders, forward: func(ctx context.Context, peer string, fr internalapi.ForwardRequest) (internalapi.ForwardResponse, error) {
+					// A forwarding server must be a member of the cluster (CP-07); its certificate was
+					// already checked against the CA and the revocation list by the internal API.
+					if _, ok := peerDir.Get(peer); !ok {
+						return internalapi.ForwardResponse{}, fmt.Errorf("%q is not a server of this cluster", peer)
+					}
+					return api.ServeForwarded(ctx, peer, fr)
+				}, receiver: receiver})
 		}()
 	}
 

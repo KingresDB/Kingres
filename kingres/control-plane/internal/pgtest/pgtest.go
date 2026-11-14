@@ -12,7 +12,6 @@ package pgtest
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -24,6 +23,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/instance"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pgconninfo"
 )
 
 // Password is the password of the service role of every test instance.
@@ -42,8 +42,12 @@ type Instance struct {
 
 // DSN returns a connection string for the service role and database db.
 func (i *Instance) DSN(db string) string {
-	return fmt.Sprintf("host=127.0.0.1 port=%d dbname=%s user=%s password=%s sslmode=disable",
-		i.Port, db, instance.ServiceRole, Password)
+	dsn, err := pgconninfo.Format(pgconninfo.Pair{Key: "host", Value: "127.0.0.1"}, pgconninfo.Pair{Key: "port", Value: strconv.Itoa(i.Port)}, pgconninfo.Pair{Key: "dbname", Value: db},
+		pgconninfo.Pair{Key: "user", Value: instance.ServiceRole}, pgconninfo.Pair{Key: "password", Value: Password}, pgconninfo.Pair{Key: "sslmode", Value: "disable"})
+	if err != nil {
+		panic(err) // test helper: db is a literal
+	}
+	return dsn
 }
 
 // Connect opens a connection as the service role.
@@ -227,4 +231,16 @@ func FreePortPair(t testing.TB) int {
 	}
 	t.Fatalf("no free pair of ports in %d..%d", lo, hi)
 	return 0
+}
+
+// ReleasePorts makes ports handed out by FreePort or FreePortPair available
+// again. Only a test that owns every process that used them may call it (the
+// multi-server tests do, after stopping their nodes); the shared cluster of a
+// test binary never does.
+func ReleasePorts(ports ...int) {
+	portMu.Lock()
+	defer portMu.Unlock()
+	for _, p := range ports {
+		delete(usedPorts, p)
+	}
 }

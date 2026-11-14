@@ -37,6 +37,7 @@ func twoServers(t *testing.T, fw *direct) (leader, follower *env) {
 	leader = newEnv(t)
 	leader.initialize()
 	fw.target = leader.srv
+	leader.testUser([]string{auth.RoleAdmin}) // the leader knows the roles of the forwarded identities
 	follower = newEnv(t, func(d *Deps) { d.Forwarder = fw })
 	follower.initialize()
 	return leader, follower

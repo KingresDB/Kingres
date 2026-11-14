@@ -252,12 +252,20 @@ func TestRoleChangeReachesAServerThatWasDown(t *testing.T) {
 		}
 		time.Sleep(time.Second)
 	}
-	// The housekeeping task is not part of the contract's task kinds and is hidden.
+	// The task that brought the server up to date is a task of the contract (kind replicate.apply,
+	// subject type replication, contract 0.4.0) and is listed.
 	body := c.Leader().Expect(200, "GET", "/tasks?limit=100", nil)
 	items, _ := body["items"].([]any)
+	found := false
 	for _, it := range items {
-		if m, _ := it.(map[string]any); strings.HasPrefix(fmt.Sprint(m["kind"]), "replicate.") {
-			t.Errorf("the task API lists the housekeeping task: %v", m)
+		if m, _ := it.(map[string]any); fmt.Sprint(m["kind"]) == "replicate.apply" {
+			found = true
+			if sub, _ := m["subject"].(map[string]any); fmt.Sprint(sub["type"]) != "replication" {
+				t.Errorf("subject of the replication task: %v", m["subject"])
+			}
 		}
+	}
+	if !found {
+		t.Errorf("the task API does not list the replication task: %v", items)
 	}
 }

@@ -12,7 +12,7 @@
 | `POST /internal/v1/globals/apply` | leader, or any peer while joining | create roles (with password verifiers, never passwords) and databases with their extensions |
 | `POST /internal/v1/node/finish` | leader, or any peer while joining | the server becomes clustered and its setup token is removed |
 | `POST /internal/v1/node/reset` | leader | delete the instance, certificates and key; the server is uninitialized again with a new setup token |
-| `POST /internal/v1/apply` | leader | one cluster-wide operation from a closed set (create or drop a database, network rules, role sync and drop, grant) with structured parameters |
+| `POST /internal/v1/apply` | leader | one cluster-wide operation from a closed set (create or drop a database, network rules, role sync and drop, grant, `role.changed`: end the sessions of a changed role and forget cached role checks) with structured parameters |
 <!-- SPDX-License-Identifier: PostgreSQL -->
 # The internal API of kingresd
 
@@ -90,7 +90,7 @@ and reads other than listTasks, getTask, listAlerts and getClusterSettings), req
 exactly the operation's, rebuilds the URL from the contract's template with escaped values, checks the identity
 (user name, only the four cluster roles), and runs the request through the same pipeline as a public one: query
 validation, the role the operation requires (so a server cannot raise an identity's privileges beyond what it
-claims, but it can claim any identity: every server is fully trusted by every other), the handler and the audit.
+claims; the leader also derives the claimed role's cluster roles itself, from its own catalog, and refuses an identity that is dropped, cannot log in, is expired or does not hold the claimed roles (CP-07), and refuses a forwarding server that is not in its peer directory; apart from that every server is fully trusted by every other), the handler and the audit.
 The audit event is written by the leader, once, with the details `forwardedBy` (the server id in the caller's
 certificate) and `originRequestId`; the forwarding server writes none, unless the leader could not be reached
 (then it answers 503 and audits the failure itself). The leader makes the role connectable for its own

@@ -263,7 +263,8 @@ func TestRemoveEmptyServerAndRevokedCertificate(t *testing.T) {
 	pool := x509.NewCertPool()
 	pool.AppendCertsFromPEM(caPEM)
 	for _, n := range c.Nodes[:2] {
-		cfg, _ := pgx.ParseConfig(fmt.Sprintf("host=%s port=%d dbname=postgres user=kingresd sslmode=require connect_timeout=10", n.Host, n.PGPort))
+		cfg, _ := pgx.ParseConfig("")
+		cfg.Host, cfg.Port, cfg.Database, cfg.User, cfg.ConnectTimeout = n.Host, uint16(n.PGPort), "postgres", "kingresd", 10*time.Second //nolint:gosec // test ports
 		cfg.TLSConfig = &tls.Config{Certificates: []tls.Certificate{*oldPair}, RootCAs: pool, ServerName: n.Host, MinVersion: tls.VersionTLS13}
 		cfg.Fallbacks = nil
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

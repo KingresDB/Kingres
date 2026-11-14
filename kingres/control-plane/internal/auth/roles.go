@@ -5,6 +5,11 @@
 // limiter and the PostgreSQL authenticator.
 package auth
 
+import (
+	"unicode"
+	"unicode/utf8"
+)
+
 // The four built-in cluster roles and the pseudo role "none".
 const (
 	RoleNone     = "none"
@@ -69,4 +74,34 @@ func Normalize(have []string) []string {
 		}
 	}
 	return out
+}
+
+// Subset reports whether every role of sub is in all.
+func Subset(sub, all []string) bool {
+	have := map[string]bool{}
+	for _, r := range all {
+		have[r] = true
+	}
+	for _, r := range sub {
+		if !have[r] {
+			return false
+		}
+	}
+	return true
+}
+
+// ValidUsername reports whether s can be a user name at the boundary: valid
+// UTF-8 with no control characters (NUL, newlines, escapes, the C1 range and
+// the Unicode line and paragraph separators). Names are written to the audit
+// file and to PostgreSQL; this keeps both free of them.
+func ValidUsername(s string) bool {
+	if !utf8.ValidString(s) {
+		return false
+	}
+	for _, r := range s {
+		if unicode.IsControl(r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) || r == 0xFEFF {
+			return false
+		}
+	}
+	return true
 }

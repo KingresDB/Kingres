@@ -204,6 +204,8 @@ func TestRoleRefusals(t *testing.T) {
 	}
 	// Restore: the second admin promotes the first again, then is dropped.
 	two.expect(t, 200, "PUT", "/roles/"+adminUser+"/cluster-roles", map[string]any{"clusterRoles": []string{"kingres_admin"}})
+	// Changing a role ends its sessions (CP-02): the first administrator signs in again.
+	e.login(t, adminUser, adminPass)
 	e.expect(t, 204, "DELETE", "/roles/admin_two", nil)
 	// The built-in roles are not valid role names for creation tricks.
 	if st, _, _ := e.call("POST", "/roles", map[string]any{"name": "pg_evil"}, nil); st != 400 && st != 422 {

@@ -57,11 +57,24 @@ func (t taskRow) toAPI() (api.Task, error) {
 			return api.Task{}, fmt.Errorf("decoding error of task %d: %w", t.id, err)
 		}
 	}
+	var extra struct {
+		Detail string `json:"detail"`
+	}
+	if len(t.progress) > 0 {
+		_ = json.Unmarshal(t.progress, &extra)
+	}
+	if extra.Detail != "" {
+		d := extra.Detail
+		out.Detail = &d
+	}
 	out.Subject = &api.TaskSubject{Type: t.subjType, ID: t.subjID}
-	for _, st := range out.Progress.Steps {
+	for i, st := range out.Progress.Steps {
 		if st.State == "running" {
 			n := st.Name
 			out.Progress.CurrentStep = &n
+			if out.Detail != nil {
+				out.Progress.Steps[i].Detail = out.Detail
+			}
 		}
 	}
 	return out, nil
@@ -88,7 +101,7 @@ func (s *Store) Tasks(ctx context.Context, f store.TaskFilter, p store.Page) (ap
 		bound = before
 	}
 	rows, err := pool.Query(ctx, `SELECT `+taskColumns+` FROM kingres_cp.task
-		WHERE kind NOT LIKE 'replicate.%' AND ($1::bigint IS NULL OR id < $1) AND ($2 = '' OR state = $2) AND ($3 = '' OR kind = $3)
+		WHERE ($1::bigint IS NULL OR id < $1) AND ($2 = '' OR state = $2) AND ($3 = '' OR kind = $3)
 		ORDER BY id DESC LIMIT $4`, bound, f.State, f.Kind, p.Limit+1)
 	if err != nil {
 		return empty, s.wrap("reading kingres_cp.task", err)
@@ -126,7 +139,7 @@ func (s *Store) Task(ctx context.Context, id int64) (api.Task, error) {
 	if !ok {
 		return api.Task{}, store.ErrNotFound
 	}
-	rows, err := pool.Query(ctx, `SELECT `+taskColumns+` FROM kingres_cp.task WHERE id = $1 AND kind NOT LIKE 'replicate.%'`, id)
+	rows, err := pool.Query(ctx, `SELECT `+taskColumns+` FROM kingres_cp.task WHERE id = $1 `, id)
 	if err != nil {
 		return api.Task{}, s.wrap("reading kingres_cp.task", err)
 	}

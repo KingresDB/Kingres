@@ -195,6 +195,8 @@ type JoinClusterRequest struct {
 	ServerGroup *string `json:"serverGroup,omitempty"`
 	// AdvertiseAddress is the address other servers use to reach this one.
 	AdvertiseAddress *string `json:"advertiseAddress,omitempty"`
+	// ExpectedFingerprint pins the SHA-256 fingerprint of the existing server's internal certificate.
+	ExpectedFingerprint *string `json:"expectedFingerprint,omitempty"`
 }
 
 // AddServerRequest is the body of POST /servers.
@@ -205,4 +207,6 @@ type AddServerRequest struct {
 	SetupToken string `json:"setupToken"`
 	// ServerGroup places the server in a group (not supported yet).
 	ServerGroup *string `json:"serverGroup,omitempty"`
+	// ExpectedFingerprint pins the SHA-256 fingerprint of the new server's bootstrap certificate.
+	ExpectedFingerprint *string `json:"expectedFingerprint,omitempty"`
 }

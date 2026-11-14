@@ -179,13 +179,19 @@ func (s *Server) ServeForwarded(ctx context.Context, peer string, fr internalapi
 	if len(fr.Query) > 4096 || strings.ContainsAny(fr.Query, "\r\n") {
 		return internalapi.ForwardResponse{}, errors.New("the query string is not valid")
 	}
-	target := path
-	if fr.Query != "" {
-		target += "?" + fr.Query
+	if _, qerr := url.ParseQuery(fr.Query); qerr != nil {
+		return internalapi.ForwardResponse{}, errors.New("the query string is not valid")
 	}
+	// The URL is assembled as a structure, never by concatenation: the path
+	// is already escaped per segment, the query is only a query.
+	unescaped, uerr := url.PathUnescape(path)
+	if uerr != nil {
+		return internalapi.ForwardResponse{}, errors.New("the path is not valid")
+	}
+	target := (&url.URL{Scheme: "http", Host: "leader.internal", Path: unescaped, RawPath: path, RawQuery: fr.Query}).String()
 	req, err := http.NewRequestWithContext(context.WithValue(ctx, fwdKey{}, &forwarded{
 		peer: peer, identity: fr.Identity, requestID: fr.RequestID, sourceAddress: fr.SourceAddress, source: fr.Source, pin: pinText(fr.Pin),
-	}), op.Method, "http://leader.internal"+target, bytes.NewReader(fr.Body))
+	}), op.Method, target, bytes.NewReader(fr.Body))
 	if err != nil {
 		return internalapi.ForwardResponse{}, fmt.Errorf("building the request: %w", err)
 	}

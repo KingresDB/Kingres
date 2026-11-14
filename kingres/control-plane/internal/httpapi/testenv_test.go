@@ -190,7 +190,7 @@ func (e *env) do(r req) *httptest.ResponseRecorder {
 // token.
 func (e *env) token(roles ...string) string {
 	e.t.Helper()
-	cred, _, err := e.sessions.Create("tester", roles, auth.KindToken)
+	cred, _, err := e.sessions.Create(e.testUser(roles), roles, auth.KindToken)
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -201,7 +201,7 @@ func (e *env) token(roles ...string) string {
 // CSRF token.
 func (e *env) cookieSession(roles ...string) (cookie, csrf string) {
 	e.t.Helper()
-	cred, sess, err := e.sessions.Create("tester", roles, auth.KindCookie)
+	cred, sess, err := e.sessions.Create(e.testUser(roles), roles, auth.KindCookie)
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -235,4 +235,37 @@ func wantProblem(t *testing.T, w *httptest.ResponseRecorder, status int, code st
 		t.Fatalf("body status = %v, want %d", m["status"], status)
 	}
 	return m
+}
+
+// CurrentRoles reads the (mutable) user table: a user that was removed or
+// whose roles were changed is seen at once.
+func (f *fakeAuth) CurrentRoles(_ context.Context, user string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	u, ok := f.users[user]
+	if !ok {
+		return nil, auth.ErrInvalidCredentials
+	}
+	return auth.Normalize(u.roles), nil
+}
+
+// testUser registers (in the fake role table) a user for a test session with
+// the given cluster roles and returns its name: "tester" for one role,
+// "tester-<roles>" otherwise, so that sessions with different roles are
+// different users.
+func (e *env) testUser(roles []string) string {
+	name := "tester"
+	if len(roles) != 1 || roles[0] != auth.RoleAdmin {
+		name += "-" + strings.Join(roles, "+")
+	}
+	e.fa.mu.Lock()
+	defer e.fa.mu.Unlock()
+	if e.fa.users == nil {
+		e.fa.users = map[string]fakeUser{}
+	}
+	e.fa.users[name] = fakeUser{password: "-", roles: roles}
+	return name
 }

@@ -128,6 +128,9 @@ type Task struct {
 	Error *TaskError `json:"error"`
 	// Subject is the resource the task works on.
 	Subject *TaskSubject `json:"subject"`
+	// Detail is free text the running step recorded for the operator, for
+	// example the server it waits for; null when there is none.
+	Detail *string `json:"detail"`
 	// Cancellable tells whether cancel is accepted now.
 	Cancellable bool `json:"cancellable"`
 	// CreatedAt is the creation time.

@@ -195,3 +195,18 @@ func CSRFValid(sess Session, presented string) bool {
 	}
 	return subtle.ConstantTimeCompare([]byte(sess.CSRFToken), []byte(presented)) == 1
 }
+
+// RevokeUser deletes every session and token of a role and returns how many
+// there were. It is how a change to a role ends its sessions at once.
+func (s *Store) RevokeUser(username string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for k, sess := range s.sessions {
+		if sess.Username == username {
+			delete(s.sessions, k)
+			n++
+		}
+	}
+	return n
+}

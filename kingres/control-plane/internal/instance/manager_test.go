@@ -7,7 +7,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -152,7 +151,8 @@ func TestHBAChangeTakesEffect(t *testing.T) {
 		t.Fatal(err)
 	}
 	bob := func() error {
-		cfg, _ := pgx.ParseConfig(strings.Replace(in.DSN("postgres"), "user=kingresd password="+pgtest.Password, "user=bob password=bobpw", 1))
+		cfg, _ := pgx.ParseConfig(in.DSN("postgres"))
+		cfg.User, cfg.Password = "bob", "bobpw"
 		c, err := pgx.ConnectConfig(ctx, cfg)
 		if err == nil {
 			_ = c.Close(ctx)
@@ -218,5 +218,29 @@ func TestInitFailureLeavesNothing(t *testing.T) {
 	}
 	if err := m.Init(ctx, good); !errors.Is(err, instance.ErrExists) {
 		t.Errorf("second init: %v", err)
+	}
+}
+
+// A stopped instance whose socket directory is gone (a reboot empties /run)
+// starts again: the directory is created before every start.
+func TestStartRecreatesTheSocketDirectory(t *testing.T) {
+	in := pgtest.Start(t, nil)
+	ctx := context.Background()
+	m := in.Manager
+	if err := m.Stop(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	sock, err := m.SocketDir(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(sock); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Start(ctx, 1); err != nil {
+		t.Fatalf("start without the socket directory: %v", err)
+	}
+	if st, err := os.Stat(sock); err != nil || st.Mode().Perm() != 0o700 {
+		t.Errorf("socket directory after start: %v %v", st, err)
 	}
 }

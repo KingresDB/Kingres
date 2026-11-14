@@ -21,10 +21,12 @@ func (e *cp) serviceConn(t testing.TB, db string) *pgx.Conn {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := pgx.ParseConfig(fmt.Sprintf("host=127.0.0.1 port=%d dbname=%s user=kingresd password=%s sslmode=disable", e.pgPort, db, strings.TrimSpace(string(pw))))
+	cfg, err := pgx.ParseConfig("")
 	if err != nil {
 		t.Fatal(err)
 	}
+	cfg.Host, cfg.Port, cfg.Database, cfg.User, cfg.Password = "127.0.0.1", uint16(e.pgPort), db, "kingresd", strings.TrimSpace(string(pw)) //nolint:gosec // test port
+	cfg.TLSConfig, cfg.Fallbacks = nil, nil
 	c, err := pgx.ConnectConfig(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)

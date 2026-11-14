@@ -60,11 +60,20 @@ func (o *Ops) ExecuteQuery(ctx context.Context, actor string, req api.QueryReque
 	if o.Roles == nil {
 		return api.QueryResult{}, problem.New(problem.UnsupportedOp, "This server cannot act as the signed-in role (no managed instance).")
 	}
+	select {
+	case workbenchSlots <- struct{}{}:
+		defer func() { <-workbenchSlots }()
+	default:
+		return api.QueryResult{}, problem.New(problem.ServiceUnavailable, "Too many statements are running on this server; try again shortly.").WithRetryAfter(2)
+	}
 	conn, err := o.Roles.Connect(ctx, req.Database, actor)
 	if err != nil {
 		return api.QueryResult{}, connectProblem(err)
 	}
 	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+	if err := refuseDangerousRole(ctx, conn); err != nil {
+		return api.QueryResult{}, err
+	}
 
 	started := time.Now()
 	qctx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Millisecond+2*time.Second)
@@ -84,6 +93,7 @@ func (o *Ops) ExecuteQuery(ctx context.Context, actor string, req api.QueryReque
 		return api.QueryResult{}, queryProblem(err)
 	}
 	res := api.QueryResult{Columns: []api.QueryColumn{}, Rows: [][]any{}}
+	bytesSoFar := 0
 	tm := conn.TypeMap()
 	for _, fd := range rows.FieldDescriptions() {
 		name := fmt.Sprintf("oid:%d", fd.DataTypeOID)
@@ -98,6 +108,22 @@ func (o *Ops) ExecuteQuery(ctx context.Context, actor string, req api.QueryReque
 			cancel() // stop the server from sending the rest
 			break
 		}
+		// The size is checked on the raw wire values before anything is converted.
+		cells := 0
+		for _, raw := range rows.RawValues() {
+			if len(raw) > maxValueBytes {
+				cancel()
+				rows.Close()
+				return api.QueryResult{}, problem.New(problem.Unprocessable, fmt.Sprintf("A value in the result is larger than %d bytes; select a part of it (for example with substr).", maxValueBytes))
+			}
+			cells += len(raw) + 8
+		}
+		if bytesSoFar+cells > maxResultBytes {
+			res.Truncated = true
+			cancel()
+			break
+		}
+		bytesSoFar += cells
 		vals, err := rows.Values()
 		if err != nil {
 			rows.Close()
@@ -196,4 +222,79 @@ func queryProblem(err error) error {
 		return problem.SQL(pe.Message, pe.Code, int(pe.Position))
 	}
 	return PGProblem(err)
+}
+
+// Limits of the workbench (CP-04). A result is cut when its (wire) size passes
+// maxResultBytes (Truncated is then true, as for the row limit); one value
+// larger than maxValueBytes refuses the statement, because a cut value would
+// look like data. At most maxWorkbench statements run at once on a server.
+// Peak memory of one statement is the budget plus one row as it arrives from
+// PostgreSQL; the statement is canceled as soon as a limit is passed.
+const (
+	maxResultBytes = 16 << 20
+	maxValueBytes  = 1 << 20
+	maxWorkbench   = 4
+)
+
+var workbenchSlots = make(chan struct{}, maxWorkbench)
+
+// dangerousRolesSQL says whether the current role has an attribute or a
+// membership that gives the operating system's file system or programs
+// (CP-05): a superuser, replication or BYPASSRLS attribute, or membership,
+// direct or indirect and inherited or not (SET ROLE can use it), in a
+// predefined role that reads or writes server files, runs programs or reads
+// the server log.
+const dangerousRolesSQL = `
+WITH RECURSIVE me AS (SELECT oid, rolsuper, rolreplication, rolbypassrls FROM pg_catalog.pg_roles WHERE rolname = coalesce($2::text, current_user)),
+m(roleid) AS (
+    SELECT a.roleid FROM pg_catalog.pg_auth_members a WHERE a.member = (SELECT oid FROM me)
+  UNION
+    SELECT a.roleid FROM pg_catalog.pg_auth_members a JOIN m ON a.member = m.roleid)
+SELECT (SELECT rolsuper OR rolreplication OR rolbypassrls FROM me)
+    OR EXISTS (SELECT 1 FROM pg_catalog.pg_roles r WHERE r.oid IN (SELECT roleid FROM m) AND r.rolname = ANY($1))`
+
+// DangerousPredefinedRoles are the predefined roles that no cluster API grants
+// and whose members the workbench refuses.
+var DangerousPredefinedRoles = []string{"pg_execute_server_program", "pg_read_server_files", "pg_write_server_files", "pg_read_server_logs"}
+
+func refuseDangerousRole(ctx context.Context, conn *pgx.Conn) error {
+	var bad bool
+	if err := conn.QueryRow(ctx, dangerousRolesSQL, DangerousPredefinedRoles, nil).Scan(&bad); err != nil {
+		return PGProblem(err)
+	}
+	if bad {
+		return problem.New(problem.Forbidden, "The query workbench does not run as a role with the SUPERUSER, REPLICATION or BYPASSRLS attribute or with access to server files, programs or logs.")
+	}
+	return nil
+}
+
+// harmlessPredefined are the predefined roles the API may grant. Every other
+// pg_* role is refused: it is either dangerous (files, programs, logs) or not
+// known to this version.
+var harmlessPredefined = map[string]bool{
+	"pg_monitor": true, "pg_read_all_settings": true, "pg_read_all_stats": true, "pg_stat_scan_tables": true,
+	"pg_signal_backend": true, "pg_checkpoint": true, "pg_maintain": true, "pg_use_reserved_connections": true,
+}
+
+// memberOfRefusal says why a role may not be offered as a membership target by
+// name alone ("" when the name is acceptable).
+func memberOfRefusal(name string) string {
+	if len(name) >= 3 && name[:3] == "pg_" && !harmlessPredefined[name] {
+		return "memberships in this predefined role cannot be granted through the API"
+	}
+	return ""
+}
+
+// refuseDangerousTarget checks, in the catalog, that the role a membership is
+// granted in is not a superuser or replication or BYPASSRLS role and does not
+// itself lead to a dangerous predefined role.
+func refuseDangerousTarget(ctx context.Context, x execer, name string) error {
+	var bad bool
+	if err := x.QueryRow(ctx, dangerousRolesSQL, DangerousPredefinedRoles, name).Scan(&bad); err != nil {
+		return err
+	}
+	if bad {
+		return problem.Validation("The memberships are invalid.", field("/memberOf", "role "+strconv.Quote(name)+" has the SUPERUSER, REPLICATION or BYPASSRLS attribute or access to server files, programs or logs and cannot be granted through the API", "invalid"))
+	}
+	return nil
 }

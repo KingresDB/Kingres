@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: KingresDB Management API
-  version: 0.3.0
+  version: 0.4.0
   summary: REST API of the KingresDB management panel, CLI and manager.
   description: |
     The single REST API served by `kingresd` on every KingresDB server. The web panel
@@ -648,9 +648,12 @@ paths:
     get:
       operationId: listThisServerLogs
       summary: List local logs
-      description: Log entries of this server (agent, manager, router, etcd, Patroni, PostgreSQL instances), newest first.
+      description: |
+        Log entries of this server (agent, manager, router, etcd, Patroni, PostgreSQL instances), newest first.
+        Requires `kingres_ops`: PostgreSQL's log can contain data values (constraint violations, error details) of
+        statements run by other roles. The text of statements is not written to the log of managed instances.
       tags: [This server]
-      x-required-role: kingres_readonly
+      x-required-role: kingres_ops
       parameters:
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
@@ -2625,9 +2628,11 @@ paths:
     get:
       operationId: listLogs
       summary: Search cluster logs
-      description: Log entries from every server, newest first. For one server only, filter by `serverId` or use `/this-server/logs`.
+      description: |
+        Log entries from every server, newest first. For one server only, filter by `serverId` or use `/this-server/logs`.
+        Requires `kingres_ops` (see `listThisServerLogs`).
       tags: [Logs]
-      x-required-role: kingres_readonly
+      x-required-role: kingres_ops
       parameters:
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
@@ -3036,6 +3041,7 @@ components:
                 error: null
                 subject: { type: database, id: shop }
                 cancellable: true
+                detail: null
                 createdAt: '2026-11-14T09:58:00Z'
                 updatedAt: '2026-11-14T09:58:02Z'
                 createdBy: alice
@@ -3472,6 +3478,16 @@ components:
             - $ref: '#/components/schemas/NodeAddress'
             - type: 'null'
           description: Address other servers use to reach this one, if different from its listen address.
+        expectedFingerprint:
+          type:
+            - string
+            - 'null'
+          description: |
+            SHA-256 fingerprint (hex, colons allowed) that the internal certificate of the existing server must
+            have. With it, a different certificate is refused before the administrator's password is sent; without
+            it the fingerprint seen is only recorded (trust on first use). Replaces the header
+            `X-Kingres-Pin-Sha256` of 0.3.0, which is still accepted; both must agree if both are given. The
+            internal API of a server is at its REST host and the port above its REST port.
 
     # ------------------------------------------------------------------ this server
     ServiceName:
@@ -4232,6 +4248,16 @@ components:
             - string
             - 'null'
           description: Server group to place the server in.
+        expectedFingerprint:
+          type:
+            - string
+            - 'null'
+          description: |
+            SHA-256 fingerprint (hex, colons allowed) that the bootstrap certificate of the new server must have
+            (the server logs it at start). With it, a different certificate is refused before the setup token is
+            sent; without it the fingerprint seen is only recorded (trust on first use). Replaces the header
+            `X-Kingres-Pin-Sha256` of 0.3.0, which is still accepted; both must agree if both are given. The
+            internal API of the new server is at its REST host and the port above its REST port.
     ServerUpdateRequest:
       type: object
       description: Partial update of a server.
@@ -4703,8 +4729,9 @@ components:
       description: |
         A table has one or more classes. `plain` is a normal table on its home shard group; `distributed` is
         hash-distributed over buckets; `reference` is copied to every shard group; `ledger` has a tamper-evident
-        ledger. A table can be `distributed` and `ledger` (or `reference` and `ledger`) at the same time;
-        `plain` is never combined with `distributed` or `reference`.
+        ledger. A table can be `distributed` and `ledger` (or `reference` and `ledger`) at the same time.
+        **`plain` is never combined with another class**: a plain table with a ledger is `[ledger]`, not
+        `[plain, ledger]`.
       enum: [plain, distributed, reference, ledger]
     TableDistribution:
       type: object
@@ -5523,6 +5550,7 @@ components:
         - replication.restorePreferredPrimaries
         - ledger.verify
         - networkAccess.apply
+        - replicate.apply
     TaskStep:
       type: object
       description: One step of a task.
@@ -5539,7 +5567,7 @@ components:
           type:
             - string
             - 'null'
-          description: Extra information, for example the failing shard group.
+          description: Extra information about the step, for example `Waiting for server db3, which cannot be reached`. Set while the step runs; null otherwise.
         itemsDone:
           type:
             - integer
@@ -5621,12 +5649,20 @@ components:
     Task:
       type: object
       description: A durable long-running operation.
-      required: [id, kind, state, progress, error, subject, cancellable, createdAt, updatedAt, createdBy]
+      required: [id, kind, state, progress, error, subject, detail, cancellable, createdAt, updatedAt, createdBy]
       properties:
         id:
           type: integer
           format: int64
           description: Task identifier (`task_id` in `kingres.task`).
+        detail:
+          type:
+            - string
+            - 'null'
+          description: |
+            Free text the running step recorded for the operator: the server a step is waiting for, or the
+            certificate fingerprint seen when a server was added. Null when there is none. The text of the
+            running step is repeated in `TaskStep.detail`.
         kind:
           $ref: '#/components/schemas/TaskKind'
         state:
@@ -6526,9 +6562,11 @@ components:
           format: int64
           description: Digest verified against.
         taskId:
-          type: integer
+          type:
+            - integer
+            - 'null'
           format: int64
-          description: Task running the verification.
+          description: Task that ran the verification; null for a verification the extension recorded without a task (started in SQL or by the ledger worker).
         startedAt:
           type: string
           format: date-time
@@ -6734,7 +6772,7 @@ components:
           description: Rows returned in `rows`, or rows affected by a data-changing statement.
         truncated:
           type: boolean
-          description: True when the result was cut at `rowLimit`.
+          description: "True when the result was cut at `rowLimit` or at the byte budget of the result (16 MiB). A single value larger than 1 MiB is not cut and fails the statement with 422."
         commandTag:
           type: string
           description: PostgreSQL command tag, for example `SELECT 2` or `INSERT 0 1`.
@@ -6768,6 +6806,9 @@ components:
         - autoFailoverLimitReached
         - mapGroupUnavailable
         - ledgerVerificationFailed
+        - ledgerPendingTooOld
+        - versionMismatch
+        - certificateExpiring
         - taskFailed
     Alert:
       type: object

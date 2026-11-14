@@ -27,6 +27,15 @@ func taskToAPI(t task.Task) api.Task {
 		Cancellable: t.State == task.Pending || t.State == task.Running,
 		CreatedAt:   t.CreatedAt.UTC(), UpdatedAt: t.UpdatedAt.UTC(), CreatedBy: t.CreatedBy,
 	}
+	if t.Detail != "" {
+		d := t.Detail
+		out.Detail = &d
+		for i := range out.Progress.Steps {
+			if out.Progress.Steps[i].State == task.StepRunning {
+				out.Progress.Steps[i].Detail = &d
+			}
+		}
+	}
 	if t.Error != nil {
 		te := &api.TaskError{Code: t.Error.Code, Message: t.Error.Message}
 		if t.Error.Step != "" {

@@ -28,6 +28,10 @@ type Authenticator interface {
 	// ErrInvalidCredentials or ErrUnavailable. The password is used for this
 	// call only.
 	Authenticate(ctx context.Context, username, password string) ([]string, error)
+	// CurrentRoles tells, without a password, whether the role may still sign
+	// in (ErrInvalidCredentials when it was dropped, can no longer log in or
+	// has expired) and what its cluster roles are now.
+	CurrentRoles(ctx context.Context, username string) ([]string, error)
 }
 
 // memberSQL lists the built-in cluster roles the current role is a member of,
@@ -128,4 +132,48 @@ func classifyConnectError(err error) error {
 		return fmt.Errorf("%w: SQLSTATE %s", ErrUnavailable, pgErr.Code)
 	}
 	return fmt.Errorf("%w: %w", ErrUnavailable, err)
+}
+
+// currentSQL tells whether a role still exists, can log in and has not passed
+// VALID UNTIL, and lists the cluster roles it is a member of now. It is run
+// with the service connection: the answer reflects the catalog at this
+// moment, not the moment of sign-in.
+const currentSQL = `
+WITH RECURSIVE me AS (
+    SELECT oid FROM pg_catalog.pg_roles
+    WHERE rolname = $1 AND rolcanlogin AND (rolvaliduntil IS NULL OR rolvaliduntil > now())),
+m(roleid) AS (
+    SELECT a.roleid FROM pg_catalog.pg_auth_members a WHERE a.member = (SELECT oid FROM me) AND a.inherit_option
+  UNION
+    SELECT a.roleid FROM pg_catalog.pg_auth_members a JOIN m ON a.member = m.roleid WHERE a.inherit_option)
+SELECT (SELECT count(*) FROM me)::int,
+       coalesce((SELECT array_agg(r.rolname::text) FROM pg_catalog.pg_roles r
+                 WHERE r.oid IN (SELECT roleid FROM m)
+                   AND r.rolname IN ('kingres_admin', 'kingres_ops', 'kingres_readonly', 'kingres_stats')), '{}')`
+
+// CurrentRoles implements Authenticator: the role must exist, be able to log
+// in and not be expired (otherwise ErrInvalidCredentials), and its cluster
+// roles are derived again from pg_auth_members.
+func (p *Postgres) CurrentRoles(ctx context.Context, username string) ([]string, error) {
+	cfg := p.config()
+	if cfg.RuntimeParams == nil {
+		cfg.RuntimeParams = map[string]string{}
+	}
+	cfg.RuntimeParams["application_name"] = "kingresd-session"
+	cctx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+	conn, err := pgx.ConnectConfig(cctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrUnavailable, err)
+	}
+	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+	var n int
+	var roles []string
+	if err := conn.QueryRow(cctx, currentSQL, username).Scan(&n, &roles); err != nil {
+		return nil, fmt.Errorf("%w: reading the role: %w", ErrUnavailable, err)
+	}
+	if n == 0 {
+		return nil, ErrInvalidCredentials
+	}
+	return Normalize(roles), nil
 }

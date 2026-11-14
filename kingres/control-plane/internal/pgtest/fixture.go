@@ -9,9 +9,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pgconninfo"
 )
 
 // The integration tests of several packages read a PostgreSQL instance loaded with
@@ -90,8 +93,13 @@ func setupFixture(t testing.TB) (string, error) {
 		if fixtureErr = run("pg_basebackup", "-h", "127.0.0.1", "-p", strconv.Itoa(in.Port), "-U", "kingresd", "-D", sdir, "-X", "stream", "-R", "-c", "fast"); fixtureErr != nil {
 			return
 		}
-		conf := fmt.Sprintf("\nport = %d\nunix_socket_directories = '%s'\nprimary_conninfo = 'host=127.0.0.1 port=%d user=kingresd password=%s application_name=kingres_node_2'\n",
-			standby, in.Root, in.Port, Password)
+		primary, perr := pgconninfo.Format(pgconninfo.Pair{Key: "host", Value: "127.0.0.1"}, pgconninfo.Pair{Key: "port", Value: strconv.Itoa(in.Port)},
+			pgconninfo.Pair{Key: "user", Value: "kingresd"}, pgconninfo.Pair{Key: "password", Value: Password}, pgconninfo.Pair{Key: "application_name", Value: "kingres_node_2"})
+		if perr != nil {
+			fixtureErr = perr
+			return
+		}
+		conf := "\nport = " + strconv.Itoa(standby) + "\nunix_socket_directories = '" + in.Root + "'\nprimary_conninfo = '" + strings.ReplaceAll(primary, "'", "''") + "'\n"
 		f, err := os.OpenFile(filepath.Join(sdir, "postgresql.auto.conf"), os.O_APPEND|os.O_WRONLY, 0)
 		if err != nil {
 			fixtureErr = err
@@ -121,7 +129,9 @@ func setupFixture(t testing.TB) (string, error) {
 		if fixtureErr = psql("postgres", "-c", "select pg_create_physical_replication_slot('kingres_slot_2')"); fixtureErr != nil {
 			return
 		}
-		fixtureDSN = fmt.Sprintf("postgres://cp_service:cp_service_pw@127.0.0.1:%d/kingres_cp?sslmode=disable", in.Port)
+		fixtureDSN, fixtureErr = pgconninfo.Format(pgconninfo.Pair{Key: "host", Value: "127.0.0.1"}, pgconninfo.Pair{Key: "port", Value: strconv.Itoa(in.Port)},
+			pgconninfo.Pair{Key: "dbname", Value: "kingres_cp"}, pgconninfo.Pair{Key: "user", Value: "cp_service"},
+			pgconninfo.Pair{Key: "password", Value: "cp_service_pw"}, pgconninfo.Pair{Key: "sslmode", Value: "disable"})
 	})
 	return fixtureDSN, fixtureErr
 }

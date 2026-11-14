@@ -54,6 +54,9 @@ const (
 	ApplyRoleSync       = "role.sync"
 	ApplyRoleDrop       = "role.drop"
 	ApplyGrant          = "grant"
+	// ApplyRoleChanged tells a server that a role changed: it ends the role's
+	// sessions and forgets cached role checks (no database change).
+	ApplyRoleChanged = "role.changed"
 )
 
 // KindReplicate is the hidden task kind that brings servers up to date.
@@ -121,6 +124,16 @@ func (o *Ops) ApplyLocal(ctx context.Context, kind string, raw json.RawMessage) 
 			return errors.New("this server has no instance")
 		}
 		return o.Local.ApplyRoles(ctx, p.Roles)
+	case ApplyRoleChanged:
+		var p roleDrop
+		if err := strictJSON(raw, &p); err != nil {
+			return err
+		}
+		if p.Name == "" || len(p.Name) > 63 {
+			return errors.New("the role name is not valid")
+		}
+		o.endSessionsLocal(ctx, p.Name)
+		return nil
 	case ApplyRoleDrop:
 		var p roleDrop
 		if err := strictJSON(raw, &p); err != nil {
@@ -299,8 +312,8 @@ func (o *Ops) replicate(ctx context.Context, in replicateInput) {
 		return
 	}
 	in.Servers = failed
-	subject := fmt.Sprintf("%s:%s:%d", in.Kind, strings.Join(in.Names, ","), time.Now().UnixNano())
-	if _, err := o.StartTask(ctx, KindReplicate, "replicate", subject, in, "system"); err != nil {
+	subject := fmt.Sprintf("apply:%s:%s:%d", in.Kind, strings.Join(in.Names, ","), time.Now().UnixNano())
+	if _, err := o.StartTask(ctx, KindReplicate, "replication", subject, in, "system"); err != nil {
 		o.Log.Error("starting the task that brings servers up to date failed", "error", err)
 	}
 }
@@ -323,4 +336,31 @@ func (o *Ops) replicateDefinition() task.Definition {
 			return o.Fanout.Apply(ctx, server, cur.Kind, params)
 		}), nil
 	}}
+}
+
+// endSessionsLocal ends the sessions of a role on this server and removes its
+// acting-as entry of the proxy.
+func (o *Ops) endSessionsLocal(ctx context.Context, role string) {
+	if o.SessionEnder != nil {
+		o.SessionEnder(role)
+	}
+	if o.Roles != nil {
+		o.Roles.Revoke(ctx, role)
+	}
+}
+
+// roleChanged ends the sessions of a changed role here and, as the leader, on
+// every other server (after the change reached them). A server that cannot be
+// reached is not waited for: it re-checks every role within a few seconds
+// (auth.Revalidator), so the worst case is that bound.
+func (o *Ops) roleChanged(ctx context.Context, role string) {
+	o.endSessionsLocal(ctx, role)
+	if o.Fanout == nil {
+		return
+	}
+	for _, s := range o.others(ctx) {
+		if err := o.Fanout.Apply(ctx, s.ID, ApplyRoleChanged, roleDrop{Name: role}); err != nil {
+			o.Log.Warn("telling a server that a role changed failed; it re-checks roles on its own", "server", s.ID, "error", err)
+		}
+	}
 }

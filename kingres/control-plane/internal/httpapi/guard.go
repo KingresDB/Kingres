@@ -219,6 +219,16 @@ func (s *Server) checkSession(c *call, r *http.Request) *problem.Problem {
 		// Identity verified by the forwarding server and delivered through the
 		// internal API (mutual TLS); there is no cookie, token or CSRF here.
 		sess := forwardedSession(f)
+		cur, perr := s.currentRoles(r, sess.Username)
+		if perr != nil {
+			return perr
+		}
+		// The claimed roles must still be held by the role on this server (CP-07);
+		// authorization uses the current ones.
+		if !auth.Subset(sess.ClusterRoles, cur) {
+			return problem.New(problem.Unauthenticated, "The forwarded identity does not hold the claimed cluster roles.")
+		}
+		sess.ClusterRoles = cur
 		c.session = &sess
 		c.audit = contract.IsAuditAction(c.op.ID)
 		c.details = map[string]any{"forwardedBy": f.peer, "originRequestId": f.requestID}
@@ -234,6 +244,11 @@ func (s *Server) checkSession(c *call, r *http.Request) *problem.Problem {
 	if p != nil {
 		return p
 	}
+	cur, perr := s.currentRoles(r, sess.Username)
+	if perr != nil {
+		return perr
+	}
+	sess.ClusterRoles = cur
 	c.session, c.credential = &sess, cred
 	c.audit = contract.IsAuditAction(c.op.ID)
 
@@ -376,3 +391,28 @@ func requireJSON(r *http.Request) *problem.Problem {
 	}
 	return nil
 }
+
+// currentRoles re-derives the cluster roles of the session's role from
+// PostgreSQL (through the short cache of the revalidator): a role that was
+// dropped, can no longer log in, has expired or lost its cluster roles loses
+// the session at once. A backend that cannot be asked fails closed.
+func (s *Server) currentRoles(r *http.Request, username string) ([]string, *problem.Problem) {
+	roles, err := s.reval.Roles(r.Context(), username)
+	switch {
+	case errors.Is(err, auth.ErrInvalidCredentials):
+		return nil, problem.New(problem.Unauthenticated, "The role of this session may no longer sign in; sign in again.").
+			WithHeader("WWW-Authenticate", `Bearer realm="kingresd"`)
+	case err != nil:
+		s.log.Error("re-checking the role of a session", "request_id", stateOf(r).id, "error", err)
+		return nil, problem.New(problem.ServiceUnavailable, "The role of this session cannot be checked right now.").WithRetryAfter(5)
+	case len(roles) == 0:
+		return nil, problem.New(problem.Unauthenticated, "The role of this session no longer has a cluster role; sign in again.").
+			WithHeader("WWW-Authenticate", `Bearer realm="kingresd"`)
+	}
+	return roles, nil
+}
+
+// RoleChanged ends the sessions of a role on this server and forgets the
+// cached role checks; it is called after every change to a role, here and
+// on the request of the leader.
+func (s *Server) RoleChanged(username string) { s.reval.Changed(username) }

@@ -133,7 +133,7 @@ server at start. The DSN is never logged.
 | `metrics-token` | `KINGRES_METRICS_TOKEN` | none | bearer token that may scrape `/metrics` besides stats-role session tokens |
 | `server-host` | `KINGRES_SERVER_HOST` | machine host name | host registered in the shard catalog; it is the server id, the common name and a name of its certificate, and the host the other servers (and the sharding extension) connect to. It must resolve to this server from every other server |
 | `allow-remote-setup` | `KINGRES_ALLOW_REMOTE_SETUP` | `false` | `true` lets the setup operations come from non-loopback addresses while uninitialized (containers listening on `0.0.0.0`); the setup token is still required |
-| `-version` | | | prints version, contract revision (0.3.0) and build commit (`-ldflags "-X main.commit=..."`, else `unknown`) |
+| `-version` | | | prints version, contract revision (0.4.0) and build commit (`-ldflags "-X main.commit=..."`, else `unknown`) |
 | `-stop-instances` | | | stops the managed instances (fast shutdown) and exits |
 | `tls-cert-file`, `tls-key-file` | `KINGRES_TLS_CERT_FILE`, `KINGRES_TLS_KEY_FILE` | none | enable HTTPS (both or neither) |
 
@@ -175,8 +175,8 @@ bodies.
 
 ## What is implemented
 
-The server implements revision **0.3.0** of the contract (86 operations, 69
-paths). "Real" means the operation works against PostgreSQL or the local node
+The server implements revision **0.4.0** of the contract (86 operations, 69
+paths; what 0.4.0 planned beyond this table is in "Not done in this increment"). "Real" means the operation works against PostgreSQL or the local node
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
@@ -511,6 +511,65 @@ failover of the manager leader does not exist. A server must be reachable at the
 need the trust rules to be applied again (any membership change does that). A cluster-wide task takes the list of servers when it starts: a server that joins while a
 `database.create` or `database.drop` task is running is not part of that task (do not overlap them).
 
+## Security review of 2026-11-14 (CP-01 to CP-07) and what the logs can contain
+
+The review `docs/reviews/2026-11-14-kingresd-control-plane.md` was fixed before anything else in this increment. Each
+finding has a test that fails on the reviewed code.
+
+| Finding | Reproducing test | Fix |
+|---|---|---|
+| CP-01 (critical) a database name from a path is spliced into the service DSN | `TestServiceDSNDatabaseNameCannotRedirect` (`internal/cluster`; failed before: the name added `host` and `port`); `TestCP01DatabaseNameCannotRedirectTheServiceConnection` (WSL: a listener named in the database name gets no connection) | no connection string is built by formatting: `internal/pgconninfo` is the only place that quotes values per libpq's rules (NUL refused, keywords from a closed list); used by the service DSN, `kingres_shard.node_conninfo`, the fallback DSN and the test helpers; `TestNoConnectionStringsAssembledElsewhere` scans every Go file of the module; `FuzzFormatRoundTrip`; internal-API URLs are built by `internalapi.URL` and the forwarded request URL as a `url.URL` value. Service connections for operations use the instance socket (the read pools and the sign-in use loopback TCP) |
+| CP-02 (critical) sessions keep the roles of sign-in | `TestSessionsFollowTheCurrentStateOfTheRole`, `TestRoleChangedEndsItsSessionsAtOnce`, `TestLeaderChecksForwardedIdentityAgainstTheRole` (unit); `TestCP02SessionsFollowTheCurrentRole` (WSL: the review's scenario, a role disabled in SQL, a dropped role, a password change) | every request re-derives the role's cluster roles from `pg_roles` and `pg_auth_members` (`auth.Revalidator`): a role that no longer exists, cannot log in, has expired or has no cluster role gets 401 and loses its sessions. The answer is cached for **3 seconds** per role, so a change made directly in SQL is seen within 3 s. A change through the API (create, update, delete, memberships, cluster roles) ends the role's sessions at once on this server and, through the internal call `POST /apply` with kind `role.changed`, on every other server, and removes the role's entry of the acting-as map. A backend that cannot be asked fails closed (503) |
+| CP-03 (high) statement text in PostgreSQL's log, served by `/logs` | `TestCP03FailedStatementTextIsNotLogged` (WSL) | the managed configuration sets `log_min_error_statement = panic`, `log_statement = none`, `log_min_duration_statement = -1` and no parameter logging, and local settings cannot override them; `listLogs` and `listThisServerLogs` need **kingres_ops** (contract 0.4.0, breaking) |
+| CP-04 (high) no size cap on workbench results | `TestCP04WorkbenchResultsAreBounded` (WSL; shows the allocation of the review's statement) | result budget 16 MiB (then `truncated: true`), one value at most 1 MiB (422 otherwise), at most 4 statements at once per server (503 with `Retry-After` otherwise); the internal `exec` call has the same caps. Peak memory is the budget plus one row as PostgreSQL sends it |
+| CP-05 (medium) dangerous predefined roles can be granted | `TestCP05DangerousMembershipsAreRefused` (WSL) | memberships in any `pg_*` role except the harmless monitoring ones, and in roles with SUPERUSER, REPLICATION or BYPASSRLS (or that lead to a dangerous predefined role), are refused with 400; the workbench answers 403 for a role that has such an attribute or a membership in `pg_execute_server_program`, `pg_read_server_files`, `pg_write_server_files` or `pg_read_server_logs`. A superuser can still grant these in SQL; that is outside the panel's model |
+| CP-06 (low) control characters in user names | `TestLoginRefusesControlCharactersInTheUserName`, `TestCleanReplacesControlCharacters` | `login` refuses control characters (400) before PostgreSQL and the audit log; the audit sink replaces control characters in actor and resource id |
+| CP-07 (medium) the leader trusts a forwarded identity | `TestLeaderChecksForwardedIdentityAgainstTheRole` | the leader derives the claimed role's cluster roles itself (the check of CP-02) and refuses an identity that does not hold the claimed roles; a forwarding server must be in the peer directory (its certificate is already checked against the CA and the revocation list). The stated trust model is unchanged: every server of a cluster is fully trusted |
+
+**What the logs can contain.** The text of statements is not written to the log of a managed instance (settings above;
+an operator who overrides them in `postgresql.conf` after the include of the managed file can undo this). The error
+message and the DETAIL line that PostgreSQL writes can still contain data values (a unique violation names the key
+value), which is why the log operations need `kingres_ops`. The kingresd log and the audit file never contain
+statement text, passwords or tokens.
+
+**Blast radius of the service password.** The service role (`kingresd`, a superuser) authenticates with a SCRAM
+password stored in `<data-dir>/service-credentials` (0600). The service connections kingresd opens for operations use the
+instance's unix socket, so the password is not sent over TCP there, and no connection string can be redirected (CP-01);
+the read-side pools and the sign-in authenticator still use loopback TCP (the socket has only a peer rule for other
+roles), and the loopback password rule remains in `pg_hba.conf`. Peer authentication for the service role was
+not adopted. A `pg-dsn` of an unmanaged instance is used as the operator gave it. Connections to other servers use
+the server certificate and no password.
+
+**Connecting locally as an administrator.** The supported way is through kingresd (the query workbench). A DBA with
+the operating system account that runs kingresd can use `psql -h <socket-dir>/<instance id> -p <pg-port> -U <role>
+postgres` (the package's socket directory is `/run/kingres/1`) with the role's password. `psql` does not find the
+socket without `-h` because the sockets are not in PostgreSQL's default directory.
+
+**Socket directory.** The socket directory of an instance (`<socket-dir>/<id>`, mode 0700) is created before every
+`pg_ctl start`, not only when the instance is created (`TestStartRecreatesTheSocketDirectory`): after a reboot, when
+`/run` is empty, the start works, and a package no longer needs `RuntimeDirectory=kingres kingres/1` for the instance
+directory.
+
+## Not done in this increment, and the manager's state on a leader change
+
+**Not done** (each still answers 422 `unsupported_operation`, or is unchanged): server groups (create, delete,
+assign), inclusion proofs, the list and detail of ledger verifications, instance start and stop, leave-cluster, local
+settings, certificate revoke and renew, the renewal job, cluster-wide gathering of logs, alerts and metrics, raising
+the new alert kinds (the contract lists them; nothing raises them yet), certificate expiry, seen fingerprint and
+pinned flag on `Server`, `NodeStateInfo.setupTask` and `SetupTaskSummary`, the `removeServer` wording in the
+contract, and a dedicated problem for operations that need the CA when the leader does not hold it. Rebalance,
+failover, restoring preferred primaries and `updateServer` stay as specified.
+
+**What has to move with the manager (for the high-availability increment).** The certificate authority key
+(`<data-dir>/pki/ca.key`), the revocation list (`revoked.json`), the task engine (rows of `kingres_system` on the
+leader's instance), the directory of internal addresses (`peers.json`, on every server), the audit file
+(`audit.jsonl`, per server) and the session store (memory, per server) belong to the first server today. A leader
+change (not implemented) has to move the CA key and the revocation list (encrypted, to the standby leader) and the
+`kingres_cp` schema (it lives in the map group and follows it); followers already re-read the leader from the catalog
+every 2 s. Until then the limitation is: **if the manager leader is not the server that holds the CA, operations that
+need the CA (adding a server, removing one, certificate operations) cannot work**; the cluster keeps running on its
+existing certificates until they expire (one year). See `docs/design/ha-phase5.md`.
+
 ## Design notes (where the specification was silent or was changed)
 
 1. **Role connections (D6)**: the spec keeps the sign-in connection. A connection is bound to one database and the
@@ -647,7 +706,7 @@ mismatches the web panel's end-to-end run found (see "Corrections after the pane
 part, joining and adding a server (D4), removing an empty server (D5), the certificate trust between the PostgreSQL
 instances (D3), the cluster-wide create and drop of databases, role and grant changes and network rules, and the
 integration tests with three `kingresd` processes (package `clustertest`); see "Running several servers" and design
-notes 11 to 21. Tested against `kingres_shard` 0.2 as committed in `c283dbf6bc` (`scripts/install-shard-0.2.sh`).
+notes 11 to 21. Tested against `kingres_shard` and `kingres_ledger` 0.2 built from the repository commit recorded by `scripts/install-extensions.sh`.
 **Not done:** server groups and the cluster-wide logs, alerts and metrics, the certificate renewal job, rebalance,
 failover and restoring preferred primaries, and contract 0.4.0 with what depends on it (inclusion proofs,
 verifications list and detail, instance start/stop, leave-cluster, the new alert kinds); every one of them still
@@ -728,8 +787,7 @@ interrupted (SIGKILL of the leader) at each of the seven steps; a failed join th
 that waits for a stopped server and finishes when it is back; the network rules on every server; and that no
 password, verifier or private key is in a log, the audit file, a task row or another server's directory.
 `scripts/smoke3.sh <kingresd> [base-port]` is the same flow driven by curl and psql (output in the increment's report).
-`scripts/install-shard-0.2.sh [commit]` builds `kingres_shard` 0.2 from a commit (default `c283dbf6bc`) into
-`~/kw-cp/install`, not from the working tree.
+`scripts/install-extensions.sh [commit]` builds `kingres_shard` and `kingres_ledger` (both 0.2, with the fixes of their reviews) from a commit (default: the repository HEAD) into `~/kw-cp/install`, not from the working tree, and records the commit in `~/kw-cp/install/extensions-commit.txt`.
 
 ## Contract types and validation
 

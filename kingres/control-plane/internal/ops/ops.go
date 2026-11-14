@@ -50,6 +50,9 @@ type Ops struct {
 	// Service opens service connections; Roles opens role connections.
 	Service ServiceConnector
 	Roles   RoleConnector
+	// SessionEnder ends the sessions of a role on this server and forgets cached
+	// role checks (the HTTP layer provides it); nil does nothing.
+	SessionEnder func(role string)
 	// Instances writes pg_hba.conf and reloads the local instance.
 	Instances InstanceControl
 	// Fanout reaches the other servers (nil: this server is alone) and Local is

@@ -169,7 +169,11 @@ func (c *Client) Do(ctx context.Context, serverID, method, path string, in, out 
 		}
 		body = bytes.NewReader(b)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, "https://"+p.InternalAddr+internalapi.Prefix+path, body)
+	target, err := internalapi.URL(p.InternalAddr, path)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, method, target, body)
 	if err != nil {
 		return err
 	}

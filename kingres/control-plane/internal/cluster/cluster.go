@@ -24,6 +24,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/instance"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pgconninfo"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/setup"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
 )
@@ -144,13 +145,38 @@ func (s *Service) OnDSN(f func(dsn string) error) {
 
 // ServiceDSN returns the DSN of the service role for database db, or "" when
 // no credentials exist yet.
-func (s *Service) ServiceDSN(db string) string {
+func (s *Service) ServiceDSN(db string) string { return s.serviceDSN(db, false) }
+
+// serviceDSN builds the DSN; viaSocket uses the instance's unix socket (only the
+// service role has a password rule there, so it is for service connections, not
+// for the sign-in authenticator).
+func (s *Service) serviceDSN(db string, viaSocket bool) string {
 	pw, err := s.readCredentials()
 	if err != nil {
 		return ""
 	}
-	return fmt.Sprintf("host=127.0.0.1 port=%d dbname=%s user=%s password=%s sslmode=%s",
-		s.cfg.PGPort, db, instance.ServiceRole, pw, s.sslMode())
+	// Every value goes through pgconninfo, which quotes it: a database name
+	// from a request path can never add or replace a keyword (CP-01). The
+	// host is the instance's unix socket directory when it is known, so the
+	// service password does not travel over TCP at all; otherwise loopback.
+	host, sslmode := "127.0.0.1", s.sslMode()
+	if viaSocket && s.mgr != nil {
+		if sock, err := s.mgr.SocketDir(NodeID); err == nil {
+			host, sslmode = filepath.ToSlash(sock), "disable"
+		}
+	}
+	dsn, err := pgconninfo.Format(
+		pgconninfo.Pair{Key: "host", Value: host},
+		pgconninfo.Pair{Key: "port", Value: strconv.Itoa(s.cfg.PGPort)},
+		pgconninfo.Pair{Key: "dbname", Value: db},
+		pgconninfo.Pair{Key: "user", Value: instance.ServiceRole},
+		pgconninfo.Pair{Key: "password", Value: pw},
+		pgconninfo.Pair{Key: "sslmode", Value: sslmode},
+	)
+	if err != nil {
+		return ""
+	}
+	return dsn
 }
 
 func (s *Service) sslMode() string {
@@ -260,7 +286,7 @@ func (s *Service) StopInstance(ctx context.Context) error {
 
 // connect opens a connection as the service role.
 func (s *Service) connect(ctx context.Context, db string) (*pgx.Conn, error) {
-	dsn := s.ServiceDSN(db)
+	dsn := s.serviceDSN(db, true)
 	if dsn == "" {
 		return nil, errors.New("no service credentials")
 	}

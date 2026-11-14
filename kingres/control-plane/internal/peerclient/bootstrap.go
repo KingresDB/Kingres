@@ -59,7 +59,11 @@ func BootstrapCall(ctx context.Context, addr, expected, method, path string, hea
 		}
 		body = bytes.NewReader(b)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, "https://"+addr+internalapi.Prefix+path, body)
+	target, err := internalapi.URL(addr, path)
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, method, target, body)
 	if err != nil {
 		return "", err
 	}

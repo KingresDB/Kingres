@@ -17,8 +17,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 )
@@ -119,12 +122,12 @@ func (s *FileSink) Append(_ context.Context, e Event) (int64, error) {
 	ev := api.AuditEvent{
 		ID:           s.nextID,
 		Timestamp:    s.now().UTC(),
-		Actor:        e.Actor,
-		ActorAddress: e.ActorAddress,
+		Actor:        Clean(e.Actor),
+		ActorAddress: Clean(e.ActorAddress),
 		Source:       e.Source,
 		Action:       e.Action,
 		ResourceType: e.ResourceType,
-		ResourceID:   e.ResourceID,
+		ResourceID:   Clean(e.ResourceID),
 		Outcome:      e.Outcome,
 		RequestID:    e.RequestID,
 		Details:      e.Details,
@@ -237,8 +240,8 @@ func (m *Memory) Append(_ context.Context, e Event) (int64, error) {
 	defer m.mu.Unlock()
 	id := int64(len(m.events)) + 1
 	m.events = append(m.events, api.AuditEvent{
-		ID: id, Timestamp: m.now().UTC(), Actor: e.Actor, ActorAddress: e.ActorAddress,
-		Source: e.Source, Action: e.Action, ResourceType: e.ResourceType, ResourceID: e.ResourceID,
+		ID: id, Timestamp: m.now().UTC(), Actor: Clean(e.Actor), ActorAddress: Clean(e.ActorAddress),
+		Source: e.Source, Action: e.Action, ResourceType: e.ResourceType, ResourceID: Clean(e.ResourceID),
 		Outcome: e.Outcome, RequestID: e.RequestID, Details: e.Details,
 	})
 	return id, nil
@@ -292,4 +295,26 @@ func (s *FileSink) terminateTornLine() error {
 		return err
 	}
 	return s.file.Sync()
+}
+
+// Clean replaces control characters (and invalid UTF-8) in a text taken from a
+// request with U+FFFD, so that one event is always one clean line whoever
+// reads the file, and a name cannot forge a field in a plain-text view.
+func Clean(s string) string {
+	bad := false
+	for _, r := range s {
+		if unicode.IsControl(r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) || r == utf8.RuneError {
+			bad = true
+			break
+		}
+	}
+	if !bad {
+		return s
+	}
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) || r == utf8.RuneError {
+			return utf8.RuneError
+		}
+		return r
+	}, s)
 }

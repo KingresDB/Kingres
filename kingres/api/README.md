@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.3.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.4.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and `kingres-cli`. Lint it and run the mechanical rule check with:
 
 ```
@@ -138,13 +138,14 @@ Each task kind has exactly one `subject.type`; `subject.id` is always a string.
 | `kind` | `subject.type` | `subject.id` |
 |---|---|---|
 | `cluster.init`, `cluster.join` | `cluster` | `cluster` |
-| `server.add`, `server.remove`, `server.failover`, `server.leave` | `server` | the `ServerId` (for `server.add` the host of the new server's address; for `server.leave` this server) |
+| `server.add`, `server.remove`, `server.failover`, `server.leave` | `server` | the `ServerId` (for `server.add` and `server.remove` the id the server registers under, which is the host of its address; for `server.leave` this server) |
 | `instance.start`, `instance.stop`, `instance.restart` | `instance` | the instance id (`node_id`) as a decimal string |
 | `database.create`, `database.update`, `database.drop` | `database` | the database name |
 | `table.distribute` | `table` | `database/schema.table` |
 | `rebalance` | `rebalance` | the task id as a decimal string (equals the report id) |
 | `replication.restorePreferredPrimaries` | `replication` | `preferred-primaries` |
-| `ledger.verify` | `ledgerVerification` | the verification id as a decimal string |
+| `ledger.verify` | `ledgerVerification` | the **database name**: the verification id exists only after the run (see `LedgerVerification.taskId`) |
+| `replicate.apply` | `replication` | `apply:<operation>:<role or database names>:<unix nanoseconds>`: the task that brings the servers that could not be reached up to date after a role or grant change (one step per server, `TaskStep.detail` names the server it waits for) |
 | `networkAccess.apply` | `networkAccess` | `network-access` |
 
 `Task.subject` is null only for tasks whose subject is not known (system tasks such as auto-failover use
@@ -272,6 +273,54 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.4.0
+
+Revision written with the fourth increment of `kingresd` (design: `docs/design/control-plane-3.md`) and the fixes of
+the security review of 2026-11-14. Summary for the panel: 0 operations added (86 operations, 69 paths), 1 breaking
+change of a required role, 1 new required response property, 4 optional request properties.
+
+#### Breaking
+
+1. **`listLogs` and `listThisServerLogs` now need `kingres_ops`** (was `kingres_readonly`). The log of a PostgreSQL
+   instance can contain data values of statements of other roles (finding CP-03 of the review); the panel must hide
+   the Logs page from `kingres_readonly` and `kingres_stats` accounts. The text of statements itself is no
+   longer written to the log of managed instances.
+2. **`Task.detail` is a new required response property** (string or `null`): free text the running step recorded,
+   for example `Waiting for server db3, which cannot be reached (Create the database on server db3).` or the
+   certificate fingerprint seen when a server was added. Existing clients that ignore unknown properties are
+   unaffected; a client that validates strictly must accept it.
+
+#### Additive
+
+1. **`JoinClusterRequest.expectedFingerprint` and `AddServerRequest.expectedFingerprint`** (optional string, SHA-256
+   hex, colons allowed): pins the certificate of the other server on first contact. The header
+   `X-Kingres-Pin-Sha256` of 0.3.0 still works; if both are given they must agree (400 otherwise). The seen
+   fingerprint is in `Task.detail` of `server.add` and in the audit event (`fingerprintPinned`).
+2. **Internal address convention** (stated in the descriptions of both requests): the internal API of a server is at
+   its REST host and the port above its REST port. There is no `internalAddress` field.
+3. **`TaskKind`** gains `replicate.apply` (see "Task kinds and subjects"; it was already used in 0.3.0 but hidden
+   from the task list). Every kind the server uses is in the table, each with one subject type.
+4. **`TaskStep.detail`** is now filled: for the running step it repeats `Task.detail`.
+5. **`AlertKind`** gains `ledgerPendingTooOld`, `versionMismatch` and `certificateExpiring`
+   (`ledgerVerificationFailed` existed).
+6. **`LedgerVerification.taskId`** is nullable (a verification recorded by the extension without a task).
+7. **`QueryResult.truncated`** is also `true` when the byte budget of the result (16 MiB) is reached, not only
+   when `rowLimit` is; a single value larger than 1 MiB makes the statement fail with 422 `unprocessable`.
+
+#### Documentation
+
+1. `info.version` 0.4.0.
+2. `TableClass`: **`plain` is never combined with another class** (a plain table with a ledger is `[ledger]`).
+3. `removeServer`, `createInclusionProof`, server groups, certificate operations and the other items planned for
+   0.4.0 are **not in this revision**; they answer `unsupported_operation` as before. See the server README, "Not done".
+4. Role changes (`createRole`, `updateRole`, `deleteRole`, `setRoleMemberships`, `setRoleClusterRoles`) end the
+   sessions and tokens of the changed role on every server at once; a role that is dropped, disabled or expired is
+   refused on its next request (401); cluster roles are re-derived on every request (cache of 3 seconds).
+   Membership in `pg_*` roles other than the harmless monitoring ones, and in roles with the SUPERUSER,
+   REPLICATION or BYPASSRLS attribute, is refused with 400 `validation_failed`; the query workbench answers 403 for
+   a role that has such an attribute or a membership giving access to server files, programs or logs.
+   User names with control characters are refused by `login` with 400.
 
 ### 0.3.0
 

@@ -235,6 +235,27 @@ const opIds = new Set(operations.map((o) => o.op.operationId));
 const events = new Set(['loginFailed', 'setupTokenRejected', 'autoFailover']);
 for (const a of schemas.AuditAction?.enum ?? []) if (!events.has(a) && !opIds.has(a)) fail('AuditAction', a + ' is neither an operationId nor a known event');
 
+
+// 0.4.0 rules.
+// Log operations expose data values of other roles' statements: kingres_ops at least.
+for (const o of operations) {
+  if (['listLogs', 'listThisServerLogs'].includes(o.op.operationId) && !['kingres_ops', 'kingres_admin'].includes(o.op['x-required-role'])) fail(o.op.operationId, 'log operations need kingres_ops or better');
+}
+// Every Task has a nullable detail; every task kind appears in the README table of kinds and subjects.
+if (!(schemas.Task?.required ?? []).includes('detail')) fail('Task', 'detail must be required (nullable)');
+for (const k of schemas.TaskKind?.enum ?? []) {
+  if (!readme.includes('`' + k + '`')) fail('TaskKind', k + ' is not in the README table "Task kinds and subjects"');
+}
+// plain is never combined with another class.
+if (!(schemas.TableClass?.description ?? '').includes('never combined with another class')) fail('TableClass', 'must state that plain is never combined with another class');
+// The pin: both requests carry expectedFingerprint.
+for (const n of ['JoinClusterRequest', 'AddServerRequest']) if (!schemas[n]?.properties?.expectedFingerprint) fail(n, 'expectedFingerprint is missing');
+// Alert kinds raised by the health checks.
+for (const k of ['ledgerVerificationFailed', 'ledgerPendingTooOld', 'versionMismatch', 'certificateExpiring']) {
+  if (!(schemas.AlertKind?.enum ?? []).includes(k)) fail('AlertKind', 'missing ' + k);
+}
+if (schemas.LedgerVerification?.properties?.taskId?.type?.includes?.('null') !== true) fail('LedgerVerification.taskId', 'must be nullable');
+
 // ------------------------------------------------------------------ report
 const pathCount = Object.keys(doc.paths ?? {}).length;
 console.log(`openapi ${doc.openapi}, info.version ${doc.info?.version}`);

@@ -233,6 +233,9 @@ func (s *Server) login(c *call, w http.ResponseWriter, r *http.Request) error {
 	if l := len(req.Username); l < 1 || l > 63 {
 		errs = append(errs, problem.FieldError{Field: "/username", Message: "must be between 1 and 63 characters", Code: "out_of_range"})
 	}
+	if !auth.ValidUsername(req.Username) {
+		errs = append(errs, problem.FieldError{Field: "/username", Message: "must not contain control characters", Code: "pattern"})
+	}
 	if l := len(req.Password); l < 1 || l > 1024 {
 		errs = append(errs, problem.FieldError{Field: "/password", Message: "must be between 1 and 1024 characters", Code: "out_of_range"})
 	}

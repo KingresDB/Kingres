@@ -113,6 +113,10 @@ func New(t testing.TB, n int) *Cluster {
 	t.Cleanup(func() {
 		if !c.retain {
 			c.Close()
+			// The processes are stopped: the ports can be used by the next cluster.
+			for _, nd := range c.Nodes {
+				pgtest.ReleasePorts(nd.APIPort, nd.APIPort+1, nd.PGPort)
+			}
 		}
 	})
 	return c
@@ -455,10 +459,12 @@ func (n *Node) Servers() map[string]map[string]any {
 // PG opens a connection to database db of this node's instance as user, over
 // TCP without TLS (the managed rules allow password logins from loopback).
 func (n *Node) PG(ctx context.Context, user, pass, db string) (*pgx.Conn, error) {
-	cfg, err := pgx.ParseConfig(fmt.Sprintf("host=127.0.0.1 port=%d dbname=%s user=%s password=%s sslmode=disable connect_timeout=10", n.PGPort, db, user, pass))
+	cfg, err := pgx.ParseConfig("")
 	if err != nil {
 		return nil, err
 	}
+	cfg.Host, cfg.Port, cfg.Database, cfg.User, cfg.Password = "127.0.0.1", uint16(n.PGPort), db, user, pass //nolint:gosec // test ports
+	cfg.TLSConfig, cfg.Fallbacks, cfg.ConnectTimeout = nil, nil, 10*time.Second
 	return pgx.ConnectConfig(ctx, cfg)
 }
 

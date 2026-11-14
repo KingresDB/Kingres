@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -147,5 +148,14 @@ func TestFileSinkConcurrentAppend(t *testing.T) {
 	}
 	if len(got) != 20 || len(seen) != 20 {
 		t.Errorf("got %d events, %d distinct ids", len(got), len(seen))
+	}
+}
+
+func TestCleanReplacesControlCharacters(t *testing.T) {
+	if got := Clean("root\x00options\nx\x1b[0m"); strings.ContainsAny(got, "\x00\n\x1b") {
+		t.Errorf("control characters survived: %q", got)
+	}
+	if got := Clean("alice"); got != "alice" {
+		t.Errorf("a clean name changed: %q", got)
 	}
 }

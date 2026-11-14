@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pgconninfo"
 )
 
 // ErrInvalid is wrapped by validation errors of this package.
@@ -231,6 +233,13 @@ func RenderManaged(s ManagedSettings) (string, error) {
 		{"log_directory", "log"},
 		{"log_filename", "postgresql-%a.log"},
 		{"log_truncate_on_rotation", "on"},
+		// The text of a statement is never written to the log (CP-03): the workbench
+		// and every other session may hold secrets in literals.
+		{"log_min_error_statement", "panic"},
+		{"log_statement", "none"},
+		{"log_min_duration_statement", "-1"},
+		{"log_parameter_max_length", "0"},
+		{"log_parameter_max_length_on_error", "0"},
 	}
 	if s.SocketDir != "" {
 		if err := validateConfPath(s.SocketDir); err != nil {
@@ -360,19 +369,12 @@ func RenderIdentWithNodes(osUser string, roles []string, nodes NodeTrust) (strin
 
 var identMapRE = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}$`)
 
-// quoteConninfoValue quotes a value of a libpq connection string.
-func quoteConninfoValue(v string) string {
-	v = strings.ReplaceAll(v, "\\", "\\\\")
-	v = strings.ReplaceAll(v, "'", "\\'")
-	return "'" + v + "'"
-}
-
 // NodeConninfo builds the value of kingres_shard.node_conninfo (design D3): the
 // options that make this server's outgoing node connections present its
 // certificate and verify the peer's against the cluster CA and the names in it.
 // The files are named, never their content; crl may be empty.
 func NodeConninfo(cert, key, ca, crl string) (string, error) {
-	parts := []string{"sslmode=verify-full"}
+	pairs := []pgconninfo.Pair{{Key: "sslmode", Value: "verify-full"}}
 	for _, kv := range [][2]string{{"sslcert", cert}, {"sslkey", key}, {"sslrootcert", ca}, {"sslcrl", crl}} {
 		if kv[1] == "" {
 			if kv[0] == "sslcrl" {
@@ -383,7 +385,11 @@ func NodeConninfo(cert, key, ca, crl string) (string, error) {
 		if err := validateConfPath(kv[1]); err != nil {
 			return "", err
 		}
-		parts = append(parts, kv[0]+"="+quoteConninfoValue(kv[1]))
+		pairs = append(pairs, pgconninfo.Pair{Key: kv[0], Value: kv[1]})
 	}
-	return strings.Join(parts, " "), nil
+	ci, err := pgconninfo.Format(pairs...)
+	if err != nil {
+		return "", invalid("node connection options: %v", err)
+	}
+	return ci, nil
 }

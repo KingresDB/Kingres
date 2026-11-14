@@ -109,10 +109,11 @@ type Server struct {
 
 	routes []Route
 
-	publicLimiter *auth.Limiter // all unauthenticated operations, per client address
-	loginIP       *auth.Limiter // login attempts per client address
-	loginUser     *auth.Limiter // login attempts per user name
-	setupLimiter  *auth.Limiter // setup token attempts per client address
+	publicLimiter *auth.Limiter     // all unauthenticated operations, per client address
+	reval         *auth.Revalidator // re-derives the cluster roles of every request
+	loginIP       *auth.Limiter     // login attempts per client address
+	loginUser     *auth.Limiter     // login attempts per user name
+	setupLimiter  *auth.Limiter     // setup token attempts per client address
 }
 
 // Route is a method and a full path pattern the server routes.
@@ -143,6 +144,7 @@ func build(d Deps, registry func(*Server) map[string]handlerFunc) (*Server, erro
 		now = time.Now
 	}
 	s := &Server{deps: d, log: d.Logger, now: now}
+	s.reval = auth.NewRevalidator(d.Authenticator, d.Sessions, 0, now)
 	s.publicLimiter = auth.NewLimiter(publicRateLimit, time.Minute, now)
 	s.loginIP = auth.NewLimiter(d.LoginRateLimit, d.LoginRateWindow, now)
 	s.loginUser = auth.NewLimiter(d.LoginRateLimit, d.LoginRateWindow, now)

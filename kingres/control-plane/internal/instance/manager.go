@@ -333,6 +333,15 @@ func (m *Manager) Start(ctx context.Context, id int) error {
 	if up, err := m.Running(ctx, id); err != nil || up {
 		return err
 	}
+	// The socket directory may be gone (a reboot empties /run): it is created
+	// before every start, not only when the instance is created.
+	sock, serr := m.SocketDir(id)
+	if serr != nil {
+		return serr
+	}
+	if err := os.MkdirAll(sock, 0o700); err != nil {
+		return fmt.Errorf("instance: creating the socket directory: %w", err)
+	}
 	data, _ := m.DataDir(id)
 	out, err := m.run(ctx, "pg_ctl", "start", "-D", data, "-w", "-t", secs(m.startTO),
 		"-l", filepath.Join(data, "kingres-startup.log"))

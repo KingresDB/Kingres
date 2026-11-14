@@ -123,6 +123,8 @@ func (o *Ops) createRole(ctx context.Context, actor string, req api.RoleCreateRe
 			errs = append(errs, field("/memberOf/"+strconv.Itoa(i), "is not a valid role name", "pattern"))
 		} else if isClusterRole(m) {
 			errs = append(errs, field("/memberOf/"+strconv.Itoa(i), "cluster roles are set with clusterRoles", "invalid"))
+		} else if why := memberOfRefusal(m); why != "" {
+			errs = append(errs, field("/memberOf/"+strconv.Itoa(i), why, "invalid"))
 		}
 	}
 	for i, c := range req.ClusterRoles {
@@ -146,6 +148,9 @@ func (o *Ops) createRole(ctx context.Context, actor string, req api.RoleCreateRe
 				return err
 			} else if !ok {
 				return problem.Validation("The role is invalid.", field("/memberOf/"+strconv.Itoa(i), "role does not exist", "not_found"))
+			}
+			if err := refuseDangerousTarget(ctx, tx, m); err != nil {
+				return err
 			}
 		}
 		b := stmt().Text("CREATE ROLE").ID(name)
@@ -355,6 +360,8 @@ func (o *Ops) setMemberships(ctx context.Context, actor, role string, want []str
 			errs = append(errs, field("/memberOf/"+strconv.Itoa(i), "is not a valid role name", "pattern"))
 		} else if isClusterRole(m) {
 			errs = append(errs, field("/memberOf/"+strconv.Itoa(i), "cluster roles are set with the cluster-roles resource", "invalid"))
+		} else if why := memberOfRefusal(m); why != "" {
+			errs = append(errs, field("/memberOf/"+strconv.Itoa(i), why, "invalid"))
 		} else if m == role {
 			errs = append(errs, field("/memberOf/"+strconv.Itoa(i), "a role cannot be a member of itself", "invalid"))
 		}
@@ -387,6 +394,9 @@ func (o *Ops) setMemberships(ctx context.Context, actor, role string, want []str
 				return err
 			} else if !ok {
 				return problem.Validation("The memberships are invalid.", field("/memberOf/"+strconv.Itoa(i), "role "+strconv.Quote(m)+" does not exist", "not_found"))
+			}
+			if err := refuseDangerousTarget(ctx, tx, m); err != nil {
+				return err
 			}
 		}
 		r := sqlx.MustIdent(role)
@@ -529,6 +539,7 @@ func (o *Ops) CreateRole(ctx context.Context, actor string, req api.RoleCreateRe
 		return err
 	}
 	o.replicateRoles(ctx, req.Name)
+	o.roleChanged(ctx, req.Name)
 	return nil
 }
 
@@ -538,6 +549,7 @@ func (o *Ops) UpdateRole(ctx context.Context, actor, role string, req api.RoleUp
 		return err
 	}
 	o.replicateRoles(ctx, role)
+	o.roleChanged(ctx, role)
 	return nil
 }
 
@@ -547,6 +559,7 @@ func (o *Ops) DeleteRole(ctx context.Context, actor, role string) error {
 		return err
 	}
 	o.replicateRoleDrop(ctx, role)
+	o.roleChanged(ctx, role)
 	return nil
 }
 
@@ -556,6 +569,7 @@ func (o *Ops) SetMemberships(ctx context.Context, actor, role string, want []str
 		return err
 	}
 	o.replicateRoles(ctx, role)
+	o.roleChanged(ctx, role)
 	return nil
 }
 
@@ -565,5 +579,6 @@ func (o *Ops) SetClusterRoles(ctx context.Context, actor, role string, want []st
 		return err
 	}
 	o.replicateRoles(ctx, role)
+	o.roleChanged(ctx, role)
 	return nil
 }

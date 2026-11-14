@@ -36,17 +36,33 @@ func (s *Server) memberHandlers() map[string]handlerFunc {
 }
 
 // pin reads and checks the optional pinned fingerprint of the request.
-func pinOf(r *http.Request) (string, error) {
-	h := r.Header.Get(HeaderPin)
-	if h == "" {
-		return "", nil
+func pinOf(r *http.Request, body *string) (string, error) {
+	var fp [2]string
+	for i, src := range []struct{ field, v string }{{HeaderPin, r.Header.Get(HeaderPin)}, {"/expectedFingerprint", deref(body)}} {
+		if src.v == "" {
+			continue
+		}
+		fp[i] = pki.NormalizeFingerprint(src.v)
+		if fp[i] == "" {
+			return "", problem.Validation("The pinned fingerprint is invalid.",
+				problem.FieldError{Field: src.field, Message: "must be a SHA-256 fingerprint in hex, with or without colons", Code: "pattern"})
+		}
 	}
-	fp := pki.NormalizeFingerprint(h)
-	if fp == "" {
-		return "", problem.Validation("The pinned fingerprint is invalid.",
-			problem.FieldError{Field: HeaderPin, Message: "must be a SHA-256 fingerprint in hex, with or without colons", Code: "pattern"})
+	if fp[0] != "" && fp[1] != "" && fp[0] != fp[1] {
+		return "", problem.Validation("The pinned fingerprint is given twice, differently.",
+			problem.FieldError{Field: "/expectedFingerprint", Message: "differs from the header " + HeaderPin, Code: "invalid"})
 	}
-	return fp, nil
+	if fp[1] != "" {
+		return fp[1], nil
+	}
+	return fp[0], nil
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 // joinCluster joins this server to the cluster at existingNodeAddress (D4).
@@ -67,7 +83,7 @@ func (s *Server) joinCluster(c *call, w http.ResponseWriter, r *http.Request) er
 		}
 		return problem.Validation("The join request is invalid.", fe...)
 	}
-	pin, err := pinOf(r)
+	pin, err := pinOf(r, req.ExpectedFingerprint)
 	if err != nil {
 		return err
 	}
@@ -107,7 +123,7 @@ func (s *Server) addServer(c *call, w http.ResponseWriter, r *http.Request) erro
 	pin := ""
 	if f := forwardedOf(r); f != nil {
 		pin = f.pin
-	} else if pin, err = pinOf(r); err != nil {
+	} else if pin, err = pinOf(r, req.ExpectedFingerprint); err != nil {
 		return err
 	}
 	t, err := m.AddServer(r.Context(), c.session.Username, req, pin)
