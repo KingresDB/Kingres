@@ -204,7 +204,7 @@ sudo apt install ./kingres_0.1.0-1_amd64.deb
 | `/etc/kingres/kingresd.env` | environment and secrets such as `KINGRES_METRICS_TOKEN`, TLS file names (conffile, 0600 root) |
 | `/var/lib/kingres` | the node's state (0750 `kingres:kingres`, created by `postinst`, not shipped): `node-state.json`, `setup-token` (0600, only while uninitialized), `audit.jsonl`, `pki/` (cluster CA `ca.key` 0600 and certificates, 0700), `service-credentials` (0600), `instances/1/pgdata` (the database, 0700) |
 | `/var/lib/kingres/instances/1/pgdata/log/` | PostgreSQL server log (weekday-rotated `postgresql-Mon.log`...); the manager's log is in the journal: `journalctl -u kingres` |
-| `/run/kingres/1` | the instance's Unix socket (created by the unit, 0750) |
+| `/run/kingres/1` | the instance's Unix socket (`/run/kingres` is created by the unit, 0750; the directory of each instance by `kingresd`, 0700) |
 | `/usr/share/doc/kingres/` | copyright, changelog, `README.Debian`, dependency lists |
 
 **Command names.** The clients are linked as `kingres-<name>`, not `psql` and
@@ -244,7 +244,7 @@ Sandboxing, re-checked against a `kingresd` that runs `initdb`, `pg_ctl` and
 `postgres` and writes data, sockets and logs: `NoNewPrivileges`, empty capability
 set (no capability in the manager or in the postmaster, checked), `ProtectSystem=strict`
 with `ReadWritePaths=/var/lib/kingres` (the runtime directory is writable through
-`RuntimeDirectory=kingres kingres/1`, kept across restarts with
+`RuntimeDirectory=kingres`, kept across restarts with
 `RuntimeDirectoryPreserve=restart`), `ProtectHome`, `PrivateTmp` (safe because
 sockets are never in `/tmp`), `PrivateDevices` (`/dev/shm` still works: a parallel
 query that uses dynamic shared memory is tested), kernel, clock, hostname and
@@ -290,8 +290,8 @@ of the distribution already uses it.
 kingres-psql -h 127.0.0.1 -p 5432 -U <administrator> postgres
 ```
 
-Use TCP. The Unix socket is `/run/kingres/1/.s.PGSQL.5432` (mode 0750, group
-`kingres`), but `kingres-psql` looks in `/tmp` by default (a compile-time default
+Use TCP. The Unix socket is `/run/kingres/1/.s.PGSQL.5432` (in a directory only
+the service user can enter), but `kingres-psql` looks in `/tmp` by default (a compile-time default
 of PostgreSQL), so it does not find it without `-h /run/kingres/1`, and "local"
 connections use peer authentication that `kingresd` maps to its own OS user only
 (the tests confirm that a socket login of the administrator is refused). Network
@@ -391,14 +391,10 @@ Verified by the tests against the commit built:
 2. `kingresd` sends `READY=1`/`STOPPING=1`, leaves the instance running when it
    exits, adopts it at start, and `-stop-instances` stops it (fast shutdown).
 3. `socket-dir` is `/run/kingres`; the instance's socket is `<socket-dir>/1/`.
-4. **Defect worked around, needs a change in `kingresd`**: when it starts an
-   instance that already exists (after a reboot or `systemctl stop`/`start`), it
-   does not create `<socket-dir>/<id>` first; PostgreSQL then fails with "could
-   not create lock file /run/kingres/1/.s.PGSQL.5432.lock" and `kingresd` exits.
-   The unit works around it with `RuntimeDirectory=kingres kingres/1`, which
-   hard-codes instance id 1 (fine for a one-server cluster). The fix belongs in
-   the instance manager (`MkdirAll` of the socket directory before `pg_ctl
-   start`).
+4. `kingresd` creates `<socket-dir>/<id>` before every start of an instance,
+   so the cluster comes back after a reboot, when `/run` is empty (the package
+   test stops and starts the service, which removes the runtime directory). An
+   earlier build did not, and the unit then created `/run/kingres/1` itself.
 5. `kingres-psql` and the other prefixed programs do not find the instance's
    socket by default (PostgreSQL's compiled-in default is `/tmp`, and the socket is
    in `/run/kingres/1`); administrators connect over TCP (see above). Local socket

@@ -54,12 +54,12 @@ TasksMax=16384
 # (a moderate value: the unit is not exempt, and backends inherit it).
 OOMScoreAdjust=-100
 
-# Directories.  /run/kingres/1 holds the Unix socket of instance 1 (kingresd does
-# not create the per-instance directory itself when it starts an existing
-# instance, so the unit creates it) and survives a
-# restart of the unit (the instance keeps running); /var/lib/kingres (created
-# by the package) is the only other place the service may write.
-RuntimeDirectory=kingres kingres/1
+# Directories.  /run/kingres holds one directory per instance with its Unix
+# socket (kingresd creates /run/kingres/<id> before it starts an instance) and
+# survives a restart of the unit (the instance keeps running);
+# /var/lib/kingres (created by the package) is the only other place the
+# service may write.
+RuntimeDirectory=kingres
 RuntimeDirectoryMode=0750
 RuntimeDirectoryPreserve=restart
 ReadWritePaths=/var/lib/kingres

@@ -224,12 +224,16 @@ x systemctl stop kingres
 check_eq "unit inactive after stop" inactive "$(x systemctl is-active kingres || true)"
 check "no postgres process after stop" sh_ '! pgrep -x postgres && ! pgrep -x kingresd'
 check "no postmaster.pid after a clean stop" sh_ '! test -e /var/lib/kingres/instances/1/pgdata/postmaster.pid'
+# After a stop the runtime directory is gone, as after a reboot: kingresd has
+# to create the instance's socket directory again when it starts the instance.
+check "runtime directory removed by the stop" sh_ '! test -e /run/kingres/1'
 x systemctl start kingres
 check_eq "unit active after start" active "$(x systemctl is-active kingres)"
 check "API answers" wait_ready
 wait_for "database is back" 60 db_up
 check_eq "node state: no wizard" clustered \
     "$(x curl -fsS http://127.0.0.1:8091/api/v1/setup/state | sed -n 's/^{"state":"\([a-z]*\)".*/\1/p')"
+check_eq "socket directory recreated by kingresd" "700 kingres" "$(x stat -c '%a %U' /run/kingres/1)"
 check "no setup token" sh_ '! test -e /var/lib/kingres/setup-token'
 flow_check_api "after stop and start"
 flow_check_data "after stop and start"
