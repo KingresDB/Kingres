@@ -3,18 +3,16 @@
 //
 // Long-running operations return 202 + a Task. These composables follow the task by polling
 // GET /tasks/{id} until it settles, expose its progress, and refresh the affected queries.
-import { computed, onScopeDispose, ref, shallowRef } from 'vue'
+// A task whose dialog is closed while it still runs is handed to the task notice store, so its
+// end (and its failure) is still reported.
+import { computed, getCurrentScope, onScopeDispose, ref, shallowRef } from 'vue'
 import { useQueryClient, type QueryKey } from '@tanstack/vue-query'
 import { endpoints } from '@/api/endpoints'
 import type { Task } from '@/api/types'
+import { useTaskNoticeStore } from '@/stores/taskNotices'
+import { createTaskPoller, isSettled, taskPolling } from './taskPoller'
 
-/** Poll settings. Tests shorten the interval. */
-export const taskPolling = { intervalMs: 1_000, maxConsecutiveFailures: 5 }
-
-/** A task that will not change any more without outside action. `paused` is a stopped rebalance. */
-export function isSettled(task: Task): boolean {
-  return task.state === 'done' || task.state === 'failed' || task.state === 'paused'
-}
+export { createTaskPoller, isSettled, taskPolling }
 
 export interface UseTaskOptions {
   /** Called once when the task settles (done, failed or paused). */
@@ -31,64 +29,44 @@ export function useTask(options: UseTaskOptions = {}) {
   const fetchTask = options.fetchTask ?? endpoints.getTask
   const task = shallowRef<Task | null>(null)
   const pollError = ref<unknown>(null)
-  let timer: ReturnType<typeof setTimeout> | undefined
-  let generation = 0
 
   const state = computed(() => task.value?.state ?? null)
   const percent = computed(() => task.value?.progress.percent ?? 0)
   const isActive = computed(() => task.value !== null && !isSettled(task.value))
   const failed = computed(() => task.value?.state === 'failed')
 
-  function stop(): void {
-    generation += 1
-    if (timer !== undefined) clearTimeout(timer)
-    timer = undefined
-  }
-
-  function settle(t: Task): void {
-    options.onSettled?.(t)
-  }
-
-  function schedule(id: number, myGeneration: number, failures: number): void {
-    timer = setTimeout(async () => {
-      if (myGeneration !== generation) return
-      try {
-        const next = await fetchTask(id)
-        if (myGeneration !== generation) return
-        task.value = next
-        pollError.value = null
-        if (isSettled(next)) settle(next)
-        else schedule(id, myGeneration, 0)
-      } catch (error) {
-        if (myGeneration !== generation) return
-        // The server may be restarting (leave cluster, restart instance): tolerate a few misses.
-        if (failures + 1 >= taskPolling.maxConsecutiveFailures) pollError.value = error
-        else schedule(id, myGeneration, failures + 1)
-      }
-    }, taskPolling.intervalMs)
-  }
+  const poller = createTaskPoller({
+    fetchTask,
+    onUpdate: (next) => {
+      task.value = next
+      pollError.value = null
+    },
+    onSettled: (t) => options.onSettled?.(t),
+    onLost: (error) => {
+      pollError.value = error
+    },
+  })
 
   function track(initial: Task | number): void {
-    stop()
-    const myGeneration = generation
+    poller.stop()
     pollError.value = null
     if (typeof initial === 'number') {
       task.value = null
-      schedule(initial, myGeneration, 0)
+      poller.start(initial)
       return
     }
     task.value = initial
-    if (isSettled(initial)) settle(initial)
-    else schedule(initial.id, myGeneration, 0)
+    if (isSettled(initial)) options.onSettled?.(initial)
+    else poller.start(initial.id)
   }
 
   function reset(): void {
-    stop()
+    poller.stop()
     task.value = null
     pollError.value = null
   }
 
-  onScopeDispose(stop)
+  if (getCurrentScope()) onScopeDispose(poller.stop)
 
   return { task, state, percent, isActive, failed, pollError, track, reset }
 }
@@ -99,17 +77,21 @@ export interface TaskActionOptions<V> {
   onDone?: (task: Task, variables: V) => void
   /** Replaces the function that reads a task (the setup wizard needs a special one). */
   fetchTask?: (id: number) => Promise<Task>
+  /** Names the task in the notice that outlives the dialog, for example the dialog title. */
+  label?: () => string
 }
 
 /**
  * Starts an operation that answers 202 + Task, follows the task, and refreshes affected queries.
  * Errors from the start request are exposed as `error` (never thrown into the template).
+ * If the owner goes away while the task still runs (a closed dialog), a task notice takes over.
  */
 export function useTaskAction<V = void>(
   start: (variables: V) => Promise<Task>,
   options: TaskActionOptions<V> = {},
 ) {
   const client = useQueryClient()
+  const notices = useTaskNoticeStore()
   const error = ref<unknown>(null)
   const isStarting = ref(false)
   let lastVariables: V
@@ -150,6 +132,20 @@ export function useTaskAction<V = void>(
   function reset(): void {
     error.value = null
     tracker.reset()
+  }
+
+  // The dialog was closed while the task still runs: keep following it in the notice store.
+  if (getCurrentScope()) {
+    onScopeDispose(() => {
+      const t = tracker.task.value
+      if (t && !isSettled(t)) {
+        notices.follow(t, {
+          label: options.label?.() ?? t.kind,
+          refresh,
+          fetchTask: options.fetchTask,
+        })
+      }
+    })
   }
 
   const isBusy = computed(() => isStarting.value || tracker.isActive.value)

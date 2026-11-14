@@ -6,6 +6,7 @@
 // changed later and which are fixed at creation. Choices, defaults and ranges come from
 // GET /database-create-options, so the server (not the panel) decides what is offered.
 import { computed, reactive, ref, watch } from 'vue'
+import { safeText } from '@/lib/safe-text'
 import { RouterLink } from 'vue-router'
 import TaskActionDialog from './TaskActionDialog.vue'
 import FormField from './FormField.vue'
@@ -171,7 +172,7 @@ const errorFor = (field: string, server: Record<string, string>): string | undef
                 :key="r.name"
                 :value="r.name"
               >
-                {{ r.name }}
+                {{ safeText(r.name) }}
               </option>
             </select>
             <input v-else v-bind="slot" v-model="form.owner" class="input mono" />

@@ -2,6 +2,8 @@
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import SafeName from '@/components/SafeName.vue'
+import TableWrap from '@/components/TableWrap.vue'
 import { useMutation, useQueryClient } from '@tanstack/vue-query'
 import PageHeader from '@/components/PageHeader.vue'
 import QueryBoundary from '@/components/QueryBoundary.vue'
@@ -52,7 +54,7 @@ const open = computed(() => items.value.find((t) => t.id === openId.value) ?? nu
     empty-hint="Operations such as creating a database or adding a server appear here."
     @retry="query.refetch()"
   >
-    <div class="table-wrap">
+    <TableWrap>
       <table class="table">
         <caption class="sr-only">
           Tasks
@@ -73,14 +75,24 @@ const open = computed(() => items.value.find((t) => t.id === openId.value) ?? nu
           <tr v-for="t in items" :key="t.id">
             <th scope="row" class="num">{{ t.id }}</th>
             <td class="mono">{{ t.kind }}</td>
-            <td>{{ t.subject ? `${t.subject.type} ${t.subject.id}` : '-' }}</td>
+            <td>
+              <SafeName
+                v-if="t.subject"
+                :value="`${t.subject.type} ${t.subject.id}`"
+                kind="text"
+                :max="120"
+              />
+              <template v-else>-</template>
+            </td>
             <td>
               <StatusBadge :meta="TASK_STATE[t.state]" />
-              <div v-if="t.error" class="muted">{{ t.error.message }}</div>
+              <div v-if="t.error" class="muted">
+                <SafeName :value="t.error.message" kind="text" :max="300" />
+              </div>
             </td>
             <td class="num">{{ Math.round(t.progress.percent) }}%</td>
             <td>{{ formatAgo(t.updatedAt) }}</td>
-            <td>{{ t.createdBy }}</td>
+            <td><SafeName :value="t.createdBy" :max="60" /></td>
             <td>
               <div class="row">
                 <button type="button" class="btn btn-small" @click="openId = t.id">Details</button>
@@ -92,7 +104,7 @@ const open = computed(() => items.value.find((t) => t.id === openId.value) ?? nu
           </tr>
         </tbody>
       </table>
-    </div>
+    </TableWrap>
     <button
       v-if="query.hasNextPage.value"
       type="button"

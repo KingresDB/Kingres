@@ -171,7 +171,9 @@ export function register(operationId: OperationId, handler: Handler): HttpHandle
         })
       }
       const flat: Record<string, string> = {}
-      for (const [k, v] of Object.entries(params)) flat[k] = decodeURIComponent(String(v))
+      // MSW has already percent-decoded the path parameters; decoding them again would change
+      // every name that contains a percent sign.
+      for (const [k, v] of Object.entries(params)) flat[k] = String(v)
       const reply = await handler({ s, params: flat, url: new URL(request.url), request, body })
       if (MUTATING.has(request.method) && operationId !== 'login')
         audit(s, operationId, flat, reply.status)

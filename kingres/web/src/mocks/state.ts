@@ -94,6 +94,8 @@ interface DbRec {
   tables: Table[]
   colocations: ColocationGroup[]
   buckets: Map<number, BucketRec[]>
+  /** Columns to report instead of the built-in ones, by table name (hostile-data tests). */
+  extraColumns?: Record<string, S['TableColumn'][]>
 }
 
 export interface TaskRec {
@@ -159,6 +161,8 @@ export interface MockState {
   localSettings: S['LocalSettings']
   instanceStates: Map<number, Instance['state']>
   session: SessionRec | null
+  /** Result sets the workbench can select from, by table name (hostile-data tests). */
+  extraQueryTables?: Record<string, { columns: S['QueryColumn'][]; rows: unknown[][] }>
 }
 
 // --- helpers ----------------------------------------------------------------------------------
@@ -571,7 +575,7 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
         resourceType: 'role',
         resourceId: 'analyst',
         outcome: 'success',
-        actorAddress: '10.2.0.5',
+        actorAddress: '10.0.0.50',
       },
       {
         id: 2,

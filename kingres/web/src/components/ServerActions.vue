@@ -4,6 +4,7 @@
 // The four server operations, each with a confirmation that states the consequence:
 // add server, remove server, failover (hard or graceful), restore preferred primaries.
 import { computed, reactive, ref } from 'vue'
+import { safeText } from '@/lib/safe-text'
 import type { QueryKey } from '@tanstack/vue-query'
 import TaskActionDialog from './TaskActionDialog.vue'
 import FormField from './FormField.vue'
@@ -46,6 +47,7 @@ const config = computed(() => {
         title: 'Add server',
         confirmLabel: 'Add server',
         danger: false,
+        typeToConfirm: undefined as string | undefined,
         start: () =>
           endpoints.addServer({
             address: form.address,
@@ -58,6 +60,7 @@ const config = computed(() => {
         title: `Remove server ${props.server?.address ?? ''}`,
         confirmLabel: 'Remove server',
         danger: true,
+        typeToConfirm: props.server?.address,
         start: () => endpoints.removeServer(id),
       }
     case 'failover':
@@ -65,6 +68,8 @@ const config = computed(() => {
         title: `Fail over server ${props.server?.address ?? ''}`,
         confirmLabel: mode.value === 'hard' ? 'Hard failover' : 'Graceful failover',
         danger: mode.value === 'hard',
+        // Marking a server dead is not undone by a click: the address has to be typed.
+        typeToConfirm: mode.value === 'hard' ? props.server?.address : undefined,
         start: () => endpoints.failoverServer(id, mode.value),
       }
     default:
@@ -72,6 +77,7 @@ const config = computed(() => {
         title: 'Restore preferred primaries',
         confirmLabel: 'Restore primaries',
         danger: false,
+        typeToConfirm: undefined as string | undefined,
         start: () => endpoints.restorePreferredPrimaries(),
       }
   }
@@ -83,6 +89,7 @@ const config = computed(() => {
     :title="config.title"
     :confirm-label="config.confirmLabel"
     :danger="config.danger"
+    :type-to-confirm="config.typeToConfirm"
     :start="config.start"
     :validate="validate"
     :invalidate="invalidate"
@@ -115,7 +122,7 @@ const config = computed(() => {
           <select v-bind="slot" v-model="form.serverGroup">
             <option value="">None</option>
             <option v-for="g in groups.data.value?.items" :key="g.name" :value="g.name">
-              {{ g.name }}
+              {{ safeText(g.name) }}
             </option>
           </select>
         </FormField>

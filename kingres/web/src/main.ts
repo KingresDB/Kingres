@@ -17,7 +17,10 @@ async function startMocks(): Promise<void> {
 async function bootstrap(): Promise<void> {
   await startMocks()
   const app = createApp(App)
-  createKingres().install(app)
+  const kingres = createKingres()
+  kingres.install(app)
+  // The browser tests drive the application through its router (development build only).
+  if (import.meta.env.DEV) (window as unknown as { __router?: unknown }).__router = kingres.router
   app.mount('#app')
 }
 

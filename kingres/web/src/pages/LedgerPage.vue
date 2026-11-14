@@ -4,6 +4,8 @@
 // Ledger: per-database status (one hash chain per shard group), blocks, digests, verification and
 // row inclusion proofs.
 import { computed, ref, watch } from 'vue'
+import { safeText } from '@/lib/safe-text'
+import TableWrap from '@/components/TableWrap.vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
 import PageHeader from '@/components/PageHeader.vue'
@@ -14,6 +16,8 @@ import NullableValue from '@/components/NullableValue.vue'
 import NotAvailable from '@/components/NotAvailable.vue'
 import ProblemNotice from '@/components/ProblemNotice.vue'
 import TaskProgress from '@/components/TaskProgress.vue'
+import SafeName from '@/components/SafeName.vue'
+import { describeProblem } from '@/api/problem'
 import { endpoints } from '@/api/endpoints'
 import { every, keys, useLedgerStatusList, usePagedQuery } from '@/api/queries'
 import { useTaskAction } from '@/composables/useTask'
@@ -66,12 +70,18 @@ const blocks = usePagedQuery(
 )
 const digests = useQuery({
   queryKey: computed(() => [...keys.ledger(dbName.value), 'digests']),
-  queryFn: () => endpoints.listLedgerDigests(dbName.value, { limit: 10 }),
+  queryFn: async () => {
+    const page = await endpoints.listLedgerDigests(dbName.value, { limit: 10 })
+    return { items: page.items, moreNotShown: !!page.nextCursor }
+  },
   enabled: computed(() => !!dbName.value),
 })
 const verifications = useQuery({
   queryKey: computed(() => [...keys.ledger(dbName.value), 'verifications']),
-  queryFn: () => endpoints.listLedgerVerifications(dbName.value, { limit: 10 }),
+  queryFn: async () => {
+    const page = await endpoints.listLedgerVerifications(dbName.value, { limit: 10 })
+    return { items: page.items, moreNotShown: !!page.nextCursor }
+  },
   enabled: computed(() => !!dbName.value),
   refetchInterval: every(5000),
 })
@@ -95,6 +105,21 @@ const proofForm = ref({
   key: '{"id": 9000000001}',
   op: 'I' as 'I' | 'D',
 })
+/** True when the text holds a number that a 64-bit float cannot represent exactly. */
+function unsafeNumber(text: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(text)
+    return (
+      typeof parsed === 'object' &&
+      parsed !== null &&
+      Object.values(parsed).some(
+        (v) => typeof v === 'number' && Number.isInteger(v) && !Number.isSafeInteger(v),
+      )
+    )
+  } catch {
+    return false
+  }
+}
 const proof = ref<InclusionProof | null>(null)
 const keyError = ref('')
 const proofMutation = useMutation({
@@ -105,8 +130,16 @@ const proofMutation = useMutation({
       if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed))
         throw new Error('not an object')
       primaryKey = parsed as Record<string, string | number | boolean>
+      // JSON numbers become 64-bit floats here: a larger number would be sent as another number.
+      for (const value of Object.values(primaryKey)) {
+        if (typeof value === 'number' && !Number.isSafeInteger(value)) {
+          throw new Error('unsafe number')
+        }
+      }
     } catch {
-      keyError.value = 'Enter the primary key as a JSON object, for example {"id": 42}.'
+      keyError.value = unsafeNumber(proofForm.value.key)
+        ? 'A number larger than 2^53 cannot be sent exactly as a JSON number. Write it as a string, for example {"id": "9007199254740993"}.'
+        : 'Enter the primary key as a JSON object, for example {"id": 42}.'
       return Promise.reject(new Error(keyError.value))
     }
     keyError.value = ''
@@ -129,10 +162,33 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
     title="Ledger"
     subtitle="Tamper-evident history: hash chains, digests and verification."
   />
+  <section
+    v-if="statusList.data.value?.unreadable.length"
+    class="notice tone-danger"
+    role="alert"
+    aria-label="The ledger status could not be read"
+  >
+    <span aria-hidden="true">&#10006;</span>
+    <div class="stack" style="gap: var(--s-1)">
+      <strong
+        >The ledger status could not be read for these databases; the list may be
+        incomplete.</strong
+      >
+      <ul style="margin: 0; padding-left: 1.2em">
+        <li v-for="u in statusList.data.value.unreadable" :key="u.databaseName">
+          <SafeName :value="u.databaseName" :max="60" />:
+          <SafeName :value="describeProblem(u.error).message" kind="text" :max="200" />
+        </li>
+      </ul>
+    </div>
+  </section>
   <QueryBoundary
     :loading="statusList.isPending.value"
     :error="statusList.error.value"
-    :empty="(statusList.data.value?.items.length ?? 0) === 0"
+    :empty="
+      (statusList.data.value?.items.length ?? 0) === 0 &&
+      (statusList.data.value?.unreadable.length ?? 0) === 0
+    "
     empty-title="No database uses the ledger"
     empty-hint="Turn on the ledger for a database to see its chains here."
     @retry="statusList.refetch()"
@@ -146,7 +202,7 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
             :key="s.databaseName"
             :value="s.databaseName"
           >
-            {{ s.databaseName }}
+            {{ safeText(s.databaseName) }}
           </option>
         </select>
       </div>
@@ -154,7 +210,7 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
       <template v-if="status">
         <section class="card stack" aria-labelledby="chains-h">
           <div class="row-between">
-            <h2 id="chains-h">Status of {{ status.databaseName }}</h2>
+            <h2 id="chains-h">Status of {{ safeText(status.databaseName, 80) }}</h2>
             <StatusBadge
               v-if="status.verificationState"
               :meta="LEDGER_STATE[status.verificationState]"
@@ -169,7 +225,7 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
               >Last verified {{ formatAgo(status.lastVerifiedAt) }}.</template
             >
           </p>
-          <div class="table-wrap">
+          <TableWrap>
             <table class="table">
               <caption class="sr-only">
                 Chains
@@ -207,7 +263,7 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
                 </tr>
               </tbody>
             </table>
-          </div>
+          </TableWrap>
         </section>
 
         <section class="card stack" aria-labelledby="verify-h">
@@ -236,7 +292,11 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
             :empty="verifications.data.value?.items.length === 0"
             empty-title="No verifications yet"
           >
-            <div class="table-wrap">
+            <p v-if="verifications.data.value?.moreNotShown" class="notice tone-warn" role="status">
+              <span aria-hidden="true">&#9650;</span>
+              <span>More verifications exist than are shown here; only the latest are listed.</span>
+            </p>
+            <TableWrap>
               <table class="table">
                 <caption class="sr-only">
                   Verifications
@@ -259,7 +319,7 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
                     <td>{{ v.scope === 'full' ? 'Full' : 'Since last verified' }}</td>
                     <td>
                       {{ formatDateTime(v.startedAt) }} by
-                      <NullableValue :value="v.startedBy" />
+                      <NullableValue :value="v.startedBy" safe />
                     </td>
                     <td class="num">
                       <NullableValue :value="v.blocksChecked" :format="formatNumber" />
@@ -270,7 +330,8 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
                     <td>
                       <ul v-if="v.inconsistencies.length" style="margin: 0; padding-left: 1.1em">
                         <li v-for="(i, n) in v.inconsistencies" :key="n">
-                          {{ i.kind }} in group {{ i.shardGroupId }}: {{ i.detail }}
+                          {{ i.kind }} in group {{ i.shardGroupId }}:
+                          <SafeName :value="i.detail" kind="text" :max="300" />
                         </li>
                       </ul>
                       <span v-else class="muted">None</span>
@@ -278,7 +339,7 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
                   </tr>
                 </tbody>
               </table>
-            </div>
+            </TableWrap>
           </QueryBoundary>
         </section>
 
@@ -299,7 +360,11 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
             :empty="digests.data.value?.items.length === 0"
             empty-title="No digests yet"
           >
-            <div class="table-wrap">
+            <p v-if="digests.data.value?.moreNotShown" class="notice tone-warn" role="status">
+              <span aria-hidden="true">&#9650;</span>
+              <span>More digests exist than are shown here; only the latest are listed.</span>
+            </p>
+            <TableWrap>
               <table class="table">
                 <caption class="sr-only">
                   Digests
@@ -318,7 +383,7 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
                     <th scope="row">{{ d.id }}</th>
                     <td>
                       {{ formatDateTime(d.generatedAt) }} by
-                      <NullableValue :value="d.generatedBy" />
+                      <NullableValue :value="d.generatedBy" safe />
                     </td>
                     <td>
                       {{ d.chains.map((c) => `g${c.shardGroupId}@${c.blockHeight}`).join(', ') }}
@@ -336,7 +401,7 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
                   </tr>
                 </tbody>
               </table>
-            </div>
+            </TableWrap>
           </QueryBoundary>
         </section>
 
@@ -357,7 +422,7 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
             empty-title="No blocks yet"
             @retry="blocks.query.refetch()"
           >
-            <div class="table-wrap">
+            <TableWrap>
               <table class="table">
                 <caption class="sr-only">
                   Blocks
@@ -383,7 +448,7 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
                   </tr>
                 </tbody>
               </table>
-            </div>
+            </TableWrap>
             <button
               v-if="blocks.query.hasNextPage.value"
               type="button"
@@ -474,7 +539,7 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
 <style scoped>
 .kv {
   display: grid;
-  grid-template-columns: max-content 1fr;
+  grid-template-columns: fit-content(45%) minmax(0, 1fr);
   gap: var(--s-1) var(--s-4);
   margin: 0;
 }

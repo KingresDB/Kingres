@@ -6,6 +6,7 @@
 // resource: fast-changing state is refreshed while the tab is visible, the rest on demand.
 import { computed, toValue, type MaybeRefOrGetter } from 'vue'
 import {
+  MutationCache,
   QueryClient,
   QueryCache,
   useInfiniteQuery,
@@ -15,6 +16,38 @@ import {
 import { endpoints } from './endpoints'
 import { ApiError, isSessionLost, isUnsupported, shouldRetry } from './problem'
 import type { MetricName } from './types'
+
+/**
+ * How many pages a "load everything" query follows. A server that keeps answering with a cursor
+ * must not keep the browser busy for ever; what is left over is reported (`moreNotShown`).
+ */
+export const paging = { maxPages: 20 }
+
+interface CursorPage<T> {
+  items: T[]
+  nextCursor?: string | null
+}
+
+export interface AllPages<T> {
+  items: T[]
+  /** True when the server still had more pages after the bound. */
+  moreNotShown: boolean
+}
+
+/** Follows `nextCursor` until the list ends or `paging.maxPages` pages were read. */
+export async function fetchAllPages<T>(
+  fetchPage: (cursor: string | undefined) => Promise<CursorPage<T>>,
+): Promise<AllPages<T>> {
+  const items: T[] = []
+  let cursor: string | undefined
+  for (let page = 0; page < paging.maxPages; page += 1) {
+    const result = await fetchPage(cursor)
+    items.push(...result.items)
+    cursor = result.nextCursor ?? undefined
+    if (!cursor) return { items, moreNotShown: false }
+  }
+  return { items, moreNotShown: true }
+}
 
 /** Poll intervals in milliseconds. Background tabs are not polled (library default). */
 export const POLL = { fast: 3_000, normal: 10_000, slow: 30_000 } as const
@@ -70,6 +103,12 @@ export const keys = {
 export function createAppQueryClient(onSessionLost: () => void = () => {}): QueryClient {
   return new QueryClient({
     queryCache: new QueryCache({
+      onError: (error) => {
+        if (isSessionLost(error)) onSessionLost()
+      },
+    }),
+    // A mutation that meets an expired session ends the session just like a query does.
+    mutationCache: new MutationCache({
       onError: (error) => {
         if (isSessionLost(error)) onSessionLost()
       },
@@ -155,7 +194,8 @@ export const useDatabase = (name: MaybeRefOrGetter<string>) =>
 export const useTables = (name: MaybeRefOrGetter<string>) =>
   useQuery({
     queryKey: computed(() => keys.tables(toValue(name))),
-    queryFn: () => endpoints.listTables(toValue(name)),
+    queryFn: () =>
+      fetchAllPages((cursor) => endpoints.listTables(toValue(name), cursor ? { cursor } : {})),
   })
 
 export const useColocationGroups = (name: MaybeRefOrGetter<string | null>) =>
@@ -177,17 +217,13 @@ export const useAllBuckets = (
     queryFn: async () => {
       const db = toValue(name) ?? ''
       const colocation = toValue(colocationId) ?? 0
-      const pages = []
-      let cursor: string | undefined
-      do {
+      let mapVersion = 0
+      const all = await fetchAllPages(async (cursor) => {
         const page = await endpoints.listBuckets(db, colocation, { cursor })
-        pages.push(page)
-        cursor = page.nextCursor ?? undefined
-      } while (cursor)
-      return {
-        mapVersion: pages[pages.length - 1]?.mapVersion ?? 0,
-        items: pages.flatMap((p) => p.items),
-      }
+        mapVersion = page.mapVersion
+        return page
+      })
+      return { mapVersion, ...all }
     },
   })
 
@@ -222,7 +258,10 @@ export const useRebalanceStatus = () =>
 export const useRebalanceReports = () =>
   useQuery({
     queryKey: keys.rebalanceReports,
-    queryFn: () => endpoints.listRebalanceReports({ limit: 20 }),
+    queryFn: async () => {
+      const page = await endpoints.listRebalanceReports({ limit: 20 })
+      return { items: page.items, moreNotShown: !!page.nextCursor }
+    },
   })
 
 // --- tasks, alerts, logs ----------------------------------------------------------------------
@@ -269,7 +308,10 @@ export const useMetric = (metric: MetricName, rangeMinutes = 60, groupBy?: 'serv
 export const useRoles = (search?: MaybeRefOrGetter<string>) =>
   useQuery({
     queryKey: computed(() => [...keys.roles, toValue(search) ?? '']),
-    queryFn: () => endpoints.listRoles({ limit: 500, search: toValue(search) || undefined }),
+    queryFn: () =>
+      fetchAllPages((cursor) =>
+        endpoints.listRoles({ limit: 500, search: toValue(search) || undefined, cursor }),
+      ),
   })
 
 export const useClusterRoles = () =>
@@ -282,8 +324,10 @@ export const useClusterRoles = () =>
  * its own status, which that server does implement.
  */
 async function ledgerStatusList() {
+  /** Databases whose ledger status could not be read; they are reported, never left out. */
+  const unreadable: { databaseName: string; error: unknown }[] = []
   try {
-    return await endpoints.listLedgerStatus()
+    return { ...(await endpoints.listLedgerStatus()), unreadable }
   } catch (error) {
     if (!(error instanceof ApiError) || error.code !== 'not_found') throw error
     const databases = await endpoints.listDatabases()
@@ -292,11 +336,12 @@ async function ledgerStatusList() {
       if (d.ledger.mode === 'off') continue
       try {
         items.push(await endpoints.getLedgerStatus(d.name))
-      } catch {
-        // A database whose ledger status cannot be read is left out of the list.
+      } catch (e) {
+        if (e instanceof ApiError && isSessionLost(e)) throw e
+        unreadable.push({ databaseName: d.name, error: e })
       }
     }
-    return { items }
+    return { items, unreadable }
   }
 }
 
@@ -317,11 +362,6 @@ export const useThisServer = () =>
   })
 
 // --- generic cursor-paged lists ---------------------------------------------------------------
-
-interface CursorPage<T> {
-  items: T[]
-  nextCursor: string | null
-}
 
 /** A cursor-paged list with "load more". `fetchPage` receives the cursor of the page to load. */
 export function usePagedQuery<T>(

@@ -4,6 +4,8 @@
 // Each shard group with its primary and standbys, sync state and lag. With chained placement a
 // server runs the primary of one group and a standby of a neighbouring group.
 import { computed, ref } from 'vue'
+import SafeName from '@/components/SafeName.vue'
+import TableWrap from '@/components/TableWrap.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import QueryBoundary from '@/components/QueryBoundary.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
@@ -65,7 +67,7 @@ const restoring = ref(false)
             <StatusBadge :meta="GROUP_HEALTH[g.health]" />
           </span>
         </div>
-        <div class="table-wrap">
+        <TableWrap>
           <table class="table">
             <caption class="sr-only">
               Members of
@@ -123,13 +125,14 @@ const restoring = ref(false)
               </tr>
             </tbody>
           </table>
-        </div>
+        </TableWrap>
         <details v-if="g.slots.length">
           <summary>Replication slots ({{ g.slots.length }})</summary>
           <ul>
             <li v-for="s in g.slots" :key="s.name">
-              <code>{{ s.name }}</code>, {{ s.type }}, {{ s.active ? 'active' : 'inactive' }},
-              retains {{ formatBytes(s.retainedWalBytes) }} of WAL
+              <code><SafeName :value="s.name" kind="text" :max="80" /></code>, {{ s.type }},
+              {{ s.active ? 'active' : 'inactive' }}, retains
+              {{ formatBytes(s.retainedWalBytes) }} of WAL
             </li>
           </ul>
         </details>

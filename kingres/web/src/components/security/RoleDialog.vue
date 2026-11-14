@@ -8,11 +8,23 @@ import { useQueryClient } from '@tanstack/vue-query'
 import AppDialog from '../AppDialog.vue'
 import FormField from '../FormField.vue'
 import ProblemNotice from '../ProblemNotice.vue'
+import SafeName from '../SafeName.vue'
 import { endpoints } from '@/api/endpoints'
 import { describeProblem } from '@/api/problem'
 import { keys, useClusterRoles, useRoles } from '@/api/queries'
 import type { ClusterRoleName, Role, RoleUpdateRequest } from '@/api/types'
-import { compact, firstError, identifier, minLength } from '@/lib/validators'
+import { compact, firstError, identifier, integerBetween, minLength } from '@/lib/validators'
+
+/** The value of a datetime-local input for a timestamp, read in UTC (seconds, no zone). */
+function utcInput(iso: string): string {
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? '' : d.toISOString().slice(0, 19)
+}
+/** A value of a datetime-local input read as UTC, as an exact ISO timestamp. */
+function utcIso(value: string): string | null {
+  const d = new Date(`${value.length === 16 ? `${value}:00` : value}Z`)
+  return Number.isNaN(d.getTime()) ? null : d.toISOString()
+}
 
 const props = defineProps<{ role?: Role }>()
 const emit = defineEmits<{ close: [] }>()
@@ -29,17 +41,25 @@ const form = reactive({
   canLogin: r?.canLogin ?? true,
   canCreateDatabase: r?.canCreateDatabase ?? false,
   canCreateRole: r?.canCreateRole ?? false,
-  connectionLimit: r?.connectionLimit ?? -1,
-  validUntil: r?.validUntil ? r.validUntil.slice(0, 16) : '',
+  // An emptied number field reads as '' (not a number); it is refused, never sent.
+  connectionLimit: (r?.connectionLimit ?? -1) as number | '',
+  // Shown and typed in UTC, the zone of the server and of the rest of the panel.
+  validUntil: r?.validUntil ? utcInput(r.validUntil) : '',
   memberOf: [...(r?.memberOf ?? [])],
   clusterRoles: [...(r?.clusterRoles ?? [])] as ClusterRoleName[],
 })
+/** True once the person has changed the date; an untouched date is never sent back. */
+const validUntilTouched = ref(false)
 const submitted = ref(false)
 const busy = ref(false)
 const error = ref<unknown>(null)
 
 const errors = computed(() =>
   compact({
+    connectionLimit: firstError<number | null>(
+      typeof form.connectionLimit === 'number' ? form.connectionLimit : null,
+      integerBetween('The connection limit', -1, 1_000_000),
+    ),
     name: editing.value ? undefined : firstError(form.name, identifier('The name')),
     password:
       form.password === '' && editing.value
@@ -60,7 +80,9 @@ async function save(): Promise<void> {
   if (Object.keys(errors.value).length) return
   busy.value = true
   error.value = null
-  const validUntil = form.validUntil ? new Date(form.validUntil).toISOString() : null
+  // The date as typed (UTC) as an exact timestamp; undefined while the person has not touched it.
+  const validUntil = form.validUntil ? utcIso(form.validUntil) : null
+  const connectionLimit = form.connectionLimit === '' ? -1 : form.connectionLimit
   try {
     if (r) {
       const update: RoleUpdateRequest = {}
@@ -69,8 +91,8 @@ async function save(): Promise<void> {
       if (form.canCreateDatabase !== r.canCreateDatabase)
         update.canCreateDatabase = form.canCreateDatabase
       if (form.canCreateRole !== r.canCreateRole) update.canCreateRole = form.canCreateRole
-      if (form.connectionLimit !== r.connectionLimit) update.connectionLimit = form.connectionLimit
-      if (validUntil !== r.validUntil) update.validUntil = validUntil
+      if (connectionLimit !== r.connectionLimit) update.connectionLimit = connectionLimit
+      if (validUntilTouched.value && validUntil !== r.validUntil) update.validUntil = validUntil
       if (Object.keys(update).length) await endpoints.updateRole(r.name, update)
       if (!sameSet(form.memberOf, r.memberOf))
         await endpoints.setRoleMemberships(r.name, form.memberOf)
@@ -83,7 +105,7 @@ async function save(): Promise<void> {
         canLogin: form.canLogin,
         canCreateDatabase: form.canCreateDatabase,
         canCreateRole: form.canCreateRole,
-        connectionLimit: form.connectionLimit,
+        connectionLimit,
         validUntil,
         memberOf: form.memberOf,
         clusterRoles: form.clusterRoles,
@@ -148,7 +170,12 @@ async function save(): Promise<void> {
         <label class="check"
           ><input v-model="form.canCreateRole" type="checkbox" /> Can create roles</label
         >
-        <FormField v-slot="slot" label="Connection limit" hint="-1 means unlimited.">
+        <FormField
+          v-slot="slot"
+          label="Connection limit"
+          hint="-1 means unlimited."
+          :error="err('connectionLimit')"
+        >
           <input
             v-bind="slot"
             v-model.number="form.connectionLimit"
@@ -157,8 +184,19 @@ async function save(): Promise<void> {
             min="-1"
           />
         </FormField>
-        <FormField v-slot="slot" label="Password valid until (optional)">
-          <input v-bind="slot" v-model="form.validUntil" class="input" type="datetime-local" />
+        <FormField
+          v-slot="slot"
+          label="Password valid until (UTC, optional)"
+          hint="Universal time, as in the rest of the panel. Empty means no expiry."
+        >
+          <input
+            v-bind="slot"
+            v-model="form.validUntil"
+            class="input"
+            type="datetime-local"
+            step="1"
+            @input="validUntilTouched = true"
+          />
         </FormField>
       </fieldset>
       <fieldset>
@@ -175,7 +213,8 @@ async function save(): Promise<void> {
         <legend>Member of</legend>
         <p v-if="otherRoles.length === 0" class="muted">No other roles.</p>
         <label v-for="o in otherRoles" :key="o.name" class="check">
-          <input v-model="form.memberOf" type="checkbox" :value="o.name" /> {{ o.name }}
+          <input v-model="form.memberOf" type="checkbox" :value="o.name" />
+          <SafeName :value="o.name" :max="80" />
         </label>
       </fieldset>
     </form>

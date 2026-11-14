@@ -2,6 +2,7 @@
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
 import { computed } from 'vue'
+import SafeName from '@/components/SafeName.vue'
 import { RouterLink } from 'vue-router'
 import PageHeader from '@/components/PageHeader.vue'
 import QueryBoundary from '@/components/QueryBoundary.vue'
@@ -187,7 +188,7 @@ const metricsUnsupported = computed(() =>
           <ul class="plain-list">
             <li v-for="a in alerts.data.value?.items.slice(0, 5)" :key="a.id" class="row">
               <StatusBadge :meta="SEVERITY[a.severity]" />
-              <span>{{ a.title }}</span>
+              <span><SafeName :value="a.title" kind="text" :max="120" /></span>
               <span class="muted">{{ formatAgo(a.raisedAt) }}</span>
             </li>
           </ul>
@@ -209,7 +210,9 @@ const metricsUnsupported = computed(() =>
             <li v-for="t in tasks.data.value?.items" :key="t.id" class="row">
               <StatusBadge :meta="TASK_STATE[t.state]" />
               <span class="mono">{{ t.kind }}</span>
-              <span v-if="t.subject" class="muted">{{ t.subject.id }}</span>
+              <span v-if="t.subject" class="muted"
+                ><SafeName :value="t.subject.id" kind="text" :max="60"
+              /></span>
               <span class="muted">{{ formatAgo(t.updatedAt) }}</span>
             </li>
           </ul>

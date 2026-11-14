@@ -385,3 +385,115 @@ table.table {
     transition: none;
   }
 }
+
+/* --- Reflow, long values, hidden characters (W-05, W-06, W-09, W-10) ------------------------- */
+
+/* Nothing may push the page wider than the screen: flex and grid children can shrink, words break. */
+.stack > *,
+.stack-lg > *,
+.row > *,
+.grid-cards > *,
+.grid-2 > *,
+.card {
+  min-width: 0;
+}
+h1,
+h2,
+h3,
+h4,
+code,
+.btn {
+  overflow-wrap: break-word;
+}
+/* A badge is a short label; one that holds text from the server may wrap. */
+.badge.wrap {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.btn {
+  max-width: 100%;
+  text-align: left;
+}
+.input,
+select,
+textarea {
+  min-width: 0;
+}
+.grid-cards {
+  grid-template-columns: repeat(auto-fill, minmax(min(220px, 100%), 1fr));
+}
+.grid-2 {
+  grid-template-columns: repeat(auto-fit, minmax(min(340px, 100%), 1fr));
+}
+
+/* A table that is wider than its box scrolls inside the box, which the keyboard can reach. */
+.table-wrap {
+  max-width: 100%;
+}
+.table-wrap:focus-visible {
+  outline: 2px solid var(--c-focus);
+  outline-offset: 0;
+}
+.table td {
+  overflow-wrap: break-word;
+}
+.table td .btn,
+.table td .row {
+  flex-wrap: wrap;
+}
+
+/* One name or message from the database (SafeName). */
+.safe {
+  unicode-bidi: isolate;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.safe.multiline {
+  white-space: pre-wrap;
+}
+.esc {
+  display: inline-block;
+  padding: 0 0.3em;
+  margin: 0 0.1em;
+  font-family: var(--font-mono);
+  font-size: 0.8em;
+  font-style: normal;
+  line-height: 1.4;
+  color: var(--c-text);
+  background: var(--c-warn-bg);
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--radius-sm);
+  white-space: nowrap;
+  unicode-bidi: isolate;
+  direction: ltr;
+}
+.safe-flag {
+  margin-inline-start: var(--s-1);
+}
+.safe-more {
+  margin-inline-start: var(--s-2);
+  font-size: var(--fs-sm);
+  /* A target of at least 24 CSS pixels (WCAG 2.5.8). */
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  min-width: 24px;
+  padding-inline: var(--s-1);
+}
+.null-cell {
+  font-style: italic;
+  color: var(--c-text-muted);
+}
+.empty-cell {
+  color: var(--c-text-muted);
+}
+.kv {
+  display: grid;
+  grid-template-columns: fit-content(45%) minmax(0, 1fr);
+  gap: var(--s-1) var(--s-4);
+  margin: 0;
+}
+.kv dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}

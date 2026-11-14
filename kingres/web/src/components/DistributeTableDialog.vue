@@ -4,6 +4,8 @@
 // Distribute a plain table. The distribution column is chosen from the columns the server says can
 // be one (`canBeDistributionColumn`); the others are listed with the reason from the contract.
 import { computed, reactive, ref, watch } from 'vue'
+import { safeText } from '@/lib/safe-text'
+import SafeName from './SafeName.vue'
 import TaskActionDialog from './TaskActionDialog.vue'
 import FormField from './FormField.vue'
 import QueryBoundary from './QueryBoundary.vue'
@@ -13,6 +15,9 @@ import type { DistributionBlockedReason, Table } from '@/api/types'
 
 const props = defineProps<{ databaseName: string; table: Table; candidates: Table[] }>()
 const emit = defineEmits<{ close: [] }>()
+
+/** An unambiguous key for a table: a schema or a table name may itself contain a dot. */
+const tableKey = (t: Table): string => JSON.stringify([t.schema, t.name])
 
 const BLOCKED_TEXT: Record<DistributionBlockedReason, string> = {
   shardingDisabled: 'Sharding is turned off for this database.',
@@ -52,7 +57,7 @@ const validate = (): boolean => {
 }
 
 const start = () => {
-  const target = props.candidates.find((t) => `${t.schema}.${t.name}` === form.colocateWith)
+  const target = props.candidates.find((t) => tableKey(t) === form.colocateWith)
   return endpoints.distributeTable(props.databaseName, props.table.schema, props.table.name, {
     method: form.method,
     ...(form.method === 'hash' ? { distributionColumn: form.column } : {}),
@@ -102,7 +107,7 @@ const start = () => {
           >
             <select v-bind="slot" v-model="form.column" data-autofocus>
               <option v-for="c in usable" :key="c.name" :value="c.name">
-                {{ c.name }} ({{ c.type }})
+                {{ safeText(c.name) }} ({{ safeText(c.type, 60) }})
               </option>
             </select>
           </FormField>
@@ -110,14 +115,16 @@ const start = () => {
             <p class="muted">Columns that cannot be used:</p>
             <ul class="blocked">
               <li v-for="c in blocked" :key="c.name">
-                <code>{{ c.name }}</code> ({{ c.type }}):
+                <code><SafeName :value="c.name" :max="80" /></code> ({{ safeText(c.type, 60) }}):
                 {{
                   c.distributionBlockedReason
                     ? BLOCKED_TEXT[c.distributionBlockedReason]
                     : 'Not allowed.'
                 }}
                 <template v-if="c.blockingKeys.length">
-                  Keys without it: <code>{{ c.blockingKeys.join(', ') }}</code>.
+                  Keys without it:
+                  <code><SafeName :value="c.blockingKeys.join(', ')" kind="text" :max="200" /></code
+                  >.
                 </template>
               </li>
             </ul>
@@ -129,12 +136,8 @@ const start = () => {
           >
             <select v-bind="slot" v-model="form.colocateWith">
               <option value="">A new colocation group</option>
-              <option
-                v-for="t in candidates"
-                :key="`${t.schema}.${t.name}`"
-                :value="`${t.schema}.${t.name}`"
-              >
-                {{ t.schema }}.{{ t.name }}
+              <option v-for="t in candidates" :key="tableKey(t)" :value="tableKey(t)">
+                {{ safeText(`${t.schema}.${t.name}`) }}
               </option>
             </select>
           </FormField>

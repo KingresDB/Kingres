@@ -5,9 +5,11 @@
 // count) are listed read-only with the reason. PATCH answers 200 for instant changes and 202 + Task
 // when background work is needed (turning on sharding or the ledger).
 import { computed, reactive, ref } from 'vue'
+import SafeName from './SafeName.vue'
 import TaskActionDialog from './TaskActionDialog.vue'
 import FormField from './FormField.vue'
 import NullableValue from './NullableValue.vue'
+import HiddenPreview from './HiddenPreview.vue'
 import { endpoints } from '@/api/endpoints'
 import { keys } from '@/api/queries'
 import type { Database, DatabaseUpdateRequest, Durability, LedgerMode, Task } from '@/api/types'
@@ -112,6 +114,7 @@ async function start(): Promise<Task> {
         <legend>Can be changed</legend>
         <FormField v-slot="slot" label="Owner role" :error="fieldErrors['general.owner']">
           <input v-bind="slot" v-model="form.owner" class="input mono" />
+          <HiddenPreview :value="form.owner" />
         </FormField>
         <FormField
           v-slot="slot"
@@ -184,7 +187,7 @@ async function start(): Promise<Task> {
         <legend>Fixed after creation</legend>
         <dl class="fixed">
           <dt>Name</dt>
-          <dd class="mono">{{ d.name }}</dd>
+          <dd class="mono"><SafeName :value="d.name" :max="80" /></dd>
           <dt>Encoding</dt>
           <dd class="mono"><NullableValue :value="d.general.encoding" /></dd>
           <dt>Collation</dt>
@@ -206,7 +209,7 @@ async function start(): Promise<Task> {
 <style scoped>
 .fixed {
   display: grid;
-  grid-template-columns: max-content 1fr;
+  grid-template-columns: fit-content(45%) minmax(0, 1fr);
   gap: var(--s-1) var(--s-4);
   margin: 0;
 }

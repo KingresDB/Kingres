@@ -21,8 +21,16 @@ export interface AppHarness extends RenderResult {
  * Builds the real app graph (see bootstrap.ts) with a memory history and test query defaults:
  * no retries, nothing kept between tests.
  */
+const built: { dispose: () => void }[] = []
+
+/** Removes the global hooks of every app built by the test that just ended. */
+export function disposeBuiltApps(): void {
+  for (const app of built.splice(0)) app.dispose()
+}
+
 function build() {
   const kingres = createKingres(createMemoryHistory())
+  built.push(kingres)
   setActivePinia(kingres.pinia)
   const { queryClient } = kingres
   queryClient.setDefaultOptions({

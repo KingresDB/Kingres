@@ -9,6 +9,7 @@ import { resetMockState } from '@/mocks/http'
 import { mockConfig } from '@/mocks/state'
 import { taskPolling } from '@/composables/useTask'
 import { setCsrfToken, setSetupToken } from '@/api/client'
+import { disposeBuiltApps } from './helpers'
 
 expect.extend(axeMatchers)
 // Pages are lazy-loaded and transformed on first use; give async queries room on a busy machine.
@@ -26,6 +27,7 @@ beforeEach(() => {
 })
 afterEach(() => {
   cleanup()
+  disposeBuiltApps()
   mockServer.resetHandlers()
 })
 afterAll(() => mockServer.close())

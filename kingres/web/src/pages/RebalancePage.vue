@@ -3,6 +3,8 @@
 <script setup lang="ts">
 // Rebalance: plan preview, start/stop, live progress and past reports.
 import { computed, ref } from 'vue'
+import SafeName from '@/components/SafeName.vue'
+import TableWrap from '@/components/TableWrap.vue'
 import { useMutation, useQueryClient } from '@tanstack/vue-query'
 import PageHeader from '@/components/PageHeader.vue'
 import QueryBoundary from '@/components/QueryBoundary.vue'
@@ -149,7 +151,7 @@ const detailId = ref<number | null>(null)
           </div>
           <p class="muted">{{ formatBytes(st.progress.bytesMoved) }} moved</p>
         </template>
-        <div v-if="st.inFlightMoves?.length" class="table-wrap">
+        <TableWrap v-if="st.inFlightMoves?.length">
           <table class="table">
             <caption class="sr-only">
               Moves in flight
@@ -169,7 +171,7 @@ const detailId = ref<number | null>(null)
                 v-for="m in st.inFlightMoves"
                 :key="`${m.databaseName}-${m.colocationId}-${m.bucket}`"
               >
-                <td>{{ m.databaseName }}</td>
+                <td><SafeName :value="m.databaseName" :max="60" /></td>
                 <td class="num">{{ m.bucket }}</td>
                 <td>{{ m.fromShardGroupId }}</td>
                 <td>{{ m.toShardGroupId }}</td>
@@ -178,7 +180,7 @@ const detailId = ref<number | null>(null)
               </tr>
             </tbody>
           </table>
-        </div>
+        </TableWrap>
         <p class="sr-only" aria-live="polite" role="status">
           {{
             running && st.progress
@@ -198,7 +200,7 @@ const detailId = ref<number | null>(null)
             class="check"
           >
             <input v-model="selectedDbs" type="checkbox" :value="d.name" :disabled="running" />
-            {{ d.name }}
+            <SafeName :value="d.name" :max="80" />
           </label>
         </fieldset>
         <div class="field" style="max-width: 20em">
@@ -234,10 +236,11 @@ const detailId = ref<number | null>(null)
           </p>
           <ul v-if="plan.warnings.length">
             <li v-for="w in plan.warnings" :key="w" class="notice tone-warn">
-              <span aria-hidden="true">&#9650;</span> {{ w }}
+              <span aria-hidden="true">&#9650;</span>
+              <SafeName :value="w" kind="text" :max="300" />
             </li>
           </ul>
-          <div class="table-wrap">
+          <TableWrap>
             <table class="table">
               <caption class="sr-only">
                 Primary buckets per server before and after
@@ -257,11 +260,14 @@ const detailId = ref<number | null>(null)
                 </tr>
               </tbody>
             </table>
-          </div>
+          </TableWrap>
           <details>
             <summary>Moves ({{ plan.moves.length }})</summary>
-            <div class="table-wrap">
+            <TableWrap>
               <table class="table">
+                <caption class="sr-only">
+                  Moves of the plan
+                </caption>
                 <thead>
                   <tr>
                     <th scope="col">Database</th>
@@ -276,7 +282,7 @@ const detailId = ref<number | null>(null)
                     v-for="m in plan.moves"
                     :key="`${m.databaseName}-${m.colocationId}-${m.bucket}`"
                   >
-                    <td>{{ m.databaseName }}</td>
+                    <td><SafeName :value="m.databaseName" :max="60" /></td>
                     <td class="num">{{ m.bucket }}</td>
                     <td>{{ m.fromShardGroupId }}</td>
                     <td>{{ m.toShardGroupId }}</td>
@@ -286,7 +292,7 @@ const detailId = ref<number | null>(null)
                   </tr>
                 </tbody>
               </table>
-            </div>
+            </TableWrap>
           </details>
         </template>
       </section>
@@ -301,8 +307,11 @@ const detailId = ref<number | null>(null)
           empty-hint="Every rebalance run leaves a report here."
           @retry="reports.refetch()"
         >
-          <div class="table-wrap">
+          <TableWrap>
             <table class="table">
+              <caption class="sr-only">
+                Past rebalance reports
+              </caption>
               <thead>
                 <tr>
                   <th scope="col">Report</th>
@@ -338,8 +347,12 @@ const detailId = ref<number | null>(null)
                 </tr>
               </tbody>
             </table>
-          </div>
+          </TableWrap>
         </QueryBoundary>
+        <p v-if="reports.data.value?.moreNotShown" class="notice tone-warn" role="status">
+          <span aria-hidden="true">&#9650;</span>
+          <span>More reports exist than are shown here; only the latest are listed.</span>
+        </p>
       </section>
     </div>
   </QueryBoundary>
@@ -364,7 +377,7 @@ const detailId = ref<number | null>(null)
 <style scoped>
 .kv {
   display: grid;
-  grid-template-columns: max-content 1fr;
+  grid-template-columns: fit-content(45%) minmax(0, 1fr);
   gap: var(--s-1) var(--s-4);
   margin: 0;
 }

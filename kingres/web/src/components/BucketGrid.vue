@@ -5,6 +5,7 @@
 // shows the group number, so colour is never the only signal; moving buckets get a dashed outline
 // and an arrow, orphans a cross. A per-group summary table is the accessible alternative.
 import { computed } from 'vue'
+import TableWrap from './TableWrap.vue'
 import type { Bucket } from '@/api/types'
 import { formatNumber } from '@/lib/format'
 
@@ -89,7 +90,7 @@ const summary = computed(() => {
       <li><span class="swatch moving">&rarr;</span> Moving</li>
       <li><span class="swatch orphan">&#10005;</span> Orphan</li>
     </ul>
-    <div class="table-wrap">
+    <TableWrap>
       <table class="table">
         <caption class="sr-only">
           Buckets per shard group
@@ -111,7 +112,7 @@ const summary = computed(() => {
           </tr>
         </tbody>
       </table>
-    </div>
+    </TableWrap>
   </div>
 </template>
 

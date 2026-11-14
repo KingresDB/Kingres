@@ -175,6 +175,10 @@ export async function runFlow(ctx) {
       )
       ;[...row.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Disable').click()
     })
+    // Disabling a role ends its sign-in, so the panel asks for the name to be typed.
+    await ui.waitForText('Disable role app_user?')
+    await page.type('[role=dialog] input.mono', 'app_user')
+    await ui.click('Disable role', { within: '[role=dialog] .dlg-foot' })
     await page.waitForFunction(
       () =>
         [...document.querySelectorAll('tr')].some(
@@ -380,7 +384,10 @@ export async function runFlow(ctx) {
       await page.type(`input[aria-label="Rule ${n} address"]`, '10.20.0.0/24')
     })
     await shot('16-network-edit')
-    await ui.click('Apply on all servers')
+    // The rules are applied from a confirmation that shows what changes; Enter in a field does nothing.
+    await ui.click('Review and apply')
+    await ui.waitForText('Apply the network access rules on every server?')
+    await ui.click('Apply on all servers', { within: '[role=dialog] .dlg-foot' })
     await sleep(3000)
     const text = await ui.text()
     notes.push(`network access after apply: alerts=${JSON.stringify(await ui.alerts())}`)

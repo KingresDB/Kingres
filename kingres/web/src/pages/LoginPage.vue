@@ -7,6 +7,7 @@ import ProblemNotice from '@/components/ProblemNotice.vue'
 import FormField from '@/components/FormField.vue'
 import BrandLogo from '@/components/BrandLogo.vue'
 import { SessionCookieError, useSessionStore } from '@/stores/session'
+import { safeRedirect } from '@/lib/redirect'
 
 const session = useSessionStore()
 const route = useRoute()
@@ -29,9 +30,13 @@ async function submit(): Promise<void> {
   error.value = null
   try {
     await session.signIn(username.value, password.value)
-    const target = typeof route.query.redirect === 'string' ? route.query.redirect : '/'
-    // Only follow redirects that stay inside the panel.
-    await router.push(target.startsWith('/') && !target.startsWith('//') ? target : '/')
+    // The page a previous user was on is not offered to someone else; a redirect must stay inside
+    // the panel.
+    const previous = session.expiredUser
+    session.expiredUser = null
+    const target =
+      previous !== null && previous !== session.username ? '/' : safeRedirect(route.query.redirect)
+    await router.push(target)
   } catch (e) {
     error.value = e
     password.value = ''

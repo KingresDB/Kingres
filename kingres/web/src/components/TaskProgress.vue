@@ -2,12 +2,16 @@
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
 // Live view of a Task: state, percent, steps and error. Announced through an aria-live region.
-import { computed } from 'vue'
+import { computed, watch } from 'vue'
 import StatusBadge from './StatusBadge.vue'
+import SafeName from './SafeName.vue'
+import { useAnnounce } from '@/composables/useAnnounce'
 import { TASK_STATE } from '@/lib/status'
 import type { Task } from '@/api/types'
 
 const props = defineProps<{ task: Task | null; pollError?: unknown }>()
+const announce = useAnnounce()
+
 const summary = computed(() => {
   const t = props.task
   if (!t) return ''
@@ -15,6 +19,23 @@ const summary = computed(() => {
   if (t.state === 'done') return `Task ${t.id} finished.`
   return `Task ${t.id}: ${t.progress.currentStep ?? t.state}, ${Math.round(t.progress.percent)} percent.`
 })
+// What is read aloud changes only when the state, the step or the next tenth of the progress
+// changes, not every second.
+const announcementKey = computed(() => {
+  const t = props.task
+  return t
+    ? `${t.state}|${t.progress.currentStep ?? ''}|${Math.floor(t.progress.percent / 10)}`
+    : ''
+})
+watch(announcementKey, (key) => {
+  if (key) announce(summary.value, props.task?.state === 'failed' ? 'assertive' : 'polite')
+})
+watch(
+  () => props.pollError,
+  (error) => {
+    if (error) announce('Lost contact with the server while following this task.', 'assertive')
+  },
+)
 </script>
 
 <template>
@@ -47,21 +68,23 @@ const summary = computed(() => {
                 ? '◐'
                 : '○'
         }}</span>
-        {{ step.name }}
+        <SafeName :value="step.name" kind="text" :max="120" />
         <span class="muted">({{ step.state }})</span>
       </li>
     </ol>
     <p v-if="task.error" class="tone-danger notice" role="alert">
       <span aria-hidden="true">&#10006;</span>
       <span
-        >{{ task.error.message
-        }}<template v-if="task.error.step"> (step: {{ task.error.step }})</template></span
+        ><SafeName :value="task.error.message" kind="text" :max="400" /><template
+          v-if="task.error.step"
+        >
+          (step: <SafeName :value="task.error.step" kind="text" :max="80" />)</template
+        ></span
       >
     </p>
-    <p v-if="pollError" class="muted">
+    <p v-if="pollError" class="muted" role="alert">
       Lost contact with the server while following this task. Reload to see its state.
     </p>
-    <p class="sr-only" aria-live="polite" role="status">{{ summary }}</p>
   </section>
 </template>
 

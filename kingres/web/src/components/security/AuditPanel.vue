@@ -2,6 +2,8 @@
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
 import { ref } from 'vue'
+import SafeName from '../SafeName.vue'
+import TableWrap from '../TableWrap.vue'
 import QueryBoundary from '../QueryBoundary.vue'
 import { endpoints } from '@/api/endpoints'
 import { keys, usePagedQuery } from '@/api/queries'
@@ -63,7 +65,7 @@ const OUTCOME = {
       empty-hint="Sign-ins and administrative actions are recorded here."
       @retry="query.refetch()"
     >
-      <div class="table-wrap">
+      <TableWrap>
         <table class="table">
           <caption class="sr-only">
             Audit log
@@ -82,12 +84,21 @@ const OUTCOME = {
             <tr v-for="e in items" :key="e.id">
               <td>{{ formatDateTime(e.timestamp) }}</td>
               <td>
-                {{ e.actor }}
-                <div v-if="e.actorAddress" class="muted mono">{{ e.actorAddress }}</div>
+                <SafeName :value="e.actor" :max="60" />
+                <div v-if="e.actorAddress" class="muted mono">
+                  <SafeName :value="e.actorAddress" kind="text" :max="60" />
+                </div>
               </td>
               <td>{{ e.source }}</td>
               <td class="mono">{{ e.action }}</td>
-              <td>{{ e.resourceType ? `${e.resourceType} ${e.resourceId ?? ''}` : '-' }}</td>
+              <td>
+                <SafeName
+                  v-if="e.resourceType"
+                  :value="`${e.resourceType} ${e.resourceId ?? ''}`"
+                  :max="120"
+                />
+                <template v-else>-</template>
+              </td>
               <td>
                 <span class="badge" :class="`tone-${OUTCOME[e.outcome].tone}`"
                   ><span aria-hidden="true">{{ OUTCOME[e.outcome].icon }}</span>
@@ -97,7 +108,7 @@ const OUTCOME = {
             </tr>
           </tbody>
         </table>
-      </div>
+      </TableWrap>
       <button
         v-if="query.hasNextPage.value"
         type="button"

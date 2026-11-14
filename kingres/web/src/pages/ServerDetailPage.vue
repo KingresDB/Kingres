@@ -2,6 +2,9 @@
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
+import { safeText } from '@/lib/safe-text'
+import SafeName from '@/components/SafeName.vue'
+import TableWrap from '@/components/TableWrap.vue'
 import { RouterLink } from 'vue-router'
 import { useMutation, useQueryClient } from '@tanstack/vue-query'
 import PageHeader from '@/components/PageHeader.vue'
@@ -27,10 +30,12 @@ const dialog = ref<'failover' | 'remove' | null>(null)
 // Server group assignment: PATCH /servers/{id} with serverGroup (null removes the server from its group).
 const group = ref('')
 const groupSaved = ref(false)
+// A refresh of the server must not replace a choice the person has made but not saved.
+const groupTouched = ref(false)
 watch(
   () => s.value?.serverGroup,
   (g) => {
-    group.value = g ?? ''
+    if (!groupTouched.value) group.value = g ?? ''
   },
   { immediate: true },
 )
@@ -38,6 +43,7 @@ const assign = useMutation({
   mutationFn: () => endpoints.updateServer(props.id, { serverGroup: group.value || null }),
   onSuccess: () => {
     groupSaved.value = true
+    groupTouched.value = false
   },
   onSettled: () =>
     Promise.all([
@@ -72,7 +78,11 @@ function saveGroup(): void {
         <div class="card kpi">
           <span class="label">Status</span>
           <span class="value"><StatusBadge :meta="SERVER_STATUS[s.status]" /></span>
-          <span class="muted">Server group: {{ s.serverGroup ?? 'none' }}</span>
+          <span class="muted"
+            >Server group:
+            <SafeName v-if="s.serverGroup" :value="s.serverGroup" :max="60" />
+            <template v-else>none</template></span
+          >
         </div>
         <div class="card kpi">
           <span class="label">Buckets (primary / replica)</span>
@@ -110,10 +120,10 @@ function saveGroup(): void {
         >
           <div class="field">
             <label for="srv-group">Group</label>
-            <select id="srv-group" v-model="group">
+            <select id="srv-group" v-model="group" @change="groupTouched = true">
               <option value="">None</option>
               <option v-for="g in groups.data.value?.items" :key="g.name" :value="g.name">
-                {{ g.name }}
+                {{ safeText(g.name) }}
               </option>
             </select>
           </div>
@@ -132,8 +142,11 @@ function saveGroup(): void {
 
       <section class="card" aria-labelledby="inst-h">
         <h2 id="inst-h">Instances</h2>
-        <div class="table-wrap">
+        <TableWrap>
           <table class="table">
+            <caption class="sr-only">
+              Instances of the server
+            </caption>
             <thead>
               <tr>
                 <th scope="col">Instance</th>
@@ -163,14 +176,17 @@ function saveGroup(): void {
               </tr>
             </tbody>
           </table>
-        </div>
+        </TableWrap>
       </section>
 
       <section class="card" aria-labelledby="db-h">
         <h2 id="db-h">Buckets by database</h2>
         <p v-if="s.bucketsByDatabase.length === 0" class="muted">No sharded databases.</p>
-        <div v-else class="table-wrap">
+        <TableWrap v-else>
           <table class="table">
+            <caption class="sr-only">
+              Primary and replica buckets per database
+            </caption>
             <thead>
               <tr>
                 <th scope="col">Database</th>
@@ -183,10 +199,9 @@ function saveGroup(): void {
             <tbody>
               <tr v-for="d in s.bucketsByDatabase" :key="d.databaseName">
                 <th scope="row">
-                  <RouterLink
-                    :to="{ name: 'shards', query: { db: d.databaseName, server: s.id } }"
-                    >{{ d.databaseName }}</RouterLink
-                  >
+                  <RouterLink :to="{ name: 'shards', query: { db: d.databaseName, server: s.id } }"
+                    ><SafeName :value="d.databaseName" :max="80"
+                  /></RouterLink>
                 </th>
                 <td class="num">{{ d.primaryBuckets }}</td>
                 <td class="num">
@@ -199,7 +214,7 @@ function saveGroup(): void {
               </tr>
             </tbody>
           </table>
-        </div>
+        </TableWrap>
       </section>
 
       <section class="card" aria-labelledby="res-h">
@@ -236,7 +251,7 @@ function saveGroup(): void {
 <style scoped>
 .kv {
   display: grid;
-  grid-template-columns: max-content 1fr;
+  grid-template-columns: fit-content(45%) minmax(0, 1fr);
   gap: var(--s-1) var(--s-4);
   margin: 0;
 }

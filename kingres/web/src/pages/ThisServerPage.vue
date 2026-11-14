@@ -4,6 +4,9 @@
 // "This server": the node that serves this panel. These pages keep working when the node is
 // standalone or cut off from the rest of the cluster.
 import { computed, reactive, ref, watch } from 'vue'
+import { safeText } from '@/lib/safe-text'
+import SafeName from '@/components/SafeName.vue'
+import TableWrap from '@/components/TableWrap.vue'
 import { RouterLink } from 'vue-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
 import PageHeader from '@/components/PageHeader.vue'
@@ -14,12 +17,16 @@ import NullableValue from '@/components/NullableValue.vue'
 import ResourceMeter from '@/components/ResourceMeter.vue'
 import ProblemNotice from '@/components/ProblemNotice.vue'
 import TaskActionDialog from '@/components/TaskActionDialog.vue'
+import { vBlockEnterSubmit } from '@/lib/forms'
 import { endpoints } from '@/api/endpoints'
 import { every, keys, POLL, useThisServer } from '@/api/queries'
 import { INSTANCE_STATE, SERVICE_STATE } from '@/lib/status'
 import { instanceLabel } from '@/lib/cluster'
 import { formatBytes, formatDuration, percent } from '@/lib/format'
 import type { Instance, LogLevel } from '@/api/types'
+import type { components } from '@/api/schema'
+
+type S = components['schemas']
 
 const client = useQueryClient()
 const info = useThisServer()
@@ -42,6 +49,10 @@ const action = ref<
   { kind: 'restart' | 'stop' | 'start'; instance: Instance } | { kind: 'leave' } | null
 >(null)
 const force = ref(false)
+// "Force" belongs to the action it was ticked for: every new dialog starts unticked.
+watch(action, () => {
+  force.value = false
+})
 
 const form = reactive({ memory: 4096, logLevel: 'info' as LogLevel })
 watch(
@@ -57,12 +68,17 @@ watch(
 const memoryError = computed(() =>
   form.memory >= 512 ? undefined : 'The memory quota must be at least 512 MB.',
 )
+/** Only what was changed; an untouched field is not sent back. */
+function localChanges(): S['LocalSettingsUpdate'] {
+  const d = local.data.value
+  const body: S['LocalSettingsUpdate'] = {}
+  if (!d || form.memory !== d.memoryQuota.totalMegabytes)
+    body.memoryQuota = { totalMegabytes: form.memory }
+  if (!d || form.logLevel !== d.logLevel) body.logLevel = form.logLevel
+  return body
+}
 const saveSettings = useMutation({
-  mutationFn: () =>
-    endpoints.updateThisServerSettings({
-      memoryQuota: { totalMegabytes: form.memory },
-      logLevel: form.logLevel,
-    }),
+  mutationFn: () => endpoints.updateThisServerSettings(localChanges()),
   onSuccess: () => client.invalidateQueries({ queryKey: keys.thisServer }),
 })
 
@@ -118,9 +134,11 @@ const percentText = (v: number) => percent(v)
         <h2 id="svc-h">Services</h2>
         <ul class="plain-list">
           <li v-for="s in info.data.value.services" :key="s.name" class="row">
-            <span class="mono" style="min-width: 7em">{{ s.name }}</span><StatusBadge
-              :meta="SERVICE_STATE[s.state]"
-            /><span v-if="s.detail" class="muted">{{ s.detail }}</span>
+            <span class="mono" style="min-width: 7em"
+              ><SafeName :value="s.name" kind="text" :max="60" /></span
+            ><StatusBadge :meta="SERVICE_STATE[s.state]" /><span v-if="s.detail" class="muted"
+              ><SafeName :value="s.detail" kind="text" :max="300"
+            /></span>
           </li>
         </ul>
       </section>
@@ -133,7 +151,7 @@ const percentText = (v: number) => percent(v)
           :empty="instances.data.value?.items.length === 0"
           empty-title="No instances on this server"
         >
-          <div class="table-wrap">
+          <TableWrap>
             <table class="table">
               <caption class="sr-only">
                 Local instances
@@ -184,7 +202,7 @@ const percentText = (v: number) => percent(v)
                 </tr>
               </tbody>
             </table>
-          </div>
+          </TableWrap>
         </QueryBoundary>
       </section>
 
@@ -214,8 +232,8 @@ const percentText = (v: number) => percent(v)
             <ResourceMeter
               v-for="d in resources.data.value.disks"
               :key="d.path"
-              :label="`Disk ${d.path} (${d.purpose})`"
-              :name="`Disk usage of ${d.path}`"
+              :label="`Disk ${safeText(d.path)} (${d.purpose})`"
+              :name="`Disk usage of ${safeText(d.path)}`"
               :used="d.usedBytes"
               :total="d.totalBytes"
               :format="formatBytes"
@@ -229,6 +247,7 @@ const percentText = (v: number) => percent(v)
         <QueryBoundary :loading="local.isPending.value" :error="local.error.value">
           <form
             v-if="local.data.value"
+            v-block-enter-submit
             class="stack"
             style="max-width: 32em"
             @submit.prevent="saveSettings.mutate()"
@@ -239,7 +258,13 @@ const percentText = (v: number) => percent(v)
             </p>
             <dl class="kv">
               <dt>Data directory</dt>
-              <dd class="mono">{{ local.data.value.dataPaths.dataDirectory }}</dd>
+              <dd class="mono">
+                <SafeName
+                  :value="local.data.value.dataPaths.dataDirectory"
+                  kind="text"
+                  :max="200"
+                />
+              </dd>
               <dt>Client ports</dt>
               <dd>
                 read-write {{ local.data.value.clientPorts.readWritePort
@@ -347,7 +372,7 @@ const percentText = (v: number) => percent(v)
 }
 .kv {
   display: grid;
-  grid-template-columns: max-content 1fr;
+  grid-template-columns: fit-content(45%) minmax(0, 1fr);
   gap: var(--s-1) var(--s-4);
   margin: 0;
 }

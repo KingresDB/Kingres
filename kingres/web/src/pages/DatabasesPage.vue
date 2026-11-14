@@ -2,6 +2,7 @@
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import TableWrap from '@/components/TableWrap.vue'
 import { RouterLink } from 'vue-router'
 import PageHeader from '@/components/PageHeader.vue'
 import QueryBoundary from '@/components/QueryBoundary.vue'
@@ -9,6 +10,8 @@ import StatusBadge from '@/components/StatusBadge.vue'
 import GateButton from '@/components/GateButton.vue'
 import NullableValue from '@/components/NullableValue.vue'
 import NotAvailable from '@/components/NotAvailable.vue'
+import SafeName from '@/components/SafeName.vue'
+import { isAddressableSegment } from '@/lib/path-segment'
 import CreateDatabaseDialog from '@/components/CreateDatabaseDialog.vue'
 import { useDatabaseCreateOptions, useDatabases } from '@/api/queries'
 import { DATABASE_STATUS, DURABILITY_LABEL, LEDGER_MODE_LABEL, LEDGER_STATE } from '@/lib/status'
@@ -41,7 +44,7 @@ const creating = ref(false)
     empty-hint="Create a database to choose its sharding, replication and ledger settings."
     @retry="databases.refetch()"
   >
-    <div class="table-wrap">
+    <TableWrap>
       <table class="table">
         <caption class="sr-only">
           Databases
@@ -62,12 +65,20 @@ const creating = ref(false)
         <tbody>
           <tr v-for="d in rows" :key="d.name">
             <th scope="row">
-              <RouterLink :to="{ name: 'database', params: { name: d.name } }">{{
-                d.name
-              }}</RouterLink>
+              <RouterLink
+                v-if="isAddressableSegment(d.name)"
+                :to="{ name: 'database', params: { name: d.name } }"
+                ><SafeName :value="d.name"
+              /></RouterLink>
+              <template v-else>
+                <SafeName :value="d.name" />
+                <div class="muted">
+                  This name cannot be opened by address; use SQL to manage it.
+                </div>
+              </template>
             </th>
             <td><StatusBadge :meta="DATABASE_STATUS[d.status]" /></td>
-            <td><NullableValue :value="d.general.owner" /></td>
+            <td><NullableValue :value="d.general.owner" safe /></td>
             <td>
               <template v-if="d.sharding.enabled"
                 >On, <NullableValue :value="d.sharding.bucketCount" :format="(n) => `${n} buckets`"
@@ -119,7 +130,7 @@ const creating = ref(false)
           </tr>
         </tbody>
       </table>
-    </div>
+    </TableWrap>
   </QueryBoundary>
 
   <CreateDatabaseDialog v-if="creating" @close="creating = false" />

@@ -3,6 +3,8 @@
 <script setup lang="ts">
 // Cluster logs, or (with `local`) the logs of this server only.
 import { ref } from 'vue'
+import SafeName from '@/components/SafeName.vue'
+import TableWrap from '@/components/TableWrap.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import QueryBoundary from '@/components/QueryBoundary.vue'
 import { endpoints } from '@/api/endpoints'
@@ -88,7 +90,7 @@ const LEVEL_ICON: Record<LogLevel, string> = { debug: '·', info: 'ⓘ', warning
     empty-hint="Nothing matches these filters."
     @retry="query.refetch()"
   >
-    <div class="table-wrap">
+    <TableWrap>
       <table class="table">
         <caption class="sr-only">
           Log lines
@@ -119,12 +121,15 @@ const LEVEL_ICON: Record<LogLevel, string> = { debug: '·', info: 'ⓘ', warning
               >
             </td>
             <td>{{ l.component }}</td>
-            <td>{{ l.serverId ?? '-' }}</td>
-            <td class="mono">{{ l.message }}</td>
+            <td>
+              <SafeName v-if="l.serverId" :value="l.serverId" kind="text" :max="60" />
+              <template v-else>-</template>
+            </td>
+            <td class="mono"><SafeName :value="l.message" kind="text" :max="400" multiline /></td>
           </tr>
         </tbody>
       </table>
-    </div>
+    </TableWrap>
     <button
       v-if="query.hasNextPage.value"
       type="button"

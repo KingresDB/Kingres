@@ -5,14 +5,18 @@
 // columns are the privileges. A checkbox issues GRANT or REVOKE immediately. Three templates
 // set up common access in one step.
 import { computed, ref, watch } from 'vue'
+import TableWrap from '../TableWrap.vue'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
 import QueryBoundary from '../QueryBoundary.vue'
 import GateButton from '../GateButton.vue'
 import ProblemNotice from '../ProblemNotice.vue'
+import ConfirmDialog from '../ConfirmDialog.vue'
+import SafeName from '../SafeName.vue'
 import { endpoints } from '@/api/endpoints'
-import { keys, useDatabases, useRoles, useTables } from '@/api/queries'
+import { fetchAllPages, keys, useDatabases, useRoles, useTables } from '@/api/queries'
 import type { Grant, GrantLevel, GrantRequest, Privilege } from '@/api/types'
 import { useSessionStore } from '@/stores/session'
+import { safeText } from '@/lib/safe-text'
 
 const client = useQueryClient()
 const session = useSessionStore()
@@ -39,7 +43,10 @@ watch(
 const tables = useTables(database)
 const grants = useQuery({
   queryKey: computed(() => [...keys.grants, grantee.value, database.value]),
-  queryFn: () => endpoints.listGrants({ grantee: grantee.value, database: database.value }),
+  queryFn: () =>
+    fetchAllPages((cursor) =>
+      endpoints.listGrants({ grantee: grantee.value, database: database.value, cursor }),
+    ),
   enabled: computed(() => !!grantee.value && !!database.value),
 })
 
@@ -64,6 +71,9 @@ const COLUMNS: Privilege[] = [
 
 interface Row {
   key: string
+  /** Kind of object and its name, shown with SafeName: `Database shop`. */
+  kind: 'Database' | 'Schema' | 'Table'
+  name: string
   label: string
   level: GrantLevel
   schema: string | null
@@ -73,7 +83,9 @@ const rows = computed<Row[]>(() => {
   const list: Row[] = [
     {
       key: 'db',
-      label: `Database ${database.value}`,
+      kind: 'Database',
+      name: database.value,
+      label: `Database ${safeText(database.value)}`,
       level: 'database',
       schema: null,
       table: null,
@@ -82,11 +94,22 @@ const rows = computed<Row[]>(() => {
   const items = tables.data.value?.items ?? []
   const schemas = [...new Set(['public', ...items.map((t) => t.schema)])]
   for (const s of schemas) {
-    list.push({ key: `s:${s}`, label: `Schema ${s}`, level: 'schema', schema: s, table: null })
+    list.push({
+      key: JSON.stringify(['s', s]),
+      kind: 'Schema',
+      name: s,
+      label: `Schema ${safeText(s)}`,
+      level: 'schema',
+      schema: s,
+      table: null,
+    })
     for (const t of items.filter((x) => x.schema === s)) {
       list.push({
-        key: `t:${s}.${t.name}`,
-        label: `Table ${s}.${t.name}`,
+        // A name may contain a dot: the key must not be ambiguous.
+        key: JSON.stringify(['t', s, t.name]),
+        kind: 'Table',
+        name: `${s}.${t.name}`,
+        label: `Table ${safeText(`${s}.${t.name}`)}`,
         level: 'table',
         schema: s,
         table: t.name,
@@ -105,6 +128,7 @@ const has = (row: Row, p: Privilege) => grantFor(row)?.privileges.includes(p) ??
 const applicable = (row: Row, p: Privilege) => PRIVILEGES[row.level].includes(p)
 const refresh = () => client.invalidateQueries({ queryKey: keys.grants })
 
+const failedChange = ref<string | null>(null)
 const toggle = useMutation({
   mutationFn: ({ row, p, on }: { row: Row; p: Privilege; on: boolean }) => {
     const body: GrantRequest = {
@@ -120,7 +144,20 @@ const toggle = useMutation({
   onSettled: refresh,
 })
 function onToggle(row: Row, p: Privilege, event: Event): void {
-  toggle.mutate({ row, p, on: (event.target as HTMLInputElement).checked })
+  const box = event.target as HTMLInputElement
+  const on = box.checked
+  failedChange.value = null
+  toggle.mutate(
+    { row, p, on },
+    {
+      // The box was flipped by the click. When the server did not make the change, put it back to
+      // what the server has, so that the matrix never shows a grant that does not exist.
+      onError: () => {
+        box.checked = !on
+        failedChange.value = `${on ? 'Granting' : 'Revoking'} ${p.toUpperCase()} on ${safeText(row.name)}`
+      },
+    },
+  )
 }
 
 const template = ref<'readOnly' | 'readWrite' | 'owner'>('readOnly')
@@ -129,6 +166,20 @@ const TEMPLATE_HELP = {
   readWrite: 'Connect, read and change data in every table (SELECT, INSERT, UPDATE, DELETE).',
   owner: 'Full control of all objects in the database, including DDL.',
 }
+const reviewingTemplate = ref(false)
+const TEMPLATE_LABEL = {
+  readOnly: 'read-only',
+  readWrite: 'read-write',
+  owner: 'database owner',
+} as const
+const TEMPLATE_GRANTS = {
+  readOnly:
+    'CONNECT on the database, USAGE on its schemas, and SELECT on every table. Nothing can be changed.',
+  readWrite:
+    'CONNECT and TEMPORARY on the database, USAGE on its schemas, and SELECT, INSERT, UPDATE and DELETE on every table.',
+  owner:
+    'CONNECT, CREATE and TEMPORARY on the database, USAGE and CREATE on its schemas, and every privilege on every table. The role can change the structure (create, alter and drop objects).',
+}
 const applyTemplate = useMutation({
   mutationFn: () =>
     endpoints.applyGrantTemplate({
@@ -136,6 +187,9 @@ const applyTemplate = useMutation({
       grantee: grantee.value,
       database: database.value,
     }),
+  onSuccess: () => {
+    reviewingTemplate.value = false
+  },
   onSettled: refresh,
 })
 </script>
@@ -147,7 +201,7 @@ const applyTemplate = useMutation({
         <label for="g-role">Role</label>
         <select id="g-role" v-model="grantee">
           <option v-for="r in roles.data.value?.items" :key="r.name" :value="r.name">
-            {{ r.name }}
+            {{ safeText(r.name) }}
           </option>
         </select>
       </div>
@@ -155,7 +209,7 @@ const applyTemplate = useMutation({
         <label for="g-db">Database</label>
         <select id="g-db" v-model="database">
           <option v-for="d in databases.data.value?.items" :key="d.name" :value="d.name">
-            {{ d.name }}
+            {{ safeText(d.name) }}
           </option>
         </select>
       </div>
@@ -181,15 +235,26 @@ const applyTemplate = useMutation({
         <GateButton
           op="applyGrantTemplate"
           :disabled="!grantee || !database || applyTemplate.isPending.value"
-          @click="applyTemplate.mutate()"
+          @click="reviewingTemplate = true"
         >
-          Apply template to {{ grantee || 'role' }}
+          Apply template to <SafeName :value="grantee || 'role'" kind="text" :max="40" />
         </GateButton>
       </div>
     </fieldset>
 
+    <p v-if="roles.data.value?.moreNotShown" class="notice tone-warn" role="status">
+      <span aria-hidden="true">&#9650;</span>
+      <span>More roles exist than are listed here.</span>
+    </p>
+    <p v-if="tables.data.value?.moreNotShown" class="notice tone-warn" role="status">
+      <span aria-hidden="true">&#9650;</span>
+      <span>More tables exist than are shown in the matrix.</span>
+    </p>
+    <div v-if="failedChange" class="notice tone-danger" role="alert">
+      <span aria-hidden="true">&#10006;</span>
+      <span>{{ failedChange }} was not applied. The matrix shows what the server has.</span>
+    </div>
     <ProblemNotice v-if="toggle.error.value" :error="toggle.error.value" />
-    <ProblemNotice v-if="applyTemplate.error.value" :error="applyTemplate.error.value" />
 
     <QueryBoundary
       :loading="grants.isPending.value || tables.isPending.value"
@@ -197,16 +262,16 @@ const applyTemplate = useMutation({
       :empty="!grantee || !database"
       empty-title="Choose a role and a database"
     >
-      <div class="table-wrap">
+      <TableWrap>
         <table class="table matrix">
           <caption class="sr-only">
             Privileges of
             {{
-              grantee
+              safeText(grantee)
             }}
             on
             {{
-              database
+              safeText(database)
             }}
           </caption>
           <thead>
@@ -217,7 +282,7 @@ const applyTemplate = useMutation({
           </thead>
           <tbody>
             <tr v-for="row in rows" :key="row.key">
-              <th scope="row">{{ row.label }}</th>
+              <th scope="row">{{ row.kind }} <SafeName :value="row.name" :max="120" /></th>
               <td v-for="p in COLUMNS" :key="p">
                 <input
                   v-if="applicable(row, p)"
@@ -232,9 +297,30 @@ const applyTemplate = useMutation({
             </tr>
           </tbody>
         </table>
-      </div>
+      </TableWrap>
     </QueryBoundary>
   </div>
+
+  <ConfirmDialog
+    v-if="reviewingTemplate"
+    :title="`Apply the ${TEMPLATE_LABEL[template]} template to ${grantee} on ${database}?`"
+    confirm-label="Apply template"
+    :danger="template !== 'readOnly'"
+    :type-to-confirm="template === 'owner' ? database : undefined"
+    :busy="applyTemplate.isPending.value"
+    @cancel="reviewingTemplate = false"
+    @confirm="applyTemplate.mutate()"
+  >
+    <p>
+      Role <strong><SafeName :value="grantee" :max="60" /></strong> is given, on database
+      <strong><SafeName :value="database" :max="60" /></strong>:
+    </p>
+    <p class="notice">{{ TEMPLATE_GRANTS[template] }}</p>
+    <p class="muted">
+      Grants the role already has stay. You can revoke single privileges in the matrix afterwards.
+    </p>
+    <ProblemNotice v-if="applyTemplate.error.value" :error="applyTemplate.error.value" />
+  </ConfirmDialog>
 </template>
 
 <style scoped>

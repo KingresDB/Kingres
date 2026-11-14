@@ -708,7 +708,7 @@ function runQuery(ctx: Ctx): S['QueryResult'] {
   m = /^select\s+(.+?)\s+from\s+([\w.]+)/i.exec(sql)
   if (m) {
     const table = (m[2] ?? '').split('.').pop() ?? ''
-    const data = TABLES[table]
+    const data = ctx.s.extraQueryTables?.[table] ?? TABLES[table]
     if (!data)
       throw problem('sql_error', `relation "${m[2]}" does not exist`, {
         sqlState: '42P01',
@@ -1234,7 +1234,10 @@ export function createHandlers(): HttpHandler[] {
         (x) => x.schema === c.params.schemaName && x.name === c.params.tableName,
       )
       if (!t) throw problem('not_found', 'Table does not exist.')
-      return ok({ ...t, columns: columnsFor(rec, t) } satisfies S['TableDetail'])
+      return ok({
+        ...t,
+        columns: rec.extraColumns?.[t.name] ?? columnsFor(rec, t),
+      } satisfies S['TableDetail'])
     },
     distributeTable: (c) => {
       const s = c.s

@@ -10,6 +10,8 @@ import QueryBoundary from '@/components/QueryBoundary.vue'
 import GateButton from '@/components/GateButton.vue'
 import ProblemNotice from '@/components/ProblemNotice.vue'
 import FormField from '@/components/FormField.vue'
+import ConfirmDialog from '@/components/ConfirmDialog.vue'
+import { vBlockEnterSubmit } from '@/lib/forms'
 import { endpoints } from '@/api/endpoints'
 import { describeProblem } from '@/api/problem'
 import { keys, useClusterSettings } from '@/api/queries'
@@ -33,6 +35,9 @@ const form = reactive({
 })
 const saved = ref(false)
 const submitted = ref(false)
+/** True once the person has edited a field; a refresh from the server must not overwrite edits. */
+const dirty = ref(false)
+const confirmingFeatures = ref<string[] | null>(null)
 
 function load(): void {
   const d = s.value
@@ -47,8 +52,15 @@ function load(): void {
     sharding: d.features.sharding,
     ledger: d.features.ledger,
   })
+  dirty.value = false
 }
-watch(s, load, { immediate: true })
+watch(
+  s,
+  () => {
+    if (!dirty.value) load()
+  },
+  { immediate: true },
+)
 
 const errors = computed(() =>
   compact({
@@ -101,6 +113,8 @@ const save = useMutation({
   mutationFn: () => endpoints.updateClusterSettings(changes()),
   onSuccess: async () => {
     saved.value = true
+    dirty.value = false
+    confirmingFeatures.value = null
     await Promise.all([
       client.invalidateQueries({ queryKey: keys.clusterSettings }),
       client.invalidateQueries({ queryKey: keys.cluster }),
@@ -117,8 +131,15 @@ function submit(): void {
   saved.value = false
   unchanged.value = false
   if (Object.keys(errors.value).length > 0) return
-  if (Object.keys(changes()).length === 0) {
+  const body = changes()
+  if (Object.keys(body).length === 0) {
     unchanged.value = true
+    return
+  }
+  // A feature cannot be turned off again, so turning one on is confirmed first.
+  const turnedOn = Object.keys(body.features ?? {})
+  if (turnedOn.length > 0) {
+    confirmingFeatures.value = turnedOn
     return
   }
   save.mutate()
@@ -135,7 +156,16 @@ function submit(): void {
     :error="settings.error.value"
     @retry="settings.refetch()"
   >
-    <form v-if="s" class="stack-lg" style="max-width: 720px" novalidate @submit.prevent="submit">
+    <form
+      v-if="s"
+      v-block-enter-submit
+      class="stack-lg"
+      style="max-width: 720px"
+      novalidate
+      @submit.prevent="submit"
+      @input="dirty = true"
+      @change="dirty = true"
+    >
       <p v-if="s.restart.required" class="notice tone-warn" role="status">
         <span aria-hidden="true">&#9650;</span>
         <span
@@ -258,4 +288,19 @@ function submit(): void {
       </div>
     </form>
   </QueryBoundary>
+  <ConfirmDialog
+    v-if="confirmingFeatures"
+    :title="`Turn on ${confirmingFeatures.join(' and ')} for the whole cluster?`"
+    confirm-label="Turn on permanently"
+    danger
+    :busy="save.isPending.value"
+    @cancel="confirmingFeatures = null"
+    @confirm="save.mutate()"
+  >
+    <p>
+      This cannot be turned off again. The first time a feature is enabled, every server needs a
+      restart before it is loaded.
+    </p>
+    <ProblemNotice v-if="save.error.value" :error="save.error.value" />
+  </ConfirmDialog>
 </template>

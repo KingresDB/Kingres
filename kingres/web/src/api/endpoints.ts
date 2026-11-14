@@ -268,7 +268,8 @@ export const endpoints = {
     ),
 
   // --- workbench, alerts, logs, metrics
-  executeQuery: (body: S['QueryRequest']) => j(api.POST('/query', { body })),
+  executeQuery: (body: S['QueryRequest'], signal?: AbortSignal) =>
+    j(api.POST('/query', { body, signal })),
   listAlerts: (q: Page & { state?: S['AlertState']; severity?: AlertSeverity } = {}) =>
     j(api.GET('/alerts', { params: { query: q } })),
   acknowledgeAlert: (alertId: number) =>

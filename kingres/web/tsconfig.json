@@ -19,7 +19,17 @@
     "resolveJsonModule": true,
     "noEmit": true,
     "types": ["vite/client", "node"],
-    "paths": { "@/*": ["./src/*"] }
+    "paths": {
+      "@/*": ["./src/*"]
+    }
   },
-  "include": ["src/**/*.ts", "src/**/*.vue", "src/**/*.d.ts", "tests/**/*.ts", "vite.config.ts"]
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.vue",
+    "src/**/*.d.ts",
+    "tests/**/*.ts",
+    "vite.config.ts",
+    "browser-tests/**/*.ts",
+    "vitest.browser.config.ts"
+  ]
 }

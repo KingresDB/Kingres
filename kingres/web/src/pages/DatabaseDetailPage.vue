@@ -1,7 +1,8 @@
 <!-- SPDX-License-Identifier: PostgreSQL -->
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
+import TableWrap from '@/components/TableWrap.vue'
 import { RouterLink, useRouter } from 'vue-router'
 import PageHeader from '@/components/PageHeader.vue'
 import QueryBoundary from '@/components/QueryBoundary.vue'
@@ -9,6 +10,8 @@ import StatusBadge from '@/components/StatusBadge.vue'
 import GateButton from '@/components/GateButton.vue'
 import NullableValue from '@/components/NullableValue.vue'
 import NotAvailable from '@/components/NotAvailable.vue'
+import SafeName from '@/components/SafeName.vue'
+import { safeText } from '@/lib/safe-text'
 import TaskActionDialog from '@/components/TaskActionDialog.vue'
 import EditDatabaseDialog from '@/components/EditDatabaseDialog.vue'
 import DistributeTableDialog from '@/components/DistributeTableDialog.vue'
@@ -29,6 +32,16 @@ const tableRows = computed(() => tables.data.value?.items ?? [])
 const dialog = ref<'edit' | 'drop' | null>(null)
 const distributing = ref<Table | null>(null)
 const ledgerFor = ref<Table | null>(null)
+// The page is reused when the address changes to another database. A dialog opened for the
+// previous one must not stay open and act on the new one.
+watch(
+  () => props.name,
+  () => {
+    dialog.value = null
+    distributing.value = null
+    ledgerFor.value = null
+  },
+)
 
 const CLASS_LABEL: Record<TableClass, string> = {
   plain: 'Plain',
@@ -44,7 +57,7 @@ const createdText = computed(() => {
   const d = db.value
   if (!d) return undefined
   if (d.createdBy === null && d.createdAt === null) return 'Creation record not available.'
-  const by = d.createdBy === null ? 'an unknown user' : d.createdBy
+  const by = d.createdBy === null ? 'an unknown user' : safeText(d.createdBy, 60)
   return d.createdAt === null
     ? `Created by ${by}.`
     : `Created by ${by} on ${formatDateTime(d.createdAt)}`
@@ -78,7 +91,7 @@ const shardingOn = computed(() => db.value?.sharding.enabled === true)
             <dt>Status</dt>
             <dd><StatusBadge :meta="DATABASE_STATUS[db.status]" /></dd>
             <dt>Owner</dt>
-            <dd><NullableValue :value="db.general.owner" /></dd>
+            <dd><NullableValue :value="db.general.owner" safe /></dd>
             <dt>Encoding</dt>
             <dd>
               <NullableValue :value="db.general.encoding" /> <span class="muted">(fixed)</span>
@@ -174,8 +187,11 @@ const shardingOn = computed(() => db.value?.sharding.enabled === true)
           empty-hint="Create tables with SQL in the query workbench."
           @retry="tables.refetch()"
         >
-          <div class="table-wrap">
+          <TableWrap>
             <table class="table">
+              <caption class="sr-only">
+                Tables of the database
+              </caption>
               <thead>
                 <tr>
                   <th scope="col">Table</th>
@@ -187,8 +203,10 @@ const shardingOn = computed(() => db.value?.sharding.enabled === true)
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="t in tableRows" :key="`${t.schema}.${t.name}`">
-                  <th scope="row" class="mono">{{ t.schema }}.{{ t.name }}</th>
+                <tr v-for="t in tableRows" :key="JSON.stringify([t.schema, t.name])">
+                  <th scope="row" class="mono">
+                    <SafeName :value="`${t.schema}.${t.name}`" :max="120" />
+                  </th>
                   <td>
                     <span class="row" style="gap: var(--s-1)">
                       <span v-for="c in t.classes" :key="c" class="badge tone-neutral">{{
@@ -198,7 +216,7 @@ const shardingOn = computed(() => db.value?.sharding.enabled === true)
                   </td>
                   <td>
                     <template v-if="t.distribution?.column">
-                      <code>{{ t.distribution.column }}</code>
+                      <code><SafeName :value="t.distribution.column" :max="60" /></code>
                       <span class="muted"> (colocation {{ t.distribution.colocationId }})</span>
                     </template>
                     <template v-else-if="t.distribution">Replicated to every group</template>
@@ -235,7 +253,11 @@ const shardingOn = computed(() => db.value?.sharding.enabled === true)
                 </tr>
               </tbody>
             </table>
-          </div>
+          </TableWrap>
+          <p v-if="tables.data.value?.moreNotShown" class="notice tone-warn" role="status">
+            <span aria-hidden="true">&#9650;</span>
+            <span>More tables exist than are shown here.</span>
+          </p>
           <p v-if="!shardingOn" class="muted">
             Sharding is off, so tables cannot be distributed. Turn it on in the settings.
           </p>
@@ -259,7 +281,7 @@ const shardingOn = computed(() => db.value?.sharding.enabled === true)
     <p class="notice tone-danger" role="alert">
       <span aria-hidden="true">&#10006;</span>
       <span>
-        All tables and data of <strong>{{ db.name }}</strong>
+        All tables and data of <strong><SafeName :value="db.name" :max="80" /></strong>
         <template v-if="db.stats.sizeBytes !== null"
           >({{ formatBytes(db.stats.sizeBytes) }})</template
         >
@@ -285,7 +307,7 @@ const shardingOn = computed(() => db.value?.sharding.enabled === true)
 <style scoped>
 .kv {
   display: grid;
-  grid-template-columns: max-content 1fr;
+  grid-template-columns: fit-content(45%) minmax(0, 1fr);
   gap: var(--s-1) var(--s-4);
   margin: 0;
 }

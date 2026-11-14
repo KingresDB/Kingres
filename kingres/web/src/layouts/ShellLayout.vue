@@ -10,14 +10,17 @@ import { useMediaQuery } from '@/composables/useMediaQuery'
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 import { useSessionStore } from '@/stores/session'
 import { useThemeStore } from '@/stores/theme'
-import { useQueryClient } from '@tanstack/vue-query'
 import GlobalBanners from '@/components/GlobalBanners.vue'
+import TaskNotices from '@/components/TaskNotices.vue'
+import LiveRegions from '@/components/LiveRegions.vue'
+import SafeName from '@/components/SafeName.vue'
+import { createAnnouncer } from '@/composables/useAnnounce'
 
 const router = useRouter()
 const route = useRoute()
 const session = useSessionStore()
 const theme = useThemeStore()
-const queryClient = useQueryClient()
+const announcer = createAnnouncer()
 const navOpen = ref(false)
 const narrow = useMediaQuery('(max-width: 860px)')
 
@@ -34,11 +37,11 @@ const themeLabel = computed(
   () => ({ system: 'System theme', light: 'Light theme', dark: 'Dark theme' })[theme.mode],
 )
 
+/** Ending the session drops all server data (session.adopt), whatever the way it ended. */
 async function signOut(): Promise<void> {
   try {
     await session.signOut()
   } finally {
-    queryClient.clear()
     await router.push({ name: 'login' })
   }
 }
@@ -85,7 +88,7 @@ watch(
       </button>
       <span class="user">
         <span class="sr-only">Signed in as</span>
-        <strong>{{ session.username }}</strong>
+        <strong><SafeName :value="session.username ?? ''" kind="text" :max="40" /></strong>
         <span class="role mono" :title="'Highest cluster role'">{{
           session.role ?? 'no cluster role'
         }}</span>
@@ -93,7 +96,25 @@ watch(
       <button type="button" class="btn btn-small" @click="signOut">Sign out</button>
     </header>
 
+    <LiveRegions :polite="announcer.polite.value" :assertive="announcer.assertive.value" />
+    <div
+      v-if="session.identityNotice"
+      class="banner tone-warn"
+      role="status"
+      data-testid="banner-identity"
+    >
+      <span aria-hidden="true">&#9650;</span>
+      <span>
+        Another browser tab signed in as
+        <strong><SafeName :value="session.identityNotice" kind="text" :max="40" /></strong>. This
+        tab now shows that account, and the data of the previous account was removed.
+      </span>
+      <button type="button" class="btn btn-small" @click="session.identityNotice = null">
+        Dismiss
+      </button>
+    </div>
     <GlobalBanners />
+    <TaskNotices />
 
     <div class="body">
       <nav id="side-nav" class="side" :class="{ open: navOpen }" aria-label="Main">
@@ -145,9 +166,10 @@ watch(
   z-index: 50;
   display: flex;
   align-items: center;
-  gap: var(--s-3);
-  height: var(--topbar-h);
-  padding: 0 var(--s-4);
+  flex-wrap: wrap;
+  gap: var(--s-1) var(--s-3);
+  min-height: var(--topbar-h);
+  padding: var(--s-1) var(--s-4);
   background: var(--c-surface);
   border-bottom: 1px solid var(--c-border);
 }
@@ -168,14 +190,21 @@ watch(
   color: var(--c-text-muted);
   padding-left: var(--s-3);
   border-left: 1px solid var(--c-border);
+  min-width: 0;
+  max-width: 20em;
+  overflow-wrap: anywhere;
 }
 .spacer {
   flex: 1;
 }
 .user {
   display: inline-flex;
+  flex-wrap: wrap;
   align-items: baseline;
-  gap: var(--s-2);
+  gap: 0 var(--s-2);
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 .role {
   font-size: var(--fs-xs);
@@ -236,13 +265,15 @@ watch(
   .menu-btn {
     display: inline-flex;
   }
+  /* The menu opens below the top bar (whatever height the bar has) instead of beside the page. */
+  .body {
+    flex-direction: column;
+  }
   .side {
     display: none;
-    position: fixed;
-    top: var(--topbar-h);
-    bottom: 0;
-    z-index: 60;
-    overflow-y: auto;
+    width: 100%;
+    border-right: 0;
+    border-bottom: 1px solid var(--c-border);
   }
   .side.open {
     display: block;
@@ -251,6 +282,15 @@ watch(
     padding: var(--s-3);
   }
   .cluster-name {
+    display: none;
+  }
+}
+@media (max-width: 600px) {
+  .topbar {
+    padding-inline: var(--s-2);
+  }
+  /* Only the icon of the theme switch at small widths; its accessible name stays. */
+  .theme-label {
     display: none;
   }
 }

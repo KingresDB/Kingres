@@ -26,7 +26,12 @@ export class ApiError extends Error {
 
 /** Builds the error for a request that never got an HTTP response (network down, CORS, abort). */
 export function networkError(cause: unknown): ApiError {
-  const detail = cause instanceof Error ? cause.message : String(cause)
+  const detail =
+    cause instanceof Error && cause.name === 'AbortError'
+      ? 'The request was cancelled.'
+      : cause instanceof Error
+        ? cause.message
+        : String(cause)
   return new ApiError({
     type: 'about:blank',
     title: 'Cannot reach the server',
@@ -269,7 +274,8 @@ export function describeProblem(error: unknown): ProblemView {
     }
   }
   const p = error.problem
-  const entry = entries[p.code] ?? unknownEntry
+  // A code this panel does not know (a newer server) still shows the server's own explanation.
+  const entry: Entry = entries[p.code] ?? { ...unknownEntry, withDetail: true }
   const fieldErrors: Record<string, string> = {}
   for (const issue of p.errors ?? []) {
     if (!(issue.field in fieldErrors)) fieldErrors[issue.field] = issue.message

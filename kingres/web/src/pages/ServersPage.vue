@@ -2,6 +2,8 @@
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import SafeName from '@/components/SafeName.vue'
+import TableWrap from '@/components/TableWrap.vue'
 import { RouterLink } from 'vue-router'
 import PageHeader from '@/components/PageHeader.vue'
 import QueryBoundary from '@/components/QueryBoundary.vue'
@@ -44,7 +46,7 @@ const dialog = ref<{ kind: 'add' | 'restore' | 'failover' | 'remove'; server?: S
     empty-title="No servers"
     @retry="servers.refetch()"
   >
-    <div class="table-wrap">
+    <TableWrap>
       <table class="table">
         <caption class="sr-only">
           Servers
@@ -69,11 +71,14 @@ const dialog = ref<{ kind: 'add' | 'restore' | 'failover' | 'remove'; server?: S
               <RouterLink :to="{ name: 'server', params: { id: s.id } }">{{
                 s.address
               }}</RouterLink>
-              <div class="muted">{{ s.hostname }}</div>
+              <div class="muted"><SafeName :value="s.hostname" kind="text" :max="80" /></div>
               <div v-if="s.isManagerLeader" class="muted">Manager leader</div>
             </th>
             <td><StatusBadge :meta="SERVER_STATUS[s.status]" /></td>
-            <td>{{ s.serverGroup ?? '-' }}</td>
+            <td>
+              <SafeName v-if="s.serverGroup" :value="s.serverGroup" :max="60" />
+              <template v-else>-</template>
+            </td>
             <td>
               <ul class="plain">
                 <li v-for="i in s.instances" :key="i.id" class="nowrap">
@@ -127,7 +132,7 @@ const dialog = ref<{ kind: 'add' | 'restore' | 'failover' | 'remove'; server?: S
           </tr>
         </tbody>
       </table>
-    </div>
+    </TableWrap>
   </QueryBoundary>
 
   <div style="margin-top: var(--s-5)"><ServerGroupsPanel /></div>

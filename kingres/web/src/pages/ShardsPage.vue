@@ -4,6 +4,8 @@
 // Bucket map: one cell per bucket, coloured by the owning shard group, with filters by database,
 // colocation group and server, and per-server bucket counts.
 import { computed, ref, watch } from 'vue'
+import { safeText } from '@/lib/safe-text'
+import TableWrap from '@/components/TableWrap.vue'
 import { useRoute, useRouter } from 'vue-router'
 import PageHeader from '@/components/PageHeader.vue'
 import QueryBoundary from '@/components/QueryBoundary.vue'
@@ -120,7 +122,9 @@ function findBucket(): void {
         <div class="field">
           <label for="f-db">Database</label>
           <select id="f-db" v-model="dbName">
-            <option v-for="d in sharded" :key="d.name" :value="d.name">{{ d.name }}</option>
+            <option v-for="d in sharded" :key="d.name" :value="d.name">
+              {{ safeText(d.name) }}
+            </option>
           </select>
         </div>
         <div class="field">
@@ -140,7 +144,7 @@ function findBucket(): void {
           <select id="f-srv" v-model="serverFilter">
             <option value="">All servers</option>
             <option v-for="s in servers.data.value?.items" :key="s.id" :value="s.id">
-              {{ s.address }}
+              {{ safeText(s.address) }}
             </option>
           </select>
         </div>
@@ -177,6 +181,10 @@ function findBucket(): void {
       >
         <section class="card stack" aria-labelledby="map-h">
           <h2 id="map-h">Bucket map</h2>
+          <p v-if="buckets.data.value?.moreNotShown" class="notice tone-warn" role="status">
+            <span aria-hidden="true">&#9650;</span>
+            <span>More buckets exist than are shown: the map below is incomplete.</span>
+          </p>
           <p class="muted">
             Map version {{ formatNumber(buckets.data.value?.mapVersion) }},
             {{ items.length }} buckets.
@@ -212,8 +220,11 @@ function findBucket(): void {
 
         <section v-if="unusual.length" class="card" aria-labelledby="odd-h">
           <h2 id="odd-h">Moving and orphan buckets</h2>
-          <div class="table-wrap">
+          <TableWrap>
             <table class="table">
+              <caption class="sr-only">
+                Buckets that are moving or orphaned
+              </caption>
               <thead>
                 <tr>
                   <th scope="col" class="num">Bucket</th>
@@ -231,7 +242,7 @@ function findBucket(): void {
                 </tr>
               </tbody>
             </table>
-          </div>
+          </TableWrap>
         </section>
       </QueryBoundary>
 
@@ -241,8 +252,11 @@ function findBucket(): void {
           :loading="distribution.isPending.value && !!dbName"
           :error="distribution.error.value"
         >
-          <div class="table-wrap">
+          <TableWrap>
             <table class="table">
+              <caption class="sr-only">
+                Primary and replica buckets per server
+              </caption>
               <thead>
                 <tr>
                   <th scope="col">Server</th>
@@ -275,7 +289,7 @@ function findBucket(): void {
                 </tr>
               </tbody>
             </table>
-          </div>
+          </TableWrap>
         </QueryBoundary>
       </section>
     </div>

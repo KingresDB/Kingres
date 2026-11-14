@@ -7,6 +7,7 @@
 import { computed, ref } from 'vue'
 import type { QueryKey } from '@tanstack/vue-query'
 import AppDialog from './AppDialog.vue'
+import TypeToConfirm from './TypeToConfirm.vue'
 import ProblemNotice from './ProblemNotice.vue'
 import TaskProgress from './TaskProgress.vue'
 import { describeProblem } from '@/api/problem'
@@ -38,10 +39,10 @@ const props = withDefaults(
 const emit = defineEmits<{ close: []; done: [task: Task] }>()
 
 const typed = ref('')
-const typedId = `tc-${Math.random().toString(36).slice(2, 9)}`
 const action = useTaskAction<void>(() => props.start(), {
   invalidate: () => props.invalidate,
   onDone: (task) => emit('done', task),
+  label: () => props.title,
 })
 
 const fieldErrors = computed(() =>
@@ -67,18 +68,7 @@ async function confirm(): Promise<void> {
   >
     <template v-if="!started">
       <slot :field-errors="fieldErrors" />
-      <div v-if="typeToConfirm !== undefined" class="field">
-        <label :for="typedId">
-          Type <code>{{ typeToConfirm }}</code> to confirm
-        </label>
-        <input
-          :id="typedId"
-          v-model="typed"
-          class="input mono"
-          autocomplete="off"
-          spellcheck="false"
-        />
-      </div>
+      <TypeToConfirm v-if="typeToConfirm !== undefined" v-model="typed" :expected="typeToConfirm" />
       <ProblemNotice v-if="action.error.value" :error="action.error.value" />
     </template>
     <template v-else>

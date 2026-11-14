@@ -3,6 +3,8 @@
 <script setup lang="ts">
 // One rebalance report with the outcome of every move (GET /rebalance/reports/{id}).
 import { useQuery } from '@tanstack/vue-query'
+import SafeName from './SafeName.vue'
+import TableWrap from './TableWrap.vue'
 import AppDialog from './AppDialog.vue'
 import QueryBoundary from './QueryBoundary.vue'
 import NullableValue from './NullableValue.vue'
@@ -50,7 +52,7 @@ const OUTCOME = {
         <p v-if="report.data.value.moves.length === 0" class="muted">
           This report has no per-move detail.
         </p>
-        <div v-else class="table-wrap" data-testid="report-moves">
+        <TableWrap v-else data-testid="report-moves">
           <table class="table">
             <caption class="sr-only">
               Moves of the report
@@ -71,7 +73,7 @@ const OUTCOME = {
                 v-for="m in report.data.value.moves"
                 :key="`${m.databaseName}-${m.colocationId}-${m.bucket}`"
               >
-                <td>{{ m.databaseName }}</td>
+                <td><SafeName :value="m.databaseName" :max="60" /></td>
                 <td class="num">{{ m.bucket }}</td>
                 <td>{{ m.fromShardGroupId }}</td>
                 <td>{{ m.toShardGroupId }}</td>
@@ -84,12 +86,14 @@ const OUTCOME = {
                     ><span aria-hidden="true">{{ OUTCOME[m.outcome].icon }}</span>
                     {{ OUTCOME[m.outcome].label }}</span
                   >
-                  <div v-if="m.error" class="muted">{{ m.error }}</div>
+                  <div v-if="m.error" class="muted">
+                    <SafeName :value="m.error" kind="text" :max="300" />
+                  </div>
                 </td>
               </tr>
             </tbody>
           </table>
-        </div>
+        </TableWrap>
       </template>
     </QueryBoundary>
   </AppDialog>
@@ -98,7 +102,7 @@ const OUTCOME = {
 <style scoped>
 .kv {
   display: grid;
-  grid-template-columns: max-content 1fr;
+  grid-template-columns: fit-content(45%) minmax(0, 1fr);
   gap: var(--s-1) var(--s-4);
   margin: 0;
 }

@@ -10,6 +10,9 @@ import FormField from '@/components/FormField.vue'
 import BrandLogo from '@/components/BrandLogo.vue'
 import ProblemNotice from '@/components/ProblemNotice.vue'
 import TaskProgress from '@/components/TaskProgress.vue'
+import LiveRegions from '@/components/LiveRegions.vue'
+import { createAnnouncer } from '@/composables/useAnnounce'
+import { vBlockEnterSubmit } from '@/lib/forms'
 import { setSetupToken } from '@/api/client'
 import { describeProblem } from '@/api/problem'
 import { endpoints } from '@/api/endpoints'
@@ -32,6 +35,7 @@ type Step = 'token' | 'choose' | 'create' | 'join' | 'progress'
 
 const router = useRouter()
 const queryClient = useQueryClient()
+const announcer = createAnnouncer()
 const step = ref<Step>('token')
 const token = ref('')
 const submitted = ref(false)
@@ -227,6 +231,7 @@ async function finish(): Promise<void> {
 
 <template>
   <main class="wizard">
+    <LiveRegions :polite="announcer.polite.value" :assertive="announcer.assertive.value" />
     <div class="card stack-lg">
       <header class="stack" style="gap: var(--s-1)">
         <BrandLogo variant="horizontal" :size="44" />
@@ -302,7 +307,13 @@ async function finish(): Promise<void> {
       </div>
 
       <!-- 3a. create -->
-      <form v-else-if="step === 'create'" class="stack" novalidate @submit.prevent="submit">
+      <form
+        v-else-if="step === 'create'"
+        v-block-enter-submit
+        class="stack"
+        novalidate
+        @submit.prevent="submit"
+      >
         <h2>Create new cluster</h2>
         <ProblemNotice v-if="action.error.value" :error="action.error.value" />
         <p v-if="tokenInvalid">
@@ -429,7 +440,13 @@ async function finish(): Promise<void> {
       </form>
 
       <!-- 3b. join -->
-      <form v-else-if="step === 'join'" class="stack" novalidate @submit.prevent="submit">
+      <form
+        v-else-if="step === 'join'"
+        v-block-enter-submit
+        class="stack"
+        novalidate
+        @submit.prevent="submit"
+      >
         <h2>Join existing cluster</h2>
         <ProblemNotice v-if="action.error.value" :error="action.error.value" />
         <p v-if="tokenInvalid">

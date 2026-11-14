@@ -2,22 +2,27 @@
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
 import { ref } from 'vue'
+import TableWrap from '@/components/TableWrap.vue'
 import { useMutation, useQueryClient } from '@tanstack/vue-query'
 import PageHeader from '@/components/PageHeader.vue'
 import QueryBoundary from '@/components/QueryBoundary.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
 import GateButton from '@/components/GateButton.vue'
 import ProblemNotice from '@/components/ProblemNotice.vue'
+import SafeName from '@/components/SafeName.vue'
 import { endpoints } from '@/api/endpoints'
-import { keys, useAlerts } from '@/api/queries'
+import { keys, usePagedQuery } from '@/api/queries'
 import { SEVERITY } from '@/lib/status'
 import { formatAgo, formatDateTime } from '@/lib/format'
 
 const client = useQueryClient()
 const state = ref<'' | 'open' | 'acknowledged' | 'resolved'>('')
-const alerts = useAlerts()
-const shown = () =>
-  alerts.data.value?.items.filter((a) => !state.value || a.state === state.value) ?? []
+const { query: alerts, items } = usePagedQuery(
+  () => [...keys.alerts, 'page'],
+  (cursor) => endpoints.listAlerts({ cursor, limit: 100 }),
+  10_000,
+)
+const shown = () => items.value.filter((a) => !state.value || a.state === state.value)
 const ack = useMutation({
   mutationFn: (id: number) => endpoints.acknowledgeAlert(id),
   onSettled: () =>
@@ -49,7 +54,7 @@ const STATE_LABEL = { open: 'Open', acknowledged: 'Acknowledged', resolved: 'Res
     empty-hint="Nothing matches this filter."
     @retry="alerts.refetch()"
   >
-    <div class="table-wrap">
+    <TableWrap>
       <table class="table">
         <caption class="sr-only">
           Alerts
@@ -67,12 +72,16 @@ const STATE_LABEL = { open: 'Open', acknowledged: 'Acknowledged', resolved: 'Res
           <tr v-for="a in shown()" :key="a.id">
             <td><StatusBadge :meta="SEVERITY[a.severity]" /></td>
             <td>
-              <strong>{{ a.title }}</strong>
-              <div class="muted">{{ a.message }}</div>
+              <strong><SafeName :value="a.title" kind="text" :max="200" /></strong>
+              <div class="muted">
+                <SafeName :value="a.message" kind="text" :max="600" multiline />
+              </div>
             </td>
             <td>
               {{ STATE_LABEL[a.state] }}
-              <div v-if="a.acknowledgedBy" class="muted">by {{ a.acknowledgedBy }}</div>
+              <div v-if="a.acknowledgedBy" class="muted">
+                by <SafeName :value="a.acknowledgedBy" :max="60" />
+              </div>
             </td>
             <td :title="formatDateTime(a.raisedAt)">{{ formatAgo(a.raisedAt) }}</td>
             <td>
@@ -87,6 +96,17 @@ const STATE_LABEL = { open: 'Open', acknowledged: 'Acknowledged', resolved: 'Res
           </tr>
         </tbody>
       </table>
-    </div>
+    </TableWrap>
   </QueryBoundary>
+  <p v-if="alerts.hasNextPage.value" class="row">
+    <span class="muted">More alerts exist than are shown.</span>
+    <button
+      type="button"
+      class="btn"
+      :disabled="alerts.isFetchingNextPage.value"
+      @click="alerts.fetchNextPage()"
+    >
+      Load more
+    </button>
+  </p>
 </template>

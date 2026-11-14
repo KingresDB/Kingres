@@ -4,6 +4,9 @@
 // Modal dialog: traps Tab focus, closes on Escape, and returns focus to the element that opened it.
 // Mount it with v-if; it is open for as long as it exists.
 import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import SafeName from './SafeName.vue'
+import LiveRegions from './LiveRegions.vue'
+import { createAnnouncer } from '@/composables/useAnnounce'
 
 const props = withDefaults(
   defineProps<{
@@ -17,6 +20,11 @@ const props = withDefaults(
 const emit = defineEmits<{ close: [] }>()
 
 const panel = ref<HTMLElement | null>(null)
+const backdrop = ref<HTMLElement | null>(null)
+// A dialog has its own announcement regions: the page behind it is inert, and an inert region is silent.
+const announcer = createAnnouncer()
+/** Parts of the page made inert while this dialog is open, and what to undo on close. */
+const madeInert: HTMLElement[] = []
 const titleId = `dlg-${Math.random().toString(36).slice(2, 9)}`
 let opener: HTMLElement | null = null
 
@@ -59,6 +67,14 @@ function onKeydown(event: KeyboardEvent): void {
 }
 
 onMounted(async () => {
+  // Everything else on the page becomes unreachable (keyboard, pointer and screen readers) until
+  // the dialog closes. Nested dialogs make the dialog below inert as well.
+  for (const child of Array.from(document.body.children)) {
+    if (!(child instanceof HTMLElement) || child.contains(backdrop.value)) continue
+    if (child.hasAttribute('inert') || child.tagName === 'SCRIPT') continue
+    child.setAttribute('inert', '')
+    madeInert.push(child)
+  }
   opener = document.activeElement instanceof HTMLElement ? document.activeElement : null
   await nextTick()
   // Prefer the first form control; fall back to the first focusable, then the panel itself.
@@ -70,6 +86,8 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  for (const el of madeInert) el.removeAttribute('inert')
+  madeInert.length = 0
   opener?.focus()
 })
 </script>
@@ -78,7 +96,7 @@ onBeforeUnmount(() => {
   <Teleport to="body">
     <!-- A click on the dimmed area closes the dialog; keyboard users have Escape and the close button. -->
     <!-- eslint-disable-next-line vuejs-accessibility/no-static-element-interactions -->
-    <div class="dlg-backdrop" @mousedown.self="requestClose">
+    <div ref="backdrop" class="dlg-backdrop" @mousedown.self="requestClose">
       <!-- Focus is trapped inside the dialog, so Tab/Escape are handled on its root. -->
       <!-- eslint-disable-next-line vuejs-accessibility/no-static-element-interactions -->
       <div
@@ -92,7 +110,8 @@ onBeforeUnmount(() => {
         @keydown="onKeydown"
       >
         <div class="dlg-head">
-          <h2 :id="titleId">{{ title }}</h2>
+          <!-- eslint-disable-next-line vuejs-accessibility/heading-has-content -->
+          <h2 :id="titleId"><SafeName :value="title" kind="text" :max="200" /></h2>
           <button
             type="button"
             class="btn btn-small"
@@ -104,6 +123,7 @@ onBeforeUnmount(() => {
             <span aria-hidden="true">&#10005;</span>
           </button>
         </div>
+        <LiveRegions :polite="announcer.polite.value" :assertive="announcer.assertive.value" />
         <div class="dlg-body"><slot /></div>
         <div v-if="$slots.footer" class="dlg-foot"><slot name="footer" /></div>
       </div>

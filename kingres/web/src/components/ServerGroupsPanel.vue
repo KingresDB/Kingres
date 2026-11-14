@@ -4,6 +4,8 @@
 // Server groups (racks or zones): list, create and delete. A server is assigned to a group on its
 // own page. Replicas of one shard group never share a server group, so groups matter for placement.
 import { computed, ref } from 'vue'
+import SafeName from './SafeName.vue'
+import TableWrap from './TableWrap.vue'
 import { RouterLink } from 'vue-router'
 import { useMutation, useQueryClient } from '@tanstack/vue-query'
 import QueryBoundary from './QueryBoundary.vue'
@@ -89,7 +91,7 @@ function openCreate(): void {
       empty-hint="Create a group, then assign servers to it on their detail page."
       @retry="groups.refetch()"
     >
-      <div class="table-wrap">
+      <TableWrap>
         <table class="table">
           <caption class="sr-only">
             Server groups
@@ -104,8 +106,8 @@ function openCreate(): void {
           </thead>
           <tbody>
             <tr v-for="g in rows" :key="g.name">
-              <th scope="row">{{ g.name }}</th>
-              <td>{{ g.description || '' }}</td>
+              <th scope="row"><SafeName :value="g.name" :max="80" /></th>
+              <td><SafeName :value="g.description || ''" kind="text" :max="200" /></td>
               <td>
                 <template v-if="g.serverIds.length">
                   <span v-for="(id, i) in g.serverIds" :key="id">
@@ -124,7 +126,7 @@ function openCreate(): void {
             </tr>
           </tbody>
         </table>
-      </div>
+      </TableWrap>
     </QueryBoundary>
   </section>
 

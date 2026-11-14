@@ -4,7 +4,9 @@
 // A small dependency-free SVG line chart for the metrics endpoint. Multiple series share axes.
 // Lines differ by colour and by dash pattern, and the legend names every series.
 import { computed } from 'vue'
+import SafeName from './SafeName.vue'
 import { formatBytes, formatNumber } from '@/lib/format'
+import { safeText } from '@/lib/safe-text'
 
 export interface ChartSeries {
   label: string
@@ -102,7 +104,9 @@ const latest = computed(() =>
 )
 
 const description = computed(() =>
-  latest.value.map((l) => `${l.label}: ${l.value === null ? 'no data' : fmt(l.value)}`).join('; '),
+  latest.value
+    .map((l) => `${safeText(l.label, 60)}: ${l.value === null ? 'no data' : fmt(l.value)}`)
+    .join('; '),
 )
 </script>
 
@@ -151,7 +155,7 @@ const description = computed(() =>
             stroke-width="2"
           />
         </svg>
-        {{ l.label }}
+        <SafeName :value="l.label" kind="name" :max="60" />
         <span class="muted num">{{ l.value === null ? '-' : fmt(l.value) }}</span>
       </li>
     </ul>
@@ -207,7 +211,8 @@ svg {
   font-size: var(--fs-sm);
 }
 .legend li {
-  white-space: nowrap;
+  min-width: 0;
+  overflow-wrap: anywhere;
   display: inline-flex;
   align-items: center;
   gap: var(--s-1);

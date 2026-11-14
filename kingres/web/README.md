@@ -26,10 +26,12 @@ adding a server, rebalancing, failing over or creating a database visibly change
 
 Development switches in the URL (mock API only):
 
-| Parameter                                      | Effect                                                                                                                                                        |
-| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `?mock=uninitialized`                          | Starts as a fresh server and shows the first-run wizard. The setup token is `demo-setup-token`. A cluster named `failme` makes setup fail (to see the retry). |
-| `?unsupported=createInclusionProof,listAlerts` | Those operations answer `unsupported_operation`, to see the "not available on this server version yet" state.                                                 |
+| Parameter                                      | Effect                                                                                                                                                                                         |
+| ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `?mock=uninitialized`                          | Starts as a fresh server and shows the first-run wizard. The setup token is `demo-setup-token`. A cluster named `failme` makes setup fail (to see the retry).                                  |
+| `?unsupported=createInclusionProof,listAlerts` | Those operations answer `unsupported_operation`, to see the "not available on this server version yet" state.                                                                                  |
+| `?mock=hostile`                                | Adds names and messages as a low-privileged database user could make them (markup, bidirectional and zero-width characters, look-alike letters, 5000-character names, a database called `..`). |
+| `?latency=0`                                   | No artificial delay (the default is 150 ms).                                                                                                                                                   |
 
 Reload the page to reset the mock state. Creating a database named `failme` fails half way, to see a failed
 task. The `metrics` account has only `kingres_stats`: it lands on the Dashboard with the charts it may read.
@@ -48,18 +50,19 @@ string in `dist/`).
 
 ## Scripts
 
-| Script                        | What it does                                                                             |
-| ----------------------------- | ---------------------------------------------------------------------------------------- |
-| `npm run dev` / `dev:backend` | Dev server with the mock API / with the proxy to `127.0.0.1:8091`                        |
-| `npm run build`               | Type-check, then build to `dist/` (the directory the Go server embeds)                   |
-| `npm run typecheck`           | `vue-tsc --noEmit` (scripts and templates, `strict`, `noUncheckedIndexedAccess`)         |
-| `npm run lint`                | ESLint (flat config, Vue and Vue accessibility plugins) and `prettier --check`           |
-| `npm run lint:fix` / `format` | Fix lint problems / format with Prettier                                                 |
-| `npm test`                    | Vitest and Testing Library, against the mock API                                         |
-| `npm run api:generate`        | Regenerate the API types from the contract                                               |
-| `npm run api:check`           | Fail if the generated files are out of date (also run by `npm test`)                     |
-| `npm run brand:sync`          | Copy the favicons from `kingres/brand/` into `public/` and regenerate the logo path data |
-| `npm run brand:check`         | Fail if the committed brand files differ from `kingres/brand/` (also run by `npm test`)  |
+| Script                        | What it does                                                                                                                                                                                                    |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `npm run dev` / `dev:backend` | Dev server with the mock API / with the proxy to `127.0.0.1:8091`                                                                                                                                               |
+| `npm run build`               | Type-check, then build to `dist/` (the directory the Go server embeds)                                                                                                                                          |
+| `npm run typecheck`           | `vue-tsc --noEmit` (scripts and templates, `strict`, `noUncheckedIndexedAccess`)                                                                                                                                |
+| `npm run lint`                | ESLint (flat config, Vue and Vue accessibility plugins) and `prettier --check`                                                                                                                                  |
+| `npm run lint:fix` / `format` | Fix lint problems / format with Prettier                                                                                                                                                                        |
+| `npm test`                    | Vitest and Testing Library, against the mock API (jsdom, no browser needed)                                                                                                                                     |
+| `npm run test:browser`        | The tests that need a real Chrome or Edge: layout at 1366, 683 and 320 px, keyboard, axe, and the production build under the content security policy (needs `CHROME_PATH` if Chrome is not in a standard place) |
+| `npm run api:generate`        | Regenerate the API types from the contract                                                                                                                                                                      |
+| `npm run api:check`           | Fail if the generated files are out of date (also run by `npm test`)                                                                                                                                            |
+| `npm run brand:sync`          | Copy the favicons from `kingres/brand/` into `public/` and regenerate the logo path data                                                                                                                        |
+| `npm run brand:check`         | Fail if the committed brand files differ from `kingres/brand/` (also run by `npm test`)                                                                                                                         |
 
 ## End-to-end test against the real server
 
@@ -91,6 +94,77 @@ Ledger page falls back to per-database status, see `src/api/queries.ts`).
 - A table with a ledger has `classes: [plain, ledger]`; the contract says `plain` never combines.
 - `Server.isManagerLeader` is false while `GET /this-server` says `isManagerLeader: true` and `ClusterOverview.managerLeader` is null.
 - `ClusterSummary.databaseCount` counts 3 databases where `GET /databases` lists 2.
+
+## What the server must send
+
+The panel is static files plus calls to `/api/v1/` on the **same origin**. It sets no security header itself (a
+`<meta>` tag cannot set `frame-ancestors`, and caching is the server's business), so `kingresd` has to. This section is
+written to be implemented without reading anything else. The values are checked: `tests/server-headers.test.ts` fails
+when a value here differs from `browser-tests/server-headers.ts`, and `npm run test:browser` (`csp.test.ts`) builds
+`dist/`, serves it with exactly these headers, and visits every page, the sign-in page, the first-run wizard and the
+dialogs with hostile data: there is **no** policy violation and no console message about one.
+
+### Headers on every response (the files of the panel and `/api/v1/`)
+
+| Header                       | Value                                                                                                                                                                                          |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Content-Security-Policy`    | `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'` |
+| `X-Frame-Options`            | `DENY` (old browsers; `frame-ancestors 'none'` above is the real protection)                                                                                                                   |
+| `X-Content-Type-Options`     | `nosniff`                                                                                                                                                                                      |
+| `Referrer-Policy`            | `no-referrer` (task ids, database and server names are in the path, and the sign-in redirect is in the query)                                                                                  |
+| `Cross-Origin-Opener-Policy` | `same-origin`                                                                                                                                                                                  |
+| `Permissions-Policy`         | `camera=(), microphone=(), geolocation=()`                                                                                                                                                     |
+
+The exact lines, to copy:
+
+```
+Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'
+X-Frame-Options: DENY
+X-Content-Type-Options: nosniff
+Referrer-Policy: no-referrer
+Cross-Origin-Opener-Policy: same-origin
+Permissions-Policy: camera=(), microphone=(), geolocation=()
+```
+
+What the policy relies on, so that nobody weakens it by accident: the build has no inline script and no inline style
+element, no `eval`, no `data:` URL, no web font, no external origin and no service worker. `'unsafe-inline'` and
+`'unsafe-eval'` are **not** needed and must not be added. Vue sets styles through the CSSOM, which `style-src` does not
+block; a `style="..."` attribute written into a statically hoisted template would be blocked (`style-src-attr`), so
+the browser test fails if one appears. If the server also serves the panel under another path prefix or over another
+origin, `connect-src` and `default-src` must name it (the panel only ever calls its own origin).
+
+### Caching
+
+| Response                                                                                                                   | `Cache-Control`                       |
+| -------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
+| `index.html` and every path that falls back to it (`/login`, `/servers`, ...)                                              | `no-cache`                            |
+| Files under `/assets/` (their names contain a content hash)                                                                | `public, max-age=31536000, immutable` |
+| Every response of `/api/v1/`, errors included (the data is sensitive and depends on the role)                              | `no-store`                            |
+| `/favicon.svg`, `/favicon-32.png`, `/apple-touch-icon.png`, `/icon-512.png`, `/manifest.webmanifest` (no hash in the name) | `no-cache`                            |
+
+### The session cookie and the CSRF token
+
+- `kingres_session=<value>; HttpOnly; Secure; SameSite=Strict; Path=/`, as the contract states. The panel works over
+  HTTPS and at `http://localhost` (browsers keep a `Secure` cookie there); over plain HTTP on another host the browser
+  drops the cookie and the panel says so after sign-in.
+- The CSRF token comes in the JSON body of `login` and `GET /auth/session` and is held in memory only. The server must
+  require `X-CSRF-Token` on **every** non-GET request, and must not accept `login` from another site (`SameSite=Strict`
+  on the cookie covers it; a cross-site login would otherwise sign a victim into the attacker's account).
+- A restart of the server or an expired session must answer `401` with `code: "session_expired"` or `"unauthenticated"`
+  on **every** protected path (also with an HTML body from a proxy: the panel treats any `401` as the end of the session).
+
+### Routing
+
+- Serve `index.html` for every path that is not a file and does **not** start with `/api/`, so that a reload on
+  `/databases/shop` works. An unknown path under `/api/` must answer a JSON problem (`404 not_found`), never HTML.
+- Path parameters arrive percent-encoded once (`/api/v1/databases/a%2Fb%3Fc%23d%25e` is the database `a/b?c#d%e`). The
+  router of the server must decode a segment after splitting the path, and must not treat `%2F` as a separator. A
+  name that is `.` or `..` (or empty) cannot be sent by a browser at all (the URL parser removes it, also written
+  `%2E`): the panel refuses to send such a request and shows the object as "cannot be opened by address".
+- Do not serve `mockServiceWorker.js` or any development file; the production build contains none (the browser test
+  checks the bundle for the mock).
+- Recommended in addition (not tested here): `Strict-Transport-Security: max-age=31536000` when the panel is served over
+  HTTPS.
 
 ## Brand
 
@@ -140,8 +214,9 @@ src/
   lib/          format.ts, status.ts (status -> tone, icon, label), validators.ts, cluster.ts, metrics.ts
   styles/       tokens.css (the only place for colours, sizes, fonts), base.css (shared classes)
   mocks/        the in-memory cluster (state.ts), request handlers (handlers.ts, http.ts), browser and node setup
-  bootstrap.ts  builds pinia + query client + router (used by main.ts and by the tests)
+  bootstrap.ts  builds pinia + query client + router, and the one end-of-session path (used by main.ts and the tests)
 tests/          Vitest; helpers.ts renders the real app against the mock API
+browser-tests/  Real-browser tests (puppeteer-core, own vitest config): layout, keyboard, axe, content security policy
 scripts/        gen-api.mjs
 ```
 
@@ -166,6 +241,24 @@ scripts/        gen-api.mjs
   Escape, status is icon plus text, `aria-live` for progress and errors, visible focus ring, tabular numerals.
   Contrast of the token pairs is tested in both themes.
 - **Design tokens:** use `var(--...)` from `tokens.css`; do not write colours or font sizes in components.
+- **Names and messages from the database** (roles, databases, schemas, tables, columns, server groups, and the text of
+  logs, alerts, audit entries, tasks and errors) are chosen by whoever may create them, so they are shown only through
+  `SafeName` (or `safeText()` where markup cannot go, such as an `<option>` or an `aria-label`). It makes bidirectional
+  controls, zero-width characters and control characters visible as `U+202E`-style marks with a description, isolates the
+  text direction, flags names that mix scripts or use look-alike letters, and folds very long values with "Show all N
+  characters". Confirmations show the escaped name and still require the real one (with a "Copy the name" button).
+  Nothing is stripped or normalised before it is sent. `tests/hostile.test.ts` goes through every page with hostile data.
+- **One end of session.** Every way a session can end (sign-out, expiry seen by any query, mutation or task poll, a
+  different user in the session, another tab signing in) goes through `session.adopt`, which calls
+  `resetServerState()` (`src/api/server-state.ts`): the query cache, the in-flight requests, the task pollers and the task
+  notices are cleared or cancelled. A new store that holds API data registers its own reset there.
+- **Path parameters** are encoded in one place (`pathSerializer` in `src/api/client.ts`). A value that no URL can carry
+  (`.`, `..`, empty) is refused with an error before any request is made.
+- **Forms.** A form whose action changes the whole cluster, or cannot be undone, has no implicit submission
+  (`v-block-enter-submit` from `src/lib/forms.ts`) and a button that opens a confirmation; dialog forms with their own
+  visible submit button (create role, create server group, sign-in) keep Enter. Fields that were not edited are not sent.
+- **Dates** from the API are UTC and are shown as UTC (`formatDateTime` adds "UTC"); a date field says "(UTC)" and
+  is read as UTC; an untouched date is not sent back.
 - **Text** is English and kept next to the feature that shows it. Every source file starts with an
   `SPDX-License-Identifier: PostgreSQL` comment (checked by a test).
 
@@ -184,20 +277,31 @@ scripts/        gen-api.mjs
 `npm test` runs everything in about 15 seconds. The tests render the real app (router, pinia, query client)
 and talk to the mock API through MSW in Node, so the same handlers serve `npm run dev` and the tests.
 
-| File                      | Covers                                                                                                                                       |
-| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `problem.test.ts`         | Problem to message mapping for every code, field errors, retry policy                                                                        |
-| `useTask.test.ts`         | Polling, progress, failure, paused, tolerance of lost polls, cleanup                                                                         |
-| `roles.test.ts`           | Role hierarchy from the contract, hidden navigation, disabled actions with reason, forbidden page                                            |
-| `create-database.test.ts` | Four groups, immutable-field notes, validation, submit, task, list update, focus handling                                                    |
-| `setup-wizard.test.ts`    | Token, create, join, validation, wrong token, task, hand-off to sign-in                                                                      |
-| `servers-page.test.ts`    | Status badges (icon and text), instances, failover and add-server flows, unsupported and error states                                        |
-| `shards-grid.test.ts`     | Bucket grid for a given bucket map, filters, bucket lookup                                                                                   |
-| `pages-a11y.test.ts`      | Every page: renders data, logs no Vue warnings, no axe violations                                                                            |
-| `flows.test.ts`           | Sign-in/out, CSRF, expired session, add server then rebalance, workbench, security, ledger, settings, theme, distribute table, drop database |
-| `tokens-contrast.test.ts` | WCAG AA contrast of the token pairs in the light and dark theme                                                                              |
-| `contract.test.ts`        | Generated files up to date, mock covers every operation in the spec (count read from the spec), audit actions, SPDX headers                  |
-| `contract-0-2.test.ts`    | Contract 0.2.0: stats-only landing page, n/a for null, create options, distribution columns, server groups, report detail, audit filter      |
+| File                                                      | Covers                                                                                                                                         |
+| --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `problem.test.ts`                                         | Problem to message mapping for every code, field errors, retry policy                                                                          |
+| `useTask.test.ts`                                         | Polling, progress, failure, paused, tolerance of lost polls, cleanup                                                                           |
+| `roles.test.ts`                                           | Role hierarchy from the contract, hidden navigation, disabled actions with reason, forbidden page                                              |
+| `create-database.test.ts`                                 | Four groups, immutable-field notes, validation, submit, task, list update, focus handling                                                      |
+| `setup-wizard.test.ts`                                    | Token, create, join, validation, wrong token, task, hand-off to sign-in                                                                        |
+| `servers-page.test.ts`                                    | Status badges (icon and text), instances, failover and add-server flows, unsupported and error states                                          |
+| `shards-grid.test.ts`                                     | Bucket grid for a given bucket map, filters, bucket lookup                                                                                     |
+| `pages-a11y.test.ts`                                      | Every page: renders data, logs no Vue warnings, no axe violations                                                                              |
+| `flows.test.ts`                                           | Sign-in/out, CSRF, expired session, add server then rebalance, workbench, security, ledger, settings, theme, distribute table, drop database   |
+| `tokens-contrast.test.ts`                                 | WCAG AA contrast of the token pairs in the light and dark theme                                                                                |
+| `contract.test.ts`                                        | Generated files up to date, mock covers every operation in the spec (count read from the spec), audit actions, SPDX headers                    |
+| `session-reset.test.ts`                                   | Every way a session ends clears the client (sign-out, expiry on a query, a mutation or a task poll, another user, another tab)                 |
+| `api-client.test.ts`                                      | Exact request URLs for hostile path parameters, answers that are not problem documents, unknown problem codes, the sign-in redirect allow-list |
+| `task-notices.test.ts`                                    | A hidden task is still followed and its failure reported; typed confirmations for remove server, hard failover, disable role                   |
+| `network-access.test.ts`, `network-rules.test.ts`         | Network rules: no Enter submission, confirmation with the changes, lock-out warnings, lists that round-trip                                    |
+| `grants.test.ts`, `role-dialog.test.ts`                   | A failed grant is not shown as granted, template confirmation, an unchanged role is not sent (also under another time zone)                    |
+| `workbench.test.ts`                                       | NULL, the text NULL and the empty string, stale results, timeout, stop waiting, large results, duplicate columns                               |
+| `plumbing.test.ts`                                        | Unreadable ledger status shown, cursor paging with a bound and a "more results" notice                                                         |
+| `hostile.test.ts`                                         | Every list and detail page and dialog with hostile names and messages                                                                          |
+| `forms.test.ts`, `dialogs.test.ts`, `task-poller.test.ts` | Enter in forms, what is sent on save, inert page behind a dialog, live regions, no polling in a hidden tab                                     |
+| `dependencies.test.ts`                                    | `DEPENDENCIES.md` names every package of the production tree and every exceptional development package                                         |
+| `server-headers.test.ts`                                  | The values in "What the server must send" are the ones the browser test uses                                                                   |
+| `contract-0-2.test.ts`                                    | Contract 0.2.0: stats-only landing page, n/a for null, create options, distribution columns, server groups, report detail, audit filter        |
 
 jsdom has no layout engine, so axe cannot compute colour contrast there; that is why contrast is tested from the
 tokens instead.
@@ -206,3 +310,23 @@ tokens instead.
 
 The SQL editor is a plain textarea, the replication page is a table rather than a graph, and the charts are simple
 SVG lines without zoom or tooltips.
+
+What the contract (revision 0.3.0) does not let the panel do, and what the panel does instead:
+
+- **Cancel a workbench statement.** There is no way to cancel it on the server. "Stop waiting" aborts the request in the
+  browser and says that the statement may still run until it finishes or reaches its timeout (the person chooses the
+  timeout; the default of the server is 30 s). A cancel operation (for example a `queryId` in the answer and
+  `DELETE /query/{queryId}`) is needed.
+- **Read-only workbench.** The API has no read-only mode, so the workbench says "Mode: read-write" and that INSERT,
+  UPDATE, DELETE and DDL are executed. A `readOnly` flag on `QueryRequest` (a read-only transaction) is needed.
+- **Truncation marker for names.** A result cell, a log line or a name cannot say that the server cut it; the panel cuts
+  what it draws (with "Show all N characters") but cannot tell a cut value from a complete one.
+- **The address of the signed-in administrator.** The session does not carry it. The network-rules confirmation reads the
+  last address the audit log has for the account, and says that it cannot know more (a proxy, another network path).
+  A `clientAddress` in `Session`, and a dry-run of `replaceNetworkAccess` that answers "would lock the caller out", are
+  needed.
+- **Names that no URL can carry** (`.` and `..`). They are listed but cannot be opened. The server should refuse to create
+  such a database or table through the API, or define an escape for them.
+- **Paging.** The contract does not paginate `GET /databases`, `/servers`, `/server-groups` and
+  `/this-server/instances` ("Not paginated"); the panel shows what they return and cannot tell if a very large cluster
+  makes them long. Every list that has cursors is followed up to a bound and says when more exists.
