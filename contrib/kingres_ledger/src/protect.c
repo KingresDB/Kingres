@@ -27,7 +27,13 @@
  *	  - DROP EXTENSION kingres_ledger while any ledger table exists, and the
  *		DROP SCHEMA and DROP OWNED statements that would drop ledger tables;
  *	  - renaming, replacing, altering, re-owning or changing the privileges of
- *		the functions and the event triggers of the extension.
+ *		the functions and the event triggers of the extension, and dropping,
+ *		replacing or altering the status view of the extension;
+ *	  - the history table of an updatable ledger table (registered as
+ *		history_relid in kingres.ledger_table) is treated like a table of the
+ *		ledger catalog, except for the one ALTER TABLE ... ADD COLUMN that the
+ *		extension runs itself (kl_internal_ddl), and ADD COLUMN of a column
+ *		with the name of a history column is rejected.
  *
  * Name resolution.  The statement itself resolves the names in it again
  * after the hook has looked at them.  If the hook resolved a name without a
@@ -101,6 +107,10 @@
 #include "utils/syscache.h"
 
 #include "kingres_ledger.h"
+#include "row_hash.h"
+
+/* Attribute number of history_relid in kingres.ledger_table (version 0.2). */
+#define KL_LEDGER_TABLE_HISTORY_ATTNO 5
 
 /* What kind of protected relation a relation is. */
 typedef enum KlKind
@@ -212,7 +222,8 @@ kl_is_internal_function(Oid funcoid, Oid extoid)
 	return kl_is_ledger_function(funcoid, extoid, KL_SYM_CAPTURE) ||
 		kl_is_ledger_function(funcoid, extoid, KL_SYM_BLOCK_MODIFY) ||
 		kl_is_ledger_function(funcoid, extoid, KL_SYM_RECORD_ROW) ||
-		kl_is_ledger_function(funcoid, extoid, KL_SYM_LOCK_TABLE);
+		kl_is_ledger_function(funcoid, extoid, KL_SYM_LOCK_TABLE) ||
+		kl_is_ledger_function(funcoid, extoid, KL_SYM_HISTORY_SYNC);
 }
 
 /*
@@ -291,6 +302,45 @@ kl_is_registered(Oid relid)
 }
 
 /*
+ * kl_is_history
+ *		Whether the table is the history table of an updatable ledger table,
+ *		that is, whether kingres.ledger_table names it as history_relid.  Like
+ *		kl_is_registered it uses the latest snapshot.  The history table is part
+ *		of the ledger: it is treated like a table of the ledger catalog.  In a
+ *		database that still has version 0.1 of the extension there is no such
+ *		column and no table is a history table.
+ */
+static bool
+kl_is_history(Oid relid)
+{
+	Oid			nspoid = get_namespace_oid(KL_SCHEMA_NAME, true);
+	Oid			tableoid;
+	Oid			idxoid;
+	Relation	rel;
+	SysScanDesc scan;
+	ScanKeyData key;
+	Snapshot	snap;
+	bool		found;
+
+	if (!OidIsValid(nspoid))
+		return false;
+	tableoid = get_relname_relid("ledger_table", nspoid);
+	idxoid = get_relname_relid("ledger_table_history_relid_key", nspoid);
+	if (!OidIsValid(tableoid) || !OidIsValid(idxoid))
+		return false;
+
+	rel = table_open(tableoid, AccessShareLock);
+	snap = RegisterSnapshot(GetLatestSnapshot());
+	ScanKeyInit(&key, KL_LEDGER_TABLE_HISTORY_ATTNO, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(relid));
+	scan = systable_beginscan(rel, idxoid, true, snap, 1, &key);
+	found = HeapTupleIsValid(systable_getnext(scan));
+	systable_endscan(scan);
+	UnregisterSnapshot(snap);
+	table_close(rel, AccessShareLock);
+	return found;
+}
+/*
  * kl_classify
  *		Classify a relation.  An index is classified as its table.
  */
@@ -309,9 +359,14 @@ kl_classify(Oid relid, Oid extoid)
 			return KL_NOT_LEDGER;
 		relkind = get_rel_relkind(relid);
 	}
+	/* The status view of the extension is part of the ledger too. */
+	if (relkind == RELKIND_VIEW)
+		return getExtensionOfObject(RelationRelationId, relid) == extoid ?
+			KL_CATALOG_LEDGER : KL_NOT_LEDGER;
 	if (relkind != RELKIND_RELATION)
 		return KL_NOT_LEDGER;
-	if (getExtensionOfObject(RelationRelationId, relid) == extoid)
+	if (getExtensionOfObject(RelationRelationId, relid) == extoid ||
+		kl_is_history(relid))
 		return KL_CATALOG_LEDGER;
 	if (kl_is_registered(relid) || kl_has_armed_capture_trigger(relid, extoid))
 		return KL_USER_LEDGER;
@@ -376,6 +431,14 @@ kl_ledger_relids(void)
 
 		if (!isnull)
 			result = lappend_oid(result, DatumGetObjectId(d));
+		/* The history table of an updatable table is dropped with it. */
+		if (HeapTupleHeaderGetNatts(tup->t_data) >= KL_LEDGER_TABLE_HISTORY_ATTNO)
+		{
+			d = heap_getattr(tup, KL_LEDGER_TABLE_HISTORY_ATTNO,
+							 RelationGetDescr(rel), &isnull);
+			if (!isnull)
+				result = lappend_oid(result, DatumGetObjectId(d));
+		}
 	}
 	systable_endscan(scan);
 	UnregisterSnapshot(snap);
@@ -448,6 +511,9 @@ kl_check_add_column(ColumnDef *col, const char *relname, KlKind kind)
 	ListCell   *lc;
 	Oid			typid;
 
+	if (col->colname != NULL && kl_is_history_column(col->colname))
+		kl_reject("add a column named like a column of the history table to table",
+				  relname, kind);
 	if (col->raw_default != NULL || col->cooked_default != NULL ||
 		col->identity != 0 || col->generated != 0 || col->is_not_null)
 		kl_reject("add a column with a default, NOT NULL, identity or generated value to table",
@@ -730,11 +796,12 @@ kl_check_drop(DropStmt *stmt, Oid extoid)
 	switch (stmt->removeType)
 	{
 		case OBJECT_TABLE:
+		case OBJECT_VIEW:
 		case OBJECT_INDEX:
 			foreach(lc, stmt->objects)
 			{
 				Oid			relid = kl_name_list_relid((List *) lfirst(lc),
-													   stmt->removeType == OBJECT_TABLE ?
+													   stmt->removeType != OBJECT_INDEX ?
 													   AccessExclusiveLock : NoLock);
 				KlKind		kind = kl_classify(relid, extoid);
 
@@ -743,7 +810,7 @@ kl_check_drop(DropStmt *stmt, Oid extoid)
 				/* Indexes of user ledger tables may be dropped. */
 				if (stmt->removeType == OBJECT_INDEX && kind == KL_USER_LEDGER)
 					continue;
-				kl_reject(stmt->removeType == OBJECT_TABLE ?
+				kl_reject(stmt->removeType != OBJECT_INDEX ?
 						  "drop table" : "drop an index of table",
 						  get_rel_name(stmt->removeType == OBJECT_TABLE ?
 									   relid : IndexGetRelation(relid, true)),
@@ -1060,6 +1127,9 @@ kl_check_statement(Node *parsetree)
 
 	if (parsetree == NULL)
 		return;
+	/* The extension's own ALTER TABLE on a history table (history_sync). */
+	if (kl_internal_ddl)
+		return;
 
 	switch (nodeTag(parsetree))
 	{
@@ -1082,6 +1152,7 @@ kl_check_statement(Node *parsetree)
 		case T_CreateFunctionStmt:
 		case T_AlterFunctionStmt:
 		case T_AlterEnumStmt:
+		case T_ViewStmt:
 			break;
 		default:
 			return;
@@ -1249,6 +1320,20 @@ kl_check_statement(Node *parsetree)
 
 		case T_AlterFunctionStmt:
 			kl_check_alter_function((AlterFunctionStmt *) parsetree, extoid);
+			break;
+
+		case T_ViewStmt:
+			{
+				ViewStmt   *stmt = (ViewStmt *) parsetree;
+
+				/* CREATE OR REPLACE VIEW of the status view of the extension. */
+				if (stmt->replace)
+				{
+					relid = kl_rv_relid(stmt->view, NoLock);
+					if (kl_classify(relid, extoid) != KL_NOT_LEDGER)
+						kl_reject("replace view", get_rel_name(relid), KL_CATALOG_LEDGER);
+				}
+			}
 			break;
 
 		case T_AlterEnumStmt:

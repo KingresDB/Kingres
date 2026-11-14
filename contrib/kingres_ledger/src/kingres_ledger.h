@@ -46,6 +46,15 @@
 #define KL_TAG_BLOCK		0x13
 #define KL_TAG_CHAIN		0x14
 
+/* Operations of a ledger entry: the byte hashed into the entry leaf. */
+#define KL_OP_INSERT		'I'
+#define KL_OP_DELETE		'D'
+
+/* Columns that the history table adds to the columns of an updatable table. */
+#define KL_HIST_COL_TXID	"ledger_txid"
+#define KL_HIST_COL_SEQ		"ledger_seq"
+#define KL_HIST_COL_OP		"ledger_op"
+
 /* Length of the random identity of a chain, in bytes. */
 #define KL_CHAIN_ID_LEN 32
 
@@ -76,9 +85,16 @@
 #define KL_SYM_BLOCK_MODIFY		"kingres_ledger_block_modify"
 #define KL_SYM_RECORD_ROW		"kingres_ledger_record_row"
 #define KL_SYM_LOCK_TABLE		"kingres_ledger_lock_table"
+#define KL_SYM_HISTORY_SYNC		"kingres_ledger_history_sync"
 
 /* GUC, see kingres_ledger.c. */
 extern int	kl_max_block_transactions;
+
+/* GUC: how often the launcher looks for pending transactions, in ms; 0 = off. */
+extern int	kl_block_interval;
+
+/* True while the extension itself runs a DDL statement on a history table. */
+extern bool kl_internal_ddl;
 
 /* True when the library was loaded through shared_preload_libraries. */
 extern bool kl_preloaded;
@@ -109,6 +125,10 @@ kl_put_u64(uint8 *p, uint64 v)
 
 /* capture.c */
 extern void kl_capture_init(void);
+
+/* worker.c */
+extern void kl_worker_init(void);
+extern void kl_mark_dirty(Oid dboid);
 
 /* protect.c */
 extern void kl_protect_init(void);

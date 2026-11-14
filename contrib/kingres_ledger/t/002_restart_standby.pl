@@ -19,6 +19,7 @@ $primary->init(allows_streaming => 1);
 $primary->append_conf(
 	'postgresql.conf', qq(
 shared_preload_libraries = 'kingres_ledger'
+kingres_ledger.block_interval = 0
 max_prepared_transactions = 5
 ));
 $primary->start;

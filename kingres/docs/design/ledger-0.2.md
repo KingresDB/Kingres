@@ -163,3 +163,130 @@ kingres.ledger_verification (
   ledger tables, blocks and digests: everything still verifies, and digests
   generated before the upgrade still verify after it.
 - The hash format is unchanged: the format tests of 0.1 pass unmodified.
+
+## Implementation notes and deviations
+
+Added with the implementation in `contrib/kingres_ledger/` (version 0.2). The
+text above is unchanged. The README of the extension has the exact behaviour,
+the privilege model and the complete list of what the protections cannot stop.
+Where this section says "deviation" the implementation does something the
+specification does not say or does differently.
+
+### Deviations and additions
+
+1. **The history table's owner and privileges.** The history table is created
+   by `ledger_enable` and belongs to the extension owner; the owner of the
+   ledger table gets `SELECT` on it and nobody else gets anything (the
+   history holds data that the table's own privileges and row security would
+   protect). The specification only says the capture code writes it.
+2. **A third blocking trigger on the history table**,
+   `kingres_ledger_block_insert` (`BEFORE INSERT`), rejects every SQL insert.
+   The capture code inserts through the table access method, which fires no
+   trigger, so this closes SQL inserts of forged history rows for every role
+   without costing the capture path anything. The specification lists UPDATE,
+   DELETE and TRUNCATE as blocked; INSERT is blocked in addition.
+3. **Registry and queue columns.** `ledger_table` gains `history_relid`
+   (regclass, NULL for append-only tables; a check ties it to the mode) and
+   `ledger_pending` gains `queued_at` (the time of the first entry of the
+   transaction). The latter is needed for "the age of the oldest" pending
+   transaction in `ledger_status`, which the specification asks for but the
+   0.1 queue could not answer. It is not covered by any hash; it is NULL for
+   transactions queued by 0.1.
+4. **`ledger_verification` never has state `running`.** The table allows it,
+   as specified, but PostgreSQL has no autonomous transaction and the table is
+   append-only, so a `running` row cannot be written and later finished. The
+   run is written when it ends, as the specification permits ("otherwise the
+   row is written at the end"); an error inside `ledger_verify` is caught and
+   recorded as `failed`, with a warning; an error of the arguments (an invalid
+   range) raises before anything is recorded. `rows_checked` is the number of
+   ledger entries of the blocks in the range; the problems are capped at 100
+   (the count is exact).
+5. **`ledger_status` is not readable by PUBLIC** (the number of pending
+   transactions says how active the database is); the specification says
+   nothing about it. `ledger_digest` and `ledger_verification` are readable by
+   PUBLIC as specified. `ledger_verify` does not compare recorded digests with
+   the chain (that would make a consistent rewrite of the blocks detectable
+   only if the attacker forgot the table, and changes the 0.1 tests that show
+   exactly such a rewrite passing); `ledger_verify_digest(digest)` is how a
+   recorded digest is checked.
+6. **`ledger_inclusion_proof` is an overload, not one function with a default.**
+   The three-argument form `(relation, row_hash, op "char")` is new; the
+   two-argument form stays as a `SECURITY DEFINER` SQL wrapper of it with op
+   `I`, so that grants made on the two-argument function under 0.1 survive the
+   upgrade (replacing it by a function with another signature would drop them
+   silently). The wrapper is one more function in the exact set that the
+   test `ledger_privs` asserts as `SECURITY DEFINER`, with that reason.
+7. **`ledger_verify_proof` gained a five-argument form** that takes the
+   expected operation; the four-argument form of 0.1 now accepts an `I` proof
+   only (the operation `D` did not exist in 0.1, so every proof it ever
+   accepted was an `I` proof). The check also became stricter in ways the
+   format documentation needed (see "Format documentation" below).
+8. **The workers.** One launcher at library load (started when recovery has
+   finished, restarted after 10 seconds if it dies) and one short-lived worker
+   per database, run one after another. Because a launcher cannot look into a
+   database, a backend that commits a transaction with ledger entries records
+   its database in a small set in shared memory (an additional shared memory
+   segment of a few hundred bytes), and the launcher visits those databases;
+   it visits every database in its first round after the start or promotion
+   of the server and every sixth round (covering a lost set, an overflow, and a
+   prepared transaction committed later). This implements "for each database
+   in which the extension is installed and which has pending ledger
+   transactions" without starting a process for every database every
+   interval. The worker's lock timeout is one second or the interval if
+   shorter. `kingres_ledger.block_interval` is a `PGC_SIGHUP` setting in
+   milliseconds, as a server setting only (a database or role setting is not
+   seen by the launcher).
+9. **History columns after `ADD COLUMN`.** A column added to the table is
+   appended to the history table, after `ledger_op`; the rows of the history
+   table are matched to the table by column name, and the row hash of a history
+   row encodes the columns other than the three ledger ones in their order,
+   which equals the order of the table. The follow-up `ALTER TABLE` on the
+   history table runs only after an `ALTER TABLE` command that names a
+   registered updatable table, through the event trigger and a flag set by one
+   internal function.
+10. **Names.** A table with a column named `ledger_txid`, `ledger_seq` or
+    `ledger_op` cannot be made updatable (the names would clash in the history
+    table), the names are rejected by `ADD COLUMN`, and a table whose history
+    name (`<table>_ledger_history`) would be longer than 63 bytes or already
+    exists is rejected.
+11. **Event trigger and hook additions.** The status view and the history
+    table are recognised by the hook (`DROP`, `CREATE OR REPLACE`, rename,
+    `SET SCHEMA`, grants other than `SELECT`); the event triggers reject drops
+    and rewrites of history tables and check their state (`history_missing`,
+    `history_state`, `history_trigger`, `history_columns`).
+12. **Existing tests changed.** `ledger_capture` called `ledger_enable(...,
+    'updatable')` to show "not supported yet"; it now uses an invalid mode
+    (`'bogus'`) for the same check. The expected output of `ledger_hash` lists
+    the new GUC `kingres_ledger.block_interval` (the only change there, no
+    hash or format line) and shows the value `0` that the new first test
+    `ledger_setup` sets; the expected output of `ledger_privs` lists the new
+    functions, tables and the changed `SECURITY DEFINER` set. The TAP test
+    `002_restart_standby` sets `kingres_ledger.block_interval = 0` because it
+    checks that a committed transaction is still queued after crash recovery,
+    which the workers would otherwise have emptied. No assertion was removed or
+    weakened.
+
+### Format documentation
+
+The independent verifier found twelve gaps in the description of format
+version 1 (`kingres/verifier/README.md`). All are resolved in the README of the
+extension; the format itself did not change. Three behaviours of the server's
+own `ledger_verify_proof` turned out to be defects and were fixed, with tests
+in `ledger_updatable`: it hashed the user name of a proof as it stood in the
+JSON (database encoding) instead of in UTF-8 as the block builder does (different
+bytes for a non-ASCII name in a database that is not UTF-8); it did not check
+that `format` is 1; it accepted any one-character `op`; it treated a malformed
+`block_hash` of a header in `chain` as an absent one; and it ignored the
+headers of `chain` beyond the digest height completely (they are now parsed
+strictly, like the verifier does, but not used). The rest of the proposals
+describe what the code already did.
+
+### Known gaps
+
+- A test of a non-ASCII user name in a database that is not UTF-8 is not part
+  of the suite (it needs a role whose name is valid in two encodings); the
+  conversion is the one `ledger_block_tx_leaf` uses.
+- The state `failed` of `ledger_verification` is written by code that only a
+  failure inside `ledger_verify` reaches; no test makes `ledger_verify` fail.
+- The launcher has not been tested with `EXEC_BACKEND` (Windows); the shared
+  memory pointer is not re-attached there.

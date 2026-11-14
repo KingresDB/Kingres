@@ -2,19 +2,34 @@
 <!-- Portions Copyright (c) 2026, RooyeKhat Media Co -->
 # kingres_ledger
 
-Tamper-evident ledger tables for KingresDB (a thin fork of PostgreSQL 18.7).
-This is the first increment of phase 6 of the roadmap; the design is in
-[`kingres/docs/design/ledger-mvp.md`](../../kingres/docs/design/ledger-mvp.md),
-including its section "Implementation notes and deviations". The findings of
-the independent review of version 0.1 and what was done about them are in
+Tamper-evident ledger tables for KingresDB (a thin fork of PostgreSQL 18.7),
+version 0.2. Version 0.1 (phase 6, first increment) has append-only tables;
+version 0.2 adds updatable ledger tables with a history table, background
+workers that build the blocks, and the records an operator needs (recorded
+digests and verifications and a status view). The designs are
+[`kingres/docs/design/ledger-mvp.md`](../../kingres/docs/design/ledger-mvp.md)
+(0.1, including its implementation notes) and
+[`kingres/docs/design/ledger-0.2.md`](../../kingres/docs/design/ledger-0.2.md)
+(0.2, with its "Implementation notes and deviations"). The findings of the
+independent review of version 0.1 and what was done about them are in
 [`kingres/docs/reviews/2026-11-14-kingres-ledger-0.1.md`](../../kingres/docs/reviews/2026-11-14-kingres-ledger-0.1.md)
-and in the notes at the end of the design document.
+and in the notes at the end of the 0.1 design document.
 
-A table put under ledger control with `kingres.ledger_enable` becomes
-append-only. Every inserted row is hashed and recorded in a hash chain of
-blocks. A digest of the latest block, stored outside the database, lets anyone
-check later that the table and the chain have not been changed, and an
-inclusion proof shows that one row is part of the ledger.
+A table put under ledger control with `kingres.ledger_enable` is either
+**append-only** (the default: rows can only be inserted) or **updatable**
+(`ledger_enable(table, 'updatable')`: rows can be inserted, updated and
+deleted, and every old version stays provable). Every change is hashed and
+recorded in a hash chain of blocks. A digest of the latest block, stored
+outside the database, lets anyone check later that the table and the chain
+have not been changed, and an inclusion proof shows that one row version is
+part of the ledger.
+
+The hash format is **version 1, unchanged by 0.2**: digests, proofs and block
+hashes made by 0.1 still verify, and the independent verifier written for 0.1
+reads 0.2 ledgers of append-only tables. What 0.2 adds that a verifier needs
+to know is the operation `D` (an entry that records the removal of a row
+version) and the `op` member of a proof; both are described in "Hash format
+version 1" below.
 
 ## What the ledger guarantees, and what it does not
 
@@ -31,7 +46,27 @@ exported earlier.
 There is also a window: a committed transaction is covered by a digest only
 once it has been placed in a block and a digest of that block has left the
 database. Until then a privileged attacker could alter its ledger entries
-undetected. The window is the block interval plus the digest export interval.
+undetected. The window is the block interval (the background worker builds a
+block about every `kingres_ledger.block_interval`, 10 seconds by default) plus
+the digest export interval. The digests that `ledger_generate_digest` records
+in `kingres.ledger_digest` are **not** outside the database and are not a root
+of trust.
+
+**What an updatable table guarantees, and what it does not.** The ledger of an
+updatable table proves that the rows the table holds now are exactly the row
+versions that were entered and not yet removed (every `I` entry minus every
+`D` entry, as multisets of row hashes), that every removed version is in the
+history table with the transaction that removed it, and, against a digest kept
+outside the database, that none of this was rewritten. It does **not** prove
+what a version meant, who is allowed to change a row, or that a change was
+authorised; the user name of a transaction is the name of the role that ran
+the statement. It does not prevent a change (a privileged user can still run
+`UPDATE`); it makes a change visible and the old version provable. The order of
+the entries inside a transaction is the order in which the capture triggers
+ran, which is the order in which statements and their triggers finished: for
+nested changes (a trigger that updates the row again) an old version can be
+entered after a newer one, which does not matter for the check of the rows, as
+the check compares multisets.
 
 The protections against switching the ledger off (below) stop mistakes and
 ordinary privileged use. They are not a security boundary against someone who
@@ -39,17 +74,22 @@ edits the catalogs directly, switches event triggers off, removes the library
 from the configuration, or changes files: the section "What the protections
 cannot stop" lists every way that is known.
 
-**Enabling the ledger on a table is permanent.** There is deliberately no
-function that switches it off. Once a table is under ledger control:
+**Enabling the ledger on a table is permanent, and so is its mode.** There is
+deliberately no function that switches it off, and an append-only table cannot
+be made updatable or the reverse (`ledger_enable` on a ledger table with the
+other mode is rejected with "not supported yet"). Once a table is under ledger
+control:
 
 - `DROP TABLE` of it is rejected, and so is `DROP SCHEMA ... CASCADE` of a
   schema that contains it, and `DROP OWNED BY` its owner;
 - `DROP ROLE` of its owner fails until the table has been moved to another
   role with `REASSIGN OWNED BY old TO new` (`ALTER TABLE ... OWNER TO` works);
-- rows of other tables cannot be deleted while a ledger row refers to them
-  through a foreign key (the ledger rows can neither be deleted nor changed,
-  so `ON DELETE CASCADE` and `ON DELETE SET NULL` fail), and `TRUNCATE` of
-  such a table fails;
+- rows of other tables cannot be deleted while an append-only ledger row
+  refers to them through a foreign key (the ledger rows can neither be deleted
+  nor changed, so `ON DELETE CASCADE` and `ON DELETE SET NULL` fail), and
+  `TRUNCATE` of such a table fails; an updatable table does not have this
+  problem: the actions change its rows and are captured;
+- the history table of an updatable table is part of the ledger and stays too;
 - `DROP EXTENSION kingres_ledger` is rejected while any ledger table exists;
 - the entries of its rows stay in `kingres.ledger_entry` for ever, and the
   tables and their entries take disk space for ever.
@@ -79,10 +119,13 @@ tests:
 kingres/dev/ext.sh kingres_ledger all     # sync build install regress tap
 ```
 
-Tests: seven pg_regress tests and six TAP tests under `t/`.
+Tests: ten pg_regress tests and nine TAP tests under `t/`.
 
 | Test | What it covers |
 |---|---|
+| `ledger_setup` | switches the block-building workers off for the pg_regress tests, which build blocks by hand and count them (the TAP tests cover the workers) |
+| `ledger_updatable` | updatable tables: the history table, every statement path that changes a row (`ON CONFLICT DO UPDATE`, `MERGE`, foreign-key actions, triggers that change the row before and after the capture, `COPY`, `session_replication_role = replica`, views, prepared transactions, `TOAST`ed values), `ADD COLUMN`, rejection of conversion, the protection and privileges of the history table, proofs of `I` and `D` entries and the strict parsing of proofs, and every tamper case |
+| `ledger_records` | `ledger_digest`, `ledger_verify_recorded`, `ledger_status`: contents, caps, privileges, protection |
 | `ledger_hash` | RFC 6962 vectors, the tags, the genesis hash, the canonical row encoding, independence of session settings |
 | `ledger_capture` | `ledger_enable`, capture, rollback and subtransactions, blocks, digests |
 | `ledger_verify` | clean verification, digests, proofs, and every tamper case |
@@ -96,6 +139,9 @@ Tests: seven pg_regress tests and six TAP tests under `t/`.
 | `004_races` | the rename race against the hook (a stress test), a foreign-table child, `ledger_enable` and snapshots, the block builder lock |
 | `005_environments` | logical replication apply, hot standby, parallel query, an extension owner that is not a superuser |
 | `006_guard_without_hook` | the event triggers alone: after the library was removed from `shared_preload_libraries` each way of switching the ledger off is still rejected |
+| `007_upgrade` | `ALTER EXTENSION UPDATE` from 0.1 with tables, blocks, digests and proofs; the upgraded database has the objects, privileges and protection of a direct installation of 0.2 (compared through a fingerprint of the catalogs) |
+| `008_updatable_concurrency` | concurrent `UPDATE`, `DELETE`, upsert, `MERGE`, locking, savepoints and rollbacks of the same rows (READ COMMITTED with re-evaluation of the row, and REPEATABLE READ with retries) while blocks are built; logical replication apply into an updatable table |
+| `009_worker` | the block-building workers: bounded time, two databases, `block_interval = 0`, reload, restart, a prepared transaction, bounded blocks, a busy builder lock, a standby and promotion |
 
 The regress tests need `shared_preload_libraries = 'kingres_ledger'` (the
 in-tree `check` target and `kingres/dev/ext.sh` set it).
@@ -130,6 +176,22 @@ Note: a role named `kingres` puts the schema `kingres` first in the default
 creates the table there; `ledger_enable` refuses tables in schema `kingres`.
 Create user tables in another schema.
 
+**Upgrade from 0.1.** `ALTER EXTENSION kingres_ledger UPDATE` (the script is
+`kingres_ledger--0.1--0.2.sql`; load the new library first: restart the server,
+or at least start new sessions after installing the files). It adds the column
+`history_relid` to `ledger_table` and `queued_at` to `ledger_pending`, lets
+`ledger_entry.op` be `D`, creates `ledger_digest` and `ledger_verification` and
+the view `ledger_status`, and replaces the functions that changed. Existing
+ledger tables, blocks, digests and proofs are not touched and still verify; a
+digest made before the upgrade verifies after it; the result is the same set
+of objects, privileges and protection as `CREATE EXTENSION kingres_ledger
+VERSION '0.2'`. Things to know: `ledger_inclusion_proof(regclass, bytea)` is
+kept (as a wrapper) so that existing grants keep working, and the new
+three-argument form needs its own grant; transactions that were pending
+before the upgrade have no `queued_at`; and the 0.2 library must be loaded
+for the 0.2 SQL (a 0.2 library works with the 0.1 SQL, a 0.1 library does not
+work with the 0.2 SQL).
+
 The extension creates three event triggers (`kingres_ledger_guard_end`,
 `..._drop`, `..._rewrite`), which run after every DDL command of the
 database; see "Protection against being switched off". Their cost is a few
@@ -155,32 +217,135 @@ table has one. The extension itself never relies on a bare alias.
 `ledger_enable` needs the READ COMMITTED isolation level, as the block builder
 does.
 
+### Updatable tables
+
+```sql
+SELECT kingres.ledger_enable('public.inventory', 'updatable');
+UPDATE inventory SET qty = qty - 1 WHERE id = 7;     -- D of the old version, I of the new one
+DELETE FROM inventory WHERE id = 8;                  -- D of the old version
+SELECT * FROM inventory_ledger_history ORDER BY ledger_txid, ledger_seq;   -- every removed version
+```
+
+`ledger_enable(relation, 'updatable')` creates the **history table**
+`<schema>.<table>_ledger_history` (the name must fit in 63 bytes and must not
+exist; the table must not have columns named `ledger_txid`, `ledger_seq` or
+`ledger_op`): the columns of the table (same names, types and modifiers, in
+the same order, no constraints, defaults or identity), then `ledger_txid
+bigint`, `ledger_seq int` and `ledger_op "char"`. The two triggers on the
+table fire after every row change:
+
+| Statement | Entries | History row |
+|---|---|---|
+| `INSERT` | `I`, the hash of the new row | none |
+| `DELETE` | `D`, the hash of the old row | the old row |
+| `UPDATE` | `D` of the old row, then `I` of the new row | the old row |
+
+An `UPDATE` that changes no column still writes both entries (they have the
+same row hash). `ledger_txid` and `ledger_seq` of a history row are those of
+its `D` entry, `ledger_op` is `D`. `TRUNCATE` of an updatable table is
+rejected. Existing rows are entered as `I` entries by `ledger_enable`.
+Everything that changes a row of the table is captured, whatever statement
+did it: `UPDATE`, `DELETE`, `INSERT ... ON CONFLICT DO UPDATE`, `MERGE`,
+foreign-key actions (`ON DELETE CASCADE`, `SET NULL`, `ON UPDATE CASCADE`),
+`COPY`, an updatable view over the table, the logical replication apply worker
+(which runs with `session_replication_role = replica`; the triggers are
+`ENABLE ALWAYS`), triggers on the table that change the row before the
+capture (the capture sees the row that was stored) and triggers that update
+the row again after it (every version is captured), and concurrent updates of
+the same row (a row that READ COMMITTED re-evaluates after another transaction
+changed it is captured as the version that was really replaced). `SELECT ...
+FOR UPDATE` changes no row and writes nothing.
+
+The history table belongs to the extension owner. **Its privileges**: the owner
+of the table gets `SELECT` on it (the history holds data that the table's
+`SELECT` privileges, column privileges and row security would otherwise
+protect, so nobody else gets anything automatically); grant `SELECT` on it to
+others yourself. Nobody can write it through SQL: `UPDATE`, `DELETE` and
+`TRUNCATE` are rejected by the blocking triggers like those of every ledger
+table, `INSERT` by a third trigger (`kingres_ledger_block_insert`; only the
+capture code inserts, and it does that through the table access method, which
+fires no trigger), and no privilege other than `SELECT` can be granted on it.
+
+`ALTER TABLE ... ADD COLUMN` on an updatable table is allowed under the rules
+of 0.1 (nullable, no default, a type `ledger_enable` accepts) and is applied
+to the history table in the same statement by the event trigger; the new
+column is appended to the history table (after `ledger_op`), and the row hash
+of a history row ignores the three ledger columns, so the order of the columns
+of the table decides the hash. A column named `ledger_txid`, `ledger_seq` or
+`ledger_op` is rejected. Every other change of the column layout stays
+rejected.
+
+**Verification of an updatable table** (`ledger_verify`), in addition to the
+checks of 0.1: the multiset of the row hashes of the current rows equals the
+multiset of `I` entries minus the multiset of `D` entries (`table_rows`);
+every `D` entry has exactly one history row with the same `ledger_txid` and
+`ledger_seq`, whose row hash recomputed from its columns
+(`kingres.ledger_history_row_hash(h.*)`) is the row hash of the entry, and
+every history row has its `D` entry and has `ledger_op = 'D'`
+(`history_rows`); the history table, its triggers and its columns are as
+`ledger_enable` made them (`history_missing`, `history_state`,
+`history_trigger`, `history_columns`); and an append-only table has no `D`
+entry (`entry_op`).
+
+**Proofs.** `ledger_inclusion_proof(relation, row_hash)` proves the first `I`
+entry with that row hash, as before; `ledger_inclusion_proof(relation,
+row_hash, 'D')` proves the first `D` entry: that this version was removed in
+that transaction. The proof carries `op`. `ledger_verify_proof(proof, digest)`
+accepts either; the four-argument form (with the table id and the row hash)
+accepts an `I` proof only; the five-argument form takes the operation as its
+last argument.
+
 | Function | Purpose | Executable by |
 |---|---|---|
-| `kingres.ledger_enable(regclass, text default 'append_only')` | Put an ordinary table under ledger control, for good. The caller must own the table. READ COMMITTED only. | granted roles |
+| `kingres.ledger_enable(regclass, text default 'append_only')` | Put an ordinary table under ledger control, for good, in mode `append_only` or `updatable`. The caller must own the table. READ COMMITTED only. | granted roles |
 | `kingres.ledger_row_hash(record) returns bytea` | Leaf hash of a row of a ledger table; the argument must be a row of the table itself, e.g. `ledger_row_hash(a.*) FROM accounts a` (not a sub-select). | PUBLIC |
 | `kingres.ledger_build_block() returns bigint` | Close a block from the pending transactions; the new height, or NULL when nothing was pending. READ COMMITTED only. | granted roles |
-| `kingres.ledger_generate_digest() returns jsonb` | Build a block if needed and return the digest of the latest block; NULL when the ledger is empty. | granted roles |
-| `kingres.ledger_verify(from_height bigint default 0, to_height bigint default null)` | One row `(check_name, object, detail)` per problem. | granted roles |
+| `kingres.ledger_generate_digest() returns jsonb` | Build a block if needed, **record** the digest in `kingres.ledger_digest` and return it: the digest of the latest block; NULL (and nothing recorded) when the ledger is empty. | granted roles |
+| `kingres.ledger_verify(from_height bigint default 0, to_height bigint default null)` | One row `(check_name, object, detail)` per problem. Records nothing. | granted roles |
+| `kingres.ledger_verify_recorded(from_height bigint default 0, to_height bigint default null) returns bigint` | Run `ledger_verify` and record the run in `kingres.ledger_verification`; returns its id. | granted roles |
 | `kingres.ledger_verify_digest(jsonb) returns boolean` | Whether a digest matches the stored chain (the whole chain up to the digest height is recomputed). Never raises an error for a malformed digest. | granted roles |
-| `kingres.ledger_inclusion_proof(regclass, bytea) returns jsonb` | Proof for the (first) entry with this row hash. The row must already be in a block. | granted roles |
+| `kingres.ledger_inclusion_proof(regclass, bytea) returns jsonb` | Proof for the (first) `I` entry with this row hash. The row must already be in a block. | granted roles |
+| `kingres.ledger_inclusion_proof(regclass, bytea, "char") returns jsonb` | The same for the entry of the given operation, `I` or `D`. | granted roles |
 | `kingres.ledger_verify_proof(jsonb, jsonb) returns boolean` | Check a proof against a trusted digest of the same chain; reads no table; malformed input gives false. | PUBLIC |
-| `kingres.ledger_verify_proof(jsonb, jsonb, int, bytea) returns boolean` | The same, and the proof must be for this table id and this row hash (the ones the caller computed from the row it holds). | PUBLIC |
+| `kingres.ledger_verify_proof(jsonb, jsonb, int, bytea) returns boolean` | The same, and the proof must be for this table id and this row hash (the ones the caller computed from the row it holds), and must be an `I` proof. | PUBLIC |
+| `kingres.ledger_verify_proof(jsonb, jsonb, int, bytea, "char") returns boolean` | The same for a proof of the given operation, `I` or `D`. | PUBLIC |
+| `kingres.ledger_history_row_hash(record) returns bytea` | Row hash of a row of a history table (`SELECT kingres.ledger_history_row_hash(h.*) FROM t_ledger_history h`): the hash its `D` entry carries. | PUBLIC |
 | `kingres.ledger_leaf_hash(bytea)`, `ledger_node_hash(bytea, bytea)`, `ledger_merkle_root(bytea)` (aggregate), `ledger_merkle_path(bytea[], int)`, `ledger_tx_leaf(...)`, `ledger_block_tx_leaf(...)`, `ledger_block_hash(...)`, `ledger_genesis_hash(bytea)`, `ledger_timestamptz_us(timestamptz)` | Primitives used by the SQL functions and useful for independent checks. | PUBLIC |
 | `kingres.ledger_hook_active()` | True when the library was loaded through `shared_preload_libraries`. | PUBLIC |
 
 Internal functions (`ledger_capture`, `ledger_record_row`, `ledger_lock_table`,
-and the helpers `ledger_all_defects`, `ledger_table_defects`,
-`ledger_catalog_defects`, `ledger_trigger_ok`, `ledger_type_problem`,
-`ledger_is_member`, `ledger_guard`) are not part of the interface. The ones that
-write the ledger are not executable by PUBLIC, and the protection hook rejects
-any attempt to grant them.
+`ledger_history_sync`, and the helpers `ledger_all_defects`,
+`ledger_table_defects`, `ledger_history_defects`, `ledger_catalog_defects`,
+`ledger_trigger_ok`, `ledger_type_problem`, `ledger_is_member`,
+`ledger_guard`) are not part of the interface. The ones that write the ledger
+are not executable by PUBLIC, and the protection hook rejects any attempt to
+grant them.
 
-Setting:
+**The records for operators.**
+
+| Object | Contents |
+|---|---|
+| `kingres.ledger_digest` | one row per digest this database generated (`ledger_generate_digest`): `digest_id`, `generated_at`, `generated_by`, `height`, `block_hash`, `digest` (exactly what the function returned). **A convenience, not a root of trust**: the table is in the database, whoever can rewrite the chain can rewrite it, and `ledger_verify` does not compare it with the chain; to check a recorded digest call `ledger_verify_digest(digest)`; keep a copy outside the database. |
+| `kingres.ledger_verification` | one row per `ledger_verify_recorded` run: `verification_id`, `started_at`, `finished_at`, `started_by`, `from_height`, `to_height` (the heights actually checked), `state` (`clean`, `problems`, `failed`; `running` is allowed by the table but never written: see below), `problem_count`, `blocks_checked` (blocks in the range), `rows_checked` (ledger entries of the transactions in those blocks), `problems` (a JSON array of `{check, object, detail}`, at most the first 100; `problem_count` is exact; NULL when clean). |
+| `kingres.ledger_status` | one row: `append_only_tables`, `updatable_tables`, `latest_block_height`, `latest_block_hash`, `latest_block_closed_at`, `pending_transactions`, `oldest_pending_age` (the clock time since the oldest pending transaction wrote its first entry; NULL when nothing is pending or for a transaction that was queued by 0.1), `last_digest_id`, `last_digest_at`, `last_digest_height`, `last_verification_id`, `last_verification_at`, `last_verification_state`, `last_verification_problems`. |
+
+`ledger_verify_recorded` writes its row when the run is over. PostgreSQL has
+no autonomous transaction, and the table is append-only, so a row in state
+`running` that survives a failure of the calling transaction cannot exist. A
+failure of `ledger_verify` itself (an error, not a finding) is caught: the run
+is recorded with state `failed` and the error message, the caller gets a
+warning and the id. If the caller's transaction rolls back, the record goes
+with it. Both tables are append-only for every role and are protected like the
+other ledger tables; `ledger_digest` and `ledger_verification` are readable by
+PUBLIC (like `ledger_blocks`; the problems list names tables and hashes), the
+view is not (see "Privileges").
+
+Settings:
 
 | GUC | Default | Meaning |
 |---|---|---|
 | `kingres_ledger.max_block_transactions` | 100000 | A block is closed with at most this many transactions; the rest wait for the next block. Superuser setting (`PGC_SUSET`). |
+| `kingres_ledger.block_interval` | 10s | How often the launcher looks for pending transactions; `0` switches the block-building workers off. Server setting (`PGC_SIGHUP`, `postgresql.conf` or `ALTER SYSTEM` and a reload; a database or role setting has no effect on the launcher). |
 
 Errors raised by the extension: SQLSTATE `KL001` (modification of an
 append-only table), `KL002` (statement rejected by the protection hook or by
@@ -197,9 +362,11 @@ DEFINER`:
 | `ledger_capture` | writes the entry of every inserted row; ordinary roles have no privilege on the ledger tables |
 | `ledger_record_row` | writes the entries of the rows that exist when a table is enabled |
 | `ledger_enable` | creates triggers on a table that the owner does not own, and writes `ledger_table` (it checks that the calling role owns the table) |
-| `ledger_build_block`, `ledger_generate_digest` | write blocks and transactions |
-| `ledger_verify` | reads every ledger table and every table under ledger control |
-| `ledger_inclusion_proof` | reads the entries and transactions, which the caller may not read |
+| `ledger_build_block` | writes blocks and transactions |
+| `ledger_generate_digest` | calls the block builder and writes `ledger_digest` |
+| `ledger_verify` | reads every ledger table, every history table and every table under ledger control |
+| `ledger_verify_recorded` | writes `ledger_verification` |
+| `ledger_inclusion_proof` (both forms) | reads the entries and transactions, which the caller may not read; the two-argument form is a wrapper that exists so that grants made on it under 0.1 keep working |
 | `ledger_guard` (event trigger) | must see the ledger tables whatever grants an administrator changed, so that DDL of every role keeps working |
 
 All of them have `SET search_path = pg_catalog, pg_temp`, and every reference to
@@ -212,10 +379,12 @@ on their arguments and look nothing up (the list is in the test).
 
 | Object | PUBLIC |
 |---|---|
-| `kingres.ledger_table`, `kingres.ledger_chain`, `kingres.ledger_blocks` | `SELECT` |
+| `kingres.ledger_table`, `kingres.ledger_chain`, `kingres.ledger_blocks`, `kingres.ledger_digest`, `kingres.ledger_verification` | `SELECT` |
 | `kingres.ledger_entry`, `kingres.ledger_pending`, `kingres.ledger_tx` | nothing |
-| `ledger_enable`, `ledger_build_block`, `ledger_generate_digest`, `ledger_verify`, `ledger_verify_digest`, `ledger_inclusion_proof` | nothing |
-| `ledger_row_hash`, `ledger_verify_proof`, the hash primitives, `ledger_hook_active` | `EXECUTE` |
+| `kingres.ledger_status` (view) | nothing (it runs with the rights of its owner and shows how many transactions wait) |
+| the history table of an updatable table | nothing; `SELECT` for the owner of the table (granted by `ledger_enable`) |
+| `ledger_enable`, `ledger_build_block`, `ledger_generate_digest`, `ledger_verify`, `ledger_verify_recorded`, `ledger_verify_digest`, `ledger_inclusion_proof` | nothing |
+| `ledger_row_hash`, `ledger_history_row_hash`, `ledger_verify_proof`, the hash primitives, `ledger_hook_active` | `EXECUTE` |
 
 The entries, the work queue and the transaction table are not readable by
 PUBLIC because the row hashes in them let a reader confirm a guess about the
@@ -238,8 +407,12 @@ The role still has to own the table (or be a member of the owning role).
 
 ```sql
 GRANT EXECUTE ON FUNCTION kingres.ledger_build_block(),
-                          kingres.ledger_generate_digest() TO ledger_agent;
+                          kingres.ledger_generate_digest(),
+                          kingres.ledger_verify_recorded(bigint, bigint) TO ledger_agent;
+GRANT SELECT ON kingres.ledger_status TO ledger_agent;      -- and the management panel's role
 ```
+
+(The block-building workers need no grant: they run as the extension owner.)
 
 **An auditor role** that verifies the ledger and builds proofs needs `EXECUTE`
 only (the functions run as the owner):
@@ -247,7 +420,9 @@ only (the functions run as the owner):
 ```sql
 GRANT EXECUTE ON FUNCTION kingres.ledger_verify(bigint, bigint),
                           kingres.ledger_verify_digest(jsonb),
-                          kingres.ledger_inclusion_proof(regclass, bytea) TO auditor;
+                          kingres.ledger_inclusion_proof(regclass, bytea),
+                          kingres.ledger_inclusion_proof(regclass, bytea, "char") TO auditor;
+GRANT SELECT ON inventory_ledger_history TO auditor;          -- to read the old versions
 ```
 
 A role that also wants to read the entries, the pending transactions and the
@@ -284,6 +459,17 @@ the size of the ledger, which is why they are not executable by PUBLIC.
   callbacks, and the "queued" flag follows subtransactions: if the
   subtransaction that queued the transaction is rolled back, the next entry
   queues it again. Sequence numbers are unique and ordered but may have gaps.
+- For an updatable table the same trigger function is an `AFTER INSERT OR UPDATE
+  OR DELETE` row trigger (the blocking trigger for update and delete is not
+  created; `TRUNCATE` is blocked). On `UPDATE` and `DELETE` it hashes the old
+  tuple (`tg_trigtuple`) and writes the `D` entry, then writes the old tuple into
+  the history table (matched by column name, same types, through the table
+  access method: the exact old tuple, no copy through text), then, for
+  `UPDATE`, hashes the new tuple (`tg_newtuple`) and writes the `I` entry. The
+  tuples are those the executor queued for the trigger, fetched by tuple id, so
+  they are the versions that were really stored, whatever happened to the row
+  afterwards in the same statement. The trigger argument (the table id) is
+  checked against the registry for `UPDATE` and `DELETE`.
 - `ledger_build_block` takes a table lock on `kingres.ledger_chain` (EXCLUSIVE
   mode; only the extension owner can take it, so no other role can stop block
   building), reads the pending transactions (at most `max_block_transactions`,
@@ -292,13 +478,36 @@ the size of the ledger, which is why they are not executable by PUBLIC.
   `ledger_pending`. A transaction that commits after the builder's snapshot is
   picked up by the next block. Order inside a block is by transaction id, not
   by commit order.
-- There is no background worker in this increment; blocks are built when
-  `ledger_generate_digest()` or `ledger_build_block()` is called.
-- Logical replication into a ledger table works for inserts: the apply worker
-  runs with `session_replication_role = replica`, the `ENABLE ALWAYS` triggers
-  fire, and the rows are captured as the owner of the subscription. A replicated
-  `UPDATE`, `DELETE` or `TRUNCATE` is rejected by the append-only triggers, so
-  the apply worker stops with an error until the subscription is changed.
+- **The block-building workers** (`src/worker.c`). A launcher is registered at
+  library load (it needs `shared_preload_libraries`; it starts when recovery has
+  finished, so a standby has none). Every `kingres_ledger.block_interval` it
+  starts, one at a time, a short-lived worker for each database it decides to
+  look at; the worker connects to the database, runs as the extension owner,
+  does nothing if the extension is not installed or nothing is pending, and
+  otherwise calls `ledger_build_block()` once and exits. It sets READ
+  COMMITTED, and a lock timeout of one second (or the interval, if shorter) for
+  the builder lock: if another builder holds it, the worker logs a message,
+  gives up and the next round tries again. If more than
+  `max_block_transactions` transactions were pending, the next round builds
+  the next block. The launcher cannot look into a database, so a backend that
+  commits a transaction with ledger entries puts its database into a small set
+  in shared memory, and the launcher visits those databases only; it visits
+  every database in its first round after the server starts or is promoted,
+  and again every sixth round (a transaction that was prepared and is
+  committed later, and an overflow of the set, are covered by that). A
+  committed transaction is therefore in a block within about one interval, a
+  committed prepared transaction within six. `block_interval = 0` (or a
+  reload that sets it) switches the workers off; the launcher then idles. Every
+  database needs `max_worker_processes` to have a free slot for the worker.
+  The blocks are the same ones `ledger_build_block()` builds by hand; both can
+  run together (they serialise on the builder lock).
+- Logical replication into a ledger table works: the apply worker runs with
+  `session_replication_role = replica`, the `ENABLE ALWAYS` triggers fire, and
+  the rows are captured as the owner of the subscription. For an append-only
+  table a replicated `UPDATE`, `DELETE` or `TRUNCATE` is rejected by the
+  blocking triggers, so the apply worker stops with an error until the
+  subscription is changed; for an updatable table they are captured like local
+  changes (`TRUNCATE` is rejected).
 - A hot standby can verify the ledger, check digests and build and check
   proofs; it cannot enable tables or build blocks (it is read-only).
 
@@ -359,6 +568,45 @@ conversion takes place and the bytes are the stored bytes.) NULL columns are
 omitted, so adding a nullable column later does not change the hash of
 existing rows. `row_hash = leaf_hash(encoding)`.
 
+*Edge cases of the encoding.* Columns are taken in `attnum` order, that is, in
+the order in which they were created; a dropped column is skipped (the
+`attnum` of the others does not change), and a column added later comes last,
+whatever the names. A value of zero length (an empty string, an empty `bytea`,
+an empty array) is **not** NULL: it is encoded with `u32 length = 0` and counts
+in the number of encoded columns. A NULL column is not encoded at all and does
+not count. The column name is the name stored in the catalog, converted from
+the database encoding to UTF-8 like text values are (for a `SQL_ASCII`
+database the stored bytes); its length is a `u16` in bytes (the name is at
+most 63 bytes in the database encoding, so at most 252 in UTF-8, and a table
+has at most 1600 columns, so no limit of the encoding is ever reached; the
+implementation raises an error for a name longer than 65535 bytes). There is no
+padding and no alignment anywhere.
+
+*The value bytes.* They are the bytes that the type's binary send function
+(`typsend`) produces, without the length word of the frontend/backend
+protocol. For example: `int4send` is 4 bytes, big-endian; `int8send` 8;
+`boolsend` 1 byte (`0` or `1`); `float8send` the 8 bytes of the IEEE double,
+big-endian (`NaN` and `-0` as they are); `textsend` and `varcharsend` the
+UTF-8 bytes of the text; `bpcharsend` the UTF-8 bytes including the padding;
+`byteasend` the bytes; `timestamptzsend` and `timestampsend` the `int64`
+microseconds since 2000-01-01 00:00:00 (UTC for `timestamptz`); `date_send`
+the `int32` days since 2000-01-01; `numeric_send` the PostgreSQL binary numeric
+(`ndigits`, `weight`, `sign`, `dscale`, and the base-10000 digits, each a
+`u16`); `uuid_send` the 16 bytes; `jsonb_send` a version byte `1` followed by
+the text of the document in the canonical `jsonb` output form; `array_send`
+the array header with the element type OID (so arrays of types with an OID of
+16384 or more are rejected) and the elements, each with a `u32` length (-1
+for NULL). Outside the server, in SQL on any server: `SET client_encoding =
+'UTF8'; SELECT encode(int4send(42), 'hex'), encode(textsend('abc'), 'hex')`;
+the send function of any other type is named in `pg_type.typsend`. The text
+send functions convert to `client_encoding`, which is why the extension forces
+UTF-8 and why you must set it to get the same bytes. Types whose binary form
+is not stable, or that have none, are rejected by `ledger_enable`
+(`kingres.ledger_type_problem(oid)` says why); a type whose binary form
+changes between server versions would change the hashes of existing rows, and
+nothing prevents the server from being upgraded to such a version (see
+"What the protections cannot stop").
+
 `ledger_enable` rejects columns whose binary form is not stable or does not
 exist: types without a binary send function, composite types and arrays of
 composite types (the binary form contains type OIDs), arrays whose element type
@@ -368,8 +616,28 @@ checks (the event trigger applies them).
 
 **Transaction tree.** The leaves of a transaction are its entries in `seq`
 order: `leaf_hash(0x11 || u32 seq || u32 table_id || u8 op || row_hash)` with
-`op = 0x49` ('I'). `merkle_root` of the transaction is `MTH` over these leaf
-hashes (a transaction row in `ledger_tx` also stores `entry_count`).
+`op = 0x49` (ASCII `I`, an inserted row version) or `op = 0x44` (ASCII `D`,
+**new in 0.2**: a row version that was removed by an `UPDATE` or a `DELETE`;
+`row_hash` is then the hash of the version that was removed, computed exactly
+like that of an inserted row). The JSON value `"I"` of the `op` member of a
+proof is the byte `0x49`, `"D"` is `0x44`. The entry leaf data is 42 bytes
+(`1 + 4 + 4 + 1 + 32`). `merkle_root` of the transaction is `MTH` over these
+leaf hashes (a transaction row in `ledger_tx` also stores `entry_count`). The
+format of the leaf, the tags, the trees, the block hash and the chain
+identity are exactly those of 0.1; only the set of values `op` may have grew.
+An `UPDATE` writes `D` (old version) then `I` (new version) in consecutive
+`seq` positions of the same transaction (for nested changes by triggers the
+order of the entries is the order in which the capture trigger ran); a
+verifier of the tree does not need to know the meaning of `op`.
+
+**What the entries mean for a table** (not part of the hash format, but what
+`ledger_verify` checks): for every row hash `h` of a table, the number of rows
+of the table with hash `h` equals the number of `I` entries with `h` minus the
+number of `D` entries with `h`. For an updatable table each `D` entry has a
+history row with the same `ledger_txid` and `ledger_seq` whose columns hash to
+`h` (`ledger_history_row_hash`, which encodes the history row as the table's
+row: the columns other than `ledger_txid`, `ledger_seq` and `ledger_op`, in
+order, with the `table_id` of the ledger table).
 
 **Block tree.** The leaves of a block are its transactions in `tx_index` order
 (ascending `ledger_txid`, `tx_index` from 0):
@@ -391,6 +659,16 @@ Only the first entry of a transaction records the name; a later `SET ROLE` in th
 same transaction does not change it. The name is captured before the block
 exists, see the limitations.
 
+*Encoding of the name.* `name` values are stored in the database encoding. In
+the hash the name is **UTF-8**: for a database whose encoding is not UTF-8 it
+is converted from the database encoding like text values are (for `SQL_ASCII`
+the stored bytes are used). A role name has at most 63 bytes in the database
+encoding, at most 252 in UTF-8, so the limit of 255 bytes that the proof
+check applies never truncates anything and no truncation rule exists. (The
+proof check of 0.1 hashed the name of a proof as it stood in the JSON, that
+is, in the database encoding, which is the same bytes only for UTF-8 and ASCII
+names; 0.2 converts it like the block builder does.)
+
 **Chain identity.** `kingres.ledger_chain` has one row, written when the
 extension is created: `chain_id`, 32 random bytes (`SHA-256` of two random
 UUIDs). The `prev_hash` of block 0 is `SHA256(0x14 || chain_id)` instead of 32
@@ -398,6 +676,28 @@ zero bytes. `ledger_verify` checks that block 0 starts from the stored
 `chain_id`; the digest and every proof carry `chain_id`, and
 `ledger_verify_digest` and `ledger_verify_proof` reject a digest or proof of
 another chain. The table is protected like the other ledger tables.
+
+**Exporting the chain for an independent check.** `ledger_blocks` is readable
+by PUBLIC; the block headers and the chain identity are
+`SELECT chain_id FROM kingres.ledger_chain` (the chain identity is also in
+every digest and every proof) and
+
+```sql
+SELECT height, hash_version, prev_hash, tx_merkle_root, tx_count,
+       kingres.ledger_timestamptz_us(closed_at) AS closed_at_us, block_hash
+FROM kingres.ledger_blocks ORDER BY height;
+```
+
+(`ledger_blocks` itself has `closed_at timestamptz`, not `closed_at_us`; the
+function returns the `int8` microseconds since 2000-01-01 UTC that the block
+hash covers.) These are the same members a proof carries in `block` and in the
+elements of `chain`. The chain is valid when block 0 has `prev_hash =
+SHA256(0x14 || chain_id)`, every block hash is recomputed as in "Block hash"
+and equals `block_hash`, every `prev_hash` equals the hash of the previous
+block, the heights are 0, 1, 2, ... without gaps, `hash_version` is 1 in every
+block and `closed_at_us` never decreases. Each block's transactions
+(`ledger_tx`, not readable by PUBLIC) and entries (`ledger_entry`) are then
+checked against `tx_merkle_root` as in "Block tree" and "Transaction tree".
 
 What this does: a digest or proof of one ledger is not accepted as belonging
 to another, and two ledgers that were created independently have different
@@ -419,9 +719,12 @@ block_hash = SHA256(0x13 || u16 hash_version || u64 height || prev_hash
                     || tx_merkle_root || u32 tx_count || i64 closed_at)
 ```
 
-where `closed_at` is the timestamp in microseconds since 2000-01-01 00:00:00
-UTC (the internal value of `timestamptz`; `kingres.ledger_timestamptz_us`
-returns it), and `prev_hash` is `SHA256(0x14 || chain_id)` for height 0.
+The input is 87 bytes (`1 + 2 + 8 + 32 + 32 + 4 + 8`). `closed_at` is the
+timestamp in microseconds since 2000-01-01 00:00:00 UTC (the internal value of
+`timestamptz`; `kingres.ledger_timestamptz_us` returns it, and the proof
+carries it as `closed_at_us`), and `prev_hash` is `SHA256(0x14 || chain_id)`
+for height 0. The block transaction leaf data is `1 + 8 + 4 + 32 + 2 + n` =
+47 + `n` bytes for a user name of `n` bytes.
 
 **Block time.** `closed_at` is the clock of the database server when the
 block was built. It never goes back: the builder uses the `closed_at` of the
@@ -433,17 +736,67 @@ is evidence only relative to an external anchor (a digest that is stored with
 a timestamp from a source you trust); inside the database it is the word of the
 server.
 
+**JSON.** Digests and proofs are JSON documents (the server holds and
+produces them as `jsonb`, so the order of the members and the white space are
+not significant: `jsonb` sorts the members and normalises the spacing, and a
+verifier must not depend on either). Hex strings are lower case and exactly
+64 digits for a 32-byte value (upper case digits are accepted by the server;
+a verifier may be strict). Rules that apply to every number of a digest or a
+proof:
+
+- A number must be an integer in the range given below. A number that is not
+  an integer in value (`1.5`) is rejected; one that is out of range is
+  rejected. The server function receives `jsonb`, which has already parsed the
+  number: leading zeros and a plus sign are not JSON and fail when the text is
+  turned into `jsonb`, and a number that is integral in value is accepted
+  whatever its spelling (`1.0`, `1e2` and `-0` are read as `1`, `100` and `0`).
+  The server writes plain decimal integers only; an independent verifier that
+  works on the text may, and should, reject any other spelling.
+- Ranges: `table_id`, `seq`, `entry_index`, `tx_index`, `entry_count` and
+  `tx_count` are 32-bit signed integers (0 to 2147483647), with `entry_count`
+  at least 1, `entry_index < entry_count` and `tx_index < block.tx_count`
+  (so `block.tx_count` is at least 1); `ledger_txid` and `height` (also the
+  height of a digest) are 64-bit signed integers (0 to 9223372036854775807);
+  `closed_at_us` is a 64-bit signed integer; `hash_version` and `format` must
+  be exactly 1. The `tx_count` of an element of `chain` may be 0 to
+  2147483647.
+- Members: **every member shown in the example is required**, except
+  `relation` (informational) and `block_hash` in the elements of `chain`
+  (optional; when present it must be a well-formed hash and is checked against
+  the recomputed one; a malformed value is an error, not an absent member).
+  Unknown members are ignored. A member of the wrong JSON type is an error.
+  The server cannot see a repeated member (`jsonb` keeps the last value of a
+  key); an independent verifier that reads the text must reject an object that
+  has the same key twice.
+
 **Digest.** A JSON object; `chain_id`, `height` and `block_hash` (lower case hex
-of the bytes) are what verifiers use:
+of the bytes) are what `ledger_verify_digest` and `ledger_verify_proof` read
+and require; the others are informational and not authenticated:
 
 ```json
-{"database": "...", "chain_id": "3f1c...", "hash_version": 1, "height": 12,
- "block_hash": "e3b0...", "block_closed_at": "2026-11-14T10:20:30.123456Z",
+{"database": "shop", "chain_id": "3f1c...", "hash_version": 1, "height": 8,
+ "block_hash": "e3b0...", "block_closed_at": "2026-11-14T10:20:31.000000Z",
  "generated_at": "2026-11-14T10:21:00.000000Z"}
 ```
 
-**Inclusion proof.** A JSON object (hex is lower case; numbers are JSON
-integers: a number with a fractional part, or outside the range, is rejected):
+`block_closed_at` is the `closed_at` of block `height` and `generated_at` the
+server time when the digest was made, both RFC 3339 timestamps in UTC with six
+digits of microseconds and a `Z`; `block_closed_at` equals `closed_at_us` of
+that block (here 847966831000000), and a verifier that holds the block header
+may check it (the server does not look at it). `generated_at`, `database`
+and `hash_version` are not read by the server's checks; generated digests
+always have `hash_version` 1, and a verifier should require it. An empty
+ledger has no block, so `ledger_generate_digest()` returns NULL for it: there
+is no digest, and no proof, until the first block exists.
+
+*Several digests of one chain*, taken at different times, are consistent when:
+they have the same `chain_id`; two digests with the same `height` have the same
+`block_hash`; and of two digests with different heights the one with the larger
+height has a `block_closed_at` that is not smaller. `ledger_verify_digest`
+checks one digest against the stored chain; the comparison of a set of stored
+digests is the job of whoever stores them.
+
+**Inclusion proof.** A JSON object (the rules above apply):
 
 ```json
 {"format": 1, "chain_id": "3f1c...", "relation": "public.t", "table_id": 3,
@@ -452,20 +805,23 @@ integers: a number with a fractional part, or outside the range, is rejected):
  "tx_root": "<hex>", "user_name": "alice", "tx_index": 2, "tx_path": ["<hex>", ...],
  "block": {"height": 7, "hash_version": 1, "prev_hash": "<hex>",
            "tx_merkle_root": "<hex>", "tx_count": 4,
-           "closed_at_us": 816000000000000, "block_hash": "<hex>"},
+           "closed_at_us": 847966830123456, "block_hash": "<hex>"},
  "chain": [{"height": 8, "hash_version": 1, "prev_hash": "<hex>",
             "tx_merkle_root": "<hex>", "tx_count": 1,
-            "closed_at_us": 816000000000001, "block_hash": "<hex>"}, ...]}
+            "closed_at_us": 847966831000000, "block_hash": "<hex>"}, ...]}
 ```
 
-`entry_index` is the position of the entry among the entries of its
-transaction in `seq` order (not the value of `seq`, which may have gaps);
-`tx_index` is the position of the transaction in its block; `chain` lists the
-headers of the blocks after the proof's block up to the latest block at the
-time the proof was made. `relation` is informational. `table_id` is a local
-number that is part of the row encoding and of the entry leaf, so the proof
-binds the table: a proof for a row of one table does not verify as a proof for
-the same bytes in another table.
+`op` is `"I"` or `"D"` (a one-character string; any other value is
+rejected); a proof of a `D` entry proves that the row version with that
+`row_hash` was removed in that transaction. `entry_index` is the position of
+the entry among the entries of its transaction in `seq` order (not the value
+of `seq`, which may have gaps); `tx_index` is the position of the transaction
+in its block; `chain` lists the headers of the blocks after the proof's block
+up to the latest block at the time the proof was made. `relation` is
+informational. `table_id` is a local number that is part of the row encoding
+and of the entry leaf, so the proof binds the table: a proof for a row of one
+table does not verify as a proof for the same bytes in another table.
+`user_name` is the UTF-8 name described under "Which user".
 
 **What a proof proves, and what the verifier must do.** A proof says that an
 entry with this `row_hash` and this `table_id` is in the ledger. It cannot know
@@ -473,35 +829,50 @@ the row. To learn that a row you hold is in the ledger, **recompute the row
 hash from that row** (encode it as above with the `table_id` of the proof, or
 call `ledger_row_hash` on a server that has the table) and compare it with the
 `row_hash` of the proof; the four-argument `ledger_verify_proof` does that
-comparison for the caller. An independent verifier, given a trusted digest
-`(C, H, D)` (chain identity, height, block hash):
+comparison for the caller, and the five-argument form also fixes the
+operation. An independent verifier, given a trusted digest `(C, H, D)` (chain
+identity, height, block hash):
 
-0. checks that the `chain_id` of the proof is `C`, and, for the row it holds,
-   that `row_hash` is the hash it computed and `table_id` is the table it
-   means;
+0. checks that the proof is well formed (the rules under "JSON"), that
+   `format` is 1, that `op` is `I` or `D` (and the one it expects), that the
+   `chain_id` of the proof is `C`, and, for the row it holds, that `row_hash`
+   is the hash it computed and `table_id` is the table it means;
 1. computes `e = leaf_hash(0x11 || u32 seq || u32 table_id || u8 op || row_hash)`
    and checks that the audit path `entry_path` leads from `e`, at index
-   `entry_index` in a tree of `entry_count` leaves, to `tx_root`;
+   `entry_index` in a tree of `entry_count` leaves, to `tx_root`; the path has
+   at most 64 hashes, the tree has at least one leaf and the index is smaller
+   than the size;
 2. computes `t = leaf_hash(0x12 || u64 ledger_txid || u32 entry_count || tx_root ||
-   u16 n || user_name)` (`user_name` from the proof, UTF-8, `n` its length) and
-   checks that `tx_path` leads from `t`, at index `tx_index` in a tree of
-   `block.tx_count` leaves, to `block.tx_merkle_root`;
-3. recomputes the block hash from the header fields of `block` (it must equal
-   `block.block_hash`; for height 0 the `prev_hash` must be `SHA256(0x14 || C)`);
-4. if `block.height == H`, checks that this hash equals `D`; if `H` is greater,
-   walks `chain`: the element for height `h + 1` must have `prev_hash` equal to
-   the hash of the block at `h`, a `closed_at_us` not smaller than that of the
-   block at `h`, and its own hash is recomputed the same way, until height `H`,
-   whose recomputed hash must equal `D`; if `H` is smaller than `block.height`
-   the digest is too old to prove anything about this block and the check
-   fails.
+   u16 n || user_name)` (`user_name` from the proof, in UTF-8, at most 255
+   bytes, valid UTF-8, `n` its length) and checks that `tx_path` leads from
+   `t`, at index `tx_index` in a tree of `block.tx_count` leaves, to
+   `block.tx_merkle_root` (the same bounds);
+3. recomputes the block hash from the header fields of `block` (`hash_version`
+   must be 1; the hash must equal `block.block_hash`; for height 0 the
+   `prev_hash` must be `SHA256(0x14 || C)`);
+4. if `block.height == H`, checks that this hash equals `D` (and ignores
+   `chain`); if `H` is greater, walks `chain`: the element for height `h + 1`
+   must have `hash_version` 1, `prev_hash` equal to the hash of the block at
+   `h`, a `closed_at_us` not smaller than that of the block at `h`, and its own
+   hash is recomputed the same way (and must equal its `block_hash` when it has
+   one), until height `H`, whose recomputed hash must equal `D`; if `H` is
+   smaller than `block.height`, or `chain` ends before `H`, the check fails.
+   **Elements of `chain` with a height greater than `H` are not used**: they
+   are parsed under the same rules (a malformed one makes the proof invalid)
+   but their links and hashes are not checked, because a proof made after the
+   digest legitimately has them and they say nothing about the digest. So a
+   proof is valid against any digest whose height is at least the proof's block
+   height and at most the height of the last element of `chain`, and a change
+   to an element beyond `H` is not detected by the digest of height `H`.
 
 The tree sizes (`entry_count`, `block.tx_count`) are authenticated by the
 transaction leaf and by the block hash respectively; an audit path alone does
-not authenticate the size of its tree. A proof for a row that is in a block
-older than the digest needs the chain of headers in between, so its size is
-linear in the number of blocks between them.
-
+not authenticate the size of its tree (a path built for a tree of `n` leaves
+also verifies at some indexes of a tree of `n + 1` leaves, which is why the
+sizes come from the authenticated values and the index must be checked against
+them). A proof for a row that is in a block older than the digest needs the
+chain of headers in between, so its size is linear in the number of blocks
+between them.
 ## Protection against being switched off
 
 Two layers enforce the rules, both for every role including superusers, both
@@ -536,6 +907,21 @@ calls the previous hook.
 A table is "under ledger control" for the hook when it is registered in
 `kingres.ledger_table` or its capture trigger is `ENABLE ALWAYS` (`ledger_enable`
 arms that trigger before it registers the table).
+
+**The history table** of an updatable table is part of the ledger: the hook
+treats it like a table of the ledger catalog (registered as `history_relid` in
+`kingres.ledger_table`; it is not a member of the extension, so the registry is
+what identifies it). Every `ALTER TABLE`, rename, `SET SCHEMA`, `DROP`, index,
+trigger, rule or policy on it is rejected, and so is every `GRANT` other than
+`SELECT` (the extension's own `ALTER TABLE ... ADD COLUMN` that follows an `ADD
+COLUMN` of the table goes through a flag that only `ledger_history_sync`
+sets). Dropping its columns or the table, or rewriting it, is rejected by the
+event triggers too, and so is any state of it that is not what `ledger_enable`
+made (a missing trigger, a constraint, an index, a column that does not belong,
+different column types or order). The updatable table itself is protected like
+an append-only one, with the capture trigger of the other shape (`AFTER INSERT
+OR UPDATE OR DELETE`), no blocking trigger for update and delete, and the
+names `ledger_txid`, `ledger_seq` and `ledger_op` forbidden for columns.
 
 **Names are resolved once, with the lock.** A statement resolves the names in it
 again after the hook has looked at them. If the hook only looked, a concurrent
@@ -622,14 +1008,64 @@ the database can see.
   registered), and `ledger_verify` reports the capture trigger of an unregistered
   table. Use physical backups and standbys.
 - The clock: block times are the server's clock, kept from going backwards.
+- **Updatable tables.** Everything that changes a row through SQL fires the
+  capture trigger, which is `ENABLE ALWAYS`; the ways around it are the ones
+  above (catalog edits, event triggers off for the `ADD COLUMN` follow-up,
+  file level) and these, each detected by `ledger_verify` after the fact:
+  a current row changed, removed or put back (an old version as the current row)
+  without entries; a history row changed, removed, duplicated, invented or
+  with another operation; a `D` entry removed together with its history row
+  (the transaction root of the block no longer matches, and the table no longer
+  equals its entries); an entry turned from `I` into `D` or back. Against a
+  digest taken before the change all of these are detected, including a
+  consistent rewrite of the entries, the blocks and the history table. What the
+  verification cannot tell is whether a legitimate-looking change was
+  authorised.
+- **With `event_triggers = off`** an `ALTER TABLE ... ADD COLUMN` on an updatable
+  table does not extend its history table. The next `UPDATE` or `DELETE` of the
+  table then fails (the capture function refuses a history table that lacks a
+  column), so nothing is recorded wrongly, and `ledger_verify` reports
+  `history_columns`; inserts, which write no history row, continue.
+- **The workers** can be switched off (`kingres_ledger.block_interval = 0`, a
+  failed launcher, `max_worker_processes` exhausted, a standby): blocks are then
+  built only when something calls `ledger_build_block()`, and the window
+  before a transaction is in a block grows. `kingres.ledger_status` shows the
+  number of pending transactions and the age of the oldest; nothing raises an
+  alarm by itself. `ledger_pending.queued_at` (like the rest of the work queue) is
+  not covered by any hash.
+- **The records for operators** (`ledger_digest`, `ledger_verification`) are in
+  the database: whoever rewrites the chain can write fitting records. A
+  `clean` verification run proves nothing about the past unless the digest it
+  was checked against was kept outside; the `ledger_verify` function and its
+  recorded runs are only as honest as the functions (see "The bodies of the
+  functions"). The view `ledger_status` is not checked by `ledger_verify`
+  (the hook rejects replacing or dropping it).
+- **Reading**: the history table holds the old versions of rows, protected by
+  its privileges only (the owner of the table can read it, nobody else
+  unless granted); row security and column privileges of the table do not
+  apply to it.
+- **Dump and restore** does not restore the history tables either (`pg_dump`
+  would dump them; inserting into them fails, as no trigger allows it).
 - Anything that reads: the ledger protects the integrity of the data, not its
   confidentiality, and the row hashes of an entry reveal a row with little
   entropy to somebody who may read them (hence the privileges).
 
-## Limitations of this increment
+## Limitations of this version
 
-- Only `append_only` mode; no updatable tables, no client or server
-  signatures, no external anchoring, no per-shard aggregate digest.
+- No client or server signatures, no external anchoring, no per-shard
+  aggregate digest (phase 7). No conversion between the modes of a table, no
+  partitioned or inheriting tables, `TRUNCATE` is rejected for both modes.
+- A history table's name is `<table>_ledger_history` and must fit in 63 bytes.
+  An `UPDATE` that changes nothing writes two entries and a history row.
+  The history table has no indexes (the capture path writes it directly, and
+  the protection rejects an index on it), so a lookup by key scans it; copy
+  the rows somewhere else if you need to query the history often.
+- The capture code writes the history row through the table access method,
+  not through the executor: no trigger, rule, constraint or index of the
+  history table is involved (there must be none), and a value stored out of
+  line in the table is stored in the TOAST table of the history table.
+- `ledger_verify_recorded` cannot write a `running` record (see above), and the
+  `rows_checked` of a run is the number of entries of the blocks in its range.
 - `user_name` is covered by the hashes only once the transaction is in a block.
   In `ledger_pending`, before `ledger_build_block` has run, it can be changed
   without detection, like everything else in the window before a block and its

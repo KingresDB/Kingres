@@ -7,6 +7,7 @@ kingres_ledger_sources = files(
   'src/proof.c',
   'src/protect.c',
   'src/row_hash.c',
+  'src/worker.c',
 )
 
 if host_system == 'windows'
@@ -24,6 +25,8 @@ contrib_targets += kingres_ledger
 
 install_data(
   'kingres_ledger--0.1.sql',
+  'kingres_ledger--0.2.sql',
+  'kingres_ledger--0.1--0.2.sql',
   'kingres_ledger.control',
   kwargs: contrib_data_args,
 )
@@ -34,12 +37,15 @@ tests += {
   'bd': meson.current_build_dir(),
   'regress': {
     'sql': [
+      'ledger_setup',
       'ledger_hash',
       'ledger_capture',
       'ledger_verify',
       'ledger_protect',
       'ledger_format',
       'ledger_review',
+      'ledger_updatable',
+      'ledger_records',
       'ledger_privs',
     ],
     'regress_args': ['--temp-config', files('kingres_ledger.conf')],
@@ -55,6 +61,9 @@ tests += {
       't/004_races.pl',
       't/005_environments.pl',
       't/006_guard_without_hook.pl',
+      't/007_upgrade.pl',
+      't/008_updatable_concurrency.pl',
+      't/009_worker.pl',
     ],
   },
 }

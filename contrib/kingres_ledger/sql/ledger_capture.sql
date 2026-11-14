@@ -26,7 +26,7 @@ WHERE d.classid = 'pg_namespace'::regclass AND n.nspname = 'kingres'
 CREATE TABLE accounts (id int PRIMARY KEY, owner_name text NOT NULL, balance numeric(12,2) NOT NULL);
 INSERT INTO accounts VALUES (1, 'alice', 100.00), (2, 'bob', 50.50);
 
-SELECT kingres.ledger_enable('accounts', 'updatable');
+SELECT kingres.ledger_enable('accounts', 'bogus');
 SELECT kingres.ledger_enable(NULL);
 CREATE TEMP TABLE tmp_t (a int);
 SELECT kingres.ledger_enable('tmp_t');

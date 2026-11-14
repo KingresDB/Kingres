@@ -27,7 +27,13 @@
  * caller has to recompute the row hash from the row it holds.  A proof that
  * is malformed in any way is rejected by returning false, never by raising
  * an error, so callers can use the function on untrusted input.  Numbers
- * must be integers in range; a number with a fractional part is rejected.
+ * must be integers in range; a number that is not an integer in value is
+ * rejected.  "format" must be 1, "op" must be "I" or "D" (and the one the
+ * caller expects, for the forms that take it; the four-argument form expects
+ * "I"), a block header must have hash_version 1, and the headers of "chain"
+ * after the one the digest names are parsed under the same rules but not
+ * used.  The user name is covered in UTF-8: the name in the proof is in the
+ * database encoding and is converted, as ledger_block_tx_leaf does.
  *
  * Proof format (hash_version 1):
  *	  {"format":1, "chain_id":hex, "relation":text, "table_id":N,
@@ -52,6 +58,7 @@
 #include "postgres.h"
 
 #include "fmgr.h"
+#include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/fmgrprotos.h"
@@ -214,7 +221,21 @@ kl_json_header(JsonbContainer *obj, bool need_block_hash, KlHeader *h)
 		!kl_json_int(obj, "tx_count", &h->tx_count) ||
 		!kl_json_int(obj, "closed_at_us", &h->closed_at_us))
 		return false;
-	h->has_block_hash = kl_json_hash(obj, "block_hash", h->block_hash);
+	/*
+	 * block_hash is required in the header of the proof's own block and
+	 * optional in the elements of "chain"; when it is there it must be a
+	 * well-formed hash (a malformed one is an error, not an absent member).
+	 */
+	{
+		JsonbValue	bscratch;
+
+		if (kl_json_member(obj, "block_hash", &bscratch) != NULL)
+		{
+			if (!kl_json_hash(obj, "block_hash", h->block_hash))
+				return false;
+			h->has_block_hash = true;
+		}
+	}
 	if (need_block_hash && !h->has_block_hash)
 		return false;
 	if (h->height < 0 || h->tx_count < 0 || h->tx_count > PG_INT32_MAX ||
@@ -251,6 +272,8 @@ kl_chain_reaches_digest(JsonbContainer *proof, int64 start_height,
 	uint8		prev[KL_HASH_LEN];
 	int64		height = start_height;
 	int64		closed_at_us = start_closed_at_us;
+	bool		reached = false;
+	bool		matches = false;
 
 	if (arr == NULL || !JsonContainerIsArray(arr) || JsonContainerIsScalar(arr))
 		return false;
@@ -268,6 +291,15 @@ kl_chain_reaches_digest(JsonbContainer *proof, int64 start_height,
 		if (v.type != jbvBinary ||
 			!kl_json_header(v.val.binary.data, false, &h))
 			return false;
+
+		/*
+		 * Headers after the one the digest names are parsed strictly (a
+		 * proof made after the digest was taken has them) but not used: they
+		 * say nothing about the digest.
+		 */
+		if (reached)
+			continue;
+
 		if (h.height != height + 1 || memcmp(h.prev_hash, prev, KL_HASH_LEN) != 0)
 			return false;
 		/* Block time never goes backwards along the chain. */
@@ -280,11 +312,14 @@ kl_chain_reaches_digest(JsonbContainer *proof, int64 start_height,
 		closed_at_us = h.closed_at_us;
 		memcpy(prev, calc, KL_HASH_LEN);
 		if (height == digest_height)
-			return memcmp(calc, digest_hash, KL_HASH_LEN) == 0;
-		if (height > digest_height)
+		{
+			reached = true;
+			matches = (memcmp(calc, digest_hash, KL_HASH_LEN) == 0);
+		}
+		else if (height > digest_height)
 			return false;
 	}
-	return false;
+	return tok == WJB_END_ARRAY && reached && matches;
 }
 
 /*
@@ -296,9 +331,13 @@ kingres_ledger_verify_proof(PG_FUNCTION_ARGS)
 {
 	Jsonb	   *proof = PG_GETARG_JSONB_P(0);
 	Jsonb	   *digest = PG_GETARG_JSONB_P(1);
-	bool		have_expected = (PG_NARGS() == 4);
+	bool		have_expected = (PG_NARGS() >= 4);
 	int32		expected_table_id = 0;
 	const uint8 *expected_row_hash = NULL;
+	uint8		expected_op = KL_OP_INSERT;	/* the four-argument form: an I entry */
+	int64		format;
+	char	   *uname_utf8;
+	int			uname_len;
 	JsonbContainer *p = &proof->root;
 	JsonbContainer *d = &digest->root;
 	JsonbValue	scratch;
@@ -336,9 +375,15 @@ kingres_ledger_verify_proof(PG_FUNCTION_ARGS)
 		if (VARSIZE_ANY_EXHDR(eh) != KL_HASH_LEN)
 			PG_RETURN_BOOL(false);
 		expected_row_hash = (const uint8 *) VARDATA_ANY(eh);
+		if (PG_NARGS() == 5)
+			expected_op = (uint8) PG_GETARG_CHAR(4);
 	}
 
 	if (!JsonContainerIsObject(p) || !JsonContainerIsObject(d))
+		PG_RETURN_BOOL(false);
+
+	/* The proof format; "format" is required and must be 1. */
+	if (!kl_json_int(p, "format", &format) || format != 1)
 		PG_RETURN_BOOL(false);
 
 	/* The trusted digest, and the chain it belongs to. */
@@ -374,6 +419,10 @@ kingres_ledger_verify_proof(PG_FUNCTION_ARGS)
 	if (opv == NULL || opv->type != jbvString || opv->val.string.len != 1)
 		PG_RETURN_BOOL(false);
 	op = (uint8) opv->val.string.val[0];
+	/* Only the two operations of the ledger exist; the caller may ask for one. */
+	if ((op != KL_OP_INSERT && op != KL_OP_DELETE) ||
+		(have_expected && op != expected_op))
+		PG_RETURN_BOOL(false);
 
 	unamev = kl_json_member(p, "user_name", &uscratch);
 	if (unamev == NULL || unamev->type != jbvString ||
@@ -417,9 +466,19 @@ kingres_ledger_verify_proof(PG_FUNCTION_ARGS)
 		PG_RETURN_BOOL(false);
 
 	/* 2. transaction -> block transaction root */
+	/*
+	 * The name in the proof is in the database encoding; the hash covers it
+	 * in UTF-8, as ledger_block_tx_leaf computes it.
+	 */
+	uname_utf8 = (char *) pg_do_encoding_conversion((unsigned char *) pnstrdup(unamev->val.string.val,
+																			   unamev->val.string.len),
+													unamev->val.string.len,
+													GetDatabaseEncoding(), PG_UTF8);
+	uname_len = strlen(uname_utf8);
+	if (uname_len > KL_MAX_USER_NAME_BYTES)
+		PG_RETURN_BOOL(false);
 	kl_block_tx_leaf_hash(leaf, (uint64) ledger_txid, (uint32) entry_count,
-						  tx_root, (const uint8 *) unamev->val.string.val,
-						  unamev->val.string.len);
+						  tx_root, (const uint8 *) uname_utf8, uname_len);
 	if (!kl_merkle_verify_path(leaf, tx_index, header.tx_count, tx_path,
 							   n_tx_path, header.tx_root))
 		PG_RETURN_BOOL(false);

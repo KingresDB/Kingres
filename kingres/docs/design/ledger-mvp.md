@@ -402,8 +402,12 @@ No second-preimage or ambiguity flaw that requires a change of the format was
 found. The points that were checked:
 
 - Leaves and inner nodes of every tree are domain separated by the RFC 6962
-  prefix bytes. The row encoding, the transaction leaf (41 bytes) and the block
-  leaf (44 bytes) have different, fixed layouts and are never mixed in one tree.
+  prefix bytes. The row encoding, the entry leaf data (42 bytes: tag, `u32 seq`,
+  `u32 table_id`, `u8 op`, 32 bytes of row hash) and the block transaction leaf
+  data (47 bytes plus the user name: tag, `u64 ledger_txid`, `u32 entry_count`,
+  32 bytes of transaction root, `u16` name length) have different layouts and
+  are never mixed in one tree (corrected in 0.2: the counts used to say 41 and
+  44, from before the domain tags and the user name were added).
 - The row encoding is unambiguous: every variable-length item is length
   prefixed, the number of columns is explicit, and the table identity and the
   hash version are inside. Omitting NULL columns is intended; two rows that differ
@@ -412,10 +416,10 @@ found. The points that were checked:
 - An audit path does not authenticate the size of its tree. The sizes are
   authenticated one level up: the transaction leaf contains `entry_count`, and
   the block hash contains `tx_count`. `ledger_verify_proof` uses those values.
-- The block hash input starts with `0x0001` (version), so it has the same shape
-  as a leaf hash of data that starts with `0x01`; this does not matter because
-  the block hash input has a different length from any leaf data in a tree and
-  is never used inside a tree.
+- The block hash input starts with the tag `0x13` (the fix round replaced the
+  earlier remark that it started with the version `0x0001`) and is 87 bytes:
+  `1 + 2 + 8 + 32 + 32 + 4 + 8`. It is not used inside a tree and has the same
+  length as no leaf data.
 
 One weakness found in the first review is closed in hash version 1 (item 12 of
 the deviations). Weaknesses that remain:
@@ -527,3 +531,25 @@ above: switching event triggers off (`event_triggers = off`), a cooperating
 second role that moves a name under a statement that only the hook rejects
 (`RENAME COLUMN`, `ALTER COLUMN TYPE` without rewrite; detected by
 `ledger_verify`), and the replacement of a function body by catalog edits.
+
+## Notes of version 0.2 (format documentation, hash format unchanged)
+
+Added with version 0.2 after the independent verifier (`kingres/verifier`)
+was written from the README alone and listed gaps in the description of format
+version 1. The format did not change. The README of the extension is the
+reference and now says, in the section "Hash format version 1": the export of
+the block headers and where the chain identity comes from; that headers of
+`chain` beyond the height of the digest are parsed but not used; the ranges of
+the JSON integers, which members are required and how unknown and repeated
+members are treated; the formats of `block_closed_at` and `generated_at` and
+that an empty ledger has no digest; the edge cases of the row encoding
+(dropped and added columns, an empty value against NULL, the encoding of
+column names, limits); how to obtain the binary send bytes outside the server;
+the checks a verifier must make that were only implied; the encoding of the
+user name in a database that is not UTF-8 (the server's proof check converted
+nothing before 0.2, which was wrong for such a database and is fixed); and the
+rules that make a set of digests consistent. The operation `D` of version 0.2
+(`ledger_entry.op`, byte `0x44`, and the `op` member of a proof) adds a value
+to the entry leaf and changes no layout. The sizes above (entry leaf data 42
+bytes, block transaction leaf data 47 bytes plus the name, block hash input
+87 bytes) replace the stale ones in "Review of the hash formats".

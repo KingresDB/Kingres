@@ -1,0 +1,1226 @@
+-- ledger_updatable: updatable ledger tables (mode "updatable"): the history
+-- table, capture of UPDATE and DELETE, every statement path that changes a
+-- row (ON CONFLICT DO UPDATE, MERGE, foreign-key actions, triggers, COPY,
+-- session_replication_role, views, ...), verification, ADD COLUMN, proofs of I
+-- and D entries, the protection of the history table, the privileges, and the
+-- tamper cases an attacker with catalog access can perform.
+--
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+-- SPDX-License-Identifier: PostgreSQL
+SET search_path = public;
+\set VERBOSITY terse
+DROP ROLE IF EXISTS kl_u_owner;
+NOTICE:  role "kl_u_owner" does not exist, skipping
+DROP ROLE IF EXISTS kl_u_other;
+NOTICE:  role "kl_u_other" does not exist, skipping
+CREATE ROLE kl_u_owner;
+CREATE ROLE kl_u_other;
+GRANT USAGE ON SCHEMA public TO kl_u_owner, kl_u_other;
+GRANT CREATE ON SCHEMA public TO kl_u_owner;
+GRANT EXECUTE ON FUNCTION kingres.ledger_enable(regclass, text) TO kl_u_owner;
+-- Report of ledger_verify with the values that change from run to run masked.
+CREATE FUNCTION public.ureport() RETURNS TABLE (check_name text, object text, detail text)
+LANGUAGE sql AS $$
+    SELECT v.check_name,
+           regexp_replace(v.object, 'tx [0-9]+', 'tx N', 'g'),
+           regexp_replace(regexp_replace(regexp_replace(v.detail, '[0-9a-f]{64}', '<hash>', 'g'),
+                                         'tx [0-9]+', 'tx N', 'g'), 'seq [0-9]+', 'seq N', 'g')
+    FROM kingres.ledger_verify() v
+    ORDER BY 1, 2, 3
+$$;
+-- The entries of a table, one line each: the ordinal of the transaction, the
+-- position in it, the operation and which version of which row it stands for.
+CREATE FUNCTION public.uentries(t regclass, key text) RETURNS TABLE (tx int, seq int, op text, version text)
+LANGUAGE plpgsql AS $$
+BEGIN
+    RETURN QUERY EXECUTE format($q$
+        SELECT dense_rank() OVER (ORDER BY e.ledger_txid)::int,
+               (row_number() OVER (PARTITION BY e.ledger_txid ORDER BY e.seq) - 1)::int,
+               e.op::text,
+               COALESCE((SELECT 'cur ' || %1$s FROM %2$s r
+                          WHERE kingres.ledger_row_hash(r.*) = e.row_hash LIMIT 1),
+                        (SELECT 'old ' || %1$s FROM %2$s_ledger_history r
+                          WHERE kingres.ledger_history_row_hash(r.*) = e.row_hash LIMIT 1),
+                        '?')
+          FROM kingres.ledger_entry e JOIN kingres.ledger_table lt USING (table_id)
+         WHERE lt.relid = %3$L::regclass
+         ORDER BY e.ledger_txid, e.seq $q$, key, t, t);
+END $$;
+--------------------------------------------------------------------------
+-- Enabling, the history table
+--------------------------------------------------------------------------
+CREATE TABLE inv (id int PRIMARY KEY, item text NOT NULL, qty int, note text);
+INSERT INTO inv VALUES (1, 'bolt', 10, NULL), (2, 'nut', 20, 'n'), (3, 'screw', 30, NULL);
+SELECT kingres.ledger_enable('inv', 'updatable');
+ ledger_enable 
+---------------
+ 
+(1 row)
+
+SELECT t.mode, t.history_relid::regclass AS history FROM kingres.ledger_table t WHERE t.relid = 'inv'::regclass;
+   mode    |      history       
+-----------+--------------------
+ updatable | inv_ledger_history
+(1 row)
+
+-- the columns of the history table
+SELECT a.attnum, a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, a.atthasdef, a.attidentity
+FROM pg_attribute a WHERE a.attrelid = 'inv_ledger_history'::regclass AND a.attnum > 0 AND NOT a.attisdropped
+ORDER BY a.attnum;
+ attnum |   attname   | format_type | attnotnull | atthasdef | attidentity 
+--------+-------------+-------------+------------+-----------+-------------
+      1 | id          | integer     | f          | f         | 
+      2 | item        | text        | f          | f         | 
+      3 | qty         | integer     | f          | f         | 
+      4 | note        | text        | f          | f         | 
+      5 | ledger_txid | bigint      | f          | f         | 
+      6 | ledger_seq  | integer     | f          | f         | 
+      7 | ledger_op   | "char"      | f          | f         | 
+(7 rows)
+
+-- no constraints, indexes; two triggers, ENABLE ALWAYS
+SELECT (SELECT count(*) FROM pg_constraint WHERE conrelid = 'inv_ledger_history'::regclass) AS constraints,
+       (SELECT count(*) FROM pg_index WHERE indrelid = 'inv_ledger_history'::regclass) AS indexes;
+ constraints | indexes 
+-------------+---------
+           0 |       0
+(1 row)
+
+SELECT tgrelid::regclass, tgname, tgenabled FROM pg_trigger
+WHERE tgrelid IN ('inv'::regclass, 'inv_ledger_history'::regclass) AND NOT tgisinternal ORDER BY 1, 2;
+      tgrelid       |            tgname             | tgenabled 
+--------------------+-------------------------------+-----------
+ inv                | kingres_ledger_block_truncate | A
+ inv                | kingres_ledger_capture        | A
+ inv_ledger_history | kingres_ledger_block_insert   | A
+ inv_ledger_history | kingres_ledger_block_modify   | A
+ inv_ledger_history | kingres_ledger_block_truncate | A
+(5 rows)
+
+-- the existing rows were entered as I
+SELECT * FROM uentries('inv', 'r.id') ORDER BY tx, seq;
+ tx | seq | op | version 
+----+-----+----+---------
+  1 |   0 | I  | cur 1
+  1 |   1 | I  | cur 2
+  1 |   2 | I  | cur 3
+(3 rows)
+
+SELECT * FROM ureport();
+ check_name | object | detail 
+------------+--------+--------
+(0 rows)
+
+-- Not supported, with clear errors.
+SELECT kingres.ledger_enable('inv', 'append_only');
+ERROR:  table "inv" is a ledger table of mode "updatable"; converting it to "append_only" is not supported yet
+SELECT kingres.ledger_enable('inv', 'updatable');
+ERROR:  table "inv" is already under ledger control
+SELECT kingres.ledger_enable('docs', 'updatable');
+ERROR:  table "docs" is a ledger table of mode "append_only"; converting it to "updatable" is not supported yet
+CREATE TABLE clash (id int, ledger_seq int);
+SELECT kingres.ledger_enable('clash', 'updatable');
+ERROR:  column "ledger_seq" of table "clash" has the name of a column of the history table
+CREATE TABLE taken (id int);
+CREATE TABLE taken_ledger_history (x int);
+SELECT kingres.ledger_enable('taken', 'updatable');
+ERROR:  relation "taken_ledger_history" already exists
+CREATE TABLE a_table_with_a_long_name_that_fills_the_whole_identifier_space_xxx (id int);
+NOTICE:  identifier "a_table_with_a_long_name_that_fills_the_whole_identifier_space_xxx" will be truncated to "a_table_with_a_long_name_that_fills_the_whole_identifier_space_"
+SELECT kingres.ledger_enable('a_table_with_a_long_name_that_fills_the_whole_identifier_space_xxx', 'updatable');
+ERROR:  the name of the history table of "a_table_with_a_long_name_that_fills_the_whole_identifier_space_" would be longer than 63 bytes
+SELECT count(*) AS leftovers_of_failed_enables FROM kingres.ledger_table WHERE relid IN ('clash'::regclass, 'taken'::regclass);
+ leftovers_of_failed_enables 
+-----------------------------
+                           0
+(1 row)
+
+--------------------------------------------------------------------------
+-- INSERT, UPDATE, DELETE
+--------------------------------------------------------------------------
+INSERT INTO inv VALUES (4, 'washer', 40, NULL);
+UPDATE inv SET qty = 11 WHERE id = 1;
+DELETE FROM inv WHERE id = 3;
+SELECT * FROM uentries('inv', 'r.id') WHERE tx > 1 ORDER BY tx, seq;
+ tx | seq | op | version 
+----+-----+----+---------
+  2 |   0 | I  | cur 4
+  3 |   0 | D  | old 1
+  3 |   1 | I  | cur 1
+  4 |   0 | D  | old 3
+(4 rows)
+
+SELECT id, item, qty, ledger_op, ledger_txid IS NOT NULL AS has_tx, ledger_seq IS NOT NULL AS has_seq
+FROM inv_ledger_history ORDER BY id;
+ id | item  | qty | ledger_op | has_tx | has_seq 
+----+-------+-----+-----------+--------+---------
+  1 | bolt  |  10 | D         | t      | t
+  3 | screw |  30 | D         | t      | t
+(2 rows)
+
+-- every history row has the hash of its D entry
+SELECT count(*) AS history_rows, count(e.*) AS with_entry
+FROM inv_ledger_history h
+LEFT JOIN kingres.ledger_entry e ON e.ledger_txid = h.ledger_txid AND e.seq = h.ledger_seq
+     AND e.op = 'D' AND e.row_hash = kingres.ledger_history_row_hash(h.*);
+ history_rows | with_entry 
+--------------+------------
+            2 |          2
+(1 row)
+
+SELECT count(*) AS problems FROM kingres.ledger_verify();
+ problems 
+----------
+        0
+(1 row)
+
+-- An UPDATE that changes nothing still writes D and I.
+UPDATE inv SET qty = qty WHERE id = 2;
+SELECT op, version FROM uentries('inv', 'r.id') ORDER BY tx DESC, seq LIMIT 2;
+ op | version 
+----+---------
+ D  | cur 2
+ I  | cur 2
+(2 rows)
+
+-- Several changes to one row in one transaction.
+BEGIN;
+UPDATE inv SET qty = 21 WHERE id = 2;
+UPDATE inv SET qty = 22, note = 'm' WHERE id = 2;
+DELETE FROM inv WHERE id = 2;
+INSERT INTO inv VALUES (2, 'nut', 23, 'again');
+COMMIT;
+SELECT op, version FROM uentries('inv', 'r.id') ORDER BY tx DESC, seq LIMIT 7;
+ op | version 
+----+---------
+ D  | old 2
+ I  | old 2
+ D  | old 2
+ I  | old 2
+ D  | old 2
+ I  | cur 2
+ D  | old 2
+(7 rows)
+
+-- Rollback and savepoints leave nothing.
+SELECT count(*) AS history_before FROM inv_ledger_history \gset
+BEGIN;
+UPDATE inv SET qty = 0;
+DELETE FROM inv WHERE id = 1;
+ROLLBACK;
+BEGIN;
+UPDATE inv SET qty = 99 WHERE id = 1;
+SAVEPOINT s1;
+UPDATE inv SET qty = 98 WHERE id = 1;
+DELETE FROM inv WHERE id = 4;
+ROLLBACK TO s1;
+SAVEPOINT s2;
+UPDATE inv SET note = 'sp' WHERE id = 1;
+RELEASE s2;
+COMMIT;
+SELECT id, qty, note FROM inv ORDER BY id;
+ id | qty | note  
+----+-----+-------
+  1 |  99 | sp
+  2 |  23 | again
+  4 |  40 | 
+(3 rows)
+
+SELECT count(*) - :history_before AS history_rows_added_by_the_savepoint_transaction FROM inv_ledger_history;
+ history_rows_added_by_the_savepoint_transaction 
+-------------------------------------------------
+                                               2
+(1 row)
+
+SELECT count(*) AS problems FROM kingres.ledger_verify();
+ problems 
+----------
+        0
+(1 row)
+
+-- Rows are locked, not changed, by SELECT ... FOR UPDATE.
+SELECT count(*) AS entries_before FROM kingres.ledger_entry \gset
+SELECT id FROM inv ORDER BY id FOR UPDATE;
+ id 
+----
+  1
+  2
+  4
+(3 rows)
+
+SELECT count(*) - :entries_before AS entries_added_by_locking FROM kingres.ledger_entry;
+ entries_added_by_locking 
+--------------------------
+                        0
+(1 row)
+
+-- TRUNCATE is rejected.
+TRUNCATE inv;
+ERROR:  table "inv" is an updatable ledger table and cannot be truncated
+TRUNCATE inv, taken;
+ERROR:  table "inv" is an updatable ledger table and cannot be truncated
+SELECT count(*) AS problems FROM kingres.ledger_verify();
+ problems 
+----------
+        0
+(1 row)
+
+--------------------------------------------------------------------------
+-- Every statement path that changes a row
+--------------------------------------------------------------------------
+-- INSERT ... ON CONFLICT DO UPDATE / DO NOTHING
+INSERT INTO inv VALUES (1, 'bolt', 5, 'conflict') ON CONFLICT (id) DO UPDATE SET qty = inv.qty + EXCLUDED.qty;
+INSERT INTO inv VALUES (1, 'bolt', 5, 'nothing') ON CONFLICT (id) DO NOTHING;
+INSERT INTO inv VALUES (5, 'rivet', 1, NULL) ON CONFLICT (id) DO UPDATE SET qty = 1000;
+SELECT id, qty FROM inv WHERE id IN (1, 5) ORDER BY id;
+ id | qty 
+----+-----
+  1 | 104
+  5 |   1
+(2 rows)
+
+SELECT count(*) AS problems FROM kingres.ledger_verify();
+ problems 
+----------
+        0
+(1 row)
+
+-- MERGE: update, delete and insert in one statement
+MERGE INTO inv t
+USING (VALUES (1, 'bolt', 1), (4, 'washer', 0), (6, 'pin', 6), (7, 'cotter', 7)) AS s(id, item, qty)
+ON t.id = s.id
+WHEN MATCHED AND s.qty = 0 THEN DELETE
+WHEN MATCHED THEN UPDATE SET qty = s.qty, note = 'merged'
+WHEN NOT MATCHED THEN INSERT (id, item, qty) VALUES (s.id, s.item, s.qty);
+SELECT id, item, qty, note FROM inv ORDER BY id;
+ id |  item  | qty |  note  
+----+--------+-----+--------
+  1 | bolt   |   1 | merged
+  2 | nut    |  23 | again
+  5 | rivet  |   1 | 
+  6 | pin    |   6 | 
+  7 | cotter |   7 | 
+(5 rows)
+
+SELECT count(*) AS problems FROM kingres.ledger_verify();
+ problems 
+----------
+        0
+(1 row)
+
+-- UPDATE ... FROM, DELETE ... USING, RETURNING
+UPDATE inv SET qty = s.q FROM (VALUES (6, 66), (7, 77)) s(i, q) WHERE inv.id = s.i RETURNING inv.id, inv.qty;
+ id | qty 
+----+-----
+  6 |  66
+  7 |  77
+(2 rows)
+
+DELETE FROM inv USING (VALUES (7)) s(i) WHERE inv.id = s.i RETURNING inv.id;
+ id 
+----
+  7
+(1 row)
+
+SELECT count(*) AS problems FROM kingres.ledger_verify();
+ problems 
+----------
+        0
+(1 row)
+
+-- Through an updatable view
+CREATE VIEW inv_v AS SELECT * FROM inv WHERE id < 100;
+UPDATE inv_v SET qty = qty + 1 WHERE id = 6;
+DELETE FROM inv_v WHERE id = 6;
+INSERT INTO inv_v VALUES (8, 'view', 8, NULL);
+SELECT count(*) AS problems FROM kingres.ledger_verify();
+ problems 
+----------
+        0
+(1 row)
+
+-- COPY
+COPY inv FROM stdin;
+SELECT count(*) AS problems FROM kingres.ledger_verify();
+ problems 
+----------
+        0
+(1 row)
+
+-- session_replication_role = replica does not skip the triggers
+SET session_replication_role = replica;
+UPDATE inv SET qty = 91 WHERE id = 9;
+DELETE FROM inv WHERE id = 10;
+INSERT INTO inv VALUES (11, 'replica', 11, NULL);
+RESET session_replication_role;
+SELECT count(*) AS problems FROM kingres.ledger_verify();
+ problems 
+----------
+        0
+(1 row)
+
+-- A prepared transaction
+BEGIN;
+UPDATE inv SET qty = qty + 1 WHERE id = 9;
+PREPARE TRANSACTION 'kl_u_prepared';
+COMMIT PREPARED 'kl_u_prepared';
+SELECT count(*) AS problems FROM kingres.ledger_verify();
+ problems 
+----------
+        0
+(1 row)
+
+-- Foreign keys: ON DELETE CASCADE, ON UPDATE CASCADE and SET NULL actions
+-- change rows of an updatable table without a statement that names it.
+CREATE TABLE fk_parent (id int PRIMARY KEY);
+INSERT INTO fk_parent VALUES (1), (2), (3), (4);
+CREATE TABLE fk_child (id int PRIMARY KEY, p_cascade int REFERENCES fk_parent ON DELETE CASCADE ON UPDATE CASCADE,
+                       p_null int REFERENCES fk_parent ON DELETE SET NULL ON UPDATE SET NULL, v text);
+INSERT INTO fk_child VALUES (1, 1, 1, 'a'), (2, 2, 2, 'b'), (3, 3, 3, 'c'), (4, 4, 4, 'd');
+SELECT kingres.ledger_enable('fk_child', 'updatable');
+ ledger_enable 
+---------------
+ 
+(1 row)
+
+UPDATE fk_parent SET id = 20 WHERE id = 2;
+DELETE FROM fk_parent WHERE id = 3;
+DELETE FROM fk_parent WHERE id = 4;
+SELECT * FROM fk_child ORDER BY id;
+ id | p_cascade | p_null | v 
+----+-----------+--------+---
+  1 |         1 |      1 | a
+  2 |        20 |        | b
+(2 rows)
+
+SELECT count(*) AS history_rows FROM fk_child_ledger_history;
+ history_rows 
+--------------
+            4
+(1 row)
+
+SELECT count(*) AS problems FROM kingres.ledger_verify();
+ problems 
+----------
+        0
+(1 row)
+
+-- Triggers on the table that change the row before and after the capture
+CREATE TABLE trg (id int PRIMARY KEY, val text, note text);
+SELECT kingres.ledger_enable('trg', 'updatable');
+ ledger_enable 
+---------------
+ 
+(1 row)
+
+CREATE FUNCTION trg_before() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        IF OLD.id = 99 THEN RETURN NULL; END IF;
+        RETURN OLD;
+    END IF;
+    NEW.val := NEW.val || '!';
+    RETURN NEW;
+END $$;
+CREATE TRIGGER trg_before BEFORE INSERT OR UPDATE OR DELETE ON trg
+    FOR EACH ROW EXECUTE FUNCTION trg_before();
+-- An AFTER trigger that sorts before the capture trigger and one that sorts
+-- after it; both update the row again.
+CREATE FUNCTION trg_after() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.note IS DISTINCT FROM TG_ARGV[0] THEN
+        UPDATE trg SET note = TG_ARGV[0] WHERE id = NEW.id AND note IS DISTINCT FROM TG_ARGV[0];
+    END IF;
+    RETURN NULL;
+END $$;
+CREATE TRIGGER a_first AFTER INSERT OR UPDATE ON trg FOR EACH ROW WHEN (NEW.id < 50) EXECUTE FUNCTION trg_after('first');
+CREATE TRIGGER z_last AFTER INSERT OR UPDATE ON trg FOR EACH ROW WHEN (NEW.id >= 50) EXECUTE FUNCTION trg_after('last');
+INSERT INTO trg VALUES (1, 'one', NULL), (50, 'fifty', NULL), (99, 'ninety-nine', NULL);
+UPDATE trg SET val = 'uno' WHERE id = 1;
+UPDATE trg SET val = 'cincuenta' WHERE id = 50;
+DELETE FROM trg WHERE id = 99;
+DELETE FROM trg WHERE id = 1;
+SELECT id, val, note FROM trg ORDER BY id;
+ id |      val      | note 
+----+---------------+------
+ 50 | cincuenta!    | last
+ 99 | ninety-nine!! | last
+(2 rows)
+
+SELECT count(*) AS problems FROM kingres.ledger_verify();
+ problems 
+----------
+        0
+(1 row)
+
+SELECT op, count(*) FROM uentries('trg', 'r.id') GROUP BY op ORDER BY op;
+ op | count 
+----+-------
+ D  |     6
+ I  |     8
+(2 rows)
+
+-- Data-modifying CTEs, and a domain and an enum column
+CREATE DOMAIN posint AS int CHECK (VALUE > 0);
+CREATE TABLE typ2 (id int PRIMARY KEY, c color, d posint, tags text[]);
+INSERT INTO typ2 VALUES (1, 'red', 5, '{a,b}'), (2, 'green', 6, NULL);
+SELECT kingres.ledger_enable('typ2', 'updatable');
+ ledger_enable 
+---------------
+ 
+(1 row)
+
+WITH u AS (UPDATE typ2 SET d = d + 1 WHERE id = 1 RETURNING id)
+UPDATE typ2 SET c = 'red' WHERE id = 2 AND EXISTS (SELECT 1 FROM u);
+WITH d AS (DELETE FROM typ2 WHERE id = 1 RETURNING *)
+INSERT INTO typ2 SELECT id + 10, c, d, tags FROM d;
+UPDATE typ2 SET d = 0 WHERE id = 11;
+ERROR:  value for domain posint violates check constraint "posint_check"
+SELECT id, c, d FROM typ2 ORDER BY id;
+ id |  c  | d 
+----+-----+---
+  2 | red | 6
+ 11 | red | 6
+(2 rows)
+
+SELECT count(*) AS problems FROM kingres.ledger_verify();
+ problems 
+----------
+        0
+(1 row)
+
+SELECT count(*) AS history_rows FROM typ2_ledger_history;
+ history_rows 
+--------------
+            3
+(1 row)
+
+-- Many types, values stored out of line, NULLs: the history row hashes like the entry
+CREATE TABLE typ (id int PRIMARY KEY, n numeric(12,2), ts timestamptz, d date, b boolean, big text, big2 text,
+                  ba bytea, j jsonb, arr int[], u uuid, f float8, iv interval, bits varbit, c char(5), e text);
+ALTER TABLE typ ALTER COLUMN big SET STORAGE EXTERNAL;
+SELECT kingres.ledger_enable('typ', 'updatable');
+ ledger_enable 
+---------------
+ 
+(1 row)
+
+INSERT INTO typ
+SELECT g, g * 1.25, '2026-11-14 10:20:30.123456+00', '2026-11-14', g % 2 = 0,
+       (SELECT string_agg(md5(i::text), '') FROM generate_series(1, 2000) i),
+       repeat('compressible ', 5000), '\xdeadbeef', '{"a": [1, 2, {"b": null}]}', ARRAY[1, 2, NULL, 4],
+       '123e4567-e89b-12d3-a456-426614174000', CASE g WHEN 1 THEN 'NaN'::float8 ELSE -0.0 END,
+       '1 year 2 days 03:04:05', B'1011', 'ab', ''
+FROM generate_series(1, 3) g;
+UPDATE typ SET n = n + 1, e = NULL WHERE id < 3;
+UPDATE typ SET big = big || 'x' WHERE id = 3;
+DELETE FROM typ WHERE id = 1;
+UPDATE typ SET j = NULL, arr = NULL, ba = '\x', c = NULL WHERE id = 2;
+SELECT count(*) AS problems FROM kingres.ledger_verify();
+ problems 
+----------
+        0
+(1 row)
+
+SELECT count(*) AS history_rows, bool_and(kingres.ledger_history_row_hash(h.*) IN
+       (SELECT row_hash FROM kingres.ledger_entry WHERE op = 'D')) AS all_hash_to_a_d_entry
+FROM typ_ledger_history h;
+ history_rows | all_hash_to_a_d_entry 
+--------------+-----------------------
+            5 | t
+(1 row)
+
+--------------------------------------------------------------------------
+-- ADD COLUMN reaches the history table
+--------------------------------------------------------------------------
+ALTER TABLE inv ADD COLUMN extra text;
+ALTER TABLE inv ADD COLUMN extra2 numeric(5,1), ADD COLUMN extra3 int[];
+SELECT a.attnum, a.attname, format_type(a.atttypid, a.atttypmod)
+FROM pg_attribute a WHERE a.attrelid = 'inv_ledger_history'::regclass AND a.attnum > 4 AND NOT a.attisdropped
+ORDER BY a.attnum;
+ attnum |   attname   | format_type  
+--------+-------------+--------------
+      5 | ledger_txid | bigint
+      6 | ledger_seq  | integer
+      7 | ledger_op   | "char"
+      8 | extra       | text
+      9 | extra2      | numeric(5,1)
+     10 | extra3      | integer[]
+(6 rows)
+
+UPDATE inv SET extra = 'new', extra2 = 1.5, extra3 = '{1}' WHERE id = 1;
+DELETE FROM inv WHERE id = 5;
+SELECT id, extra, extra2, extra3 FROM inv_ledger_history ORDER BY ledger_txid DESC, ledger_seq LIMIT 3;
+ id | extra | extra2 | extra3 
+----+-------+--------+--------
+  5 |       |        | 
+  1 |       |        | 
+  9 |       |        | 
+(3 rows)
+
+SELECT count(*) AS problems FROM kingres.ledger_verify();
+ problems 
+----------
+        0
+(1 row)
+
+-- Rejected: a default, NOT NULL, the history columns' names, a column of an unsupported type
+ALTER TABLE inv ADD COLUMN bad int DEFAULT 1;
+ERROR:  cannot add a column with a default or a constraint to table "inv": it is a ledger table
+ALTER TABLE inv ADD COLUMN bad int NOT NULL;
+ERROR:  cannot add a column with a default or a constraint to table "inv": it is a ledger table
+ALTER TABLE inv ADD COLUMN ledger_op text;
+ERROR:  cannot add a column named like a column of the history table to table "inv": it is a ledger table
+ALTER TABLE inv ADD COLUMN ledger_txid bigint;
+ERROR:  cannot add a column named like a column of the history table to table "inv": it is a ledger table
+ALTER TABLE inv ADD COLUMN bad pair;
+ERROR:  the statement leaves the ledger broken (column: public.inv: column "bad" has a composite type, which is not supported yet)
+CREATE TYPE upair AS (x int, y int);
+ALTER TABLE inv ADD COLUMN bad upair;
+ERROR:  the statement leaves the ledger broken (column: public.inv: column "bad" has a composite type, which is not supported yet)
+SELECT count(*) AS problems FROM kingres.ledger_verify();
+ problems 
+----------
+        0
+(1 row)
+
+-- A transaction that adds a column and writes in the same transaction
+BEGIN;
+ALTER TABLE inv ADD COLUMN extra4 text;
+UPDATE inv SET extra4 = 'same tx' WHERE id = 1;
+DELETE FROM inv WHERE id = 6;
+COMMIT;
+SELECT count(*) AS problems FROM kingres.ledger_verify();
+ problems 
+----------
+        0
+(1 row)
+
+-- ... and one that rolls back
+BEGIN;
+ALTER TABLE inv ADD COLUMN extra5 text;
+ROLLBACK;
+SELECT count(*) AS history_has_extra5 FROM pg_attribute WHERE attrelid = 'inv_ledger_history'::regclass AND attname = 'extra5';
+ history_has_extra5 
+--------------------
+                  0
+(1 row)
+
+SELECT count(*) AS problems FROM kingres.ledger_verify();
+ problems 
+----------
+        0
+(1 row)
+
+--------------------------------------------------------------------------
+-- Protection of the history table and of the updatable table
+--------------------------------------------------------------------------
+\set VERBOSITY sqlstate
+-- Rows of the history table cannot be changed, even by a superuser.
+UPDATE inv_ledger_history SET qty = 0;
+ERROR:  KL001
+DELETE FROM inv_ledger_history;
+ERROR:  KL001
+TRUNCATE inv_ledger_history;
+ERROR:  KL001
+INSERT INTO inv_ledger_history (id, item) VALUES (1000, 'forged');
+ERROR:  KL001
+-- DDL on it
+DROP TABLE inv_ledger_history;
+ERROR:  KL002
+DROP TABLE inv_ledger_history CASCADE;
+ERROR:  KL002
+ALTER TABLE inv_ledger_history ADD COLUMN y int;
+ERROR:  KL002
+ALTER TABLE inv_ledger_history DROP COLUMN qty;
+ERROR:  KL002
+ALTER TABLE inv_ledger_history RENAME COLUMN qty TO q;
+ERROR:  KL002
+ALTER TABLE inv_ledger_history RENAME TO other_name;
+ERROR:  KL002
+ALTER TABLE inv_ledger_history SET SCHEMA pg_catalog;
+ERROR:  KL002
+ALTER TABLE inv_ledger_history OWNER TO kl_u_owner;
+ERROR:  KL002
+ALTER TABLE inv_ledger_history ALTER COLUMN qty TYPE bigint;
+ERROR:  KL002
+ALTER TABLE inv_ledger_history DISABLE TRIGGER ALL;
+ERROR:  KL002
+ALTER TABLE inv_ledger_history DISABLE TRIGGER kingres_ledger_block_modify;
+ERROR:  KL002
+ALTER TABLE inv_ledger_history ENABLE TRIGGER kingres_ledger_block_modify;
+ERROR:  KL002
+ALTER TABLE inv_ledger_history SET UNLOGGED;
+ERROR:  KL002
+ALTER TABLE inv_ledger_history ADD PRIMARY KEY (id, ledger_txid);
+ERROR:  KL002
+ALTER TABLE inv_ledger_history ENABLE ROW LEVEL SECURITY;
+ERROR:  KL002
+ALTER TABLE inv_ledger_history INHERIT inv;
+ERROR:  KL002
+CREATE INDEX ON inv_ledger_history (id);
+ERROR:  KL002
+CREATE TRIGGER x AFTER INSERT ON inv_ledger_history FOR EACH ROW EXECUTE FUNCTION trg_after('x');
+ERROR:  KL002
+DROP TRIGGER kingres_ledger_block_modify ON inv_ledger_history;
+ERROR:  KL002
+CREATE RULE r AS ON INSERT TO inv_ledger_history DO INSTEAD NOTHING;
+ERROR:  KL002
+CREATE POLICY p ON inv_ledger_history USING (true);
+ERROR:  KL002
+CREATE TABLE child_of_history () INHERITS (inv_ledger_history);
+ERROR:  KL002
+CREATE VIEW hist_v AS SELECT * FROM inv_ledger_history;
+DROP VIEW hist_v;
+-- privileges: only SELECT can be granted
+GRANT INSERT ON inv_ledger_history TO kl_u_other;
+ERROR:  KL002
+GRANT ALL ON inv_ledger_history TO kl_u_other;
+ERROR:  KL002
+REVOKE ALL ON inv_ledger_history FROM CURRENT_USER;
+ERROR:  KL002
+-- DROP of what holds it
+DROP SCHEMA public CASCADE;
+ERROR:  KL002
+DROP OWNED BY CURRENT_USER;
+ERROR:  KL002
+DROP TABLE inv;
+ERROR:  KL002
+DROP TABLE inv CASCADE;
+ERROR:  KL002
+ALTER TABLE inv DROP COLUMN extra;
+ERROR:  KL002
+ALTER TABLE inv DISABLE TRIGGER kingres_ledger_capture;
+ERROR:  KL002
+ALTER TABLE inv ENABLE TRIGGER kingres_ledger_capture;
+ERROR:  KL002
+ALTER TABLE inv ENABLE REPLICA TRIGGER kingres_ledger_capture;
+ERROR:  KL002
+DROP TRIGGER kingres_ledger_capture ON inv;
+ERROR:  KL002
+ALTER TRIGGER kingres_ledger_capture ON inv RENAME TO other;
+ERROR:  KL002
+CREATE OR REPLACE TRIGGER kingres_ledger_capture AFTER INSERT ON inv FOR EACH ROW EXECUTE FUNCTION trg_after('x');
+ERROR:  KL002
+ALTER TABLE inv RENAME COLUMN qty TO q;
+ERROR:  KL002
+ALTER TABLE inv ALTER COLUMN qty TYPE bigint;
+ERROR:  KL002
+ALTER TABLE inv SET UNLOGGED;
+ERROR:  KL002
+CREATE RULE r AS ON UPDATE TO inv DO INSTEAD NOTHING;
+ERROR:  KL002
+ALTER TABLE inv INHERIT trg;
+ERROR:  KL002
+CREATE TABLE child_of_inv () INHERITS (inv);
+ERROR:  KL002
+-- ENABLE ALWAYS is a trigger state change too
+ALTER TABLE inv ENABLE ALWAYS TRIGGER kingres_ledger_capture;
+ERROR:  KL002
+-- Internal functions: no grants, no direct calls
+GRANT EXECUTE ON FUNCTION kingres.ledger_history_sync(regclass, regclass) TO kl_u_other;
+ERROR:  KL002
+SET ROLE kl_u_other;
+SELECT kingres.ledger_history_sync('inv', 'inv_ledger_history');
+ERROR:  42501
+RESET ROLE;
+\set VERBOSITY terse
+SELECT count(*) AS problems FROM kingres.ledger_verify();
+ problems 
+----------
+        0
+(1 row)
+
+--------------------------------------------------------------------------
+-- Privileges: who can write the table, who can read the history
+--------------------------------------------------------------------------
+CREATE TABLE priv_t (id int PRIMARY KEY, v text);
+ALTER TABLE priv_t OWNER TO kl_u_owner;
+SET ROLE kl_u_owner;
+SELECT kingres.ledger_enable('priv_t', 'updatable');
+ ledger_enable 
+---------------
+ 
+(1 row)
+
+INSERT INTO priv_t VALUES (1, 'a'), (2, 'b');
+UPDATE priv_t SET v = 'a2' WHERE id = 1;
+DELETE FROM priv_t WHERE id = 2;
+SELECT id, v, ledger_op FROM priv_t_ledger_history ORDER BY id;
+ id | v | ledger_op 
+----+---+-----------
+  1 | a | D
+  2 | b | D
+(2 rows)
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON priv_t TO kl_u_other;
+SELECT count(*) FROM kingres.ledger_entry;
+ERROR:  permission denied for table ledger_entry
+RESET ROLE;
+SELECT relacl FROM pg_class WHERE oid = 'priv_t_ledger_history'::regclass;
+                     relacl                      
+-------------------------------------------------
+ {kingres=arwdDxtm/kingres,kl_u_owner=r/kingres}
+(1 row)
+
+SELECT pg_get_userbyid(relowner) AS history_owner_is_the_extension_owner_not_the_table_owner
+FROM pg_class WHERE oid = 'priv_t_ledger_history'::regclass;
+ history_owner_is_the_extension_owner_not_the_table_owner 
+----------------------------------------------------------
+ kingres
+(1 row)
+
+SET ROLE kl_u_other;
+UPDATE priv_t SET v = 'by other' WHERE id = 1;
+SELECT count(*) FROM priv_t_ledger_history;
+ERROR:  permission denied for table priv_t_ledger_history
+RESET ROLE;
+SELECT user_name FROM kingres.ledger_pending ORDER BY ledger_txid DESC LIMIT 1;
+ user_name  
+------------
+ kl_u_other
+(1 row)
+
+GRANT SELECT ON priv_t_ledger_history TO kl_u_other;
+SET ROLE kl_u_other;
+SELECT count(*) AS other_can_read_after_the_grant FROM priv_t_ledger_history;
+ other_can_read_after_the_grant 
+--------------------------------
+                              3
+(1 row)
+
+RESET ROLE;
+SELECT count(*) AS problems FROM kingres.ledger_verify();
+ problems 
+----------
+        0
+(1 row)
+
+--------------------------------------------------------------------------
+-- Blocks, digests, proofs of I and D entries
+--------------------------------------------------------------------------
+SELECT kingres.ledger_build_block() IS NOT NULL AS block_built;
+ block_built 
+-------------
+ t
+(1 row)
+
+SELECT kingres.ledger_generate_digest() AS dig \gset
+SELECT kingres.ledger_verify_digest(:'dig'::jsonb) AS digest_ok;
+ digest_ok 
+-----------
+ t
+(1 row)
+
+-- an I proof and a D proof for the same row version
+CREATE TABLE pr (id int PRIMARY KEY, v text);
+SELECT kingres.ledger_enable('pr', 'updatable');
+ ledger_enable 
+---------------
+ 
+(1 row)
+
+INSERT INTO pr VALUES (1, 'first');
+UPDATE pr SET v = 'second' WHERE id = 1;
+SELECT kingres.ledger_generate_digest() AS dig \gset
+SELECT kingres.ledger_history_row_hash(h.*) AS oldhash, t.table_id
+FROM pr_ledger_history h, kingres.ledger_table t WHERE t.relid = 'pr'::regclass \gset
+SELECT kingres.ledger_inclusion_proof('pr', :'oldhash'::bytea) AS pi \gset
+SELECT kingres.ledger_inclusion_proof('pr', :'oldhash'::bytea, 'D') AS pd \gset
+SELECT :'pi'::jsonb ->> 'op' AS i_op, :'pd'::jsonb ->> 'op' AS d_op;
+ i_op | d_op 
+------+------
+ I    | D
+(1 row)
+
+SELECT kingres.ledger_verify_proof(:'pi'::jsonb, :'dig'::jsonb) AS i_proof,
+       kingres.ledger_verify_proof(:'pd'::jsonb, :'dig'::jsonb) AS d_proof;
+ i_proof | d_proof 
+---------+---------
+ t       | t
+(1 row)
+
+-- the four-argument form is for I entries, the five-argument form says which
+SELECT kingres.ledger_verify_proof(:'pi'::jsonb, :'dig'::jsonb, :table_id, :'oldhash'::bytea) AS i_with_4_args,
+       kingres.ledger_verify_proof(:'pd'::jsonb, :'dig'::jsonb, :table_id, :'oldhash'::bytea) AS d_with_4_args,
+       kingres.ledger_verify_proof(:'pd'::jsonb, :'dig'::jsonb, :table_id, :'oldhash'::bytea, 'D') AS d_with_5_args,
+       kingres.ledger_verify_proof(:'pi'::jsonb, :'dig'::jsonb, :table_id, :'oldhash'::bytea, 'D') AS i_expected_as_d,
+       kingres.ledger_verify_proof(:'pd'::jsonb, :'dig'::jsonb, :table_id, :'oldhash'::bytea, 'I') AS d_expected_as_i;
+ i_with_4_args | d_with_4_args | d_with_5_args | i_expected_as_d | d_expected_as_i 
+---------------+---------------+---------------+-----------------+-----------------
+ t             | f             | t             | f               | f
+(1 row)
+
+-- the operation is covered by the hashes
+SELECT kingres.ledger_verify_proof(jsonb_set(:'pi'::jsonb, '{op}', '"D"'), :'dig'::jsonb) AS i_altered_to_d,
+       kingres.ledger_verify_proof(jsonb_set(:'pd'::jsonb, '{op}', '"I"'), :'dig'::jsonb) AS d_altered_to_i,
+       kingres.ledger_verify_proof(jsonb_set(:'pd'::jsonb, '{op}', '"X"'), :'dig'::jsonb) AS d_altered_to_x,
+       kingres.ledger_verify_proof(jsonb_set(:'pd'::jsonb, '{op}', '"DD"'), :'dig'::jsonb) AS op_too_long,
+       kingres.ledger_verify_proof(jsonb_set(:'pd'::jsonb, '{op}', '7'), :'dig'::jsonb) AS op_not_a_string,
+       kingres.ledger_verify_proof(:'pd'::jsonb - 'op', :'dig'::jsonb) AS op_missing,
+       kingres.ledger_verify_proof(jsonb_set(:'pd'::jsonb, '{format}', '2'), :'dig'::jsonb) AS format_2,
+       kingres.ledger_verify_proof(:'pd'::jsonb - 'format', :'dig'::jsonb) AS format_missing;
+ i_altered_to_d | d_altered_to_i | d_altered_to_x | op_too_long | op_not_a_string | op_missing | format_2 | format_missing 
+----------------+----------------+----------------+-------------+-----------------+------------+----------+----------------
+ f              | f              | f              | f           | f               | f          | f        | f
+(1 row)
+
+-- the current version has an I entry and no D entry
+SELECT kingres.ledger_row_hash(p.*) AS curhash FROM pr p \gset
+SELECT kingres.ledger_inclusion_proof('pr', :'curhash'::bytea, 'D');
+ERROR:  no ledger entry of operation D with this row hash for table "public.pr"
+SELECT kingres.ledger_inclusion_proof('pr', :'curhash'::bytea) IS NOT NULL AS current_version_has_i_proof;
+ current_version_has_i_proof 
+-----------------------------
+ t
+(1 row)
+
+SELECT kingres.ledger_inclusion_proof('pr', :'curhash'::bytea, 'X');
+ERROR:  operation must be I or D
+SELECT kingres.ledger_inclusion_proof('pr', :'curhash'::bytea, NULL);
+ERROR:  operation must be I or D
+-- a D entry for an append-only table does not exist
+SELECT kingres.ledger_inclusion_proof('docs', kingres.ledger_row_hash(d.*), 'D') FROM docs d LIMIT 1;
+ERROR:  no ledger entry of operation D with this row hash for table "public.docs"
+-- The headers in "chain": a proof made after more blocks exist carries them;
+-- a digest of an earlier block uses only the headers up to its height, the
+-- headers beyond it are ignored, a header before it that is altered is not.
+INSERT INTO pr VALUES (50, 'later');
+SELECT kingres.ledger_build_block() IS NOT NULL AS block_a;
+ block_a 
+---------
+ t
+(1 row)
+
+INSERT INTO pr VALUES (51, 'later');
+SELECT kingres.ledger_build_block() IS NOT NULL AS block_b;
+ block_b 
+---------
+ t
+(1 row)
+
+INSERT INTO pr VALUES (52, 'later');
+SELECT kingres.ledger_generate_digest() AS dig_later \gset
+SELECT kingres.ledger_inclusion_proof('pr', :'oldhash'::bytea, 'D') AS pd2 \gset
+SELECT jsonb_array_length(:'pd2'::jsonb -> 'chain') AS headers_in_chain,
+       (:'dig_later'::jsonb ->> 'height')::int - (:'pd2'::jsonb -> 'block' ->> 'height')::int AS tip_minus_block;
+ headers_in_chain | tip_minus_block 
+------------------+-----------------
+                3 |               3
+(1 row)
+
+SELECT kingres.ledger_verify_proof(:'pd2'::jsonb, :'dig_later'::jsonb) AS against_the_latest_digest,
+       kingres.ledger_verify_proof(:'pd2'::jsonb, :'dig'::jsonb) AS against_the_earlier_digest;
+ against_the_latest_digest | against_the_earlier_digest 
+---------------------------+----------------------------
+ t                         | t
+(1 row)
+
+-- a digest of the block after the proof's block stops there: later headers are not used
+SELECT jsonb_build_object('chain_id', :'dig'::jsonb -> 'chain_id', 'height', :'pd2'::jsonb -> 'chain' -> 0 -> 'height',
+                          'block_hash', :'pd2'::jsonb -> 'chain' -> 0 -> 'block_hash') AS dig_mid \gset
+SELECT kingres.ledger_verify_proof(:'pd2'::jsonb, :'dig_mid'::jsonb) AS against_the_digest_in_between;
+ against_the_digest_in_between 
+-------------------------------
+ t
+(1 row)
+
+SELECT kingres.ledger_verify_proof(
+           jsonb_set(:'pd2'::jsonb, '{chain,1,prev_hash}', to_jsonb(repeat('00', 32))), :'dig_mid'::jsonb) AS altered_beyond_the_digest,
+       kingres.ledger_verify_proof(
+           jsonb_set(:'pd2'::jsonb, '{chain,1,prev_hash}', to_jsonb(repeat('00', 32))), :'dig_later'::jsonb) AS altered_within_the_latest;
+ altered_beyond_the_digest | altered_within_the_latest 
+---------------------------+---------------------------
+ t                         | f
+(1 row)
+
+-- ... but they are parsed: a malformed header beyond the digest makes the proof malformed
+SELECT kingres.ledger_verify_proof(jsonb_set(:'pd2'::jsonb, '{chain,2}', '"x"'), :'dig_mid'::jsonb) AS not_an_object_beyond,
+       kingres.ledger_verify_proof(jsonb_set(:'pd2'::jsonb, '{chain,2,tx_count}', '1.5'), :'dig_mid'::jsonb) AS fractional_count_beyond,
+       kingres.ledger_verify_proof(:'pd2'::jsonb #- '{chain,2,closed_at_us}', :'dig_mid'::jsonb) AS missing_member_beyond;
+ not_an_object_beyond | fractional_count_beyond | missing_member_beyond 
+----------------------+-------------------------+-----------------------
+ f                    | f                       | f
+(1 row)
+
+-- a malformed block_hash in a header is an error; an absent one is allowed
+SELECT kingres.ledger_verify_proof(
+           jsonb_set(:'pd2'::jsonb, '{chain,0,block_hash}', '"zz"'), :'dig_later'::jsonb) AS malformed_header_hash,
+       kingres.ledger_verify_proof(
+           jsonb_set(:'pd2'::jsonb, '{chain,0,block_hash}', to_jsonb(repeat('00', 32))), :'dig_later'::jsonb) AS wrong_header_hash,
+       kingres.ledger_verify_proof(
+           :'pd2'::jsonb #- '{chain,0,block_hash}', :'dig_later'::jsonb) AS absent_header_hash,
+       kingres.ledger_verify_proof(
+           jsonb_set(:'pd2'::jsonb, '{chain,0,hash_version}', '2'), :'dig_later'::jsonb) AS header_version_2;
+ malformed_header_hash | wrong_header_hash | absent_header_hash | header_version_2 
+-----------------------+-------------------+--------------------+------------------
+ f                     | f                 | t                  | f
+(1 row)
+
+--------------------------------------------------------------------------
+-- Tamper cases, the way an attacker with catalog access performs them:
+-- the triggers are switched off by editing pg_trigger, the session is
+-- reconnected, the change is made, and the verification looks at it.  Each
+-- case runs in a transaction that is rolled back.
+--------------------------------------------------------------------------
+SELECT kingres.ledger_build_block() IS NOT NULL AS block_built;
+ block_built 
+-------------
+ f
+(1 row)
+
+SELECT count(*) AS problems_before FROM kingres.ledger_verify();
+ problems_before 
+-----------------
+               0
+(1 row)
+
+\set trig_off 'UPDATE pg_trigger SET tgenabled = ''D'' WHERE tgname LIKE ''kingres_ledger_%'' AND tgrelid IN (SELECT oid FROM pg_class WHERE relname IN (''pr'', ''pr_ledger_history'', ''ledger_entry'', ''ledger_table''))'
+\set trig_on 'UPDATE pg_trigger SET tgenabled = ''A'' WHERE tgname LIKE ''kingres_ledger_%'' AND tgrelid IN (SELECT oid FROM pg_class WHERE relname IN (''pr'', ''pr_ledger_history'', ''ledger_entry'', ''ledger_table''))'
+INSERT INTO pr VALUES (2, 'two'), (3, 'three');
+UPDATE pr SET v = 'two-b' WHERE id = 2;
+DELETE FROM pr WHERE id = 3;
+SELECT kingres.ledger_build_block() IS NOT NULL AS block_built;
+ block_built 
+-------------
+ t
+(1 row)
+
+SELECT count(*) AS problems_before FROM kingres.ledger_verify();
+ problems_before 
+-----------------
+               0
+(1 row)
+
+:trig_off;
+\c
+SET search_path = public;
+-- 1. a current row changed without entries
+BEGIN;
+UPDATE pr SET v = 'tampered' WHERE id = 1;
+:trig_on;
+SELECT * FROM ureport();
+ check_name |  object   |                               detail                               
+------------+-----------+--------------------------------------------------------------------
+ table_rows | public.pr | row hash <hash>: 0 row(s) in the table, 1 entry(ies) in the ledger
+ table_rows | public.pr | row hash <hash>: 1 row(s) in the table, 0 entry(ies) in the ledger
+(2 rows)
+
+ROLLBACK;
+\c
+SET search_path = public;
+-- 2. a current row removed
+BEGIN;
+DELETE FROM pr WHERE id = 2;
+:trig_on;
+SELECT * FROM ureport();
+ check_name |  object   |                               detail                               
+------------+-----------+--------------------------------------------------------------------
+ table_rows | public.pr | row hash <hash>: 0 row(s) in the table, 1 entry(ies) in the ledger
+(1 row)
+
+ROLLBACK;
+\c
+SET search_path = public;
+-- 3. a history row changed
+BEGIN;
+UPDATE pr_ledger_history SET v = 'tampered' WHERE id = 3;
+:trig_on;
+SELECT * FROM ureport();
+  check_name  |  object   |                                 detail                                 
+--------------+-----------+------------------------------------------------------------------------
+ history_rows | public.pr | history row of tx N seq N does not hash to the row hash of its D entry
+(1 row)
+
+ROLLBACK;
+\c
+SET search_path = public;
+-- 4. a history row removed
+BEGIN;
+DELETE FROM pr_ledger_history WHERE id = 3;
+:trig_on;
+SELECT * FROM ureport();
+  check_name  |  object   |                  detail                  
+--------------+-----------+------------------------------------------
+ history_rows | public.pr | D entry of tx N seq N has no history row
+(1 row)
+
+ROLLBACK;
+\c
+SET search_path = public;
+-- 5. a D entry removed together with its history row (a block that was built
+-- has covered it: the transaction root no longer matches)
+BEGIN;
+DELETE FROM kingres.ledger_entry e USING pr_ledger_history h
+ WHERE e.ledger_txid = h.ledger_txid AND e.seq = h.ledger_seq AND h.id = 3;
+DELETE FROM pr_ledger_history WHERE id = 3;
+:trig_on;
+SELECT * FROM ureport();
+ check_name |     object      |                               detail                               
+------------+-----------------+--------------------------------------------------------------------
+ table_rows | public.pr       | row hash <hash>: 0 row(s) in the table, 1 entry(ies) in the ledger
+ tx_root    | tx N (block 16) | entry_count is 1 but 0 entries exist
+(2 rows)
+
+ROLLBACK;
+\c
+SET search_path = public;
+-- 6. an old version put back as the current row
+BEGIN;
+INSERT INTO pr SELECT id, v FROM pr_ledger_history WHERE id = 3;
+:trig_on;
+SELECT * FROM ureport();
+ check_name |  object   |                               detail                               
+------------+-----------+--------------------------------------------------------------------
+ table_rows | public.pr | row hash <hash>: 1 row(s) in the table, 0 entry(ies) in the ledger
+(1 row)
+
+ROLLBACK;
+\c
+SET search_path = public;
+-- 7. a history row duplicated
+BEGIN;
+INSERT INTO pr_ledger_history SELECT * FROM pr_ledger_history WHERE id = 3;
+:trig_on;
+SELECT * FROM ureport();
+  check_name  |  object   |                  detail                  
+--------------+-----------+------------------------------------------
+ history_rows | public.pr | D entry of tx N seq N has 2 history rows
+(1 row)
+
+ROLLBACK;
+\c
+SET search_path = public;
+-- 8. a history row that points to another entry, and one that claims another operation
+BEGIN;
+UPDATE pr_ledger_history SET ledger_seq = ledger_seq + 100 WHERE id = 3;
+:trig_on;
+SELECT * FROM ureport();
+  check_name  |  object   |                  detail                  
+--------------+-----------+------------------------------------------
+ history_rows | public.pr | D entry of tx N seq N has no history row
+ history_rows | public.pr | history row of tx N seq N has no D entry
+(2 rows)
+
+ROLLBACK;
+\c
+SET search_path = public;
+BEGIN;
+UPDATE pr_ledger_history SET ledger_op = 'I' WHERE id = 3;
+:trig_on;
+SELECT * FROM ureport();
+  check_name  |  object   |                         detail                          
+--------------+-----------+---------------------------------------------------------
+ history_rows | public.pr | history row of tx N seq N has an operation other than D
+(1 row)
+
+ROLLBACK;
+\c
+SET search_path = public;
+-- 9. a history row with an invented content (no entry)
+BEGIN;
+INSERT INTO pr_ledger_history VALUES (77, 'invented', 1, 1, 'D');
+:trig_on;
+SELECT * FROM ureport();
+  check_name  |  object   |                  detail                  
+--------------+-----------+------------------------------------------
+ history_rows | public.pr | history row of tx N seq N has no D entry
+(1 row)
+
+ROLLBACK;
+\c
+SET search_path = public;
+-- 10. an entry turned from D into I, and from I into D
+BEGIN;
+UPDATE kingres.ledger_entry e SET op = 'I' FROM pr_ledger_history h
+ WHERE e.ledger_txid = h.ledger_txid AND e.seq = h.ledger_seq AND h.id = 3;
+:trig_on;
+SELECT * FROM ureport();
+  check_name  |     object      |                               detail                               
+--------------+-----------------+--------------------------------------------------------------------
+ history_rows | public.pr       | history row of tx N seq N has no D entry
+ table_rows   | public.pr       | row hash <hash>: 0 row(s) in the table, 2 entry(ies) in the ledger
+ tx_root      | tx N (block 16) | merkle_root <hash> differs from the recomputed root
+(3 rows)
+
+ROLLBACK;
+\c
+SET search_path = public;
+BEGIN;
+UPDATE kingres.ledger_entry e SET op = 'D'
+ WHERE e.row_hash = (SELECT kingres.ledger_row_hash(p.*) FROM pr p WHERE id = 1) AND e.op = 'I';
+:trig_on;
+SELECT * FROM ureport();
+  check_name  |     object      |                               detail                                
+--------------+-----------------+---------------------------------------------------------------------
+ history_rows | public.pr       | D entry of tx N seq N has no history row
+ table_rows   | public.pr       | row hash <hash>: 1 row(s) in the table, -1 entry(ies) in the ledger
+ tx_root      | tx N (block 12) | merkle_root <hash> differs from the recomputed root
+(3 rows)
+
+ROLLBACK;
+\c
+SET search_path = public;
+-- 11. a D entry for an append-only table
+BEGIN;
+UPDATE kingres.ledger_entry e SET op = 'D'
+ WHERE e.ledger_txid = (SELECT min(ledger_txid) FROM kingres.ledger_entry WHERE table_id =
+                         (SELECT table_id FROM kingres.ledger_table WHERE relid = 'docs'::regclass));
+:trig_on;
+SELECT check_name, object FROM ureport();
+ check_name |     object     
+------------+----------------
+ entry_op   | public.docs
+ table_rows | public.docs
+ tx_root    | tx N (block 3)
+(3 rows)
+
+ROLLBACK;
+\c
+SET search_path = public;
+-- 12. the registry says append-only for a table that has a history table
+BEGIN;
+UPDATE kingres.ledger_table SET mode = 'append_only', history_relid = NULL WHERE relid = 'pr'::regclass;
+:trig_on;
+SELECT check_name, object FROM ureport();
+ check_name |  object   
+------------+-----------
+ entry_op   | public.pr
+ trigger    | public.pr
+ trigger    | public.pr
+(3 rows)
+
+ROLLBACK;
+\c
+SET search_path = public;
+:trig_on;
+\c
+SET search_path = public;
+SELECT count(*) AS problems_after FROM kingres.ledger_verify();
+ problems_after 
+----------------
+              0
+(1 row)
+
+--------------------------------------------------------------------------
+-- The statement-level ways around the capture trigger do not work
+--------------------------------------------------------------------------
+\set VERBOSITY sqlstate
+-- a trigger that is not ENABLE ALWAYS
+SELECT count(*) AS plain_triggers FROM pg_trigger t
+WHERE t.tgname = 'kingres_ledger_capture' AND t.tgenabled <> 'A';
+ plain_triggers 
+----------------
+              0
+(1 row)
+
+-- the table cannot lose its history through ALTER TABLE ... ADD COLUMN with a type that cannot be hashed
+ALTER TABLE pr ADD COLUMN c pair;
+ERROR:  KL002
+\set VERBOSITY terse
+SELECT count(*) AS problems FROM kingres.ledger_verify();
+ problems 
+----------
+        0
+(1 row)
+

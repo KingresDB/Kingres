@@ -10,13 +10,14 @@ OBJS = \
 	src/merkle.o \
 	src/proof.o \
 	src/protect.o \
-	src/row_hash.o
+	src/row_hash.o \
+	src/worker.o
 
 EXTENSION = kingres_ledger
-DATA = kingres_ledger--0.1.sql
+DATA = kingres_ledger--0.1.sql kingres_ledger--0.2.sql kingres_ledger--0.1--0.2.sql
 PGFILEDESC = "kingres_ledger - tamper-evident ledger tables for KingresDB"
 
-REGRESS = ledger_hash ledger_capture ledger_verify ledger_protect ledger_format ledger_review ledger_privs
+REGRESS = ledger_setup ledger_hash ledger_capture ledger_verify ledger_protect ledger_format ledger_review ledger_updatable ledger_records ledger_privs
 REGRESS_OPTS = --temp-config $(srcdir)/kingres_ledger.conf
 
 TAP_TESTS = 1

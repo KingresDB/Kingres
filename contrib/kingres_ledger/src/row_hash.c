@@ -40,6 +40,7 @@
 #include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
 #include "utils/lsyscache.h"
+#include "utils/rel.h"
 #include "utils/memutils.h"
 #include "utils/typcache.h"
 
@@ -48,6 +49,7 @@
 #include "row_hash.h"
 
 PG_FUNCTION_INFO_V1(kingres_ledger_row_hash);
+PG_FUNCTION_INFO_V1(kingres_ledger_history_row_hash);
 
 /* Scratch memory of the hash computation; reset for every row. */
 static MemoryContext kl_work_cxt = NULL;
@@ -62,6 +64,15 @@ static int32 kl_cached_table_id = 0;
 /* Saved plan of the table_id lookup. */
 static SPIPlanPtr kl_lookup_plan = NULL;
 
+/* One-entry cache of the last history lookup, valid per transaction. */
+static Oid	kl_hist_cached_relid = InvalidOid;
+static Oid	kl_hist_cached_history = InvalidOid;
+static int32 kl_hist_cached_table_id = 0;
+
+/* Saved plans of the history lookups. */
+static SPIPlanPtr kl_hist_plan = NULL;
+static SPIPlanPtr kl_hist_by_history_plan = NULL;
+
 /*
  * kl_table_cache_reset
  *		Forget the cached relid to table_id mapping.  Called at transaction
@@ -71,6 +82,7 @@ void
 kl_table_cache_reset(void)
 {
 	kl_cached_relid = InvalidOid;
+	kl_hist_cached_relid = InvalidOid;
 }
 
 /*
@@ -167,7 +179,7 @@ kl_table_id_for_type(Oid typeid)
  */
 static void
 kl_encode_row(StringInfo buf, TupleDesc tupdesc, Datum *values, bool *isnull,
-			  int32 table_id)
+			  int32 table_id, bool history)
 {
 	uint8		hdr[8];
 	int			natts = tupdesc->natts;
@@ -178,7 +190,8 @@ kl_encode_row(StringInfo buf, TupleDesc tupdesc, Datum *values, bool *isnull,
 	{
 		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
 
-		if (!att->attisdropped && !isnull[i])
+		if (!att->attisdropped && !isnull[i] &&
+			!(history && kl_is_history_column(NameStr(att->attname))))
 			ncols++;
 	}
 
@@ -198,7 +211,8 @@ kl_encode_row(StringInfo buf, TupleDesc tupdesc, Datum *values, bool *isnull,
 		bool		isvarlena;
 		bytea	   *sent;
 
-		if (att->attisdropped || isnull[i])
+		if (att->attisdropped || isnull[i] ||
+			(history && kl_is_history_column(NameStr(att->attname))))
 			continue;
 
 		/* The column name in UTF-8, whatever the database encoding is. */
@@ -233,7 +247,7 @@ kl_encode_row(StringInfo buf, TupleDesc tupdesc, Datum *values, bool *isnull,
  */
 void
 kl_row_hash_tuple(TupleDesc tupdesc, HeapTuple tuple, int32 table_id,
-				  uint8 *out)
+				  bool history, uint8 *out)
 {
 	MemoryContext oldcxt;
 	int			saved_encoding;
@@ -276,7 +290,7 @@ kl_row_hash_tuple(TupleDesc tupdesc, HeapTuple tuple, int32 table_id,
 		heap_deform_tuple(tuple, tupdesc, values, isnull);
 
 		initStringInfo(&buf);
-		kl_encode_row(&buf, tupdesc, values, isnull, table_id);
+		kl_encode_row(&buf, tupdesc, values, isnull, table_id, history);
 		kl_leaf_hash(out, (const uint8 *) buf.data, buf.len);
 	}
 	PG_FINALLY();
@@ -296,7 +310,8 @@ kl_row_hash_tuple(TupleDesc tupdesc, HeapTuple tuple, int32 table_id,
  *		datum header.
  */
 void
-kl_row_hash_composite(HeapTupleHeader header, int32 table_id, uint8 *out)
+kl_row_hash_composite(HeapTupleHeader header, int32 table_id, bool history,
+					  uint8 *out)
 {
 	Oid			tuptype = HeapTupleHeaderGetTypeId(header);
 	int32		tupmod = HeapTupleHeaderGetTypMod(header);
@@ -308,7 +323,7 @@ kl_row_hash_composite(HeapTupleHeader header, int32 table_id, uint8 *out)
 	tuple.t_tableOid = InvalidOid;
 	tuple.t_data = header;
 
-	kl_row_hash_tuple(tupdesc, &tuple, table_id, out);
+	kl_row_hash_tuple(tupdesc, &tuple, table_id, history, out);
 	ReleaseTupleDesc(tupdesc);
 }
 
@@ -330,6 +345,159 @@ kingres_ledger_row_hash(PG_FUNCTION_ARGS)
 
 	result = (bytea *) palloc(VARHDRSZ + KL_HASH_LEN);
 	SET_VARSIZE(result, VARHDRSZ + KL_HASH_LEN);
-	kl_row_hash_composite(header, table_id, (uint8 *) VARDATA(result));
+	kl_row_hash_composite(header, table_id, false, (uint8 *) VARDATA(result));
+	PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * kl_is_history_column
+ *		Whether a column name is one of the three columns that the history
+ *		table of an updatable ledger table adds to the columns of the table.
+ *		They are not part of the encoded row.  ledger_enable and the event
+ *		trigger reject columns of these names in an updatable table.
+ */
+bool
+kl_is_history_column(const char *name)
+{
+	return strcmp(name, KL_HIST_COL_TXID) == 0 ||
+		strcmp(name, KL_HIST_COL_SEQ) == 0 ||
+		strcmp(name, KL_HIST_COL_OP) == 0;
+}
+
+/*
+ * kl_lookup_history
+ *		The history table of the ledger table "relid" and its table_id.
+ *		Returns the OID of the history table, or InvalidOid when the table is
+ *		append-only.  Raises an error when the table is not registered.  The
+ *		query is fully qualified so that no object of a schema earlier in the
+ *		search_path can capture it.
+ */
+Oid
+kl_lookup_history(Oid relid, int32 *table_id)
+{
+	Datum		values[1];
+	Oid			history = InvalidOid;
+	int32		tid = -1;
+	int			rc;
+
+	if (OidIsValid(kl_hist_cached_relid) && kl_hist_cached_relid == relid)
+	{
+		*table_id = kl_hist_cached_table_id;
+		return kl_hist_cached_history;
+	}
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	if (kl_hist_plan == NULL)
+	{
+		Oid			argtypes[1] = {REGCLASSOID};
+		SPIPlanPtr	plan;
+
+		plan = SPI_prepare("SELECT table_id, history_relid::pg_catalog.oid "
+						   "FROM kingres.ledger_table "
+						   "WHERE relid OPERATOR(pg_catalog.=) $1",
+						   1, argtypes);
+		if (plan == NULL)
+			elog(ERROR, "SPI_prepare failed: %s",
+				 SPI_result_code_string(SPI_result));
+		if (SPI_keepplan(plan))
+			elog(ERROR, "SPI_keepplan failed");
+		kl_hist_plan = plan;
+	}
+	values[0] = ObjectIdGetDatum(relid);
+	rc = SPI_execute_plan(kl_hist_plan, values, NULL, true, 1);
+	if (rc != SPI_OK_SELECT)
+		elog(ERROR, "SPI_execute_plan failed: %s", SPI_result_code_string(rc));
+	if (SPI_processed == 1)
+	{
+		bool		isnull;
+		Datum		d = SPI_getbinval(SPI_tuptable->vals[0],
+									  SPI_tuptable->tupdesc, 1, &isnull);
+
+		if (!isnull)
+			tid = DatumGetInt32(d);
+		d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2,
+						  &isnull);
+		if (!isnull)
+			history = DatumGetObjectId(d);
+	}
+	SPI_finish();
+
+	if (tid < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 errmsg("table \"%s\" is not under ledger control",
+						get_rel_name(relid))));
+	kl_hist_cached_relid = relid;
+	kl_hist_cached_table_id = tid;
+	kl_hist_cached_history = history;
+	*table_id = tid;
+	return history;
+}
+
+/*
+ * kingres.ledger_history_row_hash(record) returns bytea
+ *		Row hash of a row of the history table of an updatable ledger table:
+ *		the leaf hash of the canonical encoding of the columns the history
+ *		table has in common with the ledger table (everything except
+ *		ledger_txid, ledger_seq and ledger_op), with the table_id of the ledger
+ *		table.  It equals the hash that the capture trigger computed for the
+ *		old version of the row.
+ */
+Datum
+kingres_ledger_history_row_hash(PG_FUNCTION_ARGS)
+{
+	HeapTupleHeader header = PG_GETARG_HEAPTUPLEHEADER(0);
+	Oid			relid = get_typ_typrelid(HeapTupleHeaderGetTypeId(header));
+	int32		table_id = -1;
+	bytea	   *result;
+	Datum		values[1];
+	int			rc;
+
+	if (!OidIsValid(relid))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("argument must be a row of a ledger history table")));
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	if (kl_hist_by_history_plan == NULL)
+	{
+		Oid			argtypes[1] = {REGCLASSOID};
+		SPIPlanPtr	plan;
+
+		plan = SPI_prepare("SELECT table_id FROM kingres.ledger_table "
+						   "WHERE history_relid OPERATOR(pg_catalog.=) $1",
+						   1, argtypes);
+		if (plan == NULL)
+			elog(ERROR, "SPI_prepare failed: %s",
+				 SPI_result_code_string(SPI_result));
+		if (SPI_keepplan(plan))
+			elog(ERROR, "SPI_keepplan failed");
+		kl_hist_by_history_plan = plan;
+	}
+	values[0] = ObjectIdGetDatum(relid);
+	rc = SPI_execute_plan(kl_hist_by_history_plan, values, NULL, true, 1);
+	if (rc != SPI_OK_SELECT)
+		elog(ERROR, "SPI_execute_plan failed: %s", SPI_result_code_string(rc));
+	if (SPI_processed == 1)
+	{
+		bool		isnull;
+		Datum		d = SPI_getbinval(SPI_tuptable->vals[0],
+									  SPI_tuptable->tupdesc, 1, &isnull);
+
+		if (!isnull)
+			table_id = DatumGetInt32(d);
+	}
+	SPI_finish();
+	if (table_id < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 errmsg("table \"%s\" is not the history table of a ledger table",
+						get_rel_name(relid))));
+
+	result = (bytea *) palloc(VARHDRSZ + KL_HASH_LEN);
+	SET_VARSIZE(result, VARHDRSZ + KL_HASH_LEN);
+	kl_row_hash_composite(header, table_id, true, (uint8 *) VARDATA(result));
 	PG_RETURN_BYTEA_P(result);
 }
