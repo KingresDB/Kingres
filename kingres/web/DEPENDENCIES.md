@@ -31,6 +31,7 @@ initial download at about 64 KiB gzip.
 | `vue-tsc`            | 3.3.14  | `typecheck`: checks templates as well as scripts                                                                                              | MIT        |
 | `openapi-typescript` | 7.13.0  | Generates `src/api/schema.d.ts` from `kingres/api/openapi.yaml`                                                                               | MIT        |
 | `yaml`               | 2.9.1   | Reads `x-required-role` from the contract for `src/api/operations.generated.ts`                                                               | ISC        |
+| `puppeteer-core`     | 25.17.0 | Drives a headless Chrome in `npm run e2e` only; it downloads no browser                                                                       | Apache-2.0 |
 
 ## Mock API and tests (development only)
 
@@ -87,5 +88,5 @@ npm dependency. No package was added for the logo work.
   `src/lib/validators.ts` and the server's field errors are shown as well.
 - **Headless UI / Radix Vue:** the only complex primitives are the dialog and tabs, both implemented to the
   WAI-ARIA patterns and covered by tests.
-- **Playwright / Cypress:** the testing document defers end-to-end tests until the panel has a real backend.
-  The browser check in the report used puppeteer-core outside this project.
+- **Playwright / Cypress:** `npm run e2e` uses `puppeteer-core` (no browser download, small) with the Chrome or
+  Edge already on the machine; the larger frameworks add nothing this flow needs.

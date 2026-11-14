@@ -218,7 +218,7 @@ function saveGroup(): void {
             <NullableValue :value="s.resources.diskTotalBytes" :format="formatBytes" />
           </dd>
           <dt>Version</dt>
-          <dd>{{ s.version }}</dd>
+          <dd><NullableValue :value="s.version" /></dd>
         </dl>
       </section>
     </div>

@@ -32,7 +32,12 @@ export default defineConfig({
   server: {
     port: 5173,
     // Used when mocks are off (`npm run dev:backend`): forward the REST API to a local kingresd.
-    proxy: { '/api': { target: 'http://127.0.0.1:8091', changeOrigin: false } },
+    proxy: {
+      '/api': {
+        target: process.env.KINGRES_API_TARGET ?? 'http://127.0.0.1:8091',
+        changeOrigin: false,
+      },
+    },
   },
   build: {
     outDir: 'dist',

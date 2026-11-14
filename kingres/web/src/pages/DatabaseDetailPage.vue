@@ -12,6 +12,7 @@ import NotAvailable from '@/components/NotAvailable.vue'
 import TaskActionDialog from '@/components/TaskActionDialog.vue'
 import EditDatabaseDialog from '@/components/EditDatabaseDialog.vue'
 import DistributeTableDialog from '@/components/DistributeTableDialog.vue'
+import EnableLedgerDialog from '@/components/EnableLedgerDialog.vue'
 import { endpoints } from '@/api/endpoints'
 import { keys, useDatabase, useTables } from '@/api/queries'
 import { DATABASE_STATUS, DURABILITY_LABEL, LEDGER_MODE_LABEL, LEDGER_STATE } from '@/lib/status'
@@ -27,6 +28,7 @@ const tableRows = computed(() => tables.data.value?.items ?? [])
 
 const dialog = ref<'edit' | 'drop' | null>(null)
 const distributing = ref<Table | null>(null)
+const ledgerFor = ref<Table | null>(null)
 
 const CLASS_LABEL: Record<TableClass, string> = {
   plain: 'Plain',
@@ -37,14 +39,21 @@ const CLASS_LABEL: Record<TableClass, string> = {
 const distributedTables = computed(() =>
   tableRows.value.filter((t) => t.classes.includes('distributed')),
 )
+/** Databases made outside the control plane have no creation record (null). */
+const createdText = computed(() => {
+  const d = db.value
+  if (!d) return undefined
+  if (d.createdBy === null && d.createdAt === null) return 'Creation record not available.'
+  const by = d.createdBy === null ? 'an unknown user' : d.createdBy
+  return d.createdAt === null
+    ? `Created by ${by}.`
+    : `Created by ${by} on ${formatDateTime(d.createdAt)}`
+})
 const shardingOn = computed(() => db.value?.sharding.enabled === true)
 </script>
 
 <template>
-  <PageHeader
-    :title="`Database ${name}`"
-    :subtitle="db ? `Created by ${db.createdBy} on ${formatDateTime(db.createdAt)}` : undefined"
-  >
+  <PageHeader :title="`Database ${name}`" :subtitle="createdText">
     <template #actions>
       <GateButton op="updateDatabase" :disabled="!db" @click="dialog = 'edit'"
         >Edit settings</GateButton
@@ -200,16 +209,28 @@ const shardingOn = computed(() => db.value?.sharding.enabled === true)
                   </td>
                   <td class="num"><NullableValue :value="t.sizeBytes" :format="formatBytes" /></td>
                   <td>
-                    <GateButton
-                      v-if="t.classes.includes('plain')"
-                      op="distributeTable"
-                      small
-                      :disabled="!shardingOn"
-                      :title="shardingOn ? undefined : 'Turn on sharding for this database first.'"
-                      @click="distributing = t"
-                    >
-                      Distribute table
-                    </GateButton>
+                    <div class="row">
+                      <GateButton
+                        v-if="t.classes.includes('plain')"
+                        op="distributeTable"
+                        small
+                        :disabled="!shardingOn"
+                        :title="
+                          shardingOn ? undefined : 'Turn on sharding for this database first.'
+                        "
+                        @click="distributing = t"
+                      >
+                        Distribute table
+                      </GateButton>
+                      <GateButton
+                        v-if="!t.classes.includes('ledger')"
+                        op="enableTableLedger"
+                        small
+                        @click="ledgerFor = t"
+                      >
+                        Enable ledger
+                      </GateButton>
+                    </div>
                   </td>
                 </tr>
               </tbody>
@@ -246,6 +267,12 @@ const shardingOn = computed(() => db.value?.sharding.enabled === true)
       </span>
     </p>
   </TaskActionDialog>
+  <EnableLedgerDialog
+    v-if="ledgerFor"
+    :database-name="name"
+    :table="ledgerFor"
+    @close="ledgerFor = null"
+  />
   <DistributeTableDialog
     v-if="distributing"
     :database-name="name"

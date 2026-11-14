@@ -41,7 +41,7 @@ const create = reactive({
   adminUser: 'admin',
   adminPassword: '',
   adminPassword2: '',
-  dataDirectory: '/var/lib/kingresdb/data',
+  dataDirectory: '/var/lib/kingres',
   walDirectory: '',
   logDirectory: '',
   memoryMb: 4096,
@@ -54,27 +54,30 @@ const join = reactive({
   address: '',
   adminUser: 'admin',
   adminPassword: '',
-  dataDirectory: '/var/lib/kingresdb/data',
+  dataDirectory: '/var/lib/kingres',
   memoryMb: 4096,
   serverGroup: '',
 })
 
-/** Last task seen by the wizard; used to fill the gaps of the setup summary. */
+/** Last task seen by the wizard; shown if a poll briefly reports no setup task. */
 let lastTask: Task | null = null
 
 /** The summary in GET /setup/state, shaped like a Task so the shared progress view can show it. */
 function taskFromSummary(summary: SetupTaskSummary): Task {
-  const now = new Date().toISOString()
   return {
     id: summary.id,
     kind: summary.kind,
     state: summary.state,
-    progress: { percent: summary.progressPercent, currentStep: null, steps: [] },
+    progress: {
+      percent: summary.progressPercent,
+      currentStep: summary.steps.find((s) => s.state === 'running')?.name ?? null,
+      steps: summary.steps.map((s) => ({ name: s.name, state: s.state })),
+    },
     error: summary.error,
     subject: { type: 'cluster', id: 'cluster' },
     cancellable: false,
-    createdAt: lastTask?.createdAt ?? now,
-    updatedAt: now,
+    createdAt: summary.createdAt,
+    updatedAt: summary.updatedAt,
     createdBy: 'setup',
   }
 }

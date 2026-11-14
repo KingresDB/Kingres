@@ -84,7 +84,7 @@ const summary = computed(() => {
     <ul class="legend">
       <li v-for="g in groupIds" :key="g">
         <span class="swatch" :style="{ background: colorVar(g) }">{{ g }}</span>
-        Shard group {{ g }}
+        {{ g === 0 ? 'Map group (0)' : `Shard group ${g}` }}
       </li>
       <li><span class="swatch moving">&rarr;</span> Moving</li>
       <li><span class="swatch orphan">&#10005;</span> Orphan</li>
@@ -104,7 +104,7 @@ const summary = computed(() => {
         </thead>
         <tbody>
           <tr v-for="r in summary" :key="r.id">
-            <th scope="row">Group {{ r.id }}</th>
+            <th scope="row">{{ r.id === 0 ? 'Map group (0)' : `Group ${r.id}` }}</th>
             <td class="num">{{ r.total }}</td>
             <td class="num">{{ r.moving }}</td>
             <td class="num">{{ r.orphan }}</td>

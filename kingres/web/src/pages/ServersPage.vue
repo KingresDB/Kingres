@@ -102,7 +102,7 @@ const dialog = ref<{ kind: 'add' | 'restore' | 'failover' | 'remove'; server?: S
               </div>
             </td>
             <td>
-              {{ s.version }}
+              <NullableValue :value="s.version" />
               <div class="muted">
                 up <NullableValue :value="s.uptimeSeconds" :format="formatDuration" />
               </div>

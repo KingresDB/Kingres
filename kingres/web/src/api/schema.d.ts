@@ -462,6 +462,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/cluster/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the short cluster summary
+         * @description The part of the cluster overview that a statistics-only account may see: identity, health and counts.
+         *     `GET /cluster` needs `kingres_readonly`.
+         */
+        get: operations["getClusterSummary"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/servers": {
         parameters: {
             query?: never;
@@ -762,6 +783,36 @@ export interface paths {
          *     are moved to their buckets; the table can be a ledger table at the same time. Long-running: returns a task.
          */
         put: operations["distributeTable"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/ledger": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Put a table under ledger control
+         * @description Calls `kingres.ledger_enable`: the table becomes a ledger table in the given mode. One-way: a ledger table
+         *     cannot lose its ledger and the mode cannot be changed afterwards. Needs the `kingres_ledger` extension in the
+         *     database (409 `conflict` if the database has no ledger). Rows already in the table are entered into the ledger.
+         *     Synchronous: returns the table as it is afterwards.
+         */
+        put: operations["enableTableLedger"];
         post?: never;
         delete?: never;
         options?: never;
@@ -1770,6 +1821,26 @@ export interface components {
              * @description Task identifier.
              */
             id: number;
+            /** @description The ordered steps of the task with their state, so that the wizard can show where a failure happened. */
+            steps: {
+                /** @description Human-readable step name (English). */
+                name: string;
+                /**
+                 * @description State of the step.
+                 * @enum {string}
+                 */
+                state: "pending" | "running" | "done" | "failed";
+            }[];
+            /**
+             * Format: date-time
+             * @description When the setup request was accepted.
+             */
+            createdAt: string;
+            /**
+             * Format: date-time
+             * @description When the task last changed state or progress.
+             */
+            updatedAt: string;
             /**
              * @description Which setup operation started the task.
              * @enum {string}
@@ -1912,8 +1983,8 @@ export interface components {
             hostname: string;
             /** @description KingresDB version. */
             version: string;
-            /** @description PostgreSQL version. */
-            postgresVersion: string;
+            /** @description PostgreSQL version of the managed instance; null when no instance is running. */
+            postgresVersion: string | null;
             nodeState: components["schemas"]["NodeState"];
             /**
              * Format: uuid
@@ -2166,15 +2237,32 @@ export interface components {
          * @enum {string}
          */
         RebalanceReason: "serverAdded" | "serverRemoved" | "replicaCountChanged" | "replicasMissing" | "skewed" | "serverGroupChanged";
+        /** @description Short cluster summary for statistics-only accounts. Null means "not available". */
+        ClusterSummary: {
+            /**
+             * Format: uuid
+             * @description Cluster identifier; null when the node state carries no cluster identity.
+             */
+            clusterId: string | null;
+            /** @description Cluster name; null when the node state carries no cluster identity. */
+            name: string | null;
+            health: components["schemas"]["ClusterHealth"];
+            /** @description Number of servers. */
+            serverCount: number;
+            /** @description Number of user databases. */
+            databaseCount: number;
+            /** @description Number of open alerts; 0 when the alert system is not available. */
+            openAlerts: number;
+        };
         /** @description Cluster-wide health summary. */
         ClusterOverview: {
             /**
              * Format: uuid
-             * @description Cluster identifier.
+             * @description Cluster identifier; null when the node state carries no cluster identity.
              */
-            clusterId: string;
-            /** @description Cluster name. */
-            name: string;
+            clusterId: string | null;
+            /** @description Cluster name; null when the node state carries no cluster identity. */
+            name: string | null;
             health: components["schemas"]["ClusterHealth"];
             /** @description KingresDB version of the cluster. */
             version: string;
@@ -2285,8 +2373,8 @@ export interface components {
             shouldHaveShards: boolean;
             /** @description Whether the active manager runs here. */
             isManagerLeader: boolean;
-            /** @description KingresDB version. */
-            version: string;
+            /** @description KingresDB version of that server; null when the server cannot know it (a remote server whose version has not been reported). */
+            version: string | null;
             /**
              * Format: int64
              * @description Seconds since `kingresd` started; null when not available (the server's agent is not reachable).
@@ -2539,13 +2627,13 @@ export interface components {
             };
             /** @description Whether this database's buckets need rebalancing. */
             rebalanceRequired: boolean;
-            /** @description Role that created the database. */
-            createdBy: string;
+            /** @description Role that created the database; null when not recorded (databases created outside the control plane). */
+            createdBy: string | null;
             /**
              * Format: date-time
-             * @description Creation time.
+             * @description Creation time; null when not recorded (databases created outside the control plane).
              */
-            createdAt: string;
+            createdAt: string | null;
         };
         /** @description All databases. */
         DatabaseList: {
@@ -2611,7 +2699,7 @@ export interface components {
             collations: {
                 /** @description Locale name, for example `en_US.UTF-8` or `C`. */
                 name: string;
-                /** @description Encodings the locale can be combined with; null means every encoding. */
+                /** @description Encodings the locale can be combined with. `null` means every encoding; an empty array means none (the locale is listed but cannot be combined with any encoding the server offers). */
                 encodings: string[] | null;
                 /** @description Whether it is used when the field is omitted. */
                 isDefault: boolean;
@@ -2691,8 +2779,9 @@ export interface components {
          * @description Why a column cannot be the distribution column. When several reasons apply the first of this list wins:
          *     `shardingDisabled` sharding is not enabled on the database; `tableNotPlain` the table is already
          *     distributed or a reference table; `unsupportedType` the column type cannot be hashed by the engine;
-         *     `notInUniqueKey` a hash-distributed table needs a primary or unique key that includes the distribution
-         *     column and this column is not part of one.
+         *     `notInUniqueKey` the table has at least one primary or unique key that does not contain this column
+         *     (PostgreSQL requires the partition key in every unique index; the keys are listed in
+         *     `TableColumn.blockingKeys`). A table without any unique key never has this reason.
          * @enum {string}
          */
         DistributionBlockedReason: "shardingDisabled" | "tableNotPlain" | "unsupportedType" | "notInUniqueKey";
@@ -2700,8 +2789,10 @@ export interface components {
         TableColumn: {
             /** @description Column name. */
             name: string;
-            /** @description PostgreSQL type name as `format_type` prints it, for example `bigint` or `numeric(12,2)`. */
+            /** @description The text of PostgreSQL `format_type(atttypid, atttypmod)`, for example `bigint`, `character varying(20)` or `numeric(12,2)`. For display only; clients must not parse it. */
             type: string;
+            /** @description Names of the primary and unique keys (index names) that do not contain this column. Non-empty exactly when `distributionBlockedReason` is `notInUniqueKey`. */
+            blockingKeys: string[];
             /** @description True when the column has no NOT NULL constraint. */
             nullable: boolean;
             /** @description Whether `PUT .../distribution` accepts this column as `distributionColumn` now. */
@@ -2726,6 +2817,14 @@ export interface components {
             schema: string;
             /** @description Table name. */
             table: string;
+        };
+        /** @description How to put a table under ledger control. */
+        EnableTableLedgerRequest: {
+            /**
+             * @description `appendOnly` allows INSERT only; `updatable` also allows UPDATE and DELETE and keeps a history table.
+             * @enum {string}
+             */
+            mode: "appendOnly" | "updatable";
         };
         /** @description How to distribute a plain table. */
         DistributeTableRequest: {
@@ -3508,7 +3607,7 @@ export interface components {
          *     `failure`. Read-only operations are not audited except `executeQuery`.
          * @enum {string}
          */
-        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert";
+        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "enableTableLedger" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert";
         /** @description One audit log entry. */
         AuditEvent: {
             /**
@@ -3644,9 +3743,10 @@ export interface components {
         LedgerStatus: {
             /** @description Database. */
             databaseName: string;
-            mode: components["schemas"]["LedgerMode"];
-            /** @description Automatic digest interval. */
-            digestIntervalSeconds: number;
+            /** @description Ledger mode of the database; null when not available (no catalog stores it). */
+            mode: components["schemas"]["LedgerMode"] | null;
+            /** @description Automatic digest interval; null when not available. */
+            digestIntervalSeconds: number | null;
             /** @description Verification state of the database; null when not available. */
             verificationState: components["schemas"]["LedgerVerificationState"] | null;
             /**
@@ -3865,6 +3965,12 @@ export interface components {
              * @description For an updatable table, the specific row version to prove; null proves the current version.
              */
             ledgerTxId?: number | null;
+            /**
+             * @description Which ledger entry of the row to prove (`kingres.ledger_inclusion_proof` argument `op`). `I` proves that the version was written, `D` that it was removed (updatable tables only).
+             * @default I
+             * @enum {string}
+             */
+            op?: "I" | "D";
         };
         /** @description One sibling hash on a Merkle path. */
         MerkleStep: {
@@ -3885,6 +3991,11 @@ export interface components {
             primaryKey: {
                 [key: string]: unknown;
             };
+            /**
+             * @description The entry this proof is for. `I` means the row version was written in the transaction, `D` that it was removed in the transaction.
+             * @enum {string}
+             */
+            op: "I" | "D";
             /**
              * Format: int32
              * @description Chain holding the row.
@@ -4085,8 +4196,9 @@ export interface components {
         };
         /**
          * @description The caller is authenticated but lacks the cluster role named by `x-required-role`, or the CSRF token is
-         *     missing or wrong. For the setup-token operations: the request did not come from a permitted address
-         *     while the panel is still `localhostOnly`.
+         *     missing or wrong. For the setup-token operations: the request did not come from a permitted address.
+         *     While `localhostOnly` is true (the server listens on loopback addresses only) the permitted addresses are the
+         *     loopback addresses `127.0.0.0/8` and `::1`; otherwise every address is permitted.
          */
         Forbidden: {
             headers: {
@@ -4774,6 +4886,31 @@ export interface operations {
             503: components["responses"]["ServiceUnavailable"];
         };
     };
+    getClusterSummary: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Cluster summary. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClusterSummary"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
     listServers: {
         parameters: {
             query?: {
@@ -5281,6 +5418,45 @@ export interface operations {
         };
         responses: {
             202: components["responses"]["AcceptedTask"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    enableTableLedger: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EnableTableLedgerRequest"];
+            };
+        };
+        responses: {
+            /** @description The table with its ledger properties. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Table"];
+                };
+            };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];

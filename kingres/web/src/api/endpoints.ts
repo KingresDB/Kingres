@@ -69,6 +69,19 @@ export const endpoints = {
 
   // --- cluster and servers
   getCluster: () => j(api.GET('/cluster')),
+  getClusterSummary: () => j(api.GET('/cluster/summary')),
+  enableTableLedger: (
+    databaseName: string,
+    schemaName: string,
+    tableName: string,
+    mode: 'appendOnly' | 'updatable',
+  ) =>
+    j(
+      api.PUT('/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/ledger', {
+        params: { path: { databaseName, schemaName, tableName } },
+        body: { mode },
+      }),
+    ),
   listServers: () => j(api.GET('/servers')),
   getServer: (serverId: ServerId) =>
     j(api.GET('/servers/{serverId}', { params: { path: { serverId } } })),

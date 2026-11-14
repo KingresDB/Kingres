@@ -15,7 +15,7 @@ import NotAvailable from '@/components/NotAvailable.vue'
 import ProblemNotice from '@/components/ProblemNotice.vue'
 import TaskProgress from '@/components/TaskProgress.vue'
 import { endpoints } from '@/api/endpoints'
-import { keys, useLedgerStatusList, usePagedQuery } from '@/api/queries'
+import { every, keys, useLedgerStatusList, usePagedQuery } from '@/api/queries'
 import { useTaskAction } from '@/composables/useTask'
 import { LEDGER_MODE_LABEL, LEDGER_STATE } from '@/lib/status'
 import { formatAgo, formatDateTime, formatNumber, shortHash } from '@/lib/format'
@@ -73,7 +73,7 @@ const verifications = useQuery({
   queryKey: computed(() => [...keys.ledger(dbName.value), 'verifications']),
   queryFn: () => endpoints.listLedgerVerifications(dbName.value, { limit: 10 }),
   enabled: computed(() => !!dbName.value),
-  refetchInterval: 5000,
+  refetchInterval: every(5000),
 })
 
 const generate = useMutation({
@@ -89,7 +89,12 @@ const verify = useTaskAction(
 )
 
 // Row inclusion proof lookup
-const proofForm = ref({ schema: 'public', table: 'orders', key: '{"id": 9000000001}' })
+const proofForm = ref({
+  schema: 'public',
+  table: 'orders',
+  key: '{"id": 9000000001}',
+  op: 'I' as 'I' | 'D',
+})
 const proof = ref<InclusionProof | null>(null)
 const keyError = ref('')
 const proofMutation = useMutation({
@@ -109,6 +114,7 @@ const proofMutation = useMutation({
       schema: proofForm.value.schema,
       table: proofForm.value.table,
       primaryKey,
+      op: proofForm.value.op,
     })
   },
   onSuccess: (p) => {
@@ -156,9 +162,9 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
             <NotAvailable v-else />
           </div>
           <p class="muted">
-            {{ LEDGER_MODE_LABEL[status.mode] }},
+            <NullableValue :value="status.mode" :format="(m) => LEDGER_MODE_LABEL[m]" />,
             <NullableValue :value="status.ledgerTableCount" /> ledger table(s), digest every
-            {{ status.digestIntervalSeconds }} s.
+            <NullableValue :value="status.digestIntervalSeconds" :format="(n) => `${n} s`" />.
             <template v-if="status.lastVerifiedAt"
               >Last verified {{ formatAgo(status.lastVerifiedAt) }}.</template
             >
@@ -181,17 +187,15 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
               <tbody>
                 <tr v-for="c in status.chains" :key="c.shardGroupId">
                   <th scope="row">Group {{ c.shardGroupId }}</th>
-                  <td class="num">{{ formatNumber(c.latestBlockHeight) }}</td>
-                  <td class="mono" :title="c.latestBlockHash ?? undefined">
-                    {{ shortHash(c.latestBlockHash) }}
-                  </td>
-                  <td>{{ formatAgo(c.latestBlockAt) }}</td>
                   <td class="num">
-                    {{
-                      c.lastVerifiedBlockHeight === null
-                        ? '-'
-                        : formatNumber(c.lastVerifiedBlockHeight)
-                    }}
+                    <NullableValue :value="c.latestBlockHeight" :format="formatNumber" />
+                  </td>
+                  <td class="mono" :title="c.latestBlockHash ?? undefined">
+                    <NullableValue :value="c.latestBlockHash" :format="shortHash" />
+                  </td>
+                  <td><NullableValue :value="c.latestBlockAt" :format="(v) => formatAgo(v)" /></td>
+                  <td class="num">
+                    <NullableValue :value="c.lastVerifiedBlockHeight" :format="formatNumber" />
                   </td>
                   <td>
                     <StatusBadge
@@ -421,6 +425,13 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
               />
               <span v-if="keyError" class="error" role="alert">{{ keyError }}</span>
             </div>
+            <div class="field">
+              <label for="p-op">Entry</label>
+              <select id="p-op" v-model="proofForm.op">
+                <option value="I">Insert (the row was written)</option>
+                <option value="D">Delete (the row was removed or replaced)</option>
+              </select>
+            </div>
             <GateButton
               op="createInclusionProof"
               type="submit"
@@ -432,6 +443,8 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
           <ProblemNotice v-if="proofApiError" :error="proofApiError" />
           <div v-if="proof" class="stack" data-testid="proof">
             <dl class="kv">
+              <dt>Entry</dt>
+              <dd>{{ proof.op === 'I' ? 'Insert' : 'Delete' }}</dd>
               <dt>Leaf hash</dt>
               <dd class="mono">{{ proof.leafHash }}</dd>
               <dt>Transaction</dt>

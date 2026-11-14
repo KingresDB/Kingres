@@ -116,6 +116,9 @@ const start = () => {
                     ? BLOCKED_TEXT[c.distributionBlockedReason]
                     : 'Not allowed.'
                 }}
+                <template v-if="c.blockingKeys.length">
+                  Keys without it: <code>{{ c.blockingKeys.join(', ') }}</code>.
+                </template>
               </li>
             </ul>
           </div>

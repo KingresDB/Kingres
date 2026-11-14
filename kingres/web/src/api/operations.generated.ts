@@ -22,12 +22,14 @@ export const operations = {
   deleteServerGroup: { role: 'kingres_ops', method: 'DELETE', path: '/server-groups/{serverGroupName}' },
   distributeTable: { role: 'kingres_admin', method: 'PUT', path: '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/distribution' },
   dropDatabase: { role: 'kingres_admin', method: 'DELETE', path: '/databases/{databaseName}' },
+  enableTableLedger: { role: 'kingres_admin', method: 'PUT', path: '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/ledger' },
   executeQuery: { role: 'kingres_readonly', method: 'POST', path: '/query' },
   failoverServer: { role: 'kingres_ops', method: 'POST', path: '/servers/{serverId}/failover' },
   generateLedgerDigest: { role: 'kingres_ops', method: 'POST', path: '/databases/{databaseName}/ledger/digests' },
   getBucketDistribution: { role: 'kingres_readonly', method: 'GET', path: '/databases/{databaseName}/bucket-distribution' },
   getCluster: { role: 'kingres_readonly', method: 'GET', path: '/cluster' },
   getClusterSettings: { role: 'kingres_readonly', method: 'GET', path: '/settings/cluster' },
+  getClusterSummary: { role: 'kingres_stats', method: 'GET', path: '/cluster/summary' },
   getDatabase: { role: 'kingres_readonly', method: 'GET', path: '/databases/{databaseName}' },
   getDatabaseCreateOptions: { role: 'kingres_readonly', method: 'GET', path: '/database-create-options' },
   getHealth: { role: 'none', method: 'GET', path: '/healthz' },
@@ -100,4 +102,4 @@ export const operations = {
 export type OperationId = keyof typeof operations
 
 /** The closed list of audit actions (components/schemas/AuditAction). */
-export const auditActions = ['login', 'logout', 'loginFailed', 'setupTokenRejected', 'initCluster', 'joinCluster', 'updateThisServerSettings', 'restartThisServerInstance', 'stopThisServerInstance', 'startThisServerInstance', 'leaveCluster', 'addServer', 'updateServer', 'removeServer', 'failoverServer', 'autoFailover', 'createServerGroup', 'deleteServerGroup', 'createDatabase', 'updateDatabase', 'dropDatabase', 'distributeTable', 'restorePreferredPrimaries', 'startRebalance', 'stopRebalance', 'cancelTask', 'createRole', 'updateRole', 'deleteRole', 'setRoleMemberships', 'setRoleClusterRoles', 'createGrant', 'revokeGrants', 'applyGrantTemplate', 'replaceNetworkAccess', 'updateClusterSettings', 'generateLedgerDigest', 'startLedgerVerification', 'executeQuery', 'acknowledgeAlert'] as const
+export const auditActions = ['login', 'logout', 'loginFailed', 'setupTokenRejected', 'initCluster', 'joinCluster', 'updateThisServerSettings', 'restartThisServerInstance', 'stopThisServerInstance', 'startThisServerInstance', 'leaveCluster', 'addServer', 'updateServer', 'removeServer', 'failoverServer', 'autoFailover', 'createServerGroup', 'deleteServerGroup', 'createDatabase', 'updateDatabase', 'dropDatabase', 'distributeTable', 'enableTableLedger', 'restorePreferredPrimaries', 'startRebalance', 'stopRebalance', 'cancelTask', 'createRole', 'updateRole', 'deleteRole', 'setRoleMemberships', 'setRoleClusterRoles', 'createGrant', 'revokeGrants', 'applyGrantTemplate', 'replaceNetworkAccess', 'updateClusterSettings', 'generateLedgerDigest', 'startLedgerVerification', 'executeQuery', 'acknowledgeAlert'] as const

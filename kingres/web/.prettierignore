@@ -5,3 +5,4 @@ src/api/schema.d.ts
 src/api/operations.generated.ts
 package-lock.json
 src/components/brand.generated.ts
+.e2e

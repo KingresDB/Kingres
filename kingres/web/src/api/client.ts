@@ -75,7 +75,12 @@ export async function unwrap<T>(call: Promise<Result<T>>): Promise<T> {
     type: 'about:blank',
     title: result.response.statusText || 'Unexpected response',
     status: result.response.status >= 400 ? result.response.status : 500,
-    code: result.response.status >= 500 ? 'internal_error' : 'bad_request',
+    // A proxy answers 502/503/504 with its own page when the server is down.
+    code: [502, 503, 504].includes(result.response.status)
+      ? 'service_unavailable'
+      : result.response.status >= 500
+        ? 'internal_error'
+        : 'bad_request',
     detail: 'The server answered with something that is not a problem document.',
   })
 }

@@ -6,11 +6,14 @@ import { RouterLink } from 'vue-router'
 import PageHeader from '@/components/PageHeader.vue'
 import QueryBoundary from '@/components/QueryBoundary.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
+import NullableValue from '@/components/NullableValue.vue'
 import LineChart from '@/components/LineChart.vue'
-import { useAlerts, useCluster, useMetric, useTasks } from '@/api/queries'
+import { useAlerts, useCluster, useClusterSummary, useMetric, useTasks } from '@/api/queries'
 import { HEALTH, SEVERITY, TASK_STATE } from '@/lib/status'
 import { formatAgo, formatNumber } from '@/lib/format'
 import { toChartSeries } from '@/lib/metrics'
+import { isUnsupported } from '@/api/problem'
+import ProblemNotice from '@/components/ProblemNotice.vue'
 import { useSessionStore } from '@/stores/session'
 
 const session = useSessionStore()
@@ -19,6 +22,8 @@ const canCluster = computed(() => session.can('getCluster'))
 const canAlerts = computed(() => session.can('listAlerts'))
 const canTasks = computed(() => session.can('listTasks'))
 const cluster = useCluster(canCluster)
+// A stats-only account cannot read /cluster; GET /cluster/summary is open to it.
+const summary = useClusterSummary(() => !canCluster.value)
 const alerts = useAlerts('open', canAlerts)
 const tasks = useTasks(5, canTasks)
 const cpu = useMetric('cpuUsagePercent', 60, 'server')
@@ -27,11 +32,46 @@ const lag = useMetric('replicationLagSeconds', 60, 'server')
 const memory = useMetric('memoryUsedBytes', 60, 'server')
 
 const c = computed(() => cluster.data.value)
+// When the server has no metrics at all, say so once instead of in four cards.
+const metricsUnsupported = computed(() =>
+  [cpu, tps, lag, memory].every((q) => isUnsupported(q.error.value)),
+)
 </script>
 
 <template>
   <PageHeader title="Dashboard" subtitle="Cluster health at a glance." />
   <div class="stack-lg">
+    <QueryBoundary
+      v-if="!canCluster"
+      :loading="summary.isPending.value"
+      :error="summary.error.value"
+      @retry="summary.refetch()"
+    >
+      <section
+        v-if="summary.data.value"
+        class="grid-cards"
+        aria-label="Summary"
+        data-testid="cluster-summary"
+      >
+        <div class="card kpi">
+          <span class="label">Cluster health</span>
+          <span class="value"><StatusBadge :meta="HEALTH[summary.data.value.health]" /></span>
+          <span class="muted"><NullableValue :value="summary.data.value.name" /></span>
+        </div>
+        <div class="card kpi">
+          <span class="label">Servers</span>
+          <span class="value">{{ summary.data.value.serverCount }}</span>
+        </div>
+        <div class="card kpi">
+          <span class="label">Databases</span>
+          <span class="value">{{ summary.data.value.databaseCount }}</span>
+        </div>
+        <div class="card kpi">
+          <span class="label">Open alerts</span>
+          <span class="value">{{ summary.data.value.openAlerts }}</span>
+        </div>
+      </section>
+    </QueryBoundary>
     <QueryBoundary
       v-if="canCluster"
       :loading="cluster.isPending.value"
@@ -79,7 +119,7 @@ const c = computed(() => cluster.data.value)
           <span class="label">Manager leader</span>
           <span class="value">
             <template v-if="c.managerLeader">Server {{ c.managerLeader.serverId }}</template>
-            <StatusBadge v-else :meta="{ tone: 'danger', icon: '✖', label: 'No leader' }" />
+            <StatusBadge v-else :meta="{ tone: 'neutral', icon: '○', label: 'Not reported' }" />
           </span>
           <span class="muted mono">{{ c.managerLeader?.address }}</span>
         </div>
@@ -95,7 +135,8 @@ const c = computed(() => cluster.data.value)
     </QueryBoundary>
     <section aria-labelledby="charts-h" class="stack">
       <h2 id="charts-h">Last hour</h2>
-      <div class="grid-2">
+      <ProblemNotice v-if="metricsUnsupported" :error="cpu.error.value" />
+      <div v-else class="grid-2">
         <div class="card">
           <QueryBoundary :loading="cpu.isPending.value" :error="cpu.error.value">
             <LineChart title="CPU usage" unit="percent" :series="toChartSeries(cpu.data.value)" />

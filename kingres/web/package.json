@@ -22,7 +22,8 @@
     "api:generate": "node scripts/gen-api.mjs",
     "api:check": "node scripts/gen-api.mjs --check",
     "brand:sync": "node scripts/brand-sync.mjs",
-    "brand:check": "node scripts/brand-sync.mjs --check"
+    "brand:check": "node scripts/brand-sync.mjs --check",
+    "e2e": "node scripts/e2e/run.mjs"
   },
   "dependencies": {
     "@tanstack/vue-query": "^5.107.1",
@@ -49,6 +50,7 @@
     "msw": "^3.0.5",
     "openapi-typescript": "^7.13.0",
     "prettier": "^3.10.1",
+    "puppeteer-core": "^25.17.0",
     "typescript": "~5.9",
     "typescript-eslint": "^8.72.2",
     "vite": "^8.3.8",

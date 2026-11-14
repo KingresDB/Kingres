@@ -3,7 +3,7 @@
 # KingresDB web panel
 
 The management console of KingresDB: a single-page application (Vue 3, TypeScript, Vite) that is a client
-of the REST API in `kingres/api/openapi.yaml` (revision 0.2.0, 84 operations) and nothing else. The Go server (`kingresd`) will embed the
+of the REST API in `kingres/api/openapi.yaml` (revision 0.3.0, 86 operations) and nothing else. The Go server (`kingresd`) will embed the
 production build from `dist/` and serve it on every node. The information architecture follows the
 "Management panel" chapter of `docs/architecture.md`: a first-run wizard, a **Cluster** scope and a
 **This server** scope.
@@ -60,6 +60,37 @@ string in `dist/`).
 | `npm run api:check`           | Fail if the generated files are out of date (also run by `npm test`)                     |
 | `npm run brand:sync`          | Copy the favicons from `kingres/brand/` into `public/` and regenerate the logo path data |
 | `npm run brand:check`         | Fail if the committed brand files differ from `kingres/brand/` (also run by `npm test`)  |
+
+## End-to-end test against the real server
+
+`npm run e2e` is one command. It needs Windows with WSL2 (distribution `Ubuntu-24.04`, user `kingres`), Go, Chrome or Edge, and
+the installed KingresDB at `~/kingres-work/install` inside WSL. It:
+
+1. builds `kingresd` for Linux from `kingres/control-plane` (or uses `KINGRESD_BIN`),
+2. copies the installation to `~/kw-web/install`, starts `kingresd` there on a fresh data directory (API port 58201,
+   PostgreSQL port 58200; override with `E2E_API_PORT`, `E2E_PG_PORT`),
+3. starts the panel with the mock off (`vite --mode backend`, proxy to the backend, port 5188),
+4. drives a headless browser through the real flow (`scripts/e2e/flow.mjs`): wizard with the real setup token (wrong
+   token and wrong data directory first), sign-in, reload, roles (duplicate, disable, a stats-only account), a sharded
+   database with the ledger, tables made with psql, distribute and enable-ledger from the panel, workbench query and
+   SQL error, grant, network rule, every page, calm notices for unsupported operations, the audit log, drop database,
+   a server restart that signs everyone out, and the stats-only and read-only accounts,
+5. prints a report (notes, per-page state, every HTTP error the browser saw) and tears everything down.
+
+The exit code is 0 only if every step passed. Screenshots are in `.e2e/shots/` (ignored by git). `E2E_KEEP_INSTALL=1`
+keeps `~/kw-web/install` for faster re-runs; `E2E_KEEP_RUNNING=1` leaves the processes running. `scripts/e2e/backend.sh` is
+the WSL side (`prepare`, `start`, `restart`, `token`, `psql`, `stop`). `puppeteer-core` is a development dependency.
+
+### Where kingresd 0.2.0-dev differs from the contract (found by the run)
+
+The panel copes with these; they are for the server team to fix. Only the first one needs a workaround in the panel (the
+Ledger page falls back to per-database status, see `src/api/queries.ts`).
+
+- `GET /ledger/status` answers 404 `not_found` (the contract lists 200).
+- `GET /grants` without `grantee` and `database` answers 404 (the panel always sends both).
+- A table with a ledger has `classes: [plain, ledger]`; the contract says `plain` never combines.
+- `Server.isManagerLeader` is false while `GET /this-server` says `isManagerLeader: true` and `ClusterOverview.managerLeader` is null.
+- `ClusterSummary.databaseCount` counts 3 databases where `GET /databases` lists 2.
 
 ## Brand
 

@@ -326,6 +326,9 @@ function seedDatabases(): DbRec[] {
   }
   const reports: DbRec = {
     info: base('reports', {
+      // Created outside the control plane: no record of who created it, or when.
+      createdBy: null,
+      createdAt: null,
       general: {
         owner: 'analyst',
         encoding: 'UTF8',
@@ -861,7 +864,8 @@ export function serverView(s: MockState, rec: ServerRec): Server {
     serverGroup: rec.serverGroup,
     shouldHaveShards: rec.shouldHaveShards,
     isManagerLeader: rec.id === '10.0.0.11',
-    version: rec.version,
+    // The version of a server that has not reported yet is unknown.
+    version: rec.telemetry ? rec.version : null,
     uptimeSeconds: rec.telemetry ? Math.floor((Date.now() - rec.startedAt) / 1000) : null,
     joinedAt: rec.joinedAt,
     lastHeartbeatAt: rec.status === 'dead' ? ago(600) : ago(1),

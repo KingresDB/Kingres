@@ -15,7 +15,7 @@ import ResourceMeter from '@/components/ResourceMeter.vue'
 import ProblemNotice from '@/components/ProblemNotice.vue'
 import TaskActionDialog from '@/components/TaskActionDialog.vue'
 import { endpoints } from '@/api/endpoints'
-import { keys, POLL, useThisServer } from '@/api/queries'
+import { every, keys, POLL, useThisServer } from '@/api/queries'
 import { INSTANCE_STATE, SERVICE_STATE } from '@/lib/status'
 import { instanceLabel } from '@/lib/cluster'
 import { formatBytes, formatDuration, percent } from '@/lib/format'
@@ -26,12 +26,12 @@ const info = useThisServer()
 const resources = useQuery({
   queryKey: [...keys.thisServer, 'resources'],
   queryFn: endpoints.getThisServerResources,
-  refetchInterval: POLL.fast,
+  refetchInterval: every(POLL.fast),
 })
 const instances = useQuery({
   queryKey: [...keys.thisServer, 'instances'],
   queryFn: endpoints.listThisServerInstances,
-  refetchInterval: POLL.fast,
+  refetchInterval: every(POLL.fast),
 })
 const local = useQuery({
   queryKey: [...keys.thisServer, 'settings'],
@@ -101,7 +101,9 @@ const percentText = (v: number) => percent(v)
         </div>
         <div class="card kpi">
           <span class="label">Version</span><span class="value">{{ info.data.value.version }}</span
-          ><span class="muted">PostgreSQL {{ info.data.value.postgresVersion }}</span>
+          ><span class="muted"
+            >PostgreSQL <NullableValue :value="info.data.value.postgresVersion"
+          /></span>
         </div>
         <div class="card kpi">
           <span class="label">Uptime</span

@@ -86,6 +86,12 @@ function setupTaskSummary(s: MockState): S['SetupTaskSummary'] | null {
     state: rec.task.state,
     progressPercent: rec.task.progress.percent,
     error: rec.task.error,
+    steps: rec.task.progress.steps.map((st) => ({
+      name: st.name,
+      state: st.state === 'skipped' ? 'pending' : st.state,
+    })),
+    createdAt: rec.task.createdAt,
+    updatedAt: rec.task.updatedAt,
   }
 }
 
@@ -493,6 +499,8 @@ function columnsFor(rec: ReturnType<typeof db>, t: Table): S['TableColumn'][] {
       name: d.name,
       type: d.type,
       nullable: !d.key,
+      // The unique keys that lack the column (named in the panel's explanation).
+      blockingKeys: reason === 'notInUniqueKey' ? [`${t.name}_pkey`] : [],
       canBeDistributionColumn: reason === null,
       distributionBlockedReason: reason,
     }
@@ -759,7 +767,7 @@ export function createHandlers(): HttpHandler[] {
         address: c.s.servers[0]?.address ?? '',
         hostname: c.s.servers[0]?.hostname ?? '',
         version: '0.1.0',
-        postgresVersion: '18.1',
+        postgresVersion: c.s.node.leftCluster ? null : '18.1',
         nodeState: c.s.node.leftCluster ? 'standalone' : 'clustered',
         clusterId: c.s.node.leftCluster ? null : c.s.clusterId,
         uptimeSeconds: Math.floor((Date.now() - (c.s.servers[0]?.startedAt ?? Date.now())) / 1000),
@@ -844,6 +852,17 @@ export function createHandlers(): HttpHandler[] {
 
     // --- cluster and servers
     getCluster: (c) => ok(overview(c.s)),
+    getClusterSummary: (c) => {
+      const o = overview(c.s)
+      return ok({
+        clusterId: o.clusterId,
+        name: o.name,
+        health: o.health,
+        serverCount: o.servers.total,
+        databaseCount: o.databaseCount,
+        openAlerts: o.openAlerts.critical + o.openAlerts.warning + o.openAlerts.info,
+      } satisfies S['ClusterSummary'])
+    },
     listServers: (c) => {
       const status = c.url.searchParams.get('status')
       const group = c.url.searchParams.get('serverGroup')
@@ -1311,6 +1330,27 @@ export function createHandlers(): HttpHandler[] {
           },
         }),
       )
+    },
+    enableTableLedger: (c) => {
+      const s = c.s
+      const rec = db(s, c.params.databaseName ?? '')
+      const t = rec.tables.find(
+        (x) => x.schema === c.params.schemaName && x.name === c.params.tableName,
+      )
+      if (!t) throw problem('not_found', 'Table does not exist.')
+      const { mode } = body<S['EnableTableLedgerRequest']>(c)
+      if (mode !== 'appendOnly' && mode !== 'updatable')
+        throw validationFailed([{ field: 'mode', message: 'Use appendOnly or updatable.' }])
+      if (!s.settings.features.ledger)
+        throw problem('unprocessable', 'The ledger is not enabled for this cluster.')
+      if (t.ledger)
+        throw problem('conflict', 'The table already has a ledger. It cannot be changed.')
+      t.ledger = { mode, historyTable: mode === 'updatable' ? `${t.name}_history` : null }
+      // `plain` never combines with another class.
+      t.classes = t.classes.includes('plain') ? ['ledger'] : [...t.classes, 'ledger']
+      if (rec.info.ledger.mode === 'off' || rec.info.ledger.mode === null)
+        rec.info.ledger.mode = 'optIn'
+      return ok(t)
     },
     listColocationGroups: (c) => ok({ items: db(c.s, c.params.databaseName ?? '').colocations }),
     listBuckets: (c) => {
@@ -1786,6 +1826,13 @@ export function createHandlers(): HttpHandler[] {
       const s = c.s
       const b = body<S['ClusterSettingsUpdateRequest']>(c)
       const errors: { field: string; message: string }[] = []
+      if (Object.keys(b).length === 0)
+        throw validationFailed([{ field: '/', message: 'at least one property is required' }])
+      for (const group of ['autoFailover', 'rebalance', 'features'] as const) {
+        const g = b[group]
+        if (g !== undefined && Object.keys(g).length === 0)
+          errors.push({ field: `/${group}`, message: 'at least one property is required' })
+      }
       if (
         b.defaultReplicaCount !== undefined &&
         (b.defaultReplicaCount < 0 || b.defaultReplicaCount > 3)
@@ -1984,6 +2031,7 @@ export function createHandlers(): HttpHandler[] {
         table: b.table,
         primaryKey: b.primaryKey,
         shardGroupId: gid,
+        op: b.op ?? 'I',
         ledgerTxId: b.ledgerTxId ?? 48_000_123,
         leafHash: fakeHash(`leaf${key}`),
         leafIndex: 5,

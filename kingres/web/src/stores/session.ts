@@ -10,6 +10,17 @@ import { canCall, highestRole, type OperationId } from '@/api/roles'
 import type { Session } from '@/api/types'
 import { ApiError } from '@/api/problem'
 
+/**
+ * The server accepted the sign-in but the next request was not signed in: the browser did not keep
+ * the session cookie. The cookie is `Secure`, which browsers accept only over HTTPS or on localhost.
+ */
+export class SessionCookieError extends Error {
+  constructor() {
+    super('The browser did not keep the session cookie')
+    this.name = 'SessionCookieError'
+  }
+}
+
 export const useSessionStore = defineStore('session', () => {
   const session = ref<Session | null>(null)
   /** True once the initial session check has finished (successfully or not). */
@@ -46,6 +57,15 @@ export const useSessionStore = defineStore('session', () => {
 
   async function signIn(username: string, password: string): Promise<void> {
     adopt(await endpoints.login({ username, password }))
+    // Prove that the cookie came back: a Secure cookie set over plain HTTP (not localhost) is dropped.
+    try {
+      await endpoints.getSession()
+    } catch (error) {
+      if (error instanceof ApiError && error.code === 'unauthenticated') {
+        adopt(null)
+        throw new SessionCookieError()
+      }
+    }
     restored.value = true
   }
 

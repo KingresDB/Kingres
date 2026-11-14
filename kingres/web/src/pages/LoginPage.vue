@@ -6,7 +6,7 @@ import { useRoute, useRouter } from 'vue-router'
 import ProblemNotice from '@/components/ProblemNotice.vue'
 import FormField from '@/components/FormField.vue'
 import BrandLogo from '@/components/BrandLogo.vue'
-import { useSessionStore } from '@/stores/session'
+import { SessionCookieError, useSessionStore } from '@/stores/session'
 
 const session = useSessionStore()
 const route = useRoute()
@@ -53,7 +53,15 @@ async function submit(): Promise<void> {
         </p>
         <h1 id="login-title">Sign in to KingresDB</h1>
         <p class="muted">Use your PostgreSQL role. Your cluster role decides what you can do.</p>
-        <ProblemNotice v-if="error" :error="error" />
+        <p v-if="error instanceof SessionCookieError" class="notice tone-warn" role="alert">
+          <span aria-hidden="true">&#9650;</span>
+          <span>
+            <strong>Your browser did not keep the session.</strong> The session cookie is only kept
+            over HTTPS or when the panel is opened at <code>localhost</code>. Use an HTTPS address
+            or open the panel on this server through <code>http://localhost</code>.
+          </span>
+        </p>
+        <ProblemNotice v-else-if="error" :error="error" />
         <FormField v-slot="slot" label="User name">
           <input
             v-bind="slot"

@@ -13,15 +13,25 @@ import {
   type QueryKey,
 } from '@tanstack/vue-query'
 import { endpoints } from './endpoints'
-import { isSessionLost, shouldRetry } from './problem'
+import { ApiError, isSessionLost, isUnsupported, shouldRetry } from './problem'
 import type { MetricName } from './types'
 
 /** Poll intervals in milliseconds. Background tabs are not polled (library default). */
 export const POLL = { fast: 3_000, normal: 10_000, slow: 30_000 } as const
 
+/**
+ * Polling interval that stops once the server has said "not supported yet": asking again every few
+ * seconds would only repeat the same answer.
+ */
+export const every =
+  (ms: number) =>
+  (query: { state: { error: unknown } }): number | false =>
+    isUnsupported(query.state.error) ? false : ms
+
 export const keys = {
   nodeState: ['nodeState'] as const,
   cluster: ['cluster'] as const,
+  clusterSummary: ['clusterSummary'] as const,
   servers: ['servers'] as const,
   server: (id: string) => ['server', id] as const,
   serverGroups: ['serverGroups'] as const,
@@ -84,7 +94,16 @@ export const useCluster = (enabled: MaybeRefOrGetter<boolean> = true) =>
   useQuery({
     queryKey: keys.cluster,
     queryFn: endpoints.getCluster,
-    refetchInterval: POLL.fast,
+    refetchInterval: every(POLL.fast),
+    enabled: computed(() => toValue(enabled)),
+  })
+
+/** The stats-level view of the cluster (needs only kingres_stats). */
+export const useClusterSummary = (enabled: MaybeRefOrGetter<boolean> = true) =>
+  useQuery({
+    queryKey: keys.clusterSummary,
+    queryFn: endpoints.getClusterSummary,
+    refetchInterval: every(POLL.fast),
     enabled: computed(() => toValue(enabled)),
   })
 
@@ -95,7 +114,7 @@ export const useServer = (id: MaybeRefOrGetter<string>) =>
   useQuery({
     queryKey: computed(() => keys.server(toValue(id))),
     queryFn: () => endpoints.getServer(toValue(id)),
-    refetchInterval: POLL.fast,
+    refetchInterval: every(POLL.fast),
   })
 
 export const useServerGroups = () =>
@@ -110,7 +129,7 @@ export const useDatabases = () =>
   useQuery({
     queryKey: keys.databases,
     queryFn: endpoints.listDatabases,
-    refetchInterval: POLL.normal,
+    refetchInterval: every(POLL.normal),
   })
 
 export const useDatabaseCreateOptions = () =>
@@ -130,7 +149,7 @@ export const useDatabase = (name: MaybeRefOrGetter<string>) =>
   useQuery({
     queryKey: computed(() => keys.database(toValue(name))),
     queryFn: () => endpoints.getDatabase(toValue(name)),
-    refetchInterval: POLL.normal,
+    refetchInterval: every(POLL.normal),
   })
 
 export const useTables = (name: MaybeRefOrGetter<string>) =>
@@ -154,7 +173,7 @@ export const useAllBuckets = (
   useQuery({
     queryKey: computed(() => keys.buckets(toValue(name) ?? '', toValue(colocationId) ?? -1)),
     enabled: computed(() => !!toValue(name) && toValue(colocationId) !== null),
-    refetchInterval: POLL.normal,
+    refetchInterval: every(POLL.normal),
     queryFn: async () => {
       const db = toValue(name) ?? ''
       const colocation = toValue(colocationId) ?? 0
@@ -180,7 +199,7 @@ export const useBucketDistribution = (
     queryKey: computed(() => keys.bucketDistribution(toValue(name) ?? '', toValue(colocationId))),
     queryFn: () => endpoints.getBucketDistribution(toValue(name) ?? '', toValue(colocationId)),
     enabled: computed(() => !!toValue(name)),
-    refetchInterval: POLL.normal,
+    refetchInterval: every(POLL.normal),
   })
 
 // --- replication and rebalance ----------------------------------------------------------------
@@ -189,14 +208,15 @@ export const useTopology = () =>
   useQuery({
     queryKey: keys.topology,
     queryFn: endpoints.getReplicationTopology,
-    refetchInterval: POLL.fast,
+    refetchInterval: every(POLL.fast),
   })
 
 export const useRebalanceStatus = () =>
   useQuery({
     queryKey: keys.rebalance,
     queryFn: endpoints.getRebalanceStatus,
-    refetchInterval: (q) => (q.state.data?.state === 'running' ? 1_500 : POLL.fast),
+    refetchInterval: (q) =>
+      isUnsupported(q.state.error) ? false : q.state.data?.state === 'running' ? 1_500 : POLL.fast,
   })
 
 export const useRebalanceReports = () =>
@@ -212,7 +232,7 @@ export const useTasks = (limit = 50, enabled: MaybeRefOrGetter<boolean> = true) 
     enabled: computed(() => toValue(enabled)),
     queryKey: [...keys.tasks, limit],
     queryFn: () => endpoints.listTasks({ limit }),
-    refetchInterval: POLL.fast,
+    refetchInterval: every(POLL.fast),
   })
 
 export const useAlerts = (
@@ -223,7 +243,7 @@ export const useAlerts = (
     enabled: computed(() => toValue(enabled)),
     queryKey: [...keys.alerts, state ?? 'all'],
     queryFn: () => endpoints.listAlerts({ limit: 100, state }),
-    refetchInterval: POLL.normal,
+    refetchInterval: every(POLL.normal),
   })
 
 export const useMetric = (metric: MetricName, rangeMinutes = 60, groupBy?: 'server' | 'database') =>
@@ -240,7 +260,7 @@ export const useMetric = (metric: MetricName, rangeMinutes = 60, groupBy?: 'serv
         groupBy,
       })
     },
-    refetchInterval: POLL.normal,
+    refetchInterval: every(POLL.normal),
     staleTime: 10_000,
   })
 
@@ -255,11 +275,36 @@ export const useRoles = (search?: MaybeRefOrGetter<string>) =>
 export const useClusterRoles = () =>
   useQuery({ queryKey: keys.clusterRoles, queryFn: endpoints.listClusterRoles, staleTime: 60_000 })
 
+/**
+ * Ledger status of every database that has a ledger. The contract has no 404 for GET /ledger/status,
+ * but kingresd 0.2.0-dev answers 404 not_found for it (a known deviation, listed in the README). So
+ * that the page still works against it, a 404 is answered by asking each database with a ledger for
+ * its own status, which that server does implement.
+ */
+async function ledgerStatusList() {
+  try {
+    return await endpoints.listLedgerStatus()
+  } catch (error) {
+    if (!(error instanceof ApiError) || error.code !== 'not_found') throw error
+    const databases = await endpoints.listDatabases()
+    const items = []
+    for (const d of databases.items) {
+      if (d.ledger.mode === 'off') continue
+      try {
+        items.push(await endpoints.getLedgerStatus(d.name))
+      } catch {
+        // A database whose ledger status cannot be read is left out of the list.
+      }
+    }
+    return { items }
+  }
+}
+
 export const useLedgerStatusList = () =>
   useQuery({
     queryKey: keys.ledgerStatus,
-    queryFn: endpoints.listLedgerStatus,
-    refetchInterval: POLL.normal,
+    queryFn: ledgerStatusList,
+    refetchInterval: every(POLL.normal),
   })
 
 // --- this server ------------------------------------------------------------------------------
@@ -268,7 +313,7 @@ export const useThisServer = () =>
   useQuery({
     queryKey: keys.thisServer,
     queryFn: endpoints.getThisServer,
-    refetchInterval: POLL.normal,
+    refetchInterval: every(POLL.normal),
   })
 
 // --- generic cursor-paged lists ---------------------------------------------------------------
@@ -290,7 +335,7 @@ export function usePagedQuery<T>(
     queryFn: ({ pageParam }) => fetchPage(pageParam),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (last) => last.nextCursor ?? undefined,
-    refetchInterval,
+    refetchInterval: refetchInterval === undefined ? undefined : every(refetchInterval),
     enabled: computed(() => toValue(enabled)),
   })
   const items = computed(() => query.data.value?.pages.flatMap((p) => p.items) ?? [])

@@ -71,26 +71,34 @@ const errors = computed(() =>
   }),
 )
 
+/**
+ * Only what the user changed. A PATCH is a partial update: the contract refuses an empty group
+ * (`features: {}`) and an empty body, so unchanged groups are left out entirely.
+ */
+function changes(): ClusterSettingsUpdateRequest {
+  const d = s.value
+  const body: ClusterSettingsUpdateRequest = {}
+  if (!d) return body
+  if (form.replicas !== d.defaultReplicaCount) body.defaultReplicaCount = form.replicas
+  if (form.durability !== d.defaultDurability) body.defaultDurability = form.durability
+  const af: NonNullable<ClusterSettingsUpdateRequest['autoFailover']> = {}
+  if (form.afEnabled !== d.autoFailover.enabled) af.enabled = form.afEnabled
+  if (form.afTimeout !== d.autoFailover.timeoutSeconds) af.timeoutSeconds = form.afTimeout
+  if (form.afMax !== d.autoFailover.maxCount) af.maxCount = form.afMax
+  if (Object.keys(af).length) body.autoFailover = af
+  if (form.maxMoves !== d.rebalance.maxConcurrentMoves)
+    body.rebalance = { maxConcurrentMoves: form.maxMoves }
+  // A feature can be turned on, never off.
+  const features: NonNullable<ClusterSettingsUpdateRequest['features']> = {}
+  if (form.sharding && !d.features.sharding) features.sharding = true
+  if (form.ledger && !d.features.ledger) features.ledger = true
+  if (Object.keys(features).length) body.features = features
+  return body
+}
+
+const unchanged = ref(false)
 const save = useMutation({
-  mutationFn: () => {
-    const d = s.value
-    const body: ClusterSettingsUpdateRequest = {
-      defaultReplicaCount: form.replicas,
-      defaultDurability: form.durability,
-      autoFailover: {
-        enabled: form.afEnabled,
-        timeoutSeconds: form.afTimeout,
-        maxCount: form.afMax,
-      },
-      rebalance: { maxConcurrentMoves: form.maxMoves },
-      // Only send features that are being turned on; turning one off is not possible.
-      features: {
-        ...(form.sharding && !d?.features.sharding ? { sharding: true } : {}),
-        ...(form.ledger && !d?.features.ledger ? { ledger: true } : {}),
-      },
-    }
-    return endpoints.updateClusterSettings(body)
-  },
+  mutationFn: () => endpoints.updateClusterSettings(changes()),
   onSuccess: async () => {
     saved.value = true
     await Promise.all([
@@ -107,7 +115,13 @@ const err = (f: string) => (submitted.value ? errors.value[f] : undefined) ?? se
 function submit(): void {
   submitted.value = true
   saved.value = false
-  if (Object.keys(errors.value).length === 0) save.mutate()
+  unchanged.value = false
+  if (Object.keys(errors.value).length > 0) return
+  if (Object.keys(changes()).length === 0) {
+    unchanged.value = true
+    return
+  }
+  save.mutate()
 }
 </script>
 
@@ -226,6 +240,9 @@ function submit(): void {
         <p class="hint muted">The first time a feature is enabled, every server needs a restart.</p>
       </fieldset>
       <ProblemNotice v-if="save.error.value" :error="save.error.value" />
+      <p v-if="unchanged" class="notice tone-info" role="status">
+        <span aria-hidden="true">&#9432;</span> Nothing was changed, so nothing was saved.
+      </p>
       <p v-if="saved" class="notice tone-ok" role="status">
         <span aria-hidden="true">&#10003;</span> Settings saved.
       </p>
