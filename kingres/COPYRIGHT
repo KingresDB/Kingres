@@ -1,0 +1,33 @@
+KingresDB
+
+KingresDB is derived from PostgreSQL.  The PostgreSQL source in this
+repository remains under the PostgreSQL License; its copyright notices and
+the license text are in the file COPYRIGHT at the top of the repository and
+are kept unchanged.
+
+The KingresDB-specific code (everything under kingres/ and
+contrib/kingres_*, and the changes to upstream files listed in
+kingres/docs/dev/core-patches.md) is released under the same license:
+
+Portions Copyright (c) 2026, RooyeKhat Media Co
+
+Permission to use, copy, modify, and distribute this software and its
+documentation for any purpose, without fee, and without a written agreement
+is hereby granted, provided that the above copyright notice and this
+paragraph and the following two paragraphs appear in all copies.
+
+IN NO EVENT SHALL ROOYEKHAT MEDIA CO BE LIABLE TO ANY PARTY FOR DIRECT,
+INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, INCLUDING LOST
+PROFITS, ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS DOCUMENTATION, EVEN
+IF ROOYEKHAT MEDIA CO HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH
+DAMAGE.
+
+ROOYEKHAT MEDIA CO SPECIFICALLY DISCLAIMS ANY WARRANTIES, INCLUDING, BUT
+NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+PARTICULAR PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS ON AN "AS IS" BASIS,
+AND ROOYEKHAT MEDIA CO HAS NO OBLIGATIONS TO PROVIDE MAINTENANCE,
+SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
+
+PostgreSQL, Postgres and the Slonik logo are trademarks or registered
+trademarks of the PostgreSQL Community Association of Canada.  KingresDB is
+not affiliated with or endorsed by the PostgreSQL project.

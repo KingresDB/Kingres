@@ -1,0 +1,12 @@
+KingresDB authors
+
+KingresDB is developed by:
+
+  Mohammad Rasoul Kazemi (RooyeKhat)
+
+for RooyeKhat Media Co, which holds the copyright in the KingresDB-specific
+code (see the file COPYRIGHT in this directory).
+
+KingresDB is derived from PostgreSQL, the work of the PostgreSQL Global
+Development Group and its many contributors; see the file COPYRIGHT at the
+top of the repository.
