@@ -49,6 +49,7 @@ typedef struct DdlSet
 	StringInfoData local_pre;
 	StringInfoData remote_pre;
 	StringInfoData both;
+	StringInfoData fk;
 } DdlSet;
 
 /*
@@ -85,13 +86,19 @@ fetch_ddl(Oid relid, const char *column, DdlSet *ddl, MemoryContext cxt)
 	initStringInfo(&ddl->local_pre);
 	initStringInfo(&ddl->remote_pre);
 	initStringInfo(&ddl->both);
+	initStringInfo(&ddl->fk);
 	MemoryContextSwitchTo(oldcxt);
 
 	values[0] = ObjectIdGetDatum(relid);
-	values[1] = CStringGetTextDatum(column);
-	run_spi("SELECT scope, stmt FROM " KINGRES_SHARD_SCHEMA ".internal_table_ddl("
-			"$1::pg_catalog.oid::pg_catalog.regclass, $2::pg_catalog.name) ORDER BY ord",
-			2, argtypes, values);
+	values[1] = column != NULL ? CStringGetTextDatum(column) : (Datum) 0;
+	{
+		char		nulls[2] = {' ', column != NULL ? ' ' : 'n'};
+
+		if (SPI_execute_with_args("SELECT scope, stmt FROM " KINGRES_SHARD_SCHEMA ".internal_table_ddl("
+								  "$1::pg_catalog.oid::pg_catalog.regclass, $2::pg_catalog.name) ORDER BY ord",
+								  2, argtypes, values, nulls, false, 0) < 0)
+			elog(ERROR, "could not read the statements that recreate table %u", relid);
+	}
 
 	for (i = 0; i < SPI_processed; i++)
 	{
@@ -101,6 +108,8 @@ fetch_ddl(Oid relid, const char *column, DdlSet *ddl, MemoryContext cxt)
 
 		if (strcmp(scope, "local_pre") == 0)
 			target = &ddl->local_pre;
+		else if (strcmp(scope, "fk") == 0)
+			target = &ddl->fk;
 		else if (strcmp(scope, "remote_pre") == 0)
 			target = &ddl->remote_pre;
 		else
@@ -136,6 +145,26 @@ kingres_shard_remote_table_script(Oid relid, const char *column)
 	appendStringInfoString(&script, ddl.remote_pre.data);
 	appendStringInfoString(&script, ddl.both.data);
 	return script.data;
+}
+
+/*
+ * kingres_shard_remote_fk_script
+ *
+ * The statements that add the foreign keys of a table on a node that got its
+ * tables from kingres_shard_remote_table_script(): they run after every table
+ * exists there.  An empty string when the table has none.
+ */
+char *
+kingres_shard_remote_fk_script(Oid relid, const char *column)
+{
+	MemoryContext callercxt = CurrentMemoryContext;
+	DdlSet		ddl;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	fetch_ddl(relid, column, &ddl, callercxt);
+	SPI_finish();
+	return ddl.fk.data;
 }
 
 /*
@@ -189,7 +218,7 @@ choose_colocation(Oid coltype, Oid collation, Oid colocate_with,
 	{
 		const KsDistTable *other = kingres_shard_lookup_dist_table(colocate_with);
 
-		if (other == NULL)
+		if (other == NULL || other->is_reference)
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg("table \"%s\" is not a distributed table",
@@ -453,7 +482,7 @@ kingres_create_distributed_table(PG_FUNCTION_ARGS)
 		KsConn	   *kc = kingres_shard_get_conn(n->host, n->port, false, NULL);
 		PGresult   *res;
 
-		kingres_shard_begin_xact(kc);
+		kingres_shard_begin_write_xact(kc);
 		resetStringInfo(&script);
 		appendStringInfoString(&script, ddl.remote_pre.data);
 		appendStringInfoString(&script, ddl.both.data);
@@ -465,5 +494,189 @@ kingres_create_distributed_table(PG_FUNCTION_ARGS)
 	/* 6. Make every node know the table. */
 	kingres_shard_sync_catalog_internal();
 
+	PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(kingres_create_reference_table);
+
+/*
+ * kingres_shard_copy_table_rows
+ *
+ * Copy every row of a table of this node to the tables of the same name on
+ * the nodes of conns (a list of KsConn *), whose transactions are open.  The
+ * rows are read through a cursor and written in multi-row INSERTs with
+ * parameters in text form, under the transmission modes, so that every value
+ * means the same on the other side; generated columns are left to be computed
+ * there, identity columns are copied with their values.
+ */
+void
+kingres_shard_copy_table_rows(Oid relid, List *conns)
+{
+	char	   *nsp = get_namespace_name(get_rel_namespace(relid));
+	char	   *rel = get_rel_name(relid);
+	StringInfoData collist;
+	StringInfoData query;
+	Oid			argtypes[1] = {OIDOID};
+	Datum		values[1];
+	int			ncols;
+	uint64		i;
+	Portal		portal;
+	int			rows_per_batch;
+	int			nest;
+	SPIPlanPtr	plan;
+	MemoryContext batchcxt;
+	MemoryContext oldcxt;
+
+	if (conns == NIL)
+		return;
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+
+	values[0] = ObjectIdGetDatum(relid);
+	run_spi("SELECT pg_catalog.quote_ident(attname::pg_catalog.text) FROM pg_catalog.pg_attribute "
+			"WHERE attrelid OPERATOR(pg_catalog.=) $1 AND attnum OPERATOR(pg_catalog.>) 0 "
+			"AND NOT attisdropped AND attgenerated OPERATOR(pg_catalog.=) '' ORDER BY attnum",
+			1, argtypes, values);
+	ncols = (int) SPI_processed;
+	if (ncols == 0)
+	{
+		SPI_finish();
+		return;
+	}
+	initStringInfo(&collist);
+	for (i = 0; i < SPI_processed; i++)
+		appendStringInfo(&collist, "%s%s", i ? ", " : "",
+						 SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1));
+
+	initStringInfo(&query);
+	appendStringInfo(&query, "SELECT %s FROM %s.%s", collist.data,
+					 quote_identifier(nsp), quote_identifier(rel));
+	plan = SPI_prepare(query.data, 0, NULL);
+	if (plan == NULL)
+		elog(ERROR, "could not prepare the copy of table \"%s\"", rel);
+	portal = SPI_cursor_open(NULL, plan, NULL, NULL, true);
+
+	rows_per_batch = Max(1, 20000 / ncols);
+	batchcxt = AllocSetContextCreate(CurrentMemoryContext, "kingres_shard row copy batch",
+									 ALLOCSET_DEFAULT_SIZES);
+	nest = kingres_shard_set_transmission_modes();
+	for (;;)
+	{
+		StringInfoData sql;
+		const char **params;
+		int			nrows;
+		int			r;
+		int			c;
+		ListCell   *lc;
+
+		SPI_cursor_fetch(portal, true, rows_per_batch);
+		if (SPI_processed == 0)
+			break;
+		nrows = (int) SPI_processed;
+
+		oldcxt = MemoryContextSwitchTo(batchcxt);
+		params = palloc(sizeof(char *) * nrows * ncols);
+		initStringInfo(&sql);
+		appendStringInfo(&sql, "INSERT INTO %s.%s (%s) OVERRIDING SYSTEM VALUE VALUES ",
+						 quote_identifier(nsp), quote_identifier(rel), collist.data);
+		for (r = 0; r < nrows; r++)
+		{
+			appendStringInfo(&sql, "%s(", r ? ", " : "");
+			for (c = 0; c < ncols; c++)
+			{
+				appendStringInfo(&sql, "%s$%d", c ? ", " : "", r * ncols + c + 1);
+				params[r * ncols + c] = SPI_getvalue(SPI_tuptable->vals[r],
+													 SPI_tuptable->tupdesc, c + 1);
+			}
+			appendStringInfoChar(&sql, ')');
+		}
+		MemoryContextSwitchTo(oldcxt);
+
+		foreach(lc, conns)
+		{
+			PGresult   *res = kingres_shard_exec_params((KsConn *) lfirst(lc), sql.data,
+														 nrows * ncols, NULL, params, true);
+
+			PQclear(res);
+		}
+		MemoryContextReset(batchcxt);
+		SPI_freetuptable(SPI_tuptable);
+	}
+	kingres_shard_reset_transmission_modes(nest);
+	SPI_cursor_close(portal);
+	MemoryContextDelete(batchcxt);
+	SPI_finish();
+}
+
+/*
+ * kingres.create_reference_table(relation regclass) returns void
+ *
+ * Make an ordinary table a reference table: every node gets a full copy, in
+ * the same distributed transaction as the catalog change, and from then on
+ * writes to it run on every node.  Map group primary only.  Writers are
+ * blocked while the rows are copied (an EXCLUSIVE lock); readers are not.
+ */
+Datum
+kingres_create_reference_table(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	MemoryContext callercxt = CurrentMemoryContext;
+	Oid			argtypes[1] = {OIDOID};
+	Datum		values[1];
+	DdlSet		ddl;
+	List	   *targets = NIL;
+	List	   *conns = NIL;
+	ListCell   *lc;
+	StringInfoData script;
+
+	kingres_shard_lock_catalog();
+	kingres_shard_require_map_group();
+	LockRelationOid(relid, ExclusiveLock);
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	values[0] = ObjectIdGetDatum(relid);
+	run_spi("SELECT " KINGRES_SHARD_SCHEMA ".internal_check_referenceable("
+			"$1::pg_catalog.oid::pg_catalog.regclass)", 1, argtypes, values);
+	fetch_ddl(relid, NULL, &ddl, callercxt);
+	run_spi("INSERT INTO " KINGRES_SHARD_SCHEMA ".dist_table (relid, method) "
+			"VALUES ($1::pg_catalog.oid::pg_catalog.regclass, 'reference')",
+			1, argtypes, values);
+	SPI_finish();
+
+	initStringInfo(&script);
+	appendStringInfoString(&script, ddl.remote_pre.data);
+	appendStringInfoString(&script, ddl.both.data);
+
+	{
+		const KsCatalog *cat = kingres_shard_catalog();
+
+		foreach(lc, cat->nodes)
+		{
+			KsNode	   *n = (KsNode *) lfirst(lc);
+			KsNode	   *copy;
+
+			if (n->node_id == cat->local_node_id || !n->is_active || !n->is_primary)
+				continue;
+			copy = MemoryContextAlloc(callercxt, sizeof(KsNode));
+			*copy = *n;
+			copy->host = MemoryContextStrdup(callercxt, n->host);
+			targets = lappend(targets, copy);
+		}
+	}
+	foreach(lc, targets)
+	{
+		KsNode	   *n = (KsNode *) lfirst(lc);
+		KsConn	   *kc = kingres_shard_get_conn(n->host, n->port, false, NULL);
+		PGresult   *res;
+
+		kingres_shard_begin_write_xact(kc);
+		res = kingres_shard_exec(kc, script.data);
+		PQclear(res);
+		conns = lappend(conns, kc);
+	}
+	kingres_shard_copy_table_rows(relid, conns);
+
+	kingres_shard_sync_catalog_internal();
 	PG_RETURN_VOID();
 }

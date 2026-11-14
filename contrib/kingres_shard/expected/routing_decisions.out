@@ -47,7 +47,7 @@ SELECT kingres.create_distributed_table('t', 'id', bucket_count => 8);
 INSERT INTO w SELECT 'name' || g, g FROM generate_series(1, 20) g;
 INSERT INTO t SELECT g, 'row ' || g FROM generate_series(1, 20) g;
 INSERT INTO kingres.node (node_id, group_id, host, port, role)
-  VALUES (2, 1, 'group1.invalid', 5432, 'primary');
+  VALUES (2, 1, '127.0.0.1', 1, 'primary');
 UPDATE kingres.bucket_map SET group_id = 1 WHERE bucket % 2 = 1;
 -- A key of a local bucket and of a remote bucket, per table.
 SELECT min(k) AS wl FROM (SELECT 'name' || g AS k FROM generate_series(1, 100) g) s
@@ -72,7 +72,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM w WHERE name = :'wr';
                                QUERY PLAN                                
 -------------------------------------------------------------------------
  Custom Scan (Kingres Remote Statement)
-   Node: group1.invalid:5432 (group 1, bucket 1)
+   Node: 127.0.0.1:1 (group 1, bucket 1)
    Remote SQL: SELECT name, v FROM public.w WHERE (name = 'name1'::text)
 (3 rows)
 
@@ -87,7 +87,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM wc WHERE name = :'wcr';
                                 QUERY PLAN                                
 --------------------------------------------------------------------------
  Custom Scan (Kingres Remote Statement)
-   Node: group1.invalid:5432 (group 1, bucket 1)
+   Node: 127.0.0.1:1 (group 1, bucket 1)
    Remote SQL: SELECT name, v FROM public.wc WHERE (name = 'name1'::text)
 (3 rows)
 
@@ -100,29 +100,169 @@ EXPLAIN (COSTS OFF) SELECT * FROM wc WHERE name = :'wcl';
 
 -- a different collation: not restricted to one bucket
 EXPLAIN (COSTS OFF) SELECT * FROM w WHERE name = :'wr' COLLATE ci;
-ERROR:  statements that span shard groups are not supported yet
-HINT:  Restrict every distributed table of the statement to one key, for example with WHERE name = <value> on table "w".
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Custom Scan (Kingres Distributed Scan)
+   Filter: (name = 'name1'::text COLLATE ci)
+   Remote groups: 1
+   Remote SQL: SELECT name, v FROM public.w AS ks_t
+   ->  Append
+         ->  Seq Scan on w_b0000 w_1
+               Filter: (name = 'name1'::text COLLATE ci)
+         ->  Seq Scan on w_b0001 w_2
+               Filter: (name = 'name1'::text COLLATE ci)
+         ->  Seq Scan on w_b0002 w_3
+               Filter: (name = 'name1'::text COLLATE ci)
+         ->  Seq Scan on w_b0003 w_4
+               Filter: (name = 'name1'::text COLLATE ci)
+         ->  Seq Scan on w_b0004 w_5
+               Filter: (name = 'name1'::text COLLATE ci)
+         ->  Seq Scan on w_b0005 w_6
+               Filter: (name = 'name1'::text COLLATE ci)
+         ->  Seq Scan on w_b0006 w_7
+               Filter: (name = 'name1'::text COLLATE ci)
+         ->  Seq Scan on w_b0007 w_8
+               Filter: (name = 'name1'::text COLLATE ci)
+(21 rows)
+
 EXPLAIN (COSTS OFF) SELECT * FROM w WHERE name = :'wl' COLLATE ci;
-ERROR:  statements that span shard groups are not supported yet
-HINT:  Restrict every distributed table of the statement to one key, for example with WHERE name = <value> on table "w".
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Custom Scan (Kingres Distributed Scan)
+   Filter: (name = 'name11'::text COLLATE ci)
+   Remote groups: 1
+   Remote SQL: SELECT name, v FROM public.w AS ks_t
+   ->  Append
+         ->  Seq Scan on w_b0000 w_1
+               Filter: (name = 'name11'::text COLLATE ci)
+         ->  Seq Scan on w_b0001 w_2
+               Filter: (name = 'name11'::text COLLATE ci)
+         ->  Seq Scan on w_b0002 w_3
+               Filter: (name = 'name11'::text COLLATE ci)
+         ->  Seq Scan on w_b0003 w_4
+               Filter: (name = 'name11'::text COLLATE ci)
+         ->  Seq Scan on w_b0004 w_5
+               Filter: (name = 'name11'::text COLLATE ci)
+         ->  Seq Scan on w_b0005 w_6
+               Filter: (name = 'name11'::text COLLATE ci)
+         ->  Seq Scan on w_b0006 w_7
+               Filter: (name = 'name11'::text COLLATE ci)
+         ->  Seq Scan on w_b0007 w_8
+               Filter: (name = 'name11'::text COLLATE ci)
+(21 rows)
+
 EXPLAIN (COSTS OFF) SELECT * FROM w WHERE name COLLATE ci = :'wr';
-ERROR:  statements that span shard groups are not supported yet
-HINT:  Restrict every distributed table of the statement to one key, for example with WHERE name = <value> on table "w".
+                      QUERY PLAN                      
+------------------------------------------------------
+ Custom Scan (Kingres Distributed Scan)
+   Filter: ((name)::text = 'name1'::text)
+   Remote groups: 1
+   Remote SQL: SELECT name, v FROM public.w AS ks_t
+   ->  Append
+         ->  Seq Scan on w_b0000 w_1
+               Filter: ((name)::text = 'name1'::text)
+         ->  Seq Scan on w_b0001 w_2
+               Filter: ((name)::text = 'name1'::text)
+         ->  Seq Scan on w_b0002 w_3
+               Filter: ((name)::text = 'name1'::text)
+         ->  Seq Scan on w_b0003 w_4
+               Filter: ((name)::text = 'name1'::text)
+         ->  Seq Scan on w_b0004 w_5
+               Filter: ((name)::text = 'name1'::text)
+         ->  Seq Scan on w_b0005 w_6
+               Filter: ((name)::text = 'name1'::text)
+         ->  Seq Scan on w_b0006 w_7
+               Filter: ((name)::text = 'name1'::text)
+         ->  Seq Scan on w_b0007 w_8
+               Filter: ((name)::text = 'name1'::text)
+(21 rows)
+
 EXPLAIN (COSTS OFF) SELECT * FROM w WHERE name = :'wr' COLLATE "C";
-ERROR:  statements that span shard groups are not supported yet
-HINT:  Restrict every distributed table of the statement to one key, for example with WHERE name = <value> on table "w".
+                                          QUERY PLAN                                           
+-----------------------------------------------------------------------------------------------
+ Custom Scan (Kingres Distributed Scan)
+   Filter: (name = 'name1'::text COLLATE "C")
+   Remote groups: 1
+   Remote SQL: SELECT name, v FROM public.w AS ks_t WHERE ((name = 'name1'::text COLLATE "C"))
+   ->  Append
+         ->  Seq Scan on w_b0000 w_1
+               Filter: (name = 'name1'::text COLLATE "C")
+         ->  Seq Scan on w_b0001 w_2
+               Filter: (name = 'name1'::text COLLATE "C")
+         ->  Seq Scan on w_b0002 w_3
+               Filter: (name = 'name1'::text COLLATE "C")
+         ->  Seq Scan on w_b0003 w_4
+               Filter: (name = 'name1'::text COLLATE "C")
+         ->  Seq Scan on w_b0004 w_5
+               Filter: (name = 'name1'::text COLLATE "C")
+         ->  Seq Scan on w_b0005 w_6
+               Filter: (name = 'name1'::text COLLATE "C")
+         ->  Seq Scan on w_b0006 w_7
+               Filter: (name = 'name1'::text COLLATE "C")
+         ->  Seq Scan on w_b0007 w_8
+               Filter: (name = 'name1'::text COLLATE "C")
+(21 rows)
+
 EXPLAIN (COSTS OFF) SELECT * FROM wc WHERE name = :'wcr' COLLATE ci;
-ERROR:  statements that span shard groups are not supported yet
-HINT:  Restrict every distributed table of the statement to one key, for example with WHERE name = <value> on table "wc".
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Custom Scan (Kingres Distributed Scan)
+   Filter: (name = 'name1'::text COLLATE ci)
+   Remote groups: 1
+   Remote SQL: SELECT name, v FROM public.wc AS ks_t
+   ->  Append
+         ->  Seq Scan on wc_b0000 wc_1
+               Filter: (name = 'name1'::text COLLATE ci)
+         ->  Seq Scan on wc_b0001 wc_2
+               Filter: (name = 'name1'::text COLLATE ci)
+         ->  Seq Scan on wc_b0002 wc_3
+               Filter: (name = 'name1'::text COLLATE ci)
+         ->  Seq Scan on wc_b0003 wc_4
+               Filter: (name = 'name1'::text COLLATE ci)
+         ->  Seq Scan on wc_b0004 wc_5
+               Filter: (name = 'name1'::text COLLATE ci)
+         ->  Seq Scan on wc_b0005 wc_6
+               Filter: (name = 'name1'::text COLLATE ci)
+         ->  Seq Scan on wc_b0006 wc_7
+               Filter: (name = 'name1'::text COLLATE ci)
+         ->  Seq Scan on wc_b0007 wc_8
+               Filter: (name = 'name1'::text COLLATE ci)
+(21 rows)
+
 EXPLAIN (COSTS OFF) SELECT * FROM wc WHERE name = :'wcl' COLLATE "default";
-ERROR:  statements that span shard groups are not supported yet
-HINT:  Restrict every distributed table of the statement to one key, for example with WHERE name = <value> on table "wc".
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
+ Custom Scan (Kingres Distributed Scan)
+   Filter: (name = 'name11'::text)
+   Remote groups: 1
+   Remote SQL: SELECT name, v FROM public.wc AS ks_t WHERE ((name = 'name11'::text))
+   ->  Append
+         ->  Seq Scan on wc_b0000 wc_1
+               Filter: (name = 'name11'::text)
+         ->  Seq Scan on wc_b0001 wc_2
+               Filter: (name = 'name11'::text)
+         ->  Seq Scan on wc_b0002 wc_3
+               Filter: (name = 'name11'::text)
+         ->  Seq Scan on wc_b0003 wc_4
+               Filter: (name = 'name11'::text)
+         ->  Seq Scan on wc_b0004 wc_5
+               Filter: (name = 'name11'::text)
+         ->  Seq Scan on wc_b0005 wc_6
+               Filter: (name = 'name11'::text)
+         ->  Seq Scan on wc_b0006 wc_7
+               Filter: (name = 'name11'::text)
+         ->  Seq Scan on wc_b0007 wc_8
+               Filter: (name = 'name11'::text)
+(21 rows)
+
 UPDATE w SET v = 0 WHERE name = :'wr' COLLATE ci;
-ERROR:  statements that span shard groups are not supported yet
-HINT:  Restrict every distributed table of the statement to one key, for example with WHERE name = <value> on table "w".
+ERROR:  this UPDATE spans shard groups and cannot be shipped
+DETAIL:  The statement is not shippable: it uses a type or collation that is not built in.
+HINT:  Restrict it by the distribution column, for example with WHERE name = <value>, or use only built-in immutable functions on the one table (and reference tables).
 DELETE FROM w WHERE name = :'wl' COLLATE ci;
-ERROR:  statements that span shard groups are not supported yet
-HINT:  Restrict every distributed table of the statement to one key, for example with WHERE name = <value> on table "w".
+ERROR:  this DELETE spans shard groups and cannot be shipped
+DETAIL:  The statement is not shippable: it uses a type or collation that is not built in.
+HINT:  Restrict it by the distribution column, for example with WHERE name = <value>, or use only built-in immutable functions on the one table (and reference tables).
 SET kingres_shard.enable_routing = off;
 SELECT count(*) AS rows_after_refused_delete FROM w;
  rows_after_refused_delete 
@@ -144,20 +284,21 @@ CREATE FUNCTION t_rows() RETURNS SETOF t LANGUAGE sql STABLE
 CREATE FUNCTION t_by_id(k int) RETURNS SETOF t LANGUAGE sql STABLE
   AS $$ SELECT * FROM t WHERE id = k $$;
 SELECT t_count();
-ERROR:  statements that span shard groups are not supported yet
-HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
+ERROR:  could not connect to node 127.0.0.1:1
+DETAIL:  connection to server at "127.0.0.1", port 1 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
 SELECT count(*) FROM t_rows();
-ERROR:  statements that reach distributed tables through a SQL-language function are not supported yet
-DETAIL:  The planner expanded a SQL-language function into the statement, and the body of the function reads distributed table public.t without a key the router could see.
-HINT:  Write the function in PL/pgSQL, which is never expanded and whose statements are routed one by one, or put the key in the statement itself.
+ERROR:  could not connect to node 127.0.0.1:1
+DETAIL:  connection to server at "127.0.0.1", port 1 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
 SELECT * FROM t_by_id(:tl);
-ERROR:  statements that reach distributed tables through a SQL-language function are not supported yet
-DETAIL:  The planner expanded a SQL-language function into the statement, and the body of the function reads distributed table public.t without a key the router could see.
-HINT:  Write the function in PL/pgSQL, which is never expanded and whose statements are routed one by one, or put the key in the statement itself.
+ERROR:  could not connect to node 127.0.0.1:1
+DETAIL:  connection to server at "127.0.0.1", port 1 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
 SELECT * FROM t_by_id(:tr);
-ERROR:  statements that reach distributed tables through a SQL-language function are not supported yet
-DETAIL:  The planner expanded a SQL-language function into the statement, and the body of the function reads distributed table public.t without a key the router could see.
-HINT:  Write the function in PL/pgSQL, which is never expanded and whose statements are routed one by one, or put the key in the statement itself.
+ERROR:  could not connect to node 127.0.0.1:1
+DETAIL:  connection to server at "127.0.0.1", port 1 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
 SELECT 1 AS other_statements_unaffected;
  other_statements_unaffected 
 -----------------------------
@@ -178,8 +319,9 @@ CREATE FUNCTION t_count_pl() RETURNS bigint LANGUAGE plpgsql
 CREATE FUNCTION t_one_pl(k int) RETURNS text LANGUAGE plpgsql
   AS $$ BEGIN RETURN (SELECT v FROM t WHERE id = k); END $$;
 SELECT t_count_pl();
-ERROR:  statements that span shard groups are not supported yet
-HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
+ERROR:  could not connect to node 127.0.0.1:1
+DETAIL:  connection to server at "127.0.0.1", port 1 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
 SELECT t_one_pl(:tl);
  t_one_pl 
 ----------
@@ -187,19 +329,23 @@ SELECT t_one_pl(:tl);
 (1 row)
 
 DO $$ BEGIN PERFORM count(*) FROM t; END $$;
-ERROR:  statements that span shard groups are not supported yet
-HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
+ERROR:  could not connect to node 127.0.0.1:1
+DETAIL:  connection to server at "127.0.0.1", port 1 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
 DO $$ BEGIN EXECUTE 'SELECT count(*) FROM t'; END $$;
-ERROR:  statements that span shard groups are not supported yet
-HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
+ERROR:  could not connect to node 127.0.0.1:1
+DETAIL:  connection to server at "127.0.0.1", port 1 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
 -- views and rules
 CREATE VIEW t_view AS SELECT * FROM t;
 SELECT count(*) FROM t_view;
-ERROR:  statements that span shard groups are not supported yet
-HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
+ERROR:  could not connect to node 127.0.0.1:1
+DETAIL:  connection to server at "127.0.0.1", port 1 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
 SELECT * FROM t_view WHERE id = :tl;
-ERROR:  statements that span shard groups are not supported yet
-HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
+ERROR:  could not connect to node 127.0.0.1:1
+DETAIL:  connection to server at "127.0.0.1", port 1 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
 CREATE RULE plain_to_t AS ON INSERT TO plain DO ALSO INSERT INTO t VALUES (NEW.x, 'rule');
 INSERT INTO plain VALUES (:tn);
 CREATE FUNCTION plain_trg() RETURNS trigger LANGUAGE plpgsql
@@ -207,13 +353,12 @@ CREATE FUNCTION plain_trg() RETURNS trigger LANGUAGE plpgsql
 CREATE TRIGGER plain_trg_i BEFORE INSERT ON plain FOR EACH ROW EXECUTE FUNCTION plain_trg();
 DROP RULE plain_to_t ON plain;
 INSERT INTO plain VALUES (1);
-ERROR:  statements that span shard groups are not supported yet
-HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
+ERROR:  could not connect to node 127.0.0.1:1
+DETAIL:  connection to server at "127.0.0.1", port 1 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
 -- cursors, CTAS, COPY, EXPLAIN ANALYZE, SELECT INTO
 BEGIN;
 DECLARE c1 CURSOR FOR SELECT * FROM t;
-ERROR:  statements that span shard groups are not supported yet
-HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
 ROLLBACK;
 BEGIN;
 DECLARE c2 CURSOR FOR SELECT * FROM t WHERE id = :tl;
@@ -225,8 +370,9 @@ FETCH 1 FROM c2;
 
 ROLLBACK;
 CREATE TABLE ctas1 AS SELECT * FROM t;
-ERROR:  statements that span shard groups are not supported yet
-HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
+ERROR:  could not connect to node 127.0.0.1:1
+DETAIL:  connection to server at "127.0.0.1", port 1 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
 CREATE TABLE ctas2 AS SELECT * FROM t WHERE id = :tl;
 SELECT count(*) AS ctas2_rows FROM ctas2;
  ctas2_rows 
@@ -235,24 +381,27 @@ SELECT count(*) AS ctas2_rows FROM ctas2;
 (1 row)
 
 SELECT * INTO ctas3 FROM t;
-ERROR:  statements that span shard groups are not supported yet
-HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
+ERROR:  could not connect to node 127.0.0.1:1
+DETAIL:  connection to server at "127.0.0.1", port 1 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
 COPY (SELECT * FROM t) TO stdout;
-ERROR:  statements that span shard groups are not supported yet
-HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
+ERROR:  could not connect to node 127.0.0.1:1
+DETAIL:  connection to server at "127.0.0.1", port 1 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
 COPY t TO stdout;
 ERROR:  cannot copy from partitioned table "t"
 HINT:  Try the COPY (SELECT ...) TO variant.
 COPY (SELECT id FROM t WHERE id = :tl) TO stdout;
 1
 EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT * FROM t;
-ERROR:  statements that span shard groups are not supported yet
-HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
+ERROR:  could not connect to node 127.0.0.1:1
+DETAIL:  connection to server at "127.0.0.1", port 1 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
 EXPLAIN (COSTS OFF) SELECT * FROM t WHERE id = :tr;
                        QUERY PLAN                        
 ---------------------------------------------------------
  Custom Scan (Kingres Remote Statement)
-   Node: group1.invalid:5432 (group 1, bucket 1)
+   Node: 127.0.0.1:1 (group 1, bucket 1)
    Remote SQL: SELECT id, v FROM public.t WHERE (id = 3)
 (3 rows)
 

@@ -17,5 +17,6 @@
 #include "postgres.h"
 
 extern void kingres_shard_utility_init(void);
+extern bool kingres_shard_in_authorized_ddl(void);
 
 #endif							/* KINGRES_SHARD_UTILITY_H */

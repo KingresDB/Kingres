@@ -55,20 +55,34 @@ INSERT INTO kingres.node (node_id, group_id, host, port, role)
   VALUES (2, 1, 'group1.invalid', 5432, 'primary');
 UPDATE kingres.bucket_map SET group_id = 1 WHERE bucket % 2 = 1;
 
--- Refused: they would act on this node only.
+-- Refused, or propagated: with fake group nodes that cannot be reached, a statement that is propagated fails to connect and applies nothing.
+\set VERBOSITY terse
 TRUNCATE ug;
+\set VERBOSITY default
 TRUNCATE ug, ug_plain;
 TRUNCATE ug_b0000;
+\set VERBOSITY terse
 ALTER TABLE ug ADD COLUMN x int;
+\set VERBOSITY default
+\set VERBOSITY terse
 ALTER TABLE ug RENAME TO ug_renamed;
+\set VERBOSITY default
 ALTER TABLE ug SET SCHEMA ugs;
+\set VERBOSITY terse
 ALTER TABLE ug OWNER TO CURRENT_USER;
+\set VERBOSITY default
 ALTER TABLE ug ENABLE ROW LEVEL SECURITY;
 ALTER INDEX ug_pkey RENAME TO ug_pkey2;
+\set VERBOSITY terse
 CREATE INDEX ug_v_idx ON ug (v);
+\set VERBOSITY default
+\set VERBOSITY terse
 CREATE UNIQUE INDEX ug_v_uidx ON ug (id, v);
+\set VERBOSITY default
 CREATE INDEX ug_b_idx ON ug_b0000 (v);
+\set VERBOSITY terse
 DROP TABLE ug;
+\set VERBOSITY default
 DROP TABLE ug_plain, ug;
 DROP INDEX ug_pkey;
 DROP SCHEMA ugs CASCADE;
@@ -83,7 +97,9 @@ CREATE TABLE ug_part PARTITION OF ug FOR VALUES WITH (MODULUS 4, REMAINDER 0);
 CREATE TABLE ug_part2 (id int, v text);
 ALTER TABLE ug ATTACH PARTITION ug_part2 FOR VALUES WITH (MODULUS 4, REMAINDER 0);
 -- A statement inside a function is refused as well.
+\set VERBOSITY terse
 DO $$ BEGIN EXECUTE 'TRUNCATE ug'; END $$;
+\set VERBOSITY default
 -- Nothing was applied (routing is switched off to count the local partitions).
 SET kingres_shard.enable_routing = off;
 SELECT count(*) AS rows_still_there FROM ug;
@@ -105,7 +121,9 @@ BEGIN;
 LOCK TABLE ug IN ACCESS SHARE MODE;
 ROLLBACK;
 EXPLAIN (COSTS OFF) SELECT * FROM ug WHERE id = 1;
+\set VERBOSITY terse
 COMMENT ON TABLE ug IS 'per-node metadata';
+\set VERBOSITY default
 
 -- The per-node escape hatch for an administrator who repeats the statement on
 -- every node: with routing off nothing is checked.

@@ -20,7 +20,9 @@ sub make_node
 	my $node = PostgreSQL::Test::Cluster->new($name);
 	$node->init(allows_streaming => 1);
 	$node->append_conf('postgresql.conf',
-		"shared_preload_libraries = 'kingres_shard'");
+		"shared_preload_libraries = 'kingres_shard'
+max_prepared_transactions = 20
+kingres_shard.recovery_interval = 0");
 	$node->start;
 	return $node;
 }
@@ -72,7 +74,7 @@ sub refused
 {
 	my ($sql, $label) = @_;
 	my ($rc, $out, $err) = run_sql($n1, $sql);
-	like($err, qr/not supported yet|cannot copy from partitioned table/,
+	like($err, qr/not supported yet|cannot be shipped|cannot copy from partitioned table/,
 		"$label: refused");
 	is($out, '', "$label: and no partial answer");
 }
@@ -98,26 +100,40 @@ $n1->safe_psql('postgres', qq{
 });
 
 # ---------------------------------------------------------------------------
-# Refused, with no silent partial answer.
+# Statements that read the whole table.  In phase 1 these were refused so that
+# no partial answer could come out of them; since phase 2a the planner reads the
+# other groups too (the distributed scan), wherever the statement hides the
+# reading: an inlined SQL function, PL/pgSQL, DO, CREATE TABLE AS, COPY (query),
+# EXPLAIN ANALYZE, a cursor.  The answer is always the answer for the whole
+# table, never the count of the local partitions.
 # ---------------------------------------------------------------------------
-refused("SELECT public.f_count()", 'S-D: an inlined SQL function that counts the table');
-refused("SELECT count(*) FROM public.f_rows()", 'S-D: an inlined set-returning SQL function');
-refused("SELECT * FROM public.f_by_id($k1)",
-	'S-D: an inlined SQL function that reads a remote key');
-refused("SELECT * FROM public.f_by_id($k0)",
-	'S-D: an inlined SQL function that reads a local key');
-refused("SELECT public.p_count()", 'S-D: a PL/pgSQL function that counts the table');
-refused("DO \$\$ BEGIN PERFORM count(*) FROM public.kvn; END \$\$", 'S-D: a DO block without a key');
-refused("DO \$\$ BEGIN EXECUTE 'DELETE FROM public.kvn'; END \$\$", 'S-D: EXECUTE of a DELETE without a key');
-refused("CREATE TABLE public.ctas_bad AS SELECT * FROM public.kvn", 'S-D: CREATE TABLE AS without a key');
-refused("COPY (SELECT * FROM public.kvn) TO STDOUT", 'S-D: COPY (query) TO without a key');
-refused("COPY public.kvn TO STDOUT", 'S-D: COPY table TO');
-refused("EXPLAIN (ANALYZE, COSTS OFF) SELECT * FROM public.kvn", 'S-D: EXPLAIN ANALYZE without a key');
-refused("BEGIN; DECLARE c CURSOR FOR SELECT * FROM public.kvn; FETCH 1 FROM c; COMMIT;", 'S-D: a cursor without a key');
+sub gives
 {
-	my ($rc, $out, $err) = run_sql($n1, "SELECT public.f_count()");
-	unlike($out, qr/^\d+$/, 'S-D: the inlined count does not return the count of the local partitions');
+	my ($sql, $want, $label) = @_;
+	my ($rc, $out, $err) = run_sql($n1, $sql);
+	is($err, '', "$label: runs");
+	is($out, $want, "$label: and gives the answer for the whole table");
 }
+
+gives("SELECT public.f_count()", '3', 'S-D: an inlined SQL function that counts the table');
+gives("SELECT count(*) FROM public.f_rows()", '3', 'S-D: an inlined set-returning SQL function');
+gives("SELECT * FROM public.f_by_id($k1)", "$k1|row-of-group-1", 'S-D: an inlined SQL function that reads a remote key');
+gives("SELECT * FROM public.f_by_id($k0)", "$k0|row-of-group-0", 'S-D: an inlined SQL function that reads a local key');
+gives("SELECT public.p_count()", '3', 'S-D: a PL/pgSQL function that counts the table');
+gives("DO \$\$ BEGIN IF (SELECT count(*) FROM public.kvn) <> 3 THEN RAISE EXCEPTION 'partial'; END IF; END \$\$", '', 'S-D: a DO block without a key');
+gives("CREATE TABLE public.ctas_all AS SELECT * FROM public.kvn;\nSELECT count(*) FROM public.ctas_all", '3', 'S-D: CREATE TABLE AS without a key');
+gives("COPY (SELECT id FROM public.kvn ORDER BY id) TO STDOUT", join("\n", sort { $a <=> $b } ($k0, $k1, $k2)), 'S-D: COPY (query) TO without a key');
+gives("BEGIN; DECLARE c CURSOR FOR SELECT id FROM public.kvn ORDER BY id; FETCH 3 FROM c; COMMIT;", join("\n", sort { $a <=> $b } ($k0, $k1, $k2)), 'S-D: a cursor without a key');
+{
+	my ($rc, $out, $err) = run_sql($n1, "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT * FROM public.kvn");
+	is($err, '', 'S-D: EXPLAIN ANALYZE without a key runs');
+	like($out, qr/Kingres Distributed Scan.*actual rows=3/s, 'S-D: and shows the distributed scan returning the whole table');
+}
+# A write that spans groups and cannot be shipped is still refused (a plain one without a key now
+# runs on every group; see t/014_dist_write.pl).
+refused("DO \$\$ BEGIN EXECUTE 'DELETE FROM public.kvn USING public.kvn k2 WHERE k2.id = kvn.id'; END \$\$", 'S-D: EXECUTE of a DELETE that cannot be shipped');
+refused("COPY public.kvn TO STDOUT", 'S-D: COPY table TO');
+$n1->safe_psql('postgres', 'DROP TABLE public.ctas_all');
 
 # ---------------------------------------------------------------------------
 # Routed to the owner of the key.
@@ -195,8 +211,8 @@ is($n1->safe_psql('postgres',
 		'a hot standby forwards a read for another group');
 	my ($rc, $out, $err) = run_sql($s, "INSERT INTO public.kvn VALUES ($k2 + 1000000, 'x')");
 	like($err, qr/read-only/, 'a write on a hot standby is refused');
-	($rc, $out, $err) = run_sql($s, "SELECT * FROM public.kvn");
-	like($err, qr/span shard groups/, 'a statement without a key is refused on a hot standby');
+	($rc, $out, $err) = run_sql($s, "SELECT count(*) FROM public.kvn");
+	is($out, '3', 'a statement without a key reads the whole table on a hot standby');
 	$s->stop;
 }
 

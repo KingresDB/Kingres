@@ -19,6 +19,7 @@ sub make_node
 	$node->init;
 	$node->append_conf('postgresql.conf', qq{
 shared_preload_libraries = '$libs'
+max_prepared_transactions = 20
 auto_explain.log_min_duration = 0
 auto_explain.log_analyze = on
 pg_stat_statements.track = all

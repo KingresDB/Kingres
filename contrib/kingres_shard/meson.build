@@ -3,13 +3,18 @@
 
 kingres_shard_sources = files(
   'src/catalog.c',
+  'src/dist_scan.c',
   'src/dist_table.c',
+  'src/fanout.c',
+  'src/fault.c',
   'src/hashing.c',
   'src/kingres_shard.c',
   'src/node_admin.c',
   'src/node_conn.c',
   'src/planner.c',
+  'src/recovery.c',
   'src/remote_scan.c',
+  'src/shippable.c',
   'src/utility.c',
 )
 
@@ -31,6 +36,8 @@ contrib_targets += kingres_shard
 install_data(
   'kingres_shard.control',
   'kingres_shard--0.1.sql',
+  'kingres_shard--0.2.sql',
+  'kingres_shard--0.1--0.2.sql',
   kwargs: contrib_data_args,
 )
 
@@ -48,6 +55,9 @@ tests += {
       'security',
       'utility_guard',
       'routing_decisions',
+      'reference',
+      'ddl_single',
+      'upgrade',
     ],
     'regress_args': ['--temp-config', files('kingres_shard.conf')],
     # The tests need shared_preload_libraries = 'kingres_shard', which a
@@ -63,6 +73,14 @@ tests += {
       't/005_session_settings.pl',
       't/006_ddl_and_concurrency.pl',
       't/007_nested_contexts.pl',
+      't/008_twophase.pl',
+      't/009_recovery_worker.pl',
+      't/010_atomic_catalog.pl',
+      't/011_reference.pl',
+      't/012_ddl_propagation.pl',
+      't/013_dist_scan.pl',
+      't/014_dist_write.pl',
+      't/015_node_conninfo.pl',
     ],
   },
 }

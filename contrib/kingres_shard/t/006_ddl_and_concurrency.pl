@@ -19,7 +19,9 @@ sub make_node
 	my $node = PostgreSQL::Test::Cluster->new($name);
 	$node->init;
 	$node->append_conf('postgresql.conf',
-		"shared_preload_libraries = 'kingres_shard'");
+		"shared_preload_libraries = 'kingres_shard'
+max_prepared_transactions = 20
+kingres_shard.recovery_interval = 0");
 	$node->start;
 	return $node;
 }
@@ -166,20 +168,27 @@ sub rows_everywhere
 }
 is(rows_everywhere(), 'row-0,row-1,row-2', 'one row per node before the DDL tests');
 
+# Since phase 2a the DDL statements of the list are propagated to every node
+# when they run on the map group primary (t/012_ddl_propagation.pl), and refused
+# on any other node, where they would change the table there only.  COPY FROM
+# is refused everywhere: its rows would land on the partitions of one node.
 for my $case (
 	[ 'TRUNCATE', 'TRUNCATE public.kv' ],
 	[ 'ALTER TABLE', 'ALTER TABLE public.kv ADD COLUMN extra int' ],
 	[ 'DROP TABLE', 'DROP TABLE public.kv' ],
 	[ 'CREATE INDEX', 'CREATE INDEX kv_val_idx ON public.kv (val)' ],
-	[ 'COPY FROM', "COPY public.kv FROM '/dev/null'" ],
   )
 {
-	for my $n ($n1, $n3)
-	{
-		my ($rc, $out, $err) = run_sql($n, $case->[1]);
-		like($err, qr/$case->[0] is not supported on distributed tables yet/,
-			"finding 3: $case->[0] on " . $n->name . ' is refused');
-	}
+	my ($rc, $out, $err) = run_sql($n3, $case->[1]);
+	like($err, qr/$case->[0] on a distributed or reference table must run on the map group primary/,
+		"finding 3: $case->[0] on " . $n3->name . ' is refused');
+	like($err, qr/HINT:  Run it on node 1/, "the hint names the map group primary");
+}
+for my $n ($n1, $n3)
+{
+	my ($rc, $out, $err) = run_sql($n, "COPY public.kv FROM '/dev/null'");
+	like($err, qr/COPY FROM is not supported on distributed tables yet/,
+		"finding 3: COPY FROM on " . $n->name . ' is refused');
 }
 is(rows_everywhere(), 'row-0,row-1,row-2',
 	'finding 3: no row was removed from any node by the refused statements');

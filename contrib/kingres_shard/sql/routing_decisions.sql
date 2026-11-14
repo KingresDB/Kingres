@@ -29,7 +29,7 @@ INSERT INTO w SELECT 'name' || g, g FROM generate_series(1, 20) g;
 INSERT INTO t SELECT g, 'row ' || g FROM generate_series(1, 20) g;
 
 INSERT INTO kingres.node (node_id, group_id, host, port, role)
-  VALUES (2, 1, 'group1.invalid', 5432, 'primary');
+  VALUES (2, 1, '127.0.0.1', 1, 'primary');
 UPDATE kingres.bucket_map SET group_id = 1 WHERE bucket % 2 = 1;
 
 -- A key of a local bucket and of a remote bucket, per table.

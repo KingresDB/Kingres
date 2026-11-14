@@ -1,0 +1,150 @@
+-- SPDX-License-Identifier: PostgreSQL
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+--
+-- ddl_single.sql: pg_regress test of kingres_shard 0.2 (purpose below).
+-- DDL on distributed and reference tables on a single node (one shard group):
+-- every supported statement just runs, renaming a distributed table renames its
+-- bucket partitions, and the statements that would damage the distribution are
+-- refused whatever the number of groups.  (Propagation to other nodes is tested
+-- by t/012_ddl_propagation.pl.)
+\set SHOW_CONTEXT never
+SET search_path = public;
+CREATE EXTENSION kingres_shard;
+SELECT kingres.init_cluster('localhost', current_setting('port')::int);
+ init_cluster 
+--------------
+ 
+(1 row)
+
+CREATE TABLE d (id int PRIMARY KEY, a text, b int);
+SELECT kingres.create_distributed_table('d', 'id', bucket_count => 4);
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+CREATE TABLE r (id int PRIMARY KEY, name text);
+SELECT kingres.create_reference_table('r');
+ create_reference_table 
+------------------------
+ 
+(1 row)
+
+INSERT INTO d SELECT g, 'a' || g, g FROM generate_series(1, 10) g;
+INSERT INTO r VALUES (1, 'one');
+-- Supported statements.
+ALTER TABLE d ADD COLUMN c int DEFAULT 7;
+ALTER TABLE d ALTER COLUMN b SET DEFAULT 5;
+ALTER TABLE d ALTER COLUMN b SET NOT NULL;
+ALTER TABLE d ALTER COLUMN b DROP NOT NULL;
+ALTER TABLE d ALTER COLUMN b DROP DEFAULT;
+ALTER TABLE d ADD CONSTRAINT d_b_pos CHECK (b >= 0);
+ALTER TABLE d ADD CONSTRAINT d_id_a_key UNIQUE (id, a);
+ALTER TABLE d ADD COLUMN rr int;
+ALTER TABLE d ADD CONSTRAINT d_rr_fk FOREIGN KEY (rr) REFERENCES r (id);
+ALTER TABLE d DROP CONSTRAINT d_b_pos;
+ALTER TABLE d RENAME COLUMN a TO a2;
+ALTER TABLE d DROP COLUMN c;
+CREATE INDEX d_b_idx ON d (b);
+DROP INDEX d_b_idx;
+GRANT SELECT ON d TO PUBLIC;
+REVOKE SELECT ON d FROM PUBLIC;
+COMMENT ON TABLE d IS 'a distributed table';
+SELECT a2, b FROM d WHERE id = 3;
+ a2 | b 
+----+---
+ a3 | 3
+(1 row)
+
+-- Renaming the table renames the partitions.
+ALTER TABLE d RENAME TO d_renamed;
+SELECT relname FROM pg_class WHERE relname ~ '^d(_renamed)?(_b[0-9]{4})?$' AND relkind IN ('r', 'p') ORDER BY 1;
+     relname     
+-----------------
+ d_renamed
+ d_renamed_b0000
+ d_renamed_b0001
+ d_renamed_b0002
+ d_renamed_b0003
+(5 rows)
+
+SELECT count(*) AS partitions_found FROM kingres.buckets WHERE table_name = 'd_renamed'::regclass AND partition_size IS NOT NULL;
+ partitions_found 
+------------------
+                4
+(1 row)
+
+SELECT count(*) FROM d_renamed;
+ count 
+-------
+    10
+(1 row)
+
+ALTER TABLE d_renamed RENAME TO d;
+-- Reference table DDL (the foreign key from d is dropped first: TRUNCATE and DROP need it).
+ALTER TABLE d DROP CONSTRAINT d_rr_fk;
+ALTER TABLE r ADD COLUMN extra text;
+ALTER TABLE r RENAME TO r2;
+TRUNCATE r2;
+ALTER TABLE r2 RENAME TO r;
+-- Refused whatever the number of groups: the distribution column and the
+-- bucket partitions.
+ALTER TABLE d DROP COLUMN id;
+ERROR:  ALTER TABLE is not supported on distributed tables yet
+DETAIL:  The statement would change the distribution column or a bucket partition of distributed table "d".
+HINT:  A superuser can run the statement on every node by hand with kingres_shard.enable_routing = off.
+ALTER TABLE d RENAME COLUMN id TO id2;
+ERROR:  ALTER TABLE is not supported on distributed tables yet
+DETAIL:  The statement would change the distribution column or a bucket partition of distributed table "d".
+HINT:  A superuser can run the statement on every node by hand with kingres_shard.enable_routing = off.
+ALTER TABLE d ALTER COLUMN id TYPE bigint;
+ERROR:  ALTER TABLE is not supported on distributed tables yet
+DETAIL:  The statement would change the distribution column or a bucket partition of distributed table "d".
+HINT:  A superuser can run the statement on every node by hand with kingres_shard.enable_routing = off.
+ALTER TABLE d_b0000 RENAME TO oops;
+ERROR:  ALTER TABLE is not supported on distributed tables yet
+DETAIL:  The statement would change the distribution column or a bucket partition of distributed table "d".
+HINT:  A superuser can run the statement on every node by hand with kingres_shard.enable_routing = off.
+DROP TABLE d_b0000;
+ERROR:  DROP TABLE is not supported on distributed tables yet
+DETAIL:  The statement would change the distribution column or a bucket partition of distributed table "d".
+HINT:  A superuser can run the statement on every node by hand with kingres_shard.enable_routing = off.
+CREATE TABLE d_b0009 PARTITION OF d FOR VALUES WITH (MODULUS 4, REMAINDER 0);
+ERROR:  CREATE TABLE is not supported on distributed tables yet
+DETAIL:  The statement would change the distribution column or a bucket partition of distributed table "d".
+HINT:  A superuser can run the statement on every node by hand with kingres_shard.enable_routing = off.
+ALTER TABLE d DETACH PARTITION d_b0000;
+ERROR:  ALTER TABLE is not supported on distributed tables yet
+DETAIL:  The statement would change the distribution column or a bucket partition of distributed table "d".
+HINT:  A superuser can run the statement on every node by hand with kingres_shard.enable_routing = off.
+CREATE INDEX d_b0000_idx ON d_b0000 (b);
+ERROR:  CREATE INDEX is not supported on distributed tables yet
+DETAIL:  The statement would change the distribution column or a bucket partition of distributed table "d".
+HINT:  A superuser can run the statement on every node by hand with kingres_shard.enable_routing = off.
+-- A name too long for the partition names.
+ALTER TABLE d RENAME TO this_name_is_far_too_long_for_the_partition_suffix_to_fit_in_63_bytes;
+NOTICE:  identifier "this_name_is_far_too_long_for_the_partition_suffix_to_fit_in_63_bytes" will be truncated to "this_name_is_far_too_long_for_the_partition_suffix_to_fit_in_63"
+ERROR:  table name "this_name_is_far_too_long_for_the_partition_suffix_to_fit_in_63" is too long for a distributed table
+DETAIL:  Bucket partition names append 6 characters (_bNNNN) to the table name.
+SELECT count(*) FROM d;
+ count 
+-------
+    10
+(1 row)
+
+-- DROP TABLE removes the catalog row.
+DROP TABLE r;
+SELECT relid::regclass FROM kingres.dist_table ORDER BY 1;
+ relid 
+-------
+ d
+(1 row)
+
+DROP TABLE d CASCADE;
+SELECT count(*) AS catalog_rows FROM kingres.dist_table;
+ catalog_rows 
+--------------
+            0
+(1 row)
+
+DROP EXTENSION kingres_shard;

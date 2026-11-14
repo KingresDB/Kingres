@@ -365,30 +365,48 @@ catalog_load(void)
 				TupleDesc	desc = RelationGetDescr(cs.rel);
 				bool		isnull;
 				Oid			relid = DatumGetObjectId(heap_getattr(tup, 1, desc, &isnull));
-				Name		colname = DatumGetName(heap_getattr(tup, 3, desc, &isnull));
-				int			cid = DatumGetInt32(heap_getattr(tup, 4, desc, &isnull));
+				char	   *method = TextDatumGetCString(heap_getattr(tup, 2, desc, &isnull));
+				Datum		coldatum = heap_getattr(tup, 3, desc, &isnull);
+				bool		col_null = isnull;
+				Datum		ciddatum = heap_getattr(tup, 4, desc, &isnull);
+				bool		cid_null = isnull;
 				KsDistTable *dt;
 				bool		found;
-				AttrNumber	attno;
+				AttrNumber	attno = InvalidAttrNumber;
+				bool		is_ref = (strcmp(method, "reference") == 0);
 
-				attno = get_attnum(relid, NameStr(*colname));
-				if (attno == InvalidAttrNumber)
-					continue;	/* relation vanished; the drop trigger cleans up */
+				/* A relation that vanished is cleaned up by the drop trigger. */
+				if (get_rel_name(relid) == NULL)
+					continue;
+				if (!is_ref)
+				{
+					if (col_null || cid_null)
+						continue;
+					attno = get_attnum(relid, NameStr(*DatumGetName(coldatum)));
+					if (attno == InvalidAttrNumber)
+						continue;
+				}
 
 				dt = hash_search(cat.dist_tables, &relid, HASH_ENTER, &found);
 				dt->relid = relid;
 				dt->dist_attno = attno;
-				dt->colocation_id = cid;
+				dt->colocation_id = is_ref ? 0 : DatumGetInt32(ciddatum);
 				dt->coloc = NULL;
-				namestrcpy(&dt->dist_column, NameStr(*colname));
-				foreach(lc, cat.colocations)
+				dt->is_reference = is_ref;
+				if (is_ref)
+					memset(&dt->dist_column, 0, sizeof(dt->dist_column));
+				else
 				{
-					KsColocation *c = (KsColocation *) lfirst(lc);
+					namestrcpy(&dt->dist_column, NameStr(*DatumGetName(coldatum)));
+					foreach(lc, cat.colocations)
+					{
+						KsColocation *c = (KsColocation *) lfirst(lc);
 
-					if (c->colocation_id == cid)
-						dt->coloc = c;
+						if (c->colocation_id == dt->colocation_id)
+							dt->coloc = c;
+					}
 				}
-				if (dt->coloc == NULL)
+				if (!is_ref && dt->coloc == NULL)
 					hash_search(cat.dist_tables, &relid, HASH_REMOVE, NULL);
 				else
 					cat.ndist_tables++;

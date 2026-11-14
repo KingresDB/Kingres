@@ -1,37 +1,54 @@
 /*-------------------------------------------------------------------------
  *
  * utility.c
- *	  A ProcessUtility hook that refuses utility statements that would act on a
- *	  distributed table on this node only.
+ *	  A ProcessUtility hook that propagates DDL on distributed and reference
+ *	  tables to every node, or refuses it.
  *
  * The planner hook sees queries (SELECT, INSERT, UPDATE, DELETE, MERGE), never
- * utility statements, so before this hook TRUNCATE of a distributed table
- * emptied the local partitions and reported success, ALTER TABLE changed the
- * table on one node, and COPY FROM wrote to the local partitions only (review
- * finding 3).  Propagating DDL to every node is a later phase; until then, on
- * a cluster with more than one shard group, every utility statement that
- * would change a distributed table (or one of its partitions or indexes) is
- * refused with a "not supported on distributed tables yet" error.  What is
- * not refused:
+ * utility statements, so without this hook TRUNCATE of a distributed table
+ * empties the local partitions only, ALTER TABLE changes the table on one node,
+ * and COPY FROM writes to the local partitions only (review finding 3).  The
+ * hook looks at every utility statement that names a distributed or reference
+ * table (design/shard-phase2a.md, section 4):
  *
- *	- statements on other tables, and statements that only read
- *	  (EXPLAIN, COPY TO, LOCK);
- *	- the per-node maintenance commands VACUUM, ANALYZE, REINDEX and CLUSTER,
- *	  which change no logical content and are run on each node anyway;
- *	- GRANT, REVOKE, COMMENT and SECURITY LABEL: they have to be repeated on
- *	  every node by hand (the privileges and comments of a table are not
- *	  copied), and a node that lacks one fails loudly, never silently.
+ *	- Supported statements (ALTER TABLE with ADD/DROP COLUMN, SET/DROP DEFAULT,
+ *	  SET/DROP NOT NULL, ADD/DROP/VALIDATE CONSTRAINT and OWNER TO; RENAME of the
+ *	  table and of a column; CREATE INDEX and DROP INDEX; DROP TABLE; TRUNCATE;
+ *	  GRANT and REVOKE; COMMENT on the table and its columns) are executed on the
+ *	  map group primary and then, in the same distributed transaction (two-phase
+ *	  commit), on every other node, with the text of the statement and the
+ *	  search_path and literal settings of the session.  On any other node they are
+ *	  refused with a hint to use the map group primary.  The cluster-wide
+ *	  catalog lock serializes them with the other catalog changes.
+ *	- VACUUM, ANALYZE, REINDEX and LOCK act on one node by nature and are
+ *	  allowed, local.
+ *	- Everything else that names such a table is refused with "<statement> is
+ *	  not supported on distributed tables yet".
  *
- * A superuser who runs the statement on every node by hand sets
- * kingres_shard.enable_routing = off, which switches this hook off too.
- * With one shard group every statement works as before, except the few that
- * would destroy the structure of the distribution whatever the number of
- * nodes: dropping, renaming or retyping the distribution column and attaching,
- * detaching, dropping or creating a bucket partition.
+ * A bucket partition is not a table of the user: statements that act on one
+ * (rename, drop, attach, detach, create) and statements that change the
+ * distribution column are refused whatever the number of nodes.  A cluster with
+ * one shard group has no other node to propagate to: the supported statements
+ * just run, but renaming a distributed table renames its partitions too, on
+ * every node, because the partition names are derived from the table name.
+ *
+ * The statements that arrive propagated (from the map group primary, in a
+ * session with kingres_shard.forwarded on) are executed without propagating
+ * again.  That flag can be set by whoever connects, so on a non-map node it is
+ * a way around the "run DDL on the map group primary" rule for a user who is
+ * allowed to run the statement anyway: it never gives a privilege (every
+ * statement is checked against the user's own rights), it only lets the owner
+ * of a table make it differ between nodes, which is an inconsistency the owner
+ * can cause with enable_routing off, as a superuser, too.
+ *
+ * The text of the statement is sent as written, so a query string with several
+ * statements is refused (the statement text cannot be told apart).  Names
+ * resolve identically because the remote transaction runs with the search_path
+ * of the session.
  *
  * Drops that cascade (DROP SCHEMA ... CASCADE, DROP TYPE ... CASCADE) are not
- * named by the statement; the event trigger kingres.forget_dropped_tables()
- * is the backstop for those.
+ * named by the statement; the event trigger kingres.forget_dropped_tables() is
+ * the backstop for those.
  *
  * SPDX-License-Identifier: PostgreSQL
  * Portions Copyright (c) 2026, RooyeKhat Media Co
@@ -43,22 +60,57 @@
  */
 #include "postgres.h"
 
+#include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/partition.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_inherits.h"
 #include "commands/extension.h"
+#include "executor/spi.h"
+#include "nodes/makefuncs.h"
 #include "nodes/parsenodes.h"
+#include "nodes/value.h"
+#include "storage/lockdefs.h"
 #include "tcop/cmdtag.h"
 #include "tcop/utility.h"
+#include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 
 #include "catalog.h"
 #include "kingres_shard.h"
+#include "node_admin.h"
+#include "node_conn.h"
 #include "utility.h"
 
 static ProcessUtility_hook_type prev_ProcessUtility = NULL;
+
+PG_FUNCTION_INFO_V1(kingres_internal_ddl_authorized);
+
+/* > 0 while the hook runs a statement that it propagates or that arrived propagated. */
+static int	ddl_authorized_depth = 0;
+
+/*
+ * kingres.internal_ddl_authorized() returns bool
+ *
+ * Used by the sql_drop event trigger to let a DROP that the extension itself
+ * runs (or propagates) through its drop guard.
+ */
+Datum
+kingres_internal_ddl_authorized(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(ddl_authorized_depth > 0);
+}
+
+/* What the hook decided about one statement. */
+typedef struct UtilDecision
+{
+	bool		propagate;		/* run on the other nodes too */
+	bool		authorize;		/* let the drop guard pass */
+	Oid			rename_relid;	/* a hash table renamed: rename its partitions */
+} UtilDecision;
 
 static void kingres_shard_process_utility(PlannedStmt *pstmt,
 										   const char *queryString,
@@ -81,25 +133,23 @@ kingres_shard_utility_init(void)
 	ProcessUtility_hook = kingres_shard_process_utility;
 }
 
-/*
- * The name of the statement for the error message.
- */
+/* The name of the statement for the error message. */
 static const char *
 utility_name(Node *parsetree)
 {
 	if (IsA(parsetree, TruncateStmt))
 		return "TRUNCATE";
 	if (IsA(parsetree, CopyStmt))
-		return "COPY FROM";
+		return ((CopyStmt *) parsetree)->is_from ? "COPY FROM" : "COPY TO";
 	return GetCommandTagName(CreateCommandTag(parsetree));
 }
 
 /*
  * find_dist
  *
- * The distributed table that a relation belongs to: the table itself, the
- * parent of a bucket partition, or the table of an index of either.  NULL when
- * the relation has nothing to do with a distributed table.
+ * The distributed or reference table that a relation belongs to: the table
+ * itself, the parent of a bucket partition, or the table of an index of either.
+ * NULL when the relation has nothing to do with one.
  */
 static const KsDistTable *
 find_dist(const KsCatalog *cat, Oid relid)
@@ -125,27 +175,41 @@ find_dist(const KsCatalog *cat, Oid relid)
 	return NULL;
 }
 
-/*
- * Is the relation a bucket partition of a distributed table (not the table,
- * not an index)?
- */
+/* The table itself (not a partition or an index) when it is distributed or a reference table. */
+static const KsDistTable *
+direct_dist(const KsCatalog *cat, Oid relid)
+{
+	if (!OidIsValid(relid))
+		return NULL;
+	return hash_search(cat->dist_tables, &relid, HASH_FIND, NULL);
+}
+
+/* Is the relation a bucket partition of a distributed table, or an index of one? */
 static bool
-is_bucket_partition(const KsCatalog *cat, Oid relid)
+is_bucket_child(const KsCatalog *cat, Oid relid)
 {
 	return OidIsValid(relid) &&
-		hash_search(cat->dist_tables, &relid, HASH_FIND, NULL) == NULL &&
-		get_rel_relkind(relid) == RELKIND_RELATION &&
+		direct_dist(cat, relid) == NULL &&
 		find_dist(cat, relid) != NULL;
+}
+
+static Oid
+rangevar_relid(RangeVar *rv)
+{
+	if (rv == NULL)
+		return InvalidOid;
+	return RangeVarGetRelid(rv, NoLock, true);
 }
 
 /*
  * reject
  *
- * Raise the error for a statement that would act on distributed table dt on
- * this node only (or, with structural, that would damage its structure).
+ * Raise the error for a statement that is not supported on the distributed or
+ * reference table dt.  structural: the statement would damage the distribution
+ * (the distribution column or a bucket partition), whatever the cluster size.
  */
 static void
-reject(Node *parsetree, const KsDistTable *dt, bool structural)
+reject(Node *parsetree, const KsDistTable *dt, bool structural, const char *detail)
 {
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -154,84 +218,91 @@ reject(Node *parsetree, const KsDistTable *dt, bool structural)
 			 structural ?
 			 errdetail("The statement would change the distribution column or a bucket partition of distributed table \"%s\".",
 					   get_rel_name(dt->relid)) :
-			 errdetail("The statement would change distributed table \"%s\" on this node only, but the table exists on every node of the cluster; running DDL on every node is a later phase.",
-					   get_rel_name(dt->relid)),
+			 errdetail("%s", detail ? detail :
+					   psprintf("The statement would change %s table \"%s\" on this node only, and phase 2a propagates only a fixed set of statements to every node.",
+								dt->is_reference ? "reference" : "distributed",
+								get_rel_name(dt->relid))),
 			 errhint("A superuser can run the statement on every node by hand with kingres_shard.enable_routing = off.")));
 }
 
 /*
- * guard_relid
- *
- * Refuse the statement if relid belongs to a distributed table and the
- * cluster has more than one shard group, or if structural is true.
+ * A foreign key from table src (NULL: a table that is not distributed) to the
+ * table that con names.  Allowed: distributed -> reference, reference ->
+ * reference, and distributed -> colocated distributed on the distribution
+ * column.  Everything the nodes could not enforce locally is refused.
  */
 static void
-guard_relid(const KsCatalog *cat, Node *parsetree, Oid relid, bool structural)
+check_foreign_key(Node *parsetree, const KsCatalog *cat, const KsDistTable *src,
+				  Constraint *con)
 {
-	const KsDistTable *dt;
+	Oid			pkrel = rangevar_relid(con->pktable);
+	const KsDistTable *pk;
 
-	if (!OidIsValid(relid))
-		return;
-	dt = find_dist(cat, relid);
-	if (dt == NULL)
-		return;
-	if (cat->ngroups <= 1 && !structural)
-		return;
-	reject(parsetree, dt, structural);
-}
-
-/*
- * guard_rangevar
- *
- * guard_relid() for a relation named by a RangeVar; a relation that does not
- * exist is left for the statement itself to report.
- */
-static void
-guard_rangevar(const KsCatalog *cat, Node *parsetree, RangeVar *rv,
-			   bool structural)
-{
-	if (rv == NULL)
-		return;
-	guard_relid(cat, parsetree, RangeVarGetRelid(rv, NoLock, true), structural);
-}
-
-/*
- * guard_schema
- *
- * Refuse a statement that acts on a whole schema (DROP SCHEMA, ALTER SCHEMA ...
- * RENAME) if the schema holds a distributed table.
- */
-static void
-guard_schema(const KsCatalog *cat, Node *parsetree, const char *nspname)
-{
-	Oid			nspid;
-	HASH_SEQ_STATUS scan;
-	KsDistTable *dt;
-
-	if (cat->ngroups <= 1)
-		return;
-	nspid = get_namespace_oid(nspname, true);
-	if (!OidIsValid(nspid))
-		return;
-	hash_seq_init(&scan, cat->dist_tables);
-	while ((dt = (KsDistTable *) hash_seq_search(&scan)) != NULL)
+	if (!OidIsValid(pkrel))
+		return;					/* the statement reports a missing table */
+	pk = direct_dist(cat, pkrel);
+	if (pk == NULL)
 	{
-		if (get_rel_namespace(dt->relid) == nspid)
+		if (find_dist(cat, pkrel) != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("%s is not supported on distributed tables yet",
+							utility_name(parsetree)),
+					 errdetail("A foreign key cannot reference a bucket partition.")));
+		if (src != NULL)
+			reject(parsetree, src, false,
+				   "A foreign key of a distributed or reference table can reference only a reference table or a colocated distributed table.");
+		return;
+	}
+	if (pk->is_reference)
+		return;
+	/* The referenced table is distributed. */
+	if (src == NULL || src->is_reference)
+		reject(parsetree, pk, false,
+			   "A foreign key to a distributed table is possible only from a colocated distributed table.");
+	if (src->colocation_id != pk->colocation_id)
+		reject(parsetree, src, false,
+			   "A foreign key between distributed tables needs both in the same colocation group.");
+	{
+		ListCell   *l1;
+		ListCell   *l2;
+		bool		ok = false;
+
+		if (con->pk_attrs == NIL)
+			reject(parsetree, src, false,
+				   "Name the referenced columns of a foreign key between distributed tables.");
+		forboth(l1, con->fk_attrs, l2, con->pk_attrs)
 		{
-			hash_seq_term(&scan);
-			reject(parsetree, dt, false);
+			if (strcmp(strVal(lfirst(l1)), NameStr(src->dist_column)) == 0 &&
+				strcmp(strVal(lfirst(l2)), NameStr(pk->dist_column)) == 0)
+				ok = true;
 		}
+		if (!ok)
+			reject(parsetree, src, false,
+				   "A foreign key between distributed tables must contain the distribution column of both tables.");
 	}
 }
 
-/*
- * alter_is_structural
- *
- * Does an ALTER TABLE of distributed table dt change its distribution column
- * or attach or detach a partition?
- */
 static bool
-alter_is_structural(AlterTableStmt *stmt, const KsDistTable *dt)
+is_serial_type(TypeName *tn)
+{
+	const char *name;
+
+	if (tn == NULL || tn->names == NIL)
+		return false;
+	name = strVal(llast(tn->names));
+	return strcmp(name, "serial") == 0 || strcmp(name, "bigserial") == 0 ||
+		strcmp(name, "smallserial") == 0 || strcmp(name, "serial2") == 0 ||
+		strcmp(name, "serial4") == 0 || strcmp(name, "serial8") == 0;
+}
+
+/*
+ * The supported forms of ALTER TABLE.  Sets *structural for a statement that
+ * damages the distribution; calls reject() for a form that is not supported.
+ */
+static void
+check_alter_table(AlterTableStmt *stmt, const KsCatalog *cat,
+				  const KsDistTable *dt, bool multi, bool *structural)
 {
 	ListCell   *lc;
 
@@ -244,76 +315,263 @@ alter_is_structural(AlterTableStmt *stmt, const KsDistTable *dt)
 			case AT_AttachPartition:
 			case AT_DetachPartition:
 			case AT_DetachPartitionFinalize:
-				return true;
+				*structural = true;
+				return;
+
 			case AT_DropColumn:
 			case AT_AlterColumnType:
-				if (cmd->name != NULL &&
+				if (!dt->is_reference && cmd->name != NULL &&
 					strcmp(cmd->name, NameStr(dt->dist_column)) == 0)
-					return true;
+				{
+					*structural = true;
+					return;
+				}
 				break;
+
 			default:
 				break;
 		}
+
+		if (!multi)
+			continue;
+
+		switch (cmd->subtype)
+		{
+			case AT_AddColumn:
+				{
+					ColumnDef  *col = (ColumnDef *) cmd->def;
+					ListCell   *lc2;
+
+					if (col->identity != 0)
+						reject((Node *) stmt, dt, false, "ADD COLUMN with an identity is not supported yet.");
+					if (is_serial_type(col->typeName))
+						reject((Node *) stmt, dt, false, "ADD COLUMN of a serial type would create a different sequence on every node.");
+					foreach(lc2, col->constraints)
+					{
+						Constraint *c = lfirst_node(Constraint, lc2);
+
+						switch (c->contype)
+						{
+							case CONSTR_DEFAULT:
+								/* A default is evaluated for every row on every node: it must be a constant. */
+								if (!(c->raw_expr != NULL &&
+									  (IsA(c->raw_expr, A_Const) ||
+									   (IsA(c->raw_expr, TypeCast) &&
+										IsA(((TypeCast *) c->raw_expr)->arg, A_Const)))))
+									reject((Node *) stmt, dt, false, "ADD COLUMN with a default that is not a constant would give different values on different nodes.");
+								break;
+							case CONSTR_IDENTITY:
+								reject((Node *) stmt, dt, false, "ADD COLUMN with an identity is not supported yet.");
+								break;
+							case CONSTR_FOREIGN:
+								check_foreign_key((Node *) stmt, cat, dt, c);
+								break;
+							case CONSTR_EXCLUSION:
+								reject((Node *) stmt, dt, false, "Exclusion constraints are not supported.");
+								break;
+							default:
+								break;
+						}
+					}
+				}
+				break;
+
+			case AT_ColumnDefault:
+			case AT_DropNotNull:
+			case AT_SetNotNull:
+			case AT_ChangeOwner:
+			case AT_ValidateConstraint:
+			case AT_DropConstraint:
+				break;
+
+			case AT_DropColumn:
+				if (cmd->behavior == DROP_CASCADE)
+					reject((Node *) stmt, dt, false, "DROP COLUMN ... CASCADE could drop objects that exist on one node only.");
+				break;
+
+			case AT_AddConstraint:
+				{
+					Constraint *c = (Constraint *) cmd->def;
+
+					switch (c->contype)
+					{
+						case CONSTR_CHECK:
+							break;
+						case CONSTR_PRIMARY:
+						case CONSTR_UNIQUE:
+							if (c->indexname != NULL)
+								reject((Node *) stmt, dt, false, "A constraint built on an existing index (USING INDEX) is not supported yet.");
+							break;
+						case CONSTR_FOREIGN:
+							check_foreign_key((Node *) stmt, cat, dt, c);
+							break;
+						default:
+							reject((Node *) stmt, dt, false, "This kind of constraint is not supported yet.");
+					}
+				}
+				break;
+
+			case AT_AlterColumnType:
+				reject((Node *) stmt, dt, false, "ALTER COLUMN ... TYPE would rewrite the table on every node.");
+				break;
+
+			default:
+				reject((Node *) stmt, dt, false, "This form of ALTER TABLE is not supported yet.");
+		}
 	}
-	return false;
 }
 
 /*
- * guard_utility
- *
- * The decision for one utility statement; see the file header.
+ * A CREATE TABLE or ALTER TABLE of a table that is not distributed must not add
+ * a foreign key to a distributed table: the nodes could not enforce it.
  */
 static void
-guard_utility(Node *parsetree)
+check_foreign_keys_to_dist(Node *parsetree, const KsCatalog *cat, List *elements,
+						   bool are_cmds)
 {
-	const KsCatalog *cat;
+	ListCell   *lc;
+
+	foreach(lc, elements)
+	{
+		Node	   *e = (Node *) lfirst(lc);
+		List	   *cons = NIL;
+		ListCell   *lc2;
+
+		if (are_cmds)
+		{
+			AlterTableCmd *cmd = (AlterTableCmd *) e;
+
+			if (cmd->subtype == AT_AddConstraint && cmd->def != NULL &&
+				IsA(cmd->def, Constraint))
+				cons = list_make1(cmd->def);
+			else if (cmd->subtype == AT_AddColumn && cmd->def != NULL &&
+					 IsA(cmd->def, ColumnDef))
+				cons = ((ColumnDef *) cmd->def)->constraints;
+		}
+		else if (IsA(e, Constraint))
+			cons = list_make1(e);
+		else if (IsA(e, ColumnDef))
+			cons = ((ColumnDef *) e)->constraints;
+
+		foreach(lc2, cons)
+		{
+			Constraint *c = (Constraint *) lfirst(lc2);
+			const KsDistTable *pk;
+
+			if (!IsA(c, Constraint) || c->contype != CONSTR_FOREIGN)
+				continue;
+			pk = direct_dist(cat, rangevar_relid(c->pktable));
+			if (pk != NULL && !pk->is_reference)
+				reject(parsetree, pk, false,
+					   "A foreign key to a distributed table is possible only from a colocated distributed table.");
+		}
+	}
+}
+
+/* Refuse a statement on a whole schema if the schema holds a distributed table. */
+static void
+guard_schema(Node *parsetree, const KsCatalog *cat, const char *nspname, const char *detail)
+{
+	Oid			nspid = get_namespace_oid(nspname, true);
+	HASH_SEQ_STATUS scan;
+	KsDistTable *t;
+
+	if (!OidIsValid(nspid))
+		return;
+	hash_seq_init(&scan, cat->dist_tables);
+	while ((t = (KsDistTable *) hash_seq_search(&scan)) != NULL)
+	{
+		if (get_rel_namespace(t->relid) == nspid)
+		{
+			hash_seq_term(&scan);
+			reject(parsetree, t, false, detail);
+		}
+	}
+}
+
+/*
+ * decide
+ *
+ * The decision for one utility statement; see the file header.  Raises an
+ * error for a statement that is not allowed; fills *d for one that is.
+ */
+static void
+decide(Node *parsetree, const KsCatalog *cat, UtilDecision *d)
+{
+	bool		multi = cat->ngroups > 1;
 	ListCell   *lc;
 
 	switch (nodeTag(parsetree))
 	{
 		case T_TruncateStmt:
-		case T_AlterTableStmt:
-		case T_RenameStmt:
-		case T_AlterObjectSchemaStmt:
-		case T_IndexStmt:
-		case T_DropStmt:
-		case T_CopyStmt:
-		case T_CreateTrigStmt:
-		case T_RuleStmt:
-		case T_CreatePolicyStmt:
-		case T_AlterPolicyStmt:
-		case T_CreateStatsStmt:
-		case T_CreateStmt:
-			break;
-		default:
-			return;
-	}
+			{
+				int			ndist = 0;
+				int			nother = 0;
+				const KsDistTable *first = NULL;
 
-	cat = kingres_shard_catalog();
-	if (!cat->present || cat->ndist_tables == 0)
-		return;
+				foreach(lc, ((TruncateStmt *) parsetree)->relations)
+				{
+					Oid			relid = rangevar_relid((RangeVar *) lfirst(lc));
+					const KsDistTable *dt = direct_dist(cat, relid);
 
-	switch (nodeTag(parsetree))
-	{
-		case T_TruncateStmt:
-			foreach(lc, ((TruncateStmt *) parsetree)->relations)
-				guard_rangevar(cat, parsetree, (RangeVar *) lfirst(lc), false);
+					if (dt == NULL && is_bucket_child(cat, relid))
+						reject(parsetree, find_dist(cat, relid), true, NULL);
+					if (dt != NULL)
+					{
+						ndist++;
+						if (first == NULL)
+							first = dt;
+					}
+					else
+						nother++;
+				}
+				if (ndist > 0 && multi)
+				{
+					if (nother > 0)
+						reject(parsetree, first, false,
+							   "Name only distributed or reference tables in a TRUNCATE that includes one.");
+					d->propagate = true;
+					d->authorize = true;
+				}
+			}
 			break;
 
 		case T_AlterTableStmt:
 			{
 				AlterTableStmt *stmt = (AlterTableStmt *) parsetree;
-				Oid			relid;
-				const KsDistTable *dt;
+				Oid			relid = rangevar_relid(stmt->relation);
+				const KsDistTable *dt = direct_dist(cat, relid);
+				bool		structural = false;
 
-				relid = stmt->relation == NULL ? InvalidOid :
-					RangeVarGetRelid(stmt->relation, NoLock, true);
-				dt = OidIsValid(relid) ? find_dist(cat, relid) : NULL;
-				if (dt == NULL)
+				if (!OidIsValid(relid))
 					break;
-				guard_relid(cat, parsetree, relid,
-							alter_is_structural(stmt, dt) &&
-							hash_search(cat->dist_tables, &relid, HASH_FIND, NULL) != NULL);
+				if (stmt->objtype != OBJECT_TABLE)
+				{
+					/* ALTER INDEX and friends on an object of a distributed table */
+					const KsDistTable *any = find_dist(cat, relid);
+
+					if (any != NULL && multi)
+						reject(parsetree, any, false, NULL);
+					break;
+				}
+				if (dt == NULL)
+				{
+					const KsDistTable *any = find_dist(cat, relid);
+
+					if (any != NULL)	/* a bucket partition */
+						reject(parsetree, any, true, NULL);
+					if (multi)
+						check_foreign_keys_to_dist(parsetree, cat, stmt->cmds, true);
+					break;
+				}
+				check_alter_table(stmt, cat, dt, multi, &structural);
+				if (structural)
+					reject(parsetree, dt, true, NULL);
+				if (multi)
+				{
+					d->propagate = true;
+					d->authorize = true;
+				}
 			}
 			break;
 
@@ -321,12 +579,13 @@ guard_utility(Node *parsetree)
 			{
 				RenameStmt *stmt = (RenameStmt *) parsetree;
 				Oid			relid = InvalidOid;
-				bool		structural = false;
+				const KsDistTable *dt;
 
 				switch (stmt->renameType)
 				{
 					case OBJECT_SCHEMA:
-						guard_schema(cat, parsetree, stmt->subname);
+						if (multi)
+							guard_schema(parsetree, cat, stmt->subname, NULL);
 						return;
 					case OBJECT_TABLE:
 					case OBJECT_INDEX:
@@ -335,25 +594,45 @@ guard_utility(Node *parsetree)
 					case OBJECT_TRIGGER:
 					case OBJECT_POLICY:
 					case OBJECT_RULE:
-						if (stmt->relation != NULL)
-							relid = RangeVarGetRelid(stmt->relation, NoLock, true);
+						relid = rangevar_relid(stmt->relation);
 						break;
 					default:
 						return;
 				}
 				if (!OidIsValid(relid))
 					break;
+				dt = direct_dist(cat, relid);
+				if (dt == NULL)
+				{
+					const KsDistTable *any = find_dist(cat, relid);
+
+					if (any != NULL && (multi || stmt->renameType == OBJECT_TABLE))
+						reject(parsetree, any, stmt->renameType == OBJECT_TABLE, NULL);
+					break;
+				}
 				if (stmt->renameType == OBJECT_TABLE)
-					structural = is_bucket_partition(cat, relid);
+				{
+					if (!dt->is_reference && strlen(stmt->newname) + 6 > NAMEDATALEN - 1)
+						ereport(ERROR,
+								(errcode(ERRCODE_INVALID_NAME),
+								 errmsg("table name \"%s\" is too long for a distributed table", stmt->newname),
+								 errdetail("Bucket partition names append 6 characters (_bNNNN) to the table name.")));
+					if (!dt->is_reference)
+						d->rename_relid = relid;
+				}
 				else if (stmt->renameType == OBJECT_COLUMN)
 				{
-					const KsDistTable *dt = hash_search(cat->dist_tables, &relid,
-														HASH_FIND, NULL);
-
-					structural = dt != NULL && stmt->subname != NULL &&
-						strcmp(stmt->subname, NameStr(dt->dist_column)) == 0;
+					if (!dt->is_reference && stmt->subname != NULL &&
+						strcmp(stmt->subname, NameStr(dt->dist_column)) == 0)
+						reject(parsetree, dt, true, NULL);
 				}
-				guard_relid(cat, parsetree, relid, structural);
+				else if (multi)
+					reject(parsetree, dt, false, NULL);
+				if (multi)
+				{
+					d->propagate = true;
+					d->authorize = true;
+				}
 			}
 			break;
 
@@ -361,61 +640,178 @@ guard_utility(Node *parsetree)
 			{
 				AlterObjectSchemaStmt *stmt = (AlterObjectSchemaStmt *) parsetree;
 
-				if ((stmt->objectType == OBJECT_TABLE ||
-					 stmt->objectType == OBJECT_INDEX) && stmt->relation != NULL)
+				if ((stmt->objectType == OBJECT_TABLE || stmt->objectType == OBJECT_INDEX) &&
+					stmt->relation != NULL)
 				{
-					Oid			relid = RangeVarGetRelid(stmt->relation, NoLock, true);
+					Oid			relid = rangevar_relid(stmt->relation);
+					const KsDistTable *any = find_dist(cat, relid);
 
-					guard_relid(cat, parsetree, relid,
-								is_bucket_partition(cat, relid));
+					if (any != NULL && (multi || is_bucket_child(cat, relid)))
+						reject(parsetree, any, is_bucket_child(cat, relid), NULL);
 				}
 			}
 			break;
 
 		case T_IndexStmt:
-			guard_rangevar(cat, parsetree, ((IndexStmt *) parsetree)->relation,
-						   false);
+			{
+				IndexStmt  *stmt = (IndexStmt *) parsetree;
+				Oid			relid = rangevar_relid(stmt->relation);
+				const KsDistTable *dt = direct_dist(cat, relid);
+
+				if (dt == NULL)
+				{
+					const KsDistTable *any = find_dist(cat, relid);
+
+					if (any != NULL)
+						reject(parsetree, any, true, NULL);
+					break;
+				}
+				if (multi)
+				{
+					if (stmt->concurrent)
+						reject(parsetree, dt, false, "CREATE INDEX CONCURRENTLY cannot run in the distributed transaction.");
+					d->propagate = true;
+					d->authorize = true;
+				}
+			}
 			break;
 
 		case T_DropStmt:
 			{
 				DropStmt   *stmt = (DropStmt *) parsetree;
+				int			ndist = 0;
+				int			nother = 0;
+				const KsDistTable *first = NULL;
 
 				foreach(lc, stmt->objects)
 				{
 					Node	   *obj = (Node *) lfirst(lc);
 					List	   *names = IsA(obj, List) ? (List *) obj : NIL;
 					Oid			relid;
+					const KsDistTable *dt;
 
 					switch (stmt->removeType)
 					{
 						case OBJECT_SCHEMA:
-							if (IsA(obj, String))
-								guard_schema(cat, parsetree, strVal(obj));
+							if (IsA(obj, String) && multi)
+								guard_schema(parsetree, cat, strVal(obj), NULL);
 							break;
 						case OBJECT_TABLE:
 						case OBJECT_INDEX:
 							if (names == NIL)
 								break;
-							relid = RangeVarGetRelid(makeRangeVarFromNameList(names),
-													 NoLock, true);
-							guard_relid(cat, parsetree, relid,
-										is_bucket_partition(cat, relid));
+							relid = rangevar_relid(makeRangeVarFromNameList(names));
+							if (!OidIsValid(relid))
+								break;
+							dt = find_dist(cat, relid);
+							if (dt == NULL)
+							{
+								nother++;
+								break;
+							}
+							if (stmt->removeType == OBJECT_TABLE && is_bucket_child(cat, relid))
+								reject(parsetree, dt, true, NULL);
+							if (stmt->removeType == OBJECT_INDEX &&
+								get_rel_relispartition(IndexGetRelation(relid, true)))
+								reject(parsetree, dt, true, NULL);
+							ndist++;
+							if (first == NULL)
+								first = dt;
 							break;
 						case OBJECT_TRIGGER:
 						case OBJECT_POLICY:
 						case OBJECT_RULE:
-							/* the names are those of the table, then of the object */
-							if (list_length(names) < 2)
-								break;
-							guard_rangevar(cat, parsetree,
-										   makeRangeVarFromNameList(list_copy_head(names,
-																				   list_length(names) - 1)),
-										   false);
+							if (list_length(names) >= 2 && multi)
+							{
+								Oid			trel = rangevar_relid(makeRangeVarFromNameList(list_copy_head(names, list_length(names) - 1)));
+								const KsDistTable *any = find_dist(cat, trel);
+
+								if (any != NULL)
+									reject(parsetree, any, false, NULL);
+							}
 							break;
 						default:
 							break;
 					}
+				}
+				if (ndist > 0 && multi)
+				{
+					if (nother > 0)
+						reject(parsetree, first, false,
+							   "Name only distributed or reference tables (or only their indexes) in a DROP that includes one.");
+					if (stmt->concurrent)
+						reject(parsetree, first, false, "DROP INDEX CONCURRENTLY cannot run in the distributed transaction.");
+					d->propagate = true;
+					d->authorize = true;
+				}
+				else if (ndist > 0 && stmt->removeType == OBJECT_TABLE)
+					d->authorize = true;
+			}
+			break;
+
+		case T_GrantStmt:
+			{
+				GrantStmt  *stmt = (GrantStmt *) parsetree;
+				int			ndist = 0;
+				int			nother = 0;
+				const KsDistTable *first = NULL;
+
+				if (stmt->objtype != OBJECT_TABLE || !multi)
+					break;
+				if (stmt->targtype == ACL_TARGET_ALL_IN_SCHEMA)
+				{
+					foreach(lc, stmt->objects)
+						guard_schema(parsetree, cat, strVal(lfirst(lc)),
+									 "GRANT ... ON ALL TABLES IN SCHEMA would act on different tables on different nodes; name the tables.");
+					break;
+				}
+				foreach(lc, stmt->objects)
+				{
+					Oid			relid;
+					const KsDistTable *dt;
+
+					if (!IsA(lfirst(lc), RangeVar))
+						continue;
+					relid = rangevar_relid((RangeVar *) lfirst(lc));
+					dt = direct_dist(cat, relid);
+					if (dt == NULL && is_bucket_child(cat, relid))
+						reject(parsetree, find_dist(cat, relid), true, NULL);
+					if (dt != NULL)
+					{
+						ndist++;
+						if (first == NULL)
+							first = dt;
+					}
+					else
+						nother++;
+				}
+				if (ndist > 0)
+				{
+					if (nother > 0)
+						reject(parsetree, first, false,
+							   "Name only distributed or reference tables in a GRANT or REVOKE that includes one.");
+					d->propagate = true;
+					d->authorize = true;
+				}
+			}
+			break;
+
+		case T_CommentStmt:
+			{
+				CommentStmt *stmt = (CommentStmt *) parsetree;
+				List	   *names = IsA(stmt->object, List) ? (List *) stmt->object : NIL;
+				Oid			relid = InvalidOid;
+
+				if (!multi || names == NIL)
+					break;
+				if (stmt->objtype == OBJECT_TABLE)
+					relid = rangevar_relid(makeRangeVarFromNameList(names));
+				else if (stmt->objtype == OBJECT_COLUMN && list_length(names) >= 2)
+					relid = rangevar_relid(makeRangeVarFromNameList(list_copy_head(names, list_length(names) - 1)));
+				if (direct_dist(cat, relid) != NULL)
+				{
+					d->propagate = true;
+					d->authorize = true;
 				}
 			}
 			break;
@@ -423,37 +819,64 @@ guard_utility(Node *parsetree)
 		case T_CopyStmt:
 			{
 				CopyStmt   *stmt = (CopyStmt *) parsetree;
+				const KsDistTable *any = find_dist(cat, rangevar_relid(stmt->relation));
 
-				if (stmt->is_from)
-					guard_rangevar(cat, parsetree, stmt->relation, false);
+				if (any != NULL && multi && stmt->query == NULL && stmt->is_from)
+					reject(parsetree, any, false,
+						   "COPY FROM would write the rows to the partitions of this node only.");
+			}
+			break;
+
+		case T_ClusterStmt:
+			{
+				const KsDistTable *any = find_dist(cat, rangevar_relid(((ClusterStmt *) parsetree)->relation));
+
+				if (any != NULL && multi)
+					reject(parsetree, any, false, NULL);
 			}
 			break;
 
 		case T_CreateTrigStmt:
-			guard_rangevar(cat, parsetree, ((CreateTrigStmt *) parsetree)->relation,
-						   false);
+			{
+				const KsDistTable *any = find_dist(cat, rangevar_relid(((CreateTrigStmt *) parsetree)->relation));
+
+				if (any != NULL && multi)
+					reject(parsetree, any, false, NULL);
+			}
 			break;
 
 		case T_RuleStmt:
-			guard_rangevar(cat, parsetree, ((RuleStmt *) parsetree)->relation,
-						   false);
+			{
+				const KsDistTable *any = find_dist(cat, rangevar_relid(((RuleStmt *) parsetree)->relation));
+
+				if (any != NULL && multi)
+					reject(parsetree, any, false, NULL);
+			}
 			break;
 
 		case T_CreatePolicyStmt:
-			guard_rangevar(cat, parsetree, ((CreatePolicyStmt *) parsetree)->table,
-						   false);
-			break;
-
 		case T_AlterPolicyStmt:
-			guard_rangevar(cat, parsetree, ((AlterPolicyStmt *) parsetree)->table,
-						   false);
+			{
+				RangeVar   *rv = IsA(parsetree, CreatePolicyStmt) ?
+					((CreatePolicyStmt *) parsetree)->table :
+					((AlterPolicyStmt *) parsetree)->table;
+				const KsDistTable *any = find_dist(cat, rangevar_relid(rv));
+
+				if (any != NULL && multi)
+					reject(parsetree, any, false, NULL);
+			}
 			break;
 
 		case T_CreateStatsStmt:
 			foreach(lc, ((CreateStatsStmt *) parsetree)->relations)
 			{
 				if (IsA(lfirst(lc), RangeVar))
-					guard_rangevar(cat, parsetree, (RangeVar *) lfirst(lc), false);
+				{
+					const KsDistTable *any = find_dist(cat, rangevar_relid((RangeVar *) lfirst(lc)));
+
+					if (any != NULL && multi)
+						reject(parsetree, any, false, NULL);
+				}
 			}
 			break;
 
@@ -465,9 +888,15 @@ guard_utility(Node *parsetree)
 				foreach(lc, stmt->inhRelations)
 				{
 					if (IsA(lfirst(lc), RangeVar))
-						guard_rangevar(cat, parsetree, (RangeVar *) lfirst(lc),
-									   stmt->partbound != NULL);
+					{
+						const KsDistTable *any = find_dist(cat, rangevar_relid((RangeVar *) lfirst(lc)));
+
+						if (any != NULL && (stmt->partbound != NULL || multi))
+							reject(parsetree, any, stmt->partbound != NULL, NULL);
+					}
 				}
+				if (multi)
+					check_foreign_keys_to_dist(parsetree, cat, stmt->tableElts, false);
 			}
 			break;
 
@@ -477,11 +906,129 @@ guard_utility(Node *parsetree)
 }
 
 /*
+ * The text of the statement, for the other nodes.  The query string may hold
+ * several statements; the text of one of them cannot be told apart reliably in
+ * every case, so such a query string is refused.
+ */
+static char *
+statement_text(PlannedStmt *pstmt, const char *queryString)
+{
+	int			loc = pstmt->stmt_location;
+	int			len = pstmt->stmt_len;
+	int			total = strlen(queryString);
+	const char *p;
+
+	if (loc < 0)
+		loc = 0;
+	if (len <= 0 || loc + len > total)
+		len = total - loc;
+	if (loc != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a DDL statement on distributed tables cannot be one of several statements in one query string"),
+				 errhint("Send each statement on its own.")));
+	for (p = queryString + loc + len; *p; p++)
+	{
+		if (!(*p == ';' || *p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("a DDL statement on distributed tables cannot be one of several statements in one query string"),
+					 errhint("Send each statement on its own.")));
+	}
+	return pnstrdup(queryString + loc, len);
+}
+
+/* A node to propagate to; copied out of the catalog cache. */
+typedef struct DdlTarget
+{
+	int			node_id;
+	char	   *host;
+	int			port;
+} DdlTarget;
+
+static int
+compare_targets(const ListCell *a, const ListCell *b)
+{
+	return ((DdlTarget *) lfirst(a))->node_id - ((DdlTarget *) lfirst(b))->node_id;
+}
+
+/*
+ * After a distributed table was renamed, rename its bucket partitions: their
+ * names are <table>_b<NNNN>, derived from the name of the table.
+ */
+static void
+rename_partitions(Oid relid)
+{
+	char	   *nsp = get_namespace_name(get_rel_namespace(relid));
+	char	   *newname = get_rel_name(relid);
+	List	   *children = find_inheritance_children(relid, NoLock);
+	ListCell   *lc;
+	List	   *stmts = NIL;
+
+	foreach(lc, children)
+	{
+		Oid			child = lfirst_oid(lc);
+		char	   *old = get_rel_name(child);
+		size_t		len = strlen(old);
+
+		if (len < 6)
+			continue;
+		stmts = lappend(stmts,
+						psprintf("ALTER TABLE %s.%s RENAME TO %s",
+								 quote_identifier(nsp), quote_identifier(old),
+								 quote_identifier(psprintf("%s%s", newname, old + len - 6))));
+	}
+	if (stmts == NIL)
+		return;
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	foreach(lc, stmts)
+	{
+		if (SPI_execute((char *) lfirst(lc), false, 0) < 0)
+			elog(ERROR, "could not rename a bucket partition");
+	}
+	SPI_finish();
+}
+
+/*
+ * Does the hook have to look at this kind of statement?  The catalog cache
+ * takes a snapshot, so it must not be read for statements that never concern
+ * it: BEGIN ISOLATION LEVEL ... would fail after a snapshot was taken.
+ */
+static bool
+statement_is_of_interest(Node *parsetree)
+{
+	switch (nodeTag(parsetree))
+	{
+		case T_TruncateStmt:
+		case T_AlterTableStmt:
+		case T_RenameStmt:
+		case T_AlterObjectSchemaStmt:
+		case T_IndexStmt:
+		case T_DropStmt:
+		case T_GrantStmt:
+		case T_CommentStmt:
+		case T_CopyStmt:
+		case T_ClusterStmt:
+		case T_CreateTrigStmt:
+		case T_RuleStmt:
+		case T_CreatePolicyStmt:
+		case T_AlterPolicyStmt:
+		case T_CreateStatsStmt:
+		case T_CreateStmt:
+			return true;
+		default:
+			return false;
+	}
+}
+
+/*
  * kingres_shard_process_utility
  *
- * The hook: decide, then hand over to the previous hook or the standard
- * function.  Statements that run while the extension itself is created, and
- * all statements while routing is off, are not looked at.
+ * The hook: decide, run, propagate.  Statements that run while the extension
+ * itself is created, and all statements while routing is off, are not looked
+ * at; nor are statements generated by another statement, nor those that run
+ * while an authorized statement runs (the renames of partitions).
  */
 static void
 kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
@@ -491,13 +1038,111 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 							   QueryEnvironment *queryEnv,
 							   DestReceiver *dest, QueryCompletion *qc)
 {
-	if (kingres_shard_enable_routing && !creating_extension)
-		guard_utility(pstmt->utilityStmt);
+	Node	   *parsetree = pstmt->utilityStmt;
+	UtilDecision d;
+	const KsCatalog *cat;
+	List	   *targets = NIL;
+	char	   *text = NULL;
+	bool		authorized;
 
-	if (prev_ProcessUtility)
-		prev_ProcessUtility(pstmt, queryString, readOnlyTree, context, params,
-							queryEnv, dest, qc);
-	else
-		standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
-								params, queryEnv, dest, qc);
+	memset(&d, 0, sizeof(d));
+
+	if (kingres_shard_enable_routing && !creating_extension &&
+		statement_is_of_interest(parsetree) &&
+		ddl_authorized_depth == 0 && context != PROCESS_UTILITY_SUBCOMMAND)
+	{
+		cat = kingres_shard_catalog();
+		if (cat->present && cat->ndist_tables > 0)
+		{
+			decide(parsetree, cat, &d);
+
+			if (d.propagate && !kingres_shard_forwarded)
+			{
+				const KsNode *self;
+				ListCell   *lc;
+
+				self = kingres_shard_node_by_id(cat->local_node_id);
+				if (self == NULL || self->group_id != KINGRES_SHARD_MAP_GROUP || !self->is_primary)
+				{
+					const KsNode *mg = kingres_shard_group_primary(KINGRES_SHARD_MAP_GROUP);
+
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("%s on a distributed or reference table must run on the map group primary",
+									utility_name(parsetree)),
+							 mg ? errhint("Run it on node %d (%s:%d).", mg->node_id, mg->host, mg->port) :
+							 errhint("Run it on the map group primary.")));
+				}
+				text = statement_text(pstmt, queryString);
+				kingres_shard_lock_catalog();
+				cat = kingres_shard_catalog();
+				foreach(lc, cat->nodes)
+				{
+					KsNode	   *n = (KsNode *) lfirst(lc);
+					DdlTarget  *t;
+
+					if (n->node_id == cat->local_node_id || !n->is_active || !n->is_primary)
+						continue;
+					t = palloc(sizeof(DdlTarget));
+					t->node_id = n->node_id;
+					t->host = pstrdup(n->host);
+					t->port = n->port;
+					targets = lappend(targets, t);
+				}
+				list_sort(targets, compare_targets);
+			}
+		}
+	}
+
+	authorized = d.authorize || OidIsValid(d.rename_relid);
+	if (authorized)
+		ddl_authorized_depth++;
+	PG_TRY();
+	{
+		if (prev_ProcessUtility)
+			prev_ProcessUtility(pstmt, queryString, readOnlyTree, context, params,
+								queryEnv, dest, qc);
+		else
+			standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+									params, queryEnv, dest, qc);
+		if (OidIsValid(d.rename_relid))
+			rename_partitions(d.rename_relid);
+	}
+	PG_FINALLY();
+	{
+		if (authorized)
+			ddl_authorized_depth--;
+	}
+	PG_END_TRY();
+
+	if (text != NULL)
+	{
+		ListCell   *lc;
+
+		foreach(lc, targets)
+		{
+			DdlTarget  *t = (DdlTarget *) lfirst(lc);
+			KsConn	   *kc = kingres_shard_get_conn(t->host, t->port, false, NULL);
+
+			kingres_shard_begin_write_xact(kc);
+			kingres_shard_exec_ddl(kc, text);
+		}
+	}
+}
+
+/*
+ * kingres_shard_in_authorized_ddl
+ *
+ * True while a propagated (or arrived) DDL statement runs.  The statements that
+ * PostgreSQL runs on its behalf, such as the validation of a new foreign key
+ * (a join of the partitions of the referencing table with the referenced
+ * table), concern the partitions of this node: the foreign keys that are
+ * accepted are on the distribution column of colocated tables or reference a
+ * reference table, so every node validates its own buckets.  The planner must
+ * not apply the routing checks to them.
+ */
+bool
+kingres_shard_in_authorized_ddl(void)
+{
+	return ddl_authorized_depth > 0;
 }

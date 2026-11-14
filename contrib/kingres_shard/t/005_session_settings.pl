@@ -24,7 +24,9 @@ sub make_node
 	my $node = PostgreSQL::Test::Cluster->new($name);
 	$node->init(extra => [ "--encoding=$encoding", '--locale=C' ]);
 	$node->append_conf('postgresql.conf',
-		"shared_preload_libraries = 'kingres_shard'");
+		"shared_preload_libraries = 'kingres_shard'
+max_prepared_transactions = 20
+kingres_shard.recovery_interval = 0");
 	$node->start;
 	return $node;
 }

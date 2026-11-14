@@ -17,6 +17,12 @@
  *	utility.c	 the ProcessUtility hook that refuses statements that would act
  *				 on a distributed table on one node only
  *	remote_scan.c the "Kingres Remote Statement" custom scan
+ *	fanout.c	 the "Kingres Fan-out Write" custom scan: reference table writes
+ *				 and UPDATE/DELETE that span shard groups
+ *	dist_scan.c	 the "Kingres Distributed Scan" custom scan and its path hook
+ *	shippable.c	 what may be sent to another node and mean the same there
+ *	recovery.c	 recover_prepared_transactions() and the background workers
+ *	fault.c		 fault injection for the tests of two-phase commit
  *
  * SPDX-License-Identifier: PostgreSQL
  * Portions Copyright (c) 2026, RooyeKhat Media Co
@@ -29,14 +35,18 @@
 #include "postgres.h"
 
 #include "fmgr.h"
+#include "access/twophase.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 
 #include "catalog.h"
+#include "dist_scan.h"
+#include "fanout.h"
 #include "kingres_shard.h"
 #include "node_conn.h"
 #include "planner.h"
+#include "recovery.h"
 #include "remote_scan.h"
 #include "utility.h"
 
@@ -52,6 +62,9 @@ int			kingres_shard_default_bucket_count = 128;
 bool		kingres_shard_enable_routing = true;
 bool		kingres_shard_forwarded = false;
 int			kingres_shard_node_connect_timeout = 5;
+char	   *kingres_shard_node_conninfo = NULL;
+int			kingres_shard_recovery_interval = 30;
+bool		kingres_shard_enable_distributed_scan = true;
 
 /*
  * _PG_init
@@ -118,10 +131,50 @@ _PG_init(void)
 							PGC_USERSET, GUC_UNIT_S,
 							NULL, NULL, NULL);
 
+	/*
+	 * Appended to every node-to-node connection string (sslmode, sslcert,
+	 * sslkey, sslrootcert, ...).  Superusers only: it can name key files.
+	 * The keywords the extension controls are rejected when it is set, and
+	 * the value never appears in the messages of the extension.
+	 */
+	DefineCustomStringVariable("kingres_shard.node_conninfo",
+							   "Connection options appended to every node-to-node connection.",
+							   "A libpq connection string such as \"sslmode=verify-full sslrootcert=...\"; host, port, dbname, user, password and options are not allowed.",
+							   &kingres_shard_node_conninfo,
+							   "",
+							   PGC_SUSET, GUC_SUPERUSER_ONLY,
+							   kingres_shard_check_node_conninfo, NULL, NULL);
+
+	DefineCustomIntVariable("kingres_shard.recovery_interval",
+							"Seconds between runs of the recovery of prepared transactions; 0 disables.",
+							NULL,
+							&kingres_shard_recovery_interval,
+							30, 0, 86400,
+							PGC_SIGHUP, GUC_UNIT_S,
+							NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("kingres_shard.enable_distributed_scan",
+							 "Let SELECT statements that span shard groups run through the distributed scan.",
+							 "When off, such statements fail with \"statements that span shard groups are not supported yet\".",
+							 &kingres_shard_enable_distributed_scan,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+
 	MarkGUCPrefixReserved("kingres_shard");
 
+	/* Two-phase commit needs prepared transactions on every node. */
+	if (max_prepared_xacts == 0)
+		ereport(WARNING,
+				(errmsg("kingres_shard: max_prepared_transactions is 0"),
+				 errhint("Transactions that write on several nodes need max_prepared_transactions greater than zero on every node.")));
+
+	kingres_shard_fault_init();
 	kingres_shard_catalog_init();
 	kingres_shard_conn_init();
+	kingres_shard_recovery_init();
+	kingres_shard_fanout_init();
+	kingres_shard_dist_scan_init();
 	kingres_shard_planner_init();
 	kingres_shard_utility_init();
 	kingres_shard_remote_scan_init();

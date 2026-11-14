@@ -9,13 +9,18 @@ MODULE_big = kingres_shard
 OBJS = \
 	$(WIN32RES) \
 	src/catalog.o \
+	src/dist_scan.o \
 	src/dist_table.o \
+	src/fanout.o \
+	src/fault.o \
 	src/hashing.o \
 	src/kingres_shard.o \
 	src/node_admin.o \
 	src/node_conn.o \
 	src/planner.o \
+	src/recovery.o \
 	src/remote_scan.o \
+	src/shippable.o \
 	src/utility.o
 PGFILEDESC = "kingres_shard - KingresDB sharding extension"
 
@@ -23,10 +28,10 @@ PG_CPPFLAGS = -I$(libpq_srcdir) -I$(srcdir)/src
 SHLIB_LINK_INTERNAL = $(libpq)
 
 EXTENSION = kingres_shard
-DATA = kingres_shard--0.1.sql
+DATA = kingres_shard--0.1.sql kingres_shard--0.2.sql kingres_shard--0.1--0.2.sql
 
 REGRESS = version catalog bucket_for distribute routing_single security \
-	utility_guard routing_decisions
+	utility_guard routing_decisions reference ddl_single upgrade
 # The tests need the extension preloaded (see kingres_shard.conf).
 REGRESS_OPTS = --temp-config $(srcdir)/kingres_shard.conf
 TAP_TESTS = 1

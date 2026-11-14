@@ -14,8 +14,20 @@
  * The bucket map then names the owning shard group: if that is this node's
  * group the standard planner runs, if it is another group the statement is
  * deparsed and wrapped in the "Kingres Remote Statement" custom scan
- * (remote_scan.c).  Any other statement is refused with a "not supported
- * yet" error: that is the phase 1 boundary.
+ * (remote_scan.c).
+ *
+ * Phase 2a (design/shard-phase2a.md) handles what used to be refused:
+ *	- a SELECT that spans groups (and a write to an ordinary table that reads a
+ *	  distributed one) is planned by the standard planner with the distributed
+ *	  scan (dist_scan.c) replacing the paths of the distributed tables;
+ *	- an UPDATE or DELETE of one distributed table that spans groups and can be
+ *	  shipped whole runs on every group that owns buckets (fanout.c);
+ *	- a write to a reference table runs on every node (fanout.c);
+ *	- the rest (a multi-row INSERT or INSERT ... SELECT across groups, a write
+ *	  that cannot be shipped) is refused with a "not supported yet" error.
+ * The decision is made per statement; a function called while a statement is
+ * planned decides for its own statements, and the distributed scan is switched
+ * on only around the standard planner of the statement that needs it.
  *
  * A forwarded session (kingres_shard.forwarded, opened by another node) never
  * forwards, and does not take the origin's word for it either: it runs a
@@ -64,11 +76,15 @@
 #include "utils/typcache.h"
 
 #include "catalog.h"
+#include "dist_scan.h"
+#include "fanout.h"
 #include "hashing.h"
 #include "kingres_shard.h"
 #include "node_conn.h"
 #include "planner.h"
 #include "remote_scan.h"
+#include "shippable.h"
+#include "utility.h"
 
 static planner_hook_type prev_planner_hook = NULL;
 
@@ -90,13 +106,17 @@ typedef struct Analysis
 	List	   *refs;			/* of DistRef * */
 	bool		has_nondist;	/* the query also reads other relations */
 	bool		has_merge;
-	int			ndist_rtes;		/* every range table entry of a distributed table */
+	int			ndist_rtes;		/* every range table entry of a hash-distributed table */
+	bool		has_ref;		/* the query reads or writes a reference table */
 } Analysis;
 
 static PlannedStmt *kingres_shard_planner_hook(Query *parse,
 												const char *query_string,
 												int cursorOptions,
 												ParamListInfo boundParams);
+static bool is_scan_fragment(Query *q, const KsCatalog *cat);
+static PlannedStmt *planner_hook_body(Query *parse, const char *query_string,
+									   int cursorOptions, ParamListInfo boundParams);
 static PlannedStmt *pass_through(Query *parse, const char *query_string,
 								 int cursorOptions, ParamListInfo boundParams);
 
@@ -323,6 +343,12 @@ analyze_query(Query *q, Analysis *a, const KsCatalog *cat)
 		 * inserted, not a scan, and takes part in no routing decision.
 		 */
 		dt = hash_search(cat->dist_tables, &rte->relid, HASH_FIND, NULL);
+		if (dt != NULL && dt->is_reference)
+		{
+			/* every node has the whole table: it takes no part in routing */
+			a->has_ref = true;
+			continue;
+		}
 		if (dt != NULL)
 			a->ndist_rtes++;
 		if (q->onConflict != NULL && q->onConflict->exclRelIndex == (int) rti)
@@ -437,6 +463,110 @@ error_spans_groups(DistRef *ref, const char *detail)
 }
 
 /*
+ * error_write_spans_groups
+ *
+ * An UPDATE or DELETE that spans shard groups and cannot be run group by group.
+ */
+static void
+error_write_spans_groups(Query *parse, DistRef *ref, const char *detail)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("this %s spans shard groups and cannot be shipped",
+					parse->commandType == CMD_UPDATE ? "UPDATE" : "DELETE"),
+			 detail ? errdetail("%s", detail) : 0,
+			 errhint("Restrict it by the distribution column, for example with WHERE %s = <value>, or use only built-in immutable functions on the one table (and reference tables).",
+					 NameStr(ref->dt->dist_column))));
+}
+
+/*
+ * plan_distributed_write
+ *
+ * An UPDATE or DELETE of one distributed table that is not restricted to one
+ * bucket (design/shard-phase2a.md, section 6): when the whole statement can be
+ * shipped (shippable.c: it reads no other distributed table, uses only built-in
+ * immutable functions and operators) it is executed on every shard group that
+ * owns buckets of the table, in one distributed transaction, and the counts
+ * and the RETURNING rows of the groups are added.  A statement that assigns the
+ * distribution column is refused: the row would have to move between groups.
+ * The text carries KS_WRITE_MARKER, which tells the forwarded sessions of the
+ * other groups that this is such a fragment.
+ */
+static PlannedStmt *
+plan_distributed_write(Query *parse, DistRef *ref, const KsCatalog *cat, List *relids)
+{
+	const char *reason = NULL;
+	List	   *groups = NIL;
+	List	   *targets = NIL;
+	ListCell   *lc;
+	int			b;
+	char	   *sql;
+
+	if (parse->commandType == CMD_UPDATE)
+	{
+		foreach(lc, parse->targetList)
+		{
+			TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+			if (!te->resjunk && te->resno == ref->dt->dist_attno)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("an UPDATE of the distribution column \"%s\" of \"%s\" is not supported",
+								NameStr(ref->dt->dist_column), get_rel_name(ref->dt->relid)),
+						 errdetail("The row would have to move to another bucket, possibly of another shard group."),
+						 errhint("DELETE the row and INSERT it with the new key.")));
+		}
+	}
+	if (parse->hasModifyingCTE || parse->rowMarks != NIL ||
+		!kingres_shard_stmt_shippable(parse, ref->dt->relid, &reason))
+		error_write_spans_groups(parse, ref,
+								 reason ? psprintf("The statement is not shippable: %s.", reason) : NULL);
+	if (IsInParallelMode())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a statement for several shard groups cannot be run from a parallel worker")));
+
+	for (b = 0; b < ref->dt->coloc->bucket_count; b++)
+	{
+		int			g = ref->dt->coloc->bucket_group[b];
+
+		if (g >= 0 && !list_member_int(groups, g))
+			groups = lappend_int(groups, g);
+	}
+	list_sort(groups, list_int_cmp);
+	foreach(lc, groups)
+	{
+		int			g = lfirst_int(lc);
+		const KsNode *n = NULL;
+		ListCell   *lc2;
+		KsFanTarget *t;
+
+		foreach(lc2, cat->nodes)
+		{
+			KsNode	   *c = (KsNode *) lfirst(lc2);
+
+			if (c->group_id == g && c->is_primary && c->is_active)
+			{
+				n = c;
+				break;
+			}
+		}
+		if (n == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("shard group %d has no active primary node", g)));
+		t = palloc(sizeof(KsFanTarget));
+		t->host = n->host;
+		t->port = n->port;
+		t->is_local = (g == cat->local_group_id);
+		targets = lappend(targets, t);
+	}
+
+	sql = psprintf("%s%s", KS_WRITE_MARKER, deparse_for_remote(parse));
+	return kingres_shard_make_fanout_plan(parse, sql, targets, true, relids);
+}
+
+/*
  * all_buckets_local
  *
  * True when every bucket of the colocation group belongs to this node's
@@ -507,8 +637,12 @@ check_plan_dist_rtes(PlannedStmt *pstmt, int expected)
 
 		if (rte->rtekind != RTE_RELATION)
 			continue;
-		if (hash_search(cat->dist_tables, &rte->relid, HASH_FIND, NULL) == NULL)
-			continue;
+		{
+			KsDistTable *d2 = hash_search(cat->dist_tables, &rte->relid, HASH_FIND, NULL);
+
+			if (d2 == NULL || d2->is_reference)
+				continue;
+		}
 		if (++found == 1)
 			first = rte->relid;
 	}
@@ -568,6 +702,27 @@ plan_forwarded(Query *parse, const char *query_string, int cursorOptions,
 	List	   *relids = NIL;
 	bool		pending = false;
 
+	/* The fragment of a distributed scan of another node: the local buckets only. */
+	if (list_length(a->refs) == 1 && query_string != NULL &&
+		strncmp(query_string, KS_FRAGMENT_MARKER, strlen(KS_FRAGMENT_MARKER)) == 0 &&
+		is_scan_fragment(parse, cat))
+		return plan_locally(parse, query_string, cursorOptions, boundParams, cat,
+							a->ndist_rtes);
+
+	/* The part of an UPDATE or DELETE that another node runs on every group. */
+	if (list_length(a->refs) == 1 && query_string != NULL &&
+		strncmp(query_string, KS_WRITE_MARKER, strlen(KS_WRITE_MARKER)) == 0 &&
+		(parse->commandType == CMD_UPDATE || parse->commandType == CMD_DELETE) &&
+		!parse->hasModifyingCTE && parse->rowMarks == NIL)
+	{
+		DistRef    *only = (DistRef *) linitial(a->refs);
+
+		if (only->query == parse && only->rti == (Index) parse->resultRelation &&
+			kingres_shard_stmt_shippable(parse, only->dt->relid, NULL))
+			return plan_locally(parse, query_string, cursorOptions, boundParams, cat,
+								a->ndist_rtes);
+	}
+
 	foreach(lc, a->refs)
 	{
 		DistRef    *ref = (DistRef *) lfirst(lc);
@@ -599,12 +754,295 @@ plan_forwarded(Query *parse, const char *query_string, int cursorOptions,
 }
 
 /*
+ * Count the data-modifying queries below the top one that write a reference
+ * table (a WITH clause may hide one).
+ */
+static bool
+nested_reference_write_walker(Node *node, void *context)
+{
+	const KsCatalog *cat = ((void **) context)[0];
+	Query	   *top = ((void **) context)[1];
+
+	if (node == NULL)
+		return false;
+	if (IsA(node, Query))
+	{
+		Query	   *q = (Query *) node;
+
+		if (q != top && q->resultRelation > 0 &&
+			(q->commandType == CMD_INSERT || q->commandType == CMD_UPDATE ||
+			 q->commandType == CMD_DELETE || q->commandType == CMD_MERGE))
+		{
+			RangeTblEntry *rte = rt_fetch(q->resultRelation, q->rtable);
+			KsDistTable *dt = hash_search(cat->dist_tables, &rte->relid, HASH_FIND, NULL);
+
+			if (dt != NULL && dt->is_reference)
+				return true;
+		}
+		return query_tree_walker(q, nested_reference_write_walker, context, 0);
+	}
+	return expression_tree_walker(node, nested_reference_write_walker, context);
+}
+
+/* The reference table the statement writes, or InvalidOid. */
+static Oid
+reference_write_target(Query *parse, const KsCatalog *cat)
+{
+	void	   *ctx[2];
+
+	if ((parse->commandType == CMD_INSERT || parse->commandType == CMD_UPDATE ||
+		 parse->commandType == CMD_DELETE || parse->commandType == CMD_MERGE) &&
+		parse->resultRelation > 0)
+	{
+		RangeTblEntry *rte = rt_fetch(parse->resultRelation, parse->rtable);
+		KsDistTable *dt = hash_search(cat->dist_tables, &rte->relid, HASH_FIND, NULL);
+
+		if (dt != NULL && dt->is_reference)
+			return rte->relid;
+	}
+
+	ctx[0] = (void *) cat;
+	ctx[1] = parse;
+	if (query_tree_walker(parse, nested_reference_write_walker, ctx, 0))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a write to a reference table inside a WITH clause or a subquery is not supported yet"),
+				 errhint("Run the write to the reference table as a statement of its own.")));
+	return InvalidOid;
+}
+
+static int
+compare_nodes_by_id(const ListCell *a, const ListCell *b)
+{
+	const KsNode *na = (const KsNode *) lfirst(a);
+	const KsNode *nb = (const KsNode *) lfirst(b);
+
+	return na->node_id - nb->node_id;
+}
+
+/*
+ * plan_reference_write
+ *
+ * A write to a reference table runs on every active primary node, in one
+ * distributed transaction (design/shard-phase2a.md, section 3), so it must
+ * produce the same rows everywhere: it is shipped only if every expression in
+ * it is built in and immutable (no volatile function, no sequence default, and
+ * also no now(), which differs between nodes), and it reads no table that is
+ * not a reference table.
+ */
+static PlannedStmt *
+plan_reference_write(Query *parse, Oid target, const KsCatalog *cat)
+{
+	const char *reason = NULL;
+	List	   *nodes = NIL;
+	List	   *targets = NIL;
+	ListCell   *lc;
+	char	   *sql;
+
+	if (parse->commandType == CMD_MERGE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("MERGE into a reference table is not supported yet")));
+	if (!kingres_shard_stmt_shippable(parse, target, &reason))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("this write to reference table \"%s\" cannot be run on every node",
+						get_rel_name(target)),
+				 errdetail("The statement is not shippable: %s.", reason),
+				 errhint("A write to a reference table runs on every node, so it may use only constants, parameters and built-in immutable functions (not a sequence, random() or now()), and other reference tables.")));
+	if (IsInParallelMode())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a write to a reference table cannot be run from a parallel worker")));
+
+	foreach(lc, cat->nodes)
+	{
+		KsNode	   *n = (KsNode *) lfirst(lc);
+
+		if (n->is_active && n->is_primary)
+			nodes = lappend(nodes, n);
+	}
+	list_sort(nodes, compare_nodes_by_id);
+	foreach(lc, nodes)
+	{
+		KsNode	   *n = (KsNode *) lfirst(lc);
+		KsFanTarget *t = palloc(sizeof(KsFanTarget));
+
+		t->host = n->host;
+		t->port = n->port;
+		t->is_local = (n->node_id == cat->local_node_id);
+		targets = lappend(targets, t);
+	}
+
+	sql = deparse_for_remote(parse);
+	return kingres_shard_make_fanout_plan(parse, sql, targets, false,
+										   list_make1_oid(target));
+}
+
+/*
+ * can_distributed_scan
+ *
+ * May a statement that spans shard groups be planned with the distributed scan?
+ * Only a SELECT without row locking and without a data-modifying WITH clause.
+ */
+static bool
+writes_hash_dist_walker(Node *node, void *context)
+{
+	const KsCatalog *cat = (const KsCatalog *) context;
+
+	if (node == NULL)
+		return false;
+	if (IsA(node, Query))
+	{
+		Query	   *q = (Query *) node;
+
+		if (q->resultRelation > 0 &&
+			(q->commandType == CMD_INSERT || q->commandType == CMD_UPDATE ||
+			 q->commandType == CMD_DELETE || q->commandType == CMD_MERGE))
+		{
+			RangeTblEntry *rte = rt_fetch(q->resultRelation, q->rtable);
+			KsDistTable *dt = hash_search(cat->dist_tables, &rte->relid, HASH_FIND, NULL);
+
+			if (dt != NULL && !dt->is_reference)
+				return true;
+		}
+		return query_tree_walker(q, writes_hash_dist_walker, context, 0);
+	}
+	return expression_tree_walker(node, writes_hash_dist_walker, context);
+}
+
+static bool
+can_distributed_scan(Query *parse, const KsCatalog *cat)
+{
+	if (!kingres_shard_enable_distributed_scan)
+		return false;
+	/* A statement that writes a distributed table is not planned by reading it all. */
+	if (writes_hash_dist_walker((Node *) parse, (void *) cat))
+		return false;
+	if (parse->rowMarks != NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("row-level locking on a statement that spans shard groups is not supported yet"),
+				 errhint("Restrict every distributed table of the statement to one key, or remove FOR UPDATE / FOR SHARE.")));
+	return true;
+}
+
+/*
+ * plan_with_scan
+ *
+ * Plan a statement with the standard planner while the set_rel_pathlist_hook of
+ * dist_scan.c replaces the paths of the distributed tables by the distributed
+ * scan.  The planner is not allowed to join or aggregate partition by
+ * partition: that would read the local partitions only.
+ */
+static PlannedStmt *
+plan_with_scan(Query *parse, const char *query_string, int cursorOptions,
+			   ParamListInfo boundParams)
+{
+	PlannedStmt *pstmt;
+	int			nest = NewGUCNestLevel();
+
+	(void) set_config_option("enable_partitionwise_join", "off", PGC_SUSET,
+							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	(void) set_config_option("enable_partitionwise_aggregate", "off", PGC_SUSET,
+							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	(void) kingres_shard_distscan_set_active(true);
+	PG_TRY();
+	{
+		pstmt = pass_through(parse, query_string, cursorOptions, boundParams);
+	}
+	PG_FINALLY();
+	{
+		(void) kingres_shard_distscan_set_active(false);
+	}
+	PG_END_TRY();
+	AtEOXact_GUC(true, nest);
+	return pstmt;
+}
+
+/*
+ * is_scan_fragment
+ *
+ * Is the statement of a forwarded session the fragment of a distributed scan:
+ * a plain read of one distributed table, returning columns of it, restricted
+ * only by clauses that are safe to ship?  Such a statement means "the rows of
+ * the buckets of this node that satisfy the restriction" and nothing else, so
+ * it is correct to run it here whatever buckets it names, and it is how the
+ * other groups read their part of the table.
+ */
+static bool
+is_scan_fragment(Query *q, const KsCatalog *cat)
+{
+	RangeTblEntry *rte;
+	KsDistTable *dt;
+	FromExpr   *f = q->jointree;
+	ListCell   *lc;
+
+	if (q->commandType != CMD_SELECT || q->cteList != NIL || q->setOperations != NULL ||
+		q->hasSubLinks || q->hasAggs || q->hasWindowFuncs || q->hasTargetSRFs ||
+		q->hasRecursive || q->groupClause != NIL || q->groupingSets != NIL ||
+		q->havingQual != NULL || q->distinctClause != NIL || q->sortClause != NIL ||
+		q->limitCount != NULL || q->limitOffset != NULL || q->rowMarks != NIL)
+		return false;
+	if (list_length(q->rtable) != 1)
+		return false;
+	rte = (RangeTblEntry *) linitial(q->rtable);
+	if (rte->rtekind != RTE_RELATION)
+		return false;
+	dt = hash_search(cat->dist_tables, &rte->relid, HASH_FIND, NULL);
+	if (dt == NULL || dt->is_reference)
+		return false;
+	if (f == NULL || list_length(f->fromlist) != 1 || !IsA(linitial(f->fromlist), RangeTblRef))
+		return false;
+	foreach(lc, q->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		Node	   *e = (Node *) te->expr;
+
+		if (IsA(e, Const))
+			continue;
+		if (IsA(e, Var) && ((Var *) e)->varno == 1 && ((Var *) e)->varlevelsup == 0 &&
+			((Var *) e)->varattno >= 0)
+			continue;
+		return false;
+	}
+	if (f->quals != NULL && !kingres_shard_clause_shippable(f->quals, 1))
+		return false;
+	return true;
+}
+
+/*
+ * The hook proper.  Whatever it decides for one statement is not inherited by
+ * the statements planned while it plans (a function called during constant
+ * folding may plan its own): the distributed scan is switched on only around
+ * the standard planner of a statement that needs it.
+ */
+static PlannedStmt *
+kingres_shard_planner_hook(Query *parse, const char *query_string,
+							int cursorOptions, ParamListInfo boundParams)
+{
+	PlannedStmt *result;
+	bool		old = kingres_shard_distscan_set_active(false);
+
+	PG_TRY();
+	{
+		result = planner_hook_body(parse, query_string, cursorOptions, boundParams);
+	}
+	PG_FINALLY();
+	{
+		(void) kingres_shard_distscan_set_active(old);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+/*
  * kingres_shard_planner_hook
  *
  * See the file header.
  */
 static PlannedStmt *
-kingres_shard_planner_hook(Query *parse, const char *query_string,
+planner_hook_body(Query *parse, const char *query_string,
 							int cursorOptions, ParamListInfo boundParams)
 {
 	const KsCatalog *cat;
@@ -616,9 +1054,18 @@ kingres_shard_planner_hook(Query *parse, const char *query_string,
 	int			bucket = -1;
 	bool		pending = false;
 	int			group;
+	bool		spans = false;
+	DistRef    *span_ref = NULL;
+	const char *span_detail = NULL;
 	List	   *relids = NIL;
 	bool		is_write;
 
+	/* The local part of a fanned-out statement is planned for this node only. */
+	if (kingres_shard_in_fanout_local(query_string))
+		return pass_through(parse, query_string, cursorOptions, boundParams);
+	/* The statements PostgreSQL runs for a propagated DDL work on this node's buckets. */
+	if (kingres_shard_in_authorized_ddl())
+		return pass_through(parse, query_string, cursorOptions, boundParams);
 	if (!kingres_shard_enable_routing || creating_extension)
 		return pass_through(parse, query_string, cursorOptions, boundParams);
 	if (parse->commandType != CMD_SELECT && parse->commandType != CMD_INSERT &&
@@ -641,13 +1088,66 @@ kingres_shard_planner_hook(Query *parse, const char *query_string,
 	ctx[1] = (void *) cat;
 	(void) analyze_walker((Node *) parse, ctx);
 
+	/*
+	 * A write to a reference table runs on every node; it takes no part in the
+	 * routing by key, and it cannot be combined with a distributed table.
+	 */
+	if (a.has_ref && !kingres_shard_forwarded)
+	{
+		Oid			reftarget = reference_write_target(parse, cat);
+
+		if (OidIsValid(reftarget))
+		{
+			if (a.refs != NIL)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("a statement that writes reference table \"%s\" and reads a distributed table is not supported yet",
+								get_rel_name(reftarget))));
+			return plan_reference_write(parse, reftarget, cat);
+		}
+	}
+
 	if (a.refs == NIL)
+	{
+		/*
+		 * No distributed table in the statement as written: the planner may
+		 * still find one (it expands a SQL-language function into the
+		 * statement).  The distributed scan reads such a table correctly.
+		 */
+		if (!kingres_shard_forwarded && kingres_shard_enable_distributed_scan)
+			return plan_with_scan(parse, query_string, cursorOptions, boundParams);
 		return plan_locally(parse, query_string, cursorOptions, boundParams,
 							cat, a.ndist_rtes);
+	}
 
 	if (kingres_shard_forwarded)
 		return plan_forwarded(parse, query_string, cursorOptions, boundParams,
 							  &a, cat);
+
+	/* A row cannot change its key: it might have to move to another shard group. */
+	if (parse->commandType == CMD_UPDATE && parse->resultRelation > 0)
+	{
+		foreach(lc, a.refs)
+		{
+			DistRef    *ref = (DistRef *) lfirst(lc);
+			ListCell   *lc2;
+
+			if (ref->query != parse || ref->rti != (Index) parse->resultRelation)
+				continue;
+			foreach(lc2, parse->targetList)
+			{
+				TargetEntry *te = lfirst_node(TargetEntry, lc2);
+
+				if (!te->resjunk && te->resno == ref->dt->dist_attno)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("an UPDATE of the distribution column \"%s\" of \"%s\" is not supported",
+									NameStr(ref->dt->dist_column), get_rel_name(ref->dt->relid)),
+							 errdetail("The row would have to move to another bucket, possibly of another shard group."),
+							 errhint("DELETE the row and INSERT it with the new key.")));
+			}
+		}
+	}
 
 	first = (DistRef *) linitial(a.refs);
 	colocation_id = first->dt->colocation_id;
@@ -657,16 +1157,51 @@ kingres_shard_planner_hook(Query *parse, const char *query_string,
 		DistRef    *ref = (DistRef *) lfirst(lc);
 
 		relids = list_append_unique_oid(relids, ref->dt->relid);
+		if (spans)
+			continue;
 		if (ref->dt->colocation_id != colocation_id)
-			error_spans_groups(ref, "The statement uses distributed tables of different colocation groups.");
-		if (ref->bucket < 0 && !ref->param_pending)
-			error_spans_groups(ref, NULL);
-		if (ref->param_pending)
+		{
+			spans = true;
+			span_ref = ref;
+			span_detail = "The statement uses distributed tables of different colocation groups.";
+		}
+		else if (ref->bucket < 0 && !ref->param_pending)
+		{
+			spans = true;
+			span_ref = ref;
+		}
+		else if (ref->param_pending)
 			pending = true;
 		else if (bucket < 0)
 			bucket = ref->bucket;
 		else if (bucket != ref->bucket)
-			error_spans_groups(ref, "The keys of the statement hash to different buckets.");
+		{
+			spans = true;
+			span_ref = ref;
+			span_detail = "The keys of the statement hash to different buckets.";
+		}
+	}
+
+	if (spans)
+	{
+		/*
+		 * The statement spans shard groups.  A SELECT is planned as if all the
+		 * data were here, with the distributed scan fetching the rows of the
+		 * other groups (dist_scan.c); a write cannot be (a multi-row INSERT,
+		 * INSERT ... SELECT) or is handled by the planner of the writes below.
+		 */
+		if (can_distributed_scan(parse, cat))
+			return plan_with_scan(parse, query_string, cursorOptions, boundParams);
+		if (parse->commandType == CMD_UPDATE || parse->commandType == CMD_DELETE)
+		{
+			if (list_length(a.refs) == 1 && span_ref->query == parse &&
+				span_ref->rti == (Index) parse->resultRelation && span_detail == NULL)
+				return plan_distributed_write(parse, span_ref, cat, relids);
+			error_write_spans_groups(parse, span_ref,
+									 span_detail ? span_detail :
+									 "The statement reads a distributed table other than as its target (a subquery, a join, a self join).");
+		}
+		error_spans_groups(span_ref, span_detail);
 	}
 
 	if (pending)

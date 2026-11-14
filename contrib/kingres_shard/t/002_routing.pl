@@ -19,7 +19,9 @@ sub make_node
 	my $node = PostgreSQL::Test::Cluster->new($name);
 	$node->init;
 	$node->append_conf('postgresql.conf',
-		"shared_preload_libraries = 'kingres_shard'");
+		"shared_preload_libraries = 'kingres_shard'
+max_prepared_transactions = 20
+kingres_shard.recovery_interval = 0");
 	$node->start;
 	return $node;
 }
@@ -226,23 +228,37 @@ sub rowcount
 		"from-node-1-group-0|extra-$k", 'a colocated join restricted on both tables');
 	my ($rc, $out, $err) = run_sql($n3,
 		"SELECT a.val, b.extra FROM public.kv a JOIN public.kv2 b ON a.id = b.id WHERE a.id = $k");
-	like($err, qr/statements that span shard groups are not supported yet/,
-		'a join with one unrestricted table is refused');
-	like($err, qr/HINT:.*WHERE id = <value>/, 'the hint names the distribution column');
+	is($err, '', 'a join with one unrestricted table runs: the distributed scan reads the other groups');
+	is($out, "from-node-1-group-0|extra-$k", 'and gives the same row as the restricted join');
 }
 
 # ---------------------------------------------------------------------------
-# Statements that span shard groups.
+# Statements that span shard groups: SELECT works (the distributed scan,
+# t/013_dist_scan.pl compares it with a single node); a write that cannot be
+# routed to one group is still refused.
 # ---------------------------------------------------------------------------
 {
 	my ($k0, $k1) = ($keys{0}[0], $keys{1}[0]);
+	my $local = sub {
+		my ($where) = @_;
+		my $n = 0;
+		$n += $_->safe_psql('postgres',
+			"SET kingres_shard.enable_routing = off; SELECT count(*) FROM public.kv WHERE $where")
+		  for @nodes;
+		return $n;
+	};
 	for my $case (
-		[ 'a statement without a key', "SELECT * FROM public.kv" ],
-		[ 'two keys in different buckets', "SELECT * FROM public.kv WHERE id IN ($k0, $k1)" ],
-		[ 'OR of two keys', "SELECT * FROM public.kv WHERE id = $k0 OR id = $k1" ],
-		[ 'a range', "SELECT * FROM public.kv WHERE id < 10" ],
-		[ 'an UPDATE without a key', "UPDATE public.kv SET val = 'x'" ],
-		[ 'a DELETE without a key', "DELETE FROM public.kv" ],
+		[ 'a statement without a key', "SELECT count(*) FROM public.kv", $local->('true') ],
+		[ 'two keys in different buckets', "SELECT count(*) FROM public.kv WHERE id IN ($k0, $k1)", 2 ],
+		[ 'OR of two keys', "SELECT count(*) FROM public.kv WHERE id = $k0 OR id = $k1", 2 ],
+		[ 'a range', "SELECT count(*) FROM public.kv WHERE id < 10", $local->('id < 10') ],
+	  )
+	{
+		my ($rc, $out, $err) = run_sql($n3, $case->[1]);
+		is($err, '', "runs: $case->[0]");
+		is($out, $case->[2], "the answer for the whole table: $case->[0]");
+	}
+	for my $case (
 		[ 'a multi-row INSERT', "INSERT INTO public.kv VALUES (-1, 'a'), (-2, 'b')" ],
 		[ 'INSERT ... SELECT', "INSERT INTO public.kv SELECT g, 'x' FROM generate_series(-10, -5) g" ],
 	  )
@@ -375,7 +391,8 @@ sub rowcount
 }
 
 # ---------------------------------------------------------------------------
-# Phase 1 limits on writes.
+# Writes on several groups in one transaction (phase 2a: two-phase commit
+# replaced the phase 1 limits, which refused all of these).
 # ---------------------------------------------------------------------------
 {
 	my ($ka, $kb) = (8001, 8001);
@@ -386,23 +403,34 @@ sub rowcount
 
 	my ($rc, $out, $err) = run_sql($n1,
 		"BEGIN; INSERT INTO public.kv VALUES ($ka, 'a'); INSERT INTO public.kv VALUES ($kb, 'b'); COMMIT;");
-	like($err, qr/more than one remote shard group in one transaction is not supported yet/,
-		'writing on two remote groups in one transaction is refused');
-	is($n2->safe_psql('postgres', "SELECT count(*) FROM public.kv WHERE id = $ka"), '0',
-		'the refused transaction left nothing behind');
+	is($err, '', 'writing on two remote groups in one transaction commits');
+	is($n2->safe_psql('postgres', "SELECT count(*) FROM public.kv WHERE id = $ka"), '1',
+		'the write on the first remote group is there');
+	is($n3->safe_psql('postgres', "SELECT count(*) FROM public.kv WHERE id = $kb"), '1',
+		'the write on the second remote group is there');
+	$n1->safe_psql('postgres', "DELETE FROM public.kv WHERE id = $ka");
+	$n1->safe_psql('postgres', "DELETE FROM public.kv WHERE id = $kb");
 
 	($rc, $out, $err) = run_sql($n1,
 		"BEGIN; INSERT INTO public.kv VALUES ($kl, 'local'); INSERT INTO public.kv VALUES ($ka, 'remote'); COMMIT;");
-	like($err, qr/writing locally and on another shard group in one transaction is not supported yet/,
-		'a remote write after a local write is refused');
+	is($err, '', 'a remote write after a local write commits');
 	($rc, $out, $err) = run_sql($n1,
-		"BEGIN; INSERT INTO public.kv VALUES ($ka, 'remote'); INSERT INTO public.kv VALUES ($kl, 'local'); COMMIT;");
-	like($err, qr/writing locally after writing on another shard group in one transaction is not supported yet/,
-		'a local write after a remote write is refused');
+		"BEGIN; DELETE FROM public.kv WHERE id = $ka; DELETE FROM public.kv WHERE id = $kl; COMMIT;");
+	is($err, '', 'a local write after a remote write commits');
+	is($n1->safe_psql('postgres', "SELECT count(*) FROM public.kv WHERE id = $ka") . $n1->safe_psql('postgres', "SELECT count(*) FROM public.kv WHERE id = $kl"), '00',
+		'both of those writes took effect');
 	($rc, $out, $err) = run_sql($n1,
 		"BEGIN; INSERT INTO public.kv VALUES ($ka, 'remote'); INSERT INTO public.loc VALUES (1); COMMIT;");
-	like($err, qr/writing locally after writing on another shard group/,
-		'a local write to an ordinary table after a remote write is refused');
+	is($err, '', 'a local write to an ordinary table after a remote write commits');
+	is($n1->safe_psql('postgres', "SELECT count(*) FROM public.loc"), '1', 'the local write is there');
+	is($n2->safe_psql('postgres', "SELECT count(*) FROM public.kv WHERE id = $ka"), '1',
+		'the remote write is there');
+	$n1->safe_psql('postgres', "DELETE FROM public.loc; DELETE FROM public.kv WHERE id = $ka");
+
+	# A failing statement after a remote write rolls both back.
+	($rc, $out, $err) = run_sql($n1,
+		"BEGIN; INSERT INTO public.kv VALUES ($ka, 'remote'); INSERT INTO public.loc VALUES (1); SELECT 1/0; COMMIT;");
+	like($err, qr/division by zero/, 'an error after writes is reported');
 	is($n1->safe_psql('postgres', "SELECT count(*) FROM public.loc"), '0', 'nothing was written locally');
 	is($n2->safe_psql('postgres', "SELECT count(*) FROM public.kv WHERE id = $ka"), '0',
 		'nothing was written remotely either');
@@ -413,6 +441,10 @@ sub rowcount
 		  . "SELECT val FROM public.kv WHERE id = $kb; SELECT val FROM public.kv WHERE id = $kl; COMMIT;");
 	is($err, '', 'reads from other groups around one remote write are allowed');
 	$n1->safe_psql('postgres', "DELETE FROM public.kv WHERE id = $ka");
+	is($n1->safe_psql('postgres', "SELECT count(*) FROM pg_prepared_xacts"), '0',
+		'no prepared transaction is left on the origin');
+	is($n2->safe_psql('postgres', "SELECT count(*) FROM pg_prepared_xacts"), '0',
+		'no prepared transaction is left on node 2');
 }
 
 # ---------------------------------------------------------------------------

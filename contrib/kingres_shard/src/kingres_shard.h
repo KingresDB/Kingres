@@ -20,6 +20,7 @@
 #include "nodes/params.h"
 #include "nodes/parsenodes.h"
 #include "nodes/plannodes.h"
+#include "utils/guc.h"
 
 #ifndef KINGRES_VERSION
 #error "KINGRES_VERSION is not defined: kingres_shard must be built against KingresDB (core patch KP-0001), not against stock PostgreSQL"
@@ -34,10 +35,28 @@
 /* SQLSTATE of "this bucket is not on this node" (stale map), class KS. */
 #define ERRCODE_KINGRES_STALE_MAP MAKE_SQLSTATE('K','S','0','0','1')
 
+/*
+ * The text that starts the statement of every fragment of a distributed scan
+ * (dist_scan.c).  A forwarded session runs a plain read of a distributed table
+ * as the local rows of the table only when the statement carries it; without
+ * it such a statement is a routed statement, and a bucket that is not here is
+ * the stale-map error.
+ */
+#define KS_FRAGMENT_MARKER "/* kingres:scan-fragment */ "
+
+/* The same for the statement of a write that is run on every shard group (fanout.c). */
+#define KS_WRITE_MARKER "/* kingres:write-fragment */ "
+
 /* GUC variables (defined in kingres_shard.c). */
 extern PGDLLIMPORT int kingres_shard_default_bucket_count;
 extern PGDLLIMPORT bool kingres_shard_enable_routing;
 extern PGDLLIMPORT bool kingres_shard_forwarded;
 extern PGDLLIMPORT int kingres_shard_node_connect_timeout;
+extern PGDLLIMPORT char *kingres_shard_node_conninfo;
+extern PGDLLIMPORT int kingres_shard_recovery_interval;
+extern PGDLLIMPORT bool kingres_shard_enable_distributed_scan;
+
+extern bool kingres_shard_check_node_conninfo(char **newval, void **extra,
+											   GucSource source);
 
 #endif							/* KINGRES_SHARD_KINGRES_SHARD_H */

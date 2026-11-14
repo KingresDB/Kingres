@@ -194,7 +194,7 @@ kingres_shard_sync_catalog_internal(void)
 		const char *params[1];
 		PGresult   *res;
 
-		kingres_shard_begin_xact(kc);
+		kingres_shard_begin_write_xact(kc);
 		params[0] = snapshot;
 		res = kingres_shard_exec_params(kc,
 										 "SELECT " KINGRES_SHARD_SCHEMA ".internal_apply_catalog($1::pg_catalog.jsonb)",
@@ -235,31 +235,84 @@ create_tables_on_node(KsConn *kc)
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
+	/* Reference tables have no column: hash tables first, in colocation order. */
 	spi_run("SELECT relid::pg_catalog.oid, dist_column::pg_catalog.text FROM "
-			KINGRES_SHARD_SCHEMA ".dist_table ORDER BY colocation_id, relid::pg_catalog.oid",
+			KINGRES_SHARD_SCHEMA ".dist_table ORDER BY colocation_id NULLS LAST, relid::pg_catalog.oid",
 			SPI_OK_SELECT, 0, NULL, NULL);
 	for (i = 0; i < SPI_processed; i++)
 	{
 		bool		isnull;
+		char	   *col;
 		MemoryContext old = MemoryContextSwitchTo(callercxt);
 
 		relids = lappend_oid(relids,
 							 DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[i],
 															SPI_tuptable->tupdesc, 1, &isnull)));
-		columns = lappend(columns, pstrdup(SPI_getvalue(SPI_tuptable->vals[i],
-														SPI_tuptable->tupdesc, 2)));
+		col = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2);
+		columns = lappend(columns, col ? pstrdup(col) : NULL);
 		MemoryContextSwitchTo(old);
 	}
 	SPI_finish();
 
 	forboth(lc1, relids, lc2, columns)
 	{
-		char	   *script = kingres_shard_remote_table_script(lfirst_oid(lc1),
-																(char *) lfirst(lc2));
+		char	   *column = (char *) lfirst(lc2);
+		char	   *script = kingres_shard_remote_table_script(lfirst_oid(lc1), column);
 		PGresult   *res = kingres_shard_exec(kc, script);
 
 		PQclear(res);
+		/* A reference table comes with its rows. */
+		if (column == NULL)
+			kingres_shard_copy_table_rows(lfirst_oid(lc1), list_make1(kc));
 	}
+
+	/* The foreign keys, now that every table exists on the node. */
+	forboth(lc1, relids, lc2, columns)
+	{
+		char	   *script = kingres_shard_remote_fk_script(lfirst_oid(lc1),
+															(char *) lfirst(lc2));
+
+		if (script[0] != '\0')
+		{
+			PGresult   *res = kingres_shard_exec(kc, script);
+
+			PQclear(res);
+		}
+	}
+}
+
+/*
+ * record_pending_node
+ *
+ * Remember, in a transaction of its own that commits at once, that add_node()
+ * is going to prepare a transaction on host:port.  The registration of the node
+ * is part of the transaction that may abort or crash, so without this record
+ * recovery could not find the prepared transaction on a node that never got
+ * registered.  The record is written through a connection to this node itself,
+ * outside the user's transaction.
+ */
+static void
+record_pending_node(const char *host, int port)
+{
+	const KsCatalog *cat = kingres_shard_catalog();
+	const KsNode *self = kingres_shard_node_by_id(cat->local_node_id);
+	KsConn	   *kc;
+	const char *params[2];
+	char		portstr[16];
+	PGresult   *res;
+
+	if (self == NULL)
+		return;
+	kc = kingres_shard_get_conn(self->host, self->port, false, NULL);
+	snprintf(portstr, sizeof(portstr), "%d", port);
+	params[0] = host;
+	params[1] = portstr;
+	res = kingres_shard_exec_params(kc,
+									 "INSERT INTO " KINGRES_SHARD_SCHEMA ".pending_node (host, port, created_at) "
+									 "VALUES ($1::pg_catalog.text, $2::pg_catalog.int4, pg_catalog.clock_timestamp()) "
+									 "ON CONFLICT (host, port) DO UPDATE SET created_at = excluded.created_at",
+									 2, NULL, params, true);
+	PQclear(res);
 }
 
 /*
@@ -375,8 +428,9 @@ kingres_add_node(PG_FUNCTION_ARGS)
 	 */
 	if (is_primary)
 	{
+		record_pending_node(host, port);
 		kc = kingres_shard_get_conn(host, port, false, NULL);
-		kingres_shard_begin_xact(kc);
+		kingres_shard_begin_write_xact(kc);
 		res = kingres_shard_exec(kc, "CREATE EXTENSION IF NOT EXISTS kingres_shard");
 		PQclear(res);
 		res = kingres_shard_exec(kc,
@@ -492,7 +546,7 @@ kingres_remove_node(PG_FUNCTION_ARGS)
 		{
 			PGresult   *res;
 
-			kingres_shard_begin_xact(kc);
+			kingres_shard_begin_write_xact(kc);
 			res = kingres_shard_exec(kc, "SELECT " KINGRES_SHARD_SCHEMA ".internal_reset_node()");
 			PQclear(res);
 		}
@@ -535,7 +589,6 @@ kingres_shard_reload_catalog(void)
 	Oid			argtypes[1] = {JSONBOID};
 	Oid			funcid;
 	Datum		doc;
-	bool		had_xid;
 
 	if (!cat->present)
 		return false;
@@ -580,24 +633,19 @@ kingres_shard_reload_catalog(void)
 							1, argtypes, false);
 	doc = DirectFunctionCall1(jsonb_in, CStringGetDatum(snapshot));
 
-	had_xid = TransactionIdIsValid(GetTopTransactionIdIfAny());
 	GetUserIdAndSecContext(&save_uid, &save_sec);
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID,
 						   save_sec | SECURITY_LOCAL_USERID_CHANGE);
-	kingres_shard_in_catalog_write = true;
 	PG_TRY();
 	{
 		(void) OidFunctionCall1(funcid, doc);
 	}
 	PG_FINALLY();
 	{
-		kingres_shard_in_catalog_write = false;
 		SetUserIdAndSecContext(save_uid, save_sec);
 	}
 	PG_END_TRY();
 
-	if (!had_xid)
-		kingres_shard_ignore_current_xid();
 	kingres_shard_catalog_invalidate();
 	return true;
 }

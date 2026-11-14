@@ -28,8 +28,7 @@
  * started and has a huge cost, so that the plan cache only ever uses custom
  * plans for such statements.
  *
- * This file also holds the executor hook that enforces the phase 1 rule that
- * a transaction does not write locally after writing remotely.
+
  *
  * SPDX-License-Identifier: PostgreSQL
  * Portions Copyright (c) 2026, RooyeKhat Media Co
@@ -76,12 +75,10 @@
 #define KS_PRIV_DEFERRED	6	/* Integer: fails when started */
 #define KS_PRIV_RETURNS_ROWS 7	/* Integer: result rows are returned */
 
-bool		kingres_shard_in_catalog_write = false;
 
 /* Depth of retries in progress: a retried statement is not retried again. */
 static int	retry_depth = 0;
 
-static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 
 typedef struct KsRemoteScanState
 {
@@ -111,7 +108,6 @@ static void ks_end_scan(CustomScanState *node);
 static void ks_rescan(CustomScanState *node);
 static void ks_explain_scan(CustomScanState *node, List *ancestors,
 							ExplainState *es);
-static void ks_executor_start(QueryDesc *queryDesc, int eflags);
 
 static const CustomScanMethods ks_scan_methods = {
 	.CustomName = "Kingres Remote Statement",
@@ -131,57 +127,12 @@ static const CustomExecMethods ks_exec_methods = {
  * kingres_shard_remote_scan_init
  *
  * Register the custom scan methods (needed to copy and read plans) and
- * install the executor hook, chaining to a previous one.
+ * nothing else is installed.
  */
 void
 kingres_shard_remote_scan_init(void)
 {
 	RegisterCustomScanMethods(&ks_scan_methods);
-	prev_ExecutorStart = ExecutorStart_hook;
-	ExecutorStart_hook = ks_executor_start;
-}
-
-/*
- * Is this the plan built by kingres_shard_make_remote_plan()?
- */
-static bool
-is_remote_plan(PlannedStmt *pstmt)
-{
-	return pstmt->planTree != NULL && IsA(pstmt->planTree, CustomScan) &&
-		((CustomScan *) pstmt->planTree)->methods == &ks_scan_methods;
-}
-
-/*
- * ks_executor_start
- *
- * Phase 1 allows no transaction that writes both remotely and locally,
- * because without two-phase commit it could not be atomic.  Routed writes
- * check for earlier local writes themselves (node_conn.c); this hook refuses
- * a local write after a remote one.  Reads are always allowed.
- */
-static void
-ks_executor_start(QueryDesc *queryDesc, int eflags)
-{
-	PlannedStmt *pstmt = queryDesc->plannedstmt;
-
-	if (kingres_shard_remote_write_pending() &&
-		!kingres_shard_in_catalog_write &&
-		(pstmt->commandType != CMD_SELECT || pstmt->hasModifyingCTE) &&
-		!is_remote_plan(pstmt) && !(eflags & EXEC_FLAG_EXPLAIN_ONLY))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("writing locally after writing on another shard group in one transaction is not supported yet"),
-				 errhint("Write on one shard group per transaction until distributed transactions are implemented.")));
-
-	if (!kingres_shard_in_catalog_write &&
-		(pstmt->commandType != CMD_SELECT || pstmt->hasModifyingCTE) &&
-		!is_remote_plan(pstmt) && !(eflags & EXEC_FLAG_EXPLAIN_ONLY))
-		kingres_shard_note_local_write();
-
-	if (prev_ExecutorStart)
-		prev_ExecutorStart(queryDesc, eflags);
-	else
-		standard_ExecutorStart(queryDesc, eflags);
 }
 
 /*
@@ -190,8 +141,8 @@ ks_executor_start(QueryDesc *queryDesc, int eflags)
  * same: one column per non-junk entry of the target list, typed from the
  * query, so no projection is needed.
  */
-static CustomScan *
-build_scan(Query *parse, List *private, bool returns_rows)
+CustomScan *
+kingres_shard_build_scan(Query *parse, List *private, bool returns_rows)
 {
 	CustomScan *cscan = makeNode(CustomScan);
 	List	   *src;
@@ -249,8 +200,8 @@ build_scan(Query *parse, List *private, bool returns_rows)
  * listed in relationOids so that a cached plan is invalidated when the bucket
  * map changes (the map version trigger invalidates their relcache entries).
  */
-static PlannedStmt *
-wrap_plan(Query *parse, CustomScan *cscan, List *relids, bool returns_rows)
+PlannedStmt *
+kingres_shard_wrap_plan(Query *parse, CustomScan *cscan, List *relids, bool returns_rows)
 {
 	PlannedStmt *pstmt = makeNode(PlannedStmt);
 
@@ -299,7 +250,7 @@ kingres_shard_make_remote_plan(Query *parse, char *sql, const char *host,
 	private = lappend(private, makeInteger(0));
 	private = lappend(private, makeInteger(returns_rows ? 1 : 0));
 
-	return wrap_plan(parse, build_scan(parse, private, returns_rows), relids,
+	return kingres_shard_wrap_plan(parse, kingres_shard_build_scan(parse, private, returns_rows), relids,
 					 returns_rows);
 }
 
@@ -324,9 +275,9 @@ kingres_shard_make_deferred_plan(Query *parse, List *relids)
 	private = lappend(private, makeInteger(1));
 	private = lappend(private, makeInteger(0));
 
-	cscan = build_scan(parse, private, false);
+	cscan = kingres_shard_build_scan(parse, private, false);
 	cscan->scan.plan.total_cost = 1.0e30;
-	return wrap_plan(parse, cscan, relids, false);
+	return kingres_shard_wrap_plan(parse, cscan, relids, false);
 }
 
 static Node *
@@ -397,8 +348,8 @@ ks_begin_scan(CustomScanState *node, EState *estate, int eflags)
  * resolve by OID (built-in ones) are sent as such; the others are left for
  * the remote parser to infer.
  */
-static const char **
-params_to_text(ParamListInfo params, Oid **types_out, int *nparams_out)
+const char **
+kingres_shard_params_to_text(ParamListInfo params, Oid **types_out, int *nparams_out)
 {
 	int			n = params ? params->numParams : 0;
 	const char **values = palloc0(sizeof(char *) * Max(n, 1));
@@ -604,7 +555,7 @@ fetch_remote(KsRemoteScanState *s)
 	kingres_shard_begin_xact(kc);
 	fresh = (kc->nstatements == 0);
 
-	values = params_to_text(params, &types, &nparams);
+	values = kingres_shard_params_to_text(params, &types, &nparams);
 	res = kingres_shard_exec_params(kc, s->sql, nparams, types, values, false);
 
 	if (res != NULL && PQresultStatus(res) != PGRES_COMMAND_OK &&

@@ -1,0 +1,1154 @@
+/*-------------------------------------------------------------------------
+ *
+ * dist_scan.c
+ *	  The "Kingres Distributed Scan" custom scan (design/shard-phase2a.md,
+ *	  section 5).
+ *
+ * When the routing decision of planner.c is "this SELECT spans shard groups",
+ * the standard planner plans the statement as if all the data were here, and a
+ * set_rel_pathlist_hook (this file) replaces the paths of every distributed
+ * table by one custom path whose plan is a CustomScan with
+ *
+ *	- a child: the best local path of the table, which reads the local buckets
+ *	  (the partitions this node has) and applies every restriction;
+ *	- one remote fragment per other shard group that owns buckets of the table:
+ *	  SELECT <the columns needed> FROM <table> WHERE <the restrictions that are
+ *	  safe to ship>, run in the remote transaction of the local transaction, and
+ *	  read through a cursor in batches (kingres_shard.scan_fetch_size rows),
+ *	  with the next batch of every group requested before the current one is
+ *	  consumed, so that the groups work concurrently and no group's rows have to
+ *	  fit in memory.
+ *
+ * PostgreSQL then joins, aggregates, sorts and limits above the scan as it
+ * does above any scan, so every query shape gives a correct answer.  The rows
+ * of the local buckets are returned as the child produced them; the rows of
+ * the other groups are filtered again here with every restriction of the table
+ * (the shipped ones too: a recheck is always correct), so a restriction that
+ * cannot be shipped (a function that is not built in, a subquery) costs
+ * transfer, not correctness.
+ *
+ * The scan tuple has the columns of the table's target list first (what the
+ * child returns), then the other columns that the restrictions need, which only
+ * the remote rows carry.
+ *
+ * Not supported in this phase (they raise "not supported yet"): system columns
+ * of a distributed table (the remote values would mean nothing here), and
+ * PlaceHolderVars computed on the table.
+ *
+ * SPDX-License-Identifier: PostgreSQL
+ * Portions Copyright (c) 2026, RooyeKhat Media Co
+ *
+ * IDENTIFICATION
+ *	  contrib/kingres_shard/src/dist_scan.c
+ *
+ *-------------------------------------------------------------------------
+ */
+#include "postgres.h"
+
+#include "access/htup_details.h"
+#include "access/xact.h"
+#include "catalog/pg_type_d.h"
+#include "commands/explain.h"
+#include "commands/explain_format.h"
+#include "executor/executor.h"
+#include "executor/tuptable.h"
+#include "libpq/libpq-be-fe-helpers.h"
+#include "miscadmin.h"
+#include "nodes/extensible.h"
+#include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
+#include "nodes/pathnodes.h"
+#include "optimizer/cost.h"
+#include "optimizer/optimizer.h"
+#include "optimizer/paths.h"
+#include "optimizer/pathnode.h"
+#include "optimizer/restrictinfo.h"
+#include "rewrite/rewriteManip.h"
+#include "utils/builtins.h"
+#include "utils/guc.h"
+#include "utils/lsyscache.h"
+#include "utils/memutils.h"
+#include "utils/rel.h"
+#include "utils/ruleutils.h"
+#include "utils/wait_classes.h"
+
+#include "catalog.h"
+#include "dist_scan.h"
+#include "kingres_shard.h"
+#include "node_conn.h"
+#include "shippable.h"
+
+/* Layout of CustomScan.custom_private. */
+#define DS_PRIV_SQL			0	/* String: the fragment */
+#define DS_PRIV_RELID		1	/* Integer: the distributed table */
+#define DS_PRIV_NCHILD		2	/* Integer: scan columns the child returns */
+#define DS_PRIV_PARAMS		3	/* List of Integer: external parameter ids of the fragment, in order */
+
+/* Rows requested from a remote group at a time. */
+int			kingres_shard_scan_fetch_size = 1000;
+
+static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
+static bool distscan_active = false;
+static uint64 cursor_serial = 0;
+
+/* A fragment: the query of one remote group, read through a cursor. */
+typedef struct DsFrag
+{
+	struct KsDistScanState *scan;
+	KsConn	   *kc;
+	char		cursor[40];
+	bool		declared;
+	bool		exhausted;
+	bool		in_flight;		/* a FETCH was sent and not yet read */
+	PGresult   *res;			/* the batch being consumed */
+	int			nrows;
+	int			next_row;
+	char	   *host;
+	int			port;
+	int			group_id;
+} DsFrag;
+
+typedef struct KsDistScanState
+{
+	CustomScanState css;
+	char	   *sql;
+	Oid			relid;
+	int			nchild;			/* scan columns the child returns */
+	int			ncols;			/* scan columns in all */
+	List	   *param_ids;
+	PlanState  *child;
+	bool		started;
+	bool		child_done;
+	List	   *frags;			/* of DsFrag * */
+	int			cur;			/* round-robin position */
+	FmgrInfo   *infuncs;
+	Oid		   *typioparams;
+	int32	   *typmods;
+	bool	   *fetched;		/* column j comes from the other groups */
+	ExprState **exprs;		/* column j is computed here (else NULL) */
+	int			nfetch;
+	Datum	   *values;
+	bool	   *nulls;
+} KsDistScanState;
+
+static void ds_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
+								RangeTblEntry *rte);
+static Plan *ds_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
+								 CustomPath *best_path, List *tlist,
+								 List *clauses, List *custom_plans);
+static Node *ds_create_scan_state(CustomScan *cscan);
+static void ds_begin_scan(CustomScanState *node, EState *estate, int eflags);
+static TupleTableSlot *ds_exec_scan(CustomScanState *node);
+static void ds_end_scan(CustomScanState *node);
+static void ds_rescan(CustomScanState *node);
+static void ds_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es);
+static void ds_finish_pending(void *owner);
+static void ds_stop(KsDistScanState *s, bool close_cursors);
+
+static const CustomPathMethods ds_path_methods = {
+	.CustomName = "Kingres Distributed Scan",
+	.PlanCustomPath = ds_plan_custom_path
+};
+
+static const CustomScanMethods ds_scan_methods = {
+	.CustomName = "Kingres Distributed Scan",
+	.CreateCustomScanState = ds_create_scan_state
+};
+
+static const CustomExecMethods ds_exec_methods = {
+	.CustomName = "Kingres Distributed Scan",
+	.BeginCustomScan = ds_begin_scan,
+	.ExecCustomScan = ds_exec_scan,
+	.EndCustomScan = ds_end_scan,
+	.ReScanCustomScan = ds_rescan,
+	.ExplainCustomScan = ds_explain_scan
+};
+
+void
+kingres_shard_dist_scan_init(void)
+{
+	RegisterCustomScanMethods(&ds_scan_methods);
+	prev_set_rel_pathlist_hook = set_rel_pathlist_hook;
+	set_rel_pathlist_hook = ds_set_rel_pathlist;
+
+	DefineCustomIntVariable("kingres_shard.scan_fetch_size",
+							"Rows fetched at a time from another shard group by the distributed scan.",
+							NULL,
+							&kingres_shard_scan_fetch_size,
+							1000, 1, 1000000,
+							PGC_USERSET, 0,
+							NULL, NULL, NULL);
+}
+
+/* Returns the previous value. */
+bool
+kingres_shard_distscan_set_active(bool active)
+{
+	bool		old = distscan_active;
+
+	distscan_active = active;
+	return old;
+}
+
+/*
+ * The shard groups other than this one that own buckets of a table: their
+ * primaries, copied into the current memory context.
+ */
+static List *
+remote_groups_of(const KsDistTable *dt, const KsCatalog *cat)
+{
+	List	   *groups = NIL;
+	List	   *result = NIL;
+	int			b;
+	ListCell   *lc;
+
+	for (b = 0; b < dt->coloc->bucket_count; b++)
+	{
+		int			g = dt->coloc->bucket_group[b];
+
+		if (g >= 0 && g != cat->local_group_id && !list_member_int(groups, g))
+			groups = lappend_int(groups, g);
+	}
+	foreach(lc, groups)
+	{
+		int			g = lfirst_int(lc);
+		const KsNode *n = kingres_shard_group_primary(g);
+		DsFrag	   *f;
+
+		if (n == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("shard group %d has no active primary node", g)));
+		f = palloc0(sizeof(DsFrag));
+		f->group_id = g;
+		f->host = pstrdup(n->host);
+		f->port = n->port;
+		result = lappend(result, f);
+	}
+	return result;
+}
+
+/* Does a restriction clause list contain a constant false or NULL clause? */
+static bool
+has_constant_false(List *restrictlist)
+{
+	ListCell   *lc;
+
+	foreach(lc, restrictlist)
+	{
+		RestrictInfo *ri = lfirst_node(RestrictInfo, lc);
+
+		if (IsA(ri->clause, Const))
+		{
+			Const	   *c = (Const *) ri->clause;
+
+			if (c->constisnull || !DatumGetBool(c->constvalue))
+				return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * ds_set_rel_pathlist
+ *
+ * Replace the paths of a distributed table by the distributed scan.
+ */
+static void
+ds_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
+					RangeTblEntry *rte)
+{
+	const KsCatalog *cat;
+	const KsDistTable *dt;
+	List	   *remote;
+	Path	   *best = NULL;
+	ListCell   *lc;
+	CustomPath *cpath;
+	double		local_rows;
+	int			local_buckets = 0;
+	int			b;
+	double		remote_rows;
+	double		nremote;
+
+	if (prev_set_rel_pathlist_hook)
+		prev_set_rel_pathlist_hook(root, rel, rti, rte);
+	if (!distscan_active)
+		return;
+	/* A member of a UNION ALL is a member rel too; its partitions are not in the catalog. */
+	if ((rel->reloptkind != RELOPT_BASEREL && rel->reloptkind != RELOPT_OTHER_MEMBER_REL) ||
+		rte->rtekind != RTE_RELATION)
+		return;
+	cat = kingres_shard_catalog();
+	if (!cat->present)
+		return;
+	dt = hash_search(cat->dist_tables, &rte->relid, HASH_FIND, NULL);
+	if (dt == NULL || dt->is_reference)
+		return;
+	/* A constant false restriction: no row anywhere. */
+	if (has_constant_false(rel->baserestrictinfo))
+		return;
+	remote = remote_groups_of(dt, cat);
+	if (remote == NIL)
+		return;					/* every bucket is here: the local paths are right */
+
+	foreach(lc, rel->pathlist)
+	{
+		Path	   *p = (Path *) lfirst(lc);
+
+		if (p->param_info != NULL || IsA(p, GatherPath) || IsA(p, GatherMergePath))
+			continue;
+		if (best == NULL || p->total_cost < best->total_cost)
+			best = p;
+	}
+	if (best == NULL)
+		return;
+
+	for (b = 0; b < dt->coloc->bucket_count; b++)
+		if (dt->coloc->bucket_group[b] == cat->local_group_id)
+			local_buckets++;
+	local_rows = Max(best->rows, 0);
+	nremote = list_length(remote);
+	if (local_buckets > 0)
+		remote_rows = local_rows * (dt->coloc->bucket_count - local_buckets) / local_buckets;
+	else
+		remote_rows = 1000.0 * nremote;
+
+	cpath = makeNode(CustomPath);
+	cpath->path.pathtype = T_CustomScan;
+	cpath->path.parent = rel;
+	cpath->path.pathtarget = rel->reltarget;
+	cpath->path.param_info = NULL;
+	cpath->path.parallel_aware = false;
+	cpath->path.parallel_safe = false;
+	cpath->path.parallel_workers = 0;
+	cpath->path.pathkeys = NIL;
+	cpath->path.rows = clamp_row_est(local_rows + remote_rows);
+	cpath->path.disabled_nodes = best->disabled_nodes;
+	cpath->path.startup_cost = best->startup_cost + 100.0 * nremote;
+	cpath->path.total_cost = best->total_cost + 100.0 * nremote +
+		remote_rows * (cpu_tuple_cost * 2.0 + 0.02);
+	cpath->flags = 0;
+	cpath->custom_paths = list_make1(best);
+	cpath->custom_restrictinfo = NIL;
+	cpath->custom_private = list_make1(makeInteger((int) rte->relid));
+	cpath->methods = &ds_path_methods;
+
+	rel->pathlist = list_make1(cpath);
+	rel->partial_pathlist = NIL;
+	rel->rows = cpath->path.rows;
+
+	/*
+	 * The table must stop looking partitioned to the rest of the planner:
+	 * apply_scanjoin_target_to_paths() throws away the paths of a partitioned
+	 * relation and rebuilds them from the paths of its partitions, which would
+	 * read the local buckets only.  The partitions stay in the child path.
+	 */
+	rel->part_scheme = NULL;
+	rel->nparts = 0;
+	rel->consider_partitionwise_join = false;
+}
+
+/*
+ * Replace the external parameters of a clause by consecutively numbered ones,
+ * recording the original ids in order, for a fragment that carries only the
+ * parameters it uses.
+ */
+typedef struct ParamRenumber
+{
+	List	   *ids;			/* original ids, position = new id - 1 */
+} ParamRenumber;
+
+static Node *
+renumber_params(Node *node, ParamRenumber *ctx)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, Param))
+	{
+		Param	   *p = (Param *) copyObject(node);
+		int			pos = -1;
+		int			i = 0;
+		ListCell   *lc;
+
+		foreach(lc, ctx->ids)
+		{
+			if (lfirst_int(lc) == p->paramid)
+				pos = i;
+			i++;
+		}
+		if (pos < 0)
+		{
+			ctx->ids = lappend_int(ctx->ids, p->paramid);
+			pos = list_length(ctx->ids) - 1;
+		}
+		p->paramid = pos + 1;
+		return (Node *) p;
+	}
+	return expression_tree_mutator(node, renumber_params, ctx);
+}
+
+/*
+ * ds_plan_custom_path
+ *
+ * Build the CustomScan: its columns, the fragment that the other groups run,
+ * and the restrictions that are applied to the rows they return.
+ */
+static Plan *
+ds_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
+					List *tlist, List *clauses, List *custom_plans)
+{
+	CustomScan *cscan = makeNode(CustomScan);
+	Oid			relid = (Oid) intVal(linitial(best_path->custom_private));
+	List	   *quals = extract_actual_clauses(clauses, false);
+	List	   *scan_tlist = NIL;
+	List	   *attnos = NIL;	/* attnos in scan_tlist order; 0 = whole row */
+	int			resno = 0;
+	int			nchild;
+	ListCell   *lc;
+	List	   *extra;
+	List	   *nonvar_exprs = NIL;
+	StringInfoData sql;
+	StringInfoData select;
+	List	   *pushed = NIL;
+	ParamRenumber prn = {NIL};
+	List	   *dpcontext;
+	int			nest;
+	char	   *nsp = get_namespace_name(get_rel_namespace(relid));
+	char	   *relname = get_rel_name(relid);
+	bool		first;
+	List	   *param_ids_int = NIL;
+
+	/*
+	 * 1. The columns the child returns: its target list, which is what the
+	 * planner needs of the table (the order is the child's, not the relation's).  Its
+	 * entries are columns, and also expressions that the planner computes on
+	 * the table (the child computes them for the local rows; for the rows of
+	 * the other groups they are computed here from the columns fetched).
+	 */
+	foreach(lc, ((Plan *) linitial(custom_plans))->targetlist)
+	{
+		Node	   *e = (Node *) ((TargetEntry *) lfirst(lc))->expr;
+
+
+		if (IsA(e, Var))
+		{
+			Var		   *v = (Var *) e;
+
+			if (v->varattno < 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("system columns of distributed table \"%s\" are not supported in a statement that spans shard groups",
+								relname)));
+			scan_tlist = lappend(scan_tlist,
+								 makeTargetEntry((Expr *) copyObject(v), ++resno, NULL, false));
+			attnos = lappend_int(attnos, v->varattno);
+		}
+		else
+		{
+			scan_tlist = lappend(scan_tlist,
+								 makeTargetEntry((Expr *) copyObject(e), ++resno, NULL, false));
+			attnos = lappend_int(attnos, -1);
+			nonvar_exprs = lappend(nonvar_exprs, copyObject(e));
+		}
+	}
+	nchild = resno;
+
+	/* Every column the statement reads above this node must come from the child. */
+	foreach(lc, pull_var_clause((Node *) tlist, PVC_RECURSE_PLACEHOLDERS))
+	{
+		Var		   *v = (Var *) lfirst(lc);
+		ListCell   *lc2;
+		bool		have = false;
+
+		if (v->varno != rel->relid || v->varlevelsup != 0)
+			continue;
+		foreach(lc2, attnos)
+			if (lfirst_int(lc2) == v->varattno)
+				have = true;
+		if (!have)
+		{
+			/* An expression of the child may produce it: no column of its own. */
+			ListCell   *lc3;
+
+			foreach(lc3, scan_tlist)
+			{
+				TargetEntry *te = lfirst_node(TargetEntry, lc3);
+
+				if (!IsA(te->expr, Var) && equal(te->expr, v))
+					have = true;
+			}
+		}
+		if (!have)
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("distributed scan of \"%s\": column %d is needed above the scan but the local scan does not return it",
+							relname, (int) v->varattno)));
+	}
+
+	/* 2. The other columns that those expressions and the restrictions need. */
+	extra = pull_var_clause((Node *) list_concat(nonvar_exprs, copyObject(quals)),
+							PVC_RECURSE_PLACEHOLDERS);
+	foreach(lc, extra)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+		ListCell   *lc2;
+		bool		have = false;
+
+		if (v->varno != rel->relid || v->varlevelsup != 0)
+			continue;
+		if (v->varattno < 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("system columns of distributed table \"%s\" are not supported in a statement that spans shard groups",
+							relname)));
+		foreach(lc2, attnos)
+			if (lfirst_int(lc2) == v->varattno)
+				have = true;
+		if (have)
+			continue;
+		scan_tlist = lappend(scan_tlist,
+							 makeTargetEntry((Expr *) copyObject(v), ++resno, NULL, false));
+		attnos = lappend_int(attnos, v->varattno);
+	}
+
+	/* 3. The fragment. */
+	nest = kingres_shard_set_transmission_modes();
+	dpcontext = deparse_context_for("ks_t", relid);
+	initStringInfo(&select);
+	first = true;
+	foreach(lc, attnos)
+	{
+		int			attno = lfirst_int(lc);
+
+		if (attno < 0)
+			continue;		/* computed here, not fetched */
+
+		appendStringInfoString(&select, first ? "" : ", ");
+		first = false;
+		if (attno == 0)
+			appendStringInfoString(&select, "ks_t");
+		else
+			appendStringInfoString(&select,
+								   quote_identifier(get_attname(relid, attno, false)));
+	}
+	if (first)
+		appendStringInfoString(&select, "1");
+	initStringInfo(&sql);
+	appendStringInfo(&sql, "SELECT %s FROM %s AS ks_t", select.data,
+					 quote_qualified_identifier(nsp, relname));
+
+	foreach(lc, quals)
+	{
+		Node	   *q = (Node *) lfirst(lc);
+
+		if (kingres_shard_clause_shippable(q, rel->relid))
+		{
+			Node	   *c = (Node *) copyObject(q);
+
+			ChangeVarNodes(c, rel->relid, 1, 0);
+			c = renumber_params(c, &prn);
+			pushed = lappend(pushed, c);
+		}
+	}
+	if (pushed != NIL)
+	{
+		appendStringInfoString(&sql, " WHERE ");
+		first = true;
+		foreach(lc, pushed)
+		{
+			appendStringInfo(&sql, "%s(%s)", first ? "" : " AND ",
+							 deparse_expression((Node *) lfirst(lc), dpcontext, false, false));
+			first = false;
+		}
+	}
+	kingres_shard_reset_transmission_modes(nest);
+	foreach(lc, prn.ids)
+		param_ids_int = lappend(param_ids_int, makeInteger(lfirst_int(lc)));
+
+	cscan->scan.plan.targetlist = tlist;
+	cscan->scan.plan.qual = quals;
+	cscan->scan.scanrelid = 0;
+	cscan->flags = best_path->flags;
+	cscan->custom_scan_tlist = scan_tlist;
+	cscan->custom_plans = custom_plans;
+	cscan->custom_relids = bms_make_singleton(rel->relid);
+	cscan->custom_private = list_make4(makeString(sql.data), makeInteger((int) relid),
+									   makeInteger(nchild), param_ids_int);
+	cscan->methods = &ds_scan_methods;
+	return &cscan->scan.plan;
+}
+
+static Node *
+ds_create_scan_state(CustomScan *cscan)
+{
+	KsDistScanState *s = palloc0(sizeof(KsDistScanState));
+	List	   *p = cscan->custom_private;
+	ListCell   *lc;
+
+	NodeSetTag(&s->css, T_CustomScanState);
+	s->css.methods = &ds_exec_methods;
+	s->css.slotOps = &TTSOpsVirtual;
+	s->sql = pstrdup(strVal(list_nth(p, DS_PRIV_SQL)));
+	s->relid = (Oid) intVal(list_nth(p, DS_PRIV_RELID));
+	s->nchild = intVal(list_nth(p, DS_PRIV_NCHILD));
+	foreach(lc, (List *) list_nth(p, DS_PRIV_PARAMS))
+		s->param_ids = lappend_int(s->param_ids, intVal(lfirst(lc)));
+	return (Node *) s;
+}
+
+/*
+ * An expression of the table's target list, ready to be evaluated here on a
+ * row of the other groups: its columns become references to the scan tuple
+ * (INDEX_VAR), and a PlaceHolderVar is replaced by what it holds.
+ */
+typedef struct ExprRewrite
+{
+	List	   *scan_tlist;
+} ExprRewrite;
+
+static Node *
+rewrite_for_scan(Node *node, ExprRewrite *ctx)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, PlaceHolderVar))
+		return rewrite_for_scan((Node *) ((PlaceHolderVar *) node)->phexpr, ctx);
+	if (IsA(node, Var))
+	{
+		Var		   *v = (Var *) node;
+		ListCell   *lc;
+		int			k = 0;
+
+		foreach(lc, ctx->scan_tlist)
+		{
+			TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+			k++;
+			if (IsA(te->expr, Var) && ((Var *) te->expr)->varattno == v->varattno)
+				return (Node *) makeVar(INDEX_VAR, k, v->vartype, v->vartypmod,
+										v->varcollid, 0);
+		}
+		elog(ERROR, "column %d of a distributed scan is not in its scan tuple", v->varattno);
+	}
+	return expression_tree_mutator(node, rewrite_for_scan, ctx);
+}
+
+static void
+ds_begin_scan(CustomScanState *node, EState *estate, int eflags)
+{
+	KsDistScanState *s = (KsDistScanState *) node;
+	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
+	TupleDesc	tupdesc = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
+	int			i;
+	ExprRewrite rw;
+
+	s->child = ExecInitNode((Plan *) linitial(cscan->custom_plans), estate, eflags);
+	node->custom_ps = list_make1(s->child);
+
+	rw.scan_tlist = cscan->custom_scan_tlist;
+	s->ncols = tupdesc->natts;
+	s->infuncs = palloc0(sizeof(FmgrInfo) * Max(s->ncols, 1));
+	s->typioparams = palloc0(sizeof(Oid) * Max(s->ncols, 1));
+	s->typmods = palloc0(sizeof(int32) * Max(s->ncols, 1));
+	s->values = palloc0(sizeof(Datum) * Max(s->ncols, 1));
+	s->nulls = palloc0(sizeof(bool) * Max(s->ncols, 1));
+	s->fetched = palloc0(sizeof(bool) * Max(s->ncols, 1));
+	s->exprs = palloc0(sizeof(ExprState *) * Max(s->ncols, 1));
+	s->nfetch = 0;
+	for (i = 0; i < s->ncols; i++)
+	{
+		TargetEntry *te = list_nth_node(TargetEntry, cscan->custom_scan_tlist, i);
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+
+		if (IsA(te->expr, Var))
+		{
+			Oid			infunc;
+
+			getTypeInputInfo(att->atttypid, &infunc, &s->typioparams[i]);
+			fmgr_info(infunc, &s->infuncs[i]);
+			s->typmods[i] = att->atttypmod;
+			s->fetched[i] = true;
+			s->nfetch++;
+		}
+		else
+			s->exprs[i] = ExecInitExpr((Expr *) rewrite_for_scan((Node *) copyObject(te->expr), &rw),
+									   &node->ss.ps);
+	}
+}
+
+/* ---- remote fragments ---- */
+
+/* The value of an external parameter, as text, for the fragment. */
+static const char **
+fragment_params(KsDistScanState *s, Oid **types_out, int *n_out)
+{
+	ParamListInfo params = s->css.ss.ps.state->es_param_list_info;
+	int			n = list_length(s->param_ids);
+	const char **values = palloc0(sizeof(char *) * Max(n, 1));
+	Oid		   *types = palloc0(sizeof(Oid) * Max(n, 1));
+	int			nest;
+	int			i = 0;
+	ListCell   *lc;
+
+	nest = kingres_shard_set_transmission_modes();
+	foreach(lc, s->param_ids)
+	{
+		int			id = lfirst_int(lc);
+		ParamExternData *prm;
+		ParamExternData workspace;
+		Oid			outfunc;
+		bool		isvarlena;
+
+		if (params == NULL || id < 1 || id > params->numParams)
+			elog(ERROR, "no value for parameter $%d of a distributed scan", id);
+		if (params->paramFetch != NULL)
+			prm = params->paramFetch(params, id, false, &workspace);
+		else
+			prm = &params->params[id - 1];
+		types[i] = prm->ptype;
+		if (!prm->isnull)
+		{
+			getTypeOutputInfo(prm->ptype, &outfunc, &isvarlena);
+			values[i] = OidOutputFunctionCall(outfunc, prm->value);
+		}
+		i++;
+	}
+	kingres_shard_reset_transmission_modes(nest);
+	*types_out = types;
+	*n_out = n;
+	return values;
+}
+
+/* Read the answer of the FETCH that is in flight. */
+static void
+frag_collect(DsFrag *f)
+{
+	PGresult   *res;
+
+	if (!f->in_flight)
+		return;
+	kingres_shard_conn_clear_pending(f->kc, f);
+	res = libpqsrv_get_result_last(f->kc->conn, PG_WAIT_EXTENSION);
+	f->kc->in_query = false;
+	f->in_flight = false;
+	if (res == NULL)
+	{
+		f->kc->have_error = true;
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("lost the connection to node %s:%d during a distributed scan",
+						f->host, f->port)));
+	}
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		kingres_shard_report_error(f->kc, res, "FETCH");
+	f->res = res;
+	f->nrows = PQntuples(res);
+	f->next_row = 0;
+	if (f->nrows < kingres_shard_scan_fetch_size)
+		f->exhausted = true;
+}
+
+/* Called when something else wants the connection while a FETCH is in flight. */
+static void
+ds_finish_pending(void *owner)
+{
+	DsFrag	   *f = (DsFrag *) owner;
+
+	frag_collect(f);
+}
+
+static void
+frag_send_fetch(DsFrag *f)
+{
+	char		sql[96];
+
+	snprintf(sql, sizeof(sql), "FETCH FORWARD %d FROM %s", kingres_shard_scan_fetch_size,
+			 f->cursor);
+	f->kc->in_query = true;
+	if (!PQsendQuery(f->kc->conn, sql))
+	{
+		f->kc->have_error = true;
+		f->kc->in_query = false;
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("could not send a command to node %s:%d", f->host, f->port),
+				 errdetail_internal("%s", pchomp(PQerrorMessage(f->kc->conn)))));
+	}
+	f->in_flight = true;
+	kingres_shard_conn_set_pending(f->kc, f, ds_finish_pending);
+}
+
+/* Open the cursors on every group, then ask each for its first batch. */
+static void
+ds_start(KsDistScanState *s)
+{
+	EState	   *estate = s->css.ss.ps.state;
+	const KsCatalog *cat = kingres_shard_catalog();
+	const KsDistTable *dt = hash_search(cat->dist_tables, &s->relid, HASH_FIND, NULL);
+	MemoryContext old;
+	const char **values;
+	Oid		   *types;
+	int			nparams;
+	ListCell   *lc;
+
+	old = MemoryContextSwitchTo(estate->es_query_cxt);
+	if (dt == NULL || dt->is_reference)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("table %u is no longer a distributed table", s->relid)));
+	s->frags = remote_groups_of(dt, cat);
+	MemoryContextSwitchTo(old);
+	s->cur = 0;
+	values = fragment_params(s, &types, &nparams);
+
+	/* DECLARE on every group first (they plan concurrently), then read the answers. */
+	foreach(lc, s->frags)
+	{
+		DsFrag	   *f = (DsFrag *) lfirst(lc);
+		StringInfoData decl;
+
+		f->scan = s;
+		f->kc = kingres_shard_get_conn(f->host, f->port, false, NULL);
+		kingres_shard_begin_xact(f->kc);
+		snprintf(f->cursor, sizeof(f->cursor), "ks_scan_" UINT64_FORMAT, ++cursor_serial);
+		initStringInfo(&decl);
+		appendStringInfo(&decl, KS_FRAGMENT_MARKER "DECLARE %s NO SCROLL CURSOR FOR %s", f->cursor, s->sql);
+		f->kc->in_query = true;
+		if (!PQsendQueryParams(f->kc->conn, decl.data, nparams, types, values, NULL, NULL, 0))
+		{
+			f->kc->have_error = true;
+			f->kc->in_query = false;
+			ereport(ERROR,
+					(errcode(ERRCODE_CONNECTION_FAILURE),
+					 errmsg("could not send a command to node %s:%d", f->host, f->port),
+					 errdetail_internal("%s", pchomp(PQerrorMessage(f->kc->conn)))));
+		}
+		f->kc->nstatements++;
+		f->in_flight = true;
+		kingres_shard_conn_set_pending(f->kc, f, ds_finish_pending);
+	}
+	foreach(lc, s->frags)
+	{
+		DsFrag	   *f = (DsFrag *) lfirst(lc);
+		PGresult   *res;
+
+		/* The answer to DECLARE (not a batch). */
+		kingres_shard_conn_clear_pending(f->kc, f);
+		res = libpqsrv_get_result_last(f->kc->conn, PG_WAIT_EXTENSION);
+		f->kc->in_query = false;
+		f->in_flight = false;
+		if (res == NULL || PQresultStatus(res) != PGRES_COMMAND_OK)
+		{
+			if (res == NULL)
+				f->kc->have_error = true;
+			kingres_shard_report_error(f->kc, res, "DECLARE");
+		}
+		PQclear(res);
+		f->declared = true;
+	}
+	foreach(lc, s->frags)
+		frag_send_fetch((DsFrag *) lfirst(lc));
+	s->started = true;
+}
+
+/* Read the batch in flight, forgetting an error: the scan is being closed. */
+static void
+frag_drain(DsFrag *f)
+{
+	MemoryContext oldcxt = CurrentMemoryContext;
+
+	PG_TRY();
+	{
+		frag_collect(f);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(oldcxt);
+		FlushErrorState();
+		f->in_flight = false;
+	}
+	PG_END_TRY();
+}
+
+/* Close cursors and free batches. */
+static void
+ds_stop(KsDistScanState *s, bool close_cursors)
+{
+	ListCell   *lc;
+
+	foreach(lc, s->frags)
+	{
+		DsFrag	   *f = (DsFrag *) lfirst(lc);
+
+		if (f->in_flight && f->kc != NULL && f->kc->conn != NULL && !f->kc->have_error)
+		{
+			/* Let the batch that was asked for arrive: cancelling would abort the remote transaction. */
+			frag_drain(f);
+		}
+		if (f->res != NULL)
+			PQclear(f->res);
+		f->res = NULL;
+		if (close_cursors && f->declared && f->kc != NULL && f->kc->conn != NULL &&
+			!f->kc->have_error && f->kc->xact_depth > 0 &&
+			PQstatus(f->kc->conn) == CONNECTION_OK &&
+			PQtransactionStatus(f->kc->conn) == PQTRANS_INTRANS)
+		{
+			char		sql[64];
+			PGresult   *res;
+
+			kingres_shard_conn_quiesce(f->kc);
+			snprintf(sql, sizeof(sql), "CLOSE %s", f->cursor);
+			res = PQexec(f->kc->conn, sql);
+			PQclear(res);
+		}
+		f->declared = false;
+	}
+	s->frags = NIL;
+	s->started = false;
+}
+
+/*
+ * The next row of the other groups into the scan slot, or false at the end.
+ * Batches are taken in turn, and the next batch of a group is requested as soon
+ * as the current one is used up.
+ */
+static bool
+ds_next_remote(KsDistScanState *s, TupleTableSlot *slot)
+{
+	int			nfrags = list_length(s->frags);
+
+	if (nfrags == 0)
+		return false;
+	for (;;)
+	{
+		int			i;
+		bool		any_pending = false;
+		DsFrag	   *f = NULL;
+
+		/* A batch with rows left. */
+		for (i = 0; i < nfrags; i++)
+		{
+			DsFrag	   *c = (DsFrag *) list_nth(s->frags, (s->cur + i) % nfrags);
+
+			if (c->res != NULL && c->next_row < c->nrows)
+			{
+				f = c;
+				s->cur = (s->cur + i) % nfrags;
+				break;
+			}
+		}
+		if (f != NULL)
+		{
+			int			row = f->next_row++;
+			int			j;
+			int			r = 0;
+			int			expected = (s->nfetch == 0) ? 1 : s->nfetch;
+			MemoryContext oldcxt;
+			ExprContext *econtext = s->css.ss.ps.ps_ExprContext;
+
+			if (PQnfields(f->res) != expected)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_EXCEPTION),
+						 errmsg("node %s:%d returned %d columns, expected %d",
+								f->host, f->port, PQnfields(f->res), expected)));
+			ExecClearTuple(slot);
+			/* The values live until the next call, which resets this context. */
+			oldcxt = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+			for (j = 0; j < s->ncols; j++)
+			{
+				if (!s->fetched[j])
+				{
+					slot->tts_values[j] = (Datum) 0;
+					slot->tts_isnull[j] = true;
+					continue;
+				}
+				if (PQgetisnull(f->res, row, r))
+				{
+					slot->tts_values[j] = (Datum) 0;
+					slot->tts_isnull[j] = true;
+				}
+				else
+				{
+					slot->tts_isnull[j] = false;
+					slot->tts_values[j] = InputFunctionCall(&s->infuncs[j],
+															PQgetvalue(f->res, row, r),
+															s->typioparams[j],
+															s->typmods[j]);
+				}
+				r++;
+			}
+			ExecStoreVirtualTuple(slot);
+			/* The expressions of the target list, from the columns just read. */
+			econtext->ecxt_scantuple = slot;
+			for (j = 0; j < s->ncols; j++)
+			{
+				if (s->exprs[j] != NULL)
+					slot->tts_values[j] = ExecEvalExpr(s->exprs[j], econtext,
+													   &slot->tts_isnull[j]);
+			}
+			MemoryContextSwitchTo(oldcxt);
+			return true;
+		}
+
+		/* Batches that are used up: free them and ask for the next ones. */
+		for (i = 0; i < nfrags; i++)
+		{
+			DsFrag	   *c = (DsFrag *) list_nth(s->frags, i);
+
+			if (c->res != NULL && c->next_row >= c->nrows)
+			{
+				PQclear(c->res);
+				c->res = NULL;
+				c->nrows = 0;
+			}
+			if (c->res == NULL && !c->in_flight && !c->exhausted)
+				frag_send_fetch(c);
+			if (c->in_flight)
+				any_pending = true;
+		}
+		if (!any_pending)
+		{
+			bool		anything = false;
+
+			for (i = 0; i < nfrags; i++)
+			{
+				DsFrag	   *c = (DsFrag *) list_nth(s->frags, i);
+
+				if (c->res != NULL && c->next_row < c->nrows)
+					anything = true;
+			}
+			if (!anything)
+				return false;
+			continue;
+		}
+		/* Wait for the first group that has a batch coming. */
+		for (i = 0; i < nfrags; i++)
+		{
+			DsFrag	   *c = (DsFrag *) list_nth(s->frags, (s->cur + i) % nfrags);
+
+			if (c->in_flight)
+			{
+				frag_collect(c);
+				break;
+			}
+		}
+	}
+}
+
+static TupleTableSlot *
+ds_exec_scan(CustomScanState *node)
+{
+	KsDistScanState *s = (KsDistScanState *) node;
+	ExprContext *econtext = node->ss.ps.ps_ExprContext;
+	TupleTableSlot *scan = node->ss.ss_ScanTupleSlot;
+
+	if (!s->started)
+		ds_start(s);
+
+	for (;;)
+	{
+		bool		remote;
+
+		CHECK_FOR_INTERRUPTS();
+		ResetExprContext(econtext);
+
+		if (!s->child_done)
+		{
+			TupleTableSlot *cs = ExecProcNode(s->child);
+
+			if (!TupIsNull(cs))
+			{
+				int			i;
+
+				slot_getallattrs(cs);
+				ExecClearTuple(scan);
+				for (i = 0; i < s->ncols; i++)
+				{
+					if (i < s->nchild)
+					{
+						scan->tts_values[i] = cs->tts_values[i];
+						scan->tts_isnull[i] = cs->tts_isnull[i];
+					}
+					else
+					{
+						scan->tts_values[i] = (Datum) 0;
+						scan->tts_isnull[i] = true;
+					}
+				}
+				ExecStoreVirtualTuple(scan);
+				econtext->ecxt_scantuple = scan;
+				/* The child applied every restriction already. */
+				if (node->ss.ps.ps_ProjInfo)
+					return ExecProject(node->ss.ps.ps_ProjInfo);
+				return scan;
+			}
+			s->child_done = true;
+		}
+
+		remote = ds_next_remote(s, scan);
+		if (!remote)
+			return NULL;
+		econtext->ecxt_scantuple = scan;
+		if (node->ss.ps.qual != NULL && !ExecQual(node->ss.ps.qual, econtext))
+		{
+			InstrCountFiltered1(node, 1);
+			continue;
+		}
+		if (node->ss.ps.ps_ProjInfo)
+			return ExecProject(node->ss.ps.ps_ProjInfo);
+		return scan;
+	}
+}
+
+static void
+ds_end_scan(CustomScanState *node)
+{
+	KsDistScanState *s = (KsDistScanState *) node;
+
+	ds_stop(s, true);
+	if (s->child != NULL)
+		ExecEndNode(s->child);
+}
+
+static void
+ds_rescan(CustomScanState *node)
+{
+	KsDistScanState *s = (KsDistScanState *) node;
+
+	ds_stop(s, true);
+	s->child_done = false;
+	if (node->ss.ps.chgParam != NULL)
+		UpdateChangedParamSet(s->child, node->ss.ps.chgParam);
+	ExecReScan(s->child);
+}
+
+static void
+ds_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
+{
+	KsDistScanState *s = (KsDistScanState *) node;
+	const KsCatalog *cat = kingres_shard_catalog();
+	const KsDistTable *dt = hash_search(cat->dist_tables, &s->relid, HASH_FIND, NULL);
+	StringInfoData flat;
+	const char *p;
+	bool		pending_space = false;
+	List	   *remote = NIL;
+
+	if (dt != NULL && !dt->is_reference)
+		remote = remote_groups_of(dt, cat);
+	ExplainPropertyInteger("Remote groups", NULL, list_length(remote), es);
+
+	initStringInfo(&flat);
+	for (p = s->sql; *p; p++)
+	{
+		if (*p == '\n' || *p == '\r' || *p == '\t' || *p == ' ')
+		{
+			pending_space = (flat.len > 0);
+			continue;
+		}
+		if (pending_space)
+			appendStringInfoChar(&flat, ' ');
+		pending_space = false;
+		appendStringInfoChar(&flat, *p);
+	}
+	ExplainPropertyText("Remote SQL", flat.data, es);
+}

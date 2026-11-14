@@ -165,6 +165,11 @@ kingres_bucket_for_relation(PG_FUNCTION_ARGS)
 				 errmsg("relation with OID %u is not a distributed table",
 						relid)));
 	}
+	if (dt->is_reference)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("table \"%s\" is a reference table and has no buckets",
+						get_rel_name(relid))));
 	return bucket_for_colocation_entry(fcinfo, dt->coloc);
 }
 

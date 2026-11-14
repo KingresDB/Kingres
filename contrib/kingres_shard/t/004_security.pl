@@ -20,7 +20,9 @@ sub make_node
 	my $node = PostgreSQL::Test::Cluster->new($name);
 	$node->init;
 	$node->append_conf('postgresql.conf',
-		"shared_preload_libraries = 'kingres_shard'");
+		"shared_preload_libraries = 'kingres_shard'
+max_prepared_transactions = 20
+kingres_shard.recovery_interval = 0");
 	$node->start;
 	return $node;
 }
@@ -50,7 +52,8 @@ $n1->safe_psql('postgres', q{
 	SELECT kingres.create_distributed_table('public.kv', 'id', bucket_count => 12);
 });
 # Privileges are per node.
-$_->safe_psql('postgres', 'GRANT ALL ON public.kv TO ks_user') for @nodes;
+# GRANT on a distributed table is propagated from the map group primary.
+$nodes[0]->safe_psql('postgres', 'GRANT ALL ON public.kv TO ks_user');
 
 my %keys;
 for my $g (0 .. 2)

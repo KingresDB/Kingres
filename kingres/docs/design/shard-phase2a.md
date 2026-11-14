@@ -296,3 +296,181 @@ Multi-node (TAP, three nodes unless stated):
   single-node cluster; the non-shippable cases are rejected.
 - A large-result test (enough rows that a remote fragment cannot be held in
   memory at once with a small `work_mem`) to confirm batched fetching.
+
+## Implementation notes and deviations
+
+Added when `contrib/kingres_shard` version 0.2 was implemented, on PostgreSQL
+18.7. Everything above is implemented as written except what is listed here;
+each item says what differs and why. "The extension" is `kingres_shard`.
+
+**What the specification got wrong about PostgreSQL 18, or left open**
+
+- *The recovery rule of section 1 is not enough after a crash.* "The full
+  transaction id in the gid is not running locally" assumes that an id that was
+  handed out stays handed out. A backend that dies by `SIGKILL` after assigning an
+  id but before its WAL reaches the disk leaves the id unused: after the restart
+  the next transaction gets it again, and recovery then sees "that id is in
+  progress" and leaves the prepared transaction alone (the recovery function's own
+  transaction can be the one that got the id). The rule implemented: an id at or
+  above the next id of the node cannot belong to a live backend; an id below it is
+  "running" only if `TransactionIdIsInProgress()` is true *and*
+  `BackendXidGetPid()` is the pid in the gid.
+- *`max_prepared_transactions` defaults to 0*, so every node of every test needs it
+  set (the TAP helpers and `kingres_shard.conf` do). The library warns at load when
+  it is 0.
+- *A partitioned table loses its paths after the hook.* For a query with one
+  partitioned base relation, `apply_scanjoin_target_to_paths()` discards the paths
+  of the partitioned relation and rebuilds them from the paths of its partitions,
+  which would read the local buckets only. The distributed scan therefore makes the
+  table stop looking partitioned (`rel->part_scheme = NULL`, `nparts = 0`) when it
+  installs its path, and partitionwise join and aggregation are switched off while
+  such a statement is planned. Members of a `UNION ALL` arrive as
+  `RELOPT_OTHER_MEMBER_REL`; the hook handles them too.
+- *The target of the path is not the target of the plan.* By the time
+  `PlanCustomPath` runs the planner has replaced the path target (order, extra
+  expressions); the scan tuple is therefore built from the target list of the child
+  plan, and an expression the planner computes on the table (a `COALESCE` of
+  columns) is evaluated here on the rows of the other groups from the columns
+  fetched.
+- *`DECLARE CURSOR` takes parameters in the extended protocol*, which lets one
+  fragment text carry the external parameters of the statement.
+- *PostgreSQL 18 has no deparser for `ALTER TABLE`*, so the original statement text
+  is always what is sent (section 4 allowed that).
+- *`COPY` of a partitioned table to `STDOUT` is refused by PostgreSQL itself*; the
+  hook leaves `COPY ... TO` alone and refuses every `COPY ... FROM` on a
+  distributed table (not only the rows for other groups: the router cannot see
+  which rows those are).
+- *The validation of a new foreign key* (a join of the partitions of the
+  referencing table with the whole referenced table) is run by PostgreSQL inside
+  the `ALTER TABLE` and must read the node's own buckets on every node. While a
+  propagated DDL statement runs, the planner hook therefore does no routing
+  (`kingres_shard_in_authorized_ddl()`). Foreign keys are accepted only between
+  colocated tables on the distribution column and to reference tables, which is
+  what makes that correct.
+
+**Two-phase commit and recovery**
+
+- *The cluster-wide lock* is the exclusive lock on `kingres.map_version` of phase 1
+  (review finding 4), not `pg_advisory_xact_lock`: it also blocks a hand-made change
+  of a catalog table and cannot collide with an application's advisory keys.
+  `create_reference_table` and the propagated DDL take it too.
+- *gid.* The format is as specified. When one transaction has two connections to one
+  node (two roles after `SET ROLE`), the second gid gets a `_<n>` suffix.
+- *`kingres.dtx_log` rows are removed only if they are older than the moment the
+  prepared transactions of their node were listed* and are no longer prepared;
+  otherwise a transaction that prepared and committed between the listing and the
+  cleanup would lose its decision while still prepared and be rolled back by the
+  next pass. Rows of nodes that are no longer registered are removed.
+- *`kingres.pending_node` (a second node-local table, not in the spec).* The
+  registration of a new node is part of the transaction that may abort or crash, so
+  after a crash between prepare and commit of `add_node` the prepared transaction on
+  the new node belongs to no registered node and recovery would never look there.
+  `add_node` therefore records the address in this table, in a transaction of its
+  own (through a connection to the node itself), before it touches the new node;
+  recovery looks at those addresses too and forgets them once the node is registered
+  or after an hour.
+- *Order at commit.* Read-only remote participants are committed first, then the
+  writers are prepared. A single writer is committed directly (no `dtx_log` row); a
+  transaction whose only writer is the local node commits as before.
+- *The decision row is inserted with the heap API* (`CatalogTupleInsert`) in the
+  pre-commit callback, with a snapshot pushed for the unique-index check; the
+  committing user needs no privilege on `dtx_log`.
+- *The recovery function* refuses to run in a transaction that has operated on
+  remote nodes, in a `REPEATABLE READ` or `SERIALIZABLE` transaction (it needs a
+  fresh snapshot for the `dtx_log` lookup after the in-progress test) and on a
+  standby. `EXECUTE` is revoked from `PUBLIC`.
+- *The workers.* One launcher (restarted after 5 s) and one short-lived worker per
+  connectable database, started and awaited one after the other. The workers run
+  as the bootstrap superuser with a pinned `search_path`, so that role's name must
+  exist on every node (as for `add_node`).
+- *Fault injection* is the superuser-only developer setting
+  `kingres_shard.fault_injection`, as the task allowed.
+- `kingres_shard.recovery_interval` is `sighup` (0 disables). The regression
+  configuration sets it to 0 so that the worker cannot hold a database that
+  `pg_regress` wants to drop.
+
+**Reference tables**
+
+- A write is accepted only if every expression is a built-in *immutable* function or
+  operator on built-in types (not merely non-volatile): `now()` and every other
+  `STABLE` function differ between nodes and are rejected with the volatile ones. It
+  may read only reference tables.
+- The statement runs node after node in node-id order (the local node through SPI
+  in its turn), so concurrent writers take row locks in the same order on every
+  node. The rows and the count returned are those of the local copy; a statement
+  that affects a different number of rows on two nodes raises an error ("the copies
+  of a reference table differ"), which aborts the transaction.
+- A statement that writes a reference table and reads a distributed table is "not
+  supported yet".
+- `create_reference_table` copies the rows with multi-row `INSERT`s with text-form
+  parameters under the transmission modes (generated columns are left to be
+  computed, identity values are kept).
+
+**DDL propagation**
+
+- The list of section 4 is implemented, plus `VALIDATE CONSTRAINT` (needed for `NOT
+  VALID` constraints) and `COMMENT ON TABLE` / `COLUMN` (a comment would otherwise
+  exist on one node only). `ADD COLUMN` accepts a constant default only and no
+  `serial` or identity (they would create a different sequence per node); generated
+  columns are allowed (their expression must be immutable). `DROP COLUMN ...
+  CASCADE` is refused.
+- `CLUSTER` on a distributed or reference table is now refused (the spec lists it
+  among the rejected statements; phase 1 allowed it).
+- *The forwarded flag is also the "this DDL was propagated" marker*, and any client
+  can give it: a table owner who connects to a non-map node with
+  `kingres_shard.forwarded=on` can run the supported statements there without
+  propagation. Privilege checks are unchanged, and the owner could do the same with
+  `enable_routing = off` as a superuser; the README says so. A stronger marker needs
+  an authenticated channel between nodes (a later phase).
+- The text of a DDL statement is sent after `set_config(..., is_local)` of
+  `search_path`, `DateStyle`, `IntervalStyle`, `standard_conforming_strings`,
+  `bytea_output` and `extra_float_digits` of the session; the fixed settings are put
+  back afterwards. A query string with several statements is refused.
+- A foreign key from an ordinary table to a distributed table is refused (it cannot
+  be enforced).
+
+**Distributed scan**
+
+- The remote fragment is `DECLARE ks_scan_n NO SCROLL CURSOR FOR SELECT <columns>
+  FROM <table> AS ks_t WHERE <shippable clauses>`, read with `FETCH FORWARD
+  kingres_shard.scan_fetch_size` (a new setting, default 1000). It starts with the
+  comment `/* kingres:scan-fragment */`: a forwarded session runs a plain read of one
+  distributed table without the bucket check only with that marker, so a routed
+  statement of the same shape sent to a node that no longer owns the bucket is
+  still `KS001`. A client can write the comment too; what it gets is the rows of
+  this node of a table it may read.
+- No bucket pruning: every group that owns a bucket of the table is asked, even if
+  a restriction fixes the key of that table (range table indexes change when the
+  planner pulls up subqueries, so the key analysis of the routing hook cannot be
+  matched to the plan). The restriction is shipped, so the other groups return
+  nothing.
+- Row locking, system columns and `PlaceHolderVar`s computed on the table are "not
+  supported yet". A `SELECT` of a SQL-language function that the planner expands is
+  now read through the scan instead of being refused.
+- A write to an ordinary table that reads a distributed table (`INSERT INTO local
+  SELECT ... FROM dist`, `CREATE TABLE AS`) uses the scan as well.
+- The scan asks the groups of the node's current bucket map; nothing checks the
+  remote map version (buckets do not move in this phase).
+
+**UPDATE and DELETE**
+
+- "No sub-selects on distributed tables" is implemented as: the distributed table
+  appears once, as the target; any other reference to it (a subquery, a self join)
+  is refused, because group-by-group execution would see only the rows of one group.
+- An `UPDATE` that assigns the distribution column is refused always (also when it
+  would be routed to one bucket); the hint is DELETE and INSERT.
+- Each group's part carries `/* kingres:write-fragment */`; a forwarded session runs
+  such a statement on its own buckets if it is shippable.
+
+**Node connection options (not in the spec)**
+
+The forbidden keywords are `host`, `hostaddr`, `port`, `dbname`, `user`, `password`,
+`options`, `service`, `client_encoding`, `application_name`, `connect_timeout` and
+`replication` (the last six because the extension controls them or they would change
+the kind of connection). The check hook replaces a rejected value by a placeholder so
+that the generic server message does not print it; connection errors have the values
+of `sslcert`, `sslkey`, `sslrootcert`, `sslcrl`, `sslcrldir`, `sslpassword`,
+`sslkeylogfile` and `passfile` replaced by `<hidden>`. The server logs a value of
+`postgresql.conf` in full when the file is reloaded; the README says so. `sslmode`
+and the other SSL options apply to TCP connections only (libpq ignores them on Unix
+sockets), which the test accounts for.

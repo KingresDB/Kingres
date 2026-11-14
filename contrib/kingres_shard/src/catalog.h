@@ -40,6 +40,7 @@ typedef struct KsDistTable
 	int			colocation_id;
 	KsColocation *coloc;
 	NameData	dist_column;
+	bool		is_reference;	/* a reference table: no key, no colocation group */
 } KsDistTable;
 
 /* A node of the cluster. */

@@ -22,6 +22,7 @@
 /* Maximum lengths of the parts of a connection cache key. */
 #define KS_CONN_HOST_LEN 256
 #define KS_TZ_LEN 96
+#define KS_GID_LEN 160
 
 /*
  * A cached connection to one node, used by one local user.  The pointer is
@@ -42,6 +43,13 @@ typedef struct KsConn
 	bool		have_error;		/* connection state is unknown: discard it */
 	/* TimeZone sent with SET LOCAL in the open remote transaction, or "" */
 	char		tz_applied[KS_TZ_LEN];
+	/* two-phase commit state of the current local transaction */
+	bool		wrote;			/* the remote transaction has written */
+	bool		prepared;		/* PREPARE TRANSACTION succeeded; gid is valid */
+	char		gid[KS_GID_LEN];
+	/* an asynchronous fetch of one scan is in flight on conn */
+	void	   *pending_owner;
+	void		(*pending_finish) (void *owner);
 } KsConn;
 
 extern void kingres_shard_conn_init(void);
@@ -51,6 +59,7 @@ extern KsConn *kingres_shard_get_conn(const char *host, int port,
 									   bool missing_ok, char **errmsg_out);
 extern void kingres_shard_begin_xact(KsConn *kc);
 extern PGresult *kingres_shard_exec(KsConn *kc, const char *sql);
+extern void kingres_shard_exec_ddl(KsConn *kc, const char *stmt);
 extern PGresult *kingres_shard_exec_params(KsConn *kc, const char *sql,
 											int nparams, const Oid *types,
 											const char *const *values,
@@ -60,10 +69,30 @@ extern void kingres_shard_report_error(KsConn *kc, PGresult *res,
 extern int	kingres_shard_result_sqlstate(PGresult *res);
 extern void kingres_shard_forget_xact(KsConn *kc);
 
-/* Phase 1 limits on routed writes (design/shard-mvp.md, "Transactions"). */
+/*
+ * Two-phase commit (design/shard-phase2a.md, section 1).  A connection that
+ * runs a writing statement is marked with kingres_shard_note_remote_write();
+ * at pre-commit a transaction with two or more writers (the local node counts
+ * as one when it has a transaction id) prepares every remote writer and logs
+ * the decision in kingres.dtx_log.
+ */
 extern void kingres_shard_note_remote_write(KsConn *kc);
-extern bool kingres_shard_remote_write_pending(void);
-extern void kingres_shard_note_local_write(void);
-extern void kingres_shard_ignore_current_xid(void);
+extern void kingres_shard_begin_write_xact(KsConn *kc);
+
+/* An asynchronous fetch of one scan is in flight on kc. */
+extern void kingres_shard_conn_set_pending(KsConn *kc, void *owner,
+											void (*finish) (void *owner));
+extern void kingres_shard_conn_clear_pending(KsConn *kc, void *owner);
+extern void kingres_shard_conn_quiesce(KsConn *kc);
+
+/* The node id of the registered node at host:port, or 0. */
+extern int	kingres_shard_conn_node_id(const char *host, int port);
+
+/* Failure injection for tests (fault.c). */
+extern void kingres_shard_fault_init(void);
+extern void kingres_shard_fault_point(const char *point);
+
+/* Text of a connection error with secret paths of node_conninfo removed. */
+extern char *kingres_shard_scrub_conn_error(const char *msg);
 
 #endif							/* KINGRES_SHARD_NODE_CONN_H */
