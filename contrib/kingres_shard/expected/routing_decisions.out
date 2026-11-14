@@ -1,0 +1,419 @@
+-- sql/routing_decisions.sql
+--   Routing decisions that need no second server (review 2026-11-14: finding 1,
+--   finding 2, S-D).
+--
+-- SPDX-License-Identifier: PostgreSQL
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+--
+-- The cluster has a second shard group that does not exist as a server: the
+-- odd buckets belong to it.  A statement for such a bucket is planned as a
+-- "Kingres Remote Statement" (EXPLAIN shows it; nothing connects), a
+-- statement the router cannot place is refused, and a statement for a local
+-- bucket runs here.  Every partition still exists locally, so a statement
+-- that is wrongly run here instead of being routed or refused returns rows
+-- instead of an error: that is how the tests see a silent wrong answer.
+\set SHOW_CONTEXT never
+SET search_path = public;
+CREATE EXTENSION kingres_shard;
+SELECT kingres.init_cluster('localhost', current_setting('port')::int);
+ init_cluster 
+--------------
+ 
+(1 row)
+
+CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+CREATE TABLE w (name text PRIMARY KEY, v int);
+CREATE TABLE wc (name text COLLATE "C" PRIMARY KEY, v int);
+CREATE TABLE t (id int PRIMARY KEY, v text);
+CREATE TABLE plain (x int);
+SELECT kingres.create_distributed_table('w', 'name', bucket_count => 8);
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+SELECT kingres.create_distributed_table('wc', 'name', bucket_count => 8);
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+SELECT kingres.create_distributed_table('t', 'id', bucket_count => 8);
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+INSERT INTO w SELECT 'name' || g, g FROM generate_series(1, 20) g;
+INSERT INTO t SELECT g, 'row ' || g FROM generate_series(1, 20) g;
+INSERT INTO kingres.node (node_id, group_id, host, port, role)
+  VALUES (2, 1, 'group1.invalid', 5432, 'primary');
+UPDATE kingres.bucket_map SET group_id = 1 WHERE bucket % 2 = 1;
+-- A key of a local bucket and of a remote bucket, per table.
+SELECT min(k) AS wl FROM (SELECT 'name' || g AS k FROM generate_series(1, 100) g) s
+  WHERE kingres.bucket_for('w'::regclass, k) % 2 = 0 \gset
+SELECT min(k) AS wr FROM (SELECT 'name' || g AS k FROM generate_series(1, 100) g) s
+  WHERE kingres.bucket_for('w'::regclass, k) % 2 = 1 \gset
+SELECT min(k) AS wcl FROM (SELECT 'name' || g AS k FROM generate_series(1, 100) g) s
+  WHERE kingres.bucket_for('wc'::regclass, k) % 2 = 0 \gset
+SELECT min(k) AS wcr FROM (SELECT 'name' || g AS k FROM generate_series(1, 100) g) s
+  WHERE kingres.bucket_for('wc'::regclass, k) % 2 = 1 \gset
+SELECT min(g) AS tl FROM generate_series(1, 100) g
+  WHERE kingres.bucket_for('t'::regclass, g) % 2 = 0 \gset
+SELECT min(g) AS tn FROM generate_series(1001, 1100) g
+  WHERE kingres.bucket_for('t'::regclass, g) % 2 = 0 \gset
+SELECT min(g) AS tr FROM generate_series(1, 100) g
+  WHERE kingres.bucket_for('t'::regclass, g) % 2 = 1 \gset
+-- ---------------------------------------------------------------------------
+-- Finding 2: a key restriction routes only when the comparison uses the
+-- collation the key is hashed with.
+-- ---------------------------------------------------------------------------
+EXPLAIN (COSTS OFF) SELECT * FROM w WHERE name = :'wr';
+                               QUERY PLAN                                
+-------------------------------------------------------------------------
+ Custom Scan (Kingres Remote Statement)
+   Node: group1.invalid:5432 (group 1, bucket 1)
+   Remote SQL: SELECT name, v FROM public.w WHERE (name = 'name1'::text)
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM w WHERE name = :'wl';
+                 QUERY PLAN                 
+--------------------------------------------
+ Index Scan using w_b0006_pkey on w_b0006 w
+   Index Cond: (name = 'name11'::text)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM wc WHERE name = :'wcr';
+                                QUERY PLAN                                
+--------------------------------------------------------------------------
+ Custom Scan (Kingres Remote Statement)
+   Node: group1.invalid:5432 (group 1, bucket 1)
+   Remote SQL: SELECT name, v FROM public.wc WHERE (name = 'name1'::text)
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM wc WHERE name = :'wcl';
+                  QUERY PLAN                   
+-----------------------------------------------
+ Index Scan using wc_b0006_pkey on wc_b0006 wc
+   Index Cond: (name = 'name11'::text)
+(2 rows)
+
+-- a different collation: not restricted to one bucket
+EXPLAIN (COSTS OFF) SELECT * FROM w WHERE name = :'wr' COLLATE ci;
+ERROR:  statements that span shard groups are not supported yet
+HINT:  Restrict every distributed table of the statement to one key, for example with WHERE name = <value> on table "w".
+EXPLAIN (COSTS OFF) SELECT * FROM w WHERE name = :'wl' COLLATE ci;
+ERROR:  statements that span shard groups are not supported yet
+HINT:  Restrict every distributed table of the statement to one key, for example with WHERE name = <value> on table "w".
+EXPLAIN (COSTS OFF) SELECT * FROM w WHERE name COLLATE ci = :'wr';
+ERROR:  statements that span shard groups are not supported yet
+HINT:  Restrict every distributed table of the statement to one key, for example with WHERE name = <value> on table "w".
+EXPLAIN (COSTS OFF) SELECT * FROM w WHERE name = :'wr' COLLATE "C";
+ERROR:  statements that span shard groups are not supported yet
+HINT:  Restrict every distributed table of the statement to one key, for example with WHERE name = <value> on table "w".
+EXPLAIN (COSTS OFF) SELECT * FROM wc WHERE name = :'wcr' COLLATE ci;
+ERROR:  statements that span shard groups are not supported yet
+HINT:  Restrict every distributed table of the statement to one key, for example with WHERE name = <value> on table "wc".
+EXPLAIN (COSTS OFF) SELECT * FROM wc WHERE name = :'wcl' COLLATE "default";
+ERROR:  statements that span shard groups are not supported yet
+HINT:  Restrict every distributed table of the statement to one key, for example with WHERE name = <value> on table "wc".
+UPDATE w SET v = 0 WHERE name = :'wr' COLLATE ci;
+ERROR:  statements that span shard groups are not supported yet
+HINT:  Restrict every distributed table of the statement to one key, for example with WHERE name = <value> on table "w".
+DELETE FROM w WHERE name = :'wl' COLLATE ci;
+ERROR:  statements that span shard groups are not supported yet
+HINT:  Restrict every distributed table of the statement to one key, for example with WHERE name = <value> on table "w".
+SET kingres_shard.enable_routing = off;
+SELECT count(*) AS rows_after_refused_delete FROM w;
+ rows_after_refused_delete 
+---------------------------
+                        20
+(1 row)
+
+RESET kingres_shard.enable_routing;
+-- ---------------------------------------------------------------------------
+-- S-D: statements that reach a distributed table from inside another
+-- statement or object are either routed like any statement or refused.
+-- ---------------------------------------------------------------------------
+-- SQL-language functions that the planner inlines are expanded after the
+-- routing decision has been made.
+CREATE FUNCTION t_count() RETURNS bigint LANGUAGE sql STABLE
+  AS $$ SELECT (SELECT count(*) FROM t) $$;
+CREATE FUNCTION t_rows() RETURNS SETOF t LANGUAGE sql STABLE
+  AS $$ SELECT * FROM t $$;
+CREATE FUNCTION t_by_id(k int) RETURNS SETOF t LANGUAGE sql STABLE
+  AS $$ SELECT * FROM t WHERE id = k $$;
+SELECT t_count();
+ERROR:  statements that span shard groups are not supported yet
+HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
+SELECT count(*) FROM t_rows();
+ERROR:  statements that reach distributed tables through a SQL-language function are not supported yet
+DETAIL:  The planner expanded a SQL-language function into the statement, and the body of the function reads distributed table public.t without a key the router could see.
+HINT:  Write the function in PL/pgSQL, which is never expanded and whose statements are routed one by one, or put the key in the statement itself.
+SELECT * FROM t_by_id(:tl);
+ERROR:  statements that reach distributed tables through a SQL-language function are not supported yet
+DETAIL:  The planner expanded a SQL-language function into the statement, and the body of the function reads distributed table public.t without a key the router could see.
+HINT:  Write the function in PL/pgSQL, which is never expanded and whose statements are routed one by one, or put the key in the statement itself.
+SELECT * FROM t_by_id(:tr);
+ERROR:  statements that reach distributed tables through a SQL-language function are not supported yet
+DETAIL:  The planner expanded a SQL-language function into the statement, and the body of the function reads distributed table public.t without a key the router could see.
+HINT:  Write the function in PL/pgSQL, which is never expanded and whose statements are routed one by one, or put the key in the statement itself.
+SELECT 1 AS other_statements_unaffected;
+ other_statements_unaffected 
+-----------------------------
+                           1
+(1 row)
+
+-- not inlined: the body is a statement of its own
+CREATE FUNCTION t_v(k int) RETURNS text LANGUAGE sql STABLE
+  AS $$ SELECT v FROM t WHERE id = k $$;
+SELECT t_v(:tl);
+  t_v  
+-------
+ row 1
+(1 row)
+
+CREATE FUNCTION t_count_pl() RETURNS bigint LANGUAGE plpgsql
+  AS $$ BEGIN RETURN (SELECT count(*) FROM t); END $$;
+CREATE FUNCTION t_one_pl(k int) RETURNS text LANGUAGE plpgsql
+  AS $$ BEGIN RETURN (SELECT v FROM t WHERE id = k); END $$;
+SELECT t_count_pl();
+ERROR:  statements that span shard groups are not supported yet
+HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
+SELECT t_one_pl(:tl);
+ t_one_pl 
+----------
+ row 1
+(1 row)
+
+DO $$ BEGIN PERFORM count(*) FROM t; END $$;
+ERROR:  statements that span shard groups are not supported yet
+HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
+DO $$ BEGIN EXECUTE 'SELECT count(*) FROM t'; END $$;
+ERROR:  statements that span shard groups are not supported yet
+HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
+-- views and rules
+CREATE VIEW t_view AS SELECT * FROM t;
+SELECT count(*) FROM t_view;
+ERROR:  statements that span shard groups are not supported yet
+HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
+SELECT * FROM t_view WHERE id = :tl;
+ERROR:  statements that span shard groups are not supported yet
+HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
+CREATE RULE plain_to_t AS ON INSERT TO plain DO ALSO INSERT INTO t VALUES (NEW.x, 'rule');
+INSERT INTO plain VALUES (:tn);
+CREATE FUNCTION plain_trg() RETURNS trigger LANGUAGE plpgsql
+  AS $$ BEGIN PERFORM count(*) FROM t; RETURN NEW; END $$;
+CREATE TRIGGER plain_trg_i BEFORE INSERT ON plain FOR EACH ROW EXECUTE FUNCTION plain_trg();
+DROP RULE plain_to_t ON plain;
+INSERT INTO plain VALUES (1);
+ERROR:  statements that span shard groups are not supported yet
+HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
+-- cursors, CTAS, COPY, EXPLAIN ANALYZE, SELECT INTO
+BEGIN;
+DECLARE c1 CURSOR FOR SELECT * FROM t;
+ERROR:  statements that span shard groups are not supported yet
+HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
+ROLLBACK;
+BEGIN;
+DECLARE c2 CURSOR FOR SELECT * FROM t WHERE id = :tl;
+FETCH 1 FROM c2;
+ id |   v   
+----+-------
+  1 | row 1
+(1 row)
+
+ROLLBACK;
+CREATE TABLE ctas1 AS SELECT * FROM t;
+ERROR:  statements that span shard groups are not supported yet
+HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
+CREATE TABLE ctas2 AS SELECT * FROM t WHERE id = :tl;
+SELECT count(*) AS ctas2_rows FROM ctas2;
+ ctas2_rows 
+------------
+          1
+(1 row)
+
+SELECT * INTO ctas3 FROM t;
+ERROR:  statements that span shard groups are not supported yet
+HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
+COPY (SELECT * FROM t) TO stdout;
+ERROR:  statements that span shard groups are not supported yet
+HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
+COPY t TO stdout;
+ERROR:  cannot copy from partitioned table "t"
+HINT:  Try the COPY (SELECT ...) TO variant.
+COPY (SELECT id FROM t WHERE id = :tl) TO stdout;
+1
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT * FROM t;
+ERROR:  statements that span shard groups are not supported yet
+HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
+EXPLAIN (COSTS OFF) SELECT * FROM t WHERE id = :tr;
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Custom Scan (Kingres Remote Statement)
+   Node: group1.invalid:5432 (group 1, bucket 1)
+   Remote SQL: SELECT id, v FROM public.t WHERE (id = 3)
+(3 rows)
+
+-- prepared statements under every plan_cache_mode
+PREPARE p1 (int) AS SELECT v FROM t WHERE id = $1;
+EXECUTE p1(:tl);
+   v   
+-------
+ row 1
+(1 row)
+
+SET plan_cache_mode = force_custom_plan;
+EXECUTE p1(:tl);
+   v   
+-------
+ row 1
+(1 row)
+
+SET plan_cache_mode = force_generic_plan;
+EXECUTE p1(:tl);
+ERROR:  a generic plan cannot route a statement on distributed tables
+HINT:  Set plan_cache_mode to force_custom_plan or auto, so that parameter values are known when the statement is planned.
+SET plan_cache_mode = auto;
+EXECUTE p1(:tl);
+   v   
+-------
+ row 1
+(1 row)
+
+EXECUTE p1(:tl);
+   v   
+-------
+ row 1
+(1 row)
+
+EXECUTE p1(:tl);
+   v   
+-------
+ row 1
+(1 row)
+
+EXECUTE p1(:tl);
+   v   
+-------
+ row 1
+(1 row)
+
+EXECUTE p1(:tl);
+   v   
+-------
+ row 1
+(1 row)
+
+EXECUTE p1(:tl);
+   v   
+-------
+ row 1
+(1 row)
+
+EXECUTE p1(:tl);
+   v   
+-------
+ row 1
+(1 row)
+
+-- a parallel worker may not forward a statement
+CREATE FUNCTION t_par(k int) RETURNS bigint LANGUAGE plpgsql STABLE PARALLEL SAFE
+  AS $$ BEGIN RETURN (SELECT count(*) FROM t WHERE id = k); END $$;
+SET debug_parallel_query = on;
+SELECT t_par(:tl);
+ t_par 
+-------
+     1
+(1 row)
+
+SELECT t_par(:tr);
+ERROR:  a statement for another shard group cannot be forwarded from a parallel worker
+HINT:  Mark the function that runs the statement PARALLEL RESTRICTED or PARALLEL UNSAFE.
+RESET debug_parallel_query;
+-- SPI from C goes through the same hook: pg_catalog functions that run
+-- queries on their own are not distributed-table aware, so only the
+-- statements above matter.
+-- ---------------------------------------------------------------------------
+-- Finding 1: in a forwarded session a statement runs only if every bucket it
+-- can touch is local; otherwise KS001.  The flag is set by the connection
+-- options of a forwarded session and cannot be changed later.
+-- ---------------------------------------------------------------------------
+\c -reuse-previous=on "options='-c kingres_shard.forwarded=on'"
+SET search_path = public;
+SHOW kingres_shard.forwarded;
+ kingres_shard.forwarded 
+-------------------------
+ on
+(1 row)
+
+SELECT v FROM t WHERE id = :tl;
+   v   
+-------
+ row 1
+(1 row)
+
+SELECT * FROM t;
+ERROR:  cannot prove that the statement touches only buckets of this node
+DETAIL:  Distributed table public.t is not restricted to one bucket, and shard group 0 does not own every bucket of its colocation group.
+HINT:  A session opened by another node runs a statement locally only when every bucket the statement can touch is on this node.
+SELECT v FROM t WHERE id = :tr;
+ERROR:  bucket 1 of public.t is not on this node (stale map version 15)
+SELECT count(*) FROM t WHERE id = :tl OR id = :tr;
+ERROR:  cannot prove that the statement touches only buckets of this node
+DETAIL:  Distributed table public.t is not restricted to one bucket, and shard group 0 does not own every bucket of its colocation group.
+HINT:  A session opened by another node runs a statement locally only when every bucket the statement can touch is on this node.
+UPDATE t SET v = 'x';
+ERROR:  cannot prove that the statement touches only buckets of this node
+DETAIL:  Distributed table public.t is not restricted to one bucket, and shard group 0 does not own every bucket of its colocation group.
+HINT:  A session opened by another node runs a statement locally only when every bucket the statement can touch is on this node.
+DELETE FROM t;
+ERROR:  cannot prove that the statement touches only buckets of this node
+DETAIL:  Distributed table public.t is not restricted to one bucket, and shard group 0 does not own every bucket of its colocation group.
+HINT:  A session opened by another node runs a statement locally only when every bucket the statement can touch is on this node.
+INSERT INTO t VALUES (:tl + 1000, 'a'), (:tr + 1000, 'b');
+ERROR:  cannot prove that the statement touches only buckets of this node
+DETAIL:  Distributed table public.t is not restricted to one bucket, and shard group 0 does not own every bucket of its colocation group.
+HINT:  A session opened by another node runs a statement locally only when every bucket the statement can touch is on this node.
+SELECT count(*) FROM t, w WHERE t.id = :tl;
+ERROR:  cannot prove that the statement touches only buckets of this node
+DETAIL:  Distributed table public.w is not restricted to one bucket, and shard group 0 does not own every bucket of its colocation group.
+HINT:  A session opened by another node runs a statement locally only when every bucket the statement can touch is on this node.
+SELECT t_count();
+ERROR:  cannot prove that the statement touches only buckets of this node
+DETAIL:  Distributed table public.t is not restricted to one bucket, and shard group 0 does not own every bucket of its colocation group.
+HINT:  A session opened by another node runs a statement locally only when every bucket the statement can touch is on this node.
+SELECT * FROM t_by_id(:tl);
+ERROR:  cannot prove that the statement touches only buckets of this node
+DETAIL:  The planner expanded a SQL-language function that reads distributed table public.t.
+HINT:  A session opened by another node runs a statement locally only when every bucket the statement can touch is on this node.
+\set VERBOSITY sqlstate
+SELECT * FROM t;
+ERROR:  KS001
+\set VERBOSITY default
+SET kingres_shard.forwarded = off;
+ERROR:  parameter "kingres_shard.forwarded" cannot be set after connection start
+-- A forwarded session of a one-group cluster runs anything: every bucket is
+-- local.
+UPDATE kingres.bucket_map SET group_id = 0;
+DELETE FROM kingres.node WHERE node_id = 2;
+SELECT count(*) AS all_rows_local FROM t;
+ all_rows_local 
+----------------
+             21
+(1 row)
+
+SELECT count(*) AS all_rows_local_w FROM w WHERE name = :'wr' COLLATE ci;
+ all_rows_local_w 
+------------------
+                1
+(1 row)
+
+DROP VIEW t_view;
+DROP TABLE ctas2, plain;
+DROP FUNCTION t_count(), t_rows(), t_by_id(int), t_v(int), t_count_pl(),
+  t_one_pl(int), plain_trg(), t_par(int);
+DROP TABLE w, wc, t;
+DROP COLLATION ci;
+DROP EXTENSION kingres_shard;

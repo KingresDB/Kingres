@@ -1,0 +1,109 @@
+-- kingres.bucket_for() must return the partition PostgreSQL really stores a
+-- row in, for every supported key type.
+SET search_path = public;
+CREATE EXTENSION kingres_shard;
+
+INSERT INTO kingres.colocation VALUES
+  (1, 16, 'int4', 0),
+  (2, 16, 'int8', 0),
+  (3, 16, 'text', 100),
+  (4, 16, 'uuid', 0),
+  (5, 7, 'int4', 0),
+  (6, 16, 'date', 0),
+  (7, 16, 'varchar', 100);
+
+CREATE TABLE t_int4 (k int4) PARTITION BY HASH (k);
+CREATE TABLE t_int8 (k int8) PARTITION BY HASH (k);
+CREATE TABLE t_text (k text) PARTITION BY HASH (k);
+CREATE TABLE t_uuid (k uuid) PARTITION BY HASH (k);
+CREATE TABLE t_mod7 (k int4) PARTITION BY HASH (k);
+CREATE TABLE t_date (k date) PARTITION BY HASH (k);
+CREATE TABLE t_varchar (k varchar(20)) PARTITION BY HASH (k);
+
+DO $$
+DECLARE
+    t text;
+    i int;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['t_int4', 't_int8', 't_text', 't_uuid', 't_date', 't_varchar'] LOOP
+        FOR i IN 0..15 LOOP
+            EXECUTE format('CREATE TABLE %I PARTITION OF %I FOR VALUES WITH (MODULUS 16, REMAINDER %s)',
+                           t || '_b' || i, t, i);
+        END LOOP;
+    END LOOP;
+    FOR i IN 0..6 LOOP
+        EXECUTE format('CREATE TABLE %I PARTITION OF t_mod7 FOR VALUES WITH (MODULUS 7, REMAINDER %s)',
+                       't_mod7_b' || i, i);
+    END LOOP;
+END
+$$;
+
+INSERT INTO t_int4 SELECT g FROM generate_series(-300, 700) g;
+INSERT INTO t_int4 VALUES (NULL), (2147483647), (-2147483648);
+INSERT INTO t_int8 SELECT g * 1000003 FROM generate_series(-300, 700) g;
+INSERT INTO t_int8 VALUES (NULL), (9223372036854775807), (-9223372036854775808);
+INSERT INTO t_text SELECT 'key-' || g FROM generate_series(1, 1000) g;
+INSERT INTO t_text VALUES (NULL), (''), ('Caf' || chr(233)), ('long ' || repeat('x', 300));
+INSERT INTO t_uuid SELECT md5(g::text)::uuid FROM generate_series(1, 1000) g;
+INSERT INTO t_uuid VALUES (NULL), ('00000000-0000-0000-0000-000000000000');
+INSERT INTO t_mod7 SELECT g FROM generate_series(1, 700) g;
+INSERT INTO t_date SELECT date '2020-01-01' + g FROM generate_series(1, 700) g;
+INSERT INTO t_varchar SELECT 'v' || g FROM generate_series(1, 500) g;
+
+-- For every table: rows stored, rows whose partition differs from the bucket.
+SELECT 'int4' AS type, count(*) AS total,
+       count(*) FILTER (WHERE kingres.bucket_for(1, k) IS DISTINCT FROM
+                        substring(tableoid::regclass::text from '_b([0-9]+)$')::int) AS mismatches
+  FROM t_int4
+UNION ALL
+SELECT 'int8', count(*),
+       count(*) FILTER (WHERE kingres.bucket_for(2, k) IS DISTINCT FROM
+                        substring(tableoid::regclass::text from '_b([0-9]+)$')::int)
+  FROM t_int8
+UNION ALL
+SELECT 'text', count(*),
+       count(*) FILTER (WHERE kingres.bucket_for(3, k) IS DISTINCT FROM
+                        substring(tableoid::regclass::text from '_b([0-9]+)$')::int)
+  FROM t_text
+UNION ALL
+SELECT 'uuid', count(*),
+       count(*) FILTER (WHERE kingres.bucket_for(4, k) IS DISTINCT FROM
+                        substring(tableoid::regclass::text from '_b([0-9]+)$')::int)
+  FROM t_uuid
+UNION ALL
+SELECT 'int4 modulus 7', count(*),
+       count(*) FILTER (WHERE kingres.bucket_for(5, k) IS DISTINCT FROM
+                        substring(tableoid::regclass::text from '_b([0-9]+)$')::int)
+  FROM t_mod7
+UNION ALL
+SELECT 'date', count(*),
+       count(*) FILTER (WHERE kingres.bucket_for(6, k) IS DISTINCT FROM
+                        substring(tableoid::regclass::text from '_b([0-9]+)$')::int)
+  FROM t_date
+UNION ALL
+SELECT 'varchar', count(*),
+       count(*) FILTER (WHERE kingres.bucket_for(7, k) IS DISTINCT FROM
+                        substring(tableoid::regclass::text from '_b([0-9]+)$')::int)
+  FROM t_varchar;
+
+-- Every bucket is hit, so the check above is not vacuous.
+SELECT count(DISTINCT tableoid) AS int4_partitions_used FROM t_int4;
+SELECT count(DISTINCT tableoid) AS mod7_partitions_used FROM t_mod7;
+
+-- A NULL key is stored in bucket 0.
+SELECT kingres.bucket_for(1, NULL::int4) AS null_bucket,
+       (SELECT substring(tableoid::regclass::text from '_b([0-9]+)$')::int
+          FROM t_int4 WHERE k IS NULL) AS null_partition;
+
+-- Values of another integer type hash like the column type.
+SELECT kingres.bucket_for(2, 42::int4) = kingres.bucket_for(2, 42::int8) AS int4_value_for_int8_column,
+       kingres.bucket_for(1, 42::int8) = kingres.bucket_for(1, 42::int4) AS int8_value_for_int4_column,
+       kingres.bucket_for(3, 'x'::varchar) = kingres.bucket_for(3, 'x'::text) AS varchar_value_for_text_column;
+
+-- Errors.
+SELECT kingres.bucket_for(99, 1);
+SELECT kingres.bucket_for(1, 'text'::text);
+SELECT kingres.bucket_for('t_int4'::regclass, 1);
+
+DROP TABLE t_int4, t_int8, t_text, t_uuid, t_mod7, t_date, t_varchar;
+DROP EXTENSION kingres_shard;
