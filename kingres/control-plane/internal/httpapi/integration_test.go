@@ -118,7 +118,7 @@ func TestIntegrationRolesLimitAccess(t *testing.T) {
 	wantProblem(t, e.do(req{method: "POST", path: "/api/v1/servers", cookie: roCookie, body: map[string]any{},
 		header: map[string]string{"X-CSRF-Token": roCSRF}}), 403, "forbidden")
 	// ops may reach an ops operation (not implemented yet) but not an admin one.
-	wantProblem(t, e.do(req{method: "POST", path: "/api/v1/server-groups", cookie: opsCookie, body: map[string]any{},
+	wantProblem(t, e.do(req{method: "POST", path: "/api/v1/rebalance", cookie: opsCookie, body: map[string]any{},
 		header: map[string]string{"X-CSRF-Token": csrfOf(t, e, opsCookie)}}), 422, "unsupported_operation")
 	if w := e.do(req{method: "GET", path: "/api/v1/roles", cookie: adminCookie}); w.Code != 200 {
 		t.Errorf("admin /roles: %d", w.Code)

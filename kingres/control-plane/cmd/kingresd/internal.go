@@ -20,6 +20,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/leader"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/membership"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/monitor"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ops"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pki"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/serverinfo"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/setup"
@@ -43,6 +44,10 @@ type internalDeps struct {
 	forward func(ctx context.Context, peer string, req internalapi.ForwardRequest) (internalapi.ForwardResponse, error)
 	// receiver answers the membership calls.
 	receiver *membership.Receiver
+	// ops records the tasks of instance operations (nil: none); lastLeader is
+	// the leader known last, used while this server's instance is stopped.
+	ops        *ops.Ops
+	lastLeader *leaderMemory
 }
 
 // serveInternal serves the internal API with mutual TLS until ctx ends. A
@@ -84,11 +89,11 @@ func serveInternal(ctx context.Context, d internalDeps) {
 				InternalVersion: internalapi.Version, UptimeSeconds: int64(time.Since(d.started).Seconds())}
 		},
 		// The leader is the server holding the primary of shard group 0.
-		Leader:    d.leaders.Current,
+		Leader:    leaderOf(d),
 		Self:      me,
 		Forward:   d.forward,
 		Revoked:   d.svc.RevokedSerials,
-		Handle:    d.receiver.Handle,
+		Handle:    handleCall(d),
 		Bootstrap: d.receiver.Bootstrap,
 		Joining:   d.svc.Joining,
 		Resources: func(context.Context) (any, error) {
@@ -207,5 +212,36 @@ func runEngineOnLeader(ctx context.Context, eng *task.Engine, leaders *leader.Re
 		case <-ctx.Done():
 		case <-time.After(2 * time.Second):
 		}
+	}
+}
+
+// leaderOf is the leader the internal API authorizes with: the catalog's, and
+// while this server's instance is stopped on purpose (the catalog cannot be
+// read) the last one known.
+func leaderOf(d internalDeps) func() string {
+	return func() string {
+		if id := d.leaders.Current(); id != "" {
+			d.lastLeader.set(id)
+			return id
+		}
+		if d.ops != nil && d.ops.LocalInstanceDown() {
+			return d.lastLeader.get()
+		}
+		return ""
+	}
+}
+
+// handleCall routes the task calls of instance operations to the task code and
+// everything else to the membership receiver.
+func handleCall(d internalDeps) func(ctx context.Context, key, peer string, body []byte) (any, error) {
+	return func(ctx context.Context, key, peer string, body []byte) (any, error) {
+		switch key {
+		case "POST /task/record", "POST /task/settle", "POST /task/reserve":
+			if d.ops == nil {
+				return nil, &internalapi.CallError{Status: http.StatusNotImplemented, Code: "not_available", Message: "This server cannot record tasks."}
+			}
+			return d.ops.HandleTaskCall(ctx, key, body)
+		}
+		return d.receiver.Handle(ctx, key, peer, body)
 	}
 }

@@ -55,6 +55,10 @@ type Ops struct {
 	SessionEnder func(role string)
 	// Instances writes pg_hba.conf and reloads the local instance.
 	Instances InstanceControl
+	// Recorder writes the tasks of instance start and stop (PeerRecorder on a
+	// server that may not be the leader); nil records in this server's own task
+	// engine.
+	Recorder TaskRecorder
 	// Fanout reaches the other servers (nil: this server is alone) and Local is
 	// this server's cluster service, which applies roles and rules locally.
 	Fanout Fanout
@@ -69,6 +73,7 @@ type Ops struct {
 	engineP    atomic.Pointer[task.Engine]
 	wg         sync.WaitGroup
 	applyState applyState
+	life       lifecycle
 }
 
 // SetEngine installs the task engine once the system database exists.

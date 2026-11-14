@@ -44,16 +44,21 @@ func (s *Server) getCluster(_ *call, w http.ResponseWriter, r *http.Request) err
 	return nil
 }
 
-func (s *Server) listServers(_ *call, w http.ResponseWriter, r *http.Request) error {
+func (s *Server) listServers(c *call, w http.ResponseWriter, r *http.Request) error {
 	items, err := s.deps.Store.Servers(r.Context())
 	if err != nil {
 		return s.storeProblem(r, err, "")
 	}
+	ptrs := make([]*api.Server, len(items))
+	for i := range items {
+		ptrs[i] = &items[i]
+	}
+	s.completeServers(c, r, ptrs)
 	s.writeJSON(w, r, http.StatusOK, api.ServerList{Items: nonNil(items)})
 	return nil
 }
 
-func (s *Server) getServer(_ *call, w http.ResponseWriter, r *http.Request) error {
+func (s *Server) getServer(c *call, w http.ResponseWriter, r *http.Request) error {
 	pp := newParams(r)
 	id := pp.pathServerID("serverId")
 	if p := pp.err(); p != nil {
@@ -63,6 +68,7 @@ func (s *Server) getServer(_ *call, w http.ResponseWriter, r *http.Request) erro
 	if err != nil {
 		return s.storeProblem(r, err, "Server "+r.PathValue("serverId")+" does not exist.")
 	}
+	s.completeServers(c, r, []*api.Server{&srv.Server})
 	s.writeJSON(w, r, http.StatusOK, srv)
 	return nil
 }

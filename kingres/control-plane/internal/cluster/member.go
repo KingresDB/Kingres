@@ -364,7 +364,7 @@ func (s *Service) CreateInstance(ctx context.Context, req wire.CreateInstanceReq
 			mb = 512
 		}
 		settings, err := s.withTLS(instance.ManagedSettings{
-			Port: s.cfg.PGPort, ListenAddresses: s.cfg.PGListen, ClusterName: req.ClusterName,
+			Port: s.cfg.PGPort, ListenAddresses: s.cfg.PGListen, ClusterName: req.ClusterName, MemoryMegabytes: mb,
 			Extra: map[string]string{
 				"shared_buffers":       itoa(mb/4) + "MB",
 				"effective_cache_size": itoa(mb/2) + "MB",

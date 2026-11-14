@@ -1,3 +1,8 @@
+| `POST /internal/v1/leave-cluster` | any peer, answered only by the leader | a server asks to leave the cluster. The body is `{"actor": "<administrator>", "force": false}` and names no server: the server that leaves is the one named by the caller's certificate, so a server cannot ask for another's removal. The leader decides (404, 422 dead, 409 `last_server`, `server_hosts_map_group`, `server_owns_buckets`, `rebalance_in_progress`, `operation_in_progress`), starts the task `server.leave` and answers with it |
+| `POST /internal/v1/leave-status` | any peer, answered only by the leader | the state of the leave task whose subject is the caller (`{"taskId": n}`; a task of another server, of another kind or none is 404); the leaving server resets itself when it is done |
+| `POST /internal/v1/task/record` | any peer, answered only by the leader | a server records the task of one of its instance operations (`instance.start`, `instance.stop`, `instance.restart`, subject type `instance`, a numeric instance id, state `running`, `done` or `failed`, one to four steps, at most 1,024 bytes of input). With `id` the task is written under that id (a reserved or announced one; writing the same id again changes nothing), without it the leader assigns one. The answer is `{"id": n}`; `409 subject_busy` when the instance already has an unfinished task, `400` for anything outside these limits, `503 unavailable` when the leader cannot write it |
+| `POST /internal/v1/task/settle` | any peer, answered only by the leader | the end of a recorded task of those kinds (`id` required): state, steps, percent and error; a task of another kind is `400` |
+| `POST /internal/v1/task/reserve` | any peer, answered only by the leader | takes the next id of the task sequence for a task recorded later (the start that follows a stop); answer `{"id": n}` |
 | `POST /internal/v1/forward` | any peer, answered only by the leader | one operation of the public contract, run as the identity the forwarding server verified |
 | `POST /internal/v1/bootstrap/prepare` | setup token (no certificate) | the uninitialized server returns a certificate request for its own key |
 | `POST /internal/v1/bootstrap/install` | setup token (no certificate) | the uninitialized server stores its certificate and the CA certificate |
@@ -86,7 +91,7 @@ passed on).
 
 What the leader does with it: it looks the operation up by id (a path is never accepted), refuses an operation
 that is not leader-bound (sign-in and sign-out, setup, the operations on this very server, the query workbench,
-and reads other than listTasks, getTask, listAlerts and getClusterSettings), requires the path parameters to be
+and reads other than listTasks, getTask, listAlerts, getClusterSettings, listServerGroups, listServers (a follower asks for it to take the groups, fingerprints and certificate expiry of the servers from the leader's system database; the public listServers is answered locally), listLedgerVerifications and getLedgerVerification; createInclusionProof is not forwarded either), requires the path parameters to be
 exactly the operation's, rebuilds the URL from the contract's template with escaped values, checks the identity
 (user name, only the four cluster roles), and runs the request through the same pipeline as a public one: query
 validation, the role the operation requires (so a server cannot raise an identity's privileges beyond what it

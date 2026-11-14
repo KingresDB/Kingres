@@ -273,8 +273,14 @@ func TestResponsesValidateAgainstContract(t *testing.T) {
 		}
 	}
 	mutating["initCluster"] = true
+	for id := range e.srv.instanceHandlers() {
+		mutating[id] = true // validated in instance_test.go and by the end-to-end tests
+	}
 	for id := range e.srv.memberHandlers() {
 		mutating[id] = true
+	}
+	for id := range e.srv.serverGroupHandlers() {
+		mutating[id] = true // need the system database; validated in cmd/kingresd/servergroups_e2e_test.go
 	}
 	// Alerts and metrics need the system database and the sampler.
 	for id := range s2(e) {

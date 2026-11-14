@@ -90,11 +90,24 @@ var Calls = map[string]Policy{
 	"POST /node/finish":       LeaderOrJoining,
 	"POST /node/reset":        LeaderOrJoining,
 	"POST /apply":             LeaderOnly,
+
+	// Leaving the cluster (D5, mirror of removing a server): the leaving server
+	// asks the leader, which answers only for the caller named by the certificate.
+	"POST /leave-cluster": ToLeader,
+	"POST /leave-status":  ToLeader,
+
+	// Recording the task of an instance start or stop of the calling server (the
+	// system database is held by the leader).
+	"POST /task/record":  ToLeader,
+	"POST /task/settle":  ToLeader,
+	"POST /task/reserve": ToLeader,
 }
 
 // handled lists the calls dispatched to Backend.Handle (the rest have their
 // own code in ServeHTTP).
 var handled = map[string]bool{
+	"POST /task/record": true, "POST /task/settle": true, "POST /task/reserve": true,
+	"POST /leave-cluster": true, "POST /leave-status": true,
 	"POST /add-server": true, "GET /instance/status": true, "POST /instance/create": true, "POST /instance/start": true,
 	"POST /instance/stop": true, "POST /instance/remove": true, "POST /instance/trust": true, "POST /pki/install": true,
 	"POST /peers": true, "POST /globals/apply": true, "POST /node/finish": true, "POST /node/reset": true, "POST /apply": true,

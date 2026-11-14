@@ -24,7 +24,7 @@ func taskToAPI(t task.Task) api.Task {
 		ID: t.ID, Kind: t.Kind, State: string(t.State),
 		Progress:    api.TaskProgress{Percent: t.Percent, CurrentStep: current, Steps: steps},
 		Subject:     &api.TaskSubject{Type: t.SubjectType, ID: t.SubjectID},
-		Cancellable: t.State == task.Pending || t.State == task.Running,
+		Cancellable: task.Cancellable(t),
 		CreatedAt:   t.CreatedAt.UTC(), UpdatedAt: t.UpdatedAt.UTC(), CreatedBy: t.CreatedBy,
 	}
 	if t.Detail != "" {

@@ -18,7 +18,10 @@ authenticated operation lists 401, 403, 422 and 503; every operation with a requ
 from a request body has a `readOnly` property that is `required`; every `$ref` resolves; server ids are strings
 (`ServerId`); `AuditAction` consists of operation ids plus the closed list of non-operation events and covers every
 mutating operation; the default bucket count is 128 (1 to 4096); the durability levels map to
-`synchronous_commit` `local`, `on`, `remote_apply`. Run it after every change to the contract and in CI.
+`synchronous_commit` `local`, `on`, `remote_apply`; and the 0.4.0 rules listed in the script (409 on the stop, start,
+leave, remove, update-server, server-group and inclusion-proof operations, the new problem codes, the required and
+nullable `Server` properties, the members of `InclusionProof` and of the digest document, the required
+`NodeStateInfo.setupTask`, the closed update requests). Run it after every change to the contract and in CI.
 
 ## Conventions
 
@@ -60,6 +63,9 @@ mutating operation; the default bucket count is 128 (1 to 4096); the durability 
   need nothing the client cannot know.
 - **Updates**: `PATCH` is a partial update with `application/json`; nested objects are merged. `PUT` on a
   sub-resource replaces it (`memberships`, `cluster-roles`, `network-access`).
+- **Snake-case exception.** `InclusionProof` and `LedgerDigest.chains[].document` are the JSON documents of the
+  `kingres_ledger` extension and keep its snake_case member names, so that they can be handed to `kingres-verify`
+  unchanged. They are the only such exceptions.
 - **Request id.** Servers return `X-Request-Id`; it is copied into `Problem.requestId` and into audit events.
 
 ## Errors
@@ -75,10 +81,10 @@ plus the machine-readable `code` (enum `ProblemCode`). Clients must branch on `c
 | 403 | Missing cluster role, bad CSRF token, setup call from a non-permitted address | `forbidden`, `csrf_token_invalid` |
 | 404 | Unknown resource | `not_found` |
 | 405 | Known path, wrong method (transport level, `Allow` header) | `method_not_allowed` |
-| 409 | State conflict | `already_exists`, `immutable_field`, `rebalance_in_progress`, `operation_in_progress`, `task_not_cancellable`, `last_admin`, `role_in_use`, `optimistic_lock_failed`, `no_replica_available` |
+| 409 | State conflict | `already_exists`, `immutable_field`, `rebalance_in_progress`, `operation_in_progress`, `task_not_cancellable`, `last_admin`, `role_in_use`, `optimistic_lock_failed`, `no_replica_available`, `instance_already_running`, `instance_already_stopped`, `server_owns_buckets`, `server_hosts_map_group`, `last_server`, `server_group_not_empty`, `ledger_entry_pending` |
 | 422 | Well-formed but cannot be done | `unprocessable`, `sql_error`, `unsupported_operation`, `node_state_invalid` |
 | 429 | Rate limit on unauthenticated endpoints | `rate_limited` |
-| 503 | Cannot serve now | `node_uninitialized`, `map_group_unavailable`, `leader_unavailable`, `quorum_unavailable`, `service_unavailable` |
+| 503 | Cannot serve now | `node_uninitialized`, `map_group_unavailable`, `leader_unavailable`, `quorum_unavailable`, `service_unavailable`, `system_database_stopped` |
 
 Unexpected failures return 500 with `code: internal_error` (not listed per operation).
 
@@ -202,6 +208,35 @@ operation is recorded under that operation's id with `outcome` `denied` or `fail
 audited except `executeQuery`. The list is the closed enum `AuditAction`, which is also the type of the `action`
 filter of `GET /audit`.
 
+## Inclusion proofs and `kingres-verify`
+
+`POST /databases/{databaseName}/ledger/inclusion-proofs` answers with the proof document of
+`kingres.ledger_inclusion_proof` (see `contrib/kingres_ledger/README.md`, "Inclusion proof") unchanged, with one added
+member `shard_group_id` that the verifier ignores. The members are snake_case:
+
+```
+format, chain_id, relation (optional), table_id, ledger_txid, seq, op ("I"|"D"), row_hash,
+entry_index, entry_count, entry_path[hex], tx_root, user_name, tx_index, tx_path[hex],
+block {height, hash_version, prev_hash, tx_merkle_root, tx_count, closed_at_us, block_hash},
+chain [ {height, hash_version, prev_hash, tx_merkle_root, tx_count, closed_at_us, block_hash?} ... ],
+shard_group_id
+```
+
+The leaf of the row is `row_hash` (the entry leaf is derived from it, `seq`, `table_id` and `op`), the paths are lists of
+sibling hashes without left/right marks (the side follows from `entry_index` and `tx_index` in trees of `entry_count`
+and `block.tx_count` leaves), and the root of the proof is the `block_hash` of a digest of the same chain, reached
+through `chain`. There is no digest reference in the proof: the digest is chosen by the verifier and must come from
+outside the database (`generateLedgerDigest` returns it as `chains[].document`).
+
+```
+curl ... -X POST /api/v1/databases/shop/ledger/inclusion-proofs -d '{"schema":"app","table":"accounts","primaryKey":{"id":1}}' > proof.json
+kingres-verify proof --proof proof.json --digest digest.json --table-id 1 --row-hash <hash recomputed from your own copy of the row>
+```
+
+The request names the row by `schema`, `table` and the whole primary key; the server reads the row as the signed-in role,
+computes `ledger_row_hash` and asks for the proof (`ledgerTxId` selects a removed version of an updatable table,
+`op: D` proves its removal). A row that is not in a block yet answers 409 `ledger_entry_pending`.
+
 ## Design notes and assumptions
 
 Where the architecture document leaves something open, the simplest option was chosen:
@@ -242,11 +277,13 @@ Where the architecture document leaves something open, the simplest option was c
    (`/ledger/verifications/{id}`). Digest anchoring targets are modeled (`anchors[]`) but empty until anchoring
    exists (phase 7). Generating digests and verifying need `kingres_ops`; no operation can turn the ledger off.
 7. **Server groups** are named racks/zones, created and deleted via `/server-groups`; membership is set with
-   `PATCH /servers/{id}` (`serverGroup`). Deleting a non-empty group is 409.
+   `PATCH /servers/{id}` (`serverGroup`). Deleting a non-empty group is 409 `server_group_not_empty`; a duplicate
+   name is 409 `already_exists`; a name that breaks the pattern is 400.
 8. **Rebalance** has one cluster-wide lock (409 `rebalance_in_progress`). `maxConcurrentMoves` defaults to the
    cluster setting (4), range 1 to 64. The plan preview lists at most `moveLimit` moves and always reports totals.
-   Removing a server and changing replica count do not rebalance implicitly except that `DELETE /servers/{id}` runs
-   the drain rebalance as part of its own task. `GET /rebalance` reports `progress` only while a run is active and
+   Removing a server and changing replica count do not rebalance implicitly: `DELETE /servers/{id}` removes a server
+   that holds no buckets (409 `server_owns_buckets` otherwise); to empty one, set `shouldHaveShards: false` and run
+   `POST /rebalance` first. `GET /rebalance` reports `progress` only while a run is active and
    always `lastReport`, the nullable summary of the most recent finished, stopped or failed run.
 9. **Auto-failover** settings live in `/settings/cluster` (`enabled`, `timeoutSeconds` 1 to 3600 default 120,
    `maxCount` default 1, read-only `eventsSinceReset`). The counter is reset by a rebalance.
@@ -277,8 +314,10 @@ Where the architecture document leaves something open, the simplest option was c
 ### 0.4.0
 
 Revision written with the fourth increment of `kingresd` (design: `docs/design/control-plane-3.md`) and the fixes of
-the security review of 2026-11-14. Summary for the panel: 0 operations added (86 operations, 69 paths), 1 breaking
-change of a required role, 1 new required response property, 4 optional request properties.
+the security review of 2026-11-14. Summary for the panel: 0 operations added (86 operations, 69 paths), 7 breaking
+changes (1 required role, 4 response schemas with new required properties or a new shape, 2 changes of behaviour that were
+only described), 12 additive changes, 8 new problem codes. The revision number stays
+0.4.0 (not released yet). Not in this revision: the operations to revoke and renew a certificate.
 
 #### Breaking
 
@@ -290,13 +329,39 @@ change of a required role, 1 new required response property, 4 optional request 
    for example `Waiting for server db3, which cannot be reached (Create the database on server db3).` or the
    certificate fingerprint seen when a server was added. Existing clients that ignore unknown properties are
    unaffected; a client that validates strictly must accept it.
+3. **`Server` has three new required response properties** (`GET /servers`, `GET /servers/{id}`,
+   `PATCH /servers/{id}`): `certificateExpiresAt` (date-time or `null`: not available), `seenFingerprint` (64
+   lower-case hex characters or `null`: no first contact recorded, for example the server that created the cluster)
+   and `fingerprintPinned` (boolean; false whenever `seenFingerprint` is null). Clients that ignore unknown
+   properties are unaffected.
+4. **`InclusionProof` has a new shape** (nothing served it before: `createInclusionProof` answered 422
+   `unsupported_operation`, so no client can depend on the 0.3.0 shape). The old camelCase members `leafHash`,
+   `leafIndex`, `merklePath[] {hash, position}`, `transactionMerkleRoot`, `block` (`LedgerBlock`), `shardHeadPath`,
+   `aggregateHash`, `digestId`, `hashVersion`, `shardGroupId`, `ledgerTxId`, `primaryKey`, `schema`, `table` are
+   **removed**, with the schema `MerkleStep`: the extension's proof carries no leaf hash and no left/right positions
+   (the side follows from the index) and no aggregate path. The body is now exactly the document of
+   `kingres.ledger_inclusion_proof` with its snake_case members (`format`, `chain_id`, `relation`, `table_id`,
+   `ledger_txid`, `seq`, `op`, `row_hash`, `entry_index`, `entry_count`, `entry_path`, `tx_root`, `user_name`, `tx_index`,
+   `tx_path`, `block`, `chain`) plus one member `shard_group_id`; see "Inclusion proofs and `kingres-verify`" below.
+   New schema `LedgerProofBlockHeader`. The rule "`InclusionProof.op` is required and is `I` or `D`" still holds.
+5. **`LedgerDigest.chains[].document` is a new required response property**: the digest of that chain exactly as the
+   extension returned it (`chain_id`, `height`, `block_hash`, ...), which `kingres-verify --digest` needs and the
+   camelCase members do not hold.
+6. **`removeServer` no longer drains.** The 0.3.0 text said that the task marks the server `draining`, rebalances and
+   removes it. A server is removed only when it holds no bucket copy; otherwise 409 `server_owns_buckets`. To empty
+   a server: `PATCH` `shouldHaveShards: false`, `POST /rebalance`, then `DELETE`. (This is what the server did; the old
+   text was never implemented.) A `dead` server: 422 `node_state_invalid`.
+7. **`leaveCluster` refuses a server that holds any bucket copy** (was: only the sole holder of a bucket), the same
+   rule as `removeServer`; `force` no longer skips the three conflict checks, only the requirement that the rest of
+   the cluster is reachable.
 
 #### Additive
 
 1. **`JoinClusterRequest.expectedFingerprint` and `AddServerRequest.expectedFingerprint`** (optional string, SHA-256
    hex, colons allowed): pins the certificate of the other server on first contact. The header
    `X-Kingres-Pin-Sha256` of 0.3.0 still works; if both are given they must agree (400 otherwise). The seen
-   fingerprint is in `Task.detail` of `server.add` and in the audit event (`fingerprintPinned`).
+   fingerprint is in `Task.detail` of `server.add`, in the audit event (`fingerprintPinned`) and now in
+   `Server.seenFingerprint`.
 2. **Internal address convention** (stated in the descriptions of both requests): the internal API of a server is at
    its REST host and the port above its REST port. There is no `internalAddress` field.
 3. **`TaskKind`** gains `replicate.apply` (see "Task kinds and subjects"; it was already used in 0.3.0 but hidden
@@ -307,20 +372,68 @@ change of a required role, 1 new required response property, 4 optional request 
 6. **`LedgerVerification.taskId`** is nullable (a verification recorded by the extension without a task).
 7. **`QueryResult.truncated`** is also `true` when the byte budget of the result (16 MiB) is reached, not only
    when `rowLimit` is; a single value larger than 1 MiB makes the statement fail with 422 `unprocessable`.
+8. **`ProblemCode`** gains `instance_already_running`, `instance_already_stopped`, `server_owns_buckets`,
+   `server_hosts_map_group`, `last_server`, `server_group_not_empty`, `ledger_entry_pending` (all 409) and
+   `system_database_stopped` (503). The enum description and the `Conflict` response list which operation answers
+   which.
+9. **409 `Conflict` is now listed by `updateServer` and `createInclusionProof`** (the other operations of the
+   conflict list had it already).
+10. **`LedgerInconsistency.kind`** gains `other` (a check of the extension with no kind of its own; `detail` starts
+    with the check name).
+11. **`ServerUpdateRequest`, `LocalSettingsUpdate` and `InclusionProofRequest` are closed**
+    (`additionalProperties: false`): a member that is not listed is 400 `validation_failed`. Stated so that the
+    server's refusal is specified; no client could send another member meaningfully.
+12. **`InclusionProofRequest`**: `ledgerTxId` now means the transaction that removed a version (required for
+    `op: D`), and `schema`, `table` have length limits. The member names are those of 0.3.0.
 
 #### Documentation
 
 1. `info.version` 0.4.0.
 2. `TableClass`: **`plain` is never combined with another class** (a plain table with a ledger is `[ledger]`).
-3. `removeServer`, `createInclusionProof`, server groups, certificate operations and the other items planned for
-   0.4.0 are **not in this revision**; they answer `unsupported_operation` as before. See the server README, "Not done".
-4. Role changes (`createRole`, `updateRole`, `deleteRole`, `setRoleMemberships`, `setRoleClusterRoles`) end the
+3. Role changes (`createRole`, `updateRole`, `deleteRole`, `setRoleMemberships`, `setRoleClusterRoles`) end the
    sessions and tokens of the changed role on every server at once; a role that is dropped, disabled or expired is
    refused on its next request (401); cluster roles are re-derived on every request (cache of 3 seconds).
    Membership in `pg_*` roles other than the harmless monitoring ones, and in roles with the SUPERUSER,
    REPLICATION or BYPASSRLS attribute, is refused with 400 `validation_failed`; the query workbench answers 403 for
    a role that has such an attribute or a membership giving access to server files, programs or logs.
    User names with control characters are refused by `login` with 400.
+4. **Stopping the instance that hosts the system database** (decision: allowed, no flag). `stopThisServerInstance`
+   accepts it; the API keeps answering from the process; every authenticated operation except
+   `startThisServerInstance`, and `login`, answers 503 `system_database_stopped` until the instance is started;
+   `startThisServerInstance` works from the in-memory session with the roles of the last successful check;
+   `getHealth`, `getReadiness`, `getNodeState` keep answering; the stop task is recorded `done` just before the
+   shutdown. Also stated: 409 `instance_already_stopped`, `instance_already_running`, `operation_in_progress` and
+   `no_replica_available` (`force` overrides only the last one) on start, stop and restart.
+5. **`leaveCluster` and `removeServer` conflicts** (409, checked in this order): `last_server`,
+   `server_hosts_map_group` (an instance of shard group 0 on the server), `server_owns_buckets`, then
+   `rebalance_in_progress` and `operation_in_progress`; `removeServer` answers 404 for an unknown server and 422
+   `node_state_invalid` for a `dead` one.
+6. **`updateServer`**: only `serverGroup` and `shouldHaveShards` can change; everything else is read-only (400);
+   an empty body is 400; an equal value is a no-op 200; an unknown group is 422 `unprocessable` (`/serverGroup`);
+   409 `operation_in_progress` while the server is being added, removed or left; 409 `rebalance_in_progress` while
+   a rebalance runs.
+7. **Server groups.** `createServerGroup`: duplicate name 409 `already_exists` (case-sensitive), pattern or length
+   violation 400 `validation_failed`. `deleteServerGroup`: unknown group 404, group with servers 409
+   `server_group_not_empty` (`detail` lists the ids); nothing changes on a refusal.
+8. **Local settings.** `getThisServerSettings`: `restartRequired` is a persistent state until the instances are
+   restarted. `updateThisServerSettings`: partial update of `memoryQuota`, `logLevel`, `logDirectory`; `logLevel`
+   never needs a restart, the other two do (`restartRequired: true` in the response); an unknown or immutable
+   member is 400; a quota the machine cannot hold or a log directory that is not an absolute existing writable
+   directory is 422 `unprocessable`; the operation is local.
+9. **Ledger verifications.** `listLedgerVerifications`: newest first, cursor paging as for every large list, bad
+   cursor 400, `items: []` for a database without verifications; only finished runs have an id (a run in progress
+   is followed through its task). `getLedgerVerification`: at most 100 inconsistencies, 404 for another
+   database's run. `LedgerVerification`: the id is the control plane's; the extension's `clean`, `problems` and
+   `failed` map to `passed`, `failed` and `failed`; `scope` is derived from the start height; `taskId` is the
+   `ledger.verify` task that recorded the run and is never null for a run started with `startLedgerVerification`.
+10. **`createInclusionProof`**: how the row is found (as the signed-in role, by full primary key; removed versions
+    by the history row's `ledger_txid`, readable by the table owner only), the refusals (404, 403, 422, 409
+    `ledger_entry_pending`) and the `kingres-verify` recipe; see "Inclusion proofs and `kingres-verify`".
+11. `NodeStateInfo.setupTask` and `SetupTaskSummary` were specified in 0.2.0 and 0.3.0 and are unchanged; the server
+    must emit them (see "Setup flow"). The check script now guards that `setupTask` is required.
+12. The items that an earlier draft of this revision listed as "not in this revision" (`removeServer`,
+    `createInclusionProof`, server groups) are specified now. Still not in this revision: the operations to revoke
+    and renew a certificate; they do not exist in the contract.
 
 ### 0.3.0
 

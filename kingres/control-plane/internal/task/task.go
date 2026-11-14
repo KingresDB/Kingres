@@ -63,6 +63,9 @@ const (
 	CodeCanceled          = "cancelled"
 	CodeSecretUnavailable = "secret_unavailable"
 	CodeUnknownKind       = "unknown_kind"
+	// CodeStepInterrupted means a NonIdempotent step had started when the
+	// previous run ended, so whether its effect happened is unknown.
+	CodeStepInterrupted = "step_interrupted"
 )
 
 // Task is a persisted task.
@@ -164,6 +167,13 @@ type Step struct {
 	Name string
 	// Irreversible steps say so; cancellation never undoes a finished step.
 	Irreversible bool
+	// NonIdempotent marks a step that must never run twice. The engine
+	// records the step as running before it calls Run; when a later run finds
+	// that record (the leader died or lost its lease after the step started,
+	// so the outcome is unknown) it does not run the step again but fails the
+	// task with CodeStepInterrupted. Steps without the mark are at-least-once:
+	// they run again.
+	NonIdempotent bool
 	// NeedsSecret names a secret the step needs; when it is missing the task
 	// fails with CodeSecretUnavailable instead of running the step.
 	NeedsSecret string
@@ -232,6 +242,7 @@ type Engine struct {
 	now     func() time.Time
 	log     *slog.Logger
 	tries   int
+	faultFn FaultFunc
 }
 
 // Options configure an Engine.
@@ -247,12 +258,15 @@ type Options struct {
 	// StoreTries is how many times a store write is tried, one second apart
 	// (default 30).
 	StoreTries int
+	// Fault, when set, is called at the named crash points (see FaultFunc).
+	// Production code leaves it nil; the crash-injection tests set it.
+	Fault FaultFunc
 }
 
 // NewEngine builds an engine. Definitions must have at least one step each.
 func NewEngine(s Store, defs []Definition, o Options) (*Engine, error) {
 	e := &Engine{store: s, defs: map[string]Definition{}, holder: o.Holder, lease: o.Lease, poll: o.Poll,
-		now: o.Now, log: o.Logger, tries: o.StoreTries}
+		now: o.Now, log: o.Logger, tries: o.StoreTries, faultFn: o.Fault}
 	if e.holder == "" {
 		return nil, errors.New("task: a holder id is required")
 	}
@@ -351,6 +365,9 @@ func (e *Engine) Run(ctx context.Context) {
 
 // Cancel asks for the cancellation of a task (between steps).
 func (e *Engine) Cancel(ctx context.Context, id int64) error {
+	if t, err := e.store.Get(ctx, id); err == nil && recordedKinds[t.Kind] {
+		return ErrNotCancellable // written by its owner, not run by the engine
+	}
 	return e.store.RequestCancel(ctx, id, e.now())
 }
 
@@ -386,6 +403,11 @@ func (e *Engine) run(ctx context.Context, t Task, secrets map[string]string) err
 			return runCtx.Err() // lease lost or shutdown: the next leader resumes here
 		}
 		st := def.Steps[i]
+		if st.NonIdempotent && i < len(t.Steps) && t.Steps[i].State == StepRunning {
+			return e.fail(ctx, t, i, st, &Error{Code: CodeStepInterrupted, Step: st.Name, Retryable: false,
+				Message: "The step was interrupted after it started and must not run twice, so it is unknown whether it took effect. Check the result and submit the task again if needed."})
+		}
+		e.fault(FaultBeforeStep, t.ID, i)
 		if st.NeedsSecret != "" {
 			if _, have := secrets[st.NeedsSecret]; !have {
 				return e.fail(ctx, t, i, st, &Error{Code: CodeSecretUnavailable, Step: st.Name, Retryable: false,
@@ -397,6 +419,7 @@ func (e *Engine) run(ctx context.Context, t Task, secrets map[string]string) err
 		} else if cancelReq {
 			return e.cancelTask(ctx, t, def, i)
 		}
+		e.fault(FaultStepStarted, t.ID, i)
 		if err := st.Run(runCtx, env); err != nil {
 			if runCtx.Err() != nil && ctx.Err() == nil {
 				return ErrLeaseLost
@@ -406,15 +429,20 @@ func (e *Engine) run(ctx context.Context, t Task, secrets map[string]string) err
 			}
 			return e.fail(ctx, t, i, st, &Error{Code: CodeStepFailed, Step: st.Name, Retryable: true, Message: clip(err.Error())})
 		}
+		e.fault(FaultStepRan, t.ID, i)
 		cancelReq, err := e.setStep(ctx, t.ID, e.holder, i, StepDone, percent(i+1, len(def.Steps)), e.now())
 		if err != nil {
 			return err
 		}
+		e.fault(FaultStepRecorded, t.ID, i)
 		if cancelReq && i+1 < len(def.Steps) {
 			return e.cancelTask(ctx, t, def, i+1)
 		}
 	}
-	return e.finish(ctx, t, Done, nil)
+	e.fault(FaultBeforeFinish, t.ID, len(def.Steps))
+	err = e.finish(ctx, t, Done, nil)
+	e.fault(FaultAfterFinish, t.ID, len(def.Steps))
+	return err
 }
 
 func (e *Engine) renewLoop(ctx context.Context, cancel context.CancelFunc, id int64) {
@@ -425,6 +453,7 @@ func (e *Engine) renewLoop(ctx context.Context, cancel context.CancelFunc, id in
 		case <-ctx.Done():
 			return
 		case <-tick.C:
+			e.fault(FaultLeaseRenew, id, -1)
 			if err := e.store.Renew(ctx, id, e.holder, e.now(), e.lease); err != nil {
 				if errors.Is(err, ErrLeaseLost) || errors.Is(err, ErrNotFound) {
 					e.log.Warn("task lease lost", "task", id)

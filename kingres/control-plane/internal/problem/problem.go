@@ -25,37 +25,45 @@ type Code string
 
 // The problem codes of the contract (schema ProblemCode).
 const (
-	BadRequest          Code = "bad_request"
-	ValidationFailed    Code = "validation_failed"
-	Unauthenticated     Code = "unauthenticated"
-	InvalidCredentials  Code = "invalid_credentials"
-	SessionExpired      Code = "session_expired"
-	CSRFTokenInvalid    Code = "csrf_token_invalid"
-	Forbidden           Code = "forbidden"
-	SetupTokenInvalid   Code = "setup_token_invalid"
-	NotFound            Code = "not_found"
-	MethodNotAllowed    Code = "method_not_allowed"
-	Conflict            Code = "conflict"
-	AlreadyExists       Code = "already_exists"
-	ImmutableField      Code = "immutable_field"
-	RebalanceInProgress Code = "rebalance_in_progress"
-	OperationInProgress Code = "operation_in_progress"
-	TaskNotCancellable  Code = "task_not_cancellable"
-	LastAdmin           Code = "last_admin"
-	RoleInUse           Code = "role_in_use"
-	OptimisticLockFail  Code = "optimistic_lock_failed"
-	NoReplicaAvailable  Code = "no_replica_available"
-	QuorumUnavailable   Code = "quorum_unavailable"
-	Unprocessable       Code = "unprocessable"
-	SQLError            Code = "sql_error"
-	UnsupportedOp       Code = "unsupported_operation"
-	NodeStateInvalid    Code = "node_state_invalid"
-	NodeUninitialized   Code = "node_uninitialized"
-	MapGroupUnavailable Code = "map_group_unavailable"
-	LeaderUnavailable   Code = "leader_unavailable"
-	RateLimited         Code = "rate_limited"
-	ServiceUnavailable  Code = "service_unavailable"
-	InternalError       Code = "internal_error"
+	BadRequest             Code = "bad_request"
+	ValidationFailed       Code = "validation_failed"
+	Unauthenticated        Code = "unauthenticated"
+	InvalidCredentials     Code = "invalid_credentials"
+	SessionExpired         Code = "session_expired"
+	CSRFTokenInvalid       Code = "csrf_token_invalid"
+	Forbidden              Code = "forbidden"
+	SetupTokenInvalid      Code = "setup_token_invalid"
+	NotFound               Code = "not_found"
+	MethodNotAllowed       Code = "method_not_allowed"
+	Conflict               Code = "conflict"
+	AlreadyExists          Code = "already_exists"
+	ImmutableField         Code = "immutable_field"
+	RebalanceInProgress    Code = "rebalance_in_progress"
+	OperationInProgress    Code = "operation_in_progress"
+	TaskNotCancellable     Code = "task_not_cancellable"
+	LastAdmin              Code = "last_admin"
+	ServerOwnsBuckets      Code = "server_owns_buckets"
+	ServerHostsMapGroup    Code = "server_hosts_map_group"
+	LastServer             Code = "last_server"
+	RoleInUse              Code = "role_in_use"
+	OptimisticLockFail     Code = "optimistic_lock_failed"
+	NoReplicaAvailable     Code = "no_replica_available"
+	InstanceAlreadyRunning Code = "instance_already_running"
+	InstanceAlreadyStopped Code = "instance_already_stopped"
+	SystemDatabaseStopped  Code = "system_database_stopped"
+	LedgerEntryPending     Code = "ledger_entry_pending"
+	QuorumUnavailable      Code = "quorum_unavailable"
+	ServerGroupNotEmpty    Code = "server_group_not_empty"
+	Unprocessable          Code = "unprocessable"
+	SQLError               Code = "sql_error"
+	UnsupportedOp          Code = "unsupported_operation"
+	NodeStateInvalid       Code = "node_state_invalid"
+	NodeUninitialized      Code = "node_uninitialized"
+	MapGroupUnavailable    Code = "map_group_unavailable"
+	LeaderUnavailable      Code = "leader_unavailable"
+	RateLimited            Code = "rate_limited"
+	ServiceUnavailable     Code = "service_unavailable"
+	InternalError          Code = "internal_error"
 )
 
 // FieldError is one entry of the "errors" extension (schema ValidationIssue).
@@ -114,37 +122,45 @@ var specs = map[Code]struct {
 	title  string
 	slug   string
 }{
-	BadRequest:          {400, "Bad request", "bad-request"},
-	ValidationFailed:    {400, "Validation failed", "validation-failed"},
-	Unauthenticated:     {401, "Authentication required", "unauthenticated"},
-	InvalidCredentials:  {401, "Invalid credentials", "invalid-credentials"},
-	SessionExpired:      {401, "Session expired", "session-expired"},
-	SetupTokenInvalid:   {401, "Setup token invalid", "setup-token-invalid"},
-	CSRFTokenInvalid:    {403, "CSRF token invalid", "csrf-token-invalid"},
-	Forbidden:           {403, "Forbidden", "forbidden"},
-	NotFound:            {404, "Not found", "not-found"},
-	MethodNotAllowed:    {405, "Method not allowed", "method-not-allowed"},
-	Conflict:            {409, "Conflict", "conflict"},
-	AlreadyExists:       {409, "Already exists", "already-exists"},
-	ImmutableField:      {409, "Immutable field", "immutable-field"},
-	RebalanceInProgress: {409, "Rebalance in progress", "rebalance-in-progress"},
-	OperationInProgress: {409, "Operation in progress", "operation-in-progress"},
-	TaskNotCancellable:  {409, "Task not cancellable", "task-not-cancellable"},
-	LastAdmin:           {409, "Last administrator", "last-admin"},
-	RoleInUse:           {409, "Role in use", "role-in-use"},
-	OptimisticLockFail:  {409, "Optimistic lock failed", "optimistic-lock-failed"},
-	NoReplicaAvailable:  {409, "No replica available", "no-replica-available"},
-	Unprocessable:       {422, "Unprocessable request", "unprocessable"},
-	SQLError:            {422, "SQL error", "sql-error"},
-	UnsupportedOp:       {422, "Operation not supported yet", "unsupported-operation"},
-	NodeStateInvalid:    {422, "Invalid node state", "node-state-invalid"},
-	RateLimited:         {429, "Too many requests", "rate-limited"},
-	NodeUninitialized:   {503, "Node uninitialized", "node-uninitialized"},
-	MapGroupUnavailable: {503, "Map group unavailable", "map-group-unavailable"},
-	LeaderUnavailable:   {503, "Leader unavailable", "leader-unavailable"},
-	QuorumUnavailable:   {503, "Quorum unavailable", "quorum-unavailable"},
-	ServiceUnavailable:  {503, "Service unavailable", "service-unavailable"},
-	InternalError:       {500, "Internal error", "internal-error"},
+	BadRequest:             {400, "Bad request", "bad-request"},
+	ValidationFailed:       {400, "Validation failed", "validation-failed"},
+	Unauthenticated:        {401, "Authentication required", "unauthenticated"},
+	InvalidCredentials:     {401, "Invalid credentials", "invalid-credentials"},
+	SessionExpired:         {401, "Session expired", "session-expired"},
+	SetupTokenInvalid:      {401, "Setup token invalid", "setup-token-invalid"},
+	CSRFTokenInvalid:       {403, "CSRF token invalid", "csrf-token-invalid"},
+	Forbidden:              {403, "Forbidden", "forbidden"},
+	NotFound:               {404, "Not found", "not-found"},
+	MethodNotAllowed:       {405, "Method not allowed", "method-not-allowed"},
+	Conflict:               {409, "Conflict", "conflict"},
+	AlreadyExists:          {409, "Already exists", "already-exists"},
+	ImmutableField:         {409, "Immutable field", "immutable-field"},
+	RebalanceInProgress:    {409, "Rebalance in progress", "rebalance-in-progress"},
+	OperationInProgress:    {409, "Operation in progress", "operation-in-progress"},
+	TaskNotCancellable:     {409, "Task not cancellable", "task-not-cancellable"},
+	LastAdmin:              {409, "Last administrator", "last-admin"},
+	ServerOwnsBuckets:      {409, "Server owns buckets", "server-owns-buckets"},
+	ServerHostsMapGroup:    {409, "Server hosts the map group", "server-hosts-map-group"},
+	LastServer:             {409, "Last server", "last-server"},
+	RoleInUse:              {409, "Role in use", "role-in-use"},
+	OptimisticLockFail:     {409, "Optimistic lock failed", "optimistic-lock-failed"},
+	NoReplicaAvailable:     {409, "No replica available", "no-replica-available"},
+	InstanceAlreadyRunning: {409, "Instance already running", "instance-already-running"},
+	InstanceAlreadyStopped: {409, "Instance already stopped", "instance-already-stopped"},
+	SystemDatabaseStopped:  {503, "System database stopped", "system-database-stopped"},
+	LedgerEntryPending:     {409, "Ledger entry pending", "ledger-entry-pending"},
+	ServerGroupNotEmpty:    {409, "Server group not empty", "server-group-not-empty"},
+	Unprocessable:          {422, "Unprocessable request", "unprocessable"},
+	SQLError:               {422, "SQL error", "sql-error"},
+	UnsupportedOp:          {422, "Operation not supported yet", "unsupported-operation"},
+	NodeStateInvalid:       {422, "Invalid node state", "node-state-invalid"},
+	RateLimited:            {429, "Too many requests", "rate-limited"},
+	NodeUninitialized:      {503, "Node uninitialized", "node-uninitialized"},
+	MapGroupUnavailable:    {503, "Map group unavailable", "map-group-unavailable"},
+	LeaderUnavailable:      {503, "Leader unavailable", "leader-unavailable"},
+	QuorumUnavailable:      {503, "Quorum unavailable", "quorum-unavailable"},
+	ServiceUnavailable:     {503, "Service unavailable", "service-unavailable"},
+	InternalError:          {500, "Internal error", "internal-error"},
 }
 
 // New returns a Problem for the code with the standard status, title and

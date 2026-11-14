@@ -12,10 +12,11 @@ import (
 
 func testFS() fstest.MapFS {
 	return fstest.MapFS{
-		"index.html":       {Data: []byte("<html>panel</html>")},
-		"assets/app.js":    {Data: []byte("console.log(1)")},
-		"favicon.ico":      {Data: []byte("ico")},
-		"deep/page/x.html": {Data: []byte("x")},
+		"index.html":             {Data: []byte("<html>panel</html>")},
+		"assets/app-Ab3dEf9x.js": {Data: []byte("console.log(1)")},
+		"assets/app.js":          {Data: []byte("console.log(1)")},
+		"favicon.ico":            {Data: []byte("ico")},
+		"deep/page/x.html":       {Data: []byte("x")},
 	}
 }
 
@@ -36,7 +37,8 @@ func TestSPAFallbackAndFiles(t *testing.T) {
 		{"/", 200, "panel", "no-cache"},
 		{"/databases", 200, "panel", "no-cache"},
 		{"/databases/shop/tables", 200, "panel", "no-cache"},
-		{"/assets/app.js", 200, "console.log", "immutable"},
+		{"/assets/app-Ab3dEf9x.js", 200, "console.log", "immutable"},
+		{"/assets/app.js", 200, "console.log", "no-cache"},
 		{"/favicon.ico", 200, "ico", "no-cache"},
 		{"/assets/missing.js", 404, "not_found", ""},
 		{"/missing.css", 404, "not_found", ""},

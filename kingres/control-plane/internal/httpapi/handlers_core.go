@@ -27,7 +27,13 @@ func (s *Server) handlers() map[string]handlerFunc {
 	for k, v := range s.monitorHandlers() {
 		m[k] = v
 	}
+	for k, v := range s.serverGroupHandlers() {
+		m[k] = v
+	}
 	for k, v := range s.serverHandlers() {
+		m[k] = v
+	}
+	for k, v := range s.instanceHandlers() {
 		m[k] = v
 	}
 	for k, v := range s.coreHandlers() {
@@ -106,7 +112,11 @@ func (s *Server) getReadiness(_ *call, w http.ResponseWriter, r *http.Request) e
 		s.log.Warn("readiness: local PostgreSQL check failed", "request_id", stateOf(r).id, "error", err)
 		check.OK, check.Detail = false, "the local PostgreSQL instance is not reachable"
 	}
-	if !check.OK && state != setup.Uninitialized {
+	if !check.OK && s.deps.Ops != nil && s.deps.Ops.LocalInstanceDown() {
+		// Stopped on purpose (stopThisServerInstance): this process still serves the
+		// start of the instance and answers the probes, so it stays ready.
+		check.Detail = "the instance was stopped with stopThisServerInstance"
+	} else if !check.OK && state != setup.Uninitialized {
 		return problem.New(problem.ServiceUnavailable, "The local PostgreSQL instance is not reachable.").WithRetryAfter(5)
 	}
 	s.writeJSON(w, r, http.StatusOK, api.ReadinessStatus{
@@ -286,10 +296,7 @@ func (s *Server) login(c *call, w http.ResponseWriter, r *http.Request) error {
 		out.Token = &tokenCred
 	}
 	s.loginUser.Reset(userKey)
-	http.SetCookie(w, &http.Cookie{
-		Name: CookieName, Value: cookieCred, Path: "/api/v1", Expires: sess.ExpiresAt, MaxAge: int(s.deps.SessionTTL.Seconds()),
-		HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode,
-	})
+	http.SetCookie(w, s.sessionCookie(cookieCred, sess.ExpiresAt, int(s.deps.SessionTTL.Seconds())))
 	ev.Action, ev.Outcome = "login", audit.OutcomeSuccess
 	s.writeJSON(w, r, http.StatusOK, out)
 	return nil
@@ -307,10 +314,7 @@ func (s *Server) sessionProblem(r *http.Request, err error) *problem.Problem {
 // clears the cookie.
 func (s *Server) logout(c *call, w http.ResponseWriter, _ *http.Request) error {
 	s.deps.Sessions.Revoke(c.credential)
-	http.SetCookie(w, &http.Cookie{
-		Name: CookieName, Value: "", Path: "/api/v1", MaxAge: -1,
-		HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode,
-	})
+	http.SetCookie(w, s.sessionCookie("", time.Time{}, -1))
 	w.WriteHeader(http.StatusNoContent)
 	return nil
 }

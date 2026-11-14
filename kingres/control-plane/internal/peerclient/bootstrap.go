@@ -89,7 +89,7 @@ func BootstrapCall(ctx context.Context, addr, expected, method, path string, hea
 	if resp.StatusCode/100 != 2 {
 		var pe struct{ Error, Message string }
 		_ = json.Unmarshal(data, &pe)
-		return seen, &APIError{Status: resp.StatusCode, Code: pe.Error, Message: pe.Message}
+		return seen, &APIError{Status: resp.StatusCode, Code: peerText(pe.Error, 64), Message: peerText(pe.Message, MaxPeerText)}
 	}
 	if out != nil {
 		if err := json.Unmarshal(data, out); err != nil {

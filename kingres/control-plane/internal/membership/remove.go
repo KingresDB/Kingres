@@ -24,52 +24,27 @@ type removeInput struct {
 // ownsBuckets reports whether a server holds buckets (or a copy of them) in
 // any sharded database, naming the first database that does.
 func (m *Manager) ownsBuckets(ctx context.Context, server string) (bool, string, error) {
-	dbs, err := m.shardedDatabases(ctx)
-	if err != nil {
+	h, err := m.holds(ctx, server)
+	if err != nil || len(h) == 0 {
 		return false, "", err
 	}
-	for _, db := range dbs {
-		c, err := m.Svc.ServiceConn(ctx, db)
-		if err != nil {
-			return false, "", err
-		}
-		var n int
-		err = c.QueryRow(ctx, `SELECT count(*) FROM kingres.bucket_map b
-			WHERE b.group_id IN (SELECT n.group_id FROM kingres.node n WHERE n.host = $1)`, server).Scan(&n)
-		_ = c.Close(context.WithoutCancel(ctx))
-		if err != nil {
-			return false, "", err
-		}
-		if n > 0 {
-			return true, db, nil
-		}
-	}
-	return false, "", nil
+	return true, h[0].DB, nil
 }
 
 // RemoveServer is DELETE /servers/{id} on the leader (design D5): only a server
-// that owns no buckets in any database, and not the server of the map group.
+// that owns no buckets in any database, and does not host the map group. The
+// refusals and their order are decideRemoval's, the contract's.
 func (m *Manager) RemoveServer(ctx context.Context, actor, id string) (task.Task, error) {
-	row, err := m.getServer(ctx, id)
-	if errors.Is(err, errNoServer) || (err == nil && row.Status == StatusPending) {
-		return task.Task{}, problem.New(problem.NotFound, fmt.Sprintf("Server %q does not exist.", id))
-	}
+	f, err := m.leaderFacts(ctx, id)
 	if err != nil {
-		return task.Task{}, err
+		m.log().Warn("reading the catalog for a removal failed", "server", id, "error", err)
+		return task.Task{}, problem.New(problem.ServiceUnavailable, "The catalog cannot be read now.").WithRetryAfter(5)
 	}
-	if id == m.Self {
-		return task.Task{}, conflictProblem("This server holds the primary of the map group (the manager leader) and cannot be removed.")
+	if l, lerr := m.Leaders.Get(ctx); id == m.Self || (lerr == nil && l == id) {
+		f.HostsMapGroup = true
 	}
-	if l, lerr := m.Leaders.Get(ctx); lerr == nil && l == id {
-		return task.Task{}, conflictProblem("This server holds the primary of the map group and cannot be removed.")
-	}
-	owns, db, err := m.ownsBuckets(ctx, id)
-	if err != nil {
-		m.log().Warn("checking the buckets of a server failed", "server", id, "error", err)
-		return task.Task{}, problem.New(problem.ServiceUnavailable, "The bucket map cannot be read now.").WithRetryAfter(5)
-	}
-	if owns {
-		return task.Task{}, conflictProblem(fmt.Sprintf("Server %q still owns buckets (for example in database %q). Rebalance them away from it first.", id, db))
+	if p := decideRemoval(id, false, f); p != nil {
+		return task.Task{}, p
 	}
 	t, err := m.Ops.StartTask(ctx, KindRemove, "server", id, removeInput{ServerID: id}, actor)
 	if errors.Is(err, task.ErrSubjectBusy) {
@@ -224,5 +199,5 @@ func (m *Manager) stepRemoveForget(ctx context.Context, env *task.Env) error {
 
 // Definitions returns the task definitions of this package.
 func (m *Manager) Definitions() []task.Definition {
-	return []task.Definition{m.addDefinition(), m.removeDefinition()}
+	return []task.Definition{m.addDefinition(), m.removeDefinition(), m.leaveDefinition()}
 }

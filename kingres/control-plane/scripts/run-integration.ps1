@@ -43,6 +43,11 @@ try {
     # kingresd itself for the multi-server tests (they start several processes).
     & go build -o (Join-Path $stage 'kingresd') ./cmd/kingresd
     if ($LASTEXITCODE -ne 0) { throw 'go build kingresd failed' }
+    # The standalone verifier (kingres/verifier, standard library only): the proof tests feed it
+    # what the API returned (KINGRES_VERIFY_BIN, exported by run-wsl-tests.sh).
+    Push-Location (Join-Path (Split-Path $module -Parent) 'verifier')
+    try { & go build -o (Join-Path $stage 'kingres-verify') ./cmd/kingres-verify } finally { Pop-Location }
+    if ($LASTEXITCODE -ne 0) { throw 'go build kingres-verify failed' }
     Remove-Item Env:GOOS, Env:GOARCH
     # Fixtures and the contract the tests read.
     New-Item -ItemType Directory (Join-Path $stage 'fixtures') | Out-Null
@@ -54,7 +59,7 @@ try {
     # Copy into WSL so that the binaries run from the native file system.
     $wslStage = ConvertTo-WslPath $stage
     $wslScript = ConvertTo-WslPath (Join-Path $PSScriptRoot 'run-wsl-tests.sh')
-    & wsl.exe -d $Distro -u $WslUser bash -c "rm -rf ~/kw-cp/test/bin && mkdir -p ~/kw-cp/test/bin && cp '$wslStage'/kingresd '$wslStage'/*.test '$wslStage'/openapi.yaml '$wslStage'/README.md '$wslStage'/operations_gen.go.txt '$wslStage'/wsl-allowed-skips.txt ~/kw-cp/test/bin/ && cp -r '$wslStage'/fixtures ~/kw-cp/test/bin/ && chmod +x ~/kw-cp/test/bin/*.test ~/kw-cp/test/bin/kingresd"
+    & wsl.exe -d $Distro -u $WslUser bash -c "rm -rf ~/kw-cp/test/bin && mkdir -p ~/kw-cp/test/bin && cp '$wslStage'/kingresd '$wslStage'/kingres-verify '$wslStage'/*.test '$wslStage'/openapi.yaml '$wslStage'/README.md '$wslStage'/operations_gen.go.txt '$wslStage'/wsl-allowed-skips.txt ~/kw-cp/test/bin/ && cp -r '$wslStage'/fixtures ~/kw-cp/test/bin/ && chmod +x ~/kw-cp/test/bin/*.test ~/kw-cp/test/bin/kingresd ~/kw-cp/test/bin/kingres-verify"
     $bins = ($names | ForEach-Object { "`$HOME/kw-cp/test/bin/$_.test" }) -join ' '
     $extra = ''
     if ($Run) { $extra = "-- -test.run '$Run'" }

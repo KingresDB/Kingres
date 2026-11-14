@@ -170,8 +170,11 @@ func (s *Server) metricsEndpoint(w http.ResponseWriter, r *http.Request) {
 	}
 	allowed := s.deps.MetricsToken != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.deps.MetricsToken)) == 1
 	if !allowed {
-		if sess, err := s.deps.Sessions.Lookup(token); err == nil && sess.Kind == auth.KindToken && auth.Allows(sess.ClusterRoles, auth.RoleStats) {
-			allowed = true
+		if sess, err := s.deps.Sessions.Lookup(token); err == nil && sess.Kind == auth.KindToken {
+			// The roles are the current ones, not those of the sign-in (CP-02).
+			if cur, perr := s.currentRoles(r, sess.Username); perr == nil && auth.Allows(cur, auth.RoleStats) {
+				allowed = true
+			}
 		}
 	}
 	if !allowed {

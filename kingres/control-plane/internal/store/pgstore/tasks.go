@@ -16,7 +16,7 @@ import (
 
 // Tasks live in kingres_cp.task of the system database (migration 1, see
 // package sysdb); the database of the service DSN is the system database.
-const taskColumns = `id, kind, state, subject_type, subject_id, progress, error, state IN ('pending', 'running'), created_at, updated_at, created_by`
+const taskColumns = `id, kind, state, subject_type, subject_id, progress, error, (state IN ('pending', 'running') AND kind NOT IN ('instance.start', 'instance.stop', 'instance.restart')), created_at, updated_at, created_by`
 
 type taskRow struct {
 	id          int64

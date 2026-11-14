@@ -32,6 +32,7 @@ func (s *Server) memberHandlers() map[string]handlerFunc {
 		"joinCluster":  s.joinCluster,
 		"addServer":    s.addServer,
 		"removeServer": s.removeServer,
+		"leaveCluster": s.leaveCluster,
 	}
 }
 

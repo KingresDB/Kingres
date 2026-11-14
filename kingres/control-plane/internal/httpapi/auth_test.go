@@ -41,7 +41,7 @@ func TestLoginSuccessSetsSecureCookieAndCSRF(t *testing.T) {
 	if ck == nil {
 		t.Fatal("no session cookie")
 	}
-	if !ck.HttpOnly || !ck.Secure || ck.SameSite != http.SameSiteStrictMode || ck.Path != "/api/v1" || ck.Value == "" {
+	if !ck.HttpOnly || !ck.Secure || ck.SameSite != http.SameSiteStrictMode || ck.Path != "/" || ck.Value == "" {
 		t.Errorf("cookie attributes: %+v", ck)
 	}
 	// The cookie value is the credential, not the CSRF token.

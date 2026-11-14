@@ -11,9 +11,10 @@ This is the **third increment** (several servers). The second added the instance
 system database, cluster creation (`init-cluster`) and the operations behind the Databases, Security, Query and
 Settings pages; the third lets a second and a third server join (`joinCluster`, `addServer`), removes an empty
 server (`removeServer`) and makes the cluster-wide operations run on every server (see
-[Running several servers](#running-several-servers)). Rebalance, failover, restoring preferred primaries, server
-groups, cluster-wide logs, alerts and metrics, the certificate renewal job and leaving a cluster still answer the
-contract's "not supported yet" problem. Design: `kingres/docs/design/control-plane-2.md` and
+[Running several servers](#running-several-servers)). Rebalance, failover, restoring preferred primaries
+still answer the contract's "not supported yet" problem; cluster-wide logs, alerts and metrics and the certificate
+renewal job are not written. The fourth step added server groups, leaving a cluster, instance start and stop, local
+settings, inclusion proofs and verification records, security headers and crash-injection tests of the task engine. Design: `kingres/docs/design/control-plane-2.md` and
 `kingres/docs/design/control-plane-3.md`.
 
 > **Module path.** The Go module is `github.com/KingresDB/Kingres/kingres/control-plane`: the
@@ -171,7 +172,75 @@ header, answered before authentication; unknown routes are the contract's 404 pr
 panics become 500 `internal_error` and are logged with the stack; every
 response carries `X-Request-Id`, copied into `Problem.requestId` and into audit
 events; access logs are structured and contain no query strings, headers or
-bodies.
+bodies. The security headers and cookie attributes are described in
+[Headers the server sends](#headers-the-server-sends).
+
+## Headers the server sends
+
+One middleware (`internal/httpapi/headers.go`) sets these on every response of
+the listener: API success and error (problem+json), `index.html`, the SPA
+fallback, hashed and other assets, 404, 405, the recovered 500, `/metrics`,
+`/healthz` and `/readyz`. Tests: `TestSecurityHeadersEveryResponseClass`,
+`TestHSTSIgnoresForwardedProto`, `TestCacheControlDefaultDoesNotOverride`
+(`internal/httpapi/headers_test.go`).
+
+| Header | Value |
+|---|---|
+| `Content-Security-Policy` | `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'` |
+| `X-Frame-Options` | `DENY` |
+| `X-Content-Type-Options` | `nosniff` |
+| `Referrer-Policy` | `no-referrer` |
+| `Cross-Origin-Opener-Policy` | `same-origin` |
+| `Cross-Origin-Resource-Policy` | `same-origin` |
+| `Permissions-Policy` | `camera=(), microphone=(), geolocation=()` |
+| `Strict-Transport-Security` | with TLS on (`tls-cert-file` set) only: `max-age=63072000; includeSubDomains`; never over plain HTTP; `X-Forwarded-Proto` is not trusted |
+| `Cache-Control` | see below |
+
+`Cache-Control` by response class:
+
+| Class | Value |
+|---|---|
+| every `/api/v1/` response, errors, 404, 405, 500, `/metrics`, `/healthz`, `/readyz` | `no-store` |
+| `index.html` and the SPA fallback (any non-API path without a file extension) | `no-cache` (as the panel specification says) |
+| file under `/assets/` whose name has a content hash (`name-<8 base64url characters with a digit or an upper case letter>.ext`, as Vite writes it) | `public, max-age=31536000, immutable` |
+| any other static file (`favicon.svg`, `manifest.webmanifest`, icons, a file under `/assets/` without a hash) | `no-cache` |
+| a response whose handler set nothing | `no-store` (a handler's own value is never overridden) |
+
+Decisions:
+
+- The policy allows no inline script or style, no `data:`, no fonts, no
+  external origin. `internal/webui/csp_test.go` scans the embedded panel
+  (`index.html`, CSS) and a Vite-like fixture for inline scripts, `on*=`
+  handlers, `javascript:` URLs, inline `<style>`, `style=` attributes, external
+  origins and `data:` URLs in CSS. The placeholder page therefore uses
+  `placeholder.css`, not an inline style. If the panel later needs inline
+  `style=` attributes, `style-src-attr` must be added deliberately.
+- `Cross-Origin-Opener-Policy: same-origin` isolates the browsing context group
+  (no `window.opener` access from or to another site). `Cross-Origin-Resource-Policy:
+  same-origin` stops other sites from embedding any response; Prometheus scrapes
+  are server to server and unaffected.
+- HSTS has no `preload`: submission to the preload list is practically
+  irreversible and covers every subdomain of the host name, which an operator
+  of an internal installation cannot promise. `includeSubDomains` stays.
+- TLS is on when `tls-cert-file` is configured (`Deps.TLS`). A TLS-terminating
+  proxy in front of a plain-HTTP kingresd is not detected: the proxy must add
+  HSTS itself, and kingresd then uses the plain cookie name.
+
+Session cookie (the panel never reads it: it is `HttpOnly`; the CSRF token comes
+in the JSON body and lives in the panel's memory, so there is no CSRF cookie):
+
+| | TLS off | TLS on |
+|---|---|---|
+| Name | `kingres_session` | `kingres_session` (no `__Host-` prefix: the panel specification fixes the plain name) |
+| Path | `/` | `/` |
+| Attributes | `HttpOnly; Secure; SameSite=Strict`, no `Domain`, `Max-Age` = session TTL | same |
+| Logout | same name, Path and attributes with `Max-Age=-1` (empty value) | same |
+| Accepted on requests | `kingres_session` | `kingres_session` |
+
+`Secure` is set even without TLS, as the contract states: browsers accept it on
+`localhost` and behind an HTTPS proxy. Tests: `TestSessionCookieAttributes`
+(`internal/httpapi/cookies_test.go`). Nothing in `kingres/web` has to change for
+the rename.
 
 ## What is implemented
 
@@ -180,7 +249,7 @@ paths; what 0.4.0 planned beyond this table is in "Not done in this increment").
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **67 of 86 operations are real; 19 answer "not yet".**
+authenticated operation lists in 0.2.0. **78 of 86 operations are real; 8 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -191,7 +260,7 @@ authenticated operation lists in 0.2.0. **67 of 86 operations are real; 19 answe
 | Roles | `listClusterRoles`, `listRoles`, `createRole`, `getRole`, `deleteRole`, `updateRole`, `setRoleClusterRoles`, `setRoleMemberships` |  |
 | Databases | `getDatabaseCreateOptions`, `listDatabases`, `createDatabase`, `getDatabase`, `dropDatabase`, `updateDatabase` |  |
 | Shards | `getBucketDistribution`, `listColocationGroups`, `listBuckets` |  |
-| Ledger | `getLedgerStatus`, `listLedgerBlocks`, `listLedgerDigests`, `generateLedgerDigest`, `startLedgerVerification`, `listLedgerStatus` | `createInclusionProof`, `listLedgerVerifications`, `getLedgerVerification` |
+| Ledger | `getLedgerStatus`, `listLedgerBlocks`, `listLedgerDigests`, `generateLedgerDigest`, `startLedgerVerification`, `listLedgerStatus`, `createInclusionProof`, `listLedgerVerifications`, `getLedgerVerification` |  |
 | Tables | `getTable`, `distributeTable`, `enableTableLedger`, `listTables` |  |
 | Grants | `listGrants`, `createGrant`, `revokeGrants`, `applyGrantTemplate` |  |
 | Health | `getHealth`, `getReadiness` |  |
@@ -200,13 +269,13 @@ authenticated operation lists in 0.2.0. **67 of 86 operations are real; 19 answe
 | Query | `executeQuery` |  |
 | Rebalance |  | `getRebalanceStatus`, `startRebalance`, `previewRebalancePlan`, `listRebalanceReports`, `getRebalanceReport`, `stopRebalance` |
 | Replication | `getReplicationTopology` | `restorePreferredPrimaries` |
-| Server groups | `listServerGroups` | `createServerGroup`, `deleteServerGroup` |
-| Servers | `listServers`, `getServer`, `addServer`, `removeServer` | `updateServer`, `failoverServer` |
+| Server groups | `listServerGroups`, `createServerGroup`, `deleteServerGroup` |  |
+| Servers | `listServers`, `getServer`, `addServer`, `removeServer`, `updateServer` | `failoverServer` |
 | Settings | `getClusterSettings`, `updateClusterSettings` |  |
 | Network access | `getNetworkAccess`, `replaceNetworkAccess` |  |
 | Setup | `initCluster`, `joinCluster`, `getNodeState`, `checkSetupToken` |  |
 | Tasks | `listTasks`, `getTask`, `cancelTask` |  |
-| This server | `getThisServer`, `listThisServerInstances`, `getThisServerInstance`, `restartThisServerInstance`, `listThisServerLogs`, `getThisServerResources` | `startThisServerInstance`, `stopThisServerInstance`, `leaveCluster`, `getThisServerSettings`, `updateThisServerSettings` |
+| This server | `getThisServer`, `listThisServerInstances`, `getThisServerInstance`, `restartThisServerInstance`, `listThisServerLogs`, `getThisServerResources`, `startThisServerInstance`, `stopThisServerInstance`, `leaveCluster`, `getThisServerSettings`, `updateThisServerSettings` |  |
 
 ### How the catalog maps to the contract
 
@@ -511,6 +580,72 @@ failover of the manager leader does not exist. A server must be reachable at the
 need the trust rules to be applied again (any membership change does that). A cluster-wide task takes the list of servers when it starts: a server that joins while a
 `database.create` or `database.drop` task is running is not part of that task (do not overlap them).
 
+### Leaving a cluster
+
+`POST /this-server/leave-cluster` (`kingres_admin`; optional body `{"force": false}`) is the mirror of
+`removeServer`, driven from the server that leaves. The API of the leaving server does not forward it: it checks,
+asks the manager leader over the internal API, and answers with the leader's task (`server.leave`, subject
+`{type: server, id: <the leaving server>}`; 202 with `Location: /api/v1/tasks/{id}`).
+
+**Refusals.** The same decision function (`internal/membership/refuse.go`) serves `removeServer` and `leaveCluster`,
+with the contract's order: 404 for an unknown server; 422 `node_state_invalid` for a `dead` server (fail it over
+first); 409 `last_server` (the only server of the cluster); 409 `server_hosts_map_group` (the server has an instance,
+primary or standby, of shard group 0, or is the manager leader); 409 `server_owns_buckets` (a copy, primary or
+replica, of any bucket of any sharded database; the `detail` names the databases with the number of buckets);
+409 `rebalance_in_progress` (an unfinished `rebalance` task); 409 `operation_in_progress` (another unfinished task
+of this server, such as a second leave or a `removeServer` of it). A leaving server decides first from **its own
+copy of the catalog** (`kingres.node` and `kingres.bucket_map` in its local instance), then the leader decides again
+from its own and starts the task; the server never asks the leader to remove another server (the call carries no
+server id, see `internal-api.md`).
+
+**`force`.** `force: true` lifts only the requirement that the rest of the cluster is reachable. The checks above
+still run from the local copy, and a refusal is final (the leader leaving with `force` is still 409
+`server_hosts_map_group`; a server with buckets still 409 `server_owns_buckets`). Without `force`, a leader that
+cannot be reached (or is not known) is 503 `service_unavailable` and the server stays a member. With `force` and an
+unreachable leader the server resets itself about a second after the answer: no task can exist on a cluster that
+cannot be reached, so the answer is a finished task with `id` 0 (state `done`, one step) that cannot be fetched
+with `GET /tasks/0`. The cluster, not knowing, keeps listing the server (its certificate is **not** revoked, since
+only the leader can) until it is removed there with `removeServer` or failed over; this is the situation the
+contract describes.
+
+**The task on the leader.** Steps: check again and mark the server `removing`; unregister the node in every database
+(`kingres.remove_node`); remove the server from the managed rules of the others; forget the server (its record and
+its entry of the peer directory, which is sent to the others); revoke the certificate and send the revocation list to
+every other kingresd and PostgreSQL instance. After the revocation the leaving server cannot call the leader again.
+
+**What the leaving server does.** Unlike `removeServer`, the leader does not call the server to reset it. The leaving
+server writes `<data-dir>/leave-pending.json` (task id and leader), then asks the leader every half second how
+its task stands (`POST /internal/v1/leave-status`, answered only for the task whose subject is the caller). It
+resets itself (the same reset as `removeServer`: stop and delete the instance and its credentials, delete the
+certificates and key, forget the cluster, new setup token, peer directory reduced to itself) when the leader says
+`done`, or when the leader refuses its certificate as revoked (that only happens in the last step; it then waits
+four seconds for the leader to record the end). If the task fails the certificate is still valid: the server stays
+a member and drops the record. If kingresd restarts while a leave is under way, it resumes the watch from the
+record. The data directory handling is exactly that of `removeServer`: `instances/` (data, logs of the instance),
+`service-credentials`, `pki/` are deleted; `audit.jsonl`, `node-state.json`, `peers.json` (reset to this server) and
+kingresd's own log are kept. The server can join again with its new setup token (`joinCluster`) and gets a new
+certificate.
+
+**What a client sees.** The 202 and its `Location` are answered by the leaving server. While it is still clustered
+and its certificate is valid, `GET /tasks/{id}` on the leaving server is forwarded to the leader like any
+task read. The last step (revocation) ends that: the leader refuses the server's certificate, so the leaving server
+answers 503 `service_unavailable` for about the next four seconds and then 503 `node_uninitialized` (it is
+uninitialized; every API call except health and setup says so). The task is recorded `done` on the leader
+immediately after the last step, which is before the server resets itself (the server waits for that); a client
+should follow the task on the leaving server while that answers, and ask any other server (`GET /tasks/{id}` is
+forwarded to the leader) when it answers 503. The task is not visible on the leaving server afterwards because the
+server no longer belongs to the cluster.
+
+**Audit.** The leaving server's pipeline audits `leaveCluster` (success or failure, `details.force`) in its own
+`audit.jsonl`, which survives the reset. The leader records two `leaveCluster` events for the server
+(`resourceId` is the leaving server, `source` is `system`, `details.phase` is `accepted` when the task starts and
+`completed` after the last step).
+
+**Not done.** A leave cannot be cancelled once the server is unregistered; a failed task after that point is not
+undone (retry is by starting another leave, which the checks refuse once the server is no longer registered; use
+`removeServer` or reset the server by hand). The leave of a server whose instance was stopped on purpose is not
+tried.
+
 ## Security review of 2026-11-14 (CP-01 to CP-07) and what the logs can contain
 
 The review `docs/reviews/2026-11-14-kingresd-control-plane.md` was fixed before anything else in this increment. Each
@@ -525,6 +660,24 @@ finding has a test that fails on the reviewed code.
 | CP-05 (medium) dangerous predefined roles can be granted | `TestCP05DangerousMembershipsAreRefused` (WSL) | memberships in any `pg_*` role except the harmless monitoring ones, and in roles with SUPERUSER, REPLICATION or BYPASSRLS (or that lead to a dangerous predefined role), are refused with 400; the workbench answers 403 for a role that has such an attribute or a membership in `pg_execute_server_program`, `pg_read_server_files`, `pg_write_server_files` or `pg_read_server_logs`. A superuser can still grant these in SQL; that is outside the panel's model |
 | CP-06 (low) control characters in user names | `TestLoginRefusesControlCharactersInTheUserName`, `TestCleanReplacesControlCharacters` | `login` refuses control characters (400) before PostgreSQL and the audit log; the audit sink replaces control characters in actor and resource id |
 | CP-07 (medium) the leader trusts a forwarded identity | `TestLeaderChecksForwardedIdentityAgainstTheRole` | the leader derives the claimed role's cluster roles itself (the check of CP-02) and refuses an identity that does not hold the claimed roles; a forwarding server must be in the peer directory (its certificate is already checked against the CA and the revocation list). The stated trust model is unchanged: every server of a cluster is fully trusted |
+
+### Class search of 2026-11-14 (leftovers)
+
+The same classes as CP-01 to CP-07 were searched in the code the fixes did not touch. Fixed (each with a test that
+failed before): the `/metrics` scrape decided a bearer token's privilege from the roles cached at sign-in (CP-02 class;
+`TestMetricsScrapeFollowsTheCurrentStateOfTheRole`), now re-derived like every other request; the error text a peer
+answers with was quoted unbounded and unescaped into problems and task errors (CP-06 class;
+`TestPeerErrorTextIsBoundedAndClean`), now cut at 500 bytes with control characters replaced; the managed
+configuration accepted `include_dir`, `include_if_exists`, `archive_command` and other file/command settings in its
+`Extra` map (`TestManagedExtraSettingsCannotIncludeOrRedirectFiles`), now refused. Checked and sound: every SQL
+statement is built by `sqlx.Builder` (identifiers quoted, literals quoted, fixed text restricted to a closed alphabet)
+or bound with `$n`; the one `Fixed(k)` built from stored data (`ALTER DATABASE ... SET`) is guarded by `gucRE`;
+pg_hba.conf, pg_ident.conf and postgresql.conf values are quoted or refused when they hold control characters; every
+request body is read through `http.MaxBytesReader` (REST 1 MiB default, internal API 1 to 16 MiB) and every peer answer
+through `io.LimitReader`; every log call goes through `slog`, which quotes values, and the audit sink cleans actor,
+address and resource id. Known and left: catalog listings (`listTables` and the role and grant listings) read every row
+of the catalog and page in memory, so their size follows the number of tables or roles that the database's own users can
+create; a hard cap needs a contract decision.
 
 **What the logs can contain.** The text of statements is not written to the log of a managed instance (settings above;
 an operator who overrides them in `postgresql.conf` after the include of the managed file can undo this). The error
@@ -550,15 +703,42 @@ socket without `-h` because the sockets are not in PostgreSQL's default director
 `/run` is empty, the start works, and a package no longer needs `RuntimeDirectory=kingres kingres/1` for the instance
 directory.
 
+### Task engine: crash points and guarantees
+
+A task is a list of steps. Before it calls a step the engine records the step as `running` in `kingres_cp.task`, after
+the step returned it records `done`, and a lease (renewed every third of its length) says which process owns the task.
+When that process dies, the next engine that polls takes the task over after the lease expired and starts at the
+first step that is not recorded `done`. What the engine promises:
+
+- A step recorded `done` never runs again.
+- A step that ran but whose `done` was not recorded runs again (**at least once**). Every step must therefore be
+  idempotent unless it is marked `NonIdempotent`.
+- A `NonIdempotent` step that was recorded `running` but not `done` is **not** run again: the task fails with the
+  code `step_interrupted` (not retryable) and names the step, because it is unknown whether the effect happened. The
+  steps after it do not run. A crash before the `running` record leaves the step untouched, so it runs once.
+- A task whose process died is never lost and never stays `running` forever: once the lease expired it is resumed or
+  failed as above, as long as some server runs the engine. A task that has all steps `done` is recorded `done`.
+- Secrets live only in the process that started the task; a resumed step that needs one fails with
+  `secret_unavailable`.
+
+Crash points (`task.FaultPoints`, set through `task.Options.Fault`, nil in the product): `before_step`,
+`step_started` (recorded running, `Run` not called), `step_ran` (`Run` returned, `done` not recorded),
+`step_recorded`, `lease_renew` (a renewal tick while a step runs), `before_finish` and `after_finish`. Tests make the
+hook end the process: `crash_test.go` simulates the death with a store that refuses all writes after the hook ran
+(`TestCrashAtEveryStepBoundary`, `TestCrashAtTheFinish`, `TestCrashAtTheLeaseRenewal`), and `pgcrash_test.go`
+(`TestTaskEngineSurvivesAKilledProcess`, real PostgreSQL, WSL) starts the test binary as helper processes that
+`os.Exit(137)` at each point, then a second process takes the task over; the steps count their runs in a side file.
+The real task `server.add` is killed with SIGKILL at each of its steps by `TestJoinInterruptedAtEveryStepResumes`.
+No task kind of the product is marked `NonIdempotent` today (all steps check what exists before they create).
+
 ## Not done in this increment, and the manager's state on a leader change
 
-**Not done** (each still answers 422 `unsupported_operation`, or is unchanged): server groups (create, delete,
-assign), inclusion proofs, the list and detail of ledger verifications, instance start and stop, leave-cluster, local
-settings, certificate revoke and renew, the renewal job, cluster-wide gathering of logs, alerts and metrics, raising
-the new alert kinds (the contract lists them; nothing raises them yet), certificate expiry, seen fingerprint and
-pinned flag on `Server`, `NodeStateInfo.setupTask` and `SetupTaskSummary`, the `removeServer` wording in the
-contract, and a dedicated problem for operations that need the CA when the leader does not hold it. Rebalance,
-failover, restoring preferred primaries and `updateServer` stay as specified.
+**Not done** (each still answers 422 `unsupported_operation`, or is unchanged): certificate revoke and renew (not in
+the contract yet), the renewal job, cluster-wide gathering of logs, alerts and metrics, raising the new alert kinds
+(the contract lists them; nothing raises them yet), and a dedicated problem for operations that need the CA when the
+leader does not hold it. Rebalance, failover and restoring preferred primaries stay as specified (8 operations
+answer "not yet"). Server groups, `updateServer`, inclusion proofs, ledger verification records, instance start and
+stop, leave-cluster and local settings are done (see their sections).
 
 **What has to move with the manager (for the high-availability increment).** The certificate authority key
 (`<data-dir>/pki/ca.key`), the revocation list (`revoked.json`), the task engine (rows of `kingres_system` on the
@@ -668,9 +848,8 @@ the digest list is empty and the verification fields of the status stay null; af
 works (tested). `ledger_status` supplies the table counts and the last verification. History tables of updatable
 tables are not listed as tables; the table shows `ledger.historyTable`. A verification runs `ledger_verify_recorded`
 as a task (scope `full` or since the last clean one; verification against a given digest is not supported yet).
-**Not done:** `listLedgerVerifications`, `getLedgerVerification` (the contract requires a `taskId` the extension does
-not record) and `createInclusionProof` (the proof JSON of the extension carries no leaf hash and no left/right
-positions, which the contract requires; both would have to be derived or the contract changed).
+The records of verifications, the proofs and the link of a record to its task are in "Inclusion proofs and verification
+records" below.
 The task subject of a verification is the database name, because the verification id exists only after the run.
 
 **Alerts** (kinds of the contract): `serverDown` (the instance is not running; since nothing can be stored while it is
@@ -734,10 +913,10 @@ group 0 (`Store.ManagerLeader`, cached for two seconds by `internal/leader`; an 
 answered from a stale value, because leader-only internal calls are authorized with it). `ClusterOverview.managerLeader`,
 `Server.isManagerLeader` and `LocalServerInfo.isManagerLeader` all derive from that one answer (a test asserts they
 agree). A server that is not the leader forwards a mutating cluster operation (and the reads of data that only the
-leader has: `listTasks`, `getTask`, `listAlerts`, `getClusterSettings`) over `POST /internal/v1/forward` after it has
+leader has: `listTasks`, `getTask`, `listAlerts`, `getClusterSettings`, `listLedgerVerifications`, `getLedgerVerification`) over `POST /internal/v1/forward` after it has
 authenticated the caller, checked CSRF and the required role itself; the leader re-checks the operation, the identity
 and the role and writes the audit event, once (`forwardedBy`, `originRequestId`). Not forwarded: sign-in/out, setup,
-operations on this server, the query workbench. If the leader is unknown or unreachable the answer is 503 and nothing
+operations on this server, the query workbench, `createInclusionProof`. If the leader is unknown or unreachable the answer is 503 and nothing
 runs locally. The internal address of every server is kept in `<data-dir>/peers.json` (`internal/peers`), because the
 shard catalog knows only hosts and PostgreSQL ports; each server records itself at start when `internal-listen` is set,
 and the join task (not written yet) distributes the file. The leader is also the only server that runs the task engine
@@ -819,6 +998,149 @@ What keeps the hand-written types honest:
   refuses to start with a handler for an unknown operation.
 
 If a 3.1-capable generator appears, `internal/api` is the only place to replace.
+
+## Inclusion proofs and verification records
+
+`createInclusionProof`, `listLedgerVerifications` and `getLedgerVerification` (kingres_ledger 0.2; the proof also
+works with 0.1 for insert entries). Code: `internal/ops/ledger_proof.go`, `internal/ops/ledger_verifications.go`,
+`internal/httpapi/handlers_ledger_proof.go`; migration 3 of the system database.
+
+**The proof.** The 200 body is the extension's `ledger_inclusion_proof` document with its own snake_case members plus
+`shard_group_id`, nothing renamed or wrapped, so the bytes the client receives can be saved and given to
+`kingres-verify proof --proof` unchanged. The row is found like this: the server connects **as the signed-in
+PostgreSQL role** (table privileges and row security apply: no privilege on the table is 403 `forbidden`, a row hidden
+by a policy is 404) and reads `kingres.ledger_row_hash(t.*)` (or `ledger_history_row_hash` for a removed version) from
+the table, matching the primary key with `jsonb_populate_record(NULL::table, <the primaryKey as one bind parameter>)`
+so PostgreSQL converts every value to its column type and no value is ever part of the statement text. The proof
+itself is made on a **service connection** (`ledger_inclusion_proof` is executable only by granted roles, and
+granting it would let a role learn the row hashes of the whole table); the cluster role (`kingres_readonly`) and the
+row read are what authorize it. It is not forwarded to the leader (it is a POST that changes nothing and runs as the
+caller, like the query workbench). The `ledgerTxId` form reads the history table, which only the owner of the ledger
+table can read (403 for everyone else).
+
+| Situation | Answer |
+|---|---|
+| unknown database, schema, table, row, or removed version | 404 `not_found` |
+| the extension is not installed in the database | 409 `conflict` (as the digest operations) |
+| the row is not in a block yet (`55000`), or the ledger has no block | 409 `ledger_entry_pending` (generate a digest and ask again) |
+| the table is not a ledger table; has no primary key; `ledgerTxId` or `op: D` on an append-only table | 422 `unprocessable` |
+| `ledgerTxId` or `op: D` while kingres_ledger is 0.1 | 422 `unsupported_operation` |
+| `op: D` without `ledgerTxId`; a primary key column missing or extra; a value that does not fit its column; bad `op`; `null`, array or object values | 400 `validation_failed` (field `/primaryKey/<column>`) |
+| a body member the contract does not know | 400 `bad_request` (the decoder rejects unknown members) |
+| distributed table whose distribution column is not in `primaryKey` | 400 `validation_failed` |
+
+Limits of this increment: the lookup reads the chain of **this server's shard group** (`shard_group_id` is that
+group; the other operations of the ledger do the same). A distributed table whose row is on another group has no
+entry in the local chain, which answers 422 `unsupported_operation` with the reason; reading the chain of another
+group needs the agent's connections and is not done. The verification of a proof against a digest is the job of the
+verifier, not of the server.
+
+**Digests.** `LedgerDigest.chains[].document` is the `digest` jsonb of `kingres.ledger_digest` (what
+`ledger_generate_digest()` returned); the list and the generate operation fill it. Save it outside the database and
+give it to `kingres-verify --digest`.
+
+**Verification records.** The records are the extension's (`kingres.ledger_verification` of the user database, read on
+a service connection). The control plane keeps one table, `kingres_cp.ledger_verification` (migration 3): its own
+`id`, the `database_name`, the extension's `chain_id` and `verification_id`, the shard group, and the `task_id`. The
+ids are allocated **the first time a record is seen**, in the order of the extension's ids (under an advisory lock, in
+one statement), so they grow with time and stay unique when a database is dropped and created again (`chain_id` is
+part of the key, so a stale pairing is never applied to a new chain; its extension ids start at 1 again). The task
+`ledger.verify` calls `ledger_verify_recorded` and, when it returns, stores the extension's id with its own task id
+(after giving the older records their ids); a run recorded without a task (SQL, the ledger worker) gets an id when it
+is first listed and `taskId: null`. Because that allocation writes to the system database, both read operations are
+answered by the **manager leader** (`leaderBoundReads` in `forward.go`). Mapping: `clean` is `passed`; `problems` is
+`failed` with the (at most 100) problems as `inconsistencies`; the extension's `failed` is `failed` with no
+inconsistencies and null counts (the cause is in the task's error). `scope` is `full` when the run started at height
+0. Kinds: `block_hash` blockHashMismatch, `block_prev_hash` prevHashMismatch, `block_tx_root` and `tx_root`
+merkleRootMismatch, `table_rows` and `history_rows` rowHashMismatch (field `table`), `block_height` and `tx_block`
+missingBlock, every other check `other` (the detail starts with the check name). `blockHeight` is read from the
+extension's object text (`block 7`). `startedBy` is the creator of the task, `system` for a run of the service role,
+the extension's `started_by` otherwise. Paging is a keyset on the control plane's id; the cursor is `v<id>` (base64url),
+so a cursor of another list is a 400, and a run that starts while a client pages appears only on a fresh first page.
+A database with ledger mode off, without the extension or with kingres_ledger 0.1 answers 200 with `items: []`.
+Not done: records of other shard groups (one chain per group needs their connections), verification against a given
+digest, `state: running` (the extension never writes it).
+
+**Tests.** `cmd/kingresd/ledger_proof_e2e_test.go` (WSL, real PostgreSQL): `TestInclusionProofsAndTheVerifier` builds
+the proofs, checks each against the contract and feeds the API's bytes and the digest's `document` to `kingres-verify`
+(exit 0 and `VERIFIED`; a flipped hash and a proof for another row's hash exit 1); `TestInclusionProofOnLedger01`,
+`TestInclusionProofOnADatabaseWithoutLedger`, `TestLedgerVerificationRecords` (task linkage, paging, `taskId: null`,
+cursors, access). The verifier binary comes from `KINGRES_VERIFY_BIN`: `scripts/run-integration.ps1` builds it
+(`kingres/verifier`, standard library only) and `scripts/run-wsl-tests.sh` exports it; a proof test **fails** when
+PostgreSQL is available and the variable is not set. Unit tests: `internal/ops/ledger_proof_test.go`,
+`internal/httpapi/ledger_proof_test.go`.
+
+## Server groups, updateServer and the certificate properties of Server
+
+Operations: `createServerGroup`, `deleteServerGroup`, `updateServer` (role `kingres_ops`, all three audited and
+forwarded to the manager leader); the properties `certificateExpiresAt`, `seenFingerprint`, `fingerprintPinned` of
+`Server`.
+
+1. **Where the groups live.** In the system database of the leader: `kingres_cp.server_group` (name, description) and
+   `kingres_cp.server.server_group` (the assignment; foreign key `ON DELETE RESTRICT`). Both tables came with
+   migration 1, so there is no new migration. Names are compared exactly (the column is `text`): `rack-a` and
+   `Rack-A` are two groups. The shard catalog's column `kingres.node.server_group` is **never written** (the
+   extension has no function for it); the system database is the source of truth. Where the system database has no
+   `kingres_cp` schema (a bare catalog, the read-side fixtures) the store still shows the catalog's value; a recorded
+   value (also "no group") replaces it.
+2. **What a follower shows.** `listServerGroups` is answered by the leader (a leader-bound read, like `listTasks`).
+   `listServers` and `getServer` on a follower are answered locally and then completed from the leader: the follower
+   asks the leader for its `listServers` over the forward call (internal API, with the caller's identity; the leader
+   accepts that one read in addition to the leader-bound ones) and takes `serverGroup`, `seenFingerprint`,
+   `fingerprintPinned` and `certificateExpiresAt` from it. If the leader cannot be asked, the answer is still given
+   with the values the follower has (no group, null); a read is not refused for it, a change is (503, as every
+   cluster change).
+3. **createServerGroup.** The body is validated as an object: an unknown member is 400 `validation_failed` with the
+   member as field, so is a name outside `^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$`, a description over 200 characters or a
+   wrong type. 201 with `serverIds: []`; a name that exists is 409 `already_exists` (the primary key decides, so two
+   concurrent creates cannot both win).
+4. **deleteServerGroup.** 404 for an unknown group (and for a name that cannot be a group name); 409
+   `server_group_not_empty` while any server is assigned, in any status, the detail lists the server ids; nothing is
+   deleted on a refusal; 204 otherwise. A server assigned between the check and the delete is caught by the foreign
+   key and answers the same 409.
+5. **updateServer.** Only `serverGroup` (string or null) and `shouldHaveShards` (boolean). Any other member is 400 (a
+   property of `Server` is reported as read-only, anything else as unknown); an empty object and an empty body are
+   400. 404 for a server that is not in the catalog. Order: the group must exist (422 `unprocessable`, field
+   `/serverGroup`); then, **only when something would change**, 409 `operation_in_progress` while the server has an
+   unfinished task of kind `server.add`, `server.remove` or `server.leave` or a record in status
+   `pending`/`removing`, and 409 `rebalance_in_progress` while a task of kind `rebalance` is unfinished (no rebalance
+   exists yet in this version, so that check becomes reachable with it). A value equal to the current one changes
+   nothing and answers 200, also during those operations. The answer is the whole `Server`.
+6. **shouldHaveShards is honoured.** The catalog has `kingres.node.should_have_shards`; the leader sets it on every
+   node of the server, in every database that has a `kingres` catalog, in one transaction per database: with
+   `kingres.set_node_property` where the extension has it (0.3 and later) and, for 0.2 (which has the column and
+   `kingres.sync_catalog()` but not the function), with the statements the function runs (lock
+   `kingres.map_version`, update, `sync_catalog()`), after checking that the local instance is the map group's
+   primary (otherwise 422 `node_state_invalid`). The change reaches the other servers through the catalog sync; no
+   data moves until a rebalance runs. The group assignment is made in a transaction of the system database that is
+   committed only after the catalog change succeeded, so a refusal by the catalog leaves the group as it was. A
+   failure in the second of several databases leaves the first changed (the catalogs are separate); repeating the
+   request completes it, because only nodes whose value differs are touched.
+7. **Server properties.** `certificateExpiresAt`: this server's own is read from `<data-dir>/pki/server.crt`; the
+   others come from the certificate the leader signed (`kingres_cp.server.certificate_pem`), so every server shows
+   all of them (the creator's row has no copy, its file is used); null when neither exists. `seenFingerprint` is
+   `kingres_cp.server.seen_fingerprint` (64 lower-case hex digits; anything stored that is not one is shown as null)
+   and `fingerprintPinned` the recorded pin flag, false whenever the fingerprint is null. They are set only by
+   `addServer` (the leader contacts the new server and records the certificate it presented). **A server that
+   joined by its own request (`joinCluster`) has null and false**: it never presented a certificate to the leader;
+   the fingerprint that the joining server checked (the existing server's) is in its own setup task. The first
+   server has null and false.
+8. **setupTask.** `NodeStateInfo.setupTask` was already served: null until a setup request was accepted on that
+   server, afterwards the summary of its task (`done`, or `failed` with the error), also after a restart. Verified:
+   the creator and a server that joined show `done` with 100 percent
+   (`TestServerCertificateAndFingerprintProperties`), a failed join shows `failed`
+   (`TestFingerprintModesAndSetupTokenReplay`), a server that the leader added shows null. Nothing had to change.
+9. **Audit.** The three actions are in the `AuditAction` enum and audited by the guard; the details carry `name`
+   (groups) or the changed `serverGroup`/`shouldHaveShards` (updateServer), merged with `forwardedBy` and
+   `originRequestId` of a forwarded request. A handler must add to `c.details`, not replace it: replacing it drops
+   `forwardedBy` (`addDetails` in `handlers_servergroups.go` does it for these three).
+
+Tests: `internal/ops/servergroups_test.go` (validation), `internal/ops/servergroups_integration_test.go` (the store
+with its refusals), `internal/httpapi/servergroups_test.go` (400/403/404 paths, the follower's completion, the
+forwarded read, the local certificate), `internal/store/pgstore/servergroups_test.go` (the overlay),
+`cmd/kingresd/servergroups_e2e_test.go` (one server, contract validation, audit) and
+`internal/clustertest/servergroups_test.go` (three servers: create on the leader and through a follower, assign
+through a follower, see it from all, refusals relayed, delete, audit, certificates and fingerprints).
 
 ## Security notes
 
@@ -958,6 +1280,140 @@ new in 0.2.0 (the contract was not changed):
     no database has buckets.
 13. A way to revoke a server certificate without removing the server, and the revocation list of the cluster, are not
     in the contract.
+
+## Starting and stopping the instance
+
+`startThisServerInstance` and `stopThisServerInstance` (`kingres_ops`) and `restartThisServerInstance` act on the
+PostgreSQL instance of **this** server only; they are never forwarded to the leader (tag "This server"). Code:
+`internal/ops/instancectl.go` (states, conflicts, the gate), `internal/ops/instancerun.go` (the three runs, the task
+records), `internal/ops/taskrecorder.go` (who writes the tasks), `internal/httpapi/handlers_instance.go` (handlers,
+the 503 gate, the start from memory). The instance id of the path is the catalog's `node_id` of this server's instance
+(read from the catalog while it can be read and remembered; `1` when nothing is known); another id is 404. The body
+`{"force": bool}` of stop and restart is optional; anything else in it is 400.
+
+**States and conflicts.** The state is the in-memory operation (`starting`, `stopping`, `restarting`) or else follows
+the process (`pg_ctl status`): `running` or `stopped`. Stop: `stopped`/`stopping` is 409 `instance_already_stopped`,
+`starting`/`restarting` is 409 `operation_in_progress`. Start: `running`/`starting`/`restarting` is 409
+`instance_already_running`, `stopping` is 409 `operation_in_progress`. Restart: like stop. An unfinished task of the
+instance in the task table is also `operation_in_progress`. `no_replica_available` (stop and restart, not start) means
+the instance is the only up-to-date copy of its shard group while replicas exist that are not caught up (a standby is
+"up to date" when it runs and is at most 1 MiB behind; an unknown lag counts as behind; a group without replicas never
+blocks); `force: true` overrides this and only this.
+
+**Tasks.** `instance.start`, `instance.stop` and `instance.restart` have subject `instance/<node id>` and one step
+("Start the instance", "Stop the instance", "Restart the instance"). They are **not run by the task engine** (the
+engine writes a step only after it ran, and the database that holds the task is hosted by the instance the task
+starts or stops, or, on a follower, does not have the task table at all): the owner writes them through a
+`TaskRecorder`. On the leader that is its own task engine (`task.RecordStore`, new in `internal/task/record.go`:
+`Record`, `Settle`, `ReserveID`); on any other server it is the leader, through three new internal calls (see
+`internal-api.md`: `POST /task/record`, `/task/settle`, `/task/reserve`, answered only by the leader, limited to the
+three kinds with an instance subject). The flows:
+
+* **stop**: the task is recorded `running` and returned with 202; just before the shutdown it is settled `done` (all
+  steps done, 100 percent), then `pg_ctl stop -m fast`; if the instance does not stop (or still runs) the task is
+  corrected to `failed` (error `step_failed`, retryable) and everything is as before. While the database is still up
+  an id is reserved from the task sequence for the start that follows.
+* **start**: the system database of the leader is down, so nothing can be written: the task is announced with the
+  reserved id (or, when none exists, with a number of microseconds since 1970, far above any sequence value and
+  below 2^53), kept in memory, and written finished (`done` or `failed`) under that id once the instance runs and a
+  service connection to the system database works; `getTask` answers 503 `system_database_stopped` until then. A
+  follower's start is recorded with the leader at once (the leader is up) and settled when the instance is back.
+  When a write cannot be made the finished task stays in memory and is written at the next successful start.
+* **restart**: recorded and settled the same way (settled when the system database is back; the earlier engine step
+  "retries 30 seconds" is replaced by waiting for the database). Restart used the engine before, which made it fail
+  with 500 on a follower (no task table there); it now works on every server.
+
+If kingresd is killed between the record and the settle, the row keeps a lease of 15 minutes
+(`task.RecordLease`); then the leader's engine claims it and the definitions in `InstanceDefinitions` fail it ("the
+server ended before the operation finished"). Until then the instance has an unfinished task (409
+`operation_in_progress` for a new operation).
+
+**While the instance is down (stopped on purpose).** From just before the shutdown until the start has finished,
+`Ops.LocalInstanceDown()` is true and the guard (`gateStoppedInstance`, before authentication) answers **503
+`system_database_stopped`** (with `Retry-After: 10`, naming `POST .../this-server/instances/<id>/start` in the detail)
+for `login` and for every operation with a session, except `startThisServerInstance`. `getHealth`, `getNodeState` and
+the setup operations are not gated and answer as always. **`getReadiness` answers 200** with the check
+`localPostgres` `ok: false` and a detail while the instance is stopped on purpose (the process is ready to serve the
+start; a load balancer that needs the database must look at the check); it still answers 503 when the instance is down
+for any other reason. The stopped state ends when the start finishes, and also when an operator starts the instance on
+the machine (probed at most every 2 seconds). A restart of kingresd starts the instance again (`Resume`): the stopped
+state is not persisted, so a deliberate stop does not survive a reboot or a service restart of kingresd.
+
+**The start from memory (CP-02).** The revalidation reads `pg_roles` of this server's instance and fails closed with
+503 when it cannot (that is unchanged for every operation). For `startThisServerInstance` only, when the fresh check
+fails with 503 **and** the instance is verifiably not running (stopped on purpose, or not running for any reason; never
+while it runs), the session is authorized with the cluster roles of the last successful check of that role
+(`auth.Revalidator.LastGood`, kept past the 3-second cache, forgotten by `Changed` and by any refusal) or, when the
+process has not checked that role since it started, the roles of the sign-in, if that check is not older than
+`Deps.StaleRolesMaxAge` (default one hour). The session itself (in memory) must still be valid: an expired or revoked
+token is 401. A check that is too old answers 503 (`system_database_stopped` while the instance is down on purpose).
+Tests: `internal/httpapi/instance_test.go` (`TestStartFromMemoryDoesNotWeakenRevalidation`: a running instance still
+fails closed also for the start; the other operations stay 503 while it is stopped; a role that lost its cluster roles
+is not revived; a check older than the bound is refused; an expired session is 401) and
+`internal/auth/lastgood_test.go`.
+
+**A server that forwards.** A follower that forwards a mutating operation or a leader-bound read (`listTasks`,
+`getTask`, `listAlerts`, `getClusterSettings`) to a leader whose instance is stopped relays the leader's 503
+`system_database_stopped` (the leader's guard answers it). The leader's internal API cannot read the catalog while its
+instance is down, so it authorizes with the leader it knew last (`cmd/kingresd/leadermemory.go`); there is no failover
+and the leader still checks that it is the leader, so this adds no power to a peer. The same remembered leader is what
+a stopped follower uses to find the leader that records its start task.
+
+**What else happens while the instance is down.** There is one instance per server in this version, so "other
+instances" are the instances of the other servers: they keep running and keep serving; the catalog is not updated by
+the stop (the leader keeps listing a stopped follower as `live`; there is no heartbeat, a server is `dead` only when
+the catalog says so), cluster changes made on the leader meanwhile reach the stopped server later through the
+`replicate.apply` task that every role or grant change starts for a server it could not reach (observed in
+`TestFollowerInstanceStopAndStart`). Followers keep answering what they read from their own instance (observed:
+`getThisServer`, `getCluster` 200); what is the leader's answers the leader's 503. The monitor's sampler keeps
+sampling the operating-system metrics of the server (the instance-dependent ones are skipped), remembers the outage
+(`downSince`) and, when the instance runs again, records it and raises the alert `serverDown` (so the alert appears
+when the server is back, as the contract wants, within one sampler interval of 10 seconds); a stop shorter than one
+interval is not seen by it. No ledger digest, verification or other background work of this process needs the
+instance except through the task engine and the sampler, so nothing else runs in the meantime; the engine of the
+leader keeps polling and fails quietly until the database is back. The panel, the audit file and the logs are not
+affected (the audit log is a file).
+
+**Not done.** The stopped state of a deliberate stop is not persisted across a restart of kingresd (see above). The
+leader's `listServers` does not show a stopped follower as down. `start` while the leader is also stopped keeps the
+follower's task in memory only (it is written at the next start).
+
+## Local settings of this server
+
+`getThisServerSettings` (`kingres_readonly`) and `updateThisServerSettings` (`kingres_admin`), in
+`internal/localsettings`. They are per server and are never forwarded; each server answers from its own files, so they
+also work on a standalone server and while the leader is down.
+
+* **Where the values are.** The memory quota and the log directory are in the instance's managed settings
+  (`instance.ManagedSettings.MemoryMegabytes` and `LogDirectory`, recorded in the instance's `settings.json` and
+  rendered into `kingres-managed.conf`; the setup and the join now record the quota there, the old `Extra` values
+  `shared_buffers`, `effective_cache_size`, `maintenance_work_mem` remain valid and are replaced when the quota is
+  changed). `shared_buffers` is a quarter of the quota, `effective_cache_size` half, `maintenance_work_mem` a sixteenth
+  up to 2 GiB (`instance.MemorySettings`); `log_directory` is `log` (below the data directory) unless set. An instance
+  without the recorded quota reports `shared_buffers * 4`, else 1024. The log level of kingresd and the "restart
+  pending" mark are in `<data-dir>/local-settings.json`. A saved log level is applied at start and wins over the
+  configured `log-level` until it is changed again.
+* **Read.** `dataPaths.dataDirectory` is the data directory of kingresd (`walDirectory` is absent, `logDirectory` is
+  present when set), `clientPorts.readWritePort` is the PostgreSQL port of this server (there is no router and no
+  read-only port: `readOnlyPort` is `null`), `logLevel` is `debug`, `info`, `warning` or `error`.
+* **Update (400 `validation_failed`, `errors[].field` is a JSON pointer).** `dataPaths` and `clientPorts` ("cannot be
+  changed after the server was created"), any other member, an empty object, a wrong type, a log level outside the
+  enumeration, `memoryQuota.totalMegabytes` outside 512 to 16777216 (or missing, or an unknown member of
+  `memoryQuota`), and a `logDirectory` that is an empty string. **422 `unprocessable`**: a quota larger than the
+  physical memory when it is known (`/memoryQuota/totalMegabytes`), a `logDirectory` that is not an absolute clean path
+  starting with `/`, does not exist, is not a directory or cannot be written by kingresd (`/logDirectory`). One refused
+  member refuses the whole request; nothing changes. The audit entry records the operation id (and in `details`
+  whether a restart is now required); the settings are never written to a log.
+* **Applying.** `logLevel` is applied at once (`slog.LevelVar`) and never needs a restart. A changed quota or log
+  directory is written to the managed configuration and applies **when the instance is restarted** (kingresd does not
+  reload it, so an instance never runs half of a change; the contract's "restartRequired: true for both" is therefore
+  also what PostgreSQL's contexts need: `shared_buffers` is `postmaster`, `log_directory` is `sighup`). A value equal to
+  the current one changes nothing. A change while the instance is stopped is read by the next start.
+* **`restartRequired` is persistent.** It is true from the change until the postmaster that was running at that moment
+  has been replaced: the state file keeps `pid:start time` of `postmaster.pid` (`instance.Manager.PostmasterToken`),
+  and `restartRequired` is "the token of the running postmaster equals the saved one". Every way of restarting
+  (`restartThisServerInstance`, stop and start, an operator, a reboot) ends it, kingresd's own restart does not, and no
+  code path that restarts the instance needs a hook.
 
 ---
 

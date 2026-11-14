@@ -47,6 +47,9 @@ func (s *Server) opsHandlers() map[string]handlerFunc {
 		"listLedgerDigests":         s.listLedgerDigests,
 		"generateLedgerDigest":      s.generateLedgerDigest,
 		"startLedgerVerification":   s.startLedgerVerification,
+		"createInclusionProof":      s.createInclusionProof,
+		"listLedgerVerifications":   s.listLedgerVerifications,
+		"getLedgerVerification":     s.getLedgerVerification,
 	}
 }
 
@@ -556,24 +559,29 @@ func (s *Server) startLedgerVerification(c *call, w http.ResponseWriter, r *http
 	return nil
 }
 
-// restartThisServerInstance restarts the local instance as a task. Start and stop
-// are not offered: in a one-server cluster the instance holds the control
-// plane's own state (tasks, sessions need it to sign in), so a stopped
-// instance could neither record the task nor sign anyone in to start it.
+// restartThisServerInstance restarts the local instance as a task (start and
+// stop are in handlers_instance.go). A stopped instance answers 409
+// instance_already_stopped; the only up-to-date copy of a shard group needs force.
 func (s *Server) restartThisServerInstance(c *call, w http.ResponseWriter, r *http.Request) error {
 	o, err := s.needOps()
 	if err != nil {
 		return err
 	}
-	pp := newParams(r)
-	id := pp.pathName("instanceId")
-	if p := pp.err(); p != nil {
-		return p
+	id, err := s.instanceTarget(r)
+	if err != nil {
+		return err
 	}
-	if id != "1" {
-		return problem.New(problem.NotFound, "No such instance on this server.")
+	force, err := s.forceOf(w, r)
+	if err != nil {
+		return err
 	}
-	t, err := o.StartTask(r.Context(), ops.KindInstanceRestart, "instance", id, map[string]string{"instanceId": id}, c.session.Username)
+	if st, serr := o.InstanceState(r.Context()); serr == nil && (st == ops.StateStopped || st == ops.StateStopping) {
+		return problem.New(problem.InstanceAlreadyStopped, "The instance is stopped; use startThisServerInstance.")
+	}
+	if err := s.checkReplicas(r, id, force); err != nil {
+		return err
+	}
+	t, err := o.RestartInstance(r.Context(), id, c.session.Username)
 	if err != nil {
 		return s.taskProblem(r, err)
 	}

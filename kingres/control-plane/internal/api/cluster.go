@@ -202,6 +202,15 @@ type Server struct {
 	JoinedAt *Time `json:"joinedAt"`
 	// LastHeartbeatAt is the last heartbeat seen by the manager; null when not available.
 	LastHeartbeatAt *Time `json:"lastHeartbeatAt"`
+	// CertificateExpiresAt is the notAfter of the server certificate the
+	// cluster issued to the server; null when it has not been read.
+	CertificateExpiresAt *Time `json:"certificateExpiresAt"`
+	// SeenFingerprint is the SHA-256 fingerprint (64 lower-case hex digits) of
+	// the bootstrap certificate recorded on first contact; null when none was.
+	SeenFingerprint *string `json:"seenFingerprint"`
+	// FingerprintPinned tells whether the fingerprint was checked against one
+	// the operator gave; false whenever SeenFingerprint is null.
+	FingerprintPinned bool `json:"fingerprintPinned"`
 	// Instances are the instances on the server.
 	Instances []Instance `json:"instances"`
 	// Buckets are the bucket counts of the server.

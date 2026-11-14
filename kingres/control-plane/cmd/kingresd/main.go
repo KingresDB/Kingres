@@ -30,6 +30,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/httpapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/leader"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/localsettings"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/membership"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/monitor"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ops"
@@ -51,7 +52,7 @@ var version = "0.2.0-dev"
 var commit = "unknown"
 
 // contractRevision is the revision of kingres/api/openapi.yaml implemented.
-const contractRevision = "0.3.0"
+const contractRevision = "0.4.0"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -90,7 +91,10 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	if err != nil {
 		return err
 	}
-	log := newLogger(cfg, stderr)
+	// The level can be changed while running (updateThisServerSettings).
+	var logLevel slog.LevelVar
+	logLevel.Set(cfg.SlogLevel())
+	log := newLogger(cfg, stderr, &logLevel)
 	log.Info("starting kingresd", "version", version, "config", cfg)
 
 	hostname, err := os.Hostname()
@@ -210,12 +214,20 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		LoopbackOnly: !cfg.AllowRemoteSetup, SetupService: svc, DataDir: cfg.DataDir, Ops: opsSvc, Started: started, Metrics: ring, MetricsToken: cfg.MetricsToken,
 		LogDir: filepath.Join(cfg.DataDir, "instances", "1", "pgdata", "log"), MaxBodyBytes: cfg.MaxBodyBytes,
 		RequestTimeout: cfg.RequestTimeout, LoginRateLimit: cfg.LoginRateLimit,
-		LoginRateWindow: cfg.LoginRateWindow, SessionTTL: cfg.SessionTTL,
+		LoginRateWindow: cfg.LoginRateWindow, SessionTTL: cfg.SessionTTL, TLS: cfg.TLSCertFile != "",
 	}
 	if proxy != nil {
 		deps.Proxy = proxy
 	}
+	if svc.Enabled() {
+		deps.LocalSettings, err = localsettings.New(localsettings.Options{
+			DataDir: cfg.DataDir, Instances: svc.Manager(), InstanceID: cluster.NodeID, PGPort: cfg.PGPort, Level: &logLevel, Log: log})
+		if err != nil {
+			return err
+		}
+	}
 	leaders := leader.New(pg.ManagerLeader, 2*time.Second, nil)
+	lastLeader := &leaderMemory{}
 	var members *membership.Manager
 	var receiver *membership.Receiver
 	peerDir, err := peers.Open(cfg.DataDir)
@@ -232,6 +244,9 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		}
 		pc := peerclient.New(peerclient.Config{PKIDir: svc.PKIDir(), Peers: peerDir, Revoked: svc.RevokedSerials})
 		deps.Forwarder = &peerclient.Forwarder{Self: serverHost, Leaders: leaders, Client: pc}
+		opsSvc.Recorder = opsSvc.NewPeerRecorder(func(ctx context.Context) (string, bool, error) {
+			return lastLeader.resolve(ctx, leaders, serverHost)
+		}, pc)
 		members = &membership.Manager{Svc: svc, Ops: opsSvc, Peers: peerDir, Client: peerclient.New(peerclient.Config{PKIDir: svc.PKIDir(), Peers: peerDir, Revoked: svc.RevokedSerials, Timeout: 10 * time.Minute}), Leaders: leaders, Self: serverHost, Version: version, Log: log,
 			SelfPeer: peers.Peer{ServerID: serverHost, InternalAddr: net.JoinHostPort(serverHost, iport)},
 			Audit: func(ctx context.Context, ev audit.Event) {
@@ -285,6 +300,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 			}
 			var eng *task.Engine
 			defs := opsSvc.Definitions()
+			defs = append(defs, opsSvc.InstanceDefinitions()...)
 			if members != nil {
 				defs = append(defs, members.Definitions()...)
 			}
@@ -328,6 +344,9 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		wg.Wait()
 		return err
 	}
+	if members != nil {
+		members.ResumeLeave() // a leave that was under way when kingresd stopped
+	}
 
 	if opsSvc != nil && node.State() == setup.Clustered {
 		// The stored network rules are the truth; rewrite pg_hba.conf from them.
@@ -345,7 +364,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		go func() {
 			defer wg.Done()
 			serveInternal(bgCtx, internalDeps{addr: cfg.InternalListen, svc: svc, node: node, ring: ring, log: log, started: started,
-				serverHost: serverHost, version: version, dataDir: cfg.DataDir, leaders: leaders, forward: func(ctx context.Context, peer string, fr internalapi.ForwardRequest) (internalapi.ForwardResponse, error) {
+				serverHost: serverHost, version: version, dataDir: cfg.DataDir, leaders: leaders, ops: opsSvc, lastLeader: lastLeader, forward: func(ctx context.Context, peer string, fr internalapi.ForwardRequest) (internalapi.ForwardResponse, error) {
 					// A forwarding server must be a member of the cluster (CP-07); its certificate was
 					// already checked against the CA and the revocation list by the internal API.
 					if _, ok := peerDir.Get(peer); !ok {
@@ -400,8 +419,8 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	return runErr
 }
 
-func newLogger(cfg config.Config, out io.Writer) *slog.Logger {
-	opts := &slog.HandlerOptions{Level: cfg.SlogLevel()}
+func newLogger(cfg config.Config, out io.Writer, level *slog.LevelVar) *slog.Logger {
+	opts := &slog.HandlerOptions{Level: level}
 	if cfg.LogFormat == "json" {
 		return slog.New(slog.NewJSONHandler(out, opts))
 	}

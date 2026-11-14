@@ -131,6 +131,13 @@ func (s *Server) guard(c *call, r *http.Request) *problem.Problem {
 		}
 	}
 
+	// 3b. The instance of this server was stopped on purpose: everything that needs
+	// the system database answers 503 system_database_stopped (README "Starting
+	// and stopping the instance").
+	if p := s.gateStoppedInstance(op); p != nil {
+		return p
+	}
+
 	switch {
 	case !sessionOp && !setupOp:
 		// Public operation (health, login, setup state): nothing to check.
@@ -244,7 +251,7 @@ func (s *Server) checkSession(c *call, r *http.Request) *problem.Problem {
 	if p != nil {
 		return p
 	}
-	cur, perr := s.currentRoles(r, sess.Username)
+	cur, perr := s.sessionRoles(c, r, sess)
 	if perr != nil {
 		return perr
 	}
@@ -278,7 +285,7 @@ func (s *Server) authenticate(r *http.Request) (auth.Session, string, *problem.P
 			return auth.Session{}, "", unauth(problem.Unauthenticated, "The Authorization header must be \"Bearer <token>\".")
 		}
 		cred, want = strings.TrimSpace(token), auth.KindToken
-	} else if ck, err := r.Cookie(CookieName); err == nil && ck.Value != "" {
+	} else if ck, err := r.Cookie(s.sessionCookieName()); err == nil && ck.Value != "" {
 		cred, want = ck.Value, auth.KindCookie
 	} else {
 		return auth.Session{}, "", unauth(problem.Unauthenticated, "No valid session or token was presented.")

@@ -256,6 +256,127 @@ for (const k of ['ledgerVerificationFailed', 'ledgerPendingTooOld', 'versionMism
 }
 if (schemas.LedgerVerification?.properties?.taskId?.type?.includes?.('null') !== true) fail('LedgerVerification.taskId', 'must be nullable');
 
+// 0.4.0 rules, second part: conflicts, problem codes, Server, InclusionProof, digests, closed update requests.
+const opById = new Map(operations.map((o) => [o.op.operationId, o]));
+const opDesc = (id) => opById.get(id)?.op.description ?? '';
+const respCodes = (id) => Object.keys(opById.get(id)?.op.responses ?? {});
+const problemCodes = new Set(schemas.ProblemCode?.enum ?? []);
+
+// Every operation of the conflict list answers 409 and names the codes it can answer in its description.
+const CONFLICTS = {
+  startThisServerInstance: ['instance_already_running', 'operation_in_progress', 'system_database_stopped'],
+  stopThisServerInstance: ['instance_already_stopped', 'operation_in_progress', 'no_replica_available', 'system_database_stopped'],
+  restartThisServerInstance: ['instance_already_stopped', 'operation_in_progress', 'no_replica_available'],
+  leaveCluster: ['last_server', 'server_hosts_map_group', 'server_owns_buckets', 'rebalance_in_progress', 'operation_in_progress'],
+  removeServer: ['last_server', 'server_hosts_map_group', 'server_owns_buckets', 'rebalance_in_progress', 'operation_in_progress'],
+  updateServer: ['operation_in_progress', 'rebalance_in_progress'],
+  createServerGroup: ['already_exists'],
+  deleteServerGroup: ['server_group_not_empty'],
+  createInclusionProof: ['ledger_entry_pending'],
+};
+for (const [id, codes] of Object.entries(CONFLICTS)) {
+  if (!opById.has(id)) { fail(id, 'operation of the conflict list does not exist'); continue; }
+  if (!respCodes(id).includes('409')) fail(id, 'must list 409');
+  for (const c of codes) {
+    if (!problemCodes.has(c)) fail(id, `problem code ${c} is not in ProblemCode`);
+    if (!opDesc(id).includes('`' + c + '`')) fail(id, `description must name the conflict code ${c}`);
+  }
+}
+// 404 where an addressed resource can be unknown, 400 where a body is validated.
+for (const id of ['removeServer', 'updateServer', 'deleteServerGroup', 'startThisServerInstance', 'stopThisServerInstance', 'createInclusionProof', 'getLedgerVerification', 'listLedgerVerifications']) {
+  if (!respCodes(id).includes('404')) fail(id, 'must list 404');
+}
+for (const id of ['updateServer', 'createServerGroup', 'updateThisServerSettings', 'createInclusionProof', 'listLedgerVerifications']) {
+  if (!respCodes(id).includes('400')) fail(id, 'must list 400');
+}
+// The stop decision is part of the contract: 503 system_database_stopped exists and is explained.
+for (const c of ['instance_already_running', 'instance_already_stopped', 'server_owns_buckets', 'server_hosts_map_group', 'last_server', 'server_group_not_empty', 'ledger_entry_pending', 'system_database_stopped']) {
+  if (!problemCodes.has(c)) fail('ProblemCode', 'missing ' + c);
+}
+if (!/system_database_stopped/.test(doc.components?.responses?.ServiceUnavailable?.description ?? '')) fail('ServiceUnavailable', 'must explain system_database_stopped');
+// Every code named in the lists of the ProblemCode and Conflict descriptions exists in the enum.
+for (const [where, text] of [['ProblemCode', schemas.ProblemCode?.description], ['Conflict', doc.components?.responses?.Conflict?.description]]) {
+  for (const m of (text ?? '').matchAll(/`([a-z]+(?:_[a-z]+)+)`/g)) if (!problemCodes.has(m[1])) fail(where, `description names ${m[1]}, which is not a ProblemCode`);
+}
+// Every 409 code of the Conflict description is answered by at least one operation (named in its description).
+for (const m of (doc.components?.responses?.Conflict?.description ?? '').matchAll(/`([a-z]+(?:_[a-z]+)+)`/g)) {
+  const code = m[1];
+  if (!operations.some((o) => (o.op.description ?? '').includes('`' + code + '`')) && !['already_exists', 'immutable_field', 'task_not_cancellable', 'last_admin', 'role_in_use', 'optimistic_lock_failed', 'rebalance_in_progress', 'operation_in_progress', 'no_replica_available'].includes(code)) {
+    fail('Conflict', `code ${code} is not named by any operation`);
+  }
+}
+
+// Server: certificate expiry, seen fingerprint and pinned flag are required; null means "not available".
+const serverProps = schemas.Server?.properties ?? {};
+for (const n of ['certificateExpiresAt', 'seenFingerprint', 'fingerprintPinned']) {
+  if (!(schemas.Server?.required ?? []).includes(n)) fail('Server', `${n} must be required`);
+  if (!serverProps[n]) fail('Server', `${n} is missing`);
+}
+const nullableOf = (p) => {
+  const d = p ?? {};
+  if (Array.isArray(d.type)) return d.type.includes('null');
+  return (d.oneOf ?? d.anyOf ?? []).some((x) => x.type === 'null');
+};
+if (!nullableOf(serverProps.certificateExpiresAt) || serverProps.certificateExpiresAt?.format !== 'date-time') fail('Server.certificateExpiresAt', 'must be a nullable date-time');
+if (!nullableOf(serverProps.seenFingerprint)) fail('Server.seenFingerprint', 'must be nullable');
+if (serverProps.fingerprintPinned?.type !== 'boolean') fail('Server.fingerprintPinned', 'must be a boolean');
+// NodeStateInfo.setupTask is required and nullable (SetupTaskSummary or null).
+if (!(schemas.NodeStateInfo?.required ?? []).includes('setupTask') || !nullableOf(schemas.NodeStateInfo?.properties?.setupTask)) fail('NodeStateInfo.setupTask', 'must be required and nullable');
+if (!schemas.SetupTaskSummary) fail('SetupTaskSummary', 'must exist');
+
+// Closed update requests: the server refuses unknown members with 400.
+if (schemas.ServerUpdateRequest?.additionalProperties !== false) fail('ServerUpdateRequest', 'must be closed (additionalProperties: false)');
+if (JSON.stringify(Object.keys(schemas.ServerUpdateRequest?.properties ?? {}).sort()) !== '["serverGroup","shouldHaveShards"]') fail('ServerUpdateRequest', 'may only change serverGroup and shouldHaveShards');
+if (schemas.LocalSettingsUpdate?.additionalProperties !== false) fail('LocalSettingsUpdate', 'must be closed (additionalProperties: false)');
+if (schemas.InclusionProofRequest?.additionalProperties !== false) fail('InclusionProofRequest', 'must be closed (additionalProperties: false)');
+// Server groups: the create request has a name pattern.
+if (!schemas.ServerGroupCreateRequest?.properties?.name?.pattern) fail('ServerGroupCreateRequest.name', 'must have a pattern');
+
+// InclusionProof is the extension's own document (snake_case, verifiable by kingres-verify) plus shard_group_id.
+const PROOF_REQUIRED = ['format', 'chain_id', 'table_id', 'ledger_txid', 'seq', 'op', 'row_hash', 'entry_index', 'entry_count', 'entry_path', 'tx_root', 'user_name', 'tx_index', 'tx_path', 'block', 'chain', 'shard_group_id'];
+const proofReq = schemas.InclusionProof?.required ?? [];
+for (const n of PROOF_REQUIRED) {
+  if (!proofReq.includes(n)) fail('InclusionProof', `${n} must be required`);
+  if (!schemas.InclusionProof?.properties?.[n]) fail('InclusionProof', `${n} is not defined`);
+}
+for (const n of Object.keys(schemas.InclusionProof?.properties ?? {})) {
+  if (!/^[a-z][a-z0-9_]*$/.test(n)) fail('InclusionProof', `member ${n} must be snake_case (the extension's document)`);
+}
+if (schemas.InclusionProof?.properties?.relation && proofReq.includes('relation')) fail('InclusionProof', 'relation is informational and must stay optional');
+if (schemas.InclusionProof?.properties?.format?.const !== 1) fail('InclusionProof.format', 'must be const 1');
+if (schemas.MerkleStep) fail('MerkleStep', 'was removed with the new InclusionProof (the extension has no left/right positions)');
+const hdr = schemas.LedgerProofBlockHeader;
+for (const n of ['height', 'hash_version', 'prev_hash', 'tx_merkle_root', 'tx_count', 'closed_at_us']) {
+  if (!(hdr?.required ?? []).includes(n)) fail('LedgerProofBlockHeader', `${n} must be required`);
+}
+if (!hdr?.properties?.block_hash) fail('LedgerProofBlockHeader', 'block_hash is missing');
+if ((hdr?.required ?? []).includes('block_hash')) fail('LedgerProofBlockHeader', 'block_hash is optional in chain[] (required for block via allOf)');
+// The digest document of a chain is part of LedgerDigest so that it can be handed to kingres-verify.
+const digestChain = schemas.LedgerDigest?.properties?.chains?.items;
+if (!(digestChain?.required ?? []).includes('document') || digestChain?.properties?.document?.type !== 'object') fail('LedgerDigest.chains[].document', 'must be a required object');
+// createInclusionProof describes the kingres-verify hand-over and the row lookup.
+for (const needle of ['kingres-verify', 'ledger_entry_pending', 'primary key']) {
+  if (!opDesc('createInclusionProof').includes(needle)) fail('createInclusionProof', `description must mention ${needle}`);
+}
+// LedgerVerification: taskId nullable (checked above), a cursor-paged list, 404 on the detail.
+if (schemas.LedgerVerificationPage?.required?.includes('nextCursor') !== true) fail('LedgerVerificationPage', 'nextCursor must be required');
+const lvParams = (opById.get('listLedgerVerifications')?.op.parameters ?? []).map((p) => deref(p)?.name);
+for (const n of ['limit', 'cursor']) if (!lvParams.includes(n)) fail('listLedgerVerifications', `parameter ${n} is missing`);
+// Settings: restartRequired is a required response property.
+if (!(schemas.LocalSettings?.required ?? []).includes('restartRequired')) fail('LocalSettings', 'restartRequired must be required');
+// The README changelog has the three sections for the current version and names the new codes.
+const cl = readme.slice(readme.indexOf(`### ${doc.info?.version}\n`));
+const clEnd = cl.indexOf('\n### ', 5);
+const changelog = clEnd > 0 ? cl.slice(0, clEnd) : cl;
+for (const h of ['#### Breaking', '#### Additive', '#### Documentation']) if (!changelog.includes(h)) fail('README.md', `changelog of ${doc.info?.version} lacks "${h}"`);
+for (const c of ['system_database_stopped', 'server_owns_buckets', 'ledger_entry_pending', 'seenFingerprint', 'InclusionProof']) {
+  if (!changelog.includes(c)) fail('README.md', `changelog of ${doc.info?.version} must mention ${c}`);
+}
+if (changelog.includes('are **not in this revision**')) fail('README.md', 'removeServer, createInclusionProof and server groups are in this revision now');
+const m = changelog.match(/\((\d+) operations added \((\d+) operations, (\d+) paths\)/) ?? changelog.match(/(\d+) operations added \((\d+) operations, (\d+) paths\)/);
+if (!m) fail('README.md', 'the changelog summary must state "N operations added (M operations, P paths)"');
+else if (Number(m[2]) !== operations.length || Number(m[3]) !== Object.keys(doc.paths ?? {}).length) fail('README.md', `changelog says ${m[2]} operations and ${m[3]} paths, the contract has ${operations.length} and ${Object.keys(doc.paths ?? {}).length}`);
+
 // ------------------------------------------------------------------ report
 const pathCount = Object.keys(doc.paths ?? {}).length;
 console.log(`openapi ${doc.openapi}, info.version ${doc.info?.version}`);

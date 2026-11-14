@@ -8,7 +8,9 @@
 # (default: HEAD of the repository). Records the commit in
 # ~/kw-cp/install/extensions-commit.txt.
 set -euo pipefail
-repo="${KINGRES_REPO:?set KINGRES_REPO to the root of the repository}"
+# The repository root is three levels above this script
+# (kingres/control-plane/scripts); KINGRES_REPO overrides it.
+repo="${KINGRES_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
 commit="$(git -c safe.directory='*' -C "$repo" rev-parse "${1:-HEAD}")"
 inst="$HOME/kw-cp/install"
 for ext in kingres_shard kingres_ledger; do

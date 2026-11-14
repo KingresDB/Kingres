@@ -97,6 +97,8 @@ type LedgerDigestChain struct {
 	ShardGroupID int32  `json:"shardGroupId"`
 	BlockHeight  int64  `json:"blockHeight"`
 	BlockHash    string `json:"blockHash"`
+	// Document is the digest of the chain exactly as the extension made it.
+	Document JSONDocument `json:"document"`
 }
 
 // DigestAnchor is an external anchoring target (none exist yet).

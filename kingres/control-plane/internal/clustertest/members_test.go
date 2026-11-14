@@ -328,11 +328,16 @@ func TestFingerprintModesAndSetupTokenReplay(t *testing.T) {
 		t.Errorf("wrong token: %d %v", st, out)
 	}
 	// The right pin works (pinned mode).
-	st, add := leader.AddServer(n1, n1.SetupToken(), n1.BootstrapFingerprint())
+	seen1 := n1.BootstrapFingerprint()
+	st, add := leader.AddServer(n1, n1.SetupToken(), seen1)
 	if st != 202 {
 		t.Fatalf("pinned add: %d %v", st, add)
 	}
 	leader.WaitTaskDone(clustertest.TaskID(add), 6*time.Minute)
+	// The pinned add is recorded as such: the fingerprint that was checked.
+	if s := leader.Servers()[n1.Host]; s["seenFingerprint"] != seen1 || s["fingerprintPinned"] != true {
+		t.Errorf("after the pinned add: seenFingerprint %v, fingerprintPinned %v (want %s, true)", s["seenFingerprint"], s["fingerprintPinned"], seen1)
+	}
 
 	// Replay of the setup token of a server that joined: refused.
 	oldToken := "" // the token file is gone; keep what an attacker could have captured
@@ -385,6 +390,11 @@ func TestFingerprintModesAndSetupTokenReplay(t *testing.T) {
 	n2.WaitSetup(8 * time.Minute)
 	if got := leader.Servers(); len(got) != 3 {
 		t.Errorf("after the pinned join: %v", got)
+	} else if s := got[n2.Host]; s["seenFingerprint"] != nil || s["fingerprintPinned"] != false {
+		// The fingerprint that was pinned is the existing server's, checked by the
+		// joining server (its setup task says so); the leader saw no certificate of
+		// the joining server, so it has no first contact to report.
+		t.Errorf("after the pinned join: seenFingerprint %v, fingerprintPinned %v", s["seenFingerprint"], s["fingerprintPinned"])
 	}
 }
 

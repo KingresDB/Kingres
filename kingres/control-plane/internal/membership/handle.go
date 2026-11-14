@@ -145,19 +145,30 @@ func (r *Receiver) Handle(ctx context.Context, key, peer string, body []byte) (a
 		}
 		return wire.Empty{}, svc.FinishMember(req.ClusterID, req.ClusterName)
 	case "POST /node/reset":
-		if err := svc.ResetMember(ctx); err != nil {
+		if err := m.ResetLocal(ctx); err != nil {
 			return nil, err
-		}
-		for _, p := range m.Peers.All() {
-			m.Client.Forget(p.ServerID)
-		}
-		if err := m.Peers.Replace(nil); err != nil {
-			return nil, err
-		}
-		if m.SelfPeer.ServerID != "" {
-			_ = m.Peers.Put(m.SelfPeer)
 		}
 		return wire.Empty{}, nil
+	case "POST /leave-cluster":
+		req, err := decode[wire.LeaveRequest](body)
+		if err != nil {
+			return nil, err
+		}
+		if m.Ops == nil {
+			return nil, &internalapi.CallError{Status: http.StatusNotImplemented, Code: "not_available", Message: "this server cannot run operations"}
+		}
+		res, err := m.LeaveFromPeer(ctx, peer, req)
+		return res, toCallError(err)
+	case "POST /leave-status":
+		req, err := decode[wire.LeaveStatusRequest](body)
+		if err != nil {
+			return nil, err
+		}
+		if m.Ops == nil {
+			return nil, &internalapi.CallError{Status: http.StatusNotImplemented, Code: "not_available", Message: "this server cannot run operations"}
+		}
+		res, err := m.LeaveStatus(ctx, peer, req)
+		return res, toCallError(err)
 	case "POST /apply":
 		req, err := decode[wire.ApplyRequest](body)
 		if err != nil {

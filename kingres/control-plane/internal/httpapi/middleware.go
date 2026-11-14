@@ -64,11 +64,11 @@ func (w *statusWriter) Write(b []byte) (int, error) {
 func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 // chain wraps the mux with the outer middleware: request id,
-// access log, panic recovery and security headers (outermost first). The
+// security headers (headers.go), access log and panic recovery (outermost first). The
 // recoverer sits inside the access log so that a panicking request is still
 // logged, with status 500.
 func (s *Server) chain(next http.Handler) http.Handler {
-	return s.requestID(s.accessLog(s.recoverer(s.securityHeaders(next))))
+	return s.requestID(s.securityHeaders(s.accessLog(s.recoverer(next))))
 }
 
 // requestID assigns the request id, taken from a well-formed incoming
@@ -136,18 +136,6 @@ func (s *Server) accessLog(next http.Handler) http.Handler {
 			level = s.log.Error
 		}
 		level("request", attrs...)
-	})
-}
-
-// securityHeaders sets headers that apply to every response.
-func (s *Server) securityHeaders(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		h := w.Header()
-		h.Set("X-Content-Type-Options", "nosniff")
-		h.Set("Referrer-Policy", "no-referrer")
-		h.Set("X-Frame-Options", "DENY")
-		h.Set("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'")
-		next.ServeHTTP(w, r)
 	})
 }
 

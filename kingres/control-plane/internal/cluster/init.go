@@ -242,7 +242,7 @@ func (s *Service) stepInstance(ctx context.Context, env *task.Env) error {
 		err := s.mgr.Init(ctx, instance.Spec{
 			ID: NodeID, SuperuserPassword: pw, HBA: HBARules(defaultRules()),
 			Settings: instance.ManagedSettings{
-				Port: s.cfg.PGPort, ListenAddresses: s.cfg.PGListen, ClusterName: p.ClusterName,
+				Port: s.cfg.PGPort, ListenAddresses: s.cfg.PGListen, ClusterName: p.ClusterName, MemoryMegabytes: mb,
 				TLSCertFile: s.cfg.TLSCertFile, TLSKeyFile: s.cfg.TLSKeyFile,
 				Extra: map[string]string{
 					"shared_buffers":       itoa(mb/4) + "MB",

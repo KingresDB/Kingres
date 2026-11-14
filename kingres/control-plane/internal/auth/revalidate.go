@@ -24,6 +24,15 @@ type Revalidator struct {
 	mu    sync.Mutex
 	cache map[string]revalEntry
 	epoch uint64
+	// good is the last successful answer per role, kept past the cache time for
+	// LastGood (never used to authorize anything but the start of a stopped
+	// instance).
+	good map[string]goodEntry
+}
+
+type goodEntry struct {
+	roles []string
+	at    time.Time
 }
 
 type revalEntry struct {
@@ -44,7 +53,7 @@ func NewRevalidator(a Authenticator, sessions *Store, ttl time.Duration, now fun
 	if now == nil {
 		now = time.Now
 	}
-	return &Revalidator{authn: a, sessions: sessions, ttl: ttl, now: now, cache: map[string]revalEntry{}}
+	return &Revalidator{authn: a, sessions: sessions, ttl: ttl, now: now, cache: map[string]revalEntry{}, good: map[string]goodEntry{}}
 }
 
 // Roles returns the current cluster roles of the role. ErrInvalidCredentials
@@ -67,6 +76,14 @@ func (v *Revalidator) Roles(ctx context.Context, username string) ([]string, err
 		v.sessions.RevokeUser(username)
 	}
 	v.mu.Lock()
+	if err == nil {
+		if len(v.good) > 4096 {
+			v.good = map[string]goodEntry{}
+		}
+		v.good[username] = goodEntry{roles: roles, at: v.now()}
+	} else {
+		delete(v.good, username)
+	}
 	if len(v.cache) > 4096 {
 		v.cache = map[string]revalEntry{}
 	}
@@ -84,5 +101,20 @@ func (v *Revalidator) Changed(username string) {
 	v.mu.Lock()
 	v.epoch++
 	v.cache = map[string]revalEntry{}
+	v.good = map[string]goodEntry{}
 	v.mu.Unlock()
+}
+
+// LastGood returns the cluster roles of the role's last successful check, if
+// it is not older than maxAge. It is for the one operation that must work while
+// PostgreSQL cannot be asked (starting the stopped instance, see the README);
+// every other caller uses Roles, which fails closed.
+func (v *Revalidator) LastGood(username string, maxAge time.Duration) ([]string, bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	g, ok := v.good[username]
+	if !ok || v.now().Sub(g.at) > maxAge || len(g.roles) == 0 {
+		return nil, false
+	}
+	return append([]string(nil), g.roles...), true
 }

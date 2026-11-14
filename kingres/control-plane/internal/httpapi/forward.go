@@ -46,6 +46,11 @@ type Forwarder interface {
 // are answered by the leader too.
 var leaderBoundReads = map[string]bool{
 	"listTasks": true, "getTask": true, "listAlerts": true, "getClusterSettings": true,
+	// The groups are state of the leader's system database (see completeServers).
+	"listServerGroups": true,
+	// The verification records get their identifiers in the system database
+	// the first time they are read (README, "Inclusion proofs and verification records").
+	"listLedgerVerifications": true, "getLedgerVerification": true,
 }
 
 // forwardsToLeader tells whether an operation is run by the leader. Mutating
@@ -64,7 +69,9 @@ func forwardsToLeader(op contract.Operation) bool {
 	case "Auth", contract.TagSetup, contract.TagHealth, "This server":
 		return false
 	}
-	return op.ID != "executeQuery"
+	// createInclusionProof is a POST that changes nothing: it reads the row as
+	// the signed-in role, like the query workbench, wherever the user is.
+	return op.ID != "executeQuery" && op.ID != "createInclusionProof"
 }
 
 type fwdKey struct{}
@@ -159,7 +166,7 @@ func (s *Server) ServeForwarded(ctx context.Context, peer string, fr internalapi
 			break
 		}
 	}
-	if !found || !forwardsToLeader(op) {
+	if !found || !(forwardsToLeader(op) || forwardedReads[op.ID]) {
 		return internalapi.ForwardResponse{}, fmt.Errorf("operation %q is not forwarded", fr.OperationID)
 	}
 	if err := validateIdentity(fr.Identity); err != nil {

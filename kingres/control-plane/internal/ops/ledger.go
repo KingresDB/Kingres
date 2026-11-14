@@ -59,15 +59,16 @@ type digestRow struct {
 	height      int64
 	hash        string
 	hashVersion int
+	doc         []byte
 }
 
 const digestCols = `digest_id, generated_at, generated_by::text, height, encode(block_hash, 'hex'),
-	coalesce((digest->>'hash_version')::int, 1)`
+	coalesce((digest->>'hash_version')::int, 1), digest`
 
 func toDigest(db string, r digestRow, group int32) api.LedgerDigest {
 	by := r.by
 	return api.LedgerDigest{ID: r.id, DatabaseName: db, GeneratedAt: r.at.UTC(), GeneratedBy: &by, HashVersion: r.hashVersion,
-		Chains: []api.LedgerDigestChain{{ShardGroupID: group, BlockHeight: r.height, BlockHash: r.hash}}, Anchors: []api.DigestAnchor{}}
+		Chains: []api.LedgerDigestChain{{ShardGroupID: group, BlockHeight: r.height, BlockHash: r.hash, Document: r.doc}}, Anchors: []api.DigestAnchor{}}
 }
 
 // GenerateDigest builds a block if needed, records and returns the digest.
@@ -89,10 +90,10 @@ func (o *Ops) GenerateDigest(ctx context.Context, db string) (api.LedgerDigest, 
 		}
 		var r digestRow
 		if err := tx.QueryRow(ctx, "SELECT "+digestCols+" FROM kingres.ledger_digest ORDER BY digest_id DESC LIMIT 1").
-			Scan(&r.id, &r.at, &r.by, &r.height, &r.hash, &r.hashVersion); err != nil {
+			Scan(&r.id, &r.at, &r.by, &r.height, &r.hash, &r.hashVersion, &r.doc); err != nil {
 			return err
 		}
-		out = toDigest(db, r, 0)
+		out = toDigest(db, r, localGroup(ctx, tx))
 		return nil
 	})
 	return out, wrap(err)
@@ -123,7 +124,7 @@ func (o *Ops) ListDigests(ctx context.Context, db string, p store.Page) (api.Led
 		}
 		list, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (digestRow, error) {
 			var d digestRow
-			return d, r.Scan(&d.id, &d.at, &d.by, &d.height, &d.hash, &d.hashVersion)
+			return d, r.Scan(&d.id, &d.at, &d.by, &d.height, &d.hash, &d.hashVersion, &d.doc)
 		})
 		if err != nil {
 			return err
@@ -133,8 +134,9 @@ func (o *Ops) ListDigests(ctx context.Context, db string, p store.Page) (api.Led
 			page.NextCursor = &next
 			list = list[:p.Limit]
 		}
+		group := localGroup(ctx, tx)
 		for _, d := range list {
-			page.Items = append(page.Items, toDigest(db, d, 0))
+			page.Items = append(page.Items, toDigest(db, d, group))
 		}
 		return nil
 	})
@@ -199,6 +201,9 @@ func (o *Ops) stepVerifyLedger(ctx context.Context, env *task.Env) error {
 	}
 	var id int64
 	if err := c.QueryRow(ctx, "SELECT kingres.ledger_verify_recorded($1, NULL)", from).Scan(&id); err != nil {
+		return err
+	}
+	if err := o.recordVerificationTask(ctx, p.Database, c, id, env.Task.ID); err != nil {
 		return err
 	}
 	var state string

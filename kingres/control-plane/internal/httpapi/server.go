@@ -21,6 +21,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/audit"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/auth"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/contract"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/localsettings"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/monitor"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ops"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
@@ -67,6 +68,13 @@ type Deps struct {
 	// Members adds and removes servers (design D4 and D5); nil makes addServer
 	// and removeServer answer "not supported".
 	Members Members
+	// LocalSettings serves getThisServerSettings and updateThisServerSettings;
+	// nil makes them answer "not supported".
+	LocalSettings *localsettings.Manager
+	// StaleRolesMaxAge bounds the age of the last successful role check that
+	// startThisServerInstance may use while the instance is stopped
+	// (DefaultStaleRolesMaxAge when zero).
+	StaleRolesMaxAge time.Duration
 	// Web serves the panel at "/" (static files with SPA fallback); when nil
 	// unknown non-API paths answer with the 404 problem.
 	Web http.Handler
@@ -85,6 +93,10 @@ type Deps struct {
 	// LoginRateLimit and LoginRateWindow configure the login limiter.
 	LoginRateLimit  int
 	LoginRateWindow time.Duration
+	// TLS tells that kingresd itself serves HTTPS (tls-cert-file is set): the
+	// server then sends HSTS and uses the __Host- session cookie. It is never
+	// derived from a request header.
+	TLS bool
 	// SessionTTL is the lifetime of sessions (for the cookie lifetime).
 	SessionTTL time.Duration
 	// Now is the clock; time.Now when nil.
@@ -114,6 +126,7 @@ type Server struct {
 	loginIP       *auth.Limiter     // login attempts per client address
 	loginUser     *auth.Limiter     // login attempts per user name
 	setupLimiter  *auth.Limiter     // setup token attempts per client address
+	inst          instanceState     // start and stop of the local instance
 }
 
 // Route is a method and a full path pattern the server routes.

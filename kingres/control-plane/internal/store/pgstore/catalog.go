@@ -380,6 +380,7 @@ func (s *Store) buildServers(ctx context.Context, cat *catalog, hold map[string]
 		}
 		out = append(out, server)
 	}
+	s.applyRecords(ctx, out)
 	return out
 }
 
@@ -485,6 +486,9 @@ func (s *Store) Server(ctx context.Context, id string) (api.ServerDetail, error)
 
 // ServerGroups implements store.Store.
 func (s *Store) ServerGroups(ctx context.Context) ([]api.ServerGroup, error) {
+	if groups, ok, err := s.recordedGroups(ctx); err != nil || ok {
+		return groups, err
+	}
 	cat, err := s.loadCatalog(ctx)
 	if err != nil {
 		return nil, err

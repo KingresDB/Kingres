@@ -91,11 +91,6 @@ func (o *Ops) Definitions() []task.Definition {
 		{Kind: KindLedgerVerify, Steps: []task.Step{
 			{Name: "Verify the ledger", Run: o.stepVerifyLedger},
 		}},
-		{Kind: KindInstanceRestart, Steps: []task.Step{
-			{Name: "Restart the instance", Run: func(ctx context.Context, _ *task.Env) error {
-				return o.Instances.Restart(ctx, 1)
-			}},
-		}},
 		{Kind: KindNetworkApply, Dynamic: func(in json.RawMessage) ([]task.Step, error) {
 			p, err := rawInput[networkParams](in)
 			if err != nil {
