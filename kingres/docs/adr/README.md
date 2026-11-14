@@ -18,7 +18,7 @@ An ADR records one decision: the context, the decision, its consequences and the
 | [0009](0009-two-phase-commit-no-global-snapshot.md) | 2PC without a global snapshot at first | Accepted | 2026-11-14 | - |
 | [0010](0010-writes-on-any-node.md) | Writes on any node: a primary per server and a router in the agent; no conflict-resolving multi-master | Accepted | 2026-11-14 | - |
 | [0011](0011-replica-count-per-cluster.md) | Replica count per cluster, durability per database | Accepted | 2026-11-14 | 6 |
-| [0012](0012-patroni-bundled-failover.md) | Patroni bundled as the failover engine | Accepted | 2026-11-14 | 7 |
+| [0012](0012-patroni-bundled-failover.md) | Patroni bundled as the failover engine | Superseded by 0021 | 2026-11-14 | 7 |
 | [0013](0013-ledger-tables-and-anchoring-first.md) | Ledger tables and external anchoring first; consensus only with a consortium use case | Accepted | 2026-11-14 | 8 |
 | [0014](0014-one-package-panel-on-every-node.md) | One package and a panel on every node | Accepted | 2026-11-14 | 9 (first OS) |
 | [0015](0015-panel-accounts-are-postgresql-roles.md) | Panel accounts are PostgreSQL roles | Accepted | 2026-11-14 | 10 |
@@ -27,6 +27,7 @@ An ADR records one decision: the context, the decision, its consequences and the
 | [0018](0018-manager-leader-follows-the-map-group-primary.md) | The manager leader is the server of the map group primary | Accepted | 2026-11-14 | - |
 | [0019](0019-cluster-state-in-a-system-database.md) | Control-plane state lives in a system database with embedded migrations | Accepted | 2026-11-14 | - |
 | [0020](0020-no-bundled-metrics-store.md) | No bundled metrics store; kingresd samples and exports metrics itself | Accepted | 2026-11-14 | - |
+| [0021](0021-failover-in-kingresd.md) | Failover is part of kingresd, with leases; Patroni and etcd are not bundled | Accepted | 2026-11-14 | Supersedes 0012 |
 
 "Open decision #" refers to the table "Open decisions" in architecture.md.
 

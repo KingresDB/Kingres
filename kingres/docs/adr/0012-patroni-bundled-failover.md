@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: PostgreSQL -->
 # ADR 0012: Patroni bundled as the failover engine
 
-- Status: Accepted
+- Status: Superseded by [ADR 0021](0021-failover-in-kingresd.md)
 - Date: 2026-11-14
 - Source in architecture.md: Open decisions #7; "HA, replication, DDL and backup"; "One package, and a panel on every node"
 
