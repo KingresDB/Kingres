@@ -1,0 +1,26 @@
+{"digests": [
+  {"file": "digests/d0.json", "height": 0},
+  {"file": "digests/d1.json", "height": 1},
+  {"file": "digests/d2.json", "height": 2},
+  {"file": "digests/d3.json", "height": 3},
+  {"file": "digests/d4.json", "height": 4},
+  {"file": "digests/d5.json", "height": 6}
+],
+"rows": [
+  {"label": "acc1", "relation": "app.accounts", "table_id": 1, "row_hash": "04ff29c1a13bef6365f25f2c74ceec34cb268bbc4204ee5f1211eed8333800fa", "proof": "proofs/acc1.json", "columns": "columns/acc1.json"},
+  {"label": "acc2", "relation": "app.accounts", "table_id": 1, "row_hash": "925417605eaba88b1b1bdc4f8cf4036d88f35c01e820f086273adb514021b11c", "proof": "proofs/acc2.json", "columns": "columns/acc2.json"},
+  {"label": "acc3", "relation": "app.accounts", "table_id": 1, "row_hash": "352190b96a36d43ce9b62561171e6a1e3136bb4293b60d224d22c8e94d218208", "proof": "proofs/acc3.json", "columns": "columns/acc3.json"},
+  {"label": "acc4", "relation": "app.accounts", "table_id": 1, "row_hash": "736968d346bf33cace0d0e254d6553b7698d00db7fe4af8affe3158a75d5bdf9", "proof": "proofs/acc4.json", "columns": "columns/acc4.json"},
+  {"label": "acc5", "relation": "app.accounts", "table_id": 1, "row_hash": "56700cbe26b660e69f01339a5629217dde30b035480f68f9c7873caca086d856", "proof": "proofs/acc5.json", "columns": "columns/acc5.json"},
+  {"label": "evt1", "relation": "app.events", "table_id": 2, "row_hash": "716b3feedf6d74ab67ff97a537488694b9cc10c8359c233924e2da81e32f58e5", "proof": "proofs/evt1.json", "columns": "columns/evt1.json"},
+  {"label": "evt2", "relation": "app.events", "table_id": 2, "row_hash": "aca65e55568d7f959ccd780f93d5ab135fde447dcb78e34e4f1d8ef8f137568c", "proof": "proofs/evt2.json", "columns": "columns/evt2.json"},
+  {"label": "evt3", "relation": "app.events", "table_id": 2, "row_hash": "225cbbb7b1625e24171b64275449f39ab7ed6b27af0659a1521d70f28f0ab88b", "proof": "proofs/evt3.json", "columns": "columns/evt3.json"},
+  {"label": "acc6", "relation": "app.accounts", "table_id": 1, "row_hash": "89c1e1f4516e95cdb4026e54f38d8f0370d8f2e32093de4f0df6b02d63856c1b", "proof": "proofs/acc6.json", "columns": "columns/acc6.json"},
+  {"label": "acc7", "relation": "app.accounts", "table_id": 1, "row_hash": "eb56504ccff12057fe79f5706136a4c4ee2bceab5c4b0565b7daf3785539e683", "proof": "proofs/acc7.json", "columns": "columns/acc7.json"},
+  {"label": "evt4", "relation": "app.events", "table_id": 2, "row_hash": "64a2bca42dacef6180c4e521042c3e68865298cf893628ff8fe3674877a57f30", "proof": "proofs/evt4.json", "columns": "columns/evt4.json"},
+  {"label": "evt8", "relation": "app.events", "table_id": 2, "row_hash": "38295603c2e4f5dd7fe342eaaa3a31d71ba932eb7f9db2bbe757170d4105c7c1", "proof": "proofs/evt8.json", "columns": "columns/evt8.json"},
+  {"label": "acc8", "relation": "app.accounts", "table_id": 1, "row_hash": "1b43fc0327f0f26def0ae36ff2a79bf5842cef984ddfa0a053ea47bb93a70afb", "proof": "proofs/acc8.json", "columns": "columns/acc8.json"},
+  {"label": "evt9", "relation": "app.events", "table_id": 2, "row_hash": "f94403d6b8778d245c662fbcd3c6897082a5bc250061410830643675b3493878", "proof": "proofs/evt9.json", "columns": "columns/evt9.json"},
+  {"label": "evt10", "relation": "app.events", "table_id": 2, "row_hash": "e10eb6d0f3b1b69b8f93f116fa9a8f479a175f5a35e25473e831ecf4e71afa87", "proof": "proofs/evt10.json", "columns": "columns/evt10.json"}
+],
+"blocks": "blocks.jsonl", "other_chain_digest": "digests/other_chain.json"}

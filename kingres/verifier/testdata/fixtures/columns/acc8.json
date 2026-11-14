@@ -1,0 +1,18 @@
+[
+    {
+        "name": "id",
+        "send_hex": "00000008"
+    },
+    {
+        "name": "owner",
+        "send_hex": "68616e6b"
+    },
+    {
+        "name": "balance",
+        "send_hex": "0001000200000002000a"
+    },
+    {
+        "name": "memo",
+        "send_hex": "696e20746865206c61737420626c6f636b"
+    }
+]

@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: PostgreSQL
+#
+# golangci-lint v2 configuration of the kingres-verify module
+# (kingres/docs/dev/coding-standards.md, section 3).
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    - errcheck       # unchecked errors
+    - govet          # go vet
+    - staticcheck    # staticcheck, including deprecated API use
+    - unused         # unused code
+    - ineffassign    # useless assignments
+    - errorlint      # errors.Is/As and %w instead of == and %v
+    - bodyclose      # unclosed HTTP response bodies
+    - noctx          # HTTP requests without a context
+    - gosec          # security checks
+    - revive         # doc comments on exported identifiers, naming
+    - misspell
+    - unconvert
+    - nilerr         # returning nil after checking err != nil
+    - copyloopvar
+    - contextcheck   # context passed through
+    - sloglint       # consistent log/slog usage
+  settings:
+    revive:
+      rules:
+        - name: exported
+          arguments:
+            - checkPrivateReceivers
+        - name: package-comments
+        - name: context-as-argument
+        - name: error-return
+        - name: error-naming
+        - name: error-strings
+        - name: increment-decrement
+        - name: var-naming
+    sloglint:
+      no-mixed-args: true
+      attr-only: false
+    gosec:
+      excludes:
+        - G104 # unchecked errors are covered by errcheck
+        - G101 # false positives on names of header and problem-code constants
+  exclusions:
+    presets:
+      - comments
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - errcheck
+          - noctx
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/KingresDB/Kingres/kingres/verifier

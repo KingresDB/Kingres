@@ -1,0 +1,38 @@
+[
+    {
+        "name": "id",
+        "send_hex": "0000000000000001"
+    },
+    {
+        "name": "kind",
+        "send_hex": "6f70656e"
+    },
+    {
+        "name": "payload",
+        "send_hex": "017b2261223a2022c3a9222c202262223a205b312c20322c207b2263223a206e756c6c7d5d7d"
+    },
+    {
+        "name": "at",
+        "send_hex": "0002ef2a8be16250"
+    },
+    {
+        "name": "small",
+        "send_hex": "7fff"
+    },
+    {
+        "name": "größe",
+        "send_hex": "3fc00000"
+    },
+    {
+        "name": "span",
+        "send_hex": "000000036c97ca88000000030000000e"
+    },
+    {
+        "name": "addr",
+        "send_hex": "02200004c0a80105"
+    },
+    {
+        "name": "empty",
+        "send_hex": ""
+    }
+]

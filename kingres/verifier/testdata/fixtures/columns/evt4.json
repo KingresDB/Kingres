@@ -1,0 +1,14 @@
+[
+    {
+        "name": "id",
+        "send_hex": "0000000000000004"
+    },
+    {
+        "name": "kind",
+        "send_hex": "6c61746572"
+    },
+    {
+        "name": "payload",
+        "send_hex": "015b5d"
+    }
+]

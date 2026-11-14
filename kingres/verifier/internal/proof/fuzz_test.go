@@ -1,0 +1,25 @@
+// SPDX-License-Identifier: PostgreSQL
+
+package proof
+
+import "testing"
+
+// FuzzVerify checks that parsing and verifying arbitrary bytes as a proof
+// never panics, and that a proof that verifies keeps verifying.
+func FuzzVerify(f *testing.F) {
+	for _, n := range []string{"proofs/acc5.json", "proofs/acc1_at_d0.json", "proofs/evt10.json", "digests/d5.json"} {
+		f.Add(readFixture(f, n))
+	}
+	d5 := mustDigest(f, readFixture(f, "digests/d5.json"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		p, err := Parse(data)
+		if err != nil {
+			return
+		}
+		_, err1 := Verify(p, d5, Expect{})
+		_, err2 := Verify(p, d5, Expect{})
+		if (err1 == nil) != (err2 == nil) {
+			t.Error("verification is not deterministic")
+		}
+	})
+}

@@ -1,0 +1,50 @@
+[
+    {
+        "name": "id",
+        "send_hex": "00000001"
+    },
+    {
+        "name": "owner",
+        "send_hex": "616c696365"
+    },
+    {
+        "name": "balance",
+        "send_hex": "000200000000000200641388"
+    },
+    {
+        "name": "opened",
+        "send_hex": "0002ea5dbb1f6f35"
+    },
+    {
+        "name": "active",
+        "send_hex": "01"
+    },
+    {
+        "name": "token",
+        "send_hex": "a0eebc999c0b4ef8bb6d6bb9bd380a11"
+    },
+    {
+        "name": "blob",
+        "send_hex": "00ff10"
+    },
+    {
+        "name": "big",
+        "send_hex": "7fffffffffffffff"
+    },
+    {
+        "name": "ratio",
+        "send_hex": "400921f9f01b866e"
+    },
+    {
+        "name": "note",
+        "send_hex": "706c61696e"
+    },
+    {
+        "name": "tags",
+        "send_hex": "000000010000000000000019000000020000000100000001610000000162"
+    },
+    {
+        "name": "born",
+        "send_hex": "0000251a"
+    }
+]
