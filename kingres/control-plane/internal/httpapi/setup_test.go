@@ -89,7 +89,11 @@ func TestSetupTokenChecks(t *testing.T) {
 		// Right token: authenticated, then the uniform "not yet" response.
 		w := e.do(req{method: "POST", path: p, body: body, header: map[string]string{"X-Setup-Token": tok}})
 		m := wantProblem(t, w, 422, "unsupported_operation")
-		if !strings.Contains(m["detail"].(string), "not supported by this server version yet") {
+		want := "not supported by this server version yet"
+		if strings.HasSuffix(p, "init-cluster") {
+			want = "pg-bin-dir" // no instance management is configured in these tests
+		}
+		if !strings.Contains(m["detail"].(string), want) {
 			t.Errorf("detail = %v", m["detail"])
 		}
 	}

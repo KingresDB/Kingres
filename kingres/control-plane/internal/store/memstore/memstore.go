@@ -337,7 +337,7 @@ func (s *Store) Task(_ context.Context, id int64) (api.Task, error) {
 func (s *Store) LedgerStatuses(context.Context) ([]api.LedgerStatus, error) {
 	out := []api.LedgerStatus{}
 	for _, d := range s.DBs {
-		if st, ok := s.LedgerByDB[d.Name]; ok && st.Mode != "off" {
+		if st, ok := s.LedgerByDB[d.Name]; ok && st.Mode != nil && *st.Mode != "off" {
 			out = append(out, st)
 		}
 	}
@@ -355,7 +355,7 @@ func (s *Store) LedgerStatus(_ context.Context, db string) (api.LedgerStatus, er
 	if st, ok := s.LedgerByDB[db]; ok {
 		return st, nil
 	}
-	return api.LedgerStatus{DatabaseName: db, Mode: "off", DigestIntervalSeconds: 3600,
+	return api.LedgerStatus{DatabaseName: db, Mode: strPtr("off"),
 		Chains: []api.LedgerChainStatus{}}, nil
 }
 
@@ -448,3 +448,5 @@ func contains(list []string, v string) bool {
 	}
 	return false
 }
+
+func strPtr(s string) *string { return &s }

@@ -15,7 +15,7 @@ const specPath = "../../../api/openapi.yaml"
 // TestGeneratedTableIsCurrent fails when operations_gen.go does not match the
 // contract: run "go generate ./internal/contract".
 func TestGeneratedTableIsCurrent(t *testing.T) {
-	doc, err := spec.Load(specPath)
+	doc, err := spec.Load(contractFile())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,4 +88,12 @@ func TestAuditActions(t *testing.T) {
 			t.Errorf("%s must not be an audit action", a)
 		}
 	}
+}
+
+// contractFile is the contract; the WSL runner sets KINGRES_CONTRACT.
+func contractFile() string {
+	if p := os.Getenv("KINGRES_CONTRACT"); p != "" {
+		return p
+	}
+	return specPath
 }

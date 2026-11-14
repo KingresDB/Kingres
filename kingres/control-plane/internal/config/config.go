@@ -67,6 +67,23 @@ type Config struct {
 	// TLSCertFile and TLSKeyFile enable HTTPS when both are set.
 	TLSCertFile string
 	TLSKeyFile  string
+	// PGBinDir is the directory with the PostgreSQL binaries; when set,
+	// kingresd manages the local instance (initdb, pg_ctl).
+	PGBinDir string
+	// PGPort and PGListen are the port and listen_addresses of the managed
+	// instance.
+	PGPort   int
+	PGListen string
+	// SocketDir is the base directory of the instances' unix sockets;
+	// empty means <DataDir>/run.
+	SocketDir string
+	// AllowRemoteSetup lets setup operations come from non-loopback
+	// addresses while the node is uninitialized (default false: safe).
+	AllowRemoteSetup bool
+	// StopInstances is not a setting: it is set by the -stop-instances mode.
+	// ServerHost is the host name this server registers in the cluster
+	// catalog; it is the server id. Empty means the machine's host name.
+	ServerHost string
 }
 
 // setting describes one configuration key.
@@ -169,6 +186,35 @@ var settings = []setting{
 		apply: str(func(c *Config) *string { return &c.TLSCertFile })},
 	{key: "tls-key-file", env: "KINGRES_TLS_KEY_FILE", usage: "TLS private key file",
 		apply: str(func(c *Config) *string { return &c.TLSKeyFile })},
+	{key: "pg-bin-dir", env: "KINGRES_PG_BIN_DIR", usage: "directory with the PostgreSQL binaries; enables managing the local instance",
+		apply: str(func(c *Config) *string { return &c.PGBinDir })},
+	{key: "pg-port", env: "KINGRES_PG_PORT", usage: "TCP port of the managed instance",
+		apply: func(c *Config, v string) error {
+			n := int64(0)
+			if err := integer(func(*Config) *int64 { return &n }, 1024)(c, v); err != nil {
+				return err
+			}
+			if n > 65535 {
+				return fmt.Errorf("port %d is above 65535", n)
+			}
+			c.PGPort = int(n)
+			return nil
+		}},
+	{key: "pg-listen", env: "KINGRES_PG_LISTEN", usage: "listen_addresses of the managed instance",
+		apply: str(func(c *Config) *string { return &c.PGListen })},
+	{key: "socket-dir", env: "KINGRES_SOCKET_DIR", usage: "base directory of the instances' unix sockets (default <data-dir>/run; never /tmp)",
+		apply: str(func(c *Config) *string { return &c.SocketDir })},
+	{key: "allow-remote-setup", env: "KINGRES_ALLOW_REMOTE_SETUP", usage: "true lets the setup operations be called from non-local addresses while the node is uninitialized (default false)",
+		apply: func(c *Config, v string) error {
+			b, err := strconv.ParseBool(v)
+			if err != nil {
+				return fmt.Errorf("invalid boolean %q", v)
+			}
+			c.AllowRemoteSetup = b
+			return nil
+		}},
+	{key: "server-host", env: "KINGRES_SERVER_HOST", usage: "host name this server registers in the cluster catalog (default: the machine's host name)",
+		apply: str(func(c *Config) *string { return &c.ServerHost })},
 }
 
 // Defaults returns the built-in configuration.
@@ -190,6 +236,8 @@ func Defaults() Config {
 		MaxBodyBytes:      1 << 20,
 		LoginRateLimit:    10,
 		LoginRateWindow:   time.Minute,
+		PGPort:            5432,
+		PGListen:          "127.0.0.1",
 	}
 }
 
@@ -308,6 +356,9 @@ func (c *Config) Validate() error {
 	}
 	if (c.TLSCertFile == "") != (c.TLSKeyFile == "") {
 		errs = append(errs, errors.New("tls-cert-file and tls-key-file must be set together"))
+	}
+	if c.SocketDir == "" {
+		c.SocketDir = filepath.Join(c.DataDir, "run")
 	}
 	if c.AuditFile == "" {
 		c.AuditFile = filepath.Join(c.DataDir, "audit.jsonl")

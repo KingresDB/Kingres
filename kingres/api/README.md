@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.2.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.3.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and `kingres-cli`. Lint it and run the mechanical rule check with:
 
 ```
@@ -272,6 +272,50 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.3.0
+
+Revision written together with the second increment of `kingresd` (design: `docs/design/control-plane-2.md`).
+Notation as in 0.2.0. Summary for the panel: 2 new operations (86 operations, 69 paths), 8 response properties
+became nullable, 5 response properties are new and required, 1 request property is new and optional.
+
+#### Breaking
+
+1. **Response properties became nullable** (accept `null` = "not available"):
+   - `Server.version` (the version of a remote server is unknown until it reports it);
+   - `Database.createdAt`, `Database.createdBy` (databases created outside the control plane have no record);
+   - `ClusterOverview.clusterId`, `ClusterOverview.name` (node state without cluster identity);
+   - `LedgerStatus.mode`, `LedgerStatus.digestIntervalSeconds` (now consistent with `Database.ledger.*`: no catalog
+     stores either, so the server answers `null` instead of an invented `optIn`/3600);
+   - `LocalServerInfo.postgresVersion` (no instance is running).
+2. **New required response properties** (the server must emit them; clients may rely on them):
+   - `SetupTaskSummary.steps[]` (`name`, `state` in `pending|running|done|failed`), `createdAt`, `updatedAt`;
+   - `TableColumn.blockingKeys[]` (index names of the primary and unique keys that lack the column; non-empty
+     exactly when `distributionBlockedReason` is `notInUniqueKey`);
+   - `InclusionProof.op` (`I` or `D`).
+3. **`DistributionBlockedReason.notInUniqueKey` changed meaning** (clarified, previously ambiguous): the table has
+   at least one primary or unique key that does not contain the column. A table without any unique key never
+   has this reason, and a column that is part of every unique key can be distributed.
+
+#### Additive
+
+1. **`getClusterSummary`** (`GET /cluster/summary`, role `kingres_stats`): `ClusterSummary` (`clusterId`, `name`,
+   `health`, `serverCount`, `databaseCount`, `openAlerts`), so that a statistics-only account has a cluster view.
+2. **`enableTableLedger`** (`PUT /databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/ledger`, role
+   `kingres_admin`): body `EnableTableLedgerRequest` (`mode` `appendOnly|updatable`), answers 200 with the `Table`;
+   one-way. New `AuditAction` value `enableTableLedger`.
+3. **`InclusionProofRequest.op`** (`I` default, or `D`): which ledger entry of the row to prove; `D` proves a removal
+   (updatable ledger tables).
+4. Examples of `SetupTaskSummary` and `TableColumn` updated.
+
+#### Documentation
+
+1. `info.version` 0.3.0.
+2. `Forbidden` response: the permitted addresses while `localhostOnly` are `127.0.0.0/8` and `::1`; every address
+   otherwise.
+3. `TableColumn.type` is the text of `format_type(atttypid, atttypmod)`, for display only.
+4. `DatabaseCreateOptions.collations[].encodings`: `null` means every encoding, an empty array means none.
+5. The meaning of `null` for the setup, ledger and table fields above is stated in each description.
 
 ### 0.2.0
 

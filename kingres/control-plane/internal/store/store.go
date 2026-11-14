@@ -149,7 +149,7 @@ type Store interface {
 	Buckets(ctx context.Context, db string, colocationID int32, f BucketFilter, p Page) (api.BucketPage, error)
 	BucketDistribution(ctx context.Context, db string, colocationID *int32) (api.BucketDistribution, error)
 
-	// Tasks and Task read kingres.task.
+	// Tasks and Task read kingres_cp.task of the system database.
 	Tasks(ctx context.Context, f TaskFilter, p Page) (api.TaskPage, error)
 	Task(ctx context.Context, id int64) (api.Task, error)
 

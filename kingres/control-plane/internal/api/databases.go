@@ -92,9 +92,9 @@ type Database struct {
 	// RebalanceRequired tells whether buckets need rebalancing.
 	RebalanceRequired bool `json:"rebalanceRequired"`
 	// CreatedBy is the role that created the database.
-	CreatedBy string `json:"createdBy"`
+	CreatedBy *string `json:"createdBy"`
 	// CreatedAt is the creation time.
-	CreatedAt Time `json:"createdAt"`
+	CreatedAt *Time `json:"createdAt"`
 }
 
 // DatabaseList is the response of GET /databases.
@@ -157,6 +157,8 @@ type TableColumn struct {
 	// DistributionBlockedReason is the first applicable reason when the
 	// column cannot be the distribution column.
 	DistributionBlockedReason *string `json:"distributionBlockedReason"`
+	// BlockingKeys are the primary and unique keys that lack the column.
+	BlockingKeys []string `json:"blockingKeys"`
 }
 
 // TableDetail is a table with its columns (response of getTable).

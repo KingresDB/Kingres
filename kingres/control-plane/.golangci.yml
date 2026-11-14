@@ -52,6 +52,10 @@ linters:
       - comments
       - std-error-handling
     rules:
+      - path: pgtest/
+        linters:
+          - gosec
+          - noctx
       - path: _test\.go
         linters:
           - gosec

@@ -45,6 +45,9 @@ type call struct {
 	audit     bool
 	auditSelf bool
 	ip        string
+	// details are extra audit details a handler sets (never secrets or
+	// statement text).
+	details map[string]any
 }
 
 // handlerFunc implements one operation. It writes the success response and
@@ -293,6 +296,9 @@ func (s *Server) recordAudit(c *call, r *http.Request, status int) {
 		}
 	case c.viaSetupToken:
 		ev.Actor = "setup"
+	}
+	for k, v := range c.details {
+		ev.Details[k] = v
 	}
 	ev.ResourceType, ev.ResourceID = resourceOf(c.op, r)
 	s.appendAudit(r, ev, c.op.ID)

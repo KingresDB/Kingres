@@ -17,7 +17,7 @@ embedding, TLS) is the standard library.
 | `github.com/jackc/pgservicefile` | v0.0.0-20240606120523-5a60cdf6a761 | MIT | Dependency of pgx (`pg_service.conf` support). |
 | `github.com/jackc/puddle/v2` | v2.2.3 | MIT | Dependency of `pgxpool` (generic resource pool). |
 | `golang.org/x/sync` | v0.22.0 | BSD-3-Clause | Dependency of puddle (semaphore). |
-| `golang.org/x/text` | v0.41.0 | BSD-3-Clause | Dependency of pgx (Unicode normalization for SCRAM `SASLprep`). |
+| `golang.org/x/text` | v0.41.0 | BSD-3-Clause | Dependency of pgx and used directly by `internal/scram` (`precis`, the SASLprep of SCRAM password verifiers). |
 
 ## Build and test only (not linked into the binary)
 

@@ -43,7 +43,7 @@ FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 	` + distJoin + `
 	` + ledgerJoin + `
 WHERE c.relkind IN ('r', 'p') AND NOT c.relispartition
-  AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'kingres')
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'kingres', 'kingres_cp')
   AND n.nspname !~ '^pg_(toast|temp)'
   AND ($1 = '' OR n.nspname = $1) AND ($2 = '' OR c.relname = $2)
 ORDER BY n.nspname, c.relname`
@@ -395,10 +395,11 @@ SELECT a.attname, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull,
            WHEN bt.typtype = 'e' THEN 'anyenum'::regtype
            WHEN bt.typtype = 'r' THEN 'anyrange'::regtype
            WHEN bt.typtype = 'm' THEN 'anymultirange'::regtype END)),
-  EXISTS (
-    SELECT 1 FROM pg_index i
+  ARRAY(
+    SELECT ic.relname::text FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid
     WHERE i.indrelid = c.oid AND i.indisunique
-      AND NOT EXISTS (SELECT 1 FROM generate_series(0, i.indnkeyatts - 1) k WHERE i.indkey[k] = a.attnum))
+      AND NOT EXISTS (SELECT 1 FROM generate_series(0, i.indnkeyatts - 1) k WHERE i.indkey[k] = a.attnum)
+    ORDER BY 1)
 FROM pg_class c
   JOIN pg_namespace n ON n.oid = c.relnamespace
   JOIN pg_attribute a ON a.attrelid = c.oid
@@ -426,11 +427,13 @@ func (s *Store) readColumns(ctx context.Context, h *dbHandle, t api.Table) ([]ap
 	}
 	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (api.TableColumn, error) {
 		var c api.TableColumn
-		var hashable, outside bool
+		var hashable bool
+		var outside []string
 		if err := r.Scan(&c.Name, &c.Type, &c.Nullable, &hashable, &outside); err != nil {
 			return c, err
 		}
 		reason := ""
+		c.BlockingKeys = []string{}
 		switch {
 		case !shardingOn:
 			reason = "shardingDisabled"
@@ -438,8 +441,11 @@ func (s *Store) readColumns(ctx context.Context, h *dbHandle, t api.Table) ([]ap
 			reason = "tableNotPlain"
 		case !hashable:
 			reason = "unsupportedType"
-		case outside:
+		case len(outside) > 0:
 			reason = "notInUniqueKey"
+		}
+		if reason == "notInUniqueKey" {
+			c.BlockingKeys = outside
 		}
 		if reason == "" {
 			c.CanBeDistributionColumn = true

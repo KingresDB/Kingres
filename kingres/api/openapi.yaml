@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: KingresDB Management API
-  version: 0.2.0
+  version: 0.3.0
   summary: REST API of the KingresDB management panel, CLI and manager.
   description: |
     The single REST API served by `kingresd` on every KingresDB server. The web panel
@@ -284,7 +284,7 @@ paths:
                     localhostOnly: true
                     serverId: null
                     clusterId: null
-                    setupTask: { id: 1, kind: cluster.init, state: running, progressPercent: 40, error: null }
+                    setupTask: { id: 1, kind: cluster.init, state: running, progressPercent: 40, steps: [{ name: Create instance, state: done }, { name: Create roles, state: running }], createdAt: '2026-11-14T10:00:00Z', updatedAt: '2026-11-14T10:00:20Z', error: null }
                 initDone:
                   summary: init-cluster finished; the wizard can now show the login page
                   value:
@@ -297,7 +297,7 @@ paths:
                     localhostOnly: false
                     serverId: 10.0.0.11
                     clusterId: 7d1f2c0e-3b2a-4d58-9c51-2f6f0a1b9e11
-                    setupTask: { id: 1, kind: cluster.init, state: done, progressPercent: 100, error: null }
+                    setupTask: { id: 1, kind: cluster.init, state: done, progressPercent: 100, steps: [{ name: Create instance, state: done }, { name: Create roles, state: running }], createdAt: '2026-11-14T10:00:00Z', updatedAt: '2026-11-14T10:00:20Z', error: null }
                 initFailed:
                   summary: init-cluster failed; the token is still valid, retry is possible
                   value:
@@ -310,7 +310,7 @@ paths:
                     localhostOnly: true
                     serverId: null
                     clusterId: null
-                    setupTask: { id: 1, kind: cluster.init, state: failed, progressPercent: 55, error: { code: step_failed, message: 'Cannot create the data directory /var/lib/kingresdb/data.', step: Initialize map group, retryable: true } }
+                    setupTask: { id: 1, kind: cluster.init, state: failed, progressPercent: 55, steps: [{ name: Create instance, state: done }, { name: Initialize map group, state: failed }], createdAt: '2026-11-14T10:00:00Z', updatedAt: '2026-11-14T10:00:20Z', error: { code: step_failed, message: 'Cannot create the data directory /var/lib/kingresdb/data.', step: Initialize map group, retryable: true } }
         '405': { $ref: '#/components/responses/MethodNotAllowed' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
@@ -705,6 +705,27 @@ paths:
                     openAlerts: { critical: 0, warning: 1, info: 0 }
                     features: { sharding: true, ledger: true }
                     updatedAt: '2026-11-14T10:00:00Z'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /cluster/summary:
+    get:
+      operationId: getClusterSummary
+      summary: Get the short cluster summary
+      description: |
+        The part of the cluster overview that a statistics-only account may see: identity, health and counts.
+        `GET /cluster` needs `kingres_readonly`.
+      tags: [Cluster]
+      x-required-role: kingres_stats
+      responses:
+        '200':
+          description: Cluster summary.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ClusterSummary' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '405': { $ref: '#/components/responses/MethodNotAllowed' }
@@ -1221,9 +1242,9 @@ paths:
                     estimatedRows: 1250000
                     sizeBytes: 536870912
                     columns:
-                      - { name: id, type: bigint, nullable: false, canBeDistributionColumn: true, distributionBlockedReason: null }
-                      - { name: customer_id, type: bigint, nullable: false, canBeDistributionColumn: false, distributionBlockedReason: notInUniqueKey }
-                      - { name: payload, type: jsonb, nullable: true, canBeDistributionColumn: false, distributionBlockedReason: unsupportedType }
+                      - { name: id, type: bigint, nullable: false, canBeDistributionColumn: true, distributionBlockedReason: null, blockingKeys: [] }
+                      - { name: customer_id, type: bigint, nullable: false, canBeDistributionColumn: false, distributionBlockedReason: notInUniqueKey, blockingKeys: [orders_pkey] }
+                      - { name: payload, type: jsonb, nullable: true, canBeDistributionColumn: false, distributionBlockedReason: unsupportedType, blockingKeys: [] }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -1255,6 +1276,44 @@ paths:
               reference: { value: { method: reference } }
       responses:
         '202': { $ref: '#/components/responses/AcceptedTask' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/ledger:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - $ref: '#/components/parameters/SchemaName'
+      - $ref: '#/components/parameters/TableName'
+    put:
+      operationId: enableTableLedger
+      summary: Put a table under ledger control
+      description: |
+        Calls `kingres.ledger_enable`: the table becomes a ledger table in the given mode. One-way: a ledger table
+        cannot lose its ledger and the mode cannot be changed afterwards. Needs the `kingres_ledger` extension in the
+        database (409 `conflict` if the database has no ledger). Rows already in the table are entered into the ledger.
+        Synchronous: returns the table as it is afterwards.
+      tags: [Tables]
+      x-required-role: kingres_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EnableTableLedgerRequest' }
+            examples:
+              appendOnly: { value: { mode: appendOnly } }
+              updatable: { value: { mode: updatable } }
+      responses:
+        '200':
+          description: The table with its ledger properties.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Table' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -2825,8 +2884,9 @@ components:
     Forbidden:
       description: |
         The caller is authenticated but lacks the cluster role named by `x-required-role`, or the CSRF token is
-        missing or wrong. For the setup-token operations: the request did not come from a permitted address
-        while the panel is still `localhostOnly`.
+        missing or wrong. For the setup-token operations: the request did not come from a permitted address.
+        While `localhostOnly` is true (the server listens on loopback addresses only) the permitted addresses are the
+        loopback addresses `127.0.0.0/8` and `::1`; otherwise every address is permitted.
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }
@@ -3204,12 +3264,35 @@ components:
         Summary of the task started by `initCluster` or `joinCluster`, served by `GET /setup/state` so that the
         wizard needs neither the setup token nor a session to follow it. It is the same task that
         `GET /tasks/{taskId}` returns after sign-in.
-      required: [id, kind, state, progressPercent, error]
+      required: [id, kind, state, progressPercent, steps, createdAt, updatedAt, error]
       properties:
         id:
           type: integer
           format: int64
           description: Task identifier.
+        steps:
+          type: array
+          description: The ordered steps of the task with their state, so that the wizard can show where a failure happened.
+          items:
+            type: object
+            description: One step.
+            required: [name, state]
+            properties:
+              name:
+                type: string
+                description: Human-readable step name (English).
+              state:
+                type: string
+                enum: [pending, running, done, failed]
+                description: State of the step.
+        createdAt:
+          type: string
+          format: date-time
+          description: When the setup request was accepted.
+        updatedAt:
+          type: string
+          format: date-time
+          description: When the task last changed state or progress.
         kind:
           type: string
           enum: [cluster.init, cluster.join]
@@ -3433,8 +3516,10 @@ components:
           type: string
           description: KingresDB version.
         postgresVersion:
-          type: string
-          description: PostgreSQL version.
+          type:
+            - string
+            - 'null'
+          description: PostgreSQL version of the managed instance; null when no instance is running.
         nodeState:
           $ref: '#/components/schemas/NodeState'
         clusterId:
@@ -3810,18 +3895,52 @@ components:
       type: string
       description: Why a rebalance is needed.
       enum: [serverAdded, serverRemoved, replicaCountChanged, replicasMissing, skewed, serverGroupChanged]
+    ClusterSummary:
+      type: object
+      description: Short cluster summary for statistics-only accounts. Null means "not available".
+      required: [clusterId, name, health, serverCount, databaseCount, openAlerts]
+      properties:
+        clusterId:
+          type:
+            - string
+            - 'null'
+          format: uuid
+          description: Cluster identifier; null when the node state carries no cluster identity.
+        name:
+          type:
+            - string
+            - 'null'
+          description: Cluster name; null when the node state carries no cluster identity.
+        health:
+          $ref: '#/components/schemas/ClusterHealth'
+        serverCount:
+          type: integer
+          minimum: 0
+          description: Number of servers.
+        databaseCount:
+          type: integer
+          minimum: 0
+          description: Number of user databases.
+        openAlerts:
+          type: integer
+          minimum: 0
+          description: Number of open alerts; 0 when the alert system is not available.
     ClusterOverview:
       type: object
       description: Cluster-wide health summary.
       required: [clusterId, name, health, version, mapVersion, mapGroupAvailable, managerLeader, servers, buckets, databaseCount, rebalance, autoFailover, openAlerts, features, updatedAt]
       properties:
         clusterId:
-          type: string
+          type:
+            - string
+            - 'null'
           format: uuid
-          description: Cluster identifier.
+          description: Cluster identifier; null when the node state carries no cluster identity.
         name:
-          type: string
-          description: Cluster name.
+          type:
+            - string
+            - 'null'
+          description: Cluster name; null when the node state carries no cluster identity.
         health:
           $ref: '#/components/schemas/ClusterHealth'
         version:
@@ -4002,8 +4121,10 @@ components:
           type: boolean
           description: Whether the active manager runs here.
         version:
-          type: string
-          description: KingresDB version.
+          type:
+            - string
+            - 'null'
+          description: KingresDB version of that server; null when the server cannot know it (a remote server whose version has not been reported).
         uptimeSeconds:
           type:
             - integer
@@ -4428,12 +4549,16 @@ components:
           type: boolean
           description: Whether this database's buckets need rebalancing.
         createdBy:
-          type: string
-          description: Role that created the database.
+          type:
+            - string
+            - 'null'
+          description: Role that created the database; null when not recorded (databases created outside the control plane).
         createdAt:
-          type: string
+          type:
+            - string
+            - 'null'
           format: date-time
-          description: Creation time.
+          description: Creation time; null when not recorded (databases created outside the control plane).
     DatabaseList:
       type: object
       description: All databases.
@@ -4553,7 +4678,7 @@ components:
                 type:
                   - array
                   - 'null'
-                description: Encodings the locale can be combined with; null means every encoding.
+                description: Encodings the locale can be combined with. `null` means every encoding; an empty array means none (the locale is listed but cannot be combined with any encoding the server offers).
                 items: { type: string }
               isDefault:
                 type: boolean
@@ -4670,20 +4795,25 @@ components:
         Why a column cannot be the distribution column. When several reasons apply the first of this list wins:
         `shardingDisabled` sharding is not enabled on the database; `tableNotPlain` the table is already
         distributed or a reference table; `unsupportedType` the column type cannot be hashed by the engine;
-        `notInUniqueKey` a hash-distributed table needs a primary or unique key that includes the distribution
-        column and this column is not part of one.
+        `notInUniqueKey` the table has at least one primary or unique key that does not contain this column
+        (PostgreSQL requires the partition key in every unique index; the keys are listed in
+        `TableColumn.blockingKeys`). A table without any unique key never has this reason.
       enum: [shardingDisabled, tableNotPlain, unsupportedType, notInUniqueKey]
     TableColumn:
       type: object
       description: One column of a table.
-      required: [name, type, nullable, canBeDistributionColumn, distributionBlockedReason]
+      required: [name, type, nullable, canBeDistributionColumn, distributionBlockedReason, blockingKeys]
       properties:
         name:
           type: string
           description: Column name.
         type:
           type: string
-          description: PostgreSQL type name as `format_type` prints it, for example `bigint` or `numeric(12,2)`.
+          description: The text of PostgreSQL `format_type(atttypid, atttypmod)`, for example `bigint`, `character varying(20)` or `numeric(12,2)`. For display only; clients must not parse it.
+        blockingKeys:
+          type: array
+          description: Names of the primary and unique keys (index names) that do not contain this column. Non-empty exactly when `distributionBlockedReason` is `notInUniqueKey`.
+          items: { type: string }
         nullable:
           type: boolean
           description: True when the column has no NOT NULL constraint.
@@ -4728,6 +4858,15 @@ components:
         table:
           type: string
           description: Table name.
+    EnableTableLedgerRequest:
+      type: object
+      description: How to put a table under ledger control.
+      required: [mode]
+      properties:
+        mode:
+          type: string
+          enum: [appendOnly, updatable]
+          description: '`appendOnly` allows INSERT only; `updatable` also allows UPDATE and DELETE and keeps a history table.'
     DistributeTableRequest:
       type: object
       description: How to distribute a plain table.
@@ -5906,6 +6045,7 @@ components:
         - updateDatabase
         - dropDatabase
         - distributeTable
+        - enableTableLedger
         - restorePreferredPrimaries
         - startRebalance
         - stopRebalance
@@ -6142,11 +6282,16 @@ components:
           type: string
           description: Database.
         mode:
-          $ref: '#/components/schemas/LedgerMode'
+          oneOf:
+            - $ref: '#/components/schemas/LedgerMode'
+            - type: 'null'
+          description: Ledger mode of the database; null when not available (no catalog stores it).
         digestIntervalSeconds:
-          type: integer
+          type:
+            - integer
+            - 'null'
           minimum: 60
-          description: Automatic digest interval.
+          description: Automatic digest interval; null when not available.
         verificationState:
           oneOf:
             - $ref: '#/components/schemas/LedgerVerificationState'
@@ -6450,6 +6595,11 @@ components:
             - 'null'
           format: int64
           description: For an updatable table, the specific row version to prove; null proves the current version.
+        op:
+          type: string
+          enum: [I, D]
+          default: I
+          description: Which ledger entry of the row to prove (`kingres.ledger_inclusion_proof` argument `op`). `I` proves that the version was written, `D` that it was removed (updatable tables only).
     MerkleStep:
       type: object
       description: One sibling hash on a Merkle path.
@@ -6464,7 +6614,7 @@ components:
     InclusionProof:
       type: object
       description: Merkle proof that a row version is part of the ledger.
-      required: [schema, table, primaryKey, shardGroupId, ledgerTxId, leafHash, leafIndex, merklePath, transactionMerkleRoot, block, shardHeadPath, aggregateHash, digestId, hashVersion]
+      required: [schema, table, primaryKey, op, shardGroupId, ledgerTxId, leafHash, leafIndex, merklePath, transactionMerkleRoot, block, shardHeadPath, aggregateHash, digestId, hashVersion]
       properties:
         schema:
           type: string
@@ -6476,6 +6626,10 @@ components:
           type: object
           description: Primary key of the row.
           additionalProperties: true
+        op:
+          type: string
+          enum: [I, D]
+          description: 'The entry this proof is for. `I` means the row version was written in the transaction, `D` that it was removed in the transaction.'
         shardGroupId:
           type: integer
           format: int32

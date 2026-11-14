@@ -223,6 +223,18 @@ if (!(schemas.ProblemCode?.enum ?? []).includes('method_not_allowed')) fail('Pro
 const mna = doc.components?.responses?.MethodNotAllowed;
 if (!mna?.headers?.Allow) fail('components.responses.MethodNotAllowed', 'must define the Allow header');
 
+
+// 0.3.0 rules: the changelog has a heading for the current version; every ledger-proof op enum is [I, D];
+// every audited operation of the enum exists as an operationId (except the events).
+const readme = fs.readFileSync(path.join(here, '..', 'README.md'), 'utf8');
+if (!readme.includes(`### ${doc.info?.version}\n`)) fail('README.md', 'changelog heading for ' + doc.info?.version + ' is missing');
+const opEnum = (n) => JSON.stringify(schemas[n]?.properties?.op?.enum);
+if (opEnum('InclusionProof') !== '["I","D"]' || opEnum('InclusionProofRequest') !== '["I","D"]') fail('InclusionProof', 'op must be an enum [I, D]');
+if (!(schemas.InclusionProof?.required ?? []).includes('op')) fail('InclusionProof', 'op must be required');
+const opIds = new Set(operations.map((o) => o.op.operationId));
+const events = new Set(['loginFailed', 'setupTokenRejected', 'autoFailover']);
+for (const a of schemas.AuditAction?.enum ?? []) if (!events.has(a) && !opIds.has(a)) fail('AuditAction', a + ' is neither an operationId nor a known event');
+
 // ------------------------------------------------------------------ report
 const pathCount = Object.keys(doc.paths ?? {}).length;
 console.log(`openapi ${doc.openapi}, info.version ${doc.info?.version}`);

@@ -24,16 +24,25 @@ var zeroHash = strings.Repeat("0", 64)
 // needs the connections of the agent.
 func (s *Store) ledgerStatus(ctx context.Context, h *dbHandle) (api.LedgerStatus, error) {
 	st := api.LedgerStatus{
-		DatabaseName: h.name, Mode: "off", DigestIntervalSeconds: 3600,
-		Chains: []api.LedgerChainStatus{},
+		DatabaseName: h.name,
+		Chains:       []api.LedgerChainStatus{},
 	}
-	zero := 0
-	st.LedgerTableCount = &zero // no ledger catalog: no ledger tables
+	zero, off := 0, "off"
+	st.Mode = &off              // no ledger catalog: the ledger is certainly off
+	st.LedgerTableCount = &zero // and there are no ledger tables
 	ok, err := s.regclassExists(ctx, h.pool, "kingres.ledger_blocks")
 	if err != nil || !ok {
 		return st, err
 	}
-	st.Mode = "optIn"
+	// A ledger catalog exists: the mode is whatever the control plane recorded,
+	// and unknown (null) for databases it did not create.
+	st.Mode = nil
+	if rec, err := s.dbSettings(ctx); err == nil {
+		if r, ok := rec[h.name]; ok {
+			mode := r.ledgerMode
+			st.Mode, st.DigestIntervalSeconds = &mode, r.digest
+		}
+	}
 	if has, err := s.regclassExists(ctx, h.pool, "kingres.ledger_table"); err != nil {
 		return st, err
 	} else if has {
@@ -94,7 +103,7 @@ func (s *Store) LedgerStatuses(ctx context.Context) ([]api.LedgerStatus, error) 
 			s.opts.Logger.Debug("skipping database in ledger status", "database", n, "error", err)
 			continue
 		}
-		if st.Mode != "off" {
+		if st.Mode == nil || *st.Mode != "off" {
 			out = append(out, st)
 		}
 	}

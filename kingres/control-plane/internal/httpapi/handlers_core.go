@@ -20,6 +20,14 @@ import (
 // here are answered by notImplemented. The set is checked against the
 // contract in New, so a handler for an unknown operation cannot exist.
 func (s *Server) handlers() map[string]handlerFunc {
+	m := s.opsHandlers()
+	for k, v := range s.coreHandlers() {
+		m[k] = v
+	}
+	return m
+}
+
+func (s *Server) coreHandlers() map[string]handlerFunc {
 	return map[string]handlerFunc{
 		"getHealth":    s.getHealth,
 		"getReadiness": s.getReadiness,
@@ -53,6 +61,7 @@ func (s *Server) handlers() map[string]handlerFunc {
 		"getTask":   s.getTask,
 
 		"checkSetupToken":          s.checkSetupTokenOp,
+		"initCluster":              s.initCluster,
 		"getDatabaseCreateOptions": s.getDatabaseCreateOptions,
 
 		"listLedgerStatus": s.listLedgerStatus,
@@ -249,6 +258,11 @@ func (s *Server) login(c *call, w http.ResponseWriter, r *http.Request) error {
 	cookieCred, sess, err := s.deps.Sessions.Create(req.Username, roles, auth.KindCookie)
 	if err != nil {
 		return s.sessionProblem(r, err)
+	}
+	if s.deps.Proxy != nil {
+		if err := s.deps.Proxy.Allow(r.Context(), req.Username); err != nil {
+			s.log.Warn("enabling the role for administration", "request_id", stateOf(r).id, "error", err)
+		}
 	}
 	out := s.sessionBody(r.Context(), sess)
 	if req.IssueToken {

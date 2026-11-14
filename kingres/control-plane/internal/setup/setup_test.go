@@ -156,7 +156,8 @@ func TestSetupTaskIsPersistedAndSurvivesInitialization(t *testing.T) {
 	if m.Snapshot().SetupTask != nil {
 		t.Fatal("a fresh node has no setup task")
 	}
-	want := api.SetupTaskSummary{ID: 7, Kind: "cluster.init", State: "running", ProgressPercent: 40}
+	want := api.SetupTaskSummary{ID: 7, Kind: "cluster.init", State: "running", ProgressPercent: 40,
+		Steps: []api.SetupTaskStep{{Name: "a", State: "done"}, {Name: "b", State: "running"}}}
 	if err := m.SetSetupTask(want); err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +169,7 @@ func TestSetupTaskIsPersistedAndSurvivesInitialization(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := m2.Snapshot().SetupTask
-	if got == nil || *got != (api.SetupTaskSummary{ID: 7, Kind: "cluster.init", State: "running", ProgressPercent: 40}) {
+	if got == nil || got.ID != 7 || got.State != "running" || got.ProgressPercent != 40 || len(got.Steps) != 2 || got.Steps[1].State != "running" {
 		t.Errorf("setup task after restart = %+v", got)
 	}
 }

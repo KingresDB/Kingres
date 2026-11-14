@@ -90,7 +90,9 @@ func New(opts Options) (*Store, error) {
 // Target returns "host:port/database" of the configured instance, without
 // credentials, for logging.
 func (s *Store) Target() string {
+	s.mu.Lock()
 	c := s.base.ConnConfig
+	s.mu.Unlock()
 	return net.JoinHostPort(c.Host, strconv.Itoa(int(c.Port))) + "/" + c.Database
 }
 
@@ -105,17 +107,35 @@ func (s *Store) Close() {
 	s.pools = map[string]*pgxpool.Pool{}
 }
 
-// defaultDB is the database of the DSN.
-func (s *Store) defaultDB() string { return s.base.ConnConfig.Database }
+// SetDSN replaces the connection string (for example after the control plane
+// created the managed instance and learned its credentials) and closes the
+// pools opened with the old one.
+func (s *Store) SetDSN(dsn string) error {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return fmt.Errorf("parsing PostgreSQL DSN: %w", err)
+	}
+	cfg.ConnConfig.ConnectTimeout = s.opts.ConnectTimeout
+	cfg.MaxConns, cfg.MinConns, cfg.MaxConnIdleTime = 4, 0, time.Minute
+	cfg.ConnConfig.RuntimeParams["application_name"] = "kingresd"
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, p := range s.pools {
+		p.Close()
+	}
+	s.pools = map[string]*pgxpool.Pool{}
+	s.base = cfg
+	return nil
+}
 
 // pool returns the pool of a database, creating it on first use. db "" means
 // the database of the DSN.
 func (s *Store) pool(ctx context.Context, db string) (*pgxpool.Pool, error) {
-	if db == "" {
-		db = s.defaultDB()
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if db == "" {
+		db = s.base.ConnConfig.Database
+	}
 	if s.closed {
 		return nil, fmt.Errorf("%w: store closed", store.ErrUnavailable)
 	}
@@ -138,7 +158,9 @@ func (s *Store) connectInstance(ctx context.Context, host string, port int) (*pg
 	if port < 1 || port > 65535 {
 		return nil, fmt.Errorf("invalid port %d for node %s", port, host)
 	}
+	s.mu.Lock()
 	cfg := s.base.ConnConfig.Copy()
+	s.mu.Unlock()
 	cfg.Host = host
 	cfg.Port = uint16(port)
 	for _, fb := range cfg.Fallbacks {

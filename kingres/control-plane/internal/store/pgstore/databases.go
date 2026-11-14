@@ -4,9 +4,7 @@ package pgstore
 
 import (
 	"context"
-	"strconv"
 	"strings"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -40,7 +38,7 @@ SELECT d.oid, d.datname, pg_get_userbyid(d.datdba), pg_encoding_to_char(d.encodi
        CASE WHEN has_database_privilege(d.oid, 'CONNECT') THEN pg_database_size(d.oid) ELSE 0 END,
        (SELECT count(*) FROM pg_stat_activity a WHERE a.datname = d.datname)
 FROM pg_database d
-WHERE NOT d.datistemplate AND d.datallowconn AND ($1 = '' OR d.datname = $1)
+WHERE NOT d.datistemplate AND d.datallowconn AND d.datname <> 'kingres_system' AND ($1 = '' OR d.datname = $1)
 ORDER BY d.datname`, name)
 	if err != nil {
 		return nil, s.wrap("listing databases", err)
@@ -74,7 +72,7 @@ func (s *Store) probeDatabase(ctx context.Context, db string) dbProbe {
 	err = p.QueryRow(ctx, `
 SELECT (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE c.relkind IN ('r', 'p') AND NOT c.relispartition
-          AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'kingres')
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'kingres', 'kingres_cp')
           AND n.nspname !~ '^pg_(toast|temp)'),
        to_regclass('kingres.bucket_map') IS NOT NULL,
        to_regclass('kingres.ledger_blocks') IS NOT NULL`).Scan(&probe.tableCount, &probe.hasShard, &probe.hasLedger)
@@ -119,25 +117,6 @@ func (s *Store) databaseDurability(ctx context.Context, oid uint32, fallback str
 	return durabilityOf(v)
 }
 
-// createdAt estimates the creation time of a database from the modification
-// time of its PG_VERSION file (readable with pg_monitor); it falls back to
-// the postmaster start time, which is documented in the README.
-func (s *Store) createdAt(ctx context.Context, oid uint32) time.Time {
-	p, err := s.pool(ctx, "")
-	if err != nil {
-		return s.now().UTC()
-	}
-	var t time.Time
-	err = p.QueryRow(ctx, `SELECT (pg_stat_file('base/' || $1 || '/PG_VERSION')).modification`, strconv.FormatUint(uint64(oid), 10)).Scan(&t)
-	if err == nil {
-		return t.UTC()
-	}
-	if err := p.QueryRow(ctx, "SELECT pg_postmaster_start_time()").Scan(&t); err == nil {
-		return t.UTC()
-	}
-	return s.now().UTC()
-}
-
 func (s *Store) buildDatabases(ctx context.Context, name string) ([]api.Database, error) {
 	rows, err := s.listDatabaseRows(ctx, name)
 	if err != nil {
@@ -155,11 +134,23 @@ func (s *Store) buildDatabases(ctx context.Context, name string) ([]api.Database
 	if err != nil {
 		return nil, err
 	}
+	recorded, err := s.dbSettings(ctx)
+	if err != nil {
+		return nil, err
+	}
 	replicas := cat.replicaCount()
 	out := make([]api.Database, 0, len(rows))
 	for _, r := range rows {
 		probe := s.probeDatabase(ctx, r.name)
-		db := newDatabase(r, probe, replicas, s.databaseDurability(ctx, r.oid, settings.DefaultDurability), s.createdAt(ctx, r.oid))
+		db := newDatabase(r, probe, replicas, s.databaseDurability(ctx, r.oid, settings.DefaultDurability))
+		if st, ok := recorded[r.name]; ok {
+			by, at, mode := st.createdBy, st.createdAt, st.ledgerMode
+			db.CreatedBy, db.CreatedAt = &by, &at
+			db.Ledger.Mode, db.Ledger.DigestIntervalSeconds = &mode, st.digest
+			if st.sharding && st.bucketCnt != nil && db.Sharding.BucketCount == nil {
+				db.Sharding.BucketCount = st.bucketCnt
+			}
+		}
 		if probe.hasShard {
 			stats, _, err := s.bucketStats(ctx, r.name, nil)
 			if err != nil {
@@ -253,7 +244,7 @@ func (s *Store) ClusterSettings(ctx context.Context) (api.ClusterSettings, error
 // the ledger mode and digest interval (not stored anywhere), the commit rate
 // and the ledger verification state. A database without a shard catalog has
 // no buckets, so its bucket health is a true 0.
-func newDatabase(r databaseRow, probe dbProbe, replicas int, durability string, createdAt time.Time) api.Database {
+func newDatabase(r databaseRow, probe dbProbe, replicas int, durability string) api.Database {
 	zero := 0
 	db := api.Database{
 		Name: r.name, Status: "ready",
@@ -263,8 +254,6 @@ func newDatabase(r databaseRow, probe dbProbe, replicas int, durability string, 
 		Replication: api.ReplicationSettings{Durability: &durability, ReplicaCount: replicas},
 		Stats:       api.DatabaseStats{SizeBytes: &r.sizeBytes, ActiveConnections: &r.connections},
 		Health:      api.DatabaseHealth{UnderReplicatedBuckets: &zero, UnavailableBuckets: &zero},
-		CreatedBy:   r.owner,
-		CreatedAt:   createdAt,
 	}
 	if probe.ok {
 		tables := probe.tableCount

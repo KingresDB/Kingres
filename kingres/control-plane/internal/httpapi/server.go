@@ -21,6 +21,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/audit"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/auth"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/contract"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ops"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/setup"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/store"
@@ -41,6 +42,16 @@ type Deps struct {
 	Authenticator auth.Authenticator
 	// Audit receives audit events.
 	Audit audit.Sink
+	// Proxy makes a role connectable after sign-in; Ops are the operations
+	// that change the cluster (nil makes them answer "not supported").
+	Proxy RoleConnector
+	Ops   *ops.Ops
+	// SetupService creates the cluster; nil or disabled makes initCluster answer
+	// "not supported".
+	SetupService SetupService
+	// DataDir is the configured data directory of kingresd (validated against
+	// the request of initCluster).
+	DataDir string
 	// Web serves the panel at "/" (static files with SPA fallback); when nil
 	// unknown non-API paths answer with the 404 problem.
 	Web http.Handler

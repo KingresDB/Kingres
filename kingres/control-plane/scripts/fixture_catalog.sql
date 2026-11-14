@@ -3,7 +3,7 @@
 -- Per-database part of the integration test fixture: the kingres catalog of
 -- kingres/docs/design/shard-mvp.md and ledger-mvp.md, written from the
 -- specifications as plain tables (the extensions are not needed to test the
--- read side), plus user tables and the assumed kingres.task table.
+-- read side), plus user tables and the task table of the system schema.
 --
 -- Run in database kingres_cp with the psql variables :p1 and :p2 set to the
 -- ports of the primary and the standby instance.
@@ -64,18 +64,21 @@ CREATE TABLE kingres.ledger_blocks (
   block_hash     bytea NOT NULL
 );
 
--- Assumed shape of the task table (see README, "Assumptions about the catalog").
-CREATE TABLE kingres.task (
-  task_id     bigint PRIMARY KEY,
-  kind        text NOT NULL,
-  state       text NOT NULL,
-  progress    jsonb,
-  error       jsonb,
-  subject     jsonb,
-  cancellable bool NOT NULL DEFAULT false,
-  created_at  timestamptz NOT NULL,
-  updated_at  timestamptz NOT NULL,
-  created_by  text NOT NULL
+-- The task table of the system schema (shape of sysdb migration 1, columns
+-- that the read side uses).
+CREATE SCHEMA kingres_cp;
+GRANT USAGE ON SCHEMA kingres_cp TO cp_service;
+CREATE TABLE kingres_cp.task (
+  id           bigint PRIMARY KEY,
+  kind         text NOT NULL,
+  state        text NOT NULL,
+  subject_type text NOT NULL,
+  subject_id   text NOT NULL,
+  progress     jsonb NOT NULL DEFAULT '{"percent": 0, "steps": []}'::jsonb,
+  error        jsonb,
+  created_at   timestamptz NOT NULL,
+  updated_at   timestamptz NOT NULL,
+  created_by   text NOT NULL
 );
 
 GRANT USAGE ON SCHEMA kingres TO PUBLIC;
@@ -125,17 +128,20 @@ INSERT INTO kingres.ledger_blocks VALUES
   (1, 1, decode(repeat('b0', 32), 'hex'), decode(repeat('ab', 32), 'hex'), 5, '2026-11-14 09:00:00+00', decode(repeat('b1', 32), 'hex')),
   (2, 1, decode(repeat('b1', 32), 'hex'), decode(repeat('ac', 32), 'hex'), 1, '2026-11-14 10:00:00+00', decode(repeat('b2', 32), 'hex'));
 
-INSERT INTO kingres.task VALUES
-  (1, 'database.create', 'done',
+INSERT INTO kingres_cp.task (id, kind, state, subject_type, subject_id, progress, error, created_at, updated_at, created_by) VALUES
+  (1, 'database.create', 'done', 'database', 'shop',
    '{"percent":100,"currentStep":null,"steps":[{"name":"Create database","state":"done","detail":null,"itemsDone":1,"itemsTotal":1,"startedAt":"2026-11-14T09:58:00Z","finishedAt":"2026-11-14T09:58:02Z"}]}',
-   NULL, '{"type":"database","id":"shop"}', false, '2026-11-14 09:58:00+00', '2026-11-14 09:58:02+00', 'cp_admin'),
-  (2, 'rebalance', 'running', '{"percent":10,"steps":[]}', NULL, '{"type":"rebalance","id":"1"}', true,
+   NULL, '2026-11-14 09:58:00+00', '2026-11-14 09:58:02+00', 'cp_admin'),
+  (2, 'rebalance', 'running', 'rebalance', '1', '{"percent":10,"steps":[]}', NULL,
    '2026-11-14 10:00:00+00', '2026-11-14 10:01:00+00', 'cp_admin'),
-  (3, 'server.add', 'failed', NULL, '{"code":"step_failed","message":"cannot reach 10.0.0.9","step":"connect","retryable":true}',
-   '{"type":"server","id":"9"}', false, '2026-11-14 10:05:00+00', '2026-11-14 10:06:00+00', 'cp_admin');
+  (3, 'server.add', 'failed', 'server', '9', DEFAULT,
+   '{"code":"step_failed","message":"cannot reach 10.0.0.9","step":"connect","retryable":true}',
+   '2026-11-14 10:05:00+00', '2026-11-14 10:06:00+00', 'cp_admin');
 
 -- Grants for the grant listing.
 GRANT CONNECT ON DATABASE kingres_cp TO cp_ro;
 GRANT USAGE ON SCHEMA public TO cp_ro;
 GRANT SELECT, INSERT ON public.orders TO cp_ro;
 GRANT SELECT ON public.settings TO cp_ro;
+
+GRANT SELECT ON ALL TABLES IN SCHEMA kingres_cp TO cp_service;

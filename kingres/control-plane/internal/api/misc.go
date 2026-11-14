@@ -300,9 +300,9 @@ type LedgerStatus struct {
 	// DatabaseName is the database.
 	DatabaseName string `json:"databaseName"`
 	// Mode is off, optIn, appendOnly or updatable.
-	Mode string `json:"mode"`
+	Mode *string `json:"mode"`
 	// DigestIntervalSeconds is the automatic digest interval.
-	DigestIntervalSeconds int `json:"digestIntervalSeconds"`
+	DigestIntervalSeconds *int `json:"digestIntervalSeconds"`
 	// VerificationState is never, running, passed or failed; null when not
 	// available.
 	VerificationState *string `json:"verificationState"`

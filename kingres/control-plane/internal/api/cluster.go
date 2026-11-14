@@ -87,9 +87,9 @@ type FeatureFlags struct {
 // ClusterOverview is the response of GET /cluster.
 type ClusterOverview struct {
 	// ClusterID is the cluster identifier (UUID).
-	ClusterID string `json:"clusterId"`
+	ClusterID *string `json:"clusterId"`
 	// Name is the cluster name.
-	Name string `json:"name"`
+	Name *string `json:"name"`
 	// Health is healthy, degraded or critical.
 	Health string `json:"health"`
 	// Version is the KingresDB version.
@@ -195,7 +195,7 @@ type Server struct {
 	// IsManagerLeader tells whether the active manager runs here.
 	IsManagerLeader bool `json:"isManagerLeader"`
 	// Version is the KingresDB version.
-	Version string `json:"version"`
+	Version *string `json:"version"`
 	// UptimeSeconds is the seconds since kingresd started; null when not available.
 	UptimeSeconds *int64 `json:"uptimeSeconds"`
 	// JoinedAt is when the server joined the cluster; null when not available.

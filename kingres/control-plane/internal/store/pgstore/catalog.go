@@ -363,7 +363,7 @@ func (s *Store) buildServers(ctx context.Context, cat *catalog, hold map[string]
 			ID: sv.ID, Address: net.JoinHostPort(sv.Host, s.opts.PanelPort), Hostname: sv.Host,
 			Status:      statusOf(sv, h.Primary+h.Replica, anyBuckets),
 			ServerGroup: sv.Group, ShouldHaveShards: sv.Should,
-			Version:   s.opts.Version,
+			Version:   versionPtr(s.opts.Version),
 			Instances: make([]api.Instance, 0, len(sv.Nodes)), Buckets: h,
 		}
 		if sv.Host == localHost && localHost != "" {
@@ -588,4 +588,11 @@ func groupHealth(cat *catalog, group int32, replicas int) (unavailable, underRep
 		}
 	}
 	return false, live < replicas
+}
+
+func versionPtr(v string) *string {
+	if v == "" {
+		return nil
+	}
+	return &v
 }

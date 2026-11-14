@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -37,9 +38,9 @@ type Authenticator interface {
 const memberSQL = `
 WITH RECURSIVE m(roleid) AS (
     SELECT a.roleid FROM pg_auth_members a
-    WHERE a.member = (SELECT oid FROM pg_roles WHERE rolname = current_user)
+    WHERE a.member = (SELECT oid FROM pg_roles WHERE rolname = current_user) AND a.inherit_option
   UNION
-    SELECT a.roleid FROM pg_auth_members a JOIN m ON a.member = m.roleid
+    SELECT a.roleid FROM pg_auth_members a JOIN m ON a.member = m.roleid WHERE a.inherit_option
 )
 SELECT r.rolname FROM pg_roles r
 WHERE r.oid IN (SELECT roleid FROM m)
@@ -50,6 +51,7 @@ WHERE r.oid IN (SELECT roleid FROM m)
 // by the driver), with the server's pg_hba.conf and role attributes
 // applying. kingresd never sees or stores a password hash.
 type Postgres struct {
+	mu      sync.RWMutex
 	base    *pgx.ConnConfig
 	timeout time.Duration
 }
@@ -66,27 +68,43 @@ func NewPostgres(dsn string, timeout time.Duration) (*Postgres, error) {
 	return &Postgres{base: cfg, timeout: timeout}, nil
 }
 
+// SetDSN replaces the connection settings (host, port, database), for
+// example after the control plane created the managed instance.
+func (p *Postgres) SetDSN(dsn string) error {
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return fmt.Errorf("parsing PostgreSQL DSN: %w", err)
+	}
+	p.mu.Lock()
+	p.base = cfg
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *Postgres) config() *pgx.ConnConfig {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.base.Copy()
+}
+
 // Authenticate implements Authenticator.
 func (p *Postgres) Authenticate(ctx context.Context, username, password string) ([]string, error) {
-	cfg := p.base.Copy()
+	cfg := p.config()
 	cfg.User = username
 	cfg.Password = password
 	if cfg.RuntimeParams == nil {
 		cfg.RuntimeParams = map[string]string{}
 	}
 	cfg.RuntimeParams["application_name"] = "kingresd-login"
-	// Prepared statement caching has no use for a one-shot connection.
-	cfg.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
 
-	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	cctx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
-	conn, err := pgx.ConnectConfig(ctx, cfg)
+	conn, err := pgx.ConnectConfig(cctx, cfg)
 	if err != nil {
 		return nil, classifyConnectError(err)
 	}
 	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
-
-	rows, err := conn.Query(ctx, memberSQL)
+	rows, err := conn.Query(cctx, memberSQL, pgx.QueryExecModeSimpleProtocol)
 	if err != nil {
 		return nil, fmt.Errorf("%w: reading cluster roles: %w", ErrUnavailable, err)
 	}

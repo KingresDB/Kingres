@@ -109,6 +109,11 @@ type SetupTaskSummary struct {
 	State string `json:"state"`
 	// ProgressPercent is the overall progress.
 	ProgressPercent float64 `json:"progressPercent"`
+	// Steps are the steps of the task with their state.
+	Steps []SetupTaskStep `json:"steps"`
+	// CreatedAt and UpdatedAt are the acceptance and last change times.
+	CreatedAt Time `json:"createdAt"`
+	UpdatedAt Time `json:"updatedAt"`
 	// Error is set when the task failed.
 	Error *TaskError `json:"error"`
 }
@@ -125,4 +130,53 @@ type ClusterRoleInfo struct {
 type ClusterRoleInfoList struct {
 	// Items are the four built-in roles.
 	Items []ClusterRoleInfo `json:"items"`
+}
+
+// SetupTaskStep is one step of the setup task.
+type SetupTaskStep struct {
+	// Name is the step name.
+	Name string `json:"name"`
+	// State is pending, running, done or failed.
+	State string `json:"state"`
+}
+
+// AdminAccount is the first administrator of a new cluster.
+type AdminAccount struct {
+	// Username is the role name.
+	Username string `json:"username"`
+	// Password is write-only and never logged.
+	Password string `json:"password"`
+}
+
+// DataPaths are the directories of a server.
+type DataPaths struct {
+	// DataDirectory is the absolute data directory.
+	DataDirectory string `json:"dataDirectory"`
+	// WalDirectory and LogDirectory are optional directories.
+	WalDirectory *string `json:"walDirectory,omitempty"`
+	LogDirectory *string `json:"logDirectory,omitempty"`
+}
+
+// MemoryQuota is the memory budget of a server.
+type MemoryQuota struct {
+	// TotalMegabytes is the budget in MiB, at least 512.
+	TotalMegabytes int `json:"totalMegabytes"`
+}
+
+// InitClusterRequest is the body of POST /setup/init-cluster.
+type InitClusterRequest struct {
+	// ClusterName is the display name of the cluster.
+	ClusterName string `json:"clusterName"`
+	// Admin is the first administrator.
+	Admin AdminAccount `json:"admin"`
+	// DataPaths are the directories of this server.
+	DataPaths DataPaths `json:"dataPaths"`
+	// MemoryQuota is the memory budget.
+	MemoryQuota MemoryQuota `json:"memoryQuota"`
+	// Features selects the extensions; both on when omitted.
+	Features *FeatureFlags `json:"features,omitempty"`
+	// DefaultReplicaCount is 0 to 3; 1 when omitted.
+	DefaultReplicaCount *int `json:"defaultReplicaCount,omitempty"`
+	// DefaultDurability is async, sync or syncApply; sync when omitted.
+	DefaultDurability *string `json:"defaultDurability,omitempty"`
 }

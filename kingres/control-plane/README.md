@@ -7,13 +7,11 @@ REST API that the web panel and `kingres-cli` use
 embedded web panel, on one port (default `127.0.0.1:8091`). It runs on every
 server of a cluster.
 
-This is the **first increment**: the process skeleton, the complete routing of
-the contract, authentication and authorization, the setup state machine, the
-audit log, and the read side of the API backed by PostgreSQL. Everything that
-changes the cluster answers with one uniform "not supported yet" problem (see
-[What is implemented](#what-is-implemented)). The agent that manages PostgreSQL
-instances, the task engine, rebalance, failover, the client router, etcd and the
-CLI are not part of this increment.
+This is the **second increment**: it adds the instance manager, the task engine, the system database,
+cluster creation (`init-cluster`) and the operations behind the Databases, Security, Query and Settings
+pages that one server can do (see [What is implemented](#what-is-implemented)). Joining servers, rebalance,
+failover, the ledger digests, verifications and proofs, alerts, logs, metrics, server groups and cluster
+settings updates answer the contract's "not supported yet" problem. Design: `kingres/docs/design/control-plane-2.md`.
 
 > **Module path.** The Go module is `github.com/KingresDB/Kingres/kingres/control-plane`: the
 > repository's location followed by the directory of this module.
@@ -32,6 +30,15 @@ internal/
   httpapi/                router, guard pipeline, handlers, middleware
   auth/                   role hierarchy, sessions, CSRF, rate limiter, PostgreSQL login
   setup/                  node state machine and the one-time setup token
+  sqlx/                   identifier quoting and the statement builder (the only way names reach SQL)
+  scram/                  SCRAM-SHA-256 password verifiers
+  sysdb/                  embedded migrations of the system database kingres_system (schema kingres_cp)
+  instance/               instance manager: initdb, pg_hba.conf/pg_ident.conf/managed config rendering, pg_ctl
+  task/                   task engine (leases, resumable steps) with PostgreSQL, file and memory stores
+  cluster/                init-cluster, service credentials, proxy connections as signed-in roles
+  ops/                    operations that change the cluster (roles, grants, databases, tables, network, workbench)
+  sdnotify/               systemd readiness notification
+  pgtest/, contracttest/  test helpers (real instances; contract response validation)
   audit/                  append-only audit log (JSON lines)
   testutil/               test helpers (temporary directories)
   store/                  Store interface (read side) and cursor helpers
@@ -67,11 +74,10 @@ go test ./...                   # no database needed; integration tests skip
 CGO_ENABLED=1 go test -race ./...   # needs a C compiler (gcc) on PATH
 ```
 
-Integration tests against a real PostgreSQL run when `KINGRES_TEST_DSN` is set.
-`scripts/run-integration.ps1` does everything: it starts a primary and a
-streaming standby from a KingresDB build in WSL2 on ports 56010/56011
-(`scripts/pg-test-instance.sh`, SCRAM, fixture in `scripts/fixture_*.sql`),
-runs `go test` with the DSN, and always removes the instances.
+Integration tests against real PostgreSQL instances run when `KINGRES_PG_BIN` is set.
+`scripts/run-integration.ps1` builds the test binaries for Linux, copies them into WSL2 and runs them against
+the installation in `~/kw-cp/install` (`scripts/run-wsl-tests.sh`); every instance is created by the instance
+manager itself in a throwaway directory under `~/kw-cp/test`, on ports 56000-56199, and removed afterwards.
 
 ```
 .\scripts\run-integration.ps1 [-Port 56010] [-Race]
@@ -108,6 +114,13 @@ server at start. The DSN is never logged.
 | `max-body-bytes` | `KINGRES_MAX_BODY_BYTES` | `1048576` | request body limit |
 | `login-rate-limit` | `KINGRES_LOGIN_RATE_LIMIT` | `10` | login attempts per client address and per user name per window |
 | `login-rate-window` | `KINGRES_LOGIN_RATE_WINDOW` | `1m` | |
+| `pg-bin-dir` | `KINGRES_PG_BIN_DIR` | none | directory of `postgres`, `initdb`, `pg_ctl`, `pg_config` (the package sets `/opt/kingres/bin`). Unset: the directory of the kingresd binary, then `PATH`; none found: instance management is off and `initCluster` answers 422. A directory that is not a KingresDB 18 build stops the server |
+| `socket-dir` | `KINGRES_SOCKET_DIR` | `<data-dir>/run` | base directory of the instances' unix sockets (the package sets `/run/kingres`); never `/tmp` |
+| `pg-port`, `pg-listen` | `KINGRES_PG_PORT`, `KINGRES_PG_LISTEN` | `5432`, `127.0.0.1` | port and `listen_addresses` of the managed instance |
+| `server-host` | `KINGRES_SERVER_HOST` | machine host name | host registered in the shard catalog; it is the server id |
+| `allow-remote-setup` | `KINGRES_ALLOW_REMOTE_SETUP` | `false` | `true` lets the setup operations come from non-loopback addresses while uninitialized (containers listening on `0.0.0.0`); the setup token is still required |
+| `-version` | | | prints version, contract revision (0.3.0) and build commit (`-ldflags "-X main.commit=..."`, else `unknown`) |
+| `-stop-instances` | | | stops the managed instances (fast shutdown) and exits |
 | `tls-cert-file`, `tls-key-file` | `KINGRES_TLS_CERT_FILE`, `KINGRES_TLS_KEY_FILE` | none | enable HTTPS (both or neither) |
 
 The role in the DSN is the **service role**: it reads the catalogs. It needs
@@ -148,36 +161,36 @@ bodies.
 
 ## What is implemented
 
-The server implements revision **0.2.0** of the contract (84 operations, 67
+The server implements revision **0.3.0** of the contract (86 operations, 69
 paths). "Real" means the operation works against PostgreSQL or the local node
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **33 of 84 operations are real; 51
+authenticated operation lists in 0.2.0. **52 of 86 operations are real; 34
 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
 | Health | `getHealth`, `getReadiness` | |
 | Auth | `login`, `logout`, `getSession` | |
-| Setup | `getNodeState` (with `setupTask`), `checkSetupToken`; setup-token check, state gating and audit of `initCluster`, `joinCluster` | the cluster initialization and join themselves (`initCluster`, `joinCluster`) |
+| Setup | `getNodeState` (with `setupTask`), `checkSetupToken`, `initCluster` | `joinCluster` |
 | This server | `listThisServerInstances`, `getThisServerInstance` (from `kingres.node`) | `getThisServer`, `getThisServerResources`, instance `start`/`stop`/`restart`, local settings, `leaveCluster`, local logs |
-| Cluster | `getCluster` | |
+| Cluster | `getCluster`, `getClusterSummary` | |
 | Servers | `listServers`, `getServer` | `addServer`, `updateServer`, `removeServer`, `failoverServer` |
 | Server groups | `listServerGroups` | `createServerGroup`, `deleteServerGroup` |
-| Databases | `listDatabases`, `getDatabase`, `getDatabaseCreateOptions` | `createDatabase`, `updateDatabase`, `dropDatabase` |
-| Tables | `listTables`, `getTable` (with `columns`) | `distributeTable` |
+| Databases | `listDatabases`, `getDatabase`, `getDatabaseCreateOptions`, `createDatabase`, `updateDatabase`, `dropDatabase` | |
+| Tables | `listTables`, `getTable` (with `columns`), `distributeTable`, `enableTableLedger` | |
 | Shards | `listColocationGroups`, `listBuckets`, `getBucketDistribution` | |
 | Replication | `getReplicationTopology` | `restorePreferredPrimaries` |
 | Rebalance | | all six operations |
-| Tasks | `listTasks`, `getTask` (from `kingres.task`, empty if absent) | `cancelTask` |
-| Roles | `listRoles`, `getRole`, `listClusterRoles` | `createRole`, `updateRole`, `deleteRole`, `setRoleMemberships`, `setRoleClusterRoles` |
-| Grants | `listGrants` | `createGrant`, `revokeGrants`, `applyGrantTemplate` |
-| Network access | | both operations |
+| Tasks | `listTasks`, `getTask` (from `kingres_cp.task`), `cancelTask` | |
+| Roles | `listRoles`, `getRole`, `listClusterRoles`, `createRole`, `updateRole`, `deleteRole`, `setRoleMemberships`, `setRoleClusterRoles` | |
+| Grants | `listGrants`, `createGrant`, `revokeGrants`, `applyGrantTemplate` | |
+| Network access | `getNetworkAccess`, `replaceNetworkAccess` | |
 | Audit | `listAuditEvents` | |
 | Settings | `getClusterSettings` | `updateClusterSettings` |
-| Ledger | `listLedgerStatus`, `getLedgerStatus`, `listLedgerBlocks` | digests (list, generate), verifications (list, start, get), `createInclusionProof` |
-| Query | | `executeQuery` |
+| Ledger | `listLedgerStatus`, `getLedgerStatus`, `listLedgerBlocks` | digests (list, generate), verifications (list, start, get), `createInclusionProof` (need `kingres_ledger` 0.2; not written yet) |
+| Query | `executeQuery` | |
 | Alerts | | both operations |
 | Logs | | `listLogs` |
 | Metrics | | `queryMetrics` |
@@ -268,6 +281,114 @@ Everything else is read from PostgreSQL:
   empty and every task is 404.
 - **Missing catalog objects** (`kingres.node`, `bucket_map`, `ledger_*`, ...)
   give empty but valid responses.
+
+## Operations
+
+### Data directory layout
+
+```
+<data-dir>/
+  node-state.json          node state (uninitialized, standalone, clustered), cluster id and name, setup task summary
+  setup-token              one-time setup token (only while uninitialized, mode 0600)
+  setup-task.json          the setup task (it must exist before the system database does)
+  service-credentials      password of the role "kingresd" of the managed instance (mode 0600)
+  audit.jsonl              audit log
+  instances/<id>/          one directory per managed instance (id 1 on a one-server cluster)
+    kingresd-instance.json   marker: kingresd created this directory; every operation checks it
+    pgdata/                  PostgreSQL data directory
+      kingres-managed.conf     managed settings, included by postgresql.conf (rewritten, do not edit)
+      pg_hba.conf, pg_ident.conf  generated from the stored network rules, do not edit
+  run/<id>/                unix socket of instance <id> (setting socket-dir; never /tmp)
+```
+
+### Start a one-server cluster by hand
+
+```
+kingresd -data-dir /var/lib/kingres -pg-bin-dir /opt/kingres/bin -listen 127.0.0.1:8091
+cat /var/lib/kingres/setup-token
+curl -s -X POST http://127.0.0.1:8091/api/v1/setup/init-cluster \
+  -H "X-Setup-Token: $(cat /var/lib/kingres/setup-token)" -H 'Content-Type: application/json' \
+  -d '{"clusterName":"prod","admin":{"username":"root_admin","password":"a-long-password"},
+       "dataPaths":{"dataDirectory":"/var/lib/kingres"},"memoryQuota":{"totalMegabytes":4096}}'
+curl -s http://127.0.0.1:8091/api/v1/setup/state      # follow setupTask until state is done
+```
+
+`dataPaths.dataDirectory` must be the data directory kingresd was started with; `walDirectory` and
+`logDirectory` must be null (not supported yet; answered with 422 field errors).
+
+### Recovering from an interrupted setup
+
+The setup task is stored in `setup-task.json` and its steps are idempotent. If kingresd stops during setup it
+resumes the task at the first step not done when it starts again, except that the step that needs the
+administrator password cannot resume: the password exists only in the memory of the request that started the
+task. In that case the task fails with `secret_unavailable` (or with the step's own error); call
+`POST /setup/init-cluster` again with the same data directory and the setup token (the token stays valid until
+setup finishes): the new task reuses the instance and the service credentials that already exist, creates what is
+missing and alters the password of an administrator role that exists. To start over completely stop kingresd and
+remove `<data-dir>/instances`, `service-credentials`, `setup-task.json` and `node-state.json`.
+
+### What happens to the instances when kingresd stops
+
+Instances are started with `pg_ctl start` and are independent processes: stopping or restarting kingresd leaves
+them running, and kingresd at start-up re-adopts the instance it owns (marker file and `postmaster.pid`; starting
+a running instance is a no-op). `kingresd -stop-instances` (same configuration) stops the managed instances with a
+fast shutdown and exits. For the service unit: `KillMode=process`, `TimeoutStopSec=120`, and
+`ExecStop=/opt/kingres/bin/kingresd -config <file> -stop-instances` to stop the database with the service.
+`systemctl restart` then also restarts the database (ExecStop runs on restart); to restart only the manager send
+it `SIGTERM` (`systemctl kill --kill-whom=main -s TERM kingres`) and let `Restart=` bring it back. kingresd sends
+`READY=1` (after the API listens) and `STOPPING=1` to `NOTIFY_SOCKET` (standard library only, no-op when unset).
+
+### Identity of the signed-in role
+
+Role and grant changes and the query workbench run on a PostgreSQL connection of the signed-in role. kingresd
+never keeps passwords, so PostgreSQL itself authenticates kingresd's operating system user over the unix socket
+(peer authentication with `pg_ident.conf` map `kingres_proxy`): a role is mapped when it signs in with a valid
+password, the map starts empty at every start, and the connections are ordinary sessions of that role. See
+"Design notes".
+
+## Design notes (where the specification was silent or was changed)
+
+1. **Role connections (D6)**: the spec keeps the sign-in connection. A connection is bound to one database and the
+   workbench takes a `database`, so a kept sign-in connection cannot serve it; the peer-authenticated proxy above
+   serves every database without storing a password. Role creation, update, drop and all grants/revokes run as the
+   signed-in role (PostgreSQL's checks apply). Exceptions, all authorized first by the cluster-role check:
+   membership changes (cluster roles and ordinary roles) run with the service role, because PostgreSQL lets a role
+   revoke only the grants it made itself and a second administrator could otherwise never undo them; changes to a
+   role that is itself an administrator run with the service role, because the ADMIN OPTION that would let
+   administrators manage each other is a membership cycle. Roles created through the API are granted to
+   `kingres_admin` WITH ADMIN OPTION, INHERIT FALSE, SET FALSE so that every administrator can manage them.
+   Membership walks consider only rows with `inherit_option` (PostgreSQL 16+ creates such implicit rows).
+2. **Passwords** reach PostgreSQL as SCRAM-SHA-256 verifiers computed in kingresd (package `scram`), so the clear
+   text is never in a statement, in `pg_stat_activity` or in the PostgreSQL log. `VALID UNTIL` "no expiry" is
+   `infinity`; the read side maps it to null.
+3. **Setup task storage**: the system database does not exist during setup, so the setup task lives in
+   `setup-task.json` and is copied into `kingres_cp.task` (same id) when it is done; later tasks are rows of
+   `kingres_cp.task` executed by the engine.
+4. **Tasks that finish quickly are still tasks** (202): createDatabase, dropDatabase, distributeTable,
+   replaceNetworkAccess. updateDatabase, enableTableLedger, roles, grants and the workbench are synchronous.
+5. **Database-wide ledger mode**: `off` and `optIn` only; `appendOnly` and `updatable` as a database mode answer 422
+   `unsupported_operation` (per table: `enableTableLedger`; `updatable` needs `kingres_ledger` 0.2).
+6. **Reference tables**: `kingres_shard` 0.1 has no function for them: `method: reference` answers 422
+   `unsupported_operation`.
+7. **Network rules** are stored by revision in `kingres_cp.network_rule`; the generated `pg_hba.conf` always starts
+   with fixed rules for the role `kingresd` (loopback, SCRAM) and the peer rule, so managed rules cannot lock the
+   control plane out. `trust` does not exist as a method. A rule set under which the caller's own address would be
+   rejected (first match) is refused with 422. A reload takes effect within a moment of the task finishing.
+8. **The workbench** uses the extended protocol (so a text with several statements is refused by PostgreSQL), sets
+   `statement_timeout` with `set_config` and a bind parameter, commits on success, and stops reading at `rowLimit`
+   rows by canceling the connection. Its audit event holds the database, the length and a hash prefix of the
+   statement, never the text.
+9. **`pg-bin-dir` check**: this KingresDB build's programs print `PostgreSQL 18.x`, not a KingresDB string, so
+   start-up requires `postgres`, `initdb`, `pg_ctl` (version 18) and `pg_config`, and that `kingres_shard.so` and
+   `kingres_ledger.so` exist in `pg_config --pkglibdir`; a plain PostgreSQL is refused.
+10. **Setup from remote addresses** is controlled by `allow-remote-setup` (default false), no longer by the listen
+    address: the setup operations are accepted only from loopback callers unless it is true (containers).
+
+## Verification of this increment
+
+The end-to-end and instance tests run inside WSL with `scripts/run-integration.ps1` against the private
+installation in `~/kw-cp/install` (set `KINGRES_PG_BIN` to run them elsewhere); without `KINGRES_PG_BIN` they are
+skipped and `go test ./...` runs the unit tests only.
 
 ## Contract types and validation
 
@@ -375,6 +496,13 @@ Things a reviewer should look at first:
   set (the server may speak plain HTTP on localhost).
 
 ## Contract notes
+
+**Revision 0.3.0 resolved items 1 to 5 below** (nullable `Server.version`, `Database.createdAt/By`, `ClusterOverview.clusterId/name`,
+`LedgerStatus.mode/digestIntervalSeconds`; the meaning of `notInUniqueKey` with `TableColumn.blockingKeys`; the permitted
+setup addresses; `TableColumn.type`). `Database.createdAt/By`, ledger mode and digest interval, bucket count and
+durability now come from `kingres_cp.database_setting` for databases created through the API and are null for others.
+The lists above that say "always null in this version" are otherwise unchanged except `ClusterOverview.managerLeader`,
+which is still null (no election yet; the leader is the single server).
 
 The 0.1.0 defects (missing 422/429/503/405 responses, no 405 code, no server
 identity, "map group has id 1", unstored database settings answered with

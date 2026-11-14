@@ -14,22 +14,17 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/store"
 )
 
-// The task table is not specified yet by the design notes; the contract says
-// the id is "task_id in kingres.task". The columns read here are the
-// ones the contract's Task schema needs, and are documented in the README as
-// an assumption for the task engine to honor:
-//
-//	kingres.task(task_id bigint PK, kind text, state text, progress jsonb,
-//	              error jsonb, subject jsonb, cancellable bool,
-//	              created_at timestamptz, updated_at timestamptz, created_by text)
-const taskColumns = `task_id, kind, state, progress, error, subject, cancellable, created_at, updated_at, created_by`
+// Tasks live in kingres_cp.task of the system database (migration 1, see
+// package sysdb); the database of the service DSN is the system database.
+const taskColumns = `id, kind, state, subject_type, subject_id, progress, error, state IN ('pending', 'running'), created_at, updated_at, created_by`
 
 type taskRow struct {
 	id          int64
 	kind, state string
 	progress    []byte
 	taskErr     []byte
-	subject     []byte
+	subjType    string
+	subjID      string
 	cancellable bool
 	createdAt   time.Time
 	updatedAt   time.Time
@@ -38,7 +33,7 @@ type taskRow struct {
 
 func scanTask(r pgx.CollectableRow) (taskRow, error) {
 	var t taskRow
-	err := r.Scan(&t.id, &t.kind, &t.state, &t.progress, &t.taskErr, &t.subject, &t.cancellable, &t.createdAt, &t.updatedAt, &t.createdBy)
+	err := r.Scan(&t.id, &t.kind, &t.state, &t.subjType, &t.subjID, &t.progress, &t.taskErr, &t.cancellable, &t.createdAt, &t.updatedAt, &t.createdBy)
 	return t, err
 }
 
@@ -62,17 +57,18 @@ func (t taskRow) toAPI() (api.Task, error) {
 			return api.Task{}, fmt.Errorf("decoding error of task %d: %w", t.id, err)
 		}
 	}
-	if len(t.subject) > 0 && string(t.subject) != "null" {
-		out.Subject = new(api.TaskSubject)
-		if err := json.Unmarshal(t.subject, out.Subject); err != nil {
-			return api.Task{}, fmt.Errorf("decoding subject of task %d: %w", t.id, err)
+	out.Subject = &api.TaskSubject{Type: t.subjType, ID: t.subjID}
+	for _, st := range out.Progress.Steps {
+		if st.State == "running" {
+			n := st.Name
+			out.Progress.CurrentStep = &n
 		}
 	}
 	return out, nil
 }
 
 // Tasks implements store.Store. Tasks are listed newest first with a keyset
-// cursor on task_id; without kingres.task the list is empty.
+// cursor on task_id; without kingres_cp.task the list is empty.
 func (s *Store) Tasks(ctx context.Context, f store.TaskFilter, p store.Page) (api.TaskPage, error) {
 	empty := api.TaskPage{Items: []api.Task{}}
 	before, bounded, err := store.DecodeKey(p.Cursor)
@@ -83,7 +79,7 @@ func (s *Store) Tasks(ctx context.Context, f store.TaskFilter, p store.Page) (ap
 	if err != nil {
 		return empty, err
 	}
-	ok, err := s.regclassExists(ctx, pool, "kingres.task")
+	ok, err := s.regclassExists(ctx, pool, "kingres_cp.task")
 	if err != nil || !ok {
 		return empty, err
 	}
@@ -91,15 +87,15 @@ func (s *Store) Tasks(ctx context.Context, f store.TaskFilter, p store.Page) (ap
 	if bounded {
 		bound = before
 	}
-	rows, err := pool.Query(ctx, `SELECT `+taskColumns+` FROM kingres.task
-		WHERE ($1::bigint IS NULL OR task_id < $1) AND ($2 = '' OR state = $2) AND ($3 = '' OR kind = $3)
-		ORDER BY task_id DESC LIMIT $4`, bound, f.State, f.Kind, p.Limit+1)
+	rows, err := pool.Query(ctx, `SELECT `+taskColumns+` FROM kingres_cp.task
+		WHERE ($1::bigint IS NULL OR id < $1) AND ($2 = '' OR state = $2) AND ($3 = '' OR kind = $3)
+		ORDER BY id DESC LIMIT $4`, bound, f.State, f.Kind, p.Limit+1)
 	if err != nil {
-		return empty, s.wrap("reading kingres.task", err)
+		return empty, s.wrap("reading kingres_cp.task", err)
 	}
 	raw, err := pgx.CollectRows(rows, scanTask)
 	if err != nil {
-		return empty, s.wrap("reading kingres.task", err)
+		return empty, s.wrap("reading kingres_cp.task", err)
 	}
 	page := api.TaskPage{Items: make([]api.Task, 0, len(raw))}
 	if len(raw) > p.Limit {
@@ -123,20 +119,20 @@ func (s *Store) Task(ctx context.Context, id int64) (api.Task, error) {
 	if err != nil {
 		return api.Task{}, err
 	}
-	ok, err := s.regclassExists(ctx, pool, "kingres.task")
+	ok, err := s.regclassExists(ctx, pool, "kingres_cp.task")
 	if err != nil {
 		return api.Task{}, err
 	}
 	if !ok {
 		return api.Task{}, store.ErrNotFound
 	}
-	rows, err := pool.Query(ctx, `SELECT `+taskColumns+` FROM kingres.task WHERE task_id = $1`, id)
+	rows, err := pool.Query(ctx, `SELECT `+taskColumns+` FROM kingres_cp.task WHERE id = $1`, id)
 	if err != nil {
-		return api.Task{}, s.wrap("reading kingres.task", err)
+		return api.Task{}, s.wrap("reading kingres_cp.task", err)
 	}
 	raw, err := pgx.CollectRows(rows, scanTask)
 	if err != nil {
-		return api.Task{}, s.wrap("reading kingres.task", err)
+		return api.Task{}, s.wrap("reading kingres_cp.task", err)
 	}
 	if len(raw) == 0 {
 		return api.Task{}, store.ErrNotFound

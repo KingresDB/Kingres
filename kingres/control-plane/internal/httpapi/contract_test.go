@@ -3,7 +3,6 @@
 package httpapi
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"net/http"
@@ -12,22 +11,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/santhosh-tekuri/jsonschema/v6"
-
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/audit"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/auth"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/contracttest"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/spec"
 )
 
-const specPath = "../../../api/openapi.yaml"
-
 func loadSpec(t *testing.T) *spec.Document {
 	t.Helper()
-	doc, err := spec.Load(specPath)
-	if err != nil {
-		t.Fatalf("loading the contract: %v", err)
-	}
+	doc := contracttest.Load(t)
 	return doc
 }
 
@@ -44,8 +37,8 @@ func TestRoutingMatchesContract(t *testing.T) {
 	for _, op := range doc.Operations {
 		want[op.Method+" /api/v1"+op.Path] = op.ID
 	}
-	if len(want) != 84 {
-		t.Errorf("contract has %d operations, this test was written for 84", len(want))
+	if len(want) != 86 {
+		t.Errorf("contract has %d operations, this test was written for 86", len(want))
 	}
 	got := map[string]string{}
 	for _, r := range e.srv.Routes() {
@@ -111,63 +104,26 @@ func TestNewRejectsHandlerOutsideContract(t *testing.T) {
 	}
 }
 
-// schemaChecker validates JSON documents against the schemas of the contract.
+// schemaChecker validates JSON documents against the schemas of the contract
+// (package contracttest, shared with the end-to-end tests).
 type schemaChecker struct {
-	t    *testing.T
-	doc  *spec.Document
-	comp *jsonschema.Compiler
+	t testing.TB
+	c *contracttest.Checker
 }
 
 func newSchemaChecker(t *testing.T) *schemaChecker {
 	t.Helper()
-	doc := loadSpec(t)
-	raw, err := doc.JSON()
-	if err != nil {
-		t.Fatal(err)
-	}
-	inst, err := jsonschema.UnmarshalJSON(bytes.NewReader(raw))
-	if err != nil {
-		t.Fatal(err)
-	}
-	c := jsonschema.NewCompiler()
-	c.AssertFormat()
-	if err := c.AddResource("http://contract.test/openapi.json", inst); err != nil {
-		t.Fatal(err)
-	}
-	return &schemaChecker{t: t, doc: doc, comp: c}
+	return &schemaChecker{t: t, c: contracttest.NewChecker(t)}
 }
 
-// validate checks body against the component schema name.
 func (c *schemaChecker) validateSchema(name string, body []byte) error {
 	c.t.Helper()
-	sch, err := c.comp.Compile("http://contract.test/openapi.json#/components/schemas/" + name)
-	if err != nil {
-		c.t.Fatalf("compiling schema %s: %v", name, err)
-	}
-	return c.validate(sch, body)
+	return c.c.Schema(name, body)
 }
 
-// validateResponse checks body against the schema the contract declares for
-// the application/json response with the given status of the operation.
 func (c *schemaChecker) validateResponse(opID, status string, body []byte) error {
 	c.t.Helper()
-	ptr, ok := c.doc.ResponseSchemaPointer(opID, status)
-	if !ok {
-		c.t.Fatalf("contract has no inline JSON response %s for %s", status, opID)
-	}
-	sch, err := c.comp.Compile("http://contract.test/openapi.json" + ptr)
-	if err != nil {
-		c.t.Fatalf("compiling response schema of %s: %v", opID, err)
-	}
-	return c.validate(sch, body)
-}
-
-func (c *schemaChecker) validate(sch *jsonschema.Schema, body []byte) error {
-	inst, err := jsonschema.UnmarshalJSON(bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("response is not JSON: %w", err)
-	}
-	return sch.Validate(inst)
+	return c.c.Response(opID, status, body)
 }
 
 // seed fills the fake store with one of every resource, so that responses
@@ -190,9 +146,10 @@ func seed(e *env) {
 	inst1 := api.Instance{ID: 1, ServerID: h1, ShardGroupID: 0, IsMapGroup: true, Role: "primary", State: "running", Port: 5432}
 	inst2 := api.Instance{ID: 2, ServerID: h2, ShardGroupID: 0, IsMapGroup: true, Role: "standby", State: "running", Port: 5432,
 		UpstreamInstanceID: &pri, ReplicationLagBytes: &lagB, ReplicationLagSeconds: &lag}
+	ver := "1.0.0"
 	mk := func(id string, in api.Instance) api.Server {
 		return api.Server{ID: id, Address: id + ":8091", Hostname: id,
-			Status: "live", ServerGroup: &sg, ShouldHaveShards: true, Version: "1.0.0",
+			Status: "live", ServerGroup: &sg, ShouldHaveShards: true, Version: &ver,
 			Instances: []api.Instance{in}, Buckets: api.BucketHolding{Primary: 64, Replica: 64}}
 	}
 	e.mem.ServerList = []api.Server{mk(h1, inst1), mk(h2, inst2)}
@@ -207,6 +164,7 @@ func seed(e *env) {
 		Slots: []api.ReplicationSlot{{Name: "s1", Type: "physical", Active: true, InstanceID: 1, RetainedWalBytes: 10}},
 	}}}
 	owner, enc, coll, limit, dur := "alice", "UTF8", "C", -1, "sync"
+	by := "alice"
 	bc, tables, conns, mode := 128, 2, 1, "off"
 	e.mem.DBs = []api.Database{{
 		Name: "shop", Status: "ready",
@@ -216,15 +174,15 @@ func seed(e *env) {
 		Ledger:        api.LedgerSettings{Mode: &mode},
 		Stats:         api.DatabaseStats{SizeBytes: &size, TableCount: &tables, ActiveConnections: &conns},
 		LedgerSummary: api.DatabaseLedgerSummary{},
-		CreatedBy:     "alice", CreatedAt: now,
+		CreatedBy:     &by, CreatedAt: &now,
 	}}
 	col, rows := "id", int64(10)
 	orders := api.TableDetail{Table: api.Table{Schema: "public", Name: "orders", Classes: []string{"distributed", "ledger"},
 		Distribution: &api.TableDistribution{Method: "hash", Column: &col, ColocationID: 1, BucketCount: 128},
 		Ledger:       &api.TableLedger{Mode: "appendOnly"}, EstimatedRows: &rows, SizeBytes: &size},
-		Columns: []api.TableColumn{{Name: "id", Type: "bigint", DistributionBlockedReason: ptr("tableNotPlain")}}}
+		Columns: []api.TableColumn{{Name: "id", Type: "bigint", DistributionBlockedReason: ptr("tableNotPlain"), BlockingKeys: []string{}}}}
 	settings := api.TableDetail{Table: api.Table{Schema: "public", Name: "settings", Classes: []string{"plain"}, HomeShardGroupID: ptr(int32(0))},
-		Columns: []api.TableColumn{{Name: "k", Type: "text", CanBeDistributionColumn: true}, {Name: "v", Type: "jsonb", Nullable: true, DistributionBlockedReason: ptr("unsupportedType")}}}
+		Columns: []api.TableColumn{{Name: "k", Type: "text", CanBeDistributionColumn: true, BlockingKeys: []string{}}, {Name: "v", Type: "jsonb", Nullable: true, DistributionBlockedReason: ptr("unsupportedType"), BlockingKeys: []string{}}}}
 	e.mem.TablesByDB["shop"] = []api.TableDetail{orders, settings}
 	e.mem.Colocation["shop"] = []api.ColocationGroup{{ColocationID: 1, BucketCount: 128, DistributionColumnType: "bigint", TableCount: 1, SizeBytes: &size}}
 	e.mem.BucketsByCG["shop"] = map[int32][]api.Bucket{1: {
@@ -237,7 +195,7 @@ func seed(e *env) {
 		Progress: api.TaskProgress{Percent: 50, CurrentStep: &step, Steps: []api.TaskStep{{Name: step, State: "failed", StartedAt: &now}}},
 		Error:    &api.TaskError{Code: "step_failed", Message: "boom"}, Subject: &api.TaskSubject{Type: "database", ID: "shop"}}}
 	hash, height, one, interval := "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", int64(4210), 1, 3600
-	e.mem.LedgerByDB["shop"] = api.LedgerStatus{DatabaseName: "shop", Mode: "optIn", DigestIntervalSeconds: interval,
+	e.mem.LedgerByDB["shop"] = api.LedgerStatus{DatabaseName: "shop", Mode: &mode, DigestIntervalSeconds: &interval,
 		LedgerTableCount: &one, Chains: []api.LedgerChainStatus{{ShardGroupID: 0, LatestBlockHeight: &height, LatestBlockHash: &hash, LatestBlockAt: &now}}}
 	e.mem.BlocksByDB["shop"] = []api.LedgerBlock{{ShardGroupID: 0, Height: 0, TxMerkleRoot: hash, BlockHash: hash, Timestamp: now, HashVersion: 1},
 		{ShardGroupID: 0, Height: 1, PrevHash: &hash, TxMerkleRoot: hash, BlockHash: hash, Timestamp: now, HashVersion: 1, TransactionCount: 3}}
@@ -274,6 +232,7 @@ func TestResponsesValidateAgainstContract(t *testing.T) {
 		{"getNodeState", "/api/v1/setup/state"},
 		{"getSession", "/api/v1/auth/session"},
 		{"getCluster", "/api/v1/cluster"},
+		{"getClusterSummary", "/api/v1/cluster/summary"},
 		{"listServers", "/api/v1/servers"},
 		{"getServer", "/api/v1/servers/10.0.0.1"},
 		{"listServerGroups", "/api/v1/server-groups"},
@@ -301,6 +260,15 @@ func TestResponsesValidateAgainstContract(t *testing.T) {
 		{"listGrants", "/api/v1/grants"},
 		{"listAuditEvents", "/api/v1/audit"},
 	}
+	// Operations that change the cluster need a real PostgreSQL instance; their
+	// responses are validated against the contract by the end-to-end tests.
+	mutating := map[string]bool{}
+	for id := range e.srv.opsHandlers() {
+		if id != "getClusterSummary" {
+			mutating[id] = true
+		}
+	}
+	mutating["initCluster"] = true
 	covered := map[string]bool{}
 	for _, c := range calls {
 		covered[c.op] = true
@@ -320,7 +288,7 @@ func TestResponsesValidateAgainstContract(t *testing.T) {
 	// Every implemented operation except the cookie/side-effect ones must be
 	// covered by the table above.
 	for id := range e.srv.handlers() {
-		if id == "login" || id == "logout" || id == "checkSetupToken" || covered[id] {
+		if id == "login" || id == "logout" || id == "checkSetupToken" || covered[id] || mutating[id] {
 			continue
 		}
 		t.Errorf("implemented operation %s has no response validation case", id)

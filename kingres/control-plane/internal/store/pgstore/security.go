@@ -18,19 +18,19 @@ import (
 // roles they belong to, directly or through other roles. The four built-in
 // cluster roles and the predefined pg_* roles are not listed as accounts.
 const roleSQL = `
-SELECT r.rolname, r.rolcanlogin, r.rolsuper, r.rolcreatedb, r.rolcreaterole, r.rolconnlimit, r.rolvaliduntil,
+SELECT r.rolname, r.rolcanlogin, r.rolsuper, r.rolcreatedb, r.rolcreaterole, r.rolconnlimit, NULLIF(r.rolvaliduntil, 'infinity'::timestamptz),
   coalesce((SELECT array_agg(g.rolname ORDER BY g.rolname) FROM pg_auth_members m
             JOIN pg_roles g ON g.oid = m.roleid
-            WHERE m.member = r.oid
+            WHERE m.member = r.oid AND m.inherit_option
               AND g.rolname NOT IN ('kingres_admin', 'kingres_ops', 'kingres_readonly', 'kingres_stats')),
            '{}'::name[])::text[],
   coalesce((SELECT array_agg(c.rolname ORDER BY c.rolname) FROM pg_roles c
             WHERE c.rolname IN ('kingres_admin', 'kingres_ops', 'kingres_readonly', 'kingres_stats')
               AND EXISTS (
                 WITH RECURSIVE x(roleid) AS (
-                    SELECT a.roleid FROM pg_auth_members a WHERE a.member = r.oid
+                    SELECT a.roleid FROM pg_auth_members a WHERE a.member = r.oid AND a.inherit_option
                   UNION
-                    SELECT a.roleid FROM pg_auth_members a JOIN x ON a.member = x.roleid)
+                    SELECT a.roleid FROM pg_auth_members a JOIN x ON a.member = x.roleid WHERE a.inherit_option)
                 SELECT 1 FROM x WHERE x.roleid = c.oid)),
            '{}'::name[])::text[]
 FROM pg_roles r

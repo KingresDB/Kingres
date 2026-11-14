@@ -13,7 +13,6 @@ import (
 
 // nilUUID is reported as the cluster id of a node whose state file does not
 // carry one yet.
-const nilUUID = "00000000-0000-0000-0000-000000000000"
 
 func (s *Server) getCluster(_ *call, w http.ResponseWriter, r *http.Request) error {
 	sum, err := s.deps.Store.ClusterSummary(r.Context())
@@ -26,7 +25,7 @@ func (s *Server) getCluster(_ *call, w http.ResponseWriter, r *http.Request) err
 	}
 	snap := s.deps.Setup.Snapshot()
 	out := api.ClusterOverview{
-		ClusterID: snap.ClusterID, Name: snap.ClusterName, Health: sum.Health,
+		ClusterID: optStr(snap.ClusterID), Name: optStr(snap.ClusterName), Health: sum.Health,
 		Version: s.deps.Version, MapVersion: sum.MapVersion, MapGroupAvailable: sum.MapGroupAvailable,
 		// The manager does not exist yet, so there is no elected leader.
 		ManagerLeader: nil,
@@ -36,9 +35,6 @@ func (s *Server) getCluster(_ *call, w http.ResponseWriter, r *http.Request) err
 			EventsSinceReset: settings.AutoFailover.EventsSinceReset, MaxCount: settings.AutoFailover.MaxCount},
 		Features:  settings.Features,
 		UpdatedAt: s.now().UTC(),
-	}
-	if out.ClusterID == "" {
-		out.ClusterID = nilUUID
 	}
 	if out.Rebalance.Reasons == nil {
 		out.Rebalance.Reasons = []string{}
@@ -422,4 +418,12 @@ func (s *Server) getDatabaseCreateOptions(_ *call, w http.ResponseWriter, r *htt
 	v.Collations = nonNil(v.Collations)
 	s.writeJSON(w, r, http.StatusOK, v)
 	return nil
+}
+
+// optStr returns nil for the empty string ("not available").
+func optStr(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }

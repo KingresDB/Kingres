@@ -6,25 +6,27 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pgtest"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/store"
 )
 
-// These tests need a PostgreSQL instance loaded with scripts/fixture_*.sql
-// (see scripts/pg-test-instance.sh and scripts/run-integration.ps1). They run
-// only when KINGRES_TEST_DSN is set, so "go test ./..." works without a
-// database.
+// These tests need a PostgreSQL instance loaded with scripts/fixture_*.sql and
+// a streaming standby; fixture_test.go builds both with the instance manager.
+// They run only when KINGRES_PG_BIN is set.
 
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
-	dsn := os.Getenv("KINGRES_TEST_DSN")
-	if dsn == "" {
-		t.Skip("KINGRES_TEST_DSN is not set; skipping the PostgreSQL integration test")
+	if !pgtest.Available() {
+		t.Skip("KINGRES_PG_BIN is not set; skipping the PostgreSQL integration test")
+	}
+	dsn, err := setupFixture(t)
+	if err != nil {
+		t.Fatalf("fixture: %v", err)
 	}
 	s, err := New(Options{
 		DSN: dsn, Logger: slog.New(slog.DiscardHandler), PanelPort: "8091", Version: "test",
@@ -70,7 +72,7 @@ func TestIntegrationServers(t *testing.T) {
 		byID[sv.ID] = sv
 	}
 	s1 := byID["127.0.0.1"]
-	if s1.Address != "127.0.0.1:8091" || s1.Status != "live" || s1.Version != "test" || s1.UptimeSeconds == nil || *s1.UptimeSeconds < 60 ||
+	if s1.Address != "127.0.0.1:8091" || s1.Status != "live" || s1.Version == nil || *s1.Version != "test" || s1.UptimeSeconds == nil || *s1.UptimeSeconds < 60 ||
 		s1.ServerGroup == nil || *s1.ServerGroup != "rack-a" || len(s1.Instances) != 1 {
 		t.Errorf("server 1 = %+v", s1)
 	}
@@ -189,7 +191,7 @@ func TestIntegrationDatabases(t *testing.T) {
 	if str(kcp.General.Owner) != "cp_admin" || str(kcp.General.Encoding) != "UTF8" || kcp.Status != "ready" || !kcp.Sharding.Enabled ||
 		kcp.Sharding.BucketCount == nil || *kcp.Sharding.BucketCount != 8 || kcp.Stats.SizeBytes == nil || *kcp.Stats.SizeBytes <= 0 ||
 		kcp.Stats.TableCount == nil || *kcp.Stats.TableCount != 7 || str(kcp.Replication.Durability) != "sync" ||
-		kcp.Replication.ReplicaCount != 1 || kcp.CreatedAt.IsZero() {
+		kcp.Replication.ReplicaCount != 1 || kcp.CreatedAt != nil {
 		t.Errorf("kingres_cp = %+v", kcp)
 	}
 	// The ledger catalog exists, but no catalog stores the mode or the interval: null.
@@ -411,7 +413,7 @@ func TestIntegrationTasks(t *testing.T) {
 func TestIntegrationLedger(t *testing.T) {
 	s := newTestStore(t)
 	st, err := s.LedgerStatus(ctx(t), "kingres_cp")
-	if err != nil || st.Mode != "optIn" || st.LedgerTableCount == nil || *st.LedgerTableCount != 1 || len(st.Chains) != 1 || st.VerificationState != nil {
+	if err != nil || st.Mode != nil || st.LedgerTableCount == nil || *st.LedgerTableCount != 1 || len(st.Chains) != 1 || st.VerificationState != nil {
 		t.Fatalf("status = %+v %v", st, err)
 	}
 	ch := st.Chains[0]
@@ -420,7 +422,7 @@ func TestIntegrationLedger(t *testing.T) {
 		t.Errorf("chain = %+v", ch)
 	}
 	off, err := s.LedgerStatus(ctx(t), "plain_cp")
-	if err != nil || off.Mode != "off" || len(off.Chains) != 0 || off.Chains == nil {
+	if err != nil || str(off.Mode) != "off" || len(off.Chains) != 0 || off.Chains == nil {
 		t.Errorf("plain_cp ledger = %+v %v", off, err)
 	}
 	if _, err := s.LedgerStatus(ctx(t), "nope"); !errors.Is(err, store.ErrNotFound) {
