@@ -290,3 +290,91 @@ describe what the code already did.
   failure inside `ledger_verify` reaches; no test makes `ledger_verify` fail.
 - The launcher has not been tested with `EXEC_BACKEND` (Windows); the shared
   memory pointer is not re-attached there.
+
+## Notes of the second review fixes (findings L2-01 to L2-08)
+
+The review `kingres/docs/reviews/2026-11-14-kingres-ledger-0.2.md` found eight
+defects. Version 0.2 was not released, so the fixes are in `kingres_ledger--0.2.sql`
+and `kingres_ledger--0.1--0.2.sql` (no new version); the hash format did not
+change. What was done, with the decisions the review left open.
+
+**L2-01, the `kl_internal_ddl` window.** The flag is gone. `ledger_history_sync`
+makes the `ADD COLUMN` of the history table with `AlterTableInternal` (the catalog
+API), on the history table whose OID it was given and with the subcommands it built
+itself, with the collection of commands for event triggers inhibited; nothing is
+run as a statement, so no event trigger of a user, no function and no default
+expression runs while it works, and the hook has nothing to be told. The
+privileges of the history table are changed the same way (`ExecuteGrantStmt`).
+
+Every state of the form "we are inside our own code" that was examined:
+
+| State | Where | Verdict |
+|---|---|---|
+| `kl_internal_ddl` (global boolean, hook skipped every statement) | `kingres_ledger.c`, `protect.c` | removed (L2-01) |
+| `creating_extension && CurrentExtensionObject == extoid` (hook skipped every statement while the install or upgrade script of the extension ran, including statements of event triggers fired by the script) | `protect.c` | scoped: the hook remembers the query string of the first statement of the script (the text `execute_sql_string` passes for each of its statements) and trusts only statements with that very string; a statement run by an event trigger, a function or SPI has a text of its own and is checked fully. The state is forgotten as soon as no script of this extension runs. Limit: one step of upgrade per command (a chain of scripts would need the rule extended; there is one step) |
+| `SetUserIdAndSecContext(extowner)` in the worker | `worker.c` | not a relaxation of a check; the worker only calls `kingres.ledger_build_block()` (qualified) with the settings overridden; the launcher is not connected to a database |
+| `SetUserIdAndSecContext(extowner)` in the hook after `REASSIGN OWNED` | `history.c` | new; runs only `kl_sync_history_acl` (fixed catalog operations on the history tables of the registry); the user id is restored in `PG_FINALLY` |
+| `SECURITY DEFINER` functions of the extension | SQL | each runs fixed statements with a fixed `search_path`; the function that runs on behalf of a user (`ledger_enable`) checks the ownership by hand; no flag |
+| `ENABLE ALWAYS` triggers and `kl_preloaded` | | not relaxations (`kl_preloaded` only refuses `ledger_enable`) |
+| `ledger_guard` and `ledger_all_defects` | SQL | read-only checks; the guard now also calls the ACL sync, which only brings the privileges to the rule |
+| `kl_rv_relid`: no lock for a role that does not own the table | `protect.c` | an optimisation that was reviewed in 0.1 (L-03); it does not skip a check |
+
+**L2-02, privileges of the history table.** The rule: the extension owner and the
+owner of the ledger table read it, nobody else. `ledger_enable` sets the ACL
+explicitly (default privileges are revoked); the event trigger repairs every
+history table after every DDL command (also what `GRANT ... ON ALL TABLES IN
+SCHEMA` did), the hook repairs after `ALTER TABLE ... OWNER TO` and `REASSIGN
+OWNED` (which fire no event trigger), and a `GRANT` on a history table is rejected.
+`ledger_verify` and the guard report `history_privileges`. Decision: no grant
+to other roles (the previous documentation said "grant `SELECT` yourself");
+membership in the owner role is the way, documented with the bypass of row
+security and column privileges.
+
+**L2-03, settings of the database.** `BackgroundWorkerInitializeConnectionByOid`
+has no flag that skips `pg_db_role_setting`; the worker overrides the list in
+`kl_harden_settings` with `PGC_S_OVERRIDE` before its transaction (the list is in
+the README). The worker is also cancelled by its own `USER_TIMEOUT` timer after
+`kingres_ledger.worker_timeout` (a GUC added by this fix: a fix needs a limit that
+can be tested), reports its outcome in shared memory (`ledger_worker_state`,
+shown by `ledger_status`), is not started again for a delay that doubles with
+every failure up to an hour, and logs one line per failure at `LOG`.
+`synchronous_commit` and `work_mem` are not overridden. The SQL of the extension
+has no backslash (a literal `'\x00'` and a `LIKE` with a backslash escape were
+replaced) and no dependence on session settings; `ledger_review2` runs every
+function under hostile session settings.
+
+**L2-04, readability.** `ledger_verification` is not readable by PUBLIC;
+`ledger_digest` is readable except `generated_by`. The view `ledger_status` calls
+`ledger_worker_state`, and PostgreSQL checks `EXECUTE` of a function in a view for
+the caller, so a reader of the view needs `EXECUTE` on it too (documented in
+"Privileges"). Existing tests: `ledger_records` grants that and the read of the
+verifications now needs a grant; `ledger_updatable` expected that a `GRANT SELECT`
+on a history table works, and it is now rejected (expected output changed);
+`ledger_hash` lists the new GUC; `ledger_privs` lists the new functions and the
+columns. No assertion was removed.
+
+**L2-05.** The caches are dropped by the subtransaction abort callback.
+
+**L2-06.** Launcher: the per-round list is freed (round memory context) and so is
+the worker handle; sweeps skip databases where no extension was found (nine of
+ten sweeps) and databases in their failure delay; order continues after the last
+visited database; a round stops at the worker timeout and its remainder goes to
+the next round; a worker has a timeout and is terminated by the launcher five
+seconds after it; a missing
+worker slot is logged once and then every sixty rounds.
+
+**L2-07.** The verifier accepts `I` and `D` proofs, `--op I|D|any`, fixtures from an
+updatable table.
+
+**L2-08.** Records: decision "administrators only" (see README, "Growth of the
+records"). A cancelled `ledger_verify_recorded` is recorded as `failed`. The
+assertions of `009_worker` are on outcomes. The README has "Where a reviewer
+should attack first".
+
+**Areas the review did not examine**, established by test (`ledger_review2`,
+`010_review2`): `COPY ... FREEZE` works in both orders; logical replication apply
+into an updatable table works, a missing row is skipped, a replicated `TRUNCATE`
+fails the apply worker until the subscription is disabled; `max_worker_processes`
+used up leaves transactions pending (`ledger_status` shows them), logs once, and
+a call of `ledger_generate_digest` builds the block; `pg_dump` and restore give a
+database with the rows and an empty ledger (documented limit, not a defect).

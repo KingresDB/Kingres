@@ -38,6 +38,11 @@ const (
 // OpInsert is the operation byte of an insert entry: README "op = 0x49 ('I')".
 const OpInsert byte = 0x49
 
+// OpDelete is the operation byte of a removal entry (version 0.2 of the
+// ledger, updatable tables): the version of a row with this hash left the
+// table, by an UPDATE or a DELETE. README "op = 0x44 ('D')".
+const OpDelete byte = 0x44
+
 // Limits that follow from the widths of the length fields.
 const (
 	maxColumns   = 1<<16 - 1

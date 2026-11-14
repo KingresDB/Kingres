@@ -76,7 +76,8 @@ COMMENT ON TABLE kingres.ledger_verification IS
     'Every verification run through ledger_verify_recorded and its outcome; append-only.';
 
 REVOKE ALL ON kingres.ledger_digest, kingres.ledger_verification FROM PUBLIC;
-GRANT SELECT ON kingres.ledger_digest, kingres.ledger_verification TO PUBLIC;
+GRANT SELECT (digest_id, generated_at, height, block_hash, digest)
+    ON kingres.ledger_digest TO PUBLIC;
 
 CREATE TRIGGER kingres_ledger_block_modify
     BEFORE UPDATE OR DELETE ON kingres.ledger_digest
@@ -116,6 +117,30 @@ COMMENT ON FUNCTION kingres.ledger_history_sync(regclass, regclass) IS
     'Internal: add the columns of an updatable ledger table that its history table lacks.';
 REVOKE ALL ON FUNCTION kingres.ledger_history_sync(regclass, regclass) FROM PUBLIC;
 
+CREATE FUNCTION kingres.ledger_history_acl_sync(relation regclass, history regclass)
+    RETURNS boolean
+    AS 'MODULE_PATHNAME', 'kingres_ledger_history_acl_sync'
+    LANGUAGE C VOLATILE STRICT
+    SET search_path = pg_catalog, pg_temp;
+COMMENT ON FUNCTION kingres.ledger_history_acl_sync(regclass, regclass) IS
+    'Internal: make the privileges on a history table those of the owner of its ledger table and of the extension owner, and nobody else.';
+REVOKE ALL ON FUNCTION kingres.ledger_history_acl_sync(regclass, regclass) FROM PUBLIC;
+
+CREATE FUNCTION kingres.ledger_worker_state(OUT state text, OUT visits bigint,
+                                             OUT failures bigint,
+                                             OUT consecutive_failures int,
+                                             OUT last_attempt timestamptz,
+                                             OUT last_success timestamptz,
+                                             OUT retry_after timestamptz,
+                                             OUT last_error text)
+    RETURNS record
+    AS 'MODULE_PATHNAME', 'kingres_ledger_worker_state'
+    LANGUAGE C VOLATILE
+    SET search_path = pg_catalog, pg_temp;
+COMMENT ON FUNCTION kingres.ledger_worker_state() IS
+    'Internal: the outcome of the last visits of the block-building worker to this database (state, counts, times of the last attempt, success and next attempt after a failure, and the last error); read by ledger_status.';
+REVOKE ALL ON FUNCTION kingres.ledger_worker_state() FROM PUBLIC;
+
 CREATE FUNCTION kingres.ledger_verify_proof(proof jsonb, digest jsonb,
                                              expected_table_id int,
                                              expected_row_hash bytea,
@@ -142,6 +167,7 @@ AS $fn$
 DECLARE
     v_rel  pg_catalog.pg_class%ROWTYPE;
     v_name text;
+    v_towner oid;
 BEGIN
     IF p_hist IS NULL THEN
         RETURN QUERY SELECT 'history_missing'::text, 'the table has no history table'::text;
@@ -194,6 +220,34 @@ BEGIN
      WHERE g.tgrelid = p_hist AND NOT g.tgisinternal
        AND g.tgname NOT IN ('kingres_ledger_block_modify', 'kingres_ledger_block_truncate',
                             'kingres_ledger_block_insert');
+
+    -- Who may read it: the owner of the history table and the owner of the
+    -- ledger table, on the table and on no column, and nobody else.
+    SELECT k.relowner INTO v_towner FROM pg_catalog.pg_class k WHERE k.oid = p_relid;
+    RETURN QUERY
+    SELECT 'history_privileges'::text,
+           pg_catalog.format('%s: %s has the privilege %s, which the rule gives only to the owner of the table and the owner of the history table',
+                             v_name,
+                             CASE x.grantee WHEN 0 THEN 'PUBLIC' ELSE pg_catalog.pg_get_userbyid(x.grantee)::pg_catalog.text END,
+                             x.privilege_type)
+      FROM pg_catalog.aclexplode(COALESCE(v_rel.relacl, pg_catalog.acldefault('r', v_rel.relowner))) x
+     WHERE x.grantee <> v_rel.relowner
+       AND NOT (x.grantee = v_towner AND x.grantor = v_rel.relowner
+                AND x.privilege_type = 'SELECT' AND NOT x.is_grantable);
+    IF v_towner <> v_rel.relowner
+       AND NOT EXISTS (SELECT 1
+                         FROM pg_catalog.aclexplode(COALESCE(v_rel.relacl, pg_catalog.acldefault('r', v_rel.relowner))) x
+                        WHERE x.grantee = v_towner AND x.grantor = v_rel.relowner
+                          AND x.privilege_type = 'SELECT' AND NOT x.is_grantable) THEN
+        RETURN QUERY SELECT 'history_privileges'::text,
+            v_name || ': the owner of the table cannot read the history table';
+    END IF;
+    RETURN QUERY
+    SELECT 'history_privileges'::text,
+           pg_catalog.format('%s: column "%s" has column privileges', v_name, a.attname)
+      FROM pg_catalog.pg_attribute a
+     WHERE a.attrelid = p_hist AND a.attnum > 0 AND NOT a.attisdropped
+       AND a.attacl IS NOT NULL;
 
     -- Columns of the table that the history table lacks, or has with another
     -- type, and columns of the history table that do not belong there.
@@ -295,7 +349,7 @@ BEGIN
         -- trigger for updates and deletes.
         IF NOT kingres.ledger_trigger_ok(p_relid, 'kingres_ledger_capture',
                    'kingres_ledger_capture', true, 29,
-                   pg_catalog.convert_to(p_table_id::pg_catalog.text, 'UTF8') || '\x00'::pg_catalog.bytea) THEN
+                   pg_catalog.convert_to(p_table_id::pg_catalog.text, 'UTF8') || pg_catalog.decode('00', 'hex')) THEN
             RETURN QUERY SELECT 'trigger'::text,
                 'trigger kingres_ledger_capture is missing, disabled or not ENABLE ALWAYS'::text;
         END IF;
@@ -317,7 +371,7 @@ BEGIN
     ELSE
         IF NOT kingres.ledger_trigger_ok(p_relid, 'kingres_ledger_capture',
                    'kingres_ledger_capture', true, 5,
-                   pg_catalog.convert_to(p_table_id::pg_catalog.text, 'UTF8') || '\x00'::pg_catalog.bytea) THEN
+                   pg_catalog.convert_to(p_table_id::pg_catalog.text, 'UTF8') || pg_catalog.decode('00', 'hex')) THEN
             RETURN QUERY SELECT 'trigger'::text,
                 'trigger kingres_ledger_capture is missing, disabled or not ENABLE ALWAYS'::text;
         END IF;
@@ -485,6 +539,18 @@ BEGIN
             PERFORM kingres.ledger_history_sync(d.relid::pg_catalog.regclass,
                                                 d.hist::pg_catalog.regclass);
         END LOOP;
+        -- The privileges on every history table follow the owner of its
+        -- table (ALTER TABLE ... OWNER TO, REASSIGN OWNED, GRANT ... ON ALL
+        -- TABLES IN SCHEMA); a table that is already right costs a cache
+        -- lookup.
+        FOR d IN
+            SELECT t.relid::pg_catalog.oid AS relid, t.history_relid::pg_catalog.oid AS hist
+              FROM kingres.ledger_table t
+             WHERE t.history_relid IS NOT NULL
+        LOOP
+            PERFORM kingres.ledger_history_acl_sync(d.relid::pg_catalog.regclass,
+                                                    d.hist::pg_catalog.regclass);
+        END LOOP;
         FOR d IN SELECT x.check_name, x.object, x.detail
                    FROM kingres.ledger_all_defects() x LIMIT 1
         LOOP
@@ -581,7 +647,7 @@ BEGIN
             USING ERRCODE = '0A000',
                   HINT = 'Create the table in another schema, or schema-qualify its name.';
     END IF;
-    IF nsp = 'information_schema' OR nsp LIKE 'pg\_%' THEN
+    IF nsp = 'information_schema' OR nsp LIKE 'pg!_%' ESCAPE '!' THEN
         RAISE EXCEPTION 'table "%" is in a system schema and cannot be a ledger table', rel.relname
             USING ERRCODE = '0A000';
     END IF;
@@ -671,7 +737,7 @@ BEGIN
           FROM pg_catalog.pg_attribute a
          WHERE a.attrelid = rel.oid AND a.attnum > 0 AND NOT a.attisdropped;
         EXECUTE pg_catalog.format(
-            'CREATE TABLE %I.%I (%s, ledger_txid bigint, ledger_seq integer, ledger_op "char")',
+            'CREATE TABLE %I.%I (%s, ledger_txid bigint, ledger_seq integer, ledger_op "char") USING heap',
             nsp, hname, hcols);
         SELECT c.oid INTO hid FROM pg_catalog.pg_class c
          WHERE c.relnamespace = rel.relnamespace AND c.relname = hname;
@@ -689,10 +755,10 @@ BEGIN
         EXECUTE pg_catalog.format('ALTER TABLE %I.%I ENABLE ALWAYS TRIGGER kingres_ledger_block_modify', nsp, hname);
         EXECUTE pg_catalog.format('ALTER TABLE %I.%I ENABLE ALWAYS TRIGGER kingres_ledger_block_truncate', nsp, hname);
         EXECUTE pg_catalog.format('ALTER TABLE %I.%I ENABLE ALWAYS TRIGGER kingres_ledger_block_insert', nsp, hname);
-        owner_name := pg_catalog.pg_get_userbyid(rel.relowner);
-        IF owner_name <> current_user THEN
-            EXECUTE pg_catalog.format('GRANT SELECT ON %I.%I TO %I', nsp, hname, owner_name);
-        END IF;
+        -- Who may read the old versions: the owner of the table and the
+        -- extension owner, nobody else, whatever default privileges say.
+        PERFORM kingres.ledger_history_acl_sync(rel.oid::pg_catalog.regclass,
+                                                hid::pg_catalog.regclass);
 
         EXECUTE pg_catalog.format(
             'CREATE TRIGGER kingres_ledger_capture AFTER INSERT OR UPDATE OR DELETE ON %I.%I FOR EACH ROW EXECUTE FUNCTION kingres.ledger_capture(%L)',
@@ -1255,6 +1321,8 @@ DECLARE
     n_rows    bigint;
     probs     jsonb;
     vid       bigint;
+    err_text  text;
+    err_state text;
 BEGIN
     IF lo < 0 OR (to_height IS NOT NULL AND to_height < lo) THEN
         RAISE EXCEPTION 'invalid height range % .. %', from_height, to_height
@@ -1284,17 +1352,30 @@ BEGIN
                 n_problems, n_blocks, n_rows,
                 CASE WHEN n_problems = 0 THEN NULL ELSE probs END)
         RETURNING verification_id INTO vid;
-    EXCEPTION WHEN OTHERS THEN
+    -- A run that was cancelled (statement_timeout, pg_cancel_backend, Ctrl-C)
+    -- is recorded as failed too: OTHERS does not catch query_canceled.  What
+    -- cannot be recorded: a run that ends the session (pg_terminate_backend,
+    -- transaction_timeout, a crash, a lost connection) and a run whose
+    -- calling transaction rolls back.
+    EXCEPTION
+        WHEN query_canceled THEN
+            err_text := SQLERRM;
+            err_state := SQLSTATE;
+        WHEN OTHERS THEN
+            err_text := SQLERRM;
+            err_state := SQLSTATE;
+    END;
+    IF err_state IS NOT NULL THEN
         INSERT INTO kingres.ledger_verification
                (started_at, finished_at, started_by, from_height, to_height, state,
                 problem_count, problems)
         VALUES (started, pg_catalog.clock_timestamp(), who, lo, hi, 'failed', NULL,
                 pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
                     'check', 'verification_failed', 'object', NULL::pg_catalog.text,
-                    'detail', SQLERRM, 'sqlstate', SQLSTATE)))
+                    'detail', pg_catalog.left(err_text, 1000), 'sqlstate', err_state)))
         RETURNING verification_id INTO vid;
-        RAISE WARNING 'ledger verification % failed: %', vid, SQLERRM;
-    END;
+        RAISE WARNING 'ledger verification % failed: %', vid, err_text;
+    END IF;
     RETURN vid;
 END
 $fn$;
@@ -1318,8 +1399,13 @@ SELECT (SELECT pg_catalog.count(*) FROM kingres.ledger_table t WHERE t.mode = 'a
        lv.verification_id AS last_verification_id,
        lv.finished_at AS last_verification_at,
        lv.state AS last_verification_state,
-       lv.problem_count AS last_verification_problems
+       lv.problem_count AS last_verification_problems,
+       ws.state AS worker_state,
+       ws.consecutive_failures AS worker_consecutive_failures,
+       ws.retry_after AS worker_retry_after,
+       ws.last_error AS worker_last_error
   FROM (SELECT 1) one
+  CROSS JOIN LATERAL kingres.ledger_worker_state() ws
   LEFT JOIN LATERAL (SELECT b.height, b.block_hash, b.closed_at
                        FROM kingres.ledger_blocks b
                       ORDER BY b.height DESC LIMIT 1) lb ON true
@@ -1331,7 +1417,7 @@ SELECT (SELECT pg_catalog.count(*) FROM kingres.ledger_table t WHERE t.mode = 'a
                       WHERE v.finished_at IS NOT NULL
                       ORDER BY v.verification_id DESC LIMIT 1) lv ON true;
 COMMENT ON VIEW kingres.ledger_status IS
-    'One row: the number of append-only and updatable ledger tables, the latest block, the pending transactions and the age of the oldest, the last digest and the last finished verification. Not readable by PUBLIC.';
+    'One row: the number of append-only and updatable ledger tables, the latest block, the pending transactions and the age of the oldest, the last digest and the last finished verification, and the state of the block-building worker for this database (ok, failed with the delay before the next attempt and the last error, ...). Not readable by PUBLIC.';
 
 REVOKE ALL ON FUNCTION kingres.ledger_verify_recorded(bigint, bigint) FROM PUBLIC;
 REVOKE ALL ON kingres.ledger_status FROM PUBLIC;

@@ -7,7 +7,7 @@ import "testing"
 // FuzzVerify checks that parsing and verifying arbitrary bytes as a proof
 // never panics, and that a proof that verifies keeps verifying.
 func FuzzVerify(f *testing.F) {
-	for _, n := range []string{"proofs/acc5.json", "proofs/acc1_at_d0.json", "proofs/evt10.json", "digests/d5.json"} {
+	for _, n := range []string{"proofs/acc5.json", "proofs/acc1_at_d0.json", "proofs/evt10.json", "proofs/itm1_v1_d.json", "proofs/itm1_v1_i.json", "digests/d5.json"} {
 		f.Add(readFixture(f, n))
 	}
 	d5 := mustDigest(f, readFixture(f, "digests/d5.json"))

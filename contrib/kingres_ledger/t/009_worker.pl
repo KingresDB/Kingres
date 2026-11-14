@@ -27,6 +27,31 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
+# What a failing worker leaves behind, asserted on outcomes and not on the
+# absence of one kind of line: the state that the workers report for the
+# database (ok and no failure), and no line of the log that says a worker
+# failed, ended with an error, or was killed.  An ERROR or FATAL of any kind
+# in the log of a node that only runs this test's statements is a failure
+# too (the statements of the test that are meant to fail are not in the
+# parts that call this).
+sub assert_workers_fine
+{
+	my ($node, $what, $since, @dbs) = @_;
+
+	foreach my $db (@dbs)
+	{
+		ok($node->poll_query_until($db,
+				q(SELECT worker_state || ' failures=' || worker_consecutive_failures FROM kingres.ledger_status),
+				'ok failures=0'),
+			"$what: the worker of $db reports ok and no failure");
+	}
+	my $log = substr(slurp_file($node->logfile), $since);
+	my @bad = grep { /(\bERROR:|\bFATAL:|\bPANIC:|block worker for database \d+ failed|exited with exit code|terminated by signal|did not stop within)/ }
+	  split /\n/, $log;
+	is(scalar(@bad), 0, "$what: the log has no error, no failed worker and no killed worker")
+	  or diag(join("\n", @bad));
+}
+
 my $primary = PostgreSQL::Test::Cluster->new('primary');
 $primary->init(allows_streaming => 1);
 $primary->append_conf(
@@ -92,8 +117,10 @@ is($primary->safe_psql('db1', 'SELECT count(*) FROM public.u_ledger_history'),
 	'2', 'db1: the updatable table was captured and built');
 
 # A database without the extension, and the log: nothing went wrong.
-my $log = slurp_file($primary->logfile);
-unlike($log, qr/kingres_ledger.*ERROR|ERROR.*kingres_ledger/, 'no error in the log from the workers');
+assert_workers_fine($primary, "after the first blocks", 0, 'db1', 'db2');
+# The database without the extension was visited and remembered as such.
+is($primary->safe_psql('plain', q(SELECT count(*) FROM pg_extension WHERE extname = 'kingres_ledger')),
+	'0', 'the database "plain" has no extension and costs nothing');
 
 #--------------------------------------------------------------------------
 # block_interval = 0 switches the workers off; a reload switches them on.
@@ -130,12 +157,15 @@ $primary->safe_psql('db1', q(INSERT INTO public.w VALUES (3, 'c')));
 $primary->safe_psql('db2', q(INSERT INTO public.w VALUES (3, 'c')));
 $primary->safe_psql('postgres', q(ALTER SYSTEM SET kingres_ledger.block_interval = '500ms'));
 $primary->restart;
+my $after_restart;
 foreach my $db ('db1', 'db2')
 {
 	ok( $primary->poll_query_until($db,
 			q(SELECT count(*) = 0 FROM kingres.ledger_pending), 't'),
 		"$db: what was pending at a restart is built after it");
 }
+# Lines of the log before this point include the shutdown of the old server.
+$after_restart = -s $primary->logfile;
 
 #--------------------------------------------------------------------------
 # A bounded block is followed by more blocks.
@@ -172,6 +202,8 @@ $holder->quit;
 ok( $primary->poll_query_until('db2',
 		q(SELECT count(*) = 0 FROM kingres.ledger_pending), 't'),
 	'after the lock is released the next round builds the block');
+# The busy builder is not a failure: the state is ok and the count is zero.
+assert_workers_fine($primary, "at the end of the primary part", $after_restart, 'db1', 'db2');
 
 #--------------------------------------------------------------------------
 # A standby runs no worker; the promoted server builds.
@@ -185,7 +217,9 @@ sleep 3;
 is($standby->safe_psql('postgres',
 		q(SELECT count(*) FROM pg_stat_activity WHERE backend_type LIKE 'kingres_ledger%')),
 	'0', 'a standby has no launcher and no worker');
-unlike(slurp_file($standby->logfile), qr/kingres_ledger.*(ERROR|FATAL)/, 'and nothing in its log');
+my @standby_bad = grep { /(\bERROR:|\bFATAL:|\bPANIC:|block worker for database \d+ failed|exited with exit code|terminated by signal)/ }
+  split /\n/, slurp_file($standby->logfile);
+is(scalar(@standby_bad), 0, 'and nothing went wrong in its log') or diag(join("\n", @standby_bad));
 $primary->stop;
 $standby->promote;
 $standby->safe_psql('db2', q(INSERT INTO public.w VALUES (40, 'promoted')));
@@ -197,6 +231,9 @@ is($standby->safe_psql('db2', 'SELECT count(*) FROM kingres.ledger_verify()'),
 is($standby->safe_psql('postgres',
 		q(SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'kingres_ledger launcher')),
 	'1', 'the launcher runs after promotion');
+ok($standby->poll_query_until('db2',
+		q(SELECT worker_state FROM kingres.ledger_status), 'ok'),
+	'db2: the worker of the promoted server reports ok');
 $standby->stop;
 
 done_testing();

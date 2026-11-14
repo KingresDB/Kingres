@@ -31,9 +31,16 @@
  *		replacing or altering the status view of the extension;
  *	  - the history table of an updatable ledger table (registered as
  *		history_relid in kingres.ledger_table) is treated like a table of the
- *		ledger catalog, except for the one ALTER TABLE ... ADD COLUMN that the
- *		extension runs itself (kl_internal_ddl), and ADD COLUMN of a column
- *		with the name of a history column is rejected.
+ *		ledger catalog, without exception: the ADD COLUMN that follows an ADD
+ *		COLUMN of the ledger table is made by kingres.ledger_history_sync
+ *		through the catalog API (history.c), not as a statement, so no switch
+ *		exists that would let a statement through; every GRANT on it is
+ *		rejected (its privileges follow the owner of the ledger table), and
+ *		ADD COLUMN of a column with the name of a history column is rejected.
+ *
+ * The hook has no "inside our own code" state that relaxes a check, with one
+ * exception that is scoped to the statement text: the statements of the
+ * extension's own install or upgrade script (see kl_is_own_script).
  *
  * Name resolution.  The statement itself resolves the names in it again
  * after the hook has looked at them.  If the hook resolved a name without a
@@ -108,9 +115,6 @@
 
 #include "kingres_ledger.h"
 #include "row_hash.h"
-
-/* Attribute number of history_relid in kingres.ledger_table (version 0.2). */
-#define KL_LEDGER_TABLE_HISTORY_ATTNO 5
 
 /* What kind of protected relation a relation is. */
 typedef enum KlKind
@@ -223,7 +227,8 @@ kl_is_internal_function(Oid funcoid, Oid extoid)
 		kl_is_ledger_function(funcoid, extoid, KL_SYM_BLOCK_MODIFY) ||
 		kl_is_ledger_function(funcoid, extoid, KL_SYM_RECORD_ROW) ||
 		kl_is_ledger_function(funcoid, extoid, KL_SYM_LOCK_TABLE) ||
-		kl_is_ledger_function(funcoid, extoid, KL_SYM_HISTORY_SYNC);
+		kl_is_ledger_function(funcoid, extoid, KL_SYM_HISTORY_SYNC) ||
+		kl_is_ledger_function(funcoid, extoid, KL_SYM_HISTORY_ACL_SYNC);
 }
 
 /*
@@ -1016,12 +1021,25 @@ kl_extension_owner(Oid extoid)
  *		is harmless.
  */
 static void
-kl_check_catalog_grant(GrantStmt *stmt, const char *relname, Oid extoid)
+kl_check_catalog_grant(GrantStmt *stmt, const char *relname, Oid extoid,
+					   bool history)
 {
 	ListCell   *lc;
 
 	if (stmt->is_grant)
 	{
+		/*
+		 * The history table holds old row versions, which bypass the row
+		 * security and the column privileges of the table: who may read it
+		 * is decided by the ownership of the ledger table alone (history.c),
+		 * not by a grant.
+		 */
+		if (history)
+			ereport(ERROR,
+					(errcode(ERRCODE_KL_PROTECTED),
+					 errmsg("cannot grant privileges on table \"%s\": it is a history table of the ledger",
+							relname),
+					 errhint("Only the owner of the ledger table can read its history table; make a role a member of that owner to give it access.")));
 		if (stmt->privileges == NIL)
 			kl_reject("grant all privileges on table", relname,
 					  KL_CATALOG_LEDGER);
@@ -1070,14 +1088,15 @@ kl_check_grant(GrantStmt *stmt, Oid extoid)
 				if (stmt->targtype == ACL_TARGET_ALL_IN_SCHEMA)
 				{
 					if (strcmp(strVal(lfirst(lc)), KL_SCHEMA_NAME) == 0)
-						kl_check_catalog_grant(stmt, KL_SCHEMA_NAME, extoid);
+						kl_check_catalog_grant(stmt, KL_SCHEMA_NAME, extoid, false);
 				}
 				else
 				{
 					Oid			relid = kl_rv_relid((RangeVar *) lfirst(lc), NoLock);
 
 					if (kl_classify(relid, extoid) == KL_CATALOG_LEDGER)
-						kl_check_catalog_grant(stmt, get_rel_name(relid), extoid);
+						kl_check_catalog_grant(stmt, get_rel_name(relid), extoid,
+											   kl_is_history(relid));
 				}
 			}
 			break;
@@ -1114,21 +1133,66 @@ kl_check_grant(GrantStmt *stmt, Oid extoid)
 }
 
 /*
+ * The query text of the script of this extension that is being run by
+ * CREATE EXTENSION or ALTER EXTENSION UPDATE, or NULL.  execute_sql_string
+ * passes the text of the whole script to ProcessUtility for each of its
+ * statements, so the statements of the script share one pointer, and a
+ * statement that anything else runs meanwhile (an event trigger, a function)
+ * has a text of its own.  The first statement that the hook sees while the
+ * script runs is a statement of the script; see kl_note_script.
+ */
+static const char *kl_script_query = NULL;
+
+/*
+ * kl_note_script
+ *		Called for every utility statement, before it is checked.  Remembers
+ *		the text of the script of this extension at its first statement, and
+ *		forgets it as soon as no script of this extension is running.
+ *		A script that is followed by another one in the same command (a chain
+ *		of upgrade steps) would need this to learn the text of the next one;
+ *		today there is a single step, and a second one would be rejected
+ *		rather than trusted.
+ */
+static void
+kl_note_script(const char *queryString)
+{
+	if (!creating_extension)
+	{
+		kl_script_query = NULL;
+		return;
+	}
+	if (kl_script_query == NULL &&
+		CurrentExtensionObject == get_extension_oid(KL_EXTENSION_NAME, true))
+		kl_script_query = queryString;
+}
+
+/*
+ * kl_is_own_script
+ *		Whether the statement is a statement of the install or upgrade script
+ *		of the extension, which has to be able to do what the hook rejects
+ *		everywhere else.  Nothing else is trusted while the script runs: not a
+ *		statement of an event trigger, not one of a function.
+ */
+static bool
+kl_is_own_script(Oid extoid, const char *queryString)
+{
+	return creating_extension && CurrentExtensionObject == extoid &&
+		kl_script_query != NULL && queryString == kl_script_query;
+}
+
+/*
  * kl_check_statement
  *		Dispatch on the statement type.  Unlisted statements are not
  *		inspected and cost nothing.
  */
 static void
-kl_check_statement(Node *parsetree)
+kl_check_statement(Node *parsetree, const char *queryString)
 {
 	Oid			extoid;
 	Oid			relid;
 	KlKind		kind;
 
 	if (parsetree == NULL)
-		return;
-	/* The extension's own ALTER TABLE on a history table (history_sync). */
-	if (kl_internal_ddl)
 		return;
 
 	switch (nodeTag(parsetree))
@@ -1162,8 +1226,8 @@ kl_check_statement(Node *parsetree)
 	extoid = get_extension_oid(KL_EXTENSION_NAME, true);
 	if (!OidIsValid(extoid))
 		return;
-	/* The extension's own install and upgrade scripts are trusted. */
-	if (creating_extension && CurrentExtensionObject == extoid)
+	/* The statements of the extension's own install and upgrade script. */
+	if (kl_is_own_script(extoid, queryString))
 		return;
 
 	switch (nodeTag(parsetree))
@@ -1363,6 +1427,31 @@ kl_check_statement(Node *parsetree)
 }
 
 /*
+ * kl_may_change_owner
+ *		Whether a statement can change the owner of a table: REASSIGN OWNED, or
+ *		ALTER TABLE with an OWNER TO subcommand.
+ */
+static bool
+kl_may_change_owner(Node *parsetree)
+{
+	if (parsetree == NULL)
+		return false;
+	if (IsA(parsetree, ReassignOwnedStmt))
+		return true;
+	if (IsA(parsetree, AlterTableStmt))
+	{
+		ListCell   *lc;
+
+		foreach(lc, ((AlterTableStmt *) parsetree)->cmds)
+		{
+			if (lfirst_node(AlterTableCmd, lc)->subtype == AT_ChangeOwner)
+				return true;
+		}
+	}
+	return false;
+}
+
+/*
  * kl_ProcessUtility
  *		The hook: check the statement, then run it through the next hook or
  *		the standard implementation.
@@ -1373,7 +1462,11 @@ kl_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 				  ParamListInfo params, QueryEnvironment *queryEnv,
 				  DestReceiver *dest, QueryCompletion *qc)
 {
-	kl_check_statement(pstmt->utilityStmt);
+	bool		owner_change;
+
+	kl_note_script(queryString);
+	kl_check_statement(pstmt->utilityStmt, queryString);
+	owner_change = kl_may_change_owner(pstmt->utilityStmt);
 
 	if (prev_ProcessUtility)
 		prev_ProcessUtility(pstmt, queryString, readOnlyTree, context, params,
@@ -1381,4 +1474,17 @@ kl_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 	else
 		standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
 								params, queryEnv, dest, qc);
+
+	/*
+	 * A history table is readable by the owner of its ledger table only.  The
+	 * event trigger moves the privileges after an ALTER TABLE ... OWNER TO,
+	 * but REASSIGN OWNED fires none, and event triggers can be off.
+	 */
+	if (owner_change && !creating_extension)
+	{
+		Oid			extoid = get_extension_oid(KL_EXTENSION_NAME, true);
+
+		if (OidIsValid(extoid))
+			kl_sync_all_history_acls(kl_extension_owner(extoid));
+	}
 }

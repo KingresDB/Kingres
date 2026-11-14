@@ -1,0 +1,22 @@
+[
+    {
+        "name": "id",
+        "send_hex": "00000004"
+    },
+    {
+        "name": "name",
+        "send_hex": "776173686572"
+    },
+    {
+        "name": "qty",
+        "send_hex": "00000005"
+    },
+    {
+        "name": "note",
+        "send_hex": "78"
+    },
+    {
+        "name": "price",
+        "send_hex": "00010000000000020001"
+    }
+]

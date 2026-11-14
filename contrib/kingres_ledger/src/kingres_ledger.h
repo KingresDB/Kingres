@@ -86,6 +86,10 @@
 #define KL_SYM_RECORD_ROW		"kingres_ledger_record_row"
 #define KL_SYM_LOCK_TABLE		"kingres_ledger_lock_table"
 #define KL_SYM_HISTORY_SYNC		"kingres_ledger_history_sync"
+#define KL_SYM_HISTORY_ACL_SYNC	"kingres_ledger_history_acl_sync"
+
+/* Attribute number of history_relid in kingres.ledger_table (version 0.2). */
+#define KL_LEDGER_TABLE_HISTORY_ATTNO 5
 
 /* GUC, see kingres_ledger.c. */
 extern int	kl_max_block_transactions;
@@ -93,8 +97,8 @@ extern int	kl_max_block_transactions;
 /* GUC: how often the launcher looks for pending transactions, in ms; 0 = off. */
 extern int	kl_block_interval;
 
-/* True while the extension itself runs a DDL statement on a history table. */
-extern bool kl_internal_ddl;
+/* GUC: the longest one worker may run for one database, in ms; 0 = no limit. */
+extern int	kl_worker_timeout;
 
 /* True when the library was loaded through shared_preload_libraries. */
 extern bool kl_preloaded;
@@ -132,5 +136,8 @@ extern void kl_mark_dirty(Oid dboid);
 
 /* protect.c */
 extern void kl_protect_init(void);
+
+/* history.c */
+extern void kl_sync_all_history_acls(Oid extowner);
 
 #endif							/* KINGRES_LEDGER_KINGRES_LEDGER_H */

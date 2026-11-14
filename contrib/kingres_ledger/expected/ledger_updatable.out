@@ -782,13 +782,10 @@ SELECT user_name FROM kingres.ledger_pending ORDER BY ledger_txid DESC LIMIT 1;
 (1 row)
 
 GRANT SELECT ON priv_t_ledger_history TO kl_u_other;
+ERROR:  cannot grant privileges on table "priv_t_ledger_history": it is a history table of the ledger
 SET ROLE kl_u_other;
 SELECT count(*) AS other_can_read_after_the_grant FROM priv_t_ledger_history;
- other_can_read_after_the_grant 
---------------------------------
-                              3
-(1 row)
-
+ERROR:  permission denied for table priv_t_ledger_history
 RESET ROLE;
 SELECT count(*) AS problems FROM kingres.ledger_verify();
  problems 

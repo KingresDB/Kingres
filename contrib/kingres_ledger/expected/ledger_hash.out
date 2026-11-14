@@ -15,7 +15,8 @@ SELECT name, setting, context FROM pg_settings WHERE name LIKE 'kingres_ledger.%
 ---------------------------------------+---------+-----------
  kingres_ledger.block_interval         | 0       | sighup
  kingres_ledger.max_block_transactions | 100000  | superuser
-(2 rows)
+ kingres_ledger.worker_timeout         | 60000   | sighup
+(3 rows)
 
 SET kingres_ledger.no_such_setting = 1;
 ERROR:  invalid configuration parameter name "kingres_ledger.no_such_setting"

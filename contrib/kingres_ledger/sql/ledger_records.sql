@@ -125,10 +125,21 @@ SET ROLE kl_r_reader;
 SELECT count(*) FROM kingres.ledger_status;
 RESET ROLE;
 GRANT SELECT ON kingres.ledger_status TO kl_r_reader;
+-- the view calls ledger_worker_state, and a function is executed with the
+-- privileges of the caller, so a reader of the view needs EXECUTE on it too
+SET ROLE kl_r_reader;
+SELECT count(*) FROM kingres.ledger_status;
+RESET ROLE;
+GRANT EXECUTE ON FUNCTION kingres.ledger_worker_state() TO kl_r_reader;
 SET ROLE kl_r_reader;
 SELECT count(*) AS reader_sees_the_status FROM kingres.ledger_status;
 SELECT count(*) > 0 AS reader_reads_digests FROM kingres.ledger_digest;
+-- the verification records name tables and row hashes: not readable by PUBLIC
 SELECT count(*) > 0 AS reader_reads_verifications FROM kingres.ledger_verification;
+RESET ROLE;
+GRANT SELECT ON kingres.ledger_verification TO kl_r_reader;
+SET ROLE kl_r_reader;
+SELECT count(*) > 0 AS reader_reads_verifications_when_granted FROM kingres.ledger_verification;
 RESET ROLE;
 
 --------------------------------------------------------------------------

@@ -3,6 +3,7 @@
 package crosscheck
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -28,6 +29,7 @@ type manifest struct {
 		RowHash  string `json:"row_hash"`
 		Proof    string `json:"proof"`
 		Columns  string `json:"columns"`
+		Op       string `json:"op"`
 	} `json:"rows"`
 	Blocks           string `json:"blocks"`
 	OtherChainDigest string `json:"other_chain_digest"`
@@ -80,7 +82,8 @@ func TestServerProofsAgainstDigests(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		exp := proof.Expect{TableID: &row.TableID, RowHash: &want}
+		op := opByte(t, row.Op)
+		exp := proof.Expect{TableID: &row.TableID, RowHash: &want, Op: &op}
 		okSomewhere := false
 		for _, md := range m.Digests {
 			d := digest(t, md.File)
@@ -218,5 +221,148 @@ func TestDigestSetConsistent(t *testing.T) {
 	ds = append(ds, chain.NamedDigest{Name: "other", Digest: digest(t, m.OtherChainDigest)})
 	if problems := chain.CheckDigestSet(ds); len(problems) == 0 {
 		t.Error("a digest of another chain was not noticed")
+	}
+}
+
+// opByte is the operation byte of the manifest's "op" ("I" or "D").
+func opByte(t testing.TB, s string) byte {
+	t.Helper()
+	switch s {
+	case "I":
+		return format.OpInsert
+	case "D":
+		return format.OpDelete
+	}
+	t.Fatalf("manifest has the operation %q, expected I or D", s)
+	return 0
+}
+
+// The fixtures come from updatable tables too: there are D proofs, and for
+// every removed version also the I proof of the entry that entered it.
+func TestFixtureCoverageOfRemovals(t *testing.T) {
+	m := load(t)
+	var inserts, deletes int
+	hashes := map[string]map[string]bool{}
+	for _, row := range m.Rows {
+		switch row.Op {
+		case "I":
+			inserts++
+		case "D":
+			deletes++
+		default:
+			t.Errorf("%s: operation %q", row.Label, row.Op)
+		}
+		if hashes[row.RowHash] == nil {
+			hashes[row.RowHash] = map[string]bool{}
+		}
+		hashes[row.RowHash][row.Op] = true
+	}
+	if deletes < 4 || inserts < 15 {
+		t.Errorf("%d I and %d D proofs, want at least 15 and 4", inserts, deletes)
+	}
+	both := 0
+	for _, ops := range hashes {
+		if ops["I"] && ops["D"] {
+			both++
+		}
+	}
+	if both < 3 {
+		t.Errorf("%d row hashes have both an I and a D proof, want at least 3", both)
+	}
+}
+
+// Every D proof that the server made verifies, with the operation expected or
+// not named, and says that it is a D proof; the recomputed leaf of an entry
+// depends on the operation, so the same proof with the other operation fails.
+func TestDeleteProofsVerify(t *testing.T) {
+	m := load(t)
+	latest := digest(t, m.Digests[len(m.Digests)-1].File)
+	n := 0
+	for _, row := range m.Rows {
+		if row.Op != "D" {
+			continue
+		}
+		n++
+		raw := read(t, row.Proof)
+		p, err := proof.Parse(raw)
+		if err != nil {
+			t.Fatalf("%s: %v", row.Label, err)
+		}
+		if p.Op != format.OpDelete {
+			t.Errorf("%s: parsed operation %s", row.Label, proof.OpName(p.Op))
+		}
+		want, err := format.DecodeHash(row.RowHash)
+		if err != nil {
+			t.Fatal(err)
+		}
+		del, ins := format.OpDelete, format.OpInsert
+		// Named D, and not named.
+		for _, exp := range []proof.Expect{
+			{TableID: &row.TableID, RowHash: &want, Op: &del},
+			{TableID: &row.TableID, RowHash: &want},
+			{},
+		} {
+			if _, err := proof.Verify(p, latest, exp); err != nil {
+				t.Errorf("%s: %v", row.Label, err)
+			}
+		}
+		// Presented as an I proof: refused by the caller's choice ...
+		_, err = proof.Verify(p, latest, proof.Expect{TableID: &row.TableID, RowHash: &want, Op: &ins})
+		if !proof.IsStep(err, proof.StepBinding) {
+			t.Errorf("%s as an I proof: err = %v, want a binding failure", row.Label, err)
+		}
+		// ... and a proof file whose op was changed to I fails by itself: the
+		// entry leaf, which covers the operation, no longer leads to the root.
+		flipped := bytes.Replace(raw, []byte(`"op": "D"`), []byte(`"op": "I"`), 1)
+		if bytes.Equal(flipped, raw) {
+			t.Fatalf("%s: no op member to flip", row.Label)
+		}
+		fp, err := proof.Parse(flipped)
+		if err != nil {
+			t.Fatalf("%s flipped: %v", row.Label, err)
+		}
+		if _, err := proof.Verify(fp, latest, proof.Expect{}); !proof.IsStep(err, proof.StepEntryPath) {
+			t.Errorf("%s with op flipped to I: err = %v, want an entry-path failure", row.Label, err)
+		}
+	}
+	if n < 4 {
+		t.Errorf("only %d D proofs in the fixtures", n)
+	}
+}
+
+// And the reverse: an I proof presented as D, or flipped to D, fails.
+func TestInsertProofsAreNotDeleteProofs(t *testing.T) {
+	m := load(t)
+	latest := digest(t, m.Digests[len(m.Digests)-1].File)
+	n := 0
+	for _, row := range m.Rows {
+		if row.Op != "I" {
+			continue
+		}
+		n++
+		raw := read(t, row.Proof)
+		p, err := proof.Parse(raw)
+		if err != nil {
+			t.Fatalf("%s: %v", row.Label, err)
+		}
+		want, err := format.DecodeHash(row.RowHash)
+		if err != nil {
+			t.Fatal(err)
+		}
+		del := format.OpDelete
+		if _, err := proof.Verify(p, latest, proof.Expect{TableID: &row.TableID, RowHash: &want, Op: &del}); !proof.IsStep(err, proof.StepBinding) {
+			t.Errorf("%s as a D proof: err = %v, want a binding failure", row.Label, err)
+		}
+		flipped := bytes.Replace(raw, []byte(`"op": "I"`), []byte(`"op": "D"`), 1)
+		fp, err := proof.Parse(flipped)
+		if err != nil {
+			t.Fatalf("%s flipped: %v", row.Label, err)
+		}
+		if _, err := proof.Verify(fp, latest, proof.Expect{}); !proof.IsStep(err, proof.StepEntryPath) {
+			t.Errorf("%s with op flipped to D: err = %v, want an entry-path failure", row.Label, err)
+		}
+	}
+	if n < 15 {
+		t.Errorf("only %d I proofs in the fixtures", n)
 	}
 }

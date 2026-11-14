@@ -68,7 +68,7 @@ instead of text; the exit status is the same.
 ### `proof`
 
 ```
-kingres-verify proof --proof proof.json --digest digest.json [--table-id N] [--row-hash HEX] [--json]
+kingres-verify proof --proof proof.json --digest digest.json [--table-id N] [--row-hash HEX] [--op I|D|any] [--json]
 ```
 
 Runs the verification steps of the ledger README on the proof against the
@@ -83,11 +83,24 @@ the digest carries `block_closed_at` it must equal the block time of the digest'
 block (`digest-time`). A digest older than the proof's block fails at
 `chain-walk`. Numbers must be plain JSON integers in range; hex must be lower case.
 
+**Insert and removal proofs.** A proof is for one ledger entry, and an entry has an
+operation: `I` (a version of a row was inserted) or `D` (a version of a row was
+removed, by an `UPDATE` or a `DELETE` of an updatable table). They are different
+statements: "this version was inserted" does not say that it is still there, and
+"this version was removed" does not say who made the row. The verifier accepts
+proofs of either operation, because the entry leaf covers the operation byte and a
+proof whose `op` was changed fails at `entry-path`. `--op I` or `--op D` makes the
+expected operation the caller's explicit choice: a proof of the other operation
+fails at step `binding`. The default, `--op any`, accepts either and **reports
+which one was proven** (in the text output as `operation D: ...`, in `--json` as
+`info.op` and `info.proves`). Use `--op` whenever you mean one of the two. Any
+other value of `op` in the proof is a parse failure.
+
 ```
 $ kingres-verify proof --proof proofs/acc5.json --digest digests/d5.json \
-    --table-id 1 --row-hash 56700cbe26b660e69f01339a5629217dde30b035480f68f9c7873caca086d856
-VERIFIED: the proof is valid against the digest at height 6.
-  ok  binding      proof is for the expected table and row
+    --table-id 1 --row-hash 56700cbe26b660e69f01339a5629217dde30b035480f68f9c7873caca086d856 --op I
+VERIFIED: the proof is valid against the digest at height 9.
+  ok  binding      proof is for the expected table, row and operation
   ...
 $ echo $?
 0
@@ -214,16 +227,20 @@ it against a digest of block T or later.
 ## Cross-check against the server
 
 `scripts/gen-fixtures.sh` starts a throwaway server from the installed binaries
-in WSL2 (new directory under `~/kingres-work/verifier-test/`, a free port from
+in WSL2 (new directory under `$KINGRES_TEST_WORK/verifier-test/`, default `~/kw-verifier`, a free port from
 57300 to 57399, `shared_preload_libraries = 'kingres_ledger'`), creates two
-ledger tables with many column types (integers, numeric, text with non-ASCII
+ledger tables with many column types and a third, updatable table (integers, numeric, text with non-ASCII
 characters and a non-ASCII column name, timestamptz, timestamp, date, bytea,
 boolean, uuid, float, jsonb, interval, inet, an array, NULL columns, an empty
 string, an added nullable column), inserts rows over several transactions (one
-by another role, one rolled back) and seven blocks, and writes
-`testdata/fixtures/`: six digests at different heights, one digest of a second,
-separately created database, 17 proofs, the column descriptions of 15 rows in
-binary send form, the block headers and a manifest of the server's own answers.
+by another role, one rolled back) and ten blocks (the updatable table gets inserts, updates of the same row
+in two transactions, an update that changes several columns and a delete), and
+writes `testdata/fixtures/`: nine digests at different heights, one digest of a
+second, separately created database, the proofs of 15 rows and of 4 current rows
+of the updatable table (`I`) and of 4 removed versions of rows, each as the `D`
+proof of its removal and as the `I` proof of its entry, the column descriptions of
+all of them in binary send form (for a removed version, the columns of its row in
+the history table), the block headers and a manifest of the server's own answers.
 Then it stops and removes the server. Regenerate with:
 
 ```
@@ -232,7 +249,7 @@ wsl.exe -d Ubuntu-24.04 -u kingres -- bash "/mnt/c/<path to the repository>/king
 
 `go test ./internal/crosscheck/` then shows that every server proof verifies
 against its digest and every later digest, fails against earlier digests and
-against the other database's digest, that every recomputed row hash equals the
+against the other database's digest, that every `D` proof verifies and says that it is a `D` proof, that a `D` proof presented as `I` (by `--op I`, or by changing its `op` member) fails and the reverse, that every recomputed row hash equals the
 server's `ledger_row_hash`, that the recomputed block chain equals the server's
 digests and the headers inside the proofs, and (in `internal/proof`) that every
 single-field and every single-byte mutation of a fixture proof is rejected.
@@ -269,7 +286,9 @@ These readings were made and are enforced; each is a finding below.
   `closed_at_us` is any `int64`; `hash_version` and `format` must be 1.
 - Headers in `chain` after the digest height are parsed (strictly) but not
   verified, because a proof made after the digest legitimately has them.
-- `op` must be the string `"I"` (byte `0x49`).
+- `op` must be the string `"I"` (byte `0x49`, an entry that inserted a row version) or `"D"`
+  (byte `0x44`, an entry that removed one); any other string is rejected. A proof
+  that says `D` but whose entry is an `I` (or the reverse) fails at `entry-path`.
 
 ## Findings about the format documentation
 

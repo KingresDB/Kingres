@@ -116,6 +116,17 @@ static void
 kl_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 					SubTransactionId parentSubid, void *arg)
 {
+	/*
+	 * A rolled back subtransaction may have registered a table
+	 * (ledger_enable) or removed a registration, and the caches map the OID
+	 * of a table to what the registry said while it was in force; a table
+	 * that is registered again after a ROLLBACK TO SAVEPOINT or an exception
+	 * block gets another table_id.  Whatever was cached is dropped (finding
+	 * L2-05); the next lookup reads the registry again.
+	 */
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+		kl_table_cache_reset();
+
 	if (!kl_state.pending_written || kl_state.pending_subid != mySubid)
 		return;
 

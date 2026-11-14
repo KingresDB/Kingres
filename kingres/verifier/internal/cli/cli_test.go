@@ -249,3 +249,55 @@ func TestVersionAndHelp(t *testing.T) {
 		t.Errorf("unknown command: %d %q", code, errs)
 	}
 }
+
+// The operation of a proof: D proofs (a version was removed) verify, the
+// caller's choice of --op is binding, and the output says which one was proven.
+func TestProofCommandOperation(t *testing.T) {
+	dproof := fx("proofs/itm1_v1_d.json")
+	iproof := fx("proofs/itm1_v1_i.json")
+	d8 := fx("digests/d8.json")
+	tests := []struct {
+		name     string
+		args     []string
+		wantCode int
+		wantOut  string
+		notOut   string
+	}{
+		{"D proof, any operation", []string{"proof", "--proof", dproof, "--digest", d8}, 0, "operation D: a version of a row with this hash was removed", "FAILED"},
+		{"D proof, --op D", []string{"proof", "--proof", dproof, "--digest", d8, "--op", "D"}, 0, "VERIFIED", "FAILED"},
+		{"D proof, --op any", []string{"proof", "--proof", dproof, "--digest", d8, "--op", "any"}, 0, "operation D", "FAILED"},
+		{"D proof, --op I", []string{"proof", "--proof", dproof, "--digest", d8, "--op", "I"}, 1, "FAILED at step binding", "VERIFIED"},
+		{"I proof of the same version, any operation", []string{"proof", "--proof", iproof, "--digest", d8}, 0, "operation I: a version of a row with this hash was inserted", "FAILED"},
+		{"I proof, --op I", []string{"proof", "--proof", iproof, "--digest", d8, "--op", "I"}, 0, "VERIFIED", "FAILED"},
+		{"I proof, --op D", []string{"proof", "--proof", iproof, "--digest", d8, "--op", "D"}, 1, "FAILED at step binding", "VERIFIED"},
+		{"bad --op", []string{"proof", "--proof", dproof, "--digest", d8, "--op", "X"}, 2, "", "VERIFIED"},
+		{"lower case --op", []string{"proof", "--proof", dproof, "--digest", d8, "--op", "d"}, 2, "", "VERIFIED"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			code, out, errs := run(t, tt.args...)
+			if code != tt.wantCode {
+				t.Fatalf("exit %d, want %d\nstdout: %s\nstderr: %s", code, tt.wantCode, out, errs)
+			}
+			if tt.wantOut != "" && !strings.Contains(out, tt.wantOut) {
+				t.Errorf("stdout %q does not contain %q", out, tt.wantOut)
+			}
+			if tt.notOut != "" && (strings.Contains(out, tt.notOut) || strings.Contains(errs, tt.notOut)) {
+				t.Errorf("output contains %q", tt.notOut)
+			}
+		})
+	}
+	code, out, _ := run(t, "proof", "--json", "--proof", dproof, "--digest", d8)
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, out)
+	}
+	var res struct {
+		Info map[string]any `json:"info"`
+	}
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if res.Info["op"] != "D" {
+		t.Errorf("info.op = %v, want D", res.Info["op"])
+	}
+}

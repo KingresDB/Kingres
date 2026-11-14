@@ -174,6 +174,26 @@ my $fp_new = fingerprint('new02');
 my $fp_old = fingerprint('old01');
 ok(length($fp_new) > 1000, 'the fingerprint covers the extension');
 is($fp_old, $fp_new, 'upgrading 0.1 to 0.2 gives the objects of installing 0.2');
+# What PUBLIC can read of the records is the same after an upgrade (the second
+# review: ledger_verification is not readable, ledger_digest without generated_by),
+# and the functions that must not be executable are not.
+foreach my $db ('old01', 'new02')
+{
+	is($node->safe_psql($db, q{
+		SELECT string_agg(c.relname || '.' || a.attname, ',' ORDER BY c.relname, a.attnum)
+		  FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+		 WHERE c.relnamespace = 'kingres'::regnamespace AND c.relkind = 'r'
+		   AND c.relname IN ('ledger_digest', 'ledger_verification')
+		   AND has_column_privilege('public', c.oid, a.attnum, 'select')}),
+		'ledger_digest.digest_id,ledger_digest.generated_at,ledger_digest.height,ledger_digest.block_hash,ledger_digest.digest',
+		"$db: PUBLIC reads the digests without generated_by and nothing of the verifications");
+	is($node->safe_psql($db, q{
+		SELECT count(*) FROM pg_proc p
+		 WHERE p.pronamespace = 'kingres'::regnamespace
+		   AND p.proname IN ('ledger_history_acl_sync', 'ledger_history_sync', 'ledger_worker_state')
+		   AND has_function_privilege('public', p.oid, 'execute')}),
+		'0', "$db: PUBLIC cannot execute the internal functions of the history and worker");
+}
 if ($fp_old ne $fp_new)
 {
 	my @a = split /\n/, $fp_old;

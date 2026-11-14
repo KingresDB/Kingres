@@ -110,10 +110,14 @@ func Parse(data []byte) (*Proof, error) {
 	if err != nil {
 		return nil, err
 	}
-	if op != "I" {
-		return nil, fmt.Errorf("%s.op: is %q, expected \"I\"", o.Path(), op)
+	switch op {
+	case "I":
+		p.Op = format.OpInsert
+	case "D":
+		p.Op = format.OpDelete
+	default:
+		return nil, fmt.Errorf("%s.op: is %q, expected \"I\" or \"D\"", o.Path(), op)
 	}
-	p.Op = format.OpInsert
 	if p.RowHash, err = chain.HashField(o, "row_hash"); err != nil {
 		return nil, err
 	}
@@ -194,10 +198,26 @@ func hashArray(o jsonx.Object, name string) ([]merkle.Hash, error) {
 }
 
 // Expect is what the auditor expects the proof to be for. A nil field is not
-// checked.
+// checked. Op is the operation the auditor expects the entry to be: "this
+// version was inserted" (format.OpInsert) and "this version was removed"
+// (format.OpDelete) are different statements, so a caller that means one of
+// them says so; nil accepts either, and the result reports which one the
+// proof is for.
 type Expect struct {
 	TableID *uint32
 	RowHash *merkle.Hash
+	Op      *byte
+}
+
+// OpName is the name of an operation byte of an entry: "I" or "D".
+func OpName(op byte) string {
+	switch op {
+	case format.OpInsert:
+		return "I"
+	case format.OpDelete:
+		return "D"
+	}
+	return fmt.Sprintf("0x%02x", op)
 }
 
 // Result describes a successful verification.
@@ -232,8 +252,13 @@ func Verify(p *Proof, d chain.Digest, exp Expect) (*Result, error) {
 			return nil, fail(StepBinding, "proof row_hash is %x, expected %x", p.RowHash, *exp.RowHash)
 		}
 	}
-	if exp.TableID != nil || exp.RowHash != nil {
-		pass(StepBinding, "proof is for the expected table and row")
+	if exp.Op != nil {
+		if p.Op != *exp.Op {
+			return nil, fail(StepBinding, "proof is for an entry with operation %s, expected %s", OpName(p.Op), OpName(*exp.Op))
+		}
+	}
+	if exp.TableID != nil || exp.RowHash != nil || exp.Op != nil {
+		pass(StepBinding, "proof is for the expected table, row and operation")
 	}
 	if p.ChainID != d.ChainID {
 		return nil, fail(StepChainID, "proof chain_id is %x, the digest's is %x", p.ChainID, d.ChainID)

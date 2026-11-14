@@ -174,14 +174,19 @@ func requireFlag(name, val string) error {
 // ---- proof ----
 
 func (e *env) runProof(args []string) int {
-	fs, asJSON := e.newFlags("proof", "--proof FILE --digest FILE [--table-id N] [--row-hash HEX] [--json]",
+	fs, asJSON := e.newFlags("proof", "--proof FILE --digest FILE [--table-id N] [--row-hash HEX] [--op I|D|any] [--json]",
 		"Check an inclusion proof against a trusted digest of the same chain, following the\n"+
 			"verification steps of the ledger README. With --table-id and --row-hash the proof must\n"+
-			"also be for that table and row (recompute the row hash with the row-hash command).")
+			"also be for that table and row (recompute the row hash with the row-hash command).\n"+
+			"A proof is for an entry of operation I (this version of the row was inserted) or D\n"+
+			"(this version was removed, by an update or a delete): with --op I or --op D the proof\n"+
+			"must be for that operation, with the default --op any either is accepted and the\n"+
+			"output says which one was proven.")
 	proofPath := fs.String("proof", "", "inclusion proof file (JSON)")
 	digestPath := fs.String("digest", "", "trusted digest file (JSON)")
 	tableID := fs.Int64("table-id", -1, "expected table id of the proof")
 	rowHash := fs.String("row-hash", "", "expected row hash, 64 lower case hex characters")
+	opFlag := fs.String("op", "any", "expected operation of the entry: I, D or any")
 	if code, done := e.parseFlags(fs, args); done {
 		return code
 	}
@@ -205,6 +210,17 @@ func (e *env) runProof(args []string) int {
 			return e.inputError(cmd, *asJSON, fmt.Errorf("--row-hash: %w", err))
 		}
 		exp.RowHash = &h
+	}
+	switch *opFlag {
+	case "any":
+	case "I":
+		op := format.OpInsert
+		exp.Op = &op
+	case "D":
+		op := format.OpDelete
+		exp.Op = &op
+	default:
+		return e.inputError(cmd, *asJSON, fmt.Errorf("--op %q is not I, D or any", *opFlag))
 	}
 	digestData, err := readLimited(*digestPath, maxFileSize)
 	if err != nil {
@@ -239,6 +255,8 @@ func (e *env) runProof(args []string) int {
 	out.Verified = true
 	out.Info = map[string]any{
 		"table_id":      p.TableID,
+		"op":            proof.OpName(p.Op),
+		"proves":        opMeaning(p.Op),
 		"row_hash":      format.EncodeHex(p.RowHash[:]),
 		"block_height":  p.Block.Height,
 		"digest_height": d.Height,
@@ -258,10 +276,20 @@ func (e *env) runProof(args []string) int {
 		fmt.Fprintf(e.stdout, "  ok  %-12s %s\n", s.Name, s.Detail)
 	}
 	fmt.Fprintf(e.stdout, "  table_id %d, row_hash %x, written by %q in block %d\n", p.TableID, p.RowHash, p.UserName, p.Block.Height)
+	fmt.Fprintf(e.stdout, "  operation %s: %s\n", proof.OpName(p.Op), opMeaning(p.Op))
 	for _, n := range out.NotProved {
 		fmt.Fprintf(e.stdout, "  note: %s\n", n)
 	}
 	return ExitOK
+}
+
+// opMeaning says what a proof of an entry of this operation proves; the two
+// are different statements and a reader must not mix them up.
+func opMeaning(op byte) string {
+	if op == format.OpDelete {
+		return "a version of a row with this hash was removed (updated away or deleted) in this transaction"
+	}
+	return "a version of a row with this hash was inserted (entered) in this transaction"
 }
 
 var proofLimits = []string{

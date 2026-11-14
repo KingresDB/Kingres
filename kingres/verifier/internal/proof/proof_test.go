@@ -344,9 +344,10 @@ func pathString(p []any) string {
 
 func TestProofFieldMutations(t *testing.T) {
 	cases := []struct{ proof, digest string }{
-		{"proofs/acc5.json", "digests/d5.json"},       // block 1, five later headers
+		{"proofs/acc5.json", "digests/d8.json"},       // block 1, all later headers (the proof reaches d8)
 		{"proofs/acc1_at_d0.json", "digests/d0.json"}, // block 0, empty chain
-		{"proofs/evt10.json", "digests/d5.json"},      // the last block
+		{"proofs/evt10.json", "digests/d8.json"},      // a block of the first ledger, with later headers
+		{"proofs/itm1_v1_d.json", "digests/d8.json"},  // a D proof
 	}
 	for _, c := range cases {
 		t.Run(c.proof, func(t *testing.T) {
@@ -410,8 +411,9 @@ func TestDigestFieldMutations(t *testing.T) {
 // informational relation field aside).
 func TestEveryByteMutation(t *testing.T) {
 	cases := []struct{ proof, digest string }{
-		{"proofs/acc5.json", "digests/d5.json"},
+		{"proofs/acc5.json", "digests/d8.json"},
 		{"proofs/acc1_at_d0.json", "digests/d0.json"},
+		{"proofs/itm1_v1_d.json", "digests/d8.json"},
 	}
 	for _, c := range cases {
 		t.Run(c.proof, func(t *testing.T) {
@@ -483,7 +485,10 @@ func TestParseRejectsStructure(t *testing.T) {
 		{"empty", ""},
 		{"array", "[]"},
 		{"duplicate key", strings.Replace(good, `"op": "I"`, `"op": "I", "op": "I"`, 1)},
-		{"op D", strings.Replace(good, `"op": "I"`, `"op": "D"`, 1)},
+		{"op X", strings.Replace(good, `"op": "I"`, `"op": "X"`, 1)},
+		{"op lower case", strings.Replace(good, `"op": "I"`, `"op": "d"`, 1)},
+		{"op empty", strings.Replace(good, `"op": "I"`, `"op": ""`, 1)},
+		{"op two letters", strings.Replace(good, `"op": "I"`, `"op": "ID"`, 1)},
 		{"format 2", strings.Replace(good, `"format": 1`, `"format": 2`, 1)},
 		{"upper case hex", strings.Replace(good, `"row_hash": "5`, `"row_hash": "A`, 1)},
 		{"short hash", strings.Replace(good, `"row_hash": "56`, `"row_hash": "5`, 1)},
@@ -503,5 +508,25 @@ func TestErrorWrapping(t *testing.T) {
 	}
 	if e.Error() != "parse: x" {
 		t.Errorf("Error() = %q", e.Error())
+	}
+}
+
+func TestParseAcceptsInsertAndDelete(t *testing.T) {
+	for name, want := range map[string]byte{
+		"proofs/acc5.json":           0x49,
+		"proofs/itm1_v1_i.json":      0x49,
+		"proofs/itm1_v1_d.json":      0x44,
+		"proofs/itm3_deleted_d.json": 0x44,
+	} {
+		p, err := Parse(readFixture(t, name))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if p.Op != want {
+			t.Errorf("%s: operation byte %#x, want %#x", name, p.Op, want)
+		}
+	}
+	if OpName(0x49) != "I" || OpName(0x44) != "D" || OpName(0x58) != "0x58" {
+		t.Error("OpName")
 	}
 }

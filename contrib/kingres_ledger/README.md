@@ -25,11 +25,13 @@ have not been changed, and an inclusion proof shows that one row version is
 part of the ledger.
 
 The hash format is **version 1, unchanged by 0.2**: digests, proofs and block
-hashes made by 0.1 still verify, and the independent verifier written for 0.1
-reads 0.2 ledgers of append-only tables. What 0.2 adds that a verifier needs
-to know is the operation `D` (an entry that records the removal of a row
-version) and the `op` member of a proof; both are described in "Hash format
-version 1" below.
+hashes made by 0.1 still verify, and the independent verifier
+(`kingres/verifier`) checks proofs of both operations: `I` (a row version was
+inserted) and `D` (a row version was removed), where the caller chooses which one
+it expects (`--op I|D|any`; the default accepts either and reports which one
+was proven). What 0.2 adds that a verifier needs to know is the operation `D`
+(an entry that records the removal of a row version) and the `op` member of a
+proof; both are described in "Hash format version 1" below.
 
 ## What the ledger guarantees, and what it does not
 
@@ -119,13 +121,14 @@ tests:
 kingres/dev/ext.sh kingres_ledger all     # sync build install regress tap
 ```
 
-Tests: ten pg_regress tests and nine TAP tests under `t/`.
+Tests: eleven pg_regress tests and ten TAP tests under `t/`.
 
 | Test | What it covers |
 |---|---|
 | `ledger_setup` | switches the block-building workers off for the pg_regress tests, which build blocks by hand and count them (the TAP tests cover the workers) |
 | `ledger_updatable` | updatable tables: the history table, every statement path that changes a row (`ON CONFLICT DO UPDATE`, `MERGE`, foreign-key actions, triggers that change the row before and after the capture, `COPY`, `session_replication_role = replica`, views, prepared transactions, `TOAST`ed values), `ADD COLUMN`, rejection of conversion, the protection and privileges of the history table, proofs of `I` and `D` entries and the strict parsing of proofs, and every tamper case |
 | `ledger_records` | `ledger_digest`, `ledger_verify_recorded`, `ledger_status`: contents, caps, privileges, protection |
+| `ledger_review2` | one reproduction for each finding of the second review (L2-01 to L2-05, L2-08) that a single server can show: event triggers of a superuser at every point of an `ADD COLUMN`, the privileges of the history table through owner changes, `REASSIGN OWNED`, default privileges and tampering, what PUBLIC can read, savepoints and exception blocks around `ledger_enable`, `COPY ... FREEZE`, hostile session settings |
 | `ledger_hash` | RFC 6962 vectors, the tags, the genesis hash, the canonical row encoding, independence of session settings |
 | `ledger_capture` | `ledger_enable`, capture, rollback and subtransactions, blocks, digests |
 | `ledger_verify` | clean verification, digests, proofs, and every tamper case |
@@ -141,7 +144,8 @@ Tests: ten pg_regress tests and nine TAP tests under `t/`.
 | `006_guard_without_hook` | the event triggers alone: after the library was removed from `shared_preload_libraries` each way of switching the ledger off is still rejected |
 | `007_upgrade` | `ALTER EXTENSION UPDATE` from 0.1 with tables, blocks, digests and proofs; the upgraded database has the objects, privileges and protection of a direct installation of 0.2 (compared through a fingerprint of the catalogs) |
 | `008_updatable_concurrency` | concurrent `UPDATE`, `DELETE`, upsert, `MERGE`, locking, savepoints and rollbacks of the same rows (READ COMMITTED with re-evaluation of the row, and REPEATABLE READ with retries) while blocks are built; logical replication apply into an updatable table |
-| `009_worker` | the block-building workers: bounded time, two databases, `block_interval = 0`, reload, restart, a prepared transaction, bounded blocks, a busy builder lock, a standby and promotion |
+| `009_worker` | the block-building workers: bounded time, two databases, `block_interval = 0`, reload, restart, a prepared transaction, bounded blocks, a busy builder lock, a standby and promotion; every phase asserts the outcome (the state the workers report, and no failed or killed worker in the log), not the absence of one line |
+| `010_review2` | the second review and the areas it did not examine: 24 hostile database settings that must not stop the worker, a failing worker (growing delay, `ledger_status`), a cancelled `ledger_verify_recorded`, the launcher (sweeps, memory, a worker that never finishes), `max_worker_processes` used up, logical replication into an updatable table (conflict, `TRUNCATE`), `pg_dump` and restore |
 
 The regress tests need `shared_preload_libraries = 'kingres_ledger'` (the
 in-tree `check` target and `kingres/dev/ext.sh` set it).
@@ -256,19 +260,37 @@ the same row (a row that READ COMMITTED re-evaluates after another transaction
 changed it is captured as the version that was really replaced). `SELECT ...
 FOR UPDATE` changes no row and writes nothing.
 
-The history table belongs to the extension owner. **Its privileges**: the owner
-of the table gets `SELECT` on it (the history holds data that the table's
-`SELECT` privileges, column privileges and row security would otherwise
-protect, so nobody else gets anything automatically); grant `SELECT` on it to
-others yourself. Nobody can write it through SQL: `UPDATE`, `DELETE` and
-`TRUNCATE` are rejected by the blocking triggers like those of every ledger
-table, `INSERT` by a third trigger (`kingres_ledger_block_insert`; only the
+The history table belongs to the extension owner. **Who can read old row
+versions.** Exactly these roles, and nobody else: the extension owner (a
+superuser), and the owner of the ledger table, which includes every role that is
+a member of the owner and inherits its privileges. The rule is kept by the
+extension, not by a grant: `ledger_enable` sets the privileges explicitly (default
+privileges of the extension owner, `ALTER DEFAULT PRIVILEGES`, do not apply to
+it); when the owner of the table changes (`ALTER TABLE ... OWNER TO`, `REASSIGN
+OWNED`) the former owner's `SELECT` is taken away and the new owner is granted
+`SELECT` in the same transaction (the event trigger does it after every DDL
+command, and the protection hook does it after `ALTER TABLE ... OWNER TO` and
+`REASSIGN OWNED` also when event triggers are off); `GRANT` on a history table
+is rejected, a `GRANT ... ON ALL TABLES IN SCHEMA` that reaches one is undone by
+the event trigger at the end of the statement, and `ledger_verify` reports a
+history table whose privileges are not the ones of the rule (`history_privileges`).
+To give another role access, make it a member of the owner of the ledger table
+(or read the history through a `SECURITY DEFINER` function of your own that
+applies the filter you want). **The history table bypasses everything that
+protects the ledger table itself**: the row security policies and the column
+privileges of the table do not apply to it, so a role that reads the history can
+read every column of every old version, including rows and columns that the
+role could not read in the table. Nobody can write it through SQL: `UPDATE`,
+`DELETE` and `TRUNCATE` are rejected by the blocking triggers like those of every
+ledger table, `INSERT` by a third trigger (`kingres_ledger_block_insert`; only the
 capture code inserts, and it does that through the table access method, which
-fires no trigger), and no privilege other than `SELECT` can be granted on it.
+fires no trigger).
 
 `ALTER TABLE ... ADD COLUMN` on an updatable table is allowed under the rules
 of 0.1 (nullable, no default, a type `ledger_enable` accepts) and is applied
-to the history table in the same statement by the event trigger; the new
+to the history table in the same statement by the event trigger, through the
+catalog API of the server and not as a statement (no event trigger, hook or
+function of a user runs while it is done); the new
 column is appended to the history table (after `ledger_op`), and the row hash
 of a history row ignores the three ledger columns, so the order of the columns
 of the table decides the hash. A column named `ledger_txid`, `ledger_seq` or
@@ -314,7 +336,9 @@ last argument.
 | `kingres.ledger_hook_active()` | True when the library was loaded through `shared_preload_libraries`. | PUBLIC |
 
 Internal functions (`ledger_capture`, `ledger_record_row`, `ledger_lock_table`,
-`ledger_history_sync`, and the helpers `ledger_all_defects`,
+`ledger_history_sync`, `ledger_history_acl_sync`, `ledger_worker_state` (read by
+the view `ledger_status`, whose readers need `EXECUTE` on it; see
+"Privileges"), and the helpers `ledger_all_defects`,
 `ledger_table_defects`, `ledger_history_defects`, `ledger_catalog_defects`,
 `ledger_trigger_ok`, `ledger_type_problem`, `ledger_is_member`,
 `ledger_guard`) are not part of the interface. The ones that write the ledger
@@ -325,20 +349,42 @@ grant them.
 
 | Object | Contents |
 |---|---|
-| `kingres.ledger_digest` | one row per digest this database generated (`ledger_generate_digest`): `digest_id`, `generated_at`, `generated_by`, `height`, `block_hash`, `digest` (exactly what the function returned). **A convenience, not a root of trust**: the table is in the database, whoever can rewrite the chain can rewrite it, and `ledger_verify` does not compare it with the chain; to check a recorded digest call `ledger_verify_digest(digest)`; keep a copy outside the database. |
+| `kingres.ledger_digest` | one row per digest this database generated (`ledger_generate_digest`), also when nothing changed since the last one: `digest_id`, `generated_at`, `generated_by`, `height`, `block_hash`, `digest` (exactly what the function returned). PUBLIC can read it except the column `generated_by` (the name of an operator). **A convenience, not a root of trust**: the table is in the database, whoever can rewrite the chain can rewrite it, and `ledger_verify` does not compare it with the chain; to check a recorded digest call `ledger_verify_digest(digest)`; keep a copy outside the database. |
 | `kingres.ledger_verification` | one row per `ledger_verify_recorded` run: `verification_id`, `started_at`, `finished_at`, `started_by`, `from_height`, `to_height` (the heights actually checked), `state` (`clean`, `problems`, `failed`; `running` is allowed by the table but never written: see below), `problem_count`, `blocks_checked` (blocks in the range), `rows_checked` (ledger entries of the transactions in those blocks), `problems` (a JSON array of `{check, object, detail}`, at most the first 100; `problem_count` is exact; NULL when clean). |
-| `kingres.ledger_status` | one row: `append_only_tables`, `updatable_tables`, `latest_block_height`, `latest_block_hash`, `latest_block_closed_at`, `pending_transactions`, `oldest_pending_age` (the clock time since the oldest pending transaction wrote its first entry; NULL when nothing is pending or for a transaction that was queued by 0.1), `last_digest_id`, `last_digest_at`, `last_digest_height`, `last_verification_id`, `last_verification_at`, `last_verification_state`, `last_verification_problems`. |
+| `kingres.ledger_status` | one row: `append_only_tables`, `updatable_tables`, `latest_block_height`, `latest_block_hash`, `latest_block_closed_at`, `pending_transactions`, `oldest_pending_age` (the clock time since the oldest pending transaction wrote its first entry; NULL when nothing is pending or for a transaction that was queued by 0.1), `last_digest_id`, `last_digest_at`, `last_digest_height`, `last_verification_id`, `last_verification_at`, `last_verification_state`, `last_verification_problems`, and what the block-building worker knows about this database: `worker_state` (`ok`, `busy` when the builder lock was taken, `failed`, `no_extension`, `never_visited`, `not_running` when the library is not preloaded), `worker_consecutive_failures`, `worker_retry_after` (when the next attempt follows a failure) and `worker_last_error`. |
 
 `ledger_verify_recorded` writes its row when the run is over. PostgreSQL has
 no autonomous transaction, and the table is append-only, so a row in state
 `running` that survives a failure of the calling transaction cannot exist. A
 failure of `ledger_verify` itself (an error, not a finding) is caught: the run
 is recorded with state `failed` and the error message, the caller gets a
-warning and the id. If the caller's transaction rolls back, the record goes
-with it. Both tables are append-only for every role and are protected like the
-other ledger tables; `ledger_digest` and `ledger_verification` are readable by
-PUBLIC (like `ledger_blocks`; the problems list names tables and hashes), the
-view is not (see "Privileges").
+warning and the id. A run that was **cancelled** (`statement_timeout`,
+`pg_cancel_backend`, Ctrl-C) is recorded as `failed` too, with the SQLSTATE
+`57014`, and the function then returns normally (it does not re-raise the
+cancellation, which would roll the record back with it). What cannot be
+recorded: a run that ends the session (`pg_terminate_backend`,
+`transaction_timeout`, a crash, a lost connection) and a run whose calling
+transaction rolls back. Both tables are append-only for every role and are
+protected like the other ledger tables. `ledger_verification` is **not**
+readable by PUBLIC (its problems name tables, row hashes and transaction ids, the
+class of the finding L-09 of the first review); `ledger_digest` is readable
+except its column `generated_by` because it holds what a digest holds,
+block-level data; the view is not readable either (see "Privileges").
+
+**Growth of the records.** Both tables are append-only for every role, so their
+rows cannot be pruned, and every call of `ledger_generate_digest` (also when
+nothing changed) and of `ledger_verify_recorded` adds a row (a digest row is
+a few hundred bytes; a verification row holds at most the first 100 problems, a
+few tens of kilobytes at worst). The decision: **these functions are for
+administrators, and a role that is granted `EXECUTE` on them is trusted not to
+call them in a loop**, like the holder of `ledger_enable`, which also writes
+permanent rows. A rate limit inside the functions was not added because it
+would bound the speed, not the total (a caller can call once per interval for
+ever), and PostgreSQL has no quota for it; granting `EXECUTE` is the only
+control, and it is kept off PUBLIC. A dashboard that only shows the state needs
+`SELECT` on `ledger_status` (and `EXECUTE` on `ledger_worker_state`), not the
+recording functions. Plan the disk for the rows of one digest and one
+verification per interval of your schedule, for ever.
 
 Settings:
 
@@ -346,6 +392,7 @@ Settings:
 |---|---|---|
 | `kingres_ledger.max_block_transactions` | 100000 | A block is closed with at most this many transactions; the rest wait for the next block. Superuser setting (`PGC_SUSET`). |
 | `kingres_ledger.block_interval` | 10s | How often the launcher looks for pending transactions; `0` switches the block-building workers off. Server setting (`PGC_SIGHUP`, `postgresql.conf` or `ALTER SYSTEM` and a reload; a database or role setting has no effect on the launcher). |
+| `kingres_ledger.worker_timeout` | 60s | The longest one block-building worker may work on one database; it cancels itself after this time (an error, recorded as a failure, with a growing delay before the next attempt) and the launcher terminates it five seconds later if it does not react. A round of the launcher also stops starting workers when it has used this much time, and continues with the other databases in the next round. `0` means no limit. Server setting (`PGC_SIGHUP`). |
 
 Errors raised by the extension: SQLSTATE `KL001` (modification of an
 append-only table), `KL002` (statement rejected by the protection hook or by
@@ -367,10 +414,16 @@ DEFINER`:
 | `ledger_verify` | reads every ledger table, every history table and every table under ledger control |
 | `ledger_verify_recorded` | writes `ledger_verification` |
 | `ledger_inclusion_proof` (both forms) | reads the entries and transactions, which the caller may not read; the two-argument form is a wrapper that exists so that grants made on it under 0.1 keep working |
-| `ledger_guard` (event trigger) | must see the ledger tables whatever grants an administrator changed, so that DDL of every role keeps working |
+| `ledger_guard` (event trigger) | must see the ledger tables whatever grants an administrator changed, so that DDL of every role keeps working; it also moves the privileges of the history tables (through `ledger_history_acl_sync`, which is not `SECURITY DEFINER` and is not executable by anybody else) |
 
 All of them have `SET search_path = pg_catalog, pg_temp`, and every reference to
-an object of the extension is qualified with `kingres.`. The test
+an object of the extension is qualified with `kingres.`. None of the SQL of the
+extension contains a backslash or relies on a setting that a role or database can
+change for its sessions (`standard_conforming_strings`, `DateStyle`, `TimeZone`,
+`plpgsql.*`, `default_table_access_method` and so on): the test `ledger_review2`
+runs every function with those settings changed, and `010_review2` attaches 24
+such settings to a database and checks that the block-building worker is not
+stopped by any of them. The test
 `ledger_privs` scans `pg_proc` and fails when a function breaks one of these
 rules. The only functions without a `search_path` are C primitives that compute
 on their arguments and look nothing up (the list is in the test).
@@ -379,10 +432,13 @@ on their arguments and look nothing up (the list is in the test).
 
 | Object | PUBLIC |
 |---|---|
-| `kingres.ledger_table`, `kingres.ledger_chain`, `kingres.ledger_blocks`, `kingres.ledger_digest`, `kingres.ledger_verification` | `SELECT` |
-| `kingres.ledger_entry`, `kingres.ledger_pending`, `kingres.ledger_tx` | nothing |
-| `kingres.ledger_status` (view) | nothing (it runs with the rights of its owner and shows how many transactions wait) |
-| the history table of an updatable table | nothing; `SELECT` for the owner of the table (granted by `ledger_enable`) |
+| `kingres.ledger_table`, `kingres.ledger_chain`, `kingres.ledger_blocks` | `SELECT` |
+| `kingres.ledger_digest` | `SELECT` on every column except `generated_by` (block-level data only) |
+| `kingres.ledger_entry`, `kingres.ledger_pending`, `kingres.ledger_tx`, `kingres.ledger_verification` | nothing |
+| `kingres.ledger_status` (view) | nothing (it shows how many transactions wait, and the state of the worker) |
+| the history table of an updatable table | nothing; `SELECT` for the owner of the ledger table only, kept by the extension (see "Updatable tables"); no grant is possible |
+| `ledger_history_acl_sync`, `ledger_history_sync`, `ledger_worker_state`, `ledger_lock_table`, `ledger_record_row`, `ledger_capture` | nothing |
+| the identity sequences of `ledger_digest` and `ledger_verification` | nothing |
 | `ledger_enable`, `ledger_build_block`, `ledger_generate_digest`, `ledger_verify`, `ledger_verify_recorded`, `ledger_verify_digest`, `ledger_inclusion_proof` | nothing |
 | `ledger_row_hash`, `ledger_history_row_hash`, `ledger_verify_proof`, the hash primitives, `ledger_hook_active` | `EXECUTE` |
 
@@ -410,6 +466,7 @@ GRANT EXECUTE ON FUNCTION kingres.ledger_build_block(),
                           kingres.ledger_generate_digest(),
                           kingres.ledger_verify_recorded(bigint, bigint) TO ledger_agent;
 GRANT SELECT ON kingres.ledger_status TO ledger_agent;      -- and the management panel's role
+GRANT EXECUTE ON FUNCTION kingres.ledger_worker_state() TO ledger_agent;   -- the view calls it with the caller's rights
 ```
 
 (The block-building workers need no grant: they run as the extension owner.)
@@ -422,8 +479,16 @@ GRANT EXECUTE ON FUNCTION kingres.ledger_verify(bigint, bigint),
                           kingres.ledger_verify_digest(jsonb),
                           kingres.ledger_inclusion_proof(regclass, bytea),
                           kingres.ledger_inclusion_proof(regclass, bytea, "char") TO auditor;
-GRANT SELECT ON inventory_ledger_history TO auditor;          -- to read the old versions
+GRANT SELECT ON kingres.ledger_verification TO auditor;       -- to read the recorded runs and their problems
+GRANT inventory_owner TO auditor;                              -- to read the old versions (see below)
 ```
+
+The old versions of an updatable table can be read by the owner of the ledger
+table only; a `GRANT SELECT` on the history table is rejected. An auditor who must
+read them is made a member of that role (`GRANT owner_role TO auditor`, with
+`INHERIT`, which is the default), and that gives the auditor everything the owner
+has. If that is too much, write a `SECURITY DEFINER` function that returns what the
+auditor may see.
 
 A role that also wants to read the entries, the pending transactions and the
 transactions itself needs, in addition:
@@ -431,6 +496,10 @@ transactions itself needs, in addition:
 ```sql
 GRANT SELECT ON kingres.ledger_entry, kingres.ledger_pending, kingres.ledger_tx TO auditor;
 ```
+
+`ledger_digest` (without the column `generated_by`) and the block headers are
+readable by everybody, so a role that only checks digests needs `EXECUTE` on
+`ledger_verify_digest` and nothing else.
 
 Whoever can execute `ledger_inclusion_proof` can learn the row hashes of the
 table it is called for. The verification functions cost time proportional to
@@ -484,10 +553,44 @@ the size of the ledger, which is why they are not executable by PUBLIC.
   starts, one at a time, a short-lived worker for each database it decides to
   look at; the worker connects to the database, runs as the extension owner,
   does nothing if the extension is not installed or nothing is pending, and
-  otherwise calls `ledger_build_block()` once and exits. It sets READ
-  COMMITTED, and a lock timeout of one second (or the interval, if shorter) for
-  the builder lock: if another builder holds it, the worker logs a message,
-  gives up and the next round tries again. If more than
+  otherwise calls `ledger_build_block()` once and exits. The settings that a
+  database owner or a role owner attaches to the database or the role
+  (`ALTER DATABASE ... SET`) are applied during the connection, before any code of
+  the extension runs; the worker then overrides, with the highest priority and
+  before its transaction starts, every setting that can make it fail or stall:
+  `transaction_timeout`, `idle_in_transaction_session_timeout`,
+  `idle_session_timeout`, `statement_timeout`, `default_transaction_isolation` (READ
+  COMMITTED), `default_transaction_read_only`, `default_transaction_deferrable`,
+  `transaction_read_only`, `search_path`, `session_replication_role`,
+  `row_security`, `check_function_bodies`, `standard_conforming_strings`,
+  `plpgsql.variable_conflict`, `plpgsql.extra_errors`, `plpgsql.extra_warnings`,
+  `jit`, `debug_parallel_query` and `temp_tablespaces`, and a lock timeout of one
+  second (or the interval, if shorter) for the builder lock: if another builder
+  holds it, the worker logs a message, gives up and the next round tries again.
+  The background worker API has no flag that skips the settings, so a setting
+  that kills the session during the connection itself cannot be overridden; such
+  a failure is handled like any other. **A worker that fails** logs one line,
+  records the failure (state, error, count) in shared memory, which
+  `kingres.ledger_status` shows, and is not started again for a delay that doubles
+  with every failure (the interval, up to an hour); the first success clears it.
+  Nothing logs at `FATAL` every interval. **The cost of a sweep**: the launcher
+  remembers the outcome of each visit, so a database where a worker found no
+  extension is left out of the next nine sweeps (without the extension nothing can
+  be pending, and a database that gets the extension and a ledger transaction is
+  marked dirty by the commit and visited at once), and a database in its delay
+  is left out. What it cannot know without connecting is whether the extension is
+  installed in a database and whether anything is pending there, so the first
+  sweep after a start connects once to every database. **Fairness**: a worker is
+  cancelled after `kingres_ledger.worker_timeout`, databases are visited in an
+  order that continues where the last sweep stopped, and a round that has used
+  `worker_timeout` leaves the other databases to the next round; one slow or
+  failing database delays the others by at most about that time, and a database
+  whose single block needs longer than `worker_timeout` is never finished by the
+  worker (lower `max_block_transactions` for it). When `max_worker_processes` is
+  used up (a launcher takes one slot, a worker another) no worker starts, the
+  launcher says so in the log (at the first round and then every sixty rounds),
+  transactions stay pending, `ledger_status` shows their number and age, and a call
+  of `ledger_build_block()` or `ledger_generate_digest()` still builds the block. If more than
   `max_block_transactions` transactions were pending, the next round builds
   the next block. The launcher cannot look into a database, so a backend that
   commits a transaction with ledger entries puts its database into a small set
@@ -507,7 +610,15 @@ the size of the ledger, which is why they are not executable by PUBLIC.
   table a replicated `UPDATE`, `DELETE` or `TRUNCATE` is rejected by the
   blocking triggers, so the apply worker stops with an error until the
   subscription is changed; for an updatable table they are captured like local
-  changes (`TRUNCATE` is rejected).
+  changes (`TRUNCATE` is rejected: the apply worker then fails and retries until
+  the subscription is disabled, as for any statement that the ledger refuses).
+  A change that the apply worker skips because the row is missing on the
+  subscriber (an update or delete of a row that is not there) writes no entry.
+  A publication can name a ledger table and its history table. Tested in
+  `010_review2`.
+- `COPY ... FREEZE` works for a ledger table in both orders (loaded frozen and then
+  enabled in the same transaction, or enabled and then loaded frozen): the rows are
+  captured by the trigger or entered by `ledger_enable`, and the ledger verifies.
 - A hot standby can verify the ledger, check digests and build and check
   proofs; it cannot enable tables or build blocks (it is read-only).
 
@@ -901,8 +1012,22 @@ that would drop a ledger table, `DROP TYPE/DOMAIN ... CASCADE` and `DROP
 EXTENSION ... CASCADE` that would drop a column of a ledger table, and `ALTER TYPE
 ... RENAME VALUE` of an enum that a ledger column uses (the label is part of the
 row hash). The hook does nothing in a database where the extension is not
-installed and nothing while the extension's own install script runs. It always
-calls the previous hook.
+installed. It always calls the previous hook.
+
+**No "inside our own code" switch.** The hook has no global flag, setting or
+state that turns a check off while the extension works. The audit of every such
+state is in `kingres/docs/design/ledger-0.2.md` ("Notes of the second review
+fixes"); the result: the extension's own change of a history table (`ADD
+COLUMN`, the privileges) is made through the catalog API, not as a statement, so no
+statement is run in a privileged window and no event trigger of a user fires in
+it, and the one remaining exception is the **statements of the extension's own
+install or upgrade script**, identified by the text of the script (the query
+string that `CREATE EXTENSION` and `ALTER EXTENSION UPDATE` pass for each of
+its statements, which a statement of an event trigger or a function never has),
+and only while that script runs. A statement that an event trigger, a function
+or a default expression runs meanwhile goes through every check. A chain of
+upgrade scripts in one command would need that rule extended (only one step
+exists).
 
 A table is "under ledger control" for the hook when it is registered in
 `kingres.ledger_table` or its capture trigger is `ENABLE ALWAYS` (`ledger_enable`
@@ -912,10 +1037,10 @@ arms that trigger before it registers the table).
 treats it like a table of the ledger catalog (registered as `history_relid` in
 `kingres.ledger_table`; it is not a member of the extension, so the registry is
 what identifies it). Every `ALTER TABLE`, rename, `SET SCHEMA`, `DROP`, index,
-trigger, rule or policy on it is rejected, and so is every `GRANT` other than
-`SELECT` (the extension's own `ALTER TABLE ... ADD COLUMN` that follows an `ADD
-COLUMN` of the table goes through a flag that only `ledger_history_sync`
-sets). Dropping its columns or the table, or rewriting it, is rejected by the
+trigger, rule or policy on it is rejected, and so is every `GRANT` (its privileges
+follow the owner of the ledger table; the extension's own `ADD COLUMN` that
+follows an `ADD COLUMN` of the table is made through the catalog API and does
+not pass the hook). Dropping its columns or the table, or rewriting it, is rejected by the
 event triggers too, and so is any state of it that is not what `ledger_enable`
 made (a missing trigger, a constraint, an index, a column that does not belong,
 different column types or order). The updatable table itself is protected like
@@ -1027,9 +1152,16 @@ the database can see.
   column), so nothing is recorded wrongly, and `ledger_verify` reports
   `history_columns`; inserts, which write no history row, continue.
 - **The workers** can be switched off (`kingres_ledger.block_interval = 0`, a
-  failed launcher, `max_worker_processes` exhausted, a standby): blocks are then
-  built only when something calls `ledger_build_block()`, and the window
-  before a transaction is in a block grows. `kingres.ledger_status` shows the
+  failed launcher, `max_worker_processes` exhausted, a standby), or kept from
+  finishing by what the database settings cannot reach but a superuser can (a
+  broken chain row, a lock held on `ledger_chain`, a synchronous standby that
+  never answers, a block that needs longer than `kingres_ledger.worker_timeout`):
+  blocks are then built only when something calls `ledger_build_block()`, and the
+  window before a transaction is in a block grows. Settings that a database owner
+  or a role owner attaches to the database or the role do not stop the worker
+  (see "How it works"), except one that kills the session during the connection
+  itself, which the background worker API does not allow to be skipped; that
+  failure is retried with a growing delay and shown in `ledger_status`. `kingres.ledger_status` shows the
   number of pending transactions and the age of the oldest; nothing raises an
   alarm by itself. `ledger_pending.queued_at` (like the rest of the work queue) is
   not covered by any hash.
@@ -1041,14 +1173,72 @@ the database can see.
   functions"). The view `ledger_status` is not checked by `ledger_verify`
   (the hook rejects replacing or dropping it).
 - **Reading**: the history table holds the old versions of rows, protected by
-  its privileges only (the owner of the table can read it, nobody else
-  unless granted); row security and column privileges of the table do not
-  apply to it.
-- **Dump and restore** does not restore the history tables either (`pg_dump`
-  would dump them; inserting into them fails, as no trigger allows it).
+  its privileges only: the extension owner (a superuser) and the owner of the
+  ledger table (and the roles that inherit from it) can read it, nobody else; row
+  security and column privileges of the table do not apply to it, so those roles
+  read every column of every old version. A superuser, or a role that is made a
+  member of the owner, reads it too.
+- **Dump and restore** (`pg_dump`, then a restore into a new database): the dump
+  contains the tables, the history tables with their rows and the triggers, and
+  the restore works without error, because the data is loaded before the
+  triggers are created. The restored database has the rows but an **empty ledger**
+  (the `kingres.ledger_*` tables are not dumped): `ledger_verify` reports the
+  capture trigger of every table that is not registered, and an insert into a
+  restored ledger table fails on the entry's foreign key. The restored copy is
+  not a ledger. Use physical backups and standbys (tested in `010_review2`).
+- **Reviewer-visible limit of the history privileges**: they follow the owner of the
+  ledger table at the end of every DDL command and after `ALTER TABLE ... OWNER TO`
+  and `REASSIGN OWNED`; with event triggers off and an ownership change that is
+  neither of those (a catalog edit), the privileges are wrong until the next DDL
+  command, and `ledger_verify` reports it as `history_privileges`.
 - Anything that reads: the ledger protects the integrity of the data, not its
   confidentiality, and the row hashes of an entry reveal a row with little
   entropy to somebody who may read them (hence the privileges).
+
+## Where a reviewer should attack first
+
+Written from what is known of this code after two reviews; ordered by how little
+it has been looked at, not by how likely it is to be wrong.
+
+1. **The hook's list of statements** (`kl_check_statement` in `src/protect.c`).
+   It inspects the statement types it lists and lets every other type through. A
+   utility statement of PostgreSQL that is not listed and that changes a ledger
+   table or the ledger catalog is not stopped by the hook (the event triggers are
+   the second line, and only for what they look at: drops, rewrites and the state
+   checked by `ledger_all_defects`). Read the list against `src/include/nodes/parsenodes.h`
+   and against what the event trigger can see afterwards.
+2. **The identity of the extension's own script** (`kl_note_script`,
+   `kl_is_own_script`). It trusts the statements whose query string is the text of
+   the script that `execute_sql_string` passes. That is a property of the server
+   code that is not documented as an interface; check it against
+   `src/backend/commands/extension.c`, and check that nothing a script statement
+   triggers can hand a statement the same string.
+3. **The history table's privileges** (`src/history.c`). They are changed through
+   `ExecuteGrantStmt` with a statement built in C, run as the extension owner, from
+   the event trigger (every DDL command, every updatable table) and from the hook
+   after `ALTER TABLE ... OWNER TO` and `REASSIGN OWNED`. Look at roles that hold
+   the privilege with grant option from somebody else, at column privileges, at a
+   change of owner that neither the hook nor the event trigger sees (`event_triggers
+   = off` and a catalog edit), and at the cost of the check on a database with many
+   updatable tables.
+4. **The history write path and `ADD COLUMN`** (`kl_insert_history`, `ledger_history_sync`).
+   The history row is written through the table access method; the history table is
+   changed through `AlterTableInternal` with the collection of commands for event
+   triggers switched off. A race between a concurrent `UPDATE` and an `ADD COLUMN`
+   is excluded by the lock `ALTER TABLE` takes on the table, not by a test of its
+   own.
+5. **The worker's settings** (`kl_harden_settings`, `src/worker.c`). The list was
+   made by reading `guc_tables.c`; a setting that is missing from it can still stop
+   or subvert a worker. `synchronous_commit` and `work_mem` are deliberately left
+   alone. The failure state is in shared memory with a spinlock and is written from
+   an exit callback and from an `emit_log_hook` that is installed in the worker
+   process only.
+6. **Cancellation is swallowed on purpose** in `ledger_verify_recorded` (it records
+   a cancelled run and returns normally). A caller that sends several statements
+   in one request and cancels the first will see the others run.
+7. **Not run at all**: `EXEC_BACKEND` (Windows) builds, `pg_upgrade`, a standby that
+   is promoted while a worker is running a failure delay, and concurrent `ALTER
+   TABLE ... OWNER TO` of the same table by two sessions.
 
 ## Limitations of this version
 

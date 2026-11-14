@@ -1,0 +1,14 @@
+[
+    {
+        "name": "id",
+        "send_hex": "00000003"
+    },
+    {
+        "name": "name",
+        "send_hex": "7363726577"
+    },
+    {
+        "name": "qty",
+        "send_hex": "0000001e"
+    }
+]

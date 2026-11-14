@@ -2,6 +2,7 @@
 
 kingres_ledger_sources = files(
   'src/capture.c',
+  'src/history.c',
   'src/kingres_ledger.c',
   'src/merkle.c',
   'src/proof.c',
@@ -46,6 +47,7 @@ tests += {
       'ledger_review',
       'ledger_updatable',
       'ledger_records',
+      'ledger_review2',
       'ledger_privs',
     ],
     'regress_args': ['--temp-config', files('kingres_ledger.conf')],
@@ -64,6 +66,7 @@ tests += {
       't/007_upgrade.pl',
       't/008_updatable_concurrency.pl',
       't/009_worker.pl',
+      't/010_review2.pl',
     ],
   },
 }

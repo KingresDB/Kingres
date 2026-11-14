@@ -8,11 +8,12 @@
 #   wsl.exe -d Ubuntu-24.04 -u kingres -- bash /mnt/c/.../kingres/verifier/scripts/gen-fixtures.sh
 #
 # It starts a throwaway server in a new directory under
-# ~/kingres-work/verifier-test/ on a free port in 57300-57399, builds the
+# $KINGRES_TEST_WORK/verifier-test/ (default ~/kw-verifier) on a free port in 57300-57399, builds the
 # ledgers, exports the fixtures and removes the server. It only reads the
 # installed binaries; it builds and installs nothing.
 #
-# Environment: KINGRES_BIN (default ~/kingres-work/install/bin),
+# Environment: KINGRES_BIN (default ~/kingres-work/install/bin), KINGRES_TEST_WORK
+# (where the throwaway server lives, default ~/kw-verifier),
 # FIXTURE_DIR (default ../testdata/fixtures next to this script).
 set -euo pipefail
 
@@ -20,7 +21,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="${KINGRES_BIN:-$HOME/kingres-work/install/bin}"
 OUT="${FIXTURE_DIR:-$SCRIPT_DIR/../testdata/fixtures}"
 RUN="run-$(date +%Y%m%d-%H%M%S)-$$"
-WORK="$HOME/kingres-work/verifier-test/$RUN"
+WORK="${KINGRES_TEST_WORK:-$HOME/kw-verifier}/verifier-test/$RUN"
 DATA="$WORK/data"
 SOCK="$WORK/sock"
 
@@ -94,13 +95,14 @@ CREATE TABLE app.events (
 );
 GRANT INSERT, SELECT ON app.accounts, app.events TO "zoé";
 
-CREATE FUNCTION app.fx_cols(rel regclass, row_ctid tid) RETURNS jsonb
+CREATE FUNCTION app.fx_cols(rel regclass, row_ctid tid, skip text[] DEFAULT '{}') RETURNS jsonb
 LANGUAGE plpgsql AS $f$
 DECLARE r record; res jsonb := '[]'; hx text;
 BEGIN
   FOR r IN SELECT a.attname::text AS attname, t.typsend::regproc::text AS send
            FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
            WHERE a.attrelid = rel AND a.attnum > 0 AND NOT a.attisdropped
+             AND a.attname::text <> ALL (skip)
            ORDER BY a.attnum
   LOOP
     EXECUTE format('SELECT pg_catalog.encode(%s(%I), ''hex'') FROM %s WHERE ctid = $1', r.send, r.attname, rel)
@@ -153,8 +155,24 @@ sql "SELECT kingres.ledger_build_block()" >/dev/null
 sql "INSERT INTO app.events(id, kind) VALUES (10, 'last')"
 digest d5
 
+# ---- an updatable table: updates and deletes, entries I and D ---------------
+# The history table keeps every removed version. Blocks 7 to 9: the rows go in;
+# one is updated twice and one deleted; one is updated in a later block.
+q <<'SQL'
+CREATE TABLE app.items (id int PRIMARY KEY, name text NOT NULL, qty int, note text, price numeric(10,2));
+SELECT kingres.ledger_enable('app.items', 'updatable');
+SQL
+sql "INSERT INTO app.items VALUES (1, 'bolt', 10, NULL, 0.25), (2, 'nut', 20, 'ünï', 0.1), (3, 'screw', 30, NULL, NULL), (4, 'washer', 5, 'x', 1)"
+digest d6
+sql "UPDATE app.items SET qty = qty - 1 WHERE id = 1; DELETE FROM app.items WHERE id = 3"
+sql "UPDATE app.items SET qty = qty - 1 WHERE id = 1"
+digest d7
+sql "UPDATE app.items SET note = 'changed', price = 0.15 WHERE id = 2"
+sql "INSERT INTO app.items VALUES (5, 'rivet', 1, NULL, NULL)"
+digest d8
+
 # ---- proofs and column descriptions at the end ------------------------------
-# label | relation | where clause | with columns (1/0)
+# label | relation | table id | row hash | columns file | operation
 MANIFEST="$WORK/manifest.rows"
 : > "$MANIFEST"
 export_row() {
@@ -169,7 +187,18 @@ export_row() {
     sql "SELECT jsonb_pretty(app.fx_cols('$rel'::regclass, r.ctid)) FROM $rel r WHERE $where" > "$OUT/columns/$label.json"
     colfile="columns/$label.json"
   fi
-  printf '%s\t%s\t%s\t%s\t%s\n' "$label" "$rel" "$tid" "$rh" "$colfile" >> "$MANIFEST"
+  printf '%s\t%s\t%s\t%s\t%s\tI\n' "$label" "$rel" "$tid" "$rh" "$colfile" >> "$MANIFEST"
+}
+# A removed version of a row of an updatable table, from its history table:
+# the proof of its D entry (op D) or of the I entry that entered it (op I).
+export_old() {
+  local label="$1" rel="$2" where="$3" op="$4"
+  local hist="${rel}_ledger_history" tid rh
+  tid=$(sql "SELECT table_id FROM kingres.ledger_table WHERE relid = '$rel'::regclass")
+  rh=$(sql "SELECT encode(kingres.ledger_history_row_hash(h.*), 'hex') FROM $hist h WHERE $where")
+  sql "SELECT kingres.ledger_inclusion_proof('$rel', decode('$rh', 'hex'), '$op')" > "$OUT/proofs/$label.json"
+  sql "SELECT jsonb_pretty(app.fx_cols('$hist'::regclass, h.ctid, ARRAY['ledger_txid', 'ledger_seq', 'ledger_op'])) FROM $hist h WHERE $where" > "$OUT/columns/$label.json"
+  printf '%s\t%s\t%s\t%s\tcolumns/%s.json\t%s\n' "$label" "$rel" "$tid" "$rh" "$label" "$op" >> "$MANIFEST"
 }
 export_row acc1 app.accounts "id = 1" 1
 export_row acc2 app.accounts "id = 2" 1
@@ -186,6 +215,21 @@ export_row evt8 app.events "id = 8" 1
 export_row acc8 app.accounts "id = 8" 1
 export_row evt9 app.events "id = 9" 1
 export_row evt10 app.events "id = 10" 1
+# The current rows of the updatable table (I), and its removed versions: each
+# removed version has a D proof and an I proof (the entry that entered it).
+export_row itm1 app.items "id = 1" 1
+export_row itm2 app.items "id = 2" 1
+export_row itm4 app.items "id = 4" 1
+export_row itm5 app.items "id = 5" 1
+# id 1 was (10), (9), is (8): two removals; id 2 was (nut, ünï, 0.1); id 3 was deleted.
+export_old itm1_v1_d app.items "id = 1 AND qty = 10" D
+export_old itm1_v1_i app.items "id = 1 AND qty = 10" I
+export_old itm1_v2_d app.items "id = 1 AND qty = 9" D
+export_old itm1_v2_i app.items "id = 1 AND qty = 9" I
+export_old itm2_v1_d app.items "id = 2" D
+export_old itm2_v1_i app.items "id = 2" I
+export_old itm3_deleted_d app.items "id = 3" D
+export_old itm3_deleted_i app.items "id = 3" I
 
 # The proof of a row made when its block was the latest.
 sql "SELECT kingres.ledger_inclusion_proof('app.accounts', kingres.ledger_row_hash(a.*)) FROM app.accounts a WHERE id = 1" > "$OUT/proofs/acc1_latest.json"
@@ -216,7 +260,7 @@ PGDATABASE=otherdb sql "SELECT kingres.ledger_generate_digest()" > "$OUT/digests
 {
   echo '{"digests": ['
   first=1
-  for f in d0 d1 d2 d3 d4 d5; do
+  for f in d0 d1 d2 d3 d4 d5 d6 d7 d8; do
     h=$(sql "SELECT ($(printf "'%s'" "$(cat "$OUT/digests/$f.json")")::jsonb->>'height')::int")
     [ $first = 1 ] || echo ','
     first=0
@@ -226,11 +270,11 @@ PGDATABASE=otherdb sql "SELECT kingres.ledger_generate_digest()" > "$OUT/digests
   echo '],'
   echo '"rows": ['
   first=1
-  while IFS=$'\t' read -r label rel tid rh colfile; do
+  while IFS=$'\t' read -r label rel tid rh colfile op; do
     [ $first = 1 ] || echo ','
     first=0
-    printf '  {"label": "%s", "relation": "%s", "table_id": %s, "row_hash": "%s", "proof": "proofs/%s.json", "columns": "%s"}' \
-      "$label" "$rel" "$tid" "$rh" "$label" "$colfile"
+    printf '  {"label": "%s", "relation": "%s", "table_id": %s, "row_hash": "%s", "proof": "proofs/%s.json", "columns": "%s", "op": "%s"}' \
+      "$label" "$rel" "$tid" "$rh" "$label" "$colfile" "$op"
   done < "$MANIFEST"
   echo ''
   echo '],'
