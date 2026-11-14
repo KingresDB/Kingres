@@ -1,0 +1,48 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: PostgreSQL -->
+<!--
+  Placeholder page served when the management panel has not been built into
+  the binary.  The logo is the project's mark, redrawn from
+  kingres/brand/svg/kingres-db-mark-color-transparent.svg with the crown
+  following the text color so that it is readable in light and dark schemes.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>KingresDB</title>
+<style>
+  :root { color-scheme: light dark; --ink: #14171f; --surface: #ffffff; }
+  @media (prefers-color-scheme: dark) { :root { --ink: #f1eadb; --surface: #0b0d12; } }
+  body {
+    margin: 0; min-height: 100vh; display: grid; place-items: center;
+    background: var(--surface); color: var(--ink);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 32rem; padding: 2rem; text-align: center; }
+  svg { width: 7rem; height: 7rem; }
+  h1 { margin: 0.5rem 0 1rem; font-size: 1.75rem; letter-spacing: 0.02em; }
+  code { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; }
+</style>
+</head>
+<body>
+<main>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" aria-hidden="true" focusable="false">
+<defs>
+<linearGradient id="kg-gold" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#F6D365"/><stop offset="1" stop-color="#C8962E"/></linearGradient>
+<clipPath id="kg-shield"><path d="M136 204 H376 V332 C376 392 328 432 256 466 C184 432 136 392 136 332 Z"/></clipPath>
+</defs>
+<g fill="currentColor">
+<path d="M140 160 L124 92 L192 128 L256 62 L320 128 L388 92 L372 160 Z"/>
+<circle cx="122" cy="76" r="11"/><circle cx="256" cy="44" r="12"/><circle cx="390" cy="76" r="11"/>
+<rect x="136" y="170" width="240" height="18" rx="3"/></g>
+<g fill="url(#kg-gold)" clip-path="url(#kg-shield)" fill-rule="evenodd">
+<path d="M130 200 H250 V470 H130 Z M176 246 H212 V390 Q190 372 176 340 Z"/>
+<path d="M262 200 H382 V470 H262 Z M300 246 H338 V288 H300 Z M300 324 H338 V340 Q324 372 300 390 Z M382 292 L356 306 L382 320 Z"/></g>
+</svg>
+<h1>KingresDB</h1>
+<p>The management panel has not been built into this binary yet. The REST API is available at <code>/api/v1</code>.</p>
+</main>
+</body>
+</html>
