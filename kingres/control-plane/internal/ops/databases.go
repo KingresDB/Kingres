@@ -45,26 +45,45 @@ type createParams struct {
 	LcCollate       string `json:"lcCollate,omitempty"`
 	LcCtype         string `json:"lcCtype,omitempty"`
 	ConnectionLimit int    `json:"connectionLimit"`
-	Sharding        bool   `json:"sharding"`
-	BucketCount     int    `json:"bucketCount"`
-	Durability      string `json:"durability"`
-	LedgerMode      string `json:"ledgerMode"`
-	DigestInterval  int    `json:"digestIntervalSeconds"`
-	CreatedBy       string `json:"createdBy"`
+	// Servers are the other servers of the cluster when the task was made; the
+	// task has one step for each of them.
+	Servers        []string `json:"servers,omitempty"`
+	Sharding       bool     `json:"sharding"`
+	BucketCount    int      `json:"bucketCount"`
+	Durability     string   `json:"durability"`
+	LedgerMode     string   `json:"ledgerMode"`
+	DigestInterval int      `json:"digestIntervalSeconds"`
+	CreatedBy      string   `json:"createdBy"`
 }
 
 // Definitions returns the task definitions of this package; the engine that
 // runs them is built by the caller (cluster wiring).
 func (o *Ops) Definitions() []task.Definition {
 	return []task.Definition{
-		{Kind: KindDatabaseCreate, Steps: []task.Step{
-			{Name: "Create the database", Run: o.stepCreateDB},
-			{Name: "Install the extensions", Run: o.stepInstallExtensions},
-			{Name: "Record the settings", Run: o.stepRecordSettings},
+		o.replicateDefinition(),
+		{Kind: KindDatabaseCreate, Dynamic: func(in json.RawMessage) ([]task.Step, error) {
+			p, err := rawInput[createParams](in)
+			if err != nil {
+				return nil, err
+			}
+			steps := []task.Step{
+				{Name: "Create the database", Run: o.stepCreateDB},
+				{Name: "Install the extensions", Run: o.stepInstallExtensions},
+			}
+			// One step for each other server: the database is created there, and a
+			// sharded database registers the server as a node.
+			steps = append(steps, o.perServer(p.Servers, "Create the database on server %s", o.stepCreateOn)...)
+			return append(steps, task.Step{Name: "Record the settings", Run: o.stepRecordSettings}), nil
 		}},
-		{Kind: KindDatabaseDrop, Steps: []task.Step{
-			{Name: "Drop the database", Irreversible: true, Run: o.stepDropDB},
-			{Name: "Remove the settings", Run: o.stepDropSettings},
+		{Kind: KindDatabaseDrop, Dynamic: func(in json.RawMessage) ([]task.Step, error) {
+			p, err := rawInput[dropParams](in)
+			if err != nil {
+				return nil, err
+			}
+			steps := o.perServer(p.Servers, "Drop the database on server %s", o.stepDropOn)
+			return append(steps,
+				task.Step{Name: "Drop the database", Irreversible: true, Run: o.stepDropDB},
+				task.Step{Name: "Remove the settings", Run: o.stepDropSettings}), nil
 		}},
 		{Kind: KindTableDistribute, Steps: []task.Step{
 			{Name: "Distribute the table", Irreversible: true, Run: o.stepDistribute},
@@ -77,11 +96,26 @@ func (o *Ops) Definitions() []task.Definition {
 				return o.Instances.Restart(ctx, 1)
 			}},
 		}},
-		{Kind: KindNetworkApply, Steps: []task.Step{
-			{Name: "Store the rules", Run: o.stepStoreRules},
-			{Name: "Write pg_hba.conf and reload", Run: o.stepApplyRules},
+		{Kind: KindNetworkApply, Dynamic: func(in json.RawMessage) ([]task.Step, error) {
+			p, err := rawInput[networkParams](in)
+			if err != nil {
+				return nil, err
+			}
+			steps := []task.Step{
+				{Name: "Store the rules", Run: o.stepStoreRules},
+				{Name: "Write pg_hba.conf and reload", Run: o.stepApplyRules},
+			}
+			return append(steps, o.perServer(p.Servers, "Apply the rules on server %s", o.stepApplyOn)...), nil
 		}},
 	}
+}
+
+func rawInput[T any](raw json.RawMessage) (T, error) {
+	var v T
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return v, fmt.Errorf("reading the task input: %w", err)
+	}
+	return v, nil
 }
 
 func inputOf[T any](t task.Task) (T, error) {
@@ -125,7 +159,8 @@ func (o *Ops) PrepareCreateDatabase(ctx context.Context, actor string, req api.D
 	if !dbNameRE.MatchString(req.Name) || protectedDB[req.Name] {
 		errs = append(errs, field("/name", "must match ^[a-z_][a-z0-9_]{0,62}$ and not be a system database", "pattern"))
 	}
-	p := createParams{Name: req.Name, Owner: actor, Encoding: "UTF8", ConnectionLimit: -1, BucketCount: 128,
+	servers := o.others(ctx)
+	p := createParams{Name: req.Name, Owner: actor, Servers: ids(servers), Encoding: "UTF8", ConnectionLimit: -1, BucketCount: 128,
 		Durability: "sync", LedgerMode: "off", DigestInterval: 3600, CreatedBy: actor}
 	if g := req.General; g != nil {
 		if g.Owner != "" {
@@ -210,6 +245,12 @@ func (o *Ops) stepCreateDB(ctx context.Context, env *task.Env) error {
 	if err != nil {
 		return err
 	}
+	return o.createDB(ctx, p)
+}
+
+// createDB creates the database on the local instance (not an error when it
+// exists).
+func (o *Ops) createDB(ctx context.Context, p createParams) error {
 	c, err := o.Service.ServiceConn(ctx, "postgres")
 	if err != nil {
 		return err
@@ -300,7 +341,8 @@ func (o *Ops) setDurability(ctx context.Context, x execer, db, level string) err
 }
 
 type dropParams struct {
-	Name string `json:"name"`
+	Name    string   `json:"name"`
+	Servers []string `json:"servers,omitempty"`
 }
 
 // PrepareDropDatabase validates a drop request.
@@ -319,7 +361,7 @@ func (o *Ops) PrepareDropDatabase(ctx context.Context, name string) (any, error)
 	if err != nil {
 		return nil, wrap(err)
 	}
-	return dropParams{Name: name}, nil
+	return dropParams{Name: name, Servers: ids(o.others(ctx))}, nil
 }
 
 func (o *Ops) stepDropDB(ctx context.Context, env *task.Env) error {
@@ -327,6 +369,11 @@ func (o *Ops) stepDropDB(ctx context.Context, env *task.Env) error {
 	if err != nil {
 		return err
 	}
+	return o.dropDB(ctx, p)
+}
+
+// dropDB drops the database on the local instance.
+func (o *Ops) dropDB(ctx context.Context, p dropParams) error {
 	if protectedDB[p.Name] || !dbNameRE.MatchString(p.Name) {
 		return fmt.Errorf("refusing to drop %q", p.Name)
 	}
@@ -459,4 +506,28 @@ func (o *Ops) UpdateDatabase(ctx context.Context, actor, name string, req api.Da
 		}
 		return nil
 	}))
+}
+
+// stepCreateOn creates the database on another server and, for a sharded
+// database, registers that server as a node of it.
+func (o *Ops) stepCreateOn(ctx context.Context, env *task.Env, server string) error {
+	p, err := inputOf[createParams](env.Task)
+	if err != nil {
+		return err
+	}
+	if err := o.Fanout.Apply(ctx, server, ApplyDatabaseCreate, p); err != nil {
+		return err
+	}
+	if p.Sharding {
+		return o.Fanout.Register(ctx, p.Name, OtherServer{ID: server, PGPort: o.pgPortOf(ctx, server)})
+	}
+	return nil
+}
+
+func (o *Ops) stepDropOn(ctx context.Context, env *task.Env, server string) error {
+	p, err := inputOf[dropParams](env.Task)
+	if err != nil {
+		return err
+	}
+	return o.Fanout.Apply(ctx, server, ApplyDatabaseDrop, p)
 }

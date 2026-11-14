@@ -52,6 +52,10 @@ type Ops struct {
 	Roles   RoleConnector
 	// Instances writes pg_hba.conf and reloads the local instance.
 	Instances InstanceControl
+	// Fanout reaches the other servers (nil: this server is alone) and Local is
+	// this server's cluster service, which applies roles and rules locally.
+	Fanout Fanout
+	Local  *cluster.Service
 	// ServerHost and PGPort identify this server in the shard catalog.
 	ServerHost string
 	PGPort     int
@@ -102,6 +106,10 @@ func stmt() *sqlx.Builder { return new(sqlx.Builder) }
 
 // asRole runs f in a transaction on a connection of role to database db.
 func (o *Ops) asRole(ctx context.Context, db, role string, f func(tx pgx.Tx) error) error {
+	if role == "" {
+		// A change replayed from the leader: PostgreSQL's checks already passed there.
+		return o.asService(ctx, db, f)
+	}
 	if o.Roles == nil {
 		return problem.New(problem.UnsupportedOp, "This server cannot act as the signed-in role (no managed instance).")
 	}

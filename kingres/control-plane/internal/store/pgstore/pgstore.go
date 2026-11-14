@@ -15,6 +15,7 @@ package pgstore
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -49,6 +50,11 @@ type Options struct {
 	Now func() time.Time
 	// ConnectTimeout bounds opening a connection; 3 s when zero.
 	ConnectTimeout time.Duration
+	// NodeTLS, when set, gives the TLS configuration for connections to the
+	// instances of other servers (and this server's own address as registered in
+	// the catalog): the cluster certificate is the client certificate and
+	// replaces the password (design D3). nil: the local credentials are used.
+	NodeTLS func(host string) (*tls.Config, error)
 }
 
 // Store is the PostgreSQL implementation of store.Store.
@@ -163,9 +169,17 @@ func (s *Store) connectInstance(ctx context.Context, host string, port int) (*pg
 	s.mu.Unlock()
 	cfg.Host = host
 	cfg.Port = uint16(port)
-	for _, fb := range cfg.Fallbacks {
-		fb.Host = host
-		fb.Port = uint16(port)
+	if s.opts.NodeTLS != nil && host != "127.0.0.1" && host != "localhost" && host != "::1" {
+		tc, err := s.opts.NodeTLS(host)
+		if err != nil {
+			return nil, fmt.Errorf("%w: no certificate for the node connection", store.ErrUnavailable)
+		}
+		cfg.TLSConfig, cfg.Password, cfg.Fallbacks = tc, "", nil
+	} else {
+		for _, fb := range cfg.Fallbacks {
+			fb.Host = host
+			fb.Port = uint16(port)
+		}
 	}
 	conn, err := pgx.ConnectConfig(ctx, cfg)
 	if err != nil {

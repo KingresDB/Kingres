@@ -157,7 +157,7 @@ func checkLedgerRule(ctx context.Context, x execer, req api.GrantRequest) error 
 }
 
 // Grant issues GRANT as the actor.
-func (o *Ops) Grant(ctx context.Context, actor string, req api.GrantRequest) error {
+func (o *Ops) grantLocal(ctx context.Context, actor string, req api.GrantRequest) error {
 	t, grantee, err := parseGrant(req)
 	if err != nil {
 		return err
@@ -171,7 +171,7 @@ func (o *Ops) Grant(ctx context.Context, actor string, req api.GrantRequest) err
 }
 
 // Revoke issues REVOKE as the actor.
-func (o *Ops) Revoke(ctx context.Context, actor string, req api.GrantRequest) error {
+func (o *Ops) revokeLocal(ctx context.Context, actor string, req api.GrantRequest) error {
 	t, grantee, err := parseGrant(req)
 	if err != nil {
 		return err
@@ -182,7 +182,7 @@ func (o *Ops) Revoke(ctx context.Context, actor string, req api.GrantRequest) er
 }
 
 // ApplyTemplate applies readOnly, readWrite or owner to a role on a database.
-func (o *Ops) ApplyTemplate(ctx context.Context, actor string, req api.GrantTemplateRequest) error {
+func (o *Ops) applyTemplateLocal(ctx context.Context, actor string, req api.GrantTemplateRequest) error {
 	var errs []problem.FieldError
 	switch req.Template {
 	case "readOnly", "readWrite", "owner":
@@ -287,4 +287,76 @@ func (o *Ops) ApplyTemplate(ctx context.Context, actor string, req api.GrantTemp
 		}
 		return nil
 	}))
+}
+
+// sharded reports whether database db uses kingres_shard; the extension
+// propagates grants on tables and schemas of such a database itself.
+func (o *Ops) sharded(ctx context.Context, db string) bool {
+	var yes bool
+	err := o.asService(ctx, db, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'kingres_shard')").Scan(&yes)
+	})
+	return err == nil && yes
+}
+
+// replicateGrantChange sends a grant change to the other servers: database
+// level changes always (a database's privileges are per instance); table and
+// schema level changes only for databases without kingres_shard, whose objects
+// the extension does not propagate.
+func (o *Ops) replicateGrantChange(ctx context.Context, op string, req *api.GrantRequest, tpl *api.GrantTemplateRequest) {
+	if len(o.others(ctx)) == 0 {
+		return
+	}
+	db := ""
+	switch {
+	case req != nil:
+		db = req.Database
+	case tpl != nil:
+		db = tpl.Database
+	}
+	if o.sharded(ctx, db) {
+		switch {
+		case req != nil && req.Level != "database":
+			return
+		case tpl != nil && tpl.Template != "owner":
+			// the database-level part of a template
+			o.replicateGrant(ctx, grantOp{Op: "grant", Grant: &api.GrantRequest{Database: db, Level: "database",
+				Grantee: tpl.Grantee, Privileges: []string{"connect"}}})
+			return
+		}
+	}
+	o.replicateGrant(ctx, grantOp{Op: op, Grant: req, Template: tpl})
+}
+
+// Grant issues GRANT as the actor.
+func (o *Ops) Grant(ctx context.Context, actor string, req api.GrantRequest) error {
+	if err := o.grantLocal(ctx, actor, req); err != nil {
+		return err
+	}
+	if actor != "" {
+		o.replicateGrantChange(ctx, "grant", &req, nil)
+	}
+	return nil
+}
+
+// Revoke issues REVOKE as the actor.
+func (o *Ops) Revoke(ctx context.Context, actor string, req api.GrantRequest) error {
+	if err := o.revokeLocal(ctx, actor, req); err != nil {
+		return err
+	}
+	if actor != "" {
+		o.replicateGrantChange(ctx, "revoke", &req, nil)
+	}
+	return nil
+}
+
+// ApplyTemplate applies readOnly, readWrite or owner to a role on a database.
+func (o *Ops) ApplyTemplate(ctx context.Context, actor string, req api.GrantTemplateRequest) error {
+	if err := o.applyTemplateLocal(ctx, actor, req); err != nil {
+		return err
+	}
+	if actor != "" {
+		o.replicateGrantChange(ctx, "template", nil, &req)
+	}
+	return nil
 }

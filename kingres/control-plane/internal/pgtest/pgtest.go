@@ -200,3 +200,31 @@ func (i *Instance) ConnectRaw() (*pgx.Conn, error) {
 	}
 	return pgx.ConnectConfig(context.Background(), cfg)
 }
+
+// FreePortPair returns p and p+1, both free on 127.0.0.1 (a server's REST API
+// and the internal API above it).
+func FreePortPair(t testing.TB) int {
+	t.Helper()
+	portMu.Lock()
+	defer portMu.Unlock()
+	lo, hi := envInt("KINGRES_TEST_PORT_BASE", 56000), envInt("KINGRES_TEST_PORT_END", 56199)
+	for p := lo; p < hi; p++ {
+		if usedPorts[p] || usedPorts[p+1] {
+			continue
+		}
+		l1, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(p))
+		if err != nil {
+			continue
+		}
+		l2, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(p+1))
+		_ = l1.Close()
+		if err != nil {
+			continue
+		}
+		_ = l2.Close()
+		usedPorts[p], usedPorts[p+1] = true, true
+		return p
+	}
+	t.Fatalf("no free pair of ports in %d..%d", lo, hi)
+	return 0
+}

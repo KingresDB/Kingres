@@ -1,3 +1,18 @@
+| `POST /internal/v1/forward` | any peer, answered only by the leader | one operation of the public contract, run as the identity the forwarding server verified |
+| `POST /internal/v1/bootstrap/prepare` | setup token (no certificate) | the uninitialized server returns a certificate request for its own key |
+| `POST /internal/v1/bootstrap/install` | setup token (no certificate) | the uninitialized server stores its certificate and the CA certificate |
+| `POST /internal/v1/bootstrap/join` | administrator credentials (no certificate) | a joining server asks to be added; the credentials are checked here and go no further |
+| `POST /internal/v1/add-server` | any peer, answered only by the leader | the server that checked an administrator hands a join to the leader |
+| `GET /internal/v1/instance/status` | leader, or any peer while this server is joining | whether the instance exists and runs |
+| `POST /internal/v1/instance/create` | leader, or any peer while joining | create, configure and start the instance for the cluster's settings and managed rules |
+| `POST /internal/v1/instance/start`, `/stop`, `/remove` | leader | start or stop the instance; stop and delete it and its credentials |
+| `POST /internal/v1/instance/trust` | leader, or any peer while joining | the servers to trust (certificate rules and map), the managed network rules, TLS settings; reload |
+| `POST /internal/v1/pki/install` | leader, or any peer while joining | revocation list (PEM CRL and serial numbers) and, when renewed, the server certificate |
+| `POST /internal/v1/peers` | leader, or any peer while joining | the peer directory (server id and internal address of every server) |
+| `POST /internal/v1/globals/apply` | leader, or any peer while joining | create roles (with password verifiers, never passwords) and databases with their extensions |
+| `POST /internal/v1/node/finish` | leader, or any peer while joining | the server becomes clustered and its setup token is removed |
+| `POST /internal/v1/node/reset` | leader | delete the instance, certificates and key; the server is uninitialized again with a new setup token |
+| `POST /internal/v1/apply` | leader | one cluster-wide operation from a closed set (create or drop a database, network rules, role sync and drop, grant) with structured parameters |
 <!-- SPDX-License-Identifier: PostgreSQL -->
 # The internal API of kingresd
 
@@ -87,9 +102,3 @@ JSON `{"error": "<code>", "message": "..."}`. Codes: `no_certificate`,
 `certificate_refused` (401), `version_mismatch` (409), `not_leader` (403),
 `not_found` (404), `bad_request` (400), `statement_failed` (422), `failed` (500).
 
-## Not in version 1
-
-The calls that create, configure, start, stop and remove instances, that apply
-network rules, that sign certificate requests (join and add) and that distribute the
-peer directory and the revocation list are specified with the join and add operations;
-they are not implemented in this version.

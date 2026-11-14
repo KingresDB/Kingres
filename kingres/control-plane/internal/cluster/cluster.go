@@ -57,6 +57,10 @@ type Config struct {
 	// ServerHost is the host name this server registers in the catalog; it is
 	// the server id.
 	ServerHost string
+	// InternalPort is the port of the internal API listener (0 when off).
+	InternalPort int
+	// Version is the kingresd version.
+	Version string
 	// TLSCertFile and TLSKeyFile enable TLS on the instance.
 	TLSCertFile, TLSKeyFile string
 	// Logger receives diagnostics, never secrets.
@@ -72,6 +76,11 @@ type Service struct {
 
 	initEngine *task.Engine
 	initStore  *task.FileStore
+
+	pki      pkiState
+	memberMu sync.Mutex
+	proxyMu  sync.Mutex
+	identRef func() error
 
 	mu       sync.Mutex
 	dsnSinks []func(dsn string) error
@@ -110,6 +119,9 @@ func New(cfg Config, node *setup.Manager) (*Service, error) {
 		return nil, err
 	}
 	s.initEngine = eng
+	if err := eng.Register(s.joinDefinition()); err != nil {
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -214,14 +226,16 @@ func (s *Service) Resume(bg context.Context) error {
 	if !s.Enabled() {
 		return nil
 	}
-	if s.mgr.Exists(NodeID) && s.setup.State() != setup.Uninitialized {
+	if s.mgr.Exists(NodeID) && (s.setup.State() != setup.Uninitialized || s.Joining()) {
 		ctx, cancel := context.WithTimeout(bg, 2*time.Minute)
 		defer cancel()
 		if err := s.mgr.Start(ctx, NodeID); err != nil {
 			return fmt.Errorf("starting the local instance: %w", err)
 		}
 		s.publishDSN()
-		return nil
+		if s.setup.State() != setup.Uninitialized {
+			return nil
+		}
 	}
 	if s.setup.State() == setup.Uninitialized {
 		s.wg.Add(1)

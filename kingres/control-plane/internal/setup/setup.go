@@ -252,6 +252,27 @@ func (m *Manager) Transition(to State, clusterID, clusterName string, serverID *
 	return nil
 }
 
+// Reset returns a clustered node to uninitialized after the cluster removed it
+// (design D5): the cluster identity is forgotten and a new setup token is
+// generated, so the server can join a cluster again.
+func (m *Manager) Reset() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.persisted.State == Uninitialized {
+		return nil
+	}
+	if m.persisted.State != Clustered {
+		return fmt.Errorf("%w: %s to uninitialized", ErrInvalidTransition, m.persisted.State)
+	}
+	prev := m.persisted
+	m.persisted = Persisted{State: Uninitialized, ChangedAt: m.now().UTC()}
+	if err := m.writeState(); err != nil {
+		m.persisted = prev
+		return err
+	}
+	return m.loadOrCreateToken()
+}
+
 // SetSetupTask records the summary of the setup task so that GET /setup/state
 // can report it; it is persisted with the node state.
 func (m *Manager) SetSetupTask(t api.SetupTaskSummary) error {

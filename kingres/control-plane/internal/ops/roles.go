@@ -100,7 +100,7 @@ func validUntilLit(t *time.Time) string {
 
 // CreateRole creates a role as the signed-in actor and applies the optional
 // memberships and cluster roles in the same transaction.
-func (o *Ops) CreateRole(ctx context.Context, actor string, req api.RoleCreateRequest) error {
+func (o *Ops) createRole(ctx context.Context, actor string, req api.RoleCreateRequest) error {
 	var errs []problem.FieldError
 	if !roleNameRE.MatchString(req.Name) {
 		errs = append(errs, field("/name", "must match ^[a-z_][a-z0-9_]{0,62}$", "pattern"))
@@ -218,7 +218,7 @@ func wrap(err error) error {
 }
 
 // UpdateRole changes attributes of a role.
-func (o *Ops) UpdateRole(ctx context.Context, actor, role string, req api.RoleUpdateRequest) error {
+func (o *Ops) updateRole(ctx context.Context, actor, role string, req api.RoleUpdateRequest) error {
 	var errs []problem.FieldError
 	if _, err := sqlx.NewIdent(role); err != nil {
 		return problem.New(problem.NotFound, "No such role.")
@@ -284,7 +284,7 @@ func (o *Ops) UpdateRole(ctx context.Context, actor, role string, req api.RoleUp
 }
 
 // DeleteRole drops a role.
-func (o *Ops) DeleteRole(ctx context.Context, actor, role string) error {
+func (o *Ops) deleteRole(ctx context.Context, actor, role string) error {
 	if _, err := sqlx.NewIdent(role); err != nil {
 		return problem.New(problem.NotFound, "No such role.")
 	}
@@ -348,7 +348,7 @@ func diff(want, have []string) (add, del []string) {
 }
 
 // SetMemberships replaces the ordinary roles that role is a member of.
-func (o *Ops) SetMemberships(ctx context.Context, actor, role string, want []string) error {
+func (o *Ops) setMemberships(ctx context.Context, actor, role string, want []string) error {
 	var errs []problem.FieldError
 	for i, m := range want {
 		if _, err := sqlx.NewIdent(m); err != nil {
@@ -405,7 +405,7 @@ func (o *Ops) SetMemberships(ctx context.Context, actor, role string, want []str
 }
 
 // SetClusterRoles replaces the cluster roles of a role.
-func (o *Ops) SetClusterRoles(ctx context.Context, actor, role string, want []string) error {
+func (o *Ops) setClusterRoles(ctx context.Context, actor, role string, want []string) error {
 	for i, c := range want {
 		if !isClusterRole(c) {
 			return problem.Validation("The cluster roles are invalid.", field("/clusterRoles/"+strconv.Itoa(i), "must be one of the four cluster roles", "enum"))
@@ -516,5 +516,54 @@ func problemFields(err error) []problem.FieldError {
 	if errors.As(err, &p) {
 		return p.Errors
 	}
+	return nil
+}
+
+// The role operations run on this server as the signed-in role, then on every
+// other server (design D4); see fanout.go.
+
+// CreateRole creates a role as the signed-in actor and applies the optional
+// memberships and cluster roles in the same transaction.
+func (o *Ops) CreateRole(ctx context.Context, actor string, req api.RoleCreateRequest) error {
+	if err := o.createRole(ctx, actor, req); err != nil {
+		return err
+	}
+	o.replicateRoles(ctx, req.Name)
+	return nil
+}
+
+// UpdateRole changes attributes of a role.
+func (o *Ops) UpdateRole(ctx context.Context, actor, role string, req api.RoleUpdateRequest) error {
+	if err := o.updateRole(ctx, actor, role, req); err != nil {
+		return err
+	}
+	o.replicateRoles(ctx, role)
+	return nil
+}
+
+// DeleteRole drops a role.
+func (o *Ops) DeleteRole(ctx context.Context, actor, role string) error {
+	if err := o.deleteRole(ctx, actor, role); err != nil {
+		return err
+	}
+	o.replicateRoleDrop(ctx, role)
+	return nil
+}
+
+// SetMemberships replaces the ordinary memberships of a role.
+func (o *Ops) SetMemberships(ctx context.Context, actor, role string, want []string) error {
+	if err := o.setMemberships(ctx, actor, role, want); err != nil {
+		return err
+	}
+	o.replicateRoles(ctx, role)
+	return nil
+}
+
+// SetClusterRoles replaces the cluster roles of a role.
+func (o *Ops) SetClusterRoles(ctx context.Context, actor, role string, want []string) error {
+	if err := o.setClusterRoles(ctx, actor, role, want); err != nil {
+		return err
+	}
+	o.replicateRoles(ctx, role)
 	return nil
 }

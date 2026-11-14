@@ -32,6 +32,7 @@ const cols = `id, kind, state, subject_type, subject_id, input, progress, error,
 	created_at, updated_at, created_by, coalesce(lease_holder, ''), coalesce(lease_expires_at, 'epoch')`
 
 type progressJSON struct {
+	Detail  string      `json:"detail,omitempty"`
 	Percent float64     `json:"percent"`
 	Steps   []StepState `json:"steps"`
 }
@@ -53,7 +54,7 @@ func scan(row pgx.Row) (Task, error) {
 	if err := json.Unmarshal(prog, &p); err != nil {
 		return Task{}, fmt.Errorf("task %d: progress: %w", t.ID, err)
 	}
-	t.Percent, t.Steps = p.Percent, p.Steps
+	t.Percent, t.Steps, t.Detail = p.Percent, p.Steps, p.Detail
 	if len(errj) > 0 {
 		var e Error
 		if err := json.Unmarshal(errj, &e); err == nil {
@@ -203,4 +204,14 @@ func (s *PGStore) List(ctx context.Context, limit int) ([]Task, error) {
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+// SetDetail implements DetailStore.
+func (s *PGStore) SetDetail(ctx context.Context, id int64, holder, detail string) error {
+	tag, err := s.db.Exec(ctx, `UPDATE kingres_cp.task SET progress = jsonb_set(progress, '{detail}', to_jsonb($3::text))
+		WHERE id = $1 AND lease_holder = $2 AND state = 'running'`, id, holder, detail)
+	if err != nil {
+		return err
+	}
+	return s.heldOrErr(ctx, tag, id)
 }

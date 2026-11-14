@@ -46,7 +46,21 @@ func (s *Service) NewProxy() (*Proxy, error) {
 	if err != nil {
 		return nil, fmt.Errorf("determining the operating system user: %w", err)
 	}
-	return &Proxy{svc: s, osUser: u.Username, roles: map[string]struct{}{}}, nil
+	p := &Proxy{svc: s, osUser: u.Username, roles: map[string]struct{}{}}
+	s.SetIdentRefresh(p.Refresh)
+	return p, nil
+}
+
+// Refresh rewrites pg_ident.conf with the roles mapped now (the manager adds
+// the map of the other servers); the caller reloads the instance.
+func (p *Proxy) Refresh() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	next := make([]string, 0, len(p.roles))
+	for r := range p.roles {
+		next = append(next, r)
+	}
+	return p.svc.mgr.WriteIdent(NodeID, p.osUser, next)
 }
 
 // Reset empties the map (kingresd start). The instance must be running or

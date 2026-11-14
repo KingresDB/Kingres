@@ -21,6 +21,9 @@ import (
 // contract in New, so a handler for an unknown operation cannot exist.
 func (s *Server) handlers() map[string]handlerFunc {
 	m := s.opsHandlers()
+	for k, v := range s.memberHandlers() {
+		m[k] = v
+	}
 	for k, v := range s.monitorHandlers() {
 		m[k] = v
 	}

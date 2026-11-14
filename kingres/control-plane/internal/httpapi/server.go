@@ -64,6 +64,9 @@ type Deps struct {
 	// Forwarder sends cluster operations to the manager leader when this server
 	// is not it; nil means this server is alone and runs everything itself.
 	Forwarder Forwarder
+	// Members adds and removes servers (design D4 and D5); nil makes addServer
+	// and removeServer answer "not supported".
+	Members Members
 	// Web serves the panel at "/" (static files with SPA fallback); when nil
 	// unknown non-API paths answer with the 404 problem.
 	Web http.Handler

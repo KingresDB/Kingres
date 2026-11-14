@@ -223,21 +223,48 @@ func NewKeyAndCSR(n Names) (keyPEM, csrPEM []byte, err error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	dns := n.DNS
-	if ip := net.ParseIP(n.CommonName); ip == nil && !contains(dns, n.CommonName) {
-		dns = append([]string{n.CommonName}, dns...)
-	}
-	tpl := &x509.CertificateRequest{Subject: pkix.Name{CommonName: n.CommonName}, DNSNames: dns, IPAddresses: n.IPs}
-	der, err := x509.CreateCertificateRequest(rand.Reader, tpl, key)
-	if err != nil {
-		return nil, nil, err
-	}
 	kb, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
 		return nil, nil, err
 	}
-	return pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kb}),
-		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}), nil
+	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kb})
+	csrPEM, err = csrFor(key, n)
+	return keyPEM, csrPEM, err
+}
+
+// CSRFromKey creates a certificate request for names from an existing key (a
+// server that resumes a join keeps the key it generated).
+func CSRFromKey(keyPEM []byte, n Names) ([]byte, error) {
+	if err := n.Validate(); err != nil {
+		return nil, err
+	}
+	b, _ := pem.Decode(keyPEM)
+	if b == nil {
+		return nil, errors.New("pki: the key is not PEM")
+	}
+	key, err := x509.ParseECPrivateKey(b.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	return csrFor(key, n)
+}
+
+func csrFor(key *ecdsa.PrivateKey, n Names) ([]byte, error) {
+	dns := append([]string(nil), n.DNS...)
+	ips := append([]net.IP(nil), n.IPs...)
+	if ip := net.ParseIP(n.CommonName); ip != nil {
+		// An address as the server id is a name of the certificate too: peers
+		// verify the certificate against the address they dial.
+		ips = append(ips, ip)
+	} else if !contains(dns, n.CommonName) {
+		dns = append([]string{n.CommonName}, dns...)
+	}
+	tpl := &x509.CertificateRequest{Subject: pkix.Name{CommonName: n.CommonName}, DNSNames: dns, IPAddresses: ips}
+	der, err := x509.CreateCertificateRequest(rand.Reader, tpl, key)
+	if err != nil {
+		return nil, err
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}), nil
 }
 
 func contains(l []string, s string) bool {

@@ -17,8 +17,8 @@ func TestForwardAnyPeerMayCallTheLeaderOnly(t *testing.T) {
 		t.Errorf("backend saw %v (the peer must be the certificate's server id)", e.forwarded)
 	}
 	// Without a certificate, with another version and with an unknown field: refused.
-	if _, _, err := e.do(e.client(nil), "POST", "/forward", Version, body); err == nil {
-		t.Error("forward without a client certificate succeeded")
+	if st, out, err := e.do(e.client(nil), "POST", "/forward", Version, body); err == nil && (st != 401 || out["error"] != "no_certificate") {
+		t.Errorf("forward without a client certificate: %d %v", st, out)
 	}
 	if st, _, _ := e.do(pc, "POST", "/forward", "99", body); st != 409 {
 		t.Errorf("wrong version: %d", st)

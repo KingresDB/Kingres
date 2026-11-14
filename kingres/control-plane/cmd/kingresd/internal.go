@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -19,10 +18,12 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/cluster"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/leader"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/membership"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/monitor"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pki"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/serverinfo"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/setup"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
 )
 
 // internalDeps are what the internal listener needs.
@@ -40,47 +41,41 @@ type internalDeps struct {
 	// forwarded operation (only ever called on the leader).
 	leaders *leader.Resolver
 	forward func(ctx context.Context, peer string, req internalapi.ForwardRequest) (internalapi.ForwardResponse, error)
+	// receiver answers the membership calls.
+	receiver *membership.Receiver
 }
 
-// serveInternal waits until the server certificate exists (it is created by
-// the setup task on the first server), then serves the internal API with
-// mutual TLS until ctx ends. The CA of this server is loaded when it holds one
-// (the leader); the revocation list is then live, otherwise the CA certificate
-// alone is trusted.
+// serveInternal serves the internal API with mutual TLS until ctx ends. A
+// server that has no certificate of a cluster yet presents a self-signed
+// bootstrap certificate, which a joining or adding server pins or records
+// (design D4); only the bootstrap calls are possible then. The certificate is
+// chosen at every handshake, so a server that receives its certificate does
+// not restart.
 func serveInternal(ctx context.Context, d internalDeps) {
 	dir := d.svc.PKIDir()
-	for ctx.Err() == nil {
-		if _, err := os.Stat(filepath.Join(dir, cluster.ServerCertFile)); err == nil {
-			break
+	var logOnce sync.Once
+	get := func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+		if pair, err := tls.LoadX509KeyPair(filepath.Join(dir, cluster.ServerCertFile), filepath.Join(dir, cluster.ServerKeyFile)); err == nil {
+			return &pair, nil
 		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(500 * time.Millisecond):
+		if d.node.State() != setup.Uninitialized {
+			return nil, errors.New("no server certificate")
 		}
-	}
-	if ctx.Err() != nil {
-		return
-	}
-	pair, err := tls.LoadX509KeyPair(filepath.Join(dir, cluster.ServerCertFile), filepath.Join(dir, cluster.ServerKeyFile))
-	if err != nil {
-		d.log.Error("internal API: loading the server certificate", "error", err)
-		return
-	}
-	var verifier internalapi.PeerVerifier
-	var revoked func() []string
-	if ca, err := pki.LoadCA(dir); err == nil {
-		verifier, revoked = ca, ca.Revoked
-	} else if caPEM, rerr := os.ReadFile(filepath.Join(dir, pki.CACertFile)); rerr == nil { //nolint:gosec // path below the pki directory
-		v, verr := pki.NewVerifier(caPEM)
-		if verr != nil {
-			d.log.Error("internal API: reading the CA certificate", "error", verr)
-			return
+		pair, fp, err := pki.EnsureBootstrapCert(dir, d.svc.ServerNames(), time.Now())
+		if err != nil {
+			return nil, err
 		}
-		verifier, revoked = v, func() []string { return nil }
-	} else {
-		d.log.Error("internal API: no CA certificate", "error", rerr)
-		return
+		logOnce.Do(func() {
+			d.log.Info("bootstrap certificate of the internal API", "sha256", pki.FormatFingerprint(fp))
+		})
+		return &pair, nil
+	}
+	if d.node.State() == setup.Uninitialized {
+		// Log the fingerprint at start so that the administrator can pin it.
+		if _, fp, err := pki.EnsureBootstrapCert(dir, d.svc.ServerNames(), time.Now()); err == nil && !d.svc.Joining() {
+			d.log.Info("internal API bootstrap certificate", "sha256", pki.FormatFingerprint(fp),
+				"hint", "give this fingerprint in the header X-Kingres-Pin-Sha256 when adding or joining this server to pin it")
+		}
 	}
 	me := d.serverHost
 	be := internalapi.Backend{
@@ -89,10 +84,13 @@ func serveInternal(ctx context.Context, d internalDeps) {
 				InternalVersion: internalapi.Version, UptimeSeconds: int64(time.Since(d.started).Seconds())}
 		},
 		// The leader is the server holding the primary of shard group 0.
-		Leader:  d.leaders.Current,
-		Self:    me,
-		Forward: d.forward,
-		Revoked: revoked,
+		Leader:    d.leaders.Current,
+		Self:      me,
+		Forward:   d.forward,
+		Revoked:   d.svc.RevokedSerials,
+		Handle:    d.receiver.Handle,
+		Bootstrap: d.receiver.Bootstrap,
+		Joining:   d.svc.Joining,
 		Resources: func(context.Context) (any, error) {
 			return serverinfo.Resources(map[string]string{"data": filepath.Join(d.dataDir, "instances")}, nil), nil
 		},
@@ -111,7 +109,7 @@ func serveInternal(ctx context.Context, d internalDeps) {
 		},
 	}
 	srv := &http.Server{
-		Addr: d.addr, Handler: internalapi.New(verifier, be, d.log, nil), TLSConfig: internalapi.TLSConfig(pair),
+		Addr: d.addr, Handler: internalapi.New(d.svc, be, d.log, nil), TLSConfig: internalapi.TLSConfigFunc(get),
 		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 120 * time.Second,
 		MaxHeaderBytes: 64 << 10, ErrorLog: slog.NewLogLogger(d.log.Handler(), slog.LevelWarn),
 	}
@@ -173,4 +171,33 @@ func execLocal(ctx context.Context, svc *cluster.Service, r internalapi.ExecRequ
 	}
 	res.Tag = rows.CommandTag().String()
 	return res, nil
+}
+
+// runEngineOnLeader runs the task engine on the manager leader only: tasks are
+// rows of the leader's system database, and a follower's copy holds none. A
+// leader that stops being the leader finishes the step in hand (its lease
+// protects the row) and then stops claiming. The leader also sweeps abandoned
+// pending servers at start and then hourly.
+func runEngineOnLeader(ctx context.Context, eng *task.Engine, leaders *leader.Resolver, self string, members *membership.Manager, log *slog.Logger) {
+	var lastSweep time.Time
+	for ctx.Err() == nil {
+		lctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		id, err := leaders.Get(lctx)
+		cancel()
+		if err == nil && id == self {
+			if members != nil && time.Since(lastSweep) > time.Hour {
+				members.SweepAbandoned(ctx)
+				lastSweep = time.Now()
+			}
+			if ran, rerr := eng.RunOnce(ctx); rerr != nil && ctx.Err() == nil {
+				log.Error("task engine", "error", rerr)
+			} else if ran {
+				continue
+			}
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(2 * time.Second):
+		}
+	}
 }

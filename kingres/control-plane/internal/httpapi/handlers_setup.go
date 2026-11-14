@@ -18,6 +18,10 @@ type SetupService interface {
 	Enabled() bool
 	// Init starts the setup task for a validated request.
 	Init(req api.InitClusterRequest, actor string) (task.Task, error)
+	// Join starts the new server's side of joining a cluster (design D4);
+	// Joinable reports whether no setup task is running.
+	Join(req api.JoinClusterRequest, pin string) (task.Task, error)
+	Joinable() bool
 }
 
 // initCluster creates a one-server cluster (D5). The administrator password

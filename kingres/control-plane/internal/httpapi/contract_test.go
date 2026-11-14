@@ -273,6 +273,9 @@ func TestResponsesValidateAgainstContract(t *testing.T) {
 		}
 	}
 	mutating["initCluster"] = true
+	for id := range e.srv.memberHandlers() {
+		mutating[id] = true
+	}
 	// Alerts and metrics need the system database and the sampler.
 	for id := range s2(e) {
 		mutating[id] = true

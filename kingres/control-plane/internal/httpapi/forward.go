@@ -15,6 +15,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/auth"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/contract"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pki"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 )
 
@@ -77,6 +78,7 @@ type forwarded struct {
 	requestID     string
 	sourceAddress string
 	source        string
+	pin           string
 }
 
 func forwardedOf(r *http.Request) *forwarded {
@@ -117,7 +119,7 @@ func (s *Server) tryForward(c *call, w http.ResponseWriter, r *http.Request) (bo
 	}
 	resp, err := fw.Forward(r.Context(), leaderID, internalapi.ForwardRequest{
 		OperationID: c.op.ID, PathParams: params, Query: r.URL.RawQuery,
-		ContentType: r.Header.Get("Content-Type"), Body: body,
+		ContentType: r.Header.Get("Content-Type"), Body: body, Pin: r.Header.Get(HeaderPin),
 		Identity:  internalapi.ForwardIdentity{Username: c.session.Username, ClusterRoles: c.session.ClusterRoles},
 		RequestID: stateOf(r).id, SourceAddress: c.ip, Source: src,
 	})
@@ -182,7 +184,7 @@ func (s *Server) ServeForwarded(ctx context.Context, peer string, fr internalapi
 		target += "?" + fr.Query
 	}
 	req, err := http.NewRequestWithContext(context.WithValue(ctx, fwdKey{}, &forwarded{
-		peer: peer, identity: fr.Identity, requestID: fr.RequestID, sourceAddress: fr.SourceAddress, source: fr.Source,
+		peer: peer, identity: fr.Identity, requestID: fr.RequestID, sourceAddress: fr.SourceAddress, source: fr.Source, pin: pinText(fr.Pin),
 	}), op.Method, "http://leader.internal"+target, bytes.NewReader(fr.Body))
 	if err != nil {
 		return internalapi.ForwardResponse{}, fmt.Errorf("building the request: %w", err)
@@ -251,3 +253,7 @@ func (b *bufferedResponse) Write(p []byte) (int, error) {
 	}
 	return b.body.Write(p)
 }
+
+// pinText normalizes the pinned fingerprint of a forwarded request ("" when
+// it is not one: a server of the cluster already checked it).
+func pinText(s string) string { return pki.NormalizeFingerprint(s) }

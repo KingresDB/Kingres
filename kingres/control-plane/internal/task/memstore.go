@@ -228,3 +228,15 @@ func (m *MemStore) Import(ts []Task) {
 		}
 	}
 }
+
+// SetDetail implements DetailStore.
+func (m *MemStore) SetDetail(_ context.Context, id int64, holder, detail string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, err := m.held(id, holder)
+	if err != nil {
+		return err
+	}
+	t.Detail = detail
+	return nil
+}

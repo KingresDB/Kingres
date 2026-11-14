@@ -180,3 +180,29 @@ type InitClusterRequest struct {
 	// DefaultDurability is async, sync or syncApply; sync when omitted.
 	DefaultDurability *string `json:"defaultDurability,omitempty"`
 }
+
+// JoinClusterRequest is the body of POST /setup/join-cluster.
+type JoinClusterRequest struct {
+	// ExistingNodeAddress is host:port of the REST API of a server of the cluster.
+	ExistingNodeAddress string `json:"existingNodeAddress"`
+	// Admin is an existing cluster administrator.
+	Admin AdminAccount `json:"admin"`
+	// DataPaths are the directories of this server.
+	DataPaths DataPaths `json:"dataPaths"`
+	// MemoryQuota is the memory budget (optional).
+	MemoryQuota *MemoryQuota `json:"memoryQuota,omitempty"`
+	// ServerGroup places the server in a group (not supported yet).
+	ServerGroup *string `json:"serverGroup,omitempty"`
+	// AdvertiseAddress is the address other servers use to reach this one.
+	AdvertiseAddress *string `json:"advertiseAddress,omitempty"`
+}
+
+// AddServerRequest is the body of POST /servers.
+type AddServerRequest struct {
+	// Address is host:port of the new server's REST API.
+	Address string `json:"address"`
+	// SetupToken is the new server's one-time setup token (write-only).
+	SetupToken string `json:"setupToken"`
+	// ServerGroup places the server in a group (not supported yet).
+	ServerGroup *string `json:"serverGroup,omitempty"`
+}

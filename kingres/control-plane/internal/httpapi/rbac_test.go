@@ -127,7 +127,7 @@ func TestNotImplementedIsUniform(t *testing.T) {
 			}
 		}
 	}
-	if count < 20 {
+	if count < 15 {
 		t.Errorf("only %d not-implemented operations found", count)
 	}
 }

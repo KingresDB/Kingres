@@ -69,8 +69,8 @@ func TestInternalAPIOfARunningServer(t *testing.T) {
 	if st, _, err := get("/resources", &pair, internalapi.Version); err != nil || st != 200 {
 		t.Errorf("the leader (this server) asks for resources: %d %v", st, err)
 	}
-	if _, _, err := get("/state", nil, internalapi.Version); err == nil {
-		t.Error("a call without a certificate was answered")
+	if st, out, err := get("/state", nil, internalapi.Version); err == nil && (st != 401 || out["error"] != "no_certificate") {
+		t.Errorf("a call without a certificate was answered: %d %v", st, out)
 	}
 	if st, out, err := get("/state", &pair, "99"); err != nil || st != 409 || out["error"] != "version_mismatch" {
 		t.Errorf("version: %d %v %v", st, out, err)
@@ -95,6 +95,8 @@ func TestInternalAPIOfARunningServer(t *testing.T) {
 	cl := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, ServerName: "127.0.0.1"}}}
 	if resp, err := cl.Do(req); err == nil {
 		resp.Body.Close()
-		t.Error("a session token was accepted by the internal API")
+		if resp.StatusCode != 401 {
+			t.Errorf("a session token was accepted by the internal API: %d", resp.StatusCode)
+		}
 	}
 }

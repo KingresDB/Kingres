@@ -121,7 +121,7 @@ func (s *Service) Init(req api.InitClusterRequest, actor string) (task.Task, err
 		p.Durability = *req.DefaultDurability
 	}
 	ctx := context.Background()
-	t, err := s.initEngine.Submit(ctx, KindInit, task.Subject{Type: "cluster", ID: "cluster"}, p, actor)
+	t, run, err := s.initEngine.SubmitHeld(ctx, KindInit, task.Subject{Type: "cluster", ID: "cluster"}, p, actor)
 	if err != nil {
 		return task.Task{}, err
 	}
@@ -129,7 +129,7 @@ func (s *Service) Init(req api.InitClusterRequest, actor string) (task.Task, err
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		if err := s.initEngine.RunNow(s.bg, t.ID, secrets); err != nil && s.bg.Err() == nil {
+		if err := run(s.bg, secrets); err != nil && s.bg.Err() == nil {
 			s.log.Error("setup task ended with an error", "task", t.ID, "error", err)
 		}
 	}()

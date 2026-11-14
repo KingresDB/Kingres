@@ -250,6 +250,9 @@ func (m *Manager) Init(ctx context.Context, s Spec) (err error) {
 	if err := os.WriteFile(filepath.Join(data, "kingres-managed.conf"), []byte(managed), 0o600); err != nil {
 		return err
 	}
+	if err := m.saveSettings(s.ID, s.Settings); err != nil {
+		return err
+	}
 	conf, err := os.OpenFile(filepath.Join(data, "postgresql.conf"), os.O_APPEND|os.O_WRONLY, 0) //nolint:gosec // path below the manager root
 	if err != nil {
 		return err
@@ -384,7 +387,11 @@ func (m *Manager) WriteHBA(id int, rules []HBARule, tlsRequired bool) error {
 	if _, err := m.Managed(id); err != nil {
 		return err
 	}
-	text, err := RenderHBA(rules, tlsRequired)
+	trust, err := m.Trust(id)
+	if err != nil {
+		return err
+	}
+	text, err := RenderHBAWithNodes(rules, tlsRequired, trust)
 	if err != nil {
 		return err
 	}
@@ -409,7 +416,10 @@ func (m *Manager) WriteManaged(id int, s ManagedSettings) error {
 		return err
 	}
 	data, _ := m.DataDir(id)
-	return writeAtomic(filepath.Join(data, "kingres-managed.conf"), []byte(text))
+	if err := writeAtomic(filepath.Join(data, "kingres-managed.conf"), []byte(text)); err != nil {
+		return err
+	}
+	return m.saveSettings(id, s)
 }
 
 // LogDir returns the directory that holds the instance's log files.
@@ -478,7 +488,11 @@ func (m *Manager) WriteIdent(id int, osUser string, roles []string) error {
 	if _, err := m.Managed(id); err != nil {
 		return err
 	}
-	text, err := RenderIdent(osUser, roles)
+	trust, err := m.Trust(id)
+	if err != nil {
+		return err
+	}
+	text, err := RenderIdentWithNodes(osUser, roles, trust)
 	if err != nil {
 		return err
 	}

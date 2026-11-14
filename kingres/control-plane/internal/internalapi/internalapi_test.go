@@ -156,9 +156,9 @@ func TestAuthorizationTable(t *testing.T) {
 
 func TestCertificateAndVersionRefusals(t *testing.T) {
 	e := newEnv(t)
-	// No client certificate: the TLS handshake already fails.
-	if _, _, err := e.do(e.client(nil), "GET", "/state", Version, nil); err == nil {
-		t.Error("a call without a certificate was answered")
+	// No client certificate: the handshake succeeds (the bootstrap calls need that) and the call is refused.
+	if st, out, err := e.do(e.client(nil), "GET", "/state", Version, nil); err == nil && (st != 401 || out["error"] != "no_certificate") {
+		t.Errorf("a call without a certificate was answered: %d %v", st, out)
 	}
 	// A certificate of another CA.
 	other, _ := pki.CreateCA(filepath.Join(t.TempDir(), "pki"), "other", time.Now())
@@ -194,8 +194,10 @@ func TestCertificateAndVersionRefusals(t *testing.T) {
 	req.Header.Set("X-Setup-Token", "abc")
 	req.Header.Set(HeaderVersion, Version)
 	if resp, err := e.client(nil).Do(req); err == nil {
-		resp.Body.Close()
-		t.Error("a call with only a bearer token was answered")
+		defer resp.Body.Close()
+		if resp.StatusCode != 401 {
+			t.Errorf("a call with only a bearer token was answered: %d", resp.StatusCode)
+		}
 	}
 }
 

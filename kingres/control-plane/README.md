@@ -7,11 +7,14 @@ REST API that the web panel and `kingres-cli` use
 embedded web panel, on one port (default `127.0.0.1:8091`). It runs on every
 server of a cluster.
 
-This is the **second increment**: it adds the instance manager, the task engine, the system database,
-cluster creation (`init-cluster`) and the operations behind the Databases, Security, Query and Settings
-pages that one server can do (see [What is implemented](#what-is-implemented)). Joining servers, rebalance,
-failover, the ledger digests, verifications and proofs, alerts, logs, metrics, server groups and cluster
-settings updates answer the contract's "not supported yet" problem. Design: `kingres/docs/design/control-plane-2.md`.
+This is the **third increment** (several servers). The second added the instance manager, the task engine, the
+system database, cluster creation (`init-cluster`) and the operations behind the Databases, Security, Query and
+Settings pages; the third lets a second and a third server join (`joinCluster`, `addServer`), removes an empty
+server (`removeServer`) and makes the cluster-wide operations run on every server (see
+[Running several servers](#running-several-servers)). Rebalance, failover, restoring preferred primaries, server
+groups, cluster-wide logs, alerts and metrics, the certificate renewal job and leaving a cluster still answer the
+contract's "not supported yet" problem. Design: `kingres/docs/design/control-plane-2.md` and
+`kingres/docs/design/control-plane-3.md`.
 
 > **Module path.** The Go module is `github.com/KingresDB/Kingres/kingres/control-plane`: the
 > repository's location followed by the directory of this module.
@@ -40,6 +43,10 @@ internal/
   internalapi/             the server-to-server API on its own mutual-TLS listener (see internal-api.md)
   peerclient/             client of the internal API; forwarding to the leader
   peers/                  directory of the other servers' internal addresses (peers.json)
+  membership/             joining and removing servers: the leader's tasks server.add and server.remove, and the
+                          receiving side of the internal calls (instance, trust, certificates, globals, apply)
+  wire/                   request and answer types of those internal calls (no behavior)
+  clustertest/            starts N kingresd processes on one machine; the multi-server tests
   leader/                 the manager leader read from the catalog, cached
   ops/                    operations that change the cluster (roles, grants, databases, tables, network, workbench)
   sdnotify/               systemd readiness notification
@@ -121,10 +128,10 @@ server at start. The DSN is never logged.
 | `login-rate-window` | `KINGRES_LOGIN_RATE_WINDOW` | `1m` | |
 | `pg-bin-dir` | `KINGRES_PG_BIN_DIR` | none | directory of `postgres`, `initdb`, `pg_ctl`, `pg_config` (the package sets `/opt/kingres/bin`). Unset: the directory of the kingresd binary, then `PATH`; none found: instance management is off and `initCluster` answers 422. A directory that is not a KingresDB 18 build stops the server |
 | `socket-dir` | `KINGRES_SOCKET_DIR` | `<data-dir>/run` | base directory of the instances' unix sockets (the package sets `/run/kingres`); never `/tmp` |
-| `pg-port`, `pg-listen` | `KINGRES_PG_PORT`, `KINGRES_PG_LISTEN` | `5432`, `127.0.0.1` | port and `listen_addresses` of the managed instance |
-| `internal-listen` | `KINGRES_INTERNAL_LISTEN` | empty (off) | host:port of the mutual-TLS listener of the internal server-to-server API |
+| `pg-port`, `pg-listen` | `KINGRES_PG_PORT`, `KINGRES_PG_LISTEN` | `5432`, `127.0.0.1` | port and `listen_addresses` of the managed instance. In a cluster of several servers `pg-listen` must include the address the other servers reach this one at (the `server-host`), and `127.0.0.1` for kingresd itself, for example `127.0.0.1,10.0.0.12` |
+| `internal-listen` | `KINGRES_INTERNAL_LISTEN` | empty (off) | host:port of the mutual-TLS listener of the internal server-to-server API. **Required to join, add or remove servers and for forwarding.** By convention it is the port above the REST API (`listen` 8091, `internal-listen` 8092): the contract names only the REST address of a server, and the internal API of that server is found at the next port (kingresd warns when it is not) |
 | `metrics-token` | `KINGRES_METRICS_TOKEN` | none | bearer token that may scrape `/metrics` besides stats-role session tokens |
-| `server-host` | `KINGRES_SERVER_HOST` | machine host name | host registered in the shard catalog; it is the server id |
+| `server-host` | `KINGRES_SERVER_HOST` | machine host name | host registered in the shard catalog; it is the server id, the common name and a name of its certificate, and the host the other servers (and the sharding extension) connect to. It must resolve to this server from every other server |
 | `allow-remote-setup` | `KINGRES_ALLOW_REMOTE_SETUP` | `false` | `true` lets the setup operations come from non-loopback addresses while uninitialized (containers listening on `0.0.0.0`); the setup token is still required |
 | `-version` | | | prints version, contract revision (0.3.0) and build commit (`-ldflags "-X main.commit=..."`, else `unknown`) |
 | `-stop-instances` | | | stops the managed instances (fast shutdown) and exits |
@@ -173,7 +180,7 @@ paths). "Real" means the operation works against PostgreSQL or the local node
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **64 of 86 operations are real; 22 answer "not yet".**
+authenticated operation lists in 0.2.0. **67 of 86 operations are real; 19 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -194,10 +201,10 @@ authenticated operation lists in 0.2.0. **64 of 86 operations are real; 22 answe
 | Rebalance |  | `getRebalanceStatus`, `startRebalance`, `previewRebalancePlan`, `listRebalanceReports`, `getRebalanceReport`, `stopRebalance` |
 | Replication | `getReplicationTopology` | `restorePreferredPrimaries` |
 | Server groups | `listServerGroups` | `createServerGroup`, `deleteServerGroup` |
-| Servers | `listServers`, `getServer` | `addServer`, `removeServer`, `updateServer`, `failoverServer` |
+| Servers | `listServers`, `getServer`, `addServer`, `removeServer` | `updateServer`, `failoverServer` |
 | Settings | `getClusterSettings`, `updateClusterSettings` |  |
 | Network access | `getNetworkAccess`, `replaceNetworkAccess` |  |
-| Setup | `initCluster`, `getNodeState`, `checkSetupToken` | `joinCluster` |
+| Setup | `initCluster`, `joinCluster`, `getNodeState`, `checkSetupToken` |  |
 | Tasks | `listTasks`, `getTask`, `cancelTask` |  |
 | This server | `getThisServer`, `listThisServerInstances`, `getThisServerInstance`, `restartThisServerInstance`, `listThisServerLogs`, `getThisServerResources` | `startThisServerInstance`, `stopThisServerInstance`, `leaveCluster`, `getThisServerSettings`, `updateThisServerSettings` |
 
@@ -352,6 +359,158 @@ never keeps passwords, so PostgreSQL itself authenticates kingresd's operating s
 password, the map starts empty at every start, and the connections are ordinary sessions of that role. See
 "Design notes".
 
+### Running several servers
+
+A cluster of several servers is formed by joining servers to the first one. Every server runs its own `kingresd`
+with its own data directory and its own PostgreSQL instance; the first server (the **manager leader**) keeps the
+cluster certificate authority, the system database `kingres_system` and the task engine.
+
+**What every server needs** (the example is the server `db2.example.com`; the first server has the same
+settings with its own names):
+
+| Setting | Value | Why |
+|---|---|---|
+| `server-host` | `db2.example.com` | the server id: its certificate names it, the others and the sharding extension connect to it |
+| `listen` | `0.0.0.0:8091` (or the address of the panel) | the REST API; the contract's `address` of a server |
+| `internal-listen` | `0.0.0.0:8092` | the internal API, **the port above `listen`**: the contract gives only the REST address of a server and the internal API is found at the next port |
+| `pg-port`, `pg-listen` | `5432`, `127.0.0.1,db2.example.com` | the PostgreSQL port and addresses; the other servers' instances connect here |
+| `pg-bin-dir` | `/opt/kingres/bin` | as for a single server |
+| `allow-remote-setup` | `false` | the setup operations stay local; adding a server does not need remote setup (the internal API takes the setup token) |
+
+The ports to open between the servers: the internal API port (8092) and the PostgreSQL port (5432). The REST API
+port is only for the panel and the clients. Every server name must resolve, from every other server, to the
+address its instance listens on (a name that resolves to several addresses gets a certificate rule for each).
+
+**Certificates.** Creating a cluster creates its certificate authority (ECDSA P-256, ten years) on the first server
+in `<data-dir>/pki/` (`ca.key` mode 0600, never copied). Each server generates its own key, sends the CA only a
+certificate request, and gets a one-year server certificate whose common name and subject alternative name are its
+`server-host` (plus `localhost` and `127.0.0.1`). The same certificate is the server certificate and the client
+certificate of the internal API and of the PostgreSQL instance of that server. `<data-dir>/pki/` of a server holds
+`ca.crt`, `server.crt`, `server.key` (0600), `revoked.crl` and `revoked-serials.json`; the first server also `ca.key`
+and `revoked.json`. The renewal job is not written yet (`NeedsRenewal` exists): a certificate has to be replaced
+before it expires after a year, and the CA is not rotated.
+
+**Joining a second server from its own API** (the wizard's way). On the new server, with the setup token it printed
+in `<data-dir>/setup-token`:
+
+```
+curl -s -X POST http://127.0.0.1:8091/api/v1/setup/join-cluster \
+  -H "X-Setup-Token: $(cat /var/lib/kingres/setup-token)" -H 'Content-Type: application/json' \
+  -H 'X-Kingres-Pin-Sha256: <fingerprint of the existing server, optional>' \
+  -d '{"existingNodeAddress":"db1.example.com:8091","admin":{"username":"root_admin","password":"..."},
+       "dataPaths":{"dataDirectory":"/var/lib/kingres"},"memoryQuota":{"totalMegabytes":4096}}'
+curl -s http://127.0.0.1:8091/api/v1/setup/state      # follow setupTask until it is done
+```
+
+**Adding a server from the cluster's API.** On any server of the cluster, signed in as `kingres_ops` or better, with
+the new server's setup token:
+
+```
+curl -s -X POST http://db1.example.com:8091/api/v1/servers -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H 'X-Kingres-Pin-Sha256: <fingerprint of the new server, optional>' \
+  -d '{"address":"db3.example.com:8091","setupToken":"..."}'     # answers 202 with a task; follow GET /tasks/{id}
+```
+
+Both lead to the same task `server.add` on the leader (a request to a server that is not the leader is forwarded).
+Its steps: wait for the new server to hold its certificate; prepare the instance on the new server (it creates
+and starts its own instance with the cluster's settings and managed network rules); trust the new server on every
+server; copy the roles (with password verifiers and memberships, never passwords) and every user database with the
+extensions it uses; register the server with `kingres.add_node` in every database that uses `kingres_shard`
+(this is the step after which nothing is cleaned up any more); record the server; finish (the new server becomes
+`clustered`, its setup token is removed, the server directory is sent to every server). The server is listed with
+status `pendingRebalance` until a rebalance (not written yet) moves buckets to it; databases created afterwards
+spread their buckets over all servers at once.
+
+**Pinned fingerprint or trust on first use.** The first contact has no common CA. The internal API of a server
+without a cluster presents a self-signed certificate (its fingerprint is logged at start, `bootstrap certificate of the
+internal API`, and is the SHA-256 of `<data-dir>/pki/bootstrap.crt`); the internal API of a server of the cluster
+presents the cluster certificate (`<data-dir>/pki/server.crt`). The contract 0.3.0 has no field for a fingerprint, so
+the expected SHA-256 fingerprint (hex, colons allowed) goes in the header `X-Kingres-Pin-Sha256` of `addServer` (the
+fingerprint of the new server's bootstrap certificate) or `joinCluster` (the fingerprint of the existing server's
+internal certificate). With the header a different certificate is refused before the setup token or the password is
+sent. Without it the fingerprint that was seen is recorded: in the log of the server that made the call, in the
+task's detail, and in `kingres_cp.server.seen_fingerprint`; compare it with the other server's log afterwards.
+
+**What each mode protects against.**
+
+- *A network attacker between the two servers during a join without a pinned fingerprint* can present his own
+  certificate and read the setup token (adding) or the administrator's password (joining), and can then act as
+  that server's counterpart. Trust on first use gives no protection against an attacker who is in the path at that
+  moment; it only makes a later comparison possible. Use the pinned mode, or join on a network you control.
+  With a pin, the attacker cannot complete the handshake.
+- *A malicious address given to the join* (an administrator is led to enter the address of a server of an
+  attacker): without a pin the attacker receives the administrator's password (joining) or the new server's setup
+  token (adding). The password of an administrator is the most valuable of these: **pin the fingerprint whenever
+  the address was not typed from your own records**. When adding, the leader also checks that the id the new
+  server calls itself resolves to the host it was reached at, so that it cannot register under another server's
+  name, and refuses an id that already belongs to a member. A server that is added or joined gets a certificate
+  only for the names its own id implies.
+- *A stolen or replayed setup token*: the token is 192 random bits, valid only on its own server and only while
+  that server is uninitialized, compared in constant time, rate limited per address, and removed when the server
+  becomes clustered, so a captured token is useless afterwards. Before that, someone who holds the token and reaches
+  the internal port can add the server to *a* cluster of his choosing (the leader he controls); keep the token
+  secret and the internal port closed to untrusted networks until the server has joined.
+- *A joined server calling internal operations it should not*: the internal API authenticates by certificate only and
+  authorizes by a fixed table; a server that is not the leader cannot call the leader-only calls (instance, trust,
+  certificates, globals, apply, reset, exec), and a removed server's certificate is revoked. **But every server
+  of a cluster is fully trusted by every other**: a server can claim any identity in a forwarded call, and the
+  PostgreSQL instances accept the certificate of any server as any database role (below). Someone who controls
+  one server's key can act as any role on all of them. This is the design (D3), not a defect to be fixed by
+  configuration.
+
+**Trust between the PostgreSQL instances.** Every instance runs with `ssl = on` (TLS 1.3, the server certificate,
+`ssl_ca_file` = the cluster CA, `ssl_crl_file` = the revocation list). Its generated `pg_hba.conf` starts with one
+`hostssl all all <address of each server> cert map=kingres_nodes` rule per server (including itself and, for a cluster
+on one machine, the loopback source address), and `pg_ident.conf` maps the certificate name of every server to any
+role (`kingres_nodes "<server id>" all`). `kingres_shard.node_conninfo` in the managed configuration makes the
+outgoing connections of the sharding extension present the server's certificate and verify the peer's against the
+CA and its name (`sslmode=verify-full`). A statement that the sharding extension routes from one server to another
+therefore runs there as the same role, authenticated by the certificate, with no password stored anywhere (the
+role's password is not known to the cluster; only verifiers exist). Because those rules come first, **a
+TLS connection from a server's own address that presents no certificate is refused instead of falling through to the
+password rules**: clients on the servers themselves must use `sslmode=disable` (kingresd does) or present a
+certificate. In plain words: every server of a cluster is fully trusted by every other.
+
+**Removing a server.** `DELETE /servers/{serverId}` (kingres_ops) removes a server that owns no buckets in any
+database: the state of a new server before a rebalance or after one drained it. The task `server.remove` checks
+that again, unregisters the node (`kingres.remove_node`) in every database, removes the server from the managed
+rules of the others, tells the server to stop and delete its instance and reset itself to `uninitialized` (it
+deletes its key and certificates and gets a new setup token, so it can join again), revokes its certificate and
+sends the revocation list to every kingresd and PostgreSQL instance, and forgets it. A server that owns buckets
+(or holds a copy of them) is refused with 409 and a hint to rebalance first; the server of the map group (the
+manager leader) is refused with 409 too; a server that does not exist is 404.
+
+**Operations on every server.** Creating and dropping a database and replacing the network rules are tasks with
+one step per other server ("Create the database on server X"). Role and grant changes keep their contract answer
+(synchronous) and run on every server as well: they run on the leader as the signed-in role, then at once on every
+other server (the role's current attributes, password verifier and memberships are read and copied; grants are
+replayed with the service role, table and schema level grants only for databases without `kingres_shard`, whose
+extension propagates them itself); a server that cannot be reached then gets a task of kind `replicate.apply`
+that waits for it (see "Design notes"). A server that is down makes a task wait on that step, with the step
+name naming the server (`currentStep`: "Create the database on server 10.0.0.13"), and it finishes when the server
+is back; the server is never skipped.
+
+**If a join is interrupted.** The task is resumable: when `kingresd` of the leader stops or crashes it takes up
+at the first step that is not done after a restart (within the 30 s lease). A failure before the registration step
+(for example the new server's port is taken) cleans up: the other servers stop trusting the new one, the new server
+deletes its instance and key and becomes `uninitialized` again, and the certificate that was signed for it is
+revoked; fix the cause and add it again. A failure during or after the registration is not undone (part of the
+catalog may know the server); add the server again with the same setup token and the task continues. On the new
+server, a join that was refused (wrong fingerprint, wrong credentials, the cluster discarded it) leaves
+`setupTask.state = failed` in `GET /setup/state`; the setup token is still valid and `join-cluster` can be called
+again. A pending server that has no unfinished task is revoked and forgotten by the leader's hourly check (and at start) once it is older than 15 minutes.
+
+**Revoking a certificate.** The leader keeps the revoked serial numbers in `<data-dir>/pki/revoked.json`
+(serial numbers in hex, with the time). Removing a server revokes its certificate. There is no public operation to revoke another certificate in contract 0.3.0 (0.4.0 should have one); the
+only supported way to take a server's certificate out of use is to remove the server. A removal distributes the list immediately: the internal API of every server and, through `ssl_crl_file`, every
+PostgreSQL instance refuse the certificate from then on (a reload is enough).
+
+**Limits of this increment.** One map group (the first server) and one server per shard group: no standby, no
+failover, no rebalance, no server groups. The map group's server cannot be removed or restarted away from, and
+failover of the manager leader does not exist. A server must be reachable at the id it registers; DNS changes
+need the trust rules to be applied again (any membership change does that). A cluster-wide task takes the list of servers when it starts: a server that joins while a
+`database.create` or `database.drop` task is running is not part of that task (do not overlap them).
+
 ## Design notes (where the specification was silent or was changed)
 
 1. **Role connections (D6)**: the spec keeps the sign-in connection. A connection is bound to one database and the
@@ -389,6 +548,54 @@ password, the map starts empty at every start, and the connections are ordinary 
    `kingres_ledger.so` exist in `pg_config --pkglibdir`; a plain PostgreSQL is refused.
 10. **Setup from remote addresses** is controlled by `allow-remote-setup` (default false), no longer by the listen
     address: the setup operations are accepted only from loopback callers unless it is true (containers).
+
+11. **Where the internal API of a server is** (third increment). `joinCluster` and `addServer` give the REST address of
+    a server; the contract has no field for the internal one. The internal API of a server is at its REST host and
+    the port above its REST port. kingresd warns at start when `internal-listen` is not on that port.
+12. **First contact on the internal listener.** The internal listener also answers three calls without a client
+    certificate (`/internal/v1/bootstrap/prepare`, `install`, `join`), authenticated by the new server's setup token
+    or an administrator's credentials, over TLS 1.3 with a self-signed certificate whose fingerprint is pinned or
+    recorded (see "Running several servers"). The handshake therefore asks for, but does not require, a client
+    certificate; every other call still needs a valid one and answers 401 `no_certificate` otherwise. The public
+    listener is unchanged and never takes a client certificate.
+13. **The fingerprint has no contract field** in 0.3.0: it is the header `X-Kingres-Pin-Sha256` of `joinCluster` and
+    `addServer` (forwarded with the request), and the seen fingerprint is in the log, in the `detail` of the task
+    (`Task.Detail`, stored in the task's progress, not part of the contract) and in `kingres_cp.server`. Contract
+    0.4.0 should carry both.
+14. **Introduction happens before the task.** `POST /servers` contacts the new server, signs its certificate request
+    and records it as `pending` in one transaction, installs the certificate on it and only then submits the task,
+    whose subject is the server id (known only after the first contact). The task's first step therefore waits for
+    the new server to answer with its certificate instead of introducing it. A failed install revokes what was
+    signed; a crash between introduction and task is handled by the sweep of abandoned pending servers.
+15. **The new server's instance is slot 1 locally, node id n in the catalog.** The instance directory, socket and
+    marker of a server's instance are always `instances/1` (the code of the earlier increments assumes one local
+    instance); the node id that `kingres.add_node` assigns differs per server (the instance id of the API is the node
+    id).
+16. **Node rules come first in `pg_hba.conf`.** A `cert` rule applies to TLS connections only, and on a cluster
+    on one machine every connection between instances arrives from `127.0.0.1` whatever address it was made to,
+    so the rule for a loopback peer also covers the loopback source addresses. They precede the fixed rules of the
+    service role; a connection that presents no certificate over TLS from such an address fails in that rule.
+17. **Followers do not run tasks.** The task engine now polls only while this server is the manager leader (a
+    follower's `kingres_system` is an empty database made for its catalog copy). `listTasks`, `getTask` and the
+    other leader-bound reads were already answered by the leader.
+18. **Hidden task kind `replicate.apply`.** Role and grant changes are synchronous in the contract, so they cannot be
+    tasks. They are replayed on every other server at once; a server that cannot be reached gets a task of kind
+    `replicate.apply` (one step per such server, waits without limit, reads the role's *current* state when it runs
+    so it never applies a stale one, stores names only, never verifiers). That kind is not in the contract's
+    `TaskKind` enum, so it is not listed by the task API (`listTasks` and `getTask` skip it); it is visible in the
+    log and in `kingres_cp.task`. Contract 0.4.0 should add the kind.
+19. **Roles are copied as state, not as the operation.** After a role operation succeeded on the leader as the
+    signed-in role, the other servers get the role's attributes, SCRAM verifier and memberships (replacing the
+    memberships it has there). Dropping a role drops it everywhere. Databases and extensions: `kingres_shard` is
+    installed by `kingres.add_node` on the new server (it fails when another extension made the schema `kingres`
+    first), the other extensions after the registration. The system database exists on every server as the home
+    of its catalog copy and nothing else.
+20. **Setup state of the new server.** A join is a setup task `cluster.join` on the new server (steps: key and
+    request, ask the cluster, wait for the leader), visible in `setupTask` of `GET /setup/state`; the leader's
+    `server.add` is visible in `GET /tasks/{id}` after sign-in. `ResetMember` returns a removed or discarded server
+    to `uninitialized` with a new setup token; it deletes the instance, key and certificates, keeps the audit file.
+21. **Remote reads.** The store connects to the instances of other servers (replication topology) with the server's
+    certificate as the `kingresd` role instead of the local service password.
 
 ## Ledger, alerts, metrics, this server (second part of the increment)
 
@@ -436,13 +643,15 @@ local settings; `leaveCluster`.
 
 Specification: `kingres/docs/design/control-plane-3.md`. Done: the certificate authority (D1), the internal API
 (D2), the cluster settings update (part of D7), the manager leader and forwarding to it (D6), and the fixes of the
-mismatches the web panel's end-to-end run found (see "Corrections after the panel's end-to-end run"). **Not done:**
-server groups and the cluster-wide logs, alerts and metrics, join, add and remove of servers (D4, D5), the renewal
-job, "every primary" operations on every server, certificate trust between PostgreSQL instances (D3), the
-three-process integration tests and contract 0.4.0 with what depends on it (inclusion proofs, verifications list and
-detail, instance start/stop, leave-cluster, the new alert kinds); every one of them still answers "not supported yet",
-and a cluster still has exactly one server. Nothing half-working is switched on: the join and add operations are not
-routed, and `kingres_shard` 0.2 (needed by D3) was not committed when this was written.
+mismatches the web panel's end-to-end run found (see "Corrections after the panel's end-to-end run"), and, in this
+part, joining and adding a server (D4), removing an empty server (D5), the certificate trust between the PostgreSQL
+instances (D3), the cluster-wide create and drop of databases, role and grant changes and network rules, and the
+integration tests with three `kingresd` processes (package `clustertest`); see "Running several servers" and design
+notes 11 to 21. Tested against `kingres_shard` 0.2 as committed in `c283dbf6bc` (`scripts/install-shard-0.2.sh`).
+**Not done:** server groups and the cluster-wide logs, alerts and metrics, the certificate renewal job, rebalance,
+failover and restoring preferred primaries, and contract 0.4.0 with what depends on it (inclusion proofs,
+verifications list and detail, instance start/stop, leave-cluster, the new alert kinds); every one of them still
+answers "not supported yet".
 
 **CA and server certificates (`internal/pki`).** `init-cluster` creates the CA in `<data-dir>/pki/` (ECDSA P-256, ten
 years, `ca.key` mode 0600, written with an exclusive create) and this server's certificate (one year). The server key
@@ -504,7 +713,23 @@ The panel's engineer found these mismatches against the contract; each has a reg
 
 The end-to-end and instance tests run inside WSL with `scripts/run-integration.ps1` against the private
 installation in `~/kw-cp/install` (set `KINGRES_PG_BIN` to run them elsewhere); without `KINGRES_PG_BIN` they are
-skipped and `go test ./...` runs the unit tests only.
+skipped and `go test ./...` runs the unit tests only. The runner also builds `kingresd` for Linux and sets
+`KINGRESD_BIN`, which the multi-server tests of `internal/clustertest` need: they start three `kingresd` processes
+(127.0.0.2, .3 and .4, each with its own data directory, ports and instance), form the cluster through the HTTP
+APIs only (the first creates it, the second joins from its own API, the third is added from the cluster's API) and
+cover: objects made before and after the servers joined; buckets of a distributed table on all three servers;
+statements routed from every server to every other over certificates (`pg_stat_ssl` and the client certificate
+name on the receiving side); sign-in with a role made on another server; a mutation sent to a follower, forwarded
+and audited once; removal of an empty server, the refusal for servers that own buckets and for the map group's
+server, the refusal of a removed server's certificate by the internal API and by the PostgreSQL instances; both
+fingerprint modes and the wrong pin, setup token replay, wrong credentials; the internal API without a certificate,
+with another CA's certificate, with another internal version and from a server that is not the leader; a join
+interrupted (SIGKILL of the leader) at each of the seven steps; a failed join that cleans up; a cluster-wide task
+that waits for a stopped server and finishes when it is back; the network rules on every server; and that no
+password, verifier or private key is in a log, the audit file, a task row or another server's directory.
+`scripts/smoke3.sh <kingresd> [base-port]` is the same flow driven by curl and psql (output in the increment's report).
+`scripts/install-shard-0.2.sh [commit]` builds `kingres_shard` 0.2 from a commit (default `c283dbf6bc`) into
+`~/kw-cp/install`, not from the working tree.
 
 ## Contract types and validation
 
@@ -656,6 +881,25 @@ new in 0.2.0 (the contract was not changed):
 7. **`Instance.dataDirectory` and `.version`** are optional and omitted: no
    catalog provides them. `ReplicationSettings.durability` is nullable in
    0.2.0, but `synchronous_commit` provides it, so it is returned.
+
+**Contract changes wanted for 0.4.0 by the third increment** (nothing under `kingres/api/` was changed):
+
+8. `JoinClusterRequest` and `AddServerRequest` need an optional `expectedFingerprint` (SHA-256 of the other server's
+   certificate on first contact; now the header `X-Kingres-Pin-Sha256`), and the seen fingerprint has to be returned
+   (`seenFingerprint` and whether it was pinned) in the accepted task, `NodeStateInfo.setupTask` and `Server`; today it
+   is only in the log, in the task's internal detail and in `kingres_cp.server`.
+9. The internal API of a server has no address in the contract: it is found at the REST port plus one. Either say so
+   in `NodeAddress` or let the requests carry `internalAddress`.
+10. `Task` needs a free-text `detail` (and `TaskStep.detail`): a task that waits for a server says which one in
+    `progress.currentStep` ("Create the database on server X") today, which works but is a convention.
+11. `TaskKind` needs the housekeeping kind `replicate.apply` (hidden now), and the `subject.type` of `server.add` and
+    `server.remove` is `server` with the server id.
+12. `removeServer` is described as draining through a rebalance; this version removes only a server that owns no
+    buckets and answers 409 otherwise (the draining removal needs rebalance). The description and the conflict text
+    should say which. `addServer` and `joinCluster` should say that the server stays `live` (not `pendingRebalance`) while
+    no database has buckets.
+13. A way to revoke a server certificate without removing the server, and the revocation list of the cluster, are not
+    in the contract.
 
 ---
 

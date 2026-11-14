@@ -77,7 +77,10 @@ type Task struct {
 	// Steps has one entry per step of the definition.
 	Steps []StepState
 	// Percent is the overall progress, 0 to 100.
-	Percent         float64
+	Percent float64
+	// Detail is free text a step records for the operator (for example the
+	// certificate fingerprint it saw); never a secret. Not part of the contract.
+	Detail          string
 	Error           *Error
 	CancelRequested bool
 	CreatedAt       time.Time
@@ -121,6 +124,29 @@ type Env struct {
 	// Task is the task being run (a copy).
 	Task    Task
 	secrets map[string]string
+	eng     *Engine
+}
+
+// DetailStore is implemented by stores that can keep a task's Detail.
+type DetailStore interface {
+	SetDetail(ctx context.Context, id int64, holder, detail string) error
+}
+
+// SetDetail records free text on the task (see Task.Detail); a store without
+// support ignores it.
+func (e *Env) SetDetail(ctx context.Context, detail string) error {
+	if e.eng == nil {
+		return nil
+	}
+	ds, ok := e.eng.store.(DetailStore)
+	if !ok {
+		return nil
+	}
+	if len(detail) > 2000 {
+		detail = detail[:2000]
+	}
+	e.Task.Detail = detail
+	return ds.SetDetail(ctx, e.Task.ID, e.eng.holder, detail)
 }
 
 // Secret returns a secret handed to this run, or false (after a restart the
@@ -149,6 +175,21 @@ type Step struct {
 type Definition struct {
 	Kind  string
 	Steps []Step
+	// Dynamic, when set, builds the steps of one task from its input (a task
+	// with one step per server); Steps is then ignored. It must give the same
+	// answer every time for the same input.
+	Dynamic func(input json.RawMessage) ([]Step, error)
+	// OnFail, when set, runs after the task has been recorded as failed or
+	// canceled (not when it was only interrupted): it cleans up what the steps
+	// that ran created. Its error is only logged.
+	OnFail func(ctx context.Context, t Task)
+}
+
+func (d Definition) steps(input json.RawMessage) ([]Step, error) {
+	if d.Dynamic != nil {
+		return d.Dynamic(input)
+	}
+	return d.Steps, nil
 }
 
 // Store persists tasks. Every method that changes a task named by a holder
@@ -180,14 +221,17 @@ type Store interface {
 
 // Engine runs tasks.
 type Engine struct {
-	store  Store
-	defs   map[string]Definition
-	holder string
-	lease  time.Duration
-	poll   time.Duration
-	now    func() time.Time
-	log    *slog.Logger
-	tries  int
+	store Store
+	defs  map[string]Definition
+	defMu sync.RWMutex
+	// claimMu keeps pollers from claiming a task that SubmitHeld is creating.
+	claimMu sync.RWMutex
+	holder  string
+	lease   time.Duration
+	poll    time.Duration
+	now     func() time.Time
+	log     *slog.Logger
+	tries   int
 }
 
 // Options configure an Engine.
@@ -228,7 +272,7 @@ func NewEngine(s Store, defs []Definition, o Options) (*Engine, error) {
 		e.log = slog.New(slog.DiscardHandler)
 	}
 	for _, d := range defs {
-		if d.Kind == "" || len(d.Steps) == 0 {
+		if d.Kind == "" || (len(d.Steps) == 0 && d.Dynamic == nil) {
 			return nil, fmt.Errorf("task: definition %q needs a kind and steps", d.Kind)
 		}
 		if _, dup := e.defs[d.Kind]; dup {
@@ -242,7 +286,7 @@ func NewEngine(s Store, defs []Definition, o Options) (*Engine, error) {
 // Submit creates a pending task. input must not contain secrets. It returns
 // ErrSubjectBusy when the subject has an unfinished task.
 func (e *Engine) Submit(ctx context.Context, kind string, subj Subject, input any, createdBy string) (Task, error) {
-	def, ok := e.defs[kind]
+	def, ok := e.def(kind)
 	if !ok {
 		return Task{}, fmt.Errorf("%w: %s", ErrUnknownKind, kind)
 	}
@@ -250,8 +294,12 @@ func (e *Engine) Submit(ctx context.Context, kind string, subj Subject, input an
 	if err != nil {
 		return Task{}, fmt.Errorf("task: encoding input: %w", err)
 	}
-	steps := make([]StepState, len(def.Steps))
-	for i, s := range def.Steps {
+	defSteps, err := def.steps(raw)
+	if err != nil {
+		return Task{}, fmt.Errorf("task: building the steps: %w", err)
+	}
+	steps := make([]StepState, len(defSteps))
+	for i, s := range defSteps {
 		steps[i] = StepState{Name: s.Name, State: StepPending}
 	}
 	now := e.now()
@@ -275,7 +323,9 @@ func (e *Engine) RunNow(ctx context.Context, id int64, secrets map[string]string
 
 // RunOnce claims and runs one available task. It reports whether it ran one.
 func (e *Engine) RunOnce(ctx context.Context) (bool, error) {
+	e.claimMu.RLock()
 	t, err := e.store.Claim(ctx, e.holder, e.now(), e.lease)
+	e.claimMu.RUnlock()
 	if err != nil || t == nil {
 		return false, err
 	}
@@ -308,11 +358,16 @@ func (e *Engine) Cancel(ctx context.Context, id int64) error {
 func (e *Engine) Get(ctx context.Context, id int64) (Task, error) { return e.store.Get(ctx, id) }
 
 func (e *Engine) run(ctx context.Context, t Task, secrets map[string]string) error {
-	def, ok := e.defs[t.Kind]
+	def, ok := e.def(t.Kind)
 	if !ok {
 		return e.finish(ctx, t, Failed, &Error{Code: CodeUnknownKind, Message: "No definition for task kind " + t.Kind + "."})
 	}
-	env := &Env{Task: t, secrets: secrets}
+	steps, err := def.steps(t.Input)
+	if err != nil {
+		return e.finish(ctx, t, Failed, &Error{Code: CodeStepFailed, Message: "The steps of the task cannot be built."})
+	}
+	def.Steps = steps
+	env := &Env{Task: t, secrets: secrets, eng: e}
 	// The lease is renewed in the background while a step runs. A lost lease
 	// cancels the step's context.
 	runCtx, cancel := context.WithCancel(ctx)
@@ -393,7 +448,9 @@ func (e *Engine) cancelTask(ctx context.Context, t Task, def Definition, next in
 	if len(irrev) > 0 {
 		msg += " Steps already done are not undone, including irreversible ones."
 	}
-	return e.finish(ctx, t, Failed, &Error{Code: CodeCanceled, Message: msg, Retryable: false})
+	err := e.finish(ctx, t, Failed, &Error{Code: CodeCanceled, Message: msg, Retryable: false})
+	e.onFail(ctx, t)
+	return err
 }
 
 func (e *Engine) fail(ctx context.Context, t Task, i int, st Step, te *Error) error {
@@ -402,8 +459,18 @@ func (e *Engine) fail(ctx context.Context, t Task, i int, st Step, te *Error) er
 			e.log.Error("recording failed step", "task", t.ID, "error", err)
 		}
 	}
-	e.log.Warn("task step failed", "task", t.ID, "kind", t.Kind, "step", st.Name)
-	return e.finish(ctx, t, Failed, te)
+	e.log.Warn("task step failed", "task", t.ID, "kind", t.Kind, "step", st.Name, "error", te.Message)
+	err := e.finish(ctx, t, Failed, te)
+	e.onFail(ctx, t)
+	return err
+}
+
+// onFail runs the definition's cleanup hook for a task that was recorded as
+// failed.
+func (e *Engine) onFail(ctx context.Context, t Task) {
+	if d, ok := e.def(t.Kind); ok && d.OnFail != nil {
+		d.OnFail(context.WithoutCancel(ctx), t)
+	}
 }
 
 func (e *Engine) finish(ctx context.Context, t Task, s State, te *Error) error {
@@ -448,4 +515,53 @@ func clip(s string) string {
 		return s[:500] + "..."
 	}
 	return s
+}
+
+// Register adds a definition after the engine was built (a definition that
+// needs the engine's owner, which does not exist yet when the engine is made).
+func (e *Engine) Register(d Definition) error {
+	if d.Kind == "" || (len(d.Steps) == 0 && d.Dynamic == nil) {
+		return fmt.Errorf("task: definition %q needs a kind and steps", d.Kind)
+	}
+	e.defMu.Lock()
+	defer e.defMu.Unlock()
+	if _, dup := e.defs[d.Kind]; dup {
+		return fmt.Errorf("task: duplicate definition %q", d.Kind)
+	}
+	e.defs[d.Kind] = d
+	return nil
+}
+
+func (e *Engine) def(kind string) (Definition, bool) {
+	e.defMu.RLock()
+	defer e.defMu.RUnlock()
+	d, ok := e.defs[kind]
+	return d, ok
+}
+
+// List returns the newest tasks.
+func (e *Engine) List(ctx context.Context, limit int) ([]Task, error) {
+	return e.store.List(ctx, limit)
+}
+
+// SubmitHeld creates a task and claims it for this engine in one step that no
+// poller of Run or RunOnce can interleave with, so that a task whose steps need
+// secrets is never started without them. The returned function runs the task to
+// its end with the secrets (they are dropped when the run ends).
+func (e *Engine) SubmitHeld(ctx context.Context, kind string, subj Subject, input any, createdBy string) (Task, func(ctx context.Context, secrets map[string]string) error, error) {
+	e.claimMu.Lock()
+	defer e.claimMu.Unlock()
+	t, err := e.Submit(ctx, kind, subj, input, createdBy)
+	if err != nil {
+		return Task{}, nil, err
+	}
+	claimed, err := e.store.ClaimID(ctx, t.ID, e.holder, e.now(), e.lease)
+	if err != nil {
+		return Task{}, nil, err
+	}
+	if claimed == nil {
+		return Task{}, nil, errors.New("task: the new task was claimed by someone else")
+	}
+	run := func(ctx context.Context, secrets map[string]string) error { return e.run(ctx, *claimed, secrets) }
+	return *claimed, run, nil
 }

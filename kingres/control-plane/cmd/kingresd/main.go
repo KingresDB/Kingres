@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -28,6 +29,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/config"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/httpapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/leader"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/membership"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/monitor"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ops"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/peerclient"
@@ -134,9 +136,21 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	} else {
 		log.Warn("no PostgreSQL programs found (set pg-bin-dir): this server cannot create or manage a cluster")
 	}
+	internalPort := 0
+	if cfg.InternalListen != "" {
+		_, ip, perr := net.SplitHostPort(cfg.InternalListen)
+		if perr != nil {
+			return fmt.Errorf("internal-listen: %w", perr)
+		}
+		internalPort, _ = strconv.Atoi(ip)
+		if rp, _ := strconv.Atoi(port); internalPort != rp+1 {
+			log.Warn("the internal API is not on the port above the REST API: other servers find it there when they join or add this server", "listen", cfg.Listen, "internal-listen", cfg.InternalListen)
+		}
+	}
 	svc, err := cluster.New(cluster.Config{
 		DataDir: cfg.DataDir, BinDir: binDir, SocketDir: cfg.SocketDir, PGPort: cfg.PGPort, PGListen: cfg.PGListen,
 		ServerHost: serverHost, TLSCertFile: cfg.TLSCertFile, TLSKeyFile: cfg.TLSKeyFile, Logger: log,
+		InternalPort: internalPort, Version: version,
 	}, node)
 	if err != nil {
 		return fmt.Errorf("preparing instance management: %w", err)
@@ -157,7 +171,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		}
 	}
 	pg, err := pgstore.New(pgstore.Options{
-		DSN: dsn, Logger: log, PanelPort: port, Version: version, Started: started,
+		DSN: dsn, Logger: log, PanelPort: port, Version: version, Started: started, NodeTLS: svc.NodeTLSConfig,
 	})
 	if err != nil {
 		return err
@@ -197,6 +211,8 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		deps.Proxy = proxy
 	}
 	leaders := leader.New(pg.ManagerLeader, 2*time.Second, nil)
+	var members *membership.Manager
+	var receiver *membership.Receiver
 	peerDir, err := peers.Open(cfg.DataDir)
 	if err != nil {
 		return err
@@ -209,8 +225,18 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		if err := peerDir.Put(peers.Peer{ServerID: serverHost, InternalAddr: net.JoinHostPort(serverHost, iport)}); err != nil {
 			return fmt.Errorf("recording this server in the peer directory: %w", err)
 		}
-		deps.Forwarder = &peerclient.Forwarder{Self: serverHost, Leaders: leaders,
-			Client: peerclient.New(peerclient.Config{PKIDir: svc.PKIDir(), Peers: peerDir})}
+		pc := peerclient.New(peerclient.Config{PKIDir: svc.PKIDir(), Peers: peerDir, Revoked: svc.RevokedSerials})
+		deps.Forwarder = &peerclient.Forwarder{Self: serverHost, Leaders: leaders, Client: pc}
+		members = &membership.Manager{Svc: svc, Ops: opsSvc, Peers: peerDir, Client: peerclient.New(peerclient.Config{PKIDir: svc.PKIDir(), Peers: peerDir, Revoked: svc.RevokedSerials, Timeout: 10 * time.Minute}), Leaders: leaders, Self: serverHost, Version: version, Log: log,
+			SelfPeer: peers.Peer{ServerID: serverHost, InternalAddr: net.JoinHostPort(serverHost, iport)},
+			Audit: func(ctx context.Context, ev audit.Event) {
+				if _, err := sink.Append(ctx, ev); err != nil {
+					log.Error("writing the audit log", "error", err)
+				}
+			}}
+		receiver = &membership.Receiver{M: members, Authn: authn, VerifyToken: svc.VerifyToken}
+		opsSvc.Fanout, opsSvc.Local = members, svc
+		deps.Members = members
 	}
 	api, err := httpapi.New(deps)
 	if err != nil {
@@ -250,7 +276,11 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 				return
 			}
 			var eng *task.Engine
-			eng, err = task.NewEngine(task.NewPGStore(pool), opsSvc.Definitions(), task.Options{
+			defs := opsSvc.Definitions()
+			if members != nil {
+				defs = append(defs, members.Definitions()...)
+			}
+			eng, err = task.NewEngine(task.NewPGStore(pool), defs, task.Options{
 				Holder: fmt.Sprintf("%s-%d", hostname, os.Getpid()), Logger: log})
 			if err != nil {
 				return
@@ -261,7 +291,11 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 			wg.Add(1)
 			go func() { defer wg.Done(); run.Run(bgCtx) }()
 			wg.Add(1)
-			go func() { defer wg.Done(); eng.Run(bgCtx); pool.Close() }()
+			go func() {
+				defer wg.Done()
+				runEngineOnLeader(bgCtx, eng, leaders, serverHost, members, log)
+				pool.Close()
+			}()
 		})
 		return err
 	}
@@ -303,7 +337,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		go func() {
 			defer wg.Done()
 			serveInternal(bgCtx, internalDeps{addr: cfg.InternalListen, svc: svc, node: node, ring: ring, log: log, started: started,
-				serverHost: serverHost, version: version, dataDir: cfg.DataDir, leaders: leaders, forward: api.ServeForwarded})
+				serverHost: serverHost, version: version, dataDir: cfg.DataDir, leaders: leaders, forward: api.ServeForwarded, receiver: receiver})
 		}()
 	}
 

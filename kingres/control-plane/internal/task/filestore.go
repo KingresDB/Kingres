@@ -149,3 +149,11 @@ func (f *FileStore) RequestCancel(ctx context.Context, id int64, now time.Time) 
 func (f *FileStore) List(ctx context.Context, limit int) ([]Task, error) {
 	return f.inner.List(ctx, limit)
 }
+
+// SetDetail implements DetailStore.
+func (f *FileStore) SetDetail(ctx context.Context, id int64, holder, detail string) error {
+	if err := f.inner.SetDetail(ctx, id, holder, detail); err != nil {
+		return err
+	}
+	return f.save(id) //nolint:contextcheck // saving does not depend on a request
+}

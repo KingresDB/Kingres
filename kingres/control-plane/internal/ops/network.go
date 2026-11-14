@@ -39,6 +39,8 @@ type networkParams struct {
 	TLSRequired bool                    `json:"tlsRequired"`
 	Rules       []api.NetworkAccessRule `json:"rules"`
 	Actor       string                  `json:"actor"`
+	// Servers are the other servers when the task was made.
+	Servers []string `json:"servers,omitempty"`
 }
 
 const maxRules = 1000
@@ -135,7 +137,7 @@ func (o *Ops) PrepareReplaceNetworkAccess(ctx context.Context, actor, clientIP s
 	if cur.Revision != req.Revision {
 		return nil, problem.New(problem.OptimisticLockFail, fmt.Sprintf("The rules changed (revision %d); reload and try again.", cur.Revision))
 	}
-	return networkParams{Revision: req.Revision + 1, TLSRequired: req.TLSRequired, Rules: req.Rules, Actor: actor}, nil
+	return networkParams{Revision: req.Revision + 1, TLSRequired: req.TLSRequired, Rules: req.Rules, Actor: actor, Servers: ids(o.others(ctx))}, nil
 }
 
 func (o *Ops) stepStoreRules(ctx context.Context, env *task.Env) error {
@@ -197,4 +199,12 @@ func (o *Ops) ApplyStoredRules(ctx context.Context) error {
 	o.applyState.applied = cur.Revision
 	o.applyState.mu.Unlock()
 	return nil
+}
+
+func (o *Ops) stepApplyOn(ctx context.Context, env *task.Env, server string) error {
+	p, err := inputOf[networkParams](env.Task)
+	if err != nil {
+		return err
+	}
+	return o.Fanout.Apply(ctx, server, ApplyNetwork, networkApply{Rules: p.Rules, TLSRequired: p.TLSRequired})
 }
