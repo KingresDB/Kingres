@@ -24,6 +24,9 @@ An ADR records one decision: the context, the decision, its consequences and the
 | [0015](0015-panel-accounts-are-postgresql-roles.md) | Panel accounts are PostgreSQL roles | Accepted | 2026-11-14 | 10 |
 | [0016](0016-go-backend-react-frontend-openapi-first.md) | Go backend and React/TypeScript frontend, OpenAPI first | Accepted; frontend framework superseded by 0017 | 2026-11-14 | - |
 | [0017](0017-vue-for-the-web-panel.md) | Vue for the web panel | Accepted | 2026-11-14 | Supersedes part of 0016 |
+| [0018](0018-manager-leader-follows-the-map-group-primary.md) | The manager leader is the server of the map group primary | Accepted | 2026-11-14 | - |
+| [0019](0019-cluster-state-in-a-system-database.md) | Control-plane state lives in a system database with embedded migrations | Accepted | 2026-11-14 | - |
+| [0020](0020-no-bundled-metrics-store.md) | No bundled metrics store; kingresd samples and exports metrics itself | Accepted | 2026-11-14 | - |
 
 "Open decision #" refers to the table "Open decisions" in architecture.md.
 
