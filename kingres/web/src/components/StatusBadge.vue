@@ -1,0 +1,15 @@
+<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
+<script setup lang="ts">
+// A status is always shown as icon + text, never as colour alone.
+import type { StatusMeta } from '@/lib/status'
+
+defineProps<{ meta: StatusMeta; label?: string }>()
+</script>
+
+<template>
+  <span class="badge" :class="`tone-${meta.tone}`" :data-tone="meta.tone">
+    <span aria-hidden="true">{{ meta.icon }}</span>
+    <span>{{ label ?? meta.label }}</span>
+  </span>
+</template>
