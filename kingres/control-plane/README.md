@@ -166,7 +166,7 @@ paths). "Real" means the operation works against PostgreSQL or the local node
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **52 of 86 operations are real; 34
+authenticated operation lists in 0.2.0. **63 of 86 operations are real; 23
 answer "not yet".**
 
 | Tag | Real | Not yet |
@@ -174,7 +174,7 @@ answer "not yet".**
 | Health | `getHealth`, `getReadiness` | |
 | Auth | `login`, `logout`, `getSession` | |
 | Setup | `getNodeState` (with `setupTask`), `checkSetupToken`, `initCluster` | `joinCluster` |
-| This server | `listThisServerInstances`, `getThisServerInstance` (from `kingres.node`) | `getThisServer`, `getThisServerResources`, instance `start`/`stop`/`restart`, local settings, `leaveCluster`, local logs |
+| This server | `listThisServerInstances`, `getThisServerInstance`, `getThisServer`, `getThisServerResources`, `listThisServerLogs`, `restartThisServerInstance` | `getThisServer`, `getThisServerResources`, instance `start`/`stop`/`restart`, local settings, `leaveCluster`, local logs |
 | Cluster | `getCluster`, `getClusterSummary` | |
 | Servers | `listServers`, `getServer` | `addServer`, `updateServer`, `removeServer`, `failoverServer` |
 | Server groups | `listServerGroups` | `createServerGroup`, `deleteServerGroup` |
@@ -189,11 +189,11 @@ answer "not yet".**
 | Network access | `getNetworkAccess`, `replaceNetworkAccess` | |
 | Audit | `listAuditEvents` | |
 | Settings | `getClusterSettings` | `updateClusterSettings` |
-| Ledger | `listLedgerStatus`, `getLedgerStatus`, `listLedgerBlocks` | digests (list, generate), verifications (list, start, get), `createInclusionProof` (need `kingres_ledger` 0.2; not written yet) |
+| Ledger | `listLedgerStatus`, `getLedgerStatus`, `listLedgerBlocks`, `listLedgerDigests`, `generateLedgerDigest`, `startLedgerVerification` | `listLedgerVerifications`, `getLedgerVerification`, `createInclusionProof` |
 | Query | `executeQuery` | |
-| Alerts | | both operations |
-| Logs | | `listLogs` |
-| Metrics | | `queryMetrics` |
+| Alerts | `listAlerts`, `acknowledgeAlert` | |
+| Logs | `listLogs`, `listThisServerLogs` (the local instance log only) | |
+| Metrics | `queryMetrics`, and `/metrics` in the Prometheus text format (outside the contract) | |
 
 ### How the catalog maps to the contract
 
@@ -383,6 +383,48 @@ password, the map starts empty at every start, and the connections are ordinary 
    `kingres_ledger.so` exist in `pg_config --pkglibdir`; a plain PostgreSQL is refused.
 10. **Setup from remote addresses** is controlled by `allow-remote-setup` (default false), no longer by the listen
     address: the setup operations are accepted only from loopback callers unless it is true (containers).
+
+## Ledger, alerts, metrics, this server (second part of the increment)
+
+**Ledger on kingres_ledger 0.2.** kingresd uses the service role (a superuser) for every ledger function and for reading
+the records: the functions are not executable and `ledger_digest`, `ledger_verification` and the status view are not
+readable by PUBLIC, and granting them to the panel's roles would let those roles write or read the chain. Nothing is
+granted at database creation; the cluster-role check (`kingres_ops` for digests and verifications) decides who asks.
+Detection is by object: a database whose extension is still 0.1 has no `ledger_digest`/`ledger_verification`, so
+generating a digest and starting a verification answer 422 `unsupported_operation` (naming `ALTER EXTENSION ... UPDATE`),
+the digest list is empty and the verification fields of the status stay null; after the upgrade the same database
+works (tested). `ledger_status` supplies the table counts and the last verification. History tables of updatable
+tables are not listed as tables; the table shows `ledger.historyTable`. A verification runs `ledger_verify_recorded`
+as a task (scope `full` or since the last clean one; verification against a given digest is not supported yet).
+**Not done:** `listLedgerVerifications`, `getLedgerVerification` (the contract requires a `taskId` the extension does
+not record) and `createInclusionProof` (the proof JSON of the extension carries no leaf hash and no left/right
+positions, which the contract requires; both would have to be derived or the contract changed).
+The task subject of a verification is the database name, because the verification id exists only after the run.
+
+**Alerts** (kinds of the contract): `serverDown` (the instance is not running; since nothing can be stored while it is
+down, the outage is recorded as a resolved alert when the instance is back), `diskSpaceLow` (90% warning, 95% critical),
+`memoryPressure` (under 10% available), `replicationLagHigh` (over 60 s). Every 10 s; an alert is raised once per kind
+and server, cleared when the reading is fine again, and a value that could not be measured neither raises nor clears.
+Not covered because the contract has no alert kind for them: ledger verification problems, pending ledger transactions
+too old, and `version()` not containing "KingresDB" (the latter is logged as an error). Listing needs `kingres_readonly`,
+acknowledging `kingres_ops`.
+
+**Metrics**: a sampler (every 10 s) fills a bounded in-memory ring (1440 points per series, 2000 series): connections,
+CPU, memory and disk of the server, replication lag, and per database size and transactions per second.
+`GET /metrics/query` resamples it (average per step, at most 5000 points, 422 beyond). `queriesPerSecond` and
+`bucketsUnderReplicated` have no samples yet (empty series). `GET /metrics` (Prometheus text) **requires
+authentication**: a bearer token of a session with `kingres_stats` or better, or the scrape token `metrics-token`
+(`KINGRES_METRICS_TOKEN`); without either it answers 401. It is outside the contract.
+
+**This server**: info, resources (Linux `/proc` and `statfs`; elsewhere every value except the CPU count is null) and the
+instance log (the directory comes from the configuration; entries are parsed from at most the last 1 MiB of at most 8
+`postgresql-*.log` files; no path is taken from a request). Only `restartThisServerInstance` is offered: start and stop
+would stop the instance that holds the control plane's own state (the task row, the sign-in), so they stay "not supported
+yet". A task step that writes to the instance it restarts retries for 30 s.
+
+**Not done in this part:** `updateClusterSettings`, server groups (create, delete, assign): the groups live in the shard
+catalog (`kingres.node.server_group`) and changing them needs a catalog function this version does not have; the
+local settings; `leaveCluster`.
 
 ## Verification of this increment
 

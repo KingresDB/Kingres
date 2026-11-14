@@ -67,6 +67,37 @@ func (s *Store) ledgerStatus(ctx context.Context, h *dbHandle) (api.LedgerStatus
 	case !isNoRows(err):
 		return st, s.wrap("reading kingres.ledger_blocks", err)
 	}
+	// kingres_ledger 0.2 records verifications and has the status view; 0.1
+	// has neither, and the verification fields then stay null ("not available").
+	if has, err := s.regclassExists(ctx, h.pool, "kingres.ledger_status"); err != nil {
+		return st, err
+	} else if has {
+		var at *time.Time
+		var state *string
+		var tables int
+		err := h.pool.QueryRow(ctx, `SELECT append_only_tables + updatable_tables, last_verification_at, last_verification_state
+			FROM kingres.ledger_status`).Scan(&tables, &at, &state)
+		if err != nil {
+			return st, s.wrap("reading kingres.ledger_status", err)
+		}
+		st.LedgerTableCount = &tables
+		never := "never"
+		vs := &never
+		if state != nil {
+			m := "failed"
+			if *state == "clean" {
+				m = "passed"
+			}
+			vs = &m
+			u := at.UTC()
+			st.LastVerifiedAt = &u
+			var to *int64
+			if err := h.pool.QueryRow(ctx, "SELECT max(to_height) FROM kingres.ledger_verification WHERE state = 'clean'").Scan(&to); err == nil {
+				chain.LastVerifiedBlockHeight = to
+			}
+		}
+		st.VerificationState, chain.VerificationState = vs, vs
+	}
 	st.Chains = append(st.Chains, chain)
 	return st, nil
 }

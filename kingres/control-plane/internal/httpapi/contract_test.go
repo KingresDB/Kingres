@@ -232,6 +232,10 @@ func TestResponsesValidateAgainstContract(t *testing.T) {
 		{"getNodeState", "/api/v1/setup/state"},
 		{"getSession", "/api/v1/auth/session"},
 		{"getCluster", "/api/v1/cluster"},
+		{"getThisServer", "/api/v1/this-server"},
+		{"getThisServerResources", "/api/v1/this-server/resources"},
+		{"listThisServerLogs", "/api/v1/this-server/logs"},
+		{"listLogs", "/api/v1/logs"},
 		{"getClusterSummary", "/api/v1/cluster/summary"},
 		{"listServers", "/api/v1/servers"},
 		{"getServer", "/api/v1/servers/10.0.0.1"},
@@ -269,6 +273,10 @@ func TestResponsesValidateAgainstContract(t *testing.T) {
 		}
 	}
 	mutating["initCluster"] = true
+	// Alerts and metrics need the system database and the sampler.
+	for id := range s2(e) {
+		mutating[id] = true
+	}
 	covered := map[string]bool{}
 	for _, c := range calls {
 		covered[c.op] = true
@@ -423,3 +431,5 @@ func TestFilterEnumsMatchTheContract(t *testing.T) {
 		wantProblem(t, e.do(req{method: "GET", path: c.path + "?" + c.param + "=notAValue", bearer: tok}), 400, "validation_failed")
 	}
 }
+
+func s2(e *env) map[string]handlerFunc { return e.srv.monitorHandlers() }

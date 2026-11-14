@@ -23,7 +23,7 @@ func TestGeneratedTableIsCurrent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := os.ReadFile("operations_gen.go")
+	got, err := os.ReadFile(generatedFile())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,4 +96,14 @@ func contractFile() string {
 		return p
 	}
 	return specPath
+}
+
+// generatedFile is the checked-in operation table. The WSL runner, which runs
+// test binaries away from the source tree, copies it and sets
+// KINGRES_OPERATIONS_GEN; a missing file is a failure, never a skip.
+func generatedFile() string {
+	if p := os.Getenv("KINGRES_OPERATIONS_GEN"); p != "" {
+		return p
+	}
+	return "operations_gen.go"
 }

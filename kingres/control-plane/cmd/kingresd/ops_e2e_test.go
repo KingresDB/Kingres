@@ -54,10 +54,12 @@ func (e *cp) waitTask(t testing.TB, task map[string]any) map[string]any {
 	id := fmt.Sprint(int64(task["id"].(float64)))
 	deadline := time.Now().Add(3 * time.Minute)
 	for {
-		_, cur, _ := e.call("GET", "/tasks/"+id, nil, nil)
-		validTask(t, cur)
-		if s := cur["state"]; s == "done" || s == "failed" {
-			return cur
+		st, cur, _ := e.call("GET", "/tasks/"+id, nil, nil)
+		if st != 503 { // 503: the instance is restarting under the task
+			validTask(t, cur)
+			if s := cur["state"]; s == "done" || s == "failed" {
+				return cur
+			}
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("task %s did not finish: %v", id, cur)

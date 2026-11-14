@@ -7,10 +7,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pgtest"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/auth"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/store/pgstore"
@@ -18,14 +19,14 @@ import (
 
 // Full-stack tests: the real PostgreSQL store and the real PostgreSQL
 // authenticator against the fixture instance (scripts/). They run only when
-// KINGRES_TEST_DSN is set.
+// KINGRES_PG_BIN is set (pgtest builds the fixture).
 
 func newIntegrationEnv(t *testing.T) *env {
 	t.Helper()
-	dsn := os.Getenv("KINGRES_TEST_DSN")
-	if dsn == "" {
-		t.Skip("KINGRES_TEST_DSN is not set; skipping the PostgreSQL integration test")
+	if !pgtest.Available() {
+		t.Skip("KINGRES_PG_BIN is not set; skipping the PostgreSQL integration test")
 	}
+	dsn := pgtest.Fixture(t)
 	pg, err := pgstore.New(pgstore.Options{
 		DSN: dsn, Logger: slog.New(slog.DiscardHandler), PanelPort: "8091", Version: "test",
 		Started: time.Now(),

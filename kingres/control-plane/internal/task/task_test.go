@@ -48,7 +48,7 @@ func defn(c *counter, names ...string) task.Definition {
 
 func engine(t *testing.T, st task.Store, holder string, clk *clock, d ...task.Definition) *task.Engine {
 	t.Helper()
-	e, err := task.NewEngine(st, d, task.Options{Holder: holder, Lease: 30 * time.Second, Now: clk.Now})
+	e, err := task.NewEngine(st, d, task.Options{Holder: holder, Lease: 30 * time.Second, Now: clk.Now, StoreTries: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -187,6 +187,7 @@ type Engine struct {
 	poll   time.Duration
 	now    func() time.Time
 	log    *slog.Logger
+	tries  int
 }
 
 // Options configure an Engine.
@@ -199,14 +200,20 @@ type Options struct {
 	// Now is the clock (default time.Now).
 	Now    func() time.Time
 	Logger *slog.Logger
+	// StoreTries is how many times a store write is tried, one second apart
+	// (default 30).
+	StoreTries int
 }
 
 // NewEngine builds an engine. Definitions must have at least one step each.
 func NewEngine(s Store, defs []Definition, o Options) (*Engine, error) {
 	e := &Engine{store: s, defs: map[string]Definition{}, holder: o.Holder, lease: o.Lease, poll: o.Poll,
-		now: o.Now, log: o.Logger}
+		now: o.Now, log: o.Logger, tries: o.StoreTries}
 	if e.holder == "" {
 		return nil, errors.New("task: a holder id is required")
+	}
+	if e.tries == 0 {
+		e.tries = 30
 	}
 	if e.lease == 0 {
 		e.lease = 30 * time.Second
@@ -330,7 +337,7 @@ func (e *Engine) run(ctx context.Context, t Task, secrets map[string]string) err
 					Message: "The step needs a secret that is only available to the request that started the task."})
 			}
 		}
-		if cancelReq, err := e.store.SetStep(ctx, t.ID, e.holder, i, StepRunning, percent(i, len(def.Steps)), e.now()); err != nil {
+		if cancelReq, err := e.setStep(ctx, t.ID, e.holder, i, StepRunning, percent(i, len(def.Steps)), e.now()); err != nil {
 			return err
 		} else if cancelReq {
 			return e.cancelTask(ctx, t, def, i)
@@ -344,7 +351,7 @@ func (e *Engine) run(ctx context.Context, t Task, secrets map[string]string) err
 			}
 			return e.fail(ctx, t, i, st, &Error{Code: CodeStepFailed, Step: st.Name, Retryable: true, Message: clip(err.Error())})
 		}
-		cancelReq, err := e.store.SetStep(ctx, t.ID, e.holder, i, StepDone, percent(i+1, len(def.Steps)), e.now())
+		cancelReq, err := e.setStep(ctx, t.ID, e.holder, i, StepDone, percent(i+1, len(def.Steps)), e.now())
 		if err != nil {
 			return err
 		}
@@ -391,7 +398,7 @@ func (e *Engine) cancelTask(ctx context.Context, t Task, def Definition, next in
 
 func (e *Engine) fail(ctx context.Context, t Task, i int, st Step, te *Error) error {
 	if i < len(t.Steps) {
-		if _, err := e.store.SetStep(ctx, t.ID, e.holder, i, StepFailed, percent(i, len(t.Steps)), e.now()); err != nil {
+		if _, err := e.setStep(ctx, t.ID, e.holder, i, StepFailed, percent(i, len(t.Steps)), e.now()); err != nil {
 			e.log.Error("recording failed step", "task", t.ID, "error", err)
 		}
 	}
@@ -400,7 +407,37 @@ func (e *Engine) fail(ctx context.Context, t Task, i int, st Step, te *Error) er
 }
 
 func (e *Engine) finish(ctx context.Context, t Task, s State, te *Error) error {
-	return e.store.Finish(context.WithoutCancel(ctx), t.ID, e.holder, s, te, e.now())
+	c := context.WithoutCancel(ctx)
+	return e.retry(c, func() error { return e.store.Finish(c, t.ID, e.holder, s, te, e.now()) })
+}
+
+// setStep records a step state, retrying while the store is briefly
+// unavailable (a task may restart the very instance that holds its row).
+func (e *Engine) setStep(ctx context.Context, id int64, holder string, i int, state string, pct float64, now time.Time) (bool, error) {
+	var cancel bool
+	err := e.retry(ctx, func() error {
+		var err error
+		cancel, err = e.store.SetStep(ctx, id, holder, i, state, pct, now)
+		return err
+	})
+	return cancel, err
+}
+
+// retry runs f again for a few seconds unless the error says the lease or the
+// task is gone.
+func (e *Engine) retry(ctx context.Context, f func() error) error {
+	var err error
+	for attempt := 0; attempt < e.tries; attempt++ {
+		if err = f(); err == nil || errors.Is(err, ErrLeaseLost) || errors.Is(err, ErrNotFound) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(time.Second):
+		}
+	}
+	return err
 }
 
 func percent(done, total int) float64 { return float64(done) * 100 / float64(total) }

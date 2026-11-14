@@ -21,6 +21,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/audit"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/auth"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/contract"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/monitor"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ops"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/setup"
@@ -52,6 +53,14 @@ type Deps struct {
 	// DataDir is the configured data directory of kingresd (validated against
 	// the request of initCluster).
 	DataDir string
+	// Started is the process start time; LogDir is the instance log directory
+	// (from the configuration, never from a request).
+	Started time.Time
+	LogDir  string
+	// Metrics is the sampler ring (nil: no metrics); MetricsToken is the
+	// optional scrape token of /metrics (empty: only stats-role bearer tokens).
+	Metrics      *monitor.Ring
+	MetricsToken string
 	// Web serves the panel at "/" (static files with SPA fallback); when nil
 	// unknown non-API paths answer with the 404 problem.
 	Web http.Handler
@@ -162,6 +171,7 @@ func build(d Deps, registry func(*Server) map[string]handlerFunc) (*Server, erro
 	for _, p := range paths {
 		mux.Handle(contract.BasePath+p, s.methodMux(byPath[p]))
 	}
+	mux.HandleFunc("/metrics", s.metricsEndpoint)
 	// Everything else below /api is an unknown route.
 	mux.HandleFunc("/api", s.notFoundRoute)
 	mux.HandleFunc("/api/", s.notFoundRoute)

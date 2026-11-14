@@ -45,6 +45,7 @@ type cp struct {
 	root    string
 	token   string // bearer token of the administrator
 	client  *http.Client
+	args    []string
 }
 
 var (
@@ -81,6 +82,7 @@ func newServer(t testing.TB) *cp {
 	e.cancel = cancel
 	args := []string{"-listen", "127.0.0.1:0", "-data-dir", e.dataDir, "-log-format", "json",
 		"-login-rate-limit", "1000", "-pg-bin-dir", pgtest.BinDir(), "-pg-port", fmt.Sprint(e.pgPort), "-server-host", "127.0.0.1"}
+	e.args = args
 	go func() { e.done <- run(ctx, args, noEnv, e.logs, ready) }()
 	select {
 	case addr := <-ready:
@@ -356,4 +358,36 @@ func tail(s string, n int) string {
 		return s[len(s)-n:]
 	}
 	return s
+}
+
+// stopManager stops kingresd only; the PostgreSQL instance keeps running.
+func (e *cp) stopManager(t testing.TB) {
+	t.Helper()
+	e.cancel()
+	select {
+	case err := <-e.done:
+		if err != nil {
+			t.Fatalf("kingresd stopped with an error: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("kingresd did not stop")
+	}
+}
+
+// startManager starts kingresd again on the same data directory.
+func (e *cp) startManager(t testing.TB) {
+	t.Helper()
+	ready := make(chan string, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	e.cancel = cancel
+	e.done = make(chan error, 1)
+	go func() { e.done <- run(ctx, e.args, noEnv, e.logs, ready) }()
+	select {
+	case addr := <-ready:
+		e.base = "http://" + addr + "/api/v1"
+	case err := <-e.done:
+		t.Fatalf("kingresd exited early: %v\n%s", err, tail(e.logs.String(), 3000))
+	case <-time.After(60 * time.Second):
+		t.Fatal("kingresd did not start")
+	}
 }

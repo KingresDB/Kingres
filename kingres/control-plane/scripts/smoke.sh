@@ -28,7 +28,14 @@ curl -s $API/databases/shop/schemas/public/tables/orders -H "$A" | grep -o '"cla
 echo "== enable ledger"; j -X PUT $API/databases/shop/schemas/public/tables/audit_rows/ledger -H "$A" -d '{"mode":"appendOnly"}' | grep -o '"ledger":{[^}]*}'
 echo "== insert with psql"; PGPASSWORD='Smoke-Passw0rd-1' "$INST/bin/psql" -X -h 127.0.0.1 -p 56150 -U root_admin -d shop -c "insert into public.audit_rows values (1, 'first')"
 echo "== workbench"; q "select id, note from public.audit_rows"
-echo "== digest (needs kingres_ledger 0.2)"; j -X POST $API/databases/shop/ledger/digests -H "$A" | cut -c1-220
-"$KD" -pg-bin-dir "$INST/bin" -data-dir "$D/data" -stop-instances 2>/dev/null
+echo "== digest"; j -X POST $API/databases/shop/ledger/digests -H "$A" | cut -c1-260
+echo "== digests"; j $API/databases/shop/ledger/digests -H "$A" | cut -c1-120
+echo "== verification (task)"; j -X POST $API/databases/shop/ledger/verifications -H "$A" -d '{"scope":"full"}' | cut -c1-110; sleep 2
+echo "== ledger status"; curl -s $API/databases/shop/ledger -H "$A" | grep -o '"verificationState":"[a-z]*"|"ledgerTableCount":[0-9]*|"lastVerifiedAt":"[^"]*"' | tr '
+' ' '; echo
+echo "== inclusion proof (not implemented)"; j -X POST $API/databases/shop/ledger/inclusion-proofs -H "$A" -d '{"schema":"public","table":"audit_rows","primaryKey":{"id":1}}' | cut -c1-150
+echo "== this server / resources / logs"; curl -s $API/this-server -H "$A" | cut -c1-200; echo; curl -s "$API/this-server/logs?limit=2" -H "$A" | cut -c1-260; echo
+echo "== metrics (Prometheus, needs a token)"; curl -s -o /dev/null -w "no token: %{http_code}
+" http://127.0.0.1:56151/metrics; sleep 12; curl -s http://127.0.0.1:56151/metrics -H "$A" | head -4
 kill $KPID; wait $KPID 2>/dev/null
 "$INST/bin/pg_ctl" -D "$D/data/instances/1/pgdata" -m immediate stop >/dev/null 2>&1; rm -rf "$D"

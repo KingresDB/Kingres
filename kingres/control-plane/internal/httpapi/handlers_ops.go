@@ -24,24 +24,28 @@ type RoleConnector interface {
 // opsHandlers are the operations of package ops.
 func (s *Server) opsHandlers() map[string]handlerFunc {
 	return map[string]handlerFunc{
-		"createRole":           s.createRole,
-		"updateRole":           s.updateRole,
-		"deleteRole":           s.deleteRole,
-		"setRoleMemberships":   s.setRoleMemberships,
-		"setRoleClusterRoles":  s.setRoleClusterRoles,
-		"createGrant":          s.createGrant,
-		"revokeGrants":         s.revokeGrants,
-		"applyGrantTemplate":   s.applyGrantTemplate,
-		"getNetworkAccess":     s.getNetworkAccess,
-		"replaceNetworkAccess": s.replaceNetworkAccess,
-		"createDatabase":       s.createDatabase,
-		"updateDatabase":       s.updateDatabase,
-		"dropDatabase":         s.dropDatabase,
-		"distributeTable":      s.distributeTable,
-		"enableTableLedger":    s.enableTableLedger,
-		"executeQuery":         s.executeQuery,
-		"cancelTask":           s.cancelTask,
-		"getClusterSummary":    s.getClusterSummary,
+		"createRole":                s.createRole,
+		"updateRole":                s.updateRole,
+		"deleteRole":                s.deleteRole,
+		"setRoleMemberships":        s.setRoleMemberships,
+		"setRoleClusterRoles":       s.setRoleClusterRoles,
+		"createGrant":               s.createGrant,
+		"revokeGrants":              s.revokeGrants,
+		"applyGrantTemplate":        s.applyGrantTemplate,
+		"getNetworkAccess":          s.getNetworkAccess,
+		"replaceNetworkAccess":      s.replaceNetworkAccess,
+		"createDatabase":            s.createDatabase,
+		"updateDatabase":            s.updateDatabase,
+		"dropDatabase":              s.dropDatabase,
+		"distributeTable":           s.distributeTable,
+		"enableTableLedger":         s.enableTableLedger,
+		"executeQuery":              s.executeQuery,
+		"cancelTask":                s.cancelTask,
+		"restartThisServerInstance": s.restartThisServerInstance,
+		"getClusterSummary":         s.getClusterSummary,
+		"listLedgerDigests":         s.listLedgerDigests,
+		"generateLedgerDigest":      s.generateLedgerDigest,
+		"startLedgerVerification":   s.startLedgerVerification,
 	}
 }
 
@@ -480,5 +484,98 @@ func (s *Server) getClusterSummary(_ *call, w http.ResponseWriter, r *http.Reque
 		"clusterId": optStr(snap.ClusterID), "name": optStr(snap.ClusterName), "health": sum.Health,
 		"serverCount": servers, "databaseCount": sum.DatabaseCount, "openAlerts": 0,
 	})
+	return nil
+}
+
+func (s *Server) listLedgerDigests(_ *call, w http.ResponseWriter, r *http.Request) error {
+	o, err := s.needOps()
+	if err != nil {
+		return err
+	}
+	pp := newParams(r)
+	db := pp.pathName("databaseName")
+	page := pp.page()
+	if p := pp.err(); p != nil {
+		return p
+	}
+	out, err := o.ListDigests(r.Context(), db, page)
+	if err != nil {
+		return err
+	}
+	s.writeJSON(w, r, http.StatusOK, out)
+	return nil
+}
+
+func (s *Server) generateLedgerDigest(_ *call, w http.ResponseWriter, r *http.Request) error {
+	o, err := s.needOps()
+	if err != nil {
+		return err
+	}
+	pp := newParams(r)
+	db := pp.pathName("databaseName")
+	if p := pp.err(); p != nil {
+		return p
+	}
+	d, err := o.GenerateDigest(r.Context(), db)
+	if err != nil {
+		return err
+	}
+	s.writeJSON(w, r, http.StatusCreated, d)
+	return nil
+}
+
+func (s *Server) startLedgerVerification(c *call, w http.ResponseWriter, r *http.Request) error {
+	o, err := s.needOps()
+	if err != nil {
+		return err
+	}
+	pp := newParams(r)
+	db := pp.pathName("databaseName")
+	if p := pp.err(); p != nil {
+		return p
+	}
+	var req api.LedgerVerifyRequest
+	if r.ContentLength != 0 {
+		if err := s.body(w, r, &req); err != nil {
+			return err
+		}
+	}
+	in, err := o.PrepareVerification(r.Context(), db, req)
+	if err != nil {
+		return err
+	}
+	// The verification record has no id until the run ends, so the task's
+	// subject is the database (a deviation from the contract table; see the
+	// README).
+	t, err := o.StartTask(r.Context(), ops.KindLedgerVerify, "ledgerVerification", db, in, c.session.Username)
+	if err != nil {
+		return s.taskProblem(r, err)
+	}
+	s.accepted(w, r, t)
+	return nil
+}
+
+// restartThisServerInstance restarts the local instance as a task. Start and stop
+// are not offered: in a one-server cluster the instance holds the control
+// plane's own state (tasks, sessions need it to sign in), so a stopped
+// instance could neither record the task nor sign anyone in to start it.
+func (s *Server) restartThisServerInstance(c *call, w http.ResponseWriter, r *http.Request) error {
+	o, err := s.needOps()
+	if err != nil {
+		return err
+	}
+	pp := newParams(r)
+	id := pp.pathName("instanceId")
+	if p := pp.err(); p != nil {
+		return p
+	}
+	if id != "1" {
+		return problem.New(problem.NotFound, "No such instance on this server.")
+	}
+	t, err := o.StartTask(r.Context(), ops.KindInstanceRestart, "instance", id, map[string]string{"instanceId": id}, c.session.Username)
+	if err != nil {
+		return s.taskProblem(r, err)
+	}
+	s.accepted(w, r, t)
 	return nil
 }

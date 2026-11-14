@@ -21,6 +21,7 @@ import (
 
 // Task kinds of this package.
 const (
+	KindInstanceRestart = "instance.restart"
 	KindDatabaseCreate  = "database.create"
 	KindDatabaseDrop    = "database.drop"
 	KindTableDistribute = "table.distribute"
@@ -67,6 +68,14 @@ func (o *Ops) Definitions() []task.Definition {
 		}},
 		{Kind: KindTableDistribute, Steps: []task.Step{
 			{Name: "Distribute the table", Irreversible: true, Run: o.stepDistribute},
+		}},
+		{Kind: KindLedgerVerify, Steps: []task.Step{
+			{Name: "Verify the ledger", Run: o.stepVerifyLedger},
+		}},
+		{Kind: KindInstanceRestart, Steps: []task.Step{
+			{Name: "Restart the instance", Run: func(ctx context.Context, _ *task.Env) error {
+				return o.Instances.Restart(ctx, 1)
+			}},
 		}},
 		{Kind: KindNetworkApply, Steps: []task.Step{
 			{Name: "Store the rules", Run: o.stepStoreRules},

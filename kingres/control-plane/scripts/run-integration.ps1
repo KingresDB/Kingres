@@ -44,11 +44,13 @@ try {
     # Fixtures and the contract the tests read.
     New-Item -ItemType Directory (Join-Path $stage 'fixtures') | Out-Null
     Copy-Item (Join-Path $PSScriptRoot 'fixture_*.sql') (Join-Path $stage 'fixtures')
+    Copy-Item (Join-Path $module 'internal/contract/operations_gen.go') (Join-Path $stage 'operations_gen.go.txt')
+    Copy-Item (Join-Path $PSScriptRoot 'wsl-allowed-skips.txt') (Join-Path $stage 'wsl-allowed-skips.txt')
     Copy-Item (Join-Path (Split-Path $module -Parent) 'api/openapi.yaml') (Join-Path $stage 'openapi.yaml')
     # Copy into WSL so that the binaries run from the native file system.
     $wslStage = ConvertTo-WslPath $stage
     $wslScript = ConvertTo-WslPath (Join-Path $PSScriptRoot 'run-wsl-tests.sh')
-    & wsl.exe -d $Distro -u $WslUser bash -c "rm -rf ~/kw-cp/test/bin && mkdir -p ~/kw-cp/test/bin && cp '$wslStage'/*.test '$wslStage'/openapi.yaml ~/kw-cp/test/bin/ && cp -r '$wslStage'/fixtures ~/kw-cp/test/bin/ && chmod +x ~/kw-cp/test/bin/*.test"
+    & wsl.exe -d $Distro -u $WslUser bash -c "rm -rf ~/kw-cp/test/bin && mkdir -p ~/kw-cp/test/bin && cp '$wslStage'/*.test '$wslStage'/openapi.yaml '$wslStage'/operations_gen.go.txt '$wslStage'/wsl-allowed-skips.txt ~/kw-cp/test/bin/ && cp -r '$wslStage'/fixtures ~/kw-cp/test/bin/ && chmod +x ~/kw-cp/test/bin/*.test"
     $bins = ($names | ForEach-Object { "`$HOME/kw-cp/test/bin/$_.test" }) -join ' '
     $extra = ''
     if ($Run) { $extra = "-- -test.run '$Run'" }

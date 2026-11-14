@@ -13,7 +13,7 @@ import (
 
 // tableQuery builds the table listing query for the catalog objects that
 // exist in the database. Missing kingres tables contribute NULL columns.
-func tableQuery(hasShard, hasLedger bool) string {
+func tableQuery(hasShard, hasLedger, hasUpdatable bool) string {
 	dist := "NULL::text, NULL::text, NULL::int, NULL::int"
 	distJoin := ""
 	if hasShard {
@@ -21,11 +21,17 @@ func tableQuery(hasShard, hasLedger bool) string {
 		distJoin = `LEFT JOIN kingres.dist_table dt ON dt.relid::oid = c.oid
 		LEFT JOIN kingres.colocation co ON co.colocation_id = dt.colocation_id`
 	}
-	ledger := "false"
-	ledgerJoin := ""
+	ledger := "false, NULL::text, NULL::text"
+	ledgerJoin, hideHistory := "", ""
 	if hasLedger {
-		ledger = "(lt.table_id IS NOT NULL)"
+		ledger = "(lt.table_id IS NOT NULL), lt.mode, NULL::text"
 		ledgerJoin = "LEFT JOIN kingres.ledger_table lt ON lt.relid::oid = c.oid"
+	}
+	if hasUpdatable {
+		// 0.2: the registry has history_relid; history tables are an attribute of
+		// their table, not tables of the user.
+		ledger = "(lt.table_id IS NOT NULL), lt.mode, (SELECT hc.relname::text FROM pg_class hc WHERE hc.oid = lt.history_relid::oid)"
+		hideHistory = "AND NOT EXISTS (SELECT 1 FROM kingres.ledger_table hl WHERE hl.history_relid::oid = c.oid)"
 	}
 	return `SELECT n.nspname, c.relname,
 	-- pg_partition_tree returns no rows for a table that is not partitioned.
@@ -45,6 +51,7 @@ FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE c.relkind IN ('r', 'p') AND NOT c.relispartition
   AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'kingres', 'kingres_cp')
   AND n.nspname !~ '^pg_(toast|temp)'
+  ` + hideHistory + `
   AND ($1 = '' OR n.nspname = $1) AND ($2 = '' OR c.relname = $2)
 ORDER BY n.nspname, c.relname`
 }
@@ -73,8 +80,14 @@ func (s *Store) readTables(ctx context.Context, h *dbHandle, schema, name string
 	if err != nil {
 		return nil, err
 	}
+	hasUpdatable := false
+	if hasLedger {
+		if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'kingres.ledger_table'::regclass AND attname = 'history_relid' AND NOT attisdropped)`).Scan(&hasUpdatable); err != nil {
+			return nil, s.wrap("checking the ledger version", err)
+		}
+	}
 	home := s.localGroup(ctx, h)
-	rows, err := h.pool.Query(ctx, tableQuery(hasShard, hasLedger), schema, name)
+	rows, err := h.pool.Query(ctx, tableQuery(hasShard, hasLedger, hasUpdatable), schema, name)
 	if err != nil {
 		return nil, s.wrap("listing tables", err)
 	}
@@ -84,8 +97,9 @@ func (s *Store) readTables(ctx context.Context, h *dbHandle, schema, name string
 			method, column     *string
 			colocation, bucket *int32
 			isLedger           bool
+			lmode, lhistory    *string
 		)
-		if err := r.Scan(&t.Schema, &t.Name, &t.EstimatedRows, &t.SizeBytes, &method, &column, &colocation, &bucket, &isLedger); err != nil {
+		if err := r.Scan(&t.Schema, &t.Name, &t.EstimatedRows, &t.SizeBytes, &method, &column, &colocation, &bucket, &isLedger, &lmode, &lhistory); err != nil {
 			return t, s.wrap("scanning tables", err)
 		}
 		t.Classes = []string{"plain"}
@@ -112,7 +126,10 @@ func (s *Store) readTables(ctx context.Context, h *dbHandle, schema, name string
 		}
 		if isLedger {
 			t.Classes = append(t.Classes, "ledger")
-			t.Ledger = &api.TableLedger{Mode: "appendOnly"}
+			t.Ledger = &api.TableLedger{Mode: "appendOnly", HistoryTable: lhistory}
+			if lmode != nil && *lmode == "updatable" {
+				t.Ledger.Mode = "updatable"
+			}
 		}
 		return t, nil
 	})

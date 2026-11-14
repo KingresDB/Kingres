@@ -6,22 +6,23 @@ import (
 	"context"
 	"errors"
 	"net/url"
-	"os"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pgtest"
 )
 
 // Integration tests against the fixture instance (see scripts/); they run
-// only when KINGRES_TEST_DSN is set.
+// only when KINGRES_PG_BIN is set (pgtest builds the fixture).
 
 func testDSN(t *testing.T) string {
 	t.Helper()
-	dsn := os.Getenv("KINGRES_TEST_DSN")
-	if dsn == "" {
-		t.Skip("KINGRES_TEST_DSN is not set; skipping the PostgreSQL integration test")
+	if !pgtest.Available() {
+		t.Skip("KINGRES_PG_BIN is not set; skipping the PostgreSQL integration test")
 	}
+	dsn := pgtest.Fixture(t)
 	return dsn
 }
 

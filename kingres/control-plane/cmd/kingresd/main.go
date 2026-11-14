@@ -14,10 +14,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/audit"
@@ -25,6 +27,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/cluster"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/config"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/httpapi"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/monitor"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ops"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sdnotify"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/setup"
@@ -170,17 +173,20 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	}
 
 	var opsSvc *ops.Ops
+	var ring *monitor.Ring
 	var proxy *cluster.Proxy
 	if svc.Enabled() {
 		if proxy, err = svc.NewProxy(); err != nil {
 			return err
 		}
+		ring = monitor.NewRing(1440, 2000)
 		opsSvc = &ops.Ops{Service: svc, Roles: proxy, Instances: svc.Manager(), ServerHost: serverHost, PGPort: cfg.PGPort, Log: log}
 	}
 	deps := httpapi.Deps{
 		Logger: log, Store: pg, Setup: node, Sessions: sessions, Authenticator: authn, Audit: sink,
 		Web: web, Version: version, Hostname: hostname, ListenAddr: cfg.Listen,
-		LoopbackOnly: !cfg.AllowRemoteSetup, SetupService: svc, DataDir: cfg.DataDir, Ops: opsSvc, MaxBodyBytes: cfg.MaxBodyBytes,
+		LoopbackOnly: !cfg.AllowRemoteSetup, SetupService: svc, DataDir: cfg.DataDir, Ops: opsSvc, Started: started, Metrics: ring, MetricsToken: cfg.MetricsToken,
+		LogDir: filepath.Join(cfg.DataDir, "instances", "1", "pgdata", "log"), MaxBodyBytes: cfg.MaxBodyBytes,
 		RequestTimeout: cfg.RequestTimeout, LoginRateLimit: cfg.LoginRateLimit,
 		LoginRateWindow: cfg.LoginRateWindow, SessionTTL: cfg.SessionTTL,
 	}
@@ -232,6 +238,9 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 			}
 			opsSvc.BG = bgCtx
 			opsSvc.SetEngine(eng)
+			run := &monitor.Runner{Src: monSource{svc}, Ring: ring, Host: serverHost, DataDir: filepath.Join(cfg.DataDir, "instances"), Log: log, System: "kingres_system"}
+			wg.Add(1)
+			go func() { defer wg.Done(); run.Run(bgCtx) }()
 			wg.Add(1)
 			go func() { defer wg.Done(); eng.Run(bgCtx); pool.Close() }()
 		})
@@ -320,4 +329,15 @@ func newLogger(cfg config.Config, out io.Writer) *slog.Logger {
 		return slog.New(slog.NewJSONHandler(out, opts))
 	}
 	return slog.New(slog.NewTextHandler(out, opts))
+}
+
+// monSource adapts the cluster service to the monitor.
+type monSource struct{ svc *cluster.Service }
+
+func (m monSource) ServiceConn(ctx context.Context, db string) (*pgx.Conn, error) {
+	return m.svc.ServiceConn(ctx, db)
+}
+
+func (m monSource) InstanceRunning(ctx context.Context) (bool, error) {
+	return m.svc.Manager().Running(ctx, cluster.NodeID)
 }

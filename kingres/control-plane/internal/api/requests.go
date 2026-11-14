@@ -91,3 +91,37 @@ type QueryResult struct {
 	CommandTag string        `json:"commandTag"`
 	DurationMs float64       `json:"durationMs"`
 }
+
+// LedgerDigestChain is the head of one chain in a digest.
+type LedgerDigestChain struct {
+	ShardGroupID int32  `json:"shardGroupId"`
+	BlockHeight  int64  `json:"blockHeight"`
+	BlockHash    string `json:"blockHash"`
+}
+
+// DigestAnchor is an external anchoring target (none exist yet).
+type DigestAnchor map[string]any
+
+// LedgerDigest is a recorded digest.
+type LedgerDigest struct {
+	ID            int64               `json:"id"`
+	DatabaseName  string              `json:"databaseName"`
+	GeneratedAt   Time                `json:"generatedAt"`
+	GeneratedBy   *string             `json:"generatedBy"`
+	HashVersion   int                 `json:"hashVersion"`
+	Chains        []LedgerDigestChain `json:"chains"`
+	AggregateHash *string             `json:"aggregateHash"`
+	Anchors       []DigestAnchor      `json:"anchors"`
+}
+
+// LedgerDigestPage is a page of digests.
+type LedgerDigestPage struct {
+	Items      []LedgerDigest `json:"items"`
+	NextCursor *string        `json:"nextCursor"`
+}
+
+// LedgerVerifyRequest is the body of POST .../ledger/verifications.
+type LedgerVerifyRequest struct {
+	Scope    string `json:"scope,omitempty"`
+	DigestID *int64 `json:"digestId,omitempty"`
+}

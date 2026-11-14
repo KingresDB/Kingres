@@ -25,6 +25,7 @@ import (
 type InstanceControl interface {
 	WriteHBA(id int, rules []instance.HBARule, tlsRequired bool) error
 	Reload(ctx context.Context, id int) error
+	Restart(ctx context.Context, id int) error
 }
 
 type applyState struct {
