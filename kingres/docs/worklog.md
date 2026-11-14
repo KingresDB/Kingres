@@ -7,6 +7,137 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-14: Sharding 0.2, ledger 0.2, the verifier, packaging, and the control plane up to one real server
+
+### What was done
+
+- **`kingres_shard` 0.2** (phase 2a,
+  [design/shard-phase2a.md](design/shard-phase2a.md)): two-phase commit with
+  a decision log and a recovery worker, atomic catalog changes, reference
+  tables, DDL propagation, a distributed scan for any `SELECT` that spans
+  shard groups, cross-group `UPDATE` and `DELETE`, and
+  `kingres_shard.node_conninfo`.
+- **`kingres_ledger` 0.2** ([design/ledger-0.2.md](design/ledger-0.2.md)):
+  updatable ledger tables with a history table, a background worker that
+  builds blocks, and digest and verification records. The format
+  documentation was completed from the gaps the verifier found, and four
+  defects in the server-side proof check were fixed on the way (the format
+  member was not checked, the operation accepted any character, a malformed
+  later header was ignored, and the user name was hashed in the database
+  encoding).
+- **`kingres/verifier`**: `kingres-verify`, a standalone verifier written
+  from the format documentation alone, standard library only.
+- **`kingres/packaging`**: a release build recipe, a container image, a
+  three-node compose topology, a Debian package with the unit
+  `kingres.service`, and tests of each. A CI workflow exists but is not in
+  the repository yet (see "Still open").
+- **REST contract 0.3.0** (69 paths, 86 operations).
+- **Control plane** ([design/control-plane-2.md](design/control-plane-2.md),
+  [design/control-plane-3.md](design/control-plane-3.md)): `kingresd`
+  manages the local instance, keeps its state in the system database, runs
+  durable tasks, creates a cluster through the API, and implements 64 of
+  the 86 operations (databases and tables, roles and grants, network rules,
+  the query workbench, ledger status, digests and verification, this
+  server, alerts, logs, metrics, cluster settings). The first part of the
+  multi-server increment is in: a cluster certificate authority and an
+  internal API with mutual TLS.
+- **Web panel**: follows contract 0.3.0 and has an end-to-end run against
+  the real server (`npm run e2e`).
+- **Decisions** recorded as ADRs 0018 (manager leader), 0019 (system
+  database) and 0020 (no bundled metrics store).
+- **Design** of phase 4 of sharding,
+  [design/shard-phase4.md](design/shard-phase4.md).
+
+### How it was verified
+
+- `kingres_shard` 0.2: 11 pg_regress tests and 1850 TAP subtests in 15 files
+  pass out of tree, and the whole tree built from the last commit plus this
+  version passes both extension suites in tree (29 of 29), run by the
+  integrator.
+- `kingres_ledger` 0.2: 10 pg_regress tests and 199 TAP subtests in 9 files
+  pass out of tree and in tree (21 of 21 at that commit), run by the
+  integrator.
+- Verifier: `go build`, `go vet`, `gofmt -l` clean and `go test ./...`
+  passing, run by the integrator, on fixtures regenerated from a server
+  running ledger 0.2; the cross-check passed unchanged, which shows 0.2 did
+  not change hash format version 1.
+- Packaging: the integrator built the image from a clean snapshot and ran
+  its test (23 checks passed). The package test (61 checks: install, service
+  start, upgrade, remove, purge in a container with systemd) and the compose
+  test (16 checks) were run by the author only.
+- Control plane: Windows build, Linux build, `go vet`, `gofmt -l` and
+  `go test ./...` clean, and the full WSL integration run (21 packages, no
+  skipped test) passing, run by the integrator after each of its three
+  commits.
+- Contract 0.3.0: Redocly lint and the rule checker pass.
+- Panel: typecheck, lint, 180 tests, build and the generated-file checks
+  pass, run by the integrator. The end-to-end run (28 steps) was run by the
+  author only; the integrator did not repeat it because the control plane
+  it builds from was being changed at the time.
+- **Two mistakes of the integrator's own tooling, found and fixed.** The
+  first in-tree check of sharding 0.2 failed because the check reused a
+  build directory and both ninja and the temporary installation decide by
+  modification time, so a stale control file was tested; the check now makes
+  overlaid files newer and discards the temporary installation. And
+  `ext.sh` did not apply an extension's settings file while the in-tree run
+  does, so one expected output could not be right in both; `ext.sh` now
+  applies it.
+
+### Needs-verification items checked
+
+- "Shard moves use logical replication; does not replicate DDL, sequences,
+  TRUNCATE": not checked yet; phase 4 will.
+- "2PC recovery by comparing prepared transactions with a local log":
+  implemented and tested with fault injection. One rule from the design did
+  not survive contact with PostgreSQL: "the transaction id in the gid is not
+  running" is not enough after a crash, because a killed backend's
+  transaction id can still be reported as in progress; the backend pid is
+  compared as well.
+- "A hot standby rejects writes; write forwarding would need a core patch":
+  not checked; phase 5.
+
+### Decisions and deviations
+
+- Deviations are in the "Implementation notes and deviations" sections of
+  the design notes. Those a user notices: an `UPDATE` that assigns the
+  distribution column is always refused; multi-row `INSERT`, `INSERT ...
+  SELECT` and `COPY FROM` across shard groups are still refused;
+  reference-table writes accept only built-in immutable expressions; the
+  distributed scan fetches rows only, with no aggregate, sort or limit
+  pushdown; the internal API of `kingresd` listens on its own port.
+- `kingresd` signs users in and then acts as the signed-in role through the
+  local socket with a role map, instead of keeping the sign-in connection
+  (which is bound to one database).
+- The package installs client programs with a `kingres-` prefix
+  (`kingres-psql` and so on) so that they cannot collide with a
+  distribution's PostgreSQL packages.
+
+### Still open
+
+- **Reviews in progress or pending**: `kingres_shard` 0.2 (in progress);
+  `kingres_ledger` 0.2 was reviewed (eight findings,
+  [reviews/2026-11-14-kingres-ledger-0.2.md](reviews/2026-11-14-kingres-ledger-0.2.md))
+  and its fix round is in progress; the control plane and the panel have not
+  had an independent review.
+- **CI**: the workflow file is committed on a local branch only. The access
+  token used for pushing may not create workflow files; it needs the
+  workflow permission.
+- The control plane cannot yet join servers, rebalance or fail over; 22
+  operations answer "not supported yet".
+- Seven mismatches between the server and the contract found by the panel's
+  end-to-end run (for example `GET /ledger/status` answering 404) are being
+  fixed.
+- Phase 2b of sharding (pushdown for speed), phase 4 (moving buckets) and
+  phase 5 (standbys and failover) are not started.
+- For a release: signing of the package and image, an apt repository, RPM,
+  arm64.
+
+### Core patches
+
+None added in this entry.
+
+---
+
 ## 2026-11-14: Reviews, fix rounds, REST contract 0.2 and the first control plane and panel
 
 ### What was done
