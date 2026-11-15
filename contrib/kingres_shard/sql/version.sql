@@ -9,7 +9,7 @@ SELECT kingres.version() =
        substring(version() from '\(KingresDB ([0-9]+\.[0-9]+\.[0-9]+)\)$')
        AS same_version_as_in_version_function;
 SELECT current_setting('server_version') !~* 'kingres' AS server_version_has_no_kingres;
-SELECT current_setting('server_version') ~ '^18\.' AS server_version_is_postgresql_18;
-SELECT current_setting('server_version_num')::int BETWEEN 180000 AND 189999 AS server_version_num_unchanged;
+SELECT current_setting('server_version') ~ '^(18|19)(\.|beta|rc)' AS server_version_is_supported_major;
+SELECT current_setting('server_version_num')::int BETWEEN 180000 AND 199999 AS server_version_num_unchanged;
 
 DROP EXTENSION kingres_shard;

@@ -19,7 +19,7 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 use POSIX ();
 use Time::HiRes qw(sleep);
-use KingresShardTest qw(make_cluster run_sql wait_for_file);
+use KingresShardTest qw(make_cluster run_sql wait_for_fault_file);
 
 my @nodes = make_cluster('mt', 3, logical => 1);
 my ($n1, $n2, $n3) = @nodes;
@@ -63,7 +63,7 @@ sub start_move
 		system("psql -X -q -h " . $n1->host . " -p " . $n1->port . " -d postgres -c \"$sql\" > $tmp/out_$name 2>&1");
 		POSIX::_exit(0);
 	}
-	ok(wait_for_file("$hold.reached", 120), "$name: the move reached the end of the catch-up");
+	ok(wait_for_fault_file("$hold.reached", 120), "$name: the move reached the end of the catch-up");
 	return { pid => $pid, hold => $hold, bucket => $bucket, name => $name };
 }
 

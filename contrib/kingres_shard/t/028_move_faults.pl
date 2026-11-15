@@ -18,7 +18,7 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 use POSIX ();
 use Time::HiRes qw(sleep);
-use KingresShardTest qw(make_node make_cluster run_sql move_state wait_for_file);
+use KingresShardTest qw(make_node make_cluster run_sql move_state wait_for_fault_file);
 
 my @nodes = make_cluster('fl', 3, logical => 1);
 my ($n1, $n2, $n3) = @nodes;
@@ -161,7 +161,7 @@ for my $which ('target', 'source')
 		system("psql -X -q -h " . $n1->host . " -p " . $n1->port . " -d postgres -c \"$sql\" > $tmp/child_$which.out 2>&1");
 		POSIX::_exit(0);
 	}
-	ok(wait_for_file("$file.reached", 60), "the $which case: the move reached the copy");
+	ok(wait_for_fault_file("$file.reached", 60), "the $which case: the move reached the copy");
 	restart($victim) if $which eq 'target';
 	$victim->stop('immediate', fail_ok => 1) if $which eq 'source';
 	unlink($file);
@@ -206,7 +206,7 @@ for my $which ('target', 'source')
 		system("psql -X -q -h " . $n1->host . " -p " . $n1->port . " -d postgres -c \"$sql\" > $tmp/child_cancel.out 2>&1");
 		POSIX::_exit(0);
 	}
-	ok(wait_for_file("$file.reached", 60), 'cancel: the move reached the copy');
+	ok(wait_for_fault_file("$file.reached", 60), 'cancel: the move reached the copy');
 	my $id = $n1->safe_psql('postgres', "SELECT max(move_id) FROM kingres.bucket_move");
 	# a second move of the same bucket is refused while it runs
 	my ($rc, $out, $err) = run_sql($n1, "SELECT kingres.move_bucket(1, $b, $tgt)");

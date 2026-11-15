@@ -120,6 +120,9 @@ tests += {
       't/042_add_node_acl.pl',
       't/043_reference_paths.pl',
       't/044_reference_lock.pl',
+      't/045_server_major.pl',
+      't/046_two_majors.pl',
+      't/047_review_s5.pl',
     ],
   },
 }

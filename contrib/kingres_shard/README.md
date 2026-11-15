@@ -123,7 +123,15 @@ describes what is implemented and how to use it.
 ## Requirements and installation
 
 - KingresDB (the extension needs `KINGRES_VERSION`, core patch KP-0001; it
-  does not compile against stock PostgreSQL by design).
+  does not compile against stock PostgreSQL by design), built on **PostgreSQL 18 or
+  19**. One source builds against both (ADR 0023): the differences between the majors
+  are in `src/pg_compat.h`, the SQL scripts are the same, and the tests run on both.
+- **One PostgreSQL major per cluster.** `add_node()` refuses a node whose major differs
+  from the one of the node that adds it (`object_not_in_prerequisite_state`),
+  `move_bucket()` refuses to move a bucket between two nodes of different majors, and
+  `check_cluster()` reports a node of another major as `server_major_differs`. To go
+  from 18 to 19 build a new cluster of 19 nodes and move the data; mixing majors in
+  one cluster is not supported.
 - On every node: `shared_preload_libraries = 'kingres_shard'` (the library
   installs hooks and a background worker; `CREATE EXTENSION` fails otherwise)
   and `max_prepared_transactions` > 0 (at least the number of concurrent
@@ -175,7 +183,11 @@ PROVE_TESTS=t/013_dist_scan.pl kingres/dev/ext.sh kingres_shard tap
   second, fictitious shard group; `routing_decisions`: collations, functions
   and other nested contexts, forwarded sessions, decided with `EXPLAIN`;
   `reference`: reference tables on one node; `upgrade`: `ALTER EXTENSION ...
-  UPDATE` from 0.1, 0.2 and 0.3 against a fresh 0.4 install).
+  UPDATE` from 0.1, 0.2 and 0.3 against a fresh 0.4 install; the same on both majors:
+  the script of 0.3 names a column of `pg_stat_subscription_stats` that PostgreSQL 19
+  renamed, so on 19 it creates `kingres.internal_move_subscription_status()` with its
+  body check off and `ALTER EXTENSION ... UPDATE` to 0.4 replaces it with a body that
+  reads the counter on both majors; 0.3 itself is not usable on 19).
 - `t/`: TAP tests with several nodes. Phase 1: `001_cluster`, `002_routing`,
   `003_hooks`, `004_security`, `005_session_settings`,
   `006_ddl_and_concurrency`, `007_nested_contexts`. Phase 2a: `008_twophase`
@@ -207,6 +219,12 @@ PROVE_TESTS=t/013_dist_scan.pl kingres/dev/ext.sh kingres_shard tap
   `041_copy_and_utility`, `042_add_node_acl`, `043_reference_paths` (every path that
   can write a reference table, the divergence check), `044_reference_lock` (the
   writer lock nobody can take, foreign key lock sets).
+  One PostgreSQL major per cluster: `045_server_major` (`add_node()` refuses a node of
+  another major, tested with a fault setting that makes this node report another
+  major, on any single installation) and `046_two_majors` (real nodes of 18 and 19:
+  `add_node()`, `check_cluster()`, `move_bucket()`; it skips, with the reason in its
+  plan, unless the installation of the other major, named by `KINGRES_PG18` or
+  `KINGRES_PG19` as in `kingres/dev/ext-majors.sh`, has this build of the extension).
   `t/KingresShardTest.pm` builds clusters; `t/KingresShardCompare.pm` is the
   comparison harness: it loads the same data into a three-node cluster and a
   single node and compares query results, and repeats every query under four
@@ -285,6 +303,28 @@ are not copied (grant after creating; the grant is propagated).
 without inheritance, foreign keys, triggers, row-level security, storage
 parameters or exclusion constraints; a unique constraint needs no distribution
 column). Add foreign keys afterwards with `ALTER TABLE`.
+
+## Restoring a node from a logical dump
+
+`pg_dump` of a node holds that node's partitions (`COPY public.d_b0001 ...`) and the
+reference tables in full, and nothing of the cluster catalog or the secret. What works, in this order
+(review finding S5-06):
+
+1. Restore the schema and data into a database that has **no** `kingres_shard`: the partitions come
+   back as plain tables and the distributed tables as plain partitioned tables. Run
+   `CREATE EXTENSION kingres_shard` on the node only if it is to be a new node.
+2. To put a node back into a cluster, restore into an empty database, then run
+   `SELECT kingres.add_node(...)` from the map group primary for it (the node must not belong to a
+   cluster); `add_node()` creates the tables, copies the reference tables and installs the catalog
+   and the secret. Restored data of a distributed table is not read by the cluster: load it through
+   the cluster (`COPY (SELECT ...)` out, `INSERT` in, or a restore on a single node that is then
+   distributed with `create_distributed_table`).
+3. A restore into a node that already has the catalog meets the refusal of `COPY` into bucket
+   partitions, and of `CREATE TABLE` of a table that is distributed. A superuser can repair one
+   node by hand with `SET kingres_shard.enable_routing = off`, which this check does not need to
+   ask about: the partitions of the node can be written, and nothing else on the cluster changes.
+   Afterwards run `kingres.check_cluster()`; a node that lost its secret shows as `secret_missing`
+   and gets it back with `kingres.sync_catalog()`.
 
 ## Settings
 
@@ -393,7 +433,10 @@ fragment, only if it proves it comes from a node of the cluster:
   messages, the log or `EXPLAIN`: the setting rewrites its own value to
   `<hidden>` before it is stored. Node-to-node connections should use TLS
   (`kingres_shard.node_conninfo`), because a token seen on the wire can be
-  replayed for the same role and node.
+  replayed for the same role and node. Without TLS, whoever can read the traffic between two
+  nodes can open sessions that the node takes for sessions of the cluster, as that role,
+  until `kingres.rotate_secret()` is run: the exposure of a cluster whose nodes talk in the
+  clear (S3-17).
 - A node that is not part of a cluster (no node id) holds no secret and accepts
   the claim: there is nothing to protect there, and `add_node()` talks to a node
   in that state. A node that belongs to a cluster and holds no secret (one that
@@ -525,7 +568,11 @@ reference table is refused on a cluster with several groups.
   evaluated by the node that reads. `sqrt`, the basic operators and everything on
   `numeric` are exact and are shipped. A floating point `sum` or `avg` over a
   distributed table adds the groups in an order that depends on the node that runs
-  the query, so the last digits can differ between origins.
+  the query, so the last digits can differ between origins: that is a *read*, and it is
+  not refused. A *write* to a reference table that reads a distributed table (as
+  `INSERT INTO ref SELECT sum(f) FROM dist`) is refused whatever the aggregate, and a
+  floating point aggregate is not shippable (see below), so no copy of a reference table
+  can depend on the order of the rows of the origin (S3-14).
 - A write through a view of a reference (or distributed) table is refused with "it
   writes through a view; write the table itself" (S3-18): the rewritten statement
   does not stand alone, and `WITH CHECK OPTION` and the rights of the view's owner
@@ -575,6 +622,7 @@ The decision for each path (tested in `t/043_reference_paths.pl`):
 | a function (any language), a `DO` block or dynamic SQL called by a statement that runs on this node | each write it makes is a statement of its own and runs on every node |
 | the same function called by a statement that is routed to another shard group (`INSERT INTO d VALUES (6, f(6))`, `SELECT f(6) FROM d WHERE id = 6`) | **refused**: `reference table "t" cannot be written from a statement that is run for another node`; nothing is changed. Call the function in a statement of its own |
 | a trigger on an ordinary table | its write runs on every node, as a function's does; a trigger on a bucket partition (made by hand) fires on the other node and is refused as above |
+| a trigger on the reference table itself | **refused**, `CREATE TRIGGER` and `CREATE CONSTRAINT TRIGGER`, also by a superuser with `enable_routing = off` (S5-01): what a trigger reads or computes on each node (a count of a distributed table, a clock, a sequence) cannot be shown to give every copy the same row. The supported way is to put the logic in the statement that writes the table, or in a trigger on a distributed table; the foreign keys of a reference table are not affected, and their actions are the only statements that run on this node's copy alone while a write to a reference table runs. Any other statement that such a write makes run (a function it calls) is planned, routed and checked like a statement of its own |
 | a rule on an ordinary table whose action writes the table | **refused** ("cannot be run on every node": the rule's action reads the rule's table) |
 | a data-modifying `WITH` | **refused** ("a write to a reference table inside a WITH clause or a subquery is not supported yet") |
 | `MERGE`, `COPY ... FROM` | **refused** |
@@ -889,6 +937,8 @@ milliseconds; the measurement is in the design note):
 - Every table of the colocation group has a primary key or `REPLICA IDENTITY FULL`
   (`REPLICA IDENTITY USING INDEX` and identity columns are refused as "not supported
   yet"). A table without one is named in the error and nothing is started.
+- Source and target run the same PostgreSQL major; a move between nodes of different
+  majors is refused before it starts.
 - The role that runs the move is a superuser. The subscription connects with the
   `kingres_shard.node_conninfo` of the **target** (sslmode and key files) and the
   password file of the server's OS user; no password is stored in the catalog.
@@ -904,7 +954,7 @@ milliseconds; the measurement is in the design note):
 | `kingres.rebalance_plan(max_moves default null)` | `(colocation_id, bucket, source_group, target_group, size_bytes)`: the moves that even out the buckets per group, in the order to run them; any node, reads only (sizes come from the source group when the caller is a superuser) |
 | `kingres.set_node_property(node_id, should_have_shards)` | change the flag (atomic); a group whose primary has it false is drained by the plan |
 | `kingres.resume_bucket_moves() returns int` | undo the moves interrupted before the switch, finish those after it; the recovery worker calls it |
-| `kingres.cancel_bucket_move(move_id)` | stop and undo a move that has not reached *switching* |
+| `kingres.cancel_bucket_move(move_id)` | stop and undo a move that has not reached *switching*; it says that the move was stopped, or fails with "passed the point where it can be stopped"; a move that was asked to stop never enters its switch (S5-05) |
 | `kingres.cleanup_moved_buckets(force default false) returns int` | drop the orphan tables whose delay is over (all with `force`) |
 | `kingres.check_cluster(older_than default '5 minutes')` | one row per inconsistency |
 
@@ -961,8 +1011,12 @@ long, or a *cleaning* move that is overdue by it: the worker would resolve it, o
 `resume_bucket_moves()` / `cleanup_moved_buckets()` by hand), `replication_slot`, `publication`, `subscription`, `replication_origin`
 (leftovers of a move that is not running), `prepared_transaction` (older than the
 argument), `node_unreachable`; and on the map group `bucket_map_incomplete`,
-`group_without_primary`, `bucket_moving_without_move`, `move_without_moving_bucket`; and
-for every reference table `reference_table_differs` (a node whose copy has other rows).
+`group_without_primary`, `bucket_moving_without_move`, `move_without_moving_bucket`; per
+active primary also `extension_version_differs` (the node runs another version of the
+extension: nothing else is compared with it, so a copy of a reference table that could not be
+read is not reported as one that differs), `secret_missing` (the node holds no cluster secret),
+`server_major_differs` (the node runs another PostgreSQL major than the map
+group primary); and for every reference table `reference_table_differs` (a node whose copy has other rows).
 No rows means consistent, in this sense: it is a **structural** check (catalogs, which
 partitions exist where, what a move left behind). It never compares the rows, indexes,
 constraints or replica identity of a partition with its parent, so a copy that diverged

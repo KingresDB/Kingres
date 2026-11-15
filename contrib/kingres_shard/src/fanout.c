@@ -162,6 +162,23 @@ in_refwrite_fragment(void)
 }
 
 /*
+ * Is the text one of the statements that the triggers of foreign keys run
+ * (ri_triggers.c: every one of them names its table with ONLY)?  Only these are
+ * left to this node's copy while a reference-table write runs; any other
+ * statement that the write makes run (review finding S5-01: a trigger or a
+ * function) is planned like a statement of its own, routed and checked.  There
+ * is no trigger on a reference table by hand (utility.c); the rest is the
+ * foreign keys.
+ */
+static bool
+is_ri_action(const char *query_string)
+{
+	return strncmp(query_string, "SELECT 1 FROM ONLY ", 19) == 0 ||
+		strncmp(query_string, "UPDATE ONLY ", 12) == 0 ||
+		strncmp(query_string, "DELETE FROM ONLY ", 17) == 0;
+}
+
+/*
  * kingres_shard_in_refwrite_nested
  *
  * True for a statement planned while a reference-table write runs on this node
@@ -173,9 +190,11 @@ in_refwrite_fragment(void)
 bool
 kingres_shard_in_refwrite_nested(const char *query_string)
 {
+	if (query_string == NULL || !is_ri_action(query_string))
+		return false;
 	if (refwrite_local_depth > 0)
 		return true;
-	return in_refwrite_fragment() && query_string != NULL &&
+	return in_refwrite_fragment() &&
 		debug_query_string != NULL && strcmp(query_string, debug_query_string) != 0;
 }
 
@@ -209,8 +228,9 @@ static void
 fo_executor_start(QueryDesc *queryDesc, int eflags)
 {
 	PlannedStmt *pstmt = queryDesc->plannedstmt;
+	List	   *result_rels = ks_result_relations(pstmt);
 
-	if (pstmt->resultRelations != NIL && !(eflags & EXEC_FLAG_EXPLAIN_ONLY) &&
+	if (result_rels != NIL && !(eflags & EXEC_FLAG_EXPLAIN_ONLY) &&
 		kingres_shard_enable_routing && !creating_extension &&
 		refwrite_local_depth == 0 && !IsParallelWorker() && !in_refwrite_fragment())
 	{
@@ -220,7 +240,7 @@ fo_executor_start(QueryDesc *queryDesc, int eflags)
 		if (cat->present && cat->dist_tables != NULL && cat->ndist_tables > 0 &&
 			(cat->ngroups > 1 || kingres_shard_session_forwarded()))
 		{
-			foreach(lc, pstmt->resultRelations)
+			foreach(lc, result_rels)
 			{
 				RangeTblEntry *rte = rt_fetch(lfirst_int(lc), pstmt->rtable);
 				KsDistTable *dt;

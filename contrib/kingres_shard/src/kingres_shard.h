@@ -16,7 +16,13 @@
 #ifndef KINGRES_SHARD_KINGRES_SHARD_H
 #define KINGRES_SHARD_KINGRES_SHARD_H
 
+/* The differences between the PostgreSQL majors; see the file. */
+#include "pg_compat.h"
+
 #include "fmgr.h"
+
+/* The version of the extension this library belongs to (the SQL objects of every node must match). */
+#define KINGRES_SHARD_EXT_VERSION "0.4"
 #include "nodes/params.h"
 #include "nodes/parsenodes.h"
 #include "nodes/plannodes.h"

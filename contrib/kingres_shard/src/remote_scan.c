@@ -218,7 +218,7 @@ kingres_shard_wrap_plan(Query *parse, CustomScan *cscan, List *relids, bool retu
 	pstmt->planTree = (Plan *) cscan;
 	pstmt->rtable = NIL;
 	pstmt->permInfos = NIL;
-	pstmt->resultRelations = NIL;
+	KS_CLEAR_RESULT_RELATIONS(pstmt);
 	pstmt->subplans = NIL;
 	pstmt->relationOids = relids;
 	pstmt->invalItems = NIL;

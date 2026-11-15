@@ -26,6 +26,12 @@
  * a move is copied to every control session it opens, so a point inside a
  * function that runs on another node fires there.
  *
+ *	  server_major:value:<n>	not a point of the protocol: the major version of
+ *							PostgreSQL that this session reports as its own to the
+ *							checks of kingres.add_node() (kingres_shard_server_major),
+ *							so that a test can refuse a node of "another major"
+ *							with two nodes of one.
+ *
  * Points, in the order a committing transaction reaches them:
  *	  before_prepare, after_first_prepare, after_prepare, after_log (before the
  *	  local commit), after_commit (the local commit is durable, no COMMIT
@@ -97,6 +103,20 @@ const char *
 kingres_shard_fault_spec(void)
 {
 	return fault_spec != NULL ? fault_spec : "";
+}
+
+/*
+ * The major version of PostgreSQL this server runs, as the checks that keep one
+ * major in a cluster see it (see the setting server_major:value:<n> above).
+ */
+int
+kingres_shard_server_major(void)
+{
+	const char *prefix = "server_major:value:";
+
+	if (fault_spec != NULL && strncmp(fault_spec, prefix, strlen(prefix)) == 0)
+		return atoi(fault_spec + strlen(prefix));
+	return PG_MAJORVERSION_NUM;
 }
 
 /*

@@ -14,14 +14,16 @@ use Test::More;
 use Exporter 'import';
 
 our @EXPORT_OK = qw(make_node make_cluster keys_of_group run_sql group_of_key
-  prepared_count wait_prepared_count logical_settings move_state wait_for_file);
+  prepared_count wait_prepared_count logical_settings move_state wait_for_fault_file);
 
 # A node that preloads the extension.  Two-phase commit needs prepared
 # transactions; recovery_interval is 0 (no background recovery) unless asked.
 sub make_node
 {
 	my ($name, %opt) = @_;
-	my $node = PostgreSQL::Test::Cluster->new($name);
+	# install_path: a node of another PostgreSQL installation (t/046_two_majors.pl).
+	my $node = PostgreSQL::Test::Cluster->new($name,
+		(defined $opt{install_path} ? (install_path => $opt{install_path}) : ()));
 	if ($opt{logical})
 	{
 		$node->init(allows_streaming => 'logical');
@@ -132,7 +134,7 @@ sub move_state
 
 # Wait (at most $timeout seconds) until the fault point that waits on $file has
 # been reached (fault.c creates $file.reached).
-sub wait_for_file
+sub wait_for_fault_file
 {
 	my ($file, $timeout) = @_;
 	$timeout //= 60;

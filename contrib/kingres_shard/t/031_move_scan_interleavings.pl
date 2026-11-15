@@ -37,7 +37,7 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 use POSIX ();
 use Time::HiRes qw(sleep time);
-use KingresShardTest qw(make_cluster wait_for_file);
+use KingresShardTest qw(make_cluster wait_for_fault_file);
 
 # Run at a lower priority, servers included: this test starts hundreds of sessions,
 # and the suites that run beside it (in the in-tree run, all at once) have tests that
@@ -395,7 +395,7 @@ sub stepped_move
 		"SET kingres_shard.fault_injection = 'after_commit\@switch:wait:$mfile';\n"
 		  . "SELECT kingres.move_bucket(1, $bucket, $T);\n",
 		'mover');
-	ok(wait_for_file("$mfile.reached", 60), "move of bucket $bucket $S>$T reached the commit");
+	ok(wait_for_fault_file("$mfile.reached", 60), "move of bucket $bucket $S>$T reached the commit");
 	my @prep = prepared_nodes();
 	my @perms = permutations(@prep);
 	my @order = @{ $perms[$perm % @perms] };
@@ -451,7 +451,7 @@ sub paused_move
 		"SET kingres_shard.fault_injection = '$spec:wait:$mfile';\n"
 		  . "SELECT kingres.move_bucket(1, $bucket, $T);\n",
 		'mover');
-	ok(wait_for_file("$mfile.reached", 60), "move of bucket $bucket $S>$T reached $mpoint");
+	ok(wait_for_fault_file("$mfile.reached", 60), "move of bucket $bucket $S>$T reached $mpoint");
 	my $label = "bucket $bucket $S>$T paused at $mpoint";
 	my @all;
 	for my $o (0 .. 2)
@@ -480,7 +480,7 @@ sub pinned_move
 	my $move = { S => $S, T => $T };
 	my $label = "bucket $bucket $S>$T, $kind from node " . ($origin + 1) . " paused at $point holds the tables";
 	my $r = statement($origin, $kind, $point, $move, $label);
-	ok(wait_for_file("$r->{pause_file}.reached", 60), "$label: the statement reached its pause point");
+	ok(wait_for_fault_file("$r->{pause_file}.reached", 60), "$label: the statement reached its pause point");
 	my $mover = spawn($n1, "SELECT kingres.move_bucket(1, $bucket, $T);\n", 'mover');
 	sleep(3);
 	waitpid($mover->{pid}, POSIX::WNOHANG()) == 0
@@ -619,7 +619,7 @@ sub w_whole
 		"SET kingres_shard.fault_injection = 'move_switch_after_detach:wait:$aflag';\n"
 		  . "SELECT kingres.move_bucket($wcol, $bucket, $T);\n",
 		'mover');
-	ok(wait_for_file("$aflag.reached", 60), "$label: the first move holds the source in its switch");
+	ok(wait_for_fault_file("$aflag.reached", 60), "$label: the first move holds the source in its switch");
 
 	my $scan = statement(0, 'scan_w', "scan_declared_g$S", $move, "$label, scan from node 1");
 	ok($nodes[$S]->poll_query_until('postgres',
@@ -627,7 +627,7 @@ sub w_whole
 		"$label: the DECLARE of the scan waits for the switch's lock");
 	unlink($aflag);
 	finish($mover);
-	ok(wait_for_file("$scan->{pause_file}.reached", 60), "$label: the scan declared its cursor on the detached bucket");
+	ok(wait_for_fault_file("$scan->{pause_file}.reached", 60), "$label: the scan declared its cursor on the detached bucket");
 	is($n1->safe_psql('postgres', "SELECT group_id FROM kingres.bucket_map WHERE colocation_id = $wcol AND bucket = $bucket"),
 		$T, "$label: the bucket is on the target");
 
@@ -666,7 +666,7 @@ my $w2col = $n1->safe_psql('postgres',
 		want => sub { '60,1830' },
 	};
 	my $scan = statement(0, 'scan_w2', 'scan_after_placement', { S => 1, T => 2 }, "$label, scan from node 1");
-	ok(wait_for_file("$scan->{pause_file}.reached", 60), "$label: the scan asked the groups for their placement");
+	ok(wait_for_fault_file("$scan->{pause_file}.reached", 60), "$label: the scan asked the groups for their placement");
 	$n1->safe_psql('postgres', "SELECT kingres.move_bucket($w2col, $b1, 2)");
 	$n1->safe_psql('postgres', "SELECT kingres.move_bucket($w2col, $b2, 1)");
 	release($scan);

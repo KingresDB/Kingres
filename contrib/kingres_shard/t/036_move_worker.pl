@@ -16,7 +16,7 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 use POSIX ();
-use KingresShardTest qw(make_cluster run_sql wait_for_file);
+use KingresShardTest qw(make_cluster run_sql wait_for_fault_file);
 
 my $tmp = PostgreSQL::Test::Utils::tempdir();
 my $settings = "kingres_shard.node_timeout = 3\nkingres_shard.move_cleanup_delay = 1\n";
@@ -85,7 +85,7 @@ sub move_backend_pid
 	$src = owner($n1, $b);
 	$tgt = ($src + 1) % 3;
 	my ($pid, $file) = start_stopped_move($n1, 'move_after_subscription', $b, $tgt, 'kill');
-	ok(wait_for_file("$file.reached", 60), 'the move to be killed reached the copy');
+	ok(wait_for_fault_file("$file.reached", 60), 'the move to be killed reached the copy');
 	my $bpid = move_backend_pid($n1);
 	$n1->safe_psql('postgres', "SELECT pg_terminate_backend($bpid)");
 	unlink($file);
@@ -107,7 +107,7 @@ sub move_backend_pid
 	$src = owner($n1, $b);
 	$tgt = ($src + 1) % 3;
 	($pid, $file) = start_stopped_move($n1, 'move_after_catchup', $b, $tgt, 'live');
-	ok(wait_for_file("$file.reached", 60), 'the live move reached the end of the catch-up');
+	ok(wait_for_fault_file("$file.reached", 60), 'the live move reached the end of the catch-up');
 	# The node timeout is 3 s and the worker runs every second: ten seconds are several passes
 	# (the check is that nothing happens, so no event can be waited for).
 	sleep(10);
@@ -143,7 +143,7 @@ sub move_backend_pid
 	my $src = owner($n1, $b);
 	my $tgt = ($src + 1) % 3;
 	my ($pid, $file) = start_stopped_move($n1, 'move_after_subscription', $b, $tgt, 'stalled');
-	ok(wait_for_file("$file.reached", 60), 'the move to be killed reached the copy');
+	ok(wait_for_fault_file("$file.reached", 60), 'the move to be killed reached the copy');
 	is(problems(), '', 'a move that is running is not a problem');
 	my $bpid = move_backend_pid($n1);
 	$n1->safe_psql('postgres', "SELECT pg_terminate_backend($bpid)");

@@ -817,6 +817,15 @@ kingres_add_node(PG_FUNCTION_ARGS)
 			local_enc = pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
 			spi_run(verq, SPI_OK_SELECT, 0, NULL, NULL);
 			local_ver = pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
+			/* One PostgreSQL major per cluster (ADR 0023). */
+			if (PQserverVersion(kc->conn) / 10000 != kingres_shard_server_major())
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("node %s:%d runs PostgreSQL %d, this node runs PostgreSQL %d",
+								host, port, PQserverVersion(kc->conn) / 10000,
+								kingres_shard_server_major()),
+						 errdetail("All nodes of a cluster must run the same major version of PostgreSQL."),
+						 errhint("Install the major version of this node on the new node.")));
 			if (strcmp(remote_ver, local_ver) != 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),

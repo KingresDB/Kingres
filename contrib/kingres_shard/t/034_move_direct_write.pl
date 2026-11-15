@@ -32,7 +32,7 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 use POSIX ();
 use Time::HiRes qw(sleep time);
-use KingresShardTest qw(make_cluster run_sql wait_for_file);
+use KingresShardTest qw(make_cluster run_sql wait_for_fault_file);
 
 my @nodes = make_cluster('dw', 3, logical => 1);
 my ($n1, $n2, $n3) = @nodes;
@@ -141,7 +141,7 @@ my $mover = spawn($n1,
 	"SET kingres_shard.fault_injection = 'move_after_catchup:wait:$flag';\n"
 	  . "SET kingres_shard.move_switch_timeout = '20s';\n"
 	  . "SELECT kingres.move_bucket(1, $bucket, 2);\n");
-ok(wait_for_file("$flag.reached", 120), 'the copy of the bucket is complete');
+ok(wait_for_fault_file("$flag.reached", 120), 'the copy of the bucket is complete');
 
 # The writer: routing off (the refusal of part 1 is what an ordinary session
 # meets), a transaction that has written the partition and stays open.
@@ -237,7 +237,7 @@ is($n1->safe_psql('postgres', q{SELECT coalesce(string_agg(check_name || ' ' || 
 	my $mover2 = spawn($n1,
 		"SET kingres_shard.fault_injection = 'move_switch_after_lock:wait:$hold';\n"
 		  . "SELECT kingres.move_bucket(1, $bucket2, 2);\n");
-	ok(wait_for_file("$hold.reached", 120), 'the second move holds the locks of its switch');
+	ok(wait_for_fault_file("$hold.reached", 120), 'the second move holds the locks of its switch');
 	my $late = spawn($n2, "SET kingres_shard.enable_routing = off;\nINSERT INTO $part2 VALUES ($key2, 5);\n");
 	ok($n2->poll_query_until('postgres',
 			"SELECT count(*) > 0 FROM pg_locks WHERE NOT granted AND locktype = 'relation' AND relation IN (SELECT c.oid FROM pg_class c WHERE c.relname LIKE 'orders%')"),

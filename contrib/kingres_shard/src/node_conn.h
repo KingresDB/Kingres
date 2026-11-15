@@ -17,7 +17,7 @@
 
 #include "postgres.h"
 
-#include "libpq-fe.h"
+#include "pg_compat.h"
 
 /* Maximum lengths of the parts of a connection cache key. */
 #define KS_CONN_HOST_LEN 256
@@ -107,6 +107,7 @@ extern void kingres_shard_fault_point(const char *point);
 /* Ask the node to stop what its session runs; waits for the request for a bounded time only. */
 extern void kingres_shard_cancel_with_deadline(PGconn *conn);
 extern const char *kingres_shard_fault_spec(void);
+extern int	kingres_shard_server_major(void);
 extern void kingres_shard_fault_set_scope(const char *scope);
 
 /*

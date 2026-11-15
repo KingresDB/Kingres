@@ -181,6 +181,8 @@ DECLARE
     v_node_ms  pg_catalog.int4;
     v_srcrow   pg_catalog.record;
     v_tgtrow   pg_catalog.record;
+    v_maj_src  pg_catalog.text;
+    v_maj_tgt  pg_catalog.text;
     v_st       pg_catalog.jsonb;
     v_lag      pg_catalog.int8;
     v_iter     pg_catalog.int4 := 0;
@@ -245,6 +247,17 @@ BEGIN
     END IF;
     SELECT n.host, n.port INTO v_srcrow FROM kingres.node n WHERE n.node_id OPERATOR(pg_catalog.=) v_src;
     SELECT n.host, n.port INTO v_tgtrow FROM kingres.node n WHERE n.node_id OPERATOR(pg_catalog.=) v_tgt;
+
+    -- The rows travel by logical replication between the two nodes, and a cluster runs one
+    -- PostgreSQL major.
+    v_maj_src := kingres.internal_exec_scalar(v_src, 'SELECT (pg_catalog.current_setting(''server_version_num'')::pg_catalog.int4 OPERATOR(pg_catalog./) 10000)::pg_catalog.text');
+    v_maj_tgt := kingres.internal_exec_scalar(v_tgt, 'SELECT (pg_catalog.current_setting(''server_version_num'')::pg_catalog.int4 OPERATOR(pg_catalog./) 10000)::pg_catalog.text');
+    IF v_maj_src IS DISTINCT FROM v_maj_tgt THEN
+        RAISE EXCEPTION 'bucket % of colocation group % cannot move from node % (%:%) to node % (%:%): they run different PostgreSQL major versions (% and %)',
+                        v_bucket, v_colo, v_src, v_srcrow.host, v_srcrow.port, v_tgt, v_tgtrow.host, v_tgtrow.port, v_maj_src, v_maj_tgt
+            USING ERRCODE = 'object_not_in_prerequisite_state',
+                  HINT = 'All nodes of a cluster must run the same major version of PostgreSQL.';
+    END IF;
 
     v_info := (kingres.internal_exec_scalar(v_src, pg_catalog.format(
                   'SELECT kingres.internal_move_inspect(''source'', %s, %s, %L::pg_catalog.jsonb)::pg_catalog.text',
@@ -342,6 +355,11 @@ BEGIN
             -- Switching.
             PERFORM kingres.internal_exec_scalar(v_self, pg_catalog.format(
                 'SELECT kingres.internal_move_set(%s, ''switching'', ''waiting for the write lock of the bucket'')', v_id));
+            -- A cancel that arrived since the last look: the switch was not entered (S5-05).
+            SELECT b.phase INTO v_phase FROM kingres.bucket_move b WHERE b.move_id OPERATOR(pg_catalog.=) v_id;
+            IF v_phase OPERATOR(pg_catalog.<>) 'switching' THEN
+                RAISE EXCEPTION 'bucket move % was cancelled', v_id USING ERRCODE = 'KS003';
+            END IF;
             v_stage := 2;
             PERFORM kingres.internal_fault_point('move_before_switch');
             BEGIN
@@ -478,6 +496,54 @@ BEGIN
 END;
 $$;
 
+-- The state of a node as check_cluster() collects it now has the PostgreSQL major.
+CREATE OR REPLACE FUNCTION kingres.internal_local_state()
+    RETURNS jsonb
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+SELECT pg_catalog.jsonb_build_object(
+    'node_id', (SELECT l.node_id FROM kingres.local_node l),
+    'server_major', (pg_catalog.current_setting('server_version_num')::pg_catalog.int4 OPERATOR(pg_catalog./) 10000),
+    'ext_version', (SELECT e.extversion FROM pg_catalog.pg_extension e WHERE e.extname OPERATOR(pg_catalog.=) 'kingres_shard'),
+    'has_secret', EXISTS (SELECT 1 FROM kingres.cluster_secret),
+    'catalog', kingres.internal_catalog_snapshot(),
+    -- bucket partitions that are attached
+    'partitions', COALESCE((SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+                                 'schema_name', ns.nspname, 'table_name', p.relname, 'part', c.relname))
+                              FROM pg_catalog.pg_inherits i
+                              JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) i.inhrelid
+                              JOIN pg_catalog.pg_class p ON p.oid OPERATOR(pg_catalog.=) i.inhparent
+                              JOIN pg_catalog.pg_namespace ns ON ns.oid OPERATOR(pg_catalog.=) p.relnamespace
+                              JOIN kingres.dist_table d ON d.relid::pg_catalog.oid OPERATOR(pg_catalog.=) p.oid
+                             WHERE d.method OPERATOR(pg_catalog.=) 'hash'), '[]'::pg_catalog.jsonb),
+    -- tables with the name of a bucket partition that are not partitions
+    'standalone', COALESCE((SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+                                 'schema_name', ns.nspname, 'part', c.relname,
+                                 'comment', pg_catalog.obj_description(c.oid, 'pg_class')))
+                              FROM pg_catalog.pg_class c
+                              JOIN pg_catalog.pg_namespace ns ON ns.oid OPERATOR(pg_catalog.=) c.relnamespace
+                             WHERE c.relkind OPERATOR(pg_catalog.=) 'r' AND NOT c.relispartition
+                               AND c.relname OPERATOR(pg_catalog.~) '_b[0-9]{4}$'
+                               AND EXISTS (SELECT 1 FROM kingres.dist_table d
+                                             JOIN pg_catalog.pg_class p ON p.oid OPERATOR(pg_catalog.=) d.relid::pg_catalog.oid
+                                            WHERE d.method OPERATOR(pg_catalog.=) 'hash'
+                                              AND p.relnamespace OPERATOR(pg_catalog.=) c.relnamespace
+                                              AND p.relname OPERATOR(pg_catalog.=) pg_catalog.left(c.relname, -6))), '[]'::pg_catalog.jsonb),
+    'orphans', COALESCE((SELECT pg_catalog.jsonb_agg(c.relname)
+                           FROM pg_catalog.pg_class c
+                          WHERE c.relnamespace OPERATOR(pg_catalog.=) 'kingres'::pg_catalog.regnamespace
+                            AND c.relkind OPERATOR(pg_catalog.=) 'r' AND c.relname OPERATOR(pg_catalog.~) '^orphan_[0-9]+_[0-9]+$'), '[]'::pg_catalog.jsonb),
+    'slots', COALESCE((SELECT pg_catalog.jsonb_agg(s.slot_name) FROM pg_catalog.pg_replication_slots s), '[]'::pg_catalog.jsonb),
+    'subscriptions', COALESCE((SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('name', s.subname, 'oid', s.oid::pg_catalog.int8))
+                                 FROM pg_catalog.pg_subscription s), '[]'::pg_catalog.jsonb),
+    'publications', COALESCE((SELECT pg_catalog.jsonb_agg(p.pubname) FROM pg_catalog.pg_publication p), '[]'::pg_catalog.jsonb),
+    'origins', COALESCE((SELECT pg_catalog.jsonb_agg(o.roname) FROM pg_catalog.pg_replication_origin o), '[]'::pg_catalog.jsonb),
+    'prepared', COALESCE((SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+                               'gid', x.gid, 'age', extract(epoch FROM pg_catalog.clock_timestamp() OPERATOR(pg_catalog.-) x.prepared)))
+                            FROM pg_catalog.pg_prepared_xacts x), '[]'::pg_catalog.jsonb));
+$$;
+
 CREATE OR REPLACE FUNCTION kingres.check_cluster(p_prepared_older_than interval DEFAULT interval '5 minutes')
     RETURNS TABLE (check_name text, node_id int, object text, detail text)
     LANGUAGE plpgsql
@@ -487,6 +553,9 @@ CREATE OR REPLACE FUNCTION kingres.check_cluster(p_prepared_older_than interval 
 DECLARE
     v_self   pg_catalog.int4;
     v_cat    pg_catalog.jsonb;
+    v_major  pg_catalog.int4;
+    v_ext    pg_catalog.text;
+    v_skip   pg_catalog.int4[] := '{}'::pg_catalog.int4[];	-- nodes that could not be asked, or that run another version
     n        pg_catalog.record;
     st       pg_catalog.jsonb;
     x        pg_catalog.record;
@@ -508,6 +577,8 @@ BEGIN
     PERFORM kingres.internal_require_map_group();
     SELECT l.node_id INTO v_self FROM kingres.local_node l;
     v_cat := kingres.internal_catalog_snapshot();
+    v_major := (pg_catalog.current_setting('server_version_num')::pg_catalog.int4 OPERATOR(pg_catalog./) 10000);
+    SELECT e.extversion INTO v_ext FROM pg_catalog.pg_extension e WHERE e.extname OPERATOR(pg_catalog.=) 'kingres_shard';
     v_grace := pg_catalog.make_interval(secs => 2 OPERATOR(pg_catalog.*)
         (SELECT pg_catalog.sum(s.setting::pg_catalog.float8) FROM pg_catalog.pg_settings s
           WHERE s.name IN ('kingres_shard.node_timeout', 'kingres_shard.recovery_interval')));
@@ -584,8 +655,22 @@ BEGIN
             check_name := 'node_unreachable'; node_id := n.node_id;
             object := pg_catalog.format('%s:%s', n.host, n.port); detail := SQLERRM;
             RETURN NEXT;
+            v_skip := pg_catalog.array_append(v_skip, n.node_id);
             CONTINUE;
         END;
+
+        -- A node that runs another version of the extension answers other questions than this
+        -- node asks: say so, and make no comparison with it (a copy that cannot be read is not a
+        -- copy that differs; review finding S5-02).
+        IF (st ->> 'ext_version') IS DISTINCT FROM v_ext THEN
+            check_name := 'extension_version_differs'; node_id := n.node_id;
+            object := pg_catalog.format('%s:%s', n.host, n.port);
+            detail := pg_catalog.format('the node runs kingres_shard %s, this node %s; nothing else is compared with it, and run ALTER EXTENSION kingres_shard UPDATE where the version is older',
+                                        COALESCE(st ->> 'ext_version', 'an older version'), v_ext);
+            RETURN NEXT;
+            v_skip := pg_catalog.array_append(v_skip, n.node_id);
+            CONTINUE;
+        END IF;
 
         -- The version is not part of the comparison: statements that touch no row
         -- of the catalog (a DROP TABLE runs the drop trigger on the node that
@@ -595,6 +680,23 @@ BEGIN
             object := pg_catalog.format('%s:%s', n.host, n.port);
             detail := pg_catalog.format('the catalog of this node (map version %s) differs from the map group''s (version %s)',
                                         st -> 'catalog' ->> 'version', v_cat ->> 'version');
+            RETURN NEXT;
+        END IF;
+
+        -- A node without the cluster secret: an ordinary role fails on every statement that needs another node.
+        IF (st ->> 'has_secret') OPERATOR(pg_catalog.=) 'false' THEN
+            check_name := 'secret_missing'; node_id := n.node_id;
+            object := pg_catalog.format('%s:%s', n.host, n.port);
+            detail := 'the node holds no cluster secret; statements of ordinary roles that need another node fail until kingres.sync_catalog() is run on the map group primary';
+            RETURN NEXT;
+        END IF;
+
+        -- One PostgreSQL major per cluster: a node of another major than this one.
+        IF (st ->> 'server_major') IS NOT NULL AND (st ->> 'server_major')::pg_catalog.int4 OPERATOR(pg_catalog.<>) v_major THEN
+            check_name := 'server_major_differs'; node_id := n.node_id;
+            object := pg_catalog.format('%s:%s', n.host, n.port);
+            detail := pg_catalog.format('the node runs PostgreSQL %s, this node PostgreSQL %s; all nodes of a cluster must run the same major version',
+                                        st ->> 'server_major', v_major);
             RETURN NEXT;
         END IF;
 
@@ -745,7 +847,8 @@ BEGIN
             v_det := '{}'::pg_catalog.text[];
             FOR n IN SELECT nd.node_id FROM kingres.node nd
                       WHERE nd.is_active AND nd.role OPERATOR(pg_catalog.=) 'primary'
-                        AND nd.node_id OPERATOR(pg_catalog.<>) v_self ORDER BY nd.node_id
+                        AND nd.node_id OPERATOR(pg_catalog.<>) v_self
+                        AND nd.node_id OPERATOR(pg_catalog.<>) ALL (v_skip) ORDER BY nd.node_id
             LOOP
                 BEGIN
                     v_dig := kingres.internal_exec_scalar(n.node_id,
@@ -918,3 +1021,98 @@ $$;
 
 -- 0.3 granted SELECT on the records of moves (error texts, node addresses, slot names) to everyone.
 REVOKE ALL ON kingres.bucket_move FROM PUBLIC;
+
+-- The status of the copy of a move, read the same way on every PostgreSQL major
+-- (see kingres_shard--0.4.sql); the 0.3 text names a column that 19 renamed.
+CREATE OR REPLACE FUNCTION kingres.internal_move_subscription_status(p_name text)
+    RETURNS jsonb
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+SELECT COALESCE(
+    (SELECT pg_catalog.jsonb_build_object(
+                'enabled', s.subenabled,
+                'tables', (SELECT pg_catalog.count(*) FROM pg_catalog.pg_subscription_rel r WHERE r.srsubid OPERATOR(pg_catalog.=) s.oid),
+                'ready', (SELECT pg_catalog.count(*) FROM pg_catalog.pg_subscription_rel r
+                           WHERE r.srsubid OPERATOR(pg_catalog.=) s.oid AND r.srsubstate OPERATOR(pg_catalog.=) 'r'),
+                'errors', COALESCE((SELECT (pg_catalog.to_jsonb(st) OPERATOR(pg_catalog.->>) 'apply_error_count')::pg_catalog.int8
+                                       OPERATOR(pg_catalog.+)
+                                       COALESCE(pg_catalog.to_jsonb(st) OPERATOR(pg_catalog.->>) 'sync_error_count',
+                                                pg_catalog.to_jsonb(st) OPERATOR(pg_catalog.->>) 'sync_table_error_count')::pg_catalog.int8
+                                      FROM pg_catalog.pg_stat_subscription_stats st
+                                     WHERE st.subid OPERATOR(pg_catalog.=) s.oid), 0))
+       FROM pg_catalog.pg_subscription s WHERE s.subname OPERATOR(pg_catalog.=) p_name),
+    pg_catalog.jsonb_build_object('missing', true));
+$$;
+
+-- A move that was asked to stop does not enter its switch, and cancel_bucket_move() says what became of the move.
+CREATE OR REPLACE FUNCTION kingres.internal_move_set(p_move bigint, p_phase text, p_detail text)
+    RETURNS void
+    LANGUAGE sql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+UPDATE kingres.bucket_move m
+   SET phase = p_phase, detail = p_detail, updated_at = pg_catalog.clock_timestamp()
+ WHERE m.move_id OPERATOR(pg_catalog.=) p_move
+   AND m.phase IN ('preparing', 'copying', 'catching_up', 'switching')
+   -- A move that was asked to stop does not enter its switch (review finding S5-05).
+   AND NOT (p_phase OPERATOR(pg_catalog.=) 'switching' AND m.cancel_requested);
+$$;
+
+CREATE OR REPLACE FUNCTION kingres.cancel_bucket_move(move_id bigint)
+    RETURNS void
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_move   pg_catalog.int8 := move_id;
+    v_self   pg_catalog.int4;
+    v_phase  pg_catalog.text;
+    v_res    pg_catalog.text;
+    v_to     pg_catalog.int4;
+    v_start  pg_catalog.timestamptz := pg_catalog.clock_timestamp();
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    PERFORM kingres.internal_require_map_group();
+    SELECT l.node_id INTO v_self FROM kingres.local_node l;
+    v_to := (SELECT s.setting::pg_catalog.int4 FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'kingres_shard.node_timeout');
+    SELECT b.phase INTO v_phase FROM kingres.bucket_move b WHERE b.move_id OPERATOR(pg_catalog.=) v_move;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'bucket move % does not exist', v_move USING ERRCODE = 'undefined_object';
+    END IF;
+    IF v_phase OPERATOR(pg_catalog.=) 'switching' THEN
+        RAISE EXCEPTION 'bucket move % is switching and cannot be cancelled', v_move
+            USING ERRCODE = 'object_not_in_prerequisite_state',
+                  HINT = 'The switch ends in a moment, either completed or back to catching up; cancel then.';
+    ELSIF v_phase NOT IN ('preparing', 'copying', 'catching_up') THEN
+        RAISE EXCEPTION 'bucket move % is already %', v_move, v_phase
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    -- In a session of its own (committed at once): flag it, and undo it if
+    -- nobody is running it; otherwise the running session undoes it.
+    v_res := kingres.internal_exec_scalar(v_self, pg_catalog.format(
+        'UPDATE kingres.bucket_move SET cancel_requested = true WHERE move_id = %s AND phase IN (''preparing'', ''copying'', ''catching_up'')', v_move) ||
+        '; SELECT kingres.internal_undo_move(' || v_move || ', ''cancelled by kingres.cancel_bucket_move()'', ''cancelled'', false)', v_to * 4000);
+    LOOP
+        SELECT b.phase INTO v_phase FROM kingres.bucket_move b WHERE b.move_id OPERATOR(pg_catalog.=) v_move;
+        EXIT WHEN v_phase NOT IN ('preparing', 'copying', 'catching_up');
+        IF pg_catalog.clock_timestamp() OPERATOR(pg_catalog.>) (v_start OPERATOR(pg_catalog.+) pg_catalog.make_interval(secs => v_to)) THEN
+            -- The request is recorded, and the move does not start its switch once it is (see
+            -- internal_move_set and move_bucket): it will stop, it just has not answered yet.
+            RAISE NOTICE 'the request to stop bucket move % is recorded; the session that runs it has not answered yet (it is still %) and will stop it before its switch',
+                v_move, v_phase;
+            RETURN;
+        END IF;
+        PERFORM pg_catalog.pg_sleep(0.1);
+    END LOOP;
+    IF v_phase OPERATOR(pg_catalog.=) 'cancelled' THEN
+        RAISE NOTICE 'bucket move % was stopped', v_move;
+    ELSIF v_phase OPERATOR(pg_catalog.=) 'failed' THEN
+        RAISE NOTICE 'bucket move % had failed and was undone', v_move;
+    ELSE
+        RAISE EXCEPTION 'bucket move % passed the point where it can be stopped (it is %)', v_move, v_phase
+            USING ERRCODE = 'object_not_in_prerequisite_state',
+                  HINT = 'It finishes by itself; a completed move can be moved back with kingres.move_bucket().';
+    END IF;
+END;
+$$;

@@ -143,7 +143,7 @@ kingres_shard_conn_init(void)
  * are not interesting to the client and libpq would print them to stderr.
  */
 static void
-ignore_notice(void *arg, const PGresult *res)
+ignore_notice(void *arg, const KsRawResult *res)
 {
 }
 
@@ -1046,6 +1046,55 @@ kingres_shard_result_sqlstate(PGresult *res)
 }
 
 /*
+ * remote_extension_version
+ *
+ * The version of the extension that host:port has, asked on a connection that
+ * claims nothing (the node refused the claim of this one), as the current role;
+ * NULL when it cannot be asked.  Only used to explain a refusal.
+ */
+static char *
+remote_extension_version(const char *host, int port)
+{
+	const char *keywords[8];
+	const char *values[8];
+	char		portstr[16];
+	char		timeoutstr[16];
+	PGconn	   *conn;
+	PGresult   *res;
+	char	   *version = NULL;
+	int			n = 0;
+
+	snprintf(portstr, sizeof(portstr), "%d", port);
+	snprintf(timeoutstr, sizeof(timeoutstr), "%d", kingres_shard_node_connect_timeout);
+	keywords[n] = "host";
+	values[n++] = host;
+	keywords[n] = "port";
+	values[n++] = portstr;
+	keywords[n] = "dbname";
+	values[n++] = get_database_name(MyDatabaseId);
+	keywords[n] = "user";
+	values[n++] = GetUserNameFromId(GetUserId(), false);
+	keywords[n] = "connect_timeout";
+	values[n++] = timeoutstr;
+	keywords[n] = NULL;
+	values[n] = NULL;
+	conn = PQconnectdbParams(keywords, values, false);
+	if (conn == NULL)
+		return NULL;
+	if (PQstatus(conn) == CONNECTION_OK)
+	{
+		res = kingres_shard_bounded_exec(conn,
+										 "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'kingres_shard'",
+										 false);
+		if (res != NULL && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1)
+			version = pstrdup(PQgetvalue(res, 0, 0));
+		PQclear(res);
+	}
+	PQfinish(conn);
+	return version;
+}
+
+/*
  * kingres_shard_report_error
  *
  * Raise the error held by res (which is cleared) as a local ERROR, keeping
@@ -1100,6 +1149,28 @@ kingres_shard_report_error(KsConn *kc, PGresult *res, const char *sql)
 						kc->host, kc->port),
 				 errdetail("%s", primary),
 				 errhint("Run ALTER EXTENSION kingres_shard UPDATE on that node; every node of a cluster must run the same version.")));
+
+	/*
+	 * A node that does not accept the claim of this session to come from a
+	 * node of the cluster: with another version of the extension the proof is
+	 * made another way (0.3 and 0.4 differ), and "cannot prove it" says nothing
+	 * about that (review finding S5-02).  Ask for the version and say it.
+	 */
+	if (strstr(primary, "claims to have been opened by another node of the cluster") != NULL)
+	{
+		char	   *theirs = remote_extension_version(kc->host, kc->port);
+
+		if (theirs == NULL || strcmp(theirs, KINGRES_SHARD_EXT_VERSION) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 theirs ?
+					 errmsg("node %s:%d runs kingres_shard %s, this node runs %s", kc->host, kc->port,
+							theirs, KINGRES_SHARD_EXT_VERSION) :
+					 errmsg("node %s:%d did not accept the session of this node, and its kingres_shard version could not be read",
+							kc->host, kc->port),
+					 errdetail("The node said: %s", primary),
+					 errhint("Every node of a cluster must run the same version of kingres_shard; run ALTER EXTENSION kingres_shard UPDATE on the nodes that run an older one.")));
+	}
 
 	ereport(ERROR,
 			(errcode(sqlstate),

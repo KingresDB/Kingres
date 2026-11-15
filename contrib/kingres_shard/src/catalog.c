@@ -183,7 +183,7 @@ catscan_begin(CatScan *cs, Oid relid)
 	 */
 	cs->snap = RegisterSnapshot(IsInParallelMode() ? GetActiveSnapshot() :
 								GetLatestSnapshot());
-	cs->scan = table_beginscan(cs->rel, cs->snap, 0, NULL);
+	cs->scan = KS_TABLE_BEGINSCAN(cs->rel, cs->snap, 0, NULL);
 }
 
 static HeapTuple

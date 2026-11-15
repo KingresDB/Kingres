@@ -732,6 +732,14 @@ ds_reset_callback(void *arg)
 	KsDistScanState *s = (KsDistScanState *) arg;
 	ListCell   *lc;
 
+	/*
+	 * PostgreSQL 19 wraps every libpq result in an object that the memory
+	 * context frees itself, in a reset callback registered after this one, so
+	 * the results are gone already (see pg_compat.h).
+	 */
+	if (KS_LIBPQ_RESULTS_OWNED_BY_CONTEXT)
+		return;
+
 	foreach(lc, s->frags)
 	{
 		DsFrag	   *f = (DsFrag *) lfirst(lc);
@@ -846,11 +854,22 @@ static void
 frag_collect(DsFrag *f)
 {
 	PGresult   *res;
+	MemoryContext oldcxt;
 
 	if (!f->in_flight)
 		return;
 	kingres_shard_conn_clear_pending(f->kc, f);
+
+	/*
+	 * The batch outlives this call, and the call can come from another
+	 * statement that wants the connection (ds_finish_pending), in whatever
+	 * memory context that statement is in.  PostgreSQL 19 ties a libpq result
+	 * to the context it is made in (see pg_compat.h), so make it in the one of
+	 * the query, which lives as long as the scan does.
+	 */
+	oldcxt = MemoryContextSwitchTo(f->scan->css.ss.ps.state->es_query_cxt);
 	res = libpqsrv_get_result_last(f->kc->conn, PG_WAIT_EXTENSION);
+	MemoryContextSwitchTo(oldcxt);
 	f->kc->in_query = false;
 	f->in_flight = false;
 	if (res == NULL)

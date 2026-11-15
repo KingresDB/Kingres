@@ -34,6 +34,11 @@ kingres_shard.recovery_interval = 0");
 my $n1 = make_node('c1', 'UTF8');
 my $n2 = make_node('c2', 'LATIN1');
 
+# PostgreSQL 19 keeps standard_conforming_strings on: setting it to "off" is an
+# error there, so the statement is left out (the values written with E'...' do
+# not depend on it).
+my $scs_off = $n1->pg_version->major >= 19 ? '' : 'SET standard_conforming_strings = off;';
+
 $n1->safe_psql('postgres', 'CREATE EXTENSION kingres_shard');
 $n1->safe_psql('postgres',
 	sprintf("SELECT kingres.init_cluster('%s', %d)", $n1->host, $n1->port));
@@ -145,7 +150,7 @@ sub run_sql
 	$n1->safe_psql('postgres', "INSERT INTO public.ses (id) VALUES ($kr)");
 	my ($rc, $out, $err) = run_sql($n1, qq{
 		SET datestyle = 'SQL, DMY'; SET intervalstyle = sql_standard;
-		SET extra_float_digits = -3; SET standard_conforming_strings = off;
+		SET extra_float_digits = -3; $scs_off
 		SET timezone = 'Asia/Tokyo'; SET bytea_output = escape;
 		SELECT current_setting('datestyle'), current_setting('intervalstyle'),
 		       current_setting('extra_float_digits'),
@@ -192,7 +197,7 @@ check_case('extra_float_digits -3',
 	q{SET extra_float_digits = -3;},
 	values => { f => q{'0.30000000000000004'::float8} });
 check_case('standard_conforming_strings off',
-	q{SET standard_conforming_strings = off;},
+	$scs_off,
 	values => { s => q{E'back\\\\slash ''q'' \\\\n'}, b => q{E'\\\\x00ff'::bytea} });
 check_case('standard_conforming_strings on, backslashes',
 	q{SET standard_conforming_strings = on;},
@@ -201,7 +206,7 @@ check_case('bytea_output escape',
 	q{SET bytea_output = escape;},
 	values => { b => q{'\x5c27ff00'::bytea} });
 check_case('bytea_output escape and standard_conforming_strings off',
-	q{SET bytea_output = escape; SET standard_conforming_strings = off;},
+	q{SET bytea_output = escape;} . $scs_off,
 	values => { b => q{E'\\\\x5c27ff00'::bytea}, s => q{E'\\\\\\\\'} });
 check_case('non-ASCII text under a LATIN1 remote node',
 	q{SET standard_conforming_strings = on;},
@@ -216,8 +221,7 @@ check_case('TimeZone America/Los_Angeles',
 	after => q{UPDATE public.ses SET d2 = ts::date WHERE id = %ID%;});
 check_case('everything at once',
 	q{SET datestyle = 'SQL, DMY'; SET intervalstyle = sql_standard; SET extra_float_digits = 0;
-	  SET standard_conforming_strings = off; SET bytea_output = escape;
-	  SET timezone = 'Asia/Tokyo';},
+	  SET bytea_output = escape; SET timezone = 'Asia/Tokyo';} . $scs_off,
 	values => {
 		d   => q{'03/04/2026'},
 		ts  => q{'04/05/2026 10:11:12'},

@@ -20,7 +20,7 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 use POSIX ();
 use Time::HiRes qw(time sleep);
-use KingresShardTest qw(make_cluster move_state wait_for_file);
+use KingresShardTest qw(make_cluster move_state wait_for_fault_file);
 
 my @nodes = make_cluster('ld', 3, logical => 1);
 my ($n1, $n2, $n3) = @nodes;
@@ -195,7 +195,7 @@ is($n1->safe_psql('postgres', "SELECT count(*) FROM kingres.bucket_move WHERE ph
 	# created, so a transaction that starts during the copy holds the copy back and
 	# the move never reaches the switch.  The move stops by itself at the end of the
 	# catch-up (a fault point), which is exactly that moment, however slow the host.
-	ok(wait_for_file("$hold.reached", 120), 'the move reached the end of the catch-up');
+	ok(wait_for_fault_file("$hold.reached", 120), 'the move reached the end of the catch-up');
 	my $holder = $nodes[$src]->background_psql('postgres');
 	$holder->query_safe("BEGIN; UPDATE public.orders SET customer = 8 WHERE id = $key;");
 	unlink($hold);

@@ -1613,6 +1613,12 @@ BEGIN
 END;
 $$;
 
+-- PostgreSQL 19 has no sync_error_count in pg_stat_subscription_stats, and the body
+-- of a SQL function is checked when the function is created, so the check is left out
+-- for this one function (kingres_shard--0.3--0.4.sql replaces it with a body that works on
+-- both majors).  What is created is the same on every major.
+SET LOCAL check_function_bodies = off;
+
 -- On the target: how far the copy is.
 CREATE FUNCTION kingres.internal_move_subscription_status(p_name text)
     RETURNS jsonb
@@ -1631,6 +1637,7 @@ SELECT COALESCE(
        FROM pg_catalog.pg_subscription s WHERE s.subname OPERATOR(pg_catalog.=) p_name),
     pg_catalog.jsonb_build_object('missing', true));
 $$;
+RESET check_function_bodies;
 
 -- On the source: the lag of the slot behind the WAL, in bytes, or NULL.
 CREATE FUNCTION kingres.internal_move_slot_lag(p_name text)

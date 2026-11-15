@@ -27,7 +27,7 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 use POSIX ();
 use Time::HiRes qw(sleep);
-use KingresShardTest qw(make_cluster keys_of_group wait_for_file);
+use KingresShardTest qw(make_cluster keys_of_group wait_for_fault_file);
 
 my @nodes = make_cluster('tw', 3, logical => 1);
 my ($n1, $n2, $n3) = @nodes;
@@ -94,12 +94,12 @@ if ($mover == 0)
 	system("psql -X -q -h " . $n1->host . " -p " . $n1->port . " -d postgres -c \"$sql\" > $tmp/mover.out 2>&1");
 	POSIX::_exit(0);
 }
-ok(wait_for_file("$mv_hold.reached", 120), 'the move reached the end of the catch-up');
+ok(wait_for_fault_file("$mv_hold.reached", 120), 'the move reached the end of the catch-up');
 
 # The session processes the messages of the move so far (its catalog cache is dropped),
 # reads what it needs, and stops in the planner hook with its statement parsed.
 touch($go1);
-ok(wait_for_file("$plan_hold.reached", 60), 'the statement of the session stopped in the planner hook');
+ok(wait_for_fault_file("$plan_hold.reached", 60), 'the statement of the session stopped in the planner hook');
 
 # The switch commits on every node while the statement waits.
 unlink($mv_hold);

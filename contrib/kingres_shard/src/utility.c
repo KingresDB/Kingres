@@ -265,8 +265,9 @@ reject(Node *parsetree, const KsDistTable *dt, bool structural, const char *deta
 {
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("%s is not supported on distributed tables yet",
-					utility_name(parsetree)),
+			 errmsg("%s is not supported on %s tables yet",
+					utility_name(parsetree),
+					dt->is_reference ? "reference" : "distributed"),
 			 structural ?
 			 errdetail("The statement would change the distribution column or a bucket partition of distributed table \"%s\".",
 					   get_rel_name(dt->relid)) :
@@ -1137,9 +1138,9 @@ decide(Node *parsetree, const KsCatalog *cat, UtilDecision *d)
 			}
 			break;
 
-		case T_ClusterStmt:
+		case KS_T_CLUSTER_STMT:
 			{
-				const KsDistTable *any = find_dist(cat, rangevar_relid(((ClusterStmt *) parsetree)->relation));
+				const KsDistTable *any = find_dist(cat, rangevar_relid(ks_cluster_stmt_relation(parsetree)));
 
 				if (any != NULL && multi)
 					reject(parsetree, any, false, NULL);
@@ -1337,7 +1338,7 @@ statement_is_of_interest(Node *parsetree)
 		case T_GrantStmt:
 		case T_CommentStmt:
 		case T_CopyStmt:
-		case T_ClusterStmt:
+		case KS_T_CLUSTER_STMT:
 		case T_CreateTrigStmt:
 		case T_RuleStmt:
 		case T_CreatePolicyStmt:
@@ -1348,6 +1349,36 @@ statement_is_of_interest(Node *parsetree)
 		default:
 			return false;
 	}
+}
+
+/*
+ * refuse_trigger_on_reference_table
+ *
+ * A trigger on a reference table runs in the write of every node, with whatever
+ * its function reads on that node: a count of a distributed table, a clock, a
+ * sequence.  Nothing can prove that every copy gets the same row from it (review
+ * finding S5-01), so there is none: not with routing off either, which is how
+ * the one the review made got there.  The extension creates no trigger on a
+ * reference table itself (its foreign keys are internal triggers that do not go
+ * through this statement), so there is no exception.
+ */
+static void
+refuse_trigger_on_reference_table(CreateTrigStmt *stmt)
+{
+	const KsCatalog *cat = kingres_shard_catalog();
+	const KsDistTable *dt;
+
+	if (!cat->present || cat->ndist_tables == 0)
+		return;
+	dt = direct_dist(cat, rangevar_relid(stmt->relation));
+	if (dt == NULL || !dt->is_reference)
+		return;
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("a trigger on reference table \"%s\" is not supported",
+					get_rel_name(dt->relid)),
+			 errdetail("A write to a reference table runs on every node, and what a trigger reads or computes there (another table, a clock, a sequence) can differ between the copies."),
+			 errhint("Put the logic in the statement that writes the table, or in a trigger on a distributed table.")));
 }
 
 /*
@@ -1379,6 +1410,10 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 	(void) kingres_shard_session_forwarded();
 
 	memset(&d, 0, sizeof(d));
+
+	/* Whatever the routing setting is: see refuse_trigger_on_reference_table. */
+	if (IsA(parsetree, CreateTrigStmt) && !creating_extension && !kingres_shard_session_forwarded())
+		refuse_trigger_on_reference_table((CreateTrigStmt *) parsetree);
 
 	if (kingres_shard_enable_routing && !creating_extension &&
 		statement_is_of_interest(parsetree) &&

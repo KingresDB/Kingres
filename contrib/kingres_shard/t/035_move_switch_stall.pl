@@ -28,7 +28,7 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 use POSIX ();
 use Time::HiRes qw(sleep time);
-use KingresShardTest qw(make_cluster run_sql wait_for_file);
+use KingresShardTest qw(make_cluster run_sql wait_for_fault_file);
 
 my @nodes = make_cluster('st', 3, logical => 1);
 my ($n1, $n2, $n3) = @nodes;
@@ -105,7 +105,7 @@ sub move_and_watch
 		  . "SELECT kingres.move_bucket(1, $bucket, 2);\n");
 	# The holder begins after the copy is complete: the slot of the move waits for
 	# the transactions that are running when it is made.
-	die 'the copy did not complete' unless wait_for_file("$flag.reached", 120);
+	die 'the copy did not complete' unless wait_for_fault_file("$flag.reached", 120);
 	my $holder = $start_holder->();
 	unlink($flag);
 	my ($samples, $waiting) = (0, 0);

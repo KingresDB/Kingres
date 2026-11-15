@@ -63,7 +63,6 @@
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
-#include "libpq-fe.h"
 #include "miscadmin.h"
 #include "storage/latch.h"
 #include "storage/lock.h"
@@ -636,6 +635,8 @@ kingres_internal_partition_identity(PG_FUNCTION_ARGS)
 {
 	if (PG_ARGISNULL(0))
 		PG_RETURN_NULL();
+	/* Like the other helpers: a node session, a superuser or a role that may read the table. */
+	require_node_session(PG_GETARG_OID(0));
 	PG_RETURN_INT64(kingres_shard_partition_identity_now(PG_GETARG_OID(0)));
 }
 

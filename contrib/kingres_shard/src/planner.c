@@ -99,6 +99,14 @@
 
 static planner_hook_type prev_planner_hook = NULL;
 
+/*
+ * The ExplainState that the planner hook was called with, for the next planner
+ * in the chain; NULL on a major whose hook has none.  Saved and restored
+ * around each call, because a statement planned while another is planned
+ * (see kingres_shard_planner_hook) has its own.
+ */
+static void *current_explain = NULL;
+
 /* One distributed table reference found in the query tree. */
 typedef struct DistRef
 {
@@ -124,7 +132,8 @@ typedef struct Analysis
 static PlannedStmt *kingres_shard_planner_hook(Query *parse,
 												const char *query_string,
 												int cursorOptions,
-												ParamListInfo boundParams);
+												ParamListInfo boundParams
+												KS_PLANNER_ES_PARAM);
 static bool is_scan_fragment(Query *q, const KsCatalog *cat);
 static PlannedStmt *planner_hook_body(Query *parse, const char *query_string,
 									   int cursorOptions, ParamListInfo boundParams);
@@ -151,8 +160,10 @@ pass_through(Query *parse, const char *query_string, int cursorOptions,
 			 ParamListInfo boundParams)
 {
 	if (prev_planner_hook)
-		return prev_planner_hook(parse, query_string, cursorOptions, boundParams);
-	return standard_planner(parse, query_string, cursorOptions, boundParams);
+		return prev_planner_hook(parse, query_string, cursorOptions, boundParams
+								KS_PLANNER_ES_ARG(current_explain));
+	return standard_planner(parse, query_string, cursorOptions, boundParams
+							KS_PLANNER_ES_ARG(current_explain));
 }
 
 /* Remove binary-compatible relabeling, which hides a Var or a constant. */
@@ -1367,11 +1378,13 @@ refuse_bucket_partition_write(Query *parse, const KsCatalog *cat)
  */
 static PlannedStmt *
 kingres_shard_planner_hook(Query *parse, const char *query_string,
-							int cursorOptions, ParamListInfo boundParams)
+							int cursorOptions, ParamListInfo boundParams KS_PLANNER_ES_PARAM)
 {
 	PlannedStmt *result;
 	bool		old = kingres_shard_distscan_set_active(false);
+	void	   *old_explain = current_explain;
 
+	current_explain = (void *) KS_PLANNER_ES_VALUE;
 	PG_TRY();
 	{
 		result = planner_hook_body(parse, query_string, cursorOptions, boundParams);
@@ -1379,6 +1392,7 @@ kingres_shard_planner_hook(Query *parse, const char *query_string,
 	PG_FINALLY();
 	{
 		(void) kingres_shard_distscan_set_active(old);
+		current_explain = old_explain;
 	}
 	PG_END_TRY();
 	return result;
