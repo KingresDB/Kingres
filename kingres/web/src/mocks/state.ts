@@ -53,6 +53,8 @@ export const mockConfig = {
   unsupported: new Set<OperationId>(),
   /** Artificial network delay for every request. */
   latencyMs: 0,
+  /** How long a server that has left the cluster answers 503 before it is uninitialized. */
+  leaveResetMs: 2000,
 }
 
 // --- types of the internal records ------------------------------------------------------------
@@ -69,6 +71,10 @@ interface ServerRec {
   startedAt: number
   /** False when the server has not reported resource usage and uptime (they are null then). */
   telemetry: boolean
+  certificateExpiresAt?: string | null
+  seenFingerprint?: string | null
+  fingerprintPinned?: boolean
+  certificateRevokedAt?: string | null
 }
 
 interface GroupRec {
@@ -160,6 +166,12 @@ export interface MockState {
   logs: LogEntry[]
   localSettings: S['LocalSettings']
   instanceStates: Map<number, Instance['state']>
+  /** True while the instance that hosts the system database is stopped on purpose. */
+  systemDatabaseStopped: boolean
+  /** Set when this server has left the cluster: it answers 503 until `until`, then is uninitialized. */
+  leave: { until: number } | null
+  /** False simulates a manager leader that cannot be reached (leaving needs `force` then). */
+  leaderReachable: boolean
   session: SessionRec | null
   /** Result sets the workbench can select from, by table name (hostile-data tests). */
   extraQueryTables?: Record<string, { columns: S['QueryColumn'][]; rows: unknown[][] }>
@@ -169,6 +181,7 @@ export interface MockState {
 
 export const nowIso = (): string => new Date().toISOString()
 const ago = (seconds: number): string => new Date(Date.now() - seconds * 1000).toISOString()
+const ahead = (seconds: number): string => new Date(Date.now() + seconds * 1000).toISOString()
 
 /** Deterministic 64-hex-character hash-like string (not cryptographic; this is mock data). */
 export function fakeHash(seed: string): string {
@@ -444,6 +457,10 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
     startedAt: Date.now() - (86400 * 12 + (n - 10) * 3600) * 1000,
     // The third server's agent has not reported resources and uptime yet: those values are null.
     telemetry: n !== 13,
+    // The creator of the cluster has no first contact on record; the other two were added.
+    certificateExpiresAt: n === 13 ? ahead(86400 * 9) : ahead(86400 * 300),
+    seenFingerprint: n === 11 ? null : fakeHash(`bootstrap-${n}`),
+    fingerprintPinned: n === 12,
   }))
   const groups: GroupRec[] = [
     {
@@ -746,12 +763,49 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
             shardGroupId: g,
             blockHeight: 1800 + g * 10,
             blockHash: fakeHash(`b${g}-${1800 + g * 10}`),
+            document: digestDocument(g, 1800 + g * 10),
           })),
           aggregateHash: fakeHash('agg-3'),
           anchors: [],
         },
       ],
+      // Newest first, as the contract says. Ids grow with time; id 8 was recorded without a task.
       verifications: [
+        ...[16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6].map((id): S['LedgerVerification'] => {
+          const failed = id === 12
+          return {
+            id,
+            databaseName: 'shop',
+            state: failed ? 'failed' : 'passed',
+            scope: id % 3 === 0 ? 'full' : 'sinceLastVerified',
+            digestId: null,
+            taskId: id === 8 ? null : 80 + id,
+            startedAt: ago(600 * (17 - id) + 300),
+            finishedAt: ago(600 * (17 - id)),
+            startedBy: id % 2 ? 'ops' : 'system',
+            blocksChecked: 40 + id,
+            rowsChecked: 1000 * id,
+            inconsistencies: failed
+              ? [
+                  {
+                    shardGroupId: 2,
+                    blockHeight: 1805,
+                    kind: 'blockHashMismatch',
+                    table: null,
+                    detail: 'The stored hash of block 1805 differs from the recomputed hash.',
+                  },
+                  {
+                    shardGroupId: 3,
+                    blockHeight: null,
+                    kind: 'other',
+                    table: 'public.orders',
+                    detail:
+                      'ledger_check_x: the check reported a mismatch the contract has no kind for.',
+                  },
+                ]
+              : [],
+          }
+        }),
         {
           id: 5,
           databaseName: 'shop',
@@ -759,8 +813,8 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
           scope: 'full',
           digestId: null,
           taskId: 90,
-          startedAt: ago(7200),
-          finishedAt: ago(6900),
+          startedAt: ago(86400),
+          finishedAt: ago(86400 - 300),
           startedBy: 'ops',
           blocksChecked: 5_460,
           rowsChecked: 4_812_330,
@@ -782,6 +836,9 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
       restartRequired: false,
     },
     instanceStates: new Map(),
+    systemDatabaseStopped: false,
+    leave: null,
+    leaderReachable: true,
     session: null,
   }
 }
@@ -868,6 +925,10 @@ export function serverView(s: MockState, rec: ServerRec): Server {
     serverGroup: rec.serverGroup,
     shouldHaveShards: rec.shouldHaveShards,
     isManagerLeader: rec.id === '10.0.0.11',
+    certificateExpiresAt: rec.certificateExpiresAt ?? null,
+    certificateRevokedAt: rec.certificateRevokedAt ?? null,
+    seenFingerprint: rec.seenFingerprint ?? null,
+    fingerprintPinned: rec.seenFingerprint ? (rec.fingerprintPinned ?? false) : false,
     // The version of a server that has not reported yet is unknown.
     version: rec.telemetry ? rec.version : null,
     uptimeSeconds: rec.telemetry ? Math.floor((Date.now() - rec.startedAt) / 1000) : null,
@@ -1034,6 +1095,18 @@ export function ledgerStatusOf(s: MockState, db: DbRec): S['LedgerStatus'] {
   }
 }
 
+/** The digest of one chain as the extension returns it (what `kingres-verify --digest` reads). */
+export function digestDocument(g: number, height: number): Record<string, unknown> {
+  return {
+    format: 1,
+    chain_id: `chain-${g}`,
+    height,
+    block_hash: fakeHash(`b${g}-${height}`),
+    hash_version: 1,
+    generated_at_us: 1_700_000_000_000_000 + height,
+  }
+}
+
 export function ledgerBlock(g: number, height: number): LedgerBlock {
   return {
     shardGroupId: g,
@@ -1054,6 +1127,7 @@ export interface TaskInit {
   kind: TaskKind
   subject: Task['subject']
   steps: string[]
+  detail?: string | null
   apply: () => void
   user?: string
   durationMs?: number
@@ -1074,9 +1148,14 @@ export function createTask(s: MockState, init: TaskInit): Task {
     progress: {
       percent: 0,
       currentStep: init.steps[0] ?? null,
-      steps: init.steps.map((name, i) => ({ name, state: i === 0 ? 'running' : 'pending' })),
+      steps: init.steps.map((name, i) => ({
+        name,
+        state: i === 0 ? 'running' : 'pending',
+        ...(i === 0 && init.detail ? { detail: init.detail } : {}),
+      })),
     },
     error: null,
+    detail: init.detail ?? null,
     subject: init.subject,
     cancellable: init.cancellable ?? false,
     createdAt: created,
@@ -1131,10 +1210,14 @@ export function tickTasks(s: MockState): void {
     rec.onProgress?.(fraction)
     t.progress.percent = Math.round(fraction * 1000) / 10
     t.progress.currentStep = fraction >= 1 ? null : (t.progress.steps[current]?.name ?? null)
-    t.progress.steps = t.progress.steps.map((st, i) => ({
-      ...st,
-      state: fraction >= 1 || i < current ? 'done' : i === current ? 'running' : 'pending',
-    }))
+    t.progress.steps = t.progress.steps.map((st, i) => {
+      const state = fraction >= 1 || i < current ? 'done' : i === current ? 'running' : 'pending'
+      // The running step repeats the task's detail (contract 0.4.0).
+      const detail = state === 'running' ? t.detail : null
+      const { detail: _old, ...rest } = st
+      void _old
+      return { ...rest, state, ...(detail ? { detail } : {}) }
+    })
     t.updatedAt = nowIso()
     if (fraction >= 1 && !rec.applied) {
       rec.applied = true

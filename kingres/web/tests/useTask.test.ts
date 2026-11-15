@@ -12,6 +12,7 @@ function task(id: number, state: TaskState, percent: number): Task {
     state,
     progress: { percent, currentStep: null, steps: [] },
     error: state === 'failed' ? { code: 'x', message: 'disk full' } : null,
+    detail: null,
     subject: null,
     cancellable: false,
     createdAt: '2026-01-01T00:00:00Z',

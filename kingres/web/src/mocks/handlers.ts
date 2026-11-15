@@ -27,6 +27,7 @@ import {
   bucketView,
   createTask,
   dataGroups,
+  digestDocument,
   fakeHash,
   hostNumber,
   groupView,
@@ -36,6 +37,7 @@ import {
   makeBuckets,
   MOCK_PASSWORD,
   MOCK_SETUP_TOKEN,
+  mockConfig,
   nowIso,
   overview,
   planMoves,
@@ -48,6 +50,30 @@ import {
 } from './state'
 
 type S = components['schemas']
+
+/**
+ * A digest document as the extension prints it: its own key order and spacing, and an integer a
+ * float cannot hold. The panel must save these characters unchanged.
+ */
+function oddDocument(doc: Record<string, unknown>): string {
+  const members = Object.entries(doc)
+    .reverse()
+    .map(([k, v]) => `"${k}" : ${JSON.stringify(v)}`)
+  members.push('"entries_total":  9007199254740993')
+  return `{ ${members.join(' ,\n\t')} }`
+}
+
+/** JSON text of a digest or of a page of digests, with every chain document written by oddDocument. */
+function digestJson(value: unknown): string {
+  const docs: string[] = []
+  const text = JSON.stringify(value, (k, v: unknown) => {
+    if (k !== 'document') return v
+    docs.push(oddDocument(v as Record<string, unknown>))
+    return `@@${docs.length - 1}@@`
+  })
+  return text.replace(/"@@(\d+)@@"/g, (_, i: string) => docs[Number(i)] as string)
+}
+
 const NAME_RE = /^[a-z_][a-z0-9_]{0,62}$/
 const ADDRESS_RE = /^(\[[0-9a-fA-F:]+\]|[A-Za-z0-9.-]+):([0-9]{1,5})$/
 
@@ -107,6 +133,39 @@ function server(s: MockState, id: string) {
   const rec = s.servers.find((x) => x.id === id)
   if (!rec) throw problem('not_found', `Server ${id} does not exist.`)
   return rec
+}
+
+const LEADER = '10.0.0.11'
+
+function ownsCopy(g: { primaryServerId: string | null; standbyServerIds: string[] }, id: string) {
+  return g.primaryServerId === id || g.standbyServerIds.includes(id)
+}
+
+/** The sharded databases in which the server holds a copy of at least one bucket. */
+function bucketsHeldBy(s: MockState, id: string): { database: string; buckets: number }[] {
+  const out: { database: string; buckets: number }[] = []
+  for (const d of s.databases) {
+    if (!d.info.sharding.enabled) continue
+    let n = 0
+    for (const b of [...d.buckets.values()].flat()) {
+      const g = s.groups.find((x) => x.id === b.group)
+      if (g && ownsCopy(g, id)) n += 1
+    }
+    if (n > 0) out.push({ database: d.info.name, buckets: n })
+  }
+  return out
+}
+
+/** An unfinished add, remove or leave of this server. */
+function isOpenServerTask(
+  t: { kind: string; state: string; subject: { id: string } | null },
+  id: string,
+): boolean {
+  return (
+    t.state === 'running' &&
+    ['server.add', 'server.remove', 'server.leave'].includes(t.kind) &&
+    t.subject?.id === id
+  )
 }
 
 function markRebalance(s: MockState, reason: S['RebalanceReason']): void {
@@ -198,6 +257,11 @@ function requireSetupToken(ctx: Ctx): void {
 }
 
 /** A second setup request while one runs is a conflict (the token stays valid after a failure). */
+/** Colons and case do not matter for a fingerprint. */
+function normalizeFp(text: string): string {
+  return text.replace(/[:s]/g, '').toLowerCase()
+}
+
 function requireNoRunningSetup(s: MockState): void {
   if (s.tasks.some((x) => x.setup && x.task.state === 'running'))
     throw problem('operation_in_progress', 'A setup request is already running.')
@@ -293,9 +357,16 @@ const joinCluster: Handler = (ctx) => {
     throw problem('unprocessable', `Cannot reach ${b.existingNodeAddress}.`)
   if (b.admin.password !== MOCK_PASSWORD) throw problem('invalid_credentials')
   const s = ctx.s
+  // The certificate the existing server presents; a pin that differs refuses the join before the
+  // password is sent.
+  const presented = fakeHash(`internal-${b.existingNodeAddress.replace(/:[0-9]+$/, '')}`)
+  const pinMismatch = !!b.expectedFingerprint && normalizeFp(b.expectedFingerprint) !== presented
   return accepted(
     createTask(s, {
       kind: 'cluster.join',
+      failWith: pinMismatch
+        ? 'The certificate presented by the existing server is not the expected one. Nothing was sent.'
+        : undefined,
       subject: { type: 'cluster', id: b.existingNodeAddress },
       steps: [
         'Contact existing server',
@@ -321,26 +392,64 @@ function thisServerInstance(s: MockState, id: number) {
   return inst
 }
 
+/** The group of the instance has a standby that is not caught up: this is the only current copy. */
+function isOnlyUpToDateCopy(s: MockState, inst: S['Instance']): boolean {
+  if (inst.role !== 'primary') return false
+  return s.servers
+    .filter((x) => x.id !== LOCAL)
+    .flatMap((x) => instancesOfServer(s, x.id))
+    .some(
+      (other) =>
+        other.shardGroupId === inst.shardGroupId &&
+        other.role === 'standby' &&
+        (other.replicationLagSeconds ?? 0) >= 1,
+    )
+}
+
 function instanceAction(action: 'restart' | 'stop' | 'start'): Handler {
   return (ctx) => {
     const id = num(ctx, 'instanceId')
     const s = ctx.s
-    thisServerInstance(s, id)
+    const inst = thisServerInstance(s, id)
+    const force = action !== 'start' && body<{ force?: boolean }>(ctx).force === true
+    const state = inst.state
+    if (action === 'start') {
+      if (state === 'running' || state === 'starting' || state === 'restarting')
+        throw problem('instance_already_running', `Instance ${id} is ${state}.`)
+      if (state === 'stopping') throw problem('operation_in_progress')
+    } else {
+      if (state === 'stopped' || state === 'stopping' || state === 'failed')
+        throw problem('instance_already_stopped', `Instance ${id} is ${state}.`)
+      if (state === 'starting' || state === 'restarting') throw problem('operation_in_progress')
+    }
     if (activeTask(s, `instance.${action}`, String(id))) throw problem('operation_in_progress')
+    if (action !== 'start' && !force && isOnlyUpToDateCopy(s, inst))
+      throw problem(
+        'no_replica_available',
+        `Instance ${id} is the only up-to-date copy of shard group ${inst.shardGroupId}; a standby is behind.`,
+      )
     const steps =
       action === 'stop'
-        ? ['Stop PostgreSQL']
+        ? ['Stop the instance']
         : action === 'start'
-          ? ['Start PostgreSQL', 'Wait for recovery']
-          : ['Stop PostgreSQL', 'Start PostgreSQL']
-    if (action !== 'start') s.instanceStates.set(id, action === 'stop' ? 'stopping' : 'restarting')
+          ? ['Start the instance']
+          : ['Restart the instance']
+    s.instanceStates.set(
+      id,
+      action === 'stop' ? 'stopping' : action === 'start' ? 'starting' : 'restarting',
+    )
     return accepted(
       createTask(s, {
         kind: `instance.${action}`,
         subject: { type: 'instance', id: String(id) },
         steps,
         durationMs: 2500,
-        apply: () => s.instanceStates.set(id, action === 'stop' ? 'stopped' : 'running'),
+        apply: () => {
+          s.instanceStates.set(id, action === 'stop' ? 'stopped' : 'running')
+          if (inst.isMapGroup) s.systemDatabaseStopped = action === 'stop'
+          // A new postmaster has read the saved settings.
+          if (action !== 'stop') s.localSettings.restartRequired = false
+        },
       }),
     )
   }
@@ -822,32 +931,121 @@ export function createHandlers(): HttpHandler[] {
     startThisServerInstance: instanceAction('start'),
     getThisServerSettings: (c) => ok(c.s.localSettings),
     updateThisServerSettings: (c) => {
-      const b = body<S['LocalSettingsUpdate']>(c)
+      const b = body<Record<string, unknown>>(c) as S['LocalSettingsUpdate']
       const l = c.s.localSettings
+      const known = ['memoryQuota', 'logLevel', 'logDirectory']
+      const unknown = Object.keys(b).filter((k) => !known.includes(k))
+      if (unknown.length || Object.keys(b).length === 0)
+        throw validationFailed(
+          unknown.length
+            ? unknown.map((k) => ({
+                field: `/${k}`,
+                message:
+                  k === 'dataPaths' || k === 'clientPorts'
+                    ? 'This setting cannot be changed after the server was created.'
+                    : 'Unknown setting.',
+              }))
+            : [{ field: '/', message: 'Send at least one setting.' }],
+        )
       if (b.memoryQuota) {
-        if (b.memoryQuota.totalMegabytes < 512)
+        const mb = b.memoryQuota.totalMegabytes
+        if (!(mb >= 512 && mb <= 16_777_216))
           throw validationFailed([
-            { field: 'memoryQuota.totalMegabytes', message: 'At least 512 MB.' },
+            { field: '/memoryQuota/totalMegabytes', message: 'Use 512 to 16777216 MB.' },
           ])
+        if (mb > 65_536)
+          throw problem('unprocessable', 'The machine has 64 GiB of memory.', {
+            errors: [
+              { field: '/memoryQuota/totalMegabytes', message: 'More than the machine has.' },
+            ],
+          })
+      }
+      if (b.logDirectory !== undefined && b.logDirectory !== null) {
+        if (b.logDirectory === '')
+          throw validationFailed([{ field: '/logDirectory', message: 'Must not be empty.' }])
+        if (!b.logDirectory.startsWith('/') || b.logDirectory.includes('missing'))
+          throw problem('unprocessable', 'The log directory must be an absolute, existing path.', {
+            errors: [
+              {
+                field: '/logDirectory',
+                message: 'Not an absolute path of an existing, writable directory.',
+              },
+            ],
+          })
+      }
+      if (b.memoryQuota && b.memoryQuota.totalMegabytes !== l.memoryQuota.totalMegabytes) {
         l.memoryQuota = b.memoryQuota
         l.restartRequired = true
       }
       if (b.logLevel) l.logLevel = b.logLevel
-      if (b.logDirectory !== undefined)
-        l.dataPaths = { ...l.dataPaths, logDirectory: b.logDirectory }
+      if (b.logDirectory !== undefined && b.logDirectory !== l.dataPaths.logDirectory) {
+        l.dataPaths = { ...l.dataPaths, logDirectory: b.logDirectory ?? undefined }
+        l.restartRequired = true
+      }
       return ok(l)
     },
-    leaveCluster: (c) =>
-      accepted(
-        createTask(c.s, {
+    leaveCluster: (c) => {
+      const s = c.s
+      const force = body<{ force?: boolean }>(c).force === true
+      if (s.servers.length <= 1) throw problem('last_server')
+      if (
+        s.groups.some(
+          (g) =>
+            g.isMapGroup && (g.primaryServerId === LOCAL || g.standbyServerIds.includes(LOCAL)),
+        )
+      )
+        throw problem('server_hosts_map_group', 'This server runs an instance of shard group 0.')
+      const held = s.databases
+        .map((d) => ({
+          name: d.info.name,
+          copies: [...d.buckets.values()].flat().filter((b) => {
+            const g = s.groups.find((x) => x.id === b.group)
+            return g?.primaryServerId === LOCAL || g?.standbyServerIds.includes(LOCAL)
+          }).length,
+        }))
+        .filter((x) => x.copies > 0)
+      if (held.length)
+        throw problem(
+          'server_owns_buckets',
+          held.map((x) => `${x.name}: ${x.copies} bucket copies`).join('; '),
+        )
+      if (s.rebalance.state === 'running') throw problem('rebalance_in_progress')
+      if (activeTask(s, 'server.leave', LOCAL)) throw problem('operation_in_progress')
+      const resetAfterMs = mockConfig.leaveResetMs
+      if (!s.leaderReachable) {
+        if (!force) throw problem('service_unavailable', 'The manager leader cannot be reached.')
+        // No task can exist on a cluster that cannot be reached: a finished task with id 0.
+        s.leave = { until: Date.now() + resetAfterMs }
+        const now = nowIso()
+        return accepted({
+          id: 0,
           kind: 'server.leave',
-          subject: { type: 'server', id: '1' },
-          steps: ['Drain local instances', 'Deregister from manager', 'Detach from cluster'],
+          state: 'done',
+          progress: {
+            percent: 100,
+            currentStep: null,
+            steps: [{ name: 'Reset this server', state: 'done' }],
+          },
+          error: null,
+          detail: null,
+          subject: { type: 'server', id: LOCAL },
+          cancellable: false,
+          createdAt: now,
+          updatedAt: now,
+          createdBy: s.session?.username ?? 'system',
+        })
+      }
+      return accepted(
+        createTask(s, {
+          kind: 'server.leave',
+          subject: { type: 'server', id: LOCAL },
+          steps: ['Check again', 'Unregister the server', 'Revoke the certificate'],
           apply: () => {
-            c.s.node.leftCluster = true
+            s.leave = { until: Date.now() + resetAfterMs }
           },
         }),
-      ),
+      )
+    },
     listThisServerLogs: (c) => ok(filterLogs(c.s, c.url, LOCAL)),
 
     // --- cluster and servers
@@ -921,10 +1119,21 @@ export function createHandlers(): HttpHandler[] {
       requireNoRebalance(s)
       // The server id is the host of its address (IPv6 without brackets).
       const id = b.address.replace(/:\d+$/, '').replace(/^\[|\]$/g, '')
+      // The bootstrap certificate the new server presents. A pin that differs refuses it before the
+      // setup token is sent.
+      const seen = fakeHash(`bootstrap-${id}`)
+      const pinned = !!b.expectedFingerprint
+      const mismatch = pinned && normalizeFp(b.expectedFingerprint ?? '') !== seen
       return accepted(
         createTask(s, {
           kind: 'server.add',
           subject: { type: 'server', id: String(id) },
+          detail: mismatch
+            ? null
+            : `Certificate fingerprint seen on first contact: ${seen}${pinned ? ' (pinned)' : ' (not pinned)'}.`,
+          failWith: mismatch
+            ? 'The certificate presented by the new server is not the expected one. The setup token was not sent.'
+            : undefined,
           steps: [
             'Contact server',
             'Issue certificates',
@@ -944,6 +1153,9 @@ export function createHandlers(): HttpHandler[] {
               joinedAt: nowIso(),
               startedAt: Date.now(),
               telemetry: true,
+              certificateExpiresAt: new Date(Date.now() + 365 * 86_400_000).toISOString(),
+              seenFingerprint: seen,
+              fingerprintPinned: pinned,
             })
             const gid = Math.max(...s.groups.map((g) => g.id)) + 1
             s.groups.push({
@@ -961,54 +1173,117 @@ export function createHandlers(): HttpHandler[] {
       )
     },
     updateServer: (c) => {
-      const rec = server(c.s, c.params.serverId ?? '')
+      const s = c.s
+      const rec = server(s, c.params.serverId ?? '')
       const b = body<S['ServerUpdateRequest']>(c)
-      if (b.serverGroup !== undefined) {
-        if (b.serverGroup !== null && !c.s.serverGroups.some((g) => g.name === b.serverGroup))
-          throw problem('not_found', `Server group "${b.serverGroup}" does not exist.`)
-        rec.serverGroup = b.serverGroup
-        markRebalance(c.s, 'serverGroupChanged')
+      const known = ['serverGroup', 'shouldHaveShards']
+      const keys = Object.keys(b)
+      if (keys.length === 0)
+        throw validationFailed([{ field: '', message: 'Give serverGroup or shouldHaveShards.' }])
+      const stray = keys.find((k) => !known.includes(k))
+      if (stray)
+        throw validationFailed([
+          { field: `/${stray}`, message: 'This member is read-only or unknown.' },
+        ])
+      if (b.serverGroup != null && !s.serverGroups.some((g) => g.name === b.serverGroup))
+        throw problem('unprocessable', `Server group "${b.serverGroup}" does not exist.`, {
+          errors: [{ field: '/serverGroup', message: 'Unknown server group.' }],
+        })
+      const groupChanges = b.serverGroup !== undefined && b.serverGroup !== rec.serverGroup
+      const placementChanges =
+        b.shouldHaveShards !== undefined && b.shouldHaveShards !== rec.shouldHaveShards
+      // An equal value is a no-op, also while the server is being added or removed.
+      if (groupChanges || placementChanges) {
+        if (s.tasks.some((t) => isOpenServerTask(t.task, rec.id)))
+          throw problem('operation_in_progress')
+        requireNoRebalance(s)
       }
-      if (b.shouldHaveShards !== undefined) rec.shouldHaveShards = b.shouldHaveShards
-      return ok(serverView(c.s, rec))
+      if (groupChanges) {
+        rec.serverGroup = b.serverGroup ?? null
+        markRebalance(s, 'serverGroupChanged')
+      }
+      if (placementChanges) rec.shouldHaveShards = b.shouldHaveShards as boolean
+      return ok(serverView(s, rec))
     },
     removeServer: (c) => {
       const s = c.s
       const rec = server(s, c.params.serverId ?? '')
-      if (s.servers.length <= 1)
+      if (rec.status === 'dead')
         throw problem(
-          'unprocessable',
-          'The last server cannot be removed. Use "leave cluster" on it.',
+          'node_state_invalid',
+          'The server is dead. Fail it over first, then remove it.',
+        )
+      if (s.servers.length <= 1) throw problem('last_server')
+      if (s.groups.some((g) => g.isMapGroup && ownsCopy(g, rec.id)) || rec.id === LEADER)
+        throw problem(
+          'server_hosts_map_group',
+          'The server has an instance of shard group 0 or is the manager leader.',
+        )
+      const owned = bucketsHeldBy(s, rec.id)
+      if (owned.length > 0)
+        throw problem(
+          'server_owns_buckets',
+          `Holds copies of buckets of: ${owned.map((o) => `${o.database} (${o.buckets})`).join(', ')}.`,
         )
       requireNoRebalance(s)
-      if (activeTask(s, 'server.remove', String(rec.id))) throw problem('operation_in_progress')
-      rec.status = 'draining'
+      if (
+        activeTask(s, 'server.remove', String(rec.id)) ||
+        activeTask(s, 'server.leave', String(rec.id))
+      )
+        throw problem('operation_in_progress')
       return accepted(
         createTask(s, {
           kind: 'server.remove',
           subject: { type: 'server', id: String(rec.id) },
-          steps: ['Mark as draining', 'Move buckets away', 'Remove instances', 'Deregister'],
+          steps: [
+            'Check that the server holds no bucket',
+            'Unregister the node',
+            'Reset the server',
+            'Revoke its certificate',
+          ],
           apply: () => {
-            const rest = dataGroups(s).filter((g) => g.preferredPrimaryServerId !== rec.id)
-            const gone = s.groups.find(
-              (g) => !g.isMapGroup && g.preferredPrimaryServerId === rec.id,
-            )
-            let i = 0
-            for (const d of s.databases)
-              for (const bs of d.buckets.values())
-                for (const b of bs)
-                  if (gone && b.group === gone.id)
-                    b.group = (rest[i++ % rest.length] as { id: number }).id
-            s.groups = s.groups.filter((g) => g !== gone)
+            s.groups = s.groups.filter((g) => g.isMapGroup || g.primaryServerId !== rec.id)
             s.servers = s.servers.filter((x) => x !== rec)
             for (const g of s.groups) {
               if (g.primaryServerId === rec.id)
                 g.primaryServerId = g.standbyServerIds.shift() ?? null
               g.standbyServerIds = g.standbyServerIds.filter((x) => x !== rec.id)
-              if (g.isMapGroup && g.preferredPrimaryServerId === rec.id)
-                g.preferredPrimaryServerId = g.primaryServerId ?? LOCAL
             }
             fixReplicas(s)
+          },
+        }),
+      )
+    },
+    renewServerCertificates: (c) => {
+      const s = c.s
+      const rec = server(s, c.params.serverId ?? '')
+      if (rec.certificateRevokedAt) throw problem('certificate_revoked')
+      if (activeTask(s, 'certificate.renew', String(rec.id))) throw problem('operation_in_progress')
+      return accepted(
+        createTask(s, {
+          kind: 'certificate.renew',
+          subject: { type: 'server', id: String(rec.id) },
+          steps: ['Issue the certificate', 'Install it on the server'],
+          apply: () => {
+            rec.certificateExpiresAt = new Date(Date.now() + 365 * 86400_000).toISOString()
+          },
+        }),
+      )
+    },
+    revokeServerCertificates: (c) => {
+      const s = c.s
+      const rec = server(s, c.params.serverId ?? '')
+      if (rec.id === '10.0.0.11') throw problem('server_hosts_map_group')
+      if (rec.certificateRevokedAt) throw problem('certificate_revoked')
+      if (activeTask(s, 'certificate.revoke', String(rec.id)))
+        throw problem('operation_in_progress')
+      return accepted(
+        createTask(s, {
+          kind: 'certificate.revoke',
+          subject: { type: 'server', id: String(rec.id) },
+          steps: ['Revoke the certificates', 'Send the revocation list to every server'],
+          apply: () => {
+            rec.certificateRevokedAt = nowIso()
           },
         }),
       )
@@ -1084,14 +1359,21 @@ export function createHandlers(): HttpHandler[] {
       const b = body<S['ServerGroupCreateRequest']>(c)
       if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$/.test(b.name ?? ''))
         throw validationFailed([{ field: 'name', message: 'Invalid name.' }])
-      if (c.s.serverGroups.some((g) => g.name === b.name)) throw problem('already_exists')
+      if (c.s.serverGroups.some((g) => g.name === b.name))
+        throw problem('already_exists', `A server group named "${b.name}" already exists.`)
       c.s.serverGroups.push({ name: b.name, description: b.description ?? '' })
       return created({ name: b.name, description: b.description, serverIds: [] })
     },
     deleteServerGroup: (c) => {
       const name = c.params.serverGroupName ?? ''
-      if (c.s.servers.some((x) => x.serverGroup === name))
-        throw problem('conflict', 'The server group still has servers.')
+      if (!c.s.serverGroups.some((g) => g.name === name))
+        throw problem('not_found', `Server group "${name}" does not exist.`)
+      const members = c.s.servers.filter((x) => x.serverGroup === name).map((x) => x.id)
+      if (members.length > 0)
+        throw problem(
+          'server_group_not_empty',
+          `Servers still in the group: ${members.join(', ')}.`,
+        )
       c.s.serverGroups = c.s.serverGroups.filter((g) => g.name !== name)
       return noContent()
     },
@@ -1119,6 +1401,7 @@ export function createHandlers(): HttpHandler[] {
         createTask(s, {
           kind: 'database.create',
           subject: { type: 'database', id: b.name },
+          detail: `Creating ${b.name} on ${s.servers.length} servers.`,
           steps: [
             'Create database on every group',
             'Install extensions',
@@ -1916,13 +2199,15 @@ export function createHandlers(): HttpHandler[] {
       )
       return ok(paginate(blocks, c.url))
     },
-    listLedgerDigests: (c) =>
-      ok(
+    listLedgerDigests: (c) => ({
+      status: 200,
+      rawJson: digestJson(
         paginate(
           c.s.ledger.digests.filter((d) => d.databaseName === c.params.databaseName),
           c.url,
         ),
       ),
+    }),
     generateLedgerDigest: (c) => {
       const rec = db(c.s, c.params.databaseName ?? '')
       if (rec.info.ledger.mode === 'off')
@@ -1939,12 +2224,13 @@ export function createHandlers(): HttpHandler[] {
           shardGroupId: ch.shardGroupId,
           blockHeight: ch.latestBlockHeight ?? 0,
           blockHash: ch.latestBlockHash ?? fakeHash('none'),
+          document: digestDocument(ch.shardGroupId, ch.latestBlockHeight ?? 0),
         })),
         aggregateHash: rec.info.sharding.enabled ? fakeHash(`agg-${id}`) : null,
         anchors: [],
       }
       c.s.ledger.digests.unshift(digest)
-      return created(digest)
+      return { status: 201, rawJson: digestJson(digest) }
     },
     listLedgerVerifications: (c) =>
       ok(
@@ -2022,30 +2308,61 @@ export function createHandlers(): HttpHandler[] {
         throw validationFailed([
           { field: 'primaryKey', message: 'Give at least one primary key column.' },
         ])
+      if (b.op === 'D' && b.ledgerTxId === undefined)
+        throw validationFailed([
+          { field: '/ledgerTxId', message: 'A removed version is named by ledgerTxId.' },
+        ])
+      if ((b.op === 'D' || b.ledgerTxId !== undefined) && t.ledger.mode === 'appendOnly')
+        throw problem(
+          'unprocessable',
+          `Table ${b.schema}.${b.table} is append-only: it has no removed versions.`,
+        )
+      // Special keys let tests and the demo reach each refusal of the contract.
+      const first = Object.values(b.primaryKey)[0]
+      if (first === 404404 || first === '404404')
+        throw problem('not_found', 'No such row, or a policy hides it.')
+      if (first === 403403 || first === '403403')
+        throw problem('forbidden', `The role has no privilege on ${b.schema}.${b.table}.`)
+      // Pending until a digest closes the block (the seed has digest 3 only).
+      if ((first === 424242 || first === '424242') && (c.s.ledger.digests[0]?.id ?? 0) <= 3)
+        throw problem('ledger_entry_pending', 'The row is not in a block yet.')
       const key = JSON.stringify(b.primaryKey)
       const gid = (dataGroups(c.s)[Number(Object.values(b.primaryKey)[0]) % 3] ?? { id: 1 }).id
       const height = (c.s.ledger.heights[gid] ?? 1000) - 12
-      const step = (n: string, position: 'left' | 'right') => ({
-        hash: fakeHash(`${key}${n}`),
-        position,
+      const hash = (n: string) => fakeHash(`${key}${n}`)
+      const header = (h: number) => ({
+        height: h,
+        hash_version: 1 as const,
+        prev_hash: fakeHash(`b${gid}-${h - 1}`),
+        tx_merkle_root: fakeHash(`m${gid}-${h}`),
+        tx_count: 3 + ((h * 7 + gid) % 40),
+        closed_at_us: 800_000_000_000_000 + h * 1_000_000,
       })
-      return ok({
-        schema: b.schema,
-        table: b.table,
-        primaryKey: b.primaryKey,
-        shardGroupId: gid,
+      // The generated type of `block` carries an `additionalProperties: false` artefact (`& Record<string, never>`).
+      const proof = {
+        format: 1,
+        chain_id: `chain-${gid}`,
+        relation: `${b.schema}.${b.table}`,
+        table_id: 16_384 + t.name.length,
+        ledger_txid: b.ledgerTxId ?? 48_000_123,
+        seq: 2,
         op: b.op ?? 'I',
-        ledgerTxId: b.ledgerTxId ?? 48_000_123,
-        leafHash: fakeHash(`leaf${key}`),
-        leafIndex: 5,
-        merklePath: [step('a', 'right'), step('b', 'left'), step('c', 'right')],
-        transactionMerkleRoot: fakeHash(`m${gid}-${height}`),
-        block: ledgerBlock(gid, height),
-        shardHeadPath: rec.info.sharding.enabled ? [step('x', 'left'), step('y', 'right')] : null,
-        aggregateHash: rec.info.sharding.enabled ? fakeHash('agg-3') : null,
-        digestId: c.s.ledger.digests[0]?.id ?? null,
-        hashVersion: 1,
-      } satisfies S['InclusionProof'])
+        row_hash: hash('row'),
+        entry_index: 1,
+        entry_count: 3,
+        entry_path: [hash('e0'), hash('e1')],
+        tx_root: hash('tx'),
+        user_name: c.s.session?.username ?? 'admin',
+        tx_index: 5,
+        tx_path: [hash('t0'), hash('t1'), hash('t2')],
+        block: { ...header(height), block_hash: fakeHash(`b${gid}-${height}`) },
+        chain: [header(height + 1), header(height + 2)].map((h) => ({
+          ...h,
+          block_hash: fakeHash(`b${gid}-${h.height}`),
+        })),
+        shard_group_id: gid,
+      } as unknown as S['InclusionProof']
+      return { status: 200, rawJson: `${JSON.stringify(proof, null, '\t')}\n` }
     },
 
     // --- workbench, alerts, logs, metrics

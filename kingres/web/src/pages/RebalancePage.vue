@@ -103,16 +103,24 @@ const detailId = ref<number | null>(null)
     </template>
   </PageHeader>
 
+  <!-- Outside the boundary: the answer to an action must show even when the status cannot be read
+       (for example while the server answers "not available yet" for every rebalance operation). -->
+  <div
+    v-if="start.error.value || previewMutation.error.value || stopMutation.error.value"
+    class="stack"
+    style="margin-bottom: var(--s-3)"
+  >
+    <ProblemNotice v-if="start.error.value" :error="start.error.value" />
+    <ProblemNotice v-if="previewMutation.error.value" :error="previewMutation.error.value" />
+    <ProblemNotice v-if="stopMutation.error.value" :error="stopMutation.error.value" />
+  </div>
+
   <QueryBoundary
     :loading="status.isPending.value"
     :error="status.error.value"
     @retry="status.refetch()"
   >
     <div v-if="st" class="stack-lg">
-      <ProblemNotice v-if="start.error.value" :error="start.error.value" />
-      <ProblemNotice v-if="previewMutation.error.value" :error="previewMutation.error.value" />
-      <ProblemNotice v-if="stopMutation.error.value" :error="stopMutation.error.value" />
-
       <section class="card stack" aria-labelledby="status-h">
         <div class="row-between">
           <h2 id="status-h">Status</h2>

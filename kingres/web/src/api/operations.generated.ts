@@ -64,7 +64,7 @@ export const operations = {
   listLedgerDigests: { role: 'kingres_readonly', method: 'GET', path: '/databases/{databaseName}/ledger/digests' },
   listLedgerStatus: { role: 'kingres_readonly', method: 'GET', path: '/ledger/status' },
   listLedgerVerifications: { role: 'kingres_readonly', method: 'GET', path: '/databases/{databaseName}/ledger/verifications' },
-  listLogs: { role: 'kingres_readonly', method: 'GET', path: '/logs' },
+  listLogs: { role: 'kingres_ops', method: 'GET', path: '/logs' },
   listRebalanceReports: { role: 'kingres_readonly', method: 'GET', path: '/rebalance/reports' },
   listRoles: { role: 'kingres_admin', method: 'GET', path: '/roles' },
   listServerGroups: { role: 'kingres_readonly', method: 'GET', path: '/server-groups' },
@@ -72,16 +72,18 @@ export const operations = {
   listTables: { role: 'kingres_readonly', method: 'GET', path: '/databases/{databaseName}/tables' },
   listTasks: { role: 'kingres_readonly', method: 'GET', path: '/tasks' },
   listThisServerInstances: { role: 'kingres_readonly', method: 'GET', path: '/this-server/instances' },
-  listThisServerLogs: { role: 'kingres_readonly', method: 'GET', path: '/this-server/logs' },
+  listThisServerLogs: { role: 'kingres_ops', method: 'GET', path: '/this-server/logs' },
   login: { role: 'none', method: 'POST', path: '/auth/login' },
   logout: { role: 'kingres_stats', method: 'POST', path: '/auth/logout' },
   previewRebalancePlan: { role: 'kingres_readonly', method: 'POST', path: '/rebalance/plan' },
   queryMetrics: { role: 'kingres_stats', method: 'GET', path: '/metrics/query' },
   removeServer: { role: 'kingres_ops', method: 'DELETE', path: '/servers/{serverId}' },
+  renewServerCertificates: { role: 'kingres_admin', method: 'POST', path: '/servers/{serverId}/certificates/renewals' },
   replaceNetworkAccess: { role: 'kingres_admin', method: 'PUT', path: '/settings/network-access' },
   restartThisServerInstance: { role: 'kingres_ops', method: 'POST', path: '/this-server/instances/{instanceId}/restart' },
   restorePreferredPrimaries: { role: 'kingres_ops', method: 'POST', path: '/replication/restore-preferred-primaries' },
   revokeGrants: { role: 'kingres_admin', method: 'POST', path: '/grants/revocations' },
+  revokeServerCertificates: { role: 'kingres_admin', method: 'POST', path: '/servers/{serverId}/certificates/revocations' },
   setRoleClusterRoles: { role: 'kingres_admin', method: 'PUT', path: '/roles/{roleName}/cluster-roles' },
   setRoleMemberships: { role: 'kingres_admin', method: 'PUT', path: '/roles/{roleName}/memberships' },
   startLedgerVerification: { role: 'kingres_ops', method: 'POST', path: '/databases/{databaseName}/ledger/verifications' },
@@ -102,4 +104,4 @@ export const operations = {
 export type OperationId = keyof typeof operations
 
 /** The closed list of audit actions (components/schemas/AuditAction). */
-export const auditActions = ['login', 'logout', 'loginFailed', 'setupTokenRejected', 'initCluster', 'joinCluster', 'updateThisServerSettings', 'restartThisServerInstance', 'stopThisServerInstance', 'startThisServerInstance', 'leaveCluster', 'addServer', 'updateServer', 'removeServer', 'failoverServer', 'autoFailover', 'createServerGroup', 'deleteServerGroup', 'createDatabase', 'updateDatabase', 'dropDatabase', 'distributeTable', 'enableTableLedger', 'restorePreferredPrimaries', 'startRebalance', 'stopRebalance', 'cancelTask', 'createRole', 'updateRole', 'deleteRole', 'setRoleMemberships', 'setRoleClusterRoles', 'createGrant', 'revokeGrants', 'applyGrantTemplate', 'replaceNetworkAccess', 'updateClusterSettings', 'generateLedgerDigest', 'startLedgerVerification', 'executeQuery', 'acknowledgeAlert'] as const
+export const auditActions = ['login', 'logout', 'loginFailed', 'setupTokenRejected', 'initCluster', 'joinCluster', 'updateThisServerSettings', 'restartThisServerInstance', 'stopThisServerInstance', 'startThisServerInstance', 'leaveCluster', 'addServer', 'updateServer', 'removeServer', 'failoverServer', 'autoFailover', 'createServerGroup', 'deleteServerGroup', 'createDatabase', 'updateDatabase', 'dropDatabase', 'distributeTable', 'enableTableLedger', 'restorePreferredPrimaries', 'startRebalance', 'stopRebalance', 'cancelTask', 'createRole', 'updateRole', 'deleteRole', 'setRoleMemberships', 'setRoleClusterRoles', 'createGrant', 'revokeGrants', 'applyGrantTemplate', 'replaceNetworkAccess', 'updateClusterSettings', 'generateLedgerDigest', 'startLedgerVerification', 'executeQuery', 'acknowledgeAlert', 'renewServerCertificates', 'revokeServerCertificates', 'certificateRenewed', 'certificateRenewalFailed'] as const

@@ -14,6 +14,8 @@ import GlobalBanners from '@/components/GlobalBanners.vue'
 import TaskNotices from '@/components/TaskNotices.vue'
 import LiveRegions from '@/components/LiveRegions.vue'
 import SafeName from '@/components/SafeName.vue'
+import SystemDatabaseStopped from '@/components/this-server/SystemDatabaseStopped.vue'
+import { availability } from '@/api/availability'
 import { createAnnouncer } from '@/composables/useAnnounce'
 
 const router = useRouter()
@@ -136,7 +138,8 @@ watch(
         </template>
       </nav>
       <main id="main" tabindex="-1" class="content">
-        <RouterView />
+        <SystemDatabaseStopped v-if="availability.systemDatabaseStopped" />
+        <RouterView v-else />
       </main>
     </div>
   </div>

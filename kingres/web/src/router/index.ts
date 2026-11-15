@@ -183,6 +183,8 @@ export function createAppRouter(
         queryKey: keys.nodeState,
         queryFn: endpoints.getNodeState,
         staleTime: 30_000,
+        // Navigation must not hang while the client is paused (system database stopped).
+        networkMode: 'always',
       })
       uninitialized = node.state === 'uninitialized'
     } catch {

@@ -4,7 +4,8 @@
 import { computed, ref } from 'vue'
 import SafeName from '@/components/SafeName.vue'
 import TableWrap from '@/components/TableWrap.vue'
-import { useMutation, useQueryClient } from '@tanstack/vue-query'
+import { useRoute } from 'vue-router'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
 import PageHeader from '@/components/PageHeader.vue'
 import QueryBoundary from '@/components/QueryBoundary.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
@@ -14,7 +15,7 @@ import AppDialog from '@/components/AppDialog.vue'
 import TaskProgress from '@/components/TaskProgress.vue'
 import { endpoints } from '@/api/endpoints'
 import { keys, usePagedQuery } from '@/api/queries'
-import { TASK_STATE } from '@/lib/status'
+import { taskKindLabel, TASK_STATE } from '@/lib/status'
 import { formatAgo } from '@/lib/format'
 import type { TaskState } from '@/api/types'
 
@@ -29,8 +30,18 @@ const cancel = useMutation({
   mutationFn: (id: number) => endpoints.cancelTask(id),
   onSettled: () => client.invalidateQueries({ queryKey: keys.tasks }),
 })
-const openId = ref<number | null>(null)
-const open = computed(() => items.value.find((t) => t.id === openId.value) ?? null)
+// A link from another page (`/tasks?task=12`) opens that task, also when it is not on the first page.
+const route = useRoute()
+const linked = Number(route.query.task)
+const openId = ref<number | null>(Number.isSafeInteger(linked) && linked > 0 ? linked : null)
+const listed = computed(() => items.value.find((t) => t.id === openId.value) ?? null)
+const fetched = useQuery({
+  queryKey: computed(() => [...keys.tasks, 'one', openId.value]),
+  queryFn: () => endpoints.getTask(openId.value as number),
+  enabled: computed(() => openId.value !== null && listed.value === null),
+  retry: false,
+})
+const open = computed(() => listed.value ?? fetched.data.value ?? null)
 </script>
 
 <template>
@@ -74,7 +85,12 @@ const open = computed(() => items.value.find((t) => t.id === openId.value) ?? nu
         <tbody>
           <tr v-for="t in items" :key="t.id">
             <th scope="row" class="num">{{ t.id }}</th>
-            <td class="mono">{{ t.kind }}</td>
+            <td>
+              <span class="mono"><SafeName :value="t.kind" kind="text" :max="40" /></span>
+              <div class="muted task-kind-label">
+                <SafeName :value="taskKindLabel(t.kind)" kind="text" :max="80" />
+              </div>
+            </td>
             <td>
               <SafeName
                 v-if="t.subject"
@@ -88,6 +104,9 @@ const open = computed(() => items.value.find((t) => t.id === openId.value) ?? nu
               <StatusBadge :meta="TASK_STATE[t.state]" />
               <div v-if="t.error" class="muted">
                 <SafeName :value="t.error.message" kind="text" :max="300" />
+              </div>
+              <div v-if="t.detail" class="muted">
+                <SafeName :value="t.detail" kind="text" :max="200" />
               </div>
             </td>
             <td class="num">{{ Math.round(t.progress.percent) }}%</td>
@@ -115,7 +134,9 @@ const open = computed(() => items.value.find((t) => t.id === openId.value) ?? nu
       Load more
     </button>
   </QueryBoundary>
-  <AppDialog v-if="open" :title="`Task ${open.id}`" @close="openId = null">
-    <TaskProgress :task="open" />
+  <AppDialog v-if="openId !== null" :title="`Task ${openId}`" @close="openId = null">
+    <TaskProgress v-if="open" :task="open" />
+    <ProblemNotice v-else-if="fetched.error.value" :error="fetched.error.value" />
+    <p v-else role="status">Loading the task ...</p>
   </AppDialog>
 </template>

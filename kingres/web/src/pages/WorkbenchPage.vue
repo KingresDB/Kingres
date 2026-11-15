@@ -253,7 +253,8 @@ const hiddenRows = computed(() => (result.value?.data.rows.length ?? 0) - shownR
         {{ formatNumber(result.data.rowCount) }} row(s) in
         {{ result.data.durationMs.toFixed(1) }} ms.
         <span v-if="result.data.truncated" class="badge tone-warn"
-          ><span aria-hidden="true">&#9650;</span> Truncated at the row limit</span
+          ><span aria-hidden="true">&#9650;</span> Cut at the row limit or at the 16 MiB size limit
+          of a result</span
         >
       </p>
       <p v-if="stale" class="notice tone-warn" role="status">

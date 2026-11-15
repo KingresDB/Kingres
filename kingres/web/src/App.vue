@@ -4,6 +4,7 @@
 import { ref } from 'vue'
 import { RouterView, useRouter } from 'vue-router'
 import SplashScreen from '@/components/SplashScreen.vue'
+import LeftClusterNotice from '@/components/this-server/LeftClusterNotice.vue'
 
 // The first navigation checks the setup state and the session; show the splash meanwhile.
 const router = useRouter()
@@ -15,5 +16,8 @@ void router.isReady().then(() => {
 
 <template>
   <SplashScreen v-if="!ready" />
-  <RouterView v-else />
+  <template v-else>
+    <LeftClusterNotice />
+    <RouterView />
+  </template>
 </template>

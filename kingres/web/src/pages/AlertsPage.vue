@@ -12,7 +12,7 @@ import ProblemNotice from '@/components/ProblemNotice.vue'
 import SafeName from '@/components/SafeName.vue'
 import { endpoints } from '@/api/endpoints'
 import { keys, usePagedQuery } from '@/api/queries'
-import { SEVERITY } from '@/lib/status'
+import { alertKindLabel, SEVERITY } from '@/lib/status'
 import { formatAgo, formatDateTime } from '@/lib/format'
 
 const client = useQueryClient()
@@ -73,6 +73,9 @@ const STATE_LABEL = { open: 'Open', acknowledged: 'Acknowledged', resolved: 'Res
             <td><StatusBadge :meta="SEVERITY[a.severity]" /></td>
             <td>
               <strong><SafeName :value="a.title" kind="text" :max="200" /></strong>
+              <div class="muted alert-kind">
+                <SafeName :value="alertKindLabel(a.kind)" kind="text" :max="80" />
+              </div>
               <div class="muted">
                 <SafeName :value="a.message" kind="text" :max="600" multiline />
               </div>

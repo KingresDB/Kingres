@@ -27,6 +27,7 @@ import type {
   BucketState,
 } from './types'
 import type { components } from './schema'
+import { parseProof, withRawDocuments, type RawDigest, type RawProof } from '@/lib/ledger-proof'
 
 type S = components['schemas']
 const j = unwrap
@@ -234,18 +235,32 @@ export const endpoints = {
         params: { path: { databaseName }, query: q },
       }),
     ),
-  listLedgerDigests: (databaseName: string, q: Page = {}) =>
-    j(
+  /** Digest page; every chain also carries `rawDocument`, the document's exact text (see ledger-proof.ts). */
+  listLedgerDigests: async (
+    databaseName: string,
+    q: Page = {},
+  ): Promise<{ items: RawDigest[]; nextCursor: string | null }> => {
+    const text = await j(
       api.GET('/databases/{databaseName}/ledger/digests', {
         params: { path: { databaseName }, query: q },
+        parseAs: 'text',
       }),
-    ),
-  generateLedgerDigest: (databaseName: string) =>
-    j(
+    )
+    const page = JSON.parse(text) as { items: S['LedgerDigest'][]; nextCursor: string | null }
+    withRawDocuments(page, text)
+    return page as { items: RawDigest[]; nextCursor: string | null }
+  },
+  generateLedgerDigest: async (databaseName: string): Promise<RawDigest> => {
+    const text = await j(
       api.POST('/databases/{databaseName}/ledger/digests', {
         params: { path: { databaseName } },
+        parseAs: 'text',
       }),
-    ),
+    )
+    const digest = JSON.parse(text) as S['LedgerDigest']
+    withRawDocuments(digest, text)
+    return digest as RawDigest
+  },
   listLedgerVerifications: (databaseName: string, q: Page = {}) =>
     j(
       api.GET('/databases/{databaseName}/ledger/verifications', {
@@ -259,12 +274,25 @@ export const endpoints = {
         body,
       }),
     ),
-  createInclusionProof: (databaseName: string, body: S['InclusionProofRequest']) =>
+  getLedgerVerification: (databaseName: string, verificationId: number) =>
     j(
-      api.POST('/databases/{databaseName}/ledger/inclusion-proofs', {
-        params: { path: { databaseName } },
-        body,
+      api.GET('/databases/{databaseName}/ledger/verifications/{verificationId}', {
+        params: { path: { databaseName, verificationId } },
       }),
+    ),
+  /** The proof as the server sent it: `raw` is what is saved for `kingres-verify`, unchanged. */
+  createInclusionProof: async (
+    databaseName: string,
+    body: S['InclusionProofRequest'],
+  ): Promise<RawProof> =>
+    parseProof(
+      await j(
+        api.POST('/databases/{databaseName}/ledger/inclusion-proofs', {
+          params: { path: { databaseName } },
+          body,
+          parseAs: 'text',
+        }),
+      ),
     ),
 
   // --- workbench, alerts, logs, metrics

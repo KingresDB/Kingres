@@ -3,7 +3,8 @@
 //
 // The browser steps of the end-to-end test against a real kingresd. A step that fails is recorded
 // and the flow stops at the first failed step that later steps depend on.
-import { mkdirSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { helpers, openBrowser, sleep } from './browser.mjs'
 
@@ -12,17 +13,18 @@ const DATA_DIR = '/home/kingres/kw-web/data'
 
 /**
  * @param {{ baseUrl: string, setupToken: () => string, psql: (db: string, sql: string) => string,
+ *   restartApi: () => void, serverLog: () => string, verifier: string, downloads: string,
  *   shots: string }} ctx
  */
 export async function runFlow(ctx) {
   mkdirSync(ctx.shots, { recursive: true })
-  const { browser, page, log } = await openBrowser()
+  const { browser, page, log } = await openBrowser({ downloadDir: ctx.downloads })
   const ui = helpers(page)
   const results = []
   const notes = []
   let fatal = false
 
-  async function step(name, fn) {
+  async function step(name, fn, { soft = false } = {}) {
     if (fatal) {
       results.push({ name, ok: false, error: 'skipped after an earlier failure' })
       return
@@ -41,7 +43,8 @@ export async function runFlow(ctx) {
       } catch {
         // ignore
       }
-      fatal = true
+      // A soft step reports a finding (usually in the server) without stopping the later steps.
+      if (!soft) fatal = true
     }
   }
   const expect = (condition, message) => {
@@ -132,6 +135,21 @@ export async function runFlow(ctx) {
     await ui.waitForText('Dashboard')
     expect(!page.url().includes('/login'), `reload sent the user to ${page.url()}`)
     // The proof that the CSRF token survived is the role created in the next step.
+  })
+
+  await step('the session cookie has the attributes the panel expects', async () => {
+    const cookies = await page.cookies()
+    const c = cookies.find((x) => x.name === 'kingres_session')
+    expect(c, `no kingres_session cookie (cookies: ${cookies.map((x) => x.name).join(', ')})`)
+    notes.push(
+      `cookie kingres_session: httpOnly=${c.httpOnly} secure=${c.secure} sameSite=${c.sameSite} path=${c.path} session=${c.session}`,
+    )
+    expect(
+      c.httpOnly && c.secure && c.sameSite === 'Strict' && c.path === '/',
+      'cookie attributes differ',
+    )
+    const readable = await page.evaluate(() => document.cookie)
+    expect(!readable.includes('kingres_session'), 'the session cookie is readable by script')
   })
 
   // ---- 3. role ----------------------------------------------------------------------------------
@@ -445,68 +463,75 @@ export async function runFlow(ctx) {
     }
   })
 
-  // ---- 9. things the server does not do yet must be calm, not alarming ----------------------------------
-  await step('actions the server does not support yet answer with a calm notice', async () => {
-    const calm = async (label) => {
-      await page
-        .waitForFunction(
-          () =>
-            [...document.querySelectorAll('[role=dialog] .notice, main .notice')].some((n) =>
-              /not available on this server version yet/i.test(n.textContent),
-            ),
-          { timeout: 15000 },
-        )
-        .catch(() => {
-          throw new Error(`${label}: no "not available yet" notice`)
-        })
-      const danger = await page.$$eval('.notice.tone-danger', (e) =>
-        e.map((x) => x.textContent.replace(/\s+/g, ' ').slice(0, 100)),
-      )
-      expect(danger.length === 0, `${label}: alarming notice: ${danger.join(' | ')}`)
-    }
-    // create a server group
+  // ---- 9. what the server does not do yet must be calm, not alarming; the cluster settings are real ----
+  await step('failover (not implemented yet) answers with a calm notice', async () => {
     await ui.navigate('/servers')
     await ui.waitForText('Create server group')
-    await ui.click('Create server group')
-    await ui.waitForText('Description (optional)')
-    await ui.fill('Name', 'rack-e2e', { within: '[role=dialog]' })
-    await ui.click('Create server group', { within: '[role=dialog] .dlg-foot' })
-    await calm('create server group')
-    await shot('18-unsupported-server-group')
-    await ui.click('Cancel', { within: '[role=dialog]' })
-    // hard failover confirm
     await ui.click('Failover')
     await ui.waitForText('Failover mode')
     await ui.click('Graceful failover', { within: '[role=dialog] .dlg-foot' })
-    await calm('failover')
+    await page
+      .waitForFunction(
+        () =>
+          [...document.querySelectorAll('[role=dialog] .notice')].some((n) =>
+            /not available on this server version yet/i.test(n.textContent),
+          ),
+        { timeout: 15000 },
+      )
+      .catch(() => {
+        throw new Error('failover: no "not available yet" notice')
+      })
+    const danger = await page.$$eval('.notice.tone-danger', (e) =>
+      e.map((x) => x.textContent.replace(/s+/g, ' ').slice(0, 100)),
+    )
+    expect(danger.length === 0, `failover: alarming notice: ${danger.join(' | ')}`)
+    await shot('18-unsupported-failover')
     await ui.click('Cancel', { within: '[role=dialog]' })
-    // digest
-    await ui.navigate('/ledger')
-    await ui.waitForText('Generate digest')
-    await ui.click('Generate digest')
-    await calm('generate digest')
-    // settings: nothing changed, then one value changed (only that value may be sent)
-    await ui.navigate('/settings')
-    await ui.waitForText('Save settings')
-    await ui.click('Save settings')
-    await ui.waitForText('Nothing was changed')
-    await ui.fill('Concurrent moves', '8')
-    await ui.click('Save settings')
-    await page.waitForFunction(
-      () =>
-        /Settings saved|not available on this server version yet/i.test(document.body.innerText),
-      { timeout: 15000 },
-    )
-    const saved = (await ui.text()).includes('Settings saved')
-    notes.push(
-      `PATCH /settings/cluster with one changed value: ${saved ? 'saved' : 'not supported yet'}`,
-    )
-    expect(
-      (await page.$$eval('.notice.tone-danger', (e) => e.length)) === 0,
-      'settings: alarming notice',
-    )
-    await shot('19-unsupported-settings')
   })
+
+  await step(
+    'rebalance (not implemented yet): the page shows a calm notice, no alarm',
+    async () => {
+      await ui.navigate('/rebalance')
+      await ui.waitForText('Rebalance')
+      await sleep(2000)
+      const text = await ui.text()
+      notes.push(
+        `rebalance page: ${/not available on this server version yet/i.test(text) ? 'says "not available on this server version yet"' : 'does not say it is unsupported'}`,
+      )
+      expect(
+        (await page.$$eval('.notice.tone-danger', (e) => e.length)) === 0,
+        'rebalance: alarming notice',
+      )
+    },
+  )
+
+  await step(
+    'the cluster settings can be changed (one value, only that value is sent)',
+    async () => {
+      await ui.navigate('/settings')
+      await ui.waitForText('Save settings')
+      await ui.click('Save settings')
+      await ui.waitForText('Nothing was changed')
+      await ui.fill('Concurrent moves', '8')
+      await ui.click('Save settings')
+      await page.waitForFunction(
+        () =>
+          /Settings saved|not available on this server version yet/i.test(document.body.innerText),
+        { timeout: 15000 },
+      )
+      const saved = (await ui.text()).includes('Settings saved')
+      notes.push(
+        `PATCH /settings/cluster with one changed value: ${saved ? 'saved' : 'not supported yet'}`,
+      )
+      expect(saved, 'the cluster settings were not saved')
+      expect(
+        (await page.$$eval('.notice.tone-danger', (e) => e.length)) === 0,
+        'settings: alarming notice',
+      )
+      await shot('19-settings')
+    },
+  )
 
   await step('the audit log lists what was done, with the closed action names', async () => {
     await ui.navigate('/security')
@@ -544,6 +569,422 @@ export async function runFlow(ctx) {
     const text = await ui.text()
     expect(!text.includes('scratch'), 'the dropped database is still listed')
     expect(text.includes('shop'), 'the other database disappeared from the list')
+  })
+
+  // ---- 10. the operations that became real in 0.4.0 ------------------------------------------------
+  const serverLinkPath = () =>
+    page.$eval('a[href^="/servers/"]', (a) => a.getAttribute('href')).catch(() => null)
+  const clickRowButton = (rowText, label) =>
+    page.evaluate(
+      (rowText, label) => {
+        const row = [...document.querySelectorAll('tr')].find(
+          (r) => r.querySelector('th[scope=row]')?.textContent.trim() === rowText,
+        )
+        ;[...row.querySelectorAll('button')].find((b) => b.textContent.trim() === label).click()
+      },
+      rowText,
+      label,
+    )
+
+  await step(
+    'server groups: create, assign a server, refuse the delete, unassign, delete',
+    async () => {
+      await ui.navigate('/servers')
+      await ui.waitForText('Create server group')
+      await ui.click('Create server group')
+      await ui.waitForText('Description (optional)')
+      await ui.fill('Name', 'rack-e2e', { within: '[role=dialog]' })
+      await ui.click('Create server group', { within: '[role=dialog] .dlg-foot' })
+      await page.waitForFunction(() => !document.querySelector('[role=dialog]'), { timeout: 15000 })
+      await page.waitForFunction(
+        () => [...document.querySelectorAll('tr')].some((r) => r.textContent.includes('rack-e2e')),
+        { timeout: 15000 },
+      )
+      await shot('24-server-group-created')
+      const href = await serverLinkPath()
+      expect(href, 'no server link on the servers page')
+      await ui.navigate(href)
+      await ui.waitForText('Save group')
+      await ui.select('Group', 'rack-e2e')
+      await ui.click('Save group')
+      await ui.waitForText('Server group saved.')
+      // The group has a server now: the delete is refused and explained.
+      await ui.navigate('/servers')
+      await ui.waitForText('rack-e2e')
+      await clickRowButton('rack-e2e', 'Delete')
+      await ui.waitForText('Delete server group rack-e2e?')
+      await ui.click('Delete group', { within: '[role=dialog] .dlg-foot' })
+      await ui.waitForText('Server group still has servers')
+      const refusal = await page.$$eval('[role=dialog] .notice', (e) =>
+        e.map((x) => x.textContent.replace(/\s+/g, ' ').trim()),
+      )
+      notes.push(`delete of a group with a server: ${refusal.join(' | ').slice(0, 300)}`)
+      await shot('25-server-group-not-empty')
+      await ui.click('Cancel', { within: '[role=dialog]' })
+      // Unassign, then delete.
+      await ui.navigate(href)
+      await ui.waitForText('Save group')
+      await ui.select('Group', '')
+      await ui.click('Save group')
+      await ui.waitForText('Server group saved.')
+      await ui.navigate('/servers')
+      await ui.waitForText('rack-e2e')
+      await clickRowButton('rack-e2e', 'Delete')
+      await ui.waitForText('Delete server group rack-e2e?')
+      await ui.click('Delete group', { within: '[role=dialog] .dlg-foot' })
+      await page.waitForFunction(() => !document.querySelector('[role=dialog]'), { timeout: 15000 })
+      await page.waitForFunction(() => !document.body.innerText.includes('rack-e2e'), {
+        timeout: 15000,
+      })
+    },
+  )
+
+  await step('the server page shows the certificate and the fingerprint state', async () => {
+    await ui.navigate('/servers')
+    await ui.waitForText('Add server')
+    const href = await serverLinkPath()
+    await ui.navigate(href ?? '/servers')
+    await ui.waitForText('Certificate and first contact')
+    const text = await page.$eval('[aria-labelledby=cert-h]', (e) =>
+      e.innerText.replace(/\s+/g, ' '),
+    )
+    notes.push(`certificate section of the first server: ${text.slice(0, 260)}`)
+    expect(/Certificate valid until/.test(text), 'no certificate expiry on the server page')
+    await shot('26-server-certificate')
+  })
+
+  await step('the add-server dialog takes a fingerprint and rejects a malformed one', async () => {
+    await ui.navigate('/servers')
+    await ui.waitForText('Add server')
+    await ui.click('Add server')
+    await ui.waitForText('Expected fingerprint (recommended)')
+    await ui.fill('Expected fingerprint (recommended)', 'not-a-fingerprint', {
+      within: '[role=dialog]',
+    })
+    await ui.fill('Server address', '127.0.0.1:9', { within: '[role=dialog]' })
+    await ui.fill('Setup token of the new server', 'x', { within: '[role=dialog]' })
+    await ui.click('Add server', { within: '[role=dialog] .dlg-foot' })
+    await sleep(500)
+    const text = await page.$eval('[role=dialog]', (e) => e.innerText.replace(/\s+/g, ' '))
+    expect(/64|hex|fingerprint/i.test(text), 'no fingerprint validation message')
+    await shot('27-add-server-fingerprint')
+    await ui.click('Cancel', { within: '[role=dialog]' })
+  })
+
+  // --- the ledger: proof, files, verifier, verification record
+  const clearDownloads = () => {
+    for (const f of readdirSync(ctx.downloads)) rmSync(join(ctx.downloads, f), { force: true })
+  }
+  const waitFile = async (match) => {
+    for (let i = 0; i < 50; i++) {
+      const f = readdirSync(ctx.downloads).find((x) => match.test(x))
+      if (f) return join(ctx.downloads, f)
+      await sleep(200)
+    }
+    throw new Error(
+      `the browser did not save ${match} (found: ${readdirSync(ctx.downloads).join(', ')})`,
+    )
+  }
+  const proofFile = { path: '', table: 0, hash: '', digest: '' }
+
+  await step('a ledger proof for a row: pending until a digest, then shown', async () => {
+    ctx.psql('shop', "insert into public.audit_rows values (3, 'third')")
+    await ui.navigate('/ledger')
+    await ui.waitForText('Row inclusion proof')
+    await ui.select('Database', 'shop')
+    await sleep(800)
+    await ui.fill('Schema', 'public')
+    await ui.fill('Table', 'audit_rows')
+    await ui.fill('Primary key (JSON)', '{"id": 3}')
+    await ui.click('Look up proof')
+    await page.waitForFunction(
+      () =>
+        document.querySelector('[data-testid=proof]') ||
+        /not in a block yet/i.test(document.body.innerText) ||
+        document.querySelector('[role=alert]'),
+      { timeout: 20000 },
+    )
+    if (!(await page.$('[data-testid=proof]'))) {
+      const text = await ui.text()
+      const pending = /not in a block yet/i.test(text)
+      notes.push(
+        `first proof request: ${pending ? 'ledger_entry_pending explained (row not in a block yet)' : (await ui.alerts()).join(' | ')}`,
+      )
+      await shot('28-proof-pending')
+      expect(pending, `unexpected answer to the proof request: ${(await ui.alerts()).join(' | ')}`)
+      await ui.click('Generate digest and ask again')
+    } else {
+      notes.push('first proof request: the row was already in a block (no pending answer)')
+    }
+    await page.waitForSelector('[data-testid=proof]', { timeout: 30000 })
+    await shot('29-proof')
+    const text = await page.$eval('[data-testid=proof]', (e) => e.innerText.replace(/\s+/g, ' '))
+    notes.push(`proof shown: ${text.slice(0, 240)}`)
+    expect(/kingres-verify/.test(await ui.text()), 'the page does not say how to check the proof')
+  })
+
+  await step('download the proof and the digest; the bytes are those the server sent', async () => {
+    clearDownloads()
+    await ui.click('Download proof.json')
+    proofFile.path = await waitFile(/^proof\.json$/)
+    const saved = readFileSync(proofFile.path)
+    // Keep a copy: the downloads folder is emptied before the digest is saved.
+    proofFile.path = join(ctx.downloads, '..', 'proof-kept.json')
+    writeFileSync(proofFile.path, saved)
+    const answers = log.bodies.filter((b) => b.path.endsWith('/inclusion-proofs'))
+    const last = answers.at(-1)
+    expect(last, 'no proof answer was recorded')
+    expect(
+      Buffer.compare(saved, last.buffer) === 0,
+      'proof.json differs from the bytes of the answer',
+    )
+    const parsed = JSON.parse(saved.toString('utf8'))
+    proofFile.table = parsed.table_id
+    proofFile.hash = parsed.row_hash
+    notes.push(
+      `proof.json is byte-identical to the answer (${saved.length} bytes), chain ${parsed.chain_id}, shard_group_id ${parsed.shard_group_id}`,
+    )
+
+    // The digest document, from the digests list.
+    await ui.navigate('/ledger')
+    await ui.waitForText('Row inclusion proof')
+    await ui.select('Database', 'shop')
+    await page.waitForFunction(
+      () => document.querySelector('button[aria-label^="Download document of chain"]'),
+      { timeout: 20000 },
+    )
+    clearDownloads()
+    await page.click('button[aria-label^="Download document of chain"]')
+    proofFile.digest = await waitFile(/^digest-.*\.json$/)
+    const digest = readFileSync(proofFile.digest).toString('utf8')
+    const lists = log.bodies
+      .filter((b) => /\/digests$/.test(b.path))
+      .map((b) => b.buffer.toString('utf8'))
+    expect(
+      lists.some((l) => l.includes(digest)),
+      'the digest file is not a verbatim part of a digests answer',
+    )
+    notes.push(`the digest file is a verbatim slice of the digests answer (${digest.length} bytes)`)
+  })
+
+  await step('kingres-verify accepts the downloaded proof and digest', async () => {
+    const r = spawnSync(
+      ctx.verifier,
+      [
+        'proof',
+        '--proof',
+        proofFile.path,
+        '--digest',
+        proofFile.digest,
+        '--table-id',
+        String(proofFile.table),
+        '--row-hash',
+        proofFile.hash,
+      ],
+      { encoding: 'utf8' },
+    )
+    notes.push(
+      `kingres-verify exit ${r.status}: ${(r.stdout + r.stderr).replace(/\s+/g, ' ').slice(0, 200)}`,
+    )
+    expect(
+      r.status === 0 && /VERIFIED/.test(r.stdout),
+      `kingres-verify did not verify: ${r.stdout} ${r.stderr}`,
+    )
+  })
+
+  await step('a ledger verification runs and its record appears with its task', async () => {
+    await ui.navigate('/ledger')
+    await ui.waitForText('Start verification')
+    await ui.select('Database', 'shop')
+    await sleep(500)
+    await ui.click('Start verification')
+    await page.waitForFunction(
+      () => document.querySelector('button[aria-label^="Details of verification"]'),
+      { timeout: 90000 },
+    )
+    await page.click('button[aria-label^="Details of verification"]')
+    await page.waitForSelector('[role=dialog]')
+    await page
+      .waitForFunction(
+        () =>
+          /Task \d+|without a task|Cannot|failed/i.test(
+            document.querySelector('[role=dialog]')?.innerText ?? '',
+          ),
+        { timeout: 15000 },
+      )
+      .catch(() => {})
+    const text = await page.$eval('[role=dialog]', (e) => e.innerText.replace(/\s+/g, ' '))
+    notes.push(`verification record: ${text.slice(0, 260)}`)
+    await shot('30-verification')
+    expect(/Task \d+|without a task/.test(text), 'the record has no link to its task')
+    await page.keyboard.press('Escape')
+    await sleep(300)
+  })
+
+  // --- local settings and the instance
+  await step(
+    'local settings: the log level applies at once, a memory change asks for a restart',
+    async () => {
+      await ui.navigate('/this-server')
+      await ui.waitForText('Local settings')
+      await ui.select('Log level', 'debug')
+      await ui.click('Save local settings')
+      await ui.waitForText('Saved.')
+      await page.reload({ waitUntil: 'networkidle0' })
+      await ui.waitForText('Local settings')
+      const level = await page.$eval('#ls-level', (e) => e.value)
+      expect(level === 'debug', `the log level after a reload is ${level}`)
+      expect(
+        !/A restart is required/.test(await ui.text()),
+        'a log level change asked for a restart',
+      )
+      await ui.fill('Memory quota (MB)', '1536')
+      await ui.click('Save local settings')
+      await ui.waitForText('A restart is required')
+      await shot('31-restart-required')
+      // A reload keeps it: the state is persistent on the server.
+      await page.reload({ waitUntil: 'networkidle0' })
+      await ui.waitForText('A restart is required')
+    },
+  )
+
+  await step('restarting the instance ends the restart-required state', async () => {
+    await page.evaluate(() =>
+      [...document.querySelectorAll('.notice button')]
+        .find((b) => /^Restart instance #/.test(b.textContent.trim()))
+        ?.click(),
+    )
+    await page.waitForSelector('[role=dialog]')
+    if (await page.$('[role=dialog] input.mono')) {
+      const word = await page.$eval('[role=dialog] label code', (e) => e.textContent.trim())
+      await page.type('[role=dialog] input.mono', word)
+    }
+    await ui.click('Restart instance', { within: '[role=dialog] .dlg-foot' })
+    // The instance hosts the system database: the panel waits calmly and comes back by itself.
+    await ui.waitForText('Finished.', 120000)
+    await ui.click('Close', { within: '[role=dialog]' })
+    await page.waitForFunction(
+      () =>
+        !/A restart is required/.test(document.body.innerText) &&
+        !/system database is stopped/.test(document.body.innerText) &&
+        !document.querySelector('[role=dialog]'),
+      { timeout: 120000 },
+    )
+    await sleep(1500)
+    expect(!page.url().includes('/login'), 'the restart signed the user out')
+  })
+
+  await step(
+    'stop the instance of the system database: one clear state, then start it',
+    async () => {
+      await ui.navigate('/this-server')
+      await ui.waitForText('Instances')
+      const before = log.responses.length
+      await clickRowButton('Stop', 'Stop').catch(async () => {
+        await page.evaluate(() => {
+          const row = [...document.querySelectorAll('tr')].find((r) =>
+            [...r.querySelectorAll('button')].some((b) => b.textContent.trim() === 'Stop'),
+          )
+          ;[...row.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Stop').click()
+        })
+      })
+      await page.waitForSelector('[role=dialog]')
+      await shot('32-stop-instance')
+      await page.type('[role=dialog] input.mono', 'stop')
+      await ui.click('Stop instance', { within: '[role=dialog] .dlg-foot' })
+      await ui.waitForText('The system database is stopped', 60000)
+      await shot('33-system-database-stopped')
+      expect(!page.url().includes('/login'), 'the stop signed the user out')
+      // No wall of errors: wait and count the failed requests.
+      await sleep(8000)
+      const failed = log.responses.slice(before).filter((r) => r.status >= 400)
+      const groups = new Map()
+      for (const r of failed) {
+        const key = `${r.method} ${r.path} ${r.code}`
+        groups.set(key, (groups.get(key) ?? 0) + 1)
+      }
+      notes.push(
+        `failed requests while the instance was stopped (about 8 s): ${failed.length}: ${[...groups].map(([k, n]) => `${n}x ${k}`).join('; ')}`,
+      )
+      expect(
+        failed.length <= 12,
+        `an error storm while the system database was stopped: ${failed.length} failed requests`,
+      )
+      await ui.click('Start instance')
+      await page.waitForFunction(
+        () => !/The system database is stopped/.test(document.body.innerText),
+        { timeout: 120000 },
+      )
+      await sleep(2000)
+      expect(!page.url().includes('/login'), 'the start ended in the sign-in page')
+      await ui.navigate('/this-server')
+      await ui.waitForText('Instances')
+      await shot('34-instance-started')
+      expect(
+        /running/i.test(await ui.text()),
+        'the instance is not shown as running after the start',
+      )
+    },
+  )
+
+  await step(
+    'leave cluster is refused for the only server, in words',
+    async () => {
+      await ui.navigate('/this-server')
+      await ui.waitForText('Leave cluster')
+      await ui.click('Leave cluster')
+      await page.waitForSelector('[role=dialog] input.mono')
+      const asked = await page.$eval('[role=dialog]', (e) => e.innerText.replace(/\s+/g, ' '))
+      notes.push(`leave dialog: ${asked.slice(0, 200)}`)
+      const hostname = await page.$eval('[role=dialog] label code', (e) => e.textContent.trim())
+      await page.type('[role=dialog] input.mono', hostname)
+      await shot('35-leave-dialog')
+      await ui.click('Leave cluster', { within: '[role=dialog] .dlg-foot' })
+      await sleep(1500)
+      const leaveAnswer = log.bodies.filter((b) => b.path.endsWith('/leave-cluster')).at(-1)
+      if (leaveAnswer)
+        notes.push(
+          `POST /this-server/leave-cluster answered ${leaveAnswer.status}: ${leaveAnswer.buffer.toString('utf8').slice(0, 400)}`,
+        )
+      await page.waitForFunction(
+        () =>
+          /Last server of the cluster|Server hosts the cluster metadata|Server still holds data/.test(
+            document.body.innerText,
+          ),
+        { timeout: 20000 },
+      )
+      await shot('36-leave-refused')
+      await page.keyboard.press('Escape')
+      await sleep(300)
+    },
+    { soft: true },
+  )
+
+  await step('the audit log shows the new operations', async () => {
+    await ui.navigate('/security')
+    await ui.waitForText('Create role')
+    await page.evaluate(() =>
+      [...document.querySelectorAll('[role=tab]')]
+        .find((t) => t.textContent.trim() === 'Audit log')
+        .click(),
+    )
+    await sleep(1500)
+    const text = await ui.text()
+    const wanted = [
+      'createServerGroup',
+      'deleteServerGroup',
+      'updateServer',
+      'generateLedgerDigest',
+      'startLedgerVerification',
+      'stopThisServerInstance',
+      'startThisServerInstance',
+      'updateThisServerSettings',
+    ]
+    const missing = wanted.filter((a) => !text.includes(a))
+    notes.push(
+      `audit actions of the new operations missing on the first page: ${missing.join(', ') || 'none'}`,
+    )
+    expect(missing.length === 0, `the audit log does not show: ${missing.join(', ')}`)
   })
 
   async function signInAs(user, password) {
@@ -612,12 +1053,81 @@ export async function runFlow(ctx) {
     await ui.waitForText('Databases')
   })
 
+  await step('the headers the server sent: policy, caching and no violations', async () => {
+    const CSP =
+      "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+    const same = {
+      'content-security-policy': CSP,
+      'x-frame-options': 'DENY',
+      'x-content-type-options': 'nosniff',
+      'referrer-policy': 'no-referrer',
+      'cross-origin-opener-policy': 'same-origin',
+      'permissions-policy': 'camera=(), microphone=(), geolocation=()',
+    }
+    const seen = [...log.seen.values()]
+    const problems = []
+    for (const r of seen) {
+      for (const [name, value] of Object.entries(same))
+        if (r.headers[name] !== value)
+          problems.push(
+            `${r.method} ${r.path} ${r.status}: ${name} is "${r.headers[name] ?? '(missing)'}"`,
+          )
+    }
+    const kind = (r) =>
+      r.path.startsWith('/api/v1/')
+        ? 'api'
+        : r.path.startsWith('/assets/')
+          ? 'asset'
+          : /.[a-z0-9]+$/.test(r.path)
+            ? 'file'
+            : 'page'
+    const want = { api: 'no-store', page: 'no-cache', file: 'no-cache' }
+    for (const r of seen) {
+      const k = kind(r)
+      const cc = r.headers['cache-control']
+      if (k === 'asset') {
+        if (cc !== 'public, max-age=31536000, immutable')
+          problems.push(`asset ${r.path}: cache-control "${cc}" (the panel expects immutable)`)
+      } else if (cc !== want[k])
+        problems.push(`${k} ${r.path} ${r.status}: cache-control "${cc}", expected "${want[k]}"`)
+    }
+    const extra = new Set(
+      seen.flatMap((r) =>
+        ['cross-origin-resource-policy', 'strict-transport-security']
+          .filter((h) => r.headers[h])
+          .map((h) => `${h}: ${r.headers[h]}`),
+      ),
+    )
+    notes.push(
+      `headers checked on ${seen.length} distinct responses (${new Set(seen.map(kind)).size} kinds); extra headers the panel README does not list: ${[...extra].join('; ') || 'none'}`,
+    )
+    notes.push(
+      `problems with headers: ${problems.length ? problems.slice(0, 12).join(' || ') : 'none'}`,
+    )
+    expect(problems.length === 0, `header differences: ${problems.slice(0, 8).join(' || ')}`)
+    expect(log.csp.length === 0, `Content-Security-Policy violations: ${log.csp.join(' | ')}`)
+    const csprint = log.consoleErrors.filter((m) => /content security policy|refused to/i.test(m))
+    expect(csprint.length === 0, `console messages about the policy: ${csprint.join(' | ')}`)
+  })
+
   // ---- 10. sign out ---------------------------------------------------------------------------------------------
   await step('sign out', async () => {
     await ui.click('Sign out')
     await ui.waitForText('Sign in to KingresDB')
+    const left = (await page.cookies()).find((x) => x.name === 'kingres_session')
+    expect(!left || left.value === '', 'the session cookie is still set after sign-out')
   })
 
+  try {
+    const errors = ctx
+      .serverLog()
+      .split(/\r?\n/)
+      .filter((l) => /"level":"(ERROR|WARN)"/.test(l))
+    notes.push(`kingresd log: ${errors.length} warning or error lines`)
+    for (const l of errors.slice(0, 8)) notes.push(`  ${l.slice(0, 300)}`)
+  } catch (e) {
+    notes.push(`kingresd log not read: ${e}`)
+  }
   await browser.close()
   return { results, notes, pageReport, log }
 }

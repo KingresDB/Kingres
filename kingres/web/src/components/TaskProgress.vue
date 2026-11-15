@@ -17,7 +17,7 @@ const summary = computed(() => {
   if (!t) return ''
   if (t.state === 'failed') return `Task ${t.id} failed: ${t.error?.message ?? 'unknown error'}`
   if (t.state === 'done') return `Task ${t.id} finished.`
-  return `Task ${t.id}: ${t.progress.currentStep ?? t.state}, ${Math.round(t.progress.percent)} percent.`
+  return `Task ${t.id}: ${t.progress.currentStep ?? t.state}, ${Math.round(t.progress.percent)} percent.${t.detail ? ` ${t.detail}` : ''}`
 })
 // What is read aloud changes only when the state, the step or the next tenth of the progress
 // changes, not every second.
@@ -43,7 +43,7 @@ watch(
     <div class="row-between">
       <span class="row">
         <StatusBadge :meta="TASK_STATE[task.state]" />
-        <span class="mono">{{ task.kind }}</span>
+        <span class="mono"><SafeName :value="task.kind" kind="text" :max="40" /></span>
       </span>
       <span class="num">{{ Math.round(task.progress.percent) }}%</span>
     </div>
@@ -70,8 +70,14 @@ watch(
         }}</span>
         <SafeName :value="step.name" kind="text" :max="120" />
         <span class="muted">({{ step.state }})</span>
+        <span v-if="step.detail && step.detail !== task.detail" class="muted step-detail"
+          ><SafeName :value="step.detail" kind="text" :max="200"
+        /></span>
       </li>
     </ol>
+    <p v-if="task.detail" class="muted task-detail">
+      <SafeName :value="task.detail" kind="text" :max="300" multiline />
+    </p>
     <p v-if="task.error" class="tone-danger notice" role="alert">
       <span aria-hidden="true">&#10006;</span>
       <span

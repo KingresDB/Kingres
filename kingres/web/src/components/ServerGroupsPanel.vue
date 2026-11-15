@@ -179,7 +179,10 @@ function openCreate(): void {
     @cancel="deleting = null"
     @confirm="remove.mutate(deleting)"
   >
-    <p>The group is removed. A group that still has servers cannot be deleted; move them first.</p>
+    <p>
+      The group is removed. A group that still has servers cannot be deleted: move each of them to
+      another group, or to no group, on its page first.
+    </p>
     <ProblemNotice v-if="remove.error.value" :error="remove.error.value" />
   </ConfirmDialog>
 </template>

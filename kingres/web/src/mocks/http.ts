@@ -45,6 +45,16 @@ const STATUS: Record<ProblemCode, number> = {
   role_in_use: 409,
   optimistic_lock_failed: 409,
   no_replica_available: 409,
+  instance_already_running: 409,
+  instance_already_stopped: 409,
+  server_owns_buckets: 409,
+  server_hosts_map_group: 409,
+  last_server: 409,
+  server_group_not_empty: 409,
+  ledger_entry_pending: 409,
+  system_database_stopped: 503,
+  certificate_revoked: 409,
+  certificate_authority_unavailable: 503,
   unprocessable: 422,
   sql_error: 422,
   unsupported_operation: 422,
@@ -99,6 +109,8 @@ export const validationFailed = (errors: { field: string; message: string }[]): 
 export interface Reply {
   status: number
   body?: unknown
+  /** A JSON text sent byte for byte (a document that a verifier reads must not be re-serialized). */
+  rawJson?: string
   headers?: Record<string, string>
 }
 
@@ -178,6 +190,11 @@ export function register(operationId: OperationId, handler: Handler): HttpHandle
       if (MUTATING.has(request.method) && operationId !== 'login')
         audit(s, operationId, flat, reply.status)
       const headers = { 'X-Request-Id': requestId, ...reply.headers }
+      if (reply.rawJson !== undefined)
+        return new HttpResponse(reply.rawJson, {
+          status: reply.status,
+          headers: { ...headers, 'Content-Type': 'application/json' },
+        })
       if (reply.status === 204 || reply.body === undefined)
         return new HttpResponse(null, { status: reply.status, headers })
       return HttpResponse.json(reply.body as Record<string, unknown>, {
@@ -188,7 +205,11 @@ export function register(operationId: OperationId, handler: Handler): HttpHandle
       if (error instanceof MockProblem) {
         return HttpResponse.json(error.toProblem(requestId) as unknown as Record<string, unknown>, {
           status: STATUS[error.code],
-          headers: { 'Content-Type': 'application/problem+json', 'X-Request-Id': requestId },
+          headers: {
+            'Content-Type': 'application/problem+json',
+            'X-Request-Id': requestId,
+            ...(error.code === 'system_database_stopped' ? { 'Retry-After': '10' } : {}),
+          },
         })
       }
       throw error
@@ -197,8 +218,30 @@ export function register(operationId: OperationId, handler: Handler): HttpHandle
 }
 
 /** Setup state, authentication, CSRF and role checks. */
+/** Answered by a server that is stopped on purpose or resetting; these keep answering. */
+const ALWAYS_UP = new Set<OperationId>(['getHealth', 'getReadiness', 'getNodeState'])
+
 function precheck(s: MockState, operationId: OperationId, request: Request): void {
   const role = operations[operationId].role
+  if (s.leave) {
+    if (Date.now() >= s.leave.until) {
+      // The server finished resetting itself: it is uninitialized and has no sessions.
+      s.leave = null
+      s.node.state = 'uninitialized'
+      s.session = null
+    } else if (!ALWAYS_UP.has(operationId)) {
+      throw problem('service_unavailable', 'The server is resetting after it left the cluster.')
+    }
+  }
+  if (
+    s.systemDatabaseStopped &&
+    !ALWAYS_UP.has(operationId) &&
+    operationId !== 'startThisServerInstance'
+  )
+    throw problem(
+      'system_database_stopped',
+      'The instance that hosts the system database is stopped. Start it with startThisServerInstance.',
+    )
   if (s.node.state === 'uninitialized') {
     if (SETUP_OPS.has(operationId)) return
     // GET /tasks/{id} is not available here: setup progress is read from GET /setup/state.

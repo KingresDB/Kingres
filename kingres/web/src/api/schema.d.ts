@@ -315,9 +315,12 @@ export interface paths {
         put?: never;
         /**
          * Restart a local instance
-         * @description Restarts one local PostgreSQL instance. Restarting a primary interrupts its writes; the task
-         *     refuses (409) when the instance is the only copy of a shard group and replicas exist that are not
-         *     caught up, unless `force` is true.
+         * @description Restarts one local PostgreSQL instance. Restarting a primary interrupts its writes. Answers 409
+         *     `no_replica_available` when the instance is the only up-to-date copy of a shard group (replicas exist
+         *     that are not caught up), unless `force` is true; 409 `operation_in_progress` when another start, stop
+         *     or restart of this instance is running; 409 `instance_already_stopped` when the instance is stopped
+         *     (use `startThisServerInstance`). Restarting the instance that hosts the system database is allowed
+         *     (the task step that writes to it retries for 30 seconds).
          */
         post: operations["restartThisServerInstance"];
         delete?: never;
@@ -340,7 +343,22 @@ export interface paths {
         put?: never;
         /**
          * Stop a local instance
-         * @description Stops one local PostgreSQL instance. The agent does not restart it until it is started again.
+         * @description Stops one local PostgreSQL instance. The agent does not restart it until `startThisServerInstance`
+         *     is called. Conflicts (409): `instance_already_stopped` (the instance is `stopped` or `stopping`),
+         *     `operation_in_progress` (another start, stop or restart of this instance is running),
+         *     `no_replica_available` (the instance is the only up-to-date copy of a shard group and replicas exist
+         *     that are not caught up; `force: true` overrides this and only this).
+         *
+         *     **The instance that hosts the system database** (the primary of the map group, on the server of the
+         *     manager leader; it holds the tasks and answers the role checks of every request) **may be stopped
+         *     like any other**; it needs no flag. The request is accepted with 202 and its task is recorded as
+         *     `done` immediately before the shutdown is requested (no write is possible afterwards); the task is
+         *     corrected to `failed` if the instance does not stop. The API keeps answering from this process
+         *     while the instance is stopped, but every operation that needs the system database or a role check
+         *     in PostgreSQL, that is `login` and every authenticated operation except `startThisServerInstance`,
+         *     answers **503 `system_database_stopped`** until the instance runs again. `getHealth`,
+         *     `getReadiness` and `getNodeState` keep answering. A server that forwards a mutating operation to
+         *     this leader relays the same 503.
          */
         post: operations["stopThisServerInstance"];
         delete?: never;
@@ -363,7 +381,18 @@ export interface paths {
         put?: never;
         /**
          * Start a local instance
-         * @description Starts a stopped local PostgreSQL instance.
+         * @description Starts a stopped local PostgreSQL instance. Conflicts (409): `instance_already_running` (the
+         *     instance is `running`, `starting` or `restarting`) and `operation_in_progress` (another start, stop
+         *     or restart of this instance is running).
+         *
+         *     This operation **keeps working while the system database is stopped** (see
+         *     `stopThisServerInstance`). For it alone, the session or bearer token is checked in memory and the
+         *     cluster roles of the last successful role check are used instead of failing closed with 503. A
+         *     sign-in that was valid before the stop therefore still works; a new sign-in is impossible until the
+         *     instance runs (`login` answers 503 `system_database_stopped`), and when no valid session exists the
+         *     operator has to start the instance on the machine. The task is written to the system database once
+         *     it is back; until then it exists only in the memory and the log of this process and `getTask`
+         *     answers 503.
          */
         post: operations["startThisServerInstance"];
         delete?: never;
@@ -381,7 +410,10 @@ export interface paths {
         };
         /**
          * Get local settings
-         * @description Data paths, memory quota and other settings that apply to this server only.
+         * @description Data paths, memory quota, log level and client ports that apply to this server only. Answered from
+         *     this server's own configuration, also when it is standalone. `restartRequired` is true from the
+         *     moment a saved change needs a restart of this server's instances until they have been restarted
+         *     (`restartThisServerInstance` on each); it is a persistent state, not a flag of one response.
          */
         get: operations["getThisServerSettings"];
         put?: never;
@@ -391,8 +423,21 @@ export interface paths {
         head?: never;
         /**
          * Update local settings
-         * @description Changes the memory quota, log level or log directory of this server. Data paths cannot be
-         *     changed after initialization. The response says whether a restart is needed to apply the change.
+         * @description Changes the memory quota, log level or log directory of this server (partial update: only the
+         *     members present change; `logDirectory: null` selects the system default). Data paths and client
+         *     ports cannot be changed: a request with any other member is refused with 400 `validation_failed`
+         *     (`errors[].field` names it). The change is saved and applied at once where possible and the
+         *     response is the whole `LocalSettings` after the change:
+         *
+         *     * `logLevel` takes effect at once; it never sets `restartRequired`.
+         *     * `memoryQuota` and `logDirectory` are written to the managed configuration and take effect when
+         *       the instances of this server are restarted; the response has `restartRequired: true`. A value
+         *       equal to the current one changes nothing.
+         *     * A `memoryQuota` the machine cannot hold (more than its physical memory when that is known) and a
+         *       `logDirectory` that is not an absolute path to an existing directory the server can write to are
+         *       refused with 422 `unprocessable` (`errors[].field` names the member); nothing is changed.
+         *     Changes are audited (`updateThisServerSettings`). The operation is local: it is never forwarded to
+         *     the leader.
          */
         patch: operations["updateThisServerSettings"];
         trace?: never;
@@ -408,11 +453,32 @@ export interface paths {
         put?: never;
         /**
          * Leave the cluster
-         * @description Detaches this server from the cluster and returns it to the `standalone` state. Allowed only
-         *     when the server is not the only holder of any bucket (drain it first with
-         *     `DELETE /servers/{serverId}`) and not the last server; otherwise 409. Works when the
-         *     rest of the cluster is unreachable if `force` is true, in which case the cluster must be repaired by
-         *     failing this server over.
+         * @description Detaches this server from the cluster and returns it to the `uninitialized` state: it deletes its instance,
+         *     its key and its certificates, forgets the cluster and gets a new setup token, so that it can join or be
+         *     added again (corrected in 0.5.0: 0.4.0 said `standalone`, which the server never did). Conflicts (409),
+         *     checked in this order against this server's copy of the catalog:
+         *
+         *     1. `last_server`: this is the only server of the cluster.
+         *     2. `server_hosts_map_group`: this server hosts an instance of the map group (shard group 0), that is
+         *        it is, or hosts the standby of, the manager leader's catalog. Move the map group first.
+         *     3. `server_owns_buckets`: this server holds a copy (primary or replica) of any bucket of any
+         *        database. Drain it first: `PATCH /servers/{serverId}` with `shouldHaveShards: false`, then
+         *        `POST /rebalance`.
+         *     4. `rebalance_in_progress` while a rebalance runs, and `operation_in_progress` when another task of
+         *        this server (add, remove, leave) runs.
+         *
+         *     `force: true` only lifts the requirement that the rest of the cluster is reachable: the three
+         *     checks above are still made, from the local copy of the catalog, and a refusal is final. A server
+         *     that left with `force` while the cluster was unreachable is still listed by the cluster until it
+         *     is removed or failed over from there (`removeServer`).
+         *
+         *     **Answer of a forced leave without a leader (0.5.0 wording of what 0.4.0 left unsaid).** With `force: true`
+         *     and a manager leader that cannot be reached or is not known, or that refuses the certificate of this server
+         *     because it was revoked (`revokeServerCertificates`), no task can exist anywhere, so the answer is `202`
+         *     with a `Task` whose `kind` is `server.leave`, `state` is `done`, `id` is `0` and which has one step; its
+         *     `Location` names a task that cannot be fetched (`GET /tasks/0` answers 404, here and on every server). The
+         *     server resets itself about a second after the answer. Without `force` the same situation is 503
+         *     `service_unavailable` and the server stays a member.
          */
         post: operations["leaveCluster"];
         delete?: never;
@@ -431,6 +497,8 @@ export interface paths {
         /**
          * List local logs
          * @description Log entries of this server (agent, manager, router, etcd, Patroni, PostgreSQL instances), newest first.
+         *     Requires `kingres_ops`: PostgreSQL's log can contain data values (constraint violations, error details) of
+         *     statements run by other roles. The text of statements is not written to the log of managed instances.
          */
         get: operations["listThisServerLogs"];
         put?: never;
@@ -529,17 +597,39 @@ export interface paths {
         post?: never;
         /**
          * Remove a server (drain)
-         * @description Marks the server `draining`, starts a rebalance that moves all its buckets away, and removes it
-         *     from the cluster when it is empty (status `decommissioning` while the rebalance runs). Returns a task for
-         *     the whole removal. A `dead` server cannot be drained: fail it over first. Fails with 409 while
-         *     another rebalance is running or when the remaining servers cannot hold the required replica count.
+         * @description Removes a server that holds no data: unregisters it from the catalog, withdraws its certificate
+         *     (revoked on every server), tells it to delete its instance and reset itself to `uninitialized`,
+         *     and forgets it (status `decommissioning` while the task runs). Returns a task (`server.remove`) for
+         *     the whole removal. **The operation does not move data**: to empty a server, set
+         *     `shouldHaveShards: false` (`PATCH /servers/{serverId}`) and run `POST /rebalance`, then remove it.
+         *     The task checks the conditions again when it starts.
+         *
+         *     Refusals, checked in this order: 404 for an unknown server; 409 `last_server` (the only server of
+         *     the cluster); 409 `server_hosts_map_group` (the server hosts an instance of the map group, shard
+         *     group 0, which is the manager leader's catalog); 409 `server_owns_buckets` (it holds a copy,
+         *     primary or replica, of any bucket of any database; the problem `detail` names the databases and
+         *     counts); 409 `rebalance_in_progress` while a rebalance runs and `operation_in_progress` while
+         *     another task of this server runs. A `dead` server is refused with 422 `node_state_invalid`: fail
+         *     it over first.
          */
         delete: operations["removeServer"];
         options?: never;
         head?: never;
         /**
          * Update a server
-         * @description Changes the server group or whether the server should hold shards. Changing either may make a rebalance necessary.
+         * @description Changes the server group or whether the server should hold shards (partial update, answered
+         *     synchronously with the whole `Server`). **Only `serverGroup` and `shouldHaveShards` can be
+         *     changed**; every other property of `Server` is read-only and a request that contains any other
+         *     member is refused with 400 `validation_failed` (`errors[].field` names it, for example `/status`).
+         *     An empty body is refused with 400. A value equal to the current one changes nothing and still
+         *     answers 200. Changing either value may make a rebalance necessary (`ClusterOverview.rebalance`);
+         *     no data moves until `POST /rebalance`.
+         *
+         *     Refusals: 404 for an unknown server; 422 `unprocessable` with `errors[].field` `/serverGroup` when
+         *     the named group does not exist (create it with `createServerGroup` first); 409
+         *     `operation_in_progress` while the server is being added, removed or left (`draining` because of a
+         *     removal, `decommissioning`); 409 `rebalance_in_progress` while a rebalance runs, because it would
+         *     change the placement under it.
          */
         patch: operations["updateServer"];
         trace?: never;
@@ -571,6 +661,90 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/servers/{serverId}/certificates/renewals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Server identifier, an opaque string (the host of the server's instances, see `ServerId`). Percent-encode it in the path, for example an IPv6 host. */
+                serverId: components["parameters"]["ServerId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Renew the certificates of a server now
+         * @description Added in 0.5.0. Gives the server a new certificate from the cluster certificate authority now,
+         *     without waiting for the renewal job (every server renews its own certificate by itself when less
+         *     than a configurable part of its lifetime is left). One certificate is the server certificate and
+         *     the client certificate of the server's internal API and of its PostgreSQL instance, so this renews
+         *     both. The key of the server stays; the new certificate carries the same names. Nothing is restarted:
+         *     the internal API and the connections to the other servers read the certificate at every handshake
+         *     and the PostgreSQL instance of the server re-reads it with a reload. Connections that are open keep
+         *     working. Returns a task (`certificate.renew`, subject type `server`).
+         *
+         *     The manager leader holds the certificate authority key today. When it does not, the operation is
+         *     refused with 503 `certificate_authority_unavailable`. 404 for an unknown server; 409
+         *     `certificate_revoked` for a server whose certificates were revoked (it gets no new certificate: remove
+         *     it with `removeServer` or let it leave, and join it again); 409 `operation_in_progress` while another
+         *     task of this server runs; 409 `conflict` for a server that is not an active member.
+         */
+        post: operations["renewServerCertificates"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/servers/{serverId}/certificates/revocations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Server identifier, an opaque string (the host of the server's instances, see `ServerId`). Percent-encode it in the path, for example an IPv6 host. */
+                serverId: components["parameters"]["ServerId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Revoke the certificates of a server
+         * @description Added in 0.5.0. Revokes every certificate that was issued to the server and may still be valid, and
+         *     sends the revocation list to every server and every PostgreSQL instance of the cluster. Returns a
+         *     task (`certificate.revoke`, subject type `server`; it waits for a server that cannot be reached, as
+         *     every cluster-wide task does).
+         *
+         *     **What stops working.** From the moment the task has sent the list to a server, that server's
+         *     internal API refuses the revoked server (every call it makes, including forwarding, recording its
+         *     tasks and asking to leave, answers 401), and the PostgreSQL instances refuse its certificate
+         *     (`hostssl ... cert`, the sharding extension's connections to and from it), so statements that need a
+         *     shard on the revoked server fail. Connections that were open before keep running until they end.
+         *     The revoked server keeps running and keeps its data; its own REST API still answers for what it can
+         *     do alone (`GET /this-server`, its instances) but it cannot change the cluster.
+         *
+         *     **How the server gets back in.** A revoked server never gets a new certificate (`renewServerCertificates`
+         *     answers 409 `certificate_revoked`; its renewal job is refused too). Take it out and add it again: a
+         *     server that owns no bucket is removed with `removeServer` (or it leaves with `leaveCluster` and
+         *     `force: true`, which resets it without the cluster, after which `removeServer` still has to take it out of
+         *     the cluster's list) and joins again with a new setup token and a new key. A server that still owns buckets
+         *     cannot be removed before a rebalance has emptied it, which is not possible while it is cut off; this version
+         *     has no other way back. The leader still reaches the revoked server to give it the revocation list and to tell
+         *     it to reset itself.
+         *
+         *     The manager leader's own certificates cannot be revoked (409 `server_hosts_map_group`). The
+         *     operation needs the certificate authority key like `renewServerCertificates`: 503
+         *     `certificate_authority_unavailable` when the manager leader does not hold it. 404 for an unknown
+         *     server; 409 `certificate_revoked` when they are revoked already; 409 `operation_in_progress`.
+         */
+        post: operations["revokeServerCertificates"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/server-groups": {
         parameters: {
             query?: never;
@@ -586,7 +760,11 @@ export interface paths {
         put?: never;
         /**
          * Create a server group
-         * @description Creates an empty server group. Assign servers with `PATCH /servers/{serverId}`.
+         * @description Creates an empty server group and answers 201 with the `ServerGroup` (`serverIds: []`). Assign servers with `PATCH /servers/{serverId}`. A name that does not match
+         *     `^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$`, a description longer than 200 characters or an unknown member
+         *     is refused with 400 `validation_failed`. A name that already exists is refused with 409
+         *     `already_exists`; names are compared exactly (case-sensitive), so `rack-a` and `Rack-A` are two
+         *     groups. The group is part of the cluster state and exists on every server at once.
          */
         post: operations["createServerGroup"];
         delete?: never;
@@ -610,7 +788,10 @@ export interface paths {
         post?: never;
         /**
          * Delete a server group
-         * @description Deletes an empty server group. Returns 409 while servers are still assigned to it.
+         * @description Deletes an empty server group and answers 204. Answers 404 for an unknown group and 409
+         *     `server_group_not_empty` while any server is still assigned to it (including a server that is
+         *     `draining` or `dead`); the problem `detail` lists the server ids. Move or unassign them first
+         *     (`PATCH /servers/{serverId}` with `serverGroup`). Nothing is deleted when the answer is 409.
          */
         delete: operations["deleteServerGroup"];
         options?: never;
@@ -1498,7 +1679,14 @@ export interface paths {
         };
         /**
          * List verification runs
-         * @description Past and running ledger verifications, newest first.
+         * @description Finished ledger verifications of the database, newest first (descending `id`, which grows
+         *     with time). A run in progress has no id and is followed through its task (`startLedgerVerification`). Cursor paging as for every large list: `limit` 1 to 500 (default 50), the opaque
+         *     `cursor` of the previous page's `nextCursor`; `nextCursor` is null on the last page. A page is a
+         *     snapshot position: a run that starts while a client pages appears only on a fresh first page, and no
+         *     item appears twice. A cursor that is malformed or belongs to another list is refused with 400
+         *     `bad_request`. A database whose ledger mode is `off`, or whose `kingres_ledger` extension is still
+         *     0.1, has no verification and answers 200 with `items: []`; an unknown database is 404. Includes
+         *     runs recorded by the extension without a task (`taskId: null`).
          */
         get: operations["listLedgerVerifications"];
         put?: never;
@@ -1529,7 +1717,12 @@ export interface paths {
         };
         /**
          * Get a verification run
-         * @description Result of one verification including every inconsistency found.
+         * @description Result of one finished verification run including the inconsistencies found (at most the first 100:
+         *     the extension records no more, and the exact total is not part of the contract). 404 when the
+         *     database or the run does not exist, or the run belongs to another database. A run that is still
+         *     executing has no id yet (the record is written when the run ends); follow it with the task
+         *     returned by `startLedgerVerification`. `state: running` is therefore not returned by this
+         *     operation or by the list in this revision.
          */
         get: operations["getLedgerVerification"];
         put?: never;
@@ -1554,9 +1747,38 @@ export interface paths {
         put?: never;
         /**
          * Create an inclusion proof for a row
-         * @description Computes (`kingres.ledger_inclusion_proof`) the Merkle path from a row to its block header and, for
-         *     a sharded database, from that header to the aggregate digest. Uses POST because the primary key is
-         *     a structured value and the proof is computed on demand; nothing is stored.
+         * @description Computes the inclusion proof of one version of a row (`kingres.ledger_inclusion_proof`). Uses POST
+         *     because the primary key is a structured value and the proof is computed on demand; nothing is
+         *     stored. The 200 body **is the proof document of the extension, byte for byte in meaning, in its
+         *     own snake_case members** (see `InclusionProof`), plus one member `shard_group_id`; it is not
+         *     wrapped and not renamed, so it can be saved and given to `kingres-verify proof` unchanged:
+         *
+         *     ```
+         *     curl -s -X POST .../ledger/inclusion-proofs -d '{"schema":"public","table":"accounts","primaryKey":{"id":42}}' > proof.json
+         *     kingres-verify proof --proof proof.json --digest digest.json --table-id <table_id of the proof> --row-hash <row hash you recomputed>
+         *     ```
+         *     The digest must come from outside the database and be of the same chain at the proof's block height
+         *     or later (`generateLedgerDigest` returns it as `chains[].document`). A proof carries the block
+         *     headers up to the latest block at the time it was made and verifies against any digest of that
+         *     range (see `kingres/verifier/README.md`).
+         *
+         *     **How the row is found.** `schema`, `table` and all columns of the primary key (`primaryKey`, by
+         *     column name; a bigint above 2^53, a uuid, a date or a timestamp is given as a string) identify the
+         *     row. The server reads the row **as the signed-in PostgreSQL role** (so table privileges and row
+         *     security apply; no privilege on the table gives 403 `forbidden`) and computes its row hash with
+         *     `kingres.ledger_row_hash`, then asks the extension for the proof of the entry with that hash and
+         *     operation. Which version and entry: `op: I` without `ledgerTxId` proves that the **current**
+         *     version of the row was written; `ledgerTxId` (updatable tables only) names a **removed** version
+         *     by the `ledger_txid` of its history row, i.e. the transaction that removed it, and is read from the
+         *     history table, which only the owner of the ledger table can read (403 `forbidden` otherwise);
+         *     `op: D` proves that removal and requires `ledgerTxId` (400 `validation_failed` otherwise). In a
+         *     sharded database the row is looked up on the shard group that holds it, so the distribution
+         *     column must be part of `primaryKey` (it is part of every unique key).
+         *
+         *     Refusals: 404 when the database, the table or the row (or the removed version) does not exist;
+         *     422 `unprocessable` when the table is not a ledger table or when `op: D` or `ledgerTxId` is used on
+         *     an append-only table, and 422 `unsupported_operation` for those two when `kingres_ledger` is 0.1; 409 `ledger_entry_pending` when the row is not in a block yet (or the ledger has no
+         *     block): generate a digest (`generateLedgerDigest`, which closes the open block) and ask again.
          */
         post: operations["createInclusionProof"];
         delete?: never;
@@ -1597,7 +1819,13 @@ export interface paths {
         };
         /**
          * List alerts
-         * @description Alerts raised by the manager, newest first.
+         * @description Alerts of the whole cluster, newest first, from any server: each server keeps the alerts about itself,
+         *     and the server that receives the request asks the others for theirs in parallel (see `partial` and
+         *     `missingServers` of `AlertPage`). The alerts about the cluster as a whole (`versionMismatch`) are kept by
+         *     the manager leader. An alert `id` is unique in the cluster and names the server that holds the alert (the
+         *     high bits are that server's number), so `PUT /alerts/{alertId}/acknowledgement` can be sent to any
+         *     server. Cursors are keyset cursors over one order (time raised, then id): a page boundary is the same
+         *     whichever servers answered; a cursor of 0.4.0 is refused with 400 `validation_failed`.
          */
         get: operations["listAlerts"];
         put?: never;
@@ -1640,7 +1868,13 @@ export interface paths {
         };
         /**
          * Search cluster logs
-         * @description Log entries from every server, newest first. For one server only, filter by `serverId` or use `/this-server/logs`.
+         * @description Log entries from every server, newest first, from any server: the server that receives the request asks the
+         *     others for their part in parallel (each has a deadline; the servers that did not answer are named in
+         *     `missingServers`, `partial` is then true). `level` keeps the entries at that level or more severe and `q`
+         *     the entries whose message contains the text (case-insensitive). For one server only, filter by `serverId` or
+         *     use `/this-server/logs`. Entries are ordered by time, then by server id, and the cursor is a position in
+         *     that order, so paging is stable across servers. Requires `kingres_ops` (see `listThisServerLogs`); the role
+         *     is checked again by every server that answers.
          */
         get: operations["listLogs"];
         put?: never;
@@ -1664,6 +1898,9 @@ export interface paths {
          *     Without a filter the cluster aggregate is returned (sum for counters and sizes, average for
          *     percentages). With `serverId` or `databaseName` the series is restricted; with `groupBy` one series per
          *     server or database is returned. At most 5000 points per series (422 otherwise).
+         *     The series are those of the whole cluster, from any server: each server answers with its own samples and the
+         *     receiving server combines them (a database that several servers report is summed or averaged like the
+         *     servers); a server that did not answer is named in `missingServers` (`partial` is then true).
          */
         get: operations["queryMetrics"];
         put?: never;
@@ -1680,9 +1917,26 @@ export interface components {
     schemas: {
         /**
          * @description Stable machine-readable error code. Clients branch on this, not on `title` or `detail`.
+         *
+         *     409 (state conflict): `conflict` (generic), `already_exists`, `immutable_field`,
+         *     `rebalance_in_progress`, `operation_in_progress`, `task_not_cancellable`, `last_admin`, `role_in_use`,
+         *     `optimistic_lock_failed`, `no_replica_available` (the instance or server is the only up-to-date copy),
+         *     `instance_already_running` (`startThisServerInstance`), `instance_already_stopped`
+         *     (`stopThisServerInstance`, `restartThisServerInstance`), `server_owns_buckets`,
+         *     `server_hosts_map_group`, `last_server` (`removeServer`, `leaveCluster`), `server_group_not_empty`
+         *     (`deleteServerGroup`), `ledger_entry_pending` (`createInclusionProof`).
+         *
+         *     Added in 0.5.0: `certificate_revoked` (409: `renewServerCertificates`, `revokeServerCertificates`) and
+         *     `certificate_authority_unavailable` (503: the operation needs the certificate authority key and the manager
+         *     leader does not hold it; `renewServerCertificates`, `revokeServerCertificates`, `addServer`, `removeServer`,
+         *     `leaveCluster`, `joinCluster`). Clients must tolerate codes they do not know.
+         *
+         *     503 (cannot serve now): `node_uninitialized`, `map_group_unavailable`, `leader_unavailable`,
+         *     `quorum_unavailable`, `service_unavailable`, `system_database_stopped` (the instance that hosts the
+         *     system database was stopped on purpose; start it with `startThisServerInstance`).
          * @enum {string}
          */
-        ProblemCode: "bad_request" | "validation_failed" | "unauthenticated" | "invalid_credentials" | "session_expired" | "csrf_token_invalid" | "forbidden" | "setup_token_invalid" | "not_found" | "method_not_allowed" | "conflict" | "already_exists" | "immutable_field" | "rebalance_in_progress" | "operation_in_progress" | "task_not_cancellable" | "last_admin" | "role_in_use" | "optimistic_lock_failed" | "no_replica_available" | "quorum_unavailable" | "unprocessable" | "sql_error" | "unsupported_operation" | "node_state_invalid" | "node_uninitialized" | "map_group_unavailable" | "leader_unavailable" | "rate_limited" | "service_unavailable" | "internal_error";
+        ProblemCode: "bad_request" | "validation_failed" | "unauthenticated" | "invalid_credentials" | "session_expired" | "csrf_token_invalid" | "forbidden" | "setup_token_invalid" | "not_found" | "method_not_allowed" | "conflict" | "already_exists" | "immutable_field" | "rebalance_in_progress" | "operation_in_progress" | "task_not_cancellable" | "last_admin" | "role_in_use" | "optimistic_lock_failed" | "no_replica_available" | "instance_already_running" | "instance_already_stopped" | "server_owns_buckets" | "server_hosts_map_group" | "last_server" | "server_group_not_empty" | "ledger_entry_pending" | "quorum_unavailable" | "system_database_stopped" | "unprocessable" | "sql_error" | "unsupported_operation" | "node_state_invalid" | "node_uninitialized" | "map_group_unavailable" | "leader_unavailable" | "rate_limited" | "service_unavailable" | "internal_error" | "certificate_revoked" | "certificate_authority_unavailable";
         /** @description One invalid field of a request. */
         ValidationIssue: {
             /** @description JSON Pointer (RFC 6901) to the invalid property of the request body, or the name of the invalid query or path parameter. */
@@ -1951,6 +2205,14 @@ export interface components {
             serverGroup?: string | null;
             /** @description Address other servers use to reach this one, if different from its listen address. */
             advertiseAddress?: components["schemas"]["NodeAddress"] | null;
+            /**
+             * @description SHA-256 fingerprint (hex, colons allowed) that the internal certificate of the existing server must
+             *     have. With it, a different certificate is refused before the administrator's password is sent; without
+             *     it the fingerprint seen is only recorded (trust on first use). Replaces the header
+             *     `X-Kingres-Pin-Sha256` of 0.3.0, which is still accepted; both must agree if both are given. The
+             *     internal API of a server is at its REST host and the port above its REST port.
+             */
+            expectedFingerprint?: string | null;
         };
         /**
          * @description A process role inside `kingresd` or a bundled component.
@@ -2148,7 +2410,12 @@ export interface components {
             /** @description True when a saved change needs a restart of this server's instances to take effect. */
             restartRequired: boolean;
         };
-        /** @description Partial update of local settings. */
+        /**
+         * @description Partial update of local settings. Only the three members below exist; any other member (for
+         *     example `dataPaths` or `clientPorts`) is refused with 400 `validation_failed`. `memoryQuota` and
+         *     `logDirectory` need a restart of this server's instances (`LocalSettings.restartRequired`),
+         *     `logLevel` does not.
+         */
         LocalSettingsUpdate: {
             memoryQuota?: components["schemas"]["MemoryQuota"];
             logLevel?: components["schemas"]["LogLevel"];
@@ -2182,11 +2449,30 @@ export interface components {
             /** @description Log message. */
             message: string;
         };
+        /**
+         * @description Added in 0.5.0. A server that did not take part in a cluster-wide answer (`listLogs`, `listAlerts`,
+         *     `queryMetrics`): the receiving server asks every other server for its part in parallel, each with its own
+         *     deadline, and says here which ones it could not use.
+         */
+        MissingServer: {
+            serverId: components["schemas"]["ServerId"];
+            /**
+             * @description Why: `timeout` (no answer within the deadline), `unreachable` (the connection failed), `refused` (the
+             *     server answered with an error, for example because it no longer accepts the caller's role) or
+             *     `invalidAnswer` (the answer was too large or not well formed). Clients must tolerate other values.
+             * @enum {string}
+             */
+            reason: "timeout" | "unreachable" | "refused" | "invalidAnswer";
+        };
         /** @description A page of log entries. */
         LogPage: {
             /** @description Entries, newest first. */
             items: components["schemas"]["LogEntry"][];
             nextCursor: components["schemas"]["NextCursor"];
+            /** @description Added in 0.5.0, optional. True when at least one other server did not answer (see `MissingServer`); the page holds what the servers that answered know. */
+            partial?: boolean;
+            /** @description Added in 0.5.0, optional. The servers that did not answer, sorted by id; absent when `partial` is false. */
+            missingServers?: components["schemas"]["MissingServer"][];
         };
         /** @description Cursor for the next page; null when this is the last page. */
         NextCursor: string | null;
@@ -2361,6 +2647,11 @@ export interface components {
         };
         /** @description A machine in the cluster, defined as one distinct host of the `kingres.node` catalog. Values the backend does not know yet are null ("not available"), never invented zeros. */
         Server: {
+            /**
+             * Format: date-time
+             * @description Added in 0.5.0, optional. When the certificates of this server were revoked (`revokeServerCertificates`); absent or null when they were not. A server with revoked certificates cannot take part in the cluster until it is removed and joined again.
+             */
+            certificateRevokedAt?: string | null;
             id: components["schemas"]["ServerId"];
             /** @description Address (host:port) of the server's REST API. */
             address: string;
@@ -2390,6 +2681,26 @@ export interface components {
              * @description Last heartbeat seen by the manager; null when not available.
              */
             lastHeartbeatAt: string | null;
+            /**
+             * Format: date-time
+             * @description `notAfter` of the server certificate the cluster issued to this server (the one its internal API
+             *     presents); null when not available (the certificate has not been read, for example the server is
+             *     unreachable and the leader holds no copy). The alert kind `certificateExpiring` is raised from it.
+             */
+            certificateExpiresAt: string | null;
+            /**
+             * @description SHA-256 fingerprint of the bootstrap certificate this server presented when it was added or joined
+             *     (the value recorded on first contact, 64 lower-case hex characters, no colons; the same value
+             *     as in `Task.detail` of `server.add`). Null when no first contact was recorded: the server that
+             *     created the cluster, and servers added before this property existed.
+             */
+            seenFingerprint: components["schemas"]["Sha256Hex"] | null;
+            /**
+             * @description True when the fingerprint was checked against an expected one given by the operator
+             *     (`expectedFingerprint` or the `X-Kingres-Pin-Sha256` header) before the server was trusted; false
+             *     for trust on first use and whenever `seenFingerprint` is null.
+             */
+            fingerprintPinned: boolean;
             /** @description Instances on this server with role, shard group, port and lag. */
             instances: components["schemas"]["Instance"][];
             buckets: components["schemas"]["BucketHolding"];
@@ -2438,10 +2749,21 @@ export interface components {
             setupToken: string;
             /** @description Server group to place the server in. */
             serverGroup?: string | null;
+            /**
+             * @description SHA-256 fingerprint (hex, colons allowed) that the bootstrap certificate of the new server must have
+             *     (the server logs it at start). With it, a different certificate is refused before the setup token is
+             *     sent; without it the fingerprint seen is only recorded (trust on first use). Replaces the header
+             *     `X-Kingres-Pin-Sha256` of 0.3.0, which is still accepted; both must agree if both are given. The
+             *     internal API of the new server is at its REST host and the port above its REST port.
+             */
+            expectedFingerprint?: string | null;
         };
-        /** @description Partial update of a server. */
+        /**
+         * @description Partial update of a server. Only these two members exist; every other property of `Server` is
+         *     read-only and is refused with 400 `validation_failed`.
+         */
         ServerUpdateRequest: {
-            /** @description Server group name; null removes the server from its group. The group must exist. */
+            /** @description Server group name; null removes the server from its group. The group must exist (422 `unprocessable` otherwise). */
             serverGroup?: string | null;
             /** @description False excludes the server from bucket placement at the next rebalance. */
             shouldHaveShards?: boolean;
@@ -2465,7 +2787,7 @@ export interface components {
         };
         /** @description A new server group. */
         ServerGroupCreateRequest: {
-            /** @description Unique name. */
+            /** @description Unique name (exact, case-sensitive comparison); an existing name is 409 `already_exists`, a name that does not match the pattern is 400 `validation_failed`. */
             name: string;
             /** @description Free text. */
             description?: string;
@@ -2715,8 +3037,9 @@ export interface components {
         /**
          * @description A table has one or more classes. `plain` is a normal table on its home shard group; `distributed` is
          *     hash-distributed over buckets; `reference` is copied to every shard group; `ledger` has a tamper-evident
-         *     ledger. A table can be `distributed` and `ledger` (or `reference` and `ledger`) at the same time;
-         *     `plain` is never combined with `distributed` or `reference`.
+         *     ledger. A table can be `distributed` and `ledger` (or `reference` and `ledger`) at the same time.
+         *     **`plain` is never combined with another class**: a plain table with a ledger is `[ledger]`, not
+         *     `[plain, ledger]`.
          * @enum {string}
          */
         TableClass: "plain" | "distributed" | "reference" | "ledger";
@@ -3272,7 +3595,7 @@ export interface components {
          *     (section "Task kinds and subjects").
          * @enum {string}
          */
-        TaskKind: "cluster.init" | "cluster.join" | "server.add" | "server.remove" | "server.failover" | "server.leave" | "instance.start" | "instance.stop" | "instance.restart" | "database.create" | "database.update" | "database.drop" | "table.distribute" | "rebalance" | "replication.restorePreferredPrimaries" | "ledger.verify" | "networkAccess.apply";
+        TaskKind: "cluster.init" | "cluster.join" | "server.add" | "server.remove" | "server.failover" | "server.leave" | "instance.start" | "instance.stop" | "instance.restart" | "database.create" | "database.update" | "database.drop" | "table.distribute" | "rebalance" | "replication.restorePreferredPrimaries" | "ledger.verify" | "networkAccess.apply" | "replicate.apply" | "certificate.renew" | "certificate.revoke";
         /** @description One step of a task. */
         TaskStep: {
             /** @description Step name. */
@@ -3282,7 +3605,7 @@ export interface components {
              * @enum {string}
              */
             state: "pending" | "running" | "done" | "failed" | "skipped";
-            /** @description Extra information, for example the failing shard group. */
+            /** @description Extra information about the step, for example `Waiting for server db3, which cannot be reached`. Set while the step runs; null otherwise. */
             detail?: string | null;
             /** @description Items completed, for example buckets moved. */
             itemsDone?: number | null;
@@ -3341,6 +3664,12 @@ export interface components {
              * @description Task identifier (`task_id` in `kingres.task`).
              */
             id: number;
+            /**
+             * @description Free text the running step recorded for the operator: the server a step is waiting for, or the
+             *     certificate fingerprint seen when a server was added. Null when there is none. The text of the
+             *     running step is repeated in `TaskStep.detail`.
+             */
+            detail: string | null;
             kind: components["schemas"]["TaskKind"];
             state: components["schemas"]["TaskState"];
             progress: components["schemas"]["TaskProgress"];
@@ -3602,12 +3931,12 @@ export interface components {
          * @description What happened. Either the `operationId` of the audited operation of this contract (for example
          *     `createDatabase`, `dropDatabase`, `login`, `executeQuery`), or one of the events that are not an
          *     operation: `loginFailed` (a sign-in attempt that was rejected, also for an unknown user), `setupTokenRejected`
-         *     (a wrong setup token), `autoFailover` (a failover started by the manager, actor `system`). A denied
+         *     (a wrong setup token), `autoFailover` (a failover started by the manager, actor `system`). From 0.5.0 also `certificateRenewed` and `certificateRenewalFailed` (a server renewed its certificates by itself, or failed to; actor `system`). A denied
          *     or failed call of an operation is recorded under that operation's id with `outcome` `denied` or
          *     `failure`. Read-only operations are not audited except `executeQuery`.
          * @enum {string}
          */
-        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "enableTableLedger" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert";
+        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "enableTableLedger" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert" | "renewServerCertificates" | "revokeServerCertificates" | "certificateRenewed" | "certificateRenewalFailed";
         /** @description One audit log entry. */
         AuditEvent: {
             /**
@@ -3839,6 +4168,15 @@ export interface components {
             /** @description Head of every chain. */
             chains: {
                 /**
+                 * @description The digest of this chain exactly as `kingres.ledger_generate_digest()` returned it
+                 *     (snake_case members `database`, `chain_id`, `hash_version`, `height`, `block_hash`,
+                 *     `block_closed_at`, `generated_at`). Store it outside the database and give it unchanged to
+                 *     `kingres-verify --digest`. `blockHeight` and `blockHash` repeat `height` and `block_hash`.
+                 */
+                document: {
+                    [key: string]: unknown;
+                };
+                /**
                  * Format: int32
                  * @description Shard group.
                  */
@@ -3888,16 +4226,25 @@ export interface components {
              */
             blockHeight?: number | null;
             /**
-             * @description Kind of discrepancy.
+             * @description Kind of discrepancy. `other` is a check of the extension that has no kind of its own (for example a defect of a table, trigger or privilege); `detail` then starts with the extension's check name.
              * @enum {string}
              */
-            kind: "blockHashMismatch" | "prevHashMismatch" | "merkleRootMismatch" | "rowHashMismatch" | "digestMismatch" | "missingBlock";
+            kind: "blockHashMismatch" | "prevHashMismatch" | "merkleRootMismatch" | "rowHashMismatch" | "digestMismatch" | "missingBlock" | "other";
             /** @description Affected table as `schema.table`, for row-level findings. */
             table?: string | null;
             /** @description Explanation with expected and actual values. */
             detail: string;
         };
-        /** @description One verification run. */
+        /**
+         * @description One finished verification run. The id is allocated by the control plane (it is not the extension's
+         *     `verification_id`: a sharded database has one run per chain and the id has to cover all of them);
+         *     `inconsistencies[].shardGroupId` says which chain a finding belongs to. Mapping from the
+         *     extension's record: `clean` is `passed`; `problems` is `failed` with `inconsistencies` filled
+         *     (at most the first 100); the extension's `failed` (the run itself aborted) is `failed` with
+         *     `inconsistencies` empty, the cause being in the error of the task `taskId`. `scope` is `full` when
+         *     the run started at height 0 and `sinceLastVerified` otherwise; `digestId` is null (a run against
+         *     a given digest is not supported yet).
+         */
         LedgerVerification: {
             /**
              * Format: int64
@@ -3919,9 +4266,12 @@ export interface components {
             digestId: number | null;
             /**
              * Format: int64
-             * @description Task running the verification.
+             * @description Task that ran the verification: the `ledger.verify` task that called `ledger_verify_recorded`, the
+             *     control plane remembering the pairing of its task and the extension's record. Null for a run the
+             *     extension recorded without a task (started in SQL or by the ledger worker); such runs are
+             *     listed too. Never null for a run started by `startLedgerVerification`.
              */
-            taskId: number;
+            taskId: number | null;
             /**
              * Format: date-time
              * @description Start time.
@@ -3950,80 +4300,165 @@ export interface components {
             items: components["schemas"]["LedgerVerification"][];
             nextCursor: components["schemas"]["NextCursor"];
         };
-        /** @description The row to prove. */
+        /**
+         * @description The row version to prove. The row is identified by schema, table and the complete primary key; see
+         *     `createInclusionProof` for how it is found and which version and entry are proven.
+         */
         InclusionProofRequest: {
             /** @description Schema of the ledger table. */
             schema: string;
             /** @description Ledger table. */
             table: string;
-            /** @description Primary key column values of the row, by column name. */
+            /**
+             * @description Every column of the table's primary key with the value of the row, by column name (no column
+             *     may be missing or extra; a table without a primary key cannot be addressed and answers 422
+             *     `unprocessable`). A value of a type that JSON cannot carry exactly (bigint above 2^53, numeric,
+             *     uuid, date, timestamp, bytea as `\x` hex) is given as a string and converted by PostgreSQL to the
+             *     column type. The row must exist now, unless `ledgerTxId` names a removed version.
+             */
             primaryKey: {
                 [key: string]: string | number | boolean;
             };
             /**
              * Format: int64
-             * @description For an updatable table, the specific row version to prove; null proves the current version.
+             * @description Updatable tables only. The `ledger_txid` of the history row of a **removed** version of the row,
+             *     that is the ledger transaction that removed (updated or deleted) it; several removed versions
+             *     of one primary key are told apart by it. Null selects the current version of the row. Required
+             *     when `op` is `D`. An append-only table answers 422 `unprocessable` when it is not null.
              */
             ledgerTxId?: number | null;
             /**
-             * @description Which ledger entry of the row to prove (`kingres.ledger_inclusion_proof` argument `op`). `I` proves that the version was written, `D` that it was removed (updatable tables only).
+             * @description Which ledger entry to prove (`kingres.ledger_inclusion_proof` argument `op`). `I` proves that the
+             *     version was written; `D` proves that it was removed (updatable tables only, with `ledgerTxId`).
              * @default I
              * @enum {string}
              */
             op?: "I" | "D";
         };
-        /** @description One sibling hash on a Merkle path. */
-        MerkleStep: {
-            hash: components["schemas"]["Sha256Hex"];
+        /**
+         * @description Header of a ledger block as the extension writes it into a proof (`kingres.ledger_blocks`, with the
+         *     time as `closed_at_us`). The block hash is
+         *     `SHA256(0x13 || u16 hash_version || u64 height || prev_hash || tx_merkle_root || u32 tx_count || i64 closed_at_us)`.
+         */
+        LedgerProofBlockHeader: {
             /**
-             * @description Side on which the sibling is concatenated.
-             * @enum {string}
+             * Format: int64
+             * @description Block height (0 to 9223372036854775807).
              */
-            position: "left" | "right";
-        };
-        /** @description Merkle proof that a row version is part of the ledger. */
-        InclusionProof: {
-            /** @description Schema. */
-            schema: string;
-            /** @description Table. */
-            table: string;
-            /** @description Primary key of the row. */
-            primaryKey: {
-                [key: string]: unknown;
-            };
+            height: number;
             /**
-             * @description The entry this proof is for. `I` means the row version was written in the transaction, `D` that it was removed in the transaction.
+             * @description Hash format version; must be 1.
+             * @constant
+             */
+            hash_version: 1;
+            prev_hash: components["schemas"]["Sha256Hex"];
+            tx_merkle_root: components["schemas"]["Sha256Hex"];
+            /**
+             * Format: int32
+             * @description Transactions in the block.
+             */
+            tx_count: number;
+            /**
+             * Format: int64
+             * @description Time the block was closed, in microseconds since 2000-01-01 00:00:00 UTC.
+             */
+            closed_at_us: number;
+            block_hash?: components["schemas"]["Sha256Hex"];
+        };
+        /**
+         * @description The inclusion proof of one row version, **exactly the JSON document that
+         *     `kingres.ledger_inclusion_proof` returns, plus the member `shard_group_id`**. It is the only
+         *     response of the API that keeps the snake_case member names of the extension (an exception to the
+         *     camelCase convention) so that it can be saved and handed to `kingres-verify proof --proof` and to
+         *     `kingres.ledger_verify_proof` unchanged. Key order and white space are not significant. The verifier
+         *     ignores members it does not know, which is why `shard_group_id` does not disturb it. The proof
+         *     has no left/right positions: every Merkle path is a list of sibling hashes, and the side is derived
+         *     from the index (`entry_index` in a tree of `entry_count` leaves, `tx_index` in a tree of
+         *     `block.tx_count` leaves; RFC 6962 trees and RFC 9162 audit paths).
+         *
+         *     The proof says that **an entry with this `row_hash` and `table_id` is in the ledger**; it cannot
+         *     know the row. A client that holds the row recomputes its row hash itself
+         *     (`kingres-verify row-hash`) and gives it with `--table-id` and `--row-hash`.
+         *
+         *     The leaf is `leaf_hash(0x11 || u32 seq || u32 table_id || u8 op || row_hash)` (entry leaf, `op` is
+         *     the byte of `"I"` or `"D"`). `entry_path` leads from it, at `entry_index`, to `tx_root`. The
+         *     transaction leaf is `leaf_hash(0x12 || u64 ledger_txid || u32 entry_count || tx_root || u16 n || user_name)`
+         *     and `tx_path` leads from it, at `tx_index`, to `block.tx_merkle_root`. The block hash is recomputed from
+         *     `block` and must equal the digest's `block_hash` at the digest's `height`: if `block.height` is
+         *     smaller than the digest's height, `chain` lists the headers of the blocks after `block` (up to the
+         *     latest block when the proof was made) and each must link by `prev_hash`. Headers of `chain` above the
+         *     digest's height are not used. `format` and every `hash_version` are 1. All hashes are 64 lower-case
+         *     hex characters. Integers are plain JSON integers: `table_id`, `seq`, `entry_index`, `entry_count`,
+         *     `tx_index` and `tx_count` are 0 to 2147483647 (`entry_count` at least 1, `entry_index` below
+         *     `entry_count`, `tx_index` below `block.tx_count`); `ledger_txid` and `height` are 0 to
+         *     9223372036854775807; paths have at most 64 hashes. `user_name` is at most 255 bytes of UTF-8.
+         *     The full rules are in `contrib/kingres_ledger/README.md` ("Inclusion proof") and
+         *     `kingres/verifier/README.md`.
+         */
+        InclusionProof: {
+            /**
+             * @description Proof format version; must be 1.
+             * @constant
+             */
+            format: 1;
+            /** @description Identity of the ledger chain (32 bytes, hex); a digest of another chain is not accepted. */
+            chain_id: string;
+            /** @description `schema.table` of the proof; informational and not authenticated (optional). */
+            relation?: string;
+            /**
+             * Format: int32
+             * @description The only member that is not the extension's. The shard group (chain) the proof was made on; the map group, 0, for a database that is not sharded. Use it to pick the digest in `LedgerDigest.chains[]`.
+             */
+            shard_group_id: number;
+            /**
+             * Format: int32
+             * @description Local number of the table in the ledger (`kingres.ledger_table.table_id`); part of the row encoding, so a proof does not verify for the same bytes in another table.
+             */
+            table_id: number;
+            /**
+             * Format: int64
+             * @description Ledger transaction of the entry.
+             */
+            ledger_txid: number;
+            /**
+             * Format: int32
+             * @description Sequence number of the entry within its transaction (may have gaps; the position is `entry_index`).
+             */
+            seq: number;
+            /**
+             * @description The entry this proof is for: `I` the row version was written in the transaction, `D` it was removed in the transaction.
              * @enum {string}
              */
             op: "I" | "D";
+            row_hash: components["schemas"]["Sha256Hex"];
             /**
              * Format: int32
-             * @description Chain holding the row.
+             * @description Position of the entry among the entries of its transaction, in `seq` order.
              */
-            shardGroupId: number;
+            entry_index: number;
             /**
-             * Format: int64
-             * @description Ledger transaction that wrote the row version.
+             * Format: int32
+             * @description Entries of the transaction (the size of the entry tree).
              */
-            ledgerTxId: number;
-            leafHash: components["schemas"]["Sha256Hex"];
-            /** @description Position of the leaf among the transaction's rows. */
-            leafIndex: number;
-            /** @description Path from the leaf to the transaction Merkle root, then to the block Merkle root. */
-            merklePath: components["schemas"]["MerkleStep"][];
-            transactionMerkleRoot: components["schemas"]["Sha256Hex"];
-            block: components["schemas"]["LedgerBlock"];
-            /** @description Path from this chain's head to the aggregate hash; null for a non-sharded database. */
-            shardHeadPath: components["schemas"]["MerkleStep"][] | null;
-            /** @description Aggregate hash of the digest used; null for a non-sharded database. */
-            aggregateHash: components["schemas"]["Sha256Hex"] | null;
+            entry_count: number;
+            /** @description Sibling hashes from the entry leaf to `tx_root`. */
+            entry_path: components["schemas"]["Sha256Hex"][];
+            tx_root: components["schemas"]["Sha256Hex"];
+            /** @description Role that ran the transaction (UTF-8); part of the transaction leaf. */
+            user_name: string;
             /**
-             * Format: int64
-             * @description Digest that covers the block; null if the block is newer than every digest.
+             * Format: int32
+             * @description Position of the transaction in its block.
              */
-            digestId: number | null;
-            /** @description Hash format version needed to recompute the proof. */
-            hashVersion: number;
+            tx_index: number;
+            /** @description Sibling hashes from the transaction leaf to `block.tx_merkle_root`. */
+            tx_path: components["schemas"]["Sha256Hex"][];
+            /** @description The block that holds the transaction; `block_hash` is required here. */
+            block: components["schemas"]["LedgerProofBlockHeader"] & Record<string, never>;
+            /** @description Headers of the blocks after `block`, up to the latest block when the proof was made (empty when `block` was the latest). `block_hash` is optional here; when present it is checked. */
+            chain: components["schemas"]["LedgerProofBlockHeader"][];
+        } & {
+            [key: string]: unknown;
         };
         /** @description A SQL statement to run. */
         QueryRequest: {
@@ -4057,7 +4492,7 @@ export interface components {
             rows: unknown[][];
             /** @description Rows returned in `rows`, or rows affected by a data-changing statement. */
             rowCount: number;
-            /** @description True when the result was cut at `rowLimit`. */
+            /** @description True when the result was cut at `rowLimit` or at the byte budget of the result (16 MiB). A single value larger than 1 MiB is not cut and fails the statement with 422. */
             truncated: boolean;
             /** @description PostgreSQL command tag, for example `SELECT 2` or `INSERT 0 1`. */
             commandTag: string;
@@ -4078,12 +4513,12 @@ export interface components {
          * @description Alert type.
          * @enum {string}
          */
-        AlertKind: "serverDown" | "serverSuspect" | "underReplicatedBuckets" | "unavailableBuckets" | "replicationLagHigh" | "diskSpaceLow" | "memoryPressure" | "rebalanceNeeded" | "autoFailoverTriggered" | "autoFailoverLimitReached" | "mapGroupUnavailable" | "ledgerVerificationFailed" | "taskFailed";
+        AlertKind: "serverDown" | "serverSuspect" | "underReplicatedBuckets" | "unavailableBuckets" | "replicationLagHigh" | "diskSpaceLow" | "memoryPressure" | "rebalanceNeeded" | "autoFailoverTriggered" | "autoFailoverLimitReached" | "mapGroupUnavailable" | "ledgerVerificationFailed" | "ledgerPendingTooOld" | "versionMismatch" | "certificateExpiring" | "certificateRenewalFailed" | "taskFailed";
         /** @description An alert. */
         Alert: {
             /**
              * Format: int64
-             * @description Alert identifier.
+             * @description Alert identifier. Unique in the cluster; from 0.5.0 the high bits are the number of the server that holds the alert, which is how an acknowledgement finds it.
              */
             id: number;
             kind: components["schemas"]["AlertKind"];
@@ -4120,6 +4555,10 @@ export interface components {
             /** @description Alerts, newest first. */
             items: components["schemas"]["Alert"][];
             nextCursor: components["schemas"]["NextCursor"];
+            /** @description Added in 0.5.0, optional. True when at least one other server did not answer (see `MissingServer`); the page holds what the servers that answered know. */
+            partial?: boolean;
+            /** @description Added in 0.5.0, optional. The servers that did not answer, sorted by id; absent when `partial` is false. */
+            missingServers?: components["schemas"]["MissingServer"][];
         };
         /**
          * @description Metric names. Server-scoped: cpuUsagePercent, memoryUsedBytes, diskUsedBytes, connections,
@@ -4171,10 +4610,21 @@ export interface components {
             step: number;
             /** @description The series; a single series unless `groupBy` was used. */
             series: components["schemas"]["MetricSeries"][];
+            /** @description Added in 0.5.0, optional. True when at least one other server did not answer (see `MissingServer`); the page holds what the servers that answered know. */
+            partial?: boolean;
+            /** @description Added in 0.5.0, optional. The servers that did not answer, sorted by id; absent when `partial` is false. */
+            missingServers?: components["schemas"]["MissingServer"][];
         };
     };
     responses: {
-        /** @description The request is malformed (invalid JSON, wrong type, unknown parameter) or violates a schema constraint. */
+        /**
+         * @description The request is malformed (invalid JSON, wrong type, unknown parameter) or violates a schema constraint.
+         *     `code` is `bad_request` for a body that is not valid JSON of the operation (syntax, wrong type, empty, a member
+         *     that the request does not know) and `validation_failed`, with `errors[]`, for a value that is invalid or, for
+         *     the requests the contract declares closed (`ServerUpdateRequest`, `LocalSettingsUpdate`,
+         *     `InclusionProofRequest`), for a member that is not listed (`errors[].code` `unknown_property`; 0.5.0 corrected
+         *     the server, which answered `bad_request` for the last of them).
+         */
         BadRequest: {
             headers: {
                 [name: string]: unknown;
@@ -4217,7 +4667,14 @@ export interface components {
                 "application/problem+json": components["schemas"]["Problem"];
             };
         };
-        /** @description The request conflicts with the current state (already exists, operation in progress, immutable field, optimistic lock failure). */
+        /**
+         * @description The request conflicts with the current state. `code` says which: `already_exists`,
+         *     `immutable_field`, `rebalance_in_progress`, `operation_in_progress`, `task_not_cancellable`,
+         *     `last_admin`, `role_in_use`, `optimistic_lock_failed`, `no_replica_available`,
+         *     `instance_already_running`, `instance_already_stopped`, `server_owns_buckets`,
+         *     `server_hosts_map_group`, `last_server`, `server_group_not_empty`, `ledger_entry_pending`,
+         *     `certificate_revoked` (each operation's description says which of them it can answer). Nothing was changed.
+         */
         Conflict: {
             headers: {
                 [name: string]: unknown;
@@ -4243,8 +4700,10 @@ export interface components {
         };
         /**
          * @description The server cannot serve the request now: the node is uninitialized, the map group is failing over
-         *     (DDL and topology changes are paused), the manager leader is unreachable, quorum is lost, or the
-         *     server is shutting down.
+         *     (DDL and topology changes are paused), the manager leader is unreachable, quorum is lost, the
+         *     server is shutting down, or the instance that hosts the system database was stopped with
+         *     `stopThisServerInstance` (`system_database_stopped`; every authenticated operation except
+         *     `startThisServerInstance` answers it until that instance is started again).
          */
         ServiceUnavailable: {
             headers: {
@@ -5046,6 +5505,7 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
             422: components["responses"]["UnprocessableEntity"];
             503: components["responses"]["ServiceUnavailable"];
         };
@@ -5068,6 +5528,50 @@ export interface operations {
         responses: {
             202: components["responses"]["AcceptedTask"];
             400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    renewServerCertificates: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Server identifier, an opaque string (the host of the server's instances, see `ServerId`). Percent-encode it in the path, for example an IPv6 host. */
+                serverId: components["parameters"]["ServerId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: components["responses"]["AcceptedTask"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    revokeServerCertificates: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Server identifier, an opaque string (the host of the server's instances, see `ServerId`). Percent-encode it in the path, for example an IPv6 host. */
+                serverId: components["parameters"]["ServerId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: components["responses"]["AcceptedTask"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
@@ -6667,7 +7171,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The proof. */
+            /** @description The proof (the extension's own document; see `InclusionProof`). */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -6681,6 +7185,7 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
             422: components["responses"]["UnprocessableEntity"];
             503: components["responses"]["ServiceUnavailable"];
         };

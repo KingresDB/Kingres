@@ -4,7 +4,9 @@
 // How each status in the API looks: a tone (colour), an icon glyph and a text label. Status is never
 // shown by colour alone; the badge always renders icon and label.
 import type {
+  AlertKind,
   AlertSeverity,
+  TaskKind,
   ServerStatus,
   TaskState,
   Instance,
@@ -125,3 +127,58 @@ export const REBALANCE_REASON_LABEL = {
   skewed: 'Buckets are unevenly spread',
   serverGroupChanged: 'A server group changed',
 } as const
+
+/** What each kind of alert means, in plain words. One entry per `AlertKind` of the contract. */
+export const ALERT_KIND_LABEL: Record<AlertKind, string> = {
+  serverDown: 'Server down',
+  serverSuspect: 'Server not answering',
+  underReplicatedBuckets: 'Buckets with too few copies',
+  unavailableBuckets: 'Buckets unavailable',
+  replicationLagHigh: 'Replication lag high',
+  diskSpaceLow: 'Disk space low',
+  memoryPressure: 'Memory pressure',
+  rebalanceNeeded: 'Rebalance needed',
+  autoFailoverTriggered: 'Automatic failover happened',
+  autoFailoverLimitReached: 'Automatic failover limit reached',
+  mapGroupUnavailable: 'Map group unavailable',
+  ledgerVerificationFailed: 'Ledger verification failed',
+  ledgerPendingTooOld: 'Ledger entries waiting too long for a block',
+  versionMismatch: 'Servers run different versions',
+  certificateExpiring: 'Server certificate expiring',
+  certificateRenewalFailed: 'Certificate renewal failed',
+  taskFailed: 'Task failed',
+}
+
+/** The label of an alert kind; a kind from a newer server is shown as sent (through SafeName). */
+export function alertKindLabel(kind: string): string {
+  return (ALERT_KIND_LABEL as Record<string, string>)[kind] ?? kind
+}
+
+/** What each task kind does, in plain words. One entry per `TaskKind` of the contract. */
+export const TASK_KIND_LABEL: Record<TaskKind, string> = {
+  'cluster.init': 'Create the cluster',
+  'cluster.join': 'Join a cluster',
+  'server.add': 'Add a server',
+  'server.remove': 'Remove a server',
+  'server.failover': 'Fail over a server',
+  'server.leave': 'Leave the cluster',
+  'instance.start': 'Start an instance',
+  'instance.stop': 'Stop an instance',
+  'instance.restart': 'Restart an instance',
+  'database.create': 'Create a database',
+  'database.update': 'Change a database',
+  'database.drop': 'Drop a database',
+  'table.distribute': 'Distribute a table',
+  rebalance: 'Rebalance',
+  'replication.restorePreferredPrimaries': 'Restore preferred primaries',
+  'ledger.verify': 'Verify the ledger',
+  'networkAccess.apply': 'Apply network rules',
+  'replicate.apply': 'Bring a server up to date (roles, grants)',
+  'certificate.renew': 'Renew server certificates',
+  'certificate.revoke': 'Revoke server certificates',
+}
+
+/** The label of a task kind; a kind from a newer server is shown as sent (through SafeName). */
+export function taskKindLabel(kind: string): string {
+  return (TASK_KIND_LABEL as Record<string, string>)[kind] ?? kind
+}

@@ -12,6 +12,7 @@ import GateButton from '@/components/GateButton.vue'
 import ServerActions from '@/components/ServerActions.vue'
 import ServerGroupsPanel from '@/components/ServerGroupsPanel.vue'
 import NullableValue from '@/components/NullableValue.vue'
+import CertificateExpiry from '@/components/CertificateExpiry.vue'
 import { useServers, keys } from '@/api/queries'
 import { SERVER_STATUS } from '@/lib/status'
 import { instanceLabel } from '@/lib/cluster'
@@ -62,6 +63,7 @@ const dialog = ref<{ kind: 'add' | 'restore' | 'failover' | 'remove'; server?: S
             <th scope="col" class="num">Max lag</th>
             <th scope="col">Resources</th>
             <th scope="col">Version</th>
+            <th scope="col">Certificate valid until</th>
             <th scope="col">Actions</th>
           </tr>
         </thead>
@@ -111,6 +113,11 @@ const dialog = ref<{ kind: 'add' | 'restore' | 'failover' | 'remove'; server?: S
               <div class="muted">
                 up <NullableValue :value="s.uptimeSeconds" :format="formatDuration" />
               </div>
+            </td>
+            <td>
+              <CertificateExpiry :expires-at="s.certificateExpiresAt" />
+              <div v-if="!s.seenFingerprint" class="muted">No fingerprint on record</div>
+              <div v-else-if="!s.fingerprintPinned" class="muted">Fingerprint not pinned</div>
             </td>
             <td>
               <div class="row">

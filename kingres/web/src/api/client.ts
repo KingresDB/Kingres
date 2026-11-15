@@ -7,7 +7,11 @@
 import createClient, { defaultPathSerializer, type Middleware } from 'openapi-fetch'
 import type { paths } from './schema'
 import { ApiError, isProblem, isSessionLost, networkError } from './problem'
-import { registerServerStateReset, reportSessionLost } from './server-state'
+import {
+  registerServerStateReset,
+  reportSessionLost,
+  reportSystemDatabaseStopped,
+} from './server-state'
 import { isAddressableSegment } from '@/lib/path-segment'
 
 export const API_BASE_PATH = '/api/v1'
@@ -138,5 +142,6 @@ export async function unwrap<T>(call: Promise<Result<T>>): Promise<T> {
         detail: 'The server answered with something that is not a problem document.',
       })
   if (isSessionLost(error)) reportSessionLost()
+  if (error.code === 'system_database_stopped') reportSystemDatabaseStopped()
   throw error
 }

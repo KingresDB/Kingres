@@ -170,7 +170,9 @@ describe('query workbench', () => {
     await user.clear(limit)
     await user.type(limit, '5')
     await user.click(screen.getByRole('button', { name: /^run$/i }))
-    expect(await screen.findByText(/truncated at the row limit/i)).toBeInTheDocument()
+    expect(
+      await screen.findByText(/cut at the row limit or at the 16 MiB size limit/i),
+    ).toBeInTheDocument()
   })
 })
 
@@ -233,7 +235,7 @@ describe('ledger', () => {
 
     await user.click(screen.getByRole('button', { name: /look up proof/i }))
     const proof = await screen.findByTestId('proof')
-    expect(within(proof).getByText('Leaf hash')).toBeInTheDocument()
+    expect(within(proof).getByText('Row hash')).toBeInTheDocument()
   })
 
   it('explains an unimplemented operation calmly', async () => {

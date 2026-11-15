@@ -116,10 +116,16 @@ describe('enable the ledger of a table', () => {
 
 describe('inclusion proofs have an entry type', () => {
   it('asks for a delete entry and shows which entry the proof is for', async () => {
+    // 0.4.0: a removed version is named by ledgerTxId and exists only in an updatable table.
+    const orders = getState()
+      .databases.find((d) => d.info.name === 'shop')
+      ?.tables.find((t) => t.name === 'orders')
+    if (orders) orders.ledger = { mode: 'updatable', historyTable: 'orders_history' }
     const user = userEvent.setup()
     await renderApp('/ledger')
     await screen.findByText(/status of shop/i)
     await user.selectOptions(screen.getByLabelText('Entry'), 'D')
+    await user.type(screen.getByLabelText(/transaction id of the removed version/i), '48000123')
     await user.click(screen.getByRole('button', { name: /look up proof/i }))
     const proof = await screen.findByTestId('proof')
     expect(within(proof).getByText('Delete')).toBeInTheDocument()

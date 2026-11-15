@@ -89,6 +89,7 @@ async function start(): Promise<Task> {
       steps: [{ name: 'Apply settings', state: 'done' }],
     },
     error: null,
+    detail: null,
     subject: { type: 'database', id: d.name },
     cancellable: false,
     createdAt: now,

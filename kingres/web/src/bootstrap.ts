@@ -8,7 +8,12 @@ import { VueQueryPlugin, type QueryClient } from '@tanstack/vue-query'
 import type { App } from 'vue'
 import type { Router, RouterHistory } from 'vue-router'
 import { createAppQueryClient } from './api/queries'
-import { registerServerStateReset, setSessionLostHandler } from './api/server-state'
+import {
+  registerServerStateReset,
+  setSessionLostHandler,
+  setSystemDatabaseStoppedHandler,
+} from './api/server-state'
+import { resetAvailability, setSystemDatabaseStopped } from './api/availability'
 import { createAppRouter } from './router'
 import { useSessionStore } from './stores/session'
 
@@ -38,6 +43,12 @@ export function createKingres(history?: RouterHistory): Kingres {
   const queryClient = createAppQueryClient(onSessionLost)
   const router = createAppRouter(queryClient, pinia, history)
   setSessionLostHandler(onSessionLost)
+  // 503 system_database_stopped while signed in: the shell shows the "start instance" state, the
+  // client pauses. Without a session (sign-in itself answered it) the sign-in page explains it.
+  setSystemDatabaseStoppedHandler(() => {
+    const session = useSessionStore(pinia)
+    if (session.isSignedIn && !session.probing) setSystemDatabaseStopped(true)
+  })
 
   // Everything TanStack Query holds is server data: cancel it and drop it when a session ends.
   const unregisterReset = registerServerStateReset(() => {
@@ -62,6 +73,8 @@ export function createKingres(history?: RouterHistory): Kingres {
   const dispose = (): void => {
     unregisterReset()
     setSessionLostHandler(null)
+    setSystemDatabaseStoppedHandler(null)
+    resetAvailability()
     if (typeof window !== 'undefined') {
       window.removeEventListener('focus', recheck)
       document.removeEventListener('visibilitychange', recheck)

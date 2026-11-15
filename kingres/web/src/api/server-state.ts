@@ -36,3 +36,15 @@ export function setSessionLostHandler(handler: (() => void) | null): void {
 export function reportSessionLost(): void {
   sessionLostHandler?.()
 }
+
+let systemStoppedHandler: (() => void) | null = null
+
+/** The application sets this once; it switches to the "system database is stopped" state. */
+export function setSystemDatabaseStoppedHandler(handler: (() => void) | null): void {
+  systemStoppedHandler = handler
+}
+
+/** Called by the client for any response with the code `system_database_stopped`. */
+export function reportSystemDatabaseStopped(): void {
+  systemStoppedHandler?.()
+}

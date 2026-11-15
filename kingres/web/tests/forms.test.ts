@@ -85,8 +85,11 @@ describe('this server', () => {
     let dialog = await screen.findByRole('dialog', { name: /restart instance/i })
     await user.click(within(dialog).getByRole('checkbox', { name: /force/i }))
     await user.click(within(dialog).getByRole('button', { name: /^cancel$/i }))
-    await user.click(screen.getByRole('button', { name: /leave cluster/i }))
-    dialog = await screen.findByRole('dialog', { name: /leave the cluster/i })
+    // The next dialog (a stop) starts unticked. (Leaving the cluster has no force option up front
+    // since contract 0.4.0: it is offered only for an unreachable leader, see leave-cluster.test.ts.)
+    const stops = await screen.findAllByRole('button', { name: /^stop$/i })
+    await user.click(stops[0] as HTMLElement)
+    dialog = await screen.findByRole('dialog', { name: /stop instance/i })
     expect(within(dialog).getByRole('checkbox', { name: /force/i })).not.toBeChecked()
   })
 })

@@ -60,5 +60,8 @@ export default defineConfig({
     include: ['tests/**/*.test.ts', 'src/**/*.test.ts'],
     css: false,
     testTimeout: 15000,
+    // Several tests wait for timers of the mock (task polls, 150 ms latency); with one jsdom per core on a
+    // large machine they miss their default 1 s wait now and then. Fewer workers keep them stable.
+    maxWorkers: 6,
   },
 })

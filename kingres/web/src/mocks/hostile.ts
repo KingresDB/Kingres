@@ -216,6 +216,7 @@ export function seedHostile(s: MockState): void {
         steps: [{ name: HOSTILE.markup, state: 'failed' }],
       },
       error: { code: 'x', message: HOSTILE.reversed, step: HOSTILE.breakout },
+      detail: HOSTILE.markup,
       subject: { type: 'database', id: HOSTILE.reversed },
       cancellable: false,
       createdAt: now,

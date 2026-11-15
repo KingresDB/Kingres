@@ -22,7 +22,12 @@ export function findBrowser() {
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 /** Launches a headless browser and a page that records every failed request and console error. */
-export async function openBrowser({ width = 1366, height = 820, theme = 'light' } = {}) {
+export async function openBrowser({
+  width = 1366,
+  height = 820,
+  theme = 'light',
+  downloadDir = null,
+} = {}) {
   const browser = await puppeteer.launch({
     executablePath: findBrowser(),
     headless: true,
@@ -31,7 +36,61 @@ export async function openBrowser({ width = 1366, height = 820, theme = 'light' 
   })
   const page = await browser.newPage()
   await page.emulateMediaFeatures([{ name: 'prefers-color-scheme', value: theme }])
-  const log = { responses: [], consoleErrors: [], pageErrors: [] }
+  const log = {
+    responses: [],
+    consoleErrors: [],
+    pageErrors: [],
+    /** Content-Security-Policy violations reported by the browser (securitypolicyviolation). */
+    csp: [],
+    /** One entry per distinct response the browser got: path, status, type, cache and security headers. */
+    seen: new Map(),
+    /** The exact bytes of the ledger digest and proof answers (to compare with the downloaded files). */
+    bodies: [],
+  }
+  await page.exposeFunction('__reportCsp', (message) => log.csp.push(message))
+  await page.evaluateOnNewDocument(() => {
+    document.addEventListener('securitypolicyviolation', (e) => {
+      window.__reportCsp(
+        `${e.violatedDirective} blocked ${e.blockedURI || '(inline)'} at ${e.sourceFile || location.pathname}:${e.lineNumber}`,
+      )
+    })
+  })
+  if (downloadDir) {
+    const cdp = await browser.target().createCDPSession()
+    await cdp.send('Browser.setDownloadBehavior', {
+      behavior: 'allow',
+      downloadPath: downloadDir,
+    })
+  }
+  page.on('response', async (res) => {
+    // Only what the server sent (the browser's own data: images have no headers to check).
+    if (!/^https?:/.test(res.url())) return
+    const url = new URL(res.url())
+    const req = res.request()
+    const h = res.headers()
+    const key = `${req.method()} ${url.pathname} ${res.status()}`
+    if (!log.seen.has(key)) {
+      log.seen.set(key, {
+        method: req.method(),
+        path: url.pathname,
+        status: res.status(),
+        type: req.resourceType(),
+        headers: h,
+      })
+    }
+    if (/\/(digests|inclusion-proofs|leave-cluster)(\/|$)/.test(url.pathname)) {
+      try {
+        log.bodies.push({
+          path: url.pathname.replace('/api/v1', ''),
+          method: req.method(),
+          status: res.status(),
+          buffer: await res.buffer(),
+        })
+      } catch {
+        // a body that is gone (navigation) is not needed
+      }
+    }
+  })
   page.on('response', async (res) => {
     if (res.status() >= 400 && res.url().includes('/api/v1/')) {
       const code = await res

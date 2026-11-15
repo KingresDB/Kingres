@@ -67,7 +67,7 @@ async function confirm(): Promise<void> {
     @close="emit('close')"
   >
     <template v-if="!started">
-      <slot :field-errors="fieldErrors" />
+      <slot :field-errors="fieldErrors" :error="action.error.value" />
       <TypeToConfirm v-if="typeToConfirm !== undefined" v-model="typed" :expected="typeToConfirm" />
       <ProblemNotice v-if="action.error.value" :error="action.error.value" />
     </template>
@@ -76,6 +76,7 @@ async function confirm(): Promise<void> {
       <p v-if="action.state.value === 'done'" class="tone-ok notice" role="status">
         <span aria-hidden="true">&#10003;</span> Finished.
       </p>
+      <slot v-if="action.state.value === 'done'" name="result" :task="action.task.value" />
     </template>
 
     <template #footer>

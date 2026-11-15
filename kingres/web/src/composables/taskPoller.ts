@@ -3,6 +3,7 @@
 //
 // The polling loop that follows a task through GET /tasks/{id}. It has no dependency on components
 // or stores, so that dialogs and the task notice store can both use it.
+import { isPaused } from '@/api/availability'
 import { registerServerStateReset } from '@/api/server-state'
 import type { Task } from '@/api/types'
 
@@ -52,6 +53,12 @@ export function createTaskPoller(handlers: {
       if (myGeneration !== generation) return
       // A hidden tab does not poll; it asks again as soon as the timer runs while visible.
       if (typeof document !== 'undefined' && document.hidden) {
+        schedule(id, myGeneration, failures)
+        return
+      }
+      // The server cannot answer on purpose (system database stopped, or resetting): ask nothing
+      // and count no failure; the follow resumes when it can answer again.
+      if (isPaused()) {
         schedule(id, myGeneration, failures)
         return
       }

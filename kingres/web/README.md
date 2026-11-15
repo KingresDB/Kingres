@@ -3,7 +3,7 @@
 # KingresDB web panel
 
 The management console of KingresDB: a single-page application (Vue 3, TypeScript, Vite) that is a client
-of the REST API in `kingres/api/openapi.yaml` (revision 0.3.0, 86 operations) and nothing else. The Go server (`kingresd`) will embed the
+of the REST API in `kingres/api/openapi.yaml` (revision 0.4.0, 86 operations; the working tree of the contract has since moved on to a 0.5.0 draft with two certificate operations, which the mock answers and the panel only reports, see "Known limits") and nothing else. The Go server (`kingresd`) will embed the
 production build from `dist/` and serve it on every node. The information architecture follows the
 "Management panel" chapter of `docs/architecture.md`: a first-run wizard, a **Cluster** scope and a
 **This server** scope.
@@ -67,33 +67,51 @@ string in `dist/`).
 ## End-to-end test against the real server
 
 `npm run e2e` is one command. It needs Windows with WSL2 (distribution `Ubuntu-24.04`, user `kingres`), Go, Chrome or Edge, and
-the installed KingresDB at `~/kingres-work/install` inside WSL. It:
+an installed KingresDB with the current extensions inside WSL (`~/kw-cp/install` when it has `kingres_ledger` 0.2, else
+`~/kingres-work/install`; `E2E_PG_INSTALL` names another). It:
 
-1. builds `kingresd` for Linux from `kingres/control-plane` (or uses `KINGRESD_BIN`),
+1. builds the production panel (`vite build`), then `kingresd` for Linux from `kingres/control-plane` (or uses `KINGRESD_BIN`) with
+   the panel embedded: a Go build overlay puts `dist/` in place of the placeholder in `internal/webui/dist` for this build only,
+   so nothing in the control plane is changed, and the panel the browser sees is served by the server with its own headers,
 2. copies the installation to `~/kw-web/install`, starts `kingresd` there on a fresh data directory (API port 58201,
    PostgreSQL port 58200; override with `E2E_API_PORT`, `E2E_PG_PORT`),
-3. starts the panel with the mock off (`vite --mode backend`, proxy to the backend, port 5188),
+3. also builds the standalone verifier `kingres-verify` (`kingres/verifier`) for this machine,
 4. drives a headless browser through the real flow (`scripts/e2e/flow.mjs`): wizard with the real setup token (wrong
    token and wrong data directory first), sign-in, reload, roles (duplicate, disable, a stats-only account), a sharded
    database with the ledger, tables made with psql, distribute and enable-ledger from the panel, workbench query and
-   SQL error, grant, network rule, every page, calm notices for unsupported operations, the audit log, drop database,
-   a server restart that signs everyone out, and the stats-only and read-only accounts,
+   SQL error, grant, network rule, every page, calm notices for the operations the server does not implement yet (failover,
+   rebalance), the cluster settings, the audit log, drop database, server groups (create, assign, refused delete, unassign,
+   delete), the certificate and fingerprint of a server, the add-server dialog with a fingerprint, a ledger proof (pending
+   until a digest, then shown), the proof and digest files compared byte for byte with the server's answer and accepted by
+   `kingres-verify`, a ledger verification and its record, local settings (log level, memory quota and the persistent
+   restart-required state), a restart of the instance, stopping the instance that hosts the system database (one clear state,
+   no error storm, start from the panel), the leave-cluster refusal for the only server, the audit log of these, the headers
+   (security headers, caching, cookie attributes, no Content-Security-Policy violation on any page), a server restart that
+   signs everyone out, and the stats-only and read-only accounts,
 5. prints a report (notes, per-page state, every HTTP error the browser saw) and tears everything down.
 
 The exit code is 0 only if every step passed. Screenshots are in `.e2e/shots/` (ignored by git). `E2E_KEEP_INSTALL=1`
 keeps `~/kw-web/install` for faster re-runs; `E2E_KEEP_RUNNING=1` leaves the processes running. `scripts/e2e/backend.sh` is
 the WSL side (`prepare`, `start`, `restart`, `token`, `psql`, `stop`). `puppeteer-core` is a development dependency.
 
-### Where kingresd 0.2.0-dev differs from the contract (found by the run)
+### What the run against kingresd 0.2.0-dev found (2026-11-15, contract 0.4.0)
 
-The panel copes with these; they are for the server team to fix. Only the first one needs a workaround in the panel (the
-Ledger page falls back to per-database status, see `src/api/queries.ts`).
+All 44 steps pass against the real server, with the panel served by the server itself. The mismatches of the earlier run
+(ledger status 404, grants 404, `plain` combined with `ledger`, `isManagerLeader`, the database count) are fixed in the server
+("Corrections after the panel's end-to-end run" in its README). What differs now, none of it needing a workaround in the panel:
 
-- `GET /ledger/status` answers 404 `not_found` (the contract lists 200).
-- `GET /grants` without `grantee` and `database` answers 404 (the panel always sends both).
-- A table with a ledger has `classes: [plain, ledger]`; the contract says `plain` never combines.
-- `Server.isManagerLeader` is false while `GET /this-server` says `isManagerLeader: true` and `ClusterOverview.managerLeader` is null.
-- `ClusterSummary.databaseCount` counts 3 databases where `GET /databases` lists 2.
+- The server also sends `Cross-Origin-Resource-Policy: same-origin` on every response (see "What the server must send").
+  Every other header, the caching of every class of response (index, hashed assets, other static files, the API) and the
+  attributes of the session cookie (`HttpOnly; Secure; SameSite=Strict; Path=/`, cleared on sign-out) are as listed, and the
+  browser reported no Content-Security-Policy violation on any page, dialog or download.
+- With TLS on the server sends `Strict-Transport-Security: max-age=63072000; includeSubDomains`; this README only recommended
+  `max-age=31536000`. The server's value is the stronger one.
+- During an instance restart or stop there is a moment (about a second) in which a request answers 503 `service_unavailable`
+  ("terminating connection due to administrator command") before the server answers 503 `system_database_stopped`. The panel
+  treats both calmly.
+- `kingresd` must be started with `-internal-listen` (the REST port plus one) for leave-cluster, add-server and remove-server.
+  Without it they answer 422 `unsupported_operation` ("This server cannot add or remove servers (no internal API or instance
+  management)"), which looks like "not implemented yet" in the panel. The end-to-end script passes the flag.
 
 ## What the server must send
 
@@ -125,6 +143,8 @@ Referrer-Policy: no-referrer
 Cross-Origin-Opener-Policy: same-origin
 Permissions-Policy: camera=(), microphone=(), geolocation=()
 ```
+
+kingresd also sends `Cross-Origin-Resource-Policy: same-origin` on every response (the panel does not need it; nothing else may embed the responses) and, with TLS on, `Strict-Transport-Security`.
 
 What the policy relies on, so that nobody weakens it by accident: the build has no inline script and no inline style
 element, no `eval`, no `data:` URL, no web font, no external origin and no service worker. `'unsafe-inline'` and
@@ -277,31 +297,36 @@ scripts/        gen-api.mjs
 `npm test` runs everything in about 15 seconds. The tests render the real app (router, pinia, query client)
 and talk to the mock API through MSW in Node, so the same handlers serve `npm run dev` and the tests.
 
-| File                                                      | Covers                                                                                                                                         |
-| --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `problem.test.ts`                                         | Problem to message mapping for every code, field errors, retry policy                                                                          |
-| `useTask.test.ts`                                         | Polling, progress, failure, paused, tolerance of lost polls, cleanup                                                                           |
-| `roles.test.ts`                                           | Role hierarchy from the contract, hidden navigation, disabled actions with reason, forbidden page                                              |
-| `create-database.test.ts`                                 | Four groups, immutable-field notes, validation, submit, task, list update, focus handling                                                      |
-| `setup-wizard.test.ts`                                    | Token, create, join, validation, wrong token, task, hand-off to sign-in                                                                        |
-| `servers-page.test.ts`                                    | Status badges (icon and text), instances, failover and add-server flows, unsupported and error states                                          |
-| `shards-grid.test.ts`                                     | Bucket grid for a given bucket map, filters, bucket lookup                                                                                     |
-| `pages-a11y.test.ts`                                      | Every page: renders data, logs no Vue warnings, no axe violations                                                                              |
-| `flows.test.ts`                                           | Sign-in/out, CSRF, expired session, add server then rebalance, workbench, security, ledger, settings, theme, distribute table, drop database   |
-| `tokens-contrast.test.ts`                                 | WCAG AA contrast of the token pairs in the light and dark theme                                                                                |
-| `contract.test.ts`                                        | Generated files up to date, mock covers every operation in the spec (count read from the spec), audit actions, SPDX headers                    |
-| `session-reset.test.ts`                                   | Every way a session ends clears the client (sign-out, expiry on a query, a mutation or a task poll, another user, another tab)                 |
-| `api-client.test.ts`                                      | Exact request URLs for hostile path parameters, answers that are not problem documents, unknown problem codes, the sign-in redirect allow-list |
-| `task-notices.test.ts`                                    | A hidden task is still followed and its failure reported; typed confirmations for remove server, hard failover, disable role                   |
-| `network-access.test.ts`, `network-rules.test.ts`         | Network rules: no Enter submission, confirmation with the changes, lock-out warnings, lists that round-trip                                    |
-| `grants.test.ts`, `role-dialog.test.ts`                   | A failed grant is not shown as granted, template confirmation, an unchanged role is not sent (also under another time zone)                    |
-| `workbench.test.ts`                                       | NULL, the text NULL and the empty string, stale results, timeout, stop waiting, large results, duplicate columns                               |
-| `plumbing.test.ts`                                        | Unreadable ledger status shown, cursor paging with a bound and a "more results" notice                                                         |
-| `hostile.test.ts`                                         | Every list and detail page and dialog with hostile names and messages                                                                          |
-| `forms.test.ts`, `dialogs.test.ts`, `task-poller.test.ts` | Enter in forms, what is sent on save, inert page behind a dialog, live regions, no polling in a hidden tab                                     |
-| `dependencies.test.ts`                                    | `DEPENDENCIES.md` names every package of the production tree and every exceptional development package                                         |
-| `server-headers.test.ts`                                  | The values in "What the server must send" are the ones the browser test uses                                                                   |
-| `contract-0-2.test.ts`                                    | Contract 0.2.0: stats-only landing page, n/a for null, create options, distribution columns, server groups, report detail, audit filter        |
+| File                                                                                                                           | Covers                                                                                                                                         |
+| ------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `problem.test.ts`                                                                                                              | Problem to message mapping for every code, field errors, retry policy                                                                          |
+| `useTask.test.ts`                                                                                                              | Polling, progress, failure, paused, tolerance of lost polls, cleanup                                                                           |
+| `roles.test.ts`                                                                                                                | Role hierarchy from the contract, hidden navigation, disabled actions with reason, forbidden page                                              |
+| `create-database.test.ts`                                                                                                      | Four groups, immutable-field notes, validation, submit, task, list update, focus handling                                                      |
+| `setup-wizard.test.ts`                                                                                                         | Token, create, join, validation, wrong token, task, hand-off to sign-in                                                                        |
+| `servers-page.test.ts`                                                                                                         | Status badges (icon and text), instances, failover and add-server flows, unsupported and error states                                          |
+| `shards-grid.test.ts`                                                                                                          | Bucket grid for a given bucket map, filters, bucket lookup                                                                                     |
+| `pages-a11y.test.ts`                                                                                                           | Every page: renders data, logs no Vue warnings, no axe violations                                                                              |
+| `flows.test.ts`                                                                                                                | Sign-in/out, CSRF, expired session, add server then rebalance, workbench, security, ledger, settings, theme, distribute table, drop database   |
+| `tokens-contrast.test.ts`                                                                                                      | WCAG AA contrast of the token pairs in the light and dark theme                                                                                |
+| `contract.test.ts`                                                                                                             | Generated files up to date, mock covers every operation in the spec (count read from the spec), audit actions, SPDX headers                    |
+| `session-reset.test.ts`                                                                                                        | Every way a session ends clears the client (sign-out, expiry on a query, a mutation or a task poll, another user, another tab)                 |
+| `api-client.test.ts`                                                                                                           | Exact request URLs for hostile path parameters, answers that are not problem documents, unknown problem codes, the sign-in redirect allow-list |
+| `task-notices.test.ts`                                                                                                         | A hidden task is still followed and its failure reported; typed confirmations for remove server, hard failover, disable role                   |
+| `network-access.test.ts`, `network-rules.test.ts`                                                                              | Network rules: no Enter submission, confirmation with the changes, lock-out warnings, lists that round-trip                                    |
+| `grants.test.ts`, `role-dialog.test.ts`                                                                                        | A failed grant is not shown as granted, template confirmation, an unchanged role is not sent (also under another time zone)                    |
+| `workbench.test.ts`                                                                                                            | NULL, the text NULL and the empty string, stale results, timeout, stop waiting, large results, duplicate columns                               |
+| `plumbing.test.ts`                                                                                                             | Unreadable ledger status shown, cursor paging with a bound and a "more results" notice                                                         |
+| `hostile.test.ts`                                                                                                              | Every list and detail page and dialog with hostile names and messages                                                                          |
+| `forms.test.ts`, `dialogs.test.ts`, `task-poller.test.ts`                                                                      | Enter in forms, what is sent on save, inert page behind a dialog, live regions, no polling in a hidden tab                                     |
+| `dependencies.test.ts`                                                                                                         | `DEPENDENCIES.md` names every package of the production tree and every exceptional development package                                         |
+| `server-headers.test.ts`                                                                                                       | The values in "What the server must send" are the ones the browser test uses                                                                   |
+| `contract-0-2.test.ts`                                                                                                         | Contract 0.2.0: stats-only landing page, n/a for null, create options, distribution columns, server groups, report detail, audit filter        |
+| `contract-0-4.test.ts`                                                                                                         | Contract 0.4.0: every problem code has words and a mock status, new required properties of Task and Server                                     |
+| `servers-0-4.test.ts`                                                                                                          | Certificate and fingerprint display, expected fingerprint (add, join), server groups (create, assign, refused delete), remove server           |
+| `ledger-0-4.test.ts`, `raw-json.test.ts`                                                                                       | Proof and digest files byte for byte, pending proofs, refusals, verification list and detail                                                   |
+| `this-server-instances.test.ts`, `system-database-stopped.test.ts`, `local-settings.test.ts`, `leave-cluster.test.ts`          | Instance start, stop and restart with their refusals, the stopped-system-database state, local settings, leave cluster                         |
+| `task-detail.test.ts`, `kind-labels.test.ts`, `role-guards.test.ts`, `unsupported-operations.test.ts`, `workbench-0-4.test.ts` | Task detail text, kind labels, log access needs `kingres_ops`, unsupported operations stay calm and start working when supported               |
 
 jsdom has no layout engine, so axe cannot compute colour contrast there; that is why contrast is tested from the
 tokens instead.
@@ -311,7 +336,7 @@ tokens instead.
 The SQL editor is a plain textarea, the replication page is a table rather than a graph, and the charts are simple
 SVG lines without zoom or tooltips.
 
-What the contract (revision 0.3.0) does not let the panel do, and what the panel does instead:
+What the contract (revision 0.4.0) does not let the panel do, and what the panel does instead:
 
 - **Cancel a workbench statement.** There is no way to cancel it on the server. "Stop waiting" aborts the request in the
   browser and says that the statement may still run until it finishes or reaches its timeout (the person chooses the
@@ -330,3 +355,12 @@ What the contract (revision 0.3.0) does not let the panel do, and what the panel
 - **Paging.** The contract does not paginate `GET /databases`, `/servers`, `/server-groups` and
   `/this-server/instances` ("Not paginated"); the panel shows what they return and cannot tell if a very large cluster
   makes them long. Every list that has cursors is followed up to a bound and says when more exists.
+
+- **The 0.5.0 draft of the contract** (in the working tree since this adaptation began) adds `renewServerCertificates` and
+  `revokeServerCertificates`, the problem codes `certificate_revoked` and `certificate_authority_unavailable`, the task kinds
+  `certificate.renew` and `certificate.revoke`, `Server.certificateRevokedAt` and an alert kind. The panel compiles and tests
+  against it (words for the codes and kinds, the revoked state on the server page, mock handlers) but has no buttons for the two
+  operations yet.
+- **A server's own fingerprint.** No operation returns the fingerprint of the server being added or joined, so the panel tells
+  the administrator where to read it (the log line "bootstrap certificate of the internal API", or the SHA-256 of the
+  certificate file in the data directory). A field in `GET /this-server` would let the panel show it.

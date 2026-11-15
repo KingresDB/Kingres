@@ -7,6 +7,8 @@ import { computed, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useQueryClient } from '@tanstack/vue-query'
 import FormField from '@/components/FormField.vue'
+import FingerprintHelp from '@/components/FingerprintHelp.vue'
+import { fingerprintError } from '@/lib/fingerprint'
 import BrandLogo from '@/components/BrandLogo.vue'
 import ProblemNotice from '@/components/ProblemNotice.vue'
 import TaskProgress from '@/components/TaskProgress.vue'
@@ -61,6 +63,7 @@ const join = reactive({
   dataDirectory: '/var/lib/kingres',
   memoryMb: 4096,
   serverGroup: '',
+  expectedFingerprint: '',
 })
 
 /** Last task seen by the wizard; shown if a poll briefly reports no setup task. */
@@ -78,6 +81,7 @@ function taskFromSummary(summary: SetupTaskSummary): Task {
       steps: summary.steps.map((s) => ({ name: s.name, state: s.state })),
     },
     error: summary.error,
+    detail: null,
     subject: { type: 'cluster', id: 'cluster' },
     cancellable: false,
     createdAt: summary.createdAt,
@@ -133,6 +137,9 @@ const joinAction = useTaskAction(
         dataPaths: { dataDirectory: join.dataDirectory },
         memoryQuota: { totalMegabytes: join.memoryMb },
         serverGroup: join.serverGroup || null,
+        ...(join.expectedFingerprint.trim()
+          ? { expectedFingerprint: join.expectedFingerprint.trim() }
+          : {}),
       }),
     ),
   { fetchTask: readSetupTask },
@@ -167,6 +174,7 @@ const joinErrors = computed(() =>
     'admin.username': firstError(join.adminUser, required('The user name')),
     'admin.password': firstError(join.adminPassword, required('The password')),
     'dataPaths.dataDirectory': firstError(join.dataDirectory, absolutePath('The data directory')),
+    expectedFingerprint: fingerprintError(join.expectedFingerprint),
   }),
 )
 
@@ -467,6 +475,21 @@ async function finish(): Promise<void> {
           </FormField>
           <FormField
             v-slot="slot"
+            label="Expected fingerprint (recommended)"
+            hint="SHA-256 of that server's internal certificate, 64 hex digits; colons are allowed."
+            :error="errors.expectedFingerprint"
+          >
+            <input
+              v-bind="slot"
+              v-model="join.expectedFingerprint"
+              class="input mono"
+              autocomplete="off"
+              spellcheck="false"
+            />
+          </FormField>
+          <FingerprintHelp purpose="join" />
+          <FormField
+            v-slot="slot"
             label="Administrator user name"
             :error="errors['admin.username']"
             required
@@ -536,6 +559,13 @@ async function finish(): Promise<void> {
           <p class="notice tone-ok" role="status">
             <span aria-hidden="true">&#10003;</span>
             This server is ready. Sign in with the administrator account.
+          </p>
+          <p v-if="mode === 'join'" class="muted" data-testid="join-fingerprint-note">
+            {{
+              join.expectedFingerprint.trim()
+                ? 'The certificate of the existing server matched the fingerprint you gave.'
+                : 'No fingerprint was given, so the certificate of the existing server was trusted on first contact. After you sign in, the fingerprint it presented is in the detail of the setup task (Tasks page), if the server reports it; compare it with the log of the existing server.'
+            }}
           </p>
           <div>
             <button type="button" class="btn btn-primary" @click="finish">

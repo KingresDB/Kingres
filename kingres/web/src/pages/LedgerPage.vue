@@ -19,11 +19,15 @@ import TaskProgress from '@/components/TaskProgress.vue'
 import SafeName from '@/components/SafeName.vue'
 import { describeProblem } from '@/api/problem'
 import { endpoints } from '@/api/endpoints'
-import { every, keys, useLedgerStatusList, usePagedQuery } from '@/api/queries'
+import { keys, useLedgerStatusList, usePagedQuery } from '@/api/queries'
 import { useTaskAction } from '@/composables/useTask'
 import { LEDGER_MODE_LABEL, LEDGER_STATE } from '@/lib/status'
 import { formatAgo, formatDateTime, formatNumber, shortHash } from '@/lib/format'
-import type { InclusionProof } from '@/api/types'
+import ProofResult from '@/components/ledger/ProofResult.vue'
+import VerificationDialog from '@/components/ledger/VerificationDialog.vue'
+import { saveTextFile } from '@/lib/download'
+import type { RawProof } from '@/lib/ledger-proof'
+import { ApiError } from '@/api/problem'
 
 const route = useRoute()
 const router = useRouter()
@@ -76,15 +80,13 @@ const digests = useQuery({
   },
   enabled: computed(() => !!dbName.value),
 })
-const verifications = useQuery({
-  queryKey: computed(() => [...keys.ledger(dbName.value), 'verifications']),
-  queryFn: async () => {
-    const page = await endpoints.listLedgerVerifications(dbName.value, { limit: 10 })
-    return { items: page.items, moreNotShown: !!page.nextCursor }
-  },
-  enabled: computed(() => !!dbName.value),
-  refetchInterval: every(5000),
-})
+const verifications = usePagedQuery(
+  () => [...keys.ledger(dbName.value), 'verifications'],
+  (cursor) => endpoints.listLedgerVerifications(dbName.value, { cursor, limit: 10 }),
+  5000,
+  () => !!dbName.value,
+)
+const openVerification = ref<number | null>(null)
 
 const generate = useMutation({
   mutationFn: () => endpoints.generateLedgerDigest(dbName.value),
@@ -104,6 +106,7 @@ const proofForm = ref({
   table: 'orders',
   key: '{"id": 9000000001}',
   op: 'I' as 'I' | 'D',
+  ledgerTxId: '',
 })
 /** True when the text holds a number that a 64-bit float cannot represent exactly. */
 function unsafeNumber(text: string): boolean {
@@ -120,7 +123,7 @@ function unsafeNumber(text: string): boolean {
     return false
   }
 }
-const proof = ref<InclusionProof | null>(null)
+const proof = ref<RawProof | null>(null)
 const keyError = ref('')
 const proofMutation = useMutation({
   mutationFn: () => {
@@ -143,18 +146,51 @@ const proofMutation = useMutation({
       return Promise.reject(new Error(keyError.value))
     }
     keyError.value = ''
+    let ledgerTxId: number | undefined
+    if (proofForm.value.op === 'D') {
+      ledgerTxId = Number(proofForm.value.ledgerTxId)
+      if (!Number.isSafeInteger(ledgerTxId) || ledgerTxId < 0) {
+        keyError.value = 'A removed version is named by its transaction id: enter a whole number.'
+        return Promise.reject(new Error(keyError.value))
+      }
+    }
     return endpoints.createInclusionProof(dbName.value, {
       schema: proofForm.value.schema,
       table: proofForm.value.table,
       primaryKey,
       op: proofForm.value.op,
+      ...(ledgerTxId === undefined ? {} : { ledgerTxId }),
     })
   },
   onSuccess: (p) => {
     proof.value = p
   },
+  onError: () => {
+    proof.value = null
+  },
 })
 const proofApiError = computed(() => (keyError.value ? null : proofMutation.error.value))
+const proofPending = computed(
+  () =>
+    proofApiError.value instanceof ApiError && proofApiError.value.code === 'ledger_entry_pending',
+)
+const proofHint = computed(() => {
+  const e = proofApiError.value
+  if (!(e instanceof ApiError)) return ''
+  if (e.code === 'not_found')
+    return 'No row with this primary key was found in this table, or a row-level policy hides it from your database role.'
+  if (e.code === 'forbidden')
+    return 'Your database role has no privilege on this table. The removed versions of a row can be read by the owner of the table only.'
+  return ''
+})
+/** The row is not in a block yet: close the block with a digest, then ask again. */
+async function generateAndAskAgain(): Promise<void> {
+  await generate.mutateAsync()
+  proofMutation.mutate()
+}
+function downloadDigest(id: number, group: number, text: string): void {
+  saveTextFile(`digest-${id}-group-${group}.json`, text)
+}
 </script>
 
 <template>
@@ -287,15 +323,13 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
           <ProblemNotice v-if="verify.error.value" :error="verify.error.value" />
           <TaskProgress :task="verify.task.value" :poll-error="verify.pollError.value" />
           <QueryBoundary
-            :loading="verifications.isPending.value"
-            :error="verifications.error.value"
-            :empty="verifications.data.value?.items.length === 0"
+            :loading="verifications.query.isPending.value"
+            :error="verifications.query.error.value"
+            :empty="verifications.items.value.length === 0"
             empty-title="No verifications yet"
+            empty-hint="Start a verification to record the first one."
+            @retry="verifications.query.refetch()"
           >
-            <p v-if="verifications.data.value?.moreNotShown" class="notice tone-warn" role="status">
-              <span aria-hidden="true">&#9650;</span>
-              <span>More verifications exist than are shown here; only the latest are listed.</span>
-            </p>
             <TableWrap>
               <table class="table">
                 <caption class="sr-only">
@@ -309,11 +343,13 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
                     <th scope="col">Started</th>
                     <th scope="col" class="num">Blocks</th>
                     <th scope="col" class="num">Rows</th>
-                    <th scope="col">Inconsistencies</th>
+                    <th scope="col">Findings</th>
+                    <th scope="col">Task</th>
+                    <th scope="col"><span class="sr-only">Actions</span></th>
                   </tr>
                 </thead>
                 <tbody>
-                  <tr v-for="v in verifications.data.value?.items" :key="v.id">
+                  <tr v-for="v in verifications.items.value" :key="v.id">
                     <th scope="row">{{ v.id }}</th>
                     <td><StatusBadge :meta="LEDGER_STATE[v.state]" /></td>
                     <td>{{ v.scope === 'full' ? 'Full' : 'Since last verified' }}</td>
@@ -328,19 +364,49 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
                       <NullableValue :value="v.rowsChecked" :format="formatNumber" />
                     </td>
                     <td>
-                      <ul v-if="v.inconsistencies.length" style="margin: 0; padding-left: 1.1em">
-                        <li v-for="(i, n) in v.inconsistencies" :key="n">
-                          {{ i.kind }} in group {{ i.shardGroupId }}:
-                          <SafeName :value="i.detail" kind="text" :max="300" />
-                        </li>
-                      </ul>
+                      <template v-if="v.inconsistencies.length">{{
+                        v.inconsistencies.length
+                      }}</template>
                       <span v-else class="muted">None</span>
+                    </td>
+                    <td>
+                      <RouterLink
+                        v-if="v.taskId !== null"
+                        :to="{ name: 'tasks', query: { task: String(v.taskId) } }"
+                        >Task {{ v.taskId }}</RouterLink
+                      >
+                      <span v-else class="muted">None</span>
+                    </td>
+                    <td>
+                      <button
+                        type="button"
+                        class="btn btn-small"
+                        :aria-label="'Details of verification ' + v.id"
+                        @click="openVerification = v.id"
+                      >
+                        Details
+                      </button>
                     </td>
                   </tr>
                 </tbody>
               </table>
             </TableWrap>
+            <button
+              v-if="verifications.query.hasNextPage.value"
+              type="button"
+              class="btn"
+              :disabled="verifications.query.isFetchingNextPage.value"
+              @click="verifications.query.fetchNextPage()"
+            >
+              Load more verifications
+            </button>
           </QueryBoundary>
+          <VerificationDialog
+            v-if="openVerification !== null"
+            :database-name="dbName"
+            :verification-id="openVerification"
+            @close="openVerification = null"
+          />
         </section>
 
         <section class="card stack" aria-labelledby="digests-h">
@@ -353,6 +419,11 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
               >Generate digest</GateButton
             >
           </div>
+          <p class="muted">
+            A digest is the head of each chain. Save its documents
+            <strong>outside the database</strong>: the verifier needs one that an attacker with
+            database access could not have changed.
+          </p>
           <ProblemNotice v-if="generate.error.value" :error="generate.error.value" />
           <QueryBoundary
             :loading="digests.isPending.value"
@@ -386,7 +457,21 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
                       <NullableValue :value="d.generatedBy" safe />
                     </td>
                     <td>
-                      {{ d.chains.map((c) => `g${c.shardGroupId}@${c.blockHeight}`).join(', ') }}
+                      <ul class="chain-heads">
+                        <li v-for="c in d.chains" :key="c.shardGroupId">
+                          g{{ c.shardGroupId }}@{{ c.blockHeight }}
+                          <button
+                            type="button"
+                            class="btn btn-small"
+                            :aria-label="
+                              'Download document of chain ' + c.shardGroupId + ' of digest ' + d.id
+                            "
+                            @click="downloadDigest(d.id, c.shardGroupId, c.rawDocument)"
+                          >
+                            Download document
+                          </button>
+                        </li>
+                      </ul>
                     </td>
                     <td class="mono" :title="d.aggregateHash ?? undefined">
                       {{ shortHash(d.aggregateHash) }}
@@ -464,8 +549,9 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
         <section class="card stack" aria-labelledby="proof-h">
           <h2 id="proof-h">Row inclusion proof</h2>
           <p class="muted">
-            Shows that a row is part of a block, with the Merkle path to the block and to the
-            digest.
+            Shows that a ledger entry for a row is part of a block, and gives you the proof as a
+            file for the verifier <code>kingres-verify</code>. Name the row by its whole primary
+            key; the server reads the row with your own database role.
           </p>
           <form
             class="row"
@@ -497,6 +583,19 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
                 <option value="D">Delete (the row was removed or replaced)</option>
               </select>
             </div>
+            <div v-if="proofForm.op === 'D'" class="field">
+              <label for="p-txid">Transaction id of the removed version</label>
+              <input
+                id="p-txid"
+                v-model="proofForm.ledgerTxId"
+                class="input mono"
+                inputmode="numeric"
+              />
+              <span class="hint"
+                >The ledger transaction that removed it; only the owner of the table can read
+                it.</span
+              >
+            </div>
             <GateButton
               op="createInclusionProof"
               type="submit"
@@ -505,31 +604,21 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
               >Look up proof</GateButton
             >
           </form>
-          <ProblemNotice v-if="proofApiError" :error="proofApiError" />
-          <div v-if="proof" class="stack" data-testid="proof">
-            <dl class="kv">
-              <dt>Entry</dt>
-              <dd>{{ proof.op === 'I' ? 'Insert' : 'Delete' }}</dd>
-              <dt>Leaf hash</dt>
-              <dd class="mono">{{ proof.leafHash }}</dd>
-              <dt>Transaction</dt>
-              <dd>{{ proof.ledgerTxId }} (leaf {{ proof.leafIndex }})</dd>
-              <dt>Block</dt>
-              <dd>
-                group {{ proof.block.shardGroupId }}, height {{ formatNumber(proof.block.height) }},
-                <span class="mono">{{ shortHash(proof.block.blockHash) }}</span>
-              </dd>
-              <dt>Merkle root</dt>
-              <dd class="mono">{{ proof.transactionMerkleRoot }}</dd>
-              <dt>Digest</dt>
-              <dd>{{ proof.digestId ?? 'not covered by a digest yet' }}</dd>
-            </dl>
-            <ol class="mono path">
-              <li v-for="(s, i) in proof.merklePath" :key="i">
-                {{ s.position }}: {{ shortHash(s.hash) }}
-              </li>
-            </ol>
+          <ProblemNotice
+            v-if="proofApiError"
+            :error="proofApiError"
+            @retry="proofMutation.mutate()"
+          />
+          <p v-if="proofHint" class="muted" data-testid="proof-hint">{{ proofHint }}</p>
+          <div v-if="proofPending">
+            <GateButton
+              op="generateLedgerDigest"
+              :disabled="generate.isPending.value || proofMutation.isPending.value"
+              @click="generateAndAskAgain()"
+              >Generate digest and ask again</GateButton
+            >
           </div>
+          <ProofResult v-if="proof && !proofApiError" :proof="proof" />
         </section>
       </template>
     </div>
@@ -537,17 +626,9 @@ const proofApiError = computed(() => (keyError.value ? null : proofMutation.erro
 </template>
 
 <style scoped>
-.kv {
-  display: grid;
-  grid-template-columns: fit-content(45%) minmax(0, 1fr);
-  gap: var(--s-1) var(--s-4);
+.chain-heads {
   margin: 0;
-}
-.kv dd {
-  margin: 0;
-  overflow-wrap: anywhere;
-}
-.path {
-  margin: 0;
+  padding: 0;
+  list-style: none;
 }
 </style>

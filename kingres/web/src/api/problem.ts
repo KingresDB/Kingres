@@ -190,6 +190,71 @@ const entries: Record<ProblemCode, Entry> = {
     message:
       'A graceful operation needs a healthy replica and none is available. Use a hard failover only if you accept the risk.',
   },
+  instance_already_running: {
+    tone: 'info',
+    heading: 'Instance already running',
+    message: 'The instance is already running or starting, so there is nothing to start.',
+  },
+  instance_already_stopped: {
+    tone: 'info',
+    heading: 'Instance already stopped',
+    message: 'The instance is already stopped or stopping, so there is nothing to stop or restart.',
+  },
+  server_owns_buckets: {
+    tone: 'warning',
+    heading: 'Server still holds data',
+    message:
+      'The server still holds a copy of at least one bucket. Move the data away first: turn off "should hold buckets" for it, run a rebalance, then try again.',
+    withDetail: true,
+  },
+  server_hosts_map_group: {
+    tone: 'warning',
+    heading: 'Server hosts the cluster metadata',
+    message:
+      'The server runs an instance of the map group (shard group 0), which holds the cluster metadata, or it is the manager leader. It cannot leave or be removed while it does.',
+    withDetail: true,
+  },
+  last_server: {
+    tone: 'warning',
+    heading: 'Last server of the cluster',
+    message:
+      'This is the only server of the cluster. A cluster cannot be left or emptied this way; keep the server or reset it by hand.',
+  },
+  server_group_not_empty: {
+    tone: 'warning',
+    heading: 'Server group still has servers',
+    message:
+      'Servers are still assigned to this group. Move each of them to another group (or to no group) first, then delete the group.',
+    withDetail: true,
+  },
+  ledger_entry_pending: {
+    tone: 'info',
+    heading: 'Row not in a block yet',
+    message:
+      'The ledger has not put this row into a block yet, so it cannot be proven yet. Generate a digest (or wait for the next block) and ask again.',
+    retryable: true,
+  },
+  system_database_stopped: {
+    tone: 'warning',
+    heading: 'The system database is stopped',
+    message:
+      'The instance that hosts the cluster system database was stopped on purpose. Every operation except starting the instance is paused until it runs again.',
+    retryable: true,
+  },
+  certificate_revoked: {
+    tone: 'warning',
+    heading: 'Certificates revoked',
+    message:
+      'The certificates of this server were revoked, so it gets no new certificate. Remove the server (or let it leave) and join it again with a new setup token.',
+    withDetail: true,
+  },
+  certificate_authority_unavailable: {
+    tone: 'danger',
+    heading: 'Certificate authority not available',
+    message:
+      'The manager leader does not hold the certificate authority key, so certificates cannot be issued or revoked right now. Try again when the leader that holds the key is reachable.',
+    retryable: true,
+  },
   quorum_unavailable: {
     tone: 'danger',
     heading: 'No quorum',
@@ -316,6 +381,8 @@ export function shouldRetry(failureCount: number, error: unknown): boolean {
   return (
     error.status >= 500 &&
     error.code !== 'node_uninitialized' &&
+    // The server says it is stopped on purpose: asking again changes nothing until it is started.
+    error.code !== 'system_database_stopped' &&
     error.code !== 'unsupported_operation'
   )
 }

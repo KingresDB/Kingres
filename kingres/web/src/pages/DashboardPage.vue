@@ -209,7 +209,7 @@ const metricsUnsupported = computed(() =>
           <ul class="plain-list">
             <li v-for="t in tasks.data.value?.items" :key="t.id" class="row">
               <StatusBadge :meta="TASK_STATE[t.state]" />
-              <span class="mono">{{ t.kind }}</span>
+              <span class="mono"><SafeName :value="t.kind" kind="text" :max="40" /></span>
               <span v-if="t.subject" class="muted"
                 ><SafeName :value="t.subject.id" kind="text" :max="60"
               /></span>

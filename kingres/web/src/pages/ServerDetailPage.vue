@@ -13,6 +13,8 @@ import StatusBadge from '@/components/StatusBadge.vue'
 import GateButton from '@/components/GateButton.vue'
 import ServerActions from '@/components/ServerActions.vue'
 import NullableValue from '@/components/NullableValue.vue'
+import CertificateExpiry from '@/components/CertificateExpiry.vue'
+import FingerprintValue from '@/components/FingerprintValue.vue'
 import ProblemNotice from '@/components/ProblemNotice.vue'
 import { endpoints } from '@/api/endpoints'
 import { keys, useServer, useServerGroups } from '@/api/queries'
@@ -53,6 +55,35 @@ const assign = useMutation({
       client.invalidateQueries({ queryKey: keys.cluster }),
     ]),
 })
+// Placement: whether the server should hold buckets (PATCH shouldHaveShards).
+const shouldHold = ref(true)
+const holdTouched = ref(false)
+const holdSaved = ref(false)
+watch(
+  () => s.value?.shouldHaveShards,
+  (v) => {
+    if (!holdTouched.value && v !== undefined) shouldHold.value = v
+  },
+  { immediate: true },
+)
+const placement = useMutation({
+  mutationFn: () => endpoints.updateServer(props.id, { shouldHaveShards: shouldHold.value }),
+  onSuccess: () => {
+    holdSaved.value = true
+    holdTouched.value = false
+  },
+  onSettled: () =>
+    Promise.all([
+      client.invalidateQueries({ queryKey: keys.server(props.id) }),
+      client.invalidateQueries({ queryKey: keys.servers }),
+      client.invalidateQueries({ queryKey: keys.cluster }),
+    ]),
+})
+function savePlacement(): void {
+  holdSaved.value = false
+  placement.mutate()
+}
+
 function saveGroup(): void {
   groupSaved.value = false
   assign.mutate()
@@ -137,6 +168,57 @@ function saveGroup(): void {
         <ProblemNotice v-if="assign.error.value" :error="assign.error.value" />
         <p v-if="groupSaved" class="notice tone-ok" role="status">
           <span aria-hidden="true">&#10003;</span> Server group saved.
+        </p>
+      </section>
+
+      <section class="card stack" aria-labelledby="plc-h">
+        <h2 id="plc-h">Placement</h2>
+        <form class="stack" @submit.prevent="savePlacement">
+          <label class="check"
+            ><input v-model="shouldHold" type="checkbox" @change="holdTouched = true" /> Should hold
+            buckets</label
+          >
+          <p class="hint muted">
+            Turning this off does not move data by itself. To empty the server, save this, then
+            start a <RouterLink :to="{ name: 'rebalance' }">rebalance</RouterLink>; a server that
+            holds no bucket copy can then be removed.
+          </p>
+          <div>
+            <GateButton op="updateServer" type="submit" :disabled="placement.isPending.value">
+              Save placement
+            </GateButton>
+          </div>
+        </form>
+        <ProblemNotice v-if="placement.error.value" :error="placement.error.value" />
+        <p v-if="holdSaved" class="notice tone-ok" role="status">
+          <span aria-hidden="true">&#10003;</span> Placement saved.
+        </p>
+      </section>
+
+      <section class="card stack" aria-labelledby="cert-h">
+        <h2 id="cert-h">Certificate and first contact</h2>
+        <dl class="kv">
+          <dt>Certificate valid until</dt>
+          <dd><CertificateExpiry :expires-at="s.certificateExpiresAt" /></dd>
+          <template v-if="s.certificateRevokedAt">
+            <dt>Certificates revoked</dt>
+            <dd>
+              <span class="badge tone-danger">Revoked</span>
+              <time :datetime="s.certificateRevokedAt">{{
+                formatDateTime(s.certificateRevokedAt)
+              }}</time>
+              (this server cannot take part in the cluster until it is removed and joined again)
+            </dd>
+          </template>
+          <dt>Fingerprint at first contact</dt>
+          <dd>
+            <FingerprintValue :fingerprint="s.seenFingerprint" :pinned="s.fingerprintPinned" />
+          </dd>
+        </dl>
+        <p class="hint muted">
+          The fingerprint is the SHA-256 of the certificate this server presented when it was added.
+          Compare it with the log of that server. A server renews its own certificate before it
+          expires; a certificate that is about to expire is flagged here and raised as an alert.
         </p>
       </section>
 

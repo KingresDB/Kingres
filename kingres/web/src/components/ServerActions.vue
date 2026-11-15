@@ -9,7 +9,11 @@ import type { QueryKey } from '@tanstack/vue-query'
 import TaskActionDialog from './TaskActionDialog.vue'
 import FormField from './FormField.vue'
 import { endpoints } from '@/api/endpoints'
-import { useServerGroups } from '@/api/queries'
+import { useServerGroups, useServers } from '@/api/queries'
+import { RouterLink } from 'vue-router'
+import FingerprintHelp from './FingerprintHelp.vue'
+import FingerprintValue from './FingerprintValue.vue'
+import { fingerprintError } from '@/lib/fingerprint'
 import { firstError, nodeAddress, required, compact } from '@/lib/validators'
 import type { Server } from '@/api/types'
 
@@ -20,15 +24,21 @@ const props = defineProps<{
 }>()
 const emit = defineEmits<{ close: [] }>()
 
-const form = reactive({ address: '', setupToken: '', serverGroup: '' })
+const form = reactive({ address: '', setupToken: '', serverGroup: '', expectedFingerprint: '' })
 const mode = ref<'hard' | 'graceful'>('graceful')
 const submitted = ref(false)
 const groups = useServerGroups()
+const servers = useServers()
+/** The server a finished add task registered, with what the cluster recorded at first contact. */
+function addedServer(task: { subject: { id: string } | null } | null) {
+  return servers.data.value?.items.find((s) => s.id === task?.subject?.id) ?? null
+}
 
 const errors = computed(() =>
   compact({
     address: firstError(form.address, nodeAddress()),
     setupToken: firstError(form.setupToken, required('The setup token')),
+    expectedFingerprint: fingerprintError(form.expectedFingerprint),
   }),
 )
 
@@ -53,6 +63,9 @@ const config = computed(() => {
             address: form.address,
             setupToken: form.setupToken,
             serverGroup: form.serverGroup || null,
+            ...(form.expectedFingerprint.trim()
+              ? { expectedFingerprint: form.expectedFingerprint.trim() }
+              : {}),
           }),
       }
     case 'remove':
@@ -95,6 +108,17 @@ const config = computed(() => {
     :invalidate="invalidate"
     @close="emit('close')"
   >
+    <template v-if="kind === 'add'" #result="{ task }">
+      <div class="stack" data-testid="add-result">
+        <template v-if="addedServer(task)">
+          <strong>Fingerprint recorded for this server</strong>
+          <FingerprintValue
+            :fingerprint="addedServer(task)?.seenFingerprint ?? null"
+            :pinned="addedServer(task)?.fingerprintPinned ?? false"
+          />
+        </template>
+      </div>
+    </template>
     <template #default="{ fieldErrors }">
       <template v-if="kind === 'add'">
         <p>
@@ -118,6 +142,23 @@ const config = computed(() => {
         >
           <input v-bind="slot" v-model="form.setupToken" class="input mono" autocomplete="off" />
         </FormField>
+        <FormField
+          v-slot="slot"
+          label="Expected fingerprint (recommended)"
+          hint="SHA-256 of the new server's certificate, 64 hex digits; colons are allowed."
+          :error="
+            (submitted ? errors.expectedFingerprint : undefined) ?? fieldErrors.expectedFingerprint
+          "
+        >
+          <input
+            v-bind="slot"
+            v-model="form.expectedFingerprint"
+            class="input mono"
+            autocomplete="off"
+            spellcheck="false"
+          />
+        </FormField>
+        <FingerprintHelp purpose="add" />
         <FormField v-slot="slot" label="Server group (optional)">
           <select v-bind="slot" v-model="form.serverGroup">
             <option value="">None</option>
@@ -130,12 +171,22 @@ const config = computed(() => {
 
       <template v-else-if="kind === 'remove'">
         <p>
-          Server <strong>{{ server?.address }}</strong> is drained first: its
-          <strong>{{ server?.buckets.primary }}</strong> primary buckets move to the other servers,
-          then it leaves the cluster. This runs a rebalance and can take a while; reads and writes
-          continue.
+          Server <strong>{{ server?.address }}</strong> is unregistered, reset to an unconfigured
+          server, and its certificate is revoked. It can join a cluster again afterwards.
         </p>
-        <p class="muted">Remaining servers must have room for the data.</p>
+        <p>
+          <strong>The server must not hold any bucket copy.</strong> Removing does not move data. To
+          empty a server: turn off <em>Should hold buckets</em> for it on its page, start a
+          <RouterLink :to="{ name: 'rebalance' }">rebalance</RouterLink> and wait until it ends,
+          then remove the server. This server holds
+          <strong>{{ server?.buckets.primary }}</strong> primary and
+          <strong>{{ server?.buckets.replica }}</strong> replica buckets now.
+        </p>
+        <p class="muted">
+          The server is refused while it hosts the cluster metadata (shard group 0) or is the
+          manager leader, while it is the only server, while a rebalance runs, and when it is dead
+          (fail it over first).
+        </p>
       </template>
 
       <template v-else-if="kind === 'failover'">

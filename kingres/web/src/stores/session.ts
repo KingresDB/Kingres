@@ -93,6 +93,11 @@ export const useSessionStore = defineStore('session', () => {
     }
   }
 
+  /** Ends the session without a sign-out call (the server reset itself: there is nothing to sign out of). */
+  function end(): void {
+    adopt(null)
+  }
+
   /** Called when any request reports that the session is gone. */
   function expire(): void {
     expiredUser.value = session.value?.username ?? expiredUser.value
@@ -149,6 +154,7 @@ export const useSessionStore = defineStore('session', () => {
     identityNotice,
     signIn,
     signOut,
+    end,
     expire,
     can,
   }
