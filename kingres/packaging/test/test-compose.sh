@@ -395,10 +395,26 @@ for n in 1 2 3; do
     shop_shared_data "kingres-${n} after stop/start"
     wait_for "kingres-${n}: count(*) of events is ${total} after stop/start" 60 event_count_is "${total}"
 done
-check "no node needed crash recovery" bash -c '
-    for n in 1 2 3; do
-        docker exec "kingres-$n" sh -c "cat /var/lib/kingres/instances/*/pgdata/log/*" | grep -qi "automatic recovery in progress" && exit 1
-    done; exit 0'
+# An orderly stop must not look like a crash to PostgreSQL.  When it does, say
+# which node, what its instance logged around it, and what kingresd logged
+# about leases and the watchdog: both stop an instance with an immediate
+# shutdown, which is right for a primary that lost its lease and wrong for a
+# server that is being shut down.
+recovered=""
+for n in 1 2 3; do
+    if docker exec "kingres-${n}" sh -c 'cat /var/lib/kingres/instances/*/pgdata/log/*' 2>/dev/null |
+        grep -qi "automatic recovery in progress"; then
+        recovered="${recovered} kingres-${n}"
+        echo "info: kingres-${n} went through crash recovery; its instance logged:"
+        docker exec "kingres-${n}" sh -c 'grep -H -i -B2 -A1 "shutdown request\|automatic recovery in progress\|not properly shut down\|was interrupted" /var/lib/kingres/instances/*/pgdata/log/*' 2>&1 |
+            sed 's|^/var/lib/kingres/instances/||' | cut -c1-200 | tail -40
+        echo "info: kingresd of kingres-${n} on leases, the watchdog and stopping:"
+        docker logs "kingres-${n}" 2>&1 | grep -i 'lease\|fenc\|watchdog\|shutting down\|stopping' | cut -c1-260 | tail -20
+        echo "info: the watchdog of kingres-${n} logged:"
+        docker exec "kingres-${n}" sh -c 'tail -n 12 /var/lib/kingres/lease/watchdog.log' 2>&1 | cut -c1-220
+    fi
+done
+check_eq "no node needed crash recovery" "" "${recovered}"
 
 note "network"
 check "kingres-1 resolves kingres-2 and kingres-3 by name" \
