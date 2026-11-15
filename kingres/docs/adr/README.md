@@ -29,6 +29,7 @@ An ADR records one decision: the context, the decision, its consequences and the
 | [0020](0020-no-bundled-metrics-store.md) | No bundled metrics store; kingresd samples and exports metrics itself | Accepted | 2026-11-14 | - |
 | [0021](0021-failover-in-kingresd.md) | Failover is part of kingresd, with leases; Patroni and etcd are not bundled | Accepted | 2026-11-14 | Supersedes 0012 |
 | [0022](0022-the-complete-scan-stays.md) | The row-moving distributed scan stays as the path that answers every query | Accepted | 2026-11-15 | - |
+| [0023](0023-one-extension-source-for-several-majors.md) | One source of every extension builds against each supported PostgreSQL major (18 and 19) | Accepted | 2026-11-15 | 1 (extends 0002) |
 
 "Open decision #" refers to the table "Open decisions" in architecture.md.
 
