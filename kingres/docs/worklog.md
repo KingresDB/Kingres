@@ -7,6 +7,167 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-15: Contract 0.6.0, the fix round of the second kingresd review, the panel through 0.6.0, kingres_shard 0.3 and its review, phases 9 to 12 added to the roadmap
+
+### What was done
+
+- **Control plane, fix round for the second review** (commit e4736d3244;
+  findings CP2-01 to CP2-22 of
+  [reviews/2026-11-15-kingresd-0.4.md](reviews/2026-11-15-kingresd-0.4.md)).
+  A forwarded request now carries a proof of the caller's identity that
+  only the manager leader can make, per request; task leases use the clock
+  of the system database and carry a fencing epoch; the audit log is read
+  cluster-wide; the rate limiter no longer counts successful sign-ins; a
+  server whose internal API is switched off answers `internal_api_disabled`.
+- **REST contract 0.6.0** (same commit), 71 paths and 88 operations. Two
+  breaking changes: `addServer` needs `kingres_admin`, and `addServer` and
+  `joinCluster` without a fingerprint pin are refused with
+  `validation_failed` unless the request says `allowUnpinned: true`.
+  Additive: `internalFingerprint` on the state and the local-server
+  answers, `complete` and `uncoveredShardGroupIds` on ledger digests and
+  verifications, `AuditEvent.serverId`, partial answers of the audit log,
+  the alert kind `replicationPending`, `LedgerProofBlock`, a degraded
+  session (`Session.degraded`, `degradedReason`, `clientAddress`), a dry
+  run of `replaceNetworkAccess`.
+- **Web panel**: an independent review
+  ([reviews/2026-11-15-web-panel-0.5.md](reviews/2026-11-15-web-panel-0.5.md),
+  findings W2-01 to W2-16, commit bc2a9aa7f7); its fixes together with the
+  certificate actions and the display of incomplete cluster-wide answers
+  (a0b32e6b3c); then contract 0.6.0 (e46feb6165): choosing or refusing a
+  pin when a server is added or joins, the server's own fingerprint, ledger
+  coverage, the degraded session, the dry run of network access. The copy of
+  the session in `sessionStorage` that a0b32e6b3c introduced was removed
+  again in e46feb6165; the browser stores the theme only.
+- **Packaging**: the bucket count reported by a follower is an ordinary
+  check of the three-node test again (0199aed9e2).
+- **`kingres_shard` 0.3** (1d4b815f2d, design
+  [design/shard-phase4.md](design/shard-phase4.md)): `kingres.move_bucket`
+  (copy, logical replication with a marker row that proves the copy is
+  complete and replayed, a two-phase switch that detaches on the source and
+  attaches on the target), `kingres.rebalance_plan`,
+  `kingres.check_cluster`, `kingres.set_node_property`. Scans and fanned-out
+  writes compare a hash of the placement before and after they open their
+  cursors and fail with the retryable `KS001` when it changed.
+- **A defect that was already in 0.2**, found while verifying 0.3: the
+  recovery worker sent its two `SET` commands as one statement of the
+  extended protocol, which PostgreSQL refuses, so its remote sessions had no
+  statement or lock timeout. Fixed in `src/recovery.c` (one statement each;
+  a node whose session cannot be bounded is skipped and logged), with a
+  check in `t/022_timeouts_and_worker.pl` that the logs of the nodes do not
+  hold the refusal.
+- **Independent review of `kingres_shard` 0.3**
+  ([reviews/2026-11-15-kingres-shard-0.3.md](reviews/2026-11-15-kingres-shard-0.3.md),
+  commit 2f29d172ea): ten findings, S4-01 to S4-10. Three are serious and
+  were reproduced: a bucket that moves away and back while a scan waits
+  leaves the placement hash unchanged, and the scan returns an incomplete
+  answer without an error (S4-01, critical); the recovery worker neither
+  resumes nor cleans an interrupted move (S4-02); a write made directly into
+  a bucket partition is not covered by the marker proof (S4-03).
+- **Roadmap**: phases 9 to 12 were added to
+  [architecture.md](architecture.md) after a comparison with the
+  documentation of Citus 13.0: table lifecycle (distributing a table with
+  rows, undistributing, changing the distribution column or the bucket
+  count, partitioned tables), elasticity (bucket split, background
+  rebalancing with strategies, draining a server), distributed schemas, and
+  real-time analytics (repartitioned joins, `MERGE`, approximate aggregates,
+  columnar storage, time partitioning with retention). Each has its design
+  document, linked from the roadmap table.
+  [ADR 0022](adr/0022-the-complete-scan-stays.md) records the rule these
+  phases are built under: the row-moving distributed scan stays as the path
+  that answers every query.
+
+### How it was verified
+
+Run by the integrator on the tree that was committed, not taken from the
+reports of the authors, unless it says otherwise.
+
+- `kingresd` at e4736d3244: build for Windows and Linux, `go vet`, `gofmt`,
+  unit tests of 32 packages; the integration run in WSL against real
+  instances: 32 test binaries, 456 top-level tests, no failure, none
+  skipped. The three-server smoke script was run by its author only.
+  `TestFanoutCallsEveryServerInParallelWithItsOwnDeadline` failed once
+  under load; its deadlines were too short for a loaded machine and were
+  lengthened (30 repeats passed afterwards).
+- Contract: `scripts/check-contract.mjs` passes on 0.6.0.
+- Web panel at e46feb6165: type check, lint, 577 unit tests, 22 browser
+  tests, production build, generated-API and brand checks. The end-to-end
+  run against a real `kingresd` (45 of 45) was run by its author only.
+- Packaging at e4736d3244: the compose test of three nodes joined into one
+  cluster, 139 checks passed and one known failure (a stopped follower is
+  still listed as healthy: there are no heartbeats before phase 5).
+- `kingres_shard` 0.3 at 1d4b815f2d: out of tree, 12 regression tests and
+  32 TAP files with 5151 subtests; in the tree twice, 47 of 47 suites, no
+  compiler warning; `t/022` thirty times under CPU load without a failure.
+  Before the fix of the worker and of the test, `t/022` failed 2 of 7 runs
+  under load.
+- The review of 0.3 ran the whole suite once (35 of 36; `t/027` failed
+  under load and passed alone) and did not cover `COPY`, user two-phase
+  transactions, or long `REPEATABLE READ` transactions across a switch.
+- The design documents of phases 9 to 12 are designs: nothing in them was
+  built or run.
+
+### Needs-verification items
+
+None of the items of `architecture.md` was checked in this unit of work.
+The new design documents label their own unchecked statements.
+
+### Decisions and deviations
+
+- Lease loss stops a primary only in a group that has a standby; in a group
+  without one it only raises an alert (decided for the phase 5 work in
+  progress; to be recorded in the phase 5 design when that work lands).
+- Work on `contrib/kingres_shard` is done by one line of work at a time;
+  parallel changes to it conflicted.
+- [ADR 0022](adr/0022-the-complete-scan-stays.md), at the request of the
+  project owner.
+
+### Still open
+
+- The findings S3-01 to S3-18 and S4-01 to S4-10 of `kingres_shard`: a fix
+  round is in progress and is not committed. Until S4-01 to S4-03 are fixed
+  a bucket move is not safe for real use.
+- `kingresd`: the six rebalance operations, `failoverServer` and
+  `restorePreferredPrimaries` are not implemented (80 of 88 operations
+  are); the fencing epoch is not yet sent to remote callees; ledger digests
+  cover one shard group each. Phase 5 part 1 (heartbeats, leases, standbys,
+  the client proxy port) is in progress and is not committed.
+- Phase 2b and phases 9 to 12 are designs only. The five new designs each end
+  with a list of the statements that still need verification (14, 14, 17,
+  17 and 27 of them), and the points that cross
+  phase boundaries are listed under the roadmap table in
+  [architecture.md](architecture.md).
+- Defects in the existing code and contract that the design work found, not
+  fixed yet:
+  - the contract says `distributeTable` moves rows and that a distributed
+    table can be a ledger table at the same time; the extension needs an
+    empty table and refuses a ledger table;
+  - `kingresd` answers `distributeTable` with `method: reference` as not
+    supported, although the extension has `create_reference_table`;
+  - `removeServer` counts the standbys a server hosts as buckets it owns,
+    so with chained placement no server can be removed before its standbys
+    are relocated, which the contract does not say;
+  - the task engine declares the state `paused` but nothing sets it, and a
+    stopped rebalance is counted as running;
+  - `create_distributed_table` does not look at the access method of the
+    table, and `ledger_enable` does not either;
+  - `choose_colocation` takes `max(colocation_id) + 1`, which can reuse the
+    number of a dropped group;
+  - `COPY <table> TO` of a distributed table was never examined and probably
+    returns the local partitions only;
+  - a `SELECT` that reads a distributed table of another shard group
+    together with a local table is refused, which ADR 0022 does not allow
+    for reads;
+  - DDL runs on the primary of the map group only, so a client that creates
+    schemas or tables through another server is refused.
+- The CI workflow is not in the repository: the access token in use cannot
+  push workflow files.
+
+### Core patches
+
+None.
+
+---
+
 ## 2026-11-15: Contract 0.4.0 complete and 0.5.0, certificates, cluster-wide reads, a real three-node cluster test, second review of kingresd
 
 ### What was done

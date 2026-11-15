@@ -28,6 +28,7 @@ An ADR records one decision: the context, the decision, its consequences and the
 | [0019](0019-cluster-state-in-a-system-database.md) | Control-plane state lives in a system database with embedded migrations | Accepted | 2026-11-14 | - |
 | [0020](0020-no-bundled-metrics-store.md) | No bundled metrics store; kingresd samples and exports metrics itself | Accepted | 2026-11-14 | - |
 | [0021](0021-failover-in-kingresd.md) | Failover is part of kingresd, with leases; Patroni and etcd are not bundled | Accepted | 2026-11-14 | Supersedes 0012 |
+| [0022](0022-the-complete-scan-stays.md) | The row-moving distributed scan stays as the path that answers every query | Accepted | 2026-11-15 | - |
 
 "Open decision #" refers to the table "Open decisions" in architecture.md.
 
