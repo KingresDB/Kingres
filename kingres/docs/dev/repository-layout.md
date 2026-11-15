@@ -12,8 +12,10 @@ Directories marked "planned" do not exist yet or are empty.
 ```
 <repository root>/                 Upstream PostgreSQL tree (branch kingres-18, base REL_18_7)
   contrib/
-    kingres_shard/                Sharding extension, C (planned)
-    kingres_ledger/               Ledger extension, C (planned)
+    kingres_shard/                Sharding extension, C
+    kingres_ledger/               Ledger extension, C
+    kingres_sketch/               Approximate aggregates, C
+    kingres_timepart/             Time partitioning and retention, SQL and PL/pgSQL
     ...                            Upstream contrib modules, untouched
   src/, doc/, config/, ...         Upstream PostgreSQL, changed only by registered core patches
   kingres/
@@ -24,7 +26,7 @@ Directories marked "planned" do not exist yet or are empty.
       internal/                      All other Go packages (agent, manager, router, task engine, REST handlers)
     web/                           Vue 3 and TypeScript panel
     verifier/                      Standalone ledger verifier (does not trust the database)
-    packaging/                     deb, rpm, Docker image, systemd unit for the kingresdb package
+    packaging/                     deb, rpm, Docker image, systemd unit for the kingres package
     dev/                           Developer scripts
     docs/
       architecture.md              Design and decisions (source of truth)

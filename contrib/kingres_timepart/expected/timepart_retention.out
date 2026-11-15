@@ -1,0 +1,497 @@
+-- timepart_retention: dropping and detaching old partitions, a partition that
+-- spans the boundary, drop_old_time_partitions by hand, a partition that
+-- cannot be dropped, and DETACH ... CONCURRENTLY from a procedure.
+--
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+-- SPDX-License-Identifier: PostgreSQL
+SET timezone = 'UTC';
+SET datestyle = ISO;
+SET intervalstyle = postgres;
+\set VERBOSITY default
+\set SHOW_CONTEXT never
+-- Drop: partitions that end at or before as_of - retention go, with their
+-- rows; a partition that ends after the boundary stays whole.
+CREATE TABLE tp.t1 (id int, ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.create_time_partitions('tp.t1', '1 day', '2026-03-10 00:00 UTC', '2026-03-01 00:00 UTC');
+ create_time_partitions 
+------------------------
+                     10
+(1 row)
+
+INSERT INTO tp.t1 SELECT g, timestamptz '2026-03-01 UTC' + (g - 1) * interval '6 hours' FROM generate_series(1, 40) g;
+SELECT count(*) AS rows_before FROM tp.t1;
+ rows_before 
+-------------
+          40
+(1 row)
+
+SELECT kingres.timepart_set_policy('tp.t1', '1 day', create_ahead => '1 day', retention => '3 days');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+-- at 2026-03-06 12:00 the boundary is 2026-03-03 12:00: the days up to 03-02
+-- end before it; 03-03 ends at 03-04 00:00, after it, and stays
+SELECT kind, partition_name, range_to FROM kingres.timepart_plan('tp.t1', '2026-03-06 12:00 UTC') WHERE kind <> 'create';
+ kind | partition_name |        range_to        
+------+----------------+------------------------
+ drop | t1_p20260301   | 2026-03-02 00:00:00+00
+ drop | t1_p20260302   | 2026-03-03 00:00:00+00
+(2 rows)
+
+\o /dev/null
+CALL kingres.timepart_run('tp.t1', '2026-03-06 12:00 UTC');
+\o
+SELECT * FROM tp.last_run('tp', 't1');
+ state | trigger | error 
+-------+---------+-------
+ done  | sql     | 
+(1 row)
+
+SELECT kind, partition_name, state FROM tp.last_actions('tp', 't1') WHERE kind <> 'create';
+ kind | partition_name | state 
+------+----------------+-------
+ drop | t1_p20260301   | done
+ drop | t1_p20260302   | done
+(2 rows)
+
+SELECT a.bytes_before > 0 AS size_recorded, a.bytes_after IS NULL AS no_after
+  FROM kingres.timepart_run_action a JOIN kingres.timepart_run r USING (run_id)
+ WHERE r.table_name = 't1' AND a.partition_name = 't1_p20260301';
+ size_recorded | no_after 
+---------------+----------
+ t             | t
+(1 row)
+
+SELECT min(ts) AS oldest_row, count(*) AS rows_after FROM tp.t1;
+       oldest_row       | rows_after 
+------------------------+------------
+ 2026-03-03 00:00:00+00 |         32
+(1 row)
+
+SELECT to_regclass('tp.t1_p20260301') IS NULL AS dropped, to_regclass('tp.t1_p20260303') IS NOT NULL AS kept;
+ dropped | kept 
+---------+------
+ t       | t
+(1 row)
+
+-- The same run again: nothing to retire.
+\o /dev/null
+CALL kingres.timepart_run('tp.t1', '2026-03-06 12:00 UTC');
+\o
+SELECT count(*) FILTER (WHERE kind IN ('drop', 'detach')) AS retired_again FROM tp.last_actions('tp', 't1');
+ retired_again 
+---------------
+             0
+(1 row)
+
+-- Later the boundary passes the end of 03-03.
+\o /dev/null
+CALL kingres.timepart_run('tp.t1', '2026-03-07 00:00 UTC');
+\o
+SELECT kind, partition_name FROM tp.last_actions('tp', 't1') WHERE kind = 'drop';
+ kind | partition_name 
+------+----------------
+ drop | t1_p20260303
+(1 row)
+
+-- Detach: the partition stays as a table with its rows, under its name.
+CREATE TABLE tp.t2 (id int, ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.create_time_partitions('tp.t2', '1 day', '2026-03-05 00:00 UTC', '2026-03-01 00:00 UTC');
+ create_time_partitions 
+------------------------
+                      5
+(1 row)
+
+INSERT INTO tp.t2 SELECT g, timestamptz '2026-03-01 UTC' + (g - 1) * interval '12 hours' FROM generate_series(1, 10) g;
+SELECT kingres.timepart_set_policy('tp.t2', '1 day', create_ahead => '1 day', retention => '2 days', retention_action => 'detach');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+\o /dev/null
+CALL kingres.timepart_run('tp.t2', '2026-03-05 06:00 UTC');
+\o
+SELECT kind, partition_name, state FROM tp.last_actions('tp', 't2') WHERE kind <> 'create';
+  kind  | partition_name | state 
+--------+----------------+-------
+ detach | t2_p20260301   | done
+ detach | t2_p20260302   | done
+(2 rows)
+
+SELECT * FROM tp.parts('tp.t2');
+     part     |                            bounds                             
+--------------+---------------------------------------------------------------
+ t2_p20260303 | FROM ('2026-03-03 00:00:00+00') TO ('2026-03-04 00:00:00+00')
+ t2_p20260304 | FROM ('2026-03-04 00:00:00+00') TO ('2026-03-05 00:00:00+00')
+ t2_p20260305 | FROM ('2026-03-05 00:00:00+00') TO ('2026-03-06 00:00:00+00')
+ t2_p20260306 | FROM ('2026-03-06 00:00:00+00') TO ('2026-03-07 00:00:00+00')
+(4 rows)
+
+SELECT c.relname, c.relispartition, (SELECT count(*) FROM tp.t2_p20260301) AS rows_in_first
+  FROM pg_class c WHERE c.oid = 'tp.t2_p20260301'::regclass;
+   relname    | relispartition | rows_in_first 
+--------------+----------------+---------------
+ t2_p20260301 | f              |             2
+(1 row)
+
+SELECT count(*) AS rows_in_parent FROM tp.t2;
+ rows_in_parent 
+----------------
+              6
+(1 row)
+
+SELECT partition, attached, range_from FROM kingres.timepart_partitions('tp.t2') ORDER BY attached, range_from;
+    partition    | attached |       range_from       
+-----------------+----------+------------------------
+ tp.t2_p20260301 | f        | 2026-03-01 00:00:00+00
+ tp.t2_p20260302 | f        | 2026-03-02 00:00:00+00
+ tp.t2_p20260303 | t        | 2026-03-03 00:00:00+00
+ tp.t2_p20260304 | t        | 2026-03-04 00:00:00+00
+ tp.t2_p20260305 | t        | 2026-03-05 00:00:00+00
+ tp.t2_p20260306 | t        | 2026-03-06 00:00:00+00
+(6 rows)
+
+-- A second run does not touch the detached tables, and does not create
+-- their cells again.
+\o /dev/null
+CALL kingres.timepart_run('tp.t2', '2026-03-05 06:00 UTC');
+\o
+SELECT count(*) AS actions FROM tp.last_actions('tp', 't2');
+ actions 
+---------
+       0
+(1 row)
+
+-- If the retention is later removed, the detached partitions do not come
+-- back: the grid starts at the first partition that is attached.
+SELECT kingres.timepart_set_policy('tp.t2', '1 day', create_ahead => '1 day');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+\o /dev/null
+CALL kingres.timepart_run('tp.t2', '2026-03-05 06:00 UTC');
+\o
+SELECT * FROM tp.last_run('tp', 't2');
+ state | trigger | error 
+-------+---------+-------
+ done  | sql     | 
+(1 row)
+
+SELECT kind, partition_name, state, detail FROM tp.last_actions('tp', 't2');
+ kind | partition_name | state | detail 
+------+----------------+-------+--------
+(0 rows)
+
+SELECT count(*) AS rows_in_detached FROM tp.t2_p20260301;
+ rows_in_detached 
+------------------
+                2
+(1 row)
+
+-- A partition that spans the boundary: monthly partitions, retention one month.
+CREATE TABLE tp.t3 (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.create_time_partitions('tp.t3', '1 month', '2026-04-15 00:00 UTC', '2026-01-10 00:00 UTC');
+ create_time_partitions 
+------------------------
+                      4
+(1 row)
+
+INSERT INTO tp.t3 VALUES ('2026-03-01 UTC'), ('2026-03-31 23:00 UTC'), ('2026-04-01 UTC');
+SELECT kingres.timepart_set_policy('tp.t3', '1 month', create_ahead => '1 day', retention => '1 month');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+-- on 2026-04-10 the boundary is 2026-03-10: January and February are gone,
+-- March ends at 04-01, after it, and stays whole with rows older than the
+-- retention
+\o /dev/null
+CALL kingres.timepart_run('tp.t3', '2026-04-10 UTC');
+\o
+SELECT kind, partition_name FROM tp.last_actions('tp', 't3') WHERE kind <> 'create';
+ kind | partition_name 
+------+----------------
+ drop | t3_p202601
+ drop | t3_p202602
+(2 rows)
+
+SELECT count(*) AS rows_kept FROM tp.t3 WHERE ts < '2026-04-01 UTC';
+ rows_kept 
+-----------
+         2
+(1 row)
+
+-- on 2026-05-01 the boundary is 2026-04-01 and March goes
+\o /dev/null
+CALL kingres.timepart_run('tp.t3', '2026-05-01 UTC');
+\o
+SELECT kind, partition_name FROM tp.last_actions('tp', 't3') WHERE kind <> 'create';
+ kind | partition_name 
+------+----------------
+ drop | t3_p202603
+(1 row)
+
+SELECT count(*) AS rows_left FROM tp.t3;
+ rows_left 
+-----------
+         1
+(1 row)
+
+-- Naive keys.
+CREATE TABLE tp.t4 (d date NOT NULL) PARTITION BY RANGE (d);
+SELECT kingres.create_time_partitions('tp.t4', '1 month', '2026-04-15 UTC', '2026-01-10 UTC');
+ create_time_partitions 
+------------------------
+                      4
+(1 row)
+
+SELECT kingres.timepart_set_policy('tp.t4', '1 month', create_ahead => '1 day', retention => '1 month');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+\o /dev/null
+CALL kingres.timepart_run('tp.t4', '2026-04-15 UTC');
+\o
+SELECT kind, partition_name FROM tp.last_actions('tp', 't4') WHERE kind <> 'create';
+ kind | partition_name 
+------+----------------
+ drop | t4_p202601
+ drop | t4_p202602
+(2 rows)
+
+SELECT * FROM tp.parts('tp.t4');
+    part    |                bounds                 
+------------+---------------------------------------
+ t4_p202603 | FROM ('2026-03-01') TO ('2026-04-01')
+ t4_p202604 | FROM ('2026-04-01') TO ('2026-05-01')
+(2 rows)
+
+CREATE TABLE tp.t5 (ts timestamp NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.create_time_partitions('tp.t5', '1 day', '2026-03-05 UTC', '2026-03-01 UTC');
+ create_time_partitions 
+------------------------
+                      5
+(1 row)
+
+SELECT kingres.timepart_set_policy('tp.t5', '1 day', create_ahead => '1 day', retention => '2 days', timezone => 'Asia/Tokyo');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+-- 2026-03-04 20:00 UTC is 2026-03-05 05:00 in Tokyo: the boundary is 03-03 05:00
+\o /dev/null
+CALL kingres.timepart_run('tp.t5', '2026-03-04 20:00 UTC');
+\o
+SELECT kind, partition_name FROM tp.last_actions('tp', 't5') WHERE kind <> 'create';
+ kind | partition_name 
+------+----------------
+ drop | t5_p20260301
+ drop | t5_p20260302
+(2 rows)
+
+-- drop_old_time_partitions by hand: the bound is inclusive, a number is
+-- returned, detach_only keeps the tables, and a default partition is never
+-- touched.
+CREATE TABLE tp.t6 (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.create_time_partitions('tp.t6', '1 day', '2026-03-06 UTC', '2026-03-01 UTC');
+ create_time_partitions 
+------------------------
+                      6
+(1 row)
+
+CREATE TABLE tp.t6_default PARTITION OF tp.t6 DEFAULT;
+INSERT INTO tp.t6 VALUES ('2025-01-01 UTC');
+SHOW lock_timeout;
+ lock_timeout 
+--------------
+ 0
+(1 row)
+
+SELECT kingres.drop_old_time_partitions('tp.t6', '2026-03-02 00:00 UTC');
+ drop_old_time_partitions 
+--------------------------
+                        1
+(1 row)
+
+SHOW lock_timeout;
+ lock_timeout 
+--------------
+ 0
+(1 row)
+
+SELECT part FROM tp.parts('tp.t6') ORDER BY part;
+     part     
+--------------
+ t6_default
+ t6_p20260302
+ t6_p20260303
+ t6_p20260304
+ t6_p20260305
+ t6_p20260306
+(6 rows)
+
+SELECT kingres.drop_old_time_partitions('tp.t6', '2026-03-03 23:59:59 UTC');
+ drop_old_time_partitions 
+--------------------------
+                        1
+(1 row)
+
+SELECT kingres.drop_old_time_partitions('tp.t6', '2026-03-04 UTC', detach_only => true);
+ drop_old_time_partitions 
+--------------------------
+                        1
+(1 row)
+
+SELECT part FROM tp.parts('tp.t6') ORDER BY part;
+     part     
+--------------
+ t6_default
+ t6_p20260304
+ t6_p20260305
+ t6_p20260306
+(4 rows)
+
+SELECT to_regclass('tp.t6_p20260303') IS NOT NULL AS detached_table_exists;
+ detached_table_exists 
+-----------------------
+ t
+(1 row)
+
+SELECT kingres.drop_old_time_partitions('tp.t6', '2100-01-01 UTC');
+ drop_old_time_partitions 
+--------------------------
+                        3
+(1 row)
+
+SELECT part FROM tp.parts('tp.t6');
+    part    
+------------
+ t6_default
+(1 row)
+
+SELECT count(*) AS default_rows FROM tp.t6_default;
+ default_rows 
+--------------
+            1
+(1 row)
+
+SELECT kingres.drop_old_time_partitions('tp.t6', 'infinity');
+ERROR:  older_than must be a finite time
+SELECT kingres.drop_old_time_partitions('tp.t6', '2026-03-02 UTC', timezone => 'Mars/Olympus');
+ERROR:  unknown time zone "Mars/Olympus"
+HINT:  Use a name from pg_timezone_names, for example UTC or Europe/Berlin.
+-- Partitions with bounds off the grid go by their upper bound.
+CREATE TABLE tp.t7 (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+CREATE TABLE tp.t7_a PARTITION OF tp.t7 FOR VALUES FROM ('2026-03-01 06:00 UTC') TO ('2026-03-02 18:00 UTC');
+CREATE TABLE tp.t7_b PARTITION OF tp.t7 FOR VALUES FROM ('2026-03-02 18:00 UTC') TO ('2026-03-05 00:00 UTC');
+SELECT kingres.drop_old_time_partitions('tp.t7', '2026-03-02 18:00 UTC');
+ drop_old_time_partitions 
+--------------------------
+                        1
+(1 row)
+
+SELECT part FROM tp.parts('tp.t7');
+ part 
+------
+ t7_b
+(1 row)
+
+-- A partition that cannot be dropped: a view depends on it.  The action
+-- fails with the reason, the run is "partial", the other partitions go, and
+-- the next run finishes once the view is gone.
+CREATE TABLE tp.t8 (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.create_time_partitions('tp.t8', '1 day', '2026-03-05 UTC', '2026-03-01 UTC');
+ create_time_partitions 
+------------------------
+                      5
+(1 row)
+
+CREATE VIEW tp.t8_view AS SELECT * FROM tp.t8_p20260302;
+SELECT kingres.timepart_set_policy('tp.t8', '1 day', create_ahead => '1 day', retention => '2 days');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+\o /dev/null
+CALL kingres.timepart_run('tp.t8', '2026-03-06 UTC');
+\o
+SELECT * FROM tp.last_run('tp', 't8');
+  state  | trigger | error 
+---------+---------+-------
+ partial | sql     | 
+(1 row)
+
+SELECT kind, partition_name, state, detail FROM tp.last_actions('tp', 't8') WHERE kind <> 'create';
+ kind | partition_name | state  |                                   detail                                    
+------+----------------+--------+-----------------------------------------------------------------------------
+ drop | t8_p20260301   | done   | 
+ drop | t8_p20260302   | failed | 2BP01: cannot drop table tp.t8_p20260302 because other objects depend on it
+ drop | t8_p20260303   | done   | 
+(3 rows)
+
+SELECT part FROM tp.parts('tp.t8');
+     part     
+--------------
+ t8_p20260302
+ t8_p20260304
+ t8_p20260305
+ t8_p20260306
+(4 rows)
+
+-- The failed drop was rolled back whole: the partition is still attached with its rows.
+SELECT count(*) AS still_attached FROM pg_inherits WHERE inhrelid = 'tp.t8_p20260302'::regclass;
+ still_attached 
+----------------
+              1
+(1 row)
+
+DROP VIEW tp.t8_view;
+\o /dev/null
+CALL kingres.timepart_run('tp.t8', '2026-03-06 UTC');
+\o
+SELECT * FROM tp.last_run('tp', 't8');
+ state | trigger | error 
+-------+---------+-------
+ done  | sql     | 
+(1 row)
+
+SELECT kind, partition_name, state FROM tp.last_actions('tp', 't8') WHERE kind <> 'create';
+ kind | partition_name | state 
+------+----------------+-------
+ drop | t8_p20260302   | done
+(1 row)
+
+-- DETACH ... CONCURRENTLY cannot run inside a function or a procedure
+-- (design item V14), which is why the retirement does not use it.  The text
+-- of the message differs between PostgreSQL 18 and 19, so only the SQLSTATE
+-- is shown (25001, active_sql_transaction).
+CREATE TABLE tp.t9 (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.create_time_partitions('tp.t9', '1 day', '2026-03-03 UTC', '2026-03-01 UTC');
+ create_time_partitions 
+------------------------
+                      3
+(1 row)
+
+\set VERBOSITY sqlstate
+DO $$ BEGIN ALTER TABLE tp.t9 DETACH PARTITION tp.t9_p20260301 CONCURRENTLY; END $$;
+ERROR:  25001
+CREATE PROCEDURE tp.detach_concurrently() LANGUAGE plpgsql AS $$ BEGIN ALTER TABLE tp.t9 DETACH PARTITION tp.t9_p20260301 CONCURRENTLY; END $$;
+CALL tp.detach_concurrently();
+ERROR:  25001
+\set VERBOSITY default
+SELECT count(*) AS still_attached FROM pg_inherits WHERE inhrelid = 'tp.t9_p20260301'::regclass;
+ still_attached 
+----------------
+              1
+(1 row)
+

@@ -1,0 +1,270 @@
+-- sketch_topn: the type topn (Space-Saving), its functions and aggregates.
+SET search_path = public, kingres_sketch;
+SELECT topn_empty()::bytea AS empty_default, topn_capacity(topn_empty()), topn_total(topn_empty());
+               empty_default                | topn_capacity | topn_total 
+--------------------------------------------+---------------+------------
+ \x4b010200e8030000000000000000000000000000 |          1000 |          0
+(1 row)
+
+SELECT topn_capacity(topn_empty(1)), topn_capacity(topn_empty(100000));
+ topn_capacity | topn_capacity 
+---------------+---------------
+             1 |        100000
+(1 row)
+
+SELECT topn_empty(0);
+ERROR:  topn capacity must be between 1 and 100000, not 0
+SELECT topn_empty(100001);
+ERROR:  topn capacity must be between 1 and 100000, not 100001
+SELECT * FROM topn_list(topn_empty());
+ item | frequency | max_error 
+------+-----------+-----------
+(0 rows)
+
+SELECT * FROM topn_list(NULL::topn);
+ item | frequency | max_error 
+------+-----------+-----------
+(0 rows)
+
+-- a stream in which the first counters are enough: exact counts, no error
+SELECT * FROM topn_list(
+  (SELECT topn_add_agg(x, 10) FROM unnest(ARRAY['a','b','a','c','a','b','d']) x));
+ item | frequency | max_error 
+------+-----------+-----------
+ a    |         3 |         0
+ b    |         2 |         0
+ c    |         1 |         0
+ d    |         1 |         0
+(4 rows)
+
+SELECT topn_total(t), topn_capacity(t)
+  FROM (SELECT topn_add_agg(x, 10) AS t FROM unnest(ARRAY['a','b','a',NULL,'a']) x) s;
+ topn_total | topn_capacity 
+------------+---------------
+          4 |            10
+(1 row)
+
+-- a stream that overflows 3 counters: the takeover rule of Space-Saving
+SELECT * FROM topn_list(
+  (SELECT topn_add_agg(x, 3) FROM unnest(ARRAY['a','b','a','c','d','a','b','e']) x));
+ item | frequency | max_error 
+------+-----------+-----------
+ a    |         3 |         0
+ e    |         3 |         2
+ d    |         2 |         1
+(3 rows)
+
+SELECT * FROM topn_list(
+  (SELECT topn_add_agg(x, 3) FROM unnest(ARRAY['a','b','a','c','d','a','b','e']) x), 2);
+ item | frequency | max_error 
+------+-----------+-----------
+ a    |         3 |         0
+ e    |         3 |         2
+(2 rows)
+
+SELECT * FROM topn_list(
+  (SELECT topn_add_agg(x, 3) FROM unnest(ARRAY['a','b','a','c','d','a','b','e']) x), 0);
+ item | frequency | max_error 
+------+-----------+-----------
+(0 rows)
+
+SELECT * FROM topn_list(topn_empty(), -1);
+ERROR:  the number of items must not be negative
+-- capacity 1: one counter whose count is the number of items
+SELECT * FROM topn_list((SELECT topn_add_agg(x, 1) FROM generate_series(1, 5) x));
+ item | frequency | max_error 
+------+-----------+-----------
+ 5    |         5 |         4
+(1 row)
+
+-- items of the accepted types, and the refused ones
+SELECT * FROM topn_list((SELECT topn_add_agg(x) FROM (VALUES (1::int2), (1::int2), (2::int2)) t(x)));
+ item | frequency | max_error 
+------+-----------+-----------
+ 1    |         2 |         0
+ 2    |         1 |         0
+(2 rows)
+
+SELECT * FROM topn_list((SELECT topn_add_agg(x) FROM (VALUES (1::int8), (1::int8), (-2::int8)) t(x)));
+ item | frequency | max_error 
+------+-----------+-----------
+ 1    |         2 |         0
+ -2   |         1 |         0
+(2 rows)
+
+SELECT * FROM topn_list((SELECT topn_add_agg(x) FROM (VALUES (1.50::numeric), (1.5::numeric), (2::numeric)) t(x)));
+ item | frequency | max_error 
+------+-----------+-----------
+ 1.5  |         1 |         0
+ 1.50 |         1 |         0
+ 2    |         1 |         0
+(3 rows)
+
+SELECT * FROM topn_list((SELECT topn_add_agg(x) FROM (VALUES (true), (true), (false)) t(x)));
+ item | frequency | max_error 
+------+-----------+-----------
+ t    |         2 |         0
+ f    |         1 |         0
+(2 rows)
+
+SELECT * FROM topn_list((SELECT topn_add_agg(x) FROM (VALUES ('123e4567-e89b-12d3-a456-426614174000'::uuid), ('123e4567-e89b-12d3-a456-426614174000'::uuid)) t(x)));
+                 item                 | frequency | max_error 
+--------------------------------------+-----------+-----------
+ 123e4567-e89b-12d3-a456-426614174000 |         2 |         0
+(1 row)
+
+SELECT * FROM topn_list((SELECT topn_add_agg(x) FROM (VALUES ('ab'::varchar), ('ab'::varchar), ('x'::name)) t(x)));
+ item | frequency | max_error 
+------+-----------+-----------
+ ab   |         2 |         0
+ x    |         1 |         0
+(2 rows)
+
+SELECT * FROM topn_list((SELECT topn_add_agg(x) FROM (VALUES ('ab'::char(4)), ('ab'::char(4))) t(x)));
+ item | frequency | max_error 
+------+-----------+-----------
+ ab   |         2 |         0
+(1 row)
+
+SELECT * FROM topn_list((SELECT topn_add_agg(x) FROM (VALUES (1.5::float8)) t(x)));
+ERROR:  topn does not take type double precision
+HINT:  Cast the value to text with an explicit format.
+SELECT * FROM topn_list((SELECT topn_add_agg(x) FROM (VALUES ('2026-01-01'::date)) t(x)));
+ERROR:  topn does not take type date
+HINT:  Cast the value to text with an explicit format.
+SELECT * FROM topn_list((SELECT topn_add_agg(x) FROM (VALUES ('2026-01-01 00:00'::timestamptz)) t(x)));
+ERROR:  topn does not take type timestamp with time zone
+HINT:  Cast the value to text with an explicit format.
+-- the longest item is 1024 bytes
+SELECT length(item), frequency FROM topn_list((SELECT topn_add_agg(repeat('x', 1024))));
+ length | frequency 
+--------+-----------
+   1024 |         1
+(1 row)
+
+SELECT topn_add_agg(repeat('x', 1025));
+ERROR:  topn item is 1025 bytes long, the limit is 1024 bytes
+SELECT * FROM topn_list(topn_add(topn_empty(), ''::text));
+ item | frequency | max_error 
+------+-----------+-----------
+      |         1 |         0
+(1 row)
+
+-- topn_add on a value
+SELECT * FROM topn_list(topn_add(topn_add(topn_add(topn_empty(5), 'a'::text), 'b'::text), 'a'::text));
+ item | frequency | max_error 
+------+-----------+-----------
+ a    |         2 |         0
+ b    |         1 |         0
+(2 rows)
+
+SELECT topn_add(topn_empty(), NULL::text)::bytea = topn_empty()::bytea AS null_item_ignored;
+ null_item_ignored 
+-------------------
+ t
+(1 row)
+
+SELECT topn_add(NULL, 'a'::text) IS NULL AS null_sketch;
+ null_sketch 
+-------------
+ t
+(1 row)
+
+-- union adds frequencies; the capacity must be the same
+SELECT * FROM topn_list(topn_union(
+  (SELECT topn_add_agg(x, 4) FROM unnest(ARRAY['a','a','b','c']) x),
+  (SELECT topn_add_agg(x, 4) FROM unnest(ARRAY['a','b','b','d']) x)));
+ item | frequency | max_error 
+------+-----------+-----------
+ a    |         3 |         0
+ b    |         3 |         0
+ c    |         1 |         0
+ d    |         1 |         0
+(4 rows)
+
+SELECT topn_total(topn_union(
+  (SELECT topn_add_agg(x, 4) FROM unnest(ARRAY['a','a','b','c']) x),
+  (SELECT topn_add_agg(x, 4) FROM unnest(ARRAY['a','b','b','d']) x)));
+ topn_total 
+------------
+          8
+(1 row)
+
+SELECT topn_union(topn_empty(3), topn_empty(4));
+ERROR:  cannot merge summaries of capacity 3 and 4
+-- full summaries: an item missing from a full summary gets its smallest count
+SELECT * FROM topn_list(topn_union(
+  (SELECT topn_add_agg(x, 2) FROM unnest(ARRAY['a','a','a','b','b','c']) x),
+  (SELECT topn_add_agg(x, 2) FROM unnest(ARRAY['d','d','d','d','e','e']) x)));
+ item | frequency | max_error 
+------+-----------+-----------
+ d    |         7 |         3
+ a    |         5 |         2
+(2 rows)
+
+-- the union aggregate; NULLs are ignored; no rows give an empty summary of capacity 1000
+SELECT * FROM topn_list(
+  (SELECT topn_union_agg(t) FROM (VALUES
+     ((SELECT topn_add_agg(x, 4) FROM unnest(ARRAY['a','a','b']) x)),
+     (NULL::topn),
+     ((SELECT topn_add_agg(x, 4) FROM unnest(ARRAY['a','c']) x))) v(t)));
+ item | frequency | max_error 
+------+-----------+-----------
+ a    |         3 |         0
+ b    |         1 |         0
+ c    |         1 |         0
+(3 rows)
+
+SELECT topn_capacity(topn_add_agg(x)), topn_total(topn_union_agg(NULL::topn))
+  FROM generate_series(1, 0) x;
+ topn_capacity | topn_total 
+---------------+------------
+          1000 |          0
+(1 row)
+
+SELECT topn_add_agg(x, 3 + x % 2) FROM generate_series(1, 4) x;
+ERROR:  the capacity of the aggregate changed from 4 to 3
+HINT:  The capacity must be the same in every row of a group.
+SELECT topn_add_agg(x, 0) FROM generate_series(1, 4) x;
+ERROR:  topn capacity must be between 1 and 100000, not 0
+-- canonical bytes: the same content rebuilt from its bytes is identical, and
+-- order of equal counts is by item
+SELECT t::bytea = t::bytea::topn::bytea AS rebuilt_same
+  FROM (SELECT topn_add_agg(x, 3) AS t FROM unnest(ARRAY['b','a','c','b','a','d','e']) x) s;
+ rebuilt_same 
+--------------
+ t
+(1 row)
+
+SELECT (SELECT topn_add_agg(x, 5) FROM unnest(ARRAY['a','b','c']) x)::bytea
+     = (SELECT topn_add_agg(x, 5) FROM unnest(ARRAY['c','b','a']) x)::bytea AS equal_counts_same_bytes;
+ equal_counts_same_bytes 
+-------------------------
+ t
+(1 row)
+
+-- the invariants on a larger stream: count - error <= true <= count, error <= N/k
+WITH data AS (SELECT (i * i % 997)::text AS x FROM generate_series(1, 20000) i),
+     truth AS (SELECT x, count(*) AS c FROM data GROUP BY x),
+     sk AS (SELECT * FROM topn_list((SELECT topn_add_agg(x, 50) FROM data)))
+SELECT count(*) AS counters,
+       bool_and(frequency - max_error <= c AND c <= frequency) AS bounds_hold,
+       bool_and(max_error <= 20000 / 50) AS error_bound_holds
+  FROM sk JOIN truth ON truth.x = sk.item;
+ counters | bounds_hold | error_bound_holds 
+----------+-------------+-------------------
+       50 | t           | t
+(1 row)
+
+-- as a window function
+SELECT i, topn_total(topn_add_agg(i % 3, 2) OVER (ORDER BY i)) AS running_total
+  FROM generate_series(1, 5) i;
+ i | running_total 
+---+---------------
+ 1 |             1
+ 2 |             2
+ 3 |             3
+ 4 |             4
+ 5 |             5
+(5 rows)
+

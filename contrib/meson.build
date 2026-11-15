@@ -40,6 +40,8 @@ subdir('jsonb_plpython')
 # KingresDB extensions; see kingres/docs/dev/core-patches.md, patch KP-0003.
 subdir('kingres_ledger')
 subdir('kingres_shard')
+subdir('kingres_sketch')
+subdir('kingres_timepart')
 subdir('lo')
 subdir('ltree')
 subdir('ltree_plpython')

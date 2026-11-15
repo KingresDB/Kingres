@@ -1,0 +1,6 @@
+# kingres_sketch extension
+comment = 'KingresDB approximate aggregates: HyperLogLog distinct count, Space-Saving top-n and t-digest percentiles'
+default_version = '1.0'
+module_pathname = '$libdir/kingres_sketch'
+relocatable = false
+schema = kingres_sketch
