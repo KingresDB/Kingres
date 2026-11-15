@@ -28,7 +28,7 @@ The base is upstream tag `REL_18_7`, on the branch `kingres-18`. State on 2026-1
 |---|---|
 | 0 Foundation, 1 Sharding MVP, 2 Distributed DML and DDL, two-phase commit, reference tables | Done (`kingres_shard` 0.2) |
 | 3 Control plane, REST API, panel, package | Done |
-| 4 Bucket movement and rebalancing | In progress: `kingres_shard` 0.3 moves buckets; a fix round for review findings is open, and rebalancing is not yet driven by the control plane |
+| 4 Bucket movement and rebalancing | In progress: `kingres_shard` 0.4 moves buckets (0.4 is the fix round for the review of 0.3; its fixes are being reviewed again); rebalancing is not yet driven by the control plane |
 | 5 High availability | In progress: designed; standbys, leases and heartbeats are being written; failover is not started |
 | 6 Ledger | Done (`kingres_ledger` 0.2, the verifier, the Ledger page) |
 | 2b, 9 to 12 | Designed, not implemented, except the two standalone extensions of phase 12 listed below |
