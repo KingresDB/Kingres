@@ -644,6 +644,72 @@ td_rank(TdState *st, double x)
 	return Min(Max(r, 0.0), 1.0);
 }
 
+/* ---- self_test ---- */
+
+/*
+ * A fixed digest for self_test(): compression 20 (a merging pass every 100
+ * points) fed 600 points from a formula, so that the merging pass, which
+ * decides with asin() of the C library, runs several times.  Results: a hash
+ * of the serialized bytes of the digest, of the union of two such digests
+ * (the union is a second merging pass over the centroids of the other), and
+ * of the bits of a quantile and a rank read from the union, and of td_scale()
+ * at 258 fixed arguments.  Two nodes whose
+ * C libraries round asin() differently give different bytes here, and the
+ * line of self_test() shows it before they exchange stored digests.
+ */
+static TdState *
+td_self_test_digest(int a, int b, double scale)
+{
+	TdState    *st = td_new(20, CurrentMemoryContext);
+	int			i;
+
+	for (i = 1; i <= 600; i++)
+		td_add_point(st, (double) ((i * a) % b) * scale, 1 + (i % 3));
+	return st;
+}
+
+static uint64
+td_self_test_bytes(TdState *st)
+{
+	bytea	   *r = td_serialize(st);
+	uint64		h = ks_hash_bytes64((const uint8 *) VARDATA(r), VARSIZE(r) - VARHDRSZ);
+
+	pfree(r);
+	return h;
+}
+
+void
+tdigest_self_test_values(uint64 *single, uint64 *uni, uint64 *read, uint64 *scale)
+{
+	TdState    *x = td_self_test_digest(7919, 1009, 0.37);
+	TdState    *y = td_self_test_digest(104729, 997, 0.53);
+	double		q;
+	double		rk;
+	uint64		bits[2];
+	double		sc[258];
+	int			i;
+
+	*single = td_self_test_bytes(x);
+	td_merge(x, y);
+	*uni = td_self_test_bytes(x);
+	q = td_quantile(x, 0.99);
+	rk = td_rank(x, 100.0);
+	memcpy(&bits[0], &q, sizeof(q));
+	memcpy(&bits[1], &rk, sizeof(rk));
+	*read = ks_hash_bytes64((const uint8 *) bits, sizeof(bits));
+	/*
+	 * The scale function itself on fixed arguments: the merging pass decides
+	 * on differences of it, and a decision flips only when a difference falls
+	 * on the boundary, which is rare; the bits of asin() show any difference of
+	 * the C library at once.
+	 */
+	for (i = 0; i <= 257; i++)
+		sc[i] = td_scale((double) i / 257.0, 100.0);
+	*scale = ks_hash_bytes64((const uint8 *) sc, sizeof(sc));
+	td_free(x);
+	td_free(y);
+}
+
 /* ---- SQL: the type ---- */
 
 Datum

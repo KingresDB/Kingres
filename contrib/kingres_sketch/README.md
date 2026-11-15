@@ -220,7 +220,9 @@ A sketch is sparse while four bytes per non-zero register are fewer than the
 dense size, so an empty sketch is 4 bytes and a sketch of a few hundred elements
 at precision 14 is a few kilobytes. The in-memory state of an aggregate is a list
 of at most `0.19 * m` entries, and then `m` bytes (16 KB at precision 14, 256 KB
-at precision 18).
+at precision 18). Working memory of a call at precision 18 (a value of 196612
+bytes): `hll_union` of two values and `hll_union_agg` over six values need about
+4 MB more than an idle backend (see "Untrusted input and limits").
 
 The union is the register-wise maximum: it is commutative, associative and
 idempotent, so the union of the sketches of any partition of the rows, with any
@@ -261,12 +263,24 @@ summary of 1000 counters of short items, at most about 104 MB for capacity
 The working memory of a call is more than the value, and is not limited by
 `work_mem`: the detoasted argument, the loaded state, the second state of a union
 and the serialized result exist together. Measured on the largest value (capacity
-100000, items of 1024 bytes, 104 MB), the peak memory of a backend running
-`topn_union` of two such values was 436 MB, 4.4 times the value, including the
-about 40 MB of an idle backend. The decoded state of a counter holds its item in a
-chunk of its exact length. With parallel workers the figure is per worker. A
-capacity and an item length that make such values are allowed; lower the
-capacity if the memory is a concern.`topn_list` returns at most 100000 rows.
+100000, items of 1024 bytes, 104200020 bytes), the peak memory of a backend
+(`VmHWM`, which includes the 15.6 MB of an idle backend; 1 MB is 1048576 bytes):
+
+| Call on the largest value | Peak of the backend | Times the value |
+|---|---|---|
+| `topn_union` of two values with the same items | 436 MB | 4.4 |
+| `topn_union` of two values with different items | 491 MB | 4.9 |
+| `topn_union_agg` over four values with different items | 513 MB | 5.2 |
+| `topn_add_agg` of 100000 distinct items of 1024 bytes | 324 MB | 3.3 |
+| `topn_list` of all counters | 329 MB | 3.3 |
+
+Size a container for about 5.2 times the value plus the idle backend: 540 MB for
+the largest value. The test `007_portable_sketches.pl` measures these calls and
+fails when one needs more than 6.5 times the value. The decoded state of a
+counter holds its item in a chunk of its exact length. With parallel workers the
+figure is per worker. A capacity and an item length that make such values are
+allowed; lower the capacity if the memory is a concern. `topn_list` returns at
+most 100000 rows.
 
 ## tdigest
 
@@ -289,7 +303,20 @@ compression 10000 about 100 KB at most; the aggregate state adds the buffer
 A merge is not exact and not order independent: the union of partial digests
 differs, within the bound, from the digest built by one backend. The
 decisions of the merging pass use the C library's `asin`, so two platforms can
-differ in the last digits of a centroid for the same input.
+differ in the last digits of a centroid for the same input. `self_test()` shows
+it: it builds two fixed digests from a formula, hashes the bytes of one and of
+their union (the union is a second merging pass), and hashes the bits of
+`asin` at 258 fixed arguments, which differ at once if the C library rounds
+differently (a difference of one unit in the last place of `asin` changes the
+hash; it changes a digest only when a merging decision falls on the boundary,
+which is rare, so equal digests on two nodes do not prove equal `asin`, and the
+`tdigest_scale` field is the sharper check).
+
+Working memory of a call: the value, the loaded state and the result exist
+together, so a union of two digests of compression 10000 (a value of about
+100 KB, 320 KB at most) needs about 4 MB more than an idle backend, and
+`tdigest_agg` of 300000 values at compression 10000 about 8 MB more (the buffer
+of the aggregate included). See "Untrusted input and limits".
 
 ## Format
 
@@ -368,9 +395,17 @@ hash-partitioned table, so a change of them between majors would break
 practice. **PostgreSQL does not state this as a promise for every function and
 every major version.** The extension therefore does not rely on it silently:
 `kingres_sketch.self_test()` returns one line with the hash of a fixed value of
-each scalar type, of an array and an estimate over a fixed set, and a node whose line differs (another
-major version that changed a hash function, a different encoding or byte order)
-must not exchange sketches with the others.
+each scalar type, of an array, an estimate over a fixed set, and the hashes of
+the bytes of a fixed `tdigest` and a fixed `topn` (each alone and united with a
+second one) built from a formula. A node whose line differs (another major
+version that changed a hash function, a different encoding or byte order, a C
+library that rounds `asin` differently) must not exchange sketches with the
+others. The fields: `int2` to `uuid` and `int4[]` the hash of a fixed value;
+`hll` the estimate of a fixed set; `tdigest`, `tdigest_union`, `tdigest_read`
+the bytes of a digest, of the union of two, and the bits of a quantile and a
+rank read from it; `tdigest_scale` the bits of the scale function (`asin`) at
+258 arguments; `topn`, `topn_union` the bytes of a summary and of the union of
+two. The line is the same on PostgreSQL 18 and 19 (checked by the tests).
 
 What follows from this choice:
 
@@ -415,6 +450,7 @@ crash or a read past the value. `pg_input_is_valid` works on all three types.
 | tdigest compression | 10 to 10000 |
 | tdigest weight | 1 to 2^63 - 1; the total must fit in a `bigint` |
 | largest value | hll 196612 bytes, topn about 104 MB, tdigest about 320 KB |
+| working memory of a call on the largest value (peak of the backend, an idle backend is 15.6 MB) | hll: about 4 MB over an idle backend (unions of precision 18, the aggregate over six values); topn: up to 513 MB, 5.2 times the value (`topn_union_agg` over values with different items; see the section "topn"); tdigest: about 4 MB over an idle backend for unions at compression 10000, 8 MB for `tdigest_agg` of 300000 values |
 | counts | `bigint`; an overflow is `22003` |
 
 ## Security notes
@@ -494,6 +530,10 @@ margin of 2.
 
 ## Limits and known behaviour
 
+- The working memory of a call is several times the value for `topn` (up to 5.2
+  times for `topn_union_agg` over values of the largest size, 513 MB for 104 MB
+  values) and a few MB over an idle backend for `hll` and `tdigest`; see the
+  tables in "topn" and "Untrusted input and limits".
 - Sketches of different precision, capacity or compression cannot be united
   directly. Only an `hll` can be folded to a lower precision.
 - The estimate of `hll` is not exact; the estimate of a union equals the estimate

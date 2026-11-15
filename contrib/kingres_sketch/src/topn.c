@@ -831,6 +831,55 @@ check_capacity(int32 k)
 	return k;
 }
 
+/* ---- self_test ---- */
+
+/*
+ * A fixed summary for self_test(): capacity 30, 1500 items of a formula over
+ * about 110 distinct strings, so that counters are replaced and merged.
+ * Results: a hash of the serialized bytes of one summary and of the union of
+ * two.  The bytes depend on the tie-breaking order of the items, which is a
+ * byte comparison, and on hash_bytes (bucket order), so a node that differs
+ * shows here.
+ */
+static TnState *
+tn_self_test_summary(int a, int b)
+{
+	TnState    *st = tn_new(30, CurrentMemoryContext);
+	char		item[32];
+	int			i;
+
+	for (i = 1; i <= 1500; i++)
+	{
+		int			len = snprintf(item, sizeof(item), "item%d", (i * a) % b);
+
+		tn_add(st, item, (uint32) len);
+	}
+	return st;
+}
+
+static uint64
+tn_self_test_bytes(TnState *st)
+{
+	bytea	   *r = tn_serialize(st);
+	uint64		h = ks_hash_bytes64((const uint8 *) VARDATA(r), VARSIZE(r) - VARHDRSZ);
+
+	pfree(r);
+	return h;
+}
+
+void
+topn_self_test_values(uint64 *single, uint64 *uni)
+{
+	TnState    *x = tn_self_test_summary(37, 113);
+	TnState    *y = tn_self_test_summary(101, 109);
+
+	*single = tn_self_test_bytes(x);
+	tn_merge(x, y);
+	*uni = tn_self_test_bytes(x);
+	tn_free(x);
+	tn_free(y);
+}
+
 /* ---- SQL: the type ---- */
 
 Datum

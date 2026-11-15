@@ -34,11 +34,11 @@ is created if it does not exist. Every object of the extension is in it.
 `CREATE EXTENSION` needs a superuser, because it creates two event triggers.
 
 EXECUTE on every function is revoked from `PUBLIC` (the pure helpers and the
-functions that row-level security calls excepted). An administrator grants it
+functions that the views call excepted). An administrator grants it
 to the roles that should use the functions that act on one's own tables. The
-policy and history tables are readable by every role that has USAGE on the
-schema, each role seeing the rows of the tables it owns (row-level security,
-judged by `current_user`):
+policy and history are readable by every role that has USAGE on the schema,
+through views that show each role the rows of the tables it owns (judged by
+`current_user`):
 
 ```sql
 GRANT USAGE ON SCHEMA kingres TO app_owner;
@@ -121,14 +121,20 @@ nothing is renamed or overwritten.
 
 ### Tables and view
 
-The tables are owned by the extension owner and are dumped with the extension's
-configuration (`pg_dump` carries the policies and the history; the sequence
-behind `run_id` too; the lock table is not dumped). Every role with USAGE on
-the schema may read the policy and history tables and may write the policy
-table, but row-level security shows it, and lets it change, only the rows of
-tables it owns, judged by `current_user`. A role that writes a policy row
-directly gets the same checks as `timepart_set_policy`, and a trigger pins what
-only the extension decides: `parent_oid`, `created_by`, `created_at`, and
+The data is in three base tables, `kingres.timepart_policy_data`,
+`kingres.timepart_run_data` and `kingres.timepart_run_action_data`, owned by
+the extension owner, which grant nothing to `PUBLIC` and have no row-level
+security. They are dumped with the extension's configuration (`pg_dump`
+carries the policies and the history; the sequence behind `run_id` too; the
+lock table is not dumped). Roles use the views `kingres.timepart_policy`,
+`kingres.timepart_run` and `kingres.timepart_run_action`, which are what the
+rest of this document calls "the policy table" and "the history tables".
+Every role with USAGE on the schema may read the views, and may write
+`timepart_policy`, but a view shows it, and lets it change, only the rows of
+tables it owns, judged by `current_user` (a superuser sees every row). See
+"Security" for why views and not row-level security. A role that writes a
+policy row directly gets the same checks as `timepart_set_policy`, and a
+trigger pins what only the extension decides: `parent_oid`, `created_by`, `created_at`, and
 `table_owner` (renewed only when the policy is written again by a role that
 owns the table now). The history tables cannot be written by anyone but the
 extension. `kingres.timepart_lock` has one row per table, is private to the
@@ -324,13 +330,33 @@ function or procedure (checked by the test `timepart_retention`).
   as the superuser: that is PostgreSQL's rule, not something an extension can
   change.) `SECURITY DEFINER` is used by the two event
   trigger functions only; they take no decision about a caller.
-- **Policy and history tables.** Row-level security shows a role the rows of
-  the tables it owns, by `current_user`. A role can write the policy row of its
-  own table directly, and then a trigger applies the same checks as
+- **Policy and history tables.** The base tables (`*_data`) grant nothing to
+  `PUBLIC` and have no row-level security; roles reach them through
+  `security_barrier` views owned by the extension owner, whose condition
+  (`timepart__visible`) shows a role the rows of the tables it owns, by
+  `current_user`. PostgreSQL checks the privileges on the base table against the
+  owner of the view, while a function in the view's condition runs as the caller,
+  so `current_user` is the role whose privileges apply, also inside a
+  `SECURITY DEFINER` function of another role (tested). The views are not
+  `security_invoker` (the caller has no right on the base tables).
+  `security_barrier` keeps a function that the caller puts in a `WHERE` clause
+  from seeing a row before the condition has hidden it (tested with a function
+  that reports what it sees), and `WITH CASCADED CHECK OPTION` on the policy
+  view refuses a write that would make a row the view does not show. A role can
+  write the policy row of its own table directly (through the view), and then a trigger applies the same checks as
   `timepart_set_policy` and pins `parent_oid`, `created_by`, `created_at` and
   `table_owner`, so a role cannot make a policy for a table it does not own or
   put another table's OID in the hint. A superuser (the extension's own code, a
-  restore) is trusted. The history tables are read-only for roles.
+  restore) is trusted. The history views are read-only for roles.
+- **Why views and not row-level security.** `pg_dump` runs with
+  `row_security = off`, and PostgreSQL allows that only to a superuser, to the
+  owner of the table and to a role with `BYPASSRLS`. A role that reads every
+  table through `pg_read_all_data` is none of them, so with row-level security
+  on the policy table the dump of the whole database by a least-privilege backup
+  role stops with "query would be affected by row-level security policy". The
+  base tables have no row-level security, so that role reads them as it reads
+  any table. What the backup role may do is stated in "Dump, restore, rename,
+  drop".
 - **DDL on user tables** (`create_time_partitions`, `drop_old_time_partitions`,
   `timepart_create_one`, `timepart_retire_one`) is `SECURITY INVOKER`: PostgreSQL
   checks every statement against the caller. They also check ownership first,
@@ -440,8 +466,20 @@ would be converted as kind `convert`. `convert_partition` and
 
 ## Dump, restore, rename, drop
 
-Policies and history are in `pg_dump` output of the database (the three tables
-and the sequence of `run_id` are extension configuration). After a restore the
+Policies and history are in `pg_dump` output of the database (the three base
+tables and the sequence of `run_id` are extension configuration).
+
+**Who may dump and restore.** A dump needs a role that can read the base tables:
+a superuser, or any role that can read every table of the database, such as a
+member of `pg_read_all_data` (no `BYPASSRLS` is needed, and no row-level
+security is in the way). A database owner that is not a member of
+`pg_read_all_data` is refused like any role that does not own the tables, with
+"permission denied for table timepart_policy_data"; add it to the role or use
+another. A dump by a superuser and a dump by a member of `pg_read_all_data` are
+identical. The restore needs a superuser, as `CREATE EXTENSION kingres_timepart`
+does, and the restore writes the policies as they were (the trigger that pins
+`created_by` and the other columns trusts a superuser only); a database owner
+that is not a superuser is refused. (Tests: `003_dump_restore.pl`.) After a restore the
 OID in a policy is stale; the table is found by name and the hint is refreshed
 by the next run. A run that was `running` in the dump is marked `interrupted` by
 the next begin on its table, because its backend (pid and start time) is not alive.
@@ -454,7 +492,7 @@ stays). A rename of the schema is not followed: the policy becomes an orphan,
 reported by `timepart_check`, and has to be set again.
 
 `DROP EXTENSION kingres_timepart` removes the event triggers, the functions and
-procedures, the view, and the tables with the policies and the whole history
+procedures, the views, and the tables with the policies and the whole history
 (without a warning: dump them first if the history matters). The partitions and
 tables of the users stay, as ordinary tables, and so do detached partitions. It
 leaves the schema `kingres`: `CREATE EXTENSION` created the schema because the
@@ -539,8 +577,10 @@ The design is `kingres/docs/design/analytics-phase12-storage.md`, section 4.4 an
    set, for the `owner_changed` rule (design 12, item V20): the simple form, the
    owner at run time must be the one recorded.
    The policy and history tables are not private to the extension owner as the
-   design says: row-level security and a trigger let a role read and write the
-   rows of the tables it owns, which makes `timepart_set_policy` and the other
+   design says: views and a trigger let a role read and write the
+   rows of the tables it owns (the data is in the tables `timepart_policy_data`,
+   `timepart_run_data` and `timepart_run_action_data`, the views carry the
+   names the design gives the tables), which makes `timepart_set_policy` and the other
    owner-facing functions `SECURITY INVOKER` (the design had `SECURITY DEFINER`
    functions that decide the caller; that cannot be done correctly, because
    inside such a function the caller's `current_user` is not available).
@@ -583,7 +623,9 @@ Every one passes an `as_of` time; none reads the clock. `t/` holds the TAP tests
 `001_locks.pl` (a long transaction holding the parent, readers and writers,
 one run per table, a role that holds advisory locks, a foreign key), `002_interrupt.pl` (a backend killed and the server
 crashed in the middle of a run, then repeated) and `003_dump_restore.pl`
-(`pg_dump` and restore, then a run).
+(`pg_dump` and restore by a superuser, a role with only `pg_read_all_data` and a
+database owner, then a run; a restore by a role that is not a superuser is
+refused; the extension in a database whose schema `kingres` exists already).
 
 Build and test against a KingresDB installation, out of tree:
 
