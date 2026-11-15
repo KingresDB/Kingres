@@ -169,4 +169,19 @@ typedef struct pg_result KsRawResult;
 #define KS_LIBPQ_RESULTS_OWNED_BY_CONTEXT false
 #endif
 
+/*
+ * Which ON CONFLICT actions a statement may have to be shipped to another node.
+ * PostgreSQL 19 adds ON CONFLICT DO SELECT (ONCONFLICT_SELECT), which returns
+ * rows of the conflicting tuples and is not designed for this extension yet: it
+ * is refused until it is.  The list names the two actions that exist on every
+ * major (and ONCONFLICT_NONE, which a statement without ON CONFLICT may carry),
+ * so a new one is refused whatever the major.
+ */
+static inline bool
+ks_onconflict_action_shippable(OnConflictAction action)
+{
+	return action == ONCONFLICT_NONE || action == ONCONFLICT_NOTHING ||
+		action == ONCONFLICT_UPDATE;
+}
+
 #endif							/* KINGRES_SHARD_PG_COMPAT_H */

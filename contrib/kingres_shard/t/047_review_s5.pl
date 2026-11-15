@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PostgreSQL
+# SPDX-License-Identifier: AGPL-3.0-only
 # Portions Copyright (c) 2026, RooyeKhat Media Co
 #
 # t/047_review_s5.pl
@@ -213,7 +213,7 @@ sub as_role
 	$n2->safe_psql('postgres', q{SET kingres_shard.enable_routing = off; UPDATE kingres.cluster_secret SET secret = decode(repeat('ab', 40), 'hex')});
 	my ($rc, $out, $err) = run_sql($n1, q{SELECT count(*) FROM public.d}, extra_params => [ '-U', 'alice' ]);
 	isnt($rc, 0, 'a scan that needs the node fails');
-	like($err, qr/node \S+:\d+ runs kingres_shard 0\.3, this node runs 0\.4/, 'S5-02: and the message names the version of the node');
+	like($err, qr/node \S+:\d+ runs kingres_shard 0\.3, this node runs 0\.5/, 'S5-02: and the message names the version of the node');
 }
 
 # ---------------------------------------------------------------------------

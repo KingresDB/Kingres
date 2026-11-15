@@ -26,7 +26,7 @@
  *	bucket_move.c the primitives of moving a bucket between shard groups:
  *				 control connections, the switch, attach and detach
  *
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only
  * Portions Copyright (c) 2026, RooyeKhat Media Co
  *
  * IDENTIFICATION
@@ -46,6 +46,7 @@
 #include "dist_scan.h"
 #include "fanout.h"
 #include "forward_auth.h"
+#include "ha.h"
 #include "kingres_shard.h"
 #include "node_conn.h"
 #include "planner.h"
@@ -73,6 +74,8 @@ int			kingres_shard_move_catchup_threshold = 1024;	/* kB */
 int			kingres_shard_move_switch_timeout = 10000;	/* ms */
 int			kingres_shard_move_switch_attempts = 20;
 int			kingres_shard_move_cleanup_delay = 600;	/* s */
+int			kingres_shard_deadlock_check_interval = 2;
+int			kingres_shard_deadlock_confirm_delay = 200;	/* ms */
 
 /*
  * _PG_init
@@ -219,6 +222,23 @@ _PG_init(void)
 							PGC_USERSET, GUC_UNIT_S,
 							NULL, NULL, NULL);
 
+	/* Distributed deadlock detection (ha-phase5.md, part C). */
+	DefineCustomIntVariable("kingres_shard.deadlock_check_interval",
+							"Seconds between passes of the distributed deadlock detector; 0 disables.",
+							"The recovery worker of the map group primary collects the wait-for edges of every primary this often and cancels the youngest transaction of a cycle that spans nodes.",
+							&kingres_shard_deadlock_check_interval,
+							2, 0, 3600,
+							PGC_SIGHUP, GUC_UNIT_S,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("kingres_shard.deadlock_confirm_delay",
+							"Time between the two readings of the wait-for graph that confirm a distributed deadlock.",
+							"A cycle is cancelled only if the same waits are found again this long after they were first seen.",
+							&kingres_shard_deadlock_confirm_delay,
+							200, 10, 60000,
+							PGC_SIGHUP, GUC_UNIT_MS,
+							NULL, NULL, NULL);
+
 	MarkGUCPrefixReserved("kingres_shard");
 
 	/* Two-phase commit needs prepared transactions on every node. */
@@ -228,6 +248,7 @@ _PG_init(void)
 				 errhint("Transactions that write on several nodes need max_prepared_transactions greater than zero on every node.")));
 
 	kingres_shard_fault_init();
+	kingres_shard_ha_init();
 	kingres_shard_catalog_init();
 	kingres_shard_conn_init();
 	kingres_shard_recovery_init();

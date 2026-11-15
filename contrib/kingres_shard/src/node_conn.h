@@ -4,7 +4,7 @@
  *	  libpq connections to other nodes of the cluster and the remote
  *	  transactions that ride on them.
  *
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only
  * Portions Copyright (c) 2026, RooyeKhat Media Co
  *
  * IDENTIFICATION
@@ -18,6 +18,7 @@
 #include "postgres.h"
 
 #include "pg_compat.h"
+#include "nodes/pg_list.h"
 
 /* Maximum lengths of the parts of a connection cache key. */
 #define KS_CONN_HOST_LEN 256
@@ -68,6 +69,7 @@ extern void kingres_shard_report_error(KsConn *kc, PGresult *res,
 										const char *sql);
 extern int	kingres_shard_result_sqlstate(PGresult *res);
 extern void kingres_shard_forget_xact(KsConn *kc);
+extern void kingres_shard_conn_drop_stale(List *nodes);
 
 /*
  * Two-phase commit (design/shard-phase2a.md, section 1).  A connection that

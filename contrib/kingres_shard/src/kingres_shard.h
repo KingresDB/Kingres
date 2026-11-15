@@ -5,7 +5,7 @@
  *	  extension: constants, the error code of a stale map and the GUC
  *	  variables.
  *
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only
  * Portions Copyright (c) 2026, RooyeKhat Media Co
  *
  * IDENTIFICATION
@@ -22,7 +22,7 @@
 #include "fmgr.h"
 
 /* The version of the extension this library belongs to (the SQL objects of every node must match). */
-#define KINGRES_SHARD_EXT_VERSION "0.4"
+#define KINGRES_SHARD_EXT_VERSION "0.5"
 #include "nodes/params.h"
 #include "nodes/parsenodes.h"
 #include "nodes/plannodes.h"
@@ -88,6 +88,8 @@ extern PGDLLIMPORT int kingres_shard_move_catchup_threshold;
 extern PGDLLIMPORT int kingres_shard_move_switch_timeout;
 extern PGDLLIMPORT int kingres_shard_move_switch_attempts;
 extern PGDLLIMPORT int kingres_shard_move_cleanup_delay;
+extern PGDLLIMPORT int kingres_shard_deadlock_check_interval;
+extern PGDLLIMPORT int kingres_shard_deadlock_confirm_delay;
 
 extern bool kingres_shard_check_node_conninfo(char **newval, void **extra,
 											   GucSource source);

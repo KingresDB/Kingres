@@ -35,7 +35,7 @@
  * of a distributed table (the remote values would mean nothing here), and
  * PlaceHolderVars computed on the table.
  *
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only
  * Portions Copyright (c) 2026, RooyeKhat Media Co
  *
  * IDENTIFICATION
@@ -325,6 +325,17 @@ ds_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	}
 	if (best == NULL)
 		return;
+
+	/*
+	 * A node that the catalog does not call the primary of its group (the old
+	 * primary after promote_node(), or a node whose group is not known) owns
+	 * no bucket, but its partitions of the table may still be there.  They are
+	 * a stale copy of what the group's primary holds: the local part of the
+	 * scan reads nothing, and every group is asked.
+	 */
+	if (cat->local_group_id < 0)
+		best = (Path *) create_group_result_path(root, rel, rel->reltarget,
+										   list_make1(makeBoolConst(false, false)));
 
 	for (b = 0; b < dt->coloc->bucket_count; b++)
 		if (dt->coloc->bucket_group[b] == cat->local_group_id)

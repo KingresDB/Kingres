@@ -14,7 +14,7 @@
  * commits can leave a node with a stale catalog, which a later
  * sync_catalog() repairs.  Phase 2 replaces it with two-phase commit.
  *
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only
  * Portions Copyright (c) 2026, RooyeKhat Media Co
  *
  * IDENTIFICATION
@@ -599,6 +599,104 @@ create_tables_on_node(KsConn *kc)
 }
 
 /*
+ * One value of a one-row result from a session on host:port, or NULL when the
+ * node cannot be asked.  Used on throwaway sessions, outside the transaction.
+ */
+static char *
+ask_node(const char *host, int port, const char *sql, char **err_out)
+{
+	char	   *local_err = NULL;
+	PGconn	   *conn;
+	PGresult   *res;
+	char	   *value = NULL;
+
+	if (err_out == NULL)
+		err_out = &local_err;
+	conn = kingres_shard_connect_control(host, port, err_out);
+	if (conn == NULL)
+		return NULL;
+	res = kingres_shard_bounded_exec(conn, sql, true);
+	if (res != NULL && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1 &&
+		!PQgetisnull(res, 0, 0))
+		value = pstrdup(PQgetvalue(res, 0, 0));
+	else
+		*err_out = pstrdup(PQerrorMessage(conn));
+	PQclear(res);
+	PQfinish(conn);
+	return value;
+}
+
+/*
+ * check_standby_node
+ *
+ * A standby is registered as a node that owns nothing and is skipped by
+ * routing and synchronization, so nothing breaks on the primaries whatever its
+ * state; what is checked is that the address is the right kind of node when the
+ * node can be asked.  A standby that is not reachable (it is being built, or it
+ * is down) is registered with a warning: "registered but not streaming" is a
+ * state the cluster has to live with (kingres.check_cluster() reports it).  A
+ * node that answers must be in recovery, run the PostgreSQL major of this node,
+ * and be a copy of the primary of its group (the same system identifier).
+ */
+static void
+check_standby_node(const char *host, int port, int group_id)
+{
+	const KsNode *primary = kingres_shard_group_primary(group_id);
+	char	   *err = NULL;
+	char	   *state;
+	char	   *sysid_sb;
+	char	   *sysid_pr;
+	char	   *major;
+
+	/*
+	 * The session proves itself with a token made for the node id the standby
+	 * holds as its own, which is the id of its primary until it is promoted.
+	 */
+	if (primary != NULL)
+		kingres_shard_conn_expect_node(host, port, primary->node_id);
+	state = ask_node(host, port, "SELECT pg_catalog.pg_is_in_recovery()::pg_catalog.text", &err);
+	if (state == NULL && err != NULL &&
+		strstr(err, "claims to have been opened by another node of the cluster") != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("node %s:%d is not a copy of the primary of group %d",
+						host, port, group_id),
+				 errdetail("The node did not accept a session of this cluster: it holds another cluster secret, or another node id.")));
+	if (state == NULL)
+	{
+		ereport(WARNING,
+				(errmsg("standby %s:%d could not be reached; it is registered anyway", host, port),
+				 errdetail_internal("%s", err ? err : ""),
+				 errhint("kingres.check_cluster() reports a standby that is not reachable or not streaming.")));
+		return;
+	}
+	if (strcmp(state, "true") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("node %s:%d is not in recovery, so it is not a standby", host, port),
+				 errhint("Register a standby that replicates from the primary of group %d.", group_id)));
+	major = ask_node(host, port, "SELECT (pg_catalog.current_setting('server_version_num')::pg_catalog.int4 / 10000)::pg_catalog.text", NULL);
+	if (major != NULL && atoi(major) != kingres_shard_server_major())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("node %s:%d runs PostgreSQL %s, this node runs PostgreSQL %d",
+						host, port, major, kingres_shard_server_major())));
+	if (primary != NULL)
+	{
+		sysid_sb = ask_node(host, port, "SELECT system_identifier::pg_catalog.text FROM pg_catalog.pg_control_system()", NULL);
+		sysid_pr = ask_node(primary->host, primary->port,
+							"SELECT system_identifier::pg_catalog.text FROM pg_catalog.pg_control_system()", NULL);
+		if (sysid_sb != NULL && sysid_pr != NULL && strcmp(sysid_sb, sysid_pr) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("node %s:%d is not a copy of the primary of group %d (node %d)",
+							host, port, group_id, primary->node_id),
+					 errdetail("The system identifier of the node is %s, that of the primary %s.",
+							   sysid_sb, sysid_pr)));
+	}
+}
+
+/*
  * record_pending_node
  *
  * Remember, in a transaction of its own that commits at once, that add_node()
@@ -740,6 +838,9 @@ kingres_add_node(PG_FUNCTION_ARGS)
 						 errmsg("group %d has no primary node", group_id)));
 		}
 	}
+
+	if (!is_primary)
+		check_standby_node(host, port, group_id);
 
 	spi_run("SELECT coalesce(max(node_id), 0) + 1 FROM " KINGRES_SHARD_SCHEMA ".node",
 			SPI_OK_SELECT, 0, NULL, NULL);
@@ -900,6 +1001,7 @@ kingres_remove_node(PG_FUNCTION_ARGS)
 	int			port;
 	int			group_id;
 	bool		reset_remote;
+	bool		node_is_primary;
 	bool		isnull;
 	int			nbuckets;
 
@@ -919,6 +1021,7 @@ kingres_remove_node(PG_FUNCTION_ARGS)
 	host = pstrdup(n->host);
 	port = n->port;
 	group_id = n->group_id;
+	node_is_primary = n->is_primary;
 	reset_remote = n->is_primary && n->is_active;
 
 	if (SPI_connect() != SPI_OK_CONNECT)
@@ -930,7 +1033,24 @@ kingres_remove_node(PG_FUNCTION_ARGS)
 	nbuckets = (int) DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
 												 SPI_tuptable->tupdesc, 1,
 												 &isnull));
-	if (nbuckets > 0)
+	/*
+	 * A standby owns nothing: it can be removed whatever its group holds, and
+	 * its removal changes nothing for routing.  A primary that still has
+	 * standbys registered cannot go before them.
+	 */
+	if (node_is_primary)
+	{
+		spi_run("SELECT node_id FROM " KINGRES_SHARD_SCHEMA ".node "
+				"WHERE group_id = $1 AND role = 'standby' LIMIT 1",
+				SPI_OK_SELECT, 1, argtypes, values);
+		if (SPI_processed > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_IN_USE),
+					 errmsg("cannot remove node %d: shard group %d still has the standby node %d",
+							node_id, group_id, spi_first_int(0)),
+					 errhint("Remove the standbys of the group first.")));
+	}
+	if (node_is_primary && nbuckets > 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
 				 errmsg("cannot remove node %d: its shard group %d owns %d buckets",
@@ -938,7 +1058,7 @@ kingres_remove_node(PG_FUNCTION_ARGS)
 				 errhint("Move the buckets to other groups first with kingres.move_bucket(); kingres.rebalance_plan() lists the moves that empty a group when its should_have_shards is false.")));
 
 	/* A group that takes part in an unfinished move of a bucket cannot go. */
-	if (OidIsValid(kingres_shard_catalog_relid("bucket_move")))
+	if (node_is_primary && OidIsValid(kingres_shard_catalog_relid("bucket_move")))
 		spi_run("SELECT m.move_id FROM " KINGRES_SHARD_SCHEMA ".bucket_move m "
 				"WHERE (m.source_group = $1 OR m.target_group = $1) "
 				"AND m.phase IN ('preparing', 'copying', 'catching_up', 'switching', 'cleaning') "
