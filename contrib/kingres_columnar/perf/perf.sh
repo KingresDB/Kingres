@@ -22,7 +22,7 @@
 # build; the sizes are.
 #
 # Portions Copyright (c) 2026, RooyeKhat Media Co
-# SPDX-License-Identifier: PostgreSQL
+# SPDX-License-Identifier: AGPL-3.0-only
 
 set -euo pipefail
 

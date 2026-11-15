@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # ADR 0019: Control-plane state lives in a system database with embedded migrations
 
 - Status: Accepted

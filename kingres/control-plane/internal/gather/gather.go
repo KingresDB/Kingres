@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package gather answers the cluster-wide reads (logs, alerts, metrics) from
 // any server: the receiving server asks every other server of the cluster in

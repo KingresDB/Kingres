@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package webui serves the management panel: the files of the dist directory,
 // embedded into the binary, with a single-page-app fallback. The web build

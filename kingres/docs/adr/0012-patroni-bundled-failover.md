@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # ADR 0012: Patroni bundled as the failover engine
 
 - Status: Superseded by [ADR 0021](0021-failover-in-kingresd.md)

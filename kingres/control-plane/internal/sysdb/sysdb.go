@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package sysdb creates and upgrades the schema kingres_cp of the system
 // database kingres_system with versioned SQL migrations embedded in the

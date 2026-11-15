@@ -1,5 +1,5 @@
 -- Portions Copyright (c) 2026, RooyeKhat Media Co
--- SPDX-License-Identifier: PostgreSQL
+-- SPDX-License-Identifier: AGPL-3.0-only
 --
 -- columnar_basic: create, insert (single row, multi-row, INSERT SELECT, COPY,
 -- CREATE TABLE AS), the codecs, transactions, savepoints, visibility,

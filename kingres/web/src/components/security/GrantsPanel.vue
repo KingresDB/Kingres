@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
 // Grant matrix for one role on one database: rows are the database, its schemas and tables,

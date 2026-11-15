@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # ADR 0005: WSL2 as the build environment
 
 - Status: Accepted

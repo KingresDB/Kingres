@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package peers keeps the directory of the other servers of the cluster: for
 // every server id (the host name registered in the shard catalog and the

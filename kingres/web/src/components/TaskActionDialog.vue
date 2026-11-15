@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
 // A dialog for an operation that answers 202 + Task: it first states the consequence (default

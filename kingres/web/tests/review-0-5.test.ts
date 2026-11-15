@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // The findings of the second independent review (kingres/docs/reviews/2026-11-15-web-panel-0.5.md,

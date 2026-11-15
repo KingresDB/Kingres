@@ -1,4 +1,4 @@
--- SPDX-License-Identifier: PostgreSQL
+-- SPDX-License-Identifier: AGPL-3.0-only
 -- Portions Copyright (c) 2026, RooyeKhat Media Co
 --
 -- reference.sql: pg_regress test of kingres_shard 0.2 (purpose below).

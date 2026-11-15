@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // W-12: a task is not polled in a hidden tab, and polling goes on when the tab is shown again.

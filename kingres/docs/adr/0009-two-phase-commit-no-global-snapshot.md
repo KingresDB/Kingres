@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # ADR 0009: 2PC without a global snapshot at first
 
 - Status: Accepted

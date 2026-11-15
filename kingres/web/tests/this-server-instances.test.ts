@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // Start, stop and restart of the local instances (contract 0.4.0): the buttons follow the state

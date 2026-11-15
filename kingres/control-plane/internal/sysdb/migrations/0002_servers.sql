@@ -1,4 +1,4 @@
--- SPDX-License-Identifier: PostgreSQL
+-- SPDX-License-Identifier: AGPL-3.0-only
 -- kingres_cp 2: servers that join or are added (design: control-plane-3.md, D4 and D5).
 -- Applied inside one transaction by internal/sysdb; do not add BEGIN/COMMIT.
 

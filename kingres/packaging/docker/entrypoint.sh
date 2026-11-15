@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: PostgreSQL
+# SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (c) 2026, RooyeKhat Media Co
 #
 # Entry point of the KingresDB image (run by tini as the main process).

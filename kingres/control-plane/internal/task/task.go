@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package task is the task engine of kingresd (design control-plane-2.md,
 // D4). A task is a row in kingres_cp.task executed by the manager leader as

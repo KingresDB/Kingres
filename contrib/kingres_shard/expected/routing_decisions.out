@@ -2,7 +2,7 @@
 --   Routing decisions that need no second server (review 2026-11-14: finding 1,
 --   finding 2, S-D).
 --
--- SPDX-License-Identifier: PostgreSQL
+-- SPDX-License-Identifier: AGPL-3.0-only
 -- Portions Copyright (c) 2026, RooyeKhat Media Co
 --
 -- The cluster has a second shard group that does not exist as a server: the

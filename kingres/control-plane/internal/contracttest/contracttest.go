@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package contracttest validates real responses against the schemas of the
 // REST contract (kingres/api/openapi.yaml) with a JSON Schema 2020-12

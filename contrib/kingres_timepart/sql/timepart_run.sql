@@ -4,7 +4,7 @@
 -- kingres_columnar, daylight saving, naive keys, failed runs, history.
 --
 -- Portions Copyright (c) 2026, RooyeKhat Media Co
--- SPDX-License-Identifier: PostgreSQL
+-- SPDX-License-Identifier: AGPL-3.0-only
 
 SET timezone = 'UTC';
 SET datestyle = ISO;

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // Client-side checks that mirror the constraints in the OpenAPI contract, so users get an answer

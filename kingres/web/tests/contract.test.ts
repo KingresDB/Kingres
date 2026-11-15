@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 // @vitest-environment node
 //
@@ -70,7 +70,7 @@ describe('source headers', () => {
     return out
   }
 
-  it('start with an SPDX-License-Identifier: PostgreSQL comment', () => {
+  it('start with an SPDX-License-Identifier: AGPL-3.0-only comment', () => {
     const files = [
       ...walk(join(root, 'src')),
       ...walk(join(root, 'tests')),
@@ -86,7 +86,7 @@ describe('source headers', () => {
             .split('\n')
             .slice(0, 3)
             .join('\n')
-            .includes('SPDX-License-Identifier: PostgreSQL'),
+            .includes('SPDX-License-Identifier: AGPL-3.0-only'),
       )
       .map((f) => relative(root, f))
     expect(missing).toEqual([])

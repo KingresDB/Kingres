@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: PostgreSQL
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Regenerates kingres/verifier/testdata/fixtures from a real KingresDB server
 # with the kingres_ledger extension. Run it inside WSL2 (distribution

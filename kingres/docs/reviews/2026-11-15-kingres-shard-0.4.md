@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # Adversarial review: contrib/kingres_shard 0.4 (fix round for the reviews of 0.3 and of the 0.2 fixes)
 
 Reviewer: independent (not the author of the code, not the reviewer of the earlier

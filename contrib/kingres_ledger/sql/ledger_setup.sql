@@ -6,7 +6,7 @@
 -- from kingres_ledger.conf.  The TAP tests cover the workers.
 --
 -- Portions Copyright (c) 2026, RooyeKhat Media Co
--- SPDX-License-Identifier: PostgreSQL
+-- SPDX-License-Identifier: AGPL-3.0-only
 ALTER SYSTEM SET kingres_ledger.block_interval = 0;
 SELECT pg_reload_conf();
 SELECT pg_sleep(1);

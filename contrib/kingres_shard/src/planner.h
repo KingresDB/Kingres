@@ -3,7 +3,7 @@
  * planner.h
  *	  The routing decision made in the planner hook.
  *
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only
  * Portions Copyright (c) 2026, RooyeKhat Media Co
  *
  * IDENTIFICATION

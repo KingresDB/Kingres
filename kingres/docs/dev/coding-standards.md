@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # Coding standards
 
 These standards apply to all KingresDB code. Each rule names the tool or review step that enforces it. A rule without an enforcing tool is checked in code review.
@@ -102,7 +102,7 @@ The rule of thumb: KingresDB C code must look like PostgreSQL C code. A reviewer
    *    In-memory cache of kingres.bucket_map and the lookup functions
    *    that turn a distribution key into a group.
    *
-   * SPDX-License-Identifier: PostgreSQL
+   * SPDX-License-Identifier: AGPL-3.0-only
    * Copyright (c) 2026, KingresDB contributors
    *
    * IDENTIFICATION
@@ -203,11 +203,11 @@ Tool version in use today: Node.js `v24.22.1`.
 - **Comments say why.** A comment that repeats the code is deleted. A comment that records a constraint, an upstream behaviour, a failure mode or a decision is required.
 - **No secrets in the repository.** No passwords, tokens, private keys, certificates with private keys, or connection strings with credentials, including in tests and examples. Test credentials are generated at test time. Enforced by: a secret-scanning step in CI and pre-commit (tool to be decided); review.
 - **Licences.**
-  - KingresDB's own code is under the PostgreSQL License, the same as upstream. The upstream `COPYRIGHT` file stays unchanged. A KingresDB copyright notice is added separately; its exact form is to be settled with the legal review named in the architecture document.
+  - KingresDB's own code is under the GNU Affero General Public License, version 3 only ([ADR 0024](../adr/0024-agpl-for-kingresdb-code.md)); PostgreSQL's code stays under the PostgreSQL License. The upstream `COPYRIGHT` file stays unchanged; `kingres/COPYRIGHT` says which licence covers which part. The legal review named in the architecture document has not been done.
   - Citus is licensed under AGPL-3 (architecture document, "The key decision"). Do not copy, translate or closely paraphrase Citus code, tests or comments. Use Citus documentation and the published architecture only as a source of concepts. If you are unsure whether something is a concept or code, ask before writing it.
-  - The same caution applies to any other code whose licence is not compatible with the PostgreSQL License. A third-party file copied into the tree keeps its own licence header and is listed in a `THIRD-PARTY` note (the file will be created with the first such import).
+  - The same caution applies to any other code: third-party code is not copied into KingresDB without a decision of its own, whatever its licence (ADR 0024, point 6), and a dependency must have a licence that can be combined with AGPL-3.0. A third-party file copied into the tree keeps its own licence header and is listed in a `THIRD-PARTY` note (the file will be created with the first such import).
   - Code taken from upstream PostgreSQL keeps its upstream header.
-- **SPDX header.** Every new KingresDB source file starts with `SPDX-License-Identifier: PostgreSQL` in the first comment (in the form that the file type allows: `/* */` in C, `--` in SQL, `//` in Go and TypeScript, `<!-- -->` in Markdown, `#` in scripts and YAML). Add `Copyright (c) <year>, KingresDB contributors` after it in source files. Files copied from upstream and edited are not re-headed. Enforced by: a header check in CI (to be written).
+- **SPDX header.** Every new KingresDB source file starts with `SPDX-License-Identifier: AGPL-3.0-only` in the first comment (in the form that the file type allows: `/* */` in C, `--` in SQL, `//` in Go and TypeScript, `<!-- -->` in Markdown, `#` in scripts and YAML). Add `Copyright (c) <year>, KingresDB contributors` after it in source files. Files copied from upstream and edited are not re-headed. Enforced by: a header check in CI (to be written).
 - **Commit messages.** One logical change per commit. Core patches follow the extra rules in [core-patches.md](core-patches.md).
 - **Platform.** C code is built and tested in WSL2 (Ubuntu 24.04) on the Windows 11 developer machine; Go and Node.js build natively on Windows. Code must not assume either platform where upstream does not.
 - **Needs-verification discipline.** A design item labelled **[Needs verification]** in the architecture document is checked against the PostgreSQL source or documentation before code depends on it. The result of the check goes in the work log.

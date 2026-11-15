@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # Architecture decision records
 
 An ADR records one decision: the context, the decision, its consequences and the alternatives that were rejected. The design itself is in [../architecture.md](../architecture.md); ADRs record that a recommendation in it has become a decision, and why. The rules for what goes where are in [../dev/documentation.md](../dev/documentation.md).
@@ -10,7 +10,7 @@ An ADR records one decision: the context, the decision, its consequences and the
 | [0001](0001-thin-fork-with-extensions.md) | Thin fork with minimal core patches; logic in extensions | Accepted | 2026-11-14 | - |
 | [0002](0002-base-on-postgresql-18.md) | Base on PostgreSQL 18 (`REL_18_7`), rebase to 19 later | Accepted | 2026-11-14 | 1 |
 | [0003](0003-single-repository-layout.md) | Single repository layout | Accepted | 2026-11-14 | 2 (partly) |
-| [0004](0004-postgresql-license-no-citus-code.md) | PostgreSQL License; no Citus code | Accepted | 2026-11-14 | 3 |
+| [0004](0004-postgresql-license-no-citus-code.md) | PostgreSQL License; no Citus code | Superseded by 0024 in its choice of licence | 2026-11-14 | 3 |
 | [0005](0005-wsl2-build-environment.md) | WSL2 as the build environment | Accepted | 2026-11-14 | 4 |
 | [0006](0006-sharding-mvp-first.md) | Sharding MVP first | Accepted | 2026-11-14 | 5 |
 | [0007](0007-fixed-hash-buckets.md) | Fixed hash buckets (default 1024) | Accepted | 2026-11-14 | - |
@@ -30,6 +30,7 @@ An ADR records one decision: the context, the decision, its consequences and the
 | [0021](0021-failover-in-kingresd.md) | Failover is part of kingresd, with leases; Patroni and etcd are not bundled | Accepted | 2026-11-14 | Supersedes 0012 |
 | [0022](0022-the-complete-scan-stays.md) | The row-moving distributed scan stays as the path that answers every query | Accepted | 2026-11-15 | - |
 | [0023](0023-one-extension-source-for-several-majors.md) | One source of every extension builds against each supported PostgreSQL major (18 and 19) | Accepted | 2026-11-15 | 1 (extends 0002) |
+| [0024](0024-agpl-for-kingresdb-code.md) | KingresDB's own code is licensed under the GNU Affero General Public License, version 3 | Accepted | 2026-11-15 | 3 (supersedes 0004) |
 
 "Open decision #" refers to the table "Open decisions" in architecture.md.
 

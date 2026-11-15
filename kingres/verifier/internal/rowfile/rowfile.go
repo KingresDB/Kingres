@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package rowfile reads the description of a row that kingres-verify
 // row-hash takes: a JSON array with one object per non-NULL column, in column

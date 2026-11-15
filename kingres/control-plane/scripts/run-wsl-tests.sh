@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: PostgreSQL
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Runs Linux test binaries inside WSL against the private KingresDB
 # installation in ~/kw-cp/install. Called by run-integration.ps1; arguments:

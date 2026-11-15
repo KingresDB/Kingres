@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # KingresDB brand assets
 
 The logo files of KingresDB, as supplied by the project owner. They are the

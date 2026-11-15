@@ -4,7 +4,7 @@
  *	  The "Kingres Distributed Scan" custom scan: the always-correct way to read
  *	  a distributed table in a statement that spans shard groups.
  *
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only
  * Portions Copyright (c) 2026, RooyeKhat Media Co
  *
  * IDENTIFICATION

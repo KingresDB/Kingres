@@ -1,5 +1,5 @@
 -- Portions Copyright (c) 2026, RooyeKhat Media Co
--- SPDX-License-Identifier: PostgreSQL
+-- SPDX-License-Identifier: AGPL-3.0-only
 --
 -- columnar_scan_plans: the Columnar Scan in EXPLAIN, the columns it projects,
 -- the stripes and chunk groups it skips for each form of condition, and that

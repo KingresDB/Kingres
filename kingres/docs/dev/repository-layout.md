@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # Repository layout
 
 KingresDB uses one repository (accepted decision #2 in the architecture document's "Open decisions"; see [ADR 0003](../adr/0003-single-repository-layout.md)). The repository root is the PostgreSQL source tree. KingresDB's own code is added next to it and never mixed into upstream directories except through registered core patches.

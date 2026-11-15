@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // Contract 0.6.0, changelog Breaking 1 and 2 and Additive 1 to 5 as far as the servers are concerned:

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: PostgreSQL
+# SPDX-License-Identifier: AGPL-3.0-only
 # Smoke run inside WSL: a fresh kingresd creates a one-server cluster through the API.
 # Usage: smoke.sh <kingresd-binary>   (uses ~/kw-cp/install and ports 56150-56151)
 set -u

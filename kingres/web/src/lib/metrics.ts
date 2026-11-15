@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 import type { ChartSeries } from '@/components/LineChart.vue'
 import type { MetricQueryResult } from '@/api/types'

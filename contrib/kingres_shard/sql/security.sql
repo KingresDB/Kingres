@@ -2,7 +2,7 @@
 --   Security of the install script (review 2026-11-14: S-A, S-B, and the
 --   settings of the routing switches).
 --
--- SPDX-License-Identifier: PostgreSQL
+-- SPDX-License-Identifier: AGPL-3.0-only
 -- Portions Copyright (c) 2026, RooyeKhat Media Co
 --
 -- The role that runs the regression tests has the same name as the extension

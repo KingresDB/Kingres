@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package fence carries the fencing epoch of a task run to the servers its steps
 // call, and lets those servers refuse a call of a run that lost its lease.

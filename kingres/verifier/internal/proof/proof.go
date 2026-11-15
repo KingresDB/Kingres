@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package proof parses ledger inclusion proofs and verifies them against a
 // trusted digest, following the verification steps of

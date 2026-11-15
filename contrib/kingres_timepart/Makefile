@@ -1,7 +1,7 @@
 # contrib/kingres_timepart/Makefile
 #
 # Portions Copyright (c) 2026, RooyeKhat Media Co
-# SPDX-License-Identifier: PostgreSQL
+# SPDX-License-Identifier: AGPL-3.0-only
 
 EXTENSION = kingres_timepart
 DATA = kingres_timepart--0.1.sql

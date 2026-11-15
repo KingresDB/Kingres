@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package chain parses and checks block headers, digests and the block hash
 // chain of a KingresDB ledger.

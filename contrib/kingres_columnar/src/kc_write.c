@@ -25,7 +25,7 @@
  * buffers they are pinned and not flushed or reset.
  *
  * Portions Copyright (c) 2026, RooyeKhat Media Co
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only
  *
  * IDENTIFICATION
  *	  contrib/kingres_columnar/src/kc_write.c

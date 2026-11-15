@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package lease implements the group leases of high availability (design
 // ha-phase5.md, "Fencing by lease"): a server that runs the primary of a shard

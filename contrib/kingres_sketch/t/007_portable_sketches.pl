@@ -12,7 +12,7 @@
 #   * The working memory of a call on a value of the largest size.
 #
 # Portions Copyright (c) 2026, RooyeKhat Media Co
-# SPDX-License-Identifier: PostgreSQL
+# SPDX-License-Identifier: AGPL-3.0-only
 
 use strict;
 use warnings FATAL => 'all';

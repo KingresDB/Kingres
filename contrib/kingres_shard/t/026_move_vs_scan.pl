@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PostgreSQL
+# SPDX-License-Identifier: AGPL-3.0-only
 # Portions Copyright (c) 2026, RooyeKhat Media Co
 #
 # A statement that reads every shard group (the distributed scan) while buckets

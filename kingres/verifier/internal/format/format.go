@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package format builds the byte strings that the KingresDB ledger hashes
 // (hash format version 1). Each kind of hash input is built in exactly one

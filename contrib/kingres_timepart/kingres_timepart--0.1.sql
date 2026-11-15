@@ -8,7 +8,7 @@
 -- kingres/docs/design/analytics-phase12-storage.md.
 --
 -- Portions Copyright (c) 2026, RooyeKhat Media Co
--- SPDX-License-Identifier: PostgreSQL
+-- SPDX-License-Identifier: AGPL-3.0-only
 
 \echo Use "CREATE EXTENSION kingres_timepart" to load this file. \quit
 

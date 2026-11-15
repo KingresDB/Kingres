@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // Contract 0.7.0, `ShardGroup.lease`: per shard group whether the primary holds its lease, whether the lease is

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package setup owns the node state machine (uninitialized, standalone,
 // clustered) and the one-time setup token.

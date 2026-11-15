@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package fault is the fault-injection hook of the tests. It exists so that a
 // partition, a one-way cut or a clock step can be produced inside the process

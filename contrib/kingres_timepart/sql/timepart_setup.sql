@@ -2,7 +2,7 @@
 -- the other tests, and look at what the install script created.
 --
 -- Portions Copyright (c) 2026, RooyeKhat Media Co
--- SPDX-License-Identifier: PostgreSQL
+-- SPDX-License-Identifier: AGPL-3.0-only
 
 SET client_min_messages = warning;
 -- Roles are global: remove those of an earlier run that did not finish.

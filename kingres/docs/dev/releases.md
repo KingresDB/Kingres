@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # Releases: one KingresDB per PostgreSQL major
 
 KingresDB is released for every supported PostgreSQL major at the same time, from one state of its own code. Whoever installs it chooses the major: the newest KingresDB on PostgreSQL 18, or the newest KingresDB on PostgreSQL 19. The decision behind this is [ADR 0023](../adr/0023-one-extension-source-for-several-majors.md); the mechanics of following upstream are in [upstream-sync.md](upstream-sync.md).

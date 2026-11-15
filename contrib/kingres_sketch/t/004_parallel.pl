@@ -17,7 +17,7 @@
 # The hash aggregate and the sorted aggregate strategies are both used.
 #
 # Portions Copyright (c) 2026, RooyeKhat Media Co
-# SPDX-License-Identifier: PostgreSQL
+# SPDX-License-Identifier: AGPL-3.0-only
 
 use strict;
 use warnings FATAL => 'all';

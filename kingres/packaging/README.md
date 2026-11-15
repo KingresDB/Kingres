@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 # KingresDB packaging
 
@@ -522,4 +522,4 @@ crash recovery. The `deb` and image tests were not run again on that commit.
 
 ---
 
-Copyright (c) 2026, RooyeKhat Media Co. Released under the PostgreSQL License.
+Copyright (c) 2026, RooyeKhat Media Co. Released under the GNU Affero General Public License, version 3 (AGPL-3.0-only).

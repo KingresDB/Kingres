@@ -4,7 +4,7 @@
   "author": "Mohammad Rasoul Kazemi (RooyeKhat)",
   "private": true,
   "type": "module",
-  "license": "PostgreSQL",
+  "license": "AGPL-3.0-only",
   "engines": {
     "node": ">=22"
   },

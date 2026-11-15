@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # kingres_shard: design of phase 9 (table lifecycle)
 
 Status: Proposed design, 2026-11-15; not implemented.

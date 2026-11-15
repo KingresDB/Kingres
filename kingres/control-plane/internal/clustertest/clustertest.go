@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package clustertest starts a cluster of several kingresd processes on one
 // machine for integration tests: every server has its own data directory, REST

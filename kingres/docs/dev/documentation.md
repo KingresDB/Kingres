@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # Documentation rules
 
 All documentation is in English, in Markdown, in plain prose without marketing language. File and directory names are English, lower case, with hyphens.

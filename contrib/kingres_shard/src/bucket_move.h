@@ -3,7 +3,7 @@
  * bucket_move.h
  *	  The C primitives of moving a bucket between shard groups.
  *
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only
  * Portions Copyright (c) 2026, RooyeKhat Media Co
  *
  * IDENTIFICATION

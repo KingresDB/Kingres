@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # kingres_shard: design of phase 2b (pushdown, ordered merge, colocated joins, row routing)
 
 Status: draft for review, 2026-11-14.

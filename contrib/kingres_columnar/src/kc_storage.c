@@ -12,7 +12,7 @@
  * under an exclusive buffer lock and is also logged as a whole-page image.
  *
  * Portions Copyright (c) 2026, RooyeKhat Media Co
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only
  *
  * IDENTIFICATION
  *	  contrib/kingres_columnar/src/kc_storage.c

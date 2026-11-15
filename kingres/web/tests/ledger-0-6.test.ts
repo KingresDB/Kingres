@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // Contract 0.6.0, ledger: `complete` and `uncoveredShardGroupIds` of a digest and of a verification. A passed

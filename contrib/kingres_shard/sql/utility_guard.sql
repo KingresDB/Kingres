@@ -1,7 +1,7 @@
 -- sql/utility_guard.sql
 --   Utility statements on distributed tables (review 2026-11-14, finding 3).
 --
--- SPDX-License-Identifier: PostgreSQL
+-- SPDX-License-Identifier: AGPL-3.0-only
 -- Portions Copyright (c) 2026, RooyeKhat Media Co
 --
 -- With one shard group every statement works as before.  Once there are two

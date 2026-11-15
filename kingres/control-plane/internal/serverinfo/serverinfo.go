@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package serverinfo reports what the operating system and the instance's log
 // files know about this server: resources (Linux /proc and statfs; every

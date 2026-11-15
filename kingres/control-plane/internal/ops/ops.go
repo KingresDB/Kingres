@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package ops implements the operations of the contract that change the
 // cluster: roles, grants, databases, tables, ledger and the query workbench.

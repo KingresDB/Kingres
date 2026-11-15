@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # ADR 0010: Writes on any node: a primary per server and a router in the agent; no conflict-resolving multi-master
 
 - Status: Accepted

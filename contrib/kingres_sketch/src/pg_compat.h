@@ -11,7 +11,7 @@
  * in 18 and 19, so the file only fixes the module magic.
  *
  * Portions Copyright (c) 2026, RooyeKhat Media Co
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only
  *
  * IDENTIFICATION
  *	  contrib/kingres_sketch/src/pg_compat.h
