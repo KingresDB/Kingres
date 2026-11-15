@@ -169,8 +169,13 @@ export const useClusterSummary = (enabled: MaybeRefOrGetter<boolean> = true) =>
     enabled: computed(() => toValue(enabled)),
   })
 
-export const useServers = () =>
-  useQuery({ queryKey: keys.servers, queryFn: endpoints.listServers, refetchInterval: POLL.fast })
+export const useServers = (enabled: MaybeRefOrGetter<boolean> = true) =>
+  useQuery({
+    queryKey: keys.servers,
+    queryFn: endpoints.listServers,
+    refetchInterval: POLL.fast,
+    enabled: computed(() => toValue(enabled)),
+  })
 
 export const useServer = (id: MaybeRefOrGetter<string>) =>
   useQuery({
@@ -263,11 +268,12 @@ export const useBucketDistribution = (
 
 // --- replication and rebalance ----------------------------------------------------------------
 
-export const useTopology = () =>
+export const useTopology = (enabled: MaybeRefOrGetter<boolean> = true) =>
   useQuery({
     queryKey: keys.topology,
     queryFn: endpoints.getReplicationTopology,
     refetchInterval: every(POLL.fast),
+    enabled: computed(() => toValue(enabled)),
   })
 
 export const useRebalanceStatus = () =>
@@ -306,6 +312,14 @@ export const useAlerts = (
     queryKey: [...keys.alerts, state ?? 'all'],
     queryFn: () => endpoints.listAlerts({ limit: 100, state }),
     refetchInterval: every(POLL.normal),
+  })
+
+/** The latest task that added or removed standbys (0.7.0), newest first; one at most. */
+export const useStandbyTask = () =>
+  useQuery({
+    queryKey: [...keys.tasks, 'standby'],
+    queryFn: () => endpoints.listTasks({ kind: 'standby.reconcile', limit: 1 }),
+    refetchInterval: every(POLL.fast),
   })
 
 export const useMetric = (metric: MetricName, rangeMinutes = 60, groupBy?: 'server' | 'database') =>

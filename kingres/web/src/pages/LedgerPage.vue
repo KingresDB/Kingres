@@ -30,6 +30,7 @@ import { saveTextFile } from '@/lib/download'
 import {
   coverageOf,
   digestCoverageText,
+  statusCoverageText,
   verificationBadge,
   verificationCoverageText,
 } from '@/lib/ledger-coverage'
@@ -65,12 +66,20 @@ watch(dbName, (v) => {
 const status = computed(() =>
   statusList.data.value?.items.find((s) => s.databaseName === dbName.value),
 )
+const statusCoverage = computed(() => (status.value ? coverageOf(status.value) : null))
+/** The chains of the status, then the shard groups it names as not covered (their blocks can still be asked for). */
+const chainOptions = computed(() => [
+  ...(status.value?.chains ?? []).map((c) => ({ id: c.shardGroupId, covered: true })),
+  ...(status.value?.uncoveredShardGroupIds ?? [])
+    .filter((n) => !status.value?.chains.some((c) => c.shardGroupId === n))
+    .map((id) => ({ id, covered: false })),
+])
 const chainId = ref<number | null>(null)
 watch(
   status,
   (s) => {
-    if (s && !s.chains.some((c) => c.shardGroupId === chainId.value))
-      chainId.value = s.chains[0]?.shardGroupId ?? null
+    if (s && !chainOptions.value.some((c) => c.id === chainId.value))
+      chainId.value = chainOptions.value[0]?.id ?? null
   },
   { immediate: true },
 )
@@ -305,6 +314,15 @@ function downloadDigest(d: RawDigest, c: DigestChain): void {
             <template v-if="status.lastVerifiedAt"
               >Last verified {{ formatAgo(status.lastVerifiedAt) }}.</template
             >
+          </p>
+          <p
+            v-if="statusCoverage && statusCoverageText(statusCoverage)"
+            class="notice tone-warn"
+            role="status"
+            data-testid="status-coverage"
+          >
+            <span aria-hidden="true">&#9650;</span>
+            <span>{{ statusCoverageText(statusCoverage) }}</span>
           </p>
           <p v-if="status.verificationState === 'passed'" class="muted">
             "Last check passed" is the state of the latest verification only. Open it under
@@ -635,8 +653,9 @@ function downloadDigest(d: RawDigest, c: DigestChain): void {
           <div class="field" style="max-width: 16em">
             <label for="b-chain">Chain</label>
             <select id="b-chain" v-model="chainId">
-              <option v-for="c in status.chains" :key="c.shardGroupId" :value="c.shardGroupId">
-                Shard group {{ c.shardGroupId }}
+              <option v-for="c in chainOptions" :key="c.id" :value="c.id">
+                Shard group {{ c.id
+                }}<template v-if="!c.covered"> (not in the status above)</template>
               </option>
             </select>
           </div>

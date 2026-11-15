@@ -9,11 +9,20 @@ import QueryBoundary from '@/components/QueryBoundary.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
 import NullableValue from '@/components/NullableValue.vue'
 import LineChart from '@/components/LineChart.vue'
+import AlertSubject from '@/components/AlertSubject.vue'
+import ClientEntryPointCharts from '@/components/ClientEntryPointCharts.vue'
 import PartialNotice from '@/components/PartialNotice.vue'
 import { useCompletenessAnnouncement } from '@/composables/useCompletenessAnnouncement'
 import { completenessOf, mergeCompleteness } from '@/lib/partial'
-import { useAlerts, useCluster, useClusterSummary, useMetric, useTasks } from '@/api/queries'
-import { HEALTH, SEVERITY, TASK_STATE } from '@/lib/status'
+import {
+  useAlerts,
+  useCluster,
+  useClusterSummary,
+  useMetric,
+  useServers,
+  useTasks,
+} from '@/api/queries'
+import { HEALTH, SERVER_STATUS, SEVERITY, TASK_STATE } from '@/lib/status'
 import { formatAgo, formatNumber } from '@/lib/format'
 import { toChartSeries } from '@/lib/metrics'
 import { isUnsupported } from '@/api/problem'
@@ -36,6 +45,15 @@ const lag = useMetric('replicationLagSeconds', 60, 'server')
 const memory = useMetric('memoryUsedBytes', 60, 'server')
 
 const c = computed(() => cluster.data.value)
+// The servers that are not live, with the time since their last heartbeat (0.7.0). The list is read only while the
+// overview says that some server is not live, and only by accounts that may read servers.
+const notLive = computed(() => (c.value ? c.value.servers.total - c.value.servers.live : 0))
+const servers = useServers(
+  () => canCluster.value && session.can('listServers') && notLive.value > 0,
+)
+const silentServers = computed(() =>
+  (servers.data.value?.items ?? []).filter((x) => x.status !== 'live'),
+)
 // Charts and the alert list are cluster-wide answers: a server that did not answer is named, never
 // silently left out (contract 0.5.0).
 const metricsCompleteness = computed(() =>
@@ -104,6 +122,17 @@ const metricsUnsupported = computed(() =>
             {{ c.servers.pendingRebalance }} pending rebalance (should hold shards, primary of no
             bucket yet)
           </span>
+          <ul v-if="silentServers.length" class="plain-list muted" data-testid="not-live-servers">
+            <li v-for="x in silentServers" :key="x.id">
+              <RouterLink :to="{ name: 'server', params: { id: x.id } }"
+                ><SafeName :value="x.id" kind="text" :max="40"
+              /></RouterLink>
+              <StatusBadge :meta="SERVER_STATUS[x.status]" />
+              <template v-if="x.lastHeartbeatAt"
+                >last heartbeat {{ formatAgo(x.lastHeartbeatAt) }}</template
+              ><template v-else>no heartbeat on record</template>
+            </li>
+          </ul>
           <RouterLink :to="{ name: 'servers' }">View servers</RouterLink>
         </div>
         <div class="card kpi" data-testid="kpi-under-replicated">
@@ -196,6 +225,7 @@ const metricsUnsupported = computed(() =>
         </div>
       </div>
     </section>
+    <ClientEntryPointCharts v-if="!metricsUnsupported" />
     <div v-if="canAlerts || canTasks" class="grid-2">
       <section v-if="canAlerts" class="card" aria-labelledby="alerts-h">
         <div class="row-between">
@@ -222,10 +252,13 @@ const metricsUnsupported = computed(() =>
           "
         >
           <ul class="plain-list">
-            <li v-for="a in alerts.data.value?.items.slice(0, 5)" :key="a.id" class="row">
-              <StatusBadge :meta="SEVERITY[a.severity]" />
-              <span><SafeName :value="a.title" kind="text" :max="120" /></span>
-              <span class="muted">{{ formatAgo(a.raisedAt) }}</span>
+            <li v-for="a in alerts.data.value?.items.slice(0, 5)" :key="a.id" class="alert-item">
+              <span class="row">
+                <StatusBadge :meta="SEVERITY[a.severity]" />
+                <span><SafeName :value="a.title" kind="text" :max="120" /></span>
+                <span class="muted">{{ formatAgo(a.raisedAt) }}</span>
+              </span>
+              <AlertSubject :alert="a" compact />
             </li>
           </ul>
         </QueryBoundary>

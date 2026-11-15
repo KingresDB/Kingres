@@ -44,6 +44,8 @@ import {
   planMoves,
   planView,
   serverView,
+  effectiveStatus,
+  startStandbyReconcile,
   tickTasks,
   topology,
   activeTask,
@@ -640,7 +642,7 @@ function databaseView(s: MockState, name: string): Database {
     if (!g || g.primaryServerId === null) unavailable += 1
     else if (g.standbyServerIds.length < s.settings.defaultReplicaCount) under += 1
   }
-  const ledger = ledgerStatusOf(s, rec)
+  const ledger = ledgerStatusOf(s, rec, true)
   const lastVerified = Math.min(...ledger.chains.map((c) => c.lastVerifiedBlockHeight ?? Infinity))
   return {
     ...rec.info,
@@ -801,7 +803,75 @@ function metricValue(metric: S['MetricName'], serverId: number, t: number): numb
       return 1800 + serverId * 120 + wave(500, 5) * 900
     case 'bucketsUnderReplicated':
       return 0
+    default:
+      return clientMetricValue(metric, serverId, t)
   }
+}
+
+/**
+ * The client entry point (0.7.0): totals since the start of kingresd, except the `Active` ones. The standby entry
+ * point carries about a fifth of the traffic.
+ */
+function clientMetricValue(metric: S['MetricName'], serverId: number, t: number): number {
+  const standby = metric.startsWith('clientStandby')
+  const name = metric.replace(/^client(Standby)?/, '')
+  const factor = standby ? 0.2 : 1
+  const hours = t / 3_600_000
+  const wave = (period: number, phase: number) =>
+    (Math.sin((t / 1000 / period) * 2 * Math.PI + phase + serverId) + 1) / 2
+  switch (name) {
+    case 'ConnectionsActive':
+      return Math.round((12 + serverId * 4 + wave(400, 1) * 14) * factor)
+    case 'ConnectionsAccepted':
+      return Math.round((20_000 + serverId * 1_500 + (hours % 5000) * 90) * factor)
+    case 'ConnectionsRefused':
+      return Math.round((3 + serverId + (hours % 5000) * 0.02) * factor)
+    case 'ConnectFailures':
+      return Math.round((8 + serverId * 2 + (hours % 5000) * 0.05) * factor)
+    case 'ConnectionsMoved':
+      return Math.round((140 + serverId * 10 + (hours % 5000) * 1.5) * factor)
+    case 'ConnectionsIdleClosed':
+      return Math.round((900 + serverId * 60 + (hours % 5000) * 12) * factor)
+    case 'BytesIn':
+      return Math.round((38 + serverId * 4 + (hours % 5000) * 0.8) * 1024 * MiB * factor)
+    case 'BytesOut':
+      return Math.round((120 + serverId * 9 + (hours % 5000) * 2.1) * 1024 * MiB * factor)
+    default:
+      return 0
+  }
+}
+
+/** The metrics of the client entry point of a given kind of entry point. */
+export const CLIENT_METRICS = {
+  on: [
+    'clientConnectionsAccepted',
+    'clientConnectionsActive',
+    'clientConnectionsRefused',
+    'clientConnectFailures',
+    'clientConnectionsMoved',
+    'clientConnectionsIdleClosed',
+    'clientBytesIn',
+    'clientBytesOut',
+  ],
+  standby: [
+    'clientStandbyConnectionsAccepted',
+    'clientStandbyConnectionsActive',
+    'clientStandbyConnectionsRefused',
+    'clientStandbyConnectFailures',
+    'clientStandbyConnectionsMoved',
+    'clientStandbyConnectionsIdleClosed',
+    'clientStandbyBytesIn',
+    'clientStandbyBytesOut',
+  ],
+} as const satisfies Record<string, readonly S['MetricName'][]>
+
+/** Whether the mock reports a metric: the client ones exist only while the client entry point is on. */
+function metricExists(metric: S['MetricName']): boolean {
+  if ((CLIENT_METRICS.on as readonly string[]).includes(metric))
+    return mockConfig.clientEntryPoint !== false
+  if ((CLIENT_METRICS.standby as readonly string[]).includes(metric))
+    return mockConfig.clientEntryPoint === 'standby'
+  return true
 }
 
 const METRIC_UNIT: Record<S['MetricName'], S['MetricQueryResult']['unit']> = {
@@ -815,6 +885,22 @@ const METRIC_UNIT: Record<S['MetricName'], S['MetricQueryResult']['unit']> = {
   transactionsPerSecond: 'countPerSecond',
   queriesPerSecond: 'countPerSecond',
   bucketsUnderReplicated: 'count',
+  clientConnectionsAccepted: 'count',
+  clientConnectionsActive: 'count',
+  clientConnectionsRefused: 'count',
+  clientConnectFailures: 'count',
+  clientConnectionsMoved: 'count',
+  clientConnectionsIdleClosed: 'count',
+  clientBytesIn: 'bytes',
+  clientBytesOut: 'bytes',
+  clientStandbyConnectionsAccepted: 'count',
+  clientStandbyConnectionsActive: 'count',
+  clientStandbyConnectionsRefused: 'count',
+  clientStandbyConnectFailures: 'count',
+  clientStandbyConnectionsMoved: 'count',
+  clientStandbyConnectionsIdleClosed: 'count',
+  clientStandbyBytesIn: 'bytes',
+  clientStandbyBytesOut: 'bytes',
 }
 
 const LEVEL_ORDER = ['debug', 'info', 'warning', 'error']
@@ -898,15 +984,10 @@ function runQuery(ctx: Ctx): S['QueryResult'] {
       durationMs: Date.now() - started + 1.5,
     }
   }
-  if (/pg_sleep/i.test(sql))
-    throw problem('sql_error', 'canceling statement due to statement timeout', {
-      sqlState: '57014',
-      sqlPosition: 1,
-    })
   if (/\bhugevalue\b/i.test(sql))
     throw problem('unprocessable', 'A value of column "doc" is larger than 1 MiB.')
   if (/\bbusyrole\b/i.test(sql))
-    throw problem('service_unavailable', 'This role already runs two statements.')
+    throw problem('workbench_busy', 'This role already runs two statements on this server.')
   let m = /^select\s+1(\s+as\s+(\w+))?$/i.exec(sql)
   if (m) return done([{ name: m[2] ?? '?column?', type: 'int4' }], [[1]])
   if (/^select\s+version\(\)$/i.test(sql))
@@ -944,6 +1025,67 @@ function runQuery(ctx: Ctx): S['QueryResult'] {
     sqlState: '42601',
     sqlPosition: 1,
   })
+}
+
+/** Seconds of `pg_sleep(n)` in a statement, or null when it is not one. */
+function sleepSeconds(sql: string): number | null {
+  const m = /^select\s+pg_sleep\(\s*(\d+(?:\.\d+)?)\s*\)$/i.exec(sql.trim().replace(/;+\s*$/, ''))
+  return m ? Number(m[1]) : null
+}
+
+const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+
+/**
+ * `executeQuery` (0.7.0): the role runs at most two statements on this server and the server four in all
+ * (429 `workbench_busy` otherwise); a request that names its statement can be cancelled with `cancelStatement`
+ * while it runs (it ends with 422 `sql_error`, SQLSTATE 57014); a second running statement with the same id is
+ * 409 `conflict`. `select pg_sleep(n)` is the statement that runs for `n` seconds.
+ */
+async function executeStatement(ctx: Ctx): Promise<S['QueryResult']> {
+  const { s } = ctx
+  const b = body<S['QueryRequest']>(ctx)
+  const username = s.session?.username ?? ''
+  const busy = () =>
+    problem(
+      'workbench_busy',
+      'This role already runs two statements on this server, or the server runs four.',
+    )
+  if (mockConfig.workbenchBusy) throw busy()
+  const key = `${username}\u0000${b.statementId ?? `anonymous-${Math.random()}`}`
+  if (b.statementId !== undefined && s.statements.has(key))
+    throw problem('conflict', 'A statement with this id is already running.')
+  const mine = [...s.statements.values()].filter((x) => x.username === username).length
+  if (mine >= 2 || s.statements.size >= 4) throw busy()
+  const seconds = sleepSeconds(b.sql)
+  if (seconds === null) return runQuery(ctx)
+  db(s, b.database)
+  const rec = { username, startedAt: Date.now(), cancelled: false }
+  s.statements.set(key, rec)
+  try {
+    const timeoutMs = b.timeoutMs ?? mockConfig.defaultStatementTimeoutMs
+    const end = rec.startedAt + Math.min(seconds * 1000, timeoutMs)
+    while (Date.now() < end && !rec.cancelled) await wait(20)
+    if (rec.cancelled)
+      throw problem('sql_error', 'canceling statement due to user request', {
+        sqlState: '57014',
+        sqlPosition: 1,
+      })
+    if (seconds * 1000 > timeoutMs)
+      throw problem('sql_error', 'canceling statement due to statement timeout', {
+        sqlState: '57014',
+        sqlPosition: 1,
+      })
+    return {
+      columns: [{ name: 'pg_sleep', type: 'void' }],
+      rows: [[null]],
+      rowCount: 1,
+      truncated: false,
+      commandTag: 'SELECT 1',
+      durationMs: Date.now() - rec.startedAt,
+    }
+  } finally {
+    s.statements.delete(key)
+  }
 }
 
 // --- the table of handlers -----------------------------------------------------------------------------
@@ -1196,7 +1338,10 @@ export function createHandlers(): HttpHandler[] {
       const group = c.url.searchParams.get('serverGroup')
       return ok({
         items: c.s.servers
-          .filter((x) => (!status || x.status === status) && (!group || x.serverGroup === group))
+          .filter(
+            (x) =>
+              (!status || effectiveStatus(x) === status) && (!group || x.serverGroup === group),
+          )
           .map((x) => serverView(c.s, x)),
       })
     },
@@ -2304,18 +2449,12 @@ export function createHandlers(): HttpHandler[] {
         (b.features?.ledger === false && s.settings.features.ledger)
       )
         throw problem('immutable_field', 'A feature cannot be turned off once it is on.')
-      if (b.defaultReplicaCount !== undefined && b.defaultReplicaCount > s.servers.length - 1)
-        throw problem(
-          'unprocessable',
-          `A replica count of ${b.defaultReplicaCount} needs at least ${b.defaultReplicaCount + 1} servers.`,
-        )
       const cur = s.settings
-      if (
-        b.defaultReplicaCount !== undefined &&
-        b.defaultReplicaCount !== cur.defaultReplicaCount
-      ) {
+      // 0.7.0: a replica count (even the current one) starts the standby check, a task that adds or removes standbys
+      // as far as the servers allow. It is not a rebalance.
+      if (b.defaultReplicaCount !== undefined) {
         cur.defaultReplicaCount = b.defaultReplicaCount
-        markRebalance(s, 'replicaCountChanged')
+        startStandbyReconcile(s, s.session?.username)
       }
       if (b.defaultDurability) cur.defaultDurability = b.defaultDurability
       if (b.autoFailover)
@@ -2345,7 +2484,7 @@ export function createHandlers(): HttpHandler[] {
     getLedgerStatus: (c) => ok(ledgerStatusOf(c.s, db(c.s, c.params.databaseName ?? ''))),
     listLedgerBlocks: (c) => {
       const rec = db(c.s, c.params.databaseName ?? '')
-      const status = ledgerStatusOf(c.s, rec)
+      const status = ledgerStatusOf(c.s, rec, true)
       const gid = Number(
         c.url.searchParams.get('shardGroupId') ?? status.chains[0]?.shardGroupId ?? 0,
       )
@@ -2368,7 +2507,7 @@ export function createHandlers(): HttpHandler[] {
       const rec = db(c.s, c.params.databaseName ?? '')
       if (rec.info.ledger.mode === 'off')
         throw problem('unprocessable', 'The ledger is off for this database.')
-      const status = ledgerStatusOf(c.s, rec)
+      const status = ledgerStatusOf(c.s, rec, true)
       const id = (c.s.ledger.digests[0]?.id ?? 0) + 1
       const covered = mockConfig.incompleteLedger ? status.chains.slice(0, -1) : status.chains
       const uncovered = mockConfig.incompleteLedger
@@ -2432,7 +2571,7 @@ export function createHandlers(): HttpHandler[] {
         rowsChecked: 0,
         complete: !mockConfig.incompleteLedger,
         uncoveredShardGroupIds: mockConfig.incompleteLedger
-          ? ledgerStatusOf(s, rec)
+          ? ledgerStatusOf(s, rec, true)
               .chains.slice(-1)
               .map((ch) => ch.shardGroupId)
           : [],
@@ -2535,7 +2674,16 @@ export function createHandlers(): HttpHandler[] {
     },
 
     // --- workbench, alerts, logs, metrics
-    executeQuery: (c) => ok(runQuery(c)),
+    executeQuery: async (c) => ok(await executeStatement(c)),
+    cancelStatement: (c) => {
+      const username = c.s.session?.username ?? ''
+      const rec = c.s.statements.get(`${username}\u0000${c.params.statementId ?? ''}`)
+      // Another role's statement, an ended one and an unknown id look the same.
+      if (!rec || rec.cancelled)
+        throw problem('not_found', 'No running statement of yours has this id on this server.')
+      rec.cancelled = true
+      return noContent()
+    },
     listAlerts: (c) => {
       const state = c.url.searchParams.get('state')
       const sev = c.url.searchParams.get('severity')
@@ -2567,6 +2715,18 @@ export function createHandlers(): HttpHandler[] {
       if (Number.isNaN(from) || Number.isNaN(to) || to <= from)
         throw validationFailed([{ field: 'from', message: 'The period is not valid.' }])
       const count = Math.min(5000, Math.floor((to - from) / (step * 1000)) + 1)
+      // 0.7.0: a metric of the client entry point exists only on a server whose entry point is on; the others
+      // have nothing to report, so the answer has no series (the contract does not say more).
+      if (!metricExists(metric))
+        return ok({
+          metric,
+          unit: METRIC_UNIT[metric],
+          from: new Date(from).toISOString(),
+          to: new Date(to).toISOString(),
+          step,
+          series: [],
+          ...partialAnswer(),
+        } satisfies S['MetricQueryResult'])
       const ids = q('serverId') ? [q('serverId')] : c.s.servers.map((x) => x.id)
       const byServer = q('groupBy') === 'server' || q('serverId')
       const points = (sid: string) =>

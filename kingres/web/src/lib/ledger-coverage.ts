@@ -6,13 +6,16 @@
 // others, so the panel never presents a digest or a verification as covering the whole database unless the
 // server said `complete: true` and named no uncovered group. A server that sends neither member (an older
 // one) did not say, and the panel does not guess.
-import type { LedgerDigest, LedgerVerification } from '@/api/types'
+import type { LedgerDigest, LedgerStatus, LedgerVerification } from '@/api/types'
 import type { StatusMeta } from './status'
 
 export type Coverage =
   { state: 'complete' } | { state: 'incomplete'; uncovered: number[] } | { state: 'unknown' }
 
-type Covering = Pick<LedgerDigest | LedgerVerification, 'complete' | 'uncoveredShardGroupIds'>
+type Covering = Pick<
+  LedgerDigest | LedgerVerification | LedgerStatus,
+  'complete' | 'uncoveredShardGroupIds'
+>
 
 export function coverageOf(x: Covering): Coverage {
   const uncovered = Array.isArray(x.uncoveredShardGroupIds)
@@ -36,6 +39,17 @@ export function digestCoverageText(c: Coverage): string {
   if (c.state === 'unknown')
     return 'This server did not say whether every shard group is covered by this digest.'
   return `This digest does not cover ${groupList(c.uncovered)}: it proves nothing about them.`
+}
+
+/**
+ * One sentence for the status of a database (contract 0.7.0). Since 0.6.0 the chains of a status are those of the
+ * shard group of the server that answered; `uncoveredShardGroupIds` names the others. Empty when it covers all.
+ */
+export function statusCoverageText(c: Coverage): string {
+  if (c.state === 'complete') return ''
+  if (c.state === 'unknown')
+    return 'This server did not say whether the chains below are all the chains of the database, so this status is not shown as the status of the whole database.'
+  return `The chains below are those of the shard group of the server that answered. This status says nothing about ${groupList(c.uncovered)}: it is not the status of the whole database.`
 }
 
 /** One sentence for a verification; empty when it covered every chain. */

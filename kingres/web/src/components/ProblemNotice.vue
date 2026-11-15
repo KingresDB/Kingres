@@ -29,6 +29,10 @@ const toneClass = computed(() => `tone-${view.value.tone === 'warning' ? 'warn' 
     <div class="stack" style="gap: var(--s-1)">
       <strong>{{ view.heading }}</strong>
       <span><SafeName :value="view.message" kind="text" :max="600" multiline /></span>
+      <span v-if="view.retryAfterSeconds !== null" data-retry-after>
+        The server asks you to wait {{ view.retryAfterSeconds }}
+        {{ view.retryAfterSeconds === 1 ? 'second' : 'seconds' }} before you try again.
+      </span>
       <span v-if="view.sqlState" class="mono">SQLSTATE {{ safeText(view.sqlState, 10) }}</span>
       <ul v-if="Object.keys(view.fieldErrors).length" style="margin: 0; padding-left: 1.2em">
         <li v-for="(msg, field) in view.fieldErrors" :key="field">

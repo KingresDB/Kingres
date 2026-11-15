@@ -12,6 +12,7 @@ import SafeName from '@/components/SafeName.vue'
 import TableWrap from '@/components/TableWrap.vue'
 import { endpoints } from '@/api/endpoints'
 import { ApiError, isSessionLost } from '@/api/problem'
+import { useAnnounce } from '@/composables/useAnnounce'
 import { useDatabases } from '@/api/queries'
 import { formatNumber } from '@/lib/format'
 import { vBlockEnterSubmit } from '@/lib/forms'
@@ -24,6 +25,7 @@ const PAGE = 500
 const LONG = 300
 
 const session = useSessionStore()
+const announce = useAnnounce()
 const databases = useDatabases()
 const database = ref('')
 const sql = ref('select * from orders')
@@ -42,6 +44,21 @@ const running = ref(false)
 const error = ref<unknown>(null)
 const stopped = ref(false)
 let controller: AbortController | null = null
+/** The id the running statement was sent with (0.7.0): it is what `cancelStatement` names. */
+const statementId = ref<string | null>(null)
+/** The id of a statement the person stopped waiting for; it may still run on the server. */
+const abandonedId = ref<string | null>(null)
+const cancelling = ref(false)
+const cancelRequested = ref(false)
+const cancelError = ref<unknown>(null)
+const abandonedCancelled = ref(false)
+
+/** A fresh random id, 32 hexadecimal digits: unique among the statements of one role on one server. */
+function newStatementId(): string {
+  const bytes = new Uint8Array(16)
+  globalThis.crypto.getRandomValues(bytes)
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
+}
 
 watch(
   () => databases.data.value,
@@ -86,14 +103,21 @@ async function runStatement(): Promise<void> {
   const started = { database: database.value, sql: sql.value }
   controller = new AbortController()
   const mine = controller
+  const id = newStatementId()
+  statementId.value = id
   running.value = true
   error.value = null
   stopped.value = false
+  abandonedId.value = null
+  abandonedCancelled.value = false
+  cancelRequested.value = false
+  cancelError.value = null
   try {
     const data = await endpoints.executeQuery(
       {
         database: started.database,
         sql: started.sql,
+        statementId: id,
         rowLimit: rowLimit.value as number,
         ...(typeof timeoutSeconds.value === 'number'
           ? { timeoutMs: timeoutSeconds.value * 1000 }
@@ -112,19 +136,61 @@ async function runStatement(): Promise<void> {
     if (controller === mine) {
       running.value = false
       controller = null
+      statementId.value = null
+      cancelling.value = false
     }
   }
 }
 
 /**
- * Stops waiting for the answer. The API has no way to cancel a statement, so the server may still
- * be running it until it finishes or reaches the timeout.
+ * Asks the server to end the running statement (0.7.0, `cancelStatement`). The request that runs it then ends with
+ * 422 `sql_error` and SQLSTATE 57014, which the page shows as "cancelled by you". Nothing here is a task: the effect
+ * is immediate.
+ */
+async function cancelStatement(): Promise<void> {
+  const id = statementId.value
+  if (!id || cancelling.value) return
+  cancelling.value = true
+  cancelError.value = null
+  try {
+    await endpoints.cancelStatement(id)
+    cancelRequested.value = true
+    announce('Cancel requested. The server is ending the statement.')
+  } catch (e) {
+    if (!isSessionLost(e)) cancelError.value = e
+  } finally {
+    cancelling.value = false
+  }
+}
+
+/** Cancels, on the server, a statement that this page stopped waiting for (it kept running there). */
+async function cancelAbandoned(): Promise<void> {
+  const id = abandonedId.value
+  if (!id || cancelling.value) return
+  cancelling.value = true
+  cancelError.value = null
+  try {
+    await endpoints.cancelStatement(id)
+    abandonedCancelled.value = true
+    announce('Cancel requested. The server is ending the statement.')
+  } catch (e) {
+    if (!isSessionLost(e)) cancelError.value = e
+  } finally {
+    cancelling.value = false
+  }
+}
+
+/**
+ * Stops waiting for the answer. This does not end the statement: the server keeps running it until it finishes or
+ * reaches the timeout (and it keeps one of the role's two workbench slots). "Cancel statement" ends it.
  */
 function stopWaiting(): void {
   controller?.abort()
   controller = null
   running.value = false
   stopped.value = true
+  abandonedId.value = statementId.value
+  statementId.value = null
 }
 
 function onKey(e: KeyboardEvent): void {
@@ -168,12 +234,14 @@ const cutAppliedChange = computed(() => {
 const errorHint = computed(() => {
   const e = error.value
   if (!(e instanceof ApiError)) return ''
+  if (e.code === 'sql_error' && e.problem.sqlState === '57014' && cancelRequested.value)
+    return 'You cancelled this statement (SQLSTATE 57014). The server ended it, and a statement that was cancelled changed nothing.'
   if (e.code === 'sql_error' && e.problem.sqlState === '57014')
     return 'The statement was cancelled because it ran longer than the time limit (SQLSTATE 57014). This is not a fault of the server: raise the timeout above, or make the statement cheaper. A statement that was cancelled changed nothing.'
   if (e.code === 'unprocessable')
     return 'A value above 1 MiB, or a row above 16 MiB, cannot be returned. The statement failed; if it changes data, it was rolled back. Select fewer or smaller columns, for example a part of the value.'
-  if (e.code === 'service_unavailable' && !e.synthetic)
-    return 'One database role can run at most two statements at a time on one server (the server runs four in all). If two of yours are still running, wait for one to finish and run this statement again; it was not started.'
+  if (e.code === 'workbench_busy')
+    return 'One database role can run at most two statements at a time on one server (the server runs four in all). A statement that you stopped waiting for still counts until it ends. Wait for one to finish, or cancel one, and run this statement again; it was not started.'
   return ''
 })
 const hiddenRows = computed(() => (result.value?.data.rows.length ?? 0) - shownRows.value.length)
@@ -240,8 +308,21 @@ const hiddenRows = computed(() => (result.value?.data.rows.length ?? 0) - shownR
       <GateButton op="executeQuery" variant="primary" :disabled="!canRun" @click="runStatement">{{
         running ? 'Running...' : 'Run'
       }}</GateButton>
+      <GateButton
+        v-if="running"
+        op="cancelStatement"
+        variant="danger"
+        :disabled="cancelling || cancelRequested || statementId === null"
+        @click="cancelStatement"
+        >Cancel statement</GateButton
+      >
       <button v-if="running" type="button" class="btn" @click="stopWaiting">Stop waiting</button>
     </div>
+    <p v-if="running" class="hint muted" data-testid="cancel-help">
+      <strong>Cancel statement</strong> asks the server to end the statement now; it is rolled back.
+      <strong>Stop waiting</strong> only stops this page from waiting: the statement keeps running
+      on the server and keeps one of your two workbench slots until it ends.
+    </p>
     <div class="field">
       <label for="w-sql">SQL (Ctrl+Enter runs)</label>
       <textarea
@@ -257,12 +338,38 @@ const hiddenRows = computed(() => (result.value?.data.rows.length ?? 0) - shownR
   </form>
 
   <div class="stack" style="margin-top: var(--s-4)" aria-live="polite">
-    <p v-if="stopped" class="notice tone-warn" role="status">
+    <p v-if="stopped" class="notice tone-warn" role="status" data-testid="stopped-notice">
       <span aria-hidden="true">&#9650;</span>
       <span>
         You stopped waiting for the answer. The statement may still be running on the server until
         it finishes or reaches its timeout, and its effects are not undone.
+        <template v-if="abandonedId && !abandonedCancelled">
+          You can still end it:
+          <GateButton
+            op="cancelStatement"
+            small
+            variant="danger"
+            :disabled="cancelling"
+            @click="cancelAbandoned"
+            >Cancel it on the server</GateButton
+          >
+        </template>
+        <template v-if="abandonedCancelled"> Cancel requested: the server is ending it.</template>
       </span>
+    </p>
+    <ProblemNotice v-if="cancelError" :error="cancelError" />
+    <p v-if="cancelError" class="muted" data-testid="cancel-error-hint">
+      The statement may have ended already (then its answer is shown), or it runs on another server
+      than the one that answered this request: a statement is bound to the server it was started on.
+    </p>
+    <p
+      v-if="cancelRequested && running"
+      class="notice tone-info"
+      role="status"
+      data-testid="cancel-requested"
+    >
+      <span aria-hidden="true">&#9432;</span>
+      <span>Cancel requested. The server is ending the statement.</span>
     </p>
     <ProblemNotice v-if="error" :error="error" />
     <p v-if="errorHint" class="muted" data-testid="query-error-hint">{{ errorHint }}</p>

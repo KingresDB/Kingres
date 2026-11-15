@@ -87,10 +87,42 @@ export const mockConfig = {
    */
   incompleteLedger: false,
   /**
+   * 0.7.0: what `getLedgerStatus` says about its coverage. 'local' (default, as kingresd 0.7.0): only the chain of the
+   * shard group of the answering server is covered; 'all': every group is covered; 'absent': an older server that
+   * sends neither `complete` nor `uncoveredShardGroupIds`.
+   */
+  ledgerStatusCoverage: 'local' as 'local' | 'all' | 'absent',
+  /**
    * The address the mock server sees the client at (`Session.clientAddress`); null: the server does not report
    * it (an older revision). Documentation range, never a real host.
    */
   clientAddress: '203.0.113.7' as string | null,
+  /**
+   * 0.7.0: every `executeQuery` answers 429 `workbench_busy` with `Retry-After`, as if the role's two statements
+   * (or the server's four) were taken by other sessions.
+   */
+  workbenchBusy: false,
+  /**
+   * 0.7.0: this server is a follower that has not heard the manager leader for longer than the leader-loss bound:
+   * every request that needs a session check answers 503 `leader_unavailable` (with `Retry-After: 5`).
+   */
+  leaderLost: false,
+  /** 0.7.0: the answering server knows nothing about leases (`ShardGroup.lease` is absent). */
+  leaseAbsent: false,
+  /**
+   * 0.7.0: the client entry point of the servers is on. 'on': the client metrics of the entry point exist; 'standby':
+   * the metrics of the standby entry point exist too; false (the default of kingresd): no client metric exists.
+   */
+  clientEntryPoint: false as false | 'on' | 'standby',
+  /** Heartbeat bounds of the mock (the defaults of kingresd): silent for this long is suspect, then dead. */
+  suspectMs: 5000,
+  failureMs: 10000,
+  /** How long no standby may stream before the group stops waiting for it (`standby-sync-grace`, 30 s). */
+  syncGraceMs: 30000,
+  /** The time a lease granted just now is valid (`lease-duration`, 10 s). */
+  leaseDurationMs: 10000,
+  /** How long a statement of the mock that runs for ever is allowed to run when no timeout was sent. */
+  defaultStatementTimeoutMs: 30000,
 }
 
 // --- types of the internal records ------------------------------------------------------------
@@ -111,6 +143,11 @@ interface ServerRec {
   seenFingerprint?: string | null
   fingerprintPinned?: boolean
   certificateRevokedAt?: string | null
+  /**
+   * 0.7.0: when the server stopped sending heartbeats (the process was stopped), or null. It is suspect after
+   * `mockConfig.suspectMs` and dead after `mockConfig.failureMs`, whatever the catalog says.
+   */
+  silentSince?: number | null
 }
 
 interface GroupRec {
@@ -120,6 +157,16 @@ interface GroupRec {
   primaryServerId: string | null
   standbyServerIds: string[]
   failedServerIds: string[]
+  /** 0.7.0: the id of the standby on a server (`kingres_cp.standby`); missing for a standby of the catalog. */
+  standbyIds?: Record<string, number>
+  /** 0.7.0: servers whose standby of this group is managed by kingresd (not in the sharding catalog yet). */
+  managed?: string[]
+  /** 0.7.0: servers whose standby is being created by the task `standby.reconcile` (not streaming yet). */
+  creating?: string[]
+  /** 0.7.0: servers whose standby does not stream, with the time it stopped (ms). */
+  stalled?: Record<string, number>
+  /** 0.7.0: the primary of the group runs here but could not renew its lease (it was stopped when enforced). */
+  leaseLost?: boolean
 }
 
 interface BucketRec {
@@ -208,6 +255,10 @@ export interface MockState {
   leave: { until: number } | null
   /** False simulates a manager leader that cannot be reached (leaving needs `force` then). */
   leaderReachable: boolean
+  /** 0.7.0: statements the workbench runs now, by statement id (one role's id is unique on a server). */
+  statements: Map<string, { username: string; startedAt: number; cancelled: boolean }>
+  /** 0.7.0: the id of the next standby the task `standby.reconcile` creates. */
+  nextStandbyId: number
   session: SessionRec | null
   /** Result sets the workbench can select from, by table name (hostile-data tests). */
   extraQueryTables?: Record<string, { columns: S['QueryColumn'][]; rows: unknown[][] }>
@@ -665,6 +716,13 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
         message: 'Instance 112 is 1.8 s behind its primary.',
         serverId: '10.0.0.12',
         databaseName: null,
+        subject: {
+          serverId: '10.0.0.12',
+          behindServerId: null,
+          shardGroupId: null,
+          databaseName: null,
+          aspect: null,
+        },
         raisedAt: ago(1500),
       },
       {
@@ -676,6 +734,13 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
         message: 'Server 10.0.0.13 data volume has 28 percent free.',
         serverId: '10.0.0.13',
         databaseName: null,
+        subject: {
+          serverId: '10.0.0.13',
+          behindServerId: null,
+          shardGroupId: null,
+          databaseName: null,
+          aspect: null,
+        },
         raisedAt: ago(86400),
         acknowledgedAt: ago(80000),
         acknowledgedBy: 'ops',
@@ -689,6 +754,13 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
         message: 'Heartbeats from server 10.0.0.12 were missing for 14 seconds.',
         serverId: '10.0.0.12',
         databaseName: null,
+        subject: {
+          serverId: '10.0.0.12',
+          behindServerId: null,
+          shardGroupId: null,
+          databaseName: null,
+          aspect: null,
+        },
         raisedAt: ago(86400 * 3),
         resolvedAt: ago(86400 * 3 - 40),
       },
@@ -884,7 +956,285 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
     systemDatabaseStopped: false,
     leave: null,
     leaderReachable: true,
+    statements: new Map(),
+    nextStandbyId: 5,
     session: null,
+  }
+}
+
+// --- heartbeats, leases and standbys (contract 0.7.0) ------------------------------------------
+
+/** The server that answers the requests of the mock (its own heartbeat is always now). */
+export const ANSWERING_SERVER = '10.0.0.11'
+
+/**
+ * The status the answering server reports: the catalog status, overlaid with what the heartbeats say. A server
+ * silent for `suspectMs` is `suspect`, for `failureMs` `dead`; the status comes back when it is heard again.
+ */
+export function effectiveStatus(rec: ServerRec): ServerStatus {
+  if (isSilent(rec)) {
+    const age = Date.now() - (rec.silentSince as number)
+    if (age >= mockConfig.failureMs) return 'dead'
+    if (age >= mockConfig.suspectMs) return 'suspect'
+  }
+  return rec.status
+}
+
+/** True while the server sends no heartbeat (the answering server cannot hear it). */
+export function isSilent(rec: ServerRec): boolean {
+  return rec.silentSince !== null && rec.silentSince !== undefined && rec.id !== ANSWERING_SERVER
+}
+
+/** Stops the heartbeats of a server (as if its kingresd process were stopped). Returns false for an unknown id. */
+export function silenceServer(s: MockState, id: string, since: number = Date.now()): boolean {
+  const rec = s.servers.find((x) => x.id === id)
+  if (!rec || rec.id === ANSWERING_SERVER) return false
+  rec.silentSince = since
+  return true
+}
+
+/** The server is heard again. */
+export function reviveServer(s: MockState, id: string): void {
+  const rec = s.servers.find((x) => x.id === id)
+  if (rec) rec.silentSince = null
+}
+
+/** Marks the lease of a group as lost (the primary runs on the answering server and could not renew it). */
+export function loseLease(s: MockState, groupId: number): boolean {
+  const g = s.groups.find((x) => x.id === groupId)
+  if (!g || g.primaryServerId !== ANSWERING_SERVER) return false
+  g.leaseLost = true
+  return true
+}
+
+/** The lease is obtained again. */
+export function regainLease(s: MockState, groupId: number): void {
+  const g = s.groups.find((x) => x.id === groupId)
+  if (g) g.leaseLost = false
+}
+
+/** Stops the standby of a group on a server from streaming (its instance is stopped, or the link is cut). */
+export function stallStandby(
+  s: MockState,
+  groupId: number,
+  serverId: string,
+  since = Date.now(),
+): void {
+  const g = s.groups.find((x) => x.id === groupId)
+  if (!g) return
+  g.stalled = { ...(g.stalled ?? {}), [serverId]: since }
+}
+
+export function resumeStandby(s: MockState, groupId: number, serverId: string): void {
+  const g = s.groups.find((x) => x.id === groupId)
+  if (g?.stalled) delete g.stalled[serverId]
+}
+
+/** A group has a standby (what the lease enforcement rule asks): at least one standby is known to it. */
+export function hasStandby(g: GroupRec): boolean {
+  return g.standbyServerIds.length > 0
+}
+
+/** Whether the standby of `g` on `serverId` streams now. */
+export function standbyStreams(s: MockState, g: GroupRec, serverId: string): boolean {
+  if (g.creating?.includes(serverId)) return false
+  if (g.stalled && serverId in g.stalled) return false
+  const rec = s.servers.find((x) => x.id === serverId)
+  if (rec && (isSilent(rec) || rec.status === 'dead')) return false
+  return !g.failedServerIds.includes(serverId)
+}
+
+/** When the standbys of the group last all stopped streaming (ms), or null while one streams or is being made. */
+function noStreamSince(s: MockState, g: GroupRec): number | null {
+  if (g.standbyServerIds.length === 0) return null
+  let latest = 0
+  for (const id of g.standbyServerIds) {
+    if (g.creating?.includes(id)) return null
+    if (standbyStreams(s, g, id)) return null
+    const rec = s.servers.find((x) => x.id === id)
+    const since = Math.min(
+      g.stalled?.[id] ?? Infinity,
+      rec && isSilent(rec) ? (rec.silentSince as number) : Infinity,
+    )
+    latest = Math.max(latest, Number.isFinite(since) ? since : 0)
+  }
+  return latest
+}
+
+/** True when the primary no longer waits for a standby: none streams and the grace period is over. */
+export function syncRuleEmptied(s: MockState, g: GroupRec): boolean {
+  const since = noStreamSince(s, g)
+  return since !== null && Date.now() - since >= mockConfig.syncGraceMs
+}
+
+/** The instance id of a standby: 1048576 plus its own id while kingresd manages it (it is not in the catalog). */
+export function standbyInstanceId(g: GroupRec, serverId: string): number {
+  if (g.managed?.includes(serverId)) return 1_048_576 + (g.standbyIds?.[serverId] ?? 0)
+  return instanceId(g.id, serverId)
+}
+
+interface AlertSubjectKey {
+  serverId?: string | undefined
+  shardGroupId?: number | undefined
+  behindServerId?: string | undefined
+}
+
+const sameSubject = (a: Alert, subject: AlertSubjectKey): boolean =>
+  (a.subject?.serverId ?? null) === (subject.serverId ?? null) &&
+  (a.subject?.shardGroupId ?? null) === (subject.shardGroupId ?? null)
+
+/** Raises an alert once per kind and subject; an acknowledged alert stays acknowledged. */
+function raise(
+  s: MockState,
+  kind: Alert['kind'],
+  severity: Alert['severity'],
+  subject: AlertSubjectKey,
+  title: string,
+  message: string,
+): void {
+  if (s.alerts.some((a) => a.kind === kind && a.state !== 'resolved' && sameSubject(a, subject)))
+    return
+  s.alerts.unshift({
+    id: Math.max(0, ...s.alerts.map((a) => a.id)) + 1,
+    kind,
+    severity,
+    state: 'open',
+    title,
+    message,
+    serverId: subject.serverId ?? null,
+    databaseName: null,
+    raisedAt: nowIso(),
+    subject: {
+      serverId: subject.serverId ?? null,
+      behindServerId: subject.behindServerId ?? null,
+      shardGroupId: subject.shardGroupId ?? null,
+      databaseName: null,
+      aspect: null,
+    },
+  })
+}
+
+/** Resolves the open alerts of a kind about a subject. Returns how many were resolved. */
+function clear(s: MockState, kind: Alert['kind'], subject: AlertSubjectKey): number {
+  let n = 0
+  for (const a of s.alerts) {
+    if (a.kind === kind && a.state !== 'resolved' && sameSubject(a, subject)) {
+      a.state = 'resolved'
+      a.resolvedAt = nowIso()
+      n += 1
+    }
+  }
+  return n
+}
+
+function systemAudit(s: MockState, action: AuditEvent['action'], groupId: number): void {
+  s.audit.unshift({
+    id: s.nextAuditId++,
+    timestamp: nowIso(),
+    actor: 'system',
+    source: 'system',
+    serverId: ANSWERING_SERVER,
+    action,
+    resourceType: 'shardGroup',
+    resourceId: String(groupId),
+    outcome: 'success',
+  })
+}
+
+/**
+ * Brings the alerts and the audit log in line with what the heartbeats, leases and standbys say now (what the
+ * manager leader does every few seconds). Called before every request of the mock, so it stays cheap.
+ */
+export function tickHa(s: MockState): void {
+  if (s.node.state !== 'clustered') return
+  for (const rec of s.servers) {
+    if (rec.id === ANSWERING_SERVER) continue
+    const st = effectiveStatus(rec)
+    const subject = { serverId: rec.id }
+    if (isSilent(rec)) {
+      if (st === 'suspect')
+        raise(
+          s,
+          'serverSuspect',
+          'warning',
+          subject,
+          `Server ${rec.id} is not answering`,
+          `No heartbeat from server ${rec.id} for more than ${Math.round(mockConfig.suspectMs / 1000)} seconds.`,
+        )
+      if (st === 'dead') {
+        clear(s, 'serverSuspect', subject)
+        raise(
+          s,
+          'serverDown',
+          'critical',
+          subject,
+          `Server ${rec.id} is down`,
+          `No heartbeat from server ${rec.id} for more than ${Math.round(mockConfig.failureMs / 1000)} seconds.`,
+        )
+      }
+    } else if (rec.status !== 'dead') {
+      // Heard again: the manager clears both alerts about heartbeats.
+      clear(s, 'serverSuspect', subject)
+      for (const a of s.alerts)
+        if (a.kind === 'serverDown' && a.state !== 'resolved' && a.title.endsWith(' is down'))
+          if (a.subject?.serverId === rec.id) {
+            a.state = 'resolved'
+            a.resolvedAt = nowIso()
+          }
+    }
+  }
+  const wanted = s.settings.defaultReplicaCount
+  const others = s.servers.length - 1
+  for (const g of s.groups) {
+    const key = { shardGroupId: g.id, serverId: g.primaryServerId ?? undefined }
+    if (g.leaseLost === true && g.primaryServerId === ANSWERING_SERVER) {
+      const known = s.alerts.some(
+        (a) => a.kind === 'leaseLost' && a.state !== 'resolved' && a.subject?.shardGroupId === g.id,
+      )
+      raise(
+        s,
+        'leaseLost',
+        'critical',
+        key,
+        `The primary of shard group ${g.id} lost its lease`,
+        hasStandby(g)
+          ? `The primary on server ${g.primaryServerId} could not renew the lease of shard group ${g.id} and was stopped, so that no second primary can run.`
+          : `The primary on server ${g.primaryServerId} could not renew the lease of shard group ${g.id}. The group has no standby, so the primary keeps running.`,
+      )
+      if (!known) {
+        systemAudit(s, 'leaseLost', g.id)
+        if (hasStandby(g)) systemAudit(s, 'leaseFenced', g.id)
+      }
+    } else if (clear(s, 'leaseLost', key) > 0) {
+      systemAudit(s, 'leaseAcquired', g.id)
+    }
+    if (syncRuleEmptied(s, g)) {
+      raise(
+        s,
+        'groupWithoutSynchronousStandby',
+        'critical',
+        key,
+        `Shard group ${g.id} has no synchronous standby`,
+        `No standby of shard group ${g.id} has streamed for more than ${Math.round(mockConfig.syncGraceMs / 1000)} seconds, so its primary no longer waits for one: commits are acknowledged by one server only.`,
+      )
+    } else {
+      clear(s, 'groupWithoutSynchronousStandby', key)
+    }
+    // Fewer standbys stream than the replica count allows (never in a one-server cluster).
+    const target = Math.min(wanted, others)
+    const streaming = g.standbyServerIds.filter((id) => standbyStreams(s, g, id)).length
+    if (others > 0 && wanted > 0 && !g.creating?.length && streaming < wanted) {
+      raise(
+        s,
+        'groupUnderReplicated',
+        'warning',
+        key,
+        `Shard group ${g.id} has fewer standbys than the replica count`,
+        `Shard group ${g.id} has ${streaming} streaming standby(s); the replica count of the cluster is ${wanted}${target < wanted ? ` and the servers allow ${target}` : ''}.`,
+      )
+    } else {
+      clear(s, 'groupUnderReplicated', key)
+    }
   }
 }
 
@@ -914,10 +1264,10 @@ function allBuckets(s: MockState): BucketRec[] {
 export function instancesOfServer(s: MockState, serverId: string): Instance[] {
   const out: Instance[] = []
   const server = s.servers.find((x) => x.id === serverId)
-  const dead = server?.status === 'dead'
+  const dead = server ? effectiveStatus(server) === 'dead' : false
   for (const g of s.groups) {
     const make = (role: 'primary' | 'standby', failed: boolean): Instance => ({
-      id: instanceId(g.id, serverId),
+      id: role === 'standby' ? standbyInstanceId(g, serverId) : instanceId(g.id, serverId),
       serverId,
       shardGroupId: g.id,
       isMapGroup: g.isMapGroup,
@@ -966,7 +1316,7 @@ export function serverView(s: MockState, rec: ServerRec): Server {
     id: rec.id,
     address: rec.address,
     hostname: rec.hostname,
-    status: rec.status,
+    status: effectiveStatus(rec),
     serverGroup: rec.serverGroup,
     shouldHaveShards: rec.shouldHaveShards,
     isManagerLeader: rec.id === '10.0.0.11',
@@ -976,68 +1326,127 @@ export function serverView(s: MockState, rec: ServerRec): Server {
     fingerprintPinned: rec.seenFingerprint ? (rec.fingerprintPinned ?? false) : false,
     // The version of a server that has not reported yet is unknown.
     version: rec.telemetry ? rec.version : null,
-    uptimeSeconds: rec.telemetry ? Math.floor((Date.now() - rec.startedAt) / 1000) : null,
+    // A server whose agent cannot be reached reports no uptime (contract 0.6.0, 0.7.0: heartbeats).
+    uptimeSeconds:
+      rec.telemetry && !isSilent(rec) ? Math.floor((Date.now() - rec.startedAt) / 1000) : null,
     joinedAt: rec.joinedAt,
-    lastHeartbeatAt: rec.status === 'dead' ? ago(600) : ago(1),
+    // 0.7.0: the time of the last heartbeat; for the answering server it is now.
+    lastHeartbeatAt: isSilent(rec)
+      ? new Date(rec.silentSince as number).toISOString()
+      : rec.status === 'dead'
+        ? ago(600)
+        : ago(rec.id === ANSWERING_SERVER ? 0 : 1),
     instances,
     buckets: { primary, replica },
     sizeBytes,
     replicationLagMaxSeconds: lags.length ? Math.max(...lags) : null,
-    resources: rec.telemetry
-      ? {
-          cpuUsagePercent: 18 + k * 9,
-          memoryUsedBytes: (6 + k) * GiB,
-          memoryTotalBytes: 16 * GiB,
-          diskUsedBytes: (120 + k * 35) * GiB,
-          diskTotalBytes: 500 * GiB,
-        }
-      : {
-          cpuUsagePercent: null,
-          memoryUsedBytes: null,
-          memoryTotalBytes: 16 * GiB,
-          diskUsedBytes: null,
-          diskTotalBytes: null,
-        },
+    resources:
+      rec.telemetry && !isSilent(rec)
+        ? {
+            cpuUsagePercent: 18 + k * 9,
+            memoryUsedBytes: (6 + k) * GiB,
+            memoryTotalBytes: 16 * GiB,
+            diskUsedBytes: (120 + k * 35) * GiB,
+            diskTotalBytes: 500 * GiB,
+          }
+        : {
+            cpuUsagePercent: null,
+            memoryUsedBytes: null,
+            memoryTotalBytes: 16 * GiB,
+            diskUsedBytes: null,
+            diskTotalBytes: null,
+          },
   }
 }
 
+/** The lease of a group as the answering server knows it (contract 0.7.0), or undefined for an older server. */
+export function leaseView(s: MockState, g: GroupRec): S['GroupLease'] | undefined {
+  if (mockConfig.leaseAbsent) return undefined
+  const enforced = hasStandby(g)
+  if (g.primaryServerId === null)
+    return { holder: g.preferredPrimaryServerId, state: 'none', enforced }
+  const holder = g.primaryServerId
+  if (holder === ANSWERING_SERVER) {
+    if (g.leaseLost === true) return { holder, state: 'lost', enforced }
+    const left = mockConfig.leaseDurationMs - (Date.now() % 2000)
+    return { holder, state: 'held', remainingMillis: left, enforced }
+  }
+  // A group whose primary runs elsewhere: the answering server only knows what it granted.
+  const rec = s.servers.find((x) => x.id === holder)
+  if (rec && isSilent(rec)) {
+    const left = mockConfig.leaseDurationMs - (Date.now() - (rec.silentSince as number))
+    if (left <= 0) return { holder, state: 'none', enforced }
+    return { holder, state: 'granted', remainingMillis: left, enforced }
+  }
+  const left = mockConfig.leaseDurationMs - (Date.now() % 2000)
+  return { holder, state: 'granted', remainingMillis: left, enforced }
+}
+
 export function groupView(s: MockState, g: GroupRec): ShardGroup {
-  const member = (
-    serverId: string,
-    role: 'primary' | 'standby',
-    index: number,
-  ): S['ReplicationMember'] => {
+  const emptied = syncRuleEmptied(s, g)
+  const member = (serverId: string, role: 'primary' | 'standby'): S['ReplicationMember'] => {
     const inst = instancesOfServer(s, serverId).find((i) => i.shardGroupId === g.id)
+    const streams = role === 'standby' && standbyStreams(s, g, serverId)
+    const creating = role === 'standby' && (g.creating?.includes(serverId) ?? false)
+    // A primary that lost an enforced lease was stopped on purpose.
+    const fenced = role === 'primary' && g.leaseLost === true && hasStandby(g)
+    const recSrv = s.servers.find((x) => x.id === serverId)
+    const unheard = recSrv !== undefined && effectiveStatus(recSrv) === 'dead'
     return {
-      instanceId: instanceId(g.id, serverId),
+      instanceId: role === 'standby' ? standbyInstanceId(g, serverId) : instanceId(g.id, serverId),
       serverId,
       role,
-      state: inst?.state ?? 'running',
+      state: fenced
+        ? 'stopped'
+        : creating
+          ? 'starting'
+          : unheard
+            ? 'failed'
+            : (inst?.state ?? 'running'),
       port: portFor(g.id, serverId),
       timeline: 3,
-      syncState: role === 'primary' ? null : index === 0 ? 'quorum' : 'async',
-      lagBytes: role === 'primary' ? null : (inst?.replicationLagBytes ?? 0),
-      lagSeconds: role === 'primary' ? null : (inst?.replicationLagSeconds ?? 0),
+      // `ANY 1 (...)` makes every streaming standby a quorum member; after the grace period nothing is waited for.
+      syncState: role === 'primary' ? null : streams && !emptied ? 'quorum' : 'async',
+      lagBytes:
+        role === 'primary' ? null : streams || !creating ? (inst?.replicationLagBytes ?? 0) : null,
+      lagSeconds:
+        role === 'primary'
+          ? null
+          : streams || !creating
+            ? (inst?.replicationLagSeconds ?? 0)
+            : null,
       isOnPreferredServer: role === 'primary' ? serverId === g.preferredPrimaryServerId : true,
     }
   }
-  const primary = g.primaryServerId === null ? null : member(g.primaryServerId, 'primary', 0)
-  const standbys = g.standbyServerIds.map((id, i) => member(id, 'standby', i))
+  const primary = g.primaryServerId === null ? null : member(g.primaryServerId, 'primary')
+  const standbys = g.standbyServerIds.map((id) => member(id, 'standby'))
   const replicaCount = s.settings.defaultReplicaCount
+  const lease = leaseView(s, g)
+  const primaryDown =
+    primary !== null && (primary.state === 'stopped' || primary.state === 'failed')
+  const standbyDown = g.standbyServerIds.some((id) => !standbyStreams(s, g, id))
   return {
     id: g.id,
     isMapGroup: g.isMapGroup,
     preferredPrimaryServerId: g.preferredPrimaryServerId,
-    health: !primary ? 'unavailable' : standbys.length < replicaCount ? 'degraded' : 'healthy',
+    health:
+      !primary || primaryDown
+        ? 'unavailable'
+        : standbys.length < replicaCount || standbyDown
+          ? 'degraded'
+          : 'healthy',
     primary,
     standbys,
     slots: standbys.map((m) => ({
-      name: `kdb_slot_g${g.id}_s${m.serverId}`,
+      name: g.managed?.includes(m.serverId)
+        ? `kingres_standby_${g.standbyIds?.[m.serverId] ?? 0}`
+        : `kdb_slot_g${g.id}_s${m.serverId}`,
       type: 'physical' as const,
-      active: true,
+      active: standbyStreams(s, g, m.serverId),
       instanceId: m.instanceId,
-      retainedWalBytes: 16 * MiB,
+      retainedWalBytes: standbyStreams(s, g, m.serverId) ? 16 * MiB : 480 * MiB,
     })),
+    ...(lease ? { lease } : {}),
   }
 }
 
@@ -1062,7 +1471,7 @@ export function bucketCounts(s: MockState): ClusterOverview['buckets'] {
 }
 
 export function overview(s: MockState): ClusterOverview {
-  const count = (st: ServerStatus) => s.servers.filter((x) => x.status === st).length
+  const count = (st: ServerStatus) => s.servers.filter((x) => effectiveStatus(x) === st).length
   const buckets = bucketCounts(s)
   const critical = s.alerts.filter((a) => a.state === 'open' && a.severity === 'critical').length
   const warning = s.alerts.filter((a) => a.state === 'open' && a.severity === 'warning').length
@@ -1113,10 +1522,38 @@ export function overview(s: MockState): ClusterOverview {
   }
 }
 
-export function ledgerStatusOf(s: MockState, db: DbRec): S['LedgerStatus'] {
+/**
+ * Contract 0.7.0: the chains of a status are those of the shard group of the answering server; the other groups are
+ * listed as not covered. A database that is not sharded has one chain. `mockConfig.incompleteLedger` makes the last
+ * shard group uncovered as the digest does; otherwise a status covers the group of the answering server only.
+ */
+function ledgerCoverage(
+  s: MockState,
+  db: DbRec,
+  groups: number[],
+): { complete?: boolean; uncoveredShardGroupIds?: number[] } {
+  if (mockConfig.ledgerStatusCoverage === 'absent') return {}
+  if (!db.info.sharding.enabled || groups.length <= 1)
+    return { complete: true, uncoveredShardGroupIds: [] }
+  const local = s.groups.find((g) => g.primaryServerId === ANSWERING_SERVER && !g.isMapGroup)
+  const covered =
+    mockConfig.ledgerStatusCoverage === 'all' ? groups : local ? [local.id] : groups.slice(0, 1)
+  const uncovered = groups.filter((g) => !covered.includes(g))
+  return { complete: uncovered.length === 0, uncoveredShardGroupIds: uncovered }
+}
+
+/**
+ * The status of a database as `getLedgerStatus` answers it. `full` reads the chains of every shard group, which the
+ * mock needs for what the real server computes by asking every group (digests, verifications, the database summary).
+ */
+export function ledgerStatusOf(s: MockState, db: DbRec, full = false): S['LedgerStatus'] {
   const verified = s.ledger.verifications.filter((v) => v.databaseName === db.info.name)
   const last = verified[0]
-  const groups = db.info.sharding.enabled ? dataGroups(s).map((g) => g.id) : [0]
+  const all = db.info.sharding.enabled ? dataGroups(s).map((g) => g.id) : [0]
+  const coverage = full
+    ? { complete: true, uncoveredShardGroupIds: [] }
+    : ledgerCoverage(s, db, all)
+  const groups = all.filter((g) => !(coverage.uncoveredShardGroupIds ?? []).includes(g))
   return {
     databaseName: db.info.name,
     mode: db.info.ledger.mode ?? 'off',
@@ -1125,6 +1562,7 @@ export function ledgerStatusOf(s: MockState, db: DbRec): S['LedgerStatus'] {
       (db.info.ledger.mode ?? 'off') === 'off' ? 'never' : (last?.state ?? 'never'),
     lastVerifiedAt: last?.finishedAt ?? null,
     ledgerTableCount: db.tables.filter((t) => t.classes.includes('ledger')).length,
+    ...coverage,
     chains:
       db.info.ledger.mode === 'off'
         ? []
@@ -1287,6 +1725,147 @@ export function activeTask(s: MockState, kind: TaskKind, subjectId?: string): Ta
       t.task.state === 'running' &&
       (subjectId === undefined || t.task.subject?.id === subjectId),
   )
+}
+
+// --- standbys: the task `standby.reconcile` (contract 0.7.0) ---------------------------------------
+
+/** The text kingresd records while the catalog step cannot do its work (the sharding extension has no standby nodes). */
+export const CATALOG_SKIPPED_DETAIL = 'skipped: needs kingres_shard 0.4'
+export const CATALOG_STEP = 'standby.register_in_catalog'
+
+interface ReconcilePlan {
+  remove: { group: GroupRec; server: string }[]
+  add: { group: GroupRec; server: string; id: number }[]
+}
+
+/**
+ * The placement of kingresd: the standbys of the group whose primary runs on server i go to the next servers after i
+ * in the ring, servers of another server group first, never two instances of one group on a server. A standby
+ * that works stays; a lower count removes the least preferred.
+ */
+function planReconcile(s: MockState): ReconcilePlan {
+  const plan: ReconcilePlan = { remove: [], add: [] }
+  const wanted = s.settings.defaultReplicaCount
+  const ring = s.servers.map((x) => x.id)
+  let nextId = s.nextStandbyId
+  for (const g of s.groups) {
+    if (g.primaryServerId === null) continue
+    const primary = s.servers.find((x) => x.id === g.primaryServerId)
+    const at = ring.indexOf(g.primaryServerId)
+    const after = [...ring.slice(at + 1), ...ring.slice(0, at)]
+    const otherGroup = after.filter(
+      (id) => s.servers.find((x) => x.id === id)?.serverGroup !== primary?.serverGroup,
+    )
+    const sameGroup = after.filter((id) => !otherGroup.includes(id))
+    const preference = [...otherGroup, ...sameGroup]
+    const rank = (id: string) => preference.indexOf(id)
+    const existing = g.standbyServerIds
+      .filter((id) => rank(id) >= 0)
+      .sort((a, b) => rank(a) - rank(b))
+    const keep = existing.slice(0, wanted)
+    for (const id of g.standbyServerIds)
+      if (!keep.includes(id)) plan.remove.push({ group: g, server: id })
+    for (const id of preference) {
+      if (keep.length >= wanted) break
+      if (keep.includes(id)) continue
+      const rec = s.servers.find((x) => x.id === id)
+      if (!rec || rec.status === 'dead' || isSilent(rec)) continue
+      keep.push(id)
+      plan.add.push({ group: g, server: id, id: nextId++ })
+    }
+  }
+  return plan
+}
+
+/** True while a `standby.reconcile` task runs (at most one runs at a time). */
+export function reconcileRunning(s: MockState): boolean {
+  return s.tasks.some((t) => t.task.kind === 'standby.reconcile' && t.task.state === 'running')
+}
+
+/**
+ * What the manager leader does when `defaultReplicaCount` is patched: it checks the standbys against the setting and,
+ * when there is work, starts the task. Returns the task, or null when nothing has to be done (or one already runs).
+ */
+export function startStandbyReconcile(s: MockState, user = 'system'): Task | null {
+  if (reconcileRunning(s)) return null
+  const plan = planReconcile(s)
+  if (plan.remove.length === 0 && plan.add.length === 0) return null
+  s.nextStandbyId += plan.add.length
+  const names = [
+    ...plan.remove.map(
+      (r) => `Remove the standby of shard group ${r.group.id} from server ${r.server}`,
+    ),
+    ...plan.add.map((a) => `Create the standby of shard group ${a.group.id} on server ${a.server}`),
+    'Send the list of standbys to every server',
+    CATALOG_STEP,
+  ]
+  const removed = new Set<string>()
+  const started = new Set<string>()
+  const ready = new Set<string>()
+  let taskId = -1
+  const advance = (fraction: number): void => {
+    const total = names.length
+    plan.remove.forEach((r, i) => {
+      const key = `${r.group.id}:${r.server}`
+      if (fraction < i / total || removed.has(key)) return
+      removed.add(key)
+      r.group.standbyServerIds = r.group.standbyServerIds.filter((x) => x !== r.server)
+      r.group.managed = (r.group.managed ?? []).filter((x) => x !== r.server)
+      r.group.creating = (r.group.creating ?? []).filter((x) => x !== r.server)
+      standbyAudit(s, 'standbyRemoved', r.group.id, r.server)
+    })
+    plan.add.forEach((a, i) => {
+      const key = `${a.group.id}:${a.server}`
+      const index = plan.remove.length + i
+      if (fraction >= index / total && !started.has(key)) {
+        started.add(key)
+        a.group.standbyServerIds.push(a.server)
+        a.group.standbyIds = { ...(a.group.standbyIds ?? {}), [a.server]: a.id }
+        a.group.managed = [...(a.group.managed ?? []), a.server]
+        a.group.creating = [...(a.group.creating ?? []), a.server]
+      }
+      if (fraction >= (index + 1) / total && !ready.has(key)) {
+        ready.add(key)
+        a.group.creating = (a.group.creating ?? []).filter((x) => x !== a.server)
+        standbyAudit(s, 'standbyCreated', a.group.id, a.server)
+      }
+    })
+    // The last step records why it did nothing, on the task (it succeeds).
+    if (fraction >= (total - 1) / total && plan.add.length > 0) {
+      const rec = s.tasks.find((t) => t.task.id === taskId)
+      if (rec) rec.task.detail = CATALOG_SKIPPED_DETAIL
+    }
+  }
+  const task = createTask(s, {
+    kind: 'standby.reconcile',
+    subject: { type: 'replication', id: 'standbys' },
+    steps: names,
+    user,
+    durationMs: 6000,
+    onProgress: advance,
+    apply: () => advance(1),
+  })
+  taskId = task.id
+  return task
+}
+
+function standbyAudit(
+  s: MockState,
+  action: AuditEvent['action'],
+  groupId: number,
+  server: string,
+): void {
+  s.audit.unshift({
+    id: s.nextAuditId++,
+    timestamp: nowIso(),
+    actor: 'system',
+    source: 'system',
+    serverId: ANSWERING_SERVER,
+    action,
+    resourceType: 'standby',
+    resourceId: `${groupId}@${server}`,
+    outcome: 'success',
+  })
 }
 
 // --- cluster operations (applied when tasks finish) ------------------------------------------------

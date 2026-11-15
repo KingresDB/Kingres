@@ -1,8 +1,7 @@
 <!-- SPDX-License-Identifier: PostgreSQL -->
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
-import { computed, ref } from 'vue'
-import { RouterLink } from 'vue-router'
+import { ref } from 'vue'
 import TableWrap from '@/components/TableWrap.vue'
 import { useMutation, useQueryClient } from '@tanstack/vue-query'
 import PageHeader from '@/components/PageHeader.vue'
@@ -11,19 +10,17 @@ import StatusBadge from '@/components/StatusBadge.vue'
 import GateButton from '@/components/GateButton.vue'
 import ProblemNotice from '@/components/ProblemNotice.vue'
 import SafeName from '@/components/SafeName.vue'
+import AlertSubject from '@/components/AlertSubject.vue'
 import PartialNotice from '@/components/PartialNotice.vue'
 import CursorResetNotice from '@/components/CursorResetNotice.vue'
 import { useCompletenessAnnouncement } from '@/composables/useCompletenessAnnouncement'
-import { isAddressableSegment } from '@/lib/path-segment'
 import { safeText } from '@/lib/safe-text'
-import { useSessionStore } from '@/stores/session'
 import { endpoints } from '@/api/endpoints'
 import { keys, usePagedQuery } from '@/api/queries'
 import { alertKindHint, alertKindLabel, SEVERITY } from '@/lib/status'
 import { formatAgo, formatDateTime } from '@/lib/format'
 
 const client = useQueryClient()
-const session = useSessionStore()
 const state = ref<'' | 'open' | 'acknowledged' | 'resolved'>('')
 const {
   query: alerts,
@@ -38,9 +35,6 @@ const {
 )
 const shown = () => items.value.filter((a) => !state.value || a.state === state.value)
 useCompletenessAnnouncement(completeness, 'list of alerts')
-/** The server page can be opened for this id (the account may read servers, the id fits in a URL). */
-const canOpenServer = computed(() => session.can('getServer'))
-const linkable = (id: string): boolean => canOpenServer.value && isAddressableSegment(id)
 /**
  * Alert ids are integers below 2^53 (0.5.0: the high bits name the server that holds the alert), which
  * a JSON number holds exactly. An id at or above 2^53 would already have been rounded when the answer
@@ -115,15 +109,7 @@ const STATE_LABEL = { open: 'Open', acknowledged: 'Acknowledged', resolved: 'Res
               <div v-if="alertKindHint(a.kind)" class="muted" data-testid="alert-kind-hint">
                 {{ alertKindHint(a.kind) }}
               </div>
-              <div v-if="a.serverId" class="muted" data-testid="alert-server">
-                Server
-                <RouterLink
-                  v-if="linkable(a.serverId)"
-                  :to="{ name: 'server', params: { id: a.serverId } }"
-                  ><SafeName :value="a.serverId" kind="text" :max="60"
-                /></RouterLink>
-                <SafeName v-else :value="a.serverId" kind="text" :max="60" />
-              </div>
+              <AlertSubject :alert="a" />
             </td>
             <td>
               {{ STATE_LABEL[a.state] ?? safeText(String(a.state), 40) }}

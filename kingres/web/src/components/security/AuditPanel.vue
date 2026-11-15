@@ -11,6 +11,7 @@ import { useCompletenessAnnouncement } from '@/composables/useCompletenessAnnoun
 import { endpoints } from '@/api/endpoints'
 import { keys, usePagedQuery } from '@/api/queries'
 import { formatDateTime } from '@/lib/format'
+import { auditActionLabel } from '@/lib/status'
 import { auditActions } from '@/api/operations.generated'
 import type { AuditAction } from '@/api/types'
 
@@ -48,7 +49,9 @@ const OUTCOME = {
         <label for="au-act">Action</label>
         <select id="au-act" v-model="action">
           <option value="">All</option>
-          <option v-for="a in auditActions" :key="a" :value="a">{{ a }}</option>
+          <option v-for="a in auditActions" :key="a" :value="a">
+            {{ auditActionLabel(a) }} ({{ a }})
+          </option>
         </select>
       </div>
       <div class="field">
@@ -110,7 +113,10 @@ const OUTCOME = {
                 <template v-else>-</template>
               </td>
               <td>{{ e.source }}</td>
-              <td class="mono">{{ e.action }}</td>
+              <td data-testid="audit-action">
+                <SafeName :value="auditActionLabel(e.action)" kind="text" :max="80" />
+                <div class="muted mono"><SafeName :value="e.action" kind="text" :max="60" /></div>
+              </td>
               <td>
                 <SafeName
                   v-if="e.resourceType"

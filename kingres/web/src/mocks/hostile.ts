@@ -195,6 +195,43 @@ export function seedHostile(s: MockState): void {
       serverId: '..',
       databaseName: null,
     },
+    // 0.7.0: the typed subject of an alert (server ids, database name and qualifier chosen by whoever controls them).
+    {
+      ...base,
+      id: 904,
+      kind: 'replicationPending',
+      severity: 'warning',
+      state: 'open',
+      title: HOSTILE.markup,
+      message: HOSTILE.newline,
+      serverId: HOSTILE.reversed,
+      databaseName: null,
+      subject: {
+        serverId: HOSTILE.reversed,
+        behindServerId: HOSTILE.zeroWidth,
+        shardGroupId: null,
+        databaseName: null,
+        aspect: null,
+      },
+    },
+    {
+      ...base,
+      id: 905,
+      kind: 'ledgerPendingTooOld',
+      severity: 'warning',
+      state: 'open',
+      title: HOSTILE.cyrillic,
+      message: HOSTILE.controls,
+      serverId: '..',
+      databaseName: HOSTILE.markup,
+      subject: {
+        serverId: '..',
+        behindServerId: null,
+        shardGroupId: 2,
+        databaseName: HOSTILE.markup,
+        aspect: HOSTILE.breakout,
+      },
+    },
   )
 
   const logs: string[] = [

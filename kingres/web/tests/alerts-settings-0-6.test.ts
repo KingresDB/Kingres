@@ -41,7 +41,12 @@ describe('alert kind replicationPending (0.6.0)', () => {
       '/servers/10.0.0.13',
     )
     expect(screen.getByText('A change has not reached a server yet')).toBeInTheDocument()
-    expect(screen.getByTestId('alert-kind-hint')).toHaveTextContent(/may still work on that server/)
+    // Other kinds with a sentence of their own (serverDown, serverSuspect) show theirs too.
+    expect(
+      screen
+        .getAllByTestId('alert-kind-hint')
+        .some((el) => /may still work on that server/.test(el.textContent ?? '')),
+    ).toBe(true)
   })
 
   it('a server id that no URL can carry stays plain text', async () => {

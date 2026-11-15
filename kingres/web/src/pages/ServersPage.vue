@@ -16,7 +16,14 @@ import CertificateExpiry from '@/components/CertificateExpiry.vue'
 import { useServers, keys } from '@/api/queries'
 import { SERVER_STATUS } from '@/lib/status'
 import { instanceLabel } from '@/lib/cluster'
-import { formatBytes, formatDateTime, formatDuration, formatLag, percent } from '@/lib/format'
+import {
+  formatAgo,
+  formatBytes,
+  formatDateTime,
+  formatDuration,
+  formatLag,
+  percent,
+} from '@/lib/format'
 import type { Server } from '@/api/types'
 
 const servers = useServers()
@@ -78,6 +85,15 @@ const dialog = ref<{ kind: 'add' | 'restore' | 'failover' | 'remove'; server?: S
             </th>
             <td>
               <StatusBadge :meta="SERVER_STATUS[s.status]" />
+              <div v-if="s.status !== 'live'" class="muted" data-testid="last-heartbeat">
+                <template v-if="s.lastHeartbeatAt"
+                  >Last heartbeat
+                  <time :datetime="s.lastHeartbeatAt" :title="formatDateTime(s.lastHeartbeatAt)">{{
+                    formatAgo(s.lastHeartbeatAt)
+                  }}</time></template
+                >
+                <template v-else>No heartbeat on record</template>
+              </div>
               <div v-if="s.certificateRevokedAt" data-testid="revoked-badge">
                 <span class="badge tone-danger"
                   ><span aria-hidden="true">&#10006;</span> Certificates revoked</span
@@ -150,6 +166,12 @@ const dialog = ref<{ kind: 'add' | 'restore' | 'failover' | 'remove'; server?: S
         </tbody>
       </table>
     </TableWrap>
+    <p class="hint muted" data-testid="liveness-note">
+      Servers send each other a heartbeat every second. A server that was silent for 5 seconds is
+      suspect, for 10 seconds dead (the defaults), and it is live again as soon as it is heard.
+      These two statuses are the view of the server that answered: another server can differ for a
+      moment.
+    </p>
   </QueryBoundary>
 
   <div style="margin-top: var(--s-5)"><ServerGroupsPanel /></div>

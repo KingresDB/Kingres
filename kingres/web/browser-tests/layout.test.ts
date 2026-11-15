@@ -8,6 +8,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { Browser, Page } from 'puppeteer-core'
 import {
+  HA_SWITCHES,
   ROUTES,
   SECURITY_TABS,
   STATES,
@@ -29,7 +30,9 @@ beforeAll(async () => {
   server = await startDevServer()
   browser = await launch()
   page = await browser.newPage()
-  await page.goto(`${server.url}/?mock=hostile&latency=0`, { waitUntil: 'networkidle0' })
+  await page.goto(`${server.url}/?mock=hostile&latency=0&${HA_SWITCHES}`, {
+    waitUntil: 'networkidle0',
+  })
   await signIn(page)
   await settled(page)
 })
@@ -321,3 +324,128 @@ describe('the legend of a chart keeps each name and value whole', () => {
     expect(Math.max(...heights)).toBeLessThan(28)
   })
 })
+
+for (const [label, width, height] of [
+  ['1366 px', 1366, 820],
+  ['683 px (200 percent zoom)', 683, 410],
+  ['320 px', 320, 640],
+] as const) {
+  describe(`the parts of contract 0.7.0 fit the window at ${label}`, () => {
+    it('Replication: the lease, the commit rule and the standbys stay inside the window and say what happened', async () => {
+      await page.setViewport({ width, height })
+      await go(page, '/replication')
+      await page.waitForSelector('[data-testid="group-lease"]')
+      // The alerts arrive after the topology: the group that lost its standby says so once they are there.
+      await page.waitForFunction(
+        () =>
+          [...document.querySelectorAll('[data-testid="commit-rule"]')].some((e) =>
+            /not any more/i.test(e.textContent ?? ''),
+          ),
+        { timeout: 30_000 },
+      )
+      const found = await page.evaluate(() => {
+        const out: string[] = []
+        const w = window.innerWidth
+        for (const sel of [
+          '[data-testid="group-lease"]',
+          '[data-testid="commit-rule"]',
+          '[data-testid="standby-task"]',
+        ])
+          for (const el of document.querySelectorAll(sel)) {
+            const r = el.getBoundingClientRect()
+            if (r.left < -1 || r.right > w + 1)
+              out.push(sel + ' ' + Math.round(r.left) + '..' + Math.round(r.right))
+          }
+        const lost = [...document.querySelectorAll('[data-testid="group-lease"]')].find(
+          (e) => (e as HTMLElement).dataset.leaseState === 'lost',
+        )
+        return {
+          outside: out,
+          leases: document.querySelectorAll('[data-testid="group-lease"]').length,
+          lostText: lost?.textContent ?? '',
+          dropped: [...document.querySelectorAll('[data-testid="commit-rule"]')].some((e) =>
+            /not any more/i.test(e.textContent ?? ''),
+          ),
+        }
+      })
+      expect(found.outside).toEqual([])
+      expect(found.leases).toBeGreaterThanOrEqual(4)
+      expect(found.lostText).toMatch(/stopped on purpose/i)
+      expect(found.dropped).toBe(true)
+      const g = await geometry()
+      expect(g.scrollWidth, g.offenders.join(', ')).toBeLessThanOrEqual(g.innerWidth)
+    })
+
+    it('Dashboard: the client entry point group has its charts, one legend line per series, and a not-live list', async () => {
+      await page.setViewport({ width, height })
+      await go(page, '/dashboard')
+      await page.waitForSelector('[data-testid="client-entry-point"]', { timeout: 30_000 })
+      await page.waitForFunction(
+        () => document.querySelectorAll('[data-testid^="metric-client"] .legend li').length >= 16,
+        { timeout: 30_000 },
+      )
+      const found = await page.evaluate(() => ({
+        charts: document.querySelectorAll('[data-testid^="metric-client"]').length,
+        tallest: Math.max(
+          ...[...document.querySelectorAll('[data-testid^="metric-client"] .legend li')].map(
+            (li) => li.getBoundingClientRect().height,
+          ),
+        ),
+        notLive: document.querySelector('[data-testid="not-live-servers"]')?.textContent ?? '',
+      }))
+      expect(found.charts).toBe(16)
+      expect(found.tallest).toBeLessThan(28)
+      expect(found.notLive).toMatch(/DEAD/)
+      const g = await geometry()
+      expect(g.scrollWidth, g.offenders.join(', ')).toBeLessThanOrEqual(g.innerWidth)
+    })
+
+    it('Servers and the server page: the heartbeat age and the notice fit, the lease list is in reach', async () => {
+      await page.setViewport({ width, height })
+      await go(page, '/servers')
+      await page.waitForSelector('[data-testid="last-heartbeat"]')
+      let g = await geometry()
+      expect(g.scrollWidth, g.offenders.join(', ')).toBeLessThanOrEqual(g.innerWidth)
+      await go(page, '/servers/10.0.0.13')
+      await page.waitForSelector('[data-testid="liveness-notice"]')
+      g = await geometry()
+      expect(g.scrollWidth, g.offenders.join(', ')).toBeLessThanOrEqual(g.innerWidth)
+      await go(page, '/servers/10.0.0.11')
+      await page.waitForSelector('[data-testid="server-leases"] [data-testid="group-lease"]')
+      g = await geometry()
+      expect(g.scrollWidth, g.offenders.join(', ')).toBeLessThanOrEqual(g.innerWidth)
+    })
+
+    it('the banner of a lost leader keeps the top bar to one row and fits the window', async () => {
+      await page.setViewport({ width, height })
+      await go(page, '/servers')
+      await page.evaluate(() => {
+        ;(
+          window as unknown as { __kingresMock: { config: { leaderLost: boolean } } }
+        ).__kingresMock.config.leaderLost = true
+      })
+      try {
+        await page.waitForSelector('[data-testid="banner-leader"]', { timeout: 30_000 })
+        const g = await geometry()
+        expect(g.scrollWidth, g.offenders.join(', ')).toBeLessThanOrEqual(g.innerWidth)
+        const rows = await page.evaluate(() => {
+          const el = document.querySelector('header.topbar') as HTMLElement
+          const set = new Set<number>()
+          for (const child of Array.from(el.children) as HTMLElement[]) {
+            const r = child.getBoundingClientRect()
+            if (r.width > 0 && r.height > 0) set.add(Math.round((r.top + r.height / 2) / 6))
+          }
+          return set.size
+        })
+        expect(rows).toBe(1)
+        expect(await reachable('Sign out')).toBe(true)
+      } finally {
+        await page.evaluate(() => {
+          ;(
+            window as unknown as { __kingresMock: { config: { leaderLost: boolean } } }
+          ).__kingresMock.config.leaderLost = false
+        })
+      }
+    })
+  })
+}

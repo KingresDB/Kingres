@@ -9,7 +9,7 @@ import { API_BASE_PATH } from '@/api/client'
 import { auditActions, operations, type OperationId } from '@/api/operations.generated'
 import { canCall } from '@/api/roles'
 import type { AuditAction, Problem, ProblemCode, Task } from '@/api/types'
-import { createMockState, mockConfig, tickTasks, findTask, type MockState } from './state'
+import { createMockState, mockConfig, tickTasks, tickHa, findTask, type MockState } from './state'
 
 let state: MockState = createMockState()
 
@@ -30,7 +30,17 @@ export function resetMockState(options: { uninitialized?: boolean } = {}): MockS
   mockConfig.omitSetupDetail = false
   mockConfig.auditUnwritable = false
   mockConfig.incompleteLedger = false
+  mockConfig.ledgerStatusCoverage = 'local'
   mockConfig.clientAddress = '203.0.113.7'
+  mockConfig.workbenchBusy = false
+  mockConfig.leaderLost = false
+  mockConfig.leaseAbsent = false
+  mockConfig.clientEntryPoint = false
+  mockConfig.suspectMs = 5000
+  mockConfig.failureMs = 10000
+  mockConfig.syncGraceMs = 30000
+  mockConfig.leaseDurationMs = 10000
+  mockConfig.defaultStatementTimeoutMs = 30000
   return state
 }
 
@@ -71,6 +81,7 @@ const STATUS: Record<ProblemCode, number> = {
   unsupported_operation: 422,
   node_state_invalid: 422,
   rate_limited: 429,
+  workbench_busy: 429,
   node_uninitialized: 503,
   map_group_unavailable: 503,
   leader_unavailable: 503,
@@ -186,6 +197,7 @@ export function register(operationId: OperationId, handler: Handler): HttpHandle
     if (mockConfig.latencyMs > 0) await delay(mockConfig.latencyMs)
     const s = getState()
     tickTasks(s)
+    tickHa(s)
     try {
       precheck(s, operationId, request)
       const dryRun = new URL(request.url).searchParams.get('dryRun') === 'true'
@@ -241,6 +253,8 @@ export function register(operationId: OperationId, handler: Handler): HttpHandle
             'Content-Type': 'application/problem+json',
             'X-Request-Id': requestId,
             ...(error.code === 'system_database_stopped' ? { 'Retry-After': '10' } : {}),
+            ...(error.code === 'workbench_busy' ? { 'Retry-After': '2' } : {}),
+            ...(error.code === 'leader_unavailable' ? { 'Retry-After': '5' } : {}),
           },
         })
       }
@@ -256,6 +270,16 @@ export function register(operationId: OperationId, handler: Handler): HttpHandle
 const WORKS_WHILE_STOPPED = new Set<OperationId>([
   'startThisServerInstance',
   'getSession',
+  'listThisServerInstances',
+])
+
+/** Operations that need no session check against the leader (contract 0.7.0, `leader_unavailable`). */
+const LEADER_FREE = new Set<OperationId>([
+  'getHealth',
+  'getReadiness',
+  'getNodeState',
+  'getSession',
+  'startThisServerInstance',
   'listThisServerInstances',
 ])
 
@@ -290,6 +314,13 @@ function precheck(s: MockState, operationId: OperationId, request: Request): voi
     throw problem('node_uninitialized')
   }
   if (role === 'none') return
+  // 0.7.0: a follower that has not heard the leader for the leader-loss bound refuses what needs a session check.
+  // The probes, the node state, `getSession` (it answers from memory) and the start of a stopped instance still work.
+  if (mockConfig.leaderLost && !LEADER_FREE.has(operationId))
+    throw problem(
+      'leader_unavailable',
+      'This server has not heard from the manager leader for longer than the leader-loss bound.',
+    )
   if (!s.session) throw problem('unauthenticated')
   if (new Date(s.session.expiresAt).getTime() < Date.now()) {
     s.session = null

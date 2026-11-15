@@ -221,6 +221,13 @@ export const ROUTES = [
   '/this-server/logs',
 ]
 
+/**
+ * The URL switches of the mock for the states of contract 0.7.0: a lost lease on group 1, a server that is dead, a
+ * standby that stopped streaming for longer than the grace period, and the client entry point (and its standby one) on.
+ */
+export const HA_SWITCHES =
+  'lease=lost:1&silent=10.0.0.13:dead&standby=stalled:3@10.0.0.11:past&client=standby'
+
 export const SECURITY_TABS = ['Roles', 'Access', 'Network access', 'Audit log']
 
 /** A page state that needs more than a visit: a dialog opened, a result shown, a special state reached. */
@@ -339,6 +346,60 @@ export const STATES: PageState[] = [
       await dialogOpen(page)
     },
     close: cancel,
+  },
+  {
+    name: 'replica count dialog (0.7.0)',
+    route: '/replication',
+    open: async (page) => {
+      await clickText(page, 'Change replica count')
+      await dialogOpen(page)
+    },
+    close: cancel,
+  },
+  {
+    name: 'replica count dialog following the standby task (0.7.0)',
+    route: '/replication',
+    open: async (page) => {
+      // The state can run several times in one session: it toggles between one and two standbys, so there is always work.
+      const current = await page.evaluate(
+        () => document.querySelector('[data-testid="replica-count"]')?.textContent?.trim() ?? '1',
+      )
+      await clickText(page, 'Change replica count')
+      await dialogOpen(page)
+      await page.click('[role="dialog"] input[type="number"]', { count: 3 })
+      await page.keyboard.type(current === '2' ? '1' : '2')
+      await clickText(page, 'Change replica count', '[role="dialog"] button')
+      await page.waitForSelector('[data-testid="replica-done"]', { timeout: 40_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await clickText(page, 'Close', '[role="dialog"] .dlg-foot button')
+      await sleep(150)
+    },
+  },
+  {
+    name: 'workbench with a statement running (Cancel statement, Stop waiting) (0.7.0)',
+    route: '/workbench',
+    open: async (page) => {
+      await page.$eval('#w-sql', (el) => {
+        ;(el as HTMLTextAreaElement).value = 'select pg_sleep(30)'
+        el.dispatchEvent(new Event('input', { bubbles: true }))
+      })
+      await clickText(page, 'Run')
+      await page.waitForFunction(
+        () =>
+          [...document.querySelectorAll('button')].some(
+            (b) => b.textContent?.trim() === 'Cancel statement',
+          ),
+        { timeout: 20_000 },
+      )
+      await sleep(250)
+    },
+    close: async (page) => {
+      await clickText(page, 'Cancel statement')
+      await page.waitForSelector('[data-testid="query-error-hint"]', { timeout: 20_000 })
+      await sleep(150)
+    },
   },
   {
     name: 'system database stopped',

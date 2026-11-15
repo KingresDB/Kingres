@@ -13,12 +13,15 @@ export class ApiError extends Error {
    * is not a problem document). The code is then a guess from the status, not the server's own word.
    */
   readonly synthetic: boolean
+  /** Whole seconds from the `Retry-After` header of the answer, when it had one. */
+  readonly retryAfterSeconds: number | null
 
-  constructor(problem: Problem, synthetic = false) {
+  constructor(problem: Problem, synthetic = false, retryAfterSeconds: number | null = null) {
     super(problem.detail ?? problem.title)
     this.name = 'ApiError'
     this.problem = problem
     this.synthetic = synthetic
+    this.retryAfterSeconds = retryAfterSeconds
   }
 
   get code(): ProblemCode {
@@ -73,6 +76,8 @@ export interface ProblemView {
   requestId?: string
   /** True when trying again later may help without any change by the user. */
   retryable: boolean
+  /** Seconds the server asked to wait (`Retry-After`), when it did. */
+  retryAfterSeconds: number | null
 }
 
 interface Entry {
@@ -310,7 +315,15 @@ const entries: Record<ProblemCode, Entry> = {
   leader_unavailable: {
     tone: 'danger',
     heading: 'No manager leader',
-    message: 'The cluster manager leader cannot be reached, so changes cannot be made right now.',
+    message:
+      'This server has not heard from the cluster manager leader for about half a minute (or the leader cannot be reached), so it does not check sessions or make changes right now. Nothing was changed. Open the console on another server of the cluster, or try again in a moment: this server serves again as soon as it hears the leader.',
+    retryable: true,
+  },
+  workbench_busy: {
+    tone: 'warning',
+    heading: 'The workbench is busy',
+    message:
+      'Your role already runs its two workbench statements on this server, or this server runs four in all. The statement was not started. Cancel a running statement or wait for one to finish, then run it again.',
     retryable: true,
   },
   rate_limited: {
@@ -352,6 +365,7 @@ export function describeProblem(error: unknown): ProblemView {
       message: unknownEntry.message + extra,
       fieldErrors: {},
       retryable: false,
+      retryAfterSeconds: null,
     }
   }
   const p = error.problem
@@ -374,6 +388,7 @@ export function describeProblem(error: unknown): ProblemView {
     sqlState: p.sqlState,
     requestId: p.requestId,
     retryable: entry.retryable ?? false,
+    retryAfterSeconds: error.retryAfterSeconds,
   }
 }
 

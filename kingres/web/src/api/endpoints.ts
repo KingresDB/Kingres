@@ -325,6 +325,9 @@ export const endpoints = {
   // --- workbench, alerts, logs, metrics
   executeQuery: (body: S['QueryRequest'], signal?: AbortSignal) =>
     j(api.POST('/query', { body, signal })),
+  /** Cancels a statement of the signed-in role that runs now on this server (204; 404 when none has this id). */
+  cancelStatement: (statementId: string) =>
+    j(api.POST('/query/statements/{statementId}/cancel', { params: { path: { statementId } } })),
   listAlerts: (q: Page & { state?: S['AlertState']; severity?: AlertSeverity } = {}) =>
     j(api.GET('/alerts', { params: { query: q } })),
   acknowledgeAlert: (alertId: number) =>

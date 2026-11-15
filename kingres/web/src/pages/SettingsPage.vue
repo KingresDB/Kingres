@@ -178,7 +178,7 @@ function submit(): void {
         <FormField
           v-slot="slot"
           label="Default replica count"
-          hint="Standby copies of every shard group, 0 to 3. Changing it needs a rebalance to add or remove the copies."
+          hint="Standby copies of every shard group, 0 to 3. Saving a replica count starts the task that adds or removes standbys, one group at a time (it is not a rebalance); follow it on the Replication page."
           :error="err('defaultReplicaCount')"
         >
           <input

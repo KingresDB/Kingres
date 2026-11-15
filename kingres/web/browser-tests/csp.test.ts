@@ -13,9 +13,11 @@ import { createHandlers } from '@/mocks/handlers'
 import { getState, resetMockState } from '@/mocks/http'
 import { seedHostile } from '@/mocks/hostile'
 import { mockConfig } from '@/mocks/state'
+import { applySwitches } from '@/mocks/switches'
 import { setupServer } from 'msw/node'
 import { CONTENT_SECURITY_POLICY, COMMON_HEADERS } from './server-headers'
 import {
+  HA_SWITCHES,
   ROUTES,
   SECURITY_TABS,
   STATES,
@@ -75,6 +77,8 @@ beforeAll(async () => {
   mockConfig.taskDurationMs = 600
   resetMockState()
   seedHostile(getState())
+  // The states of contract 0.7.0: a lost lease, a dead server, a standby that does not stream, the client entry point.
+  applySwitches(new URLSearchParams(HA_SWITCHES), getState())
   const built = await buildProduction()
   cleanup = built.cleanup
   distDir = built.dir

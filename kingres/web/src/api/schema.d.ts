@@ -1624,7 +1624,9 @@ export interface paths {
         /**
          * Update cluster settings
          * @description Partial update; omitted properties are unchanged and nested objects are merged. Changing
-         *     `defaultReplicaCount` makes a rebalance necessary (shown in `GET /cluster`). Feature flags can be
+         *     `defaultReplicaCount` (0.7.0) starts the task `standby.reconcile`, which adds or removes standby instances group
+         *     by group until every shard group has that many (as many as the servers allow; a group never has two instances on
+         *     one server), and it is not a rebalance. `defaultReplicaCount` set to its current value starts the same check. Feature flags can be
          *     turned on but never off; the first enable of a feature needs a restart of every server (reported in
          *     `restart`), because the extensions load through `shared_preload_libraries`.
          */
@@ -1873,9 +1875,48 @@ export interface paths {
          *     of rows it affected. A value larger than 1 MiB, or a row larger than 16 MiB, fails the statement with 422
          *     `unprocessable` (a statement that is not a plain read is rolled back in that case, as for any failure).
          *     A role can run at most two statements at a time on one server (the server runs four in all); further
-         *     ones answer 503 `service_unavailable` with `Retry-After`.
+         *     ones answer **429 `workbench_busy`** with `Retry-After` (0.7.0; before, 503 `service_unavailable`, which is
+         *     a statement about the server's health and is no longer used for this). The statement was not started.
+         *
+         *     **Cancelling (0.7.0).** A request may name its statement with `statementId`; `cancelStatement` then ends it
+         *     on the server that runs it. A cancelled statement ends the `executeQuery` request with 422 `sql_error` and
+         *     SQLSTATE `57014`, exactly like a statement that ran into `timeoutMs`.
          */
         post: operations["executeQuery"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/query/statements/{statementId}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel a running statement
+         * @description Added in 0.7.0. Asks PostgreSQL to cancel the statement that the signed-in role started with
+         *     `executeQuery` under the given `statementId`, on this server. The server finds the statement among the ones
+         *     it tracks and cancels the backend it opened for it; a client never names a backend or process id, and a role
+         *     can cancel only its own statements. The answer is 204 as soon as the cancel was requested; the statement
+         *     then ends the `executeQuery` request with 422 `sql_error`, SQLSTATE `57014`. A statement that does not
+         *     react within two seconds is ended by the server by closing its connection.
+         *
+         *     404 `not_found` means no running statement of the caller has that id on this server: it already ended, it
+         *     never existed, it belongs to another role (which is not revealed), or it runs on another server (send the
+         *     request to the server that received `executeQuery`; a statement is bound to the server it was started on, like
+         *     a session). A malformed id is 404 too. A statement id is unique among the running statements of one role
+         *     on one server (a second `executeQuery` with a running id answers 409 `conflict`).
+         *
+         *     Not a task: the effect is immediate. It is written to the audit log as `cancelStatement` (details:
+         *     `statementId`); the cancelled `executeQuery` is audited under its own id with outcome `failure`.
+         */
+        post: operations["cancelStatement"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2003,6 +2044,11 @@ export interface components {
          *     leader does not hold it; `renewServerCertificates`, `revokeServerCertificates`, `addServer`, `removeServer`,
          *     `leaveCluster`, `joinCluster`). Clients must tolerate codes they do not know.
          *
+         *     Added in 0.7.0: `workbench_busy` (429: the role already runs its two workbench statements on this server, or
+         *     the server runs four in all; `executeQuery`; with `Retry-After`). `leader_unavailable` (503) is now also
+         *     answered by a follower that has not heard from the manager leader for longer than the leader-loss bound
+         *     (30 s by default) to a request that needs a session check; shorter interruptions change nothing.
+         *
          *     Added in 0.6.0: `internal_api_disabled` (409: the server was started without its internal API, so it cannot
          *     take part in a cluster; `addServer`, `removeServer`, `leaveCluster`, `renewServerCertificates`,
          *     `revokeServerCertificates`). It is a state of the server's configuration, not a missing feature: start
@@ -2014,7 +2060,7 @@ export interface components {
          *     system database was stopped on purpose; start it with `startThisServerInstance`).
          * @enum {string}
          */
-        ProblemCode: "bad_request" | "validation_failed" | "unauthenticated" | "invalid_credentials" | "session_expired" | "csrf_token_invalid" | "forbidden" | "setup_token_invalid" | "not_found" | "method_not_allowed" | "conflict" | "already_exists" | "immutable_field" | "rebalance_in_progress" | "operation_in_progress" | "task_not_cancellable" | "last_admin" | "role_in_use" | "optimistic_lock_failed" | "no_replica_available" | "instance_already_running" | "instance_already_stopped" | "server_owns_buckets" | "server_hosts_map_group" | "last_server" | "server_group_not_empty" | "ledger_entry_pending" | "quorum_unavailable" | "system_database_stopped" | "unprocessable" | "sql_error" | "unsupported_operation" | "node_state_invalid" | "node_uninitialized" | "map_group_unavailable" | "leader_unavailable" | "rate_limited" | "service_unavailable" | "internal_error" | "certificate_revoked" | "certificate_authority_unavailable" | "internal_api_disabled";
+        ProblemCode: "bad_request" | "validation_failed" | "unauthenticated" | "invalid_credentials" | "session_expired" | "csrf_token_invalid" | "forbidden" | "setup_token_invalid" | "not_found" | "method_not_allowed" | "conflict" | "already_exists" | "immutable_field" | "rebalance_in_progress" | "operation_in_progress" | "task_not_cancellable" | "last_admin" | "role_in_use" | "optimistic_lock_failed" | "no_replica_available" | "instance_already_running" | "instance_already_stopped" | "server_owns_buckets" | "server_hosts_map_group" | "last_server" | "server_group_not_empty" | "ledger_entry_pending" | "quorum_unavailable" | "system_database_stopped" | "unprocessable" | "sql_error" | "unsupported_operation" | "node_state_invalid" | "node_uninitialized" | "map_group_unavailable" | "leader_unavailable" | "rate_limited" | "service_unavailable" | "internal_error" | "certificate_revoked" | "certificate_authority_unavailable" | "internal_api_disabled" | "workbench_busy";
         /** @description One invalid field of a request. */
         ValidationIssue: {
             /** @description JSON Pointer (RFC 6901) to the invalid property of the request body, or the name of the invalid query or path parameter. */
@@ -2618,13 +2664,21 @@ export interface components {
         /**
          * @description `live` healthy; `suspect` heartbeats are late; `draining` being emptied before removal;
          *     `decommissioning` rebalance away from it is running; `dead` no liveness for the failure timeout;
+         *
+         *     **Liveness (0.7.0).** Servers send each other a heartbeat every second. A server from which the answering
+         *     server has heard nothing for the suspect timeout (5 s by default) is `suspect`, after the failure timeout
+         *     (10 s by default) `dead`; it comes back to the status the catalog gives it as soon as it is heard again
+         *     (nothing is stored). `suspect` and `dead` therefore depend on **the answering server's own view**: two
+         *     servers can differ for a moment, and a server cut off from the others shows them all as dead. The counts
+         *     of `ClusterOverview` and the list of `listServers` come from the same snapshot on the answering server and
+         *     always agree.
          *     `pendingRebalance` joined but holds no data yet.
          *
          *     `pendingRebalance` (0.6.0 states what decides it): the server should hold shards, it is the primary of no
          *     bucket, and buckets exist in the cluster. The replicas of a neighbouring group's buckets that a joining
          *     server gets a standby for do not count as data; the same server was `live` in one answer and
          *     `pendingRebalance` in the next while that copy was still running. Every server answers the same for the
-         *     same catalog.
+         *     same catalog, except for `suspect` and `dead` (see liveness).
          * @enum {string}
          */
         ServerStatus: "live" | "suspect" | "draining" | "decommissioning" | "dead" | "pendingRebalance";
@@ -3415,7 +3469,7 @@ export interface components {
         ReplicationMember: {
             /**
              * Format: int32
-             * @description Instance identifier.
+             * @description Instance identifier. For a standby that kingresd manages and that is not in the sharding catalog yet (until the extension supports standby nodes) it is 1048576 plus the standby's own id, outside the range of the catalog's node ids; clients treat it as opaque.
              */
             instanceId: number;
             serverId: components["schemas"]["ServerId"];
@@ -3484,6 +3538,30 @@ export interface components {
             standbys: components["schemas"]["ReplicationMember"][];
             /** @description Replication slots on the primary. */
             slots: components["schemas"]["ReplicationSlot"][];
+            lease?: components["schemas"]["GroupLease"];
+        };
+        /**
+         * @description Added in 0.7.0, optional (absent when the answering server knows nothing about the group's lease). The lease
+         *     that keeps two primaries from running for one shard group: the server that runs the primary renews it from a
+         *     majority of the servers every two seconds, and stops its instance when it cannot (a group with a standby) or
+         *     raises the alert `leaseLost` (a group without one). The state is **the answering server's knowledge**, not a
+         *     cluster-wide agreement: `held`/`lost` for a group whose primary the answering server runs, `granted` for
+         *     a group it granted to another server.
+         */
+        GroupLease: {
+            holder: components["schemas"]["ServerId"];
+            /**
+             * @description `held` valid now; `lost` the primary of this group runs here and the lease was not renewed; `granted` granted by the answering server to `holder`; `none`.
+             * @enum {string}
+             */
+            state: "held" | "lost" | "granted" | "none";
+            /**
+             * Format: int64
+             * @description Time left on the answering server's monotonic clock; absent when not meaningful.
+             */
+            remainingMillis?: number;
+            /** @description Whether losing the lease stops the instance (the group has a standby). */
+            enforced: boolean;
         };
         /** @description Replication state of the whole cluster. */
         ReplicationTopology: {
@@ -3744,10 +3822,10 @@ export interface components {
         TaskState: "pending" | "running" | "paused" | "failed" | "done";
         /**
          * @description Kind of task. Each kind has one fixed `subject.type`; the table is in the README
-         *     (section "Task kinds and subjects").
+         *     (section "Task kinds and subjects"). `standby.reconcile` is added in 0.7.0.
          * @enum {string}
          */
-        TaskKind: "cluster.init" | "cluster.join" | "server.add" | "server.remove" | "server.failover" | "server.leave" | "instance.start" | "instance.stop" | "instance.restart" | "database.create" | "database.update" | "database.drop" | "table.distribute" | "rebalance" | "replication.restorePreferredPrimaries" | "ledger.verify" | "networkAccess.apply" | "replicate.apply" | "certificate.renew" | "certificate.revoke";
+        TaskKind: "cluster.init" | "cluster.join" | "server.add" | "server.remove" | "server.failover" | "server.leave" | "instance.start" | "instance.stop" | "instance.restart" | "database.create" | "database.update" | "database.drop" | "table.distribute" | "rebalance" | "replication.restorePreferredPrimaries" | "ledger.verify" | "networkAccess.apply" | "replicate.apply" | "certificate.renew" | "certificate.revoke" | "standby.reconcile";
         /** @description One step of a task. */
         TaskStep: {
             /** @description Step name. */
@@ -4093,12 +4171,12 @@ export interface components {
          * @description What happened. Either the `operationId` of the audited operation of this contract (for example
          *     `createDatabase`, `dropDatabase`, `login`, `executeQuery`), or one of the events that are not an
          *     operation: `loginFailed` (a sign-in attempt that was rejected, also for an unknown user), `setupTokenRejected`
-         *     (a wrong setup token), `autoFailover` (a failover started by the manager, actor `system`). From 0.5.0 also `certificateRenewed` and `certificateRenewalFailed` (a server renewed its certificates by itself, or failed to; actor `system`). A denied
+         *     (a wrong setup token), `autoFailover` (a failover started by the manager, actor `system`). From 0.5.0 also `certificateRenewed` and `certificateRenewalFailed` (a server renewed its certificates by itself, or failed to; actor `system`). From 0.7.0 also `leaseLost`, `leaseFenced` and `leaseAcquired` (the lease of a shard group, actor `system`, resource type `shardGroup`, resource id the group id) and the operation `cancelStatement`; and the standby events `standbyCreated`, `standbyRemoved`, `standbyRebuilt` (resource type `standby`, by the leader), `standbyInstanceStarted`, `standbyInstanceRemoved`, `standbyInstanceRebuilt` (by the server that runs the instance), `synchronousStandbyNamesChanged` and `replicationSlotDropped` (by the server that runs the primary), all with actor `system` unless an administrator started the task. A denied
          *     or failed call of an operation is recorded under that operation's id with `outcome` `denied` or
          *     `failure`. Read-only operations are not audited except `executeQuery`.
          * @enum {string}
          */
-        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "enableTableLedger" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert" | "renewServerCertificates" | "revokeServerCertificates" | "certificateRenewed" | "certificateRenewalFailed";
+        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "enableTableLedger" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert" | "renewServerCertificates" | "revokeServerCertificates" | "certificateRenewed" | "certificateRenewalFailed" | "cancelStatement" | "leaseLost" | "leaseFenced" | "leaseAcquired" | "standbyCreated" | "standbyRemoved" | "standbyRebuilt" | "standbyInstanceStarted" | "standbyInstanceRemoved" | "standbyInstanceRebuilt" | "synchronousStandbyNamesChanged" | "replicationSlotDropped";
         /** @description One audit log entry. */
         AuditEvent: {
             /**
@@ -4256,8 +4334,12 @@ export interface components {
             lastVerifiedAt: string | null;
             /** @description Number of ledger tables; null when not available. */
             ledgerTableCount: number | null;
-            /** @description One chain per shard group of a sharded database, or one chain otherwise. */
+            /** @description The chains this answer covers. Since 0.6.0 that is the chain of the shard group of the answering server only; `complete` and `uncoveredShardGroupIds` say what is not in it. */
             chains: components["schemas"]["LedgerChainStatus"][];
+            /** @description Added in 0.7.0, optional (absent from a server of an older revision). True when `chains` covers every shard group of the database (always true for a database that is not sharded or lives in one group); the database summary must not call the ledger healthy for a part it did not read when this is false. Same meaning as `LedgerDigest.complete`. */
+            complete?: boolean;
+            /** @description Added in 0.7.0, optional. The shard groups whose chains are not in `chains`; empty when `complete`. */
+            uncoveredShardGroupIds?: number[];
         };
         /** @description Ledger status of all ledger-enabled databases. */
         LedgerStatusList: {
@@ -4683,6 +4765,8 @@ export interface components {
              * @default 30000
              */
             timeoutMs?: number;
+            /** @description Added in 0.7.0, optional. Names the statement so that `cancelStatement` can end it. Unique among the running statements of the signed-in role on this server (409 `conflict` otherwise); chosen by the client (a random string). */
+            statementId?: string;
         };
         /** @description A result column. */
         QueryColumn: {
@@ -4717,13 +4801,21 @@ export interface components {
          */
         AlertState: "open" | "acknowledged" | "resolved";
         /**
-         * @description Alert type. Clients must tolerate kinds they do not know. Added in 0.6.0: `replicationPending` (the manager
+         * @description Alert type. Clients must tolerate kinds they do not know. Added in 0.7.0: `leaseLost` (the `kingresd` that
+         *     runs the primary of a shard group could not renew the group's lease in time; for a group with a standby the
+         *     instance was stopped (fenced), for a group without one it keeps running and this alert is the only effect;
+         *     `critical`), `groupWithoutSynchronousStandby` (the group's standby has been unreachable for longer than the
+         *     grace period and the primary no longer waits for it: acknowledged commits exist on one server only; `critical`),
+         *     `groupUnderReplicated` (fewer standbys run than the cluster's replica count; `warning`). From 0.7.0
+         *     `serverSuspect` and `serverDown` are raised by the manager leader for another server whose heartbeats stop
+         *     (`suspect` after the suspect timeout, `down` after the failure timeout, both cleared when it is heard again);
+         *     before, `serverDown` meant only that the server's instance did not run. Each kind's subject members are listed at `AlertSubject`. Added in 0.6.0: `replicationPending` (the manager
          *     leader keeps a change to roles, grants or settings waiting for a server that could not be reached; until the
          *     change arrives, a role that was disabled, changed or dropped may still work on that server. `subject` is
          *     `server:<leader>|behind:<server>`, `warning` after a minute, `critical` after ten).
          * @enum {string}
          */
-        AlertKind: "serverDown" | "serverSuspect" | "underReplicatedBuckets" | "unavailableBuckets" | "replicationLagHigh" | "diskSpaceLow" | "memoryPressure" | "rebalanceNeeded" | "autoFailoverTriggered" | "autoFailoverLimitReached" | "mapGroupUnavailable" | "ledgerVerificationFailed" | "ledgerPendingTooOld" | "versionMismatch" | "certificateExpiring" | "certificateRenewalFailed" | "replicationPending" | "taskFailed";
+        AlertKind: "serverDown" | "serverSuspect" | "underReplicatedBuckets" | "unavailableBuckets" | "replicationLagHigh" | "diskSpaceLow" | "memoryPressure" | "rebalanceNeeded" | "autoFailoverTriggered" | "autoFailoverLimitReached" | "mapGroupUnavailable" | "ledgerVerificationFailed" | "ledgerPendingTooOld" | "versionMismatch" | "certificateExpiring" | "certificateRenewalFailed" | "replicationPending" | "taskFailed" | "leaseLost" | "groupWithoutSynchronousStandby" | "groupUnderReplicated";
         /** @description An alert. */
         Alert: {
             /**
@@ -4738,10 +4830,11 @@ export interface components {
             title: string;
             /** @description Explanation. */
             message: string;
-            /** @description Related server. */
+            /** @description Related server. It equals `subject.serverId`. */
             serverId?: components["schemas"]["ServerId"] | null;
-            /** @description Related database. */
+            /** @description Related database. It equals `subject.databaseName`. */
             databaseName?: string | null;
+            subject?: components["schemas"]["AlertSubject"];
             /**
              * Format: date-time
              * @description When the alert was raised.
@@ -4760,6 +4853,32 @@ export interface components {
              */
             resolvedAt?: string | null;
         };
+        /**
+         * @description Added in 0.7.0, optional (absent from a server of an older revision). What an alert is about, in typed
+         *     members; a client never parses a string. Every member is null when the alert has nothing to say about it.
+         *     Which members an alert kind sets: `serverDown`, `serverSuspect`, `diskSpaceLow`, `memoryPressure`,
+         *     `replicationLagHigh`, `certificateExpiring` (`aspect` `ca` for the cluster certificate authority),
+         *     `certificateRenewalFailed`: `serverId` is the server concerned. `ledgerPendingTooOld`: `serverId` and
+         *     `databaseName`. `replicationPending`: `serverId` is the manager leader that keeps the change waiting and
+         *     `behindServerId` the server that is behind (the one the panel must name). `leaseLost`,
+         *     `groupWithoutSynchronousStandby`, `groupUnderReplicated`: `shardGroupId`, and `serverId` the server that
+         *     runs the group's primary. `versionMismatch`: all null.
+         */
+        AlertSubject: {
+            /** @description The server the alert is about; null when it is about the cluster. */
+            serverId: components["schemas"]["ServerId"] | null;
+            /** @description The server that is behind (`replicationPending`); null for other kinds. */
+            behindServerId: components["schemas"]["ServerId"] | null;
+            /**
+             * Format: int32
+             * @description The shard group the alert is about; null when it is not about one.
+             */
+            shardGroupId: number | null;
+            /** @description The database the alert is about; null when it is not about one. */
+            databaseName: string | null;
+            /** @description A qualifier of the subject for kinds that have several, for example `ca`; null otherwise. Clients must tolerate values they do not know. */
+            aspect: string | null;
+        };
         /** @description A page of alerts. */
         AlertPage: {
             /** @description Alerts, newest first. */
@@ -4773,10 +4892,15 @@ export interface components {
         /**
          * @description Metric names. Server-scoped: cpuUsagePercent, memoryUsedBytes, diskUsedBytes, connections,
          *     replicationLagBytes, replicationLagSeconds. Database-scoped: databaseSizeBytes, transactionsPerSecond,
-         *     queriesPerSecond. Both scopes accept connections. Cluster-scoped: bucketsUnderReplicated.
+         *     queriesPerSecond. Both scopes accept connections. Cluster-scoped: bucketsUnderReplicated. Added in 0.7.0,
+         *     server-scoped, only on a server whose client entry point is on (totals since the start of `kingresd`, except
+         *     the `Active` ones): `clientConnectionsAccepted`, `clientConnectionsActive`, `clientConnectionsRefused` (over the
+         *     cap), `clientConnectFailures`, `clientConnectionsMoved` (closed because the destination changed),
+         *     `clientConnectionsIdleClosed`, `clientBytesIn`, `clientBytesOut`, and the same with `clientStandby` for the
+         *     standby entry point.
          * @enum {string}
          */
-        MetricName: "cpuUsagePercent" | "memoryUsedBytes" | "diskUsedBytes" | "connections" | "replicationLagBytes" | "replicationLagSeconds" | "databaseSizeBytes" | "transactionsPerSecond" | "queriesPerSecond" | "bucketsUnderReplicated";
+        MetricName: "cpuUsagePercent" | "memoryUsedBytes" | "diskUsedBytes" | "connections" | "replicationLagBytes" | "replicationLagSeconds" | "databaseSizeBytes" | "transactionsPerSecond" | "queriesPerSecond" | "bucketsUnderReplicated" | "clientConnectionsAccepted" | "clientConnectionsActive" | "clientConnectionsRefused" | "clientConnectFailures" | "clientConnectionsMoved" | "clientConnectionsIdleClosed" | "clientBytesIn" | "clientBytesOut" | "clientStandbyConnectionsAccepted" | "clientStandbyConnectionsActive" | "clientStandbyConnectionsRefused" | "clientStandbyConnectFailures" | "clientStandbyConnectionsMoved" | "clientStandbyConnectionsIdleClosed" | "clientStandbyBytesIn" | "clientStandbyBytesOut";
         /** @description One sample. */
         MetricPoint: {
             /**
@@ -7436,6 +7560,35 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            429: components["responses"]["TooManyRequests"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    cancelStatement: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The `statementId` of the `executeQuery` request. */
+                statementId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The cancel was requested. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];

@@ -16,8 +16,11 @@ describe('labels', () => {
     for (const k of ['ledgerPendingTooOld', 'versionMismatch', 'certificateExpiring'])
       expect(alertKindLabel(k)).not.toBe(k)
     expect(taskKindLabel('replicate.apply')).not.toBe('replicate.apply')
-    expect(Object.keys(ALERT_KIND_LABEL)).toHaveLength(18) // 16 in 0.4.0, plus certificateRenewalFailed (0.5.0) and replicationPending (0.6.0)
-    expect(Object.keys(TASK_KIND_LABEL)).toHaveLength(20) // 18 in 0.4.0, plus the two certificate kinds of the 0.5.0 draft
+    // 16 in 0.4.0, plus certificateRenewalFailed (0.5.0), replicationPending (0.6.0) and, in 0.7.0, leaseLost,
+    // groupWithoutSynchronousStandby and groupUnderReplicated.
+    expect(Object.keys(ALERT_KIND_LABEL)).toHaveLength(21)
+    // 18 in 0.4.0, plus the two certificate kinds (0.5.0) and standby.reconcile (0.7.0).
+    expect(Object.keys(TASK_KIND_LABEL)).toHaveLength(21)
   })
   it('shows an unknown kind as sent', () => {
     expect(alertKindLabel('somethingNew')).toBe('somethingNew')

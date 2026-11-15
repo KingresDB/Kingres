@@ -3,7 +3,7 @@
 # KingresDB web panel
 
 The management console of KingresDB: a single-page application (Vue 3, TypeScript, Vite) that is a client
-of the REST API in `kingres/api/openapi.yaml` (revision 0.6.0, 88 operations; the generated files follow the committed 0.6.0, see "Contract revisions" below) and nothing else. The Go server (`kingresd`) will embed the
+of the REST API in `kingres/api/openapi.yaml` (revision 0.7.0, 89 operations; the generated files follow 0.7.0, see "Contract revisions" below) and nothing else. The Go server (`kingresd`) will embed the
 production build from `dist/` and serve it on every node. The information architecture follows the
 "Management panel" chapter of `docs/architecture.md`: a first-run wizard, a **Cluster** scope and a
 **This server** scope.
@@ -26,15 +26,24 @@ adding a server, rebalancing, failing over or creating a database visibly change
 
 Development switches in the URL (mock API only):
 
-| Parameter                                          | Effect                                                                                                                                                                                                                                              |
-| -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `?mock=uninitialized`                              | Starts as a fresh server and shows the first-run wizard. The setup token is `demo-setup-token`. A cluster named `failme` makes setup fail (to see the retry).                                                                                       |
-| `?unsupported=createInclusionProof,listAlerts`     | Those operations answer `unsupported_operation`, to see the "not available on this server version yet" state.                                                                                                                                       |
-| `?mock=hostile`                                    | Adds names and messages as a low-privileged database user could make them (markup, bidirectional and zero-width characters, look-alike letters, 5000-character names, a database called `..`).                                                      |
-| `?partial=10.0.0.12:timeout,10.0.0.13:unreachable` | Logs, alerts and metrics answer as partial answers (contract 0.5.0): `partial: true` and `missingServers` with the given ids and reasons (`timeout`, `unreachable`, `refused`, `invalidAnswer`). `?mock=hostile` does this with hostile server ids. |
-| `?cursors=reject`                                  | Every request that carries a cursor answers 400, as a 0.5.0 server does for a cursor of 0.4.0.                                                                                                                                                      |
-| `?latency=0`                                       | No artificial delay (the default is 150 ms).                                                                                                                                                                                                        |
+| Parameter                                          | Effect                                                                                                                                                                                                                                                                                                                                                |
+| -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `?mock=uninitialized`                              | Starts as a fresh server and shows the first-run wizard. The setup token is `demo-setup-token`. A cluster named `failme` makes setup fail (to see the retry).                                                                                                                                                                                         |
+| `?unsupported=createInclusionProof,listAlerts`     | Those operations answer `unsupported_operation`, to see the "not available on this server version yet" state.                                                                                                                                                                                                                                         |
+| `?mock=hostile`                                    | Adds names and messages as a low-privileged database user could make them (markup, bidirectional and zero-width characters, look-alike letters, 5000-character names, a database called `..`).                                                                                                                                                        |
+| `?partial=10.0.0.12:timeout,10.0.0.13:unreachable` | Logs, alerts and metrics answer as partial answers (contract 0.5.0): `partial: true` and `missingServers` with the given ids and reasons (`timeout`, `unreachable`, `refused`, `invalidAnswer`). `?mock=hostile` does this with hostile server ids.                                                                                                   |
+| `?cursors=reject`                                  | Every request that carries a cursor answers 400, as a 0.5.0 server does for a cursor of 0.4.0.                                                                                                                                                                                                                                                        |
+| `?silent=10.0.0.12`                                | 0.7.0: the server stops sending heartbeats when the page loads: suspect after 5 s, dead after 10 s (the console shows the time since its last heartbeat). `10.0.0.12:suspect` and `10.0.0.12:dead` start in that state; several ids with commas. The answering server (10.0.0.11) cannot be silent.                                                   |
+| `?lease=lost:1`                                    | 0.7.0: the primary of shard group 1 lost its lease (only groups whose primary runs on the answering server, 10.0.0.11: groups 0 and 1; a group with a standby has its primary stopped, a group without one keeps running). `lost:0,lost:1` for several. `?lease=absent`: the server reports no leases (`ShardGroup.lease` absent, an older revision). |
+| `?standby=stalled:3@10.0.0.11`                     | 0.7.0: the standby of group 3 on that server does not stream. During the grace period (30 s) the primary still waits for it; `stalled:3@10.0.0.11:past` puts the stop beyond the grace period (the primary no longer waits, the alert `groupWithoutSynchronousStandby` is raised).                                                                    |
+| `?workbench=busy`                                  | 0.7.0: every workbench statement answers 429 `workbench_busy` with `Retry-After: 2`. (The real rule, two statements per role and four per server, is also in the mock: two running `select pg_sleep(30)` fill it.)                                                                                                                                    |
+| `?leader=lost`                                     | 0.7.0: this server has not heard the manager leader: every request that needs a session check answers 503 `leader_unavailable` with `Retry-After: 5` (not the probes, the node state, `getSession`, the instance list and start).                                                                                                                     |
+| `?client=on` / `?client=standby`                   | 0.7.0: the client entry point is on (`standby`: its standby entry point too): the 8 (16) `client*` metrics exist. Without it `queryMetrics` answers those names with no series, as a server whose entry point is off.                                                                                                                                 |
+| `?ledger=all` / `?ledger=absent`                   | 0.7.0: the ledger status covers every shard group / carries no `complete` (an older server). The default is what kingresd 0.7.0 does: the chains of the shard group of the answering server only, the others in `uncoveredShardGroupIds`.                                                                                                             |
+| `?latency=0`                                       | No artificial delay (the default is 150 ms).                                                                                                                                                                                                                                                                                                          |
 
+In a development page, `window.__kingresMock` changes these states while the page is open (`config.leaderLost = true`,
+`silence('10.0.0.12')`, `revive(...)`, `loseLease(1)`, `regainLease(1)`; the browser tests use it).
 Reload the page to reset the mock state. Creating a database named `failme` fails half way, to see a failed
 task. The `metrics` account has only `kingres_stats`: it lands on the Dashboard with the charts it may read.
 The third server and the `reports` database report some values as `null` (not available), which the panel
@@ -95,6 +104,13 @@ an installed KingresDB with the current extensions inside WSL (`~/kw-cp/install`
 The exit code is 0 only if every step passed. Screenshots are in `.e2e/shots/` (ignored by git). `E2E_KEEP_INSTALL=1`
 keeps `~/kw-web/install` for faster re-runs; `E2E_KEEP_RUNNING=1` leaves the processes running. `scripts/e2e/backend.sh` is
 the WSL side (`prepare`, `start`, `restart`, `token`, `psql`, `stop`). `puppeteer-core` is a development dependency.
+
+The runner has steps for contract 0.7.0 (a running statement is cancelled; "Stop waiting" then "Cancel it on the server"; the
+Replication page shows the lease and the commit rule of every group; the server page lists its leases; changing the replica count
+of a one-server cluster), and the audit step expects `cancelStatement`. **These steps were written but not run**: when the
+increment was made, a cluster test of the control plane (three `kingresd` processes) was running on the same machine, and the
+runner must not start next to it. Run `npm run e2e` (with `E2E_API_PORT` and `E2E_PG_PORT` of your own) when the machine is free.
+The selectors the new steps use (`group-lease`, `commit-rule`, `replica-count`, `server-leases`) are the ones the unit tests use.
 
 ### What the run against kingresd 0.2.0-dev found (2026-11-15, contract 0.6.0)
 
@@ -325,52 +341,55 @@ scripts/        gen-api.mjs
 `npm test` runs everything in about 15 seconds. The tests render the real app (router, pinia, query client)
 and talk to the mock API through MSW in Node, so the same handlers serve `npm run dev` and the tests.
 
-| File                                                                                                                           | Covers                                                                                                                                                                              |
-| ------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `problem.test.ts`                                                                                                              | Problem to message mapping for every code, field errors, retry policy                                                                                                               |
-| `useTask.test.ts`                                                                                                              | Polling, progress, failure, paused, tolerance of lost polls, cleanup                                                                                                                |
-| `roles.test.ts`                                                                                                                | Role hierarchy from the contract, hidden navigation, disabled actions with reason, forbidden page                                                                                   |
-| `create-database.test.ts`                                                                                                      | Four groups, immutable-field notes, validation, submit, task, list update, focus handling                                                                                           |
-| `setup-wizard.test.ts`                                                                                                         | Token, create, join, validation, wrong token, task, hand-off to sign-in                                                                                                             |
-| `servers-page.test.ts`                                                                                                         | Status badges (icon and text), instances, failover and add-server flows, unsupported and error states                                                                               |
-| `shards-grid.test.ts`                                                                                                          | Bucket grid for a given bucket map, filters, bucket lookup                                                                                                                          |
-| `pages-a11y.test.ts`                                                                                                           | Every page: renders data, logs no Vue warnings, no axe violations                                                                                                                   |
-| `flows.test.ts`                                                                                                                | Sign-in/out, CSRF, expired session, add server then rebalance, workbench, security, ledger, settings, theme, distribute table, drop database                                        |
-| `tokens-contrast.test.ts`                                                                                                      | WCAG AA contrast of the token pairs in the light and dark theme                                                                                                                     |
-| `contract.test.ts`                                                                                                             | Generated files up to date, mock covers every operation in the spec (count read from the spec), audit actions, SPDX headers                                                         |
-| `session-reset.test.ts`                                                                                                        | Every way a session ends clears the client (sign-out, expiry on a query, a mutation or a task poll, another user, another tab)                                                      |
-| `api-client.test.ts`                                                                                                           | Exact request URLs for hostile path parameters, answers that are not problem documents, unknown problem codes, the sign-in redirect allow-list                                      |
-| `task-notices.test.ts`                                                                                                         | A hidden task is still followed and its failure reported; typed confirmations for remove server, hard failover, disable role                                                        |
-| `network-access.test.ts`, `network-rules.test.ts`                                                                              | Network rules: no Enter submission, confirmation with the changes, lock-out warnings, lists that round-trip                                                                         |
-| `grants.test.ts`, `role-dialog.test.ts`                                                                                        | A failed grant is not shown as granted, template confirmation, an unchanged role is not sent (also under another time zone)                                                         |
-| `workbench.test.ts`                                                                                                            | NULL, the text NULL and the empty string, stale results, timeout, stop waiting, large results, duplicate columns                                                                    |
-| `plumbing.test.ts`                                                                                                             | Unreadable ledger status shown, cursor paging with a bound and a "more results" notice                                                                                              |
-| `hostile.test.ts`                                                                                                              | Every list and detail page and dialog with hostile names and messages                                                                                                               |
-| `forms.test.ts`, `dialogs.test.ts`, `task-poller.test.ts`                                                                      | Enter in forms, what is sent on save, inert page behind a dialog, live regions, no polling in a hidden tab                                                                          |
-| `dependencies.test.ts`                                                                                                         | `DEPENDENCIES.md` names every package of the production tree and every exceptional development package                                                                              |
-| `server-headers.test.ts`                                                                                                       | The values in "What the server must send" are the ones the browser test uses                                                                                                        |
-| `contract-0-2.test.ts`                                                                                                         | Contract 0.2.0: stats-only landing page, n/a for null, create options, distribution columns, server groups, report detail, audit filter                                             |
-| `contract-0-4.test.ts`                                                                                                         | Contract 0.4.0: every problem code has words and a mock status, new required properties of Task and Server                                                                          |
-| `servers-0-4.test.ts`                                                                                                          | Certificate and fingerprint display, expected fingerprint (add, join), server groups (create, assign, refused delete), remove server                                                |
-| `ledger-0-4.test.ts`, `raw-json.test.ts`                                                                                       | Proof and digest files byte for byte, pending proofs, refusals, verification list and detail                                                                                        |
-| `this-server-instances.test.ts`, `system-database-stopped.test.ts`, `local-settings.test.ts`, `leave-cluster.test.ts`          | Instance start, stop and restart with their refusals, the stopped-system-database state, local settings, leave cluster                                                              |
-| `certificates-0-5.test.ts`                                                                                                     | Renew now (ordinary confirmation, task), Revoke certificates (what happens, typed server id, nothing pre-ticked), revoked marks, blocked actions with reasons, the two new problems |
-| `partial-answers.test.ts`, `alerts-0-5.test.ts`                                                                                | Partial notices on Logs, Alerts and the dashboard, announced once; alert kinds and links; alert ids above 2^52; cursors never kept and a 400 starts again                           |
-| `ledger-0-5.test.ts`, `system-state-sharing.test.ts`, `hostile-0-5.test.ts`                                                    | Digest paging, digest against proof (identifiers only), the stopped state across tabs, the hostile seed over the 0.5.0 places                                                       |
-| `review-0-5.test.ts`                                                                                                           | One test per finding of the second review (W2-01 to W2-16 and the residuals), named by finding                                                                                      |
-| `task-detail.test.ts`, `kind-labels.test.ts`, `role-guards.test.ts`, `unsupported-operations.test.ts`, `workbench-0-4.test.ts` | Task detail text, kind labels, log access needs `kingres_ops`, unsupported operations stay calm and start working when supported                                                    |
-| `pin-and-fingerprint-0-6.test.ts`, `roles.test.ts`                                                                             | Add server needs kingres_admin (403 explained), the pin or the explicit unpinned choice, the 400 at /expectedFingerprint, own fingerprint, setup detail, internal_api_disabled      |
-| `degraded-session-0-6.test.ts`                                                                                                 | Reload while stopped through the degraded session, the instance from the list, disabled actions with a reason, web storage holds only the theme (sign-in, degraded, sign-out)       |
-| `network-dry-run-0-6.test.ts`, `audit-0-6.test.ts`, `alerts-settings-0-6.test.ts`                                              | Dry run before saving network rules, clientAddress, audit server column, partial notice and cursor restart, 503 audit log, replicationPending, default paths                        |
-| `ledger-0-6.test.ts`, `workbench-0-6.test.ts`                                                                                  | Passed-but-incomplete badges, uncovered shard groups in list, dialog and next to downloads, LedgerProofBlock, truncated DML was applied, timeout and size limits                    |
+| File                                                                                                                           | Covers                                                                                                                                                                                                    |
+| ------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `problem.test.ts`                                                                                                              | Problem to message mapping for every code, field errors, retry policy                                                                                                                                     |
+| `useTask.test.ts`                                                                                                              | Polling, progress, failure, paused, tolerance of lost polls, cleanup                                                                                                                                      |
+| `roles.test.ts`                                                                                                                | Role hierarchy from the contract, hidden navigation, disabled actions with reason, forbidden page                                                                                                         |
+| `create-database.test.ts`                                                                                                      | Four groups, immutable-field notes, validation, submit, task, list update, focus handling                                                                                                                 |
+| `setup-wizard.test.ts`                                                                                                         | Token, create, join, validation, wrong token, task, hand-off to sign-in                                                                                                                                   |
+| `servers-page.test.ts`                                                                                                         | Status badges (icon and text), instances, failover and add-server flows, unsupported and error states                                                                                                     |
+| `shards-grid.test.ts`                                                                                                          | Bucket grid for a given bucket map, filters, bucket lookup                                                                                                                                                |
+| `pages-a11y.test.ts`                                                                                                           | Every page: renders data, logs no Vue warnings, no axe violations                                                                                                                                         |
+| `flows.test.ts`                                                                                                                | Sign-in/out, CSRF, expired session, add server then rebalance, workbench, security, ledger, settings, theme, distribute table, drop database                                                              |
+| `tokens-contrast.test.ts`                                                                                                      | WCAG AA contrast of the token pairs in the light and dark theme                                                                                                                                           |
+| `contract.test.ts`                                                                                                             | Generated files up to date, mock covers every operation in the spec (count read from the spec), audit actions, SPDX headers                                                                               |
+| `session-reset.test.ts`                                                                                                        | Every way a session ends clears the client (sign-out, expiry on a query, a mutation or a task poll, another user, another tab)                                                                            |
+| `api-client.test.ts`                                                                                                           | Exact request URLs for hostile path parameters, answers that are not problem documents, unknown problem codes, the sign-in redirect allow-list                                                            |
+| `task-notices.test.ts`                                                                                                         | A hidden task is still followed and its failure reported; typed confirmations for remove server, hard failover, disable role                                                                              |
+| `network-access.test.ts`, `network-rules.test.ts`                                                                              | Network rules: no Enter submission, confirmation with the changes, lock-out warnings, lists that round-trip                                                                                               |
+| `grants.test.ts`, `role-dialog.test.ts`                                                                                        | A failed grant is not shown as granted, template confirmation, an unchanged role is not sent (also under another time zone)                                                                               |
+| `workbench.test.ts`                                                                                                            | NULL, the text NULL and the empty string, stale results, timeout, stop waiting, large results, duplicate columns                                                                                          |
+| `plumbing.test.ts`                                                                                                             | Unreadable ledger status shown, cursor paging with a bound and a "more results" notice                                                                                                                    |
+| `hostile.test.ts`                                                                                                              | Every list and detail page and dialog with hostile names and messages                                                                                                                                     |
+| `forms.test.ts`, `dialogs.test.ts`, `task-poller.test.ts`                                                                      | Enter in forms, what is sent on save, inert page behind a dialog, live regions, no polling in a hidden tab                                                                                                |
+| `dependencies.test.ts`                                                                                                         | `DEPENDENCIES.md` names every package of the production tree and every exceptional development package                                                                                                    |
+| `server-headers.test.ts`                                                                                                       | The values in "What the server must send" are the ones the browser test uses                                                                                                                              |
+| `contract-0-2.test.ts`                                                                                                         | Contract 0.2.0: stats-only landing page, n/a for null, create options, distribution columns, server groups, report detail, audit filter                                                                   |
+| `contract-0-4.test.ts`                                                                                                         | Contract 0.4.0: every problem code has words and a mock status, new required properties of Task and Server                                                                                                |
+| `servers-0-4.test.ts`                                                                                                          | Certificate and fingerprint display, expected fingerprint (add, join), server groups (create, assign, refused delete), remove server                                                                      |
+| `ledger-0-4.test.ts`, `raw-json.test.ts`                                                                                       | Proof and digest files byte for byte, pending proofs, refusals, verification list and detail                                                                                                              |
+| `this-server-instances.test.ts`, `system-database-stopped.test.ts`, `local-settings.test.ts`, `leave-cluster.test.ts`          | Instance start, stop and restart with their refusals, the stopped-system-database state, local settings, leave cluster                                                                                    |
+| `certificates-0-5.test.ts`                                                                                                     | Renew now (ordinary confirmation, task), Revoke certificates (what happens, typed server id, nothing pre-ticked), revoked marks, blocked actions with reasons, the two new problems                       |
+| `partial-answers.test.ts`, `alerts-0-5.test.ts`                                                                                | Partial notices on Logs, Alerts and the dashboard, announced once; alert kinds and links; alert ids above 2^52; cursors never kept and a 400 starts again                                                 |
+| `ledger-0-5.test.ts`, `system-state-sharing.test.ts`, `hostile-0-5.test.ts`                                                    | Digest paging, digest against proof (identifiers only), the stopped state across tabs, the hostile seed over the 0.5.0 places                                                                             |
+| `review-0-5.test.ts`                                                                                                           | One test per finding of the second review (W2-01 to W2-16 and the residuals), named by finding                                                                                                            |
+| `task-detail.test.ts`, `kind-labels.test.ts`, `role-guards.test.ts`, `unsupported-operations.test.ts`, `workbench-0-4.test.ts` | Task detail text, kind labels, log access needs `kingres_ops`, unsupported operations stay calm and start working when supported                                                                          |
+| `pin-and-fingerprint-0-6.test.ts`, `roles.test.ts`                                                                             | Add server needs kingres_admin (403 explained), the pin or the explicit unpinned choice, the 400 at /expectedFingerprint, own fingerprint, setup detail, internal_api_disabled                            |
+| `degraded-session-0-6.test.ts`                                                                                                 | Reload while stopped through the degraded session, the instance from the list, disabled actions with a reason, web storage holds only the theme (sign-in, degraded, sign-out)                             |
+| `network-dry-run-0-6.test.ts`, `audit-0-6.test.ts`, `alerts-settings-0-6.test.ts`                                              | Dry run before saving network rules, clientAddress, audit server column, partial notice and cursor restart, 503 audit log, replicationPending, default paths                                              |
+| `workbench-0-7.test.ts`, `alerts-0-7.test.ts`, `ledger-status-0-7.test.ts`                                                     | 0.7.0: statement ids, Cancel statement and Stop waiting, `workbench_busy` and Retry-After; alert subjects and the new alert kinds; coverage of the ledger status                                          |
+| `leases-0-7.test.ts`, `liveness-0-7.test.ts`, `standbys-0-7.test.ts`                                                           | 0.7.0: leases on Replication and the server page, heartbeats (suspect, dead, time since the last one), `leader_unavailable`, the commit rule, the replica count dialog and the task with its skipped step |
+| `audit-metrics-0-7.test.ts`, `a11y-0-7.test.ts`                                                                                | 0.7.0: audit labels and filter, the client entry point group; axe and live regions for the new states                                                                                                     |
+| `ledger-0-6.test.ts`, `workbench-0-6.test.ts`                                                                                  | Passed-but-incomplete badges, uncovered shard groups in list, dialog and next to downloads, LedgerProofBlock, truncated DML was applied, timeout and size limits                                          |
 
 jsdom has no layout engine, so axe cannot compute colour contrast there; that is why contrast is tested from the
 tokens instead.
 
 ## Contract revisions and the checks against them
 
-The generated files (`src/api/schema.d.ts`, `src/api/operations.generated.ts`) follow contract **0.6.0**, the revision of
-`kingres/api/openapi.yaml` (changelog "0.6.0" in `kingres/api/README.md`). `npm run api:check` and the contract tests compare
+The generated files (`src/api/schema.d.ts`, `src/api/operations.generated.ts`) follow contract **0.7.0**, the revision of
+`kingres/api/openapi.yaml` (changelog "0.7.0" in `kingres/api/README.md`). `npm run api:check` and the contract tests compare
 with that file. While the working tree holds a draft of a later revision they fail, and that failure says nothing about the
 panel; to check against another copy of the contract (for example the committed one), point `KINGRES_API_SPEC` at it:
 
@@ -382,6 +401,79 @@ KINGRES_API_SPEC=openapi-copy.yaml npm test
 
 `scripts/gen-api.mjs` and the contract tests read the same variable, so `npm run api:generate` with it set regenerates from that
 copy. Adapting to the next revision is a separate step.
+
+## What the panel does for contract 0.7.0
+
+Every item of the changelog (`kingres/api/README.md`, "0.7.0") and where the panel uses it:
+
+1. **`Alert.subject`** (`AlertSubject`): `AlertSubject.vue` shows what an alert is about as links, in the alert list and in the
+   open alerts of the dashboard: the server (the leader that keeps a change waiting, for `replicationPending`), the server that
+   is behind (`behindServerId`), the shard group (a link to its card on Replication), the database, and the qualifier (`ca`:
+   "Cluster certificate authority"; any other value is shown as text). The message is never parsed. A server of an older
+   revision sends no subject: then `serverId` and `databaseName` of the alert are used as before. A server id that no URL can
+   carry (`..`) is shown without a link. Tests: `alerts-0-7.test.ts`, `hostile` case in the same file.
+2. **`LedgerStatus.complete`, `uncoveredShardGroupIds`**: the Ledger page says that the chains of the status are those of the
+   shard group of the server that answered and names the others ("not the status of the whole database"); a server that sends
+   neither member gets "did not say"; the groups that are not covered can still be chosen for the blocks, marked as not in the
+   status. `src/lib/ledger-coverage.ts`; `ledger-status-0-7.test.ts`. The database summary (`ledgerSummary`) has no coverage
+   member in the schema, so it still says "Last check passed" only (see the limits).
+3. **`workbench_busy`** (429, `Retry-After`): its own words ("The workbench is busy"), the `Retry-After` of the answer in the
+   notice (`ApiError.retryAfterSeconds`, read in `client.ts`), and a hint that a statement the person stopped waiting for still
+   holds a slot. `workbench-0-7.test.ts`, `problem.test.ts`, `contract-0-4.test.ts` (words for every code).
+4. **`cancelStatement`, `QueryRequest.statementId`**: every statement is sent with a fresh random id (32 hexadecimal digits).
+   While it runs the workbench offers **Cancel statement** (ends it on the server, immediately, not a task; the page then says
+   "You cancelled this statement") and keeps **Stop waiting** (only the page stops waiting; the statement keeps running and
+   keeps one of the role's two slots). After "Stop waiting" the panel still knows the id and offers **Cancel it on the
+   server**. A 404 of the cancel (the statement ended, or runs on another server) is explained. Audited as `cancelStatement`.
+   `workbench-0-7.test.ts`; the end-to-end runner has two steps for it.
+5. **Liveness**: `suspect` and `dead` come from heartbeats and are the answering server's view. Servers page: the time since
+   the last heartbeat under every status that is not LIVE, and a note that the two statuses are one server's view. Server page:
+   a notice for suspect and dead (what it means, when the last heartbeat was) and "(7s ago)" next to the last heartbeat. Dashboard:
+   the counts (they come from one snapshot with the list) and, when some server is not live, the list of those servers with their
+   status and heartbeat age. A server whose agent cannot be reached has no uptime and no resources ("n/a", never 0).
+   `leader_unavailable` (503): the shell shows a banner on every page ("This server has lost contact with the manager leader"),
+   says what it means and names the other servers the panel knew from its last answers (the response itself does not say which
+   server to open; see the gaps), and the page errors have the same words. `liveness-0-7.test.ts`.
+6. **Leases** (`ShardGroup.lease`): `GroupLeaseInfo.vue` on every group of Replication and, for the groups whose primary a server
+   runs, on the server page ("Leases of the primaries on this server"): held / granted / lost / none with the holder, the time
+   left, **Enforced** (the group has a standby) or **Watched only**, and, for a lost enforced lease, "The primary was stopped on
+   purpose". "Granted" says that the answering server only knows what it granted. Absent `lease`: "this server does not report
+   leases". `leases-0-7.test.ts`. The Shards page lists buckets, not groups, so it shows no lease.
+7. **Alert kinds** `leaseLost`, `groupWithoutSynchronousStandby`, `groupUnderReplicated` (and the heartbeat kinds `serverSuspect`,
+   `serverDown`): a label, a sentence of explanation, the severity badge of the contract; the dashboard banner counts them.
+   `alerts-0-7.test.ts`, `kind-labels.test.ts`.
+8. **Standbys**: task kind `standby.reconcile` ("Add or remove standbys"); its step `standby.register_in_catalog` is shown
+   **skipped on purpose, not a failure** (the symbol `↷`, the word "skipped", the reason, a note) both for the contract's step
+   state `skipped` and for what kingresd 0.7.0 does (the step is `done` and the task `detail` is `skipped: needs kingres_shard 0.4`).
+   The Replication page: the replica count and **Change replica count** (administrators; a task with progress inside the dialog),
+   per group the primary, every standby with state, sync state (and whether a commit can wait for it) and lag, a standby of
+   kingresd by `instanceId` 1048576 plus its id ("standby 7, managed by kingresd"), a standby that is starting ("not streaming"),
+   and the answer to "Does a commit wait for a standby?" (yes: the standbys in `quorum` or `sync` state; no: no standby, or the
+   alert `groupWithoutSynchronousStandby` is open because the grace period ran out; not yet: the standby is being made;
+   not streaming: still inside the grace period). The newest `standby.reconcile` task is shown on the page.
+   `defaultReplicaCount` (`updateClusterSettings`) answers the new settings, not a task, so the dialog looks for the task that
+   the change started (one that did not exist before the request) and follows it; when none starts it says so. The Settings
+   page no longer says that a change needs a rebalance. `standbys-0-7.test.ts`, `leases-0-7.test.ts`.
+9. **Audit actions**: all 57 actions have words (`AUDIT_ACTION_LABEL`, the compiler fails when the contract adds one); the filter
+   shows "words (name)" and the table shows both. `audit-metrics-0-7.test.ts`.
+10. **Client entry point metrics**: the dashboard group "Client entry point" (eight charts, and eight more under "Standby entry
+    point") appears only when a probe (`clientConnectionsActive`, `clientStandbyConnectionsActive`) finds a series with points;
+    otherwise nothing, not even a heading. Counters are totals since the start of kingresd and are labelled so. An error of the
+    probe that is not a 4xx is shown (it is not "off"). `audit-metrics-0-7.test.ts`.
+11. **Documentation entries**: `ServerCounts.suspect` is counted on the dashboard, `ReplicationMember.instanceId` is opaque
+    (the label above), the text of `updateClusterSettings` and of `leader_unavailable` is in the words of the panel;
+    `autoFailover.timeoutSeconds` has a heartbeat source now (the settings page keeps its text); `failoverServer` and
+    `restorePreferredPrimaries` are untouched (still answer `unsupported_operation` on a real server).
+
+The mock (`src/mocks`) follows 0.7.0 and is never more permissive: a running statement that can be cancelled (`select pg_sleep(n)`;
+a second running statement with the same id is 409, another role's id is 404), the slots (two per role, four per server, then
+`workbench_busy`), heartbeats (a silent server is suspect after 5 s and dead after 10 s, alerts `serverSuspect`/`serverDown` with
+a subject, cleared when it is heard again), leases (held, granted, lost, enforced or not, audit events `leaseLost`, `leaseFenced`,
+`leaseAcquired`), standbys created and removed by the task `standby.reconcile` with the skipped step and a `1048576 + id` instance id,
+the synchronous rule with its grace period and the alerts, `ledger` coverage and the client metrics. The switches are in the table
+at the top. Limits of the mock: the leader's automatic ten-second check is not simulated (standbys change when the replica count is
+patched, or by the tests), and the lease of a group whose primary runs elsewhere is always `granted` (the contract says the answering
+server only knows what it granted).
 
 ## What the panel does for contract 0.6.0
 
@@ -458,10 +550,9 @@ SVG lines without zoom or tooltips.
 
 What the contract (revision 0.6.0) does not let the panel do, and what the panel does instead:
 
-- **Cancel a workbench statement.** There is no way to cancel it on the server. "Stop waiting" aborts the request in the
-  browser and says that the statement may still run until it finishes or reaches its timeout (the person chooses the
-  timeout; the default of the server is 30 s). A cancel operation (for example a `queryId` in the answer and
-  `DELETE /query/{queryId}`) is needed.
+- **Cancel a workbench statement (0.7.0).** Possible with `cancelStatement` while the page knows the id of the statement. After a
+  reload the id is gone (nothing is kept in the browser), so a statement that kept running is cancelled by its timeout; a
+  cancel is bound to the server that started the statement, and a 404 says so.
 - **Read-only workbench.** The API has no read-only mode, so the workbench says "Mode: read-write" and that INSERT,
   UPDATE, DELETE and DDL are executed. A `readOnly` flag on `QueryRequest` (a read-only transaction) is needed.
 - **Truncation marker for names.** A result cell, a log line or a name cannot say that the server cut it; the panel cuts
@@ -479,12 +570,20 @@ What the contract (revision 0.6.0) does not let the panel do, and what the panel
   them (a session that server never checked, a role that was changed, a server restarted after the stop) the panel is at the
   sign-in page, which cannot sign in either; it says to start the instance on the machine (for example `pg_ctl start`) or to
   restart `kingresd`.
-- **`replicationPending` names no server.** The contract gives the alert the subject `server:<leader>|behind:<server>`, but
-  `Alert` has no `subject` property, so the panel cannot tell which server is behind; it links the alert's `serverId` and says
-  that a changed role may still not work on a server. The contract needs `Alert.subject`, or a statement of which server
-  `serverId` is for this kind.
-- **Coverage of the ledger summaries.** `LedgerStatus` and the per-chain summaries carry no `complete`, so the panel states
-  coverage only for a digest and for a verification, never for the database summary ("Last check passed").
+- **The ledger summaries.** `LedgerStatus` states its coverage since 0.7.0 and the panel says so, but `Database.ledgerSummary` (the
+  database list and page) has no such member, although the changelog says "the database summary can state its coverage"; it says
+  "Last check passed" and never "verified". `LedgerChainStatus` has no coverage inside one chain (deferred by the contract).
+- **Which server to open when `leader_unavailable`.** The answer does not name one; the panel lists the servers it knew from its last
+  answers (and marks the manager leader as last known). A panel that was opened on a server that has already lost the leader has
+  none to list.
+- **The replica count task.** `updateClusterSettings` answers 200 with the settings, not 202 with the task, so the panel finds the task
+  by listing `standby.reconcile` tasks before and after the change. If the leader starts it later than ten attempts of one
+  second, the dialog says that no task was started (the Tasks page and the Replication page still show it).
+- **Leases of other servers.** A lease is the answering server's knowledge (`GroupLease`); there is no cluster-wide view (deferred by
+  the contract), so the panel shows, for a server, the lease as seen from the server that answered. The panel never says that a
+  primary is safe because a lease is held.
+- **Client entry point.** When it is off the contract does not say what `queryMetrics` answers for the `client*` names; the panel shows
+  the group only for an answer with points, and nothing for an answer without series or a 4xx.
 - **The dry run is not a reservation.** It checks the request against the revision at that moment; someone can still change the
   rules before the administrator confirms, and the real save then answers 409 as before.
 - **`clientAddress` behind a reverse proxy** is the proxy's address (the contract says so); the lock-out check of the server

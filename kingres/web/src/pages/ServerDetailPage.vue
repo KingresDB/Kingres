@@ -16,15 +16,32 @@ import NullableValue from '@/components/NullableValue.vue'
 import CertificateExpiry from '@/components/CertificateExpiry.vue'
 import FingerprintValue from '@/components/FingerprintValue.vue'
 import ProblemNotice from '@/components/ProblemNotice.vue'
+import GroupLeaseInfo from '@/components/GroupLeaseInfo.vue'
 import { endpoints } from '@/api/endpoints'
-import { keys, useServer, useServerGroups } from '@/api/queries'
+import { keys, useServer, useServerGroups, useTopology } from '@/api/queries'
 import { INSTANCE_STATE, SERVER_STATUS } from '@/lib/status'
-import { instanceLabel } from '@/lib/cluster'
-import { formatBytes, formatDateTime, formatDuration, formatLag, percent } from '@/lib/format'
+import { groupLabel, instanceLabel } from '@/lib/cluster'
+import { heartbeatAge } from '@/lib/liveness'
+import {
+  formatAgo,
+  formatBytes,
+  formatDateTime,
+  formatDuration,
+  formatLag,
+  percent,
+} from '@/lib/format'
+import { useSessionStore } from '@/stores/session'
 
 const props = defineProps<{ id: string }>()
 const client = useQueryClient()
+const session = useSessionStore()
 const server = useServer(() => props.id)
+const topology = useTopology(() => session.can('getReplicationTopology'))
+/** The shard groups whose primary this server runs, with their leases as the answering server knows them (0.7.0). */
+const leaseGroups = computed(() =>
+  (topology.data.value?.groups ?? []).filter((g) => g.primary?.serverId === props.id),
+)
+const silent = computed(() => (server.data.value ? heartbeatAge(server.data.value) : null))
 const groups = useServerGroups()
 const s = computed(() => server.data.value)
 const dialog = ref<'failover' | 'remove' | 'renew' | 'revoke' | null>(null)
@@ -134,6 +151,30 @@ function saveGroup(): void {
           >.
         </span>
       </p>
+      <p
+        v-if="s.status === 'suspect' || s.status === 'dead'"
+        class="notice"
+        :class="s.status === 'dead' ? 'tone-danger' : 'tone-warn'"
+        role="status"
+        data-testid="liveness-notice"
+      >
+        <span aria-hidden="true">{{ s.status === 'dead' ? '✖' : '▲' }}</span>
+        <span>
+          <strong>{{
+            s.status === 'dead' ? 'No heartbeat for the failure timeout.' : 'Heartbeats are late.'
+          }}</strong>
+          <template v-if="silent !== null"
+            >The server that answered last heard a heartbeat from this server
+            {{ silent.text }}.</template
+          ><template v-else
+            >The server that answered has no heartbeat from this server on record.</template
+          >
+          A server is shown as suspect after 5 seconds and as dead after 10 seconds of silence (the
+          defaults), and as live again as soon as it is heard. This is the view of the answering
+          server: another server can differ for a moment, and a server that is cut off from the
+          others sees them all as dead.
+        </span>
+      </p>
       <section class="grid-cards" aria-label="Summary">
         <div class="card kpi">
           <span class="label">Status</span>
@@ -170,9 +211,10 @@ function saveGroup(): void {
           <span class="muted"
             >Joined <NullableValue :value="s.joinedAt" :format="formatDateTime"
           /></span>
-          <span class="muted"
-            >Last heartbeat <NullableValue :value="s.lastHeartbeatAt" :format="formatDateTime"
-          /></span>
+          <span class="muted" data-testid="last-heartbeat"
+            >Last heartbeat <NullableValue :value="s.lastHeartbeatAt" :format="formatDateTime" />
+            <template v-if="s.lastHeartbeatAt">({{ formatAgo(s.lastHeartbeatAt) }})</template></span
+          >
         </div>
       </section>
 
@@ -273,6 +315,43 @@ function saveGroup(): void {
         <p v-if="revokeBlocked" class="hint muted" data-testid="revoke-blocked">
           Revoke certificates is not available: {{ revokeBlocked }}
         </p>
+      </section>
+
+      <section
+        v-if="session.can('getReplicationTopology')"
+        class="card stack"
+        aria-labelledby="lease-h"
+        data-testid="server-leases"
+      >
+        <h2 id="lease-h">Leases of the primaries on this server</h2>
+        <p class="muted">
+          A shard group has one primary at a time because its primary holds a lease that a majority
+          of the servers grants. What is shown is what the server that answered knows.
+        </p>
+        <QueryBoundary
+          :loading="topology.isPending.value"
+          :error="topology.error.value"
+          :empty="leaseGroups.length === 0"
+          empty-title="No primary runs here"
+          empty-hint="This server runs no primary, so it holds no lease."
+          @retry="topology.refetch()"
+        >
+          <ul class="lease-list">
+            <li
+              v-for="g in leaseGroups"
+              :key="g.id"
+              class="stack"
+              :data-testid="`lease-group-${g.id}`"
+            >
+              <h3>
+                <RouterLink :to="{ name: 'replication', hash: `#g-${g.id}` }">{{
+                  groupLabel(g.id, g.isMapGroup)
+                }}</RouterLink>
+              </h3>
+              <GroupLeaseInfo :lease="g.lease" />
+            </li>
+          </ul>
+        </QueryBoundary>
       </section>
 
       <section class="card" aria-labelledby="inst-h">
@@ -396,5 +475,12 @@ function saveGroup(): void {
 .kv dd {
   margin: 0;
   font-variant-numeric: tabular-nums;
+}
+.lease-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: var(--s-4);
 }
 </style>

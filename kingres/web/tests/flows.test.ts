@@ -251,7 +251,7 @@ describe('ledger', () => {
 })
 
 describe('settings', () => {
-  it('saves the replica count and then asks for a rebalance', async () => {
+  it('saves the replica count, which starts the standby task and asks for no rebalance', async () => {
     const user = userEvent.setup()
     await renderApp('/settings')
     const replicas = await screen.findByLabelText(/default replica count/i)
@@ -260,19 +260,33 @@ describe('settings', () => {
     await user.click(screen.getByRole('button', { name: /save settings/i }))
     expect(await screen.findByText(/settings saved/i)).toBeInTheDocument()
     expect(getState().settings.defaultReplicaCount).toBe(2)
-    expect(getState().rebalance.reasons).toContain('replicaCountChanged')
+    // 0.7.0: the change starts the task standby.reconcile; it is not a rebalance.
+    expect(getState().rebalance.reasons).not.toContain('replicaCountChanged')
+    expect(getState().tasks.some((t) => t.task.kind === 'standby.reconcile')).toBe(true)
     // Features that are on cannot be turned off.
     expect(screen.getByRole('checkbox', { name: /sharding/i })).toBeDisabled()
   })
 
-  it('shows the server explanation when the value is out of range', async () => {
+  it('accepts a replica count the servers cannot all place (as far as the servers allow)', async () => {
     const user = userEvent.setup()
     await renderApp('/settings')
     const replicas = await screen.findByLabelText(/default replica count/i)
     await user.clear(replicas)
     await user.type(replicas, '3')
     await user.click(screen.getByRole('button', { name: /save settings/i }))
-    expect(await screen.findByText(/needs at least 4 servers/i)).toBeInTheDocument()
+    expect(await screen.findByText(/settings saved/i)).toBeInTheDocument()
+    expect(getState().settings.defaultReplicaCount).toBe(3)
+  })
+
+  it('refuses a replica count above 3 before sending it', async () => {
+    const user = userEvent.setup()
+    await renderApp('/settings')
+    const replicas = await screen.findByLabelText(/default replica count/i)
+    await user.clear(replicas)
+    await user.type(replicas, '4')
+    await user.click(screen.getByRole('button', { name: /save settings/i }))
+    expect(await screen.findByText(/between 0 and 3/i)).toBeInTheDocument()
+    expect(getState().settings.defaultReplicaCount).toBe(1)
   })
 })
 

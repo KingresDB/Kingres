@@ -117,6 +117,12 @@ function codeForStatus(status: number): ApiError['problem']['code'] {
   return status >= 500 ? 'internal_error' : 'bad_request'
 }
 
+/** `Retry-After` as whole seconds (the contract sends a number); an HTTP date or junk is ignored. */
+export function parseRetryAfter(value: string | null): number | null {
+  if (value === null || !/^\d{1,6}$/.test(value.trim())) return null
+  return Number(value.trim())
+}
+
 /**
  * Awaits an openapi-fetch call and returns its data, or throws an ApiError.
  * Every query, mutation and task poll goes through this, so components never see raw responses,
@@ -130,8 +136,9 @@ export async function unwrap<T>(call: Promise<Result<T>>): Promise<T> {
     throw cause instanceof ApiError ? cause : networkError(cause)
   }
   if (result.response.ok) return result.data as T
+  const retryAfter = parseRetryAfter(result.response.headers.get('Retry-After'))
   const error = isProblem(result.error)
-    ? new ApiError(result.error)
+    ? new ApiError(result.error, false, retryAfter)
     : new ApiError(
         {
           type: 'about:blank',
@@ -143,6 +150,7 @@ export async function unwrap<T>(call: Promise<Result<T>>): Promise<T> {
           detail: 'The server answered with something that is not a problem document.',
         },
         true,
+        retryAfter,
       )
   if (isSessionLost(error)) reportSessionLost()
   if (error.code === 'system_database_stopped') reportSystemDatabaseStopped()

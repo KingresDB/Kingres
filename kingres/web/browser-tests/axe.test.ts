@@ -8,6 +8,7 @@ import { createRequire } from 'node:module'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { Browser, Page } from 'puppeteer-core'
 import {
+  HA_SWITCHES,
   ROUTES,
   SECURITY_TABS,
   STATES,
@@ -58,7 +59,9 @@ async function axeViolations(where: string): Promise<string[]> {
 describe('axe in a real browser', () => {
   it('the sign-in page', async () => {
     const failures: string[] = []
-    await page.goto(`${server.url}/?mock=hostile&latency=0`, { waitUntil: 'networkidle0' })
+    await page.goto(`${server.url}/?mock=hostile&latency=0&${HA_SWITCHES}`, {
+      waitUntil: 'networkidle0',
+    })
     await page.waitForSelector('input[autocomplete="username"]')
     for (const theme of ['light', 'dark']) {
       await page.emulateMediaFeatures([{ name: 'prefers-color-scheme', value: theme }])

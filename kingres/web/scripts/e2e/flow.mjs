@@ -367,6 +367,39 @@ export async function runFlow(ctx) {
     await shot('14-workbench-error')
   })
 
+  // Contract 0.7.0: a running statement is cancelled on the server (cancelStatement), the page says so.
+  await step('a running statement is cancelled with "Cancel statement" (0.7.0)', async () => {
+    await page.$eval('#w-sql', (e) => (e.value = ''))
+    await page.type('#w-sql', 'select pg_sleep(120)')
+    await ui.click('Run')
+    await ui.waitForText('Cancel statement', 20000)
+    await shot('14b-workbench-running')
+    await ui.click('Cancel statement')
+    await ui.waitForText('You cancelled this statement', 20000)
+    const text = await ui.text()
+    expect(text.includes('57014'), 'the cancelled statement does not show SQLSTATE 57014')
+    // The statement is really gone: the next one starts at once (no slot is held).
+    await page.$eval('#w-sql', (e) => (e.value = ''))
+    await page.type('#w-sql', 'select 1 as after_cancel')
+    await ui.click('Run')
+    await ui.waitForText('after_cancel', 20000)
+    await shot('14c-workbench-after-cancel')
+  })
+
+  await step(
+    '"Stop waiting" leaves the statement running and it can still be cancelled (0.7.0)',
+    async () => {
+      await page.$eval('#w-sql', (e) => (e.value = ''))
+      await page.type('#w-sql', 'select pg_sleep(120)')
+      await ui.click('Run')
+      await ui.waitForText('Stop waiting', 20000)
+      await ui.click('Stop waiting')
+      await ui.waitForText('Cancel it on the server', 20000)
+      await ui.click('Cancel it on the server')
+      await ui.waitForText('Cancel requested', 20000)
+    },
+  )
+
   // ---- 6. grants ---------------------------------------------------------------------------------------
   await step('change a grant in the matrix', async () => {
     await ui.navigate('/security')
@@ -487,6 +520,80 @@ export async function runFlow(ctx) {
       )
     }
   })
+
+  // Contract 0.7.0: leases and standbys on the Replication page, against a real server of one server.
+  await step(
+    'the Replication page shows the lease and the commit rule of every group (0.7.0)',
+    async () => {
+      await ui.navigate('/replication')
+      await ui.waitForText('Lease of the primary', 20000)
+      await sleep(1500)
+      const info = await page.evaluate(() => ({
+        leases: [...document.querySelectorAll('[data-testid="group-lease"]')].map(
+          (e) => e.dataset.leaseState,
+        ),
+        rules: [...document.querySelectorAll('[data-testid="commit-rule"]')].map(
+          (e) => e.dataset.state,
+        ),
+        count: document.querySelector('[data-testid="replica-count"]')?.textContent?.trim() ?? '',
+      }))
+      notes.push(
+        `replication: leases ${info.leases.join(', ')}; commit rule ${info.rules.join(', ')}; replica count ${info.count}`,
+      )
+      expect(info.leases.length > 0, 'no group is shown')
+      expect(
+        info.leases.every((x) => x === 'held' || x === 'granted' || x === 'absent'),
+        `unexpected lease states: ${info.leases.join(', ')}`,
+      )
+      await shot('page-replication-leases')
+    },
+  )
+
+  await step('the server page lists the leases of the primaries it runs (0.7.0)', async () => {
+    await ui.navigate('/servers')
+    await ui.waitForText('Servers', 20000)
+    await sleep(1200)
+    const link = await page.evaluate(() => {
+      const a = document.querySelector('table a[href^="/servers/"]')
+      return a ? a.getAttribute('href') : null
+    })
+    expect(link, 'no server link on the Servers page')
+    await ui.navigate(link)
+    await ui.waitForText('Leases of the primaries on this server', 20000)
+    await sleep(1200)
+    const state = await page.evaluate(() =>
+      [
+        ...document.querySelectorAll('[data-testid="server-leases"] [data-testid="group-lease"]'),
+      ].map((e) => e.dataset.leaseState),
+    )
+    notes.push(`server page lease states: ${state.join(', ') || 'none'}`)
+    expect(state.length > 0, 'the server runs a primary but no lease is listed')
+    expect(!(await ui.text()).includes('No heartbeat'), 'a live server shows a heartbeat warning')
+    await shot('page-server-leases')
+  })
+
+  await step(
+    'changing the replica count of a one-server cluster starts no standby task (0.7.0)',
+    async () => {
+      await ui.navigate('/replication')
+      await ui.waitForText('Change replica count', 20000)
+      await ui.click('Change replica count')
+      await ui.waitForText('Standbys per shard group', 20000)
+      await page.click('[role="dialog"] input[type="number"]', { count: 3 })
+      await page.keyboard.type('0')
+      await ui.click('Change replica count', { within: '[role="dialog"]' })
+      // Either a task starts (it removes standbys that exist) or the dialog says that none was needed.
+      await page.waitForFunction(
+        () => /no standby task was started|Finished\./.test(document.body.innerText),
+        { timeout: 60000 },
+      )
+      notes.push(
+        `replica count dialog: ${(await ui.text()).includes('no standby task was started') ? 'no task was needed' : 'a task ran'}`,
+      )
+      await shot('replication-replica-count')
+      await ui.click('Close', { within: '[role="dialog"]' })
+    },
+  )
 
   // ---- 9. what the server does not do yet must be calm, not alarming; the cluster settings are real ----
   await step('failover (not implemented yet) answers with a calm notice', async () => {
@@ -1113,6 +1220,7 @@ export async function runFlow(ctx) {
       'stopThisServerInstance',
       'startThisServerInstance',
       'updateThisServerSettings',
+      'cancelStatement',
     ]
     const missing = wanted.filter((a) => !text.includes(a))
     notes.push(

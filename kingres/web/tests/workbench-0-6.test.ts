@@ -3,7 +3,8 @@
 //
 // Contract 0.6.0, executeQuery: a result cut at the limit of a statement that changes data means the statement
 // WAS committed; a statement that ran into `timeoutMs` is a 422 `sql_error` with SQLSTATE 57014; a value over
-// 1 MiB is 422 `unprocessable`; a third concurrent statement of a role answers 503 `service_unavailable`.
+// 1 MiB is 422 `unprocessable`; a third concurrent statement of a role answers 429 `workbench_busy` (0.7.0; 503
+// `service_unavailable` in 0.6.0).
 import { describe, expect, it } from 'vitest'
 import { fireEvent, screen } from '@testing-library/vue'
 import userEvent from '@testing-library/user-event'
@@ -57,8 +58,14 @@ describe('a result cut at the limit', () => {
 
 describe('errors of a statement', () => {
   it('explains the time limit as a cancelled statement, not a server fault', async () => {
-    await run('select pg_sleep(100)')
-    const hint = await screen.findByTestId('query-error-hint')
+    // The statement runs for 100 seconds and the time limit is one second.
+    const user = userEvent.setup()
+    await renderApp('/workbench')
+    await screen.findByRole('option', { name: 'shop' })
+    await fireEvent.update(screen.getByLabelText(/timeout/i), '1')
+    await fireEvent.update(screen.getByLabelText(/^SQL/), 'select pg_sleep(100)')
+    await user.click(screen.getByRole('button', { name: /^run$/i }))
+    const hint = await screen.findByTestId('query-error-hint', {}, { timeout: 5000 })
     expect(hint).toHaveTextContent(/cancelled because it ran longer than the time limit/i)
     expect(hint).toHaveTextContent(/not a fault of the server/i)
     expect(screen.queryByText(/service unavailable/i)).toBeNull()
