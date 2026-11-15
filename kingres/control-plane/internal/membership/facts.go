@@ -16,8 +16,10 @@ import (
 // membership facts: every server holds a copy of the catalog in it.
 const catalogDB = sysdb.Database
 
-// holds lists, per sharded database, the number of buckets that live in a
-// shard group in which the server has an instance (as primary or as replica).
+// holds lists, per sharded database, the number of buckets the server owns: the
+// buckets of the shard groups whose primary it runs. A standby it hosts for another
+// group owns nothing a rebalance could move, and the standbys of a removed server
+// are removed with it (standby.Leader.PurgeServer), so they are not counted.
 func (m *Manager) holds(ctx context.Context, server string) ([]bucketHold, error) {
 	dbs, err := m.shardedDatabases(ctx)
 	if err != nil {
@@ -31,7 +33,7 @@ func (m *Manager) holds(ctx context.Context, server string) ([]bucketHold, error
 		}
 		var n int
 		err = c.QueryRow(ctx, `SELECT count(*) FROM kingres.bucket_map b
-			WHERE b.group_id IN (SELECT n.group_id FROM kingres.node n WHERE n.host = $1)`, server).Scan(&n)
+			WHERE b.group_id IN (SELECT n.group_id FROM kingres.node n WHERE n.host = $1 AND n.role = 'primary')`, server).Scan(&n)
 		_ = c.Close(context.WithoutCancel(ctx))
 		if err != nil {
 			return nil, err
@@ -101,7 +103,7 @@ func (m *Manager) leaderFacts(ctx context.Context, id string) (removalFacts, err
 	}
 	err = m.sys(ctx, func(c *pgx.Conn) error {
 		if err := c.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM kingres_cp.task
-			WHERE kind = 'rebalance' AND state IN ('pending', 'running', 'paused'))`).Scan(&f.RebalanceRunning); err != nil {
+			WHERE kind = 'rebalance' AND state IN ('pending', 'running'))`).Scan(&f.RebalanceRunning); err != nil {
 			return err
 		}
 		return c.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM kingres_cp.task

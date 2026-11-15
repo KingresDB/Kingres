@@ -327,7 +327,7 @@ func ListAfter(ctx context.Context, c *pgx.Conn, state, severity string, after *
 }
 
 // parseSubject reads the stored subject ("server:<id>|behind:<id>|group:<n>|
-// database:<name>|<aspect>", segments in any order) into the typed subject of
+// database:<name>|task:<id>|<aspect>", segments in any order) into the typed subject of
 // the contract. A segment it does not know is the aspect; "cluster" is none.
 func parseSubject(subject string) api.AlertSubject {
 	var out api.AlertSubject
@@ -350,6 +350,10 @@ func parseSubject(subject string) api.AlertSubject {
 		case strings.HasPrefix(seg, "database:"):
 			v := seg[len("database:"):]
 			out.DatabaseName = &v
+		case strings.HasPrefix(seg, "task:"):
+			if n, err := strconv.ParseInt(seg[len("task:"):], 10, 64); err == nil && n > 0 {
+				out.TaskID = &n
+			}
 		default:
 			v := seg
 			out.Aspect = &v

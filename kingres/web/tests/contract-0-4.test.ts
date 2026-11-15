@@ -32,12 +32,12 @@ describe('contract 0.4.0', () => {
   // problem codes) while this panel was adapted; 0.4.0 has 86 operations, the draft 88.
   // 0.7.0 added one operation (cancelStatement): 89.
   it('is revision 0.4.0 (86 operations) or a later one (88, from 0.7.0 89)', () => {
-    expect(['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0']).toContain(spec.info.version)
+    expect(['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0']).toContain(spec.info.version)
     // 0.8.0 added the eleven operations of the Configuration tag: 100.
     expect(Object.keys(operations)).toHaveLength(
       spec.info.version === '0.4.0'
         ? 86
-        : spec.info.version === '0.8.0'
+        : spec.info.version === '0.8.0' || spec.info.version === '0.9.0'
           ? 100
           : spec.info.version === '0.7.0'
             ? 89

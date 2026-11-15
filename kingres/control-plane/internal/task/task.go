@@ -43,6 +43,9 @@ const (
 	StepRunning = "running"
 	StepDone    = "done"
 	StepFailed  = "failed"
+	// StepSkipped is a step that decided, on purpose, that it has nothing to do
+	// (contract TaskStep.state, 0.9.0); the task goes on with the next step.
+	StepSkipped = "skipped"
 )
 
 // StepState is the recorded state of one step.
@@ -105,11 +108,11 @@ type Lease struct {
 	Epoch  int64
 }
 
-// DoneSteps is the number of leading steps that are done.
+// DoneSteps is the number of leading steps that are over: done or skipped.
 func (t Task) DoneSteps() int {
 	n := 0
 	for _, s := range t.Steps {
-		if s.State != StepDone {
+		if s.State != StepDone && s.State != StepSkipped {
 			break
 		}
 		n++
@@ -133,6 +136,40 @@ var (
 	// ErrUnknownKind means no definition is registered for the kind.
 	ErrUnknownKind = errors.New("unknown task kind")
 )
+
+// PauseError is what a step returns to stop its task without failing it: the
+// engine records the task as paused, releases the lease and keeps the steps that
+// are done; the step that paused runs again from its start when the task is
+// resumed (Engine.Resume), so it must be able to pick up where it left off.
+type PauseError struct{ Reason string }
+
+func (e *PauseError) Error() string { return "task paused: " + e.Reason }
+
+// SkipError is what a step returns when it decided on purpose to do nothing: the
+// engine records the step as skipped (not done), keeps the reason as the task's
+// detail and goes on with the next step.
+type SkipError struct{ Reason string }
+
+func (e *SkipError) Error() string { return "step skipped: " + e.Reason }
+
+// Skip returns the error that makes the engine record the step as skipped.
+func Skip(reason string) error { return &SkipError{Reason: reason} }
+
+// Pause returns the error that pauses the task (see PauseError).
+func Pause(reason string) error { return &PauseError{Reason: reason} }
+
+// PauseStore is implemented by stores that can pause and resume a task.
+type PauseStore interface {
+	// Pause changes a running task of the lease holder to Paused and releases
+	// the lease; reason is kept as the task's detail.
+	Pause(ctx context.Context, id int64, l Lease, reason string) error
+	// Resume changes a paused task to Pending, so that the next claim takes it.
+	// ErrNotPaused when the task is in another state.
+	Resume(ctx context.Context, id int64) error
+}
+
+// ErrNotPaused means Resume was asked for a task that is not paused.
+var ErrNotPaused = errors.New("task is not paused")
 
 // Env is what a step can use besides its context.
 type Env struct {
@@ -399,13 +436,34 @@ func (e *Engine) Run(ctx context.Context) {
 	}
 }
 
-// Cancel asks for the cancellation of a task (between steps).
+// Cancel asks for the cancellation of a task (between steps). A paused task is
+// not run by anybody, so it is failed at once and its cleanup hook runs here.
 func (e *Engine) Cancel(ctx context.Context, id int64) error {
-	if t, err := e.store.Get(ctx, id); err == nil && recordedKinds[t.Kind] {
+	t, gerr := e.store.Get(ctx, id)
+	if gerr == nil && recordedKinds[t.Kind] {
 		return ErrNotCancellable // written by its owner, not run by the engine
 	}
-	return e.store.RequestCancel(ctx, id, e.now())
+	if err := e.store.RequestCancel(ctx, id, e.now()); err != nil {
+		return err
+	}
+	if gerr == nil && t.State == Paused {
+		e.onFail(ctx, t)
+	}
+	return nil
 }
+
+// Resume makes a paused task pending; the next claim (or RunNow) runs it.
+func (e *Engine) Resume(ctx context.Context, id int64) error {
+	ps, ok := e.store.(PauseStore)
+	if !ok {
+		return errors.New("task: the store cannot resume tasks")
+	}
+	return ps.Resume(ctx, id)
+}
+
+// RunNowID claims and runs the task id like RunNow, for a caller that wants to
+// run it in the background right after Resume.
+func (e *Engine) RunNowID(ctx context.Context, id int64) error { return e.RunNow(ctx, id, nil) }
 
 // Get returns a task.
 func (e *Engine) Get(ctx context.Context, id int64) (Task, error) { return e.store.Get(ctx, id) }
@@ -473,6 +531,26 @@ func (e *Engine) run(ctx context.Context, t Task, started time.Time, secrets map
 		}
 		e.fault(FaultStepStarted, t.ID, i)
 		if err := st.Run(fence.With(runCtx, fence.Token{Task: t.ID, Epoch: env.lease.Epoch}), env); err != nil {
+			var pe *PauseError
+			if errors.As(err, &pe) && runCtx.Err() == nil {
+				return e.pause(ctx, t, i, pe.Reason)
+			}
+			var se *SkipError
+			if errors.As(err, &se) && runCtx.Err() == nil {
+				if ds, ok := e.store.(DetailStore); ok {
+					if derr := ds.SetDetail(ctx, t.ID, env.lease, clip(se.Reason)); derr != nil {
+						return derr
+					}
+				}
+				cancelReq, serr := e.setStep(ctx, t, i, StepSkipped, percent(i+1, len(def.Steps)))
+				if serr != nil {
+					return serr
+				}
+				if cancelReq && i+1 < len(def.Steps) {
+					return e.cancelTask(ctx, t, def, i+1)
+				}
+				continue
+			}
 			if runCtx.Err() != nil && ctx.Err() == nil {
 				return ErrLeaseLost
 			}
@@ -583,6 +661,20 @@ func (e *Engine) cancelTask(ctx context.Context, t Task, def Definition, next in
 	err := e.finish(ctx, t, Failed, &Error{Code: CodeCanceled, Message: msg, Retryable: false})
 	e.onFail(ctx, t)
 	return err
+}
+
+// pause records the task as paused. The step that paused goes back to pending,
+// so the task shows where it will go on.
+func (e *Engine) pause(ctx context.Context, t Task, i int, reason string) error {
+	ps, ok := e.store.(PauseStore)
+	if !ok {
+		return e.fail(ctx, t, i, Step{Name: t.Steps[i].Name}, &Error{Code: CodeStepFailed, Step: t.Steps[i].Name, Message: "The store cannot pause tasks."})
+	}
+	if _, err := e.setStep(ctx, t, i, StepPending, percent(i, len(t.Steps))); err != nil {
+		return err
+	}
+	c := context.WithoutCancel(ctx)
+	return e.retry(c, func() error { return ps.Pause(c, t.ID, e.leaseOf(t), clip(reason)) })
 }
 
 func (e *Engine) fail(ctx context.Context, t Task, i int, st Step, te *Error) error {

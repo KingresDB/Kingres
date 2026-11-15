@@ -120,7 +120,9 @@ describe('add server, then rebalance', () => {
     expect(s.servers.find((x) => x.id === '10.0.0.14')?.status).toBe('live')
     expect(s.rebalance.reports[0]?.outcome).toBe('completed')
     await router.push('/rebalance')
-    expect(await screen.findByRole('button', { name: /^#3$/ })).toBeInTheDocument()
+    expect(
+      await screen.findByRole('button', { name: `#${s.rebalance.reports[0]!.id}` }),
+    ).toBeInTheDocument()
   })
 
   it('stops a running rebalance after confirmation', async () => {
@@ -138,9 +140,9 @@ describe('add server, then rebalance', () => {
     await user.click(await screen.findByRole('button', { name: /stop rebalance/i }))
     const dialog = await screen.findByRole('dialog', { name: /stop the rebalance/i })
     await user.click(within(dialog).getByRole('button', { name: /^stop rebalance$/i }))
-    await waitFor(() => expect(getState().rebalance.state).toBe('stopped'))
-    expect(await screen.findByText(/stopped \(can be resumed\)/i)).toBeInTheDocument()
-    expect(await screen.findByRole('button', { name: /resume rebalance/i })).toBeInTheDocument()
+    await waitFor(() => expect(getState().rebalance.state).toBe('stopped'), { timeout: 5000 })
+    expect(await screen.findByText(/stopped [(]start again to go on[)]/i)).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: /start again/i })).toBeInTheDocument()
   })
 })
 

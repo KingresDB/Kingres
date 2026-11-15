@@ -277,7 +277,7 @@ func (o *Ops) UpdateServer(ctx context.Context, serverID string, cur ServerPlace
 			return err
 		}
 		var rebalancing bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM kingres_cp.task WHERE kind = 'rebalance' AND state IN ('pending', 'running', 'paused'))
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM kingres_cp.task WHERE kind = 'rebalance' AND state IN ('pending', 'running'))
 			`).Scan(&rebalancing); err != nil {
 			return err
 		}

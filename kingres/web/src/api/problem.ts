@@ -325,6 +325,55 @@ const entries: Record<ProblemCode, Entry> = {
     heading: 'Nothing waits for a restart',
     message: 'No instance waits for a restart because of a configuration change.',
   },
+  nothing_to_rebalance: {
+    tone: 'info',
+    heading: 'Nothing to rebalance',
+    message: 'The buckets are already placed as the plan would place them.',
+  },
+  rebalance_not_running: {
+    tone: 'info',
+    heading: 'No rebalance is running',
+    message: 'There is no rebalance to stop, or it is stopped already.',
+  },
+  cluster_inconsistent: {
+    tone: 'danger',
+    heading: 'The cluster is not consistent',
+    message:
+      'A check of the sharding catalog found something that makes moving buckets unsafe. Resolve it, then start again.',
+    withDetail: true,
+  },
+  version_mismatch: {
+    tone: 'danger',
+    heading: 'The servers run different versions',
+    message:
+      'Buckets move only between servers that run the same version of the sharding extension and the same PostgreSQL major.',
+    withDetail: true,
+  },
+  failover_in_progress: {
+    tone: 'warning',
+    heading: 'A failover is in progress',
+    message: 'Wait until the failover has finished, then start the rebalance.',
+    withDetail: true,
+    retryable: true,
+  },
+  group_degraded: {
+    tone: 'warning',
+    heading: 'A shard group is degraded',
+    message: 'A group that a move would touch has no healthy standby.',
+    withDetail: true,
+  },
+  insufficient_disk: {
+    tone: 'warning',
+    heading: 'Not enough disk space',
+    message: 'The target server does not have the free disk space the move needs.',
+    withDetail: true,
+  },
+  no_receiving_server: {
+    tone: 'warning',
+    heading: 'No server can receive buckets',
+    message: 'No server should hold shards. Allow at least one server to hold shards first.',
+    withDetail: true,
+  },
   quorum_unavailable: {
     tone: 'danger',
     heading: 'No quorum',

@@ -430,7 +430,9 @@ func requireJSON(r *http.Request) *problem.Problem {
 // the session at once. A backend that cannot be asked fails closed.
 func (s *Server) currentRoles(r *http.Request, username string) ([]string, *problem.Problem) {
 	if s.deps.LeaderTrusted != nil && !s.deps.LeaderTrusted() {
-		return nil, problem.New(problem.LeaderUnavailable, "This server has lost contact with the manager leader and cannot tell whether the roles of this session were changed; try again when the leader is reachable.").WithRetryAfter(5)
+		p := problem.New(problem.LeaderUnavailable, "This server has lost contact with the manager leader and cannot tell whether the roles of this session were changed; try again when the leader is reachable, or open another server.").WithRetryAfter(5)
+		p.ServerIDs = s.alternativeServers(r.Context())
+		return nil, p
 	}
 	roles, err := s.reval.Roles(r.Context(), username)
 	switch {
@@ -451,3 +453,27 @@ func (s *Server) currentRoles(r *http.Request, username string) ([]string, *prob
 // cached role checks; it is called after every change to a role, here and
 // on the request of the leader.
 func (s *Server) RoleChanged(username string) { s.reval.Changed(username) }
+
+// alternativeServers names the servers a client can open instead of this one, from this
+// server's own copy of the catalog: the manager leader first when it is known,
+// then the others in the order of the list. It never asks the network.
+func (s *Server) alternativeServers(ctx context.Context) []string {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	self, _ := s.deps.Store.LocalServerID(ctx)
+	servers, err := s.deps.Store.Servers(ctx)
+	if err != nil {
+		return nil
+	}
+	var leaders, rest []string
+	for _, sv := range servers {
+		switch {
+		case sv.ID == self:
+		case sv.IsManagerLeader:
+			leaders = append(leaders, sv.ID)
+		default:
+			rest = append(rest, sv.ID)
+		}
+	}
+	return append(leaders, rest...)
+}

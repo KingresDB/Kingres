@@ -5,6 +5,7 @@ package pgstore
 import (
 	"context"
 	"encoding/json"
+	"sort"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -167,6 +168,25 @@ func (s *Store) buildDatabases(ctx context.Context, name string) ([]api.Database
 				}
 			}
 			db.Health = api.DatabaseHealth{UnderReplicatedBuckets: &under, UnavailableBuckets: &unavailable}
+			// The ledger chains this server reads are those of its own shard group (see
+			// ledgerStatus); the summary says so instead of implying it covers the others.
+			own := int32(-1)
+			if id, err := s.localNodeID(ctx); err == nil {
+				for _, n := range cat.nodes {
+					if n.ID == id {
+						own = n.Group
+					}
+				}
+			}
+			unc := []int32{}
+			for g := range stats {
+				if g != own {
+					unc = append(unc, g)
+				}
+			}
+			sort.Slice(unc, func(i, j int) bool { return unc[i] < unc[j] })
+			complete := len(unc) == 0
+			db.LedgerSummary.Complete, db.LedgerSummary.UncoveredShardGroupIDs = &complete, unc
 			db.RebalanceRequired = summary.RebalanceNeeded
 		}
 		out = append(out, db)

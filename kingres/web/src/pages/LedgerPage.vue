@@ -53,7 +53,10 @@ const dbName = ref(typeof route.query.db === 'string' ? route.query.db : '')
 watch(
   () => statusList.data.value,
   (d) => {
-    const items = d?.items ?? []
+    // Until the list has arrived there is nothing to choose from: keep what the URL named
+    // (it used to be reset to the first database, and the URL with it, on the first load).
+    if (!d) return
+    const items = d.items
     if (!items.some((s) => s.databaseName === dbName.value))
       dbName.value = items[0]?.databaseName ?? ''
   },

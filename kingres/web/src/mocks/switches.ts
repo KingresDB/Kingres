@@ -19,6 +19,10 @@
 //   ?config=waiting:<server>      the server cannot be reached for a configuration change: the task waits for it.
 //   ?config=restart-conflict      a restart is pending that mixes a setting going up and one going down.
 //   ?commit=none | hostile | <text>   0.8.0: the server reports no commit (the footer links to the repository) / text that is not a commit id / that text.
+//   ?rebalance=refuse:<code>      0.9.0: the next start answers 409 with that code (nothing_to_rebalance, cluster_inconsistent,
+//                                 version_mismatch, failover_in_progress, no_receiving_server, operation_in_progress ...).
+//   ?rebalance=fail               0.9.0: the next run ends failed: one bucket is given up after three attempts.
+//   ?rebalance=slow               0.9.0: moves take about three times as long (time to stop one in the middle).
 //   ?clock=off:<server>:<ms>      the clock of that server is that many milliseconds ahead (negative: behind).
 //   ?clock=unreachable:<server>   the clock of that server cannot be read.
 import type { MockState } from './state'
@@ -74,6 +78,12 @@ export function applySwitches(params: URLSearchParams, s: MockState): void {
     if (m && m[1] === 'failed') failNextApply(s, m[2] as string)
     if (m && m[1] === 'waiting') takeConfigServerDown(s, m[2] as string)
     if (entry === 'restart-conflict') seedRestartConflict(s)
+  }
+  for (const entry of (params.get('rebalance') ?? '').split(',')) {
+    const refuse = /^refuse:([a-z_]+)$/.exec(entry)
+    if (refuse) mockConfig.rebalanceRefuse = refuse[1] as string
+    if (entry === 'fail') mockConfig.rebalanceFail = true
+    if (entry === 'slow') mockConfig.rebalanceSlow = true
   }
   for (const entry of (params.get('clock') ?? '').split(',')) {
     const off = /^off:([^:]+):(-?\d+(?:\.\d+)?)$/.exec(entry)

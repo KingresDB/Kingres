@@ -379,8 +379,9 @@ type LedgerBlockPage struct {
 // granted the lease to Holder) or none. Enforced says that losing the lease stops
 // the instance (the group has a standby).
 type GroupLease struct {
-	Holder          string `json:"holder"`
-	State           string `json:"state"`
-	RemainingMillis *int64 `json:"remainingMillis,omitempty"`
-	Enforced        bool   `json:"enforced"`
+	// Holder is null when State is none (contract 0.9.0).
+	Holder          *string `json:"holder"`
+	State           string  `json:"state"`
+	RemainingMillis *int64  `json:"remainingMillis,omitempty"`
+	Enforced        bool    `json:"enforced"`
 }

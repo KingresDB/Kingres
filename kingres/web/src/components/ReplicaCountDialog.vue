@@ -2,10 +2,10 @@
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
 // Changes the replica count of the cluster (contract 0.7.0): `updateClusterSettings` with `defaultReplicaCount`.
-// The settings operation answers with the new settings, not with a task; what it starts is the task
-// `standby.reconcile`, which adds or removes standbys group by group. So the dialog sends the change, then looks for
-// the task that the change started (a task that did not exist before the request) and follows it with the usual
-// progress view. When the standbys already match, no task starts, and the dialog says so.
+// What the change starts is the task `standby.reconcile`, which adds or removes standbys group by group. Since 0.9.0 the
+// request asks for the task with `Prefer: respond-async` and the answer is 202 with it, which the dialog follows with
+// the usual progress view (before, it guessed the task by listing). When the standbys already match, no task starts,
+// the answer is 200 with the settings, and the dialog says so.
 import { computed, getCurrentScope, onScopeDispose, ref } from 'vue'
 import { useQueryClient } from '@tanstack/vue-query'
 import AppDialog from './AppDialog.vue'
@@ -18,9 +18,7 @@ import { keys } from '@/api/queries'
 import { useTask, isSettled } from '@/composables/useTask'
 import { useAnnounce } from '@/composables/useAnnounce'
 import { useTaskNoticeStore } from '@/stores/taskNotices'
-import { taskDiscovery } from '@/lib/standby'
 import { firstError, integerBetween } from '@/lib/validators'
-import type { Task } from '@/api/types'
 
 const props = defineProps<{
   /** The current `defaultReplicaCount`. */
@@ -35,7 +33,7 @@ const announce = useAnnounce()
 const notices = useTaskNoticeStore()
 
 const count = ref<number | string>(props.current)
-const phase = ref<'form' | 'sending' | 'looking' | 'following' | 'none'>('form')
+const phase = ref<'form' | 'sending' | 'following' | 'none'>('form')
 const error = ref<unknown>(null)
 const submitted = ref(false)
 let disposed = false
@@ -70,39 +68,21 @@ if (getCurrentScope()) {
   })
 }
 
-const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
-
 async function confirm(): Promise<void> {
   submitted.value = true
   error.value = null
   if (validation.value) return
   phase.value = 'sending'
   try {
-    // The tasks that exist now: the one the change starts is the one that is new afterwards.
-    const before = new Set(
-      (await endpoints.listTasks({ kind: 'standby.reconcile', limit: 50 })).items.map((t) => t.id),
-    )
-    await endpoints.updateClusterSettings({ defaultReplicaCount: wanted.value })
+    // Since 0.9.0 the answer names the task the change started (202 with Prefer: respond-async); no task
+    // starts when the standbys already match.
+    const answer = await endpoints.updateClusterSettingsAsync({ defaultReplicaCount: wanted.value })
     refresh()
     announce('Replica count saved.')
-    phase.value = 'looking'
-    let running: Task | undefined
-    for (let attempt = 0; attempt < taskDiscovery.attempts && !disposed; attempt += 1) {
-      const items = (await endpoints.listTasks({ kind: 'standby.reconcile', limit: 50 })).items
-      const started = items.find((t) => !before.has(t.id))
-      if (started) {
-        phase.value = 'following'
-        tracker.track(started)
-        return
-      }
-      running = items.find((t) => t.state === 'running')
-      if (attempt + 1 < taskDiscovery.attempts) await sleep(taskDiscovery.intervalMs)
-    }
     if (disposed) return
-    if (running) {
-      // A check is already running: it carries this change in its next round, but its progress is worth showing.
+    if (answer.task) {
       phase.value = 'following'
-      tracker.track(running)
+      tracker.track(answer.task)
       return
     }
     phase.value = 'none'
@@ -164,9 +144,6 @@ async function confirm(): Promise<void> {
       <ProblemNotice v-if="error" :error="error" />
     </template>
     <template v-else>
-      <p v-if="phase === 'looking'" class="muted" role="status" data-testid="replica-looking">
-        The change was saved. Waiting for the leader to start the standby task...
-      </p>
       <TaskProgress
         v-if="tracker.task.value"
         :task="tracker.task.value"

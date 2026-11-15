@@ -255,7 +255,21 @@ export const endpoints = {
   // --- settings
   getClusterSettings: () => j(api.GET('/settings/cluster')),
   updateClusterSettings: (body: ClusterSettingsUpdateRequest) =>
-    j(api.PATCH('/settings/cluster', { body })),
+    j(api.PATCH('/settings/cluster', { body })) as Promise<S['ClusterSettings']>,
+  /**
+   * 0.9.0: the same update, asking for the task it starts (`Prefer: respond-async`). The answer is the task (202)
+   * when the update started one, the settings (200) when it did not.
+   */
+  updateClusterSettingsAsync: async (
+    body: ClusterSettingsUpdateRequest,
+  ): Promise<{ task: S['Task'] | null; settings: S['ClusterSettings'] | null }> => {
+    const r = (await j(
+      api.PATCH('/settings/cluster', { body, headers: { Prefer: 'respond-async' } }),
+    )) as S['Task'] | S['ClusterSettings']
+    return 'kind' in r && 'progress' in r
+      ? { task: r, settings: null }
+      : { task: null, settings: r as S['ClusterSettings'] }
+  },
 
   // --- ledger
   listLedgerStatus: () => j(api.GET('/ledger/status')),

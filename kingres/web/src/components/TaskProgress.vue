@@ -31,7 +31,7 @@ const announcementKey = computed(() => {
 /** The reason a step was skipped on purpose, or null. A skipped step is not a failure. */
 function stepSkip(step: TaskStep): string | null {
   // The contract has the state `skipped`; kingresd 0.7.0 finishes the catalog step and records the reason in the
-  // detail of the task ("skipped: needs kingres_shard 0.4"). Both are shown the same way.
+  // detail of the task ("skipped: needs kingres_shard 0.5"). Both are shown the same way.
   if (step.state === 'skipped') {
     const reason = skippedReason(step.detail) ?? skippedReason(props.task?.detail)
     if (reason !== null) return reason

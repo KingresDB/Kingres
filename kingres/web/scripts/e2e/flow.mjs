@@ -621,20 +621,30 @@ export async function runFlow(ctx) {
     await ui.click('Cancel', { within: '[role=dialog]' })
   })
 
+  // 0.9.0: the rebalance operations are real. One server can show the idle state, the empty plan and the
+  // refusals; the moves, a stop in the middle and a restart of the leader need three servers (the integration
+  // tests of internal/clustertest run them).
   await step(
-    'rebalance (not implemented yet): the page shows a calm notice, no alarm',
+    'rebalance (0.9.0): idle, an empty plan, a start refused with its own notice',
     async () => {
       await ui.navigate('/rebalance')
       await ui.waitForText('Rebalance')
-      await sleep(2000)
-      const text = await ui.text()
-      notes.push(
-        `rebalance page: ${/not available on this server version yet/i.test(text) ? 'says "not available on this server version yet"' : 'does not say it is unsupported'}`,
-      )
+      await ui.waitForText('Idle').catch(async (e) => {
+        throw new Error(`${e.message}: ${(await ui.text()).replace(/s+/g, ' ').slice(0, 700)}`)
+      })
+      await ui.click('Preview plan')
+      await ui.waitForText('Nothing to move').catch(async (e) => {
+        throw new Error(`${e.message}: ${(await ui.text()).replace(/s+/g, ' ').slice(0, 700)}`)
+      })
+      await ui.click('Start rebalance')
+      await ui.waitForText('Nothing to rebalance').catch(async (e) => {
+        throw new Error(`${e.message}: ${(await ui.text()).replace(/s+/g, ' ').slice(0, 700)}`)
+      })
       expect(
         (await page.$$eval('.notice.tone-danger', (e) => e.length)) === 0,
-        'rebalance: alarming notice',
+        'rebalance: alarming notice for an empty plan',
       )
+      await shot('18b-rebalance-idle')
     },
   )
 

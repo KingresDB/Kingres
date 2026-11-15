@@ -150,6 +150,22 @@ func (f *FileStore) List(ctx context.Context, limit int) ([]Task, error) {
 	return f.inner.List(ctx, limit)
 }
 
+// Pause implements PauseStore.
+func (f *FileStore) Pause(ctx context.Context, id int64, l Lease, reason string) error {
+	if err := f.inner.Pause(ctx, id, l, reason); err != nil {
+		return err
+	}
+	return f.save(id) //nolint:contextcheck // saving does not depend on a request
+}
+
+// Resume implements PauseStore.
+func (f *FileStore) Resume(ctx context.Context, id int64) error {
+	if err := f.inner.Resume(ctx, id); err != nil {
+		return err
+	}
+	return f.save(id) //nolint:contextcheck // saving does not depend on a request
+}
+
 // SetDetail implements DetailStore.
 func (f *FileStore) SetDetail(ctx context.Context, id int64, l Lease, detail string) error {
 	if err := f.inner.SetDetail(ctx, id, l, detail); err != nil {

@@ -32,7 +32,7 @@ func (s *Server) getCluster(_ *call, w http.ResponseWriter, r *http.Request) err
 		Version: s.deps.Version, MapVersion: sum.MapVersion, MapGroupAvailable: sum.MapGroupAvailable,
 		ManagerLeader: s.managerLeader(r.Context()),
 		Servers:       sum.Servers, Buckets: sum.Buckets, DatabaseCount: sum.DatabaseCount,
-		Rebalance: api.RebalanceSummary{Needed: sum.RebalanceNeeded, Reasons: sum.RebalanceReasons},
+		Rebalance: api.RebalanceSummary{Needed: sum.RebalanceNeeded, Reasons: sum.RebalanceReasons, Running: sum.RebalanceRunning, TaskID: sum.RebalanceTaskID},
 		AutoFailover: api.AutoFailoverSummary{Enabled: settings.AutoFailover.Enabled,
 			EventsSinceReset: settings.AutoFailover.EventsSinceReset, MaxCount: settings.AutoFailover.MaxCount},
 		Features:  settings.Features,

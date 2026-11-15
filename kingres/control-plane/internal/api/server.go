@@ -113,6 +113,8 @@ type AlertSubject struct {
 	ShardGroupID   *int32  `json:"shardGroupId"`
 	DatabaseName   *string `json:"databaseName"`
 	Aspect         *string `json:"aspect"`
+	// TaskID is the task the alert is about (contract 0.9.0), null when it is not about one.
+	TaskID *int64 `json:"taskId"`
 }
 
 // AlertPage is a page of alerts.

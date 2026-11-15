@@ -182,10 +182,10 @@ func (s *PGStore) RequestCancel(ctx context.Context, id int64, now time.Time) er
 	switch t.State {
 	case Done, Failed:
 		return ErrNotCancellable
-	case Pending:
+	case Pending, Paused:
 		ej, _ := json.Marshal(Error{Code: CodeCanceled, Message: "The task was canceled before it started."})
 		tag, err := s.db.Exec(ctx, `UPDATE kingres_cp.task SET state = 'failed', error = $2, updated_at = $3
-			WHERE id = $1 AND state = 'pending'`, id, ej, now)
+			WHERE id = $1 AND state IN ('pending', 'paused')`, id, ej, now)
 		if err == nil && tag.RowsAffected() == 0 {
 			// It started meanwhile: ask it to stop instead.
 			_, err = s.db.Exec(ctx, `UPDATE kingres_cp.task SET cancel_requested = true WHERE id = $1`, id)
@@ -213,6 +213,33 @@ func (s *PGStore) List(ctx context.Context, limit int) ([]Task, error) {
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+// Pause implements PauseStore.
+func (s *PGStore) Pause(ctx context.Context, id int64, l Lease, reason string) error {
+	tag, err := s.db.Exec(ctx, `UPDATE kingres_cp.task SET state = 'paused', updated_at = clock_timestamp(),
+		progress = jsonb_set(progress, '{detail}', to_jsonb($4::text)), lease_holder = NULL, lease_expires_at = NULL
+		WHERE id = $1 AND lease_holder = $2 AND lease_epoch = $3 AND state = 'running'`, id, l.Holder, l.Epoch, reason)
+	if err != nil {
+		return err
+	}
+	return s.heldOrErr(ctx, tag, id)
+}
+
+// Resume implements PauseStore.
+func (s *PGStore) Resume(ctx context.Context, id int64) error {
+	tag, err := s.db.Exec(ctx, `UPDATE kingres_cp.task SET state = 'pending', cancel_requested = false, updated_at = clock_timestamp()
+		WHERE id = $1 AND state = 'paused'`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	if _, err := s.Get(ctx, id); err != nil {
+		return err
+	}
+	return ErrNotPaused
 }
 
 // SetDetail implements DetailStore.

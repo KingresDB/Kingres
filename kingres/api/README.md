@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.8.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.9.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and `kingres-cli`. Lint it and run the mechanical rule check with:
 
 ```
@@ -149,14 +149,14 @@ Each task kind has exactly one `subject.type`; `subject.id` is always a string.
 | `instance.start`, `instance.stop`, `instance.restart` | `instance` | the instance id (`node_id`) as a decimal string |
 | `database.create`, `database.update`, `database.drop` | `database` | the database name |
 | `table.distribute` | `table` | `database/schema.table` |
-| `rebalance` | `rebalance` | the task id as a decimal string (equals the report id) |
+| `rebalance` | `cluster` | `cluster` (0.9.0; one rebalance at a time, cluster-wide; the task id is the report id): steps `Check that the cluster can rebalance`, `Compute the plan`, `Move buckets`, `Write the report`; a stopped run is `paused` |
 | `replication.restorePreferredPrimaries` | `replication` | `preferred-primaries` |
 | `ledger.verify` | `ledgerVerification` | the **database name**: the verification id exists only after the run (see `LedgerVerification.taskId`) |
 | `replicate.apply` | `replication` | `apply:<operation>:<role or database names>:<unix nanoseconds>`: the task that brings the servers that could not be reached up to date after a role or grant change (one step per server, `TaskStep.detail` names the server it waits for) |
 | `networkAccess.apply` | `networkAccess` | `network-access` |
 | `config.apply` (0.8.0) | `config` | `cluster`: one configuration task at a time; one step per server (`TaskStep.detail` names the server a step waits for) |
 | `config.restart` (0.8.0) | `config` | `restart`: restarts the instances that wait for a restart, one server at a time |
-| `standby.reconcile` (0.7.0) | `replication` | `standbys`: adds, removes and rebuilds standby instances until every group has `defaultReplicaCount` of them; the step `standby.register_in_catalog` says `skipped: needs kingres_shard 0.4` until the sharding extension supports standby nodes |
+| `standby.reconcile` (0.7.0) | `replication` | `standbys`: adds, removes and rebuilds standby instances until every group has `defaultReplicaCount` of them; the step `standby.register_in_catalog` ends in the step state `skipped` (0.9.0; `done` before) with the task `detail` `skipped: needs kingres_shard 0.5` until `kingresd` registers standbys in the sharding catalog |
 
 `Task.subject` is null only for tasks whose subject is not known (system tasks such as auto-failover use
 `server.failover` with the failed server as subject and `createdBy: system`).
@@ -314,6 +314,59 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.9.0
+
+Revision written with phase 4 of the control plane, rebalancing driven by `kingresd`, and the defects that earlier revisions
+and the console's adoption of 0.7.0 recorded. Summary for the panel: 0 operations added (100 operations, 82 paths), the six
+rebalance operations that answered `unsupported_operation` are implemented, **4 changes that are not additive** (listed below,
+acceptable because nothing has been released), 8 new problem codes, additive members listed below. Design:
+`kingres/docs/design/shard-phase10.md` (first increment only: the strategy "by bucket count", one move at a time).
+
+#### Breaking
+
+Nothing was released, so these are corrections of the contract's own contradictions; a typed client must adapt:
+
+1. **`GroupLease.holder` is nullable** (it stays required): it is `null` when `state` is `none`. It was a required string, which the
+   server could not fill for a group that has no lease.
+2. **`Server.lastHeartbeatAt`, `Bucket.bucket`, `ClusterSettings.defaultReplicaCount`, `ServerStatus` and the text of
+   `updateServer` and `removeServer` change meaning in their descriptions** to what `kingresd` does. The ones a client can see:
+   `draining` now means "should not hold shards and still runs the primary of a group with buckets" (it also was set for a server
+   that only hosted standbys), and `decommissioning` is now set (while the removal task runs; it was never set).
+3. **`TableDistribution.colocationId` and `bucketCount` are nullable** (they stay required): a reference table is in no colocation
+   group. They were required integers, and a reference table could not be made before 0.9.0.
+4. **`removeServer` and `updateServer` no longer count a stopped rebalance as running** (`rebalance_in_progress` only while a run is
+   pending or running), and `server_owns_buckets` no longer counts standbys the server hosts. A client that waited for a stopped rebalance
+   to end before it removed a server no longer has to.
+
+#### Additive
+
+1. **Rebalance** (`getRebalanceStatus`, `startRebalance`, `previewRebalancePlan`, `stopRebalance`, `listRebalanceReports`,
+   `getRebalanceReport`): implemented. `RebalanceStatus.stoppedBy` and `pausedReason`, `RebalanceProgress.movesSkipped`,
+   `RebalanceReportSummary.stoppedBy`, `error` and `totals.movesSkipped`, `RebalanceReport.placementBefore` and `placementAfter`
+   (`PlacementEntry`), `PlannedMove`, `BucketMove` and the moves of a report gain `fromServerId` and `toServerId`, the moves of a report
+   gain `attempts` and `skipReason`. Task kind `rebalance` has subject `cluster`/`cluster` (the table said `rebalance`/task id).
+2. **`ProblemCode`** gains `nothing_to_rebalance`, `rebalance_not_running`, `cluster_inconsistent`, `version_mismatch`,
+   `failover_in_progress`, `group_degraded`, `insufficient_disk` and `no_receiving_server`. `Problem.serverIds` (optional) names, for
+   `leader_unavailable`, servers to open instead.
+3. **`updateClusterSettings`** answers 200 as before, and 202 with the `Task` and `Location` when the update started
+   `standby.reconcile` **and the request carries `Prefer: respond-async`**; a client that does not send it is not affected.
+4. **Step state `skipped`** is now what `kingresd` records for a step that skipped itself (`standby.register_in_catalog`; it recorded
+   `done` and put `skipped: ...` into the task detail). The text names `kingres_shard 0.5`, the version that provides the registration.
+5. **`Database.ledgerSummary`** gains the optional `complete` and `uncoveredShardGroupIds` (the coverage the 0.7.0 changelog announced);
+   **`AlertSubject.taskId`** (optional, nullable; `taskFailed` alerts about a failed rebalance); the format of `statementId` and the
+   answer to a malformed one (400 `validation_failed`); what `queryMetrics` answers for a metric nobody samples (200, null points).
+6. **`distributeTable`**: `method: reference` works (`kingres.create_reference_table`); the text says what the extension needs (an
+   empty table for `hash`, no ledger table, the table restrictions) and the refusals are 422 `unprocessable` before the task starts.
+7. **`Server.status`** `decommissioning` is set while `server.remove` runs, the dashboard's `ServerCounts.decommissioning` counts it,
+   and `ClusterOverview.rebalance.running` and `taskId` are set.
+
+#### Documentation
+
+The README row of the task kind `rebalance`, the step state `skipped` and the extension version in the text of the standby task are
+corrected. `Server.lastHeartbeatAt` says who heard the heartbeat (the answering server, not the manager). This version runs one
+move at a time (`maxConcurrentMoves` is accepted and recorded); the strategies, weights, automatic mode, draining a server and splitting
+a bucket of the design are later increments.
 
 ### 0.8.0
 

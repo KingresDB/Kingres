@@ -639,13 +639,16 @@ export interface paths {
          *     and forgets it (status `decommissioning` while the task runs). Returns a task (`server.remove`) for
          *     the whole removal. **The operation does not move data**: to empty a server, set
          *     `shouldHaveShards: false` (`PATCH /servers/{serverId}`) and run `POST /rebalance`, then remove it.
+         *     The standbys are handled by the removal itself (0.9.0): the standbys the server hosts for other groups, and
+         *     the standbys of its own group elsewhere, are removed with it (the reconcile of the standbys then places new
+         *     ones where the cluster allows); they do not count as buckets the server owns.
          *     The task checks the conditions again when it starts.
          *
          *     Refusals, checked in this order: 404 for an unknown server; 409 `last_server` (the only server of
          *     the cluster); 409 `server_hosts_map_group` (the server hosts an instance of the map group, shard
-         *     group 0, which is the manager leader's catalog); 409 `server_owns_buckets` (it holds a copy,
-         *     primary or replica, of any bucket of any database; the problem `detail` names the databases and
-         *     counts); 409 `rebalance_in_progress` while a rebalance runs and `operation_in_progress` while
+         *     group 0, which is the manager leader's catalog); 409 `server_owns_buckets` (it runs the primary of a
+         *     shard group that owns buckets in any database; the problem `detail` names the databases and counts; since 0.9.0
+         *     the standbys it hosts for other groups are not counted); 409 `rebalance_in_progress` while a rebalance runs and `operation_in_progress` while
          *     another task of this server runs. A `dead` server is refused with 422 `node_state_invalid`: fail
          *     it over first.
          */
@@ -664,9 +667,15 @@ export interface paths {
          *
          *     Refusals: 404 for an unknown server; 422 `unprocessable` with `errors[].field` `/serverGroup` when
          *     the named group does not exist (create it with `createServerGroup` first); 409
-         *     `operation_in_progress` while the server is being added, removed or left (`draining` because of a
-         *     removal, `decommissioning`); 409 `rebalance_in_progress` while a rebalance runs, because it would
-         *     change the placement under it.
+         *     `operation_in_progress` while the server is being added, removed or left (status `decommissioning`, or
+         *     `pendingRebalance` before its join has finished); 409 `rebalance_in_progress` while a rebalance **runs**
+         *     (a stopped rebalance does not block it: between a stop and a start again an operator changes
+         *     `shouldHaveShards`, and the run computes its plan again when it starts).
+         *
+         *     `shouldHaveShards: false` makes the server `draining` until a rebalance has moved its buckets away
+         *     (`POST /rebalance`); `true` makes a server that owns no bucket `pendingRebalance`. Nothing moves by itself.
+         *     The change is made in the sharding catalog of every database through `kingres.set_node_property`; 409
+         *     `no_receiving_server` when it would leave no server that should hold shards.
          */
         patch: operations["updateServer"];
         trace?: never;
@@ -996,9 +1005,17 @@ export interface paths {
         /**
          * Distribute a table
          * @description Turns a plain table into a hash-distributed table (by a distribution column) or a reference table
-         *     (copied to every shard group). Requires sharding to be enabled on the database. A hash-distributed
-         *     table needs a primary key or unique key that includes the distribution column. The existing rows
-         *     are moved to their buckets; the table can be a ledger table at the same time. Long-running: returns a task.
+         *     (a full copy on every shard group). Requires sharding to be enabled on the database. Long-running: returns a task.
+         *
+         *     **What the sharding extension can do, and what this operation refuses (0.9.0 states exactly that).**
+         *     *Hash* (`kingres.create_distributed_table`): the table must be **empty** (422 `unprocessable`: distributing a
+         *     table that has rows is a later phase; create an empty copy, distribute it and insert the rows), have a primary
+         *     key or unique key that includes the distribution column, and be an ordinary permanent table without foreign keys,
+         *     triggers, exclusion constraints, row-level security, inheritance or storage parameters. *Reference*
+         *     (`kingres.create_reference_table`, 0.9.0; `unsupported_operation` before): the same table restrictions, no
+         *     distribution column and no `colocateWith` (400 `validation_failed` when given); the rows it has are copied to every
+         *     group. **Neither is possible for a ledger table** (422 `unprocessable`): the ledger is kept per node. A table
+         *     the extension refuses fails the task with the extension's own reason.
          */
         put: operations["distributeTable"];
         post?: never;
@@ -1163,18 +1180,45 @@ export interface paths {
         /**
          * Get the current rebalance status
          * @description Whether a rebalance is needed, running, stopped or idle, with progress and the moves in flight.
-         *     `progress` and `inFlightMoves` describe the current run and are null or empty while idle. `lastReport`
-         *     is the summary of the most recent finished, stopped or failed run (the same object as the newest item
-         *     of `GET /rebalance/reports`) and is null when no run has finished yet.
+         *     `progress` and `inFlightMoves` describe the current run (a stopped run too) and are null or empty while
+         *     idle. `lastReport` is the summary of the most recent finished or failed run other than the current one (the
+         *     same object as the matching item of `GET /rebalance/reports`) and is null when no run has finished yet.
+         *
+         *     **States (0.9.0).** `idle`: no run is unfinished and the last one did not fail. `running`: the task runs.
+         *     `stopping`: an operator asked to stop; the run starts no new move, cancels the move in flight when it has
+         *     not reached its switch and lets it finish when it has (a switch cannot be interrupted); the state ends
+         *     when the move has. `stopped`: the task is `paused` (an operator stopped it, `stoppedBy` `operator`, or a
+         *     condition of the cluster stopped it, `stoppedBy` `safetyRule`; `pausedReason` says why) and
+         *     `POST /rebalance` goes on with it. `failed`: no run is unfinished and the most recent one ended failed
+         *     (`lastReport.outcome`); it clears when a new run starts.
+         *
+         *     `needed` and `reasons` are the same as `ClusterOverview.rebalance`: a server joined and holds no bucket, a
+         *     server that should not hold shards still owns buckets, or buckets lack their replicas.
          */
         get: operations["getRebalanceStatus"];
         put?: never;
         /**
          * Start (or resume) a rebalance
-         * @description Starts a cluster-wide rebalance as a resumable task, or resumes a stopped one. There is a single
-         *     cluster-wide rebalance lock: returns 409 (`rebalance_in_progress`) when one is running. Moves run
-         *     sequentially up to `maxConcurrentMoves`. Returns 503 (`map_group_unavailable`)
-         *     while the map group is failing over.
+         * @description Starts a cluster-wide rebalance as a resumable task (kind `rebalance`, subject `cluster`/`cluster`), or
+         *     starts a stopped one again (the same task: its moves so far are kept and the plan is computed again). There is a
+         *     single cluster-wide rebalance lock: returns 409 (`rebalance_in_progress`) when one is running. The strategy is
+         *     "by bucket count": the extension's `kingres.rebalance_plan` is computed again before every move and the first
+         *     move of it that is not backing off after a failure is made. **This version runs one move at a time**;
+         *     `maxConcurrentMoves` is accepted and recorded and does not yet make moves run together.
+         *
+         *     A move that fails is tried again up to three times, 30 s times the number of failures later, while the other
+         *     buckets go on; a bucket that fails three times is given up, and the run then ends `failed` (its report lists
+         *     every move). A run ends `completed` when no move is left; moves that were skipped (a group lost its lease or
+         *     needs a synchronous standby it does not have, the target has little disk) are in the report and are not failures.
+         *
+         *     **A start is refused, before any task exists, with the reason in the problem code (0.9.0):** 409
+         *     `rebalance_in_progress` (a run is unfinished and not stopped); `operation_in_progress` (another task adds,
+         *     removes or detaches a server); `failover_in_progress`; `version_mismatch` (the servers do not run the same
+         *     version of the sharding extension and the same PostgreSQL major); `cluster_inconsistent` (`kingres.check_cluster()`
+         *     reports something that makes moving unsafe; the detail names it); `no_receiving_server` (no server should hold
+         *     shards); `nothing_to_rebalance` (the plan is empty). The same conditions are checked again before every move; one
+         *     that stops holding stops the run (`stopped`, `stoppedBy` `safetyRule`) instead of failing it. Returns 503
+         *     (`map_group_unavailable`) while the map group is failing over.
          */
         post: operations["startRebalance"];
         delete?: never;
@@ -1216,8 +1260,12 @@ export interface paths {
         put?: never;
         /**
          * Stop the running rebalance
-         * @description Asks the running rebalance to stop after the moves in flight finish. The task becomes `paused`;
-         *     `POST /rebalance` resumes it. Returns 409 when no rebalance is running.
+         * @description Asks the running rebalance to stop. It answers at once with the status (`stopping`); the run starts no new move,
+         *     cancels the move in flight through `kingres.cancel_bucket_move` when that move has not reached its switch (the
+         *     extension undoes it and the bucket stays where it was; the report lists the move as skipped, `skipReason`
+         *     `stopped`) and lets a move finish that is switching or has switched, because a switch cannot be interrupted. The
+         *     task then becomes `paused` (state `stopped`) and `POST /rebalance` goes on with it. Returns 409
+         *     `rebalance_not_running` when no run is unfinished or the run is already stopped.
          */
         post: operations["stopRebalance"];
         delete?: never;
@@ -1235,7 +1283,7 @@ export interface paths {
         };
         /**
          * List rebalance reports
-         * @description One report summary per finished, stopped or failed rebalance run, newest first.
+         * @description One report summary per finished, stopped or failed rebalance run, newest first. A stopped run that can still be started again is listed with outcome `stopped`.
          */
         get: operations["listRebalanceReports"];
         put?: never;
@@ -1258,7 +1306,7 @@ export interface paths {
         };
         /**
          * Get a rebalance report
-         * @description The full report of one rebalance run including every move.
+         * @description The full report of one rebalance run including every move and the placement of primary buckets before the run and after it (the placement after is empty for a run that has not ended). 404 for a run that has no report yet.
          */
         get: operations["getRebalanceReport"];
         put?: never;
@@ -1629,6 +1677,14 @@ export interface paths {
          *     one server), and it is not a rebalance. `defaultReplicaCount` set to its current value starts the same check. Feature flags can be
          *     turned on but never off; the first enable of a feature needs a restart of every server (reported in
          *     `restart`), because the extensions load through `shared_preload_libraries`.
+         *
+         *     **One operation, two answers (0.9.0).** An update that starts no task (every setting but the replica count, and
+         *     a replica count with nothing to do) answers **200** with the settings. An update that starts a task answers
+         *     like every operation that starts one, **202** with the `Task` and `Location: /api/v1/tasks/{taskId}`, when
+         *     the request carries `Prefer: respond-async` (RFC 7240; the answer then has `Preference-Applied: respond-async`).
+         *     The settings are stored before the task starts, and `GET /settings/cluster` returns them. A client that does
+         *     not send the header gets 200 and the settings, as in 0.8.0, and finds the task in `GET /tasks`; the panel sends
+         *     the header. The header is ignored for an update that starts no task.
          */
         patch: operations["updateClusterSettings"];
         trace?: never;
@@ -2131,7 +2187,7 @@ export interface paths {
          *     ones answer **429 `workbench_busy`** with `Retry-After` (0.7.0; before, 503 `service_unavailable`, which is
          *     a statement about the server's health and is no longer used for this). The statement was not started.
          *
-         *     **Cancelling (0.7.0).** A request may name its statement with `statementId`; `cancelStatement` then ends it
+         *     **Cancelling (0.7.0).** A request may name its statement with `statementId` (1 to 64 characters of `A-Za-z0-9_-`; anything else is 400 `validation_failed` on `/statementId`); `cancelStatement` then ends it
          *     on the server that runs it. A cancelled statement ends the `executeQuery` request with 422 `sql_error` and
          *     SQLSTATE `57014`, exactly like a statement that ran into `timeoutMs`.
          */
@@ -2267,6 +2323,12 @@ export interface paths {
          *     The series are those of the whole cluster, from any server: each server answers with its own samples and the
          *     receiving server combines them (a database that several servers report is summed or averaged like the
          *     servers); a server that did not answer is named in `missingServers` (`partial` is then true).
+         *
+         *     **A metric that nobody samples (0.9.0 states it).** The client entry point metrics (`client...`, `clientStandby...`)
+         *     exist only while the entry point of a server is on; while it is off on every server, the metric is still a valid name
+         *     and the answer is 200: without a filter the one cluster series whose points all have `value: null` ("not
+         *     available", never zero), with `groupBy` or a filter that matches nothing `series: []`. It is not an error and not
+         *     a series of zeros; a chart shows "no data".
          */
         get: operations["queryMetrics"];
         put?: never;
@@ -2292,6 +2354,14 @@ export interface components {
          *     `server_hosts_map_group`, `last_server` (`removeServer`, `leaveCluster`), `server_group_not_empty`
          *     (`deleteServerGroup`), `ledger_entry_pending` (`createInclusionProof`).
          *
+         *     Added in 0.9.0 (409, rebalancing): `nothing_to_rebalance` (`startRebalance`: the plan is empty),
+         *     `rebalance_not_running` (`stopRebalance`), `cluster_inconsistent` (`kingres.check_cluster()` reports something that
+         *     makes moving buckets unsafe), `version_mismatch` (the servers do not run the same version of the sharding
+         *     extension and the same PostgreSQL major), `failover_in_progress`, `no_receiving_server` (no server should hold
+         *     shards). `group_degraded` and `insufficient_disk` are reserved for later increments (a move that meets them is
+         *     skipped and reported, not refused). `leader_unavailable` (503) names, in `serverIds`, servers that can be opened
+         *     instead. Clients must tolerate codes they do not know.
+         *
          *     Added in 0.5.0: `certificate_revoked` (409: `renewServerCertificates`, `revokeServerCertificates`) and
          *     `certificate_authority_unavailable` (503: the operation needs the certificate authority key and the manager
          *     leader does not hold it; `renewServerCertificates`, `revokeServerCertificates`, `addServer`, `removeServer`,
@@ -2315,7 +2385,7 @@ export interface components {
          *     system database was stopped on purpose; start it with `startThisServerInstance`).
          * @enum {string}
          */
-        ProblemCode: "bad_request" | "validation_failed" | "unauthenticated" | "invalid_credentials" | "session_expired" | "csrf_token_invalid" | "forbidden" | "setup_token_invalid" | "not_found" | "method_not_allowed" | "conflict" | "already_exists" | "immutable_field" | "rebalance_in_progress" | "operation_in_progress" | "task_not_cancellable" | "last_admin" | "role_in_use" | "optimistic_lock_failed" | "no_replica_available" | "instance_already_running" | "instance_already_stopped" | "server_owns_buckets" | "server_hosts_map_group" | "last_server" | "server_group_not_empty" | "ledger_entry_pending" | "quorum_unavailable" | "system_database_stopped" | "unprocessable" | "sql_error" | "unsupported_operation" | "node_state_invalid" | "node_uninitialized" | "map_group_unavailable" | "leader_unavailable" | "rate_limited" | "service_unavailable" | "internal_error" | "certificate_revoked" | "certificate_authority_unavailable" | "internal_api_disabled" | "workbench_busy" | "config_parameter_unknown" | "config_parameter_managed" | "config_parameter_refused" | "config_level_not_allowed" | "config_value_below_floor" | "config_change_superseded" | "config_restart_order_conflict" | "nothing_pending";
+        ProblemCode: "bad_request" | "validation_failed" | "unauthenticated" | "invalid_credentials" | "session_expired" | "csrf_token_invalid" | "forbidden" | "setup_token_invalid" | "not_found" | "method_not_allowed" | "conflict" | "already_exists" | "immutable_field" | "rebalance_in_progress" | "operation_in_progress" | "task_not_cancellable" | "last_admin" | "role_in_use" | "optimistic_lock_failed" | "no_replica_available" | "instance_already_running" | "instance_already_stopped" | "server_owns_buckets" | "server_hosts_map_group" | "last_server" | "server_group_not_empty" | "ledger_entry_pending" | "quorum_unavailable" | "system_database_stopped" | "unprocessable" | "sql_error" | "unsupported_operation" | "node_state_invalid" | "node_uninitialized" | "map_group_unavailable" | "leader_unavailable" | "rate_limited" | "service_unavailable" | "internal_error" | "certificate_revoked" | "certificate_authority_unavailable" | "internal_api_disabled" | "workbench_busy" | "config_parameter_unknown" | "config_parameter_managed" | "config_parameter_refused" | "config_level_not_allowed" | "config_value_below_floor" | "config_change_superseded" | "config_restart_order_conflict" | "nothing_pending" | "nothing_to_rebalance" | "rebalance_not_running" | "cluster_inconsistent" | "version_mismatch" | "failover_in_progress" | "group_degraded" | "insufficient_disk" | "no_receiving_server";
         /** @description One invalid field of a request. */
         ValidationIssue: {
             /** @description JSON Pointer (RFC 6901) to the invalid property of the request body, or the name of the invalid query or path parameter. */
@@ -2352,6 +2422,8 @@ export interface components {
             sqlState?: string;
             /** @description 1-based character position of the error in the statement; present for some `sql_error` problems. */
             sqlPosition?: number;
+            /** @description Added in 0.9.0, optional. Servers that can be opened instead; set for `leader_unavailable`: the manager leader first when this server knows it, then the other servers of the cluster as this server knows them. Empty or absent when it knows none. */
+            serverIds?: components["schemas"]["ServerId"][];
         };
         /** @description Liveness result. */
         HealthStatus: {
@@ -2919,8 +2991,11 @@ export interface components {
          */
         ClusterHealth: "healthy" | "degraded" | "critical";
         /**
-         * @description `live` healthy; `suspect` heartbeats are late; `draining` being emptied before removal;
-         *     `decommissioning` rebalance away from it is running; `dead` no liveness for the failure timeout;
+         * @description `live` healthy; `suspect` heartbeats are late; `draining` (0.9.0 states what decides it): the server should not hold
+         *     shards (`shouldHaveShards` false) and still runs the primary of at least one shard group that owns buckets, so a
+         *     rebalance has buckets to move away from it; it is `live` again when none is left (the standbys it hosts for other
+         *     groups do not count: a rebalance does not move them); `decommissioning` (0.9.0, it was never set before): its
+         *     removal task (`server.remove`) is running; `dead` no liveness for the failure timeout;
          *
          *     **Liveness (0.7.0).** Servers send each other a heartbeat every second. A server from which the answering
          *     server has heard nothing for the suspect timeout (5 s by default) is `suspect`, after the failure timeout
@@ -3129,7 +3204,7 @@ export interface components {
             joinedAt: string | null;
             /**
              * Format: date-time
-             * @description Last heartbeat seen by the manager; null when not available.
+             * @description Last heartbeat the answering server heard from this server (0.7.0 and later; the heartbeats go between all servers, not to the manager); null when it has heard none, and for the answering server itself.
              */
             lastHeartbeatAt: string | null;
             /**
@@ -3409,6 +3484,10 @@ export interface components {
                  * @description Highest verified block height (minimum over chains); null if never verified.
                  */
                 lastVerifiedBlockHeight: number | null;
+                /** @description Added in 0.9.0, optional. The coverage of the summary, with the meaning of `LedgerStatus.complete`: true when the summary covers the chains of every shard group of the database, false when the answering server knows only the chains of its own group; then `uncoveredShardGroupIds` lists the others. */
+                complete?: boolean;
+                /** @description Added in 0.9.0, optional. The shard groups whose chains the summary does not cover (empty when `complete`). */
+                uncoveredShardGroupIds?: number[];
             };
             /** @description Whether this database's buckets need rebalancing. */
             rebalanceRequired: boolean;
@@ -3517,11 +3596,11 @@ export interface components {
             column: string | null;
             /**
              * Format: int32
-             * @description Colocation group of the table.
+             * @description Colocation group of the table; null for a reference table, which is in none (0.9.0; a reference table could not be made before).
              */
-            colocationId: number;
-            /** @description Bucket count of the colocation group. */
-            bucketCount: number;
+            colocationId: number | null;
+            /** @description Bucket count of the colocation group; null for a reference table. */
+            bucketCount: number | null;
         };
         /** @description Ledger properties of a table. */
         TableLedger: {
@@ -3655,7 +3734,7 @@ export interface components {
         };
         /** @description One hash bucket of a colocation group. */
         Bucket: {
-            /** @description Bucket number, `hash(key) % bucketCount`. */
+            /** @description Bucket number: `hash(key)` reduced to the number of buckets of the colocation group (`ColocationGroup.bucketCount`) by the sharding extension's own hash function, which is not PostgreSQL's `hashtext` followed by a modulo; use `kingres.bucket_for` to find the bucket of a value. */
             bucket: number;
             /**
              * Format: int32
@@ -3806,7 +3885,8 @@ export interface components {
          *     a group it granted to another server.
          */
         GroupLease: {
-            holder: components["schemas"]["ServerId"];
+            /** @description The server that holds the lease as far as the answering server knows; **null when `state` is `none`** (0.9.0; the property stays required, its value can now be null). */
+            holder: components["schemas"]["ServerId"] | null;
             /**
              * @description `held` valid now; `lost` the primary of this group runs here and the lease was not renewed; `granted` granted by the answering server to `holder`; `none`.
              * @enum {string}
@@ -3834,7 +3914,7 @@ export interface components {
         RebalanceOptions: {
             /** @description Restrict to these databases; omitted or empty means all. */
             databases?: string[];
-            /** @description Concurrent bucket moves; defaults to the cluster setting (4 unless changed). */
+            /** @description Concurrent bucket moves; defaults to the cluster setting (4 unless changed). **This version runs one move at a time** and records the value (0.9.0). */
             maxConcurrentMoves?: number;
         };
         /** @description Options of a plan preview. */
@@ -3866,6 +3946,10 @@ export interface components {
              * @description Destination shard group.
              */
             toShardGroupId: number;
+            /** @description Added in 0.9.0, optional. The server that runs the primary of the source group when the plan was made; the page shows servers, not group numbers. */
+            fromServerId?: string;
+            /** @description Added in 0.9.0, optional. The server that runs the primary of the destination group. */
+            toServerId?: string;
             /**
              * Format: int64
              * @description Estimated bytes to copy; null when bucket sizes are not available.
@@ -3926,8 +4010,14 @@ export interface components {
              * @description Destination shard group.
              */
             toShardGroupId: number;
+            /** @description Added in 0.9.0, optional. The server that runs the primary of the source group. */
+            fromServerId?: string;
+            /** @description Added in 0.9.0, optional. The server that runs the primary of the destination group. */
+            toServerId?: string;
             /**
-             * @description Current phase of the move.
+             * @description Current phase of the move: the extension's `preparing`, `copying`, `catching_up`, `switching` and
+             *     `cleaning`. `percent` is an estimate by phase (5, 30, 85, 95, 100): the extension does not report how much of
+             *     the copy is done.
              * @enum {string}
              */
             phase: "prepare" | "copy" | "catchUp" | "switch" | "cleanup";
@@ -3949,9 +4039,11 @@ export interface components {
             movesInFlight: number;
             /** @description Moves that failed. */
             movesFailed: number;
+            /** @description Added in 0.9.0, optional. Moves not made in this run (skipped by a condition, or cancelled by a stop). */
+            movesSkipped?: number;
             /**
              * Format: int64
-             * @description Bytes copied so far.
+             * @description Bytes copied so far (the planned size of the moves that are done).
              */
             bytesMoved: number;
             /** @description Overall progress. */
@@ -3960,7 +4052,7 @@ export interface components {
         /** @description Current rebalance state. */
         RebalanceStatus: {
             /**
-             * @description `idle` no rebalance in progress; `stopped` a stopped run that can be resumed.
+             * @description `idle` no unfinished run; `running`; `stopping` a stop was asked and the move in flight has not ended; `stopped` a paused run that `POST /rebalance` goes on with; `failed` no unfinished run and the last one ended failed (see `getRebalanceStatus`).
              * @enum {string}
              */
             state: "idle" | "running" | "stopping" | "stopped" | "failed";
@@ -3984,7 +4076,11 @@ export interface components {
             progress?: components["schemas"]["RebalanceProgress"] | null;
             /** @description Moves running now. */
             inFlightMoves?: components["schemas"]["BucketMove"][];
-            /** @description Summary of the most recent finished, stopped or failed run, so the page can show what happened last while `progress` is null; null when no run has finished yet. */
+            /** @description Added in 0.9.0, optional. Who stopped the run, while it is `stopping` or `stopped`: `operator` or `safetyRule`. Clients must tolerate other values. Null otherwise. */
+            stoppedBy?: string | null;
+            /** @description Added in 0.9.0, optional. The text the run recorded when it paused (what stopped it, and that `POST /rebalance` goes on). Null while it is not stopped. */
+            pausedReason?: string | null;
+            /** @description Summary of the most recent finished or failed run other than the current one, so the page can show what happened last while `progress` is null; null when no run has finished yet. */
             lastReport: components["schemas"]["RebalanceReportSummary"] | null;
         };
         /** @description Summary of one rebalance run. */
@@ -4010,9 +4106,15 @@ export interface components {
              */
             finishedAt: string;
             options?: components["schemas"]["RebalanceOptions"];
+            /** @description Added in 0.9.0, optional. For outcome `stopped`: `operator` or `safetyRule`. */
+            stoppedBy?: string | null;
+            /** @description Added in 0.9.0, optional. Why the run failed or was stopped by a safety rule; null otherwise. */
+            error?: string | null;
             /** @description Totals of the run. */
             totals: {
-                /** @description Moves planned. */
+                /** @description Added in 0.9.0, optional. Moves not made (skipped by a condition, or cancelled by a stop). */
+                movesSkipped?: number;
+                /** @description Moves planned (at least the moves of the report). */
                 movesTotal: number;
                 /** @description Moves completed. */
                 movesDone: number;
@@ -4029,6 +4131,10 @@ export interface components {
         };
         /** @description Full report of a rebalance run. */
         RebalanceReport: components["schemas"]["RebalanceReportSummary"] & {
+            /** @description Added in 0.9.0, optional. Primary buckets per database and server when the run started. */
+            placementBefore?: components["schemas"]["PlacementEntry"][];
+            /** @description Added in 0.9.0, optional. The same when the run ended; empty for a run that has not ended. */
+            placementAfter?: components["schemas"]["PlacementEntry"][];
             /** @description Every move of the run. */
             moves: {
                 /** @description Database. */
@@ -4050,9 +4156,17 @@ export interface components {
                  * @description Destination shard group.
                  */
                 toShardGroupId: number;
+                /** @description Added in 0.9.0, optional. The server that ran the primary of the source group. */
+                fromServerId?: string;
+                /** @description Added in 0.9.0, optional. The server that ran the primary of the destination group. */
+                toServerId?: string;
+                /** @description Added in 0.9.0, optional. How many times the move was tried. */
+                attempts?: number;
+                /** @description Added in 0.9.0, optional. For outcome `skipped`: `stopped` (cancelled by a stop), `targetDiskLow`, `groupDegraded` or `groupLeaseLost`. Clients must tolerate other values. */
+                skipReason?: string | null;
                 /**
                  * Format: int64
-                 * @description Bytes copied.
+                 * @description Bytes copied (the size the plan estimated).
                  */
                 sizeBytes?: number;
                 /**
@@ -4065,6 +4179,14 @@ export interface components {
                 /** @description Error message for a failed move. */
                 error?: string | null;
             }[];
+        };
+        /** @description Added in 0.9.0. The primary buckets one server holds in one database. */
+        PlacementEntry: {
+            /** @description Database. */
+            databaseName: string;
+            serverId: components["schemas"]["ServerId"];
+            /** @description Buckets of the groups whose primary the server runs, over all colocation groups of the database. */
+            primaryBuckets: number;
         };
         /** @description A page of rebalance report summaries. */
         RebalanceReportPage: {
@@ -4088,11 +4210,11 @@ export interface components {
             /** @description Step name. */
             name: string;
             /**
-             * @description Step state.
+             * @description Step state. `skipped` (set by `kingresd` since 0.9.0; before, it recorded `done`): the step decided on purpose that it has nothing to do, and `detail` says why; the task goes on with the next step and counts the step as over. A paused task shows the step it will go on with as `pending`.
              * @enum {string}
              */
             state: "pending" | "running" | "done" | "failed" | "skipped";
-            /** @description Extra information about the step, for example `Waiting for server db3, which cannot be reached`. Set while the step runs; null otherwise. */
+            /** @description Extra information about the step, for example `Waiting for server db3, which cannot be reached`. Set while the step runs, and for a step that was `skipped` (the reason, for example `skipped: needs kingres_shard 0.5`); null otherwise. */
             detail?: string | null;
             /** @description Items completed, for example buckets moved. */
             itemsDone?: number | null;
@@ -4490,7 +4612,7 @@ export interface components {
         };
         /** @description Cluster-wide settings. */
         ClusterSettings: {
-            /** @description Standby copies of every shard group. A change makes a rebalance necessary. */
+            /** @description Standby copies of every shard group. A change starts the task `standby.reconcile` (adds or removes standby instances, 0.7.0); it does not make a rebalance necessary: standbys own no buckets. */
             defaultReplicaCount: number;
             defaultDurability: components["schemas"]["Durability"];
             /** @description Automatic failover. */
@@ -5410,7 +5532,7 @@ export interface components {
              * @default 30000
              */
             timeoutMs?: number;
-            /** @description Added in 0.7.0, optional. Names the statement so that `cancelStatement` can end it. Unique among the running statements of the signed-in role on this server (409 `conflict` otherwise); chosen by the client (a random string). */
+            /** @description Added in 0.7.0, optional. Names the statement so that `cancelStatement` can end it. Unique among the running statements of the signed-in role on this server (409 `conflict` otherwise); chosen by the client (a random string). Format (0.9.0 states it): 1 to 64 characters of A-Z, a-z, 0-9, underscore and hyphen. A value that does not match is 400 `validation_failed` with `errors[].field` `/statementId` and nothing is run. */
             statementId?: string;
         };
         /** @description A result column. */
@@ -5508,6 +5630,8 @@ export interface components {
          *     `behindServerId` the server that is behind (the one the panel must name). `leaseLost`,
          *     `groupWithoutSynchronousStandby`, `groupUnderReplicated`: `shardGroupId`, and `serverId` the server that
          *     runs the group's primary. `clockDifference` (0.8.0): `serverId` is the server whose clock differs. `versionMismatch`: all null.
+         *     `taskId` (0.9.0, optional) names a task the alert is about, so that a client can link to it; `kingresd` sets it for
+         *     `taskFailed` alerts (the only kind about a task; `kingresd` raises it for a rebalance that ended failed, subject `task:<id>`), and no other kind sets it.
          */
         AlertSubject: {
             /** @description The server the alert is about; null when it is about the cluster. */
@@ -5523,6 +5647,11 @@ export interface components {
             databaseName: string | null;
             /** @description A qualifier of the subject for kinds that have several, for example `ca`; null otherwise. Clients must tolerate values they do not know. */
             aspect: string | null;
+            /**
+             * Format: int64
+             * @description Added in 0.9.0, optional (absent from a server of an older revision, null when the alert is not about a task). The task the alert is about; open it with `GET /tasks/{taskId}`.
+             */
+            taskId?: number | null;
         };
         /** @description A page of alerts. */
         AlertPage: {
@@ -7882,7 +8011,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The updated settings. */
+            /** @description The updated settings (no task was started, or the request did not ask for the task). */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -7891,6 +8020,7 @@ export interface operations {
                     "application/json": components["schemas"]["ClusterSettings"];
                 };
             };
+            202: components["responses"]["AcceptedTask"];
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];

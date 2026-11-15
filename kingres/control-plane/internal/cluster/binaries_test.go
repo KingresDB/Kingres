@@ -50,7 +50,7 @@ func TestVerifyBinariesRefusesAPlainPostgres(t *testing.T) {
 	}
 	d := fakeDir(t, "postgres", "initdb", "pg_ctl", "pg_config")
 	err := VerifyBinaries(context.Background(), d)
-	if err == nil || !strings.Contains(err.Error(), "not a KingresDB 18 build") {
+	if err == nil || !strings.Contains(err.Error(), "supported PostgreSQL major") {
 		t.Errorf("version 16 programs: %v", err)
 	}
 	// Right version, but no KingresDB libraries.
@@ -74,5 +74,32 @@ func TestVerifyBinariesRefusesAPlainPostgres(t *testing.T) {
 	}
 	if err := VerifyBinaries(context.Background(), d); err != nil {
 		t.Errorf("a complete installation: %v", err)
+	}
+	// Major 19, in its pre-release forms too; a mix of majors; an unsupported one.
+	write := func(p, ver string) {
+		if err := os.WriteFile(filepath.Join(d, p), []byte("#!/bin/sh\necho 'postgres (PostgreSQL) "+ver+"'\n"), 0o755); err != nil { //nolint:gosec // test fixture
+			t.Fatal(err)
+		}
+	}
+	for _, v := range []string{"19rc2", "19beta1", "19.0", "18.1"} {
+		for _, p := range requiredPrograms {
+			write(p, v)
+		}
+		if err := VerifyBinaries(context.Background(), d); err != nil {
+			t.Errorf("version %s: %v", v, err)
+		}
+	}
+	write("pg_ctl", "18.1")
+	for _, p := range []string{"postgres", "initdb"} {
+		write(p, "19rc2")
+	}
+	if err := VerifyBinaries(context.Background(), d); err == nil || !strings.Contains(err.Error(), "one major") {
+		t.Errorf("mixed majors: %v", err)
+	}
+	for _, p := range requiredPrograms {
+		write(p, "20beta1")
+	}
+	if err := VerifyBinaries(context.Background(), d); err == nil || !strings.Contains(err.Error(), "20beta1") || !strings.Contains(err.Error(), "18 and 19") {
+		t.Errorf("an unsupported major: %v", err)
 	}
 }

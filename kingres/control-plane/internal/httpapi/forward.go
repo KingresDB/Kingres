@@ -53,6 +53,8 @@ var leaderBoundReads = map[string]bool{
 	"getConfigSummary": true, "getClusterTime": true, "listTimeZones": true,
 	// The groups are state of the leader's system database (see completeServers).
 	"listServerGroups": true,
+	// The records of a rebalance run are in the leader's system database.
+	"getRebalanceStatus": true, "listRebalanceReports": true, "getRebalanceReport": true,
 	// The verification records get their identifiers in the system database
 	// the first time they are read (README, "Inclusion proofs and verification records").
 	"listLedgerVerifications": true, "getLedgerVerification": true,
@@ -136,7 +138,7 @@ func (s *Server) tryForward(c *call, w http.ResponseWriter, r *http.Request) (bo
 	}
 	resp, err := fw.Forward(r.Context(), leaderID, internalapi.ForwardRequest{
 		OperationID: c.op.ID, PathParams: params, Query: r.URL.RawQuery,
-		ContentType: r.Header.Get("Content-Type"), Body: body, Pin: pin,
+		ContentType: r.Header.Get("Content-Type"), Body: body, Pin: pin, Prefer: r.Header.Get("Prefer"),
 		Identity:  identityOf(c.session),
 		RequestID: stateOf(r).id, SourceAddress: c.ip, Source: src,
 	})
@@ -169,6 +171,7 @@ func (s *Server) tryForward(c *call, w http.ResponseWriter, r *http.Request) (bo
 // relayedHeaders are the response headers passed through in both directions.
 var relayedHeaders = map[string]bool{
 	"Content-Type": true, "Location": true, "Retry-After": true, "Allow": true, "Content-Language": true,
+	"Preference-Applied": true,
 }
 
 // ServeForwarded runs a forwarded operation on this server, which must be the
@@ -242,6 +245,9 @@ func (s *Server) operationRequest(ctx context.Context, peer string, fr internala
 	}
 	if validRequestID(fr.RequestID) {
 		req.Header.Set("X-Request-Id", fr.RequestID)
+	}
+	if fr.Prefer != "" && len(fr.Prefer) <= 200 {
+		req.Header.Set("Prefer", fr.Prefer)
 	}
 	req.RemoteAddr = "forwarded:0"
 	return req, nil

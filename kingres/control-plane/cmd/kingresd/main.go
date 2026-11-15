@@ -44,6 +44,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/peerclient"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/peers"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pgconninfo"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/rebalance"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sdnotify"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/setup"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/store/pgstore"
@@ -322,6 +323,12 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		cfgp = newConfigParts(svc, serverHost, log, members, opsSvc, faultHook)
 		deps.Config = cfgp.leader
 	}
+	var rbs *rebalance.Service
+	if opsSvc != nil && svc.Enabled() {
+		rbs = newRebalance(svc, opsSvc, pg, haReg, log, auditFn(sink, log))
+		rbs.Backoff = cfg.RebalanceRetryBackoff
+		deps.Rebalance = rbs
+	}
 	deps.LeaderTrusted = leaderTrusted(haReg, lastLeader, serverHost, cfg.HA.LeaderLossBound)
 	api, err := httpapi.New(deps)
 	if err != nil {
@@ -374,6 +381,9 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 			}
 			if cfgp != nil {
 				defs = append(defs, cfgp.leader.Definitions()...)
+			}
+			if rbs != nil {
+				defs = append(defs, rbs.Definitions()...)
 			}
 			eng, err = task.NewEngine(task.NewPGStore(pool), defs, task.Options{
 				Holder: fmt.Sprintf("%s-%d", hostname, os.Getpid()), Logger: log})

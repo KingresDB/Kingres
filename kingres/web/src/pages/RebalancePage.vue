@@ -40,7 +40,7 @@ const STATE_META: Record<RebalanceStatus['state'], StatusMeta> = tolerant({
   idle: { tone: 'neutral', icon: '○', label: 'Idle' },
   running: { tone: 'info', icon: '◐', label: 'Running' },
   stopping: { tone: 'warn', icon: '▲', label: 'Stopping' },
-  stopped: { tone: 'warn', icon: '▲', label: 'Stopped (can be resumed)' },
+  stopped: { tone: 'warn', icon: '▲', label: 'Stopped (start again to go on)' },
   failed: { tone: 'danger', icon: '✖', label: 'Failed' },
 })
 
@@ -74,6 +74,18 @@ const stopMutation = useMutation({
 })
 
 const detailId = ref<number | null>(null)
+
+/** The phase of a move in flight, in words (the extension's phases). */
+const PHASE_LABEL: Record<string, string> = {
+  prepare: 'Preparing',
+  copy: 'Copying',
+  catchUp: 'Catching up',
+  switch: 'Switching',
+  cleanup: 'Cleaning up',
+}
+const stoppedByText = computed(() =>
+  st.value?.stoppedBy === 'safetyRule' ? 'a condition of the cluster' : 'an operator',
+)
 </script>
 
 <template>
@@ -98,7 +110,7 @@ const detailId = ref<number | null>(null)
         :disabled="start.isBusy.value"
         @click="start.run()"
       >
-        {{ st?.state === 'stopped' ? 'Resume rebalance' : 'Start rebalance' }}
+        {{ st?.state === 'stopped' ? 'Start again' : 'Start rebalance' }}
       </GateButton>
     </template>
   </PageHeader>
@@ -131,6 +143,45 @@ const detailId = ref<number | null>(null)
           {{ st.reasons.map((r) => REBALANCE_REASON_LABEL[r]).join('; ') || 'buckets are uneven' }}.
         </p>
         <p v-else-if="!running" class="muted">No rebalance is needed.</p>
+        <p
+          v-if="st.state === 'stopped'"
+          class="notice tone-warn"
+          role="status"
+          data-testid="stopped-note"
+        >
+          <span aria-hidden="true">&#9650;</span>
+          <span>
+            Stopped by {{ stoppedByText }}.
+            <SafeName v-if="st.pausedReason" :value="st.pausedReason" kind="text" :max="300" />
+            The buckets moved so far stay where they are; <strong>Start again</strong> goes on with
+            the same run and plans the remaining moves again.
+          </span>
+        </p>
+        <p
+          v-if="st.state === 'stopping'"
+          class="notice tone-warn"
+          role="status"
+          data-testid="stopping-note"
+        >
+          <span aria-hidden="true">&#9650;</span>
+          <span
+            >Stopping: the move in flight is cancelled, or finishes if it is already
+            switching.</span
+          >
+        </p>
+        <p
+          v-if="st.state === 'failed'"
+          class="notice tone-danger"
+          role="status"
+          data-testid="failed-note"
+        >
+          <span aria-hidden="true">&#10006;</span>
+          <span
+            >The last run failed<template v-if="st.lastReport?.error"
+              >: <SafeName :value="st.lastReport.error" kind="text" :max="300" /></template
+            >. Its report lists every move.</span
+          >
+        </p>
         <p v-if="!running && st.lastReport" data-testid="last-report">
           Last run: <strong>{{ st.lastReport.outcome }}</strong>,
           {{ st.lastReport.totals.movesDone }} of {{ st.lastReport.totals.movesTotal }} moves,
@@ -143,7 +194,10 @@ const detailId = ref<number | null>(null)
           <div class="row-between">
             <span class="num"
               >{{ st.progress.movesDone }} of {{ st.progress.movesTotal }} moves done,
-              {{ st.progress.movesInFlight }} in flight, {{ st.progress.movesFailed }} failed</span
+              {{ st.progress.movesInFlight }} in flight,
+              {{ st.progress.movesFailed }} failed<template v-if="st.progress.movesSkipped"
+                >, {{ st.progress.movesSkipped }} skipped</template
+              ></span
             >
             <span class="num">{{ Math.round(st.progress.percent) }}%</span>
           </div>
@@ -168,8 +222,8 @@ const detailId = ref<number | null>(null)
               <tr>
                 <th scope="col">Database</th>
                 <th scope="col" class="num">Bucket</th>
-                <th scope="col">From group</th>
-                <th scope="col">To group</th>
+                <th scope="col">From</th>
+                <th scope="col">To</th>
                 <th scope="col">Phase</th>
                 <th scope="col" class="num">Done</th>
               </tr>
@@ -181,9 +235,18 @@ const detailId = ref<number | null>(null)
               >
                 <td><SafeName :value="m.databaseName" :max="60" /></td>
                 <td class="num">{{ m.bucket }}</td>
-                <td>{{ m.fromShardGroupId }}</td>
-                <td>{{ m.toShardGroupId }}</td>
-                <td><SafeName :value="m.phase" kind="text" :max="40" /></td>
+                <td>
+                  <SafeName v-if="m.fromServerId" :value="m.fromServerId" :max="80" />
+                  <template v-else>group {{ m.fromShardGroupId }}</template>
+                </td>
+                <td>
+                  <SafeName v-if="m.toServerId" :value="m.toServerId" :max="80" />
+                  <template v-else>group {{ m.toShardGroupId }}</template>
+                </td>
+                <td>
+                  <span aria-hidden="true">&#9684;</span>
+                  <SafeName :value="PHASE_LABEL[m.phase] ?? m.phase" kind="text" :max="40" />
+                </td>
                 <td class="num">{{ Math.round(m.percent) }}%</td>
               </tr>
             </tbody>
@@ -212,7 +275,7 @@ const detailId = ref<number | null>(null)
           </label>
         </fieldset>
         <div class="field" style="max-width: 20em">
-          <label for="rb-max">Concurrent moves</label>
+          <label for="rb-max">Concurrent moves (one at a time in this version)</label>
           <input
             id="rb-max"
             v-model.number="maxMoves"
@@ -223,7 +286,9 @@ const detailId = ref<number | null>(null)
             :placeholder="String(settings.data.value?.rebalance.maxConcurrentMoves ?? 4)"
             :disabled="running"
           />
-          <span class="hint">1 to 64. Empty uses the cluster setting.</span>
+          <span class="hint"
+            >1 to 64. Recorded with the run; the server moves one bucket at a time for now.</span
+          >
         </div>
       </section>
 
@@ -280,8 +345,8 @@ const detailId = ref<number | null>(null)
                   <tr>
                     <th scope="col">Database</th>
                     <th scope="col" class="num">Bucket</th>
-                    <th scope="col">From group</th>
-                    <th scope="col">To group</th>
+                    <th scope="col">From</th>
+                    <th scope="col">To</th>
                     <th scope="col" class="num">Size</th>
                   </tr>
                 </thead>
@@ -292,8 +357,14 @@ const detailId = ref<number | null>(null)
                   >
                     <td><SafeName :value="m.databaseName" :max="60" /></td>
                     <td class="num">{{ m.bucket }}</td>
-                    <td>{{ m.fromShardGroupId }}</td>
-                    <td>{{ m.toShardGroupId }}</td>
+                    <td>
+                      <SafeName v-if="m.fromServerId" :value="m.fromServerId" :max="80" />
+                      <template v-else>group {{ m.fromShardGroupId }}</template>
+                    </td>
+                    <td>
+                      <SafeName v-if="m.toServerId" :value="m.toServerId" :max="80" />
+                      <template v-else>group {{ m.toShardGroupId }}</template>
+                    </td>
                     <td class="num">
                       <NullableValue :value="m.estimatedSizeBytes" :format="formatBytes" />
                     </td>
@@ -375,8 +446,10 @@ const detailId = ref<number | null>(null)
     @confirm="stopMutation.mutate()"
   >
     <p>
-      Moves in flight are rolled back. The rebalance becomes <strong>stopped</strong> and can be
-      resumed later; buckets already moved stay where they are.
+      A move that has not reached its switch is cancelled and undone; a move that is switching
+      finishes first. The rebalance then becomes <strong>stopped</strong>;
+      <strong>Start again</strong>
+      goes on with it. Buckets already moved stay where they are.
     </p>
   </ConfirmDialog>
   <RebalanceReportDialog v-if="detailId !== null" :report-id="detailId" @close="detailId = null" />

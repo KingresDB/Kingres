@@ -15,7 +15,11 @@ func leaseView(reg *ha.Registry, group int32) *api.GroupLease {
 		if li.Group != group {
 			continue
 		}
-		l := &api.GroupLease{Holder: li.Holder, State: li.State, Enforced: li.Enforced}
+		l := &api.GroupLease{State: li.State, Enforced: li.Enforced}
+		if li.State != "none" && li.Holder != "" {
+			h := li.Holder
+			l.Holder = &h
+		}
 		if li.State == "held" || li.State == "granted" {
 			ms := li.RemainingMillis
 			l.RemainingMillis = &ms

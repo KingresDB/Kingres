@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/audit"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/peerclient"
@@ -127,7 +128,18 @@ func (m *Manager) unregisterNode(ctx context.Context, db, host string) error {
 		return err
 	}
 	for _, id := range ids {
-		if _, err := c.Exec(ctx, `SELECT kingres.remove_node($1)`, id); err != nil {
+		_, err := c.Exec(ctx, `SELECT kingres.remove_node($1)`, id)
+		var pe *pgconn.PgError
+		if errors.As(err, &pe) && pe.Code == "55006" {
+			// The server was emptied by a rebalance a moment ago: its moves are still in the cleaning phase,
+			// waiting for the delay after which the old copies of the buckets are dropped, and the extension
+			// refuses to remove a group that takes part in a move. The server is going away with its data, so
+			// the old copies are dropped now (cleanup_moved_buckets(true)), and the removal tries again.
+			if _, cerr := c.Exec(ctx, `SELECT kingres.cleanup_moved_buckets(true)`); cerr == nil {
+				_, err = c.Exec(ctx, `SELECT kingres.remove_node($1)`, id)
+			}
+		}
+		if err != nil {
 			return fmt.Errorf("unregistering node %d in database %s: %w", id, db, cleanPG(err))
 		}
 	}

@@ -80,6 +80,15 @@ const (
 	ConfigChangeSuperseded Code = "config_change_superseded"
 	ConfigRestartOrder     Code = "config_restart_order_conflict"
 	NothingPending         Code = "nothing_pending"
+	// Added in contract 0.9.0 (rebalancing): the reasons a rebalance does not start.
+	NothingToRebalance  Code = "nothing_to_rebalance"
+	RebalanceNotRunning Code = "rebalance_not_running"
+	ClusterInconsistent Code = "cluster_inconsistent"
+	VersionMismatch     Code = "version_mismatch"
+	FailoverInProgress  Code = "failover_in_progress"
+	GroupDegraded       Code = "group_degraded"
+	InsufficientDisk    Code = "insufficient_disk"
+	NoReceivingServer   Code = "no_receiving_server"
 )
 
 // FieldError is one entry of the "errors" extension (schema ValidationIssue).
@@ -116,6 +125,8 @@ type Problem struct {
 	SQLState string `json:"sqlState,omitempty"`
 	// SQLPosition is the 1-based error position for sql_error.
 	SQLPosition int `json:"sqlPosition,omitempty"`
+	// ServerIDs are servers that can be opened instead (leader_unavailable).
+	ServerIDs []string `json:"serverIds,omitempty"`
 
 	// retryAfter, when positive, is sent as a Retry-After header (seconds).
 	retryAfter int
@@ -189,6 +200,14 @@ var specs = map[Code]struct {
 	ConfigChangeSuperseded:          {409, "Change superseded", "config-change-superseded"},
 	ConfigRestartOrder:              {409, "No safe restart order", "config-restart-order-conflict"},
 	NothingPending:                  {409, "Nothing pending", "nothing-pending"},
+	NothingToRebalance:              {409, "Nothing to rebalance", "nothing-to-rebalance"},
+	RebalanceNotRunning:             {409, "No rebalance running", "rebalance-not-running"},
+	ClusterInconsistent:             {409, "Cluster inconsistent", "cluster-inconsistent"},
+	VersionMismatch:                 {409, "Version mismatch", "version-mismatch"},
+	FailoverInProgress:              {409, "Failover in progress", "failover-in-progress"},
+	GroupDegraded:                   {409, "Shard group degraded", "group-degraded"},
+	InsufficientDisk:                {409, "Insufficient disk space", "insufficient-disk"},
+	NoReceivingServer:               {409, "No receiving server", "no-receiving-server"},
 }
 
 // New returns a Problem for the code with the standard status, title and

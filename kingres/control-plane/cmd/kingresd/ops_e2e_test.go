@@ -424,8 +424,9 @@ func TestDatabasesTablesAndLedger(t *testing.T) {
 	if st, _, _ := e.call("PUT", "/databases/db_both/schemas/public/tables/orders/distribution", map[string]any{"method": "hash"}, nil); st != 400 && st != 422 {
 		t.Errorf("hash without column: %d", st)
 	}
-	if st, o, _ := e.call("PUT", "/databases/db_both/schemas/public/tables/orders/distribution", map[string]any{"method": "reference"}, nil); st != 422 || problemCode(o) != "unsupported_operation" {
-		t.Errorf("reference: %d %v", st, o)
+	// 0.9.0: a reference table is made, with the rows it has; a distribution column is not allowed for it.
+	if st, _, _ := e.call("PUT", "/databases/db_both/schemas/public/tables/orders/distribution", map[string]any{"method": "reference", "distributionColumn": "id"}, nil); st != 400 {
+		t.Errorf("reference with a column: %d", st)
 	}
 	e.mustTask(t, "PUT", "/databases/db_both/schemas/public/tables/orders/distribution", map[string]any{"method": "hash", "distributionColumn": "id"})
 	tbl = e.expect(t, 200, "GET", "/databases/db_both/schemas/public/tables/orders", nil)
@@ -446,6 +447,24 @@ func TestDatabasesTablesAndLedger(t *testing.T) {
 	}
 	if st, _, _ := e.call("PUT", "/databases/db_plain/schemas/public/tables/x/ledger", map[string]any{"mode": "appendOnly"}, nil); st != 404 && st != 409 {
 		t.Errorf("database without ledger: %d", st)
+	}
+	// distributeTable offers what the extension can do (0.9.0): a reference table with rows, no hash table
+	// with rows, no ledger table of either kind, each refusal before a task exists.
+	q("create table public.refdata (id int primary key, v text)")
+	q("insert into public.refdata values (1, 'a'), (2, 'b')")
+	e.mustTask(t, "PUT", "/databases/db_both/schemas/public/tables/refdata/distribution", map[string]any{"method": "reference"})
+	if cl, _ := e.expect(t, 200, "GET", "/databases/db_both/schemas/public/tables/refdata", nil)["classes"].([]any); len(cl) != 1 || cl[0] != "reference" {
+		t.Errorf("classes of the reference table: %v", cl)
+	}
+	q("create table public.has_rows (id bigint primary key)")
+	q("insert into public.has_rows values (1)")
+	if st, o, _ := e.call("PUT", "/databases/db_both/schemas/public/tables/has_rows/distribution", map[string]any{"method": "hash", "distributionColumn": "id"}, nil); st != 422 || problemCode(o) != "unprocessable" {
+		t.Errorf("hash table with rows: %d %v", st, o)
+	}
+	for _, m := range []map[string]any{{"method": "hash", "distributionColumn": "id"}, {"method": "reference"}} {
+		if st, o, _ := e.call("PUT", "/databases/db_both/schemas/public/tables/audit_rows/distribution", m, nil); st != 422 || problemCode(o) != "unprocessable" {
+			t.Errorf("ledger table %v: %d %v", m["method"], st, o)
+		}
 	}
 	// Cluster summary for a statistics-only account.
 	sum := e.expect(t, 200, "GET", "/cluster/summary", nil)

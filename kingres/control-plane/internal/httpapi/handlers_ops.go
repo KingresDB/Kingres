@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
@@ -654,8 +655,19 @@ func (s *Server) updateClusterSettings(c *call, w http.ResponseWriter, r *http.R
 	if err := s.body(w, r, &req); err != nil {
 		return err
 	}
-	if err := o.UpdateClusterSettings(r.Context(), c.session.Username, req); err != nil {
+	started, err := o.UpdateClusterSettings(r.Context(), c.session.Username, req)
+	if err != nil {
 		return err
+	}
+	// An update that started a task (a new replica count starts standby.reconcile) answers 202
+	// with the Task and a Location, as every operation that starts a task does, to a client that
+	// asked for it with "Prefer: respond-async". A client that did not keeps getting 200 and the
+	// settings, as in 0.8.0 (it finds the task in the list of tasks).
+	if started != nil && prefersAsync(r) {
+		w.Header().Set("Preference-Applied", "respond-async")
+		c.addDetails(map[string]any{"taskId": started.ID})
+		s.accepted(w, r, *started)
+		return nil
 	}
 	out, err := s.deps.Store.ClusterSettings(r.Context())
 	if err != nil {
@@ -680,4 +692,16 @@ func (s *Server) cancelStatement(c *call, w http.ResponseWriter, r *http.Request
 	}
 	w.WriteHeader(http.StatusNoContent)
 	return nil
+}
+
+// prefersAsync tells whether the request carries "Prefer: respond-async" (RFC 7240).
+func prefersAsync(r *http.Request) bool {
+	for _, v := range r.Header.Values("Prefer") {
+		for _, tok := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(strings.SplitN(tok, ";", 2)[0]), "respond-async") {
+				return true
+			}
+		}
+	}
+	return false
 }

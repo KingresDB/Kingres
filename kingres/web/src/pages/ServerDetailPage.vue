@@ -253,8 +253,8 @@ function saveGroup(): void {
           >
           <p class="hint muted">
             Turning this off does not move data by itself. To empty the server, save this, then
-            start a <RouterLink :to="{ name: 'rebalance' }">rebalance</RouterLink>; a server that
-            holds no bucket copy can then be removed.
+            start a <RouterLink :to="{ name: 'rebalance' }">rebalance</RouterLink>; a server that is
+            the primary of no bucket can then be removed; the standbys it hosts are removed with it.
           </p>
           <div>
             <GateButton op="updateServer" type="submit" :disabled="placement.isPending.value">

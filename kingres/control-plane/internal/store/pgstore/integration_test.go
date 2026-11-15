@@ -52,7 +52,7 @@ func TestIntegrationPingAndVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 	v, err := s.PostgresVersion(ctx(t))
-	if err != nil || len(v) < 2 || v[:2] != "18" {
+	if err != nil || len(v) < 2 || (v[:2] != "18" && v[:2] != "19") {
 		t.Errorf("version = %q, %v", v, err)
 	}
 }
@@ -240,7 +240,7 @@ func TestIntegrationTables(t *testing.T) {
 	}
 	orders := got["public.orders"]
 	if len(orders.Classes) != 1 || orders.Classes[0] != "distributed" || orders.Distribution == nil || orders.Distribution.Method != "hash" ||
-		*orders.Distribution.Column != "id" || orders.Distribution.ColocationID != 1 || orders.Distribution.BucketCount != 8 ||
+		*orders.Distribution.Column != "id" || *orders.Distribution.ColocationID != 1 || *orders.Distribution.BucketCount != 8 ||
 		orders.HomeShardGroupID != nil {
 		t.Errorf("orders = %+v", orders)
 	}

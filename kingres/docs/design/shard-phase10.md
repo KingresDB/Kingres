@@ -1543,3 +1543,46 @@ extension is changed by one line of work at a time (architecture, "Phases 9 to 1
 13. The extension version number, against [shard-phase9.md](shard-phase9.md) (2.1).
 14. Whether PostgreSQL 18's slot synchronization could carry a move's slot across a
     failover (section 18).
+
+## 20. First increment as built: where it departs from this design
+
+The first increment of `kingresd` (contract 0.9.0) implements the six existing rebalance operations with the strategy "by bucket
+count" and nothing of the later increments (strategies and weights, automatic mode, draining a server, splitting a bucket). It is the
+base the later increments extend. Departures from sections 6 and 9:
+
+- **One move at a time.** The scheduler of section 6.3 runs `maxConcurrentMoves` moves; this increment runs one, and plans again
+  (`kingres.rebalance_plan`, not `plan_rebalance`, which does not exist yet) before every move. `maxConcurrentMoves` is accepted,
+  validated and recorded in the run, and has no effect yet.
+- **Task kind and steps.** Kind `rebalance`, subject `cluster`/`cluster`, steps `Check that the cluster can rebalance`, `Compute the
+  plan`, `Move buckets`, `Write the report`. The step list is fixed; the moves are rows of `kingres_cp.rebalance_move`, not steps.
+- **Engine change (section 6.1).** `task.PauseError` / `task.Pause(reason)` and the store interface `PauseStore` (`Pause`, `Resume`)
+  exist in the three stores; the state `paused` is now set. A paused task still holds the subject lock, so there is one rebalance
+  per cluster including a stopped one; `Engine.Cancel` of a paused task fails it at once and runs the definition's `OnFail`. The
+  second engine change is the step state `skipped` (`task.Skip`), which section 13 did not list.
+- **Stop (section 6.2).** A stop does not wait for the move in flight. It asks `kingres.cancel_bucket_move` for it at every poll of
+  the loop: a move before its switch is cancelled and undone by the extension (the report lists it as skipped, reason `stopped`); a
+  move that is switching answers that it cannot be cancelled yet and is asked again until it has ended (the switch either
+  completes or falls back to catching up); a move past the switch finishes. There is no `force` member yet.
+- **Retry rule.** A move that fails is tried again after 30 s times its failures (`-rebalance-retry-backoff` sets the 30 s), up to
+  three tries (the default of section 6.3); other buckets go on meanwhile. A bucket given up makes the run end `failed`; the report
+  step writes the report first and then returns the error, so the task fails with a complete report. The alert `taskFailed` is raised
+  with `subject.taskId`.
+- **Resume after a restart or a change of leader.** A new claim of the task under a new epoch re-enters `Move buckets`, which first
+  settles every move row left `running`: it finds the extension's record (`kingres.bucket_move`) and, while it is unfinished, calls
+  `kingres.resume_bucket_moves()` until the record is `done`, `cleaning`, `failed` or `cancelled` (the extension never touches a move
+  whose session is alive). Every write of the run is one transaction that proves the lease and its epoch (`FOR SHARE` on the task row),
+  so a leader that lost its lease starts and records nothing.
+- **Conditions** checked before the run and before each move: no unfinished `server.failover`, `server.add`, `server.remove` or
+  `server.leave` task; `kingres.check_cluster()` without a finding of a kind that makes moving unsafe (the list is in
+  `internal/rebalance/pg.go`); `wal_level = logical` on every primary (instances now get it from `kingresd`; an older instance
+  needs a restart); a server that should hold shards. Per move: the lease state of the two groups as the leader knows it, a
+  synchronous standby that is required and not in sync (the move is skipped: commits would wait), and the free disk of the target when
+  the server reports it (none does yet, so the check is dormant). The problem codes are `rebalance_in_progress`,
+  `operation_in_progress`, `failover_in_progress`, `version_mismatch`, `cluster_inconsistent`, `no_receiving_server`,
+  `nothing_to_rebalance`; `group_degraded` and `insufficient_disk` are reserved.
+- **Percent of a move** is an estimate by phase (5, 30, 85, 95, 100); the copy is not measured.
+- **Reports** are `rebalance_run` and `rebalance_move` of migration 0008, with the placement of primary buckets per database and server
+  before and after as JSON; there is no retention job yet.
+- **Standbys.** A move changes the owner of the data, not where standbys are. A logical slot and a subscription exist on primaries that
+  have standbys; the slot is not on the standby, so a failover during a move fails the move and the extension undoes it. Failover itself is
+  not implemented in `kingresd`.
