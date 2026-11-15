@@ -3,6 +3,7 @@
 kingres_sketch_sources = files(
   'src/hll.c',
   'src/kingres_sketch.c',
+  'src/sketch_hash.c',
   'src/tdigest.c',
   'src/topn.c',
 )
@@ -34,6 +35,7 @@ tests += {
   'regress': {
     'sql': [
       'sketch_setup',
+      'sketch_hash',
       'sketch_hll',
       'sketch_topn',
       'sketch_tdigest',
@@ -49,6 +51,7 @@ tests += {
       't/004_parallel.pl',
       't/005_dump_copy.pl',
       't/006_fuzz.pl',
+      't/007_portable_sketches.pl',
     ],
   },
 }

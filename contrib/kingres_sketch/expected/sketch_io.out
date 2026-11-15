@@ -233,6 +233,9 @@ SELECT name, (e).sql_error_code AS code, (e).message, (e).detail
             ('mean below minimum', pg_temp.td(100, 1, 1, 0.6, 1, pg_temp.tdc(0.5, 1))),
             ('mean above maximum', pg_temp.td(100, 1, 1, 0, 0.4, pg_temp.tdc(0.5, 1))),
             ('minimum above maximum', pg_temp.td(100, 1, 1, 2, 1, pg_temp.tdc(1.5, 1))),
+            ('negative zero minimum', pg_temp.td(100, 1, 1, '-0'::float8, 1, pg_temp.tdc(0.5, 1))),
+            ('negative zero maximum', pg_temp.td(100, 1, 1, -1, '-0'::float8, pg_temp.tdc(-0.5, 1))),
+            ('negative zero mean', pg_temp.td(100, 1, 1, -1, 1, pg_temp.tdc('-0'::float8, 1))),
             ('NaN mean', pg_temp.td(100, 1, 1, 0, 1, pg_temp.tdc('NaN', 1))),
             ('infinite mean', pg_temp.td(100, 1, 1, 0, 1, pg_temp.tdc('Infinity', 1))),
             ('NaN maximum', pg_temp.td(100, 1, 1, 0, 'NaN', pg_temp.tdc(0.5, 1))),
@@ -260,6 +263,9 @@ SELECT name, (e).sql_error_code AS code, (e).message, (e).detail
  minimum above maximum                  | 22P02 | invalid input syntax for type tdigest | minimum or maximum is not valid.
  negative total                         | 22P02 | invalid input syntax for type tdigest | total weight -1 does not match 1 centroids.
  negative weight                        | 22P02 | invalid input syntax for type tdigest | centroid 0 has a mean or weight that is not valid.
+ negative zero maximum                  | 22P02 | invalid input syntax for type tdigest | minimum or maximum is not valid.
+ negative zero mean                     | 22P02 | invalid input syntax for type tdigest | centroid 0 has a mean or weight that is not valid.
+ negative zero minimum                  | 22P02 | invalid input syntax for type tdigest | minimum or maximum is not valid.
  reserved byte                          | 22P02 | invalid input syntax for type tdigest | reserved header byte is not zero.
  too long                               | 22P02 | invalid input syntax for type tdigest | The value is longer than any valid tdigest.
  too many centroids                     | 22P02 | invalid input syntax for type tdigest | 23 centroids are more than compression 10 allows.
@@ -268,7 +274,7 @@ SELECT name, (e).sql_error_code AS code, (e).message, (e).detail
  weight 0                               | 22P02 | invalid input syntax for type tdigest | centroid 0 has a mean or weight that is not valid.
  weights do not add up                  | 22P02 | invalid input syntax for type tdigest | the weights add up to 2, not to the total 5.
  weights overflow                       | 22P02 | invalid input syntax for type tdigest | the weights overflow.
-(26 rows)
+(29 rows)
 
 SELECT name, pg_input_is_valid(v, 'kingres_sketch.tdigest') AS valid
   FROM (VALUES
@@ -276,14 +282,16 @@ SELECT name, pg_input_is_valid(v, 'kingres_sketch.tdigest') AS valid
     ('one centroid', pg_temp.td(100, 1, 7, 1, 2, pg_temp.tdc(1.5, 7))),
     ('equal means', pg_temp.td(100, 2, 2, 1, 1, pg_temp.tdc(1, 1) || pg_temp.tdc(1, 1))),
     ('most centroids', pg_temp.td(10, 22, 22, 0, 1, repeat(pg_temp.tdc(0.5, 1), 22)))
+    ,('zero minimum and mean', pg_temp.td(100, 1, 1, 0, 1, pg_temp.tdc(0, 1)))
   ) t(name, v) ORDER BY name;
-      name      | valid 
-----------------+-------
- empty          | t
- equal means    | t
- most centroids | t
- one centroid   | t
-(4 rows)
+         name          | valid 
+-----------------------+-------
+ empty                 | t
+ equal means           | t
+ most centroids        | t
+ one centroid          | t
+ zero minimum and mean | t
+(5 rows)
 
 -- binary input is the same validation
 SELECT pg_temp.try('\x4b0103', 'kingres_sketch.tdigest'), pg_temp.try(decode(substr(pg_temp.td(100, 1, 1, 0, 1, pg_temp.tdc(0.5, 1)), 3), 'hex'), 'kingres_sketch.tdigest'),
@@ -302,3 +310,33 @@ SELECT hll_cardinality(h), topn_total(t), tdigest_count(d) FROM sketch_io_t;
 (1 row)
 
 DROP TABLE sketch_io_t;
+-- negative zero is stored as zero: a value with the bit pattern of -0 in a
+-- minimum, a maximum, a mean or the fraction of a state is refused, so the
+-- bytes of a digest are a function of its content
+WITH b AS (SELECT tdigest_to_bytea(tdigest_agg(0.0::float8)) AS v),
+     c AS (SELECT set_byte(set_byte(v, 27, 128), 43, 128) AS v FROM b)
+SELECT pg_temp.try(v, 'kingres_sketch.tdigest') AS minus_zero_min_and_mean FROM c;
+   minus_zero_min_and_mean    
+------------------------------
+ 22023: invalid tdigest value
+(1 row)
+
+WITH b AS (SELECT tdigest_to_bytea(tdigest_agg(0.0::float8)) AS v)
+SELECT pg_temp.try(set_byte(v, 35, 128), 'kingres_sketch.tdigest') AS minus_zero_max FROM b;
+        minus_zero_max        
+------------------------------
+ 22023: invalid tdigest value
+(1 row)
+
+SELECT tdigest_to_bytea(tdigest_add(tdigest_empty(), '-0'::float8)) = tdigest_to_bytea(tdigest_add(tdigest_empty(), 0)) AS built_as_zero,
+       tdigest_to_bytea(tdigest_agg(x)) = tdigest_to_bytea(tdigest_agg(abs(x))) AS aggregate_as_zero
+  FROM (VALUES ('-0'::float8), (0)) v(x);
+ built_as_zero | aggregate_as_zero 
+---------------+-------------------
+ t             | t
+(1 row)
+
+SELECT sketch_kind(set_byte(set_byte(v, 2, 4), 3, 0) || '\x0000000000000080'::bytea) AS kind4_minus_zero_fraction
+  FROM (SELECT tdigest_to_bytea(tdigest_agg(1.0::float8)) AS v) b;
+ERROR:  invalid tdigest_state value
+DETAIL:  the fraction is not between 0 and 1, or is negative zero.

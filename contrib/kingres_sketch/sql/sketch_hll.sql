@@ -106,3 +106,9 @@ SELECT i / 10 AS g, approx_count_distinct(i) FILTER (WHERE i % 2 = 0) AS even
   FROM generate_series(1, 20) i GROUP BY i / 10 HAVING approx_count_distinct(i) > 5 ORDER BY g;
 -- the state functions cannot be called from SQL
 DO $$ BEGIN PERFORM hll_agg_add(NULL, 1); EXCEPTION WHEN undefined_function THEN RAISE NOTICE 'undefined_function'; END $$;
+
+-- a NULL precision is an error in every row, so the answer does not depend on the order of the rows
+SELECT hll_precision(hll_add_agg(x, p)) FROM (VALUES ('a', 12), ('b', NULL::int)) v(x, p);
+SELECT hll_precision(hll_add_agg(x, p)) FROM (VALUES ('a', NULL::int), ('b', 12)) v(x, p);
+SELECT approx_count_distinct(x, p) FROM (VALUES (NULL::text, NULL::int)) v(x, p);
+SELECT hll_precision(hll_add_agg(x, 12)) FROM (VALUES ('a'), (NULL)) v(x);

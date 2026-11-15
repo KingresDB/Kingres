@@ -7,6 +7,7 @@ OBJS = \
 	$(WIN32RES) \
 	src/hll.o \
 	src/kingres_sketch.o \
+	src/sketch_hash.o \
 	src/tdigest.o \
 	src/topn.o
 
@@ -14,7 +15,7 @@ EXTENSION = kingres_sketch
 DATA = kingres_sketch--1.0.sql
 PGFILEDESC = "kingres_sketch - approximate aggregates (hll, topn, tdigest) for KingresDB"
 
-REGRESS = sketch_setup sketch_hll sketch_topn sketch_tdigest sketch_io sketch_security
+REGRESS = sketch_setup sketch_hash sketch_hll sketch_topn sketch_tdigest sketch_io sketch_security
 
 TAP_TESTS = 1
 

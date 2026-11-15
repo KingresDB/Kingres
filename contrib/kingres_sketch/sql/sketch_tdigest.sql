@@ -94,3 +94,30 @@ SELECT d::bytea = d::bytea::tdigest::bytea AS rebuilt_same,
 SELECT i, tdigest_count(tdigest_agg(i::float8) OVER (ORDER BY i)) AS running_count,
        approx_percentile(0.5, i::float8) OVER (ORDER BY i) AS running_median
   FROM generate_series(1, 6) i;
+
+-- a NULL compression is an error in every row, so the answer does not depend on the order of the rows
+SELECT tdigest_compression(tdigest_agg(x, c)) FROM (VALUES (1.0::float8, 20), (2.0, NULL::int)) v(x, c);
+SELECT tdigest_compression(tdigest_agg(x, c)) FROM (VALUES (1.0::float8, NULL::int), (2.0, 20)) v(x, c);
+SELECT tdigest_compression(tdigest_weighted_agg(x, 1, c)) FROM (VALUES (1.0::float8, NULL::int), (2.0, 20)) v(x, c);
+SELECT approx_percentile(0.5, x, c) FROM (VALUES (1.0::float8, NULL::int), (2.0, 20)) v(x, c);
+SELECT approx_percentile(0.5, x, c) FROM (VALUES (1.0::float8, 20), (2.0, NULL::int)) v(x, c);
+-- a NULL fraction ignores the row, in every order
+SELECT approx_percentile(q, x) FROM (VALUES (NULL::float8, 1.0::float8), (0.5, 3.0), (0.5, 5.0)) v(q, x);
+SELECT approx_percentile(q, x) FROM (VALUES (0.5::float8, 3.0::float8), (0.5, 5.0), (NULL, 1.0)) v(q, x);
+
+-- values near the limit of the double type stay inside [min, max]
+SELECT tdigest_quantile(d, 0.5) AS q50, tdigest_quantile(d, 0.25) AS q25, tdigest_quantile(d, 0.75) AS q75,
+       tdigest_quantile(d, 0) AS q0, tdigest_quantile(d, 1) AS q1, tdigest_rank(d, 0) AS rank0,
+       tdigest_rank(d, 1.7e308) AS rank_max, tdigest_rank(d, -1.7e308) AS rank_min
+  FROM (SELECT tdigest_agg(x) d FROM (VALUES (-1.7e308::float8), (1.7e308)) v(x)) s;
+SELECT bool_and(v >= -1.7e308 AND v <= 1.7e308) AS all_in_range, count(*) AS n
+  FROM (SELECT tdigest_quantile(d, q / 100.0) AS v
+          FROM (SELECT tdigest_agg(x) d FROM (VALUES (-1.7e308::float8), (-1.7e308), (1.7e308), (1.7e308), (0), (1e300), (-1e300)) v(x)) s,
+               generate_series(0, 100) q) t;
+SELECT tdigest_quantile(d, 0.5) AS between_huge_values, tdigest_min(d), tdigest_max(d)
+  FROM (SELECT tdigest_agg(x, 10) d FROM (VALUES (1.7e308::float8), (1.6e308), (-1.6e308), (-1.7e308)) v(x)) s;
+SELECT tdigest_quantile(tdigest_union(a, b), 0.5) IS NOT NULL AS merged_ok
+  FROM (SELECT tdigest_add(tdigest_empty(), -1.7e308) a, tdigest_add(tdigest_empty(), 1.7e308) b) s;
+SELECT tdigest_count(d), tdigest_quantile(d, 0.5) >= tdigest_min(d) AND tdigest_quantile(d, 0.5) <= tdigest_max(d) AS median_in_range,
+       get_byte(d::bytea, 8) AS centroids
+  FROM (SELECT tdigest_agg(x, 10) d FROM generate_series(1, 400) i, LATERAL (SELECT CASE WHEN i % 2 = 0 THEN 1.7e308 ELSE -1.7e308 END::float8 AS x) q) s;

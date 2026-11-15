@@ -30,6 +30,7 @@
 #include "catalog/pg_type.h"
 #include "libpq/pqformat.h"
 #include "nodes/miscnodes.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
@@ -40,7 +41,6 @@
 KS_MODULE_MAGIC();
 
 PG_FUNCTION_INFO_V1(kingres_sketch_self_test);
-PG_FUNCTION_INFO_V1(kingres_sketch_hll_hash);
 PG_FUNCTION_INFO_V1(kingres_sketch_sketch_kind);
 
 /*
@@ -297,79 +297,6 @@ ks_agg_context(FunctionCallInfo fcinfo)
 	return aggcontext;
 }
 
-/* ---- hashing ---- */
-
-/*
- * The finishing function of the element hash: the 64-bit finalizer of
- * MurmurHash3 after adding a constant (a bijection).  It spreads the output of the type's own hash
- * so that both the high bits (the register index of an hll) and the low
- * bits (its rank) are well distributed.
- */
-uint64
-ks_mix64(uint64 h)
-{
-	/* the constant moves the fixed point of the finalizer away from 0 */
-	h += UINT64CONST(0x9e3779b97f4a7c15);
-	h ^= h >> 33;
-	h *= UINT64CONST(0xff51afd7ed558ccd);
-	h ^= h >> 33;
-	h *= UINT64CONST(0xc4ceb9fe1a85ec53);
-	h ^= h >> 33;
-	return h;
-}
-
-typedef struct KsHashCache
-{
-	Oid			typid;
-	Oid			collation;
-	FmgrInfo	finfo;
-} KsHashCache;
-
-/*
- * Hash one element of the type of argument "argno" of the call.  The hash
- * function is the extended hash function of the type's default hash operator
- * class (hash_extended_proc), called with seed 0, so the value is the one the
- * type's hash partitioning would use before the finishing function; it is
- * looked up once per call site and cached in fn_extra.  A type without a hash
- * operator class is refused.
- */
-uint64
-ks_hash_datum(FunctionCallInfo fcinfo, int argno, Datum value)
-{
-	KsHashCache *c = (KsHashCache *) fcinfo->flinfo->fn_extra;
-	Oid			typid = get_fn_expr_argtype(fcinfo->flinfo, argno);
-
-	if (!OidIsValid(typid))
-		ereport(ERROR,
-				(errcode(ERRCODE_INDETERMINATE_DATATYPE),
-				 errmsg("could not determine the data type of the element")));
-
-	if (c == NULL || c->typid != typid)
-	{
-		TypeCacheEntry *tce = lookup_type_cache(typid, TYPECACHE_HASH_EXTENDED_PROC);
-
-		if (!OidIsValid(tce->hash_extended_proc))
-			ereport(ERROR,
-					(errcode(ERRCODE_UNDEFINED_FUNCTION),
-					 errmsg("type %s has no hash function", format_type_be(typid))));
-		c = (KsHashCache *) MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
-											   sizeof(KsHashCache));
-		c->typid = typid;
-		c->collation = OidIsValid(PG_GET_COLLATION()) ? PG_GET_COLLATION() : DEFAULT_COLLATION_OID;
-		fmgr_info_cxt(tce->hash_extended_proc, &c->finfo, fcinfo->flinfo->fn_mcxt);
-		fcinfo->flinfo->fn_extra = c;
-	}
-	return ks_mix64((uint64) DatumGetInt64(FunctionCall2Coll(&c->finfo, c->collation,
-															 value, Int64GetDatum(0))));
-}
-
-/* hll_hash(anyelement) RETURNS bigint */
-Datum
-kingres_sketch_hll_hash(PG_FUNCTION_ARGS)
-{
-	PG_RETURN_INT64((int64) ks_hash_datum(fcinfo, 0, PG_GETARG_DATUM(0)));
-}
-
 /* ---- self_test ---- */
 
 static void
@@ -408,6 +335,13 @@ kingres_sketch_self_test(PG_FUNCTION_ARGS)
 	selftest_add(&buf, "numeric", DirectFunctionCall2(hash_numeric_extended, d, Int64GetDatum(0)));
 	d = DirectFunctionCall1(uuid_in, CStringGetDatum("123e4567-e89b-12d3-a456-426614174000"));
 	selftest_add(&buf, "uuid", DirectFunctionCall2(uuid_hash_extended, d, Int64GetDatum(0)));
+	{
+		Datum		elems[3] = {Int32GetDatum(1), Int32GetDatum(2), Int32GetDatum(3)};
+
+		d = PointerGetDatum(construct_array_builtin(elems, 3, INT4OID));
+		appendStringInfo(&buf, " int4[]=%016llx",
+						 (unsigned long long) ks_hash_value_of_type(INT4ARRAYOID, d, C_COLLATION_OID));
+	}
 	appendStringInfo(&buf, " hll=%lld", (long long) hll_self_test_value());
 	PG_RETURN_TEXT_P(cstring_to_text_with_len(buf.data, buf.len));
 }

@@ -687,6 +687,8 @@ kingres_sketch_hll_add(PG_FUNCTION_ARGS)
 {
 	HllState   *st;
 
+	/* the type of the element is checked whatever the value, even NULL */
+	ks_hash_check_type(fcinfo, 1);
 	if (PG_ARGISNULL(0))
 		PG_RETURN_NULL();
 	if (PG_ARGISNULL(1))
@@ -807,8 +809,10 @@ Datum
 kingres_sketch_hll_agg_add(PG_FUNCTION_ARGS)
 {
 	MemoryContext aggcontext = ks_agg_context(fcinfo);
-	HllState   *st = agg_state(fcinfo, KS_HLL_DEFAULT_PRECISION, aggcontext);
+	HllState   *st;
 
+	ks_hash_check_type(fcinfo, 1);
+	st = agg_state(fcinfo, KS_HLL_DEFAULT_PRECISION, aggcontext);
 	if (!PG_ARGISNULL(1))
 		hll_add_hash_value(st, ks_hash_datum(fcinfo, 1, PG_GETARG_DATUM(1)));
 	PG_RETURN_POINTER(st);
@@ -819,11 +823,12 @@ Datum
 kingres_sketch_hll_agg_add_p(PG_FUNCTION_ARGS)
 {
 	MemoryContext aggcontext = ks_agg_context(fcinfo);
-	int			p = PG_ARGISNULL(2) ? KS_HLL_DEFAULT_PRECISION : check_precision(PG_GETARG_INT32(2));
+	int			p;
 	HllState   *st;
 
-	if (PG_ARGISNULL(2) && !PG_ARGISNULL(0))
-		p = ((HllState *) PG_GETARG_POINTER(0))->p;
+	ks_hash_check_type(fcinfo, 1);
+	KS_REQUIRE_PARAM(fcinfo, 2, "precision");
+	p = check_precision(PG_GETARG_INT32(2));
 	st = agg_state(fcinfo, p, aggcontext);
 	if (!PG_ARGISNULL(1))
 		hll_add_hash_value(st, ks_hash_datum(fcinfo, 1, PG_GETARG_DATUM(1)));

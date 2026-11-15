@@ -54,6 +54,7 @@
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
 #include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
 #include "utils/tuplestore.h"
 
@@ -81,7 +82,7 @@ PG_FUNCTION_INFO_V1(kingres_sketch_topn_agg_final);
 
 typedef struct TnCounter
 {
-	char	   *item;			/* palloc'd, len bytes plus a zero byte */
+	char	   *item;			/* palloc'd, exactly len bytes (no terminator: a 1024-byte item then fits a 1024-byte chunk) */
 	uint32		len;
 	uint32		hash;
 	int64		count;
@@ -253,9 +254,12 @@ heap_build(TnState *st)
 	st->heap_ok = true;
 }
 
-/* Append a counter; the item is copied.  The caller checked n < k. */
+/*
+ * Append a counter that takes over the item, a chunk of st->cxt of the right
+ * size that the caller no longer uses.  The caller checked n < k.
+ */
 static int32
-tn_append(TnState *st, const char *item, uint32 len, uint32 hash, int64 count, int64 err)
+tn_append_owned(TnState *st, char *item, uint32 len, uint32 hash, int64 count, int64 err)
 {
 	int32		idx;
 	TnCounter  *c;
@@ -265,9 +269,7 @@ tn_append(TnState *st, const char *item, uint32 len, uint32 hash, int64 count, i
 		tn_grow(st);
 	idx = st->n++;
 	c = &st->c[idx];
-	c->item = (char *) MemoryContextAlloc(st->cxt, len + 1);
-	memcpy(c->item, item, len);
-	c->item[len] = '\0';
+	c->item = item;
 	c->len = len;
 	c->hash = hash;
 	c->count = count;
@@ -278,6 +280,16 @@ tn_append(TnState *st, const char *item, uint32 len, uint32 hash, int64 count, i
 	if ((uint32) st->n == st->k)
 		heap_build(st);
 	return idx;
+}
+
+/* Append a counter; the item is copied.  The caller checked n < k. */
+static int32
+tn_append(TnState *st, const char *item, uint32 len, uint32 hash, int64 count, int64 err)
+{
+	char	   *copy = (char *) MemoryContextAlloc(st->cxt, Max(len, 1));
+
+	memcpy(copy, item, len);
+	return tn_append_owned(st, copy, len, hash, count, err);
 }
 
 /* One insertion of an item (the Space-Saving step). */
@@ -315,9 +327,8 @@ tn_add(TnState *st, const char *item, uint32 len)
 
 		tn_unlink(st, v);
 		pfree(c->item);
-		c->item = (char *) MemoryContextAlloc(st->cxt, len + 1);
+		c->item = (char *) MemoryContextAlloc(st->cxt, Max(len, 1));
 		memcpy(c->item, item, len);
-		c->item[len] = '\0';
 		c->len = len;
 		c->hash = hash;
 		c->err = min;
@@ -336,6 +347,7 @@ typedef struct TnEntry
 	uint32		hash;
 	int64		count;
 	int64		err;
+	int32		dst_idx;	/* the counter of dst that owns the item, or -1 */
 } TnEntry;
 
 static int
@@ -405,6 +417,7 @@ tn_merge(TnState *dst, TnState *src)
 		e[ne].item = a->item;
 		e[ne].len = a->len;
 		e[ne].hash = a->hash;
+		e[ne].dst_idx = i;
 		if (j >= 0)
 		{
 			add_or_error(a->count, src->c[j].count, &e[ne].count);
@@ -426,6 +439,7 @@ tn_merge(TnState *dst, TnState *src)
 		e[ne].item = b->item;
 		e[ne].len = b->len;
 		e[ne].hash = b->hash;
+		e[ne].dst_idx = -1;
 		add_or_error(b->count, m1, &e[ne].count);
 		add_or_error(b->err, m1, &e[ne].err);
 		ne++;
@@ -435,13 +449,28 @@ tn_merge(TnState *dst, TnState *src)
 	add_or_error(dst->total, src->total, &total);
 	res = tn_new(dst->k, dst->cxt);
 	res->total = total;
+	/*
+	 * The items of dst that are kept move to the result without a copy (dst
+	 * is going away), the items of src are copied.  This keeps the peak of
+	 * memory of a merge near two states instead of three.
+	 */
 	for (i = 0; i < ne && (uint32) i < dst->k; i++)
-		tn_append(res, e[i].item, e[i].len, e[i].hash, e[i].count, e[i].err);
+	{
+		if (e[i].dst_idx >= 0)
+		{
+			tn_append_owned(res, dst->c[e[i].dst_idx].item, e[i].len, e[i].hash,
+							e[i].count, e[i].err);
+			dst->c[e[i].dst_idx].item = NULL;
+		}
+		else
+			tn_append(res, e[i].item, e[i].len, e[i].hash, e[i].count, e[i].err);
+	}
 	pfree(e);
 
 	/* move the result into dst, so the caller's pointer stays valid */
 	for (i = 0; i < dst->n; i++)
-		pfree(dst->c[i].item);
+		if (dst->c[i].item)
+			pfree(dst->c[i].item);
 	if (dst->c)
 		pfree(dst->c);
 	if (dst->buckets)
@@ -671,10 +700,17 @@ tn_load_arg(FunctionCallInfo fcinfo, int argno)
 	char		why[KS_WHY_LEN];
 	TnState    *st;
 
-	p = ks_arg_bytes(fcinfo, argno, &len);
+	struct varlena *orig = (struct varlena *) PG_GETARG_POINTER(argno);
+	struct varlena *v = pg_detoast_datum_packed(orig);
+
+	p = (const uint8 *) VARDATA_ANY(v);
+	len = VARSIZE_ANY_EXHDR(v);
 	st = tn_load(p, len, why);
 	if (st == NULL)
 		ks_invalid_value("topn", why);
+	/* the loaded state does not point into the argument: free the detoasted copy, which can be as large as the state */
+	if (v != orig)
+		pfree(v);
 	return st;
 }
 
@@ -684,6 +720,9 @@ typedef struct TnItemCache
 {
 	Oid			typid;
 	bool		is_text;		/* text or varchar: the bytes are the item */
+	bool		is_bpchar;		/* trailing spaces are not part of the item */
+	bool		is_numeric;		/* the scale is not part of the item */
+	bool		is_collated;	/* text, varchar, bpchar: the collation must be deterministic */
 	Oid			outfunc;
 } TnItemCache;
 
@@ -732,9 +771,25 @@ tn_item_text(FunctionCallInfo fcinfo, int argno, Datum value, uint32 *len)
 		c = (TnItemCache *) MemoryContextAlloc(fcinfo->flinfo->fn_mcxt, sizeof(TnItemCache));
 		c->typid = typid;
 		c->is_text = (base == TEXTOID || base == VARCHAROID);
+		c->is_bpchar = (base == BPCHAROID);
+		c->is_numeric = (base == NUMERICOID);
+		c->is_collated = (base == TEXTOID || base == VARCHAROID || base == BPCHAROID);
 		getTypeOutputInfo(base, &c->outfunc, &isvarlena);
 		fcinfo->flinfo->fn_extra = c;
 	}
+
+	/*
+	 * Two values that are equal under the equality of the type are one item.
+	 * Strings compare by bytes here, which is the equality of a deterministic
+	 * collation only; with a nondeterministic one two different byte strings
+	 * can be equal, so the type is refused.
+	 */
+	if (c->is_collated && OidIsValid(PG_GET_COLLATION()) &&
+		!get_collation_isdeterministic(PG_GET_COLLATION()))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("topn does not take strings with a nondeterministic collation"),
+				 errhint("Cast the value to text with the \"C\" collation, or use hll.")));
 
 	if (c->is_text)
 	{
@@ -745,10 +800,16 @@ tn_item_text(FunctionCallInfo fcinfo, int argno, Datum value, uint32 *len)
 	}
 	else
 	{
-		char	   *o = OidOutputFunctionCall(c->outfunc, value);
+		char	   *o;
 
+		if (c->is_numeric)
+			value = DirectFunctionCall1(numeric_trim_scale, value);
+		o = OidOutputFunctionCall(c->outfunc, value);
 		s = o;
 		l = strlen(o);
+		if (c->is_bpchar)
+			while (l > 0 && s[l - 1] == ' ')
+				l--;
 	}
 	if (l > KS_TOPN_MAX_ITEM_BYTES)
 		ereport(ERROR,
@@ -850,6 +911,7 @@ kingres_sketch_topn_union(PG_FUNCTION_ARGS)
 
 	check_same_capacity(a, b);
 	tn_merge(a, b);
+	tn_free(b);
 	PG_RETURN_BYTEA_P(tn_serialize(a));
 }
 
@@ -969,12 +1031,8 @@ kingres_sketch_topn_agg_add_k(PG_FUNCTION_ARGS)
 	uint32		k;
 	TnState    *st;
 
-	if (!PG_ARGISNULL(2))
-		k = (uint32) check_capacity(PG_GETARG_INT32(2));
-	else if (!PG_ARGISNULL(0))
-		k = ((TnState *) PG_GETARG_POINTER(0))->k;
-	else
-		k = KS_TOPN_DEFAULT_CAPACITY;
+	KS_REQUIRE_PARAM(fcinfo, 2, "capacity");
+	k = (uint32) check_capacity(PG_GETARG_INT32(2));
 	st = agg_state(fcinfo, k, aggcontext);
 	agg_add_item(fcinfo, st, aggcontext);
 	PG_RETURN_POINTER(st);

@@ -113,9 +113,16 @@ lower bound. An item is its canonical text, so only types whose text does not
 depend on a setting are accepted: `int2`, `int4`, `int8`, `numeric`, `text`,
 `varchar`, `bpchar`, `name`, `uuid` and `bool`. Floating-point, date, time and
 range types are refused with `0A000` ("cast the value to text with an explicit
-format"). `numeric` keeps its scale, so `1.5` and `1.50` are two items. An item
-longer than 1024 bytes is an error (`54000`). The capacity of an aggregate is
-repeated in every row of a group, as the precision of `hll_add_agg`.
+format"). Two values that are equal under the equality of their type are one item:
+`char(n)` values are compared without their trailing spaces, so `'a'::char(3)` and
+`'a'::char(5)` are one item, and `numeric` values without their scale, so `1.5`
+and `1.50` are one item (the item is the text `1.5`). Strings are compared by their
+bytes, which is the equality of a deterministic collation only: a string of a
+nondeterministic collation (where different bytes can be equal) is refused with
+`0A000`, and `hll` is the sketch for such strings. An item longer than 1024 bytes
+is an error (`54000`). The capacity of an aggregate is the same in every row of
+a group; a NULL capacity is an error (see "Aggregates, partial aggregation and
+NULL").
 
 ### tdigest
 
@@ -135,7 +142,7 @@ repeated in every row of a group, as the precision of `hll_add_agg`.
 | `tdigest_union_agg(tdigest)` | `tdigest` | The merge of the digests. |
 | `approx_percentile(q float8, x float8 [, compression int])` | `float8` | The approximate value at fraction `q` of the non-NULL inputs `x`. |
 
-`NaN` and infinite values are refused (`22023`). `-0` is stored as `0`. In
+`NaN` and infinite values are refused (`22023`). `-0` is stored as `0`, and a value that has the bit pattern of `-0` in its minimum, maximum, a centroid mean or the fraction of a state is refused on input, so that the bytes of a digest are a function of its content (one more rule of the validation). In
 `approx_percentile` the fraction is read from the first row of a group and must
 be the same constant in every row. It is a plain aggregate, not an ordered-set
 aggregate: `percentile_cont(0.5) WITHIN GROUP (ORDER BY x)` is a different and
@@ -164,6 +171,14 @@ NULL inputs are ignored. An aggregate over no rows returns an empty sketch
 (`approx_percentile` returns NULL, `approx_count_distinct` returns 0). When an
 aggregate has a precision, capacity or compression argument and no row is
 aggregated, the empty sketch has the default parameter.
+
+**A NULL precision, capacity or compression argument is an error (`22004`) in
+every row**, also in a row whose element is NULL, so that the answer does not
+depend on the order of the rows, on the plan or on the number of workers. Every
+row of a group must give the same non-NULL value (otherwise `22023`; a partial
+aggregate whose parts differ fails when they are combined). The fraction of
+`approx_percentile` is different: a row with a NULL fraction or a NULL `x` is
+ignored, in every order, and the first non-NULL fraction is the one of the group.
 
 ## Stored sketches and rollups
 
@@ -242,7 +257,16 @@ Memory: in an aggregate a counter costs about 60 bytes plus the item. A value is
 20 bytes plus 18 bytes and the item for each counter: about 30 KB for a full
 summary of 1000 counters of short items, at most about 104 MB for capacity
 100000 with items of 1024 bytes.
-`topn_list` returns at most 100000 rows.
+
+The working memory of a call is more than the value, and is not limited by
+`work_mem`: the detoasted argument, the loaded state, the second state of a union
+and the serialized result exist together. Measured on the largest value (capacity
+100000, items of 1024 bytes, 104 MB), the peak memory of a backend running
+`topn_union` of two such values was 436 MB, 4.4 times the value, including the
+about 40 MB of an idle backend. The decoded state of a counter holds its item in a
+chunk of its exact length. With parallel workers the figure is per worker. A
+capacity and an item length that make such values are allowed; lower the
+capacity if the memory is a concern.`topn_list` returns at most 100000 rows.
 
 ## tdigest
 
@@ -302,13 +326,38 @@ a new extension version, with a note in the upgrade script.
 
 ## The hash
 
-The hash of an element is the extended hash function of the default hash operator
-class of its type (`hash_extended_proc` of the type cache, for example
-`hashint4extended`, `hashtextextended`, `hash_numeric_extended`,
-`uuid_hash_extended`) called with seed 0, and then finished with a fixed bijection
-of 64 bits (the finalizer of MurmurHash3 after adding a constant), so that both the
-high bits (the register of an hll) and the low bits (its rank) are well mixed. A
-type without a hash operator class is refused (`type X has no hash function`).
+A sketch must depend on the values it was built from and on nothing else: the same
+values must give the same sketch in another database, on another node and after a
+dump and restore. So the hash of an element is chosen by the kind of its type, and
+never depends on an object identifier (OID):
+
+| Type | The hash |
+|---|---|
+| scalar types (integers, `numeric`, floating point, `text`, `varchar`, `bpchar`, `name`, `bool`, `uuid`, date and time types, `inet`, `jsonb`, `bytea`, and others) | the extended hash function of the default hash operator class of the type (`hash_extended_proc` of the type cache, for example `hashint4extended`, `hashtextextended`, `hash_numeric_extended`, `uuid_hash_extended`), seed 0 |
+| enum | the hash of the bytes of the label, not of its OID |
+| array | the dimensions, the lower bounds and the hashes of the elements in storage order; a NULL element has its own marker |
+| range, multirange | the empty flag, for each bound the flags (infinite, inclusive) and the hash of the value |
+| composite type, record | the hashes of the fields in order (dropped columns skipped), a NULL field has its own marker |
+| domain | the hash of the base type |
+| `oid`, `regclass`, `regproc`, `regtype` and every other `reg*` type, `oidvector`, and any array, range or composite type that contains one | refused with `0A000`: their hash is a number that is not the same after a restore |
+
+The hash of a scalar is then finished with a fixed bijection of 64 bits (the
+finalizer of MurmurHash3 after adding a constant), so that both the high bits (the
+register of an hll) and the low bits (its rank) are well mixed. The containers
+use the same finalizer to combine the hashes of their parts. A type without a hash
+operator class is refused (`type X has no hash function`), and a type that cannot
+be hashed is refused when the function or aggregate is called with that type, also
+for a NULL value, so that a query does not work or fail depending on the data.
+Two values that are equal under the equality of the type have the same hash, so
+`bpchar` values of different lengths, `numeric` values of different scale and the
+two zeros of `float8` are one element.
+
+This was changed before the first release: an earlier build hashed an enum by its
+OID (and arrays, ranges and records of enums with it), and hashed arrays, ranges
+and records by PostgreSQL's own functions. Sketches built by that build for those
+types are not comparable with the sketches of this one; sketches of the scalar types
+are unchanged, and the format version stays 1. No migration is needed because the
+extension has not been released.
 
 Why this one: a sketch is only meaningful if every node that builds or reads it
 hashes the same element to the same value, on every platform and PostgreSQL
@@ -319,7 +368,7 @@ hash-partitioned table, so a change of them between majors would break
 practice. **PostgreSQL does not state this as a promise for every function and
 every major version.** The extension therefore does not rely on it silently:
 `kingres_sketch.self_test()` returns one line with the hash of a fixed value of
-each type and an estimate over a fixed set, and a node whose line differs (another
+each scalar type, of an array and an estimate over a fixed set, and a node whose line differs (another
 major version that changed a hash function, a different encoding or byte order)
 must not exchange sketches with the others.
 
@@ -339,7 +388,7 @@ What follows from this choice:
   element. Text with a nondeterministic collation is hashed by its sort key, which
   can depend on the collation library version.
 - `bpchar` ignores trailing spaces, `numeric` ignores trailing zeros (`1.0` and
-  `1.00` are one element for `hll`, two items for `topn`), and `-0` and `0` are one
+  `1.00` are one element for `hll` and one item for `topn`), and `-0` and `0` are one
   `float8`.
 - The self test uses the C collation for its text value.
 

@@ -137,6 +137,37 @@ td_scale(double q, double delta)
 	return delta / (2.0 * M_PI) * asin(2.0 * q - 1.0);
 }
 
+/* negative zero: a value that is stored as 0, never as -0, so that bytes are a function of content */
+#define TD_NEG_ZERO(x) ((x) == 0.0 && signbit(x))
+
+/*
+ * The point at fraction t (0 to 1) between a and b, without overflow when
+ * b - a is not finite (values of opposite signs near the double limit), and
+ * never outside [a, b].
+ */
+static double
+td_lerp(double a, double b, double t)
+{
+	double		d = b - a;
+	double		r;
+	double		lo = Min(a, b);
+	double		hi = Max(a, b);
+
+	if (!(t > 0.0))
+		t = 0.0;
+	if (t > 1.0)
+		t = 1.0;
+	if (isfinite(d))
+		r = a + d * t;
+	else
+		r = a * (1.0 - t) + b * t;
+	if (!(r >= lo))
+		r = lo;
+	if (r > hi)
+		r = hi;
+	return r + 0.0;
+}
+
 static int
 cmp_point(const void *pa, const void *pb)
 {
@@ -192,7 +223,7 @@ td_flush(TdState *st)
 					 st->compression) <= klimit)
 		{
 			int64		w = cur.weight + it.weight;	/* total fits, so does this */
-			double		mean = cur.mean + (it.mean - cur.mean) * ((double) it.weight / (double) w);
+			double		mean = td_lerp(cur.mean, it.mean, (double) it.weight / (double) w);
 
 			/* keep the means sorted whatever the rounding does */
 			if (mean > it.mean)
@@ -315,15 +346,15 @@ td_serialize(TdState *st)
 	ks_put_u32(out + 4, (uint32) st->compression);
 	ks_put_u32(out + 8, (uint32) st->ncent);
 	ks_put_u64(out + 12, (uint64) st->total);
-	ks_put_f64(out + 20, st->ncent > 0 ? st->min : 0.0);
-	ks_put_f64(out + 28, st->ncent > 0 ? st->max : 0.0);
+	ks_put_f64(out + 20, st->ncent > 0 ? st->min + 0.0 : 0.0);
+	ks_put_f64(out + 28, st->ncent > 0 ? st->max + 0.0 : 0.0);
 	for (i = 0; i < st->ncent; i++)
 	{
-		ks_put_f64(out + 36 + 16 * (Size) i, st->cent[i].mean);
+		ks_put_f64(out + 36 + 16 * (Size) i, st->cent[i].mean + 0.0);
 		ks_put_u64(out + 44 + 16 * (Size) i, (uint64) st->cent[i].weight);
 	}
 	if (pct)
-		ks_put_f64(out + 36 + 16 * (Size) st->ncent, st->q);
+		ks_put_f64(out + 36 + 16 * (Size) st->ncent, st->q + 0.0);
 	return r;
 }
 
@@ -398,7 +429,8 @@ td_load(const uint8 *p, Size len, bool allow_pct, char *why)
 			return NULL;
 		}
 	}
-	else if (!isfinite(min) || !isfinite(max) || min > max)
+	else if (!isfinite(min) || !isfinite(max) || min > max ||
+			 TD_NEG_ZERO(min) || TD_NEG_ZERO(max))
 	{
 		snprintf(why, KS_WHY_LEN, "minimum or maximum is not valid");
 		return NULL;
@@ -409,15 +441,15 @@ td_load(const uint8 *p, Size len, bool allow_pct, char *why)
 	{
 		st->q = ks_get_f64(p + 36 + 16 * (Size) n);
 		st->has_q = true;
-		if (!(st->q >= 0.0 && st->q <= 1.0))
+		if (!(st->q >= 0.0 && st->q <= 1.0) || TD_NEG_ZERO(st->q))
 		{
-			snprintf(why, KS_WHY_LEN, "the fraction is not between 0 and 1");
+			snprintf(why, KS_WHY_LEN, "the fraction is not between 0 and 1, or is negative zero");
 			goto bad;
 		}
 	}
 	st->total = total;
-	st->min = n > 0 ? min + 0.0 : 0.0;
-	st->max = n > 0 ? max + 0.0 : 0.0;
+	st->min = n > 0 ? min : 0.0;
+	st->max = n > 0 ? max : 0.0;
 	if (n > 0)
 		st->cent = (TdPoint *) MemoryContextAlloc(st->cxt, (Size) n * sizeof(TdPoint));
 	for (i = 0; i < n; i++)
@@ -425,12 +457,11 @@ td_load(const uint8 *p, Size len, bool allow_pct, char *why)
 		double		mean = ks_get_f64(p + 36 + 16 * (Size) i);
 		int64		w = (int64) ks_get_u64(p + 44 + 16 * (Size) i);
 
-		if (!isfinite(mean) || w < 1)
+		if (!isfinite(mean) || w < 1 || TD_NEG_ZERO(mean))
 		{
 			snprintf(why, KS_WHY_LEN, "centroid %u has a mean or weight that is not valid", i);
 			goto bad;
 		}
-		mean += 0.0;
 		if ((i > 0 && mean < prev) || mean < st->min || mean > st->max)
 		{
 			snprintf(why, KS_WHY_LEN, "centroid %u is out of order or outside the minimum and maximum", i);
@@ -549,7 +580,7 @@ curve_quantile(const double *pos, const double *val, int n, double total, double
 	}
 	if (pos[hi] == pos[lo])
 		return val[lo];
-	return val[lo] + (val[hi] - val[lo]) * ((target - pos[lo]) / (pos[hi] - pos[lo]));
+	return td_lerp(val[lo], val[hi], (target - pos[lo]) / (pos[hi] - pos[lo]));
 }
 
 static double
@@ -596,7 +627,17 @@ td_rank(TdState *st, double x)
 		else
 			hi = mid;
 	}
-	r = pos[lo] + (pos[hi] - pos[lo]) * ((x - val[lo]) / (val[hi] - val[lo]));
+	/* halves, so that the differences cannot overflow near the double limit */
+	{
+		double		den = val[hi] / 2.0 - val[lo] / 2.0;
+		double		t = den > 0.0 ? (x / 2.0 - val[lo] / 2.0) / den : 0.0;
+
+		if (!(t > 0.0))
+			t = 0.0;
+		if (t > 1.0)
+			t = 1.0;
+		r = pos[lo] + (pos[hi] - pos[lo]) * t;
+	}
 	r /= (double) st->total;
 	pfree(pos);
 	pfree(val);
@@ -851,12 +892,15 @@ agg_state(FunctionCallInfo fcinfo, int compression, MemoryContext aggcontext)
 	return td_new(compression, aggcontext);
 }
 
-/* The compression of a call: argument "argno" if it is not NULL, else the state's or the default. */
+/* The compression of a call: argument "argno" (never NULL), or, with no such argument, the state's or the default. */
 static int
 agg_compression(FunctionCallInfo fcinfo, int argno)
 {
-	if (argno >= 0 && !PG_ARGISNULL(argno))
+	if (argno >= 0)
+	{
+		KS_REQUIRE_PARAM(fcinfo, argno, "compression");
 		return check_compression(PG_GETARG_INT32(argno));
+	}
 	if (!PG_ARGISNULL(0))
 		return ((TdState *) PG_GETARG_POINTER(0))->compression;
 	return KS_TD_DEFAULT_COMPRESSION;
@@ -935,7 +979,7 @@ agg_set_fraction(TdState *st, double q)
 	if (!st->has_q)
 	{
 		st->has_q = true;
-		st->q = q;
+		st->q = q + 0.0;
 	}
 	else if (st->q != q)
 		ereport(ERROR,

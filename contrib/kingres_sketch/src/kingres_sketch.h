@@ -186,6 +186,26 @@ extern Datum ks_from_bytea_common(FunctionCallInfo fcinfo, int kind,
 extern uint64 ks_hash_datum(FunctionCallInfo fcinfo, int argno, Datum value);
 extern uint64 ks_mix64(uint64 h);
 
+/* Refuse the type of the element argument of the call now, whatever the value. */
+extern void ks_hash_check_type(FunctionCallInfo fcinfo, int argno);
+
+/* The hash of a value of a given type outside a call (self_test). */
+extern uint64 ks_hash_value_of_type(Oid typid, Datum value, Oid collation);
+
+/*
+ * The parameter argument of an aggregate (precision, capacity, compression)
+ * must not be NULL in any row: one rule, so that the answer does not depend
+ * on the order of the rows, the plan or the number of workers.
+ */
+#define KS_REQUIRE_PARAM(fcinfo, argno, what) \
+	do { \
+		if (PG_ARGISNULL(argno)) \
+			ereport(ERROR, \
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), \
+					 errmsg("the %s argument of the aggregate must not be NULL", what), \
+					 errhint("Give the same non-NULL %s in every row.", what))); \
+	} while (0)
+
 /* Return a state pointer, or SQL NULL when there is no state (a NULL pointer is not a NULL datum). */
 #define KS_RETURN_STATE(p) \
 	do { \

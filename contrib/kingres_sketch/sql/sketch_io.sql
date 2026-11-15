@@ -138,6 +138,9 @@ SELECT name, (e).sql_error_code AS code, (e).message, (e).detail
             ('mean below minimum', pg_temp.td(100, 1, 1, 0.6, 1, pg_temp.tdc(0.5, 1))),
             ('mean above maximum', pg_temp.td(100, 1, 1, 0, 0.4, pg_temp.tdc(0.5, 1))),
             ('minimum above maximum', pg_temp.td(100, 1, 1, 2, 1, pg_temp.tdc(1.5, 1))),
+            ('negative zero minimum', pg_temp.td(100, 1, 1, '-0'::float8, 1, pg_temp.tdc(0.5, 1))),
+            ('negative zero maximum', pg_temp.td(100, 1, 1, -1, '-0'::float8, pg_temp.tdc(-0.5, 1))),
+            ('negative zero mean', pg_temp.td(100, 1, 1, -1, 1, pg_temp.tdc('-0'::float8, 1))),
             ('NaN mean', pg_temp.td(100, 1, 1, 0, 1, pg_temp.tdc('NaN', 1))),
             ('infinite mean', pg_temp.td(100, 1, 1, 0, 1, pg_temp.tdc('Infinity', 1))),
             ('NaN maximum', pg_temp.td(100, 1, 1, 0, 'NaN', pg_temp.tdc(0.5, 1))),
@@ -151,6 +154,7 @@ SELECT name, pg_input_is_valid(v, 'kingres_sketch.tdigest') AS valid
     ('one centroid', pg_temp.td(100, 1, 7, 1, 2, pg_temp.tdc(1.5, 7))),
     ('equal means', pg_temp.td(100, 2, 2, 1, 1, pg_temp.tdc(1, 1) || pg_temp.tdc(1, 1))),
     ('most centroids', pg_temp.td(10, 22, 22, 0, 1, repeat(pg_temp.tdc(0.5, 1), 22)))
+    ,('zero minimum and mean', pg_temp.td(100, 1, 1, 0, 1, pg_temp.tdc(0, 1)))
   ) t(name, v) ORDER BY name;
 
 -- binary input is the same validation
@@ -161,3 +165,17 @@ CREATE TABLE sketch_io_t (h kingres_sketch.hll, t kingres_sketch.topn, d kingres
 INSERT INTO sketch_io_t VALUES (hll_empty(4), topn_empty(2), tdigest_empty(10));
 SELECT hll_cardinality(h), topn_total(t), tdigest_count(d) FROM sketch_io_t;
 DROP TABLE sketch_io_t;
+
+-- negative zero is stored as zero: a value with the bit pattern of -0 in a
+-- minimum, a maximum, a mean or the fraction of a state is refused, so the
+-- bytes of a digest are a function of its content
+WITH b AS (SELECT tdigest_to_bytea(tdigest_agg(0.0::float8)) AS v),
+     c AS (SELECT set_byte(set_byte(v, 27, 128), 43, 128) AS v FROM b)
+SELECT pg_temp.try(v, 'kingres_sketch.tdigest') AS minus_zero_min_and_mean FROM c;
+WITH b AS (SELECT tdigest_to_bytea(tdigest_agg(0.0::float8)) AS v)
+SELECT pg_temp.try(set_byte(v, 35, 128), 'kingres_sketch.tdigest') AS minus_zero_max FROM b;
+SELECT tdigest_to_bytea(tdigest_add(tdigest_empty(), '-0'::float8)) = tdigest_to_bytea(tdigest_add(tdigest_empty(), 0)) AS built_as_zero,
+       tdigest_to_bytea(tdigest_agg(x)) = tdigest_to_bytea(tdigest_agg(abs(x))) AS aggregate_as_zero
+  FROM (VALUES ('-0'::float8), (0)) v(x);
+SELECT sketch_kind(set_byte(set_byte(v, 2, 4), 3, 0) || '\x0000000000000080'::bytea) AS kind4_minus_zero_fraction
+  FROM (SELECT tdigest_to_bytea(tdigest_agg(1.0::float8)) AS v) b;

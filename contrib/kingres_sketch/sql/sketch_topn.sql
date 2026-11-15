@@ -91,3 +91,15 @@ SELECT count(*) AS counters,
 -- as a window function
 SELECT i, topn_total(topn_add_agg(i % 3, 2) OVER (ORDER BY i)) AS running_total
   FROM generate_series(1, 5) i;
+
+-- equal values are one item: char(n) without the padding, numeric without the scale
+SELECT * FROM topn_list(topn_add(topn_add(topn_empty(), 'a'::char(3)), 'a'::char(5)));
+SELECT * FROM topn_list((SELECT topn_add_agg(x) FROM (VALUES ('a  '::char(3)), ('a'::char(1)), ('a  b'::char(5))) t(x)));
+SELECT * FROM topn_list((SELECT topn_add_agg(x) FROM (VALUES (1.5::numeric), (1.50::numeric), (1.500::numeric), (2.0::numeric), (2::numeric), (0.00::numeric), (0::numeric)) t(x)));
+-- a sketch from char(n) values of different lengths equals the sketch of the text without padding
+SELECT topn_add_agg(x)::bytea = (SELECT topn_add_agg(rtrim(x::text)) FROM (VALUES ('a'::char(3)), ('a'::char(5))) u(x))::bytea AS same_as_trimmed_text
+  FROM (VALUES ('a'::char(3)), ('a'::char(5))) t(x);
+
+-- a NULL capacity is an error in every row, so the answer does not depend on the order of the rows
+SELECT topn_capacity(topn_add_agg(x, k)) FROM (VALUES ('a', 5), ('b', NULL::int)) v(x, k);
+SELECT topn_capacity(topn_add_agg(x, k)) FROM (VALUES ('a', NULL::int), ('b', 5)) v(x, k);
