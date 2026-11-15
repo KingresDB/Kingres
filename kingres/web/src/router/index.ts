@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // Routes are lazy-loaded so that each page is its own chunk. Each route names the contract
@@ -136,6 +136,13 @@ export const routes: RouteRecordRaw[] = [
         name: 'settings',
         component: () => import('@/pages/SettingsPage.vue'),
         meta: { title: 'Settings', operation: 'getClusterSettings', nav: 'cluster' },
+      },
+      {
+        path: 'configuration',
+        name: 'configuration',
+        component: () => import('@/pages/ConfigurationPage.vue'),
+        // Reading needs kingres_readonly; a kingres_stats account cannot reach the page.
+        meta: { title: 'Configuration', operation: 'listConfigParameters', nav: 'cluster' },
       },
       {
         path: 'this-server',

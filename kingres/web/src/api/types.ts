@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // Short aliases for the generated schema types. Request and response types come only from here.
@@ -83,3 +83,30 @@ export type GroupLease = S['GroupLease']
 export type AlertSubject = S['AlertSubject']
 export type TaskStep = S['TaskStep']
 export type LedgerStatus = S['LedgerStatus']
+
+// Configuration (contract 0.8.0)
+export type ConfigLevel = S['ConfigLevel']
+export type ConfigServerState = S['ConfigServerState']
+export type ConfigParameterKind = S['ConfigParameterKind']
+export type ConfigValueSource = S['ConfigValueSource']
+export type ConfigOverride = S['ConfigOverride']
+export type ConfigServerValue = S['ConfigServerValue']
+export type ConfigParameter = S['ConfigParameter']
+export type ConfigParameterList = S['ConfigParameterList']
+export type ConfigChangeItem = S['ConfigChangeItem']
+export type ConfigChangeRequest = S['ConfigChangeRequest']
+export type ConfigProblem = S['ConfigProblem']
+export type ConfigEffect = S['ConfigEffect']
+export type ConfigRestartStep = S['ConfigRestartStep']
+export type ConfigChangePreview = S['ConfigChangePreview']
+export type ConfigChange = S['ConfigChange']
+export type ConfigChangeList = S['ConfigChangeList']
+export type ConfigServerStatus = S['ConfigServerStatus']
+export type ConfigServerList = S['ConfigServerList']
+export type ConfigSummary = S['ConfigSummary']
+export type ServerTime = S['ServerTime']
+export type ClusterTime = S['ClusterTime']
+export type DatabaseTimeZone = S['DatabaseTimeZone']
+export type TimeZoneInfo = S['TimeZoneInfo']
+export type TimeZoneList = S['TimeZoneList']
+export type RestartPendingRequest = S['RestartPendingRequest']

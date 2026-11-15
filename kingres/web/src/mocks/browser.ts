@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // Starts the mock API in the browser (development only; see main.ts). Dev switches in the URL:
@@ -9,6 +9,7 @@
 //                                reasons timeout, unreachable, refused, invalidAnswer)
 //   ?cursors=reject              every request with a cursor answers 400 (a 0.4.0 cursor on a 0.5.0 server)
 //   ?latency=0                   no artificial delay
+//   ?config=, ?clock=            states of contract 0.8.0 (configuration and clocks; see switches.ts and the README)
 //   ?silent=, ?lease=, ?standby=, ?workbench=busy, ?leader=lost, ?client=on, ?ledger=   states of contract 0.7.0
 //                                (see switches.ts and the README)
 import { setupWorker } from 'msw/browser'
@@ -19,6 +20,13 @@ import { getState, resetMockState } from './http'
 import { HOSTILE_MISSING, seedHostile } from './hostile'
 import { loseLease, mockConfig, regainLease, reviveServer, silenceServer } from './state'
 import { applySwitches } from './switches'
+import {
+  bringConfigServerBack,
+  failNextApply,
+  setClockOffset,
+  setClockReachable,
+  takeConfigServerDown,
+} from './config'
 
 export async function startBrowserMocks(): Promise<void> {
   const params = new URLSearchParams(location.search)
@@ -46,6 +54,12 @@ export async function startBrowserMocks(): Promise<void> {
     revive: (id: string) => reviveServer(getState(), id),
     loseLease: (group: number) => loseLease(getState(), group),
     regainLease: (group: number) => regainLease(getState(), group),
+    // 0.8.0 (configuration): the next change fails on a server; a server cannot be reached / is back; a clock is off.
+    failConfigOn: (id: string, text?: string) => failNextApply(getState(), id, text),
+    configServerDown: (id: string) => takeConfigServerDown(getState(), id),
+    configServerBack: (id: string) => bringConfigServerBack(getState(), id),
+    clockOff: (id: string, ms: number) => setClockOffset(getState(), id, ms),
+    clockUnreachable: (id: string, gone = true) => setClockReachable(getState(), id, gone),
   }
   const worker = setupWorker(...createHandlers())
   await worker.start({ onUnhandledFrame: 'bypass', quiet: true })

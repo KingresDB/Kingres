@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 package clustertest_test
 
@@ -50,6 +50,26 @@ func TestServerGroupsAcrossServers(t *testing.T) {
 	c := sharedCluster(t)
 	leader, f1, f2 := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	target := f2.Host
+	// Other tests of the shared cluster (the configuration tests) make server groups too: count from here.
+	audited := func(action string) (ok, forwarded int) {
+		a := leader.Expect(200, "GET", "/audit?action="+action+"&limit=200", nil)
+		for _, it := range anyList(a["items"]) {
+			m := it.(map[string]any)
+			if m["outcome"] != "success" || m["actor"] != clustertest.AdminUser {
+				continue
+			}
+			ok++
+			if d, _ := m["details"].(map[string]any); d["forwardedBy"] != nil {
+				forwarded++
+			}
+		}
+		return ok, forwarded
+	}
+	base := map[string][2]int{}
+	for _, a := range []string{"createServerGroup", "deleteServerGroup", "updateServer"} {
+		o, f := audited(a)
+		base[a] = [2]int{o, f}
+	}
 
 	for _, n := range c.Nodes {
 		// A failing node must fail the test with its answer, not panic on a missing member.
@@ -170,18 +190,8 @@ func TestServerGroupsAcrossServers(t *testing.T) {
 		action           string
 		success, viaPeer int // successes by the administrator, and those that arrived through a follower
 	}{{"createServerGroup", 2, 1}, {"deleteServerGroup", 2, 2}, {"updateServer", 5, 5}} {
-		var ok, forwarded int
-		a := leader.Expect(200, "GET", "/audit?action="+tc.action+"&limit=200", nil)
-		for _, it := range anyList(a["items"]) {
-			m := it.(map[string]any)
-			if m["outcome"] != "success" || m["actor"] != clustertest.AdminUser {
-				continue
-			}
-			ok++
-			if d, _ := m["details"].(map[string]any); d["forwardedBy"] != nil {
-				forwarded++
-			}
-		}
+		ok, forwarded := audited(tc.action)
+		ok, forwarded = ok-base[tc.action][0], forwarded-base[tc.action][1]
 		if ok != tc.success || forwarded != tc.viaPeer {
 			t.Errorf("leader audited %d successful %s events (%d forwarded), want %d (%d)", ok, tc.action, forwarded, tc.success, tc.viaPeer)
 		}

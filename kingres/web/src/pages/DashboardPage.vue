@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
 import { computed } from 'vue'
@@ -11,6 +11,7 @@ import NullableValue from '@/components/NullableValue.vue'
 import LineChart from '@/components/LineChart.vue'
 import AlertSubject from '@/components/AlertSubject.vue'
 import ClientEntryPointCharts from '@/components/ClientEntryPointCharts.vue'
+import ConfigSummaryCard from '@/components/config/ConfigSummaryCard.vue'
 import PartialNotice from '@/components/PartialNotice.vue'
 import { useCompletenessAnnouncement } from '@/composables/useCompletenessAnnouncement'
 import { completenessOf, mergeCompleteness } from '@/lib/partial'
@@ -34,6 +35,7 @@ const session = useSessionStore()
 const canCluster = computed(() => session.can('getCluster'))
 const canAlerts = computed(() => session.can('listAlerts'))
 const canTasks = computed(() => session.can('listTasks'))
+const canConfig = computed(() => session.can('getConfigSummary'))
 const cluster = useCluster(canCluster)
 // A stats-only account cannot read /cluster; GET /cluster/summary is open to it.
 const summary = useClusterSummary(() => !canCluster.value)
@@ -226,6 +228,7 @@ const metricsUnsupported = computed(() =>
       </div>
     </section>
     <ClientEntryPointCharts v-if="!metricsUnsupported" />
+    <ConfigSummaryCard v-if="canConfig" />
     <div v-if="canAlerts || canTasks" class="grid-2">
       <section v-if="canAlerts" class="card" aria-labelledby="alerts-h">
         <div class="row-between">

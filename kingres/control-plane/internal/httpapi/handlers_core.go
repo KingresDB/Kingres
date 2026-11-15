@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 package httpapi
 
@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"regexp"
 	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
@@ -34,6 +35,9 @@ func (s *Server) handlers() map[string]handlerFunc {
 		m[k] = v
 	}
 	for k, v := range s.instanceHandlers() {
+		m[k] = v
+	}
+	for k, v := range s.configHandlers() {
 		m[k] = v
 	}
 	for k, v := range s.coreHandlers() {
@@ -125,6 +129,9 @@ func (s *Server) getReadiness(_ *call, w http.ResponseWriter, r *http.Request) e
 	return nil
 }
 
+// commitRE is what a build commit must look like to be reported: the panel makes a link from it.
+var commitRE = regexp.MustCompile(`^[0-9a-f]{7,64}$`)
+
 func (s *Server) getNodeState(c *call, w http.ResponseWriter, r *http.Request) error {
 	snap := s.deps.Setup.Snapshot()
 	pgv := "unknown"
@@ -139,6 +146,10 @@ func (s *Server) getNodeState(c *call, w http.ResponseWriter, r *http.Request) e
 		SetupTokenRequired: snap.State == setup.Uninitialized,
 		LocalhostOnly:      snap.State == setup.Uninitialized && s.deps.LoopbackOnly,
 		SetupTask:          snap.SetupTask,
+	}
+	if commitRE.MatchString(s.deps.Commit) {
+		cm := s.deps.Commit
+		info.Commit = &cm
 	}
 	if snap.State != setup.Uninitialized {
 		info.ServerID = s.localServerID(ctx)

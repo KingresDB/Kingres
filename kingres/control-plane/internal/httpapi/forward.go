@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 package httpapi
 
@@ -48,6 +48,9 @@ type Forwarder interface {
 // are answered by the leader too.
 var leaderBoundReads = map[string]bool{
 	"listTasks": true, "getTask": true, "getClusterSettings": true,
+	// Configuration from the console (phase 13): the leader can ask every server.
+	"listConfigParameters": true, "getConfigParameter": true, "listConfigChanges": true, "listConfigServers": true,
+	"getConfigSummary": true, "getClusterTime": true, "listTimeZones": true,
 	// The groups are state of the leader's system database (see completeServers).
 	"listServerGroups": true,
 	// The verification records get their identifiers in the system database

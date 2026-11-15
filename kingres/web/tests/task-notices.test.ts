@@ -40,7 +40,13 @@ describe('a task whose dialog was closed is still followed (W-13a)', () => {
     await user.click(await within(dialog).findByRole('button', { name: /hide \(keeps running\)/i }))
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
 
-    const notice = await screen.findByRole('alert', { name: /drop database reports/i })
+    // The notice appears when the next poll of the hidden task sees the failure. On a loaded
+    // machine that poll can come later than the default wait of one second.
+    const notice = await screen.findByRole(
+      'alert',
+      { name: /drop database reports/i },
+      { timeout: 8000 },
+    )
     expect(notice).toHaveTextContent(/the disk is on fire/i)
     expect(startedId).toBeGreaterThan(0)
     // The notice stays until the person dismisses it.

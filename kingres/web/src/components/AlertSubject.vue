@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
 // What an alert is about (contract 0.7.0, `Alert.subject`): the server, the server that is behind, the shard group,
@@ -38,6 +38,10 @@ const aspectText = computed(() => {
   return a === null || a === undefined ? null : (ASPECT[a] ?? null)
 })
 const isPending = computed(() => props.alert.kind === 'replicationPending')
+// 0.8.0: a clock that differs is explained and handled on the Time tab of the Configuration page.
+const canTime = computed(
+  () => props.alert.kind === 'clockDifference' && session.can('getClusterTime'),
+)
 const any = computed(
   () =>
     subject.value.serverId !== null ||
@@ -84,6 +88,11 @@ const any = computed(
         ><SafeName :value="subject.databaseName" :max="60"
       /></RouterLink>
       <SafeName v-else :value="subject.databaseName" :max="60" />
+    </li>
+    <li v-if="canTime" data-testid="alert-clock">
+      <RouterLink :to="{ name: 'configuration', query: { tab: 'time' } }"
+        >Clocks and what to do</RouterLink
+      >
     </li>
     <li v-if="subject.aspect" data-testid="alert-aspect">
       <template v-if="aspectText">{{ aspectText }}</template>

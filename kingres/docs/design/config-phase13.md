@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # Configuration from the console: design of phase 13
 
 Status: accepted for implementation, 2026-11-15.
@@ -64,14 +64,14 @@ first draft and their outcome:
 | # | Statement | Outcome |
 |---|---|---|
 | V1 | A value that PostgreSQL rejects in an included file stops the reload | **Partly.** An invalid *value* is skipped alone ("configuration file contains errors; unaffected changes were applied", `pg_file_settings.error` says `invalid value for parameter ...`), the other lines of the file are applied. A *syntax* error rejects the **whole** reload of every file ("no changes were applied"), including changes of the managed file made at the same time. Therefore a file is checked **before** it is reloaded (V2) |
-| V2 | `pg_file_settings` shows the problems of a file that was not loaded | **Yes.** The view parses the files when it is queried; it needs no reload. After writing the candidate file and before the reload, the step reads it: a row with an `error` other than `setting could not be applied` is a failure and the previous file is restored. `setting could not be applied` with `applied = false` is how a `postmaster` parameter shows "pending restart" (`pg_settings.pending_restart = true` as well) |
+| V2 | `pg_file_settings` shows the problems of a file that was not loaded | **Partly (corrected during implementation).** The view parses the files when it is queried; it needs no reload, and a syntax error shows at once. But an invalid *value* gives the same text as a restart that is needed, `setting could not be applied` with `applied = false`, and an out-of-range number gives no error at all. So the step reads the file before the reload and treats that text as "pending restart" only for a parameter of context `postmaster` (for any other it is a failure and the previous file is restored); the values themselves are checked by layers 2 and 3 before anything is written, and after the reload `pg_settings.pending_restart` and the running value are the proof |
 | V3 | `pg_conf_load_time()` shows that a reload happened | **Yes, except after a syntax error** (the time does not move). The step records it before the reload and waits for it to move; a syntax error never reaches the reload because of V2 |
 | V4 | A later line wins, also across `include` | **Yes.** In `kingres-managed.conf` an `include_if_exists` placed after the derived defaults and before the fixed managed lines is overridden by the lines after it and overrides the lines before it and `postgresql.conf` (checked with `work_mem` and `max_connections`; `pg_settings.sourcefile` and `sourceline` name the file and line that won). A missing file is tolerated (`include_if_exists`) with a `LOG` line per read, so the file always exists |
 | V5 | `postgres -C name -c name=value -D data` validates a value with PostgreSQL's own parser and check hooks, also while the instance runs | **Yes for parameters PostgreSQL defines** (unit, range, enum, `TimeZone` names, `wal_level`). **No for the parameters of an extension** (it accepted `kingres_shard.node_timeout=abc`: the library is not loaded in that mode). The options of a value are passed as separate arguments, never through a shell, so a value cannot inject a second option |
 | V6 | `set_config(name, value, true)` in a transaction that is rolled back validates a value | **Yes for `user` and `superuser` contexts, extensions included** (the libraries are loaded in a session). `postmaster` and `sighup` parameters fail with "cannot be changed without restarting the server" before the value is looked at, so it is not usable for them. `ALTER DATABASE ... SET` validates too (an unknown time zone, `shared_buffers` and `log_timezone` are refused with PostgreSQL's message and nothing is stored) |
 | V7 | `pg_settings` is enough to validate | **Yes for type, unit, range and enum**: `vartype` (`bool`, `integer`, `real`, `string`, `enum`), `unit` (`B`, `kB`, `8kB`, `MB`, `ms`, `s`, `min`), `min_val`, `max_val`, `enumvals`, `context`. It is not enough for string parameters (their check hooks) and not for enum aliases (`synchronous_commit = true` is accepted and not in `enumvals`); V5 and V6 cover those |
 | V8 | PostgreSQL's number syntax | **Wider than anyone expects:** `0x10` is 16, `010` is 8, `1e3` is 1000, `1.5` for a setting in kB is rounded to 2, `o` alone is not a boolean but `of`, `tr`, `y` are. The checker of `kingresd` accepts a narrow, unambiguous subset (below) and refuses the rest, and a differential test compares every accepted value with PostgreSQL |
-| V9 | Superuser-only parameters can be found without a list | **Yes.** `SET LOCAL ROLE pg_database_owner` and read `pg_settings`: 387 of 413 rows remain; the 26 that disappear are the parameters PostgreSQL marks `GUC_SUPERUSER_ONLY` (`archive_command`, `ssl_passphrase_command`, `dynamic_library_path`, the `*_preload_libraries`, `primary_conninfo`, `data_directory`, `hba_file`, `log_directory`, `kingres_shard.node_conninfo`, ...). Same set as the 24 `GUC_SUPERUSER_ONLY` entries of `guc_tables.c` plus the extension's own |
+| V9 | Superuser-only parameters can be found without a list | **Yes, but the set is not what the first draft said (corrected).** `SET LOCAL ROLE pg_database_owner` and read `pg_settings`: 387 of 413 rows remain; the 26 that disappear are the superuser-only parameters (`ssl_passphrase_command`, `dynamic_library_path`, `shared_preload_libraries`, `session_preload_libraries`, `primary_conninfo`, `data_directory`, `hba_file`, `log_directory`, the TLS cipher settings, `kingres_shard.node_conninfo`, ...). **`archive_command`, `restore_command`, `archive_cleanup_command`, `recovery_end_command`, `archive_library` and `local_preload_libraries` are visible to every database user** in PostgreSQL 18 (the first draft read them from a grep of `guc_tables.c` that was wrong). They run commands or load code all the same, so they are refused by name (and by the suffixes `_command`, `_library`, `_libraries` and a name with `preload`), and their value is never returned by this API either |
 | V10 | `ALTER DATABASE ... SET` reaches standbys | **Yes by construction:** `pg_db_role_setting` is a shared catalog, so it is replicated physically. The change is made on the primary instance of every server (each shard group is a cluster of its own, with its own catalog) and standbys follow |
 | V11 | A hot standby needs at least the primary's values of five settings | **Yes**, `CheckRequiredParameterValues` in `xlog.c`: `max_connections`, `max_worker_processes`, `max_wal_senders`, `max_prepared_transactions`, `max_locks_per_transaction`. A standby that starts below the primary's value does not start; a running standby whose primary was restarted with a higher value pauses replay until it is restarted |
 | V12 | Which settings the sharding extension needs equal on every node | See "Cluster-only parameters". The extension forces `DateStyle`, `IntervalStyle`, `extra_float_digits`, `standard_conforming_strings`, `bytea_output` and `search_path` on the sessions it opens on other nodes (`node_conn.c`), so a statement's text transport does not depend on them; it does **not** force `TimeZone`, the `lc_*` settings or `default_text_search_config`, so a function evaluated on another node (`now()::timestamp`, `to_char`, `to_tsvector`) depends on that node's value |
@@ -152,9 +152,9 @@ operating system). **The console never sets them.** They are refused at every le
 422, with the reason) and are settable only on the server, by its administrator, in `postgresql.conf` (which is
 outside what `kingresd` rewrites and is not read back by it).
 
-The rule is not a hand-written list but PostgreSQL's own classification: the refused set is **every parameter
-that PostgreSQL hides from a role without `pg_read_all_settings`** (`GUC_SUPERUSER_ONLY`, found by the test of V9
-at run time on the running version and on every extension), plus the policy additions below. That choice fails
+The rule is PostgreSQL's own classification where PostgreSQL has one: the refused set is **every parameter
+that PostgreSQL hides from a role without `pg_read_all_settings`** (found by the test of V9 at run time on the
+running version and on every extension), plus the command and code names of V9 and the policy additions below. That choice fails
 safe: a parameter that a later PostgreSQL version or an extension marks superuser-only is refused until someone
 decides to allow it. `TestRefusedSetMatchesVersion` fails when the set PostgreSQL reports changes (a new one
 needs a decision, a vanished one needs the table updated), and a table of reasons maps each known name to one
@@ -526,7 +526,7 @@ A new tag `Configuration`. All answers are `application/json` and every operatio
 
 | operationId | Method and path | Role | Answer |
 |---|---|---|---|
-| `listConfigParameters` | `GET /config/parameters` | `kingres_readonly` | `ConfigParameterList` (`items`, `nextCursor`, `revision`, `partial`, `missingServers`). Query: `q` (name and description), `category`, `changed` (has an override), `differing` (values differ between servers), `pendingRestart`, `kind` (`settable`, `managed`, `refused`), `limit` (1 to 500, default 200), `cursor`. Keyset by name |
+| `listConfigParameters` | `GET /config/parameters` | `kingres_readonly` | `ConfigParameterList` (`items`, `nextCursor`, `revision`, `partial`, `missingServers`). Query: `q` (name and description), `category`, `changed` (has an override), `differing` (values differ between servers), `pendingRestart`, `kind` (`settable`, `managed`, `refused`), `limit` (1 to 500, default 50 like the other lists), `cursor`. Keyset by name |
 | `getConfigParameter` | `GET /config/parameters/{name}` | `kingres_readonly` | `ConfigParameter` (404 `config_parameter_unknown`) |
 | `previewConfigChange` | `POST /config/changes/preview` | `kingres_admin` | `ConfigChangePreview`: `valid`, `problems[]` (per change: pointer, code, message), `effects[]` (per server and parameter: before, after, how it takes effect: `unchanged`, `reload`, `restart`, `waits` for a server that is down), `restartServerIds`, `restartOrder[]` and `restartOrderConflict`. Status 200 also when `valid` is false (it is a question, not a request). Admin because it takes the same body as the change and reads nothing a readonly role needs; the console shows it to admins only |
 | `applyConfigChange` | `POST /config/changes` | `kingres_admin` | 202 `Task` (kind `config.apply`) with `Location`; 400 `validation_failed` / `config_value_invalid`, 422 `config_parameter_managed`, `config_parameter_refused`, `config_level_not_allowed`, `config_value_below_floor`, 404 `not_found` for an unknown server group, server or database, 409 `operation_in_progress` |
@@ -753,3 +753,32 @@ Each increment builds and passes its own tests; the contract checker passes from
 - Restarts have no failover to hide the downtime of a group (not implemented).
 - The clock difference is an estimate with a stated uncertainty and is relative to the answering server, not to
   a trusted time source.
+
+## What the implementation decided beyond this text
+
+- **The answering server is the manager leader.** The reads of the Configuration tag are answered by the leader (a
+  follower forwards them, like the task and settings reads), because only the leader can ask every server through the
+  `leader`-only internal calls and holds the system database. "The answering server" above therefore means the manager
+  leader: `ClusterTime.referenceServerId` names it and every difference is relative to its clock.
+- **The clock alert is the leader's loop, not a monitor probe.** `clockDifference` is about another server, and the
+  monitor round of a server may only reconcile alerts about itself, so the leader measures the other servers every
+  10 seconds (`Leader.CheckClocks`) and reconciles each alert in the scope of that server.
+- **Bringing servers up to date is a loop, not a step of `server.add`.** Every 30 seconds the leader compares, for each
+  server, the hash of its override file with the file the stored values give for it and starts a `config.apply` task
+  without changes for the servers that differ (a server that joined, moved to another server group, came back with a
+  file restored from a failed apply, or was edited by hand). A server is tried again at most every ten minutes. The
+  same task is what a change starts for the servers it names.
+- **The applied revision and the failed state.** A server that fails keeps its previous file (restored) and reports the
+  revision it holds; `config_server_state` keeps PostgreSQL's text per parameter, or `(server)` when the server could not
+  write its file at all (every parameter that is meant to differ there is then shown failed).
+- **A file that is already the wanted one is reloaded when the instance runs something else** (an earlier apply could
+  write but not reload a standby that was starting).
+- **Standbys.** Every instance of a server gets the file; a standby that is still being created or is starting is
+  reported `waiting` and gets the file (and the reload) at the next apply or by the loop above. A standby built from a
+  base backup starts with the override file of its primary's server until then (a limit).
+- **Derived values in the effective value.** The value shown for a parameter is the running value in the form
+  `SHOW` uses (`128MB`, `10min`), computed from `pg_settings.setting` and its unit; the pending value is the text that
+  the file holds.
+- **Values that PostgreSQL shows but kingresd does not.** The value of a parameter whose name says it runs a command or
+  loads code (`archive_command`, `restore_command`, ...) is never returned, although PostgreSQL 18 shows it to every
+  database user.

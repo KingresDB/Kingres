@@ -29,7 +29,7 @@ There is one product branch per PostgreSQL major, with the same KingresDB code o
 | 0 Foundation, 1 Sharding MVP, 2 Distributed DML and DDL, two-phase commit, reference tables | Done (`kingres_shard` 0.2) |
 | 3 Control plane, REST API, panel, package | Done |
 | 4 Bucket movement and rebalancing | In progress: `kingres_shard` 0.4 moves buckets (0.4 is the fix round for the review of 0.3; its fixes are being reviewed again); rebalancing is not yet driven by the control plane |
-| 5 High availability | In progress: heartbeats, leases, standbys and the client entry point are in the control plane; `kingres_shard` 0.5 has standby nodes, `promote_node`, prepared transactions across a failover, distributed deadlock detection and coordinated restore points; failover itself (the control plane promoting a standby) is not written yet |
+| 5 High availability | In progress: heartbeats, leases, standbys and the client entry point are in the control plane; `kingres_shard` 0.5 has standby nodes, `promote_node`, prepared transactions across a failover, distributed deadlock detection and coordinated restore points; failover itself (the control plane promoting a standby) is not written yet. The independent review of 0.5 found one critical and six high defects in these functions ([report](docs/reviews/2026-11-15-kingres-shard-0.5.md)); they are being fixed, and a failover must not be relied on before that |
 | 6 Ledger | Done (`kingres_ledger` 0.2, the verifier, the Ledger page) |
 | 2b, 9 to 12 | Designed, not implemented, except the three standalone extensions of phase 12 listed below |
 | 7 | Not started |

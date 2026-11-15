@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 package pgstore
 
@@ -237,6 +237,7 @@ func (s *Store) ClusterSettings(ctx context.Context) (api.ClusterSettings, error
 		Rebalance:           api.RebalanceSettings{MaxConcurrentMoves: 4},
 		Features:            api.FeatureFlags{Sharding: shard, Ledger: ledger},
 		Restart:             api.RestartState{ServerIDs: []string{}},
+		Clock:               &api.ClockSettings{MaxDifferenceMs: 1000},
 	}
 	// Values the administrator set (kingres_cp.cluster_setting) win over the
 	// defaults derived from the catalogs.
@@ -275,6 +276,10 @@ func (s *Store) ClusterSettings(ctx context.Context) (api.ClusterSettings, error
 			case "autoFailover.maxCount":
 				if json.Unmarshal(v, &n) == nil {
 					out.AutoFailover.MaxCount = n
+				}
+			case "clock.maxDifferenceMs":
+				if json.Unmarshal(v, &n) == nil {
+					out.Clock = &api.ClockSettings{MaxDifferenceMs: n}
 				}
 			case "rebalance.maxConcurrentMoves":
 				if json.Unmarshal(v, &n) == nil {

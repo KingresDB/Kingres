@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // One function per REST operation the panel calls. This is the only module (besides the
@@ -26,6 +26,11 @@ import type {
   TaskState,
   Task,
   BucketState,
+  ConfigChangeRequest,
+  ConfigLevel,
+  ConfigParameterKind,
+  ConfigServerState,
+  RestartPendingRequest,
 } from './types'
 import type { components } from './schema'
 import { parseProof, withRawDocuments, type RawDigest, type RawProof } from '@/lib/ledger-proof'
@@ -321,6 +326,41 @@ export const endpoints = {
         }),
       ),
     ),
+
+  // --- configuration (0.8.0)
+  listConfigParameters: (
+    q: Page & {
+      q?: string
+      category?: string
+      changed?: boolean
+      differing?: boolean
+      pendingRestart?: boolean
+      state?: ConfigServerState
+      kind?: ConfigParameterKind
+    } = {},
+  ) => j(api.GET('/config/parameters', { params: { query: q } })),
+  getConfigParameter: (name: string) =>
+    j(api.GET('/config/parameters/{name}', { params: { path: { name } } })),
+  /** A question, not a request: answers 200 also when the change would be refused (`valid: false`). */
+  previewConfigChange: (body: ConfigChangeRequest) =>
+    j(api.POST('/config/changes/preview', { body })),
+  /** 202 + task `config.apply`. */
+  applyConfigChange: async (body: ConfigChangeRequest): Promise<Task> =>
+    (await j(api.POST('/config/changes', { body }))) as Task,
+  listConfigChanges: (q: Page & { name?: string; level?: ConfigLevel; scopeId?: string } = {}) =>
+    j(api.GET('/config/changes', { params: { query: q } })),
+  /** 202 + task `config.apply`: a new change that puts the earlier value back. */
+  revertConfigChange: async (changeId: number): Promise<Task> =>
+    (await j(
+      api.POST('/config/changes/{changeId}/revert', { params: { path: { changeId } } }),
+    )) as Task,
+  listConfigServers: () => j(api.GET('/config/servers')),
+  getConfigSummary: () => j(api.GET('/config/summary')),
+  getClusterTime: () => j(api.GET('/config/time')),
+  listTimeZones: () => j(api.GET('/config/time-zones')),
+  /** 202 + task `config.restart`. */
+  restartPendingInstances: async (body: RestartPendingRequest): Promise<Task> =>
+    (await j(api.POST('/config/restarts', { body }))) as Task,
 
   // --- workbench, alerts, logs, metrics
   executeQuery: (body: S['QueryRequest'], signal?: AbortSignal) =>

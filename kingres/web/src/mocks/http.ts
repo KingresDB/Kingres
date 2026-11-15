@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // Plumbing for the mock API: the state singleton, problem responses, pagination, and the wrapper
@@ -21,6 +21,7 @@ export function getState(): MockState {
 export function resetMockState(options: { uninitialized?: boolean } = {}): MockState {
   state = createMockState(options)
   mockConfig.unsupported.clear()
+  mockConfig.commit = '0123456789abcdef0123456789abcdef01234567'
   mockConfig.partial = null
   mockConfig.rejectCursors = false
   mockConfig.caUnavailable = false
@@ -76,6 +77,14 @@ const STATUS: Record<ProblemCode, number> = {
   certificate_revoked: 409,
   certificate_authority_unavailable: 503,
   internal_api_disabled: 409,
+  config_parameter_unknown: 404,
+  config_parameter_managed: 422,
+  config_parameter_refused: 422,
+  config_level_not_allowed: 422,
+  config_value_below_floor: 422,
+  config_change_superseded: 409,
+  config_restart_order_conflict: 409,
+  nothing_pending: 409,
   unprocessable: 422,
   sql_error: 422,
   unsupported_operation: 422,

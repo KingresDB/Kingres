@@ -190,7 +190,7 @@ for (const o of operations) {
 // Audit actions: operationIds plus a small closed list of non-operation events.
 // certificateRenewed and certificateRenewalFailed are the events of the certificate renewal job (0.5.0).
 const NON_OPERATION_EVENTS = ['loginFailed', 'setupTokenRejected', 'autoFailover', 'certificateRenewed', 'certificateRenewalFailed', 'leaseLost', 'leaseFenced', 'leaseAcquired', 'standbyCreated', 'standbyRemoved', 'standbyRebuilt', 'standbyInstanceStarted', 'standbyInstanceRemoved', 'standbyInstanceRebuilt', 'synchronousStandbyNamesChanged', 'replicationSlotDropped'];
-const NOT_AUDITED_MUTATIONS = ['previewRebalancePlan', 'createInclusionProof', 'checkSetupToken'];
+const NOT_AUDITED_MUTATIONS = ['previewRebalancePlan', 'createInclusionProof', 'checkSetupToken', 'previewConfigChange'];
 const auditEnum = schemas.AuditAction?.enum;
 if (!Array.isArray(auditEnum)) fail('components.schemas.AuditAction', 'must be an enum');
 else {
@@ -378,9 +378,10 @@ const MUST_MENTION = {
   '0.4.0': ['system_database_stopped', 'server_owns_buckets', 'ledger_entry_pending', 'seenFingerprint', 'InclusionProof'],
   '0.6.0': ['addServer', 'allowUnpinned', 'internal_api_disabled', 'replicationPending', 'LedgerProofBlock', 'dryRun', 'degraded', 'additive'],
   '0.7.0': ['cancelStatement', 'workbench_busy', 'AlertSubject', 'GroupLease', 'leaseLost', 'uncoveredShardGroupIds', 'additive'],
+  '0.8.0': ['listConfigParameters', 'applyConfigChange', 'restartPendingInstances', 'clockDifference', 'config_parameter_refused', 'config.apply', 'additive'],
   '0.5.0': ['renewServerCertificates', 'revokeServerCertificates', 'certificate_authority_unavailable', 'certificate_revoked', 'certificateRenewalFailed', 'partial', 'additive'],
 };
-for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0']) {
+for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0']) {
   const changelog = changelogOf(version);
   if (!changelog) { fail('README.md', `changelog heading for ${version} is missing`); continue; }
   for (const h of ['#### Breaking', '#### Additive', '#### Documentation']) if (!changelog.includes(h)) fail('README.md', `changelog of ${version} lacks "${h}"`);
@@ -392,7 +393,7 @@ for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0']) {
   if (!m) fail('README.md', `the changelog summary of ${version} must state "N operations added (M operations, P paths)"`);
   else if (version === doc.info?.version && (Number(m[2]) !== operations.length || Number(m[3]) !== Object.keys(doc.paths ?? {}).length)) fail('README.md', `changelog says ${m[2]} operations and ${m[3]} paths, the contract has ${operations.length} and ${Object.keys(doc.paths ?? {}).length}`);
 }
-if (doc.info?.version !== '0.7.0') fail('info.version', 'the contract is revision 0.7.0');
+if (doc.info?.version !== '0.8.0') fail('info.version', 'the contract is revision 0.8.0');
 
 
 // 0.5.0 rules: certificate operations, partial answers, additive changes only.
@@ -464,6 +465,30 @@ for (const [n, prop] of [['SetupTaskSummary', 'detail'], ['NodeStateInfo', 'inte
   if (JSON.stringify(lease?.properties?.state?.enum) !== '["held","lost","granted","none"]') fail('GroupLease', 'state enum must be [held, lost, granted, none]');
   if (schemas.ShardGroup?.properties?.lease?.$ref !== '#/components/schemas/GroupLease' || (schemas.ShardGroup?.required ?? []).includes('lease')) fail('ShardGroup', 'lease must be an optional GroupLease');
   for (const m of ['clientConnectionsAccepted', 'clientBytesOut', 'clientStandbyConnectionsActive']) if (!(schemas.MetricName?.enum ?? []).includes(m)) fail('MetricName', 'missing ' + m);
+}
+// 0.8.0 rules, configuration from the console (additive only): reads are readonly, changes are admin, an
+// operation that starts a task answers 202 with the Task, the new enums, the optional clock setting.
+{
+  const need = { listConfigParameters: 'kingres_readonly', getConfigParameter: 'kingres_readonly', previewConfigChange: 'kingres_admin', applyConfigChange: 'kingres_admin', listConfigChanges: 'kingres_readonly', revertConfigChange: 'kingres_admin', listConfigServers: 'kingres_readonly', getConfigSummary: 'kingres_readonly', getClusterTime: 'kingres_readonly', listTimeZones: 'kingres_readonly', restartPendingInstances: 'kingres_admin' };
+  for (const [id, role] of Object.entries(need)) {
+    const o = opById.get(id);
+    if (!o) { fail(id, 'operation of 0.8.0 does not exist'); continue; }
+    if (o.op['x-required-role'] !== role) fail(id, 'x-required-role must be ' + role);
+    if (!(o.op.tags ?? []).includes('Configuration')) fail(id, 'must have the tag Configuration');
+  }
+  for (const id of ['applyConfigChange', 'revertConfigChange', 'restartPendingInstances']) if (!respCodes(id).includes('202')) fail(id, 'starts a task and must answer 202');
+  for (const id of ['listConfigParameters', 'listConfigChanges']) {
+    const ps = (opById.get(id)?.op.parameters ?? []).map((p) => deref(p)?.name);
+    for (const n of ['limit', 'cursor']) if (!ps.includes(n)) fail(id, 'parameter ' + n + ' is missing');
+  }
+  for (const c of ['config_parameter_unknown', 'config_parameter_managed', 'config_parameter_refused', 'config_level_not_allowed', 'config_value_below_floor', 'config_change_superseded', 'config_restart_order_conflict', 'nothing_pending']) if (!problemCodes.has(c)) fail('ProblemCode', 'missing ' + c);
+  for (const k of ['config.apply', 'config.restart']) if (!(schemas.TaskKind?.enum ?? []).includes(k)) fail('TaskKind', 'missing ' + k);
+  if (!(schemas.AlertKind?.enum ?? []).includes('clockDifference')) fail('AlertKind', 'missing clockDifference');
+  if ((schemas.ClusterSettings?.required ?? []).includes('clock')) fail('ClusterSettings', 'clock must stay optional (additive change)');
+  if (!schemas.ClusterSettings?.properties?.clock || !schemas.ClusterSettingsUpdateRequest?.properties?.clock) fail('ClusterSettings', 'clock is missing');
+  if (!opDesc('restartPendingInstances').includes('downtime')) fail('restartPendingInstances', 'must say that restarting a primary is downtime');
+  if (!opDesc('getClusterTime').includes('does not') ) fail('getClusterTime', 'must say that kingresd does not set the system clock');
+  for (const n of ['listConfigParameters']) if (!opDesc(n).includes('never returned')) fail(n, 'must say that a hidden value is never returned');
 }
 // ------------------------------------------------------------------ report
 const pathCount = Object.keys(doc.paths ?? {}).length;

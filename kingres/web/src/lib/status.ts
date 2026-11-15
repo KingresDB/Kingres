@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // How each status in the API looks: a tone (colour), an icon glyph and a text label. Status is never
@@ -197,6 +197,7 @@ export const ALERT_KIND_LABEL: Record<AlertKind, string> = {
   leaseLost: 'Primary lost its lease',
   groupWithoutSynchronousStandby: 'Commits no longer wait for a standby',
   groupUnderReplicated: 'Shard group has too few standbys',
+  clockDifference: 'Server clock differs from the leader',
 }
 
 /** The label of an alert kind; a kind from a newer server is shown as sent (through SafeName). */
@@ -227,6 +228,8 @@ export const TASK_KIND_LABEL: Record<TaskKind, string> = {
   'certificate.renew': 'Renew server certificates',
   'certificate.revoke': 'Revoke server certificates',
   'standby.reconcile': 'Add or remove standbys',
+  'config.apply': 'Apply a configuration change',
+  'config.restart': 'Restart instances for a configuration change',
 }
 
 /** The label of a task kind; a kind from a newer server is shown as sent (through SafeName). */
@@ -249,6 +252,8 @@ const ALERT_KIND_HINT: Partial<Record<AlertKind, string>> = {
     'The manager leader has heard no heartbeat from this server for the suspect timeout (5 seconds by default). The alert clears when the server is heard again.',
   serverDown:
     'No heartbeat from this server for the failure timeout (10 seconds by default), or its instance does not run. A server that is heard again is live again.',
+  clockDifference:
+    'The clock of this server differs from the clock of the manager leader by more than the cluster threshold, less the uncertainty of the measurement. KingresDB does not set the system clock: run time synchronization (NTP or chrony) on every server.',
   replicationPending:
     'The leader is still waiting to hand a change of roles, grants or settings to a server it could not reach. Until it arrives, a role that was disabled, changed or dropped may still work on that server.',
 }
@@ -325,6 +330,9 @@ export const AUDIT_ACTION_LABEL: Record<AuditAction, string> = {
   standbyInstanceRebuilt: 'Standby instance rebuilt',
   synchronousStandbyNamesChanged: 'Synchronous standby list changed',
   replicationSlotDropped: 'Replication slot dropped',
+  applyConfigChange: 'Change PostgreSQL parameters',
+  revertConfigChange: 'Revert a configuration change',
+  restartPendingInstances: 'Restart instances that wait for a restart',
 }
 
 /** The words for an audit action; an action from a newer server is shown as sent. */

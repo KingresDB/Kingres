@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
@@ -17,6 +17,7 @@ import CertificateExpiry from '@/components/CertificateExpiry.vue'
 import FingerprintValue from '@/components/FingerprintValue.vue'
 import ProblemNotice from '@/components/ProblemNotice.vue'
 import GroupLeaseInfo from '@/components/GroupLeaseInfo.vue'
+import ServerConfigSection from '@/components/config/ServerConfigSection.vue'
 import { endpoints } from '@/api/endpoints'
 import { keys, useServer, useServerGroups, useTopology } from '@/api/queries'
 import { INSTANCE_STATE, SERVER_STATUS } from '@/lib/status'
@@ -353,6 +354,8 @@ function saveGroup(): void {
           </ul>
         </QueryBoundary>
       </section>
+
+      <ServerConfigSection v-if="session.can('listConfigServers')" :server-id="s.id" />
 
       <section class="card" aria-labelledby="inst-h">
         <h2 id="inst-h">Instances</h2>

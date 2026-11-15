@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 package api
 
@@ -287,6 +287,14 @@ type ClusterSettings struct {
 	Features FeatureFlags `json:"features"`
 	// Restart is the pending restart state.
 	Restart RestartState `json:"restart"`
+	// Clock holds the clock settings (contract 0.8.0).
+	Clock *ClockSettings `json:"clock,omitempty"`
+}
+
+// ClockSettings are the clock settings of the cluster.
+type ClockSettings struct {
+	// MaxDifferenceMs is the threshold of the alert clockDifference.
+	MaxDifferenceMs int `json:"maxDifferenceMs"`
 }
 
 // LedgerChainStatus is the status of one ledger chain.

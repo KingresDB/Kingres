@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: KingresDB Management API
-  version: 0.7.0
+  version: 0.8.0
   summary: REST API of the KingresDB management panel, CLI and manager.
   description: |
     The single REST API served by `kingresd` on every KingresDB server. The web panel
@@ -28,8 +28,8 @@ info:
   contact:
     name: KingresDB maintainers
   license:
-    name: PostgreSQL
-    url: https://www.postgresql.org/about/licence/
+    name: AGPL-3.0-only
+    url: https://www.gnu.org/licenses/agpl-3.0.html
 servers:
   - url: http://{host}:{port}/api/v1
     description: Any KingresDB server; the default targets the local server.
@@ -90,6 +90,8 @@ tags:
     description: Cluster log search.
   - name: Metrics
     description: Time series for dashboard charts.
+  - name: Configuration
+    description: PostgreSQL parameters of the servers at the cluster, server group, server and database level, the clocks and time zones, and the restarts a change needs (0.8.0).
 
 paths:
   /healthz:
@@ -2521,6 +2523,323 @@ paths:
         '422': { $ref: '#/components/responses/UnprocessableEntity' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
+  /config/parameters:
+    get:
+      operationId: listConfigParameters
+      summary: List PostgreSQL parameters with their values on every server
+      description: |
+        Added in 0.8.0. Every parameter of the running PostgreSQL version and of the extensions that define parameters,
+        read from `pg_settings` of the answering server (type, unit, range, enum values, context), with the effective
+        value on every server read from that server, the level each value comes from and whether a restart is
+        pending. Ordered by name; keyset cursor over the name. Parameters that `kingresd` itself needs (`kind`
+        `managed`) or that run commands or name files (`kind` `refused`) are listed read-only with the reason.
+        A value that PostgreSQL hides from an ordinary database user (a superuser-only parameter) is never returned
+        to any role: `hidden` is true and the values are null. A server that could not be read is named in
+        `missingServers` and `partial` is true; its `servers[]` entry has `state` `unknown`.
+      tags: [Configuration]
+      x-required-role: kingres_readonly
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: q
+          in: query
+          description: Case-insensitive substring of the name or the description.
+          schema: { type: string, maxLength: 200 }
+        - name: category
+          in: query
+          description: Return only parameters of this category (PostgreSQL's text, for example `Resource Usage / Memory`; a top-level category such as `Resource Usage` matches its sub-categories).
+          schema: { type: string, maxLength: 200 }
+        - name: changed
+          in: query
+          description: When true, only parameters that have an override at some level.
+          schema: { type: boolean }
+        - name: differing
+          in: query
+          description: When true, only parameters whose effective value differs between servers.
+          schema: { type: boolean }
+        - name: pendingRestart
+          in: query
+          description: When true, only parameters that wait for a restart on at least one server.
+          schema: { type: boolean }
+        - name: state
+          in: query
+          description: Return only parameters that are in this state on at least one server.
+          schema: { $ref: '#/components/schemas/ConfigServerState' }
+        - name: kind
+          in: query
+          description: Return only parameters of this kind.
+          schema: { $ref: '#/components/schemas/ConfigParameterKind' }
+      responses:
+        '200':
+          description: A page of parameters.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigParameterList' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /config/parameters/{name}:
+    parameters:
+      - $ref: '#/components/parameters/ConfigParameterName'
+    get:
+      operationId: getConfigParameter
+      summary: Get one PostgreSQL parameter
+      description: |
+        Added in 0.8.0. The same object as one item of `listConfigParameters`. 404 `config_parameter_unknown` when the running
+        version and its extensions have no such parameter.
+      tags: [Configuration]
+      x-required-role: kingres_readonly
+      responses:
+        '200':
+          description: The parameter.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigParameter' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /config/changes/preview:
+    post:
+      operationId: previewConfigChange
+      summary: Check a configuration change and show what it would do
+      description: |
+        Added in 0.8.0. Runs exactly the checks of `applyConfigChange` (names, levels, managed and refused
+        parameters, cluster-only parameters, type, unit and range from `pg_settings`, PostgreSQL's own check of the
+        value) and reports which servers would change and how, without changing anything. Always 200 for a request
+        that is well formed: `valid` is false and `problems` explain when the change would be refused. `kingres_admin`
+        because it takes the same body as the change.
+      tags: [Configuration]
+      x-required-role: kingres_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConfigChangeRequest' }
+      responses:
+        '200':
+          description: The preview.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigChangePreview' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /config/changes:
+    get:
+      operationId: listConfigChanges
+      summary: List configuration changes
+      description: |
+        Added in 0.8.0. The history of changes made through `applyConfigChange` and `revertConfigChange`, newest first, with the
+        old and the new value and the level. Keyset cursor over `changeId`.
+      tags: [Configuration]
+      x-required-role: kingres_readonly
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: name
+          in: query
+          description: Return only changes of this parameter.
+          schema: { type: string, maxLength: 63 }
+        - name: level
+          in: query
+          description: Return only changes at this level.
+          schema: { $ref: '#/components/schemas/ConfigLevel' }
+        - name: scopeId
+          in: query
+          description: Return only changes of this server group, server or database.
+          schema: { type: string, maxLength: 253 }
+      responses:
+        '200':
+          description: A page of changes.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigChangeList' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+    post:
+      operationId: applyConfigChange
+      summary: Change PostgreSQL parameters
+      description: |
+        Added in 0.8.0. Sets or removes the value of parameters at the cluster, server group, server or database level
+        and starts the task `config.apply`: it checks the request again, records the change, then writes the
+        override file of each server, checks it with PostgreSQL, reloads and reads the effective values back, one step
+        per server. A parameter that needs a restart is reported `pendingRestart` per server; nothing is restarted
+        (see `restartPendingInstances`). A server that is down gets the change when it returns (the step waits and says
+        which). A server that fails does not stop the others: the task ends failed with `config_incomplete`, and the
+        steps and `listConfigServers` say which servers applied, wait for a restart, failed or wait. Refused with 400
+        `validation_failed` (a value that is not valid for its parameter; `errors[]` names the change) and 422
+        `config_parameter_managed`, `config_parameter_refused`, `config_level_not_allowed` and `config_value_below_floor`;
+        404 `not_found` for an unknown server group, server or database; 409 `operation_in_progress` while another
+        configuration task runs. Nothing is written before every change has passed.
+      tags: [Configuration]
+      x-required-role: kingres_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConfigChangeRequest' }
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedTask' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /config/changes/{changeId}/revert:
+    parameters:
+      - $ref: '#/components/parameters/ConfigChangeId'
+    post:
+      operationId: revertConfigChange
+      summary: Revert a configuration change
+      description: |
+        Added in 0.8.0. Makes a new change that puts the value at that change's level and scope back to what it was before
+        (or removes it, when there was none), with the same checks and the same task as `applyConfigChange`. 404 for an
+        unknown change; 409 `config_change_superseded` when a later change touched the same level, scope and
+        parameter (revert the later one first); 400 `validation_failed` when the old value is no longer valid.
+      tags: [Configuration]
+      x-required-role: kingres_admin
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedTask' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /config/servers:
+    get:
+      operationId: listConfigServers
+      summary: Configuration state of every server
+      description: |
+        Added in 0.8.0. Per server: its server group, the configuration revision it holds, its state (`applied`,
+        `pendingRestart`, `failed`, `waiting`), the parameters that wait for a restart, the ones that failed with
+        PostgreSQL's text, and the number of overrides that concern it. Not paginated.
+      tags: [Configuration]
+      x-required-role: kingres_readonly
+      responses:
+        '200':
+          description: The servers.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigServerList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /config/summary:
+    get:
+      operationId: getConfigSummary
+      summary: Configuration numbers for the dashboard
+      description: |
+        Added in 0.8.0. Servers that wait for a restart, parameters that differ between the servers of one server group
+        without a server-level override to explain it, the failed and waiting servers, and the largest clock
+        difference. A number the server cannot know is null, never 0.
+      tags: [Configuration]
+      x-required-role: kingres_readonly
+      responses:
+        '200':
+          description: The summary.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigSummary' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /config/time:
+    get:
+      operationId: getClusterTime
+      summary: Clocks and time zones of the servers
+      description: |
+        Added in 0.8.0. Per server its clock, the difference from the clock of the manager leader, which answers (`referenceServerId`), with the uncertainty of the
+        measurement (half the round trip of the best of five probes plus one millisecond; the difference is
+        exact only if both directions of the network take equally long), the operating system's time zone and
+        PostgreSQL's `TimeZone` and `log_timezone`; and the time zone set for each database. `kingresd` does not
+        set the system clock of a server: that is the job of time synchronization (NTP, chrony). A server that
+        cannot be reached has `reachable` false and null values, never 0.
+      tags: [Configuration]
+      x-required-role: kingres_readonly
+      responses:
+        '200':
+          description: The clocks.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ClusterTime' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /config/time-zones:
+    get:
+      operationId: listTimeZones
+      summary: List the time zones PostgreSQL knows
+      description: Added in 0.8.0. The names of `pg_timezone_names` of the answering server with the current UTC offset. Not paginated.
+      tags: [Configuration]
+      x-required-role: kingres_readonly
+      responses:
+        '200':
+          description: The time zones.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TimeZoneList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /config/restarts:
+    post:
+      operationId: restartPendingInstances
+      summary: Restart the instances that wait for a restart
+      description: |
+        Added in 0.8.0. Starts the task `config.restart`: restarts the instances that wait for a restart because of a
+        configuration change, one server at a time, and stops at the first failure. For the five settings a
+        standby needs at least as high as its primary (`max_connections`, `max_worker_processes`, `max_wal_senders`,
+        `max_prepared_transactions`, `max_locks_per_transaction`) a standby is restarted before its primary when
+        a value goes up and after it when a value goes down. **Restarting a primary is downtime for its shard group**
+        (writes to its buckets fail until it is back; failover does not exist yet), so `acknowledgeDowntime` must be
+        true (400 `validation_failed` otherwise). 409 `nothing_pending` when no instance waits, 409
+        `config_restart_order_conflict` when one pair has a setting going up and another going down, 409
+        `operation_in_progress` while a configuration task runs.
+      tags: [Configuration]
+      x-required-role: kingres_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RestartPendingRequest' }
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedTask' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
   /ledger/status:
     get:
       operationId: listLedgerStatus
@@ -3221,6 +3540,18 @@ components:
       required: true
       description: Instance identifier (the node id of the instance in the cluster catalog).
       schema: { type: integer, format: int32 }
+    ConfigParameterName:
+      name: name
+      in: path
+      required: true
+      description: PostgreSQL parameter name (any letter case; the answer has the canonical spelling).
+      schema: { type: string, minLength: 1, maxLength: 63 }
+    ConfigChangeId:
+      name: changeId
+      in: path
+      required: true
+      description: Configuration change identifier.
+      schema: { type: integer, format: int64 }
     ServerGroupName:
       name: serverGroupName
       in: path
@@ -3512,6 +3843,8 @@ components:
         leader does not hold it; `renewServerCertificates`, `revokeServerCertificates`, `addServer`, `removeServer`,
         `leaveCluster`, `joinCluster`). Clients must tolerate codes they do not know.
 
+        Added in 0.8.0: 404 `config_parameter_unknown` (`getConfigParameter`); 422 `config_parameter_managed` (`kingresd` needs the value), `config_parameter_refused` (runs a command, loads code, names a file or is unsafe), `config_level_not_allowed` (the value must be equal on every server, or PostgreSQL has no database level for it) and `config_value_below_floor` (below what `kingresd` needs); 409 `config_change_superseded` (`revertConfigChange`), `config_restart_order_conflict` and `nothing_pending` (`restartPendingInstances`). A value that is not valid for its parameter is 400 `validation_failed`.
+
         Added in 0.7.0: `workbench_busy` (429: the role already runs its two workbench statements on this server, or
         the server runs four in all; `executeQuery`; with `Retry-After`). `leader_unavailable` (503) is now also
         answered by a follower that has not heard from the manager leader for longer than the leader-loss bound
@@ -3570,6 +3903,14 @@ components:
         - certificate_authority_unavailable
         - internal_api_disabled
         - workbench_busy
+        - config_parameter_unknown
+        - config_parameter_managed
+        - config_parameter_refused
+        - config_level_not_allowed
+        - config_value_below_floor
+        - config_change_superseded
+        - config_restart_order_conflict
+        - nothing_pending
     ValidationIssue:
       type: object
       description: One invalid field of a request.
@@ -3843,6 +4184,12 @@ components:
         version:
           type: string
           description: KingresDB version.
+        commit:
+          type:
+            - string
+            - 'null'
+          pattern: '^[0-9a-f]{7,64}$'
+          description: Added in 0.8.0 (optional; absent from a server of an older revision). The source commit this server was built from, as 7 to 64 lower-case hexadecimal characters; null when the build does not know it. The panel links the source of the running version to it (the licence, AGPL-3.0-only section 13, asks that users of a network service can get the source). A client must check the pattern before it builds a link.
         postgresVersion:
           type: string
           description: Version of the bundled PostgreSQL.
@@ -6218,6 +6565,8 @@ components:
         - certificate.renew
         - certificate.revoke
         - standby.reconcile
+        - config.apply
+        - config.restart
     TaskStep:
       type: object
       description: One step of a task.
@@ -6304,7 +6653,7 @@ components:
       properties:
         type:
           type: string
-          enum: [cluster, server, instance, database, table, rebalance, replication, ledgerVerification, networkAccess]
+          enum: [cluster, server, instance, database, table, rebalance, replication, ledgerVerification, networkAccess, config]
           description: Resource type.
         id:
           type: string
@@ -6796,6 +7145,9 @@ components:
         - standbyInstanceRebuilt
         - synchronousStandbyNamesChanged
         - replicationSlotDropped
+        - applyConfigChange
+        - revertConfigChange
+        - restartPendingInstances
     AuditEvent:
       type: object
       description: One audit log entry.
@@ -6908,6 +7260,17 @@ components:
           $ref: '#/components/schemas/RebalanceSettings'
         features:
           $ref: '#/components/schemas/FeatureFlags'
+        clock:
+          type: object
+          description: Added in 0.8.0 (optional; absent from a server of an older revision). The clocks of the servers.
+          required: [maxDifferenceMs]
+          properties:
+            maxDifferenceMs:
+              type: integer
+              minimum: 10
+              maximum: 600000
+              default: 1000
+              description: A server whose clock differs from the manager leader's by more than this (less the uncertainty of the measurement) raises the alert `clockDifference` (`warning`; `critical` at ten times it).
         restart:
           type: object
           description: Pending restart caused by enabling a feature.
@@ -6963,6 +7326,16 @@ components:
               description: Maximum automatic failovers.
         rebalance:
           $ref: '#/components/schemas/RebalanceSettings'
+        clock:
+          type: object
+          description: Added in 0.8.0. Clock settings.
+          minProperties: 1
+          properties:
+            maxDifferenceMs:
+              type: integer
+              minimum: 10
+              maximum: 600000
+              description: New threshold of the alert `clockDifference`.
         features:
           type: object
           description: Features to turn on. `false` is rejected for a feature that is already on.
@@ -6974,6 +7347,534 @@ components:
             ledger:
               type: boolean
               description: Turn the ledger extension on.
+
+    # ------------------------------------------------------------------ configuration (0.8.0)
+    ConfigLevel:
+      type: string
+      description: |
+        Where a value is set. `cluster`: every server. `serverGroup`: the servers of one server group (rack or zone;
+        not a shard group). `server`: one server. `database`: `ALTER DATABASE ... SET` on every server. A narrower
+        level overrides a wider one; the database level applies to sessions of that database.
+      enum: [cluster, serverGroup, server, database]
+    ConfigServerState:
+      type: string
+      description: |
+        `applied`: the server runs the wanted value. `pendingRestart`: the file holds the wanted value and the
+        running instance still has the old one. `failed`: PostgreSQL did not take the value (see `error`).
+        `waiting`: the server could not be reached or its instance is not running; it gets the change when it
+        returns. `unknown`: the server could not be read for this answer.
+      enum: [applied, pendingRestart, failed, waiting, unknown]
+    ConfigParameterKind:
+      type: string
+      description: |
+        `settable`: may be set at the levels in `allowedLevels`. `managed`: `kingresd` needs its value (ports,
+        listen addresses, TLS files, preloaded libraries, replication settings, ...); shown read-only. `refused`: runs
+        a command, loads code or names a file as the operating system user of the database (`archive_command`,
+        `ssl_passphrase_command`, `*_preload_libraries`, ...), or is unsafe for the cluster; the console never sets it,
+        its administrator does on the server.
+      enum: [settable, managed, refused]
+    ConfigValueSource:
+      type: string
+      description: |
+        Where the effective value on a server comes from: `default` (PostgreSQL's), `initdb` (written by `initdb` into
+        `postgresql.conf`), `derived` (chosen by `kingresd` from the server's memory quota or connection count),
+        `cluster`, `serverGroup`, `server` (an override of that level), `managed` (written by `kingresd`), `other`
+        (the command line, the environment or `postgresql.conf`, not explained by an override). Clients must
+        tolerate other values.
+      enum: [default, initdb, derived, cluster, serverGroup, server, managed, other]
+    ConfigOverride:
+      type: object
+      description: A value set at one level.
+      required: [level, scopeId, value, revision, updatedBy, updatedAt]
+      properties:
+        level: { $ref: '#/components/schemas/ConfigLevel' }
+        scopeId:
+          type: [string, 'null']
+          description: The server group, server id or database name; null for the cluster.
+        value:
+          type: string
+          description: The value as stored, in the form PostgreSQL accepts.
+        revision:
+          type: integer
+          format: int64
+          description: The configuration revision that wrote it.
+        updatedBy:
+          type: string
+          description: The role that made the change.
+        updatedAt:
+          type: string
+          format: date-time
+          description: When it was made.
+    ConfigServerValue:
+      type: object
+      description: One parameter on one server.
+      required: [serverId, value, source, level, state, pendingValue, error]
+      properties:
+        serverId: { $ref: '#/components/schemas/ServerId' }
+        value:
+          type: [string, 'null']
+          description: The effective value now, as PostgreSQL shows it (`pg_settings.setting` with its unit); null when unknown or hidden.
+        source: { $ref: '#/components/schemas/ConfigValueSource' }
+        level:
+          oneOf:
+            - $ref: '#/components/schemas/ConfigLevel'
+            - type: 'null'
+          description: The level of the override that is meant to give this value; null when none does.
+        state: { $ref: '#/components/schemas/ConfigServerState' }
+        pendingValue:
+          type: [string, 'null']
+          description: The value that waits for a restart (`state` `pendingRestart`); null otherwise.
+        error:
+          type: [string, 'null']
+          description: 'PostgreSQL''s text when `state` is `failed`; null otherwise. Server-supplied text: show it as text.'
+    ConfigParameter:
+      type: object
+      description: |
+        A PostgreSQL parameter with its metadata from `pg_settings`, the overrides stored for it and its value on
+        every server. All text comes from PostgreSQL or from an extension and must be shown as text.
+      required: [name, category, description, type, unit, min, max, enumValues, context, restartRequired, defaultValue, kind, reason, hidden, allowedLevels, clusterOnly, overrides, servers, differs, differsInGroup]
+      properties:
+        name:
+          type: string
+          description: Canonical name (PostgreSQL's spelling, for example `TimeZone`, `work_mem`, `kingres_shard.node_timeout`).
+        category:
+          type: string
+          description: PostgreSQL's category, for example `Resource Usage / Memory`.
+        description:
+          type: string
+          description: PostgreSQL's short description.
+        type:
+          type: string
+          enum: [bool, integer, real, string, enum]
+          description: PostgreSQL's `vartype`.
+        unit:
+          type: [string, 'null']
+          description: The unit of the number as `pg_settings.unit` gives it (`kB`, `8kB`, `ms`, `s`, `min`, `B`); null when none.
+        min:
+          type: [string, 'null']
+          description: Smallest value in the unit; null when there is none.
+        max:
+          type: [string, 'null']
+          description: Largest value in the unit; null when there is none.
+        enumValues:
+          type: [array, 'null']
+          description: The values of an enum parameter; null for other types.
+          items: { type: string }
+        context:
+          type: string
+          enum: [internal, postmaster, sighup, superuser-backend, backend, superuser, user]
+          description: When a change takes effect (PostgreSQL's `context`).
+        restartRequired:
+          type: boolean
+          description: 'True for `context` `postmaster`: a change waits for a restart.'
+        defaultValue:
+          type: [string, 'null']
+          description: PostgreSQL's built-in default (`boot_val`), null when hidden.
+        kind: { $ref: '#/components/schemas/ConfigParameterKind' }
+        reason:
+          type: [string, 'null']
+          description: Why a `managed` or `refused` parameter is not settable; null for `settable`.
+        hidden:
+          type: boolean
+          description: True when PostgreSQL hides the value from an ordinary database user. No role is ever shown such a value.
+        allowedLevels:
+          type: array
+          description: The levels a value may be set at; empty for `managed` and `refused`.
+          items: { $ref: '#/components/schemas/ConfigLevel' }
+        clusterOnly:
+          type: [string, 'null']
+          description: Why the value must be equal on every server (it can be set at cluster and database level only); null otherwise.
+        overrides:
+          type: array
+          description: The values set for this parameter, at every level.
+          items: { $ref: '#/components/schemas/ConfigOverride' }
+        servers:
+          type: array
+          description: The parameter on every server.
+          items: { $ref: '#/components/schemas/ConfigServerValue' }
+        differs:
+          type: boolean
+          description: The effective value differs between servers.
+        differsInGroup:
+          type: boolean
+          description: The effective value differs between servers of one server group although no server-level override explains it.
+    ConfigParameterList:
+      type: object
+      description: A page of parameters.
+      required: [items, nextCursor, revision]
+      properties:
+        items:
+          type: array
+          description: Parameters ordered by name.
+          items: { $ref: '#/components/schemas/ConfigParameter' }
+        nextCursor:
+          type: [string, 'null']
+          description: Cursor of the next page; null on the last page.
+        revision:
+          type: integer
+          format: int64
+          description: The configuration revision (grows with every accepted change; 0 before the first).
+        partial:
+          type: boolean
+          description: True when a server could not be read.
+        missingServers:
+          type: array
+          description: The servers that could not be read.
+          items: { $ref: '#/components/schemas/MissingServer' }
+    ConfigChangeItem:
+      type: object
+      description: One value to set or remove.
+      required: [name, level, value]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 63
+          description: The parameter, in any letter case.
+        level: { $ref: '#/components/schemas/ConfigLevel' }
+        scopeId:
+          type: [string, 'null']
+          maxLength: 253
+          description: The server group, server id or database name; absent or null for `cluster`, required for the other levels.
+        value:
+          type: [string, 'null']
+          maxLength: 4096
+          description: The new value, as PostgreSQL's text form (`64MB`, `on`, `Asia/Tehran`). null removes the value at this level.
+    ConfigChangeRequest:
+      type: object
+      description: One or more changes applied together as one revision.
+      required: [changes]
+      additionalProperties: false
+      properties:
+        changes:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items: { $ref: '#/components/schemas/ConfigChangeItem' }
+    ConfigProblem:
+      type: object
+      description: Why one change of a request is not valid.
+      required: [index, pointer, code, message]
+      properties:
+        index:
+          type: integer
+          minimum: 0
+          description: Position in `changes`.
+        pointer:
+          type: string
+          description: JSON pointer into the request, for example `/changes/0/value`.
+        code:
+          type: string
+          description: |
+            `config_parameter_unknown`, `config_parameter_managed`, `config_parameter_refused`, `config_level_not_allowed`,
+            `config_value_invalid`, `config_value_below_floor`, `not_found` (the scope). Clients must tolerate other values.
+        message:
+          type: string
+          description: A sentence, with PostgreSQL's own text for an invalid value.
+    ConfigEffect:
+      type: object
+      description: What a change does to one parameter on one server.
+      required: [serverId, name, before, after, takesEffect]
+      properties:
+        serverId: { $ref: '#/components/schemas/ServerId' }
+        name:
+          type: string
+          description: The parameter.
+        before:
+          type: [string, 'null']
+          description: The effective value now; null when not known.
+        after:
+          type: [string, 'null']
+          description: The effective value the change gives; null when it falls back to a value that is not known here.
+        takesEffect:
+          type: string
+          enum: [unchanged, reload, restart, waits]
+          description: '`unchanged`: no difference on this server. `reload`: takes effect at the reload. `restart`: waits for a restart of the instance. `waits`: the server cannot be reached now and gets the change when it returns.'
+    ConfigRestartStep:
+      type: object
+      description: One instance in the order a restart would follow.
+      required: [serverId, instanceId, role]
+      properties:
+        serverId: { $ref: '#/components/schemas/ServerId' }
+        instanceId:
+          type: integer
+          format: int32
+          description: The instance on its server (the node id).
+        role:
+          type: string
+          enum: [primary, standby]
+          description: Whether the instance is the primary of its shard group or a standby.
+    ConfigChangePreview:
+      type: object
+      description: The result of `previewConfigChange`.
+      required: [valid, problems, effects, restartServerIds, restartOrder, restartOrderConflict]
+      properties:
+        valid:
+          type: boolean
+          description: True when `applyConfigChange` would accept the request.
+        problems:
+          type: array
+          items: { $ref: '#/components/schemas/ConfigProblem' }
+        effects:
+          type: array
+          description: One entry per server and parameter that the change touches.
+          items: { $ref: '#/components/schemas/ConfigEffect' }
+        restartServerIds:
+          type: array
+          description: The servers where at least one parameter would wait for a restart.
+          items: { $ref: '#/components/schemas/ServerId' }
+        restartOrder:
+          type: array
+          description: The order `restartPendingInstances` would restart the instances in, standbys before their primary when a value goes up.
+          items: { $ref: '#/components/schemas/ConfigRestartStep' }
+        restartOrderConflict:
+          type: [string, 'null']
+          description: When no safe order exists (one pair has a value going up and another going down), what to do; null otherwise.
+    ConfigChange:
+      type: object
+      description: One recorded change of a value.
+      required: [changeId, revision, name, level, scopeId, oldValue, newValue, changedBy, changedAt, taskId, reverts, revertible, taskState]
+      properties:
+        changeId:
+          type: integer
+          format: int64
+          description: Identifier.
+        revision:
+          type: integer
+          format: int64
+          description: The configuration revision.
+        name:
+          type: string
+          description: The parameter.
+        level: { $ref: '#/components/schemas/ConfigLevel' }
+        scopeId:
+          type: [string, 'null']
+          description: The server group, server id or database name; null for the cluster.
+        oldValue:
+          type: [string, 'null']
+          description: The value at this level before; null when there was none.
+        newValue:
+          type: [string, 'null']
+          description: The value at this level after; null when it was removed.
+        changedBy:
+          type: string
+          description: The role that made the change.
+        changedAt:
+          type: string
+          format: date-time
+          description: When.
+        taskId:
+          type: [integer, 'null']
+          format: int64
+          description: The `config.apply` task.
+        reverts:
+          type: [integer, 'null']
+          format: int64
+          description: The change this one reverts.
+        revertible:
+          type: boolean
+          description: True when `revertConfigChange` would accept it (it is the latest change of its level, scope and parameter).
+        taskState:
+          type: [string, 'null']
+          description: State of the task (`running`, `done`, `failed`); null when the task is gone.
+    ConfigChangeList:
+      type: object
+      description: A page of changes.
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          description: Newest first.
+          items: { $ref: '#/components/schemas/ConfigChange' }
+        nextCursor:
+          type: [string, 'null']
+          description: Cursor of the next page; null on the last page.
+    ConfigServerFailure:
+      type: object
+      description: A parameter that failed on a server.
+      required: [name, error]
+      properties:
+        name:
+          type: string
+          description: The parameter.
+        error:
+          type: string
+          description: PostgreSQL's text.
+    ConfigServerStatus:
+      type: object
+      description: The configuration state of one server.
+      required: [serverId, serverGroup, appliedRevision, state, pendingRestart, failed, overrideCount, detail]
+      properties:
+        serverId: { $ref: '#/components/schemas/ServerId' }
+        serverGroup:
+          type: [string, 'null']
+          description: The server group; null when none.
+        appliedRevision:
+          type: integer
+          format: int64
+          description: The revision the server's override file holds.
+        state: { $ref: '#/components/schemas/ConfigServerState' }
+        pendingRestart:
+          type: array
+          description: Parameters that wait for a restart.
+          items: { type: string }
+        failed:
+          type: array
+          items: { $ref: '#/components/schemas/ConfigServerFailure' }
+        overrideCount:
+          type: integer
+          minimum: 0
+          description: Overrides that apply to this server (cluster, its server group, itself).
+        detail:
+          type: [string, 'null']
+          description: A sentence for `waiting`, for example that the instance is not running; null otherwise.
+    ConfigServerList:
+      type: object
+      description: The servers' configuration state.
+      required: [items, revision]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/ConfigServerStatus' }
+        revision:
+          type: integer
+          format: int64
+          description: The configuration revision.
+    ConfigSummary:
+      type: object
+      description: The numbers of the dashboard card.
+      required: [revision, serversPendingRestart, differingInGroup, failedServerIds, waitingServerIds, largestClockDifference, maxDifferenceMs]
+      properties:
+        revision:
+          type: integer
+          format: int64
+          description: The configuration revision.
+        serversPendingRestart:
+          type: array
+          description: Servers with a parameter that waits for a restart.
+          items: { $ref: '#/components/schemas/ServerId' }
+        differingInGroup:
+          type: array
+          description: Names of parameters that differ inside a server group without a server-level override (at most 50).
+          items: { type: string }
+        failedServerIds:
+          type: array
+          items: { $ref: '#/components/schemas/ServerId' }
+        waitingServerIds:
+          type: array
+          items: { $ref: '#/components/schemas/ServerId' }
+        largestClockDifference:
+          type: object
+          description: The server whose clock differs most from the manager leader's, by the absolute value of the difference. Both members are null when no other server could be measured.
+          required: [serverId, differenceMs]
+          properties:
+            serverId:
+              oneOf:
+                - $ref: '#/components/schemas/ServerId'
+                - type: 'null'
+            differenceMs:
+              type: [number, 'null']
+              description: Milliseconds, signed (positive means that server is ahead).
+        maxDifferenceMs:
+          type: integer
+          description: The cluster's threshold (`ClusterSettings.clock.maxDifferenceMs`).
+    ServerTime:
+      type: object
+      description: The clock and the time zones of one server.
+      required: [serverId, reachable, clock, differenceMs, uncertaintyMs, roundTripMs, osTimeZone, timeZone, logTimeZone]
+      properties:
+        serverId: { $ref: '#/components/schemas/ServerId' }
+        reachable:
+          type: boolean
+          description: False when the server did not answer; its measured values are null.
+        clock:
+          type: [string, 'null']
+          format: date-time
+          description: The server's clock when it answered (UTC, millisecond resolution).
+        differenceMs:
+          type: [number, 'null']
+          description: Its clock minus the reference server's (the manager leader's), in milliseconds (positive means ahead); 0 for the reference server.
+        uncertaintyMs:
+          type: [number, 'null']
+          description: The measurement is within this many milliseconds of the real difference.
+        roundTripMs:
+          type: [number, 'null']
+          description: Round trip of the best probe, from the monotonic clock.
+        osTimeZone:
+          type: [string, 'null']
+          description: The operating system's time zone (name), null when it cannot be read.
+        timeZone:
+          type: [string, 'null']
+          description: PostgreSQL's `TimeZone` on this server.
+        logTimeZone:
+          type: [string, 'null']
+          description: PostgreSQL's `log_timezone` on this server.
+    DatabaseTimeZone:
+      type: object
+      description: The time zone set for one database.
+      required: [name, timeZone]
+      properties:
+        name:
+          type: string
+          description: The database.
+        timeZone:
+          type: [string, 'null']
+          description: The value of `ALTER DATABASE ... SET TimeZone`; null when the database follows the cluster.
+    ClusterTime:
+      type: object
+      description: Clocks and time zones.
+      required: [measuredAt, referenceServerId, maxDifferenceMs, servers, databases]
+      properties:
+        measuredAt:
+          type: string
+          format: date-time
+          description: When the probes ran.
+        referenceServerId: { $ref: '#/components/schemas/ServerId' }
+        maxDifferenceMs:
+          type: integer
+          description: The cluster's threshold.
+        servers:
+          type: array
+          items: { $ref: '#/components/schemas/ServerTime' }
+        databases:
+          type: array
+          items: { $ref: '#/components/schemas/DatabaseTimeZone' }
+    TimeZoneInfo:
+      type: object
+      description: A time zone name PostgreSQL accepts.
+      required: [name, utcOffset, isDaylightSaving]
+      properties:
+        name:
+          type: string
+          description: The name, for example `Asia/Tehran`.
+        utcOffset:
+          type: string
+          description: 'Current offset from UTC as `+HH:MM` or `-HH:MM`.'
+        isDaylightSaving:
+          type: boolean
+          description: Whether daylight saving time is in effect now.
+    TimeZoneList:
+      type: object
+      description: The time zones.
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/TimeZoneInfo' }
+    RestartPendingRequest:
+      type: object
+      description: Restart the instances that wait for a restart.
+      required: [acknowledgeDowntime]
+      additionalProperties: false
+      properties:
+        acknowledgeDowntime:
+          type: boolean
+          description: Must be true. A primary that restarts is downtime for its shard group, and failover does not exist yet.
+        serverIds:
+          type: array
+          description: Restart only the instances of these servers; default every server that waits.
+          items: { $ref: '#/components/schemas/ServerId' }
 
     # ------------------------------------------------------------------ ledger
     Sha256Hex:
@@ -7671,7 +8572,7 @@ components:
     AlertKind:
       type: string
       description: |
-        Alert type. Clients must tolerate kinds they do not know. Added in 0.7.0: `leaseLost` (the `kingresd` that
+        Alert type. Clients must tolerate kinds they do not know. Added in 0.8.0: `clockDifference` (a server's clock differs from the manager leader's by more than `ClusterSettings.clock.maxDifferenceMs`, less the uncertainty of the measurement; `warning`, `critical` at ten times the threshold; `kingresd` does not set the system clock, run NTP or chrony). Added in 0.7.0: `leaseLost` (the `kingresd` that
         runs the primary of a shard group could not renew the group's lease in time; for a group with a standby the
         instance was stopped (fenced), for a group without one it keeps running and this alert is the only effect;
         `critical`), `groupWithoutSynchronousStandby` (the group's standby has been unreachable for longer than the
@@ -7705,6 +8606,7 @@ components:
         - leaseLost
         - groupWithoutSynchronousStandby
         - groupUnderReplicated
+        - clockDifference
     Alert:
       type: object
       description: An alert.
@@ -7770,7 +8672,7 @@ components:
         `databaseName`. `replicationPending`: `serverId` is the manager leader that keeps the change waiting and
         `behindServerId` the server that is behind (the one the panel must name). `leaseLost`,
         `groupWithoutSynchronousStandby`, `groupUnderReplicated`: `shardGroupId`, and `serverId` the server that
-        runs the group's primary. `versionMismatch`: all null.
+        runs the group's primary. `clockDifference` (0.8.0): `serverId` is the server whose clock differs. `versionMismatch`: all null.
       required: [serverId, behindServerId, shardGroupId, databaseName, aspect]
       properties:
         serverId:

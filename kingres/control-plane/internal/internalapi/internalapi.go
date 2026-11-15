@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package internalapi is the server-to-server API of kingresd (design
 // control-plane-3.md, D2), specified in kingres/control-plane/internal-api.md.
@@ -130,6 +130,14 @@ var Calls = map[string]Policy{
 	"POST /standby/remove":  LeaderOnly,
 	"POST /standby/rebuild": LeaderOnly,
 	"GET /standby/status":   LeaderOnly,
+
+	// Configuration from the console (phase 13): the leader reads and sets the parameters of every
+	// server; any server answers the clock probe.
+	"POST /config/state":   LeaderOnly,
+	"POST /config/apply":   LeaderOnly,
+	"POST /config/check":   LeaderOnly,
+	"POST /config/restart": LeaderOnly,
+	"GET /time":            AnyPeer,
 }
 
 // handled lists the calls dispatched to Backend.Handle (the rest have their
@@ -143,6 +151,7 @@ var handled = map[string]bool{
 	"POST /pki/renew": true, "GET /pki/csr": true,
 	"POST /heartbeat": true, "POST /lease/grant": true, "GET /lease/state": true, "POST /standby/plan": true,
 	"POST /standby/create": true, "POST /standby/remove": true, "POST /standby/rebuild": true, "GET /standby/status": true,
+	"POST /config/state": true, "POST /config/apply": true, "POST /config/check": true, "POST /config/restart": true, "GET /time": true,
 }
 
 // CallError is an error with the status and code the internal API answers.
