@@ -692,7 +692,12 @@ $$;
 -- PostgreSQL 19 has no sync_error_count in pg_stat_subscription_stats, and the body
 -- of a SQL function is checked when the function is created, so the check is left out
 -- for this one function (kingres_shard--0.3--0.4.sql replaces it with a body that works on
--- both majors).  What is created is the same on every major.
+-- both majors).  What is created is the same on every major.  The setting of the
+-- session is put back after the function (review finding S6-07): RESET would have
+-- replaced it by the default for good, and SET LOCAL alone would leave the checks off
+-- for the rest of the transaction, which can run further scripts.
+SELECT pg_catalog.set_config('kingres_shard_script.saved_check_function_bodies',
+                             pg_catalog.current_setting('check_function_bodies'), true);
 SET LOCAL check_function_bodies = off;
 
 -- On the target: how far the copy is.
@@ -713,7 +718,8 @@ SELECT COALESCE(
        FROM pg_catalog.pg_subscription s WHERE s.subname OPERATOR(pg_catalog.=) p_name),
     pg_catalog.jsonb_build_object('missing', true));
 $$;
-RESET check_function_bodies;
+SELECT pg_catalog.set_config('check_function_bodies',
+                             pg_catalog.current_setting('kingres_shard_script.saved_check_function_bodies'), true);
 
 -- On the source: the lag of the slot behind the WAL, in bytes, or NULL.
 CREATE FUNCTION kingres.internal_move_slot_lag(p_name text)

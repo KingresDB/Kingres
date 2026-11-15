@@ -13,9 +13,30 @@
 --
 \echo Use "CREATE EXTENSION kingres_shard" to load this file. \quit
 
--- The schema is created here, not by CREATE EXTENSION, so that it is a member
--- of the extension and disappears with it.  Every object is qualified.
-CREATE SCHEMA kingres;
+-- Every object is qualified.  The schema may exist already (another KingresDB
+-- extension made it); see below for whose it is.  Not CREATE SCHEMA IF NOT EXISTS:
+-- PostgreSQL refuses that in a script when the schema exists and is not a member of
+-- the extension.
+DO $ks$ BEGIN IF pg_catalog.to_regnamespace('kingres') IS NULL THEN CREATE SCHEMA kingres; END IF; END $ks$;
+-- The schema "kingres" is shared with the other KingresDB extensions, which ask for it
+-- with "schema = kingres" in their control files, and any of them may be created
+-- first.  So it belongs to none of them: whoever made it, it is not a member of this
+-- extension, and DROP EXTENSION kingres_shard neither drops it nor fails because other
+-- extensions keep objects in it (it stays, empty if this was the last user).  An
+-- earlier version made it a member; the update takes it out.
+DO $ks$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
+                WHERE d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_namespace'::pg_catalog.regclass
+                  AND d.objid OPERATOR(pg_catalog.=) 'kingres'::pg_catalog.regnamespace
+                  AND d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_extension'::pg_catalog.regclass
+                  AND d.refobjid OPERATOR(pg_catalog.=) (SELECT e.oid FROM pg_catalog.pg_extension e WHERE e.extname OPERATOR(pg_catalog.=) 'kingres_shard')
+                  AND d.deptype OPERATOR(pg_catalog.=) 'e') THEN
+        ALTER EXTENSION kingres_shard DROP SCHEMA kingres;
+    END IF;
+END
+$ks$;
+
 
 -- ---------------------------------------------------------------------------
 -- Catalog tables
@@ -3764,6 +3785,18 @@ REVOKE ALL ON FUNCTION
     kingres.standby_status()
     FROM PUBLIC;
 
+-- The version of the extension that a node reports, asked over a session that claims
+-- nothing: a node that runs another version of the library does not accept the claim of
+-- a node's own session (review finding S6-06).  NULL when it cannot be asked, '' when
+-- the extension is not installed there.  Superusers only.
+CREATE FUNCTION kingres.internal_remote_extension_version(p_host text, p_port int)
+    RETURNS text
+    AS 'MODULE_PATHNAME', 'kingres_internal_remote_extension_version'
+    LANGUAGE C
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+REVOKE ALL ON FUNCTION kingres.internal_remote_extension_version(text, int) FROM PUBLIC;
+
 -- internal_check_node_versions(): asks for 0.5.
 CREATE OR REPLACE FUNCTION kingres.internal_check_node_versions()
     RETURNS void
@@ -3782,8 +3815,14 @@ BEGIN
             v := kingres.internal_exec_scalar(n.node_id,
                 'SELECT COALESCE((SELECT e.extversion FROM pg_catalog.pg_extension e WHERE e.extname OPERATOR(pg_catalog.=) ''kingres_shard''), '''')', 20000);
         EXCEPTION WHEN OTHERS THEN
-            RAISE EXCEPTION 'node % (%:%) cannot be asked for its kingres_shard version: %', n.node_id, n.host, n.port, SQLERRM
-                USING ERRCODE = 'object_not_in_prerequisite_state';
+            -- The node may be reachable and refuse the claim of the session of this node (it runs
+            -- another version of the library): ask for the version without a claim, so that the
+            -- error names both versions (review finding S6-06).
+            v := kingres.internal_remote_extension_version(n.host, n.port);
+            IF v IS NULL THEN
+                RAISE EXCEPTION 'node % (%:%) cannot be asked for its kingres_shard version: %', n.node_id, n.host, n.port, SQLERRM
+                    USING ERRCODE = 'object_not_in_prerequisite_state';
+            END IF;
         END;
         IF v IS DISTINCT FROM '0.5' THEN
             RAISE EXCEPTION 'node % (%:%) has kingres_shard %, a bucket move needs 0.5 on every node',
@@ -3860,6 +3899,7 @@ DECLARE
     v_major  pg_catalog.int4;
     v_ext    pg_catalog.text;
     v_skip   pg_catalog.int4[] := '{}'::pg_catalog.int4[];	-- nodes that could not be asked, or that run another version
+    v_theirs pg_catalog.text;
     n        pg_catalog.record;
     st       pg_catalog.jsonb;
     x        pg_catalog.record;
@@ -3956,8 +3996,21 @@ BEGIN
         BEGIN
             st := kingres.internal_exec_scalar(n.node_id, 'SELECT kingres.internal_local_state()::pg_catalog.text', 20000)::pg_catalog.jsonb;
         EXCEPTION WHEN OTHERS THEN
-            check_name := 'node_unreachable'; node_id := n.node_id;
-            object := pg_catalog.format('%s:%s', n.host, n.port); detail := SQLERRM;
+            -- A node that runs another version of the library refuses the claim of the session of
+            -- this node to come from a node of the cluster, and that looks like a lost connection.
+            -- Ask for its version over a session that claims nothing, and say the versions
+            -- (review finding S6-06).
+            v_theirs := kingres.internal_remote_extension_version(n.host, n.port);
+            IF v_theirs IS NOT NULL AND v_theirs IS DISTINCT FROM v_ext THEN
+                check_name := 'extension_version_differs'; node_id := n.node_id;
+                object := pg_catalog.format('%s:%s', n.host, n.port);
+                detail := pg_catalog.format('the node runs %s, this node runs kingres_shard %s; the node did not accept the session of this node, nothing else is compared with it, and run ALTER EXTENSION kingres_shard UPDATE where the version is older',
+                                            CASE WHEN v_theirs OPERATOR(pg_catalog.=) '' THEN 'no kingres_shard'
+                                                 ELSE 'kingres_shard ' OPERATOR(pg_catalog.||) v_theirs END, v_ext);
+            ELSE
+                check_name := 'node_unreachable'; node_id := n.node_id;
+                object := pg_catalog.format('%s:%s', n.host, n.port); detail := SQLERRM;
+            END IF;
             RETURN NEXT;
             v_skip := pg_catalog.array_append(v_skip, n.node_id);
             CONTINUE;
@@ -3969,8 +4022,9 @@ BEGIN
         IF (st ->> 'ext_version') IS DISTINCT FROM v_ext THEN
             check_name := 'extension_version_differs'; node_id := n.node_id;
             object := pg_catalog.format('%s:%s', n.host, n.port);
-            detail := pg_catalog.format('the node runs kingres_shard %s, this node %s; nothing else is compared with it, and run ALTER EXTENSION kingres_shard UPDATE where the version is older',
-                                        COALESCE(st ->> 'ext_version', 'an older version'), v_ext);
+            detail := pg_catalog.format('the node runs %s, this node runs kingres_shard %s; nothing else is compared with it, and run ALTER EXTENSION kingres_shard UPDATE where the version is older',
+                                        COALESCE('kingres_shard ' OPERATOR(pg_catalog.||) (st ->> 'ext_version'),
+                                                 'a kingres_shard that does not report its version'), v_ext);
             RETURN NEXT;
             v_skip := pg_catalog.array_append(v_skip, n.node_id);
             CONTINUE;

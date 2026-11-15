@@ -21,6 +21,10 @@
  * stops the commit of the switch and not the commit of the earlier steps of the
  * same move, which are two-phase transactions too.
  *
+ *	  peer_major:value:<n>	not a point either: the major version that a connection
+ *							to another node reports (kingres_shard_peer_major), see
+ *							kingres_shard_get_conn.
+ *
  * Points of a bucket move (bucket_move.c and the move_* functions of the
  * install script) are named move_<what>; the setting of the session that runs
  * a move is copied to every control session it opens, so a point inside a
@@ -116,7 +120,24 @@ kingres_shard_server_major(void)
 
 	if (fault_spec != NULL && strncmp(fault_spec, prefix, strlen(prefix)) == 0)
 		return atoi(fault_spec + strlen(prefix));
-	return PG_MAJORVERSION_NUM;
+	return KS_SERVER_MAJOR;
+}
+
+/*
+ * The major version that the node at the other end of a connection reports, as
+ * the check that keeps one major in a cluster sees it (kingres_shard_get_conn):
+ * the real one, unless the setting peer_major:value:<n> says otherwise, so that
+ * a test can have a node of "another major" with servers of one, or make the
+ * nodes of two real majors look alike to build a cluster by hand.
+ */
+int
+kingres_shard_peer_major(int actual)
+{
+	const char *prefix = "peer_major:value:";
+
+	if (fault_spec != NULL && strncmp(fault_spec, prefix, strlen(prefix)) == 0)
+		return atoi(fault_spec + strlen(prefix));
+	return actual;
 }
 
 /*

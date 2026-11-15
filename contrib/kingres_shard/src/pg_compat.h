@@ -60,6 +60,15 @@
  */
 
 /*
+ * KS_SERVER_MAJOR
+ *		The major version of PostgreSQL this library was built for (18, 19, ...),
+ *		the number that the checks which keep one major in a cluster compare
+ *		(fault.c, node_conn.c).  Defined here so that no other file looks at the
+ *		version macros.
+ */
+#define KS_SERVER_MAJOR (PG_VERSION_NUM / 10000)
+
+/*
  * KS_TABLE_BEGINSCAN
  *		Start a heap scan with the default options.  PostgreSQL 19 gives
  *		table_beginscan() a "flags" argument (a bitmask of ScanOptions).

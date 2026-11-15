@@ -106,6 +106,7 @@ typedef struct DsFrag
 	bool		declared;
 	bool		exhausted;
 	bool		in_flight;		/* a FETCH was sent and not yet read */
+	bool		failed;			/* the answer was read where no error may be raised: raise it when the batch is needed */
 	PGresult   *res;			/* the batch being consumed */
 	int			nrows;
 	int			next_row;
@@ -152,7 +153,7 @@ static TupleTableSlot *ds_exec_scan(CustomScanState *node);
 static void ds_end_scan(CustomScanState *node);
 static void ds_rescan(CustomScanState *node);
 static void ds_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es);
-static void ds_finish_pending(void *owner);
+static void ds_finish_pending(void *owner, bool quiet);
 static void ds_stop(KsDistScanState *s, bool close_cursors);
 
 static const CustomPathMethods ds_path_methods = {
@@ -743,19 +744,28 @@ ds_reset_callback(void *arg)
 	KsDistScanState *s = (KsDistScanState *) arg;
 	ListCell   *lc;
 
-	/*
-	 * PostgreSQL 19 wraps every libpq result in an object that the memory
-	 * context frees itself, in a reset callback registered after this one, so
-	 * the results are gone already (see pg_compat.h).
-	 */
-	if (KS_LIBPQ_RESULTS_OWNED_BY_CONTEXT)
-		return;
-
 	foreach(lc, s->frags)
 	{
 		DsFrag	   *f = (DsFrag *) lfirst(lc);
 
-		if (f->res != NULL)
+		/*
+		 * A connection must not keep pointing at a scan whose memory goes now
+		 * (S6-02): whatever way the statement ended, an error, the abort of a
+		 * subtransaction, a portal that is dropped.  What the scan had asked
+		 * for is read and dropped.
+		 */
+		if (f->kc != NULL && f->in_flight)
+		{
+			kingres_shard_conn_abandon_pending(f->kc, f);
+			f->in_flight = false;
+		}
+
+		/*
+		 * PostgreSQL 19 wraps every libpq result in an object that the memory
+		 * context frees itself, in a reset callback registered after this one,
+		 * so the results are gone already (see pg_compat.h).
+		 */
+		if (!KS_LIBPQ_RESULTS_OWNED_BY_CONTEXT && f->res != NULL)
 			PQclear(f->res);
 		f->res = NULL;
 	}
@@ -860,16 +870,19 @@ fragment_params(KsDistScanState *s, Oid **types_out, int *n_out)
 	return values;
 }
 
-/* Read the answer of the FETCH that is in flight. */
+/*
+ * Read the answer of the FETCH that is in flight.  With quiet (an abort path
+ * asks, and nothing may be thrown) a failure is kept in the fragment and
+ * raised when the scan asks for the batch (frag_check_failed).
+ */
 static void
-frag_collect(DsFrag *f)
+frag_collect(DsFrag *f, bool quiet)
 {
 	PGresult   *res;
 	MemoryContext oldcxt;
 
 	if (!f->in_flight)
 		return;
-	kingres_shard_conn_clear_pending(f->kc, f);
 
 	/*
 	 * The batch outlives this call, and the call can come from another
@@ -877,22 +890,45 @@ frag_collect(DsFrag *f)
 	 * memory context that statement is in.  PostgreSQL 19 ties a libpq result
 	 * to the context it is made in (see pg_compat.h), so make it in the one of
 	 * the query, which lives as long as the scan does.
+	 *
+	 * The scan stays registered on the connection until the answer is read: if
+	 * the wait is interrupted, the abort paths find the owner and let go of it
+	 * (S6-02).
 	 */
 	oldcxt = MemoryContextSwitchTo(f->scan->css.ss.ps.state->es_query_cxt);
-	res = libpqsrv_get_result_last(f->kc->conn, PG_WAIT_EXTENSION);
+	if (quiet)
+		res = kingres_shard_conn_collect_quiet(f->kc);
+	else
+	{
+		res = libpqsrv_get_result_last(f->kc->conn, PG_WAIT_EXTENSION);
+		kingres_shard_conn_clear_pending(f->kc, f);
+	}
 	MemoryContextSwitchTo(oldcxt);
 	f->kc->in_query = false;
 	f->in_flight = false;
 	if (res == NULL)
 	{
 		f->kc->have_error = true;
+		if (quiet)
+		{
+			f->failed = true;
+			return;
+		}
 		ereport(ERROR,
 				(errcode(ERRCODE_CONNECTION_FAILURE),
 				 errmsg("lost the connection to node %s:%d during a distributed scan",
 						f->host, f->port)));
 	}
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		if (quiet)
+		{
+			f->res = res;
+			f->failed = true;
+			return;
+		}
 		kingres_shard_report_error(f->kc, res, "FETCH");
+	}
 	f->res = res;
 	f->nrows = PQntuples(res);
 	f->next_row = 0;
@@ -900,13 +936,33 @@ frag_collect(DsFrag *f)
 		f->exhausted = true;
 }
 
+/* Raise what a quiet read of the answer found (see frag_collect). */
+static void
+frag_check_failed(DsFrag *f)
+{
+	PGresult   *res;
+
+	if (!f->failed)
+		return;
+	f->failed = false;
+	res = f->res;
+	f->res = NULL;
+	f->nrows = f->next_row = 0;
+	if (res == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("lost the connection to node %s:%d during a distributed scan",
+						f->host, f->port)));
+	kingres_shard_report_error(f->kc, res, "FETCH");
+}
+
 /* Called when something else wants the connection while a FETCH is in flight. */
 static void
-ds_finish_pending(void *owner)
+ds_finish_pending(void *owner, bool quiet)
 {
 	DsFrag	   *f = (DsFrag *) owner;
 
-	frag_collect(f);
+	frag_collect(f, quiet);
 }
 
 static void
@@ -916,6 +972,8 @@ frag_send_fetch(DsFrag *f)
 
 	snprintf(sql, sizeof(sql), "FETCH FORWARD %d FROM %s", kingres_shard_scan_fetch_size,
 			 f->cursor);
+	/* Another scan of this statement may have a fetch in flight on the same connection. */
+	kingres_shard_conn_quiesce(f->kc);
 	f->kc->in_query = true;
 	if (!PQsendQuery(f->kc->conn, sql))
 	{
@@ -1045,8 +1103,8 @@ ds_start(KsDistScanState *s)
 			PGresult   *res;
 			bool		same;
 
-			kingres_shard_conn_clear_pending(f->kc, f);
 			res = libpqsrv_get_result_last(f->kc->conn, PG_WAIT_EXTENSION);
+			kingres_shard_conn_clear_pending(f->kc, f);
 			f->kc->in_query = false;
 			f->in_flight = false;
 			if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK)
@@ -1099,8 +1157,8 @@ ds_start(KsDistScanState *s)
 		PGresult   *res;
 
 		/* The answer to DECLARE (not a batch). */
-		kingres_shard_conn_clear_pending(f->kc, f);
 		res = libpqsrv_get_result_last(f->kc->conn, PG_WAIT_EXTENSION);
+		kingres_shard_conn_clear_pending(f->kc, f);
 		f->kc->in_query = false;
 		f->in_flight = false;
 		if (res == NULL || PQresultStatus(res) != PGRES_COMMAND_OK)
@@ -1190,12 +1248,15 @@ frag_drain(DsFrag *f)
 
 	PG_TRY();
 	{
-		frag_collect(f);
+		frag_collect(f, false);
 	}
 	PG_CATCH();
 	{
 		MemoryContextSwitchTo(oldcxt);
 		FlushErrorState();
+		/* An interrupt in the wait leaves the query in flight: read it and let go. */
+		if (f->in_flight)
+			kingres_shard_conn_abandon_pending(f->kc, f);
 		f->in_flight = false;
 	}
 	PG_END_TRY();
@@ -1216,6 +1277,12 @@ ds_stop(KsDistScanState *s, bool close_cursors)
 			/* Let the batch that was asked for arrive: cancelling would abort the remote transaction. */
 			frag_drain(f);
 		}
+		else if (f->in_flight && f->kc != NULL)
+		{
+			kingres_shard_conn_abandon_pending(f->kc, f);
+			f->in_flight = false;
+		}
+		f->failed = false;
 		if (f->res != NULL)
 			PQclear(f->res);
 		f->res = NULL;
@@ -1255,6 +1322,10 @@ ds_next_remote(KsDistScanState *s, TupleTableSlot *slot)
 		int			i;
 		bool		any_pending = false;
 		DsFrag	   *f = NULL;
+
+		/* An answer that was read in an abort path and was an error (S6-02). */
+		for (i = 0; i < nfrags; i++)
+			frag_check_failed((DsFrag *) list_nth(s->frags, i));
 
 		/* A batch with rows left. */
 		for (i = 0; i < nfrags; i++)
@@ -1359,7 +1430,7 @@ ds_next_remote(KsDistScanState *s, TupleTableSlot *slot)
 
 			if (c->in_flight)
 			{
-				frag_collect(c);
+				frag_collect(c, false);
 				break;
 			}
 		}

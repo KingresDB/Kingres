@@ -57,8 +57,16 @@ extern void kingres_shard_lock_all_reference_tables(void);
 
 extern bool kingres_shard_in_fanout_local(const char *query_string);
 
-/* A statement planned inside a reference-table write that runs as one copy of it (foreign key actions). */
-extern bool kingres_shard_in_refwrite_nested(const char *query_string);
+/*
+ * Refuse a write that other nodes take part in when the session's
+ * session_replication_role is not "origin" (S6-04): the setting turns off
+ * triggers, foreign key actions among them, and it is not sent to the other
+ * nodes, so the origin would skip what the others do.
+ */
+extern void kingres_shard_refuse_replica_role(const char *what);
+
+/* A statement that a trigger of a foreign key plans: it runs on this node's rows only (S6-01). */
+extern bool kingres_shard_in_ri_action(Query *parse);
 
 /* Take the writer lock of a reference table on this node (until the end of the transaction). */
 extern void kingres_shard_lock_reference_table(const char *qualified_name);

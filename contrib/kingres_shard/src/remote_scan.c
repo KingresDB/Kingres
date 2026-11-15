@@ -45,6 +45,7 @@
 #include "catalog/pg_type_d.h"
 #include "commands/explain.h"
 #include "commands/explain_format.h"
+#include "commands/trigger.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "executor/tuptable.h"
@@ -64,6 +65,7 @@
 #include "catalog.h"
 #include "kingres_shard.h"
 #include "node_admin.h"
+#include "fanout.h"
 #include "node_conn.h"
 #include "remote_scan.h"
 
@@ -336,6 +338,8 @@ ks_begin_scan(CustomScanState *node, EState *estate, int eflags)
 		ereport(ERROR,
 				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
 				 errmsg("cannot execute a write statement in a read-only transaction")));
+	if (s->is_write)
+		kingres_shard_refuse_replica_role("a distributed table");
 
 	tupdesc = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
 	s->ncols = tupdesc->natts;

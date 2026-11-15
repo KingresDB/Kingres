@@ -26,6 +26,14 @@
 #define KS_GID_LEN 160
 
 /*
+ * What the owner of an asynchronous fetch does when something else wants the
+ * connection (quiet false: read the answer, keep it, raise an error if the
+ * answer is one) or when an abort needs it (quiet true: the same, but nothing
+ * may be thrown; an error is kept for the owner).
+ */
+typedef void (*KsPendingFinish) (void *owner, bool quiet);
+
+/*
  * A cached connection to one node, used by one local user.  The pointer is
  * stable for the life of the backend (entries are never removed from the
  * cache, only reconnected).
@@ -50,7 +58,7 @@ typedef struct KsConn
 	char		gid[KS_GID_LEN];
 	/* an asynchronous fetch of one scan is in flight on conn */
 	void	   *pending_owner;
-	void		(*pending_finish) (void *owner);
+	KsPendingFinish pending_finish;
 } KsConn;
 
 extern void kingres_shard_conn_init(void);
@@ -83,9 +91,13 @@ extern void kingres_shard_begin_write_xact(KsConn *kc);
 
 /* An asynchronous fetch of one scan is in flight on kc. */
 extern void kingres_shard_conn_set_pending(KsConn *kc, void *owner,
-											void (*finish) (void *owner));
+											KsPendingFinish finish);
 extern void kingres_shard_conn_clear_pending(KsConn *kc, void *owner);
 extern void kingres_shard_conn_quiesce(KsConn *kc);
+extern void kingres_shard_conn_quiesce_quiet(KsConn *kc);
+extern void kingres_shard_conn_abandon_pending(KsConn *kc, void *owner);
+extern PGresult *kingres_shard_conn_collect_quiet(KsConn *kc);
+extern void kingres_shard_conn_drop_inflight(KsConn *kc);
 
 /* The node id of the registered node at host:port, or 0. */
 extern int	kingres_shard_conn_node_id(const char *host, int port);
@@ -99,6 +111,9 @@ extern int	kingres_shard_conn_node_id(const char *host, int port);
  */
 extern PGresult *kingres_shard_bounded_exec(PGconn *conn, const char *sql, bool interruptible);
 
+/* The kingres_shard version host:port reports, asked without a claim (NULL: cannot be asked, "": none). */
+extern char *kingres_shard_remote_extension_version(const char *host, int port);
+
 /* The id add_node() is about to give the node at host:port (see forward_auth.c). */
 extern void kingres_shard_conn_expect_node(const char *host, int port, int node_id);
 
@@ -110,6 +125,7 @@ extern void kingres_shard_fault_point(const char *point);
 extern void kingres_shard_cancel_with_deadline(PGconn *conn);
 extern const char *kingres_shard_fault_spec(void);
 extern int	kingres_shard_server_major(void);
+extern int	kingres_shard_peer_major(int actual);
 extern void kingres_shard_fault_set_scope(const char *scope);
 
 /*

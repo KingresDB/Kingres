@@ -85,16 +85,32 @@ like($err, qr/runs PostgreSQL $other_major, this node runs PostgreSQL $major/, '
 is($n1->safe_psql('postgres', q{SELECT count(*) FROM kingres.node}), '1', 'the node is not registered');
 
 # Make the cluster of two majors anyway: the node that adds is told it is of the other major.
-($rc, $out, $err) = run_sql($n1, sprintf(
-	"SET kingres_shard.fault_injection = 'server_major:value:%d';\nSELECT kingres.add_node('%s', %d)",
-	$other_major, $n2->host, $n2->port));
+my $believe = sprintf("SET kingres_shard.fault_injection = 'server_major:value:%d';\n", $other_major);
+($rc, $out, $err) = run_sql($n1, sprintf("%sSELECT kingres.add_node('%s', %d)", $believe, $n2->host, $n2->port));
 is($rc, 0, 'a cluster of two majors can be made by hand (the check is told otherwise)') or diag $err;
-$n1->safe_psql('postgres', q{
+# The tables are made by a session that is told that its neighbours run its own major, because a
+# statement that needs the node of the other major is refused otherwise (S6-09, below).
+my $peer = sprintf("SET kingres_shard.fault_injection = 'peer_major:value:%d';
+", $major);
+($rc, $out, $err) = run_sql($n1, $peer . q{
 	CREATE TABLE public.t (id int PRIMARY KEY, v int);
 	SELECT kingres.create_distributed_table('public.t', 'id', bucket_count => 4);
-});
-$n1->safe_psql('postgres', join('', map { "INSERT INTO public.t VALUES ($_, $_);
-" } 1 .. 40));
+	CREATE TABLE public.r (id int PRIMARY KEY);
+	SELECT kingres.create_reference_table('public.r');
+} . join('', map { "INSERT INTO public.t VALUES ($_, $_);\n" } 1 .. 40));
+is($rc, 0, 'the tables of the cluster of two majors are made by a session that is told the same of its neighbours') or diag $err;
+
+# S6-09: a statement that needs the node of the other major is refused, with both majors named.
+for my $case ([ 'a write to a reference table, which every node takes part in', q{INSERT INTO public.r VALUES (1)} ],
+	[ 'a scan of a distributed table that has buckets on the other node', q{SELECT count(*) FROM public.t} ])
+{
+	($rc, $out, $err) = run_sql($n1, "\\set VERBOSITY verbose\n$case->[1]");
+	isnt($rc, 0, "S6-09: $case->[0], is refused");
+	like($err, qr/55000/, 'S6-09: with object_not_in_prerequisite_state');
+	like($err, qr/runs PostgreSQL $other_major, this node runs PostgreSQL $major/, 'S6-09: and the two majors named');
+	like($err, qr/HINT:  Upgrade every node/, 'S6-09: and what to do');
+}
+is($n1->safe_psql('postgres', q{SELECT count(*) FROM public.r}), '0', 'S6-09: nothing was written');
 
 # check_cluster() names the node of the other major.
 is($n1->safe_psql('postgres', q{
@@ -120,6 +136,7 @@ for my $dir ([ 0, 1 ], [ 1, 0 ])
 		'active', 'the bucket is still active');
 	is($n1->safe_psql('postgres', 'SELECT count(*) FROM kingres.bucket_move'), '0', 'no move was recorded');
 }
-is($n1->safe_psql('postgres', 'SELECT count(*) FROM public.t'), '40', 'the rows are all there');
+($rc, $out, $err) = run_sql($n1, $peer . 'SELECT count(*) FROM public.t');
+is($out, '40', 'the rows are all there (read by a session that is told the same of its neighbours)');
 
 done_testing();
