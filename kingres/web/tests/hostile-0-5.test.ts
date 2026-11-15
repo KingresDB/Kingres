@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // The hostile seed (`?mock=hostile`) over the places that 0.5.0 added: the partial-answer notice (server

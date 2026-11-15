@@ -8,7 +8,7 @@
 -- format and the limits are in the README.
 --
 -- Portions Copyright (c) 2026, RooyeKhat Media Co
--- SPDX-License-Identifier: PostgreSQL
+-- SPDX-License-Identifier: AGPL-3.0-only
 --
 -- Schema: the control file sets "schema = kingres_sketch" and "relocatable =
 -- false", so every object below is created in that schema and the extension

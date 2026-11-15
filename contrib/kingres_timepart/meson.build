@@ -1,5 +1,5 @@
 # Portions Copyright (c) 2026, RooyeKhat Media Co
-# SPDX-License-Identifier: PostgreSQL
+# SPDX-License-Identifier: AGPL-3.0-only
 
 # No C code: the extension is SQL and PL/pgSQL only.
 

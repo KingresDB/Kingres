@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package auth implements authentication and authorization: the cluster role
 // hierarchy, the server-side session store, CSRF tokens, the login rate

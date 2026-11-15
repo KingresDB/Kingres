@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Command gen writes internal/contract/operations_gen.go from the OpenAPI
 // contract. Run it with "go generate ./internal/contract".

@@ -4,7 +4,7 @@
  *	  Canonical row encoding and row hash of the ledger.
  *
  * Portions Copyright (c) 2026, RooyeKhat Media Co
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only
  *
  * IDENTIFICATION
  *	  contrib/kingres_ledger/src/row_hash.h

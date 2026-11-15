@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package config parses the configuration of kingresd from, in increasing
 // order of precedence: built-in defaults, an optional JSON config file,

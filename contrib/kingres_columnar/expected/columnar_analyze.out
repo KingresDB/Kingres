@@ -1,5 +1,5 @@
 -- Portions Copyright (c) 2026, RooyeKhat Media Co
--- SPDX-License-Identifier: PostgreSQL
+-- SPDX-License-Identifier: AGPL-3.0-only
 --
 -- columnar_analyze: ANALYZE samples a table of several stripes by block.  The
 -- statistics are compared with the exact values and with the heap table of

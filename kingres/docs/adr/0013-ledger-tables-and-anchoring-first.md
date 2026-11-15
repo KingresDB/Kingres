@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # ADR 0013: Ledger tables and external anchoring first; consensus only with a consortium use case
 
 - Status: Accepted

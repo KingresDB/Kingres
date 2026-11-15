@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package sdnotify implements the part of the systemd notification protocol
 // that kingresd needs (READY=1, STOPPING=1) with the standard library only.

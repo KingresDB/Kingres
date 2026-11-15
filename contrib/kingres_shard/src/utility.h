@@ -3,7 +3,7 @@
  * utility.h
  *	  The ProcessUtility hook of the kingres_shard extension.
  *
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only
  * Portions Copyright (c) 2026, RooyeKhat Media Co
  *
  * IDENTIFICATION

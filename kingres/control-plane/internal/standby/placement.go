@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package standby creates, maintains and removes the standbys of the shard
 // groups (design ha-phase5.md, part A): placement by the chained ring rule,

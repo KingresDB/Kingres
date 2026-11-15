@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # Independent security and correctness review: kingres_ledger 0.1
 
 Date: 2026-11-14. Reviewer: independent reviewer (not the author).

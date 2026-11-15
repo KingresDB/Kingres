@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Portions Copyright (c) 2026, RooyeKhat Media Co -->
 # kingres_sketch
 
@@ -34,7 +34,7 @@ implementation:
   t-digests", arXiv:1902.04023, 2019.
 
 The source of no other implementation of these algorithms was read or copied.
-Licence: PostgreSQL License.
+Licence: GNU Affero General Public License, version 3 (AGPL-3.0-only).
 
 ## Installing
 

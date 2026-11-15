@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package fwdproof proves, to the server that runs a forwarded or gathered
 // operation, that the forwarding server really holds a session of the user it

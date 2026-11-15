@@ -9,7 +9,7 @@
 -- are the ones this test is for; the others carry their own search_path.
 --
 -- Portions Copyright (c) 2026, RooyeKhat Media Co
--- SPDX-License-Identifier: PostgreSQL
+-- SPDX-License-Identifier: AGPL-3.0-only
 
 SET timezone = 'UTC';
 SET datestyle = ISO;

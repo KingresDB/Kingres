@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package cli implements the kingres-verify command line on top of the
 // library packages. Run is the only entry point; it never calls os.Exit.

@@ -1,5 +1,5 @@
 -- Portions Copyright (c) 2026, RooyeKhat Media Co
--- SPDX-License-Identifier: PostgreSQL
+-- SPDX-License-Identifier: AGPL-3.0-only
 --
 -- columnar_refusals: what a columnar table does not do, with the SQLSTATE and
 -- the message, and the statements that look like writes but touch no row.

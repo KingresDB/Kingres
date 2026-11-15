@@ -1,4 +1,4 @@
--- SPDX-License-Identifier: PostgreSQL
+-- SPDX-License-Identifier: AGPL-3.0-only
 -- kingres_cp 5: the lease epoch of a task (fencing token).
 -- Applied inside one transaction by internal/sysdb; do not add BEGIN/COMMIT.
 

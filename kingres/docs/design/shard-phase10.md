@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # kingres_shard and kingresd: design of phase 10 (splitting buckets, background rebalancing with strategies, draining a server)
 
 Status: Proposed design, 2026-11-15; not implemented.

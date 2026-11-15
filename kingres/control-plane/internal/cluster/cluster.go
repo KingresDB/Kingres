@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package cluster implements the cluster-level operations that need the
 // instance manager and the task engine: creating a one-server cluster

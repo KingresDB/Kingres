@@ -11,7 +11,7 @@
  * the default hash operator class of the distribution column type, the same
  * one a partition key uses.
  *
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only
  * Portions Copyright (c) 2026, RooyeKhat Media Co
  *
  * IDENTIFICATION

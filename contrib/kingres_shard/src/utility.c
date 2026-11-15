@@ -52,7 +52,7 @@
  * named by the statement; the event trigger kingres.forget_dropped_tables() is
  * the backstop for those.
  *
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only
  * Portions Copyright (c) 2026, RooyeKhat Media Co
  *
  * IDENTIFICATION

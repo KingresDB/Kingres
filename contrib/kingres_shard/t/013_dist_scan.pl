@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PostgreSQL
+# SPDX-License-Identifier: AGPL-3.0-only
 # Portions Copyright (c) 2026, RooyeKhat Media Co
 #
 # The distributed scan (design/shard-phase2a.md, section 5) and the main

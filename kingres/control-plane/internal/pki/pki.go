@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package pki is the certificate authority of a cluster (design
 // control-plane-3.md, D1). The CA signs only server certificates of its own

@@ -4,7 +4,7 @@
  *	  Authentication of the sessions that one node of the cluster opens on
  *	  another (review finding S2-04).
  *
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only
  * Portions Copyright (c) 2026, RooyeKhat Media Co
  *
  * IDENTIFICATION

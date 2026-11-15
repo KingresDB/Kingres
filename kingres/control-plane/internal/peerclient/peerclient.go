@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package peerclient is the client side of the internal API: it calls another
 // server of the cluster over TLS 1.3 with this server's certificate as the

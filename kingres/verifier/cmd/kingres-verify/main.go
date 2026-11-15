@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Command kingres-verify checks the digests and inclusion proofs of the
 // KingresDB tamper-evident ledger without trusting the database. See

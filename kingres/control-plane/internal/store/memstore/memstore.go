@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package memstore is an in-memory store.Store for tests. It is seeded by
 // assigning its exported fields and applies the same filtering, ordering and

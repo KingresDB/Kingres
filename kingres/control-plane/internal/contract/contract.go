@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package contract exposes the operation table of the REST API contract
 // (kingres/api/openapi.yaml): which operations exist, their paths, the

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package spec loads the OpenAPI 3.1 contract (kingres/api/openapi.yaml) and
 // extracts what the server needs from it: the list of operations with their

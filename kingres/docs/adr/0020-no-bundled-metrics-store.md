@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # ADR 0020: No bundled metrics store; kingresd samples and exports metrics itself
 
 - Status: Accepted

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PostgreSQL
+# SPDX-License-Identifier: AGPL-3.0-only
 # Portions Copyright (c) 2026, RooyeKhat Media Co
 #
 # Transactions that an application keeps open while a bucket moves (the cases the

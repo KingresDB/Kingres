@@ -5,7 +5,7 @@
 -- described in kingres/docs/design/ledger-mvp.md.
 --
 -- Portions Copyright (c) 2026, RooyeKhat Media Co
--- SPDX-License-Identifier: PostgreSQL
+-- SPDX-License-Identifier: AGPL-3.0-only
 --
 -- Schema: the control file sets "schema = kingres" and "relocatable =
 -- false".  CREATE EXTENSION then creates the schema when it does not exist

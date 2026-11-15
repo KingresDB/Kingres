@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package leader tells which server is the manager leader: the server that
 // holds the primary of shard group 0, read from the catalog (design

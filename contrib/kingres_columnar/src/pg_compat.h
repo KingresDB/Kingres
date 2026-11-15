@@ -17,7 +17,7 @@
  *	 - 19 makes the VacuumParams argument of relation_vacuum const.
  *
  * Portions Copyright (c) 2026, RooyeKhat Media Co
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only
  *
  * IDENTIFICATION
  *	  contrib/kingres_columnar/src/pg_compat.h

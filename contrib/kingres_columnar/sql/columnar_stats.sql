@@ -1,5 +1,5 @@
 -- Portions Copyright (c) 2026, RooyeKhat Media Co
--- SPDX-License-Identifier: PostgreSQL
+-- SPDX-License-Identifier: AGPL-3.0-only
 --
 -- columnar_stats: the minimum, maximum and null count kept for each chunk
 -- group and stripe, the rules under which they are kept, and what

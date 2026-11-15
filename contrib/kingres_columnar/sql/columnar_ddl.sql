@@ -1,5 +1,5 @@
 -- Portions Copyright (c) 2026, RooyeKhat Media Co
--- SPDX-License-Identifier: PostgreSQL
+-- SPDX-License-Identifier: AGPL-3.0-only
 --
 -- columnar_ddl: ALTER TABLE on columnar tables (columns added and dropped on
 -- old stripes, rewrites, access method changes, tablespaces), VACUUM FULL,

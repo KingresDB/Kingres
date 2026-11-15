@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # Adversarial review: contrib/kingres_shard 0.3 (moving buckets, rebalance plan, cluster check)
 
 Reviewer: independent (not the author). Reviewed state: commit 1d4b815f2d

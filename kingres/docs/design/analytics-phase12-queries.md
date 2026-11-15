@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # KingresDB: design of phase 12, part 1 (repartitioned joins, MERGE on distributed tables, approximate aggregates)
 
 Status: Proposed design, 2026-11-15; not implemented.
@@ -155,7 +155,7 @@ Not in scope:
 | Which join types? | Key-routed sides: every join type with a hash-compatible equality in the join condition. Broadcast sides: inner joins and joins where the broadcast side is not preserved. The existing rules of 2b section 9 for reference tables are the rules for replicated inputs. |
 | How is it chosen? | By cost, among the other paths of the same planner run, inside the bounds `repartition_max_bytes` per group. A statement that does not qualify keeps the 2a plan. `EXPLAIN` names the path and the reason it was not used. |
 | `MERGE` | Five proven shapes (colocated, routed source, reference target, broadcast source to a reference target, local target with a fenced source); every other shape stays refused with a message that names the missing condition. |
-| Approximate aggregates | One new extension `kingres_sketch` (C, PostgreSQL License) with types `hll`, `topn`, `tdigest`, written from the papers. No code of `postgresql-topn` (AGPL-3.0) is read or used. `postgresql-hll` (Apache-2.0) and `tdigest` (PostgreSQL License) are not bundled either, for reasons of format control and one version per cluster, not of licence (section 9.1). |
+| Approximate aggregates | One new extension `kingres_sketch` (C, under the licence of KingresDB) with types `hll`, `topn`, `tdigest`, written from the papers. No code of `postgresql-topn` (AGPL-3.0) is read or used. `postgresql-hll` (Apache-2.0) and `tdigest` (PostgreSQL License) are not bundled either, for reasons of format control and one version per cluster, not of licence (section 9.1). |
 | Pushdown of sketches | The partial aggregation of 2b section 7, with its rule "built-in aggregates only" widened to "built-in, or a member of an extension on a fixed list at a version the other nodes also run". |
 | Who enables them | `kingres_admin`, per database, from the web console: a task that installs `kingres_sketch` on every server, verifies that the versions and the hash agree, and records the setting. |
 | Rollups | `INSERT ... SELECT` that is colocated (2b P6, widened to allow `DO UPDATE` for a whole-statement push) or `MERGE` with a routed source. |
@@ -1059,7 +1059,7 @@ down needs the partial-aggregation machinery of 2b section 7 and the widening of
 
 | Component | Licence (source) | Decision | Reason |
 |---|---|---|---|
-| HyperLogLog, `postgresql-hll` | Apache-2.0 (<https://github.com/citusdata/postgresql-hll>, `LICENSE`) | **Not bundled; written new** from Flajolet et al. 2007, Heule et al. 2013 and Ertl 2017 | Apache-2.0 is permissive and compatible with shipping inside a PostgreSQL-License product, but its files would carry another licence and a notice obligation inside a tree where every file has `SPDX-License-Identifier: PostgreSQL`; more important, the pushdown needs the three types in one extension with one version that the control plane can compare across servers and one format-version byte. The upstream is a separate extension with its own versions and storage format. |
+| HyperLogLog, `postgresql-hll` | Apache-2.0 (<https://github.com/citusdata/postgresql-hll>, `LICENSE`) | **Not bundled; written new** from Flajolet et al. 2007, Heule et al. 2013 and Ertl 2017 | Apache-2.0 is permissive and compatible with shipping inside a PostgreSQL-License product, but its files would carry another licence and a notice obligation inside a tree where every file has `SPDX-License-Identifier: AGPL-3.0-only`; more important, the pushdown needs the three types in one extension with one version that the control plane can compare across servers and one format-version byte. The upstream is a separate extension with its own versions and storage format. |
 | Top-n, `postgresql-topn` | **AGPL-3.0** (<https://github.com/citusdata/postgresql-topn>, `LICENSE`) | **Written from scratch** from Metwally et al. 2005 and Agarwal et al. 2012. The source of `postgresql-topn` is not read | AGPL code must not be used or copied (ADR 0004). Only its published purpose (a frequent-items sketch with a union aggregate) is known from its page. |
 | t-digest, `tdigest` | PostgreSQL License (<https://github.com/tvondra/tdigest>, `LICENSE`) | **Not bundled; written new** from Dunning and Ertl 2019 | The licence would allow copying with its notice. Not copied because its development branch is 2.0.0-dev (the page says so) with a changing state format, and for the same reason as hll: one extension, one version, one format header, one serialization policy and one validation policy for untrusted bytes. Its published SQL names are not reused (9.2 uses a schema). |
 
@@ -1078,7 +1078,7 @@ review before a public release, as ADR 0004 asks for the trademark question.
   '$libdir/kingres_sketch'`, `relocatable = false`, `schema = kingres_sketch`),
   `kingres_sketch--1.0.sql`, later `kingres_sketch--1.0--1.1.sql`, `meson.build`,
   `Makefile`, `README.md`, `sql/`, `expected/`, `t/`. Every source file starts
-  with `SPDX-License-Identifier: PostgreSQL` and the RooyeKhat Media Co copyright
+  with `SPDX-License-Identifier: AGPL-3.0-only` and the RooyeKhat Media Co copyright
   line, as the other extensions.
 - It is a plain library of functions: **no `shared_preload_libraries` entry, no
   hook, no background worker, no catalog table**. Installing it needs no restart

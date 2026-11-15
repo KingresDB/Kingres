@@ -39,7 +39,7 @@
  * Items are strings in the database encoding of at most 1024 bytes.
  *
  * Portions Copyright (c) 2026, RooyeKhat Media Co
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only
  *
  * IDENTIFICATION
  *	  contrib/kingres_sketch/src/topn.c

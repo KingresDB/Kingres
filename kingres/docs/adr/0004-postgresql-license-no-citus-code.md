@@ -1,7 +1,7 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # ADR 0004: PostgreSQL License; no Citus code
 
-- Status: Accepted
+- Status: Superseded by [ADR 0024](0024-agpl-for-kingresdb-code.md) in its choice of licence (2026-11-15); its rule that no Citus code is copied stays
 - Date: 2026-11-14
 - Source in architecture.md: "License and trademark"; "The key decision: an extension, not changes to the executor"; Risks table (AGPL in Citus); Open decisions #3
 
@@ -13,7 +13,7 @@ Sourced facts: the PostgreSQL License permits use, modification and distribution
 
 ## Decision
 
-KingresDB's own code is released under the PostgreSQL License, the same licence as upstream. No code from Citus (AGPL-3) is copied; Citus is used only as a source of concepts and published architecture. The same rule applies to other code whose licence is incompatible. New files carry an SPDX identifier (`SPDX-License-Identifier: PostgreSQL`) as described in `kingres/docs/dev/coding-standards.md`.
+KingresDB's own code is released under the PostgreSQL License, the same licence as upstream. No code from Citus (AGPL-3) is copied; Citus is used only as a source of concepts and published architecture. The same rule applies to other code whose licence is incompatible. New files carry an SPDX identifier (`SPDX-License-Identifier: AGPL-3.0-only`) as described in `kingres/docs/dev/coding-standards.md`.
 
 ## Consequences
 

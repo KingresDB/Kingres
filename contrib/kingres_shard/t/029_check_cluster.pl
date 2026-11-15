@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PostgreSQL
+# SPDX-License-Identifier: AGPL-3.0-only
 # Portions Copyright (c) 2026, RooyeKhat Media Co
 #
 # kingres.check_cluster() (design/shard-phase4.md, "Checking a cluster"): a clean

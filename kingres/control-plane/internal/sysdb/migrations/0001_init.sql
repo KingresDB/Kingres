@@ -1,4 +1,4 @@
--- SPDX-License-Identifier: PostgreSQL
+-- SPDX-License-Identifier: AGPL-3.0-only
 -- kingres_cp 1: the state of the control plane (design: control-plane-2.md, D2).
 -- Applied inside one transaction by internal/sysdb; do not add BEGIN/COMMIT.
 

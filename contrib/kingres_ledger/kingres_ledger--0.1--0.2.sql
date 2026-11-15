@@ -11,7 +11,7 @@
 -- and proofs are not touched, and the hash format is unchanged.
 --
 -- Portions Copyright (c) 2026, RooyeKhat Media Co
--- SPDX-License-Identifier: PostgreSQL
+-- SPDX-License-Identifier: AGPL-3.0-only
 --
 -- The extension script runs with the protection hook off for its own
 -- statements, but the event triggers of the extension still run after every

@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # Getting started: build and test KingresDB
 
 This page takes a new machine to a built, tested KingresDB server. Every

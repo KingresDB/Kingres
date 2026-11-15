@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package localsettings implements getThisServerSettings and
 // updateThisServerSettings: the settings that belong to one server (memory

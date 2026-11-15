@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package merkle implements the RFC 6962 Merkle tree hashes and the audit
 // path verification of RFC 9162 section 2.1.3.2 that the ledger format uses.

@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # Third-party dependencies
 
 Policy: `kingres/docs/dev/coding-standards.md`, section 3 (standard library

@@ -35,7 +35,7 @@
  * pg_db_role_setting-like views never hold it; no message of the extension
  * contains it; the comparison does not stop at the first different byte.
  *
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only
  * Portions Copyright (c) 2026, RooyeKhat Media Co
  *
  * IDENTIFICATION

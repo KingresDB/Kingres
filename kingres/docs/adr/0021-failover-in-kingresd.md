@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # ADR 0021: Failover is part of kingresd, with leases; Patroni and etcd are not bundled
 
 - Status: Accepted

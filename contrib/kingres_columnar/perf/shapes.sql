@@ -8,7 +8,7 @@
 -- Variables (psql -v): ts_rows, wide_rows, rtext_rows, rep_rows.
 --
 -- Portions Copyright (c) 2026, RooyeKhat Media Co
--- SPDX-License-Identifier: PostgreSQL
+-- SPDX-License-Identifier: AGPL-3.0-only
 
 \set ON_ERROR_STOP 1
 SELECT setseed(0.42);

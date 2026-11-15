@@ -24,7 +24,7 @@
  * statement for this node only (kingres_shard_in_fanout_local()); a remote
  * node runs it in a forwarded session, where the same holds.
  *
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only
  * Portions Copyright (c) 2026, RooyeKhat Media Co
  *
  * IDENTIFICATION

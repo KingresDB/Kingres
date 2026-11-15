@@ -13,7 +13,7 @@
  * Every definition says which upstream change it follows.  The header is
  * included by kingres_shard.h, after postgres.h, so every file has it.
  *
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only
  * Portions Copyright (c) 2026, RooyeKhat Media Co
  *
  * IDENTIFICATION

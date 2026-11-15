@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package pgframe bounds the size of one protocol message that a PostgreSQL
 // server may send to kingresd. pgx reads a whole message into memory before it

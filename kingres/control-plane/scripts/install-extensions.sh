@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: PostgreSQL
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Builds kingres_shard and kingres_ledger from a COMMIT (not from the working
 # tree, which other engineers change) into the private installation

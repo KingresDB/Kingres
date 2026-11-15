@@ -39,7 +39,7 @@
  *		target from its own kingres_shard.node_conninfo, so that key paths
  *		never leave that node.
  *
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only
  * Portions Copyright (c) 2026, RooyeKhat Media Co
  *
  * IDENTIFICATION

@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # ADR NNNN: Title that states the decision
 
 - Status: Proposed | Accepted | Superseded by ADR NNNN

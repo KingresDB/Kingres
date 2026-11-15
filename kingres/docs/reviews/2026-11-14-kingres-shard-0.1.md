@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # Code review: contrib/kingres_shard (version 0.1)
 
 Independent review against the specification in

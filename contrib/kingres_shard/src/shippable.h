@@ -4,7 +4,7 @@
  *	  Deciding whether an expression or a whole statement can be sent to
  *	  another node and mean the same there.
  *
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only
  * Portions Copyright (c) 2026, RooyeKhat Media Co
  *
  * IDENTIFICATION

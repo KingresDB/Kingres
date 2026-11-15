@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PostgreSQL
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # golangci-lint v2 configuration of the KingresDB control plane
 # (kingres/docs/dev/coding-standards.md, section 3).

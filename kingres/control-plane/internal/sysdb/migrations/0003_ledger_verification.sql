@@ -1,4 +1,4 @@
--- SPDX-License-Identifier: PostgreSQL
+-- SPDX-License-Identifier: AGPL-3.0-only
 -- kingres_cp 3: identifiers of ledger verification records and their tasks
 -- (README, "Inclusion proofs and verification records").
 -- Applied inside one transaction by internal/sysdb; do not add BEGIN/COMMIT.

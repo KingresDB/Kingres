@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: PostgreSQL
+# SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (c) 2026, RooyeKhat Media Co
 #
 # Runs inside WSL2 (user kingres). Starts and stops a private kingresd for the end-to-end test.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package pgconninfo is the one place in kingresd where a libpq key/value
 // connection string is assembled. Every value is quoted and escaped according

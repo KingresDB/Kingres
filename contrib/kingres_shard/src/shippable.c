@@ -23,7 +23,7 @@
  * were fetched, so a refusal costs speed, never correctness.  A statement
  * that fails the test is not shipped at all (the caller refuses it).
  *
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only AND PostgreSQL
  * Portions Copyright (c) 2026, RooyeKhat Media Co
  *
  * IDENTIFICATION
