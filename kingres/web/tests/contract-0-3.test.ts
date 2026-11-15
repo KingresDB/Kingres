@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // Behaviour added by revision 0.3.0 of the contract, and the panel's answers to what the real
@@ -26,7 +26,8 @@ describe('stats-only dashboard uses getClusterSummary', () => {
     expect(within(summary).getByText('prod-eu')).toBeInTheDocument()
     expect(within(summary).getByText('Servers').nextElementSibling).toHaveTextContent('3')
     expect(within(summary).getByText('Databases').nextElementSibling).toHaveTextContent('2')
-    expect(within(summary).getByText('Open alerts').nextElementSibling).toHaveTextContent('1')
+    // One alert of the seed, and clockDifference for the server whose clock is 1.82 s off (0.8.0).
+    expect(within(summary).getByText('Open alerts').nextElementSibling).toHaveTextContent('2')
   })
 
   it('is not used for accounts that can read the full cluster view', async () => {

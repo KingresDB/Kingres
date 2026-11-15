@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // In-memory mock cluster behind the mock API. It is small but consistent: three servers with
@@ -38,6 +38,7 @@ import type {
   ShardGroup,
   ClusterRoleName,
 } from '@/api/types'
+import { createConfigState, type ConfigState } from './config-data'
 
 type S = components['schemas']
 
@@ -102,6 +103,8 @@ export const mockConfig = {
    * (or the server's four) were taken by other sessions.
    */
   workbenchBusy: false,
+  /** 0.8.0: the source commit the server reports in GET /setup/state: a hex id, null (the build does not know it) or text that is not a hex id. */
+  commit: '0123456789abcdef0123456789abcdef01234567' as string | null,
   /**
    * 0.7.0: this server is a follower that has not heard the manager leader for longer than the leader-loss bound:
    * every request that needs a session check answers 503 `leader_unavailable` (with `Retry-After: 5`).
@@ -197,6 +200,14 @@ export interface TaskRec {
   onProgress?: (fraction: number) => void
   /** When set, the task fails with this message instead of applying. */
   failWith?: string
+  /**
+   * The task stops at this fraction (0..1) and stays running with `holdDetail` until `holdAt` is cleared: a step that
+   * waits for a server that cannot be reached (`config.apply`).
+   */
+  holdAt?: number
+  holdDetail?: string
+  /** The task does all its work and then ends failed, naming the step that failed (`config.apply`: a server failed). */
+  failAtEnd?: { code: string; message: string; step: string; detail: string }
   applied: boolean
   /** True for tasks created before the node was initialized (readable with the setup token). */
   setup: boolean
@@ -260,6 +271,8 @@ export interface MockState {
   /** 0.7.0: the id of the next standby the task `standby.reconcile` creates. */
   nextStandbyId: number
   session: SessionRec | null
+  /** 0.8.0: the configuration of the servers (parameters, overrides, history, what each server runs, the clocks). */
+  config: ConfigState
   /** Result sets the workbench can select from, by table name (hostile-data tests). */
   extraQueryTables?: Record<string, { columns: S['QueryColumn'][]; rows: unknown[][] }>
 }
@@ -771,6 +784,7 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
       autoFailover: { enabled: true, timeoutSeconds: 120, maxCount: 1, eventsSinceReset: 0 },
       rebalance: { maxConcurrentMoves: 4 },
       features: { sharding: true, ledger: true },
+      clock: { maxDifferenceMs: 1000 },
       restart: { required: false, serverIds: [] },
     },
     rebalance: {
@@ -959,6 +973,7 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
     statements: new Map(),
     nextStandbyId: 5,
     session: null,
+    config: createConfigState(servers.map((x) => ({ id: x.id, serverGroup: x.serverGroup }))),
   }
 }
 
@@ -1084,7 +1099,7 @@ const sameSubject = (a: Alert, subject: AlertSubjectKey): boolean =>
   (a.subject?.shardGroupId ?? null) === (subject.shardGroupId ?? null)
 
 /** Raises an alert once per kind and subject; an acknowledged alert stays acknowledged. */
-function raise(
+export function raise(
   s: MockState,
   kind: Alert['kind'],
   severity: Alert['severity'],
@@ -1115,7 +1130,7 @@ function raise(
 }
 
 /** Resolves the open alerts of a kind about a subject. Returns how many were resolved. */
-function clear(s: MockState, kind: Alert['kind'], subject: AlertSubjectKey): number {
+export function clear(s: MockState, kind: Alert['kind'], subject: AlertSubjectKey): number {
   let n = 0
   for (const a of s.alerts) {
     if (a.kind === kind && a.state !== 'resolved' && sameSubject(a, subject)) {
@@ -1142,11 +1157,38 @@ function systemAudit(s: MockState, action: AuditEvent['action'], groupId: number
 }
 
 /**
+ * 0.8.0: the alert `clockDifference` for a server whose clock differs from the leader's by more than the cluster
+ * threshold, reduced by the uncertainty of the measurement; critical above ten times the threshold. It clears when the
+ * server is back within the threshold.
+ */
+function clockAlerts(s: MockState): void {
+  const limit = s.settings.clock?.maxDifferenceMs ?? 1000
+  for (const rec of s.servers) {
+    const clock = s.config.clocks[rec.id]
+    if (!clock || rec.id === ANSWERING_SERVER) continue
+    const subject = { serverId: rec.id }
+    const excess = clock.reachable ? Math.abs(clock.offsetMs) - clock.uncertaintyMs : 0
+    if (excess > limit) {
+      const secs = (clock.offsetMs / 1000).toFixed(2)
+      raise(
+        s,
+        'clockDifference',
+        excess > limit * 10 ? 'critical' : 'warning',
+        subject,
+        `Clock of server ${rec.id} differs from the leader`,
+        `The clock of server ${rec.id} is ${clock.offsetMs > 0 ? '+' : ''}${secs} s from the clock of the manager leader. KingresDB does not set the system clock: run time synchronization (NTP or chrony) on the server.`,
+      )
+    } else clear(s, 'clockDifference', subject)
+  }
+}
+
+/**
  * Brings the alerts and the audit log in line with what the heartbeats, leases and standbys say now (what the
  * manager leader does every few seconds). Called before every request of the mock, so it stays cheap.
  */
 export function tickHa(s: MockState): void {
   if (s.node.state !== 'clustered') return
+  clockAlerts(s)
   for (const rec of s.servers) {
     if (rec.id === ANSWERING_SERVER) continue
     const st = effectiveStatus(rec)
@@ -1615,6 +1657,9 @@ export interface TaskInit {
   user?: string
   durationMs?: number
   failWith?: string
+  holdAt?: number
+  holdDetail?: string
+  failAtEnd?: TaskRec['failAtEnd']
   onProgress?: (fraction: number) => void
   setup?: boolean
   cancellable?: boolean
@@ -1656,6 +1701,9 @@ export function createTask(s: MockState, init: TaskInit): Task {
     apply: init.apply,
     onProgress: init.onProgress,
     failWith: init.failWith,
+    holdAt: init.holdAt,
+    holdDetail: init.holdDetail,
+    failAtEnd: init.failAtEnd,
     applied: false,
     setup: init.setup ?? false,
   })
@@ -1669,7 +1717,12 @@ export function tickTasks(s: MockState): void {
   for (const rec of s.tasks) {
     const t = rec.task
     if (t.state !== 'running') continue
-    const fraction = rec.durationMs <= 0 ? 1 : Math.min(1, (now - rec.startedAt) / rec.durationMs)
+    let fraction = rec.durationMs <= 0 ? 1 : Math.min(1, (now - rec.startedAt) / rec.durationMs)
+    // A step that waits for a server holds the whole task, which never gives up (`config.apply`).
+    const held = rec.holdAt !== undefined && fraction >= rec.holdAt
+    if (held) fraction = rec.holdAt as number
+    if (held && rec.holdDetail) t.detail = rec.holdDetail
+    else if (rec.holdDetail && t.detail === rec.holdDetail) t.detail = null
     const stepCount = t.progress.steps.length
     const current = Math.min(stepCount - 1, Math.floor(fraction * stepCount))
     // A failing task stops half way through its work.
@@ -1705,6 +1758,20 @@ export function tickTasks(s: MockState): void {
     if (fraction >= 1 && !rec.applied) {
       rec.applied = true
       rec.apply()
+      if (rec.failAtEnd) {
+        const f = rec.failAtEnd
+        t.state = 'failed'
+        t.error = { code: f.code, message: f.message, step: f.step, retryable: true }
+        t.progress.percent = 100
+        t.progress.currentStep = null
+        t.progress.steps = t.progress.steps.map((st) =>
+          st.name === f.step ? { ...st, state: 'failed' as const, detail: f.detail } : st,
+        )
+        t.cancellable = false
+        t.updatedAt = nowIso()
+        s.mapVersion += 1
+        continue
+      }
       t.state = 'done'
       t.cancellable = false
       s.mapVersion += 1

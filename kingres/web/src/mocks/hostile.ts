@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // Hostile data for the mock: names and messages as a low-privileged database user could make them
@@ -7,6 +7,7 @@
 import type { MissingServer } from '@/api/types'
 import type { MockState } from './state'
 import { mockConfig, nowIso } from './state'
+import { addParameter, type ParamDef } from './config-data'
 
 const cp = (...codes: number[]) => String.fromCodePoint(...codes)
 
@@ -306,6 +307,8 @@ export function seedHostile(s: MockState): void {
     setup: false,
   })
 
+  seedHostileConfig(s)
+
   s.extraQueryTables = {
     hostile: {
       columns: [
@@ -320,5 +323,88 @@ export function seedHostile(s: MockState): void {
         [HOSTILE.newline, HOSTILE.long, 3, HOSTILE.cyrillic],
       ],
     },
+  }
+}
+
+/**
+ * Parameters as a low-privileged database user could make them: a placeholder setting of an extension has a name,
+ * a category and a value that its role chose, and PostgreSQL's error texts quote the value. Names, categories,
+ * descriptions, enum values, values on the servers and at every level, and error texts are all hostile.
+ */
+function seedHostileConfig(s: MockState): void {
+  const cfg = s.config
+  const common = {
+    unit: null,
+    min: null,
+    max: null,
+    enumValues: null,
+    context: 'user' as const,
+    bootBase: HOSTILE.reversed,
+    kind: 'settable' as const,
+    reason: null,
+    hidden: false,
+    allowedLevels: ['cluster', 'serverGroup', 'server', 'database'] as ParamDef['allowedLevels'],
+    clusterOnly: null,
+  }
+  const text: ParamDef = {
+    ...common,
+    name: HOSTILE.markup,
+    category: HOSTILE.reversed,
+    description: HOSTILE.newline,
+    type: 'string',
+  }
+  const mode: ParamDef = {
+    ...common,
+    name: `hostile.${HOSTILE.breakout}`,
+    category: HOSTILE.markup,
+    description: HOSTILE.controls,
+    type: 'enum',
+    enumValues: [HOSTILE.markup, HOSTILE.reversed, HOSTILE.zeroWidth, 'plain'],
+    bootBase: 'plain',
+  }
+  const ids = s.servers.map((x) => x.id)
+  addParameter(cfg, text, {
+    [ids[0] ?? '']: HOSTILE.markup,
+    [ids[1] ?? '']: HOSTILE.long,
+    [ids[2] ?? '']: HOSTILE.cyrillic,
+  })
+  addParameter(cfg, mode, { [ids[1] ?? '']: HOSTILE.reversed })
+  const stamp = (
+    level: 'cluster' | 'serverGroup' | 'server' | 'database',
+    scopeId: string | null,
+    value: string,
+  ) => {
+    cfg.overrides.push({
+      level,
+      scopeId,
+      name: text.name,
+      value,
+      revision: cfg.revision,
+      updatedBy: HOSTILE.reversed,
+      updatedAt: nowIso(),
+    })
+    cfg.changes.push({
+      changeId: cfg.nextChangeId++,
+      revision: cfg.revision,
+      name: text.name,
+      level,
+      scopeId,
+      oldValue: HOSTILE.long,
+      newValue: value,
+      changedBy: HOSTILE.reversed,
+      changedAt: nowIso(),
+      taskId: null,
+      reverts: null,
+    })
+  }
+  stamp('cluster', null, HOSTILE.long)
+  stamp('serverGroup', HOSTILE.markup, HOSTILE.reversed)
+  stamp('database', HOSTILE.reversed, HOSTILE.breakout)
+  // A failure whose text quotes the value that PostgreSQL rejected.
+  const second = cfg.servers[ids[1] ?? '']
+  if (second) {
+    second.failed[text.name] =
+      `invalid value for parameter "${HOSTILE.markup}": "${HOSTILE.reversed}"
+${HOSTILE.long}`
   }
 }

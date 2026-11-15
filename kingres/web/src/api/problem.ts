@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // The one place that turns API errors (RFC 9457 `Problem`) into text for people.
@@ -274,6 +274,56 @@ const entries: Record<ProblemCode, Entry> = {
     heading: 'Internal API switched off on this server',
     message:
       'This server was started without its internal API (no internal listen address), so it cannot take part in a cluster: it cannot add or remove servers, leave the cluster, or renew or revoke certificates. This is a setting of the server, not a missing feature. Nothing was changed. Start kingresd with an internal listen address (the option -internal-listen) and try again.',
+  },
+  config_parameter_unknown: {
+    tone: 'warning',
+    heading: 'Unknown parameter',
+    message: 'The running PostgreSQL version and its extensions have no parameter with this name.',
+  },
+  config_parameter_managed: {
+    tone: 'warning',
+    heading: 'Managed by KingresDB',
+    message:
+      'KingresDB needs the value of this parameter itself (for example the port, the TLS files or the replication settings), so it cannot be changed from the console.',
+    withDetail: true,
+  },
+  config_parameter_refused: {
+    tone: 'warning',
+    heading: 'Not settable from the console',
+    message:
+      'This parameter runs a command, loads code or names a file as the operating system user of the database, or is unsafe for the cluster. The console never sets it; the administrator of the server does, in postgresql.conf.',
+    withDetail: true,
+  },
+  config_level_not_allowed: {
+    tone: 'warning',
+    heading: 'Level not allowed',
+    message:
+      'This parameter cannot be set at this level: it must be equal on every server, or PostgreSQL has no database level for it.',
+    withDetail: true,
+  },
+  config_value_below_floor: {
+    tone: 'warning',
+    heading: 'Value too low',
+    message: 'The value is below what KingresDB itself needs for this parameter.',
+    withDetail: true,
+  },
+  config_change_superseded: {
+    tone: 'warning',
+    heading: 'A later change exists',
+    message:
+      'A later change touched the same parameter at the same level and scope. Revert the later change first.',
+  },
+  config_restart_order_conflict: {
+    tone: 'warning',
+    heading: 'No safe restart order',
+    message:
+      'One pair of instances has a setting that goes up and another pair one that goes down, so no order keeps every standby at or above its primary. Change one direction at a time.',
+    withDetail: true,
+  },
+  nothing_pending: {
+    tone: 'info',
+    heading: 'Nothing waits for a restart',
+    message: 'No instance waits for a restart because of a configuration change.',
   },
   quorum_unavailable: {
     tone: 'danger',

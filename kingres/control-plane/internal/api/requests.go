@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 package api
 
@@ -152,4 +152,8 @@ type ClusterSettingsUpdateRequest struct {
 		Sharding *bool `json:"sharding,omitempty"`
 		Ledger   *bool `json:"ledger,omitempty"`
 	} `json:"features,omitempty"`
+	// Clock is added in contract 0.8.0.
+	Clock *struct {
+		MaxDifferenceMs *int `json:"maxDifferenceMs,omitempty"`
+	} `json:"clock,omitempty"`
 }

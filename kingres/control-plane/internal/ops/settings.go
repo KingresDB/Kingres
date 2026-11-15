@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 package ops
 
@@ -60,6 +60,16 @@ func (o *Ops) UpdateClusterSettings(ctx context.Context, actor string, req api.C
 				errs = append(errs, field("/rebalance/maxConcurrentMoves", "must be 1 to 64", "out_of_range"))
 			}
 			set["rebalance.maxConcurrentMoves"] = *r.MaxConcurrentMoves
+		}
+	}
+	if c := req.Clock; c != nil {
+		if c.MaxDifferenceMs == nil {
+			errs = append(errs, field("/clock", "maxDifferenceMs is required", "required"))
+		} else {
+			if *c.MaxDifferenceMs < 10 || *c.MaxDifferenceMs > 600000 {
+				errs = append(errs, field("/clock/maxDifferenceMs", "must be 10 to 600000", "out_of_range"))
+			}
+			set["clock.maxDifferenceMs"] = *c.MaxDifferenceMs
 		}
 	}
 	var wantShard, wantLedger bool

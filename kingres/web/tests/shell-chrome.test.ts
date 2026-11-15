@@ -8,6 +8,7 @@ import { describe, expect, it } from 'vitest'
 import { screen, within } from '@testing-library/vue'
 import { axe } from 'vitest-axe'
 import { resetMockState } from '@/mocks/http'
+import { mockConfig } from '@/mocks/state'
 import { renderApp } from './helpers'
 
 const webRoot = process.cwd()
@@ -21,6 +22,21 @@ function expectCopyright(): void {
   expect(link).toHaveAttribute('target', '_blank')
   expect(link).toHaveAttribute('rel', 'noopener noreferrer')
   expect(link).toHaveAccessibleName(/opens in a new tab/)
+  // The licence and the source of the running version (AGPL-3.0-only, section 13).
+  expect(footer).toHaveTextContent(/Licensed under AGPL-3.0/)
+  const licence = within(footer).getByRole('link', { name: /AGPL-3.0/ })
+  expect(licence).toHaveAttribute('href', 'https://www.gnu.org/licenses/agpl-3.0.html')
+  expect(licence).toHaveAttribute('rel', 'noopener noreferrer')
+  expect(licence).toHaveAccessibleName(/opens in a new tab/)
+  const source = within(footer).getByRole('link', { name: /source code/i })
+  expect(source).toHaveAttribute('target', '_blank')
+  expect(source).toHaveAttribute('rel', 'noopener noreferrer')
+  expect(source).toHaveAccessibleName(/opens in a new tab/)
+}
+
+async function sourceLink(): Promise<HTMLElement> {
+  const footer = screen.getByRole('contentinfo')
+  return within(footer).getByRole('link', { name: /source code/i })
 }
 
 describe('the copyright line', () => {
@@ -69,5 +85,43 @@ describe('the top bar', () => {
     expect(shell).toContain('background: var(--topbar-bg)')
     // On black the logo uses its colouring for dark backgrounds in both themes.
     expect(shell).toContain('--logo-crown: var(--brand-cream)')
+  })
+})
+
+describe('the link to the source', () => {
+  it('points to the commit the server reports, with its version as text', async () => {
+    await renderApp('/servers')
+    await screen.findByRole('heading', { level: 1, name: 'Servers' })
+    await screen.findByTestId('running-version')
+    expect(screen.getByTestId('running-version')).toHaveTextContent(
+      'KingresDB 0.1.0 on PostgreSQL 18.1',
+    )
+    expect(await sourceLink()).toHaveAttribute(
+      'href',
+      'https://github.com/KingresDB/Kingres/tree/0123456789abcdef0123456789abcdef01234567',
+    )
+  })
+
+  it('points to the repository when the server reports no commit', async () => {
+    mockConfig.commit = null
+    await renderApp('/login', { user: null })
+    await screen.findByRole('heading', { name: /sign in to kingresdb/i })
+    await screen.findByTestId('running-version')
+    expect(await sourceLink()).toHaveAttribute('href', 'https://github.com/KingresDB/Kingres')
+  })
+
+  it.each([
+    'main',
+    'ABCDEF1',
+    'abc',
+    'abc"><script>x</script>',
+    '../../x',
+    '0123456789abcdef/../../x',
+  ])('never builds an address from text that is not a commit id (%s)', async (text) => {
+    mockConfig.commit = text
+    await renderApp('/login', { user: null })
+    await screen.findByRole('heading', { name: /sign in to kingresdb/i })
+    await screen.findByTestId('running-version')
+    expect(await sourceLink()).toHaveAttribute('href', 'https://github.com/KingresDB/Kingres')
   })
 })

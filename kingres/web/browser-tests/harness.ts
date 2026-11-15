@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // Shared pieces of the browser tests: a Vite dev server (the mock API runs in the page as a
@@ -217,6 +217,9 @@ export const ROUTES = [
   '/alerts',
   '/logs',
   '/settings',
+  '/configuration',
+  '/configuration?tab=changes',
+  '/configuration?tab=time',
   '/this-server',
   '/this-server/logs',
 ]
@@ -239,6 +242,28 @@ export interface PageState {
   open: (page: Page) => Promise<void>
   /** Gets out again (closes the dialog); the next state starts from its own route anyway. */
   close?: (page: Page) => Promise<void>
+}
+
+/** A value for the configuration dialogs that differs from the one before it, so that Apply is never a no-op. */
+let configCounter = 0
+const nextConfigValue = (): string => `${30 + configCounter++}MB`
+
+/** Types into the value field of the configuration dialog the way a person does (the input event). */
+async function setConfigValue(page: Page, text: string): Promise<void> {
+  await page.$eval(
+    '#cfg-value',
+    (el, v) => {
+      ;(el as HTMLInputElement).value = v
+      el.dispatchEvent(new Event('input', { bubbles: true }))
+    },
+    text,
+  )
+}
+
+/** Waits for the element (the list loads after the page is quiet) and clicks it. */
+async function clickWhenThere(page: Page, selector: string): Promise<void> {
+  await page.waitForSelector(selector, { timeout: 20_000 })
+  await page.click(selector)
 }
 
 async function dialogOpen(page: Page): Promise<void> {
@@ -400,6 +425,99 @@ export const STATES: PageState[] = [
       await page.waitForSelector('[data-testid="query-error-hint"]', { timeout: 20_000 })
       await sleep(150)
     },
+  },
+  {
+    name: 'edit parameter dialog with the preview (0.8.0)',
+    route: '/configuration?q=work_mem',
+    open: async (page) => {
+      await clickWhenThere(page, 'button[aria-label="Edit work_mem"]')
+      await dialogOpen(page)
+      await setConfigValue(page, nextConfigValue())
+      await page.waitForSelector('[data-testid="preview-sentence"]', { timeout: 20_000 })
+      await sleep(150)
+    },
+    close: cancel,
+  },
+  {
+    name: 'edit parameter dialog: a restart is needed (0.8.0)',
+    route: '/configuration?q=max_connections',
+    open: async (page) => {
+      await clickWhenThere(page, 'button[aria-label="Edit max_connections"]')
+      await dialogOpen(page)
+      await setConfigValue(page, String(200 + configCounter))
+      await page.waitForSelector('[data-testid="restart-note"]', { timeout: 20_000 })
+      await sleep(150)
+    },
+    close: cancel,
+  },
+  {
+    name: 'edit parameter dialog: the state of every server after Apply (0.8.0)',
+    route: '/configuration?q=work_mem',
+    open: async (page) => {
+      await clickWhenThere(page, 'button[aria-label="Edit work_mem"]')
+      await dialogOpen(page)
+      await setConfigValue(page, nextConfigValue())
+      await page.waitForSelector('[data-testid="preview-sentence"]', { timeout: 20_000 })
+      await clickText(page, 'Apply', '[role="dialog"] button')
+      await page.waitForFunction(
+        () =>
+          document
+            .querySelector('[role="dialog"]')
+            ?.textContent?.includes('Applied on every server'),
+        { timeout: 40_000 },
+      )
+      await sleep(250)
+    },
+    close: async (page) => {
+      await clickText(page, 'Close', '[role="dialog"] .dlg-foot button')
+      await sleep(150)
+    },
+  },
+  {
+    name: 'revert dialog (0.8.0)',
+    route: '/configuration?tab=changes',
+    open: async (page) => {
+      await clickWhenThere(page, 'button[aria-label^="Revert change"]')
+      await dialogOpen(page)
+      await page.waitForSelector('[data-testid="revert-summary"]', { timeout: 20_000 })
+      await sleep(900)
+    },
+    close: cancel,
+  },
+  {
+    name: 'restart pending instances dialog (0.8.0)',
+    route: '/configuration',
+    open: async (page) => {
+      await clickText(page, 'Restart pending instances')
+      await dialogOpen(page)
+      await page.waitForSelector(
+        '[data-testid="waiting-servers"], [data-testid="nothing-waiting"]',
+        {
+          timeout: 20_000,
+        },
+      )
+    },
+    close: cancel,
+  },
+  {
+    name: 'cluster time zone dialog (0.8.0)',
+    route: '/configuration?tab=time',
+    open: async (page) => {
+      await clickText(page, 'Apply')
+      await dialogOpen(page)
+      await sleep(900)
+    },
+    close: cancel,
+  },
+  {
+    name: 'database time zone dialog (0.8.0)',
+    route: '/configuration?tab=time',
+    open: async (page) => {
+      await clickWhenThere(page, '[data-testid="dbzone-shop"] button')
+      await dialogOpen(page)
+      await sleep(900)
+    },
+    close: cancel,
   },
   {
     name: 'system database stopped',

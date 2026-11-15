@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Command kingresd is the control-plane server of KingresDB. It serves the
 // management REST API (kingres/api/openapi.yaml) and the web panel.
@@ -59,7 +59,7 @@ var version = "0.2.0-dev"
 var commit = "unknown"
 
 // contractRevision is the revision of kingres/api/openapi.yaml implemented.
-const contractRevision = "0.7.0"
+const contractRevision = "0.8.0"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -255,7 +255,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	}
 	deps := httpapi.Deps{
 		Logger: log, Store: pg, Setup: node, Sessions: sessions, Authenticator: authn, Audit: sink,
-		Web: web, Version: version, Hostname: hostname, ListenAddr: cfg.Listen,
+		Web: web, Version: version, Commit: commit, Hostname: hostname, ListenAddr: cfg.Listen,
 		LoopbackOnly: !cfg.AllowRemoteSetup, SetupService: svc, DataDir: cfg.DataDir, Ops: opsSvc, Started: started, Metrics: ring, MetricsToken: cfg.MetricsToken,
 		LogDir: svc.LogDir, MaxBodyBytes: cfg.MaxBodyBytes,
 		RequestTimeout: cfg.RequestTimeout, LoginRateLimit: cfg.LoginRateLimit,
@@ -317,6 +317,11 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		deps.Gatherer, deps.GatherTimeout = membership.Gatherer{M: members}, cfg.GatherTimeout
 		deps.PeerUptime = members.PeerUptime
 	}
+	var cfgp *configParts
+	if opsSvc != nil && svc.Enabled() {
+		cfgp = newConfigParts(svc, serverHost, log, members, opsSvc, faultHook)
+		deps.Config = cfgp.leader
+	}
 	deps.LeaderTrusted = leaderTrusted(haReg, lastLeader, serverHost, cfg.HA.LeaderLossBound)
 	api, err := httpapi.New(deps)
 	if err != nil {
@@ -366,6 +371,9 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 			}
 			if stby != nil {
 				defs = append(defs, stby.leader.Definitions()...)
+			}
+			if cfgp != nil {
+				defs = append(defs, cfgp.leader.Definitions()...)
 			}
 			eng, err = task.NewEngine(task.NewPGStore(pool), defs, task.Options{
 				Holder: fmt.Sprintf("%s-%d", hostname, os.Getpid()), Logger: log})
@@ -438,6 +446,9 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		}}
 	if members != nil {
 		hd.PC = members.Client
+	}
+	if cfgp != nil {
+		cfgp.start(hd, haCalls)
 	}
 	if err := startHA(hd); err != nil {
 		cancelBG()

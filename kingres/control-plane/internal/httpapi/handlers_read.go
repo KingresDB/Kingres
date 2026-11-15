@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 package httpapi
 
@@ -312,7 +312,7 @@ func (s *Server) listTasks(_ *call, w http.ResponseWriter, r *http.Request) erro
 			"server.leave", "instance.start", "instance.stop", "instance.restart", "database.create",
 			"database.update", "database.drop", "table.distribute", "rebalance",
 			"replication.restorePreferredPrimaries", "ledger.verify", "networkAccess.apply", "replicate.apply",
-			"certificate.renew", "certificate.revoke", "standby.reconcile"),
+			"certificate.renew", "certificate.revoke", "standby.reconcile", "config.apply", "config.restart"),
 	}
 	page := pp.page()
 	if p := pp.err(); p != nil {

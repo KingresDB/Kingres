@@ -1,10 +1,10 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // Contract 0.5.0 on alerts and paging: the new alert kinds and the link to the server an alert names,
 // alert ids that are large integers (below 2^53) and must never be rounded or changed, and cursors,
 // which changed format in 0.5.0: never kept anywhere, and a 400 for one starts the list again.
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { cleanup, screen, waitFor, within } from '@testing-library/vue'
 import userEvent from '@testing-library/user-event'
 import { getState } from '@/mocks/http'
@@ -14,7 +14,7 @@ import { fetchAllPages } from '@/api/queries'
 import { ApiError } from '@/api/problem'
 import type { Alert, LogEntry } from '@/api/types'
 import { alertKindLabel } from '@/lib/status'
-import { disposeBuiltApps, renderApp } from './helpers'
+import { calmClocks, disposeBuiltApps, renderApp } from './helpers'
 
 afterEach(() => mockServer.events.removeAllListeners())
 
@@ -30,6 +30,9 @@ const alert = (over: Partial<Alert>): Alert => ({
   raisedAt: new Date().toISOString(),
   ...over,
 })
+
+// The seed has a server whose clock is 1.82 s off (0.8.0), which raises the alert clockDifference; these tests count alerts.
+beforeEach(calmClocks)
 
 describe('alert kinds of 0.5.0', () => {
   it('has words for every kind, none shown as the raw name', () => {

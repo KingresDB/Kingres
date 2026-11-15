@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // Contract 0.4.0 added alert kinds (ledgerPendingTooOld, versionMismatch, certificateExpiring), the task
@@ -18,9 +18,9 @@ describe('labels', () => {
     expect(taskKindLabel('replicate.apply')).not.toBe('replicate.apply')
     // 16 in 0.4.0, plus certificateRenewalFailed (0.5.0), replicationPending (0.6.0) and, in 0.7.0, leaseLost,
     // groupWithoutSynchronousStandby and groupUnderReplicated.
-    expect(Object.keys(ALERT_KIND_LABEL)).toHaveLength(21)
-    // 18 in 0.4.0, plus the two certificate kinds (0.5.0) and standby.reconcile (0.7.0).
-    expect(Object.keys(TASK_KIND_LABEL)).toHaveLength(21)
+    expect(Object.keys(ALERT_KIND_LABEL)).toHaveLength(22)
+    // 18 in 0.4.0, plus the two certificate kinds (0.5.0), standby.reconcile (0.7.0), config.apply and config.restart (0.8.0).
+    expect(Object.keys(TASK_KIND_LABEL)).toHaveLength(23)
   })
   it('shows an unknown kind as sent', () => {
     expect(alertKindLabel('somethingNew')).toBe('somethingNew')

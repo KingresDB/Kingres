@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # kingresd: the KingresDB control plane
 
 `kingresd` is the control-plane server of KingresDB. It serves the management
@@ -148,7 +148,7 @@ server at start. The DSN is never logged.
 | `version-check-interval` | `KINGRES_VERSION_CHECK_INTERVAL` | `1m` | how often the manager leader compares the versions of the servers (`versionMismatch`) |
 | `gather-timeout` | `KINGRES_GATHER_TIMEOUT` | `3s` | the time one server gets to answer its part of a cluster-wide read of logs, alerts or metrics |
 | `allow-remote-setup` | `KINGRES_ALLOW_REMOTE_SETUP` | `false` | `true` lets the setup operations come from non-loopback addresses while uninitialized (containers listening on `0.0.0.0`); the setup token is still required |
-| `-version` | | | prints version, contract revision (0.7.0) and build commit (`-ldflags "-X main.commit=..."`, else `unknown`) |
+| `-version` | | | prints version, contract revision (0.8.0) and build commit (`-ldflags "-X main.commit=..."`, else `unknown`) |
 | `-stop-instances` | | | stops the managed instances (fast shutdown) and exits |
 | `tls-cert-file`, `tls-key-file` | `KINGRES_TLS_CERT_FILE`, `KINGRES_TLS_KEY_FILE` | none | enable HTTPS (both or neither) |
 
@@ -256,14 +256,63 @@ in the JSON body and lives in the panel's memory, so there is no CSRF cookie):
 (`internal/httpapi/cookies_test.go`). Nothing in `kingres/web` has to change for
 the rename.
 
+## Configuration from the console (phase 13, contract 0.8.0)
+
+Design: `kingres/docs/design/config-phase13.md`. Code: `internal/pgconfig` (policy, validation, the agent on every
+server, the leader's side), `internal/instance` (`managed.go`, `configfile.go`), migration `0007_config.sql`,
+handlers in `internal/httpapi/handlers_config.go`, wiring in `cmd/kingresd/config_wiring.go`.
+
+- **Levels.** A PostgreSQL parameter is set for the cluster, for a server group, for one server, or for a database
+  (`ALTER DATABASE ... SET`, applied on the primary instance of every server; standbys replay it). A narrower level
+  beats a wider one. The values are stored in `kingres_cp.config_value` (with `config_change` for the history and
+  `config_server_state` for what a server reported); the file on a server is a rendering of them.
+- **The override file.** `kingres-config.conf` in the data directory of every instance (primary and standbys of a
+  server get the same file). `kingres-managed.conf` includes it after the derived defaults (`max_connections`,
+  `max_prepared_transactions`, `shared_buffers`, `effective_cache_size`, `maintenance_work_mem`) and before its fixed
+  block, so an override beats a derived default and never a managed setting. Never `ALTER SYSTEM`, never an edit of
+  `postgresql.conf`. A hand edit of the override file is overwritten by the next apply (the leader notices a file
+  that is not what the stored values give, every 30 seconds, and brings the server up to date).
+- **Managed and refused parameters.** `instance.ManagedParameters` is the one list that the renderer, the standby
+  code and the API share (`TestManagedListIsComplete` fails when they disagree). Refused: what runs a command, loads
+  code, names a file or holds a connection string (PostgreSQL's own superuser-only set, found at run time, plus
+  `*_command`, `*_library`, `*_libraries`, `*preload*` by name, `fsync`, `full_page_writes`, the developer options).
+  PostgreSQL 18 shows `archive_command` and `restore_command` to every database user, so they are refused by name and
+  their value is never returned by this API. Cluster-only parameters (`TimeZone`, `lc_*`, `DateStyle`,
+  `kingres_shard.default_bucket_count`, ...) cannot be set per server group or server.
+- **Validation** is PostgreSQL's: `pg_settings` (type, unit, range, enum), then `set_config` in a rolled-back
+  transaction or `postgres -C` for the value, then `pg_file_settings` on the written file before it is reloaded
+  (a bad file is replaced by the previous one and never loaded). Nothing is written before every change of a
+  request has passed.
+- **Applying** is the task `config.apply` (one step per server; a server that is down makes the task wait and say
+  which; a server that fails does not stop the others, the task ends `config_incomplete` and
+  `GET /config/servers` shows applied, pending restart, failed or waiting per server). A parameter of context
+  `postmaster` is pending a restart until the instance restarts; `POST /config/restarts` (task `config.restart`)
+  restarts the waiting instances one server at a time, a standby before its primary when a value goes up and after it
+  when one goes down (the five settings a hot standby needs at least as high as its primary), and says that
+  restarting a primary is downtime for its group (failover does not exist yet).
+- **Time.** The console shows each server's clock, operating system time zone, `TimeZone` and `log_timezone`, and the
+  difference between the clocks, measured over the internal API (five probes, the smallest round trip, uncertainty
+  half the round trip plus 1 ms; the round trip comes from the monotonic clock). The alert `clockDifference` is
+  raised by the manager leader when the difference less its uncertainty is above `clock.maxDifferenceMs`
+  (cluster setting, default 1000). **`kingresd` does not set the system clock** of a server: that needs the rights
+  of the operating system's administrator and is the job of time synchronization (chrony, NTP,
+  `systemd-timesyncd`). When clocks differ, fix the synchronization service on that server (`chronyc tracking`,
+  `timedatectl timesync-status`), do not set the clock by hand.
+- **Tests.** Unit: `internal/pgconfig`, `internal/instance` (`managed_test.go`). With a real PostgreSQL
+  (`internal/pgconfig/pg_test.go`): the differential test of the validator, the refused set of the running version,
+  the override file with hostile values, the check before the reload. On three servers
+  (`internal/clustertest/config_test.go`): cluster, group and server levels, removal, pending restart and the restart
+  task, the order of standbys and primaries, refused and invalid values, a server that is down, a server that fails,
+  database and cluster time zones, the clock difference, history and revert, audit, roles.
+
 ## What is implemented
 
-The server implements revision **0.5.0** of the contract (88 operations, 71
+The server implements revision **0.8.0** of the contract (100 operations, 82
 paths; what is not done is in "Not done in this increment"). "Real" means the operation works against PostgreSQL or the local node
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **81 of 89 operations are real; 8 answer "not yet".**
+authenticated operation lists in 0.2.0. **92 of 100 operations are real; 8 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -285,6 +334,7 @@ authenticated operation lists in 0.2.0. **81 of 89 operations are real; 8 answer
 | Replication | `getReplicationTopology` | `restorePreferredPrimaries` |
 | Server groups | `listServerGroups`, `createServerGroup`, `deleteServerGroup` |  |
 | Servers | `listServers`, `getServer`, `addServer`, `removeServer`, `updateServer`, `renewServerCertificates`, `revokeServerCertificates` | `failoverServer` |
+| Configuration | `listConfigParameters`, `getConfigParameter`, `previewConfigChange`, `applyConfigChange`, `listConfigChanges`, `revertConfigChange`, `listConfigServers`, `getConfigSummary`, `getClusterTime`, `listTimeZones`, `restartPendingInstances` |  |
 | Settings | `getClusterSettings`, `updateClusterSettings` |  |
 | Network access | `getNetworkAccess`, `replaceNetworkAccess` |  |
 | Setup | `initCluster`, `joinCluster`, `getNodeState`, `checkSetupToken` |  |
@@ -2257,4 +2307,4 @@ the store's epoch check refuses it.
 
 ---
 
-Copyright (c) 2026, RooyeKhat Media Co. Released under the PostgreSQL License.
+Copyright (c) 2026, RooyeKhat Media Co. Released under the GNU Affero General Public License, version 3 (AGPL-3.0-only).

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 package httpapi
 
@@ -37,8 +37,8 @@ func TestRoutingMatchesContract(t *testing.T) {
 	for _, op := range doc.Operations {
 		want[op.Method+" /api/v1"+op.Path] = op.ID
 	}
-	if len(want) != 89 {
-		t.Errorf("contract has %d operations, this test was written for 89", len(want))
+	if len(want) != 100 {
+		t.Errorf("contract has %d operations, this test was written for 100", len(want))
 	}
 	got := map[string]string{}
 	for _, r := range e.srv.Routes() {
@@ -278,6 +278,9 @@ func TestResponsesValidateAgainstContract(t *testing.T) {
 	}
 	for id := range e.srv.memberHandlers() {
 		mutating[id] = true
+	}
+	for id := range e.srv.configHandlers() {
+		mutating[id] = true // need the system database and the servers; validated by the integration tests of package clustertest
 	}
 	for id := range e.srv.serverGroupHandlers() {
 		mutating[id] = true // need the system database; validated in cmd/kingresd/servergroups_e2e_test.go

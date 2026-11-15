@@ -1,9 +1,10 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // One handler per operation in the contract, registered by operationId (see http.ts). Request and
 // response bodies are typed with the generated schema types.
 import { evaluateAccess } from '@/lib/network-rules'
+import { applyPending, configHandlers } from './config'
 import type { HttpHandler } from 'msw'
 import type { components } from '@/api/schema'
 import type { OperationId } from '@/api/operations.generated'
@@ -535,6 +536,8 @@ function instanceAction(action: 'restart' | 'stop' | 'start'): Handler {
           if (inst.isMapGroup) s.systemDatabaseStopped = action === 'stop'
           // A new postmaster has read the saved settings.
           if (action !== 'stop') s.localSettings.restartRequired = false
+          // A new postmaster reads the configuration file: what waited for a restart is running now.
+          if (action !== 'stop') applyPending(s, inst.serverId)
         },
       }),
     )
@@ -1092,6 +1095,7 @@ async function executeStatement(ctx: Ctx): Promise<S['QueryResult']> {
 
 export function createHandlers(): HttpHandler[] {
   const h: Partial<Record<OperationId, Handler>> = {
+    ...configHandlers(),
     getHealth: () => ok({ status: 'ok' }),
     getReadiness: (c) =>
       ok({
@@ -1114,6 +1118,7 @@ export function createHandlers(): HttpHandler[] {
         address: '10.0.0.11:8091',
         hostname: 'kdb-1.example.internal',
         version: '0.1.0',
+        commit: mockConfig.commit,
         postgresVersion: '18.1',
         setupTokenRequired: c.s.node.state === 'uninitialized',
         localhostOnly: c.s.node.state === 'uninitialized',
@@ -2415,7 +2420,7 @@ export function createHandlers(): HttpHandler[] {
       const errors: { field: string; message: string }[] = []
       if (Object.keys(b).length === 0)
         throw validationFailed([{ field: '/', message: 'at least one property is required' }])
-      for (const group of ['autoFailover', 'rebalance', 'features'] as const) {
+      for (const group of ['autoFailover', 'rebalance', 'features', 'clock'] as const) {
         const g = b[group]
         if (g !== undefined && Object.keys(g).length === 0)
           errors.push({ field: `/${group}`, message: 'at least one property is required' })
@@ -2443,6 +2448,16 @@ export function createHandlers(): HttpHandler[] {
         (b.rebalance.maxConcurrentMoves < 1 || b.rebalance.maxConcurrentMoves > 64)
       )
         errors.push({ field: 'rebalance.maxConcurrentMoves', message: 'Between 1 and 64.' })
+      if (
+        b.clock?.maxDifferenceMs !== undefined &&
+        (!Number.isInteger(b.clock.maxDifferenceMs) ||
+          b.clock.maxDifferenceMs < 10 ||
+          b.clock.maxDifferenceMs > 600000)
+      )
+        errors.push({
+          field: 'clock.maxDifferenceMs',
+          message: 'Between 10 and 600000 milliseconds.',
+        })
       if (errors.length) throw validationFailed(errors)
       if (
         (b.features?.sharding === false && s.settings.features.sharding) ||
@@ -2463,6 +2478,8 @@ export function createHandlers(): HttpHandler[] {
           ...Object.fromEntries(Object.entries(b.autoFailover).filter(([, v]) => v !== undefined)),
         }
       if (b.rebalance) cur.rebalance = { ...cur.rebalance, ...b.rebalance }
+      if (b.clock?.maxDifferenceMs !== undefined)
+        cur.clock = { maxDifferenceMs: b.clock.maxDifferenceMs }
       if (b.features?.sharding && !cur.features.sharding) {
         cur.features.sharding = true
         cur.restart = { required: true, serverIds: s.servers.map((x) => x.id) }

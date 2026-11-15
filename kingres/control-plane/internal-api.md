@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # The internal API of kingresd
 
 Status: version 1 (internal protocol version, independent of the public contract
@@ -77,6 +77,11 @@ version 1, the caller \"2\"."}` when the number is missing or different.
 | `POST /internal/v1/standby/plan` | leader | the complete list of the cluster's standbys with a version; stored by every server, applied at once by the server that runs a group's primary; see "Standbys" |
 | `POST /internal/v1/standby/create`, `/remove`, `/rebuild` | leader | create (slot on the primary, `pg_basebackup`, start in recovery), delete, or make again the standby instance of a group on this server |
 | `GET /internal/v1/standby/status` | leader | the standby instances of this server and, for the group whose primary it runs, the synchronous setting, streaming standbys, slots and the standbys whose slot was lost |
+| `POST /internal/v1/config/state` | leader | the effective values, sources, pending restarts and file errors of the settings of this server's instances (the metadata of every parameter with `meta`), the parameters PostgreSQL hides from ordinary users, the revision and hash of the override file; see "Configuration" |
+| `POST /internal/v1/config/apply` | leader | the override values of this server at a revision and the database-level values: the server re-validates, writes `kingres-config.conf` of each instance, has PostgreSQL check it before the reload, reloads and answers per parameter (applied, pendingRestart, failed) |
+| `POST /internal/v1/config/check` | leader | PostgreSQL's verdict on one value (layers 2 and 3 of the validation) |
+| `POST /internal/v1/config/restart` | leader | restart one local instance and wait until it accepts connections (a standby: until it streams) |
+| `GET /internal/v1/time` | any peer | this server's wall clock as late as possible, its operating system time zone and PostgreSQL's `TimeZone` and `log_timezone` (the clock probe; no state) |
 
 "Member" means a server that the leader's catalog records as `active` (or `removing`, which must still be able to ask how its removal went). A server that holds a certificate of the cluster but has not been admitted yet (`pending`: the certificate was issued and installed, the add task has not finished) is **not** a member: it may make only the calls of its own join, which the leader makes on it, and every call marked "member" is refused with `403 not_member`. Every certificate the cluster signs for a server that is not yet a member is therefore a certificate that authorizes nothing but that join.
 
@@ -337,6 +342,14 @@ An unknown leader is asked for again (three times, 200 ms apart) before a leader
 ### A server that waits for its lease
 
 A server whose instance is held back until its group lease is won (the fence marker `<data-dir>/lease/fenced` or the wait marker `<data-dir>/lease/waitlease` exists, or its instance is not running) cannot read the catalog and knows no leader. Every call that needs the leader (`LeaderOnly`, `LeaderOrJoining`, `ToLeader`) is then answered `503` with the code `service_unavailable` and `Retry-After: 2`, never `403 not_leader` (which means "the caller is not the leader"). The caller treats it as transient: a task step retries with a pause growing from 1 s to 8 s for up to 5 minutes and then fails naming the server; other callers get the 503. The REST sign-in on that server answers `503 service_unavailable` with `Retry-After: 5` in the same window.
+
+## Configuration
+
+Phase 13 (contract 0.8.0, design `config-phase13.md`). The leader asks every server for its state, then for the apply of a
+revision; the server never takes a path, a program name or SQL text from the request: the values are rendered into a file
+by `instance.RenderConfig` (checked name, quoted value), the database values are built by PostgreSQL's `format()`. The
+calls refuse managed and refused parameters again on the server. The clock probe is an exchange of one request: the asker
+reads its wall and monotonic clocks before and after, the answer carries the other server's wall clock.
 
 ## Errors
 

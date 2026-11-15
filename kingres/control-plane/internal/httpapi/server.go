@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package httpapi is the HTTP layer of kingresd: it routes every operation
 // of the contract (internal/contract), enforces node-state gating,
@@ -25,6 +25,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/localsettings"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/monitor"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ops"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pgconfig"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/setup"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/store"
@@ -87,6 +88,8 @@ type Deps struct {
 	// Members adds and removes servers (design D4 and D5); nil makes addServer
 	// and removeServer answer "not supported".
 	Members Members
+	// Config serves the Configuration operations (phase 13); nil makes them answer "not supported".
+	Config *pgconfig.Leader
 	// LocalSettings serves getThisServerSettings and updateThisServerSettings;
 	// nil makes them answer "not supported".
 	LocalSettings *localsettings.Manager
@@ -97,8 +100,9 @@ type Deps struct {
 	// Web serves the panel at "/" (static files with SPA fallback); when nil
 	// unknown non-API paths answer with the 404 problem.
 	Web http.Handler
-	// Version is the KingresDB version.
+	// Version is the KingresDB version; Commit the source commit of the build ("unknown" or empty: not reported).
 	Version string
+	Commit  string
 	// Hostname is the machine name reported by the setup state.
 	Hostname string
 	// ListenAddr is the configured listen address (host:port).

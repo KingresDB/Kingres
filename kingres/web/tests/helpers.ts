@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // Test helpers: render the real app (router, pinia, query client) against the mock API.
@@ -10,6 +10,7 @@ import type { Component } from 'vue'
 import App from '@/App.vue'
 import { createKingres } from '@/bootstrap'
 import { useSessionStore } from '@/stores/session'
+import { getState } from '@/mocks/http'
 
 export interface AppHarness extends RenderResult {
   router: Router
@@ -82,4 +83,12 @@ export async function settled(): Promise<void> {
   await waitFor(() => {
     if (document.querySelector('.skeleton')) throw new Error('still loading')
   })
+}
+
+/**
+ * Puts every clock of the mock in line with the answering server's. The seed has one server whose clock is 1.82 s off
+ * (contract 0.8.0), which raises the alert `clockDifference`; tests of alerts that count or list alerts do not want it.
+ */
+export function calmClocks(): void {
+  for (const clock of Object.values(getState().config.clocks)) clock.offsetMs = 0
 }

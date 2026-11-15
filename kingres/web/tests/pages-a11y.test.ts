@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // One smoke and accessibility check per page: the page renders its heading with data from the mock
@@ -37,6 +37,13 @@ const PAGES: PageCase[] = [
   { path: '/alerts', heading: 'Alerts', data: /Replication lag is high/ },
   { path: '/logs', heading: 'Logs', data: /heartbeat from server 2 received/ },
   { path: '/settings', heading: 'Settings', data: /Default replica count/ },
+  { path: '/configuration', heading: 'Configuration', data: /autovacuum_analyze_scale_factor/ },
+  {
+    path: '/configuration?tab=changes',
+    heading: 'Configuration',
+    data: /effective_io_concurrency/,
+  },
+  { path: '/configuration?tab=time', heading: 'Configuration', data: /within the measurement/ },
   { path: '/this-server', heading: 'This server', data: /Local settings/ },
   { path: '/this-server/logs', heading: 'Local logs', data: /heartbeat|checkpoint|leader lease/ },
 ]

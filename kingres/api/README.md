@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.7.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.8.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and `kingres-cli`. Lint it and run the mechanical rule check with:
 
 ```
@@ -154,6 +154,8 @@ Each task kind has exactly one `subject.type`; `subject.id` is always a string.
 | `ledger.verify` | `ledgerVerification` | the **database name**: the verification id exists only after the run (see `LedgerVerification.taskId`) |
 | `replicate.apply` | `replication` | `apply:<operation>:<role or database names>:<unix nanoseconds>`: the task that brings the servers that could not be reached up to date after a role or grant change (one step per server, `TaskStep.detail` names the server it waits for) |
 | `networkAccess.apply` | `networkAccess` | `network-access` |
+| `config.apply` (0.8.0) | `config` | `cluster`: one configuration task at a time; one step per server (`TaskStep.detail` names the server a step waits for) |
+| `config.restart` (0.8.0) | `config` | `restart`: restarts the instances that wait for a restart, one server at a time |
 | `standby.reconcile` (0.7.0) | `replication` | `standbys`: adds, removes and rebuilds standby instances until every group has `defaultReplicaCount` of them; the step `standby.register_in_catalog` says `skipped: needs kingres_shard 0.4` until the sharding extension supports standby nodes |
 
 `Task.subject` is null only for tasks whose subject is not known (system tasks such as auto-failover use
@@ -312,6 +314,41 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.8.0
+
+Revision written with phase 13, configuration from the console (PostgreSQL parameters at the cluster, server group, server and
+database level, the clocks and time zones). Summary for the panel: 11 operations added (100 operations, 82 paths), **0 breaking
+changes**, additive changes listed below, 8 new problem codes, 1 new alert kind, 2 new task kinds, 3 new audit actions. No property
+was removed, renamed or made required. Design: `kingres/docs/design/config-phase13.md`.
+
+#### Breaking
+
+None.
+
+#### Additive
+
+1. **Operations** (tag `Configuration`): `listConfigParameters`, `getConfigParameter`, `listConfigChanges`, `listConfigServers`,
+   `getConfigSummary`, `getClusterTime`, `listTimeZones` (`kingres_readonly`); `previewConfigChange`, `applyConfigChange`,
+   `revertConfigChange`, `restartPendingInstances` (`kingres_admin`). The three that start a task answer 202 with the `Task` and a
+   `Location`. `previewConfigChange` is a POST that changes nothing and is not audited.
+2. **`TaskKind`** gains `config.apply` and `config.restart` (subject type `config`, see the table "Task kinds and subjects").
+3. **`ProblemCode`** gains `config_parameter_unknown`, `config_parameter_managed`, `config_parameter_refused`,
+   `config_level_not_allowed`, `config_value_below_floor`, `config_change_superseded`, `config_restart_order_conflict` and
+   `nothing_pending`.
+4. **`AlertKind`** gains `clockDifference`; **`AuditAction`** gains `applyConfigChange`, `revertConfigChange` and
+   `restartPendingInstances`.
+5. **`ClusterSettings.clock`** (optional) and `ClusterSettingsUpdateRequest.clock`: `maxDifferenceMs` (10 to 600000, default 1000).
+   Changing it starts no task, so `updateClusterSettings` keeps answering 200 for it.
+7. **`NodeStateInfo.commit`** (optional, nullable): the source commit of the build, 7 to 64 lower-case hexadecimal characters; the panel links the
+   running version's source to it (AGPL-3.0-only, section 13).
+6. A value that PostgreSQL hides from an ordinary database user (`hidden: true`) is never returned to any role, and values of
+   `refused` parameters cannot be stored; nothing in the audit log can be a secret of this feature.
+
+#### Documentation
+
+The README has the two task rows. `kingresd` does not set the system clock of a server (that needs the operating system
+administrator and is the job of NTP or chrony); the contract reports clocks and says so in `getClusterTime`.
 
 ### 0.7.0
 

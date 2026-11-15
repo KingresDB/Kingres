@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package problem implements the error model of the REST API: RFC 9457
 // "problem details" documents served as application/problem+json, exactly as
@@ -71,6 +71,15 @@ const (
 	CertificateRevoked              Code = "certificate_revoked"
 	// InternalAPIDisabled (409) was added in contract 0.6.0: the server runs without its internal API.
 	InternalAPIDisabled Code = "internal_api_disabled"
+	// Added in contract 0.8.0 (configuration from the console).
+	ConfigParameterUnknown Code = "config_parameter_unknown"
+	ConfigParameterManaged Code = "config_parameter_managed"
+	ConfigParameterRefused Code = "config_parameter_refused"
+	ConfigLevelNotAllowed  Code = "config_level_not_allowed"
+	ConfigValueBelowFloor  Code = "config_value_below_floor"
+	ConfigChangeSuperseded Code = "config_change_superseded"
+	ConfigRestartOrder     Code = "config_restart_order_conflict"
+	NothingPending         Code = "nothing_pending"
 )
 
 // FieldError is one entry of the "errors" extension (schema ValidationIssue).
@@ -172,6 +181,14 @@ var specs = map[Code]struct {
 	CertificateAuthorityUnavailable: {503, "Certificate authority unavailable", "certificate-authority-unavailable"},
 	CertificateRevoked:              {409, "Certificate revoked", "certificate-revoked"},
 	InternalAPIDisabled:             {409, "Internal API disabled", "internal-api-disabled"},
+	ConfigParameterUnknown:          {404, "Unknown parameter", "config-parameter-unknown"},
+	ConfigParameterManaged:          {422, "Managed parameter", "config-parameter-managed"},
+	ConfigParameterRefused:          {422, "Refused parameter", "config-parameter-refused"},
+	ConfigLevelNotAllowed:           {422, "Level not allowed", "config-level-not-allowed"},
+	ConfigValueBelowFloor:           {422, "Value below the floor", "config-value-below-floor"},
+	ConfigChangeSuperseded:          {409, "Change superseded", "config-change-superseded"},
+	ConfigRestartOrder:              {409, "No safe restart order", "config-restart-order-conflict"},
+	NothingPending:                  {409, "Nothing pending", "nothing-pending"},
 }
 
 // New returns a Problem for the code with the standard status, title and

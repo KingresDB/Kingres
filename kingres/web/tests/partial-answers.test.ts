@@ -1,11 +1,11 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // Contract 0.5.0: cluster-wide logs, alerts and metrics can be partial (`partial`, `missingServers`).
 // The views say so calmly, name each missing server and why, announce it once, and never show a partial
 // list as "no alerts" or "no log lines".
 /* eslint-disable vue/one-component-per-file -- tiny host components for the announcer */
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { defineComponent, h, nextTick, ref, watch, type Ref } from 'vue'
 import { render, screen, waitFor, within } from '@testing-library/vue'
 import userEvent from '@testing-library/user-event'
@@ -23,12 +23,15 @@ import {
 } from '@/lib/partial'
 import { useCompletenessAnnouncement } from '@/composables/useCompletenessAnnouncement'
 import { createAnnouncer } from '@/composables/useAnnounce'
-import { renderApp } from './helpers'
+import { calmClocks, renderApp } from './helpers'
 
 const MISSING = [
   { serverId: '10.0.0.12', reason: 'timeout' },
   { serverId: '10.0.0.13', reason: 'unreachable' },
 ] as const
+
+// The seed has a server whose clock is 1.82 s off (0.8.0), which raises the alert clockDifference; these tests count alerts.
+beforeEach(calmClocks)
 
 describe('partial answers as data', () => {
   it('has plain words for every reason of the contract, and a sentence for one it does not know', () => {

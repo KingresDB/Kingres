@@ -1,14 +1,14 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // Contract 0.6.0: the alert kind `replicationPending` (label, explanation, link to the server) and the
 // local settings whose WAL and log directory are always present, null when they are the default.
-import { describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it } from 'vitest'
 import { screen, within } from '@testing-library/vue'
 import { getState } from '@/mocks/http'
 import type { Alert } from '@/api/types'
 import { alertKindHint, alertKindLabel } from '@/lib/status'
-import { renderApp } from './helpers'
+import { calmClocks, renderApp } from './helpers'
 
 const pending = (over: Partial<Alert> = {}): Alert => ({
   id: 700,
@@ -22,6 +22,9 @@ const pending = (over: Partial<Alert> = {}): Alert => ({
   raisedAt: new Date().toISOString(),
   ...over,
 })
+
+// The seed has a server whose clock is 1.82 s off (0.8.0), which raises the alert clockDifference; these tests count alerts.
+beforeEach(calmClocks)
 
 describe('alert kind replicationPending (0.6.0)', () => {
   it('has a label and an explanation that says what can still work on the server', () => {

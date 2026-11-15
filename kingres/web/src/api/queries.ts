@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // Server state: TanStack Query hooks over the endpoint functions. Query keys are defined once in
@@ -117,6 +117,12 @@ export const keys = {
   logs: ['logs'] as const,
   metrics: ['metrics'] as const,
   thisServer: ['thisServer'] as const,
+  config: ['config'] as const,
+  configServers: ['config', 'servers'] as const,
+  configSummary: ['config', 'summary'] as const,
+  configTime: ['config', 'time'] as const,
+  configChanges: ['config', 'changes'] as const,
+  timeZones: ['config', 'timeZones'] as const,
 } satisfies Record<string, QueryKey | ((...args: never[]) => QueryKey)>
 
 /**
@@ -477,3 +483,84 @@ export function usePagedQuery<T>(
     },
   }
 }
+
+// --- configuration (0.8.0) ----------------------------------------------------------------------------
+
+export const useConfigServers = (enabled: MaybeRefOrGetter<boolean> = true) =>
+  useQuery({
+    queryKey: keys.configServers,
+    queryFn: endpoints.listConfigServers,
+    refetchInterval: every(POLL.fast),
+    enabled: computed(() => toValue(enabled)),
+  })
+
+/** The numbers of the dashboard card. `enabled` is false for accounts that may not read them. */
+export const useConfigSummary = (enabled: MaybeRefOrGetter<boolean> = true) =>
+  useQuery({
+    queryKey: keys.configSummary,
+    queryFn: endpoints.getConfigSummary,
+    refetchInterval: every(POLL.normal),
+    enabled: computed(() => toValue(enabled)),
+  })
+
+/** Clocks and zones. The Time tab refreshes every 10 seconds and shows when the last measurement was made. */
+export const useClusterTime = (enabled: MaybeRefOrGetter<boolean> = true) =>
+  useQuery({
+    queryKey: keys.configTime,
+    queryFn: endpoints.getClusterTime,
+    refetchInterval: every(POLL.normal),
+    enabled: computed(() => toValue(enabled)),
+  })
+
+/** About 600 names, not paginated; the list changes only with the PostgreSQL build. */
+export const useTimeZones = (enabled: MaybeRefOrGetter<boolean> = true) =>
+  useQuery({
+    queryKey: keys.timeZones,
+    queryFn: endpoints.listTimeZones,
+    staleTime: 600_000,
+    enabled: computed(() => toValue(enabled)),
+  })
+
+export interface ConfigFilters {
+  q: string
+  category: string
+  changed: boolean
+  differing: boolean
+  pendingRestart: boolean
+  state: string
+  kind: string
+}
+
+/** The parameters, filtered by the server and paged by cursor ("Load more"). */
+export const useConfigParameters = (filters: MaybeRefOrGetter<ConfigFilters>) =>
+  usePagedQuery(
+    () => [...keys.config, 'parameters', toValue(filters)],
+    (cursor) => {
+      const f = toValue(filters)
+      return endpoints.listConfigParameters({
+        limit: 50,
+        cursor,
+        ...(f.q ? { q: f.q } : {}),
+        ...(f.category ? { category: f.category } : {}),
+        ...(f.changed ? { changed: true } : {}),
+        ...(f.differing ? { differing: true } : {}),
+        ...(f.pendingRestart ? { pendingRestart: true } : {}),
+        ...(f.state ? { state: f.state as 'failed' } : {}),
+        ...(f.kind ? { kind: f.kind as 'settable' } : {}),
+      })
+    },
+    POLL.normal,
+  )
+
+/** The history of changes, newest first, optionally of one parameter. */
+export const useConfigChanges = (name: MaybeRefOrGetter<string>) =>
+  usePagedQuery(
+    () => [...keys.configChanges, toValue(name)],
+    (cursor) =>
+      endpoints.listConfigChanges({
+        limit: 25,
+        cursor,
+        ...(toValue(name) ? { name: toValue(name) } : {}),
+      }),
+    POLL.normal,
+  )

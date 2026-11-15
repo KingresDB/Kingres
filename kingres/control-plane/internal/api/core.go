@@ -91,6 +91,8 @@ type NodeStateInfo struct {
 	Hostname string `json:"hostname"`
 	// Version is the KingresDB version.
 	Version string `json:"version"`
+	// Commit is the source commit of the build (contract 0.8.0), nil when unknown or not a hexadecimal id.
+	Commit *string `json:"commit"`
 	// PostgresVersion is the version of the local PostgreSQL.
 	PostgresVersion string `json:"postgresVersion"`
 	// SetupTokenRequired is true while the node is uninitialized.

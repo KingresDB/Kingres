@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PostgreSQL
+// SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026, RooyeKhat Media Co
 //
 // The URL switches of the mock API for the states of contract 0.7.0 that are hard to reach by hand (development
@@ -15,8 +15,21 @@
 //                                 that need a session check.
 //   ?client=on | ?client=standby  the client entry point is on (and the standby entry point too): its metrics exist.
 //   ?ledger=all | ?ledger=absent  the ledger status covers every shard group / carries no coverage (older server).
+//   ?config=failed:<server>       0.8.0: the next configuration change fails on that server (a retry works).
+//   ?config=waiting:<server>      the server cannot be reached for a configuration change: the task waits for it.
+//   ?config=restart-conflict      a restart is pending that mixes a setting going up and one going down.
+//   ?commit=none | hostile | <text>   0.8.0: the server reports no commit (the footer links to the repository) / text that is not a commit id / that text.
+//   ?clock=off:<server>:<ms>      the clock of that server is that many milliseconds ahead (negative: behind).
+//   ?clock=unreachable:<server>   the clock of that server cannot be read.
 import type { MockState } from './state'
 import { loseLease, mockConfig, silenceServer, stallStandby } from './state'
+import {
+  failNextApply,
+  seedRestartConflict,
+  setClockOffset,
+  setClockReachable,
+  takeConfigServerDown,
+} from './config'
 
 /** Applies the 0.7.0 switches of a query string to the mock. Unknown values are ignored. */
 export function applySwitches(params: URLSearchParams, s: MockState): void {
@@ -46,10 +59,26 @@ export function applySwitches(params: URLSearchParams, s: MockState): void {
         Date.now() - (m[3] ? mockConfig.syncGraceMs + 1000 : 0),
       )
   }
+  const commit = params.get('commit')
+  if (commit === 'none') mockConfig.commit = null
+  else if (commit === 'hostile') mockConfig.commit = 'abc"><script>x</script>'
+  else if (commit) mockConfig.commit = commit
   if (params.get('workbench') === 'busy') mockConfig.workbenchBusy = true
   if (params.get('leader') === 'lost') mockConfig.leaderLost = true
   const client = params.get('client')
   if (client === 'on' || client === 'standby') mockConfig.clientEntryPoint = client
   const ledger = params.get('ledger')
   if (ledger === 'all' || ledger === 'absent') mockConfig.ledgerStatusCoverage = ledger
+  for (const entry of (params.get('config') ?? '').split(',')) {
+    const m = /^(failed|waiting):(.+)$/.exec(entry)
+    if (m && m[1] === 'failed') failNextApply(s, m[2] as string)
+    if (m && m[1] === 'waiting') takeConfigServerDown(s, m[2] as string)
+    if (entry === 'restart-conflict') seedRestartConflict(s)
+  }
+  for (const entry of (params.get('clock') ?? '').split(',')) {
+    const off = /^off:([^:]+):(-?\d+(?:\.\d+)?)$/.exec(entry)
+    if (off) setClockOffset(s, off[1] as string, Number(off[2]))
+    const gone = /^unreachable:(.+)$/.exec(entry)
+    if (gone) setClockReachable(s, gone[1] as string, false)
+  }
 }
