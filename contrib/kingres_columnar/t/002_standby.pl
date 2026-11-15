@@ -119,8 +119,19 @@ $primary->safe_psql('postgres',
 # 2000 rows exist when the backup is taken: the standby's file is two stripes.
 $primary->safe_psql('postgres', gen('ct', 1, 2000));
 $primary->backup('b');
+
+# Wait for the standby to replay everything the primary has generated, up to its
+# insert position.  The default target is the primary's write position, which
+# lies before the last records of a rolled-back transaction until the WAL
+# writer flushes them, so a size comparison made right after it can race.
+sub catchup
+{
+	my ($p, $s) = @_;
+	$p->wait_for_catchup($s, 'replay', $p->lsn('insert'));
+}
+
 my $standby = new_standby($primary, 'standby', 'b');
-$primary->wait_for_catchup($standby);
+catchup($primary, $standby);
 
 my $size0 = $standby->safe_psql('postgres', "SELECT pg_relation_size('ct')");
 cmp_ok($size0, '<', 400000, 'the standby starts with a small file');
@@ -167,7 +178,7 @@ note "standby samples: $samples, distinct counts: " . scalar(keys %seen);
 $loader->query_safe('SELECT 1');
 $loader->quit;
 
-$primary->wait_for_catchup($standby);
+catchup($primary, $standby);
 my $p_fp = $primary->safe_psql('postgres', fp('ct'));
 my $s_fp = $standby->safe_psql('postgres', fp('ct'));
 like($p_fp, qr/^422000\|/, 'primary has all rows');
@@ -226,7 +237,7 @@ for my $stmt (
 $primary->safe_psql('postgres',
 	"INSERT INTO kingres.columnar_stripe VALUES (999999, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, '\\x00', '\\x00')"
 );
-$primary->wait_for_catchup($standby);
+catchup($primary, $standby);
 ($ret, $out, $err) =
   $standby->psql('postgres', "SELECT kingres.columnar_reconcile()");
 unlike($err, qr/server closed the connection|terminating/,
@@ -234,7 +245,7 @@ unlike($err, qr/server closed the connection|terminating/,
 isnt($standby->safe_psql('postgres', 'SELECT pg_is_in_recovery()'),
 	'f', 'standby is still a standby');
 $primary->safe_psql('postgres',
-	"DELETE FROM kingres.columnar_stripe WHERE filenode = 999999");
+	"DELETE FROM kingres.columnar_stripe WHERE rel_uid = 999999");
 
 # reads of every kind on the standby: EXPLAIN ANALYZE, COPY TO, a cursor
 $standby->safe_psql('postgres',
@@ -261,7 +272,7 @@ $primary->safe_psql('postgres', gen('tr', 1, 20000));
 $primary->safe_psql('postgres',
 	"BEGIN; " . gen('tr', 20001, 220000) . "; ROLLBACK");
 my $before = $primary->safe_psql('postgres', "SELECT pg_relation_size('tr')");
-$primary->wait_for_catchup($standby);
+catchup($primary, $standby);
 is( $standby->safe_psql('postgres', "SELECT pg_relation_size('tr')"),
 	$before, 'standby has the dead pages too before the VACUUM');
 my $tr_fp = $primary->safe_psql('postgres', fp('tr'));
@@ -282,7 +293,7 @@ $primary->safe_psql('postgres', 'VACUUM tr');
 my $after = $primary->safe_psql('postgres', "SELECT pg_relation_size('tr')");
 cmp_ok($after, '<', $before / 4, 'VACUUM truncated the dead tail on the primary');
 # the replay waits at most max_standby_streaming_delay, then cancels A
-$primary->wait_for_catchup($standby);
+catchup($primary, $standby);
 is( $standby->safe_psql('postgres', "SELECT pg_relation_size('tr')"),
 	$after, 'the standby truncated its file to the same length');
 
@@ -307,7 +318,7 @@ is(check_rows($standby), '', 'columnar_check finds nothing on the standby');
 # the VACUUM truncated nothing a stripe needs: new loads, then replay goes on
 $primary->safe_psql('postgres', gen('tr', 20001, 30000));
 $primary->safe_psql('postgres', gen('ct', 422001, 430000));
-$primary->wait_for_catchup($standby);
+catchup($primary, $standby);
 for my $t ('tr', 'ct')
 {
 	is($standby->safe_psql('postgres', fp($t)),
@@ -318,7 +329,7 @@ for my $t ('tr', 'ct')
 $primary->safe_psql('postgres',
 	"BEGIN; " . gen('tr', 30001, 90000) . "; ROLLBACK");
 $primary->safe_psql('postgres', 'VACUUM tr');
-$primary->wait_for_catchup($standby);
+catchup($primary, $standby);
 is($standby->safe_psql('postgres', "SELECT pg_relation_size('tr')"),
 	$primary->safe_psql('postgres', "SELECT pg_relation_size('tr')"),
 	'a truncation with no reader replays without a cancel');
@@ -332,7 +343,7 @@ log_is_clean($standby, 'standby after the truncations');
 
 my $ct_fp = $primary->safe_psql('postgres', fp('ct'));
 my $tr2_fp = $primary->safe_psql('postgres', fp('tr'));
-$primary->wait_for_catchup($standby);
+catchup($primary, $standby);
 $standby->promote;
 $standby->poll_query_until('postgres', 'SELECT NOT pg_is_in_recovery()')
   or die 'promotion did not finish';

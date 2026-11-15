@@ -117,22 +117,22 @@ SELECT * FROM kingres.columnar_check();
 -- VACUUM removes such rows too
 INSERT INTO kingres.columnar_stripe VALUES (999999, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0, '\x', '\x');
 INSERT INTO kingres.columnar_stripe VALUES (999999, 2, 0, 1, 1, 1, 1, 1, 1, 1, 0, '\x', '\x');
-SELECT count(*) AS orphan_rows FROM kingres.columnar_stripe WHERE filenode = 999999;
+SELECT count(*) AS orphan_rows FROM kingres.columnar_stripe WHERE rel_uid = 999999;
 VACUUM v3;
-SELECT count(*) AS orphan_rows FROM kingres.columnar_stripe WHERE filenode = 999999;
+SELECT count(*) AS orphan_rows FROM kingres.columnar_stripe WHERE rel_uid = 999999;
 -- a stripe that lies beyond the end of its file
-SELECT relfilenode AS v3_filenode FROM pg_class WHERE oid = 'v3'::regclass \gset
-UPDATE kingres.columnar_stripe SET first_block = first_block + 100000 WHERE filenode = :v3_filenode AND stripe_id = 2;
+SELECT kingres.columnar_identity('v3'::regclass) AS v3_filenode \gset
+UPDATE kingres.columnar_stripe SET first_block = first_block + 100000 WHERE rel_uid = :v3_filenode AND stripe_id = 2;
 SELECT check_name, relation::regclass, regexp_replace(detail, '[0-9]+', 'N', 'g') AS detail FROM kingres.columnar_check();
 SELECT count(*) AS rows_before_fix FROM v3 WHERE id <= 1000;
 SELECT check_name, relation::regclass FROM kingres.columnar_check(true);
 SELECT * FROM kingres.columnar_check();
 SELECT count(*) AS rows_after_fix, max(id) FROM v3;
 -- the first page of a stripe that is not the stripe's page: reported, not repaired
-UPDATE kingres.columnar_stripe SET first_block = first_block + 1 WHERE filenode = :v3_filenode AND stripe_id = 1;
+UPDATE kingres.columnar_stripe SET first_block = first_block + 1 WHERE rel_uid = :v3_filenode AND stripe_id = 1;
 SELECT check_name, relation::regclass, regexp_replace(detail, '[0-9]+', 'N', 'g') AS detail FROM kingres.columnar_check();
 SELECT check_name, relation::regclass FROM kingres.columnar_check(true);
-UPDATE kingres.columnar_stripe SET first_block = first_block - 1 WHERE filenode = :v3_filenode AND stripe_id = 1;
+UPDATE kingres.columnar_stripe SET first_block = first_block - 1 WHERE rel_uid = :v3_filenode AND stripe_id = 1;
 SELECT * FROM kingres.columnar_check();
 SELECT count(*) FROM v3;
 DROP TABLE v3;

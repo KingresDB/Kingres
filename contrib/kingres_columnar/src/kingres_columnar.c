@@ -53,6 +53,7 @@ PG_FUNCTION_INFO_V1(kingres_columnar_stripes);
 PG_FUNCTION_INFO_V1(kingres_columnar_compact);
 PG_FUNCTION_INFO_V1(kingres_columnar_check);
 PG_FUNCTION_INFO_V1(kingres_columnar_reconcile);
+PG_FUNCTION_INFO_V1(kingres_columnar_identity);
 
 bool		kc_rmgr_registered = false;
 
@@ -470,7 +471,7 @@ kc_check_one(Oid relid, bool fix, ReturnSetInfo *rsinfo)
 			values[2] = CStringGetTextDatum(detail);
 			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 			if (fix && strcmp(problem, "stripe_beyond_file") == 0)
-				(void) kc_catalog_delete_stripe(rel->rd_locator.relNumber, s[i].stripe_id);
+				(void) kc_catalog_delete_stripe(kc_rel_ident(rel)->uid, s[i].stripe_id);
 		}
 		relation_close(rel, NoLock);
 }
@@ -582,4 +583,20 @@ kingres_columnar_check(PG_FUNCTION_ARGS)
 		}
 	}
 	return (Datum) 0;
+}
+
+/*
+ * columnar_identity(rel): the identity of the stored content of a columnar
+ * table, the key of its rows in the stripe catalog.  For tests and for
+ * administrators who look at the catalog; superuser only by privilege.
+ */
+Datum
+kingres_columnar_identity(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	Relation	rel = kc_open_columnar(relid, AccessShareLock, false);
+	uint64		uid = kc_rel_ident(rel)->uid;
+
+	relation_close(rel, AccessShareLock);
+	PG_RETURN_INT64((int64) uid);
 }

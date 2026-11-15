@@ -26,8 +26,10 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/parallel.h"
 #include "access/xact.h"
 #include "storage/bufmgr.h"
+#include "storage/predicate.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -74,6 +76,13 @@ kc_scan_begin(Relation rel, Snapshot snapshot, const bool *needed,
 	int			i;
 	int			nvisible;
 
+	/* the leader's unflushed rows are invisible to a worker: refuse, never answer wrongly */
+	if (IsParallelWorker())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("columnar tables cannot be read in a parallel worker"),
+				 errhint("Declare the function PARALLEL UNSAFE, or run the query without parallelism.")));
+
 	cxt = AllocSetContextCreate(CurrentMemoryContext, "kingres_columnar scan",
 								ALLOCSET_DEFAULT_SIZES);
 	old = MemoryContextSwitchTo(cxt);
@@ -97,6 +106,8 @@ kc_scan_begin(Relation rel, Snapshot snapshot, const bool *needed,
 		scan->needed[i] = !scan->ti->cols[i].dropped &&
 			(needed == NULL || needed[i]);
 
+	kc_check_snapshot_age(rel, snapshot);
+	PredicateLockRelation(rel, snapshot);
 	cs = kc_catalog_snapshot(snapshot, &mvcc);
 	scan->cat_snap = cs;
 	scan->all_own_rows = !mvcc;
@@ -120,7 +131,8 @@ kc_scan_begin(Relation rel, Snapshot snapshot, const bool *needed,
 	 */
 	if (!(flags & SO_TYPE_ANALYZE))
 	{
-		scan->pend = kc_write_pending_refs(RelationGetRelid(rel), &scan->npend);
+		scan->pend = kc_write_pending_refs(RelationGetRelid(rel),
+										  kc_rel_ident(rel)->uid, &scan->npend);
 		if (scan->npend > 0)
 		{
 			kc_write_pin_relation(RelationGetRelid(rel), 1);
@@ -219,6 +231,10 @@ kc_load_group(KcScan *scan, uint32 g)
 
 			comp = MemoryContextAllocHuge(scan->group_cxt, cd->comp_len ? cd->comp_len : 1);
 			kc_stripe_read(scan->rel, si, cd->off, cd->comp_len, comp);
+			/* a chunk of its own checksum, verified before anything decodes it */
+			if (kc_crc32c(comp, cd->comp_len) != (uint64) cd->crc)
+				kc_corrupt(scan->rel, si->stripe_id, "chunk checksum mismatch (group %u, column %d)",
+						   g, c + 1);
 			scan->stats.bytes_read += cd->comp_len;
 			scan->colvals[c] = MemoryContextAlloc(scan->group_cxt, sizeof(Datum) * rows);
 			scan->colnulls[c] = MemoryContextAlloc(scan->group_cxt, rows);
@@ -249,7 +265,9 @@ kc_group_stats(KcScan *scan, uint32 g, KcColStat *out)
 
 			out[c].known = true;
 			out[c].nnulls = cd->nnulls;
-			out[c].has_minmax = (cd->flags & KC_CHUNK_HAS_MINMAX) != 0;
+			out[c].has_minmax = (cd->flags & KC_CHUNK_HAS_MINMAX) != 0 &&
+				cd->typid == scan->ti->cols[c].typid &&
+				cd->collation == scan->ti->cols[c].collation;
 			out[c].min_len = cd->min_len;
 			out[c].max_len = cd->max_len;
 			out[c].min = scan->footer.mins[(Size) g * scan->footer.ncols + c];
@@ -276,7 +294,7 @@ kc_open_next_stripe(KcScan *scan)
 			KcColStat  *st = palloc(sizeof(KcColStat) * (scan->natts + 1));
 			bool		skipit;
 
-			kc_stripe_stats_parse(si, scan->natts, st);
+			kc_stripe_stats_parse(si, scan->natts, scan->ti, st);
 			skipit = kc_skip_unit(scan->skip, st, si->row_count);
 			pfree(st);
 			if (skipit)

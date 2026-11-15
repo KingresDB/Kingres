@@ -18,13 +18,14 @@ SELECT p.proname, pg_get_function_identity_arguments(p.oid) AS args, l.lanname A
  columnar_check_ddl   |                                                                                                              | plpgsql | t                | {"search_path=pg_catalog, kingres, pg_temp"} | f
  columnar_compact     | rel regclass, min_rows integer                                                                               | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | t
  columnar_handler     | internal                                                                                                     | c       | f                |                                              | f
+ columnar_identity    | rel regclass                                                                                                 | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | t
  columnar_info        | rel regclass                                                                                                 | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | t
  columnar_on_drop     |                                                                                                              | plpgsql | t                | {"search_path=pg_catalog, kingres, pg_temp"} | f
  columnar_options     | rel regclass                                                                                                 | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | t
  columnar_reconcile   |                                                                                                              | c       | t                | {"search_path=pg_catalog, kingres, pg_temp"} | f
  columnar_set_options | rel regclass, compression text, compression_level integer, stripe_row_count integer, chunk_row_count integer | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | t
  columnar_stripes     | rel regclass                                                                                                 | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | t
-(10 rows)
+(11 rows)
 
 -- every function that runs with the rights of its owner or without a pinned search_path is listed above;
 -- none may be missing the pin
@@ -47,7 +48,7 @@ SELECT classid::regclass AS catalog, count(*) AS objects
      catalog      | objects 
 ------------------+---------
  pg_type          |       2
- pg_proc          |      10
+ pg_proc          |      11
  pg_class         |       1
  pg_am            |       1
  pg_event_trigger |       2
@@ -264,20 +265,20 @@ CREATE TABLE evil_pk (id int PRIMARY KEY);
 CREATE TABLE evil_fk (id int REFERENCES evil_pk (id)) USING columnar;
 ERROR:  foreign keys on or to columnar tables are not supported
 HINT:  Keep the referencing and the referenced table in row storage.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 8 at RAISE
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 48 at RAISE
 CREATE TABLE evil_t (id int) USING columnar;
 CREATE FUNCTION evil_trg() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
 CREATE TRIGGER evil_after AFTER INSERT ON evil_t FOR EACH ROW EXECUTE FUNCTION evil_trg();
 ERROR:  row-level AFTER triggers on columnar tables are not supported
 HINT:  Use a BEFORE ROW or a statement-level trigger, or keep the table in row storage.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 18 at RAISE
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 55 at RAISE
 CREATE TRIGGER evil_stmt AFTER INSERT ON evil_t FOR EACH STATEMENT EXECUTE FUNCTION evil_trg();
 INSERT INTO evil_t VALUES (1);
 SET search_path = public;
 -- dropping the tables of a non-superuser cleans the stripe catalog
-SELECT relfilenode AS evil_filenode FROM pg_class WHERE oid = 'evil_t'::regclass \gset
+SELECT kingres.columnar_identity('evil_t'::regclass) AS evil_filenode \gset
 RESET ROLE;
-SELECT count(*) AS stripe_rows FROM kingres.columnar_stripe WHERE filenode = :evil_filenode;
+SELECT count(*) AS stripe_rows FROM kingres.columnar_stripe WHERE rel_uid = :evil_filenode;
  stripe_rows 
 -------------
            1
@@ -286,7 +287,7 @@ SELECT count(*) AS stripe_rows FROM kingres.columnar_stripe WHERE filenode = :ev
 SET ROLE regress_kc_owner;
 DROP TABLE evil_t, evil_pk;
 RESET ROLE;
-SELECT count(*) AS stripe_rows FROM kingres.columnar_stripe WHERE filenode = :evil_filenode;
+SELECT count(*) AS stripe_rows FROM kingres.columnar_stripe WHERE rel_uid = :evil_filenode;
  stripe_rows 
 -------------
            0
@@ -297,15 +298,15 @@ DROP TABLE public.pg_trigger, public.pg_constraint;
 DROP FUNCTION evil_trg();
 RESET ROLE;
 -- DROP OWNED and DROP ROLE with columnar tables
-SELECT relfilenode AS s1_filenode FROM pg_class WHERE oid = 's1'::regclass \gset
-SELECT count(*) > 0 AS has_stripes FROM kingres.columnar_stripe WHERE filenode = :s1_filenode;
+SELECT kingres.columnar_identity('s1'::regclass) AS s1_filenode \gset
+SELECT count(*) > 0 AS has_stripes FROM kingres.columnar_stripe WHERE rel_uid = :s1_filenode;
  has_stripes 
 -------------
  t
 (1 row)
 
 DROP OWNED BY regress_kc_owner;
-SELECT count(*) AS stripe_rows FROM kingres.columnar_stripe WHERE filenode = :s1_filenode;
+SELECT count(*) AS stripe_rows FROM kingres.columnar_stripe WHERE rel_uid = :s1_filenode;
  stripe_rows 
 -------------
            0

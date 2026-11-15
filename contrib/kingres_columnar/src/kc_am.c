@@ -23,6 +23,7 @@
 #include <math.h>
 
 #include "access/heapam.h"
+#include "access/parallel.h"
 #include "access/multixact.h"
 #include "access/relscan.h"
 #include "access/tableam.h"
@@ -93,6 +94,12 @@ kc_scan_begin_cb(Relation rel, Snapshot snapshot, int nkeys, struct ScanKeyData 
 {
 	KcScan	   *scan;
 
+	/* the leader's unflushed rows are invisible to a worker: refuse, never answer wrongly */
+	if (IsParallelWorker())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("columnar tables cannot be read in a parallel worker"),
+				 errhint("Declare the function PARALLEL UNSAFE, or run the query without parallelism.")));
 	if (nkeys > 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -410,7 +417,6 @@ kc_relation_set_new_filelocator(Relation rel, const RelFileLocator *newrlocator,
 		RelationGetNumberOfBlocks(rel) > 0)
 	{
 		KcMetaData	m;
-		bool		outer;
 
 		truncating = true;
 		kc_meta_read(rel, &m);
@@ -419,13 +425,7 @@ kc_relation_set_new_filelocator(Relation rel, const RelFileLocator *newrlocator,
 		opts.stripe_rows = m.stripe_rows;
 		opts.chunk_rows = m.chunk_rows;
 
-		if (kc_write_has_outer_rows(RelationGetRelid(rel)))
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cannot truncate columnar table \"%s\" in a subtransaction after rows were inserted in an outer one",
-							RelationGetRelationName(rel))));
-		kc_write_discard_relation(RelationGetRelid(rel), &outer);
-		kc_catalog_delete_filenode(rel->rd_locator.relNumber);
+		kc_catalog_delete_uid(kc_rel_ident(rel)->uid);
 	}
 	(void) truncating;
 
@@ -443,7 +443,7 @@ kc_relation_nontransactional_truncate(Relation rel)
 	bool		outer;
 
 	kc_write_discard_relation(RelationGetRelid(rel), &outer);
-	kc_catalog_delete_filenode(rel->rd_locator.relNumber);
+	kc_catalog_delete_uid(kc_rel_ident(rel)->uid);
 	RelationTruncate(rel, 1);
 	kc_meta_reset(rel);
 }
@@ -461,8 +461,12 @@ kc_relation_copy_data(Relation rel, const RelFileLocator *newrlocator)
 	smgrclose(dstrel);
 	RelationDropStorage(rel);
 
-	/* the stripes keep their blocks: their rows follow the new file */
-	kc_catalog_rekey(rel->rd_locator.relNumber, newrlocator->relNumber);
+	/*
+	 * The copy keeps the identity in its metapage, so the stripes follow the
+	 * file with nothing to update, and a snapshot older than the move still
+	 * sees them.
+	 */
+	;
 }
 
 static void

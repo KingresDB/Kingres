@@ -141,23 +141,23 @@ CREATE TRIGGER evil_stmt AFTER INSERT ON evil_t FOR EACH STATEMENT EXECUTE FUNCT
 INSERT INTO evil_t VALUES (1);
 SET search_path = public;
 -- dropping the tables of a non-superuser cleans the stripe catalog
-SELECT relfilenode AS evil_filenode FROM pg_class WHERE oid = 'evil_t'::regclass \gset
+SELECT kingres.columnar_identity('evil_t'::regclass) AS evil_filenode \gset
 RESET ROLE;
-SELECT count(*) AS stripe_rows FROM kingres.columnar_stripe WHERE filenode = :evil_filenode;
+SELECT count(*) AS stripe_rows FROM kingres.columnar_stripe WHERE rel_uid = :evil_filenode;
 SET ROLE regress_kc_owner;
 DROP TABLE evil_t, evil_pk;
 RESET ROLE;
-SELECT count(*) AS stripe_rows FROM kingres.columnar_stripe WHERE filenode = :evil_filenode;
+SELECT count(*) AS stripe_rows FROM kingres.columnar_stripe WHERE rel_uid = :evil_filenode;
 SET ROLE regress_kc_owner;
 DROP TABLE public.pg_trigger, public.pg_constraint;
 DROP FUNCTION evil_trg();
 RESET ROLE;
 
 -- DROP OWNED and DROP ROLE with columnar tables
-SELECT relfilenode AS s1_filenode FROM pg_class WHERE oid = 's1'::regclass \gset
-SELECT count(*) > 0 AS has_stripes FROM kingres.columnar_stripe WHERE filenode = :s1_filenode;
+SELECT kingres.columnar_identity('s1'::regclass) AS s1_filenode \gset
+SELECT count(*) > 0 AS has_stripes FROM kingres.columnar_stripe WHERE rel_uid = :s1_filenode;
 DROP OWNED BY regress_kc_owner;
-SELECT count(*) AS stripe_rows FROM kingres.columnar_stripe WHERE filenode = :s1_filenode;
+SELECT count(*) AS stripe_rows FROM kingres.columnar_stripe WHERE rel_uid = :s1_filenode;
 SELECT to_regclass('s1') IS NULL AS s1_dropped;
 DROP OWNED BY regress_kc_reader, regress_kc_writer, regress_kc_other;
 REVOKE CREATE ON SCHEMA public FROM regress_kc_owner;

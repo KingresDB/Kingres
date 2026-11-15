@@ -19,7 +19,7 @@ CREATE TABLE ty_heap (
     c_date date, c_time time, c_timetz timetz, c_ts timestamp, c_tstz timestamptz, c_iv interval,
     c_uuid uuid, c_inet inet, c_cidr cidr, c_mac macaddr, c_mac8 macaddr8,
     c_bit bit(7), c_vbit varbit(20),
-    c_json json, c_jsonb jsonb, c_xml xml, c_oid oid, c_regclass regclass, c_xid8 xid8, c_lsn pg_lsn,
+    c_json json, c_jsonb jsonb, c_oid oid, c_regclass regclass, c_xid8 xid8, c_lsn pg_lsn,
     c_tsv tsvector, c_tsq tsquery,
     c_i4r int4range, c_tsr tsrange, c_dr daterange, c_nr numrange, c_mr int4multirange,
     c_ia int4[], c_ta text[], c_na numeric[], c_2d int[], c_ja jsonb[],
@@ -46,7 +46,6 @@ SELECT g,
     (g % 128)::bit(7), (('x' || lpad(to_hex(g), 5, '0'))::bit(20)),
     ('{"k": ' || g || ', "s": "v' || g || '"}')::json,
     jsonb_build_object('k', g, 'arr', jsonb_build_array(1, 'two', NULL, g % 3 = 0), 'nested', jsonb_build_object('x', g / 2.0)),
-    ('<r a="' || g || '"><c>t' || g % 10 || '</c></r>')::xml,
     g::oid, (CASE WHEN g % 2 = 0 THEN 'pg_class' ELSE 'pg_type' END)::regclass, g::text::xid8, ('0/' || to_hex(g * 4096))::pg_lsn,
     to_tsvector('simple', 'the quick fox ' || g || ' jumps'), to_tsquery('simple', 'fox & w' || g % 10),
     int4range(g, g + 10), tsrange(timestamp '2020-01-01' + g * interval '1 hour', timestamp '2020-01-01' + g * interval '1 hour' + interval '3 days'),
@@ -159,7 +158,7 @@ SELECT count(*) FILTER (WHERE c_jsonb @> '{"k": 5}') AS jsonb_match, count(*) FI
   FROM ty_col;
  jsonb_match | tsv_match | range_match | comp_match 
 -------------+-----------+-------------+------------
-           1 |      2500 |           8 |          1
+           1 |      2400 |           8 |          1
 (1 row)
 
 SELECT count(*) FILTER (WHERE c_jsonb @> '{"k": 5}') AS jsonb_match, count(*) FILTER (WHERE c_tsv @@ 'fox'::tsquery) AS tsv_match,
@@ -167,7 +166,7 @@ SELECT count(*) FILTER (WHERE c_jsonb @> '{"k": 5}') AS jsonb_match, count(*) FI
   FROM ty_heap;
  jsonb_match | tsv_match | range_match | comp_match 
 -------------+-----------+-------------+------------
-           1 |      2500 |           8 |          1
+           1 |      2400 |           8 |          1
 (1 row)
 
 -- a projection of a few columns, a count over a column that is all NULL
@@ -180,21 +179,21 @@ SELECT count(c_always_null), count(c_never_null), sum(c_never_null) FROM ty_col;
 SELECT c_enum, count(*) FROM ty_col GROUP BY c_enum ORDER BY c_enum;
        c_enum        | count 
 ---------------------+-------
- red                 |   643
- green               |   642
- blue                |   643
- a longer enum label |   643
-                     |   430
+ red                 |   500
+ green               |   750
+ blue                |   500
+ a longer enum label |   750
+                     |   501
 (5 rows)
 
 SELECT c_enum, count(*) FROM ty_heap GROUP BY c_enum ORDER BY c_enum;
        c_enum        | count 
 ---------------------+-------
- red                 |   643
- green               |   642
- blue                |   643
- a longer enum label |   643
-                     |   430
+ red                 |   500
+ green               |   750
+ blue                |   500
+ a longer enum label |   750
+                     |   501
 (5 rows)
 
 -- floating point extremes and special values

@@ -82,7 +82,7 @@ sub state
 	my ($node) = @_;
 	return $node->safe_psql('postgres', qq{
 		WITH s AS (SELECT * FROM kingres.columnar_stripe
-					WHERE filenode = pg_relation_filenode('c'))
+					WHERE rel_uid = kingres.columnar_identity('c'))
 		SELECT format('rows=%s twin=%s same=%s dups=%s check=%s stripes_bad=%s',
 			(SELECT count(*) FROM c),
 			(SELECT count(*) FROM h),
@@ -249,7 +249,7 @@ $bg = $node->background_psql('postgres');
 $bg->query_safe('BEGIN;' . load_sql(10001, 12000) . load_sql(12001, 14500));
 my $inflight = $bg->query_safe(
 	q{SELECT count(*) FROM kingres.columnar_stripe
-	   WHERE filenode = pg_relation_filenode('c')});
+	   WHERE rel_uid = kingres.columnar_identity('c')});
 cmp_ok($inflight, '>=', 7,
 	'(b) the open transaction has already written stripes');
 my $size_before = $node->safe_psql('postgres', "SELECT pg_relation_size('c')");

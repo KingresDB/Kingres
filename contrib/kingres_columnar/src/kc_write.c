@@ -42,6 +42,7 @@
 #include "catalog/storage.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "storage/predicate.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -55,6 +56,7 @@ typedef struct KcWriteBuf
 	uint32		serial;
 	Oid			relid;
 	SubTransactionId subid;
+	uint64		uid;			/* identity of the file the rows were written for */
 	MemoryContext cxt;
 	int			ncols;
 	uint32		nrows;
@@ -175,6 +177,7 @@ kc_buf_create(KcRelState *st, Relation rel, int ncols)
 	b->serial = kc_next_serial++;
 	b->relid = RelationGetRelid(rel);
 	b->subid = GetCurrentSubTransactionId();
+	b->uid = kc_rel_ident(rel)->uid;
 	b->cxt = cxt;
 	b->ncols = ncols;
 
@@ -344,6 +347,19 @@ kc_buf_flushable(KcRelState *st, KcWriteBuf *b)
 
 static void kc_flush_buf(KcRelState *st, KcWriteBuf *b, Relation rel);
 
+/*
+ * Rows buffered for a file the relation no longer has (it was truncated or
+ * rewritten after they were written: a rewrite reads them and writes them
+ * into the new file, TRUNCATE discards them) are not the table's any more.  They are
+ * kept, hidden, until the transaction ends, because a rollback of the
+ * subtransaction that replaced the file brings the old file back.
+ */
+static bool
+kc_buf_is_stale(KcWriteBuf *b, Relation rel)
+{
+	return b->uid != kc_rel_ident(rel)->uid;
+}
+
 /* Flush the largest flushable buffer of any relation; false if none. */
 static bool
 kc_flush_largest(void)
@@ -394,10 +410,14 @@ kc_write_row_values(Relation rel, Datum *vals, bool *nulls, CommandId cid)
 	int			c;
 	Size		rowbytes = 0;
 
+	/* a write conflicts with transactions that read the table (SSI) */
+	CheckForSerializableConflictIn(rel, NULL, InvalidBlockNumber);
+
 	if (st->bufs != NIL)
 	{
 		b = llast(st->bufs);
-		if (b->subid != GetCurrentSubTransactionId())
+		if (b->subid != GetCurrentSubTransactionId() ||
+			b->uid != kc_rel_ident(rel)->uid)
 			b = NULL;
 	}
 	if (b == NULL)
@@ -634,6 +654,8 @@ kc_build_stripe(Relation rel, KcWriteBuf *b, const KcOptions *opts,
 				mm = false;
 		}
 		memset(&d, 0, sizeof(d));
+		d.typid = ci->typid;
+		d.collation = ci->collation;
 		d.nnulls = (uint32) cs[c].nnulls;
 		d.flags = (cs[c].nnulls > 0 ? KC_CHUNK_HAS_NULLS : 0) |
 			(mm ? KC_CHUNK_HAS_MINMAX : 0);
@@ -750,9 +772,9 @@ kc_flush_buf(KcRelState *st, KcWriteBuf *b, Relation rel)
 	if (b->nrows == 0)
 		return;
 
-	if (!kc_rel_is_columnar(rel))
+	if (!kc_rel_is_columnar(rel) || kc_buf_is_stale(b, rel))
 	{
-		/* the table was converted to another access method meanwhile */
+		/* converted to another access method, truncated or rewritten meanwhile */
 		kc_buf_clear(b);
 		return;
 	}
@@ -808,25 +830,6 @@ kc_write_flush_relation(Relation rel)
 	}
 }
 
-/* Rows buffered by an outer level of the subtransaction stack? */
-bool
-kc_write_has_outer_rows(Oid relid)
-{
-	KcRelState *st = kc_state_get(relid, false);
-	ListCell   *lc;
-
-	if (st == NULL)
-		return false;
-	foreach(lc, st->bufs)
-	{
-		KcWriteBuf *b = lfirst(lc);
-
-		if (b->nrows > 0 && b->subid != GetCurrentSubTransactionId())
-			return true;
-	}
-	return false;
-}
-
 /* Forget the running subtransaction's buffered rows of a relation. */
 void
 kc_write_discard_relation(Oid relid, bool *had_outer)
@@ -863,7 +866,7 @@ kc_write_pin_relation(Oid relid, int delta)
 
 /* The buffers a scan starting now has to read, with their current sizes. */
 KcPendingRef *
-kc_write_pending_refs(Oid relid, int *n)
+kc_write_pending_refs(Oid relid, uint64 uid, int *n)
 {
 	KcRelState *st = kc_state_get(relid, false);
 	KcPendingRef *res;
@@ -878,7 +881,7 @@ kc_write_pending_refs(Oid relid, int *n)
 	{
 		KcWriteBuf *b = lfirst(lc);
 
-		if (b->nrows == 0)
+		if (b->nrows == 0 || b->uid != uid)
 			continue;
 		res[i].serial = b->serial;
 		res[i].nrows = b->nrows;
@@ -1034,12 +1037,14 @@ kc_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 			{
 				kc_buf_clear(b);
 				MemoryContextDelete(b->cxt);
+				pfree(b);
 				continue;
 			}
 
 			/* commit: the rows now belong to the parent subtransaction */
 			if (prev != NULL && prev->subid == parentSubid &&
-				prev->ncols == b->ncols)
+				prev->ncols == b->ncols && prev->uid == b->uid &&
+				st->pins == 0)
 			{
 				uint32		r;
 

@@ -293,7 +293,7 @@ is($node->safe_psql('postgres', q{SELECT count(*) FROM kingres.columnar_check()}
 # file, and overlaps no other stripe (V7).
 my $stripe_sql = q{
 	WITH s AS (SELECT * FROM kingres.columnar_stripe
-				WHERE filenode = pg_relation_filenode('c'))
+				WHERE rel_uid = kingres.columnar_identity('c'))
 	SELECT (SELECT count(*) FROM s a JOIN s b ON a.stripe_id < b.stripe_id
 				AND a.first_block < b.first_block + b.block_count
 				AND b.first_block < a.first_block + a.block_count)

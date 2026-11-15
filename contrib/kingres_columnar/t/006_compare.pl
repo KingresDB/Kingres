@@ -290,6 +290,9 @@ my @VARIANTS = (
 	[ 'scan',    '' ],
 	[ 'nocs',    'SET kingres_columnar.enable_custom_scan = off;' ],
 	[ 'noskip',  'SET kingres_columnar.enable_chunk_skipping = off;' ],
+	# forced parallel plans: no path over a columnar table may run in a worker
+	[ 'par',     'SET debug_parallel_query = on; SET parallel_setup_cost = 0; SET parallel_tuple_cost = 0; '
+	  . 'SET min_parallel_table_scan_size = 0; SET max_parallel_workers_per_gather = 2;' ],
 );
 my $qid = 0;
 my %QTEXT;
@@ -314,7 +317,9 @@ sub compare_sql
 			$out .= "\\echo \@\@Q $id h $v->[0]\n$qh;\n";
 			$out .= "$v->[1]\n" if $v->[1];
 			$out .= "\\echo \@\@Q $id c $v->[0]\n$qc;\n";
-			$out .= "RESET kingres_columnar.enable_custom_scan;\nRESET kingres_columnar.enable_chunk_skipping;\n" if $v->[1];
+			$out .= "RESET kingres_columnar.enable_custom_scan;\nRESET kingres_columnar.enable_chunk_skipping;\n"
+			  . "RESET debug_parallel_query;\nRESET parallel_setup_cost;\nRESET parallel_tuple_cost;\n"
+			  . "RESET min_parallel_table_scan_size;\nRESET max_parallel_workers_per_gather;\n" if $v->[1];
 			$out .= "\\echo \@\@E $id\n";
 			$QTEXT{$id} = $q;   # for the failure report
 		}
@@ -404,6 +409,11 @@ sub make_step
 		my $nops = 1 + int(rand(6));
 		my $nsp = 0;
 		my @stack;
+		my @cursors;			# open cursors: { n, seq }
+		my %spseq;				# savepoint number => sequence number
+		my $ncur = 0;
+		my $had_cursor = 0;		# a cursor was declared: no TRUNCATE or rewrite after it
+		my $seq = 0;
 		for my $i (1 .. $nops)
 		{
 			my $r = rand();
@@ -417,26 +427,61 @@ sub make_step
 				my $n = ++$nsp;
 				$s .= "SAVEPOINT sp$n;\n";
 				push @stack, $n;
+				$spseq{$n} = ++$seq;
 			}
 			elsif ($r < 0.8 && @stack)
 			{
 				$s .= "ROLLBACK TO sp$stack[-1];\n";
+				# the rollback closes the cursors declared after the savepoint
+				@cursors = grep { $_->{seq} < $spseq{ $stack[-1] } } @cursors;
 			}
 			elsif ($r < 0.9 && @stack)
 			{
 				$s .= "RELEASE sp$stack[-1];\n";
 				pop @stack;
 			}
-			elsif ($r < 0.95)
+			elsif ($r < 0.85)
 			{
 				$s .= compare_sql(1, 0);
+			}
+			elsif ($r < 0.89 && !$had_cursor)
+			{
+				# a rewrite of the table while rows are buffered
+				$s .= rewrite_step();
+				$stat{'rewrite in txn'}++;
+			}
+			elsif ($r < 0.915)
+			{
+				# a cursor over the table, fetched later in the transaction
+				my $n = ++$ncur;
+				$had_cursor = 1;
+				my $pred = predicate();
+				$s .= "DECLARE ch$n CURSOR FOR SELECT id FROM h WHERE $pred ORDER BY id;\n";
+				$s .= "DECLARE cc$n CURSOR FOR SELECT id FROM c WHERE $pred ORDER BY id;\n";
+				push @cursors, { n => $n, seq => ++$seq };
+				$stat{'cursor'}++;
+			}
+			elsif ($r < 0.97 && @cursors)
+			{
+				# fetch a cursor: it must have kept every row it was entitled to
+				# across RELEASE, ROLLBACK TO and flushes caused by size
+				my $cu = splice(@cursors, int(rand(@cursors)), 1);
+				my $id = ++$qid;
+				$s .= "\\echo \@\@Q $id h scan\nFETCH ALL FROM ch$cu->{n};\n"
+				  . "\\echo \@\@Q $id c scan\nFETCH ALL FROM cc$cu->{n};\n\\echo \@\@E $id\n";
+				$QTEXT{$id} = "cursor $cu->{n}";
+				$stat{'cursor fetch'}++;
 			}
 			else
 			{
 				# TRUNCATE inside a transaction.  If rows were inserted before
 				# (in this transaction), the columnar table may refuse it
 				# inside a subtransaction; guard it and roll back to the guard.
-				if ($inserted || @stack)
+				if ($had_cursor)
+				{
+					$s .= compare_sql(1, 0);	# no TRUNCATE under an open cursor
+				}
+				elsif ($inserted || @stack)
 				{
 					$s .= "SAVEPOINT trg;\nTRUNCATE h;\nTRUNCATE c;\n\\if :ERROR\nROLLBACK TO trg;\n\\endif\nRELEASE trg;\n";
 				}
@@ -451,6 +496,14 @@ sub make_step
 		my $end = rand() < 0.5 ? 'COMMIT' : 'ROLLBACK';
 		$s .= "$end;\n";
 		$d = "txn ($nops ops, $end)";
+	}
+	elsif ($kind eq 'rewrite')
+	{
+		$s .= "BEGIN;\n" . both(rnd_insert());
+		$s .= "SAVEPOINT rs;\n" . rewrite_step() . compare_sql(1, 0);
+		$s .= both(rnd_insert()) . "ROLLBACK TO rs;\n" . compare_sql(1, 0);
+		$s .= rewrite_step() . compare_sql(1, 0);
+		$s .= (rand() < 0.7 ? 'COMMIT' : 'ROLLBACK') . ";\n";
 	}
 	elsif ($kind eq 'truncate')
 	{
@@ -528,9 +581,25 @@ sub make_step
 	return ($s, $d);
 }
 
+# A rewrite of the table: a type change of column a on both tables, or the
+# columnar table taken through the heap access method and back.  Rows the
+# transaction buffered must be carried into the new storage exactly once, at
+# every savepoint level, and a rollback to a savepoint brings the old file
+# and its rows back.
+sub rewrite_step
+{
+	if (rand() < 0.25 || !has('a'))
+	{
+		return "ALTER TABLE c SET ACCESS METHOD heap;\nALTER TABLE c SET ACCESS METHOD columnar;\n"
+		  . "SELECT kingres.columnar_set_options('c', stripe_row_count => 1000, chunk_row_count => 100);\n";
+	}
+	my $nt = (qw(bigint int numeric))[ int(rand(3)) ];
+	return both("ALTER TABLE %T ALTER COLUMN a TYPE $nt USING a::$nt");
+}
+
 # step kinds and weights
 my @KINDS = (
-	[ insert => 30 ], [ copy => 4 ], [ txn => 28 ], [ truncate => 2 ],
+	[ insert => 30 ], [ copy => 4 ], [ txn => 28 ], [ truncate => 2 ], [ rewrite => 4 ],
 	[ vacuum => 3 ], ['vacuum full' => 2], [ analyze => 2 ], [ compact => 3 ],
 	['add column' => 2], ['drop column' => 1], [ options => 5 ], [ checkpoint => 1 ],
 	[ restart => 1.2 ],

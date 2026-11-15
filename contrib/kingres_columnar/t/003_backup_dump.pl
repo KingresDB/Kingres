@@ -385,7 +385,7 @@ sub check_restored
 		"$dst_codec|5|20000|2000", "$label: ect too");
 	is(check_rows($ddst, $db), '', "$label: columnar_check clean");
 	is($ddst->safe_psql($db, "SELECT count(*) FROM kingres.columnar_stripe"),
-		$ddst->safe_psql($db, "SELECT count(*) FROM kingres.columnar_stripe s WHERE filenode IN (SELECT relfilenode FROM pg_class)"),
+		$ddst->safe_psql($db, "SELECT count(*) FROM kingres.columnar_stripe s WHERE rel_uid IN (SELECT kingres.columnar_identity(oid) FROM pg_class WHERE relkind = 'r' AND relam = (SELECT oid FROM pg_am WHERE amname = 'columnar'))"),
 		"$label: every stripe row belongs to a table");
 }
 

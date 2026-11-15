@@ -1,4 +1,5 @@
 # Portions Copyright (c) 2026, RooyeKhat Media Co
+# SPDX-License-Identifier: AGPL-3.0-only
 
 kingres_columnar_sources = files(
   'src/kc_am.c',
@@ -55,6 +56,7 @@ tests += {
       'columnar_stats',
       'columnar_vacuum',
       'columnar_analyze',
+      'columnar_review',
       'columnar_security',
     ],
     'regress_args': ['--temp-config', files('kingres_columnar.conf')],
@@ -67,6 +69,8 @@ tests += {
       't/004_concurrent.pl',
       't/005_corruption.pl',
       't/006_compare.pl',
+      't/007_snapshots.pl',
+      't/008_array_validation.pl',
     ],
   },
 }

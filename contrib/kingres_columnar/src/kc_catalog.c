@@ -2,7 +2,7 @@
  *
  * kc_catalog.c
  *	  The stripe catalog: the heap table kingres.columnar_stripe, one row per
- *	  stripe, keyed by the relfilenode of the relation the stripe lives in.
+ *	  stripe, keyed by the identity of the stored content (an id in the metapage, copied with the file).
  *
  * A row of a columnar table is visible to a snapshot exactly when its stripe
  * is, and a stripe is visible when its catalog row is visible under the
@@ -27,6 +27,8 @@
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
+#include "access/multixact.h"
+#include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
@@ -35,6 +37,8 @@
 #include "catalog/pg_extension.h"
 #include "commands/extension.h"
 #include "miscadmin.h"
+#include "storage/bufmgr.h"
+#include "storage/smgr.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
@@ -46,7 +50,7 @@
 #include "kingres_columnar.h"
 
 #define Natts_kc_stripe				13
-#define Anum_kc_filenode			1
+#define Anum_kc_uid					1
 #define Anum_kc_stripe_id			2
 #define Anum_kc_first_row			3
 #define Anum_kc_row_count			4
@@ -162,7 +166,10 @@ kc_catalog_snapshot(Snapshot snap, bool *is_mvcc)
 		 * before it waits for the table lock, and a writer that committed
 		 * meanwhile must not be missed by the rewrite.
 		 */
-		base = GetLatestSnapshot();
+		if (IsInParallelMode())
+			base = GetActiveSnapshot();
+		else
+			base = GetLatestSnapshot();
 		*copy = *base;
 		*is_mvcc = false;
 	}
@@ -186,6 +193,51 @@ kc_latest_snapshot(void)
 	bool		dummy;
 
 	return kc_catalog_snapshot(GetLatestSnapshot(), &dummy);
+}
+
+/*
+ * Is a catalog row visible to the snapshot (a copy prepared by
+ * kc_catalog_snapshot, with its command id raised)?  The catalog is scanned
+ * with SnapshotAny and the heap visibility rules are applied here, because a
+ * scan with an MVCC snapshot would take predicate locks on the pages of the
+ * one index all columnar tables share, and under SERIALIZABLE make
+ * transactions on unrelated tables abort each other.  The table itself has
+ * its own relation-level predicate lock (kc_scan.c) and conflict check
+ * (kc_write.c).
+ */
+static bool
+kc_tuple_visible(HeapTuple tup, Snapshot snap)
+{
+	HeapTupleHeader th = tup->t_data;
+	TransactionId xmin = HeapTupleHeaderGetRawXmin(th);
+
+	if (!HeapTupleHeaderXminFrozen(th))
+	{
+		if (th->t_infomask & HEAP_XMIN_INVALID)
+			return false;
+		if (!TransactionIdIsCurrentTransactionId(xmin))
+		{
+			if (XidInMVCCSnapshot(xmin, snap))
+				return false;
+			if (!(th->t_infomask & HEAP_XMIN_COMMITTED) &&
+				!TransactionIdDidCommit(xmin))
+				return false;
+		}
+	}
+	if ((th->t_infomask & HEAP_XMAX_INVALID) ||
+		HEAP_XMAX_IS_LOCKED_ONLY(th->t_infomask))
+		return true;
+	{
+		TransactionId xmax = HeapTupleHeaderGetUpdateXid(th);
+
+		if (TransactionIdIsCurrentTransactionId(xmax))
+			return false;
+		if (XidInMVCCSnapshot(xmax, snap))
+			return true;
+		if (th->t_infomask & HEAP_XMAX_COMMITTED)
+			return false;
+		return !TransactionIdDidCommit(xmax);
+	}
 }
 
 /* ------------------------------------------------------------------------
@@ -262,11 +314,13 @@ kc_catalog_load(Relation rel, Snapshot snap, int *nstripes)
 	int			n = 0;
 	int			cap = 0;
 
-	ScanKeyInit(&key, Anum_kc_filenode, BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(rel->rd_locator.relNumber));
-	scan = systable_beginscan(cat, kc_catalog_index_oid(), true, snap, 1, &key);
+	ScanKeyInit(&key, Anum_kc_uid, BTEqualStrategyNumber, F_INT8EQ,
+				Int64GetDatum((int64) kc_rel_ident(rel)->uid));
+	scan = systable_beginscan(cat, kc_catalog_index_oid(), true, SnapshotAny, 1, &key);
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
 	{
+		if (!kc_tuple_visible(tup, snap))
+			continue;
 		if (n == cap)
 		{
 			cap = cap ? cap * 2 : 16;
@@ -341,7 +395,7 @@ kc_catalog_insert(Relation rel, const KcStripeInfo *si, const char *cid_points,
 	memcpy(VARDATA(cs), col_stats, stats_len);
 
 	memset(n, 0, sizeof(n));
-	v[Anum_kc_filenode - 1] = ObjectIdGetDatum(rel->rd_locator.relNumber);
+	v[Anum_kc_uid - 1] = Int64GetDatum((int64) kc_rel_ident(rel)->uid);
 	v[Anum_kc_stripe_id - 1] = Int64GetDatum((int64) si->stripe_id);
 	v[Anum_kc_first_row - 1] = Int64GetDatum((int64) si->first_row);
 	v[Anum_kc_row_count - 1] = Int32GetDatum((int32) si->row_count);
@@ -363,43 +417,49 @@ kc_catalog_insert(Relation rel, const KcStripeInfo *si, const char *cid_points,
 	table_close(cat, RowExclusiveLock);
 }
 
-/* Delete the rows of one filenode that are visible (to us, now). */
+/* Delete the rows of one stored content that are visible (to us, now). */
 void
-kc_catalog_delete_filenode(Oid filenode)
+kc_catalog_delete_uid(uint64 uid)
 {
 	Relation	cat = table_open(kc_catalog_oid(), RowExclusiveLock);
 	ScanKeyData key;
 	SysScanDesc scan;
 	HeapTuple	tup;
+	Snapshot	vsnap;
 
-	ScanKeyInit(&key, Anum_kc_filenode, BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(filenode));
+	ScanKeyInit(&key, Anum_kc_uid, BTEqualStrategyNumber, F_INT8EQ,
+				Int64GetDatum((int64) uid));
+	vsnap = kc_latest_snapshot();
 	scan = systable_beginscan(cat, kc_catalog_index_oid(), true,
-							  kc_latest_snapshot(), 1, &key);
+							  SnapshotAny, 1, &key);
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
-		CatalogTupleDelete(cat, &tup->t_self);
+		if (kc_tuple_visible(tup, vsnap))
+			CatalogTupleDelete(cat, &tup->t_self);
 	systable_endscan(scan);
 	table_close(cat, RowExclusiveLock);
 }
 
 /* Delete one stripe's row; returns the number of rows deleted. */
 int
-kc_catalog_delete_stripe(Oid filenode, uint64 stripe_id)
+kc_catalog_delete_stripe(uint64 uid, uint64 stripe_id)
 {
 	Relation	cat = table_open(kc_catalog_oid(), RowExclusiveLock);
 	ScanKeyData key[2];
 	SysScanDesc scan;
 	HeapTuple	tup;
+	Snapshot	vsnap = kc_latest_snapshot();
 	int			n = 0;
 
-	ScanKeyInit(&key[0], Anum_kc_filenode, BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(filenode));
+	ScanKeyInit(&key[0], Anum_kc_uid, BTEqualStrategyNumber, F_INT8EQ,
+				Int64GetDatum((int64) uid));
 	ScanKeyInit(&key[1], Anum_kc_stripe_id, BTEqualStrategyNumber, F_INT8EQ,
 				Int64GetDatum((int64) stripe_id));
 	scan = systable_beginscan(cat, kc_catalog_index_oid(), true,
-							  kc_latest_snapshot(), 2, key);
+							  SnapshotAny, 2, key);
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
 	{
+		if (!kc_tuple_visible(tup, vsnap))
+			continue;
 		CatalogTupleDelete(cat, &tup->t_self);
 		n++;
 	}
@@ -408,72 +468,75 @@ kc_catalog_delete_stripe(Oid filenode, uint64 stripe_id)
 	return n;
 }
 
-/*
- * The relation got a new file by a plain copy (SET TABLESPACE): the stripes
- * keep their pages at the same blocks, so the catalog rows are re-keyed.  An
- * update keeps the old rows for the transactions that still use the old file.
- */
-void
-kc_catalog_rekey(Oid old_filenode, Oid new_filenode)
-{
-	Relation	cat = table_open(kc_catalog_oid(), RowExclusiveLock);
-	ScanKeyData key;
-	SysScanDesc scan;
-	HeapTuple	tup;
-	List	   *tuples = NIL;
-	ListCell   *lc;
-
-	ScanKeyInit(&key, Anum_kc_filenode, BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(old_filenode));
-	scan = systable_beginscan(cat, kc_catalog_index_oid(), true,
-							  kc_latest_snapshot(), 1, &key);
-	while (HeapTupleIsValid(tup = systable_getnext(scan)))
-		tuples = lappend(tuples, heap_copytuple(tup));
-	systable_endscan(scan);
-
-	foreach(lc, tuples)
-	{
-		HeapTuple	old = (HeapTuple) lfirst(lc);
-		Datum		v[Natts_kc_stripe];
-		bool		n[Natts_kc_stripe];
-		bool		r[Natts_kc_stripe];
-		HeapTuple	nt;
-
-		memset(r, 0, sizeof(r));
-		r[Anum_kc_filenode - 1] = true;
-		v[Anum_kc_filenode - 1] = ObjectIdGetDatum(new_filenode);
-		n[Anum_kc_filenode - 1] = false;
-		nt = heap_modify_tuple(old, RelationGetDescr(cat), v, n, r);
-		CatalogTupleUpdate(cat, &old->t_self, nt);
-		heap_freetuple(nt);
-	}
-	table_close(cat, RowExclusiveLock);
-}
-
 /* ------------------------------------------------------------------------
  * Reconciliation: remove the rows of files that no relation uses any more
  * ------------------------------------------------------------------------
  */
 
 static int
-kc_oid_cmp(const void *a, const void *b)
+kc_u64_cmp(const void *a, const void *b)
 {
-	Oid			x = *(const Oid *) a;
-	Oid			y = *(const Oid *) b;
+	uint64		x = *(const uint64 *) a;
+	uint64		y = *(const uint64 *) b;
 
 	return (x > y) - (x < y);
 }
 
 /*
+ * The identity stored in block 0 of the file a pg_class row names, or 0 when
+ * the file does not exist yet or is not one of ours.  Read through the buffer
+ * manager without a lock on the relation: the relation may belong to a
+ * transaction that has not committed.
+ */
+static uint64
+kc_uid_of_file(Form_pg_class cl, bool *unknown)
+{
+	RelFileLocator loc;
+	SMgrRelation srel;
+	PGIOAlignedBlock buf;
+	KcMetaData *m;
+	KcMetaData	copy;
+
+	loc.spcOid = OidIsValid(cl->reltablespace) ? cl->reltablespace : MyDatabaseTableSpace;
+	loc.dbOid = MyDatabaseId;
+	loc.relNumber = cl->relfilenode;
+	srel = smgropen(loc, INVALID_PROC_NUMBER);
+	if (!smgrexists(srel, MAIN_FORKNUM) || smgrnblocks(srel, MAIN_FORKNUM) == 0)
+		return 0;
+
+	/*
+	 * Read the file itself, not through the buffer manager: the identity is
+	 * written once, when the file is created, straight to the file, and a
+	 * damaged page of one table must not make a VACUUM or a DROP of another
+	 * one fail.  A page that is not a valid metapage makes the identities
+	 * unknown, and the caller then deletes nothing.
+	 */
+	smgrread(srel, MAIN_FORKNUM, 0, buf.data);
+	m = (KcMetaData *) PageGetContents((Page) buf.data);
+	copy = *m;
+	copy.crc = 0;
+	if (PageIsNew((Page) buf.data) || PageGetSpecialSize((Page) buf.data) != 0 ||
+		m->magic != KC_META_MAGIC ||
+		(uint32) kc_crc32c((const char *) &copy, sizeof(copy)) != m->crc)
+	{
+		*unknown = true;
+		return 0;
+	}
+	return m->rel_uid;
+}
+
+/*
  * A table access method has no callback at DROP, and a rewrite leaves the old
- * file's rows behind, so the rows whose filenode no relation owns any more
- * are removed here: after a drop, at the end of VACUUM, and by columnar_check.
+ * file's rows behind, so the rows whose stored content no relation owns any
+ * more are removed here: after a drop, at the end of VACUUM, and by
+ * columnar_check.
  *
- * The set of live filenodes is read from pg_class with a dirty snapshot, so
- * the relations of transactions that have not committed yet (a table being
- * created, or rewritten, by another session) keep their rows; the rows
- * deleted are only those a committed-or-own snapshot sees.  Returns the number
- * of rows deleted.
+ * The catalog is read first, with a current snapshot; the identities of the
+ * live files are then read from pg_class with a dirty snapshot, so the
+ * relations of transactions that have not committed yet (a table being
+ * created, or rewritten, by another session) keep their rows, and a table
+ * that commits after the catalog snapshot cannot lose rows it was not seen to
+ * have.  Returns the number of rows deleted.
  */
 static int
 kc_reconcile_ex(bool dry)
@@ -482,13 +545,15 @@ kc_reconcile_ex(bool dry)
 	SysScanDesc scan;
 	HeapTuple	tup;
 	SnapshotData dirty;
-	Oid		   *live = NULL;
+	uint64	   *live = NULL;
 	int			nlive = 0;
 	int			caplive = 0;
 	Oid			amoid = kc_am_oid();
 	Relation	cat;
 	ScanKeyData key;
 	int			ndel = 0;
+	Snapshot	catsnap = kc_latest_snapshot();
+	bool		unknown = false;
 
 	pgclass = table_open(RelationRelationId, AccessShareLock);
 	InitDirtySnapshot(dirty);
@@ -496,36 +561,49 @@ kc_reconcile_ex(bool dry)
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
 	{
 		Form_pg_class cl = (Form_pg_class) GETSTRUCT(tup);
+		uint64		uid;
 
 		if (!OidIsValid(amoid) || cl->relam != amoid ||
-			!OidIsValid(cl->relfilenode))
+			!OidIsValid(cl->relfilenode) ||
+			(cl->relkind != RELKIND_RELATION && cl->relkind != RELKIND_MATVIEW))
+			continue;
+		uid = kc_uid_of_file(cl, &unknown);
+		if (uid == 0)
 			continue;
 		if (nlive == caplive)
 		{
 			caplive = caplive ? caplive * 2 : 64;
-			live = live ? repalloc(live, sizeof(Oid) * caplive)
-				: palloc(sizeof(Oid) * caplive);
+			live = live ? repalloc(live, sizeof(uint64) * caplive)
+				: palloc(sizeof(uint64) * caplive);
 		}
-		live[nlive++] = cl->relfilenode;
+		live[nlive++] = uid;
 	}
 	systable_endscan(scan);
 	table_close(pgclass, AccessShareLock);
+	if (unknown)
+	{
+		ereport(LOG,
+				(errmsg("columnar stripe catalog cleanup skipped: a columnar relation has an unreadable metapage")));
+		if (live)
+			pfree(live);
+		return 0;
+	}
 	if (nlive > 1)
-		qsort(live, nlive, sizeof(Oid), kc_oid_cmp);
+		qsort(live, nlive, sizeof(uint64), kc_u64_cmp);
 
 	cat = table_open(kc_catalog_oid(), RowExclusiveLock);
 	scan = systable_beginscan(cat, kc_catalog_index_oid(), true,
-							  kc_latest_snapshot(), 0, &key);
+							  SnapshotAny, 0, &key);
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
 	{
 		bool		isnull;
-		Oid			fn = DatumGetObjectId(heap_getattr(tup, Anum_kc_filenode,
-													   RelationGetDescr(cat),
-													   &isnull));
+		uint64		uid = (uint64) DatumGetInt64(heap_getattr(tup, Anum_kc_uid,
+															  RelationGetDescr(cat),
+															  &isnull));
 
-		if (isnull)
+		if (isnull || !kc_tuple_visible(tup, catsnap))
 			continue;
-		if (nlive == 0 || bsearch(&fn, live, nlive, sizeof(Oid), kc_oid_cmp) == NULL)
+		if (nlive == 0 || bsearch(&uid, live, nlive, sizeof(uint64), kc_u64_cmp) == NULL)
 		{
 			if (!dry)
 				CatalogTupleDelete(cat, &tup->t_self);
@@ -538,6 +616,7 @@ kc_reconcile_ex(bool dry)
 		pfree(live);
 	return ndel;
 }
+
 
 int
 kc_catalog_reconcile(void)
@@ -571,7 +650,8 @@ kc_stats_corrupt(uint64 stripe_id, const char *what)
  * the catalog row's copy, which lives as long as the stripe list.
  */
 void
-kc_stripe_stats_parse(const KcStripeInfo *si, int ncols, KcColStat *out)
+kc_stripe_stats_parse(const KcStripeInfo *si, int ncols, const KcTypeInfo *ti,
+						 KcColStat *out)
 {
 	const char *p = VARDATA_ANY(si->col_stats);
 	Size		left = VARSIZE_ANY_EXHDR(si->col_stats);
@@ -599,7 +679,15 @@ kc_stripe_stats_parse(const KcStripeInfo *si, int ncols, KcColStat *out)
 			kc_stats_corrupt(si->stripe_id, "bad entry");
 		out[c].known = true;
 		out[c].nnulls = d.nnulls;
-		out[c].has_minmax = (d.flags & KC_CHUNK_HAS_MINMAX) != 0;
+		/*
+		 * Minimum and maximum are valid only for the ordering they were
+		 * computed with: the column's type and collation must be the same.
+		 * (A binary-coercible ALTER COLUMN TYPE keeps old stripes.)  The null
+		 * count does not depend on either.
+		 */
+		out[c].has_minmax = (d.flags & KC_CHUNK_HAS_MINMAX) != 0 &&
+			c < ti->natts && d.typid == ti->cols[c].typid &&
+			d.collation == ti->cols[c].collation;
 		out[c].min_len = d.min_len;
 		out[c].max_len = d.max_len;
 		out[c].min = p;

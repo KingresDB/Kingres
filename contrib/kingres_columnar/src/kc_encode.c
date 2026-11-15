@@ -32,6 +32,7 @@
 #include "catalog/pg_type.h"
 #include "common/pg_lzcompress.h"
 #include "lib/stringinfo.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -275,6 +276,14 @@ kc_typeinfo_build(TupleDesc tupdesc, MemoryContext cxt)
 		 * the one of a btree index and cannot depend on a sub-type's
 		 * collation, an enum's catalog order or a domain's constraint.
 		 */
+		if (att->attlen == -1 && OidIsValid(get_element_type(att->atttypid)))
+		{
+			ci->is_array = true;
+			ci->elemtype = get_element_type(att->atttypid);
+			get_typlenbyvalalign(ci->elemtype, &ci->elemlen, &ci->elembyval,
+								 &ci->elemalign);
+		}
+
 		if (get_typtype(att->atttypid) == TYPTYPE_BASE &&
 			!OidIsValid(get_element_type(att->atttypid)) &&
 			att->atttypid != RECORDOID)
@@ -577,6 +586,8 @@ kc_encode_chunk(const KcColInfo *ci, const Datum *vals, const bool *nulls,
 
 	memset(meta, 0, sizeof(*meta));
 	meta->raw_len = (uint32) rawsz;
+	meta->typid = ci->typid;
+	meta->collation = ci->collation;
 	meta->nnulls = nnulls;
 	meta->flags = (nnulls > 0 ? KC_CHUNK_HAS_NULLS : 0) |
 		(have_mm ? KC_CHUNK_HAS_MINMAX : 0);
@@ -589,6 +600,7 @@ kc_encode_chunk(const KcColInfo *ci, const Datum *vals, const bool *nulls,
 	{
 		meta->codec = (uint8) codec;
 		meta->comp_len = clen;
+		meta->crc = (uint32) kc_crc32c(comp, clen);
 		appendBinaryStringInfo(out, comp, clen);
 		pfree(comp);
 	}
@@ -596,6 +608,7 @@ kc_encode_chunk(const KcColInfo *ci, const Datum *vals, const bool *nulls,
 	{
 		meta->codec = KC_CODEC_NONE;
 		meta->comp_len = (uint32) rawsz;
+		meta->crc = (uint32) kc_crc32c(raw, rawsz);
 		appendBinaryStringInfo(out, raw, rawsz);
 	}
 	pfree(raw);
@@ -616,6 +629,101 @@ kc_chunk_corrupt(const char *relname, uint64 stripe_id, const char *what)
 			(errcode(ERRCODE_DATA_CORRUPTED),
 			 errmsg("columnar table \"%s\" is corrupt: stripe " UINT64_FORMAT ": %s",
 					relname, stripe_id, what)));
+}
+
+/*
+ * The cheap structural check of an array value read from disk: the header,
+ * the dimensions, the null bitmap and the element sizes must fit in the
+ * value, so that the array output and element access functions, which trust
+ * the header, cannot read outside it.  It does not check the elements'
+ * contents.
+ */
+static void
+kc_validate_array(const KcColInfo *ci, const char *ptr, Size size,
+				  const char *relname, uint64 stripe_id)
+{
+	const ArrayType *a = (const ArrayType *) ptr;
+	int			ndim;
+	const int  *dims;
+	int64		nitems = 1;
+	Size		overhead;
+	Size		pos;
+	int			i;
+
+	if (size < sizeof(ArrayType))
+		kc_chunk_corrupt(relname, stripe_id, "array value is shorter than its header");
+	ndim = a->ndim;
+	if (ndim < 0 || ndim > MAXDIM)
+		kc_chunk_corrupt(relname, stripe_id, "array has an impossible number of dimensions");
+	if (a->elemtype != ci->elemtype)
+		kc_chunk_corrupt(relname, stripe_id, "array element type does not match the column");
+	if (size < ARR_OVERHEAD_NONULLS(ndim))
+		kc_chunk_corrupt(relname, stripe_id, "array value is shorter than its dimensions");
+	dims = ARR_DIMS((ArrayType *) a);
+	for (i = 0; i < ndim; i++)
+	{
+		if (dims[i] < 0 || (dims[i] > 0 && nitems > (int64) (MaxAllocSize / sizeof(Datum)) / dims[i]))
+			kc_chunk_corrupt(relname, stripe_id, "array dimension is out of range");
+		nitems *= dims[i];
+	}
+	if (ndim == 0)
+		nitems = 0;
+	if (a->dataoffset == 0)
+		overhead = ARR_OVERHEAD_NONULLS(ndim);
+	else
+	{
+		overhead = ARR_OVERHEAD_WITHNULLS(ndim, nitems);
+		if ((Size) a->dataoffset != overhead || overhead > size)
+			kc_chunk_corrupt(relname, stripe_id, "array data offset is wrong");
+	}
+	if (overhead > size)
+		kc_chunk_corrupt(relname, stripe_id, "array header does not fit in the value");
+
+	pos = overhead;
+	if (ci->elemlen > 0)
+	{
+		int64		nonnull = nitems;
+
+		if (a->dataoffset != 0)
+		{
+			const uint8 *bm = ARR_NULLBITMAP((ArrayType *) a);
+
+			nonnull = 0;
+			for (i = 0; i < nitems; i++)
+				if (bm[i / 8] & (1 << (i % 8)))
+					nonnull++;
+		}
+		if ((uint64) nonnull * TYPEALIGN(ci->elemalign == 'd' ? 8 : ci->elemalign == 'i' ? 4 :
+										 ci->elemalign == 's' ? 2 : 1, ci->elemlen) > size - pos)
+			kc_chunk_corrupt(relname, stripe_id, "array elements do not fit in the value");
+	}
+	else if (ci->elemlen == -1)
+	{
+		const uint8 *bm = (a->dataoffset != 0) ? ARR_NULLBITMAP((ArrayType *) a) : NULL;
+		char		al = ci->elemalign;
+		int			algn = (al == 'd') ? 8 : (al == 'i') ? 4 : (al == 's') ? 2 : 1;
+
+		for (i = 0; i < nitems; i++)
+		{
+			Size		l;
+
+			if (bm && !(bm[i / 8] & (1 << (i % 8))))
+				continue;
+			pos = TYPEALIGN(algn, pos);
+			if (pos >= size)
+				kc_chunk_corrupt(relname, stripe_id, "array element lies outside the value");
+			if (VARATT_IS_EXTERNAL(ptr + pos) || VARATT_IS_COMPRESSED(ptr + pos))
+				kc_chunk_corrupt(relname, stripe_id, "array element has a toast header");
+			if (!VARATT_IS_SHORT(ptr + pos) && size - pos < VARHDRSZ)
+				kc_chunk_corrupt(relname, stripe_id, "array element lies outside the value");
+			l = VARSIZE_ANY(ptr + pos);
+			if (l == 0 || l > size - pos)
+				kc_chunk_corrupt(relname, stripe_id, "array element length is wrong");
+			pos += l;
+		}
+	}
+	else
+		kc_chunk_corrupt(relname, stripe_id, "array of an unsupported element type");
 }
 
 /*
@@ -668,6 +776,15 @@ kc_decode_chunk(const KcColInfo *ci, const char *comp, const KcChunkDisk *meta,
 		if (rawlen > maxraw)
 			kc_chunk_corrupt(relname, stripe_id, "chunk is larger than its rows can be");
 	}
+	/*
+	 * A variable-length chunk is bounded by what a group may hold: it closes at
+	 * KC_CHUNK_BYTE_LIMIT raw bytes, plus the last row, which is at most one
+	 * value (below MaxAllocSize).  A crafted frame cannot ask for more.
+	 */
+	if (ci->typlen == -1 &&
+		(uint64) rawlen > ((uint64) nrows + 7) / 8 + (uint64) nrows * 4 +
+		(uint64) KC_CHUNK_BYTE_LIMIT + (uint64) MaxAllocSize)
+		kc_chunk_corrupt(relname, stripe_id, "chunk is larger than a chunk group can be");
 	if (meta->codec == KC_CODEC_PGLZ && (uint64) rawlen > (uint64) meta->comp_len * 300 + 1024)
 		kc_chunk_corrupt(relname, stripe_id, "chunk expands more than the codec allows");
 	if (meta->codec == KC_CODEC_LZ4 && (uint64) rawlen > (uint64) meta->comp_len * 260 + 1024)
@@ -831,6 +948,8 @@ kc_decode_chunk(const KcColInfo *ci, const char *comp, const KcChunkDisk *meta,
 			area = (char *) MAXALIGN(area);
 			SET_VARSIZE(area, l + VARHDRSZ);
 			memcpy(VARDATA(area), data, l);
+			if (ci->is_array)
+				kc_validate_array(ci, area, l + VARHDRSZ, relname, stripe_id);
 			data += l;
 			vals[i] = PointerGetDatum(area);
 			area += l + VARHDRSZ;
