@@ -50,3 +50,9 @@ A cluster runs one major: all its servers are installed from the same branch. Mo
 - Checked on `kingres-19` at the sync from `28d79ad3c2`, on the tree exactly as committed: the whole tree builds with assertions enabled and without a compiler warning; the core regression suite passes (243 tests); the suites of the four extensions pass in tree (73 suites, and the test that needs an installation of the other major skips). Out of tree, every extension passes on 18.7 and on 19rc2 with `-Werror`; `kingres_shard` runs 47 TAP files with 5847 subtests on each.
 - Not checked on 19 yet: the control plane's integration suite against PostgreSQL 19 instances, and the packaging. The packaging builds one major today and names its artifacts without the major, so there is no package or image for 19.
 - No release has been tagged on either branch.
+
+## Where the checks run
+
+GitHub Actions is switched off for the repository, by decision of the project owner: no check of this project runs on GitHub, and no workflow of the project is published. The tree of PostgreSQL 19 contains upstream's own workflow file (`.github/workflows/pg-ci.yml`); it stays in the tree unchanged, as every upstream file does, and does not run. Every check named in this document is run on a developer's machine with the scripts in `kingres/dev`, `kingres/control-plane/scripts`, `kingres/web` and `kingres/packaging/test`, and its result is recorded in the work log.
+
+Pushing `kingres-19` needs credentials that may write workflow files whenever that upstream file changes, which happens when the branch moves to a new upstream tag.

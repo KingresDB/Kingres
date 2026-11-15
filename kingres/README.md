@@ -8,7 +8,7 @@
 
 # KingresDB
 
-KingresDB is a thin fork of PostgreSQL 18 that adds three things:
+KingresDB is a thin fork of PostgreSQL that adds three things:
 
 - **Sharding.** Tables are split into a fixed number of hash buckets spread over several servers. The logic lives in an extension (`kingres_shard`), not in the executor.
 - **A tamper-evident ledger.** Ledger tables keep a hash chain and Merkle blocks, so changes to history can be detected, with digests that can be anchored outside the database (`kingres_ledger`).
