@@ -31,8 +31,9 @@ There is one product branch per PostgreSQL major, with the same KingresDB code o
 | 4 Bucket movement and rebalancing | In progress: `kingres_shard` 0.4 moves buckets (0.4 is the fix round for the review of 0.3; its fixes are being reviewed again); rebalancing is not yet driven by the control plane |
 | 5 High availability | In progress: designed; standbys, leases and heartbeats are being written; failover is not started |
 | 6 Ledger | Done (`kingres_ledger` 0.2, the verifier, the Ledger page) |
-| 2b, 9 to 12 | Designed, not implemented, except the two standalone extensions of phase 12 listed below |
-| 7, 8 | Not started |
+| 2b, 9 to 12 | Designed, not implemented, except the three standalone extensions of phase 12 listed below |
+| 7 | Not started |
+| 8 | Future roadmap: not part of the first release |
 
 For what has been done, how it was verified and what is still open, read the work log: [docs/worklog.md](docs/worklog.md).
 
@@ -44,6 +45,7 @@ The repository root is the PostgreSQL source tree (the fork). KingresDB's own co
 |---|---|
 | `contrib/kingres_shard/` | Sharding extension (C): catalog, bucket mapping, planner and executor hooks, two-phase commit, background worker, bucket movement. |
 | `contrib/kingres_ledger/` | Ledger extension (C): ledger tables, block builder, digest and verify functions. |
+| `contrib/kingres_columnar/` | Columnar storage (C): a table access method that stores a table column-wise with compression for analytic scans (phase 12; first version: insert-only, no indexes, serial scan). |
 | `contrib/kingres_sketch/` | Approximate aggregates (C): distinct count, top-n and percentiles, with partial aggregation (phase 12; works on one node, pushdown across shard groups comes with phase 2b). |
 | `contrib/kingres_timepart/` | Time partitioning (SQL and PL/pgSQL): partitions created ahead of time and retention by policy, for ordinary tables (phase 12; distributed tables and the scheduler in the control plane come later). |
 | `kingres/api/` | The OpenAPI contract (`openapi.yaml`). The REST API and the web client are generated from or checked against it. |

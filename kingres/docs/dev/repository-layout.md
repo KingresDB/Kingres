@@ -14,6 +14,7 @@ Directories marked "planned" do not exist yet or are empty.
   contrib/
     kingres_shard/                Sharding extension, C
     kingres_ledger/               Ledger extension, C
+    kingres_columnar/             Columnar table access method, C
     kingres_sketch/               Approximate aggregates, C
     kingres_timepart/             Time partitioning and retention, SQL and PL/pgSQL
     ...                            Upstream contrib modules, untouched

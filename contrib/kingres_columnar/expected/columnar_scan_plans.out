@@ -1,0 +1,1712 @@
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+-- SPDX-License-Identifier: PostgreSQL
+--
+-- columnar_scan_plans: the Columnar Scan in EXPLAIN, the columns it projects,
+-- the stripes and chunk groups it skips for each form of condition, and that
+-- every answer is the answer of the same data in a heap table, with the custom
+-- scan off and with skipping off.
+SET search_path = public;
+SET max_parallel_workers_per_gather = 0;
+-- 4 stripes of 5000 rows, 5 chunk groups of 1000 rows in each; id runs from 1 to 20000.
+-- nn is NULL in the whole first stripe and in one row of 1000 elsewhere.
+CREATE TABLE sp (id int, grp int, nn int, d date, ts timestamptz, txt text,
+                 txtc text COLLATE "C", f float8, n numeric, big bigint) USING columnar;
+SELECT kingres.columnar_set_options('sp', stripe_row_count => 5000, chunk_row_count => 1000);
+ columnar_set_options 
+----------------------
+ 
+(1 row)
+
+INSERT INTO sp
+SELECT i, i % 10, CASE WHEN i <= 5000 OR i % 1000 = 7 THEN NULL ELSE i END,
+       date '2020-01-01' + i / 10, timestamptz '2020-01-01 00:00:00+00' + i * interval '1 minute',
+       'k' || lpad(i::text, 6, '0'), 'k' || lpad(i::text, 6, '0'), i / 4.0, i, i::bigint * 1000000
+  FROM generate_series(1, 20000) i;
+SELECT stripes, chunk_groups, rows FROM kingres.columnar_info('sp');
+ stripes | chunk_groups | rows  
+---------+--------------+-------
+       4 |           20 | 20000
+(1 row)
+
+CREATE TABLE sp_heap AS SELECT * FROM sp;
+ANALYZE sp;
+ANALYZE sp_heap;
+-- the plan lines of the Columnar Scan, with the byte count reduced to "none" or "some"
+CREATE FUNCTION kc_scan(q text) RETURNS SETOF text LANGUAGE plpgsql AS $$
+DECLARE l text;
+BEGIN
+    FOR l IN EXECUTE 'EXPLAIN (analyze, costs off, timing off, summary off, buffers off) ' || q LOOP
+        IF l ~ 'Compressed Bytes Read' THEN
+            l := regexp_replace(l, 'Read: 0 bytes', 'Read: none');
+            l := regexp_replace(l, 'Read: [1-9][0-9]* bytes', 'Read: some');
+            RETURN NEXT btrim(l);
+        ELSIF l ~ 'Columnar|Custom Scan|Seq Scan|Rows Removed' THEN
+            RETURN NEXT btrim(l);
+        END IF;
+    END LOOP;
+END $$;
+-- the same condition on the columnar table, on the heap table, with the custom scan off
+-- and with skipping off: the number of rows and the sum of id must agree
+CREATE FUNCTION kc_agree(cond text) RETURNS TABLE (n bigint, id_sum bigint, agree boolean) LANGUAGE plpgsql AS $$
+DECLARE
+    r record;
+    a record; b record; c record; d record;
+BEGIN
+    EXECUTE 'SELECT count(*) AS n, coalesce(sum(id), 0) AS s FROM sp WHERE ' || cond INTO a;
+    EXECUTE 'SELECT count(*) AS n, coalesce(sum(id), 0) AS s FROM sp_heap WHERE ' || cond INTO b;
+    PERFORM set_config('kingres_columnar.enable_custom_scan', 'off', true);
+    EXECUTE 'SELECT count(*) AS n, coalesce(sum(id), 0) AS s FROM sp WHERE ' || cond INTO c;
+    PERFORM set_config('kingres_columnar.enable_custom_scan', 'on', true);
+    PERFORM set_config('kingres_columnar.enable_chunk_skipping', 'off', true);
+    EXECUTE 'SELECT count(*) AS n, coalesce(sum(id), 0) AS s FROM sp WHERE ' || cond INTO d;
+    PERFORM set_config('kingres_columnar.enable_chunk_skipping', 'on', true);
+    n := a.n; id_sum := a.s;
+    agree := (a.n, a.s) IS NOT DISTINCT FROM (b.n, b.s) AND (a.n, a.s) IS NOT DISTINCT FROM (c.n, c.s)
+             AND (a.n, a.s) IS NOT DISTINCT FROM (d.n, d.s);
+    RETURN NEXT;
+END $$;
+-- projection
+SELECT * FROM kc_scan('SELECT * FROM sp');
+                                     kc_scan                                     
+---------------------------------------------------------------------------------
+ Custom Scan (Columnar Scan) on sp (actual rows=20000.00 loops=1)
+ Columnar Projected Columns: 10 of 10 (id, grp, nn, d, ts, txt, txtc, f, n, big)
+ Columnar Stripes Skipped: 0 of 4
+ Columnar Chunk Groups Skipped: 0 of 20
+ Columnar Compressed Bytes Read: some
+(5 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp');
+                               kc_scan                                
+----------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=20000.00 loops=1)
+ Columnar Projected Columns: 0 of 10
+ Columnar Stripes Skipped: 0 of 4
+ Columnar Chunk Groups Skipped: 0 of 20
+ Columnar Compressed Bytes Read: none
+(5 rows)
+
+SELECT * FROM kc_scan('SELECT id FROM sp');
+                             kc_scan                              
+------------------------------------------------------------------
+ Custom Scan (Columnar Scan) on sp (actual rows=20000.00 loops=1)
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Stripes Skipped: 0 of 4
+ Columnar Chunk Groups Skipped: 0 of 20
+ Columnar Compressed Bytes Read: some
+(5 rows)
+
+SELECT * FROM kc_scan('SELECT id, txt FROM sp WHERE grp = 3');
+                             kc_scan                             
+-----------------------------------------------------------------
+ Custom Scan (Columnar Scan) on sp (actual rows=2000.00 loops=1)
+ Rows Removed by Filter: 18000
+ Columnar Projected Columns: 3 of 10 (id, grp, txt)
+ Columnar Skip Conditions: grp
+ Columnar Stripes Skipped: 0 of 4
+ Columnar Chunk Groups Skipped: 0 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT sum(f) FROM sp WHERE n > 19990');
+                              kc_scan                              
+-------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=10.00 loops=1)
+ Rows Removed by Filter: 990
+ Columnar Projected Columns: 2 of 10 (f, n)
+ Columnar Skip Conditions: n
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT max(id) FROM sp GROUP BY grp ORDER BY grp') WHERE kc_scan ~ 'Projected';
+                    kc_scan                    
+-----------------------------------------------
+ Columnar Projected Columns: 2 of 10 (id, grp)
+(1 row)
+
+SELECT * FROM kc_scan('SELECT t FROM sp t WHERE t.id = 1');
+                                     kc_scan                                     
+---------------------------------------------------------------------------------
+ Custom Scan (Columnar Scan) on sp t (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 999
+ Columnar Projected Columns: 10 of 10 (id, grp, nn, d, ts, txt, txtc, f, n, big)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT tableoid::regclass, id FROM sp WHERE id = 1');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 999
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+EXPLAIN (costs off) SELECT id, d FROM sp WHERE grp = 3;
+                     QUERY PLAN                     
+----------------------------------------------------
+ Custom Scan (Columnar Scan) on sp
+   Filter: (grp = 3)
+   Columnar Projected Columns: 3 of 10 (id, grp, d)
+   Columnar Skip Conditions: grp
+(4 rows)
+
+EXPLAIN (costs off, verbose) SELECT id, d FROM sp WHERE grp = 3;
+                     QUERY PLAN                     
+----------------------------------------------------
+ Custom Scan (Columnar Scan) on public.sp
+   Output: id, d
+   Filter: (sp.grp = 3)
+   Columnar Projected Columns: 3 of 10 (id, grp, d)
+   Columnar Skip Conditions: grp
+(5 rows)
+
+EXPLAIN (costs off, format json) SELECT id FROM sp WHERE id = 5;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ [                                                  +
+   {                                                +
+     "Plan": {                                      +
+       "Node Type": "Custom Scan",                  +
+       "Custom Plan Provider": "Columnar Scan",     +
+       "Parallel Aware": false,                     +
+       "Async Capable": false,                      +
+       "Relation Name": "sp",                       +
+       "Alias": "sp",                               +
+       "Disabled": false,                           +
+       "Filter": "(id = 5)",                        +
+       "Columnar Projected Columns": "1 of 10 (id)",+
+       "Columnar Skip Conditions": "id"             +
+     }                                              +
+   }                                                +
+ ]
+(1 row)
+
+SELECT count(*) FROM sp WHERE tableoid = 'sp'::regclass;
+ count 
+-------
+ 20000
+(1 row)
+
+-- the custom scan is a choice of the planner: off, the access method scan is used
+SET kingres_columnar.enable_custom_scan = off;
+EXPLAIN (costs off) SELECT id FROM sp WHERE id = 5;
+     QUERY PLAN     
+--------------------
+ Seq Scan on sp
+   Filter: (id = 5)
+(2 rows)
+
+SELECT count(*), sum(id), sum(n) FROM sp WHERE id < 100;
+ count | sum  | sum  
+-------+------+------
+    99 | 4950 | 4950
+(1 row)
+
+RESET kingres_columnar.enable_custom_scan;
+-- no worker is used: the scan is not parallel
+SET parallel_setup_cost = 0; SET parallel_tuple_cost = 0; SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 4;
+EXPLAIN (costs off) SELECT count(*) FROM sp;
+                 QUERY PLAN                  
+---------------------------------------------
+ Aggregate
+   ->  Custom Scan (Columnar Scan) on sp
+         Columnar Projected Columns: 0 of 10
+(3 rows)
+
+EXPLAIN (costs off) SELECT count(*), sum(f) FROM sp WHERE grp = 1;
+                      QUERY PLAN                      
+------------------------------------------------------
+ Aggregate
+   ->  Custom Scan (Columnar Scan) on sp
+         Filter: (grp = 1)
+         Columnar Projected Columns: 2 of 10 (grp, f)
+         Columnar Skip Conditions: grp
+(5 rows)
+
+SELECT count(*) FROM sp WHERE grp = 1;
+ count 
+-------
+  2000
+(1 row)
+
+RESET parallel_setup_cost; RESET parallel_tuple_cost; RESET min_parallel_table_scan_size;
+SET max_parallel_workers_per_gather = 0;
+-- skipping for every form of condition
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id = 12345');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 999
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE 12345 = id');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 999
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id < 3000');
+                               kc_scan                               
+---------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=2999.00 loops=1)
+ Rows Removed by Filter: 1
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 17 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id <= 5000');
+                               kc_scan                               
+---------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=5000.00 loops=1)
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 15 of 20
+ Columnar Compressed Bytes Read: some
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id <= 5001');
+                               kc_scan                               
+---------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=5001.00 loops=1)
+ Rows Removed by Filter: 999
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 2 of 4
+ Columnar Chunk Groups Skipped: 14 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id > 19000');
+                               kc_scan                               
+---------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1000.00 loops=1)
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id >= 19001');
+                               kc_scan                               
+---------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1000.00 loops=1)
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id >= 20000');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 999
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id > 20000');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=0.00 loops=1)
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 4 of 4
+ Columnar Chunk Groups Skipped: 20 of 20
+ Columnar Compressed Bytes Read: none
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id < 1');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=0.00 loops=1)
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 4 of 4
+ Columnar Chunk Groups Skipped: 20 of 20
+ Columnar Compressed Bytes Read: none
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE 3000 > id');
+                               kc_scan                               
+---------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=2999.00 loops=1)
+ Rows Removed by Filter: 1
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 17 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id <> 5');
+                               kc_scan                                
+----------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=19999.00 loops=1)
+ Rows Removed by Filter: 1
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Stripes Skipped: 0 of 4
+ Columnar Chunk Groups Skipped: 0 of 20
+ Columnar Compressed Bytes Read: some
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id != 12345');
+                               kc_scan                                
+----------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=19999.00 loops=1)
+ Rows Removed by Filter: 1
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Stripes Skipped: 0 of 4
+ Columnar Chunk Groups Skipped: 0 of 20
+ Columnar Compressed Bytes Read: some
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id BETWEEN 5001 AND 5010');
+                              kc_scan                              
+-------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=10.00 loops=1)
+ Rows Removed by Filter: 990
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id BETWEEN 4500 AND 5500');
+                               kc_scan                               
+---------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1001.00 loops=1)
+ Rows Removed by Filter: 999
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 2 of 4
+ Columnar Chunk Groups Skipped: 18 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id < 100 AND id > 200');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=0.00 loops=1)
+ Rows Removed by Filter: 1000
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id < 100 OR id > 19900');
+                              kc_scan                               
+--------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=199.00 loops=1)
+ Rows Removed by Filter: 1801
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 2 of 4
+ Columnar Chunk Groups Skipped: 18 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id < 100 OR grp = 5');
+                               kc_scan                               
+---------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=2089.00 loops=1)
+ Rows Removed by Filter: 17911
+ Columnar Projected Columns: 2 of 10 (id, grp)
+ Columnar Skip Conditions: id, grp
+ Columnar Stripes Skipped: 0 of 4
+ Columnar Chunk Groups Skipped: 0 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id < 100 OR id + 1 = 12345');
+                              kc_scan                               
+--------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=100.00 loops=1)
+ Rows Removed by Filter: 19900
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Stripes Skipped: 0 of 4
+ Columnar Chunk Groups Skipped: 0 of 20
+ Columnar Compressed Bytes Read: some
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id < 100 AND id + 1 = 12345');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=0.00 loops=1)
+ Rows Removed by Filter: 1000
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE NOT (id < 15000)');
+                               kc_scan                               
+---------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=5001.00 loops=1)
+ Rows Removed by Filter: 999
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 2 of 4
+ Columnar Chunk Groups Skipped: 14 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE NOT (id < 15000 OR id > 16000)');
+                               kc_scan                               
+---------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1001.00 loops=1)
+ Rows Removed by Filter: 999
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 2 of 4
+ Columnar Chunk Groups Skipped: 18 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE NOT (id <> 5)');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 999
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id = ANY (ARRAY[1, 10000, 20000])');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=3.00 loops=1)
+ Rows Removed by Filter: 2997
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 1 of 4
+ Columnar Chunk Groups Skipped: 17 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id IN (1, 2, 3)');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=3.00 loops=1)
+ Rows Removed by Filter: 997
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id IN (7000, 7001, 12000)');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=3.00 loops=1)
+ Rows Removed by Filter: 2997
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 2 of 4
+ Columnar Chunk Groups Skipped: 17 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id IN (100000, 200000)');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=0.00 loops=1)
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 4 of 4
+ Columnar Chunk Groups Skipped: 20 of 20
+ Columnar Compressed Bytes Read: none
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id IN (NULL, 5)');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 999
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id = ANY (ARRAY[]::int[])');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=0.00 loops=1)
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 4 of 4
+ Columnar Chunk Groups Skipped: 20 of 20
+ Columnar Compressed Bytes Read: none
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id = ANY (NULL::int[])');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=0.00 loops=1)
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 4 of 4
+ Columnar Chunk Groups Skipped: 20 of 20
+ Columnar Compressed Bytes Read: none
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id NOT IN (1, 2, 3)');
+                               kc_scan                                
+----------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=19997.00 loops=1)
+ Rows Removed by Filter: 3
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Stripes Skipped: 0 of 4
+ Columnar Chunk Groups Skipped: 0 of 20
+ Columnar Compressed Bytes Read: some
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id = ALL (ARRAY[5, 5])');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 19999
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Stripes Skipped: 0 of 4
+ Columnar Chunk Groups Skipped: 0 of 20
+ Columnar Compressed Bytes Read: some
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id = NULL');
+ kc_scan 
+---------
+(0 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id IS NULL');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=0.00 loops=1)
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 4 of 4
+ Columnar Chunk Groups Skipped: 20 of 20
+ Columnar Compressed Bytes Read: none
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id IS NOT NULL');
+                               kc_scan                                
+----------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=20000.00 loops=1)
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 0 of 4
+ Columnar Chunk Groups Skipped: 0 of 20
+ Columnar Compressed Bytes Read: some
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE nn IS NULL');
+                               kc_scan                               
+---------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=5015.00 loops=1)
+ Rows Removed by Filter: 14985
+ Columnar Projected Columns: 1 of 10 (nn)
+ Columnar Skip Conditions: nn
+ Columnar Stripes Skipped: 0 of 4
+ Columnar Chunk Groups Skipped: 0 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE nn IS NOT NULL');
+                               kc_scan                                
+----------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=14985.00 loops=1)
+ Rows Removed by Filter: 15
+ Columnar Projected Columns: 1 of 10 (nn)
+ Columnar Skip Conditions: nn
+ Columnar Stripes Skipped: 1 of 4
+ Columnar Chunk Groups Skipped: 5 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE nn IS NULL AND id > 10000');
+                              kc_scan                              
+-------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=10.00 loops=1)
+ Rows Removed by Filter: 9990
+ Columnar Projected Columns: 2 of 10 (id, nn)
+ Columnar Skip Conditions: nn, id
+ Columnar Stripes Skipped: 2 of 4
+ Columnar Chunk Groups Skipped: 10 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE nn IS NULL AND id > 10000 AND id < 11000');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 999
+ Columnar Projected Columns: 2 of 10 (id, nn)
+ Columnar Skip Conditions: nn, id
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE nn = 3');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=0.00 loops=1)
+ Columnar Projected Columns: 1 of 10 (nn)
+ Columnar Skip Conditions: nn
+ Columnar Stripes Skipped: 4 of 4
+ Columnar Chunk Groups Skipped: 20 of 20
+ Columnar Compressed Bytes Read: none
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE nn < 6000');
+                              kc_scan                               
+--------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=998.00 loops=1)
+ Rows Removed by Filter: 2
+ Columnar Projected Columns: 1 of 10 (nn)
+ Columnar Skip Conditions: nn
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE nn IS NULL OR nn > 19999');
+                               kc_scan                               
+---------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=5016.00 loops=1)
+ Rows Removed by Filter: 14984
+ Columnar Projected Columns: 1 of 10 (nn)
+ Columnar Skip Conditions: nn
+ Columnar Stripes Skipped: 0 of 4
+ Columnar Chunk Groups Skipped: 0 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+-- cross-type constants: the column keeps its type
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id = 12345::bigint');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 999
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id < 5000000000');
+                               kc_scan                                
+----------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=20000.00 loops=1)
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 0 of 4
+ Columnar Chunk Groups Skipped: 0 of 20
+ Columnar Compressed Bytes Read: some
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id = 5000000000');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=0.00 loops=1)
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 4 of 4
+ Columnar Chunk Groups Skipped: 20 of 20
+ Columnar Compressed Bytes Read: none
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id = 12345::int2');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 999
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id = 12345.0');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 19999
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Stripes Skipped: 0 of 4
+ Columnar Chunk Groups Skipped: 0 of 20
+ Columnar Compressed Bytes Read: some
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id = 12345::numeric');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 19999
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Stripes Skipped: 0 of 4
+ Columnar Chunk Groups Skipped: 0 of 20
+ Columnar Compressed Bytes Read: some
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id::bigint = 12345');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 19999
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Stripes Skipped: 0 of 4
+ Columnar Chunk Groups Skipped: 0 of 20
+ Columnar Compressed Bytes Read: some
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id < 100.5::float8');
+                              kc_scan                               
+--------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=100.00 loops=1)
+ Rows Removed by Filter: 19900
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Stripes Skipped: 0 of 4
+ Columnar Chunk Groups Skipped: 0 of 20
+ Columnar Compressed Bytes Read: some
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE big = 5000000000');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 999
+ Columnar Projected Columns: 1 of 10 (big)
+ Columnar Skip Conditions: big
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE big > 19999999999::int8 AND id > 1');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 999
+ Columnar Projected Columns: 2 of 10 (id, big)
+ Columnar Skip Conditions: big, id
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE big > 19999999');
+                               kc_scan                                
+----------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=19981.00 loops=1)
+ Rows Removed by Filter: 19
+ Columnar Projected Columns: 1 of 10 (big)
+ Columnar Skip Conditions: big
+ Columnar Stripes Skipped: 0 of 4
+ Columnar Chunk Groups Skipped: 0 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE f > 4999.5');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=2.00 loops=1)
+ Rows Removed by Filter: 998
+ Columnar Projected Columns: 1 of 10 (f)
+ Columnar Skip Conditions: f
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE f = 5000.25');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=0.00 loops=1)
+ Columnar Projected Columns: 1 of 10 (f)
+ Columnar Skip Conditions: f
+ Columnar Stripes Skipped: 4 of 4
+ Columnar Chunk Groups Skipped: 20 of 20
+ Columnar Compressed Bytes Read: none
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE f = 5000.25::float4');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=0.00 loops=1)
+ Columnar Projected Columns: 1 of 10 (f)
+ Columnar Skip Conditions: f
+ Columnar Stripes Skipped: 4 of 4
+ Columnar Chunk Groups Skipped: 20 of 20
+ Columnar Compressed Bytes Read: none
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE f = ''NaN''');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=0.00 loops=1)
+ Columnar Projected Columns: 1 of 10 (f)
+ Columnar Skip Conditions: f
+ Columnar Stripes Skipped: 4 of 4
+ Columnar Chunk Groups Skipped: 20 of 20
+ Columnar Compressed Bytes Read: none
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE f < 0');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=0.00 loops=1)
+ Columnar Projected Columns: 1 of 10 (f)
+ Columnar Skip Conditions: f
+ Columnar Stripes Skipped: 4 of 4
+ Columnar Chunk Groups Skipped: 20 of 20
+ Columnar Compressed Bytes Read: none
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE n = 5');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 999
+ Columnar Projected Columns: 1 of 10 (n)
+ Columnar Skip Conditions: n
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE n < 0.5');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=0.00 loops=1)
+ Columnar Projected Columns: 1 of 10 (n)
+ Columnar Skip Conditions: n
+ Columnar Stripes Skipped: 4 of 4
+ Columnar Chunk Groups Skipped: 20 of 20
+ Columnar Compressed Bytes Read: none
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE n > 19999.5');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 999
+ Columnar Projected Columns: 1 of 10 (n)
+ Columnar Skip Conditions: n
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE d = ''2020-02-01''');
+                              kc_scan                              
+-------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=10.00 loops=1)
+ Rows Removed by Filter: 990
+ Columnar Projected Columns: 1 of 10 (d)
+ Columnar Skip Conditions: d
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE d = ''2020-02-01''::timestamptz');
+                              kc_scan                              
+-------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=10.00 loops=1)
+ Rows Removed by Filter: 990
+ Columnar Projected Columns: 1 of 10 (d)
+ Columnar Skip Conditions: d
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE d >= ''2025-01-01''');
+                               kc_scan                               
+---------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1731.00 loops=1)
+ Rows Removed by Filter: 269
+ Columnar Projected Columns: 1 of 10 (d)
+ Columnar Skip Conditions: d
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 18 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE ts = ''2020-01-01 00:05:00+00''');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 999
+ Columnar Projected Columns: 1 of 10 (ts)
+ Columnar Skip Conditions: ts
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE ts >= ''2020-01-10 00:00:00+00''');
+                               kc_scan                               
+---------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=7041.00 loops=1)
+ Rows Removed by Filter: 959
+ Columnar Projected Columns: 1 of 10 (ts)
+ Columnar Skip Conditions: ts
+ Columnar Stripes Skipped: 2 of 4
+ Columnar Chunk Groups Skipped: 12 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE ts >= ''2020-01-10 00:00:00+00''::timestamp');
+                               kc_scan                               
+---------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=6561.00 loops=1)
+ Rows Removed by Filter: 439
+ Columnar Projected Columns: 1 of 10 (ts)
+ Columnar Skip Conditions: ts
+ Columnar Stripes Skipped: 2 of 4
+ Columnar Chunk Groups Skipped: 13 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+-- strings: the C collation has statistics, the others do not
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE txtc = ''k012345''');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 999
+ Columnar Projected Columns: 1 of 10 (txtc)
+ Columnar Skip Conditions: txtc
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE txtc < ''k005000''');
+                               kc_scan                               
+---------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=4999.00 loops=1)
+ Rows Removed by Filter: 1
+ Columnar Projected Columns: 1 of 10 (txtc)
+ Columnar Skip Conditions: txtc
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 15 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE txtc > ''k019999''');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 999
+ Columnar Projected Columns: 1 of 10 (txtc)
+ Columnar Skip Conditions: txtc
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE txtc LIKE ''k0123%''');
+                              kc_scan                               
+--------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=100.00 loops=1)
+ Rows Removed by Filter: 19900
+ Columnar Projected Columns: 1 of 10 (txtc)
+ Columnar Stripes Skipped: 0 of 4
+ Columnar Chunk Groups Skipped: 0 of 20
+ Columnar Compressed Bytes Read: some
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE txtc COLLATE "C" = ''k012345''');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 999
+ Columnar Projected Columns: 1 of 10 (txtc)
+ Columnar Skip Conditions: txtc
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE txtc COLLATE "POSIX" = ''k012345''');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 19999
+ Columnar Projected Columns: 1 of 10 (txtc)
+ Columnar Stripes Skipped: 0 of 4
+ Columnar Chunk Groups Skipped: 0 of 20
+ Columnar Compressed Bytes Read: some
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE txt COLLATE "C" = ''k012345''');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 19999
+ Columnar Projected Columns: 1 of 10 (txt)
+ Columnar Stripes Skipped: 0 of 4
+ Columnar Chunk Groups Skipped: 0 of 20
+ Columnar Compressed Bytes Read: some
+(6 rows)
+
+-- the default collation of the database: statistics exist only if it is C or POSIX
+SELECT (SELECT count(*) FROM kc_scan('SELECT count(*) FROM sp WHERE txt = ''k012345''') WHERE kc_scan ~ 'Skip Conditions')
+       = (SELECT (datcollate IN ('C', 'POSIX'))::int FROM pg_database WHERE datname = current_database()) AS default_collation_rule;
+ default_collation_rule 
+------------------------
+ t
+(1 row)
+
+-- stable functions and parameters
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE ts > now()');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=0.00 loops=1)
+ Columnar Projected Columns: 1 of 10 (ts)
+ Columnar Skip Conditions: ts
+ Columnar Stripes Skipped: 4 of 4
+ Columnar Chunk Groups Skipped: 20 of 20
+ Columnar Compressed Bytes Read: none
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE ts < now() - interval ''100 years''');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=0.00 loops=1)
+ Columnar Projected Columns: 1 of 10 (ts)
+ Columnar Skip Conditions: ts
+ Columnar Stripes Skipped: 4 of 4
+ Columnar Chunk Groups Skipped: 20 of 20
+ Columnar Compressed Bytes Read: none
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE ts < now()');
+                               kc_scan                                
+----------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=20000.00 loops=1)
+ Columnar Projected Columns: 1 of 10 (ts)
+ Columnar Skip Conditions: ts
+ Columnar Stripes Skipped: 0 of 4
+ Columnar Chunk Groups Skipped: 0 of 20
+ Columnar Compressed Bytes Read: some
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE d > current_date');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=0.00 loops=1)
+ Columnar Projected Columns: 1 of 10 (d)
+ Columnar Skip Conditions: d
+ Columnar Stripes Skipped: 4 of 4
+ Columnar Chunk Groups Skipped: 20 of 20
+ Columnar Compressed Bytes Read: none
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id = (SELECT 12345)');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 999
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id = length(repeat(''x'', 12345))');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 999
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id = (random() * 0)::int');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=0.00 loops=1)
+ Rows Removed by Filter: 20000
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Stripes Skipped: 0 of 4
+ Columnar Chunk Groups Skipped: 0 of 20
+ Columnar Compressed Bytes Read: some
+(6 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id = grp');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=9.00 loops=1)
+ Rows Removed by Filter: 19991
+ Columnar Projected Columns: 2 of 10 (id, grp)
+ Columnar Stripes Skipped: 0 of 4
+ Columnar Chunk Groups Skipped: 0 of 20
+ Columnar Compressed Bytes Read: some
+(6 rows)
+
+SET plan_cache_mode = force_generic_plan;
+PREPARE q_eq (int) AS SELECT count(*) FROM sp WHERE id = $1;
+SELECT * FROM kc_scan('EXECUTE q_eq(12345)');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 999
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('EXECUTE q_eq(7)');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 999
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT * FROM kc_scan('EXECUTE q_eq(NULL)');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=0.00 loops=1)
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 4 of 4
+ Columnar Chunk Groups Skipped: 20 of 20
+ Columnar Compressed Bytes Read: none
+(6 rows)
+
+EXECUTE q_eq(12345);
+ count 
+-------
+     1
+(1 row)
+
+EXECUTE q_eq(1);
+ count 
+-------
+     1
+(1 row)
+
+EXECUTE q_eq(-1);
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE q_eq(NULL);
+ count 
+-------
+     0
+(1 row)
+
+PREPARE q_in (int[]) AS SELECT count(*) FROM sp WHERE id = ANY ($1);
+SELECT * FROM kc_scan('EXECUTE q_in(ARRAY[1, 20000])');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=2.00 loops=1)
+ Rows Removed by Filter: 1998
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 2 of 4
+ Columnar Chunk Groups Skipped: 18 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+EXECUTE q_in(ARRAY[1, 20000]);
+ count 
+-------
+     2
+(1 row)
+
+EXECUTE q_in(ARRAY[0, 20001]);
+ count 
+-------
+     0
+(1 row)
+
+PREPARE q_rng (int, int) AS SELECT count(*), sum(id) FROM sp WHERE id BETWEEN $1 AND $2;
+EXECUTE q_rng(100, 200);
+ count |  sum  
+-------+-------
+   101 | 15150
+(1 row)
+
+EXECUTE q_rng(5000, 5001);
+ count |  sum  
+-------+-------
+     2 | 10001
+(1 row)
+
+EXECUTE q_rng(200, 100);
+ count | sum 
+-------+-----
+     0 |    
+(1 row)
+
+EXECUTE q_rng(NULL, 100);
+ count | sum 
+-------+-----
+     0 |    
+(1 row)
+
+SET plan_cache_mode = force_custom_plan;
+EXECUTE q_eq(12345);
+ count 
+-------
+     1
+(1 row)
+
+SELECT * FROM kc_scan('EXECUTE q_eq(12345)');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 999
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 3 of 4
+ Columnar Chunk Groups Skipped: 19 of 20
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+RESET plan_cache_mode;
+DEALLOCATE ALL;
+-- the switches
+SET kingres_columnar.enable_chunk_skipping = off;
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id = 12345');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 19999
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Stripes Skipped: 0 of 4
+ Columnar Chunk Groups Skipped: 0 of 20
+ Columnar Compressed Bytes Read: some
+(6 rows)
+
+RESET kingres_columnar.enable_chunk_skipping;
+SET kingres_columnar.enable_custom_scan = off;
+SELECT * FROM kc_scan('SELECT count(*) FROM sp WHERE id = 12345');
+                    kc_scan                    
+-----------------------------------------------
+ ->  Seq Scan on sp (actual rows=1.00 loops=1)
+ Rows Removed by Filter: 19999
+(2 rows)
+
+RESET kingres_columnar.enable_custom_scan;
+-- the answers do not depend on skipping or on the scan (count, sum of id, all four agree)
+SELECT cond, a.* FROM unnest(ARRAY[
+  'id = 12345', 'id = 0', 'id = 20000', 'id <= 1', 'id < 1', 'id >= 20000', 'id > 20000', 'id <> 5',
+  'id BETWEEN 4999 AND 5001', 'id < 100 OR id > 19900', 'NOT (id < 15000)', 'NOT (id = 5)',
+  'id = ANY (ARRAY[1, 5000, 5001, 20000])', 'id IN (NULL, 5)', 'id NOT IN (1, 2, 3)', 'id = ANY (NULL::int[])',
+  'nn IS NULL', 'nn IS NOT NULL', 'nn IS NULL AND id > 15000', 'nn = 3', 'nn < 6000', 'nn >= 20000',
+  'id = 12345::bigint', 'id < 5000000000', 'id::numeric = 5', 'id = 5.0', 'big = 5000000000', 'big > 19999999999',
+  'f > 4999.5', 'f = 5000.25', 'f < 0', 'n = 5', 'n < 0.5', 'n > 19999.5', 'n IN (1.0, 2, 20000)',
+  'd = ''2020-02-01''', 'd >= ''2025-01-01''', 'd < ''2020-01-01''', 'ts = ''2020-01-01 00:05:00+00''', 'ts >= ''2020-01-10 00:00:00+00''',
+  'ts < now()', 'ts > now()', 'd BETWEEN current_date - 10000 AND current_date',
+  'txtc = ''k012345''', 'txtc < ''k005000''', 'txtc > ''k019999''', 'txtc LIKE ''k0123%''', 'txt = ''k012345''', 'txt < ''k000100''',
+  'id = grp', 'id % 1000 = 0', 'grp = 3 AND id < 5000', 'grp = 3 OR id > 19990', 'false', 'true'
+]) AS cond, LATERAL kc_agree(cond) a ORDER BY cond COLLATE "C";
+                      cond                       |   n   |  id_sum   | agree 
+-------------------------------------------------+-------+-----------+-------
+ NOT (id < 15000)                                |  5001 |  87517500 | t
+ NOT (id = 5)                                    | 19999 | 200009995 | t
+ big = 5000000000                                |     1 |      5000 | t
+ big > 19999999999                               |     1 |     20000 | t
+ d < '2020-01-01'                                |     0 |         0 | t
+ d = '2020-02-01'                                |    10 |      3145 | t
+ d >= '2025-01-01'                               |  1731 |  33122685 | t
+ d BETWEEN current_date - 10000 AND current_date | 20000 | 200010000 | t
+ f < 0                                           |     0 |         0 | t
+ f = 5000.25                                     |     0 |         0 | t
+ f > 4999.5                                      |     2 |     39999 | t
+ false                                           |     0 |         0 | t
+ grp = 3 AND id < 5000                           |   500 |   1249000 | t
+ grp = 3 OR id > 19990                           |  2009 |  20175962 | t
+ id % 1000 = 0                                   |    20 |    210000 | t
+ id < 1                                          |     0 |         0 | t
+ id < 100 OR id > 19900                          |   199 |   2000000 | t
+ id < 5000000000                                 | 20000 | 200010000 | t
+ id <= 1                                         |     1 |         1 | t
+ id <> 5                                         | 19999 | 200009995 | t
+ id = 0                                          |     0 |         0 | t
+ id = 12345                                      |     1 |     12345 | t
+ id = 12345::bigint                              |     1 |     12345 | t
+ id = 20000                                      |     1 |     20000 | t
+ id = 5.0                                        |     1 |         5 | t
+ id = ANY (ARRAY[1, 5000, 5001, 20000])          |     4 |     30002 | t
+ id = ANY (NULL::int[])                          |     0 |         0 | t
+ id = grp                                        |     9 |        45 | t
+ id > 20000                                      |     0 |         0 | t
+ id >= 20000                                     |     1 |     20000 | t
+ id BETWEEN 4999 AND 5001                        |     3 |     15000 | t
+ id IN (NULL, 5)                                 |     1 |         5 | t
+ id NOT IN (1, 2, 3)                             | 19997 | 200009994 | t
+ id::numeric = 5                                 |     1 |         5 | t
+ n < 0.5                                         |     0 |         0 | t
+ n = 5                                           |     1 |         5 | t
+ n > 19999.5                                     |     1 |     20000 | t
+ n IN (1.0, 2, 20000)                            |     3 |     20003 | t
+ nn < 6000                                       |   998 |   5489493 | t
+ nn = 3                                          |     0 |         0 | t
+ nn >= 20000                                     |     1 |     20000 | t
+ nn IS NOT NULL                                  | 14985 | 187327395 | t
+ nn IS NULL                                      |  5015 |  12682605 | t
+ nn IS NULL AND id > 15000                       |     5 |     85035 | t
+ true                                            | 20000 | 200010000 | t
+ ts < now()                                      | 20000 | 200010000 | t
+ ts = '2020-01-01 00:05:00+00'                   |     1 |         5 | t
+ ts > now()                                      |     0 |         0 | t
+ ts >= '2020-01-10 00:00:00+00'                  |  7041 | 116035680 | t
+ txt < 'k000100'                                 |    99 |      4950 | t
+ txt = 'k012345'                                 |     1 |     12345 | t
+ txtc < 'k005000'                                |  4999 |  12497500 | t
+ txtc = 'k012345'                                |     1 |     12345 | t
+ txtc > 'k019999'                                |     1 |     20000 | t
+ txtc LIKE 'k0123%'                              |   100 |   1234950 | t
+(55 rows)
+
+-- a join, an aggregate, LIMIT
+CREATE TABLE dim AS SELECT g AS grp, 'g' || g AS label FROM generate_series(0, 9) g;
+ANALYZE dim;
+SET enable_mergejoin = off; SET enable_nestloop = off;
+EXPLAIN (costs off) SELECT count(*), sum(id) FROM sp JOIN dim USING (grp) WHERE id < 3000;
+                         QUERY PLAN                          
+-------------------------------------------------------------
+ Aggregate
+   ->  Hash Join
+         Hash Cond: (sp.grp = dim.grp)
+         ->  Custom Scan (Columnar Scan) on sp
+               Filter: (id < 3000)
+               Columnar Projected Columns: 2 of 10 (id, grp)
+               Columnar Skip Conditions: id
+         ->  Hash
+               ->  Seq Scan on dim
+(9 rows)
+
+SELECT label, count(*), sum(id) FROM sp JOIN dim USING (grp) WHERE id < 3000 GROUP BY label ORDER BY label;
+ label | count |  sum   
+-------+-------+--------
+ g0    |   299 | 448500
+ g1    |   300 | 448800
+ g2    |   300 | 449100
+ g3    |   300 | 449400
+ g4    |   300 | 449700
+ g5    |   300 | 450000
+ g6    |   300 | 450300
+ g7    |   300 | 450600
+ g8    |   300 | 450900
+ g9    |   300 | 451200
+(10 rows)
+
+RESET enable_mergejoin; RESET enable_nestloop;
+SELECT (SELECT sum(c) FROM (SELECT label, count(*) c FROM sp JOIN dim USING (grp) GROUP BY label) x) AS joined_rows;
+ joined_rows 
+-------------
+       20000
+(1 row)
+
+EXPLAIN (costs off) SELECT id FROM sp WHERE id > 100 LIMIT 5;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Limit
+   ->  Custom Scan (Columnar Scan) on sp
+         Filter: (id > 100)
+         Columnar Projected Columns: 1 of 10 (id)
+         Columnar Skip Conditions: id
+(5 rows)
+
+SELECT id FROM sp WHERE id > 100 LIMIT 5;
+ id  
+-----
+ 101
+ 102
+ 103
+ 104
+ 105
+(5 rows)
+
+SELECT * FROM kc_scan('SELECT id FROM sp WHERE id > 100 LIMIT 5');
+                             kc_scan                              
+------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on sp (actual rows=5.00 loops=1)
+ Rows Removed by Filter: 100
+ Columnar Projected Columns: 1 of 10 (id)
+ Columnar Skip Conditions: id
+ Columnar Stripes Skipped: 0 of 1
+ Columnar Chunk Groups Skipped: 0 of 1
+ Columnar Compressed Bytes Read: some
+(7 rows)
+
+SELECT id FROM sp WHERE id > 7000 ORDER BY id LIMIT 3 OFFSET 2;
+  id  
+------
+ 7003
+ 7004
+ 7005
+(3 rows)
+
+SELECT grp, count(*), min(id), max(id), round(avg(f)::numeric, 2) FROM sp GROUP BY grp ORDER BY grp;
+ grp | count | min |  max  |  round  
+-----+-------+-----+-------+---------
+   0 |  2000 |  10 | 20000 | 2501.25
+   1 |  2000 |   1 | 19991 | 2499.00
+   2 |  2000 |   2 | 19992 | 2499.25
+   3 |  2000 |   3 | 19993 | 2499.50
+   4 |  2000 |   4 | 19994 | 2499.75
+   5 |  2000 |   5 | 19995 | 2500.00
+   6 |  2000 |   6 | 19996 | 2500.25
+   7 |  2000 |   7 | 19997 | 2500.50
+   8 |  2000 |   8 | 19998 | 2500.75
+   9 |  2000 |   9 | 19999 | 2501.00
+(10 rows)
+
+SELECT count(*), count(DISTINCT grp), count(nn) FROM sp;
+ count | count | count 
+-------+-------+-------
+ 20000 |    10 | 14985
+(1 row)
+
+SELECT count(*) FROM (SELECT id FROM sp WHERE id < 100 UNION ALL SELECT id FROM sp WHERE id > 19900) u;
+ count 
+-------
+   199
+(1 row)
+
+SELECT count(*) FROM sp WHERE id IN (SELECT id FROM sp_heap WHERE grp = 4 AND id < 100);
+ count 
+-------
+    10
+(1 row)
+
+SELECT count(*) FROM sp WHERE EXISTS (SELECT 1 FROM sp_heap h WHERE h.id = sp.id AND h.grp = 9 AND h.id > 19000);
+ count 
+-------
+   100
+(1 row)
+
+-- rescan under a nested loop: the condition changes with each outer row
+SET enable_hashjoin = off; SET enable_mergejoin = off; SET enable_material = off;
+CREATE TABLE outer_t AS SELECT * FROM (VALUES (1, 100), (2, 7000), (3, 12345), (4, 20000), (5, -5), (6, 7000), (7, NULL)) v(k, x);
+EXPLAIN (costs off) SELECT o.k, c.n FROM outer_t o CROSS JOIN LATERAL (SELECT count(*) AS n FROM sp WHERE sp.id = o.x) c ORDER BY o.k;
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Sort
+   Sort Key: o.k
+   ->  Nested Loop
+         ->  Seq Scan on outer_t o
+         ->  Aggregate
+               ->  Custom Scan (Columnar Scan) on sp
+                     Filter: (id = o.x)
+                     Columnar Projected Columns: 1 of 10 (id)
+                     Columnar Skip Conditions: id
+(9 rows)
+
+SELECT o.k, (SELECT count(*) FROM sp WHERE sp.id = o.x) AS c FROM outer_t o ORDER BY o.k;
+ k | c 
+---+---
+ 1 | 1
+ 2 | 1
+ 3 | 1
+ 4 | 1
+ 5 | 0
+ 6 | 1
+ 7 | 0
+(7 rows)
+
+SELECT o.k, c.n FROM outer_t o CROSS JOIN LATERAL (SELECT count(*) AS n FROM sp WHERE sp.id BETWEEN o.x - 1 AND o.x + 1) c ORDER BY o.k;
+ k | n 
+---+---
+ 1 | 3
+ 2 | 3
+ 3 | 3
+ 4 | 2
+ 5 | 0
+ 6 | 3
+ 7 | 0
+(7 rows)
+
+SELECT o.k, c.n FROM outer_t o CROSS JOIN LATERAL (SELECT count(*) AS n FROM sp_heap WHERE sp_heap.id BETWEEN o.x - 1 AND o.x + 1) c ORDER BY o.k;
+ k | n 
+---+---
+ 1 | 3
+ 2 | 3
+ 3 | 3
+ 4 | 2
+ 5 | 0
+ 6 | 3
+ 7 | 0
+(7 rows)
+
+EXPLAIN (costs off) SELECT o.k, s.id FROM outer_t o JOIN sp s ON s.id = o.x ORDER BY o.k;
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Sort
+   Sort Key: o.k
+   ->  Nested Loop
+         Join Filter: (o.x = s.id)
+         ->  Seq Scan on outer_t o
+         ->  Custom Scan (Columnar Scan) on sp s
+               Columnar Projected Columns: 1 of 10 (id)
+(7 rows)
+
+SELECT o.k, s.id FROM outer_t o JOIN sp s ON s.id = o.x ORDER BY o.k;
+ k |  id   
+---+-------
+ 1 |   100
+ 2 |  7000
+ 3 | 12345
+ 4 | 20000
+ 6 |  7000
+(5 rows)
+
+SELECT count(*) FROM outer_t o JOIN sp s ON s.id = o.x AND s.grp = o.k;
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM outer_t o JOIN sp_heap s ON s.id = o.x AND s.grp = o.k;
+ count 
+-------
+     0
+(1 row)
+
+-- the same through a function that runs the inner query once for each outer row
+SELECT o.k, a.* FROM outer_t o, LATERAL kc_agree('id = ' || coalesce(o.x::text, 'NULL')) a ORDER BY o.k;
+ k | n | id_sum | agree 
+---+---+--------+-------
+ 1 | 1 |    100 | t
+ 2 | 1 |   7000 | t
+ 3 | 1 |  12345 | t
+ 4 | 1 |  20000 | t
+ 5 | 0 |      0 | t
+ 6 | 1 |   7000 | t
+ 7 | 0 |      0 | t
+(7 rows)
+
+RESET enable_hashjoin; RESET enable_mergejoin; RESET enable_material;
+-- a partitioned table with columnar and heap partitions
+CREATE TABLE pt (id int, v int) PARTITION BY RANGE (id);
+CREATE TABLE pt_c1 PARTITION OF pt FOR VALUES FROM (0) TO (1000) USING columnar;
+CREATE TABLE pt_c2 PARTITION OF pt FOR VALUES FROM (1000) TO (2000) USING columnar;
+CREATE TABLE pt_h PARTITION OF pt FOR VALUES FROM (2000) TO (3000);
+INSERT INTO pt SELECT i, i FROM generate_series(0, 2999) i;
+EXPLAIN (costs off) SELECT count(*) FROM pt;
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Aggregate
+   ->  Append
+         ->  Custom Scan (Columnar Scan) on pt_c1 pt_1
+               Columnar Projected Columns: 0 of 2
+         ->  Custom Scan (Columnar Scan) on pt_c2 pt_2
+               Columnar Projected Columns: 0 of 2
+         ->  Seq Scan on pt_h pt_3
+(7 rows)
+
+EXPLAIN (costs off) SELECT v FROM pt WHERE id = 1500;
+                  QUERY PLAN                  
+----------------------------------------------
+ Custom Scan (Columnar Scan) on pt_c2 pt
+   Filter: (id = 1500)
+   Columnar Projected Columns: 2 of 2 (id, v)
+   Columnar Skip Conditions: id
+(4 rows)
+
+EXPLAIN (costs off) SELECT v FROM pt WHERE id = 1500 OR id = 2500;
+                     QUERY PLAN                     
+----------------------------------------------------
+ Append
+   ->  Custom Scan (Columnar Scan) on pt_c2 pt_1
+         Filter: ((id = 1500) OR (id = 2500))
+         Columnar Projected Columns: 2 of 2 (id, v)
+         Columnar Skip Conditions: id
+   ->  Seq Scan on pt_h pt_2
+         Filter: ((id = 1500) OR (id = 2500))
+(7 rows)
+
+SELECT * FROM kc_scan('SELECT count(*) FROM pt WHERE id >= 1500 AND v < 1600');
+                                  kc_scan                                   
+----------------------------------------------------------------------------
+ ->  Custom Scan (Columnar Scan) on pt_c2 pt_1 (actual rows=100.00 loops=1)
+ Rows Removed by Filter: 900
+ Columnar Projected Columns: 2 of 2 (id, v)
+ Columnar Skip Conditions: id, v
+ Columnar Stripes Skipped: 0 of 1
+ Columnar Chunk Groups Skipped: 0 of 1
+ Columnar Compressed Bytes Read: some
+ ->  Seq Scan on pt_h pt_2 (actual rows=0.00 loops=1)
+ Rows Removed by Filter: 1000
+(9 rows)
+
+SELECT count(*), sum(v) FROM pt WHERE id BETWEEN 990 AND 2010;
+ count |   sum   
+-------+---------
+  1021 | 1531500
+(1 row)
+
+SELECT tableoid::regclass, count(*) FROM pt GROUP BY 1 ORDER BY 1;
+ tableoid | count 
+----------+-------
+ pt_c1    |  1000
+ pt_c2    |  1000
+ pt_h     |  1000
+(3 rows)
+
+DROP TABLE sp, sp_heap, dim, outer_t, pt;
+DROP FUNCTION kc_scan(text), kc_agree(text);
