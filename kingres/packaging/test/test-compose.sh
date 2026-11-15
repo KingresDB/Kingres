@@ -358,14 +358,12 @@ written="$(insert_events 21 30)"
 echo "info: ${written} of 10 rows were accepted while kingres-2 was down"
 check "at least one row was written while kingres-2 was down" test "${written}" -ge 1
 # The contract says a server without liveness for the failure timeout is
-# "dead"; kingresd has no heartbeat yet and keeps listing a stopped follower
-# as live (control-plane README, "What else happens while the instance is
-# down").  The right behaviour stays asserted, as a known failure.
+# "dead": the servers exchange heartbeats, and a stopped follower is no
+# longer listed as live by the others.
 down_seen() { ! servers_line | grep -Eq 'kingres-2=(live|pendingRebalance)'; }
 down_seen_within() { local i; for i in $(seq 1 "$1"); do down_seen && return 0; sleep 1; done; return 1; }
 signin_node 1
-check_known "kingres-1 stops listing the stopped kingres-2 as healthy" \
-    "no heartbeat: a stopped follower stays live" down_seen_within 30
+check "kingres-1 stops listing the stopped kingres-2 as healthy" down_seen_within 30
 docker compose -f "${compose}" start kingres-2 >/dev/null 2>&1
 wait_for "kingres-2 healthy after it was started" 120 node_up 2
 wait_servers_live "after kingres-2 came back" 1 2 3

@@ -255,6 +255,9 @@ go_build() { # go_build MODULE_DIR OUTPUT PACKAGE
 
 log "building kingresd ${version}"
 go_build "${cp_dir}" "${bin}/kingresd" ./cmd/kingresd
+# The lease watchdog stops the instance when kingresd hangs or dies and the
+# lease of the group runs out; kingresd looks for it next to itself.
+go_build "${cp_dir}" "${bin}/kingres-watchdog" ./cmd/kingres-watchdog
 
 if [ -f "${src}/kingres/verifier/go.mod" ]; then
     log "building kingres-verify ${version}"
