@@ -7,7 +7,9 @@ SELECT e.extname, e.extversion, n.nspname, e.extrelocatable
  WHERE e.extname = 'kingres_sketch';
 
 SET search_path = public, kingres_sketch;
-SELECT self_test();
+-- one field per line: the version, the hash of each type, and the bytes of
+-- the fixed hll, tdigest (alone, united, read) and topn (alone, united)
+SELECT regexp_split_to_table(self_test(), ' ') AS self_test;
 
 -- the three types and the casts to bytea
 SELECT t.typname, t.typlen, t.typstorage

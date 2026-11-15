@@ -36,15 +36,15 @@ const remaining = computed(() => formatLease(props.lease?.remainingMillis))
         </span>
       </p>
       <p v-if="lease.state === 'held'" data-testid="lease-text">
-        The primary on server <SafeName :value="lease.holder" kind="text" :max="60" /> holds the
-        lease<template v-if="remaining">
+        The primary on server <SafeName :value="lease.holder ?? ''" kind="text" :max="60" /> holds
+        the lease<template v-if="remaining">
           ; <span data-testid="lease-remaining">{{ remaining }}</span> left when this page was last
           refreshed (it is renewed every two seconds)</template
         >.
       </p>
       <p v-else-if="lease.state === 'granted'" data-testid="lease-text">
         The server that answered granted the lease to server
-        <SafeName :value="lease.holder" kind="text" :max="60" /><template v-if="remaining">
+        <SafeName :value="lease.holder ?? ''" kind="text" :max="60" /><template v-if="remaining">
           ; <span data-testid="lease-remaining">{{ remaining }}</span> left when this page was last
           refreshed</template
         >. It does not run this primary itself, so this is what it knows, not a check of the

@@ -11,13 +11,17 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
 )
 
 // UpdateClusterSettings validates the whole request, then stores the values
 // in one transaction (kingres_cp.cluster_setting). Feature flags can only be
 // turned on: the extension is installed in the system database, nothing is
 // ever removed.
-func (o *Ops) UpdateClusterSettings(ctx context.Context, actor string, req api.ClusterSettingsUpdateRequest) error {
+//
+// It returns the task that the update started, or nil: a new replica count starts the
+// reconcile of the standbys (standby.reconcile) and the caller reports it.
+func (o *Ops) UpdateClusterSettings(ctx context.Context, actor string, req api.ClusterSettingsUpdateRequest) (*task.Task, error) {
 	var errs []problem.FieldError
 	set := map[string]any{}
 	if v := req.DefaultReplicaCount; v != nil {
@@ -78,19 +82,19 @@ func (o *Ops) UpdateClusterSettings(ctx context.Context, actor string, req api.C
 			errs = append(errs, field("/features", "at least one property is required", "required"))
 		}
 		if f.Sharding != nil && !*f.Sharding || f.Ledger != nil && !*f.Ledger {
-			return problem.New(problem.ImmutableField, "A feature can be turned on, never off.")
+			return nil, problem.New(problem.ImmutableField, "A feature can be turned on, never off.")
 		}
 		wantShard, wantLedger = f.Sharding != nil, f.Ledger != nil
 	}
 	if len(errs) > 0 {
-		return problem.Validation("The settings are invalid.", errs...)
+		return nil, problem.Validation("The settings are invalid.", errs...)
 	}
 	if len(set) == 0 && !wantShard && !wantLedger {
-		return problem.Validation("The settings update is empty.", field("/", "at least one property is required", "required"))
+		return nil, problem.Validation("The settings update is empty.", field("/", "at least one property is required", "required"))
 	}
 	if wantShard || wantLedger {
 		if err := o.installExtensions(ctx, sysdb.Database, wantShard, wantLedger); err != nil {
-			return wrap(err)
+			return nil, wrap(err)
 		}
 	}
 	err := wrap(o.asService(ctx, sysdb.Database, func(tx pgx.Tx) error {
@@ -103,8 +107,11 @@ func (o *Ops) UpdateClusterSettings(ctx context.Context, actor string, req api.C
 		}
 		return nil
 	}))
-	if _, changed := set["replica.default"]; changed && err == nil && o.OnReplicaCount != nil {
-		o.OnReplicaCount()
+	if err != nil {
+		return nil, err
 	}
-	return err
+	if _, changed := set["replica.default"]; changed && o.OnReplicaCount != nil {
+		return o.OnReplicaCount(ctx)
+	}
+	return nil, nil
 }

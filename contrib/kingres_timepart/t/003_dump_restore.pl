@@ -162,5 +162,100 @@ $node->safe_psql('postgres', 'CREATE DATABASE restored_schema');
 $node->command_ok([ 'psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-d', $node->connstr('restored_schema'), '-f', $schemaonly ], 'restore of the schema only');
 is(q1('restored_schema', q{SELECT count(*) FROM kingres.timepart_policy}), '0', 'no policies in a schema-only dump');
 
+# K12R-01: a dump by a role that is not a superuser.  The policy and the
+# history are plain tables that grant nothing to PUBLIC (no row-level
+# security), so a role that can read every table dumps them; the restore of
+# that dump gives the same policies and history.
+$node->safe_psql('postgres', q{
+CREATE ROLE backup LOGIN IN ROLE pg_read_all_data;
+CREATE ROLE dbown LOGIN;
+CREATE ROLE dbown_reader LOGIN IN ROLE pg_read_all_data;
+CREATE ROLE nobody LOGIN;
+});
+my $now = q1('postgres', $fingerprint);
+sub dump_as
+{
+	my ($role, $file, @fmt) = @_;
+	return $node->command_ok(
+		[ 'pg_dump', @fmt, '-U', $role, '-f', $file, $node->connstr('postgres') ],
+		"pg_dump as $role (@fmt)");
+}
+sub restore_check
+{
+	my ($file, $db, $what) = @_;
+	$node->safe_psql('postgres', "CREATE DATABASE $db");
+	$node->command_ok([ 'psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-d', $node->connstr($db), '-f', $file ],
+		"restore of the dump of $what");
+	is(q1($db, $fingerprint), $now, "policies, runs, actions and partitions after the restore of the dump of $what are the same");
+}
+
+# The superuser, as a reference.
+my $d_super = $node->basedir . '/d_super.sql';
+my $d_backup = $node->basedir . '/d_backup.sql';
+dump_as($node->safe_psql('postgres', 'SELECT current_user'), $d_super);
+dump_as('backup', $d_backup);
+restore_check($d_super, 'r_super', 'the superuser');
+restore_check($d_backup, 'r_backup', 'a role with pg_read_all_data only');
+sub norm { my $t = slurp_file($_[0]); $t =~ s{^\\(?:un)?restrict .*$}{}mg; return $t; }
+is(norm($d_backup), norm($d_super),
+	'the dump of the backup role is the dump of the superuser, byte for byte');
+my $d_backup_c = $node->basedir . '/d_backup.dump';
+$node->command_ok([ 'pg_dump', '-Fc', '-U', 'backup', '-f', $d_backup_c, $node->connstr('postgres') ],
+	'pg_dump as the backup role, custom format');
+$node->safe_psql('postgres', 'CREATE DATABASE r_backup_c');
+$node->command_ok([ 'pg_restore', '-d', $node->connstr('r_backup_c'), $d_backup_c ], 'pg_restore of that dump');
+is(q1('r_backup_c', $fingerprint), $now, 'and the same policies and history come back');
+$node->command_ok([ 'pg_dump', '-U', 'backup', '-t', 'kingres.timepart_policy_data', '-f', '/dev/null', $node->connstr('postgres') ],
+	'pg_dump of the policy table alone by the backup role');
+$node->command_ok([ 'pg_dump', '-U', 'backup', '--data-only', '--inserts', '-f', '/dev/null', $node->connstr('postgres') ],
+	'pg_dump with INSERT statements by the backup role');
+
+# The database owner: with pg_read_all_data it dumps, without it it is a role
+# like any other that does not own the tables of the extension.
+$node->safe_psql('postgres', 'ALTER DATABASE postgres OWNER TO dbown');
+my $d_dbown = $node->basedir . '/d_dbown.sql';
+$node->safe_psql('postgres', 'GRANT pg_read_all_data TO dbown');
+dump_as('dbown', $d_dbown);
+restore_check($d_dbown, 'r_dbown', 'the database owner');
+$node->safe_psql('postgres', 'REVOKE pg_read_all_data FROM dbown');
+command_fails_like(
+	[ 'pg_dump', '-U', 'dbown', '-f', '/dev/null', $node->connstr('postgres') ],
+	qr/permission denied for table timepart_|permission denied for/,
+	'a database owner without pg_read_all_data is refused by name, not by row-level security');
+command_fails_like(
+	[ 'pg_dump', '-U', 'nobody', '-f', '/dev/null', $node->connstr('postgres') ],
+	qr/permission denied/,
+	'and so is a role with no rights');
+
+# The restore of the dump needs a superuser, as the extension is not trusted
+# and the restore writes the policies as they were: the database owner is
+# refused with the permission error and nothing is half restored.
+$node->safe_psql('postgres', 'CREATE DATABASE r_owner_try OWNER dbown');
+$node->safe_psql('r_owner_try', 'CREATE EXTENSION kingres_timepart');
+$node->command_fails([ 'pg_restore', '-U', 'dbown', '-d', $node->connstr('r_owner_try'), $d_backup_c ],
+	'a restore by the database owner is refused');
+is(q1('r_owner_try', q{SELECT count(*) FROM kingres.timepart_policy}), '0', 'and no policy came in');
+is(q1('r_owner_try', q{SELECT count(*) FROM kingres.timepart_run}), '0', 'nor a run');
+$node->safe_psql('postgres', 'CREATE DATABASE r_owner_try2 OWNER dbown');
+$node->safe_psql('r_owner_try2', 'CREATE EXTENSION kingres_timepart');
+$node->command_fails_like([ 'pg_restore', '--no-owner', '-U', 'dbown', '-d', $node->connstr('r_owner_try2'), $d_backup_c ],
+	qr/permission denied for schema kingres/, 'also without the owners: the database owner has no access to the schema of the extension');
+is(q1('r_owner_try2', q{SELECT count(*) FROM kingres.timepart_policy_data}), '0', 'and still no policy');
+
+# CREATE EXTENSION in a database whose schema kingres was made by something
+# else (another KingresDB extension), then dump and restore.
+$node->safe_psql('postgres', 'CREATE DATABASE has_schema');
+$node->safe_psql('has_schema', q{CREATE SCHEMA kingres; CREATE TABLE kingres.other (x int); INSERT INTO kingres.other VALUES (1);
+	CREATE EXTENSION kingres_timepart;
+	CREATE TABLE public.t (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+	SELECT kingres.timepart_set_policy('public.t', '1 day');});
+is(q1('has_schema', q{SELECT count(*) FROM kingres.timepart_policy}), '1', 'the extension is created in an existing schema kingres');
+my $d_has = $node->basedir . '/d_has.sql';
+$node->command_ok([ 'pg_dump', '-U', 'backup', '-f', $d_has, $node->connstr('has_schema') ], 'dump of it by the backup role');
+$node->safe_psql('postgres', 'CREATE DATABASE has_schema2');
+$node->command_ok([ 'psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-d', $node->connstr('has_schema2'), '-f', $d_has ], 'and its restore');
+is(q1('has_schema2', q{SELECT count(*) FROM kingres.timepart_policy}) . q1('has_schema2', q{SELECT x FROM kingres.other}), '11',
+	'with the policy and the table of the other owner of the schema');
+
 $node->stop;
 done_testing();

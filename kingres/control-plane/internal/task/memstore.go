@@ -198,7 +198,7 @@ func (m *MemStore) RequestCancel(_ context.Context, id int64, now time.Time) err
 	switch t.State {
 	case Done, Failed:
 		return ErrNotCancellable
-	case Pending:
+	case Pending, Paused:
 		t.State, t.UpdatedAt = Failed, now
 		t.Error = &Error{Code: CodeCanceled, Message: "The task was canceled before it started."}
 	default:
@@ -257,5 +257,32 @@ func (m *MemStore) SetDetail(_ context.Context, id int64, l Lease, detail string
 		return err
 	}
 	t.Detail = detail
+	return nil
+}
+
+// Pause implements PauseStore.
+func (m *MemStore) Pause(_ context.Context, id int64, l Lease, reason string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, err := m.held(id, l)
+	if err != nil {
+		return err
+	}
+	t.State, t.Detail, t.UpdatedAt, t.Holder, t.LeaseExpires = Paused, reason, m.clock(), "", time.Time{}
+	return nil
+}
+
+// Resume implements PauseStore.
+func (m *MemStore) Resume(_ context.Context, id int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, ok := m.tasks[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if t.State != Paused {
+		return ErrNotPaused
+	}
+	t.State, t.CancelRequested, t.UpdatedAt = Pending, false, m.clock()
 	return nil
 }

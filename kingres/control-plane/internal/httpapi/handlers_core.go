@@ -40,6 +40,9 @@ func (s *Server) handlers() map[string]handlerFunc {
 	for k, v := range s.configHandlers() {
 		m[k] = v
 	}
+	for k, v := range s.rebalanceHandlers() {
+		m[k] = v
+	}
 	for k, v := range s.coreHandlers() {
 		m[k] = v
 	}

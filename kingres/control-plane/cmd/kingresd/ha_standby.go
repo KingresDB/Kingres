@@ -19,6 +19,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ops"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/standby"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
 )
 
 // standbyParts are the two halves of the standby machinery: the agent that runs on
@@ -66,7 +67,14 @@ func newStandbyParts(cfg config.Config, svc *cluster.Service, self string, log *
 	})
 	reg.SetStandbys(agent)
 	members.Standbys = l
-	opsSvc.OnReplicaCount = l.Kick
+	opsSvc.OnReplicaCount = func(ctx context.Context) (*task.Task, error) {
+		eng := opsSvc.Engine()
+		if eng == nil {
+			l.Kick()
+			return nil, nil
+		}
+		return l.ReconcileNow(ctx, eng.Get)
+	}
 	return &standbyParts{agent: agent, leader: l}, nil
 }
 

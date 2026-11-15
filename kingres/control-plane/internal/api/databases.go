@@ -67,6 +67,10 @@ type DatabaseLedgerSummary struct {
 	VerificationState *string `json:"verificationState"`
 	// LastVerifiedBlockHeight is the highest verified block; null if never.
 	LastVerifiedBlockHeight *int64 `json:"lastVerifiedBlockHeight"`
+	// Complete and UncoveredShardGroupIDs (contract 0.9.0) state the coverage of the
+	// summary, with the meaning they have on LedgerStatus. Set for a sharded database.
+	Complete               *bool   `json:"complete,omitempty"`
+	UncoveredShardGroupIDs []int32 `json:"uncoveredShardGroupIds,omitempty"`
 }
 
 // Database is a database with its settings groups and statistics.
@@ -109,10 +113,10 @@ type TableDistribution struct {
 	Method string `json:"method"`
 	// Column is the distribution column; null for reference tables.
 	Column *string `json:"column"`
-	// ColocationID is the colocation group.
-	ColocationID int32 `json:"colocationId"`
-	// BucketCount is the bucket count of the colocation group.
-	BucketCount int `json:"bucketCount"`
+	// ColocationID is the colocation group; null for a reference table.
+	ColocationID *int32 `json:"colocationId"`
+	// BucketCount is the bucket count of the colocation group; null for a reference table.
+	BucketCount *int `json:"bucketCount"`
 }
 
 // TableLedger are the ledger properties of a table.

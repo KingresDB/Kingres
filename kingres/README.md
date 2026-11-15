@@ -22,17 +22,17 @@ The design is in [docs/architecture.md](docs/architecture.md). It separates sour
 
 ## Status
 
-There is one product branch per PostgreSQL major, with the same KingresDB code on each: `kingres-18` on upstream tag `REL_18_7`, and `kingres-19` on `REL_19_RC2` (a pre-release until PostgreSQL 19 is released); see [docs/dev/releases.md](docs/dev/releases.md). State on 2026-11-15, by phase of the roadmap in [docs/architecture.md](docs/architecture.md):
+There is one product branch per PostgreSQL major, with the same KingresDB code on each: `kingres-18` on upstream tag `REL_18_7`, and `kingres-19` on `REL_19_RC2` (a pre-release until PostgreSQL 19 is released); see [docs/dev/releases.md](docs/dev/releases.md). State on 2026-11-16, by phase of the roadmap in [docs/architecture.md](docs/architecture.md):
 
 | Phase | State |
 |---|---|
 | 0 Foundation, 1 Sharding MVP, 2 Distributed DML and DDL, two-phase commit, reference tables | Done (`kingres_shard` 0.2) |
 | 3 Control plane, REST API, panel, package | Done |
-| 4 Bucket movement and rebalancing | In progress: `kingres_shard` 0.4 moves buckets (0.4 is the fix round for the review of 0.3; its fixes are being reviewed again); rebalancing is not yet driven by the control plane |
+| 4 Bucket movement and rebalancing | Built, review owed: `kingres_shard` moves buckets, and the control plane drives a rebalance (a plan by bucket count, one move at a time, stop and start again, taken over after a restart or a leader change, a report per run) with its page in the panel. Several moves at once, the strategy by disk size and draining a server are phase 10 |
 | 5 High availability | In progress: heartbeats, leases, standbys and the client entry point are in the control plane; `kingres_shard` 0.5 has standby nodes, `promote_node`, prepared transactions across a failover, distributed deadlock detection and coordinated restore points; failover itself (the control plane promoting a standby) is not written yet. The independent review of 0.5 found one critical and six high defects in these functions ([report](docs/reviews/2026-11-15-kingres-shard-0.5.md)); they are being fixed, and a failover must not be relied on before that |
 | 6 Ledger | Done (`kingres_ledger` 0.2, the verifier, the Ledger page) |
 | 2b, 9 to 12 | Designed, not implemented, except the three standalone extensions of phase 12 listed below |
-| 7 | Not started |
+| 7 Signing, anchoring, publication, aggregate digest | Designed ([docs/design/ledger-phase7.md](docs/design/ledger-phase7.md)); of 25 steps the first is built: the verifier checks signed checkpoints, tile logs and consistency proofs |
 | 8 | Future roadmap: not part of the first release |
 
 For what has been done, how it was verified and what is still open, read the work log: [docs/worklog.md](docs/worklog.md).

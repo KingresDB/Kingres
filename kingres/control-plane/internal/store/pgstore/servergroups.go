@@ -27,6 +27,7 @@ type serverRecord struct {
 	certPEM string
 	revoked *time.Time
 	joined  time.Time
+	status  string
 }
 
 // loadRecords reads kingres_cp.server; ok is false when the schema is absent.
@@ -38,7 +39,7 @@ func (s *Store) loadRecords(ctx context.Context) (rec map[string]serverRecord, o
 	if ok, err = s.regclassExists(ctx, p, "kingres_cp.server"); err != nil || !ok {
 		return nil, false, err
 	}
-	rows, err := p.Query(ctx, `SELECT server_id, server_group, coalesce(seen_fingerprint, ''), fingerprint_pinned, coalesce(certificate_pem, ''), certificate_revoked_at, joined_at
+	rows, err := p.Query(ctx, `SELECT server_id, server_group, coalesce(seen_fingerprint, ''), fingerprint_pinned, coalesce(certificate_pem, ''), certificate_revoked_at, joined_at, status
 		FROM kingres_cp.server`)
 	if err != nil {
 		return nil, false, s.wrap("reading kingres_cp.server", err)
@@ -48,7 +49,7 @@ func (s *Store) loadRecords(ctx context.Context) (rec map[string]serverRecord, o
 	for rows.Next() {
 		var id string
 		var r serverRecord
-		if err := rows.Scan(&id, &r.group, &r.seen, &r.pinned, &r.certPEM, &r.revoked, &r.joined); err != nil {
+		if err := rows.Scan(&id, &r.group, &r.seen, &r.pinned, &r.certPEM, &r.revoked, &r.joined, &r.status); err != nil {
 			return nil, false, s.wrap("scanning kingres_cp.server", err)
 		}
 		rec[id] = r
@@ -77,6 +78,9 @@ func (s *Store) applyRecords(ctx context.Context, servers []api.Server) {
 			continue
 		}
 		servers[i].ServerGroup = r.group
+		if r.status == "removing" && servers[i].Status != "dead" {
+			servers[i].Status = "decommissioning"
+		}
 		if fp := pki.NormalizeFingerprint(r.seen); fp != "" {
 			servers[i].SeenFingerprint = &fp
 			servers[i].FingerprintPinned = r.pinned

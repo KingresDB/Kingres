@@ -225,5 +225,10 @@ extern bool tdigest_validate_state(const uint8 *p, Size len, char *why);
 
 /* The sketch state of hll.c, used by self_test() in kingres_sketch.c. */
 extern int64 hll_self_test_value(void);
+extern void tdigest_self_test_values(uint64 *single, uint64 *uni, uint64 *read, uint64 *scale);
+extern void topn_self_test_values(uint64 *single, uint64 *uni);
+
+/* A fixed hash of a byte string (FNV-1a), for self_test(): no dependency on a library. */
+extern uint64 ks_hash_bytes64(const uint8 *p, Size len);
 
 #endif							/* KINGRES_SKETCH_KINGRES_SKETCH_H */

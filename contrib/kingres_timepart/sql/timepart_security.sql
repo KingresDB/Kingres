@@ -36,9 +36,12 @@ SELECT proname FROM members WHERE prosecdef ORDER BY proname;
 -- DDL steps that run with the caller's own rights.
 SELECT proname FROM members
  WHERE has_function_privilege('public', oid, 'EXECUTE') ORDER BY proname;
--- The history and the policy tables are shown to a role through row-level
--- security (the rows of the tables it owns); the lock table is private.
-SELECT relname, c.relrowsecurity AS rls,
+-- The policy and the history are shown to a role through security_barrier
+-- views (the rows of the tables it owns); the base tables and the lock table
+-- grant nothing to a role, and no table has row-level security (pg_dump of a
+-- role that is not a superuser needs that).
+SELECT relname, c.relkind AS kind, c.relrowsecurity AS rls,
+       coalesce(c.reloptions::text, '') AS options,
        has_table_privilege('tp_other', c.oid, 'SELECT') AS other_select,
        has_table_privilege('tp_other', c.oid, 'INSERT') AS other_insert
   FROM pg_class c WHERE c.relnamespace = 'kingres'::regnamespace AND c.relname LIKE 'timepart_%' AND c.relkind IN ('r', 'v')
@@ -342,6 +345,103 @@ SELECT partition, attached FROM kingres.timepart_partitions('tpo.dt') WHERE NOT 
 RESET ROLE;
 DROP TABLE tpo.dt_p20260301;
 DROP TABLE tpo.dt;
+
+-- K12R-01: the policy and the history are reached through views whose
+-- condition judges current_user, and nothing else.  Two tables with a policy
+-- and a run each, of two roles.
+CREATE TABLE tpo.mine (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+ALTER TABLE tpo.mine OWNER TO tp_owner;
+CREATE TABLE tp.theirs3 (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+ALTER TABLE tp.theirs3 OWNER TO tp_other;
+SET ROLE tp_owner;
+SELECT kingres.timepart_set_policy('tpo.mine', '1 day', create_ahead => '1 day');
+RESET ROLE;
+SET ROLE tp_other;
+SELECT kingres.timepart_set_policy('tp.theirs3', '1 day', create_ahead => '1 day');
+RESET ROLE;
+GRANT CREATE ON SCHEMA tpo TO tp_owner;
+\o /dev/null
+CALL kingres.timepart_run('tpo.mine', '2026-03-05 UTC');
+CALL kingres.timepart_run('tp.theirs3', '2026-03-05 UTC');
+\o
+-- Each role sees its own policy, runs and actions; the superuser sees all.
+SET ROLE tp_other;
+SELECT table_name FROM kingres.timepart_policy WHERE table_name IN ('mine', 'theirs3') ORDER BY 1;
+SELECT DISTINCT table_name FROM kingres.timepart_run WHERE table_name IN ('mine', 'theirs3') ORDER BY 1;
+SELECT count(DISTINCT r.table_name) AS tables_of_actions
+  FROM kingres.timepart_run_action a JOIN kingres.timepart_run r USING (run_id)
+ WHERE r.table_name IN ('mine', 'theirs3');
+SELECT table_name FROM kingres.timepart_policies WHERE table_name IN ('mine', 'theirs3') ORDER BY 1;
+-- The base tables are not reachable.
+SELECT count(*) FROM kingres.timepart_policy_data;
+SELECT count(*) FROM kingres.timepart_run_data;
+SELECT count(*) FROM kingres.timepart_run_action_data;
+INSERT INTO kingres.timepart_run_data (schema_name, table_name, as_of, trigger, state, started_by)
+VALUES ('tp', 'theirs3', now(), 'manual', 'done', 'tp_other');
+INSERT INTO kingres.timepart_run (schema_name, table_name, as_of, trigger, state, started_by)
+VALUES ('tp', 'theirs3', now(), 'manual', 'done', 'tp_other');
+DELETE FROM kingres.timepart_run;
+-- A function of the caller in a WHERE clause does not see the rows the view
+-- hides: it is called for the rows of the caller only.
+CREATE FUNCTION tp.spy(anyelement) RETURNS boolean LANGUAGE plpgsql AS $$
+BEGIN RAISE NOTICE 'spy saw %', $1; RETURN true; END $$;
+SELECT count(*) AS seen FROM kingres.timepart_policy WHERE tp.spy(table_name);
+SELECT count(*) AS seen FROM kingres.timepart_policy WHERE table_name = 'mine' AND tp.spy(table_name);
+SELECT count(*) AS seen FROM kingres.timepart_run WHERE tp.spy(table_name);
+SELECT count(*) AS seen FROM kingres.timepart_run_action a WHERE tp.spy(a.partition_name) AND a.partition_name <> '';
+SELECT count(*) AS seen FROM kingres.timepart_policies WHERE tp.spy(table_name);
+SELECT count(*) AS seen FROM kingres.timepart_policy p JOIN kingres.timepart_run r USING (schema_name, table_name) WHERE tp.spy(r.error);
+-- Writes through the view: a policy for a table of another role, in every
+-- form, and an update that would move a row to a table of another role.
+INSERT INTO kingres.timepart_policy (schema_name, table_name, parent_oid, partition_every)
+VALUES ('tpo', 'mine', 0, '1 day')
+ON CONFLICT (schema_name, table_name) DO UPDATE SET retention = '1 day';
+INSERT INTO kingres.timepart_policy (schema_name, table_name, parent_oid, partition_every)
+VALUES ('tpo', 'mine', 0, '1 day')
+ON CONFLICT (schema_name, table_name) DO NOTHING;
+UPDATE kingres.timepart_policy SET schema_name = 'tpo', table_name = 'mine' WHERE table_name = 'theirs3';
+DELETE FROM kingres.timepart_policy WHERE table_name = 'mine';
+RESET ROLE;
+DROP FUNCTION tp.spy(anyelement);
+SELECT table_name, retention FROM kingres.timepart_policy WHERE table_name IN ('mine', 'theirs3') ORDER BY 1;
+-- A SECURITY DEFINER function of the role, called in the session of a
+-- superuser, sees what the role sees, and cannot write what it may not.
+SET ROLE tp_other;
+CREATE FUNCTION tp.evil_view() RETURNS text LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+    RETURN (SELECT string_agg(table_name, ',' ORDER BY table_name) FROM kingres.timepart_policy
+             WHERE table_name IN ('mine', 'theirs3'))
+        || ' / ' || (SELECT count(*) FROM kingres.timepart_run WHERE table_name = 'mine')
+        || ' / ' || (SELECT count(*) FROM kingres.timepart_run_action a JOIN kingres.timepart_run r USING (run_id) WHERE r.table_name = 'mine');
+END $$;
+CREATE FUNCTION tp.evil_write() RETURNS int LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+    UPDATE kingres.timepart_policy SET retention = '1 day' WHERE table_name = 'mine';
+    DELETE FROM kingres.timepart_policy WHERE table_name = 'mine';
+    INSERT INTO kingres.timepart_policy (schema_name, table_name, parent_oid, partition_every, retention)
+    VALUES ('tpo', 'mine', 0, '1 day', '1 day') ON CONFLICT (schema_name, table_name) DO UPDATE SET retention = '1 day';
+    RETURN 1;
+END $$;
+RESET ROLE;
+SELECT tp.evil_view();
+SELECT tp.evil_write();
+SELECT table_name, retention FROM kingres.timepart_policy WHERE table_name IN ('mine', 'theirs3') ORDER BY 1;
+DROP FUNCTION tp.evil_view(), tp.evil_write();
+-- A role that reads every table (a backup role) reads the base tables as
+-- they are, with row security off, which is what pg_dump does.
+CREATE ROLE tp_backup NOLOGIN IN ROLE pg_read_all_data;
+SET ROLE tp_backup;
+SET row_security = off;
+SELECT (SELECT count(*) FROM kingres.timepart_policy_data) >= 2 AS reads_policies,
+       (SELECT count(*) FROM kingres.timepart_run_data) >= 2 AS reads_runs,
+       (SELECT count(*) FROM kingres.timepart_run_action_data) >= 2 AS reads_actions;
+SELECT count(*) AS backup_role_sees_in_views FROM kingres.timepart_policy;
+INSERT INTO kingres.timepart_policy_data (schema_name, table_name, parent_oid, partition_every, table_owner, created_by)
+VALUES ('tpo', 'zz', 0, '1 day', 'tp_backup', 'tp_backup');
+RESET row_security;
+RESET ROLE;
+DROP ROLE tp_backup;
+DROP TABLE tpo.mine, tp.theirs3;
 
 -- Cleanup of the roles of the tests.
 DROP TABLE tpo.o1, tpo.h1, tpo.pg_class, tpo.pg_inherits, tp.o2;

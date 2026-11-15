@@ -8,7 +8,7 @@ import { applyPending, configHandlers } from './config'
 import type { HttpHandler } from 'msw'
 import type { components } from '@/api/schema'
 import type { OperationId } from '@/api/operations.generated'
-import type { Alert, Database, Role, Table } from '@/api/types'
+import type { Alert, Database, Role, Table, Task } from '@/api/types'
 import {
   accepted,
   created,
@@ -124,6 +124,193 @@ function setupTaskSummary(s: MockState): S['SetupTaskSummary'] | null {
     createdAt: rec.task.createdAt,
     updatedAt: rec.task.updatedAt,
   }
+}
+
+const REFUSAL_TEXT: Record<string, string> = {
+  nothing_to_rebalance: 'The buckets are placed as the plan would place them; nothing to move.',
+  cluster_inconsistent:
+    'Database shop: kingres.check_cluster() reports stalled_move (node 4). Resolve it before moving buckets.',
+  version_mismatch:
+    'Database shop: the servers do not run the same extension version and PostgreSQL major: extension_version_differs (node 6).',
+  failover_in_progress: 'A failover is in progress (server.failover 10.0.0.12).',
+  no_receiving_server: 'No server should hold shards in database shop.',
+  operation_in_progress: 'Another operation changes the servers (server.add 10.0.0.14).',
+  rebalance_in_progress: 'A rebalance is already running (task 118).',
+}
+
+function serverOfGroup(s: MockState, g: number): string | undefined {
+  return s.groups.find((x) => x.id === g)?.primaryServerId ?? undefined
+}
+
+/** Primary buckets per database and server (the placement a report shows before and after). */
+function placementOf(s: MockState): S['PlacementEntry'][] {
+  const out: S['PlacementEntry'][] = []
+  for (const d of s.databases) {
+    if (!d.info.sharding.enabled) continue
+    const counts = new Map<string, number>()
+    for (const b of [...d.buckets.values()].flat()) {
+      const sv = serverOfGroup(s, b.group)
+      if (sv) counts.set(sv, (counts.get(sv) ?? 0) + 1)
+    }
+    for (const [serverId, primaryBuckets] of [...counts].sort())
+      out.push({ databaseName: d.info.name, serverId, primaryBuckets })
+  }
+  return out
+}
+
+/** Writes (or, for a stopped run, replaces) the report of a run. */
+function pushReport(
+  s: MockState,
+  o: {
+    id: number
+    outcome: 'completed' | 'stopped' | 'failed'
+    startedAt: string
+    moves: S['PlannedMove'][]
+    doneCount: number
+    failedLast: boolean
+    before: S['PlacementEntry'][]
+  },
+): void {
+  const total = o.moves.length
+  const listed = o.moves.slice(0, o.outcome === 'stopped' ? o.doneCount + 1 : total)
+  const bytes = o.moves.slice(0, o.doneCount).reduce((n, m) => n + (m.estimatedSizeBytes ?? 0), 0)
+  s.rebalance.reports = s.rebalance.reports.filter((x) => x.id !== o.id)
+  s.rebalance.reports.unshift({
+    id: o.id,
+    outcome: o.outcome,
+    startedAt: o.startedAt,
+    finishedAt: nowIso(),
+    options: s.rebalance.options ?? {},
+    stoppedBy: o.outcome === 'stopped' ? 'operator' : null,
+    error:
+      o.outcome === 'failed' ? '1 bucket move failed and was given up after 3 attempts.' : null,
+    totals: {
+      movesTotal: total,
+      movesDone: o.doneCount,
+      movesFailed: o.failedLast ? 1 : 0,
+      movesSkipped: o.outcome === 'stopped' ? 1 : 0,
+      bytesMoved: bytes,
+      durationSeconds: Math.max(1, Math.round((Date.now() - Date.parse(o.startedAt)) / 1000)),
+    },
+    placementBefore: o.before,
+    placementAfter: placementOf(s),
+    moves: (o.failedLast ? listed.slice(-50) : listed.slice(0, 50)).map((m, j) => {
+      const i = j + (o.failedLast ? Math.max(0, listed.length - 50) : 0)
+      const base = {
+        databaseName: m.databaseName,
+        colocationId: m.colocationId,
+        bucket: m.bucket,
+        fromShardGroupId: m.fromShardGroupId,
+        toShardGroupId: m.toShardGroupId,
+        fromServerId: serverOfGroup(s, m.fromShardGroupId),
+        toServerId: serverOfGroup(s, m.toShardGroupId),
+        ...(m.estimatedSizeBytes === null ? {} : { sizeBytes: m.estimatedSizeBytes }),
+      }
+      if (i < o.doneCount)
+        return {
+          ...base,
+          outcome: 'done' as const,
+          attempts: 1,
+          skipReason: null,
+          durationSeconds: 3,
+          error: null,
+        }
+      if (o.outcome === 'stopped')
+        return {
+          ...base,
+          outcome: 'skipped' as const,
+          attempts: 1,
+          skipReason: 'stopped',
+          durationSeconds: 1,
+          error: null,
+        }
+      return {
+        ...base,
+        outcome: 'failed' as const,
+        attempts: 3,
+        skipReason: null,
+        durationSeconds: 95,
+        error: 'kingres.move_bucket: the subscription could not copy the table (simulated).',
+      }
+    }),
+  })
+}
+
+/** A stop that was asked a moment ago has ended: the move in flight is undone and the run is stopped. */
+function settleStop(s: MockState): void {
+  const r = s.rebalance
+  if (r.state !== 'stopping' || r.stopAskedAt === null || Date.now() - r.stopAskedAt < 1500) return
+  const done = Math.floor(r.fractionAtStop * r.moves.length)
+  applyMoveProgress(s, r.moves, done, 0)
+  r.state = 'stopped'
+  r.stopAskedAt = null
+  r.pausedReason = 'Stopped by the operator; start the rebalance again to continue.'
+  if (r.taskId !== null)
+    pushReport(s, {
+      id: r.taskId,
+      outcome: 'stopped',
+      startedAt: r.startedAt ?? nowIso(),
+      moves: r.moves,
+      doneCount: done,
+      failedLast: false,
+      before: [],
+    })
+}
+
+function rebalanceStatusView(s: MockState): S['RebalanceStatus'] {
+  settleStop(s)
+  const r = s.rebalance
+  const rec = r.taskId ? requireTask(s, r.taskId) : undefined
+  const total = r.moves.length
+  const fraction =
+    r.state === 'stopped' || r.state === 'stopping'
+      ? r.fractionAtStop
+      : (rec?.task.progress.percent ?? 0) / 100
+  const done = Math.floor(fraction * total)
+  const active = r.state === 'running' || r.state === 'stopping'
+  const inFlight = active && done < total ? r.moves.slice(done, done + 1) : []
+  const phases = ['prepare', 'copy', 'catchUp', 'switch', 'cleanup'] as const
+  const failed = r.state === 'failed' ? 1 : 0
+  return {
+    state: r.state,
+    needed: r.needed,
+    reasons: r.reasons,
+    taskId: r.state === 'idle' || r.state === 'failed' ? null : r.taskId,
+    startedAt: r.state === 'idle' || r.state === 'failed' ? null : r.startedAt,
+    options: r.state === 'idle' || r.state === 'failed' ? null : r.options,
+    progress:
+      r.state === 'idle' || r.state === 'failed'
+        ? null
+        : {
+            movesTotal: total,
+            movesDone: done,
+            movesInFlight: inFlight.length,
+            movesFailed: failed,
+            movesSkipped: 0,
+            bytesMoved: r.moves.slice(0, done).reduce((n, m) => n + (m.estimatedSizeBytes ?? 0), 0),
+            percent: Math.round(fraction * 1000) / 10,
+          },
+    inFlightMoves: inFlight.map((m) => {
+      // One move at a time: its phase follows the position inside the move.
+      const within = fraction * total - done
+      const phase = phases[Math.min(4, Math.floor(within * 5))] as (typeof phases)[number]
+      return {
+        databaseName: m.databaseName,
+        colocationId: m.colocationId,
+        bucket: m.bucket,
+        fromShardGroupId: m.fromShardGroupId,
+        toShardGroupId: m.toShardGroupId,
+        fromServerId: serverOfGroup(s, m.fromShardGroupId),
+        toServerId: serverOfGroup(s, m.toShardGroupId),
+        phase,
+        percent: [5, 30, 85, 95, 100][phases.indexOf(phase)] as number,
+        sizeBytes: m.estimatedSizeBytes,
+      }
+    }),
+    stoppedBy: r.state === 'stopped' || r.state === 'stopping' ? r.stoppedBy : null,
+    pausedReason: r.state === 'stopped' ? r.pausedReason : null,
+    lastReport: lastReportOf(s),
+  } satisfies S['RebalanceStatus']
 }
 
 /** The newest report without its moves (RebalanceStatus.lastReport). */
@@ -2002,112 +2189,105 @@ export function createHandlers(): HttpHandler[] {
         }),
       )
     },
-    getRebalanceStatus: (c) => {
-      const s = c.s
-      const r = s.rebalance
-      const rec = r.taskId ? requireTask(s, r.taskId) : undefined
-      const total = r.moves.length
-      const percent = rec?.task.progress.percent ?? 0
-      const done =
-        r.state === 'running' || r.state === 'stopped' ? Math.floor((percent / 100) * total) : 0
-      const inFlight = r.state === 'running' ? r.moves.slice(done, done + 4) : []
-      const phases = ['prepare', 'copy', 'catchUp', 'switch', 'cleanup'] as const
-      return ok({
-        state: r.state,
-        needed: r.needed,
-        reasons: r.reasons,
-        taskId: r.taskId,
-        startedAt: r.startedAt,
-        options: r.options,
-        progress:
-          r.state === 'idle'
-            ? null
-            : {
-                movesTotal: total,
-                movesDone: done,
-                movesInFlight: inFlight.length,
-                movesFailed: 0,
-                bytesMoved: r.moves
-                  .slice(0, done)
-                  .reduce((n, m) => n + (m.estimatedSizeBytes ?? 0), 0),
-                percent,
-              },
-        inFlightMoves: inFlight.map((m, i) => ({
-          databaseName: m.databaseName,
-          colocationId: m.colocationId,
-          bucket: m.bucket,
-          fromShardGroupId: m.fromShardGroupId,
-          toShardGroupId: m.toShardGroupId,
-          phase: phases[(done + i) % phases.length] as (typeof phases)[number],
-          percent: Math.min(99, (percent * 7 + i * 23) % 100),
-          sizeBytes: m.estimatedSizeBytes,
-        })),
-        lastReport: lastReportOf(s),
-      } satisfies S['RebalanceStatus'])
-    },
+    getRebalanceStatus: (c) => ok(rebalanceStatusView(c.s)),
     previewRebalancePlan: (c) => {
       const b = body<S['RebalancePlanRequest']>(c)
-      return ok(planView(c.s, b.moveLimit ?? 200, b.databases))
+      const plan = planView(c.s, b.moveLimit ?? 200, b.databases)
+      const named = {
+        ...plan,
+        moves: plan.moves.map((m) => ({
+          ...m,
+          fromServerId: serverOfGroup(c.s, m.fromShardGroupId),
+          toServerId: serverOfGroup(c.s, m.toShardGroupId),
+        })),
+      }
+      return ok(named)
     },
     startRebalance: (c) => {
       const s = c.s
-      requireNoRebalance(s)
-      const opts = body<S['RebalanceOptions']>(c)
-      const moves = planMoves(s, opts.databases)
-      if (moves.length === 0) {
-        // Nothing to move: finish quickly but still do the replica and status bookkeeping.
-        s.rebalance.needed = false
-      }
-      const total = moves.length
+      settleStop(s)
       const r = s.rebalance
+      if (r.state === 'running' || r.state === 'stopping')
+        throw problem('rebalance_in_progress', 'A rebalance is running.')
+      // The refusals, each with its problem code (the switch forces one).
+      if (mockConfig.rebalanceRefuse) {
+        const code = mockConfig.rebalanceRefuse as Parameters<typeof problem>[0]
+        mockConfig.rebalanceRefuse = null
+        throw problem(code, REFUSAL_TEXT[code] ?? 'The rebalance cannot start now.')
+      }
+      if (!s.servers.some((x) => x.shouldHaveShards && x.status !== 'dead'))
+        throw problem('no_receiving_server', 'No server should hold shards.')
+      const opts = body<S['RebalanceOptions']>(c)
+      // A stopped run goes on: the same task, the same moves, from where it was.
+      if (r.state === 'stopped' && r.taskId !== null) {
+        const rec = requireTask(s, r.taskId)
+        rec.task.state = 'running'
+        rec.task.cancellable = true
+        rec.startedAt = Date.now() - r.fractionAtStop * rec.durationMs
+        r.state = 'running'
+        r.stoppedBy = null
+        r.pausedReason = null
+        r.reports = r.reports.filter((x) => x.id !== r.taskId)
+        return accepted(rec.task)
+      }
+      const moves = planMoves(s, opts.databases)
+      if (moves.length === 0)
+        throw problem(
+          'nothing_to_rebalance',
+          'The buckets are placed as the plan would place them.',
+        )
+      const total = moves.length
+      const failing = mockConfig.rebalanceFail
+      mockConfig.rebalanceFail = false
+      const before = placementOf(s)
       r.state = 'running'
       r.moves = moves
       r.options = opts
       r.startedAt = nowIso()
+      r.stoppedBy = null
+      r.pausedReason = null
+      r.fractionAtStop = 0
       const startedAt = Date.now()
       const task = createTask(s, {
         kind: 'rebalance',
-        subject: { type: 'rebalance', id: 'cluster' },
-        steps: ['Plan moves', 'Move buckets', 'Verify placement', 'Finish'],
-        durationMs: Math.max(5000, total * 70),
+        subject: { type: 'cluster', id: 'cluster' },
+        steps: [
+          'Check that the cluster can rebalance',
+          'Compute the plan',
+          'Move buckets',
+          'Write the report',
+        ],
+        durationMs: Math.max(5000, total * 70) * (mockConfig.rebalanceSlow ? 3 : 1),
         cancellable: true,
         onProgress: (f) => {
-          const done = Math.floor(f * total)
-          applyMoveProgress(s, moves, done, Math.min(4, total - done))
+          const done = Math.floor(f * (failing ? Math.max(1, total - 1) : total))
+          applyMoveProgress(s, moves, Math.min(done, failing ? total - 1 : total), 0)
         },
+        failAtEnd: failing
+          ? {
+              code: 'step_failed',
+              message: '1 bucket move failed and was given up after 3 attempts.',
+              step: 'Write the report',
+              detail: 'Bucket move failed: the extension reported an error.',
+            }
+          : undefined,
         apply: () => {
-          applyMoveProgress(s, moves, total, 0)
+          const moved = failing ? moves.slice(0, total - 1) : moves
+          applyMoveProgress(s, moves, moved.length, 0)
           fixReplicas(s)
           for (const x of s.servers) if (x.status === 'pendingRebalance') x.status = 'live'
-          s.rebalance.state = 'idle'
-          s.rebalance.needed = false
-          s.rebalance.reasons = []
+          s.rebalance.state = failing ? 'failed' : 'idle'
+          s.rebalance.needed = failing
+          if (!failing) s.rebalance.reasons = []
           s.settings.autoFailover = { ...s.settings.autoFailover, eventsSinceReset: 0 }
-          const finished = nowIso()
-          const bytes = moves.reduce((n, m) => n + (m.estimatedSizeBytes ?? 0), 0)
-          s.rebalance.reports.unshift({
-            id: (s.rebalance.reports[0]?.id ?? 0) + 1,
-            outcome: 'completed',
+          pushReport(s, {
+            id: s.rebalance.taskId as number,
+            outcome: failing ? 'failed' : 'completed',
             startedAt: new Date(startedAt).toISOString(),
-            finishedAt: finished,
-            options: opts,
-            totals: {
-              movesTotal: total,
-              movesDone: total,
-              movesFailed: 0,
-              bytesMoved: bytes,
-              durationSeconds: Math.round((Date.now() - startedAt) / 1000),
-            },
-            moves: moves.slice(0, 50).map((m) => ({
-              databaseName: m.databaseName,
-              colocationId: m.colocationId,
-              bucket: m.bucket,
-              fromShardGroupId: m.fromShardGroupId,
-              toShardGroupId: m.toShardGroupId,
-              ...(m.estimatedSizeBytes === null ? {} : { sizeBytes: m.estimatedSizeBytes }),
-              outcome: 'done' as const,
-              durationSeconds: 3,
-            })),
+            moves,
+            doneCount: moved.length,
+            failedLast: failing,
+            before,
           })
         },
       })
@@ -2116,22 +2296,20 @@ export function createHandlers(): HttpHandler[] {
     },
     stopRebalance: (c) => {
       const s = c.s
-      if (s.rebalance.state !== 'running')
-        throw problem('node_state_invalid', 'No rebalance is running.')
-      const rec = s.rebalance.taskId ? requireTask(s, s.rebalance.taskId) : undefined
+      settleStop(s)
+      const r = s.rebalance
+      if (r.state !== 'running') throw problem('rebalance_not_running', 'No rebalance is running.')
+      const rec = r.taskId ? requireTask(s, r.taskId) : undefined
+      r.fractionAtStop = (rec?.task.progress.percent ?? 0) / 100
+      r.state = 'stopping'
+      r.stoppedBy = 'operator'
+      r.stopAskedAt = Date.now()
       if (rec) {
+        // The task keeps its progress; it is paused when the move in flight has ended.
         rec.task.state = 'paused'
         rec.task.cancellable = false
       }
-      s.rebalance.state = 'stopped'
-      for (const d of s.databases)
-        for (const bs of d.buckets.values())
-          for (const b of bs)
-            if (b.state === 'moving') {
-              b.state = 'active'
-              b.movingTo = null
-            }
-      return ok({ state: 'stopped', needed: true, reasons: s.rebalance.reasons })
+      return ok(rebalanceStatusView(s))
     },
     listRebalanceReports: (c) =>
       ok(
@@ -2467,9 +2645,10 @@ export function createHandlers(): HttpHandler[] {
       const cur = s.settings
       // 0.7.0: a replica count (even the current one) starts the standby check, a task that adds or removes standbys
       // as far as the servers allow. It is not a rebalance.
+      let started: Task | null = null
       if (b.defaultReplicaCount !== undefined) {
         cur.defaultReplicaCount = b.defaultReplicaCount
-        startStandbyReconcile(s, s.session?.username)
+        started = startStandbyReconcile(s, s.session?.username)
       }
       if (b.defaultDurability) cur.defaultDurability = b.defaultDurability
       if (b.autoFailover)
@@ -2487,6 +2666,11 @@ export function createHandlers(): HttpHandler[] {
       if (b.features?.ledger && !cur.features.ledger) {
         cur.features.ledger = true
         cur.restart = { required: true, serverIds: s.servers.map((x) => x.id) }
+      }
+      // 0.9.0: an update that started a task answers 202 with it to a request that asked for it.
+      if (started && /respond-async/i.test(c.request.headers.get('prefer') ?? '')) {
+        const r = accepted(started)
+        return { ...r, headers: { ...r.headers, 'Preference-Applied': 'respond-async' } }
       }
       return ok(cur)
     },

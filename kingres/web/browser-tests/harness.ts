@@ -283,6 +283,18 @@ const cancel = async (page: Page): Promise<void> => {
  */
 export const STATES: PageState[] = [
   {
+    // 0.9.0: the plan of a rebalance listed with its servers, and a start that the server refuses
+    // (the mock refuses an empty plan with its own notice).
+    name: 'rebalance: plan preview and a refused start',
+    route: '/rebalance',
+    open: async (page) => {
+      await clickText(page, 'Preview plan')
+      await page.waitForSelector('[data-testid="plan"]', { timeout: 20_000 })
+      await clickText(page, 'Start rebalance')
+      await sleep(600)
+    },
+  },
+  {
     name: 'renew certificates dialog',
     route: '/servers/10.0.0.13',
     open: async (page) => {

@@ -88,6 +88,8 @@ type Deps struct {
 	// Members adds and removes servers (design D4 and D5); nil makes addServer
 	// and removeServer answer "not supported".
 	Members Members
+	// Rebalance serves the Rebalance operations; nil makes them answer "not supported".
+	Rebalance Rebalancer
 	// Config serves the Configuration operations (phase 13); nil makes them answer "not supported".
 	Config *pgconfig.Leader
 	// LocalSettings serves getThisServerSettings and updateThisServerSettings;

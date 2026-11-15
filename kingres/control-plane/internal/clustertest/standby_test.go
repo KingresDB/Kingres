@@ -210,8 +210,12 @@ func TestStandbysAreCreatedForEveryGroupAndStream(t *testing.T) {
 		if tk["kind"] == "standby.reconcile" {
 			steps, _ := tk["progress"].(map[string]any)["steps"].([]any)
 			for _, s := range steps {
-				if s.(map[string]any)["name"] == "standby.register_in_catalog" {
+				if st := s.(map[string]any); st["name"] == "standby.register_in_catalog" {
 					found = true
+					// The step is skipped on purpose: the contract's state, with the reason in the detail.
+					if st["state"] != "skipped" {
+						t.Errorf("the step standby.register_in_catalog is %v, want skipped", st["state"])
+					}
 				}
 			}
 		}
@@ -227,8 +231,18 @@ func TestReplicaCountRaisedAndLowered(t *testing.T) {
 	c := formStandbys(t, 3, 1)
 	leader := c.Leader()
 	primaries, _ := primaryOf(t, leader)
-	leader.Expect(200, "PATCH", "/settings/cluster", map[string]any{"defaultReplicaCount": 2})
+	// Asked for with Prefer: respond-async, the update that starts the reconcile task answers 202 with the Task and
+	// a Location (contract 0.9.0); without the header it answers 200 with the settings, as before.
+	st, task, hdr := leader.DoH("PATCH", "/settings/cluster", map[string]any{"defaultReplicaCount": 2}, map[string]string{"Prefer": "respond-async"})
+	if st != 202 || task["kind"] != "standby.reconcile" || hdr.Get("Preference-Applied") != "respond-async" ||
+		hdr.Get("Location") != fmt.Sprintf("/api/v1/tasks/%v", task["id"]) {
+		t.Fatalf("update with Prefer: %d %v %v", st, task, hdr)
+	}
+	leader.WaitTaskDone(clustertest.TaskID(task), 5*time.Minute)
 	waitStandbys(t, c, 2)
+	if st, _ := leader.Do("PATCH", "/settings/cluster", map[string]any{"defaultReplicaCount": 2}, nil); st != 200 {
+		t.Errorf("the same update without the header: %d", st)
+	}
 	top := topology(t, leader)
 	for g, v := range top {
 		if v[0].server == v[1].server {

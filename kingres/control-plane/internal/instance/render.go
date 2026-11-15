@@ -241,6 +241,9 @@ func RenderManaged(s ManagedSettings) (string, error) {
 		{"listen_addresses", listen},
 		{"port", strconv.Itoa(s.Port)},
 		{"shared_preload_libraries", "kingres_shard,kingres_ledger"},
+		// A bucket move copies through logical replication on both nodes; the standbys use the
+		// physical part of the same WAL. (An instance created before this setting needs a restart.)
+		{"wal_level", "logical"},
 		{"password_encryption", "scram-sha-256"},
 		{"logging_collector", "on"},
 		{"log_directory", logDir},

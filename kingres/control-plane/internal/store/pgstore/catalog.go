@@ -288,10 +288,12 @@ func (c *catalog) instanceOf(n node) api.Instance {
 	return in
 }
 
-// statusOf derives the server status from the catalog. holds is the number of
-// buckets the server's nodes serve as primary or replica, primary the number it
-// serves as primary, and anyBuckets tells whether buckets exist in the cluster
-// at all.
+// statusOf derives the server status from the catalog. primary is the number of
+// buckets the server serves as primary, and anyBuckets tells whether buckets exist
+// in the cluster at all. A server that should not hold shards is draining while it
+// is the primary of buckets (a rebalance moves them away); the replicas it holds do
+// not count, a rebalance does not move them. A server whose removal task runs is
+// decommissioning (applyRecords).
 //
 // A server that joined waits for a rebalance as long as it is the primary of no
 // bucket. The replicas it holds do not count: the standby that a join creates
@@ -299,11 +301,11 @@ func (c *catalog) instanceOf(n node) api.Instance {
 // held "some data" depended on how far that copy had come when the status was
 // read, and the same server was live in one answer and pendingRebalance in the
 // next.
-func statusOf(sv *serverInfo, holds, primary int, anyBuckets bool) string {
+func statusOf(sv *serverInfo, primary int, anyBuckets bool) string {
 	switch {
 	case !sv.Active:
 		return "dead"
-	case !sv.Should && holds > 0:
+	case !sv.Should && primary > 0:
 		return "draining"
 	case sv.Should && primary == 0 && anyBuckets:
 		return "pendingRebalance"
@@ -371,7 +373,7 @@ func (s *Store) buildServers(ctx context.Context, cat *catalog, hold map[string]
 		h := *hold[sv.ID]
 		server := api.Server{
 			ID: sv.ID, Address: net.JoinHostPort(sv.Host, s.opts.PanelPort), Hostname: sv.Host,
-			Status:      s.withLiveness(sv.ID, statusOf(sv, h.Primary+h.Replica, h.Primary, anyBuckets)),
+			Status:      s.withLiveness(sv.ID, statusOf(sv, h.Primary, anyBuckets)),
 			ServerGroup: sv.Group, ShouldHaveShards: sv.Should,
 			Version:   versionPtr(s.opts.Version),
 			Instances: make([]api.Instance, 0, len(sv.Nodes)), Buckets: h,
@@ -558,6 +560,8 @@ func (s *Store) ClusterSummary(ctx context.Context) (store.ClusterSummary, error
 			sum.Servers.Dead++
 		case "pendingRebalance":
 			sum.Servers.PendingRebalance++
+		case "decommissioning":
+			sum.Servers.Decommissioning++
 		}
 	}
 	replicas := cat.replicaCount()
@@ -585,6 +589,8 @@ func (s *Store) ClusterSummary(ctx context.Context) (store.ClusterSummary, error
 		sum.RebalanceReasons = append(sum.RebalanceReasons, "replicasMissing")
 	}
 	sum.RebalanceNeeded = len(sum.RebalanceReasons) > 0
+	sum.RebalanceTaskID = s.runningRebalance(ctx)
+	sum.RebalanceRunning = sum.RebalanceTaskID != nil
 	sum.Health = "healthy"
 	switch {
 	case sum.Buckets.Unavailable > 0 || !sum.MapGroupAvailable:
@@ -645,4 +651,21 @@ func anyHeld(perDB map[string]map[int32]*groupBuckets) bool {
 		}
 	}
 	return false
+}
+
+// runningRebalance returns the task of the rebalance that is pending or running,
+// nil when there is none or this server's copy of the system database has no task table.
+func (s *Store) runningRebalance(ctx context.Context) *int64 {
+	p, err := s.pool(ctx, "")
+	if err != nil {
+		return nil
+	}
+	if ok, err := s.regclassExists(ctx, p, "kingres_cp.task"); err != nil || !ok {
+		return nil
+	}
+	var id int64
+	if err := p.QueryRow(ctx, `SELECT id FROM kingres_cp.task WHERE kind = 'rebalance' AND state IN ('pending', 'running') ORDER BY id DESC LIMIT 1`).Scan(&id); err != nil {
+		return nil
+	}
+	return &id
 }

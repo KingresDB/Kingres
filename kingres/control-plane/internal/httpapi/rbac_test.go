@@ -129,7 +129,7 @@ func TestNotImplementedIsUniform(t *testing.T) {
 	}
 	// The number shrinks as operations become real; the loop above is the test,
 	// this only guards against an empty loop.
-	if count < 3 {
+	if count < 1 {
 		t.Errorf("only %d not-implemented operations found", count)
 	}
 }

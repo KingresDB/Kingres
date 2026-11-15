@@ -234,6 +234,8 @@ type ForwardRequest struct {
 	Ordinal int `json:"ordinal,omitempty"`
 	// Pin is the fingerprint the administrator pinned (addServer only).
 	Pin string `json:"pin,omitempty"`
+	// Prefer is the Prefer header of the request (updateClusterSettings: respond-async).
+	Prefer string `json:"prefer,omitempty"`
 	// Proof shows that the sending server holds a session of Identity.Username
 	// (package fwdproof). Forward and gather-authorize calls are refused without
 	// it; a gather call never carries one (it would reveal the user's ClientKey

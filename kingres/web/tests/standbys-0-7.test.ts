@@ -338,7 +338,7 @@ describe('the task standby.reconcile', () => {
           {
             name: 'standby.register_in_catalog',
             state: 'skipped',
-            detail: 'skipped: needs kingres_shard 0.4',
+            detail: 'skipped: needs kingres_shard 0.5',
           },
         ],
       },
@@ -358,7 +358,7 @@ describe('the task standby.reconcile', () => {
     expect(row).toBeInTheDocument()
     await renderApp('/replication')
     const box = await screen.findByTestId('standby-task')
-    expect(within(box).getByTestId('step-skipped')).toHaveTextContent(/needs kingres_shard 0\.4/)
+    expect(within(box).getByTestId('step-skipped')).toHaveTextContent(/needs kingres_shard 0.5/)
     expect(within(box).getByText('Done')).toBeInTheDocument()
   })
 
@@ -424,7 +424,7 @@ describe('the task standby.reconcile', () => {
   })
 
   it('skippedReason reads only the text the server records', () => {
-    expect(skippedReason('skipped: needs kingres_shard 0.4')).toBe('needs kingres_shard 0.4')
+    expect(skippedReason('skipped: needs kingres_shard 0.5')).toBe('needs kingres_shard 0.5')
     expect(skippedReason('Skipped:')).toBe('no reason given')
     expect(skippedReason('waiting for server 3')).toBeNull()
     expect(skippedReason(null)).toBeNull()

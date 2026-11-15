@@ -31,7 +31,7 @@ SELECT count(*) FILTER (WHERE c.relkind = 'r') AS tables,
    AND d.refclassid = 'pg_extension'::regclass;
  tables | views | sequences 
 --------+-------+-----------
-      4 |     1 |         1
+      4 |     4 |         1
 (1 row)
 
 SELECT evtname, evtevent, evtenabled FROM pg_event_trigger
@@ -47,12 +47,12 @@ SELECT c.relname, c.relkind AS kind
   FROM pg_extension e, unnest(e.extconfig) AS t(oid), pg_class c
  WHERE e.extname = 'kingres_timepart' AND c.oid = t.oid
  ORDER BY 1;
-         relname         | kind 
--------------------------+------
- timepart_policy         | r
- timepart_run            | r
- timepart_run_action     | r
- timepart_run_run_id_seq | S
+           relname            | kind 
+------------------------------+------
+ timepart_policy_data         | r
+ timepart_run_action_data     | r
+ timepart_run_data            | r
+ timepart_run_data_run_id_seq | S
 (4 rows)
 
 -- Roles of the tests.

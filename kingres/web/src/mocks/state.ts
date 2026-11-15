@@ -24,7 +24,6 @@ import type {
   LogEntry,
   NetworkAccess,
   RebalancePlan,
-  RebalanceReportSummary,
   RebalanceStatus,
   ReplicationTopology,
   Role,
@@ -103,6 +102,14 @@ export const mockConfig = {
    * (or the server's four) were taken by other sessions.
    */
   workbenchBusy: false,
+  /**
+   * 0.9.0: `?rebalance=refuse:<code>` makes the next start of a rebalance answer 409 with that problem code (every code
+   * of the refusals); `?rebalance=fail` makes the next run end failed (one bucket gives up after three attempts);
+   * `?rebalance=slow` makes moves take about three times as long.
+   */
+  rebalanceRefuse: null as string | null,
+  rebalanceFail: false,
+  rebalanceSlow: false,
   /** 0.8.0: the source commit the server reports in GET /setup/state: a hex id, null (the build does not know it) or text that is not a hex id. */
   commit: '0123456789abcdef0123456789abcdef01234567' as string | null,
   /**
@@ -208,6 +215,8 @@ export interface TaskRec {
   holdDetail?: string
   /** The task does all its work and then ends failed, naming the step that failed (`config.apply`: a server failed). */
   failAtEnd?: { code: string; message: string; step: string; detail: string }
+  /** 0.9.0: the step that skips itself on purpose; the task records it as `skipped` (the reason is the task detail). */
+  skippedStep?: string
   applied: boolean
   /** True for tasks created before the node was initialized (readable with the setup token). */
   setup: boolean
@@ -250,7 +259,14 @@ export interface MockState {
     startedAt: string | null
     options: S['RebalanceOptions'] | null
     moves: S['PlannedMove'][]
-    reports: (RebalanceReportSummary & { moves: S['RebalanceReport']['moves'] })[]
+    /** Set while a stop is under way: the time it was asked (the move in flight ends about 1.5 s later). */
+    stopAskedAt: number | null
+    /** Why the run is stopped: operator or safetyRule. */
+    stoppedBy: string | null
+    pausedReason: string | null
+    /** Fraction of the work that was done when the run was stopped (a start again goes on from it). */
+    fractionAtStop: number
+    reports: S['RebalanceReport'][]
   }
   ledger: {
     digests: LedgerDigest[]
@@ -795,6 +811,10 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
       startedAt: null,
       options: null,
       moves: [],
+      stopAskedAt: null,
+      stoppedBy: null,
+      pausedReason: null,
+      fractionAtStop: 0,
       reports: [
         {
           id: 2,
@@ -1660,6 +1680,7 @@ export interface TaskInit {
   holdAt?: number
   holdDetail?: string
   failAtEnd?: TaskRec['failAtEnd']
+  skippedStep?: string
   onProgress?: (fraction: number) => void
   setup?: boolean
   cancellable?: boolean
@@ -1704,6 +1725,7 @@ export function createTask(s: MockState, init: TaskInit): Task {
     holdAt: init.holdAt,
     holdDetail: init.holdDetail,
     failAtEnd: init.failAtEnd,
+    skippedStep: init.skippedStep,
     applied: false,
     setup: init.setup ?? false,
   })
@@ -1747,9 +1769,11 @@ export function tickTasks(s: MockState): void {
     t.progress.percent = Math.round(fraction * 1000) / 10
     t.progress.currentStep = fraction >= 1 ? null : (t.progress.steps[current]?.name ?? null)
     t.progress.steps = t.progress.steps.map((st, i) => {
-      const state = fraction >= 1 || i < current ? 'done' : i === current ? 'running' : 'pending'
-      // The running step repeats the task's detail (contract 0.4.0).
-      const detail = state === 'running' ? t.detail : null
+      let state: 'done' | 'running' | 'pending' | 'skipped' =
+        fraction >= 1 || i < current ? 'done' : i === current ? 'running' : 'pending'
+      if (state === 'done' && st.name === rec.skippedStep) state = 'skipped'
+      // The running step repeats the task's detail (contract 0.4.0); a skipped step shows why (0.9.0).
+      const detail = state === 'running' || state === 'skipped' ? t.detail : null
       const { detail: _old, ...rest } = st
       void _old
       return { ...rest, state, ...(detail ? { detail } : {}) }
@@ -1797,7 +1821,7 @@ export function activeTask(s: MockState, kind: TaskKind, subjectId?: string): Ta
 // --- standbys: the task `standby.reconcile` (contract 0.7.0) ---------------------------------------
 
 /** The text kingresd records while the catalog step cannot do its work (the sharding extension has no standby nodes). */
-export const CATALOG_SKIPPED_DETAIL = 'skipped: needs kingres_shard 0.4'
+export const CATALOG_SKIPPED_DETAIL = 'skipped: needs kingres_shard 0.5'
 export const CATALOG_STEP = 'standby.register_in_catalog'
 
 interface ReconcilePlan {
@@ -1907,6 +1931,7 @@ export function startStandbyReconcile(s: MockState, user = 'system'): Task | nul
     kind: 'standby.reconcile',
     subject: { type: 'replication', id: 'standbys' },
     steps: names,
+    skippedStep: CATALOG_STEP,
     user,
     durationMs: 6000,
     onProgress: advance,

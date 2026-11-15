@@ -108,6 +108,10 @@ type ClusterSummary struct {
 	// RebalanceNeeded and RebalanceReasons describe the rebalance summary.
 	RebalanceNeeded  bool
 	RebalanceReasons []string
+	// RebalanceRunning and RebalanceTaskID: a rebalance task is pending, running or
+	// stopping (a stopped one is not running).
+	RebalanceRunning bool
+	RebalanceTaskID  *int64
 }
 
 // Store is everything the handlers read. Every method may return

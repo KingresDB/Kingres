@@ -178,7 +178,7 @@ func seed(e *env) {
 	}}
 	col, rows := "id", int64(10)
 	orders := api.TableDetail{Table: api.Table{Schema: "public", Name: "orders", Classes: []string{"distributed", "ledger"},
-		Distribution: &api.TableDistribution{Method: "hash", Column: &col, ColocationID: 1, BucketCount: 128},
+		Distribution: &api.TableDistribution{Method: "hash", Column: &col, ColocationID: &one32, BucketCount: &bc128},
 		Ledger:       &api.TableLedger{Mode: "appendOnly"}, EstimatedRows: &rows, SizeBytes: &size},
 		Columns: []api.TableColumn{{Name: "id", Type: "bigint", DistributionBlockedReason: ptr("tableNotPlain"), BlockingKeys: []string{}}}}
 	settings := api.TableDetail{Table: api.Table{Schema: "public", Name: "settings", Classes: []string{"plain"}, HomeShardGroupID: ptr(int32(0))},
@@ -213,6 +213,11 @@ func ptr[T any](v T) *T { return &v }
 // realistic data and validates the success body against the schema the
 // contract declares, plus the problem bodies of the error paths against
 // Problem. A response that drifts from the contract fails here.
+var (
+	one32 = int32(1)
+	bc128 = 128
+)
+
 func TestResponsesValidateAgainstContract(t *testing.T) {
 	chk := newSchemaChecker(t)
 	e := newEnv(t)
@@ -281,6 +286,9 @@ func TestResponsesValidateAgainstContract(t *testing.T) {
 	}
 	for id := range e.srv.configHandlers() {
 		mutating[id] = true // need the system database and the servers; validated by the integration tests of package clustertest
+	}
+	for id := range e.srv.rebalanceHandlers() {
+		mutating[id] = true // validated in rebalance_http_test.go with a fake service
 	}
 	for id := range e.srv.serverGroupHandlers() {
 		mutating[id] = true // need the system database; validated in cmd/kingresd/servergroups_e2e_test.go

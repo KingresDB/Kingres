@@ -299,6 +299,20 @@ ks_agg_context(FunctionCallInfo fcinfo)
 
 /* ---- self_test ---- */
 
+uint64
+ks_hash_bytes64(const uint8 *p, Size len)
+{
+	uint64		h = UINT64CONST(0xcbf29ce484222325);
+	Size		i;
+
+	for (i = 0; i < len; i++)
+	{
+		h ^= p[i];
+		h *= UINT64CONST(0x100000001b3);
+	}
+	return h;
+}
+
 static void
 selftest_add(StringInfo buf, const char *name, Datum hash)
 {
@@ -309,7 +323,8 @@ selftest_add(StringInfo buf, const char *name, Datum hash)
 /*
  * self_test() returns one line that depends on the extension version, the
  * format version, the hash of a fixed value of each type that the sketches
- * accept, and an hll estimate over a fixed set.  Two nodes that give a
+ * accept, an hll estimate over a fixed set, and the bytes of a fixed tdigest
+ * and topn built, and united with a second one, from a formula.  Two nodes that give a
  * different line cannot exchange sketches: they differ in encoding, byte
  * order, a hash function or the floating-point behaviour of the estimator.
  * The text hash uses the C collation so the line does not depend on the
@@ -343,6 +358,22 @@ kingres_sketch_self_test(PG_FUNCTION_ARGS)
 						 (unsigned long long) ks_hash_value_of_type(INT4ARRAYOID, d, C_COLLATION_OID));
 	}
 	appendStringInfo(&buf, " hll=%lld", (long long) hll_self_test_value());
+	{
+		uint64		td1,
+					td2,
+					td3,
+					td4,
+					tn1,
+					tn2;
+
+		tdigest_self_test_values(&td1, &td2, &td3, &td4);
+		topn_self_test_values(&tn1, &tn2);
+		appendStringInfo(&buf, " tdigest=%016llx tdigest_union=%016llx tdigest_read=%016llx tdigest_scale=%016llx topn=%016llx topn_union=%016llx",
+						 (unsigned long long) td1, (unsigned long long) td2,
+						 (unsigned long long) td3, (unsigned long long) td4,
+						 (unsigned long long) tn1,
+						 (unsigned long long) tn2);
+	}
 	PG_RETURN_TEXT_P(cstring_to_text_with_len(buf.data, buf.len));
 }
 

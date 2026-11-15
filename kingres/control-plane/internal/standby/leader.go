@@ -63,6 +63,7 @@ type Leader struct {
 	st   store
 	kick chan struct{}
 
+	roundMu  sync.Mutex
 	mu       sync.Mutex
 	lastTry  map[int64]time.Time
 	underFor map[int32]int
@@ -264,7 +265,10 @@ func (l *Leader) diff(t topology, recs []Record, replicas int) work {
 func (l *Leader) Run(ctx context.Context) {
 	for ctx.Err() == nil {
 		if l.IsLeader(ctx) {
-			if err := l.round(ctx); err != nil && ctx.Err() == nil {
+			l.roundMu.Lock()
+			err := l.round(ctx)
+			l.roundMu.Unlock()
+			if err != nil && ctx.Err() == nil {
 				l.Log.Debug("standby: the check of the standbys failed", "error", err)
 			}
 		}
@@ -275,6 +279,39 @@ func (l *Leader) Run(ctx context.Context) {
 		case <-l.kick:
 		}
 	}
+}
+
+// ReconcileNow runs one check now, on the caller's request, and returns the
+// reconcile task that is unfinished afterwards (the one this check started, or
+// one that was running already), or nil when there is none. It answers nil on a
+// server that is not the leader.
+func (l *Leader) ReconcileNow(ctx context.Context, get func(ctx context.Context, id int64) (task.Task, error)) (*task.Task, error) {
+	if !l.IsLeader(ctx) {
+		return nil, nil
+	}
+	l.roundMu.Lock()
+	err := l.round(ctx)
+	l.roundMu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	var id int64
+	err = l.Sys(ctx, func(c *pgx.Conn) error {
+		e := c.QueryRow(ctx, `SELECT id FROM kingres_cp.task WHERE kind = $1 AND state IN ('pending', 'running', 'paused') ORDER BY id DESC LIMIT 1`, KindReconcile).Scan(&id)
+		if errors.Is(e, pgx.ErrNoRows) {
+			id = 0
+			return nil
+		}
+		return e
+	})
+	if err != nil || id == 0 {
+		return nil, err
+	}
+	t, err := get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
 }
 
 // round is one check: read the state, start the reconcile task when there is
@@ -743,8 +780,9 @@ func (l *Leader) groupOf(ctx context.Context, id int32) (groupInfo, error) {
 }
 
 // registerInCatalog is the one step that records standbys in the sharding
-// catalog. With the registrar of this phase it records "skipped: needs
-// kingres_shard 0.4" in the task detail and succeeds.
+// catalog. With the registrar of this phase it ends the step as skipped (the
+// contract's step state, with the reason as the task detail); the standbys work
+// without being in the catalog.
 func (l *Leader) registerInCatalog(ctx context.Context, env *task.Env, w work) error {
 	skipped := false
 	for _, es := range [][]Entry{w.Add, w.Resume, w.Rebuild} {
@@ -774,7 +812,7 @@ func (l *Leader) registerInCatalog(ctx context.Context, env *task.Env, w work) e
 		}
 	}
 	if skipped {
-		return env.SetDetail(ctx, ErrCatalogUnsupported.Error())
+		return task.Skip(ErrCatalogUnsupported.Error())
 	}
 	return nil
 }

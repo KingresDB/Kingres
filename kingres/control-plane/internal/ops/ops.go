@@ -72,7 +72,7 @@ type Ops struct {
 	InstanceOwner func(ctx context.Context, instanceID, server string) (bool, error)
 	// OnReplicaCount is called after the cluster setting defaultReplicaCount was stored
 	// (also when the value is the same): the standby task checks the standbys at once.
-	OnReplicaCount func()
+	OnReplicaCount func(ctx context.Context) (*task.Task, error)
 	// BG bounds background task runs; Wait waits for them.
 	BG  context.Context
 	Log *slog.Logger
@@ -97,6 +97,18 @@ func (o *Ops) bg() context.Context {
 	}
 	return o.BG
 }
+
+// Go runs f in the background, waited for by Wait.
+func (o *Ops) Go(f func()) {
+	o.wg.Add(1)
+	go func() {
+		defer o.wg.Done()
+		f()
+	}()
+}
+
+// Background is the context of background task runs.
+func (o *Ops) Background() context.Context { return o.bg() }
 
 // Wait waits for the background task runs started by StartTask.
 func (o *Ops) Wait() { o.wg.Wait() }

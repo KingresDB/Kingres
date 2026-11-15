@@ -379,9 +379,10 @@ const MUST_MENTION = {
   '0.6.0': ['addServer', 'allowUnpinned', 'internal_api_disabled', 'replicationPending', 'LedgerProofBlock', 'dryRun', 'degraded', 'additive'],
   '0.7.0': ['cancelStatement', 'workbench_busy', 'AlertSubject', 'GroupLease', 'leaseLost', 'uncoveredShardGroupIds', 'additive'],
   '0.8.0': ['listConfigParameters', 'applyConfigChange', 'restartPendingInstances', 'clockDifference', 'config_parameter_refused', 'config.apply', 'additive'],
+  '0.9.0': ['startRebalance', 'previewRebalancePlan', 'nothing_to_rebalance', 'cluster_inconsistent', 'skipped', 'ledgerSummary', 'Prefer', 'additive'],
   '0.5.0': ['renewServerCertificates', 'revokeServerCertificates', 'certificate_authority_unavailable', 'certificate_revoked', 'certificateRenewalFailed', 'partial', 'additive'],
 };
-for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0']) {
+for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0']) {
   const changelog = changelogOf(version);
   if (!changelog) { fail('README.md', `changelog heading for ${version} is missing`); continue; }
   for (const h of ['#### Breaking', '#### Additive', '#### Documentation']) if (!changelog.includes(h)) fail('README.md', `changelog of ${version} lacks "${h}"`);
@@ -393,7 +394,7 @@ for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0']) {
   if (!m) fail('README.md', `the changelog summary of ${version} must state "N operations added (M operations, P paths)"`);
   else if (version === doc.info?.version && (Number(m[2]) !== operations.length || Number(m[3]) !== Object.keys(doc.paths ?? {}).length)) fail('README.md', `changelog says ${m[2]} operations and ${m[3]} paths, the contract has ${operations.length} and ${Object.keys(doc.paths ?? {}).length}`);
 }
-if (doc.info?.version !== '0.8.0') fail('info.version', 'the contract is revision 0.8.0');
+if (doc.info?.version !== '0.9.0') fail('info.version', 'the contract is revision 0.9.0');
 
 
 // 0.5.0 rules: certificate operations, partial answers, additive changes only.

@@ -30,10 +30,21 @@ func taskToAPI(t task.Task) api.Task {
 	if t.Detail != "" {
 		d := t.Detail
 		out.Detail = &d
+		// The detail belongs to the step that runs; a task that is not running one
+		// shows it on the step that was skipped last (the reason it was skipped).
+		target := -1
 		for i := range out.Progress.Steps {
-			if out.Progress.Steps[i].State == task.StepRunning {
-				out.Progress.Steps[i].Detail = &d
+			switch out.Progress.Steps[i].State {
+			case task.StepRunning:
+				target = i
+			case task.StepSkipped:
+				if target < 0 || out.Progress.Steps[target].State != task.StepRunning {
+					target = i
+				}
 			}
+		}
+		if target >= 0 {
+			out.Progress.Steps[target].Detail = &d
 		}
 	}
 	if t.Error != nil {

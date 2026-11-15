@@ -3,7 +3,7 @@
 -- Applied inside one transaction by internal/sysdb; do not add BEGIN/COMMIT.
 
 -- One row per standby instance. kingresd keeps its own record because the sharding catalog
--- cannot hold standbys before kingres_shard 0.4; the catalog registration is one separate
+-- cannot hold standbys before kingres_shard 0.5; the catalog registration is one separate
 -- step (standby.register_in_catalog) that records its result in catalog_node_id once it exists.
 CREATE TABLE kingres_cp.standby (
     standby_id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

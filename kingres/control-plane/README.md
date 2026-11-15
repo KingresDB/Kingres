@@ -133,7 +133,7 @@ server at start. The DSN is never logged.
 | `max-body-bytes` | `KINGRES_MAX_BODY_BYTES` | `1048576` | request body limit |
 | `login-rate-limit` | `KINGRES_LOGIN_RATE_LIMIT` | `10` | login attempts per client address and per user name per window |
 | `login-rate-window` | `KINGRES_LOGIN_RATE_WINDOW` | `1m` | |
-| `pg-bin-dir` | `KINGRES_PG_BIN_DIR` | none | directory of `postgres`, `initdb`, `pg_ctl`, `pg_config` (the package sets `/opt/kingres/bin`). Unset: the directory of the kingresd binary, then `PATH`; none found: instance management is off and `initCluster` answers 422. A directory that is not a KingresDB 18 build stops the server |
+| `pg-bin-dir` | `KINGRES_PG_BIN_DIR` | none | directory of `postgres`, `initdb`, `pg_ctl`, `pg_config` (the package sets `/opt/kingres/bin`). Unset: the directory of the kingresd binary, then `PATH`; none found: instance management is off and `initCluster` answers 422. A directory that is not a KingresDB build of a supported PostgreSQL major (18 or 19, pre-releases such as `19rc2` included; all programs of one major) stops the server |
 | `socket-dir` | `KINGRES_SOCKET_DIR` | `<data-dir>/run` | base directory of the instances' unix sockets (the package sets `/run/kingres`); never `/tmp` |
 | `pg-port`, `pg-listen` | `KINGRES_PG_PORT`, `KINGRES_PG_LISTEN` | `5432`, `127.0.0.1` | port and `listen_addresses` of the managed instance. In a cluster of several servers `pg-listen` must include the address the other servers reach this one at (the `server-host`), and `127.0.0.1` for kingresd itself, for example `127.0.0.1,10.0.0.12` |
 | `internal-listen` | `KINGRES_INTERNAL_LISTEN` | empty (off) | host:port of the mutual-TLS listener of the internal server-to-server API. **Required to join, add or remove servers and for forwarding.** By convention it is the port above the REST API (`listen` 8091, `internal-listen` 8092): the contract names only the REST address of a server, and the internal API of that server is found at the next port (kingresd warns when it is not) |
@@ -307,12 +307,12 @@ handlers in `internal/httpapi/handlers_config.go`, wiring in `cmd/kingresd/confi
 
 ## What is implemented
 
-The server implements revision **0.8.0** of the contract (100 operations, 82
+The server implements revision **0.9.0** of the contract (100 operations, 82
 paths; what is not done is in "Not done in this increment"). "Real" means the operation works against PostgreSQL or the local node
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **92 of 100 operations are real; 8 answer "not yet".**
+authenticated operation lists in 0.2.0. **98 of 100 operations are real; 2 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -330,7 +330,7 @@ authenticated operation lists in 0.2.0. **92 of 100 operations are real; 8 answe
 | Logs | `listLogs` |  |
 | Metrics | `queryMetrics` |  |
 | Query | `executeQuery`, `cancelStatement` |  |
-| Rebalance |  | `getRebalanceStatus`, `startRebalance`, `previewRebalancePlan`, `listRebalanceReports`, `getRebalanceReport`, `stopRebalance` |
+| Rebalance | `getRebalanceStatus`, `startRebalance`, `previewRebalancePlan`, `listRebalanceReports`, `getRebalanceReport`, `stopRebalance` |  |
 | Replication | `getReplicationTopology` | `restorePreferredPrimaries` |
 | Server groups | `listServerGroups`, `createServerGroup`, `deleteServerGroup` |  |
 | Servers | `listServers`, `getServer`, `addServer`, `removeServer`, `updateServer`, `renewServerCertificates`, `revokeServerCertificates` | `failoverServer` |
@@ -1037,7 +1037,7 @@ existing certificates until they expire (one year). See `docs/design/ha-phase5.m
    rows by canceling the connection. Its audit event holds the database, the length and a hash prefix of the
    statement, never the text.
 9. **`pg-bin-dir` check**: this KingresDB build's programs print `PostgreSQL 18.x`, not a KingresDB string, so
-   start-up requires `postgres`, `initdb`, `pg_ctl` (version 18) and `pg_config`, and that `kingres_shard.so` and
+   start-up requires `postgres`, `initdb`, `pg_ctl` (version 18 or 19, one major for all three) and `pg_config`, and that `kingres_shard.so` and
    `kingres_ledger.so` exist in `pg_config --pkglibdir`; a plain PostgreSQL is refused.
 10. **Setup from remote addresses** is controlled by `allow-remote-setup` (default false), no longer by the listen
     address: the setup operations are accepted only from loopback callers unless it is true (containers).
@@ -2300,7 +2300,7 @@ the store's epoch check refuses it.
 
 ### What part 2 must add
 
-- **Catalog registration of standbys:** implement `standby.CatalogRegistrar` (`internal/standby/catalog.go`: `Register`, `Unregister`) with kingres_shard 0.4 and pass it as `Leader.Registrar` in `newStandbyParts` (`cmd/kingresd/ha_standby.go`) instead of `SkipCatalog{}`. The task step is `standby.register_in_catalog`; store the node id in `kingres_cp.standby.catalog_node_id` and drop `pgstore.ManagedStandbyInstanceBase`.
+- **Catalog registration of standbys:** implement `standby.CatalogRegistrar` (`internal/standby/catalog.go`: `Register`, `Unregister`) with kingres_shard 0.5 and pass it as `Leader.Registrar` in `newStandbyParts` (`cmd/kingresd/ha_standby.go`) instead of `SkipCatalog{}`. The task step is `standby.register_in_catalog`; store the node id in `kingres_cp.standby.catalog_node_id` and drop `pgstore.ManagedStandbyInstanceBase`.
 - **Promotion:** set `Agent.Frozen` during a failover decision; obtain the lease through `POST /lease/grant` (use `dryRun` to wait for the old lease); make `Agent.maintainPrimary/Status/Create`, `catalogTopology` and `localInstance` in `ha_leases.go` and the watchdog files use the instance id of the group's primary instead of instance 1; repoint the other standbys (`primary_conninfo`); rebuild the old primary with `POST /standby/rebuild` and `diverged: true`; remove `lease.FencedMarker` when a server becomes a standby.
 - **Automatic failover** reads `ha.Liveness.State/Silence` (count `autoFailover.timeoutSeconds` from the dead transition) and `Leases`.
 - The 60-second leader memory (decision 8) must be revisited with leader moves.
@@ -2308,3 +2308,33 @@ the store's epoch check refuses it.
 ---
 
 Copyright (c) 2026, RooyeKhat Media Co. Released under the GNU Affero General Public License, version 3 (AGPL-3.0-only).
+
+## Rebalancing (contract 0.9.0, first increment)
+
+`internal/rebalance` runs a rebalance as one task of kind `rebalance` (subject `cluster`/`cluster`: one at a time, a stopped one
+included), on the manager leader. Design: `kingres/docs/design/shard-phase10.md`, section 20 says where this increment departs from it.
+
+- **Steps.** `Check that the cluster can rebalance`, `Compute the plan`, `Move buckets`, `Write the report`. The third is a loop that
+  plans again with `kingres.rebalance_plan()` before every move and makes the first move of the plan that is not backing off. One move runs
+  at a time, on a connection of its own (`SELECT kingres.move_bucket(...)` on the map group primary, which is where the leader runs).
+- **State** is in `kingres_cp.rebalance_run` and `rebalance_move` (migration 0008); every write of a run is one transaction that proves the
+  task's lease and epoch, so a leader that lost the lease can neither record nor start a move. The report of the contract is read from
+  these tables; its id is the task id.
+- **Stop.** `stopRebalance` sets a flag. The loop asks the extension to cancel the move in flight (`cancel_bucket_move`: before the switch
+  it undoes the move; a switching move cannot be cancelled and is asked again until it ended, so the switch is never interrupted), starts
+  no other, records the run as `stopped` and returns `task.Pause`: the task is `paused` and `startRebalance` goes on with the same task.
+  A stopped rebalance does not block `updateServer` and `removeServer`.
+- **Restart and change of leader.** The new leader's engine claims the task under a new epoch and re-enters `Move buckets`; a row left
+  `running` is settled through the extension (`resume_bucket_moves()`, waiting while the move's session is alive), never by the control
+  plane's own SQL.
+- **Retry.** A failed move is tried again after 30 s times its failures (`-rebalance-retry-backoff`), up to three tries; a bucket given up
+  ends the run `failed` (the report is written first, the alert `taskFailed` carries the task). Moves skipped by a condition (lease of a
+  group lost, a required synchronous standby not in sync, target disk low when reported) are in the report and are not failures.
+- **Conditions** before a start and before every move are listed in the design section 20; a refused start is a 409 with its own code.
+- **Standbys.** A move changes who owns data, not where standbys are. The slot and the subscription of a move are on the source and the
+  target primaries; a group with a synchronous standby that is not in sync is skipped, because the commits of the copy would wait; a
+  failover during a move fails and undoes it (the slot is not on the standby). `kingresd` writes `wal_level = logical` into the instances it
+  creates; an instance created before needs a restart, and the check says so.
+- **Not verified on real servers:** the free-disk check (no server reports its disk yet), the lease check for groups whose primary runs on
+  another server (the leader knows only its own leases), a rebalance during a failover (failover is not implemented), and the leader
+  change in the middle of a move (the tests restart the leader's `kingresd`; they cannot move the map group).

@@ -9,15 +9,15 @@ import (
 
 // CatalogStepName is the name of the one step of the reconcile task that records
 // the standbys in the sharding catalog. Phase 2 of high availability fills it in
-// (kingres_shard 0.4: kingres.add_node(..., role => 'standby'), the replacement
+// (kingres_shard 0.5: kingres.add_node(..., role => 'standby'), the replacement
 // of kingres.remove_node for a standby); nothing else in this package knows the
 // catalog's idea of a standby.
 const CatalogStepName = "standby.register_in_catalog"
 
 // ErrCatalogUnsupported is what a registrar that cannot register standbys
-// answers. The step records it in the task detail and succeeds: the standbys
+// answers. The step ends as skipped, with it as the task detail: the standbys
 // work (they replicate and are supervised) without being in the catalog.
-var ErrCatalogUnsupported = errors.New("skipped: needs kingres_shard 0.4")
+var ErrCatalogUnsupported = errors.New("skipped: needs kingres_shard 0.5")
 
 // CatalogRegistrar registers standbys in the sharding catalog as nodes with the
 // role standby (they own no buckets and receive no forwarded statements). It is

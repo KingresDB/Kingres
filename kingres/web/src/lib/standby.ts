@@ -95,7 +95,7 @@ export function commitRule(group: ShardGroup, alerts: Alert[] | null): CommitRul
   }
 }
 
-/** The text a step records when it was skipped on purpose: `skipped: needs kingres_shard 0.4`. */
+/** The text a step records when it was skipped on purpose: `skipped: needs kingres_shard 0.5`. */
 const SKIPPED = /^skipped:\s*(.*)$/i
 
 /** The reason after "skipped:" in a task or step detail, or null when the text does not start with it. */

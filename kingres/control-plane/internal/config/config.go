@@ -107,7 +107,10 @@ type Config struct {
 	MonitorInterval      time.Duration
 	LedgerPendingMaxAge  time.Duration
 	VersionCheckInterval time.Duration
-	GatherTimeout        time.Duration
+	// RebalanceRetryBackoff times the number of failures is how long a rebalance waits
+	// before it tries a bucket move that failed again (default 30s).
+	RebalanceRetryBackoff time.Duration
+	GatherTimeout         time.Duration
 	// HA are the settings of high availability (see ha.go).
 	HA HAConfig
 }
@@ -272,6 +275,8 @@ var settings = []setting{
 		apply: dur(func(c *Config) *time.Duration { return &c.MonitorInterval })},
 	{key: "ledger-pending-max-age", env: "KINGRES_LEDGER_PENDING_MAX_AGE", usage: "age of the oldest pending ledger transaction that raises the alert ledgerPendingTooOld (default 5m)",
 		apply: dur(func(c *Config) *time.Duration { return &c.LedgerPendingMaxAge })},
+	{key: "rebalance-retry-backoff", env: "KINGRES_REBALANCE_RETRY_BACKOFF", usage: "wait before a failed bucket move is tried again, times the number of failures (default 30s)",
+		apply: dur(func(c *Config) *time.Duration { return &c.RebalanceRetryBackoff })},
 	{key: "version-check-interval", env: "KINGRES_VERSION_CHECK_INTERVAL", usage: "how often the manager leader compares the versions of the servers (default 1m)",
 		apply: dur(func(c *Config) *time.Duration { return &c.VersionCheckInterval })},
 	{key: "gather-timeout", env: "KINGRES_GATHER_TIMEOUT", usage: "time one server gets to answer its part of a cluster-wide read of logs, alerts or metrics (default 3s)",
@@ -301,7 +306,7 @@ func Defaults() Config {
 		PGListen:            "127.0.0.1",
 		CertificateLifetime: 365 * 24 * time.Hour, CertificateRenewFraction: 1.0 / 3.0,
 		CertificateCheckInterval: time.Hour, CertificateRetryInterval: time.Minute,
-		MonitorInterval: 10 * time.Second, LedgerPendingMaxAge: 5 * time.Minute, VersionCheckInterval: time.Minute, GatherTimeout: 3 * time.Second,
+		MonitorInterval: 10 * time.Second, LedgerPendingMaxAge: 5 * time.Minute, VersionCheckInterval: time.Minute, RebalanceRetryBackoff: 30 * time.Second, GatherTimeout: 3 * time.Second,
 		HA: DefaultHA(),
 	}
 }

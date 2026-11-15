@@ -142,17 +142,18 @@ func (s *Store) readTables(ctx context.Context, h *dbHandle, schema, name, class
 			return t, s.wrap("scanning tables", err)
 		}
 		t.Classes = []string{"plain"}
-		if method != nil && colocation != nil {
+		if method != nil {
 			class := "distributed"
 			if *method == "reference" {
 				class = "reference"
 			}
 			t.Classes = []string{class}
-			bc := 0
+			var bc *int
 			if bucket != nil {
-				bc = int(*bucket)
+				n := int(*bucket)
+				bc = &n
 			}
-			t.Distribution = &api.TableDistribution{Method: *method, Column: column, ColocationID: *colocation, BucketCount: bc}
+			t.Distribution = &api.TableDistribution{Method: *method, Column: column, ColocationID: colocation, BucketCount: bc}
 			if multiGroup {
 				t.EstimatedRows, t.SizeBytes = nil, nil
 			}

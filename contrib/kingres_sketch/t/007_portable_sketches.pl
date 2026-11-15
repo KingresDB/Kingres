@@ -9,7 +9,8 @@
 #     builds from the restored data (no element hashes by an OID).
 #   * topn refuses strings with a nondeterministic collation, where equal
 #     values are not equal bytes (skipped when the server has no such collation).
-#   * The working memory of a call on a value of the largest size.
+#   * The working memory of a call on a value of the largest size, for the
+#     three types (the numbers of the README, with headroom).
 #
 # Portions Copyright (c) 2026, RooyeKhat Media Co
 # SPDX-License-Identifier: AGPL-3.0-only
@@ -163,24 +164,73 @@ SKIP:
 }
 
 # ---- the working memory of a call on the largest value ----
-# capacity 100000 with items of 1024 bytes: a value of about 104 MB.  The peak
-# of the backend (VmHWM) of a union of two such values must stay under a
-# bound that the README states.
+# The README states the peak memory of a backend (VmHWM, which includes the
+# few MB of an idle backend) for a call on a value of the largest size.  Every
+# call runs in a backend of its own, so the peak is that of the call.  The
+# bounds have headroom over what was measured (README, "Limits"), so that an
+# ordinary change of the allocator does not fail the test and a regression of
+# the working memory by a quarter does.
+#
+# topn: capacity 100000, items of 1024 bytes: a value of about 104 MB.
+# hll: precision 18.  tdigest: compression 10000.
 $src->safe_psql('postgres', <<'EOS');
 SET search_path = public, kingres_sketch;
 CREATE TABLE big AS
   SELECT topn_add_agg(repeat(md5(i::text), 32), 100000) AS t FROM generate_series(1, 100000) i;
+CREATE TABLE big2 AS
+  SELECT topn_add_agg(repeat(md5(i::text || 'x'), 32), 100000) AS t FROM generate_series(1, 100000) i;
+CREATE TABLE bighll AS SELECT hll_add_agg(i, 18) AS h FROM generate_series(1, 2000000) i;
+CREATE TABLE bigtd AS SELECT tdigest_agg(i::float8 * 1.1, 10000) AS d FROM generate_series(1, 300000) i;
 EOS
 my $size = $src->safe_psql('postgres', 'SELECT length(t::bytea) FROM big');
-cmp_ok($size, '>', 100000000, "the value is of the largest size ($size bytes)");
-my $peak = $src->safe_psql('postgres', <<'EOS');
+cmp_ok($size, '>', 100000000, "the topn value is of the largest size ($size bytes)");
+
+# the peak of a backend that ran one statement, in bytes
+sub peak_of
+{
+	my ($sql) = @_;
+	my $kb = $src->safe_psql('postgres', <<"EOS");
 SET search_path = public, kingres_sketch;
-SELECT length(topn_union(t, t)::bytea) FROM big \gset
-SELECT (regexp_match(pg_read_file('/proc/self/status'), 'VmHWM:\s+(\d+) kB'))[1]::bigint * 1024;
+SET max_parallel_workers_per_gather = 0;
+\\o /dev/null
+$sql;
+\\o
+SELECT (regexp_match(pg_read_file('/proc/self/status'), 'VmHWM:\\s+(\\d+) kB'))[1]::bigint;
 EOS
-my $ratio = $peak / $size;
-diag(sprintf("peak memory of topn_union on the largest value: %.0f MB, %.1f times the value", $peak / 1048576, $ratio));
-cmp_ok($ratio, '<', 5.0, 'the peak of a union of two largest values is under 5 times the value');
+	return $kb * 1024;
+}
+my $idle = peak_of('SELECT 1');
+diag(sprintf("peak memory of an idle backend: %.1f MB", $idle / 1048576));
+
+my $topn_bound = 6.5;
+foreach my $c (
+	[ 'topn_union of two values with the same items', 'SELECT length(topn_union(t, t)::bytea) FROM big' ],
+	[ 'topn_union of two values with different items', 'SELECT length(topn_union(a.t, b.t)::bytea) FROM big a, big2 b' ],
+	[ 'topn_union_agg over four values with different items',
+	  'SELECT length(topn_union_agg(t)::bytea) FROM (SELECT t FROM big UNION ALL SELECT t FROM big2 UNION ALL SELECT t FROM big UNION ALL SELECT t FROM big2) s' ],
+	[ 'topn_add_agg of 100000 distinct items of 1024 bytes',
+	  "SELECT length(topn_add_agg(repeat(md5(i::text), 32), 100000)::bytea) FROM generate_series(1, 100000) i" ],
+	[ 'topn_list of all counters', 'SELECT count(*) FROM big, topn_list(t, 100000)' ],)
+{
+	my $p = peak_of($c->[1]);
+	diag(sprintf("%s: %.0f MB, %.1f times the value", $c->[0], $p / 1048576, $p / $size));
+	cmp_ok($p / $size, '<', $topn_bound, "$c->[0]: the peak is under $topn_bound times the value");
+}
+
+# hll and tdigest: the value is small, the call needs a few MB more than an
+# idle backend; the bound is the idle peak plus 16 MB.
+my $small_bound = 16 * 1048576;
+foreach my $c (
+	[ 'hll_union of two values of precision 18', 'SELECT length(hll_union(h, h)::bytea) FROM bighll' ],
+	[ 'hll_union_agg over six values of precision 18', 'SELECT length(hll_union_agg(h)::bytea) FROM bighll, generate_series(1, 6)' ],
+	[ 'tdigest_union of two values of compression 10000', 'SELECT length(tdigest_union(d, d)::bytea) FROM bigtd' ],
+	[ 'tdigest_union_agg over six values of compression 10000', 'SELECT length(tdigest_union_agg(d)::bytea) FROM bigtd, generate_series(1, 6)' ],
+	[ 'tdigest_agg of 300000 values at compression 10000', 'SELECT length(tdigest_agg(i::float8 * 1.3, 10000)::bytea) FROM generate_series(1, 300000) i' ],)
+{
+	my $p = peak_of($c->[1]);
+	diag(sprintf("%s: %.1f MB, %.1f MB over an idle backend", $c->[0], $p / 1048576, ($p - $idle) / 1048576));
+	cmp_ok($p - $idle, '<', $small_bound, "$c->[0]: the peak is under 16 MB over an idle backend");
+}
 
 $src->stop;
 $dst->stop;
