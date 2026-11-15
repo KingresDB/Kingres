@@ -35,6 +35,8 @@
 #include "storage/bulk_write.h"
 #include "storage/lmgr.h"
 #include "storage/smgr.h"
+#include "storage/standby.h"
+#include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -43,12 +45,19 @@
 
 #define XLOG_KC_PAGES		0x00	/* whole-page images of a stripe */
 #define XLOG_KC_META		0x10	/* whole-page image of the metapage */
+#define XLOG_KC_FREEZE		0x20	/* metapage image, its transaction id frozen */
 
 typedef struct xl_kc_pages
 {
 	uint64		stripe_id;
 	uint32		nblocks;
 } xl_kc_pages;
+
+/* The record that freezes the metapage's transaction id (plus the page image). */
+typedef struct xl_kc_freeze
+{
+	TransactionId horizon;		/* the id that was frozen: standby queries holding it conflict */
+} xl_kc_freeze;
 
 #define KC_MAX_BLOCKS_PER_RECORD 32
 
@@ -95,8 +104,23 @@ kc_redo(XLogReaderState *record)
 	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
 	int			b;
 
-	if (info != XLOG_KC_PAGES && info != XLOG_KC_META)
+	if (info != XLOG_KC_PAGES && info != XLOG_KC_META && info != XLOG_KC_FREEZE)
 		elog(PANIC, "kingres_columnar_redo: unknown op code %u", info);
+
+	/*
+	 * Freezing the id makes the table readable by a snapshot that predates the
+	 * rewrite that created the file, which would then see no stripes instead of
+	 * getting the serialization failure.  A standby query that could hold the
+	 * id is therefore cancelled, as for the removal of a heap tuple.
+	 */
+	if (info == XLOG_KC_FREEZE && InHotStandby)
+	{
+		xl_kc_freeze *xlrec = (xl_kc_freeze *) XLogRecGetData(record);
+		RelFileLocator rlocator;
+
+		XLogRecGetBlockTag(record, 0, &rlocator, NULL, NULL);
+		ResolveRecoveryConflictWithSnapshot(xlrec->horizon, false, rlocator);
+	}
 
 	/*
 	 * Every block of a record carries a whole-page image, so redo restores
@@ -132,6 +156,12 @@ kc_desc(StringInfo buf, XLogReaderState *record)
 	}
 	else if (info == XLOG_KC_META)
 		appendStringInfoString(buf, "metapage");
+	else if (info == XLOG_KC_FREEZE)
+	{
+		xl_kc_freeze *xlrec = (xl_kc_freeze *) XLogRecGetData(record);
+
+		appendStringInfo(buf, "metapage, freeze transaction id %u", xlrec->horizon);
+	}
 }
 
 static const char *
@@ -143,6 +173,8 @@ kc_identify(uint8 info)
 			return "STRIPE_PAGES";
 		case XLOG_KC_META:
 			return "METAPAGE";
+		case XLOG_KC_FREEZE:
+			return "FREEZE";
 	}
 	return NULL;
 }
@@ -233,11 +265,18 @@ kc_meta_init_storage(Relation rel, const RelFileLocator *rlocator,
 	 * byte-for-byte copy of the file (SET TABLESPACE, a base backup) keeps it,
 	 * which is what lets the stripe catalog survive a copy unchanged.
 	 */
-	if (!pg_strong_random(&uid, sizeof(uid)))
-		elog(ERROR, "could not generate a random identity for a columnar file");
-	uid &= PG_INT64_MAX;
-	if (uid == 0)
-		uid = 1;
+	for (int tries = 0;; tries++)
+	{
+		if (!pg_strong_random(&uid, sizeof(uid)))
+			elog(ERROR, "could not generate a random identity for a columnar file");
+		uid &= PG_INT64_MAX;
+		if (uid == 0)
+			uid = 1;
+		if (!kc_catalog_uid_in_use(uid))
+			break;
+		if (tries >= 16)
+			elog(ERROR, "could not find an unused identity for a columnar file");
+	}
 	kc_meta_format((Page) buf, opts, 0, 1, uid, GetCurrentTransactionId());
 	smgr_bulk_write(bulk, 0, buf, true);
 	smgr_bulk_finish(bulk);
@@ -388,6 +427,93 @@ kc_meta_reset(Relation rel)
 	UnlockReleaseBuffer(buf);
 }
 
+/*
+ * Write the metapage after its transaction id changed.  The change is
+ * logged as the page image; for a freeze the record also names the id, so
+ * that a standby can cancel the queries that might still hold it.
+ */
+static void
+kc_meta_log_xid_change(Relation rel, Buffer buf, TransactionId horizon)
+{
+	if (RelationNeedsWAL(rel))
+	{
+		XLogRecPtr	recptr;
+		xl_kc_freeze xlrec;
+
+		xlrec.horizon = horizon;
+		XLogBeginInsert();
+		XLogRegisterData(&xlrec, sizeof(xlrec));
+		XLogRegisterBuffer(0, buf, REGBUF_FORCE_IMAGE | REGBUF_STANDARD);
+		recptr = XLogInsert(KC_RMGR_ID, XLOG_KC_FREEZE);
+		PageSetLSN(BufferGetPage(buf), recptr);
+	}
+}
+
+/*
+ * VACUUM: freeze the id of the transaction that created the file, once no
+ * snapshot can have it in progress (it precedes oldest_xmin).  Without this
+ * the id would, after a full lap of the transaction id space, name some
+ * other running transaction.  Returns the oldest id the metapage still
+ * holds, or InvalidTransactionId when it holds none (what the table's
+ * relfrozenxid must not pass).
+ */
+TransactionId
+kc_meta_freeze(Relation rel, TransactionId oldest_xmin)
+{
+	Buffer		buf = ReadBuffer(rel, 0);
+	Page		page;
+	KcMetaData *m;
+	TransactionId xid;
+
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buf);
+	m = kc_meta_check(rel, page);
+	xid = m->created_xid;
+	if (!TransactionIdIsNormal(xid) || !TransactionIdPrecedes(xid, oldest_xmin))
+	{
+		UnlockReleaseBuffer(buf);
+		return TransactionIdIsNormal(xid) ? xid : InvalidTransactionId;
+	}
+
+	START_CRIT_SECTION();
+	m->created_xid = FrozenTransactionId;
+	kc_meta_seal(m);
+	MarkBufferDirty(buf);
+	kc_meta_log_xid_change(rel, buf, xid);
+	END_CRIT_SECTION();
+	UnlockReleaseBuffer(buf);
+
+	/* every backend caches the id with the relation */
+	CacheInvalidateRelcache(rel);
+	return InvalidTransactionId;
+}
+
+/*
+ * A rewrite that kept what every snapshot sees (VACUUM FULL, see
+ * kc_relation_copy_for_cluster) has no creating transaction to report: an
+ * older snapshot reads the new file like the old one.
+ */
+void
+kc_meta_set_created_xid(Relation rel, TransactionId xid)
+{
+	Buffer		buf = ReadBuffer(rel, 0);
+	Page		page;
+	KcMetaData *m;
+
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buf);
+	m = kc_meta_check(rel, page);
+
+	START_CRIT_SECTION();
+	m->created_xid = xid;
+	kc_meta_seal(m);
+	MarkBufferDirty(buf);
+	kc_meta_log_and_release(rel, buf);
+	END_CRIT_SECTION();
+	UnlockReleaseBuffer(buf);
+	CacheInvalidateRelcache(rel);
+}
+
 /* ------------------------------------------------------------------------
  * Stripe pages
  * ------------------------------------------------------------------------
@@ -407,7 +533,6 @@ kc_stripe_write(Relation rel, uint64 stripe_id, const char *blob,
 	uint64		done = 0;
 	BlockNumber expected = InvalidBlockNumber;
 	BufferAccessStrategy strategy;
-	TransactionId xid = GetCurrentTransactionId();
 
 	if (npages == 0)
 		npages = 1;
@@ -460,7 +585,7 @@ kc_stripe_write(Relation rel, uint64 stripe_id, const char *blob,
 			sp->flags = 0;
 			sp->page_no = (uint32) (done + j);
 			sp->page_count = (uint32) npages;
-			sp->writer_xid = xid;
+			sp->reserved = 0;
 			sp->stripe_id = stripe_id;
 			if (len > 0)
 				memcpy(PageGetContents(page), blob + off, len);

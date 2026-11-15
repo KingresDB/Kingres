@@ -71,6 +71,11 @@ tests += {
       't/006_compare.pl',
       't/007_snapshots.pl',
       't/008_array_validation.pl',
+      't/009_serializable.pl',
+      't/010_visibility.pl',
+      't/011_memory.pl',
+      't/012_publications_toast.pl',
+      't/013_xid_wraparound.pl',
     ],
   },
 }

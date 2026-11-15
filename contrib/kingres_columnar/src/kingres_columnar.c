@@ -600,3 +600,23 @@ kingres_columnar_identity(PG_FUNCTION_ARGS)
 	relation_close(rel, AccessShareLock);
 	PG_RETURN_INT64((int64) uid);
 }
+
+/*
+ * columnar_creating_xid(rel): the transaction id kept in the metapage, that
+ * of the transaction that created the file (2, the frozen id, once VACUUM
+ * has frozen it or when a rewrite that kept what every snapshot sees made
+ * the file).  The only transaction id a columnar relation file holds.
+ */
+PG_FUNCTION_INFO_V1(kingres_columnar_creating_xid);
+
+Datum
+kingres_columnar_creating_xid(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	Relation	rel = kc_open_columnar(relid, AccessShareLock, false);
+	KcMetaData	m;
+
+	kc_meta_read(rel, &m);
+	relation_close(rel, AccessShareLock);
+	PG_RETURN_TRANSACTIONID(m.created_xid);
+}

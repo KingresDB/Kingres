@@ -1,6 +1,6 @@
 # kingres_ledger extension
 comment = 'KingresDB tamper-evident ledger: append-only and updatable tables, blocks, digests and proofs'
-default_version = '0.2'
+default_version = '0.3'
 module_pathname = '$libdir/kingres_ledger'
 relocatable = false
 schema = kingres

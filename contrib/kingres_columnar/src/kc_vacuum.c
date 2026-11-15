@@ -93,6 +93,8 @@ kc_relation_vacuum(KC_VACUUM_PARAMS)
 	uint64		rows;
 	TimestampTz starttime = GetCurrentTimestamp();
 	bool		pushed = false;
+	TransactionId oldest;
+	TransactionId remaining;
 
 	if (!kc_rel_is_columnar(rel))
 		return;
@@ -125,9 +127,20 @@ kc_relation_vacuum(KC_VACUUM_PARAMS)
 
 	nblocks = RelationGetNumberOfBlocks(rel);
 	rows = kc_catalog_row_total(rel, NULL, NULL, NULL, NULL);
+
+	/*
+	 * The only transaction id a columnar file holds is the one in its
+	 * metapage (the stripes are visible through the catalog, whose rows are
+	 * frozen by the vacuum of the catalog).  Freeze it when it is old enough,
+	 * and tell PostgreSQL the oldest id that is left, so that the table takes
+	 * part in the protection against transaction id wraparound as a heap
+	 * table does.
+	 */
+	oldest = GetOldestNonRemovableTransactionId(rel);
+	remaining = kc_meta_freeze(rel, oldest);
 	vac_update_relstats(rel, nblocks, (double) rows, 0, 0, false,
-						InvalidTransactionId, InvalidMultiXactId,
-						NULL, NULL, false);
+						TransactionIdIsValid(remaining) ? remaining : oldest,
+						GetOldestMultiXactId(), NULL, NULL, false);
 	KC_REPORT_VACUUM(rel, (PgStat_Counter) rows, 0, starttime);
 	if (pushed)
 		PopActiveSnapshot();
@@ -154,7 +167,7 @@ kc_compact(Relation rel, uint32 min_rows)
 	CommandId	cid = GetCurrentCommandId(true);
 
 	kc_meta_read(rel, &m);
-	scan = kc_scan_begin(rel, GetLatestSnapshot(), NULL, NULL, 0);
+	scan = kc_scan_begin(rel, NULL, NULL, NULL, KC_SCAN_MAINTENANCE);
 
 	/* keep the small stripes of other transactions, in the scan's list */
 	for (i = 0; i < scan->nstripes; i++)
@@ -170,6 +183,8 @@ kc_compact(Relation rel, uint32 min_rows)
 		kc_write_pin_relation(RelationGetRelid(rel), -1);
 		scan->pinned = false;
 	}
+	if (scan->npend > 0)
+		kc_write_pending_release(RelationGetRelid(rel), scan->pend, scan->npend);
 	scan->npend = 0;
 
 	if (nsmall < 2)

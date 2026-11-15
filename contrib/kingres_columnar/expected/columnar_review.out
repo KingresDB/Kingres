@@ -431,15 +431,15 @@ CREATE PUBLICATION pub1 FOR TABLE pub_h;
 ALTER PUBLICATION pub1 ADD TABLE pub_c;
 ERROR:  columnar tables are not replicated logically yet: the publication would include a columnar table
 HINT:  Leave columnar tables out of publications.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 80 at RAISE
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 94 at RAISE
 CREATE PUBLICATION pub2 FOR TABLE pub_c;
 ERROR:  columnar tables are not replicated logically yet: the publication would include a columnar table
 HINT:  Leave columnar tables out of publications.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 80 at RAISE
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 94 at RAISE
 CREATE PUBLICATION pub3 FOR ALL TABLES;
 ERROR:  columnar tables are not replicated logically yet: the publication would include a columnar table
 HINT:  Leave columnar tables out of publications.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 80 at RAISE
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 94 at RAISE
 -- with a publication in place, a columnar table cannot join it
 CREATE TABLE pub_c2 (a int) USING columnar;
 CREATE TABLE pub_h2 (a int);
@@ -448,7 +448,7 @@ DROP PUBLICATION pub1;
 CREATE PUBLICATION pub4 FOR TABLES IN SCHEMA public;
 ERROR:  columnar tables are not replicated logically yet: the publication would include a columnar table
 HINT:  Leave columnar tables out of publications.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 80 at RAISE
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 94 at RAISE
 DROP PUBLICATION pub4;
 ERROR:  publication "pub4" does not exist
 CREATE SCHEMA pubs;
@@ -456,12 +456,12 @@ CREATE PUBLICATION pub5 FOR TABLES IN SCHEMA pubs;
 CREATE TABLE pubs.c1 (a int) USING columnar;
 ERROR:  columnar tables are not replicated logically yet: a publication would include a columnar table
 HINT:  Keep tables that are published in row storage, or leave the columnar table out of the publication.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 67 at RAISE
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 71 at RAISE
 CREATE TABLE pubs.h1 (a int);
 ALTER TABLE pubs.h1 SET ACCESS METHOD columnar;
 ERROR:  columnar tables are not replicated logically yet: a publication would include a columnar table
 HINT:  Keep tables that are published in row storage, or leave the columnar table out of the publication.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 67 at RAISE
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 71 at RAISE
 DROP PUBLICATION pub5;
 DROP SCHEMA pubs CASCADE;
 -- clean up

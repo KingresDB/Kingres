@@ -130,7 +130,7 @@ my $old_blocks = $node->safe_psql('old01',
 #--------------------------------------------------------------------------
 # Upgrade.
 #--------------------------------------------------------------------------
-$node->safe_psql('old01', 'ALTER EXTENSION kingres_ledger UPDATE');
+$node->safe_psql('old01', q{ALTER EXTENSION kingres_ledger UPDATE TO '0.2'});
 is($node->safe_psql('old01',
 		q{SELECT extversion FROM pg_extension WHERE extname = 'kingres_ledger'}),
 	'0.2', 'the extension is at 0.2 after ALTER EXTENSION UPDATE');

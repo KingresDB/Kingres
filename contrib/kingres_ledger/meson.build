@@ -27,7 +27,9 @@ contrib_targets += kingres_ledger
 install_data(
   'kingres_ledger--0.1.sql',
   'kingres_ledger--0.2.sql',
+  'kingres_ledger--0.3.sql',
   'kingres_ledger--0.1--0.2.sql',
+  'kingres_ledger--0.2--0.3.sql',
   'kingres_ledger.control',
   kwargs: contrib_data_args,
 )
@@ -49,6 +51,8 @@ tests += {
       'ledger_records',
       'ledger_review2',
       'ledger_privs',
+      'ledger_preimage',
+      'ledger_head',
     ],
     'regress_args': ['--temp-config', files('kingres_ledger.conf')],
     # The tests need shared_preload_libraries = 'kingres_ledger', which a
@@ -67,6 +71,8 @@ tests += {
       't/008_updatable_concurrency.pl',
       't/009_worker.pl',
       't/010_review2.pl',
+      't/011_upgrade_0_3.pl',
+      't/012_publish_read.pl',
     ],
   },
 }

@@ -25,8 +25,11 @@ shared_preload_libraries = 'kingres_columnar'
 ```
 
 then `CREATE EXTENSION kingres_columnar;` (superuser). Objects are in schema
-`kingres`. Without the preload the extension still loads and reads, and
-refuses to write. A server that has ever written columnar WAL needs the
+`kingres`. Without the preload `CREATE EXTENSION` works and tables that
+already exist can be read, but everything that would write columnar data is
+refused with an error that names the setting: `CREATE TABLE ... USING
+columnar`, `INSERT`, `COPY`, `TRUNCATE`, a rewrite into columnar, and
+`columnar_compact`. A server that has ever written columnar WAL needs the
 library for as long as that WAL exists (crash recovery, archive recovery,
 base backups, `pg_rewind`). Resource manager id: 128 (`RM_EXPERIMENTAL_ID`).
 It must be replaced by an id reserved on the public registry before a release,
@@ -119,11 +122,28 @@ One main fork, no other fork.
   `VACUUM FULL` follow from PostgreSQL's own rules. A byte-for-byte copy of the file (`SET TABLESPACE`, a base backup) keeps
   its identity and so its stripes, with nothing to update; a rewrite or
   `TRUNCATE` creates a new file with a new identity and an empty catalog.
-  Older snapshots: a REPEATABLE READ or SERIALIZABLE transaction whose snapshot
-  is older than the commit of a `VACUUM FULL`, `TRUNCATE`, `SET ACCESS METHOD`
-  or rewriting `ALTER TABLE` of the table does not get an empty table (as heap
-  gives for some of these): its read fails with SQLSTATE `40001`, naming the
-  rewrite. `SET TABLESPACE` and `columnar_compact` change nothing for it.
+  Older snapshots, in every isolation level (a READ COMMITTED statement that
+  reads through a STABLE function has a snapshot older than the command that
+  ran meanwhile): `SET TABLESPACE`, `columnar_compact` and `VACUUM` change
+  nothing for them. `VACUUM FULL` does not change what the table contains, and
+  keeps it for them as heap does, when every stripe was committed before the
+  oldest snapshot (so before every snapshot that exists): the new stripes get
+  frozen catalog rows and the new file records no creating transaction. When
+  some stripe is newer than a snapshot that is still open, or something is in
+  progress or recently deleted (`columnar_compact`), the old snapshot would
+  have to see a different set of stripes and gets the error instead (below).
+  `TRUNCATE`, `SET ACCESS METHOD` and `ALTER TABLE` that rewrite the rows
+  (`ALTER COLUMN TYPE`, `ADD COLUMN` with a volatile default) change what the
+  table contains: a snapshot older than the commit does not get an empty table
+  (as heap gives for these): its read fails with SQLSTATE `40001`, naming the
+  rewrite. `CLUSTER` is refused (a columnar table has no index).
+* Transaction ids: a columnar file holds exactly one, in its metapage: that of
+  the transaction that created it (`kingres.columnar_creating_xid(rel)`, 2 once
+  frozen). VACUUM freezes it once every snapshot can see it (it precedes the
+  oldest transaction still running; the change is WAL-logged and cancels
+  hot-standby queries that might hold it) and reports the oldest id that is
+  left as the table's `relfrozenxid`. The pages of a stripe hold no
+  transaction id (that field is reserved, zero).
 * WAL: the resource manager `KingresColumnar` logs whole-page images only
   (`STRIPE_PAGES`, `METAPAGE`); redo restores images and has no logic of its
   own. A stripe's pages are logged before its catalog row is inserted.
@@ -199,25 +219,43 @@ not claimed to be readable by another.
 
 To columnar: `ALTER TABLE t SET ACCESS METHOD columnar` (rewrite under
 `ACCESS EXCLUSIVE`; the table must have no index, foreign key or `AFTER ROW`
-trigger). Back: `ALTER TABLE t SET ACCESS METHOD heap`. A partitioned table's
+trigger). Back: `ALTER TABLE t SET ACCESS METHOD heap` (also for rows over 8 kB: a
+columnar table with a column that heap would toast has an empty TOAST table, so
+that the heap table the rewrite creates has one). A partitioned table's
 `SET ACCESS METHOD` changes the method of partitions created afterwards. A
 rewrite other than `VACUUM FULL` and `SET TABLESPACE` (for example `ALTER
 COLUMN TYPE`) gives the new file the default options.
 
 ## Isolation, transaction ages, names
 
-All isolation levels work. Under SERIALIZABLE a scan takes a relation-level
-predicate lock and an insert checks for conflicts on the relation, so a real
-write skew on one columnar table is detected; the stripe catalog is read
-without predicate locks, so transactions on unrelated columnar tables do not
-abort each other.
+All isolation levels work. A columnar table takes part in serializable
+snapshot isolation as a heap table does, at the granularity of the relation:
 
-A columnar table has `relfrozenxid = 0` (it holds no row transaction ids):
-`age(relfrozenxid)` shows the maximum and monitoring that alerts on table age
-will alert on every columnar table; ignore them. Autovacuum's wraparound logic
-skips a table whose `relfrozenxid` is not a normal transaction id
-(`autovacuum.c`, `relation_needs_vacanalyze`), and `datfrozenxid` is not held
-back; the stripe catalog is an ordinary heap table and is frozen as usual.
+* a scan takes a relation-level predicate lock before it reads the stripe
+  catalog;
+* a write checks for conflicts with those locks when a row is buffered and
+  again when the buffer becomes a stripe (at pre-commit or pre-prepare, which
+  PostgreSQL runs before its own serialization check, or when the buffer is
+  flushed by size), so a reader whose lock came after the first check is
+  found;
+* a scan that skips a stripe because its writer had not committed before the
+  snapshot reports the dependency reader-before-writer
+  (`CheckForSerializableConflictOut`), as a heap scan does for a tuple it skips.
+
+The set of transactions that commit is therefore one that heap also allows
+(`t/009_serializable.pl` compares both, with write skew in both orders, the
+read-only anomaly, buffered and size-flushed rows, savepoints, `PREPARE
+TRANSACTION`, and mixed columnar and heap tables). Because the granularity is
+the table, a reader of a columnar table conflicts with every writer of it, as a
+heap sequential scan does. The stripe catalog is read without predicate locks,
+so transactions on unrelated columnar tables do not abort each other.
+
+A columnar table has a real `relfrozenxid`: the oldest transaction id its file
+still holds (the creating transaction of the metapage; see "On-disk format").
+VACUUM, including autovacuum's anti-wraparound vacuum, freezes it and advances
+`relfrozenxid`, so `age(relfrozenxid)` is meaningful and the table takes part
+in the protection against transaction id wraparound as a heap table does. The
+stripe catalog is an ordinary heap table and is frozen as usual.
 
 If the role that creates tables is named `kingres`, the default search path
 (`"$user", public`) puts unqualified tables into the schema `kingres`, which
@@ -230,8 +268,34 @@ Append-only, no indexes, no TOAST (values up to the 1 GB limit of one value are
 stored inline), at most about 8.8 x 10^12 rows per table, 150000-row stripes
 mean small transactions make small stripes, serial scans only, no vectorised
 execution, skipping is not in the cost estimate, logical decoding is not
-supported (do not publish a columnar table), and a hostile or damaged file can
+supported: a publication that would publish a columnar table is refused,
+whatever form it has (also `publish_via_partition_root` through the root of a
+partitioned table, and the table side of it), and a hostile or damaged file can
 give a clean error but not always the right data.
+
+Memory and costs worth knowing:
+
+* Rows of a transaction are buffered until the stripe is full, the buffers
+  exceed `kingres_columnar.write_buffer_memory` or the transaction ends; rows
+  of an outer subtransaction cannot be flushed from an inner one, so the
+  limit is soft there. A committed subtransaction hands its rows to its parent
+  and frees its buffer: the memory of a transaction with any number of
+  subtransactions (with or without an open cursor) is what its pending rows
+  need.
+* A chunk read allocates the size its footer records, bounded by what a chunk
+  group can hold (32 MB plus one value, at most 1 GB); the footer arrays are
+  sized from the footer's length, which must fit its group count.
+* The identity of a file is 63 random bits, redrawn when the catalog already
+  holds it. `DROP TABLE`, `VACUUM` and `columnar_check` remove catalog rows of
+  files no relation uses any more, which reads the first block of every
+  columnar relation file of the database (linear in their number: 0.02 s for
+  1500 tables). A table access method has no callback at drop and PostgreSQL
+  keeps no identity in `pg_class` for it, so there is nothing to look up
+  instead; a database with very many columnar partitions pays this on every
+  such command.
+* A `jsonb` value in a chunk written on purpose with valid checksums can still
+  crash the server (the structure of a jsonb container is not validated, as it
+  is not for heap); the checksums cover damage, not malice.
 
 ## Building and testing
 
@@ -243,8 +307,8 @@ make USE_PGXS=1 installcheck       # needs a server with the library preloaded
 ```
 
 or `kingres/dev/ext.sh kingres_columnar` and `kingres/dev/ext-majors.sh
-kingres_columnar` for PostgreSQL 18 and 19. The tests: ten `pg_regress` files
-(`sql/`, `expected/`) and six TAP files in `t/`: crash recovery,
+kingres_columnar` for PostgreSQL 18 and 19. The tests: eleven `pg_regress` files
+(`sql/`, `expected/`) and thirteen TAP files in `t/`: crash recovery,
 standby and `pg_rewind`, backup/restore/dump, concurrent writers, corruption,
-and a randomised comparison against heap (`KC_COMPARE_SEED`, `KC_COMPARE_STEPS`).
+a randomised comparison against heap (`KC_COMPARE_SEED`, `KC_COMPARE_STEPS`), older snapshots, array validation, serializable isolation against heap twins, the visibility rules and `VACUUM FULL`, memory with many subtransactions, publications and wide rows, and two laps of the transaction id space (`xid_wraparound` module; `KC_SKIP_WRAPAROUND=1` skips).
 `perf/perf.sh` measures size and scan time against heap.

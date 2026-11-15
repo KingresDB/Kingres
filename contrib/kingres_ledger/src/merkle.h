@@ -47,6 +47,12 @@ extern void kl_tx_leaf_hash(uint8 *out, uint32 seq, uint32 table_id, uint8 op,
 extern void kl_block_tx_leaf_hash(uint8 *out, uint64 ledger_txid,
 								  uint32 entry_count, const uint8 *root,
 								  const uint8 *name, size_t namelen);
+/* Length of the data a block hash covers (and of a chain-log leaf). */
+#define KL_BLOCK_PREIMAGE_LEN (1 + 2 + 8 + KL_HASH_LEN + KL_HASH_LEN + 4 + 8)
+
+extern void kl_block_preimage(uint8 *buf, uint16 version, uint64 height,
+							  const uint8 *prev_hash, const uint8 *tx_root,
+							  uint32 tx_count, int64 closed_at_us);
 extern void kl_block_hash(uint8 *out, uint16 version, uint64 height,
 						  const uint8 *prev_hash, const uint8 *tx_root,
 						  uint32 tx_count, int64 closed_at_us);

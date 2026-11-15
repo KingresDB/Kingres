@@ -90,7 +90,7 @@ typedef struct KcPageSpecial
 	uint16		flags;
 	uint32		page_no;		/* number of this page within the stripe */
 	uint32		page_count;		/* pages of the stripe */
-	uint32		writer_xid;		/* for the free-extent walk of a later version */
+	uint32		reserved;		/* zero; it held a transaction id, which VACUUM would have to freeze */
 	uint64		stripe_id;
 } KcPageSpecial;
 
@@ -287,6 +287,8 @@ extern void kc_meta_allocate(Relation rel, uint32 nrows, uint64 *stripe_id,
 							 uint64 *first_row);
 extern void kc_meta_set_options(Relation rel, const KcOptions *opts);
 extern void kc_meta_reset(Relation rel);
+extern TransactionId kc_meta_freeze(Relation rel, TransactionId oldest_xmin);
+extern void kc_meta_set_created_xid(Relation rel, TransactionId xid);
 extern void kc_stripe_write(Relation rel, uint64 stripe_id, const char *blob,
 							uint64 blob_len, uint64 *first_block,
 							uint32 *block_count);
@@ -307,9 +309,11 @@ extern Snapshot kc_catalog_snapshot(Snapshot snap, bool *is_mvcc);
 extern KcStripeInfo *kc_catalog_load(Relation rel, Snapshot snap, int *nstripes);
 extern void kc_catalog_insert(Relation rel, const KcStripeInfo *si,
 							  const char *cid_points, int cid_len,
-							  const char *col_stats, int stats_len);
+							  const char *col_stats, int stats_len, bool frozen);
 extern void kc_catalog_delete_uid(uint64 uid);
 extern int	kc_catalog_delete_stripe(uint64 uid, uint64 stripe_id);
+extern bool kc_catalog_uid_in_use(uint64 uid);
+extern bool kc_catalog_all_visible(Relation rel, TransactionId oldest_xmin);
 extern uint64 kc_catalog_row_total(Relation rel, Snapshot snap, uint64 *stripes,
 								   uint64 *groups, uint64 *raw_bytes);
 extern int	kc_catalog_reconcile(void);
@@ -330,6 +334,7 @@ extern void kc_write_row_values(Relation rel, Datum *vals, bool *nulls,
 extern void kc_write_flush_relation(Relation rel);
 extern void kc_write_discard_relation(Oid relid, bool *had_outer);
 extern void kc_write_pin_relation(Oid relid, int delta);
+extern void kc_write_set_frozen(Relation rel, bool frozen);
 extern int	kc_write_pending_count(Oid relid);
 extern bool kc_write_pending_get(Oid relid, int ordinal, uint32 *serial);
 
@@ -340,6 +345,7 @@ typedef struct KcPendingRef
 } KcPendingRef;
 
 extern KcPendingRef *kc_write_pending_refs(Oid relid, uint64 uid, int *n);
+extern void kc_write_pending_release(Oid relid, const KcPendingRef *refs, int n);
 extern bool kc_write_pending_fetch(Oid relid, const KcPendingRef *ref,
 								   uint32 rowno, Datum **vals, bool **nulls,
 								   int *ncols, CommandId *cid);
@@ -417,6 +423,9 @@ typedef struct KcScan
 	KcScanStats stats;
 	MemoryContext scan_cxt;
 } KcScan;
+
+/* a scan flag of the extension itself, outside the SO_ bits of PostgreSQL */
+#define KC_SCAN_MAINTENANCE	(1 << 30)
 
 extern KcScan *kc_scan_begin(Relation rel, Snapshot snapshot,
 							 const bool *needed, struct KcSkip *skip,

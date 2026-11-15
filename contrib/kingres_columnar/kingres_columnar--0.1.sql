@@ -89,6 +89,12 @@ CREATE FUNCTION columnar_identity(rel regclass)
     LANGUAGE C STRICT SECURITY INVOKER
     SET search_path = pg_catalog, kingres, pg_temp;
 
+CREATE FUNCTION columnar_creating_xid(rel regclass)
+    RETURNS xid
+    AS 'MODULE_PATHNAME', 'kingres_columnar_creating_xid'
+    LANGUAGE C STRICT SECURITY INVOKER
+    SET search_path = pg_catalog, kingres, pg_temp;
+
 CREATE FUNCTION columnar_reconcile()
     RETURNS int
     AS 'MODULE_PATHNAME', 'kingres_columnar_reconcile'
@@ -185,14 +191,18 @@ BEGIN
                 USING ERRCODE = '0A000',
                       HINT = 'Use a BEFORE ROW or a statement-level trigger, or keep the table in row storage.';
         END IF;
-        IF EXISTS (SELECT 1 FROM pg_catalog.pg_class c
-                    WHERE c.oid = ANY (cols)
-                      AND (EXISTS (SELECT 1 FROM pg_catalog.pg_publication WHERE puballtables)
-                           OR EXISTS (SELECT 1 FROM pg_catalog.pg_publication_rel pr
-                                       WHERE pr.prrelid IN (SELECT relid
-                                                              FROM pg_catalog.pg_partition_ancestors(c.oid)))
-                           OR EXISTS (SELECT 1 FROM pg_catalog.pg_publication_namespace pn
-                                       WHERE pn.pnnspid = c.relnamespace))) THEN
+        -- What a publication publishes is what the server says it does
+        -- (pg_get_publication_tables: all tables, a schema, the listed
+        -- tables, the exceptions of 19, the partitions or their root with
+        -- publish_via_partition_root), so ask it, and test the table and
+        -- every ancestor of it against that list.
+        IF EXISTS (SELECT 1
+                     FROM unnest(cols) AS col(relid),
+                          pg_catalog.pg_publication p,
+                          LATERAL pg_catalog.pg_get_publication_tables(p.pubname) pt
+                    WHERE pt.relid = col.relid
+                       OR pt.relid IN (SELECT an.relid
+                                         FROM pg_catalog.pg_partition_ancestors(col.relid) an)) THEN
             RAISE EXCEPTION 'columnar tables are not replicated logically yet: a publication would include a columnar table'
                 USING ERRCODE = '0A000',
                       HINT = 'Keep tables that are published in row storage, or leave the columnar table out of the publication.';
@@ -200,12 +210,22 @@ BEGIN
     END IF;
 
     IF cardinality(pubs) > 0 THEN
+        -- The relations listed are the ones published under their own name
+        -- (partitions) or, with publish_via_partition_root, the roots of
+        -- partitioned tables: the rows that are published are those of the
+        -- listed relation and of everything below it.
         IF EXISTS (SELECT 1
                      FROM pg_catalog.pg_publication p,
-                          LATERAL pg_catalog.pg_get_publication_tables(p.pubname) pt
-                     JOIN pg_catalog.pg_class c ON c.oid = pt.relid
-                     JOIN pg_catalog.pg_am a ON a.oid = c.relam
-                    WHERE p.oid = ANY (pubs) AND a.amname = 'columnar') THEN
+                          LATERAL pg_catalog.pg_get_publication_tables(p.pubname) pt,
+                          LATERAL (SELECT pt.relid
+                                   UNION ALL
+                                   SELECT t.relid
+                                     FROM pg_catalog.pg_partition_tree(pt.relid) t) x(relid)
+                    WHERE p.oid = ANY (pubs)
+                      AND x.relid IN (SELECT c.oid
+                                        FROM pg_catalog.pg_class c
+                                        JOIN pg_catalog.pg_am a ON a.oid = c.relam
+                                       WHERE a.amname = 'columnar')) THEN
             RAISE EXCEPTION 'columnar tables are not replicated logically yet: the publication would include a columnar table'
                 USING ERRCODE = '0A000',
                       HINT = 'Leave columnar tables out of publications.';
@@ -236,6 +256,7 @@ REVOKE ALL ON FUNCTION columnar_on_drop() FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_check_ddl() FROM PUBLIC;
 -- The functions that act on one table check ownership themselves.
 GRANT EXECUTE ON FUNCTION columnar_identity(regclass) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION columnar_creating_xid(regclass) TO PUBLIC;
 GRANT EXECUTE ON FUNCTION columnar_options(regclass), columnar_info(regclass),
     columnar_stripes(regclass), columnar_set_options(regclass, text, int, int, int),
     columnar_compact(regclass, int) TO PUBLIC;
