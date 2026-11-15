@@ -14,6 +14,7 @@ import { availability, recovery, setSystemDatabaseStopped } from '@/api/availabi
 import { endpoints } from '@/api/endpoints'
 import { ApiError } from '@/api/problem'
 import { useSessionStore } from '@/stores/session'
+import SafeName from '@/components/SafeName.vue'
 
 const client = useQueryClient()
 const session = useSessionStore()
@@ -25,8 +26,9 @@ let timer: ReturnType<typeof setTimeout> | undefined
 let alive = true
 
 async function check(): Promise<void> {
+  let current
   try {
-    await endpoints.getSession()
+    current = await endpoints.getSession()
   } catch {
     // Still stopped (503), or the server is busy starting: keep watching. A lost session is
     // handled by the application as for any other request.
@@ -34,8 +36,15 @@ async function check(): Promise<void> {
     return
   }
   if (!alive) return
+  // Since 0.6.0 the server answers while the system database is stopped, marked `degraded`: that is
+  // still the stopped state. Learn the instance if it is not known yet and keep watching.
+  if (current.degraded === true) {
+    if (availability.instanceId === null) void session.learnInstance()
+    schedule()
+    return
+  }
   setSystemDatabaseStopped(false)
-  // The session of this tab may have been restored from a copy (after a reload): take the server's own.
+  // Take the server's own session (roles are read from the database again).
   void session.refresh()
   // Everything that was paused or answered 503 is asked again.
   void client.invalidateQueries()
@@ -94,6 +103,15 @@ onBeforeUnmount(() => {
         are still signed in, and nothing was lost.</span
       >
     </p>
+    <p v-if="session.session?.degradedReason" data-testid="degraded-reason">
+      What the server says:
+      <SafeName :value="session.session.degradedReason" kind="text" :max="300" />
+    </p>
+    <p class="muted" data-testid="degraded-allowed">
+      While it is stopped the server accepts only three things from a signed-in account: starting
+      the instance, asking who is signed in, and listing the instances. Everything else (the
+      navigation, signing out) is switched off and says why.
+    </p>
     <p
       v-if="availability.instanceId === null"
       class="notice tone-warn"
@@ -102,10 +120,10 @@ onBeforeUnmount(() => {
       <span aria-hidden="true">&#9650;</span>
       <span
         >This panel does not know which instance of this server hosts the system database: it could
-        only be read while the server still answered, and that did not happen in this tab. It does
-        not guess. Start the instance on the machine of this server (for example with
-        <code>pg_ctl start</code>), or restart the <code>kingresd</code> service of this server;
-        this page notices within seconds that the server answers again.</span
+        not be read: the server could not list its instances in this state (it never read the list
+        since it started). It does not guess. Start the instance on the machine of this server (for
+        example with <code>pg_ctl start</code>), or restart the <code>kingresd</code> service of
+        this server; this page notices within seconds that the server answers again.</span
       >
     </p>
     <p v-else data-testid="instance-known">

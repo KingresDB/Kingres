@@ -89,6 +89,7 @@ describe('add server, then rebalance', () => {
     const task = await endpoints.addServer({
       address: '10.0.0.14:8091',
       setupToken: 'demo-setup-token',
+      allowUnpinned: true,
     })
     await waitFor(async () => expect((await endpoints.getTask(task.id)).state).toBe('done'))
 
@@ -128,6 +129,7 @@ describe('add server, then rebalance', () => {
     const added = await endpoints.addServer({
       address: '10.0.0.14:8091',
       setupToken: 'demo-setup-token',
+      allowUnpinned: true,
     })
     await waitFor(async () => expect((await endpoints.getTask(added.id)).state).toBe('done'))
     mockConfig.taskDurationMs = 20000

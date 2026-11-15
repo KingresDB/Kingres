@@ -264,6 +264,12 @@ const entries: Record<ProblemCode, Entry> = {
       'The manager leader does not hold the key of the certificate authority, so it cannot issue or revoke certificates, or add or remove a server, right now. Nothing was changed. Try again when the server that holds the key is the leader; the cluster keeps running on its current certificates until they expire.',
     retryable: true,
   },
+  internal_api_disabled: {
+    tone: 'warning',
+    heading: 'Internal API switched off on this server',
+    message:
+      'This server was started without its internal API (no internal listen address), so it cannot take part in a cluster: it cannot add or remove servers, leave the cluster, or renew or revoke certificates. This is a setting of the server, not a missing feature. Nothing was changed. Start kingresd with an internal listen address (the option -internal-listen) and try again.',
+  },
   quorum_unavailable: {
     tone: 'danger',
     heading: 'No quorum',
@@ -316,7 +322,8 @@ const entries: Record<ProblemCode, Entry> = {
   service_unavailable: {
     tone: 'danger',
     heading: 'Service unavailable',
-    message: 'The server cannot answer right now.',
+    message:
+      'The server cannot answer right now. If you asked for a change, one cause is that the audit log cannot be written: the server then refuses the change before it does anything, so nothing was changed. Try again; if it persists, look at the disk and the log of the server.',
     retryable: true,
     withDetail: true,
   },

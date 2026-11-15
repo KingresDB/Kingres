@@ -28,9 +28,17 @@ import ProofResult from '@/components/ledger/ProofResult.vue'
 import VerificationDialog from '@/components/ledger/VerificationDialog.vue'
 import { saveTextFile } from '@/lib/download'
 import {
+  coverageOf,
+  digestCoverageText,
+  verificationBadge,
+  verificationCoverageText,
+} from '@/lib/ledger-coverage'
+import {
   digestRelation,
   digestRelationText,
   type DigestRelation,
+  type DigestChain,
+  type RawDigest,
   type RawProof,
 } from '@/lib/ledger-proof'
 import { ApiError } from '@/api/problem'
@@ -212,10 +220,21 @@ const relationText = (id: number): string => {
 const coveringCount = computed(
   () => [...relations.value.values()].filter((r) => r.state === 'covers').length,
 )
-const downloaded = ref<{ id: number; group: number; relation: DigestRelation | null } | null>(null)
-function downloadDigest(id: number, group: number, text: string): void {
-  saveTextFile(`digest-${id}-group-${group}.json`, text)
-  downloaded.value = { id, group, relation: relations.value.get(id) ?? null }
+const downloaded = ref<{
+  id: number
+  group: number
+  relation: DigestRelation | null
+  coverage: string
+} | null>(null)
+/** The file is saved exactly as sent; the warning about what the digest does not cover is only text on screen. */
+function downloadDigest(d: RawDigest, c: DigestChain): void {
+  saveTextFile(`digest-${d.id}-group-${c.shardGroupId}.json`, c.rawDocument)
+  downloaded.value = {
+    id: d.id,
+    group: c.shardGroupId,
+    relation: relations.value.get(d.id) ?? null,
+    coverage: digestCoverageText(coverageOf(d)),
+  }
 }
 </script>
 
@@ -286,6 +305,10 @@ function downloadDigest(id: number, group: number, text: string): void {
             <template v-if="status.lastVerifiedAt"
               >Last verified {{ formatAgo(status.lastVerifiedAt) }}.</template
             >
+          </p>
+          <p v-if="status.verificationState === 'passed'" class="muted">
+            "Last check passed" is the state of the latest verification only. Open it under
+            Verification to see which shard groups it covered.
           </p>
           <TableWrap>
             <table class="table">
@@ -377,7 +400,16 @@ function downloadDigest(id: number, group: number, text: string): void {
                 <tbody>
                   <tr v-for="v in verifications.items.value" :key="v.id">
                     <th scope="row">{{ v.id }}</th>
-                    <td><StatusBadge :meta="LEDGER_STATE[v.state]" /></td>
+                    <td>
+                      <StatusBadge :meta="verificationBadge(v)" />
+                      <div
+                        v-if="v.state === 'passed' && verificationCoverageText(coverageOf(v))"
+                        class="muted"
+                        :data-testid="`verification-coverage-${v.id}`"
+                      >
+                        {{ verificationCoverageText(coverageOf(v)) }}
+                      </div>
+                    </td>
                     <td>{{ v.scope === 'full' ? 'Full' : 'Since last verified' }}</td>
                     <td>
                       {{ formatDateTime(v.startedAt) }} by
@@ -448,7 +480,10 @@ function downloadDigest(id: number, group: number, text: string): void {
           <p class="muted">
             A digest is the head of each chain. Save its documents
             <strong>outside the database</strong>: the verifier needs one that an attacker with
-            database access could not have changed.
+            database access could not have changed. A document is saved byte for byte as the server
+            sent it: do not open and save it again in an editor, the verifier needs the exact bytes.
+            "By" names the role that asked for the digest, or <code>system</code> for the scheduled
+            one.
           </p>
           <ProblemNotice v-if="generate.error.value" :error="generate.error.value" />
           <CursorResetNotice
@@ -494,6 +529,9 @@ function downloadDigest(id: number, group: number, text: string): void {
               <span aria-hidden="true">&#9432;</span>
               <span>
                 Saved the document of chain {{ downloaded.group }} of digest {{ downloaded.id }}.
+                <strong v-if="downloaded.coverage" data-testid="digest-downloaded-coverage">{{
+                  downloaded.coverage
+                }}</strong>
                 <template v-if="downloaded.relation">{{
                   digestRelationText(downloaded.relation)
                 }}</template>
@@ -522,6 +560,14 @@ function downloadDigest(id: number, group: number, text: string): void {
                       <NullableValue :value="d.generatedBy" safe />
                     </td>
                     <td>
+                      <p
+                        v-if="digestCoverageText(coverageOf(d))"
+                        class="badge tone-warn"
+                        :data-testid="`digest-coverage-${d.id}`"
+                      >
+                        <span aria-hidden="true">&#9650;</span>
+                        {{ digestCoverageText(coverageOf(d)) }}
+                      </p>
                       <ul class="chain-heads">
                         <li v-for="c in d.chains" :key="c.shardGroupId">
                           g{{ c.shardGroupId }}@{{ c.blockHeight }}
@@ -531,7 +577,7 @@ function downloadDigest(id: number, group: number, text: string): void {
                             :aria-label="
                               'Download document of chain ' + c.shardGroupId + ' of digest ' + d.id
                             "
-                            @click="downloadDigest(d.id, c.shardGroupId, c.rawDocument)"
+                            @click="downloadDigest(d, c)"
                           >
                             Download document
                           </button>
@@ -539,7 +585,8 @@ function downloadDigest(id: number, group: number, text: string): void {
                       </ul>
                     </td>
                     <td class="mono" :title="d.aggregateHash ?? undefined">
-                      {{ shortHash(d.aggregateHash) }}
+                      <template v-if="d.aggregateHash">{{ shortHash(d.aggregateHash) }}</template>
+                      <span v-else class="muted">None (not for an incomplete digest)</span>
                     </td>
                     <td>
                       <template v-if="d.anchors.length">

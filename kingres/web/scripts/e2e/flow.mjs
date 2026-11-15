@@ -70,6 +70,19 @@ export async function runFlow(ctx) {
     await ui.fill('Setup token', ctx.setupToken())
     await ui.click('Continue')
     await ui.waitForText('Create new cluster')
+    // 0.6.0: with the setup token (and from loopback) the server tells its own fingerprint; the wizard shows it.
+    await page.waitForSelector('[data-testid="own-fingerprint-value"]', { timeout: 15000 })
+    const shown = await page.$eval('[data-testid="own-fingerprint-value"]', (e) =>
+      e.textContent.replace(/[\s:]/g, '').toLowerCase(),
+    )
+    const reported = await page.evaluate(async (token) => {
+      const r = await fetch('/api/v1/setup/state', { headers: { 'X-Setup-Token': token } })
+      return (await r.json()).internalFingerprint
+    }, ctx.setupToken())
+    expect(/^[0-9a-f]{64}$/.test(shown), `the wizard shows no 64-digit fingerprint: ${shown}`)
+    expect(shown === reported, `wizard shows ${shown}, GET /setup/state says ${reported}`)
+    notes.push(`the wizard shows this server's own fingerprint (internalFingerprint) ${shown}`)
+    await shot('01b-wizard-own-fingerprint')
     await ui.click('Create new cluster', { role: 'button' })
     await ui.waitForText('Administrator account')
   })
@@ -405,6 +418,18 @@ export async function runFlow(ctx) {
     // The rules are applied from a confirmation that shows what changes; Enter in a field does nothing.
     await ui.click('Review and apply')
     await ui.waitForText('Apply the network access rules on every server?')
+    // 0.6.0: the dialog asks the server (dryRun=true) whether it accepts the rules; nothing is saved yet.
+    await page.waitForFunction(
+      () =>
+        /accepts them/.test(
+          document.querySelector('[data-testid="server-check"]')?.innerText ?? '',
+        ),
+      { timeout: 15000 },
+    )
+    notes.push(
+      `network dry run notice: ${(await page.$eval('[data-testid="server-check"]', (e) => e.innerText)).replace(/\s+/g, ' ')}`,
+    )
+    await shot('16b-network-dry-run')
     await ui.click('Apply on all servers', { within: '[role=dialog] .dlg-foot' })
     await sleep(3000)
     const text = await ui.text()
@@ -653,23 +678,83 @@ export async function runFlow(ctx) {
     await shot('26-server-certificate')
   })
 
-  await step('the add-server dialog takes a fingerprint and rejects a malformed one', async () => {
-    await ui.navigate('/servers')
-    await ui.waitForText('Add server')
-    await ui.click('Add server')
-    await ui.waitForText('Expected fingerprint (recommended)')
-    await ui.fill('Expected fingerprint (recommended)', 'not-a-fingerprint', {
-      within: '[role=dialog]',
-    })
-    await ui.fill('Server address', '127.0.0.1:9', { within: '[role=dialog]' })
-    await ui.fill('Setup token of the new server', 'x', { within: '[role=dialog]' })
-    await ui.click('Add server', { within: '[role=dialog] .dlg-foot' })
-    await sleep(500)
-    const text = await page.$eval('[role=dialog]', (e) => e.innerText.replace(/\s+/g, ' '))
-    expect(/64|hex|fingerprint/i.test(text), 'no fingerprint validation message')
-    await shot('27-add-server-fingerprint')
-    await ui.click('Cancel', { within: '[role=dialog]' })
-  })
+  await step(
+    'the add-server dialog makes the pin the normal path; unpinned is an explicit choice',
+    async () => {
+      await ui.navigate('/servers')
+      await ui.waitForText('Add server')
+      await ui.click('Add server')
+      await ui.waitForText('Expected fingerprint')
+      const preselected = await page.$eval('[data-testid="allow-unpinned"]', (e) => e.checked)
+      expect(!preselected, 'the unpinned choice is pre-selected')
+      await ui.fill('Server address', '127.0.0.1:9', { within: '[role=dialog]' })
+      await ui.fill('Setup token of the new server', 'x', { within: '[role=dialog]' })
+      // neither a pin nor the explicit choice: blocked, with a message on the field
+      await ui.click('Add server', { within: '[role=dialog] .dlg-foot' })
+      await sleep(400)
+      let text = await page.$eval('[role=dialog]', (e) => e.innerText.replace(/\s+/g, ' '))
+      expect(
+        /fingerprint/i.test(text) && /trust whatever answers|enter the fingerprint/i.test(text),
+        'no message about the missing pin',
+      )
+      await ui.fill('Expected fingerprint', 'not-a-fingerprint', { within: '[role=dialog]' })
+      await ui.click('Add server', { within: '[role=dialog] .dlg-foot' })
+      await sleep(400)
+      text = await page.$eval('[role=dialog]', (e) => e.innerText.replace(/\s+/g, ' '))
+      expect(/64|hex|fingerprint/i.test(text), 'no fingerprint validation message')
+      await shot('27-add-server-fingerprint')
+      await page.click('[data-testid="allow-unpinned"]')
+      await page.waitForSelector('[data-testid="unpinned-warning"]')
+      const warning = await page.$eval('[data-testid="unpinned-warning"]', (e) => e.innerText)
+      expect(/whatever answers/i.test(warning), 'the unpinned warning does not say what it means')
+      await shot('27b-add-server-unpinned-warning')
+      await ui.click('Cancel', { within: '[role=dialog]' })
+    },
+  )
+
+  await step(
+    'the server itself refuses add-server without a pin (400 at /expectedFingerprint)',
+    async () => {
+      const result = await page.evaluate(
+        async (creds) => {
+          const login = await fetch('/api/v1/auth/login', {
+            method: 'POST',
+            credentials: 'omit',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ...creds, issueToken: true }),
+          })
+          const bearer = (await login.json()).token
+          const post = async (path, body) => {
+            const r = await fetch('/api/v1' + path, {
+              method: 'POST',
+              credentials: 'omit',
+              headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + bearer },
+              body: JSON.stringify(body),
+            })
+            return { status: r.status, body: await r.text() }
+          }
+          return {
+            add: await post('/servers', { address: '127.0.0.1:9', setupToken: 'x' }),
+            badPin: await post('/servers', {
+              address: '127.0.0.1:9',
+              setupToken: 'x',
+              expectedFingerprint: 'zz',
+            }),
+          }
+        },
+        { username: ADMIN.user, password: ADMIN.password },
+      )
+      notes.push(`addServer without a pin: ${result.add.status} ${result.add.body.slice(0, 300)}`)
+      notes.push(
+        `addServer with a malformed pin: ${result.badPin.status} ${result.badPin.body.slice(0, 200)}`,
+      )
+      expect(
+        result.add.status === 400 && /expectedFingerprint/.test(result.add.body),
+        'addServer without a pin was not refused with 400 at /expectedFingerprint',
+      )
+      expect(result.badPin.status === 400, `a malformed pin answered ${result.badPin.status}`)
+    },
+  )
 
   // --- the ledger: proof, files, verifier, verification record
   const clearDownloads = () => {
@@ -861,15 +946,37 @@ export async function runFlow(ctx) {
     }
     await ui.click('Restart instance', { within: '[role=dialog] .dlg-foot' })
     // The instance hosts the system database: the panel waits calmly and comes back by itself.
-    await ui.waitForText('Finished.', 120000)
-    await ui.click('Close', { within: '[role=dialog]' })
+    // 0.6.0: the stopped state begins when the restart is accepted, so the page (and the dialog on it) is
+    // replaced by the stopped state while the instance restarts. The result is then told by the notice of the
+    // shell ("Restart instance #N: finished."), not by the dialog: accept either.
     await page.waitForFunction(
       () =>
-        !/A restart is required/.test(document.body.innerText) &&
-        !/system database is stopped/.test(document.body.innerText) &&
-        !document.querySelector('[role=dialog]'),
+        /Finished\./.test(document.querySelector('[role=dialog]')?.innerText ?? '') ||
+        /Restart instance #\d+\W+finished/i.test(
+          [...document.querySelectorAll('.banner')].map((b) => b.innerText).join(' '),
+        ),
       { timeout: 120000 },
     )
+    if (await page.$('[role=dialog]')) await ui.click('Close', { within: '[role=dialog]' })
+    try {
+      await page.waitForFunction(
+        () =>
+          !/A restart is required/.test(document.body.innerText) &&
+          !/system database is stopped/.test(document.body.innerText) &&
+          !document.querySelector('[role=dialog]'),
+        { timeout: 120000 },
+      )
+    } catch (e) {
+      // Evidence for the report: which of the three conditions holds, and what the server says.
+      const seen = await page.evaluate(async () => ({
+        restartRequiredShown: /A restart is required/.test(document.body.innerText),
+        stoppedShown: /system database is stopped/.test(document.body.innerText),
+        dialogOpen: !!document.querySelector('[role=dialog]'),
+        settings: await fetch('/api/v1/this-server/settings').then((r) => r.text()),
+      }))
+      notes.push(`restart step did not settle: ${JSON.stringify(seen).slice(0, 900)}`)
+      throw e
+    }
     await sleep(1500)
     expect(!page.url().includes('/login'), 'the restart signed the user out')
   })
@@ -910,7 +1017,34 @@ export async function runFlow(ctx) {
         failed.length <= 12,
         `an error storm while the system database was stopped: ${failed.length} failed requests`,
       )
-      await ui.click('Start instance')
+      // 0.6.0: a reload while stopped. Nothing is kept in the browser; getSession answers degraded and
+      // listThisServerInstances names the instance to start.
+      await page.reload({ waitUntil: 'networkidle0' })
+      await ui.waitForText('The system database is stopped', 60000)
+      expect(!page.url().includes('/login'), 'the reload while stopped ended in the sign-in page')
+      const stored = await page.evaluate(() => [
+        ...Object.keys(localStorage),
+        ...Object.keys(sessionStorage),
+      ])
+      expect(
+        stored.every((k) => k === 'kingres.theme'),
+        `web storage holds more than the theme: ${stored.join(', ')}`,
+      )
+      await page.waitForSelector('[data-testid="instance-known"]', { timeout: 30000 })
+      notes.push(
+        `after a reload while stopped: ${(await page.$eval('[data-testid="system-database-stopped"]', (e) => e.innerText)).replace(/\s+/g, ' ').slice(0, 300)}`,
+      )
+      await shot('33b-stopped-after-reload')
+      // The button names the instance it starts ("Start instance #N"), learned from listThisServerInstances.
+      const started = await page.evaluate(() => {
+        const b = [...document.querySelectorAll('button')].find((x) =>
+          /^Start instance #\d+$/.test(x.textContent.trim()),
+        )
+        b?.click()
+        return b?.textContent.trim() ?? null
+      })
+      expect(started, 'no "Start instance #N" button in the stopped state')
+      notes.push(`start button after the reload: ${started}`)
       await page.waitForFunction(
         () => !/The system database is stopped/.test(document.body.innerText),
         { timeout: 120000 },

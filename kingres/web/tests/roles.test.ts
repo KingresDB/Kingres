@@ -54,14 +54,14 @@ describe('role-based UI', () => {
     await settled()
     const add = await screen.findByRole('button', { name: /add server/i })
     expect(add).toHaveAttribute('aria-disabled', 'true')
-    expect(add).toHaveAccessibleDescription(/requires the kingres_ops cluster role/i)
+    expect(add).toHaveAccessibleDescription(/requires the kingres_admin cluster role/i)
     await user.click(add)
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
   })
 
-  it('enables the same action for an operator', async () => {
+  it('enables the action for an administrator only (0.6.0: addServer needs kingres_admin)', async () => {
     const user = userEvent.setup()
-    await renderApp('/servers', { user: 'ops' })
+    await renderApp('/servers', { user: 'admin' })
     const add = await screen.findByRole('button', { name: /add server/i })
     expect(add).not.toHaveAttribute('aria-disabled')
     await user.click(add)

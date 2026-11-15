@@ -136,6 +136,7 @@ describe('add server: expected fingerprint', () => {
     const user = userEvent.setup()
     await renderApp('/servers')
     const dialog = await openAdd(user)
+    await user.click(within(dialog).getByLabelText(/do not check the certificate/i))
     await user.click(within(dialog).getByRole('button', { name: /^add server$/i }))
     expect(await within(dialog).findByText('Finished.')).toBeInTheDocument()
     expect(await within(dialog).findByTestId('fingerprint-state')).toHaveTextContent(/not pinned/i)
@@ -185,11 +186,10 @@ describe('join cluster: expected fingerprint', () => {
     await user.click(screen.getByRole('button', { name: /^join cluster$/i }))
     expect(await screen.findByRole('button', { name: /continue to sign in/i })).toBeInTheDocument()
     expect(bodies[0]).toMatchObject({ expectedFingerprint: fp })
-    // Nothing from the server says the pin was checked, so the page does not claim it (W2-03).
-    const note = screen.getByTestId('join-fingerprint-note')
-    expect(note).toHaveTextContent(/you gave a fingerprint and the panel sent it/i)
-    expect(note).toHaveTextContent(/does not report whether it checked it/i)
-    expect(note).not.toHaveTextContent(/matched/i)
+    // The only claim about the pin is the text the server reported (0.6.0 `detail`).
+    expect(screen.getByTestId('join-fingerprint-note')).toHaveTextContent(
+      /what the server reports about the first contact: the certificate of the existing server matched the pinned fingerprint/i,
+    )
   })
 
   it('without a fingerprint, tells the administrator to compare it afterwards', async () => {
@@ -201,9 +201,10 @@ describe('join cluster: expected fingerprint', () => {
     await user.click(await screen.findByRole('button', { name: /^join existing cluster$/i }))
     await user.type(screen.getByLabelText(/address of any existing server/i), '10.0.0.11:8091')
     await user.type(screen.getByLabelText(/administrator password/i), 'demo-password')
+    await user.click(screen.getByLabelText(/do not check the certificate/i))
     await user.click(screen.getByRole('button', { name: /^join cluster$/i }))
     expect(await screen.findByTestId('join-fingerprint-note')).toHaveTextContent(
-      /compare it with the log of the existing server/i,
+      /no pin was checked/i,
     )
   })
 

@@ -65,6 +65,32 @@ export const mockConfig = {
   rejectCursors: false,
   /** True: the manager leader does not hold the CA key, so renew and revoke answer 503. */
   caUnavailable: false,
+  /** True: the server runs without its internal API, so add, remove, leave, renew and revoke answer 409 `internal_api_disabled`. */
+  internalApiDisabled: false,
+  /**
+   * False: the caller of `getNodeState` is not on the machine and has no setup token, so `internalFingerprint` is
+   * null (the contract answers it only to a loopback caller or with a valid setup token).
+   */
+  setupFingerprintVisible: true,
+  /** Text a hostile server could send as the setup task `detail` and as the fingerprint of this server. Null: the normal text. */
+  hostileSetupText: null as string | null,
+  /** True: the setup task has no `detail` (an older server, or one that does not report the pin check). */
+  omitSetupDetail: false,
+  /**
+   * True: the audit log cannot be written, so every audited mutation answers 503 `service_unavailable` before
+   * anything is done (contract 0.6.0).
+   */
+  auditUnwritable: false,
+  /**
+   * True: the ledger of the last shard group of a database is not covered by new digests and verifications
+   * (contract 0.6.0 `complete: false`, `uncoveredShardGroupIds`, no aggregate hash).
+   */
+  incompleteLedger: false,
+  /**
+   * The address the mock server sees the client at (`Session.clientAddress`); null: the server does not report
+   * it (an older revision). Documentation range, never a real host.
+   */
+  clientAddress: '203.0.113.7' as string | null,
 }
 
 // --- types of the internal records ------------------------------------------------------------
@@ -603,6 +629,7 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
         resourceId: 'analyst',
         outcome: 'success',
         actorAddress: '10.0.0.50',
+        serverId: '10.0.0.11',
       },
       {
         id: 2,
@@ -614,6 +641,7 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
         resourceId: '2',
         outcome: 'denied',
         actorAddress: '10.2.0.9',
+        serverId: '10.0.0.12',
       },
       {
         id: 1,
@@ -623,6 +651,7 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
         action: 'login',
         outcome: 'success',
         actorAddress: '10.2.0.5',
+        serverId: '10.0.0.11',
       },
     ],
     nextAuditId: 4,
@@ -777,6 +806,8 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
           })),
           aggregateHash: fakeHash('agg-3'),
           anchors: [],
+          complete: true,
+          uncoveredShardGroupIds: [],
         },
       ],
       // Newest first, as the contract says. Ids grow with time; id 8 was recorded without a task.
@@ -795,6 +826,8 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
             startedBy: id % 2 ? 'ops' : 'system',
             blocksChecked: 40 + id,
             rowsChecked: 1000 * id,
+            complete: true,
+            uncoveredShardGroupIds: [],
             inconsistencies: failed
               ? [
                   {
@@ -828,6 +861,8 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
           startedBy: 'ops',
           blocksChecked: 5_460,
           rowsChecked: 4_812_330,
+          complete: true,
+          uncoveredShardGroupIds: [],
           inconsistencies: [],
         },
       ],
@@ -837,7 +872,7 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
     localSettings: {
       dataPaths: {
         dataDirectory: '/var/lib/kingresdb/data',
-        walDirectory: '/var/lib/kingresdb/wal',
+        walDirectory: null,
         logDirectory: '/var/log/kingresdb',
       },
       memoryQuota: { totalMegabytes: 16384 },

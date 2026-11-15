@@ -3,7 +3,7 @@
 # KingresDB web panel
 
 The management console of KingresDB: a single-page application (Vue 3, TypeScript, Vite) that is a client
-of the REST API in `kingres/api/openapi.yaml` (revision 0.5.0, 88 operations; the generated files follow the committed 0.5.0, see "Contract revisions" below) and nothing else. The Go server (`kingresd`) will embed the
+of the REST API in `kingres/api/openapi.yaml` (revision 0.6.0, 88 operations; the generated files follow the committed 0.6.0, see "Contract revisions" below) and nothing else. The Go server (`kingresd`) will embed the
 production build from `dist/` and serve it on every node. The information architecture follows the
 "Management panel" chapter of `docs/architecture.md`: a first-run wizard, a **Cluster** scope and a
 **This server** scope.
@@ -78,16 +78,16 @@ an installed KingresDB with the current extensions inside WSL (`~/kw-cp/install`
 2. copies the installation to `~/kw-web/install`, starts `kingresd` there on a fresh data directory (API port 58201,
    PostgreSQL port 58200; override with `E2E_API_PORT`, `E2E_PG_PORT`),
 3. also builds the standalone verifier `kingres-verify` (`kingres/verifier`) for this machine,
-4. drives a headless browser through the real flow (`scripts/e2e/flow.mjs`): wizard with the real setup token (wrong
+4. drives a headless browser through the real flow (`scripts/e2e/flow.mjs`): wizard with the real setup token and the server's own fingerprint (wrong
    token and wrong data directory first), sign-in, reload, roles (duplicate, disable, a stats-only account), a sharded
    database with the ledger, tables made with psql, distribute and enable-ledger from the panel, workbench query and
    SQL error, grant, network rule, every page, calm notices for the operations the server does not implement yet (failover,
    rebalance), the cluster settings, the audit log, drop database, server groups (create, assign, refused delete, unassign,
-   delete), the certificate and fingerprint of a server, the add-server dialog with a fingerprint, a ledger proof (pending
+   delete), the certificate and fingerprint of a server, the add-server dialog (pin or explicit unpinned choice; the server refuses a request without either), a ledger proof (pending
    until a digest, then shown), the proof and digest files compared byte for byte with the server's answer and accepted by
    `kingres-verify`, a ledger verification and its record, local settings (log level, memory quota and the persistent
    restart-required state), a restart of the instance, stopping the instance that hosts the system database (one clear state,
-   no error storm, start from the panel), the leave-cluster refusal for the only server, the audit log of these, the headers
+   no error storm, a reload while stopped through the degraded session, start from the panel), the leave-cluster refusal for the only server, the audit log of these, the headers
    (security headers, caching, cookie attributes, no Content-Security-Policy violation on any page), a server restart that
    signs everyone out, and the stats-only and read-only accounts,
 5. prints a report (notes, per-page state, every HTTP error the browser saw) and tears everything down.
@@ -96,24 +96,32 @@ The exit code is 0 only if every step passed. Screenshots are in `.e2e/shots/` (
 keeps `~/kw-web/install` for faster re-runs; `E2E_KEEP_RUNNING=1` leaves the processes running. `scripts/e2e/backend.sh` is
 the WSL side (`prepare`, `start`, `restart`, `token`, `psql`, `stop`). `puppeteer-core` is a development dependency.
 
-### What the run against kingresd 0.2.0-dev found (2026-11-15, contract 0.4.0)
+### What the run against kingresd 0.2.0-dev found (2026-11-15, contract 0.6.0)
 
-All 44 steps pass against the real server, with the panel served by the server itself. The mismatches of the earlier run
-(ledger status 404, grants 404, `plain` combined with `ledger`, `isManagerLeader`, the database count) are fixed in the server
-("Corrections after the panel's end-to-end run" in its README). What differs now, none of it needing a workaround in the panel:
+All 45 steps pass against the real server (built from the working tree, contract 0.6.0), with the panel served by the server
+itself. What the run now proves for 0.6.0:
 
-- The server also sends `Cross-Origin-Resource-Policy: same-origin` on every response (see "What the server must send").
-  Every other header, the caching of every class of response (index, hashed assets, other static files, the API) and the
-  attributes of the session cookie (`HttpOnly; Secure; SameSite=Strict; Path=/`, cleared on sign-out) are as listed, and the
-  browser reported no Content-Security-Policy violation on any page, dialog or download.
-- With TLS on the server sends `Strict-Transport-Security: max-age=63072000; includeSubDomains`; this README only recommended
-  `max-age=31536000`. The server's value is the stronger one.
-- During an instance restart or stop there is a moment (about a second) in which a request answers 503 `service_unavailable`
-  ("terminating connection due to administrator command") before the server answers 503 `system_database_stopped`. The panel
-  treats both calmly.
-- `kingresd` must be started with `-internal-listen` (the REST port plus one) for leave-cluster, add-server and remove-server.
-  Without it they answer 422 `unsupported_operation` ("This server cannot add or remove servers (no internal API or instance
-  management)"), which looks like "not implemented yet" in the panel. The end-to-end script passes the flag.
+- The setup wizard shows the server's own fingerprint (`NodeStateInfo.internalFingerprint`, 64 digits) and it equals what
+  `GET /setup/state` answers to the setup token.
+- The add-server dialog does not pre-select the unpinned choice, blocks a submit with neither a pin nor the choice, and
+  explains the unpinned choice; the server itself answers `POST /servers` without a pin with 400 `validation_failed` at
+  `/expectedFingerprint`, and a malformed pin with 400 (checked with a bearer token, so the panel's session is untouched).
+- The network-rules review dialog shows the server's dry-run answer ("accepts them ... Nothing is saved yet") before Apply.
+- A ledger verification record says "Passed, all groups" with "All shard groups of the database" (`complete: true`).
+- After the instance of the system database is stopped, a reload keeps the panel in the stopped state (no sign-in page): `getSession`
+  answers `degraded`, the panel shows what the server says, names "Start instance #1" (from `listThisServerInstances`), holds
+  nothing in web storage but the theme, and the start works. The stopped state lasted four failed requests (all
+  `system_database_stopped`) in about 8 seconds.
+
+Two things in the run are consequences of 0.6.0 and not defects: the stopped state begins when a restart is accepted, so the
+page and the dialog on it are replaced by the stopped state while the instance restarts (the shell's notice "Restart instance #N:
+finished." tells the result; the step accepts that or the dialog's "Finished."), and the "Start" button names the instance
+(`Start instance #N`).
+
+Earlier findings that still hold: the server sends `Cross-Origin-Resource-Policy: same-origin` and, with TLS,
+`Strict-Transport-Security: max-age=63072000; includeSubDomains` (stronger than the `max-age=31536000` recommended below);
+`kingresd` must be started with `-internal-listen` for leave-cluster, add-server and remove-server (without it they answer 409
+`internal_api_disabled` since 0.6.0, which the panel explains as configuration; the run passes the flag).
 
 ## What the server must send
 
@@ -293,13 +301,12 @@ scripts/        gen-api.mjs
   (`CursorResetNotice`); `fetchAllPages` restarts once, silently.
 - **Alert ids** are integers below 2^53 and are never parsed, rounded or re-serialized by the panel (tested with 2^52+1);
   an id that a JSON number cannot hold exactly is not acknowledged from the panel.
-- **What is kept in `sessionStorage`** (this tab only, gone with the tab): the session as `login`/`getSession` returned it
-  (with its CSRF token) and the id of the instance that hosts the system database. They are used for one thing: after a
-  reload while the system database is stopped, `getSession` answers 503 and the contract still lets the existing session
-  start the instance; the panel then keeps the session and shows the stopped state with a Start button (see below). The
-  server decides in every other case, and both are removed when the session ends. `localStorage` still holds only the
-  theme. The stopped state is told to the other tabs through `BroadcastChannel` (a `storage` event where there is none):
-  one boolean, no session, no token.
+- **Browser storage: only the theme.** `localStorage` holds `kingres.theme` and nothing else; `sessionStorage` holds nothing
+  (0.6.0 removed the copy of the session and CSRF token and the saved instance id: see "What the panel does for contract
+  0.6.0"). The router's own scroll key is removed after every navigation, and the transient key of the cross-tab channel is
+  removed at once; the stopped state is told to the other tabs (`BroadcastChannel`, or a `storage` event where there is none):
+  one boolean, no session, no token. `tests/degraded-session-0-6.test.ts` scans both stores after sign-in, in the degraded
+  state and after sign-out.
 - **Text** is English and kept next to the feature that shows it. Every source file starts with an
   `SPDX-License-Identifier: PostgreSQL` comment (checked by a test).
 
@@ -352,26 +359,77 @@ and talk to the mock API through MSW in Node, so the same handlers serve `npm ru
 | `ledger-0-5.test.ts`, `system-state-sharing.test.ts`, `hostile-0-5.test.ts`                                                    | Digest paging, digest against proof (identifiers only), the stopped state across tabs, the hostile seed over the 0.5.0 places                                                       |
 | `review-0-5.test.ts`                                                                                                           | One test per finding of the second review (W2-01 to W2-16 and the residuals), named by finding                                                                                      |
 | `task-detail.test.ts`, `kind-labels.test.ts`, `role-guards.test.ts`, `unsupported-operations.test.ts`, `workbench-0-4.test.ts` | Task detail text, kind labels, log access needs `kingres_ops`, unsupported operations stay calm and start working when supported                                                    |
+| `pin-and-fingerprint-0-6.test.ts`, `roles.test.ts`                                                                             | Add server needs kingres_admin (403 explained), the pin or the explicit unpinned choice, the 400 at /expectedFingerprint, own fingerprint, setup detail, internal_api_disabled      |
+| `degraded-session-0-6.test.ts`                                                                                                 | Reload while stopped through the degraded session, the instance from the list, disabled actions with a reason, web storage holds only the theme (sign-in, degraded, sign-out)       |
+| `network-dry-run-0-6.test.ts`, `audit-0-6.test.ts`, `alerts-settings-0-6.test.ts`                                              | Dry run before saving network rules, clientAddress, audit server column, partial notice and cursor restart, 503 audit log, replicationPending, default paths                        |
+| `ledger-0-6.test.ts`, `workbench-0-6.test.ts`                                                                                  | Passed-but-incomplete badges, uncovered shard groups in list, dialog and next to downloads, LedgerProofBlock, truncated DML was applied, timeout and size limits                    |
 
 jsdom has no layout engine, so axe cannot compute colour contrast there; that is why contrast is tested from the
 tokens instead.
 
 ## Contract revisions and the checks against them
 
-The generated files (`src/api/schema.d.ts`, `src/api/operations.generated.ts`) follow the **committed** contract, 0.5.0.
-The working tree of `kingres/api/openapi.yaml` can hold a draft of the next revision (0.6.0 was being prepared while this
-increment was written); the panel does not chase a draft. `npm run api:check` and the contract tests compare with the working
-tree, so they fail as soon as the draft differs from the generated files; that failure says nothing about the panel. To check
-against the committed revision, point `KINGRES_API_SPEC` at a copy of it:
+The generated files (`src/api/schema.d.ts`, `src/api/operations.generated.ts`) follow contract **0.6.0**, the revision of
+`kingres/api/openapi.yaml` (changelog "0.6.0" in `kingres/api/README.md`). `npm run api:check` and the contract tests compare
+with that file. While the working tree holds a draft of a later revision they fail, and that failure says nothing about the
+panel; to check against another copy of the contract (for example the committed one), point `KINGRES_API_SPEC` at it:
 
 ```
-git show HEAD:kingres/api/openapi.yaml > /tmp/openapi-0.5.0.yaml   # outside the repository
-KINGRES_API_SPEC=/tmp/openapi-0.5.0.yaml npm run api:check
-KINGRES_API_SPEC=/tmp/openapi-0.5.0.yaml npm test
+git show HEAD:kingres/api/openapi.yaml > openapi-copy.yaml   # outside the repository
+KINGRES_API_SPEC=openapi-copy.yaml npm run api:check
+KINGRES_API_SPEC=openapi-copy.yaml npm test
 ```
 
 `scripts/gen-api.mjs` and the contract tests read the same variable, so `npm run api:generate` with it set regenerates from that
 copy. Adapting to the next revision is a separate step.
+
+## What the panel does for contract 0.6.0
+
+Breaking changes (the panel follows them; nothing of the 0.5.0 behaviour is kept):
+
+- **Add server is administrator-only** (`addServer`, `kingres_admin`). Visibility follows the generated `x-required-role`: an
+  operator sees the button disabled with "Requires the kingres_admin cluster role"; a 403 `forbidden` is explained (`tests/pin-and-fingerprint-0-6.test.ts`, `tests/roles.test.ts`).
+- **A pin is the normal path** (add-server dialog and join form, `PinChoice`): the fingerprint field is required and validated
+  (64 hex digits, colons and case accepted). The only other way is a checkbox that is never pre-selected, "Do not check the
+  certificate: trust whatever answers at this address", with a warning in plain words (the server will trust whatever answers
+  there; for a join the administrator's password is sent to it; for an add the setup token). It sends `allowUnpinned: true` and
+  no pin. Without either, the submit is blocked on the field; the server's 400 at `/expectedFingerprint` is shown on the field.
+
+Additive changes (each tested; the file is named in the report of the increment):
+
+- **The server's own fingerprint** (`NodeStateInfo.internalFingerprint`, `LocalServerInfo.internalFingerprint`): shown in the
+  setup wizard (only the loopback caller or a request with the setup token gets it) and on the This server page, in groups of
+  eight digits with a copy button (the plain 64 digits). The "read it from the log line" text is the fallback when the value is
+  null or absent. `SetupTaskSummary.detail` is shown by the join wizard through `SafeName`; the wizard says that a fingerprint
+  was checked only from that text.
+- **Degraded session** (`Session.degraded`, `degradedReason`, `clientAddress`; `getSession` and `listThisServerInstances` work while
+  the system database is stopped): the copy of the session in `sessionStorage` and the saved instance id are gone. After a
+  reload the panel calls `getSession`; `degraded: true` shows the stopped state with the reason, and the instance to start is
+  read from `listThisServerInstances` (an answer 503 leaves the "does not know the instance" text, no button). In this state only
+  `startThisServerInstance`, `getSession` and `listThisServerInstances` work, so navigation and sign-out are shown
+  disabled with the reason (strike-through, not colour alone). `clientAddress` is "your address" on the network rules page (behind a
+  reverse proxy it is the proxy's address, and the page says so).
+- **Dry run** (`replaceNetworkAccess?dryRun=true`): the review dialog asks the server first; the server's 422/409/400 is shown as
+  for a real change and keeps Apply off; "accepted" says that nothing is saved yet. The panel's own address check stays as an
+  immediate hint, labelled as one. If the dry run cannot be answered the dialog says so and does not block.
+- **`internal_api_disabled`** (409): its own explanation (the server runs without its internal API: configuration, not a
+  missing feature) on add, remove, leave, renew and revoke.
+- **Ledger coverage** (`complete`, `uncoveredShardGroupIds`): "Passed, all groups", "Passed, incomplete" (different text and
+  symbol) and "Passed, coverage not stated" (a server that did not say); the uncovered groups are named in the verification
+  list, the detail dialog, the digest list and next to the downloads (the saved file stays byte-exact). The database summary
+  says "Last check passed", not "Verified".
+- **Audit:** server column, `PartialNotice`, the restart after a refused old cursor, and the explanation of a 503 when the audit
+  log cannot be written (nothing was changed). Event ids are opaque and are never sorted, parsed or re-serialized.
+- **`replicationPending`** has a label and links to the server of the alert (see the limits for the subject).
+- **`LedgerProofBlock`:** the generated type is used; the panel's own `ProofView` is removed (integers are still read from the raw text).
+- **`dataPaths.walDirectory` / `logDirectory`:** null is shown as "default".
+- **Documentation entries:** the workbench says that a result cut at the limit of a statement that changes data was still
+  committed (with its real command tag), explains the timeout (422, SQLSTATE 57014), the 1 MiB / 16 MiB limits and the two-statement
+  limit per role; `pendingRebalance` is worded as the contract defines it; the sign-in page says a sign-in belongs to one server;
+  digest `generatedBy` and the byte-exact `document` are explained next to the downloads.
+
+The mock (`src/mocks`) is never more permissive than 0.6.0: pin required, administrator for add-server, degraded session, dry run,
+`complete`/uncovered, audit `serverId`, switches for `internal_api_disabled` and the unwritable audit log.
 
 ## What the panel does for contract 0.5.0
 
@@ -390,16 +448,15 @@ copy. Adapting to the next revision is a separate step.
 - **Ledger:** the digest list pages ("Load more digests"). When a proof is on screen, every listed digest says whether it has the
   proof's chain (`chain_id` of the document of the chain with the proof's `shard_group_id`) and is not older than the proof's
   block; saving a digest repeats that. It compares identifiers only and says so; the check is `kingres-verify`.
-- **System database stopped:** the state is shared across tabs; after a reload the stopped state is shown with a Start button
-  that names the instance it starts (#N, learned from the instance list while the server answered, never guessed); with no
-  saved session (a new tab, another browser) the sign-in page explains what to do (see the limits).
+- **System database stopped:** the state is shared across tabs and has a Start button that names the instance (see 0.6.0 for how
+  it is learned after a reload).
 
 ## Known limits of this increment
 
 The SQL editor is a plain textarea, the replication page is a table rather than a graph, and the charts are simple
 SVG lines without zoom or tooltips.
 
-What the contract (revision 0.5.0) does not let the panel do, and what the panel does instead:
+What the contract (revision 0.6.0) does not let the panel do, and what the panel does instead:
 
 - **Cancel a workbench statement.** There is no way to cancel it on the server. "Stop waiting" aborts the request in the
   browser and says that the statement may still run until it finishes or reaches its timeout (the person chooses the
@@ -409,10 +466,6 @@ What the contract (revision 0.5.0) does not let the panel do, and what the panel
   UPDATE, DELETE and DDL are executed. A `readOnly` flag on `QueryRequest` (a read-only transaction) is needed.
 - **Truncation marker for names.** A result cell, a log line or a name cannot say that the server cut it; the panel cuts
   what it draws (with "Show all N characters") but cannot tell a cut value from a complete one.
-- **The address of the signed-in administrator.** The session does not carry it. The network-rules confirmation reads the
-  last address the audit log has for the account, and says that it cannot know more (a proxy, another network path).
-  A `clientAddress` in `Session`, and a dry-run of `replaceNetworkAccess` that answers "would lock the caller out", are
-  needed.
 - **Names that no URL can carry** (`.` and `..`). They are listed without a link and the router refuses them, but they cannot
   be opened. The server should refuse to create such a database or table through the API, or define an escape for them.
 - **Paging.** The contract does not paginate `GET /databases`, `/servers`, `/server-groups` and
@@ -420,25 +473,21 @@ What the contract (revision 0.5.0) does not let the panel do, and what the panel
   makes them long. Every list that has cursors can be paged ("Load more"); the lists that are read completely
   (roles, grants, rebalance reports) are followed up to a bound and say when more exists. A refused cursor restarts them
   without a notice.
-- **Start after a reload with no saved session.** While the system database is stopped, `getSession`, `login` and
-  `listThisServerInstances` answer 503, and `startThisServerInstance` needs the CSRF token that only `login` and
-  `getSession` return. A tab that had the session keeps working (the panel keeps the session of the tab in
-  `sessionStorage`); a new tab or another browser cannot start the instance and the sign-in page says what to do: start the
-  instance on the machine of the server (for example `pg_ctl start`), or restart the `kingresd` service, which starts it
-  again. The panel of another server cannot help: it starts only the instances of its own server. The contract offers
-  nothing else; wishes are in the report of this increment (for example: `getSession` and `listThisServerInstances` keep
-  answering from memory while the system database is stopped, or `startThisServerInstance` for "the instance that hosts the
-  system database" without an id and without a CSRF token for a bearer-less cookie session).
-- **The join wizard cannot say that a pin was checked.** `SetupTaskSummary` carries no detail, so after a join the wizard says
-  that the fingerprint was sent and that the server does not report whether it checked it. A `detail` on the setup task is
-  expected with the next contract revision.
-- **A server's own fingerprint.** No operation returns the fingerprint of the server being added or joined, so the panel tells
-  the administrator where to read it (the log line "bootstrap certificate of the internal API", or the SHA-256 of the
-  certificate file in the data directory). A field in `GET /this-server` would let the panel show it.
-- **The id of the system-database instance** is known only if this tab read the instance list while the server answered (the
-  shell reads it once signed in, and every 3 s on the This server page). Otherwise the stopped state offers no button.
-- **The end-to-end run** (`npm run e2e`) was not repeated for this increment: it builds `kingresd` from the working tree, which
-  was being edited. The real server's answers for the new operations, for `partial` and for the cursor refusal are known from
-  the contract text only.
+- **Start from a new tab, or when the server never answered the instance list.** There is no saved copy any more: the panel
+  needs `getSession` (the server marks it `degraded`, and only for a session that server checked before the stop, at most an
+  hour old) and `listThisServerInstances` (from the instance manager's memory, 503 if this process never read the list). Without
+  them (a session that server never checked, a role that was changed, a server restarted after the stop) the panel is at the
+  sign-in page, which cannot sign in either; it says to start the instance on the machine (for example `pg_ctl start`) or to
+  restart `kingresd`.
+- **`replicationPending` names no server.** The contract gives the alert the subject `server:<leader>|behind:<server>`, but
+  `Alert` has no `subject` property, so the panel cannot tell which server is behind; it links the alert's `serverId` and says
+  that a changed role may still not work on a server. The contract needs `Alert.subject`, or a statement of which server
+  `serverId` is for this kind.
+- **Coverage of the ledger summaries.** `LedgerStatus` and the per-chain summaries carry no `complete`, so the panel states
+  coverage only for a digest and for a verification, never for the database summary ("Last check passed").
+- **The dry run is not a reservation.** It checks the request against the revision at that moment; someone can still change the
+  rules before the administrator confirms, and the real save then answers 409 as before.
+- **`clientAddress` behind a reverse proxy** is the proxy's address (the contract says so); the lock-out check of the server
+  uses the same address.
 - **Opaque to the panel:** the manager leader's CA key. `certificate_authority_unavailable` is explained, not predicted: the panel
   cannot tell beforehand whether a revoke will be refused.

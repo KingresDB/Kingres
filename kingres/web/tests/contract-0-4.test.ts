@@ -30,8 +30,8 @@ const codes = spec.components.schemas.ProblemCode!.enum as ProblemCode[]
 describe('contract 0.4.0', () => {
   // The working tree of the contract moved on to a 0.5.0 draft (two certificate operations, two
   // problem codes) while this panel was adapted; 0.4.0 has 86 operations, the draft 88.
-  it('is revision 0.4.0 (86 operations) or its 0.5.0 draft (88)', () => {
-    expect(['0.4.0', '0.5.0']).toContain(spec.info.version)
+  it('is revision 0.4.0 (86 operations) or a later one (88)', () => {
+    expect(['0.4.0', '0.5.0', '0.6.0']).toContain(spec.info.version)
     expect(Object.keys(operations)).toHaveLength(spec.info.version === '0.4.0' ? 86 : 88)
   })
 

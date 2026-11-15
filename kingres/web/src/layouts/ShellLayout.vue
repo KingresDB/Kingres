@@ -40,6 +40,10 @@ const clusterTitle = computed(() => {
   const id = session.session?.clusterId
   return id ? safeText(id, 60) : undefined
 })
+/** The system database is stopped: the server accepts only start, session and instance list. */
+const stopped = computed(() => availability.systemDatabaseStopped)
+const signOutReason =
+  'Signing out is not possible while the system database is stopped: the server cannot end the session now. Start the instance first.'
 const narrow = useMediaQuery('(max-width: 860px)')
 
 function itemsFor(scope: 'cluster' | 'server') {
@@ -111,7 +115,17 @@ watch(
           session.role ?? 'no cluster role'
         }}</span>
       </span>
-      <button type="button" class="btn btn-small" @click="signOut">Sign out</button>
+      <button
+        type="button"
+        class="btn btn-small"
+        :aria-disabled="stopped ? 'true' : undefined"
+        :aria-describedby="stopped ? 'signout-off-reason' : undefined"
+        :title="stopped ? signOutReason : undefined"
+        @click="stopped ? undefined : signOut()"
+      >
+        Sign out
+      </button>
+      <span v-if="stopped" id="signout-off-reason" class="sr-only">{{ signOutReason }}</span>
     </header>
 
     <LiveRegions :polite="announcer.polite.value" :assertive="announcer.assertive.value" />
@@ -140,7 +154,14 @@ watch(
           <h2 class="group">Cluster</h2>
           <ul>
             <li v-for="item in clusterItems" :key="item.name">
-              <RouterLink :to="{ name: item.name }">{{ item.title }}</RouterLink>
+              <span
+                v-if="stopped"
+                class="nav-off"
+                aria-disabled="true"
+                data-testid="nav-disabled"
+                >{{ item.title }}</span
+              >
+              <RouterLink v-else :to="{ name: item.name }">{{ item.title }}</RouterLink>
             </li>
           </ul>
         </template>
@@ -148,10 +169,21 @@ watch(
           <h2 class="group">This server</h2>
           <ul>
             <li v-for="item in serverItems" :key="item.name">
-              <RouterLink :to="{ name: item.name }">{{ item.title }}</RouterLink>
+              <span
+                v-if="stopped"
+                class="nav-off"
+                aria-disabled="true"
+                data-testid="nav-disabled"
+                >{{ item.title }}</span
+              >
+              <RouterLink v-else :to="{ name: item.name }">{{ item.title }}</RouterLink>
             </li>
           </ul>
         </template>
+        <p v-if="stopped" id="nav-off-reason" class="nav-note" data-testid="nav-off-reason">
+          Switched off: the system database is stopped, and the server accepts only "start instance"
+          until it runs again.
+        </p>
       </nav>
       <main id="main" tabindex="-1" class="content">
         <SystemDatabaseStopped v-if="availability.systemDatabaseStopped" />
@@ -262,6 +294,17 @@ watch(
   border-radius: var(--radius-sm);
   color: var(--c-text);
   text-decoration: none;
+}
+.nav-off {
+  display: block;
+  padding: var(--s-1) var(--s-3);
+  color: var(--c-text-muted);
+  text-decoration: line-through;
+}
+.nav-note {
+  margin: var(--s-2) var(--s-3);
+  font-size: var(--fs-xs);
+  color: var(--c-text-muted);
 }
 .side a:hover {
   background: var(--c-surface-2);

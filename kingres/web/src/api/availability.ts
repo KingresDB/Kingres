@@ -30,8 +30,9 @@ export const availability = reactive({
   leftNotice: false,
   /**
    * The instance that hosts the system database on this server, learned from the list of instances
-   * while the server could still answer; null when it is not known. It is never guessed: the Start
-   * button is offered only for an id that was read, and says which instance it starts.
+   * (which the server also answers while the system database is stopped, from 0.6.0); null when it is
+   * not known. It is never guessed: the Start button is offered only for an id that was read, and says
+   * which instance it starts. Kept in memory only.
    */
   instanceId: null as number | null,
 })
@@ -87,39 +88,15 @@ export function setResetting(resetting: boolean): void {
   sync()
 }
 
-/** The id of the host instance is a plain number, not a secret; it is kept for this tab so that a reload still knows it. */
-const INSTANCE_KEY = 'kingres.system-instance'
-
-/** Remembers which instance hosts the system database, so that it can be started when it is down. */
+/** Remembers which instance hosts the system database, so that it can be started when it is down. Memory only. */
 export function rememberInstances(items: { id: number; isMapGroup: boolean }[]): void {
   const host = items.find((i) => i.isMapGroup)
-  if (!host) return
-  availability.instanceId = host.id
-  try {
-    sessionStorage.setItem(INSTANCE_KEY, String(host.id))
-  } catch {
-    // Storage is blocked: the id stays in memory for this page load.
-  }
-}
-
-/** After a reload: the id remembered by this tab, if any. */
-export function recallSystemInstance(): void {
-  try {
-    const id = Number(sessionStorage.getItem(INSTANCE_KEY))
-    if (Number.isSafeInteger(id) && id > 0) availability.instanceId = id
-  } catch {
-    // Nothing remembered.
-  }
+  if (host) availability.instanceId = host.id
 }
 
 /** Forgets the instance (the session ended). */
 export function forgetSystemInstance(): void {
   availability.instanceId = null
-  try {
-    sessionStorage.removeItem(INSTANCE_KEY)
-  } catch {
-    // Nothing to forget.
-  }
 }
 
 /** Back to normal (the session ended or the test is over). The notice is kept for the wizard. */

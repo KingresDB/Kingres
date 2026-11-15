@@ -64,7 +64,10 @@ async function submit(): Promise<void> {
           continue.
         </p>
         <h1 id="login-title">Sign in to KingresDB</h1>
-        <p class="muted">Use your PostgreSQL role. Your cluster role decides what you can do.</p>
+        <p class="muted">
+          Use your PostgreSQL role. Your cluster role decides what you can do. A sign-in belongs to
+          this server only: another server of the cluster needs its own sign-in.
+        </p>
         <SystemDatabaseStoppedSignIn v-if="availability.stoppedSeen" />
         <p v-if="error instanceof SessionCookieError" class="notice tone-warn" role="alert">
           <span aria-hidden="true">&#9650;</span>

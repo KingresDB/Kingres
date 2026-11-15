@@ -170,6 +170,19 @@ export const routes: RouteRecordRaw[] = [
  * Creates the router. The guard runs, in order: setup state (wizard while `uninitialized`),
  * session restore, sign-in requirement, and the role needed by the page.
  */
+/**
+ * vue-router keeps scroll positions in `sessionStorage` ("vue-router:scroll"; the panel sets no scroll
+ * behaviour, so the value is empty). The panel's storage statement is "only the theme", so the key is
+ * removed after each navigation. It holds no credential either way.
+ */
+function forgetRouterScrollStore(): void {
+  try {
+    sessionStorage.removeItem('vue-router:scroll')
+  } catch {
+    // Storage is blocked: nothing was written either.
+  }
+}
+
 export function createAppRouter(
   queryClient: QueryClient,
   pinia: Pinia,
@@ -214,6 +227,7 @@ export function createAppRouter(
 
   router.afterEach((to) => {
     document.title = to.meta.title ? `${to.meta.title} - KingresDB` : 'KingresDB'
+    forgetRouterScrollStore()
   })
 
   return router

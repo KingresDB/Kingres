@@ -24,6 +24,13 @@ export function resetMockState(options: { uninitialized?: boolean } = {}): MockS
   mockConfig.partial = null
   mockConfig.rejectCursors = false
   mockConfig.caUnavailable = false
+  mockConfig.internalApiDisabled = false
+  mockConfig.setupFingerprintVisible = true
+  mockConfig.hostileSetupText = null
+  mockConfig.omitSetupDetail = false
+  mockConfig.auditUnwritable = false
+  mockConfig.incompleteLedger = false
+  mockConfig.clientAddress = '203.0.113.7'
   return state
 }
 
@@ -58,6 +65,7 @@ const STATUS: Record<ProblemCode, number> = {
   system_database_stopped: 503,
   certificate_revoked: 409,
   certificate_authority_unavailable: 503,
+  internal_api_disabled: 409,
   unprocessable: 422,
   sql_error: 422,
   unsupported_operation: 422,
@@ -106,7 +114,9 @@ export const problem = (
   extra?: Partial<Problem>,
 ): MockProblem => new MockProblem(code, detail, extra)
 
-export const validationFailed = (errors: { field: string; message: string }[]): MockProblem =>
+export const validationFailed = (
+  errors: { field: string; message: string; code?: string }[],
+): MockProblem =>
   new MockProblem('validation_failed', 'One or more fields are not valid.', { errors })
 
 export interface Reply {
@@ -178,6 +188,19 @@ export function register(operationId: OperationId, handler: Handler): HttpHandle
     tickTasks(s)
     try {
       precheck(s, operationId, request)
+      const dryRun = new URL(request.url).searchParams.get('dryRun') === 'true'
+      // Contract 0.6.0: an audited mutation is refused before anything is done when the audit log cannot be written.
+      if (
+        mockConfig.auditUnwritable &&
+        MUTATING.has(request.method) &&
+        !dryRun &&
+        operationId !== 'login' &&
+        AUDIT_ACTIONS.includes(operationId)
+      )
+        throw problem(
+          'service_unavailable',
+          'The audit log cannot be written; nothing was changed.',
+        )
       if (mockConfig.unsupported.has(operationId)) {
         throw problem(
           'unsupported_operation',
@@ -195,7 +218,8 @@ export function register(operationId: OperationId, handler: Handler): HttpHandle
       // every name that contains a percent sign.
       for (const [k, v] of Object.entries(params)) flat[k] = String(v)
       const reply = await handler({ s, params: flat, url: new URL(request.url), request, body })
-      if (MUTATING.has(request.method) && operationId !== 'login')
+      // A dry run changes nothing and writes no audit event.
+      if (MUTATING.has(request.method) && operationId !== 'login' && !dryRun)
         audit(s, operationId, flat, reply.status)
       const headers = { 'X-Request-Id': requestId, ...reply.headers }
       if (reply.rawJson !== undefined)
@@ -225,6 +249,16 @@ export function register(operationId: OperationId, handler: Handler): HttpHandle
   })
 }
 
+/**
+ * The operations that work while the system database is stopped (0.6.0). All of them need a session this
+ * server checked before the stop (here: the one the mock holds); without one the answer is the 503.
+ */
+const WORKS_WHILE_STOPPED = new Set<OperationId>([
+  'startThisServerInstance',
+  'getSession',
+  'listThisServerInstances',
+])
+
 /** Setup state, authentication, CSRF and role checks. */
 /** Answered by a server that is stopped on purpose or resetting; these keep answering. */
 const ALWAYS_UP = new Set<OperationId>(['getHealth', 'getReadiness', 'getNodeState'])
@@ -244,7 +278,7 @@ function precheck(s: MockState, operationId: OperationId, request: Request): voi
   if (
     s.systemDatabaseStopped &&
     !ALWAYS_UP.has(operationId) &&
-    operationId !== 'startThisServerInstance'
+    !(WORKS_WHILE_STOPPED.has(operationId) && (s.session !== null || SETUP_OPS.has(operationId)))
   )
     throw problem(
       'system_database_stopped',
@@ -283,6 +317,7 @@ function audit(
     timestamp: new Date().toISOString(),
     actor: s.session?.username ?? 'setup',
     source: 'panel',
+    serverId: '10.0.0.11',
     action: operationId as AuditAction,
     resourceType: resourceType?.replace(/(Id|Name)$/, ''),
     resourceId,

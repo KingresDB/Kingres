@@ -45,6 +45,8 @@ export interface StatusMeta {
   tone: Tone
   icon: string
   label: string
+  /** Longer explanation, shown as the tooltip of the badge (and in the text near it where there is room). */
+  hint?: string
 }
 
 const OK = '✓' // check
@@ -62,7 +64,12 @@ export const SERVER_STATUS: Record<ServerStatus, StatusMeta> = tolerant({
   draining: { tone: 'info', icon: HALF, label: 'DRAINING' },
   decommissioning: { tone: 'info', icon: HALF, label: 'DECOMMISSIONING' },
   dead: { tone: 'danger', icon: BAD, label: 'DEAD' },
-  pendingRebalance: { tone: 'info', icon: CLOCK, label: 'PENDING REBALANCE' },
+  pendingRebalance: {
+    tone: 'info',
+    icon: CLOCK,
+    label: 'PENDING REBALANCE',
+    hint: 'The server should hold shards, is the primary of no bucket yet, and buckets exist: a rebalance has to give it data.',
+  },
 })
 
 export const TASK_STATE: Record<TaskState, StatusMeta> = tolerant({
@@ -127,7 +134,9 @@ export const DATABASE_STATUS: Record<Database['status'], StatusMeta> = tolerant(
 export const LEDGER_STATE: Record<LedgerVerification['state'], StatusMeta> = tolerant({
   never: { tone: 'neutral', icon: RING, label: 'Never verified' },
   running: { tone: 'info', icon: HALF, label: 'Verifying' },
-  passed: { tone: 'ok', icon: OK, label: 'Verified' },
+  // A summary (database list, status) does not say which shard groups the last check covered, so it never claims
+  // a verified database: the verification itself says (see lib/ledger-coverage.ts).
+  passed: { tone: 'info', icon: OK, label: 'Last check passed' },
   failed: { tone: 'danger', icon: BAD, label: 'Inconsistent' },
 })
 
@@ -171,6 +180,7 @@ export const ALERT_KIND_LABEL: Record<AlertKind, string> = {
   versionMismatch: 'Servers run different versions',
   certificateExpiring: 'Server certificate expiring',
   certificateRenewalFailed: 'Certificate renewal failed',
+  replicationPending: 'A change has not reached a server yet',
   taskFailed: 'Task failed',
 }
 
@@ -206,4 +216,18 @@ export const TASK_KIND_LABEL: Record<TaskKind, string> = {
 /** The label of a task kind; a kind from a newer server is shown as sent (through SafeName). */
 export function taskKindLabel(kind: string): string {
   return (TASK_KIND_LABEL as Record<string, string>)[kind] ?? kind
+}
+
+/**
+ * A sentence for the kinds that need one beyond their label. `replicationPending` (0.6.0): until the change
+ * reaches the server, an account that was disabled, changed or dropped may still work there.
+ */
+const ALERT_KIND_HINT: Partial<Record<AlertKind, string>> = {
+  replicationPending:
+    'The leader is still waiting to hand a change of roles, grants or settings to a server it could not reach. Until it arrives, a role that was disabled, changed or dropped may still work on that server.',
+}
+
+/** The extra sentence for an alert kind, or null. */
+export function alertKindHint(kind: string): string | null {
+  return (ALERT_KIND_HINT as Record<string, string | undefined>)[kind] ?? null
 }

@@ -14,6 +14,7 @@ import QueryBoundary from '@/components/QueryBoundary.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
 import GateButton from '@/components/GateButton.vue'
 import NullableValue from '@/components/NullableValue.vue'
+import OwnFingerprint from '@/components/OwnFingerprint.vue'
 import ResourceMeter from '@/components/ResourceMeter.vue'
 import LocalSettingsPanel from '@/components/this-server/LocalSettingsPanel.vue'
 import InstanceActionDialog from '@/components/this-server/InstanceActionDialog.vue'
@@ -90,6 +91,15 @@ const percentText = (v: number) => percent(v)
             info.data.value.isManagerLeader ? 'Manager leader' : 'Not the manager leader'
           }}</span>
         </div>
+      </section>
+
+      <section class="card stack" aria-labelledby="fp-h" data-testid="this-server-fingerprint">
+        <h2 id="fp-h">Fingerprint of this server</h2>
+        <OwnFingerprint
+          :fingerprint="info.data.value.internalFingerprint"
+          purpose="The SHA-256 fingerprint of the certificate that the internal API of this server presents now. An administrator who joins a new server to this cluster through this server (the join form of the new server) pins it; give it to them by a way other than the network between the servers."
+          fallback="This server does not report its fingerprint. Read it as the SHA-256 of the file pki/server.crt in its data directory."
+        />
       </section>
 
       <section class="card stack" aria-labelledby="svc-h">

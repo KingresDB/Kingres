@@ -3,11 +3,13 @@
 <script setup lang="ts">
 // First-run wizard, shown while the server is `uninitialized`:
 //   1. setup token  2. create a cluster or join one  3. task progress  4. hand-off to sign-in.
-import { computed, onBeforeUnmount, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useQueryClient } from '@tanstack/vue-query'
 import FormField from '@/components/FormField.vue'
-import FingerprintHelp from '@/components/FingerprintHelp.vue'
+import PinChoice from '@/components/PinChoice.vue'
+import OwnFingerprint from '@/components/OwnFingerprint.vue'
+import SafeName from '@/components/SafeName.vue'
 import { fingerprintError, normalizeFingerprint } from '@/lib/fingerprint'
 import BrandLogo from '@/components/BrandLogo.vue'
 import ProblemNotice from '@/components/ProblemNotice.vue'
@@ -65,6 +67,18 @@ const join = reactive({
   serverGroup: '',
   expectedFingerprint: '',
 })
+/** The person chose to skip the check (never pre-selected): sent as `allowUnpinned: true`. */
+const joinUnpinned = ref(false)
+/** This server's own fingerprint, when the server reports it (loopback caller or valid setup token). */
+const ownFingerprint = ref<string | null>(null)
+async function loadOwnFingerprint(): Promise<void> {
+  try {
+    ownFingerprint.value = (await endpoints.getNodeState()).internalFingerprint ?? null
+  } catch {
+    ownFingerprint.value = null
+  }
+}
+onMounted(() => void loadOwnFingerprint())
 
 /** Last task seen by the wizard; shown if a poll briefly reports no setup task. */
 let lastTask: Task | null = null
@@ -81,7 +95,7 @@ function taskFromSummary(summary: SetupTaskSummary): Task {
       steps: summary.steps.map((s) => ({ name: s.name, state: s.state })),
     },
     error: summary.error,
-    detail: null,
+    detail: summary.detail ?? null,
     subject: { type: 'cluster', id: 'cluster' },
     cancellable: false,
     createdAt: summary.createdAt,
@@ -137,9 +151,9 @@ const joinAction = useTaskAction(
         dataPaths: { dataDirectory: join.dataDirectory },
         memoryQuota: { totalMegabytes: join.memoryMb },
         serverGroup: join.serverGroup || null,
-        ...(join.expectedFingerprint.trim()
-          ? { expectedFingerprint: normalizeFingerprint(join.expectedFingerprint) }
-          : {}),
+        ...(joinUnpinned.value
+          ? { allowUnpinned: true }
+          : { expectedFingerprint: normalizeFingerprint(join.expectedFingerprint) }),
       }),
     ),
   { fetchTask: readSetupTask },
@@ -174,7 +188,11 @@ const joinErrors = computed(() =>
     'admin.username': firstError(join.adminUser, required('The user name')),
     'admin.password': firstError(join.adminPassword, required('The password')),
     'dataPaths.dataDirectory': firstError(join.dataDirectory, absolutePath('The data directory')),
-    expectedFingerprint: fingerprintError(join.expectedFingerprint),
+    expectedFingerprint: joinUnpinned.value
+      ? undefined
+      : join.expectedFingerprint.trim() === ''
+        ? 'Enter the fingerprint of the existing server, or choose below to trust whatever answers at the address.'
+        : fingerprintError(join.expectedFingerprint),
   }),
 )
 
@@ -182,8 +200,12 @@ const joinErrors = computed(() =>
 const serverErrors = computed(() =>
   action.value.error.value ? describeProblem(action.value.error.value).fieldErrors : {},
 )
-const errors = computed(() => ({
+const errors = computed<Record<string, string | undefined>>(() => ({
   ...serverErrors.value,
+  // The contract names a body property by JSON Pointer; the forms key it without the slash.
+  ...(serverErrors.value['/expectedFingerprint']
+    ? { expectedFingerprint: serverErrors.value['/expectedFingerprint'] }
+    : {}),
   ...(submitted.value ? (mode.value === 'create' ? createErrors.value : joinErrors.value) : {}),
 }))
 
@@ -203,6 +225,8 @@ async function acceptToken(): Promise<void> {
   try {
     await endpoints.checkSetupToken()
     step.value = 'choose'
+    // With the token the server may now tell this server's own fingerprint.
+    void loadOwnFingerprint()
   } catch (error) {
     setSetupToken(null)
     tokenError.value = error
@@ -315,6 +339,14 @@ async function finish(): Promise<void> {
             </div>
           </section>
         </div>
+        <section class="card stack" aria-labelledby="own-fp-h">
+          <h2 id="own-fp-h">Fingerprint of this server</h2>
+          <OwnFingerprint
+            :fingerprint="ownFingerprint"
+            purpose="If an administrator adds this server from the panel of a cluster (Add server), they pin this fingerprint. Give it to them by a way other than the network between the two servers."
+            fallback="This server does not report its fingerprint here (it does so only to a request from the machine itself, or with the setup token). Read it in the log of this server, in the line bootstrap certificate of the internal API."
+          />
+        </section>
         <div>
           <button type="button" class="btn btn-link" @click="step = 'token'">
             Change setup token
@@ -481,21 +513,13 @@ async function finish(): Promise<void> {
           >
             <input v-bind="slot" v-model="join.address" class="input mono" data-autofocus />
           </FormField>
-          <FormField
-            v-slot="slot"
-            label="Expected fingerprint (recommended)"
-            hint="SHA-256 of that server's internal certificate, 64 hex digits; colons are allowed."
+          <PinChoice
+            v-model:fingerprint="join.expectedFingerprint"
+            v-model:unpinned="joinUnpinned"
+            purpose="join"
+            hint="SHA-256 of that server's internal certificate, 64 hex digits; colons are allowed. Read it on that server's This server page."
             :error="errors.expectedFingerprint"
-          >
-            <input
-              v-bind="slot"
-              v-model="join.expectedFingerprint"
-              class="input mono"
-              autocomplete="off"
-              spellcheck="false"
-            />
-          </FormField>
-          <FingerprintHelp purpose="join" />
+          />
           <FormField
             v-slot="slot"
             label="Administrator user name"
@@ -569,11 +593,15 @@ async function finish(): Promise<void> {
             This server is ready. Sign in with the administrator account.
           </p>
           <p v-if="mode === 'join'" class="muted" data-testid="join-fingerprint-note">
-            {{
-              join.expectedFingerprint.trim()
-                ? 'You gave a fingerprint and the panel sent it with the request. The server does not report whether it checked it, so this page cannot say whether the certificate was the expected one. Compare the fingerprint with the log of the existing server.'
-                : 'No fingerprint was given, so the certificate of the existing server was trusted on first contact. After you sign in, the fingerprint it presented is in the detail of the setup task (Tasks page), if the server reports it; compare it with the log of the existing server.'
-            }}
+            <template v-if="action.task.value?.detail"
+              >What the server reports about the first contact:
+              <SafeName :value="action.task.value.detail" kind="text" :max="500" multiline
+            /></template>
+            <template v-else
+              >The server did not report whether the certificate of the existing server was checked,
+              so this page cannot say. Compare the fingerprint with the one on the This server page
+              of the existing server.</template
+            >
           </p>
           <div>
             <button type="button" class="btn btn-primary" @click="finish">

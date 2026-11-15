@@ -65,6 +65,14 @@ export interface paths {
          *     of at least one of the four cluster roles. The response also carries the cluster name and id so that
          *     every signed-in user (including one with only `kingres_stats`) can render the application shell.
          *     Rate limited (429).
+         *
+         *     **A session belongs to the server that created it** (stated in 0.6.0; the server always behaved
+         *     so). The cookie and the bearer token are random values that exist only in the memory of the server
+         *     that answered `login`: the same value presented to another server of the cluster is answered
+         *     401 `unauthenticated`, and a restart of the server ends its sessions. A client that talks to several
+         *     servers (a load balancer, a failover to another address) signs in once per server and keeps one
+         *     credential per address. Whichever server a request reaches, the cluster operations in it are run by
+         *     the manager leader for the role of the session.
          */
         post: operations["login"];
         delete?: never;
@@ -106,6 +114,17 @@ export interface paths {
          *     `csrfToken` in the response is the session's current token. This operation never rotates the token:
          *     the token changes only when a new session is created by `login`. For bearer authentication
          *     `csrfToken` is null.
+         *
+         *     **Sessions belong to one server** (stated here from 0.6.0; the behaviour is older). A cookie or token
+         *     issued by one server is unknown to every other server of the cluster (401 `unauthenticated` there); a
+         *     client that talks to several servers signs in on each. `serverId` names the server that issued the session.
+         *
+         *     **While the system database of this server is stopped** (`stopThisServerInstance`) this operation keeps
+         *     working for a session this server has already checked since it started: it answers from memory with
+         *     `degraded: true`, the roles of the last successful check (at most one hour old), the CSRF token and the
+         *     cluster identity, so that a reloaded panel can learn which instance to start. A session this server never
+         *     checked, a session of a role that was changed (`Changed` ends it), expired, or checked and refused, gets
+         *     the same 503 `system_database_stopped` as every other operation.
          */
         get: operations["getSession"];
         put?: never;
@@ -268,6 +287,11 @@ export interface paths {
         /**
          * List local PostgreSQL instances
          * @description Instances running on this server with their roles (primary or standby of a shard group).
+         *
+         *     While the system database of this server is stopped (`stopThisServerInstance`) this operation answers from
+         *     the memory of this server, like `getSession`: the list of the last successful read, with `state` taken from
+         *     the instance manager and `sizeBytes` and the replication lags null. If this server never read the list,
+         *     or the session was never checked, it answers 503 `system_database_stopped`.
          */
         get: operations["listThisServerInstances"];
         put?: never;
@@ -355,8 +379,13 @@ export interface paths {
          *     `done` immediately before the shutdown is requested (no write is possible afterwards); the task is
          *     corrected to `failed` if the instance does not stop. The API keeps answering from this process
          *     while the instance is stopped, but every operation that needs the system database or a role check
-         *     in PostgreSQL, that is `login` and every authenticated operation except `startThisServerInstance`,
-         *     answers **503 `system_database_stopped`** until the instance runs again. `getHealth`,
+         *     in PostgreSQL, that is `login` and every authenticated operation except the three listed here,
+         *     answers **503 `system_database_stopped`** until the instance runs again. **The operations that work in this
+         *     state** (from 0.6.0; an existing session whose roles this server checked before the stop is needed for all of
+         *     them) are `startThisServerInstance`, `getSession` (answer marked `degraded`) and `listThisServerInstances`
+         *     (answer from memory); no other operation, `getThisServerInstance` included. The state begins when the stop (or
+         *     a restart) is accepted, not when PostgreSQL ends the connections, so `system_database_stopped` is the only
+         *     503 a client sees in that window (an older revision could answer `service_unavailable` for about a second). `getHealth`,
          *     `getReadiness` and `getNodeState` keep answering. A server that forwards a mutating operation to
          *     this leader relays the same 503.
          */
@@ -386,7 +415,7 @@ export interface paths {
          *     or restart of this instance is running).
          *
          *     This operation **keeps working while the system database is stopped** (see
-         *     `stopThisServerInstance`). For it alone, the session or bearer token is checked in memory and the
+         *     `stopThisServerInstance`). For it (and, from 0.6.0, for `getSession` and `listThisServerInstances`) the session or bearer token is checked in memory and the
          *     cluster roles of the last successful role check are used instead of failing closed with 503. A
          *     sign-in that was valid before the stop therefore still works; a new sign-in is impossible until the
          *     instance runs (`login` answers 503 `system_database_stopped`), and when no valid session exists the
@@ -570,6 +599,14 @@ export interface paths {
          *     with its setup token, which performs the same join as the first-run wizard. The server appears as
          *     `pendingRebalance`; adding and rebalancing are two separate steps and no data moves until
          *     `POST /rebalance` is called. Long-running: returns a task.
+         *
+         *     **Requires `kingres_admin` (0.6.0; `kingres_ops` before, which was a privilege escalation).** Adding a
+         *     server gives it a certificate of the cluster and, later in the same task, every role with its password
+         *     verifier; whoever may do that may become any role. `joinCluster` has always required an administrator.
+         *     The certificate is issued, and the verifiers are sent, only for a request that an administrator made
+         *     and that named the server's certificate (see `AddServerRequest.expectedFingerprint` and
+         *     `allowUnpinned`); a server that holds a certificate but has not finished joining (`status` still
+         *     pending) may make no other call to the cluster.
          */
         post: operations["addServer"];
         delete?: never;
@@ -1516,6 +1553,12 @@ export interface paths {
          *     `revision` must equal the current revision, otherwise 409 (optimistic concurrency). Node-to-node
          *     rules for cluster members are added by the system and cannot be removed. A rule set that would lock
          *     out the caller's own address is rejected with 422. Returns a task that finishes when all servers applied it.
+         *
+         *     **Dry run (0.6.0).** With `dryRun=true` the request is checked exactly as for a real change (body
+         *     validation, `revision` conflict 409, the lock-out rule 422) and nothing is changed: no task is created, no
+         *     rule is applied, nothing is written to the audit log. A request that would be accepted answers 200
+         *     `NetworkAccessCheck`; one that would be refused answers the same problem as without the flag. The
+         *     panel can use it to show the outcome (for example the lock-out) before the administrator confirms.
          */
         put: operations["replaceNetworkAccess"];
         post?: never;
@@ -1535,6 +1578,22 @@ export interface paths {
         /**
          * List audit events
          * @description Append-only log of sign-ins and every administrative action through the panel, CLI or REST API, newest first.
+         *
+         *     **Answers for the whole cluster from any server (0.6.0).** Every server writes its own audit file: a
+         *     sign-in is recorded by the server that took it, an administrative action by the manager leader that ran
+         *     it (also when it arrived at another server). The server that receives the request asks every other
+         *     server for its part (as `listLogs` does), merges the answers newest first (by `timestamp`, then
+         *     `id`) and names the servers that did not answer in `missingServers` (`partial: true`): an
+         *     administrator never sees a log that silently lacks a server. Events of a server that was removed from
+         *     the cluster are gone with it. `AuditEvent.id` is unique in the cluster (see there) and
+         *     `AuditEvent.serverId` names the server whose log holds the event. A cursor is valid for the whole
+         *     cluster-wide listing and not across revisions (a cursor of 0.5.0 is refused with 400 `validation_failed`).
+         *
+         *     **Operations are not run while the audit log cannot be written (0.6.0).** A mutating operation by an
+         *     authenticated caller is answered 503 `service_unavailable` before it has any effect when the server
+         *     that would run it cannot write its audit file (full disk, lost file); reads and `login` are not
+         *     refused. A write that fails after the operation ran (the disk filled in between) is logged by the
+         *     server and cannot be undone.
          */
         get: operations["listAuditEvents"];
         put?: never;
@@ -1800,8 +1859,21 @@ export interface paths {
          * Execute a SQL statement
          * @description Runs one SQL statement against a database as the signed-in PostgreSQL role (so PostgreSQL
          *     privileges apply) through the client router. The result is cut at `rowLimit` rows and aborted after
-         *     `timeoutMs`. Statements that fail return 422 with code `sql_error` and the SQLSTATE in `sqlState`.
+         *     `timeoutMs`. Statements that fail return 422 with code `sql_error` and the SQLSTATE in `sqlState`; that
+         *     includes a statement that ran into `timeoutMs` (SQLSTATE `57014`), whatever `timeoutMs` is (0.6.0: the
+         *     server's request timeout no longer ends a statement earlier, and an answer of `503` is no longer
+         *     possible for a statement that merely ran long).
          *     Every execution is written to the audit log. Multiple statements per request are not allowed.
+         *
+         *     **What a cut result means (0.6.0).** A plain read (a statement that starts with `SELECT`, `TABLE`,
+         *     `VALUES` or `SHOW`) is stopped when its result passes `rowLimit` or the byte budget; it changed nothing
+         *     and `truncated` is true. Any other statement (`INSERT`, `UPDATE`, `DELETE` with `RETURNING`, a `WITH` that
+         *     changes data, ...) is **never cut short**: its remaining rows are read and dropped so that it completes
+         *     and is committed, `truncated` is true, `commandTag` is PostgreSQL's real tag and `rowCount` is the number
+         *     of rows it affected. A value larger than 1 MiB, or a row larger than 16 MiB, fails the statement with 422
+         *     `unprocessable` (a statement that is not a plain read is rolled back in that case, as for any failure).
+         *     A role can run at most two statements at a time on one server (the server runs four in all); further
+         *     ones answer 503 `service_unavailable` with `Retry-After`.
          */
         post: operations["executeQuery"];
         delete?: never;
@@ -1931,12 +2003,18 @@ export interface components {
          *     leader does not hold it; `renewServerCertificates`, `revokeServerCertificates`, `addServer`, `removeServer`,
          *     `leaveCluster`, `joinCluster`). Clients must tolerate codes they do not know.
          *
+         *     Added in 0.6.0: `internal_api_disabled` (409: the server was started without its internal API, so it cannot
+         *     take part in a cluster; `addServer`, `removeServer`, `leaveCluster`, `renewServerCertificates`,
+         *     `revokeServerCertificates`). It is a state of the server's configuration, not a missing feature: start
+         *     `kingresd` with an internal listen address. Before 0.6.0 these operations answered 422
+         *     `unsupported_operation`, which a client showed as "not implemented in this version".
+         *
          *     503 (cannot serve now): `node_uninitialized`, `map_group_unavailable`, `leader_unavailable`,
          *     `quorum_unavailable`, `service_unavailable`, `system_database_stopped` (the instance that hosts the
          *     system database was stopped on purpose; start it with `startThisServerInstance`).
          * @enum {string}
          */
-        ProblemCode: "bad_request" | "validation_failed" | "unauthenticated" | "invalid_credentials" | "session_expired" | "csrf_token_invalid" | "forbidden" | "setup_token_invalid" | "not_found" | "method_not_allowed" | "conflict" | "already_exists" | "immutable_field" | "rebalance_in_progress" | "operation_in_progress" | "task_not_cancellable" | "last_admin" | "role_in_use" | "optimistic_lock_failed" | "no_replica_available" | "instance_already_running" | "instance_already_stopped" | "server_owns_buckets" | "server_hosts_map_group" | "last_server" | "server_group_not_empty" | "ledger_entry_pending" | "quorum_unavailable" | "system_database_stopped" | "unprocessable" | "sql_error" | "unsupported_operation" | "node_state_invalid" | "node_uninitialized" | "map_group_unavailable" | "leader_unavailable" | "rate_limited" | "service_unavailable" | "internal_error" | "certificate_revoked" | "certificate_authority_unavailable";
+        ProblemCode: "bad_request" | "validation_failed" | "unauthenticated" | "invalid_credentials" | "session_expired" | "csrf_token_invalid" | "forbidden" | "setup_token_invalid" | "not_found" | "method_not_allowed" | "conflict" | "already_exists" | "immutable_field" | "rebalance_in_progress" | "operation_in_progress" | "task_not_cancellable" | "last_admin" | "role_in_use" | "optimistic_lock_failed" | "no_replica_available" | "instance_already_running" | "instance_already_stopped" | "server_owns_buckets" | "server_hosts_map_group" | "last_server" | "server_group_not_empty" | "ledger_entry_pending" | "quorum_unavailable" | "system_database_stopped" | "unprocessable" | "sql_error" | "unsupported_operation" | "node_state_invalid" | "node_uninitialized" | "map_group_unavailable" | "leader_unavailable" | "rate_limited" | "service_unavailable" | "internal_error" | "certificate_revoked" | "certificate_authority_unavailable" | "internal_api_disabled";
         /** @description One invalid field of a request. */
         ValidationIssue: {
             /** @description JSON Pointer (RFC 6901) to the invalid property of the request body, or the name of the invalid query or path parameter. */
@@ -2048,6 +2126,21 @@ export interface components {
             clusterName: string | null;
             /** @description Bearer token; only present in the login response when `issueToken` was true. */
             token?: string | null;
+            /**
+             * @description Added in 0.6.0, optional. The network address (IP, no port) this server saw the request come from, in
+             *     `login` and `getSession`. It is the address of the TCP peer: behind a reverse proxy it is the proxy's.
+             */
+            clientAddress?: string;
+            /**
+             * @description Added in 0.6.0, optional (absent means false). True when the answer was given from the memory of this
+             *     server because the instance that hosts its system database is stopped (see `stopThisServerInstance`):
+             *     `clusterRoles` are those of the last successful role check of this server, `serverId` may be null
+             *     although the server is in a cluster, and nothing was read from the database. Only `getSession` can answer
+             *     like this, and only for a session this server has checked before the stop.
+             */
+            degraded?: boolean;
+            /** @description Added in 0.6.0, optional. A sentence that says why `degraded` is true; present only then. */
+            degradedReason?: string;
         };
         /**
          * @description Lifecycle state of a server.
@@ -2105,6 +2198,13 @@ export interface components {
             progressPercent: number;
             /** @description Failure information; null unless `state` is `failed`. */
             error: components["schemas"]["TaskError"] | null;
+            /**
+             * @description Added in 0.6.0, optional (absent from a server of an older revision). The same text as `Task.detail`:
+             *     for `cluster.join` the fingerprint of the existing server's certificate that was checked ("pinned") or
+             *     only seen ("first use, not verified"), so that the wizard can show it. Null when the running step
+             *     recorded none.
+             */
+            detail?: string | null;
         };
         /** @description Setup state of a server. */
         NodeStateInfo: {
@@ -2133,6 +2233,16 @@ export interface components {
              *     from acceptance on, and kept after the task finished and after the node left `uninitialized`.
              */
             setupTask: components["schemas"]["SetupTaskSummary"] | null;
+            /**
+             * @description Added in 0.6.0, optional. SHA-256 fingerprint of the certificate this server's internal API presents to
+             *     a server that adds it (`addServer`) while it is `uninitialized`: what an administrator pins as
+             *     `AddServerRequest.expectedFingerprint`. It is not a secret (every machine that reaches the internal
+             *     port sees the certificate), but the pin only protects when it comes by another way than the channel
+             *     it protects, so the server answers it only to a request from the machine itself, which is where the
+             *     setup wizard runs (`localhostOnly`); for every other caller, and once the server belongs to a cluster
+             *     (then see `LocalServerInfo.internalFingerprint`), it is null.
+             */
+            internalFingerprint?: components["schemas"]["Sha256Hex"] | null;
         };
         /**
          * @description Address of a server's panel and REST API as host:port, host being a DNS name, IPv4 or bracketed IPv6 address and port a number from 1 to 65535.
@@ -2207,12 +2317,23 @@ export interface components {
             advertiseAddress?: components["schemas"]["NodeAddress"] | null;
             /**
              * @description SHA-256 fingerprint (hex, colons allowed) that the internal certificate of the existing server must
-             *     have. With it, a different certificate is refused before the administrator's password is sent; without
-             *     it the fingerprint seen is only recorded (trust on first use). Replaces the header
-             *     `X-Kingres-Pin-Sha256` of 0.3.0, which is still accepted; both must agree if both are given. The
-             *     internal API of a server is at its REST host and the port above its REST port.
+             *     have. With it, a different certificate is refused before the administrator's password is sent. From
+             *     0.6.0 one of `expectedFingerprint` and `allowUnpinned: true` is required (see there); a malformed
+             *     value is 400 `validation_failed`. Replaces the header `X-Kingres-Pin-Sha256` of 0.3.0, which is
+             *     still accepted; both must agree if both are given. The internal API of a server is at its REST host
+             *     and the port above its REST port. An administrator reads the value on the existing server's panel
+             *     (`internalFingerprint` of `GET /this-server`).
              */
             expectedFingerprint?: string | null;
+            /**
+             * @description Added in 0.6.0. Without an `expectedFingerprint` the administrator's user name and password are sent
+             *     to whatever certificate answers at `existingNodeAddress` (trust on first use), where a machine on the
+             *     path receives them. Since 0.6.0 such a request is refused with 400 `validation_failed`
+             *     (`errors[].field` `/expectedFingerprint`, code `required`) unless `allowUnpinned` is true, which is
+             *     the administrator's explicit acceptance of that risk. Ignored when a fingerprint is given.
+             * @default false
+             */
+            allowUnpinned?: boolean;
         };
         /**
          * @description A process role inside `kingresd` or a bundled component.
@@ -2262,6 +2383,13 @@ export interface components {
             isManagerLeader: boolean;
             /** @description Status of the local services. */
             services: components["schemas"]["ServiceStatus"][];
+            /**
+             * @description Added in 0.6.0, optional. SHA-256 fingerprint of the certificate this server's internal API presents
+             *     now (its cluster certificate); what an administrator pins as `JoinClusterRequest.expectedFingerprint`
+             *     when another server joins through this one. Null when the server has no certificate. It follows a
+             *     certificate renewal.
+             */
+            internalFingerprint?: components["schemas"]["Sha256Hex"] | null;
         };
         /** @description CPU usage. A value the server cannot measure is null ("not available"), never 0. */
         CpuUsage: {
@@ -2397,6 +2525,12 @@ export interface components {
         LogComponent: "api" | "agent" | "manager" | "router" | "etcd" | "patroni" | "postgres" | "metrics";
         /** @description Settings of this server only. */
         LocalSettings: {
+            /**
+             * @description The directories of this server. In this answer `walDirectory` and `logDirectory` are always
+             *     present (0.6.0 states it; 0.5.0 left them out when they were not set): `null` means the default
+             *     named in `DataPaths`, otherwise the absolute path. They stay optional in `DataPaths` because
+             *     the setup requests may leave them out.
+             */
             dataPaths: components["schemas"]["DataPaths"];
             memoryQuota: components["schemas"]["MemoryQuota"];
             logLevel: components["schemas"]["LogLevel"];
@@ -2485,6 +2619,12 @@ export interface components {
          * @description `live` healthy; `suspect` heartbeats are late; `draining` being emptied before removal;
          *     `decommissioning` rebalance away from it is running; `dead` no liveness for the failure timeout;
          *     `pendingRebalance` joined but holds no data yet.
+         *
+         *     `pendingRebalance` (0.6.0 states what decides it): the server should hold shards, it is the primary of no
+         *     bucket, and buckets exist in the cluster. The replicas of a neighbouring group's buckets that a joining
+         *     server gets a standby for do not count as data; the same server was `live` in one answer and
+         *     `pendingRebalance` in the next while that copy was still running. Every server answers the same for the
+         *     same catalog.
          * @enum {string}
          */
         ServerStatus: "live" | "suspect" | "draining" | "decommissioning" | "dead" | "pendingRebalance";
@@ -2668,12 +2808,12 @@ export interface components {
             version: string | null;
             /**
              * Format: int64
-             * @description Seconds since `kingresd` started; null when not available (the server's agent is not reachable).
+             * @description Seconds since `kingresd` started; null when not available (the server's agent is not reachable). Since 0.6.0 every server that answers the manager's question has one, not only the server that served the request.
              */
             uptimeSeconds: number | null;
             /**
              * Format: date-time
-             * @description When the server joined the cluster; null when not available.
+             * @description When the server joined the cluster (the manager leader's record); null when not available. Set for every server of a cluster since 0.6.0 (it was always null before).
              */
             joinedAt: string | null;
             /**
@@ -2752,11 +2892,23 @@ export interface components {
             /**
              * @description SHA-256 fingerprint (hex, colons allowed) that the bootstrap certificate of the new server must have
              *     (the server logs it at start). With it, a different certificate is refused before the setup token is
-             *     sent; without it the fingerprint seen is only recorded (trust on first use). Replaces the header
+             *     sent. From 0.6.0 one of `expectedFingerprint` and `allowUnpinned: true` is required (see there). A
+             *     malformed value is 400 `validation_failed` on every server, also when the request is sent to a server
+             *     that is not the manager leader, and the pin is kept on the way to the leader. Replaces the header
              *     `X-Kingres-Pin-Sha256` of 0.3.0, which is still accepted; both must agree if both are given. The
-             *     internal API of the new server is at its REST host and the port above its REST port.
+             *     internal API of the new server is at its REST host and the port above its REST port. The new server
+             *     shows the value in `GET /node` (`internalFingerprint`) on its own panel.
              */
             expectedFingerprint?: string | null;
+            /**
+             * @description Added in 0.6.0. Without an `expectedFingerprint` the first contact trusts whatever certificate answers
+             *     at `address` (trust on first use): a machine on the path then receives the setup token and a
+             *     certificate of the cluster. Since 0.6.0 such a request is refused with 400 `validation_failed`
+             *     (`errors[].field` `/expectedFingerprint`, code `required`) unless `allowUnpinned` is true, which
+             *     is the administrator's explicit acceptance of that risk. Ignored when a fingerprint is given.
+             * @default false
+             */
+            allowUnpinned?: boolean;
         };
         /**
          * @description Partial update of a server. Only these two members exist; every other property of `Server` is
@@ -3910,6 +4062,16 @@ export interface components {
                 error: string | null;
             }[];
         };
+        /** @description Added in 0.6.0. The answer of a dry run of `replaceNetworkAccess`. A change that would be refused is answered with a problem, never with `valid` false. */
+        NetworkAccessCheck: {
+            /** @description Always true. */
+            valid: boolean;
+            /**
+             * Format: int64
+             * @description The current revision of the rule set, which the request matched.
+             */
+            revision: number;
+        };
         /** @description The complete new rule set. */
         NetworkAccessUpdateRequest: {
             /**
@@ -3941,7 +4103,10 @@ export interface components {
         AuditEvent: {
             /**
              * Format: int64
-             * @description Monotonic event identifier.
+             * @description Event identifier, unique in the cluster. From 0.6.0 the high bits are the ordinal of the server
+             *     whose log holds the event (as for `Alert.id`) and the low 32 bits count that server's events, so
+             *     the ids of one server increase but those of the cluster do not form a sequence. A client must treat
+             *     the id as an opaque number below 2^53.
              */
             id: number;
             /**
@@ -3975,12 +4140,18 @@ export interface components {
             details?: {
                 [key: string]: unknown;
             };
+            /** @description Added in 0.6.0, optional. The server whose audit log holds the event (the one that wrote it); absent when the server has no cluster identity yet. */
+            serverId?: string;
         };
         /** @description A page of audit events. */
         AuditPage: {
             /** @description Events, newest first. */
             items: components["schemas"]["AuditEvent"][];
             nextCursor: components["schemas"]["NextCursor"];
+            /** @description Added in 0.6.0, optional. True when at least one other server did not answer (see `MissingServer`); the page holds what the servers that answered know. */
+            partial?: boolean;
+            /** @description Added in 0.6.0, optional. The servers that did not answer, sorted by id; absent when `partial` is false. */
+            missingServers?: components["schemas"]["MissingServer"][];
         };
         /** @description Cluster-wide settings. */
         ClusterSettings: {
@@ -4147,7 +4318,16 @@ export interface components {
             /** @description Destination-specific reference, for example an object URL or transaction id. */
             reference?: string | null;
         };
-        /** @description A database digest, the latest block hash of every chain at one moment. */
+        /**
+         * @description A database digest, the latest block hash of every chain at one moment.
+         *
+         *     **Which chains it holds (0.6.0).** A digest is made by one server and holds the chain of that server's
+         *     shard group. `complete` says whether that is every shard group of the database; when it is not,
+         *     `uncoveredShardGroupIds` names the groups whose chains are **not** in this digest (and so are not
+         *     anchored by it) and `aggregateHash` is null. A client or auditor must not read a digest with
+         *     `complete: false` as a statement about the whole database. The groups are those of the database at the time
+         *     of the answer, also for a digest that was made earlier.
+         */
         LedgerDigest: {
             /**
              * Format: int64
@@ -4172,6 +4352,11 @@ export interface components {
                  *     (snake_case members `database`, `chain_id`, `hash_version`, `height`, `block_hash`,
                  *     `block_closed_at`, `generated_at`). Store it outside the database and give it unchanged to
                  *     `kingres-verify --digest`. `blockHeight` and `blockHash` repeat `height` and `block_hash`.
+                 *     **Clients must keep the bytes of this member exactly as received** (the verifier checks the
+                 *     document the extension wrote; a client that parses and re-serializes it, for example to reorder
+                 *     keys, change white space or number formats, may produce a document that no longer verifies):
+                 *     copy the member's text out of the response, or keep the response, instead of re-encoding the
+                 *     parsed object.
                  */
                 document: {
                     [key: string]: unknown;
@@ -4192,6 +4377,10 @@ export interface components {
             aggregateHash: components["schemas"]["Sha256Hex"] | null;
             /** @description Anchoring destinations; empty until anchoring is configured. */
             anchors: components["schemas"]["DigestAnchor"][];
+            /** @description Added in 0.6.0, optional (a 0.6.0 server always sends it). True when `chains` holds the chain of every shard group of the database; false when `uncoveredShardGroupIds` is not empty. */
+            complete?: boolean;
+            /** @description Added in 0.6.0, optional (a 0.6.0 server always sends it, empty when `complete`). Shard groups of the database whose chains this digest does not contain. */
+            uncoveredShardGroupIds?: number[];
         };
         /** @description A page of digests. */
         LedgerDigestPage: {
@@ -4244,6 +4433,13 @@ export interface components {
          *     `inconsistencies` empty, the cause being in the error of the task `taskId`. `scope` is `full` when
          *     the run started at height 0 and `sinceLastVerified` otherwise; `digestId` is null (a run against
          *     a given digest is not supported yet).
+         *
+         *     **What it covered (0.6.0).** A run checks one chain, that of the shard group of the server that ran it.
+         *     `state: passed` means that chain was checked and is clean. `complete` says whether that chain is the
+         *     whole database; when it is not, `uncoveredShardGroupIds` names the shard groups that were **not**
+         *     checked, and `passed` must not be read as a statement about them. A task of the verification that ends
+         *     `done` always leaves a record: when nothing is new since the last clean run, the head block is checked
+         *     again (and an empty ledger fails the task).
          */
         LedgerVerification: {
             /**
@@ -4293,6 +4489,10 @@ export interface components {
             rowsChecked: number | null;
             /** @description Findings; empty when the state is `passed`. */
             inconsistencies: components["schemas"]["LedgerInconsistency"][];
+            /** @description Added in 0.6.0, optional (a 0.6.0 server always sends it). True when the checked chain is every shard group of the database. */
+            complete?: boolean;
+            /** @description Added in 0.6.0, optional (a 0.6.0 server always sends it, empty when `complete`). Shard groups of the database that this run did not check. */
+            uncoveredShardGroupIds?: number[];
         };
         /** @description A page of verification runs. */
         LedgerVerificationPage: {
@@ -4364,6 +4564,14 @@ export interface components {
              */
             closed_at_us: number;
             block_hash?: components["schemas"]["Sha256Hex"];
+        };
+        /**
+         * @description The block that holds the transaction of an inclusion proof: a `LedgerProofBlockHeader` whose
+         *     `block_hash` is required. (0.6.0: a named schema instead of an inline `allOf` whose second branch had
+         *     no properties, which code generators turned into an unusable type; the JSON is unchanged.)
+         */
+        LedgerProofBlock: components["schemas"]["LedgerProofBlockHeader"] & {
+            block_hash: components["schemas"]["Sha256Hex"];
         };
         /**
          * @description The inclusion proof of one row version, **exactly the JSON document that
@@ -4453,8 +4661,7 @@ export interface components {
             tx_index: number;
             /** @description Sibling hashes from the transaction leaf to `block.tx_merkle_root`. */
             tx_path: components["schemas"]["Sha256Hex"][];
-            /** @description The block that holds the transaction; `block_hash` is required here. */
-            block: components["schemas"]["LedgerProofBlockHeader"] & Record<string, never>;
+            block: components["schemas"]["LedgerProofBlock"];
             /** @description Headers of the blocks after `block`, up to the latest block when the proof was made (empty when `block` was the latest). `block_hash` is optional here; when present it is checked. */
             chain: components["schemas"]["LedgerProofBlockHeader"][];
         } & {
@@ -4510,10 +4717,13 @@ export interface components {
          */
         AlertState: "open" | "acknowledged" | "resolved";
         /**
-         * @description Alert type.
+         * @description Alert type. Clients must tolerate kinds they do not know. Added in 0.6.0: `replicationPending` (the manager
+         *     leader keeps a change to roles, grants or settings waiting for a server that could not be reached; until the
+         *     change arrives, a role that was disabled, changed or dropped may still work on that server. `subject` is
+         *     `server:<leader>|behind:<server>`, `warning` after a minute, `critical` after ten).
          * @enum {string}
          */
-        AlertKind: "serverDown" | "serverSuspect" | "underReplicatedBuckets" | "unavailableBuckets" | "replicationLagHigh" | "diskSpaceLow" | "memoryPressure" | "rebalanceNeeded" | "autoFailoverTriggered" | "autoFailoverLimitReached" | "mapGroupUnavailable" | "ledgerVerificationFailed" | "ledgerPendingTooOld" | "versionMismatch" | "certificateExpiring" | "certificateRenewalFailed" | "taskFailed";
+        AlertKind: "serverDown" | "serverSuspect" | "underReplicatedBuckets" | "unavailableBuckets" | "replicationLagHigh" | "diskSpaceLow" | "memoryPressure" | "rebalanceNeeded" | "autoFailoverTriggered" | "autoFailoverLimitReached" | "mapGroupUnavailable" | "ledgerVerificationFailed" | "ledgerPendingTooOld" | "versionMismatch" | "certificateExpiring" | "certificateRenewalFailed" | "replicationPending" | "taskFailed";
         /** @description An alert. */
         Alert: {
             /**
@@ -4703,7 +4913,8 @@ export interface components {
          *     (DDL and topology changes are paused), the manager leader is unreachable, quorum is lost, the
          *     server is shutting down, or the instance that hosts the system database was stopped with
          *     `stopThisServerInstance` (`system_database_stopped`; every authenticated operation except
-         *     `startThisServerInstance` answers it until that instance is started again).
+         *     `startThisServerInstance`, `getSession` and `listThisServerInstances` answers it until that instance is
+         *     started again).
          */
         ServiceUnavailable: {
             headers: {
@@ -6786,7 +6997,10 @@ export interface operations {
     };
     replaceNetworkAccess: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Added in 0.6.0. When true, only check the request (see the description). Default false. */
+                dryRun?: boolean;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -6797,6 +7011,15 @@ export interface operations {
             };
         };
         responses: {
+            /** @description Dry run only (`dryRun=true`) - the change would be accepted. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NetworkAccessCheck"];
+                };
+            };
             202: components["responses"]["AcceptedTask"];
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];

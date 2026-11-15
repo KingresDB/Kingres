@@ -4,7 +4,7 @@
 // Network access rules (the pg_hba.conf rules, applied on every server). The list is replaced as
 // a whole with optimistic concurrency (`revision`). Replacing it changes every server at once and
 // can lock everybody out, so it is only ever done from a confirmation that shows what changes.
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useQuery } from '@tanstack/vue-query'
 import QueryBoundary from '../QueryBoundary.vue'
 import GateButton from '../GateButton.vue'
@@ -12,6 +12,8 @@ import TableWrap from '../TableWrap.vue'
 import TaskActionDialog from '../TaskActionDialog.vue'
 import SafeName from '../SafeName.vue'
 import HiddenPreview from '../HiddenPreview.vue'
+import ProblemNotice from '../ProblemNotice.vue'
+import { ApiError } from '@/api/problem'
 import { endpoints } from '@/api/endpoints'
 import { keys, useRoles } from '@/api/queries'
 import { vBlockEnterSubmit } from '@/lib/forms'
@@ -113,16 +115,20 @@ function discard(): void {
 
 // --- the confirmation ------------------------------------------------------------------------
 
+/** The address the server saw this session come from (contract 0.6.0, `Session.clientAddress`). */
+const sessionAddress = computed(() => session.session?.clientAddress ?? null)
+// An older server does not report it: the address of the last panel action in the audit log is the fallback.
 const ownAddress = useQuery({
   queryKey: computed(() => [...keys.audit, 'own-address', session.username]),
   queryFn: () => endpoints.listAuditEvents({ actor: session.username ?? '', limit: 20 }),
-  enabled: computed(() => !!session.username),
+  enabled: computed(() => !!session.username && sessionAddress.value === null),
 })
-/** The address the server last saw this account use through the panel, if the audit log has one. */
 const knownAddress = computed(
   () =>
+    sessionAddress.value ??
     ownAddress.data.value?.items.find((e) => e.source === 'panel' && e.actorAddress)
-      ?.actorAddress ?? null,
+      ?.actorAddress ??
+    null,
 )
 const administrators = computed(() => {
   const names = (roles.data.value?.items ?? [])
@@ -158,15 +164,65 @@ const review = computed(() => {
     rejectedBy: afterAccess?.result === 'rejected' ? afterAccess.rule + 1 : null,
   }
 })
+// The server decides about the lock-out (its dry run). The panel's own address check is a hint: it
+// asks for the typed confirmation only while the server has not said the rules are acceptable.
+const serverAccepts = computed(() => check.value.state === 'valid')
 const risky = computed(
-  () => review.value.empty || review.value.noAdministrator || review.value.lostAddress,
+  () =>
+    review.value.empty ||
+    review.value.noAdministrator ||
+    (review.value.lostAddress && !serverAccepts.value),
+)
+const confirmDisabled = computed(
+  () => check.value.state === 'checking' || check.value.state === 'refused',
 )
 const plural = (n: number, verb: string) => `${n} rule${n === 1 ? '' : 's'} ${verb}`
+
+// --- the server's dry run (contract 0.6.0) ---------------------------------------------------
+
+type Check =
+  | { state: 'idle' }
+  | { state: 'checking' }
+  | { state: 'valid'; revision: number }
+  | { state: 'refused'; error: ApiError }
+  | { state: 'unavailable'; error: unknown }
+const check = ref<Check>({ state: 'idle' })
+let checkToken = 0
+
+async function runCheck(r: {
+  revision: number
+  tlsRequired: boolean
+  rules: NetworkAccessRule[]
+}): Promise<void> {
+  const mine = ++checkToken
+  check.value = { state: 'checking' }
+  try {
+    const answer = await endpoints.checkNetworkAccess(r)
+    if (mine === checkToken) check.value = { state: 'valid', revision: answer.revision }
+  } catch (error) {
+    if (mine !== checkToken) return
+    // 400, 409 and 422 are the server refusing exactly this change; anything else (503, no answer) is
+    // not an answer about the rules, so it must not block, and the real change is checked again anyway.
+    check.value =
+      error instanceof ApiError && [400, 409, 422].includes(error.status)
+        ? { state: 'refused', error }
+        : { state: 'unavailable', error }
+  }
+}
+onBeforeUnmount(() => {
+  checkToken += 1
+})
 
 function openReview(): void {
   const d = access.data.value
   if (!d) return
   reviewing.value = { revision: d.revision, tlsRequired: tlsRequired.value, rules: edited.value }
+  void runCheck(reviewing.value)
+}
+function closeReview(): void {
+  checkToken += 1
+  check.value = { state: 'idle' }
+  reviewing.value = null
 }
 const start = () => {
   const r = reviewing.value
@@ -334,9 +390,10 @@ const start = () => {
     danger
     wide
     :type-to-confirm="risky ? 'lock out' : undefined"
+    :confirm-disabled="confirmDisabled"
     :start="start"
     :invalidate="[keys.networkAccess, keys.audit]"
-    @close="reviewing = null"
+    @close="closeReview"
     @done="dirty = false"
   >
     <p>
@@ -344,6 +401,44 @@ const start = () => {
       <strong>every server</strong>, and the first matching rule decides who may connect.
     </p>
 
+    <div data-testid="server-check">
+      <p v-if="check.state === 'checking'" class="notice tone-info" role="status">
+        <span aria-hidden="true">&#9680;</span>
+        <span>Asking the server whether it accepts these rules. Nothing is changed by this.</span>
+      </p>
+      <p v-else-if="check.state === 'valid'" class="notice tone-ok" role="status">
+        <span aria-hidden="true">&#10003;</span>
+        <span
+          >The server checked these rules against revision {{ check.revision }} and accepts them,
+          including the check that they do not lock out your own address.
+          <strong>Nothing is saved yet</strong>: the rules apply only when you confirm below.</span
+        >
+      </p>
+      <template v-else-if="check.state === 'refused'">
+        <ProblemNotice :error="check.error" />
+        <p class="notice tone-danger" role="alert">
+          <span aria-hidden="true">&#10006;</span>
+          <span
+            >The server would refuse this change, so it cannot be applied.<template
+              v-if="check.error.status === 409"
+            >
+              The rules were changed by someone else after you opened this page: close this window,
+              use "Discard changes" to load the current rules, and make your change again.</template
+            ><template v-else>
+              Close this window, change the rules and review again.</template
+            ></span
+          >
+        </p>
+      </template>
+      <p v-else-if="check.state === 'unavailable'" class="notice tone-warn" role="status">
+        <span aria-hidden="true">&#9650;</span>
+        <span
+          >The server could not check these rules just now, so this window cannot tell you whether
+          it accepts them. You can still apply them: the server checks them again and refuses a
+          change that locks out your address.</span
+        >
+      </p>
+    </div>
     <div v-if="review.empty" class="notice tone-danger" role="alert">
       <span aria-hidden="true">&#10006;</span>
       <span>The new list is empty. Nobody will be able to connect over the network.</span>
@@ -355,8 +450,17 @@ const start = () => {
         rules afterwards.
       </span>
     </div>
-    <div v-if="review.lostAddress && review.address" class="notice tone-danger" role="alert">
-      <span aria-hidden="true">&#10006;</span>
+    <div
+      v-if="review.lostAddress && review.address"
+      class="notice"
+      :class="serverAccepts ? 'tone-warn' : 'tone-danger'"
+      :role="serverAccepts ? 'status' : 'alert'"
+      data-testid="address-hint"
+    >
+      <span aria-hidden="true">{{ serverAccepts ? '\u25B2' : '\u2716' }}</span>
+      <span v-if="serverAccepts"
+        ><strong>Hint only (the server accepts the rules):</strong>&nbsp;</span
+      >
       <span v-if="review.wasAllowed">
         The new rules no longer allow the address you connect from (<code
           ><SafeName :value="review.address" kind="text" :max="60" /></code
@@ -426,10 +530,11 @@ const start = () => {
       </ul>
     </div>
     <p class="hint muted">
-      This check compares your address and role name with each rule from the top. It does not look
-      at the database, at TLS, or at role groups, and the panel does not know whether these rules
-      apply to the connection the panel itself uses. A proxy in front of the server can make the
-      address in the audit log differ from yours.
+      The panel's own quick check (a hint; the server's check above decides) compares your address
+      and role name with each rule from the top. It does not look at the database, at TLS, or at
+      role groups, and the panel does not know whether these rules apply to the connection the panel
+      itself uses. A proxy in front of the server can make the address in the audit log differ from
+      yours.
     </p>
   </TaskActionDialog>
 </template>

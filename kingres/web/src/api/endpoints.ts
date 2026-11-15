@@ -24,6 +24,7 @@ import type {
   ServerId,
   TaskKind,
   TaskState,
+  Task,
   BucketState,
 } from './types'
 import type { components } from './schema'
@@ -228,8 +229,20 @@ export const endpoints = {
   applyGrantTemplate: (body: S['GrantTemplateRequest']) =>
     j(api.POST('/grants/template-applications', { body })),
   getNetworkAccess: () => j(api.GET('/settings/network-access')),
-  replaceNetworkAccess: (body: Omit<NetworkAccess, 'applyStatus'>) =>
-    j(api.PUT('/settings/network-access', { body })),
+  /** Replaces the rules: 202 + task (the answer of the real change). */
+  replaceNetworkAccess: async (body: Omit<NetworkAccess, 'applyStatus'>): Promise<Task> =>
+    (await j(api.PUT('/settings/network-access', { body }))) as Task,
+  /**
+   * The same request as a dry run (contract 0.6.0): validation, the revision check (409) and the lock-out
+   * rule (422) as for a real change, but nothing is changed, no task is made and nothing is audited.
+   * A change that would be refused is answered with a problem; the 200 answer is always `valid: true`.
+   */
+  checkNetworkAccess: async (
+    body: Omit<NetworkAccess, 'applyStatus'>,
+  ): Promise<S['NetworkAccessCheck']> =>
+    (await j(
+      api.PUT('/settings/network-access', { body, params: { query: { dryRun: true } } }),
+    )) as S['NetworkAccessCheck'],
   listAuditEvents: (
     q: Page & { actor?: string; action?: AuditAction; outcome?: S['AuditOutcome'] } = {},
   ) => j(api.GET('/audit', { params: { query: q } })),

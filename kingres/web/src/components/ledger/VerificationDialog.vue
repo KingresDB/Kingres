@@ -13,7 +13,12 @@ import StatusBadge from '@/components/StatusBadge.vue'
 import TableWrap from '@/components/TableWrap.vue'
 import { endpoints } from '@/api/endpoints'
 import { keys } from '@/api/queries'
-import { LEDGER_STATE } from '@/lib/status'
+import {
+  coverageOf,
+  groupList,
+  verificationBadge,
+  verificationCoverageText,
+} from '@/lib/ledger-coverage'
 import { formatDateTime, formatNumber } from '@/lib/format'
 
 const props = defineProps<{ databaseName: string; verificationId: number }>()
@@ -28,6 +33,10 @@ const query = useQuery({
   queryFn: () => endpoints.getLedgerVerification(props.databaseName, props.verificationId),
 })
 const v = computed(() => query.data.value)
+const coverage = computed(() => (v.value ? coverageOf(v.value) : null))
+const coverageText = computed(() =>
+  coverage.value ? verificationCoverageText(coverage.value) : '',
+)
 
 const KIND_LABEL = {
   blockHashMismatch: 'Block hash differs',
@@ -45,9 +54,28 @@ const KIND_LABEL = {
     <p v-if="query.isPending.value" role="status">Loading the verification ...</p>
     <ProblemNotice v-else-if="query.error.value" :error="query.error.value" />
     <template v-else-if="v">
+      <p
+        v-if="v.state === 'passed' && coverageText"
+        class="notice tone-warn"
+        role="status"
+        data-testid="verification-coverage"
+      >
+        <span aria-hidden="true">&#9650;</span>
+        <span>{{ coverageText }}</span>
+      </p>
       <dl class="kv">
         <dt>Result</dt>
-        <dd><StatusBadge :meta="LEDGER_STATE[v.state]" /></dd>
+        <dd><StatusBadge :meta="verificationBadge(v)" /></dd>
+        <dt>Shard groups covered</dt>
+        <dd data-testid="verification-covered">
+          <template v-if="coverage?.state === 'complete'"
+            >All shard groups of the database</template
+          >
+          <template v-else-if="coverage?.state === 'incomplete'"
+            >Not all. Not covered: {{ groupList(coverage.uncovered) }}</template
+          >
+          <template v-else>Not stated by the server</template>
+        </dd>
         <dt>Scope</dt>
         <dd>
           {{

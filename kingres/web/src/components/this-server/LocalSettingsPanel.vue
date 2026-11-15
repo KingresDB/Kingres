@@ -112,6 +112,28 @@ const running = computed(() => props.instances.filter((i) => i.state === 'runnin
           <dd class="mono">
             <SafeName :value="local.data.value.dataPaths.dataDirectory" kind="text" :max="200" />
           </dd>
+          <dt>WAL directory</dt>
+          <dd data-testid="wal-directory">
+            <SafeName
+              v-if="local.data.value.dataPaths.walDirectory"
+              class="mono"
+              :value="local.data.value.dataPaths.walDirectory"
+              kind="text"
+              :max="200"
+            />
+            <span v-else>default (inside the data directory)</span>
+          </dd>
+          <dt>Log directory in use</dt>
+          <dd data-testid="log-directory">
+            <SafeName
+              v-if="local.data.value.dataPaths.logDirectory"
+              class="mono"
+              :value="local.data.value.dataPaths.logDirectory"
+              kind="text"
+              :max="200"
+            />
+            <span v-else>default (the system default)</span>
+          </dd>
           <dt>Client ports</dt>
           <dd>
             read-write {{ local.data.value.clientPorts.readWritePort }}, read-only

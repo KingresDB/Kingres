@@ -9,7 +9,7 @@ export type RequiredRole = 'kingres_ops' | 'kingres_admin' | 'none' | 'kingres_r
 /** Minimum cluster role, HTTP method and path of every operation, from `x-required-role`. */
 export const operations = {
   acknowledgeAlert: { role: 'kingres_ops', method: 'PUT', path: '/alerts/{alertId}/acknowledgement' },
-  addServer: { role: 'kingres_ops', method: 'POST', path: '/servers' },
+  addServer: { role: 'kingres_admin', method: 'POST', path: '/servers' },
   applyGrantTemplate: { role: 'kingres_admin', method: 'POST', path: '/grants/template-applications' },
   cancelTask: { role: 'kingres_ops', method: 'POST', path: '/tasks/{taskId}/cancel' },
   checkSetupToken: { role: 'none', method: 'POST', path: '/setup/token-check' },

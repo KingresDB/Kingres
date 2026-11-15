@@ -11,7 +11,7 @@ import ProblemNotice from '@/components/ProblemNotice.vue'
 import SafeName from '@/components/SafeName.vue'
 import TableWrap from '@/components/TableWrap.vue'
 import { endpoints } from '@/api/endpoints'
-import { isSessionLost } from '@/api/problem'
+import { ApiError, isSessionLost } from '@/api/problem'
 import { useDatabases } from '@/api/queries'
 import { formatNumber } from '@/lib/format'
 import { vBlockEnterSubmit } from '@/lib/forms'
@@ -151,6 +151,31 @@ const plain = (text: string) => text.length <= LONG && !hasHidden(text)
 const shownRows = computed(() =>
   (result.value?.data.rows.slice(0, visibleRows.value) ?? []).map((row) => row.map(describeCell)),
 )
+/**
+ * A cut result of a plain read (SELECT, TABLE, VALUES, SHOW) changed nothing. Any other statement is never cut
+ * short (contract 0.6.0): it ran to the end and was committed, only the rows it returns were dropped.
+ */
+const cutAppliedChange = computed(() => {
+  const r = result.value
+  if (!r || !r.data.truncated) return false
+  const plainRead =
+    /^(select|table|values|show)\b/i.test(r.data.commandTag) &&
+    /^[\s(]*(select|table|values|show|with)\b/i.test(r.sql)
+  return !plainRead
+})
+
+/** Plain words for the answers that have a special meaning in the workbench. */
+const errorHint = computed(() => {
+  const e = error.value
+  if (!(e instanceof ApiError)) return ''
+  if (e.code === 'sql_error' && e.problem.sqlState === '57014')
+    return 'The statement was cancelled because it ran longer than the time limit (SQLSTATE 57014). This is not a fault of the server: raise the timeout above, or make the statement cheaper. A statement that was cancelled changed nothing.'
+  if (e.code === 'unprocessable')
+    return 'A value above 1 MiB, or a row above 16 MiB, cannot be returned. The statement failed; if it changes data, it was rolled back. Select fewer or smaller columns, for example a part of the value.'
+  if (e.code === 'service_unavailable' && !e.synthetic)
+    return 'One database role can run at most two statements at a time on one server (the server runs four in all). If two of yours are still running, wait for one to finish and run this statement again; it was not started.'
+  return ''
+})
 const hiddenRows = computed(() => (result.value?.data.rows.length ?? 0) - shownRows.value.length)
 </script>
 
@@ -165,7 +190,8 @@ const hiddenRows = computed(() => (result.value?.data.rows.length ?? 0) - shownR
       <strong>Mode: read-write.</strong> The statement runs for real, as role
       <strong><SafeName :value="session.username ?? ''" kind="text" :max="40" /></strong>. INSERT,
       UPDATE, DELETE and DDL statements are executed, not simulated, and are recorded in the audit
-      log. There is no read-only mode in the API.
+      log. There is no read-only mode in the API. A result cut at the row limit does not stop a
+      statement that changes data: it is still carried out and committed.
     </span>
   </p>
   <form v-block-enter-submit class="stack" @submit.prevent>
@@ -239,6 +265,7 @@ const hiddenRows = computed(() => (result.value?.data.rows.length ?? 0) - shownR
       </span>
     </p>
     <ProblemNotice v-if="error" :error="error" />
+    <p v-if="errorHint" class="muted" data-testid="query-error-hint">{{ errorHint }}</p>
     <section
       v-if="result"
       class="stack"
@@ -248,13 +275,27 @@ const hiddenRows = computed(() => (result.value?.data.rows.length ?? 0) - shownR
       :data-stale="stale ? 'true' : 'false'"
     >
       <h2 id="res-h">Result</h2>
+      <p
+        v-if="cutAppliedChange"
+        class="notice tone-danger"
+        role="status"
+        data-testid="truncated-applied"
+      >
+        <span aria-hidden="true">&#10006;</span>
+        <span>
+          <strong>The statement WAS applied.</strong> Only the rows it returns are cut at the limit;
+          the statement itself ran to the end and was committed ({{ result.data.commandTag }}). Do
+          not run it again to see the other rows: that would change the data a second time.
+        </span>
+      </p>
       <p class="muted">
         Database <SafeName :value="result.database" :max="60" />: {{ result.data.commandTag }},
         {{ formatNumber(result.data.rowCount) }} row(s) in
         {{ result.data.durationMs.toFixed(1) }} ms.
-        <span v-if="result.data.truncated" class="badge tone-warn"
+        <span v-if="result.data.truncated" class="badge tone-warn wrap"
           ><span aria-hidden="true">&#9650;</span> Cut at the row limit or at the 16 MiB size limit
-          of a result</span
+          of a result<template v-if="cutAppliedChange">; the statement was still applied</template
+          ><template v-else>; the statement only read data</template></span
         >
       </p>
       <p v-if="stale" class="notice tone-warn" role="status">

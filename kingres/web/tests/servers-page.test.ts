@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest'
 import { screen, waitFor, within } from '@testing-library/vue'
 import userEvent from '@testing-library/user-event'
 import { getState } from '@/mocks/http'
+import { fakeHash } from '@/mocks/state'
 import { SERVER_STATUS } from '@/lib/status'
 import { renderApp } from './helpers'
 
@@ -94,6 +95,10 @@ describe('Servers page', () => {
     const dialog = await screen.findByRole('dialog', { name: /add server/i })
     await user.type(within(dialog).getByLabelText(/server address/i), '10.0.0.14:8091')
     await user.type(within(dialog).getByLabelText(/setup token/i), 'demo-setup-token')
+    await user.type(
+      within(dialog).getByLabelText(/expected fingerprint/i),
+      fakeHash('bootstrap-10.0.0.14'),
+    )
     await user.click(within(dialog).getByRole('button', { name: /^add server$/i }))
     expect(await within(dialog).findByText('Finished.')).toBeInTheDocument()
     await user.click(within(dialog).getByRole('button', { name: /^close$/i }))

@@ -9,27 +9,6 @@ import { rawSlices } from './raw-json'
 
 type S = components['schemas']
 
-/** The members of a proof document the panel shows (the document has more; see the contract). */
-export interface ProofView {
-  chain_id: string
-  relation?: string
-  shard_group_id: number
-  table_id: number
-  ledger_txid: number
-  seq: number
-  op: 'I' | 'D'
-  row_hash: string
-  entry_index: number
-  entry_count: number
-  entry_path: string[]
-  tx_root: string
-  user_name: string
-  tx_index: number
-  tx_path: string[]
-  block: { height: number; tx_count: number; block_hash?: string; tx_merkle_root: string }
-  chain: unknown[]
-}
-
 /** The integers of a proof that the panel shows. They are read from the raw text (see `RawProof.numbers`). */
 const SHOWN_INTEGERS = [
   'table_id',
@@ -47,7 +26,8 @@ export type ShownInteger = (typeof SHOWN_INTEGERS)[number]
 /** A proof as received: the bytes to save, the parsed view, and numbers read from the raw text. */
 export interface RawProof {
   raw: string
-  view: ProofView
+  /** The parsed document, typed by the generated `InclusionProof` (its integers are read from `numbers`). */
+  view: S['InclusionProof']
   /** `table_id` exactly as written (an integer may be larger than a float holds). */
   tableId: string
   /** Every integer the panel shows, exactly as written in the text (a float would round above 2^53). */
@@ -87,7 +67,7 @@ export function proofShapeError(view: unknown): string | null {
 }
 
 export function parseProof(raw: string): RawProof {
-  const view = JSON.parse(raw) as ProofView
+  const view = JSON.parse(raw) as S['InclusionProof']
   const wanted = new Set<string>(SHOWN_INTEGERS)
   const numbers: Partial<Record<ShownInteger, string>> = {}
   for (const slice of rawSlices(raw, (p) => wanted.has(p.join('.')))) {
@@ -161,7 +141,7 @@ export type DigestRelation =
   | { state: 'unknown'; shardGroupId: number }
 
 export function digestRelation(
-  proof: Pick<ProofView, 'chain_id' | 'shard_group_id' | 'block'>,
+  proof: Pick<S['InclusionProof'], 'chain_id' | 'shard_group_id' | 'block'>,
   digest: Pick<RawDigest, 'chains'>,
 ): DigestRelation {
   const group = proof.shard_group_id

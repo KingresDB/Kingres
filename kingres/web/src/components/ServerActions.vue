@@ -13,7 +13,7 @@ import FormField from './FormField.vue'
 import { endpoints } from '@/api/endpoints'
 import { useServerGroups, useServers } from '@/api/queries'
 import { RouterLink } from 'vue-router'
-import FingerprintHelp from './FingerprintHelp.vue'
+import PinChoice from './PinChoice.vue'
 import FingerprintValue from './FingerprintValue.vue'
 import { fingerprintError, normalizeFingerprint } from '@/lib/fingerprint'
 import { firstError, nodeAddress, required, compact } from '@/lib/validators'
@@ -27,6 +27,7 @@ const props = defineProps<{
 const emit = defineEmits<{ close: [] }>()
 
 const form = reactive({ address: '', setupToken: '', serverGroup: '', expectedFingerprint: '' })
+const unpinned = ref(false)
 const mode = ref<'hard' | 'graceful'>('graceful')
 const submitted = ref(false)
 const groups = useServerGroups()
@@ -40,7 +41,11 @@ const errors = computed(() =>
   compact({
     address: firstError(form.address, nodeAddress()),
     setupToken: firstError(form.setupToken, required('The setup token')),
-    expectedFingerprint: fingerprintError(form.expectedFingerprint),
+    expectedFingerprint: unpinned.value
+      ? undefined
+      : form.expectedFingerprint.trim() === ''
+        ? 'Enter the fingerprint of the new server, or choose below to trust whatever answers at the address.'
+        : fingerprintError(form.expectedFingerprint),
   }),
 )
 
@@ -65,9 +70,10 @@ const config = computed(() => {
             address: form.address,
             setupToken: form.setupToken,
             serverGroup: form.serverGroup || null,
-            ...(form.expectedFingerprint.trim()
-              ? { expectedFingerprint: normalizeFingerprint(form.expectedFingerprint) }
-              : {}),
+            // The pin is the normal path; `allowUnpinned` is sent only for the explicit choice.
+            ...(unpinned.value
+              ? { allowUnpinned: true }
+              : { expectedFingerprint: normalizeFingerprint(form.expectedFingerprint) }),
           }),
       }
     case 'remove':
@@ -162,23 +168,17 @@ const config = computed(() => {
         >
           <input v-bind="slot" v-model="form.setupToken" class="input mono" autocomplete="off" />
         </FormField>
-        <FormField
-          v-slot="slot"
-          label="Expected fingerprint (recommended)"
-          hint="SHA-256 of the new server's certificate, 64 hex digits; colons are allowed."
+        <PinChoice
+          v-model:fingerprint="form.expectedFingerprint"
+          v-model:unpinned="unpinned"
+          purpose="add"
+          hint="SHA-256 of the new server's certificate, 64 hex digits; colons are allowed. Read it on the new server's own panel."
           :error="
-            (submitted ? errors.expectedFingerprint : undefined) ?? fieldErrors.expectedFingerprint
+            (submitted ? errors.expectedFingerprint : undefined) ??
+            fieldErrors['/expectedFingerprint'] ??
+            fieldErrors.expectedFingerprint
           "
-        >
-          <input
-            v-bind="slot"
-            v-model="form.expectedFingerprint"
-            class="input mono"
-            autocomplete="off"
-            spellcheck="false"
-          />
-        </FormField>
-        <FingerprintHelp purpose="add" />
+        />
         <FormField v-slot="slot" label="Server group (optional)">
           <select v-bind="slot" v-model="form.serverGroup">
             <option value="">None</option>

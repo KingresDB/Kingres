@@ -101,7 +101,8 @@ const metricsUnsupported = computed(() =>
           <span class="value">{{ c.servers.live }} / {{ c.servers.total }} live</span>
           <span class="muted">
             {{ c.servers.suspect }} suspect, {{ c.servers.dead }} dead,
-            {{ c.servers.pendingRebalance }} pending rebalance
+            {{ c.servers.pendingRebalance }} pending rebalance (should hold shards, primary of no
+            bucket yet)
           </span>
           <RouterLink :to="{ name: 'servers' }">View servers</RouterLink>
         </div>

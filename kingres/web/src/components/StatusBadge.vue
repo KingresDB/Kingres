@@ -8,7 +8,7 @@ defineProps<{ meta: StatusMeta; label?: string }>()
 </script>
 
 <template>
-  <span class="badge" :class="`tone-${meta.tone}`" :data-tone="meta.tone">
+  <span class="badge" :class="`tone-${meta.tone}`" :data-tone="meta.tone" :title="meta.hint">
     <span aria-hidden="true">{{ meta.icon }}</span>
     <span>{{ label ?? meta.label }}</span>
   </span>

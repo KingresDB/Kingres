@@ -6,7 +6,7 @@
 // log a line). Used by the tests and by `?mock=hostile` in development, never in a build.
 import type { MissingServer } from '@/api/types'
 import type { MockState } from './state'
-import { nowIso } from './state'
+import { mockConfig, nowIso } from './state'
 
 const cp = (...codes: number[]) => String.fromCodePoint(...codes)
 
@@ -64,6 +64,9 @@ export const HOSTILE_MISSING: MissingServer[] = [
 export function seedHostile(s: MockState): void {
   const template = s.roles[0]
   if (!template) return
+  // Texts a hostile server could send in the fields added in 0.6.0: the setup task `detail` and the
+  // fingerprints it reports about itself (shown through SafeName).
+  mockConfig.hostileSetupText = HOSTILE.markup
 
   for (const name of HOSTILE_NAMES) {
     s.roles.push({
@@ -225,6 +228,7 @@ export function seedHostile(s: MockState): void {
       resourceId: name,
       outcome: 'success',
       actorAddress: '10.0.0.77',
+      serverId: HOSTILE.reversed,
     })
   }
   s.nextAuditId = id

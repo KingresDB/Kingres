@@ -3,6 +3,7 @@
 //
 // One handler per operation in the contract, registered by operationId (see http.ts). Request and
 // response bodies are typed with the generated schema types.
+import { evaluateAccess } from '@/lib/network-rules'
 import type { HttpHandler } from 'msw'
 import type { components } from '@/api/schema'
 import type { OperationId } from '@/api/operations.generated'
@@ -112,6 +113,7 @@ function setupTaskSummary(s: MockState): S['SetupTaskSummary'] | null {
     state: rec.task.state,
     progressPercent: rec.task.progress.percent,
     error: rec.task.error,
+    detail: rec.task.detail,
     steps: rec.task.progress.steps.map((st) => ({
       name: st.name,
       state: st.state === 'skipped' ? 'pending' : st.state,
@@ -209,6 +211,7 @@ const login: Handler = (ctx) => {
       actor: username,
       source: 'panel',
       action: 'loginFailed',
+      serverId: LOCAL,
       outcome: 'failure',
     })
     throw problem('invalid_credentials')
@@ -227,6 +230,7 @@ const login: Handler = (ctx) => {
     actor: username,
     source: 'panel',
     action: 'login',
+    serverId: LOCAL,
     outcome: 'success',
   })
   const out: S['Session'] = {
@@ -235,9 +239,13 @@ const login: Handler = (ctx) => {
     clusterId: ctx.s.clusterId,
     clusterName: ctx.s.clusterName,
     token: issueToken ? `mock-token-${csrfToken}` : null,
+    ...(mockConfig.clientAddress === null ? {} : { clientAddress: mockConfig.clientAddress }),
   }
   return ok(out)
 }
+
+/** The address the mock "sees" the request come from (documentation range, never a real host). */
+export const MOCK_CLIENT_ADDRESS = '203.0.113.7'
 
 function sessionBody(s: MockState): S['Session'] {
   const sess = s.session
@@ -248,6 +256,15 @@ function sessionBody(s: MockState): S['Session'] {
     clusterId: s.clusterId,
     clusterName: s.clusterName,
     token: null,
+    ...(mockConfig.clientAddress === null ? {} : { clientAddress: mockConfig.clientAddress }),
+    // 0.6.0: while the system database is stopped the answer comes from memory and says so.
+    ...(s.systemDatabaseStopped
+      ? {
+          degraded: true,
+          degradedReason:
+            'The instance that hosts the system database of this server is stopped; this answer comes from the memory of the server.',
+        }
+      : {}),
   }
 }
 
@@ -268,11 +285,52 @@ function requireFingerprintShape(value: string | null | undefined): void {
   if (!FINGERPRINT_SHAPE.test(value))
     throw validationFailed([
       {
-        field: 'expectedFingerprint',
+        field: '/expectedFingerprint',
         message: 'Use 64 hexadecimal digits; colons between byte pairs are allowed.',
+        code: 'pattern',
       },
     ])
 }
+/**
+ * Contract 0.6.0: a request without a pin (body member or header `X-Kingres-Pin-Sha256`) and without
+ * `allowUnpinned: true` is 400 at `/expectedFingerprint`; a malformed pin is 400 as well. Returns the pin.
+ */
+function requirePin(
+  ctx: Ctx,
+  b: { expectedFingerprint?: string | null; allowUnpinned?: boolean },
+): string | null {
+  const header = ctx.request.headers.get('X-Kingres-Pin-Sha256')
+  const pin = b.expectedFingerprint || header || null
+  requireFingerprintShape(pin)
+  if (b.expectedFingerprint && header && normalizeFp(b.expectedFingerprint) !== normalizeFp(header))
+    throw validationFailed([
+      {
+        field: '/expectedFingerprint',
+        message: 'The body and the header X-Kingres-Pin-Sha256 name different fingerprints.',
+        code: 'mismatch',
+      },
+    ])
+  if (!pin && b.allowUnpinned !== true)
+    throw validationFailed([
+      {
+        field: '/expectedFingerprint',
+        message:
+          'Give the fingerprint of the server, or set allowUnpinned to trust whatever answers.',
+        code: 'required',
+      },
+    ])
+  return pin
+}
+
+/** The server runs without its internal API (contract 0.6.0, `-internal-listen` not given). */
+function requireInternalApi(): void {
+  if (mockConfig.internalApiDisabled)
+    throw problem(
+      'internal_api_disabled',
+      'The server was started without its internal API (no internal listen address).',
+    )
+}
+
 function normalizeFp(text: string): string {
   return text.replace(/:/g, '').toLowerCase()
 }
@@ -368,7 +426,7 @@ const joinCluster: Handler = (ctx) => {
   if (!b.dataPaths?.dataDirectory?.startsWith('/'))
     errors.push({ field: 'dataPaths.dataDirectory', message: 'Use an absolute path.' })
   if (errors.length) throw validationFailed(errors)
-  requireFingerprintShape(b.expectedFingerprint)
+  const pin = requirePin(ctx, b)
   if (b.existingNodeAddress.includes('unreachable'))
     throw problem('unprocessable', `Cannot reach ${b.existingNodeAddress}.`)
   if (b.admin.password !== MOCK_PASSWORD) throw problem('invalid_credentials')
@@ -376,10 +434,20 @@ const joinCluster: Handler = (ctx) => {
   // The certificate the existing server presents; a pin that differs refuses the join before the
   // password is sent.
   const presented = fakeHash(`internal-${b.existingNodeAddress.replace(/:[0-9]+$/, '')}`)
-  const pinMismatch = !!b.expectedFingerprint && normalizeFp(b.expectedFingerprint) !== presented
+  const pinMismatch = !!pin && normalizeFp(pin) !== presented
   return accepted(
     createTask(s, {
       kind: 'cluster.join',
+      // What the server says about the pin check (SetupTaskSummary.detail, Task.detail).
+      detail: mockConfig.omitSetupDetail
+        ? null
+        : mockConfig.hostileSetupText
+          ? mockConfig.hostileSetupText
+          : pinMismatch
+            ? null
+            : pin
+              ? `The certificate of the existing server matched the pinned fingerprint ${presented}.`
+              : `No pin was checked (allowUnpinned): the certificate fingerprint seen on first contact is ${presented}.`,
       failWith: pinMismatch
         ? 'The certificate presented by the existing server is not the expected one. Nothing was sent.'
         : undefined,
@@ -830,6 +898,15 @@ function runQuery(ctx: Ctx): S['QueryResult'] {
       durationMs: Date.now() - started + 1.5,
     }
   }
+  if (/pg_sleep/i.test(sql))
+    throw problem('sql_error', 'canceling statement due to statement timeout', {
+      sqlState: '57014',
+      sqlPosition: 1,
+    })
+  if (/\bhugevalue\b/i.test(sql))
+    throw problem('unprocessable', 'A value of column "doc" is larger than 1 MiB.')
+  if (/\bbusyrole\b/i.test(sql))
+    throw problem('service_unavailable', 'This role already runs two statements.')
   let m = /^select\s+1(\s+as\s+(\w+))?$/i.exec(sql)
   if (m) return done([{ name: m[2] ?? '?column?', type: 'int4' }], [[1]])
   if (/^select\s+version\(\)$/i.test(sql))
@@ -846,6 +923,22 @@ function runQuery(ctx: Ctx): S['QueryResult'] {
         sqlPosition: sql.toLowerCase().indexOf(m[2]?.toLowerCase() ?? '') + 1,
       })
     return done(data.columns, data.rows)
+  }
+  // Contract 0.6.0: a statement that changes data is never cut short; its rows are dropped beyond the limit,
+  // but it is committed and answers its real command tag with truncated: true.
+  m = /^(insert|update|delete)\b.*\bbulk\b/i.exec(sql)
+  if (m) {
+    const verb = (m[1] ?? '').toUpperCase()
+    const affected = 5000
+    const limit = b.rowLimit ?? 1000
+    return {
+      columns: [{ name: 'id', type: 'int8' }],
+      rows: Array.from({ length: Math.min(affected, limit) }, (_, i) => [i + 1]),
+      rowCount: affected,
+      truncated: affected > limit,
+      commandTag: verb === 'INSERT' ? `INSERT 0 ${affected}` : `${verb} ${affected}`,
+      durationMs: Date.now() - started + 1.5,
+    }
   }
   throw problem('sql_error', `syntax error at or near "${sql.split(/\s+/)[0] ?? ''}"`, {
     sqlState: '42601',
@@ -885,6 +978,11 @@ export function createHandlers(): HttpHandler[] {
         serverId: c.s.node.state === 'uninitialized' ? null : LOCAL,
         clusterId: c.s.node.state === 'uninitialized' ? null : c.s.clusterId,
         setupTask: setupTaskSummary(c.s),
+        // Only to a loopback caller or with a valid setup token, and only before setup (contract 0.6.0).
+        internalFingerprint:
+          c.s.node.state === 'uninitialized' && mockConfig.setupFingerprintVisible
+            ? (mockConfig.hostileSetupText ?? fakeHash('bootstrap-10.0.0.11'))
+            : null,
       } satisfies S['NodeStateInfo']),
     checkSetupToken,
     initCluster,
@@ -903,6 +1001,9 @@ export function createHandlers(): HttpHandler[] {
         clusterId: c.s.node.leftCluster ? null : c.s.clusterId,
         uptimeSeconds: Math.floor((Date.now() - (c.s.servers[0]?.startedAt ?? Date.now())) / 1000),
         isManagerLeader: true,
+        internalFingerprint: c.s.node.leftCluster
+          ? null
+          : (mockConfig.hostileSetupText ?? fakeHash(`internal-${LOCAL}`)),
         services: (
           ['api', 'agent', 'manager', 'router', 'etcd', 'patroni', 'metrics'] as const
         ).map((name) => ({
@@ -946,7 +1047,13 @@ export function createHandlers(): HttpHandler[] {
         sampledAt: nowIso(),
       } satisfies S['ServerResources'])
     },
-    listThisServerInstances: (c) => ok({ items: instancesOfServer(c.s, LOCAL) }),
+    listThisServerInstances: (c) =>
+      ok({
+        items: instancesOfServer(c.s, LOCAL).map((i) =>
+          // Stopped state: answered from the memory of the instance manager, size and lag unknown.
+          c.s.systemDatabaseStopped ? { ...i, sizeBytes: null, replicationLagSeconds: null } : i,
+        ),
+      }),
     getThisServerInstance: (c) => ok(thisServerInstance(c.s, num(c, 'instanceId'))),
     restartThisServerInstance: instanceAction('restart'),
     stopThisServerInstance: instanceAction('stop'),
@@ -1001,13 +1108,14 @@ export function createHandlers(): HttpHandler[] {
       }
       if (b.logLevel) l.logLevel = b.logLevel
       if (b.logDirectory !== undefined && b.logDirectory !== l.dataPaths.logDirectory) {
-        l.dataPaths = { ...l.dataPaths, logDirectory: b.logDirectory ?? undefined }
+        l.dataPaths = { ...l.dataPaths, logDirectory: b.logDirectory ?? null }
         l.restartRequired = true
       }
       return ok(l)
     },
     leaveCluster: (c) => {
       const s = c.s
+      requireInternalApi()
       const force = body<{ force?: boolean }>(c).force === true
       if (s.servers.length <= 1) throw problem('last_server')
       if (
@@ -1130,7 +1238,8 @@ export function createHandlers(): HttpHandler[] {
         throw validationFailed([
           { field: 'address', message: 'Use host:port, for example 10.0.0.14:8091.' },
         ])
-      requireFingerprintShape(b.expectedFingerprint)
+      requireInternalApi()
+      const pin = requirePin(c, b)
       if (b.setupToken !== MOCK_SETUP_TOKEN) throw problem('setup_token_invalid')
       if (s.servers.some((x) => x.address === b.address))
         throw problem(
@@ -1145,8 +1254,8 @@ export function createHandlers(): HttpHandler[] {
       // The bootstrap certificate the new server presents. A pin that differs refuses it before the
       // setup token is sent.
       const seen = fakeHash(`bootstrap-${id}`)
-      const pinned = !!b.expectedFingerprint
-      const mismatch = pinned && normalizeFp(b.expectedFingerprint ?? '') !== seen
+      const pinned = !!pin
+      const mismatch = pinned && normalizeFp(pin ?? '') !== seen
       return accepted(
         createTask(s, {
           kind: 'server.add',
@@ -1230,6 +1339,7 @@ export function createHandlers(): HttpHandler[] {
     },
     removeServer: (c) => {
       const s = c.s
+      requireInternalApi()
       const rec = server(s, c.params.serverId ?? '')
       if (rec.status === 'dead')
         throw problem(
@@ -1279,6 +1389,7 @@ export function createHandlers(): HttpHandler[] {
     },
     renewServerCertificates: (c) => {
       const s = c.s
+      requireInternalApi()
       if (mockConfig.caUnavailable) throw problem('certificate_authority_unavailable')
       const rec = server(s, c.params.serverId ?? '')
       if (rec.certificateRevokedAt) throw problem('certificate_revoked')
@@ -1296,6 +1407,7 @@ export function createHandlers(): HttpHandler[] {
     },
     revokeServerCertificates: (c) => {
       const s = c.s
+      requireInternalApi()
       if (mockConfig.caUnavailable) throw problem('certificate_authority_unavailable')
       const rec = server(s, c.params.serverId ?? '')
       if (rec.id === '10.0.0.11') throw problem('server_hosts_map_group')
@@ -2074,6 +2186,10 @@ export function createHandlers(): HttpHandler[] {
     replaceNetworkAccess: (c) => {
       const s = c.s
       const b = body<S['NetworkAccessUpdateRequest']>(c)
+      const dryParam = c.url.searchParams.get('dryRun')
+      if (dryParam !== null && dryParam !== 'true' && dryParam !== 'false')
+        throw problem('bad_request', 'The query parameter dryRun must be true or false.')
+      const dryRun = dryParam === 'true'
       if (b.revision !== s.network.revision)
         throw problem(
           'optimistic_lock_failed',
@@ -2095,6 +2211,20 @@ export function createHandlers(): HttpHandler[] {
             ],
       )
       if (errors.length) throw validationFailed(errors)
+      // 422: the new rules would lock out the address of the caller (it was let in, and no longer is).
+      const user = s.session?.username ?? ''
+      const own = mockConfig.clientAddress
+      const before = own ? evaluateAccess(s.network.rules, own, user) : null
+      const after = own ? evaluateAccess(b.rules, own, user) : null
+      if (
+        before?.result === 'allowed' &&
+        (after?.result === 'rejected' || after?.result === 'no-rule')
+      )
+        throw problem(
+          'unprocessable',
+          `These rules would lock out your own address (${own}), so they were refused.`,
+        )
+      if (dryRun) return ok({ valid: true, revision: s.network.revision })
       return accepted(
         createTask(s, {
           kind: 'networkAccess.apply',
@@ -2118,8 +2248,8 @@ export function createHandlers(): HttpHandler[] {
     },
     listAuditEvents: (c) => {
       const q = (k: string) => c.url.searchParams.get(k)
-      return ok(
-        paginate(
+      return ok({
+        ...paginate(
           c.s.audit.filter(
             (e) =>
               (!q('actor') || e.actor === q('actor')) &&
@@ -2128,7 +2258,8 @@ export function createHandlers(): HttpHandler[] {
           ),
           c.url,
         ),
-      )
+        ...partialAnswer(),
+      })
     },
 
     // --- settings
@@ -2239,20 +2370,27 @@ export function createHandlers(): HttpHandler[] {
         throw problem('unprocessable', 'The ledger is off for this database.')
       const status = ledgerStatusOf(c.s, rec)
       const id = (c.s.ledger.digests[0]?.id ?? 0) + 1
+      const covered = mockConfig.incompleteLedger ? status.chains.slice(0, -1) : status.chains
+      const uncovered = mockConfig.incompleteLedger
+        ? status.chains.slice(-1).map((ch) => ch.shardGroupId)
+        : []
       const digest: S['LedgerDigest'] = {
         id,
         databaseName: rec.info.name,
         generatedAt: nowIso(),
         generatedBy: c.s.session?.username ?? 'system',
         hashVersion: 1,
-        chains: status.chains.map((ch) => ({
+        chains: covered.map((ch) => ({
           shardGroupId: ch.shardGroupId,
           blockHeight: ch.latestBlockHeight ?? 0,
           blockHash: ch.latestBlockHash ?? fakeHash('none'),
           document: digestDocument(ch.shardGroupId, ch.latestBlockHeight ?? 0),
         })),
-        aggregateHash: rec.info.sharding.enabled ? fakeHash(`agg-${id}`) : null,
+        aggregateHash:
+          rec.info.sharding.enabled && uncovered.length === 0 ? fakeHash(`agg-${id}`) : null,
         anchors: [],
+        complete: uncovered.length === 0,
+        uncoveredShardGroupIds: uncovered,
       }
       c.s.ledger.digests.unshift(digest)
       return { status: 201, rawJson: digestJson(digest) }
@@ -2292,6 +2430,12 @@ export function createHandlers(): HttpHandler[] {
         startedBy: s.session?.username ?? 'system',
         blocksChecked: 0,
         rowsChecked: 0,
+        complete: !mockConfig.incompleteLedger,
+        uncoveredShardGroupIds: mockConfig.incompleteLedger
+          ? ledgerStatusOf(s, rec)
+              .chains.slice(-1)
+              .map((ch) => ch.shardGroupId)
+          : [],
         inconsistencies: [],
       }
       s.ledger.verifications.unshift(v)

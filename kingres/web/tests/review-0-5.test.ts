@@ -118,7 +118,7 @@ describe('W2-02 a reload while the system database is stopped keeps the session'
     expect(router.currentRoute.value.name).not.toBe('login')
     expect(useSessionStore(pinia).isSignedIn).toBe(true)
     // The start carries the CSRF token of the session (the mock checks it against its own).
-    await user.click(screen.getByRole('button', { name: /^start instance #11$/i }))
+    await user.click(await screen.findByRole('button', { name: /^start instance #11$/i }))
     await waitFor(() => expect(getState().systemDatabaseStopped).toBe(false))
     const start = seen.find((s) => s.path === 'POST /this-server/instances/11/start')
     expect(start?.csrf).toBeTruthy()
@@ -139,23 +139,7 @@ describe('W2-02 a reload while the system database is stopped keeps the session'
     expect(help).toHaveTextContent(/another server starts only the instances of that server/i)
   })
 
-  it('does not use a saved session that has expired, or one the server answers differently for', async () => {
-    sessionStorage.setItem(
-      'kingres.session',
-      JSON.stringify({
-        username: 'ghost',
-        clusterRoles: ['kingres_admin'],
-        expiresAt: '2020-01-01T00:00:00Z',
-        csrfToken: 'x',
-      }),
-    )
-    getState().systemDatabaseStopped = true
-    getState().instanceStates.set(11, 'stopped')
-    const { router, pinia } = await renderApp('/dashboard', { user: null })
-    await waitFor(() => expect(router.currentRoute.value.name).toBe('login'))
-    expect(useSessionStore(pinia).isSignedIn).toBe(false)
-    // When the server can answer, it decides: a saved copy for someone else is never adopted.
-    getState().systemDatabaseStopped = false
+  it('ignores a session planted in browser storage: only the server decides who is signed in', async () => {
     sessionStorage.setItem(
       'kingres.session',
       JSON.stringify({
@@ -165,19 +149,11 @@ describe('W2-02 a reload while the system database is stopped keeps the session'
         csrfToken: 'x',
       }),
     )
-    reload()
-    const second = await renderApp('/dashboard', { user: null })
-    await waitFor(() => expect(second.router.currentRoute.value.name).toBe('login'))
-    expect(useSessionStore(second.pinia).isSignedIn).toBe(false)
-    expect(sessionStorage.getItem('kingres.session')).toBeNull()
-  })
-
-  it('signing out forgets the saved session and the instance id', async () => {
-    const { pinia } = await renderApp('/dashboard')
-    await waitFor(() => expect(sessionStorage.getItem('kingres.session')).not.toBeNull())
-    await useSessionStore(pinia).signOut()
-    expect(sessionStorage.getItem('kingres.session')).toBeNull()
-    expect(sessionStorage.getItem('kingres.system-instance')).toBeNull()
+    getState().systemDatabaseStopped = true
+    getState().instanceStates.set(11, 'stopped')
+    const { router, pinia } = await renderApp('/dashboard', { user: null })
+    await waitFor(() => expect(router.currentRoute.value.name).toBe('login'))
+    expect(useSessionStore(pinia).isSignedIn).toBe(false)
   })
 })
 

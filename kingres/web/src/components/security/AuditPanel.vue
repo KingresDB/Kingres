@@ -5,6 +5,9 @@ import { ref } from 'vue'
 import SafeName from '../SafeName.vue'
 import TableWrap from '../TableWrap.vue'
 import QueryBoundary from '../QueryBoundary.vue'
+import PartialNotice from '../PartialNotice.vue'
+import CursorResetNotice from '../CursorResetNotice.vue'
+import { useCompletenessAnnouncement } from '@/composables/useCompletenessAnnouncement'
 import { endpoints } from '@/api/endpoints'
 import { keys, usePagedQuery } from '@/api/queries'
 import { formatDateTime } from '@/lib/format'
@@ -15,7 +18,7 @@ const actor = ref('')
 const outcome = ref<'' | 'success' | 'failure' | 'denied'>('')
 // The action filter is the closed AuditAction enum of the contract.
 const action = ref<'' | AuditAction>('')
-const { query, items } = usePagedQuery(
+const { query, items, completeness, cursorReset, dismissCursorReset } = usePagedQuery(
   () => [...keys.audit, actor.value, outcome.value, action.value],
   (cursor) =>
     endpoints.listAuditEvents({
@@ -27,6 +30,7 @@ const { query, items } = usePagedQuery(
     }),
   15_000,
 )
+useCompletenessAnnouncement(completeness, 'audit log')
 const OUTCOME = {
   success: { tone: 'ok', icon: '✓', label: 'Success' },
   failure: { tone: 'danger', icon: '✖', label: 'Failure' },
@@ -57,12 +61,23 @@ const OUTCOME = {
         </select>
       </div>
     </div>
+    <CursorResetNotice :shown="cursorReset" @dismiss="dismissCursorReset" />
+    <PartialNotice
+      :completeness="completeness"
+      consequence="Events written by these servers are not shown."
+    />
     <QueryBoundary
       :loading="query.isPending.value"
       :error="query.error.value"
       :empty="items.length === 0"
-      empty-title="No audit events"
-      empty-hint="Sign-ins and administrative actions are recorded here."
+      :empty-title="
+        completeness.partial ? 'No audit events from the servers that answered' : 'No audit events'
+      "
+      :empty-hint="
+        completeness.partial
+          ? 'This does not mean there are none: the servers named above did not answer, so their events are not shown.'
+          : 'Sign-ins and administrative actions are recorded here.'
+      "
       @retry="query.refetch()"
     >
       <TableWrap>
@@ -74,6 +89,7 @@ const OUTCOME = {
             <tr>
               <th scope="col">Time</th>
               <th scope="col">Actor</th>
+              <th scope="col">Server</th>
               <th scope="col">Source</th>
               <th scope="col">Action</th>
               <th scope="col">Resource</th>
@@ -88,6 +104,10 @@ const OUTCOME = {
                 <div v-if="e.actorAddress" class="muted mono">
                   <SafeName :value="e.actorAddress" kind="text" :max="60" />
                 </div>
+              </td>
+              <td data-testid="audit-server">
+                <SafeName v-if="e.serverId" :value="e.serverId" kind="text" :max="60" />
+                <template v-else>-</template>
               </td>
               <td>{{ e.source }}</td>
               <td class="mono">{{ e.action }}</td>

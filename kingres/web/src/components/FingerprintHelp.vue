@@ -11,16 +11,19 @@ defineProps<{ purpose: 'add' | 'join' }>()
     <div class="stack" style="gap: var(--s-2)">
       <p v-if="purpose === 'add'">
         <strong>Where to read it.</strong> It is the SHA-256 fingerprint of the certificate of the
-        <em>new</em> server. That server writes it to its log when it starts, in the line "bootstrap
-        certificate of the internal API"; it is also the SHA-256 of the file
-        <code>pki/bootstrap.crt</code> in its data directory. Copy it from the new server itself,
-        not from this screen.
+        <em>new</em> server. Open the panel of the new server itself: its setup wizard shows the
+        fingerprint (with a copy button) as soon as you have entered its setup token there (or when
+        you open it on that machine itself). Copy it from there, not from this screen. If that panel
+        does not show it (it says so), read it in the log of the new server, in the line "bootstrap
+        certificate of the internal API", or take the SHA-256 of the file
+        <code>pki/bootstrap.crt</code> in its data directory.
       </p>
       <p v-else>
         <strong>Where to read it.</strong> It is the SHA-256 fingerprint of the internal certificate
-        of the <em>existing</em> server you join: the SHA-256 of the file
-        <code>pki/server.crt</code> in that server's data directory. Read it on that server, not
-        from this screen.
+        of the <em>existing</em> server you join. Open the panel of that server and read it on its
+        <em>This server</em> page (with a copy button). If that page does not show it, read the
+        SHA-256 of the file <code>pki/server.crt</code> in that server's data directory. Do not read
+        it from this screen.
       </p>
       <p>
         <strong>What it protects against.</strong> The first contact between two servers has no
@@ -35,8 +38,8 @@ defineProps<{ purpose: 'add' | 'join' }>()
         certificate is not the one you named.
       </p>
       <p>
-        Leave it empty only on a network you control. Without it the cluster records the fingerprint
-        it saw, so you can compare it afterwards; that detects a problem but does not prevent it.
+        The fingerprint is required. The only way around it is the explicit choice below it, which
+        trusts whatever answers at the address.
         <strong
           >Give the fingerprint whenever the address was not typed from your own records.</strong
         >

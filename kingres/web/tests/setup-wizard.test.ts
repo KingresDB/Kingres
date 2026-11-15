@@ -118,6 +118,7 @@ describe('First-run wizard', () => {
     await user.clear(address)
     await user.type(address, '10.0.0.11:8091')
     await user.type(screen.getByLabelText(/administrator password/i), 'demo-password')
+    await user.click(screen.getByLabelText(/do not check the certificate/i))
     await user.click(screen.getByRole('button', { name: /^join cluster$/i }))
 
     expect(await screen.findByRole('button', { name: /continue to sign in/i })).toBeInTheDocument()

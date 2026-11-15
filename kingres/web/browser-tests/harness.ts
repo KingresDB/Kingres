@@ -287,6 +287,32 @@ export const STATES: PageState[] = [
     close: cancel,
   },
   {
+    name: 'add server dialog with the explicit unpinned choice ticked',
+    route: '/servers',
+    open: async (page) => {
+      await clickText(page, 'Add server')
+      await dialogOpen(page)
+      await page.click('[role="dialog"] [data-testid="allow-unpinned"]')
+      await page.waitForSelector('[role="dialog"] [data-testid="unpinned-warning"]')
+      await sleep(150)
+    },
+    close: cancel,
+  },
+  {
+    name: 'workbench with a truncated statement that was applied',
+    route: '/workbench',
+    open: async (page) => {
+      await page.click('#w-sql', { count: 3 })
+      await page.keyboard.press('Backspace')
+      await page.type('#w-sql', 'update orders set seen = true returning bulk')
+      await clickText(page, 'Run')
+      await page.waitForFunction(() => document.body.textContent?.includes('WAS applied'), {
+        timeout: 20_000,
+      })
+      await sleep(250)
+    },
+  },
+  {
     name: 'ledger inclusion proof with the digests compared',
     route: '/ledger',
     open: async (page) => {

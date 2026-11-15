@@ -19,7 +19,7 @@ import { safeText } from '@/lib/safe-text'
 import { useSessionStore } from '@/stores/session'
 import { endpoints } from '@/api/endpoints'
 import { keys, usePagedQuery } from '@/api/queries'
-import { alertKindLabel, SEVERITY } from '@/lib/status'
+import { alertKindHint, alertKindLabel, SEVERITY } from '@/lib/status'
 import { formatAgo, formatDateTime } from '@/lib/format'
 
 const client = useQueryClient()
@@ -111,6 +111,9 @@ const STATE_LABEL = { open: 'Open', acknowledged: 'Acknowledged', resolved: 'Res
               </div>
               <div class="muted">
                 <SafeName :value="a.message" kind="text" :max="600" multiline />
+              </div>
+              <div v-if="alertKindHint(a.kind)" class="muted" data-testid="alert-kind-hint">
+                {{ alertKindHint(a.kind) }}
               </div>
               <div v-if="a.serverId" class="muted" data-testid="alert-server">
                 Server

@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest'
 import { screen, waitFor, within } from '@testing-library/vue'
 import userEvent from '@testing-library/user-event'
 import { getState } from '@/mocks/http'
+import { mockConfig } from '@/mocks/state'
 import { mockServer } from '@/mocks/server'
 import { renderApp } from './helpers'
 
@@ -20,20 +21,19 @@ function recordPuts(): { body: unknown }[] {
   return puts
 }
 
+/**
+ * The panel takes the address from the session (, 203.0.113.7 in the mock). A known address is
+ * made to matter by letting rule 1 allow it; null removes it from the session answer (an older server).
+ */
+/**
+ * The panel takes the address from the session (`clientAddress`, 203.0.113.7 in the mock). A known address is
+ * made to matter by letting rule 1 allow it; null removes it from the answers (an older server).
+ */
 function knownAddress(address: string | null): void {
   const s = getState()
   s.audit = s.audit.filter((e) => e.actor !== 'admin')
-  if (address) {
-    s.audit.unshift({
-      id: 900,
-      timestamp: new Date().toISOString(),
-      actor: 'admin',
-      actorAddress: address,
-      source: 'panel',
-      action: 'login',
-      outcome: 'success',
-    })
-  }
+  if (address) s.network.rules[0]!.address = '203.0.113.0/24'
+  else mockConfig.clientAddress = null
 }
 
 async function openNetwork() {
@@ -91,18 +91,19 @@ describe('network access: no implicit submission (W-01)', () => {
 })
 
 describe('network access: lock-out warnings (W-01)', () => {
-  it('warns that the address of the administrator is no longer allowed, and asks to type to confirm', async () => {
+  it('warns that the address of the administrator is no longer allowed; the server refuses, so apply stays off', async () => {
     knownAddress('10.0.0.50')
     const { user } = await openNetwork()
     await user.click(screen.getByRole('button', { name: /remove rule 1/i }))
     await user.click(screen.getByRole('button', { name: /review and apply/i }))
     const dialog = await screen.findByRole('dialog', { name: /network access rules/i })
     expect(within(dialog).getByText(/1 rule removed/i)).toBeInTheDocument()
-    expect(dialog).toHaveTextContent(/no longer allow.*10.0.0.50/i)
+    expect(dialog).toHaveTextContent(/no longer allow.*203.0.113.7/i)
+    // The server's dry run decides: it refuses (422), so typing the confirmation does not help.
+    await within(dialog).findByText(/would refuse this change/i)
     const apply = within(dialog).getByRole('button', { name: /^apply on all servers$/i })
-    expect(apply).toBeDisabled()
     await user.type(within(dialog).getByLabelText(/to confirm/i), 'lock out')
-    expect(apply).toBeEnabled()
+    expect(apply).toBeDisabled()
   })
 
   it('warns when no rule allows administrators and when the list is empty', async () => {

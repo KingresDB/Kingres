@@ -27,6 +27,8 @@ const props = withDefaults(
     validate?: () => boolean
     invalidate?: QueryKey[]
     wide?: boolean
+    /** True while the confirm button must stay disabled for a reason the dialog itself explains. */
+    confirmDisabled?: boolean
   }>(),
   {
     danger: false,
@@ -34,6 +36,7 @@ const props = withDefaults(
     validate: undefined,
     invalidate: () => [],
     wide: false,
+    confirmDisabled: false,
   },
 )
 const emit = defineEmits<{ close: []; done: [task: Task] }>()
@@ -93,7 +96,7 @@ async function confirm(): Promise<void> {
           type="button"
           class="btn"
           :class="danger ? 'btn-danger' : 'btn-primary'"
-          :disabled="!typedOk || action.isStarting.value"
+          :disabled="!typedOk || confirmDisabled || action.isStarting.value"
           @click="confirm"
         >
           {{ confirmLabel }}

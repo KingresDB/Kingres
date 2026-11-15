@@ -220,9 +220,42 @@ describe('the production build under the content security policy', () => {
       await state.close?.(page)
       await collect(`${state.name} (closed)`)
     }
-    // A reload while the system database is stopped (the session of the tab is kept for it).
+  })
+
+  it('shows the 0.6.0 states (reload while stopped, incomplete ledger, partial audit log) without a violation', async () => {
+    // Reload while the system database is stopped: nothing is kept in the browser, the server answers
+    // getSession with degraded: true and the instance to start comes from listThisServerInstances.
+    const stopped = STATES.find((s) => s.name === 'system database stopped')
+    if (!stopped) throw new Error('state missing')
     await page.goto(`${server.url}/this-server`, { waitUntil: 'networkidle0' })
     await settled(page)
+    await stopped.open(page)
+    await page.reload({ waitUntil: 'networkidle0' })
+    await page.waitForSelector('[data-testid="instance-known"]', { timeout: 30_000 })
+    await collect('stopped state after a reload (degraded session)')
+    const stored = await page.evaluate(() => [
+      ...Object.keys(localStorage),
+      ...Object.keys(sessionStorage),
+    ])
+    expect(stored.filter((k) => k !== 'kingres.theme')).toEqual([])
+    await stopped.close?.(page)
+    await collect('stopped state ended')
+
+    mockConfig.incompleteLedger = true
+    await page.goto(`${server.url}/ledger`, { waitUntil: 'networkidle0' })
+    await settled(page)
+    await clickText(page, 'Generate digest')
+    await page.waitForSelector('[data-testid^="digest-coverage-"]', { timeout: 20_000 })
+    await collect('incomplete digest')
+    mockConfig.incompleteLedger = false
+
+    mockConfig.partial = [{ serverId: '10.0.0.13', reason: 'timeout' }]
+    await page.goto(`${server.url}/security`, { waitUntil: 'networkidle0' })
+    await settled(page)
+    await clickText(page, 'Audit log', '[role="tab"]')
+    await page.waitForSelector('[data-testid="partial-notice"]', { timeout: 20_000 })
+    await collect('partial audit log')
+    mockConfig.partial = null
   })
 
   it('runs the sign-in page and the first-run wizard without a violation', async () => {
