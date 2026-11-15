@@ -162,4 +162,3 @@ COMMENT ON FUNCTION kingres.ledger_blocks_entries(bigint, int) IS
 
 REVOKE ALL ON FUNCTION kingres.ledger_head() FROM PUBLIC;
 REVOKE ALL ON FUNCTION kingres.ledger_blocks_entries(bigint, int) FROM PUBLIC;
-
