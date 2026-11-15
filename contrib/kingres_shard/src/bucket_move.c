@@ -92,6 +92,7 @@ PG_FUNCTION_INFO_V1(kingres_internal_switch_bucket);
 PG_FUNCTION_INFO_V1(kingres_internal_attach_bucket);
 PG_FUNCTION_INFO_V1(kingres_internal_detach_bucket);
 PG_FUNCTION_INFO_V1(kingres_internal_subscription_conninfo);
+PG_FUNCTION_INFO_V1(kingres_internal_note_barrier);
 
 /* ---------------------------------------------------------------------------
  * Control sessions
@@ -108,6 +109,7 @@ typedef struct CtlConn
 	char		user[NAMEDATALEN];
 	PGconn	   *conn;
 	char		fault[KS_CTL_FAULT_LEN];	/* kingres_shard.fault_injection last sent */
+	int64		barrier_gen;	/* a restore-point barrier this session raised and has not lowered; 0 none */
 } CtlConn;
 
 static CtlConn ctl_cache[KS_MAX_CTL];
@@ -120,6 +122,7 @@ ctl_discard(CtlConn *cc)
 		PQfinish(cc->conn);
 	cc->conn = NULL;
 	cc->fault[0] = '\0';
+	cc->barrier_gen = 0;
 }
 
 /* Ask the node to stop the running statement, waiting for the request for a bounded time only (S3-07). */
@@ -420,6 +423,77 @@ kingres_internal_node_exec(PG_FUNCTION_ARGS)
 	result = result_to_jsonb(res);
 	PQclear(res);
 	PG_RETURN_DATUM(result);
+}
+
+/*
+ * kingres.internal_note_barrier(node_id int, generation bigint) returns void
+ *
+ * See the install script.  The barrier is lowered by the abort callback below
+ * when the transaction ends in an error or a cancel.
+ */
+Datum
+kingres_internal_note_barrier(PG_FUNCTION_ARGS)
+{
+	int			node_id = PG_GETARG_INT32(0);
+	int64		gen = PG_GETARG_INT64(1);
+	const KsNode *n;
+	char	   *host;
+	int			port;
+
+	require_superuser("kingres.internal_note_barrier()");
+	n = kingres_shard_node_by_id(node_id);
+	if (n == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("node %d does not exist", node_id)));
+	host = pstrdup(n->host);
+	port = n->port;
+	ctl_get(host, port)->barrier_gen = gen;
+	PG_RETURN_VOID();
+}
+
+/*
+ * The abort of the transaction that raised a barrier lowers it, over the
+ * control session that raised it (when that session is still usable: a session
+ * whose command was cancelled has been closed, and the node lowers the barrier of
+ * a session that ended).  Nothing is thrown, and every wait is bounded.
+ */
+static void
+ctl_xact_callback(XactEvent event, void *arg)
+{
+	int			i;
+
+	if (event != XACT_EVENT_ABORT)
+		return;
+	for (i = 0; i < nctl; i++)
+	{
+		CtlConn    *cc = &ctl_cache[i];
+		char		sql[160];
+		PGresult   *res;
+
+		if (cc->barrier_gen == 0)
+			continue;
+		if (cc->conn == NULL || PQstatus(cc->conn) != CONNECTION_OK ||
+			PQtransactionStatus(cc->conn) != PQTRANS_IDLE)
+		{
+			ctl_discard(cc);
+			continue;
+		}
+		snprintf(sql, sizeof(sql),
+				 "SELECT " KINGRES_SHARD_SCHEMA ".internal_restore_barrier('off', NULL, " INT64_FORMAT ")",
+				 cc->barrier_gen);
+		res = kingres_shard_bounded_exec(cc->conn, sql, false);
+		if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK)
+			ctl_discard(cc);
+		PQclear(res);
+		cc->barrier_gen = 0;
+	}
+}
+
+void
+kingres_shard_ctl_init(void)
+{
+	RegisterXactCallback(ctl_xact_callback, NULL);
 }
 
 /*

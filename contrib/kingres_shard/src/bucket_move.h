@@ -24,6 +24,9 @@
  */
 extern void kingres_shard_assert_no_move(int colocation_id);
 
+/* Registers the callback that lowers the restore-point barriers of an aborted transaction. */
+extern void kingres_shard_ctl_init(void);
+
 /*
  * Make the relcache entry of a distributed table (its partition list) at least
  * as new as the catalog cache the planner hook has just read, version

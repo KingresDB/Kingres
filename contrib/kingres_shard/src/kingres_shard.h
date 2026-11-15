@@ -42,6 +42,12 @@
 #define ERRCODE_KINGRES_STALE_MAP MAKE_SQLSTATE('K','S','0','0','1')
 
 /*
+ * SQLSTATE of "the catalog of the sender has been superseded": the refusing node
+ * holds a newer catalog term (term.c).  The detail carries "kingres-term=<n>".
+ */
+#define ERRCODE_KINGRES_STALE_TERM MAKE_SQLSTATE('K','S','0','0','2')
+
+/*
  * SQLSTATE of a switch attempt of a bucket move that gave up waiting (for the
  * lock of the bucket's tables, or for the replay of the copy): the move goes
  * back to catching up and tries again (bucket_move.c).
@@ -90,6 +96,7 @@ extern PGDLLIMPORT int kingres_shard_move_switch_attempts;
 extern PGDLLIMPORT int kingres_shard_move_cleanup_delay;
 extern PGDLLIMPORT int kingres_shard_deadlock_check_interval;
 extern PGDLLIMPORT int kingres_shard_deadlock_confirm_delay;
+extern PGDLLIMPORT int kingres_shard_decision_retention;
 
 extern bool kingres_shard_check_node_conninfo(char **newval, void **extra,
 											   GucSource source);

@@ -46,9 +46,11 @@
 #include "dist_scan.h"
 #include "fanout.h"
 #include "forward_auth.h"
+#include "bucket_move.h"
 #include "ha.h"
 #include "kingres_shard.h"
 #include "node_conn.h"
+#include "term.h"
 #include "planner.h"
 #include "recovery.h"
 #include "remote_scan.h"
@@ -76,6 +78,7 @@ int			kingres_shard_move_switch_attempts = 20;
 int			kingres_shard_move_cleanup_delay = 600;	/* s */
 int			kingres_shard_deadlock_check_interval = 2;
 int			kingres_shard_deadlock_confirm_delay = 200;	/* ms */
+int			kingres_shard_decision_retention = 300;	/* s */
 
 /*
  * _PG_init
@@ -135,6 +138,7 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	kingres_shard_forward_auth_init();
+	kingres_shard_term_init();
 
 	/*
 	 * The longest a wait on a node may last where nothing may be left waiting
@@ -239,6 +243,15 @@ _PG_init(void)
 							PGC_SIGHUP, GUC_UNIT_MS,
 							NULL, NULL, NULL);
 
+	/* Failover of a participant (review S7-07). */
+	DefineCustomIntVariable("kingres_shard.decision_retention",
+							"Seconds that the commit decisions of a transaction that is over are kept when the participant's group has a standby.",
+							"If the participant's group fails over in that time, the origin compares its decisions with the participant's own record and reports a committed transaction that the new primary has no trace of; 0 keeps them no longer than recovery needs them.",
+							&kingres_shard_decision_retention,
+							300, 0, 86400,
+							PGC_SIGHUP, GUC_UNIT_S,
+							NULL, NULL, NULL);
+
 	MarkGUCPrefixReserved("kingres_shard");
 
 	/* Two-phase commit needs prepared transactions on every node. */
@@ -251,6 +264,7 @@ _PG_init(void)
 	kingres_shard_ha_init();
 	kingres_shard_catalog_init();
 	kingres_shard_conn_init();
+	kingres_shard_ctl_init();
 	kingres_shard_recovery_init();
 	kingres_shard_fanout_init();
 	kingres_shard_dist_scan_init();

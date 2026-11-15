@@ -41,6 +41,8 @@ sub prepare_row
 		SELECT kingres.create_distributed_table('public.kv', 'id', bucket_count => 6);
 	});
 	my @k = keys_of_group($n1, 1, 1, 8);
+	# These names were prepared by 0.4 before this node was upgraded: the moment of the upgrade is ahead (S7-09).
+	$_->safe_psql('postgres', "UPDATE kingres.dtx_epoch SET old_format_until = now() + interval '1 hour'") for ($n1, $n2, $n3);
 	# A transaction number that no backend has: it is over, whatever format the gid has.
 	my $x = '4000000000';
 	# Old format (kingres_<origin node>_<pid>_<xid>_<target node>), decided: committed.
@@ -85,6 +87,8 @@ sub prepare_row
 	my $id = register_standby($n1, $s2, 1);
 	my $x = '4000000000';
 	my @j = keys_of_group($n1, 1, 2, 2);
+	# These names were prepared by 0.4 before this node was upgraded: the moment of the upgrade is ahead (S7-09).
+	$_->safe_psql('postgres', "UPDATE kingres.dtx_epoch SET old_format_until = now() + interval '1 hour'") for ($n1, $n2, $n3);
 	# Prepared on node 3 by node 2 with the 0.4 identifier, and decided by node 2.
 	prepare_row($n3, "kingres_2_999_${x}1_3", $j[0]);
 	$n2->safe_psql('postgres', "INSERT INTO kingres.dtx_log VALUES ('kingres_2_999_${x}1_3', 3, now())");

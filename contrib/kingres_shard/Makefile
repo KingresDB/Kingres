@@ -25,6 +25,7 @@ OBJS = \
 	src/recovery.o \
 	src/remote_scan.o \
 	src/shippable.o \
+	src/term.o \
 	src/utility.o
 PGFILEDESC = "kingres_shard - KingresDB sharding extension"
 

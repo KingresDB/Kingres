@@ -65,6 +65,8 @@ typedef struct KsCatalog
 {
 	bool		present;
 	int64		map_version;
+	int64		term;			/* catalog term: raised by every promotion (failover.c) */
+	int64		superseded_by_term; /* 0, or the newer term this node learned of while acting as the map primary */
 	int			local_node_id;	/* 0 when the cluster is not initialized */
 	int			local_group_id;	/* -1 when the cluster is not initialized */
 	int			ngroups;		/* number of groups with an active primary */
@@ -82,6 +84,7 @@ extern void kingres_shard_catalog_invalidate(void);
 extern int64 kingres_shard_placement_hash(const KsColocation *coloc);
 extern int64 kingres_shard_placement_hash_now(int colocation_id);
 extern int64 kingres_shard_map_version_now(void);
+extern int64 kingres_shard_term_now(void);
 extern int64 kingres_shard_partition_set_identity(int n, const Oid *oids);
 extern int64 kingres_shard_partition_identity_now(Oid parent);
 extern const KsDistTable *kingres_shard_lookup_dist_table(Oid relid);

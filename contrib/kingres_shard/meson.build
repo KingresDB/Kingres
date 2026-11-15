@@ -19,6 +19,7 @@ kingres_shard_sources = files(
   'src/recovery.c',
   'src/remote_scan.c',
   'src/shippable.c',
+  'src/term.c',
   'src/utility.c',
 )
 
@@ -140,6 +141,15 @@ tests += {
       't/058_review_s6.pl',
       't/059_restore_node.pl',
       't/060_shared_schema.pl',
+      't/061_sync_decision.pl',
+      't/062_participant_sync.pl',
+      't/063_catalog_term.pl',
+      't/064_promote_resume.pl',
+      't/065_deadlock_identity.pl',
+      't/066_restore_cancel.pl',
+      't/067_gid_tag.pl',
+      't/068_participant_failover.pl',
+      't/069_inflight_promotion.pl',
     ],
   },
 }

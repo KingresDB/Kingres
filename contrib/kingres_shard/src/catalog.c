@@ -354,6 +354,12 @@ catalog_load(void)
 					DatumGetInt64(heap_getattr(tup, 1,
 											   RelationGetDescr(cs.rel),
 											   &isnull));
+				/* the columns that review S7 added; an older SQL script has only the version */
+				if (RelationGetDescr(cs.rel)->natts >= 3)
+				{
+					cat.term = DatumGetInt64(heap_getattr(tup, 2, RelationGetDescr(cs.rel), &isnull));
+					cat.superseded_by_term = DatumGetInt64(heap_getattr(tup, 3, RelationGetDescr(cs.rel), &isnull));
+				}
 			}
 			catscan_end(&cs);
 
@@ -902,4 +908,31 @@ kingres_map_version_bump(PG_FUNCTION_ARGS)
 	SPI_finish();
 	ks.valid = false;
 	return PointerGetDatum(NULL);
+}
+
+/*
+ * The latest committed catalog term of this node (the same read as
+ * kingres_shard_map_version_now(): no cache, so no reload of the catalog and no
+ * side effect on the cached sessions); -1 when there is none.
+ */
+int64
+kingres_shard_term_now(void)
+{
+	Oid			relid = kingres_shard_catalog_relid("map_version");
+	CatScan		cs;
+	HeapTuple	tup;
+	int64		term = -1;
+
+	if (!OidIsValid(relid))
+		return -1;
+	catscan_begin(&cs, relid);
+	tup = catscan_next(&cs);
+	if (tup != NULL && RelationGetDescr(cs.rel)->natts >= 3)
+	{
+		bool		isnull;
+
+		term = DatumGetInt64(heap_getattr(tup, 2, RelationGetDescr(cs.rel), &isnull));
+	}
+	catscan_end(&cs);
+	return term;
 }
