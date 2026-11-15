@@ -36,9 +36,11 @@ sub other_installation
 {
 	my $mine = PostgreSQL::Test::Cluster->new('probe')->pg_version->major;
 	my $other = $mine == 18 ? 19 : 18;
-	my $work = $ENV{KINGRES_WORK} // "$ENV{HOME}/kingres-work";
+	# Only an installation that is named explicitly is used.  Guessing one
+	# (the default work area of kingres/dev/ext.sh) made this test run, and
+	# fail, against whatever old build happened to be there when the suite was
+	# run in tree without these variables.
 	my $spec = $ENV{"KINGRES_PG$other"};
-	$spec //= "$work/install" if $other == 18;
 	return (undef, "no installation of PostgreSQL $other (set KINGRES_PG$other, see kingres/dev/ext-majors.sh)")
 	  unless defined $spec && $spec ne '';
 	my $dir = -d $spec ? $spec : dirname(dirname($spec));
