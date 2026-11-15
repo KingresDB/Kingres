@@ -7,6 +7,102 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-15: Contract 0.4.0 complete and 0.5.0, certificates, cluster-wide reads, a real three-node cluster test, second review of kingresd
+
+### What was done
+
+- **Control plane, 80 of 88 operations** (commits a35bf950e3 and
+  e95eaa06a3):
+  - the rest of contract 0.4.0: server groups, inclusion proofs, the list of
+    ledger verifications, start, stop and restart of an instance, leaving a
+    cluster, local settings; the security headers and the cookie attributes
+    the panel's review asked for; crash points in the task engine with a
+    test that interrupts a join at every step;
+  - certificates: every server renews its own certificate when a third of
+    its lifetime is left, the key stays, nothing is restarted, and the
+    revocation list is issued again long before it runs out; an
+    administrator can renew or revoke a server's certificates;
+  - `listLogs`, `listAlerts` and `queryMetrics` answer for the whole cluster
+    from any server and name the servers that did not answer;
+  - four alerts are raised: `certificateExpiring`,
+    `certificateRenewalFailed`, `ledgerPendingTooOld`, `versionMismatch`.
+- **REST contract 0.5.0**, additive only: the two certificate operations,
+  `partial` and `missingServers` on the log, alert and metric answers, two
+  problem codes, two task kinds, one alert kind.
+- **Web panel** (commit f82bb16231): follows every entry of the 0.4.0
+  changelog (ledger proof and byte-exact digest download, fingerprint pin
+  when adding or joining a server, instance start and stop, local settings,
+  leave cluster, server groups), shows one calm state while the system
+  database is stopped, and is generated from contract 0.5.0.
+- **Packaging** (commit b12e1f1d7a): the compose test joins the three nodes
+  into one cluster through the REST API, once with `addServer` and once with
+  `joinCluster`, both with the certificate fingerprint pinned, and then
+  writes on one node and reads on all three. The compose file had the
+  internal API on a port no peer looks at; it is corrected.
+- **Second independent review of `kingresd`**
+  ([reviews/2026-11-15-kingresd-0.4.md](reviews/2026-11-15-kingresd-0.4.md)):
+  22 findings, none critical, four high.
+
+### How it was verified
+
+Run by the integrator on the committed tree unless it says otherwise.
+
+- Control plane: Windows and Linux builds, `go vet`, `gofmt -l`, unit tests
+  of 30 packages, and the WSL integration run with real PostgreSQL: 30 test
+  binaries, 391 top-level tests, none failed, none skipped. The race
+  detector was run by the author only, on Windows, without PostgreSQL.
+- Contract 0.5.0: the rule checker passes (71 paths, 88 operations, 172
+  schemas).
+- Panel: typecheck, lint, build, generated-files check and brand check
+  clean; 396 unit and component tests; 17 tests in a headless browser. The
+  end-to-end run against the real server (44 steps, including a proof
+  checked by `kingres-verify`) was run by its author only.
+- Packaging: the compose cluster test from a clean snapshot of the commit,
+  138 checks, none failed, two marked as known defects of `kingresd` (below).
+  The image and package tests were not run again by the integrator after
+  this change; the author ran the image test (79 checks).
+
+### Decisions and deviations
+
+- A renewed certificate keeps the server's key and names, and the previous
+  certificate stays valid until it expires. The CA therefore records every
+  serial it issues, and a revocation covers all of them.
+- A revoked server gets back in by being removed and joining again. That
+  works only for a server that holds no bucket copy until rebalance exists.
+- Alerts stay on the server that raised them; an alert id carries the
+  server's ordinal and stays below 2^53.
+- Cursors of logs and alerts changed format with 0.5.0; a cursor from 0.4.0
+  answers 400.
+- The panel's unit tests run with six workers: two timer-dependent tests
+  failed now and then with one worker per core.
+
+### Still open
+
+- **`kingresd`, second review**: a forwarded identity is accepted by name
+  from any holder of a cluster certificate (CP2-01); `addServer` lets
+  `kingres_ops` reach `kingres_admin` (CP2-02, by reading only); a pinned
+  fingerprint is dropped when `addServer` goes through a follower (CP2-03);
+  task leases use the claiming server's clock (CP2-06); ledger verification
+  covers the leader's shard group only but answers `passed` (CP2-08). The
+  fix round is running. CP2-04 (no renewal) is closed by the certificate
+  work above.
+- **`kingresd`, found by the compose test**: `getDatabase` on a follower
+  answers a null bucket count, and a stopped follower stays listed as live
+  because there is no heartbeat (phase 5).
+- **Eight operations** still answer "not supported yet": the six of
+  rebalance, `failoverServer` and `restorePreferredPrimaries`.
+- **`kingres_shard` 0.3** (moving buckets) is written but not committed: one
+  of about fifteen thousand scans during a move returned a wrong count
+  without an error. The cause is being looked for. The fix round for S3-01
+  to S3-18 has not started.
+- **Panel**: no buttons for renewing or revoking certificates and no notice
+  for incomplete cluster-wide answers yet; both are being built. An
+  independent review of the fix round and of the 0.4.0 change is running.
+- A file pushed in commit 5c829987d5 contained a machine-local path; the
+  file is corrected, the line remains in history.
+
+---
+
 ## 2026-11-15: Several servers in one cluster, four independent reviews and their fix rounds, contract 0.4.0
 
 ### What was done
