@@ -1,3 +1,20 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="kingres/brand/svg/kingres-db-horizontal-color-dark.svg">
+    <img src="kingres/brand/svg/kingres-db-horizontal-color-light.svg" alt="KingresDB" width="420">
+  </picture>
+</p>
+
+KingresDB
+=========
+
+This repository is KingresDB, a database derived from PostgreSQL that adds
+sharding, a tamper-evident ledger and a cluster management panel.  The
+KingresDB-specific code and documentation live in the `kingres/` directory
+and in `contrib/kingres_*`; start with [kingres/README.md](kingres/README.md).
+Everything else in this tree is the PostgreSQL source it is based on, and the
+original PostgreSQL README follows unchanged.
+
 PostgreSQL Database Management System
 =====================================
 
