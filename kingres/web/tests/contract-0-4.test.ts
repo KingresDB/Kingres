@@ -16,13 +16,15 @@ import { createTask, serverView } from '@/mocks/state'
 import type { ProblemCode } from '@/api/types'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
+// The same file the generator reads: KINGRES_API_SPEC, or the working tree of the contract.
+const specFile = process.env.KINGRES_API_SPEC ?? join(root, '../api/openapi.yaml')
 interface Spec {
   info: { version: string }
   components: {
     schemas: Record<string, { enum?: string[]; required?: string[] }>
   }
 }
-const spec = parse(readFileSync(join(root, '../api/openapi.yaml'), 'utf8')) as Spec
+const spec = parse(readFileSync(specFile, 'utf8')) as Spec
 const codes = spec.components.schemas.ProblemCode!.enum as ProblemCode[]
 
 describe('contract 0.4.0', () => {

@@ -121,6 +121,19 @@ export function safeText(value: string, limit = 200): string {
   return [...value].length > limit ? `${shown}…` : shown
 }
 
+/**
+ * An ordinary space is drawn as a space, so "orders", "orders " and " orders" look alike. Returns what
+ * is unusual about the spaces of a name: at the start, at the end, or two in a row.
+ */
+export function spaceIssues(value: string): string[] {
+  const out: string[] = []
+  if (value.startsWith(' ')) out.push('starts with a space')
+  if (value.endsWith(' ') && value.trim() !== '') out.push('ends with a space')
+  if (value.trim() === '' && value !== '') out.push('is only spaces')
+  if (/ {2}/.test(value.trim())) out.push('has two spaces in a row')
+  return out
+}
+
 /** True when `pieces` would show an escape. */
 export function hasHidden(value: string): boolean {
   for (const char of value) if (needsEscape(char)) return true
@@ -285,20 +298,18 @@ export interface NameAnalysis {
   hidden: number
 }
 
-/** Examines at most the first 300 characters. */
+/** Examines at most the first 300 characters for scripts and look-alikes; hidden characters in all of it. */
 export function analyseName(value: string): NameAnalysis {
   const scripts: string[] = []
   let hidden = 0
+  for (const char of value) if (needsEscape(char)) hidden += 1
   let nonAscii = 0
   let allLookalike = true
   let skeleton = ''
   let n = 0
   for (const char of value) {
     if (n++ >= 300) break
-    if (needsEscape(char)) {
-      hidden += 1
-      continue
-    }
+    if (needsEscape(char)) continue
     if (/\p{L}/u.test(char)) {
       const script = SCRIPT_RES.find(([, re]) => re.test(char))?.[0]
       if (script && !scripts.includes(script)) scripts.push(script)
@@ -334,6 +345,11 @@ export function nameWarnings(value: string): string[] {
   if (a.hidden > 0)
     out.push(
       `Contains ${a.hidden} hidden character${a.hidden === 1 ? '' : 's'}, shown as U+ codes. It can look like another name.`,
+    )
+  const spaces = spaceIssues(value)
+  if (spaces.length > 0)
+    out.push(
+      `Has spaces that are easy to miss: it ${spaces.join(' and ')}. It can look like another name.`,
     )
   if (a.mixedScripts)
     out.push(

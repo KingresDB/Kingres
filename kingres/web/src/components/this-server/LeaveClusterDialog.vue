@@ -39,9 +39,14 @@ const expected = computed(() => props.serverName || 'leave')
 const typedOk = computed(() => typed.value === expected.value)
 const code = computed(() => (error.value instanceof ApiError ? error.value.code : null))
 /** The first attempt met a leader that cannot be reached: only now "force" can be offered. */
+/** Only an answer of this server counts: a failure the panel made up (network, proxy) says nothing about the leader. */
+const answeredByServer = computed(() => error.value instanceof ApiError && !error.value.synthetic)
 const leaderUnreachable = computed(
-  () => code.value === 'service_unavailable' || code.value === 'leader_unavailable',
+  () =>
+    answeredByServer.value &&
+    (code.value === 'service_unavailable' || code.value === 'leader_unavailable'),
 )
+const noAnswer = computed(() => error.value instanceof ApiError && error.value.synthetic)
 
 /** For each refusal: what the administrator has to do first (the cause comes from the problem). */
 const TO_DO_FIRST: Record<string, string> = {
@@ -71,6 +76,7 @@ async function leave(): Promise<void> {
     // keeps the force option.
     if (!(
       e instanceof ApiError &&
+      !e.synthetic &&
       (e.code === 'service_unavailable' || e.code === 'leader_unavailable')
     ))
       force.value = false
@@ -164,15 +170,23 @@ onBeforeUnmount(() => {
         <span aria-hidden="true">&#9432;</span>
         <span><strong>What to do first.</strong> {{ toDoFirst }}</span>
       </p>
+      <p v-if="noAnswer" class="notice tone-info" role="status" data-testid="leave-no-answer">
+        <span aria-hidden="true">&#9432;</span>
+        <span
+          >No answer came back from this server, so nothing is known about the manager leader. The
+          request may or may not have been carried out: reload the page and check whether this
+          server is still a member of the cluster before you try again.</span
+        >
+      </p>
       <div v-if="leaderUnreachable" class="stack" data-testid="force-leave">
         <p class="notice tone-warn" role="alert">
           <span aria-hidden="true">&#9650;</span>
           <span
-            >The manager leader cannot be reached. You can make this server leave anyway. The
-            cluster is then not told, and its certificate is <strong>not revoked</strong>: the
-            cluster keeps listing this server, and the certificate stays valid, until an
-            administrator removes the server on the cluster with "Remove server". The checks above
-            still apply.</span
+            >This server could not reach the manager leader, or the answer was lost. You can make
+            this server leave anyway. The cluster is then not told, and its certificate is
+            <strong>not revoked</strong>: the cluster keeps listing this server, and the certificate
+            stays valid, until an administrator removes the server on the cluster with "Remove
+            server". The checks above still apply.</span
           >
         </p>
         <label class="check"

@@ -1,10 +1,12 @@
 <!-- SPDX-License-Identifier: PostgreSQL -->
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
-// The four server operations, each with a confirmation that states the consequence:
-// add server, remove server, failover (hard or graceful), restore preferred primaries.
+// The server operations, each with a confirmation that states the consequence: add server, remove
+// server, failover (hard or graceful), restore preferred primaries, and (0.5.0) renew and revoke the
+// certificates of a server.
 import { computed, reactive, ref } from 'vue'
 import { safeText } from '@/lib/safe-text'
+import SafeName from './SafeName.vue'
 import type { QueryKey } from '@tanstack/vue-query'
 import TaskActionDialog from './TaskActionDialog.vue'
 import FormField from './FormField.vue'
@@ -13,12 +15,12 @@ import { useServerGroups, useServers } from '@/api/queries'
 import { RouterLink } from 'vue-router'
 import FingerprintHelp from './FingerprintHelp.vue'
 import FingerprintValue from './FingerprintValue.vue'
-import { fingerprintError } from '@/lib/fingerprint'
+import { fingerprintError, normalizeFingerprint } from '@/lib/fingerprint'
 import { firstError, nodeAddress, required, compact } from '@/lib/validators'
 import type { Server } from '@/api/types'
 
 const props = defineProps<{
-  kind: 'add' | 'remove' | 'failover' | 'restore'
+  kind: 'add' | 'remove' | 'failover' | 'restore' | 'renew' | 'revoke'
   server?: Server
   invalidate?: QueryKey[]
 }>()
@@ -64,7 +66,7 @@ const config = computed(() => {
             setupToken: form.setupToken,
             serverGroup: form.serverGroup || null,
             ...(form.expectedFingerprint.trim()
-              ? { expectedFingerprint: form.expectedFingerprint.trim() }
+              ? { expectedFingerprint: normalizeFingerprint(form.expectedFingerprint) }
               : {}),
           }),
       }
@@ -84,6 +86,23 @@ const config = computed(() => {
         // Marking a server dead is not undone by a click: the address has to be typed.
         typeToConfirm: mode.value === 'hard' ? props.server?.address : undefined,
         start: () => endpoints.failoverServer(id, mode.value),
+      }
+    case 'renew':
+      return {
+        title: `Renew certificates of server ${props.server?.address ?? ''}`,
+        confirmLabel: 'Renew now',
+        danger: false,
+        typeToConfirm: undefined as string | undefined,
+        start: () => endpoints.renewServerCertificates(id),
+      }
+    case 'revoke':
+      return {
+        title: `Revoke certificates of server ${props.server?.address ?? ''}`,
+        confirmLabel: 'Revoke certificates',
+        danger: true,
+        // The id, not the address: it is what the operation names and what the audit log records.
+        typeToConfirm: props.server?.id,
+        start: () => endpoints.revokeServerCertificates(id),
       }
     default:
       return {
@@ -106,6 +125,7 @@ const config = computed(() => {
     :start="config.start"
     :validate="validate"
     :invalidate="invalidate"
+    :wide="kind === 'revoke'"
     @close="emit('close')"
   >
     <template v-if="kind === 'add'" #result="{ task }">
@@ -171,8 +191,11 @@ const config = computed(() => {
 
       <template v-else-if="kind === 'remove'">
         <p>
-          Server <strong>{{ server?.address }}</strong> is unregistered, reset to an unconfigured
-          server, and its certificate is revoked. It can join a cluster again afterwards.
+          Server
+          <strong><SafeName :value="server?.address ?? ''" kind="text" :max="80" /></strong> is
+          unregistered, told to delete its PostgreSQL instance and the data of it on that machine,
+          reset to an unconfigured server, and its certificate is revoked (the server shows as
+          decommissioning meanwhile). It can join a cluster again afterwards.
         </p>
         <p>
           <strong>The server must not hold any bucket copy.</strong> Removing does not move data. To
@@ -186,6 +209,76 @@ const config = computed(() => {
           The server is refused while it hosts the cluster metadata (shard group 0) or is the
           manager leader, while it is the only server, while a rebalance runs, and when it is dead
           (fail it over first).
+        </p>
+        <p v-if="server?.certificateRevokedAt" class="notice tone-info">
+          <span aria-hidden="true">&#9432;</span>
+          <span>
+            The certificates of this server are revoked. Removing it, and then joining it again with
+            a new setup token, is the only way back. That works only for a server that holds no
+            bucket copy<template v-if="server.buckets.primary + server.buckets.replica > 0"
+              >, and this one still holds some</template
+            >.
+          </span>
+        </p>
+      </template>
+
+      <template v-else-if="kind === 'renew'">
+        <p>
+          The manager leader issues a new certificate for server
+          <strong><SafeName :value="server?.address ?? ''" kind="text" :max="80" /></strong> now and
+          installs it on the server. Nothing is restarted and open connections keep working.
+        </p>
+        <p class="muted">
+          A server renews its own certificate before it expires, so this is for when you do not want
+          to wait, for example after the alert <em>Certificate renewal failed</em>. It is also the
+          way to renew a certificate that has already expired: the leader can still reach the server
+          although the server can no longer call the leader.
+        </p>
+      </template>
+
+      <template v-else-if="kind === 'revoke'">
+        <p class="notice tone-danger" data-testid="revoke-warning">
+          <span aria-hidden="true">&#10006;</span>
+          <span>
+            <strong>This cannot be undone.</strong> Revoking the certificates of server
+            <strong><SafeName :value="server?.id ?? ''" kind="text" :max="80" /></strong> makes
+            every certificate it has invalid, in the whole cluster, for good.
+          </span>
+        </p>
+        <h3>What happens</h3>
+        <ul>
+          <li>
+            The revocation list is sent to every server and every database instance. The task waits
+            for a server that is down, like every task that concerns the whole cluster.
+          </li>
+          <li>
+            From then on every other server and every database instance refuses this server, in both
+            directions: its calls to them (the internal API, forwarding, recording tasks, leaving)
+            and the connections between the database instances (the sharding connections too) are
+            refused, and so are their calls to it.
+          </li>
+          <li>Connections that are open now keep running until they end. New ones are refused.</li>
+          <li>
+            The server never gets a new certificate: <em>Renew now</em> answers that the
+            certificates are revoked.
+          </li>
+        </ul>
+        <h3>The only way back</h3>
+        <p>
+          Remove the server and join it again with a new setup token. Removing works
+          <strong>only for a server that holds no bucket copy</strong>. A server that holds bucket
+          copies can be removed only after a rebalance has emptied it, which the current server
+          version cannot do yet, so for a server that holds data revocation is a one-way door.
+          <template v-if="server">
+            Server <SafeName :value="server.id" kind="text" :max="80" /> holds
+            <strong>{{ server.buckets.primary }}</strong> primary and
+            <strong>{{ server.buckets.replica }}</strong> replica buckets now.
+          </template>
+        </p>
+        <p class="muted">
+          The certificates of the manager leader cannot be revoked (the server refuses with
+          <em>Server hosts the cluster metadata</em>). If the manager leader does not hold the key
+          of the certificate authority, nothing is revoked and nothing is changed.
         </p>
       </template>
 
@@ -204,15 +297,17 @@ const config = computed(() => {
         <p v-if="mode === 'hard'" class="notice tone-danger" role="alert">
           <span aria-hidden="true">&#10006;</span>
           <span>
-            Hard failover marks <strong>{{ server?.address }}</strong> as dead. Its
-            {{ primaries.length }} primary instance(s) are replaced by their standbys, and their
-            former neighbours carry double write load until you restore the preferred primaries.
+            Hard failover marks
+            <strong><SafeName :value="server?.address ?? ''" kind="text" :max="80" /></strong> as
+            dead. Its {{ primaries.length }} primary instance(s) are replaced by their standbys, and
+            their former neighbours carry double write load until you restore the preferred
+            primaries.
           </span>
         </p>
         <p v-else>
           The {{ primaries.length }} primary instance(s) on
-          <strong>{{ server?.address }}</strong> hand over to their standbys. The server stays in
-          the cluster as a standby.
+          <strong><SafeName :value="server?.address ?? ''" kind="text" :max="80" /></strong> hand
+          over to their standbys. The server stays in the cluster as a standby.
         </p>
       </template>
 

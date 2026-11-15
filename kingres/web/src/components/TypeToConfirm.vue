@@ -6,13 +6,18 @@
 // very long) can be copied with the button and pasted.
 import { computed, ref } from 'vue'
 import SafeName from './SafeName.vue'
-import { hasHidden } from '@/lib/safe-text'
+import { hasHidden, spaceIssues } from '@/lib/safe-text'
 
 const props = defineProps<{ expected: string }>()
 const model = defineModel<string>({ required: true })
 
 const id = `tc-${Math.random().toString(36).slice(2, 9)}`
-const hard = computed(() => hasHidden(props.expected) || [...props.expected].length > 40)
+const hard = computed(
+  () =>
+    hasHidden(props.expected) ||
+    spaceIssues(props.expected).length > 0 ||
+    [...props.expected].length > 40,
+)
 const copied = ref(false)
 
 async function copy(): Promise<void> {
@@ -32,8 +37,9 @@ async function copy(): Promise<void> {
     </label>
     <input :id="id" v-model="model" class="input mono" autocomplete="off" spellcheck="false" />
     <p v-if="hard" class="hint muted">
-      This name has hidden or many characters. Type it exactly as it is (the box compares the real
-      name, not what is drawn above), or copy it and paste it.
+      This name has hidden characters, spaces that are easy to miss, or many characters. Type it
+      exactly as it is (the box compares the real name, not what is drawn above), or copy it and
+      paste it.
       <button type="button" class="btn btn-small" @click="copy">Copy the name</button>
       <span v-if="copied" role="status"> Copied.</span>
     </p>

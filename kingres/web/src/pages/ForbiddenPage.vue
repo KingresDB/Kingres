@@ -3,6 +3,7 @@
 <script setup lang="ts">
 import { RouterLink } from 'vue-router'
 import StatePanel from '@/components/StatePanel.vue'
+import SafeName from '@/components/SafeName.vue'
 import { useSessionStore } from '@/stores/session'
 
 const session = useSessionStore()
@@ -15,7 +16,8 @@ const session = useSessionStore()
       <div class="stack" style="gap: var(--s-1)">
         <strong>Your account cannot open this page.</strong>
         <span>
-          You are signed in as <code>{{ session.username }}</code> with
+          You are signed in as
+          <code><SafeName :value="session.username ?? ''" kind="text" :max="60" /></code> with
           <code>{{ session.role ?? 'no cluster role' }}</code>. Ask an administrator to grant a
           cluster role that includes this page.
         </span>

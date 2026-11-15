@@ -21,6 +21,9 @@ export function getState(): MockState {
 export function resetMockState(options: { uninitialized?: boolean } = {}): MockState {
   state = createMockState(options)
   mockConfig.unsupported.clear()
+  mockConfig.partial = null
+  mockConfig.rejectCursors = false
+  mockConfig.caUnavailable = false
   return state
 }
 
@@ -147,6 +150,11 @@ const MUTATING = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
 export function paginate<T>(items: T[], url: URL): { items: T[]; nextCursor: string | null } {
   const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit') ?? 50)))
   const cursor = url.searchParams.get('cursor')
+  if (cursor && mockConfig.rejectCursors)
+    throw problem(
+      'bad_request',
+      'The cursor is not valid: it was issued by another revision of the API.',
+    )
   const offset = cursor ? Number(atob(cursor)) : 0
   const page = items.slice(offset, offset + limit)
   const next = offset + limit < items.length ? btoa(String(offset + limit)) : null

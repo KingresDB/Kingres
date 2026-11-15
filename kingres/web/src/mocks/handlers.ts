@@ -257,9 +257,24 @@ function requireSetupToken(ctx: Ctx): void {
 }
 
 /** A second setup request while one runs is a conflict (the token stays valid after a failure). */
-/** Colons and case do not matter for a fingerprint. */
+/**
+ * The contract says "SHA-256 fingerprint (hex, colons allowed)": 64 hex digits, with or without colons
+ * between the pairs, in either case. Nothing else (no spaces, no prefix) is accepted, so the mock is not
+ * more permissive than the contract, and a client that sends the display format is found out.
+ */
+const FINGERPRINT_SHAPE = /^[0-9a-fA-F]{2}(:?[0-9a-fA-F]{2}){31}$/
+function requireFingerprintShape(value: string | null | undefined): void {
+  if (value === undefined || value === null || value === '') return
+  if (!FINGERPRINT_SHAPE.test(value))
+    throw validationFailed([
+      {
+        field: 'expectedFingerprint',
+        message: 'Use 64 hexadecimal digits; colons between byte pairs are allowed.',
+      },
+    ])
+}
 function normalizeFp(text: string): string {
-  return text.replace(/[:s]/g, '').toLowerCase()
+  return text.replace(/:/g, '').toLowerCase()
 }
 
 function requireNoRunningSetup(s: MockState): void {
@@ -353,6 +368,7 @@ const joinCluster: Handler = (ctx) => {
   if (!b.dataPaths?.dataDirectory?.startsWith('/'))
     errors.push({ field: 'dataPaths.dataDirectory', message: 'Use an absolute path.' })
   if (errors.length) throw validationFailed(errors)
+  requireFingerprintShape(b.expectedFingerprint)
   if (b.existingNodeAddress.includes('unreachable'))
     throw problem('unprocessable', `Cannot reach ${b.existingNodeAddress}.`)
   if (b.admin.password !== MOCK_PASSWORD) throw problem('invalid_credentials')
@@ -735,6 +751,12 @@ const METRIC_UNIT: Record<S['MetricName'], S['MetricQueryResult']['unit']> = {
 
 const LEVEL_ORDER = ['debug', 'info', 'warning', 'error']
 
+/** `partial` and `missingServers` of a cluster-wide answer while `mockConfig.partial` is set. */
+function partialAnswer(): { partial?: boolean; missingServers?: S['MissingServer'][] } {
+  const missing = mockConfig.partial
+  return missing ? { partial: true, missingServers: structuredClone(missing) } : {}
+}
+
 function filterLogs(s: MockState, url: URL, serverId?: string) {
   const level = url.searchParams.get('level')
   const component = url.searchParams.get('component')
@@ -1108,6 +1130,7 @@ export function createHandlers(): HttpHandler[] {
         throw validationFailed([
           { field: 'address', message: 'Use host:port, for example 10.0.0.14:8091.' },
         ])
+      requireFingerprintShape(b.expectedFingerprint)
       if (b.setupToken !== MOCK_SETUP_TOKEN) throw problem('setup_token_invalid')
       if (s.servers.some((x) => x.address === b.address))
         throw problem(
@@ -1256,6 +1279,7 @@ export function createHandlers(): HttpHandler[] {
     },
     renewServerCertificates: (c) => {
       const s = c.s
+      if (mockConfig.caUnavailable) throw problem('certificate_authority_unavailable')
       const rec = server(s, c.params.serverId ?? '')
       if (rec.certificateRevokedAt) throw problem('certificate_revoked')
       if (activeTask(s, 'certificate.renew', String(rec.id))) throw problem('operation_in_progress')
@@ -1272,6 +1296,7 @@ export function createHandlers(): HttpHandler[] {
     },
     revokeServerCertificates: (c) => {
       const s = c.s
+      if (mockConfig.caUnavailable) throw problem('certificate_authority_unavailable')
       const rec = server(s, c.params.serverId ?? '')
       if (rec.id === '10.0.0.11') throw problem('server_hosts_map_group')
       if (rec.certificateRevokedAt) throw problem('certificate_revoked')
@@ -2370,12 +2395,13 @@ export function createHandlers(): HttpHandler[] {
     listAlerts: (c) => {
       const state = c.url.searchParams.get('state')
       const sev = c.url.searchParams.get('severity')
-      return ok(
-        paginate(
+      return ok({
+        ...paginate(
           c.s.alerts.filter((a) => (!state || a.state === state) && (!sev || a.severity === sev)),
           c.url,
         ),
-      )
+        ...partialAnswer(),
+      })
     },
     acknowledgeAlert: (c) => {
       const a = c.s.alerts.find((x) => x.id === num(c, 'alertId'))
@@ -2387,7 +2413,7 @@ export function createHandlers(): HttpHandler[] {
       }
       return ok(a satisfies Alert)
     },
-    listLogs: (c) => ok(filterLogs(c.s, c.url)),
+    listLogs: (c) => ok({ ...filterLogs(c.s, c.url), ...partialAnswer() }),
     queryMetrics: (c) => {
       const q = (k: string) => c.url.searchParams.get(k) ?? ''
       const metric = q('metric') as S['MetricName']
@@ -2429,6 +2455,7 @@ export function createHandlers(): HttpHandler[] {
         to: new Date(to).toISOString(),
         step,
         series,
+        ...partialAnswer(),
       } satisfies S['MetricQueryResult'])
     },
   }

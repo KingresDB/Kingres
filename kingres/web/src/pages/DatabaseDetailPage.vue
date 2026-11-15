@@ -288,6 +288,15 @@ const shardingOn = computed(() => db.value?.sharding.enabled === true)
         are deleted on every server, including the replicas. This cannot be undone.
       </span>
     </p>
+    <p v-if="db.ledger.mode !== 'off'" class="notice tone-danger" data-testid="drop-ledger-note">
+      <span aria-hidden="true">&#10006;</span>
+      <span>
+        This database has a ledger. Its hash chains, blocks and digests are deleted with it, so
+        nobody can verify its history afterwards, not even with a digest or a proof that you saved.
+        A ledger does not protect a database from being dropped; only the audit log keeps a record
+        that it happened. Download the digests you need first (Ledger page).
+      </span>
+    </p>
   </TaskActionDialog>
   <EnableLedgerDialog
     v-if="ledgerFor"

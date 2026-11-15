@@ -93,6 +93,20 @@ export const endpoints = {
     j(api.DELETE('/servers/{serverId}', { params: { path: { serverId } } })),
   failoverServer: (serverId: ServerId, mode: 'hard' | 'graceful') =>
     j(api.POST('/servers/{serverId}/failover', { params: { path: { serverId } }, body: { mode } })),
+  /** Gives the server a new certificate now (202 + task `certificate.renew`). */
+  renewServerCertificates: (serverId: ServerId) =>
+    j(
+      api.POST('/servers/{serverId}/certificates/renewals', {
+        params: { path: { serverId } },
+      }),
+    ),
+  /** Revokes every certificate of the server (202 + task `certificate.revoke`). Cannot be undone. */
+  revokeServerCertificates: (serverId: ServerId) =>
+    j(
+      api.POST('/servers/{serverId}/certificates/revocations', {
+        params: { path: { serverId } },
+      }),
+    ),
   listServerGroups: () => j(api.GET('/server-groups')),
 
   // --- databases

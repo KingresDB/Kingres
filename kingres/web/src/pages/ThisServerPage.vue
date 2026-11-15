@@ -20,7 +20,7 @@ import InstanceActionDialog from '@/components/this-server/InstanceActionDialog.
 import LeaveClusterDialog from '@/components/this-server/LeaveClusterDialog.vue'
 import { rememberInstances } from '@/api/availability'
 import { endpoints } from '@/api/endpoints'
-import { every, keys, POLL, useThisServer } from '@/api/queries'
+import { every, keys, POLL, useThisServer, useThisServerInstances } from '@/api/queries'
 import { INSTANCE_STATE, SERVICE_STATE } from '@/lib/status'
 import { instanceLabel } from '@/lib/cluster'
 import { formatBytes, formatDuration, percent } from '@/lib/format'
@@ -32,11 +32,7 @@ const resources = useQuery({
   queryFn: endpoints.getThisServerResources,
   refetchInterval: every(POLL.fast),
 })
-const instances = useQuery({
-  queryKey: [...keys.thisServer, 'instances'],
-  queryFn: endpoints.listThisServerInstances,
-  refetchInterval: every(POLL.fast),
-})
+const instances = useThisServerInstances()
 const action = ref<
   { kind: 'restart' | 'stop' | 'start'; instance: Instance } | { kind: 'leave' } | null
 >(null)
@@ -73,11 +69,16 @@ const percentText = (v: number) => percent(v)
       <section class="grid-cards" aria-label="Summary">
         <div class="card kpi">
           <span class="label">Node state</span
-          ><span class="value">{{ info.data.value.nodeState }}</span
-          ><span class="muted">Server id {{ info.data.value.serverId ?? 'none' }}</span>
+          ><span class="value"
+            ><SafeName :value="info.data.value.nodeState" kind="text" :max="40" /></span
+          ><span class="muted"
+            >Server id <SafeName :value="info.data.value.serverId ?? 'none'" kind="text" :max="60"
+          /></span>
         </div>
         <div class="card kpi">
-          <span class="label">Version</span><span class="value">{{ info.data.value.version }}</span
+          <span class="label">Version</span
+          ><span class="value"
+            ><SafeName :value="info.data.value.version" kind="text" :max="40" /></span
           ><span class="muted"
             >PostgreSQL <NullableValue :value="info.data.value.postgresVersion"
           /></span>

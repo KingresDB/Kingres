@@ -10,6 +10,7 @@ import type { Browser, Page } from 'puppeteer-core'
 import {
   ROUTES,
   SECURITY_TABS,
+  STATES,
   clickText,
   go,
   launch,
@@ -167,6 +168,37 @@ for (const [label, width, height] of [
           )
         if (!(await reachable('Sign out'))) failures.push(`${route}: "Sign out" is not reachable`)
       })
+      expect(failures).toEqual([])
+    })
+  })
+}
+
+for (const [label, width, height] of [
+  ['1366 px', 1366, 820],
+  ['320 px', 320, 640],
+] as const) {
+  describe(`the 0.4.0 and 0.5.0 states fit the window at ${label} (W2-16)`, () => {
+    it('dialogs, the proof with its digests and the stopped state do not push the page sideways or out of the window', async () => {
+      await page.setViewport({ width, height })
+      const failures: string[] = []
+      for (const state of STATES) {
+        await go(page, state.route)
+        await state.open(page)
+        const g = await geometry()
+        if (g.scrollWidth > g.innerWidth)
+          failures.push(
+            `${state.name}: page ${g.scrollWidth} > window ${g.innerWidth} (${g.offenders.join(', ')})`,
+          )
+        const dialog = await page.evaluate(() => {
+          const el = document.querySelector('[role="dialog"]')
+          if (!el) return null
+          const r = el.getBoundingClientRect()
+          return { left: r.left, right: r.right, width: window.innerWidth }
+        })
+        if (dialog && (dialog.left < -1 || dialog.right > dialog.width + 1))
+          failures.push(`${state.name}: the dialog is outside the window`)
+        await state.close?.(page)
+      }
       expect(failures).toEqual([])
     })
   })

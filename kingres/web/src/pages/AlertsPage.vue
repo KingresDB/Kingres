@@ -1,7 +1,8 @@
 <!-- SPDX-License-Identifier: PostgreSQL -->
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
+import { RouterLink } from 'vue-router'
 import TableWrap from '@/components/TableWrap.vue'
 import { useMutation, useQueryClient } from '@tanstack/vue-query'
 import PageHeader from '@/components/PageHeader.vue'
@@ -10,19 +11,42 @@ import StatusBadge from '@/components/StatusBadge.vue'
 import GateButton from '@/components/GateButton.vue'
 import ProblemNotice from '@/components/ProblemNotice.vue'
 import SafeName from '@/components/SafeName.vue'
+import PartialNotice from '@/components/PartialNotice.vue'
+import CursorResetNotice from '@/components/CursorResetNotice.vue'
+import { useCompletenessAnnouncement } from '@/composables/useCompletenessAnnouncement'
+import { isAddressableSegment } from '@/lib/path-segment'
+import { safeText } from '@/lib/safe-text'
+import { useSessionStore } from '@/stores/session'
 import { endpoints } from '@/api/endpoints'
 import { keys, usePagedQuery } from '@/api/queries'
 import { alertKindLabel, SEVERITY } from '@/lib/status'
 import { formatAgo, formatDateTime } from '@/lib/format'
 
 const client = useQueryClient()
+const session = useSessionStore()
 const state = ref<'' | 'open' | 'acknowledged' | 'resolved'>('')
-const { query: alerts, items } = usePagedQuery(
+const {
+  query: alerts,
+  items,
+  completeness,
+  cursorReset,
+  dismissCursorReset,
+} = usePagedQuery(
   () => [...keys.alerts, 'page'],
   (cursor) => endpoints.listAlerts({ cursor, limit: 100 }),
   10_000,
 )
 const shown = () => items.value.filter((a) => !state.value || a.state === state.value)
+useCompletenessAnnouncement(completeness, 'list of alerts')
+/** The server page can be opened for this id (the account may read servers, the id fits in a URL). */
+const canOpenServer = computed(() => session.can('getServer'))
+const linkable = (id: string): boolean => canOpenServer.value && isAddressableSegment(id)
+/**
+ * Alert ids are integers below 2^53 (0.5.0: the high bits name the server that holds the alert), which
+ * a JSON number holds exactly. An id at or above 2^53 would already have been rounded when the answer
+ * was read, so the panel does not send an acknowledgement for it.
+ */
+const idIsExact = (id: number): boolean => Number.isSafeInteger(id)
 const ack = useMutation({
   mutationFn: (id: number) => endpoints.acknowledgeAlert(id),
   onSettled: () =>
@@ -46,12 +70,21 @@ const STATE_LABEL = { open: 'Open', acknowledged: 'Acknowledged', resolved: 'Res
     </select>
   </div>
   <ProblemNotice v-if="ack.error.value" :error="ack.error.value" />
+  <CursorResetNotice :shown="cursorReset" @dismiss="dismissCursorReset" />
+  <PartialNotice
+    :completeness="completeness"
+    consequence="Alerts held by these servers are not shown."
+  />
   <QueryBoundary
     :loading="alerts.isPending.value"
     :error="alerts.error.value"
     :empty="shown().length === 0"
-    empty-title="No alerts"
-    empty-hint="Nothing matches this filter."
+    :empty-title="completeness.partial ? 'No alerts from the servers that answered' : 'No alerts'"
+    :empty-hint="
+      completeness.partial
+        ? 'This does not mean there are none: the servers named above did not answer, so their alerts are not shown.'
+        : 'Nothing matches this filter.'
+    "
     @retry="alerts.refetch()"
   >
     <TableWrap>
@@ -79,22 +112,38 @@ const STATE_LABEL = { open: 'Open', acknowledged: 'Acknowledged', resolved: 'Res
               <div class="muted">
                 <SafeName :value="a.message" kind="text" :max="600" multiline />
               </div>
+              <div v-if="a.serverId" class="muted" data-testid="alert-server">
+                Server
+                <RouterLink
+                  v-if="linkable(a.serverId)"
+                  :to="{ name: 'server', params: { id: a.serverId } }"
+                  ><SafeName :value="a.serverId" kind="text" :max="60"
+                /></RouterLink>
+                <SafeName v-else :value="a.serverId" kind="text" :max="60" />
+              </div>
             </td>
             <td>
-              {{ STATE_LABEL[a.state] }}
+              {{ STATE_LABEL[a.state] ?? safeText(String(a.state), 40) }}
               <div v-if="a.acknowledgedBy" class="muted">
                 by <SafeName :value="a.acknowledgedBy" :max="60" />
               </div>
             </td>
             <td :title="formatDateTime(a.raisedAt)">{{ formatAgo(a.raisedAt) }}</td>
             <td>
-              <GateButton
-                v-if="a.state === 'open'"
-                op="acknowledgeAlert"
-                small
-                @click="ack.mutate(a.id)"
-                >Acknowledge</GateButton
-              >
+              <template v-if="a.state === 'open'">
+                <GateButton
+                  v-if="idIsExact(a.id)"
+                  op="acknowledgeAlert"
+                  small
+                  :aria-label="`Acknowledge alert ${safeText(a.title, 80)}`"
+                  @click="ack.mutate(a.id)"
+                  >Acknowledge</GateButton
+                >
+                <span v-else class="muted"
+                  >This panel cannot acknowledge this alert: its id is too large to be sent
+                  exactly.</span
+                >
+              </template>
             </td>
           </tr>
         </tbody>

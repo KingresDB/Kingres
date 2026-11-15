@@ -53,7 +53,7 @@ describe('the system database is stopped', () => {
     expect(useSessionStore(pinia).isSignedIn).toBe(true)
     expect(router.currentRoute.value.name).not.toBe('login')
     expect(screen.queryAllByRole('alert')).toHaveLength(0)
-    expect(screen.getByRole('button', { name: /^start instance$/i })).toBeEnabled()
+    expect(screen.getByRole('button', { name: /^start instance #11$/i })).toBeEnabled()
     expect(document.body).toHaveTextContent(/can take a while/i)
     // Calm: while the state is shown, the only call is the cheap watch on the session.
     const seen = trackRequests()
@@ -69,7 +69,7 @@ describe('the system database is stopped', () => {
     await stopSystemInstance(user)
     await screen.findByRole('heading', { name: /system database is stopped/i })
     const seen = trackRequests()
-    await user.click(screen.getByRole('button', { name: /^start instance$/i }))
+    await user.click(screen.getByRole('button', { name: /^start instance #11$/i }))
     await waitFor(() =>
       expect(screen.queryByRole('heading', { name: /system database is stopped/i })).toBeNull(),
     )
@@ -90,7 +90,7 @@ describe('the system database is stopped', () => {
     // An operator started it on the machine just before the button was pressed.
     getState().systemDatabaseStopped = false
     getState().instanceStates.set(11, 'running')
-    await user.click(screen.getByRole('button', { name: /^start instance$/i }))
+    await user.click(screen.getByRole('button', { name: /^start instance #11$/i }))
     await waitFor(() =>
       expect(screen.queryByRole('heading', { name: /system database is stopped/i })).toBeNull(),
     )

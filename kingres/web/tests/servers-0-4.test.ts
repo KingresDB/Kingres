@@ -124,7 +124,8 @@ describe('add server: expected fingerprint', () => {
     await user.type(within(dialog).getByLabelText(/expected fingerprint/i), colons(good))
     await user.click(within(dialog).getByRole('button', { name: /^add server$/i }))
     expect(await within(dialog).findByText('Finished.')).toBeInTheDocument()
-    expect(bodies[0]).toMatchObject({ expectedFingerprint: colons(good) })
+    // The panel sends the normalized form: 64 lower-case hex digits, no colons (W2-04).
+    expect(bodies[0]).toMatchObject({ expectedFingerprint: good })
     expect(await within(dialog).findByTestId('fingerprint')).toHaveTextContent(
       groupFingerprint(good),
     )
@@ -184,9 +185,11 @@ describe('join cluster: expected fingerprint', () => {
     await user.click(screen.getByRole('button', { name: /^join cluster$/i }))
     expect(await screen.findByRole('button', { name: /continue to sign in/i })).toBeInTheDocument()
     expect(bodies[0]).toMatchObject({ expectedFingerprint: fp })
-    expect(screen.getByTestId('join-fingerprint-note')).toHaveTextContent(
-      /matched the fingerprint you gave/i,
-    )
+    // Nothing from the server says the pin was checked, so the page does not claim it (W2-03).
+    const note = screen.getByTestId('join-fingerprint-note')
+    expect(note).toHaveTextContent(/you gave a fingerprint and the panel sent it/i)
+    expect(note).toHaveTextContent(/does not report whether it checked it/i)
+    expect(note).not.toHaveTextContent(/matched/i)
   })
 
   it('without a fingerprint, tells the administrator to compare it afterwards', async () => {

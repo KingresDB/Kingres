@@ -9,6 +9,9 @@ import QueryBoundary from '@/components/QueryBoundary.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
 import NullableValue from '@/components/NullableValue.vue'
 import LineChart from '@/components/LineChart.vue'
+import PartialNotice from '@/components/PartialNotice.vue'
+import { useCompletenessAnnouncement } from '@/composables/useCompletenessAnnouncement'
+import { completenessOf, mergeCompleteness } from '@/lib/partial'
 import { useAlerts, useCluster, useClusterSummary, useMetric, useTasks } from '@/api/queries'
 import { HEALTH, SEVERITY, TASK_STATE } from '@/lib/status'
 import { formatAgo, formatNumber } from '@/lib/format'
@@ -33,6 +36,14 @@ const lag = useMetric('replicationLagSeconds', 60, 'server')
 const memory = useMetric('memoryUsedBytes', 60, 'server')
 
 const c = computed(() => cluster.data.value)
+// Charts and the alert list are cluster-wide answers: a server that did not answer is named, never
+// silently left out (contract 0.5.0).
+const metricsCompleteness = computed(() =>
+  mergeCompleteness([cpu, tps, lag, memory].map((q) => q.data.value)),
+)
+const alertsCompleteness = computed(() => completenessOf(alerts.data.value))
+useCompletenessAnnouncement(metricsCompleteness, 'set of charts')
+useCompletenessAnnouncement(alertsCompleteness, 'list of open alerts', canAlerts)
 // When the server has no metrics at all, say so once instead of in four cards.
 const metricsUnsupported = computed(() =>
   [cpu, tps, lag, memory].every((q) => isUnsupported(q.error.value)),
@@ -119,10 +130,18 @@ const metricsUnsupported = computed(() =>
         <div class="card kpi">
           <span class="label">Manager leader</span>
           <span class="value">
-            <template v-if="c.managerLeader">Server {{ c.managerLeader.serverId }}</template>
+            <template v-if="c.managerLeader"
+              >Server <SafeName :value="c.managerLeader.serverId" kind="text" :max="60"
+            /></template>
             <StatusBadge v-else :meta="{ tone: 'neutral', icon: '○', label: 'Not reported' }" />
           </span>
-          <span class="muted mono">{{ c.managerLeader?.address }}</span>
+          <span class="muted mono"
+            ><SafeName
+              v-if="c.managerLeader"
+              :value="c.managerLeader.address"
+              kind="text"
+              :max="80"
+          /></span>
         </div>
         <div class="card kpi">
           <span class="label">Auto-failover</span>
@@ -137,7 +156,11 @@ const metricsUnsupported = computed(() =>
     <section aria-labelledby="charts-h" class="stack">
       <h2 id="charts-h">Last hour</h2>
       <ProblemNotice v-if="metricsUnsupported" :error="cpu.error.value" />
-      <div v-else class="grid-2">
+      <PartialNotice
+        :completeness="metricsCompleteness"
+        consequence="The charts show only what the other servers know; the values of these servers are missing."
+      />
+      <div v-if="!metricsUnsupported" class="grid-2">
         <div class="card">
           <QueryBoundary :loading="cpu.isPending.value" :error="cpu.error.value">
             <LineChart title="CPU usage" unit="percent" :series="toChartSeries(cpu.data.value)" />
@@ -178,12 +201,24 @@ const metricsUnsupported = computed(() =>
           <h2 id="alerts-h">Open alerts</h2>
           <RouterLink :to="{ name: 'alerts' }">All alerts</RouterLink>
         </div>
+        <PartialNotice
+          :completeness="alertsCompleteness"
+          consequence="Alerts held by these servers are not shown."
+        />
         <QueryBoundary
           :loading="alerts.isPending.value"
           :error="alerts.error.value"
           :empty="alerts.data.value?.items.length === 0"
-          empty-title="No open alerts"
-          empty-hint="Everything looks calm."
+          :empty-title="
+            alertsCompleteness.partial
+              ? 'No open alerts from the servers that answered'
+              : 'No open alerts'
+          "
+          :empty-hint="
+            alertsCompleteness.partial
+              ? 'This does not mean there are none: the servers named above did not answer.'
+              : 'Everything looks calm.'
+          "
         >
           <ul class="plain-list">
             <li v-for="a in alerts.data.value?.items.slice(0, 5)" :key="a.id" class="row">

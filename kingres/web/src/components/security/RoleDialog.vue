@@ -204,8 +204,9 @@ async function save(): Promise<void> {
         <label v-for="c in clusterRoleInfo.data.value?.items" :key="c.name" class="check">
           <input v-model="form.clusterRoles" type="checkbox" :value="c.name" />
           <span
-            ><code>{{ c.name }}</code> <span class="muted">{{ c.description }}</span></span
-          >
+            ><code><SafeName :value="c.name" kind="text" :max="60" /></code>
+            <span class="muted"><SafeName :value="c.description" kind="text" :max="200" /></span
+          ></span>
         </label>
         <p v-if="clusterRoleInfo.isPending.value" class="muted">Loading cluster roles...</p>
       </fieldset>

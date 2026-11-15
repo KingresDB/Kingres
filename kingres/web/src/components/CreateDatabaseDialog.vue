@@ -181,14 +181,14 @@ const errorFor = (field: string, server: Record<string, string>): string | undef
             <FormField v-slot="slot" label="Encoding" hint="Fixed after creation.">
               <select v-bind="slot" v-model="form.encoding">
                 <option v-for="e in o?.encodings" :key="e.name" :value="e.name">
-                  {{ e.name }}{{ e.isDefault ? ' (default)' : '' }}
+                  {{ safeText(e.name) }}{{ e.isDefault ? ' (default)' : '' }}
                 </option>
               </select>
             </FormField>
             <FormField v-slot="slot" label="Collation" hint="Fixed after creation.">
               <select v-bind="slot" v-model="form.collation">
                 <option v-for="c in collations" :key="c.name" :value="c.name">
-                  {{ c.name }}{{ c.isDefault ? ' (default)' : '' }}
+                  {{ safeText(c.name) }}{{ c.isDefault ? ' (default)' : '' }}
                 </option>
               </select>
             </FormField>

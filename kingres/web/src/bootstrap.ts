@@ -13,7 +13,15 @@ import {
   setSessionLostHandler,
   setSystemDatabaseStoppedHandler,
 } from './api/server-state'
-import { resetAvailability, setSystemDatabaseStopped } from './api/availability'
+import {
+  availability,
+  clearSystemDatabaseStoppedSeen,
+  noteSystemDatabaseStoppedSignedOut,
+  resetAvailability,
+  setSystemDatabaseStopped,
+  setSystemStateSharer,
+} from './api/availability'
+import { createSystemStateSharing } from './lib/cross-tab'
 import { createAppRouter } from './router'
 import { useSessionStore } from './stores/session'
 
@@ -48,7 +56,25 @@ export function createKingres(history?: RouterHistory): Kingres {
   setSystemDatabaseStoppedHandler(() => {
     const session = useSessionStore(pinia)
     if (session.isSignedIn && !session.probing) setSystemDatabaseStopped(true)
+    else noteSystemDatabaseStoppedSignedOut()
   })
+  // The other tabs of this browser: one boolean, no credential (see lib/cross-tab.ts).
+  const sharing = createSystemStateSharing((stopped) => {
+    const session = useSessionStore(pinia)
+    if (stopped) {
+      if (session.isSignedIn) setSystemDatabaseStopped(true, true)
+      else noteSystemDatabaseStoppedSignedOut(true)
+      return
+    }
+    // It runs again: the stopped page of this tab would find out within seconds anyway.
+    const wasPaused = availability.systemDatabaseStopped
+    clearSystemDatabaseStoppedSeen()
+    if (wasPaused) {
+      setSystemDatabaseStopped(false, true)
+      void queryClient.invalidateQueries()
+    }
+  })
+  setSystemStateSharer(sharing.share)
 
   // Everything TanStack Query holds is server data: cancel it and drop it when a session ends.
   const unregisterReset = registerServerStateReset(() => {
@@ -74,7 +100,10 @@ export function createKingres(history?: RouterHistory): Kingres {
     unregisterReset()
     setSessionLostHandler(null)
     setSystemDatabaseStoppedHandler(null)
+    setSystemStateSharer(null)
+    sharing.dispose()
     resetAvailability()
+    clearSystemDatabaseStoppedSeen()
     if (typeof window !== 'undefined') {
       window.removeEventListener('focus', recheck)
       document.removeEventListener('visibilitychange', recheck)

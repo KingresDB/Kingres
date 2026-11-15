@@ -17,6 +17,7 @@ import type {
   Database,
   Grant,
   Instance,
+  MissingServer,
   LedgerBlock,
   LedgerDigest,
   LedgerVerification,
@@ -55,6 +56,15 @@ export const mockConfig = {
   latencyMs: 0,
   /** How long a server that has left the cluster answers 503 before it is uninitialized. */
   leaveResetMs: 2000,
+  /**
+   * Servers that did not answer a cluster-wide read (contract 0.5.0): `listLogs`, `listAlerts` and
+   * `queryMetrics` then answer `partial: true` with these in `missingServers`. Null: complete answers.
+   */
+  partial: null as MissingServer[] | null,
+  /** True: every request that carries a cursor answers 400, as a 0.5.0 server does for a 0.4.0 cursor. */
+  rejectCursors: false,
+  /** True: the manager leader does not hold the CA key, so renew and revoke answer 503. */
+  caUnavailable: false,
 }
 
 // --- types of the internal records ------------------------------------------------------------

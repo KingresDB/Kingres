@@ -7,7 +7,7 @@ import { computed, ref, watch } from 'vue'
 import { safeText } from '@/lib/safe-text'
 import TableWrap from '@/components/TableWrap.vue'
 import { useRoute, useRouter } from 'vue-router'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
+import { useMutation, useQueryClient } from '@tanstack/vue-query'
 import PageHeader from '@/components/PageHeader.vue'
 import QueryBoundary from '@/components/QueryBoundary.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
@@ -17,6 +17,7 @@ import NotAvailable from '@/components/NotAvailable.vue'
 import ProblemNotice from '@/components/ProblemNotice.vue'
 import TaskProgress from '@/components/TaskProgress.vue'
 import SafeName from '@/components/SafeName.vue'
+import CursorResetNotice from '@/components/CursorResetNotice.vue'
 import { describeProblem } from '@/api/problem'
 import { endpoints } from '@/api/endpoints'
 import { keys, useLedgerStatusList, usePagedQuery } from '@/api/queries'
@@ -26,7 +27,12 @@ import { formatAgo, formatDateTime, formatNumber, shortHash } from '@/lib/format
 import ProofResult from '@/components/ledger/ProofResult.vue'
 import VerificationDialog from '@/components/ledger/VerificationDialog.vue'
 import { saveTextFile } from '@/lib/download'
-import type { RawProof } from '@/lib/ledger-proof'
+import {
+  digestRelation,
+  digestRelationText,
+  type DigestRelation,
+  type RawProof,
+} from '@/lib/ledger-proof'
 import { ApiError } from '@/api/problem'
 
 const route = useRoute()
@@ -72,14 +78,13 @@ const blocks = usePagedQuery(
   undefined,
   () => !!dbName.value && chainId.value !== null,
 )
-const digests = useQuery({
-  queryKey: computed(() => [...keys.ledger(dbName.value), 'digests']),
-  queryFn: async () => {
-    const page = await endpoints.listLedgerDigests(dbName.value, { limit: 10 })
-    return { items: page.items, moreNotShown: !!page.nextCursor }
-  },
-  enabled: computed(() => !!dbName.value),
-})
+// Ten digests a page, newest first; "Load more digests" follows the cursor (it is never stored).
+const digests = usePagedQuery(
+  () => [...keys.ledger(dbName.value), 'digests'],
+  (cursor) => endpoints.listLedgerDigests(dbName.value, { cursor, limit: 10 }),
+  undefined,
+  () => !!dbName.value,
+)
 const verifications = usePagedQuery(
   () => [...keys.ledger(dbName.value), 'verifications'],
   (cursor) => endpoints.listLedgerVerifications(dbName.value, { cursor, limit: 10 }),
@@ -188,8 +193,29 @@ async function generateAndAskAgain(): Promise<void> {
   await generate.mutateAsync()
   proofMutation.mutate()
 }
+/** The proof on screen, when there is one that is still valid (no error after it). */
+const shownProof = computed(() =>
+  proof.value && !proof.value.shapeError && !proofApiError.value ? proof.value : null,
+)
+/** How each listed digest relates to the proof on screen (identifiers only; nothing is verified). */
+const relations = computed(() => {
+  const p = shownProof.value
+  const map = new Map<number, DigestRelation>()
+  if (p) for (const d of digests.items.value) map.set(d.id, digestRelation(p.view, d))
+  return map
+})
+const relationCovers = (id: number): boolean => relations.value.get(id)?.state === 'covers'
+const relationText = (id: number): string => {
+  const r = relations.value.get(id)
+  return r ? digestRelationText(r) : ''
+}
+const coveringCount = computed(
+  () => [...relations.value.values()].filter((r) => r.state === 'covers').length,
+)
+const downloaded = ref<{ id: number; group: number; relation: DigestRelation | null } | null>(null)
 function downloadDigest(id: number, group: number, text: string): void {
   saveTextFile(`digest-${id}-group-${group}.json`, text)
+  downloaded.value = { id, group, relation: relations.value.get(id) ?? null }
 }
 </script>
 
@@ -425,15 +451,53 @@ function downloadDigest(id: number, group: number, text: string): void {
             database access could not have changed.
           </p>
           <ProblemNotice v-if="generate.error.value" :error="generate.error.value" />
+          <CursorResetNotice
+            :shown="digests.cursorReset.value"
+            @dismiss="digests.dismissCursorReset"
+          />
           <QueryBoundary
-            :loading="digests.isPending.value"
-            :error="digests.error.value"
-            :empty="digests.data.value?.items.length === 0"
+            :loading="digests.query.isPending.value"
+            :error="digests.query.error.value"
+            :empty="digests.items.value.length === 0"
             empty-title="No digests yet"
+            @retry="digests.query.refetch()"
           >
-            <p v-if="digests.data.value?.moreNotShown" class="notice tone-warn" role="status">
-              <span aria-hidden="true">&#9650;</span>
-              <span>More digests exist than are shown here; only the latest are listed.</span>
+            <div
+              v-if="shownProof"
+              class="notice"
+              :class="coveringCount > 0 ? 'tone-info' : 'tone-warn'"
+              data-testid="digest-proof-summary"
+            >
+              <span aria-hidden="true">{{ coveringCount > 0 ? 'ⓘ' : '▲' }}</span>
+              <span>
+                <template v-if="coveringCount > 0"
+                  >{{ coveringCount }} of the {{ digests.items.value.length }} digests listed here
+                  have the same chain as the proof on screen and are not older than its
+                  block.</template
+                >
+                <template v-else
+                  >None of the {{ digests.items.value.length }} digests listed here covers the proof
+                  on screen<template v-if="digests.query.hasNextPage.value"
+                    >; load more digests or generate a new one</template
+                  >.</template
+                >
+                This compares identifiers only; it does not verify anything. The check is done by
+                <code>kingres-verify</code>.
+              </span>
+            </div>
+            <p
+              v-if="downloaded"
+              class="notice tone-info"
+              role="status"
+              data-testid="digest-downloaded"
+            >
+              <span aria-hidden="true">&#9432;</span>
+              <span>
+                Saved the document of chain {{ downloaded.group }} of digest {{ downloaded.id }}.
+                <template v-if="downloaded.relation">{{
+                  digestRelationText(downloaded.relation)
+                }}</template>
+              </span>
             </p>
             <TableWrap>
               <table class="table">
@@ -447,10 +511,11 @@ function downloadDigest(id: number, group: number, text: string): void {
                     <th scope="col">Chain heads</th>
                     <th scope="col">Aggregate hash</th>
                     <th scope="col">Anchors</th>
+                    <th v-if="shownProof" scope="col">Compared with the proof</th>
                   </tr>
                 </thead>
                 <tbody>
-                  <tr v-for="d in digests.data.value?.items" :key="d.id">
+                  <tr v-for="d in digests.items.value" :key="d.id">
                     <th scope="row">{{ d.id }}</th>
                     <td>
                       {{ formatDateTime(d.generatedAt) }} by
@@ -477,16 +542,44 @@ function downloadDigest(id: number, group: number, text: string): void {
                       {{ shortHash(d.aggregateHash) }}
                     </td>
                     <td>
-                      {{
-                        d.anchors.length
-                          ? d.anchors.map((a) => `${a.target} (${a.status})`).join(', ')
-                          : 'None yet'
-                      }}
+                      <template v-if="d.anchors.length">
+                        <span v-for="(a, i) in d.anchors" :key="i"
+                          ><template v-if="i > 0">, </template
+                          ><SafeName :value="a.target" kind="text" :max="80" /> (<SafeName
+                            :value="a.status"
+                            kind="text"
+                            :max="40"
+                          />)</span
+                        >
+                      </template>
+                      <template v-else>None yet</template>
+                    </td>
+                    <td v-if="shownProof" :data-testid="`digest-relation-${d.id}`">
+                      <template v-if="relations.get(d.id)">
+                        <span
+                          class="badge"
+                          :class="relationCovers(d.id) ? 'tone-info' : 'tone-warn'"
+                          ><span aria-hidden="true">{{ relationCovers(d.id) ? 'ⓘ' : '▲' }}</span>
+                          {{
+                            relationCovers(d.id) ? 'Same chain' : 'Does not cover the proof'
+                          }}</span
+                        >
+                        <div class="muted">{{ relationText(d.id) }}</div>
+                      </template>
                     </td>
                   </tr>
                 </tbody>
               </table>
             </TableWrap>
+            <button
+              v-if="digests.query.hasNextPage.value"
+              type="button"
+              class="btn"
+              :disabled="digests.query.isFetchingNextPage.value"
+              @click="digests.query.fetchNextPage()"
+            >
+              Load more digests
+            </button>
           </QueryBoundary>
         </section>
 

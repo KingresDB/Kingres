@@ -16,6 +16,28 @@ import type {
   Database,
   ClusterOverview,
 } from '@/api/types'
+import { safeText } from './safe-text'
+
+/**
+ * A status map that does not break on a value the panel does not know (a newer server can add one:
+ * 0.5.0 added members to enums). An unknown value gets a neutral badge that says so and shows the
+ * value, with hidden characters made visible.
+ */
+export function tolerant<T extends Record<string, StatusMeta>>(map: T): T {
+  return new Proxy(map, {
+    get(target, key, receiver) {
+      if (typeof key !== 'string') return Reflect.get(target, key, receiver)
+      const known = (target as Record<string, StatusMeta | undefined>)[key]
+      if (known) return known
+      // Names of Object.prototype members (toString, ...) are not statuses either.
+      return {
+        tone: 'neutral',
+        icon: '?',
+        label: `Unknown (${safeText(key, 40)})`,
+      } satisfies StatusMeta
+    },
+  })
+}
 
 export type Tone = 'ok' | 'warn' | 'danger' | 'info' | 'neutral'
 
@@ -34,77 +56,80 @@ const RING = '○' // empty circle
 const HALF = '◐' // half circle
 const CLOCK = '⏳' // hourglass
 
-export const SERVER_STATUS: Record<ServerStatus, StatusMeta> = {
+export const SERVER_STATUS: Record<ServerStatus, StatusMeta> = tolerant({
   live: { tone: 'ok', icon: OK, label: 'LIVE' },
   suspect: { tone: 'warn', icon: WARN, label: 'SUSPECT' },
   draining: { tone: 'info', icon: HALF, label: 'DRAINING' },
   decommissioning: { tone: 'info', icon: HALF, label: 'DECOMMISSIONING' },
   dead: { tone: 'danger', icon: BAD, label: 'DEAD' },
   pendingRebalance: { tone: 'info', icon: CLOCK, label: 'PENDING REBALANCE' },
-}
+})
 
-export const TASK_STATE: Record<TaskState, StatusMeta> = {
+export const TASK_STATE: Record<TaskState, StatusMeta> = tolerant({
   pending: { tone: 'neutral', icon: RING, label: 'Pending' },
   running: { tone: 'info', icon: HALF, label: 'Running' },
   paused: { tone: 'warn', icon: WARN, label: 'Paused' },
   failed: { tone: 'danger', icon: BAD, label: 'Failed' },
   done: { tone: 'ok', icon: OK, label: 'Done' },
-}
+})
 
-export const SEVERITY: Record<AlertSeverity, StatusMeta> = {
+export const SEVERITY: Record<AlertSeverity, StatusMeta> = tolerant({
   info: { tone: 'info', icon: INFO, label: 'Info' },
   warning: { tone: 'warn', icon: WARN, label: 'Warning' },
   critical: { tone: 'danger', icon: BAD, label: 'Critical' },
-}
+})
 
-export const HEALTH: Record<ClusterOverview['health'], StatusMeta> = {
+export const HEALTH: Record<ClusterOverview['health'], StatusMeta> = tolerant({
   healthy: { tone: 'ok', icon: OK, label: 'Healthy' },
   degraded: { tone: 'warn', icon: WARN, label: 'Degraded' },
   critical: { tone: 'danger', icon: BAD, label: 'Critical' },
-}
+})
 
-export const GROUP_HEALTH: Record<ShardGroup['health'], StatusMeta> = {
+export const GROUP_HEALTH: Record<ShardGroup['health'], StatusMeta> = tolerant({
   healthy: { tone: 'ok', icon: OK, label: 'Healthy' },
   degraded: { tone: 'warn', icon: WARN, label: 'Degraded' },
   unavailable: { tone: 'danger', icon: BAD, label: 'Unavailable' },
-}
+})
 
-export const INSTANCE_STATE: Record<Instance['state'], StatusMeta> = {
+export const INSTANCE_STATE: Record<Instance['state'], StatusMeta> = tolerant({
   running: { tone: 'ok', icon: DOT, label: 'Running' },
   starting: { tone: 'info', icon: HALF, label: 'Starting' },
   stopping: { tone: 'info', icon: HALF, label: 'Stopping' },
   restarting: { tone: 'info', icon: HALF, label: 'Restarting' },
   stopped: { tone: 'neutral', icon: RING, label: 'Stopped' },
   failed: { tone: 'danger', icon: BAD, label: 'Failed' },
-}
+})
 
-export const SERVICE_STATE: Record<'running' | 'stopped' | 'degraded' | 'disabled', StatusMeta> = {
-  running: { tone: 'ok', icon: DOT, label: 'Running' },
-  stopped: { tone: 'danger', icon: BAD, label: 'Stopped' },
-  degraded: { tone: 'warn', icon: WARN, label: 'Degraded' },
-  disabled: { tone: 'neutral', icon: RING, label: 'Disabled' },
-}
+export const SERVICE_STATE: Record<'running' | 'stopped' | 'degraded' | 'disabled', StatusMeta> =
+  tolerant({
+    running: { tone: 'ok', icon: DOT, label: 'Running' },
+    stopped: { tone: 'danger', icon: BAD, label: 'Stopped' },
+    degraded: { tone: 'warn', icon: WARN, label: 'Degraded' },
+    disabled: { tone: 'neutral', icon: RING, label: 'Disabled' },
+  })
 
-export const SYNC_STATE: Record<NonNullable<ReplicationMember['syncState']>, StatusMeta> = {
-  sync: { tone: 'ok', icon: OK, label: 'Sync' },
-  quorum: { tone: 'ok', icon: OK, label: 'Quorum' },
-  potential: { tone: 'info', icon: HALF, label: 'Potential' },
-  async: { tone: 'neutral', icon: RING, label: 'Async' },
-}
+export const SYNC_STATE: Record<NonNullable<ReplicationMember['syncState']>, StatusMeta> = tolerant(
+  {
+    sync: { tone: 'ok', icon: OK, label: 'Sync' },
+    quorum: { tone: 'ok', icon: OK, label: 'Quorum' },
+    potential: { tone: 'info', icon: HALF, label: 'Potential' },
+    async: { tone: 'neutral', icon: RING, label: 'Async' },
+  },
+)
 
-export const DATABASE_STATUS: Record<Database['status'], StatusMeta> = {
+export const DATABASE_STATUS: Record<Database['status'], StatusMeta> = tolerant({
   ready: { tone: 'ok', icon: OK, label: 'Ready' },
   creating: { tone: 'info', icon: HALF, label: 'Creating' },
   dropping: { tone: 'info', icon: HALF, label: 'Dropping' },
   failed: { tone: 'danger', icon: BAD, label: 'Failed' },
-}
+})
 
-export const LEDGER_STATE: Record<LedgerVerification['state'], StatusMeta> = {
+export const LEDGER_STATE: Record<LedgerVerification['state'], StatusMeta> = tolerant({
   never: { tone: 'neutral', icon: RING, label: 'Never verified' },
   running: { tone: 'info', icon: HALF, label: 'Verifying' },
   passed: { tone: 'ok', icon: OK, label: 'Verified' },
   failed: { tone: 'danger', icon: BAD, label: 'Inconsistent' },
-}
+})
 
 export const DURABILITY_LABEL = {
   async: 'Asynchronous',

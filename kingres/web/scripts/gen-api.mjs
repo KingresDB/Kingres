@@ -14,7 +14,11 @@ import openapiTS, { astToString } from 'openapi-typescript'
 import { parse } from 'yaml'
 
 const here = dirname(fileURLToPath(import.meta.url))
-const specPath = resolve(here, '../../api/openapi.yaml')
+// KINGRES_API_SPEC names another copy of the contract (for example the committed revision while the working
+// tree holds a draft of the next one). The committed generated files follow the file named here.
+export const specPath = process.env.KINGRES_API_SPEC
+  ? resolve(process.env.KINGRES_API_SPEC)
+  : resolve(here, '../../api/openapi.yaml')
 const outputs = {
   schema: resolve(here, '../src/api/schema.d.ts'),
   operations: resolve(here, '../src/api/operations.generated.ts'),

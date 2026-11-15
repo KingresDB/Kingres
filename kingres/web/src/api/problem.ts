@@ -8,11 +8,17 @@ import type { Problem, ProblemCode } from './types'
 /** An error response from the API, or a failure to reach it. */
 export class ApiError extends Error {
   readonly problem: Problem
+  /**
+   * True when the panel made this error up (no answer arrived, or a proxy answered with something that
+   * is not a problem document). The code is then a guess from the status, not the server's own word.
+   */
+  readonly synthetic: boolean
 
-  constructor(problem: Problem) {
+  constructor(problem: Problem, synthetic = false) {
     super(problem.detail ?? problem.title)
     this.name = 'ApiError'
     this.problem = problem
+    this.synthetic = synthetic
   }
 
   get code(): ProblemCode {
@@ -32,13 +38,16 @@ export function networkError(cause: unknown): ApiError {
       : cause instanceof Error
         ? cause.message
         : String(cause)
-  return new ApiError({
-    type: 'about:blank',
-    title: 'Cannot reach the server',
-    status: 503,
-    code: 'service_unavailable',
-    detail,
-  })
+  return new ApiError(
+    {
+      type: 'about:blank',
+      title: 'Cannot reach the server',
+      status: 503,
+      code: 'service_unavailable',
+      detail,
+    },
+    true,
+  )
 }
 
 /** Narrows a response body to Problem (a proxy may answer with an HTML error page instead). */
@@ -252,7 +261,7 @@ const entries: Record<ProblemCode, Entry> = {
     tone: 'danger',
     heading: 'Certificate authority not available',
     message:
-      'The manager leader does not hold the certificate authority key, so certificates cannot be issued or revoked right now. Try again when the leader that holds the key is reachable.',
+      'The manager leader does not hold the key of the certificate authority, so it cannot issue or revoke certificates, or add or remove a server, right now. Nothing was changed. Try again when the server that holds the key is the leader; the cluster keeps running on its current certificates until they expire.',
     retryable: true,
   },
   quorum_unavailable: {
@@ -364,6 +373,14 @@ export function describeProblem(error: unknown): ProblemView {
 /** The backend answers with this code for operations it has not implemented yet. */
 export function isUnsupported(error: unknown): boolean {
   return error instanceof ApiError && error.code === 'unsupported_operation'
+}
+
+/**
+ * A 400 for a request that carried a cursor. Since 0.5.0 a cursor of an earlier revision (and one
+ * the server cannot place any more) answers 400; the panel then starts the list again.
+ */
+export function isRejectedCursor(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 400
 }
 
 /** Codes that mean the browser session is no longer valid. */

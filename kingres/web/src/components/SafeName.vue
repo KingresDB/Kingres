@@ -30,9 +30,11 @@ const warnings = computed(() => (props.kind === 'name' ? nameWarnings(props.valu
 const warningLabel = computed(() =>
   warnings.value.some((w) => w.startsWith('Contains'))
     ? 'hidden characters'
-    : warnings.value.some((w) => w.startsWith('Mixes'))
-      ? 'mixed scripts'
-      : 'look-alike',
+    : warnings.value.some((w) => w.startsWith('Has spaces'))
+      ? 'spaces'
+      : warnings.value.some((w) => w.startsWith('Mixes'))
+        ? 'mixed scripts'
+        : 'look-alike',
 )
 </script>
 

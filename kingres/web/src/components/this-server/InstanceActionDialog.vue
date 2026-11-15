@@ -6,7 +6,7 @@
 import { computed, ref } from 'vue'
 import TaskActionDialog from '@/components/TaskActionDialog.vue'
 import { ApiError } from '@/api/problem'
-import { availability } from '@/api/availability'
+import { rememberInstances } from '@/api/availability'
 import { endpoints } from '@/api/endpoints'
 import { keys } from '@/api/queries'
 import { instanceLabel } from '@/lib/cluster'
@@ -19,9 +19,11 @@ const force = ref(false)
 const verb = computed(() => `${props.kind[0]?.toUpperCase()}${props.kind.slice(1)}`)
 /** Stopping the instance of the system database pauses the whole panel: ask for typing. */
 const hostsSystemDatabase = computed(() => props.instance.isMapGroup && props.kind === 'stop')
+/** A restart of the same instance pauses the same operations, for the time the restart takes. */
+const restartsSystemDatabase = computed(() => props.instance.isMapGroup && props.kind === 'restart')
 
 function start() {
-  if (props.instance.isMapGroup) availability.instanceId = props.instance.id
+  if (props.instance.isMapGroup) rememberInstances([props.instance])
   return endpoints.instanceAction(props.instance.id, props.kind, force.value)
 }
 
@@ -72,6 +74,14 @@ function nextStep(error: unknown): string | null {
           >This instance hosts the cluster system database. While it is stopped, every operation in
           this panel except "Start instance" is paused and nobody can sign in. The panel then shows
           a Start button until the instance runs again.</span
+        >
+      </p>
+      <p v-if="restartsSystemDatabase" class="notice tone-warn" data-testid="restart-system-note">
+        <span aria-hidden="true">&#9650;</span>
+        <span
+          >This instance hosts the cluster system database. While it restarts, operations that need
+          it, including sign-in, are paused and answer that the system database is stopped. They
+          work again when the instance has restarted.</span
         >
       </p>
       <label v-if="kind !== 'start'" class="check"

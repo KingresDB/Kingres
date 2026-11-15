@@ -3,22 +3,25 @@
 <script setup lang="ts">
 // An inclusion proof as the server sent it: what it says, the file to save for `kingres-verify`
 // (the exact text of the answer), and how to check it. Every string comes from the server and is
-// drawn through SafeName.
+// drawn through SafeName. Every integer is shown as it is written in the text of the answer (the
+// parsed copy would round one above 2^53); a document without the members shown here is not drawn
+// from guesses: the file can still be saved and the raw text is shown.
 import { computed } from 'vue'
 import SafeName from '@/components/SafeName.vue'
 import { saveTextFile } from '@/lib/download'
-import { formatNumber } from '@/lib/format'
-import type { RawProof } from '@/lib/ledger-proof'
+import type { RawProof, ShownInteger } from '@/lib/ledger-proof'
 
 const props = defineProps<{ proof: RawProof }>()
 
 const v = computed(() => props.proof.view)
+const n = (key: ShownInteger): string => props.proof.numbers[key] ?? ''
 const tableId = computed(() =>
   /^\d{1,20}$/.test(props.proof.tableId) ? props.proof.tableId : '<table id>',
 )
+// A backslash and a real line break: the command can be copied into a shell as it is shown.
 const command = computed(
   () =>
-    `kingres-verify proof --proof proof.json --digest digest.json --table-id ${tableId.value} \\n  --row-hash <hash recomputed from your own copy of the row>`,
+    `kingres-verify proof --proof proof.json --digest digest.json --table-id ${tableId.value} \\\n  --row-hash <hash recomputed from your own copy of the row>`,
 )
 function download(): void {
   saveTextFile('proof.json', props.proof.raw)
@@ -26,7 +29,23 @@ function download(): void {
 </script>
 
 <template>
-  <div class="stack" data-testid="proof">
+  <div v-if="proof.shapeError" class="stack" data-testid="proof">
+    <p class="notice tone-warn" role="alert" data-testid="proof-shape-error">
+      <span aria-hidden="true">&#9650;</span>
+      <span>
+        The answer is not a proof document the panel can show: {{ proof.shapeError }}. It is not
+        interpreted. You can still save it exactly as the server sent it.
+      </span>
+    </p>
+    <div>
+      <button type="button" class="btn btn-primary" @click="download">Download proof.json</button>
+    </div>
+    <pre
+      class="mono"
+      data-testid="proof-raw"
+    ><SafeName :value="proof.raw" kind="text" :max="2000" multiline /></pre>
+  </div>
+  <div v-else class="stack" data-testid="proof">
     <p class="muted">
       This proof says that a ledger entry with the row hash below, for the table with the id below,
       is part of a block that is reached from a digest of the same chain. It cannot know the row
@@ -36,7 +55,8 @@ function download(): void {
     <dl class="kv">
       <dt>Chain</dt>
       <dd>
-        <SafeName :value="v.chain_id" kind="text" :max="80" /> (shard group {{ v.shard_group_id }})
+        <SafeName :value="v.chain_id" kind="text" :max="80" /> (shard group
+        {{ n('shard_group_id') }})
       </dd>
       <dt>Table</dt>
       <dd>
@@ -45,22 +65,22 @@ function download(): void {
       </dd>
       <dt>Entry</dt>
       <dd>
-        <strong>{{ v.op === 'I' ? 'Insert' : 'Delete' }}</strong>, sequence {{ v.seq }}, transaction
-        id
-        {{ v.ledger_txid }}
+        <strong>{{ v.op === 'I' ? 'Insert' : 'Delete' }}</strong>, sequence {{ n('seq') }},
+        transaction id
+        {{ n('ledger_txid') }}
       </dd>
       <dt>Row hash</dt>
       <dd class="mono"><SafeName :value="v.row_hash" kind="text" :max="80" /></dd>
       <dt>Position in the transaction</dt>
-      <dd>entry {{ v.entry_index }} of {{ v.entry_count }}</dd>
+      <dd>entry {{ n('entry_index') }} of {{ n('entry_count') }}</dd>
       <dt>Position in the block</dt>
       <dd>
-        transaction {{ v.tx_index }} of {{ v.block.tx_count }}, written by
+        transaction {{ n('tx_index') }} of {{ n('block.tx_count') }}, written by
         <SafeName :value="v.user_name" :max="60" />
       </dd>
       <dt>Block</dt>
       <dd>
-        height {{ formatNumber(v.block.height) }}
+        height {{ n('block.height') }}
         <span v-if="v.block.block_hash" class="mono"
           ><SafeName :value="v.block.block_hash" kind="text" :max="80"
         /></span>
@@ -70,7 +90,7 @@ function download(): void {
     </dl>
     <div class="row" style="gap: var(--s-6)">
       <div>
-        <h4>Entry path ({{ v.entry_path.length }} hashes)</h4>
+        <h3>Entry path ({{ v.entry_path.length }} hashes)</h3>
         <ol class="mono path">
           <li v-for="(h, i) in v.entry_path" :key="i">
             <SafeName :value="h" kind="text" :max="80" />
@@ -78,7 +98,7 @@ function download(): void {
         </ol>
       </div>
       <div>
-        <h4>Transaction path ({{ v.tx_path.length }} hashes)</h4>
+        <h3>Transaction path ({{ v.tx_path.length }} hashes)</h3>
         <ol class="mono path">
           <li v-for="(h, i) in v.tx_path" :key="i">
             <SafeName :value="h" kind="text" :max="80" />

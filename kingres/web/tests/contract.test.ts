@@ -14,6 +14,8 @@ import { createHandlers } from '@/mocks/handlers'
 import { staleFiles } from '../scripts/gen-api.mjs'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
+// The same file the generator reads: KINGRES_API_SPEC, or the working tree of the contract.
+const specFile = process.env.KINGRES_API_SPEC ?? join(root, '../api/openapi.yaml')
 
 describe('generated API files', () => {
   it('are up to date with kingres/api/openapi.yaml (run `npm run api:generate` if not)', async () => {
@@ -22,7 +24,7 @@ describe('generated API files', () => {
   })
 
   it('cover every operation of the contract (the count comes from the spec, not from this file)', () => {
-    const spec = parse(readFileSync(join(root, '../api/openapi.yaml'), 'utf8')) as {
+    const spec = parse(readFileSync(specFile, 'utf8')) as {
       info: { version: string }
       paths: Record<string, Record<string, { operationId?: string }>>
     }
@@ -34,7 +36,7 @@ describe('generated API files', () => {
   })
 
   it('knows the closed list of audit actions of the contract', () => {
-    const spec = parse(readFileSync(join(root, '../api/openapi.yaml'), 'utf8')) as {
+    const spec = parse(readFileSync(specFile, 'utf8')) as {
       components: { schemas: { AuditAction: { enum: string[] } } }
     }
     expect([...auditActions]).toEqual(spec.components.schemas.AuditAction.enum)

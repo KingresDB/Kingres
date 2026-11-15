@@ -4,18 +4,21 @@
 // Server state: TanStack Query hooks over the endpoint functions. Query keys are defined once in
 // `keys` so that mutations can invalidate them precisely. Polling intervals are chosen per
 // resource: fast-changing state is refreshed while the tab is visible, the rest on demand.
-import { computed, toValue, type MaybeRefOrGetter } from 'vue'
+import { computed, ref, toValue, watch, type MaybeRefOrGetter } from 'vue'
 import {
   MutationCache,
   QueryClient,
   QueryCache,
   useInfiniteQuery,
   useQuery,
+  useQueryClient,
   type QueryKey,
 } from '@tanstack/vue-query'
 import { endpoints } from './endpoints'
-import { ApiError, isSessionLost, isUnsupported, shouldRetry } from './problem'
-import type { MetricName } from './types'
+import { ApiError, isRejectedCursor, isSessionLost, isUnsupported, shouldRetry } from './problem'
+import type { MetricName, MissingServer } from './types'
+import { useAnnounce } from '@/composables/useAnnounce'
+import { mergeCompleteness } from '@/lib/partial'
 
 /**
  * How many pages a "load everything" query follows. A server that keeps answering with a cursor
@@ -26,27 +29,47 @@ export const paging = { maxPages: 20 }
 interface CursorPage<T> {
   items: T[]
   nextCursor?: string | null
+  /** Contract 0.5.0, cluster-wide lists only: some servers did not answer. */
+  partial?: boolean
+  missingServers?: MissingServer[]
 }
 
 export interface AllPages<T> {
   items: T[]
   /** True when the server still had more pages after the bound. */
   moreNotShown: boolean
+  /** True when the server refused a cursor (400) and the list was read again from the first page. */
+  restarted?: boolean
 }
 
-/** Follows `nextCursor` until the list ends or `paging.maxPages` pages were read. */
+/**
+ * Follows `nextCursor` until the list ends or `paging.maxPages` pages were read. A cursor the server
+ * refuses (400: a cursor is valid only for the revision and the moment that made it) is not a dead
+ * end: the list is read again from the first page, once.
+ */
 export async function fetchAllPages<T>(
   fetchPage: (cursor: string | undefined) => Promise<CursorPage<T>>,
 ): Promise<AllPages<T>> {
-  const items: T[] = []
+  let items: T[] = []
   let cursor: string | undefined
+  let restarted = false
   for (let page = 0; page < paging.maxPages; page += 1) {
-    const result = await fetchPage(cursor)
+    let result: CursorPage<T>
+    try {
+      result = await fetchPage(cursor)
+    } catch (error) {
+      if (cursor === undefined || restarted || !isRejectedCursor(error)) throw error
+      restarted = true
+      items = []
+      cursor = undefined
+      page = -1
+      continue
+    }
     items.push(...result.items)
     cursor = result.nextCursor ?? undefined
-    if (!cursor) return { items, moreNotShown: false }
+    if (!cursor) return { items, moreNotShown: false, ...(restarted ? { restarted } : {}) }
   }
-  return { items, moreNotShown: true }
+  return { items, moreNotShown: true, ...(restarted ? { restarted } : {}) }
 }
 
 /** Poll intervals in milliseconds. Background tabs are not polled (library default). */
@@ -354,6 +377,15 @@ export const useLedgerStatusList = () =>
 
 // --- this server ------------------------------------------------------------------------------
 
+/** The instances of this server; the shell reads it so that the host of the system database is known. */
+export const useThisServerInstances = (enabled: MaybeRefOrGetter<boolean> = true) =>
+  useQuery({
+    queryKey: [...keys.thisServer, 'instances'],
+    queryFn: endpoints.listThisServerInstances,
+    refetchInterval: every(POLL.fast),
+    enabled: computed(() => toValue(enabled)),
+  })
+
 export const useThisServer = () =>
   useQuery({
     queryKey: keys.thisServer,
@@ -363,21 +395,71 @@ export const useThisServer = () =>
 
 // --- generic cursor-paged lists ---------------------------------------------------------------
 
-/** A cursor-paged list with "load more". `fetchPage` receives the cursor of the page to load. */
+/** A page the list put in its cache in place of one whose cursor the server refused (see below). */
+type PagedPage<T> = CursorPage<T> & { cursorRejected?: boolean }
+
+/**
+ * A cursor-paged list with "load more". `fetchPage` receives the cursor of the page to load.
+ *
+ * - A cursor is never stored anywhere but in this query's memory: not in the address, not in
+ *   browser storage. A reload or a new session starts at the first page.
+ * - A cursor the server refuses (400; since 0.5.0 an old revision's cursor does) is not an error
+ *   dead end: the list starts again from the first page and `cursorReset` tells the view to say so.
+ * - `completeness` says whether the latest answers were partial (contract 0.5.0).
+ */
 export function usePagedQuery<T>(
   key: MaybeRefOrGetter<QueryKey>,
   fetchPage: (cursor: string | undefined) => Promise<CursorPage<T>>,
   refetchInterval?: number,
   enabled: MaybeRefOrGetter<boolean> = true,
 ) {
+  const client = useQueryClient()
+  const announce = useAnnounce()
   const query = useInfiniteQuery({
     queryKey: computed(() => toValue(key)),
-    queryFn: ({ pageParam }) => fetchPage(pageParam),
+    queryFn: async ({ pageParam }): Promise<PagedPage<T>> => {
+      try {
+        return await fetchPage(pageParam)
+      } catch (error) {
+        if (pageParam !== undefined && isRejectedCursor(error))
+          return { items: [], nextCursor: null, cursorRejected: true }
+        throw error
+      }
+    },
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (last) => last.nextCursor ?? undefined,
     refetchInterval: refetchInterval === undefined ? undefined : every(refetchInterval),
     enabled: computed(() => toValue(enabled)),
   })
   const items = computed(() => query.data.value?.pages.flatMap((p) => p.items) ?? [])
-  return { query, items }
+  const completeness = computed(() => mergeCompleteness(query.data.value?.pages ?? []))
+
+  /** True after a refused cursor sent the list back to its first page. */
+  const cursorReset = ref(false)
+  watch(
+    () => query.data.value?.pages.some((p) => p.cursorRejected) ?? false,
+    (rejected) => {
+      if (!rejected) return
+      cursorReset.value = true
+      announce('The list started again from the first page.')
+      void client.resetQueries({ queryKey: toValue(key), exact: true })
+    },
+  )
+  // Another list (a changed filter) is a new start anyway.
+  watch(
+    () => toValue(key),
+    () => {
+      cursorReset.value = false
+    },
+    { deep: true },
+  )
+  return {
+    query,
+    items,
+    completeness,
+    cursorReset,
+    dismissCursorReset: () => {
+      cursorReset.value = false
+    },
+  }
 }

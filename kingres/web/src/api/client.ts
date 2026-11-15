@@ -132,15 +132,18 @@ export async function unwrap<T>(call: Promise<Result<T>>): Promise<T> {
   if (result.response.ok) return result.data as T
   const error = isProblem(result.error)
     ? new ApiError(result.error)
-    : new ApiError({
-        type: 'about:blank',
-        title: result.response.statusText || 'Unexpected response',
-        status: result.response.status >= 400 ? result.response.status : 500,
-        // A proxy answers with its own page (not a problem document) when the server is down or
-        // when it ends the session itself.
-        code: codeForStatus(result.response.status),
-        detail: 'The server answered with something that is not a problem document.',
-      })
+    : new ApiError(
+        {
+          type: 'about:blank',
+          title: result.response.statusText || 'Unexpected response',
+          status: result.response.status >= 400 ? result.response.status : 500,
+          // A proxy answers with its own page (not a problem document) when the server is down or
+          // when it ends the session itself.
+          code: codeForStatus(result.response.status),
+          detail: 'The server answered with something that is not a problem document.',
+        },
+        true,
+      )
   if (isSessionLost(error)) reportSessionLost()
   if (error.code === 'system_database_stopped') reportSystemDatabaseStopped()
   throw error

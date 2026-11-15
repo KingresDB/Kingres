@@ -147,7 +147,7 @@ describe('lists longer than one page (W-14b, W-14c)', () => {
 })
 
 describe('ledger lists with more than one page (W-14)', () => {
-  it('says so when there are more digests and verifications than the page shown', async () => {
+  it('offers more digests and more verifications than the first page shown', async () => {
     mockServer.use(
       http.get('*/api/v1/databases/:name/ledger/digests', () =>
         HttpResponse.json({ items: [], nextCursor: 'more' }),
@@ -176,6 +176,7 @@ describe('ledger lists with more than one page (W-14)', () => {
         }),
       ),
     )
-    expect(await screen.findByText(/more digests exist than are shown/i)).toBeInTheDocument()
+    // Digests have paging now (the notice "more digests exist" is gone): the button loads the next page.
+    expect(await screen.findByRole('button', { name: /load more digests/i })).toBeInTheDocument()
   })
 })

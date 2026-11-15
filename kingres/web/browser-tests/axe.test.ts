@@ -10,6 +10,7 @@ import type { Browser, Page } from 'puppeteer-core'
 import {
   ROUTES,
   SECURITY_TABS,
+  STATES,
   clickText,
   go,
   launch,
@@ -125,6 +126,24 @@ describe('axe in a real browser', () => {
     await page.waitForSelector('[role="dialog"]')
     await sleep(200)
     failures.push(...(await axeViolations('network review dialog')))
+    expect(failures).toEqual([])
+  })
+
+  it('the 0.4.0 and 0.5.0 states: certificate dialogs, proof and digests, add server, leave cluster, stopped system database', async () => {
+    const failures: string[] = []
+    for (const [theme, width] of [
+      ['light', 1366],
+      ['dark', 320],
+    ] as const) {
+      await page.emulateMediaFeatures([{ name: 'prefers-color-scheme', value: theme }])
+      await page.setViewport({ width, height: 800 })
+      for (const state of STATES) {
+        await go(page, state.route)
+        await state.open(page)
+        failures.push(...(await axeViolations(`${state.name} ${theme} ${width}`)))
+        await state.close?.(page)
+      }
+    }
     expect(failures).toEqual([])
   })
 

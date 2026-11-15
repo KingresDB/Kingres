@@ -18,6 +18,7 @@ import { CONTENT_SECURITY_POLICY, COMMON_HEADERS } from './server-headers'
 import {
   ROUTES,
   SECURITY_TABS,
+  STATES,
   buildProduction,
   clickText,
   launch,
@@ -208,6 +209,20 @@ describe('the production build under the content security policy', () => {
     await clickText(page, 'Review and apply')
     await page.waitForSelector('[role="dialog"]')
     await collect('network review dialog')
+  })
+
+  it('shows the 0.4.0 and 0.5.0 states (certificate dialogs, proof and digests, add server, leave cluster, stopped system database) without a violation', async () => {
+    for (const state of STATES) {
+      await page.goto(`${server.url}${state.route}`, { waitUntil: 'networkidle0' })
+      await settled(page)
+      await state.open(page)
+      await collect(state.name)
+      await state.close?.(page)
+      await collect(`${state.name} (closed)`)
+    }
+    // A reload while the system database is stopped (the session of the tab is kept for it).
+    await page.goto(`${server.url}/this-server`, { waitUntil: 'networkidle0' })
+    await settled(page)
   })
 
   it('runs the sign-in page and the first-run wizard without a violation', async () => {

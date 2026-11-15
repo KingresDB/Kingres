@@ -3,12 +3,12 @@
 <script setup lang="ts">
 // First-run wizard, shown while the server is `uninitialized`:
 //   1. setup token  2. create a cluster or join one  3. task progress  4. hand-off to sign-in.
-import { computed, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useQueryClient } from '@tanstack/vue-query'
 import FormField from '@/components/FormField.vue'
 import FingerprintHelp from '@/components/FingerprintHelp.vue'
-import { fingerprintError } from '@/lib/fingerprint'
+import { fingerprintError, normalizeFingerprint } from '@/lib/fingerprint'
 import BrandLogo from '@/components/BrandLogo.vue'
 import ProblemNotice from '@/components/ProblemNotice.vue'
 import TaskProgress from '@/components/TaskProgress.vue'
@@ -138,7 +138,7 @@ const joinAction = useTaskAction(
         memoryQuota: { totalMegabytes: join.memoryMb },
         serverGroup: join.serverGroup || null,
         ...(join.expectedFingerprint.trim()
-          ? { expectedFingerprint: join.expectedFingerprint.trim() }
+          ? { expectedFingerprint: normalizeFingerprint(join.expectedFingerprint) }
           : {}),
       }),
     ),
@@ -228,7 +228,15 @@ async function submit(): Promise<void> {
 function backToForm(): void {
   action.value.reset()
   step.value = mode.value
+  // The password of the administrator account is typed again after a failure.
+  create.adminPassword = ''
+  create.adminPassword2 = ''
+  join.adminPassword = ''
 }
+
+// The setup token is one-time and held in memory: it must not stay attached to later requests when the
+// page is left for any reason (back button, another tab finished the setup, a redirect).
+onBeforeUnmount(() => setSetupToken(null))
 
 async function finish(): Promise<void> {
   setSetupToken(null)
@@ -563,7 +571,7 @@ async function finish(): Promise<void> {
           <p v-if="mode === 'join'" class="muted" data-testid="join-fingerprint-note">
             {{
               join.expectedFingerprint.trim()
-                ? 'The certificate of the existing server matched the fingerprint you gave.'
+                ? 'You gave a fingerprint and the panel sent it with the request. The server does not report whether it checked it, so this page cannot say whether the certificate was the expected one. Compare the fingerprint with the log of the existing server.'
                 : 'No fingerprint was given, so the certificate of the existing server was trusted on first contact. After you sign in, the fingerprint it presented is in the detail of the setup task (Tasks page), if the server reports it; compare it with the log of the existing server.'
             }}
           </p>

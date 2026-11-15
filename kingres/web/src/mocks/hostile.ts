@@ -4,6 +4,7 @@
 // Hostile data for the mock: names and messages as a low-privileged database user could make them
 // (anyone who may create a role, a table or a column chooses its name; anyone can make the server
 // log a line). Used by the tests and by `?mock=hostile` in development, never in a build.
+import type { MissingServer } from '@/api/types'
 import type { MockState } from './state'
 import { nowIso } from './state'
 
@@ -46,6 +47,17 @@ export const HOSTILE_DATABASES = [
   HOSTILE.slashy,
   HOSTILE.long,
   '..',
+]
+
+/**
+ * Servers that did not answer a cluster-wide read, with ids chosen by someone who controls a host name
+ * (contract 0.5.0: `missingServers`). `?mock=hostile` switches the mock to a partial answer with these.
+ */
+export const HOSTILE_MISSING: MissingServer[] = [
+  { serverId: HOSTILE.reversed, reason: 'timeout' },
+  { serverId: HOSTILE.markup, reason: 'unreachable' },
+  { serverId: HOSTILE.zeroWidth, reason: 'refused' },
+  { serverId: HOSTILE.long, reason: 'invalidAnswer' },
 ]
 
 /** Adds the hostile data to a fresh mock state. */
@@ -156,6 +168,29 @@ export function seedHostile(s: MockState): void {
       databaseName: null,
       acknowledgedAt: nowIso(),
       acknowledgedBy: HOSTILE.reversed,
+    },
+    // Alerts whose subject is a server with a hostile id (contract 0.5.0: certificateRenewalFailed).
+    {
+      ...base,
+      id: 902,
+      kind: 'certificateRenewalFailed',
+      severity: 'warning',
+      state: 'open',
+      title: HOSTILE.breakout,
+      message: HOSTILE.controls,
+      serverId: HOSTILE.reversed,
+      databaseName: null,
+    },
+    {
+      ...base,
+      id: 903,
+      kind: 'certificateRenewalFailed',
+      severity: 'warning',
+      state: 'open',
+      title: HOSTILE.cyrillic,
+      message: HOSTILE.newline,
+      serverId: '..',
+      databaseName: null,
     },
   )
 

@@ -14,8 +14,10 @@ import GlobalBanners from '@/components/GlobalBanners.vue'
 import TaskNotices from '@/components/TaskNotices.vue'
 import LiveRegions from '@/components/LiveRegions.vue'
 import SafeName from '@/components/SafeName.vue'
+import { safeText } from '@/lib/safe-text'
 import SystemDatabaseStopped from '@/components/this-server/SystemDatabaseStopped.vue'
-import { availability } from '@/api/availability'
+import { availability, rememberInstances } from '@/api/availability'
+import { useThisServerInstances } from '@/api/queries'
 import { createAnnouncer } from '@/composables/useAnnounce'
 
 const router = useRouter()
@@ -24,6 +26,20 @@ const session = useSessionStore()
 const theme = useThemeStore()
 const announcer = createAnnouncer()
 const navOpen = ref(false)
+// While the server can still answer, learn which instance hosts the system database: when it is stopped
+// the list can no longer be read, and "Start instance" needs the id.
+const instances = useThisServerInstances(() => session.can('listThisServerInstances'))
+watch(
+  () => instances.data.value?.items,
+  (items) => {
+    if (items) rememberInstances(items)
+  },
+  { immediate: true },
+)
+const clusterTitle = computed(() => {
+  const id = session.session?.clusterId
+  return id ? safeText(id, 60) : undefined
+})
 const narrow = useMediaQuery('(max-width: 860px)')
 
 function itemsFor(scope: 'cluster' | 'server') {
@@ -73,8 +89,8 @@ watch(
       <RouterLink :to="{ name: 'dashboard' }" class="brand-link">
         <BrandLogo :variant="narrow ? 'mark' : 'horizontal'" :size="30" />
       </RouterLink>
-      <span class="cluster-name" :title="session.session?.clusterId ?? undefined">
-        {{ session.session?.clusterName ?? 'This server' }}
+      <span class="cluster-name" :title="clusterTitle">
+        <SafeName :value="session.session?.clusterName ?? 'This server'" kind="text" :max="60" />
       </span>
       <span class="spacer" />
       <button

@@ -94,6 +94,10 @@ describe('First-run wizard', () => {
     const name = await screen.findByLabelText(/cluster name/i)
     await user.clear(name)
     await user.type(name, 'prod-eu')
+    // The administrator password is not kept after a failure: it is typed again (W2-12).
+    expect(screen.getByLabelText(/^password/i)).toHaveValue('')
+    await user.type(screen.getByLabelText(/^password/i), 'a-very-long-password')
+    await user.type(screen.getByLabelText(/repeat password/i), 'a-very-long-password')
     await user.click(screen.getByRole('button', { name: /^create cluster$/i }))
     expect(await screen.findByRole('button', { name: /continue to sign in/i })).toBeInTheDocument()
     expect(getState().node.state).toBe('clustered')

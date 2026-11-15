@@ -14,17 +14,19 @@ const props = withDefaults(
     variant?: 'default' | 'primary' | 'danger'
     small?: boolean
     disabled?: boolean
+    /** Why the action cannot work right now (not a role problem); makes the button aria-disabled and says why. */
+    blockedReason?: string
     type?: 'button' | 'submit'
   }>(),
-  { variant: 'default', small: false, disabled: false, type: 'button' },
+  { variant: 'default', small: false, disabled: false, blockedReason: '', type: 'button' },
 )
 const emit = defineEmits<{ click: [event: MouseEvent] }>()
 
 const session = useSessionStore()
 const allowed = computed(() => session.can(props.op))
-const reason = computed(() => (allowed.value ? '' : denialReason(props.op)))
+const reason = computed(() => (allowed.value ? props.blockedReason : denialReason(props.op)))
 const reasonId = `gate-${Math.random().toString(36).slice(2, 9)}`
-const blocked = computed(() => !allowed.value || props.disabled)
+const blocked = computed(() => !allowed.value || props.disabled || props.blockedReason !== '')
 
 function onClick(event: MouseEvent): void {
   if (blocked.value) {

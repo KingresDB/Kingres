@@ -7,6 +7,9 @@ import SafeName from '@/components/SafeName.vue'
 import TableWrap from '@/components/TableWrap.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import QueryBoundary from '@/components/QueryBoundary.vue'
+import PartialNotice from '@/components/PartialNotice.vue'
+import CursorResetNotice from '@/components/CursorResetNotice.vue'
+import { useCompletenessAnnouncement } from '@/composables/useCompletenessAnnouncement'
 import { endpoints } from '@/api/endpoints'
 import { keys, usePagedQuery } from '@/api/queries'
 import { formatDateTime } from '@/lib/format'
@@ -19,7 +22,7 @@ const component = ref<'' | LogComponent>('')
 const q = ref('')
 const serverId = ref('')
 
-const { query, items } = usePagedQuery(
+const { query, items, completeness, cursorReset, dismissCursorReset } = usePagedQuery(
   () => [...keys.logs, props.local, level.value, component.value, q.value, serverId.value],
   (cursor) => {
     const filter = {
@@ -35,6 +38,7 @@ const { query, items } = usePagedQuery(
   },
   10_000,
 )
+useCompletenessAnnouncement(completeness, 'list of log lines')
 const LEVELS: LogLevel[] = ['debug', 'info', 'warning', 'error']
 const COMPONENTS: LogComponent[] = [
   'api',
@@ -82,12 +86,23 @@ const LEVEL_ICON: Record<LogLevel, string> = { debug: '·', info: 'ⓘ', warning
       ><input id="lg-q" v-model="q" class="input" type="search" />
     </div>
   </form>
+  <CursorResetNotice :shown="cursorReset" @dismiss="dismissCursorReset" />
+  <PartialNotice
+    :completeness="completeness"
+    consequence="Log lines of these servers are not shown."
+  />
   <QueryBoundary
     :loading="query.isPending.value"
     :error="query.error.value"
     :empty="items.length === 0"
-    empty-title="No log lines"
-    empty-hint="Nothing matches these filters."
+    :empty-title="
+      completeness.partial ? 'No log lines from the servers that answered' : 'No log lines'
+    "
+    :empty-hint="
+      completeness.partial
+        ? 'This does not mean there are none: the servers named above did not answer, so their lines are not shown.'
+        : 'Nothing matches these filters.'
+    "
     @retry="query.refetch()"
   >
     <TableWrap>

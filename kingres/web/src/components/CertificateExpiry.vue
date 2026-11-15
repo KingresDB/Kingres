@@ -14,13 +14,22 @@ const state = computed(() => certificateState(props.expiresAt))
 
 <template>
   <NotAvailable v-if="state === 'unknown'" />
-  <span v-else class="nowrap">
-    {{ formatDateTime(expiresAt) }}
-    <span v-if="state === 'expired'" class="badge tone-danger" data-testid="cert-flag"
+  <span v-else>
+    <!-- The date stays in one piece; the flag may wrap below it on a narrow screen (W2-16). -->
+    <span class="nowrap">{{ formatDateTime(expiresAt) }}</span>
+    <span v-if="state === 'expired'" class="badge flag tone-danger" data-testid="cert-flag"
       ><span aria-hidden="true">&#10006;</span> Certificate expired</span
     >
-    <span v-else-if="state === 'expiring'" class="badge tone-warn" data-testid="cert-flag"
+    <span v-else-if="state === 'expiring'" class="badge flag tone-warn" data-testid="cert-flag"
       ><span aria-hidden="true">&#9650;</span> Expires within {{ CERTIFICATE_WARN_DAYS }} days</span
     >
   </span>
 </template>
+
+<style scoped>
+/* In a narrow column (the details grid at 320 px) the flag wraps inside itself instead of pushing the page. */
+.flag {
+  max-width: 100%;
+  white-space: normal;
+}
+</style>

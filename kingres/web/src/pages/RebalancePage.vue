@@ -23,7 +23,7 @@ import {
   useRebalanceStatus,
 } from '@/api/queries'
 import { useTaskAction } from '@/composables/useTask'
-import { REBALANCE_REASON_LABEL, type StatusMeta } from '@/lib/status'
+import { REBALANCE_REASON_LABEL, tolerant, type StatusMeta } from '@/lib/status'
 import { formatBytes, formatDateTime, formatDuration, formatNumber } from '@/lib/format'
 import type { RebalancePlan, RebalanceStatus } from '@/api/types'
 
@@ -36,13 +36,13 @@ const settings = useClusterSettings()
 const st = computed(() => status.data.value)
 const running = computed(() => st.value?.state === 'running' || st.value?.state === 'stopping')
 
-const STATE_META: Record<RebalanceStatus['state'], StatusMeta> = {
+const STATE_META: Record<RebalanceStatus['state'], StatusMeta> = tolerant({
   idle: { tone: 'neutral', icon: '○', label: 'Idle' },
   running: { tone: 'info', icon: '◐', label: 'Running' },
   stopping: { tone: 'warn', icon: '▲', label: 'Stopping' },
   stopped: { tone: 'warn', icon: '▲', label: 'Stopped (can be resumed)' },
   failed: { tone: 'danger', icon: '✖', label: 'Failed' },
-}
+})
 
 // Options shared by preview and start.
 const selectedDbs = ref<string[]>([])
@@ -183,7 +183,7 @@ const detailId = ref<number | null>(null)
                 <td class="num">{{ m.bucket }}</td>
                 <td>{{ m.fromShardGroupId }}</td>
                 <td>{{ m.toShardGroupId }}</td>
-                <td>{{ m.phase }}</td>
+                <td><SafeName :value="m.phase" kind="text" :max="40" /></td>
                 <td class="num">{{ Math.round(m.percent) }}%</td>
               </tr>
             </tbody>

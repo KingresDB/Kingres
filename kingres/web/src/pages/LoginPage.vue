@@ -1,13 +1,16 @@
 <!-- SPDX-License-Identifier: PostgreSQL -->
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
-import { defineAsyncComponent, ref } from 'vue'
+import { computed, defineAsyncComponent, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import ProblemNotice from '@/components/ProblemNotice.vue'
 import FormField from '@/components/FormField.vue'
 import BrandLogo from '@/components/BrandLogo.vue'
+import SystemDatabaseStoppedSignIn from '@/components/SystemDatabaseStoppedSignIn.vue'
+import { availability } from '@/api/availability'
 import { SessionCookieError, useSessionStore } from '@/stores/session'
 import { safeRedirect } from '@/lib/redirect'
+import { ApiError } from '@/api/problem'
 
 const session = useSessionStore()
 const route = useRoute()
@@ -19,6 +22,10 @@ const error = ref<unknown>(null)
 // bootstrap.ts adds ?expired=1 when a request reports that the session is gone.
 const expired = route.query.expired === '1'
 const busy = ref(false)
+// The explanation for this answer is the help block above, not the generic problem text.
+const stoppedError = computed(
+  () => error.value instanceof ApiError && error.value.code === 'system_database_stopped',
+)
 // Only in development with the mock API; the import is removed from production builds.
 const DemoHint =
   import.meta.env.DEV && import.meta.env.VITE_MOCKS !== 'off'
@@ -58,6 +65,7 @@ async function submit(): Promise<void> {
         </p>
         <h1 id="login-title">Sign in to KingresDB</h1>
         <p class="muted">Use your PostgreSQL role. Your cluster role decides what you can do.</p>
+        <SystemDatabaseStoppedSignIn v-if="availability.stoppedSeen" />
         <p v-if="error instanceof SessionCookieError" class="notice tone-warn" role="alert">
           <span aria-hidden="true">&#9650;</span>
           <span>
@@ -66,7 +74,7 @@ async function submit(): Promise<void> {
             or open the panel on this server through <code>http://localhost</code>.
           </span>
         </p>
-        <ProblemNotice v-else-if="error" :error="error" />
+        <ProblemNotice v-else-if="error && !stoppedError" :error="error" />
         <FormField v-slot="slot" label="User name">
           <input
             v-bind="slot"

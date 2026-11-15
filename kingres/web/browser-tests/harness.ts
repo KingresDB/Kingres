@@ -204,6 +204,7 @@ export const ROUTES = [
   '/dashboard',
   '/servers',
   '/servers/10.0.0.11',
+  '/servers/10.0.0.13',
   '/databases',
   '/databases/shop',
   '/shards',
@@ -221,3 +222,128 @@ export const ROUTES = [
 ]
 
 export const SECURITY_TABS = ['Roles', 'Access', 'Network access', 'Audit log']
+
+/** A page state that needs more than a visit: a dialog opened, a result shown, a special state reached. */
+export interface PageState {
+  name: string
+  /** The route to open first (inside the application, or by address in the production build). */
+  route: string
+  /** Gets into the state. */
+  open: (page: Page) => Promise<void>
+  /** Gets out again (closes the dialog); the next state starts from its own route anyway. */
+  close?: (page: Page) => Promise<void>
+}
+
+async function dialogOpen(page: Page): Promise<void> {
+  await page.waitForSelector('[role="dialog"]', { timeout: 20_000 })
+  await sleep(250)
+}
+const cancel = async (page: Page): Promise<void> => {
+  await clickText(page, 'Cancel')
+  await sleep(150)
+}
+
+/**
+ * The 0.4.0 and 0.5.0 states that the page loop does not reach: the certificate dialogs of a server, the
+ * inclusion proof with the digests compared against it, the add-server dialog with the fingerprint, the
+ * leave-cluster and instance dialogs, and the state of a stopped system database. Used by the axe, layout
+ * and content-security-policy runs (W2-16).
+ */
+export const STATES: PageState[] = [
+  {
+    name: 'renew certificates dialog',
+    route: '/servers/10.0.0.13',
+    open: async (page) => {
+      await clickText(page, 'Renew now')
+      await dialogOpen(page)
+    },
+    close: cancel,
+  },
+  {
+    name: 'revoke certificates dialog',
+    route: '/servers/10.0.0.13',
+    open: async (page) => {
+      await clickText(page, 'Revoke certificates')
+      await dialogOpen(page)
+    },
+    close: cancel,
+  },
+  {
+    name: 'remove server dialog',
+    route: '/servers/10.0.0.13',
+    open: async (page) => {
+      await clickText(page, 'Remove')
+      await dialogOpen(page)
+    },
+    close: cancel,
+  },
+  {
+    name: 'add server dialog with the fingerprint field',
+    route: '/servers',
+    open: async (page) => {
+      await clickText(page, 'Add server')
+      await dialogOpen(page)
+    },
+    close: cancel,
+  },
+  {
+    name: 'ledger inclusion proof with the digests compared',
+    route: '/ledger',
+    open: async (page) => {
+      await clickText(page, 'Look up proof')
+      await page.waitForSelector('[data-testid="proof"]', { timeout: 20_000 })
+      await page.waitForSelector('[data-testid="digest-proof-summary"]', { timeout: 20_000 })
+      await sleep(250)
+    },
+  },
+  {
+    name: 'restart instance dialog',
+    route: '/this-server',
+    open: async (page) => {
+      await clickText(page, 'Restart')
+      await dialogOpen(page)
+    },
+    close: cancel,
+  },
+  {
+    name: 'leave cluster dialog',
+    route: '/this-server',
+    open: async (page) => {
+      await clickText(page, 'Leave cluster')
+      await dialogOpen(page)
+    },
+    close: cancel,
+  },
+  {
+    name: 'system database stopped',
+    route: '/this-server',
+    open: async (page) => {
+      // The Stop button of instance #11, the one that hosts the system database.
+      const ok = await page.evaluate(() => {
+        const row = [...document.querySelectorAll('tr')].find((r) => r.textContent?.includes('#11'))
+        const button = [...(row?.querySelectorAll('button') ?? [])].find(
+          (b) => b.textContent?.trim() === 'Stop',
+        )
+        button?.click()
+        return !!button
+      })
+      if (!ok) throw new Error('No Stop button for instance #11')
+      await dialogOpen(page)
+      await page.type('[role="dialog"] input[autocomplete="off"]', 'stop')
+      await clickText(page, 'Stop instance')
+      await page.waitForFunction(
+        () => document.body.textContent?.includes('The system database is stopped'),
+        { timeout: 30_000 },
+      )
+      await sleep(300)
+    },
+    close: async (page) => {
+      await clickText(page, 'Start instance #11')
+      await page.waitForFunction(
+        () => !document.body.textContent?.includes('The system database is stopped'),
+        { timeout: 60_000 },
+      )
+      await sleep(300)
+    },
+  },
+]

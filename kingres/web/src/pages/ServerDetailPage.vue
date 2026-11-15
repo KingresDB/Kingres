@@ -27,7 +27,25 @@ const client = useQueryClient()
 const server = useServer(() => props.id)
 const groups = useServerGroups()
 const s = computed(() => server.data.value)
-const dialog = ref<'failover' | 'remove' | null>(null)
+const dialog = ref<'failover' | 'remove' | 'renew' | 'revoke' | null>(null)
+
+/** Why "Renew now" cannot work for this server, or an empty text. */
+const renewBlocked = computed(() =>
+  s.value?.certificateRevokedAt
+    ? 'The certificates of this server are revoked, so it gets no new certificate. Remove the server and join it again.'
+    : '',
+)
+/** Why "Revoke certificates" cannot work for this server, or an empty text. */
+const revokeBlocked = computed(() =>
+  s.value?.certificateRevokedAt
+    ? 'The certificates of this server are already revoked.'
+    : s.value?.isManagerLeader
+      ? 'The certificates of the manager leader cannot be revoked: the server refuses, because it hosts the cluster metadata.'
+      : '',
+)
+const holdsBuckets = computed(() =>
+  s.value ? s.value.buckets.primary + s.value.buckets.replica > 0 : false,
+)
 
 // Server group assignment: PATCH /servers/{id} with serverGroup (null removes the server from its group).
 const group = ref('')
@@ -105,10 +123,26 @@ function saveGroup(): void {
     @retry="server.refetch()"
   >
     <div v-if="s" class="stack-lg">
+      <p v-if="s.certificateRevokedAt" class="notice tone-danger" data-testid="revoked-notice">
+        <span aria-hidden="true">&#10006;</span>
+        <span>
+          <strong>The certificates of this server are revoked.</strong> Every other server and every
+          database instance refuses it, and it gets no new certificate. The only way back is to
+          remove the server and join it again with a new setup token<template v-if="holdsBuckets">
+            (removing works only for a server that holds no bucket copy, and this one holds
+            {{ s.buckets.primary + s.buckets.replica }})</template
+          >.
+        </span>
+      </p>
       <section class="grid-cards" aria-label="Summary">
         <div class="card kpi">
           <span class="label">Status</span>
           <span class="value"><StatusBadge :meta="SERVER_STATUS[s.status]" /></span>
+          <span v-if="s.certificateRevokedAt" class="value">
+            <span class="badge tone-danger" data-testid="revoked-badge"
+              ><span aria-hidden="true">&#10006;</span> Certificates revoked</span
+            >
+          </span>
           <span class="muted"
             >Server group:
             <SafeName v-if="s.serverGroup" :value="s.serverGroup" :max="60" />
@@ -203,7 +237,9 @@ function saveGroup(): void {
           <template v-if="s.certificateRevokedAt">
             <dt>Certificates revoked</dt>
             <dd>
-              <span class="badge tone-danger">Revoked</span>
+              <span class="badge tone-danger"
+                ><span aria-hidden="true">&#10006;</span> Revoked</span
+              >
               <time :datetime="s.certificateRevokedAt">{{
                 formatDateTime(s.certificateRevokedAt)
               }}</time>
@@ -219,6 +255,27 @@ function saveGroup(): void {
           The fingerprint is the SHA-256 of the certificate this server presented when it was added.
           Compare it with the log of that server. A server renews its own certificate before it
           expires; a certificate that is about to expire is flagged here and raised as an alert.
+        </p>
+        <div class="row" data-testid="certificate-actions">
+          <GateButton
+            op="renewServerCertificates"
+            :blocked-reason="renewBlocked"
+            @click="dialog = 'renew'"
+            >Renew now</GateButton
+          >
+          <GateButton
+            op="revokeServerCertificates"
+            variant="danger"
+            :blocked-reason="revokeBlocked"
+            @click="dialog = 'revoke'"
+            >Revoke certificates</GateButton
+          >
+        </div>
+        <p v-if="renewBlocked" class="hint muted" data-testid="renew-blocked">
+          Renew now is not available: {{ renewBlocked }}
+        </p>
+        <p v-if="revokeBlocked" class="hint muted" data-testid="revoke-blocked">
+          Revoke certificates is not available: {{ revokeBlocked }}
         </p>
       </section>
 
@@ -325,7 +382,7 @@ function saveGroup(): void {
     v-if="dialog && s"
     :kind="dialog"
     :server="s"
-    :invalidate="[keys.servers, keys.server(id), keys.topology]"
+    :invalidate="[keys.servers, keys.server(id), keys.topology, keys.cluster, keys.tasks]"
     @close="dialog = null"
   />
 </template>

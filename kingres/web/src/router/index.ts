@@ -11,6 +11,7 @@ import type { OperationId } from '@/api/roles'
 import { endpoints } from '@/api/endpoints'
 import { keys } from '@/api/queries'
 import { useSessionStore } from '@/stores/session'
+import { isAddressableSegment } from '@/lib/path-segment'
 
 declare module 'vue-router' {
   interface RouteMeta {
@@ -177,6 +178,10 @@ export function createAppRouter(
   const router = createRouter({ history, routes })
 
   router.beforeEach(async (to) => {
+    // A name that no URL can carry (`.`, `..`, empty) cannot be opened: the browser would resolve the
+    // address to another page. Whatever made the link, it lands on the list, which says so.
+    if (to.name === 'database' && !isAddressableSegment(String(to.params.name ?? '')))
+      return { name: 'databases' }
     let uninitialized = false
     try {
       const node = await queryClient.fetchQuery({

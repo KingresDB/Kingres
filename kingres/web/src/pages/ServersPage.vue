@@ -16,7 +16,7 @@ import CertificateExpiry from '@/components/CertificateExpiry.vue'
 import { useServers, keys } from '@/api/queries'
 import { SERVER_STATUS } from '@/lib/status'
 import { instanceLabel } from '@/lib/cluster'
-import { formatBytes, formatDuration, formatLag, percent } from '@/lib/format'
+import { formatBytes, formatDateTime, formatDuration, formatLag, percent } from '@/lib/format'
 import type { Server } from '@/api/types'
 
 const servers = useServers()
@@ -70,13 +70,20 @@ const dialog = ref<{ kind: 'add' | 'restore' | 'failover' | 'remove'; server?: S
         <tbody>
           <tr v-for="s in rows" :key="s.id" :data-testid="`server-row-${s.id}`">
             <th scope="row">
-              <RouterLink :to="{ name: 'server', params: { id: s.id } }">{{
-                s.address
-              }}</RouterLink>
+              <RouterLink :to="{ name: 'server', params: { id: s.id } }"
+                ><SafeName :value="s.address" kind="text" :max="80"
+              /></RouterLink>
               <div class="muted"><SafeName :value="s.hostname" kind="text" :max="80" /></div>
               <div v-if="s.isManagerLeader" class="muted">Manager leader</div>
             </th>
-            <td><StatusBadge :meta="SERVER_STATUS[s.status]" /></td>
+            <td>
+              <StatusBadge :meta="SERVER_STATUS[s.status]" />
+              <div v-if="s.certificateRevokedAt" data-testid="revoked-badge">
+                <span class="badge tone-danger"
+                  ><span aria-hidden="true">&#10006;</span> Certificates revoked</span
+                >
+              </div>
+            </td>
             <td>
               <SafeName v-if="s.serverGroup" :value="s.serverGroup" :max="60" />
               <template v-else>-</template>
@@ -116,6 +123,9 @@ const dialog = ref<{ kind: 'add' | 'restore' | 'failover' | 'remove'; server?: S
             </td>
             <td>
               <CertificateExpiry :expires-at="s.certificateExpiresAt" />
+              <div v-if="s.certificateRevokedAt" class="muted">
+                Revoked {{ formatDateTime(s.certificateRevokedAt) }}
+              </div>
               <div v-if="!s.seenFingerprint" class="muted">No fingerprint on record</div>
               <div v-else-if="!s.fingerprintPinned" class="muted">Fingerprint not pinned</div>
             </td>

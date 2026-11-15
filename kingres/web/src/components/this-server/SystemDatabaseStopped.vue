@@ -13,8 +13,10 @@ import ProblemNotice from '@/components/ProblemNotice.vue'
 import { availability, recovery, setSystemDatabaseStopped } from '@/api/availability'
 import { endpoints } from '@/api/endpoints'
 import { ApiError } from '@/api/problem'
+import { useSessionStore } from '@/stores/session'
 
 const client = useQueryClient()
+const session = useSessionStore()
 const phase = ref<'idle' | 'starting' | 'waiting'>('idle')
 const error = ref<unknown>(null)
 let waitingSince = 0
@@ -33,6 +35,8 @@ async function check(): Promise<void> {
   }
   if (!alive) return
   setSystemDatabaseStopped(false)
+  // The session of this tab may have been restored from a copy (after a reload): take the server's own.
+  void session.refresh()
   // Everything that was paused or answered 503 is asked again.
   void client.invalidateQueries()
 }
@@ -48,10 +52,13 @@ function schedule(): void {
 }
 
 async function startInstance(): Promise<void> {
+  const instanceId = availability.instanceId
+  // Never a guess: without a known id there is nothing to start from here.
+  if (instanceId === null) return
   error.value = null
   phase.value = 'starting'
   try {
-    await endpoints.instanceAction(availability.instanceId, 'start')
+    await endpoints.instanceAction(instanceId, 'start')
   } catch (e) {
     // "Already running" means someone started it a moment ago: wait for it like any start.
     if (!(e instanceof ApiError && e.code === 'instance_already_running')) {
@@ -87,6 +94,24 @@ onBeforeUnmount(() => {
         are still signed in, and nothing was lost.</span
       >
     </p>
+    <p
+      v-if="availability.instanceId === null"
+      class="notice tone-warn"
+      data-testid="instance-unknown"
+    >
+      <span aria-hidden="true">&#9650;</span>
+      <span
+        >This panel does not know which instance of this server hosts the system database: it could
+        only be read while the server still answered, and that did not happen in this tab. It does
+        not guess. Start the instance on the machine of this server (for example with
+        <code>pg_ctl start</code>), or restart the <code>kingresd</code> service of this server;
+        this page notices within seconds that the server answers again.</span
+      >
+    </p>
+    <p v-else data-testid="instance-known">
+      The instance to start is <strong>instance #{{ availability.instanceId }}</strong
+      >, the PostgreSQL instance of this server that hosts the system database.
+    </p>
     <p>
       Start the instance to continue. Starting can take a while (the instance recovers its data
       first); this page checks on its own and returns you to your work as soon as the server
@@ -94,11 +119,12 @@ onBeforeUnmount(() => {
     </p>
     <div class="row">
       <GateButton
+        v-if="availability.instanceId !== null"
         op="startThisServerInstance"
         variant="primary"
         :disabled="busy"
         @click="startInstance"
-        >Start instance</GateButton
+        >Start instance #{{ availability.instanceId }}</GateButton
       >
       <span v-if="phase === 'starting'" role="status">Asking the server to start it...</span>
       <span v-else-if="phase === 'waiting'" role="status"
