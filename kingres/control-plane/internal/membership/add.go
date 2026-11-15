@@ -11,6 +11,8 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -18,6 +20,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/audit"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/cluster"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fwdproof"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/leader"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ops"
@@ -53,6 +56,12 @@ type Manager struct {
 	// OnCertificateInstalled is called after this server stored a renewed
 	// certificate: the connections opened with the old one are closed.
 	OnCertificateInstalled func()
+	// GatherSigner signs the assertions of gather calls when this server is the
+	// leader (see Gatherer.Ask).
+	GatherSigner *fwdproof.Signer
+
+	gatherMu   sync.Mutex
+	gatherAuth map[string]*gatherAuth
 }
 
 func (m *Manager) log() *slog.Logger {
@@ -86,6 +95,19 @@ type introduction struct {
 // ErrExists means the server is already a member.
 var ErrExists = errors.New("the server is already a member of the cluster")
 
+// caseCollision reports whether a server id differs from an existing one only
+// by letters' case. Ids are compared as exact strings but a host name is not:
+// the certificate of "Node1" is accepted where "node1" is expected, so a server
+// that calls itself "Node1" next to the member "node1" could answer for it.
+func caseCollision(existing []string, id string) bool {
+	for _, e := range existing {
+		if e != id && strings.EqualFold(e, id) {
+			return true
+		}
+	}
+	return false
+}
+
 // introduce signs the certificate request of a new server and records the
 // server as pending in one step (design D4 step 1 and the security
 // requirement that no certificate exists for a server that is not recorded).
@@ -116,6 +138,17 @@ func (m *Manager) introduce(ctx context.Context, in introduction) (string, error
 			return err
 		}
 		defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+		idRows, err := tx.Query(ctx, `SELECT server_id FROM kingres_cp.server`)
+		if err != nil {
+			return err
+		}
+		ids, err := pgx.CollectRows(idRows, pgx.RowTo[string])
+		if err != nil {
+			return err
+		}
+		if caseCollision(ids, in.ServerID) {
+			return ErrExists
+		}
 		old, err := scanRow(tx.QueryRow(ctx, `SELECT `+rowCols+` FROM kingres_cp.server WHERE server_id = $1 FOR UPDATE`, in.ServerID))
 		switch {
 		case err == nil && old.Status == StatusActive:
@@ -351,9 +384,18 @@ func (m *Manager) discardPending(ctx context.Context, id string) {
 	if err != nil || row.Status != StatusPending || row.Registering {
 		return
 	}
-	if ca, err := m.Svc.CA(); err == nil && row.Serial != "" {
-		if err := ca.Revoke(row.Serial, time.Now()); err != nil {
-			m.log().Error("revoking the certificate of an abandoned server", "server", id, "error", err)
+	if row.Serial != "" {
+		// A certificate that cannot be revoked now (this server does not hold the CA key, or
+		// the list cannot be written) keeps its pending record: forgetting the server would
+		// forget that a valid certificate exists. The next sweep, on a leader that can
+		// revoke, finishes it.
+		ca, err := m.Svc.CA()
+		if err == nil {
+			err = ca.Revoke(row.Serial, time.Now())
+		}
+		if err != nil {
+			m.log().Error("revoking the certificate of an abandoned server; its record is kept", "server", id, "error", err)
+			return
 		}
 	}
 	_ = m.sys(ctx, func(c *pgx.Conn) error {
@@ -378,14 +420,39 @@ func (m *Manager) SweepAbandoned(ctx context.Context) {
 		return
 	}
 	for _, r := range rows {
-		if r.Status != StatusPending || r.Registering || time.Since(r.JoinedAt) < 15*time.Minute {
+		if r.Status != StatusPending || time.Since(r.JoinedAt) < 15*time.Minute || m.hasActiveTask(ctx, eng, r.ID) {
 			continue
 		}
-		if m.hasActiveTask(ctx, eng, r.ID) {
+		if !r.Registering {
+			m.log().Warn("revoking the certificate of an abandoned pending server", "server", r.ID)
+			m.discardPending(ctx, r.ID)
 			continue
 		}
-		m.log().Warn("revoking the certificate of an abandoned pending server", "server", r.ID)
-		m.discardPending(ctx, r.ID)
+		// The server may be registered in the shard catalogs, so its record stays (adding it
+		// again finishes the job), but it must not keep a valid certificate for ever: after a
+		// day without a task its certificates are revoked.
+		if r.RevokedAt == nil && time.Since(r.JoinedAt) > abandonedRegisteredAfter {
+			m.log().Warn("revoking the certificates of a registered server whose add never finished", "server", r.ID)
+			m.revokeAbandoned(ctx, r)
+		}
+	}
+}
+
+// abandonedRegisteredAfter is how long a pending server that was registered
+// keeps its certificates when no task works on it (CP2-14).
+const abandonedRegisteredAfter = 24 * time.Hour
+
+func (m *Manager) revokeAbandoned(ctx context.Context, r serverRow) {
+	ca, err := m.Svc.CA()
+	if err == nil {
+		err = m.revokeServerCertificates(ctx, ca, r.ID, r.Serial)
+	}
+	if err == nil {
+		m.Client.Forget(r.ID)
+		err = m.distributeRevocations(ctx)
+	}
+	if err != nil {
+		m.log().Error("revoking the certificates of an abandoned registered server", "server", r.ID, "error", err)
 	}
 }
 

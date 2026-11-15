@@ -190,3 +190,23 @@ func TestMonitoringAndGatheringSettings(t *testing.T) {
 		t.Error("a zero gather timeout was accepted")
 	}
 }
+
+func TestPlaintextOnNetwork(t *testing.T) {
+	for _, tc := range []struct {
+		listen, cert string
+		want         bool
+	}{
+		{"127.0.0.1:8091", "", false},
+		{"[::1]:8091", "", false},
+		{"localhost:8091", "", false},
+		{"0.0.0.0:8091", "", true},
+		{":8091", "", true},
+		{"10.0.0.5:8091", "", true},
+		{"0.0.0.0:8091", "server.pem", false},
+	} {
+		c := Config{Listen: tc.listen, TLSCertFile: tc.cert}
+		if got := c.PlaintextOnNetwork(); got != tc.want {
+			t.Errorf("listen %q cert %q: %v, want %v", tc.listen, tc.cert, got, tc.want)
+		}
+	}
+}

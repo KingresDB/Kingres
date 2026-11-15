@@ -40,6 +40,10 @@ type Session struct {
 	ExpiresAt time.Time
 	// CreatedAt is the sign-in time.
 	CreatedAt time.Time
+	// ProofKey is what the session proves itself to other servers with when a
+	// request is forwarded (package fwdproof); empty when the role has no SCRAM
+	// verifier. It is kept in memory only and never leaves this server.
+	ProofKey []byte
 }
 
 // Errors returned by the session store.
@@ -57,18 +61,26 @@ var (
 type Store struct {
 	ttl time.Duration
 	max int
-	now func() time.Time
+	// maxPerUser bounds the sessions of one role; the oldest one of the role is
+	// ended when a new one would exceed it. Without it one account could use up
+	// the global cap and lock every other sign-in out (CP2-09).
+	maxPerUser int
+	now        func() time.Time
 
 	mu       sync.Mutex
 	sessions map[[sha256.Size]byte]*Session
 	expired  map[[sha256.Size]byte]time.Time // recently expired, to report session_expired
 }
 
+// DefaultMaxSessionsPerUser is the number of live sessions one role may hold.
+const DefaultMaxSessionsPerUser = 20
+
 // NewStore creates a store. ttl is the absolute session lifetime, max the
-// maximum number of live sessions, now the clock.
+// maximum number of live sessions (a backstop: the per-role cap is what stops
+// one account from filling the store), now the clock.
 func NewStore(ttl time.Duration, max int, now func() time.Time) *Store {
 	return &Store{
-		ttl: ttl, max: max, now: now,
+		ttl: ttl, max: max, maxPerUser: DefaultMaxSessionsPerUser, now: now,
 		sessions: map[[sha256.Size]byte]*Session{},
 		expired:  map[[sha256.Size]byte]time.Time{},
 	}
@@ -103,6 +115,7 @@ func (s *Store) Create(username string, roles []string, kind Kind) (credential s
 	defer s.mu.Unlock()
 	now := s.now()
 	s.sweepLocked(now)
+	s.evictOldestOfLocked(username)
 	if len(s.sessions) >= s.max {
 		return "", Session{}, ErrTooManySessions
 	}
@@ -111,6 +124,29 @@ func (s *Store) Create(username string, roles []string, kind Kind) (credential s
 	cp := sess
 	s.sessions[digest(credential)] = &cp
 	return credential, sess, nil
+}
+
+// evictOldestOfLocked ends the oldest sessions of the role until one more fits
+// under the per-role cap.
+func (s *Store) evictOldestOfLocked(username string) {
+	for {
+		n := 0
+		var oldestKey [sha256.Size]byte
+		var oldest time.Time
+		for k, sess := range s.sessions {
+			if sess.Username != username {
+				continue
+			}
+			if n == 0 || sess.CreatedAt.Before(oldest) {
+				oldestKey, oldest = k, sess.CreatedAt
+			}
+			n++
+		}
+		if n < s.maxPerUser {
+			return
+		}
+		delete(s.sessions, oldestKey)
+	}
 }
 
 // Lookup returns the session of a credential. ErrExpired is returned (once

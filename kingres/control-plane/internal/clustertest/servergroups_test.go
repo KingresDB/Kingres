@@ -188,7 +188,8 @@ func TestServerGroupsAcrossServers(t *testing.T) {
 		a := n.Expect(200, "GET", "/audit?action=createServerGroup&limit=200", nil)
 		for _, it := range a["items"].([]any) {
 			// Only the refused attempt of the read-only role is audited where it was made.
-			if m := it.(map[string]any); m["outcome"] != "denied" {
+			// The list is the cluster's: only the events this follower wrote count.
+			if m := it.(map[string]any); m["serverId"] == n.Host && m["outcome"] != "denied" {
 				t.Errorf("the follower %d audited a forwarded request: %v", n.Index, m)
 			}
 		}

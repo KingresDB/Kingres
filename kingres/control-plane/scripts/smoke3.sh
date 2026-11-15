@@ -70,14 +70,18 @@ curl -s -X POST "$(base 1)/setup/init-cluster" -H "X-Setup-Token: $(cat $D/n1/da
   -d "{\"clusterName\":\"smoke3\",\"admin\":{\"username\":\"$ADMIN\",\"password\":\"$APW\"},\"dataPaths\":{\"dataDirectory\":\"$D/n1/data\"},\"memoryQuota\":{\"totalMegabytes\":1024}}" | jq -c '{id,kind,state}'
 wait_setup 1; login 1 $ADMIN $APW; echo "state: $(curl -s $(base 1)/setup/state | jq -r .state)"
 
-say "2. join server 2 from its own API (trust on first use; fingerprint seen is logged)"
+say "2. join server 2 from its own API, pinning the fingerprint that server 1 shows on its own panel"
+FP1=$(api 1 GET /this-server '' | jq -r .internalFingerprint)
+echo "fingerprint of server 1: $FP1"
 curl -s -X POST "$(base 2)/setup/join-cluster" -H "X-Setup-Token: $(cat $D/n2/data/setup-token)" -H "Content-Type: application/json" \
-  -d "{\"existingNodeAddress\":\"${HOST[1]}:${API[1]}\",\"admin\":{\"username\":\"$ADMIN\",\"password\":\"$APW\"},\"dataPaths\":{\"dataDirectory\":\"$D/n2/data\"},\"memoryQuota\":{\"totalMegabytes\":1024}}" | jq -c '{id,kind,state}'
+  -d "{\"existingNodeAddress\":\"${HOST[1]}:${API[1]}\",\"expectedFingerprint\":\"$FP1\",\"admin\":{\"username\":\"$ADMIN\",\"password\":\"$APW\"},\"dataPaths\":{\"dataDirectory\":\"$D/n2/data\"},\"memoryQuota\":{\"totalMegabytes\":1024}}" | jq -c '{id,kind,state}'
 wait_setup 2; login 2 $ADMIN $APW; echo "server 2 state: $(curl -s $(base 2)/setup/state | jq -r .state)"
 grep -h 'certificate seen on first contact' "$D/n2/kingresd.log" | jq -c '{msg,sha256,pinned}'
 
 say "3. add server 3 from the cluster's API, pinning its bootstrap fingerprint"
-FP=$(openssl x509 -in "$D/n3/data/pki/bootstrap.crt" -noout -fingerprint -sha256 | cut -d= -f2)
+# a server that is not a member shows the fingerprint of its bootstrap certificate to the machine it runs on
+fp3() { curl -s "$(base 3)/setup/state" | jq -r .internalFingerprint; }
+FP=$(fp3)
 echo "fingerprint of server 3: $FP"
 T=$(api 1 POST /servers "{\"address\":\"${HOST[3]}:${API[3]}\",\"setupToken\":\"$(cat $D/n3/data/setup-token)\"}" -H "X-Kingres-Pin-Sha256: $FP")
 echo "$T" | jq -c '{id,kind,state}'; wait_task 1 "$(echo "$T" | jq -r .id)" && echo "task done"; login 3 $ADMIN $APW
@@ -86,7 +90,7 @@ echo "servers listed by each server:"; for i in 1 2 3; do echo "  server $i: $(a
 say "4. remove an empty server (server 3), then add it again"
 T=$(api 1 DELETE "/servers/${HOST[3]}" ""); echo "$T" | jq -c '{id,kind,state}'; wait_task 1 "$(echo "$T" | jq -r .id)" && echo "task done"
 echo "server 3 is now: $(curl -s $(base 3)/setup/state | jq -r .state); servers: $(api 1 GET /servers '' | jq -c '[.items[].id]')"
-T=$(api 1 POST /servers "{\"address\":\"${HOST[3]}:${API[3]}\",\"setupToken\":\"$(cat $D/n3/data/setup-token)\"}"); wait_task 1 "$(echo "$T" | jq -r .id)" && echo "server 3 added again"; login 3 $ADMIN $APW
+T=$(api 1 POST /servers "{\"address\":\"${HOST[3]}:${API[3]}\",\"setupToken\":\"$(cat $D/n3/data/setup-token)\",\"expectedFingerprint\":\"$(fp3)\"}"); wait_task 1 "$(echo "$T" | jq -r .id)" && echo "server 3 added again"; login 3 $ADMIN $APW
 
 say "4b. server 3 leaves the cluster through its own API (it owns nothing), then is added again"
 T=$(api 3 POST /this-server/leave-cluster '{}'); echo "$T" | jq -c '{id,kind,state,subject}'
@@ -94,7 +98,7 @@ wait_task 1 "$(echo "$T" | jq -r .id)" && echo "leave task done (read through th
 for _ in $(seq 1 60); do [ "$(curl -s $(base 3)/setup/state | jq -r .state)" = uninitialized ] && break; sleep 1; done
 echo "server 3 is now: $(curl -s $(base 3)/setup/state | jq -r .state); servers: $(api 1 GET /servers '' | jq -c '[.items[].id]')"
 check "the revocation list of the leader holds the certificate of the server that left" "$([ -n "$(curl -s --cert $D/n1/data/pki/server.crt --key $D/n1/data/pki/server.key --cacert $D/n1/data/pki/ca.crt -H 'X-Kingres-Internal-Version: 1' https://${HOST[1]}:$((API[1]+1))/internal/v1/revoked | jq -r '.serials[]')" ]; echo $?)"
-T=$(api 1 POST /servers "{\"address\":\"${HOST[3]}:${API[3]}\",\"setupToken\":\"$(cat $D/n3/data/setup-token)\"}"); wait_task 1 "$(echo "$T" | jq -r .id)" && echo "server 3 joined again with a new setup token and a new certificate"; login 3 $ADMIN $APW
+T=$(api 1 POST /servers "{\"address\":\"${HOST[3]}:${API[3]}\",\"setupToken\":\"$(cat $D/n3/data/setup-token)\",\"expectedFingerprint\":\"$(fp3)\"}"); wait_task 1 "$(echo "$T" | jq -r .id)" && echo "server 3 joined again with a new setup token and a new certificate"; login 3 $ADMIN $APW
 
 say "5. a role and a sharded database made on server 1 exist on all three"
 api 1 POST /roles "{\"name\":\"app_user\",\"password\":\"App-Passw0rd-12\",\"clusterRoles\":[\"kingres_readonly\"]}" | jq -c '{name,canLogin}'

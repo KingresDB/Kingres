@@ -504,7 +504,7 @@ extensions it uses; register the server with `kingres.add_node` in every databas
 status `pendingRebalance` until a rebalance (not written yet) moves buckets to it; databases created afterwards
 spread their buckets over all servers at once.
 
-**Pinned fingerprint or trust on first use.** The first contact has no common CA. The internal API of a server
+**Pinned fingerprint or trust on first use.** (Since 0.6.0 a pin is required for `addServer` and `joinCluster` unless the request says `allowUnpinned: true`, and the fingerprint can be read from the server itself; see "Fix round for the second review" at the end. The text below describes the mechanism.) The first contact has no common CA. The internal API of a server
 without a cluster presents a self-signed certificate (its fingerprint is logged at start, `bootstrap certificate of the
 internal API`, and is the SHA-256 of `<data-dir>/pki/bootstrap.crt`); the internal API of a server of the cluster
 presents the cluster certificate (`<data-dir>/pki/server.crt`). The contract 0.3.0 has no field for a fingerprint, so
@@ -1626,6 +1626,110 @@ also work on a standalone server and while the leader is down.
   and `restartRequired` is "the token of the running postmaster equals the saved one". Every way of restarting
   (`restartThisServerInstance`, stop and start, an operator, a reboot) ends it, kingresd's own restart does not, and no
   code path that restarts the instance needs a hook.
+
+## Fix round for the second review (contract 0.6.0)
+
+Source: `kingres/docs/reviews/2026-11-15-kingresd-0.4.md` (CP2-01 to CP2-22, the unconfirmed list) and the defects the
+other engineers reported afterwards. Every finding below has a test that fails without the fix; where "before" could
+not be run (the old API cannot express the test) it is said. This section supersedes older statements of this file
+where they disagree (for example "Not done: records of other shard groups" and the "few seconds" bound of role
+revocation). Contract 0.6.0 and its breaking and additive changes: `kingres/api/README.md`, section "0.6.0".
+
+### Findings and what changed
+
+| Finding | Result | What changed | Test |
+|---|---|---|---|
+| CP2-01 / CP-07 forwarded identity by name | fixed | Per-request SCRAM-style proof of a session of the named user, checked against the user's verifier by the leader only (`internal/fwdproof`, `internal/scram`, `auth/proofkey.go`); cluster-wide reads carry an assertion signed by the leader (`POST /gather-authorize`) instead of a proof, so no other member ever receives a value from which a ClientKey can be derived; pending servers authorize nothing; `Proxy.Allow` runs after the guard. See `internal-api.md`, "Forwarded identities need a proof". | `fwdproof` tests, `internalapi` `TestPendingServerAuthorizesNothing`, `TestUnprovenIdentityIsRefusedBeforeTheBackend`, clustertest `TestForwardedIdentityNeedsTheProofOfASession` (real three-server cluster; with the check switched off the same forward without a proof answered 200) |
+| CP2-02 ops to admin through `addServer` | fixed (breaking) | `addServer` needs `kingres_admin`; a certificate is issued only for a request an administrator made and that names the candidate's certificate; verifiers only after that; a pending server authorizes nothing | clustertest `TestOpsCannotAddAServer`. The run before the fix was not completed, so the first half (the leader signs for an ops caller's server) is confirmed by reading only |
+| CP2-03 pin dropped through a follower | fixed | the receiving server normalizes body and header pin (malformed: 400 everywhere) and forwards one value; the leader uses it for both sources | `httpapi` `TestAddServerPinThroughAFollower` (13 cases) |
+| CP2-05 password before fingerprint | fixed (breaking) | `joinCluster` and `addServer` need a pin or an explicit `allowUnpinned: true` | `TestAddServerPinThroughAFollower`, clustertest `TestJoinPinFlowFromThePanels` |
+| CP2-04 renewal and CRL refresh | verified closed, not redone | `membership/certjob.go` renews and refreshes the CRL | `TestRenewalJob*`, clustertest `TestCertificateRenewalKeepsAThreeServerClusterWorking` |
+| CP2-06 task leases | fixed | lease arithmetic on the database clock (`clock_timestamp()`), fencing epoch `task.lease_epoch` checked in every write, the `running` mark atomic with the lease check, the step context is cancelled when the lease cannot be kept | `task` `TestSkewedClockCannotTakeALiveLease` (two engines, 5 minutes skew), `TestStepStopsWhenTheLeaseCannotBeRenewed`, `TestFencingEpochSeparatesRunsOfTheSameHolder`, `TestNoStepStartsOnAnExpiredLease`, `TestPGStoreLeaseUsesTheDatabaseClock` |
+| CP2-07 revocation on unreachable servers | partly fixed, rest deferred | wrong "few seconds" claim corrected; alert kind `replicationPending` for a server the leader still waits for. Deferred: followers refusing sessions after losing the leader (needs the heartbeat of the next phase); the response of the revoking operation does not list unapplied servers | `monitor` `TestReplicationPendingConditions`, `TestReadReplicationAgainstPostgreSQL` |
+| CP2-08 digests and verification of one group | fixed (truthful scope) | `complete` and `uncoveredShardGroupIds` on `LedgerDigest` and `LedgerVerification`; a task `done` always leaves a record | `ops` `TestDigestAndVerificationSayWhatTheyCover`, `TestOtherGroupsReadsTheShardCatalog`, e2e `TestLedgerDigestScopeAttributionAndBytes` |
+| CP2-09 sessions lock-out | fixed | 20 sessions per role, oldest first; global cap as backstop | `auth` `TestStorePerUserCap` |
+| CP2-10 limiter lock-out | fixed | a full table evicts instead of refusing; IPv6 by /64; health probes exempt | `auth` `TestLimiterSaturationDoesNotLockNewKeysOut`, `TestAddressKeyGroupsIPv6By64`, `httpapi` `TestPublicEndpointsAreRateLimited` |
+| CP2-11 cut DML | fixed | non-read statements are read to the end and committed (`truncated`, real tag); plain reads are stopped and rolled back | e2e `TestWorkbenchCutDMLIsCommitted` |
+| CP2-12 `timeoutMs` | fixed | own context for `executeQuery`, write deadline `timeoutMs + 15 s`, 422 `sql_error` 57014 | e2e `TestWorkbenchTimeoutIsASQLError` |
+| CP2-13 audit on a follower | fixed | `listAuditEvents` is cluster-wide through gather with `partial`/`missingServers`; event ids are cluster-unique; `Sink.Ready` refuses an audited mutation (503) before any effect when the log cannot be written | `httpapi` `TestAuditListIsClusterWideAndPaged`, `TestMutationIsRefusedWhileTheAuditLogCannotBeWritten`, clustertest `TestAuditShowsTheLeadersActionsOnEveryServer` |
+| CP2-14 removal order, CA key | fixed, partly tested | revoke before the irreversible reset; a pending record is kept when it cannot be revoked; a registered pending server whose add never finished is revoked after 24 h | `membership` `TestRemovalRevokesBeforeTheIrreversibleStep` (the other two paths have no seam without a system database) |
+| CP2-15 workbench slots | fixed | two of four slots per role | `TestOneRoleCannotHoldEveryWorkbenchSlot` |
+| CP2-16 audit scan | fixed | backward scan to `Limit+1`; rotation at 64 MiB into `audit.jsonl.<first id>`, segments are never deleted | `audit` `TestFileSinkRotatesAndQueriesAcrossSegments`, `TestFileSinkBackwardReadHandlesBlockBoundaries` |
+| CP2-17 log directory | fixed | the directory comes from the managed `log_directory` | `instance` `TestLogDirFollowsTheManagedSettings`, `httpapi` `TestLogsFollowAMovedLogDirectory` |
+| CP2-18 durable revocations | fixed | `pki.WriteFile` syncs the file and the directory | `pki` `TestWriteFileFlushesBeforeAndAfterTheRename` |
+| CP2-19 `LastGood` | fixed | `good` is stored only when the epoch is unchanged; the start fallback to sign-in roles is gone | `auth` `TestRevalidatorChangedIsNotUndoneByAnInFlightCheck`, `httpapi` `TestStartFromMemoryDoesNotWeakenRevalidation` |
+| CP2-20 peer task calls | fixed | a peer may record and settle only tasks of its own instances | `ops` `TestHandleTaskCallBindsTheCallToTheCallersInstances` |
+| CP2-21 plaintext listener | fixed as a warning, not a refusal | a WARN at every start for a non-loopback listener without TLS; a refusal needs a packaging flag, deferred. `getNodeState` and `getReadiness` stay public by contract and say nothing secret | `config` `TestPlaintextOnNetwork` |
+| CP2-22 stop settled first | documented, not changed | see "Stop is settled before the stop" below | none |
+| Unconfirmed: digest attribution | confirmed, fixed | `kingres_cp.ledger_digest_actor`; a digest of the service role is `system` | e2e `TestLedgerDigestScopeAttributionAndBytes` (`generatedBy` was `kingresd`) |
+| Unconfirmed: CRL expiry | not re-run; CP2-04 removes the cause (the CRL is refreshed well inside its validity) | | `TestRenewalJob*` |
+| Unconfirmed: one huge value | confirmed, fixed | `internal/pgframe` closes a connection whose message header announces more than 16 MiB before the body is read (286 MiB were allocated before) | `pgframe` tests, e2e `TestWorkbenchHugeValueIsBounded` |
+| Unconfirmed: case-insensitive names | confirmed by reading, fixed | a server id that differs only by case from a member is refused (409) | `membership` `TestCaseCollision` (unit; not run with two real servers) |
+| Unconfirmed: exec without statement timeout | confirmed, fixed | `execLocal` sets `statement_timeout` to 15 minutes | clustertest `TestInternalExecRunsUnderAStatementTimeout` |
+| Unconfirmed: leader change under a pause | refuted as far as this code goes | with CP2-06 a paused old leader cannot start a step after its lease ended (the mark is atomic with the lease) nor write after another claim (epoch); the election itself is the extension's | `TestNoStepStartsOnAnExpiredLease`, `TestFencingEpochSeparatesRunsOfTheSameHolder` |
+| Unconfirmed: ledger byte-exactness | refuted (sound) | the API's `document` equals the stored `digest::text` with white space removed; the verifier checks the API bytes | e2e `TestLedgerDigestScopeAttributionAndBytes`, `TestInclusionProofsAndTheVerifier` |
+| Defect 1 `getDatabase` on a follower | fixed (server only) | the follower takes the recorded fields (bucket count, ledger mode, digest interval, creator) from the leader, whose system database holds them | `httpapi` `TestFollowerAnswersTheRecordedFieldsOfADatabase`, clustertest `TestDatabaseRecordedFieldsAreTheSameOnEveryServer`. `packaging/test/test-compose.sh` was not edited |
+| Defect 2 `joinedAt`, `uptimeSeconds`, status | fixed | `joinedAt` was never set; `uptimeSeconds` only for the answering server (the others are asked, null when silent); `pendingRebalance` is now "should hold shards, is primary of no bucket, buckets exist" (before, it depended on how far the standby's copy of a neighbour's buckets had come) | `pgstore` `TestStatusPendingRebalanceNeedsBucketsElsewhere`, clustertest `TestJoinedServersHaveJoinedAtUptimeAndOneStatus` |
+| Defect 3 sessions per server | fixed (contract text) | `login`, `sessionCookie`, `bearerAuth` | `npm run check` |
+| Defect 4 503 window | fixed | `down` is set when a stop or restart is accepted; a connection lost while it is down is `system_database_stopped` | `ops` `TestStopAndRestartGateFromTheStart`, `httpapi` `TestStoreFailureWhileTheInstanceIsDownIsTheDocumentedCode` |
+| Defect 5 no internal API | fixed | 409 `internal_api_disabled` (additive) | clustertest `TestServerWithoutInternalAPIAnswersADedicatedCode` |
+| Defect 6 `walDirectory` | fixed | the answer always has `walDirectory` and `logDirectory`, null when default; the `required` list stays `[dataDirectory]` | `localsettings` `TestAnswerAlwaysNamesTheOptionalDirectories` |
+| Defect 7 TypeScript types | fixed (contract) | `LedgerProofBlock`; `document` must be kept byte-exact | `npm run check` |
+| Defect 8 `SetupTaskSummary.detail` | fixed | additive | `TestJoinPinFlowFromThePanels` |
+| Defect 9 own fingerprint | fixed | `NodeStateInfo.internalFingerprint` (loopback or setup token holder only), `LocalServerInfo.internalFingerprint` (any signed-in role) | `TestJoinPinFlowFromThePanels` |
+| Panel review W2-01/W2-02: no session after a reload while the system database is stopped | fixed | `getSession` and `listThisServerInstances` answer from memory in the stopped state, authorized from `Revalidator.LastGood` (at most one hour, ended by any role change, never for a session this process did not check); the answer is marked `degraded`. Residue: a dropped or disabled role keeps its own session, the instance list and the start of this server for at most one hour and only until any role change on the cluster (the CP2-07 residue, not wider). After any role change on the leader a stopped follower can only be started on the machine | `httpapi` `TestSessionAndInstancesWhileTheSystemDatabaseIsStopped`, e2e `TestInstanceStopStartEndToEnd`, clustertest `TestFollowerInstanceStopAndStart`, `TestStoppedFollowerSessionRules` |
+| Wishes: `Session.clientAddress`, dry run of `replaceNetworkAccess` | done (additive); cancelling a workbench statement is deferred | | e2e `TestNetworkAccess` |
+| Extra defect found by testing | fixed | the workbench's dangerous-role check counted the bare ADMIN membership of a role's creator and locked administrators out | e2e `TestWorkbenchIgnoresBareAdminMemberships` |
+
+### Decisions
+
+1. **Forwarded identities carry a SCRAM-style proof** checked against the user's verifier, sent to the leader only (a receiver of a proof recovers the ClientKey, as a SCRAM server does; a gather therefore carries an assertion signed by the leader, not a proof). A signed assertion of the
+   forwarding server's certificate was rejected: the member's key signs anything, the proof needs a secret that only
+   a server that saw the password has.
+2. **A pending server authorizes nothing** except its own join: every call to the leader needs catalog membership.
+3. **`addServer` needs `kingres_admin`**; a pin is mandatory for add and join unless `allowUnpinned: true`.
+4. **The fingerprint of a server that is not a member yet** is shown only to the machine itself or to the holder of
+   the setup token; a member's fingerprint to any signed-in role.
+5. **Leases are on the database clock**; the engine's own clock only measures time since a confirmation, never an expiry.
+6. **Digests and verifications state what they cover** (`complete`, `uncoveredShardGroupIds`) instead of covering every
+   group now. Never `passed` for a part without saying so.
+7. **The audit list is cluster-wide** (gather), not leader-bound; a mutation is refused when the audit log cannot be
+   written (pre-flight, not an intent record, which would double the log and need a new enum value).
+8. **Limiter tables evict, never refuse**; sessions are capped per role.
+9. **`pendingRebalance` means "primary of no bucket"**, not "holds nothing".
+10. **A plaintext non-loopback listener warns**, it does not refuse (packaging decides).
+11. **Revocation lag is an alert** (`replicationPending`), not a bound; a bound needs the heartbeat of the next phase.
+12. **`down` is set when a stop or restart is accepted**, so the documented code is the only one seen.
+
+### What a compromised member can still do
+
+See `internal-api.md`, "Forwarded identities need a proof". In short: a member holds its own superuser, every role's
+SCRAM verifier and the proof key of every session opened on it. It can act as any user who signs in on it, run SQL on
+itself and (through the sharding extension's node connections) on the data routed to it, and attack the verifiers
+offline. Since 0.6.0 it can no longer act as a user who never signed in on it, and a server that is only pending can do
+nothing. A compromised leader is a compromised cluster (it receives the proofs, holds the CA key and runs every
+cluster operation). The rest is inherent: every server authenticates users itself and holds the verifiers, so a compromised
+member is a compromised server for the users who use it.
+
+### Stop is settled before the stop (CP2-22)
+
+The task row of an instance stop lives in the database that is about to stop, so it can only be settled before the
+shutdown; it is corrected to `failed` when the instance does not stop. A crash of `kingresd` between the two leaves a
+`done` task and a running instance. This is a deliberate choice, not an oversight.
+
+### Limits that remain
+
+- The residual of CP2-06: a process paused between the atomic `running` mark and the first side effect of a
+  non-idempotent step can still act after its lease ended. `Env.Fence()` hands the epoch to a step so that a callee
+  can fence remote calls; no step uses it yet.
+- Digests and verifications still cover only the chain of the server that makes them.
+- A cluster-wide read is refused (the server shows as missing) when the leader cannot be reached or cannot check the proof.
+- The replay cache of forwarded proofs is per server and lost on restart (a replay needs a proof captured from a
+  TLS channel and falls inside the two-minute window).
+- The leader's `ClusterOverview` counts use each server's own catalog view.
+- Events of a removed server are gone with it (audit); a disk that fills between the pre-flight check and the final
+  audit record only logs the failure.
+- Schema version is 5 (`0005_task_fence.sql`: `task.lease_epoch`, `ledger_digest_actor`).
 
 ---
 

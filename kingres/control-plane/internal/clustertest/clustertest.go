@@ -391,8 +391,9 @@ func (n *Node) waitSetup(d time.Duration) error {
 }
 
 // JoinFrom asks node n to join the cluster of existing (POST /setup/join-cluster
-// on n). pin is the fingerprint to pin ("" for trust on first use). It returns
-// the status and body without waiting.
+// on n). pin is the fingerprint to pin; "" asks for trust on first use, which
+// the server refuses unless the request says allowUnpinned (contract 0.6.0), so
+// the helper does. It returns the status and body without waiting.
 func (n *Node) JoinFrom(existing *Node, pin string) (int, map[string]any) {
 	h := map[string]string{"X-Setup-Token": n.SetupToken(), "Authorization": ""}
 	if pin != "" {
@@ -401,6 +402,7 @@ func (n *Node) JoinFrom(existing *Node, pin string) (int, map[string]any) {
 	return n.Do("POST", "/setup/join-cluster", map[string]any{
 		"existingNodeAddress": existing.RestAddr(), "admin": map[string]any{"username": AdminUser, "password": AdminPass},
 		"dataPaths": map[string]any{"dataDirectory": n.DataDir}, "memoryQuota": map[string]any{"totalMegabytes": 1024},
+		"allowUnpinned": pin == "",
 	}, h)
 }
 
@@ -410,7 +412,7 @@ func (n *Node) AddServer(other *Node, token, pin string) (int, map[string]any) {
 	if pin != "" {
 		h["X-Kingres-Pin-Sha256"] = pin
 	}
-	return n.Do("POST", "/servers", map[string]any{"address": other.RestAddr(), "setupToken": token}, h)
+	return n.Do("POST", "/servers", map[string]any{"address": other.RestAddr(), "setupToken": token, "allowUnpinned": pin == ""}, h)
 }
 
 // WaitTask polls GET /tasks/{id} until the task is done or failed.

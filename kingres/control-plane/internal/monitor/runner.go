@@ -114,6 +114,11 @@ func (r *Runner) Once(ctx context.Context, now time.Time) {
 	if r.round%3 == 0 {
 		r.ledger(ctx, c, now, &rd)
 	}
+	if rep, err := ReadReplication(ctx, c); err != nil {
+		r.Log.Warn("reading the replication tasks", "error", err)
+	} else {
+		rd.ReplicationChecked, rd.Replication, rd.Now = true, rep, now
+	}
 	r.round++
 	conds, evaluated := Evaluate(rd)
 	if !rd.LedgerChecked {

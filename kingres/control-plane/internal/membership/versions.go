@@ -93,3 +93,12 @@ func (m *Manager) CheckVersions(ctx context.Context) error {
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
 	return monitor.CheckVersions(ctx, c, versionSource{m}, time.Now())
 }
+
+// PeerUptime asks a server how long its kingresd has run.
+func (m *Manager) PeerUptime(ctx context.Context, server string) (int64, error) {
+	var st internalapi.State
+	if err := m.do(ctx, server, "GET", "/state", nil, &st); err != nil {
+		return 0, err
+	}
+	return st.UptimeSeconds, nil
+}

@@ -24,6 +24,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fwdproof"
 )
 
 // Version is the version of the internal protocol; it is bumped with every
@@ -72,8 +74,12 @@ var Calls = map[string]Policy{
 	"POST /forward":  ToLeader,
 	// Cluster-wide reads: a server asks the others for their part of the logs, alerts or
 	// metrics (and an acknowledgement that belongs to one server); every server answers
-	// after it has checked the identity the asking server vouches for.
+	// after it has checked the identity the leader's assertion vouches for.
 	"POST /gather": AnyPeer,
+	// The leader signs an assertion for a gather call: the asking server proves its session
+	// to the leader only (the proof reveals the ClientKey), the members that answer the
+	// gather call accept the leader's assertion and never see a proof.
+	"POST /gather-authorize": ToLeader,
 
 	// Joining and adding a server (D4), removing it (D5), and the calls the
 	// leader needs on another server. Nothing in them takes a path, a program
@@ -180,6 +186,9 @@ type ExecResult struct {
 type ForwardIdentity struct {
 	Username     string   `json:"username"`
 	ClusterRoles []string `json:"clusterRoles"`
+	// ProofKey is the key of the session that makes the Proof of the request. It
+	// is only ever used by the sending side and is never serialized.
+	ProofKey []byte `json:"-"`
 }
 
 // ForwardRequest is the body of POST /forward: one operation of the public
@@ -201,6 +210,24 @@ type ForwardRequest struct {
 	Ordinal int `json:"ordinal,omitempty"`
 	// Pin is the fingerprint the administrator pinned (addServer only).
 	Pin string `json:"pin,omitempty"`
+	// Proof shows that the sending server holds a session of Identity.Username
+	// (package fwdproof). Forward and gather-authorize calls are refused without
+	// it; a gather call never carries one (it would reveal the user's ClientKey
+	// to a member) and is refused if it does.
+	Proof *fwdproof.Proof `json:"proof,omitempty"`
+	// Assertion is what a gather call carries instead: the leader's signed
+	// statement that the sending server holds that session.
+	Assertion *fwdproof.Assertion `json:"assertion,omitempty"`
+}
+
+// ProofMessage is what the Proof of a request is bound to; from and to are the
+// sending and the receiving server.
+func (r ForwardRequest) ProofMessage(kind fwdproof.Kind, from, to string) fwdproof.Message {
+	return fwdproof.Message{
+		Kind: kind, From: from, To: to, Username: r.Identity.Username, Roles: r.Identity.ClusterRoles,
+		Operation: r.OperationID, PathParams: r.PathParams, Query: r.Query, ContentType: r.ContentType, Body: r.Body,
+		RequestID: r.RequestID, Source: r.Source, SourceAddress: r.SourceAddress, Pin: r.Pin, Ordinal: r.Ordinal,
+	}
 }
 
 // ForwardResponse is the answer of the leader to a forwarded operation, to be
@@ -241,6 +268,24 @@ type Backend struct {
 	// Bootstrap runs a Bootstrap call. r gives the headers (the setup token)
 	// and the address of the caller.
 	Bootstrap func(ctx context.Context, key string, r *http.Request, body []byte) (any, error)
+	// VerifyIdentity checks the proof that comes with a forwarded or gathered
+	// request against the verifier of the user it names (nil: not checked, for
+	// tests of the table only). The server never acts for an identity it did
+	// not verify.
+	VerifyIdentity func(ctx context.Context, kind fwdproof.Kind, peer string, req ForwardRequest) error
+	// Authorize makes the leader's assertion for a gather call whose proof was
+	// verified (only called on the leader).
+	Authorize func(ctx context.Context, peer string, req ForwardRequest) (fwdproof.Assertion, error)
+	// VerifyAssertion checks the assertion of a gather call (nil: not checked, for
+	// tests of the table only).
+	VerifyAssertion func(ctx context.Context, peer string, req ForwardRequest) error
+	// Member tells whether a server is a member of the cluster: active, or
+	// being removed. A server whose certificate was issued but which has not
+	// been admitted yet (pending) is not one, and may make only the calls of
+	// its own join (nil: every peer is one, for tests of the table only). It is
+	// checked for every call answered by the leader except POST /forward, whose
+	// Forward function checks it itself.
+	Member func(ctx context.Context, peer string) (bool, error)
 	// Joining reports whether this server is not part of a cluster yet but
 	// holds a certificate of one (a join is under way).
 	Joining func() bool
@@ -338,6 +383,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// A forwarded operation is gated by the backend's Forward (it must answer the stopped
+	// instance of the leader in the documented way, see cmd/kingresd forwardGate).
+	if policy == ToLeader && key != "POST /forward" && s.be.Member != nil {
+		member, err := s.be.Member(r.Context(), peer)
+		switch {
+		case err != nil:
+			s.log.Error("internal call refused", "reason", "membership unknown", "call", key, "peer", peer, "error", err)
+			fail(w, http.StatusServiceUnavailable, "unavailable", "Whether the caller is a member cannot be checked now.")
+			return
+		case !member:
+			s.log.Warn("internal call refused", "reason", "not a member", "call", key, "peer", peer)
+			fail(w, http.StatusForbidden, "not_member", "The calling server is not a member of the cluster.")
+			return
+		}
+	}
 	limit := int64(1 << 20)
 	if policy == ToLeader || key == "POST /globals/apply" || key == "POST /apply" {
 		limit = 16 << 20
@@ -369,6 +429,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.forward(w, r, peer)
 	case "POST /gather":
 		s.gather(w, r, peer)
+	case "POST /gather-authorize":
+		s.gatherAuthorize(w, r, peer)
 	default:
 		if handled[key] {
 			s.handle(w, r, key, peer)

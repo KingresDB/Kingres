@@ -60,8 +60,12 @@ func (m *Manager) removeDefinition() task.Definition {
 		{Name: "Check that the server owns no buckets", Run: m.stepRemoveCheck},
 		{Name: "Unregister the server in every database", Run: m.stepRemoveUnregister},
 		{Name: "Remove the server from the managed rules of the others", Run: m.stepRemoveTrust},
-		{Name: "Stop and delete the instance, reset the server", Irreversible: true, Run: m.stepRemoveReset},
+		// The certificate is revoked before the step that cannot be undone (CP2-14): a task
+		// that fails at the revocation (the CA key went away) then leaves a server that is
+		// still there but cut off, never a server that is gone with a valid certificate.
+		// The reset call does not need the server's certificate to be valid.
 		{Name: "Revoke the certificate and distribute the revocation list", Run: m.stepRemoveRevoke},
+		{Name: "Stop and delete the instance, reset the server", Irreversible: true, Run: m.stepRemoveReset},
 		{Name: "Forget the server", Run: m.stepRemoveForget},
 	}}
 }

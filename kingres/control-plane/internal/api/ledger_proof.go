@@ -50,6 +50,10 @@ type LedgerVerification struct {
 	BlocksChecked   *int64                `json:"blocksChecked"`
 	RowsChecked     *int64                `json:"rowsChecked"`
 	Inconsistencies []LedgerInconsistency `json:"inconsistencies"`
+	// Complete and UncoveredShardGroupIDs (contract 0.6.0): a run checks one
+	// chain; the shard groups of the database it did not check are named.
+	Complete               bool    `json:"complete"`
+	UncoveredShardGroupIDs []int32 `json:"uncoveredShardGroupIds"`
 }
 
 // LedgerVerificationPage is a page of verification runs.

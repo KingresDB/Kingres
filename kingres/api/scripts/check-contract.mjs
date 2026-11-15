@@ -376,9 +376,10 @@ const changelogOf = (version) => {
 };
 const MUST_MENTION = {
   '0.4.0': ['system_database_stopped', 'server_owns_buckets', 'ledger_entry_pending', 'seenFingerprint', 'InclusionProof'],
+  '0.6.0': ['addServer', 'allowUnpinned', 'internal_api_disabled', 'replicationPending', 'LedgerProofBlock', 'dryRun', 'degraded', 'additive'],
   '0.5.0': ['renewServerCertificates', 'revokeServerCertificates', 'certificate_authority_unavailable', 'certificate_revoked', 'certificateRenewalFailed', 'partial', 'additive'],
 };
-for (const version of ['0.4.0', '0.5.0']) {
+for (const version of ['0.4.0', '0.5.0', '0.6.0']) {
   const changelog = changelogOf(version);
   if (!changelog) { fail('README.md', `changelog heading for ${version} is missing`); continue; }
   for (const h of ['#### Breaking', '#### Additive', '#### Documentation']) if (!changelog.includes(h)) fail('README.md', `changelog of ${version} lacks "${h}"`);
@@ -390,7 +391,7 @@ for (const version of ['0.4.0', '0.5.0']) {
   if (!m) fail('README.md', `the changelog summary of ${version} must state "N operations added (M operations, P paths)"`);
   else if (version === doc.info?.version && (Number(m[2]) !== operations.length || Number(m[3]) !== Object.keys(doc.paths ?? {}).length)) fail('README.md', `changelog says ${m[2]} operations and ${m[3]} paths, the contract has ${operations.length} and ${Object.keys(doc.paths ?? {}).length}`);
 }
-if (doc.info?.version !== '0.5.0') fail('info.version', 'the contract is revision 0.5.0');
+if (doc.info?.version !== '0.6.0') fail('info.version', 'the contract is revision 0.6.0');
 
 
 // 0.5.0 rules: certificate operations, partial answers, additive changes only.
@@ -421,6 +422,21 @@ const leaveText = opDesc('leaveCluster');
 if (leaveText.includes('`standalone`') && !leaveText.includes('0.4.0 said `standalone`')) fail('leaveCluster', 'a server that leaves is `uninitialized`, not `standalone`');
 if (!leaveText.includes('`uninitialized`') || !leaveText.includes('`id` is `0`')) fail('leaveCluster', 'must say `uninitialized` and the answer of a forced leave without a leader (id 0)');
 if (!(doc.components?.responses?.BadRequest?.description ?? '').includes('unknown_property')) fail('BadRequest', 'must say when an unknown member is validation_failed');
+// 0.6.0 rules, trust and membership (second review): addServer needs an administrator (the one breaking
+// change that security required), a first contact is pinned or explicitly not, the new optional members.
+if (opById.get('addServer')?.op['x-required-role'] !== 'kingres_admin') fail('addServer', 'must need kingres_admin since 0.6.0 (kingres_ops could obtain every role)');
+if (!opDesc('addServer').includes('kingres_admin') || !opDesc('addServer').includes('0.6.0')) fail('addServer', 'the description must say that kingres_admin is required since 0.6.0');
+for (const n of ['AddServerRequest', 'JoinClusterRequest']) {
+  const sc = schemas[n];
+  if (sc?.properties?.allowUnpinned?.type !== 'boolean' || sc.properties.allowUnpinned.default !== false) fail(n, 'allowUnpinned (boolean, default false) is missing');
+  if ((sc?.required ?? []).includes('allowUnpinned') || (sc?.required ?? []).includes('expectedFingerprint')) fail(n, 'allowUnpinned and expectedFingerprint stay optional in the schema; the rule that one of them is needed is stated in their descriptions');
+  if (!(sc?.properties?.expectedFingerprint?.description ?? '').includes('allowUnpinned')) fail(n, 'expectedFingerprint must say that allowUnpinned is the alternative');
+}
+if (!problemCodes.has('internal_api_disabled')) fail('ProblemCode', 'missing internal_api_disabled');
+for (const [n, prop] of [['SetupTaskSummary', 'detail'], ['NodeStateInfo', 'internalFingerprint'], ['LocalServerInfo', 'internalFingerprint']]) {
+  if (!schemas[n]?.properties?.[prop]) fail(n, prop + ' is missing');
+  if ((schemas[n]?.required ?? []).includes(prop)) fail(n, prop + ' must stay optional (additive change)');
+}
 // ------------------------------------------------------------------ report
 const pathCount = Object.keys(doc.paths ?? {}).length;
 console.log(`openapi ${doc.openapi}, info.version ${doc.info?.version}`);

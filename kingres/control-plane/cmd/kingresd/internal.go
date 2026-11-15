@@ -6,16 +6,19 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/cluster"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fwdproof"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/leader"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/membership"
@@ -44,6 +47,12 @@ type internalDeps struct {
 	forward func(ctx context.Context, peer string, req internalapi.ForwardRequest) (internalapi.ForwardResponse, error)
 	// gather answers a cluster-wide read for a server of the cluster.
 	gather func(ctx context.Context, peer string, req internalapi.ForwardRequest) (internalapi.ForwardResponse, error)
+	// keys gives the verifier of a role, against which the identity of a forwarded
+	// or gathered request is proven (nil: such requests are refused).
+	keys fwdproof.KeySource
+	// signer signs the assertions of gather calls with this server's certificate key
+	// (only the leader's is ever used).
+	signer *fwdproof.Signer
 	// receiver answers the membership calls.
 	receiver *membership.Receiver
 	// members is the membership manager (nil without an internal API).
@@ -87,7 +96,27 @@ func serveInternal(ctx context.Context, d internalDeps) {
 		}
 	}
 	me := d.serverHost
+	instanceDown := func() bool { return d.ops != nil && d.ops.LocalInstanceDown() }
+	member := func(ctx context.Context, peer string) (bool, error) {
+		if d.members == nil {
+			return false, nil
+		}
+		return d.members.IsMember(ctx, peer)
+	}
 	be := internalapi.Backend{
+		// While this server's instance is stopped on purpose nothing can be read to check a
+		// proof or a membership, and the pipeline behind Forward and Gather answers every
+		// session operation with system_database_stopped before it does anything: the
+		// checks are left to it (nothing is run for the caller either way).
+		VerifyIdentity: skipWhile(instanceDown, newIdentityChecker(d.keys, me)),
+		// The assertion of a gather call is checked against the certificate of the leader
+		// this server knows: nothing is read from the database for it.
+		VerifyAssertion: assertionChecker(d.svc, leaderOf(d), me),
+		Authorize: func(_ context.Context, peer string, req internalapi.ForwardRequest) (fwdproof.Assertion, error) {
+			return d.signer.Sign(req.ProofMessage(fwdproof.KindGather, peer, me))
+		},
+		Member:  member,
+		Forward: forwardGate(instanceDown, member, d.forward),
 		State: func(ctx context.Context) internalapi.State {
 			st := internalapi.State{ServerID: me, NodeState: string(d.node.State()), Version: d.version,
 				InternalVersion: internalapi.Version, UptimeSeconds: int64(time.Since(d.started).Seconds())}
@@ -103,7 +132,6 @@ func serveInternal(ctx context.Context, d internalDeps) {
 		// The leader is the server holding the primary of shard group 0.
 		Leader:    leaderOf(d),
 		Self:      me,
-		Forward:   d.forward,
 		Gather:    d.gather,
 		Revoked:   d.svc.RevokedSerials,
 		Handle:    handleCall(d),
@@ -113,7 +141,7 @@ func serveInternal(ctx context.Context, d internalDeps) {
 			return serverinfo.Resources(map[string]string{"data": filepath.Join(d.dataDir, "instances")}, nil), nil
 		},
 		Logs: func(context.Context, map[string]string) (any, error) {
-			return serverinfo.ReadLogs(filepath.Join(d.dataDir, "instances", "1", "pgdata", "log"), &me, 1)
+			return serverinfo.ReadLogs(d.svc.LogDir(), &me, 1)
 		},
 		Metrics: func(context.Context) (any, error) {
 			out := map[string]float64{}
@@ -153,6 +181,14 @@ func serveInternal(ctx context.Context, d internalDeps) {
 	wg.Wait()
 }
 
+// execStatementTimeout bounds a statement of the internal exec call. The request
+// context ends when the leader disconnects, but a statement that PostgreSQL
+// runs does not stop for that on every path, so the server bounds it itself
+// (second review, "internal exec has no statement timeout"). It is longer than
+// anything the leader runs through exec (schema and ledger work), shorter than
+// forever.
+const execStatementTimeout = 15 * time.Minute
+
 // execLocal runs one statement on a local database as the service role through
 // the local connection and returns at most RowLimit rows. The caller (the
 // leader) is authorized by the internal API; the statement is whatever the
@@ -167,6 +203,9 @@ func execLocal(ctx context.Context, svc *cluster.Service, r internalapi.ExecRequ
 		return internalapi.ExecResult{}, errors.New("cannot connect to the database")
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	if _, err := c.Exec(ctx, "SELECT set_config('statement_timeout', $1, false)", strconv.FormatInt(execStatementTimeout.Milliseconds(), 10)); err != nil {
+		return internalapi.ExecResult{}, errors.New("cannot connect to the database")
+	}
 	rows, err := c.Query(ctx, r.SQL, pgx.QueryExecModeExec) // one statement only
 	if err != nil {
 		return internalapi.ExecResult{}, errors.New("the statement failed")
@@ -253,7 +292,7 @@ func handleCall(d internalDeps) func(ctx context.Context, key, peer string, body
 			if d.ops == nil {
 				return nil, &internalapi.CallError{Status: http.StatusNotImplemented, Code: "not_available", Message: "This server cannot record tasks."}
 			}
-			return d.ops.HandleTaskCall(ctx, key, body)
+			return d.ops.HandleTaskCall(ctx, key, peer, body)
 		}
 		return d.receiver.Handle(ctx, key, peer, body)
 	}
@@ -282,5 +321,68 @@ func runVersionCheck(ctx context.Context, members *membership.Manager, leaders *
 		case <-ctx.Done():
 		case <-time.After(every):
 		}
+	}
+}
+
+// assertionChecker returns the check of the assertion that comes with a gather
+// call: the caller (the server named by its certificate) is the asking server.
+func assertionChecker(certs fwdproof.PeerVerifier, leader func() string, self string) func(context.Context, string, internalapi.ForwardRequest) error {
+	v := &fwdproof.AssertionVerifier{Certs: certs, Leader: leader}
+	return func(ctx context.Context, peer string, req internalapi.ForwardRequest) error {
+		if req.Assertion == nil {
+			return fwdproof.ErrInvalid
+		}
+		return v.Check(ctx, req.ProofMessage(fwdproof.KindGather, peer, self), *req.Assertion)
+	}
+}
+
+// skipWhile returns check for the forwarded operations, except that it accepts
+// them while skip reports true. Only the kind forward is skipped: the leader
+// must never sign a gather assertion for a proof it could not check.
+func skipWhile(skip func() bool, check func(context.Context, fwdproof.Kind, string, internalapi.ForwardRequest) error) func(context.Context, fwdproof.Kind, string, internalapi.ForwardRequest) error {
+	return func(ctx context.Context, kind fwdproof.Kind, peer string, req internalapi.ForwardRequest) error {
+		if kind == fwdproof.KindForward && skip() {
+			return nil
+		}
+		return check(ctx, kind, peer, req)
+	}
+}
+
+// forwardGate wraps the forward call: the forwarding server must be a member of the
+// cluster (a server that holds a certificate but was not admitted yet may not
+// forward), except while the local instance is stopped, when the pipeline answers
+// system_database_stopped and runs nothing.
+func forwardGate(instanceDown func() bool, member func(context.Context, string) (bool, error),
+	next func(context.Context, string, internalapi.ForwardRequest) (internalapi.ForwardResponse, error),
+) func(context.Context, string, internalapi.ForwardRequest) (internalapi.ForwardResponse, error) {
+	return func(ctx context.Context, peer string, req internalapi.ForwardRequest) (internalapi.ForwardResponse, error) {
+		if !instanceDown() {
+			ok, err := member(ctx, peer)
+			if err != nil {
+				return internalapi.ForwardResponse{}, fmt.Errorf("checking whether %q is a member: %w", peer, err)
+			}
+			if !ok {
+				return internalapi.ForwardResponse{}, fmt.Errorf("%q is not a member of the cluster", peer)
+			}
+		}
+		return next(ctx, peer, req)
+	}
+}
+
+// newIdentityChecker returns the check of the proof that comes with a forwarded
+// or gathered request. Without a key source nothing can be proven and every
+// such request is refused.
+func newIdentityChecker(keys fwdproof.KeySource, self string) func(context.Context, fwdproof.Kind, string, internalapi.ForwardRequest) error {
+	if keys == nil {
+		return func(context.Context, fwdproof.Kind, string, internalapi.ForwardRequest) error {
+			return fwdproof.ErrInvalid
+		}
+	}
+	c := fwdproof.NewChecker(keys, 0, nil)
+	return func(ctx context.Context, kind fwdproof.Kind, peer string, req internalapi.ForwardRequest) error {
+		if req.Proof == nil {
+			return fwdproof.ErrInvalid
+		}
+		return c.Check(ctx, req.ProofMessage(kind, peer, self), *req.Proof)
 	}
 }

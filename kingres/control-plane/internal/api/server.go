@@ -22,6 +22,9 @@ type LocalServerInfo struct {
 	UptimeSeconds   int64           `json:"uptimeSeconds"`
 	IsManagerLeader bool            `json:"isManagerLeader"`
 	Services        []ServiceStatus `json:"services"`
+	// InternalFingerprint is the fingerprint of the certificate the internal API
+	// presents (contract 0.6.0).
+	InternalFingerprint *string `json:"internalFingerprint"`
 }
 
 // CPUUsage is CPU usage; null means not available.

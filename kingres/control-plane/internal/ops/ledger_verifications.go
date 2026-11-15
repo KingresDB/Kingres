@@ -77,6 +77,26 @@ func localGroup(ctx context.Context, x execer) int32 {
 	return g
 }
 
+// otherGroups lists the shard groups of the database other than the one whose
+// chain this server holds: the chains that a digest or a verification made here
+// does not cover. Never nil, so that the answer says "none" with [].
+func otherGroups(ctx context.Context, x execer, local int32) []int32 {
+	out := []int32{}
+	var ok bool
+	if x.QueryRow(ctx, `SELECT to_regclass('kingres.node') IS NOT NULL`).Scan(&ok) != nil || !ok {
+		return out
+	}
+	rows, err := x.Query(ctx, `SELECT DISTINCT group_id FROM kingres.node WHERE group_id <> $1 ORDER BY group_id`, local)
+	if err != nil {
+		return out
+	}
+	groups, err := pgx.CollectRows(rows, pgx.RowTo[int32])
+	if err != nil {
+		return out
+	}
+	return append(out, groups...)
+}
+
 func chainOf(ctx context.Context, x execer) (ledgerChain, error) {
 	c := ledgerChain{group: localGroup(ctx, x)}
 	err := x.QueryRow(ctx, `SELECT encode(chain_id, 'hex') FROM kingres.ledger_chain LIMIT 1`).Scan(&c.id)
@@ -181,11 +201,15 @@ func inconsistencies(raw []byte, group int32) []api.LedgerInconsistency {
 
 // toVerification maps the record of the extension and its link to the
 // contract's schema.
-func toVerification(db string, l verificationLink, e extVerification) api.LedgerVerification {
+func toVerification(db string, l verificationLink, e extVerification, uncovered []int32) api.LedgerVerification {
+	if uncovered == nil {
+		uncovered = []int32{}
+	}
 	v := api.LedgerVerification{
 		ID: l.id, DatabaseName: db, Scope: "sinceLastVerified", TaskID: l.taskID,
 		StartedAt: e.startedAt.UTC(), BlocksChecked: e.blocks, RowsChecked: e.rows,
 		Inconsistencies: []api.LedgerInconsistency{},
+		Complete:        len(uncovered) == 0, UncoveredShardGroupIDs: uncovered,
 	}
 	if e.from == 0 {
 		v.Scope = "full"
@@ -249,9 +273,10 @@ func (o *Ops) ListVerifications(ctx context.Context, db string, p store.Page) (a
 		return page, problem.Validation("The cursor is not valid.", field("cursor", "not a cursor issued by this server for this list", "invalid_cursor"))
 	}
 	var (
-		ch    ledgerChain
-		ext   []int64
-		found bool
+		ch        ledgerChain
+		ext       []int64
+		uncovered []int32
+		found     bool
 	)
 	err = o.asService(ctx, db, func(tx pgx.Tx) error {
 		inst, rec, err := ledgerRecords(ctx, tx)
@@ -261,6 +286,7 @@ func (o *Ops) ListVerifications(ctx context.Context, db string, p store.Page) (a
 		if ch, err = chainOf(ctx, tx); err != nil {
 			return err
 		}
+		uncovered = otherGroups(ctx, tx, ch.group)
 		rows, err := tx.Query(ctx, `SELECT verification_id FROM kingres.ledger_verification WHERE state <> 'running' ORDER BY verification_id`)
 		if err != nil {
 			return err
@@ -328,7 +354,7 @@ func (o *Ops) ListVerifications(ctx context.Context, db string, p store.Page) (a
 	}
 	for _, l := range links {
 		if e, ok := byExt[l.extID]; ok {
-			page.Items = append(page.Items, toVerification(db, l, e))
+			page.Items = append(page.Items, toVerification(db, l, e, uncovered))
 		}
 	}
 	return page, nil
@@ -392,7 +418,7 @@ func (o *Ops) GetVerification(ctx context.Context, db string, id int64) (api.Led
 		if len(list) == 0 {
 			return none
 		}
-		out = toVerification(db, l, list[0])
+		out = toVerification(db, l, list[0], otherGroups(ctx, tx, l.group))
 		return nil
 	})
 	return out, wrap(err)

@@ -57,3 +57,44 @@ func (s *Server) initCluster(c *call, w http.ResponseWriter, r *http.Request) er
 	s.writeJSON(w, r, http.StatusAccepted, taskToAPI(t))
 	return nil
 }
+
+// fingerprinter is implemented by the setup service when it can tell the
+// fingerprint of the certificate the internal API presents.
+type fingerprinter interface{ InternalFingerprint() string }
+
+// internalFingerprint is that fingerprint, nil when it is not known.
+func (s *Server) internalFingerprint() *string {
+	f, ok := s.deps.SetupService.(fingerprinter)
+	if !ok {
+		return nil
+	}
+	if fp := f.InternalFingerprint(); fp != "" {
+		return &fp
+	}
+	return nil
+}
+
+// setupAudience tells whether the caller of the public setup state may read the
+// fingerprint of this uninitialized server's certificate: whoever may set the
+// server up. That is a request from the machine itself while the panel is
+// loopback-only (where the wizard runs), or a request with the setup token of
+// this server. The fingerprint is no secret, but a pin only protects when it was
+// read through another channel than the one it protects, so the answer is not
+// given to everybody who can reach the port.
+func (s *Server) setupAudience(c *call, r *http.Request) bool {
+	if s.deps.LoopbackOnly && isLoopback(c.ip) {
+		return true
+	}
+	tok := r.Header.Get(headerSetupToken)
+	if tok == "" {
+		return false
+	}
+	if blocked, _ := s.setupLimiter.Blocked(c.ip); blocked {
+		return false
+	}
+	ok, err := s.deps.Setup.VerifyToken(tok)
+	if err == nil && !ok {
+		s.setupLimiter.Record(c.ip)
+	}
+	return err == nil && ok
+}

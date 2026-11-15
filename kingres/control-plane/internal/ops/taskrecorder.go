@@ -221,8 +221,9 @@ func clipTo(s string, n int) string {
 
 // HandleTaskCall answers the task calls of other servers; it runs on the
 // leader (the internal API only dispatches them there). key is the call, for
-// example "POST /task/record".
-func (o *Ops) HandleTaskCall(ctx context.Context, key string, body []byte) (any, error) {
+// example "POST /task/record"; peer is the verified server id of the caller,
+// which may record and settle the tasks of its own instances only.
+func (o *Ops) HandleTaskCall(ctx context.Context, key, peer string, body []byte) (any, error) {
 	rec := engineRecorder{o}
 	busy := &internalapi.CallError{Status: http.StatusConflict, Code: remoteBusy, Message: "The instance already has an unfinished task."}
 	unavailable := &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The task cannot be recorded now."}
@@ -242,6 +243,11 @@ func (o *Ops) HandleTaskCall(ctx context.Context, key string, body []byte) (any,
 		if ce != nil {
 			return nil, ce
 		}
+		if key == "POST /task/record" {
+			if ce := o.ownedBy(ctx, peer, t.SubjectID); ce != nil {
+				return nil, ce
+			}
+		}
 		if key == "POST /task/settle" {
 			if t.ID == 0 {
 				return nil, &internalapi.CallError{Status: http.StatusBadRequest, Code: "bad_request", Message: "A task id is required."}
@@ -252,6 +258,10 @@ func (o *Ops) HandleTaskCall(ctx context.Context, key string, body []byte) (any,
 			}
 			if !recordableKinds[cur.Kind] {
 				return nil, &internalapi.CallError{Status: http.StatusBadRequest, Code: "bad_request", Message: "This task cannot be settled by a peer."}
+			}
+			// The instance of the stored task counts, not the one the caller names.
+			if ce := o.ownedBy(ctx, peer, cur.SubjectID); ce != nil {
+				return nil, ce
 			}
 			if err := rec.Settle(ctx, t); err != nil {
 				return nil, unavailable
@@ -268,6 +278,21 @@ func (o *Ops) HandleTaskCall(ctx context.Context, key string, body []byte) (any,
 		return internalapi.TaskRecordResult{ID: got.ID}, nil
 	}
 	return nil, &internalapi.CallError{Status: http.StatusNotFound, Code: "not_found", Message: "No such call."}
+}
+
+// ownedBy refuses a call about an instance that is not one of the peer's.
+func (o *Ops) ownedBy(ctx context.Context, peer, instanceID string) *internalapi.CallError {
+	if o.InstanceOwner == nil {
+		return &internalapi.CallError{Status: http.StatusForbidden, Code: "forbidden", Message: "Tasks of instances cannot be recorded by a peer here."}
+	}
+	own, err := o.InstanceOwner(ctx, instanceID, peer)
+	switch {
+	case err != nil:
+		return &internalapi.CallError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "The task cannot be recorded now."}
+	case !own:
+		return &internalapi.CallError{Status: http.StatusForbidden, Code: "forbidden", Message: "The instance is not one of the calling server's."}
+	}
+	return nil
 }
 
 func (o *Ops) engineGet(ctx context.Context, id int64) (task.Task, error) {

@@ -5,6 +5,7 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/auth"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/contract"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/peerclient"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pki"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 )
@@ -117,6 +119,10 @@ func (s *Server) tryForward(c *call, w http.ResponseWriter, r *http.Request) (bo
 			return true, problem.New(problem.BadRequest, "The request body could not be read.")
 		}
 	}
+	pin, err := s.forwardPin(c.op, r, body)
+	if err != nil {
+		return true, err
+	}
 	params := map[string]string{}
 	for _, p := range c.op.PathParams {
 		params[p] = r.PathValue(p)
@@ -127,10 +133,17 @@ func (s *Server) tryForward(c *call, w http.ResponseWriter, r *http.Request) (bo
 	}
 	resp, err := fw.Forward(r.Context(), leaderID, internalapi.ForwardRequest{
 		OperationID: c.op.ID, PathParams: params, Query: r.URL.RawQuery,
-		ContentType: r.Header.Get("Content-Type"), Body: body, Pin: r.Header.Get(HeaderPin),
-		Identity:  internalapi.ForwardIdentity{Username: c.session.Username, ClusterRoles: c.session.ClusterRoles},
+		ContentType: r.Header.Get("Content-Type"), Body: body, Pin: pin,
+		Identity:  identityOf(c.session),
 		RequestID: stateOf(r).id, SourceAddress: c.ip, Source: src,
 	})
+	var refused *peerclient.APIError
+	if errors.As(err, &refused) && refused.Code == "identity_unproven" {
+		// The leader does not accept this session's proof: the password changed, or the
+		// role has no SCRAM verifier. Signing in again opens a session that can prove itself.
+		return true, problem.New(problem.Unauthenticated, "This session cannot be used for operations of the cluster any more; sign in again.").
+			WithHeader("WWW-Authenticate", `Bearer realm="kingresd"`)
+	}
 	if err != nil {
 		s.log.Warn("forwarding to the manager leader failed", "request_id", stateOf(r).id, "leader", leaderID, "error", err)
 		c.details = map[string]any{"forwardedTo": leaderID}
@@ -170,13 +183,8 @@ func (s *Server) ServeForwarded(ctx context.Context, peer string, fr internalapi
 	if err != nil {
 		return internalapi.ForwardResponse{}, err
 	}
-	if s.deps.Proxy != nil {
-		// The forwarding server verified the password; the leader makes the
-		// role connectable for its own connections as that role.
-		if err := s.deps.Proxy.Allow(ctx, fr.Identity.Username); err != nil {
-			return internalapi.ForwardResponse{}, fmt.Errorf("making the role connectable: %w", err)
-		}
-	}
+	// The role is made connectable only after the guard accepted the identity
+	// (Proxy.Allow writes pg_ident.conf and reloads PostgreSQL), see checkSession.
 	return s.serveRequest(req, maxForwardedResponse), nil
 }
 
@@ -248,6 +256,30 @@ func (s *Server) serveRequest(req *http.Request, max int) internalapi.ForwardRes
 		}
 	}
 	return out
+}
+
+// identityOf is the identity a request is forwarded or gathered with: the
+// session's role and roles, and the key it proves itself with.
+func identityOf(sess *auth.Session) internalapi.ForwardIdentity {
+	return internalapi.ForwardIdentity{Username: sess.Username, ClusterRoles: sess.ClusterRoles, ProofKey: sess.ProofKey}
+}
+
+// forwardPin is the pinned fingerprint a forwarded request carries. The
+// receiving server reads it from the header and from the body field
+// expectedFingerprint (addServer), refuses a malformed one with 400, and
+// forwards the one normalized value, so that the pin is not lost on the way
+// to the leader and a malformed pin is not read as "no pin" there.
+func (s *Server) forwardPin(op contract.Operation, r *http.Request, body []byte) (string, error) {
+	var field *string
+	if op.ID == "addServer" {
+		var b struct {
+			ExpectedFingerprint *string `json:"expectedFingerprint"`
+		}
+		// A body that does not parse is for the leader's handler to refuse.
+		_ = json.Unmarshal(body, &b)
+		field = b.ExpectedFingerprint
+	}
+	return pinOf(r, field)
 }
 
 func validateIdentity(id internalapi.ForwardIdentity) error {

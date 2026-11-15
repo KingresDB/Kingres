@@ -11,6 +11,7 @@
 package httpapi
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -54,10 +55,11 @@ type Deps struct {
 	// DataDir is the configured data directory of kingresd (validated against
 	// the request of initCluster).
 	DataDir string
-	// Started is the process start time; LogDir is the instance log directory
-	// (from the configuration, never from a request).
+	// Started is the process start time.
 	Started time.Time
-	LogDir  string
+	// LogDir returns the directory of the instance log. It is asked on every read:
+	// the directory can be moved with updateThisServerSettings.
+	LogDir func() string
 	// Metrics is the sampler ring (nil: no metrics); MetricsToken is the
 	// optional scrape token of /metrics (empty: only stats-role bearer tokens).
 	Metrics      *monitor.Ring
@@ -69,6 +71,13 @@ type Deps struct {
 	// this server answers for itself only); GatherTimeout is the time each gets.
 	Gatherer      Gatherer
 	GatherTimeout time.Duration
+	// PeerUptime asks another server how long its kingresd has run (nil: the
+	// uptime of other servers is not known, null in a Server).
+	PeerUptime func(ctx context.Context, serverID string) (seconds int64, err error)
+	// InternalAPIDisabled is true when this server was started without its
+	// internal API (no -internal-listen): the operations that need the other
+	// servers answer 409 internal_api_disabled instead of "not supported".
+	InternalAPIDisabled bool
 	// Members adds and removes servers (design D4 and D5); nil makes addServer
 	// and removeServer answer "not supported".
 	Members Members

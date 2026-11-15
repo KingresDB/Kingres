@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
@@ -160,7 +161,7 @@ func (s *Server) updateServer(c *call, w http.ResponseWriter, r *http.Request) e
 // forwardedReads are reads that a server asks the leader for, as part of its
 // own answer, although the public operation is answered by the server asked
 // (see completeServers); the leader accepts them over the forward call only.
-var forwardedReads = map[string]bool{"listServers": true}
+var forwardedReads = map[string]bool{"listServers": true, "listDatabases": true, "getDatabase": true, "listLedgerStatus": true, "getLedgerStatus": true}
 
 // completeServers adds to servers what this server cannot read itself. The
 // manager leader reads the groups, the fingerprint recorded at the first
@@ -174,6 +175,7 @@ func (s *Server) completeServers(c *call, r *http.Request, servers []*api.Server
 	if fw := s.deps.Forwarder; fw != nil && c != nil && c.session != nil && forwardedOf(r) == nil {
 		s.completeFromLeader(c, r, fw, servers)
 	}
+	s.fillUptimes(r.Context(), servers)
 	if id := s.localServerID(r.Context()); id != nil {
 		if exp := s.localCertExpiry(); exp != nil {
 			for _, sv := range servers {
@@ -185,25 +187,35 @@ func (s *Server) completeServers(c *call, r *http.Request, servers []*api.Server
 	}
 }
 
-func (s *Server) completeFromLeader(c *call, r *http.Request, fw Forwarder, servers []*api.Server) {
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+// fillUptimes asks the servers whose uptime this server does not know (every
+// server but itself) for it, in parallel and within two seconds; a server that
+// does not answer keeps a null uptime, which the contract allows ("the server's
+// agent is not reachable").
+func (s *Server) fillUptimes(ctx context.Context, servers []*api.Server) {
+	if s.deps.PeerUptime == nil {
+		return
+	}
+	var wg sync.WaitGroup
+	cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	leader, self, err := fw.Leader(ctx)
-	if err != nil || leader == "" || self {
-		return
+	for _, sv := range servers {
+		if sv.UptimeSeconds != nil || sv.Status == "dead" {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if up, err := s.deps.PeerUptime(cctx, sv.ID); err == nil && up >= 0 {
+				sv.UptimeSeconds = &up
+			}
+		}()
 	}
-	resp, err := fw.Forward(ctx, leader, internalapi.ForwardRequest{
-		OperationID: "listServers", PathParams: map[string]string{},
-		Identity:  internalapi.ForwardIdentity{Username: c.session.Username, ClusterRoles: c.session.ClusterRoles},
-		RequestID: stateOf(r).id, SourceAddress: c.ip, Source: "panel",
-	})
-	if err != nil || resp.Status != http.StatusOK {
-		s.log.Warn("the leader's server records could not be read", "request_id", stateOf(r).id, "leader", leader, "error", err, "status", resp.Status)
-		return
-	}
+	wg.Wait()
+}
+
+func (s *Server) completeFromLeader(c *call, r *http.Request, fw Forwarder, servers []*api.Server) {
 	var list api.ServerList
-	if err := json.Unmarshal(resp.Body, &list); err != nil {
-		s.log.Warn("the leader's server list is not valid", "request_id", stateOf(r).id, "leader", leader, "error", err)
+	if !s.askLeaderRead(c, r, fw, "listServers", nil, &list) {
 		return
 	}
 	byID := make(map[string]api.Server, len(list.Items))
@@ -215,6 +227,7 @@ func (s *Server) completeFromLeader(c *call, r *http.Request, fw Forwarder, serv
 			sv.ServerGroup, sv.SeenFingerprint, sv.FingerprintPinned = l.ServerGroup, l.SeenFingerprint, l.FingerprintPinned
 			sv.CertificateExpiresAt = l.CertificateExpiresAt
 			sv.CertificateRevokedAt = l.CertificateRevokedAt
+			sv.JoinedAt = l.JoinedAt
 		}
 	}
 }
@@ -235,4 +248,109 @@ func (s *Server) localCertExpiry() *api.Time {
 	}
 	t := cert.NotAfter.UTC()
 	return &t
+}
+
+// askLeaderRead asks the manager leader for a read operation with the caller's
+// identity and decodes its answer into out. It reports false, and leaves out as
+// it was, when this server is the leader, the leader is not known or cannot be
+// reached, or its answer is not the expected one: the caller then keeps what
+// its own store answered.
+func (s *Server) askLeaderRead(c *call, r *http.Request, fw Forwarder, op string, params map[string]string, out any) bool {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	leader, self, err := fw.Leader(ctx)
+	if err != nil || leader == "" || self {
+		return false
+	}
+	if params == nil {
+		params = map[string]string{}
+	}
+	resp, err := fw.Forward(ctx, leader, internalapi.ForwardRequest{
+		OperationID: op, PathParams: params,
+		Identity:  identityOf(c.session),
+		RequestID: stateOf(r).id, SourceAddress: c.ip, Source: "panel",
+	})
+	if err != nil || resp.Status != http.StatusOK {
+		s.log.Warn("a read of the leader could not be completed", "request_id", stateOf(r).id, "leader", leader, "operation", op, "error", err, "status", resp.Status)
+		return false
+	}
+	if err := json.Unmarshal(resp.Body, out); err != nil {
+		s.log.Warn("the leader's answer is not valid", "request_id", stateOf(r).id, "leader", leader, "operation", op, "error", err)
+		return false
+	}
+	return true
+}
+
+// canAskLeader tells whether a follower may complete its answer from the leader.
+func (s *Server) canAskLeader(c *call, r *http.Request) (Forwarder, bool) {
+	fw := s.deps.Forwarder
+	return fw, fw != nil && c != nil && c.session != nil && forwardedOf(r) == nil
+}
+
+// The control plane records what it knows about a database (when and by whom it
+// was created, the bucket count, the ledger mode and digest interval) in the
+// system database of the leader only, so the catalogs of a follower cannot
+// answer them: they would be null where the leader's answer has a value. A
+// follower completes those fields from the leader's answer and keeps what only
+// it knows (its own sizes, connections and table count).
+func (s *Server) completeDatabases(c *call, r *http.Request, op string, params map[string]string, dbs []api.Database) {
+	fw, ok := s.canAskLeader(c, r)
+	if !ok || len(dbs) == 0 {
+		return
+	}
+	var list api.DatabaseList
+	if op == "getDatabase" {
+		var one api.Database
+		if !s.askLeaderRead(c, r, fw, op, params, &one) {
+			return
+		}
+		list.Items = []api.Database{one}
+	} else if !s.askLeaderRead(c, r, fw, op, params, &list) {
+		return
+	}
+	byName := make(map[string]api.Database, len(list.Items))
+	for _, d := range list.Items {
+		byName[d.Name] = d
+	}
+	for i := range dbs {
+		l, ok := byName[dbs[i].Name]
+		if !ok {
+			continue
+		}
+		if dbs[i].Sharding.BucketCount == nil {
+			dbs[i].Sharding.BucketCount = l.Sharding.BucketCount
+		}
+		if dbs[i].Ledger.Mode == nil || (dbs[i].Ledger.Mode != nil && *dbs[i].Ledger.Mode == "off" && l.Ledger.Mode != nil) {
+			dbs[i].Ledger = l.Ledger
+		}
+		dbs[i].CreatedBy, dbs[i].CreatedAt = l.CreatedBy, l.CreatedAt
+	}
+}
+
+// completeLedgerStatus does the same for the mode and digest interval of the
+// ledger status.
+func (s *Server) completeLedgerStatus(c *call, r *http.Request, op string, params map[string]string, sts []api.LedgerStatus) {
+	fw, ok := s.canAskLeader(c, r)
+	if !ok || len(sts) == 0 {
+		return
+	}
+	var list api.LedgerStatusList
+	if op == "getLedgerStatus" {
+		var one api.LedgerStatus
+		if !s.askLeaderRead(c, r, fw, op, params, &one) {
+			return
+		}
+		list.Items = []api.LedgerStatus{one}
+	} else if !s.askLeaderRead(c, r, fw, op, params, &list) {
+		return
+	}
+	byName := make(map[string]api.LedgerStatus, len(list.Items))
+	for _, l := range list.Items {
+		byName[l.DatabaseName] = l
+	}
+	for i := range sts {
+		if l, ok := byName[sts[i].DatabaseName]; ok && sts[i].Mode == nil {
+			sts[i].Mode, sts[i].DigestIntervalSeconds = l.Mode, l.DigestIntervalSeconds
+		}
+	}
 }

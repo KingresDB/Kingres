@@ -3,6 +3,7 @@
 package httpapi
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -51,14 +52,39 @@ func TestHealthAndReadiness(t *testing.T) {
 func TestPublicEndpointsAreRateLimited(t *testing.T) {
 	e := newEnv(t)
 	for i := 0; i < publicRateLimit; i++ {
-		if w := e.do(req{method: "GET", path: "/api/v1/healthz"}); w.Code != 200 {
+		if w := e.do(req{method: "GET", path: "/api/v1/setup/state"}); w.Code != 200 {
 			t.Fatalf("request %d: %d", i, w.Code)
 		}
 	}
-	w := e.do(req{method: "GET", path: "/api/v1/healthz"})
+	w := e.do(req{method: "GET", path: "/api/v1/setup/state"})
 	wantProblem(t, w, 429, "rate_limited")
 	if w.Header().Get("Retry-After") == "" {
 		t.Error("missing Retry-After")
+	}
+	// The probes of a load balancer are not limited (CP2-10), also not from an
+	// address that has used up its allowance.
+	for i := 0; i < 2*publicRateLimit; i++ {
+		for _, p := range []string{"/api/v1/healthz", "/api/v1/readyz"} {
+			if w := e.do(req{method: "GET", path: p}); w.Code != 200 {
+				t.Fatalf("%s request %d: %d", p, i, w.Code)
+			}
+		}
+	}
+}
+
+// An IPv6 client is limited by its /64: changing the low 64 bits does not
+// give it a fresh allowance (CP2-10).
+func TestPublicRateLimitKeysIPv6By64(t *testing.T) {
+	e := newEnv(t)
+	for i := 0; i < publicRateLimit; i++ {
+		remote := fmt.Sprintf("[2001:db8:1:2::%x]:4000", i+1)
+		if w := e.do(req{method: "GET", path: "/api/v1/setup/state", remote: remote}); w.Code != 200 {
+			t.Fatalf("request %d: %d", i, w.Code)
+		}
+	}
+	wantProblem(t, e.do(req{method: "GET", path: "/api/v1/setup/state", remote: "[2001:db8:1:2:ffff::1]:4000"}), 429, "rate_limited")
+	if w := e.do(req{method: "GET", path: "/api/v1/setup/state", remote: "[2001:db8:1:3::1]:4000"}); w.Code != 200 {
+		t.Errorf("another /64 must have its own allowance: %d", w.Code)
 	}
 }
 

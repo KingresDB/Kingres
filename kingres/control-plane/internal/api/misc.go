@@ -229,6 +229,8 @@ type AuditEvent struct {
 	RequestID string `json:"requestId,omitempty"`
 	// Details is action-specific data; secrets are never recorded.
 	Details map[string]any `json:"details,omitempty"`
+	// ServerID is the server whose audit log holds the event (contract 0.6.0, optional).
+	ServerID *string `json:"serverId,omitempty"`
 }
 
 // AuditPage is a page of audit events.
@@ -237,6 +239,9 @@ type AuditPage struct {
 	Items []AuditEvent `json:"items"`
 	// NextCursor is null on the last page.
 	NextCursor *string `json:"nextCursor"`
+	// Partial and MissingServers (contract 0.6.0): the servers that did not answer.
+	Partial        bool            `json:"partial"`
+	MissingServers []MissingServer `json:"missingServers,omitempty"`
 }
 
 // AutoFailoverSettings are the auto-failover cluster settings.

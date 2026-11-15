@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
@@ -28,6 +29,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/auth"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/cluster"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/config"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fwdproof"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/httpapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/leader"
@@ -53,7 +55,7 @@ var version = "0.2.0-dev"
 var commit = "unknown"
 
 // contractRevision is the revision of kingres/api/openapi.yaml implemented.
-const contractRevision = "0.5.0"
+const contractRevision = "0.6.0"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -193,6 +195,9 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	if err != nil {
 		return err
 	}
+	if svc.Enabled() {
+		authn.SetVerifierSource(svc.RoleVerifier)
+	}
 	sessions := auth.NewStore(cfg.SessionTTL, cfg.MaxSessions, time.Now)
 	web, err := webui.Handler()
 	if err != nil {
@@ -213,7 +218,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		Logger: log, Store: pg, Setup: node, Sessions: sessions, Authenticator: authn, Audit: sink,
 		Web: web, Version: version, Hostname: hostname, ListenAddr: cfg.Listen,
 		LoopbackOnly: !cfg.AllowRemoteSetup, SetupService: svc, DataDir: cfg.DataDir, Ops: opsSvc, Started: started, Metrics: ring, MetricsToken: cfg.MetricsToken,
-		LogDir: filepath.Join(cfg.DataDir, "instances", "1", "pgdata", "log"), MaxBodyBytes: cfg.MaxBodyBytes,
+		LogDir: svc.LogDir, MaxBodyBytes: cfg.MaxBodyBytes,
 		RequestTimeout: cfg.RequestTimeout, LoginRateLimit: cfg.LoginRateLimit,
 		LoginRateWindow: cfg.LoginRateWindow, SessionTTL: cfg.SessionTTL, TLS: cfg.TLSCertFile != "",
 	}
@@ -235,6 +240,12 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	if err != nil {
 		return err
 	}
+	deps.InternalAPIDisabled = cfg.InternalListen == "" && svc.Enabled()
+	// The leader signs the assertions of gather calls with the key of its server certificate,
+	// read at every use so that a renewed certificate is used without a restart.
+	gatherSigner := &fwdproof.Signer{Load: func() (tls.Certificate, error) {
+		return tls.LoadX509KeyPair(filepath.Join(svc.PKIDir(), cluster.ServerCertFile), filepath.Join(svc.PKIDir(), cluster.ServerKeyFile))
+	}}
 	if cfg.InternalListen != "" && svc.Enabled() {
 		_, iport, perr := net.SplitHostPort(cfg.InternalListen)
 		if perr != nil {
@@ -243,12 +254,12 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		if err := peerDir.Put(peers.Peer{ServerID: serverHost, InternalAddr: net.JoinHostPort(serverHost, iport)}); err != nil {
 			return fmt.Errorf("recording this server in the peer directory: %w", err)
 		}
-		pc := peerclient.New(peerclient.Config{PKIDir: svc.PKIDir(), Peers: peerDir, Revoked: svc.RevokedSerials})
+		pc := peerclient.New(peerclient.Config{Self: serverHost, PKIDir: svc.PKIDir(), Peers: peerDir, Revoked: svc.RevokedSerials})
 		deps.Forwarder = &peerclient.Forwarder{Self: serverHost, Leaders: leaders, Client: pc}
 		opsSvc.Recorder = opsSvc.NewPeerRecorder(func(ctx context.Context) (string, bool, error) {
 			return lastLeader.resolve(ctx, leaders, serverHost)
 		}, pc)
-		members = &membership.Manager{Svc: svc, Ops: opsSvc, Peers: peerDir, Client: peerclient.New(peerclient.Config{PKIDir: svc.PKIDir(), Peers: peerDir, Revoked: svc.RevokedSerials, Timeout: 10 * time.Minute}), Leaders: leaders, Self: serverHost, Version: version, Log: log,
+		members = &membership.Manager{Svc: svc, Ops: opsSvc, Peers: peerDir, Client: peerclient.New(peerclient.Config{Self: serverHost, PKIDir: svc.PKIDir(), Peers: peerDir, Revoked: svc.RevokedSerials, Timeout: 10 * time.Minute}), Leaders: leaders, Self: serverHost, Version: version, Log: log, GatherSigner: gatherSigner,
 			SelfPeer: peers.Peer{ServerID: serverHost, InternalAddr: net.JoinHostPort(serverHost, iport)},
 			Audit: func(ctx context.Context, ev audit.Event) {
 				if _, err := sink.Append(ctx, ev); err != nil {
@@ -257,9 +268,10 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 			}}
 		receiver = &membership.Receiver{M: members, Authn: authn, VerifyToken: svc.VerifyToken}
 		members.OnCertificateInstalled = func() { pc.ForgetAll(); members.Client.ForgetAll() }
-		opsSvc.Fanout, opsSvc.Local = members, svc
+		opsSvc.Fanout, opsSvc.Local, opsSvc.InstanceOwner = members, svc, members.InstanceBelongsTo
 		deps.Members = members
 		deps.Gatherer, deps.GatherTimeout = membership.Gatherer{M: members}, cfg.GatherTimeout
+		deps.PeerUptime = members.PeerUptime
 	}
 	api, err := httpapi.New(deps)
 	if err != nil {
@@ -374,7 +386,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		go func() {
 			defer wg.Done()
 			serveInternal(bgCtx, internalDeps{addr: cfg.InternalListen, svc: svc, node: node, ring: ring, log: log, started: started,
-				serverHost: serverHost, version: version, dataDir: cfg.DataDir, leaders: leaders, ops: opsSvc, lastLeader: lastLeader, members: members, forward: func(ctx context.Context, peer string, fr internalapi.ForwardRequest) (internalapi.ForwardResponse, error) {
+				serverHost: serverHost, version: version, dataDir: cfg.DataDir, keys: authn, signer: gatherSigner, leaders: leaders, ops: opsSvc, lastLeader: lastLeader, members: members, forward: func(ctx context.Context, peer string, fr internalapi.ForwardRequest) (internalapi.ForwardResponse, error) {
 					// A forwarding server must be a member of the cluster (CP-07); its certificate was
 					// already checked against the CA and the revocation list by the internal API.
 					if _, ok := peerDir.Get(peer); !ok {
@@ -419,6 +431,10 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		log.Warn("notifying systemd", "error", err)
 	}
 	log.Info("listening", "address", ln.Addr().String(), "tls", cfg.TLSCertFile != "")
+	if cfg.PlaintextOnNetwork() {
+		log.Warn("the REST API listens on a network address without TLS: passwords and tokens cross the network in clear text; set tls-cert-file and tls-key-file or put a TLS terminating proxy in front",
+			"address", ln.Addr().String())
+	}
 	if ready != nil {
 		ready <- ln.Addr().String()
 	}

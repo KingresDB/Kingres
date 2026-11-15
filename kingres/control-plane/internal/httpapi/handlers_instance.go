@@ -25,6 +25,8 @@ import (
 const (
 	opStartInstance = "startThisServerInstance"
 	opLogin         = "login"
+	opGetSession    = "getSession"
+	opListInstances = "listThisServerInstances"
 	// fallbackInstanceID is the instance id used when the catalog cannot say
 	// (the system database is down and nothing was learned yet): the id of the
 	// first instance of a server.
@@ -34,11 +36,22 @@ const (
 	DefaultStaleRolesMaxAge = time.Hour
 )
 
+// worksWhileStopped are the authenticated operations that still work while the
+// instance that hosts the system database is stopped: they need nothing from
+// PostgreSQL but the roles of the session, which come from the last successful
+// check (sessionRoles). A reloaded panel needs them to learn its CSRF token and
+// which instance to start. Nothing else is added without a reason (CP2-19).
+var worksWhileStopped = map[string]bool{opStartInstance: true, opGetSession: true, opListInstances: true}
+
 // instanceState is the part of the Server that belongs to these operations.
 type instanceState struct {
 	// id is the catalog id of this server's instance, learned while the catalog
 	// could be read (it is needed while the system database is down).
 	id atomic.Int32
+	// last is the instance list of the last successful read of the catalog; while
+	// the system database is stopped it is what listThisServerInstances answers
+	// (with the state of the instance taken from the instance manager).
+	last atomic.Pointer[[]api.Instance]
 }
 
 func (s *Server) instanceHandlers() map[string]handlerFunc {
@@ -48,6 +61,27 @@ func (s *Server) instanceHandlers() map[string]handlerFunc {
 		"getThisServerSettings":    s.getThisServerSettings,
 		"updateThisServerSettings": s.updateThisServerSettings,
 	}
+}
+
+// instancesFromMemory answers the instance list while the system database is
+// stopped: the list of the last successful read with the state of the process
+// as the instance manager knows it, and no measurements. When this process never
+// read it there is nothing to say and the documented 503 is the answer.
+func (s *Server) instancesFromMemory(r *http.Request) ([]api.Instance, error) {
+	last := s.inst.last.Load()
+	if last == nil {
+		return nil, s.stoppedProblem()
+	}
+	state, err := s.deps.Ops.InstanceState(r.Context())
+	if err != nil {
+		return nil, s.stoppedProblem()
+	}
+	out := make([]api.Instance, len(*last))
+	for i, in := range *last {
+		in.State, in.SizeBytes, in.ReplicationLagBytes, in.ReplicationLagSeconds = state, nil, nil, nil
+		out[i] = in
+	}
+	return out, nil
 }
 
 // localInstanceID resolves the id of this server's instance: from the catalog
@@ -214,7 +248,7 @@ func (s *Server) updateThisServerSettings(c *call, w http.ResponseWriter, r *htt
 // local instance was stopped on purpose. Health, readiness and the node state
 // are not gated; neither are the setup operations.
 func (s *Server) gateStoppedInstance(op contract.Operation) *problem.Problem {
-	if s.deps.Ops == nil || op.Tag == contract.TagHealth || op.Tag == contract.TagSetup || op.ID == opStartInstance {
+	if s.deps.Ops == nil || op.Tag == contract.TagHealth || op.Tag == contract.TagSetup || worksWhileStopped[op.ID] {
 		return nil
 	}
 	if op.ID != opLogin && !op.Accepts(contract.SchemeSessionCookie) && !op.Accepts(contract.SchemeBearer) {
@@ -223,6 +257,12 @@ func (s *Server) gateStoppedInstance(op contract.Operation) *problem.Problem {
 	if !s.deps.Ops.LocalInstanceDown() {
 		return nil
 	}
+	return s.stoppedProblem()
+}
+
+// stoppedProblem is the documented answer while the local instance is stopped,
+// being stopped or restarted.
+func (s *Server) stoppedProblem() *problem.Problem {
 	id := s.inst.id.Load()
 	if id == 0 {
 		id = fallbackInstanceID
@@ -234,12 +274,14 @@ func (s *Server) gateStoppedInstance(op contract.Operation) *problem.Problem {
 
 // sessionRoles is currentRoles for the guard, with one exception: when the
 // roles cannot be asked of PostgreSQL because the local instance is stopped,
-// startThisServerInstance (and only it) is authorized from the cluster roles of
-// the last successful check, if that is not older than the bound. Every other
-// operation fails closed as before (CP-02).
+// the operations of worksWhileStopped are authorized from the cluster roles of
+// the last successful check, if that is not older than the bound. A role that
+// was changed (Revalidator.Changed forgets the check and ends the sessions), was
+// refused by a check or was never checked by this process gets nothing. Every
+// other operation fails closed as before (CP-02).
 func (s *Server) sessionRoles(c *call, r *http.Request, sess auth.Session) ([]string, *problem.Problem) {
 	roles, perr := s.currentRoles(r, sess.Username)
-	if perr == nil || c.op.ID != opStartInstance || perr.Status != http.StatusServiceUnavailable ||
+	if perr == nil || !worksWhileStopped[c.op.ID] || perr.Status != http.StatusServiceUnavailable ||
 		s.deps.Ops == nil || !s.deps.Ops.StartMayUseStaleRoles(r.Context()) {
 		return roles, perr
 	}
@@ -250,10 +292,8 @@ func (s *Server) sessionRoles(c *call, r *http.Request, sess auth.Session) ([]st
 	if last, ok := s.reval.LastGood(sess.Username, maxAge); ok {
 		return last, nil
 	}
-	// No check since the process started: the sign-in itself was one.
-	if len(sess.ClusterRoles) > 0 && s.now().Sub(sess.CreatedAt) <= maxAge {
-		return sess.ClusterRoles, nil
-	}
+	// No successful check since the process started: the roles from sign-in are
+	// not used, a refusal is safer than a role that may have changed since (CP2-19).
 	if s.deps.Ops.LocalInstanceDown() {
 		return nil, problem.New(problem.SystemDatabaseStopped,
 			"The instance is stopped and this session has no recent successful role check; start the instance on the machine.")

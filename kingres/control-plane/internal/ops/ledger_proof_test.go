@@ -162,7 +162,7 @@ func TestToVerificationMapsStates(t *testing.T) {
 
 	clean := base
 	clean.state = "clean"
-	v := toVerification("shop", link, clean)
+	v := toVerification("shop", link, clean, nil)
 	if v.State != "passed" || v.Scope != "full" || v.TaskID == nil || *v.TaskID != 77 || v.DigestID != nil ||
 		len(v.Inconsistencies) != 0 || *v.BlocksChecked != 5 || *v.StartedBy != "system" || v.ID != 10 {
 		t.Errorf("clean: %+v", v)
@@ -177,7 +177,7 @@ func TestToVerificationMapsStates(t *testing.T) {
 		{"check":"trigger","object":"public.acc","detail":"missing"},
 		{"check":"chain_id","object":null,"detail":"no chain"},
 		{"check":"tx_block","object":"tx 5","detail":"gone"}]`)
-	v = toVerification("shop", link2, prob)
+	v = toVerification("shop", link2, prob, nil)
 	if v.State != "failed" || v.Scope != "sinceLastVerified" || v.TaskID != nil || *v.StartedBy != "alice" || len(v.Inconsistencies) != 5 {
 		t.Fatalf("problems: %+v", v)
 	}
@@ -201,7 +201,7 @@ func TestToVerificationMapsStates(t *testing.T) {
 	failed := base
 	failed.state = "failed"
 	failed.problems = []byte(`[{"check":"verification_failed","object":null,"detail":"boom","sqlstate":"57014"}]`)
-	v = toVerification("shop", verificationLink{id: 11, extID: 4}, failed)
+	v = toVerification("shop", verificationLink{id: 11, extID: 4}, failed, nil)
 	if v.State != "failed" || len(v.Inconsistencies) != 0 || v.BlocksChecked != nil || v.RowsChecked != nil || v.TaskID != nil {
 		t.Errorf("aborted run: %+v", v)
 	}

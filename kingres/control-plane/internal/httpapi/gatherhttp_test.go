@@ -102,7 +102,7 @@ func newGCluster(t *testing.T, lines []map[int]string, timeout time.Duration) *g
 		dir := t.TempDir()
 		writeLog(t, dir, t0, lines[i])
 		s.env = newEnv(t, func(d *Deps) {
-			d.LogDir = dir
+			d.LogDir = func() string { return dir }
 			d.Metrics = s.ring
 			d.GatherTimeout = timeout
 		})

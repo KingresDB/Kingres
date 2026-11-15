@@ -125,7 +125,7 @@ func (s *Server) getReadiness(_ *call, w http.ResponseWriter, r *http.Request) e
 	return nil
 }
 
-func (s *Server) getNodeState(_ *call, w http.ResponseWriter, r *http.Request) error {
+func (s *Server) getNodeState(c *call, w http.ResponseWriter, r *http.Request) error {
 	snap := s.deps.Setup.Snapshot()
 	pgv := "unknown"
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
@@ -142,6 +142,8 @@ func (s *Server) getNodeState(_ *call, w http.ResponseWriter, r *http.Request) e
 	}
 	if snap.State != setup.Uninitialized {
 		info.ServerID = s.localServerID(ctx)
+	} else if s.setupAudience(c, r) {
+		info.InternalFingerprint = s.internalFingerprint()
 	}
 	if snap.ClusterID != "" {
 		id := snap.ClusterID
@@ -167,11 +169,20 @@ func (s *Server) advertisedAddress() string {
 // sessionBody builds the Session response: identity, roles, expiry, the cluster
 // identity of the node (null outside a cluster) and the CSRF token of a cookie
 // session (null for a bearer session).
-func (s *Server) sessionBody(ctx context.Context, sess auth.Session) api.Session {
+func (s *Server) sessionBody(ctx context.Context, sess auth.Session, clientAddress string) api.Session {
 	snap := s.deps.Setup.Snapshot()
 	out := api.Session{
 		Username: sess.Username, ClusterRoles: nonNil(sess.ClusterRoles), ExpiresAt: sess.ExpiresAt.UTC(),
-		ServerID: s.localServerID(ctx),
+		ClientAddress: clientAddress,
+	}
+	if s.deps.Ops != nil && s.deps.Ops.LocalInstanceDown() {
+		// The catalog cannot be read: answer from this process (the node state
+		// file, the session in memory) and say so.
+		out.ServerID = snap.ServerID
+		out.Degraded = true
+		out.DegradedReason = "The system database of this server is stopped; the answer comes from the memory of this process. Roles are those of the last successful check."
+	} else {
+		out.ServerID = s.localServerID(ctx)
 	}
 	if snap.ClusterID != "" {
 		out.ClusterID = &snap.ClusterID
@@ -228,7 +239,7 @@ func (s *Server) login(c *call, w http.ResponseWriter, r *http.Request) error {
 		}
 	}()
 
-	if ok, wait := s.loginIP.Allow(c.ip); !ok {
+	if ok, wait := s.loginIP.Allow(auth.AddressKey(c.ip)); !ok {
 		s.log.Warn("login rate limited", "request_id", stateOf(r).id, "remote", c.ip)
 		return rateLimited(wait)
 	}
@@ -277,22 +288,25 @@ func (s *Server) login(c *call, w http.ResponseWriter, r *http.Request) error {
 		return problem.New(problem.Forbidden, "The role is not a member of any KingresDB cluster role.")
 	}
 
+	proof := s.proofKey(r.Context(), req.Username, req.Password)
 	cookieCred, sess, err := s.deps.Sessions.Create(req.Username, roles, auth.KindCookie)
 	if err != nil {
 		return s.sessionProblem(r, err)
 	}
+	s.deps.Sessions.AttachProofKey(cookieCred, proof)
 	if s.deps.Proxy != nil {
 		if err := s.deps.Proxy.Allow(r.Context(), req.Username); err != nil {
 			s.log.Warn("enabling the role for administration", "request_id", stateOf(r).id, "error", err)
 		}
 	}
-	out := s.sessionBody(r.Context(), sess)
+	out := s.sessionBody(r.Context(), sess, c.ip)
 	if req.IssueToken {
 		tokenCred, _, err := s.deps.Sessions.Create(req.Username, roles, auth.KindToken)
 		if err != nil {
 			s.deps.Sessions.Revoke(cookieCred)
 			return s.sessionProblem(r, err)
 		}
+		s.deps.Sessions.AttachProofKey(tokenCred, proof)
 		out.Token = &tokenCred
 	}
 	s.loginUser.Reset(userKey)
@@ -322,7 +336,7 @@ func (s *Server) logout(c *call, w http.ResponseWriter, _ *http.Request) error {
 // getSession returns the session of the request, including its CSRF token
 // (the cookie is HttpOnly, so a reloaded panel gets the token here).
 func (s *Server) getSession(c *call, w http.ResponseWriter, r *http.Request) error {
-	out := s.sessionBody(r.Context(), *c.session)
+	out := s.sessionBody(r.Context(), *c.session, c.ip)
 	s.writeJSON(w, r, http.StatusOK, out)
 	return nil
 }

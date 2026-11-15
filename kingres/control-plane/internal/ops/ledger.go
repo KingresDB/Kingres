@@ -4,15 +4,18 @@ package ops
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/instance"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sqlx"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/store"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
 )
 
@@ -65,18 +68,37 @@ type digestRow struct {
 const digestCols = `digest_id, generated_at, generated_by::text, height, encode(block_hash, 'hex'),
 	coalesce((digest->>'hash_version')::int, 1), digest`
 
-func toDigest(db string, r digestRow, group int32) api.LedgerDigest {
-	by := r.by
+// toDigest maps a digest row. A digest is made by the server that runs the
+// request and holds one chain, that of its own shard group; uncovered lists
+// the other shard groups of the database, whose chains it does not contain
+// (CP2-08). Without all chains there is no aggregate hash either.
+func toDigest(db string, r digestRow, group int32, uncovered []int32, actor string) api.LedgerDigest {
+	by := actor
+	switch {
+	case by != "":
+	case r.by == instance.ServiceRole:
+		by = "system" // made by kingresd without a caller: the scheduled digest
+	default:
+		by = r.by
+	}
+	if uncovered == nil {
+		uncovered = []int32{}
+	}
 	return api.LedgerDigest{ID: r.id, DatabaseName: db, GeneratedAt: r.at.UTC(), GeneratedBy: &by, HashVersion: r.hashVersion,
-		Chains: []api.LedgerDigestChain{{ShardGroupID: group, BlockHeight: r.height, BlockHash: r.hash, Document: r.doc}}, Anchors: []api.DigestAnchor{}}
+		Chains: []api.LedgerDigestChain{{ShardGroupID: group, BlockHeight: r.height, BlockHash: r.hash, Document: r.doc}}, Anchors: []api.DigestAnchor{},
+		Complete: len(uncovered) == 0, UncoveredShardGroupIDs: uncovered}
 }
 
 // GenerateDigest builds a block if needed, records and returns the digest.
-func (o *Ops) GenerateDigest(ctx context.Context, db string) (api.LedgerDigest, error) {
+// actor is the role that asked for it: the extension attributes the digest to the
+// role that ran the function, the service role, so the control plane remembers
+// the caller itself (kingres_cp.ledger_digest_actor).
+func (o *Ops) GenerateDigest(ctx context.Context, db, actor string) (api.LedgerDigest, error) {
 	if _, err := ledgerDB(db); err != nil {
 		return api.LedgerDigest{}, err
 	}
 	var out api.LedgerDigest
+	var chain string
 	err := o.asService(ctx, db, func(tx pgx.Tx) error {
 		if err := needRecords(ctx, tx); err != nil {
 			return err
@@ -93,10 +115,56 @@ func (o *Ops) GenerateDigest(ctx context.Context, db string) (api.LedgerDigest, 
 			Scan(&r.id, &r.at, &r.by, &r.height, &r.hash, &r.hashVersion, &r.doc); err != nil {
 			return err
 		}
-		out = toDigest(db, r, localGroup(ctx, tx))
+		ch, err := chainOf(ctx, tx)
+		if err != nil {
+			return err
+		}
+		chain = ch.id
+		out = toDigest(db, r, ch.group, otherGroups(ctx, tx, ch.group), actor)
 		return nil
 	})
-	return out, wrap(err)
+	if err != nil {
+		return out, wrap(err)
+	}
+	if err := o.rememberDigestActor(ctx, db, chain, out.ID, actor); err != nil {
+		return api.LedgerDigest{}, wrap(fmt.Errorf("recording who asked for digest %d: %w", out.ID, err))
+	}
+	return out, nil
+}
+
+// rememberDigestActor stores the caller of a digest.
+func (o *Ops) rememberDigestActor(ctx context.Context, db, chain string, id int64, actor string) error {
+	return o.asService(ctx, sysdb.Database, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO kingres_cp.ledger_digest_actor (database_name, chain_id, digest_id, actor)
+			VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`, db, chain, id, actor)
+		return err
+	})
+}
+
+// digestActors returns the callers remembered for the digests ids of a chain.
+func (o *Ops) digestActors(ctx context.Context, db, chain string, ids []int64) (map[int64]string, error) {
+	out := map[int64]string{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	err := o.asService(ctx, sysdb.Database, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT digest_id, actor FROM kingres_cp.ledger_digest_actor
+			WHERE database_name = $1 AND chain_id = $2 AND digest_id = ANY ($3)`, db, chain, ids)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id int64
+			var actor string
+			if err := rows.Scan(&id, &actor); err != nil {
+				return err
+			}
+			out[id] = actor
+		}
+		return rows.Err()
+	})
+	return out, err
 }
 
 // ListDigests lists recorded digests, newest first.
@@ -109,6 +177,12 @@ func (o *Ops) ListDigests(ctx context.Context, db string, p store.Page) (api.Led
 	if err != nil {
 		return page, problem.Validation("The cursor is not valid.", field("cursor", "not a cursor issued by this server", "invalid_cursor"))
 	}
+	var (
+		listed    []digestRow
+		chain     string
+		group     int32
+		uncovered []int32
+	)
 	err = o.asService(ctx, db, func(tx pgx.Tx) error {
 		inst, rec, err := ledgerRecords(ctx, tx)
 		if err != nil || !inst || !rec {
@@ -134,13 +208,29 @@ func (o *Ops) ListDigests(ctx context.Context, db string, p store.Page) (api.Led
 			page.NextCursor = &next
 			list = list[:p.Limit]
 		}
-		group := localGroup(ctx, tx)
-		for _, d := range list {
-			page.Items = append(page.Items, toDigest(db, d, group))
+		ch, err := chainOf(ctx, tx)
+		if err != nil {
+			return err
 		}
+		chain, group, listed = ch.id, ch.group, list
+		uncovered = otherGroups(ctx, tx, group)
 		return nil
 	})
-	return page, wrap(err)
+	if err != nil || len(listed) == 0 {
+		return page, wrap(err)
+	}
+	ids := make([]int64, len(listed))
+	for i, d := range listed {
+		ids[i] = d.id
+	}
+	actors, err := o.digestActors(ctx, db, chain, ids)
+	if err != nil {
+		return page, wrap(err)
+	}
+	for _, d := range listed {
+		page.Items = append(page.Items, toDigest(db, d, group, uncovered, actors[d.id]))
+	}
+	return page, nil
 }
 
 type verifyParams struct {
@@ -196,8 +286,15 @@ func (o *Ops) stepVerifyLedger(ctx context.Context, env *task.Env) error {
 	if err := c.QueryRow(ctx, "SELECT max(height) FROM kingres.ledger_blocks").Scan(&top); err != nil {
 		return err
 	}
-	if top == nil || from > *top {
-		return nil // nothing new to verify
+	if top == nil {
+		// Nothing to verify. A task that ends successfully must have made a record
+		// (CP2-08), so an empty ledger is a failure the operator can read.
+		return errors.New("the ledger is empty: there is nothing to verify")
+	}
+	if from > *top {
+		// Nothing is new since the last clean run: check the head block again, so
+		// that the task that is reported done has a record of what it checked.
+		from = *top
 	}
 	var id int64
 	if err := c.QueryRow(ctx, "SELECT kingres.ledger_verify_recorded($1, NULL)", from).Scan(&id); err != nil {

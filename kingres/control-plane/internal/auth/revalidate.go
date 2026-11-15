@@ -76,12 +76,14 @@ func (v *Revalidator) Roles(ctx context.Context, username string) ([]string, err
 		v.sessions.RevokeUser(username)
 	}
 	v.mu.Lock()
-	if err == nil {
+	// A check that was already running when Changed ran may carry the roles from
+	// before the change: it must not become the "last good" answer (CP2-19).
+	if err == nil && v.epoch == epoch {
 		if len(v.good) > 4096 {
 			v.good = map[string]goodEntry{}
 		}
 		v.good[username] = goodEntry{roles: roles, at: v.now()}
-	} else {
+	} else if err != nil {
 		delete(v.good, username)
 	}
 	if len(v.cache) > 4096 {

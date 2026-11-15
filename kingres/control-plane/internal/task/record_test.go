@@ -158,7 +158,7 @@ func TestPGStoreRecordSettleReserveAndOrphans(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	clk.Add(task.RecordLease + time.Minute)
+	expireLease(t, conn, orphan.ID)
 	for {
 		ran, rerr := e.RunOnce(ctx)
 		if rerr != nil {

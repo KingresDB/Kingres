@@ -627,6 +627,25 @@ func TestNetworkAccess(t *testing.T) {
 	if st, _, _ := e.call("PUT", "/settings/network-access", map[string]any{"revision": rev + 1, "tlsRequired": true, "rules": rules()}, nil); st < 400 || st >= 500 {
 		t.Errorf("plain rules under tlsRequired: %d", st)
 	}
+	// Dry run (contract 0.6.0): checked like a real change, nothing is changed.
+	const dry = "/settings/network-access?dryRun=true"
+	if st, o, _ := e.call("PUT", dry, map[string]any{"revision": rev + 1, "tlsRequired": false, "rules": []any{lock}}, nil); st != 422 {
+		t.Errorf("dry run of a lock-out rule set: %d %v", st, o)
+	}
+	if st, o, _ := e.call("PUT", dry, map[string]any{"revision": rev, "tlsRequired": false, "rules": rules()}, nil); st != 409 {
+		t.Errorf("dry run with a stale revision: %d %v", st, o)
+	}
+	if st, o, _ := e.call("PUT", "/settings/network-access?dryRun=maybe", map[string]any{"revision": rev + 1, "tlsRequired": false, "rules": rules()}, nil); st != 400 {
+		t.Errorf("dryRun=maybe: %d %v", st, o)
+	}
+	st, chk, _ := e.call("PUT", dry, map[string]any{"revision": rev + 1, "tlsRequired": false, "rules": rules()}, nil)
+	if st != 200 || chk["valid"] != true || chk["revision"] != rev+1 {
+		t.Errorf("dry run of a valid change: %d %v", st, chk)
+	}
+	valid(t, "replaceNetworkAccess", "200", chk)
+	if after := e.expect(t, 200, "GET", "/settings/network-access", nil); after["revision"] != rev+1 {
+		t.Errorf("a dry run changed the revision: %v", after["revision"])
+	}
 	// Restore.
 	e.mustTask(t, "PUT", "/settings/network-access", map[string]any{"revision": rev + 1, "tlsRequired": false, "rules": rules()})
 	// A reload takes effect shortly after the task finished.

@@ -50,19 +50,20 @@ version 1, the caller \"2\"."}` when the number is missing or different.
 | `GET /internal/v1/logs` | leader | local log entries (query: `level`, `from`, `to`, `limit`, `cursor`) |
 | `GET /internal/v1/metrics` | leader | latest metric samples |
 | `POST /internal/v1/exec` | leader | one statement on a local database through the local socket |
-| `POST /internal/v1/forward` | any peer, answered only by the leader | one operation of the public contract, run as the identity the forwarding server verified |
-| `POST /internal/v1/gather` | any peer | this server's part of a cluster-wide read (`listLogs`, `listAlerts`, `queryMetrics`) or the acknowledgement of an alert it holds, run as the identity the asking server vouches for; see "Cluster-wide reads" |
-| `POST /internal/v1/pki/renew` | any peer, answered only by the leader | the caller asks the CA holder for a new certificate for itself; see "Certificate renewal" |
+| `POST /internal/v1/forward` | member, answered only by the leader | one operation of the public contract, run as the identity the forwarding server proves with the proof of a session (see "Forwarded identities need a proof") |
+| `POST /internal/v1/gather` | any peer, with an assertion of the leader | this server's part of a cluster-wide read (`listLogs`, `listAlerts`, `queryMetrics`) or the acknowledgement of an alert it holds, run as the identity the leader's assertion vouches for; a request that carries a proof is refused; see "Cluster-wide reads" |
+| `POST /internal/v1/gather-authorize` | member, answered only by the leader | the asking server sends the gather request with the proof of the user's session; the leader checks it as for `forward` and answers with an assertion signed with the key of its own server certificate |
+| `POST /internal/v1/pki/renew` | member, answered only by the leader | the caller asks the CA holder for a new certificate for itself; see "Certificate renewal" |
 | `GET /internal/v1/pki/csr` | leader | a certificate request for this server's names, made from its key |
-| `POST /internal/v1/leave-cluster` | any peer, answered only by the leader | a server asks to leave the cluster. The body is `{"actor": "<administrator>", "force": false}` and names no server: the server that leaves is the one named by the caller's certificate, so a server cannot ask for another's removal. The leader decides (404, 422 dead, 409 `last_server`, `server_hosts_map_group`, `server_owns_buckets`, `rebalance_in_progress`, `operation_in_progress`), starts the task `server.leave` and answers with it |
-| `POST /internal/v1/leave-status` | any peer, answered only by the leader | the state of the leave task whose subject is the caller (`{"taskId": n}`; a task of another server, of another kind or none is 404); the leaving server resets itself when it is done |
-| `POST /internal/v1/task/record` | any peer, answered only by the leader | a server records the task of one of its instance operations (`instance.start`, `instance.stop`, `instance.restart`, subject type `instance`, a numeric instance id, state `running`, `done` or `failed`, one to four steps, at most 1,024 bytes of input). With `id` the task is written under that id (a reserved or announced one; writing the same id again changes nothing), without it the leader assigns one. The answer is `{"id": n}`; `409 subject_busy` when the instance already has an unfinished task, `400` for anything outside these limits, `503 unavailable` when the leader cannot write it |
-| `POST /internal/v1/task/settle` | any peer, answered only by the leader | the end of a recorded task of those kinds (`id` required): state, steps, percent and error; a task of another kind is `400` |
-| `POST /internal/v1/task/reserve` | any peer, answered only by the leader | takes the next id of the task sequence for a task recorded later (the start that follows a stop); answer `{"id": n}` |
+| `POST /internal/v1/leave-cluster` | member, answered only by the leader | a server asks to leave the cluster. The body is `{"actor": "<administrator>", "force": false}` and names no server: the server that leaves is the one named by the caller's certificate, so a server cannot ask for another's removal. The leader decides (404, 422 dead, 409 `last_server`, `server_hosts_map_group`, `server_owns_buckets`, `rebalance_in_progress`, `operation_in_progress`), starts the task `server.leave` and answers with it |
+| `POST /internal/v1/leave-status` | member, answered only by the leader | the state of the leave task whose subject is the caller (`{"taskId": n}`; a task of another server, of another kind or none is 404); the leaving server resets itself when it is done |
+| `POST /internal/v1/task/record` | member, answered only by the leader | a server records the task of one of its own instances (a task of another server's instance is `403 forbidden`; the shard catalog says whose an instance is) for one of its instance operations (`instance.start`, `instance.stop`, `instance.restart`, subject type `instance`, a numeric instance id, state `running`, `done` or `failed`, one to four steps, at most 1,024 bytes of input). With `id` the task is written under that id (a reserved or announced one; writing the same id again changes nothing), without it the leader assigns one. The answer is `{"id": n}`; `409 subject_busy` when the instance already has an unfinished task, `400` for anything outside these limits, `503 unavailable` when the leader cannot write it |
+| `POST /internal/v1/task/settle` | member, answered only by the leader | the end of a recorded task of those kinds (`id` required): state, steps, percent and error; a task of another kind is `400` |
+| `POST /internal/v1/task/reserve` | member, answered only by the leader | takes the next id of the task sequence for a task recorded later (the start that follows a stop); answer `{"id": n}` |
 | `POST /internal/v1/bootstrap/prepare` | setup token (no certificate) | the uninitialized server returns a certificate request for its own key |
 | `POST /internal/v1/bootstrap/install` | setup token (no certificate) | the uninitialized server stores its certificate and the CA certificate |
 | `POST /internal/v1/bootstrap/join` | administrator credentials (no certificate) | a joining server asks to be added; the credentials are checked here and go no further |
-| `POST /internal/v1/add-server` | any peer, answered only by the leader | the server that checked an administrator hands a join to the leader |
+| `POST /internal/v1/add-server` | member, answered only by the leader | the server that checked an administrator hands a join to the leader |
 | `GET /internal/v1/instance/status` | leader, or any peer while this server is joining | whether the instance exists and runs |
 | `POST /internal/v1/instance/create` | leader, or any peer while joining | create, configure and start the instance for the cluster's settings and managed rules |
 | `POST /internal/v1/instance/start`, `/stop`, `/remove` | leader | start or stop the instance; stop and delete it and its credentials |
@@ -73,6 +74,8 @@ version 1, the caller \"2\"."}` when the number is missing or different.
 | `POST /internal/v1/node/finish` | leader, or any peer while joining | the server becomes clustered and its setup token is removed |
 | `POST /internal/v1/node/reset` | leader | delete the instance, certificates and key; the server is uninitialized again with a new setup token |
 | `POST /internal/v1/apply` | leader | one cluster-wide operation from a closed set (create or drop a database, network rules, role sync and drop, grant, `role.changed`: end the sessions of a changed role and forget cached role checks) with structured parameters |
+
+"Member" means a server that the leader's catalog records as `active` (or `removing`, which must still be able to ask how its removal went). A server that holds a certificate of the cluster but has not been admitted yet (`pending`: the certificate was issued and installed, the add task has not finished) is **not** a member: it may make only the calls of its own join, which the leader makes on it, and every call marked "member" is refused with `403 not_member`. Every certificate the cluster signs for a server that is not yet a member is therefore a certificate that authorizes nothing but that join.
 
 "Leader" means the caller's certificate names the server that holds the primary of
 shard group 0, read from the catalog; while that is unknown no leader-only call is
@@ -106,12 +109,82 @@ the acknowledgement of an alert (it goes to the server that holds the alert), an
 exactly the operation's, rebuilds the URL from the contract's template with escaped values, checks the identity
 (user name, only the four cluster roles), and runs the request through the same pipeline as a public one: query
 validation, the role the operation requires (so a server cannot raise an identity's privileges beyond what it
-claims; the leader also derives the claimed role's cluster roles itself, from its own catalog, and refuses an identity that is dropped, cannot log in, is expired or does not hold the claimed roles (CP-07), and refuses a forwarding server that is not in its peer directory; apart from that every server is fully trusted by every other), the handler and the audit.
-The audit event is written by the leader, once, with the details `forwardedBy` (the server id in the caller's
+claims; the leader also derives the claimed role's cluster roles itself, from its own catalog, and refuses an identity that is dropped, cannot log in, is expired or does not hold the claimed roles (CP-07), and refuses a forwarding server that is not a member of the cluster and an identity whose proof it cannot verify; see the next section for what a compromised member can still do), the handler and the audit.
+The identity is **not** taken on the word of the forwarding server, see the next section. The audit event is written by the leader, once, with the details `forwardedBy` (the server id in the caller's
 certificate) and `originRequestId` (a handler that sets details of its own does not drop them); the forwarding
 server writes none, unless the leader could not be reached (then it answers 503 and audits the failure itself).
-The leader makes the role connectable for its own connections (the same step as a sign-in) because the
-forwarding server verified the password.
+The leader makes the role connectable for its own connections (the same step as a sign-in) only after the
+identity was proven and the role check passed, because the forwarding server verified the password.
+
+### Forwarded identities need a proof
+
+A certificate of the cluster says "this is a server of the cluster". Before 0.6.0 that was enough to act as any
+existing role by name (second review, CP2-01; first review, CP-07): the leader derived the role's cluster roles
+from its own catalog, but nothing showed that anybody had signed in as that role. Now a forwarded request carries
+a proof that the sending server holds a session of the user it names, and the leader checks it against the user's
+verifier in its own PostgreSQL (`pg_authid.rolpassword`) before it does anything else:
+
+- At sign-in the server that verified the password derives the SCRAM ClientKey of the password under the salt
+  and iteration count of the role's stored verifier and keeps it in the in-memory session (never on disk, never
+  sent). A role without a SCRAM-SHA-256 verifier gets a session that works on this server but cannot be forwarded.
+- With every forwarded request the server sends `proof = {issuedAt, nonce, value}`, where
+  `value = ClientKey XOR HMAC(StoredKey, digest(request) || issuedAt || nonce)` (the proof of RFC 5802 with the
+  request in place of the SCRAM authentication message). `digest` covers the call kind, the sending and the
+  receiving server, the user name, the claimed cluster roles, the operation id, path parameters, query, content
+  type, SHA-256 of the body, request id, source, source address, pin and ordinal.
+- The receiver reads `StoredKey` from the verifier, recovers `ClientKey' = value XOR HMAC(...)` and accepts when
+  `SHA-256(ClientKey')` equals `StoredKey`. **The receiver therefore learns the user's ClientKey**, exactly as a
+  SCRAM server does, and the ClientKey is password-equivalent (it makes proofs for that user toward any server
+  and authenticates to PostgreSQL by SCRAM). That is why a proof is sent to the manager leader only: the leader
+  holds every verifier, runs every cluster operation and is trusted with everything already. **A compromised
+  leader is a compromised cluster; that is inherent** (it is also the server that holds the CA key in the
+  current design).
+- It refuses a proof whose `issuedAt` is more than two minutes from its clock and a nonce it has accepted before
+  (a bounded replay cache that only fills with proofs that verified). The answer to a refused proof is
+  `401 identity_unproven`; the forwarding server tells its client `401 unauthenticated` ("sign in again").
+- A proof is made for one request, one sender and one receiver: it cannot be used for another operation, body,
+  query, user, role set or pin, replayed or sent on to another server. A changed password changes the verifier
+  and ends forwarding for every older session at once.
+- The leader still derives the roles itself and refuses an identity that is dropped, cannot log in, is expired or
+  does not hold the claimed roles; the audit event names the forwarding server (`forwardedBy`).
+
+A proof is sent to the server the sender believes to be the leader, and an internal call is refused before its body
+is read when the receiver is not the leader; the only way a non-leader receives a proof is a sender whose own view
+of the leader is wrong (a leader change in progress), and the sender checks the receiver's certificate against the
+name it dials.
+
+### Gather: the leader's assertion
+
+`POST /gather` goes to **every** member, so it must not carry a proof: a single compromised member would learn the
+ClientKey of every user whose cluster-wide read it answers and could forward as that user. The asking server
+therefore sends the gather request with the proof of the user's session to the leader only
+(`POST /gather-authorize`, member-only like `forward`, kind `gather-authorize`). The leader checks the proof as for
+a forward and answers with an **assertion** signed with the key of its own server certificate:
+`{leader: <certificate DER>, issuedAt, nonce, signature}`, over a digest of the asking server, the user, the claimed
+roles, the operation, path parameters, query, content type, body hash, request id, source and source address (not
+the receiver and not the ordinal: one assertion serves every server of one request). When the asking server is the
+leader it signs the assertion itself; the session was opened on it.
+
+A member accepts a gather call only with a valid assertion: the leader's certificate is accepted by the cluster
+(chain, usage, validity, revocation list), its server id is the leader **this member** knows, the signature
+verifies, `issuedAt` is within two minutes, the nonce was not used, and the digest matches a request whose asking
+server is the caller named by the mTLS certificate. Therefore a member that received an assertion cannot use it
+(it is not the asking server, the request is fixed and it is used once), a member's own key signs nothing the
+others accept, and a gather request that carries a proof is refused with `400`. The member still derives the roles
+again from its own catalog before it answers (the check of CP-07), so the assertion only proves "the leader saw a
+session of this user at this server"; it never widens what the user may do. When the leader cannot be reached or
+cannot check the proof (its instance is stopped), the gather call is refused and the server shows up as missing
+(`refused`) in the answer.
+
+What a compromised **non-leader member** can do: it holds its own PostgreSQL superuser, every role's SCRAM verifier
+(they are replicated to every server) and the ClientKey of every session opened **on it**. So it can act as any user
+who signs in on it (it sees the password), run any SQL on itself and, through the sharding extension's node
+connections, on the data routed to it, read what its own disks and memory hold, and try to guess passwords offline
+from the verifiers. It cannot act as a user who never signed in on it, it receives no value from which another
+user's ClientKey or any password-equivalent can be derived (forward goes to the leader, gather carries an
+assertion), and it cannot make the leader or another member accept an identity it cannot prove. What a compromised
+**leader** can do: everything (it holds the CA key, every verifier, the system database, and receives every
+proof); that is inherent to a design in which the leader runs the cluster operations and checks the proofs.
 
 ## Cluster-wide reads (gather)
 
@@ -123,7 +196,7 @@ deadline (setting `gather-timeout`, default 3 s). The body is the one of `forwar
 `listLogs`, `listAlerts`, `queryMetrics` and `acknowledgeAlert`, `query` the caller's query string.
 
 The answering server runs the operation through the same pipeline as a public request, with the identity the
-asking server vouches for: **the role is derived again from the answering server's own catalog** (the check of
+leader's assertion vouches for (see "Gather: the leader's assertion"): **the role is derived again from the answering server's own catalog** (the check of
 CP-07), so the caller needs the required cluster role on every server that answers a part, and a server that no
 longer accepts the role (it was dropped or disabled there) answers `refused`. It answers its own part only, in a
 form the merging server can order without ambiguity: log entries with their rank among the entries of the same
@@ -169,9 +242,15 @@ server for a request (`GET /pki/csr`), signs it and sends the certificate with `
   handshake. Nothing is restarted and open connections continue. The server then closes its idle connections to the
   other servers.
 
+## Statement timeout of exec
+
+The statement of `POST /internal/v1/exec` runs under `statement_timeout` of 15 minutes, set by the receiving server
+on its own connection; the request context ends when the leader disconnects, but that does not stop a statement on
+every path.
+
 ## Errors
 
 JSON `{"error": "<code>", "message": "..."}`. Codes: `no_certificate`,
 `certificate_refused` (401), `version_mismatch` (409), `not_leader` (403),
-`not_found` (404), `bad_request` (400), `statement_failed` (422), `ca_unavailable` (503: the leader does not hold
+`not_found` (404), `identity_unproven` (401: the proof of a forwarded or gather-authorize request, or the assertion of a gather request, is missing or wrong), `not_member` (403: the caller holds a certificate but is not a member of the cluster), `forbidden` (403: a task call about an instance that is not the caller's), `bad_request` (400), `statement_failed` (422), `ca_unavailable` (503: the leader does not hold
 the CA key), `certificate_revoked` (409), `failed` (500).

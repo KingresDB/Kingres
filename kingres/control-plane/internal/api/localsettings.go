@@ -10,10 +10,19 @@ type ClientPorts struct {
 	ReadOnlyPort *int `json:"readOnlyPort"`
 }
 
+// LocalDataPaths are the directories of this server as getThisServerSettings
+// answers them: the optional directories are always present, null when the
+// server uses the default (inside the data directory, the system log directory).
+type LocalDataPaths struct {
+	DataDirectory string  `json:"dataDirectory"`
+	WalDirectory  *string `json:"walDirectory"`
+	LogDirectory  *string `json:"logDirectory"`
+}
+
 // LocalSettings is the body of GET and PATCH /this-server/settings.
 type LocalSettings struct {
 	// DataPaths are the directories of this server.
-	DataPaths DataPaths `json:"dataPaths"`
+	DataPaths LocalDataPaths `json:"dataPaths"`
 	// MemoryQuota is the memory budget of this server.
 	MemoryQuota MemoryQuota `json:"memoryQuota"`
 	// LogLevel is debug, info, warning or error.

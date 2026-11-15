@@ -93,6 +93,10 @@ func (s *Server) serveOp(op contract.Operation, h handlerFunc) http.Handler {
 			}
 			return
 		}
+		if p := s.auditReady(c, r); p != nil {
+			writeProblem(rec, r, p)
+			return
+		}
 		if err := h(c, rec, r); err != nil {
 			var p *problem.Problem
 			if !errors.As(err, &p) {
@@ -124,9 +128,11 @@ func (s *Server) guard(c *call, r *http.Request) *problem.Problem {
 		return problem.New(problem.CSRFTokenInvalid, "Cross-site requests are not accepted.")
 	}
 
-	// 3. Rate limit on operations without a session.
-	if !sessionOp {
-		if ok, wait := s.publicLimiter.Allow(c.ip); !ok {
+	// 3. Rate limit on operations without a session. The liveness and readiness
+	// probes of a load balancer are exempt: a flood from many addresses must not
+	// make the health checks fail and take the server out of rotation (CP2-10).
+	if !sessionOp && !probeOps[op.ID] {
+		if ok, wait := s.publicLimiter.Allow(auth.AddressKey(c.ip)); !ok {
 			return rateLimited(wait)
 		}
 	}
@@ -161,6 +167,10 @@ func (s *Server) guard(c *call, r *http.Request) *problem.Problem {
 	return nil
 }
 
+// probeOps are the operations of health probes; they reveal nothing the
+// contract does not already make public.
+var probeOps = map[string]bool{"getHealth": true, "getReadiness": true}
+
 func rateLimited(wait time.Duration) *problem.Problem {
 	secs := int(wait.Seconds()) + 1
 	return problem.New(problem.RateLimited, "Too many requests; try again later.").WithRetryAfter(secs)
@@ -182,7 +192,7 @@ func (s *Server) checkSetupToken(c *call, r *http.Request) *problem.Problem {
 		c.audit = false
 		return problem.New(problem.Forbidden, "Setup is only possible from this machine until it is completed.")
 	}
-	if blocked, wait := s.setupLimiter.Blocked(c.ip); blocked {
+	if blocked, wait := s.setupLimiter.Blocked(auth.AddressKey(c.ip)); blocked {
 		c.audit = false
 		return rateLimited(wait)
 	}
@@ -199,7 +209,7 @@ func (s *Server) checkSetupToken(c *call, r *http.Request) *problem.Problem {
 	}
 	if !ok {
 		c.audit = false
-		s.setupLimiter.Record(c.ip)
+		s.setupLimiter.Record(auth.AddressKey(c.ip))
 		s.log.Warn("invalid setup token", "request_id", stateOf(r).id, "remote", c.ip)
 		s.appendAudit(r, audit.Event{
 			Actor: "anonymous", ActorAddress: c.ip, Source: "rest", Action: "setupTokenRejected",
@@ -243,6 +253,16 @@ func (s *Server) checkSession(c *call, r *http.Request) *problem.Problem {
 		}
 		if !auth.Allows(sess.ClusterRoles, c.op.Role) {
 			return problem.New(problem.Forbidden, "This operation requires the "+c.op.Role+" cluster role.")
+		}
+		if s.deps.Proxy != nil {
+			// The identity is proven and authorized; only now is the role made
+			// connectable for this server's own connections as that role (it writes
+			// pg_ident.conf and reloads PostgreSQL, so it must not be done for a
+			// name that was not accepted).
+			if err := s.deps.Proxy.Allow(r.Context(), sess.Username); err != nil {
+				s.log.Error("making the forwarded role connectable", "request_id", stateOf(r).id, "error", err)
+				return problem.New(problem.ServiceUnavailable, "The role cannot be made connectable right now.").WithRetryAfter(5)
+			}
 		}
 		return nil
 	}

@@ -13,6 +13,9 @@ import (
 	"testing"
 	"time"
 	"unicode"
+
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fwdproof"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 )
 
 // Class search of 2026-11-14: the text a peer answers with ends up in problems,
@@ -47,3 +50,22 @@ func TestPeerErrorTextIsBoundedAndClean(t *testing.T) {
 }
 
 func jsonMarshal(v any) ([]byte, error) { return json.Marshal(v) }
+
+// The body of a gather call has no proof, whatever the caller put in the request:
+// a proof would reveal the user's ClientKey to the member that receives it.
+func TestGatherBodyHasNoProof(t *testing.T) {
+	req := internalapi.ForwardRequest{OperationID: "listLogs", Identity: internalapi.ForwardIdentity{Username: "alice", ProofKey: []byte("secret-key-material-0123456789ab")},
+		Proof: &fwdproof.Proof{IssuedAt: 1, Nonce: make([]byte, 16), Value: make([]byte, 32)}, Assertion: &fwdproof.Assertion{Leader: []byte{1}}}
+	b, err := gatherBody(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{`"proof"`, "proofKey", "ProofKey", "secret-key"} {
+		if strings.Contains(string(b), forbidden) {
+			t.Errorf("the gather body contains %q: %s", forbidden, b)
+		}
+	}
+	if !strings.Contains(string(b), `"assertion"`) {
+		t.Errorf("the gather body has no assertion: %s", b)
+	}
+}

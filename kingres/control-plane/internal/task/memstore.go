@@ -16,10 +16,19 @@ type MemStore struct {
 	next   int64
 	tasks  map[int64]*Task
 	failOn func(op string) error // test hook
+	// clock stands for the database's clock: every engine that shares the
+	// store agrees on it, whatever its own clock says.
+	clock func() time.Time
 }
 
 // NewMemStore returns an empty store.
-func NewMemStore() *MemStore { return &MemStore{tasks: map[int64]*Task{}} }
+func NewMemStore() *MemStore { return &MemStore{tasks: map[int64]*Task{}, clock: time.Now} }
+
+// NewMemStoreClock returns an empty store whose lease arithmetic uses clock
+// (the stand-in for the database clock in tests).
+func NewMemStoreClock(clock func() time.Time) *MemStore {
+	return &MemStore{tasks: map[int64]*Task{}, clock: clock}
+}
 
 // FailOn installs a hook that can make an operation fail (tests).
 func (m *MemStore) FailOn(f func(op string) error) {
@@ -77,14 +86,16 @@ func claimable(t *Task, now time.Time) bool {
 
 func (m *MemStore) take(t *Task, holder string, now time.Time, lease time.Duration) *Task {
 	t.State, t.Holder, t.LeaseExpires, t.UpdatedAt = Running, holder, now.Add(lease), now
+	t.Epoch++
 	c := cp(t)
 	return &c
 }
 
 // Claim implements Store.
-func (m *MemStore) Claim(_ context.Context, holder string, now time.Time, lease time.Duration) (*Task, error) {
+func (m *MemStore) Claim(_ context.Context, holder string, lease time.Duration) (*Task, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	now := m.clock()
 	if err := m.hook("claim"); err != nil {
 		return nil, err
 	}
@@ -102,9 +113,10 @@ func (m *MemStore) Claim(_ context.Context, holder string, now time.Time, lease 
 }
 
 // ClaimID implements Store.
-func (m *MemStore) ClaimID(_ context.Context, id int64, holder string, now time.Time, lease time.Duration) (*Task, error) {
+func (m *MemStore) ClaimID(_ context.Context, id int64, holder string, lease time.Duration) (*Task, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	now := m.clock()
 	t, ok := m.tasks[id]
 	if !ok {
 		return nil, ErrNotFound
@@ -115,53 +127,60 @@ func (m *MemStore) ClaimID(_ context.Context, id int64, holder string, now time.
 	return m.take(t, holder, now, lease), nil
 }
 
-func (m *MemStore) held(id int64, holder string) (*Task, error) {
+func (m *MemStore) held(id int64, l Lease) (*Task, error) {
 	t, ok := m.tasks[id]
 	if !ok {
 		return nil, ErrNotFound
 	}
-	if t.Holder != holder || t.State != Running {
+	if t.Holder != l.Holder || t.Epoch != l.Epoch || t.State != Running {
 		return nil, ErrLeaseLost
 	}
 	return t, nil
 }
 
 // Renew implements Store.
-func (m *MemStore) Renew(_ context.Context, id int64, holder string, now time.Time, lease time.Duration) error {
+func (m *MemStore) Renew(_ context.Context, id int64, l Lease, lease time.Duration) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	t, err := m.held(id, holder)
+	if err := m.hook("renew"); err != nil {
+		return err
+	}
+	t, err := m.held(id, l)
 	if err != nil {
 		return err
 	}
-	t.LeaseExpires = now.Add(lease)
+	t.LeaseExpires = m.clock().Add(lease)
 	return nil
 }
 
 // SetStep implements Store.
-func (m *MemStore) SetStep(_ context.Context, id int64, holder string, i int, state string, pct float64, now time.Time) (bool, error) {
+func (m *MemStore) SetStep(_ context.Context, id int64, l Lease, i int, state string, pct float64) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err := m.hook("setstep:" + state); err != nil {
 		return false, err
 	}
-	t, err := m.held(id, holder)
+	t, err := m.held(id, l)
 	if err != nil {
 		return false, err
+	}
+	now := m.clock()
+	if state == StepRunning && !t.LeaseExpires.After(now) {
+		return false, ErrLeaseLost // see Store.SetStep
 	}
 	t.Steps[i].State, t.Percent, t.UpdatedAt = state, pct, now
 	return t.CancelRequested, nil
 }
 
 // Finish implements Store.
-func (m *MemStore) Finish(_ context.Context, id int64, holder string, state State, e *Error, now time.Time) error {
+func (m *MemStore) Finish(_ context.Context, id int64, l Lease, state State, e *Error) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	t, err := m.held(id, holder)
+	t, err := m.held(id, l)
 	if err != nil {
 		return err
 	}
-	t.State, t.Error, t.UpdatedAt, t.Holder, t.LeaseExpires = state, e, now, "", time.Time{}
+	t.State, t.Error, t.UpdatedAt, t.Holder, t.LeaseExpires = state, e, m.clock(), "", time.Time{}
 	if state == Done {
 		t.Percent = 100
 	}
@@ -230,10 +249,10 @@ func (m *MemStore) Import(ts []Task) {
 }
 
 // SetDetail implements DetailStore.
-func (m *MemStore) SetDetail(_ context.Context, id int64, holder, detail string) error {
+func (m *MemStore) SetDetail(_ context.Context, id int64, l Lease, detail string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	t, err := m.held(id, holder)
+	t, err := m.held(id, l)
 	if err != nil {
 		return err
 	}

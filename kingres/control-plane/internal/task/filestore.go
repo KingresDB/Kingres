@@ -98,8 +98,8 @@ func (f *FileStore) Create(ctx context.Context, t Task) (Task, error) {
 func (f *FileStore) Get(ctx context.Context, id int64) (Task, error) { return f.inner.Get(ctx, id) }
 
 // Claim implements Store.
-func (f *FileStore) Claim(ctx context.Context, holder string, now time.Time, lease time.Duration) (*Task, error) {
-	t, err := f.inner.Claim(ctx, holder, now, lease)
+func (f *FileStore) Claim(ctx context.Context, holder string, lease time.Duration) (*Task, error) {
+	t, err := f.inner.Claim(ctx, holder, lease)
 	if err != nil || t == nil {
 		return t, err
 	}
@@ -107,8 +107,8 @@ func (f *FileStore) Claim(ctx context.Context, holder string, now time.Time, lea
 }
 
 // ClaimID implements Store.
-func (f *FileStore) ClaimID(ctx context.Context, id int64, holder string, now time.Time, lease time.Duration) (*Task, error) {
-	t, err := f.inner.ClaimID(ctx, id, holder, now, lease)
+func (f *FileStore) ClaimID(ctx context.Context, id int64, holder string, lease time.Duration) (*Task, error) {
+	t, err := f.inner.ClaimID(ctx, id, holder, lease)
 	if err != nil || t == nil {
 		return t, err
 	}
@@ -116,13 +116,13 @@ func (f *FileStore) ClaimID(ctx context.Context, id int64, holder string, now ti
 }
 
 // Renew implements Store (not persisted: a restart expires the lease anyway).
-func (f *FileStore) Renew(ctx context.Context, id int64, holder string, now time.Time, lease time.Duration) error {
-	return f.inner.Renew(ctx, id, holder, now, lease)
+func (f *FileStore) Renew(ctx context.Context, id int64, l Lease, lease time.Duration) error {
+	return f.inner.Renew(ctx, id, l, lease)
 }
 
 // SetStep implements Store.
-func (f *FileStore) SetStep(ctx context.Context, id int64, holder string, i int, state string, pct float64, now time.Time) (bool, error) {
-	c, err := f.inner.SetStep(ctx, id, holder, i, state, pct, now)
+func (f *FileStore) SetStep(ctx context.Context, id int64, l Lease, i int, state string, pct float64) (bool, error) {
+	c, err := f.inner.SetStep(ctx, id, l, i, state, pct)
 	if err != nil {
 		return c, err
 	}
@@ -130,8 +130,8 @@ func (f *FileStore) SetStep(ctx context.Context, id int64, holder string, i int,
 }
 
 // Finish implements Store.
-func (f *FileStore) Finish(ctx context.Context, id int64, holder string, state State, e *Error, now time.Time) error {
-	if err := f.inner.Finish(ctx, id, holder, state, e, now); err != nil {
+func (f *FileStore) Finish(ctx context.Context, id int64, l Lease, state State, e *Error) error {
+	if err := f.inner.Finish(ctx, id, l, state, e); err != nil {
 		return err
 	}
 	return f.save(id) //nolint:contextcheck // saving does not depend on a request
@@ -151,8 +151,8 @@ func (f *FileStore) List(ctx context.Context, limit int) ([]Task, error) {
 }
 
 // SetDetail implements DetailStore.
-func (f *FileStore) SetDetail(ctx context.Context, id int64, holder, detail string) error {
-	if err := f.inner.SetDetail(ctx, id, holder, detail); err != nil {
+func (f *FileStore) SetDetail(ctx context.Context, id int64, l Lease, detail string) error {
+	if err := f.inner.SetDetail(ctx, id, l, detail); err != nil {
 		return err
 	}
 	return f.save(id) //nolint:contextcheck // saving does not depend on a request

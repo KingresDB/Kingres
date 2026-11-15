@@ -372,7 +372,7 @@ func TestFingerprintModesAndSetupTokenReplay(t *testing.T) {
 	for _, cred := range [][2]string{{clustertest.AdminUser, "wrong-password"}, {"plain", "Plain-Role-Password-1"}} {
 		prev = setupTaskID(n2)
 		st, body := n2.Do("POST", "/setup/join-cluster", map[string]any{"existingNodeAddress": leader.RestAddr(),
-			"admin": map[string]any{"username": cred[0], "password": cred[1]}, "dataPaths": map[string]any{"dataDirectory": n2.DataDir}},
+			"admin": map[string]any{"username": cred[0], "password": cred[1]}, "dataPaths": map[string]any{"dataDirectory": n2.DataDir}, "allowUnpinned": true},
 			map[string]string{"X-Setup-Token": n2.SetupToken(), "Authorization": ""})
 		if st != 202 {
 			t.Fatalf("join request: %d %v", st, body)

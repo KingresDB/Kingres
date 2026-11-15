@@ -69,3 +69,32 @@ func TestRevalidatorLastGood(t *testing.T) {
 		t.Error("LastGood survived the role being refused")
 	}
 }
+
+// CP2-19: a check that began before Changed must not become the last good answer.
+func TestRevalidatorChangedIsNotUndoneByAnInFlightCheck(t *testing.T) {
+	c := &clock{t: time.Unix(1000, 0)}
+	var v *Revalidator
+	a := &changingAuthn{roles: []string{RoleAdmin}}
+	v = NewRevalidator(a, NewStore(time.Hour, 10, c.now), time.Second, c.now)
+	a.during = func() { v.Changed("alice") } // the change lands while the check runs
+	if _, err := v.Roles(context.Background(), "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := v.LastGood("alice", time.Hour); ok {
+		t.Error("the answer of a check that straddled Changed was stored as last good")
+	}
+}
+
+type changingAuthn struct {
+	roles  []string
+	during func()
+}
+
+func (s *changingAuthn) Authenticate(context.Context, string, string) ([]string, error) {
+	return s.roles, nil
+}
+
+func (s *changingAuthn) CurrentRoles(context.Context, string) ([]string, error) {
+	s.during()
+	return s.roles, nil
+}

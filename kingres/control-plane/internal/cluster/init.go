@@ -471,6 +471,10 @@ func Summary(t task.Task) api.SetupTaskSummary {
 		te.Retryable = &r
 		sum.Error = te
 	}
+	if t.Detail != "" {
+		d := t.Detail
+		sum.Detail = &d
+	}
 	return sum
 }
 

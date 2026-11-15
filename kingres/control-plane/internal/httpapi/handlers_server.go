@@ -44,6 +44,7 @@ func (s *Server) getThisServer(_ *call, w http.ResponseWriter, r *http.Request) 
 			out.IsManagerLeader = true
 		}
 	}
+	out.InternalFingerprint = s.internalFingerprint()
 	since := started.UTC()
 	out.Services = append(out.Services, api.ServiceStatus{Name: "api", State: "running", Since: &since})
 	pg := "stopped"

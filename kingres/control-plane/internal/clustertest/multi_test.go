@@ -322,14 +322,15 @@ func TestMutationOnAFollowerIsForwardedAndAuditedOnce(t *testing.T) {
 			t.Errorf("node %d: fwd_role: %d", n.Index, got)
 		}
 	}
+	// The audit list is the cluster's: the events a server wrote are those that name it as serverId.
 	events := func(n *clustertest.Node) []any {
-		out := n.Expect(200, "GET", "/audit?action=createRole&limit=200", nil)
+		out := c.Leader().Expect(200, "GET", "/audit?action=createRole&limit=200", nil)
 		items, _ := out["items"].([]any)
 		var mine []any
 		for _, it := range items {
 			m, _ := it.(map[string]any)
 			d, _ := m["details"].(map[string]any)
-			if m["actor"] != clustertest.AdminUser || m["outcome"] != "success" {
+			if m["serverId"] != n.Host || m["actor"] != clustertest.AdminUser || m["outcome"] != "success" {
 				continue // the denied attempt of the readonly role is audited where it was made
 			}
 			if n != c.Leader() || d["forwardedBy"] != nil {

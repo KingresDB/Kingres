@@ -99,8 +99,8 @@ func TestResumeAfterInterruptionAtEveryBoundary(t *testing.T) {
 			t.Run(point+"#"+string(rune('0'+k)), func(t *testing.T) {
 				c := &counter{n: map[string]int{}}
 				d := defn(c, "s0", "s1", "s2", "s3")
-				st := task.NewMemStore()
 				clk := newClock()
+				st := task.NewMemStoreClock(clk.Now)
 				calls := 0
 				crash := errors.New("simulated crash")
 				st.FailOn(func(op string) error {
@@ -150,26 +150,28 @@ func TestResumeAfterInterruptionAtEveryBoundary(t *testing.T) {
 
 func TestZombieLeaderCannotWrite(t *testing.T) {
 	c := &counter{n: map[string]int{}}
-	st := task.NewMemStore()
 	clk := newClock()
+	st := task.NewMemStoreClock(clk.Now)
 	ctx := context.Background()
 	e := engine(t, st, "A", clk, defn(c, "only"))
 	tk, _ := e.Submit(ctx, "test.kind", task.Subject{Type: "x", ID: "1"}, nil, "u")
-	a, err := st.Claim(ctx, "A", clk.Now(), 30*time.Second)
+	a, err := st.Claim(ctx, "A", 30*time.Second)
 	if err != nil || a == nil {
 		t.Fatal(err)
 	}
 	clk.Add(time.Minute)
-	if b, _ := st.Claim(ctx, "B", clk.Now(), 30*time.Second); b == nil {
+	b, _ := st.Claim(ctx, "B", 30*time.Second)
+	if b == nil {
 		t.Fatal("takeover failed")
 	}
-	if _, err := st.SetStep(ctx, tk.ID, "A", 0, task.StepDone, 100, clk.Now()); !errors.Is(err, task.ErrLeaseLost) {
+	zombie := task.Lease{Holder: "A", Epoch: a.Epoch}
+	if _, err := st.SetStep(ctx, tk.ID, zombie, 0, task.StepDone, 100); !errors.Is(err, task.ErrLeaseLost) {
 		t.Errorf("zombie SetStep: %v", err)
 	}
-	if err := st.Finish(ctx, tk.ID, "A", task.Done, nil, clk.Now()); !errors.Is(err, task.ErrLeaseLost) {
+	if err := st.Finish(ctx, tk.ID, zombie, task.Done, nil); !errors.Is(err, task.ErrLeaseLost) {
 		t.Errorf("zombie Finish: %v", err)
 	}
-	if err := st.Renew(ctx, tk.ID, "A", clk.Now(), time.Minute); !errors.Is(err, task.ErrLeaseLost) {
+	if err := st.Renew(ctx, tk.ID, zombie, time.Minute); !errors.Is(err, task.ErrLeaseLost) {
 		t.Errorf("zombie Renew: %v", err)
 	}
 }

@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fwdproof"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/gather"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/leader"
@@ -60,6 +61,9 @@ func (e *APIError) Error() string {
 
 // Config configures a Client.
 type Config struct {
+	// Self is this server's id: the sender named in the proof of a forwarded
+	// request.
+	Self string
 	// PKIDir holds ca.crt, server.crt and server.key of this server.
 	PKIDir string
 	// Peers is the directory of internal addresses.
@@ -235,9 +239,43 @@ func (c *Client) do(ctx context.Context, serverID string, checkRevoked bool, met
 	return nil
 }
 
+// prove adds the proof of the session of req.Identity to req (nothing when
+// the session has no key: the receiver then refuses the call).
+func (c *Client) prove(kind fwdproof.Kind, to string, req *internalapi.ForwardRequest) error {
+	if len(req.Identity.ProofKey) == 0 {
+		return nil
+	}
+	p, err := fwdproof.Sign(req.Identity.ProofKey, req.ProofMessage(kind, c.cfg.Self, to), time.Now())
+	if err != nil {
+		return err
+	}
+	req.Proof = &p
+	return nil
+}
+
+// AuthorizeGather sends the leader the proof of the user's session for a gather
+// call and returns the leader's assertion, which the members that answer the call
+// accept instead of a proof. The proof reveals the user's ClientKey to its
+// receiver, so it goes to the leader only (package fwdproof).
+func (c *Client) AuthorizeGather(ctx context.Context, leaderID string, req internalapi.ForwardRequest) (fwdproof.Assertion, error) {
+	var a fwdproof.Assertion
+	if len(req.Identity.ProofKey) == 0 {
+		return a, errors.New("peerclient: the session has no key to prove itself with")
+	}
+	req.Assertion = nil
+	if err := c.prove(fwdproof.KindGatherAuthorize, leaderID, &req); err != nil {
+		return a, err
+	}
+	err := c.Do(ctx, leaderID, http.MethodPost, "/gather-authorize", req, &a)
+	return a, err
+}
+
 // Forward sends a forwarded operation to the leader.
 func (c *Client) Forward(ctx context.Context, leaderID string, req internalapi.ForwardRequest) (internalapi.ForwardResponse, error) {
 	var resp internalapi.ForwardResponse
+	if err := c.prove(fwdproof.KindForward, leaderID, &req); err != nil {
+		return resp, err
+	}
 	err := c.Do(ctx, leaderID, http.MethodPost, "/forward", req, &resp)
 	return resp, err
 }
@@ -281,6 +319,14 @@ func (c *Client) ForgetAll() {
 	}
 }
 
+// gatherBody is the body of a gather call: the request with the assertion of the
+// leader and never a proof, which would reveal the user's ClientKey to the member
+// that receives it.
+func gatherBody(req internalapi.ForwardRequest) ([]byte, error) {
+	req.Proof = nil
+	return json.Marshal(req)
+}
+
 // Gather asks a server for its part of a cluster-wide read (POST /gather) and
 // returns its answer: the status and body of the operation it ran. The answer
 // is read through a limit of maxBytes (a larger one is gather.ErrInvalid), an
@@ -296,7 +342,7 @@ func (c *Client) Gather(ctx context.Context, serverID string, req internalapi.Fo
 	if err != nil {
 		return internalapi.ForwardResponse{}, fmt.Errorf("%w: %w", gather.ErrUnreachable, err)
 	}
-	b, err := json.Marshal(req)
+	b, err := gatherBody(req)
 	if err != nil {
 		return internalapi.ForwardResponse{}, err
 	}

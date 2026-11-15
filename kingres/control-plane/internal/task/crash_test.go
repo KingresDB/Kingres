@@ -29,25 +29,25 @@ func (d *deadStore) check() error {
 	return nil
 }
 
-func (d *deadStore) Renew(ctx context.Context, id int64, h string, now time.Time, l time.Duration) error {
+func (d *deadStore) Renew(ctx context.Context, id int64, l task.Lease, d2 time.Duration) error {
 	if err := d.check(); err != nil {
 		return err
 	}
-	return d.Store.Renew(ctx, id, h, now, l)
+	return d.Store.Renew(ctx, id, l, d2)
 }
 
-func (d *deadStore) SetStep(ctx context.Context, id int64, h string, i int, s string, p float64, now time.Time) (bool, error) {
+func (d *deadStore) SetStep(ctx context.Context, id int64, l task.Lease, i int, s string, p float64) (bool, error) {
 	if err := d.check(); err != nil {
 		return false, err
 	}
-	return d.Store.SetStep(ctx, id, h, i, s, p, now)
+	return d.Store.SetStep(ctx, id, l, i, s, p)
 }
 
-func (d *deadStore) Finish(ctx context.Context, id int64, h string, s task.State, e *task.Error, now time.Time) error {
+func (d *deadStore) Finish(ctx context.Context, id int64, l task.Lease, s task.State, e *task.Error) error {
 	if err := d.check(); err != nil {
 		return err
 	}
-	return d.Store.Finish(ctx, id, h, s, e, now)
+	return d.Store.Finish(ctx, id, l, s, e)
 }
 
 type crashed struct{}
@@ -70,9 +70,9 @@ func TestCrashAtEveryStepBoundary(t *testing.T) {
 		for k := 0; k < 4; k++ {
 			t.Run(fmt.Sprintf("%s#%d", point, k), func(t *testing.T) {
 				c := &counter{n: map[string]int{}}
-				mem := task.NewMemStore()
-				ds := &deadStore{Store: mem}
 				clk := newClock()
+				mem := task.NewMemStoreClock(clk.Now)
+				ds := &deadStore{Store: mem}
 				ctx := context.Background()
 				hook := func(p string, _ int64, step int) {
 					if p == point && step == k {
@@ -150,9 +150,9 @@ func TestCrashAtTheFinish(t *testing.T) {
 	for _, point := range []string{task.FaultBeforeFinish, task.FaultAfterFinish} {
 		t.Run(point, func(t *testing.T) {
 			c := &counter{n: map[string]int{}}
-			mem := task.NewMemStore()
-			ds := &deadStore{Store: mem}
 			clk := newClock()
+			mem := task.NewMemStoreClock(clk.Now)
+			ds := &deadStore{Store: mem}
 			ctx := context.Background()
 			hook := func(p string, _ int64, _ int) {
 				if p == point {
@@ -198,7 +198,8 @@ func TestCrashAtTheLeaseRenewal(t *testing.T) {
 	for _, k := range []int{0, 1} {
 		t.Run(fmt.Sprintf("step%d", k), func(t *testing.T) {
 			c := &counter{n: map[string]int{}}
-			mem := task.NewMemStore()
+			clk := newClock()
+			mem := task.NewMemStoreClock(clk.Now)
 			ds := &deadStore{Store: mem}
 			ctx, stop := context.WithCancel(context.Background())
 			defer stop()
@@ -221,7 +222,7 @@ func TestCrashAtTheLeaseRenewal(t *testing.T) {
 			if !ds.dead.Load() {
 				t.Fatal("no lease renewal happened")
 			}
-			time.Sleep(150 * time.Millisecond) // the lease expires
+			clk.Add(time.Hour) // the lease expires
 			d2 := crashDef(c)
 			b, _ := task.NewEngine(mem, []task.Definition{d2}, task.Options{Holder: "B", Lease: time.Minute, StoreTries: 1})
 			if ran, err := b.RunOnce(context.Background()); !ran || err != nil {

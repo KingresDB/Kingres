@@ -449,11 +449,7 @@ func (ca *CA) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	tmp := filepath.Join(ca.dir, RevokedFile+".tmp")
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, filepath.Join(ca.dir, RevokedFile))
+	return WriteFile(filepath.Join(ca.dir, RevokedFile), b, 0o600)
 }
 
 // IsRevoked reports whether a serial number (hex) is revoked.

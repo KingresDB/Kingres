@@ -124,10 +124,11 @@ func TestIntegrationClusterSummaryAndSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sum.MapVersion != 7 || !sum.MapGroupAvailable || sum.Servers.Total != 5 || sum.Servers.Dead != 1 || sum.Servers.Live != 4 {
+	if sum.MapVersion != 7 || !sum.MapGroupAvailable || sum.Servers.Total != 5 || sum.Servers.Dead != 1 || sum.Servers.Live != 3 || sum.Servers.PendingRebalance != 1 {
 		t.Errorf("summary = %+v", sum)
 	}
-	// 8 + 4 buckets in total; 1 moving, 1 orphan; group 1 has no live standby
+	// The standby "localhost" holds replicas only and is the primary of no bucket: it is pendingRebalance
+	// (0.6.0: the replicas a join creates do not count, see statusOf). 8 + 4 buckets in total; 1 moving, 1 orphan; group 1 has no live standby
 	// but the replica count is 1, so its 1 held bucket is under-replicated.
 	if sum.Buckets.Total != 12 || sum.Buckets.Moving != 1 || sum.Buckets.Orphan != 1 || sum.Buckets.UnderReplicated != 1 || sum.Buckets.Unavailable != 0 {
 		t.Errorf("buckets = %+v", sum.Buckets)

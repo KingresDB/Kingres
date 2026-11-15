@@ -190,10 +190,13 @@ func TestLeaderServesOnlyTheListedForwardedReads(t *testing.T) {
 	fw := &direct{leader: "x"}
 	leader, _ := twoServers(t, fw)
 	id := internalapi.ForwardIdentity{Username: "bob", ClusterRoles: []string{auth.RoleReadonly}}
-	for op, want := range map[string]bool{"listServers": true, "listServerGroups": true, "listDatabases": false, "getServer": false} {
+	for op, want := range map[string]bool{"listServers": true, "listServerGroups": true, "listDatabases": true, "getDatabase": true, "listRoles": false, "getServer": false} {
 		pp := map[string]string{}
-		if op == "getServer" {
+		switch op {
+		case "getServer":
 			pp["serverId"] = "10.0.0.1"
+		case "getDatabase":
+			pp["databaseName"] = "shop"
 		}
 		_, err := leader.srv.ServeForwarded(t.Context(), "p", internalapi.ForwardRequest{OperationID: op, PathParams: pp, Identity: id})
 		if (err == nil) != want {

@@ -4,6 +4,7 @@ package auth
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -152,11 +153,77 @@ func TestLimiterBoundsMemory(t *testing.T) {
 			t.Fatal(k)
 		}
 	}
-	if ok, _ := l.Allow("d"); ok {
-		t.Error("a full table must refuse new keys (fail closed)")
+	if ok, _ := l.Allow("d"); !ok {
+		t.Error("a full table must make room, not refuse a new key (CP2-10)")
+	}
+	if len(l.hits) > l.maxKeys {
+		t.Errorf("table has %d keys, bound is %d", len(l.hits), l.maxKeys)
 	}
 	c.t = c.t.Add(2 * time.Minute)
-	if ok, _ := l.Allow("d"); !ok {
+	if ok, _ := l.Allow("e"); !ok {
 		t.Error("expired keys must be evicted to make room")
+	}
+}
+
+// The reviewer's reproduction of CP2-10: after 50000 distinct keys within the
+// window a new address or user name was refused. Neither is now, and the
+// table stays bounded.
+func TestLimiterSaturationDoesNotLockNewKeysOut(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	l := NewLimiter(10, time.Minute, c.now)
+	for i := 0; i < l.maxKeys; i++ {
+		c.t = c.t.Add(time.Millisecond)
+		if ok, _ := l.Allow(fmt.Sprintf("10.%d.%d.%d", i>>16&255, i>>8&255, i&255)); !ok {
+			t.Fatalf("key %d refused", i)
+		}
+	}
+	for _, k := range []string{"203.0.113.9", "root_admin"} {
+		if ok, wait := l.Allow(k); !ok {
+			t.Fatalf("new key %q refused with a wait of %v when the table is full", k, wait)
+		}
+	}
+	for i := 0; i < 2*l.maxKeys; i++ {
+		l.Record(fmt.Sprintf("flood-%d", i))
+	}
+	if len(l.hits) > l.maxKeys {
+		t.Errorf("table grew to %d keys, bound %d", len(l.hits), l.maxKeys)
+	}
+}
+
+func TestAddressKeyGroupsIPv6By64(t *testing.T) {
+	a := AddressKey("2001:db8:1:2:aaaa:bbbb:cccc:dddd")
+	b := AddressKey("2001:db8:1:2:1111:2222:3333:4444")
+	if a != b || a == AddressKey("2001:db8:1:3::1") {
+		t.Errorf("same /64 must share a key and another /64 must not: %q %q", a, b)
+	}
+	if AddressKey("192.0.2.1") != "192.0.2.1" || AddressKey("forwarded") != "forwarded" {
+		t.Error("IPv4 and non-IP text stay as they are")
+	}
+}
+
+// CP2-09: one account cannot use up the store; its oldest session goes first
+// and other accounts can still sign in.
+func TestStorePerUserCap(t *testing.T) {
+	c := &clock{t: time.Unix(1000, 0)}
+	s := NewStore(time.Hour, 100, c.now)
+	var first string
+	for i := 0; i < 500; i++ {
+		c.t = c.t.Add(time.Second)
+		cred, _, err := s.Create("mallory", nil, KindToken)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			first = cred
+		}
+	}
+	if n := s.Len(); n != DefaultMaxSessionsPerUser {
+		t.Errorf("mallory holds %d sessions, cap is %d", n, DefaultMaxSessionsPerUser)
+	}
+	if _, err := s.Lookup(first); !errors.Is(err, ErrNoSession) {
+		t.Errorf("the oldest session must be gone: %v", err)
+	}
+	if _, _, err := s.Create("root_admin", nil, KindToken); err != nil {
+		t.Errorf("another account must still sign in: %v", err)
 	}
 }

@@ -16,6 +16,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -38,23 +39,50 @@ const (
 	RevokedListFile = "revoked-serials.json"
 )
 
-// WriteFile writes a file below the pki directory atomically with the mode
-// (private key files 0600).
+// syncFile and syncDir flush a file and a directory to disk; tests replace them
+// to see the order of the steps of WriteFile.
+var (
+	syncFile = func(f *os.File) error { return f.Sync() }
+	syncDir  = func(dir string) error {
+		d, err := os.Open(dir) //nolint:gosec // the pki directory
+		if err != nil {
+			return err
+		}
+		err = d.Sync()
+		if cerr := d.Close(); err == nil {
+			err = cerr
+		}
+		return err
+	}
+)
+
+// WriteFile writes a file below the pki directory atomically and durably with
+// the mode (private key files 0600): the content is on disk before the rename
+// makes it the file, and the rename is on disk before WriteFile returns, so a
+// crash leaves the old file or the new one, never an empty one (CP2-18: a
+// revocation must not be lost to a power failure).
 func WriteFile(path string, b []byte, mode os.FileMode) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".pki-*")
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".pki-*")
 	if err != nil {
 		return err
 	}
 	name := tmp.Name()
 	_, werr := tmp.Write(b)
+	serr := syncFile(tmp)
 	cerr := tmp.Close()
-	if err := firstErr(werr, cerr, os.Chmod(name, mode)); err != nil {
+	if err := firstErr(werr, serr, cerr, os.Chmod(name, mode)); err != nil {
 		_ = os.Remove(name)
 		return err
 	}
 	if err := os.Rename(name, path); err != nil {
 		_ = os.Remove(name)
 		return err
+	}
+	// Windows cannot open a directory to flush it; the rename is as durable as the
+	// file system makes it there.
+	if err := syncDir(dir); err != nil && runtime.GOOS != "windows" {
+		return fmt.Errorf("flushing %s: %w", dir, err)
 	}
 	return nil
 }

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pki"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/setup"
 )
 
 // pkiState caches what a server knows of the cluster's PKI: the CA with its
@@ -105,4 +106,28 @@ func (s *Service) NodeTLSConfig(host string) (*tls.Config, error) {
 		return nil, err
 	}
 	return &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: pool, ServerName: host, Certificates: []tls.Certificate{pair}}, nil
+}
+
+// InternalFingerprint is the SHA-256 fingerprint (64 lower-case hex digits) of
+// the certificate the internal API of this server presents now: its cluster
+// certificate once it has one, before that its bootstrap certificate. An
+// uninitialized server that has none yet (it is made when the first call
+// arrives, and again after a reset) gets it made here, the same file the
+// internal listener would make. "" when there is none.
+func (s *Service) InternalFingerprint() string {
+	for _, name := range []string{pki.ServerCertFile, pki.BootstrapCertFile} {
+		b, err := os.ReadFile(filepath.Join(s.PKIDir(), name))
+		if err != nil {
+			continue
+		}
+		if c, err := pki.ParseCertPEM(b); err == nil {
+			return pki.Fingerprint(c.Raw)
+		}
+	}
+	if s.Enabled() && s.setup.State() == setup.Uninitialized {
+		if _, fp, err := pki.EnsureBootstrapCert(s.PKIDir(), s.ServerNames(), time.Now()); err == nil {
+			return fp
+		}
+	}
+	return ""
 }

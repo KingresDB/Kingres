@@ -29,7 +29,7 @@ type PGStore struct{ db DB }
 func NewPGStore(db DB) *PGStore { return &PGStore{db: db} }
 
 const cols = `id, kind, state, subject_type, subject_id, input, progress, error, cancel_requested,
-	created_at, updated_at, created_by, coalesce(lease_holder, ''), coalesce(lease_expires_at, 'epoch')`
+	created_at, updated_at, created_by, coalesce(lease_holder, ''), coalesce(lease_expires_at, 'epoch'), lease_epoch`
 
 type progressJSON struct {
 	Detail  string      `json:"detail,omitempty"`
@@ -42,7 +42,7 @@ func scan(row pgx.Row) (Task, error) {
 	var state string
 	var prog, errj []byte
 	err := row.Scan(&t.ID, &t.Kind, &state, &t.SubjectType, &t.SubjectID, &t.Input, &prog, &errj,
-		&t.CancelRequested, &t.CreatedAt, &t.UpdatedAt, &t.CreatedBy, &t.Holder, &t.LeaseExpires)
+		&t.CancelRequested, &t.CreatedAt, &t.UpdatedAt, &t.CreatedBy, &t.Holder, &t.LeaseExpires, &t.Epoch)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return Task{}, ErrNotFound
@@ -84,15 +84,19 @@ func (s *PGStore) Get(ctx context.Context, id int64) (Task, error) {
 	return scan(s.db.QueryRow(ctx, `SELECT `+cols+` FROM kingres_cp.task WHERE id = $1`, id))
 }
 
-const claimSQL = `UPDATE kingres_cp.task SET state = 'running', lease_holder = $1, lease_expires_at = $2, updated_at = $3
+// The lease is written and compared with clock_timestamp() of the database:
+// every server asks the same clock, so servers whose own clocks differ agree on
+// whether a lease has expired. $2 is the lease length in seconds.
+const claimSQL = `UPDATE kingres_cp.task SET state = 'running', lease_holder = $1,
+	lease_expires_at = clock_timestamp() + make_interval(secs => $2::float8), lease_epoch = lease_epoch + 1, updated_at = clock_timestamp()
 	WHERE id = (SELECT id FROM kingres_cp.task
-	            WHERE %s AND (state = 'pending' OR (state = 'running' AND lease_expires_at <= $3))
+	            WHERE %s AND (state = 'pending' OR (state = 'running' AND lease_expires_at <= clock_timestamp()))
 	            ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED)
 	RETURNING ` + cols
 
 // Claim implements Store.
-func (s *PGStore) Claim(ctx context.Context, holder string, now time.Time, lease time.Duration) (*Task, error) {
-	t, err := scan(s.db.QueryRow(ctx, fmt.Sprintf(claimSQL, "true"), holder, now.Add(lease), now))
+func (s *PGStore) Claim(ctx context.Context, holder string, lease time.Duration) (*Task, error) {
+	t, err := scan(s.db.QueryRow(ctx, fmt.Sprintf(claimSQL, "true"), holder, lease.Seconds()))
 	if errors.Is(err, ErrNotFound) {
 		return nil, nil
 	}
@@ -100,8 +104,8 @@ func (s *PGStore) Claim(ctx context.Context, holder string, now time.Time, lease
 }
 
 // ClaimID implements Store.
-func (s *PGStore) ClaimID(ctx context.Context, id int64, holder string, now time.Time, lease time.Duration) (*Task, error) {
-	t, err := scan(s.db.QueryRow(ctx, fmt.Sprintf(claimSQL, "id = $4"), holder, now.Add(lease), now, id))
+func (s *PGStore) ClaimID(ctx context.Context, id int64, holder string, lease time.Duration) (*Task, error) {
+	t, err := scan(s.db.QueryRow(ctx, fmt.Sprintf(claimSQL, "id = $3"), holder, lease.Seconds(), id))
 	if errors.Is(err, ErrNotFound) {
 		if _, gerr := s.Get(ctx, id); gerr != nil {
 			return nil, gerr
@@ -122,9 +126,9 @@ func (s *PGStore) heldOrErr(ctx context.Context, tag pgconn.CommandTag, id int64
 }
 
 // Renew implements Store.
-func (s *PGStore) Renew(ctx context.Context, id int64, holder string, now time.Time, lease time.Duration) error {
-	tag, err := s.db.Exec(ctx, `UPDATE kingres_cp.task SET lease_expires_at = $3
-		WHERE id = $1 AND lease_holder = $2 AND state = 'running'`, id, holder, now.Add(lease))
+func (s *PGStore) Renew(ctx context.Context, id int64, l Lease, lease time.Duration) error {
+	tag, err := s.db.Exec(ctx, `UPDATE kingres_cp.task SET lease_expires_at = clock_timestamp() + make_interval(secs => $4::float8)
+		WHERE id = $1 AND lease_holder = $2 AND lease_epoch = $3 AND state = 'running'`, id, l.Holder, l.Epoch, lease.Seconds())
 	if err != nil {
 		return err
 	}
@@ -132,13 +136,18 @@ func (s *PGStore) Renew(ctx context.Context, id int64, holder string, now time.T
 }
 
 // SetStep implements Store.
-func (s *PGStore) SetStep(ctx context.Context, id int64, holder string, i int, state string, pct float64, now time.Time) (bool, error) {
+//
+// The holder and the epoch are checked in the very statement that records the step, and a step is
+// marked running only while the lease has not expired by the database's clock: the check and the
+// record are atomic, and the row lock orders them against a claim of another server.
+func (s *PGStore) SetStep(ctx context.Context, id int64, l Lease, i int, state string, pct float64) (bool, error) {
 	var cancel bool
 	err := s.db.QueryRow(ctx, `UPDATE kingres_cp.task SET
-		progress = jsonb_set(jsonb_set(progress, ARRAY['steps', $3::text, 'state'], to_jsonb($4::text)), '{percent}', to_jsonb($5::float8)),
-		updated_at = $6
-		WHERE id = $1 AND lease_holder = $2 AND state = 'running' RETURNING cancel_requested`,
-		id, holder, strconv.Itoa(i), state, pct, now).Scan(&cancel)
+		progress = jsonb_set(jsonb_set(progress, ARRAY['steps', $4::text, 'state'], to_jsonb($5::text)), '{percent}', to_jsonb($6::float8)),
+		updated_at = clock_timestamp()
+		WHERE id = $1 AND lease_holder = $2 AND lease_epoch = $3 AND state = 'running'
+		  AND ($5::text <> 'running' OR lease_expires_at > clock_timestamp()) RETURNING cancel_requested`,
+		id, l.Holder, l.Epoch, strconv.Itoa(i), state, pct).Scan(&cancel)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if _, gerr := s.Get(ctx, id); gerr != nil {
 			return false, gerr
@@ -149,15 +158,15 @@ func (s *PGStore) SetStep(ctx context.Context, id int64, holder string, i int, s
 }
 
 // Finish implements Store.
-func (s *PGStore) Finish(ctx context.Context, id int64, holder string, state State, e *Error, now time.Time) error {
+func (s *PGStore) Finish(ctx context.Context, id int64, l Lease, state State, e *Error) error {
 	var ej []byte
 	if e != nil {
 		ej, _ = json.Marshal(e)
 	}
-	tag, err := s.db.Exec(ctx, `UPDATE kingres_cp.task SET state = $3, error = $4, updated_at = $5,
-		progress = CASE WHEN $3 = 'done' THEN jsonb_set(progress, '{percent}', '100') ELSE progress END,
+	tag, err := s.db.Exec(ctx, `UPDATE kingres_cp.task SET state = $4, error = $5, updated_at = clock_timestamp(),
+		progress = CASE WHEN $4 = 'done' THEN jsonb_set(progress, '{percent}', '100') ELSE progress END,
 		lease_holder = NULL, lease_expires_at = NULL
-		WHERE id = $1 AND lease_holder = $2 AND state = 'running'`, id, holder, string(state), ej, now)
+		WHERE id = $1 AND lease_holder = $2 AND lease_epoch = $3 AND state = 'running'`, id, l.Holder, l.Epoch, string(state), ej)
 	if err != nil {
 		return err
 	}
@@ -207,9 +216,9 @@ func (s *PGStore) List(ctx context.Context, limit int) ([]Task, error) {
 }
 
 // SetDetail implements DetailStore.
-func (s *PGStore) SetDetail(ctx context.Context, id int64, holder, detail string) error {
-	tag, err := s.db.Exec(ctx, `UPDATE kingres_cp.task SET progress = jsonb_set(progress, '{detail}', to_jsonb($3::text))
-		WHERE id = $1 AND lease_holder = $2 AND state = 'running'`, id, holder, detail)
+func (s *PGStore) SetDetail(ctx context.Context, id int64, l Lease, detail string) error {
+	tag, err := s.db.Exec(ctx, `UPDATE kingres_cp.task SET progress = jsonb_set(progress, '{detail}', to_jsonb($4::text))
+		WHERE id = $1 AND lease_holder = $2 AND lease_epoch = $3 AND state = 'running'`, id, l.Holder, l.Epoch, detail)
 	if err != nil {
 		return err
 	}

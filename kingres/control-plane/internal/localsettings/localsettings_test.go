@@ -3,6 +3,7 @@
 package localsettings
 
 import (
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"os"
@@ -197,5 +198,29 @@ func TestRefusalsChangeNothing(t *testing.T) {
 	}
 	if lv.Level() != slog.LevelInfo {
 		t.Error("the level was applied although the update failed")
+	}
+}
+
+// Defect 6: the optional directories are always in the answer, null when the
+// server uses the default, so that a client can type them as string or null.
+func TestAnswerAlwaysNamesTheOptionalDirectories(t *testing.T) {
+	fi := &fakeInst{s: instance.ManagedSettings{Port: 5433}}
+	m, _ := newManager(t, fi, t.TempDir())
+	got, err := m.Get()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(got.DataPaths)
+	var raw map[string]any
+	_ = json.Unmarshal(b, &raw)
+	for _, k := range []string{"walDirectory", "logDirectory"} {
+		if v, ok := raw[k]; !ok || v != nil {
+			t.Errorf("%s = %v (present %v), want an explicit null", k, v, ok)
+		}
+	}
+	fi.s.LogDirectory = "/var/log/pg"
+	got, _ = m.Get()
+	if got.DataPaths.LogDirectory == nil || *got.DataPaths.LogDirectory != "/var/log/pg" {
+		t.Errorf("logDirectory = %v", got.DataPaths.LogDirectory)
 	}
 }

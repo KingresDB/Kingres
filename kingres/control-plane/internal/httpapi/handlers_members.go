@@ -63,6 +63,36 @@ func pinOf(r *http.Request, body *string) (string, error) {
 	return fp[0], nil
 }
 
+// mergePins combines the pin forwarded with a request and the pin in its body.
+func mergePins(forwarded string, body *string) (string, error) {
+	if deref(body) == "" {
+		return forwarded, nil
+	}
+	fp := pki.NormalizeFingerprint(*body)
+	switch {
+	case fp == "":
+		return "", problem.Validation("The pinned fingerprint is invalid.",
+			problem.FieldError{Field: "/expectedFingerprint", Message: "must be a SHA-256 fingerprint in hex, with or without colons", Code: "pattern"})
+	case forwarded != "" && forwarded != fp:
+		return "", problem.Validation("The pinned fingerprint is given twice, differently.",
+			problem.FieldError{Field: "/expectedFingerprint", Message: "differs from the pin the request was forwarded with", Code: "invalid"})
+	}
+	return fp, nil
+}
+
+// requirePin refuses a first contact that would trust whatever certificate
+// answers, unless the administrator said so (CP2-05): the password of the
+// administrator (join) or the setup token and a certificate of the cluster
+// (addServer) would go to a machine that was never authenticated.
+func requirePin(pin string, allowUnpinned *bool) error {
+	if pin != "" || (allowUnpinned != nil && *allowUnpinned) {
+		return nil
+	}
+	return problem.Validation("The certificate of the other server must be pinned.",
+		problem.FieldError{Field: "/expectedFingerprint", Code: "required",
+			Message: "give the SHA-256 fingerprint of the other server's certificate, or set allowUnpinned to true to trust whatever answers"})
+}
+
 func deref(s *string) string {
 	if s == nil {
 		return ""
@@ -92,6 +122,9 @@ func (s *Server) joinCluster(c *call, w http.ResponseWriter, r *http.Request) er
 	if err != nil {
 		return err
 	}
+	if err := requirePin(pin, req.AllowUnpinned); err != nil {
+		return err
+	}
 	if !s.deps.SetupService.Joinable() {
 		return problem.New(problem.OperationInProgress, "A setup task is already running on this server.")
 	}
@@ -111,6 +144,10 @@ func (s *Server) joinCluster(c *call, w http.ResponseWriter, r *http.Request) er
 
 func (s *Server) needMembers() (Members, error) {
 	if s.deps.Members == nil {
+		if s.deps.InternalAPIDisabled {
+			return nil, problem.New(problem.InternalAPIDisabled,
+				"This server was started without its internal API (no internal-listen address), so it cannot add, remove or leave servers; start it with one.")
+		}
 		return nil, problem.New(problem.UnsupportedOp, "This server cannot add or remove servers (no internal API or instance management).")
 	}
 	return s.deps.Members, nil
@@ -125,10 +162,18 @@ func (s *Server) addServer(c *call, w http.ResponseWriter, r *http.Request) erro
 	if err := s.body(w, r, &req); err != nil {
 		return err
 	}
-	pin := ""
+	// On the leader of a forwarded request the header is not there: the server that
+	// received it forwarded the one normalized pin (see forwardPin); the body is
+	// read as well, and a pin that differs between the two is refused.
+	var pin string
 	if f := forwardedOf(r); f != nil {
-		pin = f.pin
+		if pin, err = mergePins(f.pin, req.ExpectedFingerprint); err != nil {
+			return err
+		}
 	} else if pin, err = pinOf(r, req.ExpectedFingerprint); err != nil {
+		return err
+	}
+	if err := requirePin(pin, req.AllowUnpinned); err != nil {
 		return err
 	}
 	t, err := m.AddServer(r.Context(), c.session.Username, req, pin)

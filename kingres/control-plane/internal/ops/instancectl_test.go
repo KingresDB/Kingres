@@ -132,3 +132,36 @@ func TestDownFollowsTheProcess(t *testing.T) {
 		t.Error("an Ops without an instance manager must not gate anything")
 	}
 }
+
+// Defect 4: from the moment a stop or restart is accepted every authenticated
+// operation must be answered system_database_stopped; before, the window in
+// which the database ended connections showed up as 503 service_unavailable.
+func TestStopAndRestartGateFromTheStart(t *testing.T) {
+	for _, op := range []string{"stop", "restart"} {
+		f := &lifeFake{running: true}
+		o := &Ops{Instances: f, Log: slog.New(slog.DiscardHandler)}
+		if o.LocalInstanceDown() {
+			t.Fatal("a running instance is not down")
+		}
+		undo, err := o.beginOp(context.Background(), op)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !o.LocalInstanceDown() {
+			t.Errorf("%s accepted but the instance is not reported down", op)
+		}
+		undo()
+		if o.LocalInstanceDown() {
+			t.Errorf("%s undone but the instance is still reported down", op)
+		}
+	}
+	// The restart ends: the gate opens again.
+	o := &Ops{Instances: &lifeFake{running: true}, Log: slog.New(slog.DiscardHandler)}
+	if _, err := o.beginOp(context.Background(), "restart"); err != nil {
+		t.Fatal(err)
+	}
+	o.life.clearIf(StateRestarting)
+	if o.LocalInstanceDown() {
+		t.Error("the gate stayed closed after the restart")
+	}
+}

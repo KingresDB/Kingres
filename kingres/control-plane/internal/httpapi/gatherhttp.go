@@ -29,7 +29,7 @@ import (
 // (each with its own deadline), merges the answers with its own and names the
 // servers that did not answer (`partial`, `missingServers`). The answering
 // server runs the same operation through the same pipeline, with the identity the
-// asking server vouches for: the role is derived again from the answering
+// leader's assertion vouches for: the role is derived again from the answering
 // server's own catalog (CP-07), so a server cannot ask for more than the caller
 // may read. Paging uses keyset cursors over one total order, so a page boundary
 // is the same whichever servers answered.
@@ -59,7 +59,7 @@ func gatheredOf(r *http.Request) *gathered {
 }
 
 // The operations a server may ask another to run in the cluster-wide mode.
-var gatherable = map[string]bool{"listLogs": true, "listAlerts": true, "queryMetrics": true, "acknowledgeAlert": true}
+var gatherable = map[string]bool{"listLogs": true, "listAlerts": true, "queryMetrics": true, "acknowledgeAlert": true, "listAuditEvents": true}
 
 const (
 	// maxGatherAnswer bounds what one server may answer to a gather call.
@@ -130,7 +130,7 @@ func (s *Server) askAll(c *call, r *http.Request, op string, peers []gather.Peer
 	g := s.deps.Gatherer
 	base := internalapi.ForwardRequest{
 		OperationID: op, Query: r.URL.RawQuery, RequestID: stateOf(r).id, SourceAddress: c.ip, Source: "panel",
-		Identity: internalapi.ForwardIdentity{Username: c.session.Username, ClusterRoles: c.session.ClusterRoles},
+		Identity: identityOf(c.session),
 	}
 	return gather.Fanout(r.Context(), peers, s.gatherTimeout(), func(ctx context.Context, p gather.Peer) ([]byte, error) {
 		req := base
@@ -205,10 +205,14 @@ func (s *Server) parseLogFilter(r *http.Request) (logFilter, *problem.Problem) {
 
 // localRankedLogs reads the log of this server's instance, filters and ranks it.
 func (s *Server) localRankedLogs(r *http.Request, f logFilter, self *string) ([]gather.RankedLog, error) {
-	if s.deps.LogDir == "" || f.limit < 0 {
+	var dir string
+	if s.deps.LogDir != nil {
+		dir = s.deps.LogDir()
+	}
+	if dir == "" || f.limit < 0 {
 		return nil, nil
 	}
-	all, err := serverinfo.ReadLogs(s.deps.LogDir, self, 1)
+	all, err := serverinfo.ReadLogs(dir, self, 1)
 	if err != nil {
 		s.log.Error("reading the instance log", "request_id", stateOf(r).id, "error", err)
 		return nil, problem.New(problem.InternalError, "The log could not be read.")
@@ -486,7 +490,7 @@ func (s *Server) acknowledgeAlert(c *call, w http.ResponseWriter, r *http.Reques
 		resp, err := s.deps.Gatherer.Ask(ctx, p.ID, internalapi.ForwardRequest{
 			OperationID: "acknowledgeAlert", PathParams: map[string]string{"alertId": strconv.FormatInt(local, 10)},
 			RequestID: stateOf(r).id, SourceAddress: c.ip, Source: "panel", Ordinal: p.Ordinal,
-			Identity: internalapi.ForwardIdentity{Username: c.session.Username, ClusterRoles: c.session.ClusterRoles},
+			Identity: identityOf(c.session),
 		}, maxGatherAnswer)
 		if err != nil {
 			return problem.New(problem.ServiceUnavailable, "The server that holds this alert cannot be reached.").WithRetryAfter(5)

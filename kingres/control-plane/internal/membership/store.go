@@ -175,3 +175,19 @@ func (m *Manager) memoryQuota(ctx context.Context) int {
 	})
 	return mb
 }
+
+// IsMember tells whether a server is a member of the cluster as the manager
+// leader's catalog records it: active, or being removed (it must still be able
+// to ask how its removal went). A server that was given a certificate but has
+// not been admitted yet (pending) is not a member: its certificate shows that
+// the cluster meant to add it, not that it may act in the cluster.
+func (m *Manager) IsMember(ctx context.Context, id string) (bool, error) {
+	row, err := m.getServer(ctx, id)
+	switch {
+	case errors.Is(err, errNoServer):
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+	return row.Status == StatusActive || row.Status == StatusRemoving, nil
+}

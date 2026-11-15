@@ -469,3 +469,11 @@ func (c Config) ListenIsLoopback() bool {
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
 }
+
+// PlaintextOnNetwork reports whether the REST API is served without TLS on an
+// address that other machines can reach. Passwords and bearer tokens then cross
+// the network in clear text (CP2-21); kingresd starts anyway, because a TLS
+// terminating proxy in front of it is a valid set-up, but says so at every start.
+func (c Config) PlaintextOnNetwork() bool {
+	return c.TLSCertFile == "" && !c.ListenIsLoopback()
+}

@@ -90,7 +90,17 @@ type Task struct {
 	UpdatedAt       time.Time
 	CreatedBy       string
 	Holder          string
-	LeaseExpires    time.Time
+	// Epoch is the fencing token of the lease: it grows with every claim, so a
+	// run that lost its lease is told apart from the run that holds it now.
+	Epoch        int64
+	LeaseExpires time.Time
+}
+
+// Lease names who holds a task and in which epoch. A store accepts a write of
+// a task only from the holder in the current epoch.
+type Lease struct {
+	Holder string
+	Epoch  int64
 }
 
 // DoneSteps is the number of leading steps that are done.
@@ -128,11 +138,12 @@ type Env struct {
 	Task    Task
 	secrets map[string]string
 	eng     *Engine
+	lease   Lease
 }
 
 // DetailStore is implemented by stores that can keep a task's Detail.
 type DetailStore interface {
-	SetDetail(ctx context.Context, id int64, holder, detail string) error
+	SetDetail(ctx context.Context, id int64, l Lease, detail string) error
 }
 
 // SetDetail records free text on the task (see Task.Detail); a store without
@@ -149,8 +160,13 @@ func (e *Env) SetDetail(ctx context.Context, detail string) error {
 		detail = detail[:2000]
 	}
 	e.Task.Detail = detail
-	return ds.SetDetail(ctx, e.Task.ID, e.eng.holder, detail)
+	return ds.SetDetail(ctx, e.Task.ID, e.lease, detail)
 }
+
+// Fence returns the fencing token of this run (the lease epoch). A step that
+// calls another server for a non-idempotent effect can send it along, so that
+// the other side refuses a call of a run that lost its lease meanwhile.
+func (e *Env) Fence() int64 { return e.lease.Epoch }
 
 // Secret returns a secret handed to this run, or false (after a restart the
 // secrets are gone).
@@ -202,26 +218,35 @@ func (d Definition) steps(input json.RawMessage) ([]Step, error) {
 	return d.Steps, nil
 }
 
-// Store persists tasks. Every method that changes a task named by a holder
-// checks the holder, so a leader that lost its lease cannot write.
+// Store persists tasks. Every method that changes a task named by a lease
+// checks the holder and the epoch, so a leader that lost its lease cannot write.
+//
+// All lease arithmetic (the expiry written by a claim or a renewal, the test
+// whether a lease has expired) is done with the clock of the store (the
+// database's), never with the clock of the calling server: servers whose
+// clocks differ must agree on whether a lease is still valid.
 type Store interface {
 	// Create inserts a pending task or returns ErrSubjectBusy.
 	Create(ctx context.Context, t Task) (Task, error)
 	// Get returns a task.
 	Get(ctx context.Context, id int64) (Task, error)
 	// Claim takes the oldest pending task, or a running task whose lease has
-	// expired at now, for holder until now+lease. nil when none is available.
-	Claim(ctx context.Context, holder string, now time.Time, lease time.Duration) (*Task, error)
+	// expired, for holder for the length of lease, and increments the epoch.
+	// nil when none is available.
+	Claim(ctx context.Context, holder string, lease time.Duration) (*Task, error)
 	// ClaimID claims one specific task the same way.
-	ClaimID(ctx context.Context, id int64, holder string, now time.Time, lease time.Duration) (*Task, error)
-	// Renew extends the lease.
-	Renew(ctx context.Context, id int64, holder string, now time.Time, lease time.Duration) error
+	ClaimID(ctx context.Context, id int64, holder string, lease time.Duration) (*Task, error)
+	// Renew extends the lease to lease from now.
+	Renew(ctx context.Context, id int64, l Lease, lease time.Duration) error
 	// SetStep records the state of step i and the progress; it returns
-	// whether cancellation was requested.
-	SetStep(ctx context.Context, id int64, holder string, i int, state string, percent float64, now time.Time) (cancel bool, err error)
+	// whether cancellation was requested. Marking a step StepRunning also
+	// requires that the lease has not expired: that record and the check are
+	// one atomic statement, so a holder that was paused past its lease cannot
+	// start a step another server may already have taken over.
+	SetStep(ctx context.Context, id int64, l Lease, i int, state string, percent float64) (cancel bool, err error)
 	// Finish sets the final state (Done or Failed), the error, and releases
 	// the lease.
-	Finish(ctx context.Context, id int64, holder string, state State, e *Error, now time.Time) error
+	Finish(ctx context.Context, id int64, l Lease, state State, e *Error) error
 	// RequestCancel marks a task for cancellation; a pending task is failed
 	// directly with CodeCanceled.
 	RequestCancel(ctx context.Context, id int64, now time.Time) error
@@ -239,10 +264,14 @@ type Engine struct {
 	holder  string
 	lease   time.Duration
 	poll    time.Duration
-	now     func() time.Time
-	log     *slog.Logger
-	tries   int
-	faultFn FaultFunc
+	// now is the clock of this server. It is used only to measure how long ago
+	// a lease was last confirmed by the store, never to compute an expiry.
+	now func() time.Time
+	// renewEvery replaces the renewal ticker (tests).
+	renewEvery <-chan time.Time
+	log        *slog.Logger
+	tries      int
+	faultFn    FaultFunc
 }
 
 // Options configure an Engine.
@@ -252,9 +281,12 @@ type Options struct {
 	// Lease is the lease length (default 30s); Poll the idle polling
 	// interval of Run (default 2s).
 	Lease, Poll time.Duration
-	// Now is the clock (default time.Now).
-	Now    func() time.Time
-	Logger *slog.Logger
+	// Now is the clock of this server (default time.Now); see Engine.now.
+	Now func() time.Time
+	// RenewEvery, when set, replaces the renewal ticker: one renewal per
+	// received value. Only tests use it, to drive the renewals without waiting.
+	RenewEvery <-chan time.Time
+	Logger     *slog.Logger
 	// StoreTries is how many times a store write is tried, one second apart
 	// (default 30).
 	StoreTries int
@@ -266,7 +298,7 @@ type Options struct {
 // NewEngine builds an engine. Definitions must have at least one step each.
 func NewEngine(s Store, defs []Definition, o Options) (*Engine, error) {
 	e := &Engine{store: s, defs: map[string]Definition{}, holder: o.Holder, lease: o.Lease, poll: o.Poll,
-		now: o.Now, log: o.Logger, tries: o.StoreTries, faultFn: o.Fault}
+		now: o.Now, log: o.Logger, tries: o.StoreTries, faultFn: o.Fault, renewEvery: o.RenewEvery}
 	if e.holder == "" {
 		return nil, errors.New("task: a holder id is required")
 	}
@@ -325,25 +357,27 @@ func (e *Engine) Submit(ctx context.Context, kind string, subj Subject, input an
 // with the given in-memory secrets (they are dropped when the run ends). It
 // is how a request that carries a password starts its task.
 func (e *Engine) RunNow(ctx context.Context, id int64, secrets map[string]string) error {
-	t, err := e.store.ClaimID(ctx, id, e.holder, e.now(), e.lease)
+	started := e.now()
+	t, err := e.store.ClaimID(ctx, id, e.holder, e.lease)
 	if err != nil {
 		return err
 	}
 	if t == nil {
 		return nil // somebody else runs it
 	}
-	return e.run(ctx, *t, secrets)
+	return e.run(ctx, *t, started, secrets)
 }
 
 // RunOnce claims and runs one available task. It reports whether it ran one.
 func (e *Engine) RunOnce(ctx context.Context) (bool, error) {
 	e.claimMu.RLock()
-	t, err := e.store.Claim(ctx, e.holder, e.now(), e.lease)
+	started := e.now()
+	t, err := e.store.Claim(ctx, e.holder, e.lease)
 	e.claimMu.RUnlock()
 	if err != nil || t == nil {
 		return false, err
 	}
-	return true, e.run(ctx, *t, nil)
+	return true, e.run(ctx, *t, started, nil)
 }
 
 // Run polls for tasks until ctx ends.
@@ -374,7 +408,18 @@ func (e *Engine) Cancel(ctx context.Context, id int64) error {
 // Get returns a task.
 func (e *Engine) Get(ctx context.Context, id int64) (Task, error) { return e.store.Get(ctx, id) }
 
-func (e *Engine) run(ctx context.Context, t Task, secrets map[string]string) error {
+// leaseOf is the lease this engine holds on t, as the store handed it out.
+func (e *Engine) leaseOf(t Task) Lease { return Lease{Holder: e.holder, Epoch: t.Epoch} }
+
+// leaseMargin is the part of the lease that is kept in reserve: a run stops its
+// step this long before the lease it last confirmed would expire.
+func (e *Engine) leaseMargin() time.Duration { return e.lease / 3 }
+
+// run executes the task. started is the time on this server's clock before the
+// claim was sent to the store: the lease is valid at most until started+lease
+// by this clock (the store's expiry is measured from a later moment), so
+// counting from it is the safe side.
+func (e *Engine) run(ctx context.Context, t Task, started time.Time, secrets map[string]string) error {
 	def, ok := e.def(t.Kind)
 	if !ok {
 		return e.finish(ctx, t, Failed, &Error{Code: CodeUnknownKind, Message: "No definition for task kind " + t.Kind + "."})
@@ -384,22 +429,27 @@ func (e *Engine) run(ctx context.Context, t Task, secrets map[string]string) err
 		return e.finish(ctx, t, Failed, &Error{Code: CodeStepFailed, Message: "The steps of the task cannot be built."})
 	}
 	def.Steps = steps
-	env := &Env{Task: t, secrets: secrets, eng: e}
-	// The lease is renewed in the background while a step runs. A lost lease
-	// cancels the step's context.
+	env := &Env{Task: t, secrets: secrets, eng: e, lease: e.leaseOf(t)}
+	// The lease is renewed in the background while a step runs. A lost lease,
+	// and a lease that could not be renewed for so long that it may have
+	// expired for the store, cancel the step's context: a leader that cannot
+	// reach the store stops working instead of running on while another server
+	// takes the task over.
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	guard := newLeaseGuard(e, cancel, started.Add(e.lease-e.leaseMargin()))
+	defer guard.stop()
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		e.renewLoop(runCtx, cancel, t.ID)
+		e.renewLoop(runCtx, guard, env.lease, t.ID)
 	}()
 	defer wg.Wait()
 	defer cancel()
 
 	for i := t.DoneSteps(); i < len(def.Steps); i++ {
-		if runCtx.Err() != nil {
+		if runCtx.Err() != nil || guard.expired() {
 			return runCtx.Err() // lease lost or shutdown: the next leader resumes here
 		}
 		st := def.Steps[i]
@@ -414,7 +464,7 @@ func (e *Engine) run(ctx context.Context, t Task, secrets map[string]string) err
 					Message: "The step needs a secret that is only available to the request that started the task."})
 			}
 		}
-		if cancelReq, err := e.setStep(ctx, t.ID, e.holder, i, StepRunning, percent(i, len(def.Steps)), e.now()); err != nil {
+		if cancelReq, err := e.setStep(runCtx, t, i, StepRunning, percent(i, len(def.Steps))); err != nil {
 			return err
 		} else if cancelReq {
 			return e.cancelTask(ctx, t, def, i)
@@ -430,7 +480,7 @@ func (e *Engine) run(ctx context.Context, t Task, secrets map[string]string) err
 			return e.fail(ctx, t, i, st, &Error{Code: CodeStepFailed, Step: st.Name, Retryable: true, Message: clip(err.Error())})
 		}
 		e.fault(FaultStepRan, t.ID, i)
-		cancelReq, err := e.setStep(ctx, t.ID, e.holder, i, StepDone, percent(i+1, len(def.Steps)), e.now())
+		cancelReq, err := e.setStep(ctx, t, i, StepDone, percent(i+1, len(def.Steps)))
 		if err != nil {
 			return err
 		}
@@ -445,23 +495,74 @@ func (e *Engine) run(ctx context.Context, t Task, secrets map[string]string) err
 	return err
 }
 
-func (e *Engine) renewLoop(ctx context.Context, cancel context.CancelFunc, id int64) {
-	tick := time.NewTicker(e.lease / 3)
-	defer tick.Stop()
+// leaseGuard cancels a run whose lease may have expired. validUntil is the
+// last moment, by the engine's clock, at which the lease is known to hold; a
+// successful renewal moves it forward. The timer covers a store call that
+// does not return.
+type leaseGuard struct {
+	e      *Engine
+	cancel context.CancelFunc
+	mu     sync.Mutex
+	until  time.Time
+	timer  *time.Timer
+}
+
+func newLeaseGuard(e *Engine, cancel context.CancelFunc, until time.Time) *leaseGuard {
+	g := &leaseGuard{e: e, cancel: cancel, until: until}
+	g.timer = time.AfterFunc(until.Sub(e.now()), g.fire)
+	return g
+}
+
+func (g *leaseGuard) fire() {
+	g.e.log.Warn("task lease not confirmed in time; stopping the step")
+	g.cancel()
+}
+
+// renewed records a renewal that the store accepted; started is the time on
+// the engine's clock before the renewal was sent.
+func (g *leaseGuard) renewed(started time.Time) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.until = started.Add(g.e.lease - g.e.leaseMargin())
+	g.timer.Reset(g.until.Sub(g.e.now()))
+}
+
+func (g *leaseGuard) expired() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return !g.e.now().Before(g.until)
+}
+
+func (g *leaseGuard) stop() { g.timer.Stop() }
+
+func (e *Engine) renewLoop(ctx context.Context, g *leaseGuard, l Lease, id int64) {
+	tick := e.renewEvery
+	if tick == nil {
+		t := time.NewTicker(e.lease / 3)
+		defer t.Stop()
+		tick = t.C
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-tick.C:
+		case <-tick:
 			e.fault(FaultLeaseRenew, id, -1)
-			if err := e.store.Renew(ctx, id, e.holder, e.now(), e.lease); err != nil {
+			started := e.now()
+			if err := e.store.Renew(ctx, id, l, e.lease); err != nil {
 				if errors.Is(err, ErrLeaseLost) || errors.Is(err, ErrNotFound) {
 					e.log.Warn("task lease lost", "task", id)
-					cancel()
+					g.cancel()
 					return
 				}
 				e.log.Error("renewing task lease", "task", id, "error", err)
+				if g.expired() {
+					g.fire()
+					return
+				}
+				continue
 			}
+			g.renewed(started)
 		}
 	}
 }
@@ -484,7 +585,7 @@ func (e *Engine) cancelTask(ctx context.Context, t Task, def Definition, next in
 
 func (e *Engine) fail(ctx context.Context, t Task, i int, st Step, te *Error) error {
 	if i < len(t.Steps) {
-		if _, err := e.setStep(ctx, t.ID, e.holder, i, StepFailed, percent(i, len(t.Steps)), e.now()); err != nil {
+		if _, err := e.setStep(ctx, t, i, StepFailed, percent(i, len(t.Steps))); err != nil {
 			e.log.Error("recording failed step", "task", t.ID, "error", err)
 		}
 	}
@@ -504,16 +605,16 @@ func (e *Engine) onFail(ctx context.Context, t Task) {
 
 func (e *Engine) finish(ctx context.Context, t Task, s State, te *Error) error {
 	c := context.WithoutCancel(ctx)
-	return e.retry(c, func() error { return e.store.Finish(c, t.ID, e.holder, s, te, e.now()) })
+	return e.retry(c, func() error { return e.store.Finish(c, t.ID, e.leaseOf(t), s, te) })
 }
 
 // setStep records a step state, retrying while the store is briefly
 // unavailable (a task may restart the very instance that holds its row).
-func (e *Engine) setStep(ctx context.Context, id int64, holder string, i int, state string, pct float64, now time.Time) (bool, error) {
+func (e *Engine) setStep(ctx context.Context, t Task, i int, state string, pct float64) (bool, error) {
 	var cancel bool
 	err := e.retry(ctx, func() error {
 		var err error
-		cancel, err = e.store.SetStep(ctx, id, holder, i, state, pct, now)
+		cancel, err = e.store.SetStep(ctx, t.ID, e.leaseOf(t), i, state, pct)
 		return err
 	})
 	return cancel, err
@@ -584,13 +685,16 @@ func (e *Engine) SubmitHeld(ctx context.Context, kind string, subj Subject, inpu
 	if err != nil {
 		return Task{}, nil, err
 	}
-	claimed, err := e.store.ClaimID(ctx, t.ID, e.holder, e.now(), e.lease)
+	started := e.now()
+	claimed, err := e.store.ClaimID(ctx, t.ID, e.holder, e.lease)
 	if err != nil {
 		return Task{}, nil, err
 	}
 	if claimed == nil {
 		return Task{}, nil, errors.New("task: the new task was claimed by someone else")
 	}
-	run := func(ctx context.Context, secrets map[string]string) error { return e.run(ctx, *claimed, secrets) }
+	run := func(ctx context.Context, secrets map[string]string) error {
+		return e.run(ctx, *claimed, started, secrets)
+	}
 	return *claimed, run, nil
 }

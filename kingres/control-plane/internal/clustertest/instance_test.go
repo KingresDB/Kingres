@@ -68,6 +68,7 @@ func TestFollowerInstanceStopAndStart(t *testing.T) {
 		st, out := follower.Do("GET", "/cluster", nil, nil)
 		return st == 503 && code(out) == "system_database_stopped"
 	})
+	stoppedState(t, c, follower)
 	// The follower answers its probes and refuses everything else, naming the cause.
 	if st, _ := follower.Do("GET", "/healthz", nil, map[string]string{"Authorization": ""}); st != 200 {
 		t.Errorf("healthz on the stopped follower: %d", st)
@@ -78,15 +79,25 @@ func TestFollowerInstanceStopAndStart(t *testing.T) {
 	if st, out := follower.Do("POST", "/roles", map[string]any{"name": "nobody1", "password": "Passw0rd-nobody1-xyz"}, nil); st != 503 || code(out) != "system_database_stopped" {
 		t.Errorf("a cluster change through the stopped follower: %d %v", st, out)
 	}
-	// The leader keeps working: reads, and a cluster change.
+	// The panel's reload: the session and the instance list are answered from memory.
+	if st, out := follower.Do("GET", "/auth/session", nil, nil); st != 200 || out["degraded"] != true || out["username"] != clustertest.AdminUser {
+		t.Errorf("getSession on the stopped follower: %d %v", st, out)
+	}
+	if st, out := follower.Do("GET", "/this-server/instances", nil, nil); st != 200 {
+		t.Errorf("listThisServerInstances on the stopped follower: %d %v", st, out)
+	} else if items, _ := out["items"].([]any); len(items) != 1 || items[0].(map[string]any)["state"] != "stopped" {
+		t.Errorf("instances of the stopped follower: %v", out)
+	}
+	// The leader keeps working: reads.
 	leader.Expect(200, "GET", "/cluster", nil)
 	servers := leader.Servers()
 	if len(servers) != 2 {
 		t.Errorf("the leader lists %d servers", len(servers))
 	}
 	t.Logf("the leader sees the stopped follower as: %v", servers[follower.Host]["status"])
-	st, out := leader.Do("POST", "/roles", map[string]any{"name": "while_down", "password": "Passw0rd-while-down-1", "clusterRoles": []string{"kingres_readonly"}}, nil)
-	t.Logf("createRole on the leader while the follower is down: %d %v", st, code(out))
+	// A change of a role on the leader ends the stale-roles shortcut of the follower
+	// (TestStoppedFollowerSessionRules), so none is made here: the start below works
+	// with the token of before the stop.
 
 	// Start it again with the token from before the stop.
 	st, start := startWhenStopped(t, c, follower, fid)
@@ -196,6 +207,19 @@ func TestLeaderInstanceStopWithAFollower(t *testing.T) {
 	})
 }
 
+// stoppedState waits until the instance manager reports the instance of the node
+// as stopped. The gate answers system_database_stopped from the moment a stop is
+// accepted, while the instance still shuts down; the state in the list is the
+// manager's, so it changes when the process is gone.
+func stoppedState(t *testing.T, c *clustertest.Cluster, n *clustertest.Node) {
+	t.Helper()
+	waitFor(t, c, "the instance to be reported stopped", 2*time.Minute, func() bool {
+		st, out := n.Do("GET", "/this-server/instances", nil, nil)
+		items, _ := out["items"].([]any)
+		return st == 200 && len(items) == 1 && items[0].(map[string]any)["state"] == "stopped"
+	})
+}
+
 // startWhenStopped asks for the start; while the shutdown is still going on the
 // answer is 409 operation_in_progress (the contract), so it asks again.
 func startWhenStopped(t *testing.T, c *clustertest.Cluster, n *clustertest.Node, id string) (int, map[string]any) {
@@ -208,4 +232,59 @@ func startWhenStopped(t *testing.T, c *clustertest.Cluster, n *clustertest.Node,
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
+}
+
+// TestStoppedFollowerSessionRules: while the instance of a follower is stopped,
+// getSession and listThisServerInstances answer from memory for a session the
+// follower checked before; a session of a role it never checked is refused, and a
+// change of a role made on the leader (role.changed reaches the stopped follower)
+// takes the shortcut away from every session.
+func TestStoppedFollowerSessionRules(t *testing.T) {
+	c := clustertest.Form(t, 2)
+	leader, follower := c.Nodes[0], c.Nodes[1]
+	fid := instanceIDOf(t, follower)
+	const pw = "Passw0rd-ro-user-1x"
+	leader.Expect(201, "POST", "/roles", map[string]any{"name": "ro_user", "password": pw, "clusterRoles": []string{"kingres_readonly"}})
+	waitFor(t, c, "the role to reach the follower", 2*time.Minute, func() bool {
+		st, _ := follower.Do("GET", "/roles/ro_user", nil, nil)
+		return st == 200
+	})
+	admin := follower.Token
+	if !follower.Login("ro_user", pw) {
+		t.Fatal("ro_user cannot sign in on the follower")
+	}
+	readonly := follower.Token // never used before the stop: this process never checked the role
+	follower.Token = admin
+
+	st, stop := follower.Do("POST", "/this-server/instances/"+fid+"/stop", nil, nil)
+	if st == 409 && code(stop) == "no_replica_available" {
+		st, stop = follower.Do("POST", "/this-server/instances/"+fid+"/stop", map[string]any{"force": true}, nil)
+	}
+	if st != 202 {
+		t.Fatalf("stop on the follower: %d %v\n%s", st, stop, c.Dump())
+	}
+	waitFor(t, c, "the follower's instance to stop", 2*time.Minute, func() bool {
+		st, out := follower.Do("GET", "/cluster", nil, nil)
+		return st == 503 && code(out) == "system_database_stopped"
+	})
+	stoppedState(t, c, follower)
+	if st, out := follower.Do("GET", "/auth/session", nil, nil); st != 200 || out["degraded"] != true {
+		t.Fatalf("getSession of the checked session: %d %v", st, out)
+	}
+	if st, out := follower.Do("GET", "/this-server/instances", nil, nil); st != 200 {
+		t.Fatalf("listThisServerInstances of the checked session: %d %v", st, out)
+	}
+	follower.Token = readonly
+	for _, p := range []string{"/auth/session", "/this-server/instances"} {
+		if st, out := follower.Do("GET", p, nil, nil); st != 503 || code(out) != "system_database_stopped" {
+			t.Errorf("%s of a session this process never checked: %d %v", p, st, out)
+		}
+	}
+	follower.Token = admin
+	// A role changed on the leader: the follower forgets every earlier check.
+	leader.Expect(201, "POST", "/roles", map[string]any{"name": "changed_while_down", "password": "Passw0rd-changed-1x", "clusterRoles": []string{"kingres_readonly"}})
+	waitFor(t, c, "the shortcut to end", time.Minute, func() bool {
+		st, out := follower.Do("GET", "/auth/session", nil, nil)
+		return st == 503 && code(out) == "system_database_stopped"
+	})
 }

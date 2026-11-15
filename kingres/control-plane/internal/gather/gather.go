@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/audit"
 )
 
 // Peer is a server that is asked: its id and its ordinal, the number that makes
@@ -324,4 +325,43 @@ func MergeAlerts(lists [][]api.Alert, after *AlertKey, limit int) ([]api.Alert, 
 		items = append(items, a)
 	}
 	return items, nil
+}
+
+// ------------------------------------------------------------------- audit
+
+// EncodeAuditCursor makes the opaque cursor of a position in the audit listing.
+func EncodeAuditCursor(p audit.Position) string {
+	return encodeCursor(cursorDoc{V: 1, Kind: "audit", T: p.Time.UnixNano(), I: p.ID})
+}
+
+// DecodeAuditCursor reads a cursor made by EncodeAuditCursor.
+func DecodeAuditCursor(s string) (audit.Position, error) {
+	d, err := decodeCursor(s, "audit")
+	if err != nil || d.I <= 0 {
+		return audit.Position{}, ErrCursor
+	}
+	return audit.Position{Time: time.Unix(0, d.T).UTC(), ID: d.I}, nil
+}
+
+// MergeAudit merges per-server lists of audit events (each with cluster-wide
+// ids) into one page of at most limit events after the cursor, newest first.
+func MergeAudit(lists [][]api.AuditEvent, after *audit.Position, limit int) ([]api.AuditEvent, *audit.Position) {
+	if limit <= 0 {
+		return []api.AuditEvent{}, nil
+	}
+	pos := func(e api.AuditEvent) audit.Position { return audit.Position{Time: e.Timestamp, ID: e.ID} }
+	var all []api.AuditEvent
+	for _, l := range lists {
+		for _, e := range l {
+			if after == nil || after.Before(pos(e)) {
+				all = append(all, e)
+			}
+		}
+	}
+	sort.SliceStable(all, func(i, j int) bool { return pos(all[i]).Before(pos(all[j])) })
+	if len(all) <= limit {
+		return append([]api.AuditEvent{}, all...), nil
+	}
+	next := pos(all[limit-1])
+	return append([]api.AuditEvent{}, all[:limit]...), &next
 }

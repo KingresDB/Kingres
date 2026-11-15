@@ -114,6 +114,11 @@ type LedgerDigest struct {
 	Chains        []LedgerDigestChain `json:"chains"`
 	AggregateHash *string             `json:"aggregateHash"`
 	Anchors       []DigestAnchor      `json:"anchors"`
+	// Complete and UncoveredShardGroupIDs (contract 0.6.0): the digest covers
+	// only the chain of the server that made it; the other shard groups of the
+	// database are named here instead of being silently left out.
+	Complete               bool    `json:"complete"`
+	UncoveredShardGroupIDs []int32 `json:"uncoveredShardGroupIds"`
 }
 
 // LedgerDigestPage is a page of digests.

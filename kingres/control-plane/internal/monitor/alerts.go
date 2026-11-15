@@ -29,7 +29,7 @@ const (
 )
 
 // Managed lists the alert kinds the checks own; others are never cleared by them.
-var Managed = []string{"serverDown", "diskSpaceLow", "memoryPressure", "replicationLagHigh", "certificateExpiring", "ledgerPendingTooOld", "versionMismatch", "certificateRenewalFailed"}
+var Managed = []string{"serverDown", "diskSpaceLow", "memoryPressure", "replicationLagHigh", "certificateExpiring", "ledgerPendingTooOld", "versionMismatch", "certificateRenewalFailed", "replicationPending"}
 
 // Readings are the inputs of the checks; nil means "not measured", which
 // neither raises nor clears an alert.
@@ -47,6 +47,11 @@ type Readings struct {
 	// means that no database has a queue).
 	LedgerChecked bool
 	LedgerPending []LedgerPendingReading
+	// ReplicationChecked says that Replication was read (an empty list then
+	// means that no server is behind); Now is the time of the reading.
+	ReplicationChecked bool
+	Replication        []ReplicationReading
+	Now                time.Time
 	// LedgerMaxAge is the age that raises ledgerPendingTooOld (0: LedgerPendingMaxAge).
 	LedgerMaxAge time.Duration
 }
@@ -92,6 +97,10 @@ func Evaluate(r Readings) (conds []Condition, evaluated map[string]bool) {
 	if r.LedgerChecked {
 		evaluated["ledgerPendingTooOld"] = true
 		conds = append(conds, r.ledgerConditions()...)
+	}
+	if r.ReplicationChecked {
+		evaluated["replicationPending"] = true
+		conds = append(conds, r.replicationConditions()...)
 	}
 	return conds, evaluated
 }
@@ -159,7 +168,7 @@ var titles = map[string]string{
 	"serverDown": "Server down", "diskSpaceLow": "Disk space low", "memoryPressure": "Memory pressure",
 	"replicationLagHigh": "Replication lag high", "certificateExpiring": "Certificate expiring",
 	"ledgerPendingTooOld": "Ledger entries pending for too long", "versionMismatch": "KingresDB versions differ",
-	"certificateRenewalFailed": "Certificate renewal failed",
+	"certificateRenewalFailed": "Certificate renewal failed", "replicationPending": "A server is behind on role and grant changes",
 }
 
 func scanAlert(r pgx.Row) (api.Alert, error) {

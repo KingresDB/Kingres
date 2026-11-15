@@ -5,6 +5,7 @@ package membership
 import (
 	"context"
 	"errors"
+	"strconv"
 
 	"github.com/jackc/pgx/v5"
 
@@ -107,4 +108,22 @@ func (m *Manager) leaderFacts(ctx context.Context, id string) (removalFacts, err
 			WHERE subject_type = 'server' AND subject_id = $1 AND state IN ('pending', 'running', 'paused'))`, id).Scan(&f.OperationRunning)
 	})
 	return f, err
+}
+
+// InstanceBelongsTo tells whether the instance with this id in the shard catalog
+// is one of the server's (what a peer that records the task of an instance
+// must prove, CP2-20).
+func (m *Manager) InstanceBelongsTo(ctx context.Context, instanceID, server string) (bool, error) {
+	id, err := strconv.ParseInt(instanceID, 10, 32)
+	if err != nil {
+		return false, nil
+	}
+	c, err := m.Svc.ServiceConn(ctx, catalogDB)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	var own bool
+	err = c.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM kingres.node WHERE node_id = $1 AND host = $2)`, id, server).Scan(&own)
+	return own, err
 }

@@ -113,7 +113,7 @@ func TestLeaderChecksTheForwardedIdentityAgain(t *testing.T) {
 			r.OperationID = "restartThisServerInstance"
 			r.PathParams = map[string]string{"instanceId": "1"}
 		},
-		"a read that is not leader-bound": func(r *internalapi.ForwardRequest) { r.OperationID = "listDatabases" },
+		"a read that is not leader-bound": func(r *internalapi.ForwardRequest) { r.OperationID = "listRoles" },
 		"unknown cluster role":            func(r *internalapi.ForwardRequest) { r.Identity.ClusterRoles = []string{"superuser"} },
 		"no user":                         func(r *internalapi.ForwardRequest) { r.Identity.Username = "" },
 		"missing path parameter":          func(r *internalapi.ForwardRequest) { r.OperationID = "deleteRole" },
@@ -196,7 +196,7 @@ func TestForwardedAuditKeepsForwardedByWhenTheHandlerSetsDetails(t *testing.T) {
 	leader.testUser([]string{auth.RoleAdmin})
 	follower := newEnv(t, func(d *Deps) { d.Forwarder = fw })
 	follower.initialize()
-	body := map[string]any{"address": "db9.example.com:8091", "setupToken": "tok"}
+	body := map[string]any{"address": "db9.example.com:8091", "setupToken": "tok", "allowUnpinned": true}
 	w := follower.do(req{method: "POST", path: "/api/v1/servers", bearer: follower.token(auth.RoleAdmin), body: body})
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("addServer through the follower: %d %s", w.Code, w.Body.String())

@@ -58,6 +58,8 @@ type Postgres struct {
 	mu      sync.RWMutex
 	base    *pgx.ConnConfig
 	timeout time.Duration
+	// verifierSource reads stored password verifiers (see SetVerifierSource).
+	verifierSource func(ctx context.Context, username string) (string, error)
 }
 
 // NewPostgres builds an authenticator from the DSN of the local instance.

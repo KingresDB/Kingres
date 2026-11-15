@@ -4,6 +4,7 @@ package instance_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -242,5 +243,36 @@ func TestStartRecreatesTheSocketDirectory(t *testing.T) {
 	}
 	if st, err := os.Stat(sock); err != nil || st.Mode().Perm() != 0o700 {
 		t.Errorf("socket directory after start: %v %v", st, err)
+	}
+}
+
+// CP2-17: the log directory is the one of the managed settings, so that moving
+// it through updateThisServerSettings does not blind the log reads.
+func TestLogDirFollowsTheManagedSettings(t *testing.T) {
+	bin := t.TempDir()
+	for _, n := range []string{"initdb", "pg_ctl"} {
+		if err := os.WriteFile(filepath.Join(bin, n), []byte("x"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m, err := instance.New(instance.Options{Root: t.TempDir(), BinDir: bin})
+	if err != nil {
+		t.Skipf("cannot construct a manager here: %v", err) // running as root
+	}
+	data, _ := m.DataDir(3)
+	if got, err := m.LogDir(3); err != nil || got != filepath.Join(data, "log") {
+		t.Errorf("default log dir = %q, %v", got, err)
+	}
+	dir, _ := m.Dir(3)
+	moved := filepath.Join(t.TempDir(), "pglog")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	text, _ := json.Marshal(instance.ManagedSettings{Port: 56000, LogDirectory: moved})
+	if err := os.WriteFile(filepath.Join(dir, instance.SettingsFile), text, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := m.LogDir(3); err != nil || got != moved {
+		t.Errorf("log dir after the move = %q, %v; want %q", got, err, moved)
 	}
 }

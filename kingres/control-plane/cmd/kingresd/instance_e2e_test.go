@@ -73,7 +73,7 @@ func TestInstanceStopStartEndToEnd(t *testing.T) {
 
 	// The API keeps answering from this process; everything that needs the
 	// system database says why.
-	for _, rq := range [][2]string{{"GET", "/cluster"}, {"GET", "/auth/session"}, {"GET", "/this-server/settings"}, {"GET", "/tasks"}, {"POST", "/this-server/instances/1/stop"}, {"POST", "/this-server/instances/1/restart"}} {
+	for _, rq := range [][2]string{{"GET", "/cluster"}, {"GET", "/this-server/instances/1"}, {"GET", "/this-server/settings"}, {"GET", "/tasks"}, {"POST", "/this-server/instances/1/stop"}, {"POST", "/this-server/instances/1/restart"}} {
 		st, out, h := e.call(rq[0], rq[1], nil, nil)
 		if st != 503 || problemCode(out) != "system_database_stopped" {
 			t.Errorf("%s %s while stopped: %d %v", rq[0], rq[1], st, out)
@@ -81,6 +81,19 @@ func TestInstanceStopStartEndToEnd(t *testing.T) {
 		if h.Get("Content-Type") != "application/problem+json" {
 			t.Errorf("content type %q", h.Get("Content-Type"))
 		}
+	}
+	// The reload of a panel: the session and the instance list come from memory (contract 0.6.0).
+	if st, out, _ := e.call("GET", "/auth/session", nil, nil); st != 200 || out["degraded"] != true || out["username"] != adminUser {
+		t.Errorf("getSession while stopped: %d %v", st, out)
+	} else {
+		valid(t, "getSession", "200", out)
+	}
+	if st, out, _ := e.call("GET", "/this-server/instances", nil, nil); st != 200 {
+		t.Errorf("listThisServerInstances while stopped: %d %v", st, out)
+	} else if items, _ := out["items"].([]any); len(items) != 1 || items[0].(map[string]any)["state"] != "stopped" {
+		t.Errorf("instances while stopped: %v", out)
+	} else {
+		valid(t, "listThisServerInstances", "200", out)
 	}
 	if st, out, _ := e.anon().call("POST", "/auth/login", map[string]any{"username": adminUser, "password": adminPass}, nil); st != 503 || problemCode(out) != "system_database_stopped" {
 		t.Errorf("login while stopped: %d %v", st, out)
@@ -276,6 +289,7 @@ func TestLocalSettingsEndToEnd(t *testing.T) {
 	if got := show(); got != "256MB" {
 		t.Errorf("before the restart shared_buffers = %s, want the old value", got)
 	}
+	restartedAt := time.Now().Add(-2 * time.Second)
 	e.mustTask(t, "POST", "/this-server/instances/1/restart", nil)
 	e.waitUntil(t, "the restart", time.Minute, func() bool { st, _, _ := e.call("GET", "/cluster", nil, nil); return st == 200 })
 	if s := get(); s["restartRequired"] != false || quota(s) != 2048 {
@@ -288,9 +302,22 @@ func TestLocalSettingsEndToEnd(t *testing.T) {
 		ents, _ := os.ReadDir(logDir)
 		return len(ents) > 0
 	})
+	// CP2-17: the log is read from the moved directory, which only holds what the instance
+	// wrote since the restart; the old directory has older entries.
+	entries, _ := e.expect(t, 200, "GET", "/this-server/logs?limit=500", nil)["items"].([]any)
+	if len(entries) == 0 {
+		t.Error("the log of the moved directory is empty")
+	}
+	for _, it := range entries {
+		ts, err := time.Parse(time.RFC3339Nano, it.(map[string]any)["timestamp"].(string))
+		if err != nil || ts.Before(restartedAt) {
+			t.Errorf("an entry of the old log directory is listed: %v (%v)", it, err)
+			break
+		}
+	}
 	// null selects the system default again.
 	s = patch(map[string]any{"logDirectory": nil, "memoryQuota": map[string]any{"totalMegabytes": 1024}})
-	if _, has := s["dataPaths"].(map[string]any)["logDirectory"]; has || s["restartRequired"] != true {
+	if v, has := s["dataPaths"].(map[string]any)["logDirectory"]; !has || v != nil || s["restartRequired"] != true {
 		t.Errorf("default log directory: %v", s)
 	}
 	e.mustTask(t, "POST", "/this-server/instances/1/restart", nil)

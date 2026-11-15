@@ -351,8 +351,14 @@ func (o *Ops) endSessionsLocal(ctx context.Context, role string) {
 
 // roleChanged ends the sessions of a changed role here and, as the leader, on
 // every other server (after the change reached them). A server that cannot be
-// reached is not waited for: it re-checks every role within a few seconds
-// (auth.Revalidator), so the worst case is that bound.
+// reached is not waited for here, and the "few seconds" of auth.Revalidator
+// does NOT bound it: that server asks its own PostgreSQL, which still has the
+// old role until the replicate.apply task of replicate reaches it. Until then
+// the role keeps working there (CP2-07). The task never gives up, and the
+// monitor raises the alert replicationPending for every server it waits for
+// (monitor.ReadReplication), so that an operator sees the exposure and can
+// stop the server or cut it off. Only after the task applied the change does
+// the revalidator end the sessions within its few seconds.
 func (o *Ops) roleChanged(ctx context.Context, role string) {
 	o.endSessionsLocal(ctx, role)
 	if o.Fanout == nil {
@@ -360,7 +366,7 @@ func (o *Ops) roleChanged(ctx context.Context, role string) {
 	}
 	for _, s := range o.others(ctx) {
 		if err := o.Fanout.Apply(ctx, s.ID, ApplyRoleChanged, roleDrop{Name: role}); err != nil {
-			o.Log.Warn("telling a server that a role changed failed; it re-checks roles on its own", "server", s.ID, "error", err)
+			o.Log.Warn("telling a server that a role changed failed; its sessions end when the replication task reaches it", "server", s.ID, "error", err)
 		}
 	}
 }

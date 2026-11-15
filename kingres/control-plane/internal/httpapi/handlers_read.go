@@ -4,6 +4,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"time"
 
@@ -126,6 +127,18 @@ func (s *Server) getReplicationTopology(_ *call, w http.ResponseWriter, r *http.
 // localInstances returns the instances of the server this node runs on; the
 // list is empty when the node is not in the catalog.
 func (s *Server) localInstances(r *http.Request) ([]api.Instance, error) {
+	if s.deps.Ops != nil && s.deps.Ops.LocalInstanceDown() {
+		return s.instancesFromMemory(r)
+	}
+	items, err := s.readLocalInstances(r)
+	if err == nil {
+		cp := append([]api.Instance(nil), items...)
+		s.inst.last.Store(&cp)
+	}
+	return items, err
+}
+
+func (s *Server) readLocalInstances(r *http.Request) ([]api.Instance, error) {
 	id, err := s.deps.Store.LocalServerID(r.Context())
 	if err != nil {
 		if isNotFound(err) {
@@ -140,10 +153,20 @@ func (s *Server) localInstances(r *http.Request) ([]api.Instance, error) {
 	return nonNil(srv.Instances), nil
 }
 
+// instancesProblem is storeProblem for localInstances, which may also answer
+// with a problem of its own (the instance is stopped and nothing is known).
+func (s *Server) instancesProblem(r *http.Request, err error) error {
+	var p *problem.Problem
+	if errors.As(err, &p) {
+		return p
+	}
+	return s.storeProblem(r, err, "")
+}
+
 func (s *Server) listThisServerInstances(_ *call, w http.ResponseWriter, r *http.Request) error {
 	items, err := s.localInstances(r)
 	if err != nil {
-		return s.storeProblem(r, err, "")
+		return s.instancesProblem(r, err)
 	}
 	s.writeJSON(w, r, http.StatusOK, api.InstanceList{Items: items})
 	return nil
@@ -157,7 +180,7 @@ func (s *Server) getThisServerInstance(_ *call, w http.ResponseWriter, r *http.R
 	}
 	items, err := s.localInstances(r)
 	if err != nil {
-		return s.storeProblem(r, err, "")
+		return s.instancesProblem(r, err)
 	}
 	for _, in := range items {
 		if in.ID == id {
@@ -168,16 +191,17 @@ func (s *Server) getThisServerInstance(_ *call, w http.ResponseWriter, r *http.R
 	return problem.New(problem.NotFound, "Instance "+r.PathValue("instanceId")+" does not run on this server.")
 }
 
-func (s *Server) listDatabases(_ *call, w http.ResponseWriter, r *http.Request) error {
+func (s *Server) listDatabases(c *call, w http.ResponseWriter, r *http.Request) error {
 	items, err := s.deps.Store.Databases(r.Context())
 	if err != nil {
 		return s.storeProblem(r, err, "")
 	}
+	s.completeDatabases(c, r, "listDatabases", nil, items)
 	s.writeJSON(w, r, http.StatusOK, api.DatabaseList{Items: nonNil(items)})
 	return nil
 }
 
-func (s *Server) getDatabase(_ *call, w http.ResponseWriter, r *http.Request) error {
+func (s *Server) getDatabase(c *call, w http.ResponseWriter, r *http.Request) error {
 	pp := newParams(r)
 	name := pp.pathName("databaseName")
 	if p := pp.err(); p != nil {
@@ -187,6 +211,9 @@ func (s *Server) getDatabase(_ *call, w http.ResponseWriter, r *http.Request) er
 	if err != nil {
 		return s.storeProblem(r, err, "Database \""+name+"\" does not exist.")
 	}
+	one := []api.Database{db}
+	s.completeDatabases(c, r, "getDatabase", map[string]string{"databaseName": name}, one)
+	db = one[0]
 	s.writeJSON(w, r, http.StatusOK, db)
 	return nil
 }
@@ -313,16 +340,17 @@ func (s *Server) getTask(_ *call, w http.ResponseWriter, r *http.Request) error 
 	return nil
 }
 
-func (s *Server) listLedgerStatus(_ *call, w http.ResponseWriter, r *http.Request) error {
+func (s *Server) listLedgerStatus(c *call, w http.ResponseWriter, r *http.Request) error {
 	items, err := s.deps.Store.LedgerStatuses(r.Context())
 	if err != nil {
 		return s.storeProblem(r, err, "")
 	}
+	s.completeLedgerStatus(c, r, "listLedgerStatus", nil, items)
 	s.writeJSON(w, r, http.StatusOK, api.LedgerStatusList{Items: nonNil(items)})
 	return nil
 }
 
-func (s *Server) getLedgerStatus(_ *call, w http.ResponseWriter, r *http.Request) error {
+func (s *Server) getLedgerStatus(c *call, w http.ResponseWriter, r *http.Request) error {
 	pp := newParams(r)
 	db := pp.pathName("databaseName")
 	if p := pp.err(); p != nil {
@@ -332,6 +360,9 @@ func (s *Server) getLedgerStatus(_ *call, w http.ResponseWriter, r *http.Request
 	if err != nil {
 		return s.storeProblem(r, err, "Database \""+db+"\" does not exist.")
 	}
+	one := []api.LedgerStatus{v}
+	s.completeLedgerStatus(c, r, "getLedgerStatus", map[string]string{"databaseName": db}, one)
+	v = one[0]
 	if v.Chains == nil {
 		v.Chains = []api.LedgerChainStatus{}
 	}

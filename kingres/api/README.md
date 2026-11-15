@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.5.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.6.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and `kingres-cli`. Lint it and run the mechanical rule check with:
 
 ```
@@ -311,6 +311,95 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.6.0
+
+Revision written with the fix round for the second independent review of `kingresd` and the defects the other engineers
+reported. Summary for the panel: 0 operations added (88 operations, 71 paths), 2 breaking changes (both for security),
+additive changes listed below, 1 new problem code, 1 new alert kind, documentation corrections. Everything else is additive: new optional
+members of responses and requests, new members of enums that the contract already says clients must tolerate unknown
+members of (`ProblemCode`, `AlertKind`). No property was removed, renamed or made required.
+
+#### Breaking
+
+1. **`addServer` needs `kingres_admin`** (0.5.0: `kingres_ops`). With `kingres_ops` an operator could make the cluster
+   sign a certificate for a server the operator runs and hand it every role's password verifier, which is the way to
+   `kingres_admin` (review CP2-02). **A client must:** show and call `addServer` only for administrators; an ops account
+   now gets 403 `forbidden`. `joinCluster` was already administrator-only.
+2. **`addServer` and `joinCluster` need a pin.** A request without `expectedFingerprint` (body) or the
+   `X-Kingres-Pin-Sha256` header and without `allowUnpinned: true` is `400 validation_failed` with `errors[].field`
+   `/expectedFingerprint` and code `required` (0.5.0 accepted it and trusted whoever answered first, which for a join
+   sent the administrator's password to that peer: CP2-05). A malformed pin is `400` on every server (through a
+   follower it used to become trust on first use, CP2-03). **A client must:** send the fingerprint (it can read the
+   fingerprint of the server to add from that server's own panel, see additive 4 and 5) or offer an explicit "trust
+   whatever answers" choice that sends `allowUnpinned: true`. Colons and upper case are accepted in the fingerprint,
+   anything else that is not 64 hexadecimal digits is refused.
+
+Behaviour that is not in the schema: a request that a follower forwards answers `401 unauthenticated` ("sign in again")
+when the session can no longer prove itself to the leader (the role's password changed, or the role has no
+SCRAM-SHA-256 password).
+
+#### Additive
+
+1. `AddServerRequest.allowUnpinned`, `JoinClusterRequest.allowUnpinned` (boolean, default false), see breaking 2.
+2. `SetupTaskSummary.detail` (string or null, optional): the same text as `Task.detail`; for a join or an add it says
+   whether a pin was checked and which fingerprint.
+3. `ProblemCode` `internal_api_disabled` (409): a server that runs without `-internal-listen` is a configuration state,
+   not a missing feature; `addServer`, `removeServer`, `leaveCluster`, `renewServerCertificates` and
+   `revokeServerCertificates` answer it (0.5.0: 422 `unsupported_operation`, which the panel showed as "not
+   implemented in this version").
+4. `NodeStateInfo.internalFingerprint` (hex or null, optional): the fingerprint of the certificate of the internal API
+   of an uninitialized server (its bootstrap certificate). It is answered only to a loopback caller while the panel is
+   loopback-only, or to a request with a valid `X-Setup-Token`; null for everyone else.
+5. `LocalServerInfo.internalFingerprint` (hex or null, optional): the certificate the internal API presents now,
+   readable by any signed-in role.
+6. `LedgerDigest.complete`, `LedgerVerification.complete` (boolean) and `uncoveredShardGroupIds` (int32 list), optional
+   in the schema, always sent by 0.6.0: the shard groups whose ledger chain the digest or the verification did not
+   cover. **A client must not show a `passed` verification with `complete: false` as proof for the whole database.**
+   `aggregateHash` stays null for an incomplete digest.
+7. `AuditEvent.serverId`, `AuditPage.partial`, `AuditPage.missingServers` (optional). `listAuditEvents` answers for the
+   whole cluster from any server, like `listLogs`; event ids are unique in the cluster (an opaque number below 2^53,
+   no sequence); an audit cursor of 0.5.0 is refused with 400 (cursors are not valid across revisions); an audited
+   mutation answers 503 `service_unavailable` before anything is done when the audit log cannot be written.
+8. `AlertKind` `replicationPending`: a change of roles (or other cluster state) has not reached a server that the leader
+   still waits for. Subject `server:<leader>|behind:<server>`.
+9. New schema `LedgerProofBlock` (allOf of `LedgerProofBlockHeader` and `block_hash`); `InclusionProof.block` refers to it.
+   The wire format is unchanged; generators now produce a usable type instead of an intersection with an empty object.
+10. `LocalSettings.dataPaths.walDirectory` and `logDirectory` are always present in the answer, `null` when they are the
+    default (0.5.0 left them out); the `required` list is unchanged (`dataDirectory`).
+11. **`getSession` and `listThisServerInstances` work while the system database is stopped** (they answered 503
+    `system_database_stopped`; `startThisServerInstance` was the only exception). They answer for a session this
+    process has already validated, with the roles of the last successful role check (at most one hour old), and
+    never for a session or role this process has not checked, after any role change on the cluster, or past that
+    age. `Session` gains optional `degraded` (boolean), `degradedReason` and `clientAddress`; `getSession` marks the
+    answer `degraded: true` in that state. `listThisServerInstances` answers from the instance manager's memory
+    (state from the manager; size and lag null; 503 if this process never read the list). The operations that work
+    in the stopped state are exactly `startThisServerInstance`, `getSession` and `listThisServerInstances`; the state
+    begins when the stop or restart is accepted. A client can drop the copy of the session JSON and CSRF token it
+    kept in browser storage for this case, and the guess of the instance id before a start.
+12. `Session.clientAddress` (optional): the TCP peer address of the request that made or read the session (behind a
+    reverse proxy it is the proxy's address).
+13. `replaceNetworkAccess` accepts the query parameter `dryRun=true` (any value other than true or false is 400): the
+    same validation, 409 and 422 as a real change, answered 200 `NetworkAccessCheck {valid, revision}` without a task
+    and without an audit event. A client can drop its own pre-check against locking itself out.
+
+#### Documentation
+
+1. Sessions and bearer tokens are per server: a token from server 1 gives 401 on server 2 (`login`, the two
+   security schemes).
+2. `LedgerDigest.chains[].document` must be kept byte-exact by clients: the verifier needs the exact bytes.
+3. `Server.joinedAt` and `uptimeSeconds` are set for servers that joined (0.5.0 answered null). `ServerStatus.pendingRebalance`
+   is "the server should hold shards, is the primary of no bucket and buckets exist"; it no longer depends on how far the
+   copy of a neighbouring group's buckets has come, so `live` and `pendingRebalance` are deterministic.
+4. `getDatabase` on a follower answers the same `sharding.bucketCount`, `ledger.mode` and `digestIntervalSeconds` as the
+   leader (0.5.0 answered null on a follower; the contract text did not change).
+5. `executeQuery`: a cut result of a statement that changes data is committed and reports its real command tag and
+   `truncated: true` (0.5.0 rolled it back and answered a `SELECT n` tag); `timeoutMs` ends as 422 `sql_error` with
+   SQLSTATE 57014 and never as 503; a role runs at most two statements at once; a value above 1 MiB or a row above 16 MiB
+   is 422. `LedgerDigest.generatedBy` is the requesting role or `system` as the text always said (0.5.0 returned the
+   service role).
+6. While an instance is stopping or restarting, the only answer of the operations that need the system database is
+   `system_database_stopped`.
 
 ### 0.5.0
 

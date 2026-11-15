@@ -61,7 +61,7 @@ func TestFileSinkAppendQueryAndRecovery(t *testing.T) {
 		{"actor", Filter{Actor: "alice", Limit: 10}, []int64{4, 3, 1}},
 		{"action", Filter{Action: "login", Limit: 10}, []int64{2, 1}},
 		{"outcome", Filter{Outcome: OutcomeDenied, Limit: 10}, []int64{4}},
-		{"before", Filter{BeforeID: 3, Limit: 10}, []int64{2, 1}},
+		{"below", Filter{Below: &Position{Time: c.t.Add(-time.Second), ID: 3}, Limit: 10}, []int64{2, 1}},
 		{"limit plus one", Filter{Limit: 2}, []int64{4, 3, 2}},
 		{"from", Filter{From: c.t.Add(-time.Second - time.Millisecond), Limit: 10}, []int64{4, 3}},
 		{"to", Filter{To: c.t.Add(-time.Second), Limit: 10}, []int64{2, 1}},
@@ -157,5 +157,106 @@ func TestCleanReplacesControlCharacters(t *testing.T) {
 	}
 	if got := Clean("alice"); got != "alice" {
 		t.Errorf("a clean name changed: %q", got)
+	}
+}
+
+// Rotation keeps every event reachable: a query reads the live file and then the
+// closed segments, and a reopened sink continues the id sequence even when the
+// live file is empty (CP2-16).
+func TestFileSinkRotatesAndQueriesAcrossSegments(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(testutil.TempDir(t), "audit.jsonl")
+	c := &tick{t: time.Date(2026, 11, 14, 9, 0, 0, 0, time.UTC)}
+	s, err := OpenFile(path, c.now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetSegmentBytes(600)
+	for i := 0; i < 30; i++ {
+		if _, err := s.Append(ctx, Event{Actor: "alice", Action: "createRole", Outcome: OutcomeSuccess, Source: "cli"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(s.segmentPaths()) < 2 {
+		t.Fatalf("expected several closed segments, got %v", s.segmentPaths())
+	}
+	all, err := s.Query(ctx, Filter{})
+	if err != nil || len(all) != 30 {
+		t.Fatalf("all events = %d, %v", len(all), err)
+	}
+	for i, e := range all {
+		if e.ID != int64(30-i) {
+			t.Fatalf("event %d has id %d, want %d", i, e.ID, 30-i)
+		}
+	}
+	page, _ := s.Query(ctx, Filter{Limit: 4, Below: &Position{Time: all[9].Timestamp, ID: all[9].ID}})
+	if len(page) != 5 || page[0].ID != 20 || page[4].ID != 16 {
+		t.Fatalf("page across a boundary = %+v", page)
+	}
+	_ = s.Close()
+
+	// The live file may be empty right after a rotation: the next id still follows.
+	s2, err := OpenFile(path, c.now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if id, err := s2.Append(ctx, Event{Actor: "a", Action: "x", Outcome: OutcomeSuccess}); err != nil || id != 31 {
+		t.Fatalf("id after reopen = %d, %v", id, err)
+	}
+}
+
+// A page is read from the end of the file: lines longer than a read block and
+// lines that straddle a block boundary come out intact and in order.
+func TestFileSinkBackwardReadHandlesBlockBoundaries(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(testutil.TempDir(t), "audit.jsonl")
+	s, err := OpenFile(path, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.SetSegmentBytes(0)
+	big := strings.Repeat("x", 70<<10)
+	const n = 12
+	for i := 0; i < n; i++ {
+		d := map[string]any{"pad": strings.Repeat("y", i*9000)}
+		if i == 5 {
+			d["big"] = big
+		}
+		if _, err := s.Append(ctx, Event{Actor: "a", Action: "x", Outcome: OutcomeSuccess, Details: d}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.Query(ctx, Filter{})
+	if err != nil || len(got) != n {
+		t.Fatalf("got %d events, %v", len(got), err)
+	}
+	for i, e := range got {
+		if e.ID != int64(n-i) {
+			t.Fatalf("event %d id %d", i, e.ID)
+		}
+	}
+	top, _ := s.Query(ctx, Filter{Limit: 2})
+	if len(top) != 3 || top[0].ID != n {
+		t.Fatalf("limit page = %d events", len(top))
+	}
+}
+
+func TestReadyDetectsAnUnwritableLog(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenFile(filepath.Join(testutil.TempDir(t), "audit.jsonl"), time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Ready(ctx); err != nil {
+		t.Fatalf("a healthy log is not ready: %v", err)
+	}
+	if got, _ := s.Query(ctx, Filter{}); len(got) != 0 {
+		t.Errorf("Ready must not leave an event, got %d", len(got))
+	}
+	_ = s.Close()
+	if err := s.Ready(ctx); err == nil {
+		t.Error("a closed log must not be ready")
 	}
 }

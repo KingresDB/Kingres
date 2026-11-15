@@ -72,6 +72,13 @@ type Session struct {
 	ServerID *string `json:"serverId"`
 	// Token is the bearer token; only in the login response with issueToken.
 	Token *string `json:"token"`
+	// ClientAddress is the network address this server saw the request come
+	// from (contract 0.6.0, optional).
+	ClientAddress string `json:"clientAddress,omitempty"`
+	// Degraded and DegradedReason (contract 0.6.0, optional) say that the
+	// answer was given from memory because the system database is stopped.
+	Degraded       bool   `json:"degraded,omitempty"`
+	DegradedReason string `json:"degradedReason,omitempty"`
 }
 
 // NodeStateInfo is the response of GET /setup/state.
@@ -97,6 +104,9 @@ type NodeStateInfo struct {
 	// SetupTask summarizes the task started by init-cluster or join-cluster;
 	// null until such a request was accepted.
 	SetupTask *SetupTaskSummary `json:"setupTask"`
+	// InternalFingerprint is the fingerprint of the bootstrap certificate of an
+	// uninitialized server, for the callers entitled to set it up (contract 0.6.0).
+	InternalFingerprint *string `json:"internalFingerprint"`
 }
 
 // SetupTaskSummary is the setup task as served by GET /setup/state.
@@ -116,6 +126,8 @@ type SetupTaskSummary struct {
 	UpdatedAt Time `json:"updatedAt"`
 	// Error is set when the task failed.
 	Error *TaskError `json:"error"`
+	// Detail is the text the running step recorded (contract 0.6.0).
+	Detail *string `json:"detail"`
 }
 
 // ClusterRoleInfo describes a built-in cluster role.
@@ -197,6 +209,9 @@ type JoinClusterRequest struct {
 	AdvertiseAddress *string `json:"advertiseAddress,omitempty"`
 	// ExpectedFingerprint pins the SHA-256 fingerprint of the existing server's internal certificate.
 	ExpectedFingerprint *string `json:"expectedFingerprint,omitempty"`
+	// AllowUnpinned accepts a first contact whose certificate is not checked
+	// (contract 0.6.0): the administrator's password goes to whatever answers.
+	AllowUnpinned *bool `json:"allowUnpinned,omitempty"`
 }
 
 // AddServerRequest is the body of POST /servers.
@@ -209,4 +224,8 @@ type AddServerRequest struct {
 	ServerGroup *string `json:"serverGroup,omitempty"`
 	// ExpectedFingerprint pins the SHA-256 fingerprint of the new server's bootstrap certificate.
 	ExpectedFingerprint *string `json:"expectedFingerprint,omitempty"`
+	// AllowUnpinned accepts a first contact whose certificate is not checked
+	// (contract 0.6.0): the setup token goes to, and a certificate of the cluster
+	// to, whatever answers.
+	AllowUnpinned *bool `json:"allowUnpinned,omitempty"`
 }

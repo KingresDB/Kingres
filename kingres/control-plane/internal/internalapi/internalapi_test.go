@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fwdproof"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pki"
 )
 
@@ -25,6 +26,14 @@ type env struct {
 	leader    string
 	execd     []ExecRequest
 	forwarded []string
+	// pending are the servers that hold a certificate but are not members;
+	// unproven is the error VerifyIdentity answers (nil: the proof is fine).
+	pending  map[string]bool
+	unproven error
+	// gather counts the gather calls that reach the backend; noAssertion makes
+	// VerifyAssertion refuse.
+	gather      func()
+	noAssertion bool
 }
 
 // cert issues a certificate for cn from ca and returns it as a TLS pair.
@@ -62,6 +71,23 @@ func newEnv(t *testing.T) *env {
 		Forward: func(_ context.Context, peer string, r ForwardRequest) (ForwardResponse, error) {
 			e.forwarded = append(e.forwarded, peer+":"+r.OperationID+":"+r.Identity.Username)
 			return ForwardResponse{Status: 201, Header: map[string]string{"Content-Type": "application/json"}, Body: []byte(`{"ok":true}`)}, nil
+		},
+		Member:         func(_ context.Context, peer string) (bool, error) { return !e.pending[peer], nil },
+		VerifyIdentity: func(context.Context, fwdproof.Kind, string, ForwardRequest) error { return e.unproven },
+		Gather: func(context.Context, string, ForwardRequest) (ForwardResponse, error) {
+			if e.gather != nil {
+				e.gather()
+			}
+			return ForwardResponse{Status: 200}, nil
+		},
+		Authorize: func(context.Context, string, ForwardRequest) (fwdproof.Assertion, error) {
+			return fwdproof.Assertion{}, nil
+		},
+		VerifyAssertion: func(context.Context, string, ForwardRequest) error {
+			if e.noAssertion {
+				return fwdproof.ErrInvalid
+			}
+			return nil
 		},
 		Revoked:   ca.Revoked,
 		Resources: func(context.Context) (any, error) { return map[string]int{"cores": 4}, nil },

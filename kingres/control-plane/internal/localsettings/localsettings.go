@@ -196,7 +196,7 @@ func (m *Manager) getLocked() (api.LocalSettings, error) {
 		dataDir = m.o.DataDir
 	}
 	out := api.LocalSettings{
-		DataPaths:   api.DataPaths{DataDirectory: dataDir},
+		DataPaths:   api.LocalDataPaths{DataDirectory: dataDir},
 		MemoryQuota: api.MemoryQuota{TotalMegabytes: Quota(cur)},
 		LogLevel:    LevelName(m.o.Level.Level()),
 		ClientPorts: api.ClientPorts{ReadWritePort: m.o.PGPort},

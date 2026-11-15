@@ -93,23 +93,23 @@ func (s *PGStore) Record(ctx context.Context, t Task) (Task, error) {
 		ej, _ = json.Marshal(t.Error)
 	}
 	var holder any
-	var lease any
+	var leaseSecs any // the lease runs on the database's clock (see claimSQL)
 	if t.active() {
-		holder, lease = "recorder", t.UpdatedAt.Add(RecordLease)
+		holder, leaseSecs = "recorder", RecordLease.Seconds()
 	}
 	var err error
 	if t.ID > 0 {
 		_, err = s.db.Exec(ctx, `INSERT INTO kingres_cp.task
 			(id, kind, state, subject_type, subject_id, input, progress, error, created_at, updated_at, created_by, lease_holder, lease_expires_at)
 			OVERRIDING SYSTEM VALUE
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, clock_timestamp() + make_interval(secs => $13::float8))
 			ON CONFLICT (id) DO NOTHING`,
-			t.ID, t.Kind, string(t.State), t.SubjectType, t.SubjectID, []byte(t.Input), prog, ej, t.CreatedAt, t.UpdatedAt, t.CreatedBy, holder, lease)
+			t.ID, t.Kind, string(t.State), t.SubjectType, t.SubjectID, []byte(t.Input), prog, ej, t.CreatedAt, t.UpdatedAt, t.CreatedBy, holder, leaseSecs)
 	} else {
 		err = s.db.QueryRow(ctx, `INSERT INTO kingres_cp.task
 			(kind, state, subject_type, subject_id, input, progress, error, created_at, updated_at, created_by, lease_holder, lease_expires_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`,
-			t.Kind, string(t.State), t.SubjectType, t.SubjectID, []byte(t.Input), prog, ej, t.CreatedAt, t.UpdatedAt, t.CreatedBy, holder, lease).Scan(&t.ID)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, clock_timestamp() + make_interval(secs => $12::float8)) RETURNING id`,
+			t.Kind, string(t.State), t.SubjectType, t.SubjectID, []byte(t.Input), prog, ej, t.CreatedAt, t.UpdatedAt, t.CreatedBy, holder, leaseSecs).Scan(&t.ID)
 	}
 	var pe *pgconn.PgError
 	if errors.As(err, &pe) && pe.Code == "23505" {
@@ -128,14 +128,14 @@ func (s *PGStore) Settle(ctx context.Context, t Task) error {
 	if t.Error != nil {
 		ej, _ = json.Marshal(t.Error)
 	}
-	lease := any(nil)
+	leaseSecs := any(nil)
 	holder := any(nil)
 	if t.active() {
-		holder, lease = "recorder", t.UpdatedAt.Add(RecordLease)
+		holder, leaseSecs = "recorder", RecordLease.Seconds()
 	}
 	tag, err := s.db.Exec(ctx, `UPDATE kingres_cp.task SET state = $2, progress = $3, error = $4, updated_at = $5,
-		lease_holder = $6, lease_expires_at = $7
-		WHERE id = $1 AND state IN ('running', 'done', 'failed')`, t.ID, string(t.State), prog, ej, t.UpdatedAt, holder, lease)
+		lease_holder = $6, lease_expires_at = clock_timestamp() + make_interval(secs => $7::float8)
+		WHERE id = $1 AND state IN ('running', 'done', 'failed')`, t.ID, string(t.State), prog, ej, t.UpdatedAt, holder, leaseSecs)
 	if err != nil {
 		return err
 	}

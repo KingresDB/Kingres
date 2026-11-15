@@ -77,7 +77,7 @@ func (l *lifecycle) set(mem string, down bool) {
 func (l *lifecycle) clearIf(mem string) {
 	l.mu.Lock()
 	if l.mem == mem {
-		l.mem = ""
+		l.mem, l.down = "", false
 	}
 	l.mu.Unlock()
 }
@@ -195,7 +195,10 @@ func (o *Ops) beginOp(ctx context.Context, op string) (undo func(), err error) {
 		case StateStarting, StateRestarting:
 			return nil, busy
 		}
-		o.life.mem = StateStopping
+		// down at once: from accepting the stop on, the database may end the
+		// connections of a request at any moment, and such a request must be
+		// answered system_database_stopped, not as a store failure (defect 4).
+		o.life.mem, o.life.down = StateStopping, true
 	case "start":
 		switch st {
 		case StateRunning, StateStarting, StateRestarting:
@@ -211,7 +214,7 @@ func (o *Ops) beginOp(ctx context.Context, op string) (undo func(), err error) {
 		case StateStarting, StateRestarting:
 			return nil, busy
 		}
-		o.life.mem = StateRestarting
+		o.life.mem, o.life.down = StateRestarting, true
 	default:
 		return nil, errors.New("ops: unknown instance operation")
 	}

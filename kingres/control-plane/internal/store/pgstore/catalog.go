@@ -289,15 +289,23 @@ func (c *catalog) instanceOf(n node) api.Instance {
 }
 
 // statusOf derives the server status from the catalog. holds is the number of
-// buckets the server's nodes serve and anyBuckets tells whether the cluster
-// has a bucket map at all.
-func statusOf(sv *serverInfo, holds int, anyBuckets bool) string {
+// buckets the server's nodes serve as primary or replica, primary the number it
+// serves as primary, and anyBuckets tells whether buckets exist in the cluster
+// at all.
+//
+// A server that joined waits for a rebalance as long as it is the primary of no
+// bucket. The replicas it holds do not count: the standby that a join creates
+// for a neighboring group copies that group's buckets, so whether the server
+// held "some data" depended on how far that copy had come when the status was
+// read, and the same server was live in one answer and pendingRebalance in the
+// next.
+func statusOf(sv *serverInfo, holds, primary int, anyBuckets bool) string {
 	switch {
 	case !sv.Active:
 		return "dead"
 	case !sv.Should && holds > 0:
 		return "draining"
-	case sv.Should && holds == 0 && anyBuckets:
+	case sv.Should && primary == 0 && anyBuckets:
 		return "pendingRebalance"
 	default:
 		return "live"
@@ -363,7 +371,7 @@ func (s *Store) buildServers(ctx context.Context, cat *catalog, hold map[string]
 		h := *hold[sv.ID]
 		server := api.Server{
 			ID: sv.ID, Address: net.JoinHostPort(sv.Host, s.opts.PanelPort), Hostname: sv.Host,
-			Status:      statusOf(sv, h.Primary+h.Replica, anyBuckets),
+			Status:      statusOf(sv, h.Primary+h.Replica, h.Primary, anyBuckets),
 			ServerGroup: sv.Group, ShouldHaveShards: sv.Should,
 			Version:   versionPtr(s.opts.Version),
 			Instances: make([]api.Instance, 0, len(sv.Nodes)), Buckets: h,
@@ -537,7 +545,7 @@ func (s *Store) ClusterSummary(ctx context.Context) (store.ClusterSummary, error
 	for _, sv := range cat.servers {
 		h := hold[sv.ID]
 		sum.Servers.Total++
-		switch statusOf(sv, h.Primary+h.Replica, anyHeld(perDB)) {
+		switch statusOf(sv, h.Primary+h.Replica, h.Primary, anyHeld(perDB)) {
 		case "live":
 			sum.Servers.Live++
 		case "draining":

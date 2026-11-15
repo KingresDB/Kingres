@@ -3,6 +3,7 @@
 package pki
 
 import (
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -110,5 +111,48 @@ func TestRevokedListRoundTrip(t *testing.T) {
 	l, err := LoadRevokedList(dir)
 	if err != nil || len(l) != 2 || l[1] != "ff" {
 		t.Fatalf("%v %v", l, err)
+	}
+}
+
+// CP2-18: the content of a file is flushed before the rename makes it the file,
+// and the directory after it, so a crash cannot leave an empty revocation list.
+func TestWriteFileFlushesBeforeAndAfterTheRename(t *testing.T) {
+	var events []string
+	oldFile, oldDir := syncFile, syncDir
+	t.Cleanup(func() { syncFile, syncDir = oldFile, oldDir })
+	dir := t.TempDir()
+	path := filepath.Join(dir, "revoked.json")
+	syncFile = func(f *os.File) error {
+		if _, err := os.Stat(path); err == nil {
+			events = append(events, "file flushed after the rename")
+		} else {
+			events = append(events, "file")
+		}
+		return nil
+	}
+	syncDir = func(string) error {
+		if _, err := os.Stat(path); err != nil {
+			events = append(events, "directory flushed before the rename")
+		} else {
+			events = append(events, "directory")
+		}
+		return nil
+	}
+	if err := WriteFile(path, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(events, ","); got != "file,directory" {
+		t.Fatalf("flush order: %s", got)
+	}
+	// A failed flush is an error and leaves nothing half written behind.
+	syncFile = func(*os.File) error { return errors.New("disk full") }
+	if err := WriteFile(path, []byte("{\"changed\":true}"), 0o600); err == nil {
+		t.Fatal("a failed flush was ignored")
+	}
+	if b, _ := os.ReadFile(path); string(b) != "{}" {
+		t.Errorf("the file after a failed write: %q", b)
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, ".pki-*")); len(left) != 0 {
+		t.Errorf("temporary files left: %v", left)
 	}
 }

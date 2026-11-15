@@ -67,6 +67,8 @@ const (
 	// CertificateAuthorityUnavailable (503) and CertificateRevoked (409) were added in contract 0.5.0.
 	CertificateAuthorityUnavailable Code = "certificate_authority_unavailable"
 	CertificateRevoked              Code = "certificate_revoked"
+	// InternalAPIDisabled (409) was added in contract 0.6.0: the server runs without its internal API.
+	InternalAPIDisabled Code = "internal_api_disabled"
 )
 
 // FieldError is one entry of the "errors" extension (schema ValidationIssue).
@@ -166,6 +168,7 @@ var specs = map[Code]struct {
 	InternalError:                   {500, "Internal error", "internal-error"},
 	CertificateAuthorityUnavailable: {503, "Certificate authority unavailable", "certificate-authority-unavailable"},
 	CertificateRevoked:              {409, "Certificate revoked", "certificate-revoked"},
+	InternalAPIDisabled:             {409, "Internal API disabled", "internal-api-disabled"},
 }
 
 // New returns a Problem for the code with the standard status, title and

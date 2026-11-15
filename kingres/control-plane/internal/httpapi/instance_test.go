@@ -7,15 +7,19 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/auth"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/instance"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/localsettings"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ops"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/store"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
 )
 
@@ -144,6 +148,12 @@ func TestStopStartCycleWhileTheSystemDatabaseIsDown(t *testing.T) {
 	if w := ie.do(req{method: "GET", path: "/api/v1/cluster", bearer: tok}); w.Code != 200 {
 		t.Fatalf("before the stop: %d %s", w.Code, w.Body.String())
 	}
+	// A read-only role that was checked while the instance ran (a session that
+	// was never checked is refused instead, CP2-19).
+	ro := ie.token(auth.RoleReadonly)
+	if w := ie.do(req{method: "GET", path: "/api/v1/cluster", bearer: ro}); w.Code != 200 {
+		t.Fatalf("read-only role before the stop: %d %s", w.Code, w.Body.String())
+	}
 	w := ie.do(req{method: "POST", path: "/api/v1/this-server/instances/1/stop", bearer: tok})
 	if w.Code != 202 {
 		t.Fatalf("stop: %d %s", w.Code, w.Body.String())
@@ -164,7 +174,7 @@ func TestStopStartCycleWhileTheSystemDatabaseIsDown(t *testing.T) {
 	for _, rq := range []req{
 		{method: "GET", path: "/api/v1/cluster", bearer: tok},
 		{method: "GET", path: "/api/v1/this-server/settings", bearer: tok},
-		{method: "GET", path: "/api/v1/auth/session", bearer: tok},
+		{method: "GET", path: "/api/v1/this-server/instances/1", bearer: tok},
 		{method: "POST", path: "/api/v1/this-server/instances/1/stop", bearer: tok},
 		{method: "GET", path: "/api/v1/tasks/1", bearer: tok},
 		{method: "POST", path: "/api/v1/auth/login", body: map[string]any{"username": "alice", "password": "s3cret"}},
@@ -181,7 +191,6 @@ func TestStopStartCycleWhileTheSystemDatabaseIsDown(t *testing.T) {
 		}
 	}
 	// A role without ops cannot start it (the check uses the remembered roles).
-	ro := ie.token(auth.RoleReadonly)
 	wantProblem(t, ie.do(req{method: "POST", path: "/api/v1/this-server/instances/1/start", bearer: ro}), 403, "forbidden")
 
 	// The start works with the token of before the stop.
@@ -275,6 +284,18 @@ func TestStartFromMemoryDoesNotWeakenRevalidation(t *testing.T) {
 		ie.clock.Advance(10 * time.Second)
 		ie.setUser("tester", nil) // the backend answers: no cluster role any more
 		wantProblem(t, ie.do(req{method: "POST", path: "/api/v1/this-server/instances/1/start", bearer: tok}), 401, "unauthenticated")
+	})
+	t.Run("a session that never had a role check is refused, not trusted from sign-in (CP2-19)", func(t *testing.T) {
+		ie := newInstanceEnv(t)
+		tok := ie.token(auth.RoleAdmin)
+		ie.fi.mu.Lock()
+		ie.fi.running = false
+		ie.fi.mu.Unlock()
+		down(ie)
+		wantProblem(t, ie.do(req{method: "POST", path: "/api/v1/this-server/instances/1/start", bearer: tok}), 503, "service_unavailable")
+		if ie.fi.starts != 0 {
+			t.Error("the instance was started from the roles of the sign-in")
+		}
 	})
 	t.Run("the last check must be recent", func(t *testing.T) {
 		ie := newInstanceEnv(t, func(d *Deps) { d.StaleRolesMaxAge = 30 * time.Second })
@@ -505,7 +526,7 @@ func TestSettingsOperations(t *testing.T) {
 	}
 	// logDirectory null selects the default.
 	got = mustPatch(t, e, admin, map[string]any{"logDirectory": nil})
-	if _, has := got["dataPaths"].(map[string]any)["logDirectory"]; has || got["restartRequired"] != true {
+	if v, has := got["dataPaths"].(map[string]any)["logDirectory"]; !has || v != nil || got["restartRequired"] != true {
 		t.Errorf("logDirectory null: %v", got)
 	}
 	// Audited with the operation id.
@@ -553,10 +574,124 @@ func TestInstanceTasksAreNotCancellable(t *testing.T) {
 	if m["cancellable"] != false || m["kind"] != "instance.restart" {
 		t.Errorf("restart task: %v", m)
 	}
-	wantProblem(t, ie.do(req{method: "POST", path: "/api/v1/tasks/" + itoa64(taskID(t, m)) + "/cancel", bearer: tok}), 409, "task_not_cancellable")
 	// The restart fails (the fake cannot stop) and is recorded as failed.
 	eventually(t, "the restart to end", func() bool {
 		got, err := ie.eng.Get(context.Background(), taskID(t, m))
 		return err == nil && got.State == task.Failed
+	})
+	eventually(t, "the gate to open again", func() bool { return !ie.ops.LocalInstanceDown() })
+	wantProblem(t, ie.do(req{method: "POST", path: "/api/v1/tasks/" + itoa64(taskID(t, m)) + "/cancel", bearer: tok}), 409, "task_not_cancellable")
+}
+
+// Defect 4: a request that was already running when the instance went down
+// loses its connection; it is answered with the documented
+// system_database_stopped, not with a store failure.
+func TestStoreFailureWhileTheInstanceIsDownIsTheDocumentedCode(t *testing.T) {
+	ie := newInstanceEnv(t)
+	tok := ie.token(auth.RoleAdmin)
+	r := httptest.NewRequest("GET", "/api/v1/cluster", nil)
+	if p := ie.srv.storeProblem(r, store.ErrUnavailable, ""); p.Code != problem.ServiceUnavailable {
+		t.Fatalf("instance running: %s", p.Code)
+	}
+	if w := ie.do(req{method: "POST", path: "/api/v1/this-server/instances/1/stop", bearer: tok}); w.Code != 202 {
+		t.Fatal(w.Code)
+	}
+	if p := ie.srv.storeProblem(r, store.ErrUnavailable, ""); p.Code != problem.SystemDatabaseStopped {
+		t.Errorf("after the stop was accepted: %s", p.Code)
+	}
+}
+
+// While the system database is stopped getSession and listThisServerInstances
+// answer from memory for a session this process checked before the stop (the
+// panel's reload), and refuse every other session: never checked, ended by
+// Changed, refused by a check, or too old.
+func TestSessionAndInstancesWhileTheSystemDatabaseIsStopped(t *testing.T) {
+	stop := func(ie *instanceEnv, tok string) {
+		t.Helper()
+		if w := ie.do(req{method: "POST", path: "/api/v1/this-server/instances/1/stop", bearer: tok}); w.Code != 202 {
+			t.Fatalf("stop: %d %s", w.Code, w.Body.String())
+		}
+		eventually(t, "the stop", func() bool { return ie.state() == ops.StateStopped })
+		ie.clock.Advance(10 * time.Second) // past the cache of the role check
+	}
+	t.Run("a checked session reads itself and the instances from memory", func(t *testing.T) {
+		ie := newInstanceEnv(t)
+		cookie, _ := ie.cookieSession(auth.RoleAdmin)
+		if w := ie.do(req{method: "GET", path: "/api/v1/this-server/instances", cookie: cookie}); w.Code != 200 {
+			t.Fatalf("before the stop: %d", w.Code)
+		}
+		// The test catalog has no instance: put one where the last read would have.
+		size := int64(5)
+		ie.srv.inst.last.Store(&[]api.Instance{{ID: 1, ServerID: "h", Role: "primary", State: "running", Port: 5432, SizeBytes: &size}})
+		stop(ie, ie.token(auth.RoleAdmin))
+		w := ie.do(req{method: "GET", path: "/api/v1/auth/session", cookie: cookie})
+		if w.Code != 200 {
+			t.Fatalf("getSession while stopped: %d %s", w.Code, w.Body.String())
+		}
+		m := decode(t, w)
+		if m["degraded"] != true || m["degradedReason"] == "" || m["csrfToken"] == nil || m["clientAddress"] != "127.0.0.1" {
+			t.Errorf("degraded session: %v", m)
+		}
+		w = ie.do(req{method: "GET", path: "/api/v1/this-server/instances", cookie: cookie})
+		if w.Code != 200 {
+			t.Fatalf("instances while stopped: %d %s", w.Code, w.Body.String())
+		}
+		items := decode(t, w)["items"].([]any)
+		if len(items) != 1 || items[0].(map[string]any)["state"] != "stopped" || items[0].(map[string]any)["sizeBytes"] != nil {
+			t.Errorf("instances: %v", items)
+		}
+	})
+	t.Run("a session this process never checked is refused", func(t *testing.T) {
+		ie := newInstanceEnv(t)
+		stop(ie, ie.token(auth.RoleAdmin))
+		fresh := ie.token(auth.RoleOps) // another role that this process never checked
+		ie.clock.Advance(10 * time.Second)
+		for _, p := range []string{"/api/v1/auth/session", "/api/v1/this-server/instances"} {
+			wantProblem(t, ie.do(req{method: "GET", path: p, bearer: fresh}), 503, "system_database_stopped")
+		}
+	})
+	t.Run("Changed ends the session and forgets the check", func(t *testing.T) {
+		ie := newInstanceEnv(t)
+		tok := ie.token(auth.RoleAdmin)
+		if w := ie.do(req{method: "GET", path: "/api/v1/this-server/instances", bearer: tok}); w.Code != 200 {
+			t.Fatal(w.Code)
+		}
+		stop(ie, tok)
+		ie.srv.RoleChanged("tester")
+		for _, p := range []string{"/api/v1/auth/session", "/api/v1/this-server/instances"} {
+			wantProblem(t, ie.do(req{method: "GET", path: p, bearer: tok}), 401, "unauthenticated")
+		}
+	})
+	t.Run("a change of another role forgets the check of this one", func(t *testing.T) {
+		ie := newInstanceEnv(t)
+		tok := ie.token(auth.RoleAdmin)
+		if w := ie.do(req{method: "GET", path: "/api/v1/this-server/instances", bearer: tok}); w.Code != 200 {
+			t.Fatal(w.Code)
+		}
+		stop(ie, tok)
+		ie.srv.RoleChanged("someone_else") // a group membership may have changed this role's roles too
+		wantProblem(t, ie.do(req{method: "GET", path: "/api/v1/auth/session", bearer: tok}), 503, "system_database_stopped")
+	})
+	t.Run("the check must be recent", func(t *testing.T) {
+		ie := newInstanceEnv(t, func(d *Deps) { d.StaleRolesMaxAge = 30 * time.Second })
+		tok := ie.token(auth.RoleAdmin)
+		if w := ie.do(req{method: "GET", path: "/api/v1/this-server/instances", bearer: tok}); w.Code != 200 {
+			t.Fatal(w.Code)
+		}
+		stop(ie, tok)
+		ie.clock.Advance(2 * time.Minute)
+		wantProblem(t, ie.do(req{method: "GET", path: "/api/v1/auth/session", bearer: tok}), 503, "system_database_stopped")
+	})
+	t.Run("a role without the instance role gets nothing more than before", func(t *testing.T) {
+		ie := newInstanceEnv(t)
+		stats := ie.token(auth.RoleStats)
+		if w := ie.do(req{method: "GET", path: "/api/v1/auth/session", bearer: stats}); w.Code != 200 {
+			t.Fatal(w.Code)
+		}
+		stop(ie, ie.token(auth.RoleAdmin))
+		wantProblem(t, ie.do(req{method: "GET", path: "/api/v1/this-server/instances", bearer: stats}), 403, "forbidden")
+		if w := ie.do(req{method: "GET", path: "/api/v1/auth/session", bearer: stats}); w.Code != 200 {
+			t.Errorf("the own session of a stats role: %d", w.Code)
+		}
 	})
 }

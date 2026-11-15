@@ -14,6 +14,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pgframe"
 )
 
 // ErrNotEnabled means the role has not signed in since kingresd started, so
@@ -135,6 +137,9 @@ func (p *Proxy) Connect(ctx context.Context, db, role string) (*pgx.Conn, error)
 	cfg.Host, cfg.Port, cfg.Database, cfg.User = filepath.ToSlash(sock), uint16(p.svc.cfg.PGPort), db, role //nolint:gosec // port validated 1024..65535 by the configuration
 	cfg.Password, cfg.TLSConfig, cfg.Fallbacks = "", nil, nil
 	cfg.ConnectTimeout = 5 * time.Second
+	// A statement of a signed-in role can select a value of any size; the driver would
+	// read it into memory whole, so the stream is cut at the size of a result (CP-04).
+	cfg.DialFunc = pgframe.Dialer(pgframe.MaxRoleMessage)
 	cfg.RuntimeParams["application_name"] = "kingresd-proxy"
 	// A reload that has just happened may not have reached a new backend yet.
 	var last error

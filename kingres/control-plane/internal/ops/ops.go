@@ -66,6 +66,10 @@ type Ops struct {
 	// ServerHost and PGPort identify this server in the shard catalog.
 	ServerHost string
 	PGPort     int
+	// InstanceOwner tells whether an instance (its id in the shard catalog) is one of
+	// the named server's. A peer may record and settle tasks only of its own
+	// instances (CP2-20); nil refuses every such call.
+	InstanceOwner func(ctx context.Context, instanceID, server string) (bool, error)
 	// BG bounds background task runs; Wait waits for them.
 	BG  context.Context
 	Log *slog.Logger

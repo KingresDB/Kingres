@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ops"
@@ -305,6 +306,10 @@ func (s *Server) replaceNetworkAccess(c *call, w http.ResponseWriter, r *http.Re
 	if err != nil {
 		return err
 	}
+	dry := r.URL.Query().Get("dryRun")
+	if dry != "" && dry != "true" && dry != "false" {
+		return problem.Validation("The query is invalid.", problem.FieldError{Field: "dryRun", Message: "must be true or false", Code: "invalid"})
+	}
 	var req api.NetworkAccessUpdateRequest
 	if err := s.body(w, r, &req); err != nil {
 		return err
@@ -312,6 +317,12 @@ func (s *Server) replaceNetworkAccess(c *call, w http.ResponseWriter, r *http.Re
 	in, err := o.PrepareReplaceNetworkAccess(r.Context(), c.session.Username, c.ip, req)
 	if err != nil {
 		return err
+	}
+	if dry == "true" {
+		// Checked as for a real change, nothing done and nothing audited.
+		c.audit = false
+		s.writeJSON(w, r, http.StatusOK, api.NetworkAccessCheck{Valid: true, Revision: req.Revision})
+		return nil
 	}
 	t, err := o.StartTask(r.Context(), ops.KindNetworkApply, "networkAccess", "network-access", in, c.session.Username)
 	if err != nil {
@@ -456,13 +467,42 @@ func (s *Server) executeQuery(c *call, w http.ResponseWriter, r *http.Request) e
 	// its text.
 	n, h := ops.StatementFingerprint(req.SQL)
 	c.details = map[string]any{"database": req.Database, "sqlLength": n, "sqlHash": h}
-	res, err := o.ExecuteQuery(r.Context(), c.session.Username, req)
+	ctx, stop := queryContext(w, r, req)
+	defer stop()
+	res, err := o.ExecuteQuery(ctx, c.session.Username, req)
 	if err != nil {
 		return err
 	}
 	s.writeJSON(w, r, http.StatusOK, res)
 	return nil
 }
+
+// queryContext gives a workbench statement the time its own timeoutMs asks for.
+// The request context ends at RequestTimeout (30 s by default), which would end
+// every statement with a longer timeoutMs as a service failure before its own
+// statement_timeout (CP2-12); the statement runs under a context that follows
+// the client (a disconnect cancels it) but not that deadline, and the response
+// may be written until the statement's time plus a grace period has passed.
+func queryContext(w http.ResponseWriter, r *http.Request, req api.QueryRequest) (context.Context, context.CancelFunc) {
+	timeout := 30000
+	if req.TimeoutMs != nil && *req.TimeoutMs > 0 && *req.TimeoutMs <= 300000 {
+		timeout = *req.TimeoutMs
+	}
+	budget := time.Duration(timeout)*time.Millisecond + queryGrace
+	// Best effort: a writer that cannot change its deadline keeps the server's.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(budget + 10*time.Second))
+	ctx, cancel := context.WithCancel(context.WithoutCancel(r.Context()))
+	stopWatch := context.AfterFunc(r.Context(), func() {
+		if errors.Is(r.Context().Err(), context.Canceled) { // the client went away, not the deadline
+			cancel()
+		}
+	})
+	return ctx, func() { stopWatch(); cancel() }
+}
+
+// queryGrace is added to timeoutMs for the whole request: the statement is
+// ended by PostgreSQL at timeoutMs, and this is what the answer may still take.
+const queryGrace = 5 * time.Second
 
 func (s *Server) cancelTask(_ *call, w http.ResponseWriter, r *http.Request) error {
 	o, err := s.needOps()
@@ -522,7 +562,7 @@ func (s *Server) listLedgerDigests(_ *call, w http.ResponseWriter, r *http.Reque
 	return nil
 }
 
-func (s *Server) generateLedgerDigest(_ *call, w http.ResponseWriter, r *http.Request) error {
+func (s *Server) generateLedgerDigest(c *call, w http.ResponseWriter, r *http.Request) error {
 	o, err := s.needOps()
 	if err != nil {
 		return err
@@ -532,7 +572,7 @@ func (s *Server) generateLedgerDigest(_ *call, w http.ResponseWriter, r *http.Re
 	if p := pp.err(); p != nil {
 		return p
 	}
-	d, err := o.GenerateDigest(r.Context(), db)
+	d, err := o.GenerateDigest(r.Context(), db, c.session.Username)
 	if err != nil {
 		return err
 	}

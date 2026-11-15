@@ -431,11 +431,17 @@ func (m *Manager) WriteManaged(id int, s ManagedSettings) error {
 	return m.saveSettings(id, s)
 }
 
-// LogDir returns the directory that holds the instance's log files.
+// LogDir returns the directory that holds the instance's log files: the
+// log_directory of its managed settings (an administrator can move it through
+// updateThisServerSettings), the "log" directory of the data directory when
+// none is set.
 func (m *Manager) LogDir(id int) (string, error) {
 	d, err := m.DataDir(id)
 	if err != nil {
 		return "", err
+	}
+	if s, err := m.Settings(id); err == nil && s.LogDirectory != "" {
+		return s.LogDirectory, nil
 	}
 	return filepath.Join(d, "log"), nil
 }

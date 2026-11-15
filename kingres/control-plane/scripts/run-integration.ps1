@@ -17,6 +17,10 @@ param(
     [switch]$Race
 )
 $ErrorActionPreference = 'Stop'
+# Two runs would share the staging directory, ~/kw-cp/test/bin and the test ports: runs of
+# several people or agents on one machine queue up behind this mutex instead.
+$lock = New-Object System.Threading.Mutex($false, 'Global\kingres-cp-integration')
+try { [void]$lock.WaitOne() } catch [System.Threading.AbandonedMutexException] { }
 $module = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 Push-Location $module
 try {
@@ -72,4 +76,5 @@ try {
     exit $exit
 } finally {
     Pop-Location
+    $lock.ReleaseMutex()
 }

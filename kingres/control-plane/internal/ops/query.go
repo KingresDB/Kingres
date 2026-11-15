@@ -10,13 +10,17 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
+	"unicode"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pgframe"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sqlx"
 )
@@ -60,12 +64,11 @@ func (o *Ops) ExecuteQuery(ctx context.Context, actor string, req api.QueryReque
 	if o.Roles == nil {
 		return api.QueryResult{}, problem.New(problem.UnsupportedOp, "This server cannot act as the signed-in role (no managed instance).")
 	}
-	select {
-	case workbenchSlots <- struct{}{}:
-		defer func() { <-workbenchSlots }()
-	default:
-		return api.QueryResult{}, problem.New(problem.ServiceUnavailable, "Too many statements are running on this server; try again shortly.").WithRetryAfter(2)
+	release, ok := acquireWorkbench(actor)
+	if !ok {
+		return api.QueryResult{}, problem.New(problem.ServiceUnavailable, "Too many statements are running on this server (for this role or in all); try again shortly.").WithRetryAfter(2)
 	}
+	defer release()
 	conn, err := o.Roles.Connect(ctx, req.Database, actor)
 	if err != nil {
 		return api.QueryResult{}, connectProblem(err)
@@ -78,6 +81,15 @@ func (o *Ops) ExecuteQuery(ctx context.Context, actor string, req api.QueryReque
 	started := time.Now()
 	qctx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Millisecond+2*time.Second)
 	defer cancel()
+	// A statement the server did not end by itself (statement_timeout does that first, with
+	// SQLSTATE 57014) is ended by the context at timeout plus a grace period: it is a failed
+	// statement, not a failure of the service (CP2-12).
+	fail := func(err error) error {
+		if ctx.Err() == nil && errors.Is(qctx.Err(), context.DeadlineExceeded) {
+			return problem.SQL("canceling statement due to statement timeout", "57014", 0)
+		}
+		return queryProblem(err)
+	}
 	tx, err := conn.Begin(qctx)
 	if err != nil {
 		return api.QueryResult{}, connectProblem(err)
@@ -85,13 +97,18 @@ func (o *Ops) ExecuteQuery(ctx context.Context, actor string, req api.QueryReque
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 	// The timeout is a bind parameter of set_config, not part of the text.
 	if _, err := tx.Exec(qctx, "SELECT set_config('statement_timeout', $1, true)", strconv.Itoa(timeout)); err != nil {
-		return api.QueryResult{}, queryProblem(err)
+		return api.QueryResult{}, fail(err)
 	}
 	// The extended protocol refuses text with several statements.
 	rows, err := tx.Query(qctx, req.SQL, pgx.QueryExecModeExec)
 	if err != nil {
-		return api.QueryResult{}, queryProblem(err)
+		return api.QueryResult{}, fail(err)
 	}
+	// Only a plain read is cut short when its result is cut. Any other statement is read
+	// to its end and its rows beyond the limit are dropped, so that it completes and is
+	// committed: abandoning an UPDATE ... RETURNING half way would roll it back while the
+	// answer says it succeeded (CP2-11).
+	readOnly := plainRead(req.SQL)
 	res := api.QueryResult{Columns: []api.QueryColumn{}, Rows: [][]any{}}
 	bytesSoFar := 0
 	tm := conn.TypeMap()
@@ -103,10 +120,16 @@ func (o *Ops) ExecuteQuery(ctx context.Context, actor string, req api.QueryReque
 		res.Columns = append(res.Columns, api.QueryColumn{Name: fd.Name, Type: name})
 	}
 	for rows.Next() {
+		if res.Truncated {
+			continue // a statement that must complete: the rest of its rows is dropped
+		}
 		if len(res.Rows) >= limit {
 			res.Truncated = true
-			cancel() // stop the server from sending the rest
-			break
+			if readOnly {
+				cancel() // stop the server from sending the rest
+				break
+			}
+			continue
 		}
 		// The size is checked on the raw wire values before anything is converted.
 		cells := 0
@@ -114,20 +137,23 @@ func (o *Ops) ExecuteQuery(ctx context.Context, actor string, req api.QueryReque
 			if len(raw) > maxValueBytes {
 				cancel()
 				rows.Close()
-				return api.QueryResult{}, problem.New(problem.Unprocessable, fmt.Sprintf("A value in the result is larger than %d bytes; select a part of it (for example with substr).", maxValueBytes))
+				return api.QueryResult{}, valueTooLarge()
 			}
 			cells += len(raw) + 8
 		}
 		if bytesSoFar+cells > maxResultBytes {
 			res.Truncated = true
-			cancel()
-			break
+			if readOnly {
+				cancel()
+				break
+			}
+			continue
 		}
 		bytesSoFar += cells
 		vals, err := rows.Values()
 		if err != nil {
 			rows.Close()
-			return api.QueryResult{}, queryProblem(err)
+			return api.QueryResult{}, fail(err)
 		}
 		row := make([]any, len(vals))
 		for i, v := range vals {
@@ -135,8 +161,8 @@ func (o *Ops) ExecuteQuery(ctx context.Context, actor string, req api.QueryReque
 		}
 		res.Rows = append(res.Rows, row)
 	}
-	if res.Truncated {
-		// The result is cut: the transaction is abandoned, not committed.
+	if res.Truncated && readOnly {
+		// A read whose result is cut: the transaction is abandoned, not committed (it changed nothing).
 		rows.Close()
 		res.RowCount = len(res.Rows)
 		res.CommandTag = "SELECT " + strconv.Itoa(res.RowCount)
@@ -145,15 +171,15 @@ func (o *Ops) ExecuteQuery(ctx context.Context, actor string, req api.QueryReque
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return api.QueryResult{}, queryProblem(err)
+		return api.QueryResult{}, fail(err)
 	}
 	res.CommandTag = rows.CommandTag().String()
 	res.RowCount = len(res.Rows)
-	if n := int(rows.CommandTag().RowsAffected()); n > res.RowCount && len(res.Columns) == 0 {
+	if n := int(rows.CommandTag().RowsAffected()); n > res.RowCount && (len(res.Columns) == 0 || res.Truncated) {
 		res.RowCount = n
 	}
 	if err := tx.Commit(qctx); err != nil {
-		return api.QueryResult{}, queryProblem(err)
+		return api.QueryResult{}, fail(err)
 	}
 	res.DurationMs = float64(time.Since(started).Microseconds()) / 1000
 	return res, nil
@@ -213,10 +239,50 @@ func jsonValue(v any) any {
 	return fmt.Sprint(v)
 }
 
+func valueTooLarge() error {
+	return problem.New(problem.Unprocessable, fmt.Sprintf("A value or row in the result is larger than the limit (%d bytes per value, %d per row); select a part of it (for example with substr).", maxValueBytes, pgframe.MaxRoleMessage))
+}
+
+// plainRead tells whether a statement is a read by its first keyword (comments
+// skipped): SELECT, TABLE, VALUES or SHOW. Everything else, WITH included (it may
+// hold a data-changing statement), is treated as one that may change data.
+func plainRead(sql string) bool {
+	s := strings.TrimSpace(sql)
+	for {
+		switch {
+		case strings.HasPrefix(s, "--"):
+			i := strings.IndexByte(s, '\n')
+			if i < 0 {
+				return false
+			}
+			s = strings.TrimSpace(s[i+1:])
+		case strings.HasPrefix(s, "/*"):
+			i := strings.Index(s, "*/")
+			if i < 0 {
+				return false
+			}
+			s = strings.TrimSpace(s[i+2:])
+		default:
+			word := s
+			if i := strings.IndexFunc(s, func(r rune) bool { return !unicode.IsLetter(r) }); i >= 0 {
+				word = s[:i]
+			}
+			switch strings.ToLower(word) {
+			case "select", "table", "values", "show":
+				return true
+			}
+			return false
+		}
+	}
+}
+
 // queryProblem maps an error of a workbench statement: whatever PostgreSQL
 // rejected is a sql_error (422) with the SQLSTATE, as the contract says; only
 // connection-level failures are service problems.
 func queryProblem(err error) error {
+	if errors.Is(err, pgframe.ErrTooLarge) {
+		return valueTooLarge()
+	}
 	var pe *pgconn.PgError
 	if errors.As(err, &pe) && (len(pe.Code) < 2 || (pe.Code[:2] != "08" && pe.Code[:2] != "53")) {
 		return problem.SQL(pe.Message, pe.Code, int(pe.Position))
@@ -231,25 +297,56 @@ func queryProblem(err error) error {
 // Peak memory of one statement is the budget plus one row as it arrives from
 // PostgreSQL; the statement is canceled as soon as a limit is passed.
 const (
-	maxResultBytes = 16 << 20
+	maxResultBytes = pgframe.MaxRoleMessage
 	maxValueBytes  = 1 << 20
 	maxWorkbench   = 4
+	// maxWorkbenchPerRole keeps one role from holding every slot (CP2-15).
+	maxWorkbenchPerRole = 2
 )
 
-var workbenchSlots = make(chan struct{}, maxWorkbench)
+// workbench counts the statements running on this server, in all and per role.
+var workbench = struct {
+	sync.Mutex
+	total  int
+	byRole map[string]int
+}{byRole: map[string]int{}}
+
+// acquireWorkbench reserves a slot for role; the returned function frees it. It
+// reports false when the server is full or the role has its share running.
+func acquireWorkbench(role string) (release func(), ok bool) {
+	workbench.Lock()
+	defer workbench.Unlock()
+	if workbench.total >= maxWorkbench || workbench.byRole[role] >= maxWorkbenchPerRole {
+		return nil, false
+	}
+	workbench.total++
+	workbench.byRole[role]++
+	return func() {
+		workbench.Lock()
+		defer workbench.Unlock()
+		workbench.total--
+		if workbench.byRole[role]--; workbench.byRole[role] == 0 {
+			delete(workbench.byRole, role)
+		}
+	}, true
+}
 
 // dangerousRolesSQL says whether the current role has an attribute or a
 // membership that gives the operating system's file system or programs
 // (CP-05): a superuser, replication or BYPASSRLS attribute, or membership,
 // direct or indirect and inherited or not (SET ROLE can use it), in a
 // predefined role that reads or writes server files, runs programs or reads
-// the server log.
+// the server log. A membership that has neither the INHERIT nor the SET option
+// (PostgreSQL 16 and later give the creator of a role that bare ADMIN membership)
+// cannot use the role and does not count: counting it locked the administrator
+// that created a role out of the workbench as soon as that role was given a
+// dangerous predefined role in SQL.
 const dangerousRolesSQL = `
 WITH RECURSIVE me AS (SELECT oid, rolsuper, rolreplication, rolbypassrls FROM pg_catalog.pg_roles WHERE rolname = coalesce($2::text, current_user)),
 m(roleid) AS (
-    SELECT a.roleid FROM pg_catalog.pg_auth_members a WHERE a.member = (SELECT oid FROM me)
+    SELECT a.roleid FROM pg_catalog.pg_auth_members a WHERE a.member = (SELECT oid FROM me) AND (a.inherit_option OR a.set_option)
   UNION
-    SELECT a.roleid FROM pg_catalog.pg_auth_members a JOIN m ON a.member = m.roleid)
+    SELECT a.roleid FROM pg_catalog.pg_auth_members a JOIN m ON a.member = m.roleid WHERE a.inherit_option OR a.set_option)
 SELECT (SELECT rolsuper OR rolreplication OR rolbypassrls FROM me)
     OR EXISTS (SELECT 1 FROM pg_catalog.pg_roles r WHERE r.oid IN (SELECT roleid FROM m) AND r.rolname = ANY($1))`
 

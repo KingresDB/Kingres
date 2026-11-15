@@ -98,6 +98,10 @@ func (s *Server) storeProblem(r *http.Request, err error, notFound string) *prob
 	case errors.As(err, &arg):
 		return problem.Validation("A parameter is invalid.",
 			problem.FieldError{Field: arg.Field, Message: arg.Message, Code: "invalid"})
+	case errors.Is(err, store.ErrUnavailable) && s.deps.Ops != nil && s.deps.Ops.LocalInstanceDown():
+		// A request that was already running when the instance was stopped or
+		// restarted lost its connection: the documented answer, not a store failure.
+		return s.stoppedProblem()
 	case errors.Is(err, store.ErrUnavailable):
 		s.log.Warn("store unavailable", "request_id", stateOf(r).id, "error", err)
 		return problem.New(problem.ServiceUnavailable, "The local PostgreSQL instance is not available.").WithRetryAfter(5)

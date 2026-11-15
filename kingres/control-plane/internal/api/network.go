@@ -48,3 +48,12 @@ type NetworkAccessUpdateRequest struct {
 	// Rules is the complete new list.
 	Rules []NetworkAccessRule `json:"rules"`
 }
+
+// NetworkAccessCheck is the answer of a dry run of PUT /settings/network-access
+// (contract 0.6.0).
+type NetworkAccessCheck struct {
+	// Valid is always true: a refused change is a problem, not valid=false.
+	Valid bool `json:"valid"`
+	// Revision is the current revision, which the request matched.
+	Revision int64 `json:"revision"`
+}

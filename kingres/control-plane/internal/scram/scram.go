@@ -62,3 +62,73 @@ func mac(key []byte, msg string) []byte {
 	h.Write([]byte(msg))
 	return h.Sum(nil)
 }
+
+// Parsed is a verifier taken apart: what PostgreSQL stores in pg_authid.
+type Parsed struct {
+	Iterations int
+	Salt       []byte
+	// StoredKey is SHA-256(ClientKey): enough to check a client's proof, not to make one.
+	StoredKey []byte
+	ServerKey []byte
+}
+
+// ErrNotSCRAM means the stored password is not a SCRAM-SHA-256 verifier (an
+// MD5 hash, or no password at all).
+var ErrNotSCRAM = fmt.Errorf("scram: not a SCRAM-SHA-256 verifier")
+
+// Parse takes a verifier "SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>" apart.
+func Parse(verifier string) (Parsed, error) {
+	rest, ok := strings.CutPrefix(verifier, "SCRAM-SHA-256$")
+	if !ok {
+		return Parsed{}, ErrNotSCRAM
+	}
+	head, keys, ok := strings.Cut(rest, "$")
+	if !ok {
+		return Parsed{}, ErrNotSCRAM
+	}
+	iter, salt, ok := strings.Cut(head, ":")
+	stored, server, ok2 := strings.Cut(keys, ":")
+	if !ok || !ok2 {
+		return Parsed{}, ErrNotSCRAM
+	}
+	var p Parsed
+	var err error
+	if p.Iterations, err = strconv.Atoi(iter); err != nil || p.Iterations < 1 || p.Iterations > 1<<24 {
+		return Parsed{}, ErrNotSCRAM
+	}
+	enc := base64.StdEncoding
+	if p.Salt, err = enc.DecodeString(salt); err != nil || len(p.Salt) == 0 {
+		return Parsed{}, ErrNotSCRAM
+	}
+	if p.StoredKey, err = enc.DecodeString(stored); err != nil || len(p.StoredKey) != sha256.Size {
+		return Parsed{}, ErrNotSCRAM
+	}
+	if p.ServerKey, err = enc.DecodeString(server); err != nil || len(p.ServerKey) != sha256.Size {
+		return Parsed{}, ErrNotSCRAM
+	}
+	return p, nil
+}
+
+// ClientKey derives the SCRAM ClientKey of password under the salt and
+// iteration count of the verifier. It is what a client proves it knows; only
+// somebody who has seen the password (or this key) can compute it.
+func (p Parsed) ClientKey(password string) ([]byte, error) {
+	if password == "" || len(password) > MaxPasswordBytes || strings.ContainsRune(password, 0) {
+		return nil, fmt.Errorf("scram: the password must be 1 to %d bytes without NUL", MaxPasswordBytes)
+	}
+	pw := password
+	if s, err := precis.OpaqueString.String(password); err == nil {
+		pw = s
+	}
+	salted, err := pbkdf2.Key(sha256.New, pw, p.Salt, p.Iterations, sha256.Size)
+	if err != nil {
+		return nil, fmt.Errorf("scram: deriving key: %w", err)
+	}
+	return mac(salted, "Client Key"), nil
+}
+
+// Stored returns SHA-256(clientKey), the value a verifier keeps.
+func Stored(clientKey []byte) []byte {
+	s := sha256.Sum256(clientKey)
+	return s[:]
+}
