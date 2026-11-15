@@ -53,6 +53,13 @@ func (r *Resolver) Get(ctx context.Context) (string, error) {
 		r.ok = false
 		return "", err
 	}
+	// An empty answer ("the catalog names no leader") is not cached: a server that has just
+	// joined reads an empty catalog until the leader copies it, and a cached "" would make it
+	// refuse the leader's next calls (403 not_leader) for up to ttl after it became a member.
+	if v == "" {
+		r.ok = false
+		return "", nil
+	}
 	r.val, r.at, r.ok = v, r.now(), true
 	return v, nil
 }

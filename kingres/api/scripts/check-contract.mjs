@@ -189,7 +189,7 @@ for (const o of operations) {
 
 // Audit actions: operationIds plus a small closed list of non-operation events.
 // certificateRenewed and certificateRenewalFailed are the events of the certificate renewal job (0.5.0).
-const NON_OPERATION_EVENTS = ['loginFailed', 'setupTokenRejected', 'autoFailover', 'certificateRenewed', 'certificateRenewalFailed'];
+const NON_OPERATION_EVENTS = ['loginFailed', 'setupTokenRejected', 'autoFailover', 'certificateRenewed', 'certificateRenewalFailed', 'leaseLost', 'leaseFenced', 'leaseAcquired', 'standbyCreated', 'standbyRemoved', 'standbyRebuilt', 'standbyInstanceStarted', 'standbyInstanceRemoved', 'standbyInstanceRebuilt', 'synchronousStandbyNamesChanged', 'replicationSlotDropped'];
 const NOT_AUDITED_MUTATIONS = ['previewRebalancePlan', 'createInclusionProof', 'checkSetupToken'];
 const auditEnum = schemas.AuditAction?.enum;
 if (!Array.isArray(auditEnum)) fail('components.schemas.AuditAction', 'must be an enum');
@@ -377,9 +377,10 @@ const changelogOf = (version) => {
 const MUST_MENTION = {
   '0.4.0': ['system_database_stopped', 'server_owns_buckets', 'ledger_entry_pending', 'seenFingerprint', 'InclusionProof'],
   '0.6.0': ['addServer', 'allowUnpinned', 'internal_api_disabled', 'replicationPending', 'LedgerProofBlock', 'dryRun', 'degraded', 'additive'],
+  '0.7.0': ['cancelStatement', 'workbench_busy', 'AlertSubject', 'GroupLease', 'leaseLost', 'uncoveredShardGroupIds', 'additive'],
   '0.5.0': ['renewServerCertificates', 'revokeServerCertificates', 'certificate_authority_unavailable', 'certificate_revoked', 'certificateRenewalFailed', 'partial', 'additive'],
 };
-for (const version of ['0.4.0', '0.5.0', '0.6.0']) {
+for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0']) {
   const changelog = changelogOf(version);
   if (!changelog) { fail('README.md', `changelog heading for ${version} is missing`); continue; }
   for (const h of ['#### Breaking', '#### Additive', '#### Documentation']) if (!changelog.includes(h)) fail('README.md', `changelog of ${version} lacks "${h}"`);
@@ -391,7 +392,7 @@ for (const version of ['0.4.0', '0.5.0', '0.6.0']) {
   if (!m) fail('README.md', `the changelog summary of ${version} must state "N operations added (M operations, P paths)"`);
   else if (version === doc.info?.version && (Number(m[2]) !== operations.length || Number(m[3]) !== Object.keys(doc.paths ?? {}).length)) fail('README.md', `changelog says ${m[2]} operations and ${m[3]} paths, the contract has ${operations.length} and ${Object.keys(doc.paths ?? {}).length}`);
 }
-if (doc.info?.version !== '0.6.0') fail('info.version', 'the contract is revision 0.6.0');
+if (doc.info?.version !== '0.7.0') fail('info.version', 'the contract is revision 0.7.0');
 
 
 // 0.5.0 rules: certificate operations, partial answers, additive changes only.
@@ -436,6 +437,33 @@ if (!problemCodes.has('internal_api_disabled')) fail('ProblemCode', 'missing int
 for (const [n, prop] of [['SetupTaskSummary', 'detail'], ['NodeStateInfo', 'internalFingerprint'], ['LocalServerInfo', 'internalFingerprint']]) {
   if (!schemas[n]?.properties?.[prop]) fail(n, prop + ' is missing');
   if ((schemas[n]?.required ?? []).includes(prop)) fail(n, prop + ' must stay optional (additive change)');
+}
+// 0.7.0 rules, high availability part 1 (additive only): typed alert subject, ledger coverage, the workbench
+// busy code, cancelStatement, the lease of a group, the new alert kinds, audit actions and metric names.
+{
+  const cancel = opById.get('cancelStatement');
+  if (!cancel || cancel.method !== 'post' && cancel.method !== 'POST') fail('cancelStatement', 'must exist as a POST');
+  else {
+    if (cancel.op['x-required-role'] !== 'kingres_readonly') fail('cancelStatement', 'x-required-role must be kingres_readonly');
+    for (const code of ['204', '404', '405']) if (!cancel.op.responses?.[code]) fail('cancelStatement', 'must list ' + code);
+  }
+  if (!schemas.QueryRequest?.properties?.statementId?.pattern) fail('QueryRequest', 'statementId (with a pattern) is missing');
+  if ((schemas.QueryRequest?.required ?? []).includes('statementId')) fail('QueryRequest', 'statementId must stay optional');
+  if (!opById.get('executeQuery')?.op.responses?.['429']) fail('executeQuery', 'must list 429 (workbench_busy)');
+  if (!problemCodes.has('workbench_busy')) fail('ProblemCode', 'missing workbench_busy');
+  if (schemas.Alert?.properties?.subject?.$ref !== '#/components/schemas/AlertSubject') fail('Alert', 'subject must reference AlertSubject');
+  if ((schemas.Alert?.required ?? []).includes('subject')) fail('Alert', 'subject must stay optional (additive change)');
+  for (const p of ['serverId', 'behindServerId', 'shardGroupId', 'databaseName', 'aspect']) if (!schemas.AlertSubject?.properties?.[p]) fail('AlertSubject', p + ' is missing');
+  for (const k of ['leaseLost', 'groupWithoutSynchronousStandby', 'groupUnderReplicated']) if (!(schemas.AlertKind?.enum ?? []).includes(k)) fail('AlertKind', 'missing ' + k);
+  for (const a of ['cancelStatement', 'leaseLost', 'leaseFenced', 'leaseAcquired']) if (!(schemas.AuditAction?.enum ?? []).includes(a)) fail('AuditAction', 'missing ' + a);
+  for (const p of ['complete', 'uncoveredShardGroupIds']) {
+    if (!schemas.LedgerStatus?.properties?.[p]) fail('LedgerStatus', p + ' is missing');
+    if ((schemas.LedgerStatus?.required ?? []).includes(p)) fail('LedgerStatus', p + ' must stay optional (additive change)');
+  }
+  const lease = schemas.GroupLease;
+  if (JSON.stringify(lease?.properties?.state?.enum) !== '["held","lost","granted","none"]') fail('GroupLease', 'state enum must be [held, lost, granted, none]');
+  if (schemas.ShardGroup?.properties?.lease?.$ref !== '#/components/schemas/GroupLease' || (schemas.ShardGroup?.required ?? []).includes('lease')) fail('ShardGroup', 'lease must be an optional GroupLease');
+  for (const m of ['clientConnectionsAccepted', 'clientBytesOut', 'clientStandbyConnectionsActive']) if (!(schemas.MetricName?.enum ?? []).includes(m)) fail('MetricName', 'missing ' + m);
 }
 // ------------------------------------------------------------------ report
 const pathCount = Object.keys(doc.paths ?? {}).length;

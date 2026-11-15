@@ -43,3 +43,19 @@ func TestCacheAndExpiry(t *testing.T) {
 		t.Fatalf("stale value served: %q", v)
 	}
 }
+
+// A source that says "no leader yet" must be asked again at once: the answer
+// changes the moment the catalog is copied to a server that has just joined.
+func TestNoLeaderIsNotCached(t *testing.T) {
+	now := time.Unix(1000, 0)
+	val := ""
+	calls := 0
+	r := New(func(context.Context) (string, error) { calls++; return val, nil }, 2*time.Second, func() time.Time { return now })
+	if v, err := r.Get(context.Background()); v != "" || err != nil {
+		t.Fatalf("Get = %q, %v", v, err)
+	}
+	val = "s1" // the catalog arrived; no time passed
+	if v, _ := r.Get(context.Background()); v != "s1" {
+		t.Fatalf("an empty answer was served from the cache: %q (source called %d times)", v, calls)
+	}
+}

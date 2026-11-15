@@ -9,3 +9,5 @@ import "os/exec"
 func setProc(*exec.Cmd) {}
 
 func terminate(cmd *exec.Cmd, _ bool) { _ = cmd.Process.Kill() }
+
+func pause(*exec.Cmd, bool) {}

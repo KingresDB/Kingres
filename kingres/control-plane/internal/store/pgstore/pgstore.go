@@ -28,6 +28,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ha"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/store"
 )
 
@@ -55,6 +56,9 @@ type Options struct {
 	// the catalog): the cluster certificate is the client certificate and
 	// replaces the password (design D3). nil: the local credentials are used.
 	NodeTLS func(host string) (*tls.Config, error)
+	// HA connects the store to heartbeats, leases and standbys (nil: none are
+	// running; the catalog alone decides).
+	HA *ha.Registry
 }
 
 // Store is the PostgreSQL implementation of store.Store.

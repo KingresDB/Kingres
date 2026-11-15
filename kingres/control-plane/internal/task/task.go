@@ -18,6 +18,8 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fence"
 )
 
 // State of a task.
@@ -470,7 +472,7 @@ func (e *Engine) run(ctx context.Context, t Task, started time.Time, secrets map
 			return e.cancelTask(ctx, t, def, i)
 		}
 		e.fault(FaultStepStarted, t.ID, i)
-		if err := st.Run(runCtx, env); err != nil {
+		if err := st.Run(fence.With(runCtx, fence.Token{Task: t.ID, Epoch: env.lease.Epoch}), env); err != nil {
 			if runCtx.Err() != nil && ctx.Err() == nil {
 				return ErrLeaseLost
 			}

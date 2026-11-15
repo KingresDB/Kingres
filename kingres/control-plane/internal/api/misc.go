@@ -56,6 +56,9 @@ type ShardGroup struct {
 	Standbys []ReplicationMember `json:"standbys"`
 	// Slots are the replication slots on the primary.
 	Slots []ReplicationSlot `json:"slots"`
+	// Lease is the group lease as the answering server knows it (contract 0.7.0,
+	// optional): who holds it and whether this server holds, lost or granted it.
+	Lease *GroupLease `json:"lease,omitempty"`
 }
 
 // ReplicationTopology is the replication state of the cluster.
@@ -318,6 +321,10 @@ type LedgerStatus struct {
 	LastVerifiedAt *Time `json:"lastVerifiedAt"`
 	// LedgerTableCount is the number of ledger tables.
 	LedgerTableCount *int `json:"ledgerTableCount"`
+	// Complete and UncoveredShardGroupIDs (contract 0.7.0): chains holds the chain of the shard
+	// group of the answering server; the other shard groups of the database are listed here.
+	Complete               bool    `json:"complete"`
+	UncoveredShardGroupIDs []int32 `json:"uncoveredShardGroupIds"`
 	// Chains has one entry per chain.
 	Chains []LedgerChainStatus `json:"chains"`
 }
@@ -356,4 +363,16 @@ type LedgerBlockPage struct {
 	Items []LedgerBlock `json:"items"`
 	// NextCursor is null on the last page.
 	NextCursor *string `json:"nextCursor"`
+}
+
+// GroupLease is the lease of a shard group (contract 0.7.0): the server that
+// holds it and its state at the server that answers. State is held (the answering
+// server holds it), lost (it ran the primary and could not renew), granted (it
+// granted the lease to Holder) or none. Enforced says that losing the lease stops
+// the instance (the group has a standby).
+type GroupLease struct {
+	Holder          string `json:"holder"`
+	State           string `json:"state"`
+	RemainingMillis *int64 `json:"remainingMillis,omitempty"`
+	Enforced        bool   `json:"enforced"`
 }

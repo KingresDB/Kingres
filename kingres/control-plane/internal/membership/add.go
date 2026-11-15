@@ -59,6 +59,11 @@ type Manager struct {
 	// GatherSigner signs the assertions of gather calls when this server is the
 	// leader (see Gatherer.Ask).
 	GatherSigner *fwdproof.Signer
+	// Standbys removes the standbys that go with a server that is removed or leaves
+	// (nil: none are managed).
+	Standbys interface {
+		PurgeServer(ctx context.Context, server string) error
+	}
 
 	gatherMu   sync.Mutex
 	gatherAuth map[string]*gatherAuth

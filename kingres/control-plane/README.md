@@ -96,7 +96,7 @@ CGO_ENABLED=1 go test -race ./...   # needs a C compiler (gcc) on PATH
 Integration tests against real PostgreSQL instances run when `KINGRES_PG_BIN` is set.
 `scripts/run-integration.ps1` builds the test binaries for Linux, copies them into WSL2 and runs them against
 the installation in `~/kw-cp/install` (`scripts/run-wsl-tests.sh`); every instance is created by the instance
-manager itself in a throwaway directory under `~/kw-cp/test`, on ports 56000-56199, and removed afterwards.
+manager itself in a throwaway directory under `~/kw-cp/test`, on a slice of 200 ports of its own (20000-27999, see "Carry-overs"), and removed afterwards.
 
 ```
 .\scripts\run-integration.ps1 [-Port 56010] [-Race]
@@ -148,7 +148,7 @@ server at start. The DSN is never logged.
 | `version-check-interval` | `KINGRES_VERSION_CHECK_INTERVAL` | `1m` | how often the manager leader compares the versions of the servers (`versionMismatch`) |
 | `gather-timeout` | `KINGRES_GATHER_TIMEOUT` | `3s` | the time one server gets to answer its part of a cluster-wide read of logs, alerts or metrics |
 | `allow-remote-setup` | `KINGRES_ALLOW_REMOTE_SETUP` | `false` | `true` lets the setup operations come from non-loopback addresses while uninitialized (containers listening on `0.0.0.0`); the setup token is still required |
-| `-version` | | | prints version, contract revision (0.5.0) and build commit (`-ldflags "-X main.commit=..."`, else `unknown`) |
+| `-version` | | | prints version, contract revision (0.7.0) and build commit (`-ldflags "-X main.commit=..."`, else `unknown`) |
 | `-stop-instances` | | | stops the managed instances (fast shutdown) and exits |
 | `tls-cert-file`, `tls-key-file` | `KINGRES_TLS_CERT_FILE`, `KINGRES_TLS_KEY_FILE` | none | enable HTTPS (both or neither) |
 
@@ -263,7 +263,7 @@ paths; what is not done is in "Not done in this increment"). "Real" means the op
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **80 of 88 operations are real; 8 answer "not yet".**
+authenticated operation lists in 0.2.0. **81 of 89 operations are real; 8 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -280,7 +280,7 @@ authenticated operation lists in 0.2.0. **80 of 88 operations are real; 8 answer
 | Health | `getHealth`, `getReadiness` |  |
 | Logs | `listLogs` |  |
 | Metrics | `queryMetrics` |  |
-| Query | `executeQuery` |  |
+| Query | `executeQuery`, `cancelStatement` |  |
 | Rebalance |  | `getRebalanceStatus`, `startRebalance`, `previewRebalancePlan`, `listRebalanceReports`, `getRebalanceReport`, `stopRebalance` |
 | Replication | `getReplicationTopology` | `restorePreferredPrimaries` |
 | Server groups | `listServerGroups`, `createServerGroup`, `deleteServerGroup` |  |
@@ -1720,8 +1720,9 @@ shutdown; it is corrected to `failed` when the instance does not stop. A crash o
 ### Limits that remain
 
 - The residual of CP2-06: a process paused between the atomic `running` mark and the first side effect of a
-  non-idempotent step can still act after its lease ended. `Env.Fence()` hands the epoch to a step so that a callee
-  can fence remote calls; no step uses it yet.
+  non-idempotent step can still act after its lease ended. Since the sixth increment every remote call of a step
+  carries the fencing epoch and the callee refuses a lower one (see "Carry-overs"); the residue is a late call to a
+  callee that the newer run has not called yet, and an effect of the step on its own server.
 - Digests and verifications still cover only the chain of the server that makes them.
 - A cluster-wide read is refused (the server shows as missing) when the leader cannot be reached or cannot check the proof.
 - The replay cache of forwarded proofs is per server and lost on restart (a replay needs a proof captured from a
@@ -1730,6 +1731,484 @@ shutdown; it is corrected to `failed` when the instance does not stop. A crash o
 - Events of a removed server are gone with it (audit); a disk that fills between the pre-flight check and the final
   audit record only logs the failure.
 - Schema version is 5 (`0005_task_fence.sql`: `task.lease_epoch`, `ledger_digest_actor`).
+
+## Sixth increment: high availability, part 1 (contract 0.7.0)
+
+Status of the work in this section: see the end of each subsection. The design is `kingres/docs/design/ha-phase5.md`
+(part A, part B up to the promotion step, part D). The promotion (catalog swap, `failoverServer`,
+`restorePreferredPrimaries`) needs the sharding extension 0.4 and is part 2.
+
+### Heartbeats and liveness
+
+Every server sends every other server of the peer directory a heartbeat (`POST /internal/v1/heartbeat`, see
+`internal-api.md`) each `heartbeat-interval`, and a server that answers a heartbeat has proven itself alive just as
+one that sends it has. Package `internal/liveness` keeps, per server, the monotonic time (package `internal/clock`) at
+which this server last heard from it. Nothing that travels carries a time: the receiver notes the arrival on its own
+monotonic clock, so a step of the system clock changes nothing but the wall time shown as `lastHeartbeatAt`.
+
+| Flag / file key | Environment variable | Default | Meaning |
+|---|---|---|---|
+| `heartbeat-interval` | `KINGRES_HEARTBEAT_INTERVAL` | `1s` | how often a heartbeat is sent to every other server; at most half of `suspect-timeout` |
+| `suspect-timeout` | `KINGRES_SUSPECT_TIMEOUT` | `5s` | silence after which a server is shown as `suspect` |
+| `failure-timeout` | `KINGRES_FAILURE_TIMEOUT` | `10s` | silence after which a server is shown as `dead` (the contract text: no liveness for the failure timeout) |
+| `leader-loss-bound` | `KINGRES_LEADER_LOSS_BOUND` | `30s` | how long a server that cannot hear the manager leader keeps authorizing sessions from its own copy of roles and grants |
+| `fault-dir` | `KINGRES_FAULT_DIR` | empty (off) | **tests only**: the fault-injection hook (`internal/fault`) reads `faults.json` there; see "Tests" below |
+
+**Status.** `GET /servers`, `GET /servers/{id}` and the counts of `GET /cluster` put the heartbeats over the catalog
+status: silent for `suspect-timeout` is `suspect`, silent for `failure-timeout` is `dead`, and when the server is heard
+again the status the catalog gives (`live`, `pendingRebalance`, `draining`) shows again, because nothing is stored.
+A server that never answered since this server learned of it becomes `dead` after the failure timeout too; before the
+first suspect timeout it keeps the catalog status. `lastHeartbeatAt` is the wall time of the last heartbeat, derived
+from its monotonic age (so it moves with a wall-clock step; the decision does not); for this server it is the current
+time. Servers that are only pending (an add that is running) are not listed, so they cannot be shown dead. A server
+whose instance was stopped on purpose still heartbeats (kingresd runs), so it is not dead.
+
+**One view.** The counts of the overview are made from the very list `GET /servers` builds (one catalog snapshot, one
+status function), so for one server the counts and the list agree. **Each server answers from its own heartbeat view**
+(all servers heartbeat all others): a follower can show `suspect` for a server a moment before the leader does. The
+leader view is the one the alerts follow.
+
+**Alerts.** While a server is the manager leader it raises `serverSuspect` (warning) and `serverDown` (critical, the
+existing kind) for the other servers in its own alert table, with the subject `server:<id>`, and clears them when the
+server is heard again (`internal/monitor/liveness.go`, reconciled by `cmd/kingresd/ha_liveness.go` every interval on a
+change and every ten intervals otherwise, so a restarted leader recovers them). The `serverDown` that a server raises
+about its own stopped instance is unchanged and lives in that server table. An alert about a server that was removed
+from the cluster while it was dead is not cleaned up by this code (limit).
+
+**A stalled process does not judge the others.** A kingresd that was frozen (SIGSTOP, a suspended virtual machine) and
+wakes up has not heard from anybody for longer than the failure timeout by its own count. The tracker notices a gap of
+more than three intervals between its own ticks, answers meanwhile what it knew before the stall and, at the next
+tick, gives every server a fresh window (`TestStalledProcessDoesNotJudgeItsPeers`, and in the cluster
+`TestHeartbeatsAndLiveness/a_paused_process...`).
+
+**The cached view and the leader (the deferred half of CP2-07).** Roles, grants and settings are changed on the
+leader, which pushes the change to every server (`replicate.apply`). A follower that cannot hear the leader cannot
+learn of a revoked role. Decision, and exactly which decisions need the leader:
+
+- A server trusts its own copy for authorizing a **session** (cookie, bearer token, forwarded identity: every
+  operation that goes through `currentRoles` of the guard) while it is the leader, while it has never learned a
+  leader, and while the leader was heard within `leader-loss-bound`. Beyond the bound every such request answers
+  `503 leader_unavailable` with `Retry-After: 5`, and the server serves again as soon as the leader is heard
+  (`httpapi.Deps.LeaderTrusted`, `leaderTrusted` in `cmd/kingresd/ha_liveness.go`). The leader is heard through the
+  heartbeat in either direction.
+- Everything that needs no session is unchanged: the health and readiness probes, `getSession` and the start of a
+  stopped instance in the stopped state (these use `LastGood`, bounded to one hour and flagged `degraded`, as before).
+- A blip shorter than the bound changes nothing: `TestHeartbeatsAndLiveness/a_short_blip...` reads on an isolated
+  follower for five seconds and every read answers 200. The default bound of 30 s is three times the default
+  failure timeout.
+- The residue that stays: for up to `leader-loss-bound` after the contact is lost a follower authorizes from its copy,
+  as it did before (a role revoked on the leader during that time can still work on the isolated follower for that
+  long). The leader is told by the heartbeat only; a leader that is reachable but whose kingresd is wedged is judged
+  by its answers like any server.
+
+**Tests.** Unit: `liveness` (fake clocks, a wall-clock step, a stalled process, the beater), `monitor`
+(`TestPeerLivenessConditions`). Cluster (`internal/clustertest/liveness_test.go`, three real kingresd processes with
+short bounds 0.5 s / 3 s / 6 s / 12 s): a killed server is `dead` on every server within the bound (measured: 5.7 s
+after the kill on the leader), `serverDown` raised and cleared, the counts agree with the list, the status after the
+restart equals the one before; a one-way cut (one server cannot call another, the answers still reach it) changes
+nothing for 14 s; a partition shows both sides dead to each other and heals; a follower isolated from the leader refuses
+sessions after the bound and not before; a paused process does not declare the others dead when it wakes; a step of
+the wall clock (hook `clockOffsetMs`) changes nothing. The hook of `fault-dir` is read by the peer client (outbound
+calls fail as unreachable) and the internal API (inbound calls are dropped without an answer); it exists only so that
+tests can cut the network inside the process without firewall rules or root, and is off unless `fault-dir` is set.
+`scripts/smoke3.sh` step 15b stops a server and checks that the others list it as dead and then as alive again.
+
+### Leases and fencing
+
+What exists (design `ha-phase5.md`, "Fencing by lease"; code in `internal/lease`, `cmd/kingresd/ha_leases.go`,
+`cmd/kingres-watchdog`):
+
+- **Grantor.** Every server answers `POST /internal/v1/lease/grant` (see `internal-api.md`). It keeps one holder per
+  shard group and refuses every other holder until the lease has expired **plus** the safety margin. A grant that
+  changes the holder is written to `<data-dir>/lease/grants.json` (temporary file, fsync, atomic rename, fsync of the
+  directory) **before** it is answered; if it cannot be written it is not granted. A restarted grantor reads the file and
+  assumes every grant in it was made just now for its full duration: it refuses other holders for `lease-duration` plus
+  `lease-margin` after the restart, which is the longest a lease can still be alive. A grants file that cannot be read
+  stops the grantor (and with it kingresd) at start: an unreadable record is not the same as an empty one.
+- **Holder.** The `kingresd` that runs a group's primary (the group whose `primary` node in the catalog has this server's
+  host and port) renews every `lease-renew`. A round asks every server of the catalog (itself through its own grantor,
+  without the network) and counts the grants; with a majority of the catalog's distinct hosts the lease is valid until
+  **the start of the round** plus `lease-duration`, on this server's monotonic clock. Time of day is never compared:
+  only durations travel (the request carries `durationMs`, the refusal `waitMs`).
+- **Fencing.** The holder acts on a lease only until `lease-duration` minus `lease-margin` after the round start
+  (`Holds`). A check every 100 ms (`lease.Manager.Check`) fences when that time has passed without a successful round:
+  it writes the **fence marker** `<data-dir>/lease/fenced`, then stops the instance with `pg_ctl stop -m immediate`
+  (no checkpoint, no waiting for clients), and audits `leaseLost` and `leaseFenced`. While the marker exists the instance
+  manager's start gate refuses to start the instance (`instance.ErrLeaseRequired`: the instance start operations fail,
+  the start at kingresd's own start is skipped with a warning). The next successful round removes the marker, starts
+  the instance and audits `leaseAcquired`. The marker is on disk, so a restart of kingresd or of the machine does not
+  start the primary without a lease either.
+- **Enforcement rule (decided).** Self-fencing is enforced only for a group that has at least one standby (the standby
+  manager answers `Standbys().HasStandby(group)` from local knowledge). For a group without a standby nothing could be
+  promoted, so stopping the only copy would cost availability and buy nothing: the lease is still acquired, renewed and
+  reported, and its loss raises the alert `leaseLost` (critical, subject `server:<id>|group:<n>`) and the audit event
+  `leaseLost`, without stopping the instance. A one-server cluster has one member and a majority of one: it grants itself
+  its lease.
+- **Watchdog.** `kingres-watchdog` (standard library only, about 90 lines) covers a dead or hung `kingresd` next to a
+  live primary. For an enforced group kingresd starts it after the first successful round, detached in its own session
+  (a signal to kingresd's process group does not reach it; it takes an exclusive lock so one runs per instance). After every
+  renewal kingresd replaces `<data-dir>/instances/1/lease.json` with `{"seq": N, "validMs": V}`: `seq` changes with every
+  write and `V` is how long the lease still lets the primary run (round start plus duration minus margin, minus the time
+  since). The file contains **no time of day**. The watchdog polls it every 250 ms, remembers on its own monotonic clock
+  when it last saw `seq` change, and when `V` has passed since then it writes the fence marker and stops the instance
+  with an immediate shutdown. It exits when the instance is no longer running (the pid in `postmaster.pid` is gone) or
+  after the fence. It starts at the next renewal after the group counts as enforced (a standby appeared), so there is a window of at most `lease-renew` in which a frozen kingresd is not yet covered by it. It is looked for in `pg-bin-dir`, then next to the kingresd binary; without it kingresd warns once
+  and only the in-process fence protects the group.
+- **Views.** `GET /replication/topology` shows, per group, `lease` (`holder`, `state`, `remainingMillis`, `enforced`) as
+  the answering server knows it: `held` or `lost` for the group whose primary it runs, `granted` (holder and time left)
+  for a group it granted to another server. `GET /internal/v1/lease/state` shows the same with the grants.
+
+#### Why this is safe (the two timelines)
+
+Let `D` be `lease-duration`, `M` `lease-margin`, `s` the instant a renewal round started on the holder and `r >= s` the
+instant a grantor of the majority received its request (the request is sent after `s`). The holder stops acting on the
+lease at `s + D - M` on its clock and has stopped the instance moments after (an immediate shutdown does not wait for
+clients; the check interval of 100 ms and the stop itself must fit in the margin). The grantor refuses every other holder
+until `r + D + M` on its clock. A new holder needs a majority, and any two majorities share a server, so a new holder
+cannot be granted before `r + D + M`; the old holder's last act is at about `s + D - M`. Between them lies at least
+`2M` (6 s with the defaults) minus the difference in the speed of the two clocks over `D` and the scheduling delay of the
+check: the margin must be larger than both (it is a setting). The first timeline is measured by the tests: the last
+write the old primary acknowledged against the earliest instant at which the grantors of the majority would grant the
+group to another holder (`TestPartitionedPrimaryWithStandbyStopsBeforeANewHolderCouldBeGranted`: with `D=6s, M=2s` the last
+write was acknowledged 3.4 s after the cut and the lease was free 7.4 s after it).
+
+A holder that is paused (SIGSTOP, a stalled virtual machine) and resumed does not trust its past: every judgement uses
+the monotonic clock, which keeps running while the process is stopped, and a lease obtained by a round that started
+before the pause is valid from that start only, so answers that arrive late give a lease that is already over. While it
+is paused the watchdog does its job. A step of the system clock does not matter because no decision reads it
+(`clock.Clock.Mono`); the tests step the wall clock of a server through the fault hook and see nothing change.
+
+#### Settings (flags, environment, file keys)
+
+| Flag / file key | Environment variable | Default | Meaning |
+|---|---|---|---|
+| `lease-duration` | `KINGRES_LEASE_DURATION` | `10s` | validity of a lease from the start of the round that obtained it |
+| `lease-renew` | `KINGRES_LEASE_RENEW` | `2s` | how often the holder renews (at most half of duration minus margin) |
+| `lease-margin` | `KINGRES_LEASE_MARGIN` | `3s` | safety margin: the grantor waits it after expiry, the holder fences that long before |
+| `fault-dir` | `KINGRES_FAULT_DIR` | empty (off) | **tests only**: directory polled for `faults.json` (package `fault`): blocked servers in each direction, a wall-clock offset, and `forceEnforce`, which makes every group count as having a standby |
+
+#### Decisions (leases)
+
+1. The **fence marker** is a file, not state in memory: a start gate in the instance manager reads it, so that no path
+   (the start operation, kingresd's start, a restart of the machine) starts the primary of a fenced group.
+2. A restarted `kingresd` judges nothing until its first renewal round has finished, so a primary that kept running
+   while kingresd was restarted is not stopped before the first round could succeed. The window is at most one round
+   (`lease-duration - lease-margin`); a primary that the watchdog stopped in the meantime stays stopped.
+3. The **majority** is counted over every distinct host in `kingres.node` (read from the local catalog, cached in
+   `<data-dir>/lease/topology.json` for the time the instance is down), active or not: a dead server is still a member.
+   A change of one server changes the set by one, and the majorities of the old and new sets intersect. A server that
+   is being added has no entry before its registration step.
+4. The grantor **persists only a change of holder** (or a longer duration); renewals by the same holder are memory only.
+   After a restart the persisted duration is assumed to start now, which is never earlier than the truth.
+5. The lease views are **this server's knowledge**, not a gathered cluster view.
+6. The watchdog is started **next to** the instance by kingresd (see the departures).
+
+Limits: a lease-based fence cannot stop a primary on a machine that is frozen as a whole and then resumed with the same
+processes in the middle of a write that was already acknowledged to the kernel; and the guarantee needs `M` larger
+than clock-rate error and scheduling delay (stated above). Not done in this part: nothing grants a lease to another
+server (failover is part 2); `leaseLost` for an enforced group is raised only while its instance can store alerts, the
+`serverDown` alert covers the rest.
+
+### Standbys
+
+Package `internal/standby`, design `ha-phase5.md` part A, without the sharding catalog (the installed extension is 0.2;
+see "What part 2 must add" below). Every shard group has one primary and `defaultReplicaCount` standbys (0 to 3; the
+setting is `replica.default` in `kingres_cp.cluster_setting`, ADR 0011).
+
+**What exists**
+
+- **Placement** (`placement.go`, pure functions): the standbys of the group whose primary runs on server *i* go to the
+  next servers after *i* in the ring (the servers in the order of their groups, wrapping), skipping servers of the
+  primary's server group while other choices exist and preferring a server group no earlier standby of the group
+  uses. A server never runs two instances of one group, so with fewer servers than `replicaCount + 1` the group has
+  fewer standbys (it is under-replicated). Placement is stable: a standby that works stays where it is when servers
+  join; lowering the count removes the least preferred.
+- **The task `standby.reconcile`** (subject `replication` / `standbys`, at most one at a time; the kind is not in the
+  contract's `TaskKind` list until 0.7.0): the leader checks every 10 s (and at once when `defaultReplicaCount` is patched,
+  even to the same value) whether the standbys match the catalog and the setting, and starts the task with the work it
+  found. The steps are, group by group: remove standbys, create standbys, rebuild standbys, "Send the list of standbys to
+  every server", and `standby.register_in_catalog`. A failed create or rebuild is tried again after 30 s (not a setting).
+- **Creating a standby** (target server, `POST /standby/create`): the leader first records the standby in
+  `kingres_cp.standby` and sends the list (the standby not yet ready) to every server, so the primary's server knows it;
+  the target then creates the **physical slot** `kingres_standby_<id>` on the primary (`pg_create_physical_replication_slot`
+  with immediate reservation, over a certificate-authenticated connection), takes the base backup with
+  `pg_basebackup -X stream -S <slot>` over the **replication connection authenticated by the server certificate** (no
+  password), writes the managed configuration of the standby (a copy of the primary instance's with a free port,
+  `hot_standby`, `primary_conninfo` with the certificate options, `primary_slot_name`, application name
+  `kingres_standby_<id>`), writes `standby.signal` and starts it as an instance of its own in
+  `<data-dir>/instances/<100 + group>`. The record becomes `ready` and the list is sent again. Every part checks what
+  exists, so a repeated task step continues (a base backup without its metadata file is thrown away and made again).
+- **Replication rules in `pg_hba.conf` and `pg_ident.conf`**: next to the existing `hostssl all all <cidr> cert map=kingres_nodes`
+  lines there is now `hostssl replication all <cidr> cert map=kingres_nodes` for every peer network (`all` never matches a
+  replication connection). The ident map is the existing one: the certificate name of any server maps to any role. A standby
+  has the same two files as the primary instance of its server (`Manager.SyncAccess`, checked every round) plus a rule that
+  lets kingresd in over the private unix socket by peer authentication: a standby is a copy of another server's data, so its
+  service role has that server's password, not this server's.
+- **Supervision** (`Agent.Run`, every server, every 3 s): the standby instances of this server are started when they are not
+  running (a restart of kingresd or of the machine resumes them), their access files follow the primary instance's, a changed
+  server certificate, CA or revocation list makes them reload, and a standby that the list no longer names (removed while its
+  server was unreachable) is deleted.
+- **The primary's side** (same loop, on the server that runs a group's primary, no leader needed): slots exist for the standbys
+  of the list and for no others (an inactive slot that belongs to no listed standby is dropped); a slot that retains at least
+  `slot-retention-warn-bytes` raises `replicationLagHigh` (subject `server:<s>|group:<g>|standby:<id>`); above
+  `slot-retention-limit-bytes` the slot is **dropped** (audited `replicationSlotDropped`) and the standby is marked as lost;
+  a ready standby whose slot is missing or `lost` is marked the same. The leader reads the marks (`GET /standby/status`, every
+  check) and rebuilds those standbys (`POST /standby/rebuild`: the instance is deleted, a new slot and a new base backup are
+  made; with `diverged` set `pg_rewind` is tried first and the new base backup is the fallback; nothing in this phase sets it,
+  the promotion of part 2 does).
+- **`synchronous_standby_names`** (`syncnames.go`, `SyncState.Decide`): `ANY 1 (<all the group's ready standbys>)` as soon as
+  at least one of them is connected and streaming; empty for a group without standbys. When no standby streams, the setting is
+  left alone for `standby-sync-grace` (default 30 s: a standby that reconnects within it never lets commits through without
+  it); after it the setting is emptied so that the group keeps accepting writes, `groupWithoutSynchronousStandby` is raised and
+  stays until a standby streams again, when the setting is put back and the alert clears. It is never emptied while the hook
+  `Agent.Frozen(group)` says that a failover of the group is being decided (no failover exists yet). A standby that has not
+  streamed yet is not put in the setting, so a new standby never makes its group wait during the base backup. This is the
+  trade of the design: commits are acknowledged by two servers while a standby streams and by one after the grace period,
+  which the alert says in those words. The setting lives in `kingres-managed.conf` (`Extra`), not in `ALTER SYSTEM`.
+- **Alerts**: `groupWithoutSynchronousStandby` (per server and group, on the primary's server), `groupUnderReplicated` (cluster
+  scope, `cluster|group:<g>`, raised by the leader when fewer standbys stream than the replica count at three checks in a
+  row; never in a one-server cluster, where nothing can be placed), and `replicationLagHigh` for slot retention. The first
+  two kinds are not in the `AlertKind` enum of contract 0.6.0 (0.7.0 adds them).
+- **Views**: `getReplicationTopology` lists the standbys kingresd manages in the `standbys` of their group, with the
+  synchronous state and the lag the primary reports for the walsender of the same application name; a group whose standby
+  does not stream is `degraded`. Their `instanceId` is `1048576 + standby id` (they have no catalog node id yet). Every
+  server holds the whole list, so every server answers the same.
+- **Removing a server** (`removeServer`, `leaveCluster`): a step "Remove the standbys of the server" runs after the checks and
+  before the server is unregistered. It deletes the standbys that run on the server and the standbys of the group whose
+  primary it runs, with their slots; the server that goes also deletes its standby instances when it is reset
+  (`Service.RemoveInstance`). The groups that remain place their standbys again.
+- **Persistence**: the leader's record is `kingres_cp.standby` (migration `0006_standby.sql`, schema version 6, plus the
+  sequence `kingres_cp.standby_plan_version`). Every server keeps the list the leader sent in
+  `<data-dir>/standby/state.json` (fsync and atomic replace) and a metadata file `kingres-standby.json` in the directory of
+  each standby it runs. An older list never replaces a newer one, also not after a change of leader (the version is a
+  sequence of the system database).
+
+**Configuration keys** (in `internal/config/ha.go`; flag, `KINGRES_*` environment variable and file key as for every setting)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `standby-sync-grace` | `30s` | how long no standby may stream before the group stops waiting for it |
+| `slot-retention-warn-bytes` | `1073741824` | WAL a standby's slot may retain before `replicationLagHigh` is raised |
+| `slot-retention-limit-bytes` | `4294967296` | WAL a standby's slot may retain before it is dropped and the standby rebuilt |
+| `standby-port-base` | `pg-port + 1000` | first port tried for a new standby instance (the first free one from there is used and recorded) |
+
+The replica count itself is the cluster setting `defaultReplicaCount` (`PATCH /settings/cluster`).
+
+**Tests.** Unit: `internal/standby` (`TestCandidates*`, `TestPlan`, `TestSyncNamesRule`, `TestSlotPolicy`),
+`internal/instance` (`TestNodeRulesCoverReplicationConnections`, `TestStandbyDirIDs`), `internal/sysdb` (version 6).
+Multi-server, in WSL (`internal/clustertest/standby_test.go`): `TestStandbysAreCreatedForEveryGroupAndStream`,
+`TestReplicaCountRaisedAndLowered`, `TestSynchronousCommitNeedsTheStandbyUntilTheGracePeriod`,
+`TestStandbysSurviveRestartsAndCertificateRenewal`, `TestRemovingAServerRemovesItsStandbys`.
+
+**Decisions where the design was silent**
+
+1. The leader pushes the whole list of standbys to every server (`POST /standby/plan`), not only to the primary's server: the
+   replication view and `HasStandby` (which decides whether a lease is enforced) must work on every server without the leader.
+2. Standby instances are the directories `100 + group` of the instance manager; the port is the first free one from `standby-port-base` (default `pg-port + 1000`; not
+   `pg-port + 1`, which on a one-machine cluster is the port the next server will bind), recorded in the standby record.
+3. The standby's server creates the slot on the primary itself (one call to the target), over the same certificate
+   connection as everything else; the primary's own loop only maintains and drops.
+4. A lost or dropped slot is never recreated in place (the new one would start at the current position and the standby needs
+   older WAL): the standby is rebuilt from a new base backup.
+5. `synchronous_standby_names` is owned by the standby agent in the managed file; it names all ready standbys (`ANY 1`), not
+   only the streaming ones, so that a standby that falls behind stays a candidate of the quorum.
+6. A one-server cluster raises no `groupUnderReplicated` (it is the development arrangement). With two servers or more it does,
+   also when fewer standbys can be placed than the count asks for; the message says so.
+7. Standby instances are not stopped by a stop of kingresd (like the primary instance); `-stop-instances` stops them first.
+8. kingresd reaches a standby by peer authentication on its private unix socket, never by a password.
+
+**Limits**: a cluster created before this version has no replication lines in `pg_hba.conf` until its trust rules are written
+again (any change of servers or network rules does it); `pg_rewind` is only a speed-up, the fallback is a full copy; the
+server and instance lists show catalog instances only (the standbys are in the replication view).
+
+### The client entry point
+
+Package `internal/clientproxy`, started by `cmd/kingresd/ha_proxy.go`. **Off unless configured** (the packaging
+decides the ports later): with neither key below set nothing listens.
+
+| Flag / file key | Environment variable | Default | Meaning |
+|---|---|---|---|
+| `client-listen` | `KINGRES_CLIENT_LISTEN` | empty (off) | host:port of the primary entry point |
+| `client-standby-listen` | `KINGRES_CLIENT_STANDBY_LISTEN` | empty (off) | host:port of the entry point that forwards to a local standby for lag-tolerant reads |
+| `client-max-connections` | `KINGRES_CLIENT_MAX_CONNECTIONS` | `1000` | connections forwarded at once, both entry points together; one more is closed at once and counted |
+| `client-connect-timeout` | `KINGRES_CLIENT_CONNECT_TIMEOUT` | `5s` | time to choose the destination and connect to it |
+| `client-idle-timeout` | `KINGRES_CLIENT_IDLE_TIMEOUT` | `1h` | a forwarded connection with no byte in either direction for that long is closed |
+
+**What it does.** It accepts a TCP connection and connects it to a destination it chooses, then copies bytes in both
+directions, from the first byte. It never reads, parses, buffers or logs what the client sends: the startup packet, an
+`SSLRequest`, TLS, SCRAM, a client certificate and SQL are all just bytes. TLS is therefore negotiated end to end between
+the client and the PostgreSQL instance, and authentication is PostgreSQL's own. The proxy sends nothing of its own (a
+connection that cannot be forwarded is closed without a message: there is no PostgreSQL error message it could send
+without first speaking the protocol).
+
+**Destination of the primary entry point**, chosen for each new connection and looked at again every second for the open
+ones (a connection whose destination differs from the one chosen now is closed, and counted):
+
+1. the primary instance of this server (on the loopback address), when the shard catalog (this server's copy) says it is
+   active and this server holds the valid lease of its group (`ha.Leases().Holds`). When no lease manager is running
+   (it reports no lease at all) the catalog alone decides: there is nothing that could say otherwise;
+2. otherwise the client entry point, on the same port number, of the server that runs the next active primary after this
+   server's group in group order (a ring), skipping servers that the heartbeats say are dead. This is **not** the
+   instance of that server: an instance accepts a connection from another server's address only with that server's
+   certificate (the node rules at the top of `pg_hba.conf`, a `cert` rule that does not fall through), so a user
+   forwarded to it directly would be refused. The entry point of that server connects to its own instance from its
+   loopback address. The consequence is that every server of the cluster must run its entry point on the same port
+   (that is what the packaging sets). A connection that comes from the address of another server of the cluster is
+   never forwarded a second time (no loops): it is served by the local primary or closed.
+3. nothing: the connection is closed.
+
+**TLS names.** Because TLS ends at the instance, a client that dials server A and is forwarded to server B sees B's
+certificate, which names B. A client that verifies the host name (`sslmode=verify-full`) refuses it; it must verify the chain
+only (`verify-ca`) or be given a certificate that carries every server's name (not issued today). Connections that stay on
+the server that was dialed (the normal case, while that server holds its lease) are unaffected.
+
+**The standby entry point** forwards to a running standby of this server's own that kingresd manages (a streaming one
+first, otherwise a running one that is not: the client asked for reads that tolerate lag), on the loopback address. Until
+the standby manager reports one it closes the connections.
+
+**What the instance sees (`pg_hba.conf` address matching).** The instance sees the address of the proxy's connection, not the
+client's: `127.0.0.1` for the local destination (and for the second hop of a forwarded connection). PostgreSQL has no way
+to take the client's address from a proxy (there is no PROXY protocol support in stock PostgreSQL, and a proxy that
+does not read the stream cannot pass it anywhere else), so:
+
+- the managed network rules (`replaceNetworkAccess`, `internal/ops/network.go`) are matched against that address for
+  proxied clients. A rule that names the client's network (`10.1.0.0/16`) does not match a proxied client; the default
+  rules (`127.0.0.0/8`, `::1/128`, password) match every proxied client, which is why proxied clients can sign in on a
+  fresh cluster. To let proxied clients in, a rule must include the proxy's own address (`127.0.0.0/8` here), and that
+  rule then admits every client of the proxy, whatever network it is on;
+- address rules therefore no longer say anything about who may connect to the entry point. Limiting it is the job of
+  the address `client-listen` binds (a private interface), of the host firewall, and of roles, passwords, SCRAM and
+  client certificates, which are end to end and unaffected. A rule of type `reject` for a client network cannot be
+  enforced through the proxy;
+- `pg_stat_activity.client_addr` shows `127.0.0.1` for proxied sessions. The one exception is a cluster on a single machine
+  (every server host is a loopback address, as in the tests): there `127.0.0.1` is already listed in the instances' node
+  rules as a source of the other servers (a certificate is required from it), and so is each server's own address, so the local leg then comes from
+  `127.255.255.254`, a loopback address no instance lists (the default `127.0.0.0/8` rule admits it);
+- the local leg is TCP on the loopback address, not the unix socket. TLS is not available on a unix socket (the server
+  answers `N` to an `SSLRequest`), so a client that requires TLS could not connect, and the `local` rules (`peer map`)
+  are for kingresd's own connections as signed-in roles and must not become reachable by clients.
+
+**Metrics.** Counters since the start of `kingresd`, written to the metrics ring every five seconds and shown by `/metrics`
+as `kingres_client_connections_accepted`, `_active` (a gauge), `_refused` (over the cap), `kingres_client_connect_failures`,
+`kingres_client_connections_moved` (closed because the destination changed), `kingres_client_connections_idle_closed`,
+`kingres_client_bytes_in`, `kingres_client_bytes_out`, and the same with `kingres_client_standby_` for the second entry
+point. Event lines are logged at debug level and carry no address and no data. They are not in the contract's `MetricName`
+enum yet (see the notes for 0.7.0).
+
+**Tests.** `internal/clientproxy` (unit: bytes unchanged both ways including an `SSLRequest` first and random noise, the proxy
+never speaks first, cap and shared cap, connect and idle bounds with an injected clock, closing on a destination change,
+destination rules with fakes, no forwarding loop); `internal/clustertest` `TestClientEntryPoint` (three real `kingresd`: TLS
+and SCRAM through every entry point lands on that server's instance with no client certificate recorded; a client
+certificate signed by the cluster CA authenticates through it; a destination change closes the old connections and sends new
+ones to another server and back).
+
+**Limits.** The destination is looked at every second and a connection is closed, not moved (a client reconnects; it is
+the same as a failover for a client). Which primary a connection gets when the local one is unusable is the next server of
+the ring, not the one with the least load. The loop rule recognises a forwarding server by its address in the peer
+directory, so a forwarding hop that arrives from another source address is served like a client (it is then forwarded once
+more, at most until the destination holds the lease).
+
+### Cancelling a workbench statement
+
+Engine in `internal/ops/cancel.go`, HTTP operation `cancelStatement` since contract 0.7.0: `executeQuery` takes an optional `statementId` (1 to 64 characters of `A-Za-z0-9_-`, chosen
+by the client so that it is known before the answer arrives), and `POST /query/statements/{statementId}/cancel` (role
+`kingres_readonly`, audit action `cancelStatement`) answers 204, or 404 `not_found` when the signed-in role has no such
+statement running on this server.
+
+- The server tracks each statement it runs, keyed by the signed-in role and the id, with the backend pid of the connection
+  kingresd itself opened for it. A pid never comes from a client. A role can only find its own statements; a second
+  running statement with the same id and role is 409 `conflict`.
+- A cancel marks the statement, runs `pg_cancel_backend(pid)` on a service connection restricted to that pid, role and
+  database, and starts a two-second safety net that ends the statement from this side if the server did not (a cancel that
+  reaches a backend between two statements is lost). The statement ends with SQLSTATE `57014` ("canceling statement due to
+  user request"), a 422 `sql_error` like the statement timeout.
+- The entry is marked done under its own lock **before** the connection is closed, and a cancel holds that lock while it
+  runs, so a late cancel can never reach a backend number that PostgreSQL has handed to another session.
+- `executeQuery` runs on the server that received it (it is not forwarded to the leader), so the cancel is local too: a
+  session is on one server (sessions are per server), and a cancel sent to another server is 404. It is not forwarded.
+- Tests: `internal/ops` `TestCancelFindsOnlyTheCallersOwnRunningStatement`, `TestCancelAfterTheStatementEndedNeverCancels`,
+  `TestIntegrationCancelEndsARunningStatement` (real instance: a `pg_sleep(60)` as a plain role is cancelled by id, SQLSTATE
+  57014, another role cannot cancel it, a running id conflicts, the id and the slot are free afterwards).
+
+### Carry-overs (workbench cancel, startup race, test ports, task fencing)
+
+**The `403 not_leader` on `/peers` (startup race).** The leader resolver (`internal/leader`) cached every answer
+for 2 s, also the answer "the catalog names no leader" with no error. A server that has just been added has an empty
+catalog until the leader copies it, and its task loop asks for the leader every 2 s, so the empty answer is
+cached right up to the moment the leader's last calls arrive (`/node/finish`, then `POST /peers`, policy
+`LeaderOrJoining`, which is no longer "joining" once the server is clustered): `Leader()` returned "" from the cache and
+the call was refused with 403 `not_leader` for up to 2 s. Two changes: an empty answer is **never cached**
+(`leader` `TestNoLeaderIsNotCached`, which fails without the change), and the internal API asks again, up to three
+times 200 ms apart, before it refuses a leader-only call because the leader is unknown
+(`internalapi` `TestUnknownLeaderIsAskedAgainBeforeARefusal`; this also covers a catalog that is read slowly under
+load, where `Current()` gives up after 3 s and answered ""). A joining server is no longer asked at all (it never
+knows a leader). Evidence: the failure was seen once; with the old code a loop of
+`TestCertificateRenewalKeepsAThreeServerClusterWorking` ran 6 of 6 green (about 80 s each), so the race is **proved by
+reading and by the unit tests, not reproduced in the loop**; the same loop on the fixed tree ran
+6 of 6 green too (about 74 s each, same shared machine).
+
+**Test infrastructure.** `scripts/run-wsl-tests.sh` gives every run a root `~/kw-cp/test/run-<pid>-<epoch>` and a slice
+of 200 ports (`20000-27999`, below the kernel's range for outgoing connections; `KINGRES_TEST_PORT_BASE/END`), claimed
+with an atomic `mkdir` under a `flock`, so two runs never choose the same port and the port of
+`TestFailedJoinBeforeRegistrationCleansUp` cannot be taken by another run (`pgtest.FreePort` also probes the
+wildcard address now, because the test itself binds `:port`). The run exports `KINGRES_TEST_ROOT=<root>`; everything
+the tests start inherits it. Each run writes a ledger entry (script pid, its start time, root); the next run (or
+`run-wsl-tests.sh --reap`) reads the ledger, and for every entry whose script is gone (pid and start time do not match
+any more) stops the processes whose environment contains exactly `KINGRES_TEST_ROOT=<that root>` (TERM, then KILL
+after 20 s), removes the root and frees the slice. Nothing is identified by a name pattern, other people's processes
+and runs never carry that variable and are never touched. Verified by a run whose script was killed with SIGKILL while
+three `kingresd` and three instances ran (the next run removed them and the root), and by a simulated leftover next
+to two decoy processes (one without the variable, one with another root) that survived. `run-integration.ps1` takes
+`-Count N` (every selected test N times, for stress loops), builds `cmd/kingres-watchdog` when the directory exists
+and exports `KINGRES_WATCHDOG_BIN`. `wsl-allowed-skips.txt` stays empty.
+
+**Fencing of remote task calls (`internal/fence`).** The task engine puts the run's token (task id and lease epoch) into
+the context of every step (`fence.With`); `peerclient` sends it as the header `X-Kingres-Fence: <task>:<epoch>` on every
+call made with that context; the callee (`internalapi`) checks it for calls that come from the leader (leader-only
+policies) against a registry of the highest epoch seen per task and answers `409 fenced` for a lower one. Equal or
+higher is accepted and recorded (on disk, `<data-dir>/fence.json`, fsync and atomic replace, before the call is
+accepted), a callee never lowers what it knows, and a restarted callee reads the file, so a superseded run cannot get
+through just because the callee restarted; a damaged file starts empty with a warning (refusing every call would stop
+all tasks, and the store's epoch check remains). At most 4096 tasks are remembered (the oldest ids are dropped).
+Calls without the header, and every header from a server that is not the leader, are not fenced (a member cannot
+raise an epoch to block the leader). Tests: `fence` unit tests, `internalapi` `TestSupersededRunIsRefused`, `task`
+`TestStepContextCarriesTheFence`, clustertest `TestSupersededTaskRunIsRefusedByTheCallee` (three servers, the late
+epoch 1 call refused after epoch 2 touched the callee, also after the callee's kingresd was restarted). Limit: a late
+call to a callee that the newer run has not called yet is accepted; for what the step writes in the system database
+the store's epoch check refuses it.
+
+### Decisions of this increment
+
+1. **Heartbeats are all-to-all and measured on the receiver** with a monotonic clock; nothing but durations ever crosses the wire. `dead` and `suspect` are the answering server's view.
+2. **A follower distrusts its cache after `leader-loss-bound` (30 s)** for session-authorized requests (503 `leader_unavailable`); a shorter blip changes nothing, probes and the leader itself are exempt.
+3. **Self-fencing is enforced only for a group that has a standby** (decided by the coordinator); a group without one only raises `leaseLost`. A one-server cluster grants itself.
+4. **The watchdog is started by kingresd next to the running instance**, not as its parent, so every existing start, stop, restart, reload and leave path is unchanged. It watches a sequence number, not a time of day.
+5. **The cross-server leg of the client entry point goes to the other server's entry point**, not its instance (the instances refuse client addresses of peers); the local leg is TCP loopback because TLS is impossible on a unix socket. The instance therefore sees a proxy address (see "The client entry point").
+6. **Cancel is local to the server that runs the statement** and is not forwarded; a client chooses the statement id; no pid comes from a client.
+7. **`workbench_busy` is 429** for both the per-role and the server-wide cap.
+8. **Standbys**: whole standby list pushed to every server; local instance directory id `100 + group`; a lost slot means a rebuild; `defaultReplicaCount` of `initCluster` is 1, so every cluster of two or more servers now gets standbys; the removed server's own catalog being empty is covered by remembering the last verified leader for 60 s (`leaderMemory.recent`), because the two-second cache that used to cover it was shorter than the removal of the standbys.
+9. **A leader answer of "none" is never cached** and the internal API asks again up to three times before refusing a leader-only call (the `/peers` race).
+10. **Fencing epoch** is checked only on leader-only policies, persisted in `fence.json`.
+12. **A server whose instance is held back until its group lease is won answers 503, not 403.** After kingresd was down long enough for the watchdog to fence the instance, the restarted kingresd cannot read the catalog until the lease round has finished and the instance has started, so it does not know the leader. In that window (the fence marker exists, or the instance is not running, and no leader is known) the internal API answers `503 service_unavailable` with `Retry-After: 2` instead of `403 not_leader`; the REST sign-in answers `503 service_unavailable` with `Retry-After: 5`, as it already did. A task step (its context carries the fencing token) retries that answer with a growing pause (1 s to 8 s) for up to 5 minutes (`peerclient.NotReadyBound`) and only then fails, with an error that names the server and says it waited for its group lease; a request of a user is not retried. Test: `internal/clustertest` `TestTaskWaitsForAServerThatWaitsForItsLease`.
+11. **Test ports** are a per-run slice of 20000-27999; cleanup kills only processes whose environment names the run's root.
+
+### Departures from ha-phase5.md
+
+- The design says a fenced primary stays down until it holds a lease "or has been told it is now a standby": only the first half exists (the second is part 2).
+- The watchdog is not the parent of the instance (decision 4).
+- A restarted kingresd judges nothing until its first renewal round has finished (at most one round without re-confirmation).
+- The setting is named `defaultReplicaCount` (the contract's name), not `replicaCount`; the ring order is join order.
+- `synchronous_standby_names` names all *ready* standbys and is non-empty only once one streams, so a standby in its base backup never blocks the group.
+- `pg_rewind` exists but nothing calls it with `diverged` yet (no failover).
+- The client entry point's cross-server leg goes through the other server's entry point (decision 5).
+- The wall-clock step test shifts the wall clock inside kingresd (fault hook); a step of the system clock needs root and was not made.
+
+### What part 2 must add
+
+- **Catalog registration of standbys:** implement `standby.CatalogRegistrar` (`internal/standby/catalog.go`: `Register`, `Unregister`) with kingres_shard 0.4 and pass it as `Leader.Registrar` in `newStandbyParts` (`cmd/kingresd/ha_standby.go`) instead of `SkipCatalog{}`. The task step is `standby.register_in_catalog`; store the node id in `kingres_cp.standby.catalog_node_id` and drop `pgstore.ManagedStandbyInstanceBase`.
+- **Promotion:** set `Agent.Frozen` during a failover decision; obtain the lease through `POST /lease/grant` (use `dryRun` to wait for the old lease); make `Agent.maintainPrimary/Status/Create`, `catalogTopology` and `localInstance` in `ha_leases.go` and the watchdog files use the instance id of the group's primary instead of instance 1; repoint the other standbys (`primary_conninfo`); rebuild the old primary with `POST /standby/rebuild` and `diverged: true`; remove `lease.FencedMarker` when a server becomes a standby.
+- **Automatic failover** reads `ha.Liveness.State/Silence` (count `autoFailover.timeoutSeconds` from the dead transition) and `Leases`.
+- The 60-second leader memory (decision 8) must be revisited with leader moves.
 
 ---
 

@@ -180,7 +180,13 @@ func TestClusterWideTaskWaitsForADownServer(t *testing.T) {
 		t.Error("the log does not say which server the task waits for")
 	}
 	down.Start()
-	if !down.Login(clustertest.AdminUser, clustertest.AdminPass) {
+	// A server whose kingresd was down is fenced by its watchdog when its group has a standby; it
+	// starts its instance again once it holds the lease, so signing in may take a lease round.
+	signedIn := false
+	for end := time.Now().Add(90 * time.Second); time.Now().Before(end) && !signedIn; time.Sleep(time.Second) {
+		signedIn = down.Login(clustertest.AdminUser, clustertest.AdminPass)
+	}
+	if !signedIn {
 		t.Fatalf("cannot sign in on the restarted server\n%s", down.LogTail(2000))
 	}
 	final := c.Leader().WaitTask(id, 4*time.Minute)

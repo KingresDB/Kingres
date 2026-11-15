@@ -41,6 +41,7 @@ func (s *Server) opsHandlers() map[string]handlerFunc {
 		"distributeTable":           s.distributeTable,
 		"enableTableLedger":         s.enableTableLedger,
 		"executeQuery":              s.executeQuery,
+		"cancelStatement":           s.cancelStatement,
 		"cancelTask":                s.cancelTask,
 		"restartThisServerInstance": s.restartThisServerInstance,
 		"updateClusterSettings":     s.updateClusterSettings,
@@ -467,6 +468,9 @@ func (s *Server) executeQuery(c *call, w http.ResponseWriter, r *http.Request) e
 	// its text.
 	n, h := ops.StatementFingerprint(req.SQL)
 	c.details = map[string]any{"database": req.Database, "sqlLength": n, "sqlHash": h}
+	if req.StatementID != "" {
+		c.details["statementId"] = req.StatementID
+	}
 	ctx, stop := queryContext(w, r, req)
 	defer stop()
 	res, err := o.ExecuteQuery(ctx, c.session.Username, req)
@@ -658,5 +662,22 @@ func (s *Server) updateClusterSettings(c *call, w http.ResponseWriter, r *http.R
 		return s.storeProblem(r, err, "")
 	}
 	s.writeJSON(w, r, http.StatusOK, out)
+	return nil
+}
+
+// cancelStatement ends the caller's own running workbench statement (contract
+// 0.7.0). The statement is found among the ones this server tracks; no process
+// id ever comes from the client.
+func (s *Server) cancelStatement(c *call, w http.ResponseWriter, r *http.Request) error {
+	o, err := s.needOps()
+	if err != nil {
+		return err
+	}
+	id := r.PathValue("statementId")
+	c.details = map[string]any{"statementId": id}
+	if err := o.CancelStatement(r.Context(), c.session.Username, id); err != nil {
+		return err
+	}
+	w.WriteHeader(http.StatusNoContent)
 	return nil
 }

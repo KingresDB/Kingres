@@ -78,6 +78,12 @@ type Deps struct {
 	// internal API (no -internal-listen): the operations that need the other
 	// servers answer 409 internal_api_disabled instead of "not supported".
 	InternalAPIDisabled bool
+	// LeaderTrusted tells whether this server has heard from the manager leader
+	// recently enough (the leader-loss bound) to trust its own copy of roles and
+	// grants for authorizing a session. nil: always. A false answer makes every
+	// session-authorized operation answer 503 leader_unavailable (README, "Heartbeats
+	// and liveness", decision on CP2-07).
+	LeaderTrusted func() bool
 	// Members adds and removes servers (design D4 and D5); nil makes addServer
 	// and removeServer answer "not supported".
 	Members Members

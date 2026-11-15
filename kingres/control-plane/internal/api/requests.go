@@ -74,6 +74,9 @@ type QueryRequest struct {
 	SQL       string `json:"sql"`
 	RowLimit  *int   `json:"rowLimit,omitempty"`
 	TimeoutMs *int   `json:"timeoutMs,omitempty"`
+	// StatementID names the statement so that cancelStatement can end it (contract
+	// 0.7.0, optional): 1 to 64 characters of A-Z, a-z, 0-9, _ and -.
+	StatementID string `json:"statementId,omitempty"`
 }
 
 // QueryColumn describes a result column.

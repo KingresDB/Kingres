@@ -129,7 +129,10 @@ func (s *Store) ReplicationTopology(ctx context.Context) (api.ReplicationTopolog
 
 	topo := api.ReplicationTopology{GeneratedAt: s.now().UTC(), Groups: make([]api.ShardGroup, 0, len(groupIDs))}
 	for i, g := range groupIDs {
-		topo.Groups = append(topo.Groups, buildGroup(cat, g, readings[i]))
+		sg := buildGroup(cat, g, readings[i])
+		addManagedStandbys(ctx, &sg, g, readings[i], s.opts.HA.Standbys())
+		sg.Lease = leaseView(s.opts.HA, g)
+		topo.Groups = append(topo.Groups, sg)
 	}
 	return topo, nil
 }

@@ -22,6 +22,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fault"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fence"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fwdproof"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/gather"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
@@ -73,6 +75,8 @@ type Config struct {
 	Revoked func() []string
 	// Timeout bounds one call (default 30 seconds).
 	Timeout time.Duration
+	// Fault is the fault-injection hook of the tests (nil in production).
+	Fault *fault.Hook
 }
 
 // Client calls peers. It is safe for concurrent use.
@@ -184,7 +188,47 @@ func (c *Client) DoUnchecked(ctx context.Context, serverID, method, path string,
 	return c.do(ctx, serverID, false, method, path, in, out)
 }
 
+// ErrNotReady is the answer of a server that is up but cannot serve yet: 503 service_unavailable,
+// for example while its instance is held back until its group lease is won. It is transient.
+var ErrNotReady = errors.New("peerclient: the server is not ready")
+
+// Is makes a 503 service_unavailable answer match ErrNotReady.
+func (e *APIError) Is(target error) bool {
+	return target == ErrNotReady && e.Status == http.StatusServiceUnavailable && e.Code == "service_unavailable"
+}
+
+// NotReadyBound is how long a task step keeps retrying a server that answers "not ready" before
+// the step fails (a variable so that tests can shorten it).
+var NotReadyBound = 5 * time.Minute
+
 func (c *Client) do(ctx context.Context, serverID string, checkRevoked bool, method, path string, in, out any) error {
+	_, inStep := fence.From(ctx)
+	start := time.Now()
+	for delay := time.Second; ; {
+		err := c.doOnce(ctx, serverID, checkRevoked, method, path, in, out)
+		// A task step (its context carries the fence) waits for a server that is not ready; a
+		// request of a user does not (it gets the 503 and its Retry-After).
+		if err == nil || !inStep || !errors.Is(err, ErrNotReady) {
+			return err
+		}
+		if time.Since(start) > NotReadyBound {
+			return fmt.Errorf("server %s was still waiting for its group lease after %s: %w", serverID, NotReadyBound, err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+		if delay < 8*time.Second {
+			delay *= 2
+		}
+	}
+}
+
+func (c *Client) doOnce(ctx context.Context, serverID string, checkRevoked bool, method, path string, in, out any) error {
+	if c.cfg.Fault.OutboundBlocked(serverID) {
+		return fmt.Errorf("%w: %s: blocked by the fault hook", ErrUnreachable, serverID)
+	}
 	p, ok := c.cfg.Peers.Get(serverID)
 	if !ok {
 		return fmt.Errorf("%w: %s", ErrUnknownPeer, serverID)
@@ -210,6 +254,10 @@ func (c *Client) do(ctx context.Context, serverID string, checkRevoked bool, met
 		return err
 	}
 	req.Header.Set(internalapi.HeaderVersion, internalapi.Version)
+	// A step of a task run names its run, so that the callee can refuse a run that was superseded.
+	if tok, ok := fence.From(ctx); ok {
+		req.Header.Set(fence.Header, tok.String())
+	}
 	if in != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -334,6 +382,9 @@ func gatherBody(req internalapi.ForwardRequest) ([]byte, error) {
 // failure is gather.ErrUnreachable, or context.DeadlineExceeded when the
 // caller's deadline passed. The status of the operation is for the caller to judge.
 func (c *Client) Gather(ctx context.Context, serverID string, req internalapi.ForwardRequest, maxBytes int64) (internalapi.ForwardResponse, error) {
+	if c.cfg.Fault.OutboundBlocked(serverID) {
+		return internalapi.ForwardResponse{}, fmt.Errorf("%w: blocked by the fault hook", gather.ErrUnreachable)
+	}
 	p, ok := c.cfg.Peers.Get(serverID)
 	if !ok {
 		return internalapi.ForwardResponse{}, fmt.Errorf("%w: %s", gather.ErrUnreachable, ErrUnknownPeer)

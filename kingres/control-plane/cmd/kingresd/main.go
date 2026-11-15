@@ -29,10 +29,14 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/auth"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/cluster"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/config"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fault"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fence"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fwdproof"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ha"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/httpapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/leader"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/lease"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/localsettings"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/membership"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/monitor"
@@ -55,7 +59,7 @@ var version = "0.2.0-dev"
 var commit = "unknown"
 
 // contractRevision is the revision of kingres/api/openapi.yaml implemented.
-const contractRevision = "0.6.0"
+const contractRevision = "0.7.0"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -164,6 +168,11 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	if err != nil {
 		return fmt.Errorf("preparing instance management: %w", err)
 	}
+	if svc.Enabled() {
+		// An instance that fenced itself (its group lease was lost) is not started as a
+		// primary again until the lease manager holds a lease (package lease).
+		svc.Manager().SetStartGate(lease.Gate(filepath.Join(cfg.DataDir, leaseDirName)))
+	}
 	if stopOnly {
 		sctx, scancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
 		defer scancel()
@@ -182,8 +191,16 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 			}
 		}
 	}
+	haReg := ha.NewRegistry()
+	haCalls := newCallTable()
+	faultHook := fault.New(cfg.HA.FaultDir)
+	fenceMem, ferr := fence.Open(cfg.DataDir)
+	if ferr != nil {
+		log.Warn("the memory of fenced task runs", "error", ferr)
+	}
+	certHooks := &hookList{}
 	pg, err := pgstore.New(pgstore.Options{
-		DSN: dsn, Logger: log, PanelPort: port, Version: version, Started: started, NodeTLS: svc.NodeTLSConfig,
+		DSN: dsn, Logger: log, PanelPort: port, Version: version, Started: started, NodeTLS: svc.NodeTLSConfig, HA: haReg,
 	})
 	if err != nil {
 		return err
@@ -235,6 +252,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	leaders := leader.New(pg.ManagerLeader, 2*time.Second, nil)
 	lastLeader := &leaderMemory{}
 	var members *membership.Manager
+	var stby *standbyParts
 	var receiver *membership.Receiver
 	peerDir, err := peers.Open(cfg.DataDir)
 	if err != nil {
@@ -254,12 +272,12 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		if err := peerDir.Put(peers.Peer{ServerID: serverHost, InternalAddr: net.JoinHostPort(serverHost, iport)}); err != nil {
 			return fmt.Errorf("recording this server in the peer directory: %w", err)
 		}
-		pc := peerclient.New(peerclient.Config{Self: serverHost, PKIDir: svc.PKIDir(), Peers: peerDir, Revoked: svc.RevokedSerials})
+		pc := peerclient.New(peerclient.Config{Self: serverHost, PKIDir: svc.PKIDir(), Peers: peerDir, Revoked: svc.RevokedSerials, Fault: faultHook})
 		deps.Forwarder = &peerclient.Forwarder{Self: serverHost, Leaders: leaders, Client: pc}
 		opsSvc.Recorder = opsSvc.NewPeerRecorder(func(ctx context.Context) (string, bool, error) {
 			return lastLeader.resolve(ctx, leaders, serverHost)
 		}, pc)
-		members = &membership.Manager{Svc: svc, Ops: opsSvc, Peers: peerDir, Client: peerclient.New(peerclient.Config{Self: serverHost, PKIDir: svc.PKIDir(), Peers: peerDir, Revoked: svc.RevokedSerials, Timeout: 10 * time.Minute}), Leaders: leaders, Self: serverHost, Version: version, Log: log, GatherSigner: gatherSigner,
+		members = &membership.Manager{Svc: svc, Ops: opsSvc, Peers: peerDir, Client: peerclient.New(peerclient.Config{Self: serverHost, PKIDir: svc.PKIDir(), Peers: peerDir, Revoked: svc.RevokedSerials, Timeout: 10 * time.Minute, Fault: faultHook}), Leaders: leaders, Self: serverHost, Version: version, Log: log, GatherSigner: gatherSigner,
 			SelfPeer: peers.Peer{ServerID: serverHost, InternalAddr: net.JoinHostPort(serverHost, iport)},
 			Audit: func(ctx context.Context, ev audit.Event) {
 				if _, err := sink.Append(ctx, ev); err != nil {
@@ -267,12 +285,17 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 				}
 			}}
 		receiver = &membership.Receiver{M: members, Authn: authn, VerifyToken: svc.VerifyToken}
-		members.OnCertificateInstalled = func() { pc.ForgetAll(); members.Client.ForgetAll() }
+		members.OnCertificateInstalled = func() { pc.ForgetAll(); members.Client.ForgetAll(); certHooks.run() }
 		opsSvc.Fanout, opsSvc.Local, opsSvc.InstanceOwner = members, svc, members.InstanceBelongsTo
+		stby, err = newStandbyParts(cfg, svc, serverHost, log, members.Audit, members, opsSvc, haReg)
+		if err != nil {
+			return fmt.Errorf("preparing the standbys: %w", err)
+		}
 		deps.Members = members
 		deps.Gatherer, deps.GatherTimeout = membership.Gatherer{M: members}, cfg.GatherTimeout
 		deps.PeerUptime = members.PeerUptime
 	}
+	deps.LeaderTrusted = leaderTrusted(haReg, lastLeader, serverHost, cfg.HA.LeaderLossBound)
 	api, err := httpapi.New(deps)
 	if err != nil {
 		return err
@@ -319,6 +342,9 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 			if members != nil {
 				defs = append(defs, members.Definitions()...)
 			}
+			if stby != nil {
+				defs = append(defs, stby.leader.Definitions()...)
+			}
 			eng, err = task.NewEngine(task.NewPGStore(pool), defs, task.Options{
 				Holder: fmt.Sprintf("%s-%d", hostname, os.Getpid()), Logger: log})
 			if err != nil {
@@ -326,9 +352,10 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 			}
 			opsSvc.BG = bgCtx
 			opsSvc.SetEngine(eng)
-			run := &monitor.Runner{Src: monSource{svc}, Ring: ring, Host: serverHost, DataDir: filepath.Join(cfg.DataDir, "instances"), Log: log, System: "kingres_system",
+			run := &monitor.Runner{Src: monSource{svc}, Ring: ring, Host: serverHost, Leases: func() []ha.LeaseInfo { return haReg.Leases().Info() }, DataDir: filepath.Join(cfg.DataDir, "instances"), Log: log, System: "kingres_system",
 				Interval: cfg.MonitorInterval, LedgerPendingMaxAge: cfg.LedgerPendingMaxAge, RenewFraction: cfg.CertificateRenewFraction,
-				Cert: svc.ServerCertificate, CA: func() *x509.Certificate {
+				Probes: probesOf(stby),
+				Cert:   svc.ServerCertificate, CA: func() *x509.Certificate {
 					if ca, err := svc.CA(); err == nil {
 						return ca.Cert()
 					}
@@ -381,12 +408,27 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		rcancel()
 	}
 
+	hd := &haDeps{Cfg: cfg, Log: log, Svc: svc, Node: node, ServerHost: serverHost, Peers: peerDir, Leaders: leaders, Members: members, Ops: opsSvc, Ring: ring,
+		Registry: haReg, Calls: haCalls, Standby: stby, LastLeader: lastLeader, Fault: faultHook, OnCertificateInstalled: certHooks.add, BG: bgCtx, WG: &wg, Audit: func(ctx context.Context, ev audit.Event) {
+			if _, err := sink.Append(ctx, ev); err != nil {
+				log.Error("writing the audit log", "error", err)
+			}
+		}}
+	if members != nil {
+		hd.PC = members.Client
+	}
+	if err := startHA(hd); err != nil {
+		cancelBG()
+		wg.Wait()
+		return fmt.Errorf("starting high availability: %w", err)
+	}
+
 	if cfg.InternalListen != "" && svc.Enabled() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			serveInternal(bgCtx, internalDeps{addr: cfg.InternalListen, svc: svc, node: node, ring: ring, log: log, started: started,
-				serverHost: serverHost, version: version, dataDir: cfg.DataDir, keys: authn, signer: gatherSigner, leaders: leaders, ops: opsSvc, lastLeader: lastLeader, members: members, forward: func(ctx context.Context, peer string, fr internalapi.ForwardRequest) (internalapi.ForwardResponse, error) {
+				serverHost: serverHost, version: version, dataDir: cfg.DataDir, keys: authn, signer: gatherSigner, leaders: leaders, ops: opsSvc, lastLeader: lastLeader, members: members, calls: haCalls, fault: faultHook, fence: fenceMem, forward: func(ctx context.Context, peer string, fr internalapi.ForwardRequest) (internalapi.ForwardResponse, error) {
 					// A forwarding server must be a member of the cluster (CP-07); its certificate was
 					// already checked against the CA and the revocation list by the internal API.
 					if _, ok := peerDir.Get(peer); !ok {

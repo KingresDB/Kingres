@@ -18,7 +18,7 @@ func TestNewUsesContractStatuses(t *testing.T) {
 		{SessionExpired, 401}, {SetupTokenInvalid, 401}, {CSRFTokenInvalid, 403}, {Forbidden, 403},
 		{NotFound, 404}, {AlreadyExists, 409}, {LastAdmin, 409}, {Unprocessable, 422}, {SQLError, 422},
 		{UnsupportedOp, 422}, {NodeStateInvalid, 422}, {RateLimited, 429}, {NodeUninitialized, 503},
-		{ServiceUnavailable, 503}, {QuorumUnavailable, 503}, {InternalError, 500},
+		{ServiceUnavailable, 503}, {WorkbenchBusy, 429}, {QuorumUnavailable, 503}, {InternalError, 500},
 	}
 	for _, tc := range tests {
 		p := New(tc.code, "d")

@@ -166,7 +166,7 @@ func TestForwardedOperationClassification(t *testing.T) {
 			local[op.ID] = true
 		}
 	}
-	for _, id := range []string{"login", "logout", "initCluster", "joinCluster", "checkSetupToken", "executeQuery", "createInclusionProof",
+	for _, id := range []string{"login", "logout", "initCluster", "joinCluster", "checkSetupToken", "executeQuery", "cancelStatement", "createInclusionProof",
 		"restartThisServerInstance", "startThisServerInstance", "stopThisServerInstance", "updateThisServerSettings", "leaveCluster", "acknowledgeAlert"} {
 		delete(local, id)
 	}

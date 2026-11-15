@@ -41,6 +41,9 @@ var (
 	ErrExists = errors.New("instance already exists")
 	// ErrNotRunning means the instance is not running.
 	ErrNotRunning = errors.New("instance is not running")
+	// ErrLeaseRequired means the instance may not be started as a primary now: the
+	// start gate (SetStartGate) refused it because its group lease was lost.
+	ErrLeaseRequired = errors.New("instance may not start without a lease")
 )
 
 // Marker is the content of the marker file.
@@ -82,6 +85,7 @@ type Manager struct {
 	log                 *slog.Logger
 	startTO             time.Duration
 	stopTO              time.Duration
+	gate                func(id int) error
 }
 
 // New validates the options and returns a Manager.
@@ -333,6 +337,11 @@ func (m *Manager) Start(ctx context.Context, id int) error {
 	if up, err := m.Running(ctx, id); err != nil || up {
 		return err
 	}
+	if m.gate != nil {
+		if err := m.gate(id); err != nil {
+			return err
+		}
+	}
 	// The socket directory may be gone (a reboot empties /run): it is created
 	// before every start, not only when the instance is created.
 	sock, serr := m.SocketDir(id)
@@ -513,4 +522,26 @@ func (m *Manager) WriteIdent(id int, osUser string, roles []string) error {
 	}
 	data, _ := m.DataDir(id)
 	return writeAtomic(filepath.Join(data, "pg_ident.conf"), []byte(text))
+}
+
+// SetStartGate installs a check that runs before an instance that is not running
+// is started; an error (conventionally wrapping ErrLeaseRequired) refuses the
+// start. The lease manager uses it so that an instance that fenced itself is not
+// started as a primary again without a lease. Call it before the first Start.
+func (m *Manager) SetStartGate(f func(id int) error) { m.gate = f }
+
+// StopImmediate stops the instance with an immediate shutdown (no checkpoint,
+// recovery on the next start) and waits. It is the fence of the lease protocol:
+// it must be fast and must not depend on clients disconnecting. A stopped
+// instance is not an error.
+func (m *Manager) StopImmediate(ctx context.Context, id int) error {
+	if up, err := m.Running(ctx, id); err != nil || !up {
+		return err
+	}
+	data, _ := m.DataDir(id)
+	out, err := m.run(ctx, "pg_ctl", "stop", "-D", data, "-m", "immediate", "-w", "-t", secs(m.stopTO))
+	if err != nil {
+		return fmt.Errorf("instance: pg_ctl stop -m immediate: %w: %s", err, out)
+	}
+	return nil
 }

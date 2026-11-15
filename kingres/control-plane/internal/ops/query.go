@@ -52,6 +52,9 @@ func (o *Ops) ExecuteQuery(ctx context.Context, actor string, req api.QueryReque
 	if req.TimeoutMs != nil {
 		timeout = *req.TimeoutMs
 	}
+	if req.StatementID != "" && !statementIDPattern.MatchString(req.StatementID) {
+		errs = append(errs, field("/statementId", "must be 1 to 64 characters of A-Z, a-z, 0-9, _ and -", "pattern"))
+	}
 	if limit < 1 || limit > 10000 {
 		errs = append(errs, field("/rowLimit", "must be between 1 and 10000", "out_of_range"))
 	}
@@ -66,7 +69,7 @@ func (o *Ops) ExecuteQuery(ctx context.Context, actor string, req api.QueryReque
 	}
 	release, ok := acquireWorkbench(actor)
 	if !ok {
-		return api.QueryResult{}, problem.New(problem.ServiceUnavailable, "Too many statements are running on this server (for this role or in all); try again shortly.").WithRetryAfter(2)
+		return api.QueryResult{}, problem.New(problem.WorkbenchBusy, "Too many statements are running on this server (for this role or in all); try again shortly.").WithRetryAfter(2)
 	}
 	defer release()
 	conn, err := o.Roles.Connect(ctx, req.Database, actor)
@@ -84,11 +87,24 @@ func (o *Ops) ExecuteQuery(ctx context.Context, actor string, req api.QueryReque
 	// A statement the server did not end by itself (statement_timeout does that first, with
 	// SQLSTATE 57014) is ended by the context at timeout plus a grace period: it is a failed
 	// statement, not a failure of the service (CP2-12).
+	st, untrack, err := o.trackStatement(actor, req.Database, req.StatementID, conn, cancel)
+	if err != nil {
+		return api.QueryResult{}, err
+	}
+	// Runs before the connection is closed (deferred later than its Close): see runningStatement.
+	defer untrack()
+	canceled := func() error { return problem.SQL("canceling statement due to user request", "57014", 0) }
 	fail := func(err error) error {
+		if st.cancelled.Load() {
+			return canceled()
+		}
 		if ctx.Err() == nil && errors.Is(qctx.Err(), context.DeadlineExceeded) {
 			return problem.SQL("canceling statement due to statement timeout", "57014", 0)
 		}
 		return queryProblem(err)
+	}
+	if st.cancelled.Load() {
+		return api.QueryResult{}, canceled()
 	}
 	tx, err := conn.Begin(qctx)
 	if err != nil {

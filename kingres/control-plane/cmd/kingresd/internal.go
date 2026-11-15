@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -18,15 +19,19 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/cluster"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fault"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fence"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fwdproof"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/leader"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/lease"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/membership"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/monitor"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ops"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pki"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/serverinfo"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/setup"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
 )
 
@@ -61,6 +66,12 @@ type internalDeps struct {
 	// the leader known last, used while this server's instance is stopped.
 	ops        *ops.Ops
 	lastLeader *leaderMemory
+	// calls dispatches the internal calls of the features of high availability.
+	calls *callTable
+	// fault is the fault-injection hook of the tests (nil in production).
+	fault *fault.Hook
+	// fence is the memory of fenced task runs (package fence).
+	fence *fence.Registry
 }
 
 // serveInternal serves the internal API with mutual TLS until ctx ends. A
@@ -116,6 +127,8 @@ func serveInternal(ctx context.Context, d internalDeps) {
 			return d.signer.Sign(req.ProofMessage(fwdproof.KindGather, peer, me))
 		},
 		Member:  member,
+		Fault:   d.fault,
+		Fence:   d.fence,
 		Forward: forwardGate(instanceDown, member, d.forward),
 		State: func(ctx context.Context) internalapi.State {
 			st := internalapi.State{ServerID: me, NodeState: string(d.node.State()), Version: d.version,
@@ -137,6 +150,27 @@ func serveInternal(ctx context.Context, d internalDeps) {
 		Handle:    handleCall(d),
 		Bootstrap: d.receiver.Bootstrap,
 		Joining:   d.svc.Joining,
+		// An instance held back until its group lease is won (the fence marker) cannot read the
+		// catalog: its callers get 503 service_unavailable and wait, not 403 not_leader.
+		Unavailable: func() bool {
+			if _, err := os.Stat(filepath.Join(d.dataDir, leaseDirName, lease.FencedMarker)); err == nil {
+				return true
+			}
+			// The instance is not (yet) running: right after the lease was won it is starting.
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			running, err := d.svc.Manager().Running(ctx, cluster.NodeID)
+			if err == nil && !running {
+				return true
+			}
+			// Running but not accepting connections yet (starting, recovering): the catalog cannot be read.
+			c, cerr := d.svc.ServiceConn(ctx, sysdb.Database)
+			if cerr != nil {
+				return true
+			}
+			_ = c.Close(context.WithoutCancel(ctx))
+			return false
+		},
 		Resources: func(context.Context) (any, error) {
 			return serverinfo.Resources(map[string]string{"data": filepath.Join(d.dataDir, "instances")}, nil), nil
 		},
@@ -279,7 +313,7 @@ func leaderOf(d internalDeps) func() string {
 		if d.ops != nil && d.ops.LocalInstanceDown() {
 			return d.lastLeader.get()
 		}
-		return ""
+		return d.lastLeader.recent()
 	}
 }
 
@@ -287,6 +321,11 @@ func leaderOf(d internalDeps) func() string {
 // everything else to the membership receiver.
 func handleCall(d internalDeps) func(ctx context.Context, key, peer string, body []byte) (any, error) {
 	return func(ctx context.Context, key, peer string, body []byte) (any, error) {
+		if d.calls != nil {
+			if res, ok, err := d.calls.handle(ctx, key, peer, body); ok {
+				return res, err
+			}
+		}
 		switch key {
 		case "POST /task/record", "POST /task/settle", "POST /task/reserve":
 			if d.ops == nil {

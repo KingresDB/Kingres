@@ -63,7 +63,9 @@ const (
 	LeaderUnavailable      Code = "leader_unavailable"
 	RateLimited            Code = "rate_limited"
 	ServiceUnavailable     Code = "service_unavailable"
-	InternalError          Code = "internal_error"
+	// WorkbenchBusy (429) was added in contract 0.7.0: too many statements run on this server.
+	WorkbenchBusy Code = "workbench_busy"
+	InternalError Code = "internal_error"
 	// CertificateAuthorityUnavailable (503) and CertificateRevoked (409) were added in contract 0.5.0.
 	CertificateAuthorityUnavailable Code = "certificate_authority_unavailable"
 	CertificateRevoked              Code = "certificate_revoked"
@@ -165,6 +167,7 @@ var specs = map[Code]struct {
 	LeaderUnavailable:               {503, "Leader unavailable", "leader-unavailable"},
 	QuorumUnavailable:               {503, "Quorum unavailable", "quorum-unavailable"},
 	ServiceUnavailable:              {503, "Service unavailable", "service-unavailable"},
+	WorkbenchBusy:                   {429, "Too many statements", "workbench-busy"},
 	InternalError:                   {500, "Internal error", "internal-error"},
 	CertificateAuthorityUnavailable: {503, "Certificate authority unavailable", "certificate-authority-unavailable"},
 	CertificateRevoked:              {409, "Certificate revoked", "certificate-revoked"},

@@ -83,7 +83,7 @@ func (o *Ops) UpdateClusterSettings(ctx context.Context, actor string, req api.C
 			return wrap(err)
 		}
 	}
-	return wrap(o.asService(ctx, sysdb.Database, func(tx pgx.Tx) error {
+	err := wrap(o.asService(ctx, sysdb.Database, func(tx pgx.Tx) error {
 		for k, v := range set {
 			j, _ := json.Marshal(v)
 			if _, err := tx.Exec(ctx, `INSERT INTO kingres_cp.cluster_setting (key, value) VALUES ($1, $2)
@@ -93,4 +93,8 @@ func (o *Ops) UpdateClusterSettings(ctx context.Context, actor string, req api.C
 		}
 		return nil
 	}))
+	if _, changed := set["replica.default"]; changed && err == nil && o.OnReplicaCount != nil {
+		o.OnReplicaCount()
+	}
+	return err
 }

@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ha"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/serverinfo"
 )
 
@@ -35,12 +36,17 @@ type Runner struct {
 	// Cert reads this server's certificate (nil: not checked); CA returns the
 	// certificate of the CA this server holds (nil: none); RenewFraction is the
 	// part of its lifetime at which the certificate is renewed.
+	// Leases returns the group leases of this server (nil: no lease manager).
+	Leases        func() []ha.LeaseInfo
 	Cert          func() (*x509.Certificate, error)
 	CA            func() *x509.Certificate
 	RenewFraction float64
 	// LedgerPendingMaxAge overrides the age of the oldest pending ledger
 	// transaction that raises ledgerPendingTooOld (0: LedgerPendingMaxAge).
 	LedgerPendingMaxAge time.Duration
+	// Probes are extra checks run in every round: each returns the conditions that exist
+	// and the alert kinds it evaluated (only those may be cleared).
+	Probes []func(ctx context.Context, now time.Time) ([]Condition, map[string]bool)
 
 	tracker *PendingTracker
 	round   int
@@ -119,10 +125,27 @@ func (r *Runner) Once(ctx context.Context, now time.Time) {
 	} else {
 		rd.ReplicationChecked, rd.Replication, rd.Now = true, rep, now
 	}
+	if r.Leases != nil {
+		rd.LeasesChecked = true
+		for _, l := range r.Leases() {
+			if l.State == "held" || l.State == "lost" {
+				rd.Leases = append(rd.Leases, LeaseReading{Group: l.Group, Lost: l.State == "lost", Enforced: l.Enforced})
+			}
+		}
+	}
 	r.round++
 	conds, evaluated := Evaluate(rd)
 	if !rd.LedgerChecked {
 		delete(evaluated, "ledgerPendingTooOld")
+	}
+	// Probes add the conditions of features that know their own state (standbys): their
+	// kinds are evaluated with the others, so that one Reconcile raises and clears all.
+	for _, p := range r.Probes {
+		extra, kinds := p(ctx, now)
+		conds = append(conds, extra...)
+		for k := range kinds {
+			evaluated[k] = true
+		}
 	}
 	if err := Reconcile(ctx, c, r.Host, conds, evaluated, now); err != nil {
 		r.Log.Warn("updating alerts", "error", err)

@@ -312,7 +312,7 @@ func (s *Server) listTasks(_ *call, w http.ResponseWriter, r *http.Request) erro
 			"server.leave", "instance.start", "instance.stop", "instance.restart", "database.create",
 			"database.update", "database.drop", "table.distribute", "rebalance",
 			"replication.restorePreferredPrimaries", "ledger.verify", "networkAccess.apply", "replicate.apply",
-			"certificate.renew", "certificate.revoke"),
+			"certificate.renew", "certificate.revoke", "standby.reconcile"),
 	}
 	page := pp.page()
 	if p := pp.err(); p != nil {
@@ -346,6 +346,9 @@ func (s *Server) listLedgerStatus(c *call, w http.ResponseWriter, r *http.Reques
 		return s.storeProblem(r, err, "")
 	}
 	s.completeLedgerStatus(c, r, "listLedgerStatus", nil, items)
+	for i := range items {
+		normalizeLedgerCoverage(&items[i])
+	}
 	s.writeJSON(w, r, http.StatusOK, api.LedgerStatusList{Items: nonNil(items)})
 	return nil
 }
@@ -363,6 +366,7 @@ func (s *Server) getLedgerStatus(c *call, w http.ResponseWriter, r *http.Request
 	one := []api.LedgerStatus{v}
 	s.completeLedgerStatus(c, r, "getLedgerStatus", map[string]string{"databaseName": db}, one)
 	v = one[0]
+	normalizeLedgerCoverage(&v)
 	if v.Chains == nil {
 		v.Chains = []api.LedgerChainStatus{}
 	}
@@ -484,4 +488,13 @@ func (s *Server) managerLeader(ctx context.Context) *api.ManagerLeader {
 		l.Address = srv.Address
 	}
 	return l
+}
+
+// normalizeLedgerCoverage makes the coverage of a ledger status explicit: a store
+// that named no uncovered shard group read every chain there is.
+func normalizeLedgerCoverage(st *api.LedgerStatus) {
+	if st.UncoveredShardGroupIDs == nil {
+		st.UncoveredShardGroupIDs = []int32{}
+		st.Complete = true
+	}
 }

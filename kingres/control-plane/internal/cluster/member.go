@@ -416,6 +416,15 @@ func (s *Service) RemoveInstance(ctx context.Context) error {
 	if !s.Enabled() {
 		return ErrDisabled
 	}
+	// The standbys this server runs for other servers' groups go with it: a server that
+	// is removed or reset must leave no PostgreSQL process behind.
+	for _, id := range s.mgr.IDs() {
+		if instance.IsStandbyDirID(id) {
+			if err := s.mgr.Remove(ctx, id); err != nil {
+				return err
+			}
+		}
+	}
 	if err := s.mgr.Remove(ctx, NodeID); err != nil {
 		return err
 	}

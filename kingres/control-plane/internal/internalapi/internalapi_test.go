@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fence"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fwdproof"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pki"
 )
@@ -90,6 +91,7 @@ func newEnv(t *testing.T) *env {
 			return nil
 		},
 		Revoked:   ca.Revoked,
+		Fence:     fence.NewRegistry(),
 		Resources: func(context.Context) (any, error) { return map[string]int{"cores": 4}, nil },
 		Logs:      func(context.Context, map[string]string) (any, error) { return map[string]any{"items": []any{}}, nil },
 		Metrics:   func(context.Context) (any, error) { return map[string]any{}, nil },

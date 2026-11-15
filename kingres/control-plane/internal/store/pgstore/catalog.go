@@ -371,7 +371,7 @@ func (s *Store) buildServers(ctx context.Context, cat *catalog, hold map[string]
 		h := *hold[sv.ID]
 		server := api.Server{
 			ID: sv.ID, Address: net.JoinHostPort(sv.Host, s.opts.PanelPort), Hostname: sv.Host,
-			Status:      statusOf(sv, h.Primary+h.Replica, h.Primary, anyBuckets),
+			Status:      s.withLiveness(sv.ID, statusOf(sv, h.Primary+h.Replica, h.Primary, anyBuckets)),
 			ServerGroup: sv.Group, ShouldHaveShards: sv.Should,
 			Version:   versionPtr(s.opts.Version),
 			Instances: make([]api.Instance, 0, len(sv.Nodes)), Buckets: h,
@@ -380,6 +380,7 @@ func (s *Store) buildServers(ctx context.Context, cat *catalog, hold map[string]
 			up := int64(s.now().Sub(s.opts.Started).Seconds())
 			server.UptimeSeconds = &up
 		}
+		server.LastHeartbeatAt = s.lastHeartbeat(sv.ID)
 		if n, ok := cat.activePrimary(0); ok && cat.byNode[n.ID] == sv {
 			server.IsManagerLeader = true
 		}
@@ -542,12 +543,15 @@ func (s *Store) ClusterSummary(ctx context.Context) (store.ClusterSummary, error
 	if len(cat.nodes) == 0 {
 		sum.MapGroupAvailable = true // no catalog yet: nothing is failing over
 	}
-	for _, sv := range cat.servers {
-		h := hold[sv.ID]
+	// The counts are made from the very list Servers returns (same catalog snapshot, same
+	// status function including the heartbeats), so the overview and the list agree.
+	for _, sv := range s.buildServers(ctx, cat, hold, anyHeld(perDB)) {
 		sum.Servers.Total++
-		switch statusOf(sv, h.Primary+h.Replica, h.Primary, anyHeld(perDB)) {
+		switch sv.Status {
 		case "live":
 			sum.Servers.Live++
+		case "suspect":
+			sum.Servers.Suspect++
 		case "draining":
 			sum.Servers.Draining++
 		case "dead":
@@ -585,7 +589,7 @@ func (s *Store) ClusterSummary(ctx context.Context) (store.ClusterSummary, error
 	switch {
 	case sum.Buckets.Unavailable > 0 || !sum.MapGroupAvailable:
 		sum.Health = "critical"
-	case sum.Buckets.UnderReplicated > 0 || sum.Servers.Dead > 0 || sum.Servers.Draining > 0 || sum.Servers.PendingRebalance > 0:
+	case sum.Buckets.UnderReplicated > 0 || sum.Servers.Dead > 0 || sum.Servers.Suspect > 0 || sum.Servers.Draining > 0 || sum.Servers.PendingRebalance > 0:
 		sum.Health = "degraded"
 	}
 	return sum, nil

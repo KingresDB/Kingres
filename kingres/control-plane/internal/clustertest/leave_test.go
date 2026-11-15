@@ -69,7 +69,7 @@ func revokedOn(t *testing.T, observer *clustertest.Node, as *clustertest.Node) [
 		t.Fatalf("GET /revoked on node %d: %d %v", observer.Index, st, out)
 	}
 	var serials []string
-	for _, s := range out["serials"].([]any) {
+	for _, s := range anyList(out["serials"]) {
 		serials = append(serials, s.(string))
 	}
 	return serials

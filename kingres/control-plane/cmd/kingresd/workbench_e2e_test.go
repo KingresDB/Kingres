@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // wbq runs one workbench statement through the API and returns status and body.
@@ -173,5 +174,49 @@ func TestWorkbenchIgnoresBareAdminMemberships(t *testing.T) {
 	}
 	if st, out, _ := e.as(tok).call("POST", "/query", map[string]any{"database": "postgres", "sql": "select 1"}, nil); st != 403 {
 		t.Errorf("the role that does hold pg_read_server_files must still be refused: %d %v", st, out)
+	}
+}
+
+// TestWorkbenchCancelStatementRoute is the HTTP side of cancelStatement (contract 0.7.0): a
+// statement started with a statementId is cancelled by that id and ends with sql_error 57014, a
+// second cancel finds nothing (404), and a statement id of a running statement cannot be reused.
+func TestWorkbenchCancelStatementRoute(t *testing.T) {
+	e := shared(t)
+	e.mustTask(t, "POST", "/databases", map[string]any{"name": "canceldb"})
+	defer e.mustTask(t, "DELETE", "/databases/canceldb", nil)
+	done := make(chan map[string]any, 1)
+	status := make(chan int, 1)
+	go func() {
+		st, out := e.wbq("postgres", "select pg_sleep(60)", map[string]any{"statementId": "cancel-me-1", "timeoutMs": 120000})
+		status <- st
+		done <- out
+	}()
+	// The statement is tracked as soon as it runs; poll the cancel until it finds it.
+	var cancelled bool
+	for i := 0; i < 100 && !cancelled; i++ {
+		st, _, _ := e.call("POST", "/query/statements/cancel-me-1/cancel", nil, nil)
+		if st == 204 {
+			cancelled = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !cancelled {
+		t.Fatal("the statement was never found by its id")
+	}
+	select {
+	case st := <-status:
+		out := <-done
+		if st != 422 || out["code"] != "sql_error" || out["sqlState"] != "57014" {
+			t.Fatalf("the cancelled statement answered %d %v", st, out)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the cancelled statement did not end")
+	}
+	if st, _, _ := e.call("POST", "/query/statements/cancel-me-1/cancel", nil, nil); st != 404 {
+		t.Errorf("a second cancel: %d, want 404", st)
+	}
+	if st, _, _ := e.call("POST", "/query/statements/bad%20id/cancel", nil, nil); st != 404 && st != 400 {
+		t.Errorf("a malformed id: %d", st)
 	}
 }

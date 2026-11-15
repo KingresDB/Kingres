@@ -74,6 +74,9 @@ version 1, the caller \"2\"."}` when the number is missing or different.
 | `POST /internal/v1/node/finish` | leader, or any peer while joining | the server becomes clustered and its setup token is removed |
 | `POST /internal/v1/node/reset` | leader | delete the instance, certificates and key; the server is uninitialized again with a new setup token |
 | `POST /internal/v1/apply` | leader | one cluster-wide operation from a closed set (create or drop a database, network rules, role sync and drop, grant, `role.changed`: end the sessions of a changed role and forget cached role checks) with structured parameters |
+| `POST /internal/v1/standby/plan` | leader | the complete list of the cluster's standbys with a version; stored by every server, applied at once by the server that runs a group's primary; see "Standbys" |
+| `POST /internal/v1/standby/create`, `/remove`, `/rebuild` | leader | create (slot on the primary, `pg_basebackup`, start in recovery), delete, or make again the standby instance of a group on this server |
+| `GET /internal/v1/standby/status` | leader | the standby instances of this server and, for the group whose primary it runs, the synchronous setting, streaming standbys, slots and the standbys whose slot was lost |
 
 "Member" means a server that the leader's catalog records as `active` (or `removing`, which must still be able to ask how its removal went). A server that holds a certificate of the cluster but has not been admitted yet (`pending`: the certificate was issued and installed, the add task has not finished) is **not** a member: it may make only the calls of its own join, which the leader makes on it, and every call marked "member" is refused with `403 not_member`. Every certificate the cluster signs for a server that is not yet a member is therefore a certificate that authorizes nothing but that join.
 
@@ -248,9 +251,94 @@ The statement of `POST /internal/v1/exec` runs under `statement_timeout` of 15 m
 on its own connection; the request context ends when the leader disconnects, but that does not stop a statement on
 every path.
 
+## High availability, part 1
+
+### Heartbeats
+
+`POST /internal/v1/heartbeat` (any server of the cluster, policy `AnyPeer`). Body
+`{"intervalMillis": 1000, "uptimeSeconds": 12}` (both are durations; no time of day is ever sent). The receiver notes
+the arrival on its own monotonic clock as "heard from the caller" (the caller is the server named by its certificate;
+a server it does not expect is ignored) and answers `{"serverId": "<receiver>", "uptimeSeconds": 40}`. The sender
+takes a matching `serverId` as proof that the receiver is alive. Each server sends one to every other server of its
+peer directory every `heartbeat-interval` and skips a server whose previous call has not ended. A call has a timeout of
+twice the interval (2 s at least, half the failure timeout at most). A call from a blocked peer is dropped by the
+fault hook when it is on (tests only). Errors: `version_mismatch`, `certificate_refused`, `bad_request`.
+
+### Leases
+
+Authorization: both calls are `AnyPeer` (a server with a valid certificate); `POST /lease/grant` also needs the caller
+to be a server of this server's peer directory (`403 not_member` otherwise). The holder is **the server named by the
+caller's certificate**, never a field of the body.
+
+`POST /lease/grant`: the caller asks for the lease of a shard group.
+
+```
+{"group": 1, "durationMs": 10000, "dryRun": false}
+-> 200 {"granted": true, "holder": "10.0.0.12"}
+-> 200 {"granted": false, "holder": "10.0.0.11", "waitMs": 8200}
+```
+
+`durationMs` is the validity the caller wants from the start of its renewal round (1 ms to one minute; `400
+bad_request` otherwise). The grantor answers `granted: true` when it holds no lease for the group, when the caller is the
+holder, or when the holder's lease expired more than the margin ago. Otherwise it answers `granted: false` with the
+current holder and `waitMs`, the time until it would grant to another holder (a duration; no time of day travels).
+A grant that changes the holder is on disk (`<data-dir>/lease/grants.json`) before it is answered; if it cannot be
+written the answer is `503 unavailable` and nothing was granted. `dryRun: true` answers what would happen and changes
+nothing (the tests use it to see the earliest moment a new holder could be granted; part 2 uses it to wait for the old
+lease). The call is refused while the server is not clustered (`409`/`not_available` through the call table).
+
+`GET /lease/state`: this server's knowledge of the leases.
+
+```
+{"server": "10.0.0.11",
+ "grants":  [{"group": 2, "holder": "10.0.0.12", "remainingMs": 7300}],
+ "leases":  [{"group": 1, "holder": "10.0.0.11", "state": "held", "remainingMillis": 3900, "enforced": true}]}
+```
+
+`grants` are the leases this server granted (remaining time, margin not included); `leases` merges the leases this server
+holds or lost (`state` `held`, `lost`) with the ones it granted to others (`granted`). `enforced` tells whether losing
+the lease stops the instance.
+
+Fault hook (tests only, `fault-dir`): a call from a server listed in `blockInbound` is dropped without an answer after
+its certificate was verified, and a call to a server listed in `blockOutbound` fails as unreachable, before the network
+is used. Nothing of it exists unless `fault-dir` is set.
+
+### Standbys
+
+All five calls are made by the manager leader (policy `LeaderOnly`, also to itself, where the call is answered in
+process). Bodies are JSON; the error text of a failing operation is not relayed (the log of the receiving server has it).
+Types: `internal/standby/wire.go`.
+
+| Call | Body | Answer | What the receiving server does |
+|---|---|---|---|
+| `POST /standby/plan` | `{version, replicas, standbys: [{id, group, server, primaryServer, primaryPort, port, ready, generation}]}` | `{}` | Stores the complete list of the cluster's standbys in `<data-dir>/standby/state.json` unless it holds a newer version, and runs its primary-side maintenance (slots, `synchronous_standby_names`) at once. Sent to every server whenever the list changes, and by the leader's check to a server that reports an older `planVersion`. |
+| `POST /standby/create` | `{entry}` | `{port}` | Makes the standby of `entry` on this server: slot on the primary (certificate connection), `pg_basebackup`, managed configuration, `standby.signal`, start. Idempotent. `409 conflict` when the directory of the group holds another standby. |
+| `POST /standby/remove` | `{entry}` | `{}` | Stops and deletes the standby instance and drops its slot on the primary (best effort). |
+| `POST /standby/rebuild` | `{entry, diverged}` | `{port}` | Makes the standby again: `pg_rewind` when `diverged` and possible, otherwise delete, new slot, new base backup. |
+| `GET /standby/status` | none | `{server, planVersion, standbys: [{id, group, port, running, generation, receiving, replayLagBytes}], primary: {group, synchronousStandbyNames, without, streaming, slots, needsRebuild}}` | Reports the standby instances of this server and, when it runs a group's primary, that group's synchronous setting, streaming standbys, slot retention and the standbys whose slot was lost. |
+
+The slot and the base backup use the caller's certificate-authenticated connection to the primary's instance: the
+`hostssl replication all <cidr> cert map=kingres_nodes` rule of every instance's `pg_hba.conf` (see README, "Standbys").
+
+### The fencing epoch of task steps
+
+A step of a task run that calls another server sends the header `X-Kingres-Fence: <task id>:<epoch>` (the lease epoch
+of the run, `task.Env.Fence()`). A server that receives it on a call of a leader-only policy (`LeaderOnly`,
+`LeaderOrJoining` from a known leader) keeps the highest epoch seen per task, in memory and in
+`<data-dir>/fence.json`, and answers a lower epoch with `409 fenced` before it does anything; an equal or higher epoch
+is accepted and recorded. A malformed header is `400 bad_request`. The header is ignored on calls of other policies
+and from callers that are not the leader, and a call without it is never fenced.
+
+An unknown leader is asked for again (three times, 200 ms apart) before a leader-only call is refused with
+`not_leader`; a joining server is not asked.
+
+### A server that waits for its lease
+
+A server whose instance is held back until its group lease is won (the fence marker `<data-dir>/lease/fenced` exists, or its instance is not running) cannot read the catalog and knows no leader. Every call that needs the leader (`LeaderOnly`, `LeaderOrJoining`, `ToLeader`) is then answered `503` with the code `service_unavailable` and `Retry-After: 2`, never `403 not_leader` (which means "the caller is not the leader"). The caller treats it as transient: a task step retries with a pause growing from 1 s to 8 s for up to 5 minutes and then fails naming the server; other callers get the 503. The REST sign-in on that server answers `503 service_unavailable` with `Retry-After: 5` in the same window.
+
 ## Errors
 
 JSON `{"error": "<code>", "message": "..."}`. Codes: `no_certificate`,
 `certificate_refused` (401), `version_mismatch` (409), `not_leader` (403),
 `not_found` (404), `identity_unproven` (401: the proof of a forwarded or gather-authorize request, or the assertion of a gather request, is missing or wrong), `not_member` (403: the caller holds a certificate but is not a member of the cluster), `forbidden` (403: a task call about an instance that is not the caller's), `bad_request` (400), `statement_failed` (422), `ca_unavailable` (503: the leader does not hold
-the CA key), `certificate_revoked` (409), `failed` (500).
+the CA key), `certificate_revoked` (409), `fenced` (409: the task run that made the call was superseded by a newer one), `failed` (500).

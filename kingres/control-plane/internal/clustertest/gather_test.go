@@ -46,7 +46,7 @@ func TestClusterWideLogsAlertsAndMetricsFromAnyServer(t *testing.T) {
 	for i, n := range c.Nodes {
 		sys := n.ServicePG("kingres_system")
 		if _, err := sys.Exec(ctx, `INSERT INTO kingres_cp.alert (severity, kind, subject, message, raised_at)
-			VALUES ('warning', 'replicationLagHigh', $1, $2, now() + $3 * interval '1 second')`, "server:"+n.Host, "cluster-wide test alert of "+n.Host, i); err != nil {
+			VALUES ('warning', 'taskFailed', $1, $2, now() + $3 * interval '1 second')`, "server:"+n.Host, "cluster-wide test alert of "+n.Host, i); err != nil {
 			t.Fatalf("node %d: %v", i, err)
 		}
 	}
@@ -204,7 +204,7 @@ func TestClusterWideLogsAlertsAndMetricsFromAnyServer(t *testing.T) {
 			time.Now().Add(-10*time.Minute).UTC().Format(time.RFC3339), time.Now().Add(time.Minute).UTC().Format(time.RFC3339))
 		body := c.Nodes[1].Expect(200, "GET", q, nil)
 		labels := map[string]bool{}
-		for _, s := range body["series"].([]any) {
+		for _, s := range anyList(body["series"]) {
 			labels[s.(map[string]any)["labels"].(map[string]any)["serverId"].(string)] = true
 		}
 		if len(labels) == 3 && body["partial"] == false {
@@ -281,4 +281,11 @@ func TestClusterWideReadsNameTheServerThatIsDown(t *testing.T) {
 	if st != 200 || body["partial"] != false {
 		t.Errorf("after the server is back: %d %v", st, body["missingServers"])
 	}
+}
+
+// anyList reads a JSON array member; a missing or mistyped member is an empty list, so a test
+// whose request failed reports that (the status and the answer) instead of panicking.
+func anyList(v any) []any {
+	l, _ := v.([]any)
+	return l
 }

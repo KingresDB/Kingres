@@ -205,7 +205,7 @@ func TestCertificateRenewalKeepsAThreeServerClusterWorking(t *testing.T) {
 		for _, n := range c.Nodes {
 			serials[n.Index][pki.SerialHex(certOf(t, n).SerialNumber)] = true
 			// The REST API of every server answers with the cluster's state (a follower asks the leader over the internal API).
-			if st, out := n.Do("GET", "/servers", nil, nil); st != 200 || len(out["items"].([]any)) != 3 {
+			if st, out := n.Do("GET", "/servers", nil, nil); st != 200 || len(anyList(out["items"])) != 3 {
 				fail("node %d GET /servers: %d %v", n.Index, st, out)
 			}
 			// A new connection routes statements to the three servers over the certificates.

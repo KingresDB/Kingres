@@ -70,6 +70,9 @@ type Ops struct {
 	// the named server's. A peer may record and settle tasks only of its own
 	// instances (CP2-20); nil refuses every such call.
 	InstanceOwner func(ctx context.Context, instanceID, server string) (bool, error)
+	// OnReplicaCount is called after the cluster setting defaultReplicaCount was stored
+	// (also when the value is the same): the standby task checks the standbys at once.
+	OnReplicaCount func()
 	// BG bounds background task runs; Wait waits for them.
 	BG  context.Context
 	Log *slog.Logger
@@ -78,6 +81,8 @@ type Ops struct {
 	wg         sync.WaitGroup
 	applyState applyState
 	life       lifecycle
+	// stmts tracks the running workbench statements (cancel.go).
+	stmts statements
 }
 
 // SetEngine installs the task engine once the system database exists.

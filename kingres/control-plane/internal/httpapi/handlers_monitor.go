@@ -30,6 +30,24 @@ var metricUnits = map[string]struct {
 	"queriesPerSecond": {"countPerSecond", true}, "bucketsUnderReplicated": {"count", true},
 }
 
+func init() {
+	// The counters of the client entry points (contract 0.7.0), per server and summed over servers.
+	for _, p := range []string{"client", "clientStandby"} {
+		for _, n := range []string{"ConnectionsAccepted", "ConnectionsActive", "ConnectionsRefused", "ConnectFailures", "ConnectionsMoved", "ConnectionsIdleClosed"} {
+			metricUnits[p+n] = struct {
+				unit string
+				sum  bool
+			}{"count", true}
+		}
+		for _, n := range []string{"BytesIn", "BytesOut"} {
+			metricUnits[p+n] = struct {
+				unit string
+				sum  bool
+			}{"bytes", true}
+		}
+	}
+}
+
 var errUnavailable = errors.New("backing store unavailable")
 
 // metricsEndpoint serves the Prometheus text format at /metrics (outside the

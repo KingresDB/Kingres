@@ -108,6 +108,8 @@ type Config struct {
 	LedgerPendingMaxAge  time.Duration
 	VersionCheckInterval time.Duration
 	GatherTimeout        time.Duration
+	// HA are the settings of high availability (see ha.go).
+	HA HAConfig
 }
 
 // setting describes one configuration key.
@@ -300,6 +302,7 @@ func Defaults() Config {
 		CertificateLifetime: 365 * 24 * time.Hour, CertificateRenewFraction: 1.0 / 3.0,
 		CertificateCheckInterval: time.Hour, CertificateRetryInterval: time.Minute,
 		MonitorInterval: 10 * time.Second, LedgerPendingMaxAge: 5 * time.Minute, VersionCheckInterval: time.Minute, GatherTimeout: 3 * time.Second,
+		HA: DefaultHA(),
 	}
 }
 
@@ -424,6 +427,9 @@ func (c *Config) Validate() error {
 	}
 	if c.AuditFile == "" {
 		c.AuditFile = filepath.Join(c.DataDir, "audit.jsonl")
+	}
+	if err := c.HA.validate(); err != nil {
+		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
 }

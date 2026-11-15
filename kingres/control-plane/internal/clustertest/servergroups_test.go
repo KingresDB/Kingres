@@ -13,7 +13,7 @@ import (
 
 func memberIDs(g map[string]any) []string {
 	var out []string
-	for _, id := range g["serverIds"].([]any) {
+	for _, id := range anyList(g["serverIds"]) {
 		out = append(out, id.(string))
 	}
 	return out
@@ -52,13 +52,15 @@ func TestServerGroupsAcrossServers(t *testing.T) {
 	target := f2.Host
 
 	for _, n := range c.Nodes {
-		if _, body := n.Do("GET", "/server-groups", nil, nil); len(body["items"].([]any)) != 0 {
+		// A failing node must fail the test with its answer, not panic on a missing member.
+		body := n.Expect(200, "GET", "/server-groups", nil)
+		if len(items(t, body)) != 0 {
 			t.Fatalf("node %d: groups before: %v", n.Index, body)
 		}
 	}
 	// Create one group on the leader and one through a follower.
 	g := leader.Expect(201, "POST", "/server-groups", map[string]any{"name": "rack-a", "description": "Row 1"})
-	if g["name"] != "rack-a" || len(g["serverIds"].([]any)) != 0 {
+	if g["name"] != "rack-a" || len(anyList(g["serverIds"])) != 0 {
 		t.Errorf("created %v", g)
 	}
 	f1.Expect(201, "POST", "/server-groups", map[string]any{"name": "rack-b"})
@@ -157,7 +159,7 @@ func TestServerGroupsAcrossServers(t *testing.T) {
 	f2.Expect(204, "DELETE", "/server-groups/rack-a", nil)
 	f1.Expect(204, "DELETE", "/server-groups/rack-b", nil)
 	for _, n := range c.Nodes {
-		if _, body := n.Do("GET", "/server-groups", nil, nil); len(body["items"].([]any)) != 0 {
+		if _, body := n.Do("GET", "/server-groups", nil, nil); len(anyList(body["items"])) != 0 {
 			t.Errorf("node %d: groups after the deletes: %v", n.Index, body)
 		}
 	}
@@ -170,7 +172,7 @@ func TestServerGroupsAcrossServers(t *testing.T) {
 	}{{"createServerGroup", 2, 1}, {"deleteServerGroup", 2, 2}, {"updateServer", 5, 5}} {
 		var ok, forwarded int
 		a := leader.Expect(200, "GET", "/audit?action="+tc.action+"&limit=200", nil)
-		for _, it := range a["items"].([]any) {
+		for _, it := range anyList(a["items"]) {
 			m := it.(map[string]any)
 			if m["outcome"] != "success" || m["actor"] != clustertest.AdminUser {
 				continue
@@ -186,7 +188,7 @@ func TestServerGroupsAcrossServers(t *testing.T) {
 	}
 	for _, n := range []*clustertest.Node{f1, f2} {
 		a := n.Expect(200, "GET", "/audit?action=createServerGroup&limit=200", nil)
-		for _, it := range a["items"].([]any) {
+		for _, it := range anyList(a["items"]) {
 			// Only the refused attempt of the read-only role is audited where it was made.
 			// The list is the cluster's: only the events this follower wrote count.
 			if m := it.(map[string]any); m["serverId"] == n.Host && m["outcome"] != "denied" {

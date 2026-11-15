@@ -87,6 +87,12 @@ func (t NodeTrust) hbaLines() string {
 	for _, c := range cidrs {
 		fmt.Fprintf(&sb, "hostssl   all all %s cert map=%s\n", c, NodeMap)
 	}
+	// Replication connections (pg_basebackup and the walreceiver of a standby, design
+	// ha-phase5 part A) are matched by their own database keyword: "all" never covers
+	// "replication". The same certificate map authenticates them.
+	for _, c := range cidrs {
+		fmt.Fprintf(&sb, "hostssl   replication all %s cert map=%s\n", c, NodeMap)
+	}
 	return sb.String()
 }
 

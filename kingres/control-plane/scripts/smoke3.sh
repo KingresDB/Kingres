@@ -45,7 +45,9 @@ stop() { kill "${PID[$1]:-0}" 2>/dev/null; wait "${PID[$1]:-0}" 2>/dev/null; }
 cleanup() {
   for i in 1 2 3; do
     kill "${PID[$i]:-0}" 2>/dev/null
-    [ -f "$D/n$i/data/instances/1/pgdata/postmaster.pid" ] && "$INST/bin/pg_ctl" stop -D "$D/n$i/data/instances/1/pgdata" -m fast -w >/dev/null 2>&1
+    for pd in "$D/n$i"/data/instances/*/pgdata; do  # the instance of the server and the standbys it runs
+      [ -f "$pd/postmaster.pid" ] && "$INST/bin/pg_ctl" stop -D "$pd" -m fast -w >/dev/null 2>&1
+    done
   done
 }
 trap cleanup EXIT
@@ -193,6 +195,50 @@ echo "  server 3 stopped; logs: $(api 2 GET '/logs?limit=5' '' | jq -c '{partial
 echo "                    alerts: $(api 2 GET '/alerts?limit=5' '' | jq -c '{partial, missingServers}')"
 start 3; for _ in $(seq 1 60); do login 3 $ADMIN $APW; [ "${TOK[3]}" != null ] && [ -n "${TOK[3]}" ] && break; sleep 1; done
 echo "  server 3 is back: logs partial=$(api 2 GET '/logs?limit=5' '' | jq -c .partial)"
+
+say "15b. heartbeats: a stopped server is dead on the others and live again when it returns"
+for _ in $(seq 1 30); do
+  UP=$(api 1 GET /servers '' | jq -r '[.items[] | select(.id != "'${HOST[1]}'") | select(.lastHeartbeatAt != null)] | length'); [ "$UP" = 2 ] && break; sleep 1
+done
+check "server 1 lists a heartbeat time for both other servers" "$([ "$UP" = 2 ]; echo $?)"
+stop 3
+DEAD=""
+for _ in $(seq 1 60); do
+  D1=$(api 1 GET /servers '' | jq -r '.items[] | select(.id == "'${HOST[3]}'") | .status'); D2=$(api 2 GET /servers '' | jq -r '.items[] | select(.id == "'${HOST[3]}'") | .status')
+  [ "$D1" = dead ] && [ "$D2" = dead ] && DEAD=yes && break; sleep 1
+done
+check "server 3 stopped: servers 1 and 2 list it as dead" "$([ "$DEAD" = yes ]; echo $?)"
+echo "  overview counts on server 1: $(api 1 GET /cluster '' | jq -c .servers)"
+check "the overview counts one dead server" "$([ "$(api 1 GET /cluster '' | jq -r .servers.dead)" = 1 ]; echo $?)"
+start 3; for _ in $(seq 1 60); do login 3 $ADMIN $APW; [ "${TOK[3]}" != null ] && [ -n "${TOK[3]}" ] && break; sleep 1; done
+BACK=""
+for _ in $(seq 1 60); do
+  D1=$(api 1 GET /servers '' | jq -r '.items[] | select(.id == "'${HOST[3]}'") | .status')
+  [ "$D1" != dead ] && [ "$D1" != suspect ] && [ -n "$D1" ] && BACK=yes && break; sleep 1
+done
+check "server 3 is listed as alive again after its restart" "$([ "$BACK" = yes ]; echo $?)"
+
+say "15c. standbys: every group has one that streams; a commit needs it; the replica count lowers and raises them"
+streaming_groups() { api 1 GET /replication/topology '' | jq -r '[.groups[] | select((.standbys | length) == 1 and (.standbys[0].syncState != null))] | length'; }
+SB=0
+for _ in $(seq 1 180); do SB=$(streaming_groups); [ "$SB" = 3 ] && break; sleep 2; done
+check "every shard group has one streaming standby (the default replica count)" "$([ "$SB" = 3 ]; echo $?)"
+echo "  standbys: $(api 1 GET /replication/topology '' | jq -c '[.groups[] | {group: .id, primary: .primary.serverId, standby: .standbys[0].serverId, state: .standbys[0].syncState}]')"
+SYNCN=$(sql 1 postgres "$(cat $D/n1/data/service-credentials)" kingresd "show synchronous_standby_names")
+check "the primary of group 0 waits for its standby by name ($SYNCN)" "$(case "$SYNCN" in "ANY 1 (kingres_standby_"*) echo 0 ;; *) echo 1 ;; esac)"
+sql 1 postgres "$(cat $D/n1/data/service-credentials)" kingresd "create table if not exists smoke_sb (n int); insert into smoke_sb values (1)" >/dev/null
+SBPORT=$(api 1 GET /replication/topology '' | jq -r '.groups[] | select(.id == 0) | .standbys[0].port')
+SBHOST=$(api 1 GET /replication/topology '' | jq -r '.groups[] | select(.id == 0) | .standbys[0].serverId')
+SBN=1; for j in 1 2 3; do [ "${HOST[$j]}" = "$SBHOST" ] && SBN=$j; done
+echo "  the standby of group 0 runs on server $SBN, port $SBPORT; its row count: $(PGPASSWORD= "$PSQL" -X -A -t -h "$D/n$SBN/s/100" -p "$SBPORT" -U kingresd -d postgres -c 'select count(*) from smoke_sb' 2>&1)"
+check "the standby has the row of the synchronous commit" "$([ "$(PGPASSWORD= "$PSQL" -X -A -t -h "$D/n$SBN/s/100" -p "$SBPORT" -U kingresd -d postgres -c 'select count(*) from smoke_sb' 2>&1)" = 1 ]; echo $?)"
+api 1 PATCH /settings/cluster '{"defaultReplicaCount":0}' | jq -c '{defaultReplicaCount}'
+for _ in $(seq 1 90); do N0=$(api 1 GET /replication/topology '' | jq -r '[.groups[].standbys | length] | add'); [ "$N0" = 0 ] && break; sleep 2; done
+check "replica count 0 removes every standby" "$([ "$N0" = 0 ]; echo $?)"
+check "and the synchronous setting is empty again" "$([ -z "$(sql 1 postgres "$(cat $D/n1/data/service-credentials)" kingresd "show synchronous_standby_names")" ]; echo $?)"
+api 1 PATCH /settings/cluster '{"defaultReplicaCount":1}' | jq -c '{defaultReplicaCount}'
+for _ in $(seq 1 180); do SB=$(streaming_groups); [ "$SB" = 3 ] && break; sleep 2; done
+check "replica count 1 brings every standby back" "$([ "$SB" = 3 ]; echo $?)"
 
 say "16. certificates that live 30 seconds are renewed by the servers while statements keep routing"
 for i in 1 2 3; do stop $i; done

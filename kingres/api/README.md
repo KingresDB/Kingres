@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.6.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.7.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and `kingres-cli`. Lint it and run the mechanical rule check with:
 
 ```
@@ -154,6 +154,7 @@ Each task kind has exactly one `subject.type`; `subject.id` is always a string.
 | `ledger.verify` | `ledgerVerification` | the **database name**: the verification id exists only after the run (see `LedgerVerification.taskId`) |
 | `replicate.apply` | `replication` | `apply:<operation>:<role or database names>:<unix nanoseconds>`: the task that brings the servers that could not be reached up to date after a role or grant change (one step per server, `TaskStep.detail` names the server it waits for) |
 | `networkAccess.apply` | `networkAccess` | `network-access` |
+| `standby.reconcile` (0.7.0) | `replication` | `standbys`: adds, removes and rebuilds standby instances until every group has `defaultReplicaCount` of them; the step `standby.register_in_catalog` says `skipped: needs kingres_shard 0.4` until the sharding extension supports standby nodes |
 
 `Task.subject` is null only for tasks whose subject is not known (system tasks such as auto-failover use
 `server.failover` with the failed server as subject and `createdBy: system`).
@@ -311,6 +312,61 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.7.0
+
+Revision written with high availability, part 1 (heartbeats, group leases, standbys, the client entry point) and the three
+gaps the panel reported against 0.6.0. Summary for the panel: 1 operations added (89 operations, 72 paths), **0 breaking
+changes**, additive changes listed below, 1 new problem code (`workbench_busy`, which replaces a guess), 3 new alert kinds,
+documentation corrections. No property was removed, renamed or made required.
+
+#### Breaking
+
+None. One status changes for a case that had no code of its own: the refusal of a workbench statement because the role or
+the server has its slots full was 503 `service_unavailable` (a statement about the server's health, and what the panel
+had to guess); it is now 429 `workbench_busy` (see Additive 3). A client that treated every 503 of `executeQuery` as
+"retry later" should treat 429 `workbench_busy` the same way, with `Retry-After`.
+
+#### Additive
+
+1. **`Alert.subject`** (the gap in 0.6.0 that kept the panel from naming the server that is behind). A typed object
+   `AlertSubject` with `serverId`, `behindServerId`, `shardGroupId`, `databaseName` and `aspect`, each null when
+   it does not apply. For `replicationPending`, `serverId` is the leader that keeps the change waiting and
+   `behindServerId` the server that is behind. `Alert.serverId` and `Alert.databaseName` stay and equal the subject's.
+   The description of `AlertSubject` lists, for every kind, which members it sets.
+2. **`LedgerStatus.complete` and `LedgerStatus.uncoveredShardGroupIds`.** The chains of a status are those of the shard
+   group of the answering server; the other groups are listed, with the same meaning as on `LedgerDigest`. The
+   database summary can state its coverage. (`LedgerChainStatus` is one chain and needs no such member.)
+3. **`workbench_busy`** (429, with `Retry-After`), new `ProblemCode`, and `429` and `409` on `executeQuery`: a
+   dedicated code for "this role already runs its two statements here, or the server runs four".
+4. **`cancelStatement`** (`POST /query/statements/{statementId}/cancel`, role `kingres_readonly`) and
+   `QueryRequest.statementId`: cancel one's own running statement. The server cancels the backend it tracks for that
+   id; a client never names a process id. 204 on request, 404 when no such statement of the caller runs on this
+   server. The cancelled `executeQuery` ends with 422 `sql_error` SQLSTATE `57014`. Not a task (the effect is immediate);
+   audited as `cancelStatement`. New `AuditAction` values: `cancelStatement`, `leaseLost`, `leaseFenced`, `leaseAcquired`.
+5. **Liveness.** `ServerStatus` text states `suspect` (silent for the suspect timeout, 5 s) and `dead` (the failure
+   timeout, 10 s) and that the status returns when the server is heard again. `ServerCounts.suspect` is counted, the counts
+   and the list come from one snapshot, `Server.lastHeartbeatAt` is set. The text of the status no longer says that every
+   server answers the same: `suspect` and `dead` are the answering server's view. `leader_unavailable` (503) is now also
+   the answer of a follower that has not heard from the leader for the leader-loss bound (30 s) to a request that needs a
+   session check.
+6. **Leases.** `ShardGroup.lease` (optional `GroupLease`: `holder`, `state` held/lost/granted/none, `remainingMillis`,
+   `enforced`), the answering server's knowledge. New `AlertKind` values `leaseLost`, `groupWithoutSynchronousStandby`
+   and `groupUnderReplicated`; `serverSuspect` and `serverDown` are now raised from heartbeats.
+7. **Client entry point metrics**: `MetricName` values `clientConnectionsAccepted`, `clientConnectionsActive`,
+   `clientConnectionsRefused`, `clientConnectFailures`, `clientConnectionsMoved`, `clientConnectionsIdleClosed`,
+   `clientBytesIn`, `clientBytesOut` and the same with `clientStandby`.
+8. **Standbys.** `TaskKind` `standby.reconcile`; `AuditAction` values `standbyCreated`, `standbyRemoved`, `standbyRebuilt`,
+   `standbyInstanceStarted`, `standbyInstanceRemoved`, `standbyInstanceRebuilt`, `synchronousStandbyNamesChanged`,
+   `replicationSlotDropped`; the text of `updateClusterSettings` (`defaultReplicaCount` starts the task, it does not only
+   make a rebalance necessary) and of `ReplicationMember.instanceId` (1048576 plus the standby id while a standby is
+   not in the sharding catalog). `replicationLagHigh` also covers a standby slot that retains too much WAL.
+
+#### Documentation
+
+- `autoFailover.timeoutSeconds` now has a real heartbeat source (automatic failover itself comes with the promotion
+  in part 2; `failoverServer` and `restorePreferredPrimaries` still answer `unsupported_operation`).
+- Deferred to a later revision: `LedgerChainStatus` coverage inside one chain, a cluster-wide view of leases.
 
 ### 0.6.0
 

@@ -26,6 +26,7 @@ func (s *Store) ledgerStatus(ctx context.Context, h *dbHandle) (api.LedgerStatus
 	st := api.LedgerStatus{
 		DatabaseName: h.name,
 		Chains:       []api.LedgerChainStatus{},
+		Complete:     true, UncoveredShardGroupIDs: []int32{},
 	}
 	zero, off := 0, "off"
 	st.Mode = &off              // no ledger catalog: the ledger is certainly off
@@ -99,6 +100,8 @@ func (s *Store) ledgerStatus(ctx context.Context, h *dbHandle) (api.LedgerStatus
 		st.VerificationState, chain.VerificationState = vs, vs
 	}
 	st.Chains = append(st.Chains, chain)
+	st.UncoveredShardGroupIDs = s.otherGroups(ctx, h, chain.ShardGroupID)
+	st.Complete = len(st.UncoveredShardGroupIDs) == 0
 	return st, nil
 }
 
@@ -205,4 +208,25 @@ func (s *Store) LedgerBlocks(ctx context.Context, db string, shardGroupID *int32
 		page.Items = blocks[:p.Limit]
 	}
 	return page, nil
+}
+
+// otherGroups lists the shard groups of the cluster other than the one whose
+// chain was read: their chains are not part of the status (contract 0.7.0).
+func (s *Store) otherGroups(ctx context.Context, h *dbHandle, local int32) []int32 {
+	out := []int32{}
+	if ok, err := s.regclassExists(ctx, h.pool, "kingres.node"); err != nil || !ok {
+		return out
+	}
+	rows, err := h.pool.Query(ctx, `SELECT DISTINCT group_id FROM kingres.node WHERE group_id <> $1 ORDER BY group_id`, local)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var g int32
+		if rows.Scan(&g) == nil {
+			out = append(out, g)
+		}
+	}
+	return out
 }

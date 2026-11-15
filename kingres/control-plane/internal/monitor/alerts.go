@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,7 +30,7 @@ const (
 )
 
 // Managed lists the alert kinds the checks own; others are never cleared by them.
-var Managed = []string{"serverDown", "diskSpaceLow", "memoryPressure", "replicationLagHigh", "certificateExpiring", "ledgerPendingTooOld", "versionMismatch", "certificateRenewalFailed", "replicationPending"}
+var Managed = []string{"serverDown", "serverSuspect", "diskSpaceLow", "memoryPressure", "replicationLagHigh", "certificateExpiring", "ledgerPendingTooOld", "versionMismatch", "certificateRenewalFailed", "replicationPending", "leaseLost", "groupWithoutSynchronousStandby", "groupUnderReplicated"}
 
 // Readings are the inputs of the checks; nil means "not measured", which
 // neither raises nor clears an alert.
@@ -49,6 +50,10 @@ type Readings struct {
 	LedgerPending []LedgerPendingReading
 	// ReplicationChecked says that Replication was read (an empty list then
 	// means that no server is behind); Now is the time of the reading.
+	// LeasesChecked says that Leases was read (an empty list then means that this
+	// server runs no primary); Leases are the group leases this server holds or lost.
+	LeasesChecked      bool
+	Leases             []LeaseReading
 	ReplicationChecked bool
 	Replication        []ReplicationReading
 	Now                time.Time
@@ -97,6 +102,10 @@ func Evaluate(r Readings) (conds []Condition, evaluated map[string]bool) {
 	if r.LedgerChecked {
 		evaluated["ledgerPendingTooOld"] = true
 		conds = append(conds, r.ledgerConditions()...)
+	}
+	if r.LeasesChecked {
+		evaluated["leaseLost"] = true
+		conds = append(conds, r.leaseConditions()...)
 	}
 	if r.ReplicationChecked {
 		evaluated["replicationPending"] = true
@@ -165,10 +174,11 @@ var (
 const alertCols = `id, kind, severity, subject, message, raised_at, acknowledged_at, acknowledged_by, cleared_at`
 
 var titles = map[string]string{
-	"serverDown": "Server down", "diskSpaceLow": "Disk space low", "memoryPressure": "Memory pressure",
+	"serverDown": "Server down", "serverSuspect": "Server not answering", "diskSpaceLow": "Disk space low", "memoryPressure": "Memory pressure",
 	"replicationLagHigh": "Replication lag high", "certificateExpiring": "Certificate expiring",
 	"ledgerPendingTooOld": "Ledger entries pending for too long", "versionMismatch": "KingresDB versions differ",
-	"certificateRenewalFailed": "Certificate renewal failed", "replicationPending": "A server is behind on role and grant changes",
+	"certificateRenewalFailed": "Certificate renewal failed", "replicationPending": "A server is behind on role and grant changes", "leaseLost": "A group lease was lost",
+	"groupWithoutSynchronousStandby": "A shard group runs without a synchronous standby", "groupUnderReplicated": "A shard group has too few standbys",
 }
 
 func scanAlert(r pgx.Row) (api.Alert, error) {
@@ -183,13 +193,8 @@ func scanAlert(r pgx.Row) (api.Alert, error) {
 	if a.Title == "" {
 		a.Title = a.Kind
 	}
-	if rest, ok := strings.CutPrefix(subject, "server:"); ok {
-		id, more, _ := strings.Cut(rest, "|")
-		a.ServerID = &id
-		if db, ok := strings.CutPrefix(more, "database:"); ok {
-			a.DatabaseName = &db
-		}
-	}
+	a.Subject = parseSubject(subject)
+	a.ServerID, a.DatabaseName = a.Subject.ServerID, a.Subject.DatabaseName
 	a.RaisedAt = raised.UTC()
 	switch {
 	case cleared != nil:
@@ -319,4 +324,36 @@ func ListAfter(ctx context.Context, c *pgx.Conn, state, severity string, after *
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+// parseSubject reads the stored subject ("server:<id>|behind:<id>|group:<n>|
+// database:<name>|<aspect>", segments in any order) into the typed subject of
+// the contract. A segment it does not know is the aspect; "cluster" is none.
+func parseSubject(subject string) api.AlertSubject {
+	var out api.AlertSubject
+	if subject == "" || subject == "cluster" {
+		return out
+	}
+	for _, seg := range strings.Split(subject, "|") {
+		switch {
+		case strings.HasPrefix(seg, "server:"):
+			v := seg[len("server:"):]
+			out.ServerID = &v
+		case strings.HasPrefix(seg, "behind:"):
+			v := seg[len("behind:"):]
+			out.BehindServerID = &v
+		case strings.HasPrefix(seg, "group:"):
+			if n, err := strconv.ParseInt(seg[len("group:"):], 10, 32); err == nil {
+				g := int32(n)
+				out.ShardGroupID = &g
+			}
+		case strings.HasPrefix(seg, "database:"):
+			v := seg[len("database:"):]
+			out.DatabaseName = &v
+		default:
+			v := seg
+			out.Aspect = &v
+		}
+	}
+	return out
 }

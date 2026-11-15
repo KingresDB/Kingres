@@ -199,7 +199,7 @@ func (s *Server) fillUptimes(ctx context.Context, servers []*api.Server) {
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	for _, sv := range servers {
-		if sv.UptimeSeconds != nil || sv.Status == "dead" {
+		if sv.UptimeSeconds != nil || sv.Status == "dead" || sv.Status == "suspect" {
 			continue
 		}
 		wg.Add(1)

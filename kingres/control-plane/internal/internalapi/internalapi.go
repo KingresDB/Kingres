@@ -25,6 +25,8 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fault"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fence"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fwdproof"
 )
 
@@ -117,6 +119,17 @@ var Calls = map[string]Policy{
 	"POST /task/record":  ToLeader,
 	"POST /task/settle":  ToLeader,
 	"POST /task/reserve": ToLeader,
+
+	// High availability, part 1 (internal-api.md, "Heartbeats", "Leases", "Standbys"). Heartbeats
+	// and leases are between any two servers; the standby calls come from the leader.
+	"POST /heartbeat":       AnyPeer,
+	"POST /lease/grant":     AnyPeer,
+	"GET /lease/state":      AnyPeer,
+	"POST /standby/plan":    LeaderOnly,
+	"POST /standby/create":  LeaderOnly,
+	"POST /standby/remove":  LeaderOnly,
+	"POST /standby/rebuild": LeaderOnly,
+	"GET /standby/status":   LeaderOnly,
 }
 
 // handled lists the calls dispatched to Backend.Handle (the rest have their
@@ -128,6 +141,8 @@ var handled = map[string]bool{
 	"POST /instance/stop": true, "POST /instance/remove": true, "POST /instance/trust": true, "POST /pki/install": true,
 	"POST /peers": true, "POST /globals/apply": true, "POST /node/finish": true, "POST /node/reset": true, "POST /apply": true,
 	"POST /pki/renew": true, "GET /pki/csr": true,
+	"POST /heartbeat": true, "POST /lease/grant": true, "GET /lease/state": true, "POST /standby/plan": true,
+	"POST /standby/create": true, "POST /standby/remove": true, "POST /standby/rebuild": true, "GET /standby/status": true,
 }
 
 // CallError is an error with the status and code the internal API answers.
@@ -289,6 +304,17 @@ type Backend struct {
 	// Joining reports whether this server is not part of a cluster yet but
 	// holds a certificate of one (a join is under way).
 	Joining func() bool
+	// Unavailable reports that this server cannot serve for a reason that ends by itself: its
+	// instance is held back until its group lease is won, so it cannot read the catalog and does not
+	// know the leader (nil: never). Such a server answers 503 service_unavailable with Retry-After,
+	// not 403 not_leader, and task steps wait for it.
+	Unavailable func() bool
+	// Fault is the fault-injection hook of the tests (nil in production): a call from
+	// a blocked peer is dropped without an answer.
+	Fault *fault.Hook
+	// Fence remembers the highest epoch seen per task and refuses calls of a superseded
+	// run (nil: calls are not fenced).
+	Fence *fence.Registry
 }
 
 // Server is the HTTP handler of the internal API.
@@ -297,6 +323,8 @@ type Server struct {
 	be       Backend
 	log      *slog.Logger
 	now      func() time.Time
+	// leaderRetry is the pause between asks for an unknown leader.
+	leaderRetry time.Duration
 }
 
 // New builds the server. now may be nil.
@@ -307,7 +335,7 @@ func New(v PeerVerifier, be Backend, log *slog.Logger, now func() time.Time) *Se
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &Server{verifier: v, be: be, log: log, now: now}
+	return &Server{verifier: v, be: be, log: log, now: now, leaderRetry: 200 * time.Millisecond}
 }
 
 // TLSConfig returns the server TLS configuration of the internal listener: TLS
@@ -368,19 +396,47 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusUnauthorized, "certificate_refused", "The client certificate was not accepted.")
 		return
 	}
+	if s.be.Fault.InboundBlocked(peer) {
+		dropConnection(w)
+		return
+	}
 	// 3. Authorization.
 	if policy == ToLeader {
-		if l := s.be.Leader(); l == "" || l != s.be.Self || (key == "POST /forward" && s.be.Forward == nil) {
+		if s.notReady(r.Context()) {
+			failNotReady(w)
+			return
+		}
+		if l := s.leader(r.Context()); l == "" || l != s.be.Self || (key == "POST /forward" && s.be.Forward == nil) {
 			fail(w, http.StatusConflict, "not_leader", "This server is not the manager leader.")
 			return
 		}
 	}
 	if policy == LeaderOnly || policy == LeaderOrJoining {
 		joining := policy == LeaderOrJoining && s.be.Joining != nil && s.be.Joining()
-		if l := s.be.Leader(); !joining && (l == "" || l != peer) {
-			s.log.Warn("internal call refused", "reason", "not the leader", "call", key, "peer", peer)
-			fail(w, http.StatusForbidden, "not_leader", "Only the manager leader may make this call.")
-			return
+		// A joining server has no catalog and knows no leader: it is not asked (and not waited for).
+		if !joining {
+			if s.notReady(r.Context()) {
+				failNotReady(w)
+				return
+			}
+			if l := s.leader(r.Context()); l == "" || l != peer {
+				s.log.Warn("internal call refused", "reason", "not the leader", "call", key, "peer", peer)
+				fail(w, http.StatusForbidden, "not_leader", "Only the manager leader may make this call.")
+				return
+			}
+			// The caller is the leader: the task run it makes the call for is fenced.
+			if hdr := r.Header.Get(fence.Header); hdr != "" && s.be.Fence != nil {
+				tok, err := fence.Parse(hdr)
+				if err != nil {
+					fail(w, http.StatusBadRequest, "bad_request", "The fence header is malformed.")
+					return
+				}
+				if err := s.be.Fence.Check(tok); err != nil {
+					s.log.Warn("internal call refused", "reason", "fenced", "call", key, "peer", peer, "task", tok.Task, "epoch", tok.Epoch)
+					fail(w, http.StatusConflict, "fenced", "The task run that made this call was superseded by a newer run.")
+					return
+				}
+			}
 		}
 	}
 	// A forwarded operation is gated by the backend's Forward (it must answer the stopped
@@ -541,4 +597,47 @@ func (s *Server) bootstrap(w http.ResponseWriter, r *http.Request, key string) {
 // certificate (see package pki).
 func TLSConfigFunc(get func(*tls.ClientHelloInfo) (*tls.Certificate, error)) *tls.Config {
 	return &tls.Config{MinVersion: tls.VersionTLS13, GetCertificate: get, ClientAuth: tls.RequestClientCert}
+}
+
+// dropConnection closes the connection without an answer, as a network that
+// loses the packets would look to the caller (the fault hook of the tests).
+func dropConnection(w http.ResponseWriter) {
+	if hj, ok := w.(http.Hijacker); ok {
+		if c, _, err := hj.Hijack(); err == nil {
+			_ = c.Close()
+			return
+		}
+	}
+	panic(http.ErrAbortHandler)
+}
+
+// leader returns the manager leader this server knows. "" means the catalog could not
+// be read or names none, which on a loaded machine or right after a server joined is
+// momentary: the answer is asked again a few times (about 0.6 s in all) before a call is
+// refused with not_leader. A leader that is known is never second-guessed here.
+func (s *Server) leader(ctx context.Context) string {
+	l := s.be.Leader()
+	for i := 0; l == "" && i < 3; i++ {
+		select {
+		case <-ctx.Done():
+			return ""
+		case <-time.After(s.leaderRetry):
+		}
+		l = s.be.Leader()
+	}
+	return l
+}
+
+// notReady tells whether the server cannot know the leader because it is held back (see
+// Backend.Unavailable): only then is an unknown leader "not yet" instead of "not you".
+func (s *Server) notReady(ctx context.Context) bool {
+	if s.be.Unavailable == nil || s.be.Leader() != "" {
+		return false
+	}
+	return s.be.Unavailable()
+}
+
+func failNotReady(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", "2")
+	fail(w, http.StatusServiceUnavailable, "service_unavailable", "This server cannot serve yet: its instance waits for its group lease.")
 }

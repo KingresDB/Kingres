@@ -97,6 +97,22 @@ type Alert struct {
 	AcknowledgedAt *Time   `json:"acknowledgedAt"`
 	AcknowledgedBy *string `json:"acknowledgedBy"`
 	ResolvedAt     *Time   `json:"resolvedAt"`
+	// Subject (contract 0.7.0) names what the alert is about in typed members.
+	Subject AlertSubject `json:"subject"`
+}
+
+// AlertSubject is the structured subject of an alert: each member is null when
+// the alert has nothing to say about it. ServerID is the server the alert is
+// about (the one that is down, whose certificate expires, whose lease was lost,
+// that holds the leader's unapplied change: the leader for replicationPending),
+// BehindServerID the server that is behind (replicationPending), ShardGroupID a
+// shard group, DatabaseName a database and Aspect a qualifier such as "ca".
+type AlertSubject struct {
+	ServerID       *string `json:"serverId"`
+	BehindServerID *string `json:"behindServerId"`
+	ShardGroupID   *int32  `json:"shardGroupId"`
+	DatabaseName   *string `json:"databaseName"`
+	Aspect         *string `json:"aspect"`
 }
 
 // AlertPage is a page of alerts.

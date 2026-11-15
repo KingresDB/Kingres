@@ -74,7 +74,7 @@ func forwardsToLeader(op contract.Operation) bool {
 	// createInclusionProof is a POST that changes nothing: it reads the row as
 	// the signed-in role, like the query workbench, wherever the user is.
 	// acknowledgeAlert goes to the server that holds the alert (the ordinal in its id).
-	return op.ID != "executeQuery" && op.ID != "createInclusionProof" && op.ID != "acknowledgeAlert"
+	return op.ID != "executeQuery" && op.ID != "cancelStatement" && op.ID != "createInclusionProof" && op.ID != "acknowledgeAlert"
 }
 
 type fwdKey struct{}

@@ -259,6 +259,13 @@ func (s *Service) Resume(bg context.Context) error {
 		ctx, cancel := context.WithTimeout(bg, 2*time.Minute)
 		defer cancel()
 		if err := s.mgr.Start(ctx, NodeID); err != nil {
+			if errors.Is(err, instance.ErrLeaseRequired) {
+				// The instance fenced itself (lease lost) and may not run as a primary
+				// until the lease manager holds a lease again; it starts it then.
+				s.log.Warn("the local instance is not started: its group lease was lost; it starts when the lease is held again")
+				s.publishDSN()
+				return nil
+			}
 			return fmt.Errorf("starting the local instance: %w", err)
 		}
 		s.publishDSN()
@@ -287,7 +294,18 @@ func (s *Service) StopInstance(ctx context.Context) error {
 	if !s.Enabled() || !s.mgr.Exists(NodeID) {
 		return nil
 	}
-	return s.mgr.Stop(ctx, NodeID)
+	var first error
+	for _, id := range s.mgr.IDs() {
+		if id != NodeID {
+			if err := s.mgr.Stop(ctx, id); err != nil && first == nil {
+				first = err
+			}
+		}
+	}
+	if err := s.mgr.Stop(ctx, NodeID); err != nil {
+		return err
+	}
+	return first
 }
 
 // connect opens a connection as the service role.

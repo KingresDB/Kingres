@@ -86,7 +86,7 @@ func FreePort(t testing.TB) int {
 		if usedPorts[p] {
 			continue
 		}
-		l, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(p))
+		l, err := net.Listen("tcp", ":"+strconv.Itoa(p))
 		if err != nil {
 			continue
 		}
@@ -216,11 +216,11 @@ func FreePortPair(t testing.TB) int {
 		if usedPorts[p] || usedPorts[p+1] {
 			continue
 		}
-		l1, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(p))
+		l1, err := net.Listen("tcp", ":"+strconv.Itoa(p))
 		if err != nil {
 			continue
 		}
-		l2, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(p+1))
+		l2, err := net.Listen("tcp", ":"+strconv.Itoa(p+1))
 		_ = l1.Close()
 		if err != nil {
 			continue

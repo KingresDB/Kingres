@@ -59,6 +59,9 @@ type Node struct {
 	// Extra are further command-line flags of kingresd (a test that needs a
 	// setting, for example a short certificate lifetime); they apply from the next Start.
 	Extra []string
+	// ForceEnforce makes the node enforce lease self-fencing for every group (set
+	// before SetFaults; see fault.Spec).
+	ForceEnforce bool
 
 	mu     sync.Mutex
 	cmd    *exec.Cmd
@@ -129,6 +132,7 @@ func New(t testing.TB, n int) *Cluster {
 func (c *Cluster) Close() {
 	for _, n := range c.Nodes {
 		n.Stop()
+		n.StopStandbys()
 		n.StopInstance()
 	}
 	if os.Getenv("KINGRES_TEST_KEEP") == "" {
@@ -142,7 +146,7 @@ func (c *Cluster) Leader() *Node { return c.Nodes[0] }
 func (n *Node) args() []string {
 	args := []string{"-listen", n.Host + ":" + strconv.Itoa(n.APIPort), "-internal-listen", n.Host + ":" + strconv.Itoa(n.IntPort),
 		"-data-dir", n.DataDir, "-socket-dir", filepath.Join(n.Dir, "s"), "-log-format", "json", "-login-rate-limit", "1000",
-		"-pg-bin-dir", pgtest.BinDir(), "-pg-port", strconv.Itoa(n.PGPort), "-pg-listen", "127.0.0.1," + n.Host, "-server-host", n.Host}
+		"-pg-bin-dir", pgtest.BinDir(), "-pg-port", strconv.Itoa(n.PGPort), "-pg-listen", "127.0.0.1," + n.Host, "-server-host", n.Host, "-fault-dir", n.FaultDir()}
 	return append(args, n.Extra...)
 }
 
@@ -222,6 +226,24 @@ func (n *Node) StopInstance() {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	_ = exec.CommandContext(ctx, filepath.Join(pgtest.BinDir(), "pg_ctl"), "stop", "-D", data, "-m", "fast", "-w", "-t", "50").Run() //nolint:gosec // fixed program
+}
+
+// StopStandbys stops the standby instances of the node (directories 100 and up of
+// its instances directory, see instance.StandbyBaseID); Close calls it.
+func (n *Node) StopStandbys() {
+	entries, _ := os.ReadDir(filepath.Join(n.DataDir, "instances"))
+	for _, e := range entries {
+		if id, err := strconv.Atoi(e.Name()); err != nil || id < 100 {
+			continue
+		}
+		data := filepath.Join(n.DataDir, "instances", e.Name(), "pgdata")
+		if _, err := os.Stat(filepath.Join(data, "postmaster.pid")); err != nil {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		_ = exec.CommandContext(ctx, filepath.Join(pgtest.BinDir(), "pg_ctl"), "stop", "-D", data, "-m", "fast", "-w", "-t", "50").Run() //nolint:gosec // fixed program
+		cancel()
+	}
 }
 
 // LogTail returns the last max bytes of the process log without the access
@@ -334,7 +356,16 @@ func (n *Node) BootstrapFingerprint() string {
 
 // Login signs in and keeps the bearer token.
 func (n *Node) Login(user, pass string) bool {
-	st, body := n.Do("POST", "/auth/login", map[string]any{"username": user, "password": pass, "issueToken": true}, map[string]string{"Authorization": ""})
+	// A server whose group lease is not held yet starts its instance only once it has one
+	// (a lease round), so the sign-in is retried while the server says it cannot serve: 503 or no answer.
+	var st int
+	var body map[string]any
+	for end := time.Now().Add(60 * time.Second); ; time.Sleep(500 * time.Millisecond) {
+		st, body = n.Do("POST", "/auth/login", map[string]any{"username": user, "password": pass, "issueToken": true}, map[string]string{"Authorization": ""})
+		if (st != 503 && st != 0) || time.Now().After(end) {
+			break
+		}
+	}
 	if st != 200 {
 		return false
 	}
@@ -519,7 +550,17 @@ func (n *Node) ServicePG(db string) *pgx.Conn {
 // the servers are added).
 func FormWith(t testing.TB, n int, before func(leader *Node)) *Cluster {
 	t.Helper()
+	return FormWithExtra(t, n, nil, before)
+}
+
+// FormWithExtra is FormWith where every node starts with the extra kingresd flags
+// (a test that needs short timeouts).
+func FormWithExtra(t testing.TB, n int, extra []string, before func(leader *Node)) *Cluster {
+	t.Helper()
 	c := New(t, n)
+	for _, nd := range c.Nodes {
+		nd.Extra = append([]string(nil), extra...)
+	}
 	for _, nd := range c.Nodes {
 		nd.Start()
 	}

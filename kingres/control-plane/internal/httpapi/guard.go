@@ -429,6 +429,9 @@ func requireJSON(r *http.Request) *problem.Problem {
 // dropped, can no longer log in, has expired or lost its cluster roles loses
 // the session at once. A backend that cannot be asked fails closed.
 func (s *Server) currentRoles(r *http.Request, username string) ([]string, *problem.Problem) {
+	if s.deps.LeaderTrusted != nil && !s.deps.LeaderTrusted() {
+		return nil, problem.New(problem.LeaderUnavailable, "This server has lost contact with the manager leader and cannot tell whether the roles of this session were changed; try again when the leader is reachable.").WithRetryAfter(5)
+	}
 	roles, err := s.reval.Roles(r.Context(), username)
 	switch {
 	case errors.Is(err, auth.ErrInvalidCredentials):

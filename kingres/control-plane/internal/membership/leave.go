@@ -110,6 +110,7 @@ func (m *Manager) LeaveStatus(ctx context.Context, peer string, req wire.LeaveSt
 func (m *Manager) leaveDefinition() task.Definition {
 	return task.Definition{Kind: KindLeave, Steps: []task.Step{
 		{Name: "Check that the server may leave", Run: m.stepLeaveCheck},
+		{Name: "Remove the standbys of the server", Run: m.stepRemoveStandbys},
 		{Name: "Unregister the server in every database", Run: m.stepRemoveUnregister},
 		{Name: "Remove the server from the managed rules of the others", Run: m.stepRemoveTrust},
 		{Name: "Forget the server", Run: m.stepLeaveForget},

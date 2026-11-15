@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/leader"
 )
@@ -19,11 +20,31 @@ import (
 type leaderMemory struct {
 	mu sync.Mutex
 	id string
+	at time.Time
+}
+
+// remembered is how long a server that cannot read the leader from its catalog (for
+// example one whose catalog was just emptied by its own removal, which the leader
+// then tells to reset itself) still accepts the calls of the leader it last verified.
+// It replaces the accident of a two-second cache, which the removal of the standbys of
+// the server made too short (the leader answers every call itself, so a stale
+// memory cannot make anything possible that the leader refuses).
+const remembered = 60 * time.Second
+
+// recent returns the leader last verified if that was less than remembered ago.
+func (m *leaderMemory) recent() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.id != "" && time.Since(m.at) < remembered {
+		return m.id
+	}
+	return ""
 }
 
 func (m *leaderMemory) set(id string) {
 	m.mu.Lock()
 	m.id = id
+	m.at = time.Now()
 	m.mu.Unlock()
 }
 

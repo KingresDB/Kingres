@@ -20,3 +20,13 @@ func terminate(cmd *exec.Cmd, hard bool) {
 	}
 	_ = syscall.Kill(-cmd.Process.Pid, sig)
 }
+
+// pause stops (SIGSTOP) or continues (SIGCONT) the kingresd process itself, not
+// its group: the instance it started keeps running, as it would if kingresd hung.
+func pause(cmd *exec.Cmd, stop bool) {
+	sig := syscall.SIGCONT
+	if stop {
+		sig = syscall.SIGSTOP
+	}
+	_ = syscall.Kill(cmd.Process.Pid, sig)
+}

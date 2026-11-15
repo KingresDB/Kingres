@@ -58,6 +58,7 @@ func (m *Manager) RemoveServer(ctx context.Context, actor, id string) (task.Task
 func (m *Manager) removeDefinition() task.Definition {
 	return task.Definition{Kind: KindRemove, Steps: []task.Step{
 		{Name: "Check that the server owns no buckets", Run: m.stepRemoveCheck},
+		{Name: "Remove the standbys of the server", Run: m.stepRemoveStandbys},
 		{Name: "Unregister the server in every database", Run: m.stepRemoveUnregister},
 		{Name: "Remove the server from the managed rules of the others", Run: m.stepRemoveTrust},
 		// The certificate is revoked before the step that cannot be undone (CP2-14): a task
@@ -209,4 +210,28 @@ func (m *Manager) stepRemoveForget(ctx context.Context, env *task.Env) error {
 // Definitions returns the task definitions of this package.
 func (m *Manager) Definitions() []task.Definition {
 	return []task.Definition{m.addDefinition(), m.removeDefinition(), m.leaveDefinition(), m.certRenewDefinition(), m.certRevokeDefinition()}
+}
+
+// stepRemoveStandbys removes the standbys that run on the server and those of the
+// groups whose primary it runs, with their slots (design ha-phase5, part A). It
+// comes before the server is unregistered, while the catalog still names it.
+func (m *Manager) stepRemoveStandbys(ctx context.Context, env *task.Env) error {
+	if m.Standbys == nil {
+		return nil
+	}
+	in, err := inputOf[removeInput](env.Task)
+	if err != nil {
+		in2, err2 := inputOf[leaveInput](env.Task)
+		if err2 != nil {
+			return err
+		}
+		in.ServerID = in2.ServerID
+	}
+	if _, err := m.getServer(ctx, in.ServerID); errors.Is(err, errNoServer) {
+		return nil // an earlier run finished
+	}
+	if err := m.Standbys.PurgeServer(ctx, in.ServerID); err != nil {
+		return fmt.Errorf("removing the standbys of the server: %w", err)
+	}
+	return nil
 }
