@@ -50,4 +50,10 @@ extern char *kingres_shard_forward_token(const char *user, int node_id);
  */
 extern bool kingres_shard_session_forwarded(void);
 
+/* Has the claim been proved (and not only made)?  Never raises an error. */
+extern bool kingres_shard_session_verified(void);
+
+/* The tag of a two-phase transaction identifier (16 hex digits, tag has room for 17 bytes); see forward_auth.c. */
+extern bool kingres_shard_gid_tag(const char *body, char *tag);
+
 #endif							/* KINGRES_SHARD_FORWARD_AUTH_H */

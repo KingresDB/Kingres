@@ -71,6 +71,7 @@
 #include "utils/acl.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "replication/syncrep.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
@@ -85,6 +86,7 @@
 #include "ha.h"
 #include "kingres_shard.h"
 #include "node_conn.h"
+#include "term.h"
 
 #define KS_CONN_KEY_SIZE (offsetof(KsConn, user) + NAMEDATALEN)
 
@@ -103,6 +105,9 @@
 
 
 static HTAB *conn_hash = NULL;
+
+/* The kind of standby wait the decision of this transaction required (log_decision). */
+static int	decision_wait_mode = SYNC_REP_WAIT_FLUSH;
 
 /* Connection keywords the extension controls; node_conninfo may not set them. */
 static const char *const forbidden_conninfo_keys[] = {
@@ -354,7 +359,8 @@ target_node_id(const char *host, int port)
  * NULL and sets *errmsg (palloc'd) on failure.
  */
 static PGconn *
-connect_to_node(const char *host, int port, const char *user, char **errmsg_out)
+connect_to_node_as(const char *host, int port, const char *user, int claim_id,
+				   char **errmsg_out)
 {
 	const char *keywords[64];
 	const char *values[64];
@@ -411,7 +417,7 @@ connect_to_node(const char *host, int port, const char *user, char **errmsg_out)
 	 * of the cluster (forward_auth.c): it is made for this role and for the id
 	 * of the node that receives it.
 	 */
-	token = kingres_shard_forward_token(user, target_node_id(host, port));
+	token = kingres_shard_forward_token(user, claim_id >= 0 ? claim_id : target_node_id(host, port));
 	options = psprintf("-c kingres_shard.forwarded=on%s%s -c DateStyle=ISO,MDY "
 					   "-c IntervalStyle=postgres -c extra_float_digits=3 "
 					   "-c standard_conforming_strings=on -c bytea_output=hex "
@@ -467,6 +473,91 @@ connect_to_node(const char *host, int port, const char *user, char **errmsg_out)
 	}
 	PQsetNoticeReceiver(conn, ignore_notice, NULL);
 	return conn;
+}
+
+/*
+ * The proof of a session is checked by the other node at its first statement,
+ * not when it connects.  Send one that costs nothing; false and the text of
+ * the error when the node refuses the session.
+ */
+static bool
+probe_session(PGconn *conn, char **errmsg_out)
+{
+	PGresult   *res = kingres_shard_bounded_exec(conn, "SELECT 1", false);
+	bool		ok = (res != NULL && PQresultStatus(res) == PGRES_TUPLES_OK);
+
+	if (!ok)
+		*errmsg_out = kingres_shard_scrub_conn_error(PQerrorMessage(conn));
+	PQclear(res);
+	return ok;
+}
+
+/*
+ * connect_to_node
+ *
+ * connect_to_node_as() for the id that this node's catalog gives the target.
+ * A node that holds a catalog change prepared (a promotion that was left
+ * half-done, S7-05) does not yet know itself by the id the catalog now gives
+ * it: a standby is a copy of its primary and carries the primary's id until
+ * promote_node() commits.  So when the node does not accept the proof, the same
+ * session is tried with the id of every other node of that node's group: one
+ * of them is what the node believes it is.  The first statement of a new
+ * session is a probe for that; if no id is accepted the session of the first
+ * attempt is returned, so that the statement that follows fails with the
+ * message it always had (version differences are explained there).
+ */
+static PGconn *
+connect_to_node(const char *host, int port, const char *user, char **errmsg_out)
+{
+	PGconn	   *conn = connect_to_node_as(host, port, user, -1, errmsg_out);
+	char	   *perr = NULL;
+	int			tried;
+	int			group = -1;
+	List	   *alts = NIL;
+	ListCell   *lc;
+	const KsCatalog *cat;
+
+	if (conn == NULL)
+		return NULL;
+	if (probe_session(conn, &perr))
+		return conn;
+	PQfinish(conn);
+	conn = NULL;
+	if (perr == NULL || strstr(perr, "claims to have been opened by another node") == NULL)
+		return connect_to_node_as(host, port, user, -1, errmsg_out);
+
+	tried = target_node_id(host, port);
+	cat = kingres_shard_catalog();
+	foreach(lc, cat->nodes)
+	{
+		const KsNode *n = (const KsNode *) lfirst(lc);
+
+		if (n->port == port && strcmp(n->host, host) == 0)
+			group = n->group_id;
+	}
+	if (group >= 0)
+	{
+		foreach(lc, cat->nodes)
+		{
+			const KsNode *n = (const KsNode *) lfirst(lc);
+
+			if (n->group_id == group && n->node_id != tried)
+				alts = lappend_int(alts, n->node_id);
+		}
+	}
+	foreach(lc, alts)
+	{
+		char	   *err2 = NULL;
+
+		conn = connect_to_node_as(host, port, user, lfirst_int(lc), &err2);
+		if (conn == NULL)
+			continue;
+		if (probe_session(conn, &err2))
+			return conn;
+		PQfinish(conn);
+		conn = NULL;
+	}
+	return connect_to_node_as(host, port, user, -1, errmsg_out);
 }
 
 /*
@@ -545,6 +636,7 @@ kingres_shard_get_conn(const char *host, int port, bool missing_ok,
 		kc->tz_applied[0] = '\0';
 		kc->wrote = false;
 		kc->prepared = false;
+		kc->sync_forced = false;
 		kc->gid[0] = '\0';
 		kc->pending_owner = NULL;
 		kc->pending_finish = NULL;
@@ -652,6 +744,7 @@ discard_connection(KsConn *kc)
 	kc->have_error = false;
 	kc->wrote = false;
 	kc->prepared = false;
+	kc->sync_forced = false;
 	kc->pending_owner = NULL;
 	kc->pending_finish = NULL;
 }
@@ -875,13 +968,16 @@ kingres_shard_begin_xact(KsConn *kc)
 		 * connection's own (identical) settings again.
 		 */
 		initStringInfo(&sql);
-		appendStringInfo(&sql, "BEGIN ISOLATION LEVEL %s%s; %s", level,
+		appendStringInfo(&sql, "BEGIN ISOLATION LEVEL %s%s; %s%s", level,
 						 XactReadOnly ? " READ ONLY" : "",
+						 kc->sync_forced ? "RESET synchronous_commit; " : "",
 						 KS_FIXED_SETTINGS_SQL);
 		kc->tz_applied[0] = '\0';
 		append_timezone_setting(&sql);
 		append_dtx_label(&sql);
+		kingres_shard_append_term_claim(&sql);
 		exec_internal(kc, sql.data);
+		kc->sync_forced = false;
 		pfree(sql.data);
 		remember_timezone(kc);
 		kc->xact_depth = 1;
@@ -902,13 +998,15 @@ kingres_shard_begin_xact(KsConn *kc)
 }
 
 /*
- * The label of the distributed transaction a remote session works for, as the
- * application name of the session for the length of the remote transaction:
- * "ks-dtx:<origin node>:<origin pid>:<start of the origin transaction, in
- * microseconds since the Unix epoch>".  The deadlock detector reads it from
- * pg_stat_activity of the node, so that a wait of this session counts as a
- * wait of the origin transaction (kingres.internal_wait_edges).  SET LOCAL
- * ends with the transaction.
+ * The identity of the distributed transaction a remote session works for, as
+ * the setting kingres_shard.forward_dtx for the length of the remote
+ * transaction: "<origin node>:<origin pid>:<start of the origin transaction,
+ * in microseconds since the Unix epoch>".  The node that receives it keeps it
+ * in shared memory only when the session proved to come from a node of the
+ * cluster (ha.c), and the deadlock detector reads it from there
+ * (kingres.internal_dtx_identity), so that a wait of this session counts as a
+ * wait of the origin transaction.  It is not the application name, which any
+ * client can set (S7-02).  SET LOCAL ends with the transaction.
  */
 static void
 append_dtx_label(StringInfo buf)
@@ -920,7 +1018,7 @@ append_dtx_label(StringInfo buf)
 		return;
 	us = (int64) GetCurrentTransactionStartTimestamp() +
 		((int64) (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE)) * SECS_PER_DAY * USECS_PER_SEC;
-	appendStringInfo(buf, "; SET LOCAL application_name = 'ks-dtx:%d:%d:" INT64_FORMAT "'",
+	appendStringInfo(buf, "; SET LOCAL kingres_shard.forward_dtx = '%d:%d:" INT64_FORMAT "'",
 					 node, MyProcPid, us);
 }
 
@@ -1385,6 +1483,20 @@ kingres_shard_report_error(KsConn *kc, PGresult *res, const char *sql)
 		primary = pchomp(PQerrorMessage(kc->conn));
 
 	/*
+	 * The other node holds a newer catalog term than this one (S7-06): this node
+	 * has been superseded (the map group primary) or missed a promotion (any
+	 * other).  Learn it before the error leaves, so that the next statement
+	 * starts from the right catalog.
+	 */
+	if (sqlstate == ERRCODE_KINGRES_STALE_TERM && IsTransactionState())
+	{
+		int64		newer;
+
+		if (kingres_shard_parse_term_detail(detail, &newer))
+			kingres_shard_learn_term(newer, kingres_shard_conn_node_id(kc->host, kc->port), true);
+	}
+
+	/*
 	 * A helper function of the extension that the other node does not have: its
 	 * SQL objects are older than this node's library (a rolling upgrade that is
 	 * not finished; review finding S4-05).  Say that, instead of passing on
@@ -1456,6 +1568,96 @@ kingres_shard_begin_write_xact(KsConn *kc)
 {
 	kingres_shard_begin_xact(kc);
 	kc->wrote = true;
+}
+
+/*
+ * kingres.internal_dtx_applied(gid text) returns void
+ *
+ * Runs in the remote transaction of a participant, just before its PREPARE
+ * TRANSACTION (S7-07): it writes the identifier of the distributed transaction to
+ * kingres.dtx_applied.  The row commits with the participant's part, replicates
+ * with it, and is what the origin looks for when the participant has failed over.
+ * Only a node session (or a superuser) can write one.  The row is made with the heap API, so the role of the
+ * transaction needs no privilege on the table.
+ */
+PG_FUNCTION_INFO_V1(kingres_internal_dtx_applied);
+
+Datum
+kingres_internal_dtx_applied(PG_FUNCTION_ARGS)
+{
+	char	   *gid = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	Oid			relid;
+	Relation	rel;
+	Datum		values[2];
+	bool		nulls[2] = {false, false};
+	HeapTuple	tup;
+
+	if (!superuser() && !kingres_shard_session_forwarded())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied for function internal_dtx_applied")));
+	/*
+	 * The tag is not checked here: the node that is being removed has just lost
+	 * the cluster secret in the same transaction, and only a node session or a
+	 * superuser gets this far.
+	 */
+	if (strncmp(gid, "kingres_h", 9) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("not an identifier of a distributed transaction")));
+	relid = kingres_shard_catalog_relid("dtx_applied");
+	if (!OidIsValid(relid))
+		PG_RETURN_VOID();
+	values[0] = CStringGetTextDatum(gid);
+	values[1] = TimestampTzGetDatum(GetCurrentTimestamp());
+	PushActiveSnapshot(GetTransactionSnapshot());
+	rel = table_open(relid, RowExclusiveLock);
+	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+	CatalogTupleInsert(rel, tup);
+	heap_freetuple(tup);
+	table_close(rel, NoLock);
+	PopActiveSnapshot();
+	PG_RETURN_VOID();
+}
+
+/*
+ * kingres_shard_conn_force_sync
+ *
+ * Raise synchronous_commit of an idle remote session to at least "on" (the
+ * participant's standby must acknowledge a COMMIT PREPARED or ROLLBACK PREPARED
+ * that recovery sends, whatever the setting of the participant's role is;
+ * S7-07).  "remote_apply" is kept.  Nothing is thrown.
+ */
+bool
+kingres_shard_conn_force_sync(KsConn *kc)
+{
+	PGresult   *res;
+	bool		ok;
+
+	if (kc->sync_forced)
+		return true;
+	res = kingres_shard_exec_params(kc,
+									"SELECT set_config('synchronous_commit', CASE WHEN current_setting('synchronous_commit') = 'remote_apply' THEN 'remote_apply' ELSE 'on' END, false)",
+									0, NULL, NULL, false);
+	ok = (res != NULL && PQresultStatus(res) == PGRES_TUPLES_OK);
+	PQclear(res);
+	if (ok)
+		kc->sync_forced = true;
+	return ok;
+}
+
+/* Undo kingres_shard_conn_force_sync() on an idle session; a failure only leaves the stricter setting. */
+void
+kingres_shard_conn_unforce_sync(KsConn *kc)
+{
+	PGresult   *res;
+
+	if (!kc->sync_forced || kc->conn == NULL || kc->xact_depth > 0)
+		return;
+	res = kingres_shard_exec_params(kc, "RESET synchronous_commit", 0, NULL, NULL, false);
+	if (res != NULL && PQresultStatus(res) == PGRES_COMMAND_OK)
+		kc->sync_forced = false;
+	PQclear(res);
 }
 
 /* Forget everything about the transaction that just ended on kc. */
@@ -1560,10 +1762,22 @@ abort_connection(KsConn *kc)
 static void
 prepare_one(KsConn *kc)
 {
-	char		sql[KS_GID_LEN + 32];
+	char		sql[2 * KS_GID_LEN + 320];
 	PGresult   *res;
 
-	snprintf(sql, sizeof(sql), "PREPARE TRANSACTION '%s'", kc->gid);
+	/*
+	 * The participant acknowledges its PREPARE (and, on this session, the
+	 * COMMIT PREPARED or ROLLBACK PREPARED that follows) to its synchronous
+	 * standby whatever its own session, role or database setting says: the
+	 * setting is raised to at least "on" right before the PREPARE, at session
+	 * level so that it still holds for the second phase on this connection
+	 * (S7-07).  "remote_apply" is kept.  The next remote transaction on the
+	 * connection resets it (kingres_shard_begin_xact).
+	 */
+	snprintf(sql, sizeof(sql),
+			 "SELECT " KINGRES_SHARD_SCHEMA ".internal_dtx_applied('%s'); "
+			 "SELECT set_config('synchronous_commit', CASE WHEN current_setting('synchronous_commit') = 'remote_apply' THEN 'remote_apply' ELSE 'on' END, false); "
+			 "PREPARE TRANSACTION '%s'", kc->gid, kc->gid);
 	kingres_shard_conn_quiesce(kc);
 	kc->in_query = true;
 	if (!PQsendQuery(kc->conn, sql))
@@ -1597,6 +1811,7 @@ prepare_one(KsConn *kc)
 				 errhint("Two-phase commit needs max_prepared_transactions greater than zero on every node of the cluster, and enough of them for the transactions in flight.") : 0));
 	}
 	PQclear(res);
+	kc->sync_forced = true;
 	kc->prepared = true;
 	kc->xact_depth = 0;
 }
@@ -1632,14 +1847,18 @@ log_decision(void)
 	 * standbys: the core asks for that only when synchronous_commit is above
 	 * "local" (SyncRepRequested()).  The decision must survive a failover of
 	 * this node as well as a crash of it, so for a transaction that prepared
-	 * remote participants "off" and "local" are raised to "on" until it ends
-	 * (S3-15).  Without synchronous standbys that costs nothing more than the
-	 * flush.
+	 * remote participants "off", "local" and "remote_write" are raised to "on"
+	 * until it ends (S3-15; a write that the standby has not flushed is not a
+	 * decision that survives its failover either).  Without synchronous
+	 * standbys that costs nothing more than the flush.  The wait can still end
+	 * without the standby's answer, when the backend is cancelled or
+	 * terminated: the second phase checks for that (postcommit, S7-01).
 	 */
 	ForceSyncCommit();
-	if (synchronous_commit <= SYNCHRONOUS_COMMIT_LOCAL_FLUSH)
+	if (synchronous_commit < SYNCHRONOUS_COMMIT_ON)
 		(void) set_config_option("synchronous_commit", "on", PGC_USERSET,
 								 PGC_S_SESSION, GUC_ACTION_LOCAL, true, 0, false);
+	decision_wait_mode = kingres_shard_sync_wait_mode();
 
 	/* The unique-index check of the insert needs a snapshot. */
 	PushActiveSnapshot(GetTransactionSnapshot());
@@ -1755,7 +1974,7 @@ precommit(bool parallel)
 		if (kc->xact_depth <= 0 || !kc->wrote)
 			continue;
 		target = kingres_shard_conn_node_id(kc->host, kc->port);
-		gid = psprintf("kingres_g%d_%u_%d_" UINT64_FORMAT "_%d", origin_group, tli,
+		gid = psprintf("kingres_h%d_%u_%d_" UINT64_FORMAT "_%d", origin_group, tli,
 					   MyProcPid, U64FromFullTransactionId(fxid), target);
 		/* Two connections (two roles) to one node need two names. */
 		{
@@ -1771,7 +1990,7 @@ precommit(bool parallel)
 					if (strcmp((char *) lfirst(lc), gid) == 0)
 					{
 						dup = true;
-						gid = psprintf("kingres_g%d_%u_%d_" UINT64_FORMAT "_%d_%d", origin_group,
+						gid = psprintf("kingres_h%d_%u_%d_" UINT64_FORMAT "_%d_%d", origin_group,
 									   tli, MyProcPid, U64FromFullTransactionId(fxid),
 									   target, ++n);
 						break;
@@ -1780,6 +1999,20 @@ precommit(bool parallel)
 			}
 		}
 		used_gids = lappend(used_gids, gid);
+		/*
+		 * The tag makes the name the extension's own: any role can prepare a transaction
+		 * under any name, and recovery touches only the names whose tag verifies
+		 * (recovery.c, S7-09).
+		 */
+		{
+			char		tag[17];
+
+			if (!kingres_shard_gid_tag(gid, tag))
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("could not compute the tag of a transaction identifier")));
+			gid = psprintf("%s_%s", gid, tag);
+		}
 		strlcpy(kc->gid, gid, sizeof(kc->gid));
 		prepare_one(kc);
 		nprepared++;
@@ -1805,6 +2038,48 @@ postcommit(void)
 	HASH_SEQ_STATUS scan;
 	KsConn	   *kc;
 	bool		first = true;
+	bool		deferred = false;
+
+	/*
+	 * The second phase is sent only when the decision is known to be where the
+	 * configuration of the group says it must be (S7-01).  The commit above
+	 * waited for the synchronous standbys, but a cancel or a termination of
+	 * this backend ends that wait with a warning and the commit completes
+	 * all the same.  Telling the participants to commit then would let them
+	 * keep a transaction that a standby promoted now knows nothing about.  So
+	 * ask what the standbys have confirmed; if they have not confirmed this
+	 * commit record, leave every participant prepared.  Recovery commits them
+	 * once the decision is confirmed (or rolls them back, if the node that
+	 * holds the decision is lost: what a promoted standby has is what counts).
+	 */
+	hash_seq_init(&scan, conn_hash);
+	while ((kc = (KsConn *) hash_seq_search(&scan)) != NULL)
+	{
+		if (kc->prepared)
+		{
+			hash_seq_term(&scan);
+			if (!kingres_shard_sync_confirmed(XactLastCommitEnd, decision_wait_mode))
+				deferred = true;
+			break;
+		}
+	}
+	if (deferred)
+	{
+		int			nleft = 0;
+
+		hash_seq_init(&scan, conn_hash);
+		while ((kc = (KsConn *) hash_seq_search(&scan)) != NULL)
+		{
+			if (kc->prepared)
+				nleft++;
+			reset_xact_state(kc);
+		}
+		ereport(WARNING,
+				(errmsg("the commit of this distributed transaction was not confirmed by the synchronous standby; the second phase was not sent"),
+				 errdetail("The transaction is committed on this node, but the standby has not acknowledged the decision (the wait was cancelled or the backend is terminating), so the %d prepared transaction(s) on the other nodes stay prepared.", nleft),
+				 errhint("Recovery commits them once the decision is on the standby, or rolls them back if a standby that does not have it is promoted; the outcome is decided by recovery, not by this session.")));
+		return;
+	}
 
 	hash_seq_init(&scan, conn_hash);
 	while ((kc = (KsConn *) hash_seq_search(&scan)) != NULL)

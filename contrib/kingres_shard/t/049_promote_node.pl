@@ -83,7 +83,7 @@ sub catalog_roles
 	$n1->safe_psql('postgres', "BEGIN; INSERT INTO public.kv VALUES (" . ($k[0][0] + 100000) . ", 'tx'); UPDATE public.kv SET val = 'tx' WHERE id = $k[1][1]; COMMIT");
 	is($s2->safe_psql('postgres', "SELECT val FROM public.kv WHERE id = $k[1][1]"), 'tx', 'a two-node transaction commits with the new primary');
 	is(prepared($n1) . prepared($s2), '00', 'nothing is left prepared');
-	ok($n1->safe_psql('postgres', "SELECT count(*) FROM kingres.dtx_log WHERE gid LIKE 'kingres\\_g0\\_1\\_%'") >= 1,
+	ok($n1->safe_psql('postgres', "SELECT count(*) FROM kingres.dtx_log WHERE gid LIKE 'kingres\\_h0\\_1\\_%'") >= 1,
 		'the transaction identifier names the origin group and the timeline');
 	is($n1->safe_psql('postgres', 'SELECT check_name || \':\' || node_id FROM kingres.check_cluster()'), 'standby_unreachable:2',
 		'the cluster check reports only the old primary, which is down and now a standby');

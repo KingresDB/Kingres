@@ -58,8 +58,10 @@
 #include "catalog.h"
 #include "forward_auth.h"
 #include "kingres_shard.h"
+#include "term.h"
 
 PG_FUNCTION_INFO_V1(kingres_internal_forward_token);
+PG_FUNCTION_INFO_V1(kingres_internal_gid_tag);
 
 #define KS_SECRET_MAX		128
 #define KS_TOKEN_CONTEXT	"kingres-forward-v2"
@@ -166,8 +168,8 @@ constant_time_equal(const char *a, const char *b, size_t len)
 	return diff == 0;
 }
 
-bool
-kingres_shard_session_forwarded(void)
+static bool
+session_forwarded_verified(void)
 {
 	unsigned char secret[KS_SECRET_MAX];
 	int			secret_len = 0;
@@ -222,6 +224,28 @@ kingres_shard_session_forwarded(void)
 }
 
 /*
+ * Is this session a forwarded one that proved to come from a node of the
+ * cluster?  A verified session also has its catalog term checked, once per
+ * transaction (term.c, S7-06): a sender whose catalog has been superseded is
+ * refused here, before anything it asks for runs.
+ */
+/* Did this session prove that it was opened by a node of the cluster? */
+bool
+kingres_shard_session_verified(void)
+{
+	return forwarded_verified;
+}
+
+bool
+kingres_shard_session_forwarded(void)
+{
+	if (!session_forwarded_verified())
+		return false;
+	kingres_shard_check_claimed_term();
+	return true;
+}
+
+/*
  * kingres.internal_forward_token(role text, node_id int) returns text
  *
  * For the tests of the rule: the token a node with this cluster's secret sends
@@ -242,4 +266,69 @@ kingres_internal_forward_token(PG_FUNCTION_ARGS)
 	if (token == NULL)
 		PG_RETURN_NULL();
 	PG_RETURN_TEXT_P(cstring_to_text(token));
+}
+
+/*
+ * kingres_shard_gid_tag
+ *
+ * The tag of the identifier of a two-phase transaction (S7-09): the first 16
+ * hex digits of HMAC-SHA-256(cluster secret, "kingres-gid-v1" NUL body).  A
+ * node that holds no secret (a cluster that is not secured) uses sixteen
+ * zeros, which verifies on every node of such a cluster and means nothing.  tag
+ * has room for 17 bytes.  False only when the HMAC cannot be computed.
+ */
+bool
+kingres_shard_gid_tag(const char *body, char *tag)
+{
+	unsigned char secret[KS_SECRET_MAX];
+	int			secret_len = 0;
+	pg_hmac_ctx *ctx;
+	unsigned char mac[PG_SHA256_DIGEST_LENGTH];
+	char		hex[2 * PG_SHA256_DIGEST_LENGTH + 1];
+	bool		ok;
+
+	if (!kingres_shard_cluster_secret(secret, sizeof(secret), &secret_len))
+	{
+		memset(tag, '0', 16);
+		tag[16] = '\0';
+		return true;
+	}
+	ctx = pg_hmac_create(PG_SHA256);
+	if (ctx == NULL)
+		return false;
+	ok = pg_hmac_init(ctx, secret, secret_len) == 0 &&
+		pg_hmac_update(ctx, (const uint8 *) "kingres-gid-v1", sizeof("kingres-gid-v1")) == 0 &&
+		pg_hmac_update(ctx, (const uint8 *) body, strlen(body)) == 0 &&
+		pg_hmac_final(ctx, mac, sizeof(mac)) == 0;
+	pg_hmac_free(ctx);
+	explicit_bzero(secret, sizeof(secret));
+	if (!ok)
+		return false;
+	(void) hex_encode((const char *) mac, sizeof(mac), hex);
+	memcpy(tag, hex, 16);
+	tag[16] = '\0';
+	return true;
+}
+
+/*
+ * kingres.internal_gid_tag(body text) returns text
+ *
+ * For the tests and for an operator who prepares a transaction by hand: the
+ * tag that this cluster gives a name.  Superusers only.
+ */
+Datum
+kingres_internal_gid_tag(PG_FUNCTION_ARGS)
+{
+	char	   *body = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char		tag[17];
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied for function internal_gid_tag")));
+	if (!kingres_shard_gid_tag(body, tag))
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("could not compute the tag")));
+	PG_RETURN_TEXT_P(cstring_to_text(tag));
 }

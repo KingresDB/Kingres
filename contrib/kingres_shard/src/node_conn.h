@@ -56,6 +56,8 @@ typedef struct KsConn
 	bool		wrote;			/* the remote transaction has written */
 	bool		prepared;		/* PREPARE TRANSACTION succeeded; gid is valid */
 	char		gid[KS_GID_LEN];
+	/* the session runs with synchronous_commit raised to at least "on" (S7-07) */
+	bool		sync_forced;
 	/* an asynchronous fetch of one scan is in flight on conn */
 	void	   *pending_owner;
 	KsPendingFinish pending_finish;
@@ -86,6 +88,14 @@ extern void kingres_shard_conn_drop_stale(List *nodes);
  * as one when it has a transaction id) prepares every remote writer and logs
  * the decision in kingres.dtx_log.
  */
+/*
+ * Raise (and later restore) synchronous_commit of the remote session to at
+ * least "on", for a COMMIT PREPARED or ROLLBACK PREPARED sent from outside the
+ * transaction that prepared (recovery, S7-07).  force returns false when the
+ * session is not usable.
+ */
+extern bool kingres_shard_conn_force_sync(KsConn *kc);
+extern void kingres_shard_conn_unforce_sync(KsConn *kc);
 extern void kingres_shard_note_remote_write(KsConn *kc);
 extern void kingres_shard_begin_write_xact(KsConn *kc);
 

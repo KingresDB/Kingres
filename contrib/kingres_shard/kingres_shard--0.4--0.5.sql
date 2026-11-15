@@ -66,13 +66,13 @@ COMMENT ON TABLE kingres.dtx_incident IS
 
 -- promote_node(node_id): see src/failover.c.
 CREATE FUNCTION kingres.promote_node(node_id int)
-    RETURNS void
+    RETURNS jsonb
     AS 'MODULE_PATHNAME', 'kingres_promote_node'
     LANGUAGE C STRICT
     SET search_path = pg_catalog, kingres, pg_temp;
 
 COMMENT ON FUNCTION kingres.promote_node(int) IS
-    'Make a promoted standby the primary of its shard group (map group primary; for group 0 the promoted node itself)';
+    'Make a promoted standby the primary of its shard group (map group primary; for group 0 the promoted node itself); resumable; answers {status, term, unreached}';
 
 -- The barrier of create_restore_point() on this node, and the mark of a
 -- distributed-deadlock victim (src/ha.c).
@@ -82,7 +82,7 @@ CREATE FUNCTION kingres.internal_restore_barrier(op text, ttl_ms int DEFAULT NUL
     LANGUAGE C
     SET search_path = pg_catalog, kingres, pg_temp;
 
-CREATE FUNCTION kingres.internal_mark_victim(pid int)
+CREATE FUNCTION kingres.internal_mark_victim(pid int, waitstart bigint)
     RETURNS bool
     AS 'MODULE_PATHNAME', 'kingres_internal_mark_victim'
     LANGUAGE C STRICT
@@ -275,7 +275,7 @@ BEGIN
     IF EXISTS (SELECT 1 FROM pg_catalog.pg_locks l
                 WHERE l.pid = p_pid AND NOT l.granted
                   AND (extract(epoch FROM l.waitstart) * 1000000)::pg_catalog.int8 = p_waitstart) THEN
-        IF kingres.internal_mark_victim(p_pid) THEN
+        IF kingres.internal_mark_victim(p_pid, p_waitstart) THEN
             RETURN pg_catalog.pg_cancel_backend(p_pid);
         END IF;
     END IF;
@@ -559,7 +559,7 @@ REVOKE ALL ON FUNCTION
     kingres.promote_node(int),
     kingres.create_restore_point(text),
     kingres.internal_restore_barrier(text, int, bigint),
-    kingres.internal_mark_victim(int),
+    kingres.internal_mark_victim(int, bigint),
     kingres.internal_dtx_label_of(int, int),
     kingres.internal_wait_edges(int),
     kingres.internal_cancel_waiter(int, bigint),
@@ -668,7 +668,8 @@ SELECT pg_catalog.jsonb_build_object(
                                'gid_timeline', i.gid_timeline, 'current_timeline', i.current_timeline))
                             FROM kingres.dtx_incident i), '[]'::pg_catalog.jsonb),
     'prepared', COALESCE((SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
-                               'gid', x.gid, 'age', extract(epoch FROM pg_catalog.clock_timestamp() OPERATOR(pg_catalog.-) x.prepared)))
+                               'gid', x.gid, 'age', extract(epoch FROM pg_catalog.clock_timestamp() OPERATOR(pg_catalog.-) x.prepared),
+                               'class', kingres.internal_gid_class(x.gid)))
                             FROM pg_catalog.pg_prepared_xacts x), '[]'::pg_catalog.jsonb));
 $$;
 
@@ -819,14 +820,21 @@ BEGIN
         -- Prepared transactions that recovery rolled back after a failover of the group
         -- without finding a commit decision (see README, "Failover and prepared
         -- transactions"): the operator decides whether any of them was committed elsewhere.
-        FOR x IN SELECT i.gid, i.detected_at, i.gid_timeline, i.current_timeline
+        FOR x IN SELECT i.gid, i.detected_at, i.gid_timeline, i.current_timeline, i.kind
                    FROM pg_catalog.jsonb_to_recordset(st -> 'incidents')
-                        AS i(gid pg_catalog.text, detected_at pg_catalog.timestamptz, gid_timeline pg_catalog.int4, current_timeline pg_catalog.int4)
+                        AS i(gid pg_catalog.text, detected_at pg_catalog.timestamptz, gid_timeline pg_catalog.int4, current_timeline pg_catalog.int4, kind pg_catalog.text)
                   ORDER BY i.detected_at
         LOOP
+            IF x.kind OPERATOR(pg_catalog.=) 'participant_lost' THEN
+                -- The origin committed it, and the primary that the participant group has now has no trace of its part.
+                check_name := 'participant_lost_committed_transaction'; node_id := n.node_id; object := x.gid;
+                detail := pg_catalog.format('found out at %s: the transaction was committed by its origin, and this node (the primary of its group after a failover) has no trace of its part; the changes it made on this group are lost',
+                                            x.detected_at);
+            ELSE
             check_name := 'prepared_rolled_back_after_failover'; node_id := n.node_id; object := x.gid;
             detail := pg_catalog.format('rolled back at %s: it belonged to timeline %s and had no commit decision on timeline %s; if the old primary had committed it, other nodes may have too',
                                         x.detected_at, x.gid_timeline, x.current_timeline);
+            END IF;
             RETURN NEXT;
         END LOOP;
 
@@ -984,6 +992,15 @@ BEGIN
             detail := pg_catalog.format('prepared %s seconds ago; kingres.recover_prepared_transactions() on its origin resolves it', pg_catalog.round(x.age::pg_catalog.numeric, 1));
             RETURN NEXT;
         END LOOP;
+        -- A name of the form of the extension's own whose tag does not verify (S7-09): a role prepared it,
+        -- no node of this cluster did, and recovery leaves it alone.
+        FOR x IN SELECT p.gid FROM pg_catalog.jsonb_to_recordset(st -> 'prepared') AS p(gid text, class text)
+                  WHERE p.class OPERATOR(pg_catalog.=) 'forged' ORDER BY p.gid
+        LOOP
+            check_name := 'foreign_prepared_transaction'; node_id := n.node_id; object := x.gid;
+            detail := 'a prepared transaction with the name of one of ours that does not carry a valid tag; it was not made by a node of this cluster and recovery leaves it alone';
+            RETURN NEXT;
+        END LOOP;
     END LOOP;
 
     -- The copies of every reference table: the number of rows and an
@@ -1045,3 +1062,531 @@ BEGIN
 END;
 $$;
 
+
+-- ---------------------------------------------------------------------------
+-- Review S7: the catalog term (src/term.c)
+-- ---------------------------------------------------------------------------
+
+-- The term is raised by every promote_node(); every catalog push carries it
+-- and a node refuses a push of an older term (KS002).  superseded_by_term is
+-- node-local: the newer term that this node, acting as the map group primary,
+-- was refused with; while it is above the term the node changes no catalog.
+ALTER TABLE kingres.map_version
+    ADD COLUMN term bigint NOT NULL DEFAULT 0,
+    ADD COLUMN superseded_by_term bigint NOT NULL DEFAULT 0;
+
+COMMENT ON COLUMN kingres.map_version.term IS
+    'Catalog term: raised by every promote_node(), carried by every catalog push and remote transaction';
+COMMENT ON COLUMN kingres.map_version.superseded_by_term IS
+    'Node-local, never synchronized: the newer term this node was refused with while it acted as the map group primary; 0 when not superseded';
+
+CREATE OR REPLACE FUNCTION kingres.internal_catalog_snapshot()
+    RETURNS pg_catalog.jsonb
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+SELECT jsonb_build_object(
+    'version', (SELECT m.version FROM kingres.map_version m),
+    'term', (SELECT m.term FROM kingres.map_version m),
+    'node', COALESCE((SELECT jsonb_agg(to_jsonb(n) ORDER BY n.node_id)
+                        FROM kingres.node n), '[]'::pg_catalog.jsonb),
+    'colocation', COALESCE((SELECT jsonb_agg(to_jsonb(c) ORDER BY c.colocation_id)
+                              FROM kingres.colocation c), '[]'::pg_catalog.jsonb),
+    'dist_table', COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                                       'schema', ns.nspname,
+                                       'name', cl.relname,
+                                       'method', d.method,
+                                       'dist_column', d.dist_column,
+                                       'colocation_id', d.colocation_id)
+                                     ORDER BY d.colocation_id, ns.nspname, cl.relname)
+                              FROM kingres.dist_table d
+                              JOIN pg_catalog.pg_class cl ON cl.oid OPERATOR(pg_catalog.=) d.relid::pg_catalog.oid
+                              JOIN pg_catalog.pg_namespace ns ON ns.oid OPERATOR(pg_catalog.=) cl.relnamespace),
+                           '[]'::pg_catalog.jsonb),
+    'bucket_map', COALESCE((SELECT jsonb_agg(to_jsonb(b) ORDER BY b.colocation_id, b.bucket)
+                              FROM kingres.bucket_map b), '[]'::pg_catalog.jsonb));
+$$;
+
+CREATE OR REPLACE FUNCTION kingres.internal_apply_catalog(snapshot pg_catalog.jsonb)
+    RETURNS pg_catalog.void
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    r        pg_catalog.record;
+    rid      pg_catalog.regclass;
+    cur_term pg_catalog.int8;
+    new_term pg_catalog.int8;
+BEGIN
+    -- A node that holds a newer catalog refuses an older one, whoever sends it
+    -- (a map group primary that was replaced and restarted; S7-06).  The sender
+    -- reads the term out of the detail.
+    SELECT m.term INTO cur_term FROM kingres.map_version m;
+    new_term := COALESCE((snapshot OPERATOR(pg_catalog.->>) 'term')::pg_catalog.int8, 0);
+    IF new_term OPERATOR(pg_catalog.<) cur_term THEN
+        RAISE EXCEPTION 'the catalog term % is older than the term % of this node', new_term, cur_term
+            USING ERRCODE = 'KS002',
+                  DETAIL = pg_catalog.format('kingres-term=%s', cur_term),
+                  HINT = 'The sender holds a catalog that has been superseded by a promotion.';
+    END IF;
+
+    DELETE FROM kingres.bucket_map;
+    DELETE FROM kingres.dist_table;
+    DELETE FROM kingres.colocation;
+    DELETE FROM kingres.node;
+
+    INSERT INTO kingres.node
+        SELECT * FROM pg_catalog.jsonb_populate_recordset(NULL::kingres.node,
+                                    snapshot OPERATOR(pg_catalog.->) 'node');
+    INSERT INTO kingres.colocation
+        SELECT * FROM pg_catalog.jsonb_populate_recordset(NULL::kingres.colocation,
+                                    snapshot OPERATOR(pg_catalog.->) 'colocation');
+
+    FOR r IN SELECT * FROM pg_catalog.jsonb_to_recordset(snapshot OPERATOR(pg_catalog.->) 'dist_table')
+                  AS x(schema pg_catalog.text, name pg_catalog.text, method pg_catalog.text,
+                       dist_column pg_catalog.name, colocation_id pg_catalog.int4)
+    LOOP
+        rid := pg_catalog.to_regclass(pg_catalog.format('%I.%I', r.schema, r.name));
+        IF rid IS NULL THEN
+            RAISE EXCEPTION 'distributed table %.% does not exist on this node', r.schema, r.name
+                USING ERRCODE = 'undefined_table';
+        END IF;
+        INSERT INTO kingres.dist_table VALUES (rid, r.method, r.dist_column, r.colocation_id);
+        -- Plans of statements on the table were made with the old catalog.
+        PERFORM kingres.internal_invalidate_relation(rid);
+    END LOOP;
+
+    INSERT INTO kingres.bucket_map
+        SELECT * FROM pg_catalog.jsonb_populate_recordset(NULL::kingres.bucket_map,
+                                    snapshot OPERATOR(pg_catalog.->) 'bucket_map');
+
+    -- A node that was superseded and now follows the newer catalog is no longer
+    -- superseded.
+    UPDATE kingres.map_version
+       SET version = (snapshot OPERATOR(pg_catalog.->>) 'version')::pg_catalog.int8,
+           term = new_term,
+           superseded_by_term = CASE WHEN new_term OPERATOR(pg_catalog.>=) superseded_by_term
+                                     THEN 0 ELSE superseded_by_term END;
+END;
+$$;
+
+-- What a node says about itself for promote_node(): which node it believes it
+-- is, the catalog it holds, whether it is in recovery, and how many catalog
+-- changes are prepared on it and unresolved (a prepared transaction holds a
+-- row lock on kingres.map_version; every catalog change writes it).
+CREATE FUNCTION kingres.internal_promotion_state(OUT local_node int, OUT term bigint,
+                                                 OUT version bigint, OUT in_recovery bool,
+                                                 OUT pending int)
+    RETURNS record
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+SELECT (SELECT l.node_id FROM kingres.local_node l),
+       (SELECT m.term FROM kingres.map_version m),
+       (SELECT m.version FROM kingres.map_version m),
+       pg_catalog.pg_is_in_recovery(),
+       (SELECT pg_catalog.count(DISTINCT k.virtualtransaction)::pg_catalog.int4
+          FROM pg_catalog.pg_locks k
+         WHERE k.locktype OPERATOR(pg_catalog.=) 'relation'
+           AND k.pid IS NULL
+           AND k.database OPERATOR(pg_catalog.=) (SELECT d.oid FROM pg_catalog.pg_database d
+                                                   WHERE d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database())
+           AND k.relation OPERATOR(pg_catalog.=) 'kingres.map_version'::pg_catalog.regclass);
+$$;
+
+REVOKE ALL ON FUNCTION kingres.internal_promotion_state() FROM PUBLIC;
+
+-- The catalog term of this node and whether it has been superseded.
+CREATE VIEW kingres.catalog_status AS
+    SELECT m.term, m.superseded_by_term,
+           (m.superseded_by_term OPERATOR(pg_catalog.>) m.term) AS superseded,
+           m.version AS map_version
+      FROM kingres.map_version m;
+
+COMMENT ON VIEW kingres.catalog_status IS
+    'The catalog term of this node; superseded is true on an old map group primary that learned of a newer term';
+
+-- ---------------------------------------------------------------------------
+-- Review S7: the identity of a distributed transaction (src/ha.c)
+-- ---------------------------------------------------------------------------
+
+-- The identity that a node session proved and registered for its remote
+-- transaction (origin node, origin backend, start of the origin transaction),
+-- as the label "ks-dtx:<node>:<pid>:<start>", or NULL for a backend that is not
+-- such a session.  The identity is kept in shared memory by the extension
+-- itself, set only by a session that proved to come from a node of the cluster
+-- (forward_auth.c): a client cannot choose it, which the label in
+-- application_name allowed (S7-02, S7-03).  Superusers only.
+CREATE FUNCTION kingres.internal_dtx_identity(pid int)
+    RETURNS text
+    AS 'MODULE_PATHNAME', 'kingres_internal_dtx_identity'
+    LANGUAGE C STRICT
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+REVOKE ALL ON FUNCTION kingres.internal_dtx_identity(int) FROM PUBLIC;
+
+-- The label of the distributed transaction a backend works for: the identity of
+-- a node session, and for every other backend its own: this node, its pid, the
+-- start of its transaction (what pg_stat_activity says, which no client can set).
+-- The application_name is not looked at.
+CREATE OR REPLACE FUNCTION kingres.internal_dtx_label_of(p_pid int, p_node int)
+    RETURNS text
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+SELECT COALESCE(kingres.internal_dtx_identity(p_pid),
+                CASE WHEN a.xact_start IS NOT NULL
+                     THEN pg_catalog.format('ks-dtx:%s:%s:%s', p_node, a.pid,
+                                            (extract(epoch FROM a.xact_start) * 1000000)::pg_catalog.int8)
+                END)
+  FROM pg_catalog.pg_stat_activity a
+ WHERE a.pid = p_pid;
+$$;
+
+-- The edges of every active primary.  An edge that is not well formed (a label
+-- that is not "ks-dtx:" and three numbers) is left out and logged, once per
+-- pass and node: one bad entry never stops the pass.
+CREATE OR REPLACE FUNCTION kingres.internal_collect_wait_edges()
+    RETURNS jsonb
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    n   pg_catalog.record;
+    v_all pg_catalog.jsonb := '[]'::pg_catalog.jsonb;
+    v_e   pg_catalog.jsonb;
+    v_good pg_catalog.jsonb;
+    v_bad pg_catalog.int4;
+BEGIN
+    FOR n IN SELECT nd.node_id FROM kingres.node nd
+              WHERE nd.is_active AND nd.role = 'primary' ORDER BY nd.node_id
+    LOOP
+        BEGIN
+            v_e := COALESCE(kingres.internal_exec_scalar(n.node_id,
+                'SELECT kingres.internal_wait_edges()::pg_catalog.text', 10000)::pg_catalog.jsonb,
+                '[]'::pg_catalog.jsonb);
+            SELECT COALESCE(pg_catalog.jsonb_agg(e.x) FILTER (WHERE e.ok), '[]'::pg_catalog.jsonb),
+                   (pg_catalog.count(*) FILTER (WHERE NOT e.ok))::pg_catalog.int4
+              INTO v_good, v_bad
+              FROM (SELECT x, COALESCE(
+                           pg_catalog.jsonb_typeof(x) = 'object'
+                           AND (x ->> 'waiter') ~ '^ks-dtx:[0-9]{1,9}:[0-9]{1,9}:[0-9]{1,18}$'
+                           AND (x ->> 'blocker') ~ '^ks-dtx:[0-9]{1,9}:[0-9]{1,9}:[0-9]{1,18}$'
+                           AND (x ->> 'node') ~ '^[0-9]{1,9}$'
+                           AND (x ->> 'waiter_pid') ~ '^[0-9]{1,9}$'
+                           AND (x ->> 'waitstart') ~ '^[0-9]{1,18}$', false) AS ok
+                      FROM pg_catalog.jsonb_array_elements(v_e) x) e;
+            IF v_bad > 0 THEN
+                RAISE LOG 'kingres_shard deadlock detector: node % sent % wait-for entries that are not well formed; they were ignored',
+                    n.node_id, v_bad;
+            END IF;
+            v_all := v_all || v_good;
+        EXCEPTION WHEN OTHERS THEN
+            RAISE LOG 'kingres_shard deadlock detector: node % could not be asked: %', n.node_id, SQLERRM;
+        END;
+    END LOOP;
+    RETURN v_all;
+END;
+$$;
+
+-- The decision of the detector on two readings; an edge whose label is not well
+-- formed is ignored here as well (the readings may come from anywhere, and a
+-- cast of a bad label must never stop the pass; S7-03).
+CREATE OR REPLACE FUNCTION kingres.internal_deadlock_victims(p_first jsonb, p_second jsonb)
+    RETURNS TABLE (victim text, victim_node int, victim_pid int, victim_waitstart bigint, cycle text[])
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+WITH RECURSIVE
+first_ok AS (
+    SELECT x FROM pg_catalog.jsonb_array_elements(p_first) x
+     WHERE pg_catalog.jsonb_typeof(x) = 'object'
+       AND (x ->> 'waiter') ~ '^ks-dtx:[0-9]{1,9}:[0-9]{1,9}:[0-9]{1,18}$'
+       AND (x ->> 'blocker') ~ '^ks-dtx:[0-9]{1,9}:[0-9]{1,9}:[0-9]{1,18}$'
+       AND (x ->> 'node') ~ '^[0-9]{1,9}$' AND (x ->> 'waiter_pid') ~ '^[0-9]{1,9}$'
+       AND (x ->> 'waitstart') ~ '^[0-9]{1,18}$'
+       AND COALESCE(x ->> 'blocker_pid', '0') ~ '^[0-9]{1,9}$'),
+second_ok AS (
+    SELECT x FROM pg_catalog.jsonb_array_elements(p_second) x
+     WHERE pg_catalog.jsonb_typeof(x) = 'object'
+       AND (x ->> 'waiter') ~ '^ks-dtx:[0-9]{1,9}:[0-9]{1,9}:[0-9]{1,18}$'
+       AND (x ->> 'blocker') ~ '^ks-dtx:[0-9]{1,9}:[0-9]{1,9}:[0-9]{1,18}$'
+       AND (x ->> 'node') ~ '^[0-9]{1,9}$' AND (x ->> 'waiter_pid') ~ '^[0-9]{1,9}$'
+       AND (x ->> 'waitstart') ~ '^[0-9]{1,18}$'
+       AND COALESCE(x ->> 'blocker_pid', '0') ~ '^[0-9]{1,9}$'),
+stable_edges AS (
+    SELECT DISTINCT a.node, a.waiter_pid, a.waitstart, a.waiter, a.blocker
+      FROM pg_catalog.jsonb_to_recordset((SELECT COALESCE(pg_catalog.jsonb_agg(x), '[]'::pg_catalog.jsonb) FROM first_ok))
+           AS a(node int, waiter_pid int, waitstart int8, waiter text, blocker text, blocker_pid int)
+      JOIN pg_catalog.jsonb_to_recordset((SELECT COALESCE(pg_catalog.jsonb_agg(x), '[]'::pg_catalog.jsonb) FROM second_ok))
+           AS b(node int, waiter_pid int, waitstart int8, waiter text, blocker text, blocker_pid int)
+        USING (node, waiter_pid, waitstart, waiter, blocker, blocker_pid)
+     WHERE a.waiter <> a.blocker),
+walk(start, cur, path, nodes, pids, starts) AS (
+    SELECT e.waiter, e.blocker, ARRAY[e.waiter], ARRAY[e.node], ARRAY[e.waiter_pid], ARRAY[e.waitstart]
+      FROM stable_edges e
+    UNION ALL
+    SELECT w.start, e.blocker, w.path || w.cur, w.nodes || e.node, w.pids || e.waiter_pid, w.starts || e.waitstart
+      FROM walk w JOIN stable_edges e ON e.waiter = w.cur
+     WHERE w.cur <> w.start AND NOT (w.cur = ANY (w.path))
+       AND pg_catalog.cardinality(w.path) < 32),
+cycles AS (
+    SELECT w.path, w.nodes, w.pids, w.starts
+      FROM walk w
+     WHERE w.cur = w.start
+       AND w.start = (SELECT pg_catalog.min(v) FROM pg_catalog.unnest(w.path) v)
+       AND (SELECT pg_catalog.count(DISTINCT nn) FROM pg_catalog.unnest(w.nodes) nn) > 1),
+victims AS (
+    SELECT c.*,
+           (SELECT v FROM pg_catalog.unnest(c.path) v
+             ORDER BY pg_catalog.split_part(v, ':', 4)::pg_catalog.int8 DESC, v DESC LIMIT 1) AS vic
+      FROM cycles c)
+SELECT DISTINCT ON (vv.vic)
+       vv.vic, vv.nodes[i.pos], vv.pids[i.pos], vv.starts[i.pos], vv.path
+  FROM victims vv
+  CROSS JOIN LATERAL (SELECT pg_catalog.array_position(vv.path, vv.vic) AS pos) i
+ ORDER BY vv.vic;
+$$;
+
+-- A victim mark that the victim's own error did not consume is removed by the
+-- detector after the cancel (S7-10): the cancel did not reach the wait.
+CREATE FUNCTION kingres.internal_unmark_victim(pid int)
+    RETURNS bool
+    AS 'MODULE_PATHNAME', 'kingres_internal_unmark_victim'
+    LANGUAGE C STRICT
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+REVOKE ALL ON FUNCTION kingres.internal_unmark_victim(int) FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION kingres.internal_cancel_waiter(p_pid int, p_waitstart bigint)
+    RETURNS bool
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_ok pg_catalog.bool := false;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_locks l
+                WHERE l.pid = p_pid AND NOT l.granted
+                  AND (extract(epoch FROM l.waitstart) * 1000000)::pg_catalog.int8 = p_waitstart) THEN
+        IF kingres.internal_mark_victim(p_pid, p_waitstart) THEN
+            v_ok := pg_catalog.pg_cancel_backend(p_pid);
+            -- The victim's error consumes the mark; one that is still there after a
+            -- moment means that the cancel found no wait to end.
+            PERFORM pg_catalog.pg_sleep(0.1);
+            IF kingres.internal_unmark_victim(p_pid) THEN
+                RETURN false;
+            END IF;
+        END IF;
+    END IF;
+    RETURN v_ok;
+END;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Review S7-08: the barrier of create_restore_point() falls with its caller
+-- ---------------------------------------------------------------------------
+
+-- Tell this session that it has raised the barrier of node p_node with the given
+-- generation (0: lowered).  When the transaction of this session aborts (a cancel,
+-- a timeout, an error) the session lowers every barrier it still owes, over the
+-- control sessions it holds (src/bucket_move.c).  A node also lowers a barrier whose
+-- raising session has ended (src/ha.c), so a terminated caller or a lost
+-- connection does not leave it up either.
+CREATE FUNCTION kingres.internal_note_barrier(p_node int, p_generation bigint)
+    RETURNS void
+    AS 'MODULE_PATHNAME', 'kingres_internal_note_barrier'
+    LANGUAGE C STRICT
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+REVOKE ALL ON FUNCTION kingres.internal_note_barrier(int, bigint) FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION kingres.create_restore_point(name text)
+    RETURNS TABLE (node_id int, group_id int, restore_lsn pg_lsn)
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+#variable_conflict use_column
+DECLARE
+    n         pg_catalog.record;
+    v_nodes   pg_catalog.int4[];
+    v_gens    pg_catalog.int8[] := '{}'::pg_catalog.int8[];
+    v_ttl     pg_catalog.int4;
+    v_wait    pg_catalog.int4;
+    v_deadline pg_catalog.timestamptz;
+    v_busy    pg_catalog.bool;
+    v_st      pg_catalog.jsonb;
+    v_lsns    pg_catalog.text[] := '{}'::pg_catalog.text[];
+    v_groups  pg_catalog.int4[] := '{}'::pg_catalog.int4[];
+    v_lost    pg_catalog.int4[] := '{}'::pg_catalog.int4[];
+    i         pg_catalog.int4;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    PERFORM kingres.internal_require_map_group();
+    IF name IS NULL OR pg_catalog.length(name) = 0 OR pg_catalog.octet_length(name) >= 64 THEN
+        RAISE EXCEPTION 'the name of a restore point must have 1 to 63 bytes'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    -- Taking restore points one after the other, with the barrier up: nobody else
+    -- may change the cluster in between (a node added or a primary promoted).
+    LOCK TABLE kingres.map_version IN SHARE MODE;
+    v_wait := (SELECT s.setting::pg_catalog.int4 FROM pg_catalog.pg_settings s WHERE s.name = 'kingres_shard.node_timeout');
+    v_ttl := (v_wait * 2 + 10) * 1000;
+    SELECT pg_catalog.array_agg(nd.node_id ORDER BY nd.node_id), pg_catalog.array_agg(nd.group_id ORDER BY nd.node_id)
+      INTO v_nodes, v_groups
+      FROM kingres.node nd WHERE nd.is_active AND nd.role = 'primary';
+
+    BEGIN
+        FOR i IN 1 .. pg_catalog.array_length(v_nodes, 1) LOOP
+            v_st := kingres.internal_exec_scalar(v_nodes[i],
+                pg_catalog.format('SELECT kingres.internal_restore_barrier(''on'', %s)::pg_catalog.text', v_ttl),
+                v_wait * 1000)::pg_catalog.jsonb;
+            v_gens := pg_catalog.array_append(v_gens, (v_st ->> 'generation')::pg_catalog.int8);
+            -- The calling session now owes this barrier a lowering, whatever way it ends (S7-08).
+            PERFORM kingres.internal_note_barrier(v_nodes[i], (v_st ->> 'generation')::pg_catalog.int8);
+        END LOOP;
+        PERFORM kingres.internal_fault_point('restore_barrier_up');
+
+        -- Nothing new can start now; wait for what had started.
+        v_deadline := pg_catalog.clock_timestamp() + pg_catalog.make_interval(secs => v_wait);
+        LOOP
+            v_busy := false;
+            FOR i IN 1 .. pg_catalog.array_length(v_nodes, 1) LOOP
+                v_st := kingres.internal_exec_scalar(v_nodes[i],
+                    'SELECT kingres.internal_restore_barrier(''state'')::pg_catalog.text', v_wait * 1000)::pg_catalog.jsonb;
+                IF (v_st ->> 'inflight')::pg_catalog.int4 > 0 THEN
+                    v_busy := true;
+                END IF;
+            END LOOP;
+            EXIT WHEN NOT v_busy;
+            IF pg_catalog.clock_timestamp() > v_deadline THEN
+                RAISE EXCEPTION 'distributed transactions did not finish their second phase within % seconds', v_wait
+                    USING ERRCODE = 'lock_not_available',
+                          HINT = 'Resolve the stuck transactions (kingres.recover_prepared_transactions()) and try again.';
+            END IF;
+            PERFORM pg_catalog.pg_sleep(0.02);
+        END LOOP;
+        PERFORM kingres.internal_fault_point('restore_all_quiet');
+
+        FOR i IN 1 .. pg_catalog.array_length(v_nodes, 1) LOOP
+            v_lsns := pg_catalog.array_append(v_lsns, kingres.internal_exec_scalar(v_nodes[i],
+                pg_catalog.format('SELECT pg_catalog.pg_create_restore_point(%L)::pg_catalog.text', name), v_wait * 1000));
+        END LOOP;
+    EXCEPTION WHEN OTHERS THEN
+        -- Lower what was raised; the barrier expires by itself when a node cannot be reached.
+        FOR i IN 1 .. COALESCE(pg_catalog.array_length(v_gens, 1), 0) LOOP
+            BEGIN
+                PERFORM kingres.internal_exec_scalar(v_nodes[i],
+                    pg_catalog.format('SELECT kingres.internal_restore_barrier(''off'', NULL, %s)::pg_catalog.text', v_gens[i]), 5000);
+                PERFORM kingres.internal_note_barrier(v_nodes[i], 0);
+            EXCEPTION WHEN OTHERS THEN
+                NULL;
+            END;
+        END LOOP;
+        RAISE;
+    END;
+
+    FOR i IN 1 .. pg_catalog.array_length(v_nodes, 1) LOOP
+        v_st := kingres.internal_exec_scalar(v_nodes[i],
+            pg_catalog.format('SELECT kingres.internal_restore_barrier(''off'', NULL, %s)::pg_catalog.text', v_gens[i]),
+            v_wait * 1000)::pg_catalog.jsonb;
+        PERFORM kingres.internal_note_barrier(v_nodes[i], 0);
+        IF NOT (v_st ->> 'held')::pg_catalog.bool THEN
+            v_lost := pg_catalog.array_append(v_lost, v_nodes[i]);
+        END IF;
+    END LOOP;
+    IF pg_catalog.array_length(v_lost, 1) > 0 THEN
+        RAISE EXCEPTION 'the barrier of node(s) % expired before the restore points were made; the restore point "%" is not consistent', v_lost, name
+            USING ERRCODE = 'lock_not_available',
+                  HINT = 'Do not use the restore point; run kingres.create_restore_point() again.';
+    END IF;
+
+    FOR i IN 1 .. pg_catalog.array_length(v_nodes, 1) LOOP
+        node_id := v_nodes[i];
+        group_id := v_groups[i];
+        restore_lsn := v_lsns[i]::pg_catalog.pg_lsn;
+        RETURN NEXT;
+    END LOOP;
+END;
+$$;
+
+
+-- ---------------------------------------------------------------------------
+-- Review S7-09: the identifier of a two-phase transaction carries a tag
+-- ---------------------------------------------------------------------------
+
+-- Node-local, never synchronized: the moment this node came to the version that
+-- tags the identifiers.  A prepared transaction with an identifier of the older
+-- form (no tag) that was prepared before it is resolved as before; one prepared
+-- after it is not the extension's (src/recovery.c).
+CREATE TABLE kingres.dtx_epoch (
+    old_format_until timestamptz NOT NULL
+);
+CREATE UNIQUE INDEX dtx_epoch_single_row_idx ON kingres.dtx_epoch ((true));
+INSERT INTO kingres.dtx_epoch VALUES (pg_catalog.now());
+
+COMMENT ON TABLE kingres.dtx_epoch IS
+    'Node-local: prepared transactions with an untagged identifier are resolved only when prepared before this time; never synchronized';
+
+-- The tag of an identifier (the first 16 hex digits of an HMAC of the name with
+-- the cluster secret), and what kind of name a gid is: 'tagged' (the tag
+-- verifies), 'forged' (the form of a tagged name, the tag does not verify),
+-- 'untagged' (the older forms) or 'none'.  Superusers only.
+CREATE FUNCTION kingres.internal_gid_tag(body text)
+    RETURNS text
+    AS 'MODULE_PATHNAME', 'kingres_internal_gid_tag'
+    LANGUAGE C STRICT
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+CREATE FUNCTION kingres.internal_gid_class(gid text)
+    RETURNS text
+    AS 'MODULE_PATHNAME', 'kingres_internal_gid_class'
+    LANGUAGE C STRICT
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+REVOKE ALL ON FUNCTION kingres.internal_gid_tag(text), kingres.internal_gid_class(text) FROM PUBLIC;
+
+-- ---------------------------------------------------------------------------
+-- Review S7-07: a participant that failed over and lost its part is found out
+-- ---------------------------------------------------------------------------
+
+-- Node-local, replicated with the node: the identifiers of the distributed
+-- transactions that this node took part in, written by the participant's own
+-- transaction just before its PREPARE (so a row is there exactly when the part
+-- is committed, and a standby that lost the commit does not have it).  The origin
+-- looks here when the primary of a participant group changed (src/recovery.c).
+-- Recovery removes the rows after a day.
+CREATE TABLE kingres.dtx_applied (
+    gid        text        NOT NULL,
+    applied_at timestamptz NOT NULL,
+    CONSTRAINT dtx_applied_pkey PRIMARY KEY (gid)
+);
+
+COMMENT ON TABLE kingres.dtx_applied IS
+    'Node-local: distributed transactions this node prepared a part of, written in that part; the origin compares it after a failover of this group';
+
+CREATE FUNCTION kingres.internal_dtx_applied(gid text)
+    RETURNS void
+    AS 'MODULE_PATHNAME', 'kingres_internal_dtx_applied'
+    LANGUAGE C STRICT
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+-- Executable by every role on purpose: the remote transaction of a participant runs as the role of the
+-- user whose statement it is.  The function itself refuses everyone but a node session and a superuser.
+
+-- A node that leaves the cluster forgets its catalog term as well: it may join
+-- another cluster, whose term is lower than the one it had.
+CREATE OR REPLACE FUNCTION kingres.internal_reset_node()
+    RETURNS void
+    LANGUAGE sql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DELETE FROM kingres.local_node;
+DELETE FROM kingres.bucket_map;
+DELETE FROM kingres.dist_table;
+DELETE FROM kingres.colocation;
+DELETE FROM kingres.cluster_secret;
+DELETE FROM kingres.node;
+UPDATE kingres.map_version SET version = 0, term = 0, superseded_by_term = 0;
+$$;

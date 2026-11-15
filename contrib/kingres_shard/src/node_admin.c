@@ -45,6 +45,7 @@
 #include "node_admin.h"
 #include "node_conn.h"
 #include "remote_scan.h"
+#include "term.h"
 
 PG_FUNCTION_INFO_V1(kingres_add_node);
 PG_FUNCTION_INFO_V1(kingres_remove_node);
@@ -77,6 +78,7 @@ kingres_shard_require_map_group(void)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("this function can only run on the map group primary"),
 				 errdetail("This node is node %d.", cat->local_node_id)));
+	kingres_shard_refuse_if_superseded();
 }
 
 /*
