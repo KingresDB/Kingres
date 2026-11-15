@@ -313,7 +313,7 @@ func TestInclusionProofsAndTheVerifier(t *testing.T) {
 		{"value out of range", "pfdb", map[string]any{"schema": "public", "table": "acct", "primaryKey": map[string]any{"id": "99999999999"}}, 400, "validation_failed"},
 		{"null value", "pfdb", map[string]any{"schema": "public", "table": "acct", "primaryKey": map[string]any{"id": nil}}, 400, "validation_failed"},
 		{"empty key", "pfdb", map[string]any{"schema": "public", "table": "acct", "primaryKey": map[string]any{}}, 400, "validation_failed"},
-		{"unknown member", "pfdb", map[string]any{"schema": "public", "table": "acct", "primaryKey": acct, "extra": 1}, 400, "bad_request"},
+		{"unknown member", "pfdb", map[string]any{"schema": "public", "table": "acct", "primaryKey": acct, "extra": 1}, 400, "validation_failed"},
 	}
 	for _, c := range cases {
 		st, raw := e.proof(c.db, c.body)

@@ -188,7 +188,8 @@ for (const o of operations) {
 }
 
 // Audit actions: operationIds plus a small closed list of non-operation events.
-const NON_OPERATION_EVENTS = ['loginFailed', 'setupTokenRejected', 'autoFailover'];
+// certificateRenewed and certificateRenewalFailed are the events of the certificate renewal job (0.5.0).
+const NON_OPERATION_EVENTS = ['loginFailed', 'setupTokenRejected', 'autoFailover', 'certificateRenewed', 'certificateRenewalFailed'];
 const NOT_AUDITED_MUTATIONS = ['previewRebalancePlan', 'createInclusionProof', 'checkSetupToken'];
 const auditEnum = schemas.AuditAction?.enum;
 if (!Array.isArray(auditEnum)) fail('components.schemas.AuditAction', 'must be an enum');
@@ -232,7 +233,7 @@ const opEnum = (n) => JSON.stringify(schemas[n]?.properties?.op?.enum);
 if (opEnum('InclusionProof') !== '["I","D"]' || opEnum('InclusionProofRequest') !== '["I","D"]') fail('InclusionProof', 'op must be an enum [I, D]');
 if (!(schemas.InclusionProof?.required ?? []).includes('op')) fail('InclusionProof', 'op must be required');
 const opIds = new Set(operations.map((o) => o.op.operationId));
-const events = new Set(['loginFailed', 'setupTokenRejected', 'autoFailover']);
+const events = new Set(NON_OPERATION_EVENTS);
 for (const a of schemas.AuditAction?.enum ?? []) if (!events.has(a) && !opIds.has(a)) fail('AuditAction', a + ' is neither an operationId nor a known event');
 
 
@@ -364,19 +365,62 @@ const lvParams = (opById.get('listLedgerVerifications')?.op.parameters ?? []).ma
 for (const n of ['limit', 'cursor']) if (!lvParams.includes(n)) fail('listLedgerVerifications', `parameter ${n} is missing`);
 // Settings: restartRequired is a required response property.
 if (!(schemas.LocalSettings?.required ?? []).includes('restartRequired')) fail('LocalSettings', 'restartRequired must be required');
-// The README changelog has the three sections for the current version and names the new codes.
-const cl = readme.slice(readme.indexOf(`### ${doc.info?.version}\n`));
-const clEnd = cl.indexOf('\n### ', 5);
-const changelog = clEnd > 0 ? cl.slice(0, clEnd) : cl;
-for (const h of ['#### Breaking', '#### Additive', '#### Documentation']) if (!changelog.includes(h)) fail('README.md', `changelog of ${doc.info?.version} lacks "${h}"`);
-for (const c of ['system_database_stopped', 'server_owns_buckets', 'ledger_entry_pending', 'seenFingerprint', 'InclusionProof']) {
-  if (!changelog.includes(c)) fail('README.md', `changelog of ${doc.info?.version} must mention ${c}`);
+// The README changelog has the three sections for the current version and, for the revision it names, the items
+// that revision must mention. The summary counts must match the contract.
+const changelogOf = (version) => {
+  const at = readme.indexOf(`### ${version}\n`);
+  if (at < 0) return '';
+  const rest = readme.slice(at);
+  const end = rest.indexOf('\n### ', 5);
+  return end > 0 ? rest.slice(0, end) : rest;
+};
+const MUST_MENTION = {
+  '0.4.0': ['system_database_stopped', 'server_owns_buckets', 'ledger_entry_pending', 'seenFingerprint', 'InclusionProof'],
+  '0.5.0': ['renewServerCertificates', 'revokeServerCertificates', 'certificate_authority_unavailable', 'certificate_revoked', 'certificateRenewalFailed', 'partial', 'additive'],
+};
+for (const version of ['0.4.0', '0.5.0']) {
+  const changelog = changelogOf(version);
+  if (!changelog) { fail('README.md', `changelog heading for ${version} is missing`); continue; }
+  for (const h of ['#### Breaking', '#### Additive', '#### Documentation']) if (!changelog.includes(h)) fail('README.md', `changelog of ${version} lacks "${h}"`);
+  for (const c of MUST_MENTION[version]) {
+    if (!changelog.includes(c)) fail('README.md', `changelog of ${version} must mention ${c}`);
+  }
+  if (changelog.includes('are **not in this revision**')) fail('README.md', 'removeServer, createInclusionProof and server groups are in this revision now');
+  const m = changelog.match(/\((\d+) operations added \((\d+) operations, (\d+) paths\)/) ?? changelog.match(/(\d+) operations added \((\d+) operations, (\d+) paths\)/);
+  if (!m) fail('README.md', `the changelog summary of ${version} must state "N operations added (M operations, P paths)"`);
+  else if (version === doc.info?.version && (Number(m[2]) !== operations.length || Number(m[3]) !== Object.keys(doc.paths ?? {}).length)) fail('README.md', `changelog says ${m[2]} operations and ${m[3]} paths, the contract has ${operations.length} and ${Object.keys(doc.paths ?? {}).length}`);
 }
-if (changelog.includes('are **not in this revision**')) fail('README.md', 'removeServer, createInclusionProof and server groups are in this revision now');
-const m = changelog.match(/\((\d+) operations added \((\d+) operations, (\d+) paths\)/) ?? changelog.match(/(\d+) operations added \((\d+) operations, (\d+) paths\)/);
-if (!m) fail('README.md', 'the changelog summary must state "N operations added (M operations, P paths)"');
-else if (Number(m[2]) !== operations.length || Number(m[3]) !== Object.keys(doc.paths ?? {}).length) fail('README.md', `changelog says ${m[2]} operations and ${m[3]} paths, the contract has ${operations.length} and ${Object.keys(doc.paths ?? {}).length}`);
+if (doc.info?.version !== '0.5.0') fail('info.version', 'the contract is revision 0.5.0');
 
+
+// 0.5.0 rules: certificate operations, partial answers, additive changes only.
+for (const id of ['renewServerCertificates', 'revokeServerCertificates']) {
+  const o = opById.get(id);
+  if (!o) { fail(id, 'operation of 0.5.0 does not exist'); continue; }
+  if (o.method !== 'post' || o.op['x-required-role'] !== 'kingres_admin') fail(id, 'must be a POST that needs kingres_admin');
+  for (const code of ['202', '404', '409', '503']) if (!respCodes(id).includes(code)) fail(id, `must list ${code}`);
+  for (const c of ['certificate_authority_unavailable', 'certificate_revoked']) {
+    if (!opDesc(id).includes('`' + c + '`')) fail(id, `description must name ${c}`);
+  }
+}
+for (const c of ['certificate_revoked', 'certificate_authority_unavailable']) if (!problemCodes.has(c)) fail('ProblemCode', 'missing ' + c);
+for (const k of ['certificate.renew', 'certificate.revoke']) if (!(schemas.TaskKind?.enum ?? []).includes(k)) fail('TaskKind', 'missing ' + k);
+if (!(schemas.AlertKind?.enum ?? []).includes('certificateRenewalFailed')) fail('AlertKind', 'missing certificateRenewalFailed');
+// A partial answer: optional, never required (adding a required property would be breaking).
+for (const n of ['LogPage', 'AlertPage', 'MetricQueryResult']) {
+  const sc = schemas[n];
+  if (!sc?.properties?.partial || sc.properties.partial.type !== 'boolean') fail(n, 'partial (boolean) is missing');
+  if (sc?.properties?.missingServers?.items?.$ref !== '#/components/schemas/MissingServer') fail(n, 'missingServers must be a list of MissingServer');
+  for (const p of ['partial', 'missingServers']) if ((sc?.required ?? []).includes(p)) fail(n, `${p} must stay optional (additive change)`);
+}
+if (JSON.stringify(schemas.MissingServer?.properties?.reason?.enum) !== '["timeout","unreachable","refused","invalidAnswer"]') fail('MissingServer.reason', 'enum must be [timeout, unreachable, refused, invalidAnswer]');
+if (!schemas.Server?.properties?.certificateRevokedAt) fail('Server', 'certificateRevokedAt is missing');
+if ((schemas.Server?.required ?? []).includes('certificateRevokedAt')) fail('Server', 'certificateRevokedAt must stay optional');
+// The statements of 0.5.0 about leaving and about unknown members are in the contract.
+const leaveText = opDesc('leaveCluster');
+if (leaveText.includes('`standalone`') && !leaveText.includes('0.4.0 said `standalone`')) fail('leaveCluster', 'a server that leaves is `uninitialized`, not `standalone`');
+if (!leaveText.includes('`uninitialized`') || !leaveText.includes('`id` is `0`')) fail('leaveCluster', 'must say `uninitialized` and the answer of a forced leave without a leader (id 0)');
+if (!(doc.components?.responses?.BadRequest?.description ?? '').includes('unknown_property')) fail('BadRequest', 'must say when an unknown member is validation_failed');
 // ------------------------------------------------------------------ report
 const pathCount = Object.keys(doc.paths ?? {}).length;
 console.log(`openapi ${doc.openapi}, info.version ${doc.info?.version}`);

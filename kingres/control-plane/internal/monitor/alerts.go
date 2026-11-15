@@ -10,11 +10,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/gather"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/store"
 )
 
@@ -27,7 +29,7 @@ const (
 )
 
 // Managed lists the alert kinds the checks own; others are never cleared by them.
-var Managed = []string{"serverDown", "diskSpaceLow", "memoryPressure", "replicationLagHigh"}
+var Managed = []string{"serverDown", "diskSpaceLow", "memoryPressure", "replicationLagHigh", "certificateExpiring", "ledgerPendingTooOld", "versionMismatch", "certificateRenewalFailed"}
 
 // Readings are the inputs of the checks; nil means "not measured", which
 // neither raises nor clears an alert.
@@ -38,6 +40,15 @@ type Readings struct {
 	InstanceUp bool
 	// DiskUsedPercent, MemAvailPercent and LagSeconds are the measured values.
 	DiskUsedPercent, MemAvailPercent, LagSeconds *float64
+	// Certificates are the certificates of this server to check (nil: not
+	// measured, certificateExpiring is neither raised nor cleared).
+	Certificates []CertificateReading
+	// LedgerChecked says that LedgerPending was measured (an empty list then
+	// means that no database has a queue).
+	LedgerChecked bool
+	LedgerPending []LedgerPendingReading
+	// LedgerMaxAge is the age that raises ledgerPendingTooOld (0: LedgerPendingMaxAge).
+	LedgerMaxAge time.Duration
 }
 
 // Condition is a problem that exists now.
@@ -74,18 +85,37 @@ func Evaluate(r Readings) (conds []Condition, evaluated map[string]bool) {
 			conds = append(conds, Condition{"replicationLagHigh", "warning", subject, fmt.Sprintf("A standby of server %s is %.0f seconds behind.", r.Host, l)})
 		}
 	}
+	if r.Certificates != nil {
+		evaluated["certificateExpiring"] = true
+		conds = append(conds, r.certificateConditions()...)
+	}
+	if r.LedgerChecked {
+		evaluated["ledgerPendingTooOld"] = true
+		conds = append(conds, r.ledgerConditions()...)
+	}
 	return conds, evaluated
 }
 
-// Reconcile makes the alert table match the conditions: a condition without an
-// open alert raises one (severity and message of an open alert are updated), an
-// open alert of an evaluated kind without a condition is resolved. An open
-// alert survives a restart of kingresd.
+// Reconcile makes the alert table match the conditions of server host: a
+// condition without an open alert raises one (severity and message of an open
+// alert are updated), an open alert of an evaluated kind without a condition is
+// resolved. An open alert survives a restart of kingresd. The conditions must
+// be about host (their subject is "server:<host>", optionally followed by
+// "|database:<name>" or "|ca").
 func Reconcile(ctx context.Context, c *pgx.Conn, host string, conds []Condition, evaluated map[string]bool, now time.Time) error {
-	subject := "server:" + host
-	have := map[string]bool{}
+	return ReconcileScope(ctx, c, "server:"+host, conds, evaluated, now)
+}
+
+// ReconcileScope is Reconcile for a scope: "server:<host>" or "cluster" (the
+// alerts about the cluster as a whole, such as versionMismatch). Only the alerts
+// of the scope are raised, updated or resolved.
+func ReconcileScope(ctx context.Context, c *pgx.Conn, scope string, conds []Condition, evaluated map[string]bool, now time.Time) error {
+	active := map[string][]string{} // kind -> subjects with a condition
 	for _, cd := range conds {
-		have[cd.Kind] = true
+		if cd.Subject != scope && !strings.HasPrefix(cd.Subject, scope+"|") {
+			return fmt.Errorf("monitor: the condition %s about %q is not about %q", cd.Kind, cd.Subject, scope)
+		}
+		active[cd.Kind] = append(active[cd.Kind], cd.Subject)
 		_, err := c.Exec(ctx, `INSERT INTO kingres_cp.alert (severity, kind, subject, message, raised_at)
 			VALUES ($1, $2, $3, $4, $5)
 			ON CONFLICT (kind, subject) WHERE cleared_at IS NULL DO UPDATE SET severity = EXCLUDED.severity, message = EXCLUDED.message`,
@@ -95,10 +125,13 @@ func Reconcile(ctx context.Context, c *pgx.Conn, host string, conds []Condition,
 		}
 	}
 	for kind := range evaluated {
-		if have[kind] {
-			continue
+		subjects := active[kind]
+		if subjects == nil {
+			subjects = []string{}
 		}
-		if _, err := c.Exec(ctx, "UPDATE kingres_cp.alert SET cleared_at = $3 WHERE kind = $1 AND subject = $2 AND cleared_at IS NULL", kind, subject, now); err != nil {
+		if _, err := c.Exec(ctx, `UPDATE kingres_cp.alert SET cleared_at = $3
+			WHERE kind = $1 AND (subject = $2 OR left(subject, length($2) + 1) = $2 || '|') AND cleared_at IS NULL AND NOT (subject = ANY($4::text[]))`,
+			kind, scope, now, subjects); err != nil {
 			return err
 		}
 	}
@@ -124,7 +157,9 @@ const alertCols = `id, kind, severity, subject, message, raised_at, acknowledged
 
 var titles = map[string]string{
 	"serverDown": "Server down", "diskSpaceLow": "Disk space low", "memoryPressure": "Memory pressure",
-	"replicationLagHigh": "Replication lag high",
+	"replicationLagHigh": "Replication lag high", "certificateExpiring": "Certificate expiring",
+	"ledgerPendingTooOld": "Ledger entries pending for too long", "versionMismatch": "KingresDB versions differ",
+	"certificateRenewalFailed": "Certificate renewal failed",
 }
 
 func scanAlert(r pgx.Row) (api.Alert, error) {
@@ -139,9 +174,12 @@ func scanAlert(r pgx.Row) (api.Alert, error) {
 	if a.Title == "" {
 		a.Title = a.Kind
 	}
-	if len(subject) > 7 && subject[:7] == "server:" {
-		id := subject[7:]
+	if rest, ok := strings.CutPrefix(subject, "server:"); ok {
+		id, more, _ := strings.Cut(rest, "|")
 		a.ServerID = &id
+		if db, ok := strings.CutPrefix(more, "database:"); ok {
+			a.DatabaseName = &db
+		}
 	}
 	a.RaisedAt = raised.UTC()
 	switch {
@@ -236,6 +274,40 @@ func OpenCounts(ctx context.Context, c *pgx.Conn) (map[string]int, error) {
 			return nil, err
 		}
 		out[s] = n
+	}
+	return out, rows.Err()
+}
+
+// ListAfter returns at most limit alerts of this server, newest first, that come
+// after the position after (all of them when nil), the larger id first among
+// alerts raised at the same time. The ids are the cluster-wide ids
+// (gather.AlertID) made from ordinal, which is also what after holds. state and
+// severity filter as in List.
+func ListAfter(ctx context.Context, c *pgx.Conn, state, severity string, after *gather.AlertKey, limit, ordinal int) ([]api.Alert, error) {
+	var t any
+	var gid int64
+	if after != nil {
+		t, gid = after.Time, after.ID
+	}
+	rows, err := c.Query(ctx, `SELECT `+alertCols+` FROM kingres_cp.alert
+		WHERE ($1::timestamptz IS NULL OR (raised_at, ($3::bigint * 4294967296 + id)) < ($1::timestamptz, $2::bigint))
+		  AND ($4 = '' OR severity = $4)
+		  AND ($5 = '' OR ($5 = 'resolved' AND cleared_at IS NOT NULL)
+		       OR ($5 = 'acknowledged' AND cleared_at IS NULL AND acknowledged_at IS NOT NULL)
+		       OR ($5 = 'open' AND cleared_at IS NULL AND acknowledged_at IS NULL))
+		ORDER BY raised_at DESC, id DESC LIMIT $6`, t, gid, int64(ordinal), severity, state, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []api.Alert{}
+	for rows.Next() {
+		a, err := scanAlert(rows)
+		if err != nil {
+			return nil, err
+		}
+		a.ID = gather.AlertID(ordinal, a.ID)
+		out = append(out, a)
 	}
 	return out, rows.Err()
 }

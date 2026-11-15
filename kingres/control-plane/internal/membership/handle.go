@@ -105,7 +105,13 @@ func (r *Receiver) Handle(ctx context.Context, key, peer string, body []byte) (a
 		if err != nil {
 			return nil, err
 		}
-		return wire.Empty{}, svc.InstallPKI(ctx, req)
+		if err := svc.InstallPKI(ctx, req); err != nil {
+			return nil, err
+		}
+		if req.ServerCert != "" && m.OnCertificateInstalled != nil {
+			m.OnCertificateInstalled()
+		}
+		return wire.Empty{}, nil
 	case "POST /peers":
 		req, err := decode[wire.PeersRequest](body)
 		if err != nil {
@@ -113,7 +119,7 @@ func (r *Receiver) Handle(ctx context.Context, key, peer string, body []byte) (a
 		}
 		list := make([]peers.Peer, len(req.Peers))
 		for i, p := range req.Peers {
-			list[i] = peers.Peer{ServerID: p.ServerID, InternalAddr: p.InternalAddress}
+			list[i] = peers.Peer{ServerID: p.ServerID, InternalAddr: p.InternalAddress, Ordinal: p.Ordinal}
 			if err := list[i].Validate(); err != nil {
 				return nil, bad(err.Error())
 			}
@@ -185,6 +191,9 @@ func (r *Receiver) Handle(ctx context.Context, key, peer string, body []byte) (a
 			return nil, &internalapi.CallError{Status: http.StatusUnprocessableEntity, Code: "apply_failed", Message: err.Error()}
 		}
 		return wire.Empty{}, nil
+	}
+	if res, ok, err := r.handleCertCall(ctx, key, peer, body); ok {
+		return res, err
 	}
 	return nil, &internalapi.CallError{Status: http.StatusNotFound, Code: "not_found", Message: "No such call."}
 }

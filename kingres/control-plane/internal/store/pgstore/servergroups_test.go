@@ -40,7 +40,7 @@ func TestIntegrationServerRecordsOverlay(t *testing.T) {
 		{`INSERT INTO kingres_cp.server (server_id) VALUES ('10.0.0.1')`, nil},
 		{`INSERT INTO kingres_cp.server (server_id, server_group, seen_fingerprint, fingerprint_pinned, certificate_pem) VALUES ('10.0.0.2', 'rack-a', $1, true, $2)`, []any{fp, string(crt)}},
 		{`INSERT INTO kingres_cp.server (server_id, server_group, seen_fingerprint, fingerprint_pinned) VALUES ('10.0.0.3', 'rack-a', 'not a fingerprint', true)`, nil},
-		{`INSERT INTO kingres_cp.server (server_id, server_group) VALUES ('10.0.0.4', 'rack-b')`, nil},
+		{`INSERT INTO kingres_cp.server (server_id, server_group, certificate_revoked_at) VALUES ('10.0.0.4', 'rack-b', '2026-11-10T08:00:00Z')`, nil},
 	} {
 		if _, err := c.Exec(ctx, q.sql, q.args...); err != nil {
 			t.Fatalf("%s: %v", q.sql, err)
@@ -94,6 +94,10 @@ func TestIntegrationServerRecordsOverlay(t *testing.T) {
 	}
 	if servers[3].ServerGroup == nil || *servers[3].ServerGroup != "rack-b" {
 		t.Errorf("server 4 = %+v", servers[3])
+	}
+	// Revoked certificates are reported (contract 0.5.0); the others are not.
+	if servers[3].CertificateRevokedAt == nil || servers[3].CertificateRevokedAt.Format(time.RFC3339) != "2026-11-10T08:00:00Z" || servers[1].CertificateRevokedAt != nil {
+		t.Errorf("revoked: server 4 %v, server 2 %v", servers[3].CertificateRevokedAt, servers[1].CertificateRevokedAt)
 	}
 	// A server without a record keeps what the catalog says.
 	if servers[4].ServerGroup == nil || *servers[4].ServerGroup != "catalog-rack" {

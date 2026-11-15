@@ -284,7 +284,8 @@ func (s *Server) listTasks(_ *call, w http.ResponseWriter, r *http.Request) erro
 		Kind: pp.enum("kind", "cluster.init", "cluster.join", "server.add", "server.remove", "server.failover",
 			"server.leave", "instance.start", "instance.stop", "instance.restart", "database.create",
 			"database.update", "database.drop", "table.distribute", "rebalance",
-			"replication.restorePreferredPrimaries", "ledger.verify", "networkAccess.apply", "replicate.apply"),
+			"replication.restorePreferredPrimaries", "ledger.verify", "networkAccess.apply", "replicate.apply",
+			"certificate.renew", "certificate.revoke"),
 	}
 	page := pp.page()
 	if p := pp.err(); p != nil {

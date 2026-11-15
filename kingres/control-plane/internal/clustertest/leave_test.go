@@ -120,6 +120,7 @@ func TestLeaveClusterFollowerLeavesThroughItsOwnAPIAndJoinsAgain(t *testing.T) {
 	leader, mid, leaving := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	oldPair := loadPair(t, leaving)
 	serial := serialOf(t, leaving)
+	leaving.Expect(200, "GET", "/server-groups", nil) // opens its connection to the leader before it leaves
 	mkRole(t, leader, "leave_ops", "Leave-Ops-Password-1", "kingres_ops")
 
 	// The role must be an administrator.
@@ -237,6 +238,11 @@ func TestLeaveClusterFollowerLeavesThroughItsOwnAPIAndJoinsAgain(t *testing.T) {
 	leaving.WaitSetup(8 * time.Minute)
 	if !leaving.Login(clustertest.AdminUser, clustertest.AdminPass) {
 		t.Fatal("no sign-in after joining again")
+	}
+	// A forwarded read through the rejoined server works at once: its connections to the leader are new
+	// (a connection opened with the deleted certificate would be refused by the leader).
+	if st, out := leaving.Do("GET", "/server-groups", nil, nil); st != 200 {
+		t.Errorf("a leader-bound read through the server that joined again: %d %v", st, out)
 	}
 	for _, n := range c.Nodes {
 		if got := n.Servers(); len(got) != 3 {

@@ -210,6 +210,7 @@ func (s *Service) stepPKI(_ context.Context, _ *task.Env) error {
 			return fmt.Errorf("creating the CA: %w", err)
 		}
 	}
+	ca.SetServerLifetime(s.cfg.CertificateLifetime)
 	if _, err := os.Stat(filepath.Join(dir, ServerCertFile)); err == nil {
 		return nil
 	}

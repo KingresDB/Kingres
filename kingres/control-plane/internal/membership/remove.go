@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -35,6 +34,9 @@ func (m *Manager) ownsBuckets(ctx context.Context, server string) (bool, string,
 // that owns no buckets in any database, and does not host the map group. The
 // refusals and their order are decideRemoval's, the contract's.
 func (m *Manager) RemoveServer(ctx context.Context, actor, id string) (task.Task, error) {
+	if _, err := m.ca(); err != nil {
+		return task.Task{}, err
+	}
 	f, err := m.leaderFacts(ctx, id)
 	if err != nil {
 		m.log().Warn("reading the catalog for a removal failed", "server", id, "error", err)
@@ -143,10 +145,15 @@ func (m *Manager) stepRemoveReset(ctx context.Context, env *task.Env) error {
 	// The server may already be reset by an earlier run: then its certificate
 	// is gone and the call fails with the certificate refused; that is done.
 	err = m.waitUnreachable(ctx, env, in.ServerID, "deleting its instance", func() error {
-		return m.do(ctx, in.ServerID, "POST", "/node/reset", wire.Empty{}, nil)
+		return m.doUnchecked(ctx, in.ServerID, "POST", "/node/reset", wire.Empty{}, nil)
 	})
 	var ae *peerclient.APIError
 	if errors.As(err, &ae) && ae.Status == 401 {
+		return nil
+	}
+	// A server that left alone (a forced leave) or was reset by an earlier run no
+	// longer presents a certificate of this cluster: there is nothing left to reset.
+	if errors.Is(err, peerclient.ErrNotMember) {
 		return nil
 	}
 	return err
@@ -168,10 +175,8 @@ func (m *Manager) stepRemoveRevoke(ctx context.Context, env *task.Env) error {
 	if err != nil {
 		return err
 	}
-	if row.Serial != "" {
-		if err := ca.Revoke(row.Serial, time.Now()); err != nil {
-			return err
-		}
+	if err := m.revokeServerCertificates(ctx, ca, in.ServerID, row.Serial); err != nil {
+		return err
 	}
 	m.Client.Forget(in.ServerID)
 	return m.distributeRevocations(ctx)
@@ -199,5 +204,5 @@ func (m *Manager) stepRemoveForget(ctx context.Context, env *task.Env) error {
 
 // Definitions returns the task definitions of this package.
 func (m *Manager) Definitions() []task.Definition {
-	return []task.Definition{m.addDefinition(), m.removeDefinition(), m.leaveDefinition()}
+	return []task.Definition{m.addDefinition(), m.removeDefinition(), m.leaveDefinition(), m.certRenewDefinition(), m.certRevokeDefinition()}
 }

@@ -65,6 +65,10 @@ type Deps struct {
 	// Forwarder sends cluster operations to the manager leader when this server
 	// is not it; nil means this server is alone and runs everything itself.
 	Forwarder Forwarder
+	// Gatherer asks the other servers for their part of a cluster-wide read (nil:
+	// this server answers for itself only); GatherTimeout is the time each gets.
+	Gatherer      Gatherer
+	GatherTimeout time.Duration
 	// Members adds and removes servers (design D4 and D5); nil makes addServer
 	// and removeServer answer "not supported".
 	Members Members

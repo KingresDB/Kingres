@@ -24,6 +24,8 @@ type PeerInfo struct {
 	ServerID        string `json:"serverId"`
 	PGPort          int    `json:"pgPort"`
 	InternalAddress string `json:"internalAddress"`
+	// Ordinal is the server's number (see peers.Peer); 0 when not known.
+	Ordinal int `json:"ordinal,omitempty"`
 }
 
 // PrepareResponse is the answer of the bootstrap call that asks an

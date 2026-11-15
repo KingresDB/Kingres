@@ -62,6 +62,9 @@ type Config struct {
 	InternalPort int
 	// Version is the kingresd version.
 	Version string
+	// CertificateLifetime is the validity of the certificates this server's CA
+	// signs (0: pki.ServerLifetime).
+	CertificateLifetime time.Duration
 	// TLSCertFile and TLSKeyFile enable TLS on the instance.
 	TLSCertFile, TLSKeyFile string
 	// Logger receives diagnostics, never secrets.
@@ -260,6 +263,9 @@ func (s *Service) Resume(bg context.Context) error {
 		}
 		s.publishDSN()
 		if s.setup.State() != setup.Uninitialized {
+			if err := s.MigrateSystem(ctx); err != nil {
+				s.log.Error("upgrading the system database at start", "error", err)
+			}
 			return nil
 		}
 	}

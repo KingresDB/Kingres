@@ -99,6 +99,9 @@ type CA struct {
 	mu      sync.Mutex
 	revoked map[string]time.Time // serial (hex) -> revocation time
 	crlNum  int64
+	// lifetime is the validity of the certificates this CA signs from now on
+	// (ServerLifetime unless SetServerLifetime was called).
+	lifetime time.Duration
 }
 
 func randSerial() (*big.Int, error) {
@@ -335,7 +338,7 @@ func (ca *CA) Sign(csrPEM []byte, allowed Names, now time.Time) (certPEM []byte,
 	tpl := &x509.Certificate{
 		SerialNumber: sn, Subject: pkix.Name{CommonName: allowed.CommonName, Organization: []string{"KingresDB"}},
 		DNSNames: csr.DNSNames, IPAddresses: csr.IPAddresses,
-		NotBefore: now.Add(-5 * time.Minute).UTC(), NotAfter: now.Add(ServerLifetime).UTC(),
+		NotBefore: now.Add(-backdate(ca.ServerLifetime())).UTC(), NotAfter: now.Add(ca.ServerLifetime()).UTC(),
 		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true, IsCA: false,
@@ -350,11 +353,71 @@ func (ca *CA) Sign(csrPEM []byte, allowed Names, now time.Time) (certPEM []byte,
 // SerialHex formats a serial number.
 func SerialHex(sn *big.Int) string { return hex.EncodeToString(sn.Bytes()) }
 
+// DefaultRenewFraction is the part of its lifetime that a certificate must
+// still have left when it is renewed (D1: a third).
+const DefaultRenewFraction = 1.0 / 3.0
+
+// MinServerLifetime is the shortest lifetime a CA can be configured to issue;
+// shorter values exist only so that tests can watch a renewal happen.
+const MinServerLifetime = 5 * time.Second
+
+// SetServerLifetime sets the validity of the certificates this CA signs from
+// now on; d <= 0 restores ServerLifetime.
+func (ca *CA) SetServerLifetime(d time.Duration) {
+	ca.mu.Lock()
+	defer ca.mu.Unlock()
+	if d <= 0 {
+		d = ServerLifetime
+	}
+	ca.lifetime = d
+}
+
+// ServerLifetime returns the validity of the certificates this CA signs.
+func (ca *CA) ServerLifetime() time.Duration {
+	ca.mu.Lock()
+	defer ca.mu.Unlock()
+	if ca.lifetime <= 0 {
+		return ServerLifetime
+	}
+	return ca.lifetime
+}
+
+// backdate is how far before now a certificate of the given lifetime starts:
+// five minutes of clock skew, but never more than a tenth of a short lifetime.
+func backdate(lifetime time.Duration) time.Duration {
+	return min(5*time.Minute, lifetime/10)
+}
+
 // NeedsRenewal reports whether less than a third of the lifetime of cert is
 // left at now (D1).
 func NeedsRenewal(cert *x509.Certificate, now time.Time) bool {
+	return NeedsRenewalAt(cert, now, DefaultRenewFraction)
+}
+
+// NeedsRenewalAt reports whether less than fraction of the lifetime of cert is
+// left at now. A certificate that expired always needs renewal; a fraction of
+// zero asks only then.
+func NeedsRenewalAt(cert *x509.Certificate, now time.Time, fraction float64) bool {
+	left := cert.NotAfter.Sub(now)
+	if left <= 0 {
+		return true
+	}
 	life := cert.NotAfter.Sub(cert.NotBefore)
-	return cert.NotAfter.Sub(now) < life/3
+	return float64(left) < float64(life)*fraction
+}
+
+// RemainingFraction is the part of its lifetime that cert still has at now
+// (1 when it has not started, 0 when it expired).
+func RemainingFraction(cert *x509.Certificate, now time.Time) float64 {
+	life := cert.NotAfter.Sub(cert.NotBefore)
+	left := cert.NotAfter.Sub(now)
+	switch {
+	case life <= 0 || left <= 0:
+		return 0
+	case left >= life:
+		return 1
+	}
+	return float64(left) / float64(life)
 }
 
 // Fingerprint is the SHA-256 of a DER certificate as lower-case hex.
@@ -431,7 +494,7 @@ func (ca *CA) CRL(now time.Time) ([]byte, error) {
 		return nil, err
 	}
 	der, err := x509.CreateRevocationList(rand.Reader, &x509.RevocationList{
-		Number: big.NewInt(ca.crlNum), ThisUpdate: now.UTC(), NextUpdate: now.Add(30 * 24 * time.Hour).UTC(),
+		Number: big.NewInt(ca.crlNum), ThisUpdate: now.UTC(), NextUpdate: now.Add(CRLValidity).UTC(),
 		RevokedCertificateEntries: entries,
 	}, ca.cert, ca.key)
 	if err != nil {
@@ -453,3 +516,11 @@ func (ca *CA) VerifyPeer(cert *x509.Certificate, now time.Time) (string, error) 
 	}
 	return cert.Subject.CommonName, nil
 }
+
+// CRLValidity is how long a revocation list is valid (its NextUpdate); a server
+// refuses a list past it. CRLRefreshAfter is the age at which the CA holder issues
+// it again, a third of the validity, so that a few failed rounds do not matter.
+const (
+	CRLValidity     = 30 * 24 * time.Hour
+	CRLRefreshAfter = CRLValidity / 3
+)

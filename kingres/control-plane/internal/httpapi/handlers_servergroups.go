@@ -214,6 +214,7 @@ func (s *Server) completeFromLeader(c *call, r *http.Request, fw Forwarder, serv
 		if l, ok := byID[sv.ID]; ok {
 			sv.ServerGroup, sv.SeenFingerprint, sv.FingerprintPinned = l.ServerGroup, l.SeenFingerprint, l.FingerprintPinned
 			sv.CertificateExpiresAt = l.CertificateExpiresAt
+			sv.CertificateRevokedAt = l.CertificateRevokedAt
 		}
 	}
 }

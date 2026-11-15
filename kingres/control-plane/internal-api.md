@@ -1,23 +1,3 @@
-| `POST /internal/v1/leave-cluster` | any peer, answered only by the leader | a server asks to leave the cluster. The body is `{"actor": "<administrator>", "force": false}` and names no server: the server that leaves is the one named by the caller's certificate, so a server cannot ask for another's removal. The leader decides (404, 422 dead, 409 `last_server`, `server_hosts_map_group`, `server_owns_buckets`, `rebalance_in_progress`, `operation_in_progress`), starts the task `server.leave` and answers with it |
-| `POST /internal/v1/leave-status` | any peer, answered only by the leader | the state of the leave task whose subject is the caller (`{"taskId": n}`; a task of another server, of another kind or none is 404); the leaving server resets itself when it is done |
-| `POST /internal/v1/task/record` | any peer, answered only by the leader | a server records the task of one of its instance operations (`instance.start`, `instance.stop`, `instance.restart`, subject type `instance`, a numeric instance id, state `running`, `done` or `failed`, one to four steps, at most 1,024 bytes of input). With `id` the task is written under that id (a reserved or announced one; writing the same id again changes nothing), without it the leader assigns one. The answer is `{"id": n}`; `409 subject_busy` when the instance already has an unfinished task, `400` for anything outside these limits, `503 unavailable` when the leader cannot write it |
-| `POST /internal/v1/task/settle` | any peer, answered only by the leader | the end of a recorded task of those kinds (`id` required): state, steps, percent and error; a task of another kind is `400` |
-| `POST /internal/v1/task/reserve` | any peer, answered only by the leader | takes the next id of the task sequence for a task recorded later (the start that follows a stop); answer `{"id": n}` |
-| `POST /internal/v1/forward` | any peer, answered only by the leader | one operation of the public contract, run as the identity the forwarding server verified |
-| `POST /internal/v1/bootstrap/prepare` | setup token (no certificate) | the uninitialized server returns a certificate request for its own key |
-| `POST /internal/v1/bootstrap/install` | setup token (no certificate) | the uninitialized server stores its certificate and the CA certificate |
-| `POST /internal/v1/bootstrap/join` | administrator credentials (no certificate) | a joining server asks to be added; the credentials are checked here and go no further |
-| `POST /internal/v1/add-server` | any peer, answered only by the leader | the server that checked an administrator hands a join to the leader |
-| `GET /internal/v1/instance/status` | leader, or any peer while this server is joining | whether the instance exists and runs |
-| `POST /internal/v1/instance/create` | leader, or any peer while joining | create, configure and start the instance for the cluster's settings and managed rules |
-| `POST /internal/v1/instance/start`, `/stop`, `/remove` | leader | start or stop the instance; stop and delete it and its credentials |
-| `POST /internal/v1/instance/trust` | leader, or any peer while joining | the servers to trust (certificate rules and map), the managed network rules, TLS settings; reload |
-| `POST /internal/v1/pki/install` | leader, or any peer while joining | revocation list (PEM CRL and serial numbers) and, when renewed, the server certificate |
-| `POST /internal/v1/peers` | leader, or any peer while joining | the peer directory (server id and internal address of every server) |
-| `POST /internal/v1/globals/apply` | leader, or any peer while joining | create roles (with password verifiers, never passwords) and databases with their extensions |
-| `POST /internal/v1/node/finish` | leader, or any peer while joining | the server becomes clustered and its setup token is removed |
-| `POST /internal/v1/node/reset` | leader | delete the instance, certificates and key; the server is uninitialized again with a new setup token |
-| `POST /internal/v1/apply` | leader | one cluster-wide operation from a closed set (create or drop a database, network rules, role sync and drop, grant, `role.changed`: end the sessions of a changed role and forget cached role checks) with structured parameters |
 <!-- SPDX-License-Identifier: PostgreSQL -->
 # The internal API of kingresd
 
@@ -40,9 +20,18 @@ version; a server refuses a peer that speaks another version.
 - A client certificate is accepted only if it is signed by the cluster CA, is
   within its validity, is usable as a client certificate and its serial number is
   not on the revocation list. The common name of the certificate is the caller's
-  server id.
+  server id. The check is made at every request, not only at the handshake: a
+  connection that was opened with a certificate that has expired since is refused
+  (`certificate_refused`), which is why a server closes its idle connections to the
+  others when it has installed a renewed certificate.
 - Every certificate is an ECDSA P-256 certificate whose key was generated by the
-  server that uses it; the CA only ever sees certificate requests.
+  server that uses it; the CA only ever sees certificate requests. A renewed
+  certificate is made for the key the server already holds (see "Certificate
+  renewal").
+- A server that calls a server whose certificate is revoked refuses to connect (the
+  revocation list is checked against the peer's certificate too), except for the
+  two calls that must still reach a cut-off server: the revocation list
+  (`POST /pki/install`) and `POST /node/reset`.
 
 ## Versioning
 
@@ -54,7 +43,7 @@ version 1, the caller \"2\"."}` when the number is missing or different.
 
 | Call | Policy | Meaning |
 |---|---|---|
-| `GET /internal/v1/state` | any peer | server id, node state, versions, uptime |
+| `GET /internal/v1/state` | any peer | server id, node state, versions (kingresd, internal protocol, the PostgreSQL version and the version of each KingresDB extension its instance offers, for the leader's check `versionMismatch`), uptime |
 | `GET /internal/v1/leader` | any peer | the server id this server believes to be the manager leader |
 | `GET /internal/v1/revoked` | any peer | revoked certificate serial numbers (hex) |
 | `GET /internal/v1/resources` | leader | CPU, memory and disks of the server |
@@ -62,6 +51,28 @@ version 1, the caller \"2\"."}` when the number is missing or different.
 | `GET /internal/v1/metrics` | leader | latest metric samples |
 | `POST /internal/v1/exec` | leader | one statement on a local database through the local socket |
 | `POST /internal/v1/forward` | any peer, answered only by the leader | one operation of the public contract, run as the identity the forwarding server verified |
+| `POST /internal/v1/gather` | any peer | this server's part of a cluster-wide read (`listLogs`, `listAlerts`, `queryMetrics`) or the acknowledgement of an alert it holds, run as the identity the asking server vouches for; see "Cluster-wide reads" |
+| `POST /internal/v1/pki/renew` | any peer, answered only by the leader | the caller asks the CA holder for a new certificate for itself; see "Certificate renewal" |
+| `GET /internal/v1/pki/csr` | leader | a certificate request for this server's names, made from its key |
+| `POST /internal/v1/leave-cluster` | any peer, answered only by the leader | a server asks to leave the cluster. The body is `{"actor": "<administrator>", "force": false}` and names no server: the server that leaves is the one named by the caller's certificate, so a server cannot ask for another's removal. The leader decides (404, 422 dead, 409 `last_server`, `server_hosts_map_group`, `server_owns_buckets`, `rebalance_in_progress`, `operation_in_progress`), starts the task `server.leave` and answers with it |
+| `POST /internal/v1/leave-status` | any peer, answered only by the leader | the state of the leave task whose subject is the caller (`{"taskId": n}`; a task of another server, of another kind or none is 404); the leaving server resets itself when it is done |
+| `POST /internal/v1/task/record` | any peer, answered only by the leader | a server records the task of one of its instance operations (`instance.start`, `instance.stop`, `instance.restart`, subject type `instance`, a numeric instance id, state `running`, `done` or `failed`, one to four steps, at most 1,024 bytes of input). With `id` the task is written under that id (a reserved or announced one; writing the same id again changes nothing), without it the leader assigns one. The answer is `{"id": n}`; `409 subject_busy` when the instance already has an unfinished task, `400` for anything outside these limits, `503 unavailable` when the leader cannot write it |
+| `POST /internal/v1/task/settle` | any peer, answered only by the leader | the end of a recorded task of those kinds (`id` required): state, steps, percent and error; a task of another kind is `400` |
+| `POST /internal/v1/task/reserve` | any peer, answered only by the leader | takes the next id of the task sequence for a task recorded later (the start that follows a stop); answer `{"id": n}` |
+| `POST /internal/v1/bootstrap/prepare` | setup token (no certificate) | the uninitialized server returns a certificate request for its own key |
+| `POST /internal/v1/bootstrap/install` | setup token (no certificate) | the uninitialized server stores its certificate and the CA certificate |
+| `POST /internal/v1/bootstrap/join` | administrator credentials (no certificate) | a joining server asks to be added; the credentials are checked here and go no further |
+| `POST /internal/v1/add-server` | any peer, answered only by the leader | the server that checked an administrator hands a join to the leader |
+| `GET /internal/v1/instance/status` | leader, or any peer while this server is joining | whether the instance exists and runs |
+| `POST /internal/v1/instance/create` | leader, or any peer while joining | create, configure and start the instance for the cluster's settings and managed rules |
+| `POST /internal/v1/instance/start`, `/stop`, `/remove` | leader | start or stop the instance; stop and delete it and its credentials |
+| `POST /internal/v1/instance/trust` | leader, or any peer while joining | the servers to trust (certificate rules and map), the managed network rules, TLS settings; reload |
+| `POST /internal/v1/pki/install` | leader, or any peer while joining | revocation list (PEM CRL and serial numbers) and, when renewed, the server certificate |
+| `POST /internal/v1/peers` | leader, or any peer while joining | the peer directory (server id, internal address and ordinal of every server) |
+| `POST /internal/v1/globals/apply` | leader, or any peer while joining | create roles (with password verifiers, never passwords) and databases with their extensions |
+| `POST /internal/v1/node/finish` | leader, or any peer while joining | the server becomes clustered and its setup token is removed |
+| `POST /internal/v1/node/reset` | leader | delete the instance, certificates and key; the server is uninitialized again with a new setup token |
+| `POST /internal/v1/apply` | leader | one cluster-wide operation from a closed set (create or drop a database, network rules, role sync and drop, grant, `role.changed`: end the sessions of a changed role and forget cached role checks) with structured parameters |
 
 "Leader" means the caller's certificate names the server that holds the primary of
 shard group 0, read from the catalog; while that is unknown no leader-only call is
@@ -91,19 +102,76 @@ passed on).
 
 What the leader does with it: it looks the operation up by id (a path is never accepted), refuses an operation
 that is not leader-bound (sign-in and sign-out, setup, the operations on this very server, the query workbench,
-and reads other than listTasks, getTask, listAlerts, getClusterSettings, listServerGroups, listServers (a follower asks for it to take the groups, fingerprints and certificate expiry of the servers from the leader's system database; the public listServers is answered locally), listLedgerVerifications and getLedgerVerification; createInclusionProof is not forwarded either), requires the path parameters to be
+the acknowledgement of an alert (it goes to the server that holds the alert), and reads other than listTasks, getTask, getClusterSettings, listServerGroups, listServers (a follower asks for it to take the groups, fingerprints and certificate expiry of the servers from the leader's system database; the public listServers is answered locally), listLedgerVerifications and getLedgerVerification; createInclusionProof is not forwarded either), requires the path parameters to be
 exactly the operation's, rebuilds the URL from the contract's template with escaped values, checks the identity
 (user name, only the four cluster roles), and runs the request through the same pipeline as a public one: query
 validation, the role the operation requires (so a server cannot raise an identity's privileges beyond what it
 claims; the leader also derives the claimed role's cluster roles itself, from its own catalog, and refuses an identity that is dropped, cannot log in, is expired or does not hold the claimed roles (CP-07), and refuses a forwarding server that is not in its peer directory; apart from that every server is fully trusted by every other), the handler and the audit.
 The audit event is written by the leader, once, with the details `forwardedBy` (the server id in the caller's
-certificate) and `originRequestId`; the forwarding server writes none, unless the leader could not be reached
-(then it answers 503 and audits the failure itself). The leader makes the role connectable for its own
-connections (the same step as a sign-in) because the forwarding server verified the password.
+certificate) and `originRequestId` (a handler that sets details of its own does not drop them); the forwarding
+server writes none, unless the leader could not be reached (then it answers 503 and audits the failure itself).
+The leader makes the role connectable for its own connections (the same step as a sign-in) because the
+forwarding server verified the password.
+
+## Cluster-wide reads (gather)
+
+`listLogs`, `listAlerts` and `queryMetrics` answer for the whole cluster from any server. The server that
+receives the request authenticates the caller and checks the role as for any request, then sends every other
+server of the cluster the same query with `POST /internal/v1/gather`, in parallel, each call with its own
+deadline (setting `gather-timeout`, default 3 s). The body is the one of `forward` with one more member,
+`ordinal` (the ordinal of the server that is asked, used for the ids of its alerts); `operationId` is one of
+`listLogs`, `listAlerts`, `queryMetrics` and `acknowledgeAlert`, `query` the caller's query string.
+
+The answering server runs the operation through the same pipeline as a public request, with the identity the
+asking server vouches for: **the role is derived again from the answering server's own catalog** (the check of
+CP-07), so the caller needs the required cluster role on every server that answers a part, and a server that no
+longer accepts the role (it was dropped or disabled there) answers `refused`. It answers its own part only, in a
+form the merging server can order without ambiguity: log entries with their rank among the entries of the same
+second, alerts with cluster-wide ids, metric series as the per-server resampled points; at most one more entry
+than the page needs, at most 16 MiB in all.
+
+The receiving server merges what came back with its own part. What a server answers is not trusted: entries are
+about that server only (its id replaces whatever the answer says), text is cut and cleaned of control characters
+(`peerclient.CleanText`), an alert id must carry the ordinal of the answering server, series must have exactly the
+points that were asked for. A server that did not answer within its deadline, could not be reached, refused, or
+answered something invalid is named in the response (`partial: true`, `missingServers[]` with `reason` `timeout`,
+`unreachable`, `refused` or `invalidAnswer`); the others still answer. The cursors are keyset cursors over one
+total order (logs: time, server id, rank; alerts: time raised, id), so a page boundary is the same whichever
+servers answered; a cursor of a previous revision is refused with 400.
+
+An alert's id is `ordinal << 32 | local id`: the ordinal is the number the leader gave the server when it joined
+(`kingres_cp.server.ordinal`, sent to every server in the peer directory, `peers.json`). The id is unique in the
+cluster, below 2^53 (what a browser holds in a JSON number), and tells the receiving server which server holds
+the alert, so `acknowledgeAlert` goes straight to it (it audits the acknowledgement, once).
+
+## Certificate renewal
+
+Every server renews its own certificate (the server certificate and the client certificate are one certificate)
+before it expires: when less than a configurable part of its lifetime is left (`certificate-renew-fraction`,
+default a third) its renewal job (`internal/membership/certjob.go`; looks every `certificate-check-interval`,
+retries after `certificate-retry-interval` with a doubling pause) sends `POST /internal/v1/pki/renew` to the
+manager leader, which holds the CA key. The body is `{"csr": "<PEM request>"}`; the request must be made from
+the key the server was admitted with and name only that server (the common name of the caller's certificate): a
+server renews itself and nobody else. The answer is the new certificate, the CA certificate and the current
+revocation list. An administrator can renew a server at once (`renewServerCertificates`): the leader asks the
+server for a request (`GET /pki/csr`), signs it and sends the certificate with `POST /pki/install`.
+
+- A leader that does not hold the CA key answers `503` with the code `ca_unavailable`; the job counts it as a
+  failure. After three failures in a row the job raises the alert `certificateRenewalFailed` on its own server and
+  audits the failure (`certificateRenewalFailed`, once per streak, and its end).
+- A revoked server is refused by the transport (`certificate_refused`) before the call is read; if the record says
+  `revoked` the leader answers `409 certificate_revoked`.
+- The old certificate stays valid until it expires (it carries the same key); `revokeServerCertificates` revokes
+  every certificate that was issued to the server and has not expired.
+- Installing the certificate rewrites `server.crt` and reloads the instance (PostgreSQL re-reads `ssl_cert_file`,
+  `ssl_ca_file` and `ssl_crl_file` on reload); the internal API listener, the connections of the sharding
+  extension (`kingres_shard.node_conninfo` names the files) and the connections of kingresd read the files at every
+  handshake. Nothing is restarted and open connections continue. The server then closes its idle connections to the
+  other servers.
 
 ## Errors
 
 JSON `{"error": "<code>", "message": "..."}`. Codes: `no_certificate`,
 `certificate_refused` (401), `version_mismatch` (409), `not_leader` (403),
-`not_found` (404), `bad_request` (400), `statement_failed` (422), `failed` (500).
-
+`not_found` (404), `bad_request` (400), `statement_failed` (422), `ca_unavailable` (503: the leader does not hold
+the CA key), `certificate_revoked` (409), `failed` (500).

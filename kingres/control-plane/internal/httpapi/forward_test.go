@@ -8,9 +8,11 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/auth"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/contract"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
 )
 
 // direct is a Forwarder whose "leader" is another Server in the same process:
@@ -165,10 +167,65 @@ func TestForwardedOperationClassification(t *testing.T) {
 		}
 	}
 	for _, id := range []string{"login", "logout", "initCluster", "joinCluster", "checkSetupToken", "executeQuery", "createInclusionProof",
-		"restartThisServerInstance", "startThisServerInstance", "stopThisServerInstance", "updateThisServerSettings", "leaveCluster"} {
+		"restartThisServerInstance", "startThisServerInstance", "stopThisServerInstance", "updateThisServerSettings", "leaveCluster", "acknowledgeAlert"} {
 		delete(local, id)
 	}
 	if len(local) != 0 {
 		t.Errorf("mutating operations that are not forwarded and not listed as local: %v", local)
 	}
+}
+
+type fakeMembers struct{}
+
+func (fakeMembers) AddServer(_ context.Context, actor string, _ api.AddServerRequest, _ string) (task.Task, error) {
+	return task.Task{ID: 7, Kind: "server.add", State: task.Pending, CreatedBy: actor}, nil
+}
+
+func (fakeMembers) RemoveServer(_ context.Context, actor, _ string) (task.Task, error) {
+	return task.Task{ID: 8, Kind: "server.remove", State: task.Pending, CreatedBy: actor}, nil
+}
+
+// A handler that sets its own audit details must not drop the facts of a
+// forwarded request: the audit event keeps forwardedBy and originRequestId
+// whatever the handler assigns to c.details.
+func TestForwardedAuditKeepsForwardedByWhenTheHandlerSetsDetails(t *testing.T) {
+	fw := &direct{leader: "leader-1"}
+	leader := newEnv(t, func(d *Deps) { d.Members = fakeMembers{} })
+	leader.initialize()
+	fw.target = leader.srv
+	leader.testUser([]string{auth.RoleAdmin})
+	follower := newEnv(t, func(d *Deps) { d.Forwarder = fw })
+	follower.initialize()
+	body := map[string]any{"address": "db9.example.com:8091", "setupToken": "tok"}
+	w := follower.do(req{method: "POST", path: "/api/v1/servers", bearer: follower.token(auth.RoleAdmin), body: body})
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("addServer through the follower: %d %s", w.Code, w.Body.String())
+	}
+	var found int
+	for _, ev := range leader.audit.Events() {
+		if ev.Action != "addServer" {
+			continue
+		}
+		found++
+		if ev.Details["forwardedBy"] != "follower-1" {
+			t.Errorf("forwardedBy lost: %+v", ev.Details)
+		}
+		if ev.Details["originRequestId"] == nil || ev.Details["originRequestId"] == "" {
+			t.Errorf("originRequestId lost: %+v", ev.Details)
+		}
+		if ev.Details["address"] != "db9.example.com:8091" {
+			t.Errorf("the handler's own details were lost: %+v", ev.Details)
+		}
+	}
+	if found != 1 {
+		t.Errorf("%d addServer events on the leader", found)
+	}
+}
+
+func (fakeMembers) RenewServerCertificates(_ context.Context, actor, _ string) (task.Task, error) {
+	return task.Task{ID: 9, Kind: "certificate.renew", State: task.Pending, CreatedBy: actor}, nil
+}
+
+func (fakeMembers) RevokeServerCertificates(_ context.Context, actor, _ string) (task.Task, error) {
+	return task.Task{ID: 10, Kind: "certificate.revoke", State: task.Pending, CreatedBy: actor}, nil
 }

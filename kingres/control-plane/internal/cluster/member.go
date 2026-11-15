@@ -436,6 +436,11 @@ func (s *Service) FinishMember(clusterID, clusterName string) error {
 	if err := s.setup.Transition(setup.Clustered, clusterID, clusterName, &host); err != nil {
 		return err
 	}
+	mctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := s.MigrateSystem(mctx); err != nil {
+		s.log.Error("preparing the system database of the new member", "error", err)
+	}
 	s.publishDSN()
 	return nil
 }

@@ -205,6 +205,9 @@ type Server struct {
 	// CertificateExpiresAt is the notAfter of the server certificate the
 	// cluster issued to the server; null when it has not been read.
 	CertificateExpiresAt *Time `json:"certificateExpiresAt"`
+	// CertificateRevokedAt is when the certificates of the server were revoked
+	// (contract 0.5.0, optional: absent for a server whose are not).
+	CertificateRevokedAt *Time `json:"certificateRevokedAt,omitempty"`
 	// SeenFingerprint is the SHA-256 fingerprint (64 lower-case hex digits) of
 	// the bootstrap certificate recorded on first contact; null when none was.
 	SeenFingerprint *string `json:"seenFingerprint"`

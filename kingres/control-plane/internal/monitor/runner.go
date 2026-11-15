@@ -4,6 +4,7 @@ package monitor
 
 import (
 	"context"
+	"crypto/x509"
 	"log/slog"
 	"strings"
 	"time"
@@ -31,6 +32,18 @@ type Runner struct {
 	Log      *slog.Logger
 	// System is the system database name (alerts live there).
 	System string
+	// Cert reads this server's certificate (nil: not checked); CA returns the
+	// certificate of the CA this server holds (nil: none); RenewFraction is the
+	// part of its lifetime at which the certificate is renewed.
+	Cert          func() (*x509.Certificate, error)
+	CA            func() *x509.Certificate
+	RenewFraction float64
+	// LedgerPendingMaxAge overrides the age of the oldest pending ledger
+	// transaction that raises ledgerPendingTooOld (0: LedgerPendingMaxAge).
+	LedgerPendingMaxAge time.Duration
+
+	tracker *PendingTracker
+	round   int
 
 	downSince time.Time
 	lastXact  map[string]float64
@@ -97,7 +110,15 @@ func (r *Runner) Once(ctx context.Context, now time.Time) {
 		r.downSince = time.Time{}
 	}
 	r.sample(ctx, c, now, &rd)
+	r.certificates(now, &rd)
+	if r.round%3 == 0 {
+		r.ledger(ctx, c, now, &rd)
+	}
+	r.round++
 	conds, evaluated := Evaluate(rd)
+	if !rd.LedgerChecked {
+		delete(evaluated, "ledgerPendingTooOld")
+	}
 	if err := Reconcile(ctx, c, r.Host, conds, evaluated, now); err != nil {
 		r.Log.Warn("updating alerts", "error", err)
 	}

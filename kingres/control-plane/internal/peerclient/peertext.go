@@ -30,3 +30,9 @@ func peerText(s string, max int) string {
 	}
 	return s + "..."
 }
+
+// CleanText is peerText for the text of an answer that goes into a response of
+// this server (a log message, an alert message): control characters become
+// U+FFFD and the text is cut at max bytes. Every string that comes from another
+// server and reaches a client passes through it.
+func CleanText(s string, max int) string { return peerText(s, max) }

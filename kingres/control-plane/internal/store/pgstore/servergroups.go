@@ -5,6 +5,7 @@ package pgstore
 import (
 	"context"
 	"sort"
+	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pki"
@@ -24,6 +25,7 @@ type serverRecord struct {
 	seen    string
 	pinned  bool
 	certPEM string
+	revoked *time.Time
 }
 
 // loadRecords reads kingres_cp.server; ok is false when the schema is absent.
@@ -35,7 +37,7 @@ func (s *Store) loadRecords(ctx context.Context) (rec map[string]serverRecord, o
 	if ok, err = s.regclassExists(ctx, p, "kingres_cp.server"); err != nil || !ok {
 		return nil, false, err
 	}
-	rows, err := p.Query(ctx, `SELECT server_id, server_group, coalesce(seen_fingerprint, ''), fingerprint_pinned, coalesce(certificate_pem, '')
+	rows, err := p.Query(ctx, `SELECT server_id, server_group, coalesce(seen_fingerprint, ''), fingerprint_pinned, coalesce(certificate_pem, ''), certificate_revoked_at
 		FROM kingres_cp.server`)
 	if err != nil {
 		return nil, false, s.wrap("reading kingres_cp.server", err)
@@ -45,7 +47,7 @@ func (s *Store) loadRecords(ctx context.Context) (rec map[string]serverRecord, o
 	for rows.Next() {
 		var id string
 		var r serverRecord
-		if err := rows.Scan(&id, &r.group, &r.seen, &r.pinned, &r.certPEM); err != nil {
+		if err := rows.Scan(&id, &r.group, &r.seen, &r.pinned, &r.certPEM, &r.revoked); err != nil {
 			return nil, false, s.wrap("scanning kingres_cp.server", err)
 		}
 		rec[id] = r
@@ -77,6 +79,10 @@ func (s *Store) applyRecords(ctx context.Context, servers []api.Server) {
 		if fp := pki.NormalizeFingerprint(r.seen); fp != "" {
 			servers[i].SeenFingerprint = &fp
 			servers[i].FingerprintPinned = r.pinned
+		}
+		if r.revoked != nil {
+			t := r.revoked.UTC()
+			servers[i].CertificateRevokedAt = &t
 		}
 		if r.certPEM != "" {
 			if c, err := pki.ParseCertPEM([]byte(r.certPEM)); err == nil {

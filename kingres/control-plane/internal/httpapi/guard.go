@@ -238,7 +238,6 @@ func (s *Server) checkSession(c *call, r *http.Request) *problem.Problem {
 		sess.ClusterRoles = cur
 		c.session = &sess
 		c.audit = contract.IsAuditAction(c.op.ID)
-		c.details = map[string]any{"forwardedBy": f.peer, "originRequestId": f.requestID}
 		if f.sourceAddress != "" {
 			c.ip = f.sourceAddress
 		}
@@ -348,6 +347,12 @@ func (s *Server) recordAudit(c *call, r *http.Request, status int) {
 	}
 	for k, v := range c.details {
 		ev.Details[k] = v
+	}
+	// The facts of a forwarded request are added here, after whatever the
+	// handler put into c.details, so that no handler can drop them.
+	if f := forwardedOf(r); f != nil {
+		ev.Details["forwardedBy"] = f.peer
+		ev.Details["originRequestId"] = f.requestID
 	}
 	ev.ResourceType, ev.ResourceID = resourceOf(c.op, r)
 	s.appendAudit(r, ev, c.op.ID)

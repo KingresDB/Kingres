@@ -68,6 +68,16 @@ type LogEntry struct {
 type LogPage struct {
 	Items      []LogEntry `json:"items"`
 	NextCursor *string    `json:"nextCursor"`
+	// Partial and MissingServers (contract 0.5.0): the servers that did not answer.
+	Partial        bool            `json:"partial"`
+	MissingServers []MissingServer `json:"missingServers,omitempty"`
+}
+
+// MissingServer is a server that did not take part in a cluster-wide answer.
+type MissingServer struct {
+	ServerID string `json:"serverId"`
+	// Reason is timeout, unreachable, refused or invalidAnswer.
+	Reason string `json:"reason"`
 }
 
 // Alert is an alert of the health checks.
@@ -88,8 +98,10 @@ type Alert struct {
 
 // AlertPage is a page of alerts.
 type AlertPage struct {
-	Items      []Alert `json:"items"`
-	NextCursor *string `json:"nextCursor"`
+	Items          []Alert         `json:"items"`
+	NextCursor     *string         `json:"nextCursor"`
+	Partial        bool            `json:"partial"`
+	MissingServers []MissingServer `json:"missingServers,omitempty"`
 }
 
 // MetricPoint is one value; null means not available.
@@ -106,10 +118,12 @@ type MetricSeries struct {
 
 // MetricQueryResult is the response of GET /metrics/query.
 type MetricQueryResult struct {
-	Metric string         `json:"metric"`
-	Unit   string         `json:"unit"`
-	From   Time           `json:"from"`
-	To     Time           `json:"to"`
-	Step   int            `json:"step"`
-	Series []MetricSeries `json:"series"`
+	Metric         string          `json:"metric"`
+	Unit           string          `json:"unit"`
+	From           Time            `json:"from"`
+	To             Time            `json:"to"`
+	Step           int             `json:"step"`
+	Series         []MetricSeries  `json:"series"`
+	Partial        bool            `json:"partial"`
+	MissingServers []MissingServer `json:"missingServers,omitempty"`
 }

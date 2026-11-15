@@ -20,7 +20,7 @@ func (s *Server) createInclusionProof(c *call, w http.ResponseWriter, r *http.Re
 		return p
 	}
 	var req api.InclusionProofRequest
-	if err := s.body(w, r, &req); err != nil {
+	if err := s.bodyClosed(w, r, &req); err != nil {
 		return err
 	}
 	proof, err := o.CreateInclusionProof(r.Context(), c.session.Username, db, req)

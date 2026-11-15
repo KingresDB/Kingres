@@ -197,3 +197,54 @@ func TestFingerprint(t *testing.T) {
 		t.Errorf("fingerprint %q", fp)
 	}
 }
+
+// A CA with a short certificate lifetime (tests, and operators who want it)
+// issues certificates of exactly that lifetime, with a back-dating that is a
+// small part of it, and the renewal threshold follows the configured part.
+func TestShortLifetimeAndRenewalFraction(t *testing.T) {
+	ca := newCA(t)
+	ca.SetServerLifetime(20 * time.Second)
+	n := Names{CommonName: "host1"}
+	_, csr, _ := NewKeyAndCSR(n)
+	pemb, _, err := ca.Sign(csr, n, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := parse(t, pemb)
+	if got := c.NotAfter.Sub(t0); got != 20*time.Second {
+		t.Errorf("notAfter - now = %v, want 20s", got)
+	}
+	if back := t0.Sub(c.NotBefore); back <= 0 || back > 3*time.Second {
+		t.Errorf("back-dating %v is not a small part of a 20 s lifetime", back)
+	}
+	if _, err := ca.VerifyPeer(c, t0.Add(time.Second)); err != nil {
+		t.Errorf("a young certificate was refused: %v", err)
+	}
+	if _, err := ca.VerifyPeer(c, t0.Add(21*time.Second)); err == nil {
+		t.Error("an expired certificate was accepted")
+	}
+	life := c.NotAfter.Sub(c.NotBefore)
+	if NeedsRenewalAt(c, t0, 0.25) || !NeedsRenewalAt(c, c.NotAfter.Add(-life/5), 0.25) {
+		t.Error("the renewal threshold does not follow the fraction")
+	}
+	if NeedsRenewalAt(c, c.NotAfter.Add(-life/3), 0.2) || !NeedsRenewalAt(c, c.NotAfter.Add(-life/3), 0.5) {
+		t.Error("a larger fraction must ask earlier")
+	}
+	if NeedsRenewalAt(c, t0, 0) || !NeedsRenewalAt(c, c.NotAfter.Add(time.Second), 0.0001) {
+		t.Error("an expired certificate always needs renewal; a zero fraction never asks before expiry")
+	}
+}
+
+func TestRemainingFraction(t *testing.T) {
+	ca := newCA(t)
+	n := Names{CommonName: "host1"}
+	_, csr, _ := NewKeyAndCSR(n)
+	pemb, _, _ := ca.Sign(csr, n, t0)
+	c := parse(t, pemb)
+	if r := RemainingFraction(c, c.NotBefore); r < 0.99 || r > 1.01 {
+		t.Errorf("fraction at notBefore = %v", r)
+	}
+	if r := RemainingFraction(c, c.NotAfter.Add(time.Hour)); r != 0 {
+		t.Errorf("fraction after expiry = %v", r)
+	}
+}

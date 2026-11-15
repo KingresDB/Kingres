@@ -45,7 +45,7 @@ type Forwarder interface {
 // runs (the system database's task, alert and settings tables), so that they
 // are answered by the leader too.
 var leaderBoundReads = map[string]bool{
-	"listTasks": true, "getTask": true, "listAlerts": true, "getClusterSettings": true,
+	"listTasks": true, "getTask": true, "getClusterSettings": true,
 	// The groups are state of the leader's system database (see completeServers).
 	"listServerGroups": true,
 	// The verification records get their identifiers in the system database
@@ -71,7 +71,8 @@ func forwardsToLeader(op contract.Operation) bool {
 	}
 	// createInclusionProof is a POST that changes nothing: it reads the row as
 	// the signed-in role, like the query workbench, wherever the user is.
-	return op.ID != "executeQuery" && op.ID != "createInclusionProof"
+	// acknowledgeAlert goes to the server that holds the alert (the ordinal in its id).
+	return op.ID != "executeQuery" && op.ID != "createInclusionProof" && op.ID != "acknowledgeAlert"
 }
 
 type fwdKey struct{}
@@ -158,49 +159,69 @@ var relayedHeaders = map[string]bool{
 // leader (the internal API only calls it there). peer is the verified server
 // id of the forwarding server.
 func (s *Server) ServeForwarded(ctx context.Context, peer string, fr internalapi.ForwardRequest) (internalapi.ForwardResponse, error) {
-	var op contract.Operation
-	found := false
-	for _, o := range contract.Operations() {
-		if o.ID == fr.OperationID {
-			op, found = o, true
-			break
-		}
-	}
+	op, found := operationByID(fr.OperationID)
 	if !found || !(forwardsToLeader(op) || forwardedReads[op.ID]) {
 		return internalapi.ForwardResponse{}, fmt.Errorf("operation %q is not forwarded", fr.OperationID)
 	}
 	if err := validateIdentity(fr.Identity); err != nil {
 		return internalapi.ForwardResponse{}, err
 	}
+	req, err := s.operationRequest(ctx, peer, fr, op)
+	if err != nil {
+		return internalapi.ForwardResponse{}, err
+	}
+	if s.deps.Proxy != nil {
+		// The forwarding server verified the password; the leader makes the
+		// role connectable for its own connections as that role.
+		if err := s.deps.Proxy.Allow(ctx, fr.Identity.Username); err != nil {
+			return internalapi.ForwardResponse{}, fmt.Errorf("making the role connectable: %w", err)
+		}
+	}
+	return s.serveRequest(req, maxForwardedResponse), nil
+}
+
+func operationByID(id string) (contract.Operation, bool) {
+	for _, o := range contract.Operations() {
+		if o.ID == id {
+			return o, true
+		}
+	}
+	return contract.Operation{}, false
+}
+
+// operationRequest builds the request that carries a forwarded or gathered
+// operation through the pipeline: the path from the contract's template, the
+// verified identity in the context.
+func (s *Server) operationRequest(ctx context.Context, peer string, fr internalapi.ForwardRequest, op contract.Operation) (*http.Request, error) {
 	path := contract.BasePath + op.Path
 	if len(fr.PathParams) != len(op.PathParams) {
-		return internalapi.ForwardResponse{}, errors.New("path parameters do not match the operation")
+		return nil, errors.New("path parameters do not match the operation")
 	}
 	for _, p := range op.PathParams {
 		v, ok := fr.PathParams[p]
 		if !ok || v == "" || len(v) > 512 {
-			return internalapi.ForwardResponse{}, fmt.Errorf("path parameter %q is missing or too long", p)
+			return nil, fmt.Errorf("path parameter %q is missing or too long", p)
 		}
 		path = strings.Replace(path, "{"+p+"}", url.PathEscape(v), 1)
 	}
 	if len(fr.Query) > 4096 || strings.ContainsAny(fr.Query, "\r\n") {
-		return internalapi.ForwardResponse{}, errors.New("the query string is not valid")
+		return nil, errors.New("the query string is not valid")
 	}
 	if _, qerr := url.ParseQuery(fr.Query); qerr != nil {
-		return internalapi.ForwardResponse{}, errors.New("the query string is not valid")
+		return nil, errors.New("the query string is not valid")
 	}
 	// The URL is assembled as a structure, never by concatenation: the path
 	// is already escaped per segment, the query is only a query.
 	unescaped, uerr := url.PathUnescape(path)
 	if uerr != nil {
-		return internalapi.ForwardResponse{}, errors.New("the path is not valid")
+		return nil, errors.New("the path is not valid")
 	}
 	target := (&url.URL{Scheme: "http", Host: "leader.internal", Path: unescaped, RawPath: path, RawQuery: fr.Query}).String()
 	req, err := http.NewRequestWithContext(context.WithValue(ctx, fwdKey{}, &forwarded{
 		peer: peer, identity: fr.Identity, requestID: fr.RequestID, sourceAddress: fr.SourceAddress, source: fr.Source, pin: pinText(fr.Pin),
 	}), op.Method, target, bytes.NewReader(fr.Body))
 	if err != nil {
-		return internalapi.ForwardResponse{}, fmt.Errorf("building the request: %w", err)
+		return nil, fmt.Errorf("building the request: %w", err)
 	}
 	if len(fr.Body) > 0 {
 		req.Header.Set("Content-Type", "application/json")
@@ -212,14 +233,13 @@ func (s *Server) ServeForwarded(ctx context.Context, peer string, fr internalapi
 		req.Header.Set("X-Request-Id", fr.RequestID)
 	}
 	req.RemoteAddr = "forwarded:0"
-	if s.deps.Proxy != nil {
-		// The forwarding server verified the password; the leader makes the
-		// role connectable for its own connections as that role.
-		if err := s.deps.Proxy.Allow(ctx, fr.Identity.Username); err != nil {
-			return internalapi.ForwardResponse{}, fmt.Errorf("making the role connectable: %w", err)
-		}
-	}
-	rec := &bufferedResponse{header: http.Header{}, status: http.StatusOK}
+	return req, nil
+}
+
+// serveRequest runs a request built by operationRequest through the whole
+// pipeline and returns what it answered, at most max bytes of body.
+func (s *Server) serveRequest(req *http.Request, max int) internalapi.ForwardResponse {
+	rec := &bufferedResponse{header: http.Header{}, status: http.StatusOK, max: max}
 	s.handler.ServeHTTP(rec, req)
 	out := internalapi.ForwardResponse{Status: rec.status, Body: rec.body.Bytes(), Header: map[string]string{}}
 	for k := range relayedHeaders {
@@ -227,7 +247,7 @@ func (s *Server) ServeForwarded(ctx context.Context, peer string, fr internalapi
 			out.Header[k] = v
 		}
 	}
-	return out, nil
+	return out
 }
 
 func validateIdentity(id internalapi.ForwardIdentity) error {
@@ -256,12 +276,18 @@ type bufferedResponse struct {
 	header http.Header
 	status int
 	body   bytes.Buffer
+	// max bounds the body (0: maxForwardedResponse).
+	max int
 }
 
 func (b *bufferedResponse) Header() http.Header  { return b.header }
 func (b *bufferedResponse) WriteHeader(code int) { b.status = code }
 func (b *bufferedResponse) Write(p []byte) (int, error) {
-	if b.body.Len()+len(p) > maxForwardedResponse {
+	limit := b.max
+	if limit == 0 {
+		limit = maxForwardedResponse
+	}
+	if b.body.Len()+len(p) > limit {
 		return 0, errors.New("the answer is too large to forward")
 	}
 	return b.body.Write(p)

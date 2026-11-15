@@ -50,6 +50,9 @@ type Manager struct {
 	Audit func(ctx context.Context, ev audit.Event)
 	// SelfPeer is this server's entry of the peer directory.
 	SelfPeer peers.Peer
+	// OnCertificateInstalled is called after this server stored a renewed
+	// certificate: the connections opened with the old one are closed.
+	OnCertificateInstalled func()
 }
 
 func (m *Manager) log() *slog.Logger {
@@ -148,6 +151,11 @@ func (m *Manager) introduce(ctx context.Context, in introduction) (string, error
 				seen_fingerprint = EXCLUDED.seen_fingerprint, fingerprint_pinned = EXCLUDED.fingerprint_pinned, registering = false`,
 			in.ServerID, in.InternalAddress, in.PGPort, serial, string(crt), pub, in.Seen, in.Pinned)
 		if err == nil {
+			if parsed, perr := pki.ParseCertPEM(crt); perr == nil {
+				_, err = tx.Exec(ctx, `INSERT INTO kingres_cp.certificate (serial, server_id, not_after) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, serial, in.ServerID, parsed.NotAfter)
+			}
+		}
+		if err == nil {
 			err = tx.Commit(ctx)
 		}
 		if err != nil {
@@ -199,6 +207,9 @@ func (m *Manager) audit(ctx context.Context, actor, action, resource, outcome st
 // starts the task. pin is the expected SHA-256 fingerprint of the new
 // server's bootstrap certificate (hex) or "" for trust on first use.
 func (m *Manager) AddServer(ctx context.Context, actor string, req api.AddServerRequest, pin string) (task.Task, error) {
+	if _, err := m.ca(); err != nil {
+		return task.Task{}, err
+	}
 	var errs []problem.FieldError
 	internal, aerr := cluster.InternalAddressOf(req.Address)
 	if aerr != nil {
@@ -301,6 +312,9 @@ func hostMatches(ctx context.Context, dialed, id string) bool {
 // (design D4 step 1, joining): the leader introduces the new server and starts
 // the task.
 func (m *Manager) JoinFromPeer(ctx context.Context, req wire.AddServerRequest) (wire.JoinResponse, error) {
+	if _, err := m.ca(); err != nil {
+		return wire.JoinResponse{}, err
+	}
 	if req.ServerGroup != nil {
 		return wire.JoinResponse{}, problem.New(problem.Unprocessable, "Server groups are not supported yet.")
 	}
@@ -442,6 +456,12 @@ func (m *Manager) waitUnreachable(ctx context.Context, env *task.Env, server, do
 // do calls a leader-to-server internal call on server.
 func (m *Manager) do(ctx context.Context, server, method, path string, in, out any) error {
 	return m.Client.Do(ctx, server, method, path, in, out)
+}
+
+// doUnchecked is do for a server whose certificates may be revoked (see
+// peerclient.DoUnchecked).
+func (m *Manager) doUnchecked(ctx context.Context, server, method, path string, in, out any) error {
+	return m.Client.DoUnchecked(ctx, server, method, path, in, out)
 }
 
 func (m *Manager) stepAddWait(ctx context.Context, env *task.Env) error {
@@ -687,7 +707,7 @@ func (m *Manager) distributePeers(ctx context.Context, env *task.Env, without st
 	}
 	list := make([]peers.Peer, len(infos))
 	for i, p := range infos {
-		list[i] = peers.Peer{ServerID: p.ServerID, InternalAddr: p.InternalAddress}
+		list[i] = peers.Peer{ServerID: p.ServerID, InternalAddr: p.InternalAddress, Ordinal: p.Ordinal}
 	}
 	if err := m.Peers.Replace(list); err != nil {
 		return err
@@ -729,7 +749,7 @@ func (m *Manager) distributeRevocations(ctx context.Context) error {
 			continue
 		}
 		req := wire.PKIRequest{CACert: string(ca.CertPEM()), Revoked: ca.Revoked(), CRL: string(crl)}
-		if err := m.do(ctx, p.ServerID, "POST", "/pki/install", req, nil); err != nil && first == nil {
+		if err := m.doUnchecked(ctx, p.ServerID, "POST", "/pki/install", req, nil); err != nil && first == nil {
 			first = fmt.Errorf("sending the revocation list to %s: %w", p.ServerID, err)
 		}
 	}

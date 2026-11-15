@@ -684,3 +684,138 @@ func TestIntegrationSystemDatabaseIsHiddenEverywhere(t *testing.T) {
 		t.Errorf("Grants without filters: %v", err)
 	}
 }
+
+// The listings of tables, roles and grants page with a keyset in SQL: a page
+// reads one row more than it returns, any number of pages give every row once in
+// order, and a cursor of the old kind is refused.
+func TestIntegrationKeysetPagingOfTablesRolesAndGrants(t *testing.T) {
+	s := newTestStore(t)
+	// Tables: every table of the fixture database page by page, of every size.
+	all, err := s.Tables(ctx(t), "kingres_cp", store.TableFilter{}, store.Page{Limit: 500})
+	if err != nil || all.NextCursor != nil || len(all.Items) < 4 {
+		t.Fatalf("all tables: %d %v", len(all.Items), err)
+	}
+	for size := 1; size <= 3; size++ {
+		var names []string
+		cursor := ""
+		for i := 0; i < 100; i++ {
+			pg, err := s.Tables(ctx(t), "kingres_cp", store.TableFilter{}, store.Page{Limit: size, Cursor: cursor})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, it := range pg.Items {
+				names = append(names, it.Schema+"."+it.Name)
+			}
+			if pg.NextCursor == nil {
+				break
+			}
+			if len(pg.Items) != size {
+				t.Fatalf("a page with a next page holds %d, want %d", len(pg.Items), size)
+			}
+			cursor = *pg.NextCursor
+		}
+		if len(names) != len(all.Items) {
+			t.Fatalf("page size %d: %d tables, want %d", size, len(names), len(all.Items))
+		}
+		for i, it := range all.Items {
+			if names[i] != it.Schema+"."+it.Name {
+				t.Errorf("page size %d: position %d is %s, want %s.%s", size, i, names[i], it.Schema, it.Name)
+			}
+		}
+	}
+	// The class filter works with the paging (it runs in the same query).
+	for _, class := range []string{"plain", "ledger", "distributed", "reference"} {
+		want := 0
+		for _, it := range all.Items {
+			for _, c := range it.Classes {
+				if c == class {
+					want++
+				}
+			}
+		}
+		got := 0
+		cursor := ""
+		for i := 0; i < 100; i++ {
+			pg, err := s.Tables(ctx(t), "kingres_cp", store.TableFilter{Class: class}, store.Page{Limit: 1, Cursor: cursor})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got += len(pg.Items)
+			if pg.NextCursor == nil {
+				break
+			}
+			cursor = *pg.NextCursor
+		}
+		if got != want {
+			t.Errorf("class %s: %d tables by page of 1, %d in the whole list", class, got, want)
+		}
+	}
+	// Roles.
+	roles, err := s.Roles(ctx(t), store.RoleFilter{Search: "cp_"}, store.Page{Limit: 100})
+	if err != nil || len(roles.Items) < 5 {
+		t.Fatalf("roles: %d %v", len(roles.Items), err)
+	}
+	var rn []string
+	cursor := ""
+	for i := 0; i < 100; i++ {
+		pg, err := s.Roles(ctx(t), store.RoleFilter{Search: "cp_"}, store.Page{Limit: 2, Cursor: cursor})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, r := range pg.Items {
+			rn = append(rn, r.Name)
+		}
+		if pg.NextCursor == nil {
+			break
+		}
+		cursor = *pg.NextCursor
+	}
+	if len(rn) != len(roles.Items) {
+		t.Fatalf("roles by page of 2: %v, want %d", rn, len(roles.Items))
+	}
+	for i := range rn {
+		if rn[i] != roles.Items[i].Name {
+			t.Errorf("role %d: %s, want %s", i, rn[i], roles.Items[i].Name)
+		}
+	}
+	// Grants, across the databases and the levels.
+	allG, err := s.Grants(ctx(t), store.GrantFilter{}, store.Page{Limit: 500})
+	if err != nil || len(allG.Items) < 4 {
+		t.Fatalf("grants: %d %v", len(allG.Items), err)
+	}
+	var gk []string
+	cursor = ""
+	for i := 0; i < 500; i++ {
+		pg, err := s.Grants(ctx(t), store.GrantFilter{}, store.Page{Limit: 3, Cursor: cursor})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, g := range pg.Items {
+			gk = append(gk, grantCursor(g))
+		}
+		if pg.NextCursor == nil {
+			break
+		}
+		cursor = *pg.NextCursor
+	}
+	if len(gk) != len(allG.Items) {
+		t.Fatalf("grants by page of 3: %d, want %d", len(gk), len(allG.Items))
+	}
+	for i := range gk {
+		if gk[i] != grantCursor(allG.Items[i]) {
+			t.Errorf("grant %d differs", i)
+		}
+	}
+	// Offsets and cursors of another list are refused.
+	for _, bad := range []string{store.EncodeOffset(2), store.EncodeKey(5), store.EncodeTextKey("a", "b", "c"), "x"} {
+		if _, err := s.Roles(ctx(t), store.RoleFilter{}, store.Page{Limit: 2, Cursor: bad}); !errors.Is(err, store.ErrInvalidCursor) {
+			t.Errorf("roles cursor %q: %v", bad, err)
+		}
+		if _, err := s.Grants(ctx(t), store.GrantFilter{}, store.Page{Limit: 2, Cursor: bad}); !errors.Is(err, store.ErrInvalidCursor) {
+			t.Errorf("grants cursor %q: %v", bad, err)
+		}
+		if _, err := s.Tables(ctx(t), "kingres_cp", store.TableFilter{}, store.Page{Limit: 2, Cursor: bad}); !errors.Is(err, store.ErrInvalidCursor) {
+			t.Errorf("tables cursor %q: %v", bad, err)
+		}
+	}
+}

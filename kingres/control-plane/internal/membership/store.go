@@ -40,14 +40,19 @@ type serverRow struct {
 	Pinned          bool
 	Registering     bool
 	JoinedAt        time.Time
+	// RevokedAt is when the server's certificates were revoked (nil: not revoked).
+	RevokedAt *time.Time
+	// Ordinal is the server's number in the cluster (see peers.Peer).
+	Ordinal int
 }
 
 const rowCols = `server_id, status, coalesce(internal_address, ''), coalesce(pg_port, 0), coalesce(certificate_serial, ''),
-	coalesce(certificate_pem, ''), coalesce(public_key_der, ''::bytea), coalesce(seen_fingerprint, ''), fingerprint_pinned, registering, joined_at`
+	coalesce(certificate_pem, ''), coalesce(public_key_der, ''::bytea), coalesce(seen_fingerprint, ''), fingerprint_pinned, registering, joined_at,
+	certificate_revoked_at, ordinal`
 
 func scanRow(r pgx.Row) (serverRow, error) {
 	var s serverRow
-	err := r.Scan(&s.ID, &s.Status, &s.InternalAddress, &s.PGPort, &s.Serial, &s.CertPEM, &s.PublicKey, &s.Seen, &s.Pinned, &s.Registering, &s.JoinedAt)
+	err := r.Scan(&s.ID, &s.Status, &s.InternalAddress, &s.PGPort, &s.Serial, &s.CertPEM, &s.PublicKey, &s.Seen, &s.Pinned, &s.Registering, &s.JoinedAt, &s.RevokedAt, &s.Ordinal)
 	return s, err
 }
 
@@ -112,7 +117,7 @@ func (m *Manager) peerInfos(ctx context.Context, withPending, without string) ([
 		if r.Status != StatusActive && r.ID != withPending {
 			continue
 		}
-		p := wire.PeerInfo{ServerID: r.ID, PGPort: r.PGPort, InternalAddress: r.InternalAddress}
+		p := wire.PeerInfo{ServerID: r.ID, PGPort: r.PGPort, InternalAddress: r.InternalAddress, Ordinal: r.Ordinal}
 		if r.ID == m.Self {
 			p.PGPort = m.Svc.PGPort()
 			if me, ok := m.Peers.Get(m.Self); ok {

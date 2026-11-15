@@ -37,6 +37,7 @@ func (s *Service) CA() (*pki.CA, error) {
 	if err != nil {
 		return nil, err
 	}
+	ca.SetServerLifetime(s.cfg.CertificateLifetime)
 	s.pki.ca = ca
 	return ca, nil
 }

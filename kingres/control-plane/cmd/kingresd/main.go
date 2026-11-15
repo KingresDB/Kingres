@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -52,7 +53,7 @@ var version = "0.2.0-dev"
 var commit = "unknown"
 
 // contractRevision is the revision of kingres/api/openapi.yaml implemented.
-const contractRevision = "0.4.0"
+const contractRevision = "0.5.0"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -156,7 +157,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	svc, err := cluster.New(cluster.Config{
 		DataDir: cfg.DataDir, BinDir: binDir, SocketDir: cfg.SocketDir, PGPort: cfg.PGPort, PGListen: cfg.PGListen,
 		ServerHost: serverHost, TLSCertFile: cfg.TLSCertFile, TLSKeyFile: cfg.TLSKeyFile, Logger: log,
-		InternalPort: internalPort, Version: version,
+		InternalPort: internalPort, Version: version, CertificateLifetime: cfg.CertificateLifetime,
 	}, node)
 	if err != nil {
 		return fmt.Errorf("preparing instance management: %w", err)
@@ -255,8 +256,10 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 				}
 			}}
 		receiver = &membership.Receiver{M: members, Authn: authn, VerifyToken: svc.VerifyToken}
+		members.OnCertificateInstalled = func() { pc.ForgetAll(); members.Client.ForgetAll() }
 		opsSvc.Fanout, opsSvc.Local = members, svc
 		deps.Members = members
+		deps.Gatherer, deps.GatherTimeout = membership.Gatherer{M: members}, cfg.GatherTimeout
 	}
 	api, err := httpapi.New(deps)
 	if err != nil {
@@ -311,7 +314,14 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 			}
 			opsSvc.BG = bgCtx
 			opsSvc.SetEngine(eng)
-			run := &monitor.Runner{Src: monSource{svc}, Ring: ring, Host: serverHost, DataDir: filepath.Join(cfg.DataDir, "instances"), Log: log, System: "kingres_system"}
+			run := &monitor.Runner{Src: monSource{svc}, Ring: ring, Host: serverHost, DataDir: filepath.Join(cfg.DataDir, "instances"), Log: log, System: "kingres_system",
+				Interval: cfg.MonitorInterval, LedgerPendingMaxAge: cfg.LedgerPendingMaxAge, RenewFraction: cfg.CertificateRenewFraction,
+				Cert: svc.ServerCertificate, CA: func() *x509.Certificate {
+					if ca, err := svc.CA(); err == nil {
+						return ca.Cert()
+					}
+					return nil
+				}}
 			wg.Add(1)
 			go func() { defer wg.Done(); run.Run(bgCtx) }()
 			wg.Add(1)
@@ -364,15 +374,34 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		go func() {
 			defer wg.Done()
 			serveInternal(bgCtx, internalDeps{addr: cfg.InternalListen, svc: svc, node: node, ring: ring, log: log, started: started,
-				serverHost: serverHost, version: version, dataDir: cfg.DataDir, leaders: leaders, ops: opsSvc, lastLeader: lastLeader, forward: func(ctx context.Context, peer string, fr internalapi.ForwardRequest) (internalapi.ForwardResponse, error) {
+				serverHost: serverHost, version: version, dataDir: cfg.DataDir, leaders: leaders, ops: opsSvc, lastLeader: lastLeader, members: members, forward: func(ctx context.Context, peer string, fr internalapi.ForwardRequest) (internalapi.ForwardResponse, error) {
 					// A forwarding server must be a member of the cluster (CP-07); its certificate was
 					// already checked against the CA and the revocation list by the internal API.
 					if _, ok := peerDir.Get(peer); !ok {
 						return internalapi.ForwardResponse{}, fmt.Errorf("%q is not a server of this cluster", peer)
 					}
 					return api.ServeForwarded(ctx, peer, fr)
+				}, gather: func(ctx context.Context, peer string, fr internalapi.ForwardRequest) (internalapi.ForwardResponse, error) {
+					// Every server of the cluster may ask; it must be a member (CP-07).
+					if _, ok := peerDir.Get(peer); !ok {
+						return internalapi.ForwardResponse{}, fmt.Errorf("%q is not a server of this cluster", peer)
+					}
+					return api.ServeGathered(ctx, peer, fr)
 				}, receiver: receiver})
 		}()
+	}
+
+	if members != nil && cfg.InternalListen != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runVersionCheck(bgCtx, members, leaders, serverHost, cfg.VersionCheckInterval, log)
+		}()
+	}
+	if members != nil && cfg.InternalListen != "" {
+		job := members.NewRenewalJob(cfg.CertificateRenewFraction, cfg.CertificateCheckInterval, cfg.CertificateRetryInterval)
+		wg.Add(1)
+		go func() { defer wg.Done(); job.Run(bgCtx) }()
 	}
 
 	serveErr := make(chan error, 1)

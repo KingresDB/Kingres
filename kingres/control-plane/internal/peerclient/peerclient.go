@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/gather"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/leader"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/peers"
@@ -39,6 +40,12 @@ var ErrUnknownPeer = errors.New("peerclient: no internal address is known for th
 
 // ErrUnreachable wraps a transport failure: the peer did not answer.
 var ErrUnreachable = errors.New("peerclient: the server cannot be reached")
+
+// ErrNotMember means the server answered but presents a certificate of no
+// authority this server trusts: it is not (any more) a member of this cluster,
+// for example a server that reset itself. It is not ErrUnreachable: waiting does
+// not change it.
+var ErrNotMember = errors.New("peerclient: the server does not present a certificate of this cluster")
 
 // APIError is an error answer of the internal API.
 type APIError struct {
@@ -80,7 +87,7 @@ func New(cfg Config) *Client {
 	return &Client{cfg: cfg, http: map[string]*http.Client{}}
 }
 
-func (c *Client) tlsConfig(serverID string) (*tls.Config, error) {
+func (c *Client) tlsConfig(serverID string, checkRevoked bool) (*tls.Config, error) {
 	caPEM, err := os.ReadFile(filepath.Join(c.cfg.PKIDir, pki.CACertFile)) //nolint:gosec // fixed name below the pki directory
 	if err != nil {
 		return nil, fmt.Errorf("peerclient: reading the CA certificate: %w", err)
@@ -103,7 +110,7 @@ func (c *Client) tlsConfig(serverID string) (*tls.Config, error) {
 			return &pair, nil
 		},
 		VerifyConnection: func(cs tls.ConnectionState) error {
-			if c.cfg.Revoked == nil || len(cs.PeerCertificates) == 0 {
+			if !checkRevoked || c.cfg.Revoked == nil || len(cs.PeerCertificates) == 0 {
 				return nil
 			}
 			sn := pki.SerialHex(cs.PeerCertificates[0].SerialNumber)
@@ -117,13 +124,17 @@ func (c *Client) tlsConfig(serverID string) (*tls.Config, error) {
 	}, nil
 }
 
-func (c *Client) clientFor(serverID string) (*http.Client, error) {
+func (c *Client) clientFor(serverID string, checkRevoked bool) (*http.Client, error) {
+	key := serverID
+	if !checkRevoked {
+		key += "|unchecked"
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if hc, ok := c.http[serverID]; ok {
+	if hc, ok := c.http[key]; ok {
 		return hc, nil
 	}
-	cfg, err := c.tlsConfig(serverID)
+	cfg, err := c.tlsConfig(serverID, checkRevoked)
 	if err != nil {
 		return nil, err
 	}
@@ -132,7 +143,7 @@ func (c *Client) clientFor(serverID string) (*http.Client, error) {
 		Transport:     &http.Transport{TLSClientConfig: cfg, MaxIdleConnsPerHost: 2, IdleConnTimeout: 60 * time.Second, TLSHandshakeTimeout: 10 * time.Second},
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
-	c.http[serverID] = hc
+	c.http[key] = hc
 	return hc, nil
 }
 
@@ -140,10 +151,15 @@ func (c *Client) clientFor(serverID string) (*http.Client, error) {
 // it was removed).
 func (c *Client) Forget(serverID string) {
 	c.mu.Lock()
-	hc := c.http[serverID]
-	delete(c.http, serverID)
+	var drop []*http.Client
+	for _, k := range []string{serverID, serverID + "|unchecked"} {
+		if hc := c.http[k]; hc != nil {
+			drop = append(drop, hc)
+		}
+		delete(c.http, k)
+	}
 	c.mu.Unlock()
-	if hc != nil {
+	for _, hc := range drop {
 		hc.CloseIdleConnections()
 	}
 }
@@ -153,11 +169,23 @@ func (c *Client) Forget(serverID string) {
 // returns an *APIError for a non-2xx answer and wraps ErrUnreachable when the
 // server did not answer.
 func (c *Client) Do(ctx context.Context, serverID, method, path string, in, out any) error {
+	return c.do(ctx, serverID, true, method, path, in, out)
+}
+
+// DoUnchecked is Do for a server whose certificate may be revoked: the
+// revocation list is not consulted for its certificate (the chain, the name and
+// the validity still are). It is for the calls that must reach a server that
+// was cut off: giving it the revocation list and telling it to reset itself.
+func (c *Client) DoUnchecked(ctx context.Context, serverID, method, path string, in, out any) error {
+	return c.do(ctx, serverID, false, method, path, in, out)
+}
+
+func (c *Client) do(ctx context.Context, serverID string, checkRevoked bool, method, path string, in, out any) error {
 	p, ok := c.cfg.Peers.Get(serverID)
 	if !ok {
 		return fmt.Errorf("%w: %s", ErrUnknownPeer, serverID)
 	}
-	hc, err := c.clientFor(serverID)
+	hc, err := c.clientFor(serverID, checkRevoked)
 	if err != nil {
 		return err
 	}
@@ -183,6 +211,10 @@ func (c *Client) Do(ctx context.Context, serverID, method, path string, in, out 
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
+		var unknown x509.UnknownAuthorityError
+		if errors.As(err, &unknown) {
+			return fmt.Errorf("%w: %s", ErrNotMember, serverID)
+		}
 		return fmt.Errorf("%w: %s: %w", ErrUnreachable, serverID, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -233,4 +265,76 @@ func (f *Forwarder) Leader(ctx context.Context) (string, bool, error) {
 // Forward sends the operation to the leader.
 func (f *Forwarder) Forward(ctx context.Context, leaderID string, req internalapi.ForwardRequest) (internalapi.ForwardResponse, error) {
 	return f.Client.Forward(ctx, leaderID, req)
+}
+
+// ForgetAll drops the connections to every server. It is called after this
+// server's certificate was replaced: a connection that was opened with the old
+// certificate is checked against its end of validity by the other server at
+// every request, so it must not be used after the old certificate expires.
+func (c *Client) ForgetAll() {
+	c.mu.Lock()
+	all := c.http
+	c.http = map[string]*http.Client{}
+	c.mu.Unlock()
+	for _, hc := range all {
+		hc.CloseIdleConnections()
+	}
+}
+
+// Gather asks a server for its part of a cluster-wide read (POST /gather) and
+// returns its answer: the status and body of the operation it ran. The answer
+// is read through a limit of maxBytes (a larger one is gather.ErrInvalid), an
+// error status of the internal API itself is gather.ErrRefused and a transport
+// failure is gather.ErrUnreachable, or context.DeadlineExceeded when the
+// caller's deadline passed. The status of the operation is for the caller to judge.
+func (c *Client) Gather(ctx context.Context, serverID string, req internalapi.ForwardRequest, maxBytes int64) (internalapi.ForwardResponse, error) {
+	p, ok := c.cfg.Peers.Get(serverID)
+	if !ok {
+		return internalapi.ForwardResponse{}, fmt.Errorf("%w: %s", gather.ErrUnreachable, ErrUnknownPeer)
+	}
+	hc, err := c.clientFor(serverID, true)
+	if err != nil {
+		return internalapi.ForwardResponse{}, fmt.Errorf("%w: %w", gather.ErrUnreachable, err)
+	}
+	b, err := json.Marshal(req)
+	if err != nil {
+		return internalapi.ForwardResponse{}, err
+	}
+	target, err := internalapi.URL(p.InternalAddr, "/gather")
+	if err != nil {
+		return internalapi.ForwardResponse{}, err
+	}
+	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(b))
+	if err != nil {
+		return internalapi.ForwardResponse{}, err
+	}
+	hreq.Header.Set(internalapi.HeaderVersion, internalapi.Version)
+	hreq.Header.Set("Content-Type", "application/json")
+	// The deadline of the caller bounds the call; the client's own timeout is the larger one.
+	resp, err := hc.Do(hreq)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			return internalapi.ForwardResponse{}, context.DeadlineExceeded
+		}
+		return internalapi.ForwardResponse{}, fmt.Errorf("%w: %w", gather.ErrUnreachable, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
+		if ctx.Err() != nil {
+			return internalapi.ForwardResponse{}, context.DeadlineExceeded
+		}
+		return internalapi.ForwardResponse{}, fmt.Errorf("%w: %w", gather.ErrUnreachable, err)
+	}
+	if int64(len(data)) > maxBytes {
+		return internalapi.ForwardResponse{}, gather.ErrInvalid
+	}
+	if resp.StatusCode/100 != 2 {
+		return internalapi.ForwardResponse{}, gather.ErrRefused
+	}
+	var fr internalapi.ForwardResponse
+	if err := json.Unmarshal(data, &fr); err != nil {
+		return internalapi.ForwardResponse{}, gather.ErrInvalid
+	}
+	return fr, nil
 }

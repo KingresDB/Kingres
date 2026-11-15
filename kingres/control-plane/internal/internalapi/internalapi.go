@@ -70,6 +70,10 @@ var Calls = map[string]Policy{
 	"GET /revoked":   AnyPeer,
 	"GET /leader":    AnyPeer,
 	"POST /forward":  ToLeader,
+	// Cluster-wide reads: a server asks the others for their part of the logs, alerts or
+	// metrics (and an acknowledgement that belongs to one server); every server answers
+	// after it has checked the identity the asking server vouches for.
+	"POST /gather": AnyPeer,
 
 	// Joining and adding a server (D4), removing it (D5), and the calls the
 	// leader needs on another server. Nothing in them takes a path, a program
@@ -91,6 +95,12 @@ var Calls = map[string]Policy{
 	"POST /node/reset":        LeaderOrJoining,
 	"POST /apply":             LeaderOnly,
 
+	// Certificate renewal: a server asks the manager leader, which holds the CA, for a
+	// new certificate for itself; the leader asks a server for a certificate
+	// request when an administrator renews its certificates.
+	"POST /pki/renew": ToLeader,
+	"GET /pki/csr":    LeaderOnly,
+
 	// Leaving the cluster (D5, mirror of removing a server): the leaving server
 	// asks the leader, which answers only for the caller named by the certificate.
 	"POST /leave-cluster": ToLeader,
@@ -111,6 +121,7 @@ var handled = map[string]bool{
 	"POST /add-server": true, "GET /instance/status": true, "POST /instance/create": true, "POST /instance/start": true,
 	"POST /instance/stop": true, "POST /instance/remove": true, "POST /instance/trust": true, "POST /pki/install": true,
 	"POST /peers": true, "POST /globals/apply": true, "POST /node/finish": true, "POST /node/reset": true, "POST /apply": true,
+	"POST /pki/renew": true, "GET /pki/csr": true,
 }
 
 // CallError is an error with the status and code the internal API answers.
@@ -136,6 +147,17 @@ type State struct {
 	Version         string `json:"version"`
 	InternalVersion string `json:"internalVersion"`
 	UptimeSeconds   int64  `json:"uptimeSeconds"`
+	// PostgreSQL and Extensions are the versions of the instance of this server and
+	// of the KingresDB extensions its binaries offer (the manager leader compares
+	// them between the servers); empty when they could not be read.
+	PostgreSQL string            `json:"postgresql,omitempty"`
+	Extensions map[string]string `json:"extensions,omitempty"`
+}
+
+// VersionInfo is what a server knows of the versions of its instance.
+type VersionInfo struct {
+	PostgreSQL string
+	Extensions map[string]string
 }
 
 // ExecRequest is the body of POST /exec: one statement on a local database.
@@ -174,6 +196,9 @@ type ForwardRequest struct {
 	SourceAddress string            `json:"sourceAddress,omitempty"`
 	// Source is "panel" or "cli".
 	Source string `json:"source,omitempty"`
+	// Ordinal is, in a gather call, the ordinal of the server that answers (its
+	// alert ids are made from it).
+	Ordinal int `json:"ordinal,omitempty"`
 	// Pin is the fingerprint the administrator pinned (addServer only).
 	Pin string `json:"pin,omitempty"`
 }
@@ -206,6 +231,9 @@ type Backend struct {
 	Metrics   func(ctx context.Context) (any, error)
 	// Exec runs a statement on a local instance through the local socket.
 	Exec func(ctx context.Context, req ExecRequest) (ExecResult, error)
+	// Gather answers one cluster-wide read for the server peer (nil: not
+	// available). The answer is relayed as it is.
+	Gather func(ctx context.Context, peer string, req ForwardRequest) (ForwardResponse, error)
 	// Handle runs one of the membership calls (the keys of Calls that are not
 	// handled by the server itself) with the raw JSON body; peer is the
 	// verified server id of the caller. It returns the answer or a *CallError.
@@ -339,6 +367,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.exec(w, r, peer)
 	case "POST /forward":
 		s.forward(w, r, peer)
+	case "POST /gather":
+		s.gather(w, r, peer)
 	default:
 		if handled[key] {
 			s.handle(w, r, key, peer)

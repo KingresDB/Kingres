@@ -12,9 +12,11 @@ system database, cluster creation (`init-cluster`) and the operations behind the
 Settings pages; the third lets a second and a third server join (`joinCluster`, `addServer`), removes an empty
 server (`removeServer`) and makes the cluster-wide operations run on every server (see
 [Running several servers](#running-several-servers)). Rebalance, failover, restoring preferred primaries
-still answer the contract's "not supported yet" problem; cluster-wide logs, alerts and metrics and the certificate
-renewal job are not written. The fourth step added server groups, leaving a cluster, instance start and stop, local
-settings, inclusion proofs and verification records, security headers and crash-injection tests of the task engine. Design: `kingres/docs/design/control-plane-2.md` and
+still answer the contract's "not supported yet" problem. The fourth step added server groups, leaving a cluster,
+instance start and stop, local settings, inclusion proofs and verification records, security headers and
+crash-injection tests of the task engine. The fifth step (contract 0.5.0) added certificate renewal and revocation,
+the cluster-wide logs, alerts and metrics, the alert kinds that nothing raised, and the corrections listed in
+"Fifth increment". Design: `kingres/docs/design/control-plane-2.md` and
 `kingres/docs/design/control-plane-3.md`.
 
 > **Module path.** The Go module is `github.com/KingresDB/Kingres/kingres/control-plane`: the
@@ -46,6 +48,10 @@ internal/
   peers/                  directory of the other servers' internal addresses (peers.json)
   membership/             joining and removing servers: the leader's tasks server.add and server.remove, and the
                           receiving side of the internal calls (instance, trust, certificates, globals, apply)
+                          certificate renewal (the job of every server and the leader's side), revocation, the
+                          version check, the view of the other servers for cluster-wide reads
+  gather/                 the parallel call of the other servers with deadlines, the total orders and keyset
+                          cursors of logs and alerts, the cluster-wide alert ids
   wire/                   request and answer types of those internal calls (no behavior)
   clustertest/            starts N kingresd processes on one machine; the multi-server tests
   leader/                 the manager leader read from the catalog, cached
@@ -133,8 +139,16 @@ server at start. The DSN is never logged.
 | `internal-listen` | `KINGRES_INTERNAL_LISTEN` | empty (off) | host:port of the mutual-TLS listener of the internal server-to-server API. **Required to join, add or remove servers and for forwarding.** By convention it is the port above the REST API (`listen` 8091, `internal-listen` 8092): the contract names only the REST address of a server, and the internal API of that server is found at the next port (kingresd warns when it is not) |
 | `metrics-token` | `KINGRES_METRICS_TOKEN` | none | bearer token that may scrape `/metrics` besides stats-role session tokens |
 | `server-host` | `KINGRES_SERVER_HOST` | machine host name | host registered in the shard catalog; it is the server id, the common name and a name of its certificate, and the host the other servers (and the sharding extension) connect to. It must resolve to this server from every other server |
+| `certificate-lifetime` | `KINGRES_CERTIFICATE_LIFETIME` | `8760h` | validity of the server certificates the CA of this server signs (only the server that holds the CA key uses it); at least `5s`: short values exist so that tests can watch a renewal |
+| `certificate-renew-fraction` | `KINGRES_CERTIFICATE_RENEW_FRACTION` | `0.3333` | a server renews its certificate when less than this part of its lifetime is left (above 0, at most 0.9) |
+| `certificate-check-interval` | `KINGRES_CERTIFICATE_CHECK_INTERVAL` | `1h` | how often the renewal job looks (it also wakes when the renewal window of the certificate opens) |
+| `certificate-retry-interval` | `KINGRES_CERTIFICATE_RETRY_INTERVAL` | `1m` | pause after a failed renewal; it doubles up to the check interval |
+| `monitor-interval` | `KINGRES_MONITOR_INTERVAL` | `10s` | how often the health checks and the metric sampler run |
+| `ledger-pending-max-age` | `KINGRES_LEDGER_PENDING_MAX_AGE` | `5m` | age of the oldest pending ledger transaction of a database that raises `ledgerPendingTooOld` |
+| `version-check-interval` | `KINGRES_VERSION_CHECK_INTERVAL` | `1m` | how often the manager leader compares the versions of the servers (`versionMismatch`) |
+| `gather-timeout` | `KINGRES_GATHER_TIMEOUT` | `3s` | the time one server gets to answer its part of a cluster-wide read of logs, alerts or metrics |
 | `allow-remote-setup` | `KINGRES_ALLOW_REMOTE_SETUP` | `false` | `true` lets the setup operations come from non-loopback addresses while uninitialized (containers listening on `0.0.0.0`); the setup token is still required |
-| `-version` | | | prints version, contract revision (0.4.0) and build commit (`-ldflags "-X main.commit=..."`, else `unknown`) |
+| `-version` | | | prints version, contract revision (0.5.0) and build commit (`-ldflags "-X main.commit=..."`, else `unknown`) |
 | `-stop-instances` | | | stops the managed instances (fast shutdown) and exits |
 | `tls-cert-file`, `tls-key-file` | `KINGRES_TLS_CERT_FILE`, `KINGRES_TLS_KEY_FILE` | none | enable HTTPS (both or neither) |
 
@@ -244,12 +258,12 @@ the rename.
 
 ## What is implemented
 
-The server implements revision **0.4.0** of the contract (86 operations, 69
-paths; what 0.4.0 planned beyond this table is in "Not done in this increment"). "Real" means the operation works against PostgreSQL or the local node
+The server implements revision **0.5.0** of the contract (88 operations, 71
+paths; what is not done is in "Not done in this increment"). "Real" means the operation works against PostgreSQL or the local node
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **78 of 86 operations are real; 8 answer "not yet".**
+authenticated operation lists in 0.2.0. **80 of 88 operations are real; 8 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -270,7 +284,7 @@ authenticated operation lists in 0.2.0. **78 of 86 operations are real; 8 answer
 | Rebalance |  | `getRebalanceStatus`, `startRebalance`, `previewRebalancePlan`, `listRebalanceReports`, `getRebalanceReport`, `stopRebalance` |
 | Replication | `getReplicationTopology` | `restorePreferredPrimaries` |
 | Server groups | `listServerGroups`, `createServerGroup`, `deleteServerGroup` |  |
-| Servers | `listServers`, `getServer`, `addServer`, `removeServer`, `updateServer` | `failoverServer` |
+| Servers | `listServers`, `getServer`, `addServer`, `removeServer`, `updateServer`, `renewServerCertificates`, `revokeServerCertificates` | `failoverServer` |
 | Settings | `getClusterSettings`, `updateClusterSettings` |  |
 | Network access | `getNetworkAccess`, `replaceNetworkAccess` |  |
 | Setup | `initCluster`, `joinCluster`, `getNodeState`, `checkSetupToken` |  |
@@ -456,8 +470,8 @@ certificate request, and gets a one-year server certificate whose common name an
 `server-host` (plus `localhost` and `127.0.0.1`). The same certificate is the server certificate and the client
 certificate of the internal API and of the PostgreSQL instance of that server. `<data-dir>/pki/` of a server holds
 `ca.crt`, `server.crt`, `server.key` (0600), `revoked.crl` and `revoked-serials.json`; the first server also `ca.key`
-and `revoked.json`. The renewal job is not written yet (`NeedsRenewal` exists): a certificate has to be replaced
-before it expires after a year, and the CA is not rotated.
+and `revoked.json`. Every server renews its own certificate before it expires (see "Certificates: renewal and
+revocation"); the CA is not rotated.
 
 **Joining a second server from its own API** (the wizard's way). On the new server, with the setup token it printed
 in `<data-dir>/setup-token`:
@@ -570,9 +584,10 @@ server, a join that was refused (wrong fingerprint, wrong credentials, the clust
 again. A pending server that has no unfinished task is revoked and forgotten by the leader's hourly check (and at start) once it is older than 15 minutes.
 
 **Revoking a certificate.** The leader keeps the revoked serial numbers in `<data-dir>/pki/revoked.json`
-(serial numbers in hex, with the time). Removing a server revokes its certificate. There is no public operation to revoke another certificate in contract 0.3.0 (0.4.0 should have one); the
-only supported way to take a server's certificate out of use is to remove the server. A removal distributes the list immediately: the internal API of every server and, through `ssl_crl_file`, every
-PostgreSQL instance refuse the certificate from then on (a reload is enough).
+(serial numbers in hex, with the time). Removing a server revokes every certificate that was issued to it, and
+`revokeServerCertificates` revokes them without removing the server (see "Certificates: renewal and revocation").
+The list is distributed immediately: the internal API of every server and, through `ssl_crl_file`, every PostgreSQL
+instance refuse the certificate from then on (a reload is enough).
 
 **Limits of this increment.** One map group (the first server) and one server per shard group: no standby, no
 failover, no rebalance, no server groups. The map group's server cannot be removed or restarted away from, and
@@ -646,6 +661,195 @@ undone (retry is by starting another leave, which the checks refuse once the ser
 `removeServer` or reset the server by hand). The leave of a server whose instance was stopped on purpose is not
 tried.
 
+## Fifth increment: certificates, cluster-wide reads, new alerts (contract 0.5.0)
+
+Contract 0.5.0 is additive over 0.4.0 (see the changelog in `kingres/api/README.md`): two operations, optional
+response properties, new enum members. Nothing a 0.4.0 client relies on changed, with the exception of two
+corrections of the server to what 0.4.0 already said (below).
+
+### Certificates: renewal and revocation
+
+**The renewal job** (`internal/membership/certjob.go`, one per server, started when `internal-listen` is set). It
+reads the server's own certificate (`<data-dir>/pki/server.crt`); when less than `certificate-renew-fraction` of
+its lifetime is left (`pki.NeedsRenewalAt`) it renews: a follower sends `POST /internal/v1/pki/renew` with a
+certificate request to the manager leader, which holds the CA key; the leader signs its own request without the
+network. The request must be made from the key the server was admitted with and name only that server, so a server
+renews itself and nobody else. The job looks every `certificate-check-interval` and also wakes when the renewal
+window of the certificate opens, so a lifetime of seconds and one of a year work with the same code. A failure is
+retried after `certificate-retry-interval`, the pause doubling up to the check interval. After three failures in a
+row (`FailuresBeforeAlert`) the job raises the alert `certificateRenewalFailed` on its own server (severity
+`warning`, `critical` when less than a tenth of the lifetime is left), clears it with the first success, and writes
+two audit events in `audit.jsonl` of that server: `certificateRenewalFailed` (outcome failure) when a streak starts
+and the same action with outcome success and `details.phase = "recovered"` when it ends. A renewal is audited on
+the leader as `certificateRenewed` (actor `system`, `details.via = "renewal job"`, serial and `notAfter`).
+
+**The revocation list is issued again by the same job (review finding CP2-04).** The list is valid for 30 days
+(`pki.CRLValidity`) and PostgreSQL refuses one past its end, so it used to fail 30 days after the last add or remove.
+The job of the server that holds the CA issues it again, and sends it to every server and instance (the call of a
+revocation), when it is a third of that old (`pki.CRLRefreshAfter`, 10 days); a failure is tried again at the next
+round (every `certificate-check-interval`, an hour by default), long before the end. Test:
+`TestRenewalJobIssuesTheRevocationListAgainBeforeItEnds` (injected clock, 100 days, failures, a server without the CA).
+
+**Decision: the key stays.** A renewed certificate is made for the key the server holds, with the same names. A new
+key would have to be installed together with its certificate (two files, read by PostgreSQL, by the internal API
+and by the sharding extension at different moments), which cannot be made atomic with plain files; with the key
+kept, the files, `ssl_cert_file`, `pg_hba.conf` (`hostssl ... cert map=kingres_nodes`) and `pg_ident.conf` (which
+maps the common name) stay valid as they are. The old certificate stays valid until it expires (it has the same
+key); the CA records every certificate it issued (`kingres_cp.certificate`) so that a revocation reaches all of
+them. A new key is a new join.
+
+**What a renewal needs, part by part** (nothing is restarted anywhere):
+
+| Part | How it takes the new certificate |
+|---|---|
+| internal API listener (server certificate) and its client side (kingresd's calls to the others) | read from `server.crt` at every handshake; the server then closes its idle connections to the others (a connection opened with the old certificate is checked against its end at every request) |
+| the PostgreSQL instance (`ssl_cert_file`, `ssl_ca_file`, `ssl_crl_file`) | **a reload** (`pg_ctl reload`) of the running instance; an instance that is stopped reads the files when it starts |
+| outgoing connections of the sharding extension (`kingres_shard.node_conninfo` names the files) | nothing: libpq reads the files at every new connection; sessions that exist keep working |
+| kingresd's connections to other instances (`NodeTLSConfig`) | nothing: built at every connection |
+| the public REST/panel listener (`tls-cert-file`) | not touched: it is the operator's certificate, not the cluster's |
+
+**`renewServerCertificates`** (`kingres_admin`, task `certificate.renew`, subject the server): the leader asks the
+server for a request (`GET /pki/csr`), signs it, records it and sends the certificate with `POST /pki/install`; it
+also renews the leader's own certificate. It is the way to renew a certificate whose job cannot (an expired one
+cannot call the leader; the leader can still call it). **`revokeServerCertificates`** (`kingres_admin`, task
+`certificate.revoke`): revokes every certificate that may still be valid, records `certificateRevokedAt` of the
+server (shown in `Server`), sends the revocation list to every server (the task waits for a server that is down,
+like every cluster-wide task) and drops the connections to the server. *What stops working*: the internal API of
+every server refuses the revoked server (its job, forwarding, task recording, leave), the PostgreSQL instances
+refuse its certificate (`hostssl ... cert`, in both directions of the sharding connections) and kingresd refuses to
+connect to it; connections that were open before keep running until they end. *How the server gets back in*: it
+never gets a new certificate (`renewServerCertificates` is 409 `certificate_revoked`); a server that owns no bucket
+is removed with `removeServer` (the leader still reaches it for the revocation list and for `/node/reset`: the
+revocation list is not consulted for the calls `peerclient.DoUnchecked` makes) and added again with a new setup
+token, key and certificate. A server that owns buckets cannot be removed before a rebalance has emptied it,
+which this version cannot do (**limit**): revoking the certificates of a server with data is a one-way door until
+rebalance exists. The leader's own certificates cannot be revoked (409 `server_hosts_map_group`). A revoked server
+can leave on its own with `force` (it cannot ask the leader); the cluster keeps listing it until `removeServer`,
+which does not wait for a server that has already reset itself.
+
+**The CA key and the manager.** The key lives in `<data-dir>/pki/ca.key` of the server that created the cluster. A
+manager leader that does not hold it (after a change of the manager, which does not exist yet) answers
+`renewServerCertificates`, `revokeServerCertificates`, `addServer`, `joinCluster`, `removeServer` and
+`leaveCluster` with **503 `certificate_authority_unavailable`** (a problem code of 0.5.0, detail naming the leader
+and the way out) before anything is changed, and the internal call of the renewal job with 503 `ca_unavailable`; the
+job counts it as a failure, so the alert `certificateRenewalFailed` and, as the certificate nears its end,
+`certificateExpiring` make the situation visible. The cluster keeps running on its certificates until they expire.
+
+Tests: `internal/pki` (`TestShortLifetimeAndRenewalFraction`, `TestRemainingFraction`); `internal/config`
+(`TestCertificateSettings`); the job's logic with a fake clock (`internal/membership/certjob_test.go`:
+`TestRenewalJob...`); the CA-less leader (`TestOperationsThatNeedTheCAAnswerADedicatedProblemWithoutIt`);
+`internal/peerclient/revoked_test.go`; handlers (`internal/httpapi/handlers_certs_test.go`); and, with real
+processes and certificates that live 24 to 60 seconds (`internal/clustertest/certs_test.go`):
+`TestCertificateRenewalKeepsAThreeServerClusterWorking` (three servers, statements routed between them over fresh
+connections every 300 ms for 60 s, a session kept open through every renewal, at least two renewals per server,
+PostgreSQL not restarted, the instance presents the certificate that is in the file, the renewals audited),
+`TestRevokedCertificateIsRefusedAndTheServerGetsBackIn` (a revoked certificate refused by the internal API and by
+PostgreSQL, a server cannot renew with another key or for another server, an administrator cannot renew a revoked
+server, remove and add again), `TestRevokedServerLeavesWithForceOnly`,
+`TestCertificateAuthorityMissingOnTheLeader` (the dedicated problem on every operation, the job's retries, the two
+alerts raised and cleared, the audit of the streak).
+
+### Cluster-wide logs, alerts and metrics
+
+`listLogs`, `listAlerts` and `queryMetrics` answer for the whole cluster from any server (`internal/httpapi/gatherhttp.go`,
+`internal/gather`, `POST /internal/v1/gather`; the wire is specified in `internal-api.md`). The receiving server
+checks the session and the role as for any request, asks every other server in parallel with its own deadline
+(`gather-timeout`), merges the answers and names the servers that did not answer: `partial: true` and
+`missingServers[]` with the reason `timeout`, `unreachable`, `refused` or `invalidAnswer` (optional properties of the
+three page types in 0.5.0; 0.4.0 had no way to say it). **Role checks are made again on every server that answers**
+(the forwarded-identity rule of CP-07: the answering server derives the caller's cluster roles from its own catalog).
+**Sizes are bounded**: a server answers at most one more entry than the page needs (alerts, logs) and at most 16 MiB;
+a metric answer has at most 2000 series and exactly the points asked for; a log message is cut at 8 KiB; text of
+another server passes `peerclient.CleanText`; a server can only speak for itself (its id replaces whatever its
+log entries say, an alert must carry its ordinal, series labels are its own).
+
+**Cursors are stable across servers.** They are keyset cursors over one total order: logs by time, then server id,
+then the rank among the entries of that server with the same second; alerts by time raised, then id. Every server
+is asked for what comes after the cursor, so a page boundary is the same whichever servers answered, and a server
+that was down for one page contributes to the next. The cursors of 0.4.0 (offsets, ids) are refused with 400.
+
+**Alerts of every server.** Each server keeps the alerts about itself in its own `kingres_cp.alert` (a follower's
+system database now has the `kingres_cp` schema too: `MigrateSystem` runs at every start and after a join, which
+also upgrades the leader's schema when a binary brings a new migration); the alerts about the cluster as a whole
+(`versionMismatch`) are kept by the manager leader. An alert id is `ordinal << 32 | local id`; the ordinal is the
+number `kingres_cp.server.ordinal` gave the server (migration 4; sent to every server in `peers.json`, a leader
+sends the directory again at start so that an older cluster learns the ordinals). The id is unique, below 2^53 (a
+browser reads JSON numbers as doubles) and names the server that holds the alert, so `acknowledgeAlert` is no longer
+forwarded to the leader: the receiving server acknowledges it itself or asks the holder, which audits it once. A
+server that is not reachable when its alert is acknowledged is 503; an unknown ordinal is 404. `listAlerts` is no
+longer a leader-bound read.
+
+`listLogs` also honours what the contract always said and the server ignored: `level` keeps the entries at that level
+or more severe (it was an exact match) and `q` filters the message (case-insensitive). `listThisServerLogs` uses the
+same code for its own server.
+
+Tests: `internal/gather`; `internal/httpapi/gatherhttp_test.go` (three in-process servers: merged order, paging
+from different servers, filters, unreachable, slow and refusing servers named within the deadline, the role checked
+again, cleaned answers, metric sums per server and per database); `internal/monitor` (`TestAssembleOfPerServerSeriesEqualsOneRing`,
+`TestAlertSubjectsAndKeysetListing`); `internal/clustertest/gather_test.go` (a real three-server cluster:
+alerts of every server from every server with unique ids, paging by one, acknowledgement of an alert of another
+server with one audit event on its holder, logs of all servers newest first, one series per server, a role that the
+answering server refuses named as `refused`, a stopped server named).
+
+### Alerts raised since 0.5.0
+
+Each alert has a subject (`server:<id>`, optionally `|database:<name>` or `|ca`, or `cluster`); there is one open
+alert per kind and subject; a condition that holds again updates the open alert (severity, message) and never raises
+a second one; a kind whose reading was not measured is neither raised nor cleared.
+
+| Kind | Raised when | Cleared when | Where | Test |
+|---|---|---|---|---|
+| `certificateExpiring` | the server's own certificate has less than half of the part of its lifetime at which it is renewed left (the job has not managed to): `warning`; less than an eighth or expired: `critical`. On the server that holds the CA: the CA certificate has less than a year (`warning`) or 30 days (`critical`) left (the CA is not rotated) | the certificate is younger again (renewed) | every server, for itself; every `monitor-interval` | `TestEvaluateCertificateExpiring`; `TestCertificateAuthorityMissingOnTheLeader` (raised and cleared with real certificates) |
+| `certificateRenewalFailed` | three renewals in a row failed (see above) | the next renewal succeeded, or the certificate was renewed by other means | the server whose job it is | `TestRenewalJob...`; `TestCertificateAuthorityMissingOnTheLeader` |
+| `ledgerPendingTooOld` | the oldest pending ledger transaction of a database (`kingres.ledger_pending`) has waited `ledger-pending-max-age` (default 5 min; `critical` at twelve times that). The extension records no time for a pending entry, so the monitor remembers the lowest pending transaction number and when it first saw it (`monitor.PendingTracker`); when another entry becomes the oldest the age starts again (an under-estimate), and a restart of kingresd forgets it | the queue of that database is empty or its oldest entry changed | every server, per database, every third monitor round | `TestPendingTrackerCountsTheAgeOfTheOldestPendingEntry`, `TestEvaluateLedgerPendingTooOld`; `TestLedgerPendingTooOldAlert` (block builder switched off and on in a real instance) |
+| `versionMismatch` | the servers that answer `GET /internal/v1/state` report different KingresDB (kingresd) versions, PostgreSQL versions, or versions of `kingres_shard` / `kingres_ledger` (the `default_version` their instance offers); message lists what differs and on which servers | the servers agree; with fewer than two answers nothing changes | the manager leader, subject `cluster`, every `version-check-interval` | `TestEvaluateVersions`, `TestVersionMismatchAlertLifecycle` (raised once through repeated checks, unchanged while a server does not answer, cleared). Not tested with two real binaries of different versions: the test environment has one |
+
+Limit: an alert is kept by the server that raised it, so after a change of the manager leader (not implemented) the
+cluster-wide alerts of the old leader stay open there until it evaluates them again.
+
+### Listings with a hard cap
+
+`listTables`, `listRoles` and `listGrants` no longer read the whole result: the
+database builds one row more than the page needs, with keyset paging in SQL (cursors are opaque in the contract, so
+this needed no contract change): tables by (schema, name) with the class filter in the same query; roles by name;
+grants by (database, level, schema, table, grantee), per database and per level, with the grouping of the
+privileges in SQL. The cursors of 0.4.0 (offsets) are refused with 400. Test:
+`TestIntegrationKeysetPagingOfTablesRolesAndGrants` and the existing listing tests of `internal/store/pgstore`.
+The **bucket list** (`listBuckets`) still reads every bucket of a colocation group and pages in memory (at most the
+bucket count, 4096); `listDatabases` and the other small lists are unpaged by contract.
+
+### Corrections and decisions about the contract's texts
+
+| Item | Decision |
+|---|---|
+| Audit event of a forwarded request lost `forwardedBy` and `originRequestId` when a handler set `c.details` (add-server, join, leave, the query workbench, local settings) | fixed centrally: the audit writer adds the two facts after whatever the handler put in; `TestForwardedAuditKeepsForwardedByWhenTheHandlerSetsDetails` |
+| `leaveCluster` said the server returns to `standalone` | the server returns to `uninitialized` (instance and key deleted, new setup token); the contract text was wrong and is corrected in 0.5.0 |
+| no wording for the forced leave with a leader that cannot be reached | the contract now says: 202 with a `Task` of `id` 0, `state: done`, one step, not fetchable; and that a leader that refuses the revoked certificate of the server is the same situation (the server used to answer 503 whatever `force` said) |
+| unknown members of a request body: 400 `bad_request`, the contract said `validation_failed` | for the three requests the contract declares closed (`ServerUpdateRequest`, `LocalSettingsUpdate`, `InclusionProofRequest`) the answer is `validation_failed` with `errors[].code = unknown_property` (only `createInclusionProof` was wrong; its end-to-end test said `bad_request` and was corrected); for every other request body an unknown member stays `bad_request` and the contract says so (the `BadRequest` response) |
+| `removeServer` of a server that had reset itself (a forced leave) waited for it for ever | the leader treats a server that no longer presents a certificate of the cluster (`peerclient.ErrNotMember`) as already reset |
+
+### What rebalance and failover orchestration will need from this code
+
+- **The CA key and the revocation list move with the manager.** `<data-dir>/pki/ca.key`, `revoked.json`, the table
+  `kingres_cp.certificate` (every issued serial) and the columns `kingres_cp.server.certificate_*` /
+  `ordinal` are the state a new manager leader needs; until the key moves, every operation in the list above
+  answers `certificate_authority_unavailable` and the renewal jobs of the other servers fail visibly (three failures,
+  then the alert; a certificate that expires meanwhile can only be replaced by the leader's call
+  `renewServerCertificates`, so the key must move before the first certificate runs out: a third of a year by default).
+- **Use the existing calls for a server that is cut off.** `peerclient.Client.DoUnchecked` reaches a server whose
+  certificate is revoked (revocation list, reset); everything else is refused for it on purpose. A failover that
+  fences a server by revoking its certificates will not be able to make it renew, forward or record tasks.
+- **The peer directory carries ordinals** (`peers.Peer.Ordinal`); alerts of a failed-over manager stay with the
+  server that holds them (`gather.AlertID`); `Gatherer.Others` asks the records of the leader, the others ask the
+  directory.
+- **Cluster-wide reads tolerate a missing server** (`missingServers`): a rebalance or failover report should use the
+  same fan-out (`gather.Fanout`) with a deadline per server and report partial answers instead of failing.
+- **A step that must reach every server** uses `waitUnreachable` of the membership code (the task waits and says so
+  in `Task.detail`); a step that must not wait for a revoked or reset server uses `DoUnchecked` and treats
+  `ErrNotMember` as done (see `stepRemoveReset`).
+- **Server groups and `shouldHaveShards`** are still only records; the revocation of a server's certificates with
+  buckets (above) is the first operation that needs a rebalance to finish properly.
+
 ## Security review of 2026-11-14 (CP-01 to CP-07) and what the logs can contain
 
 The review `docs/reviews/2026-11-14-kingresd-control-plane.md` was fixed before anything else in this increment. Each
@@ -675,9 +879,9 @@ or bound with `$n`; the one `Fixed(k)` built from stored data (`ALTER DATABASE .
 pg_hba.conf, pg_ident.conf and postgresql.conf values are quoted or refused when they hold control characters; every
 request body is read through `http.MaxBytesReader` (REST 1 MiB default, internal API 1 to 16 MiB) and every peer answer
 through `io.LimitReader`; every log call goes through `slog`, which quotes values, and the audit sink cleans actor,
-address and resource id. Known and left: catalog listings (`listTables` and the role and grant listings) read every row
-of the catalog and page in memory, so their size follows the number of tables or roles that the database's own users can
-create; a hard cap needs a contract decision.
+address and resource id. Fixed afterwards: catalog listings (`listTables`, `listRoles`, `listGrants`) read every row of the
+catalog and paged in memory, so their size followed the number of tables or roles that the database's own users can
+create; they now page with a keyset in SQL (see "Listings with a hard cap").
 
 **What the logs can contain.** The text of statements is not written to the log of a managed instance (settings above;
 an operator who overrides them in `postgresql.conf` after the include of the managed file can undo this). The error
@@ -733,11 +937,11 @@ No task kind of the product is marked `NonIdempotent` today (all steps check wha
 
 ## Not done in this increment, and the manager's state on a leader change
 
-**Not done** (each still answers 422 `unsupported_operation`, or is unchanged): certificate revoke and renew (not in
-the contract yet), the renewal job, cluster-wide gathering of logs, alerts and metrics, raising the new alert kinds
-(the contract lists them; nothing raises them yet), and a dedicated problem for operations that need the CA when the
-leader does not hold it. Rebalance, failover and restoring preferred primaries stay as specified (8 operations
-answer "not yet"). Server groups, `updateServer`, inclusion proofs, ledger verification records, instance start and
+**Not done** (each still answers 422 `unsupported_operation`, or is unchanged): rebalance, failover and restoring
+preferred primaries (8 operations answer "not yet"), a way back for a server with buckets whose certificates were
+revoked (it needs rebalance), the rotation of the CA itself, and any change of the manager leader (the three bullets
+below). Certificate renewal and revocation, the dedicated problem for a leader without the CA key, cluster-wide
+logs, alerts and metrics and the four alert kinds that nothing raised are done (see "Fifth increment"). Server groups, `updateServer`, inclusion proofs, ledger verification records, instance start and
 stop, leave-cluster and local settings are done (see their sections).
 
 **What has to move with the manager (for the high-availability increment).** The certificate authority key
@@ -856,8 +1060,9 @@ The task subject of a verification is the database name, because the verificatio
 down, the outage is recorded as a resolved alert when the instance is back), `diskSpaceLow` (90% warning, 95% critical),
 `memoryPressure` (under 10% available), `replicationLagHigh` (over 60 s). Every 10 s; an alert is raised once per kind
 and server, cleared when the reading is fine again, and a value that could not be measured neither raises nor clears.
-Not covered because the contract has no alert kind for them: ledger verification problems, pending ledger transactions
-too old, and `version()` not containing "KingresDB" (the latter is logged as an error). Listing needs `kingres_readonly`,
+The alert kinds `ledgerPendingTooOld`, `versionMismatch`, `certificateExpiring` and `certificateRenewalFailed` came
+with contract 0.5.0 (see "Alerts raised since 0.5.0"). Not covered because the contract has no alert kind for it:
+`version()` not containing "KingresDB" (logged as an error). Listing needs `kingres_readonly`,
 acknowledging `kingres_ops`.
 
 **Metrics**: a sampler (every 10 s) fills a bounded in-memory ring (1440 points per series, 2000 series): connections,
@@ -886,10 +1091,10 @@ part, joining and adding a server (D4), removing an empty server (D5), the certi
 instances (D3), the cluster-wide create and drop of databases, role and grant changes and network rules, and the
 integration tests with three `kingresd` processes (package `clustertest`); see "Running several servers" and design
 notes 11 to 21. Tested against `kingres_shard` and `kingres_ledger` 0.2 built from the repository commit recorded by `scripts/install-extensions.sh`.
-**Not done:** server groups and the cluster-wide logs, alerts and metrics, the certificate renewal job, rebalance,
-failover and restoring preferred primaries, and contract 0.4.0 with what depends on it (inclusion proofs,
-verifications list and detail, instance start/stop, leave-cluster, the new alert kinds); every one of them still
-answers "not supported yet".
+**Not done at that time** (done later, see the fourth and fifth increments): server groups and the cluster-wide
+logs, alerts and metrics, the certificate renewal job, contract 0.4.0 with what depends on it (inclusion proofs,
+verifications list and detail, instance start/stop, leave-cluster, the new alert kinds). Rebalance, failover and
+restoring preferred primaries still answer "not supported yet".
 
 **CA and server certificates (`internal/pki`).** `init-cluster` creates the CA in `<data-dir>/pki/` (ECDSA P-256, ten
 years, `ca.key` mode 0600, written with an exclusive create) and this server's certificate (one year). The server key
@@ -965,7 +1170,13 @@ with another CA's certificate, with another internal version and from a server t
 interrupted (SIGKILL of the leader) at each of the seven steps; a failed join that cleans up; a cluster-wide task
 that waits for a stopped server and finishes when it is back; the network rules on every server; and that no
 password, verifier or private key is in a log, the audit file, a task row or another server's directory.
-`scripts/smoke3.sh <kingresd> [base-port]` is the same flow driven by curl and psql (output in the increment's report).
+`scripts/smoke3.sh <kingresd> [base-port]` is the same flow driven by curl and psql (output in the increment's report). Since the fifth increment it also covers server groups, an inclusion proof (checked by `kingres-verify` when its path
+is the third argument), stop and start of a follower's instance, a follower that leaves and is added again,
+cluster-wide logs, alerts and metrics with a server down, certificates that live 30 seconds being renewed while
+statements keep routing, and the revocation of a server's certificates (it prints `ok:` and `FAILED:` lines and exits
+with the number of failed checks).
+The fifth increment's tests are listed with their sections ("Certificates: renewal and revocation", "Cluster-wide
+logs, alerts and metrics", "Alerts raised since 0.5.0", "Listings with a hard cap").
 `scripts/install-extensions.sh [commit]` builds `kingres_shard` and `kingres_ledger` (both 0.2, with the fixes of their reviews) from a commit (default: the repository HEAD) into `~/kw-cp/install`, not from the working tree, and records the commit in `~/kw-cp/install/extensions-commit.txt`.
 
 ## Contract types and validation
@@ -1278,8 +1489,9 @@ new in 0.2.0 (the contract was not changed):
     buckets and answers 409 otherwise (the draining removal needs rebalance). The description and the conflict text
     should say which. `addServer` and `joinCluster` should say that the server stays `live` (not `pendingRebalance`) while
     no database has buckets.
-13. A way to revoke a server certificate without removing the server, and the revocation list of the cluster, are not
-    in the contract.
+13. A way to revoke a server certificate without removing the server (`revokeServerCertificates`), to renew
+    one now (`renewServerCertificates`) and the dedicated problem for a leader without the CA key came with contract
+    0.5.0.
 
 ## Starting and stopping the instance
 

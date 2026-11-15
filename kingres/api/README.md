@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.4.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.5.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and `kingres-cli`. Lint it and run the mechanical rule check with:
 
 ```
@@ -145,6 +145,7 @@ Each task kind has exactly one `subject.type`; `subject.id` is always a string.
 |---|---|---|
 | `cluster.init`, `cluster.join` | `cluster` | `cluster` |
 | `server.add`, `server.remove`, `server.failover`, `server.leave` | `server` | the `ServerId` (for `server.add` and `server.remove` the id the server registers under, which is the host of its address; for `server.leave` this server) |
+| `certificate.renew`, `certificate.revoke` (0.5.0) | `server` | the `ServerId` whose certificates are renewed or revoked |
 | `instance.start`, `instance.stop`, `instance.restart` | `instance` | the instance id (`node_id`) as a decimal string |
 | `database.create`, `database.update`, `database.drop` | `database` | the database name |
 | `table.distribute` | `table` | `database/schema.table` |
@@ -310,6 +311,86 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.5.0
+
+Revision written with the fifth increment of `kingresd` (certificate renewal and revocation, cluster-wide logs, alerts
+and metrics, the alert kinds that nothing raised). Summary for the panel: 2 operations added (88 operations, 71 paths), 0 breaking
+changes, 16 additive changes, 2 new problem codes, 5 corrections of text. **Every change of the schema is additive**: new
+operations, new optional response properties, new members of enums that the contract already says clients must
+tolerate unknown members of (`TaskKind`, `AlertKind`, `AuditAction`, `ProblemCode`); no property was removed, renamed,
+made required or given another meaning, and no operation changed its path, method or required role. A client generated
+from 0.4.0 keeps working; it simply does not know the new members.
+
+#### Breaking
+
+None. (Three behaviours of the server changed to what 0.4.0 already said or implied; see "Documentation", 1 to 3.
+A client that sent an alert cursor or a log cursor taken from a 0.4.0 server must start the list again: cursors are
+opaque and are not valid across revisions, as the conventions always said.)
+
+#### Additive
+
+1. **`renewServerCertificates`** (`POST /servers/{serverId}/certificates/renewals`, `kingres_admin`, 202 + task
+   `certificate.renew`): gives a server a new certificate now. **`revokeServerCertificates`**
+   (`POST /servers/{serverId}/certificates/revocations`, `kingres_admin`, 202 + task `certificate.revoke`): revokes
+   every certificate of the server and sends the revocation list to every server and instance. Both are described
+   with what stops working and how a revoked server gets back in. The renewal job of the servers (a server renews
+   its own certificate when less than a configurable part of its lifetime is left) has no operation: it is not
+   controlled through the API.
+2. **`TaskKind`** gains `certificate.renew` and `certificate.revoke` (subject type `server`, the server id; see the table
+   "Task kinds and subjects").
+3. **`ProblemCode`** gains `certificate_revoked` (409: `renewServerCertificates` and `revokeServerCertificates` for a
+   server whose certificates are revoked) and `certificate_authority_unavailable` (503: the operation needs the
+   certificate authority key and the manager leader does not hold it; also `addServer`, `joinCluster`, `removeServer`
+   and `leaveCluster`, which need it too). The `Conflict` response lists the first.
+4. **`MissingServer`** (new schema) and the optional properties **`partial`** (boolean) and **`missingServers`**
+   (array of `MissingServer`) of `LogPage`, `AlertPage` and `MetricQueryResult`. A cluster-wide answer is built
+   from the parts of every server; a server that did not answer within its deadline, could not be reached, refused
+   or answered something invalid is named with its `reason` (`timeout`, `unreachable`, `refused`,
+   `invalidAnswer`) and `partial` is true; the page holds what the others know. This is how a partial answer looks
+   (0.4.0 had no way to say it, and the server answered for one server only).
+5. **`listLogs`, `listAlerts` and `queryMetrics` answer for the whole cluster from any server**, as their summaries
+   always said. `listLogs` now also applies `level` as "this level or more severe" and `q` (they were ignored or
+   exact), orders by time, then server id, with a cursor that is a position in that order. `listAlerts` lists the
+   alerts that every server keeps about itself and the cluster alerts of the manager leader. `queryMetrics`
+   combines the samples of every server (a sum or an average by metric, as for one server).
+6. **Alert ids** are unique in the cluster and name the server that holds the alert (the high bits are a number that
+   the manager leader gave the server); ids stay below 2^53. `acknowledgeAlert` can be sent to any server.
+7. **`AlertKind`** gains `certificateRenewalFailed` (the renewal job of a server failed three times in a row). The kinds
+   `ledgerPendingTooOld`, `versionMismatch` and `certificateExpiring` were listed in 0.4.0 and are raised now, each with a
+   condition, a clearing condition and one open alert per subject: see the README of `kingresd`, "Alerts raised since
+   0.5.0".
+8. **`AuditAction`** gains `renewServerCertificates`, `revokeServerCertificates` (operations) and the events that are not
+   operations `certificateRenewed` and `certificateRenewalFailed` (actor `system`).
+9. **`Server.certificateRevokedAt`** (optional, nullable date-time): when the certificates of the server were revoked.
+10. `info.version` is 0.5.0.
+11. The description of `Alert.id` says what the number means; the description of the three list operations and
+    `queryMetrics` say what a cluster-wide answer is.
+12. `listTables`, `listRoles` and `listGrants` page with a keyset in SQL (a hard cap on what one request reads); the
+    wording of the cursor is unchanged (opaque), only a cursor of 0.4.0 is no longer valid.
+13. The 503 problem `certificate_authority_unavailable` carries `Retry-After: 60`.
+14. The `BadRequest` response states when an unknown member of a request body is `bad_request` and when it is
+    `validation_failed` (see "Documentation", 3).
+15. `renewServerCertificates` and `revokeServerCertificates` answer 404 for an unknown server, 409
+    `operation_in_progress` while another task of the server runs, 409 `conflict` for a server that is not an active
+    member; `revokeServerCertificates` refuses the manager leader's own server with 409 `server_hosts_map_group`.
+16. The task table lists the two new kinds with their subject.
+
+#### Documentation
+
+1. **`leaveCluster` returns the server to `uninitialized`**, not `standalone` (0.4.0 said `standalone`; the server
+   never did): its instance, key and certificates are deleted and it gets a new setup token.
+2. **A forced leave without a reachable manager leader** answers 202 with a `Task` of `id` 0 (`state` `done`, one
+   step) that cannot be fetched (`GET /tasks/0` is 404): no task can exist on a cluster that cannot be reached. The
+   same holds when the leader refuses the revoked certificate of the server. Without `force` this is 503
+   `service_unavailable`. The cluster keeps listing the server until `removeServer`.
+3. **Unknown members of a request body.** For the requests the contract declares closed (`ServerUpdateRequest`,
+   `LocalSettingsUpdate`, `InclusionProofRequest`) the answer is 400 `validation_failed` with `errors[].field` naming
+   the member and `code` `unknown_property` (the server answered `bad_request` for `InclusionProofRequest`; fixed).
+   For every other request body an unknown member is 400 `bad_request`, as before.
+4. `listLogs` and `listThisServerLogs` order, filter and page as described above; a `partial` answer is still 200.
+5. The revocation text states that a revoked server is still reachable by the leader for the revocation list and for
+   its own removal, and that a server that owns buckets has no way back before a rebalance exists.
 
 ### 0.4.0
 

@@ -71,6 +71,18 @@ func (s *Server) body(w http.ResponseWriter, r *http.Request, dst any) error {
 	return nil
 }
 
+// bodyClosed is body for the requests the contract declares closed: a member that
+// is not listed is 400 validation_failed.
+func (s *Server) bodyClosed(w http.ResponseWriter, r *http.Request, dst any) error {
+	if p := requireJSON(r); p != nil {
+		return p
+	}
+	if p := s.decodeJSONMode(w, r, dst, true); p != nil {
+		return p
+	}
+	return nil
+}
+
 func (s *Server) createRole(c *call, w http.ResponseWriter, r *http.Request) error {
 	o, err := s.needOps()
 	if err != nil {

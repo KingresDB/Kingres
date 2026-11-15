@@ -32,6 +32,9 @@ type Peer struct {
 	ServerID string `json:"serverId"`
 	// InternalAddr is host:port of its internal API.
 	InternalAddr string `json:"internalAddress"`
+	// Ordinal is the number the leader gave the server (0: not known yet); the
+	// ids of the alerts of the server are made from it.
+	Ordinal int `json:"ordinal,omitempty"`
 }
 
 // Validate checks a peer.
@@ -127,6 +130,9 @@ func (d *Directory) Put(p Peer) error {
 	m := make(map[string]Peer, len(d.m)+1)
 	for k, v := range d.m {
 		m[k] = v
+	}
+	if old, ok := d.m[p.ServerID]; ok && p.Ordinal == 0 {
+		p.Ordinal = old.Ordinal
 	}
 	m[p.ServerID] = p
 	if err := d.write(m); err != nil {

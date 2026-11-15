@@ -107,3 +107,36 @@ func TestGrantMatches(t *testing.T) {
 }
 
 func enc(s string) string { return base64.RawURLEncoding.EncodeToString([]byte(s)) }
+
+func TestTextKeyCursors(t *testing.T) {
+	c := EncodeTextKey("public", "orders")
+	parts, err := DecodeTextKey(c, 2)
+	if err != nil || len(parts) != 2 || parts[0] != "public" || parts[1] != "orders" {
+		t.Fatalf("%v %v", parts, err)
+	}
+	if parts, err := DecodeTextKey("", 2); parts != nil || err != nil {
+		t.Errorf("no cursor: %v %v", parts, err)
+	}
+	// A key of another shape, an offset cursor, junk.
+	for _, bad := range []string{EncodeTextKey("a"), EncodeOffset(3), EncodeKey(4), "!!", "dA"} {
+		if _, err := DecodeTextKey(bad, 2); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+	// Names with every character that matters survive.
+	odd := EncodeTextKey("a\"b", "c\x00d\n")
+	if got, err := DecodeTextKey(odd, 2); err != nil || got[0] != "a\"b" {
+		t.Errorf("odd names: %v %v", got, err)
+	}
+}
+
+func TestKeysetPage(t *testing.T) {
+	items := []string{"a", "b", "c", "d"}
+	page, next := KeysetPage(items, Page{Limit: 3}, func(s string) string { return "after-" + s })
+	if len(page) != 3 || next == nil || *next != "after-c" {
+		t.Errorf("%v %v", page, next)
+	}
+	if page, next := KeysetPage(items[:3], Page{Limit: 3}, func(s string) string { return s }); len(page) != 3 || next != nil {
+		t.Errorf("last page: %v %v", page, next)
+	}
+}

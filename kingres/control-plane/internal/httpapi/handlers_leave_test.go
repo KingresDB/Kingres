@@ -147,3 +147,17 @@ func (memberStub) AddServer(context.Context, string, api.AddServerRequest, strin
 func (memberStub) RemoveServer(context.Context, string, string) (task.Task, error) {
 	return task.Task{}, nil
 }
+
+func (f *fakeLeaver) RenewServerCertificates(context.Context, string, string) (task.Task, error) {
+	return task.Task{}, nil
+}
+func (f *fakeLeaver) RevokeServerCertificates(context.Context, string, string) (task.Task, error) {
+	return task.Task{}, nil
+}
+
+func (memberStub) RenewServerCertificates(context.Context, string, string) (task.Task, error) {
+	return task.Task{}, nil
+}
+func (memberStub) RevokeServerCertificates(context.Context, string, string) (task.Task, error) {
+	return task.Task{}, nil
+}

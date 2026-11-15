@@ -140,3 +140,71 @@ func TestAlertLifecycleAgainstPostgreSQL(t *testing.T) {
 		t.Errorf("outage: %+v", page)
 	}
 }
+
+// The cluster-wide metric answer is built from the resampled series of every
+// server; it must equal what one ring holding all of them would answer.
+func TestAssembleOfPerServerSeriesEqualsOneRing(t *testing.T) {
+	t0 := time.Date(2026, 11, 14, 10, 0, 0, 0, time.UTC)
+	fill := func(rings ...*monitor.Ring) {
+		for i, r := range rings {
+			host := string(rune('a' + i))
+			for k := 0; k < 6; k++ {
+				r.Add(monitor.Series{Metric: "connections", ServerID: host}, t0.Add(time.Duration(k)*time.Second), p(float64(10*(i+1)+k)))
+				r.Add(monitor.Series{Metric: "databaseSizeBytes", Database: "shop"}, t0.Add(time.Duration(k)*time.Second), p(float64(100*(i+1))))
+			}
+		}
+	}
+	one := monitor.NewRing(100, 100)
+	a, b := monitor.NewRing(100, 100), monitor.NewRing(100, 100)
+	// One ring cannot hold two series with the same labels; give the database series of b another name.
+	for k := 0; k < 6; k++ {
+		one.Add(monitor.Series{Metric: "connections", ServerID: "a"}, t0.Add(time.Duration(k)*time.Second), p(float64(10+k)))
+		one.Add(monitor.Series{Metric: "connections", ServerID: "b"}, t0.Add(time.Duration(k)*time.Second), p(float64(20+k)))
+	}
+	fill(a, b)
+	to := t0.Add(6 * time.Second)
+	n := monitor.NumPoints(t0, to, 2)
+	for _, groupBy := range []string{"", "server"} {
+		want, err := one.Query("connections", t0, to, 2, "", "", groupBy, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var raw []monitor.Result
+		for _, r := range []*monitor.Ring{a, b} {
+			rs, err := r.Raw("connections", t0, to, 2, "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw = append(raw, rs...)
+		}
+		got := monitor.Assemble(t0, 2, n, raw, "", "", groupBy, true)
+		if len(got) != len(want) {
+			t.Fatalf("groupBy %q: %d series, want %d", groupBy, len(got), len(want))
+		}
+		for i := range want {
+			if got[i].Series != want[i].Series || len(got[i].Points) != len(want[i].Points) {
+				t.Fatalf("groupBy %q series %d: %+v vs %+v", groupBy, i, got[i].Series, want[i].Series)
+			}
+			for j := range want[i].Points {
+				gv, wv := got[i].Points[j].V, want[i].Points[j].V
+				if (gv == nil) != (wv == nil) || (gv != nil && *gv != *wv) {
+					t.Errorf("groupBy %q series %d point %d: %v vs %v", groupBy, i, j, gv, wv)
+				}
+			}
+		}
+	}
+	// A database series that two servers report is summed (the size of the database on both).
+	var raw []monitor.Result
+	for _, r := range []*monitor.Ring{a, b} {
+		rs, _ := r.Raw("databaseSizeBytes", t0, to, 2, "", "")
+		raw = append(raw, rs...)
+	}
+	agg := monitor.Assemble(t0, 2, n, raw, "", "", "", true)
+	if len(agg) != 1 || agg[0].Points[0].V == nil || *agg[0].Points[0].V != 300 {
+		t.Errorf("sum over the servers: %+v", agg)
+	}
+	byDB := monitor.Assemble(t0, 2, n, raw, "", "", "database", true)
+	if len(byDB) != 1 || byDB[0].Series.Database != "shop" || *byDB[0].Points[0].V != 300 {
+		t.Errorf("per database: %+v", byDB)
+	}
+}

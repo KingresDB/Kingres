@@ -42,8 +42,12 @@ type internalDeps struct {
 	// forwarded operation (only ever called on the leader).
 	leaders *leader.Resolver
 	forward func(ctx context.Context, peer string, req internalapi.ForwardRequest) (internalapi.ForwardResponse, error)
+	// gather answers a cluster-wide read for a server of the cluster.
+	gather func(ctx context.Context, peer string, req internalapi.ForwardRequest) (internalapi.ForwardResponse, error)
 	// receiver answers the membership calls.
 	receiver *membership.Receiver
+	// members is the membership manager (nil without an internal API).
+	members *membership.Manager
 	// ops records the tasks of instance operations (nil: none); lastLeader is
 	// the leader known last, used while this server's instance is stopped.
 	ops        *ops.Ops
@@ -84,14 +88,23 @@ func serveInternal(ctx context.Context, d internalDeps) {
 	}
 	me := d.serverHost
 	be := internalapi.Backend{
-		State: func(context.Context) internalapi.State {
-			return internalapi.State{ServerID: me, NodeState: string(d.node.State()), Version: d.version,
+		State: func(ctx context.Context) internalapi.State {
+			st := internalapi.State{ServerID: me, NodeState: string(d.node.State()), Version: d.version,
 				InternalVersion: internalapi.Version, UptimeSeconds: int64(time.Since(d.started).Seconds())}
+			if d.members != nil && d.node.State() == setup.Clustered {
+				vctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+				defer cancel()
+				if v, err := d.members.LocalVersions(vctx); err == nil {
+					st.PostgreSQL, st.Extensions = v.PostgreSQL, v.Extensions
+				}
+			}
+			return st
 		},
 		// The leader is the server holding the primary of shard group 0.
 		Leader:    leaderOf(d),
 		Self:      me,
 		Forward:   d.forward,
+		Gather:    d.gather,
 		Revoked:   d.svc.RevokedSerials,
 		Handle:    handleCall(d),
 		Bootstrap: d.receiver.Bootstrap,
@@ -243,5 +256,31 @@ func handleCall(d internalDeps) func(ctx context.Context, key, peer string, body
 			return d.ops.HandleTaskCall(ctx, key, body)
 		}
 		return d.receiver.Handle(ctx, key, peer, body)
+	}
+}
+
+// runVersionCheck compares the versions of the servers every interval while this
+// server is the manager leader (alert versionMismatch).
+func runVersionCheck(ctx context.Context, members *membership.Manager, leaders *leader.Resolver, self string, every time.Duration, log *slog.Logger) {
+	refreshed := false
+	for ctx.Err() == nil {
+		lctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		id, err := leaders.Get(lctx)
+		cancel()
+		if err == nil && id == self {
+			if !refreshed {
+				members.RefreshDirectory(ctx)
+				refreshed = true
+			}
+			cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+			if err := members.CheckVersions(cctx); err != nil && ctx.Err() == nil {
+				log.Warn("checking the versions of the servers", "error", err)
+			}
+			cancel()
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(every):
+		}
 	}
 }

@@ -89,6 +89,25 @@ type Config struct {
 	// ServerHost is the host name this server registers in the cluster
 	// catalog; it is the server id. Empty means the machine's host name.
 	ServerHost string
+	// CertificateLifetime is the validity of the server certificates that the
+	// CA of this server signs (it only matters on the server that holds the
+	// CA). CertificateRenewFraction is the part of the lifetime that a
+	// certificate must still have left when its server renews it;
+	// CertificateCheckInterval is how often the renewal job looks, and
+	// CertificateRetryInterval the pause after a failed renewal.
+	CertificateLifetime      time.Duration
+	CertificateRenewFraction float64
+	CertificateCheckInterval time.Duration
+	CertificateRetryInterval time.Duration
+	// MonitorInterval is how often the health checks and the sampler run;
+	// LedgerPendingMaxAge is the age of the oldest pending ledger transaction
+	// that raises ledgerPendingTooOld; VersionCheckInterval how often the manager
+	// leader compares the versions of the servers; GatherTimeout is the time one
+	// server gets to answer the part it owes to a cluster-wide read.
+	MonitorInterval      time.Duration
+	LedgerPendingMaxAge  time.Duration
+	VersionCheckInterval time.Duration
+	GatherTimeout        time.Duration
 }
 
 // setting describes one configuration key.
@@ -224,29 +243,63 @@ var settings = []setting{
 		apply: str(func(c *Config) *string { return &c.InternalListen })},
 	{key: "server-host", env: "KINGRES_SERVER_HOST", usage: "host name this server registers in the cluster catalog (default: the machine's host name)",
 		apply: str(func(c *Config) *string { return &c.ServerHost })},
+	{key: "certificate-lifetime", env: "KINGRES_CERTIFICATE_LIFETIME", usage: "validity of the server certificates this server's CA signs (default 8760h; at least 5s, shorter values are for tests)",
+		apply: func(c *Config, v string) error {
+			if err := dur(func(c *Config) *time.Duration { return &c.CertificateLifetime })(c, v); err != nil {
+				return err
+			}
+			if c.CertificateLifetime < 5*time.Second {
+				return fmt.Errorf("certificate lifetime %s is below 5s", v)
+			}
+			return nil
+		}},
+	{key: "certificate-renew-fraction", env: "KINGRES_CERTIFICATE_RENEW_FRACTION", usage: "renew the certificates of this server when less than this part of their lifetime is left (0 to 0.9, default 0.3333)",
+		apply: func(c *Config, v string) error {
+			f, err := strconv.ParseFloat(v, 64)
+			if err != nil || f <= 0 || f > 0.9 {
+				return fmt.Errorf("certificate renew fraction %q must be a number above 0 and at most 0.9", v)
+			}
+			c.CertificateRenewFraction = f
+			return nil
+		}},
+	{key: "certificate-check-interval", env: "KINGRES_CERTIFICATE_CHECK_INTERVAL", usage: "how often the certificate renewal job looks at the certificates of this server (default 1h)",
+		apply: dur(func(c *Config) *time.Duration { return &c.CertificateCheckInterval })},
+	{key: "certificate-retry-interval", env: "KINGRES_CERTIFICATE_RETRY_INTERVAL", usage: "pause after a failed certificate renewal before it is tried again (default 1m)",
+		apply: dur(func(c *Config) *time.Duration { return &c.CertificateRetryInterval })},
+	{key: "monitor-interval", env: "KINGRES_MONITOR_INTERVAL", usage: "how often the health checks and the metric sampler run (default 10s)",
+		apply: dur(func(c *Config) *time.Duration { return &c.MonitorInterval })},
+	{key: "ledger-pending-max-age", env: "KINGRES_LEDGER_PENDING_MAX_AGE", usage: "age of the oldest pending ledger transaction that raises the alert ledgerPendingTooOld (default 5m)",
+		apply: dur(func(c *Config) *time.Duration { return &c.LedgerPendingMaxAge })},
+	{key: "version-check-interval", env: "KINGRES_VERSION_CHECK_INTERVAL", usage: "how often the manager leader compares the versions of the servers (default 1m)",
+		apply: dur(func(c *Config) *time.Duration { return &c.VersionCheckInterval })},
+	{key: "gather-timeout", env: "KINGRES_GATHER_TIMEOUT", usage: "time one server gets to answer its part of a cluster-wide read of logs, alerts or metrics (default 3s)",
+		apply: dur(func(c *Config) *time.Duration { return &c.GatherTimeout })},
 }
 
 // Defaults returns the built-in configuration.
 func Defaults() Config {
 	return Config{
-		Listen:            "127.0.0.1:8091",
-		PostgresDSN:       "host=127.0.0.1 port=5432 dbname=postgres",
-		DataDir:           "kingresd-data",
-		LogLevel:          "info",
-		LogFormat:         "text",
-		SessionTTL:        8 * time.Hour,
-		MaxSessions:       10000,
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		RequestTimeout:    30 * time.Second,
-		ShutdownTimeout:   15 * time.Second,
-		MaxBodyBytes:      1 << 20,
-		LoginRateLimit:    10,
-		LoginRateWindow:   time.Minute,
-		PGPort:            5432,
-		PGListen:          "127.0.0.1",
+		Listen:              "127.0.0.1:8091",
+		PostgresDSN:         "host=127.0.0.1 port=5432 dbname=postgres",
+		DataDir:             "kingresd-data",
+		LogLevel:            "info",
+		LogFormat:           "text",
+		SessionTTL:          8 * time.Hour,
+		MaxSessions:         10000,
+		ReadHeaderTimeout:   10 * time.Second,
+		ReadTimeout:         30 * time.Second,
+		WriteTimeout:        60 * time.Second,
+		IdleTimeout:         120 * time.Second,
+		RequestTimeout:      30 * time.Second,
+		ShutdownTimeout:     15 * time.Second,
+		MaxBodyBytes:        1 << 20,
+		LoginRateLimit:      10,
+		LoginRateWindow:     time.Minute,
+		PGPort:              5432,
+		PGListen:            "127.0.0.1",
+		CertificateLifetime: 365 * 24 * time.Hour, CertificateRenewFraction: 1.0 / 3.0,
+		CertificateCheckInterval: time.Hour, CertificateRetryInterval: time.Minute,
+		MonitorInterval: 10 * time.Second, LedgerPendingMaxAge: 5 * time.Minute, VersionCheckInterval: time.Minute, GatherTimeout: 3 * time.Second,
 	}
 }
 

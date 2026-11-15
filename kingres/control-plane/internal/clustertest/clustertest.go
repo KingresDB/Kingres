@@ -56,6 +56,9 @@ type Node struct {
 	Dir     string
 	DataDir string
 	LogFile string
+	// Extra are further command-line flags of kingresd (a test that needs a
+	// setting, for example a short certificate lifetime); they apply from the next Start.
+	Extra []string
 
 	mu     sync.Mutex
 	cmd    *exec.Cmd
@@ -137,9 +140,10 @@ func (c *Cluster) Close() {
 func (c *Cluster) Leader() *Node { return c.Nodes[0] }
 
 func (n *Node) args() []string {
-	return []string{"-listen", n.Host + ":" + strconv.Itoa(n.APIPort), "-internal-listen", n.Host + ":" + strconv.Itoa(n.IntPort),
+	args := []string{"-listen", n.Host + ":" + strconv.Itoa(n.APIPort), "-internal-listen", n.Host + ":" + strconv.Itoa(n.IntPort),
 		"-data-dir", n.DataDir, "-socket-dir", filepath.Join(n.Dir, "s"), "-log-format", "json", "-login-rate-limit", "1000",
 		"-pg-bin-dir", pgtest.BinDir(), "-pg-port", strconv.Itoa(n.PGPort), "-pg-listen", "127.0.0.1," + n.Host, "-server-host", n.Host}
+	return append(args, n.Extra...)
 }
 
 // Start starts the process; it returns when the REST API answers.

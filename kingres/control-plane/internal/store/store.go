@@ -13,6 +13,7 @@ package store
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -257,4 +258,39 @@ func GrantMatches(g api.Grant, f GrantFilter) bool {
 		return false
 	}
 	return true
+}
+
+// EncodeTextKey returns the keyset cursor for a key made of several text parts
+// (for example schema and table name): base64url of "t" and a JSON array.
+func EncodeTextKey(parts ...string) string {
+	b, _ := json.Marshal(parts)
+	return base64.RawURLEncoding.EncodeToString(append([]byte("t"), b...))
+}
+
+// DecodeTextKey parses a cursor made by EncodeTextKey with n parts; "" means
+// "no bound" (nil).
+func DecodeTextKey(cursor string, n int) ([]string, error) {
+	if cursor == "" {
+		return nil, nil
+	}
+	b, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil || len(b) < 3 || b[0] != 't' || len(b) > 4096 {
+		return nil, ErrInvalidCursor
+	}
+	var parts []string
+	if json.Unmarshal(b[1:], &parts) != nil || len(parts) != n {
+		return nil, ErrInvalidCursor
+	}
+	return parts, nil
+}
+
+// KeysetPage cuts items read with a limit of p.Limit+1 to the page and returns
+// the cursor of the next one (nil on the last page); key makes the cursor from
+// the last item of the page.
+func KeysetPage[T any](items []T, p Page, key func(T) string) ([]T, *string) {
+	if len(items) <= p.Limit {
+		return items, nil
+	}
+	next := key(items[p.Limit-1])
+	return items[:p.Limit], &next
 }

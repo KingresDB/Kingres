@@ -25,14 +25,18 @@ const HeaderPin = "X-Kingres-Pin-Sha256"
 type Members interface {
 	AddServer(ctx context.Context, actor string, req api.AddServerRequest, pin string) (task.Task, error)
 	RemoveServer(ctx context.Context, actor, id string) (task.Task, error)
+	RenewServerCertificates(ctx context.Context, actor, id string) (task.Task, error)
+	RevokeServerCertificates(ctx context.Context, actor, id string) (task.Task, error)
 }
 
 func (s *Server) memberHandlers() map[string]handlerFunc {
 	return map[string]handlerFunc{
-		"joinCluster":  s.joinCluster,
-		"addServer":    s.addServer,
-		"removeServer": s.removeServer,
-		"leaveCluster": s.leaveCluster,
+		"joinCluster":              s.joinCluster,
+		"addServer":                s.addServer,
+		"removeServer":             s.removeServer,
+		"leaveCluster":             s.leaveCluster,
+		"renewServerCertificates":  s.renewServerCertificates,
+		"revokeServerCertificates": s.revokeServerCertificates,
 	}
 }
 
@@ -147,6 +151,44 @@ func (s *Server) removeServer(c *call, w http.ResponseWriter, r *http.Request) e
 		return p
 	}
 	t, err := m.RemoveServer(r.Context(), c.session.Username, id)
+	if err != nil {
+		return err
+	}
+	s.accepted(w, r, t)
+	return nil
+}
+
+// renewServerCertificates is POST /servers/{serverId}/certificates/renewals.
+func (s *Server) renewServerCertificates(c *call, w http.ResponseWriter, r *http.Request) error {
+	m, err := s.needMembers()
+	if err != nil {
+		return err
+	}
+	pp := newParams(r)
+	id := pp.pathServerID("serverId")
+	if p := pp.err(); p != nil {
+		return p
+	}
+	t, err := m.RenewServerCertificates(r.Context(), c.session.Username, id)
+	if err != nil {
+		return err
+	}
+	s.accepted(w, r, t)
+	return nil
+}
+
+// revokeServerCertificates is POST /servers/{serverId}/certificates/revocations.
+func (s *Server) revokeServerCertificates(c *call, w http.ResponseWriter, r *http.Request) error {
+	m, err := s.needMembers()
+	if err != nil {
+		return err
+	}
+	pp := newParams(r)
+	id := pp.pathServerID("serverId")
+	if p := pp.err(); p != nil {
+		return p
+	}
+	t, err := m.RevokeServerCertificates(r.Context(), c.session.Username, id)
 	if err != nil {
 		return err
 	}

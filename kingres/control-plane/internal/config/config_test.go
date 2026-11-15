@@ -141,3 +141,52 @@ func TestSlogLevel(t *testing.T) {
 		}
 	}
 }
+
+func TestCertificateSettings(t *testing.T) {
+	cfg, err := Load(nil, envOf(nil), &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CertificateLifetime != 365*24*time.Hour || cfg.CertificateRenewFraction < 0.33 || cfg.CertificateRenewFraction > 0.34 ||
+		cfg.CertificateCheckInterval != time.Hour || cfg.CertificateRetryInterval != time.Minute {
+		t.Errorf("defaults: %v %v %v %v", cfg.CertificateLifetime, cfg.CertificateRenewFraction, cfg.CertificateCheckInterval, cfg.CertificateRetryInterval)
+	}
+	cfg, err = Load([]string{"-certificate-lifetime", "20s", "-certificate-renew-fraction", "0.5", "-certificate-check-interval", "250ms", "-certificate-retry-interval", "100ms"}, envOf(nil), &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CertificateLifetime != 20*time.Second || cfg.CertificateRenewFraction != 0.5 || cfg.CertificateCheckInterval != 250*time.Millisecond || cfg.CertificateRetryInterval != 100*time.Millisecond {
+		t.Errorf("flags: %+v", cfg)
+	}
+	for _, bad := range [][]string{
+		{"-certificate-lifetime", "1s"}, {"-certificate-renew-fraction", "0"}, {"-certificate-renew-fraction", "0.95"},
+		{"-certificate-renew-fraction", "x"}, {"-certificate-check-interval", "0s"},
+	} {
+		if _, err := Load(bad, envOf(nil), &bytes.Buffer{}); err == nil {
+			t.Errorf("%v was accepted", bad)
+		}
+	}
+	if cfg, err = Load(nil, envOf(map[string]string{"KINGRES_CERTIFICATE_LIFETIME": "90s"}), &bytes.Buffer{}); err != nil || cfg.CertificateLifetime != 90*time.Second {
+		t.Errorf("environment: %v %v", cfg.CertificateLifetime, err)
+	}
+}
+
+func TestMonitoringAndGatheringSettings(t *testing.T) {
+	cfg, err := Load(nil, envOf(nil), &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MonitorInterval != 10*time.Second || cfg.LedgerPendingMaxAge != 5*time.Minute || cfg.GatherTimeout != 3*time.Second || cfg.VersionCheckInterval != time.Minute {
+		t.Errorf("defaults: %v %v %v %v", cfg.MonitorInterval, cfg.LedgerPendingMaxAge, cfg.GatherTimeout, cfg.VersionCheckInterval)
+	}
+	cfg, err = Load([]string{"-monitor-interval", "500ms", "-ledger-pending-max-age", "4s", "-gather-timeout", "800ms", "-version-check-interval", "2s"}, envOf(nil), &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MonitorInterval != 500*time.Millisecond || cfg.LedgerPendingMaxAge != 4*time.Second || cfg.GatherTimeout != 800*time.Millisecond || cfg.VersionCheckInterval != 2*time.Second {
+		t.Errorf("flags: %+v", cfg)
+	}
+	if _, err := Load([]string{"-gather-timeout", "0s"}, envOf(nil), &bytes.Buffer{}); err == nil {
+		t.Error("a zero gather timeout was accepted")
+	}
+}

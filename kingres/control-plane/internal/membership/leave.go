@@ -58,6 +58,9 @@ func (m *Manager) LeaveFromPeer(ctx context.Context, peer string, req wire.Leave
 	if peer == "" || req.Actor == "" || len(req.Actor) > 63 {
 		return wire.LeaveResponse{}, problem.New(problem.BadRequest, "The call needs the administrator who asked.")
 	}
+	if _, err := m.ca(); err != nil {
+		return wire.LeaveResponse{}, err
+	}
 	f, err := m.leaderFacts(ctx, peer)
 	if err != nil {
 		m.log().Warn("reading the catalog for a leave failed", "server", peer, "error", err)
@@ -167,10 +170,8 @@ func (m *Manager) stepLeaveRevoke(ctx context.Context, env *task.Env) error {
 	if err != nil {
 		return err
 	}
-	if in.Serial != "" {
-		if err := ca.Revoke(in.Serial, time.Now()); err != nil {
-			return err
-		}
+	if err := m.revokeServerCertificates(ctx, ca, in.ServerID, in.Serial); err != nil {
+		return err
 	}
 	m.Client.Forget(in.ServerID)
 	if err := m.distributeRevocations(ctx); err != nil {
@@ -220,6 +221,9 @@ func (m *Manager) LeaveCluster(ctx context.Context, actor string, force bool) (t
 		return taskOfLeave(res, m.Self), nil
 	case errors.Is(err, peerclient.ErrUnreachable), errors.Is(err, peerclient.ErrUnknownPeer):
 		return m.leaveAlone(actor, force, "The manager leader cannot be reached.")
+	case errors.As(err, &ae) && ae.Status == 401 && ae.Code == "certificate_refused":
+		// The certificates of this server were revoked: the cluster does not talk to it.
+		return m.leaveAlone(actor, force, "The cluster no longer accepts the certificate of this server.")
 	case errors.As(err, &ae):
 		return task.Task{}, problemOfAPIError(ae)
 	}
@@ -300,6 +304,11 @@ func (m *Manager) ResetLocal(ctx context.Context) error {
 	}
 	if m.SelfPeer.ServerID != "" {
 		_ = m.Peers.Put(m.SelfPeer)
+	}
+	// Connections opened with the certificate that was just deleted must not be used again
+	// (the leader checks the certificate at every request).
+	if m.OnCertificateInstalled != nil {
+		m.OnCertificateInstalled()
 	}
 	_ = os.Remove(m.leaveMarker())
 	return nil

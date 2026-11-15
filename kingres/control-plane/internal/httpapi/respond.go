@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/store"
@@ -38,6 +39,13 @@ func (s *Server) writeJSON(w http.ResponseWriter, r *http.Request, status int, v
 // decodeJSON reads a request body into dst. Unknown fields, trailing data and
 // bodies over the size limit are rejected with 400 problems.
 func (s *Server) decodeJSON(w http.ResponseWriter, r *http.Request, dst any) *problem.Problem {
+	return s.decodeJSONMode(w, r, dst, false)
+}
+
+// decodeJSONMode decodes a request body. closed makes a member that the request
+// does not list a 400 validation_failed that names the member (the requests the
+// contract declares closed); otherwise it is 400 bad_request.
+func (s *Server) decodeJSONMode(w http.ResponseWriter, r *http.Request, dst any, closed bool) *problem.Problem {
 	r.Body = http.MaxBytesReader(w, r.Body, s.deps.MaxBodyBytes)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
@@ -48,6 +56,10 @@ func (s *Server) decodeJSON(w http.ResponseWriter, r *http.Request, dst any) *pr
 			return problem.New(problem.BadRequest, "The request body is empty.")
 		case errors.As(err, &tooBig):
 			return problem.New(problem.BadRequest, fmt.Sprintf("The request body exceeds %d bytes.", tooBig.Limit))
+		case closed && strings.HasPrefix(err.Error(), "json: unknown field "):
+			name, _ := strconv.Unquote(strings.TrimPrefix(err.Error(), "json: unknown field "))
+			return problem.Validation("The request has a member that is not part of it.",
+				problem.FieldError{Field: "/" + name, Message: "unknown member", Code: "unknown_property"})
 		default:
 			return problem.New(problem.BadRequest, "The request body is not valid JSON for this operation: "+safeJSONError(err))
 		}

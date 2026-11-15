@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: KingresDB Management API
-  version: 0.4.0
+  version: 0.5.0
   summary: REST API of the KingresDB management panel, CLI and manager.
   description: |
     The single REST API served by `kingresd` on every KingresDB server. The web panel
@@ -671,7 +671,9 @@ paths:
       operationId: leaveCluster
       summary: Leave the cluster
       description: |
-        Detaches this server from the cluster and returns it to the `standalone` state. Conflicts (409),
+        Detaches this server from the cluster and returns it to the `uninitialized` state: it deletes its instance,
+        its key and its certificates, forgets the cluster and gets a new setup token, so that it can join or be
+        added again (corrected in 0.5.0: 0.4.0 said `standalone`, which the server never did). Conflicts (409),
         checked in this order against this server's copy of the catalog:
 
         1. `last_server`: this is the only server of the cluster.
@@ -687,6 +689,14 @@ paths:
         checks above are still made, from the local copy of the catalog, and a refusal is final. A server
         that left with `force` while the cluster was unreachable is still listed by the cluster until it
         is removed or failed over from there (`removeServer`).
+
+        **Answer of a forced leave without a leader (0.5.0 wording of what 0.4.0 left unsaid).** With `force: true`
+        and a manager leader that cannot be reached or is not known, or that refuses the certificate of this server
+        because it was revoked (`revokeServerCertificates`), no task can exist anywhere, so the answer is `202`
+        with a `Task` whose `kind` is `server.leave`, `state` is `done`, `id` is `0` and which has one step; its
+        `Location` names a task that cannot be fetched (`GET /tasks/0` answers 404, here and on every server). The
+        server resets itself about a second after the answer. Without `force` the same situation is 503
+        `service_unavailable` and the server stays a member.
       tags: [This server]
       x-required-role: kingres_admin
       requestBody:
@@ -987,6 +997,82 @@ paths:
       responses:
         '202': { $ref: '#/components/responses/AcceptedTask' }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /servers/{serverId}/certificates/renewals:
+    parameters:
+      - $ref: '#/components/parameters/ServerId'
+    post:
+      operationId: renewServerCertificates
+      summary: Renew the certificates of a server now
+      description: |
+        Added in 0.5.0. Gives the server a new certificate from the cluster certificate authority now,
+        without waiting for the renewal job (every server renews its own certificate by itself when less
+        than a configurable part of its lifetime is left). One certificate is the server certificate and
+        the client certificate of the server's internal API and of its PostgreSQL instance, so this renews
+        both. The key of the server stays; the new certificate carries the same names. Nothing is restarted:
+        the internal API and the connections to the other servers read the certificate at every handshake
+        and the PostgreSQL instance of the server re-reads it with a reload. Connections that are open keep
+        working. Returns a task (`certificate.renew`, subject type `server`).
+
+        The manager leader holds the certificate authority key today. When it does not, the operation is
+        refused with 503 `certificate_authority_unavailable`. 404 for an unknown server; 409
+        `certificate_revoked` for a server whose certificates were revoked (it gets no new certificate: remove
+        it with `removeServer` or let it leave, and join it again); 409 `operation_in_progress` while another
+        task of this server runs; 409 `conflict` for a server that is not an active member.
+      tags: [Servers]
+      x-required-role: kingres_admin
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedTask' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /servers/{serverId}/certificates/revocations:
+    parameters:
+      - $ref: '#/components/parameters/ServerId'
+    post:
+      operationId: revokeServerCertificates
+      summary: Revoke the certificates of a server
+      description: |
+        Added in 0.5.0. Revokes every certificate that was issued to the server and may still be valid, and
+        sends the revocation list to every server and every PostgreSQL instance of the cluster. Returns a
+        task (`certificate.revoke`, subject type `server`; it waits for a server that cannot be reached, as
+        every cluster-wide task does).
+
+        **What stops working.** From the moment the task has sent the list to a server, that server's
+        internal API refuses the revoked server (every call it makes, including forwarding, recording its
+        tasks and asking to leave, answers 401), and the PostgreSQL instances refuse its certificate
+        (`hostssl ... cert`, the sharding extension's connections to and from it), so statements that need a
+        shard on the revoked server fail. Connections that were open before keep running until they end.
+        The revoked server keeps running and keeps its data; its own REST API still answers for what it can
+        do alone (`GET /this-server`, its instances) but it cannot change the cluster.
+
+        **How the server gets back in.** A revoked server never gets a new certificate (`renewServerCertificates`
+        answers 409 `certificate_revoked`; its renewal job is refused too). Take it out and add it again: a
+        server that owns no bucket is removed with `removeServer` (or it leaves with `leaveCluster` and
+        `force: true`, which resets it without the cluster, after which `removeServer` still has to take it out of
+        the cluster's list) and joins again with a new setup token and a new key. A server that still owns buckets
+        cannot be removed before a rebalance has emptied it, which is not possible while it is cut off; this version
+        has no other way back. The leader still reaches the revoked server to give it the revocation list and to tell
+        it to reset itself.
+
+        The manager leader's own certificates cannot be revoked (409 `server_hosts_map_group`). The
+        operation needs the certificate authority key like `renewServerCertificates`: 503
+        `certificate_authority_unavailable` when the manager leader does not hold it. 404 for an unknown
+        server; 409 `certificate_revoked` when they are revoked already; 409 `operation_in_progress`.
+      tags: [Servers]
+      x-required-role: kingres_admin
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedTask' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -2739,7 +2825,14 @@ paths:
     get:
       operationId: listAlerts
       summary: List alerts
-      description: Alerts raised by the manager, newest first.
+      description: |
+        Alerts of the whole cluster, newest first, from any server: each server keeps the alerts about itself,
+        and the server that receives the request asks the others for theirs in parallel (see `partial` and
+        `missingServers` of `AlertPage`). The alerts about the cluster as a whole (`versionMismatch`) are kept by
+        the manager leader. An alert `id` is unique in the cluster and names the server that holds the alert (the
+        high bits are that server's number), so `PUT /alerts/{alertId}/acknowledgement` can be sent to any
+        server. Cursors are keyset cursors over one order (time raised, then id): a page boundary is the same
+        whichever servers answered; a cursor of 0.4.0 is refused with 400 `validation_failed`.
       tags: [Alerts]
       x-required-role: kingres_readonly
       parameters:
@@ -2803,8 +2896,13 @@ paths:
       operationId: listLogs
       summary: Search cluster logs
       description: |
-        Log entries from every server, newest first. For one server only, filter by `serverId` or use `/this-server/logs`.
-        Requires `kingres_ops` (see `listThisServerLogs`).
+        Log entries from every server, newest first, from any server: the server that receives the request asks the
+        others for their part in parallel (each has a deadline; the servers that did not answer are named in
+        `missingServers`, `partial` is then true). `level` keeps the entries at that level or more severe and `q`
+        the entries whose message contains the text (case-insensitive). For one server only, filter by `serverId` or
+        use `/this-server/logs`. Entries are ordered by time, then by server id, and the cursor is a position in
+        that order, so paging is stable across servers. Requires `kingres_ops` (see `listThisServerLogs`); the role
+        is checked again by every server that answers.
       tags: [Logs]
       x-required-role: kingres_ops
       parameters:
@@ -2847,6 +2945,9 @@ paths:
         Without a filter the cluster aggregate is returned (sum for counters and sizes, average for
         percentages). With `serverId` or `databaseName` the series is restricted; with `groupBy` one series per
         server or database is returned. At most 5000 points per series (422 otherwise).
+        The series are those of the whole cluster, from any server: each server answers with its own samples and the
+        receiving server combines them (a database that several servers report is summed or averaged like the
+        servers); a server that did not answer is named in `missingServers` (`partial` is then true).
       tags: [Metrics]
       x-required-role: kingres_stats
       parameters:
@@ -3027,7 +3128,13 @@ components:
 
   responses:
     BadRequest:
-      description: The request is malformed (invalid JSON, wrong type, unknown parameter) or violates a schema constraint.
+      description: |
+        The request is malformed (invalid JSON, wrong type, unknown parameter) or violates a schema constraint.
+        `code` is `bad_request` for a body that is not valid JSON of the operation (syntax, wrong type, empty, a member
+        that the request does not know) and `validation_failed`, with `errors[]`, for a value that is invalid or, for
+        the requests the contract declares closed (`ServerUpdateRequest`, `LocalSettingsUpdate`,
+        `InclusionProofRequest`), for a member that is not listed (`errors[].code` `unknown_property`; 0.5.0 corrected
+        the server, which answered `bad_request` for the last of them).
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }
@@ -3098,8 +3205,8 @@ components:
         `immutable_field`, `rebalance_in_progress`, `operation_in_progress`, `task_not_cancellable`,
         `last_admin`, `role_in_use`, `optimistic_lock_failed`, `no_replica_available`,
         `instance_already_running`, `instance_already_stopped`, `server_owns_buckets`,
-        `server_hosts_map_group`, `last_server`, `server_group_not_empty`, `ledger_entry_pending`
-        (each operation's description says which of them it can answer). Nothing was changed.
+        `server_hosts_map_group`, `last_server`, `server_group_not_empty`, `ledger_entry_pending`,
+        `certificate_revoked` (each operation's description says which of them it can answer). Nothing was changed.
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }
@@ -3267,6 +3374,11 @@ components:
         `server_hosts_map_group`, `last_server` (`removeServer`, `leaveCluster`), `server_group_not_empty`
         (`deleteServerGroup`), `ledger_entry_pending` (`createInclusionProof`).
 
+        Added in 0.5.0: `certificate_revoked` (409: `renewServerCertificates`, `revokeServerCertificates`) and
+        `certificate_authority_unavailable` (503: the operation needs the certificate authority key and the manager
+        leader does not hold it; `renewServerCertificates`, `revokeServerCertificates`, `addServer`, `removeServer`,
+        `leaveCluster`, `joinCluster`). Clients must tolerate codes they do not know.
+
         503 (cannot serve now): `node_uninitialized`, `map_group_unavailable`, `leader_unavailable`,
         `quorum_unavailable`, `service_unavailable`, `system_database_stopped` (the instance that hosts the
         system database was stopped on purpose; start it with `startThisServerInstance`).
@@ -3310,6 +3422,8 @@ components:
         - rate_limited
         - service_unavailable
         - internal_error
+        - certificate_revoked
+        - certificate_authority_unavailable
     ValidationIssue:
       type: object
       description: One invalid field of a request.
@@ -4052,6 +4166,23 @@ components:
         message:
           type: string
           description: Log message.
+    MissingServer:
+      type: object
+      description: |
+        Added in 0.5.0. A server that did not take part in a cluster-wide answer (`listLogs`, `listAlerts`,
+        `queryMetrics`): the receiving server asks every other server for its part in parallel, each with its own
+        deadline, and says here which ones it could not use.
+      required: [serverId, reason]
+      properties:
+        serverId:
+          $ref: '#/components/schemas/ServerId'
+        reason:
+          type: string
+          description: |
+            Why: `timeout` (no answer within the deadline), `unreachable` (the connection failed), `refused` (the
+            server answered with an error, for example because it no longer accepts the caller's role) or
+            `invalidAnswer` (the answer was too large or not well formed). Clients must tolerate other values.
+          enum: [timeout, unreachable, refused, invalidAnswer]
     LogPage:
       type: object
       description: A page of log entries.
@@ -4063,6 +4194,13 @@ components:
           items: { $ref: '#/components/schemas/LogEntry' }
         nextCursor:
           $ref: '#/components/schemas/NextCursor'
+        partial:
+          type: boolean
+          description: Added in 0.5.0, optional. True when at least one other server did not answer (see `MissingServer`); the page holds what the servers that answered know.
+        missingServers:
+          type: array
+          description: Added in 0.5.0, optional. The servers that did not answer, sorted by id; absent when `partial` is false.
+          items: { $ref: '#/components/schemas/MissingServer' }
     NextCursor:
       type:
         - string
@@ -4347,6 +4485,12 @@ components:
       description: A machine in the cluster, defined as one distinct host of the `kingres.node` catalog. Values the backend does not know yet are null ("not available"), never invented zeros.
       required: [id, address, hostname, status, serverGroup, shouldHaveShards, isManagerLeader, version, uptimeSeconds, joinedAt, lastHeartbeatAt, certificateExpiresAt, seenFingerprint, fingerprintPinned, instances, buckets, sizeBytes, resources]
       properties:
+        certificateRevokedAt:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: Added in 0.5.0, optional. When the certificates of this server were revoked (`revokeServerCertificates`); absent or null when they were not. A server with revoked certificates cannot take part in the cluster until it is removed and joined again.
         id:
           $ref: '#/components/schemas/ServerId'
         address:
@@ -5810,6 +5954,8 @@ components:
         - ledger.verify
         - networkAccess.apply
         - replicate.apply
+        - certificate.renew
+        - certificate.revoke
     TaskStep:
       type: object
       description: One step of a task.
@@ -6314,7 +6460,7 @@ components:
         What happened. Either the `operationId` of the audited operation of this contract (for example
         `createDatabase`, `dropDatabase`, `login`, `executeQuery`), or one of the events that are not an
         operation: `loginFailed` (a sign-in attempt that was rejected, also for an unknown user), `setupTokenRejected`
-        (a wrong setup token), `autoFailover` (a failover started by the manager, actor `system`). A denied
+        (a wrong setup token), `autoFailover` (a failover started by the manager, actor `system`). From 0.5.0 also `certificateRenewed` and `certificateRenewalFailed` (a server renewed its certificates by itself, or failed to; actor `system`). A denied
         or failed call of an operation is recorded under that operation's id with `outcome` `denied` or
         `failure`. Read-only operations are not audited except `executeQuery`.
       enum:
@@ -6359,6 +6505,10 @@ components:
         - startLedgerVerification
         - executeQuery
         - acknowledgeAlert
+        - renewServerCertificates
+        - revokeServerCertificates
+        - certificateRenewed
+        - certificateRenewalFailed
     AuditEvent:
       type: object
       description: One audit log entry.
@@ -7177,6 +7327,7 @@ components:
         - ledgerPendingTooOld
         - versionMismatch
         - certificateExpiring
+        - certificateRenewalFailed
         - taskFailed
     Alert:
       type: object
@@ -7186,7 +7337,7 @@ components:
         id:
           type: integer
           format: int64
-          description: Alert identifier.
+          description: Alert identifier. Unique in the cluster; from 0.5.0 the high bits are the number of the server that holds the alert, which is how an acknowledgement finds it.
         kind:
           $ref: '#/components/schemas/AlertKind'
         severity:
@@ -7241,6 +7392,13 @@ components:
           items: { $ref: '#/components/schemas/Alert' }
         nextCursor:
           $ref: '#/components/schemas/NextCursor'
+        partial:
+          type: boolean
+          description: Added in 0.5.0, optional. True when at least one other server did not answer (see `MissingServer`); the page holds what the servers that answered know.
+        missingServers:
+          type: array
+          description: Added in 0.5.0, optional. The servers that did not answer, sorted by id; absent when `partial` is false.
+          items: { $ref: '#/components/schemas/MissingServer' }
 
     # ------------------------------------------------------------------ metrics
     MetricName:
@@ -7319,3 +7477,10 @@ components:
           type: array
           description: The series; a single series unless `groupBy` was used.
           items: { $ref: '#/components/schemas/MetricSeries' }
+        partial:
+          type: boolean
+          description: Added in 0.5.0, optional. True when at least one other server did not answer (see `MissingServer`); the page holds what the servers that answered know.
+        missingServers:
+          type: array
+          description: Added in 0.5.0, optional. The servers that did not answer, sorted by id; absent when `partial` is false.
+          items: { $ref: '#/components/schemas/MissingServer' }
