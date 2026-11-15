@@ -593,6 +593,13 @@ launch_workers(void)
 		snprintf(bgw.bgw_name, BGW_MAXLEN, "kingres_shard recovery worker");
 		snprintf(bgw.bgw_type, BGW_MAXLEN, "kingres_shard recovery worker");
 		bgw.bgw_main_arg = ObjectIdGetDatum(lfirst_oid(lc));
+		/*
+		 * The values the node-to-node settings have in the server configuration:
+		 * the worker forces them (fix_worker_settings), so that a setting stored
+		 * for its database or role cannot change how long a pass waits (S3-16).
+		 */
+		snprintf(bgw.bgw_extra, BGW_EXTRALEN, "%d %d",
+				 kingres_shard_node_timeout, kingres_shard_node_connect_timeout);
 		bgw.bgw_notify_pid = MyProcPid;
 
 		if (!RegisterDynamicBackgroundWorker(&bgw, &handle))
@@ -675,7 +682,7 @@ kingres_shard_recovery_launcher_main(Datum main_arg)
  * here, at a level (PGC_S_OVERRIDE) that nothing stored can beat.
  */
 static void
-fix_worker_settings(void)
+fix_worker_settings(const char *extra)
 {
 	static const char *const settings[][2] = {
 		{"default_transaction_isolation", "read committed"},
@@ -696,23 +703,80 @@ fix_worker_settings(void)
 		{NULL, NULL}
 	};
 	int			i;
+	int			node_timeout;
+	int			node_connect_timeout;
 
 	for (i = 0; settings[i][0] != NULL; i++)
 		(void) set_config_option(settings[i][0], settings[i][1],
 								 PGC_SUSET, PGC_S_OVERRIDE, GUC_ACTION_SET, true, 0, false);
+
+	/*
+	 * node_timeout and node_connect_timeout can be stored with ALTER DATABASE
+	 * or ALTER ROLE (S3-16): a worker that took such a value would bound its
+	 * statements, its connections and the launcher's deadline by it.  The
+	 * launcher passes the values of the server configuration.
+	 */
+	if (sscanf(extra, "%d %d", &node_timeout, &node_connect_timeout) == 2)
+	{
+		char		buf[16];
+
+		snprintf(buf, sizeof(buf), "%d", node_timeout);
+		(void) set_config_option("kingres_shard.node_timeout", buf,
+								 PGC_SUSET, PGC_S_OVERRIDE, GUC_ACTION_SET, true, 0, false);
+		snprintf(buf, sizeof(buf), "%d", node_connect_timeout);
+		(void) set_config_option("kingres_shard.node_connect_timeout", buf,
+								 PGC_SUSET, PGC_S_OVERRIDE, GUC_ACTION_SET, true, 0, false);
+	}
+}
+
+/*
+ * run_move_step
+ *
+ * Run one statement of the bucket-move upkeep (resume the interrupted moves,
+ * drop the orphan tables of the finished ones) in a transaction of its own.
+ * Both functions do their work in sessions that they open themselves and that
+ * wait for the rows this transaction would hold, and each is independent of
+ * the other, so a failure is logged and ends only its own step.
+ */
+static void
+run_move_step(const char *sql)
+{
+	MemoryContext oldcxt = CurrentMemoryContext;
+
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	PG_TRY();
+	{
+		if (SPI_connect() != SPI_OK_CONNECT)
+			elog(ERROR, "SPI_connect failed");
+		if (SPI_execute(sql, false, 0) < 0)
+			elog(ERROR, "could not run \"%s\"", sql);
+		SPI_finish();
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(oldcxt);
+		EmitErrorReport();
+		FlushErrorState();
+		AbortCurrentTransaction();
+	}
+	PG_END_TRY();
 }
 
 void
 kingres_shard_recovery_worker_main(Datum main_arg)
 {
 	Oid			dboid = DatumGetObjectId(main_arg);
+	bool		run_moves = false;
 
 	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
 	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, 0);
 
 	/* Before the transaction starts: the isolation level and the access mode are read at its start. */
-	fix_worker_settings();
+	fix_worker_settings(MyBgworkerEntry->bgw_extra);
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	if (!RecoveryInProgress() &&
@@ -723,8 +787,30 @@ kingres_shard_recovery_worker_main(Datum main_arg)
 		if (cat->present && cat->local_node_id != 0 &&
 			OidIsValid(kingres_shard_catalog_relid("dtx_log")))
 			(void) kingres_shard_recover_prepared();
+
+		/*
+		 * Moves are recorded on the map group primary only, and only where the
+		 * SQL objects of 0.3 exist (a node whose library is newer than its SQL
+		 * objects has no such table: review finding S4-05).
+		 */
+		run_moves = cat->present && cat->local_group_id == KINGRES_SHARD_MAP_GROUP &&
+			OidIsValid(kingres_shard_catalog_relid("bucket_move"));
 	}
 	PopActiveSnapshot();
 	CommitTransactionCommand();
+
+	/*
+	 * Moves (review finding S4-02).  A move whose session died keeps its slot,
+	 * its "moving" bucket and the DDL block until somebody undoes it; a move
+	 * that finished keeps a full second copy of the bucket until its orphan
+	 * tables are dropped.  Both functions leave a move alone whose session
+	 * still runs it (its live mark is held) and bound every call to another
+	 * node; the pass as a whole is bounded by the launcher's deadline.
+	 */
+	if (run_moves)
+	{
+		run_move_step("SELECT " KINGRES_SHARD_SCHEMA ".resume_bucket_moves()");
+		run_move_step("SELECT " KINGRES_SHARD_SCHEMA ".cleanup_moved_buckets()");
+	}
 	proc_exit(0);
 }

@@ -31,6 +31,7 @@
 #include "miscadmin.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/typcache.h"
@@ -580,8 +581,8 @@ kingres_shard_copy_table_rows(Oid relid, List *conns)
 		oldcxt = MemoryContextSwitchTo(batchcxt);
 		params = palloc(sizeof(char *) * nrows * ncols);
 		initStringInfo(&sql);
-		appendStringInfo(&sql, "INSERT INTO %s.%s (%s) OVERRIDING SYSTEM VALUE VALUES ",
-						 quote_identifier(nsp), quote_identifier(rel), collist.data);
+		appendStringInfo(&sql, "%sINSERT INTO %s.%s (%s) OVERRIDING SYSTEM VALUE VALUES ",
+						 KS_REFWRITE_MARKER, quote_identifier(nsp), quote_identifier(rel), collist.data);
 		for (r = 0; r < nrows; r++)
 		{
 			appendStringInfo(&sql, "%s(", r ? ", " : "");
@@ -645,6 +646,8 @@ kingres_create_reference_table(PG_FUNCTION_ARGS)
 	run_spi("INSERT INTO " KINGRES_SHARD_SCHEMA ".dist_table (relid, method) "
 			"VALUES ($1::pg_catalog.oid::pg_catalog.regclass, 'reference')",
 			1, argtypes, values);
+	/* Plans of statements on the table (prepared, in functions) were made for an ordinary table (S3-02). */
+	CacheInvalidateRelcacheByRelid(relid);
 	SPI_finish();
 
 	initStringInfo(&script);

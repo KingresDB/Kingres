@@ -103,6 +103,9 @@ extern void kingres_shard_conn_expect_node(const char *host, int port, int node_
 /* Failure injection for tests (fault.c). */
 extern void kingres_shard_fault_init(void);
 extern void kingres_shard_fault_point(const char *point);
+
+/* Ask the node to stop what its session runs; waits for the request for a bounded time only. */
+extern void kingres_shard_cancel_with_deadline(PGconn *conn);
 extern const char *kingres_shard_fault_spec(void);
 extern void kingres_shard_fault_set_scope(const char *scope);
 

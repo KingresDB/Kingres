@@ -22,6 +22,8 @@
  *	  catalog lock serializes them with the other catalog changes.
  *	- VACUUM, ANALYZE, REINDEX and LOCK act on one node by nature and are
  *	  allowed, local.
+ *	- COPY <distributed table> TO is run as COPY (SELECT <columns> FROM <table>)
+ *	  TO, which the planner hook answers from every shard group.
  *	- Everything else that names such a table is refused with "<statement> is
  *	  not supported on distributed tables yet".
  *
@@ -60,18 +62,23 @@
  */
 #include "postgres.h"
 
+#include "access/table.h"
+#include "access/tupdesc.h"
 #include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/partition.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_inherits.h"
+#include "catalog/pg_type.h"
+#include "commands/copy.h"
 #include "commands/extension.h"
 #include "commands/tablecmds.h"
 #include "executor/spi.h"
 #include "nodes/makefuncs.h"
 #include "nodes/parsenodes.h"
 #include "nodes/value.h"
+#include "parser/parse_type.h"
 #include "storage/lockdefs.h"
 #include "tcop/cmdtag.h"
 #include "tcop/utility.h"
@@ -80,6 +87,9 @@
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
+#include "utils/syscache.h"
+#include "utils/typcache.h"
 
 #include "bucket_move.h"
 #include "catalog.h"
@@ -139,6 +149,7 @@ typedef struct UtilDecision
 	Oid			owner_relid;	/* a hash table whose owner changes: change its partitions' owner too */
 	Oid			owner_role;
 	List	   *colocations;	/* of int: colocation groups of the hash tables concerned */
+	Node	   *replacement;	/* the statement to run instead of the one that came */
 } UtilDecision;
 
 /*
@@ -325,42 +336,176 @@ check_foreign_key(Node *parsetree, const KsCatalog *cat, const KsDistTable *src,
 }
 
 /*
- * Is the node a string constant that the date and time input functions turn
- * into the current time or date ('now', 'today', 'tomorrow', 'yesterday',
- * 'allballs')?  PostgreSQL evaluates it when the ALTER TABLE runs, on each node
- * at its own moment, so the existing rows would get different values on
- * different nodes (review finding S2-10).
+ * What the text of a constant can mean on one node and not on another.
+ *
+ * TS_CLOCK: the input function of the type turns some words into the current
+ * time or date ('now', 'today', 'tomorrow', 'yesterday', 'allballs'), which
+ * PostgreSQL evaluates when ALTER TABLE ... ADD COLUMN runs, on each node at
+ * its own moment, so the existing rows would get different values on different
+ * nodes (review findings S2-10 and S3-08).
+ * TS_OBJECT: the type is an object identifier written as a name (regclass,
+ * regtype, ...): the same name is another number on every node.
  */
-static bool
-is_special_datetime_string(Node *n)
+#define TS_CLOCK	0x01
+#define TS_OBJECT	0x02
+
+/*
+ * type_text_meaning
+ *
+ * The flags above for a type, looking through domains and into arrays, ranges,
+ * multiranges and composite types, whose input functions call the input
+ * functions of their parts.
+ */
+static int
+type_text_meaning(Oid typid, int depth)
 {
-	static const char *const special[] = {"now", "today", "tomorrow", "yesterday", "allballs", NULL};
-	A_Const    *c;
-	char	   *p;
-	int			i;
+	Oid			base;
+	int			flags = 0;
 
-	if (n == NULL || !IsA(n, A_Const))
-		return false;
-	c = (A_Const *) n;
-	if (c->isnull || nodeTag(&c->val) != T_String)
-		return false;
-	for (p = c->val.sval.sval; *p == ' '; p++)
-		;
-	for (i = 0; special[i] != NULL; i++)
+	if (!OidIsValid(typid) || depth > 4)
+		return 0;
+	base = getBaseType(typid);
+	switch (base)
 	{
-		size_t		len = strlen(special[i]);
+		case DATEOID:
+		case TIMEOID:
+		case TIMETZOID:
+		case TIMESTAMPOID:
+		case TIMESTAMPTZOID:
+			return TS_CLOCK;
+		case REGPROCOID:
+		case REGPROCEDUREOID:
+		case REGOPEROID:
+		case REGOPERATOROID:
+		case REGCLASSOID:
+		case REGTYPEOID:
+		case REGCOLLATIONOID:
+		case REGCONFIGOID:
+		case REGDICTIONARYOID:
+		case REGNAMESPACEOID:
+		case REGROLEOID:
+			return TS_OBJECT;
+		default:
+			break;
+	}
 
-		if (pg_strncasecmp(p, special[i], len) == 0)
+	if (OidIsValid(get_element_type(base)))
+		return type_text_meaning(get_element_type(base), depth + 1);
+	if (type_is_range(base))
+		return type_text_meaning(get_range_subtype(base), depth + 1);
+	if (type_is_multirange(base))
+		return type_text_meaning(get_multirange_range(base), depth + 1);
+	if (get_typtype(base) == TYPTYPE_COMPOSITE)
+	{
+		TupleDesc	tupdesc = lookup_rowtype_tupdesc_noerror(base, -1, true);
+		int			i;
+
+		if (tupdesc != NULL)
 		{
-			const char *rest = p + len;
+			for (i = 0; i < tupdesc->natts; i++)
+			{
+				Form_pg_attribute att = TupleDescAttr(tupdesc, i);
 
-			while (*rest == ' ')
-				rest++;
-			if (*rest == '\0')
-				return true;
+				if (!att->attisdropped)
+					flags |= type_text_meaning(att->atttypid, depth + 1);
+			}
+			ReleaseTupleDesc(tupdesc);
 		}
 	}
-	return false;
+	return flags;
+}
+
+static int
+typename_text_meaning(TypeName *tn)
+{
+	Type		tup;
+	Oid			typid;
+
+	if (tn == NULL)
+		return 0;
+	tup = LookupTypeName(NULL, tn, NULL, true);
+	if (tup == NULL)
+		return 0;				/* the statement itself reports a missing type */
+	typid = ((Form_pg_type) GETSTRUCT(tup))->oid;
+	ReleaseSysCache(tup);
+	return type_text_meaning(typid, 0);
+}
+
+/*
+ * A string made only of what a date or time written numerically can contain
+ * (digits, the signs and separators of ISO 8601 and the common numeric
+ * layouts, the letters T and Z) cannot be one of the words that name the
+ * current time, because every such word has another letter.  That, and the
+ * three words that are the same constant everywhere (epoch, infinity,
+ * -infinity, alone), are the only texts of a date or time that are accepted:
+ * the test is on what the text can be, so no spelling of a special word (white
+ * space around it, other case, a word inside a longer string) gets through.
+ */
+static bool
+is_fixed_datetime_text(const char *s)
+{
+	static const char *const constants[] = {"epoch", "infinity", "-infinity", NULL};
+	const char *p;
+	const char *end;
+	bool		digit = false;
+	int			i;
+
+	/* The whole string without the white space around it, compared as a word. */
+	for (p = s; *p != '\0' && isspace((unsigned char) *p); p++)
+		;
+	for (end = s + strlen(s); end > p && isspace((unsigned char) end[-1]); end--)
+		;
+	for (i = 0; constants[i] != NULL; i++)
+	{
+		if ((size_t) (end - p) == strlen(constants[i]) &&
+			pg_strncasecmp(p, constants[i], end - p) == 0)
+			return true;
+	}
+
+	for (p = s; *p != '\0'; p++)
+	{
+		unsigned char c = (unsigned char) *p;
+
+		if (c >= '0' && c <= '9')
+			digit = true;
+		else if (strchr("-+:./ ,TtZz", c) == NULL)
+			return false;
+	}
+	return digit;
+}
+
+/*
+ * Is the default of ADD COLUMN a string whose meaning depends on the node that
+ * reads it?  expr is what the statement wrote (a constant, or a constant with a
+ * cast), coltype the type of the column.  The literal is read by the input
+ * function of the cast type, then converted to the column type, which can read
+ * the text again (text to date goes through the input function), so both types
+ * count.
+ */
+static bool
+default_text_is_node_dependent(Node *expr, TypeName *coltype)
+{
+	A_Const    *c;
+	int			flags;
+
+	if (expr == NULL)
+		return false;
+	if (IsA(expr, TypeCast))
+	{
+		flags = typename_text_meaning(((TypeCast *) expr)->typeName);
+		expr = ((TypeCast *) expr)->arg;
+	}
+	else
+		flags = 0;
+	if (expr == NULL || !IsA(expr, A_Const))
+		return false;
+	c = (A_Const *) expr;
+	if (c->isnull || nodeTag(&c->val) != T_String)
+		return false;
+	flags |= typename_text_meaning(coltype);
+	if (flags & TS_OBJECT)
+		return true;
+	return (flags & TS_CLOCK) != 0 && !is_fixed_datetime_text(c->val.sval.sval);
 }
 
 static bool
@@ -434,9 +579,8 @@ check_alter_table(AlterTableStmt *stmt, const KsCatalog *cat,
 						{
 							case CONSTR_DEFAULT:
 								/* A default is evaluated for every row on every node: it must be a constant. */
-								if (is_special_datetime_string(c->raw_expr) ||
-									(IsA(c->raw_expr, TypeCast) && is_special_datetime_string(((TypeCast *) c->raw_expr)->arg)))
-									reject((Node *) stmt, dt, false, "ADD COLUMN with a default such as 'now' or 'today' would give different values on different nodes.");
+								if (default_text_is_node_dependent(c->raw_expr, col->typeName))
+									reject((Node *) stmt, dt, false, "ADD COLUMN with a default written as a string for a column of a date, time or object-name type is refused: the text ('now', 'today', a table name, ...) can mean another value on each node. Write a date or time numerically (ISO 8601: '2024-01-02 03:04:05+00') or add the column without a default and UPDATE it.");
 								if (!(c->raw_expr != NULL &&
 									  (IsA(c->raw_expr, A_Const) ||
 									   (IsA(c->raw_expr, TypeCast) &&
@@ -570,6 +714,46 @@ guard_schema(Node *parsetree, const KsCatalog *cat, const char *nspname, const c
 			reject(parsetree, t, false, detail);
 		}
 	}
+}
+
+/*
+ * copy_table_as_query
+ *
+ * COPY [(columns)] <table> TO ... as COPY (SELECT <columns> FROM <table>) TO ...
+ * with the same options.  The columns are the ones COPY would write (all of
+ * them without a list, except dropped and generated ones, in table order; the
+ * same checks of the list), named explicitly so that the SELECT returns exactly
+ * what the table form would.
+ */
+static Node *
+copy_table_as_query(CopyStmt *stmt)
+{
+	CopyStmt   *copy = copyObject(stmt);
+	SelectStmt *sel = makeNode(SelectStmt);
+	Relation	rel = table_openrv(stmt->relation, AccessShareLock);
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	List	   *attnums = CopyGetAttnums(tupdesc, rel, stmt->attlist);
+	ListCell   *lc;
+
+	foreach(lc, attnums)
+	{
+		ColumnRef  *cref = makeNode(ColumnRef);
+		ResTarget  *rt = makeNode(ResTarget);
+
+		cref->fields = list_make1(makeString(pstrdup(NameStr(TupleDescAttr(tupdesc, lfirst_int(lc) - 1)->attname))));
+		cref->location = -1;
+		rt->val = (Node *) cref;
+		rt->location = -1;
+		sel->targetList = lappend(sel->targetList, rt);
+	}
+	table_close(rel, NoLock);
+
+	sel->fromClause = list_make1(copyObject(stmt->relation));
+	sel->limitOption = LIMIT_OPTION_COUNT;
+	copy->query = (Node *) sel;
+	copy->relation = NULL;
+	copy->attlist = NIL;
+	return (Node *) copy;
 }
 
 /*
@@ -929,6 +1113,27 @@ decide(Node *parsetree, const KsCatalog *cat, UtilDecision *d)
 				if (any != NULL && multi && stmt->query == NULL && stmt->is_from)
 					reject(parsetree, any, false,
 						   "COPY FROM would write the rows to the partitions of this node only.");
+
+				/*
+				 * COPY <distributed table> TO does not go through the planner
+				 * hook.  This core refuses it for a partitioned table ("Try the
+				 * COPY (SELECT ...) TO variant"), but a core that accepts it
+				 * would read the partitions of this node only and silently leave
+				 * out the other shard groups.  So it is run as COPY (SELECT
+				 * <columns> FROM <table>) TO, which the planner hook answers from
+				 * every group (the distributed scan), on every cluster size.  A
+				 * reference table is whole on every node, and a bucket partition
+				 * named directly is read as what it is, the rows of that bucket
+				 * on this node.
+				 */
+				if (stmt->query == NULL && !stmt->is_from &&
+					stmt->relation != NULL)
+				{
+					const KsDistTable *dt = direct_dist(cat, rangevar_relid(stmt->relation));
+
+					if (dt != NULL && !dt->is_reference)
+						d->replacement = copy_table_as_query(stmt);
+				}
 			}
 			break;
 
@@ -1183,6 +1388,17 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 		if (cat->present && cat->ndist_tables > 0)
 		{
 			decide(parsetree, cat, &d);
+
+			if (d.replacement != NULL)
+			{
+				/* The statement we were given may be shared (a cached plan): run a copy. */
+				PlannedStmt *replaced = makeNode(PlannedStmt);
+
+				memcpy(replaced, pstmt, sizeof(PlannedStmt));
+				replaced->utilityStmt = d.replacement;
+				pstmt = replaced;
+				parsetree = d.replacement;
+			}
 
 			if (d.propagate && !kingres_shard_session_forwarded())
 			{

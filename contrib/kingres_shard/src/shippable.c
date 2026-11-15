@@ -36,6 +36,7 @@
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/transam.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_type_d.h"
 #include "catalog/pg_collation_d.h"
@@ -85,18 +86,57 @@ collation_ok(Oid coll)
 		coll == C_COLLATION_OID;
 }
 
+/*
+ * Does the function compute its floating point result with the C library of the
+ * node (review finding S3-14)?  The basic operations and the square root are
+ * correctly rounded by IEEE 754 and give the same bits everywhere, but
+ * exp, ln, pow, the trigonometric and the gamma functions are not: two nodes
+ * with another libm (another CPU architecture or distribution) can differ in
+ * the last bit, and a write that applies such a function on every node would
+ * make the copies of a reference table differ without an error.  The
+ * numeric versions of the same names (sqrt(numeric), exp(numeric), ...) are
+ * implemented by PostgreSQL itself and give the same digits everywhere, so the
+ * test is on the name and a floating point result.
+ */
+static bool
+libm_dependent(Oid funcid)
+{
+	static const char *const names[] = {
+		"cbrt", "dcbrt", "exp", "dexp", "ln", "log", "dlog1", "log10", "dlog10",
+		"pow", "power", "dpow", "sin", "cos", "tan", "cot", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh",
+		"asinh", "acosh", "atanh", "sind", "cosd", "tand", "cotd", "asind",
+		"acosd", "atand", "atan2d", "erf", "erfc", "gamma", "lgamma", NULL
+	};
+	Oid			rettype = get_func_rettype(funcid);
+	char	   *name;
+	int			i;
+
+	if (rettype != FLOAT8OID && rettype != FLOAT4OID)
+		return false;
+	name = get_func_name(funcid);
+	if (name == NULL)
+		return false;
+	for (i = 0; names[i] != NULL; i++)
+	{
+		if (strcmp(name, names[i]) == 0)
+			return true;
+	}
+	return false;
+}
+
 static bool
 func_ok(Oid funcid)
 {
 	return funcid < FirstGenbkiObjectId &&
-		func_volatile(funcid) == PROVOLATILE_IMMUTABLE;
+		func_volatile(funcid) == PROVOLATILE_IMMUTABLE &&
+		!libm_dependent(funcid);
 }
 
 static bool
 op_ok(Oid opno)
 {
 	return opno < FirstGenbkiObjectId &&
-		func_volatile(get_opcode(opno)) == PROVOLATILE_IMMUTABLE;
+		func_ok(get_opcode(opno));
 }
 
 /*
@@ -306,6 +346,19 @@ query_ok(Query *q, ShipCtx *ctx)
 			case RTE_RELATION:
 				if (rte->tablesample != NULL)
 					return fail(ctx, "it samples a table at random");
+
+				/*
+				 * A write through an updatable view (review finding S3-18).  The
+				 * rewriter turns it into a statement on the base table, but that
+				 * statement is not one the other nodes can run: it reads the
+				 * base table a second time to find the rows (the join on the row
+				 * identifier is added by the planner), so the text that is sent
+				 * would be wrong, and WITH CHECK OPTION and the rights of the
+				 * view's owner cannot be put into it.  Only a view that is written
+				 * has such an entry, a view that is read is expanded.
+				 */
+				if (rte->relkind == RELKIND_VIEW)
+					return fail(ctx, "it writes through a view; write the table itself");
 				if (!relation_ok(rte->relid, ctx, q, rtindex))
 					return fail(ctx, "it reads a table that is not a reference table");
 				break;

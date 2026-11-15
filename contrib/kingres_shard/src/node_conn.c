@@ -567,7 +567,15 @@ static void
 discard_connection(KsConn *kc)
 {
 	if (kc->conn != NULL)
+	{
+		/*
+		 * PQfinish() sends a Terminate message; on a connection to a node that
+		 * does not read, in the default blocking mode, flushing it waits until
+		 * the node reads (S3-07).
+		 */
+		(void) PQsetnonblocking(kc->conn, 1);
 		PQfinish(kc->conn);
+	}
 	kc->conn = NULL;
 	kc->xact_depth = 0;
 	kc->nstatements = 0;
@@ -810,19 +818,51 @@ kingres_shard_reset_transmission_modes(int nestlevel)
 	AtEOXact_GUC(true, nestlevel);
 }
 
-/* Ask the node to stop what it is doing; the answer is not awaited. */
-static bool
-PQcancel_best_effort(PGconn *conn)
+/*
+ * Ask the node to stop what it is doing, waiting for the cancel request to be
+ * delivered for a bounded time only (review finding S3-07).  The legacy
+ * PQcancel() connects and then waits for the postmaster to close the
+ * connection with no timeout of its own: a node whose postmaster is stopped
+ * (a frozen machine whose kernel still accepts connections) held the
+ * committing backend for as long as it stayed stopped, although it had given
+ * up on the node already.  This is the non-blocking cancel of libpq polled
+ * against a deadline (as libpqsrv_cancel() does, which cannot be used here
+ * because it checks for interrupts, and the callers run where an error is not
+ * possible: the commit and abort callbacks).  The wait is a third of
+ * node_timeout, at most node_connect_timeout, at least a second.
+ */
+void
+kingres_shard_cancel_with_deadline(PGconn *conn)
 {
-	PGcancel   *cancel = PQgetCancel(conn);
-	char		errbuf[256];
-	bool		ok;
+	PGcancelConn *cc = PQcancelCreate(conn);
+	TimestampTz endtime;
 
-	if (cancel == NULL)
-		return false;
-	ok = PQcancel(cancel, errbuf, sizeof(errbuf)) != 0;
-	PQfreeCancel(cancel);
-	return ok;
+	if (cc == NULL)
+		return;
+	endtime = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+										  (int64) 1000 *
+										  Max(1, Min(kingres_shard_node_connect_timeout,
+													 kingres_shard_node_timeout / 3)));
+	if (PQcancelStart(cc))
+	{
+		for (;;)
+		{
+			PostgresPollingStatusType pollres = PQcancelPoll(cc);
+			long		remaining;
+			int			events = WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH;
+
+			if (pollres == PGRES_POLLING_OK || pollres == PGRES_POLLING_FAILED)
+				break;
+			remaining = TimestampDifferenceMilliseconds(GetCurrentTimestamp(), endtime);
+			if (remaining <= 0)
+				break;
+			events |= (pollres == PGRES_POLLING_READING) ? WL_SOCKET_READABLE : WL_SOCKET_WRITEABLE;
+			(void) WaitLatchOrSocket(MyLatch, events, PQcancelSocket(cc), remaining,
+									 PG_WAIT_EXTENSION);
+			ResetLatch(MyLatch);
+		}
+	}
+	PQcancelFinish(cc);
 }
 
 /*
@@ -857,7 +897,7 @@ kingres_shard_bounded_exec(PGconn *conn, const char *sql, bool interruptible)
 			ms = secs * 1000L + usecs / 1000;
 			if (GetCurrentTimestamp() >= deadline || ms <= 0)
 			{
-				(void) PQcancel_best_effort(conn);
+				kingres_shard_cancel_with_deadline(conn);
 				PQclear(last);
 				return NULL;
 			}
@@ -1045,6 +1085,21 @@ kingres_shard_report_error(KsConn *kc, PGresult *res, const char *sql)
 		kc->have_error = true;
 	if (primary == NULL)
 		primary = pchomp(PQerrorMessage(kc->conn));
+
+	/*
+	 * A helper function of the extension that the other node does not have: its
+	 * SQL objects are older than this node's library (a rolling upgrade that is
+	 * not finished; review finding S4-05).  Say that, instead of passing on
+	 * "function does not exist".
+	 */
+	if (sqlstate == ERRCODE_UNDEFINED_FUNCTION &&
+		strstr(primary, "function " KINGRES_SHARD_SCHEMA ".internal_") != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("node %s:%d runs an older version of the kingres_shard SQL objects",
+						kc->host, kc->port),
+				 errdetail("%s", primary),
+				 errhint("Run ALTER EXTENSION kingres_shard UPDATE on that node; every node of a cluster must run the same version.")));
 
 	ereport(ERROR,
 			(errcode(sqlstate),
@@ -1247,10 +1302,19 @@ log_decision(void)
 	 * The participants commit as soon as this transaction has, and their
 	 * COMMIT PREPARED is always flushed: the local commit record, which makes
 	 * the rows below durable, must be flushed first whatever
-	 * synchronous_commit says (review finding S2-02).  This also makes the
-	 * commit wait for synchronous standbys.
+	 * synchronous_commit says (review finding S2-02).  ForceSyncCommit() flushes
+	 * the record locally, but does not make the commit wait for synchronous
+	 * standbys: the core asks for that only when synchronous_commit is above
+	 * "local" (SyncRepRequested()).  The decision must survive a failover of
+	 * this node as well as a crash of it, so for a transaction that prepared
+	 * remote participants "off" and "local" are raised to "on" until it ends
+	 * (S3-15).  Without synchronous standbys that costs nothing more than the
+	 * flush.
 	 */
 	ForceSyncCommit();
+	if (synchronous_commit <= SYNCHRONOUS_COMMIT_LOCAL_FLUSH)
+		(void) set_config_option("synchronous_commit", "on", PGC_USERSET,
+								 PGC_S_SESSION, GUC_ACTION_LOCAL, true, 0, false);
 
 	/* The unique-index check of the insert needs a snapshot. */
 	PushActiveSnapshot(GetTransactionSnapshot());

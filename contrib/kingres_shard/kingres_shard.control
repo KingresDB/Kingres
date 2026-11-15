@@ -1,5 +1,5 @@
 # kingres_shard extension
 comment = 'KingresDB sharding: distributed tables, bucket map and statement routing'
-default_version = '0.3'
+default_version = '0.4'
 module_pathname = '$libdir/kingres_shard'
 relocatable = false

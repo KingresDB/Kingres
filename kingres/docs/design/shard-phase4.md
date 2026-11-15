@@ -252,7 +252,9 @@ transaction cannot do, so `move_bucket` reaches the map group primary itself thr
   (and the reverse); the switch holds one node and waits for the other. Each lock of
   the switch is therefore waited for for at most `max(200 ms, move_switch_timeout/10)`
   (a lock timeout, a retryable failure), and the move retries after a random pause. The
-  measured cost: a cycle holds writers for at most that long (1 s at the default).
+  measured cost: a cycle holds writers for at most that long (1 s at the default). (0.3 as
+  reviewed: the locks are no longer queued for but tried for; see "Review of 0.3: the
+  switch" below.)
 - *The slot of a move waits for every running transaction of the source* (the
   snapshot of `CREATE_REPLICATION_SLOT` must be consistent), and the session that runs
   the move must not be one of them: it holds no row lock and no transaction id while it
@@ -403,12 +405,10 @@ For each path:
   With (1) the argument holds for every node but one case it cannot cover: on a target
   that is not the map group primary, a reader's lock does not wait for the attach, and
   the node's own catalog says whether the bucket is its (`KS001` until the commit is
-  visible and its invalidation delivered). There remains a window of microseconds in
-  which the catalog cache of a backend is loaded after a commit while its partition
-  list is not yet current; it needs a cache invalidated for another reason at that
-  moment, it cannot be forced by a test, and a lock that closes it was rejected (above).
-  This is the one place where the rule is argued and not proved by a forced
-  interleaving.  On the map group primary, which commits the switch before the group
+  visible and its invalidation delivered). There was a window in which the catalog cache of a backend is loaded after a commit
+  while its partition list is not yet current; it is closed and forced by `t/033_move_target_window.pl`
+  (section "A routed statement on a target that is not the map group primary", below).
+  On the map group primary, which commits the switch before the group
   that gave the bucket up, a statement planned just before the commit can find that
   group already changed: the stale-map retry also runs there (`remote_scan.c`), once.
   The reload of that retry now takes SHARE ROW EXCLUSIVE on `kingres.map_version` before
@@ -463,11 +463,301 @@ For each path:
   `_after_local`, `move_attach`, `move_detach`, `move_after_switch`,
   `move_after_drop_replication`, `move_undo_after_subscription`, `move_undo_after_tables`,
   `move_cleanup_after_orphans`, and the points of the commit protocol.
-- *Found while testing the rule, not fixed*: moving a bucket away from a node a second time
-  before `cleanup_moved_buckets()` has dropped the first orphan fails with "relation
-  <table>_b<nnnn>_pkey already exists in schema kingres": the detach moves the table to
-  schema `kingres`, and its indexes keep their names there.  `t/032` cleans up after
-  every move for this reason.
+- *Moving a bucket away from a node a second time* is described in "Orphan tables of
+  several moves" below.
 - *Not implemented*: `REPLICA IDENTITY USING INDEX` tables and tables with identity
   columns raise "not supported yet" at the start of a move; a foreign key cycle between
   the group's tables too.
+
+**A routed statement on a target that is not the map group primary** (the one case the
+rule above could only argue; closed and forced in the fix round for review S3, item 2).
+
+*The window.* A backend learns of a commit in two ways that do not meet. The extension's
+catalog cache is rebuilt from the catalog tables with the latest committed snapshot, when
+the invalidation of `kingres.map_version` has dropped it. The partition list of a table
+(the relcache entry, which the planner prunes with) is rebuilt when the backend *processes
+the invalidation messages of the switch*, and a backend processes messages only when it
+starts a transaction, takes a lock it does not hold, or opens a catalog on a syscache miss;
+a catalog snapshot that was taken before the commit also stays in use until then. A session
+that has processed the messages sent before the switch (they drop the catalog cache) and has
+nothing to process afterwards can therefore, after the switch has committed on its node, load the
+catalog cache (new map: the bucket is here) and plan with a partition list that was built
+before the attach (no partition for the bucket): partition pruning of `WHERE id = <key>`
+finds no partition and the statement answers "no rows". A reader's `ACCESS SHARE` lock does
+not wait for the attach (decided above, "Why not a lock on the target"), so nothing orders the
+two. The same window opens for any backend between its last processing of messages and
+its read of the cache, which includes the moment after a commit is visible and before its
+messages are queued.
+
+*Forced.* `t/033_move_target_window.pl` builds the state with a fault point, `route_before_catalog`
+(in the planner hook, before the catalog cache is read), and a session that holds what it needs in an
+explicit transaction: routing off while it reads the table and the catalog tables (so the cache is
+not loaded and the locks of the catalog tables are held, which the cache load would otherwise
+take, and take messages with them), then routing on and the statement, which stops at the fault
+point after it has been parsed. The move then completes on every node, and the session is released.
+Without the fix the statement answered `0` (the partition list had 2 partitions, the catalog 3)
+in every run; with it, `1`.
+
+*The fix.* After the planner hook has read the cache and found the distributed tables of the
+statement, `kingres_shard_ensure_fresh_partitions()` (`src/bucket_move.c`) makes each table's
+partition list at least as new as the cache: a backend remembers, for each table, the version of
+the bucket map for which it last rebuilt the relcache entry, and when the version in the cache it
+is about to plan with is another it drops the catalog snapshot and the relcache entry, which the
+next use rebuilds from the catalog as it is now. *Why it is sufficient:* a switch changes the
+partitions of a node and its placement, and counts the map version up, in one transaction on that
+node; a cache that shows version V includes every switch committed up to V, so the committed state
+from which the catalog snapshot taken *after* that read is built includes those switches' partitions,
+and the rebuilt entry has them. The statement cannot be planned with a partition list older than the
+cache version it plans with. A switch that commits after the cache was read does not matter: the
+statement then follows the old placement, which the source still serves (it holds the parent
+exclusively until its own commit), or gets `KS001`. The routed statement of a forwarded session
+takes the same path. The distributed scan has its own check of the partition count.
+
+**Orphan tables of several moves** (item 1 of the fix round). A bucket that leaves the same node
+twice before `cleanup_moved_buckets()` has dropped the first orphan failed with "relation
+<table>_b<nnnn>_pkey already exists in schema kingres": the detach moved the table to schema
+`kingres`, where table and index names share one namespace, and its indexes kept their names.
+Decision: the detach renames every index of the partition (a constraint that an index implements
+follows the index) to `<orphan>_i<k>` before the table moves, so the orphan's objects carry the move
+id and cannot meet those of another orphan. The alternatives were rejected: dropping the earlier
+orphan when the next move of the bucket starts would take away the delay `move_cleanup_delay`
+guarantees to statements that still read it; one schema per move needs a schema to create, check,
+drop and protect. The orphan's table and its indexes keep the one-to-one relation of name to move
+that `cleanup_moved_buckets()`, `check_cluster()` and the orphan listing already use (they look at
+tables only). `t/025_move_bucket.pl` moves a bucket away, back and away again with no cleanup
+between, and `t/032_move_scan_stress.pl` no longer cleans up after every move.
+
+**Tests that failed under load** (item 4 of the fix round; each was run 30 times alone on the
+machine with as many busy loops as it has processors, before and after; the figures are in the
+report of that round).
+
+- `t/027_move_under_load.pl`, "the move went back to catching up when the switch timed out":
+  *the test was wrong.* It started the transaction that holds the switch back when it saw the
+  phase `catching_up`, but that phase begins with "waiting for the initial copy". The copy of
+  each table creates a slot of its own on the source, and a slot waits for every transaction
+  that is running when it is created, so a transaction that starts during the copy holds the
+  copy back, the move never reaches the switch, and "switch attempt gave up" never appears. On
+  an idle machine the copy of three small tables is finished before the test's next statement
+  starts; under load it is not. The move now stops by itself at the end of the catch-up (the
+  fault point `move_after_catchup`), the transaction starts there, and the move is released. The
+  assertions are unchanged.
+- `t/028_move_faults.pl`, the source node dies during the copy: *the product was wrong.* The loop
+  that waits for the initial copy spoke to the target only. With the source gone the copy cannot
+  finish and the apply and table-copy workers keep failing to connect, which is not counted as
+  an error of the subscription, so `move_bucket` waited forever (the test waited for it and
+  hung); on an idle machine the copy is done before the node stops, and the next call that
+  reaches the source (the lag of the slot) fails the move. The waiting loop now asks the source
+  something at every round while the copy is incomplete, so a source that cannot be reached
+  fails the move within `node_timeout` and the undo and `resume_bucket_moves()` take over as
+  for any other failure.
+
+## Review of 0.3: the recovery worker, versions, privileges (S4-02, S4-05 to S4-07, S4-09, S4-10)
+
+**The worker runs the upkeep of moves (S4-02).** The documentation said the recovery
+worker resumes interrupted moves and drops orphan tables; the code did not. The worker
+of the map group primary now, after it has resolved the prepared transactions and
+committed that transaction, runs `kingres.resume_bucket_moves()` and then
+`kingres.cleanup_moved_buckets()`, each in a transaction of its own, a failure of one
+logged and not stopping the other (`run_move_step()` in `recovery.c`). Nothing new
+is needed to make this safe: both functions already skip a move whose session holds
+the live mark (`internal_move_alive`), take the record `FOR UPDATE SKIP LOCKED`,
+bound every call to another node by `node_timeout`, and the launcher terminates a
+worker that has not finished after `5 x node_timeout`; every step they take is
+repeatable, so a terminated pass leaves a state the next pass continues from. A
+retried move cannot meet the old one: a unique index allows one unfinished move per
+bucket, and the undo changes only the bucket state `moving` of its own source group.
+One gap was real: `internal_begin_move` commits the record (phase *preparing*) in a
+session of its own and the move's session takes the live mark a moment later, so for
+that moment a live move looks abandoned. `resume_bucket_moves()` therefore leaves a
+*preparing* move alone for `2 x node_timeout`, as it already did for *switching*. A
+worker on a node whose SQL objects lack `kingres.bucket_move` (library newer than
+the SQL) does not call the functions.
+
+`check_cluster()` gets `stalled_move`: a move before *done* that no session runs
+(`internal_move_alive` is false) and that has not been touched for `2 x (node_timeout +
+recovery_interval)` (a *cleaning* move counts from its cleanup time), the time in
+which the worker, or a person when the worker is off, has certainly had a pass. The
+overdue-orphan threshold is the same time instead of the former fixed hour.
+
+**Versions (S4-05).** Two cheap defences, no new catalog. `kingres.move_bucket()` and
+`internal_begin_move()` call `internal_check_node_versions()`: every active primary
+is asked for its `pg_extension` version over the ordinary node connection (a query that
+needs nothing of the extension, so a node with older SQL answers it), and a node that
+reports anything but 0.3, or cannot be asked, stops the move before anything is
+recorded, with its id and address. A distributed scan or fan-out write that reaches a
+node whose helper functions are missing gets "node ... runs an older version of the
+kingres_shard SQL objects", raised where the library turns a remote error into a local
+one (`kingres_shard_report_error`), instead of the remote "function does not exist".
+A rolling upgrade is still a window with failing cross-group statements; the order to
+follow is in the README. The check compares with the literal 0.3: a later version
+changes it with its script.
+
+**Who may call the helpers (S4-06).** They are called from the sessions that other
+nodes open, which run as the role of the user whose statement it is, so execution
+cannot be limited to superusers, and they must not distinguish tables of which the
+caller has no knowledge. `internal_placement_hash()` and `internal_map_version()` now
+refuse unless the caller is a superuser, a session that proved it was opened by a
+node (the same proof as for the forwarded flag), or, for the placement of a table, a role with
+`SELECT` on that distributed table; any other relation is refused before anything is
+invalidated, so a role can no longer make a backend rebuild cache entries of relations
+it names.
+
+**Move records (S4-07).** `kingres.bucket_move` is no longer readable by PUBLIC; the
+view `kingres.bucket_move_status` (ids, groups, phase, times) is. The view is an
+ordinary view of the extension owner's, so its readers need no right on the table.
+
+**The xmin horizon (S4-09): documented, not changed.** `move_bucket()` is a function,
+so the statement that calls it, and its snapshot, last as long as the move; a function
+cannot end its caller's transaction or snapshot. Moving the long waits into a
+procedure (which may commit) or into steps driven by a poller changes the interface
+of the one function the control plane calls, for a cost (a delayed vacuum on the map
+group primary, whose only changing tables are the small catalog tables) that is
+documented in the README.
+
+**check_cluster is structural (S4-10).** It stays so: comparing the content of
+buckets means reading them, which a check that runs on a cluster in operation must
+not do by default. The README says what it does and does not compare, and that the
+old copy of a moved bucket stays readable until the cleanup.
+
+**Transactions across a switch.** `t/037_move_transactions.pl` holds, across a switch,
+a prepared user transaction, REPEATABLE READ and SERIALIZABLE readers on the source and
+the target, and a cursor on a third node, and runs COPY and INSERT ... SELECT during a
+move. What it found: everything that holds a lock on the group's tables on the source
+(a writer, a prepared transaction, a reader, a cursor, and also a transaction on any
+other node that scanned the table, because its remote transactions stay open) holds the
+switch back and the move gives up cleanly; the data stays whole in every case. One
+case lost rows: a REPEATABLE READ or SERIALIZABLE transaction on the *target* that has
+read only its own buckets holds nothing on the source, so the switch completes, and the
+rows of the arrived bucket, which the copy wrote after the transaction's snapshot, are
+invisible to it: its next read of the table returned 50 of 60 rows with no error
+(reproduced before the fix). The fix is in `kingres_shard_ensure_fresh_partitions()`,
+which the planner calls for every distributed table of a statement: in a transaction that
+uses one snapshot for all its statements it counts the partitions of the table that the
+snapshot sees (the `pg_inherits` rows) and the partitions of the latest state, and when
+the latest has more raises a serialization failure that says the transaction can be
+retried. It is conservative (a transaction whose snapshot was taken after the copy but
+before the attach is refused although it would have seen the rows) and costs two index
+scans of `pg_inherits` per distributed table per statement, only in such transactions.
+The reverse direction (a bucket that left this node after the snapshot) is not affected
+by the snapshot rule: its rows are read from the new owner with the statement snapshot
+of that node, as every remote read is (no global snapshot, README "Guarantees").
+## Review of 0.3: the switch (S4-01, S4-03, S4-04)
+
+**What a scan's two reads must prove (S4-01).** The scan of 0.3 compared the placement of
+the colocation group (a sum of a mix of every `(bucket, group)` pair) before and after the
+`DECLARE`. What it has to prove is "no switch of this colocation group committed on that
+node between the two reads", and the placement is a function of the state, not a count of
+switches: a bucket that moves S to T and back to S gives the same placement before and
+after, while the cursor on S was declared, and planned, while the bucket was detached (its
+`DECLARE` waited behind the first switch's lock), and the second switch re-attaches the
+bucket with a lock (SHARE UPDATE EXCLUSIVE on the parent) that the cursor's ACCESS SHARE
+does not conflict with. Reproduced at the tree (`t/031`, the away-and-back block): the scan
+answered 14 rows of 30 with no error.
+
+The compared value is now a second number next to the placement: the **identity of the set
+of partitions** the node has of the table (`kingres.internal_partition_identity(parent)`,
+`catalog.c`: the sum of a mixed value per OID of the attached partitions, from the latest
+committed state of `pg_inherits`). Every switch either detaches a partition from the node
+(the old table, which then becomes an orphan under another name) or attaches one (a new
+standalone table the move built), so the set changes at each switch, and the table that
+comes back is a different relation with a different OID: the identity cannot return to an
+earlier value unless the server hands out one OID twice while a single statement starts,
+which needs 2^32 relation creations. That is "monotonic" in the only sense the check needs,
+and it needs no counter in the catalog (a counter would be a catalog change and an upgrade
+script; none is needed). The scan asks for placement and identity in one statement before
+the cursors and in one after them and compares: the placement against the placement its
+plan was made with, the identity against the identity of the same node before. The local
+part of the scan carries, in its plan, the identity of the partitions the planner expanded
+(taken from the planner's partition directory, which is what the child path is made of,
+not from the relcache, which can be rebuilt after the expansion), and compares it with the
+catalog at the start of the scan and again after the remote checks: this replaces the
+count of partitions of 0.3, which a detach and an attach cancel out. Remote groups were
+covered only by the placement before; each node's own identity covers them now, which is
+the second case the reviewer listed ("a back-and-forth on a remote group").
+
+The fan-out write needs no identity: it holds ROW EXCLUSIVE on the parent of every node
+it has written, and the second move's attach on its target needs SHARE ROW EXCLUSIVE
+there, so a back-and-forth cannot complete under the statement; the placement is compared
+at the end as before. Tests: `t/031` (away and back inside the start of a scan, with a
+third group that owns nothing so that no cursor of the scan holds a lock where the bucket
+goes back; two moves of different buckets between the placement check and the cursors,
+which uses the new fault point `scan_after_placement`; the second passes with the old code
+too, the placement differing, and is kept as a guard of the sum).
+
+**What a write into a partition does to the proof (S4-03).** The proof that the copy has
+everything is a marker row committed on the source after the switch's locks are granted.
+It covers every transaction that wrote the bucket before, provided the lock waits for
+them. A write straight into the partition (a table owner can do it) takes ROW EXCLUSIVE
+on the partition and, to check the partition constraint, ACCESS SHARE on the parent;
+neither conflicts with SHARE on the parent. Observed: the switch queued at the detach (its
+parent lock waited for the writer's ACCESS SHARE), the writer committed, the switch
+committed and dropped the subscription at once, and the row, never replayed, was left in
+the orphan table (`t/034`, with the replication held back by disabling the subscription
+while the writer commits; confirmed by running the test against a build without the
+partition locks: the row is lost).
+
+Two measures, the second covering the gaps of the first:
+
+1. The switch locks the partitions of the moving bucket in SHARE mode, with the parents,
+   before it commits the marker. ROW EXCLUSIVE on the partition conflicts with SHARE, so
+   every transaction that wrote the partition (through the parent or not, `COPY`
+   included) has ended when the lock is granted, and none can start until the switch
+   ends: a writer that arrives later waits for the lock, and when it gets it the
+   partition has been renamed away, so its statement fails with "relation does not
+   exist" instead of being acknowledged into the orphan. This is the barrier the reviewer
+   asked for, placed before the marker instead of after the detach. The alternative, a
+   second marker committed after the detach, does not work in this design: the attach on
+   the target holds ACCESS EXCLUSIVE on the attached table until the switch commits, so
+   the apply worker cannot write it and the second marker could not arrive before the
+   commit. The barrier precedes the marker and the marker is replayed after everything
+   committed before it, so "replayed up to the end of the switch" holds for every
+   transaction that can ever have written the partition: nothing is committed on the
+   partition between the marker and the commit.
+2. The planner refuses a write that names a bucket partition (`planner.c`,
+   `refuse_bucket_partition_write`: the result relation of the statement, or of a
+   data-modifying `WITH`, is a partition of a hash-distributed table). It holds for
+   superusers. It does not hold for a superuser who has switched
+   `kingres_shard.enable_routing` off (to repeat a statement on every node by hand), for
+   `COPY` into a partition, or for the replication workers of a move; the lock of measure
+   1 covers all of them. An executor hook would close the first gaps too, at the price of
+   a hook on every statement for cases the lock already covers; not done.
+
+**Queueing for locks (S4-04).** The switch took its locks by waiting for them with a lock
+timeout. While a request waits, every later request that conflicts with it waits behind
+it (PostgreSQL grants in queue order): the SHARE request of the source stalled every new
+writer of any bucket of the group's tables, and the ACCESS EXCLUSIVE request of the
+detach every new reader. A transaction that held a table open (a long writer of another
+bucket, a report) made every attempt queue for the whole lock timeout (one tenth of
+`move_switch_timeout`, one second by default), and the attempts had no end. Reproduced by
+the reviewer (25 of 120 inserts delayed, 12 s lost in 30 s) and by `t/035` against a
+build that queues again: 29 and 27 samples of the lock table showed a waiting request.
+
+Decision: no request of the switch ever waits.
+
+- `kingres.internal_try_lock(sql, hold)` runs a `LOCK TABLE ... NOWAIT` in a
+  subtransaction and returns false when a lock is not available; the subtransaction gives
+  back what it had got. The C code retries for at most `lock_ms` (a tenth of the switch
+  timeout, at least 200 ms) with a growing pause, and raises `lock_not_available` when the
+  budget is spent, naming the sessions that hold a conflicting lock (asked from a session
+  of its own: `pg_locks` of the node; the switch's own pid is left out).
+- The attempt begins with a **probe**, holding nothing: is a transaction that has been open
+  for longer than the attempt will try (`lock_ms`) holding a table of the move on the source
+  or the target in a mode that conflicts with the lock the attempt needs (the exclusive one
+  on the source, SHARE ROW EXCLUSIVE on the target)? Such a transaction will not be gone in
+  time, and it is found before a single lock is taken, so the attempt costs the application
+  nothing. A short statement is no reason to give up (a probe that asked for the locks with
+  NOWAIT would fail whenever any reader overlaps the instant, which starved moves under a
+  continuous scan load in `t/026`); the lock phases below get past it by trying for
+  `lock_ms`. The locks are then taken in the
+  old order (target, then source SHARE with the partitions). The ACCESS EXCLUSIVE locks of
+  the detach are taken by try-locking, after the attach and before the `DETACH`
+  statement, which then finds them held and does not queue. A failure after the probe
+  holds the writers back for at most `lock_ms`.
+- A failed attempt rolls back and the move backs off: 0.2 s, 0.4 s, ... up to 10 s, and
+  fails after `kingres_shard.move_switch_attempts` attempts (default 20) with the last
+  reason, which carries the pids, in `kingres.bucket_move.detail`; the bucket goes back to
+  `active` and the move can be started again. Under a continuous, overlapping stream of
+  writers on the source no instant may exist without a conflicting lock, and the move then
+  cannot get its locks: it fails after its attempts instead of delaying the application
+  for ever. A queued request would have drained the writers, at the price of stalling
+  them; the trade is deliberate and stated in the README: the application comes first.

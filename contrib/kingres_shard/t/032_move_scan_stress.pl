@@ -109,12 +109,10 @@ for my $round (1 .. 24)
 	}
 	$n1->safe_psql('postgres', "SELECT kingres.move_bucket(1, $bucket, $t)");
 	$moves++;
-	# Each orphan is dropped before the next move: a second orphan of one bucket would
-	# collide with the first on the names of its indexes in schema kingres (a limit of
-	# phase 4 that is not what this test is about).
-	$n1->safe_psql('postgres', 'SELECT kingres.cleanup_moved_buckets(true)');
 	sleep(rand(0.05));
 }
+# The orphans of all the moves, several of them of one bucket on one node, go at once.
+$n1->safe_psql('postgres', 'SELECT kingres.cleanup_moved_buckets(true)');
 open(my $sfh, '>', $stop) or die;
 close($sfh);
 waitpid($_->{pid}, 0) for @procs;

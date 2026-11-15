@@ -49,11 +49,15 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "catalog/indexing.h"
+#include "catalog/pg_authid.h"
+#include "catalog/pg_inherits.h"
 #include "catalog/pg_type_d.h"
 #include "commands/dbcommands.h"
 #include "executor/spi.h"
@@ -63,7 +67,10 @@
 #include "miscadmin.h"
 #include "storage/latch.h"
 #include "storage/lock.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
+#include "utils/inval.h"
 #include "utils/json.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -75,6 +82,7 @@
 
 #include "bucket_move.h"
 #include "catalog.h"
+#include "forward_auth.h"
 #include "kingres_shard.h"
 #include "node_admin.h"
 #include "node_conn.h"
@@ -115,21 +123,13 @@ ctl_discard(CtlConn *cc)
 	cc->fault[0] = '\0';
 }
 
-/* Ask the node to stop the running statement; the answer is not awaited. */
+/* Ask the node to stop the running statement, waiting for the request for a bounded time only (S3-07). */
 static void
 ctl_cancel(CtlConn *cc)
 {
-	PGcancel   *cancel;
-	char		errbuf[256];
-
 	if (cc->conn == NULL)
 		return;
-	cancel = PQgetCancel(cc->conn);
-	if (cancel != NULL)
-	{
-		(void) PQcancel(cancel, errbuf, sizeof(errbuf));
-		PQfreeCancel(cancel);
-	}
+	kingres_shard_cancel_with_deadline(cc->conn);
 }
 
 /*
@@ -505,6 +505,30 @@ kingres_internal_move_alive(PG_FUNCTION_ARGS)
 }
 
 /*
+ * require_node_session
+ *
+ * The helpers below are called by the sessions that other nodes open (the
+ * distributed scan, a fan-out write), which run as the role of the user whose
+ * statement it is, so they cannot be limited to superusers.  They answer the
+ * session that proved it comes from a node of the cluster, a superuser, and a
+ * role that may read the table the answer is about (review finding S4-06): an
+ * ordinary role learns nothing about the placement of tables it cannot see and
+ * cannot make this backend forget cache entries of relations it chooses.
+ */
+static void
+require_node_session(Oid parent)
+{
+	if (superuser() || kingres_shard_session_forwarded())
+		return;
+	if (OidIsValid(parent) && kingres_shard_lookup_dist_table(parent) != NULL &&
+		pg_class_aclcheck(parent, GetUserId(), ACL_SELECT) == ACLCHECK_OK)
+		return;
+	ereport(ERROR,
+			(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+			 errmsg("permission denied for the internal functions of kingres_shard")));
+}
+
+/*
  * kingres.internal_map_version() returns bigint
  *
  * The latest committed version of the bucket map on this node, whatever the
@@ -517,7 +541,10 @@ PG_FUNCTION_INFO_V1(kingres_internal_map_version);
 Datum
 kingres_internal_map_version(PG_FUNCTION_ARGS)
 {
-	int64		version = kingres_shard_map_version_now();
+	int64		version;
+
+	require_node_session(InvalidOid);
+	version = kingres_shard_map_version_now();
 
 	if (version < 0)
 		PG_RETURN_NULL();
@@ -557,7 +584,10 @@ kingres_internal_placement_hash(PG_FUNCTION_ARGS)
 		int64		hash;
 	}			seen[KS_SEEN_PARENTS];
 	static int	next_slot = 0;
-	int64		h = kingres_shard_placement_hash_now(PG_GETARG_INT32(0));
+	int64		h;
+
+	require_node_session(PG_ARGISNULL(1) ? InvalidOid : PG_GETARG_OID(1));
+	h = kingres_shard_placement_hash_now(PG_GETARG_INT32(0));
 
 	if (!PG_ARGISNULL(1))
 	{
@@ -590,6 +620,142 @@ kingres_internal_placement_hash(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(h);
 }
 
+/*
+ * kingres.internal_partition_identity(parent regclass) returns bigint
+ *
+ * The identity of the set of partitions attached to the table on this node, from
+ * the latest committed state (catalog.c, kingres_shard_partition_identity_now).
+ * A scan asks for it together with the placement before it declares its cursor
+ * on this node and again after, and the two answers must be equal: the placement
+ * alone cannot tell that a bucket left and came back in between.
+ */
+PG_FUNCTION_INFO_V1(kingres_internal_partition_identity);
+
+Datum
+kingres_internal_partition_identity(PG_FUNCTION_ARGS)
+{
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
+	PG_RETURN_INT64(kingres_shard_partition_identity_now(PG_GETARG_OID(0)));
+}
+
+/*
+ * check_partitions_in_snapshot
+ *
+ * A transaction that works from one snapshot (REPEATABLE READ, SERIALIZABLE) and
+ * reads a distributed table through the partitions of this node must not meet a
+ * partition that arrived after its snapshot: the rows of a bucket that a move
+ * copied here were written by transactions that the snapshot does not see, so the
+ * transaction would read the table without that bucket, which the other nodes no
+ * longer serve either (review of 0.3, "long REPEATABLE READ and SERIALIZABLE
+ * transactions").  An answer that silently lacks rows is wrong; the transaction
+ * is told to retry, as for any other serialization failure.  The partitions that
+ * the snapshot sees are those whose pg_inherits row it sees (the attach of the
+ * switch writes it); the latest state has more of them when one arrived.
+ */
+static void
+check_partitions_in_snapshot(Oid parent)
+{
+	Relation	inh;
+	ScanKeyData key;
+	int			seen = 0;
+	int			latest = 0;
+	int			pass;
+
+	if (!IsolationUsesXactSnapshot() || !FirstSnapshotSet)
+		return;
+
+	ScanKeyInit(&key, Anum_pg_inherits_inhparent, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(parent));
+	inh = table_open(InheritsRelationId, AccessShareLock);
+	for (pass = 0; pass < 2; pass++)
+	{
+		Snapshot	snapshot = RegisterSnapshot(pass == 0 ? GetTransactionSnapshot() : GetLatestSnapshot());
+		SysScanDesc scan = systable_beginscan(inh, InheritsParentIndexId, true,
+											  snapshot, 1, &key);
+
+		while (systable_getnext(scan) != NULL)
+		{
+			if (pass == 0)
+				seen++;
+			else
+				latest++;
+		}
+		systable_endscan(scan);
+		UnregisterSnapshot(snapshot);
+	}
+	table_close(inh, AccessShareLock);
+
+	if (latest > seen)
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not serialize access: a bucket of table \"%s\" moved to this node after the snapshot of the transaction was taken",
+						get_rel_name(parent)),
+				 errdetail("The rows of the bucket were written after the snapshot, so the transaction cannot read them."),
+				 errhint("The transaction can be retried.")));
+}
+
+/*
+ * kingres_shard_ensure_fresh_partitions
+ *
+ * Called by the planner hook for every distributed table of a statement, after
+ * the catalog cache of this backend has been read and before the statement is
+ * planned.  The cache says which buckets this node has; the partition list of
+ * the table that the planner will use comes from the relcache.  Both change in
+ * the transaction of a switch, but they reach a backend by different paths: the
+ * cache is rebuilt from the latest committed state of the catalog tables, the
+ * relcache entry of the table only when this backend processes the switch's
+ * invalidation messages, and a backend can read the new map after the commit
+ * and before (or without) processing them (it processes them when it starts a
+ * transaction or takes a lock it did not hold, not when it reads the cache; and
+ * a commit is visible a moment before its messages are queued).  A statement
+ * for a bucket that arrived on this node would then be planned against a
+ * partition list without the partition, and answer "no rows".
+ *
+ * So the partition list is made at least as new as the cache: a backend remembers
+ * for which version of the map it last rebuilt the relcache entry of each table
+ * (the version of the map counts every switch, and the transaction that changes
+ * the partitions changes it), and rebuilds the entry, from the catalog as it is
+ * now, when the version it plans with is another.  The rebuild itself is what the
+ * invalidation message would have done.
+ */
+#define KS_FRESH_SLOTS 32
+
+void
+kingres_shard_ensure_fresh_partitions(Oid parent, int64 map_version)
+{
+	static struct
+	{
+		Oid			parent;
+		int64		version;
+	}			fresh[KS_FRESH_SLOTS];
+	static int	next_slot = 0;
+	int			i;
+
+	check_partitions_in_snapshot(parent);
+
+	for (i = 0; i < KS_FRESH_SLOTS; i++)
+	{
+		if (fresh[i].parent == parent)
+		{
+			if (fresh[i].version == map_version)
+				return;
+			break;
+		}
+	}
+	if (i == KS_FRESH_SLOTS)
+	{
+		i = next_slot;
+		next_slot = (next_slot + 1) % KS_FRESH_SLOTS;
+	}
+	fresh[i].parent = parent;
+	fresh[i].version = map_version;
+
+	/* The rebuild must not use a catalog snapshot older than the map just read. */
+	InvalidateCatalogSnapshot();
+	RelationCacheInvalidateEntry(parent);
+}
+
 /* ---------------------------------------------------------------------------
  * The cluster lock and the guard of DDL
  * ---------------------------------------------------------------------------
@@ -606,17 +772,29 @@ kingres_shard_assert_no_move(int colocation_id)
 	Oid			argtypes[1] = {INT4OID};
 	Datum		values[1];
 	int			found = 0;
+	Oid			save_uid;
+	int			save_sec;
+	int			ret;
 
 	if (!OidIsValid(kingres_shard_catalog_relid("bucket_move")))
 		return;
 	values[0] = Int32GetDatum(colocation_id);
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
-	if (SPI_execute_with_args("SELECT m.move_id FROM " KINGRES_SHARD_SCHEMA ".bucket_move m "
+	/*
+	 * The records of moves are readable by their owner only (review finding
+	 * S4-07), and this runs for the role that changes a table, who may be an
+	 * ordinary owner of it: read them as the owner of the catalog.
+	 */
+	GetUserIdAndSecContext(&save_uid, &save_sec);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, save_sec | SECURITY_LOCAL_USERID_CHANGE);
+	ret = SPI_execute_with_args("SELECT m.move_id FROM " KINGRES_SHARD_SCHEMA ".bucket_move m "
 							  "WHERE m.colocation_id OPERATOR(pg_catalog.=) $1 "
 							  "AND m.phase IN ('preparing', 'copying', 'catching_up', 'switching') "
 							  "LIMIT 1",
-							  1, argtypes, values, NULL, true, 0) != SPI_OK_SELECT)
+							  1, argtypes, values, NULL, true, 0);
+	SetUserIdAndSecContext(save_uid, save_sec);
+	if (ret != SPI_OK_SELECT)
 		elog(ERROR, "could not look for bucket moves");
 	if (SPI_processed > 0)
 	{
@@ -643,6 +821,7 @@ kingres_shard_assert_no_move(int colocation_id)
 typedef struct MoveTable
 {
 	char	   *qualified;		/* quoted schema.table of the parent */
+	char	   *partition;		/* quoted schema.table of the partition of the moving bucket */
 } MoveTable;
 
 static int
@@ -659,9 +838,25 @@ remaining_ms(TimestampTz deadline)
 	return ms < 1 ? 1 : (int) Min(ms, 3600000L);
 }
 
-/* The statement that locks the parents of the tables of the move. */
+/* The lock modes that conflict with the lock a step takes (for naming who is in the way). */
+#define LOCK_MODES_AGAINST_SHARE \
+	"'RowExclusiveLock', 'ShareUpdateExclusiveLock', 'ShareRowExclusiveLock', " \
+	"'ExclusiveLock', 'AccessExclusiveLock'"
+#define LOCK_MODES_AGAINST_SHARE_ROW_EXCLUSIVE \
+	"'RowExclusiveLock', 'ShareUpdateExclusiveLock', 'ShareLock', " \
+	"'ShareRowExclusiveLock', 'ExclusiveLock', 'AccessExclusiveLock'"
+#define LOCK_MODES_ALL \
+	"'AccessShareLock', 'RowShareLock', 'RowExclusiveLock', 'ShareUpdateExclusiveLock', " \
+	"'ShareLock', 'ShareRowExclusiveLock', 'ExclusiveLock', 'AccessExclusiveLock'"
+
+/*
+ * The statement that locks the parents of the tables of the move and, when
+ * "with_partitions", the partitions of the moving bucket (see the switch for why
+ * both).  It never waits for the lock: whoever holds a conflicting one makes it
+ * fail at once, and the caller decides how long to try again (try_lock_phase).
+ */
 static char *
-lock_statement(List *tables, const char *mode)
+lock_statement(List *tables, bool with_partitions, const char *mode)
 {
 	StringInfoData buf;
 	ListCell   *lc;
@@ -674,9 +869,11 @@ lock_statement(List *tables, const char *mode)
 		MoveTable  *t = (MoveTable *) lfirst(lc);
 
 		appendStringInfo(&buf, "%sONLY %s", first ? "" : ", ", t->qualified);
+		if (with_partitions)
+			appendStringInfo(&buf, ", ONLY %s", t->partition);
 		first = false;
 	}
-	appendStringInfo(&buf, " IN %s MODE", mode);
+	appendStringInfo(&buf, " IN %s MODE NOWAIT", mode);
 	return buf.data;
 }
 
@@ -693,6 +890,9 @@ typedef struct Part
 {
 	KsConn	   *kc;				/* NULL for this node */
 	bool		local;
+	const char *label;			/* "source" or "target", for messages */
+	const char *host;			/* of the node, to find the blockers of a lock */
+	int			port;
 } Part;
 
 static void
@@ -715,6 +915,145 @@ part_exec(Part *p, const char *sql)
 }
 
 /*
+ * One try to take locks on a participant without waiting for any of them
+ * (kingres.internal_try_lock runs the LOCK TABLE ... NOWAIT in a subtransaction,
+ * so that a refusal leaves nothing taken and the transaction usable).
+ */
+static bool
+part_try_lock(Part *p, const char *lock_sql)
+{
+	char	   *sql = psprintf("SELECT " KINGRES_SHARD_SCHEMA ".internal_try_lock(%s)",
+							   quote_literal_cstr(lock_sql));
+	bool		got;
+
+	if (p->local)
+	{
+		bool		isnull;
+
+		if (SPI_connect() != SPI_OK_CONNECT)
+			elog(ERROR, "SPI_connect failed");
+		if (SPI_execute(sql, false, 0) != SPI_OK_SELECT || SPI_processed != 1)
+			elog(ERROR, "could not try a lock on this node");
+		got = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+		SPI_finish();
+	}
+	else
+	{
+		PGresult   *res = kingres_shard_exec(p->kc, sql);
+
+		got = (PQntuples(res) == 1 && PQgetvalue(res, 0, 0)[0] == 't');
+		PQclear(res);
+	}
+	return got;
+}
+
+/*
+ * The backends that hold a lock on one of the tables in a mode that conflicts
+ * with the requested one, as "pid 123, pid 456" (empty when there are none), and,
+ * when min_age_ms is not zero, only those whose transaction has been open for
+ * longer than that.  Asked from a session of its own: the switch's session is in
+ * the middle of a transaction, and its own locks (taken earlier in the attempt)
+ * must not be named.
+ */
+static char *
+lock_holders(Part *p, List *tables, bool with_partitions, const char *conflicting_modes,
+			 int min_age_ms)
+{
+	StringInfoData rels;
+	ListCell   *lc;
+	char	   *sql;
+	PGresult   *res;
+	char	   *result;
+	int			mypid = p->local ? MyProcPid : PQbackendPID(p->kc->conn);
+
+	initStringInfo(&rels);
+	foreach(lc, tables)
+	{
+		MoveTable  *t = (MoveTable *) lfirst(lc);
+
+		appendStringInfo(&rels, "%s%s::pg_catalog.regclass", rels.len > 0 ? ", " : "",
+						 quote_literal_cstr(t->qualified));
+		if (with_partitions)
+			appendStringInfo(&rels, ", %s::pg_catalog.regclass", quote_literal_cstr(t->partition));
+	}
+	sql = psprintf("SELECT coalesce(pg_catalog.string_agg(DISTINCT 'pid ' OPERATOR(pg_catalog.||) l.pid::pg_catalog.text, ', '), '') "
+				   "FROM pg_catalog.pg_locks l "
+				   "JOIN pg_catalog.pg_stat_activity a ON a.pid OPERATOR(pg_catalog.=) l.pid "
+				   "WHERE l.locktype OPERATOR(pg_catalog.=) 'relation' AND l.granted "
+				   "AND l.pid OPERATOR(pg_catalog.<>) %d "
+				   "AND l.database OPERATOR(pg_catalog.=) (SELECT oid FROM pg_catalog.pg_database WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()) "
+				   "AND l.relation OPERATOR(pg_catalog.=) ANY (ARRAY[%s]::pg_catalog.oid[]) "
+				   "AND l.mode OPERATOR(pg_catalog.=) ANY (ARRAY[%s]) "
+				   "AND a.xact_start OPERATOR(pg_catalog.<) (pg_catalog.clock_timestamp() OPERATOR(pg_catalog.-) pg_catalog.make_interval(secs => %d / 1000.0))",
+				   mypid, rels.data, conflicting_modes, min_age_ms);
+	res = ctl_must(p->host, p->port, sql, 5000);
+	result = pstrdup(PQgetvalue(res, 0, 0));
+	PQclear(res);
+	return result;
+}
+
+/*
+ * The probe that opens an attempt, holding nothing: is a transaction that has been
+ * open for longer than a try is going to last keeping a table of the move in the
+ * way?  Such a transaction (a long writer, a report) will not be gone within the
+ * budget of this attempt, so the attempt is not made: nothing is locked, nobody
+ * waits, and the move backs off.  A short statement is not a reason to give up;
+ * try_lock_phase gets past it.
+ */
+static void
+refuse_long_holders(Part *p, List *tables, bool with_partitions, const char *mode,
+					const char *conflicting_modes, int budget_ms)
+{
+	char	   *who = lock_holders(p, tables, with_partitions, conflicting_modes, budget_ms);
+
+	if (who[0] != '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+				 errmsg("a transaction that has been open for more than %d ms holds the tables of the bucket on the %s node in a mode that conflicts with %s: %s",
+						budget_ms, p->label, mode, who),
+				 errhint("The move waits for it to end and tries again.")));
+}
+
+/*
+ * Take the locks of one phase on a participant, trying again for at most
+ * budget_ms and never queueing for them.  A queued request is what stalls the
+ * application: every later statement that needs a conflicting lock on the same
+ * table waits behind it, for as long as the request waits, and a long transaction
+ * of another session can keep it waiting for ever (review finding S4-04).  Trying
+ * and giving up leaves the table as it was.  When the budget is spent the attempt
+ * fails with lock_not_available (the move goes back to catching up, backs off and
+ * tries again, up to its limit) and the message names the sessions in the way.
+ */
+static void
+try_lock_phase(Part *p, List *tables, bool with_partitions, const char *mode,
+			   const char *conflicting_modes, int budget_ms)
+{
+	char	   *sql = lock_statement(tables, with_partitions, mode);
+	TimestampTz until = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), budget_ms);
+	long		pause_us = 2000;
+
+	for (;;)
+	{
+		if (part_try_lock(p, sql))
+			return;
+		if (GetCurrentTimestamp() >= until)
+			break;
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(pause_us);
+		pause_us = Min(pause_us * 2, 50000L);
+	}
+	{
+		char	   *who = lock_holders(p, tables, with_partitions, conflicting_modes, 0);
+
+		ereport(ERROR,
+				(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+				 errmsg("could not get the %s lock on the tables of the bucket on the %s node within %d ms%s%s",
+						mode, p->label, budget_ms, who[0] != '\0' ? ", held by " : "", who),
+				 errhint("A transaction that holds a table of the colocation group (a writer, or for the exclusive step a reader) keeps the move out; it is tried again.")));
+	}
+}
+
+/*
  * The settings of the transaction on a participant of the switch: how long it
  * may wait for a lock (the switch gives up and the move goes back to catching
  * up), and a short deadlock timeout so that if this session is part of a
@@ -722,13 +1061,16 @@ part_exec(Part *p, const char *sql)
  * transaction.
  */
 static Part
-part_begin(const char *host, int port, bool local, TimestampTz deadline, int lock_ms)
+part_begin(const char *label, const char *host, int port, bool local, TimestampTz deadline, int lock_ms)
 {
 	Part		p;
 	char	   *sql;
 
 	p.local = local;
 	p.kc = NULL;
+	p.label = label;
+	p.host = host;
+	p.port = port;
 	if (p.local)
 	{
 		sql = psprintf("SET LOCAL lock_timeout = '%dms'; SET LOCAL deadlock_timeout = '100ms'",
@@ -854,6 +1196,8 @@ kingres_internal_switch_bucket(PG_FUNCTION_ARGS)
 		char	   *rel = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2);
 
 		t->qualified = psprintf("%s.%s", quote_identifier(nsp), quote_identifier(rel));
+		t->partition = psprintf("%s.%s", quote_identifier(nsp),
+								quote_identifier(psprintf("%s_b%04d", rel, bucket)));
 		tables = lappend(tables, t);
 		MemoryContextSwitchTo(old);
 	}
@@ -875,16 +1219,32 @@ kingres_internal_switch_bucket(PG_FUNCTION_ARGS)
 	deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), switch_ms);
 
 	/*
-	 * Each lock is waited for much less than the whole attempt: the writers of
-	 * one node that wait for the lock on the other (they hold their own node's
-	 * lock while they wait) and this transaction that waits for them form a
-	 * cycle that no node can see; the lock timeout ends it, the attempt is
-	 * abandoned, and the writers go on.  The next attempt starts a moment later.
+	 * Each lock is tried for much less than the whole attempt, and never queued
+	 * for (try_lock_phase): a queued request stalls every later statement that
+	 * needs a conflicting lock on the same table, and the writers of one node that
+	 * wait for the lock on the other (they hold their own node's lock while they
+	 * wait) together with this transaction form a cycle that no node can see.  A
+	 * lock that cannot be had within the budget abandons the attempt, nothing
+	 * stays held, and the move backs off and tries again, up to its limit
+	 * (kingres.move_bucket).
 	 */
 	lock_ms = Max(200, switch_ms / 10);
 
 	/*
-	 * 1b. The target first: a lock on the parents of the tables that the attach
+	 * 1b. Both participants begin their transaction, and the attempt looks first,
+	 * holding nothing, whether a transaction that has been open for longer than the
+	 * attempt will try (a long writer or reader of any bucket of the tables) is in
+	 * the way: it is found here, before any lock is taken, so that the attempt costs
+	 * the application nothing when the move cannot succeed.  Short statements are no
+	 * reason to give up: the lock phases below get past them.
+	 */
+	T = part_begin("target", tgthost, tgtport, tgt_local, deadline, lock_ms);
+	S = part_begin("source", srchost, srcport, src_local, deadline, lock_ms);
+	refuse_long_holders(&S, tables, true, "ACCESS EXCLUSIVE", LOCK_MODES_ALL, lock_ms);
+	refuse_long_holders(&T, tables, false, "SHARE ROW EXCLUSIVE", LOCK_MODES_AGAINST_SHARE_ROW_EXCLUSIVE, lock_ms);
+
+	/*
+	 * The target first: a lock on the parents of the tables that the attach
 	 * needs anyway (attaching a table with a foreign key locks the referenced
 	 * table in SHARE ROW EXCLUSIVE).  Taken now, before anything on the source is
 	 * locked, it waits only for statements that finish by themselves; taken at
@@ -892,21 +1252,22 @@ kingres_internal_switch_bucket(PG_FUNCTION_ARGS)
 	 * waiting for the lock on the source, which nothing detects.  From here to the
 	 * commit the writers of the tables wait on the target too.
 	 */
-	T = part_begin(tgthost, tgtport, tgt_local, deadline, lock_ms);
-	part_exec(&T, lock_statement(tables, "SHARE ROW EXCLUSIVE"));
+	try_lock_phase(&T, tables, false, "SHARE ROW EXCLUSIVE", LOCK_MODES_AGAINST_SHARE_ROW_EXCLUSIVE, lock_ms);
 
 	/*
-	 * 2. The source: lock the parents of the tables.  Writers of the group's
-	 * tables on this node wait here, readers go on; every transaction that
-	 * wrote the bucket before has finished when the lock is granted, or the
-	 * lock times out (lock_not_available) and the move goes back to catching
-	 * up.  Locking the parents, and not only the partitions of the bucket, is
-	 * what makes the detach below possible without a deadlock: a writer that
-	 * is queued for a partition holds a lock on its parent, which the detach
-	 * needs exclusively.
+	 * 2. The source: lock the parents of the tables and the partitions of the
+	 * moving bucket.  Writers of the group's tables on this node wait here, readers
+	 * go on; every transaction that wrote the bucket before has finished when the
+	 * locks are granted.  The parents are what makes the detach below possible
+	 * without a deadlock: a writer that is queued for a partition holds a lock on
+	 * its parent, which the detach needs exclusively.  The partitions are what
+	 * covers a write that goes straight into the partition (a table owner can
+	 * write it; the parent is not touched, so its lock does not wait for the
+	 * writer): ROW EXCLUSIVE on the partition conflicts with SHARE, so no such
+	 * write is running when the marker below is committed, and none can start
+	 * before the commit of the switch (review finding S4-03).
 	 */
-	S = part_begin(srchost, srcport, src_local, deadline, lock_ms);
-	part_exec(&S, lock_statement(tables, "SHARE"));
+	try_lock_phase(&S, tables, true, "SHARE", LOCK_MODES_AGAINST_SHARE, lock_ms);
 	kingres_shard_fault_point("move_switch_after_lock");
 
 	/*
@@ -959,7 +1320,15 @@ kingres_internal_switch_bucket(PG_FUNCTION_ARGS)
 	}
 	kingres_shard_fault_point("move_switch_after_attach");
 
-	/* 5. The source: detach, the referencing tables first. */
+	/*
+	 * 5. The source: detach, the referencing tables first.  The detach needs the
+	 * parents and the partitions exclusively.  Asked for with the DETACH itself it
+	 * would queue behind whatever reads the tables, and every statement that comes
+	 * after it would queue behind it (review finding S4-04); so the exclusive locks
+	 * are tried for here, without queueing, while only the writers wait (they have
+	 * since the SHARE lock), and the DETACH then finds them held.
+	 */
+	try_lock_phase(&S, tables, true, "ACCESS EXCLUSIVE", LOCK_MODES_ALL, lock_ms);
 	ord = list_length(tables);
 	for (i = ord; i > 0; i--)
 	{
@@ -1146,6 +1515,38 @@ kingres_internal_detach_bucket(PG_FUNCTION_ARGS)
 						 quote_identifier(nsp), quote_identifier(part),
 						 quote_identifier((char *) lfirst(lc)));
 		spi_stmt(sql.data);
+	}
+
+	/*
+	 * Give the indexes (and with them the constraints they implement) names of
+	 * the orphan.  The orphan moves to schema kingres below, where relation
+	 * names are unique among tables and indexes: a bucket that leaves the same
+	 * node twice before the first orphan has been dropped would otherwise meet
+	 * the index names of the first one ("relation ..._pkey already exists").
+	 * The orphan's own name carries the move id, so the new names cannot clash
+	 * with those of another orphan.
+	 */
+	{
+		Oid			argtypes[1] = {OIDOID};
+		Datum		values[1];
+		List	   *indexes = NIL;
+		int			k = 0;
+
+		values[0] = ObjectIdGetDatum(partoid);
+		if (SPI_execute_with_args("SELECT i.indexrelid::pg_catalog.regclass::pg_catalog.text FROM pg_catalog.pg_index i "
+								  "WHERE i.indrelid OPERATOR(pg_catalog.=) $1 ORDER BY i.indexrelid",
+								  1, argtypes, values, NULL, true, 0) != SPI_OK_SELECT)
+			elog(ERROR, "could not list the indexes of \"%s\"", part);
+		for (i = 0; i < SPI_processed; i++)
+			indexes = lappend(indexes, pstrdup(SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1)));
+		foreach(lc, indexes)
+		{
+			resetStringInfo(&sql);
+			appendStringInfo(&sql, "ALTER INDEX %s RENAME TO %s",
+							 (char *) lfirst(lc),
+							 quote_identifier(psprintf("%s_i%d", orphan, ++k)));
+			spi_stmt(sql.data);
+		}
 	}
 	resetStringInfo(&sql);
 	appendStringInfo(&sql, "ALTER TABLE %s.%s RENAME TO %s",

@@ -71,6 +71,7 @@ int			kingres_shard_recovery_interval = 30;
 bool		kingres_shard_enable_distributed_scan = true;
 int			kingres_shard_move_catchup_threshold = 1024;	/* kB */
 int			kingres_shard_move_switch_timeout = 10000;	/* ms */
+int			kingres_shard_move_switch_attempts = 20;
 int			kingres_shard_move_cleanup_delay = 600;	/* s */
 
 /*
@@ -200,6 +201,14 @@ _PG_init(void)
 							&kingres_shard_move_switch_timeout,
 							10000, 100, 3600000,
 							PGC_USERSET, GUC_UNIT_MS,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("kingres_shard.move_switch_attempts",
+							"How many times a move tries to switch before it gives up.",
+							"A try that cannot get the locks of the bucket's tables (a long transaction holds one) is abandoned and repeated after a pause that doubles up to 10 seconds; when the tries are used up the move fails and names the sessions that were in the way.",
+							&kingres_shard_move_switch_attempts,
+							20, 1, 1000,
+							PGC_USERSET, 0,
 							NULL, NULL, NULL);
 
 	DefineCustomIntVariable("kingres_shard.move_cleanup_delay",

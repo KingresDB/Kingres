@@ -20,7 +20,7 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 use POSIX ();
 use Time::HiRes qw(time sleep);
-use KingresShardTest qw(make_cluster move_state);
+use KingresShardTest qw(make_cluster move_state wait_for_file);
 
 my @nodes = make_cluster('ld', 3, logical => 1);
 my ($n1, $n2, $n3) = @nodes;
@@ -176,8 +176,11 @@ is($n1->safe_psql('postgres', "SELECT count(*) FROM kingres.bucket_move WHERE ph
 	my $key = $n1->safe_psql('postgres', "SELECT g FROM generate_series(1000, 2000) g WHERE kingres.bucket_for(1, g) = $bucket LIMIT 1");
 	$n1->safe_psql('postgres', "INSERT INTO public.orders VALUES ($key, 7)");
 	my $script = "$tmp/long.sql";
+	my $hold = "$tmp/hold_switch";
 	open(my $fh, '>', $script) or die;
-	print $fh "SET kingres_shard.move_switch_timeout = '1500ms';\nSELECT kingres.move_bucket(1, $bucket, $tgt);\n";
+	open(my $hfh, '>', $hold) or die;
+	close($hfh);
+	print $fh "SET kingres_shard.move_switch_timeout = '1500ms';\nSET kingres_shard.fault_injection = 'move_after_catchup:wait:$hold';\nSELECT kingres.move_bucket(1, $bucket, $tgt);\n";
 	close($fh);
 	my $pid = fork();
 	die "fork" unless defined $pid;
@@ -186,17 +189,16 @@ is($n1->safe_psql('postgres', "SELECT count(*) FROM kingres.bucket_move WHERE ph
 		system("psql -X -q -At -h " . $n1->host . " -p " . $n1->port . " -d postgres -f $script > $tmp/long.out 2>&1");
 		POSIX::_exit(0);
 	}
-	# the transaction starts when the copy runs (the slot of a move waits for the transactions
-	# that are running when it is created)
-	my $holder;
-	for (1 .. 300)
-	{
-		my $p = $n1->safe_psql('postgres', "SELECT coalesce(max(phase), '') FROM kingres.bucket_move WHERE bucket = $bucket AND phase = 'catching_up'");
-		last if $p eq 'catching_up';
-		sleep(0.1);
-	}
-	$holder = $nodes[$src]->background_psql('postgres');
+	# The transaction must start after the initial copy is complete and before the
+	# first attempt to switch: the copy of each table creates a slot of its own on
+	# the source, and a slot waits for the transactions that are running when it is
+	# created, so a transaction that starts during the copy holds the copy back and
+	# the move never reaches the switch.  The move stops by itself at the end of the
+	# catch-up (a fault point), which is exactly that moment, however slow the host.
+	ok(wait_for_file("$hold.reached", 120), 'the move reached the end of the catch-up');
+	my $holder = $nodes[$src]->background_psql('postgres');
 	$holder->query_safe("BEGIN; UPDATE public.orders SET customer = 8 WHERE id = $key;");
+	unlink($hold);
 	my $seen = 0;
 	for (1 .. 300)
 	{

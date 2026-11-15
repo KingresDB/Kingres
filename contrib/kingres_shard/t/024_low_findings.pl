@@ -118,7 +118,7 @@ $n1->safe_psql('postgres', 'SELECT kingres.recover_prepared_transactions()');
 	{
 		($rc, $out, $err) = run_sql($n1, "ALTER TABLE public.r2 ADD COLUMN ts timestamptz DEFAULT '$special'");
 		isnt($rc, 0, "S2-10: ADD COLUMN ... DEFAULT '$special' is refused");
-		like($err, qr/different values on different nodes/, "S2-10: with the reason");
+		like($err, qr/can mean another value on each node/, "S2-10: with the reason");
 	}
 	($rc, $out, $err) = run_sql($n1, "ALTER TABLE public.r2 ADD COLUMN ts timestamptz DEFAULT '2024-01-01 00:00:00+00', ADD COLUMN ts2 timestamptz DEFAULT 'infinity'");
 	is($err, '', 'a fixed date default is accepted');

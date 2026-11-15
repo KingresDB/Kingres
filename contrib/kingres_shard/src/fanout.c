@@ -36,7 +36,9 @@
 
 #include "access/parallel.h"
 #include "access/xact.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_type_d.h"
+#include "commands/extension.h"
 #include "catalog.h"
 #include "commands/explain.h"
 #include "commands/explain_format.h"
@@ -48,12 +50,21 @@
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
 #include "nodes/params.h"
+#include "parser/parsetree.h"
+#include "storage/lmgr.h"
+#include "storage/lock.h"
+#include "storage/proc.h"
+#include "tcop/tcopprot.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/tuplestore.h"
+#include "utils/varlena.h"
 
 #include "fanout.h"
+#include "forward_auth.h"
 #include "kingres_shard.h"
 #include "node_conn.h"
 #include "remote_scan.h"
@@ -69,6 +80,18 @@
 
 /* The statement text whose local execution is in progress, or NULL. */
 static const char *fanout_local_sql = NULL;
+
+/*
+ * How many local parts of a fanned-out reference-table write are running in
+ * this backend.  The statements those run (the actions of foreign keys, and
+ * whatever else the write fires) are part of the write that every node runs
+ * for itself, so they act on this node's copy only.
+ */
+static int	refwrite_local_depth = 0;
+
+static ExecutorStart_hook_type prev_ExecutorStart = NULL;
+
+static void fo_executor_start(QueryDesc *queryDesc, int eflags);
 
 typedef struct KsFanoutState
 {
@@ -116,6 +139,8 @@ void
 kingres_shard_fanout_init(void)
 {
 	RegisterCustomScanMethods(&fo_scan_methods);
+	prev_ExecutorStart = ExecutorStart_hook;
+	ExecutorStart_hook = fo_executor_start;
 }
 
 bool
@@ -123,6 +148,108 @@ kingres_shard_in_fanout_local(const char *query_string)
 {
 	return fanout_local_sql != NULL && query_string != NULL &&
 		strcmp(fanout_local_sql, query_string) == 0;
+}
+
+/*
+ * True when the statement of the top-level query text of this backend is the
+ * fragment of a reference-table write that another node runs on every node.
+ */
+static bool
+in_refwrite_fragment(void)
+{
+	return kingres_shard_session_forwarded() && debug_query_string != NULL &&
+		strncmp(debug_query_string, KS_REFWRITE_MARKER, strlen(KS_REFWRITE_MARKER)) == 0;
+}
+
+/*
+ * kingres_shard_in_refwrite_nested
+ *
+ * True for a statement planned while a reference-table write runs on this node
+ * as one of its copies, other than that write itself: the action of a foreign
+ * key, a trigger.  It must run on this node's copy only, because the write is
+ * run on every node and each node does its own part of it.  (The planner then
+ * leaves the statement alone.)
+ */
+bool
+kingres_shard_in_refwrite_nested(const char *query_string)
+{
+	if (refwrite_local_depth > 0)
+		return true;
+	return in_refwrite_fragment() && query_string != NULL &&
+		debug_query_string != NULL && strcmp(query_string, debug_query_string) != 0;
+}
+
+/*
+ * fo_executor_start
+ *
+ * The rule of reference tables: every copy is written, or none.  Whatever path
+ * a write takes (a function called by a statement, a trigger, a rule, a cached
+ * plan, a statement that runs for another node), the planner hook is not
+ * always the one that decides: a plan can be older than the table's being a
+ * reference table, and a function that a routed statement calls runs on
+ * another node, in a session that never fans a write out.  So the decision is
+ * checked where it cannot be bypassed, when a plan that modifies a table starts
+ * to run (review findings S3-01 and S3-02).  A modification of a reference
+ * table is allowed only
+ *
+ *	- in the local part of a write this node fanned out (refwrite_local_depth),
+ *	  or in a session another node opened to run its fragment of such a write
+ *	  (the marker that begins the statement text), where each node does its
+ *	  own part;
+ *	- when the cluster has a single shard group and the session is not
+ *	  forwarded: there is no other copy;
+ *	- when routing is switched off (superuser, by hand), or while the extension
+ *	  is created.
+ *
+ * Everything else fails before the first row is changed.  A plan of a
+ * statement that fans the write out has no ModifyTable node (it is a custom
+ * scan that runs the statement on the nodes), so it never gets here.
+ */
+static void
+fo_executor_start(QueryDesc *queryDesc, int eflags)
+{
+	PlannedStmt *pstmt = queryDesc->plannedstmt;
+
+	if (pstmt->resultRelations != NIL && !(eflags & EXEC_FLAG_EXPLAIN_ONLY) &&
+		kingres_shard_enable_routing && !creating_extension &&
+		refwrite_local_depth == 0 && !IsParallelWorker() && !in_refwrite_fragment())
+	{
+		const KsCatalog *cat = kingres_shard_catalog();
+		ListCell   *lc;
+
+		if (cat->present && cat->dist_tables != NULL && cat->ndist_tables > 0 &&
+			(cat->ngroups > 1 || kingres_shard_session_forwarded()))
+		{
+			foreach(lc, pstmt->resultRelations)
+			{
+				RangeTblEntry *rte = rt_fetch(lfirst_int(lc), pstmt->rtable);
+				KsDistTable *dt;
+
+				if (rte->rtekind != RTE_RELATION)
+					continue;
+				dt = hash_search(cat->dist_tables, &rte->relid, HASH_FIND, NULL);
+				if (dt == NULL || !dt->is_reference)
+					continue;
+				if (kingres_shard_session_forwarded())
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("reference table \"%s\" cannot be written from a statement that is run for another node",
+									get_rel_name(rte->relid)),
+							 errdetail("A function, trigger or rule that a routed statement runs on this node would change this node's copy only, and the copies of a reference table must stay equal."),
+							 errhint("Run the write to the reference table as a statement of its own, from the session that started the work.")));
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("reference table \"%s\" cannot be written by this plan, which would change this node's copy only",
+								get_rel_name(rte->relid)),
+						 errdetail("The plan was made before the table became a reference table or before the cluster had several nodes."),
+						 errhint("Repeat the statement; it is planned again.")));
+			}
+		}
+	}
+	if (prev_ExecutorStart)
+		prev_ExecutorStart(queryDesc, eflags);
+	else
+		standard_ExecutorStart(queryDesc, eflags);
 }
 
 PlannedStmt *
@@ -321,6 +448,8 @@ run_local(KsFanoutState *s, ParamListInfo params, bool keep_rows)
 		elog(ERROR, "SPI_connect failed");
 	nest = kingres_shard_set_transmission_modes();
 	fanout_local_sql = s->sql;
+	if (!s->all_rows)
+		refwrite_local_depth++;
 	PG_TRY();
 	{
 		ret = SPI_execute_with_args(s->sql, n, argtypes, values, nulls, false, 0);
@@ -328,6 +457,8 @@ run_local(KsFanoutState *s, ParamListInfo params, bool keep_rows)
 	PG_FINALLY();
 	{
 		fanout_local_sql = saved;
+		if (!s->all_rows)
+			refwrite_local_depth--;
 	}
 	PG_END_TRY();
 	kingres_shard_reset_transmission_modes(nest);
@@ -420,12 +551,8 @@ kingres_shard_lock_all_reference_tables(void)
 
 		if (n->node_id == cat->local_node_id)
 		{
-			if (SPI_connect() != SPI_OK_CONNECT)
-				elog(ERROR, "SPI_connect failed");
 			foreach(lc2, names)
-				if (SPI_execute(kingres_shard_refwrite_lock_sql((char *) lfirst(lc2)), false, 0) != SPI_OK_SELECT)
-					elog(ERROR, "could not lock a reference table");
-			SPI_finish();
+				kingres_shard_lock_reference_table((char *) lfirst(lc2));
 		}
 		else
 		{
@@ -475,20 +602,117 @@ check_node_set(KsFanoutState *s)
 }
 
 /*
+ * The context of the error that ends a wait for the lock (lock_timeout, the
+ * deadlock detector, a cancel): which table the writer waited for, and what
+ * can hold it.
+ */
+static void
+lock_wait_error_context(void *arg)
+{
+	errcontext("while waiting for the writer lock of reference table \"%s\", which another writer (possibly a prepared transaction that waits for its origin) holds on this node",
+			   (const char *) arg);
+}
+
+/*
+ * kingres_shard_lock_reference_table
+ *
+ * Make a writer of the reference table named by the qualified name wait for
+ * the other writers of it, on this node, until the end of the transaction.
+ *
+ * The lock is a heavyweight lock on an object of a class of its own
+ * (KS_REFWRITE_LOCK_CLASS, which no catalog has) and the OID of the table on
+ * this node.  No role can take it: SQL reaches advisory locks, relation locks
+ * and the locks of the objects that DDL names, never a lock of this class, and
+ * the function that takes it for another node answers only superusers and
+ * sessions that proved they come from a node of the cluster.  (An advisory
+ * lock, as 0.2 used, is in a key space every role shares: any role could hold
+ * the key of a table and stop all writers of it, review finding S3-03.)  Not
+ * LOCK TABLE either: a mode that conflicts with itself needs the UPDATE,
+ * DELETE or TRUNCATE privilege, which a role that may only INSERT does not
+ * have.  Readers are never blocked.
+ *
+ * The wait is bounded: by the session's lock_timeout when it has one, and in
+ * any case by kingres_shard.node_timeout, so that a writer that waits behind
+ * a prepared transaction of a crashed origin (which keeps its locks until it is
+ * resolved) gets a clear error instead of waiting for ever.
+ */
+void
+kingres_shard_lock_reference_table(const char *qualified_name)
+{
+	RangeVar   *rv = makeRangeVarFromNameList(textToQualifiedNameList(cstring_to_text(qualified_name)));
+	Oid			relid = RangeVarGetRelid(rv, NoLock, true);
+	LOCKTAG		tag;
+	int			nest;
+	char		buf[32];
+	ErrorContextCallback errcallback;
+
+	if (!OidIsValid(relid))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 errmsg("reference table \"%s\" does not exist on this node", qualified_name)));
+	SET_LOCKTAG_OBJECT(tag, MyDatabaseId, KS_REFWRITE_LOCK_CLASS, relid, 0);
+
+	nest = NewGUCNestLevel();
+	if (LockTimeout == 0 || LockTimeout > kingres_shard_node_timeout * 1000)
+	{
+		snprintf(buf, sizeof(buf), "%d", kingres_shard_node_timeout * 1000);
+		(void) set_config_option("lock_timeout", buf, PGC_USERSET, PGC_S_SESSION,
+								 GUC_ACTION_SAVE, true, 0, false);
+	}
+	errcallback.callback = lock_wait_error_context;
+	errcallback.arg = (void *) qualified_name;
+	errcallback.previous = error_context_stack;
+	error_context_stack = &errcallback;
+	(void) LockAcquire(&tag, ExclusiveLock, false, false);
+	error_context_stack = errcallback.previous;
+	AtEOXact_GUC(true, nest);
+}
+
+/*
+ * kingres.internal_lock_reference_table(name text) returns void
+ *
+ * The same for another node's writer, which sends it in its forwarded session.
+ */
+PG_FUNCTION_INFO_V1(kingres_internal_lock_reference_table);
+
+Datum
+kingres_internal_lock_reference_table(PG_FUNCTION_ARGS)
+{
+	if (!superuser() && !kingres_shard_session_forwarded())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied for the internal functions of kingres_shard")));
+	kingres_shard_lock_reference_table(text_to_cstring(PG_GETARG_TEXT_PP(0)));
+	PG_RETURN_VOID();
+}
+
+/*
+ * kingres.internal_invalidate_relation(rel regclass) returns void
+ *
+ * Called when the catalog of the cluster changes: the plans of statements on a
+ * table that was planned with the old catalog (a write that did not fan out,
+ * because the table was not yet a reference table) must be made again.
+ */
+PG_FUNCTION_INFO_V1(kingres_internal_invalidate_relation);
+
+Datum
+kingres_internal_invalidate_relation(PG_FUNCTION_ARGS)
+{
+	CacheInvalidateRelcacheByRelid(PG_GETARG_OID(0));
+	PG_RETURN_VOID();
+}
+
+/*
  * kingres_shard_refwrite_lock_sql
  *
- * The statement that makes a writer of the reference table named by the
- * qualified name wait for the other writers of it, on the node it is sent to.
- * An advisory transaction lock, not LOCK TABLE: LOCK TABLE in a mode that
- * conflicts with itself needs the UPDATE, DELETE or TRUNCATE privilege, which
- * a role that may only INSERT does not have.  Readers are never blocked.  The
- * key is made of the name (the same on every node, unlike an OID).
+ * The statement that takes the lock of kingres_shard_lock_reference_table on
+ * the node it is sent to.
  */
 char *
 kingres_shard_refwrite_lock_sql(const char *qualified_name)
 {
-	return psprintf("SELECT pg_catalog.pg_advisory_xact_lock(%d, pg_catalog.hashtext(%s))",
-					KS_REFWRITE_LOCK_CLASS, quote_literal_cstr(qualified_name));
+	return psprintf("SELECT " KINGRES_SHARD_SCHEMA ".internal_lock_reference_table(%s)",
+					quote_literal_cstr(qualified_name));
 }
 
 /*
@@ -512,14 +736,8 @@ lock_reference_tables(KsFanoutState *s)
 
 		if (t->is_local)
 		{
-			if (SPI_connect() != SPI_OK_CONNECT)
-				elog(ERROR, "SPI_connect failed");
 			foreach(lc2, s->locknames)
-			{
-				if (SPI_execute(kingres_shard_refwrite_lock_sql((char *) lfirst(lc2)), false, 0) != SPI_OK_SELECT)
-					elog(ERROR, "could not lock a reference table");
-			}
-			SPI_finish();
+				kingres_shard_lock_reference_table((char *) lfirst(lc2));
 		}
 		else
 		{
@@ -527,7 +745,7 @@ lock_reference_tables(KsFanoutState *s)
 
 			kingres_shard_begin_write_xact(kc);
 			foreach(lc2, s->locknames)
-				kingres_shard_exec(kc, kingres_shard_refwrite_lock_sql((char *) lfirst(lc2)));
+				PQclear(kingres_shard_exec(kc, kingres_shard_refwrite_lock_sql((char *) lfirst(lc2))));
 		}
 	}
 }

@@ -569,28 +569,60 @@ kingres_shard_map_version_now(void)
 }
 
 /*
- * The number of partitions attached to a partitioned table now, from the catalog
- * with the latest committed snapshot (the partition list of a relcache entry can
- * be behind a commit whose invalidation has not reached this backend).
+ * The identity of the set of partitions of a partitioned table: the sum of a
+ * mixed value per partition OID, so that the order does not matter.  It is the
+ * number a scan compares before and after it declares its cursor on a node
+ * (design/shard-phase4.md, "The map version rule"), and the number the plan of
+ * the local part of a scan was made with.
+ *
+ * Why OIDs and not the placement: a bucket that moves away and comes back has
+ * the same placement before and after, but the copy that comes back is a new
+ * table with a new OID (a move builds a standalone table on its target and the
+ * old partition becomes an orphan), so the identity differs after every switch
+ * that attached or detached a partition and cannot return to an earlier value
+ * unless an OID is handed out twice, which needs 2^32 relation creations while a
+ * single statement starts.  Counting the partitions, as 0.3 did, misses a
+ * detach and an attach that cancel out.
  */
-int
-kingres_shard_attached_partitions_now(Oid parent)
+int64
+kingres_shard_partition_set_identity(int n, const Oid *oids)
+{
+	uint64		h = 0;
+	int			i;
+
+	for (i = 0; i < n; i++)
+		h += placement_mix((int) oids[i], 0);
+	return (int64) h;
+}
+
+/*
+ * The identity of the partitions attached to a partitioned table now, from the
+ * catalog with the latest committed snapshot (the partition list of a relcache
+ * entry can be behind a commit whose invalidation has not reached this backend).
+ */
+int64
+kingres_shard_partition_identity_now(Oid parent)
 {
 	Relation	rel = table_open(InheritsRelationId, AccessShareLock);
 	ScanKeyData key;
 	SysScanDesc scan;
 	Snapshot	snap = RegisterSnapshot(IsInParallelMode() ? GetActiveSnapshot() : GetLatestSnapshot());
-	int			n = 0;
+	HeapTuple	tup;
+	uint64		h = 0;
 
 	ScanKeyInit(&key, Anum_pg_inherits_inhparent, BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(parent));
 	scan = systable_beginscan(rel, InheritsParentIndexId, true, snap, 1, &key);
-	while (systable_getnext(scan) != NULL)
-		n++;
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Oid			child = ((Form_pg_inherits) GETSTRUCT(tup))->inhrelid;
+
+		h += placement_mix((int) child, 0);
+	}
 	systable_endscan(scan);
 	UnregisterSnapshot(snap);
 	table_close(rel, AccessShareLock);
-	return n;
+	return (int64) h;
 }
 
 /* From the cache of this backend. */

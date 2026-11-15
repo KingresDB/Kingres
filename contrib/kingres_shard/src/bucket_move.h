@@ -24,4 +24,11 @@
  */
 extern void kingres_shard_assert_no_move(int colocation_id);
 
+/*
+ * Make the relcache entry of a distributed table (its partition list) at least
+ * as new as the catalog cache the planner hook has just read, version
+ * "map_version" of the bucket map.  See bucket_move.c.
+ */
+extern void kingres_shard_ensure_fresh_partitions(Oid parent, int64 map_version);
+
 #endif							/* KINGRES_SHARD_BUCKET_MOVE_H */

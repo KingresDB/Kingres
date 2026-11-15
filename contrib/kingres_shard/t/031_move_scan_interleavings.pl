@@ -570,6 +570,112 @@ for my $pair (@pairs)
 }
 
 
+# ---- a bucket that moves away and back inside the start of a scan (S4-01) ------
+#
+# The placement of a colocation group is the same before the bucket left and after
+# it came back, so a comparison of placements alone cannot see a scan that was
+# planned on the node in between: its cursor was declared while the bucket was
+# detached, and the rows of the bucket would silently be missing.  Group 2 owns no
+# bucket of the table (so no cursor of the scan holds a lock there, and the move
+# back can run while the scan is paused).  The scan starts from node 1, asks node 2
+# for its placement, and its DECLARE waits for the lock of the first switch; when
+# the first move has committed the DECLARE is planned without the bucket, the scan
+# stops, the bucket comes back, and the scan goes on: it must fail with KS001, never
+# answer 16 rows of 30.
+
+$n1->safe_psql('postgres', q{
+	CREATE TABLE public.w (id int PRIMARY KEY, v int NOT NULL);
+	SELECT kingres.set_node_property(3, false);
+	SELECT kingres.create_distributed_table('public.w', 'id', bucket_count => 2);
+	SELECT kingres.set_node_property(3, true);
+});
+$n1->safe_psql('postgres', join('', map { "INSERT INTO public.w VALUES ($_, $_);
+" } 1 .. 30));
+my $wcol = $n1->safe_psql('postgres',
+	q{SELECT colocation_id FROM kingres.dist_table WHERE relid = 'public.w'::regclass});
+$kinds{scan_w} = {
+	sql => q{SELECT count(*) || ',' || sum(v) FROM public.w;},
+	want => sub { '30,465' },
+};
+
+sub w_whole
+{
+	my ($label) = @_;
+	my @t = map { $_->safe_psql('postgres', q{SELECT count(*) || ',' || sum(v) FROM public.w}) } @nodes;
+	is(join('|', @t), join('|', ('30,465') x 3), "$label: the table is whole from every node");
+}
+
+{
+	my ($S, $T) = (1, 2);
+	my $bucket = $n1->safe_psql('postgres',
+		"SELECT bucket FROM kingres.bucket_map WHERE colocation_id = $wcol AND group_id = $S");
+	my $move = { S => $S, T => $T };
+	my $label = "away and back: bucket $bucket $S>$T>$S inside the start of a scan";
+
+	my $aflag = "$tmp/away" . (++$seq);
+	open(my $fh, '>', $aflag) or die;
+	close($fh);
+	my $mover = spawn($n1,
+		"SET kingres_shard.fault_injection = 'move_switch_after_detach:wait:$aflag';\n"
+		  . "SELECT kingres.move_bucket($wcol, $bucket, $T);\n",
+		'mover');
+	ok(wait_for_file("$aflag.reached", 60), "$label: the first move holds the source in its switch");
+
+	my $scan = statement(0, 'scan_w', "scan_declared_g$S", $move, "$label, scan from node 1");
+	ok($nodes[$S]->poll_query_until('postgres',
+			q{SELECT count(*) > 0 FROM pg_locks WHERE NOT granted AND locktype = 'relation' AND relation = 'public.w'::regclass}),
+		"$label: the DECLARE of the scan waits for the switch's lock");
+	unlink($aflag);
+	finish($mover);
+	ok(wait_for_file("$scan->{pause_file}.reached", 60), "$label: the scan declared its cursor on the detached bucket");
+	is($n1->safe_psql('postgres', "SELECT group_id FROM kingres.bucket_map WHERE colocation_id = $wcol AND bucket = $bucket"),
+		$T, "$label: the bucket is on the target");
+
+	$n1->safe_psql('postgres', "SELECT kingres.move_bucket($wcol, $bucket, $S)");
+	is($n1->safe_psql('postgres', "SELECT group_id FROM kingres.bucket_map WHERE colocation_id = $wcol AND bucket = $bucket"),
+		$S, "$label: the bucket is back on the source, the placement is the original one");
+	release($scan);
+	is(classify($scan), 'retryable', "$label: the scan failed with KS001 and did not answer without the bucket");
+	$n1->safe_psql('postgres', 'SELECT kingres.cleanup_moved_buckets(true)');
+	w_whole($label);
+}
+
+# ---- two moves of different buckets between the placement check and the cursor ---
+#
+# A scan from node 1 over a table whose buckets are on every group pauses after the
+# groups have been asked for their placement; a bucket of group 2 moves to group 1
+# and one of group 1 to group 2 (every node keeps the number of partitions it had,
+# only the placement changes); the scan goes on and must not answer.
+
+$n1->safe_psql('postgres', q{
+	CREATE TABLE public.w2 (id int PRIMARY KEY, v int NOT NULL);
+	SELECT kingres.create_distributed_table('public.w2', 'id', bucket_count => 6);
+});
+$n1->safe_psql('postgres', join('', map { "INSERT INTO public.w2 VALUES ($_, $_);
+" } 1 .. 60));
+my $w2col = $n1->safe_psql('postgres',
+	q{SELECT colocation_id FROM kingres.dist_table WHERE relid = 'public.w2'::regclass});
+{
+	my $label = 'two moves of different buckets inside the start of a scan';
+	my $b1 = $n1->safe_psql('postgres',
+		"SELECT min(bucket) FROM kingres.bucket_map WHERE colocation_id = $w2col AND group_id = 1");
+	my $b2 = $n1->safe_psql('postgres',
+		"SELECT min(bucket) FROM kingres.bucket_map WHERE colocation_id = $w2col AND group_id = 2");
+	$kinds{scan_w2} = {
+		sql => q{SELECT count(*) || ',' || sum(v) FROM public.w2;},
+		want => sub { '60,1830' },
+	};
+	my $scan = statement(0, 'scan_w2', 'scan_after_placement', { S => 1, T => 2 }, "$label, scan from node 1");
+	ok(wait_for_file("$scan->{pause_file}.reached", 60), "$label: the scan asked the groups for their placement");
+	$n1->safe_psql('postgres', "SELECT kingres.move_bucket($w2col, $b1, 2)");
+	$n1->safe_psql('postgres', "SELECT kingres.move_bucket($w2col, $b2, 1)");
+	release($scan);
+	is(classify($scan), 'retryable', "$label: the scan failed with KS001");
+	$n1->safe_psql('postgres', 'SELECT kingres.cleanup_moved_buckets(true)');
+	my @t = map { $_->safe_psql('postgres', q{SELECT count(*) || ',' || sum(v) FROM public.w2}) } @nodes;
+	is(join('|', @t), join('|', ('60,1830') x 3), "$label: the table is whole from every node");
+}
+
 diag(sprintf('%-32s %8s %10s %6s %6s', 'kind/origin role', 'correct', 'retryable', 'wrong', 'failed'));
 for my $k (sort keys %by)
 {

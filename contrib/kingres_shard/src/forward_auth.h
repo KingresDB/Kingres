@@ -41,9 +41,12 @@ extern char *kingres_shard_forward_token(const char *user, int node_id);
  * statement text (KS_FRAGMENT_MARKER, KS_WRITE_MARKER) are looked at only in
  * a session for which this returns true.
  *
- * A node that holds no secret is not part of a secured cluster: the claim is
- * accepted there and the result is not remembered, so that it is checked again
- * once the secret arrives (add_node installs it in the middle of a session).
+ * A node that is not part of a cluster (no local node id) holds no secret and
+ * accepts the claim; so does a node that belongs to a cluster and lost its
+ * secret, but only for the sessions of superusers (what add_node() and
+ * sync_catalog() connect as); it refuses everyone else (S3-09).  In both cases
+ * the result is not remembered, so that the claim is checked again once the
+ * secret arrives (add_node installs it in the middle of a session).
  */
 extern bool kingres_shard_session_forwarded(void);
 

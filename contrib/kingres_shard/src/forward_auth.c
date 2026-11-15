@@ -14,15 +14,21 @@
  * The proof is a token sent as the connection option
  * kingres_shard.forward_token: the hex form of
  *
- *	  HMAC-SHA-256(cluster secret, "kingres-forward-v1" NUL role NUL node id)
+ *	  HMAC-SHA-256(cluster secret, "kingres-forward-v2" NUL role NUL database NUL node id)
  *
- * for the role of the session and the id of the node that receives it.  The
- * secret is a random value made by init_cluster() and kept in the table
- * kingres.cluster_secret, on which no role has any privilege; it is read only
- * here, with the heap API.  A token seen for one role or one node is useless
- * for another.  A token seen on an unprotected network can be replayed for the
- * same role and node, so node-to-node connections belong on TLS
- * (kingres_shard.node_conninfo, README "Securing the connections").
+ * for the role of the session, the name of the database and the id of the node
+ * that receives it.  The secret is a random value made by init_cluster() and
+ * kept in the table kingres.cluster_secret, on which no role has any privilege
+ * and which row-level security hides from every role that is not a superuser;
+ * it is read only here, with the heap API.  A token seen for one role, one
+ * database or one node is useless for another; in particular a token made in a
+ * copy of the database under another name (CREATE DATABASE ... TEMPLATE, a
+ * restored backup) is refused by the original (S3-17).  What a copy under the
+ * same name, or anyone who read the secret, can do is ended by
+ * kingres.rotate_secret().  A token seen on an unprotected network can be
+ * replayed for the same role, database and node, so node-to-node connections
+ * belong on TLS (kingres_shard.node_conninfo, README "Securing the
+ * connections").
  *
  * The token never appears anywhere a user can read: the setting rewrites its
  * own value to "<hidden>" before it is stored, so SHOW, pg_settings and
@@ -40,6 +46,7 @@
 #include "postgres.h"
 
 #include "access/parallel.h"
+#include "commands/dbcommands.h"
 #include "common/hmac.h"
 #include "fmgr.h"
 #include "common/sha2.h"
@@ -55,7 +62,7 @@
 PG_FUNCTION_INFO_V1(kingres_internal_forward_token);
 
 #define KS_SECRET_MAX		128
-#define KS_TOKEN_CONTEXT	"kingres-forward-v1"
+#define KS_TOKEN_CONTEXT	"kingres-forward-v2"
 
 /* The GUC: its stored value is always "" or "<hidden>". */
 static char *forward_token_guc = NULL;
@@ -101,10 +108,10 @@ kingres_shard_forward_auth_init(void)
 							   check_forward_token, NULL, NULL);
 }
 
-/* HMAC-SHA-256 of the token context, role and node id, as lower-case hex. */
+/* HMAC-SHA-256 of the token context, role, database and node id, as lower-case hex. */
 static bool
 compute_token(const unsigned char *secret, int secret_len, const char *role,
-			  int node_id, char *hex_out)
+			  const char *database, int node_id, char *hex_out)
 {
 	pg_hmac_ctx *ctx = pg_hmac_create(PG_SHA256);
 	unsigned char mac[PG_SHA256_DIGEST_LENGTH];
@@ -117,6 +124,7 @@ compute_token(const unsigned char *secret, int secret_len, const char *role,
 	ok = pg_hmac_init(ctx, secret, secret_len) == 0 &&
 		pg_hmac_update(ctx, (const uint8 *) KS_TOKEN_CONTEXT, sizeof(KS_TOKEN_CONTEXT)) == 0 &&
 		pg_hmac_update(ctx, (const uint8 *) role, strlen(role) + 1) == 0 &&
+		pg_hmac_update(ctx, (const uint8 *) database, strlen(database) + 1) == 0 &&
 		pg_hmac_update(ctx, (const uint8 *) idbuf, strlen(idbuf)) == 0 &&
 		pg_hmac_final(ctx, mac, sizeof(mac)) == 0;
 	pg_hmac_free(ctx);
@@ -137,7 +145,8 @@ kingres_shard_forward_token(const char *user, int node_id)
 	if (!kingres_shard_cluster_secret(secret, sizeof(secret), &secret_len))
 		return NULL;
 	hex = palloc(KS_FORWARD_TOKEN_HEX_LEN + 1);
-	if (!compute_token(secret, secret_len, user, node_id, hex))
+	if (!compute_token(secret, secret_len, user, get_database_name(MyDatabaseId),
+					   node_id, hex))
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("could not compute the token for a node-to-node connection")));
@@ -174,11 +183,32 @@ kingres_shard_session_forwarded(void)
 		return true;
 
 	if (!kingres_shard_cluster_secret(secret, sizeof(secret), &secret_len))
-		return true;			/* no secret: not a secured cluster (see the header) */
+	{
+		/*
+		 * A node that is not part of a cluster has nothing to protect, and a
+		 * node that is being added has no secret until add_node() pushes it.
+		 * A node that belongs to a cluster and has none (a node upgraded from
+		 * 0.1 before sync_catalog(), a node whose secret was deleted) must not
+		 * believe an unproved claim (S3-09): it accepts the sessions of
+		 * superusers, who can do everything anyway and are what
+		 * sync_catalog() and add_node() connect as, and refuses the others.
+		 * Not remembered, so that the claim is checked again once the secret
+		 * arrives.
+		 */
+		if (kingres_shard_local_node_id_raw() == 0 ||
+			superuser_arg(GetSessionUserId()))
+			return true;
+		ereport(FATAL,
+				(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+				 errmsg("this session claims to have been opened by another node of the cluster but cannot prove it"),
+				 errdetail("This node belongs to a cluster but holds no cluster secret to check the claim against."),
+				 errhint("Run SELECT kingres.sync_catalog() on the map group primary to install the secret on every node.")));
+	}
 
 	good = claimed_len == KS_FORWARD_TOKEN_HEX_LEN &&
 		compute_token(secret, secret_len,
 					  GetUserNameFromId(GetSessionUserId(), false),
+					  get_database_name(MyDatabaseId),
 					  kingres_shard_local_node_id_raw(), expected) &&
 		constant_time_equal(claimed_token, expected, KS_FORWARD_TOKEN_HEX_LEN);
 	explicit_bzero(secret, sizeof(secret));

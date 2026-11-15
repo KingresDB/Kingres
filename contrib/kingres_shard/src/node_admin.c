@@ -35,6 +35,7 @@
 #include "parser/parse_func.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/memutils.h"
 
 #include "catalog.h"
@@ -48,6 +49,7 @@
 PG_FUNCTION_INFO_V1(kingres_add_node);
 PG_FUNCTION_INFO_V1(kingres_remove_node);
 PG_FUNCTION_INFO_V1(kingres_sync_catalog);
+PG_FUNCTION_INFO_V1(kingres_rotate_secret);
 
 /*
  * kingres_shard_require_map_group
@@ -209,9 +211,12 @@ kingres_shard_sync_catalog_internal(void)
  *
  * Install the cluster secret on the node of kc, in the remote transaction that
  * commits with the local one.  The value is an argument of a statement, which
- * a server may log with its arguments: the session is told not to
- * (log_parameter_max_length = 0 for this transaction), so the secret reaches no
- * log.
+ * a server may log with its arguments, in the log line of a statement and in
+ * the context of an error: the session is told not to
+ * (log_parameter_max_length and log_parameter_max_length_on_error are 0 for
+ * this transaction), so the secret reaches no log and no error message, also
+ * when the statement fails (S3-06).  Each setting is a command of its own: the
+ * extended protocol refuses several commands in one statement.
  */
 static void
 push_secret(KsConn *kc)
@@ -229,6 +234,8 @@ push_secret(KsConn *kc)
 	params[0] = hex;
 	kingres_shard_begin_write_xact(kc);
 	res = kingres_shard_exec(kc, "SET LOCAL log_parameter_max_length = 0");
+	PQclear(res);
+	res = kingres_shard_exec(kc, "SET LOCAL log_parameter_max_length_on_error = 0");
 	PQclear(res);
 	res = kingres_shard_exec_params(kc,
 									 "SELECT " KINGRES_SHARD_SCHEMA ".internal_apply_secret($1::pg_catalog.text)",
@@ -277,6 +284,249 @@ kingres_sync_catalog(PG_FUNCTION_ARGS)
 		push_secret(kingres_shard_get_conn(n->host, n->port, false, NULL));
 	}
 	PG_RETURN_VOID();
+}
+
+/*
+ * kingres.rotate_secret() returns void
+ *
+ * Replace the cluster secret on every active primary node, in the one
+ * two-phase transaction that every catalog change uses.  Every connection is
+ * opened first: a new connection is authenticated with the secret the other
+ * node holds now, and the origin's own copy changes in the next step.  Sessions
+ * that other nodes open after their own commit use the new secret; during the
+ * commit itself (milliseconds) a session opened toward a node that has not yet
+ * committed is refused and the statement has to be repeated.  The old secret
+ * stops working at once on the nodes that have committed: this is how a leaked
+ * secret, or a copy of a node that left the control of the operator, is made
+ * useless.
+ */
+Datum
+kingres_rotate_secret(PG_FUNCTION_ARGS)
+{
+	const KsCatalog *cat;
+	ListCell   *lc;
+	List	   *conns = NIL;
+	uint8		raw[32];
+	char		hex[2 * sizeof(raw) + 1];
+	Datum		values[1];
+	Oid			argtypes[1] = {TEXTOID};
+
+	kingres_shard_lock_catalog();
+	kingres_shard_require_map_group();
+
+	cat = kingres_shard_catalog();
+	foreach(lc, cat->nodes)
+	{
+		KsNode	   *n = (KsNode *) lfirst(lc);
+
+		if (n->node_id == cat->local_node_id || !n->is_active || !n->is_primary)
+			continue;
+		conns = lappend(conns, kingres_shard_get_conn(n->host, n->port, false, NULL));
+	}
+
+	if (!pg_strong_random(raw, sizeof(raw)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("could not generate a random secret")));
+	(void) hex_encode((const char *) raw, sizeof(raw), hex);
+	hex[2 * sizeof(raw)] = '\0';
+	values[0] = CStringGetTextDatum(hex);
+	explicit_bzero(raw, sizeof(raw));
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	spi_run("SELECT " KINGRES_SHARD_SCHEMA ".internal_apply_secret($1)", SPI_OK_SELECT,
+			1, argtypes, values);
+	SPI_finish();
+	explicit_bzero(hex, sizeof(hex));
+
+	foreach(lc, conns)
+		push_secret((KsConn *) lfirst(lc));
+	PG_RETURN_VOID();
+}
+
+/*
+ * The objects whose owner and privileges a new node must get (review finding
+ * S3-11): every distributed and reference table, the sequences that belong
+ * to a column of one, and the schemas that hold the tables.  The sequences
+ * follow the owner of their table (OWNER TO of the table changes them), their
+ * privileges are copied.
+ */
+#define ACL_OBJECTS_CTE \
+	"WITH obj AS (" \
+	"SELECT c.oid, 'TABLE' AS kind, " \
+	"       pg_catalog.quote_ident(n.nspname) || '.' || pg_catalog.quote_ident(c.relname) AS q, " \
+	"       c.relacl, c.relowner " \
+	"  FROM " KINGRES_SHARD_SCHEMA ".dist_table d " \
+	"  JOIN pg_class c ON c.oid = d.relid::pg_catalog.oid " \
+	"  JOIN pg_namespace n ON n.oid = c.relnamespace " \
+	" UNION ALL " \
+	"SELECT s.oid, 'SEQUENCE', " \
+	"       pg_catalog.quote_ident(sn.nspname) || '.' || pg_catalog.quote_ident(s.relname), " \
+	"       s.relacl, s.relowner " \
+	"  FROM pg_depend dp " \
+	"  JOIN pg_class s ON s.oid = dp.objid AND s.relkind = 'S' " \
+	"  JOIN pg_namespace sn ON sn.oid = s.relnamespace " \
+	" WHERE dp.classid = 'pg_class'::pg_catalog.regclass " \
+	"   AND dp.refclassid = 'pg_class'::pg_catalog.regclass " \
+	"   AND dp.deptype IN ('a', 'i') " \
+	"   AND dp.refobjid IN (SELECT d2.relid::pg_catalog.oid FROM " KINGRES_SHARD_SCHEMA ".dist_table d2) " \
+	" UNION ALL " \
+	"SELECT ns.oid, 'SCHEMA', pg_catalog.quote_ident(ns.nspname), ns.nspacl, ns.nspowner " \
+	"  FROM pg_namespace ns " \
+	" WHERE ns.oid IN (SELECT c3.relnamespace FROM " KINGRES_SHARD_SCHEMA ".dist_table d3 " \
+	"                   JOIN pg_class c3 ON c3.oid = d3.relid::pg_catalog.oid)) "
+
+/*
+ * The statements, in order, that give the new node the privileges of the
+ * objects.  The ACL of an object that has one is rebuilt from nothing (the
+ * default privileges of a new object are not the ones the object has), then
+ * granted entry by entry, with grant options.  The grantor is not kept: the
+ * statements run as a superuser, so the grantor is the owner, which is what
+ * the effective rights depend on.
+ */
+#define ACL_STATEMENTS_SQL \
+	ACL_OBJECTS_CTE \
+	"SELECT stmt FROM (" \
+	" SELECT o.oid AS oid, 0 AS ord, '' AS k, " \
+	"        pg_catalog.format('ALTER SCHEMA %s OWNER TO %I', o.q, r0.rolname) AS stmt " \
+	"   FROM obj o JOIN pg_roles r0 ON r0.oid = o.relowner WHERE o.kind = 'SCHEMA' " \
+	" UNION ALL " \
+	" SELECT o.oid, 1, '', pg_catalog.format('REVOKE ALL ON %s %s FROM PUBLIC', o.kind, o.q) " \
+	"   FROM obj o WHERE o.relacl IS NOT NULL " \
+	" UNION ALL " \
+	" SELECT o.oid, 2, '', pg_catalog.format('REVOKE ALL ON %s %s FROM %I', o.kind, o.q, r.rolname) " \
+	"   FROM obj o JOIN pg_roles r ON r.oid = o.relowner WHERE o.relacl IS NOT NULL " \
+	" UNION ALL " \
+	" SELECT o.oid, 3, '', pg_catalog.format('GRANT %s ON %s %s TO %s%s', " \
+	"          pg_catalog.string_agg(x.privilege_type, ', ' ORDER BY x.privilege_type), o.kind, o.q, " \
+	"          CASE WHEN x.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.quote_ident(g.rolname) END, " \
+	"          CASE WHEN x.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END) " \
+	"   FROM obj o CROSS JOIN LATERAL pg_catalog.aclexplode(o.relacl) x " \
+	"   LEFT JOIN pg_roles g ON g.oid = x.grantee " \
+	"  WHERE o.relacl IS NOT NULL " \
+	"  GROUP BY o.oid, o.kind, o.q, x.grantee, g.rolname, x.is_grantable " \
+	" UNION ALL " \
+	" SELECT o.oid, 4, a.attname::pg_catalog.text, " \
+	"          pg_catalog.format('GRANT %s (%I) ON TABLE %s TO %s%s', " \
+	"          pg_catalog.string_agg(x.privilege_type, ', ' ORDER BY x.privilege_type), a.attname, o.q, " \
+	"          CASE WHEN x.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.quote_ident(g.rolname) END, " \
+	"          CASE WHEN x.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END) " \
+	"   FROM obj o JOIN pg_attribute a ON a.attrelid = o.oid AND a.attacl IS NOT NULL AND NOT a.attisdropped " \
+	"   CROSS JOIN LATERAL pg_catalog.aclexplode(a.attacl) x " \
+	"   LEFT JOIN pg_roles g ON g.oid = x.grantee " \
+	"  WHERE o.kind = 'TABLE' " \
+	"  GROUP BY o.oid, a.attname, o.q, x.grantee, g.rolname, x.is_grantable) s " \
+	"ORDER BY oid, ord, k, stmt"
+
+/* The names of the roles those statements and the owners of the tables need. */
+#define ACL_ROLES_SQL \
+	ACL_OBJECTS_CTE \
+	"SELECT DISTINCT rolname FROM (" \
+	" SELECT r.rolname::pg_catalog.text AS rolname FROM obj o JOIN pg_roles r ON r.oid = o.relowner " \
+	"  WHERE o.kind IN ('TABLE', 'SCHEMA') " \
+	" UNION ALL " \
+	" SELECT g.rolname::pg_catalog.text FROM obj o CROSS JOIN LATERAL pg_catalog.aclexplode(o.relacl) x " \
+	"   JOIN pg_roles g ON g.oid = x.grantee " \
+	" UNION ALL " \
+	" SELECT g.rolname::pg_catalog.text FROM obj o " \
+	"   JOIN pg_attribute a ON a.attrelid = o.oid AND a.attacl IS NOT NULL " \
+	"   CROSS JOIN LATERAL pg_catalog.aclexplode(a.attacl) x " \
+	"   JOIN pg_roles g ON g.oid = x.grantee) s " \
+	"ORDER BY 1"
+
+/*
+ * acl_query
+ *
+ * The first column of every row of one of the queries above, as strings in the
+ * caller's memory context.  The query runs with a search_path that holds
+ * nothing but the system catalogs.
+ */
+static List *
+acl_query(const char *sql)
+{
+	MemoryContext callercxt = CurrentMemoryContext;
+	List	   *result = NIL;
+	int			nest;
+	uint64		i;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	nest = NewGUCNestLevel();
+	(void) set_config_option("search_path", "pg_catalog, pg_temp", PGC_USERSET,
+							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	spi_run(sql, SPI_OK_SELECT, 0, NULL, NULL);
+	for (i = 0; i < SPI_processed; i++)
+	{
+		MemoryContext old = MemoryContextSwitchTo(callercxt);
+
+		result = lappend(result,
+						 pstrdup(SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1)));
+		MemoryContextSwitchTo(old);
+	}
+	AtEOXact_GUC(true, nest);
+	SPI_finish();
+	return result;
+}
+
+/*
+ * check_acl_roles_on_node
+ *
+ * A node that joins the cluster gets the owners and privileges of the existing
+ * tables; a role they name that does not exist there would fail the statement
+ * in the middle of the work.  Say which roles are missing before anything is
+ * changed, so that the operator can create them (roles are not copied: they
+ * hold passwords and cluster-wide settings of their own).
+ */
+static void
+check_acl_roles_on_node(KsConn *kc, const char *host, int port)
+{
+	List	   *roles = acl_query(ACL_ROLES_SQL);
+	StringInfoData array;
+	PGresult   *res;
+	ListCell   *lc;
+
+	if (roles == NIL)
+		return;
+	initStringInfo(&array);
+	foreach(lc, roles)
+		appendStringInfo(&array, "%s%s", array.len ? ", " : "", quote_literal_cstr((char *) lfirst(lc)));
+	res = kingres_shard_exec(kc,
+							 psprintf("SELECT pg_catalog.string_agg(r, ', ' ORDER BY r) "
+									  "FROM pg_catalog.unnest(ARRAY[%s]::pg_catalog.text[]) AS r "
+									  "WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles x "
+									  "WHERE x.rolname OPERATOR(pg_catalog.=) r)", array.data));
+	if (!PQgetisnull(res, 0, 0))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("cannot add node %s:%d: the roles %s own tables or hold privileges on them in this cluster and do not exist on the new node",
+						host, port, PQgetvalue(res, 0, 0)),
+				 errhint("Create the roles on the new node (CREATE ROLE, with the same names), then repeat add_node().")));
+	PQclear(res);
+}
+
+/*
+ * copy_acls_to_node
+ *
+ * Give the tables (and the sequences of their columns) that were just created
+ * on the new node the privileges they have here.  Without them a role that
+ * may write a table everywhere else gets "permission denied" on the new node,
+ * from the first statement that reaches it.  The owners of the tables are set
+ * by the script that creates them.
+ */
+static void
+copy_acls_to_node(KsConn *kc)
+{
+	List	   *stmts = acl_query(ACL_STATEMENTS_SQL);
+	StringInfoData script;
+	ListCell   *lc;
+
+	if (stmts == NIL)
+		return;
+	initStringInfo(&script);
+	foreach(lc, stmts)
+		appendStringInfo(&script, "%s;\n", (char *) lfirst(lc));
+	PQclear(kingres_shard_exec(kc, script.data));
 }
 
 /*
@@ -343,6 +593,9 @@ create_tables_on_node(KsConn *kc)
 			PQclear(res);
 		}
 	}
+
+	/* Owners were set with the tables; the privileges follow now that every table exists. */
+	copy_acls_to_node(kc);
 }
 
 /*
@@ -510,6 +763,7 @@ kingres_add_node(PG_FUNCTION_ARGS)
 		record_pending_node(host, port);
 		kc = kingres_shard_get_conn(host, port, false, NULL);
 		kingres_shard_begin_write_xact(kc);
+		check_acl_roles_on_node(kc, host, port);
 		res = kingres_shard_exec(kc, "CREATE EXTENSION IF NOT EXISTS kingres_shard");
 		PQclear(res);
 		res = kingres_shard_exec(kc,

@@ -121,7 +121,7 @@ is(partition_state($tgt_node, $part2), 'true', 'items: the partition is attached
 is(partition_state($src_node, $part), 'absent', 'orders: the partition is no longer on the source');
 is(partition_state($src_node, $part2), 'absent', 'items: the partition is no longer on the source');
 my $orphans = $src_node->safe_psql('postgres',
-	"SELECT string_agg(relname, ',' ORDER BY relname) FROM pg_class WHERE relnamespace = 'kingres'::regnamespace AND relname LIKE 'orphan\\_$id\\_%'");
+	"SELECT string_agg(relname, ',' ORDER BY relname) FROM pg_class WHERE relnamespace = 'kingres'::regnamespace AND relkind = 'r' AND relname LIKE 'orphan\\_$id\\_%'");
 is($orphans, "orphan_${id}_1,orphan_${id}_2", 'the source keeps an orphan table for each table');
 is($src_node->safe_psql('postgres', "SELECT count(*) FROM pg_constraint WHERE contype = 'f' AND conrelid IN
 		(SELECT oid FROM pg_class WHERE relnamespace = 'kingres'::regnamespace AND relname LIKE 'orphan\\_%')"), '0',
@@ -160,7 +160,7 @@ same_everywhere('after writes to the moved bucket', $want);
 # A second move of the same bucket works, and cleaning waits for the delay.
 is($n1->safe_psql('postgres', 'SELECT kingres.cleanup_moved_buckets()'), '0', 'cleanup keeps the orphans during the delay');
 is(partition_state($src_node, $part), 'absent', 'still no partition on the source');
-is($src_node->safe_psql('postgres', "SELECT count(*) FROM pg_class WHERE relnamespace = 'kingres'::regnamespace AND relname LIKE 'orphan\\_%'"),
+is($src_node->safe_psql('postgres', "SELECT count(*) FROM pg_class WHERE relnamespace = 'kingres'::regnamespace AND relkind = 'r' AND relname LIKE 'orphan\\_%'"),
 	'2', 'the orphans are still there');
 is($n1->safe_psql('postgres', 'SELECT kingres.cleanup_moved_buckets(true)'), '1', 'a forced cleanup finishes the move');
 is(move_state($n1, $id), 'done|', 'the move is done');
@@ -178,5 +178,31 @@ same_everywhere('after the move back', $want);
 is($n1->safe_psql('postgres', 'SELECT kingres.cleanup_moved_buckets(true)'), '1', 'cleanup of the second move');
 is($n1->safe_psql('postgres', q{SELECT coalesce(string_agg(check_name || ' ' || node_id || ' ' || object || ' ' || detail, E'
 '), '') FROM kingres.check_cluster()}), '', 'check_cluster finds nothing at the end');
+
+# Moves in a row with no cleanup between them: away from the source, back, and
+# away again.  The second move away from the source finds the first orphan of the
+# bucket still in schema kingres; the detached table must not collide with it on
+# the names of its indexes and constraints.
+{
+	$n1->safe_psql('postgres', "SELECT kingres.move_bucket(1, $bucket, $target)");
+	$n1->safe_psql('postgres', "SELECT kingres.move_bucket(1, $bucket, $source)");
+	my ($rc, $out, $err) = run_sql($n1, "SELECT kingres.move_bucket(1, $bucket, $target)");
+	is($rc, 0, 'a second move away from a node works while its first orphan is still there')
+	  or diag($err);
+	is($n1->safe_psql('postgres', "SELECT group_id FROM kingres.bucket_map WHERE colocation_id = 1 AND bucket = $bucket"),
+		"$target", 'the bucket is on the target after three moves');
+	same_everywhere('after three moves without cleanup', $want);
+	is($src_node->safe_psql('postgres', "SELECT count(*) FROM pg_class WHERE relnamespace = 'kingres'::regnamespace AND relkind = 'r' AND relname LIKE 'orphan\\_%'"),
+		'4', 'the source holds the orphans of two moves');
+	is($src_node->safe_psql('postgres', q{SELECT count(*) FROM (SELECT relname FROM pg_class
+			WHERE relnamespace = 'kingres'::regnamespace AND relkind = 'i'
+			GROUP BY relname HAVING count(*) > 1) d}), '0', 'no two indexes share a name');
+	is($n1->safe_psql('postgres', q{SELECT coalesce(string_agg(check_name || ' ' || node_id || ' ' || object, ','), '')
+			FROM kingres.check_cluster()}), '', 'check_cluster finds nothing with orphans of several moves');
+	is($n1->safe_psql('postgres', 'SELECT kingres.cleanup_moved_buckets(true)'), '3', 'one forced cleanup finishes the three moves');
+	is($_->safe_psql('postgres', "SELECT count(*) FROM pg_class WHERE relnamespace = 'kingres'::regnamespace AND relname LIKE 'orphan\\_%'"),
+		'0', 'no orphan is left on ' . $_->name) for @nodes;
+	same_everywhere('after the cleanup of three moves', $want);
+}
 
 done_testing();

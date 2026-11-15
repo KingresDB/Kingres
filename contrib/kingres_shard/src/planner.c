@@ -59,8 +59,12 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/hash.h"
+#include "access/table.h"
 #include "access/xact.h"
+#include "catalog/partition.h"
+#include "catalog/pg_constraint.h"
 #include "commands/extension.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -71,13 +75,16 @@
 #include "optimizer/planner.h"
 #include "parser/parse_relation.h"
 #include "parser/parsetree.h"
+#include "rewrite/rewriteManip.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/ruleutils.h"
 #include "utils/typcache.h"
 
+#include "bucket_move.h"
 #include "catalog.h"
 #include "dist_scan.h"
 #include "fanout.h"
@@ -429,6 +436,128 @@ qualified_name(Oid relid)
 }
 
 /*
+ * insert_source_needs_wrapping
+ *
+ * The rewritten INSERT ... SELECT (or multi-row INSERT ... VALUES) keeps the
+ * source as a range table entry and puts into the target list what is written
+ * to each column: a Var of the source, or an expression of its own, such as the
+ * default of a column the statement did not name.  The deparser prints the
+ * column list from the target list and the source as it is, so a default (or a
+ * column list in another order than the source's) gives a column list longer
+ * than the source: "INSERT has more target columns than expressions" (review
+ * finding S3-10).  True when some column does not simply take the next column
+ * of the source.
+ */
+static bool
+insert_source_needs_wrapping(Query *query, Index srcrti)
+{
+	ListCell   *lc;
+	AttrNumber	next = 1;
+
+	foreach(lc, query->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		List	   *vars;
+
+		if (te->resjunk)
+			continue;
+		vars = pull_var_clause((Node *) te->expr, 0);
+		if (list_length(vars) != 1 ||
+			((Var *) linitial(vars))->varno != srcrti ||
+			((Var *) linitial(vars))->varattno != next)
+			return true;
+		next++;
+	}
+	return false;
+}
+
+/*
+ * wrap_insert_source
+ *
+ * Rewrite such an INSERT so that its source is a SELECT that returns exactly
+ * the value of each column of the target list, in that order:
+ *
+ *	INSERT INTO t (a, d, b) SELECT ks_src.x, 7, ks_src.y FROM (<source>) ks_src
+ *
+ * The expressions are moved from the target list into the SELECT, the
+ * target list keeps one Var per column.  Defaults come from this node's
+ * catalog and are sent as the values they have, not looked up again on the
+ * other node.
+ */
+static Query *
+wrap_insert_source(Query *query)
+{
+	Query	   *q = copyObject(query);
+	RangeTblEntry *src = NULL;
+	Index		srcrti = 0;
+	Index		rti = 0;
+	Oid			target_relid;
+	Query	   *w;
+	RangeTblEntry *inner;
+	RangeTblEntry *outer;
+	RangeTblRef *rtr;
+	List	   *colnames = NIL;
+	AttrNumber	pos = 0;
+	ListCell   *lc;
+
+	foreach(lc, q->rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+		rti++;
+		if (rte->rtekind == RTE_SUBQUERY || rte->rtekind == RTE_VALUES)
+		{
+			src = rte;
+			srcrti = rti;
+			break;
+		}
+	}
+	if (src == NULL || !insert_source_needs_wrapping(q, srcrti))
+		return query;
+	target_relid = rt_fetch(q->resultRelation, q->rtable)->relid;
+
+	w = makeNode(Query);
+	w->commandType = CMD_SELECT;
+	w->querySource = QSRC_ORIGINAL;
+	inner = copyObject(src);
+	inner->eref = makeAlias("ks_src", inner->eref->colnames);
+	inner->alias = NULL;
+	inner->inFromCl = true;
+	w->rtable = list_make1(inner);
+	rtr = makeNode(RangeTblRef);
+	rtr->rtindex = 1;
+	w->jointree = makeFromExpr(list_make1(rtr), NULL);
+
+	foreach(lc, q->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		Node	   *expr;
+		char	   *name;
+
+		if (te->resjunk)
+			continue;
+		pos++;
+		expr = copyObject((Node *) te->expr);
+		ChangeVarNodes(expr, srcrti, 1, 0);
+		name = get_attname(target_relid, te->resno, false);
+		w->targetList = lappend(w->targetList,
+								makeTargetEntry((Expr *) expr, pos, pstrdup(name), false));
+		colnames = lappend(colnames, makeString(pstrdup(name)));
+		te->expr = (Expr *) makeVar(srcrti, pos, exprType(expr), exprTypmod(expr),
+									exprCollation(expr), 0);
+	}
+
+	outer = makeNode(RangeTblEntry);
+	outer->rtekind = RTE_SUBQUERY;
+	outer->subquery = w;
+	outer->eref = makeAlias("*SELECT*", colnames);
+	outer->inFromCl = src->inFromCl;
+	outer->rellockmode = 0;
+	lfirst(list_nth_cell(q->rtable, srcrti - 1)) = outer;
+	return q;
+}
+
+/*
  * deparse_for_remote
  *
  * Turn the query back into SQL text for another node.  The text must mean the
@@ -445,6 +574,8 @@ deparse_for_remote(Query *query)
 	int			nest = kingres_shard_set_transmission_modes();
 	char	   *sql;
 
+	if (query->commandType == CMD_INSERT)
+		query = wrap_insert_source(query);
 	sql = pg_get_querydef(query, false);
 	kingres_shard_reset_transmission_modes(nest);
 	return sql;
@@ -882,17 +1013,84 @@ compare_cstrings(const ListCell *a, const ListCell *b)
 }
 
 /*
- * The qualified names of the reference tables a statement uses, sorted: the
- * writers of each of them are serialized on every node (S2-06).
+ * add_foreign_key_linked
+ *
+ * Add to the list of relations the reference tables that a write to one of
+ * them can reach through the actions of foreign keys (ON DELETE CASCADE, SET
+ * NULL, ON UPDATE CASCADE, and the checks that read the other table), in
+ * either direction and through any number of keys.  A write that cascades into
+ * a second table and a concurrent writer of that table alone would otherwise
+ * hold different locks and could interleave differently on different nodes
+ * (review finding S3-13).
  */
 static List *
-reference_lock_names(Query *parse)
+add_foreign_key_linked(List *relids, const KsCatalog *cat)
+{
+	Relation	conrel;
+	SysScanDesc scan;
+	ScanKeyData key;
+	HeapTuple	tup;
+	List	   *children = NIL;
+	List	   *parents = NIL;
+	bool		changed = true;
+
+	conrel = table_open(ConstraintRelationId, AccessShareLock);
+	ScanKeyInit(&key, Anum_pg_constraint_contype, BTEqualStrategyNumber,
+				F_CHAREQ, CharGetDatum(CONSTRAINT_FOREIGN));
+	scan = systable_beginscan(conrel, InvalidOid, false, NULL, 1, &key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tup);
+
+		children = lappend_oid(children, con->conrelid);
+		parents = lappend_oid(parents, con->confrelid);
+	}
+	systable_endscan(scan);
+	table_close(conrel, AccessShareLock);
+
+	while (changed)
+	{
+		ListCell   *c;
+		ListCell   *p;
+
+		changed = false;
+		forboth(c, children, p, parents)
+		{
+			Oid			child = lfirst_oid(c);
+			Oid			parent = lfirst_oid(p);
+			bool		has_child = list_member_oid(relids, child);
+			bool		has_parent = list_member_oid(relids, parent);
+			Oid			other = has_child && !has_parent ? parent :
+				(has_parent && !has_child ? child : InvalidOid);
+			KsDistTable *dt;
+
+			if (!OidIsValid(other))
+				continue;
+			dt = hash_search(cat->dist_tables, &other, HASH_FIND, NULL);
+			if (dt != NULL && dt->is_reference)
+			{
+				relids = lappend_oid(relids, other);
+				changed = true;
+			}
+		}
+	}
+	return relids;
+}
+
+/*
+ * The qualified names of the reference tables a statement uses and can reach
+ * through foreign keys, sorted: the writers of each of them are serialized on
+ * every node (S2-06, S3-13).
+ */
+static List *
+reference_lock_names(Query *parse, const KsCatalog *cat)
 {
 	List	   *relids = NIL;
 	List	   *names = NIL;
 	ListCell   *lc;
 
 	(void) collect_relids_walker((Node *) parse, &relids);
+	relids = add_foreign_key_linked(relids, cat);
 	foreach(lc, relids)
 	{
 		Oid			relid = lfirst_oid(lc);
@@ -959,10 +1157,10 @@ plan_reference_write(Query *parse, Oid target, const KsCatalog *cat)
 		targets = lappend(targets, t);
 	}
 
-	sql = deparse_for_remote(parse);
+	sql = psprintf("%s%s", KS_REFWRITE_MARKER, deparse_for_remote(parse));
 	return kingres_shard_make_fanout_plan(parse, sql, targets, false,
 										   list_make1_oid(target),
-										   reference_lock_names(parse));
+										   reference_lock_names(parse, cat));
 }
 
 /*
@@ -1096,6 +1294,70 @@ is_scan_fragment(Query *q, const KsCatalog *cat)
 		return false;
 	return true;
 }
+/*
+ * A data-modifying query below (or at) the top that writes a bucket partition
+ * itself: the partition of a hash-distributed table, named directly.
+ */
+static bool
+bucket_partition_write_walker(Node *node, void *context)
+{
+	const KsCatalog *cat = (const KsCatalog *) context;
+
+	if (node == NULL)
+		return false;
+	if (IsA(node, Query))
+	{
+		Query	   *q = (Query *) node;
+
+		if (q->resultRelation > 0 &&
+			(q->commandType == CMD_INSERT || q->commandType == CMD_UPDATE ||
+			 q->commandType == CMD_DELETE || q->commandType == CMD_MERGE))
+		{
+			RangeTblEntry *rte = rt_fetch(q->resultRelation, q->rtable);
+
+			if (rte->rtekind == RTE_RELATION && get_rel_relispartition(rte->relid))
+			{
+				Oid			parent = get_partition_parent(rte->relid, true);
+
+				if (OidIsValid(parent))
+				{
+					KsDistTable *dt = hash_search(cat->dist_tables, &parent, HASH_FIND, NULL);
+
+					if (dt != NULL && !dt->is_reference)
+						return true;
+				}
+			}
+		}
+		return query_tree_walker(q, bucket_partition_write_walker, context, 0);
+	}
+	return expression_tree_walker(node, bucket_partition_write_walker, context);
+}
+
+/*
+ * refuse_bucket_partition_write
+ *
+ * A write that names a bucket partition (INSERT INTO orders_b0002 ...) is not a
+ * statement of the user's table: the partition is the extension's storage.  It
+ * takes no lock on the parent, so it is not routed by key, is not seen by the
+ * switch of a bucket move as a writer of the table, and a row written that way
+ * to a bucket that is leaving ends in the orphan table.  The move itself is safe
+ * against it (the switch locks the partitions of the bucket, bucket_move.c), but a
+ * write that is refused here fails with a reason instead of waiting for, or being
+ * undone by, a move.  Only a superuser who has switched kingres_shard.enable_routing
+ * off (to repeat a statement on every node by hand) gets past this check; the
+ * lock of the switch holds for that case as well (review finding S4-03).
+ */
+static void
+refuse_bucket_partition_write(Query *parse, const KsCatalog *cat)
+{
+	if (bucket_partition_write_walker((Node *) parse, (void *) cat))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot write a bucket partition of a distributed table directly"),
+				 errdetail("The partitions of a distributed table are the storage of its buckets; a write to one skips the routing by key and the locking of a bucket move."),
+				 errhint("Write the distributed table itself.")));
+}
+
 
 /*
  * The hook proper.  Whatever it decides for one statement is not inherited by
@@ -1152,6 +1414,9 @@ planner_hook_body(Query *parse, const char *query_string,
 	/* The local part of a fanned-out statement is planned for this node only. */
 	if (kingres_shard_in_fanout_local(query_string))
 		return pass_through(parse, query_string, cursorOptions, boundParams);
+	/* The actions of a reference-table write (foreign keys) run on this node's copy only. */
+	if (kingres_shard_in_refwrite_nested(query_string))
+		return pass_through(parse, query_string, cursorOptions, boundParams);
 	/* The statements PostgreSQL runs for a propagated DDL work on this node's buckets. */
 	if (kingres_shard_in_authorized_ddl(query_string))
 		return pass_through(parse, query_string, cursorOptions, boundParams);
@@ -1162,6 +1427,8 @@ planner_hook_body(Query *parse, const char *query_string,
 		parse->commandType != CMD_MERGE)
 		return pass_through(parse, query_string, cursorOptions, boundParams);
 
+	/* The window of shard-phase4.md, "A routed statement on a target"; forced by t/033. */
+	kingres_shard_fault_point("route_before_catalog");
 	cat = kingres_shard_catalog();
 	if (!cat->present || cat->ndist_tables == 0 || cat->local_group_id < 0)
 		return pass_through(parse, query_string, cursorOptions, boundParams);
@@ -1170,12 +1437,19 @@ planner_hook_body(Query *parse, const char *query_string,
 	if (cat->ngroups <= 1 && !kingres_shard_session_forwarded())
 		return pass_through(parse, query_string, cursorOptions, boundParams);
 
+	refuse_bucket_partition_write(parse, cat);
+
 	memset(&a, 0, sizeof(a));
 	a.params = boundParams;
 	a.parse = parse;
 	ctx[0] = &a;
 	ctx[1] = (void *) cat;
 	(void) analyze_walker((Node *) parse, ctx);
+
+	/* The partition lists must be as new as the catalog cache just read. */
+	foreach(lc, a.refs)
+		kingres_shard_ensure_fresh_partitions(((DistRef *) lfirst(lc))->dt->relid,
+											  cat->map_version);
 
 	/*
 	 * A write to a reference table runs on every node; it takes no part in the

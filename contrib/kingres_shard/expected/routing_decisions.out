@@ -389,8 +389,9 @@ ERROR:  could not connect to node 127.0.0.1:1
 DETAIL:  connection to server at "127.0.0.1", port 1 failed: Connection refused
 	Is the server running on that host and accepting TCP/IP connections?
 COPY t TO stdout;
-ERROR:  cannot copy from partitioned table "t"
-HINT:  Try the COPY (SELECT ...) TO variant.
+ERROR:  could not connect to node 127.0.0.1:1
+DETAIL:  connection to server at "127.0.0.1", port 1 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
 COPY (SELECT id FROM t WHERE id = :tl) TO stdout;
 1
 EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT * FROM t;

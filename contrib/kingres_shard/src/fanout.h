@@ -57,4 +57,10 @@ extern void kingres_shard_lock_all_reference_tables(void);
 
 extern bool kingres_shard_in_fanout_local(const char *query_string);
 
+/* A statement planned inside a reference-table write that runs as one copy of it (foreign key actions). */
+extern bool kingres_shard_in_refwrite_nested(const char *query_string);
+
+/* Take the writer lock of a reference table on this node (until the end of the transaction). */
+extern void kingres_shard_lock_reference_table(const char *qualified_name);
+
 #endif							/* KINGRES_SHARD_FANOUT_H */

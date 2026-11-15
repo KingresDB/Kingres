@@ -132,7 +132,15 @@ gives("BEGIN; DECLARE c CURSOR FOR SELECT id FROM public.kvn ORDER BY id; FETCH 
 # A write that spans groups and cannot be shipped is still refused (a plain one without a key now
 # runs on every group; see t/014_dist_write.pl).
 refused("DO \$\$ BEGIN EXECUTE 'DELETE FROM public.kvn USING public.kvn k2 WHERE k2.id = kvn.id'; END \$\$", 'S-D: EXECUTE of a DELETE that cannot be shipped');
-refused("COPY public.kvn TO STDOUT", 'S-D: COPY table TO');
+# COPY of the table itself is run as COPY (SELECT ...) TO (review round of S3, COPY TO):
+# every group answers, never this node's buckets only.
+{
+	my ($rc, $out, $err) = run_sql($n1, "COPY public.kvn TO STDOUT");
+	is($rc, 0, 'S-D: COPY table TO runs');
+	is(join(q{|}, sort split(/\n/, $out)),
+		join(q{|}, sort("$k0\trow-of-group-0", "$k1\trow-of-group-1", "$k2\trow-of-group-2")),
+		'S-D: COPY table TO returns the rows of every group');
+}
 $n1->safe_psql('postgres', 'DROP TABLE public.ctas_all');
 
 # ---------------------------------------------------------------------------

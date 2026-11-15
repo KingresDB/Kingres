@@ -8,7 +8,7 @@ node as reference tables, and makes every statement correct on a cluster with
 several groups: a statement that touches one key goes to the group that owns
 it, and a statement that spans groups is answered by reading the other groups.
 
-This is version 0.3 (phase 4 adds moving buckets; phase 2a made every statement correct). Phase 2b will make the common
+This is version 0.4 (0.3 added moving buckets, phase 2a made every statement correct, 0.4 is the fix round of the reviews of 0.2 and 0.3). Phase 2b will make the common
 statements fast. The designs are in
 [`kingres/docs/design/shard-mvp.md`](../../kingres/docs/design/shard-mvp.md)
 (phase 1) and
@@ -76,9 +76,12 @@ describes what is implemented and how to use it.
   commit: every remote writer is prepared (`PREPARE TRANSACTION`), the decision
   is written to the node-local `kingres.dtx_log` by the committing transaction
   itself, and after the local commit the remote ones are committed. The local
-  commit is always flushed (and waits for synchronous standbys) before the first
-  `COMMIT PREPARED` is sent, whatever `synchronous_commit` says: the extension
-  forces it for these transactions (`ForceSyncCommit()`). A participant that
+  commit is always flushed before the first `COMMIT PREPARED` is sent, whatever
+  `synchronous_commit` says: the extension forces it for these transactions
+  (`ForceSyncCommit()`), and a session with `synchronous_commit` of `off` or
+  `local` has it raised to `on` for such a transaction, so that the commit also
+  waits for the synchronous standbys of the origin and the decision survives a
+  failover (S3-15; `remote_write` and above are kept as they are). A participant that
   does not answer `COMMIT PREPARED` within `kingres_shard.node_timeout` is left
   to recovery with a warning and the later participants are not delayed. A crash at
   any point is resolved by `kingres.recover_prepared_transactions()` and by the
@@ -129,10 +132,21 @@ describes what is implemented and how to use it.
   database, so every node needs a role of that name, and `pg_hba.conf` (and the
   password file, if used) must let the nodes in. Credentials are never stored
   in the catalog. SSL options are set with `kingres_shard.node_conninfo`.
-- `CREATE EXTENSION kingres_shard` installs version 0.3;
-  `ALTER EXTENSION kingres_shard UPDATE` upgrades a 0.1 or 0.2 installation (the
-  catalog is identical to a fresh 0.3 one; the `upgrade` regression test
+- `CREATE EXTENSION kingres_shard` installs version 0.4;
+  `ALTER EXTENSION kingres_shard UPDATE` upgrades a 0.1, 0.2 or 0.3 installation (the
+  catalog is identical to a fresh 0.4 one; the `upgrade` regression test
   compares the two). `shared_preload_libraries` must hold the new library first.
+- **Upgrade order** (review finding S4-05). A node whose library is new and whose
+  SQL objects are not yet updated cannot answer the helper functions that the
+  other nodes call, and the library says so ("node ... runs an older version of
+  the kingres_shard SQL objects") instead of "function does not exist". Distributed
+  scans and fan-out writes of the whole cluster fail from the moment a node
+  restarts with the new library until every node has run `ALTER EXTENSION
+  kingres_shard UPDATE`; single-key reads and writes keep working. So: install the
+  new files on every node, restart them one after the other, run `ALTER EXTENSION
+  ... UPDATE` on every node at once and soon after, and do not start a bucket move
+  before it is done: `move_bucket()` refuses unless every active primary reports
+  extension version 0.4, and names the node that does not.
 
 ## Building and testing
 
@@ -161,7 +175,7 @@ PROVE_TESTS=t/013_dist_scan.pl kingres/dev/ext.sh kingres_shard tap
   second, fictitious shard group; `routing_decisions`: collations, functions
   and other nested contexts, forwarded sessions, decided with `EXPLAIN`;
   `reference`: reference tables on one node; `upgrade`: `ALTER EXTENSION ...
-  UPDATE` from 0.1 against a fresh 0.2 install).
+  UPDATE` from 0.1, 0.2 and 0.3 against a fresh 0.4 install).
 - `t/`: TAP tests with several nodes. Phase 1: `001_cluster`, `002_routing`,
   `003_hooks`, `004_security`, `005_session_settings`,
   `006_ddl_and_concurrency`, `007_nested_contexts`. Phase 2a: `008_twophase`
@@ -178,6 +192,21 @@ PROVE_TESTS=t/013_dist_scan.pl kingres/dev/ext.sh kingres_shard tap
   sessions, the token and the secret), `020_parallel_and_add_node`,
   `021_owner_and_views`, `022_timeouts_and_worker`, `023_scoped_bypass`,
   `024_low_findings`.
+  Phase 4 (moving buckets): `025_move_bucket`, `026_move_vs_scan`,
+  `027_move_under_load`, `028_move_faults`, `029_check_cluster`, `030_rebalance`,
+  `031_move_scan_interleavings`, `032_move_scan_stress`.
+  Fix round for the reviews of 0.2 and 0.3 (version 0.4): `033_move_target_window`
+  (the routed statement on a target that is not the map group primary),
+  `034_move_direct_write` (a write straight into a bucket partition during the
+  switch), `035_move_switch_stall` (the switch does not queue, bounded retries),
+  `036_move_worker` (the recovery worker resumes and cleans up, version handshake,
+  grants), `037_move_transactions` (COPY, user two-phase transactions, long
+  REPEATABLE READ and cursors across a switch), `038_secret_storage` (who can read
+  the cluster secret, rotation, logs), `039_node_timeouts` (the cancel that does not
+  block, worker settings), `040_ref_dml` (defaults, libm, views, date defaults),
+  `041_copy_and_utility`, `042_add_node_acl`, `043_reference_paths` (every path that
+  can write a reference table, the divergence check), `044_reference_lock` (the
+  writer lock nobody can take, foreign key lock sets).
   `t/KingresShardTest.pm` builds clusters; `t/KingresShardCompare.pm` is the
   comparison harness: it loads the same data into a three-node cluster and a
   single node and compares query results, and repeats every query under four
@@ -228,6 +257,7 @@ schema through `"$user"`; qualify names or fix `search_path`.
 | `kingres.add_node(host text, port int, group_id int default null, role text default 'primary') returns int` | Map group primary only. Registers a node (a new group when `group_id` is null), creates the extension there, creates the distributed and reference tables (with the rows of the reference tables and the foreign keys), sets its `local_node`, and copies the catalog, all in one two-phase transaction. A `standby` is only registered. |
 | `kingres.remove_node(node_id int)` | Unregister a node whose group owns no buckets; its catalog is cleared if reachable. |
 | `kingres.sync_catalog()` | Push the catalog to every active primary node, atomically. |
+| `kingres.rotate_secret()` | Map group primary, superuser. Replaces the secret behind the tokens of node-to-node sessions on every active primary, atomically. Sessions another node opens while the commit is in flight may be refused once; repeat the statement. |
 | `kingres.create_distributed_table(relation regclass, dist_column name, colocate_with regclass default null, bucket_count int default null)` | Map group primary only. See below. |
 | `kingres.create_reference_table(relation regclass)` | Map group primary only. Makes an ordinary table a reference table: creates it on every node and copies its rows. Writers are blocked while it copies. |
 | `kingres.recover_prepared_transactions() returns int` | Commits or rolls back the prepared transactions this node originated, on every active primary (itself included); returns how many it resolved. Superuser. Runs in a `READ COMMITTED` transaction; not on a standby. |
@@ -267,7 +297,7 @@ column). Add foreign keys afterwards with `ALTER TABLE`.
 | `kingres_shard.recovery_interval` | 30s | Seconds between runs of the recovery worker; 0 disables it. `sighup`. |
 | `kingres_shard.node_conninfo` | empty | Connection options appended to every node-to-node connection, see below. Server configuration only (`sighup`: `postgresql.conf` or `ALTER SYSTEM`), never per role or per database. |
 | `kingres_shard.node_connect_timeout` | 5s | Connection timeout between nodes. |
-| `kingres_shard.node_timeout` | 60s | The longest the phases that cannot be left waiting may wait for a node (`COMMIT PREPARED`, the cleanup after an abort, savepoint rollbacks, the recovery worker), and, as `tcp_user_timeout` and keepalives, the time after which a connection to a node that does not answer at all is dead. |
+| `kingres_shard.node_timeout` | 60s | The longest the phases that cannot be left waiting may wait for a node (`COMMIT PREPARED`, the cleanup after an abort, savepoint rollbacks, the recovery worker), and, as `tcp_user_timeout` and keepalives, the time after which a connection to a node that does not answer at all is dead. The cancel request sent when a wait runs out is bounded too (a third of this value, at most `node_connect_timeout`, at least a second), so a node whose postmaster is stopped delays the committing session by `node_timeout` plus that, not until it resumes (S3-07). The recovery worker takes the value of the server configuration, whatever `ALTER DATABASE ... SET` says (S3-16); so for `node_connect_timeout`. |
 | `kingres_shard.forwarded` | off | Set by the router on the sessions it opens, together with `kingres_shard.forward_token`; fixed at connection time (`PGC_BACKEND`). A client that sets it without the token is refused. See "The forwarded flag" below. |
 | `kingres_shard.forward_token` | hidden | The proof of a forwarded session; never shown. |
 | `kingres_shard.fault_injection` | empty | Developer setting, superuser only: fails the commit protocol at a named point (`<point>:kill`, `:error`, `:wait:<file>`; points `before_prepare`, `after_first_prepare`, `after_prepare`, `after_log`, `after_commit`, `between_commit_prepared`). Used by the tests; it adds no capability a superuser does not have. |
@@ -329,15 +359,30 @@ may be treated as forwarded, and its statement text as a scan or write
 fragment, only if it proves it comes from a node of the cluster:
 
 - `init_cluster()` creates a random secret (32 bytes from `gen_random_uuid()`)
-  in `kingres.cluster_secret`, a table on which no role has any privilege; it
-  is copied to a new node by `add_node()` and to every node by
-  `sync_catalog()`, is never part of the catalog snapshot that every user can
-  read, and is read only by the extension's C code with the heap API. The
-  statement that installs it on a node tells the node not to log its argument.
+  in `kingres.cluster_secret`, a table on which no role has any privilege and
+  which has row-level security enabled and forced with no policy, so that roles
+  that bypass table privileges (`pg_read_all_data`, a role with `SELECT` given
+  by mistake, the owner of the database) see no row (S3-04); it is copied to a
+  new node by `add_node()` and to every node by `sync_catalog()`, is never part
+  of the catalog snapshot that every user can read, and is read only by the
+  extension's C code with the heap API. The statement that installs it on a node
+  tells the node not to log its argument or show it in an error (both
+  `log_parameter_max_length` and `log_parameter_max_length_on_error` are 0 for
+  it, S3-06). What this does not cover, honestly: a superuser reads the table;
+  so does whoever can read the files of the node or its WAL (a role with
+  `pg_read_server_files`, `REPLICATION` (`pg_basebackup`, logical decoding), a
+  backup, the operating system account). Those can read every row of every
+  table anyway; treat them as superusers. `pg_dump` does not dump the table.
+  `kingres.rotate_secret()` (map group primary, superuser) replaces the secret on
+  every node in one two-phase transaction and makes every token made from the old
+  one useless; run it when a node, a backup or a disk left your control.
 - A node that opens a node-to-node connection passes, in the connection
   options, `kingres_shard.forward_token`: the hex form of
-  `HMAC-SHA-256(secret, "kingres-forward-v1" NUL role NUL id of the target
-  node)`. A token seen for one role or for one node is useless for another.
+  `HMAC-SHA-256(secret, "kingres-forward-v2" NUL role NUL database NUL id of the
+  target node)`. A token seen for one role, one database or one node is useless
+  for another: a copy of the database made under another name
+  (`CREATE DATABASE ... TEMPLATE`) cannot make tokens for the original (S3-17). A
+  copy under the same name has the secret, and is ended by the rotation.
 - The receiving backend checks the token at the first statement of the session
   (the catalog cannot be read while the connection options are processed), with
   a constant-time comparison. A session that claims the flag and cannot prove
@@ -349,11 +394,17 @@ fragment, only if it proves it comes from a node of the cluster:
   `<hidden>` before it is stored. Node-to-node connections should use TLS
   (`kingres_shard.node_conninfo`), because a token seen on the wire can be
   replayed for the same role and node.
-- A node that holds no secret (a cluster that is not initialized, or one that
+- A node that is not part of a cluster (no node id) holds no secret and accepts
+  the claim: there is nothing to protect there, and `add_node()` talks to a node
+  in that state. A node that belongs to a cluster and holds no secret (one that
   was upgraded from 0.1 and has not yet run `SELECT kingres.sync_catalog()` on
-  the map group primary) accepts the claim, as 0.1 did. After a rolling
-  upgrade, run `sync_catalog()` once on the map group primary: it makes the
-  secret if the node has none and copies it to every node.
+  the map group primary, or whose secret was deleted) fails closed (S3-09): it
+  accepts a claim only from a superuser, which is what `add_node()` and
+  `sync_catalog()` connect as, and refuses everybody else with a hint to run
+  `sync_catalog()`. The statements of ordinary roles that need such a node
+  therefore fail until the secret is installed. After a rolling upgrade, run
+  `sync_catalog()` once on the map group primary: it makes the secret if the
+  node has none and copies it to every node.
 
 With the proof in place an ordinary role cannot write one copy of a reference
 table, run DDL without propagation, or write a bucket on one node only: the
@@ -406,7 +457,12 @@ distributed or reference table is handled by the ProcessUtility hook:
 - **Propagated** (run on the map group primary, then on every other node in the
   same two-phase transaction, with the statement text as written and the
   session's `search_path` and literal settings): `ALTER TABLE` with `ADD
-  COLUMN` (a constant default only; no `serial`, no identity), `DROP COLUMN`
+  COLUMN` (a constant default only; no `serial`, no identity; a default written
+  as a string for a date, time or object-name column (`regclass`, `regtype`, ...)
+  is refused unless it is numeric ISO text such as `'2024-01-02 03:04:05+00'` or
+  one of `epoch`, `infinity`, `-infinity`, because `'now'`, `'today'` and a table
+  name mean another value on every node; domains, arrays, ranges and composite
+  types over such types count too), `DROP COLUMN`
   (not the distribution column, not `CASCADE`), `ALTER COLUMN ... SET/DROP
   DEFAULT`, `SET/DROP NOT NULL`, `ADD CONSTRAINT` (check, unique or primary key
   that includes the distribution column, foreign key from a distributed table to
@@ -458,6 +514,34 @@ supported yet. A foreign key from a distributed table to a reference table is
 allowed (a new node receives it); the reverse is refused. `COPY ... FROM` into a
 reference table is refused on a cluster with several groups.
 
+- `INSERT ... SELECT` and multi-row `INSERT` into a table with column defaults
+  work: the defaults (this node's, which are the same constants everywhere) are
+  sent as values, not looked up again on every node (S3-10). An identity or
+  `serial` column is refused, as any `nextval()`.
+- Functions that use the C library of the node for a floating point result (`exp`,
+  `ln`, `log`, `power` and `^`, the trigonometric, hyperbolic and gamma functions,
+  `cbrt`) are not shipped (S3-14): another libm can differ in the last bit and make
+  the copies differ. The same functions in a restriction of a distributed scan are
+  evaluated by the node that reads. `sqrt`, the basic operators and everything on
+  `numeric` are exact and are shipped. A floating point `sum` or `avg` over a
+  distributed table adds the groups in an order that depends on the node that runs
+  the query, so the last digits can differ between origins.
+- A write through a view of a reference (or distributed) table is refused with "it
+  writes through a view; write the table itself" (S3-18): the rewritten statement
+  does not stand alone, and `WITH CHECK OPTION` and the rights of the view's owner
+  cannot be sent. A view that is only read works.
+- `add_node()` gives the new node the owners and privileges of the tables, of the
+  sequences of their columns and of their schemas, with column privileges and grant
+  options (S3-11); the grantor is the owner. It checks first that every role that
+  owns something or holds a privilege exists on the new node and names the missing
+  ones (roles are not copied).
+- `COPY <distributed table> TO` is run as `COPY (SELECT <columns> FROM <table>) TO`
+  with the same options, so it returns the rows of every group (the core refuses
+  `COPY` of a partitioned table with a hint to use the query form; a core that
+  accepted it would return this node's buckets only). A reference table is local and
+  whole; a bucket partition named directly is read as it is, the rows of that bucket
+  on this node. `COPY ... FROM` stays refused.
+
 **The rule for every statement that is run on several nodes** (a reference-table
 write, and the `UPDATE` and `DELETE` that span shard groups; one place in the
 code: `src/shippable.c`, `ship_walker` and `query_ok`). The copies must be equal
@@ -479,18 +563,64 @@ refused ("cannot be run on every node" / "cannot be shipped") when it has:
   that is not matched through every column of one of its unique indexes, because
   which of several matching rows supplies the values is arbitrary.
 
-**Writers are serialized cluster-wide** (review finding S2-06). Before it runs,
-a reference-table write takes, on every active primary node in node-id order, a
-transaction-level advisory lock for each reference table the statement uses
-(tables in name order), held until the distributed transaction ends. Reads are
-never blocked. A write that reads the table it writes, or another reference
-table, therefore sees the same rows on every node, and the fixed order makes
-such writers wait for each other without a deadlock. It costs concurrency
-(reference-table writers do not run concurrently, even on different tables
-that one statement does not combine) and availability (a node that is down
-blocks them, as before). An advisory lock is used rather than `LOCK TABLE ...
-SHARE ROW EXCLUSIVE` because that needs the `UPDATE`, `DELETE` or `TRUNCATE`
-privilege, which a role that may only `INSERT` does not have. `add_node()` takes
+**A reference table is written on every copy or not at all** (review findings
+S3-01, S3-02, S3-13). Whatever path a write takes, it either runs on every node
+or fails before it changes anything; silently writing one copy never happens.
+The decision for each path (tested in `t/043_reference_paths.pl`):
+
+| Path | Decision |
+|---|---|
+| a statement that names the table | run on every node |
+| `INSERT ... SELECT`, `UPDATE ... FROM`, `ON CONFLICT`, `RETURNING`, prepared statements, custom and generic plans | run on every node (the statement must be shippable, see above) |
+| a function (any language), a `DO` block or dynamic SQL called by a statement that runs on this node | each write it makes is a statement of its own and runs on every node |
+| the same function called by a statement that is routed to another shard group (`INSERT INTO d VALUES (6, f(6))`, `SELECT f(6) FROM d WHERE id = 6`) | **refused**: `reference table "t" cannot be written from a statement that is run for another node`; nothing is changed. Call the function in a statement of its own |
+| a trigger on an ordinary table | its write runs on every node, as a function's does; a trigger on a bucket partition (made by hand) fires on the other node and is refused as above |
+| a rule on an ordinary table whose action writes the table | **refused** ("cannot be run on every node": the rule's action reads the rule's table) |
+| a data-modifying `WITH` | **refused** ("a write to a reference table inside a WITH clause or a subquery is not supported yet") |
+| `MERGE`, `COPY ... FROM` | **refused** |
+| `TRUNCATE` | propagated, from the map group primary only |
+| the actions of foreign keys between reference tables (`ON DELETE CASCADE`, `SET NULL`, `ON UPDATE CASCADE`) | every node does its own part of the cascade once; the writer locks cover every reference table reachable through foreign keys |
+| a plan made before the table became a reference table, or before the cluster had several nodes (a prepared statement, a PL/pgSQL function, a driver's statement) | `create_reference_table()` and every catalog change invalidate the plans of the tables, so the plan is made again; as a backstop the executor refuses a write to a reference table that a plan would make on this node only (`reference table "t" cannot be written by this plan ...`, repeat the statement) |
+| a session of a superuser with `kingres_shard.enable_routing = off` | allowed, by hand, on that node only: the superuser repeats it on every node |
+
+The check that makes this true is not in the planner hook, because a cached plan
+and a function that runs on another node never see the hook: it is made when a
+plan that modifies a table starts to run (an executor hook), so no path goes
+around it. A session that another node opened for its fragment of a write may
+modify a reference table only when the statement text begins with the marker the
+fanning-out node adds; anything else it runs, such as a function that a routed
+statement calls, is refused.
+
+`kingres.check_cluster()` compares the copies: for every reference table the row
+count and an order-independent digest of the rows (a sum of 64-bit hashes of each
+row's text under fixed session settings) on every active primary against the map
+group primary's, and reports `reference_table_differs` for a node whose copy is
+another one. It reads every row of every reference table on every node, so it is a
+check for maintenance windows; a write that is in flight shows as a difference
+once, and a difference is reported only if it is still there after two more looks.
+
+**Writers are serialized cluster-wide** (review findings S2-06, S3-03). Before it
+runs, a reference-table write takes, on every active primary node in node-id
+order, a lock for each reference table the statement uses or can reach through
+foreign keys (tables in name order), held until the distributed transaction ends.
+Reads are never blocked. A write that reads the table it writes, or another
+reference table, therefore sees the same rows on every node, and the fixed order
+makes such writers wait for each other without a deadlock. It costs concurrency
+(reference-table writers do not run concurrently, even on different tables that
+one statement does not combine) and availability (a node that is down blocks them,
+as before). The lock is a heavyweight lock on an object of a class of its own (the
+OID of the table on that node), not an advisory lock and not `LOCK TABLE`: advisory
+locks live in a key space every role shares, so any role could hold the key of a
+table and stop all its writers (S3-03); `LOCK TABLE ... SHARE ROW EXCLUSIVE` needs
+the `UPDATE`, `DELETE` or `TRUNCATE` privilege, which a role that may only `INSERT`
+does not have. No SQL a role can run reaches a lock of that class: the function
+that takes it for another node (`kingres.internal_lock_reference_table`) answers
+superusers and sessions that proved they come from a node of the cluster. The wait
+is bounded by the session's `lock_timeout` and by `kingres_shard.node_timeout`
+(whichever is shorter), with an error that names the table. A prepared transaction
+of a crashed origin keeps the lock until it is resolved (`recover_prepared_transactions()`
+or the recovery worker), so writers of that table fail with that error meanwhile;
+`check_cluster()` lists the prepared transactions. `add_node()` takes
 the same locks on the existing nodes while the new node's copies are made, and
 a writer that waited for it finds the set of nodes changed and fails with
 `KS001`-class "the set of nodes changed while a write to a reference table
@@ -603,7 +733,8 @@ Read these first; each is a reviewed boundary, not an accident.
   other nodes; failover handling is a later phase.
 - Roles, schemas created for tables, and user-defined types must already be
   compatible on every node; they are not synchronized. Privileges are copied
-  only by propagated `GRANT`.
+  by propagated `GRANT`, and to a new node by `add_node()` (see "Reference
+  tables"); `REASSIGN OWNED` and `ALTER DEFAULT PRIVILEGES` are not propagated.
 - A reference-table write to a group that is down fails (the write needs every
   node); reads are unaffected.
 - Cached connections are per backend and are replaced when found closed; there
@@ -686,12 +817,30 @@ milliseconds; the measurement is in the design note):
 - On the **target** the tables are locked in SHARE ROW EXCLUSIVE (attaching a table
   that has a foreign key needs it): writers of those tables on the target wait too,
   readers do not.
-- Each lock is waited for at most a tenth of `kingres_shard.move_switch_timeout`
-  (default 10 s, so 1 s; at least 200 ms), the whole attempt at most
-  `move_switch_timeout`; then the transaction is rolled back, the locks are released,
-  the move goes back to *catching_up* and tries again after a short random pause. A
-  long transaction that wrote the bucket therefore cannot hold writers for more than
-  that, and the move completes when the transaction ends.
+- Locks are **tried for, never queued for** (review finding S4-04). A request that
+  waits for a lock makes every later statement that needs a conflicting lock on the
+  same table wait behind it, so the switch does not wait: it first looks, holding
+  nothing, for a transaction that has been open for longer than an attempt tries and
+  holds a table of the group in the way (it will not be gone in time), then takes each set with `LOCK ... NOWAIT`, trying again for at
+  most a tenth of `kingres_shard.move_switch_timeout` (default 10 s, so 1 s; at least
+  200 ms), and takes the ACCESS EXCLUSIVE locks of the detach the same way before the
+  `DETACH` itself. A set that cannot be had abandons the attempt: everything is
+  released, the move goes back to *catching_up* and tries again after a pause that
+  doubles from 0.2 s to 10 s. A transaction that keeps a table of the colocation group
+  open (a long writer of any bucket of the tables, or, for the last step, a long
+  reader) therefore delays the move and costs the application nothing; after
+  `kingres_shard.move_switch_attempts` attempts (default 20, a few minutes at the longest pauses) the
+  move fails and its `detail` names the sessions in the way (`held by pid 123`), the
+  bucket goes back to `active`, and the move can be started again. The whole attempt
+  takes at most `move_switch_timeout`.
+- **A write straight into a bucket partition** (`INSERT INTO orders_b0002 ...`) takes
+  no lock on the parent and is not a write of the distributed table: it is refused
+  ("cannot write a bucket partition of a distributed table directly"), for superusers
+  too. A superuser who has switched `kingres_shard.enable_routing` off (to repeat a
+  statement on every node by hand) can still write one; the switch covers that case
+  as well, because it also locks the partitions of the moving bucket in SHARE mode, so
+  a transaction that wrote one before the switch holds it back until it ends, and
+  none can start before the commit of the switch.
 - A statement routed with the old map that reaches the source after the switch gets
   the stale-map error `KS001`; its origin reloads the map and repeats it (when it can:
   when no earlier statement of the transaction ran on that node).
@@ -702,24 +851,27 @@ milliseconds; the measurement is in the design note):
   target, that part runs in the coordinator's own transaction); the source also holds
   ACCESS EXCLUSIVE on the group's parents from the detach to the end of its commit, so
   a statement that opens the tables there waits for it. A scan asks every remote node
-  for the placement of its colocation group (one number,
-  `kingres.internal_placement_hash(colocation_id, parent)`, read from the catalog
-  table, not from a cache) **before** it opens its cursor there and **again after**,
-  and compares both answers, the placement its own plan was made with, and the number
-  of partitions its own node has (read from the catalog) with the number the planner
-  saw; a fan-out write compares the placement
-  of every target after the statement ran. A difference raises `KS001` ("the bucket map
-  changed while the statement was reading it") before the first row is returned (a
-  scan) or with every change rolled back (a write), and the statement can simply be
-  repeated. When all placements are equal, every node serves exactly the buckets the
-  placement gives it, so each bucket is read or written once, by its owner. A
-  statement fails with `KS001` only when the placement of its colocation group changed
-  (a switch committed on a node it reads) between planning and the check; other
-  catalog changes (another table, another colocation group, the `moving` state of a
-  move) do not fail it. Routed single-group statements need no comparison: they run on
-  the one node that serves them, and that node checks that it owns the bucket (`KS001`
-  otherwise); a reference-table statement never sees a move. The argument, and the one
-  case that is argued and not forced by a test, are in the design note.
+  for two numbers, read from the catalog tables and not from a cache: the placement of
+  its colocation group (`kingres.internal_placement_hash(colocation_id, parent)`) and
+  the **identity of the partitions** the node has of the table
+  (`kingres.internal_partition_identity(parent)`, a sum over the OIDs of the attached
+  partitions), **before** it opens its cursor there and **again after**. The placement
+  of every node must be the one its own plan was made with, and the identity of every
+  node must be what it was before the cursor was opened; so must the identity of the
+  scan's own node, against the partitions its local plan reads. The identity is what
+  sees a bucket that left a node and came back in between (S4-01): the placement is
+  the same then, but the partition that came back is another table. A fan-out write
+  compares the placement of every target after the statement ran. A difference raises
+  `KS001` ("the bucket map changed while the statement was reading it") before the
+  first row is returned (a scan) or with every change rolled back (a write), and the
+  statement can simply be repeated. When nothing differs, every node serves exactly the
+  buckets the placement gives it, so each bucket is read or written once, by its
+  owner. A statement fails with `KS001` only when a switch committed on a node it reads
+  between planning and the check; other catalog changes (another table, another
+  colocation group, the `moving` state of a move) do not fail it. Routed single-group
+  statements need no comparison: they run on the one node that serves them, and that
+  node checks that it owns the bucket (`KS001` otherwise); a reference-table statement
+  never sees a move. The argument is in the design note.
 - While a move of a colocation group is unfinished (before *cleaning*), **DDL on the
   tables of the group and the creation of a table in it are refused** ("a bucket of
   colocation group N is being moved"): the standalone copy would not see the
@@ -757,7 +909,7 @@ milliseconds; the measurement is in the design note):
 | `kingres.check_cluster(older_than default '5 minutes')` | one row per inconsistency |
 
 Settings: `kingres_shard.move_catchup_threshold` (1MB), `kingres_shard.move_switch_timeout`
-(10s), `kingres_shard.move_cleanup_delay` (10min).
+(10s), `kingres_shard.move_switch_attempts` (20: how many times a move tries to switch before it fails, see "What a move blocks"), `kingres_shard.move_cleanup_delay` (10min).
 
 The plan: only groups whose primary has `should_have_shards` receive buckets; the
 target count is `bucket_count / receivers`, the remainder one each to the receivers
@@ -772,16 +924,29 @@ A failure before the switch undoes itself (subscription, slot, publication and t
 standalone tables are dropped, the bucket goes back to `active`, the move is `failed`
 with the reason in `detail`) and the move can be started again. If the session or a
 node died, or the undo itself could not reach a node, the move stays in its phase:
-run `SELECT kingres.resume_bucket_moves()` on the map group primary (the recovery
-worker does it every `kingres_shard.recovery_interval`, after it has resolved prepared
-transactions). A move in *switching* is decided by the two-phase commit: the phase
+run `SELECT kingres.resume_bucket_moves()` on the map group primary. The recovery
+worker of the map group primary does it, and calls `cleanup_moved_buckets()` after it,
+every `kingres_shard.recovery_interval` once it has resolved the prepared transactions
+(review finding S4-02; with the interval at 0 nobody does, and `check_cluster()`
+reports a `stalled_move`). A move in *preparing* is recorded a moment before its
+session takes the live mark, so it too is left alone for `2 x node_timeout`. A move in *switching* is decided by the two-phase commit: the phase
 becomes *cleaning* in the same transaction as the bucket map, so a *switching* row
 after a crash is a switch that did not commit. `resume` waits `2 x
 kingres_shard.node_timeout` after the last update before it undoes such a move, so
 that a switch that is still committing is not undone. A move that is alive (its
 session holds a lock that nothing else takes) is never touched by resume. Watch
-`kingres.bucket_move` (`phase`, `detail`); `cancel_bucket_move()` stops a running
-move.
+`kingres.bucket_move_status` (everybody may read it: ids, groups, `phase`, times) and,
+as a superuser or a role that was granted `SELECT` on it, `kingres.bucket_move` (it
+also holds `detail`, the last error with the text of remote errors and node
+addresses, and the slot and subscription names; review finding S4-07);
+`cancel_bucket_move()` stops a running move.
+
+The helper functions `kingres.internal_placement_hash()` and
+`kingres.internal_map_version()` are called by the sessions of other nodes, which
+run as the role of the user whose statement it is; they answer superusers, sessions
+that proved they come from a node of the cluster, and a role that may `SELECT` the
+distributed table the call names (review finding S4-06). An ordinary role gets
+"permission denied" and cannot make a backend forget cache entries.
 
 ### What check_cluster reports
 
@@ -789,12 +954,25 @@ On the map group primary, superuser: per active primary node `catalog_differs` (
 version counter is not compared), `partition_missing` (a bucket's partition absent
 on its owner), `partition_misplaced` (attached where the group does not own the
 bucket), `stray_bucket_table` (a table with the name of a bucket partition that is not
-attached), `orphan_table` (no record, a move that is not cleaning, or overdue by an
-hour), `replication_slot`, `publication`, `subscription`, `replication_origin`
+attached), `orphan_table` (no record, a move that is not cleaning, or overdue by
+`2 x (node_timeout + recovery_interval)` after its cleanup time), `stalled_move` (a
+move in a phase before *done* that no session runs and that nobody has touched for that
+long, or a *cleaning* move that is overdue by it: the worker would resolve it, or
+`resume_bucket_moves()` / `cleanup_moved_buckets()` by hand), `replication_slot`, `publication`, `subscription`, `replication_origin`
 (leftovers of a move that is not running), `prepared_transaction` (older than the
 argument), `node_unreachable`; and on the map group `bucket_map_incomplete`,
-`group_without_primary`, `bucket_moving_without_move`, `move_without_moving_bucket`.
-No rows means consistent.
+`group_without_primary`, `bucket_moving_without_move`, `move_without_moving_bucket`; and
+for every reference table `reference_table_differs` (a node whose copy has other rows).
+No rows means consistent, in this sense: it is a **structural** check (catalogs, which
+partitions exist where, what a move left behind). It never compares the rows, indexes,
+constraints or replica identity of a partition with its parent, so a copy that diverged
+in content does not show up; after a move compare counts or checksums of the bucket's
+tables yourself if you need that assurance. (Reference-table copies are compared by
+their rows; see "Reference tables".) The old copy of a moved bucket stays readable in
+`kingres.orphan_<move>_<n>` (the extension's schema, with the rights of the table's
+owner) until `move_cleanup_delay` has passed and the worker or
+`cleanup_moved_buckets()` dropped it; a deletion that must be final at once (erasure)
+needs `cleanup_moved_buckets(true)` after the move (review finding S4-10).
 
 ### Limits
 
@@ -814,3 +992,24 @@ No rows means consistent.
   until it ends (the switch gives up after its lock timeout and tries again), so a
   long transaction that read a table of the group delays its moves.
 - Orphan tables are kept for `move_cleanup_delay` and take disk space on the source.
+- `move_bucket()` is one statement of the session that calls it, so its snapshot, and
+  with it the xmin horizon of the map group primary, is held back for the whole move
+  (review finding S4-09): vacuum there cannot remove rows that became dead after the
+  move began. The tables of the map group primary that change are the catalog tables,
+  which are small; a long copy therefore costs little, but the tables of an application
+  that lives on the map group primary bloat for as long as a move lasts. Moves are
+  expected to last minutes. (Splitting the move into recorded steps that a poller
+  drives would release the snapshot; it is not done in 0.3.)
+- Transactions that stay open across a switch (covered by `t/037`): a transaction
+  that holds a lock on the tables of the group on the source (a writer, a prepared
+  user transaction, a REPEATABLE READ or SERIALIZABLE reader, a cursor of a scan, and a
+  transaction on any node that has scanned the table, whose remote transactions stay
+  open until it ends) delays the switch; a move that cannot get past it gives up with
+  the pid of the blocker and moves nothing. A REPEATABLE READ or SERIALIZABLE
+  transaction on the node that a bucket moves *to*, which has read only rows of its own
+  buckets and so holds nothing on the source, does not hold the move back, and its next
+  read of the table would not see the rows of the arrived bucket (they were written
+  after its snapshot): it fails with a serialization failure ("a bucket of table ...
+  moved to this node after the snapshot of the transaction was taken") and can be
+  retried. `COPY (SELECT ...) TO` reads like any `SELECT`; `COPY ... FROM` into a
+  distributed table is refused, during a move as always.

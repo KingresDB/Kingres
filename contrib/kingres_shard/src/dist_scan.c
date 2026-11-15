@@ -47,6 +47,7 @@
 
 #include "access/parallel.h"
 #include "access/htup_details.h"
+#include "access/table.h"
 #include "access/xact.h"
 #include "catalog/pg_type_d.h"
 #include "commands/explain.h"
@@ -64,6 +65,7 @@
 #include "optimizer/paths.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/restrictinfo.h"
+#include "partitioning/partdesc.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -86,7 +88,7 @@
 #define DS_PRIV_NCHILD		2	/* Integer: scan columns the child returns */
 #define DS_PRIV_PARAMS		3	/* List of Integer: external parameter ids of the fragment, in order */
 #define DS_PRIV_PLACEMENT	4	/* String: placement of the colocation group the statement was planned with */
-#define DS_PRIV_NPARTS		5	/* Integer: partitions of the table on this node, in the plan */
+#define DS_PRIV_PARTITIONS	5	/* String: identity of the partitions of the table on this node, in the plan; "" when it is not partitioned */
 
 /* Rows requested from a remote group at a time. */
 int			kingres_shard_scan_fetch_size = 1000;
@@ -110,6 +112,7 @@ typedef struct DsFrag
 	char	   *host;
 	int			port;
 	int			group_id;
+	int64		identity;		/* identity of the node's partitions when it was first asked */
 } DsFrag;
 
 typedef struct KsDistScanState
@@ -119,7 +122,8 @@ typedef struct KsDistScanState
 	Oid			relid;
 	int			nchild;			/* scan columns the child returns */
 	int64		plan_placement;	/* placement of the colocation group in the plan (the local partitions are those of it) */
-	int			plan_nparts;	/* partitions of the table on this node in the plan */
+	bool		plan_has_parts;	/* the table is partitioned on this node */
+	int64		plan_partitions;	/* identity of its partitions in the plan (catalog.c) */
 	int			ncols;			/* scan columns in all */
 	List	   *param_ids;
 	PlanState  *child;
@@ -351,16 +355,28 @@ ds_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	cpath->custom_restrictinfo = NIL;
 	{
 		/*
-		 * The number of partitions of the table on this node as the planner saw them
-		 * when it expanded the table (rel->nparts is the one number that matches the
-		 * partitions in the child path: the partition list of the relcache can be
-		 * rebuilt between the expansion and this hook by an invalidation that a lock
-		 * acquisition processes), or -1 when the planner did not treat the table as
-		 * partitioned.  See ds_start.
+		 * The identity of the partitions of the table on this node as the planner saw
+		 * them when it expanded the table, or "" when it did not treat the table as
+		 * partitioned.  The child path is made of exactly the partitions of the
+		 * descriptor that the planner's partition directory pinned for the whole
+		 * statement; the descriptor of the relcache can be rebuilt after that by an
+		 * invalidation that a lock acquisition processes, so the directory is asked
+		 * and not the relcache.  See ds_start.
 		 */
-		int			nparts = (rel->part_scheme != NULL) ? rel->nparts : -1;
+		char	   *identity = pstrdup("");
 
-		cpath->custom_private = list_make2(makeInteger((int) rte->relid), makeInteger(nparts));
+		if (rel->part_scheme != NULL)
+		{
+			Relation	prel = table_open(rte->relid, NoLock);
+			PartitionDesc pd = PartitionDirectoryLookup(root->glob->partition_directory, prel);
+
+			Assert(pd->nparts == rel->nparts);
+			identity = psprintf(INT64_FORMAT,
+								kingres_shard_partition_set_identity(pd->nparts, pd->oids));
+			table_close(prel, NoLock);
+		}
+
+		cpath->custom_private = list_make2(makeInteger((int) rte->relid), makeString(identity));
 	}
 	cpath->methods = &ds_path_methods;
 
@@ -656,7 +672,12 @@ ds_create_scan_state(CustomScan *cscan)
 	s->relid = (Oid) intVal(list_nth(p, DS_PRIV_RELID));
 	s->nchild = intVal(list_nth(p, DS_PRIV_NCHILD));
 	s->plan_placement = pg_strtoint64(strVal(list_nth(p, DS_PRIV_PLACEMENT)));
-	s->plan_nparts = intVal(list_nth(p, DS_PRIV_NPARTS));
+	{
+		const char *ident = strVal(list_nth(p, DS_PRIV_PARTITIONS));
+
+		s->plan_has_parts = (ident[0] != '\0');
+		s->plan_partitions = s->plan_has_parts ? pg_strtoint64(ident) : 0;
+	}
 	foreach(lc, (List *) list_nth(p, DS_PRIV_PARAMS))
 		s->param_ids = lappend_int(s->param_ids, intVal(lfirst(lc)));
 	return (Node *) s;
@@ -879,6 +900,22 @@ frag_send_fetch(DsFrag *f)
 	kingres_shard_conn_set_pending(f->kc, f, ds_finish_pending);
 }
 
+/*
+ * The partitions this node has now must be the ones the plan of the local part
+ * of the scan was made with (see ds_start).
+ */
+static void
+check_local_partitions(KsDistScanState *s)
+{
+	if (s->plan_has_parts &&
+		kingres_shard_partition_identity_now(s->relid) != s->plan_partitions)
+		ereport(ERROR,
+				(errcode(ERRCODE_KINGRES_STALE_MAP),
+				 errmsg("the partitions of table \"%s\" on this node changed after the statement was planned",
+						get_rel_name(s->relid)),
+				 errhint("A bucket moved between shard groups; repeat the statement.")));
+}
+
 /* Open the cursors on every group, then ask each for its first batch. */
 static void
 ds_start(KsDistScanState *s)
@@ -893,6 +930,7 @@ ds_start(KsDistScanState *s)
 	ListCell   *lc;
 	int64		origin_placement;
 	int			colocation_id;
+	char	   *recheck;		/* the question asked again after the DECLAREs */
 
 	if (dt == NULL || dt->is_reference)
 		ereport(ERROR,
@@ -918,14 +956,11 @@ ds_start(KsDistScanState *s)
 	 * now: a switch can commit here between the parse analysis of the statement
 	 * (which locked the parent, and does not stop an ATTACH) and now, and the list
 	 * in the relcache of this backend can be behind it.  A node that changed after
-	 * the plan has other partitions than the local child of this scan reads.
+	 * the plan has other partitions than the local child of this scan reads.  The
+	 * identity names the partitions themselves, so a bucket that left and came
+	 * back (another table with the same name) is a change too.
 	 */
-	if (s->plan_nparts >= 0 && kingres_shard_attached_partitions_now(s->relid) != s->plan_nparts)
-		ereport(ERROR,
-				(errcode(ERRCODE_KINGRES_STALE_MAP),
-				 errmsg("the partitions of table \"%s\" on this node changed after the statement was planned",
-						get_rel_name(s->relid)),
-				 errhint("A bucket moved between shard groups; repeat the statement.")));
+	check_local_partitions(s);
 
 	kingres_shard_fault_point("scan_started");
 
@@ -945,8 +980,13 @@ ds_start(KsDistScanState *s)
 	{
 		char	   *qualified = quote_qualified_identifier(get_namespace_name(get_rel_namespace(s->relid)),
 														   get_rel_name(s->relid));
-		char	   *ask = psprintf("SELECT " KINGRES_SHARD_SCHEMA ".internal_placement_hash(%d, %s::pg_catalog.regclass)",
-								   colocation_id, quote_literal_cstr(qualified));
+		char	   *ask = psprintf("SELECT " KINGRES_SHARD_SCHEMA ".internal_placement_hash(%d, %s::pg_catalog.regclass), "
+								   KINGRES_SHARD_SCHEMA ".internal_partition_identity(%s::pg_catalog.regclass)",
+								   colocation_id, quote_literal_cstr(qualified), quote_literal_cstr(qualified));
+
+		recheck = psprintf("SELECT " KINGRES_SHARD_SCHEMA ".internal_placement_hash(%d), "
+						   KINGRES_SHARD_SCHEMA ".internal_partition_identity(%s::pg_catalog.regclass)",
+						   colocation_id, quote_literal_cstr(qualified));
 
 		foreach(lc, s->frags)
 		{
@@ -985,8 +1025,10 @@ ds_start(KsDistScanState *s)
 					f->kc->have_error = true;
 				kingres_shard_report_error(f->kc, res, "placement");
 			}
-			same = !PQgetisnull(res, 0, 0) &&
+			same = !PQgetisnull(res, 0, 0) && !PQgetisnull(res, 0, 1) &&
 				pg_strtoint64(PQgetvalue(res, 0, 0)) == origin_placement;
+			if (same)
+				f->identity = pg_strtoint64(PQgetvalue(res, 0, 1));
 			PQclear(res);
 			if (!same)
 				ereport(ERROR,
@@ -996,6 +1038,7 @@ ds_start(KsDistScanState *s)
 						 errhint("A bucket moved between shard groups; repeat the statement.")));
 		}
 	}
+	kingres_shard_fault_point("scan_after_placement");
 
 	/* DECLARE on every group first (they plan concurrently), then read the answers. */
 	foreach(lc, s->frags)
@@ -1048,35 +1091,40 @@ ds_start(KsDistScanState *s)
 	 * node's bucket partitions of a table and its placement of the colocation
 	 * group change only in the transaction of a switch, which commits on every
 	 * participant (the one on the map group primary included: its own part is done
-	 * in the coordinator's transaction).  The placement was read before the cursor
-	 * was opened and is read again now, from the catalog table and not from a
-	 * cache; the three numbers (before, after, this node's) are equal only if no
-	 * switch committed on the node in between, so the cursor was planned with the
-	 * partitions of that placement.  What happens on the node later cannot change
-	 * what the cursor reads: it holds the parent in ACCESS SHARE, which a detach
-	 * (the source) waits for, and a partition attached later (the target) is not in
-	 * its plan, which is what the placement says (the bucket is read from the
-	 * source).  A node whose placement is not the one the groups were chosen with
-	 * has other partitions than this scan assumes: a bucket that moved between the
-	 * reads of two groups would be returned twice or not at all.  The statement
-	 * fails with the retryable KS001; nothing has been returned yet.
+	 * in the coordinator's transaction).  The placement and the identity of the
+	 * node's partitions of the table (the set of the partitions' OIDs) were read
+	 * before the cursor was opened and are read again now, from the catalog tables
+	 * and not from a cache.  The placement of every node must be the one the groups
+	 * were chosen with; the identity of a node must be what it was before: a
+	 * switch that committed in between changes it, whatever it did to the
+	 * placement (a bucket that left and came back leaves the placement as it was,
+	 * but its partition on the node is a new table).  When both are unchanged, no
+	 * switch committed on the node between the two reads, so the cursor was planned
+	 * with the partitions of that placement.  What happens on the node later cannot
+	 * change what the cursor reads: it holds the parent in ACCESS SHARE, which a
+	 * detach (the source) waits for, and a partition attached later (the target) is
+	 * not in its plan, which is what the placement says (the bucket is read from
+	 * the source).  A node whose answers differ has other partitions than this scan
+	 * assumes: a bucket that moved between the reads of two groups would be
+	 * returned twice or not at all.  The statement fails with the retryable KS001;
+	 * nothing has been returned yet.
 	 */
 	foreach(lc, s->frags)
 	{
 		DsFrag	   *f = (DsFrag *) lfirst(lc);
-		PGresult   *res = kingres_shard_exec(f->kc,
-											 psprintf("SELECT " KINGRES_SHARD_SCHEMA ".internal_placement_hash(%d)",
-													  colocation_id));
+		PGresult   *res = kingres_shard_exec(f->kc, recheck);
 		int64		theirs = 0;
+		int64		identity = 0;
 		bool		known = false;
 
-		if (!PQgetisnull(res, 0, 0))
+		if (!PQgetisnull(res, 0, 0) && !PQgetisnull(res, 0, 1))
 		{
 			theirs = pg_strtoint64(PQgetvalue(res, 0, 0));
+			identity = pg_strtoint64(PQgetvalue(res, 0, 1));
 			known = true;
 		}
 		PQclear(res);
-		if (!known || theirs != origin_placement)
+		if (!known || theirs != origin_placement || identity != f->identity)
 		{
 			/*
 			 * No reload of the catalog here: it would run in this transaction,
@@ -1096,6 +1144,8 @@ ds_start(KsDistScanState *s)
 				(errcode(ERRCODE_KINGRES_STALE_MAP),
 				 errmsg("the bucket map changed while the statement was reading it"),
 				 errhint("A bucket moved between shard groups; repeat the statement.")));
+	/* This node's own partitions can have come and gone in the same window. */
+	check_local_partitions(s);
 	kingres_shard_fault_point("scan_after_check");
 	foreach(lc, s->frags)
 		frag_send_fetch((DsFrag *) lfirst(lc));

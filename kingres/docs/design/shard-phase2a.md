@@ -525,3 +525,270 @@ every wait that cannot throw, a per-database deadline in the launcher, fixed wor
 S2-13: `change_partition_owners()`. S2-14: three separate counters in `utility.c`; only the
 foreign-key validation join (`SELECT fk.`) is planned without routing. S2-15: refused, not
 emulated (`kingres_shard_refuse_view_owner`). S2-16: `PGC_SIGHUP`, no `sslpassword`.
+
+## Fix round for the review of 2026-11-14 (S3-04, S3-06, S3-07, S3-09, S3-12, S3-15 to S3-17): the secret and the node timeouts
+
+**Where the secret lives and who can read it (S3-04).** Decision: it stays in the table
+`kingres.cluster_secret`, with row-level security *enabled and forced* and no policy, and no
+privilege for anyone. The table is the only storage that is transactional (the secret changes in
+the same two-phase transaction as the catalog), crash-safe, replicated to the standbys of a
+group (a promoted standby has it) and copied by `add_node()`; a file or shared memory is none of
+these. The extension's C code reads the heap directly and is not subject to row security.
+Checked, role by role (`t/038_secret_storage.pl`): `pg_read_all_data` (it does not have
+`BYPASSRLS`; it sees no row, also with `row_security = off`, `COPY` and a subquery), a role that
+holds the predefined roles of the file and statistics family, the owner of the database (not the
+owner of the table), `pg_dump` with and without `--enable-row-security` and with the table named
+explicitly. What stays readable, and cannot be fixed by any storage the extension could choose: a
+superuser; a role with `pg_read_server_files` (it reads the relation file in the data directory
+with `pg_read_binary_file`); a role with `REPLICATION` (a base backup, logical decoding of the
+insert into the table when `wal_level = logical`); a backup of the node; the operating system
+account. They can read every row of every table of the node, so the secret does not widen what
+they can do to data; what they can additionally do is forge the proof of a forwarded session, which
+is the capability the secret exists to withhold from the roles of applications. The remedy for a
+leak through one of those is rotation (below). A file in the data directory, or an unlogged table,
+would not hide the secret from them either, and would lose it on a crash or a failover; this is why
+they were not chosen. (The file-level readers were reasoned about, not run.)
+
+**Rotation.** `kingres.rotate_secret()` (map group primary, superuser) opens the connections to
+every other active primary first, because a new connection is authenticated with the secret the
+other node holds now; then it makes the new random secret (`pg_strong_random`), installs it
+locally and pushes it with the statement `sync_catalog()` uses, all in one two-phase transaction. A
+failure on any node rolls back every node (tested with a trigger that refuses the insert on one
+node). Sessions another node opens during the few milliseconds between the first and the last
+commit of the two-phase transaction can be refused once; connections that exist keep working (they
+proved themselves when they were opened).
+
+**The secret reaches no log and no error (S3-06).** The statement that installs it carries it as a
+parameter. Both `log_parameter_max_length` and `log_parameter_max_length_on_error` are set to 0 in
+the remote transaction before it (one `SET LOCAL` per message: a prepared statement refuses several
+commands). The error the origin relays contains the remote context, which is where the parameters
+were printed. A transport that carries no parameter at all (binary `COPY`) was considered and not
+chosen: the two settings close the leak through the logging of the server itself, and a different
+transport would not help against a module that records the statement it runs.
+
+**Fail closed without a secret (S3-09).** A node that has a node id and no secret no longer accepts
+the claim of every session. Superusers are accepted without proof (what `add_node()` and
+`sync_catalog()` connect as, so the secret can always be pushed back, also to a node of a cluster
+upgraded from 0.1); everyone else gets the same `FATAL` as for a wrong token, with a hint to run
+`sync_catalog()`. A node without a node id (not in a cluster yet) accepts the claim as before: it is
+where `add_node()` creates the first state. The result is not remembered, so the claim is checked
+again once the secret arrives in the middle of a session.
+
+**The token names the database (S3-17).** `HMAC(secret, "kingres-forward-v2" NUL role NUL database
+NUL node id)`. A copy of a database under another name (`CREATE DATABASE ... TEMPLATE`, a restore)
+cannot make tokens for the original. A copy under the same name, or anybody who read the secret,
+can; rotation ends it. A time or a challenge in the token was not added: the token is sent in the
+startup packet, before the server can send a challenge, and an agreement of the clocks of the nodes
+would be a new failure mode. The README says that node-to-node connections belong on TLS
+(`kingres_shard.node_conninfo`); `init_cluster()` does not enforce it because a cluster on one host
+over a Unix socket has nothing to protect on the wire.
+
+**A bounded cancel (S3-07).** `kingres_shard_bounded_exec()` used the legacy `PQcancel()`, which
+connects and then waits for the postmaster to close the connection with no timeout of its own, so a
+node whose postmaster is stopped held the committing backend although it had given up on the node.
+It now uses the non-blocking cancel of libpq (`PQcancelStart`/`PQcancelPoll`) polled against a
+deadline of a third of `node_timeout` (at most `node_connect_timeout`, at least one second). The
+helper `libpqsrv_cancel()` was not used because it checks for interrupts, and these waits run in the
+commit and abort callbacks, where an error is not possible. `discard_connection()` puts the socket
+in non-blocking mode before `PQfinish()`, whose Terminate message could otherwise block on a node
+that does not read. The cancel is kept (it frees the locks of a running remote statement at once)
+and the wait for it is bounded. Test: the committing session returns in about `node_timeout` plus
+one second with every process of a participant stopped, the postmaster included, where it waited for
+the node to resume before.
+
+**The worker's session (S3-12, S3-16).** The worker's two bounds were one statement with two
+commands, which the extended protocol refuses; HEAD already sends them separately, one per message,
+and skips a node that refuses them. The test now reads the statements the node received from the
+worker's connection (`log_statement = 'all'` and `%a`) and that no pass logs an error.
+`node_timeout` and `node_connect_timeout` are forced to the value of the server configuration: the
+launcher (which has no database and so no stored settings) puts them in the `bgw_extra` of every
+worker, and `fix_worker_settings()` applies them at `PGC_S_OVERRIDE`.
+
+**Synchronous standbys (S3-15).** `ForceSyncCommit()` flushes the commit record locally but does not
+make the commit wait for standbys: the core waits only when `synchronous_commit` is above `local`
+(`SyncRepRequested()`). For a transaction that prepared remote participants, `off` and `local` are
+raised to `on` (transaction-local) in `log_decision()`, before the commit record is written;
+`remote_write` and above are kept. Without synchronous standbys the raise costs nothing. Test: a
+synchronous standby of the origin that is stopped holds a multi-node commit made with
+`synchronous_commit = off` in `SyncRep`, the participant still prepared, until the standby returns.
+
+**Audit of the commands sent to other nodes.** Every call of `kingres_shard_exec`,
+`kingres_shard_exec_params`, `PQsendQuery*`, `kingres_shard_bounded_exec` and the control-session
+runner of bucket moves was read. `_exec` and `_exec_params(..., true)` raise on any non-success
+result (a lost connection included); the callers that pass `false` (the recovery worker, the routed
+statement) test the status themselves; `_exec_params` is given a single statement in every case
+(a routed statement is one deparsed query; the DECLARE and the write fragment are one statement
+with a leading comment); scripts of several commands go through the simple protocol only (`_exec`,
+`exec_internal`), where an error ends the script and is its last result. Found and fixed: the
+bounded cancel (above). Found and left to the owners of those files: the cancel of the control
+sessions of a bucket move (`ctl_cancel`, `bucket_move.c`) still uses the blocking `PQcancel()`; and
+the lock statements of `lock_reference_tables()` (`fanout.c`) do not clear their results (a leak of
+one `PGresult` per statement until the backend ends).
+
+## Fix round for the review of 2026-11-14 (S3-08, S3-10, S3-11, S3-14, S3-18), COPY TO and the utility audit
+
+**S3-08, string defaults of ADD COLUMN.** Recognizing 'now' by its text cannot be closed: the
+date and time input functions accept the word with white space of any kind around it, in any
+case, inside longer strings ('tomorrow 03:00'), in arrays, ranges and domains, and through a
+text cast. The decision is the opposite test, on what the text can be. `ADD COLUMN ... DEFAULT
+<string>` (a string constant, with or without a cast) is looked at after the types are
+resolved (`utility.c`, `default_text_is_node_dependent`): the type of the cast and the type of
+the column, looked through domains, arrays, ranges, multiranges and composite types, are
+classified as *clock readers* (date, time, timetz, timestamp, timestamptz) or *object names*
+(the `reg*` types). A string for an object-name type is always refused (the name is another
+OID on each node). A string for a clock reader is accepted only if it consists of digits and
+the characters of numeric ISO layouts (`- + : . / , space`, `T`, `Z`) or is exactly `epoch`,
+`infinity` or `-infinity` (after trimming white space): every word that names the current time
+has another letter, so nothing spelled any other way gets through. The price is that a date
+written with month names ('January 8, 1999') or a zone name is refused; it can be written
+numerically. A string for a text column is not touched ('now' stays text). `ALTER COLUMN ...
+SET DEFAULT 'now'` stores a different constant per node, but statements get defaults from the
+node that routes them (the rewritten query carries the value), so the data cannot diverge;
+it was left alone.
+
+**S3-10, defaults in INSERT ... SELECT and multi-row INSERT.** The query the hook sees is
+rewritten: the target list holds a Var of the source (the sub-select or the VALUES list) for
+each written column and an expression of its own for each defaulted one. The deparser prints
+the column list from the target list and the source as it is, so the two had different
+lengths, and a column list in another order than the source's printed the values in the wrong
+columns. `planner.c`, `wrap_insert_source`: when some column does not simply take the next
+column of the source, the source becomes `SELECT <value of each column, in target-list order>
+FROM (<source>) ks_src`, and the target list keeps one Var per column. The defaults go out as
+values computed by this node, not looked up again by each node. An identity or serial default
+is `nextval()` in the target list and is refused by the shippability test as before.
+
+**S3-11, add_node and privileges.** `node_admin.c` builds, from the local catalogs, the
+statements that give the new node what the tables have (`REVOKE ALL` then one `GRANT` per
+`aclexplode` entry with its grant option, column privileges, the sequences owned by columns,
+the owner and ACL of the schemas of the tables) and runs them after the tables and foreign
+keys exist. The owner of a table is set by the script that creates it (unchanged). The
+grantor is not kept (the statements run as a superuser, so the owner grants), which gives the
+same effective rights. Before anything is changed add_node asks the new node which of the
+roles that own or hold something here do not exist there and raises one error that names
+them: roles carry passwords and cluster-wide settings, so they are never created implicitly.
+No SQL object changed (the statements are built in C).
+
+**S3-14, libm.** `shippable.c`, `libm_dependent`: a function with a floating point result and
+the name of exp, ln, log, power/pow (also the operator `^`), cbrt, a trigonometric,
+hyperbolic, inverse or degree-based function, erf or gamma is not shippable (by name and
+result type, so `numeric` versions, which PostgreSQL computes itself, are kept). IEEE basic
+operators and `sqrt` are correctly rounded and stay. It applies to every use of the test: a
+reference write or a fanned-out `UPDATE`/`DELETE` is refused, and a restriction of a
+distributed scan is evaluated by the node that reads. Floating point `sum`/`avg` results
+still depend on the order of the groups (documented, not changed).
+
+**S3-18, views.** The rewritten write through an auto-updatable view is not a statement the
+other nodes can run: the planner adds the join with the row identifier, so the deparsed
+`UPDATE`/`DELETE` reads the base table twice ("table name specified more than once"), and
+`WITH CHECK OPTION` and the rights of the view's owner cannot be put into text. Support was
+considered (look through the view) and rejected: it would need the original statement text
+or a second deparser. Every range table entry that is a view (only a written view has one) is
+refused with "it writes through a view; write the table itself".
+
+**COPY <table> TO.** Decision: run it as `COPY (SELECT <columns> FROM <table>) TO` with the
+same options and the columns the table form would write (`CopyGetAttnums`), for every
+distributed table and every cluster size. The reason is the core: this core refuses `COPY` of
+a partitioned table ("Try the COPY (SELECT ...) TO variant"), so nothing was returned
+silently partial, but a core that accepts it reads the partitions of this node only; the
+rewrite makes the behaviour the same everywhere and useful (the full table). Reference
+tables are whole on every node and stay as they are; a bucket partition named directly is a
+local table. Privileges are checked by the SELECT that runs.
+
+**Audit of utility statements without the planner hook** (all run in `t/041`): CREATE TABLE
+AS, SELECT INTO, CREATE and REFRESH MATERIALIZED VIEW, cursors, views and EXPLAIN ANALYZE of a
+routed and of a reference write plan their query through the hook and give whole answers;
+VACUUM, ANALYZE, REINDEX, LOCK act on this node's partitions by nature (documented);
+CLUSTER of a distributed table or of a partition and COPY FROM are refused. Found and not
+changed (outside this round): `REASSIGN OWNED` and `ALTER DEFAULT PRIVILEGES` are not
+propagated, so owners and default privileges can differ between nodes.
+
+## Fix round for the review of 2026-11-14 (S3-01 to S3-03, S3-13): every copy of a reference table, or none
+
+The invariant: a reference table is written on every copy or not at all. The 0.2 design
+kept it by one rule in the planner hook (a statement that writes a reference table is
+fanned out from the node where the session runs; a forwarded session, which another node
+opened, never fans out). Both halves of that rule are bypassed by paths the hook never
+sees, and the review found two of them (S3-01 a function called by a routed statement,
+S3-02 a cached plan).
+
+### Where the decision is made
+
+The hook is the wrong place for the check, because it runs when a statement is planned and
+a plan outlives it (the plan cache, PL/pgSQL, drivers), and because a function that a routed
+statement calls is planned on the other node, in a session that by design never fans out.
+The check is therefore an `ExecutorStart` hook (`fanout.c`, `fo_executor_start`): when a plan
+that modifies a table starts to run, every result relation of the plan (`resultRelations`
+lists the targets of data-modifying CTEs and MERGE too) is looked up in the catalog cache.
+A reference table is allowed only if
+
+- this backend is inside the local part of a write this node fanned out
+  (`refwrite_local_depth`, set around the SPI execution of `run_local`), where the actions
+  of foreign keys run as part of the write, or
+- the session is forwarded and the top-level statement text begins with
+  `KS_REFWRITE_MARKER`, which `plan_reference_write` puts in front of the text it sends (the
+  copy of the rows to a new node uses it too), or
+- the cluster has one shard group and the session is not forwarded (there is no second
+  copy), or routing is switched off (a superuser by hand), or the extension is being created.
+
+Anything else raises an error before the first row is changed, with a message that depends
+on the session: in a forwarded session it says that the statement is run for another node
+(the function, trigger or rule would change this node's copy only), in an ordinary session
+that the plan would change this node's copy only and must be made again. The plan of a
+fanned-out write is a custom scan without a `ModifyTable`, so it never reaches the check.
+Parallel workers cannot modify tables and are skipped.
+
+Statements that the planner hook sees inside a local part (the cascading `DELETE` that a
+foreign key action runs) or inside a marked fragment (nested statements, whose text differs
+from the top-level text) are not routed again: they act on this node's copy, because the write
+that fired them runs on every node (`kingres_shard_in_refwrite_nested`). Without that, a cascade
+between reference tables was fanned out a second time from the local part.
+
+### Paths and decisions
+
+The table in README, "Reference tables", lists every path with its decision, and
+`t/043_reference_paths.pl` tests each: direct statement, `INSERT ... SELECT`, prepared and
+generic plans, a function in plain SQL, PL/pgSQL, dynamic SQL, a `DO` block (fanned out when the
+statement runs here, refused when it is routed elsewhere), a trigger on an ordinary table
+(fanned out) and on a bucket partition (refused), a rule (refused by the existing rule that a
+write to a reference table may read reference tables only: the rule's action reads the rule's
+table), a data-modifying CTE (refused), `MERGE` and `COPY FROM` (refused), `TRUNCATE`
+(propagated), foreign key cascades (each node once). Refusing is what the review allowed; the
+paths that run on every node do so because the nested statement is a statement of its own.
+
+### Cached plans (S3-02)
+
+`create_reference_table` invalidates the relcache entry of the table, and `internal_apply_catalog`
+(which every node runs when the catalog changes, `add_node` and `sync_catalog` included)
+invalidates every distributed and reference table, so the plans that mention them are made
+again with the new catalog. The executor check is the backstop for a plan that is older than
+the node's knowledge of the catalog.
+
+### The writer lock (S3-03, S3-13)
+
+0.2 serialized the writers of a reference table with `pg_advisory_xact_lock(class, hashtext(name))`.
+Any role can take any advisory lock, so any role could hold the key of a table and stop its
+writers cluster-wide. The lock is now a heavyweight lock with tag type `LOCKTAG_OBJECT`, class
+`KS_REFWRITE_LOCK_CLASS` (a number that is the OID of no catalog) and the OID of the table on the
+node. SQL reaches advisory locks, relation locks and the locks of the objects DDL names; none
+of these can produce a tag of that class, so users cannot take or hold it (a user who is
+granted `pg_locks` can see it, which is harmless). For another node the lock is taken by
+`kingres.internal_lock_reference_table(name)`, a C function that answers superusers and sessions
+that proved they come from a node of the cluster (`kingres_shard_session_forwarded()`), nobody
+else; EXECUTE cannot be revoked from PUBLIC because the node-to-node session runs as the role of
+the user. The wait is a normal lock wait (so the deadlock detector sees it) with `lock_timeout`
+set to the session's value or `node_timeout`, whichever is shorter, and the error says which table
+and what can hold it (a prepared transaction of a crashed origin: S3-05, which is now a bounded,
+explained wait; `recover_prepared_transactions()` ends it). The set of locked tables is the tables the
+statement names plus every reference table reachable through foreign keys in either direction
+(S3-13; one scan of `pg_constraint` per reference write), so two writers that can touch the same
+rows through a cascade queue on the same locks.
+
+### Detecting divergence (check_cluster)
+
+`kingres.internal_reference_digest(table)` returns `count:sum` where the sum is over a 64-bit hash
+of each row's text under `DateStyle`, `IntervalStyle`, `extra_float_digits`, `bytea_output`,
+`TimeZone`, `lc_monetary` and `lc_numeric` fixed by the function's own `SET` clauses, so the text
+of every type is the same on every node and the order of the rows does not matter. `check_cluster`
+asks every active primary for it and compares with the map group primary's; the comparison is
+repeated twice after a short pause before a difference is reported, because a write that is
+committing shows as one for a moment. Cost: one scan of each reference table per node.
