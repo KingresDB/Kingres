@@ -32,7 +32,8 @@ There is one product branch per PostgreSQL major, with the same KingresDB code o
 | 5 High availability | In progress: designed; standbys, leases and heartbeats are being written; failover is not started |
 | 6 Ledger | Done (`kingres_ledger` 0.2, the verifier, the Ledger page) |
 | 2b, 9 to 12 | Designed, not implemented, except the two standalone extensions of phase 12 listed below |
-| 7, 8 | Not started |
+| 7 | Not started |
+| 8 | Future roadmap: not part of the first release |
 
 For what has been done, how it was verified and what is still open, read the work log: [docs/worklog.md](docs/worklog.md).
 
