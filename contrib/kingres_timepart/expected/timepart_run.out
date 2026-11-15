@@ -260,11 +260,13 @@ CALL kingres.timepart_run_phase(:second_run_id, 'sideways');
 ERROR:  phase must be create, convert or retire
 SELECT kingres.timepart_finish_run(0);
 ERROR:  run 0 does not exist
--- The lock is released at finish: the lock of the table is not held now.
-SELECT kingres.timepart__lock_held('tp', 'r2') AS lock_held;
- lock_held 
------------
- f
+-- The run records the backend that made it, so that a later begin can tell a live
+-- run from an abandoned one.
+SELECT backend_pid = pg_backend_pid() AS own_backend, backend_start IS NOT NULL AS has_start
+  FROM kingres.timepart_run WHERE run_id = :second_run_id;
+ own_backend | has_start 
+-------------+-----------
+ t           | t
 (1 row)
 
 -- Procedures that commit cannot run inside a transaction block.
@@ -812,5 +814,92 @@ SELECT count(*) AS orphan_actions FROM kingres.timepart_run_action a
  orphan_actions 
 ----------------
               0
+(1 row)
+
+-- User code runs during a run: the index of the parent is copied to every new
+-- partition, and an index expression that calls a function evaluates it for
+-- a constant argument.  A driver that sets statement_timeout and issues each
+-- action as a statement of its own gets that action failed after the limit
+-- instead of a session that waits for as long as the function sleeps.
+CREATE TABLE tp.r15 (ts timestamptz NOT NULL, v int) PARTITION BY RANGE (ts);
+CREATE FUNCTION tp.slowfn(int) RETURNS int LANGUAGE plpgsql IMMUTABLE
+  AS $$ BEGIN PERFORM pg_sleep(2); RETURN $1; END $$;
+CREATE INDEX r15_slow_idx ON tp.r15 (ts, (tp.slowfn(1)));
+SELECT kingres.timepart_set_policy('tp.r15', '1 day', create_ahead => '2 days');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+SELECT kingres.timepart_begin_run('tp.r15', '2026-03-10 UTC', 'manual') AS run_id \gset slow_
+SELECT kingres.timepart_action_timeout();
+ timepart_action_timeout 
+-------------------------
+                  300000
+(1 row)
+
+SET kingres_timepart.action_timeout_ms = 500;
+SELECT kingres.timepart_action_timeout();
+ timepart_action_timeout 
+-------------------------
+                     500
+(1 row)
+
+SELECT set_config('statement_timeout', kingres.timepart_action_timeout()::text || 'ms', false);
+ set_config 
+------------
+ 500ms
+(1 row)
+
+SELECT kingres.timepart_run_action(:slow_run_id, 'create');
+ timepart_run_action 
+---------------------
+ t
+(1 row)
+
+SELECT kingres.timepart_run_action(:slow_run_id, 'create');
+ timepart_run_action 
+---------------------
+ t
+(1 row)
+
+RESET statement_timeout;
+RESET kingres_timepart.action_timeout_ms;
+SELECT kingres.timepart_run_action(:slow_run_id, 'create');
+ timepart_run_action 
+---------------------
+ f
+(1 row)
+
+SELECT kingres.timepart_finish_run(:slow_run_id);
+ timepart_finish_run 
+---------------------
+ 
+(1 row)
+
+SELECT kind, partition_name, state, left(detail, 40) AS detail FROM kingres.timepart_run_action WHERE run_id = :slow_run_id ORDER BY seq;
+  kind  | partition_name | state  |                  detail                  
+--------+----------------+--------+------------------------------------------
+ create | r15_p20260310  | failed | statement_timeout: canceling statement d
+ create | r15_p20260311  | failed | statement_timeout: canceling statement d
+(2 rows)
+
+SELECT state FROM kingres.timepart_run WHERE run_id = :slow_run_id;
+  state  
+---------
+ partial
+(1 row)
+
+SELECT count(*) AS partitions FROM tp.parts('tp.r15');
+ partitions 
+------------
+          0
+(1 row)
+
+-- a cancel by an operator is not an action's failure: only the timeout is
+SELECT kingres.timepart__timed_out() AS timed_out_now;
+ timed_out_now 
+---------------
+ f
 (1 row)
 

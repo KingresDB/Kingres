@@ -71,7 +71,7 @@ SELECT kingres.create_time_partitions('tp.pol', '1 day', '2026-03-10 00:00 UTC',
 SELECT seq, kind, partition_name, range_from, range_to FROM kingres.timepart_plan('tp.pol', '2026-03-10 05:30 UTC');
 -- Planning is a pure function of the catalog and the time: nothing changed.
 SELECT count(*) AS partitions FROM tp.parts('tp.pol');
-SELECT count(*) AS runs FROM kingres.timepart_run;
+SELECT count(*) AS runs FROM kingres.timepart_run WHERE table_name = 'pol';
 -- The plan at a time before the data: nothing to retire.
 SELECT kind, count(*) FROM kingres.timepart_plan('tp.pol', '2026-02-26 05:30 UTC') GROUP BY kind ORDER BY kind;
 

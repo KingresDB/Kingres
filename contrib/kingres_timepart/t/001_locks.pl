@@ -23,7 +23,11 @@
 #     up with lock_not_available and put lock_timeout back;
 #   * a second session cannot begin a run of a table that another session is
 #     running (55P03); when that session is gone, the next run marks the
-#     abandoned one as interrupted.
+#     abandoned one as interrupted;
+#   * a role that holds the advisory locks that the earlier versions used does
+#     not stop the runs of the table, and cannot touch the lock table;
+#   * the attach of a partition of a table that has a foreign key waits for
+#     writers of the referenced table, bounded by the same settings.
 #
 # Portions Copyright (c) 2026, RooyeKhat Media Co
 # SPDX-License-Identifier: PostgreSQL
@@ -222,6 +226,64 @@ is(q1(qq{SELECT state || ':' || error FROM kingres.timepart_run WHERE run_id = $
 	'failed:interrupted', 'the abandoned run is marked interrupted');
 is(q1(qq{SELECT state FROM kingres.timepart_run WHERE run_id = $run_b}), 'running', 'and the new one runs');
 q1(qq{SELECT kingres.timepart_finish_run($run_b)});
+
+# ---- 5. No role can stop the runs of a table by taking a lock: the claim of a
+# run is a row lock that only the extension owner can take, and the run row
+# with its backend.  A role that holds the advisory locks of the former
+# versions (the keys are computable from the name of the table) changes
+# nothing.
+$node->safe_psql('postgres', q{CREATE ROLE evil LOGIN;});
+$node->safe_psql('postgres', q{GRANT USAGE ON SCHEMA kingres TO evil; GRANT USAGE ON SCHEMA public TO evil;});
+my $evil = $node->background_psql('postgres', on_error_stop => 0);
+$evil->query_safe(q{SET ROLE evil;});
+$evil->query_safe(q{SELECT pg_advisory_lock(hashtext('kingres_timepart'),
+		hashtext(quote_ident('public') || '.' || quote_ident('ev')));});
+$evil->query_safe(q{SELECT pg_advisory_lock(hashtext('kingres_timepart_step'),
+		hashtext(quote_ident('public') || '.' || quote_ident('ev')));});
+$evil->query_safe(q{BEGIN; SELECT pg_advisory_xact_lock(hashtext('kingres_timepart_step'),
+		hashtext(quote_ident('public') || '.' || quote_ident('ev')));});
+($ret, $out, $err) = run_sql(q{CALL kingres.timepart_run('ev', '2026-03-12 12:00 UTC', '{create}');});
+is($ret, 0, 'a run goes on while a role holds the advisory locks that name the table');
+is(q1(q{SELECT state FROM kingres.timepart_run ORDER BY run_id DESC LIMIT 1}), 'done', 'and is done');
+cmp_ok(q1(q{SELECT count(*) FROM kingres.timepart_run_action a
+		 WHERE a.run_id = (SELECT max(run_id) FROM kingres.timepart_run) AND a.state = 'done'}),
+	'>', 0, 'it created the partitions that were missing');
+($ret, $out, $err) = $node->psql('postgres', q{SET ROLE evil; SELECT * FROM kingres.timepart_lock;},
+	stderr => \$err);
+like($err, qr/permission denied for table timepart_lock/, 'the role cannot touch the lock table');
+($ret, $out, $err) = $node->psql('postgres', q{SET ROLE evil; SELECT * FROM kingres.timepart_policy FOR UPDATE;},
+	stdout => \$out, stderr => \$err);
+is($out, '', 'it sees no policy of a table it does not own, so it cannot lock the row either');
+$evil->query_safe(q{COMMIT;});
+$evil->quit;
+$node->safe_psql('postgres', q{DROP OWNED BY evil; DROP ROLE evil;});
+
+# ---- 6. A foreign key of the parent: the attach locks the referenced table
+# with SHARE ROW EXCLUSIVE, which conflicts with every writer of that table.
+# (This is PostgreSQL's rule; the README lists it.)  A writer of the referenced
+# table that has not committed makes the create actions wait, bounded, and
+# fail with the lock error; without the foreign key the same writer does not
+# matter (section 2).
+$node->safe_psql('postgres', q{SET timezone = 'UTC';
+	CREATE TABLE fk_ref (id int PRIMARY KEY);
+	CREATE TABLE fkp (id int REFERENCES fk_ref, ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+	SELECT kingres.create_time_partitions('fkp', '1 day', '2026-03-10 UTC', '2026-03-10 UTC');
+	SELECT kingres.timepart_set_policy('fkp', '1 day', create_ahead => '2 days');});
+$writer = $node->background_psql('postgres', on_error_stop => 0);
+$writer->query_safe(q{BEGIN; INSERT INTO fk_ref VALUES (1);});
+($ret, $out, $err) = run_sql(q{CALL kingres.timepart_run('fkp', '2026-03-10 12:00 UTC', '{create}');});
+is($ret, 0, 'a run for a table with a foreign key comes back while the referenced table has a writer');
+is(q1(q{SELECT state FROM kingres.timepart_run ORDER BY run_id DESC LIMIT 1}), 'partial', 'the run is partial');
+is(q1(q{SELECT count(*) FROM kingres.timepart_run_action a
+		 WHERE a.run_id = (SELECT max(run_id) FROM kingres.timepart_run) AND a.state = 'failed'
+		   AND a.detail LIKE 'lock_timeout:%'}),
+	'2', 'the two create actions failed on the lock timeout');
+is(q1(q{SELECT count(*) FROM pg_inherits WHERE inhparent = 'fkp'::regclass}), '1', 'and nothing was created');
+$writer->query_safe(q{COMMIT;});
+$writer->quit;
+($ret, $out, $err) = run_sql(q{CALL kingres.timepart_run('fkp', '2026-03-10 12:00 UTC', '{create}');});
+is(q1(q{SELECT state FROM kingres.timepart_run ORDER BY run_id DESC LIMIT 1}), 'done', 'the next run, without the writer, is done');
+is(q1(q{SELECT count(*) FROM pg_inherits WHERE inhparent = 'fkp'::regclass}), '3', 'with the partitions');
 
 $node->stop;
 done_testing();

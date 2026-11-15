@@ -171,3 +171,47 @@ CREATE PROCEDURE tp.detach_concurrently() LANGUAGE plpgsql AS $$ BEGIN ALTER TAB
 CALL tp.detach_concurrently();
 \set VERBOSITY default
 SELECT count(*) AS still_attached FROM pg_inherits WHERE inhrelid = 'tp.t9_p20260301'::regclass;
+
+-- A partition that the policy does not recognise as its own (bounds off the
+-- grid) is reported and never dropped or detached by a run, even when it is
+-- older than the retention, and the check names it.  The call by hand takes
+-- any partition.
+CREATE TABLE tp.t10 (ts timestamptz NOT NULL, v int) PARTITION BY RANGE (ts);
+CREATE TABLE tp.t10_hand PARTITION OF tp.t10 FOR VALUES FROM ('2026-03-03 06:00 UTC') TO ('2026-03-04 06:00 UTC');
+INSERT INTO tp.t10 VALUES ('2026-03-03 12:00 UTC', 42);
+SELECT kingres.timepart_set_policy('tp.t10', '1 day', create_ahead => '1 day', retention => '3 days');
+SELECT kind, partition_name FROM kingres.timepart_plan('tp.t10', '2026-03-10 UTC') WHERE kind <> 'create';
+\o /dev/null
+CALL kingres.timepart_run('tp.t10', '2026-03-10 UTC');
+\o
+SELECT kind, partition_name, state, detail FROM tp.last_actions('tp', 't10') WHERE kind <> 'create';
+SELECT to_regclass('tp.t10_hand') IS NOT NULL AS still_there, count(*) AS rows_kept FROM tp.t10;
+SELECT problem, detail FROM kingres.timepart_check('1 hour', '2026-03-10 UTC') WHERE table_name = 't10' ORDER BY problem;
+SELECT kingres.drop_old_time_partitions('tp.t10', '2026-03-10 UTC');
+SELECT to_regclass('tp.t10_hand') IS NULL AS dropped_by_hand;
+
+-- A partition that a foreign key references cannot be dropped: that action
+-- fails with PostgreSQL's reason, every later run is partial until the
+-- referencing row is gone, and the check names the partition.
+CREATE TABLE tp.t11 (ts timestamptz NOT NULL, id int, PRIMARY KEY (ts, id)) PARTITION BY RANGE (ts);
+SELECT kingres.create_time_partitions('tp.t11', '1 day', '2026-03-05 UTC', '2026-03-01 UTC');
+CREATE TABLE tp.t11_child (ts timestamptz, id int, FOREIGN KEY (ts, id) REFERENCES tp.t11 (ts, id));
+INSERT INTO tp.t11 VALUES ('2026-03-01 10:00 UTC', 1), ('2026-03-02 10:00 UTC', 2);
+INSERT INTO tp.t11_child VALUES ('2026-03-01 10:00 UTC', 1);
+SELECT kingres.timepart_set_policy('tp.t11', '1 day', create_ahead => '1 day', retention => '2 days');
+\o /dev/null
+CALL kingres.timepart_run('tp.t11', '2026-03-06 UTC');
+\o
+SELECT * FROM tp.last_run('tp', 't11');
+SELECT kind, partition_name, state, left(detail, 52) AS detail FROM tp.last_actions('tp', 't11') WHERE kind <> 'create';
+SELECT problem, detail FROM kingres.timepart_check('1 hour', '2026-03-06 UTC') WHERE table_name = 't11' ORDER BY problem;
+\o /dev/null
+CALL kingres.timepart_run('tp.t11', '2026-03-06 UTC');
+\o
+SELECT * FROM tp.last_run('tp', 't11');
+DELETE FROM tp.t11_child;
+\o /dev/null
+CALL kingres.timepart_run('tp.t11', '2026-03-06 UTC');
+\o
+SELECT * FROM tp.last_run('tp', 't11');
+SELECT to_regclass('tp.t11_p20260301') IS NULL AS dropped_now;

@@ -22,7 +22,9 @@ tests += {
       'timepart_run',
       'timepart_retention',
       'timepart_names',
+      'timepart_hostile',
       'timepart_security',
+      'timepart_drop',
     ],
     'regress_args': ['--temp-config', files('kingres_timepart.conf')],
     # The extension needs no preloaded library, but the tests set

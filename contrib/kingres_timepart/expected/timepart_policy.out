@@ -165,7 +165,7 @@ SELECT count(*) AS partitions FROM tp.parts('tp.pol');
          14
 (1 row)
 
-SELECT count(*) AS runs FROM kingres.timepart_run;
+SELECT count(*) AS runs FROM kingres.timepart_run WHERE table_name = 'pol';
  runs 
 ------
     0

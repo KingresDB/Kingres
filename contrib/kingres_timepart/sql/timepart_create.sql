@@ -167,3 +167,39 @@ SELECT kingres.create_time_partitions('tp.am', '1 day', '2026-03-05 UTC', '2026-
 CREATE TABLE tp.many (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
 SELECT kingres.create_time_partitions('tp.many', '1 hour', '2030-01-01 UTC', '2026-01-01 UTC');
 SELECT count(*) AS partitions FROM tp.parts('tp.many');
+
+-- Zones that skipped a whole calendar day (Apia 2011-12-30, Kwajalein
+-- 1993-08-21, Kiritimati 1994-12-31, Fakaofo 2011-12-30): the cell of that day
+-- would start and end at one instant.  It is left out: no empty partition, no
+-- duplicate name, and the cells on both sides still meet.
+SELECT tz, count(*) AS cells, count(*) FILTER (WHERE e = s) AS empty_cells,
+       bool_and(e = s OR kingres.timepart_cell_of('1 day', tz, s) = k) AS start_in_cell,
+       bool_and(e = s OR kingres.timepart_cell_of('1 day', tz, e - interval '1 microsecond') = k) AS end_in_cell
+  FROM (SELECT tz, k, kingres.timepart_cell_start('1 day', tz, k) AS s,
+               kingres.timepart_cell_start('1 day', tz, k + 1) AS e
+          FROM (VALUES ('Pacific/Apia', timestamptz '2011-12-28 12:00 UTC'),
+                       ('Pacific/Fakaofo', timestamptz '2011-12-28 12:00 UTC'),
+                       ('Pacific/Kwajalein', timestamptz '1993-08-19 12:00 UTC'),
+                       ('Pacific/Kiritimati', timestamptz '1994-12-29 12:00 UTC')) z(tz, t),
+               LATERAL generate_series(kingres.timepart_cell_of('1 day', tz, t),
+                                       kingres.timepart_cell_of('1 day', tz, t) + 4) k) c
+ GROUP BY tz ORDER BY tz;
+CREATE TABLE tp.apia (ts timestamptz NOT NULL, v int) PARTITION BY RANGE (ts);
+SELECT kingres.create_time_partitions('tp.apia', '1 day', '2012-01-02 UTC', '2011-12-28 UTC', NULL, 'Pacific/Apia');
+SELECT * FROM tp.parts('tp.apia');
+SELECT * FROM tp.gaps('tp.apia');
+SELECT kingres.create_time_partitions('tp.apia', '1 day', '2012-01-02 UTC', '2011-12-28 UTC', NULL, 'Pacific/Apia');
+INSERT INTO tp.apia VALUES ('2011-12-30 11:00 UTC', 1), ('2011-12-31 12:00 UTC', 2);
+SELECT tableoid::regclass AS part, v FROM tp.apia ORDER BY v;
+-- the same through a policy and a run
+CREATE TABLE tp.kwa (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.timepart_set_policy('tp.kwa', '1 day', create_ahead => '3 days', timezone => 'Pacific/Kwajalein');
+\o /dev/null
+CALL kingres.timepart_run('tp.kwa', '1993-08-19 12:00 UTC');
+CALL kingres.timepart_run('tp.kwa', '1993-08-21 12:00 UTC');
+\o
+SELECT * FROM tp.last_run('tp', 'kwa');
+SELECT * FROM tp.parts('tp.kwa');
+SELECT * FROM tp.gaps('tp.kwa');
+SELECT count(*) AS plan_after FROM kingres.timepart_plan('tp.kwa', '1993-08-21 12:00 UTC') WHERE kind = 'create';
+SELECT kingres.timepart_unset_policy('tp.kwa');

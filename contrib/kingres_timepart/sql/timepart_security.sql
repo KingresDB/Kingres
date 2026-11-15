@@ -36,8 +36,9 @@ SELECT proname FROM members WHERE prosecdef ORDER BY proname;
 -- DDL steps that run with the caller's own rights.
 SELECT proname FROM members
  WHERE has_function_privilege('public', oid, 'EXECUTE') ORDER BY proname;
--- The tables and the view are not readable or writable by anyone else.
-SELECT relname,
+-- The history and the policy tables are shown to a role through row-level
+-- security (the rows of the tables it owns); the lock table is private.
+SELECT relname, c.relrowsecurity AS rls,
        has_table_privilege('tp_other', c.oid, 'SELECT') AS other_select,
        has_table_privilege('tp_other', c.oid, 'INSERT') AS other_insert
   FROM pg_class c WHERE c.relnamespace = 'kingres'::regnamespace AND c.relname LIKE 'timepart_%' AND c.relkind IN ('r', 'v')
@@ -64,9 +65,11 @@ SELECT kind, partition_name FROM kingres.timepart_plan('tpo.o1', '2026-03-10 UTC
 SELECT count(*) AS partitions FROM kingres.timepart_partitions('tpo.o1');
 SELECT * FROM kingres.timepart_check('1 hour', '2026-03-03 UTC');
 SELECT kingres.drop_old_time_partitions('tpo.o1', '2026-03-02 UTC');
--- The owner cannot read the policy tables, only use the functions.
-SELECT * FROM kingres.timepart_policy;
-SELECT * FROM kingres.timepart_run;
+-- The owner sees the rows of its own tables in the policy and history tables,
+-- and nothing else.
+SELECT count(*) AS visible_policies FROM kingres.timepart_policy;
+SELECT count(*) AS visible_runs FROM kingres.timepart_run;
+SELECT count(*) AS visible_locks FROM kingres.timepart_lock;
 -- The administration functions are not for the owner, even with EXECUTE.
 RESET ROLE;
 GRANT EXECUTE ON FUNCTION kingres.timepart_begin_run(regclass, timestamptz, text),
@@ -82,7 +85,7 @@ SELECT kingres.timepart_finish_run(1);
 SELECT kingres.timepart_prune_runs('tpo', 'o1', '2026-03-10 UTC');
 CALL kingres.timepart_run('tpo.o1', '2026-03-10 UTC');
 CALL kingres.timepart_run_phase(1, 'create');
-SELECT kingres.timepart__step(1, 'create');
+SELECT kingres.timepart_run_action(1, 'create');
 RESET ROLE;
 -- Without EXECUTE the function cannot even be called.
 REVOKE EXECUTE ON FUNCTION kingres.timepart_begin_run(regclass, timestamptz, text),
@@ -243,6 +246,102 @@ CALL kingres.timepart_run('tpo.h1', '2026-03-05 UTC');
 RESET search_path;
 SELECT * FROM tp.last_run('tpo', 'h1');
 SELECT part FROM tp.parts('tpo.h1');
+
+-- The identity is current_user, not the session user.  A function of a role,
+-- SECURITY DEFINER, called in a session of a superuser runs with the
+-- privileges of that role only; the policy functions have to judge that role,
+-- and not the superuser who logged in.
+CREATE TABLE tpo.victim (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+ALTER TABLE tpo.victim OWNER TO tp_owner;
+SELECT kingres.create_time_partitions('tpo.victim', '1 day', '2026-03-03 UTC', '2026-03-01 UTC');
+SET ROLE tp_owner;
+SELECT kingres.timepart_set_policy('tpo.victim', '1 day', create_ahead => '1 day', retention => '5 days');
+RESET ROLE;
+GRANT USAGE, CREATE ON SCHEMA tp TO tp_other;
+GRANT USAGE ON SCHEMA tpo TO tp_other;
+SET ROLE tp_other;
+CREATE FUNCTION tp.evil_fn() RETURNS int LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+    PERFORM kingres.timepart_set_policy('tpo.victim'::regclass, '1 day', '1 day', '1 day');
+    RETURN 1;
+END $$;
+CREATE FUNCTION tp.evil_unset() RETURNS int LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+    PERFORM kingres.timepart_unset_policy('tpo.victim'::regclass);
+    RETURN 1;
+END $$;
+CREATE FUNCTION tp.evil_plan() RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+    RETURN (SELECT count(*) FROM kingres.timepart_plan('tpo.victim'::regclass, '2026-03-10 UTC'));
+END $$;
+SELECT tp.evil_fn();
+RESET ROLE;
+-- The same function in the session of a superuser (a view, a report): refused.
+SELECT tp.evil_fn();
+SELECT tp.evil_unset();
+SELECT tp.evil_plan();
+SELECT retention, created_by FROM kingres.timepart_policy WHERE table_name = 'victim';
+-- The ownership check follows the role, not the login: the superuser may
+-- act on the table when it acts as itself.
+SELECT kingres.timepart_set_policy('tpo.victim', '1 day', create_ahead => '1 day', retention => '5 days');
+DROP FUNCTION tp.evil_fn(), tp.evil_unset(), tp.evil_plan();
+
+-- A role writes the policy table directly only for tables it owns, and the
+-- columns the extension decides are pinned.
+SET ROLE tp_other;
+INSERT INTO kingres.timepart_policy (schema_name, table_name, parent_oid, partition_every, table_owner, created_by)
+VALUES ('tpo', 'victim', 0, '1 day', 'tp_other', 'tp_other');
+UPDATE kingres.timepart_policy SET retention = '1 day' WHERE table_name = 'victim';
+DELETE FROM kingres.timepart_policy WHERE table_name = 'victim';
+SELECT count(*) AS other_sees FROM kingres.timepart_policy;
+RESET ROLE;
+SELECT retention FROM kingres.timepart_policy WHERE table_name = 'victim';
+SET ROLE tp_owner;
+UPDATE kingres.timepart_policy SET retention = '4 days', table_owner = 'tp_other', created_by = 'tp_other',
+       parent_oid = 1, created_at = '2000-01-01' WHERE table_name = 'victim';
+SELECT retention, table_owner, created_by, parent_oid = 'tpo.victim'::regclass::oid AS hint_pinned,
+       created_at > '2020-01-01' AS created_at_kept FROM kingres.timepart_policy WHERE table_name = 'victim';
+UPDATE kingres.timepart_policy SET retention = '1 microsecond' WHERE table_name = 'victim';
+UPDATE kingres.timepart_policy SET timezone = 'Mars/Olympus' WHERE table_name = 'victim';
+UPDATE kingres.timepart_policy SET schema_name = 'tp', table_name = 'canary' WHERE table_name = 'victim';
+INSERT INTO kingres.timepart_policy (schema_name, table_name, parent_oid, partition_every, table_owner, created_by)
+VALUES ('tp', 'canary', 0, '1 day', 'tp_owner', 'tp_owner');
+DELETE FROM kingres.timepart_policy WHERE table_name = 'victim';
+SELECT count(*) AS policies_of_owner FROM kingres.timepart_policy;
+RESET ROLE;
+-- A role may also make the policy of its own table by writing the row.
+SET ROLE tp_owner;
+INSERT INTO kingres.timepart_policy (schema_name, table_name, parent_oid, partition_every, create_ahead)
+VALUES ('tpo', 'victim', 0, '1 day', '1 day');
+SELECT table_owner, created_by, retention FROM kingres.timepart_policy WHERE table_name = 'victim';
+RESET ROLE;
+DROP TABLE tpo.victim;
+
+-- K12-13: the detached partitions listed are the ones the caller may read, and
+-- a table that took the name of a detached partition is not described.
+CREATE TABLE tpo.dt (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+ALTER TABLE tpo.dt OWNER TO tp_owner;
+SET ROLE tp_owner;
+SELECT kingres.create_time_partitions('tpo.dt', '1 day', '2026-03-03 UTC', '2026-03-01 UTC');
+SELECT kingres.timepart_set_policy('tpo.dt', '1 day', create_ahead => '1 day', retention => '2 days', retention_action => 'detach');
+RESET ROLE;
+\o /dev/null
+CALL kingres.timepart_run('tpo.dt', '2026-03-06 UTC');
+\o
+SET ROLE tp_owner;
+SELECT partition, attached FROM kingres.timepart_partitions('tpo.dt') WHERE NOT attached ORDER BY 1;
+DROP TABLE tpo.dt_p20260301;
+RESET ROLE;
+GRANT CREATE ON SCHEMA tpo TO tp_other;
+SET ROLE tp_other;
+CREATE TABLE tpo.dt_p20260301 (x int);
+INSERT INTO tpo.dt_p20260301 SELECT g FROM generate_series(1, 1000) g;
+RESET ROLE;
+SET ROLE tp_owner;
+SELECT partition, attached FROM kingres.timepart_partitions('tpo.dt') WHERE NOT attached ORDER BY 1;
+RESET ROLE;
+DROP TABLE tpo.dt_p20260301;
+DROP TABLE tpo.dt;
 
 -- Cleanup of the roles of the tests.
 DROP TABLE tpo.o1, tpo.h1, tpo.pg_class, tpo.pg_inherits, tp.o2;
