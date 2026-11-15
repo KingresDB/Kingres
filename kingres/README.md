@@ -71,6 +71,7 @@ Developer standards:
 - [docs/dev/repository-layout.md](docs/dev/repository-layout.md) - directory tree and placement rules.
 - [docs/dev/core-patches.md](docs/dev/core-patches.md) - register of changes to upstream files.
 - [docs/dev/upstream-sync.md](docs/dev/upstream-sync.md) - branches, rebasing, new major versions.
+- [docs/dev/releases.md](docs/dev/releases.md) - one release per PostgreSQL major: the product branches, how a change reaches each, what a release consists of.
 - [docs/dev/testing.md](docs/dev/testing.md) - test strategy and the definition of done.
 - [docs/dev/documentation.md](docs/dev/documentation.md) - what is documented where.
 

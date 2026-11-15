@@ -424,6 +424,17 @@ Points the designs leave to be settled when each phase is implemented, because t
 - The phase 2b design needs four corrections before it is implemented: the placement check (epoch instead of a map version in the fragment), `ON CONFLICT DO UPDATE` in a colocated `INSERT ... SELECT` that is shipped whole, an allow-list of extensions whose functions and aggregates may be shipped, and an explicit destination for the batch sender of the row router.
 - Time partition policies run as tasks of the manager leader in `kingresd`, which has no recurring scheduler yet.
 
+### Phase 13: configuration from the console (added 2026-11-15)
+
+Requested by the project owner: the settings of PostgreSQL on the servers of a cluster, and the time zone the databases work in, are managed from the web console instead of by editing files on each server.
+
+| Part | What it adds | In the web console |
+|---|---|---|
+| PostgreSQL parameters | Every parameter that the control plane does not own can be set at three levels: for the whole cluster, for a server group, and for one server. A narrower level overrides a wider one. The change is validated against what PostgreSQL says about the parameter, applied to every server it concerns as a task, and reloaded; a parameter that needs a restart is shown as pending until the instance is restarted | A Configuration page: search and categories, the effective value on every server with the level it comes from, differences between servers, pending restarts, an edit dialog with a preview of what changes where, history and revert |
+| Time | The clock and time zone of every server are shown, with the difference between the servers' clocks and an alert when it is too large. The time zone of PostgreSQL (and of its log) is set for the cluster, and a database can have its own | A Time tab on the same page; the dashboard shows servers that wait for a restart, parameters that differ inside a group, and the largest clock difference |
+
+The control plane does not set the system clock of a server: that needs the rights of the operating system's administrator and is the job of time synchronization (NTP or chrony). It measures and reports the difference. The design is [design/config-phase13.md](design/config-phase13.md). This phase depends on phase 3 only and is built independently of the sharding phases.
+
 Not requested and therefore not scheduled: isolating one tenant on a bucket of its own (phase 10's split is the mechanism it would use), row-level security on distributed tables, statistics per tenant, distributed functions. The order of implementation is 2b, 9, 10, 11, 12, after phases 4 and 5 are complete; the extension is changed by one line of work at a time, because parallel changes to `contrib/kingres_shard` have conflicted before.
 
 ### Risks
