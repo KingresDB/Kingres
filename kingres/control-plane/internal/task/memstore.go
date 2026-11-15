@@ -1,0 +1,261 @@
+// SPDX-License-Identifier: PostgreSQL
+
+package task
+
+import (
+	"context"
+	"sort"
+	"sync"
+	"time"
+)
+
+// MemStore is an in-memory Store with the same rules as the PostgreSQL one;
+// the unit tests of the engine use it.
+type MemStore struct {
+	mu     sync.Mutex
+	next   int64
+	tasks  map[int64]*Task
+	failOn func(op string) error // test hook
+	// clock stands for the database's clock: every engine that shares the
+	// store agrees on it, whatever its own clock says.
+	clock func() time.Time
+}
+
+// NewMemStore returns an empty store.
+func NewMemStore() *MemStore { return &MemStore{tasks: map[int64]*Task{}, clock: time.Now} }
+
+// NewMemStoreClock returns an empty store whose lease arithmetic uses clock
+// (the stand-in for the database clock in tests).
+func NewMemStoreClock(clock func() time.Time) *MemStore {
+	return &MemStore{tasks: map[int64]*Task{}, clock: clock}
+}
+
+// FailOn installs a hook that can make an operation fail (tests).
+func (m *MemStore) FailOn(f func(op string) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.failOn = f
+}
+
+func (m *MemStore) hook(op string) error {
+	if m.failOn != nil {
+		return m.failOn(op)
+	}
+	return nil
+}
+
+func cp(t *Task) Task {
+	c := *t
+	c.Steps = append([]StepState(nil), t.Steps...)
+	if t.Error != nil {
+		e := *t.Error
+		c.Error = &e
+	}
+	return c
+}
+
+// Create implements Store.
+func (m *MemStore) Create(_ context.Context, t Task) (Task, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, o := range m.tasks {
+		if o.State.Active() && o.SubjectType == t.SubjectType && o.SubjectID == t.SubjectID {
+			return Task{}, ErrSubjectBusy
+		}
+	}
+	m.next++
+	t.ID = m.next
+	m.tasks[t.ID] = &t
+	return cp(&t), nil
+}
+
+// Get implements Store.
+func (m *MemStore) Get(_ context.Context, id int64) (Task, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, ok := m.tasks[id]
+	if !ok {
+		return Task{}, ErrNotFound
+	}
+	return cp(t), nil
+}
+
+func claimable(t *Task, now time.Time) bool {
+	return t.State == Pending || (t.State == Running && !t.LeaseExpires.After(now))
+}
+
+func (m *MemStore) take(t *Task, holder string, now time.Time, lease time.Duration) *Task {
+	t.State, t.Holder, t.LeaseExpires, t.UpdatedAt = Running, holder, now.Add(lease), now
+	t.Epoch++
+	c := cp(t)
+	return &c
+}
+
+// Claim implements Store.
+func (m *MemStore) Claim(_ context.Context, holder string, lease time.Duration) (*Task, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := m.clock()
+	if err := m.hook("claim"); err != nil {
+		return nil, err
+	}
+	ids := make([]int64, 0, len(m.tasks))
+	for id := range m.tasks {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, id := range ids {
+		if t := m.tasks[id]; claimable(t, now) {
+			return m.take(t, holder, now, lease), nil
+		}
+	}
+	return nil, nil
+}
+
+// ClaimID implements Store.
+func (m *MemStore) ClaimID(_ context.Context, id int64, holder string, lease time.Duration) (*Task, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := m.clock()
+	t, ok := m.tasks[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if !claimable(t, now) {
+		return nil, nil
+	}
+	return m.take(t, holder, now, lease), nil
+}
+
+func (m *MemStore) held(id int64, l Lease) (*Task, error) {
+	t, ok := m.tasks[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if t.Holder != l.Holder || t.Epoch != l.Epoch || t.State != Running {
+		return nil, ErrLeaseLost
+	}
+	return t, nil
+}
+
+// Renew implements Store.
+func (m *MemStore) Renew(_ context.Context, id int64, l Lease, lease time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.hook("renew"); err != nil {
+		return err
+	}
+	t, err := m.held(id, l)
+	if err != nil {
+		return err
+	}
+	t.LeaseExpires = m.clock().Add(lease)
+	return nil
+}
+
+// SetStep implements Store.
+func (m *MemStore) SetStep(_ context.Context, id int64, l Lease, i int, state string, pct float64) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.hook("setstep:" + state); err != nil {
+		return false, err
+	}
+	t, err := m.held(id, l)
+	if err != nil {
+		return false, err
+	}
+	now := m.clock()
+	if state == StepRunning && !t.LeaseExpires.After(now) {
+		return false, ErrLeaseLost // see Store.SetStep
+	}
+	t.Steps[i].State, t.Percent, t.UpdatedAt = state, pct, now
+	return t.CancelRequested, nil
+}
+
+// Finish implements Store.
+func (m *MemStore) Finish(_ context.Context, id int64, l Lease, state State, e *Error) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, err := m.held(id, l)
+	if err != nil {
+		return err
+	}
+	t.State, t.Error, t.UpdatedAt, t.Holder, t.LeaseExpires = state, e, m.clock(), "", time.Time{}
+	if state == Done {
+		t.Percent = 100
+	}
+	return nil
+}
+
+// RequestCancel implements Store.
+func (m *MemStore) RequestCancel(_ context.Context, id int64, now time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, ok := m.tasks[id]
+	if !ok {
+		return ErrNotFound
+	}
+	switch t.State {
+	case Done, Failed:
+		return ErrNotCancellable
+	case Pending:
+		t.State, t.UpdatedAt = Failed, now
+		t.Error = &Error{Code: CodeCanceled, Message: "The task was canceled before it started."}
+	default:
+		t.CancelRequested = true
+	}
+	return nil
+}
+
+// List implements Store.
+func (m *MemStore) List(_ context.Context, limit int) ([]Task, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]Task, 0, len(m.tasks))
+	for _, t := range m.tasks {
+		out = append(out, cp(t))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID > out[j].ID })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// Export returns copies of all tasks (for persistence).
+func (m *MemStore) Export() []Task {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]Task, 0, len(m.tasks))
+	for _, t := range m.tasks {
+		out = append(out, cp(t))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// Import replaces the content with tasks (for loading persisted state).
+func (m *MemStore) Import(ts []Task) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.tasks, m.next = map[int64]*Task{}, 0
+	for i := range ts {
+		t := ts[i]
+		m.tasks[t.ID] = &t
+		if t.ID > m.next {
+			m.next = t.ID
+		}
+	}
+}
+
+// SetDetail implements DetailStore.
+func (m *MemStore) SetDetail(_ context.Context, id int64, l Lease, detail string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, err := m.held(id, l)
+	if err != nil {
+		return err
+	}
+	t.Detail = detail
+	return nil
+}

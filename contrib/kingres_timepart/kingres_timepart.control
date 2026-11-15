@@ -1,0 +1,8 @@
+# kingres_timepart extension
+#
+# Portions Copyright (c) 2026, RooyeKhat Media Co
+# SPDX-License-Identifier: PostgreSQL
+comment = 'KingresDB time partitioning: creation ahead, retention and a run history for ordinary partitioned tables'
+default_version = '0.1'
+relocatable = false
+schema = kingres

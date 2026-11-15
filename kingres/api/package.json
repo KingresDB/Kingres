@@ -1,0 +1,14 @@
+{
+  "name": "kingres-api-contract",
+  "private": true,
+  "version": "0.2.0",
+  "description": "Tooling for the KingresDB management API contract (openapi.yaml).",
+  "type": "module",
+  "scripts": {
+    "check": "node scripts/check-contract.mjs",
+    "lint": "npx --yes @redocly/cli@latest lint openapi.yaml"
+  },
+  "dependencies": {
+    "yaml": "2.8.1"
+  }
+}

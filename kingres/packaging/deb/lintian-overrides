@@ -1,0 +1,22 @@
+# Decisions of the KingresDB package, each explained.  The file is installed
+# as /usr/share/lintian/overrides/kingres.
+#
+# KingresDB is an application product installed as one self-contained tree
+# under /opt/kingres, next to (and independent of) a distribution's PostgreSQL.
+kingres: dir-or-file-in-opt [opt/kingres/*]
+# The libraries of that tree (libpq) are found through the RUNPATH of its
+# programs, so that they never replace or shadow the distribution's libpq.
+kingres: custom-library-search-path RUNPATH /opt/kingres/lib [opt/kingres/*]
+# PostgreSQL loadable modules are not linked against libc or other libraries; the server that
+# loads them provides it.
+kingres: library-not-linked-against-libc [opt/kingres/lib/postgresql/*]
+# kingresd and kingres-verify are Go programs without libc, built as
+# static position-independent executables on purpose, so that they run on any
+# Ubuntu release; lintian takes a static PIE for a shared library.
+kingres: shared-library-lacks-prerequisites [opt/kingres/lib/postgresql/*]
+kingres: shared-library-lacks-prerequisites [opt/kingres/bin/kingresd]
+kingres: shared-library-lacks-prerequisites [opt/kingres/bin/kingres-verify]
+# The environment file may contain secrets (a database password): root only.
+kingres: non-standard-file-perm 0600 != 0644 [etc/kingres/kingresd.env]
+# This is not an upload to the Debian archive; there is no bug to close.
+kingres: initial-upload-closes-no-bugs [usr/share/doc/kingres/changelog.Debian.gz:*]

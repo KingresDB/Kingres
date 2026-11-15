@@ -1,0 +1,13 @@
+/* SPDX-License-Identifier: PostgreSQL */
+/* Styles of the placeholder page; an external file because the Content-Security-Policy of kingresd allows no inline style. */
+:root { color-scheme: light dark; --ink: #14171f; --surface: #ffffff; }
+@media (prefers-color-scheme: dark) { :root { --ink: #f1eadb; --surface: #0b0d12; } }
+body {
+  margin: 0; min-height: 100vh; display: grid; place-items: center;
+  background: var(--surface); color: var(--ink);
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+main { max-width: 32rem; padding: 2rem; text-align: center; }
+svg { width: 7rem; height: 7rem; }
+h1 { margin: 0.5rem 0 1rem; font-size: 1.75rem; letter-spacing: 0.02em; }
+code { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; }

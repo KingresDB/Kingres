@@ -1,0 +1,208 @@
+-- Catalog creation, constraints, map_version triggers and GUCs.
+CREATE EXTENSION kingres_shard;
+SELECT c.relname
+  FROM pg_class c
+  WHERE c.relnamespace = 'kingres'::regnamespace AND c.relkind = 'r'
+  ORDER BY 1;
+    relname     
+----------------
+ bucket_map
+ bucket_move
+ cluster_secret
+ colocation
+ dist_table
+ dtx_log
+ local_node
+ map_version
+ move_marker
+ node
+ pending_node
+(11 rows)
+
+SELECT conrelid::regclass AS tbl, conname, contype
+  FROM pg_constraint
+  WHERE connamespace = 'kingres'::regnamespace AND contype <> 'n'
+  ORDER BY 1::text, 2;
+      tbl       |            conname            | contype 
+----------------+-------------------------------+---------
+ bucket_map     | bucket_map_bucket_check       | c
+ bucket_map     | bucket_map_colocation_id_fkey | f
+ bucket_map     | bucket_map_group_id_check     | c
+ bucket_map     | bucket_map_pkey               | p
+ bucket_map     | bucket_map_state_check        | c
+ bucket_move    | bucket_move_groups_check      | c
+ bucket_move    | bucket_move_phase_check       | c
+ bucket_move    | bucket_move_pkey              | p
+ cluster_secret | cluster_secret_length_check   | c
+ colocation     | colocation_bucket_count_check | c
+ colocation     | colocation_pkey               | p
+ dist_table     | dist_table_colocation_id_fkey | f
+ dist_table     | dist_table_method_check       | c
+ dist_table     | dist_table_pkey               | p
+ dist_table     | dist_table_shape_check        | c
+ dtx_log        | dtx_log_pkey                  | p
+ move_marker    | move_marker_pkey              | p
+ node           | node_group_id_check           | c
+ node           | node_host_port_key            | u
+ node           | node_pkey                     | p
+ node           | node_port_check               | c
+ node           | node_role_check               | c
+ pending_node   | pending_node_pkey             | p
+(23 rows)
+
+-- Nothing is created outside the kingres schema.
+SELECT count(*) AS tables_outside_kingres
+  FROM pg_depend d
+  JOIN pg_extension e ON e.oid = d.refobjid AND d.refclassid = 'pg_extension'::regclass
+  JOIN pg_class c ON c.oid = d.objid AND d.classid = 'pg_class'::regclass
+  WHERE e.extname = 'kingres_shard' AND c.relnamespace <> 'kingres'::regnamespace;
+ tables_outside_kingres 
+------------------------
+                      0
+(1 row)
+
+-- The map version starts at zero and every changing statement increments it.
+SELECT version FROM kingres.map_version;
+ version 
+---------
+       0
+(1 row)
+
+INSERT INTO kingres.node (node_id, group_id, host, port, role)
+  VALUES (1, 0, 'a.example', 5432, 'primary'), (2, 1, 'b.example', 5432, 'primary');
+SELECT version FROM kingres.map_version;
+ version 
+---------
+       1
+(1 row)
+
+UPDATE kingres.node SET is_active = false WHERE node_id = 2;
+SELECT version FROM kingres.map_version;
+ version 
+---------
+       2
+(1 row)
+
+INSERT INTO kingres.colocation VALUES (1, 8, 'int4', 0);
+SELECT version FROM kingres.map_version;
+ version 
+---------
+       3
+(1 row)
+
+INSERT INTO kingres.bucket_map (colocation_id, bucket, group_id)
+  SELECT 1, g, g % 2 FROM generate_series(0, 7) g;
+SELECT version FROM kingres.map_version;
+ version 
+---------
+       4
+(1 row)
+
+DELETE FROM kingres.node WHERE node_id = 2;
+SELECT version FROM kingres.map_version;
+ version 
+---------
+       5
+(1 row)
+
+-- A statement that changes no row still counts: the trigger is per statement.
+DELETE FROM kingres.node WHERE node_id = 99;
+SELECT version FROM kingres.map_version;
+ version 
+---------
+       6
+(1 row)
+
+-- Constraints.
+INSERT INTO kingres.node (node_id, group_id, host, port, role)
+  VALUES (3, 0, 'a.example', 5432, 'primary');
+ERROR:  duplicate key value violates unique constraint "node_host_port_key"
+DETAIL:  Key (host, port)=(a.example, 5432) already exists.
+INSERT INTO kingres.node (node_id, group_id, host, port, role)
+  VALUES (3, 0, 'c.example', 5432, 'leader');
+ERROR:  new row for relation "node" violates check constraint "node_role_check"
+DETAIL:  Failing row contains (3, 0, c.example, 5432, leader, t, t, null).
+INSERT INTO kingres.node (node_id, group_id, host, port, role)
+  VALUES (3, -1, 'c.example', 5432, 'primary');
+ERROR:  new row for relation "node" violates check constraint "node_group_id_check"
+DETAIL:  Failing row contains (3, -1, c.example, 5432, primary, t, t, null).
+INSERT INTO kingres.node (node_id, group_id, host, port, role)
+  VALUES (3, 0, 'c.example', 70000, 'primary');
+ERROR:  new row for relation "node" violates check constraint "node_port_check"
+DETAIL:  Failing row contains (3, 0, c.example, 70000, primary, t, t, null).
+INSERT INTO kingres.colocation VALUES (2, 0, 'int4', 0);
+ERROR:  new row for relation "colocation" violates check constraint "colocation_bucket_count_check"
+DETAIL:  Failing row contains (2, 0, integer, 0).
+INSERT INTO kingres.colocation VALUES (2, 4097, 'int4', 0);
+ERROR:  new row for relation "colocation" violates check constraint "colocation_bucket_count_check"
+DETAIL:  Failing row contains (2, 4097, integer, 0).
+INSERT INTO kingres.bucket_map VALUES (9, 0, 0);
+ERROR:  insert or update on table "bucket_map" violates foreign key constraint "bucket_map_colocation_id_fkey"
+DETAIL:  Key (colocation_id)=(9) is not present in table "colocation".
+INSERT INTO kingres.bucket_map VALUES (1, 0, 0);
+ERROR:  duplicate key value violates unique constraint "bucket_map_pkey"
+DETAIL:  Key (colocation_id, bucket)=(1, 0) already exists.
+INSERT INTO kingres.bucket_map VALUES (1, 20, 0, 'broken');
+ERROR:  new row for relation "bucket_map" violates check constraint "bucket_map_state_check"
+DETAIL:  Failing row contains (1, 20, 0, broken).
+INSERT INTO kingres.dist_table VALUES ('pg_class'::regclass, 'range', 'oid', 1);
+ERROR:  new row for relation "dist_table" violates check constraint "dist_table_method_check"
+DETAIL:  Failing row contains (pg_class, range, oid, 1).
+INSERT INTO kingres.dist_table VALUES ('pg_class'::regclass, 'hash', 'oid', 9);
+ERROR:  insert or update on table "dist_table" violates foreign key constraint "dist_table_colocation_id_fkey"
+DETAIL:  Key (colocation_id)=(9) is not present in table "colocation".
+INSERT INTO kingres.map_version VALUES (5);
+ERROR:  duplicate key value violates unique constraint "map_version_single_row_idx"
+DETAIL:  Key ((true))=(t) already exists.
+INSERT INTO kingres.local_node VALUES (1);
+INSERT INTO kingres.local_node VALUES (2);
+ERROR:  duplicate key value violates unique constraint "local_node_single_row_idx"
+DETAIL:  Key ((true))=(t) already exists.
+-- The introspection views.
+SELECT node_id, group_id, is_local FROM kingres.nodes ORDER BY node_id;
+ node_id | group_id | is_local 
+---------+----------+----------
+       1 |        0 | t
+(1 row)
+
+SELECT count(*) AS buckets_of_undistributed_tables FROM kingres.buckets;
+ buckets_of_undistributed_tables 
+---------------------------------
+                               0
+(1 row)
+
+-- The settings the extension defines.
+SELECT name, setting, unit, context
+  FROM pg_settings WHERE name LIKE 'kingres_shard.%' ORDER BY name;
+                 name                  | setting | unit |  context  
+---------------------------------------+---------+------+-----------
+ kingres_shard.default_bucket_count    | 128     |      | user
+ kingres_shard.enable_distributed_scan | on      |      | user
+ kingres_shard.enable_routing          | on      |      | superuser
+ kingres_shard.fault_injection         |         |      | superuser
+ kingres_shard.forwarded               | off     |      | backend
+ kingres_shard.move_catchup_threshold  | 1024    | kB   | user
+ kingres_shard.move_cleanup_delay      | 600     | s    | user
+ kingres_shard.move_switch_attempts    | 20      |      | user
+ kingres_shard.move_switch_timeout     | 10000   | ms   | user
+ kingres_shard.node_connect_timeout    | 5       | s    | user
+ kingres_shard.node_conninfo           |         |      | sighup
+ kingres_shard.node_timeout            | 60      | s    | user
+ kingres_shard.recovery_interval       | 0       | s    | sighup
+ kingres_shard.scan_fetch_size         | 1000    |      | user
+(14 rows)
+
+SET kingres_shard.default_bucket_count = 0;
+ERROR:  0 is outside the valid range for parameter "kingres_shard.default_bucket_count" (1 .. 4096)
+SET kingres_shard.default_bucket_count = 4097;
+ERROR:  4097 is outside the valid range for parameter "kingres_shard.default_bucket_count" (1 .. 4096)
+SET kingres_shard.nonexistent = 1;
+ERROR:  invalid configuration parameter name "kingres_shard.nonexistent"
+DETAIL:  "kingres_shard" is a reserved prefix.
+DROP EXTENSION kingres_shard;
+SELECT count(*) AS schema_left FROM pg_namespace WHERE nspname = 'kingres';
+ schema_left 
+-------------
+           0
+(1 row)
+

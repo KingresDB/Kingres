@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: PostgreSQL
+# Copyright (c) 2026, RooyeKhat Media Co
+#
+# A clean Ubuntu 24.04 with systemd as PID 1, used by test-deb.sh to install
+# the .deb the way an administrator would.  It contains nothing of KingresDB.
+# Same pinned base image as kingres/packaging/docker/Dockerfile.
+ARG UBUNTU_IMAGE=ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5
+FROM ${UBUNTU_IMAGE}
+ENV DEBIAN_FRONTEND=noninteractive container=docker
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends systemd systemd-sysv dbus curl ca-certificates procps \
+ && rm -rf /var/lib/apt/lists/*
+# The base image ships a policy-rc.d that forbids starting services in
+# containers (exit 101); here systemd really runs, so the policy is removed.
+RUN rm -f /usr/sbin/policy-rc.d
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

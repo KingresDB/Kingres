@@ -1,0 +1,172 @@
+/*-------------------------------------------------------------------------
+ *
+ * pg_compat.h
+ *	  The differences between the PostgreSQL majors that kingres_shard
+ *	  builds against (18 and 19), in one place.
+ *
+ * One source builds against every supported major (ADR 0023).  Code outside
+ * this file does not test PG_VERSION_NUM: it uses what this file defines.
+ * Where a name or a signature changed, the definition here is the one the
+ * source uses, with a body for each major.  When a major is dropped, its
+ * branch of each #if goes.
+ *
+ * Every definition says which upstream change it follows.  The header is
+ * included by kingres_shard.h, after postgres.h, so every file has it.
+ *
+ * SPDX-License-Identifier: PostgreSQL
+ * Portions Copyright (c) 2026, RooyeKhat Media Co
+ *
+ * IDENTIFICATION
+ *	  contrib/kingres_shard/src/pg_compat.h
+ *
+ *-------------------------------------------------------------------------
+ */
+#ifndef KINGRES_SHARD_PG_COMPAT_H
+#define KINGRES_SHARD_PG_COMPAT_H
+
+/*
+ * INT_MAX and friends: PostgreSQL 19's utils/guc.h still uses INT_MAX
+ * (MAX_KILOBYTES) but no longer brings in <limits.h> for it.
+ */
+#include <limits.h>
+
+#include "access/tableam.h"
+#include "nodes/parsenodes.h"
+#include "nodes/plannodes.h"
+#include "optimizer/planner.h"
+#include "utils/lsyscache.h"
+
+/*
+ * The libpq header for backend code.  PostgreSQL 19 turns libpq use in the
+ * backend into a wrapper API: libpq/libpq-be-fe.h defines PGresult, PQclear,
+ * PQntuples and the other result functions as libpqsrv_ versions that act on
+ * a result wrapped in a memory-context-safe object.  Every file that touches
+ * a result must see the same definitions, or a wrapped result is read as a
+ * plain one (the first file to include libpq-be-fe-helpers.h after
+ * libpq-fe.h is not enough); node_conn.h gets this header from here, and
+ * every file that uses libpq includes node_conn.h.  On 18 the plain header is
+ * the one.
+ */
+#if PG_VERSION_NUM >= 190000
+#include "libpq/libpq-be-fe.h"
+#else
+#include "libpq-fe.h"
+#endif
+
+/*
+ * get_database_name() is declared in utils/lsyscache.h from PostgreSQL 19 on
+ * (it was in commands/dbcommands.h); including lsyscache.h here gives both
+ * majors the declaration.
+ */
+
+/*
+ * KS_TABLE_BEGINSCAN
+ *		Start a heap scan with the default options.  PostgreSQL 19 gives
+ *		table_beginscan() a "flags" argument (a bitmask of ScanOptions).
+ */
+#if PG_VERSION_NUM >= 190000
+#define KS_TABLE_BEGINSCAN(rel, snapshot, nkeys, key) \
+	table_beginscan((rel), (snapshot), (nkeys), (key), 0)
+#else
+#define KS_TABLE_BEGINSCAN(rel, snapshot, nkeys, key) \
+	table_beginscan((rel), (snapshot), (nkeys), (key))
+#endif
+
+
+/*
+ * The statement that CLUSTER becomes.  PostgreSQL 19 replaces ClusterStmt by
+ * RepackStmt, which also stands for the new REPACK command (CLUSTER and
+ * REPACK need the same guard: both rewrite the table of this node).
+ * VACUUM FULL is still a VacuumStmt.  The relation is NULL when the
+ * statement names none.
+ */
+#if PG_VERSION_NUM >= 190000
+#define KS_T_CLUSTER_STMT T_RepackStmt
+
+static inline RangeVar *
+ks_cluster_stmt_relation(Node *parsetree)
+{
+	RepackStmt *stmt = (RepackStmt *) parsetree;
+
+	return stmt->relation ? stmt->relation->relation : NULL;
+}
+#else
+#define KS_T_CLUSTER_STMT T_ClusterStmt
+
+static inline RangeVar *
+ks_cluster_stmt_relation(Node *parsetree)
+{
+	return ((ClusterStmt *) parsetree)->relation;
+}
+#endif
+
+/*
+ * The planner hook of PostgreSQL 19 gets the ExplainState of an EXPLAIN as a
+ * fifth argument (NULL for other statements), and standard_planner() takes
+ * it too.  The hook keeps it for the call to the next planner in the chain
+ * (KS_PLANNER_ES_ARG); on 18 there is no such argument and the macros vanish.
+ */
+#if PG_VERSION_NUM >= 190000
+#define KS_PLANNER_ES_PARAM , ExplainState *es
+#define KS_PLANNER_ES_VALUE (es)
+#define KS_PLANNER_ES_ARG(saved) , (ExplainState *) (saved)
+#else
+#define KS_PLANNER_ES_PARAM
+#define KS_PLANNER_ES_VALUE NULL
+#define KS_PLANNER_ES_ARG(saved)
+#endif
+
+/*
+ * KS_CLEAR_RESULT_RELATIONS
+ *		Say that a PlannedStmt has no result relations.  PostgreSQL 19
+ *		replaces the list of range table indexes PlannedStmt.resultRelations
+ *		by the set resultRelationRelids.
+ */
+#if PG_VERSION_NUM >= 190000
+#define KS_CLEAR_RESULT_RELATIONS(pstmt) ((pstmt)->resultRelationRelids = NULL)
+#else
+#define KS_CLEAR_RESULT_RELATIONS(pstmt) ((pstmt)->resultRelations = NIL)
+#endif
+
+/*
+ * ks_result_relations
+ *		The range table indexes of the relations a PlannedStmt writes (NIL for
+ *		a read-only plan), as an integer list.  PostgreSQL 19 keeps them as the
+ *		set PlannedStmt.resultRelationRelids instead of the list resultRelations.
+ */
+#if PG_VERSION_NUM >= 190000
+static inline List *
+ks_result_relations(PlannedStmt *pstmt)
+{
+	List	   *rels = NIL;
+	int			rti = -1;
+
+	while ((rti = bms_next_member(pstmt->resultRelationRelids, rti)) >= 0)
+		rels = lappend_int(rels, rti);
+	return rels;
+}
+#else
+#define ks_result_relations(pstmt) ((pstmt)->resultRelations)
+#endif
+
+/*
+ * The type of the notice receiver that is given to PQsetNoticeReceiver().
+ * PostgreSQL 19's libpq-be-fe-helpers.h redefines the name PGresult as the
+ * wrapper libpqsrv_PGresult, but libpq calls a receiver with the real one;
+ * "struct pg_result" is the real one on every major.
+ */
+typedef struct pg_result KsRawResult;
+
+/*
+ * Who frees a libpq result?  On 18 the code that got it, with PQclear().  On
+ * 19 the wrapper object of libpq-be-fe.h also frees it, when the memory
+ * context it was made in is reset or deleted, so a reset callback that
+ * clears results (dist_scan.c) would clear them a second time.
+ */
+#if PG_VERSION_NUM >= 190000
+#define KS_LIBPQ_RESULTS_OWNED_BY_CONTEXT true
+#else
+#define KS_LIBPQ_RESULTS_OWNED_BY_CONTEXT false
+#endif
+
+#endif							/* KINGRES_SHARD_PG_COMPAT_H */

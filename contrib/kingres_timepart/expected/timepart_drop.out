@@ -1,0 +1,89 @@
+-- timepart_drop: what DROP EXTENSION removes and what it leaves.  It removes
+-- the event triggers, the tables with the policies and the history, and the
+-- functions; it leaves the schema kingres (the extension did not create it as
+-- one of its members, so that the extensions that share it do not remove it
+-- from each other) and every partition and table of the users.
+--
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+-- SPDX-License-Identifier: PostgreSQL
+SET timezone = 'UTC';
+SET datestyle = ISO;
+SET intervalstyle = postgres;
+\set VERBOSITY default
+\set SHOW_CONTEXT never
+SELECT (SELECT count(*) FROM kingres.timepart_policy) > 0 AS had_policies,
+       (SELECT count(*) FROM kingres.timepart_run) > 0 AS had_history;
+ had_policies | had_history 
+--------------+-------------
+ t            | t
+(1 row)
+
+CREATE TABLE tp.dropme (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.create_time_partitions('tp.dropme', '1 day', '2026-03-03 UTC', '2026-03-01 UTC');
+ create_time_partitions 
+------------------------
+                      3
+(1 row)
+
+SET client_min_messages = warning;
+DROP EXTENSION kingres_timepart;
+RESET client_min_messages;
+SELECT count(*) AS event_triggers FROM pg_event_trigger WHERE evtname LIKE 'kingres_timepart%';
+ event_triggers 
+----------------
+              0
+(1 row)
+
+SELECT count(*) AS tables_left FROM pg_class WHERE relnamespace = 'kingres'::regnamespace AND relname LIKE 'timepart%';
+ tables_left 
+-------------
+           0
+(1 row)
+
+SELECT count(*) AS functions_left FROM pg_proc WHERE pronamespace = 'kingres'::regnamespace AND proname LIKE '%timepart%';
+ functions_left 
+----------------
+              0
+(1 row)
+
+SELECT count(*) AS functions_left FROM pg_proc WHERE pronamespace = 'kingres'::regnamespace AND proname IN ('create_time_partitions', 'drop_old_time_partitions', 'convert_partition');
+ functions_left 
+----------------
+              0
+(1 row)
+
+SELECT to_regnamespace('kingres') IS NOT NULL AS schema_left;
+ schema_left 
+-------------
+ t
+(1 row)
+
+SELECT count(*) AS partitions_kept FROM pg_inherits WHERE inhparent = 'tp.dropme'::regclass;
+ partitions_kept 
+-----------------
+               3
+(1 row)
+
+-- A new install starts empty and works on the tables that are still there.
+CREATE EXTENSION kingres_timepart;
+SELECT count(*) AS policies FROM kingres.timepart_policy;
+ policies 
+----------
+        0
+(1 row)
+
+SELECT kingres.timepart_set_policy('tp.dropme', '1 day', create_ahead => '1 day');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+\o /dev/null
+CALL kingres.timepart_run('tp.dropme', '2026-03-03 UTC');
+\o
+SELECT state FROM kingres.timepart_run;
+ state 
+-------
+ done
+(1 row)
+

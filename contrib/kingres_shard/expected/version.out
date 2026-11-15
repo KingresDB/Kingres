@@ -1,0 +1,48 @@
+-- Core patch KP-0001: the product version is visible next to the PostgreSQL
+-- version, without changing any PostgreSQL version symbol.
+CREATE EXTENSION kingres_shard;
+SELECT version() ~ '^PostgreSQL ' AS starts_with_postgresql;
+ starts_with_postgresql 
+------------------------
+ t
+(1 row)
+
+SELECT version() ~ ' \(KingresDB [0-9]+\.[0-9]+\.[0-9]+\)$' AS ends_with_kingresdb_version;
+ ends_with_kingresdb_version 
+-----------------------------
+ t
+(1 row)
+
+SELECT kingres.version() ~ '^[0-9]+\.[0-9]+\.[0-9]+$' AS version_has_three_parts;
+ version_has_three_parts 
+-------------------------
+ t
+(1 row)
+
+SELECT kingres.version() =
+       substring(version() from '\(KingresDB ([0-9]+\.[0-9]+\.[0-9]+)\)$')
+       AS same_version_as_in_version_function;
+ same_version_as_in_version_function 
+-------------------------------------
+ t
+(1 row)
+
+SELECT current_setting('server_version') !~* 'kingres' AS server_version_has_no_kingres;
+ server_version_has_no_kingres 
+-------------------------------
+ t
+(1 row)
+
+SELECT current_setting('server_version') ~ '^(18|19)(\.|beta|rc)' AS server_version_is_supported_major;
+ server_version_is_supported_major 
+-----------------------------------
+ t
+(1 row)
+
+SELECT current_setting('server_version_num')::int BETWEEN 180000 AND 199999 AS server_version_num_unchanged;
+ server_version_num_unchanged 
+------------------------------
+ t
+(1 row)
+
+DROP EXTENSION kingres_shard;

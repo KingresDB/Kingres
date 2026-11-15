@@ -1,0 +1,31 @@
+-- sketch_setup: install the extension; check where it lives and the
+-- self-test line that is compared between nodes.
+CREATE EXTENSION kingres_sketch;
+SELECT e.extname, e.extversion, n.nspname, e.extrelocatable
+  FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
+ WHERE e.extname = 'kingres_sketch';
+    extname     | extversion |    nspname     | extrelocatable 
+----------------+------------+----------------+----------------
+ kingres_sketch | 1.0        | kingres_sketch | f
+(1 row)
+
+SET search_path = public, kingres_sketch;
+SELECT self_test();
+                                                                                                                     self_test                                                                                                                     
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ kingres_sketch 1.0 format=1 int2=ed7199df38f813d4 int4=322e1c20d866444c int8=bba1ccdc4a06f172 bool=7afa445da7ac7b47 float8=9ca066f1a4ab2eea text=ee5fdfbf955473b7 numeric=2b2f8ad3c58d98dc uuid=62a6d07f4e6a4298 int4[]=5673c0792a1cb32f hll=1007
+(1 row)
+
+-- the three types and the casts to bytea
+SELECT t.typname, t.typlen, t.typstorage
+  FROM pg_type t
+ WHERE t.typnamespace = 'kingres_sketch'::regnamespace AND t.typtype = 'b'
+   AND t.typname IN ('hll', 'topn', 'tdigest')
+ ORDER BY t.typname;
+ typname | typlen | typstorage 
+---------+--------+------------
+ hll     |     -1 | x
+ tdigest |     -1 | x
+ topn    |     -1 | x
+(3 rows)
+

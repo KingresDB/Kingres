@@ -1,0 +1,333 @@
+// SPDX-License-Identifier: PostgreSQL
+// Copyright (c) 2026, RooyeKhat Media Co
+//
+// How each status in the API looks: a tone (colour), an icon glyph and a text label. Status is never
+// shown by colour alone; the badge always renders icon and label.
+import type {
+  AlertKind,
+  AlertSeverity,
+  AuditAction,
+  GroupLease,
+  TaskKind,
+  ServerStatus,
+  TaskState,
+  Instance,
+  LedgerVerification,
+  ShardGroup,
+  ReplicationMember,
+  Database,
+  ClusterOverview,
+} from '@/api/types'
+import { safeText } from './safe-text'
+
+/**
+ * A status map that does not break on a value the panel does not know (a newer server can add one:
+ * 0.5.0 added members to enums). An unknown value gets a neutral badge that says so and shows the
+ * value, with hidden characters made visible.
+ */
+export function tolerant<T extends Record<string, StatusMeta>>(map: T): T {
+  return new Proxy(map, {
+    get(target, key, receiver) {
+      if (typeof key !== 'string') return Reflect.get(target, key, receiver)
+      const known = (target as Record<string, StatusMeta | undefined>)[key]
+      if (known) return known
+      // Names of Object.prototype members (toString, ...) are not statuses either.
+      return {
+        tone: 'neutral',
+        icon: '?',
+        label: `Unknown (${safeText(key, 40)})`,
+      } satisfies StatusMeta
+    },
+  })
+}
+
+export type Tone = 'ok' | 'warn' | 'danger' | 'info' | 'neutral'
+
+export interface StatusMeta {
+  tone: Tone
+  icon: string
+  label: string
+  /** Longer explanation, shown as the tooltip of the badge (and in the text near it where there is room). */
+  hint?: string
+}
+
+const OK = '✓' // check
+const WARN = '▲' // triangle
+const BAD = '✖' // heavy x
+const INFO = 'ⓘ' // circled i
+const DOT = '●' // filled circle
+const RING = '○' // empty circle
+const HALF = '◐' // half circle
+const CLOCK = '⏳' // hourglass
+
+export const SERVER_STATUS: Record<ServerStatus, StatusMeta> = tolerant({
+  live: { tone: 'ok', icon: OK, label: 'LIVE' },
+  suspect: {
+    tone: 'warn',
+    icon: WARN,
+    label: 'SUSPECT',
+    hint: 'The server that answered has heard no heartbeat from this server for the suspect timeout (5 seconds by default). It is live again as soon as it is heard.',
+  },
+  draining: { tone: 'info', icon: HALF, label: 'DRAINING' },
+  decommissioning: { tone: 'info', icon: HALF, label: 'DECOMMISSIONING' },
+  dead: {
+    tone: 'danger',
+    icon: BAD,
+    label: 'DEAD',
+    hint: 'No heartbeat for the failure timeout (10 seconds by default), as the server that answered sees it. It is live again as soon as it is heard.',
+  },
+  pendingRebalance: {
+    tone: 'info',
+    icon: CLOCK,
+    label: 'PENDING REBALANCE',
+    hint: 'The server should hold shards, is the primary of no bucket yet, and buckets exist: a rebalance has to give it data.',
+  },
+})
+
+export const TASK_STATE: Record<TaskState, StatusMeta> = tolerant({
+  pending: { tone: 'neutral', icon: RING, label: 'Pending' },
+  running: { tone: 'info', icon: HALF, label: 'Running' },
+  paused: { tone: 'warn', icon: WARN, label: 'Paused' },
+  failed: { tone: 'danger', icon: BAD, label: 'Failed' },
+  done: { tone: 'ok', icon: OK, label: 'Done' },
+})
+
+export const SEVERITY: Record<AlertSeverity, StatusMeta> = tolerant({
+  info: { tone: 'info', icon: INFO, label: 'Info' },
+  warning: { tone: 'warn', icon: WARN, label: 'Warning' },
+  critical: { tone: 'danger', icon: BAD, label: 'Critical' },
+})
+
+export const HEALTH: Record<ClusterOverview['health'], StatusMeta> = tolerant({
+  healthy: { tone: 'ok', icon: OK, label: 'Healthy' },
+  degraded: { tone: 'warn', icon: WARN, label: 'Degraded' },
+  critical: { tone: 'danger', icon: BAD, label: 'Critical' },
+})
+
+export const GROUP_HEALTH: Record<ShardGroup['health'], StatusMeta> = tolerant({
+  healthy: { tone: 'ok', icon: OK, label: 'Healthy' },
+  degraded: { tone: 'warn', icon: WARN, label: 'Degraded' },
+  unavailable: { tone: 'danger', icon: BAD, label: 'Unavailable' },
+})
+
+export const INSTANCE_STATE: Record<Instance['state'], StatusMeta> = tolerant({
+  running: { tone: 'ok', icon: DOT, label: 'Running' },
+  starting: { tone: 'info', icon: HALF, label: 'Starting' },
+  stopping: { tone: 'info', icon: HALF, label: 'Stopping' },
+  restarting: { tone: 'info', icon: HALF, label: 'Restarting' },
+  stopped: { tone: 'neutral', icon: RING, label: 'Stopped' },
+  failed: { tone: 'danger', icon: BAD, label: 'Failed' },
+})
+
+export const SERVICE_STATE: Record<'running' | 'stopped' | 'degraded' | 'disabled', StatusMeta> =
+  tolerant({
+    running: { tone: 'ok', icon: DOT, label: 'Running' },
+    stopped: { tone: 'danger', icon: BAD, label: 'Stopped' },
+    degraded: { tone: 'warn', icon: WARN, label: 'Degraded' },
+    disabled: { tone: 'neutral', icon: RING, label: 'Disabled' },
+  })
+
+export const SYNC_STATE: Record<NonNullable<ReplicationMember['syncState']>, StatusMeta> = tolerant(
+  {
+    sync: { tone: 'ok', icon: OK, label: 'Sync' },
+    quorum: { tone: 'ok', icon: OK, label: 'Quorum' },
+    potential: { tone: 'info', icon: HALF, label: 'Potential' },
+    async: { tone: 'neutral', icon: RING, label: 'Async' },
+  },
+)
+
+export const DATABASE_STATUS: Record<Database['status'], StatusMeta> = tolerant({
+  ready: { tone: 'ok', icon: OK, label: 'Ready' },
+  creating: { tone: 'info', icon: HALF, label: 'Creating' },
+  dropping: { tone: 'info', icon: HALF, label: 'Dropping' },
+  failed: { tone: 'danger', icon: BAD, label: 'Failed' },
+})
+
+export const LEDGER_STATE: Record<LedgerVerification['state'], StatusMeta> = tolerant({
+  never: { tone: 'neutral', icon: RING, label: 'Never verified' },
+  running: { tone: 'info', icon: HALF, label: 'Verifying' },
+  // A summary (database list, status) does not say which shard groups the last check covered, so it never claims
+  // a verified database: the verification itself says (see lib/ledger-coverage.ts).
+  passed: { tone: 'info', icon: OK, label: 'Last check passed' },
+  failed: { tone: 'danger', icon: BAD, label: 'Inconsistent' },
+})
+
+export const DURABILITY_LABEL = {
+  async: 'Asynchronous',
+  sync: 'Synchronous (quorum)',
+  syncApply: 'Synchronous with apply',
+} as const
+
+export const LEDGER_MODE_LABEL = {
+  off: 'Off',
+  optIn: 'Opt-in per table',
+  appendOnly: 'On by default, append-only',
+  updatable: 'On by default, updatable',
+} as const
+
+export const REBALANCE_REASON_LABEL = {
+  serverAdded: 'A server was added',
+  serverRemoved: 'A server was removed',
+  replicaCountChanged: 'The replica count changed',
+  replicasMissing: 'Some replicas are missing',
+  skewed: 'Buckets are unevenly spread',
+  serverGroupChanged: 'A server group changed',
+} as const
+
+/** What each kind of alert means, in plain words. One entry per `AlertKind` of the contract. */
+export const ALERT_KIND_LABEL: Record<AlertKind, string> = {
+  serverDown: 'Server down',
+  serverSuspect: 'Server not answering',
+  underReplicatedBuckets: 'Buckets with too few copies',
+  unavailableBuckets: 'Buckets unavailable',
+  replicationLagHigh: 'Replication lag high',
+  diskSpaceLow: 'Disk space low',
+  memoryPressure: 'Memory pressure',
+  rebalanceNeeded: 'Rebalance needed',
+  autoFailoverTriggered: 'Automatic failover happened',
+  autoFailoverLimitReached: 'Automatic failover limit reached',
+  mapGroupUnavailable: 'Map group unavailable',
+  ledgerVerificationFailed: 'Ledger verification failed',
+  ledgerPendingTooOld: 'Ledger entries waiting too long for a block',
+  versionMismatch: 'Servers run different versions',
+  certificateExpiring: 'Server certificate expiring',
+  certificateRenewalFailed: 'Certificate renewal failed',
+  replicationPending: 'A change has not reached a server yet',
+  taskFailed: 'Task failed',
+  leaseLost: 'Primary lost its lease',
+  groupWithoutSynchronousStandby: 'Commits no longer wait for a standby',
+  groupUnderReplicated: 'Shard group has too few standbys',
+}
+
+/** The label of an alert kind; a kind from a newer server is shown as sent (through SafeName). */
+export function alertKindLabel(kind: string): string {
+  return (ALERT_KIND_LABEL as Record<string, string>)[kind] ?? kind
+}
+
+/** What each task kind does, in plain words. One entry per `TaskKind` of the contract. */
+export const TASK_KIND_LABEL: Record<TaskKind, string> = {
+  'cluster.init': 'Create the cluster',
+  'cluster.join': 'Join a cluster',
+  'server.add': 'Add a server',
+  'server.remove': 'Remove a server',
+  'server.failover': 'Fail over a server',
+  'server.leave': 'Leave the cluster',
+  'instance.start': 'Start an instance',
+  'instance.stop': 'Stop an instance',
+  'instance.restart': 'Restart an instance',
+  'database.create': 'Create a database',
+  'database.update': 'Change a database',
+  'database.drop': 'Drop a database',
+  'table.distribute': 'Distribute a table',
+  rebalance: 'Rebalance',
+  'replication.restorePreferredPrimaries': 'Restore preferred primaries',
+  'ledger.verify': 'Verify the ledger',
+  'networkAccess.apply': 'Apply network rules',
+  'replicate.apply': 'Bring a server up to date (roles, grants)',
+  'certificate.renew': 'Renew server certificates',
+  'certificate.revoke': 'Revoke server certificates',
+  'standby.reconcile': 'Add or remove standbys',
+}
+
+/** The label of a task kind; a kind from a newer server is shown as sent (through SafeName). */
+export function taskKindLabel(kind: string): string {
+  return (TASK_KIND_LABEL as Record<string, string>)[kind] ?? kind
+}
+
+/**
+ * A sentence for the kinds that need one beyond their label. `replicationPending` (0.6.0): until the change
+ * reaches the server, an account that was disabled, changed or dropped may still work there.
+ */
+const ALERT_KIND_HINT: Partial<Record<AlertKind, string>> = {
+  leaseLost:
+    'The server that runs the primary of this shard group could not renew the lease of the group in time. If the group has a standby, the primary was stopped on purpose, so that two primaries can never run for one group; it starts again when the lease is obtained again. If the group has no standby, the primary keeps running and this alert is the only effect.',
+  groupWithoutSynchronousStandby:
+    'The standby of this shard group has been unreachable for longer than the grace period, so the primary no longer waits for it: a commit is acknowledged by one server only and is lost if that server is lost. The wait comes back as soon as a standby streams again.',
+  groupUnderReplicated:
+    'Fewer standbys stream for this shard group than the cluster replica count asks for. Standbys are added by the standby check; a group never has two instances on one server, so a small cluster allows fewer.',
+  serverSuspect:
+    'The manager leader has heard no heartbeat from this server for the suspect timeout (5 seconds by default). The alert clears when the server is heard again.',
+  serverDown:
+    'No heartbeat from this server for the failure timeout (10 seconds by default), or its instance does not run. A server that is heard again is live again.',
+  replicationPending:
+    'The leader is still waiting to hand a change of roles, grants or settings to a server it could not reach. Until it arrives, a role that was disabled, changed or dropped may still work on that server.',
+}
+
+/** The extra sentence for an alert kind, or null. */
+export function alertKindHint(kind: string): string | null {
+  return (ALERT_KIND_HINT as Record<string, string | undefined>)[kind] ?? null
+}
+
+/** How the state of a shard group lease looks (contract 0.7.0). */
+export const LEASE_STATE: Record<GroupLease['state'], StatusMeta> = tolerant({
+  held: { tone: 'ok', icon: OK, label: 'Lease held' },
+  granted: { tone: 'info', icon: INFO, label: 'Lease granted' },
+  lost: { tone: 'danger', icon: BAD, label: 'Lease lost' },
+  none: { tone: 'neutral', icon: RING, label: 'No lease' },
+})
+
+/** What each audit action means, in plain words. One entry per `AuditAction` of the contract. */
+export const AUDIT_ACTION_LABEL: Record<AuditAction, string> = {
+  login: 'Sign in',
+  logout: 'Sign out',
+  loginFailed: 'Failed sign-in',
+  setupTokenRejected: 'Setup token rejected',
+  initCluster: 'Create the cluster',
+  joinCluster: 'Join a cluster',
+  updateThisServerSettings: 'Change the settings of a server',
+  restartThisServerInstance: 'Restart an instance',
+  stopThisServerInstance: 'Stop an instance',
+  startThisServerInstance: 'Start an instance',
+  leaveCluster: 'Leave the cluster',
+  addServer: 'Add a server',
+  updateServer: 'Change a server',
+  removeServer: 'Remove a server',
+  failoverServer: 'Fail over a server',
+  autoFailover: 'Automatic failover',
+  createServerGroup: 'Create a server group',
+  deleteServerGroup: 'Delete a server group',
+  createDatabase: 'Create a database',
+  updateDatabase: 'Change a database',
+  dropDatabase: 'Drop a database',
+  distributeTable: 'Distribute a table',
+  enableTableLedger: 'Enable the ledger of a table',
+  restorePreferredPrimaries: 'Restore preferred primaries',
+  startRebalance: 'Start a rebalance',
+  stopRebalance: 'Stop a rebalance',
+  cancelTask: 'Cancel a task',
+  createRole: 'Create a role',
+  updateRole: 'Change a role',
+  deleteRole: 'Delete a role',
+  setRoleMemberships: 'Set role memberships',
+  setRoleClusterRoles: 'Set cluster roles of a role',
+  createGrant: 'Grant privileges',
+  revokeGrants: 'Revoke privileges',
+  applyGrantTemplate: 'Apply a grant template',
+  replaceNetworkAccess: 'Replace the network rules',
+  updateClusterSettings: 'Change the cluster settings',
+  generateLedgerDigest: 'Generate a ledger digest',
+  startLedgerVerification: 'Start a ledger verification',
+  executeQuery: 'Run a workbench statement',
+  acknowledgeAlert: 'Acknowledge an alert',
+  renewServerCertificates: 'Renew server certificates',
+  revokeServerCertificates: 'Revoke server certificates',
+  certificateRenewed: 'Certificates renewed by the server',
+  certificateRenewalFailed: 'Certificate renewal failed',
+  cancelStatement: 'Cancel a workbench statement',
+  leaseLost: 'Shard group lease lost',
+  leaseFenced: 'Primary stopped because its lease was lost',
+  leaseAcquired: 'Shard group lease obtained',
+  standbyCreated: 'Standby created',
+  standbyRemoved: 'Standby removed',
+  standbyRebuilt: 'Standby rebuilt',
+  standbyInstanceStarted: 'Standby instance started',
+  standbyInstanceRemoved: 'Standby instance removed',
+  standbyInstanceRebuilt: 'Standby instance rebuilt',
+  synchronousStandbyNamesChanged: 'Synchronous standby list changed',
+  replicationSlotDropped: 'Replication slot dropped',
+}
+
+/** The words for an audit action; an action from a newer server is shown as sent. */
+export function auditActionLabel(action: string): string {
+  return (AUDIT_ACTION_LABEL as Record<string, string>)[action] ?? action
+}

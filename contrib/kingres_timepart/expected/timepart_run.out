@@ -1,0 +1,905 @@
+-- timepart_run: runs with a clock under the test's control: creation ahead,
+-- idempotence, interrupted and repeated runs, name conflicts, partitions
+-- made by hand, a default partition with rows, the conversion step without
+-- kingres_columnar, daylight saving, naive keys, failed runs, history.
+--
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+-- SPDX-License-Identifier: PostgreSQL
+SET timezone = 'UTC';
+SET datestyle = ISO;
+SET intervalstyle = postgres;
+\set VERBOSITY default
+\set SHOW_CONTEXT never
+-- A first run: partitions from the cell of as_of to three days ahead.
+CREATE TABLE tp.r1 (id int, ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.timepart_set_policy('tp.r1', '1 day', create_ahead => '3 days', retention => '5 days', run_every => '1 hour');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+\o /dev/null
+CALL kingres.timepart_run('tp.r1', '2026-03-10 05:30 UTC');
+\o
+SELECT * FROM tp.last_run('tp', 'r1');
+ state | trigger | error 
+-------+---------+-------
+ done  | sql     | 
+(1 row)
+
+SELECT * FROM tp.last_actions('tp', 'r1');
+  kind  | partition_name | state | detail 
+--------+----------------+-------+--------
+ create | r1_p20260310   | done  | 
+ create | r1_p20260311   | done  | 
+ create | r1_p20260312   | done  | 
+ create | r1_p20260313   | done  | 
+(4 rows)
+
+SELECT * FROM tp.parts('tp.r1');
+     part     |                            bounds                             
+--------------+---------------------------------------------------------------
+ r1_p20260310 | FROM ('2026-03-10 00:00:00+00') TO ('2026-03-11 00:00:00+00')
+ r1_p20260311 | FROM ('2026-03-11 00:00:00+00') TO ('2026-03-12 00:00:00+00')
+ r1_p20260312 | FROM ('2026-03-12 00:00:00+00') TO ('2026-03-13 00:00:00+00')
+ r1_p20260313 | FROM ('2026-03-13 00:00:00+00') TO ('2026-03-14 00:00:00+00')
+(4 rows)
+
+SELECT * FROM tp.gaps('tp.r1');
+ gap_from | gap_to 
+----------+--------
+(0 rows)
+
+-- The run's own columns, and the next run time computed from as_of.
+SELECT r.as_of, r.trigger, r.state, r.finished_at IS NOT NULL AS finished, r.error
+  FROM kingres.timepart_run r WHERE r.table_name = 'r1';
+         as_of          | trigger | state | finished | error 
+------------------------+---------+-------+----------+-------
+ 2026-03-10 05:30:00+00 | sql     | done  | t        | 
+(1 row)
+
+SELECT next_run_at FROM kingres.timepart_policy WHERE table_name = 'r1';
+      next_run_at       
+------------------------
+ 2026-03-10 06:30:00+00
+(1 row)
+
+SELECT * FROM kingres.timepart_due('2026-03-10 06:29 UTC') WHERE table_name = 'r1';
+ schema_name | table_name | as_of 
+-------------+------------+-------
+(0 rows)
+
+SELECT * FROM kingres.timepart_due('2026-03-10 06:30 UTC') WHERE table_name = 'r1';
+ schema_name | table_name |         as_of          
+-------------+------------+------------------------
+ tp          | r1         | 2026-03-10 06:30:00+00
+(1 row)
+
+-- The same run again does nothing: the plan is empty.
+SELECT count(*) AS planned FROM kingres.timepart_plan('tp.r1', '2026-03-10 05:30 UTC');
+ planned 
+---------
+       0
+(1 row)
+
+\o /dev/null
+CALL kingres.timepart_run('tp.r1', '2026-03-10 05:30 UTC');
+\o
+SELECT * FROM tp.last_run('tp', 'r1');
+ state | trigger | error 
+-------+---------+-------
+ done  | sql     | 
+(1 row)
+
+SELECT count(*) AS actions FROM tp.last_actions('tp', 'r1');
+ actions 
+---------
+       0
+(1 row)
+
+SELECT count(*) AS partitions FROM tp.parts('tp.r1');
+ partitions 
+------------
+          4
+(1 row)
+
+-- Two days later: new partitions, and the old ones retired.
+\o /dev/null
+CALL kingres.timepart_run('tp.r1', '2026-03-12 23:30 UTC');
+\o
+SELECT * FROM tp.last_actions('tp', 'r1');
+  kind  | partition_name | state | detail 
+--------+----------------+-------+--------
+ create | r1_p20260314   | done  | 
+ create | r1_p20260315   | done  | 
+(2 rows)
+
+SELECT * FROM tp.parts('tp.r1');
+     part     |                            bounds                             
+--------------+---------------------------------------------------------------
+ r1_p20260310 | FROM ('2026-03-10 00:00:00+00') TO ('2026-03-11 00:00:00+00')
+ r1_p20260311 | FROM ('2026-03-11 00:00:00+00') TO ('2026-03-12 00:00:00+00')
+ r1_p20260312 | FROM ('2026-03-12 00:00:00+00') TO ('2026-03-13 00:00:00+00')
+ r1_p20260313 | FROM ('2026-03-13 00:00:00+00') TO ('2026-03-14 00:00:00+00')
+ r1_p20260314 | FROM ('2026-03-14 00:00:00+00') TO ('2026-03-15 00:00:00+00')
+ r1_p20260315 | FROM ('2026-03-15 00:00:00+00') TO ('2026-03-16 00:00:00+00')
+(6 rows)
+
+SELECT * FROM tp.gaps('tp.r1');
+ gap_from | gap_to 
+----------+--------
+(0 rows)
+
+-- A long pause: the table catches up from the last partition; the cells in
+-- between are older than the retention boundary and are not created.
+\o /dev/null
+CALL kingres.timepart_run('tp.r1', '2026-06-01 12:00 UTC');
+\o
+SELECT * FROM tp.last_actions('tp', 'r1') WHERE kind = 'create';
+  kind  | partition_name | state | detail 
+--------+----------------+-------+--------
+ create | r1_p20260527   | done  | 
+ create | r1_p20260528   | done  | 
+ create | r1_p20260529   | done  | 
+ create | r1_p20260530   | done  | 
+ create | r1_p20260531   | done  | 
+ create | r1_p20260601   | done  | 
+ create | r1_p20260602   | done  | 
+ create | r1_p20260603   | done  | 
+ create | r1_p20260604   | done  | 
+(9 rows)
+
+SELECT kind, count(*) FROM tp.last_actions('tp', 'r1') GROUP BY kind ORDER BY kind;
+  kind  | count 
+--------+-------
+ create |     9
+ drop   |     6
+(2 rows)
+
+SELECT * FROM tp.parts('tp.r1');
+     part     |                            bounds                             
+--------------+---------------------------------------------------------------
+ r1_p20260527 | FROM ('2026-05-27 00:00:00+00') TO ('2026-05-28 00:00:00+00')
+ r1_p20260528 | FROM ('2026-05-28 00:00:00+00') TO ('2026-05-29 00:00:00+00')
+ r1_p20260529 | FROM ('2026-05-29 00:00:00+00') TO ('2026-05-30 00:00:00+00')
+ r1_p20260530 | FROM ('2026-05-30 00:00:00+00') TO ('2026-05-31 00:00:00+00')
+ r1_p20260531 | FROM ('2026-05-31 00:00:00+00') TO ('2026-06-01 00:00:00+00')
+ r1_p20260601 | FROM ('2026-06-01 00:00:00+00') TO ('2026-06-02 00:00:00+00')
+ r1_p20260602 | FROM ('2026-06-02 00:00:00+00') TO ('2026-06-03 00:00:00+00')
+ r1_p20260603 | FROM ('2026-06-03 00:00:00+00') TO ('2026-06-04 00:00:00+00')
+ r1_p20260604 | FROM ('2026-06-04 00:00:00+00') TO ('2026-06-05 00:00:00+00')
+(9 rows)
+
+-- A run in pieces, and a run that stopped half way: begin and the create
+-- phase only; the next run (in this session, which still holds the lock of
+-- the unfinished one) marks it interrupted and does what is left.
+CREATE TABLE tp.r2 (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.timepart_set_policy('tp.r2', '1 day', create_ahead => '2 days', retention => '3 days');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+SELECT kingres.create_time_partitions('tp.r2', '1 day', '2026-03-10 00:00 UTC', '2026-03-09 00:00 UTC');
+ create_time_partitions 
+------------------------
+                      2
+(1 row)
+
+SELECT kingres.timepart_begin_run('tp.r2', '2026-03-10 12:00 UTC', 'manual') AS run_id \gset first_
+CALL kingres.timepart_run_phase(:first_run_id, 'create');
+SELECT state, finished_at IS NULL AS open FROM kingres.timepart_run WHERE run_id = :first_run_id;
+  state  | open 
+---------+------
+ running | t
+(1 row)
+
+SELECT kind, partition_name, state FROM kingres.timepart_run_action WHERE run_id = :first_run_id ORDER BY seq;
+  kind  | partition_name | state 
+--------+----------------+-------
+ create | r2_p20260311   | done
+ create | r2_p20260312   | done
+(2 rows)
+
+-- (this session has not finished the run; a second begin takes over)
+SELECT kingres.timepart_begin_run('tp.r2', '2026-03-10 12:00 UTC', 'manual') AS run_id \gset second_
+SELECT run_id = :first_run_id AS same_run, state, error FROM kingres.timepart_run WHERE run_id IN (:first_run_id, :second_run_id) ORDER BY run_id;
+ same_run |  state  |    error    
+----------+---------+-------------
+ t        | failed  | interrupted
+ f        | running | 
+(2 rows)
+
+CALL kingres.timepart_run_phase(:second_run_id, 'create');
+CALL kingres.timepart_run_phase(:second_run_id, 'convert');
+CALL kingres.timepart_run_phase(:second_run_id, 'retire');
+-- Phases that are repeated do nothing more.
+CALL kingres.timepart_run_phase(:second_run_id, 'create');
+CALL kingres.timepart_run_phase(:second_run_id, 'retire');
+SELECT kingres.timepart_finish_run(:second_run_id);
+ timepart_finish_run 
+---------------------
+ 
+(1 row)
+
+SELECT kingres.timepart_finish_run(:second_run_id);
+ timepart_finish_run 
+---------------------
+ 
+(1 row)
+
+SELECT state, error FROM kingres.timepart_run WHERE run_id = :second_run_id;
+ state | error 
+-------+-------
+ done  | 
+(1 row)
+
+SELECT kind, partition_name, state FROM kingres.timepart_run_action WHERE run_id = :second_run_id ORDER BY seq;
+ kind | partition_name | state 
+------+----------------+-------
+(0 rows)
+
+SELECT * FROM tp.parts('tp.r2');
+     part     |                            bounds                             
+--------------+---------------------------------------------------------------
+ r2_p20260309 | FROM ('2026-03-09 00:00:00+00') TO ('2026-03-10 00:00:00+00')
+ r2_p20260310 | FROM ('2026-03-10 00:00:00+00') TO ('2026-03-11 00:00:00+00')
+ r2_p20260311 | FROM ('2026-03-11 00:00:00+00') TO ('2026-03-12 00:00:00+00')
+ r2_p20260312 | FROM ('2026-03-12 00:00:00+00') TO ('2026-03-13 00:00:00+00')
+(4 rows)
+
+-- A finished run takes no more work.
+CALL kingres.timepart_run_phase(:second_run_id, 'create');
+SELECT count(*) AS actions FROM kingres.timepart_run_action WHERE run_id = :second_run_id;
+ actions 
+---------
+       0
+(1 row)
+
+CALL kingres.timepart_run_phase(:second_run_id, 'sideways');
+ERROR:  phase must be create, convert or retire
+SELECT kingres.timepart_finish_run(0);
+ERROR:  run 0 does not exist
+-- The run records the backend that made it, so that a later begin can tell a live
+-- run from an abandoned one.
+SELECT backend_pid = pg_backend_pid() AS own_backend, backend_start IS NOT NULL AS has_start
+  FROM kingres.timepart_run WHERE run_id = :second_run_id;
+ own_backend | has_start 
+-------------+-----------
+ t           | t
+(1 row)
+
+-- Procedures that commit cannot run inside a transaction block.
+BEGIN;
+CALL kingres.timepart_run('tp.r2', '2026-03-10 12:00 UTC');
+ERROR:  invalid transaction termination
+ROLLBACK;
+SELECT count(*) AS runs_after_rollback FROM kingres.timepart_run WHERE table_name = 'r2';
+ runs_after_rollback 
+---------------------
+                   2
+(1 row)
+
+-- A name that is taken: that action fails and the run goes on; the run ends
+-- "partial".  The next run, once the name is free, finishes the work.
+CREATE TABLE tp.r3 (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+CREATE TABLE tp.r3_p20260311 (x int);
+SELECT kingres.timepart_set_policy('tp.r3', '1 day', create_ahead => '2 days');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+\o /dev/null
+CALL kingres.timepart_run('tp.r3', '2026-03-10 05:00 UTC');
+\o
+SELECT * FROM tp.last_run('tp', 'r3');
+  state  | trigger | error 
+---------+---------+-------
+ partial | sql     | 
+(1 row)
+
+SELECT * FROM tp.last_actions('tp', 'r3');
+  kind  | partition_name | state  |                                           detail                                           
+--------+----------------+--------+--------------------------------------------------------------------------------------------
+ create | r3_p20260310   | done   | 
+ create | r3_p20260311   | failed | 42P07: name_conflict: relation tp.r3_p20260311 already exists and is not the expected part
+ create | r3_p20260312   | done   | 
+(3 rows)
+
+SELECT * FROM tp.parts('tp.r3');
+     part     |                            bounds                             
+--------------+---------------------------------------------------------------
+ r3_p20260310 | FROM ('2026-03-10 00:00:00+00') TO ('2026-03-11 00:00:00+00')
+ r3_p20260312 | FROM ('2026-03-12 00:00:00+00') TO ('2026-03-13 00:00:00+00')
+(2 rows)
+
+SELECT * FROM kingres.timepart_check('1 hour', '2026-03-10 05:00 UTC') WHERE table_name = 'r3';
+ schema_name | table_name |     problem     |                          detail                           
+-------------+------------+-----------------+-----------------------------------------------------------
+ tp          | r3         | last_run_failed | the last run (as of 2026-03-10 05:00:00+00) ended partial
+(1 row)
+
+DROP TABLE tp.r3_p20260311;
+\o /dev/null
+CALL kingres.timepart_run('tp.r3', '2026-03-10 05:00 UTC');
+\o
+SELECT * FROM tp.last_run('tp', 'r3');
+ state | trigger | error 
+-------+---------+-------
+ done  | sql     | 
+(1 row)
+
+SELECT * FROM tp.last_actions('tp', 'r3');
+  kind  | partition_name | state | detail 
+--------+----------------+-------+--------
+ create | r3_p20260311   | done  | 
+(1 row)
+
+SELECT * FROM tp.parts('tp.r3');
+     part     |                            bounds                             
+--------------+---------------------------------------------------------------
+ r3_p20260310 | FROM ('2026-03-10 00:00:00+00') TO ('2026-03-11 00:00:00+00')
+ r3_p20260311 | FROM ('2026-03-11 00:00:00+00') TO ('2026-03-12 00:00:00+00')
+ r3_p20260312 | FROM ('2026-03-12 00:00:00+00') TO ('2026-03-13 00:00:00+00')
+(3 rows)
+
+SELECT * FROM kingres.timepart_check('1 hour', '2026-03-10 05:00 UTC') WHERE table_name = 'r3';
+ schema_name | table_name | problem | detail 
+-------------+------------+---------+--------
+(0 rows)
+
+-- Partitions made by hand with other bounds: reported, left alone, and the
+-- cells around them are created; the existing ones are never changed.
+CREATE TABLE tp.r4 (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+CREATE TABLE tp.r4_odd PARTITION OF tp.r4 FOR VALUES FROM ('2026-03-09 18:00 UTC') TO ('2026-03-10 18:00 UTC');
+CREATE TABLE tp.r4_ok PARTITION OF tp.r4 FOR VALUES FROM ('2026-03-07 00:00 UTC') TO ('2026-03-08 00:00 UTC');
+SELECT kingres.timepart_set_policy('tp.r4', '1 day', create_ahead => '3 days');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+\o /dev/null
+CALL kingres.timepart_run('tp.r4', '2026-03-10 05:00 UTC');
+\o
+SELECT * FROM tp.last_run('tp', 'r4');
+ state | trigger | error 
+-------+---------+-------
+ done  | sql     | 
+(1 row)
+
+SELECT * FROM tp.last_actions('tp', 'r4');
+    kind    | partition_name |  state  |                        detail                        
+------------+----------------+---------+------------------------------------------------------
+ misaligned | r4_odd         | skipped | bounds are not on the grid of the policy; left alone
+ create     | r4_p20260308   | done    | 
+ create     | r4_p20260311   | done    | 
+ create     | r4_p20260312   | done    | 
+ create     | r4_p20260313   | done    | 
+(5 rows)
+
+SELECT * FROM tp.parts('tp.r4');
+     part     |                            bounds                             
+--------------+---------------------------------------------------------------
+ r4_ok        | FROM ('2026-03-07 00:00:00+00') TO ('2026-03-08 00:00:00+00')
+ r4_p20260308 | FROM ('2026-03-08 00:00:00+00') TO ('2026-03-09 00:00:00+00')
+ r4_odd       | FROM ('2026-03-09 18:00:00+00') TO ('2026-03-10 18:00:00+00')
+ r4_p20260311 | FROM ('2026-03-11 00:00:00+00') TO ('2026-03-12 00:00:00+00')
+ r4_p20260312 | FROM ('2026-03-12 00:00:00+00') TO ('2026-03-13 00:00:00+00')
+ r4_p20260313 | FROM ('2026-03-13 00:00:00+00') TO ('2026-03-14 00:00:00+00')
+(6 rows)
+
+SELECT * FROM tp.gaps('tp.r4');
+        gap_from        |         gap_to         
+------------------------+------------------------
+ 2026-03-09 00:00:00+00 | 2026-03-09 18:00:00+00
+ 2026-03-10 18:00:00+00 | 2026-03-11 00:00:00+00
+(2 rows)
+
+SELECT * FROM kingres.timepart_check('1 hour', '2026-03-10 05:00 UTC') WHERE table_name = 'r4';
+ schema_name | table_name |  problem   |                   detail                    
+-------------+------------+------------+---------------------------------------------
+ tp          | r4         | misaligned | partitions with bounds off the grid: r4_odd
+(1 row)
+
+-- A default partition created after the policy.  Where it holds no row of
+-- a range to create, the attach succeeds.  Where it holds rows of the
+-- range, PostgreSQL refuses the attach: that action fails with its error, the
+-- run ends "partial", the other partitions are created, and the run does not
+-- loop or retry; the next run tries again.
+CREATE TABLE tp.r5 (id int, ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.timepart_set_policy('tp.r5', '1 day', create_ahead => '3 days');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+CREATE TABLE tp.r5_default PARTITION OF tp.r5 DEFAULT;
+INSERT INTO tp.r5 VALUES (1, '2026-03-12 10:00 UTC'), (2, '2026-03-15 10:00 UTC');
+SELECT tableoid::regclass AS part, id FROM tp.r5 ORDER BY id;
+     part      | id 
+---------------+----
+ tp.r5_default |  1
+ tp.r5_default |  2
+(2 rows)
+
+\o /dev/null
+CALL kingres.timepart_run('tp.r5', '2026-03-10 05:00 UTC');
+\o
+SELECT * FROM tp.last_run('tp', 'r5');
+  state  | trigger | error 
+---------+---------+-------
+ partial | sql     | 
+(1 row)
+
+SELECT * FROM tp.last_actions('tp', 'r5');
+  kind  | partition_name | state  |                                           detail                                           
+--------+----------------+--------+--------------------------------------------------------------------------------------------
+ create | r5_p20260310   | done   | 
+ create | r5_p20260311   | done   | 
+ create | r5_p20260312   | failed | 23514: updated partition constraint for default partition "r5_default" would be violated b
+ create | r5_p20260313   | done   | 
+(4 rows)
+
+SELECT * FROM tp.parts('tp.r5');
+     part     |                            bounds                             
+--------------+---------------------------------------------------------------
+ r5_p20260310 | FROM ('2026-03-10 00:00:00+00') TO ('2026-03-11 00:00:00+00')
+ r5_p20260311 | FROM ('2026-03-11 00:00:00+00') TO ('2026-03-12 00:00:00+00')
+ r5_p20260313 | FROM ('2026-03-13 00:00:00+00') TO ('2026-03-14 00:00:00+00')
+ r5_default   | DEFAULT
+(4 rows)
+
+SELECT count(*) AS actions_in_run FROM kingres.timepart_run_action a
+ WHERE a.run_id = (SELECT max(run_id) FROM kingres.timepart_run WHERE table_name = 'r5');
+ actions_in_run 
+----------------
+              4
+(1 row)
+
+SELECT * FROM kingres.timepart_check('1 hour', '2026-03-10 05:00 UTC') WHERE table_name = 'r5' ORDER BY problem;
+ schema_name | table_name |          problem          |                          detail                           
+-------------+------------+---------------------------+-----------------------------------------------------------
+ tp          | r5         | default_partition_present | default partition r5_default
+ tp          | r5         | last_run_failed           | the last run (as of 2026-03-10 05:00:00+00) ended partial
+(2 rows)
+
+-- The rows are untouched.
+SELECT tableoid::regclass AS part, id FROM tp.r5 ORDER BY id;
+     part      | id 
+---------------+----
+ tp.r5_default |  1
+ tp.r5_default |  2
+(2 rows)
+
+-- Move the rows out of the way; the next run succeeds.
+CREATE TEMP TABLE r5_rows AS SELECT * FROM tp.r5_default;
+DELETE FROM tp.r5_default;
+\o /dev/null
+CALL kingres.timepart_run('tp.r5', '2026-03-10 05:00 UTC');
+\o
+SELECT * FROM tp.last_run('tp', 'r5');
+ state | trigger | error 
+-------+---------+-------
+ done  | sql     | 
+(1 row)
+
+SELECT * FROM tp.last_actions('tp', 'r5');
+  kind  | partition_name | state | detail 
+--------+----------------+-------+--------
+ create | r5_p20260312   | done  | 
+(1 row)
+
+INSERT INTO tp.r5 SELECT * FROM r5_rows;
+SELECT tableoid::regclass AS part, id FROM tp.r5 ORDER BY id;
+      part       | id 
+-----------------+----
+ tp.r5_p20260312 |  1
+ tp.r5_default   |  2
+(2 rows)
+
+-- The conversion step: nothing to convert yet, then a partition older than
+-- columnar_after; without kingres_columnar the step reports it and skips,
+-- and the run is "done".
+CREATE TABLE tp.r6 (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.timepart_set_policy('tp.r6', '1 day', create_ahead => '1 day', columnar_after => '2 days');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+SELECT kingres.create_time_partitions('tp.r6', '1 day', '2026-03-05 00:00 UTC', '2026-03-01 00:00 UTC');
+ create_time_partitions 
+------------------------
+                      5
+(1 row)
+
+\o /dev/null
+CALL kingres.timepart_run('tp.r6', '2026-03-10 05:00 UTC');
+\o
+SELECT * FROM tp.last_run('tp', 'r6');
+ state | trigger | error 
+-------+---------+-------
+ done  | sql     | 
+(1 row)
+
+SELECT kind, partition_name, state, detail FROM tp.last_actions('tp', 'r6') WHERE kind = 'convert';
+  kind   | partition_name |  state  |                                           detail                                           
+---------+----------------+---------+--------------------------------------------------------------------------------------------
+ convert | r6             | skipped | conversion needs kingres_columnar, which is not installed; 7 partition(s) older than colum
+(1 row)
+
+SELECT kind, count(*) FROM tp.last_actions('tp', 'r6') GROUP BY kind ORDER BY kind;
+  kind   | count 
+---------+-------
+ convert |     1
+ create  |     6
+(2 rows)
+
+SELECT seq, kind, partition_name FROM kingres.timepart_plan('tp.r6', '2026-03-10 05:00 UTC') WHERE kind = 'convert';
+ seq |  kind   | partition_name 
+-----+---------+----------------
+   1 | convert | r6_p20260301
+   2 | convert | r6_p20260302
+   3 | convert | r6_p20260303
+   4 | convert | r6_p20260304
+   5 | convert | r6_p20260305
+   6 | convert | r6_p20260306
+   7 | convert | r6_p20260307
+(7 rows)
+
+CALL kingres.convert_partition('tp.r6', 'tp.r6_p20260301');
+ERROR:  converting a partition needs the extension kingres_columnar, which is not installed
+HINT:  Install kingres_columnar in this database; the run skips the conversion step until then.
+CALL kingres.convert_old_partitions('tp.r6', '2026-03-03 UTC');
+ERROR:  converting a partition needs the extension kingres_columnar, which is not installed
+HINT:  Install kingres_columnar in this database; the run skips the conversion step until then.
+SELECT NOT EXISTS (SELECT 1 FROM kingres.timepart_run_action WHERE kind = 'convert' AND state = 'failed') AS no_convert_failure;
+ no_convert_failure 
+--------------------
+ t
+(1 row)
+
+-- Daylight saving over a run: daily partitions in Berlin, a run the day
+-- before the spring change and another after it.  The cells follow the
+-- local calendar and nothing overlaps or is missing.
+CREATE TABLE tp.r7 (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.timepart_set_policy('tp.r7', '1 day', create_ahead => '3 days', timezone => 'Europe/Berlin');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+\o /dev/null
+CALL kingres.timepart_run('tp.r7', '2026-03-27 12:00 UTC');
+CALL kingres.timepart_run('tp.r7', '2026-03-30 12:00 UTC');
+\o
+SELECT * FROM tp.parts('tp.r7');
+     part     |                            bounds                             
+--------------+---------------------------------------------------------------
+ r7_p20260327 | FROM ('2026-03-26 23:00:00+00') TO ('2026-03-27 23:00:00+00')
+ r7_p20260328 | FROM ('2026-03-27 23:00:00+00') TO ('2026-03-28 23:00:00+00')
+ r7_p20260329 | FROM ('2026-03-28 23:00:00+00') TO ('2026-03-29 22:00:00+00')
+ r7_p20260330 | FROM ('2026-03-29 22:00:00+00') TO ('2026-03-30 22:00:00+00')
+ r7_p20260331 | FROM ('2026-03-30 22:00:00+00') TO ('2026-03-31 22:00:00+00')
+ r7_p20260401 | FROM ('2026-03-31 22:00:00+00') TO ('2026-04-01 22:00:00+00')
+ r7_p20260402 | FROM ('2026-04-01 22:00:00+00') TO ('2026-04-02 22:00:00+00')
+(7 rows)
+
+SELECT * FROM tp.gaps('tp.r7');
+ gap_from | gap_to 
+----------+--------
+(0 rows)
+
+-- The autumn change, from an empty table.
+CREATE TABLE tp.r8 (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.timepart_set_policy('tp.r8', '1 day', create_ahead => '3 days', timezone => 'Europe/Berlin');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+\o /dev/null
+CALL kingres.timepart_run('tp.r8', '2026-10-24 12:00 UTC');
+\o
+SELECT * FROM tp.parts('tp.r8');
+     part     |                            bounds                             
+--------------+---------------------------------------------------------------
+ r8_p20261024 | FROM ('2026-10-23 22:00:00+00') TO ('2026-10-24 22:00:00+00')
+ r8_p20261025 | FROM ('2026-10-24 22:00:00+00') TO ('2026-10-25 23:00:00+00')
+ r8_p20261026 | FROM ('2026-10-25 23:00:00+00') TO ('2026-10-26 23:00:00+00')
+ r8_p20261027 | FROM ('2026-10-26 23:00:00+00') TO ('2026-10-27 23:00:00+00')
+(4 rows)
+
+-- Hours across the change: six-hour partitions are six hours long.
+CREATE TABLE tp.r9 (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.timepart_set_policy('tp.r9', '6 hours', create_ahead => '1 day', timezone => 'Europe/Berlin');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+\o /dev/null
+CALL kingres.timepart_run('tp.r9', '2026-03-28 20:00 UTC');
+\o
+SELECT part, bounds FROM tp.parts('tp.r9');
+      part      |                            bounds                             
+----------------+---------------------------------------------------------------
+ r9_p2026032817 | FROM ('2026-03-28 17:00:00+00') TO ('2026-03-28 23:00:00+00')
+ r9_p2026032823 | FROM ('2026-03-28 23:00:00+00') TO ('2026-03-29 05:00:00+00')
+ r9_p2026032905 | FROM ('2026-03-29 05:00:00+00') TO ('2026-03-29 11:00:00+00')
+ r9_p2026032911 | FROM ('2026-03-29 11:00:00+00') TO ('2026-03-29 17:00:00+00')
+ r9_p2026032917 | FROM ('2026-03-29 17:00:00+00') TO ('2026-03-29 23:00:00+00')
+(5 rows)
+
+SELECT * FROM tp.gaps('tp.r9');
+ gap_from | gap_to 
+----------+--------
+(0 rows)
+
+-- Naive keys: the policy's zone says which wall clock "now" is.  22:00 UTC
+-- on 31 March is 1 April in Tokyo.
+CREATE TABLE tp.r10 (d date NOT NULL) PARTITION BY RANGE (d);
+SELECT kingres.timepart_set_policy('tp.r10', '1 month', create_ahead => '1 day', timezone => 'Asia/Tokyo');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+\o /dev/null
+CALL kingres.timepart_run('tp.r10', '2026-03-31 22:00 UTC');
+\o
+SELECT * FROM tp.parts('tp.r10');
+    part     |                bounds                 
+-------------+---------------------------------------
+ r10_p202604 | FROM ('2026-04-01') TO ('2026-05-01')
+(1 row)
+
+CREATE TABLE tp.r11 (ts timestamp NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.timepart_set_policy('tp.r11', '12 hours', create_ahead => '12 hours', timezone => 'America/New_York');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+\o /dev/null
+CALL kingres.timepart_run('tp.r11', '2026-03-10 03:00 UTC');
+\o
+SELECT * FROM tp.parts('tp.r11');
+      part       |                         bounds                          
+-----------------+---------------------------------------------------------
+ r11_p2026030912 | FROM ('2026-03-09 12:00:00') TO ('2026-03-10 00:00:00')
+ r11_p2026031000 | FROM ('2026-03-10 00:00:00') TO ('2026-03-10 12:00:00')
+(2 rows)
+
+SELECT range_from, range_to FROM kingres.timepart_plan('tp.r11', '2026-03-10 03:00 UTC');
+ range_from | range_to 
+------------+----------
+(0 rows)
+
+-- A run that fails as a whole: too many cells for one run.
+CREATE TABLE tp.r12 (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.timepart_set_policy('tp.r12', '1 hour', create_ahead => '2 years');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+\o /dev/null
+CALL kingres.timepart_run('tp.r12', '2026-03-10 05:00 UTC');
+\o
+SELECT * FROM tp.last_run('tp', 'r12');
+ state  | trigger |                        error                        
+--------+---------+-----------------------------------------------------
+ failed | sql     | 54000: too many partitions in one call: 17544 cells
+(1 row)
+
+SELECT count(*) AS partitions FROM tp.parts('tp.r12');
+ partitions 
+------------
+          0
+(1 row)
+
+SELECT * FROM kingres.timepart_check('1 hour', '2026-03-10 05:00 UTC') WHERE table_name = 'r12';
+ schema_name | table_name |     problem     |                                                    detail                                                     
+-------------+------------+-----------------+---------------------------------------------------------------------------------------------------------------
+ tp          | r12        | ahead_low       | the table has no partitions
+ tp          | r12        | last_run_failed | the last run (as of 2026-03-10 05:00:00+00) ended failed: 54000: too many partitions in one call: 17544 cells
+(2 rows)
+
+SELECT schema_name, table_name, last_run_state FROM kingres.timepart_policies WHERE table_name IN ('r1', 'r3', 'r12') ORDER BY table_name;
+ schema_name | table_name | last_run_state 
+-------------+------------+----------------
+ tp          | r1         | done
+ tp          | r12        | failed
+ tp          | r3         | done
+(3 rows)
+
+-- Fix the policy and run again.
+SELECT kingres.timepart_set_policy('tp.r12', '1 day', create_ahead => '2 days');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+\o /dev/null
+CALL kingres.timepart_run('tp.r12', '2026-03-10 05:00 UTC');
+\o
+SELECT * FROM tp.last_run('tp', 'r12');
+ state | trigger | error 
+-------+---------+-------
+ done  | sql     | 
+(1 row)
+
+SELECT count(*) AS partitions FROM tp.parts('tp.r12');
+ partitions 
+------------
+          3
+(1 row)
+
+-- A run needs a policy and a table; the run phases need a superuser.
+CREATE TABLE tp.r13 (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+CALL kingres.timepart_run('tp.r13', '2026-03-10 UTC');
+ERROR:  table tp.r13 has no time partitioning policy
+SELECT kingres.timepart_begin_run('tp.r1', '2026-03-10 UTC', 'cron');
+ERROR:  trigger must be schedule, manual or sql
+CALL kingres.timepart_run('tp.r1', '2026-03-10 UTC', '{create,explode}');
+ERROR:  phases must be a list of create, convert and retire
+CALL kingres.timepart_run('tp.r1', 'infinity');
+ERROR:  as_of must be a finite time
+-- Phases can be chosen: only the retirement.
+CREATE TABLE tp.r14 (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.timepart_set_policy('tp.r14', '1 day', create_ahead => '1 day', retention => '2 days');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+SELECT kingres.create_time_partitions('tp.r14', '1 day', '2026-03-05 UTC', '2026-03-01 UTC');
+ create_time_partitions 
+------------------------
+                      5
+(1 row)
+
+\o /dev/null
+CALL kingres.timepart_run('tp.r14', '2026-03-05 12:00 UTC', '{retire}');
+\o
+SELECT kind, partition_name, state FROM tp.last_actions('tp', 'r14');
+ kind | partition_name | state 
+------+----------------+-------
+ drop | r14_p20260301  | done
+ drop | r14_p20260302  | done
+(2 rows)
+
+SELECT count(*) AS partitions FROM tp.parts('tp.r14');
+ partitions 
+------------
+          3
+(1 row)
+
+-- Pruning: a run is kept for 90 days from the time of the newest, and at
+-- most 1000 runs per table.
+INSERT INTO kingres.timepart_run (schema_name, table_name, as_of, trigger, state, started_by, finished_at)
+SELECT 'tp', 'pruned', timestamptz '2026-01-01 UTC' + g * interval '1 minute', 'sql', 'done', 'x', now()
+  FROM generate_series(1, 1005) g;
+INSERT INTO kingres.timepart_run (schema_name, table_name, as_of, trigger, state, started_by, finished_at)
+VALUES ('tp', 'pruned', '2025-06-01 UTC', 'sql', 'done', 'x', now()),
+       ('tp', 'pruned_other', '2025-06-01 UTC', 'sql', 'done', 'x', now());
+INSERT INTO kingres.timepart_run (schema_name, table_name, as_of, trigger, state, started_by)
+VALUES ('tp', 'pruned', '2024-06-01 UTC', 'sql', 'running', 'x');
+SELECT kingres.timepart_prune_runs('tp', 'pruned', '2026-01-02 UTC') AS deleted;
+ deleted 
+---------
+       8
+(1 row)
+
+SELECT count(*) AS kept, count(*) FILTER (WHERE state = 'running') AS running,
+       min(as_of) > '2025-12-31' AS none_old_but_the_running FROM kingres.timepart_run
+ WHERE table_name = 'pruned' AND state <> 'running';
+ kept | running | none_old_but_the_running 
+------+---------+--------------------------
+  998 |       0 | t
+(1 row)
+
+SELECT count(*) AS other_table_kept FROM kingres.timepart_run WHERE table_name = 'pruned_other';
+ other_table_kept 
+------------------
+                1
+(1 row)
+
+-- The actions of a deleted run go with it.
+SELECT count(*) AS orphan_actions FROM kingres.timepart_run_action a
+ WHERE NOT EXISTS (SELECT 1 FROM kingres.timepart_run r WHERE r.run_id = a.run_id);
+ orphan_actions 
+----------------
+              0
+(1 row)
+
+-- User code runs during a run: the index of the parent is copied to every new
+-- partition, and an index expression that calls a function evaluates it for
+-- a constant argument.  A driver that sets statement_timeout and issues each
+-- action as a statement of its own gets that action failed after the limit
+-- instead of a session that waits for as long as the function sleeps.
+CREATE TABLE tp.r15 (ts timestamptz NOT NULL, v int) PARTITION BY RANGE (ts);
+CREATE FUNCTION tp.slowfn(int) RETURNS int LANGUAGE plpgsql IMMUTABLE
+  AS $$ BEGIN PERFORM pg_sleep(2); RETURN $1; END $$;
+CREATE INDEX r15_slow_idx ON tp.r15 (ts, (tp.slowfn(1)));
+SELECT kingres.timepart_set_policy('tp.r15', '1 day', create_ahead => '2 days');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+SELECT kingres.timepart_begin_run('tp.r15', '2026-03-10 UTC', 'manual') AS run_id \gset slow_
+SELECT kingres.timepart_action_timeout();
+ timepart_action_timeout 
+-------------------------
+                  300000
+(1 row)
+
+SET kingres_timepart.action_timeout_ms = 500;
+SELECT kingres.timepart_action_timeout();
+ timepart_action_timeout 
+-------------------------
+                     500
+(1 row)
+
+SELECT set_config('statement_timeout', kingres.timepart_action_timeout()::text || 'ms', false);
+ set_config 
+------------
+ 500ms
+(1 row)
+
+SELECT kingres.timepart_run_action(:slow_run_id, 'create');
+ timepart_run_action 
+---------------------
+ t
+(1 row)
+
+SELECT kingres.timepart_run_action(:slow_run_id, 'create');
+ timepart_run_action 
+---------------------
+ t
+(1 row)
+
+RESET statement_timeout;
+RESET kingres_timepart.action_timeout_ms;
+SELECT kingres.timepart_run_action(:slow_run_id, 'create');
+ timepart_run_action 
+---------------------
+ f
+(1 row)
+
+SELECT kingres.timepart_finish_run(:slow_run_id);
+ timepart_finish_run 
+---------------------
+ 
+(1 row)
+
+SELECT kind, partition_name, state, left(detail, 40) AS detail FROM kingres.timepart_run_action WHERE run_id = :slow_run_id ORDER BY seq;
+  kind  | partition_name | state  |                  detail                  
+--------+----------------+--------+------------------------------------------
+ create | r15_p20260310  | failed | statement_timeout: canceling statement d
+ create | r15_p20260311  | failed | statement_timeout: canceling statement d
+(2 rows)
+
+SELECT state FROM kingres.timepart_run WHERE run_id = :slow_run_id;
+  state  
+---------
+ partial
+(1 row)
+
+SELECT count(*) AS partitions FROM tp.parts('tp.r15');
+ partitions 
+------------
+          0
+(1 row)
+
+-- a cancel by an operator is not an action's failure: only the timeout is
+SELECT kingres.timepart__timed_out() AS timed_out_now;
+ timed_out_now 
+---------------
+ f
+(1 row)
+

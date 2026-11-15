@@ -1,0 +1,153 @@
+<!-- SPDX-License-Identifier: PostgreSQL -->
+<!-- Copyright (c) 2026, RooyeKhat Media Co -->
+<script setup lang="ts">
+import { ref } from 'vue'
+import TableWrap from '@/components/TableWrap.vue'
+import { useMutation, useQueryClient } from '@tanstack/vue-query'
+import PageHeader from '@/components/PageHeader.vue'
+import QueryBoundary from '@/components/QueryBoundary.vue'
+import StatusBadge from '@/components/StatusBadge.vue'
+import GateButton from '@/components/GateButton.vue'
+import ProblemNotice from '@/components/ProblemNotice.vue'
+import SafeName from '@/components/SafeName.vue'
+import AlertSubject from '@/components/AlertSubject.vue'
+import PartialNotice from '@/components/PartialNotice.vue'
+import CursorResetNotice from '@/components/CursorResetNotice.vue'
+import { useCompletenessAnnouncement } from '@/composables/useCompletenessAnnouncement'
+import { safeText } from '@/lib/safe-text'
+import { endpoints } from '@/api/endpoints'
+import { keys, usePagedQuery } from '@/api/queries'
+import { alertKindHint, alertKindLabel, SEVERITY } from '@/lib/status'
+import { formatAgo, formatDateTime } from '@/lib/format'
+
+const client = useQueryClient()
+const state = ref<'' | 'open' | 'acknowledged' | 'resolved'>('')
+const {
+  query: alerts,
+  items,
+  completeness,
+  cursorReset,
+  dismissCursorReset,
+} = usePagedQuery(
+  () => [...keys.alerts, 'page'],
+  (cursor) => endpoints.listAlerts({ cursor, limit: 100 }),
+  10_000,
+)
+const shown = () => items.value.filter((a) => !state.value || a.state === state.value)
+useCompletenessAnnouncement(completeness, 'list of alerts')
+/**
+ * Alert ids are integers below 2^53 (0.5.0: the high bits name the server that holds the alert), which
+ * a JSON number holds exactly. An id at or above 2^53 would already have been rounded when the answer
+ * was read, so the panel does not send an acknowledgement for it.
+ */
+const idIsExact = (id: number): boolean => Number.isSafeInteger(id)
+const ack = useMutation({
+  mutationFn: (id: number) => endpoints.acknowledgeAlert(id),
+  onSettled: () =>
+    Promise.all([
+      client.invalidateQueries({ queryKey: keys.alerts }),
+      client.invalidateQueries({ queryKey: keys.cluster }),
+    ]),
+})
+const STATE_LABEL = { open: 'Open', acknowledged: 'Acknowledged', resolved: 'Resolved' } as const
+</script>
+
+<template>
+  <PageHeader title="Alerts" subtitle="Conditions that need attention." />
+  <div class="field" style="max-width: 14em; margin-bottom: var(--s-3)">
+    <label for="a-state">State</label>
+    <select id="a-state" v-model="state">
+      <option value="">All</option>
+      <option value="open">Open</option>
+      <option value="acknowledged">Acknowledged</option>
+      <option value="resolved">Resolved</option>
+    </select>
+  </div>
+  <ProblemNotice v-if="ack.error.value" :error="ack.error.value" />
+  <CursorResetNotice :shown="cursorReset" @dismiss="dismissCursorReset" />
+  <PartialNotice
+    :completeness="completeness"
+    consequence="Alerts held by these servers are not shown."
+  />
+  <QueryBoundary
+    :loading="alerts.isPending.value"
+    :error="alerts.error.value"
+    :empty="shown().length === 0"
+    :empty-title="completeness.partial ? 'No alerts from the servers that answered' : 'No alerts'"
+    :empty-hint="
+      completeness.partial
+        ? 'This does not mean there are none: the servers named above did not answer, so their alerts are not shown.'
+        : 'Nothing matches this filter.'
+    "
+    @retry="alerts.refetch()"
+  >
+    <TableWrap>
+      <table class="table">
+        <caption class="sr-only">
+          Alerts
+        </caption>
+        <thead>
+          <tr>
+            <th scope="col">Severity</th>
+            <th scope="col">Alert</th>
+            <th scope="col">State</th>
+            <th scope="col">Raised</th>
+            <th scope="col">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="a in shown()" :key="a.id">
+            <td><StatusBadge :meta="SEVERITY[a.severity]" /></td>
+            <td>
+              <strong><SafeName :value="a.title" kind="text" :max="200" /></strong>
+              <div class="muted alert-kind">
+                <SafeName :value="alertKindLabel(a.kind)" kind="text" :max="80" />
+              </div>
+              <div class="muted">
+                <SafeName :value="a.message" kind="text" :max="600" multiline />
+              </div>
+              <div v-if="alertKindHint(a.kind)" class="muted" data-testid="alert-kind-hint">
+                {{ alertKindHint(a.kind) }}
+              </div>
+              <AlertSubject :alert="a" />
+            </td>
+            <td>
+              {{ STATE_LABEL[a.state] ?? safeText(String(a.state), 40) }}
+              <div v-if="a.acknowledgedBy" class="muted">
+                by <SafeName :value="a.acknowledgedBy" :max="60" />
+              </div>
+            </td>
+            <td :title="formatDateTime(a.raisedAt)">{{ formatAgo(a.raisedAt) }}</td>
+            <td>
+              <template v-if="a.state === 'open'">
+                <GateButton
+                  v-if="idIsExact(a.id)"
+                  op="acknowledgeAlert"
+                  small
+                  :aria-label="`Acknowledge alert ${safeText(a.title, 80)}`"
+                  @click="ack.mutate(a.id)"
+                  >Acknowledge</GateButton
+                >
+                <span v-else class="muted"
+                  >This panel cannot acknowledge this alert: its id is too large to be sent
+                  exactly.</span
+                >
+              </template>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </TableWrap>
+  </QueryBoundary>
+  <p v-if="alerts.hasNextPage.value" class="row">
+    <span class="muted">More alerts exist than are shown.</span>
+    <button
+      type="button"
+      class="btn"
+      :disabled="alerts.isFetchingNextPage.value"
+      @click="alerts.fetchNextPage()"
+    >
+      Load more
+    </button>
+  </p>
+</template>

@@ -1,0 +1,23 @@
+#!/bin/sh
+# SPDX-License-Identifier: PostgreSQL
+# Copyright (c) 2026, RooyeKhat Media Co
+#
+# kingres prerm: stop the service when the package is removed.  On upgrade
+# the postinst of the new version restarts it, so it is not stopped here.
+
+set -e
+
+case "$1" in
+    remove | deconfigure)
+        if [ -d /run/systemd/system ]; then
+            deb-systemd-invoke stop 'kingres.service' >/dev/null || true
+        fi
+        ;;
+    upgrade | failed-upgrade) ;;
+    *)
+        echo "prerm called with unknown argument '$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

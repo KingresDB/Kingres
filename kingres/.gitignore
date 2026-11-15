@@ -1,0 +1,18 @@
+# Build output and dependencies of the KingresDB components.
+# (The PostgreSQL tree has its own .gitignore files.)
+
+# Go
+/control-plane/bin/
+/verifier/bin/
+*.test
+*.out
+
+# Node / web panel
+node_modules/
+/web/dist/
+/web/coverage/
+
+# Local environment and editor files
+.env
+.env.*
+!.env.example

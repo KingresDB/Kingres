@@ -1,0 +1,22 @@
+[
+    {
+        "name": "id",
+        "send_hex": "00000003"
+    },
+    {
+        "name": "owner",
+        "send_hex": "6361726f6c"
+    },
+    {
+        "name": "balance",
+        "send_hex": "0000000000000002"
+    },
+    {
+        "name": "note",
+        "send_hex": ""
+    },
+    {
+        "name": "born",
+        "send_hex": "0000003b"
+    }
+]

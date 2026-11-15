@@ -1,0 +1,146 @@
+-- sql/security.sql
+--   Security of the install script (review 2026-11-14: S-A, S-B, and the
+--   settings of the routing switches).
+--
+-- SPDX-License-Identifier: PostgreSQL
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+--
+-- The role that runs the regression tests has the same name as the extension
+-- schema, so "$user" would resolve to it: pin the search path.
+\set SHOW_CONTEXT never
+SET search_path = public;
+CREATE EXTENSION kingres_shard;
+-- Every function of the extension pins a search_path that ends with pg_temp,
+-- and only the allow-listed functions are SECURITY DEFINER.  The query lists
+-- violations, so an empty result is a pass.
+WITH ext_functions AS (
+    SELECT p.oid, p.oid::regprocedure::text AS fn, p.prosecdef, p.proconfig
+      FROM pg_proc p
+      JOIN pg_depend d ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid
+                      AND d.deptype = 'e'
+      JOIN pg_extension e ON e.oid = d.refobjid
+                         AND d.refclassid = 'pg_extension'::regclass
+     WHERE e.extname = 'kingres_shard'
+)
+SELECT fn AS function_without_pinned_search_path
+  FROM ext_functions f
+ WHERE NOT EXISTS (SELECT 1
+                     FROM unnest(coalesce(f.proconfig, ARRAY[]::text[])) c
+                    WHERE c ~ '^search_path=.*, pg_temp$')
+ ORDER BY fn;
+ function_without_pinned_search_path 
+-------------------------------------
+(0 rows)
+
+WITH ext_functions AS (
+    SELECT p.oid::regprocedure::text AS fn, p.prosecdef
+      FROM pg_proc p
+      JOIN pg_depend d ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid
+                      AND d.deptype = 'e'
+      JOIN pg_extension e ON e.oid = d.refobjid
+                         AND d.refclassid = 'pg_extension'::regclass
+     WHERE e.extname = 'kingres_shard'
+)
+SELECT fn AS unexpected_security_definer
+  FROM ext_functions
+ WHERE prosecdef
+   AND fn NOT IN ('kingres.forget_dropped_tables()')
+ ORDER BY fn;
+ unexpected_security_definer 
+-----------------------------
+(0 rows)
+
+-- The count guards the two queries above against an empty scan.
+SELECT count(*) > 15 AS functions_were_scanned
+  FROM pg_proc p
+  JOIN pg_depend d ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid
+                  AND d.deptype = 'e'
+  JOIN pg_extension e ON e.oid = d.refobjid
+                     AND d.refclassid = 'pg_extension'::regclass
+ WHERE e.extname = 'kingres_shard';
+ functions_were_scanned 
+------------------------
+ t
+(1 row)
+
+-- S-A: an ordinary role must not become superuser through the SECURITY
+-- DEFINER event trigger.  The trigger only evaluates the hijacked cast when
+-- kingres.dist_table has a row, so distribute a table first.
+SELECT kingres.init_cluster('localhost', current_setting('port')::int);
+ init_cluster 
+--------------
+ 
+(1 row)
+
+CREATE TABLE sec_t (id int PRIMARY KEY, v text);
+SELECT kingres.create_distributed_table('sec_t', 'id', bucket_count => 4);
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+CREATE ROLE ks_sec_attacker LOGIN;
+CREATE ROLE ks_sec_victim LOGIN;
+SET ROLE ks_sec_attacker;
+CREATE TEMP TABLE zz (a int);
+CREATE FUNCTION pg_temp.evil(x anyelement) RETURNS bool LANGUAGE plpgsql AS $$
+BEGIN
+    ALTER ROLE ks_sec_victim SUPERUSER;
+    RETURN true;
+END $$;
+CREATE DOMAIN pg_temp.oid AS pg_catalog.oid CHECK (pg_temp.evil(VALUE));
+CREATE DOMAIN pg_temp.text AS pg_catalog.text CHECK (pg_temp.evil(VALUE));
+CREATE DOMAIN pg_temp.regclass AS pg_catalog.regclass CHECK (pg_temp.evil(VALUE));
+DROP TABLE zz;
+RESET ROLE;
+SELECT rolname, rolsuper AS became_superuser
+  FROM pg_roles WHERE rolname = 'ks_sec_victim';
+    rolname    | became_superuser 
+---------------+------------------
+ ks_sec_victim | f
+(1 row)
+
+-- Ordinary roles can still use the schema.
+SET ROLE ks_sec_attacker;
+SELECT count(*) AS still_works FROM pg_catalog.pg_tables WHERE tablename = 'sec_t';
+ still_works 
+-------------
+           1
+(1 row)
+
+RESET ROLE;
+SELECT kingres.internal_catalog_snapshot() IS NOT NULL AS snapshot_works;
+ snapshot_works 
+----------------
+ t
+(1 row)
+
+-- The routing switches.  kingres_shard.forwarded is fixed for the life of a
+-- session (it is set by the connection options of a forwarded session), and
+-- kingres_shard.enable_routing is for administrators: with it off a
+-- statement is no longer checked.
+SET ROLE ks_sec_attacker;
+SET kingres_shard.forwarded = on;
+ERROR:  parameter "kingres_shard.forwarded" cannot be set after connection start
+RESET kingres_shard.forwarded;
+ERROR:  parameter "kingres_shard.forwarded" cannot be set after connection start
+SET kingres_shard.enable_routing = off;
+ERROR:  permission denied to set parameter "kingres_shard.enable_routing"
+SHOW kingres_shard.forwarded;
+ kingres_shard.forwarded 
+-------------------------
+ off
+(1 row)
+
+SHOW kingres_shard.enable_routing;
+ kingres_shard.enable_routing 
+------------------------------
+ on
+(1 row)
+
+RESET ROLE;
+DROP TABLE sec_t;
+DROP OWNED BY ks_sec_attacker;
+DROP ROLE ks_sec_attacker;
+DROP ROLE ks_sec_victim;
+DROP EXTENSION kingres_shard;

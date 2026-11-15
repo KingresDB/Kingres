@@ -1,0 +1,42 @@
+[
+    {
+        "name": "id",
+        "send_hex": "00000002"
+    },
+    {
+        "name": "owner",
+        "send_hex": "5a6fc3ab204dc3bc6c6c65722d537472c3b66d"
+    },
+    {
+        "name": "balance",
+        "send_hex": "0001ffff400000020064"
+    },
+    {
+        "name": "opened",
+        "send_hex": "ffffffffffffffff"
+    },
+    {
+        "name": "active",
+        "send_hex": "00"
+    },
+    {
+        "name": "blob",
+        "send_hex": ""
+    },
+    {
+        "name": "big",
+        "send_hex": "ffffffffffffffff"
+    },
+    {
+        "name": "ratio",
+        "send_hex": "7ff8000000000000"
+    },
+    {
+        "name": "note",
+        "send_hex": "c3bc6ec3af636f646520d0bad0bbd18ed18720e697a5e69cace8aa9e20f09f9880"
+    },
+    {
+        "name": "tags",
+        "send_hex": "000000000000000000000019"
+    }
+]

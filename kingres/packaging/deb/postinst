@@ -1,0 +1,64 @@
+#!/bin/sh
+# SPDX-License-Identifier: PostgreSQL
+# Copyright (c) 2026, RooyeKhat Media Co
+#
+# kingres postinst: create the service user and the data directory, enable
+# and (re)start kingres.service.
+
+set -e
+
+case "$1" in
+    configure)
+        if ! getent group kingres >/dev/null; then
+            addgroup --system --quiet kingres
+        fi
+        if ! getent passwd kingres >/dev/null; then
+            adduser --system --quiet --ingroup kingres --home /var/lib/kingres \
+                --no-create-home --shell /usr/sbin/nologin \
+                --gecos "KingresDB server" kingres
+        fi
+        # Owner-only: the data directory holds the setup token and the databases.
+        install -d -o kingres -g kingres -m 0750 /var/lib/kingres
+        # The environment file may hold secrets.
+        chown root:root /etc/kingres/kingresd.env
+        chmod 0600 /etc/kingres/kingresd.env
+        ;;
+    abort-upgrade | abort-remove | abort-deconfigure) ;;
+    *)
+        echo "postinst called with unknown argument '$1'" >&2
+        exit 1
+        ;;
+esac
+
+# Enable the unit and start it (restart on upgrade), the way debhelper does.
+if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ] || [ "$1" = "abort-deconfigure" ] || [ "$1" = "abort-remove" ]; then
+    deb-systemd-helper unmask 'kingres.service' >/dev/null || true
+    if deb-systemd-helper --quiet was-enabled 'kingres.service'; then
+        deb-systemd-helper enable 'kingres.service' >/dev/null || true
+    else
+        deb-systemd-helper update-state 'kingres.service' >/dev/null || true
+    fi
+    if [ -d /run/systemd/system ]; then
+        systemctl --system daemon-reload >/dev/null || true
+        if [ -n "$2" ]; then
+            action=restart
+        else
+            action=start
+        fi
+        deb-systemd-invoke "$action" 'kingres.service' >/dev/null || true
+    fi
+fi
+
+if [ "$1" = "configure" ] && [ -z "$2" ]; then
+    cat <<'EOF'
+
+KingresDB is installed.  The node is uninitialized: open the panel on this
+server at http://127.0.0.1:8091/ and enter the one-time setup token, which is
+in /var/lib/kingres/setup-token (readable by root and the kingres user):
+
+    sudo cat /var/lib/kingres/setup-token
+
+EOF
+fi
+
+exit 0

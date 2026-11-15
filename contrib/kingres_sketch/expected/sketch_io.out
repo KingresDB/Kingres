@@ -1,0 +1,342 @@
+-- sketch_io: text and bytea input and output of the three types, and what
+-- happens to values that are cut off, too long or corrupted.
+SET search_path = public, kingres_sketch;
+-- helpers that write the bytes of a value: little-endian integers and doubles
+CREATE FUNCTION pg_temp.le(i bigint, n int) RETURNS text LANGUAGE sql IMMUTABLE AS
+$$ SELECT string_agg(lpad(to_hex(((i >> (8 * b)) & 255)::int), 2, '0'), '' ORDER BY b)
+     FROM generate_series(0, n - 1) b $$;
+CREATE FUNCTION pg_temp.lef(x float8) RETURNS text LANGUAGE sql IMMUTABLE AS
+$$ SELECT string_agg(substr(encode(float8send(x), 'hex'), 2 * i + 1, 2), '' ORDER BY 7 - i)
+     FROM generate_series(0, 7) i $$;
+-- a top-n value: capacity, total, counters (item length, count, error, item in hex)
+CREATE FUNCTION pg_temp.tn(k bigint, total bigint, n bigint, entries text) RETURNS text LANGUAGE sql IMMUTABLE AS
+$$ SELECT '\x4b010200' || pg_temp.le(k, 4) || pg_temp.le(total, 8) || pg_temp.le(n, 4) || entries $$;
+CREATE FUNCTION pg_temp.tne(len bigint, count bigint, err bigint, itemhex text) RETURNS text LANGUAGE sql IMMUTABLE AS
+$$ SELECT pg_temp.le(len, 2) || pg_temp.le(count, 8) || pg_temp.le(err, 8) || itemhex $$;
+-- a t-digest value: compression, centroid count, total, min, max, centroids
+CREATE FUNCTION pg_temp.td(c bigint, n bigint, total bigint, mn float8, mx float8, cents text) RETURNS text LANGUAGE sql IMMUTABLE AS
+$$ SELECT '\x4b010300' || pg_temp.le(c, 4) || pg_temp.le(n, 4) || pg_temp.le(total, 8)
+          || pg_temp.lef(mn) || pg_temp.lef(mx) || cents $$;
+CREATE FUNCTION pg_temp.tdc(mean float8, w bigint) RETURNS text LANGUAGE sql IMMUTABLE AS
+$$ SELECT pg_temp.lef(mean) || pg_temp.le(w, 8) $$;
+-- text input of hll
+SELECT name, (e).sql_error_code AS code, (e).message, (e).detail
+  FROM (SELECT name, pg_input_error_info(v, 'kingres_sketch.hll') AS e
+          FROM (VALUES
+            ('not hex', 'abc'),
+            ('no prefix', '4b010104'),
+            ('odd digits', '\x4b01010'),
+            ('bad digit', '\x4b0101zz'),
+            ('empty', '\x'),
+            ('short', '\x4b0101'),
+            ('bad magic', '\x4c010104'),
+            ('format 2', '\x4b020104'),
+            ('format 0', '\x4b000104'),
+            ('kind topn', '\x4b010204'),
+            ('precision 3', '\x4b010103'),
+            ('precision 19', '\x4b010113'),
+            ('sparse, not sorted', '\x4b0101044100000001000000'),
+            ('sparse, same register', '\x4b0101040100000002000000'),
+            ('sparse, rank 0', '\x4b01010400000000'),
+            ('sparse, rank 62', '\x4b0101043e000000'),
+            ('sparse, register 16', '\x4b01010401040000'),
+            ('sparse, 5 bytes', '\x4b0101040100000000'),
+            ('dense, all zero', '\x4b010104000000000000000000000000'),
+            ('dense, 11 bytes', '\x4b0101044110000000000000000000'),
+            ('dense, rank 62', '\x4b0101043e1000000000000000000000'),
+            ('too long', '\x' || repeat('00', 200000))
+          ) t(name, v)) s
+ ORDER BY name;
+         name          | code  |              message              |                            detail                             
+-----------------------+-------+-----------------------------------+---------------------------------------------------------------
+ bad digit             | 22P02 | invalid input syntax for type hll | A character that is not a hexadecimal digit was found.
+ bad magic             | 22P02 | invalid input syntax for type hll | bad magic byte 0x4c.
+ dense, 11 bytes       | 22P02 | invalid input syntax for type hll | length of 15 bytes does not fit precision 4.
+ dense, all zero       | 22P02 | invalid input syntax for type hll | dense form with only 0 non-zero registers; it must be sparse.
+ dense, rank 62        | 22P02 | invalid input syntax for type hll | register 0 holds 62, more than the largest rank 61.
+ empty                 | 22P02 | invalid input syntax for type hll | value is too short (0 bytes).
+ format 0              | 22P02 | invalid input syntax for type hll | unsupported sketch format 0.
+ format 2              | 22P02 | invalid input syntax for type hll | unsupported sketch format 2.
+ kind topn             | 22P02 | invalid input syntax for type hll | wrong kind of sketch 2, expected 1.
+ no prefix             | 22P02 | invalid input syntax for type hll | The value must start with "\x" and hold hexadecimal digits.
+ not hex               | 22P02 | invalid input syntax for type hll | The value must start with "\x" and hold hexadecimal digits.
+ odd digits            | 22P02 | invalid input syntax for type hll | The number of hexadecimal digits is odd.
+ precision 19          | 22P02 | invalid input syntax for type hll | precision 19 is outside 4 to 18.
+ precision 3           | 22P02 | invalid input syntax for type hll | precision 3 is outside 4 to 18.
+ short                 | 22P02 | invalid input syntax for type hll | value is too short (3 bytes).
+ sparse, 5 bytes       | 22P02 | invalid input syntax for type hll | length of 9 bytes does not fit precision 4.
+ sparse, not sorted    | 22P02 | invalid input syntax for type hll | sparse entry 1 is not in increasing register order.
+ sparse, rank 0        | 22P02 | invalid input syntax for type hll | sparse entry 0 (register 0, rank 0) is out of range.
+ sparse, rank 62       | 22P02 | invalid input syntax for type hll | sparse entry 0 (register 0, rank 62) is out of range.
+ sparse, register 16   | 22P02 | invalid input syntax for type hll | sparse entry 0 (register 16, rank 1) is out of range.
+ sparse, same register | 22P02 | invalid input syntax for type hll | sparse entry 1 is not in increasing register order.
+ too long              | 22P02 | invalid input syntax for type hll | The value is longer than any valid hll.
+(22 rows)
+
+SELECT v, pg_input_is_valid(v, 'kingres_sketch.hll') AS valid
+  FROM (VALUES ('\x4b010104'), ('\X4B010104'), ('\x4b01010401000000'), ('\x4b010104411000000000000000000000')) t(v);
+                 v                  | valid 
+------------------------------------+-------
+ \x4b010104                         | t
+ \X4B010104                         | f
+ \x4b01010401000000                 | t
+ \x4b010104411000000000000000000000 | t
+(4 rows)
+
+-- text and binary round trip; the output is lower-case hex
+SELECT '\x4B01010E'::hll, '\x4b01010401000000'::hll::bytea, ('\x4b010104411000000000000000000000'::hll)::text;
+    hll     |       bytea        |                text                
+------------+--------------------+------------------------------------
+ \x4b01010e | \x4b01010401000000 | \x4b010104411000000000000000000000
+(1 row)
+
+SELECT hll_cardinality('\x4b010104411000000000000000000000'), hll_precision('\x4b010104411000000000000000000000');
+ hll_cardinality | hll_precision 
+-----------------+---------------
+               3 |             4
+(1 row)
+
+-- bytea casts: validating, SQLSTATE 22023
+CREATE FUNCTION pg_temp.try(b bytea, t text) RETURNS text LANGUAGE plpgsql AS
+$$ BEGIN
+     EXECUTE format('SELECT %L::bytea::%s', b, t);
+     RETURN 'valid';
+   EXCEPTION WHEN OTHERS THEN
+     RETURN SQLSTATE || ': ' || SQLERRM;
+   END $$;
+SELECT pg_temp.try('\x4b010104', 'kingres_sketch.hll'), pg_temp.try('\x4b0101', 'kingres_sketch.hll'),
+       pg_temp.try('\x4c010104', 'kingres_sketch.hll'), pg_temp.try('\x4b020104', 'kingres_sketch.hll'),
+       pg_temp.try('\x4b010104ff', 'kingres_sketch.hll'), pg_temp.try('\x', 'kingres_sketch.topn');
+  try  |           try            |           try            |           try            |           try            |            try            
+-------+--------------------------+--------------------------+--------------------------+--------------------------+---------------------------
+ valid | 22023: invalid hll value | 22023: invalid hll value | 22023: invalid hll value | 22023: invalid hll value | 22023: invalid topn value
+(1 row)
+
+SELECT pg_temp.try(decode(repeat('00', 200000), 'hex'), 'kingres_sketch.hll');
+           try            
+--------------------------
+ 22023: invalid hll value
+(1 row)
+
+-- text input of topn: one valid value and its variations
+SELECT pg_temp.tn(3, 1, 1, pg_temp.tne(1, 1, 0, '61'))::topn::bytea AS valid_one_item,
+       (SELECT item FROM topn_list(pg_temp.tn(3, 1, 1, pg_temp.tne(1, 1, 0, '61'))::topn)) AS item;
+                                  valid_one_item                                  | item 
+----------------------------------------------------------------------------------+------
+ \x4b0102000300000001000000000000000100000001000100000000000000000000000000000061 | a
+(1 row)
+
+SELECT name, (e).sql_error_code AS code, (e).message, (e).detail
+  FROM (SELECT name, pg_input_error_info(v, 'kingres_sketch.topn') AS e
+          FROM (VALUES
+            ('too short', '\x4b0102'),
+            ('header only', '\x4b010200'),
+            ('format 2', '\x4b020200' || pg_temp.le(3, 4) || pg_temp.le(0, 8) || pg_temp.le(0, 4)),
+            ('reserved byte', '\x4b010201' || pg_temp.le(3, 4) || pg_temp.le(0, 8) || pg_temp.le(0, 4)),
+            ('capacity 0', pg_temp.tn(0, 0, 0, '')),
+            ('capacity 100001', pg_temp.tn(100001, 0, 0, '')),
+            ('negative total', pg_temp.tn(3, -1, 0, '')),
+            ('count above capacity', pg_temp.tn(1, 2, 2, pg_temp.tne(1, 1, 0, '61') || pg_temp.tne(1, 1, 0, '62'))),
+            ('count 2^32 with no bytes', pg_temp.tn(3, 1, 4294967295, '')),
+            ('counter cut off', pg_temp.tn(3, 1, 1, '0100')),
+            ('item length cut off', pg_temp.tn(3, 1, 1, pg_temp.tne(5, 1, 0, '61'))),
+            ('item length 1025', pg_temp.tn(3, 1, 1, pg_temp.tne(1025, 1, 0, repeat('61', 1025)))),
+            ('count 0', pg_temp.tn(3, 1, 1, pg_temp.tne(1, 0, 0, '61'))),
+            ('negative count', pg_temp.tn(3, 1, 1, pg_temp.tne(1, -1, 0, '61'))),
+            ('error equal to count', pg_temp.tn(3, 2, 1, pg_temp.tne(1, 1, 1, '61'))),
+            ('negative error', pg_temp.tn(3, 2, 1, pg_temp.tne(1, 1, -1, '61'))),
+            ('count above total', pg_temp.tn(3, 1, 1, pg_temp.tne(1, 2, 0, '61'))),
+            ('counts above total', pg_temp.tn(3, 2, 2, pg_temp.tne(1, 2, 0, '61') || pg_temp.tne(1, 1, 0, '62'))),
+            ('error above total / capacity', pg_temp.tn(3, 5, 1, pg_temp.tne(1, 5, 2, '61'))),
+            ('item with a zero byte', pg_temp.tn(3, 1, 1, pg_temp.tne(1, 1, 0, '00'))),
+            ('same item twice', pg_temp.tn(3, 2, 2, pg_temp.tne(1, 1, 0, '61') || pg_temp.tne(1, 1, 0, '61'))),
+            ('counts ascending', pg_temp.tn(3, 3, 2, pg_temp.tne(1, 1, 0, '61') || pg_temp.tne(1, 2, 0, '62'))),
+            ('equal counts, items descending', pg_temp.tn(3, 2, 2, pg_temp.tne(1, 1, 0, '62') || pg_temp.tne(1, 1, 0, '61'))),
+            ('trailing byte', pg_temp.tn(3, 1, 1, pg_temp.tne(1, 1, 0, '61') || '00'))
+          ) t(name, v)) s
+ ORDER BY name;
+              name              | code  |              message               |                              detail                               
+--------------------------------+-------+------------------------------------+-------------------------------------------------------------------
+ capacity 0                     | 22P02 | invalid input syntax for type topn | capacity 0 is outside 1 to 100000.
+ capacity 100001                | 22P02 | invalid input syntax for type topn | capacity 100001 is outside 1 to 100000.
+ count 0                        | 22P02 | invalid input syntax for type topn | count 0 or error 0 of counter 0 is not valid.
+ count 2^32 with no bytes       | 22P02 | invalid input syntax for type topn | counter count 4294967295 does not fit the capacity or the length.
+ count above capacity           | 22P02 | invalid input syntax for type topn | counter count 2 does not fit the capacity or the length.
+ count above total              | 22P02 | invalid input syntax for type topn | count 2 or error 0 of counter 0 is not valid.
+ counter cut off                | 22P02 | invalid input syntax for type topn | counter count 1 does not fit the capacity or the length.
+ counts above total             | 22P02 | invalid input syntax for type topn | the counts add up to more than the total.
+ counts ascending               | 22P02 | invalid input syntax for type topn | counter 1 is not in the canonical order.
+ equal counts, items descending | 22P02 | invalid input syntax for type topn | counter 1 is not in the canonical order.
+ error above total / capacity   | 22P02 | invalid input syntax for type topn | error of counter 0 exceeds total / capacity.
+ error equal to count           | 22P02 | invalid input syntax for type topn | count 1 or error 1 of counter 0 is not valid.
+ format 2                       | 22P02 | invalid input syntax for type topn | unsupported sketch format 2.
+ header only                    | 22P02 | invalid input syntax for type topn | value is too short (4 bytes).
+ item length 1025               | 22P02 | invalid input syntax for type topn | item length 1025 of counter 0 is not valid.
+ item length cut off            | 22P02 | invalid input syntax for type topn | item length 5 of counter 0 is not valid.
+ item with a zero byte          | 22P02 | invalid input syntax for type topn | item of counter 0 is not valid in the database encoding.
+ negative count                 | 22P02 | invalid input syntax for type topn | count -1 or error 0 of counter 0 is not valid.
+ negative error                 | 22P02 | invalid input syntax for type topn | count 1 or error -1 of counter 0 is not valid.
+ negative total                 | 22P02 | invalid input syntax for type topn | negative total count.
+ reserved byte                  | 22P02 | invalid input syntax for type topn | reserved header byte is not zero.
+ same item twice                | 22P02 | invalid input syntax for type topn | counter 1 is not in the canonical order.
+ too short                      | 22P02 | invalid input syntax for type topn | value is too short (3 bytes).
+ trailing byte                  | 22P02 | invalid input syntax for type topn | bytes follow the last counter.
+(24 rows)
+
+SELECT name, pg_input_is_valid(v, 'kingres_sketch.topn') AS valid
+  FROM (VALUES
+    ('empty', pg_temp.tn(3, 0, 0, '')),
+    ('two items', pg_temp.tn(3, 3, 2, pg_temp.tne(1, 2, 0, '62') || pg_temp.tne(1, 1, 0, '61'))),
+    ('empty item', pg_temp.tn(3, 1, 1, pg_temp.tne(0, 1, 0, ''))),
+    ('longest item', pg_temp.tn(3, 1, 1, pg_temp.tne(1024, 1, 0, repeat('61', 1024)))),
+    ('error = total / capacity', pg_temp.tn(2, 5, 1, pg_temp.tne(1, 5, 2, '61')))
+  ) t(name, v) ORDER BY name;
+           name           | valid 
+--------------------------+-------
+ empty                    | t
+ empty item               | t
+ error = total / capacity | t
+ longest item             | t
+ two items                | t
+(5 rows)
+
+-- text input of tdigest
+SELECT pg_temp.td(100, 2, 3, 1, 5, pg_temp.tdc(1, 1) || pg_temp.tdc(3.5, 2))::tdigest::bytea AS valid,
+       tdigest_count(pg_temp.td(100, 2, 3, 1, 5, pg_temp.tdc(1, 1) || pg_temp.tdc(3.5, 2))::tdigest);
+                                                                   valid                                                                    | tdigest_count 
+--------------------------------------------------------------------------------------------------------------------------------------------+---------------
+ \x4b01030064000000020000000300000000000000000000000000f03f0000000000001440000000000000f03f01000000000000000000000000000c400200000000000000 |             3
+(1 row)
+
+SELECT name, (e).sql_error_code AS code, (e).message, (e).detail
+  FROM (SELECT name, pg_input_error_info(v, 'kingres_sketch.tdigest') AS e
+          FROM (VALUES
+            ('too short', '\x4b0103'),
+            ('format 2', '\x4b020300' || repeat('00', 32)),
+            ('kind 4 is no value', '\x4b010400' || pg_temp.le(100, 4) || repeat('00', 36)),
+            ('reserved byte', '\x4b010301' || pg_temp.le(100, 4) || repeat('00', 28)),
+            ('compression 9', pg_temp.td(9, 0, 0, 0, 0, '')),
+            ('compression 10001', pg_temp.td(10001, 0, 0, 0, 0, '')),
+            ('too many centroids', pg_temp.td(10, 23, 23, 0, 1, repeat(pg_temp.tdc(0.5, 1), 23))),
+            ('centroid count does not fit the length', pg_temp.td(100, 3, 3, 0, 1, pg_temp.tdc(0.5, 1))),
+            ('trailing bytes', pg_temp.td(100, 1, 1, 0, 1, pg_temp.tdc(0.5, 1) || '00')),
+            ('empty with a total', pg_temp.td(100, 0, 1, 0, 0, '')),
+            ('centroids with no total', pg_temp.td(100, 1, 0, 0, 1, pg_temp.tdc(0.5, 1))),
+            ('empty with a minimum', pg_temp.td(100, 0, 0, 1, 0, '')),
+            ('negative total', pg_temp.td(100, 1, -1, 0, 1, pg_temp.tdc(0.5, 1))),
+            ('weights do not add up', pg_temp.td(100, 2, 5, 0, 1, pg_temp.tdc(0.2, 1) || pg_temp.tdc(0.5, 1))),
+            ('weight 0', pg_temp.td(100, 2, 1, 0, 1, pg_temp.tdc(0.2, 0) || pg_temp.tdc(0.5, 1))),
+            ('negative weight', pg_temp.td(100, 2, 1, 0, 1, pg_temp.tdc(0.2, -1) || pg_temp.tdc(0.5, 2))),
+            ('weights overflow', pg_temp.td(100, 2, 9223372036854775807, 0, 1,
+                                           pg_temp.tdc(0.2, 9223372036854775807) || pg_temp.tdc(0.5, 1))),
+            ('means not sorted', pg_temp.td(100, 2, 2, 0, 1, pg_temp.tdc(0.7, 1) || pg_temp.tdc(0.5, 1))),
+            ('mean below minimum', pg_temp.td(100, 1, 1, 0.6, 1, pg_temp.tdc(0.5, 1))),
+            ('mean above maximum', pg_temp.td(100, 1, 1, 0, 0.4, pg_temp.tdc(0.5, 1))),
+            ('minimum above maximum', pg_temp.td(100, 1, 1, 2, 1, pg_temp.tdc(1.5, 1))),
+            ('negative zero minimum', pg_temp.td(100, 1, 1, '-0'::float8, 1, pg_temp.tdc(0.5, 1))),
+            ('negative zero maximum', pg_temp.td(100, 1, 1, -1, '-0'::float8, pg_temp.tdc(-0.5, 1))),
+            ('negative zero mean', pg_temp.td(100, 1, 1, -1, 1, pg_temp.tdc('-0'::float8, 1))),
+            ('NaN mean', pg_temp.td(100, 1, 1, 0, 1, pg_temp.tdc('NaN', 1))),
+            ('infinite mean', pg_temp.td(100, 1, 1, 0, 1, pg_temp.tdc('Infinity', 1))),
+            ('NaN maximum', pg_temp.td(100, 1, 1, 0, 'NaN', pg_temp.tdc(0.5, 1))),
+            ('infinite minimum', pg_temp.td(100, 1, 1, '-Infinity', 1, pg_temp.tdc(0.5, 1))),
+            ('too long', '\x' || repeat('00', 400000))
+          ) t(name, v)) s
+ ORDER BY name;
+                  name                  | code  |                message                |                             detail                             
+----------------------------------------+-------+---------------------------------------+----------------------------------------------------------------
+ NaN maximum                            | 22P02 | invalid input syntax for type tdigest | minimum or maximum is not valid.
+ NaN mean                               | 22P02 | invalid input syntax for type tdigest | centroid 0 has a mean or weight that is not valid.
+ centroid count does not fit the length | 22P02 | invalid input syntax for type tdigest | length 52 does not match 3 centroids.
+ centroids with no total                | 22P02 | invalid input syntax for type tdigest | total weight 0 does not match 1 centroids.
+ compression 10001                      | 22P02 | invalid input syntax for type tdigest | compression 10001 is outside 10 to 10000.
+ compression 9                          | 22P02 | invalid input syntax for type tdigest | compression 9 is outside 10 to 10000.
+ empty with a minimum                   | 22P02 | invalid input syntax for type tdigest | an empty digest has a minimum or maximum.
+ empty with a total                     | 22P02 | invalid input syntax for type tdigest | total weight 1 does not match 0 centroids.
+ format 2                               | 22P02 | invalid input syntax for type tdigest | unsupported sketch format 2.
+ infinite mean                          | 22P02 | invalid input syntax for type tdigest | centroid 0 has a mean or weight that is not valid.
+ infinite minimum                       | 22P02 | invalid input syntax for type tdigest | minimum or maximum is not valid.
+ kind 4 is no value                     | 22P02 | invalid input syntax for type tdigest | wrong kind of sketch 4, expected 3.
+ mean above maximum                     | 22P02 | invalid input syntax for type tdigest | centroid 0 is out of order or outside the minimum and maximum.
+ mean below minimum                     | 22P02 | invalid input syntax for type tdigest | centroid 0 is out of order or outside the minimum and maximum.
+ means not sorted                       | 22P02 | invalid input syntax for type tdigest | centroid 1 is out of order or outside the minimum and maximum.
+ minimum above maximum                  | 22P02 | invalid input syntax for type tdigest | minimum or maximum is not valid.
+ negative total                         | 22P02 | invalid input syntax for type tdigest | total weight -1 does not match 1 centroids.
+ negative weight                        | 22P02 | invalid input syntax for type tdigest | centroid 0 has a mean or weight that is not valid.
+ negative zero maximum                  | 22P02 | invalid input syntax for type tdigest | minimum or maximum is not valid.
+ negative zero mean                     | 22P02 | invalid input syntax for type tdigest | centroid 0 has a mean or weight that is not valid.
+ negative zero minimum                  | 22P02 | invalid input syntax for type tdigest | minimum or maximum is not valid.
+ reserved byte                          | 22P02 | invalid input syntax for type tdigest | reserved header byte is not zero.
+ too long                               | 22P02 | invalid input syntax for type tdigest | The value is longer than any valid tdigest.
+ too many centroids                     | 22P02 | invalid input syntax for type tdigest | 23 centroids are more than compression 10 allows.
+ too short                              | 22P02 | invalid input syntax for type tdigest | value is too short (3 bytes).
+ trailing bytes                         | 22P02 | invalid input syntax for type tdigest | length 53 does not match 1 centroids.
+ weight 0                               | 22P02 | invalid input syntax for type tdigest | centroid 0 has a mean or weight that is not valid.
+ weights do not add up                  | 22P02 | invalid input syntax for type tdigest | the weights add up to 2, not to the total 5.
+ weights overflow                       | 22P02 | invalid input syntax for type tdigest | the weights overflow.
+(29 rows)
+
+SELECT name, pg_input_is_valid(v, 'kingres_sketch.tdigest') AS valid
+  FROM (VALUES
+    ('empty', pg_temp.td(100, 0, 0, 0, 0, '')),
+    ('one centroid', pg_temp.td(100, 1, 7, 1, 2, pg_temp.tdc(1.5, 7))),
+    ('equal means', pg_temp.td(100, 2, 2, 1, 1, pg_temp.tdc(1, 1) || pg_temp.tdc(1, 1))),
+    ('most centroids', pg_temp.td(10, 22, 22, 0, 1, repeat(pg_temp.tdc(0.5, 1), 22)))
+    ,('zero minimum and mean', pg_temp.td(100, 1, 1, 0, 1, pg_temp.tdc(0, 1)))
+  ) t(name, v) ORDER BY name;
+         name          | valid 
+-----------------------+-------
+ empty                 | t
+ equal means           | t
+ most centroids        | t
+ one centroid          | t
+ zero minimum and mean | t
+(5 rows)
+
+-- binary input is the same validation
+SELECT pg_temp.try('\x4b0103', 'kingres_sketch.tdigest'), pg_temp.try(decode(substr(pg_temp.td(100, 1, 1, 0, 1, pg_temp.tdc(0.5, 1)), 3), 'hex'), 'kingres_sketch.tdigest'),
+       pg_temp.try(decode(substr(pg_temp.tn(3, 1, 1, pg_temp.tne(1, 0, 0, '61')), 3), 'hex'), 'kingres_sketch.topn');
+             try              |  try  |            try            
+------------------------------+-------+---------------------------
+ 22023: invalid tdigest value | valid | 22023: invalid topn value
+(1 row)
+
+CREATE TABLE sketch_io_t (h kingres_sketch.hll, t kingres_sketch.topn, d kingres_sketch.tdigest);
+INSERT INTO sketch_io_t VALUES (hll_empty(4), topn_empty(2), tdigest_empty(10));
+SELECT hll_cardinality(h), topn_total(t), tdigest_count(d) FROM sketch_io_t;
+ hll_cardinality | topn_total | tdigest_count 
+-----------------+------------+---------------
+               0 |          0 |             0
+(1 row)
+
+DROP TABLE sketch_io_t;
+-- negative zero is stored as zero: a value with the bit pattern of -0 in a
+-- minimum, a maximum, a mean or the fraction of a state is refused, so the
+-- bytes of a digest are a function of its content
+WITH b AS (SELECT tdigest_to_bytea(tdigest_agg(0.0::float8)) AS v),
+     c AS (SELECT set_byte(set_byte(v, 27, 128), 43, 128) AS v FROM b)
+SELECT pg_temp.try(v, 'kingres_sketch.tdigest') AS minus_zero_min_and_mean FROM c;
+   minus_zero_min_and_mean    
+------------------------------
+ 22023: invalid tdigest value
+(1 row)
+
+WITH b AS (SELECT tdigest_to_bytea(tdigest_agg(0.0::float8)) AS v)
+SELECT pg_temp.try(set_byte(v, 35, 128), 'kingres_sketch.tdigest') AS minus_zero_max FROM b;
+        minus_zero_max        
+------------------------------
+ 22023: invalid tdigest value
+(1 row)
+
+SELECT tdigest_to_bytea(tdigest_add(tdigest_empty(), '-0'::float8)) = tdigest_to_bytea(tdigest_add(tdigest_empty(), 0)) AS built_as_zero,
+       tdigest_to_bytea(tdigest_agg(x)) = tdigest_to_bytea(tdigest_agg(abs(x))) AS aggregate_as_zero
+  FROM (VALUES ('-0'::float8), (0)) v(x);
+ built_as_zero | aggregate_as_zero 
+---------------+-------------------
+ t             | t
+(1 row)
+
+SELECT sketch_kind(set_byte(set_byte(v, 2, 4), 3, 0) || '\x0000000000000080'::bytea) AS kind4_minus_zero_fraction
+  FROM (SELECT tdigest_to_bytea(tdigest_agg(1.0::float8)) AS v) b;
+ERROR:  invalid tdigest_state value
+DETAIL:  the fraction is not between 0 and 1, or is negative zero.

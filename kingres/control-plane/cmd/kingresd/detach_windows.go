@@ -1,0 +1,9 @@
+// SPDX-License-Identifier: PostgreSQL
+
+//go:build windows
+
+package main
+
+import "os/exec"
+
+func detach(*exec.Cmd) {}

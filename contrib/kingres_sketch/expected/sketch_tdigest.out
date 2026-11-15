@@ -1,0 +1,301 @@
+-- sketch_tdigest: the type tdigest, its functions and aggregates.
+SET search_path = public, kingres_sketch;
+-- empty digests
+SELECT tdigest_empty()::bytea AS empty_default, tdigest_compression(tdigest_empty()),
+       tdigest_count(tdigest_empty()), tdigest_min(tdigest_empty()), tdigest_max(tdigest_empty()),
+       tdigest_quantile(tdigest_empty(), 0.5), tdigest_rank(tdigest_empty(), 1),
+       tdigest_quantile(tdigest_empty(), ARRAY[0.5, 0.9]);
+                               empty_default                                | tdigest_compression | tdigest_count | tdigest_min | tdigest_max | tdigest_quantile | tdigest_rank | tdigest_quantile 
+----------------------------------------------------------------------------+---------------------+---------------+-------------+-------------+------------------+--------------+------------------
+ \x4b0103006400000000000000000000000000000000000000000000000000000000000000 |                 100 |             0 |             |             |                  |              | 
+(1 row)
+
+SELECT tdigest_empty(9);
+ERROR:  tdigest compression must be between 10 and 10000, not 9
+SELECT tdigest_empty(10001);
+ERROR:  tdigest compression must be between 10 and 10000, not 10001
+SELECT tdigest_compression(tdigest_empty(10)), tdigest_compression(tdigest_empty(10000));
+ tdigest_compression | tdigest_compression 
+---------------------+---------------------
+                  10 |               10000
+(1 row)
+
+-- a small set is kept exactly (one centroid per value): quantiles interpolate
+SELECT tdigest_count(d), tdigest_min(d), tdigest_max(d),
+       tdigest_quantile(d, 0), tdigest_quantile(d, 0.5), tdigest_quantile(d, 1),
+       tdigest_quantile(d, 0.25), tdigest_quantile(d, 0.9),
+       tdigest_quantile(d, ARRAY[0, 0.25, 0.5, 0.75, 1, NULL])
+  FROM (SELECT tdigest_agg(i::float8) AS d FROM generate_series(1, 100) i) t;
+ tdigest_count | tdigest_min | tdigest_max | tdigest_quantile | tdigest_quantile | tdigest_quantile | tdigest_quantile | tdigest_quantile |      tdigest_quantile       
+---------------+-------------+-------------+------------------+------------------+------------------+------------------+------------------+-----------------------------
+           100 |           1 |         100 |                1 |             50.5 |              100 |             25.5 |             90.5 | {1,25.5,50.5,75.5,100,NULL}
+(1 row)
+
+SELECT tdigest_rank(d, 0), tdigest_rank(d, 1), tdigest_rank(d, 50), tdigest_rank(d, 50.5),
+       tdigest_rank(d, 100), tdigest_rank(d, 1000), tdigest_rank(d, 'Infinity'), tdigest_rank(d, '-Infinity')
+  FROM (SELECT tdigest_agg(i::float8) AS d FROM generate_series(1, 100) i) t;
+ tdigest_rank | tdigest_rank | tdigest_rank | tdigest_rank | tdigest_rank | tdigest_rank | tdigest_rank | tdigest_rank 
+--------------+--------------+--------------+--------------+--------------+--------------+--------------+--------------
+            0 |        0.005 |        0.495 |          0.5 |            1 |            1 |            1 |            0
+(1 row)
+
+-- one value, ties
+SELECT tdigest_quantile(d, 0.5), tdigest_rank(d, 7), tdigest_rank(d, 6.9), tdigest_rank(d, 7.1)
+  FROM (SELECT tdigest_agg(7::float8) AS d FROM generate_series(1, 5)) t;
+ tdigest_quantile | tdigest_rank | tdigest_rank | tdigest_rank 
+------------------+--------------+--------------+--------------
+                7 |            1 |            0 |            1
+(1 row)
+
+-- errors and NULLs
+SELECT tdigest_quantile(tdigest_empty(), -0.1);
+ERROR:  the fraction must be between 0 and 1
+SELECT tdigest_quantile(tdigest_add(tdigest_empty(), 1), 1.1);
+ERROR:  the fraction must be between 0 and 1
+SELECT tdigest_quantile(tdigest_add(tdigest_empty(), 1), 'NaN'::float8);
+ERROR:  the fraction must be between 0 and 1
+SELECT tdigest_quantile(tdigest_add(tdigest_empty(), 1), ARRAY[0.5, 2]);
+ERROR:  the fraction must be between 0 and 1
+SELECT tdigest_add(tdigest_empty(), 'NaN');
+ERROR:  tdigest does not take NaN or infinite values
+SELECT tdigest_add(tdigest_empty(), 'Infinity');
+ERROR:  tdigest does not take NaN or infinite values
+SELECT tdigest_add(tdigest_empty(), '-Infinity');
+ERROR:  tdigest does not take NaN or infinite values
+SELECT tdigest_add(tdigest_empty(), 1, 0);
+ERROR:  tdigest weight must be at least 1, not 0
+SELECT tdigest_add(tdigest_empty(), 1, -5);
+ERROR:  tdigest weight must be at least 1, not -5
+SELECT tdigest_rank(tdigest_add(tdigest_empty(), 1), 'NaN'::float8);
+ERROR:  tdigest_rank does not take NaN
+SELECT tdigest_add(tdigest_empty(), NULL)::bytea = tdigest_empty()::bytea AS null_value_ignored;
+ null_value_ignored 
+--------------------
+ t
+(1 row)
+
+SELECT tdigest_add(NULL, 1) IS NULL AS null_digest;
+ null_digest 
+-------------
+ t
+(1 row)
+
+SELECT tdigest_count(tdigest_agg(x)), tdigest_min(tdigest_agg(x))
+  FROM (VALUES (1.0::float8), (NULL), (3.0)) t(x);
+ tdigest_count | tdigest_min 
+---------------+-------------
+             2 |           1
+(1 row)
+
+SELECT tdigest_agg(x) IS NOT NULL AS empty_digest, tdigest_count(tdigest_agg(x)),
+       approx_percentile(0.5, x) FROM generate_series(1, 0) x;
+ empty_digest | tdigest_count | approx_percentile 
+--------------+---------------+-------------------
+ t            |             0 |                  
+(1 row)
+
+SELECT tdigest_agg('NaN'::float8);
+ERROR:  tdigest does not take NaN or infinite values
+-- weights
+SELECT tdigest_count(d), tdigest_quantile(d, 0.5), tdigest_min(d), tdigest_max(d)
+  FROM (SELECT tdigest_weighted_agg(x::float8, w, 100) AS d FROM (VALUES (1, 1), (2, 1), (3, 8)) t(x, w)) s;
+ tdigest_count |  tdigest_quantile  | tdigest_min | tdigest_max 
+---------------+--------------------+-------------+-------------
+            10 | 2.7777777777777777 |           1 |           3
+(1 row)
+
+SELECT tdigest_count(tdigest_add(tdigest_add(tdigest_empty(), 5, 3), 6, 4));
+ tdigest_count 
+---------------
+             7
+(1 row)
+
+SELECT tdigest_count(tdigest_add(tdigest_add(tdigest_empty(), 5, 9223372036854775807), 6, 1));
+ERROR:  the total weight of a tdigest overflows bigint
+SELECT tdigest_weighted_agg(1::float8, 0, 100);
+ERROR:  tdigest weight must be at least 1, not 0
+SELECT tdigest_count(tdigest_weighted_agg(x::float8, NULL, 100)) FROM generate_series(1, 3) x;
+ tdigest_count 
+---------------
+             0
+(1 row)
+
+-- compression of an aggregate: repeated by every row of a group
+SELECT tdigest_compression(tdigest_agg(i::float8, 20)) FROM generate_series(1, 10) i;
+ tdigest_compression 
+---------------------
+                  20
+(1 row)
+
+SELECT tdigest_agg(i::float8, 20 + i % 2) FROM generate_series(1, 10) i;
+ERROR:  the compression of the aggregate changed from 21 to 20
+HINT:  The compression must be the same in every row of a group.
+SELECT tdigest_agg(i::float8, 5) FROM generate_series(1, 10) i;
+ERROR:  tdigest compression must be between 10 and 10000, not 5
+-- -0 and 0 are one value
+SELECT tdigest_add(tdigest_empty(), '-0'::float8)::bytea = tdigest_add(tdigest_empty(), 0)::bytea AS zero_signs;
+ zero_signs 
+------------
+ t
+(1 row)
+
+-- union: weights add; the compression must be the same
+SELECT tdigest_count(u), tdigest_min(u), tdigest_max(u), tdigest_quantile(u, 0.5)
+  FROM (SELECT tdigest_union((SELECT tdigest_agg(i::float8) FROM generate_series(1, 50) i),
+                             (SELECT tdigest_agg(i::float8) FROM generate_series(51, 100) i)) AS u) t;
+ tdigest_count | tdigest_min | tdigest_max | tdigest_quantile 
+---------------+-------------+-------------+------------------
+           100 |           1 |         100 |             50.5
+(1 row)
+
+SELECT tdigest_union(tdigest_empty(50), tdigest_empty(100));
+ERROR:  cannot merge digests of compression 50 and 100
+SELECT tdigest_union(tdigest_empty(), NULL) IS NULL AS null_union;
+ null_union 
+------------
+ t
+(1 row)
+
+SELECT tdigest_count(tdigest_union_agg(d)), tdigest_quantile(tdigest_union_agg(d), 0.5)
+  FROM (SELECT tdigest_agg(i::float8) AS d FROM generate_series(1, 90) i GROUP BY i % 3) t;
+ tdigest_count | tdigest_quantile 
+---------------+------------------
+            90 |             45.5
+(1 row)
+
+SELECT tdigest_union_agg(NULL::tdigest) IS NOT NULL AS empty_union;
+ empty_union 
+-------------
+ t
+(1 row)
+
+-- approx_percentile: the fraction is the first argument and part of the state
+SELECT approx_percentile(0.5, i::float8), approx_percentile(0, i::float8),
+       approx_percentile(1, i::float8), approx_percentile(0.5, i::float8, 50)
+  FROM generate_series(1, 99) i;
+ approx_percentile | approx_percentile | approx_percentile | approx_percentile 
+-------------------+-------------------+-------------------+-------------------
+                50 |                 1 |                99 |                50
+(1 row)
+
+SELECT approx_percentile(0.5 + i / 1000.0, i::float8) FROM generate_series(1, 3) i;
+ERROR:  the fraction of approx_percentile changed from 0.501 to 0.502
+HINT:  The fraction must be a constant of the call.
+SELECT approx_percentile(1.5, i::float8) FROM generate_series(1, 3) i;
+ERROR:  the fraction must be between 0 and 1
+SELECT approx_percentile(NULL, i::float8) FROM generate_series(1, 3) i;
+ approx_percentile 
+-------------------
+                  
+(1 row)
+
+SELECT approx_percentile(0.5, i::float8) FROM generate_series(1, 3) i WHERE i > 5;
+ approx_percentile 
+-------------------
+                  
+(1 row)
+
+-- a larger input stays within the number of centroids and the rank error
+SELECT tdigest_count(d), tdigest_min(d), tdigest_max(d),
+       (get_byte(d::bytea, 8) + 256 * get_byte(d::bytea, 9)) AS centroids,
+       round(tdigest_quantile(d, 0.5)::numeric, -2) AS median,
+       round(tdigest_quantile(d, 0.99)::numeric, -3) AS p99
+  FROM (SELECT tdigest_agg(i::float8) AS d FROM generate_series(1, 100000) i) t;
+ tdigest_count | tdigest_min | tdigest_max | centroids | median |  p99  
+---------------+-------------+-------------+-----------+--------+-------
+        100000 |           1 |      100000 |        72 |  50000 | 99000
+(1 row)
+
+-- canonical bytes: rebuilding a value from its bytes gives the same bytes
+SELECT d::bytea = d::bytea::tdigest::bytea AS rebuilt_same,
+       tdigest_union(d, tdigest_empty())::bytea = d::bytea AS union_with_empty
+  FROM (SELECT tdigest_agg(i::float8) AS d FROM generate_series(1, 5000) i) t;
+ rebuilt_same | union_with_empty 
+--------------+------------------
+ t            | t
+(1 row)
+
+-- as a window function
+SELECT i, tdigest_count(tdigest_agg(i::float8) OVER (ORDER BY i)) AS running_count,
+       approx_percentile(0.5, i::float8) OVER (ORDER BY i) AS running_median
+  FROM generate_series(1, 6) i;
+ i | running_count | running_median 
+---+---------------+----------------
+ 1 |             1 |              1
+ 2 |             2 |            1.5
+ 3 |             3 |              2
+ 4 |             4 |            2.5
+ 5 |             5 |              3
+ 6 |             6 |            3.5
+(6 rows)
+
+-- a NULL compression is an error in every row, so the answer does not depend on the order of the rows
+SELECT tdigest_compression(tdigest_agg(x, c)) FROM (VALUES (1.0::float8, 20), (2.0, NULL::int)) v(x, c);
+ERROR:  the compression argument of the aggregate must not be NULL
+HINT:  Give the same non-NULL compression in every row.
+SELECT tdigest_compression(tdigest_agg(x, c)) FROM (VALUES (1.0::float8, NULL::int), (2.0, 20)) v(x, c);
+ERROR:  the compression argument of the aggregate must not be NULL
+HINT:  Give the same non-NULL compression in every row.
+SELECT tdigest_compression(tdigest_weighted_agg(x, 1, c)) FROM (VALUES (1.0::float8, NULL::int), (2.0, 20)) v(x, c);
+ERROR:  the compression argument of the aggregate must not be NULL
+HINT:  Give the same non-NULL compression in every row.
+SELECT approx_percentile(0.5, x, c) FROM (VALUES (1.0::float8, NULL::int), (2.0, 20)) v(x, c);
+ERROR:  the compression argument of the aggregate must not be NULL
+HINT:  Give the same non-NULL compression in every row.
+SELECT approx_percentile(0.5, x, c) FROM (VALUES (1.0::float8, 20), (2.0, NULL::int)) v(x, c);
+ERROR:  the compression argument of the aggregate must not be NULL
+HINT:  Give the same non-NULL compression in every row.
+-- a NULL fraction ignores the row, in every order
+SELECT approx_percentile(q, x) FROM (VALUES (NULL::float8, 1.0::float8), (0.5, 3.0), (0.5, 5.0)) v(q, x);
+ approx_percentile 
+-------------------
+                 4
+(1 row)
+
+SELECT approx_percentile(q, x) FROM (VALUES (0.5::float8, 3.0::float8), (0.5, 5.0), (NULL, 1.0)) v(q, x);
+ approx_percentile 
+-------------------
+                 4
+(1 row)
+
+-- values near the limit of the double type stay inside [min, max]
+SELECT tdigest_quantile(d, 0.5) AS q50, tdigest_quantile(d, 0.25) AS q25, tdigest_quantile(d, 0.75) AS q75,
+       tdigest_quantile(d, 0) AS q0, tdigest_quantile(d, 1) AS q1, tdigest_rank(d, 0) AS rank0,
+       tdigest_rank(d, 1.7e308) AS rank_max, tdigest_rank(d, -1.7e308) AS rank_min
+  FROM (SELECT tdigest_agg(x) d FROM (VALUES (-1.7e308::float8), (1.7e308)) v(x)) s;
+ q50 |    q25    |   q75    |    q0     |    q1    | rank0 | rank_max | rank_min 
+-----+-----------+----------+-----------+----------+-------+----------+----------
+   0 | -1.7e+308 | 1.7e+308 | -1.7e+308 | 1.7e+308 |   0.5 |        1 |     0.25
+(1 row)
+
+SELECT bool_and(v >= -1.7e308 AND v <= 1.7e308) AS all_in_range, count(*) AS n
+  FROM (SELECT tdigest_quantile(d, q / 100.0) AS v
+          FROM (SELECT tdigest_agg(x) d FROM (VALUES (-1.7e308::float8), (-1.7e308), (1.7e308), (1.7e308), (0), (1e300), (-1e300)) v(x)) s,
+               generate_series(0, 100) q) t;
+ all_in_range |  n  
+--------------+-----
+ t            | 101
+(1 row)
+
+SELECT tdigest_quantile(d, 0.5) AS between_huge_values, tdigest_min(d), tdigest_max(d)
+  FROM (SELECT tdigest_agg(x, 10) d FROM (VALUES (1.7e308::float8), (1.6e308), (-1.6e308), (-1.7e308)) v(x)) s;
+ between_huge_values | tdigest_min | tdigest_max 
+---------------------+-------------+-------------
+                   0 |   -1.7e+308 |    1.7e+308
+(1 row)
+
+SELECT tdigest_quantile(tdigest_union(a, b), 0.5) IS NOT NULL AS merged_ok
+  FROM (SELECT tdigest_add(tdigest_empty(), -1.7e308) a, tdigest_add(tdigest_empty(), 1.7e308) b) s;
+ merged_ok 
+-----------
+ t
+(1 row)
+
+SELECT tdigest_count(d), tdigest_quantile(d, 0.5) >= tdigest_min(d) AND tdigest_quantile(d, 0.5) <= tdigest_max(d) AS median_in_range,
+       get_byte(d::bytea, 8) AS centroids
+  FROM (SELECT tdigest_agg(x, 10) d FROM generate_series(1, 400) i, LATERAL (SELECT CASE WHEN i % 2 = 0 THEN 1.7e308 ELSE -1.7e308 END::float8 AS x) q) s;
+ tdigest_count | median_in_range | centroids 
+---------------+-----------------+-----------
+           400 | t               |         6
+(1 row)
+
