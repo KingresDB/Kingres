@@ -12,7 +12,7 @@ documentation (`contrib/kingres_ledger/README.md` and
 exported from a real server (see "Cross-check against the server").
 
 It is standard library Go only, no third-party modules, so that an auditor can
-read all of it (about 2,000 lines outside the tests) and build it with one
+read all of it (about 4,000 lines outside the tests) and build it with one
 command.
 
 ## What it can and cannot prove
@@ -55,12 +55,14 @@ committed). `go.mod` has no `require` line: only the standard library is used.
 |---|---|
 | 0 | everything that was asked for was verified (`VERIFIED` or `CONSISTENT` is printed) |
 | 1 | a verification failed (the failed step is named); the word `VERIFIED` is never printed |
-| 2 | usage or input error: a flag is missing or wrong, a file cannot be read, or the trusted input (digest, columns file, block export when it cannot be parsed as an export) is malformed; nothing was verified |
+| 2 | usage or input error: a flag is missing or wrong, a file cannot be read, or the trusted input (digest, columns file, trust file, block export when it cannot be parsed as an export) is malformed; nothing was verified |
+| 3 | incomplete: nothing failed, but something that was asked for could not be checked with the inputs and flags given (today: a tile of a log is missing from the directory); `INCOMPLETE` is printed and the missing items are listed; `VERIFIED` is never printed. Only the commands of phase 7 (`checkpoint`, `consistency`) can end with 3; a failure always wins over an incomplete check |
 
 A malformed **proof** is a failed verification (status 1, step `parse`): the
 proof is the thing under test. A malformed **digest** is an input error
 (status 2): the trusted anchor is unusable. `--json` prints one JSON object
-(`command`, `verified`, `steps`, `failed_step`, `error`, `not_proved`, `info`)
+(`command`, `verified`, `steps`, `failed_step`, `error`, `not_proved`, `info`, and for status 3
+`incomplete` and `missing`)
 instead of text; the exit status is the same.
 
 ## Subcommands
@@ -199,6 +201,91 @@ psql -X -At -c "SELECT json_build_object('height', height, 'hash_version', hash_
 `kingres.ledger_blocks` is readable by PUBLIC. This verifies the headers only: it
 says nothing about transactions or rows.
 
+### `checkpoint`, `consistency`, `trust` (phase 7, step 1)
+
+These commands check signed checkpoints of tile logs, the format of
+`kingres/docs/design/ledger-phase7.md` (sections 3, 4 and 7). They need a trust
+file that **you** made from a key you obtained outside the cluster. They are
+built from the public C2SP texts `signed-note`, `tlog-checkpoint` and
+`tlog-tiles` and from RFC 6962 and RFC 9162, with Ed25519 only.
+
+```
+kingres-verify trust init --origin-prefix P (--public-key B64 | --public-key-file F) --fingerprint HEX [--name LABEL] [--out FILE|-]
+kingres-verify trust show --trust trust.json [--json]
+kingres-verify checkpoint --trust trust.json --log chain:<id>[:e<N>]|aggregate:<id> [--source DIR | --note FILE] [--min-size N] [--now TIME] [--json]
+kingres-verify consistency --trust trust.json --log <as above> --old NOTEFILE|SIZE:ROOT [--new NOTEFILE] [--source DIR] [--now TIME] [--json]
+```
+
+**`trust init`** refuses to run without `--fingerprint` (the SHA-256 of the
+public key in hex; upper case and colons are accepted) and refuses a key that
+does not match it, so a mistyped or swapped key is noticed. It never overwrites
+a file. **`trust show`** validates and prints a file. `trust follow` (rotation
+events of the publication) is not built yet and exits with status 2.
+
+**`checkpoint`** verifies one checkpoint note: the note is well formed, at
+least one signature is by a key of the trust file, no signature of such a key
+is wrong, the origin is the origin of the named log below the trusted prefix,
+the size and the root are well formed (`--min-size` fails a smaller tree). It
+reads `<source>/c/<id>/e<N>/checkpoint` (aggregate: `<source>/a/<id>/checkpoint`)
+or `--note`. Without `:e<N>` the epoch is taken from the source only when it
+holds exactly one epoch of that chain; with `--note` the epoch must be given.
+It checks no tile. A key whose `not_before` is later than `--now` (default the
+system clock, printed) is not used. `not_after` is reported, not enforced: a
+checkpoint has no time, and the design says a retired key's checkpoints stay
+valid (section 3.3).
+
+**`consistency`** checks that the log at the new checkpoint (`--new`, default
+the checkpoint in `--source`) extends the log at the old one (`--old`: a note
+file, verified the same way, or `SIZE:ROOT` with the root in base64, taken as
+you give it). It reads the proof hashes from the tiles under
+`<source>/c/<id>/e<N>/tile/...` (full and partial tiles; a partial tile that
+is missing is read from the full tile), and verifies them against both roots with
+RFC 9162 section 2.1.4.2. A new size smaller than the old one fails (the log
+went back). Missing tiles give status 3; a tile of the wrong size or with
+wrong content gives status 1. A source is a directory (a tar file and an HTTP
+source are not built yet).
+
+Formats, with the specification they follow:
+
+- **Signed note** (signed-note, "Format"): UTF-8 without control characters
+  except newline; the text ends in a newline; the last blank line separates it
+  from one or more lines `U+2014 SP name SP base64(4-byte key id || signature)`.
+  Key names are non-empty without Unicode spaces or `+`. Base64 must be
+  canonical (RFC 4648 3.5), which is checked by re-encoding. Two lines with the
+  same name and key id are rejected (tlog-checkpoint). At most 32 signatures
+  and 1 MiB. Key id = `SHA-256(name || 0x0A || 0x01 || public key)[:4]`.
+  A line whose name and key id match no trusted key is ignored; a line that
+  matches one must verify, or the whole note is rejected (the specification
+  says SHOULD); no verified line means rejection.
+- **Checkpoint** (tlog-checkpoint): at least three non-empty lines, origin,
+  size as a canonical decimal below 2^62, root as canonical base64 of 32 bytes;
+  further lines are extension lines, kept and reported but without meaning here.
+  The origin follows tlog-cosignature: at most 255 bytes, no spaces, `+` or
+  control characters. A size 0 checkpoint must carry the hash of the empty
+  string. The key name of a log's signature is its origin
+  (`<prefix>/c/<chain_id>/e<epoch>`, `<prefix>/a/<aggregate_id>`).
+- **Tiles** (tlog-tiles): height 8, hashes of 32 bytes, a full tile is 8192
+  bytes; path `tile/<L>/<N>[.p/<W>]` with L from 0 to 63 and N in three digit
+  groups, every group but the last prefixed `x` (`x001/x234/067`); a partial
+  tile has 1 to 255 hashes; the width at level l for size s is
+  `floor(s / 256^l) mod 256`. Paths are parsed canonically (no leading zeros,
+  no `..`); a tile of any other length is rejected. Entry bundles
+  (`tile/entries/<N>`, big-endian `u16` length prefixes) can be parsed and are
+  not used yet.
+- **Trust file** (design 7.2): strict JSON; `format` 1, `origin_prefix`, `keys`
+  (`name` label, `public_key` base64, `fingerprint` that must equal the
+  SHA-256 of the key, `not_before`, `not_after` as RFC 3339 UTC or null),
+  optional `tsa_roots` (PEM certificates, validated), `client_keys` (`key_id`
+  must equal the first 16 bytes of the SHA-256 of the key), and `witnesses`,
+  which must be empty. Unknown members are rejected.
+
+Not built yet (later steps of the design): `trust follow` and rotation events
+(`key-added`, `key-retired`, `key-revoked`), tar and HTTP sources, `proof
+--bundle`, `aggregate`, `anchors`, `attestation`, `bundle`, `monitor`,
+`release verify`. The text of this section is the contract of step 1; where
+the design and the specification differ, the specification was followed (see
+"Findings about the phase 7 design").
+
 ### `version`, `--help`
 
 `kingres-verify version`, `kingres-verify --help`, `kingres-verify <command> --help`
@@ -255,18 +342,22 @@ digests and the headers inside the proofs, and (in `internal/proof`) that every
 single-field and every single-byte mutation of a fixture proof is rejected.
 
 Fuzz targets (kept): `FuzzParse` (jsonx, rowfile), `FuzzDecodeHex`, `FuzzEncodeRow`
-(format), `FuzzParseDigest`, `FuzzParseBlocks` (chain), `FuzzVerify` (proof).
+(format), `FuzzParseDigest`, `FuzzParseBlocks` (chain), `FuzzVerify` (proof), and for phase 7 `FuzzParse` (signednote, trust), `FuzzVerify` (checkpoint), `FuzzParseTilePath` and `FuzzParseTile` (tlog), `FuzzParseLogSpec` (cli). `scripts/fuzz.sh [seconds]` runs every target for a short bounded time; the seeds (the published vectors) also run in `go test ./...`.
 Run one with `go test ./internal/proof -run '^$' -fuzz '^FuzzVerify$' -fuzztime 30s`.
 
 ## Layout
 
 | Package | Purpose |
 |---|---|
-| `internal/merkle` | RFC 6962 hashes, tree root, RFC 9162 audit path verification |
+| `internal/merkle` | RFC 6962 hashes, tree root, RFC 9162 audit path and consistency proof verification |
 | `internal/format` | every hash input, one function each, with the domain tag as a named constant and the README text quoted; strict hex |
 | `internal/jsonx` | strict JSON (duplicate keys, invalid UTF-8, lone surrogates, plain integers in range) with error paths |
 | `internal/chain` | digests, block headers, the block chain, digest sets |
 | `internal/proof` | proof parsing and the verification steps |
+| `internal/signednote` | signed notes (C2SP signed-note), Ed25519, key ids, verification against trusted keys |
+| `internal/tlog` | tile paths, tile and entry bundle parsing, tree hashes read from tiles, inclusion and consistency proofs |
+| `internal/checkpoint` | tlog-checkpoint parsing and verification of a signed checkpoint |
+| `internal/trust` | the trust file: parsing, validation, writing, keys per log origin |
 | `internal/rowfile` | the columns file of `row-hash` |
 | `internal/cli` | the command line (`cmd/kingres-verify` is a thin `main`) |
 
@@ -409,3 +500,59 @@ the wording to add.
     JSON is produced by `jsonb`, so key order and spacing (`"op": "I"` with a
     space) are not significant; say so: *"Key order and white space are not
     significant."*
+
+## Findings about the phase 7 design (step 1)
+
+Checked against the public text of C2SP `signed-note`, `tlog-checkpoint`,
+`tlog-cosignature` (for the definition of an origin), `tlog-tiles`, RFC 6962
+section 2.1 and RFC 9162 sections 2.1.1 to 2.1.4. Where the design and a
+specification differ, the specification was followed. The test vector of the
+signed-note specification (example key and note) is used; the checkpoint
+example of tlog-checkpoint has no published key, so only its text is parsed.
+
+1. **Consistency path length.** Design 4.10 says "at most `2*ceil(log2 n)`
+   hashes"; RFC 9162 2.1.4.1 says "bounded above by `ceil(log2(n)) + 1`". The
+   verifier accepts at most 65 hashes.
+2. **Extension lines.** Design 3.2.4 says a checkpoint has three non-empty
+   lines and no extension lines; tlog-checkpoint allows optional non-empty
+   extension lines after the third. The verifier accepts and reports them
+   (the design's own checkpoints have none).
+3. **Origin rules.** The design states key-name rules only. tlog-checkpoint
+   takes the origin from tlog-cosignature: at most 255 bytes, no Unicode spaces,
+   `+` or control characters. Enforced; the trust file limits `origin_prefix`
+   to 160 bytes so that `/c/<64 hex>/e<digits>` fits.
+4. **Key names.** Design 7.2 says a key "whose name is `origin` or
+   `origin_prefix`" is tried, but the `name` of a trust file key (`"2026"`) is
+   a label. Implemented: the note key name of every signature is the log origin
+   (3.2.4), which must be the prefix or below it; each pinned public key is
+   tried under that name. The cluster-level name `<prefix>` is accepted for the
+   origin of a later step (events).
+5. **Validity windows against rotation.** Design 7.4 applies `not_before` and
+   `not_after` to `--now`, but 3.3 says a retired key's checkpoints stay valid
+   for ever, and a checkpoint carries no time. `not_before` is applied to
+   `--now`; `not_after` is reported, not enforced.
+6. **Exit status 2 for the note.** Design 7.4 lists a malformed "checkpoint
+   note given as the anchor of trust" under status 2. For `checkpoint` the note
+   is the thing under test, so a malformed note is status 1 (step `parse`), like
+   a malformed proof. For `consistency` the `--old` note is the anchor: unreadable
+   or not a note is 2, a bad signature or origin is 1.
+7. **Output order.** Design 7.4 says the final line is `VERIFIED`, `FAILED` or
+   `INCOMPLETE`; the existing commands print the headline first and the steps
+   after. The new commands do the same as the existing ones.
+8. **Duplicate signature lines.** The signed-note text does not forbid two
+   lines with the same name and key id; tlog-checkpoint does. Rejected for every
+   note, as design 7.6 (3) lists.
+9. **A forged line from a known key.** signed-note says SHOULD reject; the
+   verifier always rejects. A line of an unknown key is ignored.
+10. **Epoch.** Design 7.4 shows `:e<N>` as optional. Without it the epoch is
+    taken from the source only if it holds exactly one epoch; a checkpoint file
+    needs it given.
+11. **Partial tiles.** Design 4.4 deletes a partial tile 24 hours after its
+    full tile; tlog-tiles allows clients to fall back to the full tile, which
+    the reader does (the first `W` hashes).
+12. **Sizes are not authenticated by a proof.** A path that verifies for size
+    `n` can also verify for `n + 1` for the same root (observed in the tests),
+    so sizes are only meaningful through a signed checkpoint, which binds size
+    and root. Every command takes sizes from checkpoints.
+13. **Sources.** Design 4.6 and 7.4 let the verifier read a tar file or an HTTP
+    base URL; step 1 reads a directory only.

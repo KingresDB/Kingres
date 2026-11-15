@@ -1864,3 +1864,42 @@ implementer checks it and records the answer in the work log.
 18. The statement that the Dashboard has no ledger card and that the Ledger page has no tab bar is from the
     committed `DashboardPage.vue` and `LedgerPage.vue` by search, not by a full reading.
 
+## 14. Corrections found while building
+
+Step 1 (the verifier core) was built against the specifications themselves. Where this document and a
+specification differed, the specification was followed; the points are listed here so that later steps
+build to the corrected rule. The verifier's README has the same list with the reasons
+("Findings about the phase 7 design (step 1)").
+
+1. **Length of a consistency proof (4.10).** The bound is `ceil(log2(n)) + 1` hashes (RFC 9162, 2.1.4.1),
+   not `2*ceil(log2 n)`. The verifier accepts at most 65.
+2. **Extension lines of a checkpoint (3.2.4).** `tlog-checkpoint` allows lines after the third. The
+   verifier accepts and reports them; `kingresd` writes none.
+3. **Origin of a checkpoint.** The origin follows the rules of `tlog-cosignature`: at most 255 bytes, no
+   space, no `+`, no control character. The origin prefix of a cluster is limited to 160 bytes so that the
+   longest log origin fits.
+4. **Key names (7.2).** The key name on a signature line of a checkpoint is the origin of the log
+   (`<prefix>/c/<id>/e<N>` or `<prefix>/a/<id>`). The member `name` of a key in the trust file is a label
+   only. The cluster-level name `<prefix>` is for the signed events of a later step.
+5. **Validity windows of keys (3.3 against 7.4).** A checkpoint carries no time, and a retired key's
+   checkpoints stay valid. `not_before` is enforced against `--now`; `not_after` is reported and not
+   enforced. Which signatures of a revoked key are still trusted is decided by anchors, as 3.3 says.
+6. **Exit status for a malformed note (7.4).** When the note is the thing under test (`checkpoint`), a
+   malformed note is status 1. When it is the anchor of trust (`consistency --old`), an unreadable note is
+   status 2 and a bad signature or origin is status 1.
+7. **Order of the output (7.4).** The headline (VERIFIED, FAILED, INCOMPLETE) is the first line, as in
+   the commands that already existed, not the last.
+8. **Duplicate signature lines.** Two lines with the same name and key id are rejected for every note.
+9. **A bad signature from a known key** always rejects the note (the specification says SHOULD).
+10. **Epoch in `--log` (7.4).** Without `:e<N>` the epoch is taken from the source only if exactly one
+    epoch directory exists; with `--note` it must be given.
+11. **Partial tiles (4.4).** A reader that does not find a partial tile falls back to the full tile, as
+    `tlog-tiles` allows, so deleting partial tiles after 24 hours is safe for the verifier.
+12. **Sizes.** A proof that verifies for a size can also verify for a neighbouring size with the same
+    root, so a size is only meaningful when it comes from a signed checkpoint. Every command takes sizes
+    from checkpoints.
+13. **Sources (4.6, 7.4).** Step 1 reads a directory. `.tar.gz` and HTTP sources belong to step 7.
+
+Of section 13: item 2 (test vectors) is settled for signed notes (the example key and note of the
+specification are in the tests; the checkpoint example has no published key), item 3 (entry bundles at
+the standard path) and item 4 (RFC 9162 sections 2.1.3.2 and 2.1.4.2) were checked against the source.

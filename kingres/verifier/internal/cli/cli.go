@@ -30,6 +30,9 @@ const (
 	ExitFailed = 1
 	// ExitUsage means a usage or input error: nothing was verified.
 	ExitUsage = 2
+	// ExitIncomplete means nothing failed, but something that was asked for
+	// could not be checked with the inputs and flags given.
+	ExitIncomplete = 3
 )
 
 const (
@@ -47,10 +50,14 @@ Commands:
   row-hash      compute a row hash from the binary send form of its columns
   digest-chain  check that digests of one chain exported at different times agree
   blocks        recompute the block hash chain from an export of the block headers
+  checkpoint    verify a signed checkpoint of a tile log against a trust file
+  consistency   check that a log checkpoint extends an earlier one, from tiles
+  trust         create (init) or print (show) a trust file
   version       print the version
 
 Run "kingres-verify <command> --help" for the flags of a command.
-Exit status: 0 verified, 1 verification failed, 2 usage or input error.
+Exit status: 0 verified, 1 verification failed, 2 usage or input error,
+3 incomplete (nothing failed, but something asked for could not be checked).
 `
 
 type env struct {
@@ -81,13 +88,24 @@ func Run(args []string, stdout, stderr io.Writer, version string) int {
 		return e.runDigestChain(args[1:])
 	case "blocks":
 		return e.runBlocks(args[1:])
+	case "checkpoint":
+		return e.runCheckpoint(args[1:])
+	case "consistency":
+		return e.runConsistency(args[1:])
+	case "trust":
+		return e.runTrust(args[1:])
 	}
-	fmt.Fprintf(stderr, "kingres-verify: unknown command %q, expected one of proof, row-hash, digest-chain, blocks, version\n", args[0])
+	fmt.Fprintf(stderr, "kingres-verify: unknown command %q, expected one of proof, row-hash, digest-chain, blocks, checkpoint, consistency, trust, version\n", args[0])
 	return ExitUsage
 }
 
 // newFlags creates a flag set that prints its help to stdout.
 func (e *env) newFlags(name, synopsis, help string) (*flag.FlagSet, *bool) {
+	return e.newFlagsWithExit(name, synopsis, help, "0 verified, 1 verification failed, 2 usage or input error.")
+}
+
+// newFlagsWithExit is newFlags with its own text for the exit statuses.
+func (e *env) newFlagsWithExit(name, synopsis, help, exitText string) (*flag.FlagSet, *bool) {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	jsonOut := fs.Bool("json", false, "print the result as JSON")
@@ -96,7 +114,7 @@ func (e *env) newFlags(name, synopsis, help string) (*flag.FlagSet, *bool) {
 		fs.SetOutput(e.stdout)
 		fs.PrintDefaults()
 		fs.SetOutput(io.Discard)
-		fmt.Fprint(e.stdout, "\nExit status: 0 verified, 1 verification failed, 2 usage or input error.\n")
+		fmt.Fprint(e.stdout, "\nExit status: "+exitText+"\n")
 	}
 	return fs, jsonOut
 }
@@ -125,6 +143,9 @@ type jsonOutput struct {
 	InputErr  bool       `json:"input_error,omitempty"`
 	Info      any        `json:"info,omitempty"`
 	NotProved []string   `json:"not_proved,omitempty"`
+	// Incomplete and Missing are used by exit status 3 only.
+	Incomplete bool     `json:"incomplete,omitempty"`
+	Missing    []string `json:"missing,omitempty"`
 }
 
 type stepJSON struct {
