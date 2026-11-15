@@ -299,7 +299,6 @@ CLUSTER r1 USING r1_i;
 ERROR:  index "r1_i" for table "r1" does not exist
 VACUUM FULL r1;
 REINDEX TABLE r1;
-NOTICE:  table "r1" has no indexes to reindex
 -- TABLESAMPLE
 SELECT count(*) FROM r1 TABLESAMPLE SYSTEM (50);
 ERROR:  TABLESAMPLE is not supported on columnar tables

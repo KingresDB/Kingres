@@ -76,6 +76,16 @@ kc_scan_begin(Relation rel, Snapshot snapshot, const bool *needed,
 	int			i;
 	int			nvisible;
 
+	/*
+	 * Maintenance (compaction) reads what is committed, with the rule that its
+	 * own deletions are past, and takes part in no serializable bookkeeping.
+	 */
+	if (flags & KC_SCAN_MAINTENANCE)
+	{
+		snapshot = NULL;
+		flags &= ~KC_SCAN_MAINTENANCE;
+	}
+
 	/* the leader's unflushed rows are invisible to a worker: refuse, never answer wrongly */
 	if (IsParallelWorker())
 		ereport(ERROR,
@@ -107,7 +117,8 @@ kc_scan_begin(Relation rel, Snapshot snapshot, const bool *needed,
 			(needed == NULL || needed[i]);
 
 	kc_check_snapshot_age(rel, snapshot);
-	PredicateLockRelation(rel, snapshot);
+	if (snapshot != NULL)
+		PredicateLockRelation(rel, snapshot);
 	cs = kc_catalog_snapshot(snapshot, &mvcc);
 	scan->cat_snap = cs;
 	scan->all_own_rows = !mvcc;
@@ -165,6 +176,9 @@ kc_scan_end(KcScan *scan)
 {
 	if (scan->pinned)
 		kc_write_pin_relation(RelationGetRelid(scan->rel), -1);
+	if (scan->npend > 0)
+		kc_write_pending_release(RelationGetRelid(scan->rel), scan->pend,
+								 scan->npend);
 	MemoryContextDelete(scan->scan_cxt);
 }
 

@@ -64,6 +64,8 @@ typedef struct KcWriteBuf
 	Datum	   *vals;
 	bool	   *nulls;
 	CommandId  *cids;
+	uint32	   *sizes;			/* bytes of each by-reference value, else 0 */
+	int			refs;			/* scans that hold a reference to this buffer */
 	Size		bytes;
 	KcOptions	opts;
 } KcWriteBuf;
@@ -72,6 +74,7 @@ typedef struct KcRelState
 {
 	Oid			relid;			/* hash key */
 	int			pins;
+	bool		frozen;			/* stripes get a frozen creator (kc_write_set_frozen) */
 	List	   *bufs;			/* KcWriteBuf *, outermost first */
 } KcRelState;
 
@@ -159,6 +162,7 @@ kc_state_get(Oid relid, bool create)
 	if (st && !found)
 	{
 		st->pins = 0;
+		st->frozen = false;
 		st->bufs = NIL;
 	}
 	return st;
@@ -171,8 +175,11 @@ kc_buf_create(KcRelState *st, Relation rel, int ncols)
 	MemoryContext cxt;
 	KcMetaData meta;
 
+	/* small to start with: a transaction may have a buffer per subtransaction */
 	cxt = AllocSetContextCreate(kc_write_cxt, "kingres_columnar rows",
-								ALLOCSET_DEFAULT_SIZES);
+								ALLOCSET_DEFAULT_MINSIZE,
+								ALLOCSET_SMALL_INITSIZE,
+								ALLOCSET_DEFAULT_MAXSIZE);
 	b = MemoryContextAllocZero(kc_write_cxt, sizeof(KcWriteBuf));
 	b->serial = kc_next_serial++;
 	b->relid = RelationGetRelid(rel);
@@ -206,6 +213,7 @@ kc_buf_clear(KcWriteBuf *b)
 	b->vals = NULL;
 	b->nulls = NULL;
 	b->cids = NULL;
+	b->sizes = NULL;
 	b->bytes = 0;
 }
 
@@ -222,7 +230,11 @@ kc_buf_reserve(KcWriteBuf *b, uint32 extra)
 	if (need <= b->cap)
 		return;
 	{
-		uint32		ncap = b->cap ? b->cap : 1024;
+		/*
+		 * Start small: a subtransaction that inserts one row must not cost
+		 * thousands of row slots.  A bulk load doubles its way up.
+		 */
+		uint32		ncap = b->cap ? b->cap : 16;
 		MemoryContext old = MemoryContextSwitchTo(b->cxt);
 
 		while (ncap < need)
@@ -232,12 +244,18 @@ kc_buf_reserve(KcWriteBuf *b, uint32 extra)
 			b->vals = palloc_array(Datum, (Size) ncap * b->ncols);
 			b->nulls = palloc_array(bool, (Size) ncap * b->ncols);
 			b->cids = palloc_array(CommandId, ncap);
+			b->sizes = palloc0_array(uint32, (Size) ncap * b->ncols);
 		}
 		else
 		{
+			Size		oldn = (Size) b->cap * b->ncols;
+
 			b->vals = repalloc(b->vals, sizeof(Datum) * (Size) ncap * b->ncols);
 			b->nulls = repalloc(b->nulls, (Size) ncap * b->ncols);
 			b->cids = repalloc(b->cids, sizeof(CommandId) * ncap);
+			b->sizes = repalloc(b->sizes, sizeof(uint32) * (Size) ncap * b->ncols);
+			memset(&b->sizes[oldn], 0,
+				   sizeof(uint32) * ((Size) ncap * b->ncols - oldn));
 		}
 		b->cap = ncap;
 		MemoryContextSwitchTo(old);
@@ -296,6 +314,7 @@ kc_buf_widen(KcWriteBuf *b, Relation rel)
 	MemoryContext old;
 	Datum	   *nv;
 	bool	   *nn;
+	uint32	   *ns;
 	uint32		r;
 	int			c;
 
@@ -305,18 +324,22 @@ kc_buf_widen(KcWriteBuf *b, Relation rel)
 		b->vals = NULL;
 		b->nulls = NULL;
 		b->cids = NULL;
+		b->sizes = NULL;
 		b->cap = 0;
 		return;
 	}
 	old = MemoryContextSwitchTo(b->cxt);
 	nv = palloc_array(Datum, (Size) b->cap * new_ncols);
 	nn = palloc_array(bool, (Size) b->cap * new_ncols);
+	ns = palloc0_array(uint32, (Size) b->cap * new_ncols);
 	for (r = 0; r < b->nrows; r++)
 	{
 		memcpy(&nv[(Size) r * new_ncols], &b->vals[(Size) r * old_ncols],
 			   sizeof(Datum) * old_ncols);
 		memcpy(&nn[(Size) r * new_ncols], &b->nulls[(Size) r * old_ncols],
 			   old_ncols);
+		memcpy(&ns[(Size) r * new_ncols], &b->sizes[(Size) r * old_ncols],
+			   sizeof(uint32) * old_ncols);
 		for (c = old_ncols; c < new_ncols; c++)
 		{
 			Form_pg_attribute att = TupleDescAttr(desc, c);
@@ -330,10 +353,12 @@ kc_buf_widen(KcWriteBuf *b, Relation rel)
 				d = kc_copy_value(b, att, d, &sz);
 			nv[(Size) r * new_ncols + c] = isnull ? (Datum) 0 : d;
 			nn[(Size) r * new_ncols + c] = isnull;
+			ns[(Size) r * new_ncols + c] = isnull ? 0 : (uint32) sz;
 		}
 	}
 	b->vals = nv;
 	b->nulls = nn;
+	b->sizes = ns;
 	b->ncols = new_ncols;
 	MemoryContextSwitchTo(old);
 }
@@ -436,6 +461,7 @@ kc_write_row_values(Relation rel, Datum *vals, bool *nulls, CommandId cid)
 		{
 			b->vals[idx] = (Datum) 0;
 			b->nulls[idx] = true;
+			b->sizes[idx] = 0;
 			rowbytes += 1;
 			continue;
 		}
@@ -444,6 +470,7 @@ kc_write_row_values(Relation rel, Datum *vals, bool *nulls, CommandId cid)
 
 			b->vals[idx] = kc_copy_value(b, att, vals[c], &sz);
 			b->nulls[idx] = false;
+			b->sizes[idx] = (uint32) sz;
 			rowbytes += sizeof(Datum) + 1 + sz;
 		}
 	}
@@ -800,7 +827,17 @@ kc_flush_buf(KcRelState *st, KcWriteBuf *b, Relation rel)
 	si.footer_offset = footer_off;
 	kc_stripe_write(rel, stripe_id, blob.data, blob.len, &si.first_block,
 					&si.block_count);
-	kc_catalog_insert(rel, &si, cidpts.data, cidpts.len, stats.data, stats.len);
+	kc_catalog_insert(rel, &si, cidpts.data, cidpts.len, stats.data, stats.len,
+					 st->frozen);
+
+	/*
+	 * The stripe can be found by readers from here on.  A reader that took
+	 * its relation lock before this point is found now; one that takes it
+	 * after this point finds the stripe row (kc_catalog_load) and reports the
+	 * dependency itself.  Both happen before the commit-time check of
+	 * PostgreSQL, because this runs from the pre-commit callback.
+	 */
+	CheckForSerializableConflictIn(rel, NULL, InvalidBlockNumber);
 
 	MemoryContextSwitchTo(old);
 	MemoryContextDelete(fcxt);
@@ -852,6 +889,18 @@ kc_write_discard_relation(Oid relid, bool *had_outer)
 	}
 }
 
+/*
+ * The stripes written for rel from now on are inserted into the catalog with
+ * a frozen creator: a rewrite that keeps what every snapshot sees.
+ */
+void
+kc_write_set_frozen(Relation rel, bool frozen)
+{
+	KcRelState *st = kc_state_get(RelationGetRelid(rel), true);
+
+	st->frozen = frozen;
+}
+
 void
 kc_write_pin_relation(Oid relid, int delta)
 {
@@ -885,10 +934,41 @@ kc_write_pending_refs(Oid relid, uint64 uid, int *n)
 			continue;
 		res[i].serial = b->serial;
 		res[i].nrows = b->nrows;
+		b->refs++;
 		i++;
 	}
 	*n = i;
 	return res;
+}
+
+/*
+ * The scan that took the references is over (or no longer reads the
+ * buffers).  A buffer that was dropped meanwhile is simply not found.
+ */
+void
+kc_write_pending_release(Oid relid, const KcPendingRef *refs, int n)
+{
+	KcRelState *st = kc_state_get(relid, false);
+	int			i;
+
+	if (st == NULL)
+		return;
+	for (i = 0; i < n; i++)
+	{
+		ListCell   *lc;
+
+		foreach(lc, st->bufs)
+		{
+			KcWriteBuf *b = lfirst(lc);
+
+			if (b->serial == refs[i].serial)
+			{
+				if (b->refs > 0)
+					b->refs--;
+				break;
+			}
+		}
+	}
 }
 
 /*
@@ -1004,6 +1084,55 @@ kc_xact_callback(XactEvent event, void *arg)
 	}
 }
 
+/*
+ * Move the rows of a committed subtransaction's buffer b into the buffer of
+ * its parent, and free b.  The by-reference values are copied: b's memory is
+ * given back, so a transaction with any number of subtransactions holds what
+ * its pending rows need and not a buffer apiece.
+ */
+static void
+kc_buf_merge_into(KcWriteBuf *prev, KcWriteBuf *b)
+{
+	uint32		r;
+	int			c;
+
+	kc_buf_reserve(prev, b->nrows);
+	for (r = 0; r < b->nrows; r++)
+	{
+		Size		src = (Size) r * b->ncols;
+		Size		dst = (Size) prev->nrows * prev->ncols;
+
+		for (c = 0; c < prev->ncols; c++)
+		{
+			Datum		d = b->vals[src + c];
+			uint32		sz = b->sizes[src + c];
+
+			if (!b->nulls[src + c] && sz > 0)
+			{
+				char	   *p = MemoryContextAlloc(prev->cxt, sz);
+
+				memcpy(p, DatumGetPointer(d), sz);
+				d = PointerGetDatum(p);
+			}
+			prev->vals[dst + c] = d;
+			prev->nulls[dst + c] = b->nulls[src + c];
+			prev->sizes[dst + c] = sz;
+		}
+		prev->cids[prev->nrows] = b->cids[r];
+		prev->nrows++;
+	}
+	prev->bytes += b->bytes;
+	b->bytes = 0;
+}
+
+static void
+kc_buf_free(KcWriteBuf *b)
+{
+	kc_buf_clear(b);
+	MemoryContextDelete(b->cxt);
+	pfree(b);
+}
+
 static void
 kc_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 					SubTransactionId parentSubid, void *arg)
@@ -1019,62 +1148,47 @@ kc_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	hash_seq_init(&seq, kc_states);
 	while ((st = hash_seq_search(&seq)) != NULL)
 	{
-		List	   *keep = NIL;
+		KcWriteBuf *prev = NULL;
 		ListCell   *lc;
-		MemoryContext old = MemoryContextSwitchTo(kc_write_cxt);
 
+		/* the list is edited in place: it is not rebuilt for every commit */
 		foreach(lc, st->bufs)
 		{
 			KcWriteBuf *b = lfirst(lc);
-			KcWriteBuf *prev = keep ? llast(keep) : NULL;
 
 			if (b->subid != mySubid)
 			{
-				keep = lappend(keep, b);
+				prev = b;
 				continue;
 			}
 			if (event == SUBXACT_EVENT_ABORT_SUB)
 			{
-				kc_buf_clear(b);
-				MemoryContextDelete(b->cxt);
-				pfree(b);
+				st->bufs = foreach_delete_current(st->bufs, lc);
+				kc_buf_free(b);
 				continue;
 			}
 
-			/* commit: the rows now belong to the parent subtransaction */
+			/*
+			 * Commit: the rows now belong to the parent subtransaction.  A
+			 * buffer that a scan holds a reference to keeps its identity
+			 * (the scan names it by serial and row count) and is only
+			 * handed over; any other is merged into the parent's buffer
+			 * when there is one, with or without scans open on the table.
+			 */
 			if (prev != NULL && prev->subid == parentSubid &&
 				prev->ncols == b->ncols && prev->uid == b->uid &&
-				st->pins == 0)
+				b->refs == 0)
 			{
-				uint32		r;
-
-				kc_buf_reserve(prev, b->nrows);
-				for (r = 0; r < b->nrows; r++)
-				{
-					Size		idx = (Size) prev->nrows * prev->ncols;
-
-					memcpy(&prev->vals[idx], &b->vals[(Size) r * b->ncols],
-						   sizeof(Datum) * prev->ncols);
-					memcpy(&prev->nulls[idx], &b->nulls[(Size) r * b->ncols],
-						   prev->ncols);
-					prev->cids[prev->nrows] = b->cids[r];
-					prev->nrows++;
-				}
-				prev->bytes += b->bytes;
-
-				/* the by-reference values stay in b's context, now prev's child */
-				MemoryContextSetParent(b->cxt, prev->cxt);
-				b->bytes = 0;
-				b->nrows = 0;
+				kc_buf_merge_into(prev, b);
+				st->bufs = foreach_delete_current(st->bufs, lc);
+				kc_buf_free(b);
 			}
 			else
 			{
 				b->subid = parentSubid;
-				keep = lappend(keep, b);
+				prev = b;
 			}
 		}
-		MemoryContextSwitchTo(old);
-		st->bufs = keep;
 	}
 }
 

@@ -3,11 +3,13 @@
 # Older snapshots against commands that replace a table's storage, and
 # SERIALIZABLE transactions.
 #
-# A REPEATABLE READ transaction whose snapshot is older than a VACUUM FULL, a
-# TRUNCATE or a rewriting ALTER TABLE of a columnar table must not be handed
-# an empty table: its read fails with a serialization failure that names the
-# rewrite.  SET TABLESPACE copies the file unchanged and so changes nothing
-# for anyone; columnar_compact keeps the old stripes visible.
+# A REPEATABLE READ transaction whose snapshot is older than a TRUNCATE or a
+# rewriting ALTER TABLE of a columnar table must not be handed an empty table:
+# its read fails with a serialization failure that names the rewrite.
+# VACUUM FULL, which keeps the content, keeps it for them too when every
+# stripe is older than the snapshot (t/010_visibility.pl has the other case).
+# SET TABLESPACE copies the file unchanged and so changes nothing for anyone;
+# columnar_compact keeps the old stripes visible.
 #
 # Under SERIALIZABLE, transactions that use different columnar tables must
 # not abort each other, while a real write skew on one table is detected.
@@ -82,7 +84,8 @@ sub old_snapshot_case
 my $load = "CREATE TABLE c (a int, b text) USING columnar;
             INSERT INTO c SELECT g, 'v' || g FROM generate_series(1, 1000) g;";
 
-old_snapshot_case('VACUUM FULL', $load, 'VACUUM FULL c', 1);
+# VACUUM FULL keeps what the table contains and every stripe predates the snapshot
+old_snapshot_case('VACUUM FULL', $load, 'VACUUM FULL c', 0);
 old_snapshot_case('SET TABLESPACE', $load, 'ALTER TABLE c SET TABLESPACE snap_ts', 0);
 old_snapshot_case('columnar_compact',
 	"CREATE TABLE c (a int, b text) USING columnar;

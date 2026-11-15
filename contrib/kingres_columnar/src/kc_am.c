@@ -28,6 +28,7 @@
 #include "access/relscan.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "catalog/pg_am.h"
 #include "catalog/storage.h"
 #include "commands/vacuum.h"
 #include "executor/executor.h"
@@ -429,8 +430,14 @@ kc_relation_set_new_filelocator(Relation rel, const RelFileLocator *newrlocator,
 	}
 	(void) truncating;
 
-	*freezeXid = InvalidTransactionId;
-	*minmulti = InvalidMultiXactId;
+	/*
+	 * The new file holds one transaction id, in its metapage: that of the
+	 * creating transaction.  relfrozenxid must not pass it (VACUUM freezes it
+	 * and moves relfrozenxid on, kc_vacuum.c).
+	 */
+	*freezeXid = GetCurrentTransactionId();
+	/* a table with a relfrozenxid has a relminmxid; it holds no multixact */
+	*minmulti = GetOldestMultiXactId();
 
 	srel = RelationCreateStorage(*newrlocator, persistence, true);
 	smgrclose(srel);
@@ -476,6 +483,7 @@ kc_relation_copy_for_cluster(KC_COPY_FOR_CLUSTER_PARAMS)
 	KcOptions	opts;
 	KcScan	   *scan;
 	TupleTableSlot *slot;
+	bool		keep_visibility;
 	double		n = 0;
 
 	if (OldIndex != NULL || use_sort)
@@ -484,8 +492,18 @@ kc_relation_copy_for_cluster(KC_COPY_FOR_CLUSTER_PARAMS)
 				 errmsg("CLUSTER needs an index; columnar tables have none in this version")));
 	kc_require_rmgr();
 
-	*xid_cutoff = InvalidTransactionId;
-	*multi_cutoff = InvalidMultiXactId;
+	/*
+	 * VACUUM FULL does not change what the table contains.  When every
+	 * stripe row is old enough that every snapshot sees it (or is dead), the
+	 * new stripes get frozen catalog rows and the new file no creating
+	 * transaction, so a snapshot that predates the rewrite reads the new file
+	 * exactly as it read the old one, as it does for heap.  Otherwise some
+	 * older snapshot is meant to see a different set of stripes and the
+	 * ordinary rule applies: it fails with a serialization failure.
+	 */
+	keep_visibility = kc_catalog_all_visible(OldTable, OldestXmin);
+	*xid_cutoff = OldestXmin;
+	*multi_cutoff = GetOldestMultiXactId();
 
 	/* the new table keeps the options of the old one */
 	kc_meta_read(OldTable, &m);
@@ -494,6 +512,8 @@ kc_relation_copy_for_cluster(KC_COPY_FOR_CLUSTER_PARAMS)
 	opts.stripe_rows = m.stripe_rows;
 	opts.chunk_rows = m.chunk_rows;
 	kc_meta_set_options(NewTable, &opts);
+	if (keep_visibility)
+		kc_write_set_frozen(NewTable, true);
 
 	scan = kc_scan_begin(OldTable, NULL, NULL, NULL, 0);
 	slot = table_slot_create(OldTable, NULL);
@@ -510,6 +530,8 @@ kc_relation_copy_for_cluster(KC_COPY_FOR_CLUSTER_PARAMS)
 
 	/* the swap of the files comes before commit, so the stripes go now */
 	kc_write_flush_relation(NewTable);
+	if (keep_visibility)
+		kc_meta_set_created_xid(NewTable, FrozenTransactionId);
 
 	*num_tuples = n;
 	*tups_vacuumed = 0;
@@ -578,10 +600,36 @@ kc_index_validate_scan(Relation table_rel, Relation index_rel,
 			 errmsg("indexes on columnar tables are not supported in this version")));
 }
 
+/*
+ * A columnar table keeps nothing in a TOAST table: values are detoasted
+ * when a row is written, and stripes hold them whole.  The table still gets
+ * an (always empty) TOAST table when it has a column that heap would
+ * toast, because a rewrite creates the new table's TOAST table only when
+ * the old one had one, and ALTER TABLE ... SET ACCESS METHOD heap must
+ * give the heap table the means to store a row over 8 kB.
+ */
 static bool
 kc_relation_needs_toast_table(Relation rel)
 {
+	TupleDesc	desc = RelationGetDescr(rel);
+	int			i;
+
+	for (i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+
+		if (!att->attisdropped && att->attlen < 0 &&
+			att->attstorage != TYPSTORAGE_PLAIN)
+			return true;
+	}
 	return false;
+}
+
+/* The TOAST table of a columnar table is an ordinary heap table. */
+static Oid
+kc_relation_toast_am(Relation rel)
+{
+	return HEAP_TABLE_AM_OID;
 }
 
 static bool
@@ -682,6 +730,7 @@ static const TableAmRoutine kc_methods = {
 
 	.relation_size = table_block_relation_size,
 	.relation_needs_toast_table = kc_relation_needs_toast_table,
+	.relation_toast_am = kc_relation_toast_am,
 
 	.relation_estimate_size = kc_relation_estimate_size,
 

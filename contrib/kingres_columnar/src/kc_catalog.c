@@ -25,12 +25,14 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/multixact.h"
 #include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/indexing.h"
+#include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_class.h"
@@ -38,6 +40,8 @@
 #include "commands/extension.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
+#include "storage/predicate.h"
+#include "storage/procarray.h"
 #include "storage/smgr.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -63,6 +67,17 @@
 #define Anum_kc_footer_offset		11
 #define Anum_kc_cid_points			12
 #define Anum_kc_col_stats			13
+
+/*
+ * The snapshot the catalog is read with: the caller's snapshot copied, with
+ * what the visibility check below needs besides.
+ */
+typedef struct KcCatSnap
+{
+	SnapshotData snap;			/* must be first: callers pfree() it */
+	CommandId	real_cid;		/* the reader's command id (see kc_tuple_visible) */
+	bool		ssi;			/* report conflicts to the serializable machinery */
+} KcCatSnap;
 
 static Oid	cached_catalog_oid = InvalidOid;
 static Oid	cached_index_oid = InvalidOid;
@@ -150,12 +165,15 @@ kc_rel_is_columnar(Relation rel)
 Snapshot
 kc_catalog_snapshot(Snapshot snap, bool *is_mvcc)
 {
-	Snapshot	copy = palloc(sizeof(SnapshotData));
+	KcCatSnap  *cs = palloc0(sizeof(KcCatSnap));
+	Snapshot	copy = &cs->snap;
 
 	if (snap != NULL && snap->snapshot_type == SNAPSHOT_MVCC)
 	{
 		*copy = *snap;
 		*is_mvcc = true;
+		cs->real_cid = snap->curcid;
+		cs->ssi = true;
 	}
 	else
 	{
@@ -172,6 +190,13 @@ kc_catalog_snapshot(Snapshot snap, bool *is_mvcc)
 			base = GetLatestSnapshot();
 		*copy = *base;
 		*is_mvcc = false;
+
+		/*
+		 * A maintenance read (vacuum, compaction, a rewrite) treats every
+		 * deletion by the running transaction as past, whatever the command.
+		 */
+		cs->real_cid = InvalidCommandId;
+		cs->ssi = false;
 	}
 	copy->curcid = InvalidCommandId;
 
@@ -202,15 +227,26 @@ kc_latest_snapshot(void)
  * scan with an MVCC snapshot would take predicate locks on the pages of the
  * one index all columnar tables share, and under SERIALIZABLE make
  * transactions on unrelated tables abort each other.  The table itself has
- * its own relation-level predicate lock (kc_scan.c) and conflict check
- * (kc_write.c).
+ * its own relation-level predicate lock (kc_scan.c) and conflict checks
+ * (kc_write.c, and kc_catalog_load for the stripes this check hides).
+ *
+ * The own transaction's insertions are all visible: the scan applies the
+ * finer command-id rule from the stripe's cid_points.  The own transaction's
+ * deletions follow HeapTupleSatisfiesMVCC: a stripe deleted by an earlier
+ * command is gone, one deleted by the reader's own command or a later one is
+ * still there.  *concurrent is set to the transaction whose stripe row was
+ * hidden because that transaction had not committed before the snapshot, or
+ * to InvalidTransactionId.
  */
 static bool
-kc_tuple_visible(HeapTuple tup, Snapshot snap)
+kc_tuple_visible(HeapTuple tup, Snapshot snap, TransactionId *concurrent)
 {
 	HeapTupleHeader th = tup->t_data;
 	TransactionId xmin = HeapTupleHeaderGetRawXmin(th);
+	CommandId	real_cid = ((KcCatSnap *) snap)->real_cid;
 
+	if (concurrent)
+		*concurrent = InvalidTransactionId;
 	if (!HeapTupleHeaderXminFrozen(th))
 	{
 		if (th->t_infomask & HEAP_XMIN_INVALID)
@@ -218,7 +254,11 @@ kc_tuple_visible(HeapTuple tup, Snapshot snap)
 		if (!TransactionIdIsCurrentTransactionId(xmin))
 		{
 			if (XidInMVCCSnapshot(xmin, snap))
+			{
+				if (concurrent)
+					*concurrent = xmin;
 				return false;
+			}
 			if (!(th->t_infomask & HEAP_XMIN_COMMITTED) &&
 				!TransactionIdDidCommit(xmin))
 				return false;
@@ -231,7 +271,7 @@ kc_tuple_visible(HeapTuple tup, Snapshot snap)
 		TransactionId xmax = HeapTupleHeaderGetUpdateXid(th);
 
 		if (TransactionIdIsCurrentTransactionId(xmax))
-			return false;
+			return HeapTupleHeaderGetCmax(th) >= real_cid;
 		if (XidInMVCCSnapshot(xmax, snap))
 			return true;
 		if (th->t_infomask & HEAP_XMAX_COMMITTED)
@@ -319,8 +359,21 @@ kc_catalog_load(Relation rel, Snapshot snap, int *nstripes)
 	scan = systable_beginscan(cat, kc_catalog_index_oid(), true, SnapshotAny, 1, &key);
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
 	{
-		if (!kc_tuple_visible(tup, snap))
+		TransactionId concurrent;
+
+		if (!kc_tuple_visible(tup, snap, &concurrent))
+		{
+			/*
+			 * A stripe hidden because its writer had not committed before
+			 * the snapshot is a write the reader did not see: under
+			 * SERIALIZABLE the reader is before that writer, as heap records
+			 * for a tuple it skips.  The writer's own check
+			 * (kc_flush_buf) covers the readers whose lock came later.
+			 */
+			if (((KcCatSnap *) snap)->ssi && TransactionIdIsValid(concurrent))
+				CheckForSerializableConflictOut(rel, concurrent, snap);
 			continue;
+		}
 		if (n == cap)
 		{
 			cap = cap ? cap * 2 : 16;
@@ -336,6 +389,73 @@ kc_catalog_load(Relation rel, Snapshot snap, int *nstripes)
 	return res;
 }
 
+
+/*
+ * Does every stripe row of rel's content read the same to every snapshot
+ * that exists or will exist?  True when each row is either dead (written by a
+ * transaction that aborted, or deleted by one that committed before
+ * oldest_xmin) or live and written by a transaction that committed before
+ * oldest_xmin.  A rewrite that keeps the content (VACUUM FULL) may then give
+ * its stripe rows a frozen creator, which every snapshot sees, so that
+ * snapshots taken before the rewrite read the new file like the old one.
+ * A row in progress, newer, or deleted recently makes the answer no: some
+ * older snapshot may be meant to see a different set.
+ */
+bool
+kc_catalog_all_visible(Relation rel, TransactionId oldest_xmin)
+{
+	Relation	cat = table_open(kc_catalog_oid(), AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	bool		result = true;
+
+	ScanKeyInit(&key, Anum_kc_uid, BTEqualStrategyNumber, F_INT8EQ,
+				Int64GetDatum((int64) kc_rel_ident(rel)->uid));
+	scan = systable_beginscan(cat, kc_catalog_index_oid(), true, SnapshotAny, 1, &key);
+	while (result && HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		HeapTupleHeader th = tup->t_data;
+		TransactionId xmin = HeapTupleHeaderGetRawXmin(th);
+
+		if (!HeapTupleHeaderXminFrozen(th))
+		{
+			if (th->t_infomask & HEAP_XMIN_INVALID)
+				continue;
+			if (TransactionIdIsCurrentTransactionId(xmin) ||
+				TransactionIdIsInProgress(xmin))
+			{
+				result = false;
+				break;
+			}
+			if (!TransactionIdDidCommit(xmin))
+				continue;		/* aborted: dead */
+			if (!TransactionIdPrecedes(xmin, oldest_xmin))
+			{
+				result = false;
+				break;
+			}
+		}
+		if (!(th->t_infomask & HEAP_XMAX_INVALID) &&
+			!HEAP_XMAX_IS_LOCKED_ONLY(th->t_infomask))
+		{
+			TransactionId xmax = HeapTupleHeaderGetUpdateXid(th);
+
+			if (TransactionIdIsCurrentTransactionId(xmax) ||
+				TransactionIdIsInProgress(xmax))
+				result = false;
+			else if (TransactionIdDidCommit(xmax))
+			{
+				/* deleted: dead only when nobody can still see it */
+				if (!TransactionIdPrecedes(xmax, oldest_xmin))
+					result = false;
+			}
+		}
+	}
+	systable_endscan(scan);
+	table_close(cat, AccessShareLock);
+	return result;
+}
 /*
  * Totals over the stripes visible to snap (any snapshot: it is prepared
  * here).  Used by vacuum, the estimates and columnar_info.
@@ -378,7 +498,7 @@ kc_catalog_row_total(Relation rel, Snapshot snap, uint64 *stripes,
 
 void
 kc_catalog_insert(Relation rel, const KcStripeInfo *si, const char *cid_points,
-				  int cid_len, const char *col_stats, int stats_len)
+				  int cid_len, const char *col_stats, int stats_len, bool frozen)
 {
 	Relation	cat = table_open(kc_catalog_oid(), RowExclusiveLock);
 	Datum		v[Natts_kc_stripe];
@@ -410,7 +530,28 @@ kc_catalog_insert(Relation rel, const KcStripeInfo *si, const char *cid_points,
 	v[Anum_kc_col_stats - 1] = PointerGetDatum(cs);
 
 	tup = heap_form_tuple(RelationGetDescr(cat), v, n);
-	CatalogTupleInsert(cat, tup);
+	if (!frozen)
+		CatalogTupleInsert(cat, tup);
+	else
+	{
+		/*
+		 * A row of a rewrite that kept what every snapshot sees: its creator
+		 * is frozen, so snapshots older than the rewrite see the stripe too.
+		 * Only the new file refers to this identity until the rewrite commits,
+		 * and a rewrite that aborts leaves rows that reconciliation removes.
+		 */
+		Relation	idx = index_open(kc_catalog_index_oid(), RowExclusiveLock);
+		IndexInfo  *ii = BuildIndexInfo(idx);
+		Datum		iv[2];
+		bool		inull[2] = {false, false};
+
+		heap_insert(cat, tup, GetCurrentCommandId(true), HEAP_INSERT_FROZEN, NULL);
+		iv[0] = v[Anum_kc_uid - 1];
+		iv[1] = v[Anum_kc_stripe_id - 1];
+		(void) index_insert(idx, iv, inull, &tup->t_self, cat, UNIQUE_CHECK_YES,
+							false, ii);
+		index_close(idx, RowExclusiveLock);
+	}
 	heap_freetuple(tup);
 	pfree(cp);
 	pfree(cs);
@@ -433,7 +574,7 @@ kc_catalog_delete_uid(uint64 uid)
 	scan = systable_beginscan(cat, kc_catalog_index_oid(), true,
 							  SnapshotAny, 1, &key);
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
-		if (kc_tuple_visible(tup, vsnap))
+		if (kc_tuple_visible(tup, vsnap, NULL))
 			CatalogTupleDelete(cat, &tup->t_self);
 	systable_endscan(scan);
 	table_close(cat, RowExclusiveLock);
@@ -458,7 +599,7 @@ kc_catalog_delete_stripe(uint64 uid, uint64 stripe_id)
 							  SnapshotAny, 2, key);
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
 	{
-		if (!kc_tuple_visible(tup, vsnap))
+		if (!kc_tuple_visible(tup, vsnap, NULL))
 			continue;
 		CatalogTupleDelete(cat, &tup->t_self);
 		n++;
@@ -601,7 +742,7 @@ kc_reconcile_ex(bool dry)
 															  RelationGetDescr(cat),
 															  &isnull));
 
-		if (isnull || !kc_tuple_visible(tup, catsnap))
+		if (isnull || !kc_tuple_visible(tup, catsnap, NULL))
 			continue;
 		if (nlive == 0 || bsearch(&uid, live, nlive, sizeof(uint64), kc_u64_cmp) == NULL)
 		{
@@ -730,6 +871,14 @@ kc_footer_load(Relation rel, const KcStripeInfo *si, KcFooter *f)
 	if (flen < (uint64) h.ngroups * 4 || flen > (uint64) 1 << 30)
 		kc_corrupt(rel, si->stripe_id, "implausible footer size");
 
+	/*
+	 * Every group takes its row count and one entry per column in the footer:
+	 * the arrays below are sized from what the footer really holds, never from
+	 * a count that a damaged stripe header could inflate.
+	 */
+	if ((uint64) h.ngroups * (4 + (uint64) ncols * sizeof(KcChunkDisk)) > flen)
+		kc_corrupt(rel, si->stripe_id, "the footer is too small for its chunk groups");
+
 	raw = MemoryContextAllocHuge(CurrentMemoryContext, flen);
 	kc_stripe_read(rel, si, h.footer_off, flen, raw);
 	if (kc_crc32c(raw, flen) != (uint64) h.footer_crc)
@@ -798,4 +947,26 @@ kc_footer_free(KcFooter *f)
 		pfree(f->maxs);
 	}
 	memset(f, 0, sizeof(*f));
+}
+
+/*
+ * Does the catalog hold any row, live or dead, for this identity?  A new
+ * file draws its identity at random; the draw is repeated when it hits one
+ * that is in use, so that two stored contents never share a key.
+ */
+bool
+kc_catalog_uid_in_use(uint64 uid)
+{
+	Relation	cat = table_open(kc_catalog_oid(), AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	bool		used;
+
+	ScanKeyInit(&key, Anum_kc_uid, BTEqualStrategyNumber, F_INT8EQ,
+				Int64GetDatum((int64) uid));
+	scan = systable_beginscan(cat, kc_catalog_index_oid(), true, SnapshotAny, 1, &key);
+	used = HeapTupleIsValid(systable_getnext(scan));
+	systable_endscan(scan);
+	table_close(cat, AccessShareLock);
+	return used;
 }
