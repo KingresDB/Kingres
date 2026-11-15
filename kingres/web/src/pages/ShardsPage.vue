@@ -118,7 +118,7 @@ function findBucket(): void {
     @retry="databases.refetch()"
   >
     <div class="stack-lg">
-      <form class="row filters" aria-label="Filters" @submit.prevent="findBucket">
+      <form class="form-row" aria-label="Filters" @submit.prevent="findBucket">
         <div class="field">
           <label for="f-db">Database</label>
           <select id="f-db" v-model="dbName">
@@ -295,10 +295,3 @@ function findBucket(): void {
     </div>
   </QueryBoundary>
 </template>
-
-<style scoped>
-.filters {
-  align-items: flex-end;
-  gap: var(--s-4);
-}
-</style>

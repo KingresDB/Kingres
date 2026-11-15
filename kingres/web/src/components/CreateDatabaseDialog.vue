@@ -177,7 +177,7 @@ const errorFor = (field: string, server: Record<string, string>): string | undef
             </select>
             <input v-else v-bind="slot" v-model="form.owner" class="input mono" />
           </FormField>
-          <div class="row">
+          <div class="form-row">
             <FormField v-slot="slot" label="Encoding" hint="Fixed after creation.">
               <select v-bind="slot" v-model="form.encoding">
                 <option v-for="e in o?.encodings" :key="e.name" :value="e.name">

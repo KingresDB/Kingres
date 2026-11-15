@@ -144,7 +144,7 @@ const description = computed(() =>
     <p v-else class="muted">No data in this period.</p>
     <ul v-if="series.length > 1 || latest.length" class="legend">
       <li v-for="(l, i) in latest" :key="l.label">
-        <svg width="22" height="8" aria-hidden="true">
+        <svg class="swatch" width="22" height="8" aria-hidden="true">
           <line
             x1="0"
             x2="22"
@@ -155,8 +155,8 @@ const description = computed(() =>
             stroke-width="2"
           />
         </svg>
-        <SafeName :value="l.label" kind="name" :max="60" />
-        <span class="muted num">{{ l.value === null ? '-' : fmt(l.value) }}</span>
+        <span class="legend-label"><SafeName :value="l.label" kind="name" :max="60" /></span>
+        <span class="legend-value num">{{ l.value === null ? '-' : fmt(l.value) }}</span>
       </li>
     </ul>
   </figure>
@@ -170,7 +170,9 @@ figcaption {
   font-weight: 600;
   margin-bottom: var(--s-1);
 }
-svg {
+/* Only the plot fills the width. The same rule on every svg stretched the legend's line samples
+   over the whole row and left the names and values a few characters of width each. */
+figure > svg {
   width: 100%;
   display: block;
 }
@@ -201,20 +203,35 @@ svg {
 .s6 {
   stroke: var(--g-6);
 }
+/* One series per line: sample, name, latest value at the right edge. A long name is shortened
+   with an ellipsis (SafeName keeps the whole name available) instead of breaking between letters. */
 .legend {
   list-style: none;
-  margin: var(--s-1) 0 0;
+  margin: var(--s-2) 0 0;
   padding: 0;
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--s-1) var(--s-3);
+  display: grid;
+  gap: 2px;
   font-size: var(--fs-sm);
 }
 .legend li {
-  min-width: 0;
-  overflow-wrap: anywhere;
-  display: inline-flex;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
   align-items: center;
-  gap: var(--s-1);
+  gap: var(--s-2);
+}
+.swatch {
+  flex: none;
+  width: 22px;
+  height: 8px;
+}
+.legend-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.legend-value {
+  color: var(--c-text-muted);
+  white-space: nowrap;
 }
 </style>

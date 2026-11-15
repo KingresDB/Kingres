@@ -11,6 +11,7 @@ import PinChoice from '@/components/PinChoice.vue'
 import OwnFingerprint from '@/components/OwnFingerprint.vue'
 import SafeName from '@/components/SafeName.vue'
 import { fingerprintError, normalizeFingerprint } from '@/lib/fingerprint'
+import AppFooter from '@/components/AppFooter.vue'
 import BrandLogo from '@/components/BrandLogo.vue'
 import ProblemNotice from '@/components/ProblemNotice.vue'
 import TaskProgress from '@/components/TaskProgress.vue'
@@ -270,356 +271,380 @@ async function finish(): Promise<void> {
 </script>
 
 <template>
-  <main class="wizard">
-    <LiveRegions :polite="announcer.polite.value" :assertive="announcer.assertive.value" />
-    <div class="card stack-lg">
-      <header class="stack" style="gap: var(--s-1)">
-        <BrandLogo variant="horizontal" :size="44" />
-        <h1>Set up this server</h1>
-        <p class="muted">
-          This KingresDB server has not been set up yet. Create a new cluster or join an existing
-          one.
-        </p>
-        <ol class="steps" aria-label="Setup steps">
-          <li :aria-current="step === 'token' ? 'step' : undefined">1. Setup token</li>
-          <li :aria-current="step === 'choose' ? 'step' : undefined">2. Create or join</li>
-          <li :aria-current="step === 'create' || step === 'join' ? 'step' : undefined">
-            3. Settings
-          </li>
-          <li :aria-current="step === 'progress' ? 'step' : undefined">4. Setup</li>
-        </ol>
-      </header>
+  <div class="wizard-page">
+    <main class="wizard">
+      <LiveRegions :polite="announcer.polite.value" :assertive="announcer.assertive.value" />
+      <div class="card stack-lg">
+        <header class="stack" style="gap: var(--s-1)">
+          <BrandLogo variant="horizontal" :size="44" />
+          <h1>Set up this server</h1>
+          <p class="muted">
+            This KingresDB server has not been set up yet. Create a new cluster or join an existing
+            one.
+          </p>
+          <ol class="steps" aria-label="Setup steps">
+            <li :aria-current="step === 'token' ? 'step' : undefined">1. Setup token</li>
+            <li :aria-current="step === 'choose' ? 'step' : undefined">2. Create or join</li>
+            <li :aria-current="step === 'create' || step === 'join' ? 'step' : undefined">
+              3. Settings
+            </li>
+            <li :aria-current="step === 'progress' ? 'step' : undefined">4. Setup</li>
+          </ol>
+        </header>
 
-      <!-- 1. token -->
-      <form v-if="step === 'token'" class="stack" @submit.prevent="acceptToken">
-        <ProblemNotice v-if="tokenError" :error="tokenError" />
-        <FormField
-          v-slot="slot"
-          label="Setup token"
-          hint="Read the one-time token from the root-readable file written when the package was installed."
-        >
-          <input
-            v-bind="slot"
-            v-model="token"
-            class="input mono"
-            autocomplete="off"
-            required
-            data-autofocus
-          />
-        </FormField>
-        <div>
-          <button type="submit" class="btn btn-primary" :disabled="!token.trim() || tokenChecking">
-            {{ tokenChecking ? 'Checking...' : 'Continue' }}
-          </button>
-        </div>
-      </form>
-
-      <!-- 2. choose -->
-      <div v-else-if="step === 'choose'" class="stack">
-        <div class="grid-2">
-          <section class="card stack">
-            <h2>Create new cluster</h2>
-            <p>Start a new cluster with this server as its first member.</p>
-            <div>
-              <button type="button" class="btn btn-primary" @click="choose('create')">
-                Create new cluster
-              </button>
-            </div>
-          </section>
-          <section class="card stack">
-            <h2>Join existing cluster</h2>
-            <p>
-              Add this server to a cluster that already runs. Data moves only after you start a
-              rebalance.
-            </p>
-            <div>
-              <button type="button" class="btn" @click="choose('join')">
-                Join existing cluster
-              </button>
-            </div>
-          </section>
-        </div>
-        <section class="card stack" aria-labelledby="own-fp-h">
-          <h2 id="own-fp-h">Fingerprint of this server</h2>
-          <OwnFingerprint
-            :fingerprint="ownFingerprint"
-            purpose="If an administrator adds this server from the panel of a cluster (Add server), they pin this fingerprint. Give it to them by a way other than the network between the two servers."
-            fallback="This server does not report its fingerprint here (it does so only to a request from the machine itself, or with the setup token). Read it in the log of this server, in the line bootstrap certificate of the internal API."
-          />
-        </section>
-        <div>
-          <button type="button" class="btn btn-link" @click="step = 'token'">
-            Change setup token
-          </button>
-        </div>
-      </div>
-
-      <!-- 3a. create -->
-      <form
-        v-else-if="step === 'create'"
-        v-block-enter-submit
-        class="stack"
-        novalidate
-        @submit.prevent="submit"
-      >
-        <h2>Create new cluster</h2>
-        <ProblemNotice v-if="action.error.value" :error="action.error.value" />
-        <p v-if="tokenInvalid">
-          <button type="button" class="btn btn-link" @click="step = 'token'">
-            Enter the setup token again
-          </button>
-        </p>
-        <fieldset>
-          <legend>Cluster</legend>
-          <FormField v-slot="slot" label="Cluster name" :error="errors.clusterName" required>
+        <!-- 1. token -->
+        <form v-if="step === 'token'" class="stack" @submit.prevent="acceptToken">
+          <ProblemNotice v-if="tokenError" :error="tokenError" />
+          <FormField
+            v-slot="slot"
+            label="Setup token"
+            hint="Read the one-time token from the root-readable file written when the package was installed."
+          >
             <input
               v-bind="slot"
-              v-model="create.clusterName"
-              class="input"
+              v-model="token"
+              class="input mono"
               autocomplete="off"
+              required
               data-autofocus
             />
           </FormField>
-        </fieldset>
-        <fieldset>
-          <legend>Administrator account</legend>
-          <FormField v-slot="slot" label="User name" :error="errors['admin.username']" required>
-            <input v-bind="slot" v-model="create.adminUser" class="input" autocomplete="username" />
-          </FormField>
-          <FormField
-            v-slot="slot"
-            label="Password"
-            hint="At least 12 characters."
-            :error="errors['admin.password']"
-            required
-          >
-            <input
-              v-bind="slot"
-              v-model="create.adminPassword"
-              class="input"
-              type="password"
-              autocomplete="new-password"
-            />
-          </FormField>
-          <FormField v-slot="slot" label="Repeat password" :error="errors.adminPassword2" required>
-            <input
-              v-bind="slot"
-              v-model="create.adminPassword2"
-              class="input"
-              type="password"
-              autocomplete="new-password"
-            />
-          </FormField>
-        </fieldset>
-        <fieldset>
-          <legend>Data paths and memory</legend>
-          <FormField
-            v-slot="slot"
-            label="Data directory"
-            :error="errors['dataPaths.dataDirectory']"
-            required
-          >
-            <input v-bind="slot" v-model="create.dataDirectory" class="input mono" />
-          </FormField>
-          <FormField
-            v-slot="slot"
-            label="WAL directory (optional)"
-            hint="Leave empty to keep the WAL inside the data directory."
-          >
-            <input v-bind="slot" v-model="create.walDirectory" class="input mono" />
-          </FormField>
-          <FormField v-slot="slot" label="Log directory (optional)">
-            <input v-bind="slot" v-model="create.logDirectory" class="input mono" />
-          </FormField>
-          <FormField
-            v-slot="slot"
-            label="Memory quota (MB)"
-            :error="errors['memoryQuota.totalMegabytes']"
-            required
-          >
-            <input
-              v-bind="slot"
-              v-model.number="create.memoryMb"
-              class="input num"
-              type="number"
-              min="512"
-              step="256"
-            />
-          </FormField>
-        </fieldset>
-        <fieldset>
-          <legend>Features</legend>
-          <label class="check"><input v-model="create.sharding" type="checkbox" /> Sharding</label>
-          <label class="check"
-            ><input v-model="create.ledger" type="checkbox" /> Tamper-evident ledger</label
-          >
-          <p class="hint muted">
-            Features can be turned on later in Settings but never turned off again.
-          </p>
-          <FormField
-            v-slot="slot"
-            label="Default replica count"
-            hint="Standby copies of every shard group (0 to 3). Changed later in cluster settings."
-            :error="errors.defaultReplicaCount"
-          >
-            <input
-              v-bind="slot"
-              v-model.number="create.replicaCount"
-              class="input num"
-              type="number"
-              min="0"
-              max="3"
-            />
-          </FormField>
-          <FormField v-slot="slot" label="Default durability">
-            <select v-bind="slot" v-model="create.durability">
-              <option value="async">Asynchronous</option>
-              <option value="sync">Synchronous (quorum)</option>
-              <option value="syncApply">Synchronous with apply</option>
-            </select>
-          </FormField>
-        </fieldset>
-        <div class="row">
-          <button type="submit" class="btn btn-primary" :disabled="action.isStarting.value">
-            Create cluster
-          </button>
-          <button type="button" class="btn" @click="step = 'choose'">Back</button>
-        </div>
-      </form>
-
-      <!-- 3b. join -->
-      <form
-        v-else-if="step === 'join'"
-        v-block-enter-submit
-        class="stack"
-        novalidate
-        @submit.prevent="submit"
-      >
-        <h2>Join existing cluster</h2>
-        <ProblemNotice v-if="action.error.value" :error="action.error.value" />
-        <p v-if="tokenInvalid">
-          <button type="button" class="btn btn-link" @click="step = 'token'">
-            Enter the setup token again
-          </button>
-        </p>
-        <fieldset>
-          <legend>Existing cluster</legend>
-          <FormField
-            v-slot="slot"
-            label="Address of any existing server"
-            hint="host:port of its panel port, for example 10.0.0.11:8091."
-            :error="errors.existingNodeAddress"
-            required
-          >
-            <input v-bind="slot" v-model="join.address" class="input mono" data-autofocus />
-          </FormField>
-          <PinChoice
-            v-model:fingerprint="join.expectedFingerprint"
-            v-model:unpinned="joinUnpinned"
-            purpose="join"
-            hint="SHA-256 of that server's internal certificate, 64 hex digits; colons are allowed. Read it on that server's This server page."
-            :error="errors.expectedFingerprint"
-          />
-          <FormField
-            v-slot="slot"
-            label="Administrator user name"
-            :error="errors['admin.username']"
-            required
-          >
-            <input v-bind="slot" v-model="join.adminUser" class="input" autocomplete="username" />
-          </FormField>
-          <FormField
-            v-slot="slot"
-            label="Administrator password"
-            :error="errors['admin.password']"
-            required
-          >
-            <input
-              v-bind="slot"
-              v-model="join.adminPassword"
-              class="input"
-              type="password"
-              autocomplete="current-password"
-            />
-          </FormField>
-        </fieldset>
-        <fieldset>
-          <legend>This server</legend>
-          <FormField
-            v-slot="slot"
-            label="Data directory"
-            :error="errors['dataPaths.dataDirectory']"
-            required
-          >
-            <input v-bind="slot" v-model="join.dataDirectory" class="input mono" />
-          </FormField>
-          <FormField
-            v-slot="slot"
-            label="Memory quota (MB)"
-            :error="errors['memoryQuota.totalMegabytes']"
-          >
-            <input
-              v-bind="slot"
-              v-model.number="join.memoryMb"
-              class="input num"
-              type="number"
-              min="512"
-              step="256"
-            />
-          </FormField>
-          <FormField v-slot="slot" label="Server group (optional)" hint="Rack or zone name.">
-            <input v-bind="slot" v-model="join.serverGroup" class="input" />
-          </FormField>
-        </fieldset>
-        <p class="muted">
-          After joining, this server shows as "pending rebalance". Data moves only when you start a
-          rebalance.
-        </p>
-        <div class="row">
-          <button type="submit" class="btn btn-primary" :disabled="action.isStarting.value">
-            Join cluster
-          </button>
-          <button type="button" class="btn" @click="step = 'choose'">Back</button>
-        </div>
-      </form>
-
-      <!-- 4. progress -->
-      <div v-else class="stack">
-        <h2>{{ mode === 'create' ? 'Creating the cluster' : 'Joining the cluster' }}</h2>
-        <TaskProgress :task="action.task.value" :poll-error="action.pollError.value" />
-        <div v-if="action.state.value === 'done'" class="stack">
-          <p class="notice tone-ok" role="status">
-            <span aria-hidden="true">&#10003;</span>
-            This server is ready. Sign in with the administrator account.
-          </p>
-          <p v-if="mode === 'join'" class="muted" data-testid="join-fingerprint-note">
-            <template v-if="action.task.value?.detail"
-              >What the server reports about the first contact:
-              <SafeName :value="action.task.value.detail" kind="text" :max="500" multiline
-            /></template>
-            <template v-else
-              >The server did not report whether the certificate of the existing server was checked,
-              so this page cannot say. Compare the fingerprint with the one on the This server page
-              of the existing server.</template
-            >
-          </p>
           <div>
-            <button type="button" class="btn btn-primary" @click="finish">
-              Continue to sign in
+            <button
+              type="submit"
+              class="btn btn-primary"
+              :disabled="!token.trim() || tokenChecking"
+            >
+              {{ tokenChecking ? 'Checking...' : 'Continue' }}
+            </button>
+          </div>
+        </form>
+
+        <!-- 2. choose -->
+        <div v-else-if="step === 'choose'" class="stack">
+          <div class="grid-2">
+            <section class="card stack">
+              <h2>Create new cluster</h2>
+              <p>Start a new cluster with this server as its first member.</p>
+              <div>
+                <button type="button" class="btn btn-primary" @click="choose('create')">
+                  Create new cluster
+                </button>
+              </div>
+            </section>
+            <section class="card stack">
+              <h2>Join existing cluster</h2>
+              <p>
+                Add this server to a cluster that already runs. Data moves only after you start a
+                rebalance.
+              </p>
+              <div>
+                <button type="button" class="btn" @click="choose('join')">
+                  Join existing cluster
+                </button>
+              </div>
+            </section>
+          </div>
+          <section class="card stack" aria-labelledby="own-fp-h">
+            <h2 id="own-fp-h">Fingerprint of this server</h2>
+            <OwnFingerprint
+              :fingerprint="ownFingerprint"
+              purpose="If an administrator adds this server from the panel of a cluster (Add server), they pin this fingerprint. Give it to them by a way other than the network between the two servers."
+              fallback="This server does not report its fingerprint here (it does so only to a request from the machine itself, or with the setup token). Read it in the log of this server, in the line bootstrap certificate of the internal API."
+            />
+          </section>
+          <div>
+            <button type="button" class="btn btn-link" @click="step = 'token'">
+              Change setup token
             </button>
           </div>
         </div>
-        <div v-else-if="action.state.value === 'failed'">
-          <button type="button" class="btn" @click="backToForm">Back to the settings</button>
+
+        <!-- 3a. create -->
+        <form
+          v-else-if="step === 'create'"
+          v-block-enter-submit
+          class="stack"
+          novalidate
+          @submit.prevent="submit"
+        >
+          <h2>Create new cluster</h2>
+          <ProblemNotice v-if="action.error.value" :error="action.error.value" />
+          <p v-if="tokenInvalid">
+            <button type="button" class="btn btn-link" @click="step = 'token'">
+              Enter the setup token again
+            </button>
+          </p>
+          <fieldset>
+            <legend>Cluster</legend>
+            <FormField v-slot="slot" label="Cluster name" :error="errors.clusterName" required>
+              <input
+                v-bind="slot"
+                v-model="create.clusterName"
+                class="input"
+                autocomplete="off"
+                data-autofocus
+              />
+            </FormField>
+          </fieldset>
+          <fieldset>
+            <legend>Administrator account</legend>
+            <FormField v-slot="slot" label="User name" :error="errors['admin.username']" required>
+              <input
+                v-bind="slot"
+                v-model="create.adminUser"
+                class="input"
+                autocomplete="username"
+              />
+            </FormField>
+            <FormField
+              v-slot="slot"
+              label="Password"
+              hint="At least 12 characters."
+              :error="errors['admin.password']"
+              required
+            >
+              <input
+                v-bind="slot"
+                v-model="create.adminPassword"
+                class="input"
+                type="password"
+                autocomplete="new-password"
+              />
+            </FormField>
+            <FormField
+              v-slot="slot"
+              label="Repeat password"
+              :error="errors.adminPassword2"
+              required
+            >
+              <input
+                v-bind="slot"
+                v-model="create.adminPassword2"
+                class="input"
+                type="password"
+                autocomplete="new-password"
+              />
+            </FormField>
+          </fieldset>
+          <fieldset>
+            <legend>Data paths and memory</legend>
+            <FormField
+              v-slot="slot"
+              label="Data directory"
+              :error="errors['dataPaths.dataDirectory']"
+              required
+            >
+              <input v-bind="slot" v-model="create.dataDirectory" class="input mono" />
+            </FormField>
+            <FormField
+              v-slot="slot"
+              label="WAL directory (optional)"
+              hint="Leave empty to keep the WAL inside the data directory."
+            >
+              <input v-bind="slot" v-model="create.walDirectory" class="input mono" />
+            </FormField>
+            <FormField v-slot="slot" label="Log directory (optional)">
+              <input v-bind="slot" v-model="create.logDirectory" class="input mono" />
+            </FormField>
+            <FormField
+              v-slot="slot"
+              label="Memory quota (MB)"
+              :error="errors['memoryQuota.totalMegabytes']"
+              required
+            >
+              <input
+                v-bind="slot"
+                v-model.number="create.memoryMb"
+                class="input num"
+                type="number"
+                min="512"
+                step="256"
+              />
+            </FormField>
+          </fieldset>
+          <fieldset>
+            <legend>Features</legend>
+            <label class="check"
+              ><input v-model="create.sharding" type="checkbox" /> Sharding</label
+            >
+            <label class="check"
+              ><input v-model="create.ledger" type="checkbox" /> Tamper-evident ledger</label
+            >
+            <p class="hint muted">
+              Features can be turned on later in Settings but never turned off again.
+            </p>
+            <FormField
+              v-slot="slot"
+              label="Default replica count"
+              hint="Standby copies of every shard group (0 to 3). Changed later in cluster settings."
+              :error="errors.defaultReplicaCount"
+            >
+              <input
+                v-bind="slot"
+                v-model.number="create.replicaCount"
+                class="input num"
+                type="number"
+                min="0"
+                max="3"
+              />
+            </FormField>
+            <FormField v-slot="slot" label="Default durability">
+              <select v-bind="slot" v-model="create.durability">
+                <option value="async">Asynchronous</option>
+                <option value="sync">Synchronous (quorum)</option>
+                <option value="syncApply">Synchronous with apply</option>
+              </select>
+            </FormField>
+          </fieldset>
+          <div class="row">
+            <button type="submit" class="btn btn-primary" :disabled="action.isStarting.value">
+              Create cluster
+            </button>
+            <button type="button" class="btn" @click="step = 'choose'">Back</button>
+          </div>
+        </form>
+
+        <!-- 3b. join -->
+        <form
+          v-else-if="step === 'join'"
+          v-block-enter-submit
+          class="stack"
+          novalidate
+          @submit.prevent="submit"
+        >
+          <h2>Join existing cluster</h2>
+          <ProblemNotice v-if="action.error.value" :error="action.error.value" />
+          <p v-if="tokenInvalid">
+            <button type="button" class="btn btn-link" @click="step = 'token'">
+              Enter the setup token again
+            </button>
+          </p>
+          <fieldset>
+            <legend>Existing cluster</legend>
+            <FormField
+              v-slot="slot"
+              label="Address of any existing server"
+              hint="host:port of its panel port, for example 10.0.0.11:8091."
+              :error="errors.existingNodeAddress"
+              required
+            >
+              <input v-bind="slot" v-model="join.address" class="input mono" data-autofocus />
+            </FormField>
+            <PinChoice
+              v-model:fingerprint="join.expectedFingerprint"
+              v-model:unpinned="joinUnpinned"
+              purpose="join"
+              hint="SHA-256 of that server's internal certificate, 64 hex digits; colons are allowed. Read it on that server's This server page."
+              :error="errors.expectedFingerprint"
+            />
+            <FormField
+              v-slot="slot"
+              label="Administrator user name"
+              :error="errors['admin.username']"
+              required
+            >
+              <input v-bind="slot" v-model="join.adminUser" class="input" autocomplete="username" />
+            </FormField>
+            <FormField
+              v-slot="slot"
+              label="Administrator password"
+              :error="errors['admin.password']"
+              required
+            >
+              <input
+                v-bind="slot"
+                v-model="join.adminPassword"
+                class="input"
+                type="password"
+                autocomplete="current-password"
+              />
+            </FormField>
+          </fieldset>
+          <fieldset>
+            <legend>This server</legend>
+            <FormField
+              v-slot="slot"
+              label="Data directory"
+              :error="errors['dataPaths.dataDirectory']"
+              required
+            >
+              <input v-bind="slot" v-model="join.dataDirectory" class="input mono" />
+            </FormField>
+            <FormField
+              v-slot="slot"
+              label="Memory quota (MB)"
+              :error="errors['memoryQuota.totalMegabytes']"
+            >
+              <input
+                v-bind="slot"
+                v-model.number="join.memoryMb"
+                class="input num"
+                type="number"
+                min="512"
+                step="256"
+              />
+            </FormField>
+            <FormField v-slot="slot" label="Server group (optional)" hint="Rack or zone name.">
+              <input v-bind="slot" v-model="join.serverGroup" class="input" />
+            </FormField>
+          </fieldset>
+          <p class="muted">
+            After joining, this server shows as "pending rebalance". Data moves only when you start
+            a rebalance.
+          </p>
+          <div class="row">
+            <button type="submit" class="btn btn-primary" :disabled="action.isStarting.value">
+              Join cluster
+            </button>
+            <button type="button" class="btn" @click="step = 'choose'">Back</button>
+          </div>
+        </form>
+
+        <!-- 4. progress -->
+        <div v-else class="stack">
+          <h2>{{ mode === 'create' ? 'Creating the cluster' : 'Joining the cluster' }}</h2>
+          <TaskProgress :task="action.task.value" :poll-error="action.pollError.value" />
+          <div v-if="action.state.value === 'done'" class="stack">
+            <p class="notice tone-ok" role="status">
+              <span aria-hidden="true">&#10003;</span>
+              This server is ready. Sign in with the administrator account.
+            </p>
+            <p v-if="mode === 'join'" class="muted" data-testid="join-fingerprint-note">
+              <template v-if="action.task.value?.detail"
+                >What the server reports about the first contact:
+                <SafeName :value="action.task.value.detail" kind="text" :max="500" multiline
+              /></template>
+              <template v-else
+                >The server did not report whether the certificate of the existing server was
+                checked, so this page cannot say. Compare the fingerprint with the one on the This
+                server page of the existing server.</template
+              >
+            </p>
+            <div>
+              <button type="button" class="btn btn-primary" @click="finish">
+                Continue to sign in
+              </button>
+            </div>
+          </div>
+          <div v-else-if="action.state.value === 'failed'">
+            <button type="button" class="btn" @click="backToForm">Back to the settings</button>
+          </div>
         </div>
       </div>
-    </div>
-  </main>
+    </main>
+    <AppFooter />
+  </div>
 </template>
 
 <style scoped>
-.wizard {
+.wizard-page {
   min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+.wizard {
+  flex: 1;
   display: grid;
   place-items: start center;
   padding: var(--s-6) var(--s-4);

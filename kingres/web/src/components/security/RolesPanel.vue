@@ -48,7 +48,7 @@ const drop = useMutation({
 
 <template>
   <div class="stack">
-    <div class="row-between">
+    <div class="form-row form-row-between">
       <div class="field">
         <label for="role-search">Search roles</label>
         <input id="role-search" v-model="search" class="input" type="search" />

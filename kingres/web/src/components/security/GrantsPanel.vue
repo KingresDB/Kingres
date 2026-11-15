@@ -196,7 +196,7 @@ const applyTemplate = useMutation({
 
 <template>
   <div class="stack">
-    <div class="row filters">
+    <div class="form-row">
       <div class="field">
         <label for="g-role">Role</label>
         <select id="g-role" v-model="grantee">
@@ -330,8 +330,5 @@ const applyTemplate = useMutation({
 }
 .matrix th:first-child {
   text-align: left;
-}
-.filters {
-  gap: var(--s-4);
 }
 </style>

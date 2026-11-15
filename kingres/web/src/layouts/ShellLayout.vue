@@ -5,6 +5,7 @@
 // Navigation items come from the router's route table; an item is shown only when the signed-in
 // role satisfies the `x-required-role` of the operation the page is built on.
 import { computed, ref, watch } from 'vue'
+import AppFooter from '@/components/AppFooter.vue'
 import BrandLogo from '@/components/BrandLogo.vue'
 import { useMediaQuery } from '@/composables/useMediaQuery'
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
@@ -82,16 +83,19 @@ watch(
     <header class="topbar">
       <button
         type="button"
-        class="btn btn-small menu-btn"
+        class="top-btn menu-btn"
+        aria-label="Menu"
         :aria-expanded="navOpen"
         aria-controls="side-nav"
         @click="navOpen = !navOpen"
       >
-        Menu
+        <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true" focusable="false">
+          <path d="M2 4.5h14M2 9h14M2 13.5h14" stroke="currentColor" stroke-width="1.8" />
+        </svg>
       </button>
       <!-- The logo names the product (accessible name "KingresDB"); on narrow screens the mark alone. -->
       <RouterLink :to="{ name: 'dashboard' }" class="brand-link">
-        <BrandLogo :variant="narrow ? 'mark' : 'horizontal'" :size="30" />
+        <BrandLogo :variant="narrow ? 'mark' : 'horizontal'" :size="narrow ? 30 : 38" />
       </RouterLink>
       <span class="cluster-name" :title="clusterTitle">
         <SafeName :value="session.session?.clusterName ?? 'This server'" kind="text" :max="60" />
@@ -99,25 +103,27 @@ watch(
       <span class="spacer" />
       <button
         type="button"
-        class="btn btn-small"
+        class="top-btn"
         :aria-label="`${themeLabel}. Switch theme`"
         @click="theme.cycle()"
       >
         <span aria-hidden="true">{{
           theme.mode === 'dark' ? '☾' : theme.mode === 'light' ? '☀' : '◑'
         }}</span>
-        {{ themeLabel }}
+        <span class="theme-label">{{ themeLabel }}</span>
       </button>
       <span class="user">
         <span class="sr-only">Signed in as</span>
-        <strong><SafeName :value="session.username ?? ''" kind="text" :max="40" /></strong>
+        <strong class="user-name"
+          ><SafeName :value="session.username ?? ''" kind="text" :max="40"
+        /></strong>
         <span class="role mono" :title="'Highest cluster role'">{{
           session.role ?? 'no cluster role'
         }}</span>
       </span>
       <button
         type="button"
-        class="btn btn-small"
+        class="top-btn"
         :aria-disabled="stopped ? 'true' : undefined"
         :aria-describedby="stopped ? 'signout-off-reason' : undefined"
         :title="stopped ? signOutReason : undefined"
@@ -190,6 +196,7 @@ watch(
         <RouterView v-else />
       </main>
     </div>
+    <AppFooter />
   </div>
 </template>
 
@@ -211,23 +218,58 @@ watch(
   left: var(--s-2);
   top: var(--s-2);
 }
+/* The top bar is one row at every width and black in both themes. What does not fit is shortened
+   (cluster name, user name) or reduced to its icon (theme switch); nothing wraps to a second row. */
 .topbar {
   position: sticky;
   top: 0;
   z-index: 50;
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
-  gap: var(--s-1) var(--s-3);
+  gap: var(--s-3);
   min-height: var(--topbar-h);
-  padding: var(--s-1) var(--s-4);
-  background: var(--c-surface);
-  border-bottom: 1px solid var(--c-border);
+  padding: 3px var(--s-4) 0;
+  background: var(--topbar-bg);
+  color: var(--topbar-fg);
+  border-bottom: 1px solid var(--topbar-border);
+  /* The logo on black takes the colouring made for dark backgrounds, whatever the theme. */
+  --logo-crown: var(--brand-cream);
+  --logo-db: var(--brand-gold-light);
+}
+.topbar :focus-visible {
+  outline-color: var(--topbar-focus);
 }
 .brand-link {
   display: inline-flex;
   align-items: center;
+  flex: none;
   border-radius: var(--radius-sm);
+}
+.top-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s-2);
+  flex: none;
+  min-height: 32px;
+  min-width: 32px;
+  padding: 0 var(--s-3);
+  font: inherit;
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  white-space: nowrap;
+  color: var(--topbar-fg);
+  background: transparent;
+  border: 1px solid var(--topbar-border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.top-btn:hover:not([aria-disabled='true']) {
+  background: var(--topbar-hover);
+}
+.top-btn[aria-disabled='true'] {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 /* A thin gold strip: a brand accent that carries no meaning, so it does not depend on contrast. */
 .topbar::before {
@@ -238,31 +280,41 @@ watch(
   background: linear-gradient(90deg, var(--brand-gold-light), var(--brand-gold-deep));
 }
 .cluster-name {
-  color: var(--c-text-muted);
+  color: var(--topbar-muted);
   padding-left: var(--s-3);
-  border-left: 1px solid var(--c-border);
+  border-left: 1px solid var(--topbar-border);
   min-width: 0;
   max-width: 20em;
-  overflow-wrap: anywhere;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .spacer {
   flex: 1;
+  min-width: 0;
 }
 .user {
   display: inline-flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 0 var(--s-2);
+  flex-direction: column;
+  justify-content: center;
   min-width: 0;
-  max-width: 100%;
-  overflow-wrap: anywhere;
+  line-height: 1.2;
+  text-align: right;
+}
+.user-name {
+  max-width: 16em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .role {
   font-size: var(--fs-xs);
-  color: var(--c-text-muted);
+  color: var(--topbar-muted);
+  white-space: nowrap;
 }
 .menu-btn {
   display: none;
+  padding: 0;
 }
 .body {
   display: flex;
@@ -350,10 +402,26 @@ watch(
 @media (max-width: 600px) {
   .topbar {
     padding-inline: var(--s-2);
+    gap: var(--s-2);
   }
   /* Only the icon of the theme switch at small widths; its accessible name stays. */
   .theme-label {
     display: none;
+  }
+  .top-btn {
+    padding: 0 var(--s-2);
+  }
+  .user-name {
+    max-width: 7em;
+  }
+  /* The role stays in the page for assistive technology; there is no room to show it. */
+  .role {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
   }
 }
 </style>

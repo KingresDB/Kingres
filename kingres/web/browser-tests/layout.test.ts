@@ -225,3 +225,99 @@ describe('a scrolling table is reachable and scrollable by keyboard (W-09)', () 
     expect(after).toBeGreaterThan(before)
   })
 })
+
+describe('the top bar is one black row at every width', () => {
+  for (const width of [1366, 683, 390, 320]) {
+    it(`at ${width} px nothing in it wraps to a second row`, async () => {
+      await page.setViewport({ width, height: 700 })
+      await go(page, '/dashboard')
+      const bar = await page.evaluate(() => {
+        const el = document.querySelector('header.topbar') as HTMLElement
+        const box = el.getBoundingClientRect()
+        const rows = new Set<number>()
+        for (const child of Array.from(el.children) as HTMLElement[]) {
+          const r = child.getBoundingClientRect()
+          if (r.width === 0 || r.height === 0) continue
+          // Children of one row have their centres at the same height.
+          rows.add(Math.round((r.top + r.height / 2) / 6))
+        }
+        return { height: box.height, rows: rows.size, right: box.right, window: innerWidth }
+      })
+      expect(bar.rows).toBe(1)
+      expect(bar.height).toBeLessThanOrEqual(56)
+      expect(bar.right).toBeLessThanOrEqual(bar.window + 1)
+      expect(await reachable('Sign out')).toBe(true)
+    })
+  }
+
+  it('is the same black in the light and in the dark theme', async () => {
+    await page.setViewport({ width: 1366, height: 700 })
+    const colours: string[] = []
+    for (const scheme of ['light', 'dark']) {
+      await page.emulateMediaFeatures([{ name: 'prefers-color-scheme', value: scheme }])
+      await go(page, '/dashboard')
+      colours.push(
+        await page.evaluate(
+          () =>
+            getComputedStyle(document.querySelector('header.topbar') as HTMLElement)
+              .backgroundColor,
+        ),
+      )
+    }
+    await page.emulateMediaFeatures([{ name: 'prefers-color-scheme', value: 'light' }])
+    expect(colours[0]).toBe('rgb(10, 10, 11)')
+    expect(colours[1]).toBe(colours[0])
+  })
+})
+
+describe('the controls of a form row are on one line', () => {
+  // A hint under one control (the timeout of the workbench) used to lift that control above
+  // its neighbours, and a button next to a labelled field sat at the height of the label.
+  for (const [route, selectors] of [
+    ['/workbench', ['#w-db', '#w-limit', '#w-timeout', '.form-row > button']],
+    ['/ledger', ['#v-scope', '.form-row > button']],
+    ['/security', ['#role-search', '.form-row > button']],
+  ] as const) {
+    it(`${route}: controls that share a line start at the same height`, async () => {
+      await page.setViewport({ width: 1366, height: 820 })
+      await go(page, route)
+      const boxes = await page.evaluate((list) => {
+        const first = document.querySelector(list[0])
+        const row = first?.closest('.form-row')
+        if (!row) return null
+        return list.map((s) => {
+          const r = row.querySelector(s)?.getBoundingClientRect()
+          return r ? { top: Math.round(r.top), bottom: Math.round(r.bottom) } : null
+        })
+      }, selectors)
+      expect(boxes).not.toBeNull()
+      const found = (boxes ?? []).filter((b): b is { top: number; bottom: number } => b !== null)
+      expect(found.length).toBe(selectors.length)
+      // The mock data has a very long database name, so the row may wrap: only controls whose
+      // boxes overlap vertically are on one line, and those must start at the same height.
+      const uneven: string[] = []
+      for (let i = 0; i < found.length; i++)
+        for (let j = i + 1; j < found.length; j++) {
+          const a = found[i]!
+          const b = found[j]!
+          const overlap = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top)
+          if (overlap > 0 && Math.abs(a.top - b.top) > 2)
+            uneven.push(`${selectors[i]} at ${a.top} and ${selectors[j]} at ${b.top}`)
+        }
+      expect(uneven).toEqual([])
+    })
+  }
+})
+
+describe('the legend of a chart keeps each name and value whole', () => {
+  it('a line of the legend is as high as one line of text', async () => {
+    await page.setViewport({ width: 1366, height: 820 })
+    await go(page, '/dashboard')
+    await page.waitForSelector('.legend li')
+    const heights = await page.evaluate(() =>
+      [...document.querySelectorAll('.legend li')].map((li) => li.getBoundingClientRect().height),
+    )
+    expect(heights.length).toBeGreaterThan(0)
+    expect(Math.max(...heights)).toBeLessThan(28)
+  })
+})

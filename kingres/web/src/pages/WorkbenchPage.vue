@@ -195,7 +195,7 @@ const hiddenRows = computed(() => (result.value?.data.rows.length ?? 0) - shownR
     </span>
   </p>
   <form v-block-enter-submit class="stack" @submit.prevent>
-    <div class="row" style="align-items: flex-end; gap: var(--s-4)">
+    <div class="form-row">
       <div class="field">
         <label for="w-db">Database</label>
         <select id="w-db" v-model="database" :disabled="running">

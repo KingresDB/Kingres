@@ -353,7 +353,7 @@ function downloadDigest(d: RawDigest, c: DigestChain): void {
 
         <section class="card stack" aria-labelledby="verify-h">
           <h2 id="verify-h">Verification</h2>
-          <div class="row">
+          <div class="form-row">
             <div class="field">
               <label for="v-scope">Scope</label>
               <select id="v-scope" v-model="scope">
@@ -693,11 +693,7 @@ function downloadDigest(d: RawDigest, c: DigestChain): void {
             file for the verifier <code>kingres-verify</code>. Name the row by its whole primary
             key; the server reads the row with your own database role.
           </p>
-          <form
-            class="row"
-            style="align-items: flex-end; gap: var(--s-4)"
-            @submit.prevent="proofMutation.mutate()"
-          >
+          <form class="form-row" @submit.prevent="proofMutation.mutate()">
             <div class="field">
               <label for="p-schema">Schema</label
               ><input id="p-schema" v-model="proofForm.schema" class="input mono" />

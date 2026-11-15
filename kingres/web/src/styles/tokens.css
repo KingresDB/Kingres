@@ -60,6 +60,14 @@
   /* Theme-dependent parts of the logo: crown and "KINGRES", and "DB". */
   --logo-crown: var(--brand-ink);
   --logo-db: var(--brand-gold-deep);
+  /* The top bar is black in the light and in the dark theme, so these do not change with the
+     theme. Text and borders on it are chosen for contrast with the black, not with the page. */
+  --topbar-bg: #0a0a0b;
+  --topbar-fg: #f4f1e8;
+  --topbar-muted: #bcb8ad;
+  --topbar-border: #34343a;
+  --topbar-hover: #1e1e22;
+  --topbar-focus: #f6d365;
   /* Gold for small UI accents (active navigation mark). A darker gold on light surfaces. */
   --c-brand: #8a6310;
 

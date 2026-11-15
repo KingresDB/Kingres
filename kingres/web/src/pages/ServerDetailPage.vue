@@ -178,11 +178,7 @@ function saveGroup(): void {
 
       <section class="card stack" aria-labelledby="grp-h">
         <h2 id="grp-h">Server group</h2>
-        <form
-          class="row"
-          style="align-items: flex-end; gap: var(--s-4)"
-          @submit.prevent="saveGroup"
-        >
+        <form class="form-row" @submit.prevent="saveGroup">
           <div class="field">
             <label for="srv-group">Group</label>
             <select id="srv-group" v-model="group" @change="groupTouched = true">

@@ -58,11 +58,7 @@ const LEVEL_ICON: Record<LogLevel, string> = { debug: '·', info: 'ⓘ', warning
     :title="local ? 'Local logs' : 'Logs'"
     :subtitle="local ? 'Log lines of this server only.' : 'Log lines of all servers, newest first.'"
   />
-  <form
-    class="row"
-    style="align-items: flex-end; gap: var(--s-4); margin-bottom: var(--s-3)"
-    @submit.prevent
-  >
+  <form class="form-row" style="margin-bottom: var(--s-3)" @submit.prevent>
     <div class="field">
       <label for="lg-level">Minimum level</label
       ><select id="lg-level" v-model="level">

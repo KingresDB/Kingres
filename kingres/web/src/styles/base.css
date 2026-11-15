@@ -103,6 +103,23 @@ pre,
   gap: var(--s-3);
   flex-wrap: wrap;
 }
+/* A row of labelled fields, usually with the button that acts on them. The fields start at the
+   same height, so their labels form one line and their controls the next, and a hint or an error
+   under one control does not push the others out of line. Whatever is not a field (a button)
+   starts where the controls start: one label line and the gap of a field lower. */
+.form-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: var(--s-3) var(--s-4);
+}
+.form-row > :not(.field):not(fieldset) {
+  margin-top: calc(1em * var(--lh) + var(--s-1));
+}
+/* The fields at the left edge and the action at the right one. */
+.form-row-between {
+  justify-content: space-between;
+}
 .grid-cards {
   display: grid;
   gap: var(--s-3);
@@ -392,6 +409,7 @@ table.table {
 .stack > *,
 .stack-lg > *,
 .row > *,
+.form-row > *,
 .grid-cards > *,
 .grid-2 > *,
 .card {

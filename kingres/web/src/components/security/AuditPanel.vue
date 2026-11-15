@@ -40,7 +40,7 @@ const OUTCOME = {
 
 <template>
   <div class="stack">
-    <div class="row" style="gap: var(--s-4)">
+    <div class="form-row">
       <div class="field">
         <label for="au-actor">Actor</label><input id="au-actor" v-model="actor" class="input" />
       </div>

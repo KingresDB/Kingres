@@ -89,10 +89,10 @@ describe('where the logo appears', () => {
     )
   })
 
-  it('the sign-in page has the stacked logo above the form, as decoration next to the heading', async () => {
+  it('the sign-in page has the horizontal logo above the form, as decoration next to the heading', async () => {
     const { container } = await renderApp('/login', { user: null })
     const heading = await screen.findByRole('heading', { name: /sign in to kingresdb/i })
-    const logo = container.querySelector('svg[data-variant="stacked"]')
+    const logo = container.querySelector('svg[data-variant="horizontal"]')
     expect(logo).not.toBeNull()
     expect(logo).toHaveAttribute('aria-hidden', 'true')
     // The logo comes before the form in the document.

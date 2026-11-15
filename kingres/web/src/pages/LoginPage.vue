@@ -5,6 +5,7 @@ import { computed, defineAsyncComponent, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import ProblemNotice from '@/components/ProblemNotice.vue'
 import FormField from '@/components/FormField.vue'
+import AppFooter from '@/components/AppFooter.vue'
 import BrandLogo from '@/components/BrandLogo.vue'
 import SystemDatabaseStoppedSignIn from '@/components/SystemDatabaseStoppedSignIn.vue'
 import { availability } from '@/api/availability'
@@ -54,65 +55,79 @@ async function submit(): Promise<void> {
 </script>
 
 <template>
-  <main class="login">
-    <div class="login-box">
-      <!-- Decorative: the heading below says "KingresDB" in text. -->
-      <BrandLogo variant="stacked" :size="140" decorative />
-      <form class="card stack" aria-labelledby="login-title" @submit.prevent="submit">
-        <p v-if="expired" class="notice tone-warn" role="status">
-          <span aria-hidden="true">&#9650;</span> Your session has expired. Sign in again to
-          continue.
-        </p>
-        <h1 id="login-title">Sign in to KingresDB</h1>
-        <p class="muted">
-          Use your PostgreSQL role. Your cluster role decides what you can do. A sign-in belongs to
-          this server only: another server of the cluster needs its own sign-in.
-        </p>
-        <SystemDatabaseStoppedSignIn v-if="availability.stoppedSeen" />
-        <p v-if="error instanceof SessionCookieError" class="notice tone-warn" role="alert">
-          <span aria-hidden="true">&#9650;</span>
-          <span>
-            <strong>Your browser did not keep the session.</strong> The session cookie is only kept
-            over HTTPS or when the panel is opened at <code>localhost</code>. Use an HTTPS address
-            or open the panel on this server through <code>http://localhost</code>.
-          </span>
-        </p>
-        <ProblemNotice v-else-if="error && !stoppedError" :error="error" />
-        <FormField v-slot="slot" label="User name">
-          <input
-            v-bind="slot"
-            v-model="username"
-            class="input"
-            autocomplete="username"
-            required
-            data-autofocus
-          />
-        </FormField>
-        <FormField v-slot="slot" label="Password">
-          <input
-            v-bind="slot"
-            v-model="password"
-            class="input"
-            type="password"
-            autocomplete="current-password"
-            required
-          />
-        </FormField>
-        <button type="submit" class="btn btn-primary" :disabled="busy || !username || !password">
-          {{ busy ? 'Signing in...' : 'Sign in' }}
-        </button>
-        <component :is="DemoHint" v-if="DemoHint" />
-      </form>
-    </div>
-  </main>
+  <div class="login-page">
+    <main class="login">
+      <div class="login-box">
+        <!-- The horizontal logo straight on the page, without a plate behind it. It follows the theme:
+             ink and deep gold on the light page, cream and light gold on the dark one. Decorative: the
+             heading below says "KingresDB" in text. -->
+        <BrandLogo class="login-logo" variant="horizontal" :size="64" decorative />
+        <form class="card stack" aria-labelledby="login-title" @submit.prevent="submit">
+          <p v-if="expired" class="notice tone-warn" role="status">
+            <span aria-hidden="true">&#9650;</span> Your session has expired. Sign in again to
+            continue.
+          </p>
+          <h1 id="login-title">Sign in to KingresDB</h1>
+          <p class="muted">
+            Use your PostgreSQL role. Your cluster role decides what you can do. A sign-in belongs
+            to this server only: another server of the cluster needs its own sign-in.
+          </p>
+          <SystemDatabaseStoppedSignIn v-if="availability.stoppedSeen" />
+          <p v-if="error instanceof SessionCookieError" class="notice tone-warn" role="alert">
+            <span aria-hidden="true">&#9650;</span>
+            <span>
+              <strong>Your browser did not keep the session.</strong> The session cookie is only
+              kept over HTTPS or when the panel is opened at <code>localhost</code>. Use an HTTPS
+              address or open the panel on this server through <code>http://localhost</code>.
+            </span>
+          </p>
+          <ProblemNotice v-else-if="error && !stoppedError" :error="error" />
+          <FormField v-slot="slot" label="User name">
+            <input
+              v-bind="slot"
+              v-model="username"
+              class="input"
+              autocomplete="username"
+              required
+              data-autofocus
+            />
+          </FormField>
+          <FormField v-slot="slot" label="Password">
+            <input
+              v-bind="slot"
+              v-model="password"
+              class="input"
+              type="password"
+              autocomplete="current-password"
+              required
+            />
+          </FormField>
+          <button type="submit" class="btn btn-primary" :disabled="busy || !username || !password">
+            {{ busy ? 'Signing in...' : 'Sign in' }}
+          </button>
+          <component :is="DemoHint" v-if="DemoHint" />
+        </form>
+      </div>
+    </main>
+    <AppFooter />
+  </div>
 </template>
 
 <style scoped>
-.login {
+.login-page {
   min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+.login {
+  flex: 1;
   display: grid;
   place-items: center;
   padding: var(--s-4);
+}
+.login-logo {
+  max-width: 100%;
+  height: auto;
 }
 .login-box {
   display: flex;

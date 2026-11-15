@@ -90,7 +90,7 @@ const metricsUnsupported = computed(() =>
       :error="cluster.error.value"
       @retry="cluster.refetch()"
     >
-      <section v-if="c" class="grid-cards" aria-label="Summary">
+      <section v-if="c" class="grid-cards summary" aria-label="Summary">
         <div class="card kpi">
           <span class="label">Cluster health</span>
           <span class="value"><StatusBadge :meta="HEALTH[c.health]" /></span>
@@ -161,7 +161,7 @@ const metricsUnsupported = computed(() =>
         :completeness="metricsCompleteness"
         consequence="The charts show only what the other servers know; the values of these servers are missing."
       />
-      <div v-if="!metricsUnsupported" class="grid-2">
+      <div v-if="!metricsUnsupported" class="charts">
         <div class="card">
           <QueryBoundary :loading="cpu.isPending.value" :error="cpu.error.value">
             <LineChart title="CPU usage" unit="percent" :series="toChartSeries(cpu.data.value)" />
@@ -259,6 +259,39 @@ const metricsUnsupported = computed(() =>
 </template>
 
 <style scoped>
+/* The six summary cards fill whole rows (6, 3, 2 or 1 per row), so none is left alone on a row. */
+.summary {
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+}
+/* The four charts are two rows of two, or one row of four on a very wide screen. */
+.charts {
+  display: grid;
+  gap: var(--s-4);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+@media (min-width: 1900px) {
+  .charts {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+@media (max-width: 1500px) {
+  .summary {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+@media (max-width: 700px) {
+  .summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .charts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+@media (max-width: 460px) {
+  .summary {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
 .plain-list {
   list-style: none;
   margin: 0;
