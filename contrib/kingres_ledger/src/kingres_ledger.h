@@ -21,6 +21,9 @@
 #ifndef KINGRES_LEDGER_KINGRES_LEDGER_H
 #define KINGRES_LEDGER_KINGRES_LEDGER_H
 
+/* The differences between the PostgreSQL majors; see the file. */
+#include "pg_compat.h"
+
 /* Version of the hash formats implemented by this code (see README). */
 #define KL_HASH_VERSION 1
 

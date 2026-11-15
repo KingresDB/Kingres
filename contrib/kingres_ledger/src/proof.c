@@ -142,7 +142,7 @@ kl_json_int(JsonbContainer *obj, const char *key, int64 *out)
 
 	if (v == NULL || v->type != jbvNumeric)
 		return false;
-	n = numeric_int8_opt_error(v->val.numeric, &have_error);
+	n = kl_numeric_to_int8(v->val.numeric, &have_error);
 	if (have_error)
 		return false;
 	if (!DatumGetBool(DirectFunctionCall2(numeric_eq,

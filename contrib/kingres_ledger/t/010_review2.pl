@@ -123,6 +123,9 @@ my @hostile = (
 	[ 'TimeZone',                             "'Asia/Kolkata'" ],
 	[ 'client_encoding',                      "'LATIN1'" ],
 );
+# PostgreSQL 19 forces standard_conforming_strings on: a database cannot be
+# set to "off" any more, so that case exists on 18 only.
+@hostile = grep { !($_->[0] eq 'standard_conforming_strings' && $h->pg_version->major >= 19) } @hostile;
 my $n = 0;
 my $super = $h->safe_psql('postgres', 'SELECT current_user');
 foreach my $s (@hostile)

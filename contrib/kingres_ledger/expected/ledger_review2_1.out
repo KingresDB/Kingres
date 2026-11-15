@@ -1,0 +1,742 @@
+-- ledger_review2: regression tests for the findings L2-01 to L2-05 and L2-08
+-- of the independent review kingres/docs/reviews/2026-11-14-kingres-ledger-0.2.md
+-- that a single server can show.  Every block states the finding it
+-- reproduces.  (L2-03 and L2-06 need workers and are in t/010_review2.pl,
+-- L2-07 is in kingres/verifier.)  The test is self-contained: it makes its own
+-- roles and tables, and it needs the setting of ledger_setup (workers off).
+--
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+-- SPDX-License-Identifier: PostgreSQL
+SET search_path = public;
+\set VERBOSITY terse
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS kingres_ledger;
+RESET client_min_messages;
+DROP ROLE IF EXISTS kl2_alice;
+NOTICE:  role "kl2_alice" does not exist, skipping
+DROP ROLE IF EXISTS kl2_bob;
+NOTICE:  role "kl2_bob" does not exist, skipping
+DROP ROLE IF EXISTS kl2_carol;
+NOTICE:  role "kl2_carol" does not exist, skipping
+DROP ROLE IF EXISTS kl2_dflt;
+NOTICE:  role "kl2_dflt" does not exist, skipping
+DROP ROLE IF EXISTS kl2_auditor;
+NOTICE:  role "kl2_auditor" does not exist, skipping
+CREATE ROLE kl2_alice;
+CREATE ROLE kl2_bob;
+CREATE ROLE kl2_carol;
+CREATE ROLE kl2_dflt;
+CREATE ROLE kl2_auditor;
+GRANT USAGE, CREATE ON SCHEMA public TO kl2_alice, kl2_bob, kl2_carol;
+GRANT EXECUTE ON FUNCTION kingres.ledger_enable(regclass, text) TO kl2_alice;
+-- The report of ledger_verify with the values that change from run to run masked.
+CREATE FUNCTION public.r2report() RETURNS TABLE (check_name text, object text, detail text)
+LANGUAGE sql AS $$
+    SELECT v.check_name, v.object,
+           regexp_replace(regexp_replace(regexp_replace(v.detail, '[0-9a-f]{64}', '<hash>', 'g'),
+                                         'tx [0-9]+', 'tx N', 'g'), 'seq [0-9]+', 'seq N', 'g')
+    FROM kingres.ledger_verify() v
+    ORDER BY 1, 2, 3
+$$;
+-- Who can do what on a history table, one line per grantee and privilege.
+CREATE FUNCTION public.r2acl(t regclass) RETURNS TABLE (grantee text, privilege text, grantor text)
+LANGUAGE sql AS $$
+    SELECT CASE a.grantee WHEN 0 THEN 'PUBLIC'
+                          WHEN c.relowner THEN '<history owner>'
+                          ELSE a.grantee::regrole::text END,
+           a.privilege_type,
+           CASE a.grantor WHEN c.relowner THEN '<history owner>' ELSE a.grantor::regrole::text END
+    FROM pg_class c, aclexplode(COALESCE(c.relacl, acldefault('r', c.relowner))) a
+    WHERE c.oid = t
+    ORDER BY 1, 2
+$$;
+SET ROLE kl2_alice;
+CREATE TABLE r2_acc (id int PRIMARY KEY, v text);
+RESET ROLE;
+SELECT kingres.ledger_enable('r2_acc', 'updatable');
+ ledger_enable 
+---------------
+ 
+(1 row)
+
+INSERT INTO r2_acc VALUES (1, 'one');
+SELECT count(*) AS problems_at_start FROM r2report();
+ problems_at_start 
+-------------------
+                 0
+(1 row)
+
+--------------------------------------------------------------------------
+-- L2-01: the statement that the extension runs on the history table must not
+-- open a window in which other statements are not checked.  Event triggers
+-- of the superuser that act on the second firing of ALTER TABLE (the first
+-- is the statement of the user, the second used to be the extension's own),
+-- and event triggers that act on every firing at the start and the end.
+--------------------------------------------------------------------------
+SELECT current_user AS extension_owner \gset
+CREATE FUNCTION public.r2_evil() RETURNS event_trigger LANGUAGE plpgsql AS $$
+DECLARE n text := coalesce(current_setting('r2.n', true), '');
+BEGIN
+  IF tg_tag = 'ALTER TABLE' THEN
+    IF n = '' THEN
+      PERFORM set_config('r2.n', '1', true);
+    ELSIF n = '1' THEN
+      PERFORM set_config('r2.n', '2', true);
+      EXECUTE 'grant insert on kingres.ledger_entry to kl2_bob';
+      EXECUTE 'alter table kingres.ledger_entry owner to kl2_bob';
+      EXECUTE 'create or replace function kingres.ledger_hook_active() returns boolean language sql as $f$ select true $f$';
+    END IF;
+  END IF;
+END $$;
+CREATE EVENT TRIGGER aaa_r2_evil ON ddl_command_end EXECUTE FUNCTION public.r2_evil();
+ALTER TABLE r2_acc ADD COLUMN extra9 text;
+DROP EVENT TRIGGER aaa_r2_evil;
+SELECT has_table_privilege('kl2_bob', 'kingres.ledger_entry', 'insert') AS bob_can_write_the_entries,
+       (SELECT relowner::regrole::text = :'extension_owner' FROM pg_class WHERE oid = 'kingres.ledger_entry'::regclass) AS entries_still_owned_by_the_extension_owner,
+       (SELECT l.lanname FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang
+         WHERE p.oid = 'kingres.ledger_hook_active()'::regprocedure) AS hook_active_is_still_c;
+ bob_can_write_the_entries | entries_still_owned_by_the_extension_owner | hook_active_is_still_c 
+---------------------------+--------------------------------------------+------------------------
+ f                         | t                                          | c
+(1 row)
+
+-- An event trigger that tries on every firing, at the start and at the end:
+-- every attempt is a normal statement and is rejected, and nothing is
+-- accepted that is not accepted outside the statement.
+CREATE FUNCTION public.r2_evil_always() RETURNS event_trigger LANGUAGE plpgsql AS $$
+DECLARE stmt text;
+BEGIN
+  IF tg_tag = 'ALTER TABLE' THEN
+    FOREACH stmt IN ARRAY ARRAY[
+        'grant insert on kingres.ledger_entry to kl2_bob',
+        'alter table kingres.ledger_entry owner to kl2_bob',
+        'create or replace function kingres.ledger_hook_active() returns boolean language sql as $f$ select true $f$',
+        'alter table kingres.ledger_entry disable trigger all',
+        'grant select on r2_acc_ledger_history to kl2_bob'] LOOP
+      BEGIN
+        EXECUTE stmt;
+        RAISE NOTICE '% %: ACCEPTED %', tg_event, tg_tag, stmt;
+      EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE '% %: rejected % %', tg_event, tg_tag, SQLSTATE, left(stmt, 40);
+      END;
+    END LOOP;
+  END IF;
+END $$;
+CREATE EVENT TRIGGER aaa_r2_evil_start ON ddl_command_start EXECUTE FUNCTION public.r2_evil_always();
+CREATE EVENT TRIGGER aaa_r2_evil_end ON ddl_command_end EXECUTE FUNCTION public.r2_evil_always();
+ALTER TABLE r2_acc ADD COLUMN extra8 text;
+NOTICE:  ddl_command_start ALTER TABLE: rejected KL002 grant insert on kingres.ledger_entry to 
+NOTICE:  ddl_command_start ALTER TABLE: rejected KL002 alter table kingres.ledger_entry owner t
+NOTICE:  ddl_command_start ALTER TABLE: rejected KL002 create or replace function kingres.ledge
+NOTICE:  ddl_command_start ALTER TABLE: rejected KL002 alter table kingres.ledger_entry disable
+NOTICE:  ddl_command_start ALTER TABLE: rejected KL002 grant select on r2_acc_ledger_history to
+NOTICE:  ddl_command_end ALTER TABLE: rejected KL002 grant insert on kingres.ledger_entry to 
+NOTICE:  ddl_command_end ALTER TABLE: rejected KL002 alter table kingres.ledger_entry owner t
+NOTICE:  ddl_command_end ALTER TABLE: rejected KL002 create or replace function kingres.ledge
+NOTICE:  ddl_command_end ALTER TABLE: rejected KL002 alter table kingres.ledger_entry disable
+NOTICE:  ddl_command_end ALTER TABLE: rejected KL002 grant select on r2_acc_ledger_history to
+DROP EVENT TRIGGER aaa_r2_evil_start;
+DROP EVENT TRIGGER aaa_r2_evil_end;
+SELECT has_table_privilege('kl2_bob', 'kingres.ledger_entry', 'insert') AS bob_can_write_the_entries,
+       has_table_privilege('kl2_bob', 'r2_acc_ledger_history', 'select') AS bob_reads_the_history;
+ bob_can_write_the_entries | bob_reads_the_history 
+---------------------------+-----------------------
+ f                         | f
+(1 row)
+
+-- the history table followed both ADD COLUMNs, and the ledger verifies
+SELECT string_agg(attname, ',' ORDER BY attnum) AS history_columns
+FROM pg_attribute WHERE attrelid = 'r2_acc_ledger_history'::regclass AND attnum > 0 AND NOT attisdropped;
+                   history_columns                   
+-----------------------------------------------------
+ id,v,ledger_txid,ledger_seq,ledger_op,extra9,extra8
+(1 row)
+
+INSERT INTO r2_acc VALUES (2, 'two', 'x', 'y');
+UPDATE r2_acc SET extra9 = 'nine' WHERE id = 2;
+SELECT count(*) AS problems_after_add_column FROM r2report();
+ problems_after_add_column 
+---------------------------
+                         0
+(1 row)
+
+DROP FUNCTION public.r2_evil();
+DROP FUNCTION public.r2_evil_always();
+--------------------------------------------------------------------------
+-- L2-02: the history table follows the owner of the table
+--------------------------------------------------------------------------
+SELECT * FROM r2acl('r2_acc_ledger_history');
+     grantee     | privilege  |     grantor     
+-----------------+------------+-----------------
+ <history owner> | DELETE     | <history owner>
+ <history owner> | INSERT     | <history owner>
+ <history owner> | MAINTAIN   | <history owner>
+ <history owner> | REFERENCES | <history owner>
+ <history owner> | SELECT     | <history owner>
+ <history owner> | TRIGGER    | <history owner>
+ <history owner> | TRUNCATE   | <history owner>
+ <history owner> | UPDATE     | <history owner>
+ kl2_alice       | SELECT     | <history owner>
+(9 rows)
+
+ALTER TABLE r2_acc OWNER TO kl2_bob;
+SET ROLE kl2_bob;
+UPDATE r2_acc SET v = 'bob-secret-2' WHERE id = 1;
+RESET ROLE;
+SELECT * FROM r2acl('r2_acc_ledger_history');
+     grantee     | privilege  |     grantor     
+-----------------+------------+-----------------
+ <history owner> | DELETE     | <history owner>
+ <history owner> | INSERT     | <history owner>
+ <history owner> | MAINTAIN   | <history owner>
+ <history owner> | REFERENCES | <history owner>
+ <history owner> | SELECT     | <history owner>
+ <history owner> | TRIGGER    | <history owner>
+ <history owner> | TRUNCATE   | <history owner>
+ <history owner> | UPDATE     | <history owner>
+ kl2_bob         | SELECT     | <history owner>
+(9 rows)
+
+SELECT has_table_privilege('kl2_alice', 'r2_acc_ledger_history', 'select') AS former_owner_reads_the_history,
+       has_table_privilege('kl2_bob', 'r2_acc_ledger_history', 'select') AS new_owner_reads_the_history;
+ former_owner_reads_the_history | new_owner_reads_the_history 
+--------------------------------+-----------------------------
+ f                              | t
+(1 row)
+
+SET ROLE kl2_alice;
+SELECT v FROM r2_acc_ledger_history;
+ERROR:  permission denied for table r2_acc_ledger_history
+RESET ROLE;
+SET ROLE kl2_bob;
+SELECT v FROM r2_acc_ledger_history ORDER BY ledger_txid;
+  v  
+-----
+ two
+ one
+(2 rows)
+
+RESET ROLE;
+-- REASSIGN OWNED fires no event trigger
+REASSIGN OWNED BY kl2_bob TO kl2_carol;
+SELECT * FROM r2acl('r2_acc_ledger_history');
+     grantee     | privilege  |     grantor     
+-----------------+------------+-----------------
+ <history owner> | DELETE     | <history owner>
+ <history owner> | INSERT     | <history owner>
+ <history owner> | MAINTAIN   | <history owner>
+ <history owner> | REFERENCES | <history owner>
+ <history owner> | SELECT     | <history owner>
+ <history owner> | TRIGGER    | <history owner>
+ <history owner> | TRUNCATE   | <history owner>
+ <history owner> | UPDATE     | <history owner>
+ kl2_carol       | SELECT     | <history owner>
+(9 rows)
+
+SELECT has_table_privilege('kl2_bob', 'r2_acc_ledger_history', 'select') AS former_owner_reads_the_history,
+       has_table_privilege('kl2_carol', 'r2_acc_ledger_history', 'select') AS new_owner_reads_the_history;
+ former_owner_reads_the_history | new_owner_reads_the_history 
+--------------------------------+-----------------------------
+ f                              | t
+(1 row)
+
+-- with event triggers off the hook still moves the privileges
+SET event_triggers = off;
+ALTER TABLE r2_acc OWNER TO kl2_alice;
+RESET event_triggers;
+SELECT * FROM r2acl('r2_acc_ledger_history');
+     grantee     | privilege  |     grantor     
+-----------------+------------+-----------------
+ <history owner> | DELETE     | <history owner>
+ <history owner> | INSERT     | <history owner>
+ <history owner> | MAINTAIN   | <history owner>
+ <history owner> | REFERENCES | <history owner>
+ <history owner> | SELECT     | <history owner>
+ <history owner> | TRIGGER    | <history owner>
+ <history owner> | TRUNCATE   | <history owner>
+ <history owner> | UPDATE     | <history owner>
+ kl2_alice       | SELECT     | <history owner>
+(9 rows)
+
+-- nobody can grant anything on the history table
+GRANT SELECT ON r2_acc_ledger_history TO kl2_bob;
+ERROR:  cannot grant privileges on table "r2_acc_ledger_history": it is a history table of the ledger
+GRANT SELECT (v) ON r2_acc_ledger_history TO kl2_bob;
+ERROR:  cannot grant privileges on table "r2_acc_ledger_history": it is a history table of the ledger
+GRANT ALL ON r2_acc_ledger_history TO kl2_bob;
+ERROR:  cannot grant privileges on table "r2_acc_ledger_history": it is a history table of the ledger
+SELECT count(*) AS problems_after_owner_changes FROM r2report();
+ problems_after_owner_changes 
+------------------------------
+                            0
+(1 row)
+
+-- GRANT ... ON ALL TABLES IN SCHEMA cannot be told apart by the hook; the
+-- event trigger takes the privileges back at the end of the statement.
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO kl2_bob;
+SELECT * FROM r2acl('r2_acc_ledger_history');
+     grantee     | privilege  |     grantor     
+-----------------+------------+-----------------
+ <history owner> | DELETE     | <history owner>
+ <history owner> | INSERT     | <history owner>
+ <history owner> | MAINTAIN   | <history owner>
+ <history owner> | REFERENCES | <history owner>
+ <history owner> | SELECT     | <history owner>
+ <history owner> | TRIGGER    | <history owner>
+ <history owner> | TRUNCATE   | <history owner>
+ <history owner> | UPDATE     | <history owner>
+ kl2_alice       | SELECT     | <history owner>
+(9 rows)
+
+SELECT count(*) AS problems_after_grant_all_tables FROM r2report();
+ problems_after_grant_all_tables 
+---------------------------------
+                               0
+(1 row)
+
+-- Default privileges of the extension owner must not open a history table.
+ALTER DEFAULT PRIVILEGES FOR ROLE :"extension_owner" IN SCHEMA public GRANT SELECT ON TABLES TO PUBLIC, kl2_dflt;
+SET ROLE kl2_alice;
+CREATE TABLE r2_dflt (id int PRIMARY KEY, v text);
+RESET ROLE;
+SELECT kingres.ledger_enable('r2_dflt', 'updatable');
+ ledger_enable 
+---------------
+ 
+(1 row)
+
+SELECT * FROM r2acl('r2_dflt_ledger_history');
+     grantee     | privilege  |     grantor     
+-----------------+------------+-----------------
+ <history owner> | DELETE     | <history owner>
+ <history owner> | INSERT     | <history owner>
+ <history owner> | MAINTAIN   | <history owner>
+ <history owner> | REFERENCES | <history owner>
+ <history owner> | SELECT     | <history owner>
+ <history owner> | TRIGGER    | <history owner>
+ <history owner> | TRUNCATE   | <history owner>
+ <history owner> | UPDATE     | <history owner>
+ kl2_alice       | SELECT     | <history owner>
+(9 rows)
+
+ALTER DEFAULT PRIVILEGES FOR ROLE :"extension_owner" IN SCHEMA public REVOKE SELECT ON TABLES FROM PUBLIC, kl2_dflt;
+SELECT count(*) AS problems_with_default_privileges FROM r2report();
+ problems_with_default_privileges 
+----------------------------------
+                                0
+(1 row)
+
+-- ledger_verify reports a history table whose privileges are not those of the
+-- rule (a privilege added by a catalog edit, a privilege missing, an owner of
+-- the table that cannot read it, a column privilege).
+UPDATE pg_class SET relacl = relacl || makeaclitem('kl2_bob'::regrole, relowner, 'SELECT', false)
+WHERE oid = 'r2_acc_ledger_history'::regclass;
+SELECT * FROM r2report();
+     check_name     |    object     |                                                                         detail                                                                         
+--------------------+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------
+ history_privileges | public.r2_acc | public.r2_acc_ledger_history: kl2_bob has the privilege SELECT, which the rule gives only to the owner of the table and the owner of the history table
+(1 row)
+
+UPDATE pg_class SET relacl = NULL WHERE oid = 'r2_dflt_ledger_history'::regclass;
+SELECT * FROM r2report();
+     check_name     |     object     |                                                                         detail                                                                         
+--------------------+----------------+--------------------------------------------------------------------------------------------------------------------------------------------------------
+ history_privileges | public.r2_acc  | public.r2_acc_ledger_history: kl2_bob has the privilege SELECT, which the rule gives only to the owner of the table and the owner of the history table
+ history_privileges | public.r2_dflt | public.r2_dflt_ledger_history: the owner of the table cannot read the history table
+(2 rows)
+
+UPDATE pg_attribute SET attacl = ARRAY[makeaclitem('kl2_carol'::regrole,
+           (SELECT relowner FROM pg_class WHERE oid = 'r2_acc_ledger_history'::regclass), 'SELECT', false)]
+WHERE attrelid = 'r2_acc_ledger_history'::regclass AND attname = 'v';
+SELECT * FROM r2report();
+     check_name     |     object     |                                                                         detail                                                                         
+--------------------+----------------+--------------------------------------------------------------------------------------------------------------------------------------------------------
+ history_privileges | public.r2_acc  | public.r2_acc_ledger_history: column "v" has column privileges
+ history_privileges | public.r2_acc  | public.r2_acc_ledger_history: kl2_bob has the privilege SELECT, which the rule gives only to the owner of the table and the owner of the history table
+ history_privileges | public.r2_dflt | public.r2_dflt_ledger_history: the owner of the table cannot read the history table
+(3 rows)
+
+-- any DDL command repairs them (the event trigger runs the same rule)
+COMMENT ON TABLE r2_acc IS 'r2';
+SELECT * FROM r2acl('r2_acc_ledger_history');
+     grantee     | privilege  |     grantor     
+-----------------+------------+-----------------
+ <history owner> | DELETE     | <history owner>
+ <history owner> | INSERT     | <history owner>
+ <history owner> | MAINTAIN   | <history owner>
+ <history owner> | REFERENCES | <history owner>
+ <history owner> | SELECT     | <history owner>
+ <history owner> | TRIGGER    | <history owner>
+ <history owner> | TRUNCATE   | <history owner>
+ <history owner> | UPDATE     | <history owner>
+ kl2_alice       | SELECT     | <history owner>
+(9 rows)
+
+SELECT * FROM r2acl('r2_dflt_ledger_history');
+     grantee     | privilege  |     grantor     
+-----------------+------------+-----------------
+ <history owner> | DELETE     | <history owner>
+ <history owner> | INSERT     | <history owner>
+ <history owner> | MAINTAIN   | <history owner>
+ <history owner> | REFERENCES | <history owner>
+ <history owner> | SELECT     | <history owner>
+ <history owner> | TRIGGER    | <history owner>
+ <history owner> | TRUNCATE   | <history owner>
+ <history owner> | UPDATE     | <history owner>
+ kl2_alice       | SELECT     | <history owner>
+(9 rows)
+
+SELECT count(*) AS problems_after_repair FROM r2report();
+ problems_after_repair 
+-----------------------
+                     0
+(1 row)
+
+--------------------------------------------------------------------------
+-- L2-04: what PUBLIC can read of the records, and of every object of 0.2
+--------------------------------------------------------------------------
+SELECT kingres.ledger_verify_recorded() AS vid \gset
+SELECT kingres.ledger_generate_digest() IS NOT NULL AS digest_made;
+ digest_made 
+-------------
+ t
+(1 row)
+
+SET ROLE kl2_bob;
+SELECT count(*) FROM kingres.ledger_verification;
+ERROR:  permission denied for table ledger_verification
+SELECT problems FROM kingres.ledger_verification;
+ERROR:  permission denied for table ledger_verification
+SELECT count(*) > 0 AS public_reads_the_digests FROM kingres.ledger_digest;
+ public_reads_the_digests 
+--------------------------
+ t
+(1 row)
+
+SELECT count(digest_id) > 0 AS public_reads_the_columns_without_a_role_name FROM kingres.ledger_digest;
+ public_reads_the_columns_without_a_role_name 
+----------------------------------------------
+ t
+(1 row)
+
+SELECT generated_by FROM kingres.ledger_digest;
+ERROR:  permission denied for table ledger_digest
+SELECT count(*) FROM kingres.ledger_status;
+ERROR:  permission denied for view ledger_status
+SELECT count(*) FROM kingres.ledger_entry;
+ERROR:  permission denied for table ledger_entry
+SELECT count(*) FROM kingres.ledger_pending;
+ERROR:  permission denied for table ledger_pending
+SELECT count(*) FROM kingres.ledger_tx;
+ERROR:  permission denied for table ledger_tx
+SELECT state FROM kingres.ledger_worker_state();
+ERROR:  permission denied for function ledger_worker_state
+SELECT kingres.ledger_history_acl_sync('r2_acc', 'r2_acc_ledger_history');
+ERROR:  permission denied for function ledger_history_acl_sync
+-- L2-08: a role without EXECUTE cannot add rows to the records
+SELECT kingres.ledger_generate_digest();
+ERROR:  permission denied for function ledger_generate_digest
+SELECT kingres.ledger_verify_recorded();
+ERROR:  permission denied for function ledger_verify_recorded
+RESET ROLE;
+-- an auditor is given exactly what the README says
+GRANT SELECT ON kingres.ledger_verification TO kl2_auditor;
+SET ROLE kl2_auditor;
+SELECT count(*) > 0 AS auditor_reads_the_verifications FROM kingres.ledger_verification;
+ auditor_reads_the_verifications 
+---------------------------------
+ t
+(1 row)
+
+RESET ROLE;
+-- every column of every table of the extension that PUBLIC can read
+SELECT c.relname, a.attname
+FROM pg_class c
+JOIN pg_depend d ON d.classid = 'pg_class'::regclass AND d.objid = c.oid
+                AND d.refclassid = 'pg_extension'::regclass AND d.deptype = 'e'
+JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'kingres_ledger'
+JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+WHERE c.relkind IN ('r', 'v')
+  AND (has_column_privilege('public', c.oid, a.attnum, 'select'))
+ORDER BY 1, a.attnum;
+    relname    |    attname     
+---------------+----------------
+ ledger_blocks | height
+ ledger_blocks | hash_version
+ ledger_blocks | prev_hash
+ ledger_blocks | tx_merkle_root
+ ledger_blocks | tx_count
+ ledger_blocks | closed_at
+ ledger_blocks | block_hash
+ ledger_chain  | singleton
+ ledger_chain  | chain_id
+ ledger_chain  | created_at
+ ledger_digest | digest_id
+ ledger_digest | generated_at
+ ledger_digest | height
+ ledger_digest | block_hash
+ ledger_digest | digest
+ ledger_table  | table_id
+ ledger_table  | relid
+ ledger_table  | mode
+ ledger_table  | enabled_at
+ ledger_table  | history_relid
+(20 rows)
+
+-- the functions of the extension that PUBLIC can execute and that read or
+-- write anything outside their arguments
+SELECT p.proname
+FROM pg_proc p
+JOIN pg_depend d ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid
+                AND d.refclassid = 'pg_extension'::regclass AND d.deptype = 'e'
+WHERE has_function_privilege('public', p.oid, 'execute')
+  AND p.proname IN ('ledger_history_acl_sync', 'ledger_history_sync', 'ledger_worker_state',
+                    'ledger_lock_table', 'ledger_record_row', 'ledger_capture')
+ORDER BY 1;
+ proname 
+---------
+(0 rows)
+
+--------------------------------------------------------------------------
+-- L2-05: the caches of a transaction survive a rolled back ledger_enable
+--------------------------------------------------------------------------
+BEGIN;
+CREATE TABLE r2_spt (id int);
+SAVEPOINT s1;
+SELECT kingres.ledger_enable('r2_spt', 'updatable');
+ ledger_enable 
+---------------
+ 
+(1 row)
+
+INSERT INTO r2_spt VALUES (1);
+UPDATE r2_spt SET id = 2;
+ROLLBACK TO s1;
+SELECT kingres.ledger_enable('r2_spt', 'updatable');
+ ledger_enable 
+---------------
+ 
+(1 row)
+
+INSERT INTO r2_spt VALUES (5);
+UPDATE r2_spt SET id = 6;
+DELETE FROM r2_spt;
+COMMIT;
+SELECT count(*) AS history_rows FROM r2_spt_ledger_history;
+ history_rows 
+--------------
+            2
+(1 row)
+
+SELECT count(*) AS problems_after_savepoint FROM r2report();
+ problems_after_savepoint 
+--------------------------
+                        0
+(1 row)
+
+-- The same in an exception block, with an append-only table that is enabled
+-- a second time and then used, and with the order of the lookups reversed.
+DO $$
+BEGIN
+  CREATE TABLE r2_blk (id int PRIMARY KEY, v text);
+  BEGIN
+    PERFORM kingres.ledger_enable('r2_blk', 'updatable');
+    INSERT INTO r2_blk VALUES (1, 'a');
+    UPDATE r2_blk SET v = 'b';
+    RAISE EXCEPTION 'undo' USING ERRCODE = 'KL999';
+  EXCEPTION WHEN SQLSTATE 'KL999' THEN
+    NULL;
+  END;
+  PERFORM kingres.ledger_enable('r2_blk', 'updatable');
+  INSERT INTO r2_blk VALUES (7, 'x');
+  UPDATE r2_blk SET v = 'y' WHERE id = 7;
+  DELETE FROM r2_blk;
+END $$;
+SELECT count(*) AS history_rows FROM r2_blk_ledger_history;
+ history_rows 
+--------------
+            2
+(1 row)
+
+SELECT count(*) AS problems_after_exception_block FROM r2report();
+ problems_after_exception_block 
+--------------------------------
+                              0
+(1 row)
+
+-- Subtransactions that commit keep what they did.
+BEGIN;
+CREATE TABLE r2_keep (id int PRIMARY KEY, v text);
+SAVEPOINT s1;
+SELECT kingres.ledger_enable('r2_keep', 'updatable');
+ ledger_enable 
+---------------
+ 
+(1 row)
+
+INSERT INTO r2_keep VALUES (1, 'a');
+RELEASE SAVEPOINT s1;
+UPDATE r2_keep SET v = 'b';
+SAVEPOINT s2;
+UPDATE r2_keep SET v = 'c';
+ROLLBACK TO s2;
+UPDATE r2_keep SET v = 'd';
+COMMIT;
+SELECT v FROM r2_keep;
+ v 
+---
+ d
+(1 row)
+
+SELECT count(*) AS history_rows FROM r2_keep_ledger_history;
+ history_rows 
+--------------
+            2
+(1 row)
+
+SELECT count(*) AS problems_after_release FROM r2report();
+ problems_after_release 
+------------------------
+                      0
+(1 row)
+
+--------------------------------------------------------------------------
+-- Not examined by the review: COPY ... FREEZE into a ledger table
+--------------------------------------------------------------------------
+-- rows loaded frozen, then the table is put under ledger control
+BEGIN;
+CREATE TABLE r2_frz (id int, v text);
+COPY r2_frz FROM STDIN FREEZE;
+SELECT kingres.ledger_enable('r2_frz', 'updatable');
+ ledger_enable 
+---------------
+ 
+(1 row)
+
+COMMIT;
+-- the table is under ledger control first, then loaded frozen
+BEGIN;
+CREATE TABLE r2_frz2 (id int, v text);
+SELECT kingres.ledger_enable('r2_frz2', 'updatable');
+ ledger_enable 
+---------------
+ 
+(1 row)
+
+COPY r2_frz2 FROM STDIN FREEZE;
+COMMIT;
+SELECT count(*) AS rows_in_r2_frz2 FROM r2_frz2;
+ rows_in_r2_frz2 
+-----------------
+               1
+(1 row)
+
+SELECT count(*) AS rows_after_copy_freeze FROM r2_frz;
+ rows_after_copy_freeze 
+------------------------
+                      3
+(1 row)
+
+UPDATE r2_frz SET v = v || '!' WHERE id = 2;
+DELETE FROM r2_frz WHERE id = 3;
+SELECT count(*) AS history_rows FROM r2_frz_ledger_history;
+ history_rows 
+--------------
+            2
+(1 row)
+
+SELECT count(*) AS problems_after_copy_freeze FROM r2report();
+ problems_after_copy_freeze 
+----------------------------
+                          0
+(1 row)
+
+BEGIN;
+CREATE TABLE r2_frz_ao (id int, v text);
+SELECT kingres.ledger_enable('r2_frz_ao');
+ ledger_enable 
+---------------
+ 
+(1 row)
+
+COPY r2_frz_ao FROM STDIN FREEZE;
+COMMIT;
+SELECT count(*) AS problems_after_copy_freeze_append_only FROM r2report();
+ problems_after_copy_freeze_append_only 
+----------------------------------------
+                                      0
+(1 row)
+
+--------------------------------------------------------------------------
+-- Hostile settings of a role or a database apply to the functions that the
+-- extension runs for other roles (L2-03, the part that does not need a worker):
+-- every function still works.
+--------------------------------------------------------------------------
+SET standard_conforming_strings = off;
+ERROR:  non-standard string literals are not supported
+SET escape_string_warning = off;
+ERROR:  unrecognized configuration parameter "escape_string_warning"
+SET plpgsql.extra_errors = 'all';
+SET plpgsql.extra_warnings = 'all';
+SET plpgsql.variable_conflict = 'use_column';
+SET check_function_bodies = off;
+SET transform_null_equals = on;
+SET quote_all_identifiers = on;
+SET DateStyle = 'SQL, DMY';
+SET IntervalStyle = 'sql_standard';
+SET TimeZone = 'Asia/Kolkata';
+SET extra_float_digits = -5;
+SET bytea_output = 'escape';
+SET default_transaction_deferrable = on;
+SET default_table_access_method = 'heap';
+SET row_security = on;
+SET search_path = pg_temp;
+CREATE TABLE public.r2_hostile (id int PRIMARY KEY, v text);
+SELECT kingres.ledger_enable('public.r2_hostile', 'updatable');
+ ledger_enable 
+---------------
+ 
+(1 row)
+
+INSERT INTO public.r2_hostile VALUES (1, 'a');
+UPDATE public.r2_hostile SET v = 'b';
+COMMENT ON TABLE public.r2_hostile IS 'hostile';
+ALTER TABLE public.r2_hostile ADD COLUMN w text;
+SELECT kingres.ledger_build_block() IS NOT NULL AS built;
+ built 
+-------
+ t
+(1 row)
+
+SELECT kingres.ledger_generate_digest() IS NOT NULL AS digest;
+ digest 
+--------
+ t
+(1 row)
+
+SELECT count(*) AS problems_with_hostile_settings FROM kingres.ledger_verify();
+ problems_with_hostile_settings 
+--------------------------------
+                              0
+(1 row)
+
+SELECT kingres.ledger_verify_recorded() IS NOT NULL AS recorded;
+ recorded 
+----------
+ t
+(1 row)
+
+SELECT count(*) AS history_rows FROM public.r2_hostile_ledger_history;
+ history_rows 
+--------------
+            1
+(1 row)
+
+RESET ALL;
+SET search_path = public;
+SELECT count(*) AS problems_after_hostile_settings FROM r2report();
+ problems_after_hostile_settings 
+---------------------------------
+                               0
+(1 row)
+

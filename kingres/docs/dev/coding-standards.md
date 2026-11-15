@@ -134,6 +134,17 @@ The rule of thumb: KingresDB C code must look like PostgreSQL C code. A reviewer
 
 - Each extension has pg_regress tests (`sql/` and `expected/`) and TAP tests (`t/*.pl`) where more than one server or a restart is involved. See [testing.md](testing.md).
 
+### 1.13 Several PostgreSQL majors
+
+One source of each extension builds against every supported major, 18 and 19 (ADR 0023).
+
+- Each extension has one compatibility header, `src/pg_compat.h`. It holds every difference between the majors: a renamed function or type, a changed signature, a header that moved, a changed struct member, a compiler-flag consequence. It is included by the extension's main header, after `postgres.h`.
+- Nothing outside `pg_compat.h` tests `PG_VERSION_NUM` or `PG_MAJORVERSION_NUM`, in C or in a build file. Code calls a macro or a `static inline` function that the header defines for each major, named after what the code means (for example `KS_TABLE_BEGINSCAN`), and the header's comment names the upstream change it follows. Enforced by: `grep -rn PG_VERSION_NUM contrib/kingres_*` lists only `pg_compat.h` files; review.
+- The header uses the newest major's spelling as the one the code is written in where that is natural, and defines it for the older major; when a major is dropped its branch of each `#if` is removed and the wrapper can go. A difference that cannot be hidden without changing behaviour on the older major is not hidden by guessing: it is described in the pull request and decided there.
+- A feature that exists on a newer major alone lives in its own file, compiled on that major only; on the older major the SQL function it backs raises a clear "needs PostgreSQL N" error. The SQL scripts are the same on every major; where a catalog differs, the script or the C code decides at run time.
+- No compiler warning on any supported major, and no `-Wno-*` flag to hide one. `kingres/dev/ext-majors.sh` builds with `-Werror` on each major. Enforced by: that script.
+- A change is committed only when the regression and TAP suites pass on all supported majors ([testing.md](testing.md)). Expected output that legitimately differs between majors uses PostgreSQL's alternative expected files (`expected/<test>_1.out`).
+
 ## 2. SQL and PL/pgSQL
 
 - All KingresDB objects are in the schema `kingres`. Do not create objects in `public`.

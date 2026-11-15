@@ -88,7 +88,7 @@ kl_xact_callback(XactEvent event, void *arg)
 			/* Tell the launcher that this database has pending transactions. */
 			if (kl_state.pending_written)
 				kl_mark_dirty(MyDatabaseId);
-			/* FALLTHROUGH */
+			pg_fallthrough;
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PREPARE:
 			kl_state.txid = 0;

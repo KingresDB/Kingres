@@ -2,9 +2,12 @@
 #
 # kingres/dev/ext.sh
 #
-# Build and test one KingresDB extension (contrib/kingres_*) against the
-# KingresDB installation produced by kingres/dev/build.sh, without
-# rebuilding the server.  This is the fast inner loop for extension work.
+# Build and test one KingresDB extension (contrib/kingres_*) against a
+# KingresDB (or PostgreSQL) installation, without rebuilding the server.  By
+# default the installation is the one produced by kingres/dev/build.sh; the
+# environment variable KINGRES_PG names another one (for example a
+# PostgreSQL 19 build), so the same source can be tested on each supported
+# major.  This is the fast inner loop for extension work.
 #
 # The extension is built with PGXS in its own copy under the work area, so
 # several extensions can be built and tested at the same time.
@@ -16,6 +19,7 @@
 #
 # Commands (run in the order given; default is "all"):
 #   sync      copy contrib/<extension> into the work area
+#   clean     remove the build products of the copy (make clean)
 #   build     compile with PGXS
 #   install   install into the KingresDB installation
 #   regress   start a throwaway server with the extension preloaded and run
@@ -23,8 +27,22 @@
 #   tap       run the TAP tests under t/ (they start their own servers)
 #   all       sync, build, install, regress, tap
 #
+# "clean" is not part of "all": a build that continues from earlier objects
+# does not repeat their warnings, so to check that a source compiles without
+# warnings run "clean build" (the script ext-majors.sh does).
+#
 # Environment:
 #   KINGRES_WORK   work area (default: $HOME/kingres-work)
+#   KINGRES_PG      the installation to build and test against: the path of a
+#                   pg_config program, or of an installation directory that
+#                   holds bin/pg_config (default: $KINGRES_WORK/install).  The
+#                   copy, the throwaway data directory and the port then carry
+#                   the major version, so several majors can be tested from
+#                   one work area, even at the same time.  "install" writes
+#                   into that installation.
+#   EXT_SRC         directory to copy the extension from (default:
+#                   contrib/<extension> of this repository)
+#   EXT_WERROR      1 makes any compiler warning of the extension an error
 #   KINGRES_JOBS   parallel jobs for make (default: nproc)
 #   EXT_PRELOAD     value of shared_preload_libraries for the throwaway
 #                   server (default: the extension name)
@@ -37,8 +55,15 @@ repo_root="$(cd "${script_dir}/../.." && pwd)"
 
 work_dir="${KINGRES_WORK:-${HOME}/kingres-work}"
 jobs="${KINGRES_JOBS:-$(nproc)}"
-install_dir="${work_dir}/install"
-pg_config="${install_dir}/bin/pg_config"
+if [ -n "${KINGRES_PG:-}" ]; then
+    if [ -d "${KINGRES_PG}" ]; then
+        pg_config="${KINGRES_PG}/bin/pg_config"
+    else
+        pg_config="${KINGRES_PG}"
+    fi
+else
+    pg_config="${work_dir}/install/bin/pg_config"
+fi
 
 log() {
     printf '\n==> %s\n' "$*"
@@ -53,21 +78,40 @@ die() {
 ext="$1"
 shift
 
-src_dir="${repo_root}/contrib/${ext}"
-ext_dir="${work_dir}/ext/${ext}"
-data_dir="${work_dir}/ext/${ext}.pgdata"
+src_dir="${EXT_SRC:-${repo_root}/contrib/${ext}}"
 preload="${EXT_PRELOAD:-${ext}}"
 
 [ -d "${src_dir}" ] || die "no such extension directory: ${src_dir}"
-[ -x "${pg_config}" ] || die "no KingresDB installation at ${install_dir}; run kingres/dev/build.sh first"
+[ -x "${pg_config}" ] || die "no pg_config at ${pg_config}; run kingres/dev/build.sh first, or point KINGRES_PG at an installation"
 [ "$(id -u)" -ne 0 ] || die "do not run as root; PostgreSQL refuses to start as root"
 
-# A port derived from the extension name, so two extensions tested at the same
-# time do not collide.  Range 55000-55999.
-port=$((55000 + $(printf '%s' "${ext}" | cksum | cut -d ' ' -f 1) % 1000))
+install_dir="$("${pg_config}" --bindir)/.."
+install_dir="$(cd "${install_dir}" && pwd)"
+
+# With the default installation the names are the extension name alone, as they
+# always were.  With KINGRES_PG the major version is part of the names, so the
+# copies, data directories and ports of two majors do not collide.
+tag="${ext}"
+if [ -n "${KINGRES_PG:-}" ]; then
+    pg_major="$("${pg_config}" --version | sed -E 's/^[^0-9]*([0-9]+).*$/\1/')"
+    tag="${ext}-pg${pg_major}"
+fi
+ext_dir="${work_dir}/ext/${tag}"
+data_dir="${work_dir}/ext/${tag}.pgdata"
+
+# A port derived from the name, so two extensions (or two majors) tested at the
+# same time do not collide.  Range 55000-55999.
+port=$((55000 + $(printf '%s' "${tag}" | cksum | cut -d ' ' -f 1) % 1000))
 
 run_make() {
     make -C "${ext_dir}" USE_PGXS=1 PG_CONFIG="${pg_config}" "$@"
+}
+
+# The compiler flags of the build, so that EXT_WERROR=1 turns warnings into errors.
+werror_flags() {
+    if [ "${EXT_WERROR:-0}" = 1 ]; then
+        printf '%s' "-Werror"
+    fi
 }
 
 stop_server() {
@@ -84,9 +128,14 @@ cmd_sync() {
     chmod -R u=rwX,go=rX "${ext_dir}"
 }
 
+cmd_clean() {
+    log "cleaning ${ext}"
+    run_make clean >/dev/null
+}
+
 cmd_build() {
     log "building ${ext}"
-    run_make -j "${jobs}"
+    run_make -j "${jobs}" COPT="$(werror_flags)"
 }
 
 cmd_install() {
@@ -162,6 +211,7 @@ fi
 for command in "$@"; do
     case "${command}" in
         sync)    cmd_sync ;;
+        clean)   cmd_clean ;;
         build)   cmd_build ;;
         install) cmd_install ;;
         regress) cmd_regress ;;

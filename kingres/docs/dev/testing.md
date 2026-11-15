@@ -40,6 +40,26 @@ The commands below are the standard ones for each tool. How they are wired into 
 - Go: `go test ./...`, `go test -race ./...`, `go vet ./...`, `golangci-lint run`.
 - Web: the package scripts will expose `test` (Vitest), `lint` (ESLint), `typecheck` (`tsc --noEmit`) and `format:check` (Prettier); names to be confirmed when `package.json` exists.
 
+## Running the suites on both PostgreSQL majors
+
+Every extension must pass its regression and TAP suites on every supported major, 18 and 19 (ADR 0023).  The extension scripts build and test out of tree with PGXS against an installed server, so a second major is a second installation; the server itself is not rebuilt for an extension change.
+
+1. **A PostgreSQL 18 installation** is the one `kingres/dev/build.sh` makes (`$KINGRES_WORK/install`).
+2. **A PostgreSQL 19 installation** is built from an upstream tag in a scratch tree until `kingres-19` exists (see [upstream-sync.md](upstream-sync.md), "A new major version").  The steps that were run on `REL_19_RC2`, with `$W` as the work directory:
+
+   ```sh
+   git clone --depth 1 --branch REL_19_RC2 https://github.com/postgres/postgres.git $W/src
+   git -C <repository> diff REL_18_7 HEAD -- meson.build contrib/meson.build README.md | git -C $W/src apply
+   cd $W && meson setup build src --prefix $W/install --buildtype debugoptimized
+       -Dcassert=true -Dtap_tests=enabled -Ddocs=disabled
+   ninja -C build -j4 && ninja -C build install
+   ```
+
+   The options are those of `build.sh`.  The `subdir('kingres_*')` lines of the core patch make the in-tree build look for the extension directories; link or copy them into `$W/src/contrib/` before `meson setup`, or leave the `contrib/meson.build` hunk out of the scratch tree and build the extensions out of tree only.
+3. **One extension, one major**: `KINGRES_PG=<pg_config or installation directory> kingres/dev/ext.sh <extension> all`.  With `KINGRES_PG` set the copy, the throwaway data directory and the port carry the major version, so two majors can run from one work area, even at the same time.  Without it the script behaves as before.  `EXT_WERROR=1` turns compiler warnings of the extension into errors, and `ext.sh <extension> clean build` makes a build that reports all of them.
+4. **One extension, all majors**: `KINGRES_PG18=<installation> KINGRES_PG19=<installation> kingres/dev/ext-majors.sh <extension>`.  It runs `sync clean build install regress tap` on each configured major with warnings as errors, prints one line per major and exits non-zero if any failed.  `KINGRES_PG18` defaults to the `build.sh` installation; with no `KINGRES_PG19` only 18 is run.  `PROVE_TESTS` (a list of TAP files) and `KINGRES_JOBS` are passed on.  `ext.sh` installs the extension into the installation it is given, so each major needs an installation of its own that is not shared with another job.
+5. **A TAP file that fails** is rerun alone (`PROVE_TESTS=t/027_move_under_load.pl`) before it is called a real failure; on a loaded machine the timing-dependent tests of `kingres_shard` can fail without a defect.  A failure that repeats is a defect on that major.
+
 ## Definition of done
 
 A change is done when all of these hold:

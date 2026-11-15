@@ -11,6 +11,7 @@ This document turns the architecture document's "Branch choice and mirror mechan
 - The local clone holds the full history behind `REL_18_7`. The hosting remote is `origin` (the private repository `KingresDB/Kingres`), and its default branch is `kingres-18`.
 - Git is configured with `core.autocrlf=false` and `core.eol=lf`. The tree must stay LF on Windows.
 - PostgreSQL 18 is supported until 2030-11-14. PostgreSQL 19 GA is scheduled for 2026-11-19 (architecture document, citing the versioning policy and the PG19 RC1 announcement).
+- The newest upstream tag of PostgreSQL 19 on 2026-11-15 is `REL_19_RC2`; there is no `REL_19_0` yet. The three core patches (`meson.build`, `contrib/meson.build`, `README.md`) applied to `REL_19_RC2` without a change (checked 2026-11-15 with `git apply`).
 
 ## Branches
 
@@ -22,7 +23,7 @@ This document turns the architecture document's "Branch choice and mirror mechan
 | Local mirror branches, one per upstream stable branch that is used (proposed names: `mirror/REL_18_STABLE`, `mirror/REL_19_STABLE`) | Pure mirror | Fast-forward only to the matching upstream branch. No KingresDB commits, ever. The names are a proposal. |
 | `kingres-18` | Product branch | Upstream tag `REL_18_x` plus the KingresDB commits on top. Rebased onto each new minor tag. |
 | Feature branches | Short-lived | Branch from `kingres-18`, merged back through review. |
-| `kingres-19` (later) | Product branch for the next major | Created when the project moves to PG19; see "A new major version". |
+| `kingres-19` | Product branch for PostgreSQL 19 | An upstream `REL_19_x` tag plus the same core patches as `kingres-18` plus the same `contrib/kingres_*` and `kingres/` directories (ADR 0023). Not created yet; the first upstream tag to base it on is the one after the general release (scheduled for 2026-11-19, to be confirmed). Until then `REL_19_RC2` is used for build and test only. See "A new major version". |
 
 Why rebase instead of merge: the Postgres-XL team reported that merging upstream master produced far more conflicts than expected and that they had to rebase onto a later commit first. This is an empirical reason, not official PostgreSQL policy; the primary sources reviewed in the research give no guidance on private branches (architecture document, "Branch choice and mirror mechanics"). A rebase keeps the KingresDB changes as a small, reviewable series on top of a known upstream tag. The cost is that published history changes; see "Shared history" below.
 
@@ -71,17 +72,17 @@ At minimum, in WSL2 (build instructions are in [getting-started.md](getting-star
 
 ## A new major version
 
-PostgreSQL ships one major release per year. PG19 GA is scheduled for 2026-11-19. Decision #1 accepted by the project owner: base on PG18 now, and rebase to PG19 once the tooling around it has caught up. The mechanics below are **[Recommendation]**; none has been tried.
+PostgreSQL ships one major release per year, and KingresDB follows ADR 0023: one KingresDB per PostgreSQL major, released side by side, from **one source**. The files under `contrib/kingres_*` and `kingres/` are identical on `kingres-18` and `kingres-19`; only the base tag and the build parameter "major" differ. The mechanics below are **[Recommendation]** until the first `kingres-19` release has been made; steps marked "tried" were run on `REL_19_RC2`, the others are to be confirmed.
 
-1. Do not start before the PG19 GA release and its first minor release (to be confirmed as the trigger), and before the "Needs verification" item "list of breaking changes in version 19" in the architecture document has been closed by reading the PG19 release notes.
+1. **Before the general release** (scheduled for 2026-11-19, to be confirmed), work on the newest `REL_19_*` tag, in a scratch tree outside this repository: build it with the options of `kingres/dev/build.sh`, apply the core patches (tried: they apply unchanged to `REL_19_RC2`), build and test each extension out of tree with `kingres/dev/ext-majors.sh` (see [testing.md](testing.md)). Compile errors and warnings are the list of interface differences; each goes into the extension's `src/pg_compat.h` (see [coding-standards.md](coding-standards.md), 1.13), not into the code that uses it.
 2. Create `mirror/REL_19_STABLE` as a fast-forward mirror of `upstream/REL_19_STABLE`.
-3. Create `kingres-19` from the corresponding upstream tag and cherry-pick (or rebase) the series from `kingres-18`. Do this in the order of the register so that each patch can be re-tested and re-justified; a patch that upstream now makes unnecessary is dropped.
-4. Port the extensions. Extensions are the part expected to need the most work from API changes in hooks and structures; use the hook signatures in the PG19 headers, not the PG18 ones.
-5. Run the full verification list above on `kingres-19`, then run cluster upgrade tests (upgrade path from a PG18-based KingresDB cluster is a separate procedure and is not designed yet).
+3. Create `kingres-19` from the chosen upstream tag and apply the core-patch series of `kingres-18` in the order of the register, so that each patch can be re-tested and re-justified; a patch that upstream now makes unnecessary is dropped.
+4. Carry `contrib/kingres_*` and `kingres/` from `kingres-18` to `kingres-19`: development happens once, on one branch (the one the change is first tested on), and the same commit is cherry-picked onto the other with `git cherry-pick -x`. Because both branches hold identical files in these directories, the cherry-pick applies without conflicts unless a core patch or a file outside these directories is touched; a conflict there is a sign that something was committed to the wrong place and is reported, not resolved by editing both copies. A commit is complete only when `ext-majors.sh` passes for every extension it touches on both majors (ADR 0023, point 4). A check that the two branches stay identical in these directories (`git diff kingres-18 kingres-19 -- contrib/kingres_ledger contrib/kingres_shard kingres`, expected empty) is to be added to the routine; it is to be confirmed.
+5. Run the full verification list above on `kingres-19`, then run cluster upgrade tests (upgrade from a PostgreSQL 18 based KingresDB cluster to 19 is a separate procedure and is not designed yet; ADR 0023, point 7, says one major per cluster until it is).
 6. Keep `kingres-18` as a maintained branch for as long as the supported releases require; the supported period for PG18 is until 2030-11-14. The policy for how long KingresDB itself supports each major is not decided.
-7. Record the decision in a new ADR and a work-log entry.
+7. A new major costs a new section in each `pg_compat.h`, a test run on all supported majors, and a check of the core-patch register; it does not cost a second code base. Supporting a further major, or dropping one, is decided by a new ADR.
 
-The cost of this step is the main risk named in the architecture document ("Annual rebase cost on each new major"). The mitigation is the core patch rules: few patches, small, registered.
+The cost of this step is the main risk named in the architecture document ("Annual rebase cost on each new major"). The mitigation is the core patch rules (few patches, small, registered) and the single compatibility header per extension.
 
 ## Things this document does not decide
 
