@@ -22,6 +22,8 @@
 #include "postgres.h"
 
 #include "access/bufmask.h"
+#include "access/transam.h"
+#include "access/xact.h"
 #include "access/xlog_internal.h"
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
@@ -33,6 +35,9 @@
 #include "storage/bulk_write.h"
 #include "storage/lmgr.h"
 #include "storage/smgr.h"
+#include "utils/memutils.h"
+#include "utils/rel.h"
+#include "utils/snapmgr.h"
 
 #include "kingres_columnar.h"
 
@@ -173,9 +178,18 @@ kc_rmgr_register(void)
  * ------------------------------------------------------------------------
  */
 
+/* The checksum of the metapage payload: a damaged identity would otherwise
+ * hide every stripe of the table without an error. */
+static void
+kc_meta_seal(KcMetaData *m)
+{
+	m->crc = 0;
+	m->crc = (uint32) kc_crc32c((const char *) m, sizeof(KcMetaData));
+}
+
 static void
 kc_meta_format(Page page, const KcOptions *opts, uint64 next_row,
-			   uint64 next_stripe)
+			   uint64 next_stripe, uint64 uid, TransactionId xid)
 {
 	KcMetaData *m;
 
@@ -190,6 +204,9 @@ kc_meta_format(Page page, const KcOptions *opts, uint64 next_row,
 	m->chunk_rows = opts->chunk_rows;
 	m->next_row = next_row;
 	m->next_stripe_id = next_stripe;
+	m->rel_uid = uid;
+	m->created_xid = xid;
+	kc_meta_seal(m);
 	/* a standard page: the log can drop the unused middle of it */
 	((PageHeader) page)->pd_lower =
 		(char *) m + sizeof(KcMetaData) - (char *) page;
@@ -207,10 +224,21 @@ kc_meta_init_storage(Relation rel, const RelFileLocator *rlocator,
 	SMgrRelation srel = smgropen(*rlocator, INVALID_PROC_NUMBER);
 	BulkWriteState *bulk;
 	BulkWriteBuffer buf;
+	uint64		uid;
 
 	bulk = smgr_bulk_start_smgr(srel, MAIN_FORKNUM, XLogIsNeeded());
 	buf = smgr_bulk_get_buf(bulk);
-	kc_meta_format((Page) buf, opts, 0, 1);
+	/*
+	 * A fresh identity for every new file (create, TRUNCATE, rewrite).  A
+	 * byte-for-byte copy of the file (SET TABLESPACE, a base backup) keeps it,
+	 * which is what lets the stripe catalog survive a copy unchanged.
+	 */
+	if (!pg_strong_random(&uid, sizeof(uid)))
+		elog(ERROR, "could not generate a random identity for a columnar file");
+	uid &= PG_INT64_MAX;
+	if (uid == 0)
+		uid = 1;
+	kc_meta_format((Page) buf, opts, 0, 1, uid, GetCurrentTransactionId());
 	smgr_bulk_write(bulk, 0, buf, true);
 	smgr_bulk_finish(bulk);
 	smgrclose(srel);
@@ -226,6 +254,13 @@ kc_meta_check(Relation rel, Page page)
 	m = (KcMetaData *) PageGetContents(page);
 	if (m->magic != KC_META_MAGIC)
 		kc_corrupt(rel, 0, "the metapage has a bad magic number");
+	{
+		KcMetaData	copy = *m;
+
+		copy.crc = 0;
+		if ((uint32) kc_crc32c((const char *) &copy, sizeof(copy)) != m->crc)
+			kc_corrupt(rel, 0, "the metapage checksum does not match");
+	}
 	if (m->version != KC_META_VERSION)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -301,6 +336,7 @@ kc_meta_allocate(Relation rel, uint32 nrows, uint64 *stripe_id,
 	START_CRIT_SECTION();
 	m->next_row += nrows;
 	m->next_stripe_id++;
+	kc_meta_seal(m);
 	MarkBufferDirty(buf);
 	kc_meta_log_and_release(rel, buf);
 	END_CRIT_SECTION();
@@ -323,6 +359,7 @@ kc_meta_set_options(Relation rel, const KcOptions *opts)
 	m->level = opts->level;
 	m->stripe_rows = opts->stripe_rows;
 	m->chunk_rows = opts->chunk_rows;
+	kc_meta_seal(m);
 	MarkBufferDirty(buf);
 	kc_meta_log_and_release(rel, buf);
 	END_CRIT_SECTION();
@@ -344,6 +381,7 @@ kc_meta_reset(Relation rel)
 	START_CRIT_SECTION();
 	m->next_row = 0;
 	m->next_stripe_id = 1;
+	kc_meta_seal(m);
 	MarkBufferDirty(buf);
 	kc_meta_log_and_release(rel, buf);
 	END_CRIT_SECTION();
@@ -519,4 +557,71 @@ kc_stripe_read(Relation rel, const KcStripeInfo *si, uint64 off, uint64 len,
 		off += n;
 		len -= n;
 	}
+}
+
+/* ------------------------------------------------------------------------
+ * Identity of the stored content
+ * ------------------------------------------------------------------------
+ */
+
+/*
+ * The identity of the content of rel's file: a random id and the transaction
+ * that created the file, both in the metapage.  The stripe catalog is keyed
+ * by the id, so a copy of the file keeps its stripes, and a new file (TRUNCATE,
+ * a rewrite) starts with none.  Cached in the relcache entry, and checked
+ * against the file number so a swap of files is noticed even if the entry was
+ * not rebuilt yet.
+ */
+const KcIdent *
+kc_rel_ident(Relation rel)
+{
+	KcIdent    *id = (KcIdent *) rel->rd_amcache;
+
+	if (id == NULL || id->filenode != rel->rd_locator.relNumber)
+	{
+		KcMetaData	m;
+
+		kc_meta_read(rel, &m);
+		if (rel->rd_amcache)
+			pfree(rel->rd_amcache);
+		id = MemoryContextAlloc(CacheMemoryContext, sizeof(KcIdent));
+		id->uid = m.rel_uid;
+		id->created_xid = m.created_xid;
+		id->filenode = rel->rd_locator.relNumber;
+		rel->rd_amcache = id;
+	}
+	return id;
+}
+
+/*
+ * A snapshot taken before the file was created by a rewrite or a TRUNCATE
+ * cannot see the table's stripes (their catalog rows are newer than it).
+ * Heap hands such a snapshot an empty table for TRUNCATE and the rewriting
+ * forms of ALTER TABLE; here every such command fails the reader with a
+ * serialization failure rather than return nothing.  A transaction id older
+ * than a billion transactions cannot be in any live snapshot, and its
+ * comparison would wrap, so it is ignored.
+ */
+void
+kc_check_snapshot_age(Relation rel, Snapshot snap)
+{
+	const KcIdent *id;
+	TransactionId next;
+
+	if (snap == NULL || snap->snapshot_type != SNAPSHOT_MVCC)
+		return;
+	id = kc_rel_ident(rel);
+	if (!TransactionIdIsNormal(id->created_xid) ||
+		TransactionIdIsCurrentTransactionId(id->created_xid))
+		return;
+	next = ReadNextTransactionId();
+	if ((uint32) (next - id->created_xid) > (uint32) (1U << 30))
+		return;
+	if (XidInMVCCSnapshot(id->created_xid, snap))
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not read columnar table \"%s\": it was rewritten or truncated after this snapshot was taken",
+						RelationGetRelationName(rel)),
+				 errdetail("VACUUM FULL, TRUNCATE, SET ACCESS METHOD or a rewriting ALTER TABLE replaced the table's storage."),
+				 errhint("Retry the transaction.")));
 }

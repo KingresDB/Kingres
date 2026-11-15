@@ -359,16 +359,16 @@ CREATE TABLE pk_heap (id int PRIMARY KEY);
 CREATE TABLE fk_col (id int REFERENCES pk_heap (id)) USING columnar;
 ERROR:  foreign keys on or to columnar tables are not supported
 HINT:  Keep the referencing and the referenced table in row storage.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 8 at RAISE
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 48 at RAISE
 CREATE TABLE fk_col (id int) USING columnar;
 ALTER TABLE fk_col ADD FOREIGN KEY (id) REFERENCES pk_heap (id);
 ERROR:  foreign keys on or to columnar tables are not supported
 HINT:  Keep the referencing and the referenced table in row storage.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 8 at RAISE
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 48 at RAISE
 ALTER TABLE fk_col ADD CONSTRAINT fk_col_fk FOREIGN KEY (id) REFERENCES pk_heap (id) NOT VALID;
 ERROR:  foreign keys on or to columnar tables are not supported
 HINT:  Keep the referencing and the referenced table in row storage.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 8 at RAISE
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 48 at RAISE
 CREATE TABLE fk_heap (id int REFERENCES r1 (id));
 ERROR:  there is no unique constraint matching given keys for referenced table "r1"
 CREATE TABLE fk_heap (id int);
@@ -414,19 +414,19 @@ SELECT id, s FROM tg ORDER BY id;
 CREATE TRIGGER tg_after_row AFTER INSERT ON tg FOR EACH ROW EXECUTE FUNCTION trg_stmt_plain();
 ERROR:  row-level AFTER triggers on columnar tables are not supported
 HINT:  Use a BEFORE ROW or a statement-level trigger, or keep the table in row storage.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 18 at RAISE
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 55 at RAISE
 CREATE TRIGGER tg_after_row_upd AFTER UPDATE ON tg FOR EACH ROW EXECUTE FUNCTION trg_stmt_plain();
 ERROR:  row-level AFTER triggers on columnar tables are not supported
 HINT:  Use a BEFORE ROW or a statement-level trigger, or keep the table in row storage.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 18 at RAISE
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 55 at RAISE
 CREATE TRIGGER tg_after_row_del AFTER DELETE ON tg FOR EACH ROW EXECUTE FUNCTION trg_stmt_plain();
 ERROR:  row-level AFTER triggers on columnar tables are not supported
 HINT:  Use a BEFORE ROW or a statement-level trigger, or keep the table in row storage.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 18 at RAISE
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 55 at RAISE
 CREATE CONSTRAINT TRIGGER tg_constraint AFTER INSERT ON tg FOR EACH ROW EXECUTE FUNCTION trg_stmt_plain();
 ERROR:  row-level AFTER triggers on columnar tables are not supported
 HINT:  Use a BEFORE ROW or a statement-level trigger, or keep the table in row storage.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 18 at RAISE
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 55 at RAISE
 CREATE TRIGGER tg_before_upd BEFORE UPDATE ON tg FOR EACH ROW EXECUTE FUNCTION trg_row();
 CREATE TRIGGER tg_before_del BEFORE DELETE ON tg FOR EACH ROW EXECUTE FUNCTION trg_row();
 SELECT tgname FROM pg_trigger WHERE tgrelid = 'tg'::regclass AND NOT tgisinternal ORDER BY tgname;
@@ -449,7 +449,7 @@ CREATE TRIGGER tg_heap_after AFTER INSERT ON tg_heap FOR EACH ROW EXECUTE FUNCTI
 ALTER TABLE tg_heap SET ACCESS METHOD columnar;
 ERROR:  row-level AFTER triggers on columnar tables are not supported
 HINT:  Use a BEFORE ROW or a statement-level trigger, or keep the table in row storage.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 18 at RAISE
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 55 at RAISE
 DROP TRIGGER tg_heap_after ON tg_heap;
 ALTER TABLE tg_heap SET ACCESS METHOD columnar;
 -- the trigger of a partitioned parent is cloned to the columnar partition
@@ -458,13 +458,13 @@ CREATE TRIGGER tg_p_after AFTER INSERT ON tg_p FOR EACH ROW EXECUTE FUNCTION trg
 CREATE TABLE tg_p1 PARTITION OF tg_p FOR VALUES IN (1) USING columnar;
 ERROR:  row-level AFTER triggers on columnar tables are not supported
 HINT:  Use a BEFORE ROW or a statement-level trigger, or keep the table in row storage.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 18 at RAISE
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 55 at RAISE
 CREATE TABLE tg_p2 PARTITION OF tg_p FOR VALUES IN (2);
 CREATE TABLE tg_p3 (id int) USING columnar;
 ALTER TABLE tg_p ATTACH PARTITION tg_p3 FOR VALUES IN (3);
 ERROR:  row-level AFTER triggers on columnar tables are not supported
 HINT:  Use a BEFORE ROW or a statement-level trigger, or keep the table in row storage.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 18 at RAISE
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 55 at RAISE
 SELECT c.relname, a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.relname LIKE 'tg_p%' AND c.relkind = 'r' ORDER BY 1;
  relname |  amname  
 ---------+----------
@@ -481,12 +481,12 @@ CREATE FUNCTION trg_rr() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NUL
 CREATE TRIGGER rr_after AFTER INSERT ON rr FOR EACH ROW EXECUTE FUNCTION trg_rr();
 ERROR:  row-level AFTER triggers on columnar tables are not supported
 HINT:  Use a BEFORE ROW or a statement-level trigger, or keep the table in row storage.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 18 at RAISE
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 55 at RAISE
 CREATE TABLE pk_rr (id int PRIMARY KEY);
 CREATE TABLE rr_fk (id int REFERENCES pk_rr (id)) USING columnar;
 ERROR:  foreign keys on or to columnar tables are not supported
 HINT:  Keep the referencing and the referenced table in row storage.
-CONTEXT:  PL/pgSQL function columnar_check_ddl() line 8 at RAISE
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 48 at RAISE
 RESET session_replication_role;
 DROP TABLE rr, pk_rr;
 DROP FUNCTION trg_rr();
@@ -496,14 +496,12 @@ BEGIN;
 INSERT INTO tr VALUES (1);
 SAVEPOINT s;
 TRUNCATE tr;
-ERROR:  cannot truncate columnar table "tr" in a subtransaction after rows were inserted in an outer one
 ROLLBACK;
 BEGIN;
 SAVEPOINT a;
 INSERT INTO tr VALUES (1);
 SAVEPOINT b;
 TRUNCATE tr;
-ERROR:  cannot truncate columnar table "tr" in a subtransaction after rows were inserted in an outer one
 ROLLBACK;
 -- the same level works, and so does a table created in the transaction
 BEGIN;

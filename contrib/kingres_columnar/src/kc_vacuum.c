@@ -71,7 +71,7 @@ kc_needed_blocks(Relation rel)
 		if (res == HEAPTUPLE_DEAD)
 			continue;
 		d = heap_getattr(tup, 1, RelationGetDescr(cat), &isnull);
-		if (isnull || DatumGetObjectId(d) != rel->rd_locator.relNumber)
+		if (isnull || (uint64) DatumGetInt64(d) != kc_rel_ident(rel)->uid)
 			continue;
 		{
 			uint64		first = DatumGetInt64(heap_getattr(tup, 7, RelationGetDescr(cat), &isnull));
@@ -189,7 +189,7 @@ kc_compact(Relation rel, uint32 min_rows)
 	ExecDropSingleTupleTableSlot(slot);
 
 	for (i = 0; i < nsmall; i++)
-		(void) kc_catalog_delete_stripe(rel->rd_locator.relNumber,
+		(void) kc_catalog_delete_stripe(kc_rel_ident(rel)->uid,
 										scan->stripes[i].stripe_id);
 	kc_scan_end(scan);
 	kc_write_flush_relation(rel);

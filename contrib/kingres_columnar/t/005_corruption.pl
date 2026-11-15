@@ -287,16 +287,16 @@ sub footer_layout
 		$pos += 4;
 		for my $col (0 .. $ncols - 1)
 		{
-			my ($off, $comp, $raw, $nn, $minl, $maxl, $codec, $flags) =
-			  unpack('Q< V V V v v C C', substr($f, $pos, 26));
+			my ($off, $comp, $raw, $nn, $crc, $typ, $colln, $minl, $maxl, $codec, $flags) =
+			  unpack('Q< V V V V V V v v C C', substr($f, $pos, 38));
 			push @{ $gr{cols} },
 			  {
 				pos   => $pos, off => $off, comp_len => $comp, raw_len => $raw,
 				nnulls => $nn, min_len => $minl, max_len => $maxl,
 				codec => $codec, flags => $flags,
-				minpos => $pos + 32, maxpos => $pos + 32 + $minl,
+				minpos => $pos + 40, maxpos => $pos + 40 + $minl,
 			  };
-			$pos += 32 + $minl + $maxl;
+			$pos += 40 + $minl + $maxl;
 		}
 		push @groups, \%gr;
 	}
@@ -387,7 +387,7 @@ sub chunk_of
 sub sqlset
 {
 	my ($c, $stripe_idx, $set) = @_;
-	return sprintf('UPDATE kingres.columnar_stripe SET %s WHERE filenode = %d AND stripe_id = %d',
+	return sprintf('UPDATE kingres.columnar_stripe SET %s WHERE rel_uid = %d AND stripe_id = %d',
 		$set, $c->{filenode}, $c->{stripes}[$stripe_idx]{id});
 }
 
@@ -407,9 +407,9 @@ add('meta: bad magic', must_error => \@MI,
 	file => sub { meta_poke($_[0], 0, 'V', 0xDEADBEEF) });
 add('meta: magic zero', must_error => \@MI,
 	file => sub { meta_poke($_[0], 0, 'V', 0) });
-add('meta: format version 2 (feature not supported is fine)',
+add('meta: format version 3 (feature not supported is fine)',
 	must_error => \@MI, ok_states => ['0A000'],
-	file => sub { meta_poke($_[0], 4, 'V', 2) });
+	file => sub { meta_poke($_[0], 4, 'V', 3) });
 add('meta: format version 0xFFFFFFFF', must_error => \@MI, ok_states => ['0A000'],
 	file => sub { meta_poke($_[0], 4, 'V', 0xFFFFFFFF) });
 add('meta: codec 9', must_error => \@MI,
@@ -638,24 +638,24 @@ my @FIELDS = (
 	[ 'chunk nnulls > nrows',                       sub { fput($_[0], $_[1]{pos} + 16, 'V', 101) } ],
 	[ 'chunk nnulls +1',                            sub { fput($_[0], $_[1]{pos} + 16, 'V', $_[1]{nnulls} + 1) } ],
 	[ 'chunk nnulls 100 (all null, bitmap says otherwise)', sub { fput($_[0], $_[1]{pos} + 16, 'V', 100) } ],
-	[ 'chunk nnulls 5 with the null flag cleared',  sub { fput($_[0], $_[1]{pos} + 16, 'V', 5); fput($_[0], $_[1]{pos} + 25, 'C', $_[1]{flags} & ~1) } ],
-	[ 'chunk null flag set with nnulls 0',          sub { fput($_[0], $_[1]{pos} + 16, 'V', 0); fput($_[0], $_[1]{pos} + 25, 'C', $_[1]{flags} | 1) } ],
-	[ 'chunk flags 0xFF',                           sub { fput($_[0], $_[1]{pos} + 25, 'C', 0xFF) } ],
-	[ 'chunk flags 0 (no null flag, no min/max)',   sub { fput($_[0], $_[1]{pos} + 25, 'C', 0) } ],
-	[ 'chunk codec 9',                              sub { fput($_[0], $_[1]{pos} + 24, 'C', 9) } ],
-	[ 'chunk codec 255',                            sub { fput($_[0], $_[1]{pos} + 24, 'C', 255) } ],
-	[ 'chunk codec 4 (auto)',                       sub { fput($_[0], $_[1]{pos} + 24, 'C', 4) } ],
-	[ 'chunk codec 0 for a compressed chunk',       sub { fput($_[0], $_[1]{pos} + 24, 'C', 0) } ],
-	[ 'chunk codec 1 (pglz) for another codec',     sub { fput($_[0], $_[1]{pos} + 24, 'C', 1) } ],
-	[ 'chunk codec 2 (lz4) for another codec',      sub { fput($_[0], $_[1]{pos} + 24, 'C', 2) } ],
-	[ 'chunk codec 3 (zstd) for another codec',     sub { fput($_[0], $_[1]{pos} + 24, 'C', 3) } ],
-	[ 'chunk min_len 65',                           sub { fput($_[0], $_[1]{pos} + 20, 'v', 65) } ],
-	[ 'chunk max_len 65',                           sub { fput($_[0], $_[1]{pos} + 22, 'v', 65) } ],
-	[ 'chunk min_len 0xFFFF',                       sub { fput($_[0], $_[1]{pos} + 20, 'v', 0xFFFF) } ],
-	[ 'chunk max_len 0xFFFF',                       sub { fput($_[0], $_[1]{pos} + 22, 'v', 0xFFFF) } ],
-	[ 'chunk min_len 0 with the min/max flag set',  sub { fput($_[0], $_[1]{pos} + 20, 'v', 0) } ],
-	[ 'chunk min_len +1, max_len -1 (lengths shift, total unchanged)', sub { fput($_[0], $_[1]{pos} + 20, 'v', $_[1]{min_len} + 1); fput($_[0], $_[1]{pos} + 22, 'v', $_[1]{max_len} ? $_[1]{max_len} - 1 : 0) } ],
-	[ 'chunk min_len 3, max_len rest (wrong width for the type)', sub { fput($_[0], $_[1]{pos} + 20, 'v', 3); fput($_[0], $_[1]{pos} + 22, 'v', $_[1]{min_len} + $_[1]{max_len} - 3) } ],
+	[ 'chunk nnulls 5 with the null flag cleared',  sub { fput($_[0], $_[1]{pos} + 16, 'V', 5); fput($_[0], $_[1]{pos} + 37, 'C', $_[1]{flags} & ~1) } ],
+	[ 'chunk null flag set with nnulls 0',          sub { fput($_[0], $_[1]{pos} + 16, 'V', 0); fput($_[0], $_[1]{pos} + 37, 'C', $_[1]{flags} | 1) } ],
+	[ 'chunk flags 0xFF',                           sub { fput($_[0], $_[1]{pos} + 37, 'C', 0xFF) } ],
+	[ 'chunk flags 0 (no null flag, no min/max)',   sub { fput($_[0], $_[1]{pos} + 37, 'C', 0) } ],
+	[ 'chunk codec 9',                              sub { fput($_[0], $_[1]{pos} + 36, 'C', 9) } ],
+	[ 'chunk codec 255',                            sub { fput($_[0], $_[1]{pos} + 36, 'C', 255) } ],
+	[ 'chunk codec 4 (auto)',                       sub { fput($_[0], $_[1]{pos} + 36, 'C', 4) } ],
+	[ 'chunk codec 0 for a compressed chunk',       sub { fput($_[0], $_[1]{pos} + 36, 'C', 0) } ],
+	[ 'chunk codec 1 (pglz) for another codec',     sub { fput($_[0], $_[1]{pos} + 36, 'C', 1) } ],
+	[ 'chunk codec 2 (lz4) for another codec',      sub { fput($_[0], $_[1]{pos} + 36, 'C', 2) } ],
+	[ 'chunk codec 3 (zstd) for another codec',     sub { fput($_[0], $_[1]{pos} + 36, 'C', 3) } ],
+	[ 'chunk min_len 65',                           sub { fput($_[0], $_[1]{pos} + 32, 'v', 65) } ],
+	[ 'chunk max_len 65',                           sub { fput($_[0], $_[1]{pos} + 34, 'v', 65) } ],
+	[ 'chunk min_len 0xFFFF',                       sub { fput($_[0], $_[1]{pos} + 32, 'v', 0xFFFF) } ],
+	[ 'chunk max_len 0xFFFF',                       sub { fput($_[0], $_[1]{pos} + 34, 'v', 0xFFFF) } ],
+	[ 'chunk min_len 0 with the min/max flag set',  sub { fput($_[0], $_[1]{pos} + 32, 'v', 0) } ],
+	[ 'chunk min_len +1, max_len -1 (lengths shift, total unchanged)', sub { fput($_[0], $_[1]{pos} + 32, 'v', $_[1]{min_len} + 1); fput($_[0], $_[1]{pos} + 34, 'v', $_[1]{max_len} ? $_[1]{max_len} - 1 : 0) } ],
+	[ 'chunk min_len 3, max_len rest (wrong width for the type)', sub { fput($_[0], $_[1]{pos} + 32, 'v', 3); fput($_[0], $_[1]{pos} + 34, 'v', $_[1]{min_len} + $_[1]{max_len} - 3) } ],
 	[ 'chunk padding bytes nonzero',                sub { fput($_[0], $_[1]{pos} + 26, 'a6', "\xFF" x 6) } ],
 );
 my %FIELD_MUST = (    # those whose damage must be reported by a full read
@@ -772,7 +772,7 @@ for my $i (1 .. $nfuzz)
 						next;
 					}
 					my $e = $g->{cols}[ int(rand(@{ $g->{cols} })) ];
-					substr($$f, $e->{pos} + int(rand(26)), 1) = chr(int(rand(256)));
+					substr($$f, $e->{pos} + int(rand(38)), 1) = chr(int(rand(256)));
 				}
 			});
 		});
@@ -795,8 +795,8 @@ sub stat_bytes_edit
 			my $rest = $tot - length($minb);
 			# max: a valid one-byte-header varlena of $rest bytes
 			my $max = chr((($rest) << 1) | 1) . ('z' x ($rest - 1));
-			fput($f, $e->{pos} + 20, 'v', length($minb));
-			fput($f, $e->{pos} + 22, 'v', $rest);
+			fput($f, $e->{pos} + 32, 'v', length($minb));
+			fput($f, $e->{pos} + 34, 'v', $rest);
 			substr($$f, $e->{minpos}, $tot) = $minb . $max;
 			return;
 		}
@@ -1018,11 +1018,11 @@ for my $r (@CAT)
 add('catalog: both stripes damaged (first_block 0 and natts 0)', must_error => ['full'],
 	sql => sub { sqlset($_[0], 0, 'first_block = 0') . ";\n" . sqlset($_[0], 1, 'natts = 0') });
 add('catalog: stripe row deleted (rows vanish; not corruption)',
-	sql => sub { sprintf('DELETE FROM kingres.columnar_stripe WHERE filenode = %d AND stripe_id = %d', $_[0]{filenode}, $_[0]{stripes}[0]{id}) });
+	sql => sub { sprintf('DELETE FROM kingres.columnar_stripe WHERE rel_uid = %d AND stripe_id = %d', $_[0]{filenode}, $_[0]{stripes}[0]{id}) });
 add('catalog: all stripe rows deleted',
-	sql => sub { sprintf('DELETE FROM kingres.columnar_stripe WHERE filenode = %d', $_[0]{filenode}) });
+	sql => sub { sprintf('DELETE FROM kingres.columnar_stripe WHERE rel_uid = %d', $_[0]{filenode}) });
 add('catalog: stripe row duplicated under a new stripe id (same pages)', must_error => ['full'],
-	sql => sub { sprintf('INSERT INTO kingres.columnar_stripe SELECT filenode, 99999, first_row, row_count, chunk_groups, natts, first_block, block_count, blob_len, raw_bytes, footer_offset, cid_points, col_stats FROM kingres.columnar_stripe WHERE filenode = %d AND stripe_id = %d', $_[0]{filenode}, $_[0]{stripes}[0]{id}) });
+	sql => sub { sprintf('INSERT INTO kingres.columnar_stripe SELECT rel_uid, 99999, first_row, row_count, chunk_groups, natts, first_block, block_count, blob_len, raw_bytes, footer_offset, cid_points, col_stats FROM kingres.columnar_stripe WHERE rel_uid = %d AND stripe_id = %d', $_[0]{filenode}, $_[0]{stripes}[0]{id}) });
 # text statistics of the catalog row with a hostile pointer-style minimum
 for my $p (['indirect', pack('CC', 0x01, 0x01) . ("\x41" x 8)],
 	['expanded', pack('CC', 0x01, 0x02) . ("\x41" x 8)],
@@ -1199,11 +1199,11 @@ sub build_victims
 
 	my %by = map { $_->{table} => $_ } @$list;
 	my $rows = $n->safe_psql('postgres', <<'EOS');
-SELECT c.relname, pg_relation_filepath(c.oid), c.relfilenode::oid::int8,
+SELECT c.relname, pg_relation_filepath(c.oid), kingres.columnar_identity(c.oid),
        pg_relation_size(c.oid) / 8192,
        s.stripe_id, s.first_block, s.block_count, s.blob_len, s.footer_offset,
        s.row_count, s.chunk_groups, s.natts
-  FROM pg_class c JOIN kingres.columnar_stripe s ON s.filenode = c.relfilenode
+  FROM pg_class c JOIN kingres.columnar_stripe s ON s.rel_uid = kingres.columnar_identity(c.oid)
  WHERE c.relname ~ '^v[0-9]{3}$'
  ORDER BY c.relname, s.stripe_id
 EOS

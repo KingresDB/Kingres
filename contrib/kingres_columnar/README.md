@@ -111,22 +111,35 @@ One main fork, no other fork.
   maximum. Its CRC-32C is in the header. Large values are stored inline (there
   is no TOAST); a chunk group closes early to keep its raw size near 32 MB.
 * The stripe catalog `kingres.columnar_stripe`, an ordinary heap table keyed by
-  the relfilenode of the relation: stripe id, first row, counts, first block,
+  the identity of the stored content (a random id and the creating transaction, in
+  the metapage, protected by its own checksum): stripe id, first row, counts, first block,
   block count, sizes, the command-id change points of the writer (`cid_points`)
   and the stripe-level statistics (`col_stats`). A stripe is visible exactly
   when its catalog row is, so rollback, crash recovery, standbys, backup and
-  `VACUUM FULL` follow from PostgreSQL's own rules. A table keeps its stripes
-  when its file is swapped by a rewrite because the key is the file, not the
-  table.
+  `VACUUM FULL` follow from PostgreSQL's own rules. A byte-for-byte copy of the file (`SET TABLESPACE`, a base backup) keeps
+  its identity and so its stripes, with nothing to update; a rewrite or
+  `TRUNCATE` creates a new file with a new identity and an empty catalog.
+  Older snapshots: a REPEATABLE READ or SERIALIZABLE transaction whose snapshot
+  is older than the commit of a `VACUUM FULL`, `TRUNCATE`, `SET ACCESS METHOD`
+  or rewriting `ALTER TABLE` of the table does not get an empty table (as heap
+  gives for some of these): its read fails with SQLSTATE `40001`, naming the
+  rewrite. `SET TABLESPACE` and `columnar_compact` change nothing for it.
 * WAL: the resource manager `KingresColumnar` logs whole-page images only
   (`STRIPE_PAGES`, `METAPAGE`); redo restores images and has no logic of its
   own. A stripe's pages are logged before its catalog row is inserted.
 
-Everything read from disk is validated before use (page and stripe identity,
-the footer CRC, offsets, counts, codec ids, decompressed sizes, statistic
-lengths). A corrupt file gives an error with SQLSTATE `XX001`. Page checksums
-are the first line of defence when enabled. There is no checksum per chunk,
-so a damaged byte inside an uncompressed fixed-width chunk is not detected.
+What is validated when a chunk is read: page and stripe identity, the footer
+CRC, offsets, counts, codec ids, decompressed sizes, statistic lengths and
+headers, and a CRC-32C of every stored chunk, checked before the chunk is
+decoded, independent of data checksums, so accidental damage gives SQLSTATE
+`XX001`. The structure of array values is checked (header, dimensions, null
+bitmap, element sizes) before the array code sees them. Other variable-length
+types (numeric, jsonb, ranges, tsvector, geometric types, ...) are handed to the
+type's own code after their lengths are checked, as heap does for its pages: a
+file written on purpose, with valid checksums, by someone who can write the data
+directory can still crash the server through such a type, as with heap. The
+metapage has its own checksum. A damaged byte inside a stripe page is caught by
+the chunk checksum; page checksums, when enabled, catch it earlier.
 
 ## What is refused, and why
 
@@ -145,9 +158,13 @@ All with SQLSTATE `0A000`.
   by TID, which a columnar row has not). `BEFORE ROW` and statement
   triggers work.
 * Temporary and unlogged tables.
-* `TRUNCATE` inside a subtransaction after an outer level inserted rows into
-  the same table.
-* Parallel scans (the plan has none for a columnar table).
+* Parallel scans: no plan over a columnar table runs in a worker (rows the
+  transaction has not flushed exist only in the leader), and a parallel-safe
+  function that reads one inside a worker fails with `0A000`.
+* Logical replication: a columnar table cannot be put in a publication, a
+  publication that would include one (`FOR ALL TABLES`, `TABLES IN SCHEMA`) is
+  refused, and so is creating a columnar table into such a scope: "columnar
+  tables are not replicated logically yet".
 * A row cannot be fetched by TID. `ctid` shows a number made from the row's
   position; it is not stable and means nothing.
 
@@ -186,6 +203,26 @@ trigger). Back: `ALTER TABLE t SET ACCESS METHOD heap`. A partitioned table's
 `SET ACCESS METHOD` changes the method of partitions created afterwards. A
 rewrite other than `VACUUM FULL` and `SET TABLESPACE` (for example `ALTER
 COLUMN TYPE`) gives the new file the default options.
+
+## Isolation, transaction ages, names
+
+All isolation levels work. Under SERIALIZABLE a scan takes a relation-level
+predicate lock and an insert checks for conflicts on the relation, so a real
+write skew on one columnar table is detected; the stripe catalog is read
+without predicate locks, so transactions on unrelated columnar tables do not
+abort each other.
+
+A columnar table has `relfrozenxid = 0` (it holds no row transaction ids):
+`age(relfrozenxid)` shows the maximum and monitoring that alerts on table age
+will alert on every columnar table; ignore them. Autovacuum's wraparound logic
+skips a table whose `relfrozenxid` is not a normal transaction id
+(`autovacuum.c`, `relation_needs_vacanalyze`), and `datfrozenxid` is not held
+back; the stripe catalog is an ordinary heap table and is frozen as usual.
+
+If the role that creates tables is named `kingres`, the default search path
+(`"$user", public`) puts unqualified tables into the schema `kingres`, which
+belongs to the extension (and is shared with the other KingresDB extensions).
+Set `search_path` explicitly, or create the tables in another schema.
 
 ## Limits
 

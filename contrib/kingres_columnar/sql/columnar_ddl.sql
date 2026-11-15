@@ -130,7 +130,7 @@ SELECT count(*), sum(id), count(DISTINCT s), round(sum(f)::numeric, 3) FROM d3;
 UPDATE d3 SET s = 'updated' WHERE id = 1;
 ALTER TABLE d3 SET ACCESS METHOD columnar;
 SELECT count(*), min(s) FROM d3 WHERE id = 1;
-SELECT count(*) FROM kingres.columnar_stripe s JOIN pg_class c ON c.relfilenode = s.filenode WHERE c.oid = 'd3'::regclass;
+SELECT count(*) FROM kingres.columnar_stripe s WHERE s.rel_uid = kingres.columnar_identity('d3'::regclass);
 -- back to the default method of the session
 SET default_table_access_method = columnar;
 CREATE TABLE d3b (a int);
@@ -167,7 +167,7 @@ SELECT count(*), sum(id) FROM d4;
 INSERT INTO d4 VALUES (3001, 'after move');
 ALTER TABLE d4 SET TABLESPACE kc_ts;
 SELECT count(*), sum(id) FROM d4;
-SELECT count(*) AS catalog_rows FROM kingres.columnar_stripe s JOIN pg_class c ON c.relfilenode = s.filenode WHERE c.oid = 'd4'::regclass;
+SELECT count(*) AS catalog_rows FROM kingres.columnar_stripe s WHERE s.rel_uid = kingres.columnar_identity('d4'::regclass);
 CREATE TABLE d4b (id int) USING columnar TABLESPACE kc_ts;
 INSERT INTO d4b VALUES (1);
 SELECT count(*) FROM d4b;
@@ -261,30 +261,30 @@ DROP TABLE d8;
 CREATE TABLE d6 (a int) USING columnar;
 INSERT INTO d6 SELECT generate_series(1, 10);
 INSERT INTO d6 SELECT generate_series(1, 10);
-SELECT count(*) AS stripe_rows FROM kingres.columnar_stripe s JOIN pg_class c ON c.relfilenode = s.filenode WHERE c.oid = 'd6'::regclass;
-SELECT relfilenode AS d6_filenode FROM pg_class WHERE oid = 'd6'::regclass \gset
+SELECT count(*) AS stripe_rows FROM kingres.columnar_stripe s WHERE s.rel_uid = kingres.columnar_identity('d6'::regclass);
+SELECT kingres.columnar_identity('d6'::regclass) AS d6_filenode \gset
 DROP TABLE d6;
-SELECT count(*) AS rows_of_dropped FROM kingres.columnar_stripe WHERE filenode = :d6_filenode;
+SELECT count(*) AS rows_of_dropped FROM kingres.columnar_stripe WHERE rel_uid = :d6_filenode;
 -- DROP SCHEMA CASCADE, DROP OWNED, a dropped table inside a transaction that is rolled back
 CREATE SCHEMA d_schema;
 CREATE TABLE d_schema.t1 (a int) USING columnar;
 CREATE TABLE d_schema.t2 (a int) USING columnar;
 INSERT INTO d_schema.t1 VALUES (1);
 INSERT INTO d_schema.t2 VALUES (2);
-SELECT count(*) AS catalog_rows FROM kingres.columnar_stripe s JOIN pg_class c ON c.relfilenode = s.filenode WHERE c.relnamespace = 'd_schema'::regnamespace;
+SELECT count(*) AS catalog_rows FROM kingres.columnar_stripe s WHERE s.rel_uid IN (kingres.columnar_identity('d_schema.t1'), kingres.columnar_identity('d_schema.t2'));
 BEGIN;
 DROP TABLE d_schema.t1;
 ROLLBACK;
 SELECT count(*) FROM d_schema.t1;
-SELECT count(*) AS catalog_rows FROM kingres.columnar_stripe s JOIN pg_class c ON c.relfilenode = s.filenode WHERE c.relnamespace = 'd_schema'::regnamespace;
+SELECT count(*) AS catalog_rows FROM kingres.columnar_stripe s WHERE s.rel_uid IN (kingres.columnar_identity('d_schema.t1'), kingres.columnar_identity('d_schema.t2'));
 DROP SCHEMA d_schema CASCADE;
 -- a rolled back CREATE TABLE leaves no rows
 BEGIN;
 CREATE TABLE d7 (a int) USING columnar;
 INSERT INTO d7 SELECT generate_series(1, 100);
-SELECT relfilenode AS d7_filenode FROM pg_class WHERE oid = 'd7'::regclass \gset
+SELECT kingres.columnar_identity('d7'::regclass) AS d7_filenode \gset
 ROLLBACK;
-SELECT count(*) AS rows_of_rolled_back FROM kingres.columnar_stripe WHERE filenode = :d7_filenode;
+SELECT count(*) AS rows_of_rolled_back FROM kingres.columnar_stripe WHERE rel_uid = :d7_filenode;
 
 DROP TABLE d1, d2, d2_ref, d3;
 SELECT count(*) AS catalog_rows_after FROM kingres.columnar_stripe;

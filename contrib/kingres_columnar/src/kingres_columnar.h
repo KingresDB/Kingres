@@ -53,10 +53,10 @@
  */
 
 #define KC_META_MAGIC		0x4B434D31	/* "KCM1" */
-#define KC_META_VERSION		1
+#define KC_META_VERSION		2
 #define KC_PAGE_MAGIC		0x4B43		/* "KC" */
 #define KC_STRIPE_MAGIC		0x4B435331	/* "KCS1" */
-#define KC_STRIPE_VERSION	1
+#define KC_STRIPE_VERSION	2
 
 /* Limits that the readers enforce and the writers respect. */
 #define KC_MIN_STRIPE_ROWS	1000
@@ -77,7 +77,10 @@ typedef struct KcMetaData
 	uint32		chunk_rows;
 	uint64		next_row;
 	uint64		next_stripe_id;
-	uint8		reserved[64];
+	uint64		rel_uid;		/* identity of the stored content, copied with the file */
+	uint32		created_xid;	/* transaction that created this file */
+	uint32		crc;			/* CRC-32C of this struct with crc zero */
+	uint8		reserved[48];
 } KcMetaData;
 
 /* The special area of every page of a stripe: 24 bytes. */
@@ -121,22 +124,27 @@ typedef struct KcChunkDisk
 	uint32		comp_len;
 	uint32		raw_len;
 	uint32		nnulls;
+	uint32		crc;			/* CRC-32C of the stored bytes */
+	uint32		typid;			/* what the statistics were computed with */
+	uint32		collation;
 	uint16		min_len;
 	uint16		max_len;
 	uint8		codec;
 	uint8		flags;
-	uint8		pad[6];
-} KcChunkDisk;					/* 32 bytes */
+	uint8		pad[2];
+} KcChunkDisk;					/* 40 bytes */
 
 /* The same statistic, as the catalog's col_stats keeps it for a stripe. */
 typedef struct KcStatDisk
 {
 	uint32		nnulls;
+	uint32		typid;
+	uint32		collation;
 	uint16		min_len;
 	uint16		max_len;
 	uint8		flags;
 	uint8		pad[3];
-} KcStatDisk;					/* 12 bytes */
+} KcStatDisk;					/* 20 bytes */
 
 /* ------------------------------------------------------------------------
  * In-memory descriptions
@@ -153,6 +161,11 @@ typedef struct KcColInfo
 	char		align;
 	bool		dropped;
 	bool		minmax_ok;		/* statistics are kept for this column */
+	bool		is_array;
+	Oid			elemtype;
+	int16		elemlen;
+	bool		elembyval;
+	char		elemalign;
 	Oid			opfamily;		/* default btree operator family of the type */
 	FmgrInfo	cmp;			/* btree comparison, valid if minmax_ok */
 } KcColInfo;
@@ -258,6 +271,17 @@ extern void kc_require_rmgr(void);
 extern bool kc_rmgr_registered;
 extern void kc_meta_init_storage(Relation rel, const RelFileLocator *rlocator,
 								 const KcOptions *opts);
+
+/* The identity of a relation's stored content, from the metapage (cached). */
+typedef struct KcIdent
+{
+	uint64		uid;
+	TransactionId created_xid;
+	Oid			filenode;
+} KcIdent;
+
+extern const KcIdent *kc_rel_ident(Relation rel);
+extern void kc_check_snapshot_age(Relation rel, Snapshot snap);
 extern void kc_meta_read(Relation rel, KcMetaData *out);
 extern void kc_meta_allocate(Relation rel, uint32 nrows, uint64 *stripe_id,
 							 uint64 *first_row);
@@ -284,15 +308,14 @@ extern KcStripeInfo *kc_catalog_load(Relation rel, Snapshot snap, int *nstripes)
 extern void kc_catalog_insert(Relation rel, const KcStripeInfo *si,
 							  const char *cid_points, int cid_len,
 							  const char *col_stats, int stats_len);
-extern void kc_catalog_delete_filenode(Oid filenode);
-extern int	kc_catalog_delete_stripe(Oid filenode, uint64 stripe_id);
-extern void kc_catalog_rekey(Oid old_filenode, Oid new_filenode);
+extern void kc_catalog_delete_uid(uint64 uid);
+extern int	kc_catalog_delete_stripe(uint64 uid, uint64 stripe_id);
 extern uint64 kc_catalog_row_total(Relation rel, Snapshot snap, uint64 *stripes,
 								   uint64 *groups, uint64 *raw_bytes);
 extern int	kc_catalog_reconcile(void);
 extern int	kc_catalog_count_orphans(void);
 extern void kc_stripe_stats_parse(const KcStripeInfo *si, int ncols,
-								  KcColStat *out);
+								  const KcTypeInfo *ti, KcColStat *out);
 extern void kc_footer_load(Relation rel, const KcStripeInfo *si, KcFooter *f);
 extern void kc_footer_free(KcFooter *f);
 
@@ -306,7 +329,6 @@ extern void kc_write_row_values(Relation rel, Datum *vals, bool *nulls,
 								CommandId cid);
 extern void kc_write_flush_relation(Relation rel);
 extern void kc_write_discard_relation(Oid relid, bool *had_outer);
-extern bool kc_write_has_outer_rows(Oid relid);
 extern void kc_write_pin_relation(Oid relid, int delta);
 extern int	kc_write_pending_count(Oid relid);
 extern bool kc_write_pending_get(Oid relid, int ordinal, uint32 *serial);
@@ -317,7 +339,7 @@ typedef struct KcPendingRef
 	uint32		nrows;			/* rows present when the scan started */
 } KcPendingRef;
 
-extern KcPendingRef *kc_write_pending_refs(Oid relid, int *n);
+extern KcPendingRef *kc_write_pending_refs(Oid relid, uint64 uid, int *n);
 extern bool kc_write_pending_fetch(Oid relid, const KcPendingRef *ref,
 								   uint32 rowno, Datum **vals, bool **nulls,
 								   int *ncols, CommandId *cid);

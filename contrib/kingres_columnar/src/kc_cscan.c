@@ -192,6 +192,26 @@ kc_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		return;
 
 	/*
+	 * No parallel scan in this version.  Rows the transaction has written and
+	 * not flushed live in the leader's memory, so a worker would silently miss
+	 * them: no path over a columnar relation may run in a worker (not as a
+	 * Parallel Append child, not under a Gather, not as the inner side of a
+	 * partitioned join).  The relation is marked not parallel-safe and every
+	 * path already made is, too.
+	 */
+	rel->consider_parallel = false;
+	rel->partial_pathlist = NIL;
+	foreach(lc, rel->pathlist)
+		((Path *) lfirst(lc))->parallel_safe = false;
+	foreach(lc, rel->pathlist)
+	{
+		Path	   *path = (Path *) lfirst(lc);
+
+		if (IsA(path, GatherPath) || IsA(path, GatherMergePath))
+			rel->pathlist = foreach_delete_current(rel->pathlist, lc);
+	}
+
+	/*
 	 * Plans that need what only a plain sequential scan gives: a sampled scan,
 	 * the target of UPDATE or DELETE, rows to be locked.  They fail in the
 	 * access method with the message of the operation.
@@ -200,16 +220,6 @@ kc_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		root->parse->resultRelation == (int) rti ||
 		get_plan_rowmark(root->rowMarks, rti) != NULL)
 		return;
-
-	/* no parallel scan in this version: drop partial and Gather paths */
-	rel->partial_pathlist = NIL;
-	foreach(lc, rel->pathlist)
-	{
-		Path	   *path = (Path *) lfirst(lc);
-
-		if (IsA(path, GatherPath) || IsA(path, GatherMergePath))
-			rel->pathlist = foreach_delete_current(rel->pathlist, lc);
-	}
 
 	if (kc_guc_enable_custom_scan)
 		kc_add_custom_path(root, rel, rte);
