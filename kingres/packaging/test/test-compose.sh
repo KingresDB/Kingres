@@ -320,8 +320,7 @@ mesh_bucket_counts() {
     done
     [ "${c}" = "32 32 32 " ]
 }
-check_known "mesh reports bucketCount 32 on every node" \
-    "getDatabase on a follower answers sharding.bucketCount null" mesh_bucket_counts
+check "mesh reports bucketCount 32 on every node" mesh_bucket_counts
 
 # DDL of a sharded database goes through the map group primary (kingres-1).
 # The table is distributed by an API call received by kingres-3; the rows are

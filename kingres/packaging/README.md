@@ -433,10 +433,10 @@ after every restart.
   kingres-2 (a follower) and, separately, a stop with rows written on kingres-3
   meanwhile (a row whose bucket is on the stopped server is refused, the others
   must be there after the start); stop and start of all nodes (exit code 0, data
-  back, no crash recovery); ports bound to loopback; tear down. Two checks are
-  *known failures* (`KNOWN` in the output, not counted as failed; see
-  `check_known` in `lib.sh`): a follower answers `sharding.bucketCount: null`, and a
-  stopped follower stays listed as healthy (no heartbeat yet). `--keep` leaves
+  back, no crash recovery); ports bound to loopback; tear down. One check is a
+  *known failure* (`KNOWN` in the output, not counted as failed; see
+  `check_known` in `lib.sh`): a stopped follower stays listed as healthy (no
+  heartbeat yet). `--keep` leaves
   the nodes running for a look.
 
 ## Facts about `kingresd` the packaging depends on
@@ -490,7 +490,9 @@ the same, and the package test gave 156 checks passed, 0 failed.
 
 The join test of the compose topology was run twice in a row from a clean state on commit
 `a35bf950e3` plus the working-tree `kingres/packaging`: 138 passed, 0 failed, 2 known
-failures each time; `test-image.sh` on the same commit: 79 passed, 0 failed.
+failures each time; `test-image.sh` on the same commit: 79 passed, 0 failed. On commit
+`e4736d3244`, which fixed the follower's answer for a database, it gave 139 passed,
+0 failed, 1 known failure.
 
 | Measurement | Value |
 |---|---|
@@ -508,7 +510,7 @@ failures each time; `test-image.sh` on the same commit: 79 passed, 0 failed.
 |---|---|
 | `test/test-deb.sh` (clean ubuntu:24.04, systemd) | 150 checks passed, 0 failed |
 | `test/test-image.sh` | 79 passed, 0 failed |
-| `test/test-compose.sh` (three nodes joined into one cluster; two known failures) | 138 passed, 0 failed, 2 known failures (two runs in a row) |
+| `test/test-compose.sh` (three nodes joined into one cluster; one known failure) | 139 passed, 0 failed, 1 known failure |
 | `lintian --fail-on error` (2.117) | 0 errors, 0 warnings; 140 information tags (listed above, plus two spelling false positives in `postgres`) |
 | `shellcheck -x -P SCRIPTDIR` on every script | clean |
 | `actionlint` 1.7.12 (with shellcheck) on `ci.yml` | clean; **the workflow was not executed on GitHub** |
