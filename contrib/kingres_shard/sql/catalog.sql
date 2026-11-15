@@ -68,4 +68,9 @@ SET kingres_shard.default_bucket_count = 4097;
 SET kingres_shard.nonexistent = 1;
 
 DROP EXTENSION kingres_shard;
+-- The schema is shared with the other KingresDB extensions and belongs to none of them:
+-- it stays, empty, when the extension goes.
 SELECT count(*) AS schema_left FROM pg_namespace WHERE nspname = 'kingres';
+SELECT (SELECT count(*) FROM pg_class WHERE relnamespace = 'kingres'::regnamespace)
+     + (SELECT count(*) FROM pg_proc WHERE pronamespace = 'kingres'::regnamespace) AS objects_left;
+DROP SCHEMA kingres;

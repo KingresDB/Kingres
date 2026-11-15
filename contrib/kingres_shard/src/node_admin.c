@@ -280,8 +280,26 @@ kingres_sync_catalog(PG_FUNCTION_ARGS)
 	foreach(lc, targets)
 	{
 		KsNode	   *n = (KsNode *) lfirst(lc);
+		KsConn	   *kc = kingres_shard_get_conn(n->host, n->port, false, NULL);
+		char		idbuf[16];
+		const char *params[1];
 
-		push_secret(kingres_shard_get_conn(n->host, n->port, false, NULL));
+		/*
+		 * A node that was restored from a logical dump has the extension and its
+		 * tables but no catalog and no idea which node it is (the dump holds
+		 * neither, review finding S6-08): the catalog is the authority on who
+		 * lives at an address, so tell it, once, in the same transaction.  A node
+		 * that knows its id is not touched.  The statement runs before the
+		 * secret arrives, while the node accepts the session of a superuser.
+		 */
+		snprintf(idbuf, sizeof(idbuf), "%d", n->node_id);
+		params[0] = idbuf;
+		kingres_shard_begin_write_xact(kc);
+		PQclear(kingres_shard_exec_params(kc,
+										   "SELECT " KINGRES_SHARD_SCHEMA ".internal_set_local_node($1::pg_catalog.int4) "
+										   "WHERE NOT EXISTS (SELECT 1 FROM " KINGRES_SHARD_SCHEMA ".local_node)",
+										   1, NULL, params, true));
+		push_secret(kc);
 	}
 	PG_RETURN_VOID();
 }

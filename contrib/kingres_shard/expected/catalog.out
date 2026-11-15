@@ -204,9 +204,19 @@ SET kingres_shard.nonexistent = 1;
 ERROR:  invalid configuration parameter name "kingres_shard.nonexistent"
 DETAIL:  "kingres_shard" is a reserved prefix.
 DROP EXTENSION kingres_shard;
+-- The schema is shared with the other KingresDB extensions and belongs to none of them:
+-- it stays, empty, when the extension goes.
 SELECT count(*) AS schema_left FROM pg_namespace WHERE nspname = 'kingres';
  schema_left 
 -------------
-           0
+           1
 (1 row)
 
+SELECT (SELECT count(*) FROM pg_class WHERE relnamespace = 'kingres'::regnamespace)
+     + (SELECT count(*) FROM pg_proc WHERE pronamespace = 'kingres'::regnamespace) AS objects_left;
+ objects_left 
+--------------
+            0
+(1 row)
+
+DROP SCHEMA kingres;

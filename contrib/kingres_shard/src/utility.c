@@ -1382,6 +1382,73 @@ refuse_trigger_on_reference_table(CreateTrigStmt *stmt)
 }
 
 /*
+ * refuse_inheritance_of_reference_table
+ *
+ * A write to a reference table also writes the rows of every table that inherits
+ * from it, and fires their triggers; a partition is the same.  Those children
+ * would be tables that this extension does not know, whose triggers and rows each
+ * node would handle for itself, so the copies could differ with no error (review
+ * finding S6-03: a trigger on a child, made by hand with routing off).  A
+ * reference table is therefore never a parent or a child of anything: creation of
+ * a reference table refuses a table that takes part in inheritance
+ * (internal_check_referenceable), and from then on these statements are refused,
+ * with routing off too:
+ *	CREATE TABLE ... INHERITS (r), CREATE TABLE ... PARTITION OF r,
+ *	ALTER TABLE r INHERIT p, ALTER TABLE c INHERIT r,
+ *	ALTER TABLE r ATTACH PARTITION p ..., ALTER TABLE p ATTACH PARTITION r ...
+ */
+static void
+refuse_inheritance_of_reference_table(Node *parsetree)
+{
+	const KsCatalog *cat = kingres_shard_catalog();
+	List	   *involved = NIL;
+	ListCell   *lc;
+
+	if (!cat->present || cat->ndist_tables == 0)
+		return;
+
+	if (IsA(parsetree, CreateStmt))
+	{
+		foreach(lc, ((CreateStmt *) parsetree)->inhRelations)
+			if (IsA(lfirst(lc), RangeVar))
+				involved = lappend(involved, lfirst(lc));
+	}
+	else if (IsA(parsetree, AlterTableStmt))
+	{
+		AlterTableStmt *stmt = (AlterTableStmt *) parsetree;
+
+		foreach(lc, stmt->cmds)
+		{
+			AlterTableCmd *cmd = lfirst_node(AlterTableCmd, lc);
+
+			if (cmd->subtype == AT_AddInherit && cmd->def != NULL && IsA(cmd->def, RangeVar))
+			{
+				involved = lappend(involved, stmt->relation);
+				involved = lappend(involved, cmd->def);
+			}
+			else if (cmd->subtype == AT_AttachPartition && cmd->def != NULL && IsA(cmd->def, PartitionCmd))
+			{
+				involved = lappend(involved, stmt->relation);
+				involved = lappend(involved, ((PartitionCmd *) cmd->def)->name);
+			}
+		}
+	}
+	foreach(lc, involved)
+	{
+		RangeVar   *rv = (RangeVar *) lfirst(lc);
+		const KsDistTable *dt = direct_dist(cat, rangevar_relid(rv));
+
+		if (dt != NULL && dt->is_reference)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("%s is not supported on reference table \"%s\": a reference table has no inheritance children or parents and no partitions",
+							utility_name(parsetree), get_rel_name(dt->relid)),
+					 errdetail("A write to a reference table would also write the rows of the tables that inherit from it and fire their triggers on every node, and the copies could differ."),
+					 errhint("Keep the data in separate tables, or make the table distributed.")));
+	}
+}
+
+/*
  * kingres_shard_process_utility
  *
  * The hook: decide, run, propagate.  Statements that run while the extension
@@ -1414,6 +1481,11 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 	/* Whatever the routing setting is: see refuse_trigger_on_reference_table. */
 	if (IsA(parsetree, CreateTrigStmt) && !creating_extension && !kingres_shard_session_forwarded())
 		refuse_trigger_on_reference_table((CreateTrigStmt *) parsetree);
+
+	/* And the same for inheritance and partitions of a reference table (S6-03). */
+	if ((IsA(parsetree, CreateStmt) || IsA(parsetree, AlterTableStmt)) &&
+		!creating_extension && !kingres_shard_session_forwarded())
+		refuse_inheritance_of_reference_table(parsetree);
 
 	if (kingres_shard_enable_routing && !creating_extension &&
 		statement_is_of_interest(parsetree) &&

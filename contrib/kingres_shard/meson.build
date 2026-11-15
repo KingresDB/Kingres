@@ -135,6 +135,11 @@ tests += {
       't/053_restore_point.pl',
       't/054_failover_move.pl',
       't/055_ship_limits.pl',
+      't/056_ri_distributed.pl',
+      't/057_scan_errors.pl',
+      't/058_review_s6.pl',
+      't/059_restore_node.pl',
+      't/060_shared_schema.pl',
     ],
   },
 }

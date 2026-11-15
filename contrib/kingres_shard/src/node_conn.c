@@ -68,6 +68,7 @@
 #include "commands/dbcommands.h"
 #include "libpq/libpq-be-fe-helpers.h"
 #include "storage/latch.h"
+#include "utils/acl.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
@@ -481,6 +482,21 @@ kingres_shard_connect_control(const char *host, int port, char **errmsg_out)
 }
 
 /*
+ * Is host:port a node that add_node() is registering in this backend?  add_node()
+ * checks the major of that node itself, with its own message.
+ */
+static bool
+is_expected_node(const char *host, int port)
+{
+	int			i;
+
+	for (i = 0; i < nexpected; i++)
+		if (expected_nodes[i].port == port && strcmp(expected_nodes[i].host, host) == 0)
+			return true;
+	return false;
+}
+
+/*
  * kingres_shard_get_conn
  *
  * Return the cached connection to host:port for the current user,
@@ -563,6 +579,38 @@ kingres_shard_get_conn(const char *host, int port, bool missing_ok,
 	{
 		kc->conn = connect_to_node(kc->host, kc->port, kc->user, &err);
 		kc->have_error = false;
+
+		/*
+		 * One PostgreSQL major per cluster (review finding S6-09).  A node that
+		 * was upgraded in place to another major and restarted is reachable and
+		 * answers, but statements that span groups would run on two majors
+		 * (another libm, another planner, other defaults): it is refused here,
+		 * where a connection is made, with an error that says what to do.  This
+		 * is the one place where a node learns what major another node runs:
+		 * the catalog does not record it.  check_cluster() reports such a node
+		 * (it asks over control sessions, which are not refused).
+		 */
+		if (kc->conn != NULL &&
+			kingres_shard_peer_major(PQserverVersion(kc->conn) / 10000) != KS_SERVER_MAJOR &&
+			!is_expected_node(host, port))
+		{
+			int			theirs = kingres_shard_peer_major(PQserverVersion(kc->conn) / 10000);
+
+			discard_connection(kc);
+			if (missing_ok)
+			{
+				if (errmsg_out)
+					*errmsg_out = psprintf("node %s:%d runs PostgreSQL %d, this node runs PostgreSQL %d",
+										   host, port, theirs, KS_SERVER_MAJOR);
+				return NULL;
+			}
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("node %s:%d runs PostgreSQL %d, this node runs PostgreSQL %d",
+							host, port, theirs, KS_SERVER_MAJOR),
+					 errdetail("A cluster runs one major version of PostgreSQL, and a statement that needs another node would run on two."),
+					 errhint("Upgrade every node of the cluster to the same major version; kingres.check_cluster() lists the nodes of another major.")));
+		}
 		if (kc->conn == NULL)
 		{
 			if (missing_ok)
@@ -672,10 +720,30 @@ kingres_shard_conn_drop_stale(List *nodes)
  * answer registers itself on the connection; anything else that wants to use
  * the connection first asks the owner to read the answer (it keeps the result
  * for later), so that two statements never overlap on one libpq connection.
+ *
+ * The owner is a pointer into the memory of a statement, which an error can
+ * free without the owner ever being asked to let go (review finding S6-02).
+ * So the rule is: the connection points at its owner for exactly as long as a
+ * query of the owner is in flight, and every way that the owner can go away
+ * lets go first:
+ *	- the owner reads the answer and clears the registration itself
+ *	  (kingres_shard_conn_clear_pending), before it looks at what it got;
+ *	- the memory context of the owner has a reset callback that calls
+ *	  kingres_shard_conn_abandon_pending (dist_scan.c), which reads and drops the
+ *	  answer, whichever way the context goes (an error, a subtransaction abort,
+ *	  a portal that is dropped, the end of the backend);
+ *	- the abort of a subtransaction reads the answer through the owner while the
+ *	  owner still exists, without raising an error (conn_subxact_callback), and
+ *	  the abort of the transaction closes the connection (abort_connection),
+ *	  which forgets the owner.
+ * The finish function gets quiet = true from the abort paths: it must not
+ * throw, and it keeps an error it finds for the owner to raise when the owner
+ * asks for the batch.
  */
 void
-kingres_shard_conn_set_pending(KsConn *kc, void *owner, void (*finish) (void *owner))
+kingres_shard_conn_set_pending(KsConn *kc, void *owner, KsPendingFinish finish)
 {
+	Assert(kc->pending_owner == NULL || kc->pending_owner == owner);
 	kc->pending_owner = owner;
 	kc->pending_finish = finish;
 }
@@ -690,18 +758,61 @@ kingres_shard_conn_clear_pending(KsConn *kc, void *owner)
 	}
 }
 
+/* Ask the owner of the query in flight to read its answer (it may raise an error). */
 void
 kingres_shard_conn_quiesce(KsConn *kc)
 {
 	if (kc->pending_owner != NULL)
-	{
-		void	   *owner = kc->pending_owner;
-		void		(*finish) (void *) = kc->pending_finish;
+		kc->pending_finish(kc->pending_owner, false);
+}
 
+/* The same where an error is not possible: an abort callback. */
+void
+kingres_shard_conn_quiesce_quiet(KsConn *kc)
+{
+	if (kc->pending_owner != NULL)
+		kc->pending_finish(kc->pending_owner, true);
+}
+
+/*
+ * kingres_shard_conn_abandon_pending
+ *
+ * The owner is going away.  If the connection still has it registered, the
+ * query it sent is read and dropped (bounded, nothing thrown) and the
+ * registration is gone, so the connection can be used by whoever comes next.
+ * A connection that is broken has nothing to read; it is only forgotten.
+ */
+void
+kingres_shard_conn_abandon_pending(KsConn *kc, void *owner)
+{
+	if (kc->pending_owner != owner)
+		return;
+	if (kc->conn == NULL || kc->have_error || PQstatus(kc->conn) != CONNECTION_OK)
+	{
 		kc->pending_owner = NULL;
 		kc->pending_finish = NULL;
-		finish(owner);
+		kc->in_query = false;
+		kc->have_error = true;
+		return;
 	}
+	kingres_shard_conn_drop_inflight(kc);
+}
+
+/*
+ * kingres_shard_conn_drop_inflight
+ *
+ * Read and drop the answer of the query in flight on kc (and forget its owner).
+ * The memory the result wrapper of PostgreSQL 19 needs is taken in a context that
+ * outlives the caller: the caller may be the reset callback of a memory context
+ * that is being deleted, or an abort callback.
+ */
+void
+kingres_shard_conn_drop_inflight(KsConn *kc)
+{
+	MemoryContext oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+
+	PQclear(kingres_shard_conn_collect_quiet(kc));
+	MemoryContextSwitchTo(oldcxt);
 }
 
 /*
@@ -954,22 +1065,21 @@ kingres_shard_cancel_with_deadline(PGconn *conn)
 }
 
 /*
- * kingres_shard_bounded_exec
- *
- * PQexec without the unbounded wait: send the command, then wait on the latch
- * and the socket until the result is complete or kingres_shard.node_timeout
- * seconds have passed.  On a timeout the running command is cancelled
- * (best effort) and NULL is returned; the caller closes the connection.
+ * Wait for the answer of the query that is in flight on conn, for at most
+ * kingres_shard.node_timeout seconds, and return its last result (NULL when it
+ * has none).  *failed is set when the wait ran out (the running command is
+ * cancelled, best effort) or the connection broke; the caller closes the
+ * connection or marks it unusable then.  Never throws; interrupts are checked
+ * only when asked (the abort callbacks must not).
  */
-PGresult *
-kingres_shard_bounded_exec(PGconn *conn, const char *sql, bool interruptible)
+static PGresult *
+bounded_get_last(PGconn *conn, bool interruptible, bool *failed)
 {
 	TimestampTz deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
 													   (int64) kingres_shard_node_timeout * 1000);
 	PGresult   *last = NULL;
 
-	if (conn == NULL || PQstatus(conn) != CONNECTION_OK || !PQsendQuery(conn, sql))
-		return NULL;
+	*failed = false;
 	for (;;)
 	{
 		PGresult   *res;
@@ -987,6 +1097,7 @@ kingres_shard_bounded_exec(PGconn *conn, const char *sql, bool interruptible)
 			{
 				kingres_shard_cancel_with_deadline(conn);
 				PQclear(last);
+				*failed = true;
 				return NULL;
 			}
 			rc = WaitLatchOrSocket(MyLatch,
@@ -1001,6 +1112,7 @@ kingres_shard_bounded_exec(PGconn *conn, const char *sql, bool interruptible)
 			if (!PQconsumeInput(conn))
 			{
 				PQclear(last);
+				*failed = true;
 				return NULL;
 			}
 		}
@@ -1014,6 +1126,53 @@ kingres_shard_bounded_exec(PGconn *conn, const char *sql, bool interruptible)
 			break;
 	}
 	return last;
+}
+
+/*
+ * kingres_shard_bounded_exec
+ *
+ * PQexec without the unbounded wait: send the command, then wait on the latch
+ * and the socket until the result is complete or kingres_shard.node_timeout
+ * seconds have passed.  On a timeout the running command is cancelled
+ * (best effort) and NULL is returned; the caller closes the connection.
+ */
+PGresult *
+kingres_shard_bounded_exec(PGconn *conn, const char *sql, bool interruptible)
+{
+	bool		failed;
+	PGresult   *res;
+
+	if (conn == NULL || PQstatus(conn) != CONNECTION_OK || !PQsendQuery(conn, sql))
+		return NULL;
+	res = bounded_get_last(conn, interruptible, &failed);
+	return failed ? NULL : res;
+}
+
+/*
+ * kingres_shard_conn_collect_quiet
+ *
+ * Read the answer of the query in flight on kc, as an abort path may: the wait
+ * is bounded and interrupts are not checked, and nothing is thrown.  Returns
+ * the last result (the caller clears it; NULL when there is none or the
+ * connection failed, in which case have_error is set).  The query is no longer
+ * in flight afterwards, and nobody is registered as waiting for it.
+ */
+PGresult *
+kingres_shard_conn_collect_quiet(KsConn *kc)
+{
+	PGresult   *res = NULL;
+	bool		failed = false;
+
+	if (kc->conn == NULL || PQstatus(kc->conn) != CONNECTION_OK)
+		failed = true;
+	else
+		res = bounded_get_last(kc->conn, false, &failed);
+	if (failed)
+		kc->have_error = true;
+	kc->in_query = false;
+	kc->pending_owner = NULL;
+	kc->pending_finish = NULL;
+	return failed ? NULL : res;
 }
 
 /*
@@ -1134,14 +1293,16 @@ kingres_shard_result_sqlstate(PGresult *res)
 }
 
 /*
- * remote_extension_version
+ * kingres_shard_remote_extension_version
  *
  * The version of the extension that host:port has, asked on a connection that
  * claims nothing (the node refused the claim of this one), as the current role;
- * NULL when it cannot be asked.  Only used to explain a refusal.
+ * NULL when it cannot be asked, an empty string when the extension is not
+ * installed there.  Used to explain a refusal, and by check_cluster() and the
+ * check before a move for a node that runs another version (S6-06).
  */
-static char *
-remote_extension_version(const char *host, int port)
+char *
+kingres_shard_remote_extension_version(const char *host, int port)
 {
 	const char *keywords[8];
 	const char *values[8];
@@ -1174,8 +1335,8 @@ remote_extension_version(const char *host, int port)
 		res = kingres_shard_bounded_exec(conn,
 										 "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'kingres_shard'",
 										 false);
-		if (res != NULL && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1)
-			version = pstrdup(PQgetvalue(res, 0, 0));
+		if (res != NULL && PQresultStatus(res) == PGRES_TUPLES_OK)
+			version = pstrdup(PQntuples(res) == 1 ? PQgetvalue(res, 0, 0) : "");
 		PQclear(res);
 	}
 	PQfinish(conn);
@@ -1246,8 +1407,10 @@ kingres_shard_report_error(KsConn *kc, PGresult *res, const char *sql)
 	 */
 	if (strstr(primary, "claims to have been opened by another node of the cluster") != NULL)
 	{
-		char	   *theirs = remote_extension_version(kc->host, kc->port);
+		char	   *theirs = kingres_shard_remote_extension_version(kc->host, kc->port);
 
+		if (theirs != NULL && theirs[0] == '\0')
+			theirs = NULL;
 		if (theirs == NULL || strcmp(theirs, KINGRES_SHARD_EXT_VERSION) != 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -1305,6 +1468,9 @@ reset_xact_state(KsConn *kc)
 	kc->wrote = false;
 	kc->prepared = false;
 	kc->gid[0] = '\0';
+	/* Nothing that was in flight outlives the transaction. */
+	kc->pending_owner = NULL;
+	kc->pending_finish = NULL;
 }
 
 /*
@@ -1787,7 +1953,25 @@ conn_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 
 			/* A SET LOCAL made after the savepoint is undone with it. */
 			kc->tz_applied[0] = '\0';
-			if (kc->in_query || kc->have_error || kc->conn == NULL ||
+
+			/*
+			 * An error ended the statement of this subtransaction while a
+			 * fetch of its scan was in flight (S6-02), or interrupted a
+			 * command of ours.  The answer must be read before the rollback
+			 * can be sent.  The owner of the fetch still exists here (its
+			 * memory goes later, and its reset callback lets go of the
+			 * connection if that comes first): it reads the answer, and an
+			 * error in it is kept for the owner, not raised.  What is left in
+			 * flight after that has no owner (a command that an interrupt cut
+			 * short): read and dropped.
+			 */
+			if (kc->in_query)
+			{
+				kingres_shard_conn_quiesce_quiet(kc);
+				if (kc->in_query)
+					kingres_shard_conn_drop_inflight(kc);
+			}
+			if (kc->have_error || kc->conn == NULL ||
 				PQstatus(kc->conn) != CONNECTION_OK)
 			{
 				kc->have_error = true;
@@ -1849,6 +2033,32 @@ kingres_shard_exec_ddl(KsConn *kc, const char *stmt)
 	exec_internal(kc, KS_FIXED_SETTINGS_SQL "SELECT 1");
 	kc->tz_applied[0] = '\0';
 	sync_timezone(kc);
+}
+
+PG_FUNCTION_INFO_V1(kingres_internal_remote_extension_version);
+
+/*
+ * kingres.internal_remote_extension_version(host text, port int) returns text
+ *
+ * kingres_shard_remote_extension_version() for PL/pgSQL.  Superusers only.
+ */
+Datum
+kingres_internal_remote_extension_version(PG_FUNCTION_ARGS)
+{
+	char	   *host;
+	char	   *version;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied for the internal functions of kingres_shard")));
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		PG_RETURN_NULL();
+	host = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	version = kingres_shard_remote_extension_version(host, PG_GETARG_INT32(1));
+	if (version == NULL)
+		PG_RETURN_NULL();
+	PG_RETURN_TEXT_P(cstring_to_text(version));
 }
 
 PG_FUNCTION_INFO_V1(kingres_internal_scrub_conn_error);

@@ -10,7 +10,9 @@
 
 -- The schema is created here, not by CREATE EXTENSION, so that it is a member
 -- of the extension and disappears with it.  Every object is qualified.
-CREATE SCHEMA kingres;
+-- Not CREATE SCHEMA IF NOT EXISTS: PostgreSQL refuses that in a script when the schema
+-- exists and is not a member of the extension, and another KingresDB extension may have made it.
+DO $ks$ BEGIN IF pg_catalog.to_regnamespace('kingres') IS NULL THEN CREATE SCHEMA kingres; END IF; END $ks$;
 
 -- ---------------------------------------------------------------------------
 -- Catalog tables

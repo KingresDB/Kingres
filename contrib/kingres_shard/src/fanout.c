@@ -42,6 +42,7 @@
 #include "catalog.h"
 #include "commands/explain.h"
 #include "commands/explain_format.h"
+#include "commands/trigger.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "executor/tuptable.h"
@@ -162,40 +163,105 @@ in_refwrite_fragment(void)
 }
 
 /*
- * Is the text one of the statements that the triggers of foreign keys run
- * (ri_triggers.c: every one of them names its table with ONLY)?  Only these are
- * left to this node's copy while a reference-table write runs; any other
- * statement that the write makes run (review finding S5-01: a trigger or a
- * function) is planned like a statement of its own, routed and checked.  There
- * is no trigger on a reference table by hand (utility.c); the rest is the
- * foreign keys.
+ * kingres_shard_refuse_replica_role
+ *
+ * session_replication_role = replica (or local) is a superuser's way to switch
+ * off the triggers of a session, the actions of foreign keys among them.  The
+ * session's value is not sent to the other nodes (a remote session has the
+ * default role), so a write that runs on several nodes would skip the triggers
+ * here and run them there: the copies of a reference table would differ, and a
+ * distributed table would enforce its foreign keys for the rows of some groups
+ * only (review finding S6-04).  Such a write is refused; a superuser who really
+ * wants the role repeats the statement by hand on each node with
+ * kingres_shard.enable_routing = off.
  */
-static bool
-is_ri_action(const char *query_string)
+void
+kingres_shard_refuse_replica_role(const char *what)
 {
-	return strncmp(query_string, "SELECT 1 FROM ONLY ", 19) == 0 ||
-		strncmp(query_string, "UPDATE ONLY ", 12) == 0 ||
-		strncmp(query_string, "DELETE FROM ONLY ", 17) == 0;
+	if (SessionReplicationRole == SESSION_REPLICATION_ROLE_ORIGIN)
+		return;
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("%s cannot be written while session_replication_role is \"%s\"",
+					what,
+					SessionReplicationRole == SESSION_REPLICATION_ROLE_REPLICA ? "replica" : "local"),
+			 errdetail("The setting switches off triggers and the actions of foreign keys in this session only; the other nodes run the write with the role \"origin\", so the copies or the enforcement would differ."),
+			 errhint("Set session_replication_role to \"origin\", or run the statement by hand on each node with kingres_shard.enable_routing = off.")));
 }
 
 /*
- * kingres_shard_in_refwrite_nested
+ * The shape of the statements that the triggers of foreign keys run
+ * (ri_triggers.c): a check that reads one table by the key ("SELECT 1 FROM x
+ * WHERE $1 = col FOR KEY SHARE OF x"), or an action on the referencing table
+ * ("DELETE FROM x WHERE $1 = col", "UPDATE x SET col = ... WHERE $1 = col"):
+ * one table, no join, no subquery, no aggregate, no set operation.  The text of
+ * the statement is not looked at: PostgreSQL leaves ONLY out when the table is
+ * partitioned, which every distributed table is (review finding S6-01), and any
+ * text can be written by a user.
+ */
+static bool
+ri_shape_ok(Query *parse)
+{
+	RangeTblEntry *rte;
+
+	if (parse->commandType != CMD_SELECT && parse->commandType != CMD_UPDATE &&
+		parse->commandType != CMD_DELETE)
+		return false;
+	if (parse->cteList != NIL || parse->setOperations != NULL ||
+		parse->groupClause != NIL || parse->hasAggs || parse->hasWindowFuncs ||
+		parse->hasSubLinks || parse->hasTargetSRFs || parse->distinctClause != NIL ||
+		parse->sortClause != NIL || parse->limitCount != NULL ||
+		parse->limitOffset != NULL || parse->returningList != NIL ||
+		parse->onConflict != NULL)
+		return false;
+	if (list_length(parse->rtable) != 1 || list_length(parse->rowMarks) > 1)
+		return false;
+	rte = linitial_node(RangeTblEntry, parse->rtable);
+	if (rte->rtekind != RTE_RELATION)
+		return false;
+	if (parse->jointree == NULL || list_length(parse->jointree->fromlist) != 1)
+		return false;
+	return true;
+}
+
+/*
+ * kingres_shard_in_ri_action
  *
- * True for a statement planned while a reference-table write runs on this node
- * as one of its copies, other than that write itself: the action of a foreign
- * key, a trigger.  It must run on this node's copy only, because the write is
- * run on every node and each node does its own part of it.  (The planner then
- * leaves the statement alone.)
+ * True for a statement planned by a trigger of a foreign key, which must run on
+ * this node's rows only.
+ *
+ * How it is known (review finding S6-01).  ri_triggers.c plans and runs every
+ * one of its statements with the security restriction SECURITY_NOFORCE_RLS set
+ * (ri_PlanCheck and ri_PerformCheck, and the fast path of PostgreSQL 19), and
+ * nothing else does.  The restriction is a flag of the backend that C code sets:
+ * no SQL statement, function or SET command of a user can set it, so a user
+ * cannot make a statement of his own look like one, as he could with a rule
+ * about its text.  The statement must also have the shape above.  What remains
+ * is code that PostgreSQL itself runs inside such a statement: the default
+ * expression of a SET DEFAULT action, the check constraints of the referencing
+ * table, the equality operator of a key type.  A function of that kind that
+ * runs a statement of the shape above gets that one statement planned for this
+ * node's rows; the executor check of fo_executor_start still guards the
+ * reference tables, so it cannot write a copy that the others do not have.
+ *
+ * Why this node's rows are right.  A write to a reference table runs on every
+ * node (fo_executor_start refuses any other way), so every node fires the
+ * triggers of the foreign keys that point at the table, and each node's
+ * statement on a distributed referencing table sees the buckets this node owns:
+ * together the nodes see every row, once.  A check that finds a referencing row
+ * on any node fails the statement there, which fails the distributed
+ * transaction; an action (CASCADE, SET NULL, SET DEFAULT) changes the rows of
+ * every group, each node those of its own, in the same transaction.  A deferred
+ * check runs on each node when that node prepares.  The checks that the rows of
+ * a distributed table make against a reference table read this node's copy,
+ * which is complete.  The same holds for a key between two colocated
+ * distributed tables on the distribution column: the referencing row is in the
+ * bucket of the referenced one, which is on this node.
  */
 bool
-kingres_shard_in_refwrite_nested(const char *query_string)
+kingres_shard_in_ri_action(Query *parse)
 {
-	if (query_string == NULL || !is_ri_action(query_string))
-		return false;
-	if (refwrite_local_depth > 0)
-		return true;
-	return in_refwrite_fragment() &&
-		debug_query_string != NULL && strcmp(query_string, debug_query_string) != 0;
+	return InNoForceRLSOperation() && ri_shape_ok(parse);
 }
 
 /*
@@ -248,7 +314,12 @@ fo_executor_start(QueryDesc *queryDesc, int eflags)
 				if (rte->rtekind != RTE_RELATION)
 					continue;
 				dt = hash_search(cat->dist_tables, &rte->relid, HASH_FIND, NULL);
-				if (dt == NULL || !dt->is_reference)
+				if (dt == NULL)
+					continue;
+				if (!kingres_shard_session_forwarded())
+					kingres_shard_refuse_replica_role(dt->is_reference ? "a reference table" :
+													  "a distributed table");
+				if (!dt->is_reference)
 					continue;
 				if (kingres_shard_session_forwarded())
 					ereport(ERROR,
@@ -365,6 +436,8 @@ fo_begin_scan(CustomScanState *node, EState *estate, int eflags)
 		ereport(ERROR,
 				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
 				 errmsg("cannot execute a write statement in a read-only transaction")));
+	kingres_shard_refuse_replica_role(s->colocation_id == 0 ?
+									  "a reference table" : "a distributed table on several shard groups");
 
 	tupdesc = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
 	s->ncols = tupdesc->natts;

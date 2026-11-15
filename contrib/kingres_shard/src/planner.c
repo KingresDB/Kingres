@@ -1438,8 +1438,13 @@ planner_hook_body(Query *parse, const char *query_string,
 	/* A session that claims to be forwarded must prove it before anything runs. */
 	(void) kingres_shard_session_forwarded();
 
-	/* The local part of a fanned-out statement is planned for this node only. */
-	if (kingres_shard_in_fanout_local(query_string))
+	/*
+	 * The local part of a fanned-out statement, and a statement of a trigger of a
+	 * foreign key (S6-01), are planned for this node only.
+	 */
+	if (kingres_shard_in_fanout_local(query_string) ||
+		(kingres_shard_enable_routing && !creating_extension &&
+		 kingres_shard_in_ri_action(parse)))
 	{
 		/*
 		 * The partition list of the relcache must be as new as the catalog before the
@@ -1463,9 +1468,6 @@ planner_hook_body(Query *parse, const char *query_string,
 			}
 		return pass_through(parse, query_string, cursorOptions, boundParams);
 	}
-	/* The actions of a reference-table write (foreign keys) run on this node's copy only. */
-	if (kingres_shard_in_refwrite_nested(query_string))
-		return pass_through(parse, query_string, cursorOptions, boundParams);
 	/* The statements PostgreSQL runs for a propagated DDL work on this node's buckets. */
 	if (kingres_shard_in_authorized_ddl(query_string))
 		return pass_through(parse, query_string, cursorOptions, boundParams);

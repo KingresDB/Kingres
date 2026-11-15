@@ -6,8 +6,13 @@
 -- catalog that installing 0.5 gives, and keep the data of the catalog tables.
 SET search_path = public, pg_temp;
 -- A description of every object of the extension that the two paths could
--- make differ: columns, constraints, indexes, functions (with the digest of
--- their body), triggers, event triggers, comments and privileges.
+-- make differ: columns (with defaults, identity, generation, collation, storage and
+-- column privileges), constraints, indexes, views (with their definitions),
+-- relations (kind, persistence, owner, options), sequences (with their parameters),
+-- functions (with the digest of their body, owner and the objects they depend
+-- on), triggers, event triggers (with their tags and owner), policies, comments,
+-- privileges, the schema's owner and privileges, the configuration tables the
+-- extension dumps, and the members of the extension (review finding S6-10).
 CREATE FUNCTION public.upg_snapshot() RETURNS SETOF text
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -58,7 +63,60 @@ RETURN QUERY
     FROM pg_catalog.pg_depend d
    WHERE d.refclassid = 'pg_extension'::regclass
      AND d.refobjid = (SELECT oid FROM pg_catalog.pg_extension WHERE extname = 'kingres_shard')
-     AND d.deptype = 'e';
+     AND d.deptype = 'e'
+  UNION ALL
+  SELECT 'view ' || c.relname || ' ' || pg_catalog.pg_get_viewdef(c.oid, true)
+         || ' options=' || coalesce(c.reloptions::text, '-')
+    FROM pg_catalog.pg_class c
+   WHERE c.relnamespace = 'kingres'::regnamespace AND c.relkind = 'v'
+  UNION ALL
+  SELECT 'relation ' || c.relname || ' kind=' || c.relkind::text || ' persistence=' || c.relpersistence::text
+         || ' owner=' || c.relowner::regrole || ' options=' || coalesce(c.reloptions::text, '-')
+    FROM pg_catalog.pg_class c
+   WHERE c.relnamespace = 'kingres'::regnamespace AND c.relkind IN ('r', 'v', 'S', 'i')
+  UNION ALL
+  SELECT 'column details ' || c.relname || '.' || a.attname || ' identity=' || a.attidentity::text
+         || ' generated=' || a.attgenerated::text || ' collation=' || a.attcollation::regcollation
+         || ' storage=' || a.attstorage::text || ' acl=' || coalesce(a.attacl::text, '-')
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+   WHERE c.relnamespace = 'kingres'::regnamespace AND c.relkind IN ('r', 'v')
+  UNION ALL
+  SELECT 'sequence ' || s.seqrelid::regclass || ' type=' || s.seqtypid::regtype || ' start=' || s.seqstart
+         || ' increment=' || s.seqincrement || ' max=' || s.seqmax || ' min=' || s.seqmin
+         || ' cache=' || s.seqcache || ' cycle=' || s.seqcycle
+    FROM pg_catalog.pg_sequence s JOIN pg_catalog.pg_class c ON c.oid = s.seqrelid
+   WHERE c.relnamespace = 'kingres'::regnamespace
+  UNION ALL
+  SELECT 'policy ' || p.polrelid::regclass || ' ' || p.polname || ' cmd=' || p.polcmd::text
+         || ' permissive=' || p.polpermissive || ' roles=' || p.polroles::text
+         || ' using=' || coalesce(pg_catalog.pg_get_expr(p.polqual, p.polrelid), '-')
+         || ' check=' || coalesce(pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid), '-')
+    FROM pg_catalog.pg_policy p JOIN pg_catalog.pg_class c ON c.oid = p.polrelid
+   WHERE c.relnamespace = 'kingres'::regnamespace
+  UNION ALL
+  SELECT 'function owner ' || p.oid::regprocedure || ' ' || p.proowner::regrole
+    FROM pg_catalog.pg_proc p WHERE p.pronamespace = 'kingres'::regnamespace
+  UNION ALL
+  SELECT 'function depends ' || p.oid::regprocedure || ' -> '
+         || pg_catalog.pg_describe_object(d.refclassid, d.refobjid, d.refobjsubid) || ' ' || d.deptype::text
+    FROM pg_catalog.pg_depend d
+    JOIN pg_catalog.pg_proc p ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid
+   WHERE p.pronamespace = 'kingres'::regnamespace AND d.refclassid <> 'pg_extension'::regclass
+  UNION ALL
+  SELECT 'event trigger details ' || evtname || ' tags=' || coalesce(evttags::text, '-')
+         || ' owner=' || evtowner::regrole
+    FROM pg_catalog.pg_event_trigger WHERE evtfoid::regproc::text LIKE 'kingres.%'
+  UNION ALL
+  SELECT 'schema kingres owner=' || n.nspowner::regrole || ' acl=' || coalesce(n.nspacl::text, '-')
+    FROM pg_catalog.pg_namespace n WHERE n.nspname = 'kingres'
+  UNION ALL
+  SELECT 'type ' || t.typname || ' kind=' || t.typtype::text
+    FROM pg_catalog.pg_type t
+   WHERE t.typnamespace = 'kingres'::regnamespace AND t.typtype <> 'c' AND t.typcategory <> 'A'
+  UNION ALL
+  SELECT 'dumped configuration ' || coalesce(extconfig::regclass[]::text, '-') || ' ' || coalesce(extcondition::text, '-')
+    FROM pg_catalog.pg_extension WHERE extname = 'kingres_shard';
 END
 $$;
 -- Install 0.5 directly.
