@@ -15,6 +15,14 @@
 // since then it writes the fence marker (so that nothing starts the instance as
 // a primary without a lease) and stops the instance with an immediate shutdown.
 // It exits when the instance is no longer running or after the fence.
+//
+// The one exception is an orderly stop: kingresd -stop-instances asks the instance
+// for a fast shutdown and then writes the stand-down file, which names the
+// postmaster it asked (process id and start time, the first and third line of
+// postmaster.pid). From that moment PostgreSQL admits no new session and ends the
+// existing ones, so no write can be acknowledged after the lease ends, and the
+// watchdog exits instead of turning a slow clean shutdown into a crash. The file
+// names one postmaster, so a leftover of an earlier run does not apply to the next.
 package main
 
 import (
@@ -35,6 +43,7 @@ func main() {
 	pgctl := flag.String("pg-ctl", "", "path of pg_ctl")
 	marker := flag.String("marker", "", "fence marker file to create before stopping")
 	lock := flag.String("lock", "", "lock file: only one watchdog per instance runs")
+	standdown := flag.String("standdown", "", "file written by an orderly stop: the instance is shutting down on purpose")
 	poll := flag.Duration("poll", 250*time.Millisecond, "how often the lease file is read")
 	flag.Parse()
 	if *leaseFile == "" || *data == "" || *pgctl == "" || *marker == "" || *lock == "" {
@@ -50,6 +59,9 @@ func main() {
 	for {
 		if !running(*data) {
 			return // the instance is stopped: nothing left to watch
+		}
+		if stoodDown(*standdown, *data) {
+			return // an orderly fast shutdown is under way
 		}
 		if b, err := os.ReadFile(*leaseFile); err == nil {
 			var f struct {
@@ -78,6 +90,33 @@ func fence(marker, pgctl, data string) {
 	}
 	fmt.Fprintln(os.Stderr, "kingres-watchdog: the lease has run out, stopping the instance")
 	_ = exec.Command(pgctl, "stop", "-D", data, "-m", "immediate", "-w", "-t", "30").Run() //nolint:gosec // fixed program from a flag of kingresd
+}
+
+// stoodDown reports whether the stand-down file names the postmaster that runs now.
+func stoodDown(file, data string) bool {
+	if file == "" {
+		return false
+	}
+	b, err := os.ReadFile(file)
+	if err != nil {
+		return false
+	}
+	id := identity(data)
+	return id != "" && strings.TrimSpace(string(b)) == id
+}
+
+// identity is the process id and the start time of the postmaster: the first and
+// third line of postmaster.pid.
+func identity(data string) string {
+	b, err := os.ReadFile(filepath.Join(data, "postmaster.pid"))
+	if err != nil {
+		return ""
+	}
+	lines := strings.Split(string(b), "\n")
+	if len(lines) < 3 {
+		return ""
+	}
+	return strings.TrimSpace(lines[0]) + " " + strings.TrimSpace(lines[2])
 }
 
 // running reports whether the postmaster named in the data directory's pid file

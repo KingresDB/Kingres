@@ -262,7 +262,7 @@ func (s *Service) Resume(bg context.Context) error {
 			if errors.Is(err, instance.ErrLeaseRequired) {
 				// The instance fenced itself (lease lost) and may not run as a primary
 				// until the lease manager holds a lease again; it starts it then.
-				s.log.Warn("the local instance is not started: its group lease was lost; it starts when the lease is held again")
+				s.log.Warn("the local instance is not started: its group lease was lost or is not held yet; it starts when the lease is held")
 				s.publishDSN()
 				return nil
 			}
@@ -303,6 +303,28 @@ func (s *Service) StopInstance(ctx context.Context) error {
 		}
 	}
 	if err := s.mgr.Stop(ctx, NodeID); err != nil {
+		return err
+	}
+	return first
+}
+
+// StopInstanceForShutdown is StopInstance for the orderly stop of the service
+// (kingresd -stop-instances): the primary instance is asked for a fast shutdown
+// without waiting, requested is called with the identity of the postmaster that
+// was asked, and only then the stop is awaited (instance.Manager.StopForShutdown).
+func (s *Service) StopInstanceForShutdown(ctx context.Context, requested func(postmaster string)) error {
+	if !s.Enabled() || !s.mgr.Exists(NodeID) {
+		return nil
+	}
+	var first error
+	for _, id := range s.mgr.IDs() {
+		if id != NodeID {
+			if err := s.mgr.Stop(ctx, id); err != nil && first == nil {
+				first = err
+			}
+		}
+	}
+	if err := s.mgr.StopForShutdown(ctx, NodeID, requested); err != nil {
 		return err
 	}
 	return first

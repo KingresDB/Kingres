@@ -235,7 +235,7 @@ func (w *watchdogRunner) ensure() {
 	cmd := exec.CommandContext(context.Background(), bin, //nolint:gosec // our own program, arguments are paths of this server
 		"-lease-file", filepath.Join(w.instDir, "lease.json"), "-data", filepath.Join(w.instDir, "pgdata"),
 		"-pg-ctl", filepath.Join(binDir, "pg_ctl"), "-marker", filepath.Join(w.leaseDir, lease.FencedMarker),
-		"-lock", filepath.Join(w.leaseDir, "watchdog.lock"))
+		"-lock", filepath.Join(w.leaseDir, "watchdog.lock"), "-standdown", filepath.Join(w.leaseDir, lease.StandDownFile))
 	cmd.Stdout, cmd.Stderr = logf, logf
 	detach(cmd)
 	if err := cmd.Start(); err != nil {

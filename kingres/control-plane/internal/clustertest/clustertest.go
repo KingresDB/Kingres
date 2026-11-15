@@ -599,3 +599,41 @@ func (c *Cluster) joinRest(t testing.TB, from int) {
 		}
 	}
 }
+
+// StopInstances runs "kingresd -stop-instances" with the node's settings, as the
+// entry point of the container does after kingresd has exited, and returns its
+// error and output. The process of the node must be stopped before (Stop).
+func (n *Node) StopInstances() (string, error) {
+	n.t.Helper()
+	cmd := exec.CommandContext(context.Background(), os.Getenv("KINGRESD_BIN"), append(n.args(), "-stop-instances")...) //nolint:gosec // the binary under test
+	out, err := cmd.CombinedOutput()
+	if lf, ferr := os.OpenFile(n.LogFile, os.O_APPEND|os.O_WRONLY, 0o600); ferr == nil {
+		_, _ = lf.Write(out)
+		_ = lf.Close()
+	}
+	return string(out), err
+}
+
+// StopOrderly is the orderly stop of a server as the container's entry point does
+// it: kingresd gets SIGTERM and exits, and only then "kingresd -stop-instances"
+// shuts the instances down with a fast shutdown.
+func (n *Node) StopOrderly() {
+	n.t.Helper()
+	n.Stop()
+	if out, err := n.StopInstances(); err != nil {
+		n.t.Fatalf("kingresd -stop-instances of node %d: %v\n%s", n.Index, err, out)
+	}
+}
+
+// InstanceLogs returns the PostgreSQL log files of every instance of the node (the
+// primary and the standbys it runs), concatenated, with the file names.
+func (n *Node) InstanceLogs() string {
+	var sb strings.Builder
+	files, _ := filepath.Glob(filepath.Join(n.DataDir, "instances", "*", "pgdata", "log", "*"))
+	more, _ := filepath.Glob(filepath.Join(n.DataDir, "instances", "*", "pgdata", "kingres-startup.log"))
+	for _, f := range append(files, more...) {
+		b, _ := os.ReadFile(f)
+		fmt.Fprintf(&sb, "==== %s\n%s\n", strings.TrimPrefix(f, n.DataDir), b)
+	}
+	return sb.String()
+}

@@ -545,3 +545,62 @@ func (m *Manager) StopImmediate(ctx context.Context, id int) error {
 	}
 	return nil
 }
+
+// StopForShutdown is the orderly stop of the service: it asks the instance for a
+// fast shutdown without waiting (pg_ctl stop -W), then calls requested with the
+// identity of the postmaster that was asked (process id and start time, "" when
+// unknown), and only then waits until the instance is gone or the stop timeout
+// has passed. requested runs after PostgreSQL has accepted the request, which
+// ends all sessions and admits no new one, so a watchdog told to stand down at
+// that moment can no longer cost a write that was acknowledged. Stopping a
+// stopped instance is not an error and calls nothing.
+func (m *Manager) StopForShutdown(ctx context.Context, id int, requested func(postmaster string)) error {
+	if up, err := m.Running(ctx, id); err != nil || !up {
+		return err
+	}
+	data, _ := m.DataDir(id)
+	ident := postmasterIdentity(data)
+	out, err := m.run(ctx, "pg_ctl", "stop", "-D", data, "-m", "fast", "-W")
+	if err != nil {
+		if up, rerr := m.Running(ctx, id); rerr == nil && !up {
+			return nil // it ended between the check and the request
+		}
+		return fmt.Errorf("instance: pg_ctl stop: %w: %s", err, out)
+	}
+	if requested != nil {
+		requested(ident)
+	}
+	deadline := time.Now().Add(m.stopTO)
+	for {
+		up, err := m.Running(ctx, id)
+		if err != nil {
+			return err
+		}
+		if !up {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("instance: the instance did not shut down within %s", m.stopTO)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+// postmasterIdentity is the process id and the start time of the postmaster, the
+// first and third line of postmaster.pid ("" when unreadable); kingres-watchdog
+// reads the same two lines.
+func postmasterIdentity(data string) string {
+	b, err := os.ReadFile(filepath.Join(data, "postmaster.pid"))
+	if err != nil {
+		return ""
+	}
+	lines := strings.Split(string(b), "\n")
+	if len(lines) < 3 {
+		return ""
+	}
+	return strings.TrimSpace(lines[0]) + " " + strings.TrimSpace(lines[2])
+}

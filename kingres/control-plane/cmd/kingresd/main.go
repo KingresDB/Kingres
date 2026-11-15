@@ -138,7 +138,9 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	if err != nil {
 		return err
 	}
-	if found {
+	// The orderly stop checks nothing: every program it runs delays the request for the
+	// fast shutdown, after which the lease watchdog stands down (see lease.StandDown).
+	if found && !stopOnly {
 		vctx, vcancel := context.WithTimeout(ctx, 30*time.Second)
 		err := cluster.VerifyBinaries(vctx, binDir)
 		vcancel()
@@ -176,7 +178,27 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	if stopOnly {
 		sctx, scancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
 		defer scancel()
-		return svc.StopInstance(sctx)
+		// The watchdog is told to stand down once the fast shutdown was requested, never
+		// before; only this path does it (see lease.StandDown).
+		return svc.StopInstanceForShutdown(sctx, func(postmaster string) {
+			if err := lease.StandDown(filepath.Join(cfg.DataDir, leaseDirName), postmaster); err != nil {
+				log.Warn("telling the lease watchdog that the instance stops on purpose", "error", err)
+			}
+		})
+	}
+	if svc.Enabled() && svc.Manager().Exists(cluster.NodeID) {
+		// A primary that is not running at the start waits for its group lease before
+		// kingresd starts it, when the lease of the group is enforced; one that runs
+		// (kingresd was restarted) is left alone and judged after the first round.
+		up, rerr := svc.Manager().Running(ctx, cluster.NodeID)
+		if rerr != nil {
+			return fmt.Errorf("looking at the local instance: %w", rerr)
+		}
+		if wait, perr := lease.PrepareStart(filepath.Join(cfg.DataDir, leaseDirName), up); perr != nil {
+			return fmt.Errorf("preparing the lease directory: %w", perr)
+		} else if wait {
+			log.Info("the local instance is not running and the lease of its group is enforced: it starts once the lease is held")
+		}
 	}
 	dsn := cfg.PostgresDSN
 	if svc.Enabled() {

@@ -30,7 +30,9 @@ Push-Location $module
 try {
     if ($Packages.Count -eq 0) {
         # Every package that has test files.
-        $Packages = @(& go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' ./... | Where-Object { $_ })
+        # Listed for linux: the tests run there, and some packages have test files that only exist for it.
+        $env:GOOS = 'linux'
+        try { $Packages = @(& go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' ./... | Where-Object { $_ }) } finally { Remove-Item Env:GOOS -ErrorAction SilentlyContinue }
     }
     function ConvertTo-WslPath([string]$p) { $p = [IO.Path]::GetFullPath($p); return '/mnt/' + $p.Substring(0,1).ToLower() + $p.Substring(2).Replace([string][char]92, '/') }
     $stage = Join-Path ([IO.Path]::GetTempPath()) 'kingresd-wsl-tests'

@@ -11,6 +11,11 @@
 #   - when kingresd has exited (after a signal or by itself), it runs
 #     "kingresd -stop-instances", which shuts the instance down with a fast
 #     shutdown, and only then exits with kingresd's exit status.
+# kingresd no longer renews the group lease from its exit until the instance is
+# down, and a fast shutdown can take longer than the lease.  "-stop-instances"
+# therefore tells the lease watchdog (which outlives kingresd) to stand down as
+# soon as the shutdown has been requested; a kingresd that hangs or is killed
+# never does, so the watchdog still covers that case.
 # "docker stop" must therefore be given enough time (compose.yaml sets
 # stop_grace_period: 120s; with docker run use --stop-timeout 120).
 #

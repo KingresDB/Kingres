@@ -108,6 +108,15 @@ type Manager struct {
 	base   uint64 // distinguishes the sequence numbers of one process start from the next
 
 	op sync.Mutex // serializes fencing and starting the instance
+
+	// starting is set while the instance is being started after the lease was won;
+	// the start runs beside the renewal rounds, so that the lease is renewed while
+	// PostgreSQL starts or recovers. wg tracks it (tests wait on it).
+	starting bool
+	wg       sync.WaitGroup
+	// enf is what the lease manager last knew about which groups are enforced
+	// (loaded lazily from the lease directory, see recordEnforced).
+	enf map[int32]bool
 }
 
 const (
@@ -142,12 +151,20 @@ func New(c Config) (*Manager, error) {
 }
 
 // Gate is the start gate of the instance manager (instance.Manager.SetStartGate):
-// an instance whose lease was lost does not start until the manager holds a
-// lease again and removes the marker.
+// an instance whose lease was lost, or that waits for its lease since kingresd
+// started (the wait marker), does not start until the manager holds a lease and
+// removes the marker. A standby instance this server runs for another server's
+// group belongs to that group's lease, not to this one, and is never held back.
 func Gate(dir string) func(id int) error {
-	return func(int) error {
+	return func(id int) error {
+		if instance.IsStandbyDirID(id) {
+			return nil
+		}
 		if _, err := os.Stat(filepath.Join(dir, FencedMarker)); err == nil {
 			return fmt.Errorf("%w: the lease of the group was lost", instance.ErrLeaseRequired)
+		}
+		if waitMarkerExists(dir) {
+			return fmt.Errorf("%w: the lease of the group is not held yet", instance.ErrLeaseRequired)
 		}
 		return nil
 	}
@@ -262,18 +279,60 @@ func (m *Manager) round(ctx context.Context, group int32, members []string) {
 // acquired runs after a round that left a valid lease.
 func (m *Manager) acquired(ctx context.Context, group int32, wasLost bool) {
 	m.writeWatchdogFile(group)
+	enforced := m.c.Enforced(group)
+	m.recordEnforced(group, enforced)
+	m.mu.Lock()
+	if m.starting {
+		m.mu.Unlock()
+		return // the start that is under way finishes the work below
+	}
+	if Waiting(m.c.Dir) {
+		// The primary was fenced, or kingresd found it stopped at its start while the
+		// lease is enforced: the lease is held, so it may start. This runs beside the
+		// next rounds: a start with crash recovery can take longer than a lease.
+		m.starting = true
+		m.wg.Add(1)
+		m.mu.Unlock()
+		go func() {
+			defer m.wg.Done()
+			m.startPrimary(ctx, group, wasLost)
+		}()
+		return
+	}
+	m.mu.Unlock()
+	m.afterAcquired(ctx, group, wasLost)
+}
+
+// startPrimary removes the markers, starts the instance and finishes what
+// acquired does for a running one. A failed start puts the markers back, so that
+// nothing but this path starts the primary and the next round tries again.
+func (m *Manager) startPrimary(ctx context.Context, group int32, wasLost bool) {
+	defer func() { m.mu.Lock(); m.starting = false; m.mu.Unlock() }()
 	m.op.Lock()
-	defer m.op.Unlock()
-	marker := filepath.Join(m.c.Dir, FencedMarker)
-	if _, err := os.Stat(marker); err == nil {
-		// The primary was fenced: the lease is held again, so it may start.
-		_ = os.Remove(marker)
-		if err := m.c.Instance.Start(ctx); err != nil {
-			m.c.Log.Error("starting the primary after the lease was regained", "group", group, "error", err)
-			_ = pki.WriteFile(marker, []byte("fenced\n"), 0o600) // not started: stay fenced
-			return
+	marks := map[string]bool{}
+	for _, n := range []string{FencedMarker, WaitMarker} {
+		p := filepath.Join(m.c.Dir, n)
+		if _, err := os.Stat(p); err == nil {
+			marks[p] = true
+			_ = os.Remove(p)
 		}
 	}
+	if len(marks) > 0 {
+		if err := m.c.Instance.Start(ctx); err != nil {
+			m.c.Log.Error("starting the primary after the lease was won", "group", group, "error", err)
+			for p := range marks {
+				_ = pki.WriteFile(p, []byte("waiting for the group lease\n"), 0o600) // not started: stay held back
+			}
+			m.op.Unlock()
+			return
+		}
+		m.c.Log.Info("the group lease is held: the primary instance was started", "group", group)
+	}
+	m.op.Unlock()
+	m.afterAcquired(ctx, group, wasLost)
+}
+
+func (m *Manager) afterAcquired(ctx context.Context, group int32, wasLost bool) {
 	if wasLost {
 		m.c.Log.Warn("the group lease is held again", "group", group)
 		m.audit(ctx, AuditLeaseAcquired, group, "the lease was obtained again after it was lost")
@@ -296,6 +355,13 @@ func (m *Manager) Check(ctx context.Context) {
 	var expired []int32
 	for g, st := range m.groups {
 		if !st.roundDone || st.lost {
+			continue
+		}
+		if !st.have && waitMarkerExists(m.c.Dir) {
+			// This kingresd has not started the primary yet because it holds no
+			// lease: there is nothing to fence and nothing was lost, the lease is
+			// simply not held yet (state "none"). The first round that wins it starts
+			// the instance.
 			continue
 		}
 		if !st.have || m.c.Clock.Mono() >= st.validUntil-m.c.Margin {
@@ -328,6 +394,11 @@ func (m *Manager) Fence(ctx context.Context, group int32) error {
 	defer m.op.Unlock()
 	if err := pki.WriteFile(filepath.Join(m.c.Dir, FencedMarker), []byte("fenced\n"), 0o600); err != nil {
 		return fmt.Errorf("writing the fence marker: %w", err)
+	}
+	if up, err := m.c.Instance.Running(ctx); err == nil && !up {
+		// Nothing runs that could be stopped: the marker keeps it from starting
+		// without a lease, and no stop is claimed in the audit log.
+		return nil
 	}
 	// The stop must not be cut short by the caller's context: a fence that
 	// does not happen is the failure the whole protocol exists to prevent.
@@ -370,6 +441,7 @@ func (m *Manager) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			<-done
+			m.wg.Wait()
 			return
 		case <-t.C:
 		}

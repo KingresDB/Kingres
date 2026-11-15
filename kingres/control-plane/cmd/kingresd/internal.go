@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -150,10 +149,11 @@ func serveInternal(ctx context.Context, d internalDeps) {
 		Handle:    handleCall(d),
 		Bootstrap: d.receiver.Bootstrap,
 		Joining:   d.svc.Joining,
-		// An instance held back until its group lease is won (the fence marker) cannot read the
-		// catalog: its callers get 503 service_unavailable and wait, not 403 not_leader.
+		// An instance held back until its group lease is won (the fence marker, or the wait marker
+		// of an instance that was not running when kingresd started) cannot read the catalog: its
+		// callers get 503 service_unavailable and wait, not 403 not_leader.
 		Unavailable: func() bool {
-			if _, err := os.Stat(filepath.Join(d.dataDir, leaseDirName, lease.FencedMarker)); err == nil {
+			if lease.Waiting(filepath.Join(d.dataDir, leaseDirName)) {
 				return true
 			}
 			// The instance is not (yet) running: right after the lease was won it is starting.

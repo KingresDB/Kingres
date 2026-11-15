@@ -330,6 +330,7 @@ func TestLeaseRegainedStartsTheFencedPrimaryAndClearsTheMarker(t *testing.T) {
 	r.voter.down["b"], r.voter.down["c"] = false, false
 	r.clk.Advance(margin + time.Second) // the old lease is over everywhere
 	r.m.Renew(ctx)
+	r.m.wg.Wait() // the start runs beside the rounds
 	if up, _, starts := r.inst.state(); !up || starts != 1 {
 		t.Fatal("the primary must start again once the lease is held")
 	}

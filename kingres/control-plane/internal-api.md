@@ -297,7 +297,9 @@ lease). The call is refused while the server is not clustered (`409`/`not_availa
 
 `grants` are the leases this server granted (remaining time, margin not included); `leases` merges the leases this server
 holds or lost (`state` `held`, `lost`) with the ones it granted to others (`granted`). `enforced` tells whether losing
-the lease stops the instance.
+the lease stops the instance. `state` `none` is a group whose lease this server has not held yet in this run, for example
+while its primary instance waits to be started until the lease is held (the wait marker, README "Decisions (leases)" 7):
+nothing was lost, so no `leaseLost` event or alert exists for it.
 
 Fault hook (tests only, `fault-dir`): a call from a server listed in `blockInbound` is dropped without an answer after
 its certificate was verified, and a call to a server listed in `blockOutbound` fails as unreachable, before the network
@@ -334,7 +336,7 @@ An unknown leader is asked for again (three times, 200 ms apart) before a leader
 
 ### A server that waits for its lease
 
-A server whose instance is held back until its group lease is won (the fence marker `<data-dir>/lease/fenced` exists, or its instance is not running) cannot read the catalog and knows no leader. Every call that needs the leader (`LeaderOnly`, `LeaderOrJoining`, `ToLeader`) is then answered `503` with the code `service_unavailable` and `Retry-After: 2`, never `403 not_leader` (which means "the caller is not the leader"). The caller treats it as transient: a task step retries with a pause growing from 1 s to 8 s for up to 5 minutes and then fails naming the server; other callers get the 503. The REST sign-in on that server answers `503 service_unavailable` with `Retry-After: 5` in the same window.
+A server whose instance is held back until its group lease is won (the fence marker `<data-dir>/lease/fenced` or the wait marker `<data-dir>/lease/waitlease` exists, or its instance is not running) cannot read the catalog and knows no leader. Every call that needs the leader (`LeaderOnly`, `LeaderOrJoining`, `ToLeader`) is then answered `503` with the code `service_unavailable` and `Retry-After: 2`, never `403 not_leader` (which means "the caller is not the leader"). The caller treats it as transient: a task step retries with a pause growing from 1 s to 8 s for up to 5 minutes and then fails naming the server; other callers get the 503. The REST sign-in on that server answers `503 service_unavailable` with `Retry-After: 5` in the same window.
 
 ## Errors
 

@@ -1835,7 +1835,7 @@ What exists (design `ha-phase5.md`, "Fencing by lease"; code in `internal/lease`
   it writes the **fence marker** `<data-dir>/lease/fenced`, then stops the instance with `pg_ctl stop -m immediate`
   (no checkpoint, no waiting for clients), and audits `leaseLost` and `leaseFenced`. While the marker exists the instance
   manager's start gate refuses to start the instance (`instance.ErrLeaseRequired`: the instance start operations fail,
-  the start at kingresd's own start is skipped with a warning). The next successful round removes the marker, starts
+  the start at kingresd's own start is skipped with a warning; decision 7 adds the wait marker for a cold start). The next successful round removes the marker, starts
   the instance and audits `leaseAcquired`. The marker is on disk, so a restart of kingresd or of the machine does not
   start the primary without a lease either.
 - **Enforcement rule (decided).** Self-fencing is enforced only for a group that has at least one standby (the standby
@@ -1902,6 +1902,51 @@ is paused the watchdog does its job. A step of the system clock does not matter 
    After a restart the persisted duration is assumed to start now, which is never earlier than the truth.
 5. The lease views are **this server's knowledge**, not a gathered cluster view.
 6. The watchdog is started **next to** the instance by kingresd (see the departures).
+7. **A primary whose lease is enforced is not started by kingresd before kingresd holds the lease.** At its start
+   kingresd finds the instance either running (it was restarted, the database kept running: rule 2 applies, nothing is
+   judged before the first round and a healthy primary is not stopped) or not running (the orderly stop of the whole
+   cluster, a reboot, a crash). In the second case, when the lease of the group is enforced, kingresd writes the
+   **wait marker** `<data-dir>/lease/waitlease` and does not start the instance; the start gate (decision 1) refuses it
+   like it refuses a fenced one. The first renewal round that wins a majority removes the marker and starts the instance
+   (once; the start runs beside the next rounds, so the lease is renewed while PostgreSQL starts or recovers). Whether a
+   group is enforced must be known without the database (the map group's server cannot read the catalog before its
+   instance runs), so the lease manager records what it last knew in `<data-dir>/lease/enforced.json` (`{"groups":[2]}`, next
+   to `topology.json`), rewritten whenever a successful round finds the answer changed; no record means not enforced, and
+   a group that is not enforced starts at once as before. The wait marker is **not** an operator's stop: that one lives in
+   memory, writes no marker, and an instance stopped through `stopThisServerInstance` stays stopped when a lease is
+   acquired (only the fence marker and the wait marker make the lease manager start anything). `kingresd -stop-instances`
+   (the orderly stop of the service) leaves exactly the state "not running"; the next start of kingresd turns it into the
+   wait marker, so "start it at the next start of kingresd, once the lease is held" needs no write by the stop (and a
+   running kingresd, which `ExecStop` of the unit leaves alive meanwhile, never restarts what was stopped). While the
+   instance waits: the first round that fails fences nothing and writes no audit event (`leaseLost`, `leaseFenced`), the
+   alert `leaseLost` is not raised (a group that never held the lease in this run is judged only once it has held it),
+   the lease shows as `none` in `GET /internal/v1/lease/state` (and in `ShardGroup.lease` of any server that can answer: the
+   waiting server itself cannot read its catalog, so its REST calls answer 503 as for a held-back server, decision 12
+   of the cluster section), and a failed start puts the marker back and is tried again by the next round. A standby
+   instance that this server runs for another group is never held back by these markers (it follows its own primary's
+   lease, not this server's). Tests: `internal/lease` (`TestColdStartWithoutAMajorityStartsNothingAndFencesNothing` and the
+   four after it, fake clock) and `internal/clustertest/coldstart_test.go` (`TestRestartsOfServersDoNotCrashOrFenceAnInstance`:
+   three servers with standbys, kingresd alone restarted, one whole server stopped and started, and all three stopped
+   together and started one by one with a pause between; the PostgreSQL logs have no `immediate shutdown request` and
+   no `automatic recovery in progress`, every primary runs and holds its lease, a write through each succeeds, the audit
+   logs have no `leaseFenced`).
+8. **An orderly stop tells the watchdog to stand down.** The container's entry point stops kingresd first (no more
+   renewals) and only then runs `kingresd -stop-instances`; a fast shutdown can last longer than the lease (a slow
+   checkpoint, a backend that does not end, a walsender that must send its WAL), and the watchdog, which outlives
+   kingresd, then stopped the instance with an immediate shutdown in the middle of the clean stop (measured by
+   `TestOrderlyStopOutlastingTheLeaseIsNotFencedByTheWatchdog`: a stopped backend keeps the shutdown waiting for 12 s with
+   a lease of 6 s; the watchdog fenced after about 4 s). `-stop-instances` therefore asks the primary instance for the fast
+   shutdown without waiting (`pg_ctl stop -m fast -W`), and **after** PostgreSQL has accepted the request writes
+   `<data-dir>/lease/standdown` with the process id and start time of that postmaster (lines 1 and 3 of `postmaster.pid`),
+   and only then waits. From the request on PostgreSQL admits no new session and ends the existing ones, so no write can
+   be acknowledged after the lease ends. The watchdog exits when the file names the postmaster that runs now; a file of
+   an earlier run names another one and is ignored. Only the `-stop-instances` path writes it, so a hung or killed
+   kingresd, or a crash of the instance, is still covered by the watchdog. Residual window: from the exit of kingresd to
+   the request, which is the start of a process that checks nothing (the check of the PostgreSQL programs is skipped in
+   this mode); the lease still has `lease-duration - lease-margin` minus one renewal interval then (5 s with the defaults).
+   The unit of the package (`ExecStop` while kingresd still runs) has no such window, because kingresd renews the lease during
+   the stop; it stays `ExecStop` (an `ExecStopPost` would also run when kingresd alone is restarted) and got a comment.
+   Test of the stand-down in the watchdog: `cmd/kingres-watchdog` (a fake `pg_ctl`: fences without the file, stands down with it, ignores a stale one).
 
 Limits: a lease-based fence cannot stop a primary on a machine that is frozen as a whole and then resumed with the same
 processes in the middle of a write that was already acknowledged to the kernel; and the guarantee needs `M` larger

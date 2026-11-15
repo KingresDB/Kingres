@@ -38,6 +38,11 @@ EnvironmentFile=-/etc/kingres/kingresd.env
 Environment=PATH=/opt/kingres/bin:/usr/bin:/bin
 ExecStart=/opt/kingres/bin/kingresd -config /etc/kingres/kingresd.json
 ExecStop=/opt/kingres/bin/kingresd -config /etc/kingres/kingresd.json -stop-instances
+# ExecStop runs while kingresd still runs, so the group lease is renewed during the
+# fast shutdown and the lease watchdog has nothing to decide; the stop also tells the
+# watchdog to stand down once the shutdown was requested.  It must not become
+# ExecStopPost: that runs after every exit of kingresd, also the one before the
+# restart of the manager alone, which must leave the database running.
 # Only the main process is signalled: the database must not be killed with the
 # manager.  ExecStop has already stopped it when the unit is stopped for real.
 KillMode=process
