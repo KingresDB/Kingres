@@ -7,6 +7,205 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-15: One source for PostgreSQL 18 and 19 and two product branches, kingres_shard 0.4 and 0.5, three new extensions, high availability part 1, configuration from the console, AGPL
+
+### What was done
+
+- **One extension source for two majors**
+  ([ADR 0023](adr/0023-one-extension-source-for-several-majors.md), commit
+  b8eb415622). Every extension builds and passes its tests on PostgreSQL
+  18 and 19 from one source; the differences between the majors live in
+  one header per extension (`src/pg_compat.h`). A cluster runs one major.
+  `kingres_ledger` was ported first (44829f5239), then `kingres_shard`
+  (ad01f76b4c); the three new extensions were written that way from the
+  start.
+- **Two product branches** ([dev/releases.md](dev/releases.md), commits
+  5a57634b47, 72b12937c2, 9a469b9406): `kingres-18` on `REL_18_7`, where
+  development happens, and `kingres-19` on `REL_19_RC2`, which is the
+  upstream tag, the core patches and one "sync from kingres-18" commit per
+  synchronisation, so that the KingresDB directories of the two branches
+  are byte-identical. Both are published. Releases will be named
+  `kingres-<version>-pg18` and `kingres-<version>-pg19`.
+- **`kingres_shard` 0.4** (e5f411f899): the fix round for the reviews of
+  0.2 and 0.3 (S3-01 to S3-18, S4-01 to S4-10). Later versions moved up by
+  one (06caffea3e). Its independent review
+  ([reviews/2026-11-15-kingres-shard-0.4.md](reviews/2026-11-15-kingres-shard-0.4.md),
+  dc4278c15d, findings S5) was answered together with the port to
+  PostgreSQL 19 (ad01f76b4c); the review of the port
+  ([reviews/2026-11-15-kingres-shard-0.4-port.md](reviews/2026-11-15-kingres-shard-0.4-port.md),
+  ee6f9fc4b0, findings S6-01 to S6-10) was answered in 775fd89904, which
+  also lets the extensions be created in any order (an extension that
+  finds the schema `kingres` already made by another no longer fails).
+- **`kingres_shard` 0.5** (b52b712559): the part of phase 5 that belongs
+  to the extension. Standby nodes in the catalog, `kingres.promote_node`,
+  prepared transactions that survive a failover (the name of a prepared
+  transaction carries the group, the timeline, the backend and the
+  target), distributed deadlock detection, `kingres.create_restore_point`.
+  Its independent review
+  ([reviews/2026-11-15-kingres-shard-0.5.md](reviews/2026-11-15-kingres-shard-0.5.md),
+  7da9474be9) has ten findings, S7-01 to S7-10: one critical (the second
+  phase of a commit is sent after a cancelled wait for the synchronous
+  standby) and six high. The README says that failover is not to be
+  relied on yet.
+- **`kingres_sketch` 1.0 and `kingres_timepart` 0.1** (346be75abd), the
+  parts of phase 12 that depend on nothing else: approximate distinct
+  count, top-n and approximate percentiles as types with aggregates that
+  support partial aggregation; creation of time partitions ahead of time
+  and retention for ordinary partitioned tables. Their review
+  ([reviews/2026-11-15-phase12-extensions.md](reviews/2026-11-15-phase12-extensions.md),
+  findings K12-01 to K12-17) was answered in 2594f79e89 and 41ff7f3dac.
+- **`kingres_columnar` 0.1** (d305dbb9fe): columnar storage as a table
+  access method, with compression, skipping by minimum and maximum, and a
+  custom scan that reads only the columns a query needs. Two independent
+  reviews:
+  [the first](reviews/2026-11-15-kingres-columnar-0.1.md) (9be51af166,
+  C1-01 to C1-14) was answered in ca5dd5232e, which changed the on-disk
+  format; [the second](reviews/2026-11-15-kingres-columnar-0.1-fixes.md)
+  (73f088ead4) confirmed those fixes and has nine new findings, C2-01 to
+  C2-09, one of them critical (under SERIALIZABLE a write that a
+  concurrent reader cannot see is not detected as a conflict). The README
+  warns against real use.
+- **High availability, part 1, in `kingresd`** (6786e87540, contract
+  0.7.0): heartbeats and liveness of servers, leases with self-fencing
+  (enforced only in a group that has a standby), the watchdog
+  `kingres-watchdog`, creation and supervision of standbys, the client
+  entry point. Two defects found by the three-node package test were
+  fixed in 684050a53b: a primary started before it held its lease and was
+  stopped by its own fence at the first failed renewal (it now waits for
+  the lease at a cold start), and an orderly stop of all instances could
+  be taken for a lost lease (the stop now stands the watchdog down).
+  Failover and switchover themselves are not written.
+- **Phase 13, configuration from the console** (design 0f7706c00b,
+  implementation 621cdc6ae1, contract 0.8.0 with 82 paths and 100
+  operations): the settings of PostgreSQL and the time zone, read and
+  changed for the whole cluster, a server group or one server, with a
+  preview, a history, reverting a change, and a restart of the instances
+  that wait for one. `kingresd` writes the settings it manages into a file
+  of its own that the instance includes.
+- **Web console**: the top bar is one black row in both themes, chart
+  legends, aligned form rows, a footer on every page with the copyright,
+  the link to the project site, the licence and a link to the source of
+  the running version, the horizontal logo on the sign-in page
+  (c893ffc7e9 and later); the pages of contract 0.7.0 (85fcafdeaa) and
+  the configuration page of 0.8.0 (621cdc6ae1).
+- **Packaging** (91c4e8487b, 51fcbabef7, 0a786db179, e7dc513969): the
+  watchdog is shipped; the image, the compose file and the Debian package
+  are built for either major (`kingres_<version>+pg18-<rev>_amd64.deb`,
+  `kingres:<version>-pg18`, and the same for 19); the package of one major
+  refuses to install over the data of the other; the licence metadata
+  says AGPL-3.0-only.
+- **Licence** ([ADR 0024](adr/0024-agpl-for-kingresdb-code.md),
+  ab35bf4cd9): KingresDB's own code is `AGPL-3.0-only`; the code of
+  PostgreSQL keeps the PostgreSQL License; the two files that adapt
+  PostgreSQL code say `AGPL-3.0-only AND PostgreSQL`. Every file of
+  KingresDB carries the identifier. ADR 0004 is superseded in its choice
+  of licence.
+- **Roadmap** (47fed7291d): the first release is every phase except
+  phase 8 (several map groups and geo-distribution), which moves to the
+  future roadmap. Nothing is tagged before all of them are finished. The
+  design of phase 2b was revised against `kingres_shard` 0.4 (31359ca7d5).
+
+### How it was verified
+
+Run by the integrator on the tree that was committed, not taken from the
+reports of the authors, unless it says otherwise.
+
+- `kingres_shard` at 775fd89904: out of tree on PostgreSQL 18.7, 12
+  regression tests and 60 TAP files with 6610 tests; on 19rc2, the same 12
+  and 60 files with 6716 tests; no compiler warning with `-Werror` on
+  either; in the tree on 18, 75 of 75 suites. No test of the version of
+  the server outside the compatibility header.
+- The branch `kingres-19` after the synchronisation at 775fd89904: built
+  in the tree with no warning; the suites of the five extensions, 95
+  passed and one skipped (`t/046_two_majors`, which runs only when both
+  installations are named).
+- `kingres_ledger`: 281 subtests on 18 and 280 on 19. `kingres_sketch`:
+  339 subtests on 19. `kingres_timepart`: 105 on 19. Each also in the tree
+  on 18.
+- `kingres_columnar` at ca5dd5232e: on 19rc2 out of tree, 11 regression
+  tests and 8 TAP files with 993 tests; in the tree on 18 twice, 12 of 12
+  suites.
+- `kingresd` at 621cdc6ae1: build for Windows and Linux, `go vet`,
+  `gofmt`, unit tests; the integration run against real instances of
+  PostgreSQL 18: 40 test binaries, 594 top-level tests, no failure, none
+  skipped; the three-server smoke script, 20 of 20 steps. The contract
+  checker passes on 0.8.0.
+- Web console at 621cdc6ae1: type check, lint, 998 unit tests (passed
+  twice at normal load; one to three tests that poll failed in three runs
+  while the machine was saturated by other work), 43 browser tests,
+  production build, generated-API and brand checks, and the end-to-end run
+  against a real `kingresd`, 50 of 50 steps.
+- Packaging at ca5dd5232e on PostgreSQL 18: the image test, 129 passed and
+  one known failure; the compose test of three nodes, 162 passed; the
+  Debian package, 202 passed and one known failure, `lintian` without an
+  error. The check that the package of the other major is refused was run
+  by its author only, and so were all package tests on PostgreSQL 19.
+- The reviews ran on an export of the committed tree, by a reviewer who
+  had not seen the work; what each could not cover is listed at the end of
+  its report.
+
+### Needs-verification items
+
+- "PostgreSQL 19 is released on 2026-11-19": the date is the announced
+  one; `kingres-19` stays on `REL_19_RC2` until the tag `REL_19_0` exists.
+- The statements the new design documents label as unchecked stay
+  unchecked.
+
+### Decisions and deviations
+
+- [ADR 0023](adr/0023-one-extension-source-for-several-majors.md) and
+  [ADR 0024](adr/0024-agpl-for-kingresdb-code.md), both at the request of
+  the project owner.
+- **No check runs on GitHub.** GitHub Actions is switched off for the
+  repository and no workflow of KingresDB is published; every check runs
+  on the developer's machine ([dev/releases.md](dev/releases.md)). This
+  replaces the open item "CI workflow" of the earlier entries.
+- **No tag before the first beta**, and no tag of upstream PostgreSQL is
+  pushed to the repository of KingresDB.
+- **Version numbers of `kingres_shard`**: 0.4 is the fix round, 0.5 the
+  high-availability part, 0.6 phase 2b, 0.7 to 0.9 phases 9 to 11. The
+  design documents written before this still show the older numbers; the
+  version paragraph of [architecture.md](architecture.md) is the
+  reference.
+- **Order of work**, set by the project owner: phases 5 and 4 are
+  finished first, then phase 2b, then phases 9, 10, 11, the rest of 12 and
+  13, then phase 7.
+- A lease is enforced only in a group that has a standby, as decided in
+  the previous entry; it is implemented that way.
+
+### Still open
+
+- `kingres_shard` 0.5: the findings S7-01 to S7-10. A fix round is in
+  progress and is not committed. The fixes of S6 were not reviewed again.
+- `kingres_columnar`: the findings C2-01 to C2-09. A fix round is in
+  progress and is not committed.
+- `kingres_sketch` and `kingres_timepart`: the fix rounds of K12 were not
+  reviewed again.
+- `kingresd`: failover, switchover and `restorePreferredPrimaries` are
+  not written; the six rebalance operations are in progress and are not
+  committed. `kingresd` accepts only the binaries of PostgreSQL 18
+  (`VerifyBinaries`), so the integration suite was never run on
+  PostgreSQL 19 and the package tests fail there.
+- Phase 2b, phases 9, 10 and 11, the rest of phase 12 (repartitioned
+  joins, `MERGE`, columnar storage for distributed tables, time
+  partitioning for distributed tables and its scheduler, pushdown of
+  sketches) and phase 7 are not started.
+- The contract and control-plane defects listed under "Still open" of the
+  previous entry are part of the rebalance work in progress.
+- `kingres-19` must be moved to `REL_19_0` when upstream tags it; that
+  push changes an upstream workflow file and needs a credential with the
+  permission for it.
+
+### Core patches
+
+KP-0003 (`contrib/meson.build`, now five `subdir` lines: columnar,
+ledger, shard, sketch, timepart) and KP-0004 (`LICENSE`, a new file at
+the top of the tree with the text of the GNU Affero General Public
+License, version 3; the `COPYRIGHT` file of PostgreSQL is not changed).
+Register: [dev/core-patches.md](dev/core-patches.md).
+
+---
+
 ## 2026-11-15: Contract 0.6.0, the fix round of the second kingresd review, the panel through 0.6.0, kingres_shard 0.3 and its review, phases 9 to 12 added to the roadmap
 
 ### What was done
