@@ -14,7 +14,7 @@ KingresDB is a thin fork of PostgreSQL 18 that adds three things:
 - **A tamper-evident ledger.** Ledger tables keep a hash chain and Merkle blocks, so changes to history can be detected, with digests that can be anchored outside the database (`kingres_ledger`).
 - **An admin panel.** Every node serves a web panel and a REST API for creating or joining a cluster, managing databases, users, servers, rebalance and failover. The pattern follows the Couchbase cluster manager.
 
-The product is built on PostgreSQL 18. One source of every extension is meant to build for each supported PostgreSQL major ([ADR 0023](docs/adr/0023-one-extension-source-for-several-majors.md)); the port to 19 is in progress.
+KingresDB is released for PostgreSQL 18 and for PostgreSQL 19 from one source: every extension builds and passes its tests on both majors ([ADR 0023](docs/adr/0023-one-extension-source-for-several-majors.md)). The control plane and the packaging have not been checked on 19 yet.
 
 KingresDB is derived from PostgreSQL. It is not PostgreSQL, and it is not endorsed by the PostgreSQL project. The name "KingresDB" deliberately avoids the PostgreSQL marks; see the trademark section of the architecture document.
 
@@ -22,7 +22,7 @@ The design is in [docs/architecture.md](docs/architecture.md). It separates sour
 
 ## Status
 
-The base is upstream tag `REL_18_7`, on the branch `kingres-18`. State on 2026-11-15, by phase of the roadmap in [docs/architecture.md](docs/architecture.md):
+There is one product branch per PostgreSQL major, with the same KingresDB code on each: `kingres-18` on upstream tag `REL_18_7`, and `kingres-19` on `REL_19_RC2` (a pre-release until PostgreSQL 19 is released); see [docs/dev/releases.md](docs/dev/releases.md). State on 2026-11-15, by phase of the roadmap in [docs/architecture.md](docs/architecture.md):
 
 | Phase | State |
 |---|---|

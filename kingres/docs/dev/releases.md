@@ -45,7 +45,8 @@ A cluster runs one major: all its servers are installed from the same branch. Mo
 
 ## State on 2026-11-15
 
-- `kingres-18` exists and is the only branch that is published.
-- `kingres-19` does not exist yet. Upstream has `REL_19_RC2`; the general release of PostgreSQL 19 is scheduled for 2026-11-19. The branch is created on the release candidate as soon as `kingres_shard` builds and passes on 19 (its port is in progress; `kingres_ledger`, `kingres_sketch` and `kingres_timepart` already do), and moves to `REL_19_0` when that tag exists.
-- Not verified yet for 19: the control plane's integration suite against PostgreSQL 19 instances, and the packaging. The packaging builds one major today and names its artifacts without the major.
-- No release has been tagged.
+- `kingres-18` is on `REL_18_7` and is the default branch.
+- `kingres-19` exists since 2026-11-15, on `REL_19_RC2`: upstream has no final release of PostgreSQL 19 yet (it is scheduled for 2026-11-19). Until the branch is on `REL_19_0` it is a pre-release and nothing is tagged from it. It consists of the upstream tag, one commit with the three core patches (they applied without a change to their content), and sync commits.
+- Checked on `kingres-19` at the sync from `28d79ad3c2`, on the tree exactly as committed: the whole tree builds with assertions enabled and without a compiler warning; the core regression suite passes (243 tests); the suites of the four extensions pass in tree (73 suites, and the test that needs an installation of the other major skips). Out of tree, every extension passes on 18.7 and on 19rc2 with `-Werror`; `kingres_shard` runs 47 TAP files with 5847 subtests on each.
+- Not checked on 19 yet: the control plane's integration suite against PostgreSQL 19 instances, and the packaging. The packaging builds one major today and names its artifacts without the major, so there is no package or image for 19.
+- No release has been tagged on either branch.
