@@ -2,23 +2,86 @@ Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: KingresDB
 Upstream-Contact: Mohammad Rasoul Kazemi (RooyeKhat) <rooyekhat.media@gmail.com>
 Source: https://github.com/KingresDB/Kingres
+Comment: KingresDB is derived from PostgreSQL, and two licences apply, each to
+ its own part (see kingres/COPYRIGHT in the source).  PostgreSQL's files stay
+ under the PostgreSQL License.  KingresDB's own code, which is everything that
+ the project wrote itself (kingresd and its console, kingres-watchdog,
+ kingres-verify, the extensions kingres_columnar, kingres_ledger, kingres_shard,
+ kingres_sketch and kingres_timepart, and the scripts and the files of this
+ package), is under the GNU Affero General Public License, version 3 only.
+ The text of that licence is in /usr/share/doc/kingres/AGPL-3.0.txt.
+ The source of this package is the repository named above, at the commit in
+ /opt/kingres/share/BUILD-INFO.
 
 Files: *
 Copyright: 1996-2026, PostgreSQL Global Development Group
            1994, The Regents of the University of California
-           2026, RooyeKhat Media Co
 License: PostgreSQL
 
-Files: opt/kingres/bin/kingresd opt/kingres/bin/kingres-verify
+Files: opt/kingres/bin/kingres-watchdog
+       opt/kingres/lib/postgresql/kingres_columnar.so
+       opt/kingres/lib/postgresql/kingres_ledger.so
+       opt/kingres/lib/postgresql/kingres_sketch.so
+       opt/kingres/share/postgresql/extension/kingres_*
+       opt/kingres/share/BUILD-INFO
+       etc/kingres/*
+       usr/lib/systemd/system/kingres.service
+       usr/share/doc/kingres/README.Debian
+       usr/share/doc/kingres/DEPENDENCIES.*
+       usr/share/man/man1/kingres-*
+       usr/share/man/man8/kingresd.8.gz
+       usr/share/lintian/overrides/kingres
 Copyright: 2026, RooyeKhat Media Co
-           Go standard library and modules compiled into the programs; their
-           names, versions and licences are listed in
-           /usr/share/doc/kingres/DEPENDENCIES.control-plane.md and
-           /usr/share/doc/kingres/DEPENDENCIES.web.md (the web panel is part of
-           kingresd).
-License: PostgreSQL
-Comment: The compiled-in third-party modules are under permissive licences
- (MIT, BSD, Apache-2.0, ISC); see the dependency lists above.
+License: AGPL-3.0-only
+
+Files: opt/kingres/lib/postgresql/kingres_shard.so
+Copyright: 2026, RooyeKhat Media Co
+           1996-2026, PostgreSQL Global Development Group
+           1994, The Regents of the University of California
+License: AGPL-3.0-only and PostgreSQL
+Comment: One file of this extension (src/shippable.c) contains code adapted
+ from PostgreSQL and carries both licences.  Every other file of the extension
+ is under the AGPL only.
+
+Files: opt/kingres/bin/kingresd
+       opt/kingres/bin/kingres-verify
+Copyright: 2026, RooyeKhat Media Co
+           The Go Authors, and the authors of the Go modules and of the npm
+           packages that are compiled into the programs
+License: AGPL-3.0-only and Expat and BSD-3-Clause
+Comment: kingresd contains the web console (its npm packages are bundled in
+ the program) and kingres-verify is a separate Go program.  The third-party
+ Go modules and npm packages are under permissive licences that can be
+ combined with the AGPL (MIT, BSD, Apache-2.0 and ISC); their names, versions
+ and licences are listed in
+ /usr/share/doc/kingres/DEPENDENCIES.control-plane.md and
+ /usr/share/doc/kingres/DEPENDENCIES.web.md.  Expat and BSD-3-Clause below
+ stand for the MIT and BSD licences of those, quoted once.
+
+Files: usr/share/doc/kingres/AGPL-3.0.txt
+Copyright: 2007, Free Software Foundation, Inc.
+License: GNU-licence-text
+ Everyone is permitted to copy and distribute verbatim copies of this
+ licence document, but changing it is not allowed.
+
+License: AGPL-3.0-only
+ This program is free software: you can redistribute it and/or modify
+ it under the terms of the GNU Affero General Public License as
+ published by the Free Software Foundation, version 3 of the License.
+ .
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU Affero General Public License for more details.
+ .
+ You should have received a copy of the GNU Affero General Public
+ License along with this program.  If not, see
+ <https://www.gnu.org/licenses/>.
+ .
+ On Debian and Ubuntu systems /usr/share/common-licenses has no file for this
+ licence (it has the GPL and LGPL only), so the complete text of the GNU
+ Affero General Public License, version 3, is in
+ /usr/share/doc/kingres/AGPL-3.0.txt.
 
 License: PostgreSQL
  Permission to use, copy, modify, and distribute this software and its
@@ -37,3 +100,49 @@ License: PostgreSQL
  AND FITNESS FOR A PARTICULAR PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS
  ON AN "AS IS" BASIS, AND THE UNIVERSITY OF CALIFORNIA HAS NO OBLIGATIONS TO
  PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
+
+License: Expat
+ Permission is hereby granted, free of charge, to any person obtaining a
+ copy of this software and associated documentation files (the "Software"),
+ to deal in the Software without restriction, including without limitation
+ the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ and/or sell copies of the Software, and to permit persons to whom the
+ Software is furnished to do so, subject to the following conditions:
+ .
+ The above copyright notice and this permission notice shall be included in
+ all copies or substantial portions of the Software.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ DEALINGS IN THE SOFTWARE.
+
+License: BSD-3-Clause
+ Redistribution and use in source and binary forms, with or without
+ modification, are permitted provided that the following conditions are met:
+ .
+ 1. Redistributions of source code must retain the above copyright notice,
+    this list of conditions and the following disclaimer.
+ .
+ 2. Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in the
+    documentation and/or other materials provided with the distribution.
+ .
+ 3. Neither the name of the copyright holder nor the names of its
+    contributors may be used to endorse or promote products derived from
+    this software without specific prior written permission.
+ .
+ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ POSSIBILITY OF SUCH DAMAGE.

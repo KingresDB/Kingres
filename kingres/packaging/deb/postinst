@@ -40,7 +40,11 @@ if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ] || [ "$1" = "abort-decon
     fi
     if [ -d /run/systemd/system ]; then
         systemctl --system daemon-reload >/dev/null || true
-        if [ -n "$2" ]; then
+        # A restart only for an upgrade that went through (configure with an old
+        # version); an aborted one (the preinst of the new package refused it,
+        # for example because it is the other PostgreSQL major) leaves the old
+        # package as it was, so the running database is not restarted.
+        if [ "$1" = "configure" ] && [ -n "$2" ]; then
             action=restart
         else
             action=start
