@@ -672,7 +672,23 @@ kingres_remove_node(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_OBJECT_IN_USE),
 				 errmsg("cannot remove node %d: its shard group %d owns %d buckets",
 						node_id, group_id, nbuckets),
-				 errhint("Move the buckets to other groups first (bucket movement is not available in phase 1).")));
+				 errhint("Move the buckets to other groups first with kingres.move_bucket(); kingres.rebalance_plan() lists the moves that empty a group when its should_have_shards is false.")));
+
+	/* A group that takes part in an unfinished move of a bucket cannot go. */
+	if (OidIsValid(kingres_shard_catalog_relid("bucket_move")))
+		spi_run("SELECT m.move_id FROM " KINGRES_SHARD_SCHEMA ".bucket_move m "
+				"WHERE (m.source_group = $1 OR m.target_group = $1) "
+				"AND m.phase IN ('preparing', 'copying', 'catching_up', 'switching', 'cleaning') "
+				"LIMIT 1",
+				SPI_OK_SELECT, 1, argtypes, values);
+	else
+		spi_run("SELECT 1 WHERE false", SPI_OK_SELECT, 0, NULL, NULL);
+	if (SPI_processed > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("cannot remove node %d: shard group %d takes part in bucket move %d",
+						node_id, group_id, spi_first_int(0)),
+				 errhint("Wait for the move to finish (kingres.bucket_move), cancel it, or run kingres.cleanup_moved_buckets().")));
 
 	if (reset_remote)
 	{
@@ -730,6 +746,7 @@ kingres_shard_reload_catalog(void)
 	Oid			argtypes[1] = {JSONBOID};
 	Oid			funcid;
 	Datum		doc;
+	Oid			mvrelid;
 
 	if (!cat->present)
 		return false;
@@ -774,6 +791,22 @@ kingres_shard_reload_catalog(void)
 							1, argtypes, false);
 	doc = DirectFunctionCall1(jsonb_in, CStringGetDatum(snapshot));
 
+	/*
+	 * A catalog change of the cluster (a switch of a bucket move, for one) may be
+	 * in flight on this node: its transaction is prepared here, and the map group
+	 * primary has committed it, which is why this node's map is found stale.  It
+	 * holds ROW EXCLUSIVE on the version table until it is over; wait for it, so
+	 * that the document applied below is not written over a change that is just
+	 * committing (the writes would wait for its rows, and then run against the
+	 * rows it left: a foreign key violation or a deadlock where the caller expects
+	 * a retry).  The lock is taken before the first statement of the document runs, so
+	 * that every statement of it sees the committed change.  Reloaders serialize on
+	 * the same lock; it is released when the document is applied.
+	 */
+	mvrelid = kingres_shard_catalog_relid("map_version");
+	if (OidIsValid(mvrelid))
+		LockRelationOid(mvrelid, ShareRowExclusiveLock);
+
 	GetUserIdAndSecContext(&save_uid, &save_sec);
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID,
 						   save_sec | SECURITY_LOCAL_USERID_CHANGE);
@@ -786,6 +819,8 @@ kingres_shard_reload_catalog(void)
 		SetUserIdAndSecContext(save_uid, save_sec);
 	}
 	PG_END_TRY();
+	if (OidIsValid(mvrelid))
+		UnlockRelationOid(mvrelid, ShareRowExclusiveLock);
 
 	kingres_shard_catalog_invalidate();
 	return true;

@@ -61,6 +61,7 @@
 #include "utils/memutils.h"
 #include "utils/tuplestore.h"
 
+#include "catalog.h"
 #include "kingres_shard.h"
 #include "node_admin.h"
 #include "node_conn.h"
@@ -584,11 +585,16 @@ fetch_remote(KsRemoteScanState *s)
 				retry_through_spi(s, params);
 				return;
 			}
-			ereport(ERROR,
-					(errcode(ERRCODE_KINGRES_STALE_MAP),
-					 errmsg("shard group %d reports that bucket %d is not on it, but this is the map group",
-							s->group_id, s->bucket),
-					 errhint("Run kingres.sync_catalog() to repair the catalog of that node.")));
+			/*
+			 * The map group primary has the authoritative catalog, but a switch of a
+			 * bucket move commits here before the group that gave the bucket up has
+			 * heard of it, and a statement planned just before the commit finds the
+			 * old group already changed (design/shard-phase4.md, the map version
+			 * rule).  The catalog has moved on: plan the statement again, once.
+			 */
+			kingres_shard_catalog_invalidate();
+			retry_through_spi(s, params);
+			return;
 		}
 		kingres_shard_report_error(kc, res, s->sql);
 	}

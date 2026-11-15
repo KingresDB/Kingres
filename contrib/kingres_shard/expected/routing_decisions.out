@@ -510,7 +510,7 @@ ERROR:  cannot prove that the statement touches only buckets of this node
 DETAIL:  Distributed table public.t is not restricted to one bucket, and shard group 0 does not own every bucket of its colocation group.
 HINT:  A session opened by another node runs a statement locally only when every bucket the statement can touch is on this node.
 SELECT v FROM t WHERE id = :tr;
-ERROR:  bucket 1 of public.t is not on this node (stale map version 15)
+ERROR:  bucket 1 of public.t is not on this node (stale map version 12)
 SELECT count(*) FROM t WHERE id = :tl OR id = :tr;
 ERROR:  cannot prove that the statement touches only buckets of this node
 DETAIL:  Distributed table public.t is not restricted to one bucket, and shard group 0 does not own every bucket of its colocation group.

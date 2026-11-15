@@ -8,7 +8,7 @@ node as reference tables, and makes every statement correct on a cluster with
 several groups: a statement that touches one key goes to the group that owns
 it, and a statement that spans groups is answered by reading the other groups.
 
-This is version 0.2 (phase 2a, "correct"). Phase 2b will make the common
+This is version 0.3 (phase 4 adds moving buckets; phase 2a made every statement correct). Phase 2b will make the common
 statements fast. The designs are in
 [`kingres/docs/design/shard-mvp.md`](../../kingres/docs/design/shard-mvp.md)
 (phase 1) and
@@ -129,9 +129,9 @@ describes what is implemented and how to use it.
   database, so every node needs a role of that name, and `pg_hba.conf` (and the
   password file, if used) must let the nodes in. Credentials are never stored
   in the catalog. SSL options are set with `kingres_shard.node_conninfo`.
-- `CREATE EXTENSION kingres_shard` installs version 0.2;
-  `ALTER EXTENSION kingres_shard UPDATE` upgrades a 0.1 installation (the
-  catalog is identical to a fresh 0.2 one; the `upgrade` regression test
+- `CREATE EXTENSION kingres_shard` installs version 0.3;
+  `ALTER EXTENSION kingres_shard UPDATE` upgrades a 0.1 or 0.2 installation (the
+  catalog is identical to a fresh 0.3 one; the `upgrade` regression test
   compares the two). `shared_preload_libraries` must hold the new library first.
 
 ## Building and testing
@@ -610,3 +610,207 @@ Read these first; each is a reviewed boundary, not an accident.
   is no pool shared between backends.
 - `dist_collation` is an OID; non-default, non-deterministic collations are
   not portable between nodes.
+
+## Moving buckets and rebalancing (version 0.3, phase 4)
+
+Design: [`kingres/docs/design/shard-phase4.md`](../../kingres/docs/design/shard-phase4.md)
+(with its "Implementation notes and deviations"). The extension has a primitive
+that moves one bucket and a function that plans which buckets to move; driving a
+whole rebalance (order, concurrency, progress, stop and resume) is the control
+plane's job.
+
+### What a move does
+
+`SELECT kingres.move_bucket(colocation_id, bucket, target_group)` runs on the map
+group primary, as a superuser, in a READ COMMITTED session, and returns the id of
+its row in `kingres.bucket_move` when the bucket is on the target (or raises an
+error and leaves nothing behind). The unit is one bucket of one colocation group:
+the partitions of **every** table of the group move together. Reference tables do
+not move. The phases, recorded in `kingres.bucket_move.phase` before the action
+they announce:
+
+1. **preparing**: the preconditions are checked on both nodes, then (in a session
+   of its own, so that it is committed at once) the cluster lock is taken, the
+   move is recorded and the bucket is set to `moving` on every node (atomically).
+   Routing is unchanged.
+2. **copying**: on the target, standalone tables (`<table>_b<bbbb>`: the columns,
+   defaults, constraints and indexes of the parent, and a check that is the
+   partition constraint) that are **not** attached to anything, so a scan never
+   sees a half-filled copy. On the source a publication of the bucket's partitions
+   and a logical slot; on the target a subscription (`synchronous_commit = on`)
+   with the initial copy.
+3. **catching_up**: until every table of the subscription is ready and the lag is
+   within `kingres_shard.move_catchup_threshold` or a marker row has made the
+   round trip (next section).
+4. **switching**: one two-phase transaction across the map group, the source and
+   the target (see "What a move blocks").
+5. **cleaning**: the subscription, slot and publication are dropped at once; after
+   `kingres_shard.move_cleanup_delay` the orphan tables of the source
+   (`kingres.orphan_<move>_<n>`) are dropped by `kingres.cleanup_moved_buckets()`
+   (the recovery worker calls it) and the move is `done`.
+
+Moves of different buckets may run at the same time in different sessions; a
+second move of the same bucket fails ("already being moved").
+
+### How it knows the copy is complete and replayed
+
+- *The initial copy is complete* when `pg_subscription_rel` on the target has a row
+  for every published table (the bucket's partitions and the marker table) and every
+  row has `srsubstate = 'r'` (ready: the table sync worker has copied it and the apply
+  worker has taken it over). `pg_stat_subscription_stats` is watched for apply and
+  sync errors, which fail the move.
+- *The subscriber has replayed up to the switch point* when a **marker row**,
+  inserted on the source in its own committed transaction after the bucket's tables
+  are locked against writes, has arrived on the target (`kingres.move_marker`, in the
+  publication with a row filter on the move id). Logical replication applies
+  transactions in the commit order of the source, and every transaction that wrote the
+  bucket before the lock has committed before the lock is granted, so the marker
+  arrives after all of them. This is exact where the slot position
+  (`pg_replication_slots.confirmed_flush_lsn`) is not: that position advances only
+  with transactions that touch published tables, or with a keepalive after half of
+  `wal_sender_timeout`, so on a busy source it can lag for reasons that have nothing
+  to do with the bucket. The slot lag is used only as a quick test in *catching_up*.
+
+### What a move blocks, and for how long
+
+Only the switch blocks, and only for as long as the attempt lasts (normally tens of
+milliseconds; the measurement is in the design note):
+
+- On the **source** the tables of the colocation group (their parents) are locked in
+  SHARE mode: **writers of those tables on that node wait, readers go on**; for the
+  last step (the detach) the lock becomes ACCESS EXCLUSIVE until the two-phase commit
+  ends. The lock is on the parents, not only on the bucket's partitions: PostgreSQL's
+  DETACH needs the parent exclusively, and a writer that is queued for the bucket's
+  partition holds its parent. So **writers of every bucket of those tables on the
+  source node wait**, not only writers of the moving bucket.
+- On the **target** the tables are locked in SHARE ROW EXCLUSIVE (attaching a table
+  that has a foreign key needs it): writers of those tables on the target wait too,
+  readers do not.
+- Each lock is waited for at most a tenth of `kingres_shard.move_switch_timeout`
+  (default 10 s, so 1 s; at least 200 ms), the whole attempt at most
+  `move_switch_timeout`; then the transaction is rolled back, the locks are released,
+  the move goes back to *catching_up* and tries again after a short random pause. A
+  long transaction that wrote the bucket therefore cannot hold writers for more than
+  that, and the move completes when the transaction ends.
+- A statement routed with the old map that reaches the source after the switch gets
+  the stale-map error `KS001`; its origin reloads the map and repeats it (when it can:
+  when no earlier statement of the transaction ran on that node).
+- **The map version rule** (the placement rule; `src/dist_scan.c`, `ds_start`, and
+  `src/fanout.c`, `run_all`). A node's bucket partitions and its placement of the
+  colocation group (which group holds each bucket) change only in the switch's
+  transaction on that node (on the map group primary, when it is the source or the
+  target, that part runs in the coordinator's own transaction); the source also holds
+  ACCESS EXCLUSIVE on the group's parents from the detach to the end of its commit, so
+  a statement that opens the tables there waits for it. A scan asks every remote node
+  for the placement of its colocation group (one number,
+  `kingres.internal_placement_hash(colocation_id, parent)`, read from the catalog
+  table, not from a cache) **before** it opens its cursor there and **again after**,
+  and compares both answers, the placement its own plan was made with, and the number
+  of partitions its own node has (read from the catalog) with the number the planner
+  saw; a fan-out write compares the placement
+  of every target after the statement ran. A difference raises `KS001` ("the bucket map
+  changed while the statement was reading it") before the first row is returned (a
+  scan) or with every change rolled back (a write), and the statement can simply be
+  repeated. When all placements are equal, every node serves exactly the buckets the
+  placement gives it, so each bucket is read or written once, by its owner. A
+  statement fails with `KS001` only when the placement of its colocation group changed
+  (a switch committed on a node it reads) between planning and the check; other
+  catalog changes (another table, another colocation group, the `moving` state of a
+  move) do not fail it. Routed single-group statements need no comparison: they run on
+  the one node that serves them, and that node checks that it owns the bucket (`KS001`
+  otherwise); a reference-table statement never sees a move. The argument, and the one
+  case that is argued and not forced by a test, are in the design note.
+- While a move of a colocation group is unfinished (before *cleaning*), **DDL on the
+  tables of the group and the creation of a table in it are refused** ("a bucket of
+  colocation group N is being moved"): the standalone copy would not see the
+  statement. `remove_node()` refuses a group that takes part in a move.
+- A move holds one snapshot on the map group primary for as long as the function runs
+  (it is one statement); for hours-long copies that delays vacuum there, like any
+  long statement. The slot holds WAL on the source until the move ends.
+
+### Requirements on the cluster
+
+- `wal_level = logical` on **every** node; `max_replication_slots`, `max_wal_senders`
+  and `max_logical_replication_workers` with room for the slot and the table sync
+  workers of each move that runs at the same time (the move checks and names the
+  setting); on PostgreSQL 18 also `max_active_replication_origins`.
+- Every table of the colocation group has a primary key or `REPLICA IDENTITY FULL`
+  (`REPLICA IDENTITY USING INDEX` and identity columns are refused as "not supported
+  yet"). A table without one is named in the error and nothing is started.
+- The role that runs the move is a superuser. The subscription connects with the
+  `kingres_shard.node_conninfo` of the **target** (sslmode and key files) and the
+  password file of the server's OS user; no password is stored in the catalog.
+  `pg_hba.conf` of the source must let the target in for that role, as a logical
+  replication connection to the database.
+- No cycle of foreign keys between the tables of the group, and no DDL meanwhile.
+
+### Functions and settings
+
+| Function | |
+|---|---|
+| `kingres.move_bucket(colocation_id, bucket, target_group) returns bigint` | the move |
+| `kingres.rebalance_plan(max_moves default null)` | `(colocation_id, bucket, source_group, target_group, size_bytes)`: the moves that even out the buckets per group, in the order to run them; any node, reads only (sizes come from the source group when the caller is a superuser) |
+| `kingres.set_node_property(node_id, should_have_shards)` | change the flag (atomic); a group whose primary has it false is drained by the plan |
+| `kingres.resume_bucket_moves() returns int` | undo the moves interrupted before the switch, finish those after it; the recovery worker calls it |
+| `kingres.cancel_bucket_move(move_id)` | stop and undo a move that has not reached *switching* |
+| `kingres.cleanup_moved_buckets(force default false) returns int` | drop the orphan tables whose delay is over (all with `force`) |
+| `kingres.check_cluster(older_than default '5 minutes')` | one row per inconsistency |
+
+Settings: `kingres_shard.move_catchup_threshold` (1MB), `kingres_shard.move_switch_timeout`
+(10s), `kingres_shard.move_cleanup_delay` (10min).
+
+The plan: only groups whose primary has `should_have_shards` receive buckets; the
+target count is `bucket_count / receivers`, the remainder one each to the receivers
+that already hold the most; only the surplus of a group moves, and only to groups
+below their target (the fewest moves); a bucket that is itself moving is left out;
+colocation groups are independent and interleaved so that a receiving group fills
+evenly.
+
+### When a move fails: what an operator does
+
+A failure before the switch undoes itself (subscription, slot, publication and the
+standalone tables are dropped, the bucket goes back to `active`, the move is `failed`
+with the reason in `detail`) and the move can be started again. If the session or a
+node died, or the undo itself could not reach a node, the move stays in its phase:
+run `SELECT kingres.resume_bucket_moves()` on the map group primary (the recovery
+worker does it every `kingres_shard.recovery_interval`, after it has resolved prepared
+transactions). A move in *switching* is decided by the two-phase commit: the phase
+becomes *cleaning* in the same transaction as the bucket map, so a *switching* row
+after a crash is a switch that did not commit. `resume` waits `2 x
+kingres_shard.node_timeout` after the last update before it undoes such a move, so
+that a switch that is still committing is not undone. A move that is alive (its
+session holds a lock that nothing else takes) is never touched by resume. Watch
+`kingres.bucket_move` (`phase`, `detail`); `cancel_bucket_move()` stops a running
+move.
+
+### What check_cluster reports
+
+On the map group primary, superuser: per active primary node `catalog_differs` (the
+version counter is not compared), `partition_missing` (a bucket's partition absent
+on its owner), `partition_misplaced` (attached where the group does not own the
+bucket), `stray_bucket_table` (a table with the name of a bucket partition that is not
+attached), `orphan_table` (no record, a move that is not cleaning, or overdue by an
+hour), `replication_slot`, `publication`, `subscription`, `replication_origin`
+(leftovers of a move that is not running), `prepared_transaction` (older than the
+argument), `node_unreachable`; and on the map group `bucket_map_incomplete`,
+`group_without_primary`, `bucket_moving_without_move`, `move_without_moving_bucket`.
+No rows means consistent.
+
+### Limits
+
+- One bucket per call; no splitting, no change of the bucket count, no move between
+  colocation groups; standbys are phase 5.
+- During the switch writers of the group's tables wait on the source and the target
+  node (not only those of the bucket), and a switch has to wait for transactions that
+  hold the tables: long transactions delay moves. Attaching a copy of a table with a
+  foreign key checks the key by scanning the copy under the lock, so the switch of a
+  large bucket of such tables takes longer.
+- The slot of a move waits at its creation for the transactions that are running on
+  the source (bounded by 5 x `node_timeout`).
+- A scan or a fan-out write that meets a switch in the middle fails with `KS001`
+  instead of answering; the client repeats it.  A statement that opens the tables on
+  the source while the switch is committing there waits for the commit
+  (milliseconds); one whose transaction is open on the source holds the switch back
+  until it ends (the switch gives up after its lock timeout and tries again), so a
+  long transaction that read a table of the group delays its moves.
+- Orphan tables are kept for `move_cleanup_delay` and take disk space on the source.

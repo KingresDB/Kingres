@@ -40,14 +40,28 @@ use KingresShardTest qw(make_cluster keys_of_group run_sql prepared_count wait_p
 		ALTER DATABASE postgres SET lock_timeout = '1ms';
 		ALTER DATABASE postgres SET idle_in_transaction_session_timeout = '1ms';
 	});
+	# The hostile settings are meant for the recovery worker, not for this
+	# client: with them its own transaction is ended by the 1 ms timeouts
+	# between two statements on a loaded machine, and then nothing was
+	# prepared and the checks below test nothing.
 	my ($rc, $out, $err) = run_sql($n1,
-		"SET kingres_shard.fault_injection = 'after_commit:kill';\n"
+		"SET idle_in_transaction_session_timeout = 0; SET lock_timeout = 0;\n"
+		  . "SET kingres_shard.fault_injection = 'after_commit:kill';\n"
 		  . "BEGIN ISOLATION LEVEL READ COMMITTED; INSERT INTO public.kv VALUES ($ka, 'a'); INSERT INTO public.kv VALUES ($kb, 'b'); COMMIT;");
 	isnt($rc, 0, 'the origin dies after its local commit');
+	unlike($err, qr/timeout/, 'and it died at the fault point, not by a timeout of its own session');
 	$n1->stop('immediate', fail_ok => 1);
 	$n1->start;
 	ok(wait_prepared_count($n2, 0), 'S2-11: the worker resolves the prepared transaction although the database has hostile settings');
 	is($n2->safe_psql('postgres', "SELECT count(*) FROM public.kv WHERE id = $kb"), '1', 'and committed it (the origin had committed)');
+	# The worker bounds its remote sessions with two SET commands; sent as one
+	# statement they were refused and the bound was silently missing.
+	for my $n ($n1, $n2)
+	{
+		my $log = PostgreSQL::Test::Utils::slurp_file($n->logfile);
+		unlike($log, qr/cannot insert multiple commands into a prepared statement/,
+			'the worker\'s session settings were accepted on ' . $n->name);
+	}
 	$n1->safe_psql('postgres', q{
 		ALTER DATABASE postgres RESET default_transaction_isolation;
 		ALTER DATABASE postgres RESET lock_timeout;

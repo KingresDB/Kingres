@@ -14,7 +14,7 @@ use Test::More;
 use Exporter 'import';
 
 our @EXPORT_OK = qw(make_node make_cluster keys_of_group run_sql group_of_key
-  prepared_count wait_prepared_count);
+  prepared_count wait_prepared_count logical_settings move_state wait_for_file);
 
 # A node that preloads the extension.  Two-phase commit needs prepared
 # transactions; recovery_interval is 0 (no background recovery) unless asked.
@@ -22,11 +22,19 @@ sub make_node
 {
 	my ($name, %opt) = @_;
 	my $node = PostgreSQL::Test::Cluster->new($name);
-	$node->init;
+	if ($opt{logical})
+	{
+		$node->init(allows_streaming => 'logical');
+	}
+	else
+	{
+		$node->init;
+	}
 	my $interval = defined $opt{recovery_interval} ? $opt{recovery_interval} : 0;
 	my $conf = "shared_preload_libraries = 'kingres_shard'\n"
 	  . "max_prepared_transactions = " . ($opt{max_prepared} // 20) . "\n"
 	  . "kingres_shard.recovery_interval = $interval\n";
+	$conf .= logical_settings() if $opt{logical};
 	$conf .= $opt{extra} if defined $opt{extra};
 	# tcp: the node also listens on 127.0.0.1 and trusts connections from there, so that
 	# a cluster can be registered by an address that libpq connects to by TCP (SSL
@@ -36,6 +44,18 @@ sub make_node
 	$node->append_conf('pg_hba.conf', "host all all 127.0.0.1/32 trust\n") if $opt{tcp};
 	$node->start;
 	return $node;
+}
+
+# Settings of a node that can be the source or the target of a bucket move
+# (phase 4): logical WAL, room for the slots, senders and workers of a few moves.
+sub logical_settings
+{
+	return "wal_level = logical\n"
+	  . "max_replication_slots = 40\n"
+	  . "max_wal_senders = 40\n"
+	  . "max_logical_replication_workers = 16\n"
+	  . "max_worker_processes = 48\n"
+	  . "wal_receiver_status_interval = 1\n";
 }
 
 # A cluster of $count nodes, node i being its own shard group (node 1 is the
@@ -100,6 +120,28 @@ sub wait_prepared_count
 	my ($node, $want) = @_;
 	return $node->poll_query_until('postgres',
 		"SELECT count(*) = $want FROM pg_prepared_xacts");
+}
+
+# The state of a bucket move as one line: phase|detail.
+sub move_state
+{
+	my ($node, $id) = @_;
+	return $node->safe_psql('postgres',
+		"SELECT phase || '|' || coalesce(detail, '') FROM kingres.bucket_move WHERE move_id = $id");
+}
+
+# Wait (at most $timeout seconds) until the fault point that waits on $file has
+# been reached (fault.c creates $file.reached).
+sub wait_for_file
+{
+	my ($file, $timeout) = @_;
+	$timeout //= 60;
+	for (my $i = 0; $i < $timeout * 20; $i++)
+	{
+		return 1 if -e $file;
+		select(undef, undef, undef, 0.05);
+	}
+	return 0;
 }
 
 1;

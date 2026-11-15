@@ -1,9 +1,9 @@
 -- SPDX-License-Identifier: PostgreSQL
 -- Portions Copyright (c) 2026, RooyeKhat Media Co
 --
--- upgrade.sql: pg_regress test of kingres_shard 0.2 (purpose below).
--- ALTER EXTENSION kingres_shard UPDATE from 0.1 to 0.2 must give exactly the
--- catalog that installing 0.2 gives, and keep the data of the catalog tables.
+-- upgrade.sql: pg_regress test of kingres_shard 0.3 (purpose below).
+-- ALTER EXTENSION kingres_shard UPDATE from 0.1 (through 0.2) and from 0.2 to 0.3 must give exactly the
+-- catalog that installing 0.3 gives, and keep the data of the catalog tables.
 SET search_path = public, pg_temp;
 -- A description of every object of the extension that the two paths could
 -- make differ: columns, constraints, indexes, functions (with the digest of
@@ -60,12 +60,12 @@ RETURN QUERY
      AND d.deptype = 'e';
 END
 $$;
--- Install 0.2 directly.
+-- Install 0.3 directly.
 CREATE EXTENSION kingres_shard;
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
  extversion 
 ------------
- 0.2
+ 0.3
 (1 row)
 
 CREATE TABLE public.upg_direct AS SELECT line FROM public.upg_snapshot() line;
@@ -84,7 +84,7 @@ SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
  0.1
 (1 row)
 
-SELECT kingres.init_cluster('localhost', current_setting('port')::int);
+SELECT kingres.init_cluster(btrim(split_part(current_setting('unix_socket_directories'), ',', 1)), current_setting('port')::int);
  init_cluster 
 --------------
  
@@ -102,7 +102,7 @@ ALTER EXTENSION kingres_shard UPDATE;
 SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
  extversion 
 ------------
- 0.2
+ 0.3
 (1 row)
 
 CREATE TABLE public.upg_upgraded AS SELECT line FROM public.upg_snapshot() line;
@@ -162,6 +162,105 @@ SELECT method, dist_column, colocation_id FROM kingres.dist_table;
 (1 row)
 
 ROLLBACK;
+-- 0.3: the records of bucket moves exist, empty, and the new functions work on
+-- a catalog that came from 0.1.
+SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
+ extversion 
+------------
+ 0.3
+(1 row)
+
+SELECT count(*) AS moves FROM kingres.bucket_move;
+ moves 
+-------
+     0
+(1 row)
+
+SELECT count(*) AS markers FROM kingres.move_marker;
+ markers 
+---------
+       0
+(1 row)
+
+SELECT count(*) AS plan_rows FROM kingres.rebalance_plan();
+ plan_rows 
+-----------
+         0
+(1 row)
+
+SELECT count(*) AS cluster_problems FROM kingres.check_cluster();
+ cluster_problems 
+------------------
+                0
+(1 row)
+
+SELECT kingres.resume_bucket_moves();
+ resume_bucket_moves 
+---------------------
+                   0
+(1 row)
+
+SELECT kingres.cleanup_moved_buckets();
+ cleanup_moved_buckets 
+-----------------------
+                     0
+(1 row)
+
+DROP TABLE public.upg_t;
+DROP EXTENSION kingres_shard;
+-- The step from 0.2 to 0.3 on its own, with a bucket map that is not trivial.
+CREATE EXTENSION kingres_shard VERSION '0.2';
+SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
+ extversion 
+------------
+ 0.2
+(1 row)
+
+SELECT kingres.init_cluster(btrim(split_part(current_setting('unix_socket_directories'), ',', 1)), current_setting('port')::int);
+ init_cluster 
+--------------
+ 
+(1 row)
+
+CREATE TABLE public.upg_t (id int PRIMARY KEY, v text);
+SELECT kingres.create_distributed_table('public.upg_t', 'id', bucket_count => 4);
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+INSERT INTO public.upg_t VALUES (3, 'three');
+ALTER EXTENSION kingres_shard UPDATE TO '0.3';
+SELECT extversion FROM pg_extension WHERE extname = 'kingres_shard';
+ extversion 
+------------
+ 0.3
+(1 row)
+
+DROP TABLE public.upg_upgraded;
+CREATE TABLE public.upg_upgraded AS SELECT line FROM public.upg_snapshot() line;
+SELECT 'only in direct install' AS side, line FROM
+  (SELECT line FROM public.upg_direct EXCEPT SELECT line FROM public.upg_upgraded) x
+UNION ALL
+SELECT 'only in upgrade', line FROM
+  (SELECT line FROM public.upg_upgraded EXCEPT SELECT line FROM public.upg_direct) y
+ORDER BY 1, 2;
+ side | line 
+------+------
+(0 rows)
+
+SELECT count(*) FROM public.upg_t;
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM kingres.bucket_map;
+ count 
+-------
+     4
+(1 row)
+
 DROP TABLE public.upg_t;
 DROP EXTENSION kingres_shard;
 DROP TABLE public.upg_direct, public.upg_upgraded;

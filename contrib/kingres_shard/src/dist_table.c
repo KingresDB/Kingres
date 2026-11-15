@@ -35,6 +35,7 @@
 #include "utils/memutils.h"
 #include "utils/typcache.h"
 
+#include "bucket_move.h"
 #include "catalog.h"
 #include "kingres_shard.h"
 #include "dist_table.h"
@@ -399,6 +400,8 @@ kingres_create_distributed_table(PG_FUNCTION_ARGS)
 	/* 2. The colocation group and the placement of its buckets. */
 	colocation_id = choose_colocation(coltype, collation, colocate_with,
 									  requested, &nbuckets);
+	/* A table added to a group whose bucket is being moved would be missed by the copy. */
+	kingres_shard_assert_no_move(colocation_id);
 
 	groups = MemoryContextAlloc(callercxt, sizeof(int) * nbuckets);
 	for (i = 0; i < (uint64) nbuckets; i++)

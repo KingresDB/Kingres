@@ -449,6 +449,18 @@ connect_to_node(const char *host, int port, const char *user, char **errmsg_out)
 }
 
 /*
+ * kingres_shard_connect_control
+ *
+ * See node_conn.h.
+ */
+PGconn *
+kingres_shard_connect_control(const char *host, int port, char **errmsg_out)
+{
+	return connect_to_node(host, port, GetUserNameFromId(GetUserId(), false),
+						   errmsg_out);
+}
+
+/*
  * kingres_shard_get_conn
  *
  * Return the cached connection to host:port for the current user,

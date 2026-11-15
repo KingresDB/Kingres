@@ -36,10 +36,14 @@
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "access/skey.h"
+#include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_inherits.h"
 #include "commands/trigger.h"
 #include "executor/spi.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -515,6 +519,123 @@ catalog_load(void)
 	if (prevcxt != NULL)
 		MemoryContextDelete(prevcxt);
 	ks.valid = true;
+}
+
+/*
+ * The placement of a colocation group, as one number: which shard group holds
+ * each bucket.  A distributed scan and a fan-out write compare it between the
+ * node that plans them and every node they read or write (design/shard-phase4.md,
+ * "The map version rule"); it changes exactly when a bucket moves between groups,
+ * not with the other changes of the catalog (a state, another table, another
+ * colocation group), which count the map version up too.  The sum of a mixed
+ * value per bucket, so that the order of the rows does not matter: the node that
+ * asks reads the heap in any order.
+ */
+static uint64
+placement_mix(int bucket, int group)
+{
+	uint64		x = (((uint64) (uint32) bucket) << 32) | (uint32) group;
+
+	x += UINT64CONST(0x9E3779B97F4A7C15);
+	x = (x ^ (x >> 30)) * UINT64CONST(0xBF58476D1CE4E5B9);
+	x = (x ^ (x >> 27)) * UINT64CONST(0x94D049BB133111EB);
+	return x ^ (x >> 31);
+}
+
+/*
+ * The latest committed map version of this node, whatever the snapshot of the
+ * transaction is; -1 when the table or its row does not exist.
+ */
+int64
+kingres_shard_map_version_now(void)
+{
+	Oid			relid = kingres_shard_catalog_relid("map_version");
+	CatScan		cs;
+	HeapTuple	tup;
+	int64		version = -1;
+
+	if (!OidIsValid(relid))
+		return -1;
+	catscan_begin(&cs, relid);
+	tup = catscan_next(&cs);
+	if (tup != NULL)
+	{
+		bool		isnull;
+
+		version = DatumGetInt64(heap_getattr(tup, 1, RelationGetDescr(cs.rel), &isnull));
+	}
+	catscan_end(&cs);
+	return version;
+}
+
+/*
+ * The number of partitions attached to a partitioned table now, from the catalog
+ * with the latest committed snapshot (the partition list of a relcache entry can
+ * be behind a commit whose invalidation has not reached this backend).
+ */
+int
+kingres_shard_attached_partitions_now(Oid parent)
+{
+	Relation	rel = table_open(InheritsRelationId, AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	Snapshot	snap = RegisterSnapshot(IsInParallelMode() ? GetActiveSnapshot() : GetLatestSnapshot());
+	int			n = 0;
+
+	ScanKeyInit(&key, Anum_pg_inherits_inhparent, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(parent));
+	scan = systable_beginscan(rel, InheritsParentIndexId, true, snap, 1, &key);
+	while (systable_getnext(scan) != NULL)
+		n++;
+	systable_endscan(scan);
+	UnregisterSnapshot(snap);
+	table_close(rel, AccessShareLock);
+	return n;
+}
+
+/* From the cache of this backend. */
+int64
+kingres_shard_placement_hash(const KsColocation *coloc)
+{
+	uint64		h = 0;
+	int			b;
+
+	if (coloc == NULL)
+		return 0;
+	for (b = 0; b < coloc->bucket_count; b++)
+		if (coloc->bucket_group[b] >= 0)
+			h += placement_mix(b, coloc->bucket_group[b]);
+	return (int64) h;
+}
+
+/*
+ * From the catalog table, with the latest committed snapshot whatever the
+ * snapshot of the transaction is (the cache of a backend can be behind a commit
+ * whose invalidation has not reached it yet).
+ */
+int64
+kingres_shard_placement_hash_now(int colocation_id)
+{
+	Oid			relid = kingres_shard_catalog_relid("bucket_map");
+	CatScan		cs;
+	HeapTuple	tup;
+	uint64		h = 0;
+
+	if (!OidIsValid(relid))
+		return 0;
+	catscan_begin(&cs, relid);
+	while ((tup = catscan_next(&cs)) != NULL)
+	{
+		TupleDesc	desc = RelationGetDescr(cs.rel);
+		bool		isnull;
+
+		if (DatumGetInt32(heap_getattr(tup, 1, desc, &isnull)) != colocation_id)
+			continue;
+		h += placement_mix(DatumGetInt32(heap_getattr(tup, 2, desc, &isnull)),
+						   DatumGetInt32(heap_getattr(tup, 3, desc, &isnull)));
+	}
+	catscan_end(&cs);
+	return (int64) h;
 }
 
 /*

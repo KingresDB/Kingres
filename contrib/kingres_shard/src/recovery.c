@@ -384,10 +384,31 @@ kingres_shard_recover_prepared(void)
 		/* In the worker (its connections end with it), not in the session of a user whose connection is reused. */
 		if (MyBackendType == B_BG_WORKER)
 		{
-			char	   *lim = psprintf("SET statement_timeout = %d; SET lock_timeout = %d",
-									  kingres_shard_node_timeout * 1000, kingres_shard_node_timeout * 1000);
+			/*
+			 * One command per message: the extended protocol refuses several
+			 * commands in one statement, and a refused SET would leave the
+			 * remote database's own settings (possibly hostile ones) in
+			 * force for this session without anybody noticing.
+			 */
+			static const char *const limited[] = {"statement_timeout", "lock_timeout"};
+			bool		bounded = true;
 
-			PQclear(kingres_shard_exec_params(kc, lim, 0, NULL, NULL, false));
+			for (int s = 0; s < lengthof(limited) && bounded; s++)
+			{
+				char	   *set = psprintf("SET %s = %d", limited[s], kingres_shard_node_timeout * 1000);
+				PGresult   *sres = kingres_shard_exec_params(kc, set, 0, NULL, NULL, false);
+
+				bounded = (sres != NULL && PQresultStatus(sres) == PGRES_COMMAND_OK);
+				if (!bounded)
+					ereport(LOG,
+							(errmsg("kingres_shard recovery: could not bound the session on node %d, skipped",
+									r->node_id),
+							 errdetail_internal("%s", sres ? PQresultErrorMessage(sres) : "no result")));
+				PQclear(sres);
+				pfree(set);
+			}
+			if (!bounded)
+				continue;
 		}
 		listed_at = GetCurrentTimestamp();
 		params[0] = psprintf("kingres\\_%d\\_%%", origin);

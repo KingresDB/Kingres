@@ -36,6 +36,13 @@
 #define ERRCODE_KINGRES_STALE_MAP MAKE_SQLSTATE('K','S','0','0','1')
 
 /*
+ * SQLSTATE of a switch attempt of a bucket move that gave up waiting (for the
+ * lock of the bucket's tables, or for the replay of the copy): the move goes
+ * back to catching up and tries again (bucket_move.c).
+ */
+#define ERRCODE_KINGRES_SWITCH_TIMEOUT MAKE_SQLSTATE('K','S','0','0','4')
+
+/*
  * The text that starts the statement of every fragment of a distributed scan
  * (dist_scan.c).  A forwarded session runs a plain read of a distributed table
  * as the local rows of the table only when the statement carries it; without
@@ -63,6 +70,9 @@ extern PGDLLIMPORT int kingres_shard_node_timeout;
 extern PGDLLIMPORT char *kingres_shard_node_conninfo;
 extern PGDLLIMPORT int kingres_shard_recovery_interval;
 extern PGDLLIMPORT bool kingres_shard_enable_distributed_scan;
+extern PGDLLIMPORT int kingres_shard_move_catchup_threshold;
+extern PGDLLIMPORT int kingres_shard_move_switch_timeout;
+extern PGDLLIMPORT int kingres_shard_move_cleanup_delay;
 
 extern bool kingres_shard_check_node_conninfo(char **newval, void **extra,
 											   GucSource source);

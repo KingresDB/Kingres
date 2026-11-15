@@ -85,6 +85,8 @@
 #define DS_PRIV_RELID		1	/* Integer: the distributed table */
 #define DS_PRIV_NCHILD		2	/* Integer: scan columns the child returns */
 #define DS_PRIV_PARAMS		3	/* List of Integer: external parameter ids of the fragment, in order */
+#define DS_PRIV_PLACEMENT	4	/* String: placement of the colocation group the statement was planned with */
+#define DS_PRIV_NPARTS		5	/* Integer: partitions of the table on this node, in the plan */
 
 /* Rows requested from a remote group at a time. */
 int			kingres_shard_scan_fetch_size = 1000;
@@ -116,6 +118,8 @@ typedef struct KsDistScanState
 	char	   *sql;
 	Oid			relid;
 	int			nchild;			/* scan columns the child returns */
+	int64		plan_placement;	/* placement of the colocation group in the plan (the local partitions are those of it) */
+	int			plan_nparts;	/* partitions of the table on this node in the plan */
 	int			ncols;			/* scan columns in all */
 	List	   *param_ids;
 	PlanState  *child;
@@ -345,7 +349,19 @@ ds_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	cpath->flags = 0;
 	cpath->custom_paths = list_make1(best);
 	cpath->custom_restrictinfo = NIL;
-	cpath->custom_private = list_make1(makeInteger((int) rte->relid));
+	{
+		/*
+		 * The number of partitions of the table on this node as the planner saw them
+		 * when it expanded the table (rel->nparts is the one number that matches the
+		 * partitions in the child path: the partition list of the relcache can be
+		 * rebuilt between the expansion and this hook by an invalidation that a lock
+		 * acquisition processes), or -1 when the planner did not treat the table as
+		 * partitioned.  See ds_start.
+		 */
+		int			nparts = (rel->part_scheme != NULL) ? rel->nparts : -1;
+
+		cpath->custom_private = list_make2(makeInteger((int) rte->relid), makeInteger(nparts));
+	}
 	cpath->methods = &ds_path_methods;
 
 	rel->pathlist = list_make1(cpath);
@@ -421,6 +437,21 @@ ds_error_system_columns(PlannerInfo *root, const char *relname)
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("system columns of distributed table \"%s\" are not supported in a statement that spans shard groups",
 					relname)));
+}
+
+/*
+ * The placement of the colocation group of a table, from the catalog the planner
+ * used (the groups of the fragments, and the local partitions of the child plan,
+ * are those of it).
+ */
+static int64
+plan_placement(Oid relid)
+{
+	const KsDistTable *dt = kingres_shard_lookup_dist_table(relid);
+
+	if (dt == NULL || dt->is_reference)
+		return 0;
+	return kingres_shard_placement_hash(dt->coloc);
 }
 
 /*
@@ -602,8 +633,11 @@ ds_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	cscan->custom_scan_tlist = scan_tlist;
 	cscan->custom_plans = custom_plans;
 	cscan->custom_relids = bms_make_singleton(rel->relid);
-	cscan->custom_private = list_make4(makeString(sql.data), makeInteger((int) relid),
-									   makeInteger(nchild), param_ids_int);
+	cscan->custom_private = list_make5(makeString(sql.data), makeInteger((int) relid),
+									   makeInteger(nchild), param_ids_int,
+									   makeString(psprintf(INT64_FORMAT,
+													   plan_placement(relid))));
+	cscan->custom_private = lappend(cscan->custom_private, lsecond(best_path->custom_private));
 	cscan->methods = &ds_scan_methods;
 	return &cscan->scan.plan;
 }
@@ -621,6 +655,8 @@ ds_create_scan_state(CustomScan *cscan)
 	s->sql = pstrdup(strVal(list_nth(p, DS_PRIV_SQL)));
 	s->relid = (Oid) intVal(list_nth(p, DS_PRIV_RELID));
 	s->nchild = intVal(list_nth(p, DS_PRIV_NCHILD));
+	s->plan_placement = pg_strtoint64(strVal(list_nth(p, DS_PRIV_PLACEMENT)));
+	s->plan_nparts = intVal(list_nth(p, DS_PRIV_NPARTS));
 	foreach(lc, (List *) list_nth(p, DS_PRIV_PARAMS))
 		s->param_ids = lappend_int(s->param_ids, intVal(lfirst(lc)));
 	return (Node *) s;
@@ -699,6 +735,7 @@ ds_begin_scan(CustomScanState *node, EState *estate, int eflags)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("a distributed scan cannot run in a parallel worker"),
 				 errhint("Mark the function that runs the statement PARALLEL RESTRICTED or PARALLEL UNSAFE.")));
+	kingres_shard_fault_point("scan_begin");
 	{
 		MemoryContextCallback *cb = MemoryContextAlloc(estate->es_query_cxt, sizeof(MemoryContextCallback));
 
@@ -854,16 +891,111 @@ ds_start(KsDistScanState *s)
 	Oid		   *types;
 	int			nparams;
 	ListCell   *lc;
+	int64		origin_placement;
+	int			colocation_id;
 
-	old = MemoryContextSwitchTo(estate->es_query_cxt);
 	if (dt == NULL || dt->is_reference)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("table %u is no longer a distributed table", s->relid)));
+	colocation_id = dt->colocation_id;
+	origin_placement = kingres_shard_placement_hash(dt->coloc);
+
+	/*
+	 * The partitions the local part of this scan reads are those of the placement
+	 * the statement was planned with (their locks are held since the executor
+	 * started); the groups asked below are those of the placement as it is now.
+	 * They must be one placement.
+	 */
+	if (origin_placement != s->plan_placement)
+		ereport(ERROR,
+				(errcode(ERRCODE_KINGRES_STALE_MAP),
+				 errmsg("the bucket map changed after the statement was planned"),
+				 errhint("A bucket moved between shard groups; repeat the statement.")));
+
+	/*
+	 * The partition list the plan was made with must be the one this node has
+	 * now: a switch can commit here between the parse analysis of the statement
+	 * (which locked the parent, and does not stop an ATTACH) and now, and the list
+	 * in the relcache of this backend can be behind it.  A node that changed after
+	 * the plan has other partitions than the local child of this scan reads.
+	 */
+	if (s->plan_nparts >= 0 && kingres_shard_attached_partitions_now(s->relid) != s->plan_nparts)
+		ereport(ERROR,
+				(errcode(ERRCODE_KINGRES_STALE_MAP),
+				 errmsg("the partitions of table \"%s\" on this node changed after the statement was planned",
+						get_rel_name(s->relid)),
+				 errhint("A bucket moved between shard groups; repeat the statement.")));
+
+	kingres_shard_fault_point("scan_started");
+
+	old = MemoryContextSwitchTo(estate->es_query_cxt);
 	s->frags = remote_groups_of(dt, cat);
 	MemoryContextSwitchTo(old);
 	s->cur = 0;
 	values = fragment_params(s, &types, &nparams);
+
+	/*
+	 * First every group is asked for its placement (the question also makes the
+	 * node's partition list of the table current, see
+	 * kingres.internal_placement_hash), then the cursors are opened, then every
+	 * group is asked again (below).  A node whose answers differ, or differ from
+	 * this node's, had a switch commit in between.
+	 */
+	{
+		char	   *qualified = quote_qualified_identifier(get_namespace_name(get_rel_namespace(s->relid)),
+														   get_rel_name(s->relid));
+		char	   *ask = psprintf("SELECT " KINGRES_SHARD_SCHEMA ".internal_placement_hash(%d, %s::pg_catalog.regclass)",
+								   colocation_id, quote_literal_cstr(qualified));
+
+		foreach(lc, s->frags)
+		{
+			DsFrag	   *f = (DsFrag *) lfirst(lc);
+
+			f->scan = s;
+			f->kc = kingres_shard_get_conn(f->host, f->port, false, NULL);
+			kingres_shard_begin_xact(f->kc);
+			f->kc->in_query = true;
+			if (!PQsendQuery(f->kc->conn, ask))
+			{
+				f->kc->have_error = true;
+				f->kc->in_query = false;
+				ereport(ERROR,
+						(errcode(ERRCODE_CONNECTION_FAILURE),
+						 errmsg("could not send a command to node %s:%d", f->host, f->port),
+						 errdetail_internal("%s", pchomp(PQerrorMessage(f->kc->conn)))));
+			}
+			f->kc->nstatements++;
+			f->in_flight = true;
+			kingres_shard_conn_set_pending(f->kc, f, ds_finish_pending);
+		}
+		foreach(lc, s->frags)
+		{
+			DsFrag	   *f = (DsFrag *) lfirst(lc);
+			PGresult   *res;
+			bool		same;
+
+			kingres_shard_conn_clear_pending(f->kc, f);
+			res = libpqsrv_get_result_last(f->kc->conn, PG_WAIT_EXTENSION);
+			f->kc->in_query = false;
+			f->in_flight = false;
+			if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK)
+			{
+				if (res == NULL)
+					f->kc->have_error = true;
+				kingres_shard_report_error(f->kc, res, "placement");
+			}
+			same = !PQgetisnull(res, 0, 0) &&
+				pg_strtoint64(PQgetvalue(res, 0, 0)) == origin_placement;
+			PQclear(res);
+			if (!same)
+				ereport(ERROR,
+						(errcode(ERRCODE_KINGRES_STALE_MAP),
+						 errmsg("the bucket map changed while the statement was starting (node %s:%d has another placement of the buckets)",
+								f->host, f->port),
+						 errhint("A bucket moved between shard groups; repeat the statement.")));
+		}
+	}
 
 	/* DECLARE on every group first (they plan concurrently), then read the answers. */
 	foreach(lc, s->frags)
@@ -871,9 +1003,6 @@ ds_start(KsDistScanState *s)
 		DsFrag	   *f = (DsFrag *) lfirst(lc);
 		StringInfoData decl;
 
-		f->scan = s;
-		f->kc = kingres_shard_get_conn(f->host, f->port, false, NULL);
-		kingres_shard_begin_xact(f->kc);
 		snprintf(f->cursor, sizeof(f->cursor), "ks_scan_" UINT64_FORMAT, ++cursor_serial);
 		initStringInfo(&decl);
 		appendStringInfo(&decl, KS_FRAGMENT_MARKER "DECLARE %s NO SCROLL CURSOR FOR %s", f->cursor, s->sql);
@@ -909,7 +1038,65 @@ ds_start(KsDistScanState *s)
 		}
 		PQclear(res);
 		f->declared = true;
+		if (kingres_shard_fault_spec()[0] != '\0')
+			kingres_shard_fault_point(psprintf("scan_declared_g%d", f->group_id));
 	}
+	kingres_shard_fault_point("scan_after_declare");
+
+	/*
+	 * The map version rule (design/shard-phase4.md, "The map version rule").  A
+	 * node's bucket partitions of a table and its placement of the colocation
+	 * group change only in the transaction of a switch, which commits on every
+	 * participant (the one on the map group primary included: its own part is done
+	 * in the coordinator's transaction).  The placement was read before the cursor
+	 * was opened and is read again now, from the catalog table and not from a
+	 * cache; the three numbers (before, after, this node's) are equal only if no
+	 * switch committed on the node in between, so the cursor was planned with the
+	 * partitions of that placement.  What happens on the node later cannot change
+	 * what the cursor reads: it holds the parent in ACCESS SHARE, which a detach
+	 * (the source) waits for, and a partition attached later (the target) is not in
+	 * its plan, which is what the placement says (the bucket is read from the
+	 * source).  A node whose placement is not the one the groups were chosen with
+	 * has other partitions than this scan assumes: a bucket that moved between the
+	 * reads of two groups would be returned twice or not at all.  The statement
+	 * fails with the retryable KS001; nothing has been returned yet.
+	 */
+	foreach(lc, s->frags)
+	{
+		DsFrag	   *f = (DsFrag *) lfirst(lc);
+		PGresult   *res = kingres_shard_exec(f->kc,
+											 psprintf("SELECT " KINGRES_SHARD_SCHEMA ".internal_placement_hash(%d)",
+													  colocation_id));
+		int64		theirs = 0;
+		bool		known = false;
+
+		if (!PQgetisnull(res, 0, 0))
+		{
+			theirs = pg_strtoint64(PQgetvalue(res, 0, 0));
+			known = true;
+		}
+		PQclear(res);
+		if (!known || theirs != origin_placement)
+		{
+			/*
+			 * No reload of the catalog here: it would run in this transaction,
+			 * which the error below ends, and the writes of the reload would
+			 * wait for, and deadlock with, the very switch that made the
+			 * placements differ.
+			 */
+			ereport(ERROR,
+					(errcode(ERRCODE_KINGRES_STALE_MAP),
+					 errmsg("the bucket map changed while the statement was reading it (node %s:%d has another placement of the buckets)",
+							f->host, f->port),
+					 errhint("A bucket moved between shard groups; repeat the statement.")));
+		}
+	}
+	if (kingres_shard_placement_hash(kingres_shard_lookup_colocation(colocation_id)) != origin_placement)
+		ereport(ERROR,
+				(errcode(ERRCODE_KINGRES_STALE_MAP),
+				 errmsg("the bucket map changed while the statement was reading it"),
+				 errhint("A bucket moved between shard groups; repeat the statement.")));
+	kingres_shard_fault_point("scan_after_check");
 	foreach(lc, s->frags)
 		frag_send_fetch((DsFrag *) lfirst(lc));
 	s->started = true;

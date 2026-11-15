@@ -62,7 +62,9 @@
 #define FO_PRIV_SQL			0
 #define FO_PRIV_RETURNS		1
 #define FO_PRIV_ALL_ROWS	2
-#define FO_PRIV_NLOCKS		3
+#define FO_PRIV_COLOC		3	/* Integer: colocation group of the table (0: a reference table) */
+#define FO_PRIV_PLACEMENT	4	/* String: its placement when the statement was planned */
+#define FO_PRIV_NLOCKS		5
 /* then the lock names, then (host, port, local) per target */
 
 /* The statement text whose local execution is in progress, or NULL. */
@@ -74,6 +76,8 @@ typedef struct KsFanoutState
 	char	   *sql;
 	bool		returns_rows;
 	bool		all_rows;
+	int			colocation_id;	/* of the table, 0 for a reference table */
+	int64		plan_placement;	/* its placement when the targets were chosen */
 	List	   *targets;		/* of KsFanTarget * */
 	List	   *locknames;		/* reference tables to lock on every node first */
 	bool		done;
@@ -129,9 +133,25 @@ kingres_shard_make_fanout_plan(Query *parse, char *sql, List *targets,
 	List	   *private;
 	ListCell   *lc;
 	CustomScan *cscan;
+	int			colocation_id = 0;
+
+	/* The colocation group of the distributed table the statement writes (none for a reference table). */
+	foreach(lc, relids)
+	{
+		const KsDistTable *dt = kingres_shard_lookup_dist_table(lfirst_oid(lc));
+
+		if (dt != NULL && !dt->is_reference)
+		{
+			colocation_id = dt->colocation_id;
+			break;
+		}
+	}
 
 	private = list_make3(makeString(sql), makeInteger(returns_rows ? 1 : 0),
 						 makeInteger(all_rows ? 1 : 0));
+	private = lappend(private, makeInteger(colocation_id));
+	private = lappend(private, makeString(psprintf(INT64_FORMAT,
+												   kingres_shard_placement_hash(kingres_shard_lookup_colocation(colocation_id)))));
 	private = lappend(private, makeInteger(list_length(locknames)));
 	foreach(lc, locknames)
 		private = lappend(private, makeString(pstrdup((char *) lfirst(lc))));
@@ -163,6 +183,8 @@ fo_create_scan_state(CustomScan *cscan)
 	s->sql = pstrdup(strVal(list_nth(p, FO_PRIV_SQL)));
 	s->returns_rows = intVal(list_nth(p, FO_PRIV_RETURNS)) != 0;
 	s->all_rows = intVal(list_nth(p, FO_PRIV_ALL_ROWS)) != 0;
+	s->colocation_id = intVal(list_nth(p, FO_PRIV_COLOC));
+	s->plan_placement = pg_strtoint64(strVal(list_nth(p, FO_PRIV_PLACEMENT)));
 	nlocks = intVal(list_nth(p, FO_PRIV_NLOCKS));
 	for (i = 0; i < nlocks; i++)
 		s->locknames = lappend(s->locknames, pstrdup(strVal(list_nth(p, FO_PRIV_NLOCKS + 1 + i))));
@@ -522,6 +544,7 @@ run_all(KsFanoutState *s)
 	uint64		local_count = 0;
 	bool		have_local = false;
 	uint64		total = 0;
+	int64		origin_placement = 0;
 
 	if (IsInParallelMode())
 		ereport(ERROR,
@@ -534,6 +557,22 @@ run_all(KsFanoutState *s)
 									  "kingres_shard fanout rows",
 									  ALLOCSET_DEFAULT_SIZES);
 	MemoryContextSwitchTo(old);
+
+	/*
+	 * The groups of this statement are those of the placement it was planned with
+	 * (a cached or generic plan can be older than the catalog this node holds
+	 * now); a placement that changed since then is a different set of groups, and
+	 * nothing has run yet.
+	 */
+	if (s->all_rows)
+	{
+		origin_placement = kingres_shard_placement_hash(kingres_shard_lookup_colocation(s->colocation_id));
+		if (origin_placement != s->plan_placement)
+			ereport(ERROR,
+					(errcode(ERRCODE_KINGRES_STALE_MAP),
+					 errmsg("the bucket map changed after the statement was planned"),
+					 errhint("A bucket moved between shard groups; nothing was changed.  Repeat the statement.")));
+	}
 
 	if (s->locknames != NIL)
 	{
@@ -586,6 +625,45 @@ run_all(KsFanoutState *s)
 		total += count;
 	}
 	(void) have_local;
+	kingres_shard_fault_point("fanout_after_run");
+
+	/*
+	 * The map version rule (design/shard-phase4.md): a write to a distributed
+	 * table is run on the groups one after the other; a bucket that moved
+	 * between two of those statements would be missed.  Every group is still
+	 * locked by this transaction (the statement holds ROW EXCLUSIVE on the parent
+	 * of the table there, which the switch of a move cannot get past), so its
+	 * partitions cannot have changed since the statement ran on it; when every
+	 * group (and this node) has the placement the groups were chosen with, no
+	 * bucket moved while the statement ran.
+	 */
+	if (s->all_rows)
+	{
+		foreach(lc, s->targets)
+		{
+			KsFanTarget *t = (KsFanTarget *) lfirst(lc);
+			int64		theirs;
+
+			if (t->is_local)
+				theirs = kingres_shard_placement_hash_now(s->colocation_id);
+			else
+			{
+				KsConn	   *kc = kingres_shard_get_conn(t->host, t->port, false, NULL);
+				PGresult   *res = kingres_shard_exec(kc,
+													 psprintf("SELECT " KINGRES_SHARD_SCHEMA ".internal_placement_hash(%d)",
+															  s->colocation_id));
+
+				theirs = PQgetisnull(res, 0, 0) ? 0 : pg_strtoint64(PQgetvalue(res, 0, 0));
+				PQclear(res);
+			}
+			if (theirs != origin_placement)
+				ereport(ERROR,
+						(errcode(ERRCODE_KINGRES_STALE_MAP),
+						 errmsg("the bucket map changed while the statement was running (node %s:%d has another placement of the buckets)",
+								t->host, t->port),
+						 errhint("A bucket moved between shard groups; nothing was changed.  Repeat the statement.")));
+		}
+	}
 
 	/* A reference table's result is the local one; a distributed one's is the sum. */
 	s->processed = s->all_rows ? total : (have_local ? local_count : first_count);

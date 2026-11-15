@@ -23,6 +23,8 @@
  *	shippable.c	 what may be sent to another node and mean the same there
  *	recovery.c	 recover_prepared_transactions() and the background workers
  *	fault.c		 fault injection for the tests of two-phase commit
+ *	bucket_move.c the primitives of moving a bucket between shard groups:
+ *				 control connections, the switch, attach and detach
  *
  * SPDX-License-Identifier: PostgreSQL
  * Portions Copyright (c) 2026, RooyeKhat Media Co
@@ -67,6 +69,9 @@ int			kingres_shard_node_timeout = 60;
 char	   *kingres_shard_node_conninfo = NULL;
 int			kingres_shard_recovery_interval = 30;
 bool		kingres_shard_enable_distributed_scan = true;
+int			kingres_shard_move_catchup_threshold = 1024;	/* kB */
+int			kingres_shard_move_switch_timeout = 10000;	/* ms */
+int			kingres_shard_move_cleanup_delay = 600;	/* s */
 
 /*
  * _PG_init
@@ -179,6 +184,31 @@ _PG_init(void)
 							 true,
 							 PGC_USERSET, 0,
 							 NULL, NULL, NULL);
+
+	/* Moving a bucket (design/shard-phase4.md, "Settings added"). */
+	DefineCustomIntVariable("kingres_shard.move_catchup_threshold",
+							"How close the copy of a bucket move must be to the source before the switch is attempted.",
+							"Lag of the replication slot behind the current WAL position of the source; a replay proven by a marker row counts as caught up.",
+							&kingres_shard_move_catchup_threshold,
+							1024, 0, MAX_KILOBYTES,
+							PGC_USERSET, GUC_UNIT_KB,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("kingres_shard.move_switch_timeout",
+							"Longest time the tables of a moving bucket are locked by one switch attempt.",
+							"After it the switch is abandoned, the locks are released and the move returns to catching up.",
+							&kingres_shard_move_switch_timeout,
+							10000, 100, 3600000,
+							PGC_USERSET, GUC_UNIT_MS,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("kingres_shard.move_cleanup_delay",
+							"How long the orphan tables of a moved bucket are kept on the old group.",
+							"Statements that were reading the old partitions have finished by then.",
+							&kingres_shard_move_cleanup_delay,
+							600, 0, 31536000,
+							PGC_USERSET, GUC_UNIT_S,
+							NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("kingres_shard");
 

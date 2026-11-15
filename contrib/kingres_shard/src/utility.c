@@ -81,6 +81,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 
+#include "bucket_move.h"
 #include "catalog.h"
 #include "forward_auth.h"
 #include "kingres_shard.h"
@@ -137,7 +138,20 @@ typedef struct UtilDecision
 	Oid			rename_relid;	/* a hash table renamed: rename its partitions */
 	Oid			owner_relid;	/* a hash table whose owner changes: change its partitions' owner too */
 	Oid			owner_role;
+	List	   *colocations;	/* of int: colocation groups of the hash tables concerned */
 } UtilDecision;
+
+/*
+ * A statement on a table of a colocation group must not run while a bucket of
+ * the group is being moved: the copy on the target is a standalone table that
+ * the statement would not reach (kingres.internal_assert_no_move()).
+ */
+static void
+note_colocation(UtilDecision *d, const KsDistTable *dt)
+{
+	if (dt != NULL && !dt->is_reference)
+		d->colocations = list_append_unique_int(d->colocations, dt->colocation_id);
+}
 
 static void kingres_shard_process_utility(PlannedStmt *pstmt,
 										   const char *queryString,
@@ -588,6 +602,7 @@ decide(Node *parsetree, const KsCatalog *cat, UtilDecision *d)
 					if (dt != NULL)
 					{
 						ndist++;
+						note_colocation(d, dt);
 						if (first == NULL)
 							first = dt;
 					}
@@ -653,6 +668,7 @@ decide(Node *parsetree, const KsCatalog *cat, UtilDecision *d)
 				}
 				if (multi)
 				{
+					note_colocation(d, dt);
 					d->propagate = true;
 					d->authorize = true;
 				}
@@ -714,6 +730,7 @@ decide(Node *parsetree, const KsCatalog *cat, UtilDecision *d)
 					reject(parsetree, dt, false, NULL);
 				if (multi)
 				{
+					note_colocation(d, dt);
 					d->propagate = true;
 					d->authorize = true;
 				}
@@ -754,6 +771,7 @@ decide(Node *parsetree, const KsCatalog *cat, UtilDecision *d)
 				{
 					if (stmt->concurrent)
 						reject(parsetree, dt, false, "CREATE INDEX CONCURRENTLY cannot run in the distributed transaction.");
+					note_colocation(d, dt);
 					d->propagate = true;
 					d->authorize = true;
 				}
@@ -799,6 +817,7 @@ decide(Node *parsetree, const KsCatalog *cat, UtilDecision *d)
 								get_rel_relispartition(IndexGetRelation(relid, true)))
 								reject(parsetree, dt, true, NULL);
 							ndist++;
+							note_colocation(d, dt);
 							if (first == NULL)
 								first = dt;
 							break;
@@ -863,6 +882,7 @@ decide(Node *parsetree, const KsCatalog *cat, UtilDecision *d)
 					if (dt != NULL)
 					{
 						ndist++;
+						note_colocation(d, dt);
 						if (first == NULL)
 							first = dt;
 					}
@@ -894,6 +914,7 @@ decide(Node *parsetree, const KsCatalog *cat, UtilDecision *d)
 					relid = rangevar_relid(makeRangeVarFromNameList(list_copy_head(names, list_length(names) - 1)));
 				if (direct_dist(cat, relid) != NULL)
 				{
+					note_colocation(d, direct_dist(cat, relid));
 					d->propagate = true;
 					d->authorize = true;
 				}
@@ -1182,6 +1203,8 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 				}
 				text = statement_text(pstmt, queryString);
 				kingres_shard_lock_catalog();
+				foreach(lc, d.colocations)
+					kingres_shard_assert_no_move(lfirst_int(lc));
 				cat = kingres_shard_catalog();
 				foreach(lc, cat->nodes)
 				{
@@ -1246,6 +1269,20 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 			kingres_shard_exec_ddl(kc, text);
 		}
 	}
+}
+
+void
+kingres_shard_internal_ddl_enter(void)
+{
+	ddl_internal_depth++;
+	ddl_authorized_depth++;
+}
+
+void
+kingres_shard_internal_ddl_leave(void)
+{
+	ddl_internal_depth--;
+	ddl_authorized_depth--;
 }
 
 /*

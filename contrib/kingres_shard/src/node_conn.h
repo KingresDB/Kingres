@@ -103,6 +103,17 @@ extern void kingres_shard_conn_expect_node(const char *host, int port, int node_
 /* Failure injection for tests (fault.c). */
 extern void kingres_shard_fault_init(void);
 extern void kingres_shard_fault_point(const char *point);
+extern const char *kingres_shard_fault_spec(void);
+extern void kingres_shard_fault_set_scope(const char *scope);
+
+/*
+ * A connection that belongs to no transaction of this backend: a session on
+ * host:port as the current user, with the options of a node-to-node session.
+ * The caller owns it (PQfinish).  Used by the control sessions of a bucket
+ * move (bucket_move.c).  NULL and *errmsg_out on failure.
+ */
+extern PGconn *kingres_shard_connect_control(const char *host, int port,
+											  char **errmsg_out);
 
 /* Text of a connection error with secret paths of node_conninfo removed. */
 extern char *kingres_shard_scrub_conn_error(const char *msg);

@@ -2,6 +2,7 @@
 # Portions Copyright (c) 2026, RooyeKhat Media Co
 
 kingres_shard_sources = files(
+  'src/bucket_move.c',
   'src/catalog.c',
   'src/dist_scan.c',
   'src/dist_table.c',
@@ -28,6 +29,9 @@ endif
 kingres_shard = shared_module('kingres_shard',
   kingres_shard_sources,
   include_directories: include_directories('src'),
+  # A call of a function that no header declares must stop the build, not print a
+  # warning that nobody reads (a missing prototype once went unnoticed).
+  c_args: ['-Werror=implicit-function-declaration'],
   kwargs: contrib_mod_args + {
     'dependencies': contrib_mod_args['dependencies'] + [libpq],
   },
@@ -38,7 +42,9 @@ install_data(
   'kingres_shard.control',
   'kingres_shard--0.1.sql',
   'kingres_shard--0.2.sql',
+  'kingres_shard--0.3.sql',
   'kingres_shard--0.1--0.2.sql',
+  'kingres_shard--0.2--0.3.sql',
   kwargs: contrib_data_args,
 )
 
@@ -58,6 +64,7 @@ tests += {
       'routing_decisions',
       'reference',
       'ddl_single',
+      'rebalance_plan',
       'upgrade',
     ],
     'regress_args': ['--temp-config', files('kingres_shard.conf')],
@@ -91,6 +98,14 @@ tests += {
       't/022_timeouts_and_worker.pl',
       't/023_scoped_bypass.pl',
       't/024_low_findings.pl',
+      't/025_move_bucket.pl',
+      't/026_move_vs_scan.pl',
+      't/027_move_under_load.pl',
+      't/028_move_faults.pl',
+      't/029_check_cluster.pl',
+      't/030_rebalance.pl',
+      't/031_move_scan_interleavings.pl',
+      't/032_move_scan_stress.pl',
     ],
   },
 }

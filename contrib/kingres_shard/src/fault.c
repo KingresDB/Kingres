@@ -6,12 +6,25 @@
  * The superuser-only setting kingres_shard.fault_injection names one point of
  * the commit protocol and what to do there:
  *
- *	  <point>:kill			kill this backend with SIGKILL (a crash: the
+ *	  <point>:kill[:n]		kill this backend with SIGKILL (a crash: the
  *							postmaster restarts the node, nothing is cleaned)
+ *							(n: after letting n hits of the point pass)
  *	  <point>:error			raise an ERROR (a warning at the points after the
  *							local commit, where nothing may throw)
  *	  <point>:wait:<file>	sleep as long as <file> exists, so that a test can
- *							stop a node or kill a process at a known moment
+ *							stop a node or kill a process at a known moment;
+ *							<file>.reached is created when the point is reached
+ *
+ * A point name can carry a scope, <point>@<scope>:<action>: the point then fires
+ * only in a session whose scope is that one.  The switch of a bucket move sets
+ * the scope "switch" (kingres_shard_fault_set_scope), so that "after_commit@switch"
+ * stops the commit of the switch and not the commit of the earlier steps of the
+ * same move, which are two-phase transactions too.
+ *
+ * Points of a bucket move (bucket_move.c and the move_* functions of the
+ * install script) are named move_<what>; the setting of the session that runs
+ * a move is copied to every control session it opens, so a point inside a
+ * function that runs on another node fires there.
  *
  * Points, in the order a committing transaction reaches them:
  *	  before_prepare, after_first_prepare, after_prepare, after_log (before the
@@ -35,13 +48,17 @@
 #include <signal.h>
 #include <unistd.h>
 
+#include "fmgr.h"
 #include "miscadmin.h"
+#include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/memutils.h"
 #include "utils/timestamp.h"
 
 #include "node_conn.h"
 
 static char *fault_spec = NULL;
+static char *fault_scope = NULL;
 
 void
 kingres_shard_fault_init(void)
@@ -63,6 +80,40 @@ is_post_commit_point(const char *point)
 		strcmp(point, "between_commit_prepared") == 0;
 }
 
+/*
+ * The scope of this session for the points that name one; it stays until the
+ * session ends or another is set.
+ */
+void
+kingres_shard_fault_set_scope(const char *scope)
+{
+	if (fault_scope != NULL)
+		pfree(fault_scope);
+	fault_scope = scope ? MemoryContextStrdup(TopMemoryContext, scope) : NULL;
+}
+
+/* The current value of the setting, "" when unset (copied to control sessions). */
+const char *
+kingres_shard_fault_spec(void)
+{
+	return fault_spec != NULL ? fault_spec : "";
+}
+
+/*
+ * SQL-callable form, for the PL/pgSQL parts of a bucket move:
+ * kingres.internal_fault_point(point text).
+ */
+PG_FUNCTION_INFO_V1(kingres_internal_fault_point);
+
+Datum
+kingres_internal_fault_point(PG_FUNCTION_ARGS)
+{
+	char	   *point = text_to_cstring(PG_GETARG_TEXT_PP(0));
+
+	kingres_shard_fault_point(point);
+	PG_RETURN_VOID();
+}
+
 void
 kingres_shard_fault_point(const char *point)
 {
@@ -70,18 +121,57 @@ kingres_shard_fault_point(const char *point)
 	char	   *action;
 	char	   *arg;
 	size_t		plen;
+	const char *rest;
 
 	if (fault_spec == NULL || fault_spec[0] == '\0')
 		return;
 	plen = strlen(point);
-	if (strncmp(fault_spec, point, plen) != 0 || fault_spec[plen] != ':')
+	if (strncmp(fault_spec, point, plen) != 0)
+		return;
+	if (fault_spec[plen] == ':')
+		rest = fault_spec + plen + 1;
+	else if (fault_spec[plen] == '@')
+	{
+		/* <point>@<scope>:<action>: only in a session of that scope. */
+		const char *colon = strchr(fault_spec + plen + 1, ':');
+		size_t		slen;
+
+		if (colon == NULL || fault_scope == NULL)
+			return;
+		slen = colon - (fault_spec + plen + 1);
+		if (strlen(fault_scope) != slen ||
+			strncmp(fault_scope, fault_spec + plen + 1, slen) != 0)
+			return;
+		rest = colon + 1;
+	}
+	else
 		return;
 
-	spec = pstrdup(fault_spec + plen + 1);
+	spec = pstrdup(rest);
 	action = spec;
 	arg = strchr(spec, ':');
 	if (arg != NULL)
 		*arg++ = '\0';
+
+	/* kill and error take the number of hits to let pass first. */
+	if ((strcmp(action, "kill") == 0 || strcmp(action, "error") == 0) && arg != NULL)
+	{
+		static char *counted_spec = NULL;
+		static int	hits = 0;
+
+		if (counted_spec == NULL || strcmp(counted_spec, fault_spec) != 0)
+		{
+			if (counted_spec != NULL)
+				pfree(counted_spec);
+			counted_spec = MemoryContextStrdup(TopMemoryContext, fault_spec);
+			hits = 0;
+		}
+		if (hits++ < atoi(arg))
+		{
+			pfree(spec);
+			return;
+		}
+	}
 
 	if (strcmp(action, "kill") == 0)
 	{
@@ -101,7 +191,13 @@ kingres_shard_fault_point(const char *point)
 	else if (strcmp(action, "wait") == 0 && arg != NULL)
 	{
 		TimestampTz start = GetCurrentTimestamp();
+		char	   *reached = psprintf("%s.reached", arg);
+		FILE	   *f;
 
+		/* Tell the test that this point has been reached. */
+		f = fopen(reached, "w");
+		if (f != NULL)
+			fclose(f);
 		while (access(arg, F_OK) == 0)
 		{
 			pg_usleep(20000L);

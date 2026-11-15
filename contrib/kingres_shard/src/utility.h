@@ -19,4 +19,14 @@
 extern void kingres_shard_utility_init(void);
 extern bool kingres_shard_in_authorized_ddl(const char *query_string);
 
+/*
+ * The attach and detach of a bucket partition by a bucket move
+ * (bucket_move.c) are refused by the hook like any other; the two functions
+ * that issue them wrap exactly that statement in enter/leave (the hook leaves
+ * it alone and the planner treats the foreign key validation it generates as
+ * local), and nothing else.
+ */
+extern void kingres_shard_internal_ddl_enter(void);
+extern void kingres_shard_internal_ddl_leave(void);
+
 #endif							/* KINGRES_SHARD_UTILITY_H */

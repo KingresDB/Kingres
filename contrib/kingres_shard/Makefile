@@ -8,6 +8,7 @@
 MODULE_big = kingres_shard
 OBJS = \
 	$(WIN32RES) \
+	src/bucket_move.o \
 	src/catalog.o \
 	src/dist_scan.o \
 	src/dist_table.o \
@@ -25,14 +26,17 @@ OBJS = \
 	src/utility.o
 PGFILEDESC = "kingres_shard - KingresDB sharding extension"
 
-PG_CPPFLAGS = -I$(libpq_srcdir) -I$(srcdir)/src
+# A call of a function that no header declares must stop the build, not print a
+# warning that nobody reads (a missing prototype once went unnoticed).
+PG_CPPFLAGS = -I$(libpq_srcdir) -I$(srcdir)/src -Werror=implicit-function-declaration
 SHLIB_LINK_INTERNAL = $(libpq)
 
 EXTENSION = kingres_shard
-DATA = kingres_shard--0.1.sql kingres_shard--0.2.sql kingres_shard--0.1--0.2.sql
+DATA = kingres_shard--0.1.sql kingres_shard--0.2.sql kingres_shard--0.3.sql \
+	kingres_shard--0.1--0.2.sql kingres_shard--0.2--0.3.sql
 
 REGRESS = version catalog bucket_for distribute routing_single security \
-	utility_guard routing_decisions reference ddl_single upgrade
+	utility_guard routing_decisions reference ddl_single rebalance_plan upgrade
 # The tests need the extension preloaded (see kingres_shard.conf).
 REGRESS_OPTS = --temp-config $(srcdir)/kingres_shard.conf
 TAP_TESTS = 1
