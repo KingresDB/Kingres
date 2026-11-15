@@ -433,11 +433,11 @@ after every restart.
   kingres-2 (a follower) and, separately, a stop with rows written on kingres-3
   meanwhile (a row whose bucket is on the stopped server is refused, the others
   must be there after the start); stop and start of all nodes (exit code 0, data
-  back, no crash recovery); ports bound to loopback; tear down. One check is a
-  *known failure* (`KNOWN` in the output, not counted as failed; see
-  `check_known` in `lib.sh`): a stopped follower stays listed as healthy (no
-  heartbeat yet). `--keep` leaves
-  the nodes running for a look.
+  back, no crash recovery: when an instance does come back through crash
+  recovery the test prints the node and what its instance, kingresd and the
+  watchdog logged); ports bound to loopback; tear down. No check is a known
+  failure any more: the servers exchange heartbeats, so a stopped follower is
+  no longer listed as healthy. `--keep` leaves the nodes running for a look.
 
 ## Facts about `kingresd` the packaging depends on
 
@@ -492,7 +492,12 @@ The join test of the compose topology was run twice in a row from a clean state 
 `a35bf950e3` plus the working-tree `kingres/packaging`: 138 passed, 0 failed, 2 known
 failures each time; `test-image.sh` on the same commit: 79 passed, 0 failed. On commit
 `e4736d3244`, which fixed the follower's answer for a database, it gave 139 passed,
-0 failed, 1 known failure.
+0 failed, 1 known failure. On commit `85fcafdeaa` (heartbeats, leases, standbys) it
+gave 140 passed, 0 failed, no known failure. On the way there the test found a
+defect of the lease code that the other suites had not: after a stop and start of
+the whole cluster an instance was started before its lease was held, stopped with an
+immediate shutdown when the first renewal found no majority, and came back through
+crash recovery. The `deb` and image tests were not run again on that commit.
 
 | Measurement | Value |
 |---|---|
@@ -510,7 +515,7 @@ failures each time; `test-image.sh` on the same commit: 79 passed, 0 failed. On 
 |---|---|
 | `test/test-deb.sh` (clean ubuntu:24.04, systemd) | 150 checks passed, 0 failed |
 | `test/test-image.sh` | 79 passed, 0 failed |
-| `test/test-compose.sh` (three nodes joined into one cluster; one known failure) | 139 passed, 0 failed, 1 known failure |
+| `test/test-compose.sh` (three nodes joined into one cluster), on `85fcafdeaa` | 140 passed, 0 failed |
 | `lintian --fail-on error` (2.117) | 0 errors, 0 warnings; 140 information tags (listed above, plus two spelling false positives in `postgres`) |
 | `shellcheck -x -P SCRIPTDIR` on every script | clean |
 | `actionlint` 1.7.12 (with shellcheck) on `ci.yml` | clean; **the workflow was not executed on GitHub** |
