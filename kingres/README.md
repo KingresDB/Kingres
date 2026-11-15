@@ -32,7 +32,7 @@ There is one product branch per PostgreSQL major, with the same KingresDB code o
 | 5 High availability | In progress: heartbeats, leases, standbys and the client entry point are in the control plane; `kingres_shard` 0.5 has standby nodes, `promote_node`, prepared transactions across a failover, distributed deadlock detection and coordinated restore points; failover itself (the control plane promoting a standby) is not written yet. The independent review of 0.5 found one critical and six high defects in these functions ([report](docs/reviews/2026-11-15-kingres-shard-0.5.md)); they are being fixed, and a failover must not be relied on before that |
 | 6 Ledger | Done (`kingres_ledger` 0.2, the verifier, the Ledger page) |
 | 2b, 9 to 12 | Designed, not implemented, except the three standalone extensions of phase 12 listed below |
-| 7 Signing, anchoring, publication, aggregate digest | Designed ([docs/design/ledger-phase7.md](docs/design/ledger-phase7.md)); of 25 steps the first is built: the verifier checks signed checkpoints, tile logs and consistency proofs |
+| 7 Signing, anchoring, publication, aggregate digest | Designed ([docs/design/ledger-phase7.md](docs/design/ledger-phase7.md)); of 25 steps the first two are built: the verifier checks signed checkpoints, tile logs and consistency proofs, and `kingres_ledger` 0.3 has the functions from which the chain is published |
 | 8 | Future roadmap: not part of the first release |
 
 For what has been done, how it was verified and what is still open, read the work log: [docs/worklog.md](docs/worklog.md).

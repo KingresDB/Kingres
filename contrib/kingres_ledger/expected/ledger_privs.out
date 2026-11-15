@@ -31,7 +31,8 @@ CREATE TEMP TABLE pure_primitives (name text PRIMARY KEY);
 INSERT INTO pure_primitives VALUES
     ('ledger_leaf_hash'), ('ledger_node_hash'), ('ledger_merkle_accum'),
     ('ledger_merkle_final'), ('ledger_merkle_path'), ('ledger_tx_leaf'),
-    ('ledger_block_tx_leaf'), ('ledger_block_hash'), ('ledger_genesis_hash'),
+    ('ledger_block_tx_leaf'), ('ledger_block_hash'), ('ledger_block_preimage'),
+    ('ledger_genesis_hash'),
     ('ledger_timestamptz_us'), ('ledger_verify_proof'), ('ledger_hook_active'),
     ('ledger_outer_user');
 -- A function without a fixed search_path that is not on the list.
@@ -80,12 +81,13 @@ FROM members m WHERE m.prosecdef ORDER BY 1, 2;
  ledger_enable          | relation regclass, mode text
  ledger_generate_digest | 
  ledger_guard           | 
+ ledger_head            | 
  ledger_inclusion_proof | relation regclass, row_hash bytea
  ledger_inclusion_proof | relation regclass, row_hash bytea, op "char"
  ledger_record_row      | table_id integer, row_data record
  ledger_verify          | from_height bigint, to_height bigint
  ledger_verify_recorded | from_height bigint, to_height bigint
-(10 rows)
+(11 rows)
 
 -- Unqualified references in the SQL and PL/pgSQL functions: a table of the
 -- extension after FROM, JOIN, INTO, UPDATE or TABLE, or a call of a function
@@ -115,7 +117,9 @@ ORDER BY 1, 2;
  ledger_all_defects      |                                                                                                                                                                                                                                               | t
  ledger_block_hash       | hash_version smallint, height bigint, prev_hash bytea, tx_merkle_root bytea, tx_count integer, closed_at timestamp with time zone                                                                                                             | t
  ledger_block_modify     |                                                                                                                                                                                                                                               | t
+ ledger_block_preimage   | hash_version smallint, height bigint, prev_hash bytea, tx_merkle_root bytea, tx_count integer, closed_at timestamp with time zone                                                                                                             | t
  ledger_block_tx_leaf    | ledger_txid bigint, entry_count integer, merkle_root bytea, user_name name                                                                                                                                                                    | t
+ ledger_blocks_entries   | from_height bigint, max_count integer                                                                                                                                                                                                         | f
  ledger_build_block      |                                                                                                                                                                                                                                               | f
  ledger_capture          |                                                                                                                                                                                                                                               | f
  ledger_catalog_defects  |                                                                                                                                                                                                                                               | t
@@ -123,6 +127,7 @@ ORDER BY 1, 2;
  ledger_generate_digest  |                                                                                                                                                                                                                                               | f
  ledger_genesis_hash     | chain_id bytea                                                                                                                                                                                                                                | t
  ledger_guard            |                                                                                                                                                                                                                                               | t
+ ledger_head             |                                                                                                                                                                                                                                               | f
  ledger_history_acl_sync | relation regclass, history regclass                                                                                                                                                                                                           | f
  ledger_history_defects  | p_hist oid, p_relid oid                                                                                                                                                                                                                       | t
  ledger_history_row_hash | record                                                                                                                                                                                                                                        | t
@@ -152,7 +157,7 @@ ORDER BY 1, 2;
  ledger_verify_proof     | proof jsonb, digest jsonb, expected_table_id integer, expected_row_hash bytea, expected_op "char"                                                                                                                                             | t
  ledger_verify_recorded  | from_height bigint, to_height bigint                                                                                                                                                                                                          | f
  ledger_worker_state     | OUT state text, OUT visits bigint, OUT failures bigint, OUT consecutive_failures integer, OUT last_attempt timestamp with time zone, OUT last_success timestamp with time zone, OUT retry_after timestamp with time zone, OUT last_error text | f
-(40 rows)
+(43 rows)
 
 -- ... and which table PUBLIC can read or write.
 SELECT c.relname,

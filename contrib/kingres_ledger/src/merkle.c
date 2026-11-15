@@ -42,6 +42,7 @@ PG_FUNCTION_INFO_V1(kingres_ledger_merkle_path);
 PG_FUNCTION_INFO_V1(kingres_ledger_tx_leaf);
 PG_FUNCTION_INFO_V1(kingres_ledger_block_tx_leaf);
 PG_FUNCTION_INFO_V1(kingres_ledger_block_hash);
+PG_FUNCTION_INFO_V1(kingres_ledger_block_preimage);
 PG_FUNCTION_INFO_V1(kingres_ledger_genesis_hash);
 
 /*
@@ -374,20 +375,22 @@ kl_block_tx_leaf_hash(uint8 *out, uint64 ledger_txid, uint32 entry_count,
 }
 
 /*
- * kl_block_hash
- *		block_hash = SHA-256(u8 KL_TAG_BLOCK || u16 hash_version ||
+ * kl_block_preimage
+ *		The data a block hash covers: u8 KL_TAG_BLOCK || u16 hash_version ||
  *		u64 height || prev_hash || tx_merkle_root || u32 tx_count ||
- *		i64 closed_at_us).
+ *		i64 closed_at_us, KL_BLOCK_PREIMAGE_LEN bytes into buf.
  *		closed_at_us is microseconds since 2000-01-01 00:00:00 UTC, the
  *		internal representation of timestamptz.
+ *
+ *		This is the one place that lays the bytes out: kl_block_hash hashes
+ *		it, and the SQL function ledger_block_preimage returns it as the leaf
+ *		of the chain log, so the two cannot drift apart.
  */
 void
-kl_block_hash(uint8 *out, uint16 version, uint64 height,
-			  const uint8 *prev_hash, const uint8 *tx_root, uint32 tx_count,
-			  int64 closed_at_us)
+kl_block_preimage(uint8 *buf, uint16 version, uint64 height,
+				  const uint8 *prev_hash, const uint8 *tx_root,
+				  uint32 tx_count, int64 closed_at_us)
 {
-	uint8		buf[1 + 2 + 8 + KL_HASH_LEN + KL_HASH_LEN + 4 + 8];
-
 	buf[0] = KL_TAG_BLOCK;
 	kl_put_u16(buf + 1, version);
 	kl_put_u64(buf + 3, height);
@@ -395,6 +398,21 @@ kl_block_hash(uint8 *out, uint16 version, uint64 height,
 	memcpy(buf + 11 + KL_HASH_LEN, tx_root, KL_HASH_LEN);
 	kl_put_u32(buf + 11 + 2 * KL_HASH_LEN, tx_count);
 	kl_put_u64(buf + 15 + 2 * KL_HASH_LEN, (uint64) closed_at_us);
+}
+
+/*
+ * kl_block_hash
+ *		block_hash = SHA-256(kl_block_preimage(...)).
+ */
+void
+kl_block_hash(uint8 *out, uint16 version, uint64 height,
+			  const uint8 *prev_hash, const uint8 *tx_root, uint32 tx_count,
+			  int64 closed_at_us)
+{
+	uint8		buf[KL_BLOCK_PREIMAGE_LEN];
+
+	kl_block_preimage(buf, version, height, prev_hash, tx_root, tx_count,
+					  closed_at_us);
 	kl_sha256(out, buf, sizeof(buf));
 }
 
@@ -664,6 +682,41 @@ kingres_ledger_block_hash(PG_FUNCTION_ARGS)
 	kl_block_hash(out, (uint16) version, (uint64) height, prev, root,
 				  (uint32) tx_count, (int64) closed_at);
 	PG_RETURN_BYTEA_P(kl_make_bytea(out, KL_HASH_LEN));
+}
+
+/*
+ * kingres.ledger_block_preimage(hash_version smallint, height bigint,
+ *								  prev_hash bytea, tx_merkle_root bytea,
+ *								  tx_count int, closed_at timestamptz)
+ *		The 87 bytes ledger_block_hash hashes, with the same checks on the
+ *		arguments.
+ */
+Datum
+kingres_ledger_block_preimage(PG_FUNCTION_ARGS)
+{
+	int16		version = PG_GETARG_INT16(0);
+	int64		height = PG_GETARG_INT64(1);
+	const uint8 *prev = kl_get_hash_arg(fcinfo, 2, "previous block hash");
+	const uint8 *root = kl_get_hash_arg(fcinfo, 3, "transaction root");
+	int32		tx_count = PG_GETARG_INT32(4);
+	TimestampTz closed_at = PG_GETARG_TIMESTAMPTZ(5);
+	uint8		out[KL_BLOCK_PREIMAGE_LEN];
+
+	if (version != KL_HASH_VERSION)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("hash version %d is not supported", version)));
+	if (height < 0 || tx_count < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("height and tx_count must not be negative")));
+	if (TIMESTAMP_NOT_FINITE(closed_at))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("closed_at must be a finite timestamp")));
+	kl_block_preimage(out, (uint16) version, (uint64) height, prev, root,
+					  (uint32) tx_count, (int64) closed_at);
+	PG_RETURN_BYTEA_P(kl_make_bytea(out, sizeof(out)));
 }
 
 /*

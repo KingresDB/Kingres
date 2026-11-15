@@ -3,10 +3,12 @@
 # kingres_ledger
 
 Tamper-evident ledger tables for KingresDB (a thin fork of PostgreSQL 18.7),
-version 0.2. Version 0.1 (phase 6, first increment) has append-only tables;
+version 0.3. Version 0.1 (phase 6, first increment) has append-only tables;
 version 0.2 adds updatable ledger tables with a history table, background
 workers that build the blocks, and the records an operator needs (recorded
-digests and verifications and a status view). The designs are
+digests and verifications and a status view); version 0.3 (part A of the
+extension work of phase 7) adds three read-only functions for tile
+publication (see "Reading the chain for publication"). The designs are
 [`kingres/docs/design/ledger-mvp.md`](../../kingres/docs/design/ledger-mvp.md)
 (0.1, including its implementation notes) and
 [`kingres/docs/design/ledger-0.2.md`](../../kingres/docs/design/ledger-0.2.md)
@@ -24,7 +26,7 @@ outside the database, lets anyone check later that the table and the chain
 have not been changed, and an inclusion proof shows that one row version is
 part of the ledger.
 
-The hash format is **version 1, unchanged by 0.2**: digests, proofs and block
+The hash format is **version 1, unchanged by 0.2 and 0.3**: digests, proofs and block
 hashes made by 0.1 still verify, and the independent verifier
 (`kingres/verifier`) checks proofs of both operations: `I` (a row version was
 inserted) and `D` (a row version was removed), where the caller chooses which one
@@ -121,7 +123,7 @@ tests:
 kingres/dev/ext.sh kingres_ledger all     # sync build install regress tap
 ```
 
-Tests: eleven pg_regress tests and ten TAP tests under `t/`.
+Tests: thirteen pg_regress tests and twelve TAP tests under `t/`.
 
 | Test | What it covers |
 |---|---|
@@ -136,6 +138,8 @@ Tests: eleven pg_regress tests and ten TAP tests under `t/`.
 | `ledger_format` | the format hardening, checked against an independent SQL implementation over the whole ledger: tags, chain identity, block time, table binding of proofs |
 | `ledger_review` | one reproduction for each finding L-01 to L-12 of the review |
 | `ledger_privs` | scan of `pg_proc`: fixed `search_path`, `SECURITY DEFINER` only where needed, qualified references; the default privileges; shadowing by temporary objects |
+| `ledger_preimage` | `ledger_block_preimage`: an independent layout of the 87 bytes, a pinned value, every stored block, refused arguments, privileges |
+| `ledger_head` | `ledger_head` and `ledger_blocks_entries` in a database of their own: an empty ledger, one and five blocks, every bound of a page, malformed stored blocks (`XX001`), privileges, nothing written |
 | `001_concurrent_blocks` | concurrent writers while blocks are built |
 | `002_restart_standby` | restart, crash recovery, a streaming standby |
 | `003_preload_and_hooks` | the preload requirement, hook chaining with `pg_stat_statements` |
@@ -146,9 +150,16 @@ Tests: eleven pg_regress tests and ten TAP tests under `t/`.
 | `008_updatable_concurrency` | concurrent `UPDATE`, `DELETE`, upsert, `MERGE`, locking, savepoints and rollbacks of the same rows (READ COMMITTED with re-evaluation of the row, and REPEATABLE READ with retries) while blocks are built; logical replication apply into an updatable table |
 | `009_worker` | the block-building workers: bounded time, two databases, `block_interval = 0`, reload, restart, a prepared transaction, bounded blocks, a busy builder lock, a standby and promotion; every phase asserts the outcome (the state the workers report, and no failed or killed worker in the log), not the absence of one line |
 | `010_review2` | the second review and the areas it did not examine: 24 hostile database settings that must not stop the worker, a failing worker (growing delay, `ledger_status`), a cancelled `ledger_verify_recorded`, the launcher (sweeps, memory, a worker that never finishes), `max_worker_processes` used up, logical replication into an updatable table (conflict, `TRUNCATE`), `pg_dump` and restore |
+| `011_upgrade_0_3` | `ALTER EXTENSION UPDATE` from 0.2 and from 0.1 to 0.3 with append-only and updatable tables, blocks, digests, proofs of `I` and `D` and a recorded verification: all still verify, the upgrade writes nothing, the result equals a direct installation of 0.3 (catalog fingerprint with the full definition of every function), `pg_dump` and restore |
+| `012_publish_read` | the reads for publication: an independent recomputation with `Digest::SHA` (hashes, fields, links, the RFC 6962 root), tiles and a signed checkpoint checked by the Go verifier when `KINGRES_VERIFY` names it, concurrent calls under load, a standby, the bound of 10000 entries |
 
 The regress tests need `shared_preload_libraries = 'kingres_ledger'` (the
 in-tree `check` target and `kingres/dev/ext.sh` set it).
+
+The optional verifier check of `012_publish_read` needs a built
+`kingres-verify` (see `kingres/verifier`) and the `openssl` command; run it
+with `KINGRES_VERIFY=/path/to/kingres-verify`. Without the variable those
+subtests are skipped.
 
 ## Installation
 
@@ -179,6 +190,17 @@ Note: a role named `kingres` puts the schema `kingres` first in the default
 `search_path` (through `"$user"`), so unqualified `CREATE TABLE` by that role
 creates the table there; `ledger_enable` refuses tables in schema `kingres`.
 Create user tables in another schema.
+
+**Upgrade from 0.2.** `ALTER EXTENSION kingres_ledger UPDATE TO '0.3'` (the
+script is `kingres_ledger--0.2--0.3.sql`; load the new library first: restart
+the server). It creates three functions and changes nothing else: no table,
+block, digest, proof or ledger entry is touched or written, and every
+verification that passed before still passes. A 0.1 database reaches 0.3 with
+one `ALTER EXTENSION kingres_ledger UPDATE` (through 0.2). The result is the
+same set of objects, privileges and protection as `CREATE EXTENSION
+kingres_ledger VERSION '0.3'` (`t/011_upgrade_0_3.pl` compares them,
+including the definition of every function). The 0.3 library works with the
+0.2 SQL; the 0.3 SQL needs the 0.3 library.
 
 **Upgrade from 0.1.** `ALTER EXTENSION kingres_ledger UPDATE` (the script is
 `kingres_ledger--0.1--0.2.sql`; load the new library first: restart the server,
@@ -333,6 +355,9 @@ last argument.
 | `kingres.ledger_verify_proof(jsonb, jsonb, int, bytea, "char") returns boolean` | The same for a proof of the given operation, `I` or `D`. | PUBLIC |
 | `kingres.ledger_history_row_hash(record) returns bytea` | Row hash of a row of a history table (`SELECT kingres.ledger_history_row_hash(h.*) FROM t_ledger_history h`): the hash its `D` entry carries. | PUBLIC |
 | `kingres.ledger_leaf_hash(bytea)`, `ledger_node_hash(bytea, bytea)`, `ledger_merkle_root(bytea)` (aggregate), `ledger_merkle_path(bytea[], int)`, `ledger_tx_leaf(...)`, `ledger_block_tx_leaf(...)`, `ledger_block_hash(...)`, `ledger_genesis_hash(bytea)`, `ledger_timestamptz_us(timestamptz)` | Primitives used by the SQL functions and useful for independent checks. | PUBLIC |
+| `kingres.ledger_block_preimage(hash_version smallint, height bigint, prev_hash bytea, tx_merkle_root bytea, tx_count int, closed_at timestamptz) returns bytea` | **0.3.** The 87 bytes that `ledger_block_hash` hashes (the same code lays them out), with the same argument checks. `IMMUTABLE`, `STRICT`. | PUBLIC |
+| `kingres.ledger_head() returns table (chain_id bytea, height bigint, block_hash bytea, closed_at_us bigint)` | **0.3.** The latest block without building one and without recording a digest; no row for an empty ledger; an error `XX001` if the chain identity is missing. `STABLE`, `SECURITY DEFINER`. | granted roles (the service role of `kingresd`) |
+| `kingres.ledger_blocks_entries(from_height bigint, max_count int) returns table (height bigint, entry bytea)` | **0.3.** The block preimages from `from_height`, in height order, at most `min(max_count, 10000)` of them. Every block returned is checked first: hash version 1, lengths, no gap, the link to the block before (the genesis hash for block 0), and `SHA-256(entry) = block_hash`; the first failure is an error `XX001` and no row is returned. `STABLE`, runs as the caller (the headers are readable by PUBLIC). | granted roles |
 | `kingres.ledger_hook_active()` | True when the library was loaded through `shared_preload_libraries`. | PUBLIC |
 
 Internal functions (`ledger_capture`, `ledger_record_row`, `ledger_lock_table`,
@@ -414,6 +439,7 @@ DEFINER`:
 | `ledger_verify` | reads every ledger table, every history table and every table under ledger control |
 | `ledger_verify_recorded` | writes `ledger_verification` |
 | `ledger_inclusion_proof` (both forms) | reads the entries and transactions, which the caller may not read; the two-argument form is a wrapper that exists so that grants made on it under 0.1 keep working |
+| `ledger_head` | one statement snapshot of the chain identity and the latest block; defined as the owner so that the answer does not depend on what the caller may read of the ledger tables (it returns a hash and a count, no row data) |
 | `ledger_guard` (event trigger) | must see the ledger tables whatever grants an administrator changed, so that DDL of every role keeps working; it also moves the privileges of the history tables (through `ledger_history_acl_sync`, which is not `SECURITY DEFINER` and is not executable by anybody else) |
 
 All of them have `SET search_path = pg_catalog, pg_temp`, and every reference to
@@ -621,6 +647,46 @@ the size of the ledger, which is why they are not executable by PUBLIC.
   captured by the trigger or entered by `ledger_enable`, and the ledger verifies.
 - A hot standby can verify the ledger, check digests and build and check
   proofs; it cannot enable tables or build blocks (it is read-only).
+
+## Reading the chain for publication
+
+Version 0.3 (part A) adds what the control plane needs to publish the blocks
+as a tile log (design `kingres/docs/design/ledger-phase7.md`, sections 4 and
+8.1): the leaf of the log is the block hash preimage, and the log is built
+from pages of preimages. The three functions read; none builds a block,
+records a digest or writes any table, and the hash format is unchanged.
+
+- **Snapshot.** The functions are `STABLE`: they read the snapshot of the
+  statement that calls them, so `ledger_head` and `ledger_blocks_entries` in
+  one statement (or one `REPEATABLE READ` transaction) see the same blocks.
+  Separate statements in `READ COMMITTED` see the head they find then; the
+  head only grows. They take no lock that blocks writers or the block
+  builder, and a block becomes visible whole and in height order (the
+  builder holds an exclusive lock on `ledger_chain` until it commits), so a
+  page never has a gap that is not damage.
+- **Standby.** They work on a hot standby and read what has been replayed;
+  the answer is the same as the primary's at that replay point. They run in
+  a read-only transaction.
+- **Privileges.** `ledger_block_preimage` is a pure computation and is
+  executable by PUBLIC, like `ledger_block_hash`. `ledger_head` and
+  `ledger_blocks_entries` are not executable by PUBLIC: they expose hashes,
+  counts and close times of blocks, no row data, but the publication is an
+  operator's choice. `GRANT EXECUTE` to the service role of `kingresd`;
+  nothing is granted at installation. A role with only that grant can call
+  them and cannot read `ledger_entry`, `ledger_tx` or `ledger_pending`.
+- **Paging.** `ledger_blocks_entries(from_height, max_count)` returns the
+  blocks with `height >= from_height` in height order, at most
+  `min(max_count, 10000)`. An empty chain, a `from_height` past the head and
+  `max_count = 0` give no rows; a negative argument is an error (`22023`);
+  a NULL argument gives no rows. To read on, ask from the last height plus
+  one. `closed_at_us` and the last eight bytes of an entry are microseconds
+  since 2000-01-01 00:00:00 UTC, as in the digests.
+- **Damage.** A stored block whose fields do not hash to its `block_hash`,
+  a block with another hash version, a stored value of the wrong length, a
+  missing block or a block that does not follow the one before it is an
+  error `XX001`, never a silently shortened answer, so a publisher that
+  signs what it reads never signs a broken chain. The check uses
+  `pg_catalog.sha256`, not the extension's hash.
 
 ## Hash format version 1
 
