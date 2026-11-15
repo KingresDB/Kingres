@@ -1,0 +1,633 @@
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+-- SPDX-License-Identifier: PostgreSQL
+--
+-- columnar_refusals: what a columnar table does not do, with the SQLSTATE and
+-- the message, and the statements that look like writes but touch no row.
+SET search_path = public;
+-- run one statement; report the SQLSTATE, message and hint of its error, or ok
+CREATE FUNCTION kc_try(stmt text) RETURNS TABLE (state text, message text, hint text)
+LANGUAGE plpgsql AS $$
+BEGIN
+    EXECUTE stmt;
+    state := '00000'; message := 'ok'; hint := NULL;
+    RETURN NEXT;
+EXCEPTION WHEN OTHERS THEN
+    GET STACKED DIAGNOSTICS state = RETURNED_SQLSTATE, message = MESSAGE_TEXT, hint = PG_EXCEPTION_HINT;
+    RETURN NEXT;
+END $$;
+CREATE TABLE r1 (id int, s text) USING columnar;
+INSERT INTO r1 SELECT i, 'x' || i FROM generate_series(1, 100) i;
+CREATE TABLE src (id int, s text);
+INSERT INTO src VALUES (1, 'one'), (1000, 'thousand');
+-- UPDATE, DELETE and MERGE: refused as soon as a row would be written; the message of the
+-- statements that fetch the old row first (RETURNING, joins, MERGE) differs, the SQLSTATE does not
+UPDATE r1 SET s = 'u' WHERE id = 1;
+ERROR:  columnar tables are append-only: UPDATE and DELETE are not supported
+DELETE FROM r1 WHERE id = 1;
+ERROR:  columnar tables are append-only: UPDATE and DELETE are not supported
+UPDATE r1 SET s = 'u';
+ERROR:  columnar tables are append-only: UPDATE and DELETE are not supported
+DELETE FROM r1;
+ERROR:  columnar tables are append-only: UPDATE and DELETE are not supported
+SELECT state FROM kc_try($$UPDATE r1 SET s = 'u' WHERE id = 1 RETURNING *$$);
+ state 
+-------
+ 0A000
+(1 row)
+
+SELECT state FROM kc_try($$UPDATE r1 SET s = src.s FROM src WHERE r1.id = src.id$$);
+ state 
+-------
+ 0A000
+(1 row)
+
+SELECT state FROM kc_try($$DELETE FROM r1 USING src WHERE r1.id = src.id$$);
+ state 
+-------
+ 0A000
+(1 row)
+
+SELECT state FROM kc_try($$MERGE INTO r1 t USING src s ON t.id = s.id WHEN MATCHED THEN UPDATE SET s = 'm'$$);
+ state 
+-------
+ 0A000
+(1 row)
+
+SELECT state FROM kc_try($$MERGE INTO r1 t USING src s ON t.id = s.id WHEN MATCHED THEN DELETE$$);
+ state 
+-------
+ 0A000
+(1 row)
+
+SELECT state FROM kc_try($$MERGE INTO r1 t USING src s ON t.id = s.id
+  WHEN MATCHED THEN UPDATE SET s = 'm' WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.s)$$);
+ state 
+-------
+ 0A000
+(1 row)
+
+-- statements that write no row succeed
+UPDATE r1 SET s = 'u' WHERE false;
+UPDATE r1 SET s = 'u' WHERE id = -1;
+DELETE FROM r1 WHERE id = -1;
+SELECT * FROM kc_try($$MERGE INTO r1 t USING src s ON t.id = s.id + 5000 WHEN MATCHED THEN UPDATE SET s = 'm'$$);
+ state | message | hint 
+-------+---------+------
+ 00000 | ok      | 
+(1 row)
+
+SELECT * FROM kc_try($$MERGE INTO r1 t USING src s ON t.id = s.id + 5000 WHEN MATCHED THEN DELETE$$);
+ state | message | hint 
+-------+---------+------
+ 00000 | ok      | 
+(1 row)
+
+-- MERGE that only inserts
+MERGE INTO r1 t USING src s ON t.id = s.id + 5000 WHEN NOT MATCHED THEN INSERT VALUES (s.id + 5000, s.s);
+MERGE INTO r1 t USING src s ON t.id = s.id + 8000 WHEN MATCHED THEN UPDATE SET s = 'm'
+  WHEN NOT MATCHED THEN INSERT VALUES (s.id + 6000, s.s);
+SELECT id, s FROM r1 WHERE id > 1000 ORDER BY id;
+  id  |    s     
+------+----------
+ 5001 | one
+ 6000 | thousand
+ 6001 | one
+ 7000 | thousand
+(4 rows)
+
+SELECT count(*) FROM r1;
+ count 
+-------
+   104
+(1 row)
+
+-- row locks
+SELECT * FROM r1 WHERE id = 1 FOR UPDATE;
+ERROR:  columnar tables do not support row locks
+SELECT * FROM kc_try($$SELECT * FROM r1 FOR UPDATE$$);
+ state |                 message                  | hint 
+-------+------------------------------------------+------
+ 0A000 | columnar tables do not support row locks | 
+(1 row)
+
+SELECT * FROM kc_try($$SELECT * FROM r1 FOR NO KEY UPDATE$$);
+ state |                 message                  | hint 
+-------+------------------------------------------+------
+ 0A000 | columnar tables do not support row locks | 
+(1 row)
+
+SELECT * FROM kc_try($$SELECT * FROM r1 FOR SHARE$$);
+ state |                 message                  | hint 
+-------+------------------------------------------+------
+ 0A000 | columnar tables do not support row locks | 
+(1 row)
+
+SELECT * FROM kc_try($$SELECT * FROM r1 FOR KEY SHARE$$);
+ state |                 message                  | hint 
+-------+------------------------------------------+------
+ 0A000 | columnar tables do not support row locks | 
+(1 row)
+
+SELECT * FROM kc_try($$SELECT * FROM r1 FOR UPDATE SKIP LOCKED$$);
+ state |                 message                  | hint 
+-------+------------------------------------------+------
+ 0A000 | columnar tables do not support row locks | 
+(1 row)
+
+SELECT * FROM kc_try($$SELECT * FROM r1 FOR UPDATE NOWAIT$$);
+ state |                 message                  | hint 
+-------+------------------------------------------+------
+ 0A000 | columnar tables do not support row locks | 
+(1 row)
+
+SELECT * FROM kc_try($$SELECT * FROM r1 JOIN src USING (id) FOR UPDATE OF src$$);
+ state | message | hint 
+-------+---------+------
+ 00000 | ok      | 
+(1 row)
+
+SELECT * FROM kc_try($$SELECT * FROM r1 JOIN src USING (id) FOR UPDATE OF r1$$);
+ state |                 message                  | hint 
+-------+------------------------------------------+------
+ 0A000 | columnar tables do not support row locks | 
+(1 row)
+
+SELECT * FROM kc_try($$SELECT * FROM r1 JOIN src USING (id) FOR SHARE$$);
+ state |                 message                  | hint 
+-------+------------------------------------------+------
+ 0A000 | columnar tables do not support row locks | 
+(1 row)
+
+-- locking no row is fine, and so is locking another table
+SELECT * FROM r1 WHERE id = -1 FOR UPDATE;
+ id | s 
+----+---
+(0 rows)
+
+SELECT * FROM kc_try($$SELECT * FROM r1 JOIN src USING (id) WHERE r1.id < 0 FOR UPDATE OF src$$);
+ state | message | hint 
+-------+---------+------
+ 00000 | ok      | 
+(1 row)
+
+SELECT * FROM kc_try($$SELECT * FROM src WHERE id IN (SELECT id FROM r1) FOR UPDATE$$);
+ state | message | hint 
+-------+---------+------
+ 00000 | ok      | 
+(1 row)
+
+LOCK TABLE r1 IN ACCESS EXCLUSIVE MODE NOWAIT;
+ERROR:  LOCK TABLE can only be used in transaction blocks
+BEGIN;
+LOCK TABLE r1 IN ACCESS EXCLUSIVE MODE;
+SELECT count(*) FROM r1;
+ count 
+-------
+   104
+(1 row)
+
+COMMIT;
+-- ON CONFLICT: with no unique index there is nothing to infer, DO NOTHING without a target works
+INSERT INTO r1 VALUES (1, 'dup') ON CONFLICT DO NOTHING;
+SELECT count(*) FROM r1 WHERE id = 1;
+ count 
+-------
+     2
+(1 row)
+
+INSERT INTO r1 VALUES (1, 'dup') ON CONFLICT (id) DO NOTHING;
+ERROR:  there is no unique or exclusion constraint matching the ON CONFLICT specification
+INSERT INTO r1 VALUES (1, 'dup') ON CONFLICT (id) DO UPDATE SET s = 'y';
+ERROR:  there is no unique or exclusion constraint matching the ON CONFLICT specification
+INSERT INTO r1 VALUES (1, 'dup') ON CONFLICT DO UPDATE SET s = 'y';
+ERROR:  ON CONFLICT DO UPDATE requires inference specification or constraint name
+LINE 1: INSERT INTO r1 VALUES (1, 'dup') ON CONFLICT DO UPDATE SET s...
+                                         ^
+HINT:  For example, ON CONFLICT (column_name).
+INSERT INTO r1 VALUES (1, 'dup') ON CONFLICT ON CONSTRAINT r1_pkey DO NOTHING;
+ERROR:  constraint "r1_pkey" for table "r1" does not exist
+INSERT INTO r1 VALUES (7777, 'ret') RETURNING id, s;
+  id  |  s  
+------+-----
+ 7777 | ret
+(1 row)
+
+-- indexes, primary keys and unique constraints
+CREATE INDEX r1_i ON r1 (id);
+ERROR:  indexes on columnar tables are not supported in this version
+CREATE INDEX r1_hash ON r1 USING hash (id);
+ERROR:  indexes on columnar tables are not supported in this version
+CREATE INDEX r1_brin ON r1 USING brin (id);
+ERROR:  indexes on columnar tables are not supported in this version
+CREATE UNIQUE INDEX r1_u ON r1 (id);
+ERROR:  indexes on columnar tables are not supported in this version
+CREATE INDEX CONCURRENTLY r1_ic ON r1 (id);
+ERROR:  indexes on columnar tables are not supported in this version
+-- the failed concurrent build leaves an invalid index, as it does on a heap table
+SELECT indisvalid FROM pg_index WHERE indexrelid = 'r1_ic'::regclass;
+ indisvalid 
+------------
+ f
+(1 row)
+
+DROP INDEX r1_ic;
+CREATE TABLE r2 (id int PRIMARY KEY, s text) USING columnar;
+ERROR:  indexes on columnar tables are not supported in this version
+CREATE TABLE r2 (id int UNIQUE, s text) USING columnar;
+ERROR:  indexes on columnar tables are not supported in this version
+CREATE TABLE r2 (id int, s text, EXCLUDE USING btree (id WITH =)) USING columnar;
+ERROR:  indexes on columnar tables are not supported in this version
+CREATE TABLE r2 (id int, s text) USING columnar;
+ALTER TABLE r2 ADD PRIMARY KEY (id);
+ERROR:  indexes on columnar tables are not supported in this version
+ALTER TABLE r2 ADD UNIQUE (id);
+ERROR:  indexes on columnar tables are not supported in this version
+ALTER TABLE r2 ADD EXCLUDE USING btree (id WITH =);
+ERROR:  indexes on columnar tables are not supported in this version
+ALTER TABLE r2 ADD CONSTRAINT r2_u UNIQUE USING INDEX r1_nonexistent;
+ERROR:  index "r1_nonexistent" does not exist
+LINE 1: ALTER TABLE r2 ADD CONSTRAINT r2_u UNIQUE USING INDEX r1_non...
+                           ^
+SELECT count(*) AS indexes_on_columnar FROM pg_index WHERE indrelid IN ('r1'::regclass, 'r2'::regclass);
+ indexes_on_columnar 
+---------------------
+                   0
+(1 row)
+
+-- a heap table with an index cannot become columnar; without one it can
+CREATE TABLE r3 (id int PRIMARY KEY, s text);
+ALTER TABLE r3 SET ACCESS METHOD columnar;
+ERROR:  indexes on columnar tables are not supported in this version
+CREATE TABLE r3b (id int, s text);
+CREATE INDEX r3b_i ON r3b (id);
+ALTER TABLE r3b SET ACCESS METHOD columnar;
+ERROR:  indexes on columnar tables are not supported in this version
+DROP INDEX r3b_i;
+ALTER TABLE r3b SET ACCESS METHOD columnar;
+SELECT a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.oid = 'r3b'::regclass;
+  amname  
+----------
+ columnar
+(1 row)
+
+CREATE TABLE r3c (LIKE r3 INCLUDING ALL) USING columnar;
+ERROR:  indexes on columnar tables are not supported in this version
+CREATE TABLE r3c (LIKE r3 INCLUDING DEFAULTS INCLUDING CONSTRAINTS) USING columnar;
+SELECT a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.oid = 'r3c'::regclass;
+  amname  
+----------
+ columnar
+(1 row)
+
+CREATE MATERIALIZED VIEW mv USING columnar AS SELECT id, s FROM src;
+CREATE UNIQUE INDEX mv_u ON mv (id);
+ERROR:  indexes on columnar tables are not supported in this version
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv;
+ERROR:  cannot refresh materialized view "public.mv" concurrently
+HINT:  Create a unique index with no WHERE clause on one or more columns of the materialized view.
+REFRESH MATERIALIZED VIEW mv;
+SELECT count(*) FROM mv;
+ count 
+-------
+     2
+(1 row)
+
+-- no index, no CLUSTER
+CLUSTER r1;
+ERROR:  there is no previously clustered index for table "r1"
+CLUSTER r1 USING r1_i;
+ERROR:  index "r1_i" for table "r1" does not exist
+VACUUM FULL r1;
+REINDEX TABLE r1;
+NOTICE:  table "r1" has no indexes to reindex
+-- TABLESAMPLE
+SELECT count(*) FROM r1 TABLESAMPLE SYSTEM (50);
+ERROR:  TABLESAMPLE is not supported on columnar tables
+SELECT count(*) FROM r1 TABLESAMPLE BERNOULLI (50) REPEATABLE (1);
+ERROR:  TABLESAMPLE is not supported on columnar tables
+-- TID scans: a row of a columnar table cannot be fetched by its TID (the
+-- Columnar Scan filters on the synthetic ctid instead, so switch it off)
+SET kingres_columnar.enable_custom_scan = off;
+SET enable_seqscan = off;
+SELECT state FROM kc_try($$SELECT count(*) FROM r1 WHERE ctid = '(0,6)'$$);
+ state 
+-------
+ 0A000
+(1 row)
+
+RESET kingres_columnar.enable_custom_scan;
+RESET enable_seqscan;
+-- temporary and unlogged tables
+CREATE TEMP TABLE t_tmp (a int) USING columnar;
+ERROR:  columnar tables cannot be temporary or unlogged
+CREATE TEMPORARY TABLE t_tmp USING columnar AS SELECT 1 AS a;
+ERROR:  columnar tables cannot be temporary or unlogged
+CREATE UNLOGGED TABLE t_unl (a int) USING columnar;
+ERROR:  columnar tables cannot be temporary or unlogged
+CREATE UNLOGGED TABLE t_unl USING columnar AS SELECT 1 AS a;
+ERROR:  columnar tables cannot be temporary or unlogged
+ALTER TABLE r1 SET UNLOGGED;
+ERROR:  columnar tables cannot be temporary or unlogged
+CREATE TEMP TABLE t_heap (a int);
+ALTER TABLE t_heap SET ACCESS METHOD columnar;
+ERROR:  columnar tables cannot be temporary or unlogged
+CREATE UNLOGGED TABLE t_heap_unl (a int);
+ALTER TABLE t_heap_unl SET ACCESS METHOD columnar;
+ERROR:  columnar tables cannot be temporary or unlogged
+ALTER TABLE t_heap_unl SET LOGGED;
+ALTER TABLE t_heap_unl SET ACCESS METHOD columnar;
+SELECT a.amname, c.relpersistence FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.oid = 't_heap_unl'::regclass;
+  amname  | relpersistence 
+----------+----------------
+ columnar | p
+(1 row)
+
+SET default_table_access_method = columnar;
+CREATE TEMP TABLE t_tmp2 (a int);
+ERROR:  columnar tables cannot be temporary or unlogged
+CREATE TABLE t_def (a int);
+RESET default_table_access_method;
+SELECT a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.oid = 't_def'::regclass;
+  amname  
+----------
+ columnar
+(1 row)
+
+DROP TABLE t_def, t_heap_unl;
+-- foreign keys, both directions
+CREATE TABLE pk_heap (id int PRIMARY KEY);
+CREATE TABLE fk_col (id int REFERENCES pk_heap (id)) USING columnar;
+ERROR:  foreign keys on or to columnar tables are not supported
+HINT:  Keep the referencing and the referenced table in row storage.
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 8 at RAISE
+CREATE TABLE fk_col (id int) USING columnar;
+ALTER TABLE fk_col ADD FOREIGN KEY (id) REFERENCES pk_heap (id);
+ERROR:  foreign keys on or to columnar tables are not supported
+HINT:  Keep the referencing and the referenced table in row storage.
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 8 at RAISE
+ALTER TABLE fk_col ADD CONSTRAINT fk_col_fk FOREIGN KEY (id) REFERENCES pk_heap (id) NOT VALID;
+ERROR:  foreign keys on or to columnar tables are not supported
+HINT:  Keep the referencing and the referenced table in row storage.
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 8 at RAISE
+CREATE TABLE fk_heap (id int REFERENCES r1 (id));
+ERROR:  there is no unique constraint matching given keys for referenced table "r1"
+CREATE TABLE fk_heap (id int);
+ALTER TABLE fk_heap ADD FOREIGN KEY (id) REFERENCES r1 (id);
+ERROR:  there is no unique constraint matching given keys for referenced table "r1"
+SELECT count(*) AS foreign_keys FROM pg_constraint WHERE contype = 'f' AND conrelid IN ('fk_col'::regclass, 'fk_heap'::regclass);
+ foreign_keys 
+--------------
+            0
+(1 row)
+
+DROP TABLE fk_col, fk_heap, pk_heap;
+-- triggers
+CREATE FUNCTION trg_row() RETURNS trigger LANGUAGE plpgsql AS
+$$ BEGIN NEW.s := 'by ' || TG_NAME; RETURN NEW; END $$;
+CREATE FUNCTION trg_stmt() RETURNS trigger LANGUAGE plpgsql AS
+$$ BEGIN RAISE NOTICE '% % % rows %', TG_NAME, TG_WHEN, TG_OP, (SELECT count(*) FROM new_rows); RETURN NULL; END $$;
+CREATE FUNCTION trg_stmt_plain() RETURNS trigger LANGUAGE plpgsql AS
+$$ BEGIN RAISE NOTICE '% % % %', TG_NAME, TG_WHEN, TG_OP, TG_LEVEL; RETURN NULL; END $$;
+CREATE TABLE tg (id int, s text) USING columnar;
+CREATE TRIGGER tg_before_row BEFORE INSERT ON tg FOR EACH ROW EXECUTE FUNCTION trg_row();
+CREATE TRIGGER tg_before_stmt BEFORE INSERT ON tg FOR EACH STATEMENT EXECUTE FUNCTION trg_stmt_plain();
+CREATE TRIGGER tg_after_stmt AFTER INSERT ON tg FOR EACH STATEMENT EXECUTE FUNCTION trg_stmt_plain();
+CREATE TRIGGER tg_transition AFTER INSERT ON tg REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION trg_stmt();
+CREATE TRIGGER tg_truncate AFTER TRUNCATE ON tg FOR EACH STATEMENT EXECUTE FUNCTION trg_stmt_plain();
+INSERT INTO tg VALUES (1, 'a'), (2, 'b');
+NOTICE:  tg_before_stmt BEFORE INSERT STATEMENT
+NOTICE:  tg_after_stmt AFTER INSERT STATEMENT
+NOTICE:  tg_transition AFTER INSERT rows 2
+COPY tg FROM STDIN;
+NOTICE:  tg_before_stmt BEFORE INSERT STATEMENT
+NOTICE:  tg_after_stmt AFTER INSERT STATEMENT
+NOTICE:  tg_transition AFTER INSERT rows 2
+SELECT id, s FROM tg ORDER BY id;
+ id |        s         
+----+------------------
+  1 | by tg_before_row
+  2 | by tg_before_row
+  3 | by tg_before_row
+  4 | by tg_before_row
+(4 rows)
+
+CREATE TRIGGER tg_after_row AFTER INSERT ON tg FOR EACH ROW EXECUTE FUNCTION trg_stmt_plain();
+ERROR:  row-level AFTER triggers on columnar tables are not supported
+HINT:  Use a BEFORE ROW or a statement-level trigger, or keep the table in row storage.
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 18 at RAISE
+CREATE TRIGGER tg_after_row_upd AFTER UPDATE ON tg FOR EACH ROW EXECUTE FUNCTION trg_stmt_plain();
+ERROR:  row-level AFTER triggers on columnar tables are not supported
+HINT:  Use a BEFORE ROW or a statement-level trigger, or keep the table in row storage.
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 18 at RAISE
+CREATE TRIGGER tg_after_row_del AFTER DELETE ON tg FOR EACH ROW EXECUTE FUNCTION trg_stmt_plain();
+ERROR:  row-level AFTER triggers on columnar tables are not supported
+HINT:  Use a BEFORE ROW or a statement-level trigger, or keep the table in row storage.
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 18 at RAISE
+CREATE CONSTRAINT TRIGGER tg_constraint AFTER INSERT ON tg FOR EACH ROW EXECUTE FUNCTION trg_stmt_plain();
+ERROR:  row-level AFTER triggers on columnar tables are not supported
+HINT:  Use a BEFORE ROW or a statement-level trigger, or keep the table in row storage.
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 18 at RAISE
+CREATE TRIGGER tg_before_upd BEFORE UPDATE ON tg FOR EACH ROW EXECUTE FUNCTION trg_row();
+CREATE TRIGGER tg_before_del BEFORE DELETE ON tg FOR EACH ROW EXECUTE FUNCTION trg_row();
+SELECT tgname FROM pg_trigger WHERE tgrelid = 'tg'::regclass AND NOT tgisinternal ORDER BY tgname;
+     tgname     
+----------------
+ tg_after_stmt
+ tg_before_del
+ tg_before_row
+ tg_before_stmt
+ tg_before_upd
+ tg_transition
+ tg_truncate
+(7 rows)
+
+TRUNCATE tg;
+NOTICE:  tg_truncate AFTER TRUNCATE STATEMENT
+-- a heap table with an AFTER ROW trigger cannot become columnar
+CREATE TABLE tg_heap (id int);
+CREATE TRIGGER tg_heap_after AFTER INSERT ON tg_heap FOR EACH ROW EXECUTE FUNCTION trg_stmt_plain();
+ALTER TABLE tg_heap SET ACCESS METHOD columnar;
+ERROR:  row-level AFTER triggers on columnar tables are not supported
+HINT:  Use a BEFORE ROW or a statement-level trigger, or keep the table in row storage.
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 18 at RAISE
+DROP TRIGGER tg_heap_after ON tg_heap;
+ALTER TABLE tg_heap SET ACCESS METHOD columnar;
+-- the trigger of a partitioned parent is cloned to the columnar partition
+CREATE TABLE tg_p (id int) PARTITION BY LIST (id);
+CREATE TRIGGER tg_p_after AFTER INSERT ON tg_p FOR EACH ROW EXECUTE FUNCTION trg_stmt_plain();
+CREATE TABLE tg_p1 PARTITION OF tg_p FOR VALUES IN (1) USING columnar;
+ERROR:  row-level AFTER triggers on columnar tables are not supported
+HINT:  Use a BEFORE ROW or a statement-level trigger, or keep the table in row storage.
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 18 at RAISE
+CREATE TABLE tg_p2 PARTITION OF tg_p FOR VALUES IN (2);
+CREATE TABLE tg_p3 (id int) USING columnar;
+ALTER TABLE tg_p ATTACH PARTITION tg_p3 FOR VALUES IN (3);
+ERROR:  row-level AFTER triggers on columnar tables are not supported
+HINT:  Use a BEFORE ROW or a statement-level trigger, or keep the table in row storage.
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 18 at RAISE
+SELECT c.relname, a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.relname LIKE 'tg_p%' AND c.relkind = 'r' ORDER BY 1;
+ relname |  amname  
+---------+----------
+ tg_p2   | heap
+ tg_p3   | columnar
+(2 rows)
+
+DROP TABLE tg_p, tg_p3;
+DROP TABLE tg, tg_heap;
+-- the event triggers fire in every session_replication_role
+SET session_replication_role = replica;
+CREATE TABLE rr (id int) USING columnar;
+CREATE FUNCTION trg_rr() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
+CREATE TRIGGER rr_after AFTER INSERT ON rr FOR EACH ROW EXECUTE FUNCTION trg_rr();
+ERROR:  row-level AFTER triggers on columnar tables are not supported
+HINT:  Use a BEFORE ROW or a statement-level trigger, or keep the table in row storage.
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 18 at RAISE
+CREATE TABLE pk_rr (id int PRIMARY KEY);
+CREATE TABLE rr_fk (id int REFERENCES pk_rr (id)) USING columnar;
+ERROR:  foreign keys on or to columnar tables are not supported
+HINT:  Keep the referencing and the referenced table in row storage.
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 8 at RAISE
+RESET session_replication_role;
+DROP TABLE rr, pk_rr;
+DROP FUNCTION trg_rr();
+-- TRUNCATE in a subtransaction, after the transaction wrote rows at an outer level
+CREATE TABLE tr (id int) USING columnar;
+BEGIN;
+INSERT INTO tr VALUES (1);
+SAVEPOINT s;
+TRUNCATE tr;
+ERROR:  cannot truncate columnar table "tr" in a subtransaction after rows were inserted in an outer one
+ROLLBACK;
+BEGIN;
+SAVEPOINT a;
+INSERT INTO tr VALUES (1);
+SAVEPOINT b;
+TRUNCATE tr;
+ERROR:  cannot truncate columnar table "tr" in a subtransaction after rows were inserted in an outer one
+ROLLBACK;
+-- the same level works, and so does a table created in the transaction
+BEGIN;
+SAVEPOINT a;
+INSERT INTO tr VALUES (2);
+TRUNCATE tr;
+INSERT INTO tr VALUES (3);
+COMMIT;
+SELECT * FROM tr;
+ id 
+----
+  3
+(1 row)
+
+BEGIN;
+CREATE TABLE tr2 (id int) USING columnar;
+SAVEPOINT s;
+INSERT INTO tr2 VALUES (1);
+TRUNCATE tr2;
+INSERT INTO tr2 VALUES (2);
+RELEASE s;
+COMMIT;
+SELECT * FROM tr2;
+ id 
+----
+  2
+(1 row)
+
+-- partitioned tables with a columnar partition
+CREATE TABLE pp (id int, v int) PARTITION BY RANGE (id);
+CREATE TABLE pp_col PARTITION OF pp FOR VALUES FROM (0) TO (100) USING columnar;
+CREATE TABLE pp_heap PARTITION OF pp FOR VALUES FROM (100) TO (200);
+INSERT INTO pp SELECT i, i FROM generate_series(0, 199) i;
+UPDATE pp SET v = -1 WHERE id = 150;
+SELECT * FROM pp WHERE v = -1;
+ id  | v  
+-----+----
+ 150 | -1
+(1 row)
+
+UPDATE pp SET v = -2 WHERE id = 50;
+ERROR:  columnar tables are append-only: UPDATE and DELETE are not supported
+UPDATE pp SET v = -3 WHERE id = 500;
+UPDATE pp SET v = -4 WHERE v = 12345;
+DELETE FROM pp WHERE id >= 100 AND id < 120;
+DELETE FROM pp WHERE v = -1000;
+DELETE FROM pp WHERE id = 5;
+ERROR:  columnar tables are append-only: UPDATE and DELETE are not supported
+SELECT * FROM kc_try($$SELECT * FROM pp WHERE id = 5 FOR UPDATE$$);
+ state |                 message                  | hint 
+-------+------------------------------------------+------
+ 0A000 | columnar tables do not support row locks | 
+(1 row)
+
+SELECT * FROM kc_try($$SELECT * FROM pp WHERE id = 150 FOR UPDATE$$);
+ state | message | hint 
+-------+---------+------
+ 00000 | ok      | 
+(1 row)
+
+SELECT count(*) FROM pp;
+ count 
+-------
+   180
+(1 row)
+
+-- moving a row to a columnar partition works; moving one out of it deletes it there
+CREATE TABLE ppm (id int, v int) PARTITION BY RANGE (id);
+CREATE TABLE ppm_col PARTITION OF ppm FOR VALUES FROM (0) TO (100) USING columnar;
+CREATE TABLE ppm_heap PARTITION OF ppm FOR VALUES FROM (100) TO (200);
+INSERT INTO ppm VALUES (150, 1);
+UPDATE ppm SET id = 50 WHERE id = 150;
+SELECT tableoid::regclass, id FROM ppm;
+ tableoid | id 
+----------+----
+ ppm_col  | 50
+(1 row)
+
+UPDATE ppm SET id = 150 WHERE id = 50;
+ERROR:  columnar tables are append-only: UPDATE and DELETE are not supported
+SELECT tableoid::regclass, id FROM ppm;
+ tableoid | id 
+----------+----
+ ppm_col  | 50
+(1 row)
+
+DROP TABLE ppm, pp;
+-- options functions on tables that are not columnar
+SELECT kingres.columnar_set_options('src', compression => 'none');
+ERROR:  "src" is not a columnar table
+SELECT * FROM kingres.columnar_options('src');
+ERROR:  "src" is not a columnar table
+SELECT * FROM kingres.columnar_info('src');
+ERROR:  "src" is not a columnar table
+SELECT * FROM kingres.columnar_stripes('src');
+ERROR:  "src" is not a columnar table
+SELECT kingres.columnar_compact('src');
+ERROR:  "src" is not a columnar table
+CREATE TABLE ppo (id int) PARTITION BY RANGE (id);
+SELECT * FROM kingres.columnar_info('ppo');
+ERROR:  "ppo" is not a columnar table
+SELECT kingres.columnar_set_options('mv', compression => 'none');
+ columnar_set_options 
+----------------------
+ 
+(1 row)
+
+SELECT * FROM kingres.columnar_options('mv');
+ compression | compression_level | stripe_row_count | chunk_row_count 
+-------------+-------------------+------------------+-----------------
+ none        |                 3 |           150000 |           10000
+(1 row)
+
+SELECT kingres.columnar_set_options('no_such_table');
+ERROR:  relation "no_such_table" does not exist
+LINE 1: SELECT kingres.columnar_set_options('no_such_table');
+                                            ^
+DROP TABLE ppo;
+DROP MATERIALIZED VIEW mv;
+DROP TABLE r1, r2, r3, r3b, r3c, tr, tr2, src;
+DROP FUNCTION kc_try(text), trg_row(), trg_stmt(), trg_stmt_plain();
+SELECT count(*) AS catalog_rows FROM kingres.columnar_stripe;
+ catalog_rows 
+--------------
+            0
+(1 row)
+

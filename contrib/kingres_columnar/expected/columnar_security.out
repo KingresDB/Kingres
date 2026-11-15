@@ -1,0 +1,380 @@
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+-- SPDX-License-Identifier: PostgreSQL
+--
+-- columnar_security: what the extension installs and who may do what with it.
+SET search_path = public;
+-- every function of the extension: the language, who runs it, the pinned search_path, who may execute it
+SELECT p.proname, pg_get_function_identity_arguments(p.oid) AS args, l.lanname AS lang,
+       p.prosecdef AS security_definer,
+       coalesce(p.proconfig::text, '') AS config,
+       (p.proacl IS NULL OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) a WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE')) AS public_execute
+  FROM pg_depend d JOIN pg_proc p ON p.oid = d.objid JOIN pg_language l ON l.oid = p.prolang
+ WHERE d.classid = 'pg_proc'::regclass AND d.refclassid = 'pg_extension'::regclass AND d.deptype = 'e'
+   AND d.refobjid = (SELECT oid FROM pg_extension WHERE extname = 'kingres_columnar')
+ ORDER BY p.proname, args;
+       proname        |                                                     args                                                     |  lang   | security_definer |                    config                    | public_execute 
+----------------------+--------------------------------------------------------------------------------------------------------------+---------+------------------+----------------------------------------------+----------------
+ columnar_check       | fix boolean                                                                                                  | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | f
+ columnar_check_ddl   |                                                                                                              | plpgsql | t                | {"search_path=pg_catalog, kingres, pg_temp"} | f
+ columnar_compact     | rel regclass, min_rows integer                                                                               | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | t
+ columnar_handler     | internal                                                                                                     | c       | f                |                                              | f
+ columnar_info        | rel regclass                                                                                                 | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | t
+ columnar_on_drop     |                                                                                                              | plpgsql | t                | {"search_path=pg_catalog, kingres, pg_temp"} | f
+ columnar_options     | rel regclass                                                                                                 | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | t
+ columnar_reconcile   |                                                                                                              | c       | t                | {"search_path=pg_catalog, kingres, pg_temp"} | f
+ columnar_set_options | rel regclass, compression text, compression_level integer, stripe_row_count integer, chunk_row_count integer | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | t
+ columnar_stripes     | rel regclass                                                                                                 | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | t
+(10 rows)
+
+-- every function that runs with the rights of its owner or without a pinned search_path is listed above;
+-- none may be missing the pin
+SELECT count(*) AS functions_without_pinned_search_path
+  FROM pg_depend d JOIN pg_proc p ON p.oid = d.objid
+ WHERE d.classid = 'pg_proc'::regclass AND d.refclassid = 'pg_extension'::regclass AND d.deptype = 'e'
+   AND d.refobjid = (SELECT oid FROM pg_extension WHERE extname = 'kingres_columnar')
+   AND p.proname <> 'columnar_handler'
+   AND NOT EXISTS (SELECT 1 FROM unnest(p.proconfig) c WHERE c LIKE 'search_path=%pg_temp');
+ functions_without_pinned_search_path 
+--------------------------------------
+                                    0
+(1 row)
+
+-- the objects of the extension
+SELECT classid::regclass AS catalog, count(*) AS objects
+  FROM pg_depend d WHERE d.refclassid = 'pg_extension'::regclass AND d.deptype = 'e'
+   AND d.refobjid = (SELECT oid FROM pg_extension WHERE extname = 'kingres_columnar')
+ GROUP BY classid ORDER BY 1::text;
+     catalog      | objects 
+------------------+---------
+ pg_type          |       2
+ pg_proc          |      10
+ pg_class         |       1
+ pg_am            |       1
+ pg_event_trigger |       2
+(5 rows)
+
+-- the stripe catalog: nobody but its owner has a privilege
+SELECT relname, relacl IS NULL AS default_acl, (SELECT count(*) FROM aclexplode(relacl) a WHERE a.grantee <> c.relowner) AS other_grantees
+  FROM pg_class c WHERE oid = 'kingres.columnar_stripe'::regclass;
+     relname     | default_acl | other_grantees 
+-----------------+-------------+----------------
+ columnar_stripe | f           |              0
+(1 row)
+
+SELECT has_table_privilege('public', 'kingres.columnar_stripe', 'SELECT') AS public_select,
+       has_table_privilege('public', 'kingres.columnar_stripe', 'INSERT') AS public_insert;
+ public_select | public_insert 
+---------------+---------------
+ f             | f
+(1 row)
+
+CREATE ROLE regress_kc_owner;
+CREATE ROLE regress_kc_reader;
+CREATE ROLE regress_kc_writer;
+CREATE ROLE regress_kc_other;
+GRANT CREATE ON SCHEMA public TO regress_kc_owner;
+-- the schema of the extension is not open to everybody by default
+REVOKE USAGE ON SCHEMA kingres FROM PUBLIC;
+SET ROLE regress_kc_owner;
+CREATE TABLE s1 (id int, s text) USING columnar;
+INSERT INTO s1 SELECT i, 'x' FROM generate_series(1, 100) i;
+SELECT kingres.columnar_set_options('s1', compression => 'pglz');
+ERROR:  permission denied for schema kingres
+LINE 1: SELECT kingres.columnar_set_options('s1', compression => 'pg...
+               ^
+RESET ROLE;
+GRANT USAGE ON SCHEMA kingres TO regress_kc_owner, regress_kc_reader, regress_kc_writer, regress_kc_other;
+-- the owner
+SET ROLE regress_kc_owner;
+SELECT kingres.columnar_set_options('s1', compression => 'pglz', stripe_row_count => 5000);
+ERROR:  chunk_row_count must not exceed stripe_row_count
+SELECT kingres.columnar_set_options('s1', compression => 'pglz', stripe_row_count => 5000, chunk_row_count => 1000);
+ columnar_set_options 
+----------------------
+ 
+(1 row)
+
+SELECT compression, stripe_row_count, chunk_row_count FROM kingres.columnar_options('s1');
+ compression | stripe_row_count | chunk_row_count 
+-------------+------------------+-----------------
+ pglz        |             5000 |            1000
+(1 row)
+
+SELECT stripes, rows FROM kingres.columnar_info('s1');
+ stripes | rows 
+---------+------
+       1 |  100
+(1 row)
+
+SELECT count(*) FROM kingres.columnar_stripes('s1');
+ count 
+-------
+     1
+(1 row)
+
+SELECT kingres.columnar_compact('s1');
+ columnar_compact 
+------------------
+                0
+(1 row)
+
+-- what the owner must not reach
+SELECT * FROM kingres.columnar_stripe;
+ERROR:  permission denied for table columnar_stripe
+INSERT INTO kingres.columnar_stripe VALUES (999999, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0, '\x', '\x');
+ERROR:  permission denied for table columnar_stripe
+DELETE FROM kingres.columnar_stripe;
+ERROR:  permission denied for table columnar_stripe
+SELECT * FROM kingres.columnar_check();
+ERROR:  permission denied for function columnar_check
+SELECT kingres.columnar_reconcile();
+ERROR:  permission denied for function columnar_reconcile
+SELECT kingres.columnar_on_drop();
+ERROR:  permission denied for function columnar_on_drop
+SELECT kingres.columnar_check_ddl();
+ERROR:  permission denied for function columnar_check_ddl
+RESET ROLE;
+-- columnar_check also checks the user, whoever may execute it
+GRANT EXECUTE ON FUNCTION kingres.columnar_check(boolean) TO regress_kc_owner;
+SET ROLE regress_kc_owner;
+SELECT * FROM kingres.columnar_check();
+ERROR:  must be superuser to run columnar_check
+SELECT * FROM kingres.columnar_check(true);
+ERROR:  must be superuser to run columnar_check
+RESET ROLE;
+REVOKE EXECUTE ON FUNCTION kingres.columnar_check(boolean) FROM regress_kc_owner;
+SELECT * FROM kingres.columnar_check();
+ check_name | relation | detail 
+------------+----------+--------
+(0 rows)
+
+-- a role with SELECT can read and nothing else
+GRANT SELECT ON s1 TO regress_kc_reader;
+GRANT INSERT ON s1 TO regress_kc_writer;
+SET ROLE regress_kc_reader;
+SELECT count(*), sum(id) FROM s1;
+ count | sum  
+-------+------
+   100 | 5050
+(1 row)
+
+SELECT count(*) FROM s1 WHERE id < 50;
+ count 
+-------
+    49
+(1 row)
+
+EXPLAIN (costs off) SELECT id FROM s1 WHERE id < 50;
+                QUERY PLAN                 
+-------------------------------------------
+ Custom Scan (Columnar Scan) on s1
+   Filter: (id < 50)
+   Columnar Projected Columns: 1 of 2 (id)
+   Columnar Skip Conditions: id
+(4 rows)
+
+INSERT INTO s1 VALUES (1, 'reader');
+ERROR:  permission denied for table s1
+COPY s1 FROM STDIN;
+ERROR:  permission denied for table s1
+TRUNCATE s1;
+ERROR:  permission denied for table s1
+SELECT kingres.columnar_set_options('s1', compression => 'none');
+ERROR:  must be owner of table s1
+SELECT kingres.columnar_compact('s1');
+ERROR:  must be owner of table s1
+VACUUM s1;
+WARNING:  permission denied to vacuum "s1", skipping it
+ANALYZE s1;
+WARNING:  permission denied to analyze "s1", skipping it
+CREATE TABLE reader_t (a int) USING columnar;
+ERROR:  permission denied for schema public
+LINE 1: CREATE TABLE reader_t (a int) USING columnar;
+                     ^
+RESET ROLE;
+-- a role with INSERT can write, by INSERT, INSERT SELECT and COPY, and cannot read
+SET ROLE regress_kc_writer;
+INSERT INTO s1 VALUES (101, 'writer');
+INSERT INTO s1 SELECT 102, 'writer' FROM generate_series(1, 3);
+COPY s1 FROM STDIN;
+SELECT count(*) FROM s1;
+ERROR:  permission denied for table s1
+SELECT * FROM s1 WHERE id = 101;
+ERROR:  permission denied for table s1
+UPDATE s1 SET s = 'u';
+ERROR:  permission denied for table s1
+DELETE FROM s1;
+ERROR:  permission denied for table s1
+SELECT kingres.columnar_set_options('s1', compression => 'none');
+ERROR:  must be owner of table s1
+RESET ROLE;
+SELECT count(*), count(*) FILTER (WHERE s LIKE 'writer%') AS by_writer FROM s1;
+ count | by_writer 
+-------+-----------
+   105 |         5
+(1 row)
+
+-- a role without privileges on the table
+SET ROLE regress_kc_other;
+SELECT count(*) FROM s1;
+ERROR:  permission denied for table s1
+INSERT INTO s1 VALUES (1, 'other');
+ERROR:  permission denied for table s1
+SELECT kingres.columnar_set_options('s1', compression => 'none');
+ERROR:  must be owner of table s1
+SELECT kingres.columnar_compact('s1');
+ERROR:  must be owner of table s1
+SELECT * FROM kingres.columnar_stripe;
+ERROR:  permission denied for table columnar_stripe
+RESET ROLE;
+-- ownership: the new owner may change the options
+ALTER TABLE s1 OWNER TO regress_kc_other;
+SET ROLE regress_kc_other;
+SELECT kingres.columnar_set_options('s1', compression => 'none');
+ columnar_set_options 
+----------------------
+ 
+(1 row)
+
+SELECT compression FROM kingres.columnar_options('s1');
+ compression 
+-------------
+ none
+(1 row)
+
+SELECT kingres.columnar_compact('s1') >= 0 AS compacted;
+ compacted 
+-----------
+ t
+(1 row)
+
+RESET ROLE;
+SET ROLE regress_kc_owner;
+SELECT kingres.columnar_set_options('s1', compression => 'lz4');
+ERROR:  must be owner of table s1
+RESET ROLE;
+ALTER TABLE s1 OWNER TO regress_kc_owner;
+-- a table owner who is not a superuser: the checks of the event triggers still apply,
+-- whatever the search_path of the session is
+SET ROLE regress_kc_owner;
+CREATE TABLE public.pg_trigger (tgrelid oid, tgisinternal bool, tgtype int);
+CREATE TABLE public.pg_constraint (conrelid oid, confrelid oid, contype "char");
+SET search_path = public, pg_catalog;
+CREATE TABLE evil_pk (id int PRIMARY KEY);
+CREATE TABLE evil_fk (id int REFERENCES evil_pk (id)) USING columnar;
+ERROR:  foreign keys on or to columnar tables are not supported
+HINT:  Keep the referencing and the referenced table in row storage.
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 8 at RAISE
+CREATE TABLE evil_t (id int) USING columnar;
+CREATE FUNCTION evil_trg() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
+CREATE TRIGGER evil_after AFTER INSERT ON evil_t FOR EACH ROW EXECUTE FUNCTION evil_trg();
+ERROR:  row-level AFTER triggers on columnar tables are not supported
+HINT:  Use a BEFORE ROW or a statement-level trigger, or keep the table in row storage.
+CONTEXT:  PL/pgSQL function columnar_check_ddl() line 18 at RAISE
+CREATE TRIGGER evil_stmt AFTER INSERT ON evil_t FOR EACH STATEMENT EXECUTE FUNCTION evil_trg();
+INSERT INTO evil_t VALUES (1);
+SET search_path = public;
+-- dropping the tables of a non-superuser cleans the stripe catalog
+SELECT relfilenode AS evil_filenode FROM pg_class WHERE oid = 'evil_t'::regclass \gset
+RESET ROLE;
+SELECT count(*) AS stripe_rows FROM kingres.columnar_stripe WHERE filenode = :evil_filenode;
+ stripe_rows 
+-------------
+           1
+(1 row)
+
+SET ROLE regress_kc_owner;
+DROP TABLE evil_t, evil_pk;
+RESET ROLE;
+SELECT count(*) AS stripe_rows FROM kingres.columnar_stripe WHERE filenode = :evil_filenode;
+ stripe_rows 
+-------------
+           0
+(1 row)
+
+SET ROLE regress_kc_owner;
+DROP TABLE public.pg_trigger, public.pg_constraint;
+DROP FUNCTION evil_trg();
+RESET ROLE;
+-- DROP OWNED and DROP ROLE with columnar tables
+SELECT relfilenode AS s1_filenode FROM pg_class WHERE oid = 's1'::regclass \gset
+SELECT count(*) > 0 AS has_stripes FROM kingres.columnar_stripe WHERE filenode = :s1_filenode;
+ has_stripes 
+-------------
+ t
+(1 row)
+
+DROP OWNED BY regress_kc_owner;
+SELECT count(*) AS stripe_rows FROM kingres.columnar_stripe WHERE filenode = :s1_filenode;
+ stripe_rows 
+-------------
+           0
+(1 row)
+
+SELECT to_regclass('s1') IS NULL AS s1_dropped;
+ s1_dropped 
+------------
+ t
+(1 row)
+
+DROP OWNED BY regress_kc_reader, regress_kc_writer, regress_kc_other;
+REVOKE CREATE ON SCHEMA public FROM regress_kc_owner;
+DROP ROLE regress_kc_owner;
+DROP ROLE regress_kc_reader;
+DROP ROLE regress_kc_writer;
+DROP ROLE regress_kc_other;
+SELECT count(*) AS catalog_rows FROM kingres.columnar_stripe;
+ catalog_rows 
+--------------
+            0
+(1 row)
+
+-- DROP EXTENSION, in a database of its own
+SELECT current_database() AS maindb \gset
+CREATE DATABASE regress_kc_drop;
+\c regress_kc_drop
+CREATE EXTENSION kingres_columnar;
+CREATE TABLE e1 (a int) USING columnar;
+INSERT INTO e1 VALUES (1);
+CREATE TABLE e2 (a int);
+DROP EXTENSION kingres_columnar;
+ERROR:  cannot drop extension kingres_columnar because other objects depend on it
+DETAIL:  table e1 depends on access method columnar
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+DROP EXTENSION kingres_columnar CASCADE;
+NOTICE:  drop cascades to table e1
+SELECT to_regclass('e1') IS NULL AS e1_dropped, to_regclass('e2') IS NOT NULL AS e2_kept;
+ e1_dropped | e2_kept 
+------------+---------
+ t          | t
+(1 row)
+
+SELECT count(*) AS event_triggers FROM pg_event_trigger;
+ event_triggers 
+----------------
+              0
+(1 row)
+
+SELECT count(*) AS access_methods FROM pg_am WHERE amname = 'columnar';
+ access_methods 
+----------------
+              0
+(1 row)
+
+CREATE EXTENSION kingres_columnar;
+CREATE TABLE e1 (a int) USING columnar;
+INSERT INTO e1 VALUES (1), (2);
+SELECT count(*) FROM e1;
+ count 
+-------
+     2
+(1 row)
+
+SELECT count(*) AS catalog_rows FROM kingres.columnar_stripe;
+ catalog_rows 
+--------------
+            1
+(1 row)
+
+\c :maindb
+DROP DATABASE regress_kc_drop;

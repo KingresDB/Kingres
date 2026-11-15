@@ -1,0 +1,6 @@
+# kingres_columnar extension
+comment = 'KingresDB columnar table access method: compressed column-wise storage for analytic scans'
+default_version = '0.1'
+module_pathname = '$libdir/kingres_columnar'
+relocatable = false
+schema = kingres

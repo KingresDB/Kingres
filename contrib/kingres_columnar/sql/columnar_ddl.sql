@@ -1,0 +1,291 @@
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+-- SPDX-License-Identifier: PostgreSQL
+--
+-- columnar_ddl: ALTER TABLE on columnar tables (columns added and dropped on
+-- old stripes, rewrites, access method changes, tablespaces), VACUUM FULL,
+-- rename, drop and the stripe catalog, partitions and CREATE TABLE LIKE.
+SET search_path = public;
+
+-- a table with several old stripes: 4 stripes of 1000 rows, 100 rows per chunk group
+CREATE TABLE d1 (id int, s text, v float8) USING columnar;
+SELECT kingres.columnar_set_options('d1', stripe_row_count => 1000, chunk_row_count => 100);
+INSERT INTO d1 SELECT i, 'row' || i, i / 2.0 FROM generate_series(1, 4000) i;
+SELECT stripes, chunk_groups, rows FROM kingres.columnar_info('d1');
+
+-- ADD COLUMN without a default: NULL for the old rows
+ALTER TABLE d1 ADD COLUMN c_null int;
+SELECT count(*) AS rows, count(c_null) AS non_null FROM d1;
+SELECT count(*) FROM d1 WHERE c_null IS NULL;
+-- ADD COLUMN with a constant default: the old rows have it
+ALTER TABLE d1 ADD COLUMN c_def int DEFAULT 7;
+ALTER TABLE d1 ADD COLUMN c_txt text DEFAULT 'old';
+ALTER TABLE d1 ADD COLUMN c_arr int[] DEFAULT ARRAY[1, 2, 3];
+ALTER TABLE d1 ADD COLUMN c_now timestamptz DEFAULT now();
+SELECT count(*) AS rows, sum(c_def), count(*) FILTER (WHERE c_txt = 'old') AS old_txt,
+       count(DISTINCT c_arr) AS arrays, count(DISTINCT c_now) AS nows FROM d1;
+SELECT count(*) FROM d1 WHERE c_def = 7 AND c_txt = 'old' AND c_arr = '{1,2,3}';
+-- new rows have the values given, or the defaults
+INSERT INTO d1 (id, s, v, c_def, c_txt) VALUES (5000, 'new', 0.5, 8, 'new'), (5001, 'newer', 1.5, NULL, NULL);
+INSERT INTO d1 (id, s, v) VALUES (5002, 'defaults', 2.5);
+SELECT id, c_null, c_def, c_txt, c_arr, c_now IS NOT NULL AS has_now FROM d1 WHERE id >= 5000 ORDER BY id;
+SELECT count(*) FROM d1 WHERE c_def = 7;
+SELECT count(*) FROM d1 WHERE c_txt = 'old';
+SELECT count(*) FROM d1 WHERE c_def IS NULL;
+SELECT c_def, count(*) FROM d1 GROUP BY c_def ORDER BY 1;
+-- DROP COLUMN on a table with old stripes
+ALTER TABLE d1 DROP COLUMN c_null, DROP COLUMN c_now, DROP COLUMN c_arr;
+SELECT attname, atttypid::regtype, attnum FROM pg_attribute
+ WHERE attrelid = 'd1'::regclass AND attnum > 0 AND NOT attisdropped ORDER BY attnum;
+SELECT count(*), sum(id), sum(c_def), count(*) FILTER (WHERE c_txt = 'old') FROM d1;
+SELECT * FROM d1 WHERE id IN (1, 2500, 5002) ORDER BY id;
+-- the dropped column's number is not reused, and a column added after it has no data in old stripes
+ALTER TABLE d1 ADD COLUMN c_after int DEFAULT 99;
+ALTER TABLE d1 ADD COLUMN c_last text;
+INSERT INTO d1 VALUES (6000, 'last', 1, 1, 'x', 1, 'y');
+SELECT count(*) FILTER (WHERE c_after = 99) AS default_rows, count(c_last) AS last_values FROM d1;
+SELECT * FROM d1 WHERE id IN (1, 4000, 6000) ORDER BY id;
+-- dropping a column that is read by a filter of an old plan: a prepared statement is replanned
+PREPARE d1_q AS SELECT count(*) FROM d1 WHERE c_def = 7;
+EXECUTE d1_q;
+ALTER TABLE d1 DROP COLUMN c_def;
+EXECUTE d1_q;
+ALTER TABLE d1 ADD COLUMN c_def int DEFAULT 7;
+EXECUTE d1_q;
+DEALLOCATE d1_q;
+-- rename a column and the table
+ALTER TABLE d1 RENAME COLUMN c_txt TO c_text;
+ALTER TABLE d1 RENAME TO d1_renamed;
+SELECT count(*), count(c_text) FROM d1_renamed;
+ALTER TABLE d1_renamed RENAME TO d1;
+-- constraints that scan the table
+ALTER TABLE d1 ADD CONSTRAINT d1_id_pos CHECK (id > 0);
+ALTER TABLE d1 ADD CONSTRAINT d1_id_neg CHECK (id < 0);
+ALTER TABLE d1 ALTER COLUMN id SET NOT NULL;
+ALTER TABLE d1 ALTER COLUMN c_last SET NOT NULL;
+INSERT INTO d1 (id) VALUES (NULL);
+INSERT INTO d1 (id, s, v) VALUES (-5, 'negative', 1);
+ALTER TABLE d1 ALTER COLUMN id DROP NOT NULL;
+ALTER TABLE d1 DROP CONSTRAINT d1_id_pos;
+ALTER TABLE d1 ALTER COLUMN s SET DEFAULT 'dflt';
+ALTER TABLE d1 ALTER COLUMN s SET STATISTICS 50;
+ALTER TABLE d1 ALTER COLUMN s SET STORAGE EXTERNAL;
+COMMENT ON TABLE d1 IS 'a columnar table';
+COMMENT ON COLUMN d1.s IS 'the text';
+SELECT count(*) FROM d1;
+
+-- ALTER COLUMN TYPE rewrites the table into new storage
+CREATE TABLE d2 (id int, n int, t text) USING columnar;
+SELECT kingres.columnar_set_options('d2', compression => 'lz4', stripe_row_count => 2000, chunk_row_count => 500);
+INSERT INTO d2 SELECT i, i % 10, 'v' || i FROM generate_series(1, 5000) i;
+SELECT stripes, rows FROM kingres.columnar_info('d2');
+CREATE TABLE d2_ref AS SELECT id, n::bigint AS n, t FROM d2;
+ALTER TABLE d2 ALTER COLUMN n TYPE bigint;
+SELECT atttypid::regtype FROM pg_attribute WHERE attrelid = 'd2'::regclass AND attname = 'n';
+SELECT (SELECT count(*) FROM (SELECT * FROM d2 EXCEPT ALL SELECT * FROM d2_ref) x) AS columnar_only,
+       (SELECT count(*) FROM (SELECT * FROM d2_ref EXCEPT ALL SELECT * FROM d2) x) AS ref_only;
+ALTER TABLE d2 ALTER COLUMN t TYPE int USING substr(t, 2)::int;
+SELECT count(*), sum(t), min(t), max(t) FROM d2;
+ALTER TABLE d2 ALTER COLUMN t TYPE text USING 'x' || t;
+SELECT min(t), max(t) FROM d2;
+ALTER TABLE d2 ALTER COLUMN n TYPE text;
+SELECT n, count(*) FROM d2 GROUP BY n ORDER BY n;
+-- a failing rewrite leaves the table as it was
+ALTER TABLE d2 ALTER COLUMN t TYPE int;
+ALTER TABLE d2 ALTER COLUMN t TYPE int USING t::int;
+SELECT count(*), min(t), pg_typeof(min(t)) FROM d2;
+-- the same inside a transaction that is rolled back
+BEGIN;
+ALTER TABLE d2 ALTER COLUMN id TYPE bigint;
+INSERT INTO d2 VALUES (5000000000, '1', 'x');
+SELECT max(id) FROM d2;
+ROLLBACK;
+SELECT max(id), pg_typeof(max(id)) FROM d2;
+
+-- VACUUM FULL rewrites the table and keeps its options and its rows
+SELECT kingres.columnar_set_options('d2', compression => 'pglz', stripe_row_count => 2000, chunk_row_count => 500);
+INSERT INTO d2 SELECT id + 5000, n, t FROM d2 WHERE id <= 100;
+SELECT stripes FROM kingres.columnar_info('d2');
+SELECT count(*), sum(id) AS sum_before FROM d2 \gset
+VACUUM FULL d2;
+SELECT stripes, rows FROM kingres.columnar_info('d2');
+SELECT count(*) = :count AS same_count, sum(id) = :sum_before AS same_sum FROM d2;
+SELECT compression, stripe_row_count, chunk_row_count FROM kingres.columnar_options('d2');
+VACUUM FULL d1;
+SELECT count(*) FROM d1;
+
+-- ALTER TABLE SET ACCESS METHOD, both ways, with data in several stripes
+CREATE TABLE d3 (id int, s text, f float8);
+INSERT INTO d3 SELECT i, 'r' || i, i / 3.0 FROM generate_series(1, 3000) i;
+SELECT a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.oid = 'd3'::regclass;
+SET kingres_columnar.stripe_row_count = 1000;
+ALTER TABLE d3 SET ACCESS METHOD columnar;
+RESET kingres_columnar.stripe_row_count;
+SELECT a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.oid = 'd3'::regclass;
+SELECT stripes, rows FROM kingres.columnar_info('d3');
+SELECT count(*), sum(id), count(DISTINCT s), round(sum(f)::numeric, 3) FROM d3;
+INSERT INTO d3 VALUES (3001, 'after', 1);
+ALTER TABLE d3 SET ACCESS METHOD heap;
+SELECT a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.oid = 'd3'::regclass;
+SELECT count(*), sum(id), count(DISTINCT s), round(sum(f)::numeric, 3) FROM d3;
+UPDATE d3 SET s = 'updated' WHERE id = 1;
+ALTER TABLE d3 SET ACCESS METHOD columnar;
+SELECT count(*), min(s) FROM d3 WHERE id = 1;
+SELECT count(*) FROM kingres.columnar_stripe s JOIN pg_class c ON c.relfilenode = s.filenode WHERE c.oid = 'd3'::regclass;
+-- back to the default method of the session
+SET default_table_access_method = columnar;
+CREATE TABLE d3b (a int);
+RESET default_table_access_method;
+ALTER TABLE d3b SET ACCESS METHOD DEFAULT;
+SELECT a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.oid = 'd3b'::regclass;
+DROP TABLE d3b;
+-- within a transaction that is rolled back
+BEGIN;
+ALTER TABLE d3 SET ACCESS METHOD heap;
+SELECT count(*) FROM d3;
+ROLLBACK;
+SELECT a.amname, (SELECT count(*) FROM d3) AS n FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.oid = 'd3'::regclass;
+-- a table with a column dropped
+CREATE TABLE d3c (a int, b int, c int) USING columnar;
+INSERT INTO d3c VALUES (1, 2, 3);
+ALTER TABLE d3c DROP COLUMN b;
+ALTER TABLE d3c SET ACCESS METHOD heap;
+SELECT * FROM d3c;
+ALTER TABLE d3c SET ACCESS METHOD columnar;
+SELECT * FROM d3c;
+DROP TABLE d3c;
+
+-- ALTER TABLE SET TABLESPACE (an in-place tablespace needs no directory)
+SET allow_in_place_tablespaces = on;
+CREATE TABLESPACE kc_ts LOCATION '';
+CREATE TABLE d4 (id int, s text) TABLESPACE kc_ts;
+ALTER TABLE d4 SET ACCESS METHOD columnar;
+INSERT INTO d4 SELECT i, 'r' || i FROM generate_series(1, 3000) i;
+SELECT t.spcname FROM pg_class c JOIN pg_tablespace t ON t.oid = c.reltablespace WHERE c.oid = 'd4'::regclass;
+ALTER TABLE d4 SET TABLESPACE pg_default;
+SELECT c.reltablespace FROM pg_class c WHERE c.oid = 'd4'::regclass;
+SELECT count(*), sum(id) FROM d4;
+INSERT INTO d4 VALUES (3001, 'after move');
+ALTER TABLE d4 SET TABLESPACE kc_ts;
+SELECT count(*), sum(id) FROM d4;
+SELECT count(*) AS catalog_rows FROM kingres.columnar_stripe s JOIN pg_class c ON c.relfilenode = s.filenode WHERE c.oid = 'd4'::regclass;
+CREATE TABLE d4b (id int) USING columnar TABLESPACE kc_ts;
+INSERT INTO d4b VALUES (1);
+SELECT count(*) FROM d4b;
+DROP TABLE d4b;
+ALTER TABLE d4 SET TABLESPACE pg_default;
+DROP TABLE d4;
+DROP TABLESPACE kc_ts;
+RESET allow_in_place_tablespaces;
+
+-- CREATE TABLE LIKE: the method is not copied; the columns are
+CREATE TABLE d5 (id int NOT NULL, s text DEFAULT 'x', n numeric(8, 2)) USING columnar;
+CREATE TABLE d5_like (LIKE d5 INCLUDING DEFAULTS INCLUDING CONSTRAINTS);
+CREATE TABLE d5_like_col (LIKE d5 INCLUDING ALL) USING columnar;
+SELECT c.relname, a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.relname LIKE 'd5%' ORDER BY 1;
+INSERT INTO d5_like_col (id) VALUES (1);
+SELECT * FROM d5_like_col;
+CREATE TABLE d5_inh () INHERITS (d5);
+SELECT a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.relname = 'd5_inh';
+DROP TABLE d5_inh, d5_like, d5_like_col, d5;
+
+-- partitioned tables with columnar and heap partitions
+CREATE TABLE pp (id int, region text, v int) PARTITION BY RANGE (id);
+CREATE TABLE pp_c1 PARTITION OF pp FOR VALUES FROM (0) TO (1000) USING columnar;
+CREATE TABLE pp_c2 PARTITION OF pp FOR VALUES FROM (1000) TO (2000) USING columnar;
+CREATE TABLE pp_h1 PARTITION OF pp FOR VALUES FROM (2000) TO (3000);
+CREATE TABLE pp_def PARTITION OF pp DEFAULT;
+SELECT c.relname, a.amname FROM pg_class c LEFT JOIN pg_am a ON a.oid = c.relam WHERE c.relname LIKE 'pp%' ORDER BY 1;
+INSERT INTO pp SELECT i, 'r' || i % 3, i FROM generate_series(0, 3499) i;
+COPY pp FROM STDIN;
+10	copy	1
+1010	copy	1
+2010	copy	1
+9999	copy	1
+\.
+SELECT tableoid::regclass, count(*), min(id), max(id) FROM pp GROUP BY 1 ORDER BY 1;
+SELECT count(*), sum(v) FROM pp WHERE id BETWEEN 900 AND 2100;
+SELECT count(*) FROM pp WHERE region = 'copy';
+-- CREATE TABLE AS on a partitioned table and a partition of another method
+CREATE TABLE pp_copy USING columnar AS SELECT * FROM pp;
+SELECT (SELECT count(*) FROM (SELECT * FROM pp_copy EXCEPT ALL SELECT * FROM pp) x) AS only_in_copy,
+       (SELECT count(*) FROM (SELECT * FROM pp EXCEPT ALL SELECT * FROM pp_copy) x) AS only_in_pp;
+DROP TABLE pp_copy;
+-- default access method of a partitioned table: the partitions created later
+CREATE TABLE pq (id int, v int) PARTITION BY LIST (id) USING columnar;
+CREATE TABLE pq1 PARTITION OF pq FOR VALUES IN (1);
+CREATE TABLE pq2 PARTITION OF pq FOR VALUES IN (2) USING heap;
+SELECT c.relname, c.relkind, a.amname FROM pg_class c LEFT JOIN pg_am a ON a.oid = c.relam WHERE c.relname LIKE 'pq%' ORDER BY 1;
+INSERT INTO pq VALUES (1, 10), (2, 20), (1, 11);
+SELECT tableoid::regclass, count(*), sum(v) FROM pq GROUP BY 1 ORDER BY 1;
+DROP TABLE pq;
+-- attach and detach a columnar table, move a partition to the other method
+CREATE TABLE pp_new (id int, region text, v int) USING columnar;
+INSERT INTO pp_new SELECT i, 'new', 1 FROM generate_series(3000, 3499) i;
+ALTER TABLE pp DETACH PARTITION pp_def;
+ALTER TABLE pp ATTACH PARTITION pp_new FOR VALUES FROM (3000) TO (4000);
+SELECT tableoid::regclass, count(*) FROM pp WHERE id >= 3000 GROUP BY 1 ORDER BY 1;
+ALTER TABLE pp_c2 SET ACCESS METHOD heap;
+ALTER TABLE pp_h1 SET ACCESS METHOD columnar;
+SELECT c.relname, a.amname FROM pg_class c LEFT JOIN pg_am a ON a.oid = c.relam WHERE c.relname LIKE 'pp%' AND c.relkind = 'r' ORDER BY 1;
+SELECT tableoid::regclass, count(*), sum(v) FROM pp GROUP BY 1 ORDER BY 1;
+-- pp_c2 is a heap table now: a DELETE that prunes the columnar partitions works
+DELETE FROM pp WHERE id >= 1500 AND id < 1600;
+SELECT count(*) FROM pp_c2;
+DROP TABLE pp, pp_def;
+SELECT count(*) AS leftover FROM pg_class WHERE relname LIKE 'pp%';
+
+-- columns added over time: stripes with fewer columns are merged with newer ones
+CREATE TABLE d8 (id int) USING columnar;
+SELECT kingres.columnar_set_options('d8', stripe_row_count => 1000, chunk_row_count => 100);
+INSERT INTO d8 SELECT generate_series(1, 300);
+ALTER TABLE d8 ADD COLUMN c int DEFAULT 7;
+ALTER TABLE d8 ADD COLUMN t text DEFAULT 'old';
+INSERT INTO d8 SELECT i, i, 'new' FROM generate_series(301, 500) i;
+ALTER TABLE d8 ADD COLUMN z int;
+INSERT INTO d8 SELECT i, i, 'newer', i FROM generate_series(501, 600) i;
+SELECT stripe_id, row_count FROM kingres.columnar_stripes('d8') ORDER BY stripe_id;
+SELECT t, count(*), count(z) AS z_values, min(c), max(c) FROM d8 GROUP BY t ORDER BY t;
+SELECT kingres.columnar_compact('d8', 1000);
+SELECT stripe_id, row_count FROM kingres.columnar_stripes('d8') ORDER BY stripe_id;
+SELECT t, count(*), count(z) AS z_values, min(c), max(c) FROM d8 GROUP BY t ORDER BY t;
+-- the default of a column that was added is the one of the time it was added
+ALTER TABLE d8 ALTER COLUMN c SET DEFAULT 99;
+SELECT count(*) FILTER (WHERE c = 7) AS old_default FROM d8;
+VACUUM FULL d8;
+SELECT t, count(*), count(z) AS z_values, min(c), max(c) FROM d8 GROUP BY t ORDER BY t;
+SELECT count(*) FROM d8 WHERE z > 550;
+SELECT count(*) FROM d8 WHERE z IS NULL;
+DROP TABLE d8;
+
+-- drop: the stripe catalog loses the rows of the dropped files
+CREATE TABLE d6 (a int) USING columnar;
+INSERT INTO d6 SELECT generate_series(1, 10);
+INSERT INTO d6 SELECT generate_series(1, 10);
+SELECT count(*) AS stripe_rows FROM kingres.columnar_stripe s JOIN pg_class c ON c.relfilenode = s.filenode WHERE c.oid = 'd6'::regclass;
+SELECT relfilenode AS d6_filenode FROM pg_class WHERE oid = 'd6'::regclass \gset
+DROP TABLE d6;
+SELECT count(*) AS rows_of_dropped FROM kingres.columnar_stripe WHERE filenode = :d6_filenode;
+-- DROP SCHEMA CASCADE, DROP OWNED, a dropped table inside a transaction that is rolled back
+CREATE SCHEMA d_schema;
+CREATE TABLE d_schema.t1 (a int) USING columnar;
+CREATE TABLE d_schema.t2 (a int) USING columnar;
+INSERT INTO d_schema.t1 VALUES (1);
+INSERT INTO d_schema.t2 VALUES (2);
+SELECT count(*) AS catalog_rows FROM kingres.columnar_stripe s JOIN pg_class c ON c.relfilenode = s.filenode WHERE c.relnamespace = 'd_schema'::regnamespace;
+BEGIN;
+DROP TABLE d_schema.t1;
+ROLLBACK;
+SELECT count(*) FROM d_schema.t1;
+SELECT count(*) AS catalog_rows FROM kingres.columnar_stripe s JOIN pg_class c ON c.relfilenode = s.filenode WHERE c.relnamespace = 'd_schema'::regnamespace;
+DROP SCHEMA d_schema CASCADE;
+-- a rolled back CREATE TABLE leaves no rows
+BEGIN;
+CREATE TABLE d7 (a int) USING columnar;
+INSERT INTO d7 SELECT generate_series(1, 100);
+SELECT relfilenode AS d7_filenode FROM pg_class WHERE oid = 'd7'::regclass \gset
+ROLLBACK;
+SELECT count(*) AS rows_of_rolled_back FROM kingres.columnar_stripe WHERE filenode = :d7_filenode;
+
+DROP TABLE d1, d2, d2_ref, d3;
+SELECT count(*) AS catalog_rows_after FROM kingres.columnar_stripe;
+SELECT * FROM kingres.columnar_check();
