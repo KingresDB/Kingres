@@ -5,15 +5,21 @@
 # kingres/packaging/build/build.sh
 #
 # The release build recipe of KingresDB.  From a clean source tree it builds
-#   1. the server, its client programs and the contrib modules (including the
-#      kingres_shard and kingres_ledger extensions) with meson, as an
-#      optimized build with assertions OFF;
+#   1. the server, its client programs and the contrib modules (including every
+#      KingresDB extension, contrib/kingres_*) with meson, as an optimized
+#      build with assertions OFF;
 #   2. the web panel (npm ci, type-check, vite build);
 #   3. kingresd with the panel embedded, and kingres-verify when its module
 #      exists (static Linux binaries, -trimpath, version embedded);
 # and stages the installation tree under STAGE/<prefix> (default prefix
 # /opt/kingres).  The staged tree is what the container image and the .deb
 # package are made from.
+#
+# One recipe builds either supported PostgreSQL major.  Which one is decided by
+# the source tree it is given: the version of the project() call in its
+# meson.build (see source-info.sh), checked again against the server that was
+# built.  Nothing is typed twice.  The result says it in share/BUILD-INFO and
+# in the files of WORK/info (pg-version, pg-major).
 #
 # The developer scripts (kingres/dev/*.sh) are separate and unchanged: they
 # build with assertions for testing; this script never replaces them.
@@ -111,8 +117,20 @@ fi
 [ -f "${src}/meson.build" ] || die "${src} is not a KingresDB source tree"
 commit="$(cat "${src}/.kingres-commit" 2>/dev/null || echo unknown)"
 
-version="$(sed -n "s/^kingres_version = '\\(.*\\)'\$/\\1/p" "${src}/meson.build")"
-[ -n "${version}" ] || die "cannot read kingres_version from ${src}/meson.build"
+"${here}/source-info.sh" "${src}" >/dev/null || die "cannot read the versions from ${src}/meson.build"
+version="$("${here}/source-info.sh" "${src}" kingres_version)"
+pg_version="$("${here}/source-info.sh" "${src}" pg_version)"
+pg_major="$("${here}/source-info.sh" "${src}" pg_major)"
+log "building KingresDB ${version} on PostgreSQL ${pg_version} (major ${pg_major})"
+
+# The KingresDB extensions of this tree: contrib/kingres_*/ with a control
+# file.  Every one of them has to end up in the staged tree.
+mapfile -t kingres_exts < <(
+    for c in "${src}"/contrib/kingres_*/kingres_*.control; do
+        [ -e "${c}" ] || continue
+        basename "${c}" .control
+    done | sort)
+[ "${#kingres_exts[@]}" -gt 0 ] || die "no contrib/kingres_*/*.control in ${src}"
 
 if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then
     full="${commit%%+*}"
@@ -135,7 +153,8 @@ mkdir -p "${info}"
 #   --buildtype=release   -O3 and no debug info.  Assertions are separate.
 #   -Dcassert=false       assertions off: they cost speed and the product
 #                         must not abort on an internal consistency check.
-#   -Dtap_tests=disabled  tests are not part of the product (CI runs them).
+#   -Dtap_tests=disabled  tests are not part of the product (developers run them
+#                         with kingres/dev and the test scripts of this directory).
 #   -Ddocs=disabled       the documentation is not built or installed.
 #   -Dicu=enabled         ICU collations; required for portable sorting.
 #   -Dssl=openssl         TLS for client and replication connections.
@@ -298,18 +317,46 @@ for f in "${elfs[@]}"; do shl_args+=("-e${f}"); done
 rm -rf "${tmp}"
 [ -s "${info}/shlibs.depends" ] || die "no dependency list was produced"
 
+# --------------------------------------------- documents the package carries
+# The text of the licence of KingresDB's own code and the lists of the
+# third-party modules compiled into kingresd (the console is part of it).  The
+# image and the package both take them from here.
+mkdir -p "${info}/doc"
+grep -q "^ *GNU AFFERO GENERAL PUBLIC LICENSE" "${src}/LICENSE" 2>/dev/null ||
+    die "${src}/LICENSE is not the text of the GNU Affero General Public License"
+cp "${src}/LICENSE" "${info}/doc/AGPL-3.0.txt"
+for d in control-plane web; do
+    [ -f "${src}/kingres/${d}/DEPENDENCIES.md" ] || die "missing ${src}/kingres/${d}/DEPENDENCIES.md"
+    cp "${src}/kingres/${d}/DEPENDENCIES.md" "${info}/doc/DEPENDENCIES.${d}.md"
+done
+
 # ----------------------------------------------------------- verification
 log "checking the staged tree"
 for f in postgres initdb pg_ctl psql pg_dump pg_basebackup pg_isready kingresd; do
     [ -x "${bin}/${f}" ] || die "missing staged program ${bin}/${f}"
 done
-ext_lib="$(find "${stage}${prefix}" -name 'kingres_shard.so' | head -1)"
-[ -n "${ext_lib}" ] || die "extension library kingres_shard was not installed"
-[ -n "$(find "${stage}${prefix}" -name 'kingres_ledger.so' | head -1)" ] ||
-    die "extension library kingres_ledger was not installed"
-for f in kingres_shard kingres_ledger; do
-    [ -f "${stage}${prefix}/share/postgresql/extension/${f}.control" ] || die "control file of ${f} was not installed"
+ext_share="${stage}${prefix}/share/postgresql/extension"
+ext_dir="${stage}${prefix}/lib/postgresql"
+for e in "${kingres_exts[@]}"; do
+    ctl="${src}/contrib/${e}/${e}.control"
+    [ -f "${ext_share}/${e}.control" ] || die "control file of ${e} was not installed"
+    # A module_pathname in the control file means a C library.
+    if grep -q '^module_pathname' "${ctl}"; then
+        [ -f "${ext_dir}/${e}.so" ] || die "extension library ${e}.so was not installed"
+    fi
+    default_version="$(sed -n "s/^default_version[[:space:]]*=[[:space:]]*'\\([^']*\\)'.*/\\1/p" "${ctl}")"
+    [ -f "${ext_share}/${e}--${default_version}.sql" ] ||
+        die "install script ${e}--${default_version}.sql of ${e} was not installed"
 done
+# And nothing else named kingres_* may be there that the source does not have.
+for f in "${ext_share}"/kingres_*.control; do
+    case " ${kingres_exts[*]} " in *" $(basename "${f}" .control) "*) ;; *) die "unexpected extension $(basename "${f}")" ;; esac
+done
+# The major of the server that was built is the one of the source tree.
+built_major="$(sed -n 's/^#define PG_MAJORVERSION "\(.*\)"/\1/p' "${build_dir}/src/include/pg_config.h")"
+[ "${built_major}" = "${pg_major}" ] || die "the tree says PostgreSQL ${pg_major}, the server built is ${built_major}"
+"${bin}/postgres" --version | grep -q "^postgres (PostgreSQL) ${pg_version}\$" ||
+    die "postgres --version does not report PostgreSQL ${pg_version}: $("${bin}/postgres" --version)"
 readelf -d "${bin}/postgres" | grep -q BIND_NOW || die "the server was not linked with immediate binding"
 "${bin}/kingresd" -version | grep -q "${commit}" || die "kingresd -version does not show the build commit"
 ldd "${bin}/kingresd" 2>&1 | grep -Eq 'statically linked|not a dynamic' ||
@@ -323,6 +370,8 @@ bi="${stage}${prefix}/share/BUILD-INFO"
 mkdir -p "$(dirname "${bi}")"
 {
     echo "KingresDB ${version}"
+    echo "PostgreSQL: ${pg_version} (major ${pg_major})"
+    echo "kingres extensions: ${kingres_exts[*]}"
     echo "source commit: ${commit}"
     echo "prefix: ${prefix}"
     echo "kingres-verify: ${verify_status}"
@@ -342,8 +391,11 @@ find "${stage}" -exec touch -h --date="@${SOURCE_DATE_EPOCH}" {} +
 chmod -R go-w "${stage}"
 
 printf '%s\n' "${version}" >"${info}/version"
+printf '%s\n' "${pg_version}" >"${info}/pg-version"
+printf '%s\n' "${pg_major}" >"${info}/pg-major"
+printf '%s\n' "${kingres_exts[@]}" >"${info}/extensions"
 printf '%s\n' "${prefix}" >"${info}/prefix"
 ( cd "${stage}" && find . -type f -print0 | sort -z | xargs -0 sha256sum ) >"${info}/SHA256SUMS"
 
-log "done: KingresDB ${version} staged in ${stage}${prefix}"
+log "done: KingresDB ${version} on PostgreSQL ${pg_version} staged in ${stage}${prefix}"
 du -sh "${stage}${prefix}"

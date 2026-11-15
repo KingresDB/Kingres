@@ -8,8 +8,13 @@
 #   runtime  a minimal Ubuntu 24.04 with only the run-time libraries, a
 #            non-root user and the installation tree.
 #
-# Build (context = repository root or a clean snapshot, see README.md):
-#   docker build -f kingres/packaging/docker/Dockerfile -t kingres:0.1.0 .
+# One image per PostgreSQL major: the major is the one of the source tree in the
+# build context (see build/source-info.sh), and the image is tagged
+# kingres:<version>-pg<major>.  Build it with build-image.sh, which reads the
+# version, the PostgreSQL version and the major from the context and passes
+# them as build arguments; the build stops if they differ from what the
+# release recipe found in the tree, so a wrong tag or label cannot be made.
+#   kingres/packaging/docker/build-image.sh --context DIR
 #
 # The base image is pinned by digest for reproducibility.  To move to a newer
 # Ubuntu 24.04 build, pull "ubuntu:24.04", read its digest with
@@ -40,6 +45,19 @@ ARG SOURCE_DATE_EPOCH
 RUN KINGRES_BUILD_AS_ROOT=1 bash /src/kingres/packaging/build/build.sh \
         --src /src --work /work --jobs "$(nproc)"
 
+# The identity the caller states (build-image.sh derives it from the same
+# tree) must be what the recipe found.  Declared after the build so that it
+# does not invalidate the cached build.
+ARG VERSION
+ARG PG_VERSION
+ARG PG_MAJOR
+RUN if [ -z "${VERSION}" ] || [ -z "${PG_VERSION}" ] || [ -z "${PG_MAJOR}" ]; then \
+        echo "build the image with kingres/packaging/docker/build-image.sh: it passes VERSION, PG_VERSION and PG_MAJOR" >&2; exit 1; fi \
+ && if [ "${VERSION}" != "$(cat /work/info/version)" ] \
+    || [ "${PG_VERSION}" != "$(cat /work/info/pg-version)" ] \
+    || [ "${PG_MAJOR}" != "$(cat /work/info/pg-major)" ]; then \
+        echo "build arguments ${VERSION} ${PG_VERSION} ${PG_MAJOR} differ from the source tree: $(cat /work/info/version) $(cat /work/info/pg-version) $(cat /work/info/pg-major)" >&2; exit 1; fi
+
 # ---------------------------------------------------------------- runtime
 FROM ${UBUNTU_IMAGE} AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
@@ -60,6 +78,16 @@ RUN groupadd --gid 10001 kingres \
  && install -d -o kingres -g kingres -m 0750 /var/lib/kingres
 
 COPY --from=build /work/stage/opt/kingres /opt/kingres
+# Licences: the text of the AGPL, the lists of the third-party modules and the
+# copyright file that says which licence covers which files (the same one as in
+# the Debian package).
+COPY --from=build /work/info/doc/ /usr/share/doc/kingres/
+COPY kingres/packaging/deb/copyright /usr/share/doc/kingres/copyright
+# Licences: the text of the AGPL, the lists of third-party modules and the
+# copyright file that says which licence covers which files (the same one as
+# in the Debian package).
+COPY --from=build /work/info/doc/ /usr/share/doc/kingres/
+COPY kingres/packaging/deb/copyright /usr/share/doc/kingres/copyright
 COPY kingres/packaging/docker/entrypoint.sh /usr/local/bin/kingres-entrypoint
 COPY kingres/packaging/docker/healthcheck.sh /usr/local/bin/kingres-healthcheck
 RUN chmod 0755 /usr/local/bin/kingres-entrypoint /usr/local/bin/kingres-healthcheck
@@ -85,14 +113,22 @@ ENV KINGRES_LISTEN=0.0.0.0:8091 \
     KINGRES_PG_BIN_DIR=/opt/kingres/bin \
     PATH=/opt/kingres/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-ARG VERSION=0.1.0
+# The labels say which major this image is.  The licence expression covers what
+# the image contains: KingresDB's own code under the AGPL, PostgreSQL's under the
+# PostgreSQL License (/usr/share/doc/kingres/copyright has the details).
+ARG VERSION
+ARG PG_VERSION
+ARG PG_MAJOR
 ARG REVISION=unknown
 LABEL org.opencontainers.image.title="KingresDB" \
-      org.opencontainers.image.description="KingresDB node with the management panel" \
-      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.description="KingresDB node with the management panel, on PostgreSQL ${PG_MAJOR}" \
+      org.opencontainers.image.version="${VERSION}-pg${PG_MAJOR}" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.vendor="RooyeKhat Media Co" \
-      org.opencontainers.image.licenses="PostgreSQL"
+      org.opencontainers.image.licenses="AGPL-3.0-only AND PostgreSQL" \
+      org.kingres.version="${VERSION}" \
+      org.kingres.postgresql.version="${PG_VERSION}" \
+      org.kingres.postgresql.major="${PG_MAJOR}"
 
 USER kingres:kingres
 WORKDIR /var/lib/kingres

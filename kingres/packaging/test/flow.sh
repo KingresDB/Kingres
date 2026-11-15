@@ -78,7 +78,9 @@ wait_for() {
         sleep 0.5
     done
     fail "${what} (timed out)"
-    return 1
+    # The failure is recorded; a script that runs with "set -e" must go on to the
+    # next check, so the status is 0 (callers that need to know compare "failed").
+    return 0
 }
 
 flow_database_has() { # flow_database_has REGEX
@@ -151,3 +153,50 @@ flow_wait_task() {
         fail "${what} (task ${id} is '${s}'): $(api GET "/tasks/${id}" | sed -n 's/.*"error":\({[^}]*}\).*/\1/p' | cut -c1-300)"
     fi
 }
+
+# flow_check_extensions PREFIX: every KingresDB extension can be created in a
+# database of the running node (a scratch database, dropped afterwards).
+# kingres_columnar is not preloaded by the product: as its README says, it
+# loads, it reads (no rows) and it refuses a write.
+# It needs SERVICE_PSQL, a command prefix like PSQL_CMD that runs psql as the
+# service role kingresd (a superuser; CREATE EXTENSION needs one and the
+# administrator of the flow is not), with its password from the node's
+# service-credentials file.
+flow_check_extensions() {
+    local p="$1" e out
+    check_eq "${p}: the instance preloads kingres_shard and kingres_ledger, not kingres_columnar" "kingres_shard,kingres_ledger" \
+        "$(svc -d postgres -Atc 'show shared_preload_libraries' 2>/dev/null)"
+    check "${p}: create the scratch database ext_check" svc -d postgres -v ON_ERROR_STOP=1 -c 'create database ext_check'
+    # kingres_shard first: its install script runs CREATE SCHEMA kingres, which
+    # fails once kingres_columnar or kingres_timepart (schema = kingres in their
+    # control files) has made the schema (the known defect below).
+    for e in kingres_shard ${KINGRES_EXTENSIONS/kingres_shard/}; do
+        if out="$(svc -d ext_check -v ON_ERROR_STOP=1 -c "create extension ${e}" 2>&1)"; then
+            pass "${p}: CREATE EXTENSION ${e} in the node's own server"
+        else
+            fail "${p}: CREATE EXTENSION ${e} in the node's own server: $(printf '%s' "${out}" | head -3 | tr '\n' ' ' | cut -c1-300)"
+        fi
+    done
+    check_eq "${p}: all five are in pg_extension" "${KINGRES_EXTENSIONS}" \
+        "$(svc -d ext_check -Atc "select string_agg(extname, ' ' order by extname) from pg_extension where extname like 'kingres%'" 2>/dev/null)"
+    # Without the preload the node's server refuses even to create a columnar table
+    # (the message names shared_preload_libraries).
+    out="$(svc -d ext_check -v ON_ERROR_STOP=1 -c 'create table public.col_t (a int) using columnar' 2>&1 || true)"
+    check "${p}: a columnar table is refused without the preload (${out:0:100})" bash -c 'grep -q "shared_preload_libraries" <<<"$1"' _ "${out}"
+    check "${p}: drop the scratch database" svc -d postgres -v ON_ERROR_STOP=1 -c 'drop database ext_check'
+    # The order matters, see above.  This is a defect of the extension, not of the
+    # package: the install script of kingres_shard has "CREATE SCHEMA kingres;" (no
+    # IF NOT EXISTS), and kingres_columnar and kingres_timepart ask for the same
+    # schema in their control files.
+    check "${p}: create a second scratch database for the order of the extensions" svc -d postgres -v ON_ERROR_STOP=1 -c 'create database ext_check2'
+    check_known "${p}: kingres_shard can be created after kingres_columnar in one database" \
+        "the install script of kingres_shard runs CREATE SCHEMA kingres, which fails when kingres_columnar (schema = kingres) came first" \
+        flow_shard_after_columnar
+    check "${p}: drop the second scratch database" svc -d postgres -v ON_ERROR_STOP=1 -c 'drop database ext_check2'
+}
+flow_shard_after_columnar() {
+    svc -d ext_check2 -v ON_ERROR_STOP=1 -c 'create extension kingres_columnar' &&
+        svc -d ext_check2 -v ON_ERROR_STOP=1 -c 'create extension kingres_shard'
+}
+# svc ARGS: psql as the service role (see SERVICE_PSQL above).
+svc() { "${SERVICE_PSQL[@]}" "$@"; }

@@ -18,13 +18,17 @@
 #   - no secret is baked into the image.
 #
 # Usage:
-#   test-image.sh [--context DIR] [--port PORT] [--tag TAG] [--keep]
+#   test-image.sh [--context DIR] [--rev REV] [--port PORT] [--tag TAG] [--keep]
 #
 #   --context DIR  build context (a clean snapshot).  Default: a snapshot of
-#                  HEAD plus the working-tree kingres/packaging directory
+#                  REV plus the working-tree kingres/packaging directory
 #                  (so that packaging work that is not committed yet is built).
-#   --port PORT    host port for the panel (default 58001, bound to 127.0.0.1)
-#   --tag TAG      image tag (default kingres:test)
+#   --rev REV      commit or branch of the default snapshot (default HEAD;
+#                  kingres-18 or kingres-19 for a release).  The PostgreSQL major
+#                  tested is the one of that source tree.
+#   --port PORT    host port for the panel (default 58790, bound to 127.0.0.1)
+#   --tag TAG      image tag (default kingres:<version>-pg<major>, the name of the
+#                  release; docker/build-image.sh derives it from the tree)
 #   --keep         leave the container and the volume behind
 #
 # Needs docker (the user must be in the docker group) and curl.
@@ -40,12 +44,14 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${here}/flow.sh"
 
 context=""
-port=58001
-tag=kingres:test
+rev=HEAD
+port=58790
+tag=""
 keep=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --context) context="$2"; shift 2 ;;
+        --rev)     rev="$2"; shift 2 ;;
         --port)    port="$2"; shift 2 ;;
         --tag)     tag="$2"; shift 2 ;;
         --keep)    keep=1; shift ;;
@@ -81,14 +87,19 @@ wait_healthy() {
 # ------------------------------------------------------------------ build
 if [ -z "${context}" ]; then
     context="${tmp}/context"
-    "${here}/../build/snapshot.sh" "${context}" --overlay kingres/packaging
+    "${here}/../build/snapshot.sh" "${context}" --rev "${rev}" --overlay kingres/packaging
 fi
 commit="$(cat "${context}/.kingres-commit" 2>/dev/null || echo unknown)"
+# What this source tree is: nothing here is typed twice.
+info="${here}/../build/source-info.sh"
+kversion="$("${info}" "${context}" kingres_version)"
+pg_version="$("${info}" "${context}" pg_version)"
+major="$("${info}" "${context}" pg_major)"
+[ -n "${tag}" ] || tag="kingres:$("${info}" "${context}" image_tag)"
 
-note "building the image from ${commit}"
+note "building the image ${tag} (PostgreSQL ${pg_version}) from ${commit}"
 start=$SECONDS
-docker build --file "${context}/kingres/packaging/docker/Dockerfile" \
-    --build-arg "REVISION=${commit}" --tag "${tag}" "${context}"
+"${here}/../docker/build-image.sh" --context "${context}" --tag "${tag}"
 echo "image build time: $((SECONDS - start)) s"
 echo "image size: $(docker image inspect "${tag}" --format '{{.Size}}') bytes"
 
@@ -100,8 +111,15 @@ docker run --detach --name "${name}" --read-only --tmpfs /tmp --stop-timeout 120
     "${tag}" >/dev/null
 
 check_eq "container health" healthy "$(wait_healthy)"
-
 base="http://127.0.0.1:${port}"
+node_down=0
+if [ "$(docker inspect --format '{{.State.Health.Status}}' "${name}")" != healthy ]; then
+    node_down=1
+    echo "info: the container is not healthy (state: $(docker inspect --format '{{.State.Status}}' "${name}")); its log:"
+    docker logs --tail 12 "${name}" 2>&1 | cut -c1-260
+fi
+
+if [ "${node_down}" -eq 0 ]; then
 state="$(curl -fsS "${base}/api/v1/setup/state" || true)"
 check_eq "setup state" uninitialized "$(printf '%s' "${state}" | sed -n 's/^{"state":"\([a-z]*\)".*/\1/p')"
 check_eq "readiness endpoint" 200 "$(curl -s -o /dev/null -w '%{http_code}' "${base}/api/v1/readyz")"
@@ -130,16 +148,37 @@ echo "restart time: $((SECONDS - start)) s"
 check_eq "healthy again after restart" healthy "$(wait_healthy)"
 check "same setup token after restart" test "${token}" = "$(docker exec "${name}" cat /var/lib/kingres/setup-token)"
 
+else
+    echo "NOT RUN  panel, identity, token and restart checks (the container does not become healthy)"
+fi
+
 note "the server binary and the extensions (as the image's own user)"
-version_out="$(docker run --rm --read-only --tmpfs /tmp --cap-drop ALL \
+smoke_out="$(docker run --rm --read-only --tmpfs /tmp --cap-drop ALL \
     --volume "${here}/pg-smoke.sh:/pg-smoke.sh:ro" --entrypoint bash "${tag}" /pg-smoke.sh /tmp/smoke 2>&1 || true)"
-echo "${version_out}"
-check "version() says KingresDB" grep -q 'KingresDB 0\.' <<<"${version_out}"
-check "extension kingres_shard created" grep -q 'extension kingres_shard' <<<"${version_out}"
-check "extension kingres_ledger created" grep -q 'extension kingres_ledger' <<<"${version_out}"
+echo "${smoke_out}"
+check_smoke_output "image" "${major}" "${smoke_out}"
 check "kingres-verify runs" docker run --rm --entrypoint kingres-verify "${tag}" --help
-check_eq "kingresd reports its version" "0.1.0" \
-    "$(curl -fsS "${base}/api/v1/setup/state" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
+if [ "${node_down}" -eq 0 ]; then
+    check_eq "kingresd reports its version" "${kversion}" \
+        "$(curl -fsS "${base}/api/v1/setup/state" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
+fi
+
+note "the image says which PostgreSQL major it is"
+label() { docker image inspect "${tag}" --format "{{index .Config.Labels \"$1\"}}"; }
+check_eq "label org.kingres.postgresql.major" "${major}" "$(label org.kingres.postgresql.major)"
+check_eq "label org.kingres.postgresql.version" "${pg_version}" "$(label org.kingres.postgresql.version)"
+check_eq "label org.kingres.version" "${kversion}" "$(label org.kingres.version)"
+check_eq "label org.opencontainers.image.version" "${kversion}-pg${major}" "$(label org.opencontainers.image.version)"
+check_eq "label org.opencontainers.image.licenses" "AGPL-3.0-only AND PostgreSQL" "$(label org.opencontainers.image.licenses)"
+check_eq "the server in the image is PostgreSQL ${pg_version}" "postgres (PostgreSQL) ${pg_version}" \
+    "$(docker run --rm --entrypoint postgres "${tag}" --version)"
+check_eq "share/BUILD-INFO says the same" "PostgreSQL: ${pg_version} (major ${major})" \
+    "$(docker run --rm --entrypoint sed "${tag}" -n 's/^\(PostgreSQL: .*\)$/\1/p' /opt/kingres/share/BUILD-INFO)"
+
+note "every KingresDB extension is installed; licences"
+imgx() { docker run --rm --entrypoint "$1" "${tag}" "${@:2}"; }
+check_extension_files "image" imgx
+check_licence_files "image" imgx
 
 note "no secrets baked into the image"
 env_dump="$(docker image inspect "${tag}" --format '{{json .Config.Env}}')"
@@ -147,6 +186,7 @@ check "image environment holds no password or token" bash -c '! grep -Eiq "passw
 check "image contains no setup token" bash -c '! docker run --rm --entrypoint sh "$1" -c "test -e /var/lib/kingres/setup-token"' _ "${tag}"
 
 # ----------------------------------------------------- the real thing: a cluster
+if [ "${node_down}" -eq 0 ]; then
 # The panel's port is published, so these requests reach kingresd from the
 # Docker bridge address, not from loopback: this also proves that
 # KINGRES_ALLOW_REMOTE_SETUP=true works.
@@ -156,6 +196,8 @@ DATA_DIR=/var/lib/kingres
 TOKEN_CMD=read_token
 read_token() { docker exec "${name}" cat /var/lib/kingres/setup-token; }
 PSQL_CMD=(docker exec -e "PGPASSWORD=${FLOW_PASSWORD}" "${name}" psql -X -h 127.0.0.1 -p 5432 -U "${FLOW_ADMIN}")
+# The service role kingresd (a superuser) for the checks that need one.
+SERVICE_PSQL=(docker exec "${name}" bash -c 'PGPASSWORD="$(cat /var/lib/kingres/service-credentials)" exec psql -X -h 127.0.0.1 -p 5432 -U kingresd "$@"' _)
 db_up() { psql_run -d postgres -Atc 'select 1' >/dev/null 2>&1; }
 postmaster_pid() { docker exec "${name}" head -1 /var/lib/kingres/instances/1/pgdata/postmaster.pid 2>/dev/null || echo none; }
 # PIDs repeat in a fresh container, so the start time (line 3) identifies a postmaster.
@@ -172,6 +214,7 @@ check_eq "instance process user id" 10001 "$(docker exec "${name}" sh -c 'ps -o 
 check "instance socket is in the volume" docker exec "${name}" test -S /var/lib/kingres/run/1/.s.PGSQL.5432
 flow_create_data
 flow_check_data "after setup"
+flow_check_extensions "image"
 pm1="$(postmaster_pid)"
 
 note "docker stop: clean shutdown within the grace period"
@@ -225,5 +268,9 @@ logs="$(volume_logs)"
 check "no crash recovery after removing the container with the database running" \
     bash -c '! grep -qi "automatic recovery in progress\|not properly shut down" <<<"$1"' _ "${logs}"
 docker stop "${name}" >/dev/null
+
+else
+    echo "NOT RUN  the cluster through the API, docker stop/start/restart, a new container on the volume (the container does not become healthy: kingresd stops at start)"
+fi
 
 summary

@@ -3,7 +3,8 @@ KingresDB for Debian and Ubuntu
 
 Layout
 ------
-  /opt/kingres/            the product: bin/ lib/ share/ (server, clients, kingresd)
+  /opt/kingres/            the product: bin/ lib/ share/ (server, clients, kingresd,
+                           the five KingresDB extensions)
   /etc/kingres/            kingresd.json (settings), kingresd.env (secrets, root only)
   /var/lib/kingres/        node state, setup token, audit log, certificates (pki/),
                            and the database instance in instances/1/pgdata
@@ -18,6 +19,24 @@ packages: kingres-psql, kingres-pg_dump, kingres-pg_dumpall, kingres-pg_restore,
 kingres-pg_basebackup, kingres-pg_isready, kingres-pg_config.  The server
 programs (postgres, initdb, pg_ctl) are not on the PATH; kingresd uses them
 from /opt/kingres/bin.  Also linked: kingresd and kingres-verify.
+
+One package per PostgreSQL major
+--------------------------------
+KingresDB is released for PostgreSQL 18 and for PostgreSQL 19.  The package is
+named kingres in both cases and the major is in the version:
+
+    kingres_<version>+pg18-<revision>_amd64.deb
+    kingres_<version>+pg19-<revision>_amd64.deb
+
+Only one of them can be installed on a system, and all servers of a cluster
+must run the same major.  Because "+pg19" sorts after "+pg18", the package
+manager would offer the one as an upgrade of the other.  The package refuses
+that: its preinst script stops before anything is unpacked when a package or a
+data directory of the other major is on the system, because the programs of
+one major cannot run the data directory of the other and no procedure to move
+a cluster between majors exists yet.  To stay on your major, install packages
+whose version has the same +pgNN, and keep the two majors in separate package
+sources.
 
 First run
 ---------
@@ -53,6 +72,19 @@ Restarting
       sudo systemctl stop kingres
 After a reboot or "systemctl start" the node comes back as a cluster, without
 the wizard.
+
+Licence
+-------
+The programs and extensions that KingresDB wrote (kingresd and its console,
+kingres-verify, kingres-watchdog, kingres_columnar, kingres_ledger,
+kingres_shard, kingres_sketch, kingres_timepart) are under the GNU Affero
+General Public License, version 3 only.  Its full text is in
+/usr/share/doc/kingres/AGPL-3.0.txt, because Debian has no AGPL file in
+/usr/share/common-licenses.  PostgreSQL itself keeps the PostgreSQL License.
+/usr/share/doc/kingres/copyright says which licence covers which files.
+Section 13 of the AGPL applies to whoever changes KingresDB and lets others
+use it over a network: the source of the changed version must be offered to
+those users.
 
 Removal
 -------

@@ -1,0 +1,76 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026, RooyeKhat Media Co
+#
+# kingres preinst: keep one PostgreSQL major per system.
+#
+# KingresDB is released for several PostgreSQL majors (releases.md), and every
+# release is the same package name with the major in the version:
+# kingres_<version>+pg18-<revision> and kingres_<version>+pg19-<revision>.
+# dpkg lets only one of them be installed at a time, and orders +pg18 before
+# +pg19, so that "apt install" of the newer package would replace the programs
+# under a data directory of the other major, and a PostgreSQL 18 data
+# directory does not start under PostgreSQL 19 programs.  Moving a cluster
+# from one major to the next is not designed yet, so this script refuses,
+# before anything is unpacked, in two cases:
+#
+#   1. the installed (or removed but not purged) version has another major;
+#   2. a data directory of this node belongs to another major, whatever the
+#      state of the package (it stays after "apt remove").
+#
+# Nothing has been changed when it refuses: the old package and its service
+# keep running.  The major of this package is put in by build-deb.sh.
+
+set -e
+
+PG_MAJOR=@PG_MAJOR@
+DATA_DIR=/var/lib/kingres
+
+refuse() {
+    cat >&2 <<EOF
+
+kingres: refusing to install KingresDB for PostgreSQL ${PG_MAJOR}.
+$1
+
+KingresDB cannot be moved between PostgreSQL majors by the package manager:
+the programs of one major cannot run the data directory of another, and the
+procedure that would move a cluster does not exist yet.  Nothing was changed.
+
+  - To stay on PostgreSQL $2, install a package whose version has +pg$2.
+  - To use PostgreSQL ${PG_MAJOR}, use a system without KingresDB data, or
+    first take a logical backup (kingres-pg_dump) and run "apt purge kingres",
+    which deletes this node's data.
+
+EOF
+    exit 1
+}
+
+case "$1" in
+    install | upgrade)
+        # 1. The version that is (or was) installed.  A version without a
+        #    "+pgNN" is a package from before the major was part of the name;
+        #    those were all built on PostgreSQL 18.
+        if [ -n "$2" ]; then
+            old_major="$(printf '%s' "$2" | sed -n 's/.*+pg\([0-9][0-9]*\).*/\1/p')"
+            [ -n "${old_major}" ] || old_major=18
+            if [ "${old_major}" != "${PG_MAJOR}" ]; then
+                refuse "Version $2 (PostgreSQL ${old_major}) is installed, or was removed without purge." "${old_major}"
+            fi
+        fi
+        # 2. Data directories that are there.
+        for v in "${DATA_DIR}"/instances/*/pgdata/PG_VERSION; do
+            [ -f "${v}" ] || continue
+            data_major="$(sed -n '1s/^\([0-9][0-9]*\).*/\1/p' "${v}")"
+            if [ -n "${data_major}" ] && [ "${data_major}" != "${PG_MAJOR}" ]; then
+                refuse "The data directory $(dirname "${v}") is a PostgreSQL ${data_major} cluster." "${data_major}"
+            fi
+        done
+        ;;
+    abort-upgrade) ;;
+    *)
+        echo "preinst called with unknown argument '$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

@@ -23,13 +23,18 @@
 # of the whole cluster.  "down --volumes" removes everything it created.
 #
 # Usage:
-#   test-compose.sh [--context DIR] [--rev REV] [--port-base N] [--keep]
+#   test-compose.sh [--context DIR] [--rev REV] [--image TAG] [--port-base N] [--keep]
 #
 #   --context DIR  build context (default: a snapshot of REV plus the
 #                  working-tree kingres/packaging directory)
-#   --rev REV      commit the default snapshot is made from (default HEAD)
+#   --rev REV      commit or branch the default snapshot is made from (default
+#                  HEAD; kingres-18 or kingres-19 for a release).  The PostgreSQL
+#                  major of the three nodes is the one of that source tree.
+#   --image TAG    run this image instead of building one from the context
+#                  (it must be the image of the context's major; the test
+#                  checks its labels)
 #   --port-base N  host ports N+1, N+2, N+3 for the panels and N+11, N+12,
-#                  N+13 for the databases (default 58100)
+#                  N+13 for the databases (default 58700)
 #   --keep         leave the nodes (and the snapshot) in place when the test
 #                  ends or fails, to look at them; remove them with
 #                  "docker compose -f CONTEXT/kingres/packaging/docker/compose.yaml
@@ -46,12 +51,15 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 context=""
 rev=HEAD
-base=58100
+base=58700
+image=""
+image_given=""
 keep=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --context)   context="$2"; shift 2 ;;
         --rev)       rev="$2"; shift 2 ;;
+        --image)     image="$2"; image_given=1; shift 2 ;;
         --port-base) base="$2"; shift 2 ;;
         --keep)      keep=1; shift ;;
         *) echo "test-compose.sh: unknown argument '$1'" >&2; exit 2 ;;
@@ -64,8 +72,13 @@ if [ -z "${context}" ]; then
     "${here}/../build/snapshot.sh" "${context}" --rev "${rev}" --overlay kingres/packaging
 fi
 compose="${context}/kingres/packaging/docker/compose.yaml"
-export KINGRES_BUILD_CONTEXT="${context}"
-export KINGRES_IMAGE="${KINGRES_IMAGE:-kingres:compose-test}"
+# What this source tree is: the image of one PostgreSQL major, named after it.
+info="${here}/../build/source-info.sh"
+kversion="$("${info}" "${context}" kingres_version)"
+pg_version="$("${info}" "${context}" pg_version)"
+major="$("${info}" "${context}" pg_major)"
+[ -n "${image}" ] || image="kingres:$("${info}" "${context}" image_tag)"
+export KINGRES_IMAGE="${image}"
 export KINGRES_PANEL_PORT_1=$((base + 1)) KINGRES_PANEL_PORT_2=$((base + 2)) KINGRES_PANEL_PORT_3=$((base + 3))
 export KINGRES_PG_PORT_1=$((base + 11)) KINGRES_PG_PORT_2=$((base + 12)) KINGRES_PG_PORT_3=$((base + 13))
 
@@ -79,11 +92,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
-note "building and starting three nodes"
+note "the image of PostgreSQL ${pg_version} and three nodes of it"
 start=$SECONDS
-docker compose -f "${compose}" up --build --detach --quiet-pull 2>&1 | tail -5
+if [ -z "${image_given}" ]; then
+    "${here}/../docker/build-image.sh" --context "${context}" --tag "${image}" 2>&1 | tail -3
+fi
+image_label() { docker image inspect "${image}" --format "{{index .Config.Labels \"$1\"}}"; }
+check_eq "image label org.kingres.postgresql.major" "${major}" "$(image_label org.kingres.postgresql.major)"
+check_eq "image label org.kingres.postgresql.version" "${pg_version}" "$(image_label org.kingres.postgresql.version)"
+check_eq "image label org.kingres.version" "${kversion}" "$(image_label org.kingres.version)"
+docker compose -f "${compose}" up --detach --quiet-pull 2>&1 | tail -5
 echo "up time: $((SECONDS - start)) s"
 
+imgx() { docker run --rm --entrypoint "$1" "${image}" "${@:2}"; }
+unhealthy=0
 for n in 1 2 3; do
     h=starting
     for _ in $(seq 1 90); do
@@ -92,12 +114,25 @@ for n in 1 2 3; do
         sleep 1
     done
     check_eq "kingres-${n} health" healthy "${h}"
+    [ "${h}" = healthy ] || unhealthy=$((unhealthy + 1))
     port=$((base + n))
     state="$(curl -fsS "http://127.0.0.1:${port}/api/v1/setup/state" || true)"
     check_eq "kingres-${n} state on port ${port}" uninitialized \
         "$(printf '%s' "${state}" | sed -n 's/^{"state":"\([a-z]*\)".*/\1/p')"
     check_eq "kingres-${n} hostname" "kingres-${n}" "$(docker exec "kingres-${n}" hostname)"
+    check_eq "kingres-${n} runs PostgreSQL ${pg_version}" "postgres (PostgreSQL) ${pg_version}" \
+        "$(docker exec "kingres-${n}" postgres --version)"
 done
+# The extension files are the image's, the same on every node: one look at the image.
+check_extension_files "image of the nodes" imgx
+if [ "${unhealthy}" -gt 0 ]; then
+    echo "info: ${unhealthy} of the three nodes did not become healthy; the log of kingres-1:"
+    docker logs --tail 12 kingres-1 2>&1 | cut -c1-260
+    echo "NOT RUN  tokens, the cluster of three nodes (init, addServer, joinCluster), the restarts and the tear-down checks (the nodes do not start: kingresd stops at start)"
+    docker compose -f "${compose}" down --volumes --remove-orphans >/dev/null 2>&1 || true
+    summary
+    exit $?
+fi
 
 note "tokens"
 "${here}/../docker/tokens.sh" >"${tmp}/tokens.txt"
@@ -150,10 +185,12 @@ wait_servers_live() {
     shift
     for n in "$@"; do
         signin_node "${n}" >/dev/null
-        wait_for "${what}: listServers on kingres-${n} shows three live servers" 90 servers_all_live || {
+        local failed_before="${failed}"
+        wait_for "${what}: listServers on kingres-${n} shows three live servers" 90 servers_all_live
+        if [ "${failed}" -gt "${failed_before}" ]; then
             echo "info: kingres-${n} lists: $(servers_line) / $(api GET /servers | cut -c1-400)"
             return 1
-        }
+        fi
     done
 }
 event_count() { psql_run -d mesh -Atc 'select count(*) from public.events' 2>/dev/null; }

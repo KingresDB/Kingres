@@ -13,5 +13,9 @@ RUN apt-get update \
 # The base image ships a policy-rc.d that forbids starting services in
 # containers (exit 101); here systemd really runs, so the policy is removed.
 RUN rm -f /usr/sbin/policy-rc.d
+# The minimal image excludes /usr/share/doc and man pages from every package
+# (dpkg path-exclude); a real server does not, and the test looks at the
+# documents of the package (the licence texts), so the exclusion is removed.
+RUN rm -f /etc/dpkg/dpkg.cfg.d/excludes
 STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]

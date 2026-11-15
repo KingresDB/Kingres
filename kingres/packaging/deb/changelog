@@ -1,7 +1,13 @@
-kingres (0.1.0-1) noble; urgency=medium
+kingres (@DEB_VERSION@-@REVISION@) noble; urgency=medium
 
-  * First packaging of KingresDB: the PostgreSQL 18.7 based server with the
-    kingres_shard and kingres_ledger extensions, kingresd with the embedded
-    management panel, kingres-verify, and the kingres.service unit.
+  * First packaging of KingresDB for PostgreSQL @PG_MAJOR@ (@PG_VERSION@): the
+    PostgreSQL based server with the kingres_columnar, kingres_ledger,
+    kingres_shard, kingres_sketch and kingres_timepart extensions, kingresd
+    with the embedded management panel, kingres-verify, and the kingres.service
+    unit.
+  * One package per PostgreSQL major, in the version: +pg18 and +pg19.  The
+    maintainer script refuses to replace the one by the other.
+  * KingresDB's own code is under AGPL-3.0-only; the PostgreSQL files keep the
+    PostgreSQL License (see the copyright file).
 
- -- Mohammad Rasoul Kazemi (RooyeKhat) <rooyekhat.media@gmail.com>  Sat, 14 Nov 2026 18:43:06 +0330
+ -- Mohammad Rasoul Kazemi (RooyeKhat) <rooyekhat.media@gmail.com>  Sun, 15 Nov 2026 12:00:00 +0330
