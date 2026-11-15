@@ -49,7 +49,7 @@
  * kingres_shard_catalog(), so the hook calls it once and reads everything
  * from that one result.
  *
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only
  * Portions Copyright (c) 2026, RooyeKhat Media Co
  *
  * IDENTIFICATION
@@ -876,6 +876,19 @@ plan_forwarded(Query *parse, const char *query_string, int cursorOptions,
 	List	   *relids = NIL;
 	bool		pending = false;
 
+	/*
+	 * A node that the catalog does not call the primary of its group (the old primary
+	 * after promote_node(), a standby) answers no fragment of any kind: its partitions
+	 * are a stale copy.  The node that sent the fragment reloads its catalog and goes to
+	 * the new primary.
+	 */
+	if (cat->local_group_id < 0 && cat->local_node_id != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_KINGRES_STALE_MAP),
+				 errmsg("this node is no longer the primary of its shard group (stale map version " INT64_FORMAT ")",
+						cat->map_version),
+				 errhint("The statement can be repeated: it is sent to the current primary of the group.")));
+
 	/* The fragment of a distributed scan of another node: the local buckets only. */
 	if (list_length(a->refs) == 1 && query_string != NULL &&
 		strncmp(query_string, KS_FRAGMENT_MARKER, strlen(KS_FRAGMENT_MARKER)) == 0 &&
@@ -1427,7 +1440,29 @@ planner_hook_body(Query *parse, const char *query_string,
 
 	/* The local part of a fanned-out statement is planned for this node only. */
 	if (kingres_shard_in_fanout_local(query_string))
+	{
+		/*
+		 * The partition list of the relcache must be as new as the catalog before the
+		 * local part is planned: after a move or a promotion a plan made on an older
+		 * list writes to the wrong set of partitions.
+		 */
+		const KsCatalog *fc = kingres_shard_catalog();
+		ListCell   *flc;
+
+		if (fc->present && fc->dist_tables != NULL)
+			foreach(flc, parse->rtable)
+			{
+				RangeTblEntry *frte = (RangeTblEntry *) lfirst(flc);
+				KsDistTable *fd;
+
+				if (frte->rtekind != RTE_RELATION)
+					continue;
+				fd = hash_search(fc->dist_tables, &frte->relid, HASH_FIND, NULL);
+				if (fd != NULL && !fd->is_reference)
+					kingres_shard_ensure_fresh_partitions(frte->relid, fc->map_version);
+			}
 		return pass_through(parse, query_string, cursorOptions, boundParams);
+	}
 	/* The actions of a reference-table write (foreign keys) run on this node's copy only. */
 	if (kingres_shard_in_refwrite_nested(query_string))
 		return pass_through(parse, query_string, cursorOptions, boundParams);
@@ -1444,11 +1479,11 @@ planner_hook_body(Query *parse, const char *query_string,
 	/* The window of shard-phase4.md, "A routed statement on a target"; forced by t/033. */
 	kingres_shard_fault_point("route_before_catalog");
 	cat = kingres_shard_catalog();
-	if (!cat->present || cat->ndist_tables == 0 || cat->local_group_id < 0)
+	if (!cat->present || cat->ndist_tables == 0 || cat->local_group_id == -1)
 		return pass_through(parse, query_string, cursorOptions, boundParams);
 
 	/* With one shard group every bucket is local. */
-	if (cat->ngroups <= 1 && !kingres_shard_session_forwarded())
+	if (cat->ngroups <= 1 && cat->local_group_id >= 0 && !kingres_shard_session_forwarded())
 		return pass_through(parse, query_string, cursorOptions, boundParams);
 
 	refuse_bucket_partition_write(parse, cat);

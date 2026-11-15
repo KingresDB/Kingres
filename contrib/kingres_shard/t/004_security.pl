@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PostgreSQL
+# SPDX-License-Identifier: AGPL-3.0-only
 # Portions Copyright (c) 2026, RooyeKhat Media Co
 #
 # t/004_security.pl
@@ -22,7 +22,8 @@ sub make_node
 	$node->append_conf('postgresql.conf',
 		"shared_preload_libraries = 'kingres_shard'
 max_prepared_transactions = 20
-kingres_shard.recovery_interval = 0");
+kingres_shard.recovery_interval = 0
+kingres_shard.deadlock_check_interval = 0");
 	$node->start;
 	return $node;
 }

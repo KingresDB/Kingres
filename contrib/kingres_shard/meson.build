@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PostgreSQL
+# SPDX-License-Identifier: AGPL-3.0-only
 # Portions Copyright (c) 2026, RooyeKhat Media Co
 
 kingres_shard_sources = files(
@@ -7,8 +7,10 @@ kingres_shard_sources = files(
   'src/dist_scan.c',
   'src/dist_table.c',
   'src/fanout.c',
+  'src/failover.c',
   'src/fault.c',
   'src/forward_auth.c',
+  'src/ha.c',
   'src/hashing.c',
   'src/kingres_shard.c',
   'src/node_admin.c',
@@ -47,6 +49,8 @@ install_data(
   'kingres_shard--0.1--0.2.sql',
   'kingres_shard--0.2--0.3.sql',
   'kingres_shard--0.3--0.4.sql',
+  'kingres_shard--0.5.sql',
+  'kingres_shard--0.4--0.5.sql',
   kwargs: contrib_data_args,
 )
 
@@ -123,6 +127,14 @@ tests += {
       't/045_server_major.pl',
       't/046_two_majors.pl',
       't/047_review_s5.pl',
+      't/048_standby_nodes.pl',
+      't/049_promote_node.pl',
+      't/050_failover_twophase.pl',
+      't/051_gid_formats.pl',
+      't/052_distributed_deadlock.pl',
+      't/053_restore_point.pl',
+      't/054_failover_move.pl',
+      't/055_ship_limits.pl',
     ],
   },
 }

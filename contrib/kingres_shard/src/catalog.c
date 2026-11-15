@@ -20,7 +20,7 @@
  * The catalog is read with plain heap scans instead of SPI so that loading
  * it from inside the planner cannot recurse into the planner hook.
  *
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only
  * Portions Copyright (c) 2026, RooyeKhat Media Co
  *
  * IDENTIFICATION
@@ -51,6 +51,7 @@
 
 #include "catalog.h"
 #include "kingres_shard.h"
+#include "node_conn.h"
 
 PG_FUNCTION_INFO_V1(kingres_map_version_bump);
 
@@ -400,7 +401,17 @@ catalog_load(void)
 				KsNode	   *n = (KsNode *) lfirst(lc);
 
 				if (n->node_id == cat.local_node_id)
-					cat.local_group_id = n->group_id;
+				{
+					/*
+					 * A node that the catalog does not call the primary of its
+					 * group (it was demoted by promote_node(), or it is a
+					 * standby) is in no group as far as routing goes: -2,
+					 * which no bucket has, so that nothing is run here as
+					 * local and statements go to the primary.  -1 stays "not
+					 * initialized".
+					 */
+					cat.local_group_id = n->is_primary ? n->group_id : -2;
+				}
 			}
 
 			/* colocation(colocation_id, bucket_count, dist_column_type, dist_collation) */
@@ -519,6 +530,10 @@ catalog_load(void)
 	if (prevcxt != NULL)
 		MemoryContextDelete(prevcxt);
 	ks.valid = true;
+
+	/* Sessions to nodes that are no longer primaries are of no use any more. */
+	if (ks.cat.present)
+		kingres_shard_conn_drop_stale(ks.cat.nodes);
 }
 
 /*
@@ -625,18 +640,69 @@ kingres_shard_partition_identity_now(Oid parent)
 	return (int64) h;
 }
 
+/*
+ * The primary of every shard group, as (group, node id) pairs.  The placement of
+ * a bucket is its group AND the node that is that group's primary: when
+ * promote_node() changes the primary, a statement that planned against the old
+ * one fails with the retryable KS001 instead of answering from it.
+ */
+typedef struct GroupPrimary
+{
+	int			group;
+	int			node;
+} GroupPrimary;
+
+static int
+primary_of(const GroupPrimary *gp, int n, int group)
+{
+	int			i;
+
+	for (i = 0; i < n; i++)
+		if (gp[i].group == group)
+			return gp[i].node;
+	return 0;
+}
+
+static uint64
+bucket_term(int bucket, int group, int primary)
+{
+	uint64		t = placement_mix(bucket, group);
+
+	if (primary > 0)
+		t ^= placement_mix(primary, 0x2f1d);
+	return t;
+}
+
 /* From the cache of this backend. */
 int64
 kingres_shard_placement_hash(const KsColocation *coloc)
 {
+	const KsCatalog *cat = kingres_shard_catalog();
+	GroupPrimary *gp;
+	int			ngp = 0;
 	uint64		h = 0;
 	int			b;
+	ListCell   *lc;
 
 	if (coloc == NULL)
 		return 0;
+	gp = palloc(sizeof(GroupPrimary) * Max(list_length(cat->nodes), 1));
+	foreach(lc, cat->nodes)
+	{
+		KsNode	   *n = (KsNode *) lfirst(lc);
+
+		if (n->is_primary && n->is_active)
+		{
+			gp[ngp].group = n->group_id;
+			gp[ngp].node = n->node_id;
+			ngp++;
+		}
+	}
 	for (b = 0; b < coloc->bucket_count; b++)
 		if (coloc->bucket_group[b] >= 0)
-			h += placement_mix(b, coloc->bucket_group[b]);
+			h += bucket_term(b, coloc->bucket_group[b],
+							 primary_of(gp, ngp, coloc->bucket_group[b]));
+	pfree(gp);
 	return (int64) h;
 }
 
@@ -649,24 +715,59 @@ int64
 kingres_shard_placement_hash_now(int colocation_id)
 {
 	Oid			relid = kingres_shard_catalog_relid("bucket_map");
+	Oid			noderel = kingres_shard_catalog_relid("node");
 	CatScan		cs;
 	HeapTuple	tup;
 	uint64		h = 0;
+	GroupPrimary *gp = NULL;
+	int			ngp = 0;
+	int			cap = 0;
 
 	if (!OidIsValid(relid))
 		return 0;
+	if (OidIsValid(noderel))
+	{
+		catscan_begin(&cs, noderel);
+		while ((tup = catscan_next(&cs)) != NULL)
+		{
+			TupleDesc	desc = RelationGetDescr(cs.rel);
+			bool		isnull;
+			char	   *role = TextDatumGetCString(heap_getattr(tup, 5, desc, &isnull));
+			bool		active = DatumGetBool(heap_getattr(tup, 6, desc, &isnull));
+
+			if (strcmp(role, "primary") == 0 && active)
+			{
+				if (ngp == cap)
+				{
+					cap = cap ? cap * 2 : 8;
+					gp = gp ? repalloc(gp, sizeof(GroupPrimary) * cap)
+						: palloc(sizeof(GroupPrimary) * cap);
+				}
+				gp[ngp].node = DatumGetInt32(heap_getattr(tup, 1, desc, &isnull));
+				gp[ngp].group = DatumGetInt32(heap_getattr(tup, 2, desc, &isnull));
+				ngp++;
+			}
+			pfree(role);
+		}
+		catscan_end(&cs);
+	}
 	catscan_begin(&cs, relid);
 	while ((tup = catscan_next(&cs)) != NULL)
 	{
 		TupleDesc	desc = RelationGetDescr(cs.rel);
 		bool		isnull;
+		int			bucket;
+		int			group;
 
 		if (DatumGetInt32(heap_getattr(tup, 1, desc, &isnull)) != colocation_id)
 			continue;
-		h += placement_mix(DatumGetInt32(heap_getattr(tup, 2, desc, &isnull)),
-						   DatumGetInt32(heap_getattr(tup, 3, desc, &isnull)));
+		bucket = DatumGetInt32(heap_getattr(tup, 2, desc, &isnull));
+		group = DatumGetInt32(heap_getattr(tup, 3, desc, &isnull));
+		h += bucket_term(bucket, group, primary_of(gp, ngp, group));
 	}
 	catscan_end(&cs);
+	if (gp != NULL)
+		pfree(gp);
 	return (int64) h;
 }
 

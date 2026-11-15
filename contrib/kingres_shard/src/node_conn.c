@@ -50,7 +50,7 @@
  * what was prepared (ROLLBACK PREPARED) and what was not (ROLLBACK); a
  * prepared transaction whose origin died is resolved by recovery.c.
  *
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only AND PostgreSQL
  * Portions Copyright (c) 2026, RooyeKhat Media Co
  *
  * IDENTIFICATION
@@ -63,6 +63,7 @@
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "catalog/indexing.h"
 #include "commands/dbcommands.h"
 #include "libpq/libpq-be-fe-helpers.h"
@@ -80,6 +81,7 @@
 
 #include "catalog.h"
 #include "forward_auth.h"
+#include "ha.h"
 #include "kingres_shard.h"
 #include "node_conn.h"
 
@@ -122,6 +124,7 @@ static void conn_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 								  SubTransactionId parentSubid, void *arg);
 static void exec_internal(KsConn *kc, const char *sql);
 static void append_timezone_setting(StringInfo buf);
+static void append_dtx_label(StringInfo buf);
 static void remember_timezone(KsConn *kc);
 static void sync_timezone(KsConn *kc);
 static void discard_connection(KsConn *kc);
@@ -319,7 +322,24 @@ target_node_id(const char *host, int port)
 	int			i;
 
 	if (id != 0)
+	{
+		/*
+		 * A standby is a physical copy of the primary of its group, so the node
+		 * row it holds for itself (local_node) is the primary's until
+		 * promote_node() changes it: the token of a session to a standby is made
+		 * for that id.
+		 */
+		const KsNode *n = kingres_shard_node_by_id(id);
+
+		if (n != NULL && !n->is_primary)
+		{
+			const KsNode *p = kingres_shard_group_primary(n->group_id);
+
+			if (p != NULL)
+				return p->node_id;
+		}
 		return id;
+	}
 	for (i = 0; i < nexpected; i++)
 		if (expected_nodes[i].port == port && strcmp(expected_nodes[i].host, host) == 0)
 			return expected_nodes[i].node_id;
@@ -604,6 +624,50 @@ kingres_shard_forget_xact(KsConn *kc)
 }
 
 /*
+ * kingres_shard_conn_drop_stale
+ *
+ * Close the idle cached sessions to nodes that the catalog knows and that are
+ * not active primaries (the old primary of a group after promote_node(), a
+ * standby): nothing routes to them any more, and a session that stays open to a
+ * demoted node keeps the node's connection slot and, if the node is later
+ * promoted again, would be used with its old state.  Sessions that are in a
+ * transaction are left; they end with it.  Called when the catalog was loaded.
+ */
+void
+kingres_shard_conn_drop_stale(List *nodes)
+{
+	HASH_SEQ_STATUS scan;
+	KsConn	   *kc;
+
+	if (conn_hash == NULL)
+		return;
+	hash_seq_init(&scan, conn_hash);
+	while ((kc = (KsConn *) hash_seq_search(&scan)) != NULL)
+	{
+		ListCell   *lc;
+		bool		known = false;
+		bool		primary = false;
+
+		if (kc->conn == NULL || kc->xact_depth > 0 || kc->in_query ||
+			kc->pending_owner != NULL)
+			continue;
+		foreach(lc, nodes)
+		{
+			KsNode	   *n = (KsNode *) lfirst(lc);
+
+			if (n->port == kc->port && strcmp(n->host, kc->host) == 0)
+			{
+				known = true;
+				if (n->is_primary && n->is_active)
+					primary = true;
+			}
+		}
+		if (known && !primary)
+			discard_connection(kc);
+	}
+}
+
+/*
  * Asynchronous fetches.  A scan that has sent a FETCH and has not read the
  * answer registers itself on the connection; anything else that wants to use
  * the connection first asks the owner to read the answer (it keeps the result
@@ -705,6 +769,7 @@ kingres_shard_begin_xact(KsConn *kc)
 						 KS_FIXED_SETTINGS_SQL);
 		kc->tz_applied[0] = '\0';
 		append_timezone_setting(&sql);
+		append_dtx_label(&sql);
 		exec_internal(kc, sql.data);
 		pfree(sql.data);
 		remember_timezone(kc);
@@ -723,6 +788,29 @@ kingres_shard_begin_xact(KsConn *kc)
 
 	/* The local TimeZone may have changed since the last statement. */
 	sync_timezone(kc);
+}
+
+/*
+ * The label of the distributed transaction a remote session works for, as the
+ * application name of the session for the length of the remote transaction:
+ * "ks-dtx:<origin node>:<origin pid>:<start of the origin transaction, in
+ * microseconds since the Unix epoch>".  The deadlock detector reads it from
+ * pg_stat_activity of the node, so that a wait of this session counts as a
+ * wait of the origin transaction (kingres.internal_wait_edges).  SET LOCAL
+ * ends with the transaction.
+ */
+static void
+append_dtx_label(StringInfo buf)
+{
+	int			node = kingres_shard_local_node_id_raw();
+	int64		us;
+
+	if (node == 0)
+		return;
+	us = (int64) GetCurrentTransactionStartTimestamp() +
+		((int64) (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE)) * SECS_PER_DAY * USECS_PER_SEC;
+	appendStringInfo(buf, "; SET LOCAL application_name = 'ks-dtx:%d:%d:" INT64_FORMAT "'",
+					 node, MyProcPid, us);
 }
 
 /*
@@ -1425,7 +1513,8 @@ precommit(bool parallel)
 	bool		local_writer;
 	int			nprepared = 0;
 	FullTransactionId fxid;
-	int			origin;
+	int			origin_group;
+	TimeLineID	tli;
 	List	   *used_gids = NIL;
 
 	hash_seq_init(&scan, conn_hash);
@@ -1474,7 +1563,21 @@ precommit(bool parallel)
 	/* The global transaction id needs the local transaction id. */
 	(void) GetTopTransactionId();
 	fxid = GetTopFullTransactionId();
-	origin = kingres_shard_catalog()->local_node_id;
+	/*
+	 * The gid names the origin shard group and the timeline of the origin, not
+	 * the origin node: after a failover the promoted standby of the group
+	 * resolves what the old primary started (recovery.c).  A restore-point
+	 * barrier is waited out before anything is prepared; the count of
+	 * transactions in flight ends in the commit or abort callback.
+	 */
+	origin_group = kingres_shard_catalog()->local_group_id;
+	if (origin_group < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_KINGRES_STALE_MAP),
+				 errmsg("this node is not the primary of a shard group, so it cannot commit a transaction that writes on several nodes"),
+				 errhint("The node was demoted by kingres.promote_node(); repeat the statement on the new primary.")));
+	tli = GetWALInsertionTimeLine();
+	kingres_shard_ha_commit_enter();
 
 	kingres_shard_fault_point("before_prepare");
 	hash_seq_init(&scan, conn_hash);
@@ -1486,8 +1589,8 @@ precommit(bool parallel)
 		if (kc->xact_depth <= 0 || !kc->wrote)
 			continue;
 		target = kingres_shard_conn_node_id(kc->host, kc->port);
-		gid = psprintf("kingres_%d_%d_" UINT64_FORMAT "_%d", origin, MyProcPid,
-					   U64FromFullTransactionId(fxid), target);
+		gid = psprintf("kingres_g%d_%u_%d_" UINT64_FORMAT "_%d", origin_group, tli,
+					   MyProcPid, U64FromFullTransactionId(fxid), target);
 		/* Two connections (two roles) to one node need two names. */
 		{
 			ListCell   *lc;
@@ -1502,8 +1605,8 @@ precommit(bool parallel)
 					if (strcmp((char *) lfirst(lc), gid) == 0)
 					{
 						dup = true;
-						gid = psprintf("kingres_%d_%d_" UINT64_FORMAT "_%d_%d", origin,
-									   MyProcPid, U64FromFullTransactionId(fxid),
+						gid = psprintf("kingres_g%d_%u_%d_" UINT64_FORMAT "_%d_%d", origin_group,
+									   tli, MyProcPid, U64FromFullTransactionId(fxid),
 									   target, ++n);
 						break;
 					}
@@ -1623,6 +1726,7 @@ conn_xact_callback(XactEvent event, void *arg)
 
 		case XACT_EVENT_COMMIT:
 			postcommit();
+			kingres_shard_ha_commit_leave();
 			break;
 
 		case XACT_EVENT_PARALLEL_COMMIT:
@@ -1637,6 +1741,7 @@ conn_xact_callback(XactEvent event, void *arg)
 			hash_seq_init(&scan, conn_hash);
 			while ((kc = (KsConn *) hash_seq_search(&scan)) != NULL)
 				abort_connection(kc);
+			kingres_shard_ha_commit_leave();
 			break;
 	}
 }

@@ -1,6 +1,6 @@
 # contrib/kingres_shard/Makefile
 #
-# SPDX-License-Identifier: PostgreSQL
+# SPDX-License-Identifier: AGPL-3.0-only
 # Portions Copyright (c) 2026, RooyeKhat Media Co
 #
 # The libpq handling follows contrib/postgres_fdw/Makefile.
@@ -13,8 +13,10 @@ OBJS = \
 	src/dist_scan.o \
 	src/dist_table.o \
 	src/fanout.o \
+	src/failover.o \
 	src/fault.o \
 	src/forward_auth.o \
+	src/ha.o \
 	src/hashing.o \
 	src/kingres_shard.o \
 	src/node_admin.o \
@@ -34,7 +36,7 @@ SHLIB_LINK_INTERNAL = $(libpq)
 EXTENSION = kingres_shard
 DATA = kingres_shard--0.1.sql kingres_shard--0.2.sql kingres_shard--0.3.sql \
 	kingres_shard--0.4.sql kingres_shard--0.1--0.2.sql kingres_shard--0.2--0.3.sql \
-	kingres_shard--0.3--0.4.sql
+	kingres_shard--0.3--0.4.sql kingres_shard--0.5.sql kingres_shard--0.4--0.5.sql
 
 REGRESS = version catalog bucket_for distribute routing_single security \
 	utility_guard routing_decisions reference ddl_single rebalance_plan upgrade

@@ -36,7 +36,7 @@
  * autoprewarm.c); the worker does nothing unless the extension is installed
  * and initialized there, and nothing on a standby.
  *
- * SPDX-License-Identifier: PostgreSQL
+ * SPDX-License-Identifier: AGPL-3.0-only
  * Portions Copyright (c) 2026, RooyeKhat Media Co
  *
  * IDENTIFICATION
@@ -86,6 +86,7 @@ PG_FUNCTION_INFO_V1(kingres_recover_prepared_transactions);
 typedef struct RecNode
 {
 	int			node_id;
+	int			group_id;
 	char	   *host;
 	int			port;
 } RecNode;
@@ -124,19 +125,40 @@ xid_possibly_running(uint64 fxid, int pid)
 }
 
 /*
- * Parse kingres_<origin>_<pid>_<full xid>_<target>[_<n>]; false when the gid is
- * not one of ours.
+ * A gid of ours, split.  Two formats exist:
+ *
+ *	  kingres_g<origin group>_<timeline>_<pid>_<full xid>_<target>[_<n>]
+ *	  kingres_<origin node>_<pid>_<full xid>_<target>[_<n>]	(0.4 and older)
+ *
+ * The first names the group of the origin, so that the node that became the
+ * primary of that group after a failover resolves what the old one started,
+ * and the timeline the origin prepared on.  The second names the origin node;
+ * transactions prepared by 0.4 and still pending at an upgrade carry it, and
+ * the group is looked up from the node row.
  */
+typedef struct ParsedGid
+{
+	bool		is_group_format;
+	int			origin;			/* a group id, or (old format) a node id */
+	uint32		tli;			/* 0 in the old format */
+	int			pid;
+	uint64		fxid;
+} ParsedGid;
+
+/* false when the gid is not one of ours. */
 static bool
-parse_gid(const char *gid, int *origin, int *pid, uint64 *fxid)
+parse_gid(const char *gid, ParsedGid *out)
 {
 	char	   *copy = pstrdup(gid);
-	char	   *tok[8];
+	char	   *tok[10];
 	int			n = 0;
 	char	   *p = copy;
 	bool		ok;
+	bool		grp;
+	int			first;			/* the first numeric token */
+	int			nnum;
 
-	while (n < 8)
+	while (n < 10)
 	{
 		tok[n++] = p;
 		p = strchr(p, '_');
@@ -145,30 +167,53 @@ parse_gid(const char *gid, int *origin, int *pid, uint64 *fxid)
 		*p++ = '\0';
 	}
 	/*
-	 * kingres_<origin>_<pid>_<full xid>_<target>[_<n>], every field a number:
-	 * a prepared transaction of a user that merely starts with "kingres_" is not
-	 * ours and is never touched (review finding S2-20).
+	 * Every field a number (the group with a "g" in front): a prepared
+	 * transaction of a user that merely starts with "kingres_" is not ours and
+	 * is never touched (review finding S2-20).
 	 */
-	ok = ((n == 5 || n == 6) && strcmp(tok[0], "kingres") == 0);
+	ok = (n >= 5 && strcmp(tok[0], "kingres") == 0);
+	grp = ok && tok[1][0] == 'g';
+	if (ok)
 	{
 		int			t;
 
-		for (t = 1; ok && t < n; t++)
+		/* group format: 6 or 7 tokens; old format: 5 or 6 */
+		if (grp)
+			ok = (n == 6 || n == 7);
+		else
+			ok = (n == 5 || n == 6);
+		first = 1;
+		nnum = n;
+		for (t = first; ok && t < nnum; t++)
 		{
-			const char *c;
+			const char *c = tok[t];
 
-			if (tok[t][0] == '\0')
+			if (t == 1 && grp)
+				c++;
+			if (*c == '\0')
 				ok = false;
-			for (c = tok[t]; ok && *c != '\0'; c++)
+			for (; ok && *c != '\0'; c++)
 				if (*c < '0' || *c > '9')
 					ok = false;
 		}
 	}
 	if (ok)
 	{
-		*origin = atoi(tok[1]);
-		*pid = atoi(tok[2]);
-		*fxid = strtoull(tok[3], NULL, 10);
+		out->is_group_format = grp;
+		if (grp)
+		{
+			out->origin = atoi(tok[1] + 1);
+			out->tli = (uint32) strtoul(tok[2], NULL, 10);
+			out->pid = atoi(tok[3]);
+			out->fxid = strtoull(tok[4], NULL, 10);
+		}
+		else
+		{
+			out->origin = atoi(tok[1]);
+			out->tli = 0;
+			out->pid = atoi(tok[2]);
+			out->fxid = strtoull(tok[3], NULL, 10);
+		}
 	}
 	pfree(copy);
 	return ok;
@@ -217,21 +262,33 @@ decision_logged(const char *gid)
  * prepared transaction alone); otherwise true and *commit says what to do.
  */
 static bool
-origin_decision(const char *gid, uint64 fxid, int pid, bool *commit)
+origin_decision(const char *gid, uint64 fxid, int pid, bool earlier_timeline, bool *commit)
 {
-	/* (a) */
-	if (xid_possibly_running(fxid, pid))
+	/*
+	 * (a)  A transaction of an earlier timeline is over by definition: the
+	 * backend that ran it was on the primary that lost the group (or on this
+	 * node before it was promoted, and every transaction of that time ended
+	 * with the promotion).  Its transaction id says nothing here: the new
+	 * timeline may have used the same number for another transaction.
+	 */
+	if (!earlier_timeline && xid_possibly_running(fxid, pid))
 		return false;
 	/* (b), strictly after (a) */
 	*commit = decision_logged(gid);
 	return true;
 }
 
-/* Delete the rows of a node that are no longer prepared there. */
+/*
+ * Delete the rows of a node that are no longer prepared there.  node_ids are
+ * the ids of the node and of every other node row of its shard group: the rows
+ * of a decision name the node that was the primary when the transaction
+ * prepared, and after a failover the transaction is looked for (and gone) on
+ * the group's new primary.
+ */
 static void
-purge_log(int node_id, TimestampTz listed_at, List *still_prepared, List *listed)
+purge_log(int node_id, const int *node_ids, int nids, TimestampTz listed_at, List *still_prepared, List *listed)
 {
-	Oid			argtypes[3] = {INT4OID, TIMESTAMPTZOID, TEXTARRAYOID};
+	Oid			argtypes[3] = {INT4ARRAYOID, TIMESTAMPTZOID, TEXTARRAYOID};
 	Datum		values[3];
 	Datum	   *elems;
 	int			n = list_length(still_prepared);
@@ -241,11 +298,18 @@ purge_log(int node_id, TimestampTz listed_at, List *still_prepared, List *listed
 	elems = palloc(sizeof(Datum) * Max(n, 1));
 	foreach(lc, still_prepared)
 		elems[i++] = CStringGetTextDatum((char *) lfirst(lc));
-	values[0] = Int32GetDatum(node_id);
+	{
+		Datum	   *ids = palloc(sizeof(Datum) * Max(nids, 1));
+		int			k;
+
+		for (k = 0; k < nids; k++)
+			ids[k] = Int32GetDatum(node_ids[k]);
+		values[0] = PointerGetDatum(construct_array_builtin(ids, nids, INT4OID));
+	}
 	values[1] = TimestampTzGetDatum(listed_at);
 	values[2] = PointerGetDatum(construct_array_builtin(elems, n, TEXTOID));
 	if (SPI_execute_with_args("DELETE FROM " KINGRES_SHARD_SCHEMA ".dtx_log "
-							  "WHERE node_id OPERATOR(pg_catalog.=) $1 "
+							  "WHERE node_id OPERATOR(pg_catalog.=) ANY ($1) "
 							  "AND prepared_at OPERATOR(pg_catalog.<) $2 "
 							  "AND NOT (gid OPERATOR(pg_catalog.=) ANY ($3))",
 							  3, argtypes, values, NULL, false, 0) != SPI_OK_DELETE)
@@ -279,6 +343,42 @@ purge_log(int node_id, TimestampTz listed_at, List *still_prepared, List *listed
 }
 
 /*
+ * Remember, in kingres.dtx_incident, that a prepared transaction of an earlier
+ * timeline had no commit decision and was rolled back.  The origin that was lost
+ * may have committed it and sent COMMIT PREPARED to some participants before its
+ * decision reached the standby that was promoted (asynchronous replication): this
+ * is the one case in which a transaction can end up committed on some nodes and
+ * rolled back on others, and the row is how an operator finds out which
+ * transactions to look at.  With a synchronous standby the decision is on the
+ * promoted node before any participant is told to commit, and the rows are
+ * only the rollbacks of transactions that never committed.
+ */
+static void
+record_incident(const char *gid, int node_id, uint32 gid_tli, TimeLineID current_tli)
+{
+	Oid			argtypes[4] = {TEXTOID, INT4OID, INT4OID, INT4OID};
+	Datum		values[4];
+
+	if (!OidIsValid(kingres_shard_catalog_relid("dtx_incident")))
+		return;
+	values[0] = CStringGetTextDatum(gid);
+	values[1] = Int32GetDatum(node_id);
+	values[2] = Int32GetDatum((int32) gid_tli);
+	values[3] = Int32GetDatum((int32) current_tli);
+	if (SPI_execute_with_args("INSERT INTO " KINGRES_SHARD_SCHEMA ".dtx_incident "
+							  "(gid, node_id, gid_timeline, current_timeline, detected_at, kind) "
+							  "VALUES ($1, $2, $3, $4, pg_catalog.clock_timestamp(), 'rolled_back_after_failover') "
+							  "ON CONFLICT (gid) DO NOTHING",
+							  4, argtypes, values, NULL, false, 0) != SPI_OK_INSERT)
+		elog(ERROR, "could not record in kingres.dtx_incident");
+	ereport(WARNING,
+			(errmsg("kingres_shard recovery: prepared transaction \"%s\" on node %d belongs to timeline %u and has no commit decision on this node (timeline %u); it was rolled back",
+					gid, node_id, gid_tli, current_tli),
+			 errdetail("If the group lost its primary and the commit of this transaction had not reached this node, other nodes may have committed it."),
+			 errhint("Look at the row of this gid in kingres.dtx_incident.")));
+}
+
+/*
  * kingres_shard_recover_prepared
  *
  * See the file header.  Returns the number of prepared transactions committed
@@ -287,11 +387,25 @@ purge_log(int node_id, TimestampTz listed_at, List *still_prepared, List *listed
 int
 kingres_shard_recover_prepared(void)
 {
+	return kingres_shard_recover_prepared_with(0, 0, NULL, 0);
+}
+
+/*
+ * The same, and also on one more node that the catalog does not list as a
+ * primary (extra_host is not NULL): the standby that promote_node() is about to
+ * make the primary of its group.  What its group's old primary left prepared on it
+ * (a switch of a bucket move that was decided, a catalog change) holds row locks
+ * on the catalog tables that promote_node() writes there, so it is resolved first.
+ */
+int
+kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *extra_host, int extra_port)
+{
 	MemoryContext callercxt = CurrentMemoryContext;
 	const KsCatalog *cat = kingres_shard_catalog();
 	List	   *nodes = NIL;
 	ListCell   *lc;
-	int			origin;
+	int			my_group;
+	TimeLineID	current_tli;
 	int			resolved = 0;
 
 	if (!cat->present || cat->local_node_id == 0)
@@ -307,7 +421,15 @@ kingres_shard_recover_prepared(void)
 				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 				 errmsg("recover_prepared_transactions() must run in a READ COMMITTED transaction")));
 
-	origin = cat->local_node_id;
+	/*
+	 * The node resolves what its shard group originated, and only while the
+	 * catalog calls it the primary of that group: a node that was demoted by
+	 * promote_node() (group -2) is not the origin of anything any more.
+	 */
+	current_tli = GetWALInsertionTimeLine();
+	my_group = cat->local_group_id;
+	if (my_group < 0)
+		return 0;
 	foreach(lc, cat->nodes)
 	{
 		KsNode	   *n = (KsNode *) lfirst(lc);
@@ -317,8 +439,19 @@ kingres_shard_recover_prepared(void)
 			continue;
 		r = MemoryContextAlloc(callercxt, sizeof(RecNode));
 		r->node_id = n->node_id;
+		r->group_id = n->group_id;
 		r->host = MemoryContextStrdup(callercxt, n->host);
 		r->port = n->port;
+		nodes = lappend(nodes, r);
+	}
+	if (extra_host != NULL)
+	{
+		RecNode    *r = MemoryContextAlloc(callercxt, sizeof(RecNode));
+
+		r->node_id = extra_id;
+		r->group_id = extra_group;
+		r->host = MemoryContextStrdup(callercxt, extra_host);
+		r->port = extra_port;
 		nodes = lappend(nodes, r);
 	}
 
@@ -344,6 +477,7 @@ kingres_shard_recover_prepared(void)
 			RecNode    *r = MemoryContextAlloc(callercxt, sizeof(RecNode));
 
 			r->node_id = 0;
+			r->group_id = -1;
 			r->host = MemoryContextStrdup(callercxt,
 										  SPI_getvalue(SPI_tuptable->vals[i],
 													   SPI_tuptable->tupdesc, 1));
@@ -411,7 +545,8 @@ kingres_shard_recover_prepared(void)
 				continue;
 		}
 		listed_at = GetCurrentTimestamp();
-		params[0] = psprintf("kingres\\_%d\\_%%", origin);
+		/* Both formats; parse_gid() and the group of the origin say which are ours. */
+		params[0] = "kingres\\_%";
 		res = kingres_shard_exec_params(kc,
 										"SELECT gid FROM pg_catalog.pg_prepared_xacts "
 										"WHERE database OPERATOR(pg_catalog.=) pg_catalog.current_database() "
@@ -436,16 +571,28 @@ kingres_shard_recover_prepared(void)
 		foreach(lc2, gids)
 		{
 			char	   *gid = (char *) lfirst(lc2);
-			int			g_origin;
-			int			g_pid;
-			uint64		fxid;
+			ParsedGid	pg;
+			int			origin_group;
+			bool		earlier;
 			bool		commit;
 			char	   *sql;
 
-			if (!parse_gid(gid, &g_origin, &g_pid, &fxid) || g_origin != origin)
+			if (!parse_gid(gid, &pg))
 				continue;
+			/* The old format names a node: the group is the one of that node's row. */
+			if (pg.is_group_format)
+				origin_group = pg.origin;
+			else
+			{
+				const KsNode *on = kingres_shard_node_by_id(pg.origin);
 
-			if (!origin_decision(gid, fxid, g_pid, &commit))
+				origin_group = on ? on->group_id : -1;
+			}
+			if (origin_group != my_group)
+				continue;
+			earlier = pg.is_group_format && (TimeLineID) pg.tli < current_tli;
+
+			if (!origin_decision(gid, pg.fxid, pg.pid, earlier, &commit))
 			{
 				still_prepared = lappend(still_prepared, gid);
 				continue;
@@ -459,6 +606,8 @@ kingres_shard_recover_prepared(void)
 				ereport(LOG,
 						(errmsg("kingres_shard recovery: %s prepared transaction \"%s\" on node %d",
 								commit ? "committed" : "rolled back", gid, r->node_id)));
+				if (!commit && earlier)
+					record_incident(gid, r->node_id, pg.tli, current_tli);
 			}
 			else if (res != NULL &&
 					 kingres_shard_result_sqlstate(res) == ERRCODE_UNDEFINED_OBJECT)
@@ -476,7 +625,22 @@ kingres_shard_recover_prepared(void)
 			PQclear(res);
 		}
 
-		purge_log(r->node_id, listed_at, still_prepared, gids);
+		{
+			int		   *ids = palloc(sizeof(int) * (list_length(cat->nodes) + 1));
+			int			nids = 0;
+			ListCell   *lcn;
+
+			ids[nids++] = r->node_id;
+			if (r->node_id != 0)
+				foreach(lcn, cat->nodes)
+				{
+					KsNode	   *gn = (KsNode *) lfirst(lcn);
+
+					if (gn->group_id == r->group_id && gn->node_id != r->node_id)
+						ids[nids++] = gn->node_id;
+				}
+			purge_log(r->node_id, ids, nids, listed_at, still_prepared, gids);
+		}
 	}
 
 	/* Rows of nodes that left the cluster have nothing left to resolve. */
@@ -498,6 +662,12 @@ kingres_shard_recover_prepared(void)
 					"WHERE n.host OPERATOR(pg_catalog.=) p.host AND n.port OPERATOR(pg_catalog.=) p.port)",
 					false, 0) != SPI_OK_DELETE)
 		elog(ERROR, "could not clean kingres.pending_node");
+
+	if (OidIsValid(kingres_shard_catalog_relid("dtx_incident")) &&
+		SPI_execute("DELETE FROM " KINGRES_SHARD_SCHEMA ".dtx_incident "
+					"WHERE detected_at OPERATOR(pg_catalog.<) (pg_catalog.clock_timestamp() OPERATOR(pg_catalog.-) pg_catalog.make_interval(days => 30))",
+					false, 0) != SPI_OK_DELETE)
+		elog(ERROR, "could not clean kingres.dtx_incident");
 
 	SPI_finish();
 	return resolved;
@@ -568,9 +738,9 @@ list_databases(MemoryContext cxt)
 	return result;
 }
 
-/* One pass: a worker per database, one at a time. */
+/* One pass: a worker per database, one at a time.  mode: "recovery" or "deadlock". */
 static void
-launch_workers(void)
+launch_workers(const char *mode)
 {
 	MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext,
 											  "kingres_shard recovery launcher pass",
@@ -590,15 +760,15 @@ launch_workers(void)
 		bgw.bgw_restart_time = BGW_NEVER_RESTART;
 		snprintf(bgw.bgw_library_name, BGW_MAXLEN, "kingres_shard");
 		snprintf(bgw.bgw_function_name, BGW_MAXLEN, "kingres_shard_recovery_worker_main");
-		snprintf(bgw.bgw_name, BGW_MAXLEN, "kingres_shard recovery worker");
-		snprintf(bgw.bgw_type, BGW_MAXLEN, "kingres_shard recovery worker");
+		snprintf(bgw.bgw_name, BGW_MAXLEN, "kingres_shard %s worker", mode);
+		snprintf(bgw.bgw_type, BGW_MAXLEN, "kingres_shard %s worker", mode);
 		bgw.bgw_main_arg = ObjectIdGetDatum(lfirst_oid(lc));
 		/*
 		 * The values the node-to-node settings have in the server configuration:
 		 * the worker forces them (fix_worker_settings), so that a setting stored
 		 * for its database or role cannot change how long a pass waits (S3-16).
 		 */
-		snprintf(bgw.bgw_extra, BGW_EXTRALEN, "%d %d",
+		snprintf(bgw.bgw_extra, BGW_EXTRALEN, "%s %d %d", mode,
 				 kingres_shard_node_timeout, kingres_shard_node_connect_timeout);
 		bgw.bgw_notify_pid = MyProcPid;
 
@@ -645,19 +815,31 @@ launch_workers(void)
 void
 kingres_shard_recovery_launcher_main(Datum main_arg)
 {
+	TimestampTz next_recovery;
+	TimestampTz next_deadlock;
+
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
 	BackgroundWorkerInitializeConnection(NULL, NULL, 0);
 
+	next_recovery = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+												Max(kingres_shard_recovery_interval, 1) * 1000L);
+	next_deadlock = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+												Max(kingres_shard_deadlock_check_interval, 1) * 1000L);
+
 	for (;;)
 	{
+		TimestampTz now = GetCurrentTimestamp();
+		TimestampTz due = TimestampTzPlusMilliseconds(now, 3600 * 1000L);
 		long		wait_ms;
 
-		if (kingres_shard_recovery_interval > 0)
-			wait_ms = (long) kingres_shard_recovery_interval * 1000L;
-		else
-			wait_ms = 3600 * 1000L;	/* disabled: sleep until a reload */
+		/* A setting of 0 disables the pass: sleep until a reload. */
+		if (kingres_shard_recovery_interval > 0 && next_recovery < due)
+			due = next_recovery;
+		if (kingres_shard_deadlock_check_interval > 0 && next_deadlock < due)
+			due = next_deadlock;
+		wait_ms = Max(0, (long) ((due - now) / 1000));
 
 		(void) WaitLatch(MyLatch,
 						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
@@ -670,8 +852,24 @@ kingres_shard_recovery_launcher_main(Datum main_arg)
 			ConfigReloadPending = false;
 			ProcessConfigFile(PGC_SIGHUP);
 		}
-		if (kingres_shard_recovery_interval > 0)
-			launch_workers();
+		now = GetCurrentTimestamp();
+		if (kingres_shard_recovery_interval > 0 && now >= next_recovery)
+		{
+			launch_workers("recovery");
+			now = GetCurrentTimestamp();
+			next_recovery = TimestampTzPlusMilliseconds(now, kingres_shard_recovery_interval * 1000L);
+		}
+		if (kingres_shard_deadlock_check_interval > 0 && now >= next_deadlock)
+		{
+			launch_workers("deadlock");
+			now = GetCurrentTimestamp();
+			next_deadlock = TimestampTzPlusMilliseconds(now, kingres_shard_deadlock_check_interval * 1000L);
+		}
+		/* After a reload that switched a pass on, it is due one interval from now. */
+		if (kingres_shard_recovery_interval > 0 && next_recovery > TimestampTzPlusMilliseconds(now, kingres_shard_recovery_interval * 1000L))
+			next_recovery = TimestampTzPlusMilliseconds(now, kingres_shard_recovery_interval * 1000L);
+		if (kingres_shard_deadlock_check_interval > 0 && next_deadlock > TimestampTzPlusMilliseconds(now, kingres_shard_deadlock_check_interval * 1000L))
+			next_deadlock = TimestampTzPlusMilliseconds(now, kingres_shard_deadlock_check_interval * 1000L);
 	}
 }
 
@@ -716,7 +914,7 @@ fix_worker_settings(const char *extra)
 	 * statements, its connections and the launcher's deadline by it.  The
 	 * launcher passes the values of the server configuration.
 	 */
-	if (sscanf(extra, "%d %d", &node_timeout, &node_connect_timeout) == 2)
+	if (sscanf(extra, "%*s %d %d", &node_timeout, &node_connect_timeout) == 2)
 	{
 		char		buf[16];
 
@@ -770,12 +968,15 @@ kingres_shard_recovery_worker_main(Datum main_arg)
 {
 	Oid			dboid = DatumGetObjectId(main_arg);
 	bool		run_moves = false;
+	bool		run_deadlock = false;
+	char		mode[16] = "recovery";
 
 	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
 	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, 0);
 
 	/* Before the transaction starts: the isolation level and the access mode are read at its start. */
+	(void) sscanf(MyBgworkerEntry->bgw_extra, "%15s", mode);
 	fix_worker_settings(MyBgworkerEntry->bgw_extra);
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
@@ -784,8 +985,18 @@ kingres_shard_recovery_worker_main(Datum main_arg)
 	{
 		const KsCatalog *cat = kingres_shard_catalog();
 
-		if (cat->present && cat->local_node_id != 0 &&
-			OidIsValid(kingres_shard_catalog_relid("dtx_log")))
+		if (strcmp(mode, "deadlock") == 0)
+		{
+			/*
+			 * The detector runs on the map group primary only, and only where the
+			 * SQL objects of 0.5 exist (a library newer than its SQL objects has
+			 * no such function).
+			 */
+			run_deadlock = cat->present && cat->local_group_id == KINGRES_SHARD_MAP_GROUP &&
+				OidIsValid(kingres_shard_catalog_relid("dtx_incident"));
+		}
+		else if (cat->present && cat->local_node_id != 0 &&
+				 OidIsValid(kingres_shard_catalog_relid("dtx_log")))
 			(void) kingres_shard_recover_prepared();
 
 		/*
@@ -793,11 +1004,15 @@ kingres_shard_recovery_worker_main(Datum main_arg)
 		 * SQL objects of 0.3 exist (a node whose library is newer than its SQL
 		 * objects has no such table: review finding S4-05).
 		 */
-		run_moves = cat->present && cat->local_group_id == KINGRES_SHARD_MAP_GROUP &&
+		run_moves = strcmp(mode, "recovery") == 0 &&
+			cat->present && cat->local_group_id == KINGRES_SHARD_MAP_GROUP &&
 			OidIsValid(kingres_shard_catalog_relid("bucket_move"));
 	}
 	PopActiveSnapshot();
 	CommitTransactionCommand();
+
+	if (run_deadlock)
+		run_move_step("SELECT " KINGRES_SHARD_SCHEMA ".detect_distributed_deadlocks()");
 
 	/*
 	 * Moves (review finding S4-02).  A move whose session died keeps its slot,

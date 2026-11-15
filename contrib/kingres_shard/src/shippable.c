@@ -50,6 +50,7 @@
 #include "utils/lsyscache.h"
 
 #include "catalog.h"
+#include "pg_compat.h"
 #include "shippable.h"
 
 typedef struct ShipCtx
@@ -75,6 +76,14 @@ fail(ShipCtx *ctx, const char *reason)
 static bool
 type_ok(Oid type)
 {
+	/*
+	 * money (and arrays of it) is not shippable: its text form depends on
+	 * lc_monetary of the session that reads or writes it, which can differ between
+	 * nodes, so a value or a restriction of that type could mean another amount
+	 * there.
+	 */
+	if (type == CASHOID || get_element_type(type) == CASHOID)
+		return false;
 	return type < FirstGenbkiObjectId;
 }
 
@@ -594,6 +603,13 @@ ship_walker(Node *node, ShipCtx *ctx)
 				break;
 			}
 
+		case T_OnConflictExpr:
+			if (!ctx->statement)
+				return fail(ctx, "it has the structure of a whole statement");
+			if (!ks_onconflict_action_shippable(((OnConflictExpr *) node)->action))
+				return fail(ctx, psprintf("its ON CONFLICT action (%d) is not one that can be shipped", (int) ((OnConflictExpr *) node)->action));
+			break;
+
 		case T_SubLink:
 		case T_FromExpr:
 		case T_JoinExpr:
@@ -602,7 +618,6 @@ ship_walker(Node *node, ShipCtx *ctx)
 		case T_SortGroupClause:
 		case T_WindowClause:
 		case T_CommonTableExpr:
-		case T_OnConflictExpr:
 		case T_InferenceElem:
 		case T_RangeTblFunction:
 			if (!ctx->statement)
