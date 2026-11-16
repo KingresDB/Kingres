@@ -76,6 +76,7 @@ SELECT m.proname, pg_get_function_identity_arguments(m.oid) AS args
 FROM members m WHERE m.prosecdef ORDER BY 1, 2;
         proname         |                     args                     
 ------------------------+----------------------------------------------
+ ledger_blocks_entries  | from_height bigint, max_count integer
  ledger_build_block     | 
  ledger_capture         | 
  ledger_enable          | relation regclass, mode text
@@ -87,7 +88,7 @@ FROM members m WHERE m.prosecdef ORDER BY 1, 2;
  ledger_record_row      | table_id integer, row_data record
  ledger_verify          | from_height bigint, to_height bigint
  ledger_verify_recorded | from_height bigint, to_height bigint
-(11 rows)
+(12 rows)
 
 -- Unqualified references in the SQL and PL/pgSQL functions: a table of the
 -- extension after FROM, JOIN, INTO, UPDATE or TABLE, or a call of a function
