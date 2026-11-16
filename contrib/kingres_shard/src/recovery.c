@@ -871,6 +871,32 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 				ereport(LOG,
 						(errmsg("kingres_shard recovery: %s prepared transaction \"%s\" on node %d",
 								commit ? "committed" : "rolled back", gid, r->node_id)));
+				/*
+				 * The same rule as the origin's second phase (S8-01): the answer of
+				 * COMMIT PREPARED does not say that the participant's standby has the
+				 * record (its wait may have ended early).  Ask; when the standby has
+				 * not confirmed it, the decision row is kept for this pass at least, and
+				 * the retention keeps it after that (purge_log).
+				 */
+				if (commit)
+				{
+					char	   *qsql = psprintf("SELECT " KINGRES_SHARD_SCHEMA ".internal_sync_confirm(%d)",
+												Min(kingres_shard_node_timeout, 5) * 1000);
+					PGresult   *qres = kingres_shard_exec_params(kc, qsql, 0, NULL, NULL, false);
+
+					if (qres == NULL || PQresultStatus(qres) != PGRES_TUPLES_OK ||
+						PQntuples(qres) != 1 || strcmp(PQgetvalue(qres, 0, 0), "t") != 0)
+					{
+						ereport(LOG,
+								(errmsg("kingres_shard recovery: node %d committed \"%s\", but its synchronous standby has not confirmed the commit; the decision is kept",
+										r->node_id, gid)));
+						still_prepared = lappend(still_prepared, gid);
+						if (qres == NULL || PQresultStatus(qres) != PGRES_TUPLES_OK)
+							if (kc->conn == NULL || PQstatus(kc->conn) != CONNECTION_OK)
+								kc->have_error = true;
+					}
+					PQclear(qres);
+				}
 				if (!commit && earlier)
 					record_incident(gid, r->node_id, pg.tli, current_tli, "rolled_back_after_failover");
 			}
@@ -932,12 +958,21 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 					false, 0) != SPI_OK_DELETE)
 		elog(ERROR, "could not clean kingres.pending_node");
 
-	/* The marks of participants (S7-07) are kept for a day: the origin looks at them soon after a failover. */
-	if (OidIsValid(kingres_shard_catalog_relid("dtx_applied")) &&
-		SPI_execute("DELETE FROM " KINGRES_SHARD_SCHEMA ".dtx_applied "
-					"WHERE applied_at OPERATOR(pg_catalog.<) (pg_catalog.clock_timestamp() OPERATOR(pg_catalog.-) pg_catalog.make_interval(days => 1))",
-					false, 0) != SPI_OK_DELETE)
-		elog(ERROR, "could not clean kingres.dtx_applied");
+	/*
+	 * The marks of participants (S7-07) are kept as long as the origin keeps the
+	 * decision they are compared with: decision_retention (set the same on every node),
+	 * and a minute more.  An index on applied_at serves the delete (S8-06).
+	 */
+	if (OidIsValid(kingres_shard_catalog_relid("dtx_applied")))
+	{
+		char	   *sql = psprintf("DELETE FROM " KINGRES_SHARD_SCHEMA ".dtx_applied "
+								   "WHERE applied_at OPERATOR(pg_catalog.<) (pg_catalog.clock_timestamp() "
+								   "OPERATOR(pg_catalog.-) pg_catalog.make_interval(secs => %d))",
+								   kingres_shard_decision_retention + 60);
+
+		if (SPI_execute(sql, false, 0) != SPI_OK_DELETE)
+			elog(ERROR, "could not clean kingres.dtx_applied");
+	}
 
 	if (OidIsValid(kingres_shard_catalog_relid("dtx_incident")) &&
 		SPI_execute("DELETE FROM " KINGRES_SHARD_SCHEMA ".dtx_incident "

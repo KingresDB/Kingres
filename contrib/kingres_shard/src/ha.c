@@ -48,6 +48,7 @@
 #include "access/xlog.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "replication/message.h"
 #include "replication/syncrep.h"
 #include "replication/walsender.h"
 #include "replication/walsender_private.h"
@@ -73,6 +74,8 @@ PG_FUNCTION_INFO_V1(kingres_internal_restore_barrier);
 PG_FUNCTION_INFO_V1(kingres_internal_mark_victim);
 PG_FUNCTION_INFO_V1(kingres_internal_dtx_identity);
 PG_FUNCTION_INFO_V1(kingres_internal_unmark_victim);
+PG_FUNCTION_INFO_V1(kingres_internal_sync_confirm);
+PG_FUNCTION_INFO_V1(kingres_internal_sync_probe);
 
 #define KS_MAX_VICTIMS 32
 /* How long a mark stays valid: the cancel that follows it arrives at once. */
@@ -488,18 +491,27 @@ kingres_shard_sync_wait_mode(void)
 bool
 kingres_shard_wait_decision_durable(int timeout_ms)
 {
-	XLogRecPtr	target;
-	TimestampTz deadline;
-
 	if (RecoveryInProgress() || max_wal_senders == 0)
 		return true;
-	target = GetFlushRecPtr(NULL);
-	deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), timeout_ms);
+	return kingres_shard_wait_confirmed(GetFlushRecPtr(NULL), SYNC_REP_WAIT_FLUSH, timeout_ms);
+}
+
+/*
+ * Wait, for at most timeout_ms, until the synchronous standbys have confirmed
+ * everything up to target, the way the configuration of this node requires.
+ * The target is fixed by the caller and does not move while waiting.
+ * Interruptible: an error here is the caller's to deal with.
+ */
+bool
+kingres_shard_wait_confirmed(XLogRecPtr target, int mode, int timeout_ms)
+{
+	TimestampTz deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), timeout_ms);
+
 	for (;;)
 	{
 		long		left;
 
-		if (kingres_shard_sync_confirmed(target, SYNC_REP_WAIT_FLUSH))
+		if (kingres_shard_sync_confirmed(target, mode))
 			return true;
 		left = TimestampDifferenceMilliseconds(GetCurrentTimestamp(), deadline);
 		if (left <= 0)
@@ -509,6 +521,75 @@ kingres_shard_wait_decision_durable(int timeout_ms)
 		ResetLatch(MyLatch);
 		CHECK_FOR_INTERRUPTS();
 	}
+}
+
+/*
+ * kingres.internal_sync_confirm(timeout_ms int) returns boolean
+ *
+ * The participant's answer to "is what you just did durable?" (S8-01).  The
+ * origin cannot see the warning with which PostgreSQL ends the wait of a
+ * PREPARE TRANSACTION or a COMMIT PREPARED for a cancel, a termination or a
+ * shutdown: the statement answers as done.  So the origin asks, in the same
+ * session and right after, whether the position this node has flushed so far
+ * is confirmed by its synchronous standbys as its own configuration requires.
+ * That position is at or beyond the record of the statement, so "yes" means
+ * the record is there.  "No" is answered after timeout_ms.  The target is taken
+ * once, so a busy node waits only for the few milliseconds that its standby
+ * needs to catch up with the writes of other sessions.  The configuration that
+ * requires nothing (no synchronous standby named) answers yes, as a commit
+ * does.  Only a node session or a superuser may ask; the session's own
+ * synchronous_commit decides between flush and apply.
+ */
+Datum
+kingres_internal_sync_confirm(PG_FUNCTION_ARGS)
+{
+	int			timeout_ms = PG_GETARG_INT32(0);
+
+	if (!superuser() && !kingres_shard_session_forwarded())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied for function internal_sync_confirm")));
+	if (RecoveryInProgress())
+		PG_RETURN_BOOL(true);
+	PG_RETURN_BOOL(kingres_shard_wait_confirmed(GetFlushRecPtr(NULL),
+												kingres_shard_sync_wait_mode(),
+												Max(timeout_ms, 0)));
+}
+
+
+/*
+ * Can this node commit at all?  A commit waits for the synchronous standbys that
+ * synchronous_standby_names names, and a name that nobody serves makes every
+ * commit wait for ever (a promoted standby inherits the list of the primary it
+ * was copied from, S8-02).  A new WAL record is written and flushed, and the
+ * standbys get timeout_ms to confirm it, so that a node that has been idle
+ * since its last standby left is found out as well.  True when nothing is required
+ * of the node (no list, no walsender possible) or the standbys confirmed.
+ */
+bool
+kingres_shard_probe_sync(int timeout_ms)
+{
+	XLogRecPtr	lsn;
+
+	if (RecoveryInProgress() || max_wal_senders == 0)
+		return true;
+	lsn = LogLogicalMessage("kingres_shard", "p", 1, false, true);
+	return kingres_shard_wait_confirmed(lsn, SYNC_REP_WAIT_FLUSH, Max(timeout_ms, 0));
+}
+
+/*
+ * kingres.internal_sync_probe(timeout_ms int) returns boolean: the SQL form of
+ * kingres_shard_probe_sync(), for promote_node() to ask a node that is about
+ * to be promoted.
+ */
+Datum
+kingres_internal_sync_probe(PG_FUNCTION_ARGS)
+{
+	if (!superuser() && !kingres_shard_session_forwarded())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied for function internal_sync_probe")));
+	PG_RETURN_BOOL(kingres_shard_probe_sync(PG_GETARG_INT32(0)));
 }
 
 /*

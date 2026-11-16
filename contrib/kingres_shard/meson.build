@@ -150,6 +150,11 @@ tests += {
       't/067_gid_tag.pl',
       't/068_participant_failover.pl',
       't/069_inflight_promotion.pl',
+      't/070_participant_durability.pl',
+      't/071_promote_rules.pl',
+      't/072_rotate_and_applied.pl',
+      't/073_sequences.pl',
+      't/074_move_tablesync_hold.pl',
     ],
   },
 }

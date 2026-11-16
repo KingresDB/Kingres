@@ -55,6 +55,13 @@
 #define ERRCODE_KINGRES_SWITCH_TIMEOUT MAKE_SQLSTATE('K','S','0','0','4')
 
 /*
+ * SQLSTATE of "a participant could not confirm that its part of a distributed
+ * transaction is durable on its own synchronous standby" (node_conn.c, S8-01): the
+ * commit of the transaction is refused and nothing is committed anywhere.
+ */
+#define ERRCODE_KINGRES_NOT_DURABLE MAKE_SQLSTATE('K','S','0','0','5')
+
+/*
  * The text that starts the statement of every fragment of a distributed scan
  * (dist_scan.c).  A forwarded session runs a plain read of a distributed table
  * as the local rows of the table only when the statement carries it; without

@@ -998,7 +998,7 @@ BEGIN
                   WHERE p.class OPERATOR(pg_catalog.=) 'forged' ORDER BY p.gid
         LOOP
             check_name := 'foreign_prepared_transaction'; node_id := n.node_id; object := x.gid;
-            detail := 'a prepared transaction with the name of one of ours that does not carry a valid tag; it was not made by a node of this cluster and recovery leaves it alone';
+            detail := 'a prepared transaction with the name of one of ours that does not carry a valid tag: either no node of this cluster made it, or it was prepared in the moments around a kingres.rotate_secret() (which refuses while transactions are in doubt, but cannot stop one that prepares at that instant); recovery leaves it alone. If it is the cluster''s own, resolve it by hand on this node: COMMIT PREPARED if its gid has a row in kingres.dtx_log on the origin, ROLLBACK PREPARED if it has none';
             RETURN NEXT;
         END LOOP;
     END LOOP;
@@ -1556,7 +1556,7 @@ REVOKE ALL ON FUNCTION kingres.internal_gid_tag(text), kingres.internal_gid_clas
 -- transaction just before its PREPARE (so a row is there exactly when the part
 -- is committed, and a standby that lost the commit does not have it).  The origin
 -- looks here when the primary of a participant group changed (src/recovery.c).
--- Recovery removes the rows after a day.
+-- Recovery removes them after kingres_shard.decision_retention seconds and a minute.
 CREATE TABLE kingres.dtx_applied (
     gid        text        NOT NULL,
     applied_at timestamptz NOT NULL,
@@ -1566,6 +1566,10 @@ CREATE TABLE kingres.dtx_applied (
 COMMENT ON TABLE kingres.dtx_applied IS
     'Node-local: distributed transactions this node prepared a part of, written in that part; the origin compares it after a failover of this group';
 
+-- The cleanup looks for the rows that are older than decision_retention (plus a minute): an index keeps
+-- it from reading the whole table on every pass of the recovery worker (S8-06).
+CREATE INDEX dtx_applied_applied_at_idx ON kingres.dtx_applied (applied_at);
+
 CREATE FUNCTION kingres.internal_dtx_applied(gid text)
     RETURNS void
     AS 'MODULE_PATHNAME', 'kingres_internal_dtx_applied'
@@ -1574,6 +1578,26 @@ CREATE FUNCTION kingres.internal_dtx_applied(gid text)
 
 -- Executable by every role on purpose: the remote transaction of a participant runs as the role of the
 -- user whose statement it is.  The function itself refuses everyone but a node session and a superuser.
+
+-- Does the synchronous standby of this node confirm everything that the node has flushed so far, as its
+-- own configuration requires?  The origin of a distributed transaction asks it of a participant right after
+-- the participant's PREPARE TRANSACTION and COMMIT PREPARED, whose wait for the standby can end early
+-- (cancel, termination, shutdown) with a warning that the origin cannot see (S8-01).  Answers false after
+-- timeout_ms milliseconds.  Executable by every role, like internal_dtx_applied, for the same reason.
+CREATE FUNCTION kingres.internal_sync_confirm(timeout_ms integer)
+    RETURNS boolean
+    AS 'MODULE_PATHNAME', 'kingres_internal_sync_confirm'
+    LANGUAGE C STRICT
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+-- Can this node commit at all?  Writes a record and waits for its synchronous standbys to confirm it;
+-- promote_node() asks it of a node before it changes anything (S8-02).  Superusers and node sessions only.
+CREATE FUNCTION kingres.internal_sync_probe(timeout_ms integer)
+    RETURNS boolean
+    AS 'MODULE_PATHNAME', 'kingres_internal_sync_probe'
+    LANGUAGE C STRICT
+    SET search_path = pg_catalog, kingres, pg_temp;
+REVOKE ALL ON FUNCTION kingres.internal_sync_probe(integer) FROM PUBLIC;
 
 -- A node that leaves the cluster forgets its catalog term as well: it may join
 -- another cluster, whose term is lower than the one it had.
@@ -1589,4 +1613,328 @@ DELETE FROM kingres.colocation;
 DELETE FROM kingres.cluster_secret;
 DELETE FROM kingres.node;
 UPDATE kingres.map_version SET version = 0, term = 0, superseded_by_term = 0;
+$$;
+
+-- A bucket move whose table synchronization lost its slot on the source fails (and is undone) instead of waiting for ever.
+-- On the target: the prefixes of the table-sync slots of the tables whose copy is finished
+-- (state "f") and that wait for their worker to hand over.  Such a worker needs its slot on the
+-- source.  A table-sync worker drops its slot and only then records that it is done; a target
+-- that stops between the two (a crash) restarts a worker that asks for a slot that is not there,
+-- and no error counter of the subscription counts it (S8, t/074).
+CREATE FUNCTION kingres.internal_move_sync_prefixes(p_name text)
+    RETURNS jsonb
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.format('pg_%s_sync_%s_', s.oid, r.srrelid)), '[]'::pg_catalog.jsonb)
+  FROM pg_catalog.pg_subscription s
+  JOIN pg_catalog.pg_subscription_rel r ON r.srsubid OPERATOR(pg_catalog.=) s.oid
+ WHERE s.subname OPERATOR(pg_catalog.=) p_name AND r.srsubstate OPERATOR(pg_catalog.=) 'f';
+$$;
+
+-- On the source: how many of those prefixes have no slot.
+CREATE FUNCTION kingres.internal_move_slots_missing(p_prefixes jsonb)
+    RETURNS int
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+SELECT pg_catalog.count(*)::pg_catalog.int4
+  FROM pg_catalog.jsonb_array_elements_text(p_prefixes) AS p(prefix)
+ WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_replication_slots sl
+                    WHERE pg_catalog.starts_with(sl.slot_name, p.prefix));
+$$;
+
+REVOKE ALL ON FUNCTION kingres.internal_move_sync_prefixes(text), kingres.internal_move_slots_missing(jsonb) FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION kingres.move_bucket(colocation_id int, bucket int, target_group int)
+    RETURNS bigint
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_colo     pg_catalog.int4 := colocation_id;
+    v_bucket   pg_catalog.int4 := bucket;
+    v_target   pg_catalog.int4 := target_group;
+    v_self     pg_catalog.int4;
+    v_source   pg_catalog.int4;
+    v_src      pg_catalog.int4;
+    v_tgt      pg_catalog.int4;
+    v_count    pg_catalog.int4;
+    v_tables   pg_catalog.jsonb;
+    v_info     pg_catalog.jsonb;
+    v_id       pg_catalog.int8;
+    v_name     pg_catalog.text;
+    v_stage    pg_catalog.int4 := 0;	-- 1: recorded, 2: switching, 3: switched
+    v_thr      pg_catalog.int8;
+    v_stall    pg_catalog.timestamptz;
+    v_prefixes pg_catalog.jsonb;
+    v_sw_ms    pg_catalog.int4;
+    v_delay    pg_catalog.int4;
+    v_nt       pg_catalog.int4;
+    v_node_ms  pg_catalog.int4;
+    v_srcrow   pg_catalog.record;
+    v_tgtrow   pg_catalog.record;
+    v_maj_src  pg_catalog.text;
+    v_maj_tgt  pg_catalog.text;
+    v_st       pg_catalog.jsonb;
+    v_lag      pg_catalog.int8;
+    v_iter     pg_catalog.int4 := 0;
+    v_last     pg_catalog.text := '';
+    v_now      pg_catalog.text;
+    v_cancel   pg_catalog.bool;
+    v_phase    pg_catalog.text;
+    v_msg      pg_catalog.text;
+    v_state    pg_catalog.text;
+    v_attempts pg_catalog.int4 := 0;
+    v_max_attempts pg_catalog.int4;
+    v_wait_ms  pg_catalog.int4;
+BEGIN
+    PERFORM kingres.internal_require_superuser();
+    PERFORM kingres.internal_require_map_group();
+    IF pg_catalog.current_setting('transaction_isolation') OPERATOR(pg_catalog.<>) 'read committed' THEN
+        RAISE EXCEPTION 'kingres.move_bucket() must run in a READ COMMITTED transaction'
+            USING ERRCODE = 'invalid_transaction_state',
+                  DETAIL = 'It follows the progress of other sessions and nodes with statements that must see their latest commits.';
+    END IF;
+    SELECT l.node_id INTO v_self FROM kingres.local_node l;
+    v_node_ms := (SELECT s.setting::pg_catalog.int4 FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'kingres_shard.node_timeout') * 1000;
+    v_thr := (SELECT s.setting::pg_catalog.int8 FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'kingres_shard.move_catchup_threshold') * 1024;
+    v_sw_ms := (SELECT s.setting::pg_catalog.int4 FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'kingres_shard.move_switch_timeout');
+    v_delay := (SELECT s.setting::pg_catalog.int4 FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'kingres_shard.move_cleanup_delay');
+    v_max_attempts := (SELECT s.setting::pg_catalog.int4 FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'kingres_shard.move_switch_attempts');
+
+    -- Read-only checks first: a move that cannot start leaves nothing behind.
+    PERFORM kingres.internal_check_node_versions();
+    SELECT c.bucket_count INTO v_count FROM kingres.colocation c WHERE c.colocation_id OPERATOR(pg_catalog.=) v_colo;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'colocation group % does not exist', v_colo USING ERRCODE = 'undefined_object';
+    END IF;
+    SELECT m.group_id INTO v_source FROM kingres.bucket_map m
+     WHERE m.colocation_id OPERATOR(pg_catalog.=) v_colo AND m.bucket OPERATOR(pg_catalog.=) v_bucket;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'bucket % of colocation group % does not exist (it has % buckets)', v_bucket, v_colo, v_count
+            USING ERRCODE = 'undefined_object';
+    END IF;
+    IF v_source OPERATOR(pg_catalog.=) v_target THEN
+        RAISE EXCEPTION 'bucket % of colocation group % is already on shard group %', v_bucket, v_colo, v_target
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    v_src := kingres.internal_group_node(v_source);
+    v_tgt := kingres.internal_group_node(v_target);
+    IF v_src IS NULL OR v_tgt IS NULL THEN
+        RAISE EXCEPTION 'shard group % or % has no active primary', v_source, v_target
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    IF EXISTS (SELECT 1 FROM kingres.bucket_move b
+                WHERE b.colocation_id OPERATOR(pg_catalog.=) v_colo AND b.bucket OPERATOR(pg_catalog.=) v_bucket
+                  AND b.phase IN ('preparing', 'copying', 'catching_up', 'switching')) THEN
+        RAISE EXCEPTION 'bucket % of colocation group % is already being moved', v_bucket, v_colo
+            USING ERRCODE = 'object_in_use',
+                  HINT = 'See kingres.bucket_move; a move can be cancelled with kingres.cancel_bucket_move().';
+    END IF;
+    SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('schema_name', t.schema_name, 'table_name', t.table_name) ORDER BY t.ord)
+      INTO v_tables FROM kingres.internal_move_tables(v_colo) t;
+    IF v_tables IS NULL THEN
+        RAISE EXCEPTION 'colocation group % has no distributed table', v_colo
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    SELECT n.host, n.port INTO v_srcrow FROM kingres.node n WHERE n.node_id OPERATOR(pg_catalog.=) v_src;
+    SELECT n.host, n.port INTO v_tgtrow FROM kingres.node n WHERE n.node_id OPERATOR(pg_catalog.=) v_tgt;
+
+    -- The rows travel by logical replication between the two nodes, and a cluster runs one
+    -- PostgreSQL major.
+    v_maj_src := kingres.internal_exec_scalar(v_src, 'SELECT (pg_catalog.current_setting(''server_version_num'')::pg_catalog.int4 OPERATOR(pg_catalog./) 10000)::pg_catalog.text');
+    v_maj_tgt := kingres.internal_exec_scalar(v_tgt, 'SELECT (pg_catalog.current_setting(''server_version_num'')::pg_catalog.int4 OPERATOR(pg_catalog./) 10000)::pg_catalog.text');
+    IF v_maj_src IS DISTINCT FROM v_maj_tgt THEN
+        RAISE EXCEPTION 'bucket % of colocation group % cannot move from node % (%:%) to node % (%:%): they run different PostgreSQL major versions (% and %)',
+                        v_bucket, v_colo, v_src, v_srcrow.host, v_srcrow.port, v_tgt, v_tgtrow.host, v_tgtrow.port, v_maj_src, v_maj_tgt
+            USING ERRCODE = 'object_not_in_prerequisite_state',
+                  HINT = 'All nodes of a cluster must run the same major version of PostgreSQL.';
+    END IF;
+
+    v_info := (kingres.internal_exec_scalar(v_src, pg_catalog.format(
+                  'SELECT kingres.internal_move_inspect(''source'', %s, %s, %L::pg_catalog.jsonb)::pg_catalog.text',
+                  v_bucket, v_count, v_tables::pg_catalog.text)))::pg_catalog.jsonb;
+    PERFORM kingres.internal_exec_scalar(v_tgt, pg_catalog.format(
+                  'SELECT kingres.internal_move_inspect(''target'', %s, %s, %L::pg_catalog.jsonb)::pg_catalog.text',
+                  v_bucket, v_count, v_tables::pg_catalog.text));
+    PERFORM kingres.internal_fault_point('move_after_precheck');
+
+    -- 1. Preparing: the cluster lock, the record, the state "moving" on every node.
+    v_id := kingres.internal_exec_scalar(v_self, pg_catalog.format('SELECT kingres.internal_begin_move(%s, %s, %s)',
+                                                                   v_colo, v_bucket, v_target))::pg_catalog.int8;
+    v_name := pg_catalog.format('ks_move_%s', v_id);
+    -- The mark of a live move: whoever finds this lock held knows the session is
+    -- still running it (resume_bucket_moves() skips it).  It is released when the
+    -- function ends, or with the session.
+    PERFORM kingres.internal_move_lock(v_id);
+    v_stage := 1;
+
+    BEGIN
+        PERFORM kingres.internal_fault_point('move_after_preparing');
+
+        -- 2. Copying.
+        PERFORM kingres.internal_exec_scalar(v_self, pg_catalog.format(
+            'SELECT kingres.internal_move_set(%s, ''copying'', ''creating the tables on the target'')', v_id));
+        PERFORM kingres.internal_exec_scalar(v_tgt, pg_catalog.format(
+            'SELECT kingres.internal_create_move_tables(%s, %s, %s, %L::pg_catalog.jsonb)', v_id, v_bucket, v_count, v_info::pg_catalog.text));
+        PERFORM kingres.internal_fault_point('move_after_target_tables');
+        PERFORM kingres.internal_exec_scalar(v_src, pg_catalog.format(
+            'SELECT kingres.internal_create_move_publication(%s, %s, %L::pg_catalog.jsonb)', v_id, v_bucket, v_tables::pg_catalog.text));
+        PERFORM kingres.internal_fault_point('move_after_publication');
+        -- The slot waits for the transactions that are running on the source
+        -- (they may be long): its wait is bounded by a multiple of node_timeout.
+        PERFORM kingres.internal_exec_scalar(v_src, pg_catalog.format('SELECT kingres.internal_create_move_slot(%L)', v_name), v_node_ms * 5);
+        PERFORM kingres.internal_fault_point('move_after_slot');
+        PERFORM kingres.internal_exec_scalar(v_tgt, pg_catalog.format(
+            'SELECT kingres.internal_create_move_subscription(%L, %L, %s)', v_name, v_srcrow.host, v_srcrow.port), v_node_ms * 2);
+        PERFORM kingres.internal_exec_scalar(v_self, pg_catalog.format(
+            'UPDATE kingres.bucket_move SET sub_oid = %s WHERE move_id = %s',
+            kingres.internal_exec_scalar(v_tgt, pg_catalog.format('SELECT oid::pg_catalog.int8 FROM pg_catalog.pg_subscription WHERE subname = %L', v_name)), v_id));
+        PERFORM kingres.internal_fault_point('move_after_subscription');
+
+        -- 3. Catching up, and 4. switching, until the switch succeeds.
+        <<attempts>>
+        LOOP
+            IF v_attempts OPERATOR(pg_catalog.=) 0 THEN
+                PERFORM kingres.internal_exec_scalar(v_self, pg_catalog.format(
+                    'SELECT kingres.internal_move_set(%s, ''catching_up'', ''waiting for the initial copy'')', v_id));
+            END IF;
+            LOOP
+                SELECT b.cancel_requested INTO v_cancel FROM kingres.bucket_move b WHERE b.move_id OPERATOR(pg_catalog.=) v_id;
+                IF v_cancel THEN
+                    RAISE EXCEPTION 'bucket move % was cancelled', v_id USING ERRCODE = 'KS003';
+                END IF;
+                v_st := kingres.internal_exec_scalar(v_tgt, pg_catalog.format(
+                            'SELECT kingres.internal_move_subscription_status(%L)::pg_catalog.text', v_name))::pg_catalog.jsonb;
+                IF v_st ? 'missing' THEN
+                    RAISE EXCEPTION 'the subscription % disappeared from node %', v_name, v_tgt
+                        USING ERRCODE = 'object_not_in_prerequisite_state';
+                END IF;
+                IF (v_st ->> 'errors')::pg_catalog.int8 > 0 THEN
+                    RAISE EXCEPTION 'the replication of bucket % failed on node % (% errors of the apply or table copy workers)',
+                        v_bucket, v_tgt, v_st ->> 'errors'
+                        USING ERRCODE = 'data_exception',
+                              HINT = 'See the log of node ' || v_tgt || '; a row that conflicts with the copy is the usual cause.';
+                END IF;
+                IF (v_st ->> 'tables')::pg_catalog.int4 > 0 AND (v_st ->> 'ready') OPERATOR(pg_catalog.=) (v_st ->> 'tables') THEN
+                    v_lag := kingres.internal_exec_scalar(v_src, pg_catalog.format(
+                                 'SELECT kingres.internal_move_slot_lag(%L)', v_name))::pg_catalog.int8;
+                    IF v_lag IS NOT NULL AND v_lag <= v_thr THEN
+                        EXIT;
+                    END IF;
+                    -- The slot confirms only what it has sent: a marker proves the replay.
+                    IF kingres.internal_marker_roundtrip(v_id, v_src, v_tgt, 1000) THEN
+                        EXIT;
+                    END IF;
+                    v_now := pg_catalog.format('catching up: %s bytes behind', COALESCE(v_lag::pg_catalog.text, '?'));
+                ELSE
+                    -- The copy needs the source; a source that is gone must fail the move now, not
+                    -- leave it waiting for a copy that cannot finish (the other branch talks to the
+                    -- source at every round, this one did not).
+                    PERFORM kingres.internal_exec_scalar(v_src, 'SELECT 1');
+                    -- A table whose copy is finished and whose slot is gone from the source can
+                    -- never finish: fail the move (it is undone) once that has lasted long enough
+                    -- for a worker that is dropping its slot in the ordinary way to be done.
+                    v_prefixes := kingres.internal_exec_scalar(v_tgt, pg_catalog.format(
+                                      'SELECT kingres.internal_move_sync_prefixes(%L)::pg_catalog.text', v_name))::pg_catalog.jsonb;
+                    IF v_prefixes <> '[]'::pg_catalog.jsonb
+                       AND kingres.internal_exec_scalar(v_src, pg_catalog.format(
+                               'SELECT kingres.internal_move_slots_missing(%L::pg_catalog.jsonb)', v_prefixes::pg_catalog.text))::pg_catalog.int4 > 0 THEN
+                        v_stall := COALESCE(v_stall, pg_catalog.clock_timestamp());
+                        IF pg_catalog.clock_timestamp() OPERATOR(pg_catalog.-) v_stall > pg_catalog.make_interval(secs => GREATEST(10, v_node_ms / 500)) THEN
+                            RAISE EXCEPTION 'the table synchronization of bucket % on node % lost its replication slot on node %', v_bucket, v_tgt, v_src
+                                USING ERRCODE = 'object_not_in_prerequisite_state',
+                                      HINT = 'The target stopped while a table synchronization worker was finishing; the move is undone and can be repeated.';
+                        END IF;
+                    ELSE
+                        v_stall := NULL;
+                    END IF;
+                    v_now := pg_catalog.format('copying: %s of %s tables ready', v_st ->> 'ready', v_st ->> 'tables');
+                END IF;
+                IF v_now IS DISTINCT FROM v_last AND v_attempts OPERATOR(pg_catalog.=) 0 THEN
+                    PERFORM kingres.internal_exec_scalar(v_self, pg_catalog.format(
+                        'SELECT kingres.internal_move_set(%s, ''catching_up'', %L)', v_id, v_now));
+                    v_last := v_now;
+                END IF;
+                v_iter := v_iter + 1;
+                PERFORM pg_catalog.pg_sleep(LEAST(1.0, 0.05 + v_iter * 0.05));
+            END LOOP;
+            PERFORM kingres.internal_fault_point('move_after_catchup');
+
+            -- Switching.
+            PERFORM kingres.internal_exec_scalar(v_self, pg_catalog.format(
+                'SELECT kingres.internal_move_set(%s, ''switching'', ''waiting for the write lock of the bucket'')', v_id));
+            -- A cancel that arrived since the last look: the switch was not entered (S5-05).
+            SELECT b.phase INTO v_phase FROM kingres.bucket_move b WHERE b.move_id OPERATOR(pg_catalog.=) v_id;
+            IF v_phase OPERATOR(pg_catalog.<>) 'switching' THEN
+                RAISE EXCEPTION 'bucket move % was cancelled', v_id USING ERRCODE = 'KS003';
+            END IF;
+            v_stage := 2;
+            PERFORM kingres.internal_fault_point('move_before_switch');
+            BEGIN
+                v_attempts := v_attempts + 1;
+                PERFORM kingres.internal_node_exec(v_self, pg_catalog.format(
+                    'SELECT kingres.internal_switch_bucket(%s, %s, %s)', v_id, v_sw_ms, v_delay),
+                    v_sw_ms + v_node_ms * 2);
+                v_stage := 3;
+                EXIT attempts;
+            EXCEPTION WHEN OTHERS OR query_canceled THEN
+                GET STACKED DIAGNOSTICS v_msg = MESSAGE_TEXT, v_state = RETURNED_SQLSTATE;
+                SELECT b.phase INTO v_phase FROM kingres.bucket_move b WHERE b.move_id OPERATOR(pg_catalog.=) v_id;
+                IF v_phase OPERATOR(pg_catalog.=) 'cleaning' THEN
+                    v_stage := 3;
+                    EXIT attempts;		-- it did commit
+                ELSIF v_state IN ('55P03', '40P01', 'KS004')
+                      OR (v_state OPERATOR(pg_catalog.=) '57014' AND v_msg ~ 'statement timeout') THEN
+                    -- Waited too long for the lock or the replay: nothing was changed.
+                    v_stage := 1;
+                    PERFORM kingres.internal_exec_scalar(v_self, pg_catalog.format(
+                        'SELECT kingres.internal_move_set(%s, ''catching_up'', %L)', v_id,
+                        'switch attempt ' || v_attempts || ' gave up: ' || v_msg));
+                    -- A transaction that holds the tables for ever must not keep the move trying for ever
+                    -- (review finding S4-04): after the limit the move fails, with the reason and the
+                    -- sessions in the way in its record, and can be started again.
+                    IF v_attempts OPERATOR(pg_catalog.>=) v_max_attempts THEN
+                        RAISE EXCEPTION 'bucket move % gave up after % attempts to switch: %', v_id, v_attempts, v_msg
+                            USING ERRCODE = 'lock_not_available';
+                    END IF;
+                    -- Back off: 0.2 s, 0.4 s, ... up to 10 s, and a little at random.
+                    PERFORM pg_catalog.pg_sleep(LEAST(10.0, 0.2 OPERATOR(pg_catalog.*) pg_catalog.power(2.0, v_attempts OPERATOR(pg_catalog.-) 1))
+                                                OPERATOR(pg_catalog.+) pg_catalog.random() OPERATOR(pg_catalog.*) 0.3);
+                ELSE
+                    RAISE;
+                END IF;
+            END;
+        END LOOP attempts;
+
+        PERFORM kingres.internal_fault_point('move_after_switch');
+        -- 5. The replication is no longer needed; a failure here does not undo the move.
+        BEGIN
+            PERFORM kingres.internal_drop_move_replication(v_id, v_src, v_tgt);
+            PERFORM kingres.internal_exec_scalar(v_self, pg_catalog.format(
+                'UPDATE kingres.bucket_move SET replication_dropped = true, updated_at = pg_catalog.clock_timestamp() WHERE move_id = %s', v_id));
+        EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING 'bucket move %: the bucket has moved, but dropping the replication failed: %; kingres.resume_bucket_moves() repeats it', v_id, SQLERRM;
+        END;
+        PERFORM kingres.internal_fault_point('move_after_drop_replication');
+    EXCEPTION WHEN OTHERS OR query_canceled THEN
+        GET STACKED DIAGNOSTICS v_msg = MESSAGE_TEXT, v_state = RETURNED_SQLSTATE;
+        SELECT b.phase INTO v_phase FROM kingres.bucket_move b WHERE b.move_id OPERATOR(pg_catalog.=) v_id;
+        IF v_stage < 3 AND v_phase IN ('preparing', 'copying', 'catching_up') THEN
+            -- Not switched: undo.  A failure of the undo itself leaves the move for resume_bucket_moves().
+            BEGIN
+                PERFORM kingres.internal_exec_scalar(v_self, pg_catalog.format(
+                    'SELECT kingres.internal_undo_move(%s, %L, %L, true)', v_id, v_msg,
+                    CASE WHEN v_state OPERATOR(pg_catalog.=) 'KS003' THEN 'cancelled' ELSE 'failed' END), v_node_ms * 4);
+            EXCEPTION WHEN OTHERS THEN
+                RAISE WARNING 'bucket move %: could not undo it now (%); kingres.resume_bucket_moves() will', v_id, SQLERRM;
+            END;
+        END IF;
+        PERFORM kingres.internal_move_unlock(v_id);
+        RAISE;
+    END;
+    PERFORM kingres.internal_move_unlock(v_id);
+    RETURN v_id;
+END;
 $$;

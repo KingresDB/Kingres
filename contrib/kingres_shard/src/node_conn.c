@@ -1669,6 +1669,7 @@ reset_xact_state(KsConn *kc)
 	kc->tz_applied[0] = '\0';
 	kc->wrote = false;
 	kc->prepared = false;
+	kc->commit_sent = false;
 	kc->gid[0] = '\0';
 	/* Nothing that was in flight outlives the transaction. */
 	kc->pending_owner = NULL;
@@ -1752,18 +1753,114 @@ abort_connection(KsConn *kc)
 }
 
 /*
+ * prepare_collect
+ *
+ * Read the answers of the batch that prepare_one() sent, one result at a time,
+ * so that the answer of PREPARE TRANSACTION and the answer of the question
+ * after it (is the record durable on the participant's standby?) are told
+ * apart.  The wait is interruptible (the client may cancel) and bounded by
+ * kingres_shard.node_timeout (S8-08): when it runs out the participant's
+ * backend is cancelled, which ends a wait for its synchronous standby with a
+ * warning; the batch then goes on to the question, whose answer is "no", and
+ * gets one more node_timeout to arrive.  *prepared says that PREPARE
+ * TRANSACTION itself succeeded; *confirmed is -1 when no answer to the
+ * question arrived, 1 for yes and 0 for no.  Returns the last result (an error
+ * result when something after the start failed), or NULL when the connection
+ * broke.
+ */
+static PGresult *
+prepare_collect(KsConn *kc, bool *prepared, int *confirmed, bool *timed_out)
+{
+	TimestampTz deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+													   (int64) kingres_shard_node_timeout * 1000);
+	PGresult   *last = NULL;
+	bool		cancelled = false;
+
+	*prepared = false;
+	*confirmed = -1;
+	*timed_out = false;
+	for (;;)
+	{
+		PGresult   *res;
+
+		while (PQisBusy(kc->conn))
+		{
+			long		ms = TimestampDifferenceMilliseconds(GetCurrentTimestamp(), deadline);
+			int			rc;
+
+			if (ms <= 0)
+			{
+				if (cancelled)
+				{
+					kc->have_error = true;
+					PQclear(last);
+					return NULL;
+				}
+				kingres_shard_cancel_with_deadline(kc->conn);
+				cancelled = true;
+				*timed_out = true;
+				deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+													   (int64) kingres_shard_node_timeout * 1000);
+				continue;
+			}
+			rc = WaitLatchOrSocket(MyLatch,
+								   WL_LATCH_SET | WL_SOCKET_READABLE | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+								   PQsocket(kc->conn), Min(ms, 1000L), PG_WAIT_EXTENSION);
+			if (rc & WL_LATCH_SET)
+			{
+				ResetLatch(MyLatch);
+				CHECK_FOR_INTERRUPTS();
+			}
+			if (!PQconsumeInput(kc->conn))
+			{
+				kc->have_error = true;
+				PQclear(last);
+				return NULL;
+			}
+		}
+		res = PQgetResult(kc->conn);
+		if (res == NULL)
+			break;
+		if (PQresultStatus(res) == PGRES_COMMAND_OK &&
+			strcmp(PQcmdStatus(res), "PREPARE TRANSACTION") == 0)
+			*prepared = true;
+		else if (PQresultStatus(res) == PGRES_TUPLES_OK && PQnfields(res) == 1 &&
+				 PQntuples(res) == 1 && *prepared)
+			*confirmed = (strcmp(PQgetvalue(res, 0, 0), "t") == 0) ? 1 : 0;
+		PQclear(last);
+		last = res;
+	}
+	return last;
+}
+
+/*
  * prepare_one
  *
  * PREPARE TRANSACTION on one remote writer.  A failure (a deferred constraint
  * that fails at prepare time, prepared transactions disabled, the limit
  * reached) aborts the local transaction; the abort callback rolls back the
  * others.
+ *
+ * The prepare counts as done only when the participant says that the record is
+ * durable by its own rule (S8-01).  PostgreSQL ends the wait of PREPARE
+ * TRANSACTION for a cancel, a termination or a shutdown with a warning and an
+ * answer of success, which this session cannot see; so the same batch asks, after
+ * the PREPARE, internal_sync_confirm(): is everything this node has flushed so
+ * far confirmed by its synchronous standbys as its configuration requires?  The
+ * answer is a result of the batch, not a warning.  "No" (or no answer) before
+ * the decision is a failed prepare: the transaction aborts, and the prepared
+ * transactions are rolled back (by the abort callback, or by recovery, which finds
+ * no decision row).
  */
 static void
 prepare_one(KsConn *kc)
 {
-	char		sql[2 * KS_GID_LEN + 320];
+	char		sql[2 * KS_GID_LEN + 420];
 	PGresult   *res;
+	bool		prepared;
+	bool		timed_out;
+	int			confirmed;
+	bool		schema_missing;
 
 	/*
 	 * The participant acknowledges its PREPARE (and, on this session, the
@@ -1772,12 +1869,16 @@ prepare_one(KsConn *kc)
 	 * setting is raised to at least "on" right before the PREPARE, at session
 	 * level so that it still holds for the second phase on this connection
 	 * (S7-07).  "remote_apply" is kept.  The next remote transaction on the
-	 * connection resets it (kingres_shard_begin_xact).
+	 * connection resets it (kingres_shard_begin_xact).  The question at the end
+	 * waits at most five seconds (or node_timeout, if shorter) for a standby that
+	 * is behind with the few records written since the PREPARE.
 	 */
 	snprintf(sql, sizeof(sql),
 			 "SELECT " KINGRES_SHARD_SCHEMA ".internal_dtx_applied('%s'); "
 			 "SELECT set_config('synchronous_commit', CASE WHEN current_setting('synchronous_commit') = 'remote_apply' THEN 'remote_apply' ELSE 'on' END, false); "
-			 "PREPARE TRANSACTION '%s'", kc->gid, kc->gid);
+			 "PREPARE TRANSACTION '%s'; "
+			 "SELECT " KINGRES_SHARD_SCHEMA ".internal_sync_confirm(%d)",
+			 kc->gid, kc->gid, Min(kingres_shard_node_timeout, 5) * 1000);
 	kingres_shard_conn_quiesce(kc);
 	kc->in_query = true;
 	if (!PQsendQuery(kc->conn, sql))
@@ -1790,18 +1891,51 @@ prepare_one(KsConn *kc)
 						kc->host, kc->port),
 				 errdetail_internal("%s", pchomp(PQerrorMessage(kc->conn)))));
 	}
-	res = libpqsrv_get_result_last(kc->conn, PG_WAIT_EXTENSION);
+	res = prepare_collect(kc, &prepared, &confirmed, &timed_out);
 	kc->in_query = false;
-	if (res == NULL || PQresultStatus(res) != PGRES_COMMAND_OK)
+	if (prepared)
+	{
+		/* From here on the transaction exists on the participant, whatever follows. */
+		kc->sync_forced = true;
+		kc->prepared = true;
+		kc->xact_depth = 0;
+	}
+	/*
+	 * A node that gets the extension in this very transaction (add_node) has no
+	 * schema to ask after the PREPARE: the objects are in the prepared transaction.
+	 * It is not part of the cluster yet, so no group of it has a standby that
+	 * could matter; the error "schema does not exist" is then the answer "nothing
+	 * to confirm".
+	 */
+	schema_missing = (prepared && res != NULL && PQresultStatus(res) == PGRES_FATAL_ERROR &&
+					  kingres_shard_result_sqlstate(res) == ERRCODE_INVALID_SCHEMA_NAME);
+	if (!schema_missing &&
+		(res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK || confirmed != 1))
 	{
 		int			sqlstate = kingres_shard_result_sqlstate(res);
 		char	   *remote = (res != NULL && PQresultErrorField(res, PG_DIAG_MESSAGE_PRIMARY) != NULL) ?
 			pstrdup(PQresultErrorField(res, PG_DIAG_MESSAGE_PRIMARY)) :
 			pchomp(PQerrorMessage(kc->conn));
+		bool		said_no = (prepared && res != NULL &&
+							   PQresultStatus(res) == PGRES_TUPLES_OK && confirmed == 0);
 
 		if (PQstatus(kc->conn) != CONNECTION_OK)
 			kc->have_error = true;
 		PQclear(res);
+		if (said_no)
+			ereport(ERROR,
+					(errcode(ERRCODE_KINGRES_NOT_DURABLE),
+					 errmsg("node %s:%d did not confirm that its part of the transaction is durable on its synchronous standby",
+							kc->host, kc->port),
+					 errdetail("The PREPARE TRANSACTION of the node was acknowledged, but its synchronous standby has not confirmed the record: the wait was cancelled or ended early, or the standby is down or too slow%s.",
+							   timed_out ? " (the node did not answer within kingres_shard.node_timeout)" : ""),
+					 errhint("The transaction was not committed anywhere.  Repeat it when the standby of the node is back, or remove the standby from synchronous_standby_names of the node.")));
+		if (prepared)
+			ereport(ERROR,
+					(errcode(sqlstate != 0 ? sqlstate : ERRCODE_CONNECTION_FAILURE),
+					 errmsg("could not confirm the prepared transaction on node %s:%d: %s",
+							kc->host, kc->port, remote),
+					 errdetail("The transaction was prepared there, but the node did not say that the record is durable on its synchronous standby; nothing was committed.")));
 		ereport(ERROR,
 				(errcode(sqlstate != 0 ? sqlstate : ERRCODE_CONNECTION_FAILURE),
 				 errmsg("could not prepare the transaction on node %s:%d: %s",
@@ -1811,9 +1945,6 @@ prepare_one(KsConn *kc)
 				 errhint("Two-phase commit needs max_prepared_transactions greater than zero on every node of the cluster, and enough of them for the transactions in flight.") : 0));
 	}
 	PQclear(res);
-	kc->sync_forced = true;
-	kc->prepared = true;
-	kc->xact_depth = 0;
 }
 
 /*
@@ -2119,7 +2250,70 @@ postcommit(void)
 			discard_connection(kc);
 		}
 		else
+		{
+			/* The participant's standby is asked below, for every participant at once. */
 			PQclear(res);
+			kc->commit_sent = true;
+			continue;
+		}
+		reset_xact_state(kc);
+	}
+
+	/*
+	 * Is the commit record of each participant durable on its own standby?  The
+	 * wait of COMMIT PREPARED ends for a cancel or a shutdown exactly as the one
+	 * of PREPARE TRANSACTION does, and the statement answers as done (S8-01).  The
+	 * transaction is committed everywhere and cannot be undone; what is at stake
+	 * is that a failover of the participant right now brings its part back as
+	 * prepared.  Recovery commits it again as long as the decision row exists
+	 * (kingres_shard.decision_retention), and the client is told here.  The
+	 * questions are sent to all participants first and answered afterwards, so
+	 * that the commit does not wait for them one after another.
+	 */
+	hash_seq_init(&scan, conn_hash);
+	while ((kc = (KsConn *) hash_seq_search(&scan)) != NULL)
+	{
+		char		sql[96];
+
+		if (!kc->commit_sent)
+			continue;
+		snprintf(sql, sizeof(sql), "SELECT " KINGRES_SHARD_SCHEMA ".internal_sync_confirm(%d)",
+				 Min(kingres_shard_node_timeout, 5) * 1000);
+		if (kc->conn == NULL || PQstatus(kc->conn) != CONNECTION_OK || !PQsendQuery(kc->conn, sql))
+		{
+			kc->have_error = true;
+			kc->commit_sent = false;
+			ereport(WARNING,
+					(errmsg("could not ask node %s:%d whether the commit of \"%s\" is durable on its standby",
+							kc->host, kc->port, kc->gid)));
+			discard_connection(kc);
+			reset_xact_state(kc);
+		}
+	}
+	hash_seq_init(&scan, conn_hash);
+	while ((kc = (KsConn *) hash_seq_search(&scan)) != NULL)
+	{
+		bool		failed;
+		PGresult   *res;
+		bool		durable;
+
+		if (!kc->commit_sent)
+			continue;
+		kc->commit_sent = false;
+		res = bounded_get_last(kc->conn, false, &failed);
+		durable = (!failed && res != NULL && PQresultStatus(res) == PGRES_TUPLES_OK &&
+				   PQntuples(res) == 1 && strcmp(PQgetvalue(res, 0, 0), "t") == 0);
+		if (!durable)
+		{
+			ereport(WARNING,
+					(errmsg("node %s:%d has committed its part of the distributed transaction, but its standby has not confirmed the commit",
+							kc->host, kc->port),
+					 errdetail("The transaction is committed on every node.  If this node fails over to a standby that lacks the commit, its part comes back prepared and recovery commits it again, as long as the decision is kept (kingres_shard.decision_retention, %d s).",
+							   kingres_shard_decision_retention)));
+			if (failed || res == NULL)
+				discard_connection(kc);
+		}
+		PQclear(res);
 		reset_xact_state(kc);
 	}
 }

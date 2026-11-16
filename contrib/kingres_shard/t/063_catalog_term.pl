@@ -172,7 +172,7 @@ sub status
 	is($rc, 0, '[C] a statement for group 1 now goes to the new primary');
 	is($s2->safe_psql('postgres', "SELECT count(*) FROM public.kv WHERE id = $k1"), '1', '[C] and was written there');
 	# sync_catalog repairs a node that was missed and did not learn by itself (nothing left to repair here).
-	is($n1->safe_psql('postgres', "SELECT kingres.promote_node($id)"), '{"term": 1, "status": "already", "unreached": []}',
+	is($n1->safe_psql('postgres', "SELECT kingres.promote_node($id)"), '{"term": 1, "final": true, "status": "already", "unreached": [2]}',
 		'[C] a repeated promote_node finds the promotion complete');
 }
 
@@ -180,7 +180,8 @@ sub status
 # D. the map group from a minority and from a majority
 # ---------------------------------------------------------------------------
 {
-	my ($n1, $n2, $n3) = make_cluster('td', 3, replication => 1);
+	# Four groups: the electorate of the map group is the three others (S8-04).
+	my ($n1, $n2, $n3, $n4) = make_cluster('td', 4, replication => 1);
 	$n1->safe_psql('postgres', q{
 		CREATE TABLE public.kv (id int PRIMARY KEY, val text);
 		SELECT kingres.create_distributed_table('public.kv', 'id', bucket_count => 12);
@@ -191,23 +192,27 @@ sub status
 	$n1->stop('immediate');
 	$n2->stop('immediate');
 	$n3->stop('immediate');
+	$n4->stop('immediate');
 	promote_standby($s1);
 	my ($rc, $out, $err) = run_sql($s1, "SELECT kingres.promote_node($id)");
 	isnt($rc, 0, '[D] a standby that reaches no other group does not become the map primary');
 	like($err, qr/minority/, '[D] and says that it is a minority');
-	is(roles($s1), "1:primary,2:primary,3:primary,$id:standby", '[D] its catalog is unchanged');
+	is(roles($s1), "1:primary,2:primary,3:primary,4:primary,$id:standby", '[D] its catalog is unchanged');
 	$n3->start;
 	($rc, $out, $err) = run_sql($s1, "SELECT kingres.promote_node($id)");
-	is($rc, 0, '[D] it reaches two of the three groups (itself and node 3): enough');
-	like($out, qr/"unreached": \[1, 2\]/, '[D] and reports the old map primary and node 2');
-	is(roles($n3), "1:standby,2:primary,3:primary,$id:primary", '[D] node 3 has the new catalog');
+	isnt($rc, 0, '[D] one of the three other groups is not a majority of them');
+	$n4->start;
+	($rc, $out, $err) = run_sql($s1, "SELECT kingres.promote_node($id)");
+	is($rc, 0, '[D] two of the three other groups are');
+	like($out, qr/"unreached": \[1, 2\]/, '[D] and the old map primary and node 2 are reported');
+	is(roles($n3), "1:standby,2:primary,3:primary,4:primary,$id:primary", '[D] node 3 has the new catalog');
 	is(status($n3), '1/f', '[D] at the new term');
 	# Node 2 comes back with the old catalog; sync_catalog on the new map primary repairs it.
 	$n2->start;
 	is(status($n2), '0/f', '[D] the node that was away is behind');
 	$s1->safe_psql('postgres', 'SELECT kingres.sync_catalog()');
 	is(status($n2), '1/f', '[D] sync_catalog gives it the new catalog');
-	is(roles($n2), "1:standby,2:primary,3:primary,$id:primary", '[D] and the roles');
+	is(roles($n2), "1:standby,2:primary,3:primary,4:primary,$id:primary", '[D] and the roles');
 }
 
 # ---------------------------------------------------------------------------

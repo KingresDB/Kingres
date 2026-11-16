@@ -89,7 +89,7 @@ my $new_roles = "1:primary,2:standby,3:primary,4:primary";
 	is(roles($n1), $new_roles, 'node 4 is the primary of group 1');
 	is(roles($n3), $new_roles, 'on every node');
 	is($s2->safe_psql('postgres', 'SELECT node_id FROM kingres.local_node'), '4', 'and knows itself as node 4');
-	is($n1->safe_psql('postgres', "SELECT kingres.promote_node($id)"), '{"term": 1, "status": "already", "unreached": []}',
+	is($n1->safe_psql('postgres', "SELECT kingres.promote_node($id)"), '{"term": 1, "final": true, "status": "already", "unreached": [2]}',
 		'a further call finds nothing to do');
 }
 
@@ -108,12 +108,13 @@ for my $point (qw(after_commit between_commit_prepared))
 		# Before the fix every session to node 4 was refused: nothing could finish it.
 		my $res = $n1->safe_psql('postgres', "SELECT kingres.promote_node($id)");
 		like($res, qr/"status": "completed"/, "[$point] promote_node finishes the promotion and says so");
+		like($res, qr/"unreached": \[2\]/, "[$point] and still lists the old primary, which was never told (S8-05)");
 	}
 	else
 	{
 		is($n1->safe_psql('postgres', 'SELECT kingres.recover_prepared_transactions()') >= 1 ? 'ok' : 'none', 'ok',
 			"[$point] recovery of the origin commits what is prepared, on node 4 as well");
-		is($n1->safe_psql('postgres', "SELECT kingres.promote_node($id)"), '{"term": 1, "status": "already", "unreached": []}',
+		is($n1->safe_psql('postgres', "SELECT kingres.promote_node($id)"), '{"term": 1, "final": true, "status": "already", "unreached": [2]}',
 			"[$point] and promote_node finds the promotion complete");
 	}
 	is(prepared($n3) . prepared($s2), '00', "[$point] nothing is left prepared");
