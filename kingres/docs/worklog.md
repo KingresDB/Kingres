@@ -7,76 +7,230 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-16: The history of both branches rewritten once, rebalancing in the control plane, kingresd on PostgreSQL 19, phase 7 designed and begun, fix rounds and their reviews
+
+### What was done
+
+- **History rewritten, once, at the request of the project owner.** Two
+  scripts of the control plane carried, in eleven early commits, a default
+  value that was a path of the developer's machine. The line was replaced
+  in those commits (the scripts now ask for `KINGRES_REPO` there), so every
+  commit of `kingres-18` after `f78f85220f` has a new id: 75 commits. The
+  trees of the last 64 of them are unchanged, and so are authors, dates and
+  messages, except that a commit id cited in a message was replaced by the
+  new id. The sync commits of `kingres-19` had their messages changed in
+  the same way (24 commits, no tree changed). Both branches were
+  force-pushed. Every commit id in the documents of the repository was
+  replaced by its new id in this commit. An id noted outside the repository
+  before this date no longer resolves. See
+  [dev/releases.md](dev/releases.md), "History rewritten on 2026-11-16".
+- **Phase 4: rebalancing driven by the control plane** (5196e3da5a,
+  contract 0.9.0). One task per cluster: checks, a plan asked from the
+  extension before every move, one bucket at a time, stop and start again,
+  taken over after a restart or a leader change, a retry rule, a report
+  with the placement before and after. The task engine gained the states
+  paused and skipped. The Rebalance page of the panel. Defects recorded in
+  the earlier entry were fixed with it: `distributeTable` with a reference
+  table, `removeServer` counting standbys and a stopped rebalance,
+  `wal_level` of the instances `kingresd` creates, the coverage of the
+  ledger summary.
+- **Its independent review**
+  ([reviews/2026-11-16-kingresd-rebalance.md](reviews/2026-11-16-kingresd-rebalance.md),
+  6b3a1b9847): fourteen findings, RB-01 to RB-14, two of them high and both
+  about fencing: a holder that lost the lease of a task still ran the
+  failure hook against the new holder's run, and the lease is not proved
+  for the call that starts a move.
+- **kingresd on PostgreSQL 19** (2aba6ea01e). `VerifyBinaries` accepts
+  both majors since 5196e3da5a; the first complete run of the integration
+  suite on 19 failed one test (two new settings of 19 had no reason of
+  their own in the configuration policy). The installation of a run is
+  selectable (`run-integration.ps1 -Install`, `KINGRES_INSTALL`).
+- **Phase 7 designed**
+  ([design/ledger-phase7.md](design/ledger-phase7.md), 3af21523d8): what of
+  it exists, the decisions (signed checkpoints, tile logs per chain and for
+  the aggregate, three anchor targets, epochs after a restore), 25 steps.
+  **Step 1** (8ceed6b88b): the verifier checks signed notes, checkpoints,
+  tile logs and consistency proofs and has a trust file; thirteen
+  corrections to the design came out of building it against the
+  specifications. **Step 2** (86e15fcae3): `kingres_ledger` 0.3 with
+  `ledger_block_preimage`, `ledger_head` and `ledger_blocks_entries`; hash
+  format 1 is unchanged.
+- **`kingres_shard` 0.5, fixes for S7** (f47ce21bf5): the second phase of
+  a commit is sent only when the commit record is confirmed; forced
+  `synchronous_commit` on participants; identities of the deadlock
+  detector from shared memory; a catalog term; a resumable `promote_node`;
+  tagged names of prepared transactions. **Its review**
+  ([reviews/2026-11-16-kingres-shard-0.5-fixes.md](reviews/2026-11-16-kingres-shard-0.5-fixes.md),
+  f2ba3d95e4): eight findings, S8-01 to S8-08, one high (the durability
+  check protects the origin and not a participant) and three medium; a
+  verdict on each call sequence the control plane must follow.
+- **`kingres_columnar`**: fixes for C2 (87611197d3); a third review
+  ([reviews/2026-11-16-kingres-columnar-0.1-second-fixes.md](reviews/2026-11-16-kingres-columnar-0.1-second-fixes.md),
+  1069c409f3) with six findings, C3-01 to C3-06, one critical (the
+  SERIALIZABLE fix did not hold for a stripe flushed inside a
+  subtransaction, and the tests that should have caught it did not flush);
+  fixes for C3 (bb4519e787).
+- **`kingres_sketch` and `kingres_timepart`**: the review of their fix
+  rounds
+  ([reviews/2026-11-15-phase12-extensions-fixes.md](reviews/2026-11-15-phase12-extensions-fixes.md),
+  6d539e84a5), three findings, and their fixes (f33498c9a5): the policy
+  and history tables of `kingres_timepart` are reached through
+  security-barrier views instead of row-level security, so a backup role
+  that is not a superuser can dump the database.
+
+### How it was verified
+
+Run by the integrator on the tree that was committed, not taken from the
+reports of the authors, unless it says otherwise.
+
+- The rewrite: the tree of the new tip of each branch is the tree of the
+  old tip; of the 75 commits of `kingres-18`, 64 have an unchanged tree
+  and 11 differ in that one line; author, committer and both dates of
+  every commit are unchanged; no blob and no message of the new history
+  contains the path; every id cited in a message or a document resolves to
+  a commit of the new history. The old tip is kept under a local backup
+  reference that is not published.
+- `kingresd` at 2aba6ea01e, with `kingres_shard` of f47ce21bf5 and
+  `kingres_ledger` 0.3 installed into both test installations: one
+  complete integration run on each major, 619 top-level tests, none
+  failing, none skipped, on PostgreSQL 19rc2 and on 18.7.
+- Phase 4 at 5196e3da5a on PostgreSQL 18: 617 of 618 top-level tests
+  passed in the complete run; the one that failed (leaving and joining
+  again) passed six of six alone; the three-server smoke script, every
+  check passed; the panel: 1010 unit tests, 43 browser tests, the
+  end-to-end run against a real `kingresd`, 50 of 50 steps.
+- `kingres_shard` at f47ce21bf5: out of tree on 18.7, 12 regression tests
+  and 69 TAP files with 6858 tests; on 19rc2, 7516 tests; in tree on 18,
+  86 of 86 suites; no compiler warning.
+- `kingres_columnar` at bb4519e787: in tree on 18 twice, 19 of 19; out of
+  tree on 19rc2, 11 regression tests and 15 TAP files with 2949 tests.
+- `kingres_ledger` 0.3 at 86e15fcae3: in tree on 18 twice with the
+  verifier named (its checks ran on the output of the extension); on
+  19rc2, 374 tests. The verifier at 8ceed6b88b: 103 top-level tests.
+- `kingres_sketch` and `kingres_timepart` at f33498c9a5: in tree on 18
+  twice; on 19rc2, 348 and 134 tests.
+- The branch `kingres-19` after each synchronisation: built in the tree
+  without a warning, the suites of the five extensions; at the last one,
+  113 passed and one skipped.
+- Shown by the authors only: that each new test fails without its fix;
+  the smoke script and the end-to-end run of the panel on PostgreSQL 19;
+  the fuzz targets of the verifier.
+
+### Needs-verification items
+
+- The statements of section 13 of the phase 7 design, except the three
+  that step 1 settled (section 14 of the design).
+
+### Decisions and deviations
+
+- The rewrite of history and the force-push of both branches, by decision
+  of the project owner. The rule of [dev/releases.md](dev/releases.md)
+  that `kingres-19` is never force-pushed by a sync stands; this was not a
+  sync.
+- The commit message of the phase 4 work claimed that a superseded leader
+  can neither record nor start a move; the review showed that it can still
+  start one. The commit message of the second fix round of
+  `kingres_columnar` claimed a coverage of flushes by size that the tests
+  did not have. Both are corrected in the reports and in the README of
+  the repository, not in the messages.
+- Defaults chosen in the phase 7 design that the project owner may
+  change: publication off, ledger tables on one shard group, no anchor
+  target on by default, governance mode for write-once storage.
+
+### Still open
+
+- `kingresd`: the findings RB-01 to RB-14 (a fix round is in progress and
+  is not committed); failover, switchover and
+  `restorePreferredPrimaries` are not written.
+- `kingres_shard`: the findings S8-01 to S8-08 (a fix round is in
+  progress and is not committed).
+- `kingres_columnar`: the fixes for C3 were not reviewed again; five
+  tests that the third review asked for are not written.
+- `kingres_sketch`, `kingres_timepart`: the fixes for K12R were not
+  reviewed again.
+- The package tests were not run on PostgreSQL 19 by the integrator.
+- Phase 7: steps 3 to 25. Phase 2b, phases 9, 10 and 11 and the rest of
+  phase 12 are not started.
+- Copies of the old history that were fetched before the rewrite, and the
+  hosting service's own cache of unreachable commits, are outside the
+  repository's control.
+
+### Core patches
+
+None.
+
+---
+
 ## 2026-11-15: One source for PostgreSQL 18 and 19 and two product branches, kingres_shard 0.4 and 0.5, three new extensions, high availability part 1, configuration from the console, AGPL
 
 ### What was done
 
 - **One extension source for two majors**
   ([ADR 0023](adr/0023-one-extension-source-for-several-majors.md), commit
-  b8eb415622). Every extension builds and passes its tests on PostgreSQL
+  721ff7f034). Every extension builds and passes its tests on PostgreSQL
   18 and 19 from one source; the differences between the majors live in
   one header per extension (`src/pg_compat.h`). A cluster runs one major.
-  `kingres_ledger` was ported first (44829f5239), then `kingres_shard`
-  (ad01f76b4c); the three new extensions were written that way from the
+  `kingres_ledger` was ported first (3c04aad2b8), then `kingres_shard`
+  (9944f08d01); the three new extensions were written that way from the
   start.
 - **Two product branches** ([dev/releases.md](dev/releases.md), commits
-  5a57634b47, 72b12937c2, 9a469b9406): `kingres-18` on `REL_18_7`, where
+  fd834804e3, 23ba13bd2b, ec7d6b1a3e): `kingres-18` on `REL_18_7`, where
   development happens, and `kingres-19` on `REL_19_RC2`, which is the
   upstream tag, the core patches and one "sync from kingres-18" commit per
   synchronisation, so that the KingresDB directories of the two branches
   are byte-identical. Both are published. Releases will be named
   `kingres-<version>-pg18` and `kingres-<version>-pg19`.
-- **`kingres_shard` 0.4** (e5f411f899): the fix round for the reviews of
+- **`kingres_shard` 0.4** (37293a7e77): the fix round for the reviews of
   0.2 and 0.3 (S3-01 to S3-18, S4-01 to S4-10). Later versions moved up by
-  one (06caffea3e). Its independent review
+  one (b59008bb1b). Its independent review
   ([reviews/2026-11-15-kingres-shard-0.4.md](reviews/2026-11-15-kingres-shard-0.4.md),
-  dc4278c15d, findings S5) was answered together with the port to
-  PostgreSQL 19 (ad01f76b4c); the review of the port
+  d29a408a7d, findings S5) was answered together with the port to
+  PostgreSQL 19 (9944f08d01); the review of the port
   ([reviews/2026-11-15-kingres-shard-0.4-port.md](reviews/2026-11-15-kingres-shard-0.4-port.md),
-  ee6f9fc4b0, findings S6-01 to S6-10) was answered in 775fd89904, which
+  7cfde8ebd0, findings S6-01 to S6-10) was answered in 0ec398f6a2, which
   also lets the extensions be created in any order (an extension that
   finds the schema `kingres` already made by another no longer fails).
-- **`kingres_shard` 0.5** (b52b712559): the part of phase 5 that belongs
+- **`kingres_shard` 0.5** (5cc5f078db): the part of phase 5 that belongs
   to the extension. Standby nodes in the catalog, `kingres.promote_node`,
   prepared transactions that survive a failover (the name of a prepared
   transaction carries the group, the timeline, the backend and the
   target), distributed deadlock detection, `kingres.create_restore_point`.
   Its independent review
   ([reviews/2026-11-15-kingres-shard-0.5.md](reviews/2026-11-15-kingres-shard-0.5.md),
-  7da9474be9) has ten findings, S7-01 to S7-10: one critical (the second
+  bb0f2813d9) has ten findings, S7-01 to S7-10: one critical (the second
   phase of a commit is sent after a cancelled wait for the synchronous
   standby) and six high. The README says that failover is not to be
   relied on yet.
-- **`kingres_sketch` 1.0 and `kingres_timepart` 0.1** (346be75abd), the
+- **`kingres_sketch` 1.0 and `kingres_timepart` 0.1** (5fc2a70fad), the
   parts of phase 12 that depend on nothing else: approximate distinct
   count, top-n and approximate percentiles as types with aggregates that
   support partial aggregation; creation of time partitions ahead of time
   and retention for ordinary partitioned tables. Their review
   ([reviews/2026-11-15-phase12-extensions.md](reviews/2026-11-15-phase12-extensions.md),
-  findings K12-01 to K12-17) was answered in 2594f79e89 and 41ff7f3dac.
-- **`kingres_columnar` 0.1** (d305dbb9fe): columnar storage as a table
+  findings K12-01 to K12-17) was answered in e6ee42f265 and 873cba63ce.
+- **`kingres_columnar` 0.1** (b25c43c884): columnar storage as a table
   access method, with compression, skipping by minimum and maximum, and a
   custom scan that reads only the columns a query needs. Two independent
   reviews:
-  [the first](reviews/2026-11-15-kingres-columnar-0.1.md) (9be51af166,
-  C1-01 to C1-14) was answered in ca5dd5232e, which changed the on-disk
+  [the first](reviews/2026-11-15-kingres-columnar-0.1.md) (4988395b25,
+  C1-01 to C1-14) was answered in 5555b252a0, which changed the on-disk
   format; [the second](reviews/2026-11-15-kingres-columnar-0.1-fixes.md)
-  (73f088ead4) confirmed those fixes and has nine new findings, C2-01 to
+  (9e19a38979) confirmed those fixes and has nine new findings, C2-01 to
   C2-09, one of them critical (under SERIALIZABLE a write that a
   concurrent reader cannot see is not detected as a conflict). The README
   warns against real use.
-- **High availability, part 1, in `kingresd`** (6786e87540, contract
+- **High availability, part 1, in `kingresd`** (acebb486b6, contract
   0.7.0): heartbeats and liveness of servers, leases with self-fencing
   (enforced only in a group that has a standby), the watchdog
   `kingres-watchdog`, creation and supervision of standbys, the client
   entry point. Two defects found by the three-node package test were
-  fixed in 684050a53b: a primary started before it held its lease and was
+  fixed in d05808e9ff: a primary started before it held its lease and was
   stopped by its own fence at the first failed renewal (it now waits for
   the lease at a cold start), and an orderly stop of all instances could
   be taken for a lost lease (the stop now stands the watchdog down).
   Failover and switchover themselves are not written.
-- **Phase 13, configuration from the console** (design 0f7706c00b,
-  implementation 621cdc6ae1, contract 0.8.0 with 82 paths and 100
+- **Phase 13, configuration from the console** (design 2604fcaaab,
+  implementation 1a7a04f3c2, contract 0.8.0 with 82 paths and 100
   operations): the settings of PostgreSQL and the time zone, read and
   changed for the whole cluster, a server group or one server, with a
   preview, a history, reverting a change, and a restart of the instances
@@ -86,56 +240,56 @@ in [dev/documentation.md](dev/documentation.md).
   legends, aligned form rows, a footer on every page with the copyright,
   the link to the project site, the licence and a link to the source of
   the running version, the horizontal logo on the sign-in page
-  (c893ffc7e9 and later); the pages of contract 0.7.0 (85fcafdeaa) and
-  the configuration page of 0.8.0 (621cdc6ae1).
-- **Packaging** (91c4e8487b, 51fcbabef7, 0a786db179, e7dc513969): the
+  (2f4ab3bbbf and later); the pages of contract 0.7.0 (d546dcc06d) and
+  the configuration page of 0.8.0 (1a7a04f3c2).
+- **Packaging** (e48d2e4ec4, 240c26897f, bad3732c05, 3e04d655bf): the
   watchdog is shipped; the image, the compose file and the Debian package
   are built for either major (`kingres_<version>+pg18-<rev>_amd64.deb`,
   `kingres:<version>-pg18`, and the same for 19); the package of one major
   refuses to install over the data of the other; the licence metadata
   says AGPL-3.0-only.
 - **Licence** ([ADR 0024](adr/0024-agpl-for-kingresdb-code.md),
-  ab35bf4cd9): KingresDB's own code is `AGPL-3.0-only`; the code of
+  daa471e852): KingresDB's own code is `AGPL-3.0-only`; the code of
   PostgreSQL keeps the PostgreSQL License; the two files that adapt
   PostgreSQL code say `AGPL-3.0-only AND PostgreSQL`. Every file of
   KingresDB carries the identifier. ADR 0004 is superseded in its choice
   of licence.
-- **Roadmap** (47fed7291d): the first release is every phase except
+- **Roadmap** (7fcbc2e6ad): the first release is every phase except
   phase 8 (several map groups and geo-distribution), which moves to the
   future roadmap. Nothing is tagged before all of them are finished. The
-  design of phase 2b was revised against `kingres_shard` 0.4 (31359ca7d5).
+  design of phase 2b was revised against `kingres_shard` 0.4 (5754aa4f5b).
 
 ### How it was verified
 
 Run by the integrator on the tree that was committed, not taken from the
 reports of the authors, unless it says otherwise.
 
-- `kingres_shard` at 775fd89904: out of tree on PostgreSQL 18.7, 12
+- `kingres_shard` at 0ec398f6a2: out of tree on PostgreSQL 18.7, 12
   regression tests and 60 TAP files with 6610 tests; on 19rc2, the same 12
   and 60 files with 6716 tests; no compiler warning with `-Werror` on
   either; in the tree on 18, 75 of 75 suites. No test of the version of
   the server outside the compatibility header.
-- The branch `kingres-19` after the synchronisation at 775fd89904: built
+- The branch `kingres-19` after the synchronisation at 0ec398f6a2: built
   in the tree with no warning; the suites of the five extensions, 95
   passed and one skipped (`t/046_two_majors`, which runs only when both
   installations are named).
 - `kingres_ledger`: 281 subtests on 18 and 280 on 19. `kingres_sketch`:
   339 subtests on 19. `kingres_timepart`: 105 on 19. Each also in the tree
   on 18.
-- `kingres_columnar` at ca5dd5232e: on 19rc2 out of tree, 11 regression
+- `kingres_columnar` at 5555b252a0: on 19rc2 out of tree, 11 regression
   tests and 8 TAP files with 993 tests; in the tree on 18 twice, 12 of 12
   suites.
-- `kingresd` at 621cdc6ae1: build for Windows and Linux, `go vet`,
+- `kingresd` at 1a7a04f3c2: build for Windows and Linux, `go vet`,
   `gofmt`, unit tests; the integration run against real instances of
   PostgreSQL 18: 40 test binaries, 594 top-level tests, no failure, none
   skipped; the three-server smoke script, 20 of 20 steps. The contract
   checker passes on 0.8.0.
-- Web console at 621cdc6ae1: type check, lint, 998 unit tests (passed
+- Web console at 1a7a04f3c2: type check, lint, 998 unit tests (passed
   twice at normal load; one to three tests that poll failed in three runs
   while the machine was saturated by other work), 43 browser tests,
   production build, generated-API and brand checks, and the end-to-end run
   against a real `kingresd`, 50 of 50 steps.
-- Packaging at ca5dd5232e on PostgreSQL 18: the image test, 129 passed and
+- Packaging at 5555b252a0 on PostgreSQL 18: the image test, 129 passed and
   one known failure; the compose test of three nodes, 162 passed; the
   Debian package, 202 passed and one known failure, `lintian` without an
   error. The check that the package of the other major is refused was run
@@ -210,7 +364,7 @@ Register: [dev/core-patches.md](dev/core-patches.md).
 
 ### What was done
 
-- **Control plane, fix round for the second review** (commit e4736d3244;
+- **Control plane, fix round for the second review** (commit 8d1b2dfc04;
   findings CP2-01 to CP2-22 of
   [reviews/2026-11-15-kingresd-0.4.md](reviews/2026-11-15-kingresd-0.4.md)).
   A forwarded request now carries a proof of the caller's identity that
@@ -230,16 +384,16 @@ Register: [dev/core-patches.md](dev/core-patches.md).
   run of `replaceNetworkAccess`.
 - **Web panel**: an independent review
   ([reviews/2026-11-15-web-panel-0.5.md](reviews/2026-11-15-web-panel-0.5.md),
-  findings W2-01 to W2-16, commit bc2a9aa7f7); its fixes together with the
+  findings W2-01 to W2-16, commit d349e59483); its fixes together with the
   certificate actions and the display of incomplete cluster-wide answers
-  (a0b32e6b3c); then contract 0.6.0 (e46feb6165): choosing or refusing a
+  (39652843fc); then contract 0.6.0 (e64277c568): choosing or refusing a
   pin when a server is added or joins, the server's own fingerprint, ledger
   coverage, the degraded session, the dry run of network access. The copy of
-  the session in `sessionStorage` that a0b32e6b3c introduced was removed
-  again in e46feb6165; the browser stores the theme only.
+  the session in `sessionStorage` that 39652843fc introduced was removed
+  again in e64277c568; the browser stores the theme only.
 - **Packaging**: the bucket count reported by a follower is an ordinary
-  check of the three-node test again (0199aed9e2).
-- **`kingres_shard` 0.3** (1d4b815f2d, design
+  check of the three-node test again (053b7a3437).
+- **`kingres_shard` 0.3** (6ae61063eb, design
   [design/shard-phase4.md](design/shard-phase4.md)): `kingres.move_bucket`
   (copy, logical replication with a marker row that proves the copy is
   complete and replayed, a two-phase switch that detaches on the source and
@@ -256,7 +410,7 @@ Register: [dev/core-patches.md](dev/core-patches.md).
   hold the refusal.
 - **Independent review of `kingres_shard` 0.3**
   ([reviews/2026-11-15-kingres-shard-0.3.md](reviews/2026-11-15-kingres-shard-0.3.md),
-  commit 2f29d172ea): ten findings, S4-01 to S4-10. Three are serious and
+  commit 3c0f21b1a9): ten findings, S4-01 to S4-10. Three are serious and
   were reproduced: a bucket that moves away and back while a scan waits
   leaves the placement hash unchanged, and the scan returns an incomplete
   answer without an error (S4-01, critical); the recovery worker neither
@@ -280,7 +434,7 @@ Register: [dev/core-patches.md](dev/core-patches.md).
 Run by the integrator on the tree that was committed, not taken from the
 reports of the authors, unless it says otherwise.
 
-- `kingresd` at e4736d3244: build for Windows and Linux, `go vet`, `gofmt`,
+- `kingresd` at 8d1b2dfc04: build for Windows and Linux, `go vet`, `gofmt`,
   unit tests of 32 packages; the integration run in WSL against real
   instances: 32 test binaries, 456 top-level tests, no failure, none
   skipped. The three-server smoke script was run by its author only.
@@ -288,13 +442,13 @@ reports of the authors, unless it says otherwise.
   under load; its deadlines were too short for a loaded machine and were
   lengthened (30 repeats passed afterwards).
 - Contract: `scripts/check-contract.mjs` passes on 0.6.0.
-- Web panel at e46feb6165: type check, lint, 577 unit tests, 22 browser
+- Web panel at e64277c568: type check, lint, 577 unit tests, 22 browser
   tests, production build, generated-API and brand checks. The end-to-end
   run against a real `kingresd` (45 of 45) was run by its author only.
-- Packaging at e4736d3244: the compose test of three nodes joined into one
+- Packaging at 8d1b2dfc04: the compose test of three nodes joined into one
   cluster, 139 checks passed and one known failure (a stopped follower is
   still listed as healthy: there are no heartbeats before phase 5).
-- `kingres_shard` 0.3 at 1d4b815f2d: out of tree, 12 regression tests and
+- `kingres_shard` 0.3 at 6ae61063eb: out of tree, 12 regression tests and
   32 TAP files with 5151 subtests; in the tree twice, 47 of 47 suites, no
   compiler warning; `t/022` thirty times under CPU load without a failure.
   Before the fix of the worker and of the test, `t/022` failed 2 of 7 runs
@@ -371,8 +525,8 @@ None.
 
 ### What was done
 
-- **Control plane, 80 of 88 operations** (commits a35bf950e3 and
-  e95eaa06a3):
+- **Control plane, 80 of 88 operations** (commits a51d630d53 and
+  f6f00796fe):
   - the rest of contract 0.4.0: server groups, inclusion proofs, the list of
     ledger verifications, start, stop and restart of an instance, leaving a
     cluster, local settings; the security headers and the cookie attributes
@@ -389,12 +543,12 @@ None.
 - **REST contract 0.5.0**, additive only: the two certificate operations,
   `partial` and `missingServers` on the log, alert and metric answers, two
   problem codes, two task kinds, one alert kind.
-- **Web panel** (commit f82bb16231): follows every entry of the 0.4.0
+- **Web panel** (commit 36af22e61f): follows every entry of the 0.4.0
   changelog (ledger proof and byte-exact digest download, fingerprint pin
   when adding or joining a server, instance start and stop, local settings,
   leave cluster, server groups), shows one calm state while the system
   database is stopped, and is generated from contract 0.5.0.
-- **Packaging** (commit b12e1f1d7a): the compose test joins the three nodes
+- **Packaging** (commit 16da482e03): the compose test joins the three nodes
   into one cluster through the REST API, once with `addServer` and once with
   `joinCluster`, both with the certificate fingerprint pinned, and then
   writes on one node and reads on all three. The compose file had the
@@ -458,7 +612,7 @@ Run by the integrator on the committed tree unless it says otherwise.
 - **Panel**: no buttons for renewing or revoking certificates and no notice
   for incomplete cluster-wide answers yet; both are being built. An
   independent review of the fix round and of the 0.4.0 change is running.
-- A file pushed in commit 5c829987d5 contained a machine-local path; the
+- A file pushed in commit 57b8924ca2 contained a machine-local path; the
   file is corrected, the line remains in history.
 
 ---

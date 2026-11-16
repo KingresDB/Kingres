@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
-# Adversarial review: contrib/kingres_shard 0.4 as ported to PostgreSQL 18 and 19 (commits ad01f76b4c and 28d79ad3c2)
+# Adversarial review: contrib/kingres_shard 0.4 as ported to PostgreSQL 18 and 19 (commits 9944f08d01 and d504f44464)
 
 Reviewer: independent (not the author of the code, not the reviewer of the earlier
-rounds). Reviewed state: commit 28d79ad3c2 on top of ad01f76b4c, that is
-`git diff e5f411f899 28d79ad3c2 -- contrib/kingres_shard`, exported with `git archive`
+rounds). Reviewed state: commit d504f44464 on top of 9944f08d01, that is
+`git diff 37293a7e77 d504f44464 -- contrib/kingres_shard`, exported with `git archive`
 into a private area (`~/kw-review7`); the working tree of the repository (which holds
 the unfinished 0.5) was not used for any result. The review of 0.4
 (`2026-11-15-kingres-shard-0.4.md`) gave S5-01 to S5-06 and four rows marked "partly"
@@ -11,7 +11,7 @@ the unfinished 0.5) was not used for any result. The review of 0.4
 
 ## Scope and method
 
-Read: the commit message of `ad01f76b4c`; the whole diff of the source files
+Read: the commit message of `9944f08d01`; the whole diff of the source files
 (`pg_compat.h`, `node_conn.c`, `dist_scan.c`, `fanout.c`, `planner.c`, `utility.c`,
 `fault.c`, `node_admin.c`, `bucket_move.c`, `catalog.c`, `remote_scan.c`); the diff of the
 SQL scripts (0.2-to-0.3, 0.3, 0.3-to-0.4, 0.4); the review of 0.4 (S5-01 to S5-06 and
@@ -53,11 +53,11 @@ shared, load average 4 to 9; everything under `nice`, `-j4`):
   with no report except the one of S6-02, which it found at once.
 - **A real cluster of 18 and 19**: three nodes started from `pg_upgrade` of node 3 from
   18.7 to 19rc2 and restarted (see S6-09), and the 18/19 pair of `t/046`.
-- **A real version skew**: the extension of the commit 1d4b815f2d (0.3) built into a copy of
+- **A real version skew**: the extension of the commit 6ae61063eb (0.3) built into a copy of
   the 18.7 installation (library and SQL objects of 0.3), a cluster started with it, node 1
   then restarted with the 0.4 library and updated; then the other way (0.4 library
   everywhere, 0.3 SQL objects on nodes 2 and 3).
-- **A base build** of e5f411f899 into a second copy of 18.7, to tell what this change
+- **A base build** of 37293a7e77 into a second copy of 18.7, to tell what this change
   broke from what it inherited (used for S6-01 and S6-02).
 - **About 50 scripted experiments of my own** on three-node clusters (the clusters stay
   up between experiments; ports 54100, 54200, 54300, 54400, 54500, 54600). The ones about
@@ -101,8 +101,8 @@ Verdicts: fixed / partly / not fixed (not reproduced for S5-04).
 
 | ID | Severity | Summary |
 |---|---|---|
-| S6-01 | high | The fix of S5-01 refuses every foreign-key action of a distributed table that references a reference table: with the default `NO ACTION`, any `DELETE` or key `UPDATE` of the reference table fails, whatever the row; `ON DELETE CASCADE`, `SET NULL` and `ON UPDATE CASCADE` fail as well. It worked at e5f411f899 |
-| S6-02 | high | A statement that fails while a distributed scan has its next batch in flight, inside a subtransaction (a `ROLLBACK TO SAVEPOINT`, a PL/pgSQL `EXCEPTION` block), leaves the connection pointing at freed memory; the next statement that needs the node crashes the backend (use after free, both majors, and in e5f411f899) |
+| S6-01 | high | The fix of S5-01 refuses every foreign-key action of a distributed table that references a reference table: with the default `NO ACTION`, any `DELETE` or key `UPDATE` of the reference table fails, whatever the row; `ON DELETE CASCADE`, `SET NULL` and `ON UPDATE CASCADE` fail as well. It worked at 37293a7e77 |
+| S6-02 | high | A statement that fails while a distributed scan has its next batch in flight, inside a subtransaction (a `ROLLBACK TO SAVEPOINT`, a PL/pgSQL `EXCEPTION` block), leaves the connection pointing at freed memory; the next statement that needs the node crashes the backend (use after free, both majors, and in 37293a7e77) |
 | S6-03 | medium | A trigger on an inheritance child of a reference table (made by hand with routing off, as the README tells a superuser to repair things) runs on every node on a write to the parent and the copies diverge with no error: the refusal of S5-01 has a gap |
 | S6-04 | medium | A superuser's `session_replication_role = replica` is not sent to the other nodes: a write to a reference table with a foreign key action skips the action on the origin and runs it on the others; the copies diverge with no error |
 | S6-05 | low | A stored generated column of a reference table runs a user function on every node (the shippability check does not look at it); a function that is declared `IMMUTABLE` and reads node-local state gives different copies with no error |
@@ -156,7 +156,7 @@ node before that node's copy of the parent has the new key and fails with a fore
 violation ("Key (pid)=(10) is not present in table "rpar"").
 Nothing is written (the writes roll back), so the failure is loud; but no row of a
 reference table that a distributed table references can be deleted or have its key
-changed. At e5f411f899 (built as a second copy): the unreferenced row is deleted, the
+changed. At 37293a7e77 (built as a second copy): the unreferenced row is deleted, the
 referenced one is refused by the foreign key ("Key (id)=(1) is still referenced"), and
 `ON DELETE CASCADE` removed the two children (3 of 5 rows left); `ON UPDATE CASCADE`
 changed the children's key (`1->10, 2->10`) and `ON DELETE SET NULL` nulled it.
@@ -185,7 +185,7 @@ not help: on 18 it only clears results, on 19 it returns at once (the new early 
 and neither touches the pointer.
 
 Reproduction (three nodes, a distributed table `d` with 3000 rows, one `INSERT` each; the
-same on 18.7, 19rc2 and, as built here, e5f411f899):
+same on 18.7, 19rc2 and, as built here, 37293a7e77):
 
 ```
 SET kingres_shard.scan_fetch_size = 10;   -- also crashes with the default size

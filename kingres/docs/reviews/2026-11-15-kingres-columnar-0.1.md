@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # Adversarial review: contrib/kingres_columnar 0.1 (phase 12, increments C1 to C4)
 
-Reviewer: independent (not the author). Reviewed state: commit d305dbb9fe,
+Reviewer: independent (not the author). Reviewed state: commit b25c43c884,
 exported with `git archive` (paths `contrib/kingres_columnar` and
 `kingres/dev`) into a private directory (`~/kw-review6/src`). The working tree
 was not used for any result. Line numbers below are those of that commit.

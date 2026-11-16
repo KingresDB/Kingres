@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # Adversarial review: contrib/kingres_shard 0.3 (moving buckets, rebalance plan, cluster check)
 
-Reviewer: independent (not the author). Reviewed state: commit 1d4b815f2d
+Reviewer: independent (not the author). Reviewed state: commit 6ae61063eb
 ("kingres_shard 0.3: moving buckets between shard groups, rebalance plan,
 cluster check"), exported with `git archive` into a private directory; the
 working tree, which another engineer was editing during the review, was not

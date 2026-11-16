@@ -4,9 +4,9 @@
 
 Reviewer: independent (not the author of the code or of the first
 review). Reviewed state: `HEAD` of the two directories, which carries
-commit 2594f79e89 (`kingres_sketch`, fixes for K12-01 to K12-06) and
-commit 41ff7f3dac (`kingres_timepart`, fixes for K12-07 to K12-17), on
-top of the code the first review read at commit 346be75abd. Exported
+commit e6ee42f265 (`kingres_sketch`, fixes for K12-01 to K12-06) and
+commit 873cba63ce (`kingres_timepart`, fixes for K12-07 to K12-17), on
+top of the code the first review read at commit 5fc2a70fad. Exported
 with `git archive` into a private work area; the working tree, which
 other people were editing, was not used for any result. Nothing in the
 repository was changed except this file.
@@ -14,7 +14,7 @@ repository was changed except this file.
 ## Scope and method
 
 Read completely: the diffs of the two fix commits against
-346be75abd, the current `src/*.c`, `*.sql` and `README.md` of both
+5fc2a70fad, the current `src/*.c`, `*.sql` and `README.md` of both
 extensions, and the first review
 (`kingres/docs/reviews/2026-11-15-phase12-extensions.md`). Compared
 behaviour against both READMEs and against

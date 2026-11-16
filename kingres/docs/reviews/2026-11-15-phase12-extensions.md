@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # Adversarial review: contrib/kingres_sketch 1.0 and contrib/kingres_timepart 0.1 (phase 12)
 
-Reviewer: independent (not the author). Reviewed state: commit 346be75abd,
+Reviewer: independent (not the author). Reviewed state: commit 5fc2a70fad,
 exported with `git archive` (paths `contrib/kingres_sketch`,
 `contrib/kingres_timepart`, `kingres/dev`) into a private directory
 (`~/kw-review4/src`). The working tree, which other people were editing, was not

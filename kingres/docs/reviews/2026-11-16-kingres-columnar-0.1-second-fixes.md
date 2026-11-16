@@ -1,8 +1,8 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
-# Adversarial review of the second fix round: contrib/kingres_columnar 0.1 (commit 4a44e3c4f7)
+# Adversarial review of the second fix round: contrib/kingres_columnar 0.1 (commit 87611197d3)
 
 Reviewer: an independent reviewer (not the author). Reviewed state: commit
-4a44e3c4f7, exported with `git archive` (paths `contrib/kingres_columnar`,
+87611197d3, exported with `git archive` (paths `contrib/kingres_columnar`,
 `kingres/dev`, `kingres/docs`) into a private directory. The working tree was
 not used for any result. Line numbers are those of that commit. Nothing in the
 repository was changed except this file. The change under review answers
