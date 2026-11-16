@@ -104,7 +104,9 @@ CALL kingres.timepart_run('tp_moved.ren2', '2026-03-11 UTC');
 SELECT count(*) AS runs_of_moved_table FROM kingres.timepart_run WHERE table_name = 'ren2';
 DROP TABLE tp_moved.ren2;
 SELECT count(*) AS policies_left FROM kingres.timepart_policy WHERE table_name LIKE 'ren%';
-SELECT count(*) AS history_kept FROM kingres.timepart_run WHERE table_name = 'ren';
+-- the history is kept, under the last name of the table
+SELECT count(*) AS history_kept FROM kingres.timepart_run WHERE table_name = 'ren2';
+SELECT count(*) AS history_under_old_name FROM kingres.timepart_run WHERE table_name = 'ren';
 -- Renaming another table does not touch the policy of this one.
 CREATE TABLE tp.other (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
 ALTER TABLE tp.other RENAME TO other2;

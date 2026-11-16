@@ -24,6 +24,8 @@ tests += {
       'timepart_names',
       'timepart_hostile',
       'timepart_security',
+      'timepart_history',
+      'timepart_privilege',
       'timepart_drop',
     ],
     'regress_args': ['--temp-config', files('kingres_timepart.conf')],

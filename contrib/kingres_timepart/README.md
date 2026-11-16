@@ -141,7 +141,9 @@ extension. `kingres.timepart_lock` has one row per table, is private to the
 extension owner, and is what a run locks.
 
 `kingres.timepart_policy` has one row per table, keyed by the table's schema and
-name:
+name (the columns `table_owner` and `created_by` are the names of the roles
+in the catalog, so a role that was renamed shows its new name; they cannot be
+written):
 
 | Column | Meaning |
 |---|---|
@@ -155,19 +157,83 @@ name:
 | `run_every` | the interval between runs; default 1 hour |
 | `enabled` | disabled policies are not reported by `timepart_due` |
 | `next_run_at` | set by `timepart_finish_run` |
-| `table_owner` | the owner of the table when the policy was set; a run fails with `owner_changed` if it differs |
+| `table_owner` | the owner of the table when the policy was set; a run fails with `owner_changed` if the owner of the table is not that role (the role, not its name: see "Identity") |
 | `created_by`, `created_at`, `updated_at` | who set the policy first, and when |
 
-`kingres.timepart_run` has one row per run (`run_id`, table, `as_of`, `trigger`
-`schedule`, `manual` or `sql`, `state` `running`, `done`, `partial` or `failed`,
-`started_at`, `finished_at`, `started_by`, `error`, and the `backend_pid` and
-`backend_start` of the session that began the run).
+`kingres.timepart_run` has one row per run (`run_id`, the table's schema and
+name, `table_oid`, `table_owner`, `as_of`, `trigger` `schedule`, `manual` or
+`sql`, `state` `running`, `done`, `partial` or `failed`, `started_at`,
+`finished_at`, `started_by`, `error`, and the `backend_pid` and `backend_start`
+of the session that began the run). `table_oid` is the table the run was made
+for, and is null once that table has been dropped; `table_owner` is the role
+that owned the table when the run began (the role that may see the run, see
+"Who sees the history"); `started_by` is the session user that began it. The
+schema and the name of the table follow a rename of the table (not a rename of
+its schema).
 `kingres.timepart_run_action` has one row per action of a run (`run_id`, `seq`,
 `kind` `create`, `convert`, `drop`, `detach` or `misaligned`, the partition's
 schema and name, its bounds, `state` `done`, `failed` or `skipped`, `detail`,
 `bytes_before` for drops and detaches, times). Runs are kept for 90 days after
 the time of the newest and at most 1000 per table (`timepart_prune_runs`, called
 at the end of every run).
+
+### Identity: which table and which role a row means
+
+A policy or a run names a table by its schema and name and a role by its name,
+which is what a backup carries, and keeps the OIDs of both, which a rename does
+not change and a backup does not carry: another cluster has other role OIDs,
+another database other table OIDs, and an OID there can be the one of an
+unrelated object. The rows of the policy and of the history therefore carry a
+**stamp**: a random value made by `CREATE EXTENSION` (the function
+`kingres.timepart__stamp()` returns it), which is different in every
+installation and is never in a dump, because it is in a function and not in
+the data.
+
+- A row with the stamp of this installation was written here; its OIDs are its
+  identity. A role that is renamed is the same role (`ALTER ROLE ... RENAME`
+  changes nothing: no run fails with `owner_changed`, no run is hidden), a table
+  that is renamed or moved to another schema is the same table, a role that was
+  dropped is gone for good, and a table or role made later with the same name
+  is another one.
+- A row with another stamp was restored from a backup; its OIDs mean nothing,
+  and its names are its identity: a role is the role of that name, a run's table
+  is the table of that schema and name that the recorded owner owns. The first
+  `timepart_due` or `timepart_begin_run` after the restore (or `kingres.timepart_adopt()`,
+  which both call first) replaces the OIDs by those of the roles and tables of this
+  cluster and gives the rows the stamp of this installation, so a role that is
+  renamed after that is followed (a role renamed between the restore and that
+  first call is not: its rows name the old name; call `timepart_adopt()` right
+  after a restore into a cluster whose roles are not yet final). A row whose owner role does not exist in this
+  cluster is left as it is: only a superuser sees it, until a role of that name is
+  made. Restoring into the same cluster, or into another one where the roles
+  have the same names, gives the same visibility as before the dump (tested, in
+  a cluster where the role OIDs are not the same).
+- The event trigger that follows a rename or drops the policy of a dropped
+  table acts only on rows with the stamp of this installation, so the OID in a
+  restored policy, which may be the OID of an unrelated table, cannot make
+  that table's rename move the policy.
+
+### Who sees the history
+
+The rule: a run belongs to the table it was made for and to the role that owned
+that table when the run began. A role sees a run when it is that role, or a
+member of it that inherits its privileges (`pg_has_role(..., 'USAGE')`), or a
+superuser. `timepart_run_action` follows its run, and so does every function that
+reads the history (`timepart_partitions`, `timepart_check`, `timepart_policies`).
+
+| Case | Who sees the earlier runs |
+|---|---|
+| the table is dropped | the owner it had (and nobody else but superusers); `table_oid` is null |
+| another role, or the same one, makes a table of the same name | the new table has no history; the old runs stay with the old table and its owner; the list of detached partitions of `timepart_partitions` is the table's own |
+| the table or its schema is renamed or moved | the owner, as before (the schema name in the rows follows the table's rename, not a rename of the schema) |
+| a role is renamed | the same role |
+| `ALTER TABLE ... OWNER TO` | the runs made while the old owner owned the table stay with the old owner; the new owner sees only the runs after the change, starting with the run that fails with `owner_changed` |
+| the owner role is dropped | only superusers, also when a role of the same name is made later |
+| a dump and restore, by a superuser or by a role with `pg_read_all_data` | the same as before the dump (see "Identity") |
+
+The history of a table is never moved to the new owner by an `OWNER TO`: it
+records who was responsible when it was made, and a new owner does not learn
+what the old one saw.
 
 `kingres.timepart_policies` is the policy with the state of the latest run of
 the table.
@@ -196,8 +262,9 @@ Superuser only (the scheduler and `psql` of an administrator):
 | `CALL kingres.timepart_run_phase(run_id bigint, phase text)` | `timepart_run_action` in a loop with a `COMMIT` after each call. Idempotent: it re-plans from the catalog at the run's `as_of` and does what is left. |
 | `kingres.timepart_finish_run(run_id bigint) returns void` | Final state, `next_run_at`, pruning. Calling it again does nothing more. |
 | `kingres.timepart_action_timeout() returns integer` | The `statement_timeout`, in milliseconds, that a driver sets before it calls `timepart_run_action` (setting `kingres_timepart.action_timeout_ms`, default 300000). |
-| `kingres.timepart_due(as_of_time timestamptz default now()) returns table (schema_name name, table_name name, as_of timestamptz)` | Enabled policies whose `next_run_at` is at or before the time, oldest first. |
+| `kingres.timepart_due(as_of_time timestamptz default now()) returns table (schema_name name, table_name name, as_of timestamptz)` | Enabled policies whose `next_run_at` is at or before the time, oldest first. Calls `timepart_adopt()` first. |
 | `kingres.timepart_prune_runs(schema_name name, table_name name, as_of timestamptz default now()) returns bigint` | Delete old runs of a table; returns the number. |
+| `kingres.timepart_adopt() returns bigint` | Give the policies and runs that a backup carried here the roles and tables of this installation (see "Identity"); returns the number of rows changed. Called by every `timepart_begin_run`. |
 
 `timepart_set_policy`, `timepart_unset_policy`, `timepart_plan`, `timepart_partitions` and
 `timepart_check` are `SECURITY INVOKER`: they judge `current_user`. The functions that need
@@ -361,26 +428,51 @@ function or procedure (checked by the test `timepart_retention`).
   `timepart_create_one`, `timepart_retire_one`) is `SECURITY INVOKER`: PostgreSQL
   checks every statement against the caller. They also check ownership first,
   for a clear error.
-- **A run executes the DDL as the owner of the table** (`SET LOCAL ROLE`), so
-  the new tables are the owner's, and the owner needs `CREATE` on the schema.
-  The statements are built before the switch; the owner role needs no right on
-  the `kingres` schema.
+- **A run executes the DDL as the owner of the table, where the owner's own
+  code cannot leave that role.** The new tables are the owner's, and the owner
+  needs `CREATE` on the schema. The statements are built by the extension, as
+  the extension owner, before the switch; the owner role needs no right on the
+  `kingres` schema. The switch is not `SET ROLE`, and the reason is the
+  finding of the review of the second fix round (the test `timepart_privilege`): DDL makes
+  PostgreSQL run code that the table owner wrote. An index whose expression
+  calls a function with a constant argument is evaluated again when a partition
+  is attached, in an ordinary context, and a default, a check constraint, a
+  generated column or a trigger can call the owner's code when rows are
+  written. A run is made by a superuser. After `SET ROLE owner` in that session
+  the owner's function ran as the owner but could say `RESET ROLE`, or call
+  `set_config('role', 'none', false)` from a function declared `IMMUTABLE`
+  that calls a `VOLATILE` one (the declaration is not checked), and the rest
+  of the statement ran as the superuser: an escalation of privilege (seen on
+  PostgreSQL 18 and 19). PostgreSQL's own maintenance commands (`REINDEX`,
+  `CLUSTER`, `VACUUM`, `REFRESH MATERIALIZED VIEW`) run such code with the
+  table owner's user id and a security-restricted flag that no SQL can set. The
+  one thing SQL has is the frame of a `SECURITY DEFINER` function: inside it
+  `SET ROLE`, `RESET ROLE`, `set_config('role', ...)` and `SET SESSION
+  AUTHORIZATION` are refused (`cannot set parameter "role" within
+  security-definer function`). So for each action the extension makes a
+  `SECURITY DEFINER` function in the **temporary schema of the session**,
+  gives it to the table owner (`ALTER FUNCTION ... OWNER TO`), calls it with the
+  statements, and drops it, in the transaction of the action (`timepart__exec_as`).
+  The owner's code then runs with the owner as `current_user` and with no way
+  back; no other session can see the function (it is not committed), no object
+  of the extension is owned by a table owner (a role can be dropped at any
+  time), and a failed action rolls the function back with its subtransaction.
+  `create_time_partitions`, `drop_old_time_partitions`, `timepart_create_one` and
+  `timepart_retire_one` are `SECURITY INVOKER` and run the DDL as whoever calls
+  them: a superuser who calls them for another role's table runs that role's
+  code as the superuser, exactly as a superuser's `ALTER TABLE ... ATTACH
+  PARTITION` does; that is PostgreSQL's rule, and the reason `timepart_run`,
+  not these functions, is what a scheduler calls.
 - **A run does execute user code, as the owner, and with no limit of its own.**
-  `CREATE TABLE ... (LIKE ... INCLUDING INDEXES)` creates the parent's indexes
-  on every new partition, and an index whose expression calls a function with
-  a constant argument makes PostgreSQL evaluate that function at once: an
-  `IMMUTABLE` function of the owner's (a declaration, not a check) runs once
-  per partition created, in the session that runs the maintenance, which is
-  usually a superuser's. It runs as the owner (`current_user` is the owner, and
-  `RESET ROLE` is refused in a non-volatile function), but nothing in the
-  extension limits how long it runs; column defaults, `CHECK` constraints,
-  generated columns and triggers are copied, not run. A detach or a drop fires
-  no trigger. An attach next to a default partition scans it with the built-in
-  comparison operators of the key. Event triggers that a superuser created in
-  the database do run. A table owner who can make a function run for as long as
-  it likes can keep a driver's session busy: see "Time limit of an action", and
-  do not run the maintenance of tables of untrusted owners in a session that
-  other work waits for.
+  The owner's code that runs is the code described above (an index expression
+  at an attach; a default, a generated column or a trigger when rows are
+  written, which a run does not do; the check constraints and defaults are
+  copied, not run). It runs as the owner and cannot leave that role. Nothing in
+  the extension limits how long it runs: a table owner who can make a function
+  run for as long as it likes can keep a driver's session busy: see "Time limit
+  of an action", and do not run the maintenance of tables of untrusted owners
+  in a session that other work waits for. Event triggers that a superuser created
+  in the database do run.
 - **Search path.** Every function has `SET search_path = pg_catalog, kingres,
   pg_temp`. The two procedures that commit cannot carry a `SET` clause; their
   first statement, and the first statement after every `COMMIT`, sets the path
@@ -403,8 +495,8 @@ function or procedure (checked by the test `timepart_retention`).
   the new owner, and the old partitions, owned by the old owner, cannot be
   dropped by the new one until their owner is changed too.
 - **Superuser only:** `timepart_run`, `timepart_run_phase`, `timepart_run_action`,
-  `timepart_begin_run`, `timepart_finish_run`, `timepart_due` and
-  `timepart_prune_runs`, and EXECUTE on them is revoked from `PUBLIC`.
+  `timepart_begin_run`, `timepart_finish_run`, `timepart_due`,
+  `timepart_adopt` and `timepart_prune_runs`, and EXECUTE on them is revoked from `PUBLIC`.
 - **Quoting.** Every identifier goes into dynamic SQL with `format('%I')` and
   every literal with `%L`. Names of partitions are generated and always quoted.
   The test `timepart_names` runs tables, schemas, columns and a role with
@@ -473,27 +565,45 @@ tables and the sequence of `run_id` are extension configuration).
 a superuser, or any role that can read every table of the database, such as a
 member of `pg_read_all_data` (no `BYPASSRLS` is needed, and no row-level
 security is in the way). A database owner that is not a member of
-`pg_read_all_data` is refused like any role that does not own the tables, with
-"permission denied for table timepart_policy_data"; add it to the role or use
-another. A dump by a superuser and a dump by a member of `pg_read_all_data` are
+`pg_read_all_data` is refused like any role that does not own the tables; add
+it to the role or use another. `pg_dump` reads the sequence behind `run_id` before it reads the tables, so a
+dump of the whole database by such a role stops with `pg_dump: error: failed to
+get data for sequence "timepart_run_data_run_id_seq"; user may lack SELECT
+privilege on the sequence or the sequence may have been concurrently dropped`
+(exit status 1); only a dump of a table alone (`-t kingres.timepart_policy_data`)
+reaches the table and says `permission denied for table timepart_policy_data`.
+Both are what a role gets that cannot read the extension's tables (the messages
+are from a run on PostgreSQL 18). A dump by a superuser and a dump by a member of `pg_read_all_data` are
 identical. The restore needs a superuser, as `CREATE EXTENSION kingres_timepart`
 does, and the restore writes the policies as they were (the trigger that pins
 `created_by` and the other columns trusts a superuser only); a database owner
 that is not a superuser is refused. (Tests: `003_dump_restore.pl`.) After a restore the
-OID in a policy is stale; the table is found by name and the hint is refreshed
-by the next run. A run that was `running` in the dump is marked `interrupted` by
+OIDs in a policy and in the history are stale, and the rows carry the stamp of
+another installation (see "Identity"): the table is found by name, the role by
+name, and the next `timepart_begin_run` replaces the OIDs and the stamp. A run that was `running` in the dump is marked `interrupted` by
 the next begin on its table, because its backend (pid and start time) is not alive.
 
-An event trigger on `ALTER TABLE` moves the policy when the table is renamed or
-moved to another schema; it changes a policy only when the table named in the
-policy no longer exists, so a stale hint cannot move a policy by mistake. An
-event trigger on `DROP` removes the policy of a dropped table (the history
-stays). A rename of the schema is not followed: the policy becomes an orphan,
+An event trigger on `ALTER TABLE` moves the policy (and the name in the runs) when
+the table is renamed or moved to another schema; it changes a policy only when
+the policy has the stamp of this installation and the table named in it no
+longer exists, so a stale hint, which can be the OID of another table, cannot
+move a policy by mistake. An event trigger on `DROP` removes the policy of a
+dropped table (the history stays, with the owner the table had, and no longer
+belongs to a table). A rename of the schema is not followed: the policy becomes an orphan,
 reported by `timepart_check`, and has to be set again.
 
 `DROP EXTENSION kingres_timepart` removes the event triggers, the functions and
 procedures, the views, and the tables with the policies and the whole history
-(without a warning: dump them first if the history matters). The partitions and
+(without a warning: dump them first if the history matters). A later `CREATE
+EXTENSION` is a new installation: no policy, no run, the numbering of runs
+starts again, and it has a stamp of its own (the test `timepart_drop`).
+`CREATE EXTENSION` in a database where something of the user's already has the
+name of an object of the extension in the schema `kingres` (a table
+`timepart_policy_data`, a view `timepart_run`, a function with the signature of
+one of ours, a sequence, an index or a type of those names) ends in an error that
+names it, and changes nothing: the extension is not created, no other object of
+ours is left, and what the user made is as it was. A function of the user's with
+another signature is an overload and stays (tested). The partitions and
 tables of the users stay, as ordinary tables, and so do detached partitions. It
 leaves the schema `kingres`: `CREATE EXTENSION` created the schema because the
 control file asks for it, but the schema is not a member of the extension (the
@@ -519,7 +629,12 @@ which alters the tables in place (`ALTER TABLE ... ADD COLUMN`, new constraints
 by `ALTER TABLE ... ADD CONSTRAINT`), uses `CREATE OR REPLACE FUNCTION` for
 changed functions, and never rewrites the rows of the history; the control
 file's `default_version` is raised and the new install script `--0.2.sql` is the
-whole of the new state. A released script is not edited.
+whole of the new state. A released script is not edited. Version 0.1 has not been
+released: until it is, its script is edited in place, and a database made from an
+earlier text of it has to drop and create the extension again (the tables of the
+policy and the history changed in the rounds of review: the columns that hold the
+stamp and the OIDs of the roles and tables, and the views, which show the names
+of the roles from the catalog).
 
 ## Limits
 
@@ -618,14 +733,20 @@ The design is `kingres/docs/design/analytics-phase12-storage.md`, section 4.4 an
 
 `sql/` and `expected/` hold the pg_regress tests (`timepart_setup`,
 `timepart_grid`, `timepart_create`, `timepart_policy`, `timepart_run`,
-`timepart_retention`, `timepart_names`, `timepart_hostile`, `timepart_security`, `timepart_drop`).
+`timepart_retention`, `timepart_names`, `timepart_hostile`, `timepart_security`, `timepart_history` (who
+sees the history, renamed roles and tables, owner changes, dropped roles),
+`timepart_privilege` (the code of a table owner while a superuser runs the
+maintenance), `timepart_drop` (`DROP EXTENSION` and `CREATE EXTENSION`, also where
+the user has objects of the same names)).
 Every one passes an `as_of` time; none reads the clock. `t/` holds the TAP tests:
 `001_locks.pl` (a long transaction holding the parent, readers and writers,
 one run per table, a role that holds advisory locks, a foreign key), `002_interrupt.pl` (a backend killed and the server
 crashed in the middle of a run, then repeated) and `003_dump_restore.pl`
 (`pg_dump` and restore by a superuser, a role with only `pg_read_all_data` and a
 database owner, then a run; a restore by a role that is not a superuser is
-refused; the extension in a database whose schema `kingres` exists already).
+refused; the extension in a database whose schema `kingres` exists already; who sees
+what before and after a restore, also into another cluster where the role OIDs
+differ and a role is renamed afterwards).
 
 Build and test against a KingresDB installation, out of tree:
 
