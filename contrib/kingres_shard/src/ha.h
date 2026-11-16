@@ -34,6 +34,8 @@ extern void kingres_shard_ha_commit_leave(void);
 extern bool kingres_shard_sync_confirmed(XLogRecPtr lsn, int mode);
 extern int	kingres_shard_sync_wait_mode(void);
 extern bool kingres_shard_wait_decision_durable(int timeout_ms);
+extern bool kingres_shard_wait_confirmed(XLogRecPtr target, int mode, int timeout_ms);
+extern bool kingres_shard_probe_sync(int timeout_ms);
 
 /* The newer catalog term this node was refused with as the map group primary (term.c). */
 extern void kingres_shard_ha_note_superseded(int64 term);

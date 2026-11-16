@@ -19,7 +19,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fence"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 )
 
 // State of a task.
@@ -136,6 +139,24 @@ var (
 	// ErrUnknownKind means no definition is registered for the kind.
 	ErrUnknownKind = errors.New("unknown task kind")
 )
+
+// ExcludedError means the database refused to start a task because an operation that excludes it is unfinished
+// (migration 0009): a rebalance against a change of the servers. Other is the kind of the other task, or
+// "rebalance" when the refused task is a server operation.
+type ExcludedError struct{ Kind, Other string }
+
+func (e *ExcludedError) Error() string {
+	return "task of kind " + e.Kind + " excluded by " + e.Other
+}
+
+// excluded maps the database error of the exclusion trigger, nil for any other error.
+func excluded(kind string, err error) error {
+	var pe *pgconn.PgError
+	if errors.As(err, &pe) && (pe.Code == "KX001" || pe.Code == "KX002") {
+		return &ExcludedError{Kind: kind, Other: pe.Detail}
+	}
+	return nil
+}
 
 // PauseError is what a step returns to stop its task without failing it: the
 // engine records the task as paused, releases the lease and keeps the steps that
@@ -436,8 +457,10 @@ func (e *Engine) Run(ctx context.Context) {
 	}
 }
 
-// Cancel asks for the cancellation of a task (between steps). A paused task is
-// not run by anybody, so it is failed at once and its cleanup hook runs here.
+// Cancel asks for the cancellation of a task. A running task stops at its next
+// step boundary, or at the next pause point of a step that can pause. A paused task
+// is not run by anybody, so it is failed at once (the store's condition is "still
+// paused") and its cleanup hook runs here, with the task as recorded.
 func (e *Engine) Cancel(ctx context.Context, id int64) error {
 	t, gerr := e.store.Get(ctx, id)
 	if gerr == nil && recordedKinds[t.Kind] {
@@ -447,7 +470,11 @@ func (e *Engine) Cancel(ctx context.Context, id int64) error {
 		return err
 	}
 	if gerr == nil && t.State == Paused {
-		e.onFail(ctx, t)
+		// Read again: the hook runs only when this request ended the task (it may have
+		// been resumed meanwhile, and then a run owns it).
+		if now, err := e.store.Get(ctx, id); err == nil && now.State == Failed && now.Error != nil && now.Error.Code == CodeCanceled {
+			e.onFail(ctx, now, now.Error)
+		}
 	}
 	return nil
 }
@@ -531,9 +558,22 @@ func (e *Engine) run(ctx context.Context, t Task, started time.Time, secrets map
 		}
 		e.fault(FaultStepStarted, t.ID, i)
 		if err := st.Run(fence.With(runCtx, fence.Token{Task: t.ID, Epoch: env.lease.Epoch}), env); err != nil {
+			// A step that was refused for its lease or its fence did not fail: the run was
+			// superseded, or its lease ran out. It stands down and does nothing more in the
+			// name of the task (no record, no hook, no alert); see leaseLost.
+			if leaseLost(err) {
+				return ErrLeaseLost
+			}
 			var pe *PauseError
 			if errors.As(err, &pe) && runCtx.Err() == nil {
-				return e.pause(ctx, t, i, pe.Reason)
+				cancelReq, perr := e.pause(ctx, t, i, pe.Reason)
+				if perr != nil {
+					return perr
+				}
+				if cancelReq {
+					return e.cancelTask(ctx, t, def, i)
+				}
+				return nil
 			}
 			var se *SkipError
 			if errors.As(err, &se) && runCtx.Err() == nil {
@@ -658,43 +698,73 @@ func (e *Engine) cancelTask(ctx context.Context, t Task, def Definition, next in
 	if len(irrev) > 0 {
 		msg += " Steps already done are not undone, including irreversible ones."
 	}
-	err := e.finish(ctx, t, Failed, &Error{Code: CodeCanceled, Message: msg, Retryable: false})
-	e.onFail(ctx, t)
-	return err
+	te := &Error{Code: CodeCanceled, Message: msg, Retryable: false}
+	if err := e.finish(ctx, t, Failed, te); err != nil {
+		return err // not recorded under this lease: no hook
+	}
+	e.onFail(ctx, t, te)
+	return nil
 }
 
 // pause records the task as paused. The step that paused goes back to pending,
-// so the task shows where it will go on.
-func (e *Engine) pause(ctx context.Context, t Task, i int, reason string) error {
+// so the task shows where it will go on. It reports a cancel request that arrived
+// meanwhile: the caller then cancels the task instead of leaving it paused.
+func (e *Engine) pause(ctx context.Context, t Task, i int, reason string) (bool, error) {
 	ps, ok := e.store.(PauseStore)
 	if !ok {
-		return e.fail(ctx, t, i, Step{Name: t.Steps[i].Name}, &Error{Code: CodeStepFailed, Step: t.Steps[i].Name, Message: "The store cannot pause tasks."})
+		return false, e.fail(ctx, t, i, Step{Name: t.Steps[i].Name}, &Error{Code: CodeStepFailed, Step: t.Steps[i].Name, Message: "The store cannot pause tasks."})
 	}
-	if _, err := e.setStep(ctx, t, i, StepPending, percent(i, len(t.Steps))); err != nil {
-		return err
+	cancelReq, err := e.setStep(ctx, t, i, StepPending, percent(i, len(t.Steps)))
+	if err != nil {
+		return false, err
+	}
+	if cancelReq {
+		return true, nil
 	}
 	c := context.WithoutCancel(ctx)
-	return e.retry(c, func() error { return ps.Pause(c, t.ID, e.leaseOf(t), clip(reason)) })
+	return false, e.retry(c, func() error { return ps.Pause(c, t.ID, e.leaseOf(t), clip(reason)) })
 }
 
 func (e *Engine) fail(ctx context.Context, t Task, i int, st Step, te *Error) error {
 	if i < len(t.Steps) {
 		if _, err := e.setStep(ctx, t, i, StepFailed, percent(i, len(t.Steps))); err != nil {
+			if leaseLost(err) {
+				return ErrLeaseLost
+			}
 			e.log.Error("recording failed step", "task", t.ID, "error", err)
 		}
 	}
 	e.log.Warn("task step failed", "task", t.ID, "kind", t.Kind, "step", st.Name, "error", te.Message)
-	err := e.finish(ctx, t, Failed, te)
-	e.onFail(ctx, t)
-	return err
+	if err := e.finish(ctx, t, Failed, te); err != nil {
+		return err // not recorded under this lease: no hook, no alert
+	}
+	e.onFail(ctx, t, te)
+	return nil
 }
 
-// onFail runs the definition's cleanup hook for a task that was recorded as
-// failed.
-func (e *Engine) onFail(ctx context.Context, t Task) {
+// onFail runs the definition's cleanup hook for a task that this call has just
+// recorded as failed (the record is conditional on the holder and the epoch, so a
+// superseded run never gets here). The hook sees the task as recorded: state
+// failed and the error.
+func (e *Engine) onFail(ctx context.Context, t Task, te *Error) {
 	if d, ok := e.def(t.Kind); ok && d.OnFail != nil {
+		t.State, t.Error = Failed, te
 		d.OnFail(context.WithoutCancel(ctx), t)
 	}
+}
+
+// leaseLost reports whether err says that the run no longer holds its task: the
+// store refused a write named by its lease (ErrLeaseLost, also when the lease only
+// ran out and nobody took the task over) or a callee refused its fencing token
+// (fence.ErrFenced). That is not a failure of the task. The rule of the engine
+// (README of the control plane, "The fencing rule"): a holder that lost the lease
+// does nothing more in its name. It writes nothing, starts nothing and runs no
+// hook; the task stays as the store has it. When another server holds it now, that
+// server decides what happens next. When nobody took it over, the lease is only
+// expired and the task is claimed again by the next poll of the leader (the epoch
+// grows, the interrupted step runs again from its start, as after a restart).
+func leaseLost(err error) bool {
+	return errors.Is(err, ErrLeaseLost) || errors.Is(err, fence.ErrFenced)
 }
 
 func (e *Engine) finish(ctx context.Context, t Task, s State, te *Error) error {
@@ -791,4 +861,18 @@ func (e *Engine) SubmitHeld(ctx context.Context, kind string, subj Subject, inpu
 		return e.run(ctx, *claimed, started, secrets)
 	}
 	return *claimed, run, nil
+}
+
+// Problem is the answer for the person who asked for the refused task: the contract's 409 codes
+// rebalance_in_progress (a server operation refused by a rebalance), failover_in_progress and
+// operation_in_progress (a rebalance refused by a change of the servers).
+func (e *ExcludedError) Problem() *problem.Problem {
+	switch {
+	case e.Other == "rebalance":
+		return problem.New(problem.RebalanceInProgress, "A rebalance is running; wait until it has finished.")
+	case e.Other == "server.failover":
+		return problem.New(problem.FailoverInProgress, "A failover is in progress; the buckets stay where they are until it has finished.")
+	default:
+		return problem.New(problem.OperationInProgress, "Another operation changes the servers ("+e.Other+"); wait until it has finished.")
+	}
 }

@@ -63,13 +63,13 @@ func (r *memRows) StartMove(_ context.Context, m Move, from, to string, attempts
 	}
 	for i := range r.moves {
 		x := &r.moves[i]
-		if x.Move.Key() == m.Key() && (x.State == MoveFailed || x.State == MoveCancelled) {
+		if x.Move.Key() == m.Key() && x.Round == r.run.Round && (x.State == MoveFailed || x.State == MoveCancelled) {
 			x.State, x.Attempts, x.FinishedAt, x.Error = MoveRunning, attempts, nil, ""
 			return x.Seq, nil
 		}
 	}
 	seq := len(r.moves) + 1
-	r.moves = append(r.moves, MoveRow{Seq: seq, Move: m, FromServer: from, ToServer: to, State: MoveRunning, Attempts: attempts, Size: m.Size, StartedAt: time.Unix(1000, 0)})
+	r.moves = append(r.moves, MoveRow{Seq: seq, Move: m, FromServer: from, ToServer: to, State: MoveRunning, Attempts: attempts, Size: m.Size, StartedAt: time.Unix(1000, 0), Round: r.run.Round})
 	return seq, nil
 }
 func (r *memRows) UpdateMove(_ context.Context, seq int, ext int64, phase string, pct float64) error {
@@ -106,7 +106,7 @@ func (r *memRows) AddSkipped(_ context.Context, m Move, from, to, reason, detail
 		return err
 	}
 	now := time.Unix(2000, 0)
-	r.moves = append(r.moves, MoveRow{Seq: len(r.moves) + 1, Move: m, FromServer: from, ToServer: to, State: MoveSkipped, SkipReason: reason, Error: detail, FinishedAt: &now})
+	r.moves = append(r.moves, MoveRow{Seq: len(r.moves) + 1, Move: m, FromServer: from, ToServer: to, State: MoveSkipped, SkipReason: reason, Error: detail, FinishedAt: &now, Round: r.run.Round})
 	return nil
 }
 func (r *memRows) Moves(context.Context) ([]MoveRow, error) {
@@ -225,7 +225,7 @@ func (f *fakeCluster) RunMove(ctx context.Context, m Move) error {
 		f.mu.Unlock()
 	}
 	if fail {
-		return errors.New("simulated failure of the copy")
+		return &MoveError{Err: errors.New("simulated failure of the copy")}
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -260,11 +260,14 @@ func (f *fakeCluster) Recover(_ context.Context, r MoveRow) (string, string, err
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.recovered = r.Move.Key()
+	if f.owner[r.Move.Bucket] != r.Move.To {
+		return MoveFailed, "the move did not reach the target", nil
+	}
 	return MoveDone, "", nil
 }
 func (f *fakeCluster) Cleanup(context.Context) { f.cleaned++ }
 
-func testLoop(c *fakeCluster, r *memRows) *Loop {
+func testLoop(c Backend, r *memRows) *Loop {
 	now := time.Unix(5000, 0)
 	var mu sync.Mutex
 	return &Loop{Backend: c, Rows: r, MaxAttempts: 3, Backoff: time.Second, Poll: 5 * time.Millisecond,

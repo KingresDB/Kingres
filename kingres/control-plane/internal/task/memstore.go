@@ -63,6 +63,9 @@ func (m *MemStore) Create(_ context.Context, t Task) (Task, error) {
 			return Task{}, ErrSubjectBusy
 		}
 	}
+	if x := m.excludedLocked(t.Kind); x != nil {
+		return Task{}, x
+	}
 	m.next++
 	t.ID = m.next
 	m.tasks[t.ID] = &t
@@ -284,5 +287,21 @@ func (m *MemStore) Resume(_ context.Context, id int64) error {
 		return ErrNotPaused
 	}
 	t.State, t.CancelRequested, t.UpdatedAt = Pending, false, m.clock()
+	return nil
+}
+
+// serverOps are the kinds that exclude a rebalance (and are excluded by it), see migration 0009.
+var serverOps = map[string]bool{"server.add": true, "server.remove": true, "server.leave": true, "server.failover": true}
+
+// excludedLocked is the rule of the database trigger for a task of kind about to be created.
+func (m *MemStore) excludedLocked(kind string) error {
+	for _, o := range m.tasks {
+		switch {
+		case kind == "rebalance" && serverOps[o.Kind] && o.State.Active():
+			return &ExcludedError{Kind: kind, Other: o.Kind}
+		case serverOps[kind] && o.Kind == "rebalance" && (o.State == Pending || o.State == Running):
+			return &ExcludedError{Kind: kind, Other: "rebalance"}
+		}
+	}
 	return nil
 }

@@ -129,6 +129,10 @@ func (o *Ops) StartTask(ctx context.Context, kind, subjType, subjID string, inpu
 	}
 	t, err := eng.Submit(ctx, kind, task.Subject{Type: subjType, ID: subjID}, input, actor)
 	if err != nil {
+		var x *task.ExcludedError
+		if errors.As(err, &x) {
+			return t, x.Problem()
+		}
 		return t, err
 	}
 	o.wg.Add(1)

@@ -208,5 +208,5 @@ var recordedKinds = map[string]bool{"instance.start": true, "instance.stop": tru
 // Cancellable reports whether a cancel request is accepted for the task: it
 // is not finished and the engine runs it.
 func Cancellable(t Task) bool {
-	return (t.State == Pending || t.State == Running) && !recordedKinds[t.Kind]
+	return t.State.Active() && !recordedKinds[t.Kind]
 }

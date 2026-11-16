@@ -344,6 +344,67 @@ kingres_rotate_secret(PG_FUNCTION_ARGS)
 		conns = lappend(conns, kingres_shard_get_conn(n->host, n->port, false, NULL));
 	}
 
+	/*
+	 * A transaction that is in doubt carries a tag made with the secret of today, and
+	 * recovery resolves only the names whose tag verifies (S7-09): after the
+	 * rotation it would hold its locks for ever and be called foreign (S8-03).  So
+	 * the rotation waits for nothing and refuses while any node holds one.  Names
+	 * whose tag does not verify are somebody else's and do not count (a role could
+	 * otherwise stop rotations by preparing a transaction of that form).
+	 */
+	{
+		static const char in_doubt_sql[] =
+			"SELECT pg_catalog.count(*)::pg_catalog.text FROM pg_catalog.pg_prepared_xacts p "
+			"WHERE p.database OPERATOR(pg_catalog.=) pg_catalog.current_database() "
+			"AND p.gid LIKE 'kingres\\_h%' AND pg_catalog.length(p.gid) OPERATOR(pg_catalog.>) 17 "
+			"AND pg_catalog.right(p.gid, 16) OPERATOR(pg_catalog.=) "
+			KINGRES_SHARD_SCHEMA ".internal_gid_tag(pg_catalog.left(p.gid, pg_catalog.length(p.gid) OPERATOR(pg_catalog.-) 17))";
+		StringInfoData where;
+		int			total = 0;
+
+		initStringInfo(&where);
+		if (SPI_connect() != SPI_OK_CONNECT)
+			elog(ERROR, "SPI_connect failed");
+		if (SPI_execute(in_doubt_sql, true, 0) != SPI_OK_SELECT || SPI_processed != 1)
+			elog(ERROR, "could not look for distributed transactions in doubt");
+		{
+			int			c = atoi(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
+
+			if (c > 0)
+			{
+				total += c;
+				appendStringInfo(&where, "node %d (%d)", cat->local_node_id, c);
+			}
+		}
+		SPI_finish();
+		foreach(lc, conns)
+		{
+			KsConn	   *kc = (KsConn *) lfirst(lc);
+			PGresult   *res = kingres_shard_exec_params(kc, in_doubt_sql, 0, NULL, NULL, true);
+			int			c;
+
+			if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1)
+				ereport(ERROR,
+						(errcode(ERRCODE_CONNECTION_FAILURE),
+						 errmsg("could not look for distributed transactions in doubt on node %s:%d",
+								kc->host, kc->port)));
+			c = atoi(PQgetvalue(res, 0, 0));
+			PQclear(res);
+			if (c > 0)
+			{
+				total += c;
+				appendStringInfo(&where, "%snode %d (%d)", where.len > 0 ? ", " : "",
+								 kingres_shard_conn_node_id(kc->host, kc->port), c);
+			}
+		}
+		if (total > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("the cluster secret cannot be rotated while distributed transactions are in doubt"),
+					 errdetail("%d prepared transaction(s) of this cluster: %s.", total, where.data),
+					 errhint("Run kingres.recover_prepared_transactions() on the origin of each, wait until kingres.check_cluster() shows none, and rotate again.")));
+	}
+
 	if (!pg_strong_random(raw, sizeof(raw)))
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),

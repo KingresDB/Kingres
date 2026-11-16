@@ -361,6 +361,13 @@ Nothing was released, so these are corrections of the contract's own contradicti
 7. **`Server.status`** `decommissioning` is set while `server.remove` runs, the dashboard's `ServerCounts.decommissioning` counts it,
    and `ClusterOverview.rebalance.running` and `taskId` are set.
 
+   Review of the rebalancing work (additive, still 0.9.0): **`RebalanceReportSummary.outcome`** gains `cancelled` (a person cancelled the
+   task of a stopped or running rebalance; `stoppedBy` is `operator`; no `taskFailed` alert), `Task.cancellable` is true for a `paused`
+   task and `cancelTask` ends it at once, starting a stopped rebalance again begins a new round (attempts and skips do not carry over,
+   the options of the request replace the old ones), `maxConcurrentMoves` defaults to 1, and a rebalance and a server add, remove, leave
+   or failover are excluded atomically (409 `rebalance_in_progress`, `operation_in_progress` or `failover_in_progress` also when the other
+   task is created at the same moment). Clients must tolerate an outcome they do not know.
+
 #### Documentation
 
 The README row of the task kind `rebalance`, the step state `skipped` and the extension version in the text of the standby task are

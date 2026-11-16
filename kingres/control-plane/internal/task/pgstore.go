@@ -73,6 +73,9 @@ func (s *PGStore) Create(ctx context.Context, t Task) (Task, error) {
 		t.Kind, t.SubjectType, t.SubjectID, []byte(t.Input), prog, t.CreatedAt, t.CreatedBy)
 	out, err := scan(row)
 	var pe *pgconn.PgError
+	if x := excluded(t.Kind, err); x != nil {
+		return Task{}, x
+	}
 	if errors.As(err, &pe) && pe.Code == "23505" {
 		return Task{}, ErrSubjectBusy
 	}
@@ -230,6 +233,9 @@ func (s *PGStore) Pause(ctx context.Context, id int64, l Lease, reason string) e
 func (s *PGStore) Resume(ctx context.Context, id int64) error {
 	tag, err := s.db.Exec(ctx, `UPDATE kingres_cp.task SET state = 'pending', cancel_requested = false, updated_at = clock_timestamp()
 		WHERE id = $1 AND state = 'paused'`, id)
+	if x := excluded("rebalance", err); x != nil {
+		return x
+	}
 	if err != nil {
 		return err
 	}

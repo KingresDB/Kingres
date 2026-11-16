@@ -54,6 +54,7 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "postmaster/postmaster.h"
+#include "replication/syncrep.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -63,6 +64,7 @@
 #include "kingres_shard.h"
 #include "node_admin.h"
 #include "node_conn.h"
+#include "ha.h"
 #include "recovery.h"
 
 PG_FUNCTION_INFO_V1(kingres_promote_node);
@@ -87,6 +89,17 @@ spi_exec_ok(const char *sql, int expected, int nargs, Oid *argtypes, Datum *valu
 		ret = SPI_execute_with_args(sql, nargs, argtypes, values, NULL, false, 0);
 	if (ret != expected)
 		elog(ERROR, "SPI command failed (%d): %s", ret, sql);
+}
+
+/*
+ * How long a node gets to confirm a record to its synchronous standbys before
+ * it counts as unable to commit (S8-02): node_timeout, at most five seconds,
+ * and shorter than the bounded wait of the call that asks.
+ */
+static int
+probe_timeout_ms(void)
+{
+	return kingres_shard_node_timeout >= 2 ? Min(kingres_shard_node_timeout, 5) * 1000 - 1000 : 500;
 }
 
 /*
@@ -144,15 +157,53 @@ check_target_node(const KsNode *tgt)
 	else
 		libver = pstrdup(PQgetvalue(res, 0, 0));
 	PQclear(res);
-	PQfinish(conn);
 
 	if (strcmp(extver, KINGRES_SHARD_EXT_VERSION) != 0 || strcmp(libver, KINGRES_VERSION) != 0)
+	{
+		PQfinish(conn);
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("node %d (%s:%d) runs kingres_shard %s with library %s, this node runs %s with library %s",
 						tgt->node_id, tgt->host, tgt->port, extver, libver,
 						KINGRES_SHARD_EXT_VERSION, KINGRES_VERSION),
 				 errhint("A promoted standby must run the same library as the rest of the cluster; install it on the standby before promoting it.")));
+	}
+
+	/*
+	 * The node must be able to commit: a standby copies the synchronous_standby_names
+	 * of the primary it was made from, which may name a standby that does not exist
+	 * any more (S8-02), and the node's part of the transaction below would wait
+	 * for ever.
+	 */
+	{
+		char		sql[160];
+
+		snprintf(sql, sizeof(sql), "SELECT " KINGRES_SHARD_SCHEMA ".internal_sync_probe(%d)",
+				 probe_timeout_ms());
+		res = kingres_shard_bounded_exec(conn, sql, true);
+		if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1)
+		{
+			PQclear(res);
+			PQfinish(conn);
+			ereport(ERROR,
+					(errcode(ERRCODE_CONNECTION_FAILURE),
+					 errmsg("could not ask node %d (%s:%d) whether it can commit",
+							tgt->node_id, tgt->host, tgt->port)));
+		}
+		if (strcmp(PQgetvalue(res, 0, 0), "t") != 0)
+		{
+			PQclear(res);
+			PQfinish(conn);
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("node %d (%s:%d) cannot commit: its synchronous standbys do not confirm",
+							tgt->node_id, tgt->host, tgt->port),
+					 errdetail("The node has the synchronous_standby_names of the primary it was copied from, which names standbys that are not connected to it."),
+					 errhint("On that node set synchronous_standby_names to the standbys that exist (or to an empty string) and reload the configuration; then call kingres.promote_node() again.  Nothing was changed.")));
+		}
+		PQclear(res);
+	}
+	PQfinish(conn);
 }
 
 /*
@@ -219,8 +270,10 @@ promotion_complete(const KsCatalog *cat, const KsNode *tgt, bool map_case, List 
 		KsConn	   *kc;
 		PromoState	st;
 		bool		is_self = map_case ? (n->node_id == tgt->node_id) : (n->node_id == cat->local_node_id);
+		/* The other nodes of the group: the old primary among them (S8-05). */
+		bool		peer = (n->group_id == tgt->group_id && !n->is_primary && n->node_id != tgt->node_id);
 
-		if (is_self || !n->is_active || !(n->is_primary || n->node_id == tgt->node_id))
+		if (is_self || !n->is_active || !(n->is_primary || n->node_id == tgt->node_id || peer))
 			continue;
 		kc = kingres_shard_get_conn(n->host, n->port, true, &err);
 		if (kc == NULL || !read_state(kc, &st))
@@ -228,6 +281,15 @@ promotion_complete(const KsCatalog *cat, const KsNode *tgt, bool map_case, List 
 			if (n->node_id == tgt->node_id)
 				return false;
 			*unreached = lappend_int(*unreached, n->node_id);
+			continue;
+		}
+		if (peer)
+		{
+			/* A standby follows its primary by itself; one that is out of recovery is an old primary that must be told. */
+			if (st.in_recovery)
+				continue;
+			if (st.term != cat->term || st.version != cat->map_version)
+				return false;
 			continue;
 		}
 		if (st.in_recovery || st.pending > 0 || st.term != cat->term || st.version != cat->map_version)
@@ -238,6 +300,12 @@ promotion_complete(const KsCatalog *cat, const KsNode *tgt, bool map_case, List 
 	return true;
 }
 
+static int
+node_id_cmp(const ListCell *a, const ListCell *b)
+{
+	return lfirst_int(a) - lfirst_int(b);
+}
+
 static char *
 unreached_json(List *unreached)
 {
@@ -245,6 +313,8 @@ unreached_json(List *unreached)
 	ListCell   *lc;
 	bool		first = true;
 
+	/* In node id order, so that the answer does not depend on how the catalog was read. */
+	list_sort(unreached, node_id_cmp);
 	initStringInfo(&buf);
 	appendStringInfoChar(&buf, '[');
 	foreach(lc, unreached)
@@ -260,8 +330,8 @@ static Datum
 promote_result(const char *status, int64 term, List *unreached)
 {
 	char	   *list = unreached_json(unreached);
-	char	   *doc = psprintf("{\"status\": \"%s\", \"term\": " INT64_FORMAT ", \"unreached\": %s}",
-							   status, term, list);
+	char	   *doc = psprintf("{\"status\": \"%s\", \"term\": " INT64_FORMAT ", \"final\": %s, \"unreached\": %s}",
+							   status, term, strcmp(status, "already") == 0 ? "true" : "false", list);
 
 	return DirectFunctionCall1(jsonb_in, CStringGetDatum(doc));
 }
@@ -369,6 +439,21 @@ kingres_promote_node(PG_FUNCTION_ARGS)
 	}
 
 	/*
+	 * This node commits the catalog change, and its commit waits for its own
+	 * synchronous standbys: when it cannot be confirmed (the list names nobody that
+	 * is alive, which a promoted standby inherits from its old primary) the
+	 * call would hang, or end with the second phase deferred and an answer that
+	 * says "promoted" (S8-02).  Refuse before anything is changed.
+	 */
+	if (!kingres_shard_probe_sync(probe_timeout_ms()))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("this node cannot commit: its synchronous standbys do not confirm"),
+				 errdetail("synchronous_standby_names is \"%s\", and no standby confirmed a new WAL record within %d ms.",
+						   SyncRepStandbyNames ? SyncRepStandbyNames : "", probe_timeout_ms()),
+				 errhint("Set synchronous_standby_names on this node to the standbys that exist (or to an empty string), reload the configuration, and call kingres.promote_node() again.  Nothing was changed.")));
+
+	/*
 	 * What the old primary of the group left prepared (a switch of a bucket move that
 	 * was decided, a catalog change of the map group) holds row locks on the catalog
 	 * tables that are written below, on the promoted node and, when the group is the
@@ -408,7 +493,7 @@ kingres_promote_node(PG_FUNCTION_ARGS)
 	 * cannot be reached is skipped (S7-04), except the promoted node.
 	 */
 	local_id = map_case ? target_id : cat->local_node_id;
-	reached_groups = 1;
+	reached_groups = 0;
 	foreach(lc, cat->nodes)
 	{
 		KsNode	   *n = (KsNode *) lfirst(lc);
@@ -418,7 +503,37 @@ kingres_promote_node(PG_FUNCTION_ARGS)
 		if (n->node_id == local_id || !n->is_active)
 			continue;
 		if (!(n->is_primary || n->node_id == target_id))
+		{
+			/*
+			 * The other nodes of the group (S8-05).  One that cannot be reached is
+			 * listed, as the old primary is when the first call does not reach it.
+			 * One that is out of recovery is an old primary that holds the old catalog
+			 * (a repeated call finds it back): it is told like the others.  A
+			 * standby follows its primary by itself and is left alone.  The old
+			 * primary of this very call is a primary still and is handled below.
+			 */
+			PromoState	pst;
+			KsConn	   *pkc;
+
+			if (n->group_id != tgt_group)
+				continue;
+			pkc = kingres_shard_get_conn(n->host, n->port, true, &err);
+			if (pkc == NULL || !read_state(pkc, &pst))
+			{
+				unreached = lappend_int(unreached, n->node_id);
+				continue;
+			}
+			if (pst.in_recovery || (resume && pst.term == cat->term && pst.version == cat->map_version))
+				continue;
+			p = palloc0(sizeof(Participant));
+			p->node_id = n->node_id;
+			p->host = pstrdup(n->host);
+			p->port = n->port;
+			p->kc = pkc;
+			kingres_shard_begin_write_xact(p->kc);
+			parts = lappend(parts, p);
 			continue;
+		}
 		p = palloc0(sizeof(Participant));
 		p->node_id = n->node_id;
 		p->host = pstrdup(n->host);
@@ -455,17 +570,40 @@ kingres_promote_node(PG_FUNCTION_ARGS)
 
 	/*
 	 * The map group is promoted by the node that is promoted, which cannot know
-	 * whether the old primary is alive on the other side of a partition: it
-	 * proceeds only when it can reach a majority of the groups (itself for its
-	 * own).  A minority changes nothing; the nodes it cannot reach are not
-	 * affected.
+	 * whether the old primary is alive on the other side of a partition.  The rule
+	 * that keeps two sides of a partition from both promoting it (S8-04): the
+	 * electorate is the groups other than the map group (the map group is the
+	 * one that is being replaced, and it is on both sides of the partition: its old
+	 * primary on one, its standby on the other), and the promoting node must reach
+	 * the primary of a strict majority of them.  Two sides cannot both reach more
+	 * than half of the same electorate; an even number splits into two halves
+	 * and neither side promotes (a tie is not a majority).  A cluster with no group
+	 * but the map group has no electorate, and its standby can be promoted; a
+	 * cluster of two groups needs the other group to be reachable.  What the rule
+	 * does not do is stop the old primary from taking writes: that is fencing, which
+	 * the control plane does before it calls this function.
 	 */
-	if (map_case && reached_groups * 2 <= cat->ngroups)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("only %d of the %d shard groups can be reached from this node; the map group cannot be promoted from a minority",
-						reached_groups, cat->ngroups),
-				 errhint("Promote it from a node that can reach more than half of the groups, or bring the unreachable nodes back first.")));
+	if (map_case)
+	{
+		List	   *electorate = NIL;
+		int			nelectors;
+
+		foreach(lc, cat->nodes)
+		{
+			const KsNode *n = (const KsNode *) lfirst(lc);
+
+			if (n->is_active && n->group_id != KINGRES_SHARD_MAP_GROUP &&
+				!list_member_int(electorate, n->group_id))
+				electorate = lappend_int(electorate, n->group_id);
+		}
+		nelectors = list_length(electorate);
+		if (nelectors > 0 && reached_groups * 2 <= nelectors)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("only %d of the %d other shard groups can be reached from this node; the map group cannot be promoted from a minority of them",
+							reached_groups, nelectors),
+					 errhint("Promote it from a node that can reach more than half of the groups other than the map group, or bring the unreachable nodes back first.  The old primary of the map group must be fenced before this call.")));
+	}
 
 	kingres_shard_fault_point("promote_after_sessions");
 	kingres_shard_fault_point("promote_before_change");

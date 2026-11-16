@@ -55,6 +55,8 @@ typedef struct KsConn
 	/* two-phase commit state of the current local transaction */
 	bool		wrote;			/* the remote transaction has written */
 	bool		prepared;		/* PREPARE TRANSACTION succeeded; gid is valid */
+	/* COMMIT PREPARED was acknowledged and the durability question is not answered yet (S8-01) */
+	bool		commit_sent;
 	char		gid[KS_GID_LEN];
 	/* the session runs with synchronous_commit raised to at least "on" (S7-07) */
 	bool		sync_forced;

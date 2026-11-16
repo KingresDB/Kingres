@@ -1708,6 +1708,34 @@ SELECT COALESCE(
     pg_catalog.jsonb_build_object('missing', true));
 $$;
 
+-- On the target: the prefixes of the table-sync slots of the tables whose copy is finished
+-- (state "f") and that wait for their worker to hand over.  Such a worker needs its slot on the
+-- source.  A table-sync worker drops its slot and only then records that it is done; a target
+-- that stops between the two (a crash) restarts a worker that asks for a slot that is not there,
+-- and no error counter of the subscription counts it (S8, t/074).
+CREATE FUNCTION kingres.internal_move_sync_prefixes(p_name text)
+    RETURNS jsonb
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.format('pg_%s_sync_%s_', s.oid, r.srrelid)), '[]'::pg_catalog.jsonb)
+  FROM pg_catalog.pg_subscription s
+  JOIN pg_catalog.pg_subscription_rel r ON r.srsubid OPERATOR(pg_catalog.=) s.oid
+ WHERE s.subname OPERATOR(pg_catalog.=) p_name AND r.srsubstate OPERATOR(pg_catalog.=) 'f';
+$$;
+
+-- On the source: how many of those prefixes have no slot.
+CREATE FUNCTION kingres.internal_move_slots_missing(p_prefixes jsonb)
+    RETURNS int
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+SELECT pg_catalog.count(*)::pg_catalog.int4
+  FROM pg_catalog.jsonb_array_elements_text(p_prefixes) AS p(prefix)
+ WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_replication_slots sl
+                    WHERE pg_catalog.starts_with(sl.slot_name, p.prefix));
+$$;
+
 -- On the source: the lag of the slot behind the WAL, in bytes, or NULL.
 CREATE FUNCTION kingres.internal_move_slot_lag(p_name text)
     RETURNS bigint
@@ -2167,6 +2195,8 @@ DECLARE
     v_name     pg_catalog.text;
     v_stage    pg_catalog.int4 := 0;	-- 1: recorded, 2: switching, 3: switched
     v_thr      pg_catalog.int8;
+    v_stall    pg_catalog.timestamptz;
+    v_prefixes pg_catalog.jsonb;
     v_sw_ms    pg_catalog.int4;
     v_delay    pg_catalog.int4;
     v_nt       pg_catalog.int4;
@@ -2332,6 +2362,23 @@ BEGIN
                     -- leave it waiting for a copy that cannot finish (the other branch talks to the
                     -- source at every round, this one did not).
                     PERFORM kingres.internal_exec_scalar(v_src, 'SELECT 1');
+                    -- A table whose copy is finished and whose slot is gone from the source can
+                    -- never finish: fail the move (it is undone) once that has lasted long enough
+                    -- for a worker that is dropping its slot in the ordinary way to be done.
+                    v_prefixes := kingres.internal_exec_scalar(v_tgt, pg_catalog.format(
+                                      'SELECT kingres.internal_move_sync_prefixes(%L)::pg_catalog.text', v_name))::pg_catalog.jsonb;
+                    IF v_prefixes <> '[]'::pg_catalog.jsonb
+                       AND kingres.internal_exec_scalar(v_src, pg_catalog.format(
+                               'SELECT kingres.internal_move_slots_missing(%L::pg_catalog.jsonb)', v_prefixes::pg_catalog.text))::pg_catalog.int4 > 0 THEN
+                        v_stall := COALESCE(v_stall, pg_catalog.clock_timestamp());
+                        IF pg_catalog.clock_timestamp() OPERATOR(pg_catalog.-) v_stall > pg_catalog.make_interval(secs => GREATEST(10, v_node_ms / 500)) THEN
+                            RAISE EXCEPTION 'the table synchronization of bucket % on node % lost its replication slot on node %', v_bucket, v_tgt, v_src
+                                USING ERRCODE = 'object_not_in_prerequisite_state',
+                                      HINT = 'The target stopped while a table synchronization worker was finishing; the move is undone and can be repeated.';
+                        END IF;
+                    ELSE
+                        v_stall := NULL;
+                    END IF;
                     v_now := pg_catalog.format('copying: %s of %s tables ready', v_st ->> 'ready', v_st ->> 'tables');
                 END IF;
                 IF v_now IS DISTINCT FROM v_last AND v_attempts OPERATOR(pg_catalog.=) 0 THEN
@@ -3025,6 +3072,8 @@ REVOKE ALL ON FUNCTION
     kingres.internal_create_move_subscription(text, text, int),
     kingres.internal_move_subscription_status(text),
     kingres.internal_move_slot_lag(text),
+    kingres.internal_move_sync_prefixes(text),
+    kingres.internal_move_slots_missing(jsonb),
     kingres.internal_drop_move_publication(bigint, oid),
     kingres.internal_drop_orphans(bigint),
     kingres.internal_marker_seen(bigint, bigint),
@@ -4212,7 +4261,7 @@ BEGIN
                   WHERE p.class OPERATOR(pg_catalog.=) 'forged' ORDER BY p.gid
         LOOP
             check_name := 'foreign_prepared_transaction'; node_id := n.node_id; object := x.gid;
-            detail := 'a prepared transaction with the name of one of ours that does not carry a valid tag; it was not made by a node of this cluster and recovery leaves it alone';
+            detail := 'a prepared transaction with the name of one of ours that does not carry a valid tag: either no node of this cluster made it, or it was prepared in the moments around a kingres.rotate_secret() (which refuses while transactions are in doubt, but cannot stop one that prepares at that instant); recovery leaves it alone. If it is the cluster''s own, resolve it by hand on this node: COMMIT PREPARED if its gid has a row in kingres.dtx_log on the origin, ROLLBACK PREPARED if it has none';
             RETURN NEXT;
         END LOOP;
     END LOOP;
@@ -4770,7 +4819,7 @@ REVOKE ALL ON FUNCTION kingres.internal_gid_tag(text), kingres.internal_gid_clas
 -- transaction just before its PREPARE (so a row is there exactly when the part
 -- is committed, and a standby that lost the commit does not have it).  The origin
 -- looks here when the primary of a participant group changed (src/recovery.c).
--- Recovery removes the rows after a day.
+-- Recovery removes them after kingres_shard.decision_retention seconds and a minute.
 CREATE TABLE kingres.dtx_applied (
     gid        text        NOT NULL,
     applied_at timestamptz NOT NULL,
@@ -4780,6 +4829,10 @@ CREATE TABLE kingres.dtx_applied (
 COMMENT ON TABLE kingres.dtx_applied IS
     'Node-local: distributed transactions this node prepared a part of, written in that part; the origin compares it after a failover of this group';
 
+-- The cleanup looks for the rows that are older than decision_retention (plus a minute): an index keeps
+-- it from reading the whole table on every pass of the recovery worker (S8-06).
+CREATE INDEX dtx_applied_applied_at_idx ON kingres.dtx_applied (applied_at);
+
 CREATE FUNCTION kingres.internal_dtx_applied(gid text)
     RETURNS void
     AS 'MODULE_PATHNAME', 'kingres_internal_dtx_applied'
@@ -4788,6 +4841,26 @@ CREATE FUNCTION kingres.internal_dtx_applied(gid text)
 
 -- Executable by every role on purpose: the remote transaction of a participant runs as the role of the
 -- user whose statement it is.  The function itself refuses everyone but a node session and a superuser.
+
+-- Does the synchronous standby of this node confirm everything that the node has flushed so far, as its
+-- own configuration requires?  The origin of a distributed transaction asks it of a participant right after
+-- the participant's PREPARE TRANSACTION and COMMIT PREPARED, whose wait for the standby can end early
+-- (cancel, termination, shutdown) with a warning that the origin cannot see (S8-01).  Answers false after
+-- timeout_ms milliseconds.  Executable by every role, like internal_dtx_applied, for the same reason.
+CREATE FUNCTION kingres.internal_sync_confirm(timeout_ms integer)
+    RETURNS boolean
+    AS 'MODULE_PATHNAME', 'kingres_internal_sync_confirm'
+    LANGUAGE C STRICT
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+-- Can this node commit at all?  Writes a record and waits for its synchronous standbys to confirm it;
+-- promote_node() asks it of a node before it changes anything (S8-02).  Superusers and node sessions only.
+CREATE FUNCTION kingres.internal_sync_probe(timeout_ms integer)
+    RETURNS boolean
+    AS 'MODULE_PATHNAME', 'kingres_internal_sync_probe'
+    LANGUAGE C STRICT
+    SET search_path = pg_catalog, kingres, pg_temp;
+REVOKE ALL ON FUNCTION kingres.internal_sync_probe(integer) FROM PUBLIC;
 
 -- A node that leaves the cluster forgets its catalog term as well: it may join
 -- another cluster, whose term is lower than the one it had.

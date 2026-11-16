@@ -52,11 +52,22 @@ const placement = computed(() => {
   if (ended) for (const v of rows.values()) if (v.after === null) v.after = 0
   return [...rows.values()]
 })
-const OUTCOME = {
+const OUTCOME: Record<string, { icon: string; cls: string; label: string }> = {
   done: { icon: '✓', cls: 'tone-ok', label: 'Done' },
   failed: { icon: '✖', cls: 'tone-danger', label: 'Failed' },
   skipped: { icon: '○', cls: 'tone-neutral', label: 'Skipped' },
-} as const
+}
+/** An outcome a newer server sends is shown as it is, not as a crash (clients tolerate unknown values). */
+function outcomeOf(o: string): { icon: string; cls: string; label: string } {
+  return OUTCOME[o] ?? { icon: '?', cls: 'tone-neutral', label: o }
+}
+/** How the run ended, in words. */
+const RUN_OUTCOME: Record<string, string> = {
+  completed: 'completed',
+  stopped: 'stopped',
+  failed: 'failed',
+  cancelled: 'cancelled by an operator',
+}
 </script>
 
 <template>
@@ -69,7 +80,9 @@ const OUTCOME = {
       <template v-if="report.data.value">
         <dl class="kv">
           <dt>Outcome</dt>
-          <dd>{{ report.data.value.outcome }}</dd>
+          <dd data-testid="report-outcome">
+            {{ RUN_OUTCOME[report.data.value.outcome] ?? report.data.value.outcome }}
+          </dd>
           <dt>Started</dt>
           <dd>{{ formatDateTime(report.data.value.startedAt) }}</dd>
           <dt>Finished</dt>
@@ -139,8 +152,8 @@ const OUTCOME = {
             </thead>
             <tbody>
               <tr
-                v-for="m in report.data.value.moves"
-                :key="`${m.databaseName}-${m.colocationId}-${m.bucket}`"
+                v-for="(m, i) in report.data.value.moves"
+                :key="`${i}-${m.databaseName}-${m.colocationId}-${m.bucket}`"
               >
                 <td><SafeName :value="m.databaseName" :max="60" /></td>
                 <td class="num">{{ m.bucket }}</td>
@@ -158,9 +171,9 @@ const OUTCOME = {
                   <NullableValue :value="m.durationSeconds" :format="formatDuration" />
                 </td>
                 <td>
-                  <span class="badge" :class="OUTCOME[m.outcome].cls"
-                    ><span aria-hidden="true">{{ OUTCOME[m.outcome].icon }}</span>
-                    {{ OUTCOME[m.outcome].label }}</span
+                  <span class="badge" :class="outcomeOf(m.outcome).cls"
+                    ><span aria-hidden="true">{{ outcomeOf(m.outcome).icon }}</span>
+                    {{ outcomeOf(m.outcome).label }}</span
                   >
                   <span v-if="m.skipReason" class="muted" data-testid="skip-reason">
                     ({{ SKIP_REASON[m.skipReason] ?? m.skipReason }})</span
