@@ -54,6 +54,9 @@ CREATE EXTENSION xid_wraparound;
 CREATE TABLE c (a int, t text) USING columnar;
 INSERT INTO c SELECT g, 'x' || g FROM generate_series(1, 2000) g;
 CREATE TABLE h (a int);
+CREATE TABLE c0 (a int);
+INSERT INTO c0 SELECT generate_series(1, 100);
+ALTER TABLE c0 SET ACCESS METHOD columnar;
 });
 my $x = $node->safe_psql('postgres',
 	q{SELECT xmin::text::bigint FROM pg_class WHERE relname = 'c'});
@@ -120,6 +123,14 @@ foreach my $lap (1, 2)
 	{
 		is($node->safe_psql('postgres', q{SELECT kingres.columnar_creating_xid('c')::text::bigint}),
 			'2', "lap $lap: the id in the metapage is frozen");
+		# the table's creation is a second id in the metapage: frozen the same way,
+		# so it cannot name the transaction that holds its number either
+		is($node->safe_psql('postgres', q{SELECT kingres.columnar_table_xid('c')::text::bigint}),
+			'2', "lap $lap: the table's creation in the metapage is frozen too");
+		is($node->safe_psql('postgres', q{SELECT kingres.columnar_table_xid('c0')::text::bigint}),
+			'0', "lap $lap: a creation that was never known stays 0, and is no id that can alias");
+		is($node->safe_psql('postgres', q{SELECT count(*) FROM c0}), 100,
+			"lap $lap: the converted table reads");
 	}
 	$node->safe_psql('postgres', 'VACUUM c');
 	is($node->safe_psql('postgres', 'SELECT count(*) FROM c'), 2000 + $lap,

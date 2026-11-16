@@ -401,13 +401,22 @@ kc_finish_bulk_insert(Relation rel, KcInsertOptions options)
  *
  *	 - a table made now: this transaction;
  *	 - TRUNCATE: the old file's (the caller passes it);
- *	 - a rewrite (ALTER TABLE, VACUUM FULL, SET ACCESS METHOD): PostgreSQL makes
- *	   a transient table named "pg_temp_<oid of the table>" in the table's
- *	   schema, holds the table locked exclusively, and swaps the files in
- *	   afterwards.  A columnar table gives its own creation; any other table gives
- *	   the transaction that wrote its pg_class row, which is its creation unless
- *	   it was altered since (then later, and a snapshot between the two is told
- *	   the table is empty, as heap tells it after a rewrite).
+ *	 - a rewrite (ALTER TABLE, VACUUM FULL, SET ACCESS METHOD, REFRESH
+ *	   MATERIALIZED VIEW): PostgreSQL makes a transient table named
+ *	   "pg_temp_<oid of the table>" in the table's schema, holds the table
+ *	   locked exclusively, and swaps the files in afterwards.  A columnar table
+ *	   gives its own creation (and its file's rows are removed, once the swap
+ *	   is done: kc_write_note_replaced).  A table of another access method
+ *	   gives its creation only when that is known for certain: it was made in
+ *	   this transaction, or it has no storage at all, so that no snapshot can
+ *	   have seen content of it that the rewrite takes away.  The transaction
+ *	   that wrote its pg_class row is no evidence: any GRANT, new owner or
+ *	   storage option writes the row again, later than the creation, and a
+ *	   snapshot between the two would then be told the table was empty while it
+ *	   held rows.  Otherwise the creation is left unknown (InvalidTransactionId)
+ *	   and the reader asks the catalog what the snapshot saw
+ *	   (kc_check_snapshot_age), which gives the rows or the error, never a
+ *	   guess.
  *
  * The name is only a hint, checked against the lock and the schema, so a
  * table that a user names like that gets the creation of an unrelated table at
@@ -444,10 +453,20 @@ kc_table_creation_xid(Relation rel)
 		Relation	old = relation_open((Oid) oid, NoLock);
 
 		xid = kc_rel_ident(old)->table_xid;
+		kc_write_note_replaced(old);
 		relation_close(old, NoLock);
 	}
 	else
-		xid = HeapTupleHeaderGetXmin(tup->t_data);
+	{
+		Relation	old = relation_open((Oid) oid, NoLock);
+
+		if (old->rd_createSubid != InvalidSubTransactionId ||
+			table_relation_size(old, MAIN_FORKNUM) == 0)
+			xid = GetCurrentTransactionId();
+		else
+			xid = InvalidTransactionId;
+		relation_close(old, NoLock);
+	}
 	ReleaseSysCache(tup);
 	return xid;
 }
@@ -579,7 +598,14 @@ kc_relation_copy_for_cluster(KC_COPY_FOR_CLUSTER_PARAMS)
 	kc_meta_set_options(NewTable, &opts);
 	if (keep_visibility)
 		kc_write_set_frozen(NewTable, true);
-	kc_write_request_reconcile();
+
+	/*
+	 * The stripe rows of the old file are removed when the transaction
+	 * commits (kc_write_cleanup_replaced).  The old table was noted when the
+	 * transient table got its file (kc_table_creation_xid); noting it again
+	 * costs nothing and does not depend on the name of the transient table.
+	 */
+	kc_write_note_replaced(OldTable);
 
 	scan = kc_scan_begin(OldTable, NULL, NULL, NULL, 0);
 	slot = table_slot_create(OldTable, NULL);

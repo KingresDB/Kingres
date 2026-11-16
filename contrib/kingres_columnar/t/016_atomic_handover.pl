@@ -10,6 +10,13 @@
 # no longer fails, so each allocation and each relation in turn is the one
 # that fails, whatever order the relations are visited in.
 #
+# For the point "alloc" the fault is armed by the last statement of the block
+# whose end is the hand-over (arm_in_block), so that every allocation it counts
+# is one of the hand-over: those of the INSERTs before it are not counted (C5-07:
+# the failing allocation was often one of the INSERTs, and the case then said
+# nothing about the hand-over).  A control arms the same fault where no
+# subtransaction ends and sees that nothing fails.
+#
 # Cases: the commit of a subtransaction that wrote several relations (the
 # defect: the relations merged before the failing one stayed in the parent
 # and were committed); the same with the parent's buffer so full that the
@@ -63,10 +70,24 @@ sub fresh
 	my $sql = '';
 	foreach my $t (@T)
 	{
-		$sql .= "DROP TABLE IF EXISTS $t; CREATE TABLE $t (a int) USING columnar;
+		$sql .= "DROP TABLE IF EXISTS $t; CREATE TABLE $t (a int, t text) USING columnar;
 			SELECT kingres.columnar_set_options('$t', stripe_row_count => $stripe_rows, chunk_row_count => 100);";
 	}
 	$node->safe_psql('postgres', $sql);
+}
+
+# SQL that arms the fault: at once, or (for the allocations of the hand-over
+# alone) by the last statement of the block that is about to end
+sub arm_before
+{
+	my ($point, $n) = @_;
+	return "SET kingres_columnar.fault_point = '$point'; SET kingres_columnar.fault_nth = $n;";
+}
+
+sub arm_in_block
+{
+	my ($point, $n) = @_;
+	return "PERFORM set_config('kingres_columnar.fault_point', '$point', false); PERFORM set_config('kingres_columnar.fault_nth', '$n', false);";
 }
 
 # "n1,n2,..." of the row counts, and of the distinct values
@@ -97,13 +118,13 @@ foreach my $point (qw(merge alloc))
 	for (my $n = 1; $n <= 120; $n++)
 	{
 		fresh(100000);
-		my $inserts = join(' ', map { "INSERT INTO $_ VALUES (1);" } @T);
+		my $inserts = join(' ', map { "INSERT INTO $_ VALUES (1, repeat('v', 40));" } @T);
+		my $in_block = $point eq 'alloc';
 		my ($out, $err) = script("
 BEGIN;
-" . join(' ', map { "INSERT INTO $_ VALUES (0);" } @T) . "
-SET kingres_columnar.fault_point = '$point';
-SET kingres_columnar.fault_nth = $n;
-DO \$\$ BEGIN BEGIN $inserts
+" . join(' ', map { "INSERT INTO $_ VALUES (0, repeat('v', 40));" } @T) . "
+" . ($in_block ? '' : arm_before($point, $n)) . "
+DO \$\$ BEGIN BEGIN $inserts " . ($in_block ? arm_in_block($point, $n) : '') . "
 EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'CAUGHT: %', sqlerrm; END; END \$\$;
 SET kingres_columnar.fault_point = 'off';
 COMMIT;");
@@ -126,6 +147,21 @@ COMMIT;");
 	check_clean("hand-over, $point");
 }
 
+# the control: the fault armed the same way where no subtransaction ends counts
+# no allocation, so the failures above were made by the hand-over
+foreach my $n (1 .. 3)
+{
+	fresh(100000);
+	my ($out, $err) = script("
+BEGIN;
+" . join(' ', map { "INSERT INTO $_ VALUES (0, repeat('v', 40));" } @T) . "
+DO \$\$ BEGIN " . arm_in_block('alloc', $n) . " END \$\$;
+SET kingres_columnar.fault_point = 'off';
+COMMIT;");
+	unlike($err, qr/out of memory/, "control #$n: no allocation is counted outside the hand-over");
+	is((counts())[0], '1,1,1,1,1', "control #$n: the rows are committed");
+}
+
 # ------------------------------------------------------------------------
 # Part 2: the parent's buffer is a stripe, so the commit of the child writes
 # it: 999 rows of the parent in each of three relations, the child adds 3
@@ -137,12 +173,13 @@ foreach my $point (qw(flush merge alloc))
 	for (my $n = 1; $n <= 200; $n++)
 	{
 		fresh(1000);
+		my $in_block = $point eq 'alloc';
 		my ($out, $err) = script("
 BEGIN;
-" . join(' ', map { "INSERT INTO $_ SELECT generate_series(1, 999);" } @T[0..2]) . "
-SET kingres_columnar.fault_point = '$point';
-SET kingres_columnar.fault_nth = $n;
-DO \$\$ BEGIN BEGIN " . join(' ', map { "INSERT INTO $_ SELECT generate_series(1000, 1002);" } @T[0..2]) . "
+" . join(' ', map { "INSERT INTO $_ SELECT g, 'v' FROM generate_series(1, 999) g;" } @T[0..2]) . "
+" . ($in_block ? '' : arm_before($point, $n)) . "
+DO \$\$ BEGIN BEGIN " . join(' ', map { "INSERT INTO $_ SELECT g, 'w' FROM generate_series(1000, 1002) g;" } @T[0..2]) .
+	($in_block ? ' ' . arm_in_block($point, $n) : '') . "
 EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'CAUGHT: %', sqlerrm; END; END \$\$;
 SET kingres_columnar.fault_point = 'off';
 COMMIT;");

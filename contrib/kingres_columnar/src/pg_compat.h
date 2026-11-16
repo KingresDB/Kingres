@@ -14,7 +14,8 @@
  *	 - 19 adds a "flags" argument to index_fetch_begin;
  *	 - 19 adds a Snapshot argument to relation_copy_for_cluster;
  *	 - 19 drops the OldestXmin argument of scan_analyze_next_tuple;
- *	 - 19 makes the VacuumParams argument of relation_vacuum const.
+ *	 - 19 makes the VacuumParams argument of relation_vacuum const;
+ *	 - 19 gives heap_delete an "options" argument in place of changingPart.
  *
  * Portions Copyright (c) 2026, RooyeKhat Media Co
  * SPDX-License-Identifier: AGPL-3.0-only
@@ -58,6 +59,10 @@ typedef uint32 KcInsertOptions;
 	table_beginscan((rel), (snap), 0, NULL, SO_NONE)
 #define KC_REPORT_VACUUM(rel, live, dead, start) \
 	pgstat_report_vacuum((rel), (live), (dead), (start))
+/* delete a row of a heap relation: wait for a deleter in progress or not */
+#define KC_HEAP_DELETE(rel, tid, wait, tmfd) \
+	heap_delete((rel), (tid), GetCurrentCommandId(true), 0, InvalidSnapshot, \
+				(wait), (tmfd))
 
 #else							/* PostgreSQL 18 */
 
@@ -86,6 +91,11 @@ typedef int KcInsertOptions;
 #define KC_REPORT_VACUUM(rel, live, dead, start) \
 	pgstat_report_vacuum(RelationGetRelid(rel), (rel)->rd_rel->relisshared, \
 						 (live), (dead), (start))
+
+/* delete a row of a heap relation: wait for a deleter in progress or not */
+#define KC_HEAP_DELETE(rel, tid, wait, tmfd) \
+	heap_delete((rel), (tid), GetCurrentCommandId(true), InvalidSnapshot, \
+				(wait), (tmfd), false)
 
 #endif
 

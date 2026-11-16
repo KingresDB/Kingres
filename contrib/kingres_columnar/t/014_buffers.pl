@@ -126,7 +126,11 @@ EXPLAIN (COSTS OFF) SELECT 1/(a-a) FROM pn;");
 }
 
 # A healthy cursor keeps its hold across a caught error of another statement:
-# its rows are not flushed from under it, none is lost or repeated.
+# the rows it reads are not flushed from under it, none is lost or repeated.  The
+# rows written after it began are not its concern: they go to a buffer of their
+# own and become stripes while it is open (C5-01: a cursor on a table must not
+# turn the memory allowance off for the rows that follow), and when it is closed
+# the buffers are joined again for the last flush.
 {
 	fresh_table(1000);
 	my ($out) = script("
@@ -142,8 +146,8 @@ CLOSE cur;
 INSERT INTO pn SELECT generate_series(3001, 5000);
 SELECT 'CLOSED_STRIPES=' || count(*) FROM kingres.columnar_stripes('pn');
 COMMIT;");
-	like($out, qr/OPEN_STRIPES=0\b/, 'a healthy cursor holds the buffers across the caught error');
-	like($out, qr/CLOSED_STRIPES=5\b/, 'and gives them back when it is closed');
+	like($out, qr/OPEN_STRIPES=2\b/, 'a healthy cursor holds the buffer it reads; the rows written after it began are written');
+	like($out, qr/CLOSED_STRIPES=4\b/, 'and when it is closed the next full stripes are written as usual');
 	is($node->safe_psql('postgres', 'SELECT count(*), sum(a) FROM pn'),
 		'5000|12502500', 'every row is there once');
 }

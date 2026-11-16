@@ -83,6 +83,9 @@ tests += {
       't/018_maintenance_snapshots.pl',
       't/019_table_age.pl',
       't/020_limits_flags_check.pl',
+      't/021_table_creation.pl',
+      't/022_handover_window.pl',
+      't/023_rewrite_cleanup.pl',
     ],
   },
 }
