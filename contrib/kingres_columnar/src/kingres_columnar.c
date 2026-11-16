@@ -60,6 +60,7 @@ bool		kc_rmgr_registered = false;
 int			kc_guc_compression = KC_CODEC_AUTO;
 int			kc_guc_compression_level = 3;
 int			kc_guc_stripe_rows = 150000;
+int			kc_guc_max_stripe_rows = KC_MAX_STRIPE_ROWS;
 int			kc_guc_chunk_rows = 10000;
 int			kc_guc_write_buffer_kb = 131072;
 bool		kc_guc_enable_custom_scan = true;
@@ -102,6 +103,18 @@ _PG_init(void)
 							NULL, &kc_guc_stripe_rows, 150000,
 							KC_MIN_STRIPE_ROWS, KC_MAX_STRIPE_ROWS,
 							PGC_USERSET, 0, NULL, NULL, NULL);
+	/*
+	 * A developer setting, for tests: it only lowers the most rows the writer
+	 * puts in a stripe (and the size above which columnar_check reports one),
+	 * so the limit can be reached with a few thousand rows.  It cannot raise
+	 * anything above the compiled limit and does not touch the reader, so no
+	 * value of it can make a table unreadable.
+	 */
+	DefineCustomIntVariable("kingres_columnar.max_stripe_rows",
+							"Most rows the writer puts in one stripe (testing: lowers the compiled limit).",
+							NULL, &kc_guc_max_stripe_rows, KC_MAX_STRIPE_ROWS,
+							KC_MIN_STRIPE_ROWS, KC_MAX_STRIPE_ROWS,
+							PGC_SUSET, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 	DefineCustomIntVariable("kingres_columnar.chunk_row_count",
 							"Rows of a chunk group of a new columnar table.",
 							NULL, &kc_guc_chunk_rows, 10000,
@@ -140,6 +153,13 @@ kc_options_for_new_table(KcOptions *opts)
 	opts->level = kc_guc_compression_level;
 	opts->stripe_rows = kc_guc_stripe_rows;
 	opts->chunk_rows = kc_guc_chunk_rows;
+}
+
+/* The most rows the writer puts in a stripe: the one definition (kingres_columnar.h). */
+int
+kc_max_stripe_rows(void)
+{
+	return kc_guc_max_stripe_rows;
 }
 
 Datum
@@ -463,6 +483,19 @@ kc_check_one(Oid relid, bool fix, ReturnSetInfo *rsinfo)
 							 s[i].stripe_id, (unsigned long long) s[i].first_block);
 				}
 				UnlockReleaseBuffer(buf);
+			}
+			/*
+			 * A stripe over the limit the writer keeps to.  Versions that merged
+			 * the buffers of subtransactions without a limit could write one;
+			 * the reader accepts it, so the data can be read, and a rewrite
+			 * (VACUUM FULL, SET ACCESS METHOD) cuts it into stripes within the
+			 * limit.
+			 */
+			if (problem == NULL && s[i].row_count > (uint32) kc_max_stripe_rows())
+			{
+				problem = "stripe_over_row_limit";
+				snprintf(detail, sizeof(detail), "stripe " UINT64_FORMAT " has %u rows, more than the %d a stripe may have; it can be read, and VACUUM FULL or SET ACCESS METHOD writes it again within the limit",
+						 s[i].stripe_id, s[i].row_count, kc_max_stripe_rows());
 			}
 			if (problem == NULL)
 				continue;

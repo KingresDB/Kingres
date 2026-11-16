@@ -27,6 +27,7 @@
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/subtrans.h"
 #include "access/table.h"
 #include "access/multixact.h"
 #include "access/transam.h"
@@ -53,7 +54,7 @@
 
 #include "kingres_columnar.h"
 
-#define Natts_kc_stripe				13
+#define Natts_kc_stripe				14
 #define Anum_kc_uid					1
 #define Anum_kc_stripe_id			2
 #define Anum_kc_first_row			3
@@ -67,6 +68,7 @@
 #define Anum_kc_footer_offset		11
 #define Anum_kc_cid_points			12
 #define Anum_kc_col_stats			13
+#define Anum_kc_maintenance			14
 
 /*
  * The snapshot the catalog is read with: the caller's snapshot copied, with
@@ -173,7 +175,7 @@ kc_catalog_snapshot(Snapshot snap, bool *is_mvcc)
 		*copy = *snap;
 		*is_mvcc = true;
 		cs->real_cid = snap->curcid;
-		cs->ssi = true;
+		cs->ssi = false;
 	}
 	else
 	{
@@ -209,6 +211,20 @@ kc_catalog_snapshot(Snapshot snap, bool *is_mvcc)
 	if (copy->regd_count == 0 && copy->active_count == 0)
 		copy->regd_count = 1;
 	return copy;
+}
+
+/*
+ * Make loads with a snapshot from kc_catalog_snapshot report the stripes they
+ * skip to the serializable machinery.  Only a scan of the table (kc_scan.c)
+ * asks for it: the inspection functions, the planner's estimates and the
+ * maintenance paths read the stripe catalog but do not read the table, and
+ * must neither create dependencies nor be affected by them.  A snapshot that
+ * was not an MVCC one never reports.
+ */
+void
+kc_catalog_snapshot_report_conflicts(Snapshot snap, bool is_mvcc)
+{
+	((KcCatSnap *) snap)->ssi = is_mvcc;
 }
 
 /* A fresh snapshot of everything committed, plus the running transaction. */
@@ -298,8 +314,12 @@ kc_stripe_from_tuple(TupleDesc desc, HeapTuple tup, KcStripeInfo *si)
 	bool		n[Natts_kc_stripe];
 	int			i;
 
+	/* a catalog made before the last column existed has one column fewer */
+	memset(v, 0, sizeof(v));
+	memset(n, 0, sizeof(n));
+	n[Anum_kc_maintenance - 1] = true;
 	heap_deform_tuple(tup, desc, v, n);
-	for (i = 0; i < Natts_kc_stripe; i++)
+	for (i = 0; i < Natts_kc_stripe - 1; i++)
 		if (n[i])
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
@@ -320,11 +340,13 @@ kc_stripe_from_tuple(TupleDesc desc, HeapTuple tup, KcStripeInfo *si)
 	si->col_stats = kc_copy_bytea(v[Anum_kc_col_stats - 1]);
 	si->xmin = HeapTupleHeaderGetXmin(tup->t_data);
 	si->own = TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetXmin(tup->t_data));
+	si->maintenance = desc->natts >= Natts_kc_stripe && !n[Anum_kc_maintenance - 1] &&
+		DatumGetBool(v[Anum_kc_maintenance - 1]);
 	si->visible_rows = si->row_count;
 
 	/* the numbers must be self-consistent before anything is allocated */
 	if ((int64) si->stripe_id <= 0 || si->row_count == 0 ||
-		si->row_count > KC_MAX_STRIPE_ROWS * 4 || si->natts < 0 ||
+		si->row_count > KC_STRIPE_ROWS_READ_LIMIT || si->natts < 0 ||
 		si->block_count == 0 || si->blob_len == 0 ||
 		si->blob_len > (uint64) si->block_count * KC_PAGE_PAYLOAD ||
 		si->blob_len <= (uint64) (si->block_count - 1) * KC_PAGE_PAYLOAD ||
@@ -337,6 +359,56 @@ kc_stripe_from_tuple(TupleDesc desc, HeapTuple tup, KcStripeInfo *si)
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("the stripe catalog row of stripe " UINT64_FORMAT " is corrupt",
 						si->stripe_id)));
+}
+
+/* Is the stripe row one that compaction wrote (kc_compact)? */
+static bool
+kc_tuple_is_maintenance(TupleDesc desc, HeapTuple tup)
+{
+	bool		isnull;
+	Datum		d;
+
+	if (desc->natts < Natts_kc_stripe)
+		return false;
+	d = heap_getattr(tup, Anum_kc_maintenance, desc, &isnull);
+	return !isnull && DatumGetBool(d);
+}
+
+/*
+ * Report to the serializable machinery that the reader skipped a stripe
+ * written by the transaction xid (the xmin of the stripe row), as heap does
+ * for a tuple it skips (HeapCheckForSerializableConflictOut).  The xid in the
+ * row is the id of whatever subtransaction inserted it, and the top-level id
+ * only when the stripe was flushed at commit.  The serializable machinery
+ * knows top-level transactions only (a subtransaction id is not in its
+ * table, and the dependency would be dropped silently), so the id is mapped
+ * to its top-level transaction first.  The cases:
+ *
+ * - an id older than the oldest snapshot xmin of this backend cannot belong
+ *   to a concurrent writer, and its pg_subtrans entry may be gone (asking
+ *   for it is an error): nothing to report, as in heap;
+ * - the reader's own transaction is no dependency; an own subtransaction that
+ *   aborted can be newer than the snapshot and so looks concurrent;
+ * - a writer subtransaction that aborted left nothing to depend on (heap
+ *   sees its tuple as dead).  The test is made on the id that wrote the row,
+ *   before the mapping, because the top-level transaction goes on.
+ */
+static void
+kc_report_conflict_out(Relation rel, TransactionId xid, Snapshot snap)
+{
+	TransactionId top;
+
+	if (!TransactionIdIsNormal(xid) || TransactionIdPrecedes(xid, TransactionXmin))
+		return;
+	if (TransactionIdEquals(xid, GetTopTransactionIdIfAny()))
+		return;
+	if (!TransactionIdIsInProgress(xid) && !TransactionIdDidCommit(xid))
+		return;
+	top = SubTransGetTopmostTransaction(xid);
+	if (TransactionIdPrecedes(top, TransactionXmin) ||
+		TransactionIdEquals(top, GetTopTransactionIdIfAny()))
+		return;
+	CheckForSerializableConflictOut(rel, top, snap);
 }
 
 /*
@@ -369,9 +441,14 @@ kc_catalog_load(Relation rel, Snapshot snap, int *nstripes)
 			 * SERIALIZABLE the reader is before that writer, as heap records
 			 * for a tuple it skips.  The writer's own check
 			 * (kc_flush_buf) covers the readers whose lock came later.
+			 *
+			 * A stripe that only copies rows (compaction) hides no row from the
+			 * reader: the rows are in the stripes it replaced, which the reader
+			 * still sees, so there is no dependency on its writer.
 			 */
-			if (((KcCatSnap *) snap)->ssi && TransactionIdIsValid(concurrent))
-				CheckForSerializableConflictOut(rel, concurrent, snap);
+			if (((KcCatSnap *) snap)->ssi && TransactionIdIsValid(concurrent) &&
+				!kc_tuple_is_maintenance(RelationGetDescr(cat), tup))
+				kc_report_conflict_out(rel, concurrent, snap);
 			continue;
 		}
 		if (n == cap)
@@ -498,7 +575,8 @@ kc_catalog_row_total(Relation rel, Snapshot snap, uint64 *stripes,
 
 void
 kc_catalog_insert(Relation rel, const KcStripeInfo *si, const char *cid_points,
-				  int cid_len, const char *col_stats, int stats_len, bool frozen)
+				  int cid_len, const char *col_stats, int stats_len, bool frozen,
+				  bool maintenance)
 {
 	Relation	cat = table_open(kc_catalog_oid(), RowExclusiveLock);
 	Datum		v[Natts_kc_stripe];
@@ -528,6 +606,7 @@ kc_catalog_insert(Relation rel, const KcStripeInfo *si, const char *cid_points,
 	v[Anum_kc_footer_offset - 1] = Int64GetDatum((int64) si->footer_offset);
 	v[Anum_kc_cid_points - 1] = PointerGetDatum(cp);
 	v[Anum_kc_col_stats - 1] = PointerGetDatum(cs);
+	v[Anum_kc_maintenance - 1] = BoolGetDatum(maintenance);
 
 	tup = heap_form_tuple(RelationGetDescr(cat), v, n);
 	if (!frozen)

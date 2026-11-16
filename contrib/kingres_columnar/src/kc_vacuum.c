@@ -178,14 +178,7 @@ kc_compact(Relation rel, uint32 min_rows)
 			scan->stripes[nsmall++] = *si;
 	}
 	scan->nstripes = nsmall;
-	if (scan->pinned)
-	{
-		kc_write_pin_relation(RelationGetRelid(rel), -1);
-		scan->pinned = false;
-	}
-	if (scan->npend > 0)
-		kc_write_pending_release(RelationGetRelid(rel), scan->pend, scan->npend);
-	scan->npend = 0;
+	kc_scan_drop_hold(scan);
 
 	if (nsmall < 2)
 	{
@@ -193,14 +186,32 @@ kc_compact(Relation rel, uint32 min_rows)
 		return 0;
 	}
 
+	/*
+	 * The rows are copied through the ordinary write buffer, as maintenance:
+	 * they are rows that readers see in the stripes being replaced, so the
+	 * copy is no write for the serializable machinery (a reader needs no
+	 * dependency on it, and heap's own VACUUM FULL and CLUSTER take none).
+	 * Compaction that does not change the logical content cannot create a
+	 * dependency, and one that is made together with a real write by the same
+	 * transaction keeps that write's checks (kc_write.c).
+	 */
 	slot = table_slot_create(rel, NULL);
-	while (kc_scan_next(scan, slot))
+	PG_TRY();
 	{
-		slot_getallattrs(slot);
-		kc_write_row_values(rel, slot->tts_values, slot->tts_isnull, cid);
-		rows++;
-		CHECK_FOR_INTERRUPTS();
+		kc_write_set_maintenance(true);
+		while (kc_scan_next(scan, slot))
+		{
+			slot_getallattrs(slot);
+			kc_write_row_values(rel, slot->tts_values, slot->tts_isnull, cid);
+			rows++;
+			CHECK_FOR_INTERRUPTS();
+		}
 	}
+	PG_FINALLY();
+	{
+		kc_write_set_maintenance(false);
+	}
+	PG_END_TRY();
 	ExecDropSingleTupleTableSlot(slot);
 
 	for (i = 0; i < nsmall; i++)

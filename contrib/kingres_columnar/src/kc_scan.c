@@ -36,6 +36,31 @@
 
 #include "kingres_columnar.h"
 
+/*
+ * A scan that is abandoned by an error is never ended: the executor does not
+ * run ExecutorEnd for a failed query or portal.  Its hold on the write
+ * buffers is therefore remembered in the resource owner that was current when
+ * the scan began, and the owner releases it when the error is cleaned up: the
+ * owner of a portal is released when the portal is dropped or its failed
+ * state is cleaned up at the abort of the subtransaction that failed it, the
+ * owner of a statement outside a portal (a function, COPY, a rewrite) is the
+ * one of the (sub)transaction itself.  See kc_write.c for the hold.
+ */
+static void
+kc_hold_release_cb(Datum res)
+{
+	kc_write_hold_release(DatumGetUInt64(res));
+}
+
+static const ResourceOwnerDesc kc_hold_resowner_desc =
+{
+	.name = "kingres_columnar write buffer hold",
+	.release_phase = RESOURCE_RELEASE_BEFORE_LOCKS,
+	.release_priority = RELEASE_PRIO_FIRST,
+	.ReleaseResource = kc_hold_release_cb,
+	.DebugPrint = NULL
+};
+
 /* ------------------------------------------------------------------------
  * Set-up
  * ------------------------------------------------------------------------
@@ -120,6 +145,7 @@ kc_scan_begin(Relation rel, Snapshot snapshot, const bool *needed,
 	if (snapshot != NULL)
 		PredicateLockRelation(rel, snapshot);
 	cs = kc_catalog_snapshot(snapshot, &mvcc);
+	kc_catalog_snapshot_report_conflicts(cs, mvcc);
 	scan->cat_snap = cs;
 	scan->all_own_rows = !mvcc;
 	scan->curcid = mvcc ? snapshot->curcid : InvalidCommandId;
@@ -142,12 +168,19 @@ kc_scan_begin(Relation rel, Snapshot snapshot, const bool *needed,
 	 */
 	if (!(flags & SO_TYPE_ANALYZE))
 	{
-		scan->pend = kc_write_pending_refs(RelationGetRelid(rel),
-										  kc_rel_ident(rel)->uid, &scan->npend);
-		if (scan->npend > 0)
+		ResourceOwner owner = CurrentResourceOwner;
+
+		/* the slot in the owner first: remembering cannot fail afterwards */
+		if (owner != NULL)
+			ResourceOwnerEnlarge(owner);
+		scan->hold = kc_write_hold_acquire(RelationGetRelid(rel),
+										   kc_rel_ident(rel)->uid,
+										   &scan->pend, &scan->npend);
+		if (scan->hold != 0 && owner != NULL)
 		{
-			kc_write_pin_relation(RelationGetRelid(rel), 1);
-			scan->pinned = true;
+			ResourceOwnerRemember(owner, UInt64GetDatum(scan->hold),
+								  &kc_hold_resowner_desc);
+			scan->owner = owner;
 		}
 	}
 	MemoryContextSwitchTo(old);
@@ -171,14 +204,29 @@ kc_scan_rescan(KcScan *scan)
 	MemoryContextReset(scan->group_cxt);
 }
 
+/*
+ * Give back the scan's hold on the write buffers (it is no longer reading
+ * them).  The scan stops reading its pending rows.
+ */
+void
+kc_scan_drop_hold(KcScan *scan)
+{
+	if (scan->hold != 0)
+	{
+		if (scan->owner != NULL)
+			ResourceOwnerForget(scan->owner, UInt64GetDatum(scan->hold),
+								&kc_hold_resowner_desc);
+		kc_write_hold_release(scan->hold);
+		scan->hold = 0;
+		scan->owner = NULL;
+	}
+	scan->npend = 0;
+}
+
 void
 kc_scan_end(KcScan *scan)
 {
-	if (scan->pinned)
-		kc_write_pin_relation(RelationGetRelid(scan->rel), -1);
-	if (scan->npend > 0)
-		kc_write_pending_release(RelationGetRelid(scan->rel), scan->pend,
-								 scan->npend);
+	kc_scan_drop_hold(scan);
 	MemoryContextDelete(scan->scan_cxt);
 }
 
