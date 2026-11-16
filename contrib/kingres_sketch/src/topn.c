@@ -704,9 +704,12 @@ tn_load_arg(FunctionCallInfo fcinfo, int argno)
 	char		why[KS_WHY_LEN];
 	TnState    *st;
 
-	struct varlena *orig = (struct varlena *) PG_GETARG_POINTER(argno);
-	struct varlena *v = pg_detoast_datum_packed(orig);
+	struct varlena *orig;
+	struct varlena *v;
 
+	ks_arg_precheck(fcinfo, argno);
+	orig = (struct varlena *) PG_GETARG_POINTER(argno);
+	v = pg_detoast_datum_packed(orig);
 	p = (const uint8 *) VARDATA_ANY(v);
 	len = VARSIZE_ANY_EXHDR(v);
 	st = tn_load(p, len, why);
@@ -1175,7 +1178,6 @@ kingres_sketch_topn_agg_deserial(PG_FUNCTION_ARGS)
 	MemoryContextSwitchTo(old);
 	if (st == NULL)
 	{
-		ks_acct_release(acct);
 		ks_invalid_value("topn", why);
 	}
 	st->acct = acct;

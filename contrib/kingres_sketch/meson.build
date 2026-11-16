@@ -54,6 +54,7 @@ tests += {
       't/006_fuzz.pl',
       't/007_portable_sketches.pl',
       't/008_memory.pl',
+      't/009_memory_ceiling.pl',
     ],
   },
 }
