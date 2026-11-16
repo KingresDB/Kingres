@@ -100,3 +100,8 @@ func IsManaged(name string) (Reason, bool) {
 	r, ok := ManagedParameters[name]
 	return r, ok
 }
+
+// MajorOfVersionNum returns the PostgreSQL major of a server_version_num ("180007" is 18,
+// "190000" is 19). Behaviour that differs by major is decided from the number the running server
+// reports, with this one function: no build tag per major and no version kingresd assumed.
+func MajorOfVersionNum(num int) int { return num / 10000 }

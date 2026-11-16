@@ -31,8 +31,10 @@ case "$cmd" in
       if [ -f "$HOME/kw-cp/install/share/postgresql/extension/kingres_ledger--0.2.sql" ]; then SRC="$HOME/kw-cp/install"; else SRC="$HOME/kingres-work/install"; fi
     fi
     # A kept copy is replaced when its source changed (the extension version decides what the server can do).
-    if [ -d "$INST" ] && ! cmp -s "$SRC/extensions-commit.txt" "$INST/extensions-commit.txt" 2>/dev/null; then rm -rf "$INST"; fi
-    if [ ! -d "$INST" ]; then cp -a "$SRC" "$INST"; fi
+    # The stamp names the source, its extension commit and its PostgreSQL version, so that a kept copy of one major is never reused for another.
+    STAMP="$SRC $(cat "$SRC/extensions-commit.txt" 2>/dev/null) $("$SRC/bin/pg_config" --version 2>/dev/null)"
+    if [ -d "$INST" ] && [ "$(cat "$ROOT/install.stamp" 2>/dev/null)" != "$STAMP" ]; then rm -rf "$INST"; fi
+    if [ ! -d "$INST" ]; then cp -a "$SRC" "$INST"; echo "$STAMP" >"$ROOT/install.stamp"; fi
     cp "$1" "$ROOT/kingresd" && chmod +x "$ROOT/kingresd"
     "$ROOT/kingresd" -version
     ;;

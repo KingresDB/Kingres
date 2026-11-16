@@ -100,7 +100,21 @@ manager itself in a throwaway directory under `~/kw-cp/test`, on a slice of 200 
 
 ```
 .\scripts\run-integration.ps1 [-Port 56010] [-Race]
+.\scripts\run-integration.ps1 -Install ~/kw-cp19/install   # the same suite on another installation
 ```
+
+`-Install` is a path inside WSL (`~` and `$HOME` are expanded there); it reaches the tests as `KINGRES_INSTALL`, so the
+suite runs on whatever major that installation is (18 or 19, `cluster.SupportedMajors`). Without it the default stays
+`~/kw-cp/install`. An installation of another major is made as described in `docs/dev/testing.md` (a copy of the
+installation with its prefix fixed, then the extensions installed into it from the committed tree).
+
+One source serves both majors; nothing is built per major. What differs is decided at run time from the server:
+`internal/pgconfig` reads the parameter list, units, contexts and enumerations from `pg_settings` of the running
+instance, so the configuration page shows and validates the parameters of the major that runs; a parameter that
+PostgreSQL hides from ordinary users and that nobody has reviewed is refused as superuser-only (PostgreSQL 19 added
+`ssl_sni` and `hosts_file`, both refused with their own reason). Tests that depend on the major ask the server
+(`pgtest.Major`, from `server_version_num`, through `instance.MajorOfVersionNum`) and assert the behaviour of that major.
+`scripts/smoke3.sh` takes the installation from `KINGRES_INSTALL` and the console end-to-end run from `E2E_PG_INSTALL`.
 
 To change the contract-derived operation table after `openapi.yaml` changed:
 `go generate ./internal/contract`. A test fails while the checked-in table is
@@ -1227,7 +1241,7 @@ statements keep routing, and the revocation of a server's certificates (it print
 with the number of failed checks).
 The fifth increment's tests are listed with their sections ("Certificates: renewal and revocation", "Cluster-wide
 logs, alerts and metrics", "Alerts raised since 0.5.0", "Listings with a hard cap").
-`scripts/install-extensions.sh [commit]` builds `kingres_shard` and `kingres_ledger` (both 0.2, with the fixes of their reviews) from a commit (default: the repository HEAD) into `~/kw-cp/install`, not from the working tree, and records the commit in `~/kw-cp/install/extensions-commit.txt`.
+`scripts/install-extensions.sh [commit]` builds `kingres_shard` and `kingres_ledger` from a commit (default: the repository HEAD) into `~/kw-cp/install`, or into the installation named by `KINGRES_INSTALL` (the one of the other PostgreSQL major, for example), not from the working tree, and records the commit in `extensions-commit.txt` of that installation. Run it again after the extensions change: the suite tests the control plane against what is installed there, not against the repository.
 
 ## Contract types and validation
 

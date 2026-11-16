@@ -15,10 +15,10 @@
 # by the servers while statements keep routing between them.
 #
 # Usage: smoke3.sh <kingresd-binary> [base-port] [kingres-verify-binary]
-# (uses ~/kw-cp/install, ports base..base+8; the script finds nothing else by path).
+# (uses $KINGRES_INSTALL, default ~/kw-cp/install, so PostgreSQL 18 or 19; ports base..base+8; the script finds nothing else by path).
 set -u
 KD="$1"; BASE="${2:-56120}"; VERIFY="${3:-}"
-INST="$HOME/kw-cp/install"; D="$HOME/kw-cp/test/smoke3"
+INST="${KINGRES_INSTALL:-$HOME/kw-cp/install}"; D="$HOME/kw-cp/test/smoke3"
 export LD_LIBRARY_PATH="$INST/lib/x86_64-linux-gnu"
 PSQL="$INST/bin/psql"
 rm -rf "$D"; mkdir -p "$D"

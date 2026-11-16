@@ -175,3 +175,11 @@ func TestConfigFileAtomicAndRestore(t *testing.T) {
 		t.Log("EnsureConfig needs the managed file; none here")
 	}
 }
+
+func TestMajorOfVersionNum(t *testing.T) {
+	for num, want := range map[int]int{180007: 18, 180000: 18, 190000: 19, 190001: 19, 170012: 17} {
+		if got := MajorOfVersionNum(num); got != want {
+			t.Errorf("MajorOfVersionNum(%d) = %d, want %d", num, got, want)
+		}
+	}
+}

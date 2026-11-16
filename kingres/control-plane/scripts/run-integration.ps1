@@ -9,13 +9,18 @@
 # a killed run are removed by the next run, by proof of ownership only.
 #
 # Usage (from kingres\control-plane):
-#   .\scripts\run-integration.ps1 [-Packages ./internal/instance,./internal/sysdb] [-Run TestName] [-Race]
+#   .\scripts\run-integration.ps1 [-Packages ./internal/instance,./internal/sysdb] [-Run TestName] [-Race] [-Install ~/kw-cp19/install]
 param(
     [string[]]$Packages = @(),
     [string]$Run = '',
     [string]$Distro = 'Ubuntu-24.04',
     [string]$WslUser = 'kingres',
     [switch]$Race,
+    # The PostgreSQL installation the instances are made from, as a path inside WSL (~ and $HOME
+    # are expanded there); it reaches the tests as KINGRES_INSTALL. Empty keeps the default of
+    # run-wsl-tests.sh (~/kw-cp/install, PostgreSQL 18); an installation of PostgreSQL 19 runs
+    # the same suite on that major.
+    [string]$Install = '',
     # Count runs every selected test that many times in the same binary (stress loops); each run
     # makes its own clusters. Any failure fails the run.
     [int]$Count = 1
@@ -75,6 +80,9 @@ try {
     $wslStage = ConvertTo-WslPath $stage
     $wslScript = ConvertTo-WslPath (Join-Path $PSScriptRoot 'run-wsl-tests.sh')
     & wsl.exe -d $Distro -u $WslUser bash -c "rm -rf ~/kw-cp/test/bin && mkdir -p ~/kw-cp/test/bin && cp '$wslStage'/kingresd '$wslStage'/kingres-verify '$wslStage'/*.test '$wslStage'/openapi.yaml '$wslStage'/README.md '$wslStage'/operations_gen.go.txt '$wslStage'/wsl-allowed-skips.txt ~/kw-cp/test/bin/ && cp -r '$wslStage'/fixtures ~/kw-cp/test/bin/ && chmod +x ~/kw-cp/test/bin/*.test ~/kw-cp/test/bin/kingresd ~/kw-cp/test/bin/kingres-verify && { if [ -f '$wslStage'/kingres-watchdog ]; then cp '$wslStage'/kingres-watchdog ~/kw-cp/test/bin/ && chmod +x ~/kw-cp/test/bin/kingres-watchdog; fi; }"
+    if ($Install -and $Install -notmatch '^[A-Za-z0-9_./~$-]+$') { throw "-Install must be a plain path inside WSL, got '$Install'" }
+    $envInstall = ''
+    if ($Install) { $envInstall = "export KINGRES_INSTALL=$Install; " }
     $bins = ($names | ForEach-Object { "`$HOME/kw-cp/test/bin/$_.test" }) -join ' '
     $flags = @()
     if ($Run) { $flags += "-test.run '$Run'" }
@@ -84,7 +92,7 @@ try {
     # Output goes to a file: server processes started by the tests may
     # inherit the pipe and keep PowerShell waiting for its end.
     $log = Join-Path $stage 'run.log'
-    & wsl.exe -d $Distro -u $WslUser bash -c "bash '$wslScript' $bins $extra" *> $log
+    & wsl.exe -d $Distro -u $WslUser bash -c "${envInstall}bash '$wslScript' $bins $extra" *> $log
     $exit = $LASTEXITCODE
     Get-Content $log
     exit $exit
