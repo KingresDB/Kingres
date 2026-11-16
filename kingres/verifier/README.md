@@ -35,8 +35,12 @@ It verifies **what is in the files you give it**, nothing else.
   block covered by a digest (the window described in the ledger README).
 - Block times are the database server's clock; they are evidence only relative
   to an external anchor of a digest with a trusted timestamp.
-- `digest-chain` compares digests only; `blocks` checks exported headers only.
+- `digest-chain` compares digests only (at least two, from a directory or files you name); `blocks` checks exported headers only.
   Their output says what they do not prove.
+- `checkpoint` shows that a checkpoint is signed by a key you trust, not that it is the
+  latest one (rollback), and reads no tile; `consistency` reads only the tiles on its
+  proof path. Neither shows that the entries behind the hashes are what the operator
+  says. Status 3 is an alert: see "Exit statuses".
 
 ## Installation
 
@@ -54,16 +58,24 @@ committed). `go.mod` has no `require` line: only the standard library is used.
 | Status | Meaning |
 |---|---|
 | 0 | everything that was asked for was verified (`VERIFIED` or `CONSISTENT` is printed) |
-| 1 | a verification failed (the failed step is named); the word `VERIFIED` is never printed |
-| 2 | usage or input error: a flag is missing or wrong, a file cannot be read, or the trusted input (digest, columns file, trust file, block export when it cannot be parsed as an export) is malformed; nothing was verified |
-| 3 | incomplete: nothing failed, but something that was asked for could not be checked with the inputs and flags given (today: a tile of a log is missing from the directory); `INCOMPLETE` is printed and the missing items are listed; `VERIFIED` is never printed. Only the commands of phase 7 (`checkpoint`, `consistency`) can end with 3; a failure always wins over an incomplete check |
+| 1 | a verification failed (the failed step is named), or the publication holds a file in a form it must not have (a symbolic link on the way, a directory, device or named pipe, a file over its size limit, a tile of the wrong size); the word `VERIFIED` is never printed |
+| 2 | usage or input error: a flag is missing or wrong, a file or directory **you named** cannot be read (it is absent, not a regular file, too large) or is malformed (digest, columns file, trust file, state file, block export when it cannot be parsed as an export), or no key of the trust file can be used at the time given; nothing was verified |
+| 3 | incomplete: nothing failed, but **the publication does not contain something that was asked for** (a checkpoint, a tile, the directory of a log); `INCOMPLETE` is printed and the missing items are listed; `VERIFIED` is never printed. **Treat 3 as an alert, never as "probably fine"**: a publisher must serve the tiles of every checkpoint it signed, so one that withholds exactly the tiles that would show a fork gets status 3 and not status 1, and a missing file is at best neglect. Only the commands of phase 7 (`checkpoint`, `consistency`) can end with 3; a failure always wins over an incomplete check |
 
 A malformed **proof** is a failed verification (status 1, step `parse`): the
 proof is the thing under test. A malformed **digest** is an input error
 (status 2): the trusted anchor is unusable. `--json` prints one JSON object
-(`command`, `verified`, `steps`, `failed_step`, `error`, `not_proved`, `info`, and for status 3
-`incomplete` and `missing`)
+(`command`, `verified`, `steps`, `failed_step`, `error`, `notes`, `not_proved`, `info`, `problems`,
+and for status 3 `incomplete` and `missing`)
 instead of text; the exit status is the same.
+
+Text and JSON are made from one structure: every `ok` step, `note`, `not proved`,
+`missing` and `problems` line of the text is a member of the JSON (`steps`,
+`notes`, `not_proved`, `missing`, `problems`) and the other way round; a test fails when a
+command prints a line in only one of the two. `notes` is what the reader must know about
+how the run was made (the clock that was used, a key that was left out and why, a state
+file that was written); `not_proved` is what a success does not show. A failed result
+carries its notes too.
 
 ## Subcommands
 
@@ -211,28 +223,64 @@ built from the public C2SP texts `signed-note`, `tlog-checkpoint` and
 
 ```
 kingres-verify trust init --origin-prefix P (--public-key B64 | --public-key-file F) --fingerprint HEX [--name LABEL] [--out FILE|-]
-kingres-verify trust show --trust trust.json [--json]
-kingres-verify checkpoint --trust trust.json --log chain:<id>[:e<N>]|aggregate:<id> [--source DIR | --note FILE] [--min-size N] [--now TIME] [--json]
+kingres-verify trust show --trust trust.json [--now TIME] [--json]
+kingres-verify checkpoint --trust trust.json --log chain:<id>[:e<N>]|aggregate:<id> [--source DIR | --note FILE] [--min-size N] [--state FILE] [--now TIME] [--json]
 kingres-verify consistency --trust trust.json --log <as above> --old NOTEFILE|SIZE:ROOT [--new NOTEFILE] [--source DIR] [--now TIME] [--json]
 ```
 
 **`trust init`** refuses to run without `--fingerprint` (the SHA-256 of the
 public key in hex; upper case and colons are accepted) and refuses a key that
 does not match it, so a mistyped or swapped key is noticed. It never overwrites
-a file. **`trust show`** validates and prints a file. `trust follow` (rotation
-events of the publication) is not built yet and exits with status 2.
+a file. `trust follow` (rotation events of the publication) is not built yet and
+exits with status 2.
+
+**`trust show [--now TIME]`** validates a file and prints, for each key, how it
+stands at `--now` (default the system clock): `usable`, `not yet valid`,
+`expired` or `revoked`, and a line for each validity member the key has that
+says that it is enforced and how (below). A file that is well formed but in which
+no key can be used at that time is reported as such and ends with status 2,
+because every verifying command would refuse it; a file with no key at all is
+refused when it is read. The time-stamp authority roots and client keys of the
+file are validated and counted, and the output says that no command uses them yet.
+
+**Validity of a key** (design 14, correction 14). A checkpoint carries no time that
+can be trusted, so the verifier can enforce what the data proves (a tree size) and
+what the auditor says (the time given with `--now`), and nothing else:
+
+| Member | Effect |
+|---|---|
+| `not_before`, `not_after` | enforced on `--now` (default the system clock, printed in the output): a key outside its window is left out, with a note that says why; if no key is left the command ends with status 2 and lists each key and why. After `not_after` a retired key's checkpoints therefore stop verifying unless you give an earlier `--now`, which is your statement and is printed. This fails closed: a member that only reported would look like a control and not be one |
+| `revoked` (true or false) | true: the key is never used, whatever `--now` says |
+| `max_tree_size` (an integer from 1) | a checkpoint counts as signed by this key only if its tree size is at most this: the way to retire a key at a known size so that what it signed stays valid and what it signs later (a leaked key) is refused, step `key-size`. It does not stop a leaked key from signing a different history at a smaller size: only a checkpoint or consistency proof you already hold catches that. `revoked` and `max_tree_size` together are refused |
 
 **`checkpoint`** verifies one checkpoint note: the note is well formed, at
-least one signature is by a key of the trust file, no signature of such a key
-is wrong, the origin is the origin of the named log below the trusted prefix,
-the size and the root are well formed (`--min-size` fails a smaller tree). It
-reads `<source>/c/<id>/e<N>/checkpoint` (aggregate: `<source>/a/<id>/checkpoint`)
-or `--note`. Without `:e<N>` the epoch is taken from the source only when it
-holds exactly one epoch of that chain; with `--note` the epoch must be given.
-It checks no tile. A key whose `not_before` is later than `--now` (default the
-system clock, printed) is not used. `not_after` is reported, not enforced: a
-checkpoint has no time, and the design says a retired key's checkpoints stay
-valid (section 3.3).
+least one signature is by a key of the trust file that may be used now, no
+signature of such a key is wrong, the origin is the origin of the named log below
+the trusted prefix, the tree size is within what the trust file allows for the
+signing key, and the size and the root are well formed (`--min-size` fails a
+smaller tree). It reads `<source>/c/<id>/e<N>/checkpoint` (aggregate:
+`<source>/a/<id>/checkpoint`) or `--note`. Without `:e<N>` the epoch is taken
+from the source only when it holds exactly one epoch of that chain; with `--note`
+the epoch must be given. It checks no tile.
+
+**Rollback.** `checkpoint` shows that a checkpoint is signed, **not that it is the
+latest**: an older genuine checkpoint verifies, so a publisher that serves one hides every
+later entry. The output says so ("not proved: that this is the latest checkpoint
+... (rollback)"). Three ways to close it, strongest last: `--min-size N` (fail a
+tree smaller than the size you already saw); `consistency --old <the last
+checkpoint you verified>`, which also fails when the log went back; and
+`--state FILE`. The state file holds the last checkpoint this command verified (the
+signed note itself, checked again with the trust file at every use). With it,
+a smaller size fails (step `rollback`), the same size with another root fails (step
+`fork`, status 1), and after a success the file is replaced atomically (a temporary file
+in the same directory, flushed, renamed). The first run creates it and says that
+nothing earlier was known. **A larger size is accepted and is not shown to extend
+the earlier log**: that needs tiles, so the output says so and points to `consistency`
+(a state file can be given to `consistency --old`). Because replacing the state
+loses the older checkpoint, the order for a full check is `consistency --old STATE
+...`, then `checkpoint --state STATE ...`. A state file that does not verify (another
+log, another trust file) is an input error and is never replaced silently. Do not run
+two commands against one state file at the same time.
 
 **`consistency`** checks that the log at the new checkpoint (`--new`, default
 the checkpoint in `--source`) extends the log at the old one (`--old`: a note
@@ -240,10 +288,36 @@ file, verified the same way, or `SIZE:ROOT` with the root in base64, taken as
 you give it). It reads the proof hashes from the tiles under
 `<source>/c/<id>/e<N>/tile/...` (full and partial tiles; a partial tile that
 is missing is read from the full tile), and verifies them against both roots with
-RFC 9162 section 2.1.4.2. A new size smaller than the old one fails (the log
-went back). Missing tiles give status 3; a tile of the wrong size or with
-wrong content gives status 1. A source is a directory (a tar file and an HTTP
-source are not built yet).
+RFC 9162 section 2.1.4.2. **Only the tiles on the proof path are read** (the
+output says how many): a tile that is damaged but not on that path is not noticed,
+and the output lists it as not proved. When the sizes are equal, or the old size is 0,
+the proof is empty and no tile is read; the output says "no tile was needed". A new
+size smaller than the old one fails (the log went back). A tile that is absent gives
+status 3; a tile that is present and wrong gives status 1.
+
+**Sources and files.** A source is a directory (a tar file and an HTTP source are
+not built yet). Every file the verifier reads goes through one helper
+(`internal/safefile`): it opens without blocking (a named pipe cannot hang it),
+requires a regular file after the open, and bounds the size before and while
+reading. In a source directory **no symbolic link or Windows reparse point is
+followed, in any component of a path below the directory**, and a path cannot leave
+the directory (`os.Root`, Go 1.24 and later; the module needs Go 1.27.3 and the
+packaging build uses it with `GOTOOLCHAIN=local`). Links were refused instead of
+resolved inside the directory because a publication written by the publisher's
+tools has no link, so a link is an accident or an attempt to alias one tile as
+another or to reach outside, and a rule that allowed some would have to explain
+which. A directory you pointed `--source` at may itself be a link. A file you
+name on the command line (`--trust`, `--note`, `--old`, `--new`, `--state`, the
+files of the older commands) may be a link, since you chose it, but must be a
+regular file after resolution, never a pipe, device, socket or directory. On
+Windows the device names (`NUL`, `CON`, `COM1`, ...), the device namespace
+(`\\.\`) and alternate data streams are refused by name. A directory of digests
+or a directory of epochs is read at most 1,024 entries.
+
+**What is status 2, 3 or 1** (one rule for every command): what you named and
+cannot be used is 2; what the publication should contain and does not is 3; what the
+publication contains in a form it must not have (a link, a pipe, a directory, a file
+over its limit, a tile of the wrong size) is 1.
 
 Formats, with the specification they follow:
 
@@ -274,7 +348,8 @@ Formats, with the specification they follow:
   not used yet.
 - **Trust file** (design 7.2): strict JSON; `format` 1, `origin_prefix`, `keys`
   (`name` label, `public_key` base64, `fingerprint` that must equal the
-  SHA-256 of the key, `not_before`, `not_after` as RFC 3339 UTC or null),
+  SHA-256 of the key, `not_before`, `not_after` as RFC 3339 UTC or null, `revoked` true or
+  false, `max_tree_size` an integer from 1 or null; at least one key is required),
   optional `tsa_roots` (PEM certificates, validated), `client_keys` (`key_id`
   must equal the first 16 bytes of the SHA-256 of the key), and `witnesses`,
   which must be empty. Unknown members are rejected.
@@ -342,7 +417,7 @@ digests and the headers inside the proofs, and (in `internal/proof`) that every
 single-field and every single-byte mutation of a fixture proof is rejected.
 
 Fuzz targets (kept): `FuzzParse` (jsonx, rowfile), `FuzzDecodeHex`, `FuzzEncodeRow`
-(format), `FuzzParseDigest`, `FuzzParseBlocks` (chain), `FuzzVerify` (proof), and for phase 7 `FuzzParse` (signednote, trust), `FuzzVerify` (checkpoint), `FuzzParseTilePath` and `FuzzParseTile` (tlog), `FuzzParseLogSpec` (cli). `scripts/fuzz.sh [seconds]` runs every target for a short bounded time; the seeds (the published vectors) also run in `go test ./...`.
+(format), `FuzzParseDigest`, `FuzzParseBlocks` (chain), `FuzzVerify` (proof), and for phase 7 `FuzzParse` (signednote, trust), `FuzzVerify` (checkpoint), `FuzzParseTilePath` and `FuzzParseTile` (tlog), `FuzzParseLogSpec` (cli), `FuzzCleanRel` (safefile: the relative paths the source directory accepts). `scripts/fuzz.sh [seconds]` runs every target for a short bounded time; the seeds (the published vectors) also run in `go test ./...`.
 Run one with `go test ./internal/proof -run '^$' -fuzz '^FuzzVerify$' -fuzztime 30s`.
 
 ## Layout
@@ -359,6 +434,7 @@ Run one with `go test ./internal/proof -run '^$' -fuzz '^FuzzVerify$' -fuzztime 
 | `internal/checkpoint` | tlog-checkpoint parsing and verification of a signed checkpoint |
 | `internal/trust` | the trust file: parsing, validation, writing, keys per log origin |
 | `internal/rowfile` | the columns file of `row-hash` |
+| `internal/safefile` | the one way every file is opened: never blocking, regular files only, bounded size, no link below a source directory |
 | `internal/cli` | the command line (`cmd/kingres-verify` is a thin `main`) |
 
 ## Decisions where the documentation is silent
@@ -556,3 +632,30 @@ example of tlog-checkpoint has no published key, so only its text is parsed.
     and root. Every command takes sizes from checkpoints.
 13. **Sources.** Design 4.6 and 7.4 let the verifier read a tar file or an HTTP
     base URL; step 1 reads a directory only.
+
+## Findings of the review of step 1 and what was changed
+
+The independent review of steps 1 and 2 (`kingres/docs/reviews/2026-11-16-ledger-phase7-steps-1-2.md`)
+found these in the verifier; each has a test that failed before the change.
+
+- **L7-01, L7-05** (a named pipe hangs the verifier; links are followed): one file helper
+  for everything the verifier opens (`internal/safefile`) and the rule above for sources.
+- **L7-02** (`not_after` reported only, notes missing from `--json`): the validity members
+  of a key are enforced and `trust show` says how; text and JSON are made from one structure.
+- **L7-03** (an older genuine checkpoint is VERIFIED): the "not proved" list names rollback
+  and the three remedies; `checkpoint --state`.
+- **L7-06** (output claimed more than was checked): the tile line says how many tiles were
+  read and that no other was; an empty proof says that no tile was needed; the help and this
+  README say that only the proof path is read.
+- **L7-07** (status 2 for a missing checkpoint, 3 for a missing tile; `trust show` accepted a
+  file with no key): one rule for what the publication does not contain (status 3), and a trust
+  file with no usable key is refused by every command including `trust show`.
+- **L7-10** (status 3 and a hostile publisher): the output and "Exit statuses" say that 3 is
+  an alert.
+- Found in the pass over the older commands: `digest-chain` over an empty directory printed
+  `CONSISTENT: 0 digests agree`; `blocks` without `--digest` said "the block chain is consistent"
+  without saying that a chain rewritten from the genesis block verifies too; the text output of
+  `proof` and `blocks` called the "not proved" items "note" while `--json` called them
+  `not_proved`; a failed `proof` printed none of the steps that had passed (the JSON did); the text of `proof` had two lines (the
+  entry and the operation) that were not in `--json` as lines (they are steps now); every
+  command opened its files with `os.Open`.

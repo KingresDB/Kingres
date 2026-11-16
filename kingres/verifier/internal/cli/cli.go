@@ -5,7 +5,6 @@
 package cli
 
 import (
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -20,6 +19,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/merkle"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/proof"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/rowfile"
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/safefile"
 )
 
 // Exit statuses.
@@ -132,58 +132,9 @@ func (e *env) parseFlags(fs *flag.FlagSet, args []string) (code int, done bool) 
 	return 0, false
 }
 
-// jsonOut is the JSON form of every result.
-type jsonOutput struct {
-	Command   string     `json:"command"`
-	Verified  bool       `json:"verified"`
-	Steps     []stepJSON `json:"steps,omitempty"`
-	Problems  []string   `json:"problems,omitempty"`
-	FailedAt  string     `json:"failed_step,omitempty"`
-	Error     string     `json:"error,omitempty"`
-	InputErr  bool       `json:"input_error,omitempty"`
-	Info      any        `json:"info,omitempty"`
-	NotProved []string   `json:"not_proved,omitempty"`
-	// Incomplete and Missing are used by exit status 3 only.
-	Incomplete bool     `json:"incomplete,omitempty"`
-	Missing    []string `json:"missing,omitempty"`
-}
-
-type stepJSON struct {
-	Name   string `json:"name"`
-	OK     bool   `json:"ok"`
-	Detail string `json:"detail,omitempty"`
-}
-
-func (e *env) printJSON(v any) {
-	enc := json.NewEncoder(e.stdout)
-	enc.SetIndent("", "  ")
-	_ = enc.Encode(v)
-}
-
-// inputError reports a usage or input problem (exit status 2).
-func (e *env) inputError(cmd string, asJSON bool, err error) int {
-	if asJSON {
-		e.printJSON(jsonOutput{Command: cmd, InputErr: true, Error: err.Error()})
-	}
-	fmt.Fprintf(e.stderr, "kingres-verify %s: %v\n", cmd, err)
-	return ExitUsage
-}
-
-func readLimited(path string, limit int64) ([]byte, error) {
-	f, err := os.Open(path) // #nosec G304 -- the path is a command line argument
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, limit+1))
-	if err != nil {
-		return nil, fmt.Errorf("reading %s: %w", path, err)
-	}
-	if int64(len(data)) > limit {
-		return nil, fmt.Errorf("%s is larger than %d bytes", path, limit)
-	}
-	return data, nil
-}
+// readArg reads a file named on the command line: never blocking, a regular
+// file after links are resolved, at most limit bytes (package safefile).
+func readArg(path string, limit int64) ([]byte, error) { return safefile.ReadArg(path, limit) }
 
 func requireFlag(name, val string) error {
 	if val == "" {
@@ -243,7 +194,7 @@ func (e *env) runProof(args []string) int {
 	default:
 		return e.inputError(cmd, *asJSON, fmt.Errorf("--op %q is not I, D or any", *opFlag))
 	}
-	digestData, err := readLimited(*digestPath, maxFileSize)
+	digestData, err := readArg(*digestPath, maxFileSize)
 	if err != nil {
 		return e.inputError(cmd, *asJSON, err)
 	}
@@ -251,16 +202,21 @@ func (e *env) runProof(args []string) int {
 	if err != nil {
 		return e.inputError(cmd, *asJSON, err)
 	}
-	proofData, err := readLimited(*proofPath, maxFileSize)
+	proofData, err := readArg(*proofPath, maxFileSize)
 	if err != nil {
 		return e.inputError(cmd, *asJSON, err)
 	}
-	out := jsonOutput{Command: cmd}
+	r := &result{cmd: cmd}
 	p, err := proof.Parse(proofData)
 	if err != nil {
-		return e.failProof(out, *asJSON, proof.StepParse, err, nil)
+		return e.finishFailed(r, *asJSON, proof.StepParse, err)
 	}
 	res, err := proof.Verify(p, d, exp)
+	if res != nil {
+		for _, s := range res.Steps {
+			r.ok(s.Name, s.Detail)
+		}
+	}
 	if err != nil {
 		var pe *proof.Error
 		step := ""
@@ -268,13 +224,12 @@ func (e *env) runProof(args []string) int {
 			step = pe.Step
 			err = pe.Err
 		}
-		return e.failProof(out, *asJSON, step, err, res)
+		return e.finishFailed(r, *asJSON, step, err)
 	}
-	for _, s := range res.Steps {
-		out.Steps = append(out.Steps, stepJSON{Name: s.Name, OK: true, Detail: s.Detail})
-	}
-	out.Verified = true
-	out.Info = map[string]any{
+	r.ok("entry", fmt.Sprintf("table_id %d, row_hash %x, written by %q in block %d", p.TableID, p.RowHash, p.UserName, p.Block.Height))
+	r.ok("operation", proof.OpName(p.Op)+": "+opMeaning(p.Op))
+	r.headline = fmt.Sprintf("the proof is valid against the digest at height %d.", d.Height)
+	r.info = map[string]any{
 		"table_id":      p.TableID,
 		"op":            proof.OpName(p.Op),
 		"proves":        opMeaning(p.Op),
@@ -285,23 +240,10 @@ func (e *env) runProof(args []string) int {
 	}
 	bound := exp.TableID != nil && exp.RowHash != nil
 	if !bound {
-		out.NotProved = append(out.NotProved, "no --table-id and --row-hash were given: this shows that an entry with this row_hash exists in the ledger, not that it is the row you hold")
+		r.notProved = append(r.notProved, "no --table-id and --row-hash were given: this shows that an entry with this row_hash exists in the ledger, not that it is the row you hold")
 	}
-	out.NotProved = append(out.NotProved, proofLimits...)
-	if *asJSON {
-		e.printJSON(out)
-		return ExitOK
-	}
-	fmt.Fprintf(e.stdout, "VERIFIED: the proof is valid against the digest at height %d.\n", d.Height)
-	for _, s := range res.Steps {
-		fmt.Fprintf(e.stdout, "  ok  %-12s %s\n", s.Name, s.Detail)
-	}
-	fmt.Fprintf(e.stdout, "  table_id %d, row_hash %x, written by %q in block %d\n", p.TableID, p.RowHash, p.UserName, p.Block.Height)
-	fmt.Fprintf(e.stdout, "  operation %s: %s\n", proof.OpName(p.Op), opMeaning(p.Op))
-	for _, n := range out.NotProved {
-		fmt.Fprintf(e.stdout, "  note: %s\n", n)
-	}
-	return ExitOK
+	r.notProved = append(r.notProved, proofLimits...)
+	return e.finishOK(r, *asJSON)
 }
 
 // opMeaning says what a proof of an entry of this operation proves; the two
@@ -316,23 +258,6 @@ func opMeaning(op byte) string {
 var proofLimits = []string{
 	"this holds only if the digest was obtained and kept outside the database's control",
 	"the row hash must be recomputed from data you hold (kingres-verify row-hash)",
-}
-
-func (e *env) failProof(out jsonOutput, asJSON bool, step string, err error, res *proof.Result) int {
-	out.FailedAt = step
-	out.Error = err.Error()
-	if res != nil {
-		for _, s := range res.Steps {
-			out.Steps = append(out.Steps, stepJSON{Name: s.Name, OK: true, Detail: s.Detail})
-		}
-	}
-	out.Steps = append(out.Steps, stepJSON{Name: step, OK: false, Detail: err.Error()})
-	if asJSON {
-		e.printJSON(out)
-		return ExitFailed
-	}
-	fmt.Fprintf(e.stdout, "FAILED at step %s: %v\n", step, err)
-	return ExitFailed
 }
 
 // ---- row-hash ----
@@ -356,7 +281,7 @@ func (e *env) runRowHash(args []string) int {
 	if err := requireFlag("columns", *columns); err != nil {
 		return e.inputError(cmd, *asJSON, err)
 	}
-	data, err := readLimited(*columns, maxFileSize)
+	data, err := readArg(*columns, maxFileSize)
 	if err != nil {
 		return e.inputError(cmd, *asJSON, err)
 	}
@@ -429,7 +354,7 @@ func (e *env) runDigestChain(args []string) int {
 	}
 	var ds []chain.NamedDigest
 	for _, f := range files {
-		data, err := readLimited(f, maxFileSize)
+		data, err := readArg(f, maxFileSize)
 		if err != nil {
 			return e.inputError(cmd, *asJSON, err)
 		}
@@ -439,32 +364,23 @@ func (e *env) runDigestChain(args []string) int {
 		}
 		ds = append(ds, chain.NamedDigest{Name: f, Digest: d})
 	}
-	problems := chain.CheckDigestSet(ds)
-	notProved := []string{
+	if len(ds) == 0 {
+		// A directory with no *.json file would otherwise be reported as
+		// consistent: nothing was compared.
+		return e.inputError(cmd, *asJSON, errors.New("no digest file found: a directory stands for its *.json files and none was there"))
+	}
+	r := &result{cmd: cmd, word: "CONSISTENT", info: map[string]any{"digests": len(ds)}}
+	r.problems = chain.CheckDigestSet(ds)
+	if len(r.problems) > 0 {
+		return e.finishProblems(r, *asJSON)
+	}
+	r.headline = fmt.Sprintf("%d digests agree with each other.", len(ds))
+	r.notProved = []string{
 		"this compares digests only: it does not prove that the blocks between them are intact (use the blocks command or a proof)",
 		"it does not prove any row or that any digest is authentic: each digest must have been stored outside the database's control",
 		"generated_at is not authenticated; block times are the database server's clock",
 	}
-	if len(problems) > 0 {
-		if *asJSON {
-			e.printJSON(jsonOutput{Command: cmd, Problems: problems})
-			return ExitFailed
-		}
-		fmt.Fprintln(e.stdout, "INCONSISTENT:")
-		for _, p := range problems {
-			fmt.Fprintf(e.stdout, "  - %s\n", p)
-		}
-		return ExitFailed
-	}
-	if *asJSON {
-		e.printJSON(jsonOutput{Command: cmd, Verified: true, NotProved: notProved, Info: map[string]any{"digests": len(ds)}})
-		return ExitOK
-	}
-	fmt.Fprintf(e.stdout, "CONSISTENT: %d digests agree with each other.\n", len(ds))
-	for _, n := range notProved {
-		fmt.Fprintf(e.stdout, "  note: %s\n", n)
-	}
-	return ExitOK
+	return e.finishOK(r, *asJSON)
 }
 
 // ---- blocks ----
@@ -490,7 +406,7 @@ func (e *env) runBlocks(args []string) int {
 	haveDigest := *digestPath != ""
 	switch {
 	case haveDigest:
-		data, err := readLimited(*digestPath, maxFileSize)
+		data, err := readArg(*digestPath, maxFileSize)
 		if err != nil {
 			return e.inputError(cmd, *asJSON, err)
 		}
@@ -515,52 +431,32 @@ func (e *env) runBlocks(args []string) int {
 	default:
 		return e.inputError(cmd, *asJSON, errors.New("missing --digest or --chain-id: the genesis hash needs the chain id"))
 	}
-	data, err := readLimited(*blocksPath, maxBlocksSize)
+	data, err := readArg(*blocksPath, maxBlocksSize)
 	if err != nil {
 		return e.inputError(cmd, *asJSON, err)
 	}
-	out := jsonOutput{Command: cmd}
+	r := &result{cmd: cmd}
 	headers, err := chain.ParseBlocks(data)
 	if err != nil {
-		return e.failBlocks(out, *asJSON, "parse", err)
+		return e.finishFailed(r, *asJSON, "parse", err)
 	}
 	if err := chain.VerifyBlocks(headers, cid); err != nil {
-		return e.failBlocks(out, *asJSON, "chain", err)
+		return e.finishFailed(r, *asJSON, "chain", err)
 	}
-	out.Steps = append(out.Steps, stepJSON{Name: "chain", OK: true, Detail: fmt.Sprintf("%d blocks, heights 0 to %d, recomputed from the genesis hash", len(headers), len(headers)-1)})
+	r.ok("chain", fmt.Sprintf("%d blocks, heights 0 to %d, recomputed from the genesis hash", len(headers), len(headers)-1))
+	r.headline = "the exported block headers form an unbroken chain from the genesis hash."
 	if haveDigest {
 		if err := chain.CheckDigestOnBlocks(headers, d); err != nil {
-			return e.failBlocks(out, *asJSON, "digest", err)
+			return e.finishFailed(r, *asJSON, "digest", err)
 		}
-		out.Steps = append(out.Steps, stepJSON{Name: "digest", OK: true, Detail: fmt.Sprintf("the chain reaches the digest at height %d", d.Height)})
+		r.ok("digest", fmt.Sprintf("the chain reaches the digest at height %d", d.Height))
+		r.headline = fmt.Sprintf("the exported block headers form an unbroken chain from the genesis hash and reach the digest at height %d.", d.Height)
 	}
-	out.Verified = true
-	out.NotProved = []string{"this checks the exported headers only: not any transaction, row or table, which needs inclusion proofs"}
+	r.notProved = []string{"this checks the exported headers only: not any transaction, row or table, which needs inclusion proofs"}
 	if !haveDigest {
-		out.NotProved = append(out.NotProved, "no --digest was given: nothing ties this chain to a digest kept outside the database")
+		r.notProved = append(r.notProved, "no --digest was given: nothing ties this chain to a digest kept outside the database, so a chain that was rewritten from the genesis block verifies too")
+	} else {
+		r.notProved = append(r.notProved, "blocks after the digest's height are not covered by the digest; the digest must have been kept outside the database's control")
 	}
-	if *asJSON {
-		e.printJSON(out)
-		return ExitOK
-	}
-	fmt.Fprintln(e.stdout, "VERIFIED: the block chain is consistent.")
-	for _, s := range out.Steps {
-		fmt.Fprintf(e.stdout, "  ok  %-8s %s\n", s.Name, s.Detail)
-	}
-	for _, n := range out.NotProved {
-		fmt.Fprintf(e.stdout, "  note: %s\n", n)
-	}
-	return ExitOK
-}
-
-func (e *env) failBlocks(out jsonOutput, asJSON bool, step string, err error) int {
-	out.FailedAt = step
-	out.Error = err.Error()
-	out.Steps = append(out.Steps, stepJSON{Name: step, OK: false, Detail: err.Error()})
-	if asJSON {
-		e.printJSON(out)
-		return ExitFailed
-	}
-	fmt.Fprintf(e.stdout, "FAILED at step %s: %v\n", step, err)
-	return ExitFailed
+	return e.finishOK(r, *asJSON)
 }

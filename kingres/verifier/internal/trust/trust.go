@@ -24,6 +24,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/format"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/jsonx"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/signednote"
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/tlog"
 )
 
 // Format is the only trust file format version.
@@ -49,6 +50,12 @@ type Key struct {
 	Fingerprint string // hex SHA-256 of the public key
 	NotBefore   *time.Time
 	NotAfter    *time.Time
+	// Revoked distrusts the key outright: its signatures are never accepted.
+	Revoked bool
+	// MaxTreeSize, when set, limits the key to checkpoints of at most this
+	// tree size. A tree size is in the signed text of a checkpoint, a time is
+	// not, so this is how a retired key is limited in a way the data proves.
+	MaxTreeSize *uint64
 }
 
 // ClientKey is a pinned client attestation key (used by a later step).
@@ -177,6 +184,9 @@ func Parse(data []byte) (*File, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(keys) == 0 {
+		return nil, fmt.Errorf("%s.keys is empty: a trust file with no key can verify nothing", obj.Path())
+	}
 	if len(keys) > MaxKeys {
 		return nil, fmt.Errorf("%s.keys has %d entries, expected at most %d", obj.Path(), len(keys), MaxKeys)
 	}
@@ -219,7 +229,7 @@ func parseKey(kv jsonx.Value) (Key, error) {
 	if err != nil {
 		return Key{}, err
 	}
-	if err := o.OnlyKeys("name", "public_key", "fingerprint", "not_before", "not_after"); err != nil {
+	if err := o.OnlyKeys("name", "public_key", "fingerprint", "not_before", "not_after", "revoked", "max_tree_size"); err != nil {
 		return Key{}, err
 	}
 	var k Key
@@ -257,6 +267,32 @@ func parseKey(kv jsonx.Value) (Key, error) {
 	}
 	if k.NotBefore != nil && k.NotAfter != nil && !k.NotAfter.After(*k.NotBefore) {
 		return Key{}, fmt.Errorf("%s: not_after is not later than not_before", o.Path())
+	}
+	if o.Has("revoked") {
+		v, err := o.Field("revoked")
+		if err != nil {
+			return Key{}, err
+		}
+		if k.Revoked, err = v.Bool(); err != nil {
+			return Key{}, err
+		}
+	}
+	if o.Has("max_tree_size") {
+		v, err := o.Field("max_tree_size")
+		if err != nil {
+			return Key{}, err
+		}
+		if v.Kind() != jsonx.KindNull {
+			n, err := v.Int64(1, int64(tlog.MaxTreeSize)-1)
+			if err != nil {
+				return Key{}, err
+			}
+			u := uint64(n) // #nosec G115 -- range checked
+			k.MaxTreeSize = &u
+		}
+	}
+	if k.Revoked && k.MaxTreeSize != nil {
+		return Key{}, fmt.Errorf("%s: a revoked key is not trusted for any size, so max_tree_size makes no sense with revoked", o.Path())
 	}
 	return k, nil
 }
@@ -376,13 +412,83 @@ func parseClientKeys(obj jsonx.Object) ([]ClientKey, error) {
 	return out, nil
 }
 
+// Standing is how a key stands at one moment, for every command and for
+// trust show. Each state other than Usable has a reason that is printed.
+type Standing int
+
+// The standings of a key.
+const (
+	// Usable: the key may be used (a size limit may still apply).
+	Usable Standing = iota
+	// NotYetValid: now is before not_before.
+	NotYetValid
+	// Expired: now is after not_after.
+	Expired
+	// Revoked: the key is distrusted outright.
+	Revoked
+)
+
+func (s Standing) String() string {
+	return [...]string{"usable", "not yet valid", "expired", "revoked"}[s]
+}
+
+// StandingAt says how the key stands at now. A revoked key is revoked at any
+// time, so --now cannot bring it back.
+func (k Key) StandingAt(now time.Time) Standing {
+	switch {
+	case k.Revoked:
+		return Revoked
+	case k.NotBefore != nil && now.Before(*k.NotBefore):
+		return NotYetValid
+	case k.NotAfter != nil && now.After(*k.NotAfter):
+		return Expired
+	}
+	return Usable
+}
+
+// Why says in one sentence why the key is not used at now (or that it is
+// limited), for notes and for errors.
+func (k Key) Why(now time.Time) string {
+	id := fmt.Sprintf("key %q (%s)", k.Name, k.Fingerprint[:16])
+	switch k.StandingAt(now) {
+	case Revoked:
+		return id + " is revoked in the trust file and was not used"
+	case NotYetValid:
+		return fmt.Sprintf("%s is not valid before %s and was not used", id, k.NotBefore.Format(time.RFC3339))
+	case Expired:
+		return fmt.Sprintf("%s has not_after %s, which has passed, and was not used (to check older checkpoints give --now a time before it, or limit the key with max_tree_size instead)", id, k.NotAfter.Format(time.RFC3339))
+	}
+	if k.MaxTreeSize != nil {
+		return fmt.Sprintf("%s counts only for checkpoints of tree size %d or less", id, *k.MaxTreeSize)
+	}
+	return id + " is usable"
+}
+
+// KeyFor returns the pinned key with this public key.
+func (f *File) KeyFor(pub []byte) (Key, bool) {
+	for _, k := range f.Keys {
+		if bytes.Equal(k.Public, pub) {
+			return k, true
+		}
+	}
+	return Key{}, false
+}
+
 // SignerKeys returns the keys under which a note about the log with this
 // origin may be signed. The origin must be the prefix itself or lie below it
 // ("<prefix>/..."); the key name of every signature is the origin
 // (ledger-phase7.md 3.2.4), so each pinned key is turned into a note key of
-// that name. A key whose not_before is later than now is left out and said
-// so in the notes. not_after is not applied: a retired key's checkpoints stay
-// valid for ever (3.3), so it is only reported.
+// that name.
+//
+// What is enforced (correction 14 of the design): a revoked key is never used;
+// a key is used only between not_before and not_after, measured on now, which
+// is the system clock or --now; a size limit (max_tree_size) is applied to the
+// checkpoint by the caller with LimitFor, because the size is in the note. A
+// checkpoint carries no time, so a window can only be measured on the
+// auditor's clock, not on the time of the signature: this is why a window
+// fails closed (the key is left out) instead of being reported.
+//
+// The notes say, for every key that was left out or is limited, why.
 func (f *File) SignerKeys(origin string, now time.Time) ([]signednote.Key, []string, error) {
 	if origin != f.OriginPrefix && !strings.HasPrefix(origin, f.OriginPrefix+"/") {
 		return nil, nil, fmt.Errorf("origin %q is not below the trusted prefix %q", clip(origin), f.OriginPrefix)
@@ -390,8 +496,8 @@ func (f *File) SignerKeys(origin string, now time.Time) ([]signednote.Key, []str
 	var keys []signednote.Key
 	var notes []string
 	for _, k := range f.Keys {
-		if k.NotBefore != nil && now.Before(*k.NotBefore) {
-			notes = append(notes, fmt.Sprintf("key %q (%s) is not valid before %s and was not used", k.Name, k.Fingerprint[:16], k.NotBefore.Format(time.RFC3339)))
+		if k.StandingAt(now) != Usable {
+			notes = append(notes, k.Why(now))
 			continue
 		}
 		sk, err := signednote.NewKey(origin, k.Public)
@@ -399,14 +505,21 @@ func (f *File) SignerKeys(origin string, now time.Time) ([]signednote.Key, []str
 			return nil, nil, err
 		}
 		keys = append(keys, sk)
-		if k.NotAfter != nil && now.After(*k.NotAfter) {
-			notes = append(notes, fmt.Sprintf("key %q (%s) is marked not_after %s: its signatures count only if the statement was made before that time, which a checkpoint alone does not show", k.Name, k.Fingerprint[:16], k.NotAfter.Format(time.RFC3339)))
+		if k.MaxTreeSize != nil {
+			notes = append(notes, k.Why(now))
 		}
 	}
 	if len(keys) == 0 {
-		return nil, notes, errors.New("the trust file has no key that can be used now")
+		return nil, notes, fmt.Errorf("the trust file has no key that can be used at %s: %s", now.Format(time.RFC3339), strings.Join(notes, "; "))
 	}
 	return keys, notes, nil
+}
+
+// LimitFor reports whether a checkpoint of this size may count as signed by
+// the key with this public key: false when the key is limited to smaller trees.
+func (f *File) LimitFor(pub []byte, size uint64) bool {
+	k, ok := f.KeyFor(pub)
+	return ok && (k.MaxTreeSize == nil || size <= *k.MaxTreeSize)
 }
 
 // fileJSON is the written form; field order is the order of the design.
@@ -425,6 +538,8 @@ type keyJSON struct {
 	Fingerprint string  `json:"fingerprint"`
 	NotBefore   *string `json:"not_before"`
 	NotAfter    *string `json:"not_after"`
+	Revoked     bool    `json:"revoked"`
+	MaxTreeSize *uint64 `json:"max_tree_size"`
 }
 
 type clientKeyJSON struct {
@@ -444,7 +559,7 @@ func (f *File) Marshal() ([]byte, error) {
 		return &s
 	}
 	for _, k := range f.Keys {
-		j.Keys = append(j.Keys, keyJSON{k.Name, base64.StdEncoding.EncodeToString(k.Public), k.Fingerprint, ts(k.NotBefore), ts(k.NotAfter)})
+		j.Keys = append(j.Keys, keyJSON{k.Name, base64.StdEncoding.EncodeToString(k.Public), k.Fingerprint, ts(k.NotBefore), ts(k.NotAfter), k.Revoked, k.MaxTreeSize})
 	}
 	for _, c := range f.ClientKeys {
 		j.ClientKeys = append(j.ClientKeys, clientKeyJSON{c.KeyID, base64.StdEncoding.EncodeToString(c.Public), c.Label})

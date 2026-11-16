@@ -5,6 +5,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -15,6 +16,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/checkpoint"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/format"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/merkle"
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/safefile"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/signednote"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/tlog"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/trust"
@@ -22,7 +24,7 @@ import (
 
 // exitTextWith3 is the exit status line of the commands that can end with
 // status 3.
-const exitTextWith3 = "0 verified, 1 verification failed, 2 usage or input error,\n3 incomplete (nothing failed, but something asked for could not be checked)."
+const exitTextWith3 = "0 verified, 1 verification failed, 2 usage or input error,\n3 incomplete: nothing failed, but something asked for could not be checked, for example a file\nthe publication should hold is not there. Treat 3 as an alert, never as \"probably fine\"."
 
 // ---- the log named on the command line ----
 
@@ -35,6 +37,8 @@ type logSpec struct {
 }
 
 var logSpecRE = regexp.MustCompile(`^(chain|aggregate):([0-9a-f]{64})(?::e(0|[1-9][0-9]{0,8}))?$`)
+
+var epochDirRE = regexp.MustCompile(`^e([1-9][0-9]{0,8})$`)
 
 func parseLogSpec(s string) (logSpec, error) {
 	m := logSpecRE.FindStringSubmatch(s)
@@ -73,30 +77,57 @@ func (l logSpec) rel() string {
 // origin is the origin line of the log (design 4.2).
 func (l logSpec) origin(prefix string) string { return prefix + "/" + l.rel() }
 
-// resolveEpoch finds the epoch of a chain log from the directories of a
-// source when --log does not carry one. It refuses to guess when there is
-// not exactly one: an old closed epoch must never be taken for the current one.
-func (l logSpec) resolveEpoch(source string) (logSpec, error) {
-	if l.kind != "chain" || l.hasEpoch {
-		return l, nil
+// ---- what a publication does not contain, and what it contains wrongly ----
+//
+// One rule for every command (L7-07): a thing the auditor named (a file on the
+// command line, the source directory, the trust file) that cannot be read is
+// an input error, status 2. A thing the publication should hold and does not
+// is "could not check", status 3: nothing failed, but the check was not made.
+// A thing the publication holds in a form it must not have (a link, a pipe or
+// device, a directory, a file over its size limit, a tile of the wrong size,
+// bad content) is a failed verification, status 1.
+
+type pubKind int
+
+const (
+	pubAbsent pubKind = iota
+	pubMalformed
+)
+
+// pubError is a problem with the publication, not with the command line.
+type pubError struct {
+	kind pubKind
+	what string // what was asked for, for the missing list
+	err  error
+}
+
+func (p *pubError) Error() string { return p.err.Error() }
+func (p *pubError) Unwrap() error { return p.err }
+
+// classifyPub turns an error from reading the publication into a pubError,
+// or returns it unchanged when it is an input problem (for example a
+// permission error on the auditor's own copy).
+func classifyPub(what string, err error) error {
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return &pubError{pubAbsent, what, err}
+	case safefile.Unusable(err):
+		return &pubError{pubMalformed, what, err}
 	}
-	entries, err := os.ReadDir(filepath.Join(source, "c", l.id))
-	if err != nil {
-		return l, fmt.Errorf("cannot find the epoch of the chain log in %s: %w; give --log chain:%s:e<N>", source, err, l.id)
-	}
-	var found []uint64
-	for _, en := range entries {
-		name := en.Name()
-		if m := regexp.MustCompile(`^e([1-9][0-9]{0,8})$`).FindStringSubmatch(name); m != nil && en.IsDir() {
-			n, _ := strconv.ParseUint(m[1], 10, 64)
-			found = append(found, n)
+	return err
+}
+
+// finishPub ends a command after a pubError (status 3 or 1) or an input
+// error (status 2).
+func (e *env) finishPub(r *result, asJSON bool, err error) int {
+	var pe *pubError
+	if errors.As(err, &pe) {
+		if pe.kind == pubAbsent {
+			return e.finishIncomplete(r, asJSON, []string{"the publication does not contain " + pe.what + ": " + pe.err.Error()})
 		}
+		return e.finishFailed(r, asJSON, "publication", pe.err)
 	}
-	if len(found) != 1 {
-		return l, fmt.Errorf("%s has %d epochs of the chain log, expected exactly one; give --log chain:%s:e<N>", source, len(found), l.id)
-	}
-	l.epoch, l.hasEpoch = found[0], true
-	return l, nil
+	return e.inputError(r.cmd, asJSON, err)
 }
 
 // parseNow reads --now or takes the system clock.
@@ -111,84 +142,88 @@ func parseNow(s string) (time.Time, bool, error) {
 	return t.UTC(), true, nil
 }
 
-// ---- the result of a command with the exit status 3 ----
-
-type result struct {
-	cmd       string
-	headline  string // after VERIFIED:
-	steps     []stepJSON
-	info      map[string]any
-	notes     []string
-	notProved []string
-}
-
-func (r *result) ok(name, detail string) {
-	r.steps = append(r.steps, stepJSON{Name: name, OK: true, Detail: detail})
-}
-
-func (e *env) printSteps(steps []stepJSON) {
-	for _, s := range steps {
-		if s.OK {
-			fmt.Fprintf(e.stdout, "  ok  %-16s %s\n", s.Name, s.Detail)
-		}
-	}
-}
-
-func (e *env) finishOK(r *result, asJSON bool) int {
-	if asJSON {
-		e.printJSON(jsonOutput{Command: r.cmd, Verified: true, Steps: r.steps, Info: r.info, NotProved: r.notProved})
-		return ExitOK
-	}
-	fmt.Fprintf(e.stdout, "VERIFIED: %s\n", r.headline)
-	e.printSteps(r.steps)
-	for _, n := range r.notes {
-		fmt.Fprintf(e.stdout, "  note: %s\n", n)
-	}
-	for _, n := range r.notProved {
-		fmt.Fprintf(e.stdout, "  not proved: %s\n", n)
-	}
-	return ExitOK
-}
-
-func (e *env) finishFailed(r *result, asJSON bool, step string, err error) int {
-	steps := append(append([]stepJSON{}, r.steps...), stepJSON{Name: step, OK: false, Detail: err.Error()})
-	if asJSON {
-		e.printJSON(jsonOutput{Command: r.cmd, Steps: steps, FailedAt: step, Error: err.Error(), Info: r.info})
-		return ExitFailed
-	}
-	fmt.Fprintf(e.stdout, "FAILED at step %s: %v\n", step, err)
-	e.printSteps(r.steps)
-	return ExitFailed
-}
-
-func (e *env) finishIncomplete(r *result, asJSON bool, missing []string) int {
-	if asJSON {
-		e.printJSON(jsonOutput{Command: r.cmd, Steps: r.steps, Incomplete: true, Missing: missing, Info: r.info, NotProved: r.notProved})
-		return ExitIncomplete
-	}
-	fmt.Fprintln(e.stdout, "INCOMPLETE: nothing failed, but a check that was asked for could not be made.")
-	e.printSteps(r.steps)
-	for _, m := range missing {
-		fmt.Fprintf(e.stdout, "  missing: %s\n", m)
-	}
-	for _, n := range r.notProved {
-		fmt.Fprintf(e.stdout, "  not proved: %s\n", n)
-	}
-	return ExitIncomplete
-}
-
 // ---- shared loading ----
 
 type logInputs struct {
 	trust  *trust.File
 	spec   logSpec
 	source string
+	dir    *safefile.Dir // the source directory, opened on first use
 	now    time.Time
 	notes  []string
 }
 
-// loadLogInputs reads --trust, --log, --source and --now. Errors are input
-// errors (exit status 2).
+// close releases the source directory.
+func (in *logInputs) close() {
+	if in.dir != nil {
+		_ = in.dir.Close()
+	}
+}
+
+// openSource opens --source: an input error when it is not a directory.
+func (in *logInputs) openSource() (*safefile.Dir, error) {
+	if in.dir != nil {
+		return in.dir, nil
+	}
+	d, err := safefile.OpenDir(in.source)
+	if err != nil {
+		return nil, fmt.Errorf("--source: %w", err)
+	}
+	in.dir = d
+	return d, nil
+}
+
+// readPublished reads a file of the publication below the log directory.
+func (in *logInputs) readPublished(rel string, limit int64) ([]byte, error) {
+	d, err := in.openSource()
+	if err != nil {
+		return nil, err
+	}
+	data, err := d.ReadFile(in.spec.rel()+"/"+rel, limit)
+	if err != nil {
+		return nil, classifyPub(in.spec.rel()+"/"+rel, err)
+	}
+	return data, nil
+}
+
+// resolveEpoch finds the epoch of a chain log from the directories of the
+// source when --log does not carry one. It refuses to guess when there is not
+// exactly one: an old closed epoch must never be taken for the current one.
+func (in *logInputs) resolveEpoch() error {
+	l := in.spec
+	if l.kind != "chain" || l.hasEpoch {
+		return nil
+	}
+	d, err := in.openSource()
+	if err != nil {
+		return err
+	}
+	dirs, others, err := d.SubDirs("c/" + l.id)
+	if err != nil {
+		return classifyPub("the chain c/"+l.id, err)
+	}
+	var found []uint64
+	for _, name := range dirs {
+		if m := epochDirRE.FindStringSubmatch(name); m != nil {
+			n, _ := strconv.ParseUint(m[1], 10, 64)
+			found = append(found, n)
+		}
+	}
+	for _, name := range others {
+		if epochDirRE.MatchString(name) {
+			return &pubError{pubMalformed, "an epoch directory", fmt.Errorf("c/%s/%s %w", l.id, name, safefile.ErrNotRegular)}
+		}
+	}
+	if len(found) != 1 {
+		return fmt.Errorf("the source has %d epochs of the chain log, expected exactly one; give --log chain:%s:e<N>", len(found), l.id)
+	}
+	in.spec.epoch, in.spec.hasEpoch = found[0], true
+	return nil
+}
+
+// loadLogInputs reads --trust, --log, --source and --now. A problem with the
+// command line is an input error (exit status 2); a problem with the
+// publication is a pubError.
 func loadLogInputs(trustPath, logFlag, source, nowFlag string, noteGiven bool) (*logInputs, error) {
 	if trustPath == "" {
 		return nil, errors.New("missing --trust")
@@ -201,35 +236,37 @@ func loadLogInputs(trustPath, logFlag, source, nowFlag string, noteGiven bool) (
 	if in.spec, err = parseLogSpec(logFlag); err != nil {
 		return nil, err
 	}
-	data, err := readLimited(trustPath, trust.MaxFileSize)
+	data, err := readArg(trustPath, trust.MaxFileSize)
 	if err != nil {
 		return nil, err
 	}
 	if in.trust, err = trust.Parse(data); err != nil {
 		return nil, fmt.Errorf("trust file %s: %w", trustPath, err)
 	}
-	if len(in.trust.Keys) == 0 {
-		return nil, fmt.Errorf("trust file %s has no keys: nothing can be verified", trustPath)
-	}
 	var fixed bool
 	if in.now, fixed, err = parseNow(nowFlag); err != nil {
 		return nil, err
 	}
-	if !fixed {
+	if fixed {
+		in.notes = append(in.notes, "time used for key validity windows: "+in.now.Format(time.RFC3339)+", fixed by --now (the clock was not read)")
+	} else {
 		in.notes = append(in.notes, "time used for key validity windows: system clock "+in.now.Format(time.RFC3339))
 	}
 	if !in.spec.hasEpoch && in.spec.kind == "chain" {
 		if noteGiven {
 			return nil, fmt.Errorf("give the epoch with --log chain:%s:e<N> when the checkpoint is a file", in.spec.id)
 		}
-		if in.spec, err = in.spec.resolveEpoch(source); err != nil {
+		if err := in.resolveEpoch(); err != nil {
+			in.close()
 			return nil, err
 		}
 	}
 	return in, nil
 }
 
-// verifyNote verifies note data as the checkpoint of the log.
+// verifyNote verifies note data as the checkpoint of the log: the signature of
+// a trusted key that may be used now, and a tree size within what the trust file
+// allows for that key.
 func (in *logInputs) verifyNote(note []byte) (*checkpoint.Checkpoint, []signednote.Key, []string, error) {
 	origin := in.spec.origin(in.trust.OriginPrefix)
 	keys, notes, err := in.trust.SignerKeys(origin, in.now)
@@ -237,16 +274,28 @@ func (in *logInputs) verifyNote(note []byte) (*checkpoint.Checkpoint, []signedno
 		return nil, nil, notes, &inputErr{err}
 	}
 	cp, signers, err := checkpoint.Verify(note, keys, origin)
-	return cp, signers, notes, err
+	if err != nil {
+		return nil, nil, notes, err
+	}
+	// The size is in the signed text, so a size limit can be enforced; a time
+	// cannot (the checkpoint has none).
+	var allowed []signednote.Key
+	for _, k := range signers {
+		if in.trust.LimitFor(k.Public, cp.Size) {
+			allowed = append(allowed, k)
+		}
+	}
+	if len(allowed) == 0 {
+		return nil, nil, notes, &checkpoint.Error{Step: "key-size", Err: fmt.Errorf("the checkpoint has tree size %d, more than the trust file allows for the key that signed it (%s): a key limited with max_tree_size must not sign larger trees", cp.Size, describeSigners(signers))}
+	}
+	return cp, allowed, notes, nil
 }
 
 // inputErr marks an error that is an input problem (exit status 2) inside a
 // function that otherwise returns verification failures.
 type inputErr struct{ error }
 
-func (in *logInputs) checkpointPath() string {
-	return filepath.Join(in.source, filepath.FromSlash(in.spec.rel()), "checkpoint")
-}
+func (e *inputErr) Unwrap() error { return e.error }
 
 func describeSigners(signers []signednote.Key) string {
 	var parts []string
@@ -256,40 +305,62 @@ func describeSigners(signers []signednote.Key) string {
 	return strings.Join(parts, ", ")
 }
 
+func signerPrints(signers []signednote.Key) []string {
+	out := []string{}
+	for _, k := range signers {
+		out = append(out, trust.Fingerprint(k.Public))
+	}
+	return out
+}
+
 // ---- checkpoint ----
 
+// rollbackLine is the item of "not proved" that every checkpoint check without
+// a state carries: an older genuine checkpoint verifies.
+const rollbackLine = "that this is the latest checkpoint: an older genuine checkpoint also verifies, so a publisher that serves one hides every later entry (rollback). " +
+	"Keep the last checkpoint you verified and run consistency --old <that file>, or give --state FILE, or give --min-size"
+
 func (e *env) runCheckpoint(args []string) int {
-	fs, asJSON := e.newFlagsWithExit("checkpoint", "--trust FILE --log chain:<id>[:e<N>]|aggregate:<id> [--source DIR | --note FILE] [--min-size N] [--now TIME] [--json]",
+	fs, asJSON := e.newFlagsWithExit("checkpoint", "--trust FILE --log chain:<id>[:e<N>]|aggregate:<id> [--source DIR | --note FILE] [--min-size N] [--state FILE] [--now TIME] [--json]",
 		"Verify a signed checkpoint of a tile log: the note is well formed, at least one signature is\n"+
-			"by a key of the trust file, no signature of such a key is wrong, the origin is the one of the\n"+
-			"named log below the trusted prefix, and the size and root are well formed. The checkpoint is\n"+
-			"read from --note or from <source>/c/<id>/e<N>/checkpoint (aggregate: a/<id>/checkpoint).\n"+
-			"It does not check any tile; use consistency for that.", exitTextWith3)
+			"by a key of the trust file that may be used now, no signature of such a key is wrong, the\n"+
+			"origin is the one of the named log below the trusted prefix, the tree size is within what\n"+
+			"the trust file allows for the signing key, and the size and root are well formed. The\n"+
+			"checkpoint is read from --note or from <source>/c/<id>/e<N>/checkpoint (aggregate:\n"+
+			"a/<id>/checkpoint). It reads no tile and does not show that the checkpoint is the latest:\n"+
+			"an older genuine one verifies too. --min-size fails a smaller tree. --state FILE names a\n"+
+			"file holding the last checkpoint this command verified: a smaller size, or the same size\n"+
+			"with another root, then fails, and the file is replaced (atomically) after a success. A\n"+
+			"larger size is NOT shown to extend the state's log; use consistency for that.", exitTextWith3)
 	trustPath := fs.String("trust", "", "trust file (JSON)")
 	logFlag := fs.String("log", "", "the log: chain:<64 hex>[:e<N>] or aggregate:<64 hex>")
 	source := fs.String("source", ".", "directory of the publication or bundle")
 	note := fs.String("note", "", "checkpoint file to verify instead of the one in --source")
 	minSize := fs.Uint64("min-size", 0, "fail when the tree size is smaller than this")
+	statePath := fs.String("state", "", "file with the last verified checkpoint: refuses a smaller size or a fork, updated after a success")
 	nowFlag := fs.String("now", "", "time for key validity windows, RFC 3339 (default: system clock)")
 	if code, done := e.parseFlags(fs, args); done {
 		return code
 	}
 	const cmd = "checkpoint"
+	r := &result{cmd: cmd}
 	in, err := loadLogInputs(*trustPath, *logFlag, *source, *nowFlag, *note != "")
 	if err != nil {
-		return e.inputError(cmd, *asJSON, err)
+		return e.finishPub(r, *asJSON, err)
 	}
-	path := *note
-	if path == "" {
-		path = in.checkpointPath()
+	defer in.close()
+	r.notes = append(r.notes, in.notes...)
+	var data []byte
+	if *note != "" {
+		data, err = readArg(*note, signednote.MaxNoteSize)
+	} else {
+		data, err = in.readPublished("checkpoint", signednote.MaxNoteSize)
 	}
-	data, err := readLimited(path, signednote.MaxNoteSize)
 	if err != nil {
-		return e.inputError(cmd, *asJSON, err)
+		return e.finishPub(r, *asJSON, err)
 	}
-	r := &result{cmd: cmd}
 	cp, signers, keyNotes, err := in.verifyNote(data)
-	r.notes = append(in.notes, keyNotes...)
+	r.notes = append(r.notes, keyNotes...)
 	if err != nil {
 		var ie *inputErr
 		if errors.As(err, &ie) {
@@ -315,26 +386,101 @@ func (e *env) runCheckpoint(args []string) int {
 	if len(cp.Extensions) > 0 {
 		r.notes = append(r.notes, fmt.Sprintf("the checkpoint has %d extension line(s): they are signed but have no meaning here", len(cp.Extensions)))
 	}
-	r.headline = fmt.Sprintf("the checkpoint of %s at size %d is signed by a trusted key.", cp.Origin, cp.Size)
-	r.info = map[string]any{
-		"origin": cp.Origin, "size": cp.Size, "root": format.EncodeHex(cp.Root[:]),
-		"signers": signerPrints(signers), "extension_lines": len(cp.Extensions),
-	}
 	r.notProved = []string{
 		"the tiles and entries of the log: this checks the signed size and root only (use consistency and, later, proof with a bundle)",
 		"when the checkpoint was made: no anchor is checked, the time is the signer's claim",
 		"that the signer shows the same history to everyone: a split view needs witnesses or a monitor",
 		"that the trust file was obtained outside the cluster: that is your responsibility",
 	}
+	r.headline = fmt.Sprintf("the checkpoint of %s at size %d is signed by a trusted key.", cp.Origin, cp.Size)
+	if *statePath == "" {
+		r.notProved = append([]string{rollbackLine}, r.notProved...)
+	} else if code, done := e.checkState(r, in, cp, data, *statePath, *asJSON); done {
+		return code
+	}
+	r.info = map[string]any{
+		"origin": cp.Origin, "size": cp.Size, "root": format.EncodeHex(cp.Root[:]),
+		"signers": signerPrints(signers), "extension_lines": len(cp.Extensions),
+	}
 	return e.finishOK(r, *asJSON)
 }
 
-func signerPrints(signers []signednote.Key) []string {
-	out := []string{}
-	for _, k := range signers {
-		out = append(out, trust.Fingerprint(k.Public))
+// checkState applies --state: reads the state, compares, and after a success
+// replaces it. It returns done=true with the exit status when the command ends
+// here (a failure or an input error).
+func (e *env) checkState(r *result, in *logInputs, cp *checkpoint.Checkpoint, note []byte, path string, asJSON bool) (int, bool) {
+	oldNote, err := readArg(path, signednote.MaxNoteSize)
+	var old *checkpoint.Checkpoint
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		r.notes = append(r.notes, "the state file did not exist and was created: rollback and forks are checked against it from the next run on")
+	case err != nil:
+		return e.inputError(r.cmd, asJSON, fmt.Errorf("--state: %w", err)), true
+	default:
+		var verr error
+		old, _, _, verr = in.verifyNote(oldNote)
+		if verr != nil {
+			return e.inputError(r.cmd, asJSON, fmt.Errorf("--state %s does not verify as a checkpoint of this log with this trust file (%w): if you changed the trust file or the log on purpose, move the state file away", clipArg(path), verr)), true
+		}
 	}
-	return out
+	write := true
+	switch {
+	case old == nil:
+		r.ok("state", fmt.Sprintf("no earlier checkpoint was recorded: size %d is recorded now", cp.Size))
+		r.notProved = append(r.notProved, "that this checkpoint is not already a rollback: the state file was empty, so nothing earlier was known")
+	case cp.Size < old.Size:
+		return e.finishFailed(r, asJSON, "rollback", fmt.Errorf("the checkpoint has size %d, smaller than %d, the size of the last checkpoint you verified: the log went back, or an old checkpoint is being shown", cp.Size, old.Size)), true
+	case cp.Size == old.Size && cp.Root != old.Root:
+		return e.finishFailed(r, asJSON, "fork", fmt.Errorf("two trusted checkpoints of this log have the same size %d and different roots (%x and %x): the log has two histories", cp.Size, old.Root, cp.Root)), true
+	case cp.Size == old.Size:
+		r.ok("state", fmt.Sprintf("same size and root as the last verified checkpoint (%d)", old.Size))
+		write = false
+	default:
+		r.ok("state", fmt.Sprintf("size %d is not smaller than %d, the size of the last verified checkpoint", cp.Size, old.Size))
+		r.notProved = append(r.notProved, fmt.Sprintf("that the log at size %d extends the log at size %d recorded in the state: only the sizes were compared, a larger size can be another history (run consistency --old %s --source ... before this command to prove it)", cp.Size, old.Size, clipArg(path)))
+	}
+	r.notProved = append(r.notProved, "that the state file is the one you left: it is your record, keep it where the publisher cannot write")
+	if write {
+		if err := writeStateAtomic(path, note); err != nil {
+			return e.inputError(r.cmd, asJSON, fmt.Errorf("the checkpoint verified but --state %s could not be updated, so later runs do not know it: %w", clipArg(path), err)), true
+		}
+		r.notes = append(r.notes, fmt.Sprintf("the state file was updated to size %d", cp.Size))
+	}
+	return 0, false
+}
+
+// writeStateAtomic replaces the state file with the verified note: a
+// temporary file in the same directory, flushed to disk, then renamed, so a
+// crash leaves the old state or the new one and never half of one. Two runs at
+// the same time are not coordinated: do not run two against one state file.
+func writeStateAtomic(path string, note []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	ok := false
+	defer func() {
+		if !ok {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if _, err := f.Write(note); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	ok = true
+	return nil
 }
 
 // ---- consistency ----
@@ -347,8 +493,11 @@ func (e *env) runConsistency(args []string) int {
 			"2.1.4.2). The new checkpoint is --new or the one in --source; both are verified like the\n"+
 			"checkpoint command does. The old checkpoint is a note file (verified the same way) or\n"+
 			"SIZE:ROOT with the root in base64 (taken as given: you hold it from elsewhere). The proof\n"+
-			"hashes are read from the tiles under --source and checked against both roots. Missing tiles\n"+
-			"give status 3, a tile that is wrong gives status 1.", exitTextWith3)
+			"hashes are read from the tiles under --source and checked against both roots. Only the\n"+
+			"tiles on the proof path are read (a few per level of the tree), so a damaged tile that\n"+
+			"is not on that path is not noticed. When the sizes are equal or the old size is 0 the\n"+
+			"proof is empty and no tile is read; the output says so. A tile that is absent gives\n"+
+			"status 3, a tile that is present and wrong gives status 1.", exitTextWith3)
 	trustPath := fs.String("trust", "", "trust file (JSON)")
 	logFlag := fs.String("log", "", "the log: chain:<64 hex>[:e<N>] or aggregate:<64 hex>")
 	source := fs.String("source", ".", "directory of the publication or bundle")
@@ -359,13 +508,16 @@ func (e *env) runConsistency(args []string) int {
 		return code
 	}
 	const cmd = "consistency"
+	r := &result{cmd: cmd}
 	if *oldFlag == "" {
 		return e.inputError(cmd, *asJSON, errors.New("missing --old"))
 	}
 	in, err := loadLogInputs(*trustPath, *logFlag, *source, *nowFlag, *newFlag != "")
 	if err != nil {
-		return e.inputError(cmd, *asJSON, err)
+		return e.finishPub(r, *asJSON, err)
 	}
+	defer in.close()
+	r.notes = append(r.notes, in.notes...)
 	// The old checkpoint is an anchor the caller supplies: if it cannot be
 	// read or is not a note at all, that is an input error (status 2), not a
 	// finding about the log.
@@ -383,36 +535,36 @@ func (e *env) runConsistency(args []string) int {
 			return e.inputError(cmd, *asJSON, errors.New("--old has size 0 but not the root of the empty tree"))
 		}
 	} else {
-		oldData, err := readLimited(*oldFlag, signednote.MaxNoteSize)
+		oldData, err := readArg(*oldFlag, signednote.MaxNoteSize)
 		if err != nil {
 			return e.inputError(cmd, *asJSON, err)
 		}
 		if _, err := signednote.Parse(oldData); err != nil {
-			return e.inputError(cmd, *asJSON, fmt.Errorf("--old %s is not a signed note: %w", *oldFlag, err))
+			return e.inputError(cmd, *asJSON, fmt.Errorf("--old %s is not a signed note: %w", clipArg(*oldFlag), err))
 		}
 		oldSigned = true
-		cp, _, _, verr := in.verifyNote(oldData)
+		cp, _, oldNotes, verr := in.verifyNote(oldData)
+		r.notes = appendNew(r.notes, oldNotes)
 		if verr != nil {
 			var ie *inputErr
 			if errors.As(verr, &ie) {
 				return e.inputError(cmd, *asJSON, ie.error)
 			}
-			r := &result{cmd: cmd, notes: in.notes}
 			return e.finishFailed(r, *asJSON, "old-checkpoint", verr)
 		}
 		oldCP = cp
 	}
-	newPath := *newFlag
-	if newPath == "" {
-		newPath = in.checkpointPath()
+	var newData []byte
+	if *newFlag != "" {
+		newData, err = readArg(*newFlag, signednote.MaxNoteSize)
+	} else {
+		newData, err = in.readPublished("checkpoint", signednote.MaxNoteSize)
 	}
-	newData, err := readLimited(newPath, signednote.MaxNoteSize)
 	if err != nil {
-		return e.inputError(cmd, *asJSON, err)
+		return e.finishPub(r, *asJSON, err)
 	}
-	r := &result{cmd: cmd, notes: in.notes}
 	newCP, signers, keyNotes, err := in.verifyNote(newData)
-	r.notes = append(r.notes, keyNotes...)
+	r.notes = appendNew(r.notes, keyNotes)
 	if err != nil {
 		var ie *inputErr
 		if errors.As(err, &ie) {
@@ -438,11 +590,27 @@ func (e *env) runConsistency(args []string) int {
 	if !oldSigned {
 		r.notProved = append(r.notProved, "that the old size and root are the checkpoint you meant: they were given without a signature")
 	}
-	if newCP.Size == 0 {
-		return e.finishOK(withHeadline(r, newCP, oldCP), *asJSON)
+	r.headline = fmt.Sprintf("the log at size %d extends the log at size %d.", newCP.Size, oldCP.Size)
+	if oldCP.Size == 0 || oldCP.Size == newCP.Size {
+		// The proof is empty: no tile is read, and the output must not say
+		// that tiles were checked.
+		if err := merkle.VerifyConsistency(oldCP.Size, newCP.Size, oldCP.Root, newCP.Root, nil); err != nil {
+			return e.finishFailed(r, *asJSON, "consistency", err)
+		}
+		r.ok("tiles", "no tile was needed: the proof is empty, nothing was read from the source")
+		if oldCP.Size == 0 {
+			r.ok("consistency", "the empty tree is a prefix of every tree: there is nothing to prove")
+		} else {
+			r.ok("consistency", fmt.Sprintf("both checkpoints have size %d and the same root", oldCP.Size))
+			r.headline = fmt.Sprintf("the log at size %d is the same as the log at size %d.", newCP.Size, oldCP.Size)
+		}
+		return e.finishOK(r, *asJSON)
 	}
-	logDir := filepath.Join(in.source, filepath.FromSlash(in.spec.rel()))
-	reader, err := tlog.NewReader(tlog.FSSource{FS: os.DirFS(logDir)}, newCP.Size)
+	d, err := in.openSource()
+	if err != nil {
+		return e.inputError(cmd, *asJSON, err)
+	}
+	reader, err := tlog.NewReader(tlog.FSSource{Files: logFiles{d, in.spec.rel()}}, newCP.Size)
 	if err != nil {
 		return e.inputError(cmd, *asJSON, err)
 	}
@@ -450,162 +618,45 @@ func (e *env) runConsistency(args []string) int {
 	if err != nil {
 		switch {
 		case errors.Is(err, tlog.ErrMissing):
-			return e.finishIncomplete(r, *asJSON, []string{err.Error() + " (under " + logDir + ")"})
+			return e.finishIncomplete(r, *asJSON, []string{"the publication does not contain a tile the proof needs: " + err.Error() + " (under " + in.spec.rel() + ")"})
 		case errors.Is(err, tlog.ErrBadTile):
 			return e.finishFailed(r, *asJSON, "tiles", err)
 		}
 		return e.inputError(cmd, *asJSON, err)
 	}
-	r.ok("tiles", fmt.Sprintf("proof of %d hash(es) read from the tiles of size %d", len(path), newCP.Size))
+	r.ok("tiles", fmt.Sprintf("read %d tile(s) on the proof path of the tree of size %d: %d proof hash(es); no other tile was read", reader.TilesRead(), newCP.Size, len(path)))
 	if err := merkle.VerifyConsistency(oldCP.Size, newCP.Size, oldCP.Root, newCP.Root, path); err != nil {
 		return e.finishFailed(r, *asJSON, "consistency", err)
 	}
-	r.ok("consistency", "RFC 9162 2.1.4.2: both roots follow from the proof")
-	return e.finishOK(withHeadline(r, newCP, oldCP), *asJSON)
+	r.ok("consistency", "RFC 9162 2.1.4.2: both roots follow from the proof hashes")
+	r.notProved = append(r.notProved, "the tile directory as a whole: only the tiles on the proof path were read, a damaged tile elsewhere is not noticed")
+	return e.finishOK(r, *asJSON)
 }
 
-func withHeadline(r *result, newCP, oldCP *checkpoint.Checkpoint) *result {
-	r.headline = fmt.Sprintf("the log at size %d extends the log at size %d.", newCP.Size, oldCP.Size)
-	return r
+// logFiles reads the files below one log directory of a source.
+type logFiles struct {
+	d   *safefile.Dir
+	rel string
 }
 
-// ---- trust ----
-
-func (e *env) runTrust(args []string) int {
-	if len(args) == 0 {
-		fmt.Fprintln(e.stderr, "kingres-verify trust: expected init or show")
-		return ExitUsage
-	}
-	switch args[0] {
-	case "init":
-		return e.runTrustInit(args[1:])
-	case "show":
-		return e.runTrustShow(args[1:])
-	case "follow":
-		fmt.Fprintln(e.stderr, "kingres-verify trust follow: not built yet (it needs the key events of the publication)")
-		return ExitUsage
-	case "-h", "--help", "help":
-		fmt.Fprint(e.stdout, "Usage: kingres-verify trust init|show [flags]\n\n  init  write a trust file from a public key you typed or pasted and its fingerprint\n  show  print a trust file\n\nExit status: 0 ok, 2 usage or input error.\n")
-		return ExitOK
-	}
-	fmt.Fprintf(e.stderr, "kingres-verify trust: unknown subcommand %q, expected init or show\n", args[0])
-	return ExitUsage
+func (l logFiles) ReadFile(name string, limit int64) ([]byte, error) {
+	return l.d.ReadFile(l.rel+"/"+name, limit)
 }
 
-func (e *env) runTrustInit(args []string) int {
-	fs, asJSON := e.newFlagsWithExit("trust init", "--origin-prefix PREFIX (--public-key BASE64 | --public-key-file FILE) --fingerprint HEX [--name LABEL] [--out FILE]",
-		"Write a new trust file with one pinned signing key. The public key and the fingerprint must\n"+
-			"come from you (typed or pasted from the console), not from the publication being checked:\n"+
-			"the command refuses to run without --fingerprint and refuses a key that does not match it.\n"+
-			"It does not overwrite a file. --out - writes to the standard output.", "0 written, 2 usage or input error.")
-	prefix := fs.String("origin-prefix", "", "origin prefix of the cluster, for example ledger.example.com/kingres")
-	pubFlag := fs.String("public-key", "", "Ed25519 public key, base64 of 32 bytes")
-	pubFile := fs.String("public-key-file", "", "file holding the base64 public key")
-	fpFlag := fs.String("fingerprint", "", "SHA-256 of the public key in hex, as the console shows it")
-	name := fs.String("name", "key-1", "label for the key (not the note key name)")
-	out := fs.String("out", "trust.json", "file to write, or - for standard output")
-	if code, done := e.parseFlags(fs, args); done {
-		return code
-	}
-	const cmd = "trust init"
-	if *prefix == "" {
-		return e.inputError(cmd, *asJSON, errors.New("missing --origin-prefix"))
-	}
-	if *fpFlag == "" {
-		return e.inputError(cmd, *asJSON, errors.New("missing --fingerprint: type or paste the fingerprint the console shows, so that a wrong key is noticed"))
-	}
-	if (*pubFlag == "") == (*pubFile == "") {
-		return e.inputError(cmd, *asJSON, errors.New("give exactly one of --public-key and --public-key-file"))
-	}
-	text := *pubFlag
-	if *pubFile != "" {
-		b, err := readLimited(*pubFile, 4096)
-		if err != nil {
-			return e.inputError(cmd, *asJSON, err)
+// appendNew appends the notes that are not in the list yet: the old and the
+// new checkpoint are verified with the same keys and give the same notes.
+func appendNew(list, add []string) []string {
+	for _, a := range add {
+		dup := false
+		for _, l := range list {
+			if l == a {
+				dup = true
+				break
+			}
 		}
-		text = strings.TrimSpace(string(b))
-	}
-	pub, err := signednote.DecodeBase64(text)
-	if err != nil {
-		return e.inputError(cmd, *asJSON, fmt.Errorf("public key: %w", err))
-	}
-	f, err := trust.New(*prefix, *name, pub, *fpFlag)
-	if err != nil {
-		return e.inputError(cmd, *asJSON, err)
-	}
-	data, err := f.Marshal()
-	if err != nil {
-		return e.inputError(cmd, *asJSON, err)
-	}
-	if *out == "-" {
-		_, _ = e.stdout.Write(data)
-		return ExitOK
-	}
-	fh, err := os.OpenFile(*out, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644) // #nosec G304 -- the path is a command line argument
-	if err != nil {
-		return e.inputError(cmd, *asJSON, fmt.Errorf("not writing %s: %w", *out, err))
-	}
-	if _, err := fh.Write(data); err != nil {
-		_ = fh.Close()
-		return e.inputError(cmd, *asJSON, err)
-	}
-	if err := fh.Close(); err != nil {
-		return e.inputError(cmd, *asJSON, err)
-	}
-	if *asJSON {
-		e.printJSON(jsonOutput{Command: cmd, Verified: true, Info: map[string]any{"file": *out, "fingerprint": f.Keys[0].Fingerprint, "origin_prefix": f.OriginPrefix}})
-		return ExitOK
-	}
-	fmt.Fprintf(e.stdout, "wrote %s: origin prefix %s, key %s (fingerprint %s)\n", *out, f.OriginPrefix, f.Keys[0].Name, f.Keys[0].Fingerprint)
-	fmt.Fprintln(e.stdout, "  note: keep this file where the cluster's administrators cannot change it; a trust file that came from the cluster proves nothing")
-	return ExitOK
-}
-
-func (e *env) runTrustShow(args []string) int {
-	fs, asJSON := e.newFlagsWithExit("trust show", "--trust FILE [--json]", "Validate and print a trust file.", "0 ok, 2 usage or input error.")
-	path := fs.String("trust", "", "trust file (JSON)")
-	if code, done := e.parseFlags(fs, args); done {
-		return code
-	}
-	const cmd = "trust show"
-	if *path == "" {
-		return e.inputError(cmd, *asJSON, errors.New("missing --trust"))
-	}
-	data, err := readLimited(*path, trust.MaxFileSize)
-	if err != nil {
-		return e.inputError(cmd, *asJSON, err)
-	}
-	f, err := trust.Parse(data)
-	if err != nil {
-		return e.inputError(cmd, *asJSON, fmt.Errorf("trust file %s: %w", *path, err))
-	}
-	keys := []map[string]any{}
-	for _, k := range f.Keys {
-		m := map[string]any{"name": k.Name, "fingerprint": k.Fingerprint}
-		if k.NotBefore != nil {
-			m["not_before"] = k.NotBefore.Format(time.RFC3339)
+		if !dup {
+			list = append(list, a)
 		}
-		if k.NotAfter != nil {
-			m["not_after"] = k.NotAfter.Format(time.RFC3339)
-		}
-		keys = append(keys, m)
 	}
-	if *asJSON {
-		e.printJSON(jsonOutput{Command: cmd, Verified: true, Info: map[string]any{"origin_prefix": f.OriginPrefix, "keys": keys, "tsa_roots": len(f.TSARoots), "client_keys": len(f.ClientKeys)}})
-		return ExitOK
-	}
-	fmt.Fprintf(e.stdout, "trust file %s is valid\n  origin prefix: %s\n", *path, f.OriginPrefix)
-	for _, k := range f.Keys {
-		win := ""
-		if k.NotBefore != nil {
-			win += " not before " + k.NotBefore.Format(time.RFC3339)
-		}
-		if k.NotAfter != nil {
-			win += " not after " + k.NotAfter.Format(time.RFC3339)
-		}
-		fmt.Fprintf(e.stdout, "  key %q fingerprint %s%s\n", k.Name, k.Fingerprint, win)
-	}
-	fmt.Fprintf(e.stdout, "  time-stamp authority roots: %d, client keys: %d\n", len(f.TSARoots), len(f.ClientKeys))
-	fmt.Fprintln(e.stdout, "  note: compare the fingerprints with the ones the cluster's console shows, by a channel other than this file")
-	return ExitOK
+	return list
 }
