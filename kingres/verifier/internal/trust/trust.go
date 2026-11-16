@@ -454,9 +454,9 @@ func (k Key) Why(now time.Time) string {
 	case Revoked:
 		return id + " is revoked in the trust file and was not used"
 	case NotYetValid:
-		return fmt.Sprintf("%s is not valid before %s and was not used", id, k.NotBefore.Format(time.RFC3339))
+		return fmt.Sprintf("%s is not valid before %s and was not used", id, k.NotBefore.Format(time.RFC3339Nano))
 	case Expired:
-		return fmt.Sprintf("%s has not_after %s, which has passed, and was not used (to check older checkpoints give --now a time before it, or limit the key with max_tree_size instead)", id, k.NotAfter.Format(time.RFC3339))
+		return fmt.Sprintf("%s has not_after %s, which has passed, and was not used (to check older checkpoints give --now a time before it, or limit the key with max_tree_size instead)", id, k.NotAfter.Format(time.RFC3339Nano))
 	}
 	if k.MaxTreeSize != nil {
 		return fmt.Sprintf("%s counts only for checkpoints of tree size %d or less", id, *k.MaxTreeSize)
@@ -510,7 +510,7 @@ func (f *File) SignerKeys(origin string, now time.Time) ([]signednote.Key, []str
 		}
 	}
 	if len(keys) == 0 {
-		return nil, notes, fmt.Errorf("the trust file has no key that can be used at %s: %s", now.Format(time.RFC3339), strings.Join(notes, "; "))
+		return nil, notes, fmt.Errorf("the trust file has no key that can be used at %s: %s", now.Format(time.RFC3339Nano), strings.Join(notes, "; "))
 	}
 	return keys, notes, nil
 }
@@ -555,7 +555,7 @@ func (f *File) Marshal() ([]byte, error) {
 		if t == nil {
 			return nil
 		}
-		s := t.UTC().Format(time.RFC3339)
+		s := t.UTC().Format(time.RFC3339Nano)
 		return &s
 	}
 	for _, k := range f.Keys {
@@ -569,4 +569,24 @@ func (f *File) Marshal() ([]byte, error) {
 		return nil, err
 	}
 	return append(b, '\n'), nil
+}
+
+// AllKeys returns every pinned key as a note key for origin, whatever its
+// standing. It is for a note the auditor already holds (a state file, an old
+// checkpoint): the signature is checked against every key of the file, and the
+// caller then decides from Key.Revoked, Key.MaxTreeSize and the window what
+// the signature is worth (correction 17 of the design).
+func (f *File) AllKeys(origin string) ([]signednote.Key, error) {
+	if origin != f.OriginPrefix && !strings.HasPrefix(origin, f.OriginPrefix+"/") {
+		return nil, fmt.Errorf("origin %q is not below the trusted prefix %q", clip(origin), f.OriginPrefix)
+	}
+	var keys []signednote.Key
+	for _, k := range f.Keys {
+		sk, err := signednote.NewKey(origin, k.Public)
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, sk)
+	}
+	return keys, nil
 }

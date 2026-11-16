@@ -68,6 +68,14 @@ func Root(leaves []Hash) Hash {
 // ErrPath is returned when an audit path does not fit the tree.
 var ErrPath = errors.New("audit path does not fit the tree")
 
+// ErrOldRoot and ErrNewRoot say which root a consistency path failed to
+// reach: the old root means the two checkpoints are of different histories (a
+// fork), the new root means the tiles do not match the signed checkpoint.
+var (
+	ErrOldRoot = errors.New("consistency path does not lead to the old root")
+	ErrNewRoot = errors.New("consistency path does not lead to the new root")
+)
+
 // RootFromPath computes the tree root implied by the leaf hash at index in a
 // tree of size leaves and its audit path, following RFC 9162 section
 // 2.1.3.2. The caller compares the result with the expected root.

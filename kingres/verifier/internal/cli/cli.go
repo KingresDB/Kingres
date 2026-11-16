@@ -11,7 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/chain"
@@ -38,6 +38,9 @@ const (
 const (
 	maxFileSize   = 16 << 20
 	maxBlocksSize = 1 << 30
+	// maxDigestFiles and maxDigestTotal bound what digest-chain reads.
+	maxDigestFiles = 1024
+	maxDigestTotal = 64 << 20
 )
 
 const usageText = `kingres-verify checks the tamper-evident ledger of KingresDB without trusting the database.
@@ -95,7 +98,7 @@ func Run(args []string, stdout, stderr io.Writer, version string) int {
 	case "trust":
 		return e.runTrust(args[1:])
 	}
-	fmt.Fprintf(stderr, "kingres-verify: unknown command %q, expected one of proof, row-hash, digest-chain, blocks, checkpoint, consistency, trust, version\n", args[0])
+	fmt.Fprintf(stderr, "kingres-verify: unknown command %s, expected one of proof, row-hash, digest-chain, blocks, checkpoint, consistency, trust, version\n", untrusted(strconv.Quote(args[0])))
 	return ExitUsage
 }
 
@@ -126,7 +129,7 @@ func (e *env) parseFlags(fs *flag.FlagSet, args []string) (code int, done bool) 
 		if errors.Is(err, flag.ErrHelp) {
 			return ExitOK, true
 		}
-		fmt.Fprintf(e.stderr, "kingres-verify %s: %v\nRun \"kingres-verify %s --help\".\n", fs.Name(), err, fs.Name())
+		fmt.Fprintf(e.stderr, "kingres-verify %s: %s\nRun \"kingres-verify %s --help\".\n", fs.Name(), untrusted(err.Error()), fs.Name())
 		return ExitUsage, true
 	}
 	return 0, false
@@ -300,7 +303,7 @@ func (e *env) runRowHash(args []string) int {
 		if *showEnc {
 			info["encoding"] = format.EncodeHex(enc)
 		}
-		e.printJSON(jsonOutput{Command: cmd, Verified: true, Info: info})
+		e.printJSON(jsonOutput{Command: cmd, Verified: false, Info: info, Notes: []string{"row-hash computes a hash and verifies nothing: verified is false by design, use proof to check an entry"}})
 		return ExitOK
 	}
 	fmt.Fprintf(e.stdout, "%x\n", h)
@@ -335,34 +338,67 @@ func (e *env) runDigestChain(args []string) int {
 	if len(paths) == 0 {
 		return e.inputError(cmd, *asJSON, errors.New("missing --digests"))
 	}
-	var files []string
+	// One digest is a few hundred bytes. The number of files and their total
+	// size are bounded so that a directory the publisher filled cannot use the
+	// auditor's memory; a directory is listed by name, never as a glob pattern
+	// (a directory called x[ab] is that directory).
+	var ds []chain.NamedDigest
+	var total int64
+	add := func(name string, data []byte) error {
+		if len(ds) >= maxDigestFiles {
+			return fmt.Errorf("more than %d digest files: give fewer, or the ones you need", maxDigestFiles)
+		}
+		if total += int64(len(data)); total > maxDigestTotal {
+			return fmt.Errorf("the digest files are larger than %d bytes together", maxDigestTotal)
+		}
+		d, err := chain.ParseDigest(data)
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		ds = append(ds, chain.NamedDigest{Name: name, Digest: d})
+		return nil
+	}
 	for _, p := range paths {
 		st, err := os.Stat(p)
 		if err != nil {
 			return e.inputError(cmd, *asJSON, err)
 		}
 		if !st.IsDir() {
-			files = append(files, p)
+			data, err := readArg(p, maxFileSize)
+			if err == nil {
+				err = add(p, data)
+			}
+			if err != nil {
+				return e.inputError(cmd, *asJSON, err)
+			}
 			continue
 		}
-		m, err := filepath.Glob(filepath.Join(p, "*.json"))
+		dir, err := safefile.OpenDir(p)
 		if err != nil {
 			return e.inputError(cmd, *asJSON, err)
 		}
-		sort.Strings(m)
-		files = append(files, m...)
-	}
-	var ds []chain.NamedDigest
-	for _, f := range files {
-		data, err := readArg(f, maxFileSize)
+		names, others, err := dir.RegularNames()
+		for _, n := range others {
+			if err == nil && strings.HasSuffix(n, ".json") {
+				err = fmt.Errorf("%s %w", filepath.Join(p, n), safefile.ErrNotRegular)
+			}
+		}
+		for _, n := range names {
+			if err != nil {
+				break
+			}
+			if !strings.HasSuffix(n, ".json") {
+				continue
+			}
+			var data []byte
+			if data, err = dir.ReadFile(n, maxFileSize); err == nil {
+				err = add(filepath.Join(p, n), data)
+			}
+		}
+		_ = dir.Close()
 		if err != nil {
 			return e.inputError(cmd, *asJSON, err)
 		}
-		d, err := chain.ParseDigest(data)
-		if err != nil {
-			return e.inputError(cmd, *asJSON, fmt.Errorf("%s: %w", f, err))
-		}
-		ds = append(ds, chain.NamedDigest{Name: f, Digest: d})
 	}
 	if len(ds) == 0 {
 		// A directory with no *.json file would otherwise be reported as
@@ -431,24 +467,32 @@ func (e *env) runBlocks(args []string) int {
 	default:
 		return e.inputError(cmd, *asJSON, errors.New("missing --digest or --chain-id: the genesis hash needs the chain id"))
 	}
-	data, err := readArg(*blocksPath, maxBlocksSize)
+	f, err := safefile.OpenArg(*blocksPath, maxBlocksSize)
 	if err != nil {
 		return e.inputError(cmd, *asJSON, err)
 	}
+	defer f.Close()
 	r := &result{cmd: cmd}
-	headers, err := chain.ParseBlocks(data)
+	// The export is read line by line and one header is kept: memory does not
+	// grow with the file.
+	var dp *chain.Digest
+	if haveDigest {
+		dp = &d
+	}
+	count, err := chain.StreamBlocks(f, cid, dp)
 	if err != nil {
-		return e.finishFailed(r, *asJSON, "parse", err)
+		var se *chain.StreamError
+		if errors.As(err, &se) {
+			if errors.Is(se.Err, safefile.ErrTooLarge) {
+				return e.inputError(cmd, *asJSON, se.Err)
+			}
+			return e.finishFailed(r, *asJSON, se.Step, se.Err)
+		}
+		return e.inputError(cmd, *asJSON, err)
 	}
-	if err := chain.VerifyBlocks(headers, cid); err != nil {
-		return e.finishFailed(r, *asJSON, "chain", err)
-	}
-	r.ok("chain", fmt.Sprintf("%d blocks, heights 0 to %d, recomputed from the genesis hash", len(headers), len(headers)-1))
+	r.ok("chain", fmt.Sprintf("%d blocks, heights 0 to %d, recomputed from the genesis hash", count, count-1))
 	r.headline = "the exported block headers form an unbroken chain from the genesis hash."
 	if haveDigest {
-		if err := chain.CheckDigestOnBlocks(headers, d); err != nil {
-			return e.finishFailed(r, *asJSON, "digest", err)
-		}
 		r.ok("digest", fmt.Sprintf("the chain reaches the digest at height %d", d.Height))
 		r.headline = fmt.Sprintf("the exported block headers form an unbroken chain from the genesis hash and reach the digest at height %d.", d.Height)
 	}

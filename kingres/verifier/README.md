@@ -37,10 +37,12 @@ It verifies **what is in the files you give it**, nothing else.
   to an external anchor of a digest with a trusted timestamp.
 - `digest-chain` compares digests only (at least two, from a directory or files you name); `blocks` checks exported headers only.
   Their output says what they do not prove.
-- `checkpoint` shows that a checkpoint is signed by a key you trust, not that it is the
-  latest one (rollback), and reads no tile; `consistency` reads only the tiles on its
-  proof path. Neither shows that the entries behind the hashes are what the operator
-  says. Status 3 is an alert: see "Exit statuses".
+- `checkpoint` without `--state` shows that a checkpoint is signed by a key you trust, not
+  that it is the latest one (rollback), and reads no tile. With `--state` it also proves,
+  from the tiles, that the checkpoint extends the one you recorded, and nothing else about
+  the log. `consistency` reads only the tiles on its proof path. Neither shows that the
+  entries behind the hashes are what the operator says. Status 3 is an alert: see "Exit
+  statuses".
 
 ## Installation
 
@@ -59,7 +61,7 @@ committed). `go.mod` has no `require` line: only the standard library is used.
 |---|---|
 | 0 | everything that was asked for was verified (`VERIFIED` or `CONSISTENT` is printed) |
 | 1 | a verification failed (the failed step is named), or the publication holds a file in a form it must not have (a symbolic link on the way, a directory, device or named pipe, a file over its size limit, a tile of the wrong size); the word `VERIFIED` is never printed |
-| 2 | usage or input error: a flag is missing or wrong, a file or directory **you named** cannot be read (it is absent, not a regular file, too large) or is malformed (digest, columns file, trust file, state file, block export when it cannot be parsed as an export), or no key of the trust file can be used at the time given; nothing was verified |
+| 2 | usage or input error: a flag is missing or wrong, a file or directory **you named** cannot be read (it is absent, not a regular file, too large) or is malformed (digest, columns file, trust file, state file, block export when it cannot be parsed as an export), or no key of the trust file can be used at the time given, or **a checkpoint you hold** (`--state`, `--old FILE`) cannot serve as your anchor (no key of the trust file signed it, or only a revoked one, or one beyond its `max_tree_size`), or the state file stayed locked by another run for 10 seconds; nothing was verified |
 | 3 | incomplete: nothing failed, but **the publication does not contain something that was asked for** (a checkpoint, a tile, the directory of a log); `INCOMPLETE` is printed and the missing items are listed; `VERIFIED` is never printed. **Treat 3 as an alert, never as "probably fine"**: a publisher must serve the tiles of every checkpoint it signed, so one that withholds exactly the tiles that would show a fork gets status 3 and not status 1, and a missing file is at best neglect. Only the commands of phase 7 (`checkpoint`, `consistency`) can end with 3; a failure always wins over an incomplete check |
 
 A malformed **proof** is a failed verification (status 1, step `parse`): the
@@ -76,6 +78,19 @@ command prints a line in only one of the two. `notes` is what the reader must kn
 how the run was made (the clock that was used, a key that was left out and why, a state
 file that was written); `not_proved` is what a success does not show. A failed result
 carries its notes too.
+
+**Text from the inputs is escaped.** A file name, a key of a JSON file, a label, a path
+on the command line or an error text that quotes them can come from the publisher or the
+database server. In the text output (and on the standard error, in both formats) every
+such string is written by one function: control characters (newline, carriage return,
+tab, escape, the C1 range, DEL) become `\n`, `\r`, `\t`, `\xNN`; bytes that are not UTF-8
+become `\xNN`; the Unicode bidirectional marks and overrides, the line and paragraph
+separators, the byte order mark and the other format characters become `\uNNNN`; a value
+longer than 2,048 bytes is cut and says how much was cut. A backslash is left as it is.
+So no input can start a line (`VERIFIED:`, `FAILED at step`, `  ok  `, `  note:` ...) or
+move the terminal, and a test fails when code outside the output layer prints. The JSON
+output is ordinary JSON and carries the strings as they are (the encoder escapes them);
+do not copy it to a terminal without a tool that does the same.
 
 ## Subcommands
 
@@ -179,6 +194,10 @@ block times do not go back; equal heights have equal block hashes (and equal
 `block_closed_at`); and, when every digest has `generated_at`, heights do not
 decrease in generation order (otherwise the database went back to an earlier
 state). At least two digests are required. Exit status 1 lists every problem.
+A directory is listed by name (a directory called `x[ab]` is that directory, never a
+pattern) and is read through the same helper as a source: at most 1,024 entries, no link
+followed. At most 1,024 digest files are read in all (named or in a directory), at most
+64 MiB together (each at most 16 MiB); more is status 2.
 
 It does **not** prove that the blocks between the digests are intact, that any
 row is in the ledger, or that any digest is authentic; `generated_at` is not
@@ -197,6 +216,13 @@ previous block's hash, and block times must not go back. With `--digest` it also
 checks that the chain reaches the digest (block at the digest height has the
 digest's hash and `block_closed_at`). The chain id comes from the digest or from
 `--chain-id` (the export has no chain id; without either, status 2).
+
+The export is read line by line and only one header is kept, so memory does not grow
+with the file: a measured run over 1.2 million blocks (a 400 MB file) used 12 MB of
+resident memory, where reading the whole file and all headers (the earlier version) used
+1.15 GB (2.9 times the file). A line is at most 1 MiB and the file at most 1 GiB. The
+first problem in file order is reported, so a later damage is found only if no earlier
+one stops the run (a parse failure and a chain failure are both status 1).
 
 Each line has the header fields: `height`, `hash_version`, `prev_hash`,
 `tx_merkle_root`, `tx_count`, `closed_at_us` (microseconds since 2000-01-01 UTC,
@@ -249,9 +275,9 @@ what the auditor says (the time given with `--now`), and nothing else:
 
 | Member | Effect |
 |---|---|
-| `not_before`, `not_after` | enforced on `--now` (default the system clock, printed in the output): a key outside its window is left out, with a note that says why; if no key is left the command ends with status 2 and lists each key and why. After `not_after` a retired key's checkpoints therefore stop verifying unless you give an earlier `--now`, which is your statement and is printed. This fails closed: a member that only reported would look like a control and not be one |
-| `revoked` (true or false) | true: the key is never used, whatever `--now` says |
-| `max_tree_size` (an integer from 1) | a checkpoint counts as signed by this key only if its tree size is at most this: the way to retire a key at a known size so that what it signed stays valid and what it signs later (a leaked key) is refused, step `key-size`. It does not stop a leaked key from signing a different history at a smaller size: only a checkpoint or consistency proof you already hold catches that. `revoked` and `max_tree_size` together are refused |
+| `not_before`, `not_after` | enforced on `--now` (default the system clock, printed in the output with its fraction of a second), inclusive at both ends (a time equal to `not_after` is still inside, one nanosecond later is not): a key outside its window is left out, with a note that says why; if no key is left the command ends with status 2 and lists each key and why. After `not_after` a retired key's checkpoints therefore stop verifying as **new** checkpoints unless you give an earlier `--now`, which is your statement and is printed. **A checkpoint you already hold** (`--state`, `--old FILE`) is not subject to the window: see "Checkpoints you hold". The window is measured on the clock of the machine you run on: a machine whose clock was set back still accepts a key whose `not_after` has passed, so for a key that leaked use `revoked`, which does not depend on the clock. This fails closed: a member that only reported would look like a control and not be one. `--now` must be an RFC 3339 time with a point as the decimal mark; an empty `--now` (an unset shell variable) is an error, never the clock |
+| `revoked` (true or false) | true: the key is never used for a new checkpoint, whatever `--now` says, and its signature on a checkpoint you hold is not accepted either. A note signed by a revoked key and by a valid one is accepted through the valid key, and the output says that a signature of the revoked key was on it and was not counted |
+| `max_tree_size` (an integer from 1) | a checkpoint counts as signed by this key only if its tree size is at most this: the way to retire a key at a known size so that what it signed stays valid and what it signs later (a leaked key) is refused, step `key-size`. It does not stop a leaked key from signing a different history at a smaller size: only a checkpoint or consistency proof you already hold catches that. The limit is applied to a checkpoint you hold too. `trust show` cannot know the size of your log, so a key it reports as usable may still be refused for a larger checkpoint. `revoked` and `max_tree_size` together are refused |
 
 **`checkpoint`** verifies one checkpoint note: the note is well formed, at
 least one signature is by a key of the trust file that may be used now, no
@@ -263,29 +289,77 @@ smaller tree). It reads `<source>/c/<id>/e<N>/checkpoint` (aggregate:
 from the source only when it holds exactly one epoch of that chain; with `--note`
 the epoch must be given. It checks no tile.
 
-**Rollback.** `checkpoint` shows that a checkpoint is signed, **not that it is the
-latest**: an older genuine checkpoint verifies, so a publisher that serves one hides every
-later entry. The output says so ("not proved: that this is the latest checkpoint
-... (rollback)"). Three ways to close it, strongest last: `--min-size N` (fail a
-tree smaller than the size you already saw); `consistency --old <the last
-checkpoint you verified>`, which also fails when the log went back; and
-`--state FILE`. The state file holds the last checkpoint this command verified (the
-signed note itself, checked again with the trust file at every use). With it,
-a smaller size fails (step `rollback`), the same size with another root fails (step
-`fork`, status 1), and after a success the file is replaced atomically (a temporary file
-in the same directory, flushed, renamed). The first run creates it and says that
-nothing earlier was known. **A larger size is accepted and is not shown to extend
-the earlier log**: that needs tiles, so the output says so and points to `consistency`
-(a state file can be given to `consistency --old`). Because replacing the state
-loses the older checkpoint, the order for a full check is `consistency --old STATE
-...`, then `checkpoint --state STATE ...`. A state file that does not verify (another
-log, another trust file) is an input error and is never replaced silently. Do not run
-two commands against one state file at the same time.
+**Rollback, and what `--state` and `consistency --old` are for.** `checkpoint` shows that a
+checkpoint is signed, **not that it is the latest**: an older genuine checkpoint verifies, so a
+publisher that serves one hides every later entry. Without `--state` the output says so ("not
+proved: that this is the latest checkpoint ... (rollback)"). There are three ways to close it:
+
+- `--min-size N`: fail a tree smaller than the size you already saw.
+- `checkpoint --state FILE`: the way to **follow** a log over time. The state file is your
+  record of the last checkpoint this command proved. The invariant is that **the state only ever
+  moves from a checkpoint to one that this very run proved to be an extension of it, for the same
+  bytes whose signature it verified** (the note is read once and used for both), so status 0
+  with `--state` means exactly that. A larger checkpoint is therefore proved in the same
+  command: it reads the proof tiles from `--source` (RFC 9162 2.1.4.2) and only then replaces
+  the state (atomically: a temporary file in the same directory, flushed, renamed over the state,
+  the directory flushed; on Windows the rename is written through). The first run creates the
+  state and says that nothing earlier was known. The same checkpoint again changes nothing and
+  needs no tile. A smaller size, the same size with another root, or a path that does not lead to
+  the stored root is **status 1**: the state is left untouched, the conflicting note is saved
+  next to it as `<state>.conflict-<size>-<first 8 hex of the root>` (a name of more than 100
+  bytes is shortened), and the output names both files: two notes signed by the same key for
+  trees that are not one history are the proof of misbehaviour, so **keep both**. A smaller size
+  is reported as `rollback` and may be an old genuine checkpoint or another history; this run does
+  not tell which. If the tiles are missing the result is **status 3** and the state stays; if a tile
+  is present and wrong (the tiles do not lead to the signed new root) it is status 1 and the state
+  stays. `--source` must therefore be a source that holds the tiles; without them `--state` cannot
+  advance.
+- `consistency --old FILE|SIZE:ROOT`: a **read-only** proof for a checkpoint you hold by hand (a
+  note you saved, a state file, or a size and root from elsewhere). It writes nothing, and it does not
+  update a state file: it is the check for an old note that is not your state, or for
+  a second opinion. The earlier advice to run `consistency --old STATE` and then `checkpoint --state
+  STATE` is withdrawn: they were two reads of the publication, a publisher could show an honest
+  checkpoint to the first and a fork to the second, and the second replaced the evidence of the
+  first. `checkpoint --state` does both in one run.
+
+**The state file** is a small JSON record (`format`, `log` the origin, `size`, `root`,
+`verified_at`, `verified_by` the fingerprints of the keys, `note` the signed note). The facts are
+for the reader; no decision depends on them (a person who can write the file can also delete it,
+and the note still has to carry a valid signature of a key of the trust file that is not revoked).
+It may be a link (the state is replaced where the link points, the link stays a link; a link to
+nothing is refused). A new state file has mode 0644, a replaced one keeps its mode. The helper
+files (`.kingres-state-<12 hex>.lock` and the temporary file) have a short name that does not depend on
+the length of the state's name. The state file is locked with `flock` (Linux, macOS) or `LockFileEx`
+(Windows) on `.kingres-state-<12 hex>.lock` next to it for the whole read, check, proof and replace;
+another run waits up to 10 seconds and then ends with status 2 (nothing changed), so two runs
+never move the state backwards. A reader that does not take the lock (`consistency --old STATE`) can on
+Windows meet a sharing error while the file is replaced; run it again. A crash leaves the old state or the new
+one, whole, and at worst a temporary file that the next run removes (tested by stopping after each
+step, on both platforms). Old state files that are a plain signed note are still read.
+
+**Checkpoints you hold** (`--state`, `--old FILE`; design correction 17). A checkpoint you kept is
+a statement about the past, so it is judged differently from a checkpoint under test, and the same
+way in both commands: its signature must verify against a key of the trust file and no signature of
+a key of the file may be wrong; a **revoked** key's signature is not accepted; a key limited by
+`max_tree_size` counts only up to its size; the **validity window is not applied** (a note signed by a
+key since retired by `not_after`, or not yet valid, stays usable, and a note says so). Retiring a key
+by `not_after` therefore does not make you discard your state. Anything else (not signed by a key you
+trust, malformed, another log, a revoked key, beyond a key's limit) is **status 2** in both commands,
+never 1: the thing you hold cannot serve as your anchor. When the cause is a revoked key, a size beyond
+a key's limit or a changed trust file, the message does **not** say to delete the state (with no
+state a rollback is no longer noticed). It says to keep the file, obtain a checkpoint of the log
+signed by a key you trust from a source you trust, and run `checkpoint --state NEWFILE --min-size N`
+with N the size you believe the log had (the old note says what it claims, which nothing
+authenticates), and to use NEWFILE from then on. What trusting the record costs: whoever can write your
+state file can also delete it or put an older genuine checkpoint in it, which weakens the protection
+the same way; they cannot make a revoked key's note acceptable.
+A key that leaked should be marked `revoked`; `not_after` is only as good as the clock.
 
 **`consistency`** checks that the log at the new checkpoint (`--new`, default
 the checkpoint in `--source`) extends the log at the old one (`--old`: a note
-file, verified the same way, or `SIZE:ROOT` with the root in base64, taken as
-you give it). It reads the proof hashes from the tiles under
+file or a state file, verified as "Checkpoints you hold" says, or `SIZE:ROOT` with the root
+in base64, taken as you give it and printed as not authenticated). It writes nothing. It reads the
+proof hashes from the tiles under
 `<source>/c/<id>/e<N>/tile/...` (full and partial tiles; a partial tile that
 is missing is read from the full tile), and verifies them against both roots with
 RFC 9162 section 2.1.4.2. **Only the tiles on the proof path are read** (the
@@ -314,10 +388,17 @@ Windows the device names (`NUL`, `CON`, `COM1`, ...), the device namespace
 (`\\.\`) and alternate data streams are refused by name. A directory of digests
 or a directory of epochs is read at most 1,024 entries.
 
-**What is status 2, 3 or 1** (one rule for every command): what you named and
-cannot be used is 2; what the publication should contain and does not is 3; what the
-publication contains in a form it must not have (a link, a pipe, a directory, a file
-over its limit, a tile of the wrong size) is 1.
+**What is status 2, 3 or 1** (one rule for every command, tested path by path in
+`TestExitStatusFollowsTheRule`):
+
+| Status | When | Examples |
+|---|---|---|
+| 2 | what **you** named or hold cannot be used | a missing or malformed `--trust`, `--source`, `--note`, `--old`, `--state`; a held checkpoint no key of the trust file can vouch for (also a bad signature or another log); no key usable at `--now`; `--now` empty or malformed; two epochs of the chain in the source and no `:e<N>` in `--log` (you must name one); the lock of the state; a file of the publication that exists but that your account cannot read (permission denied: it is your copy, so it is not the publisher's absence) |
+| 3 | what the publication **should hold and does not** | no checkpoint file, no tile, a chain directory that holds no epoch directory (with or without `:e<N>`), no chain directory |
+| 1 | what the publication holds in a form it must not have, or the thing **under test** fails | a link, a pipe, a directory, a file over its limit, a tile of the wrong size; `--note`, `--new` or the checkpoint of the source that is malformed, forged, of another log or beyond a key's limit; a wrong root; a fork or a rollback with `--state` |
+
+A held checkpoint is status 2 and the thing under test status 1 because the first is your anchor
+(a wrong one is your problem) and the second is the claim being checked.
 
 Formats, with the specification they follow:
 
@@ -435,6 +516,7 @@ Run one with `go test ./internal/proof -run '^$' -fuzz '^FuzzVerify$' -fuzztime 
 | `internal/trust` | the trust file: parsing, validation, writing, keys per log origin |
 | `internal/rowfile` | the columns file of `row-hash` |
 | `internal/safefile` | the one way every file is opened: never blocking, regular files only, bounded size, no link below a source directory |
+| `internal/statefile` | the state file: lock, atomic replace with a crash test, link resolution, the place for conflicting evidence |
 | `internal/cli` | the command line (`cmd/kingres-verify` is a thin `main`) |
 
 ## Decisions where the documentation is silent
@@ -659,3 +741,30 @@ found these in the verifier; each has a test that failed before the change.
   `not_proved`; a failed `proof` printed none of the steps that had passed (the JSON did); the text of `proof` had two lines (the
   entry and the operation) that were not in `--json` as lines (they are steps now); every
   command opened its files with `os.Open`.
+
+## Findings of the review of the fixes (L8) and what was changed
+
+The second review (`kingres/docs/reviews/2026-11-16-ledger-phase7-steps-1-2-fixes.md`) found
+these in the verifier; the design has the decisions as corrections 17 to 19.
+
+- **L8-01** (`--state` accepted a fork of a larger size and replaced the evidence): `checkpoint
+  --state` proves the extension from the tiles in the same run and for the same bytes, keeps
+  the state and saves the conflicting note on a fork or rollback; `consistency --old` is the
+  read-only proof; the two-command order is withdrawn.
+- **L8-02** (input text reached the output raw): one function renders every string, see "Text
+  from the inputs is escaped".
+- **L8-03** (a state or `--old` note signed by a key retired since): a checkpoint you hold is
+  judged by signature, revocation and size limit, not by the window; one status (2) in both
+  commands; the advice never says to delete the state.
+- **L8-04, L8-07** (two runs lose the higher state; a link replaced; a long name failed; mode
+  0600; no directory flush): lock, write through a link, short helper names, kept mode, a flush
+  of the directory (a write-through rename on Windows), a crash test at every step.
+- **L8-05** (`digest-chain` caps and glob characters): listed by name through the safe helper,
+  1,024 files and 64 MiB.
+- **L8-06** (three exit statuses): a chain directory with no epoch is 3; a held note is 2 in both
+  commands; a publication file your account cannot read stays 2, documented in the table above.
+- **L8-09** (key windows): clock and `revoked` said in the table, the time is printed with its
+  fraction, the boundary is documented, an empty or comma `--now` is an error, a revoked signer
+  on a note is named, `trust show` says what it cannot know.
+- **L8-11**: `blocks` streams; `row-hash --json` no longer says `"verified": true`; the message
+  for a regular file given as a source no longer says "special file".

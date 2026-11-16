@@ -84,6 +84,8 @@ func readAll(f statReader, name string, limit int64) ([]byte, error) {
 
 func kind(m fs.FileMode) string {
 	switch {
+	case m.IsRegular():
+		return "a regular file"
 	case m.IsDir():
 		return "a directory"
 	case m&fs.ModeSymlink != 0:
@@ -178,4 +180,56 @@ func clipPath(s string) string {
 		return strings.ToValidUTF8(s[:120], "?") + "..."
 	}
 	return s
+}
+
+// limitedFile is an open regular file that fails with ErrTooLarge when more than
+// limit bytes are read from it, whatever its size was when it was opened.
+type limitedFile struct {
+	f    *os.File
+	name string
+	left int64
+}
+
+func (l *limitedFile) Read(p []byte) (int, error) {
+	if l.left < 0 {
+		return 0, fmt.Errorf("%s %w", l.name, ErrTooLarge)
+	}
+	if int64(len(p)) > l.left+1 {
+		p = p[:l.left+1]
+	}
+	n, err := l.f.Read(p)
+	l.left -= int64(n)
+	if l.left < 0 {
+		return n, fmt.Errorf("%s %w (more than the limit)", l.name, ErrTooLarge)
+	}
+	return n, err
+}
+
+func (l *limitedFile) Close() error { return l.f.Close() }
+
+// OpenArg opens a file named on the command line for reading in pieces, with
+// the checks of ReadArg: never blocking, regular after links are resolved,
+// at most limit bytes now and while it is read.
+func OpenArg(path string, limit int64) (io.ReadCloser, error) {
+	if err := checkArgPath(path); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY|openFlags, 0) // #nosec G304 -- the path is a command line argument
+	if err != nil {
+		return nil, err
+	}
+	st, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if !st.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, fmt.Errorf("%s %w (it is %s)", path, ErrNotRegular, kind(st.Mode()))
+	}
+	if st.Size() > limit {
+		_ = f.Close()
+		return nil, fmt.Errorf("%s %w (%d bytes, at most %d)", path, ErrTooLarge, st.Size(), limit)
+	}
+	return &limitedFile{f: f, name: path, left: limit}, nil
 }

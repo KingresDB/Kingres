@@ -4,10 +4,9 @@ package cli
 
 import (
 	"errors"
+	"flag"
 	"fmt"
 	"io/fs"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -130,14 +129,44 @@ func (e *env) finishPub(r *result, asJSON bool, err error) int {
 	return e.inputError(r.cmd, asJSON, err)
 }
 
-// parseNow reads --now or takes the system clock.
-func parseNow(s string) (time.Time, bool, error) {
-	if s == "" {
+// nowArg is the value of --now and whether the flag was given at all: an empty
+// value that was given (an unset shell variable) is an error and never the
+// clock, because a script that meant a fixed time must not get another one.
+type nowArg struct {
+	val   string
+	given bool
+}
+
+// nowOf reads --now from a parsed flag set.
+func nowOf(fs *flag.FlagSet, val *string) nowArg {
+	a := nowArg{val: *val}
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "now" {
+			a.given = true
+		}
+	})
+	return a
+}
+
+// timeText prints a time with its fraction when it has one, so that two times
+// that differ by less than a second never print as equal.
+func timeText(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
+
+// parseNow reads --now or takes the system clock. RFC 3339 has the decimal
+// point and no other mark, which time.Parse is more generous about.
+func parseNow(a nowArg) (time.Time, bool, error) {
+	if !a.given {
 		return time.Now().UTC(), false, nil
 	}
-	t, err := time.Parse(time.RFC3339, s)
-	if err != nil {
-		return time.Time{}, false, fmt.Errorf("--now %q is not an RFC 3339 time: %w", clipArg(s), err)
+	if a.val == "" {
+		return time.Time{}, false, errors.New("--now is empty: give an RFC 3339 time, or leave --now out to use the system clock")
+	}
+	t, err := time.Parse(time.RFC3339, a.val)
+	if err != nil || strings.Contains(a.val, ",") {
+		if err == nil {
+			err = errors.New("the fraction of a second uses a point, not a comma")
+		}
+		return time.Time{}, false, fmt.Errorf("--now %q is not an RFC 3339 time: %w", clipArg(a.val), err)
 	}
 	return t.UTC(), true, nil
 }
@@ -214,6 +243,10 @@ func (in *logInputs) resolveEpoch() error {
 			return &pubError{pubMalformed, "an epoch directory", fmt.Errorf("c/%s/%s %w", l.id, name, safefile.ErrNotRegular)}
 		}
 	}
+	if len(found) == 0 {
+		// An epoch the publication does not have is absent, like a tile.
+		return &pubError{pubAbsent, "an epoch directory of the chain", fmt.Errorf("c/%s holds no epoch directory", l.id)}
+	}
 	if len(found) != 1 {
 		return fmt.Errorf("the source has %d epochs of the chain log, expected exactly one; give --log chain:%s:e<N>", len(found), l.id)
 	}
@@ -224,7 +257,7 @@ func (in *logInputs) resolveEpoch() error {
 // loadLogInputs reads --trust, --log, --source and --now. A problem with the
 // command line is an input error (exit status 2); a problem with the
 // publication is a pubError.
-func loadLogInputs(trustPath, logFlag, source, nowFlag string, noteGiven bool) (*logInputs, error) {
+func loadLogInputs(trustPath, logFlag, source string, nowFlag nowArg, noteGiven bool) (*logInputs, error) {
 	if trustPath == "" {
 		return nil, errors.New("missing --trust")
 	}
@@ -248,9 +281,9 @@ func loadLogInputs(trustPath, logFlag, source, nowFlag string, noteGiven bool) (
 		return nil, err
 	}
 	if fixed {
-		in.notes = append(in.notes, "time used for key validity windows: "+in.now.Format(time.RFC3339)+", fixed by --now (the clock was not read)")
+		in.notes = append(in.notes, "time used for key validity windows: "+timeText(in.now)+", fixed by --now (the clock was not read)")
 	} else {
-		in.notes = append(in.notes, "time used for key validity windows: system clock "+in.now.Format(time.RFC3339))
+		in.notes = append(in.notes, "time used for key validity windows: system clock "+timeText(in.now))
 	}
 	if !in.spec.hasEpoch && in.spec.kind == "chain" {
 		if noteGiven {
@@ -288,6 +321,7 @@ func (in *logInputs) verifyNote(note []byte) (*checkpoint.Checkpoint, []signedno
 	if len(allowed) == 0 {
 		return nil, nil, notes, &checkpoint.Error{Step: "key-size", Err: fmt.Errorf("the checkpoint has tree size %d, more than the trust file allows for the key that signed it (%s): a key limited with max_tree_size must not sign larger trees", cp.Size, describeSigners(signers))}
 	}
+	notes = append(notes, in.ignoredSignatures(note, allowed)...)
 	return cp, allowed, notes, nil
 }
 
@@ -328,23 +362,29 @@ func (e *env) runCheckpoint(args []string) int {
 			"the trust file allows for the signing key, and the size and root are well formed. The\n"+
 			"checkpoint is read from --note or from <source>/c/<id>/e<N>/checkpoint (aggregate:\n"+
 			"a/<id>/checkpoint). It reads no tile and does not show that the checkpoint is the latest:\n"+
-			"an older genuine one verifies too. --min-size fails a smaller tree. --state FILE names a\n"+
-			"file holding the last checkpoint this command verified: a smaller size, or the same size\n"+
-			"with another root, then fails, and the file is replaced (atomically) after a success. A\n"+
-			"larger size is NOT shown to extend the state's log; use consistency for that.", exitTextWith3)
+			"an older genuine one verifies too (without --state). --min-size fails a smaller tree.\n"+
+			"--state FILE names the auditor's record of the last checkpoint this command proved (a small\n"+
+			"JSON file that holds the signed note). A larger checkpoint goes into it only after this run\n"+
+			"proved, from the tiles of --source and for the very bytes whose signature it verified, that\n"+
+			"it extends the stored one (RFC 9162); the file is then replaced atomically. A smaller size, the\n"+
+			"same size with another root, or a path that does not lead to the stored root is status 1: the\n"+
+			"state stays as it is and the conflicting note is saved beside it. Missing tiles are status 3\n"+
+			"and the state stays. The file is locked while in use (another run waits up to 10 s). A state\n"+
+			"that cannot serve (signed by a revoked key, beyond a max_tree_size) is status 2 and the output\n"+
+			"says how to go on without deleting it.", exitTextWith3)
 	trustPath := fs.String("trust", "", "trust file (JSON)")
 	logFlag := fs.String("log", "", "the log: chain:<64 hex>[:e<N>] or aggregate:<64 hex>")
 	source := fs.String("source", ".", "directory of the publication or bundle")
 	note := fs.String("note", "", "checkpoint file to verify instead of the one in --source")
 	minSize := fs.Uint64("min-size", 0, "fail when the tree size is smaller than this")
-	statePath := fs.String("state", "", "file with the last verified checkpoint: refuses a smaller size or a fork, updated after a success")
+	statePath := fs.String("state", "", "state file: the last checkpoint proved here; moves only to a checkpoint proved to extend it")
 	nowFlag := fs.String("now", "", "time for key validity windows, RFC 3339 (default: system clock)")
 	if code, done := e.parseFlags(fs, args); done {
 		return code
 	}
 	const cmd = "checkpoint"
 	r := &result{cmd: cmd}
-	in, err := loadLogInputs(*trustPath, *logFlag, *source, *nowFlag, *note != "")
+	in, err := loadLogInputs(*trustPath, *logFlag, *source, nowOf(fs, nowFlag), *note != "")
 	if err != nil {
 		return e.finishPub(r, *asJSON, err)
 	}
@@ -393,94 +433,16 @@ func (e *env) runCheckpoint(args []string) int {
 		"that the trust file was obtained outside the cluster: that is your responsibility",
 	}
 	r.headline = fmt.Sprintf("the checkpoint of %s at size %d is signed by a trusted key.", cp.Origin, cp.Size)
-	if *statePath == "" {
-		r.notProved = append([]string{rollbackLine}, r.notProved...)
-	} else if code, done := e.checkState(r, in, cp, data, *statePath, *asJSON); done {
-		return code
-	}
 	r.info = map[string]any{
 		"origin": cp.Origin, "size": cp.Size, "root": format.EncodeHex(cp.Root[:]),
 		"signers": signerPrints(signers), "extension_lines": len(cp.Extensions),
 	}
+	if *statePath == "" {
+		r.notProved = append([]string{rollbackLine}, r.notProved...)
+	} else if code, done := e.applyState(r, in, cp, data, signers, *statePath, *asJSON); done {
+		return code
+	}
 	return e.finishOK(r, *asJSON)
-}
-
-// checkState applies --state: reads the state, compares, and after a success
-// replaces it. It returns done=true with the exit status when the command ends
-// here (a failure or an input error).
-func (e *env) checkState(r *result, in *logInputs, cp *checkpoint.Checkpoint, note []byte, path string, asJSON bool) (int, bool) {
-	oldNote, err := readArg(path, signednote.MaxNoteSize)
-	var old *checkpoint.Checkpoint
-	switch {
-	case errors.Is(err, fs.ErrNotExist):
-		r.notes = append(r.notes, "the state file did not exist and was created: rollback and forks are checked against it from the next run on")
-	case err != nil:
-		return e.inputError(r.cmd, asJSON, fmt.Errorf("--state: %w", err)), true
-	default:
-		var verr error
-		old, _, _, verr = in.verifyNote(oldNote)
-		if verr != nil {
-			return e.inputError(r.cmd, asJSON, fmt.Errorf("--state %s does not verify as a checkpoint of this log with this trust file (%w): if you changed the trust file or the log on purpose, move the state file away", clipArg(path), verr)), true
-		}
-	}
-	write := true
-	switch {
-	case old == nil:
-		r.ok("state", fmt.Sprintf("no earlier checkpoint was recorded: size %d is recorded now", cp.Size))
-		r.notProved = append(r.notProved, "that this checkpoint is not already a rollback: the state file was empty, so nothing earlier was known")
-	case cp.Size < old.Size:
-		return e.finishFailed(r, asJSON, "rollback", fmt.Errorf("the checkpoint has size %d, smaller than %d, the size of the last checkpoint you verified: the log went back, or an old checkpoint is being shown", cp.Size, old.Size)), true
-	case cp.Size == old.Size && cp.Root != old.Root:
-		return e.finishFailed(r, asJSON, "fork", fmt.Errorf("two trusted checkpoints of this log have the same size %d and different roots (%x and %x): the log has two histories", cp.Size, old.Root, cp.Root)), true
-	case cp.Size == old.Size:
-		r.ok("state", fmt.Sprintf("same size and root as the last verified checkpoint (%d)", old.Size))
-		write = false
-	default:
-		r.ok("state", fmt.Sprintf("size %d is not smaller than %d, the size of the last verified checkpoint", cp.Size, old.Size))
-		r.notProved = append(r.notProved, fmt.Sprintf("that the log at size %d extends the log at size %d recorded in the state: only the sizes were compared, a larger size can be another history (run consistency --old %s --source ... before this command to prove it)", cp.Size, old.Size, clipArg(path)))
-	}
-	r.notProved = append(r.notProved, "that the state file is the one you left: it is your record, keep it where the publisher cannot write")
-	if write {
-		if err := writeStateAtomic(path, note); err != nil {
-			return e.inputError(r.cmd, asJSON, fmt.Errorf("the checkpoint verified but --state %s could not be updated, so later runs do not know it: %w", clipArg(path), err)), true
-		}
-		r.notes = append(r.notes, fmt.Sprintf("the state file was updated to size %d", cp.Size))
-	}
-	return 0, false
-}
-
-// writeStateAtomic replaces the state file with the verified note: a
-// temporary file in the same directory, flushed to disk, then renamed, so a
-// crash leaves the old state or the new one and never half of one. Two runs at
-// the same time are not coordinated: do not run two against one state file.
-func writeStateAtomic(path string, note []byte) error {
-	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
-	if err != nil {
-		return err
-	}
-	tmp := f.Name()
-	ok := false
-	defer func() {
-		if !ok {
-			_ = os.Remove(tmp)
-		}
-	}()
-	if _, err := f.Write(note); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return err
-	}
-	ok = true
-	return nil
 }
 
 // ---- consistency ----
@@ -497,7 +459,11 @@ func (e *env) runConsistency(args []string) int {
 			"tiles on the proof path are read (a few per level of the tree), so a damaged tile that\n"+
 			"is not on that path is not noticed. When the sizes are equal or the old size is 0 the\n"+
 			"proof is empty and no tile is read; the output says so. A tile that is absent gives\n"+
-			"status 3, a tile that is present and wrong gives status 1.", exitTextWith3)
+			"status 3, a tile that is present and wrong gives status 1. --old FILE may be a note you\n"+
+			"kept or a state file written by checkpoint --state; a note that cannot serve as your\n"+
+			"anchor (no key of the trust file signed it, or only a revoked one, or beyond its\n"+
+			"max_tree_size) is status 2. This command writes nothing: use checkpoint --state to\n"+
+			"prove the extension and record it in one run.", exitTextWith3)
 	trustPath := fs.String("trust", "", "trust file (JSON)")
 	logFlag := fs.String("log", "", "the log: chain:<64 hex>[:e<N>] or aggregate:<64 hex>")
 	source := fs.String("source", ".", "directory of the publication or bundle")
@@ -512,7 +478,7 @@ func (e *env) runConsistency(args []string) int {
 	if *oldFlag == "" {
 		return e.inputError(cmd, *asJSON, errors.New("missing --old"))
 	}
-	in, err := loadLogInputs(*trustPath, *logFlag, *source, *nowFlag, *newFlag != "")
+	in, err := loadLogInputs(*trustPath, *logFlag, *source, nowOf(fs, nowFlag), *newFlag != "")
 	if err != nil {
 		return e.finishPub(r, *asJSON, err)
 	}
@@ -535,22 +501,33 @@ func (e *env) runConsistency(args []string) int {
 			return e.inputError(cmd, *asJSON, errors.New("--old has size 0 but not the root of the empty tree"))
 		}
 	} else {
-		oldData, err := readArg(*oldFlag, signednote.MaxNoteSize)
+		// A note or a state file the auditor holds. Whatever is wrong with it
+		// (malformed, not signed by a key they trust, a revoked key, beyond a
+		// key's limit) means it cannot serve as their anchor: status 2, as for
+		// --state. A wrong history is found by the proof below, as status 1.
+		fileData, err := readArg(*oldFlag, 3*signednote.MaxNoteSize)
 		if err != nil {
 			return e.inputError(cmd, *asJSON, err)
+		}
+		oldData, rec, err := decodeHeld(fileData)
+		if err != nil {
+			return e.inputError(cmd, *asJSON, fmt.Errorf("--old %s: %w", clipArg(*oldFlag), err))
 		}
 		if _, err := signednote.Parse(oldData); err != nil {
 			return e.inputError(cmd, *asJSON, fmt.Errorf("--old %s is not a signed note: %w", clipArg(*oldFlag), err))
 		}
 		oldSigned = true
-		cp, _, oldNotes, verr := in.verifyNote(oldData)
-		r.notes = appendNew(r.notes, oldNotes)
+		cp, _, oldNotes, verr := in.verifyHeld(oldData, "--old "+clipArg(*oldFlag))
 		if verr != nil {
 			var ie *inputErr
 			if errors.As(verr, &ie) {
 				return e.inputError(cmd, *asJSON, ie.error)
 			}
-			return e.finishFailed(r, *asJSON, "old-checkpoint", verr)
+			return e.inputError(cmd, *asJSON, verr)
+		}
+		r.notes = appendNew(r.notes, oldNotes)
+		if rec != nil {
+			r.notes = append(r.notes, fmt.Sprintf("--old is a state file, recorded at %s", rec.VerifiedAt))
 		}
 		oldCP = cp
 	}

@@ -1883,7 +1883,7 @@ build to the corrected rule. The verifier's README has the same list with the re
    only. The cluster-level name `<prefix>` is for the signed events of a later step.
 5. **Validity windows of keys (3.3 against 7.4).** A checkpoint carries no time, and a retired key's
    checkpoints stay valid. `not_before` is enforced against `--now`; `not_after` was reported and not
-   enforced (superseded by 14: it is enforced on `--now`, and `max_tree_size` and `revoked` were added). Which signatures of a revoked key are still trusted is decided by anchors, as 3.3 says.
+   enforced (superseded by 14: it is enforced on `--now`, and `max_tree_size` and `revoked` were added; superseded in part by 17 for a checkpoint the auditor holds). Which signatures of a revoked key are still trusted is decided by anchors, as 3.3 says.
 6. **Exit status for a malformed note (7.4).** When the note is the thing under test (`checkpoint`), a
    malformed note is status 1. When it is the anchor of trust (`consistency --old`), an unreadable note is
    status 2 and a bad signature or origin is status 1.
@@ -1899,7 +1899,7 @@ build to the corrected rule. The verifier's README has the same list with the re
     root, so a size is only meaningful when it comes from a signed checkpoint. Every command takes sizes
     from checkpoints.
 13. **Sources (4.6, 7.4).** Step 1 reads a directory. `.tar.gz` and HTTP sources belong to step 7.
-14. **Key validity in the trust file (7.2, 7.4; replaces the second half of correction 5).** A checkpoint
+14. **Key validity in the trust file (7.2, 7.4; replaces the second half of correction 5; a checkpoint the auditor holds is not subject to the window, see 17).** A checkpoint
     carries no time that anyone can trust, so a rule that depends on "when the checkpoint was signed"
     cannot be applied; a rule that depends on a tree size can, because the size is in the signed text.
     The review of step 1 (finding L7-02) showed that a `not_after` that is only reported looks like a
@@ -1926,7 +1926,7 @@ build to the corrected rule. The verifier's README has the same list with the re
     A trust file with no key is refused when it is read (it can verify nothing), so `trust show`
     no longer calls such a file valid; `trust show` also says, for the time it is given, how each key
     stands and ends with status 2 when no key can be used then, as every verifying command would.
-15. **Rollback and a state file (7.4).** `checkpoint` shows that a checkpoint is signed, not that it is the
+15. **Rollback and a state file (7.4; superseded in part by 17: the state moves only by proof, and the order named here is withdrawn).** `checkpoint` shows that a checkpoint is signed, not that it is the
     latest: an older genuine checkpoint verifies, which hides every later entry (L7-03). Its list of what
     is not proved says so and names the three remedies (keep the last verified checkpoint and run
     `consistency --old`, `--min-size`, `--state`). `--state FILE` names a file holding the last
@@ -1951,6 +1951,55 @@ build to the corrected rule. The verifier's README has the same list with the re
     written by the publisher's tools has no link, and resolving some would need a rule for which aliases
     are lawful. A file named on the command line may be a link (the auditor chose it) but must be regular
     after resolution.
+
+17. **The state file only moves forward by proof, and what a held checkpoint is (supersedes the order
+    of correction 15 and the second half of correction 14, and changes correction 6 for `--old`).**
+    The second review (L8-01, L8-03) showed that a state that moves on a comparison of sizes can be walked
+    from one branch of a forked log to the other with status 0, and that the two-command order of
+    correction 15 reads the publication twice. The invariant is now: **the state file only ever moves from
+    a checkpoint to one that was proved, in the same run and for the same bytes, to extend it; status 0
+    with `--state` means exactly that.** `checkpoint --state` therefore reads the checkpoint once, verifies
+    its signature, and for a larger size reads the proof tiles from `--source` and verifies RFC 9162
+    2.1.4.2 against the stored and the new root before it replaces the state. An equal size and root needs
+    nothing; an empty stored tree needs no tile; no state yet records the checkpoint and says nothing was
+    known. Without tiles the result is **status 3** (the publication lacks what a signed checkpoint needs;
+    the rule of correction 16) and the state stays; a tile that does not lead to the signed new root is
+    status 1 and the state stays. A fork (a path that does not lead to the stored root, or the same size
+    with another root) and a rollback are status 1; the state is **never** overwritten, and the conflicting
+    signed note is saved beside it (`<state>.conflict-<size>-<root prefix>`), because two notes signed by
+    one key for trees that are not one history are the proof of misbehaviour; the output names both
+    files. `consistency --old` stays what it was, a read-only proof for a checkpoint held by hand; it is
+    no longer part of a two-command sequence, which is withdrawn. The state file is a JSON record (the note, the
+    log, the time and the keys it was verified with) and `--old` accepts it. The record is information for the
+    reader, not an input to any decision, because whoever can write the file can already delete it or put an
+    older genuine note in it, and the note must still carry a valid signature of a key that is not revoked.
+    **A checkpoint the auditor holds is a statement about the past**: it is accepted when a key of the trust
+    file signed it, no signature of a key of the file is wrong, no signer is revoked, and the size is within
+    the key's `max_tree_size`; the validity window is not applied to it (a window says when a key may sign new
+    checkpoints). Retiring a key with `not_after` therefore does not make the auditor discard their state;
+    `revoked` does make the key's past signatures unusable as an anchor, because they are suspect. Every
+    failure of a held checkpoint is **status 2 in both commands** (it is the auditor's anchor, not the thing
+    under test, which stays status 1, correction 6), and the advice never says to delete the state: it says to
+    keep the file, take a checkpoint signed by a trusted key from a trusted source, and start a new state with
+    `--min-size N` for the size believed, so that no rollback is opened. `not_after` is measured on the
+    auditor's clock and `revoked` is not, which the trust file documentation says.
+18. **Locks, replacement and crash safety of the state (7.4).** The state is read, compared, proved and
+    replaced under an exclusive lock on a lock file next to it (`flock`, `LockFileEx`), waited for at most
+    10 s, status 2 on timeout, so two runs cannot move it backwards. The replace writes a temporary file in the
+    same directory, flushes it, renames it over the state and flushes the directory (a write-through rename on
+    Windows); helper files have a short name that does not depend on the state's name; a state named through a
+    link is replaced where the link points; the file mode is kept. A fault hook in the helper stops after each step and a test
+    checks that the state is the old or the new one, whole, and that the next run works.
+19. **Text from inputs, input caps and the exit status table (7.4).** (a) Every string that reaches the text
+    output passes one function that escapes control characters, non-UTF-8 bytes, bidirectional and other format
+    characters and line separators, and clips long values; the JSON output carries the strings as they are. (b)
+    `digest-chain` lists a directory by name through the safe helper (no glob), reads at most 1,024 files and 64 MiB. (c)
+    A chain directory without an epoch is status 3 whether or not `:e<N>` is given; two epochs without `:e<N>`
+    is status 2; a held checkpoint is 2 in both commands (correction 17); a publication file that the auditor's
+    account cannot read stays status 2, since it is the auditor's copy. (d) `--now` must be given a value when it
+    is given, with a point as the decimal mark, and times are printed with their fraction; the window is inclusive.
+    (e) `blocks` reads its export line by line and keeps one header (1.2 million blocks, 400 MB of input, used 12 MB
+    where the whole-file version used 1.15 GB).
 
 Of section 13: item 2 (test vectors) is settled for signed notes (the example key and note of the
 specification are in the tests; the checkpoint example has no published key), item 3 (entry bundles at

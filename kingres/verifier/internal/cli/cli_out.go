@@ -13,6 +13,11 @@ import (
 // missing item, a problem) is therefore in the JSON output too, and the test
 // TestTextAndJSONCarryTheSameLines fails when a command prints a line in only
 // one of the two formats.
+//
+// Every string that reaches the text output passes untrusted (text.go): this
+// file is the one place where text is written for a person, so that no input
+// (a key of a file, a file name, an error text that quotes them) can forge a
+// line or move a terminal. TestNoPrintOutsideTheOutputLayer keeps it so.
 
 // result is what a command found, in the form both outputs are made from.
 type result struct {
@@ -59,17 +64,23 @@ func (e *env) printJSON(v any) {
 	_ = enc.Encode(v)
 }
 
+// errLine is the one line that reports a usage or input problem on the
+// standard error.
+func (e *env) errLine(cmd string, err error) {
+	fmt.Fprintf(e.stderr, "kingres-verify %s: %s\n", untrusted(cmd), untrusted(err.Error()))
+}
+
 func (e *env) printSteps(steps []stepJSON) {
 	for _, s := range steps {
 		if s.OK {
-			fmt.Fprintf(e.stdout, "  ok  %-16s %s\n", s.Name, s.Detail)
+			fmt.Fprintf(e.stdout, "  ok  %-16s %s\n", untrusted(s.Name), untrusted(s.Detail))
 		}
 	}
 }
 
 func (e *env) printLines(prefix string, lines []string) {
 	for _, l := range lines {
-		fmt.Fprintf(e.stdout, "  %s%s\n", prefix, l)
+		fmt.Fprintf(e.stdout, "  %s%s\n", prefix, untrusted(l))
 	}
 }
 
@@ -83,7 +94,7 @@ func (e *env) finishOK(r *result, asJSON bool) int {
 	if word == "" {
 		word = "VERIFIED"
 	}
-	fmt.Fprintf(e.stdout, "%s: %s\n", word, r.headline)
+	fmt.Fprintf(e.stdout, "%s: %s\n", word, untrusted(r.headline))
 	e.printSteps(r.steps)
 	e.printLines("note: ", r.notes)
 	e.printLines("not proved: ", r.notProved)
@@ -97,7 +108,7 @@ func (e *env) finishFailed(r *result, asJSON bool, step string, err error) int {
 		e.printJSON(jsonOutput{Command: r.cmd, Steps: steps, FailedAt: step, Error: err.Error(), Info: r.info, Notes: r.notes})
 		return ExitFailed
 	}
-	fmt.Fprintf(e.stdout, "FAILED at step %s: %v\n", step, err)
+	fmt.Fprintf(e.stdout, "FAILED at step %s: %s\n", untrusted(step), untrusted(err.Error()))
 	e.printSteps(r.steps)
 	e.printLines("note: ", r.notes)
 	return ExitFailed
@@ -139,7 +150,7 @@ func (e *env) inputError(cmd string, asJSON bool, err error) int {
 	if asJSON {
 		e.printJSON(jsonOutput{Command: cmd, InputErr: true, Error: err.Error()})
 	}
-	fmt.Fprintf(e.stderr, "kingres-verify %s: %v\n", cmd, err)
+	e.errLine(cmd, err)
 	return ExitUsage
 }
 
@@ -148,11 +159,11 @@ func (e *env) inputError(cmd string, asJSON bool, err error) int {
 func (e *env) finishInputWith(r *result, asJSON bool, err error) int {
 	if asJSON {
 		e.printJSON(jsonOutput{Command: r.cmd, InputErr: true, Error: err.Error(), Steps: r.steps, Info: r.info, Notes: r.notes})
-		fmt.Fprintf(e.stderr, "kingres-verify %s: %v\n", r.cmd, err)
+		e.errLine(r.cmd, err)
 		return ExitUsage
 	}
 	e.printSteps(r.steps)
 	e.printLines("note: ", r.notes)
-	fmt.Fprintf(e.stderr, "kingres-verify %s: %v\n", r.cmd, err)
+	e.errLine(r.cmd, err)
 	return ExitUsage
 }

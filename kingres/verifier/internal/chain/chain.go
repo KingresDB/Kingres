@@ -5,9 +5,11 @@
 package chain
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"time"
 
@@ -236,6 +238,83 @@ func VerifyBlocks(headers []format.Header, chainID [32]byte) error {
 	return nil
 }
 
+// StreamError is a failure of StreamBlocks with the step it belongs to
+// (parse, chain or digest), the steps the blocks command reports.
+type StreamError struct {
+	Step string
+	Err  error
+}
+
+func (e *StreamError) Error() string { return e.Err.Error() }
+
+// Unwrap returns the cause.
+func (e *StreamError) Unwrap() error { return e.Err }
+
+// maxBlockLine bounds one line of an export: a header is about 300 bytes.
+const maxBlockLine = 1 << 20
+
+// StreamBlocks verifies an export line by line and keeps one header at a time,
+// so that its memory does not grow with the size of the file (a chain of
+// millions of blocks is hundreds of megabytes of input). It checks what
+// ParseBlocks and VerifyBlocks check, and, when d is not nil, that the chain
+// reaches the digest (CheckDigestOnBlocks). It returns the number of blocks.
+// The first problem found is reported, in file order.
+func StreamBlocks(r io.Reader, chainID [32]byte, d *Digest) (int, error) {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64<<10), maxBlockLine)
+	var prev format.Header
+	n := 0
+	reached := d == nil
+	for sc.Scan() {
+		line := sc.Bytes()
+		v, err := jsonx.Parse(line)
+		var h format.Header
+		if err == nil {
+			h, err = ParseHeader(v)
+		}
+		if err != nil {
+			return n, &StreamError{"parse", fmt.Errorf("blocks line %d: %w", n+1, err)}
+		}
+		if n == 0 {
+			if h.Height != 0 {
+				return n, &StreamError{"chain", fmt.Errorf("first block has height %d, expected 0", h.Height)}
+			}
+			if want := format.GenesisHash(chainID); h.PrevHash != want {
+				return n, &StreamError{"chain", fmt.Errorf("block 0: prev_hash is %x, expected %x (SHA-256 of 0x14 and the chain id)", h.PrevHash, want)}
+			}
+		}
+		if err := CheckHeader(h); err != nil {
+			return n, &StreamError{"chain", err}
+		}
+		if n > 0 {
+			if err := CheckLink(prev, h); err != nil {
+				return n, &StreamError{"chain", err}
+			}
+		}
+		if d != nil && h.Height == d.Height {
+			if err := checkDigestHeader(h, *d); err != nil {
+				return n + 1, &StreamError{"digest", err}
+			}
+			reached = true
+		}
+		prev = h
+		n++
+	}
+	if err := sc.Err(); err != nil {
+		if errors.Is(err, bufio.ErrTooLong) {
+			err = fmt.Errorf("a line is longer than %d bytes", maxBlockLine)
+		}
+		return n, &StreamError{"parse", fmt.Errorf("blocks line %d: %w", n+1, err)}
+	}
+	if n == 0 {
+		return 0, &StreamError{"parse", errors.New("blocks file is empty, expected one JSON object per line starting with height 0")}
+	}
+	if !reached {
+		return n, &StreamError{"digest", fmt.Errorf("the blocks end at height %d, expected a block at the digest height %d", prev.Height, d.Height)}
+	}
+	return n, nil
+}
+
 // CheckDigestOnBlocks checks that the (already verified) headers reach the
 // digest: a block at the digest height exists, with the digest's block hash
 // and, when the digest carries it, its block time.
@@ -246,7 +325,12 @@ func CheckDigestOnBlocks(headers []format.Header, d Digest) error {
 	if last := headers[len(headers)-1].Height; last < d.Height {
 		return fmt.Errorf("the blocks end at height %d, expected a block at the digest height %d", last, d.Height)
 	}
-	h := headers[d.Height]
+	return checkDigestHeader(headers[d.Height], d)
+}
+
+// checkDigestHeader checks that h, the block at the digest height, is the
+// block the digest names.
+func checkDigestHeader(h format.Header, d Digest) error {
 	if h.Height != d.Height {
 		return fmt.Errorf("block at position %d has height %d, expected dense heights from 0", d.Height, h.Height)
 	}
