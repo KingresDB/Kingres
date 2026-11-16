@@ -47,9 +47,15 @@ A cluster runs one major: all its servers are installed from the same branch. Mo
 
 - `kingres-18` is on `REL_18_7` and is the default branch.
 - `kingres-19` exists since 2026-11-15, on `REL_19_RC2`: upstream has no final release of PostgreSQL 19 yet (it is scheduled for 2026-11-19). Until the branch is on `REL_19_0` it is a pre-release and nothing is tagged from it. It consists of the upstream tag, one commit with the three core patches (they applied without a change to their content), and sync commits.
-- Checked on `kingres-19` at the sync from `28d79ad3c2`, on the tree exactly as committed: the whole tree builds with assertions enabled and without a compiler warning; the core regression suite passes (243 tests); the suites of the four extensions pass in tree (73 suites, and the test that needs an installation of the other major skips). Out of tree, every extension passes on 18.7 and on 19rc2 with `-Werror`; `kingres_shard` runs 47 TAP files with 5847 subtests on each.
+- Checked on `kingres-19` at the sync from `d504f44464`, on the tree exactly as committed: the whole tree builds with assertions enabled and without a compiler warning; the core regression suite passes (243 tests); the suites of the four extensions pass in tree (73 suites, and the test that needs an installation of the other major skips). Out of tree, every extension passes on 18.7 and on 19rc2 with `-Werror`; `kingres_shard` runs 47 TAP files with 5847 subtests on each.
 - Not checked on 19 yet: the control plane's integration suite against PostgreSQL 19 instances, and the packaging. The packaging builds one major today and names its artifacts without the major, so there is no package or image for 19.
 - No release has been tagged on either branch.
+
+## History rewritten on 2026-11-16
+
+The history of both product branches was rewritten once, on 2026-11-16, by decision of the project owner, to remove a path of a developer's machine that two scripts carried as a default value in eleven early commits. Every commit of `kingres-18` after `f78f85220f` has a new id since then, and so has every sync commit of `kingres-19`; the trees of the tips did not change. A commit id of either branch that was noted before that date (in an issue, a message or a clone) does not exist in the published history any more; the ids cited in the documents and commit messages of the repository were replaced by the new ones. A clone made before that date must be made again or reset to the published branches.
+
+This is not a precedent: the branches are not rewritten or force-pushed in ordinary work, and nothing is rewritten after the first release is tagged.
 
 ## Where the checks run
 

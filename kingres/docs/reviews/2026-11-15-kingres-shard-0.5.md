@@ -2,7 +2,7 @@
 # Adversarial review: contrib/kingres_shard 0.5 (high availability in the extension)
 
 Reviewer: independent (not the author of the code, not the reviewer of the earlier
-rounds). Reviewed state: commit b52b712559 ("kingres_shard 0.5: standby nodes,
+rounds). Reviewed state: commit 5cc5f078db ("kingres_shard 0.5: standby nodes,
 promote_node, prepared transactions across a failover, deadlock detection, restore
 points"), exported with `git archive` of `contrib/kingres_shard` and `kingres/dev`
 into a private area (`~/kw-review8`); the working tree was not used for any result.

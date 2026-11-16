@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
-# Adversarial review of the fix round: contrib/kingres_columnar 0.1 (commit ca5dd5232e)
+# Adversarial review of the fix round: contrib/kingres_columnar 0.1 (commit 5555b252a0)
 
-Reviewer: independent (not the author). Reviewed state: commit ca5dd5232e,
+Reviewer: independent (not the author). Reviewed state: commit 5555b252a0,
 exported with `git archive` (paths `contrib/kingres_columnar` and
 `kingres/dev`) into a private directory (`~/kw-review9/src`). The working tree
 was not used for any result. Line numbers are those of that commit. Nothing in

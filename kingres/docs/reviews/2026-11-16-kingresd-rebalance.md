@@ -2,7 +2,7 @@
 
 # Independent review of the rebalancing work of kingresd (contract 0.9.0)
 
-Commit reviewed: `b0186e6c5c`. Reviewer: an independent reviewer, not the author of the code. Paths are
+Commit reviewed: `5196e3da5a`. Reviewer: an independent reviewer, not the author of the code. Paths are
 repository-relative at that commit; `kingres/control-plane/` is abbreviated `cp/`. Line numbers are those of the commit.
 
 ## Scope and method

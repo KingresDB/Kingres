@@ -653,8 +653,8 @@ never built:
 
 | Major | Revision built | PostgreSQL | Artifacts |
 |---|---|---|---|
-| 18 | `kingres-18` at `621cdc6ae1` | 18.7 | `kingres_0.1.0+pg18-1_amd64.deb` (12,125,000 bytes), image `kingres:0.1.0-pg18` |
-| 19 | `kingres-19` at `c64f3f6cf8` (the sync from `621cdc6ae1`) | 19rc2 | `kingres_0.1.0+pg19-1_amd64.deb` (12,351,604 bytes), image `kingres:0.1.0-pg19` |
+| 18 | `kingres-18` at `1a7a04f3c2` | 18.7 | `kingres_0.1.0+pg18-1_amd64.deb` (12,125,000 bytes), image `kingres:0.1.0-pg18` |
+| 19 | `kingres-19` at `19f94d5279` (the sync from `1a7a04f3c2`) | 19rc2 | `kingres_0.1.0+pg19-1_amd64.deb` (12,351,604 bytes), image `kingres:0.1.0-pg19` |
 
 The release recipe takes 5 to 7 minutes cold for either major, the image build 78 s
 (18) and 94 s (19) with warm caches, the content size of the image is 73 MB.
@@ -709,7 +709,7 @@ passed, 0 failed, 1 known: the same as on 18), the compose test of three nodes p
 (162 passed, 0 failed) and the package test passed (236 passed, 0 failed, 1 known).
 So PostgreSQL 19rc2 runs under `kingresd` with the tested flows (cluster, sharded
 database, ledger, restarts, stop and start, the join of two servers) once that check
-is fixed. That copy was built from `kingres-19` at `502c815210`, one revision before
+is fixed. That copy was built from `kingres-19` at `757b5044c4`, one revision before
 the one in the table.
 
 | Package test, the refusal of the other major | PostgreSQL 18 | PostgreSQL 19 |
@@ -718,8 +718,8 @@ the one in the table.
 | refused after `apt remove`; refused over a leftover data directory; installs after a purge | passed | passed |
 
 Earlier runs, for the record: the integrator repeated the package test on commit
-`2668e604d9` (156 checks, 0 failed), and the first runs of the author gave 150
-(package), 79 (image) and 140 (compose, commit `85fcafdeaa`), before the tests were
+`0e35d07ff5` (156 checks, 0 failed), and the first runs of the author gave 150
+(package), 79 (image) and 140 (compose, commit `d546dcc06d`), before the tests were
 extended for two majors, the five extensions and the licences.
 
 ## Defects of the product found by these tests (not fixed here)
@@ -757,9 +757,9 @@ extended for two majors, the five extensions and the licences.
    on, 48 files of `kingres/control-plane`, `kingres/web` and `kingres/docs` still
    carried the identifier of the PostgreSQL License in their header, against ADR 0024
    and the `copyright` file of the package. They carry AGPL-3.0-only as of commit
-   `ca5dd5232e`.
+   `5555b252a0`.
 
-The integrator ran the PostgreSQL 18 column again on commit `ca5dd5232e` with this
+The integrator ran the PostgreSQL 18 column again on commit `5555b252a0` with this
 directory on top: image test 129 passed, 0 failed, 1 known; compose test 162 passed,
 0 failed; package built, lintian without errors, package test 202 passed, 0 failed,
 1 known, without the package of the other major (the refusal tests were not run in

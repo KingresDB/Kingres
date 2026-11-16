@@ -5,7 +5,7 @@ Reviewer: an independent reviewer (not the author of the code, not the reviewer 
 earlier rounds). Findings of this review are numbered S8-nn (the findings of the review of
 the port were S6-nn, of the first review of the high-availability part S7-nn).
 
-Reviewed states: commit 60ed6a7eee (the fixes for S7-01 to S7-10) and commit 775fd89904
+Reviewed states: commit f47ce21bf5 (the fixes for S7-01 to S7-10) and commit 0ec398f6a2
 (the fixes for S6-01 to S6-10, never reviewed), both exported with `git archive` of
 `contrib/kingres_shard`, `contrib/kingres_ledger`, `kingres/dev` and `kingres/docs` into a
 private area. The working tree was not used for any result.

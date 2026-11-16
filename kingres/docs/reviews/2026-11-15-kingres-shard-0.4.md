@@ -2,7 +2,7 @@
 # Adversarial review: contrib/kingres_shard 0.4 (fix round for the reviews of 0.3 and of the 0.2 fixes)
 
 Reviewer: independent (not the author of the code, not the reviewer of the earlier
-rounds). Reviewed state: commit e5f411f899 ("kingres_shard 0.4: fix round for the
+rounds). Reviewed state: commit 37293a7e77 ("kingres_shard 0.4: fix round for the
 reviews of 0.2 and 0.3"), exported with `git archive` into a private area
 (`~/kw-review5`); the working tree was not used for any result. The ten findings
 S4-01 to S4-10 of `2026-11-15-kingres-shard-0.3.md` and the eighteen findings
