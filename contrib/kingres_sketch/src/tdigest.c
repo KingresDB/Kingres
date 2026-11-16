@@ -104,6 +104,7 @@ typedef struct TdState
 	bool		has_q;			/* approx_percentile: the fraction is part of the state */
 	double		q;
 	MemoryContext cxt;
+	KsAcct	   *acct;			/* the account of an aggregate state, else NULL */
 } TdState;
 
 static TdState *
@@ -935,6 +936,17 @@ kingres_sketch_tdigest_compression(PG_FUNCTION_ARGS)
 
 /* ---- SQL: the aggregates ---- */
 
+/* A new aggregate state, in a state context of its own, so that what it holds is counted. */
+static TdState *
+td_agg_new(int compression, MemoryContext aggcontext)
+{
+	KsAcct	   *acct = ks_acct_create(aggcontext);
+	TdState    *st = td_new(compression, ks_acct_context(acct));
+
+	st->acct = acct;
+	return st;
+}
+
 /*
  * The state of an aggregate, or a new one in the agg context.  The
  * compression is repeated by every row of a group (or NULL, meaning the
@@ -955,7 +967,7 @@ agg_state(FunctionCallInfo fcinfo, int compression, MemoryContext aggcontext)
 					 errhint("The compression must be the same in every row of a group.")));
 		return st;
 	}
-	return td_new(compression, aggcontext);
+	return td_agg_new(compression, aggcontext);
 }
 
 /* The compression of a call: argument "argno" (never NULL), or, with no such argument, the state's or the default. */
@@ -983,6 +995,7 @@ kingres_sketch_tdigest_agg_add(PG_FUNCTION_ARGS)
 		check_value(PG_GETARG_FLOAT8(1));
 		td_add_point(st, PG_GETARG_FLOAT8(1), 1);
 	}
+	ks_acct_update(st->acct);
 	PG_RETURN_POINTER(st);
 }
 
@@ -997,6 +1010,7 @@ kingres_sketch_tdigest_agg_add_c(PG_FUNCTION_ARGS)
 		check_value(PG_GETARG_FLOAT8(1));
 		td_add_point(st, PG_GETARG_FLOAT8(1), 1);
 	}
+	ks_acct_update(st->acct);
 	PG_RETURN_POINTER(st);
 }
 
@@ -1013,6 +1027,7 @@ kingres_sketch_tdigest_agg_add_wc(PG_FUNCTION_ARGS)
 		check_weight(PG_GETARG_INT64(2));
 		td_add_point(st, PG_GETARG_FLOAT8(1), PG_GETARG_INT64(2));
 	}
+	ks_acct_update(st->acct);
 	PG_RETURN_POINTER(st);
 }
 
@@ -1030,10 +1045,11 @@ kingres_sketch_tdigest_agg_union(PG_FUNCTION_ARGS)
 
 	other = td_load_arg(fcinfo, 1);
 	if (st == NULL)
-		st = td_new(other->compression, aggcontext);
+		st = td_agg_new(other->compression, aggcontext);
 	check_same_compression(st, other);
 	td_merge(st, other);
 	td_free(other);
+	ks_acct_update(st->acct);
 	PG_RETURN_POINTER(st);
 }
 
@@ -1067,6 +1083,7 @@ agg_pct(FunctionCallInfo fcinfo, int comp_argno)
 		check_value(PG_GETARG_FLOAT8(2));
 		td_add_point(st, PG_GETARG_FLOAT8(2), 1);
 	}
+	ks_acct_update(st->acct);
 	PG_RETURN_POINTER(st);
 }
 
@@ -1094,11 +1111,19 @@ kingres_sketch_tdigest_agg_combine(PG_FUNCTION_ARGS)
 	if (b == NULL)
 		KS_RETURN_STATE(a);
 	if (a == NULL)
-		PG_RETURN_POINTER(td_copy(b, aggcontext));
+	{
+		KsAcct	   *acct = ks_acct_create(aggcontext);
+
+		a = td_copy(b, ks_acct_context(acct));
+		a->acct = acct;
+		ks_acct_update(acct);
+		PG_RETURN_POINTER(a);
+	}
 	check_same_compression(a, b);
 	if (b->has_q)
 		agg_set_fraction(a, b->q);
 	td_merge(a, b);
+	ks_acct_update(a->acct);
 	PG_RETURN_POINTER(a);
 }
 
@@ -1117,15 +1142,24 @@ kingres_sketch_tdigest_agg_deserial(PG_FUNCTION_ARGS)
 	char		why[KS_WHY_LEN];
 	MemoryContext old;
 	TdState    *st;
+	KsAcct	   *acct;
 
 	p = ks_arg_bytes(fcinfo, 0, &len);
 	if (len > ks_max_value_bytes(KS_KIND_TDIGEST))
 		ks_invalid_value("tdigest", "the value is longer than any valid value of the type");
-	old = MemoryContextSwitchTo(aggcontext);
+	/* a state of this size is made whole: refuse before it is, not after */
+	ks_acct_precheck(len);
+	acct = ks_acct_create(aggcontext);
+	old = MemoryContextSwitchTo(ks_acct_context(acct));
 	st = td_load(p, len, true, why);
 	MemoryContextSwitchTo(old);
 	if (st == NULL)
+	{
+		ks_acct_release(acct);
 		ks_invalid_value("tdigest", why);
+	}
+	st->acct = acct;
+	ks_acct_update(acct);
 	PG_RETURN_POINTER(st);
 }
 

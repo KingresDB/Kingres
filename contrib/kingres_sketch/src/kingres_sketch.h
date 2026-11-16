@@ -217,6 +217,33 @@ extern uint64 ks_hash_value_of_type(Oid typid, Datum value, Oid collation);
 /* The memory context of an aggregate's state; an error outside aggregates. */
 extern MemoryContext ks_agg_context(FunctionCallInfo fcinfo);
 
+/*
+ * Memory of aggregate states.  Every state of an aggregate lives in a memory
+ * context of its own (a child of the aggregate's context) that carries an
+ * account: the bytes the context has taken from the system.  The sum of the
+ * accounts of a backend is one counter, bounded by the setting
+ * kingres_sketch.state_memory_limit.  The context goes away with the
+ * aggregate's context on every path (the end of a group, the end of the
+ * query, an error, the abort of a subtransaction), and a reset callback of the
+ * context takes its account out of the counter, so the counter cannot leak.
+ */
+typedef struct KsAcct KsAcct;
+
+/* A new state context under aggcontext, with an account and its first charge. */
+extern KsAcct *ks_acct_create(MemoryContext aggcontext);
+
+/* The context in which the state of the account allocates everything. */
+extern MemoryContext ks_acct_context(KsAcct *acct);
+
+/* Bring the account up to what the context holds now; error 54000 over the limit. */
+extern void ks_acct_update(KsAcct *acct);
+
+/* Refuse now when "want" more bytes would pass the limit (before a large load). */
+extern void ks_acct_precheck(Size want);
+
+/* Delete a state context that holds no state any more (a refused load). */
+extern void ks_acct_release(KsAcct *acct);
+
 /* Validators of the three types, used by the type functions and by tests. */
 extern bool hll_validate(const uint8 *p, Size len, char *why);
 extern bool topn_validate(const uint8 *p, Size len, char *why);

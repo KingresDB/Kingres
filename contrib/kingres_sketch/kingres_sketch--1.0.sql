@@ -429,3 +429,12 @@ CREATE FUNCTION sketch_kind(bytea) RETURNS text
 	AS 'MODULE_PATHNAME', 'kingres_sketch_sketch_kind'
 	LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 COMMENT ON FUNCTION sketch_kind(bytea) IS 'kind of a valid sketch value or aggregate state; an error for bytes that are not one';
+
+-- The bytes held now by the aggregate states of the calling backend: the
+-- counter that the setting kingres_sketch.state_memory_limit bounds.  A
+-- parallel worker counts for itself, so the function is parallel restricted
+-- (it runs in the leader, whose count is the one of the session).
+CREATE FUNCTION state_bytes() RETURNS bigint
+	AS 'MODULE_PATHNAME', 'kingres_sketch_state_bytes'
+	LANGUAGE C VOLATILE STRICT PARALLEL RESTRICTED;
+COMMENT ON FUNCTION state_bytes() IS 'bytes held by the aggregate states of this backend now; bounded by kingres_sketch.state_memory_limit';

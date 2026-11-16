@@ -110,6 +110,7 @@ typedef struct TnState
 	int32	   *heap;			/* counter indexes, when heap_ok */
 	bool		heap_ok;
 	MemoryContext cxt;			/* where the state and its arrays live */
+	KsAcct	   *acct;			/* the account of an aggregate state, else NULL */
 } TnState;
 
 static TnState *
@@ -407,6 +408,7 @@ tn_merge(TnState *dst, TnState *src)
 	int32		i;
 	int64		total;
 	TnState    *res;
+	KsAcct	   *acct;
 
 	e = (TnEntry *) palloc(((Size) dst->n + src->n + 1) * sizeof(TnEntry));
 	for (i = 0; i < dst->n; i++)
@@ -477,7 +479,9 @@ tn_merge(TnState *dst, TnState *src)
 		pfree(dst->buckets);
 	if (dst->heap)
 		pfree(dst->heap);
+	acct = dst->acct;
 	*dst = *res;
+	dst->acct = acct;
 	pfree(res);
 }
 
@@ -1030,7 +1034,7 @@ static TnState *
 agg_state(FunctionCallInfo fcinfo, uint32 k, MemoryContext aggcontext)
 {
 	TnState    *st;
-	MemoryContext old;
+	KsAcct	   *acct;
 
 	if (!PG_ARGISNULL(0))
 	{
@@ -1042,9 +1046,10 @@ agg_state(FunctionCallInfo fcinfo, uint32 k, MemoryContext aggcontext)
 					 errhint("The capacity must be the same in every row of a group.")));
 		return st;
 	}
-	old = MemoryContextSwitchTo(aggcontext);
-	st = tn_new(k, aggcontext);
-	MemoryContextSwitchTo(old);
+	/* a state context of its own, so that what the state holds is counted */
+	acct = ks_acct_create(aggcontext);
+	st = tn_new(k, ks_acct_context(acct));
+	st->acct = acct;
 	return st;
 }
 
@@ -1061,6 +1066,7 @@ agg_add_item(FunctionCallInfo fcinfo, TnState *st, MemoryContext aggcontext)
 	old = MemoryContextSwitchTo(aggcontext);
 	tn_add(st, item, len);
 	MemoryContextSwitchTo(old);
+	ks_acct_update(st->acct);
 }
 
 Datum
@@ -1108,6 +1114,7 @@ kingres_sketch_topn_agg_union(PG_FUNCTION_ARGS)
 	tn_merge(st, other);
 	MemoryContextSwitchTo(old);
 	tn_free(other);
+	ks_acct_update(st->acct);
 	PG_RETURN_POINTER(st);
 }
 
@@ -1123,13 +1130,20 @@ kingres_sketch_topn_agg_combine(PG_FUNCTION_ARGS)
 		KS_RETURN_STATE(a);
 	old = MemoryContextSwitchTo(aggcontext);
 	if (a == NULL)
+	{
+		KsAcct	   *acct = ks_acct_create(aggcontext);
+
+		MemoryContextSwitchTo(ks_acct_context(acct));
 		a = tn_copy(b);
+		a->acct = acct;
+	}
 	else
 	{
 		check_same_capacity(a, b);
 		tn_merge(a, b);
 	}
 	MemoryContextSwitchTo(old);
+	ks_acct_update(a->acct);
 	PG_RETURN_POINTER(a);
 }
 
@@ -1148,15 +1162,24 @@ kingres_sketch_topn_agg_deserial(PG_FUNCTION_ARGS)
 	char		why[KS_WHY_LEN];
 	MemoryContext old;
 	TnState    *st;
+	KsAcct	   *acct;
 
 	p = ks_arg_bytes(fcinfo, 0, &len);
 	if (len > ks_max_value_bytes(KS_KIND_TOPN))
 		ks_invalid_value("topn", "the value is longer than any valid value of the type");
-	old = MemoryContextSwitchTo(aggcontext);
+	/* a state of this size is made whole: refuse before it is, not after */
+	ks_acct_precheck(len);
+	acct = ks_acct_create(aggcontext);
+	old = MemoryContextSwitchTo(ks_acct_context(acct));
 	st = tn_load(p, len, why);
 	MemoryContextSwitchTo(old);
 	if (st == NULL)
+	{
+		ks_acct_release(acct);
 		ks_invalid_value("topn", why);
+	}
+	st->acct = acct;
+	ks_acct_update(acct);
 	PG_RETURN_POINTER(st);
 }
 

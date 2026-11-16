@@ -39,7 +39,9 @@ Licence: GNU Affero General Public License, version 3 (AGPL-3.0-only).
 ## Installing
 
 The extension has a fixed schema, `kingres_sketch`, and is not relocatable. It
-needs no `shared_preload_libraries` entry, no restart and no setting.
+needs no `shared_preload_libraries` entry and no restart. It has one setting,
+`kingres_sketch.state_memory_limit`, with a default that leaves ordinary queries
+alone (see "Memory of aggregate states and its limit").
 
 ```sql
 CREATE EXTENSION kingres_sketch;
@@ -152,7 +154,8 @@ exact function.
 
 | Function | Meaning |
 |---|---|
-| `self_test()` | One line of text that must be equal on every node that exchanges sketches (see "The hash"). |
+| `self_test()` | One line of text that must be equal on every node that exchanges sketches (see "The hash"; nothing compares it yet). |
+| `state_bytes()` | The bytes held now by the aggregate states of the calling backend, the counter that `kingres_sketch.state_memory_limit` bounds (see "Memory of aggregate states and its limit"). `PARALLEL RESTRICTED`: it runs in the leader. |
 | `sketch_kind(bytea)` | The kind (`hll`, `topn`, `tdigest`, or `tdigest_state` for the state of `approx_percentile`) of a byte string that is a valid sketch or aggregate state; error `22023` for any other bytes. It runs the validation of the input and deserial functions. |
 
 ## Aggregates, partial aggregation and NULL
@@ -255,7 +258,10 @@ in random orders.) The merge is not associative or commutative in its exact
 result: two merge orders can keep different low-count items; the guarantees hold
 for both.
 
-Memory: in an aggregate a counter costs about 60 bytes plus the item. A value is
+Memory: in an aggregate a counter costs about 60 bytes plus the item (84 KB for a full
+state of 1000 counters of short items, 1250 bytes per counter for items of 900
+bytes; "Memory of aggregate states and its limit" has the figures of a query, which has one
+state per group and per worker). A value is
 20 bytes plus 18 bytes and the item for each counter: about 30 KB for a full
 summary of 1000 counters of short items, at most about 104 MB for capacity
 100000 with items of 1024 bytes.
@@ -317,6 +323,94 @@ together, so a union of two digests of compression 10000 (a value of about
 100 KB, 320 KB at most) needs about 4 MB more than an idle backend, and
 `tdigest_agg` of 300000 values at compression 10000 about 8 MB more (the buffer
 of the aggregate included). See "Untrusted input and limits".
+
+## Memory of aggregate states and its limit
+
+The figures above are per call, or per state. **A query has one aggregate state
+per group and per aggregate expression, and a parallel plan has more: every
+worker builds a state of its own for the rows it reads, and the leader loads the
+serialized state of every worker, keeps each until the group is finished, and
+combines them into a state of its own.** `work_mem` does not limit any of it: a
+hash aggregate checks its table against `work_mem` when a group is added, and a
+state grows after its group was added. The `topn` aggregate with items of 900
+bytes over 600000 rows and 300 groups held about 740 MB (a backend that was idle
+at 19 MB went to 742 MB), and the same query with more groups or longer items
+holds proportionally more. `hll` and `tdigest` grow the same way, only less per
+state. What one state holds, measured with `state_bytes()` while the states are
+alive (this includes the memory context that each state has, about 1 KB, and
+the unused part of its blocks):
+
+| State | Held |
+|---|---|
+| any state with few values (`topn` of a few items, `hll` sparse with 100 items, `tdigest` of 10 values) | 2 to 3 KB |
+| `topn`, capacity 1000, full, short items | 84 KB |
+| `topn`, 20000 items of 900 bytes | 24 MB (1250 bytes per counter) |
+| `hll`, precision 14, dense | 20 KB |
+| `hll`, precision 18, dense | 260 KB |
+| `tdigest`, compression 100 | 12 KB |
+| `tdigest`, compression 10000, 300000 values | 885 KB |
+
+So 100000 groups hold at least 300 MB, and 100000 groups of 100000 distinct
+items hold 100000 times the figure of one. A worker is a backend with its own
+account: with two workers the same query holds each worker's states in the
+worker and the deserialized states, with the combined one, in the leader.
+
+**The limit.** `kingres_sketch.state_memory_limit` (default `1GB`, from 1 kB to
+2 TB; a plain number is in kilobytes) is the most that the aggregate states of
+one backend may hold together. A query that would pass it fails with SQLSTATE
+`54000` (`program_limit_exceeded`) and the message `aggregate states of
+kingres_sketch hold N bytes in this backend, over the limit of M bytes`, with a
+hint, and the backend's peak stays near the limit (the test `008_memory.pl`: with
+a limit of 64 MB the query of the review fails and a fresh backend goes from
+19 MB to under 160 MB, where without a limit it went to 742 MB). The limit
+counts `hll`, `topn` and `tdigest` states, `approx_count_distinct` and
+`approx_percentile` too, and counts the states a worker builds, the states a
+leader deserializes from the workers (before one is built, the length of the
+serialized state is checked against what is left) and the states made by the
+combine and union aggregates. It is checked when a state has grown, after the
+memory is taken, so a query can pass the limit by one step of one state (the
+largest step is a `topn` state of capacity 100000 doubling, a few MB, or up to
+100 MB for a deserialized value of the largest size, which the length check
+above refuses before it is built when it would not fit) and is stopped there.
+What the limit does not count: the functions that are not aggregates
+(`hll_add`, `topn_union` and the others work on values and are bounded by the
+per-call figures above), the transient memory of a call (the detoasted argument,
+the serialized result), and anything else the query uses. The default of `1GB`
+is one that no ordinary query reaches (the 300-group query above holds 740 MB);
+a server of a few GB that runs parallel queries with many groups should set a
+lower value, or lower `max_parallel_workers_per_gather`.
+
+*Who may set it.* The point of the limit is to protect the server, so a role must
+not be able to raise it for itself, and any role may lower it for its own
+queries. The setting is `PGC_USERSET` with a check hook: a role that is not a
+superuser may set any value up to the **reset value**, the value that the
+administrator gave it in `postgresql.conf`, with `ALTER DATABASE ... SET` or
+with `ALTER ROLE ... SET` (default `1GB`), and `RESET` returns to that value. A
+higher value is refused with `permission denied to raise
+"kingres_sketch.state_memory_limit" above N kB` by `SET`, `SET LOCAL`, a
+function's `SET` clause, `ALTER ROLE ... SET` and `ALTER DATABASE ... SET`; a
+superuser may set any value, and so may an administrator who stores a higher
+ceiling for a role (`ALTER ROLE r SET kingres_sketch.state_memory_limit =
+'4GB'`). A value given before the library is loaded in the session (in the
+options of a connection, or by `SET` as the first statement) is judged when the
+library loads: a raise by a role that may not is dropped with a warning and the
+limit is the reset value. Until the library is loaded in a session, which the
+first call of a function of the extension does, `SHOW
+kingres_sketch.state_memory_limit` answers `unrecognized configuration
+parameter`. Workers take the value of their leader. PostgreSQL's
+own settings of this kind (`temp_file_limit`, `max_stack_depth`) are
+`PGC_SUSET`; a `PGC_SUSET` setting would not let a role lower the limit for
+itself, and a `GRANT SET ON PARAMETER` would give it the right to raise it too.
+
+*The counter does not leak.* The account of a state lives in the memory
+context of the state, and a reset callback of that context gives the account back,
+so the counter is correct whatever ends the state: the end of a group, the end of
+the query, an error in the middle of a query, a subtransaction that aborts, a
+cursor that is closed (a cursor that is left open holds its states and counts
+them until it is closed). `state_bytes()` shows it, and the tests check that it is
+zero after a completed query, a failed one, an aborted subtransaction, forty
+failures in a row, a closed cursor and a parallel query that fails in a worker or
+in the leader.
 
 ## Format
 
@@ -400,7 +494,12 @@ the bytes of a fixed `tdigest` and a fixed `topn` (each alone and united with a
 second one) built from a formula. A node whose line differs (another major
 version that changed a hash function, a different encoding or byte order, a C
 library that rounds `asin` differently) must not exchange sketches with the
-others. The fields: `int2` to `uuid` and `int4[]` the hash of a fixed value;
+others. **No component compares the line yet.** The design has the control plane
+run `self_test()` on every node and refuse a cluster whose nodes differ
+(`sketch_hash_mismatch`); that comparison is planned for the control plane and
+does not exist: nothing in this extension or in KingresDB calls `self_test()`
+outside the regression tests, and until it exists the operator compares the line
+by running `SELECT kingres_sketch.self_test()` on every node. The fields: `int2` to `uuid` and `int4[]` the hash of a fixed value;
 `hll` the estimate of a fixed set; `tdigest`, `tdigest_union`, `tdigest_read`
 the bytes of a digest, of the union of two, and the bits of a quantile and a
 rank read from it; `tdigest_scale` the bits of the scale function (`asin`) at
@@ -450,6 +549,7 @@ crash or a read past the value. `pg_input_is_valid` works on all three types.
 | tdigest compression | 10 to 10000 |
 | tdigest weight | 1 to 2^63 - 1; the total must fit in a `bigint` |
 | largest value | hll 196612 bytes, topn about 104 MB, tdigest about 320 KB |
+| memory held by the aggregate states of a backend | `kingres_sketch.state_memory_limit`, default 1 GB; one state per group and per worker (see "Memory of aggregate states and its limit") |
 | working memory of a call on the largest value (peak of the backend, an idle backend is 15.6 MB) | hll: about 4 MB over an idle backend (unions of precision 18, the aggregate over six values); topn: up to 513 MB, 5.2 times the value (`topn_union_agg` over values with different items; see the section "topn"); tdigest: about 4 MB over an idle backend for unions at compression 10000, 8 MB for `tdigest_agg` of 300000 values |
 | counts | `bigint`; an overflow is `22003` |
 
@@ -546,8 +646,10 @@ margin of 2.
   `hll` and sketches within the bounds for the others: the exact counters of a
   `topn` and the exact centroids of a `tdigest` depend on the order of rows and
   merges.
-- A `GROUP BY` with many groups multiplies the state size: the planner uses
-  `SSPACE`; choose a smaller precision, capacity or compression for such a query.
+- A `GROUP BY` with many groups multiplies the state size, and so do parallel
+  workers; `work_mem` does not limit it, `kingres_sketch.state_memory_limit` does
+  (see "Memory of aggregate states and its limit"); choose a smaller precision,
+  capacity or compression for such a query.
 - The aggregates have no moving-aggregate form (`MSFUNC`), so a window with a
   sliding frame recomputes the sketch for every row.
 - Names that the standard reserves, like `precision`, are quoted in the
@@ -570,7 +672,9 @@ kingres/dev/ext.sh kingres_sketch all
 ```
 
 The tests: `sql/` and `expected/` (pg_regress: `sketch_setup`, `sketch_hll`,
-`sketch_topn`, `sketch_tdigest`, `sketch_io`, `sketch_security`) and `t/` (TAP:
-the accuracy of each sketch, parallel and partitionwise aggregation, dump and
-restore and `COPY`, and a fuzz test of corrupted values that should be run on a
-server built with assertions).
+`sketch_topn`, `sketch_tdigest`, `sketch_io`, `sketch_security`, `sketch_memory`)
+and `t/` (TAP: the accuracy of each sketch, parallel and partitionwise
+aggregation, dump and restore and `COPY`, a fuzz test of corrupted values that
+should be run on a server built with assertions, and `008_memory.pl`: the limit
+of the memory of aggregate states, the peak of a backend, parallel workers and
+who may raise the limit).
