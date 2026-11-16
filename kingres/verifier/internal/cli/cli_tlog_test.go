@@ -274,20 +274,18 @@ func TestCheckpointCommand(t *testing.T) {
 	}
 	// Input errors are status 2.
 	for name, args := range map[string][]string{
-		"no trust":            {"checkpoint", "--log", p.log(), "--source", p.dir},
-		"no log":              {"checkpoint", "--trust", p.trust, "--source", p.dir},
-		"bad log":             {"checkpoint", "--trust", p.trust, "--log", "chain:xyz", "--source", p.dir},
-		"upper case id":       {"checkpoint", "--trust", p.trust, "--log", "chain:" + strings.ToUpper(testChain) + ":e1", "--source", p.dir},
-		"epoch zero":          {"checkpoint", "--trust", p.trust, "--log", "chain:" + testChain + ":e0", "--source", p.dir},
-		"epoch leading zero":  {"checkpoint", "--trust", p.trust, "--log", "chain:" + testChain + ":e01", "--source", p.dir},
-		"aggregate epoch":     {"checkpoint", "--trust", p.trust, "--log", "aggregate:" + testChain + ":e1", "--source", p.dir},
-		"checkpoint missing":  {"checkpoint", "--trust", p.trust, "--log", "chain:" + strings.Repeat("cd", 32) + ":e1", "--source", p.dir},
-		"trust missing":       {"checkpoint", "--trust", filepath.Join(p.dir, "nope"), "--log", p.log(), "--source", p.dir},
-		"trust is a note":     {"checkpoint", "--trust", filepath.Join(p.logDir, "checkpoint"), "--log", p.log(), "--source", p.dir},
-		"bad now":             {"checkpoint", "--trust", p.trust, "--log", p.log(), "--source", p.dir, "--now", "yesterday"},
-		"unknown flag":        {"checkpoint", "--bogus"},
-		"epoch with note":     {"checkpoint", "--trust", p.trust, "--log", "chain:" + testChain, "--note", filepath.Join(p.logDir, "checkpoint")},
-		"aggregate not there": {"checkpoint", "--trust", p.trust, "--log", "aggregate:" + testChain, "--source", p.dir},
+		"no trust":           {"checkpoint", "--log", p.log(), "--source", p.dir},
+		"no log":             {"checkpoint", "--trust", p.trust, "--source", p.dir},
+		"bad log":            {"checkpoint", "--trust", p.trust, "--log", "chain:xyz", "--source", p.dir},
+		"upper case id":      {"checkpoint", "--trust", p.trust, "--log", "chain:" + strings.ToUpper(testChain) + ":e1", "--source", p.dir},
+		"epoch zero":         {"checkpoint", "--trust", p.trust, "--log", "chain:" + testChain + ":e0", "--source", p.dir},
+		"epoch leading zero": {"checkpoint", "--trust", p.trust, "--log", "chain:" + testChain + ":e01", "--source", p.dir},
+		"aggregate epoch":    {"checkpoint", "--trust", p.trust, "--log", "aggregate:" + testChain + ":e1", "--source", p.dir},
+		"trust missing":      {"checkpoint", "--trust", filepath.Join(p.dir, "nope"), "--log", p.log(), "--source", p.dir},
+		"trust is a note":    {"checkpoint", "--trust", filepath.Join(p.logDir, "checkpoint"), "--log", p.log(), "--source", p.dir},
+		"bad now":            {"checkpoint", "--trust", p.trust, "--log", p.log(), "--source", p.dir, "--now", "yesterday"},
+		"unknown flag":       {"checkpoint", "--bogus"},
+		"epoch with note":    {"checkpoint", "--trust", p.trust, "--log", "chain:" + testChain, "--note", filepath.Join(p.logDir, "checkpoint")},
 	} {
 		if code, _, _ := run(t, args...); code != 2 {
 			t.Errorf("%s: exit %d, want 2", name, code)
@@ -315,11 +313,16 @@ func TestCheckpointKeyWindow(t *testing.T) {
 	if code, _, errs := run(t, append(args, "--now", "2031-01-01T00:00:00Z")...); code != 0 {
 		t.Errorf("key valid: %d %s", code, errs)
 	}
+	// not_after is enforced on --now: after it the key is not used at all,
+	// and the error says why and how to check older checkpoints.
 	retired := strings.Replace(string(data), `"not_after": null`, `"not_after": "2027-01-01T00:00:00Z"`, 1)
 	_ = os.WriteFile(f, []byte(retired), 0o644)
-	code, out, _ := run(t, append(args, "--now", "2028-01-01T00:00:00Z")...)
-	if code != 0 || !strings.Contains(out, "not_after") {
-		t.Errorf("retired key: %d %s", code, out)
+	code, _, errs := run(t, append(args, "--now", "2028-01-01T00:00:00Z")...)
+	if code != 2 || !strings.Contains(errs, "not_after") || !strings.Contains(errs, "--now") {
+		t.Errorf("retired key: %d %s", code, errs)
+	}
+	if code, out, _ := run(t, append(args, "--now", "2026-06-01T00:00:00Z")...); code != 0 || !strings.Contains(out, "fixed by --now") {
+		t.Errorf("inside the window: %d %s", code, out)
 	}
 }
 

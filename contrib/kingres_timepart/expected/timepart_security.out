@@ -74,7 +74,12 @@ SELECT proname FROM members
  timepart__require_owner
  timepart__require_superuser
  timepart__retire_stmts
+ timepart__role_name
+ timepart__role_oid
+ timepart__run_table
+ timepart__run_visible
  timepart__setting_int
+ timepart__stamp
  timepart__timed_out
  timepart__validate_policy
  timepart__visible
@@ -85,7 +90,7 @@ SELECT proname FROM members
  timepart_interval_parts
  timepart_part_name
  timepart_retire_one
-(30 rows)
+(35 rows)
 
 -- The policy and the history are shown to a role through security_barrier
 -- views (the rows of the tables it owns); the base tables and the lock table
@@ -183,7 +188,7 @@ SELECT count(*) AS visible_policies FROM kingres.timepart_policy;
 SELECT count(*) AS visible_runs FROM kingres.timepart_run;
  visible_runs 
 --------------
-            0
+            1
 (1 row)
 
 SELECT count(*) AS visible_locks FROM kingres.timepart_lock;
@@ -629,8 +634,13 @@ DROP FUNCTION tp.evil_fn(), tp.evil_unset(), tp.evil_plan();
 -- A role writes the policy table directly only for tables it owns, and the
 -- columns the extension decides are pinned.
 SET ROLE tp_other;
+-- the owner and the creator are shown from the catalog and cannot be written
 INSERT INTO kingres.timepart_policy (schema_name, table_name, parent_oid, partition_every, table_owner, created_by)
 VALUES ('tpo', 'victim', 0, '1 day', 'tp_other', 'tp_other');
+ERROR:  cannot insert into column "table_owner" of view "timepart_policy"
+DETAIL:  View columns that are not columns of their base relation are not updatable.
+INSERT INTO kingres.timepart_policy (schema_name, table_name, parent_oid, partition_every)
+VALUES ('tpo', 'victim', 0, '1 day');
 ERROR:  must be owner of table tpo.victim
 UPDATE kingres.timepart_policy SET retention = '1 day' WHERE table_name = 'victim';
 DELETE FROM kingres.timepart_policy WHERE table_name = 'victim';
@@ -650,6 +660,10 @@ SELECT retention FROM kingres.timepart_policy WHERE table_name = 'victim';
 SET ROLE tp_owner;
 UPDATE kingres.timepart_policy SET retention = '4 days', table_owner = 'tp_other', created_by = 'tp_other',
        parent_oid = 1, created_at = '2000-01-01' WHERE table_name = 'victim';
+ERROR:  cannot update column "table_owner" of view "timepart_policy"
+DETAIL:  View columns that are not columns of their base relation are not updatable.
+UPDATE kingres.timepart_policy SET retention = '4 days',
+       parent_oid = 1, created_at = '2000-01-01' WHERE table_name = 'victim';
 SELECT retention, table_owner, created_by, parent_oid = 'tpo.victim'::regclass::oid AS hint_pinned,
        created_at > '2020-01-01' AS created_at_kept FROM kingres.timepart_policy WHERE table_name = 'victim';
  retention | table_owner | created_by | hint_pinned | created_at_kept 
@@ -665,8 +679,8 @@ ERROR:  unknown time zone "Mars/Olympus"
 HINT:  Use a name from pg_timezone_names, for example UTC or Europe/Berlin.
 UPDATE kingres.timepart_policy SET schema_name = 'tp', table_name = 'canary' WHERE table_name = 'victim';
 ERROR:  tp.canary is not a partitioned table
-INSERT INTO kingres.timepart_policy (schema_name, table_name, parent_oid, partition_every, table_owner, created_by)
-VALUES ('tp', 'canary', 0, '1 day', 'tp_owner', 'tp_owner');
+INSERT INTO kingres.timepart_policy (schema_name, table_name, parent_oid, partition_every)
+VALUES ('tp', 'canary', 0, '1 day');
 ERROR:  tp.canary is not a partitioned table
 DELETE FROM kingres.timepart_policy WHERE table_name = 'victim';
 SELECT count(*) AS policies_of_owner FROM kingres.timepart_policy;
@@ -799,12 +813,13 @@ SELECT count(*) FROM kingres.timepart_run_data;
 ERROR:  permission denied for table timepart_run_data
 SELECT count(*) FROM kingres.timepart_run_action_data;
 ERROR:  permission denied for table timepart_run_action_data
-INSERT INTO kingres.timepart_run_data (schema_name, table_name, as_of, trigger, state, started_by)
-VALUES ('tp', 'theirs3', now(), 'manual', 'done', 'tp_other');
+INSERT INTO kingres.timepart_run_data (schema_name, table_name, as_of, trigger, state, started_by, table_owner_oid, table_owner)
+VALUES ('tp', 'theirs3', now(), 'manual', 'done', 'tp_other', 0, 'tp_other');
 ERROR:  permission denied for table timepart_run_data
 INSERT INTO kingres.timepart_run (schema_name, table_name, as_of, trigger, state, started_by)
 VALUES ('tp', 'theirs3', now(), 'manual', 'done', 'tp_other');
-ERROR:  permission denied for view timepart_run
+ERROR:  cannot insert into column "started_by" of view "timepart_run"
+DETAIL:  View columns that are not columns of their base relation are not updatable.
 DELETE FROM kingres.timepart_run;
 ERROR:  permission denied for view timepart_run
 -- A function of the caller in a WHERE clause does not see the rows the view
@@ -812,8 +827,8 @@ ERROR:  permission denied for view timepart_run
 CREATE FUNCTION tp.spy(anyelement) RETURNS boolean LANGUAGE plpgsql AS $$
 BEGIN RAISE NOTICE 'spy saw %', $1; RETURN true; END $$;
 SELECT count(*) AS seen FROM kingres.timepart_policy WHERE tp.spy(table_name);
-NOTICE:  spy saw o1
 NOTICE:  spy saw theirs3
+NOTICE:  spy saw o1
  seen 
 ------
     2
@@ -828,17 +843,13 @@ SELECT count(*) AS seen FROM kingres.timepart_policy WHERE table_name = 'mine' A
 SELECT count(*) AS seen FROM kingres.timepart_run WHERE tp.spy(table_name);
 NOTICE:  spy saw o1
 NOTICE:  spy saw o1
-NOTICE:  spy saw o1
 NOTICE:  spy saw theirs3
  seen 
 ------
-    4
+    3
 (1 row)
 
 SELECT count(*) AS seen FROM kingres.timepart_run_action a WHERE tp.spy(a.partition_name) AND a.partition_name <> '';
-NOTICE:  spy saw o1_p20260304
-NOTICE:  spy saw o1_p20260305
-NOTICE:  spy saw o1_p20260306
 NOTICE:  spy saw o1_p20260309
 NOTICE:  spy saw o1_p20260310
 NOTICE:  spy saw o1_p20260311
@@ -852,25 +863,24 @@ NOTICE:  spy saw o1_p20260306
 NOTICE:  spy saw theirs3_p20260305
  seen 
 ------
-   14
+   11
 (1 row)
 
 SELECT count(*) AS seen FROM kingres.timepart_policies WHERE tp.spy(table_name);
-NOTICE:  spy saw o1
 NOTICE:  spy saw theirs3
+NOTICE:  spy saw o1
  seen 
 ------
     2
 (1 row)
 
 SELECT count(*) AS seen FROM kingres.timepart_policy p JOIN kingres.timepart_run r USING (schema_name, table_name) WHERE tp.spy(r.error);
-NOTICE:  spy saw <NULL>
 NOTICE:  spy saw 42501: owner_changed: the owner of tpo.o1 is now "tp_other", the policy was set for "tp_owner"
 NOTICE:  spy saw <NULL>
 NOTICE:  spy saw <NULL>
  seen 
 ------
-    4
+    3
 (1 row)
 
 -- Writes through the view: a policy for a table of another role, in every

@@ -10,6 +10,7 @@ import (
 	"math/bits"
 
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/merkle"
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/safefile"
 )
 
 // Hash is a SHA-256 tree hash.
@@ -32,9 +33,9 @@ type TileSource interface {
 
 // FSSource reads tiles from a file system laid out as a log prefix (a
 // directory of the publication, 4.6 of the design). Paths are built from
-// numbers only, and fs.FS refuses ".." and rooted names, so nothing outside
+// numbers only, and the FileReader (safefile.Dir) refuses ".." and links, so nothing outside
 // the directory can be read.
-type FSSource struct{ FS fs.FS }
+type FSSource struct{ Files FileReader }
 
 // ReadTile implements TileSource. For a partial width it reads the partial
 // tile and, when that file is missing, the full tile and its first width
@@ -62,30 +63,50 @@ func (s FSSource) ReadTile(level int, n uint64, width int) ([]byte, error) {
 }
 
 func (s FSSource) read(name string, want int) ([]byte, error) {
-	f, err := s.FS.Open(name)
+	data, err := s.Files.ReadFile(name, int64(want))
+	switch {
+	case err == nil:
+	case errors.Is(err, fs.ErrNotExist):
+		return nil, fmt.Errorf("%w: %s", ErrMissing, name)
+	case safefile.Unusable(err):
+		// Present but a link, a special file or too large: the log serves
+		// something that is not a tile.
+		return nil, fmt.Errorf("%w: %v", ErrBadTile, err)
+	default:
+		return nil, fmt.Errorf("reading %s: %w", name, err)
+	}
+	if len(data) != want {
+		return nil, fmt.Errorf("%w: %s has %d bytes, expected %d", ErrBadTile, name, len(data), want)
+	}
+	return data, nil
+}
+
+// FileReader reads a regular file of a source by its slash separated path and
+// returns an error wrapping fs.ErrNotExist when it is absent, and one that
+// safefile.Unusable recognises when it is there but must not be used.
+// safefile.Dir is the implementation for a directory on disk.
+type FileReader interface {
+	ReadFile(name string, limit int64) ([]byte, error)
+}
+
+// FSReader adapts an fs.FS (tests use an in-memory one) to FileReader.
+type FSReader struct{ FS fs.FS }
+
+// ReadFile implements FileReader.
+func (r FSReader) ReadFile(name string, limit int64) ([]byte, error) {
+	f, err := r.FS.Open(name)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, fmt.Errorf("%w: %s", ErrMissing, name)
-		}
-		return nil, fmt.Errorf("opening %s: %w", name, err)
+		return nil, err
 	}
 	defer f.Close()
-	buf := make([]byte, want+1)
-	n := 0
-	for n < len(buf) {
-		m, rerr := f.Read(buf[n:])
-		n += m
-		if rerr != nil {
-			if errors.Is(rerr, io.EOF) {
-				break
-			}
-			return nil, fmt.Errorf("reading %s: %w", name, rerr)
-		}
+	data, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, err
 	}
-	if n != want {
-		return nil, fmt.Errorf("%w: %s has %d bytes, expected %d", ErrBadTile, name, n, want)
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("%s %w", name, safefile.ErrTooLarge)
 	}
-	return buf[:want], nil
+	return data, nil
 }
 
 // Reader computes tree hashes of a tree of a fixed size from tiles.
@@ -279,3 +300,8 @@ func (r *Reader) subproof(m, lo, hi uint64, b bool) ([]Hash, error) {
 	}
 	return append(sub, h), nil
 }
+
+// TilesRead is the number of distinct tiles the reader has read so far. A
+// proof reads only the tiles on its path, so a caller can say how much of the
+// log was looked at.
+func (r *Reader) TilesRead() int { return len(r.cache) }

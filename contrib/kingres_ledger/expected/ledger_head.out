@@ -211,7 +211,7 @@ ORDER BY 1;
         proname        | prosecdef | provolatile | public_can_execute |              proconfig              
 -----------------------+-----------+-------------+--------------------+-------------------------------------
  ledger_block_preimage | f         | i           | t                  | 
- ledger_blocks_entries | f         | s           | f                  | {"search_path=pg_catalog, pg_temp"}
+ ledger_blocks_entries | t         | s           | f                  | {"search_path=pg_catalog, pg_temp"}
  ledger_head           | t         | s           | f                  | {"search_path=pg_catalog, pg_temp"}
 (3 rows)
 
@@ -251,12 +251,16 @@ RESET ROLE;
 --------------------------------------------------------------------------
 CREATE TABLE saved_blocks AS TABLE kingres.ledger_blocks;
 CREATE TABLE saved_chain AS TABLE kingres.ledger_chain;
+CREATE TABLE saved_tx AS TABLE kingres.ledger_tx;
 CREATE FUNCTION public.restore_all() RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
     TRUNCATE kingres.ledger_blocks;
     INSERT INTO kingres.ledger_blocks SELECT * FROM public.saved_blocks;
     TRUNCATE kingres.ledger_chain;
     INSERT INTO kingres.ledger_chain SELECT * FROM public.saved_chain;
+    TRUNCATE kingres.ledger_tx;
+    INSERT INTO kingres.ledger_tx SELECT * FROM public.saved_tx;
+    TRUNCATE kingres.ledger_digest;
 END $$;
 \set trig_off 'UPDATE pg_trigger SET tgenabled = ''D'' WHERE tgname IN (''kingres_ledger_capture'', ''kingres_ledger_block_modify'', ''kingres_ledger_block_truncate'')'
 \set trig_on 'UPDATE pg_trigger SET tgenabled = ''A'' WHERE tgname IN (''kingres_ledger_capture'', ''kingres_ledger_block_modify'', ''kingres_ledger_block_truncate'')'
@@ -279,11 +283,7 @@ ERROR:  block 2 does not match its stored block hash
 SELECT public.page(2, 1) AS starting_at_the_bad_block;
 ERROR:  block 2 does not match its stored block hash
 SELECT public.page(3, 5) AS after_the_bad_block;
- after_the_bad_block 
----------------------
- 3,4
-(1 row)
-
+ERROR:  block 2 is malformed or does not match its stored block hash
 SELECT height FROM kingres.ledger_head();
  height 
 --------
@@ -326,7 +326,7 @@ SELECT public.page(0, 3) AS before_the_bad_block;
 SELECT public.page(3, 1) AS the_bad_block;
 ERROR:  block 3 does not match its stored block hash
 SELECT public.page(4, 1) AS the_block_after;
-ERROR:  block 4 is malformed or does not follow the block before it
+ERROR:  block 3 is malformed or does not match its stored block hash
 :trig_off;
 \c
 SET search_path = public;
@@ -415,19 +415,11 @@ UPDATE kingres.ledger_chain SET chain_id = sha256('another chain');
 \c
 SET search_path = public;
 SELECT public.page(0, 1) AS first_block_other_chain;
-ERROR:  block 0 is malformed or does not follow the block before it
+ERROR:  the identity of the chain does not match block 0
 SELECT public.page(1, 1) AS second_block_other_chain;
- second_block_other_chain 
---------------------------
- 1
-(1 row)
-
+ERROR:  the identity of the chain does not match block 0
 SELECT height FROM kingres.ledger_head();
- height 
---------
-      4
-(1 row)
-
+ERROR:  the identity of the chain does not match block 0
 -- 6. The chain identity is missing: an error, never an empty answer.
 :trig_off;
 \c
@@ -464,8 +456,411 @@ SELECT count(*) AS problems FROM kingres.ledger_verify();
         0
 (1 row)
 
+-- 7. The end of the chain was removed from ledger_blocks and from nothing
+-- else.  A read of the blocks alone cannot see it (entries stops at the new
+-- end, as for any shorter chain), but the transactions of the removed blocks
+-- are still recorded and ledger_head says so.
+:trig_off;
+\c
+SET search_path = public;
+DELETE FROM kingres.ledger_blocks WHERE height = 4;
+:trig_on;
+\c
+SET search_path = public;
+SELECT public.page(0, 100) AS entries_after_losing_the_head;
+ entries_after_losing_the_head 
+-------------------------------
+ 0,1,2,3
+(1 row)
+
+SELECT * FROM kingres.ledger_head();
+ERROR:  the head is block 3, but transactions of the ledger refer to block 4: the end of the chain was removed
+SELECT (SELECT count(*) FROM kingres.ledger_verify()) > 0 AS verify_sees_it;
+ verify_sees_it 
+----------------
+ t
+(1 row)
+
+:trig_off;
+\c
+SET search_path = public;
+DELETE FROM kingres.ledger_blocks WHERE height >= 2;
+:trig_on;
+\c
+SET search_path = public;
+SELECT * FROM kingres.ledger_head();
+ERROR:  the head is block 1, but transactions of the ledger refer to block 4: the end of the chain was removed
+-- All the blocks removed: the head is not "empty", it is an error.
+:trig_off;
+\c
+SET search_path = public;
+DELETE FROM kingres.ledger_blocks;
+:trig_on;
+\c
+SET search_path = public;
+SELECT * FROM kingres.ledger_head();
+ERROR:  the chain has no block, but transactions of the ledger refer to block 4
+SELECT public.page(0, 100) AS entries_after_losing_everything;
+ entries_after_losing_everything 
+---------------------------------
+ (none)
+(1 row)
+
+-- What is not detected: the same removal together with the transaction rows
+-- of the removed blocks, which someone who can write the ledger tables can
+-- do.  The shorter chain is then a valid chain, and the answer is the new head.
+:trig_off;
+\c
+SET search_path = public;
+SELECT public.restore_all();
+ restore_all 
+-------------
+ 
+(1 row)
+
+DELETE FROM kingres.ledger_blocks WHERE height = 4;
+DELETE FROM kingres.ledger_tx WHERE block_height = 4;
+:trig_on;
+\c
+SET search_path = public;
+SELECT height FROM kingres.ledger_head();
+ height 
+--------
+      3
+(1 row)
+
+:trig_off;
+\c
+SET search_path = public;
+SELECT public.restore_all();
+ restore_all 
+-------------
+ 
+(1 row)
+
+:trig_on;
+\c
+SET search_path = public;
+-- 8. A digest that was recorded remembers the block it named.
+SELECT (kingres.ledger_generate_digest() ->> 'height')::bigint AS digest_height;
+ digest_height 
+---------------
+             4
+(1 row)
+
+SELECT height FROM kingres.ledger_head();
+ height 
+--------
+      4
+(1 row)
+
+:trig_off;
+\c
+SET search_path = public;
+DELETE FROM kingres.ledger_blocks WHERE height = 4;
+DELETE FROM kingres.ledger_tx WHERE block_height = 4;
+:trig_on;
+\c
+SET search_path = public;
+SELECT * FROM kingres.ledger_head();
+ERROR:  the head is block 3, but a digest was recorded at block 4: the end of the chain was removed
+:trig_off;
+\c
+SET search_path = public;
+SELECT public.restore_all();
+ restore_all 
+-------------
+ 
+(1 row)
+
+:trig_on;
+\c
+SET search_path = public;
+SELECT kingres.ledger_generate_digest() IS NOT NULL AS digest_again;
+ digest_again 
+--------------
+ t
+(1 row)
+
+:trig_off;
+\c
+SET search_path = public;
+UPDATE kingres.ledger_digest SET block_hash = sha256('not the block');
+:trig_on;
+\c
+SET search_path = public;
+SELECT * FROM kingres.ledger_head();
+ERROR:  block 4 is not the block a recorded digest names
+:trig_off;
+\c
+SET search_path = public;
+SELECT public.restore_all();
+ restore_all 
+-------------
+ 
+(1 row)
+
+:trig_on;
+\c
+SET search_path = public;
+SELECT height FROM kingres.ledger_head();
+ height 
+--------
+      4
+(1 row)
+
+-- 9. What ledger_head checks of the head itself.
+-- A head with a changed field: its hash no longer matches.
+:trig_off;
+\c
+SET search_path = public;
+UPDATE kingres.ledger_blocks SET tx_count = tx_count + 1 WHERE height = 4;
+:trig_on;
+\c
+SET search_path = public;
+SELECT * FROM kingres.ledger_head();
+ERROR:  the head, block 4, is malformed or does not match its stored block hash
+:trig_off;
+\c
+SET search_path = public;
+SELECT public.restore_all();
+ restore_all 
+-------------
+ 
+(1 row)
+
+-- A head with the right hash for a link that is wrong.
+DELETE FROM kingres.ledger_blocks WHERE height = 4;
+INSERT INTO kingres.ledger_blocks
+SELECT 4, 1, sha256('wrong link'), b.tx_merkle_root, b.tx_count, b.closed_at,
+       sha256(kingres.ledger_block_preimage(1::smallint, 4, sha256('wrong link'), b.tx_merkle_root, b.tx_count, b.closed_at))
+FROM public.saved_blocks b WHERE b.height = 4;
+:trig_on;
+\c
+SET search_path = public;
+SELECT * FROM kingres.ledger_head();
+ERROR:  the head, block 4, does not follow the block before it
+SELECT public.page(4, 1) AS wrong_link_through_entries;
+ERROR:  block 4 is malformed or does not follow the block before it
+:trig_off;
+\c
+SET search_path = public;
+SELECT public.restore_all();
+ restore_all 
+-------------
+ 
+(1 row)
+
+-- Block 0 gone while the head is above it.
+DELETE FROM kingres.ledger_blocks WHERE height = 0;
+:trig_on;
+\c
+SET search_path = public;
+SELECT * FROM kingres.ledger_head();
+ERROR:  block 0 is missing
+SELECT public.page(1, 2) AS from_one_without_block_zero;
+ERROR:  block 0 is missing
+:trig_off;
+\c
+SET search_path = public;
+SELECT public.restore_all();
+ restore_all 
+-------------
+ 
+(1 row)
+
+:trig_on;
+\c
+SET search_path = public;
+-- 10. The chain identity is checked on every call, not only from block 0.
+:trig_off;
+\c
+SET search_path = public;
+UPDATE kingres.ledger_chain SET chain_id = sha256('another chain');
+:trig_on;
+\c
+SET search_path = public;
+SELECT public.page(3, 1) AS middle_block_other_chain;
+ERROR:  the identity of the chain does not match block 0
+:trig_off;
+\c
+SET search_path = public;
+SELECT public.restore_all();
+ restore_all 
+-------------
+ 
+(1 row)
+
+:trig_on;
+\c
+SET search_path = public;
+-- 11. A height that is there twice (the primary key made non-unique, as
+-- someone with catalog access could): the message names that block.
+:trig_off;
+\c
+SET search_path = public;
+UPDATE pg_index SET indisunique = false, indisprimary = false
+ WHERE indexrelid = 'kingres.ledger_blocks_pkey'::regclass;
+\c
+SET search_path = public;
+INSERT INTO kingres.ledger_blocks SELECT * FROM public.saved_blocks WHERE height = 3;
+:trig_on;
+\c
+SET search_path = public;
+SELECT public.page(2, 5) AS duplicated_height;
+ERROR:  block 3 is present more than once
+SELECT public.page(0, 100) AS duplicated_height_from_zero;
+ERROR:  block 3 is present more than once
+:trig_off;
+\c
+SET search_path = public;
+DELETE FROM kingres.ledger_blocks WHERE height = 3;
+INSERT INTO kingres.ledger_blocks SELECT * FROM public.saved_blocks WHERE height = 3;
+UPDATE pg_index SET indisunique = true, indisprimary = true
+ WHERE indexrelid = 'kingres.ledger_blocks_pkey'::regclass;
+:trig_on;
+\c
+SET search_path = public;
+SELECT public.page(0, 100) AS restored_after_duplicate;
+ restored_after_duplicate 
+--------------------------
+ 0,1,2,3,4
+(1 row)
+
+-- 12. A fully valid successor written by someone who can write the table is
+-- returned as valid: nothing in the database can tell it from a block the
+-- builder wrote.  Only a record kept outside the database (what the
+-- publisher published, a digest) shows it.
+:trig_off;
+\c
+SET search_path = public;
+INSERT INTO kingres.ledger_blocks
+SELECT 5, 1, b.block_hash, b.tx_merkle_root, 0, b.closed_at,
+       sha256(kingres.ledger_block_preimage(1::smallint, 5, b.block_hash, b.tx_merkle_root, 0, b.closed_at))
+FROM public.saved_blocks b WHERE b.height = 4;
+:trig_on;
+\c
+SET search_path = public;
+SELECT public.page(4, 5) AS forged_valid_successor;
+ forged_valid_successor 
+------------------------
+ 4,5
+(1 row)
+
+SELECT height FROM kingres.ledger_head();
+ height 
+--------
+      5
+(1 row)
+
+SELECT count(*) > 0 AS verify_sees_the_successor FROM kingres.ledger_verify();
+ verify_sees_the_successor 
+---------------------------
+ t
+(1 row)
+
+:trig_off;
+\c
+SET search_path = public;
+SELECT public.restore_all();
+ restore_all 
+-------------
+ 
+(1 row)
+
+:trig_on;
+\c
+SET search_path = public;
+SELECT count(*) AS problems_after_all FROM kingres.ledger_verify();
+ problems_after_all 
+--------------------
+                  0
+(1 row)
+
+-- 13. PUBLIC's read access to the catalog tables is the operator's to
+-- withdraw (L7-09): the statement works, the owner's privileges stay
+-- protected, a role that was granted EXECUTE on the two reading functions
+-- keeps using them, and writing to a ledger table still works.
+CREATE ROLE kl_head_writer;
+GRANT USAGE ON SCHEMA public TO kl_head_writer;
+GRANT INSERT ON docs TO kl_head_writer;
+REVOKE SELECT ON kingres.ledger_blocks FROM PUBLIC;
+REVOKE SELECT ON kingres.ledger_chain, kingres.ledger_table FROM public;
+REVOKE SELECT ON kingres.ledger_digest FROM PUBLIC;
+SELECT c.relname, has_table_privilege('public', c.oid, 'select') AS public_can_select
+FROM pg_class c WHERE c.oid IN ('kingres.ledger_blocks'::regclass, 'kingres.ledger_chain'::regclass,
+                                'kingres.ledger_table'::regclass)
+ORDER BY 1;
+    relname    | public_can_select 
+---------------+-------------------
+ ledger_blocks | f
+ ledger_chain  | f
+ ledger_table  | f
+(3 rows)
+
+SET ROLE kl_head_service;
+SELECT count(*) FROM kingres.ledger_blocks;
+ERROR:  permission denied for table ledger_blocks
+SELECT count(*) FROM kingres.ledger_chain;
+ERROR:  permission denied for table ledger_chain
+SELECT height FROM kingres.ledger_head();
+ height 
+--------
+      4
+(1 row)
+
+SELECT count(*) AS entries FROM kingres.ledger_blocks_entries(0, 10);
+ entries 
+---------
+       5
+(1 row)
+
+SELECT count(*) AS entries_from_two FROM kingres.ledger_blocks_entries(2, 10);
+ entries_from_two 
+------------------
+                3
+(1 row)
+
+RESET ROLE;
+SET ROLE kl_head_nobody;
+SELECT count(*) FROM kingres.ledger_blocks;
+ERROR:  permission denied for table ledger_blocks
+SELECT * FROM kingres.ledger_blocks_entries(0, 1);
+ERROR:  permission denied for function ledger_blocks_entries
+RESET ROLE;
+-- The ledger still takes writes from a role that cannot read its tables.
+SET ROLE kl_head_writer;
+INSERT INTO docs VALUES (100, 'written by a role that cannot read the ledger');
+RESET ROLE;
+SELECT kingres.ledger_build_block() IS NOT NULL AS built_after_the_write;
+ built_after_the_write 
+-----------------------
+ t
+(1 row)
+
+-- The owner's own privileges stay: revoking them would stop the functions.
+REVOKE SELECT ON kingres.ledger_blocks FROM CURRENT_USER;
+ERROR:  cannot revoke privileges of the owner on table "ledger_blocks": it is part of the ledger
+REVOKE ALL ON kingres.ledger_blocks FROM PUBLIC, CURRENT_USER;
+ERROR:  cannot revoke privileges of the owner on table "ledger_blocks": it is part of the ledger
+-- All tables of the schema at once is allowed for PUBLIC, and so is granting again.
+REVOKE ALL ON ALL TABLES IN SCHEMA kingres FROM PUBLIC;
+GRANT SELECT ON kingres.ledger_blocks, kingres.ledger_chain, kingres.ledger_table TO PUBLIC;
+SELECT has_table_privilege('public', 'kingres.ledger_blocks', 'select') AS public_can_select_again;
+ public_can_select_again 
+-------------------------
+ t
+(1 row)
+
+SELECT count(*) AS problems_at_the_end FROM kingres.ledger_verify();
+ problems_at_the_end 
+---------------------
+                   0
+(1 row)
+
 -- Clean up the database and the roles.
 \c :orig_db
 DROP DATABASE kl_head_t;
 DROP ROLE kl_head_nobody;
 DROP ROLE kl_head_service;
+DROP ROLE kl_head_writer;

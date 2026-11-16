@@ -85,6 +85,7 @@ typedef struct HllState
 	uint32		nlist;
 	uint32		listcap;
 	MemoryContext cxt;			/* where the state and its arrays live */
+	KsAcct	   *acct;			/* the account of an aggregate state, else NULL */
 } HllState;
 
 static inline uint32
@@ -787,6 +788,7 @@ agg_state(FunctionCallInfo fcinfo, int p, MemoryContext aggcontext)
 {
 	HllState   *st;
 	MemoryContext old;
+	KsAcct	   *acct;
 
 	if (!PG_ARGISNULL(0))
 	{
@@ -798,9 +800,12 @@ agg_state(FunctionCallInfo fcinfo, int p, MemoryContext aggcontext)
 					 errhint("The precision must be the same in every row of a group.")));
 		return st;
 	}
-	old = MemoryContextSwitchTo(aggcontext);
+	/* a state context of its own, so that what the state holds is counted */
+	acct = ks_acct_create(aggcontext);
+	old = MemoryContextSwitchTo(ks_acct_context(acct));
 	st = hll_new(p);
 	MemoryContextSwitchTo(old);
+	st->acct = acct;
 	return st;
 }
 
@@ -815,6 +820,7 @@ kingres_sketch_hll_agg_add(PG_FUNCTION_ARGS)
 	st = agg_state(fcinfo, KS_HLL_DEFAULT_PRECISION, aggcontext);
 	if (!PG_ARGISNULL(1))
 		hll_add_hash_value(st, ks_hash_datum(fcinfo, 1, PG_GETARG_DATUM(1)));
+	ks_acct_update(st->acct);
 	PG_RETURN_POINTER(st);
 }
 
@@ -832,6 +838,7 @@ kingres_sketch_hll_agg_add_p(PG_FUNCTION_ARGS)
 	st = agg_state(fcinfo, p, aggcontext);
 	if (!PG_ARGISNULL(1))
 		hll_add_hash_value(st, ks_hash_datum(fcinfo, 1, PG_GETARG_DATUM(1)));
+	ks_acct_update(st->acct);
 	PG_RETURN_POINTER(st);
 }
 
@@ -854,6 +861,7 @@ kingres_sketch_hll_agg_union(PG_FUNCTION_ARGS)
 	check_same_precision(st, other);
 	hll_merge(st, other);
 	hll_free(other);
+	ks_acct_update(st->acct);
 	PG_RETURN_POINTER(st);
 }
 
@@ -868,14 +876,18 @@ kingres_sketch_hll_agg_combine(PG_FUNCTION_ARGS)
 		KS_RETURN_STATE(a);
 	if (a == NULL)
 	{
-		MemoryContext old = MemoryContextSwitchTo(aggcontext);
+		KsAcct	   *acct = ks_acct_create(aggcontext);
+		MemoryContext old = MemoryContextSwitchTo(ks_acct_context(acct));
 
 		a = hll_copy(b);
 		MemoryContextSwitchTo(old);
+		a->acct = acct;
+		ks_acct_update(acct);
 		PG_RETURN_POINTER(a);
 	}
 	check_same_precision(a, b);
 	hll_merge(a, b);
+	ks_acct_update(a->acct);
 	PG_RETURN_POINTER(a);
 }
 
@@ -895,15 +907,24 @@ kingres_sketch_hll_agg_deserial(PG_FUNCTION_ARGS)
 	char		why[KS_WHY_LEN];
 	MemoryContext old;
 	HllState   *st;
+	KsAcct	   *acct;
 
 	p = ks_arg_bytes(fcinfo, 0, &len);
 	if (len > ks_max_value_bytes(KS_KIND_HLL))
 		ks_invalid_value("hll", "the value is longer than any valid value of the type");
-	old = MemoryContextSwitchTo(aggcontext);
+	/* a state of this size is made whole: refuse before it is, not after */
+	ks_acct_precheck(len);
+	acct = ks_acct_create(aggcontext);
+	old = MemoryContextSwitchTo(ks_acct_context(acct));
 	st = hll_load(p, len, why);
 	MemoryContextSwitchTo(old);
 	if (st == NULL)
+	{
+		ks_acct_release(acct);
 		ks_invalid_value("hll", why);
+	}
+	st->acct = acct;
+	ks_acct_update(acct);
 	PG_RETURN_POINTER(st);
 }
 

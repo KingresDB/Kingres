@@ -1,0 +1,555 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- timepart_history: who sees the history of a run (K12S-01), and what a
+-- renamed role does to a policy (K12S-02).
+--
+-- The rule: a run belongs to the table it was made for and to the role that
+-- owned that table when the run began.  A role sees the run when it is that
+-- role or a member that inherits its privileges, or a superuser.  A table of
+-- the same name is another table; a renamed table, a renamed schema and a
+-- renamed role are the same.  After ALTER TABLE ... OWNER TO the earlier runs
+-- stay with the earlier owner, and the runs after it belong to the new one.
+-- A run whose owner role was dropped is shown to superusers only.
+--
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+SET timezone = 'UTC';
+SET datestyle = ISO;
+SET intervalstyle = postgres;
+\set VERBOSITY default
+\set SHOW_CONTEXT never
+SET client_min_messages = warning;
+DROP ROLE IF EXISTS tp_h_alice, tp_h_alice2, tp_h_bob, tp_h_carol, tp_h_dave, tp_h_zed;
+RESET client_min_messages;
+CREATE ROLE tp_h_alice NOLOGIN;
+CREATE ROLE tp_h_bob NOLOGIN;
+CREATE ROLE tp_h_carol NOLOGIN IN ROLE tp_h_alice;
+CREATE ROLE tp_h_dave NOLOGIN NOINHERIT IN ROLE tp_h_alice;
+CREATE ROLE tp_h_zed NOLOGIN;
+CREATE SCHEMA tph;
+GRANT ALL ON SCHEMA tph TO tp_h_alice, tp_h_bob, tp_h_zed;
+GRANT USAGE ON SCHEMA kingres TO tp_h_alice, tp_h_bob, tp_h_carol, tp_h_dave, tp_h_zed;
+GRANT EXECUTE ON FUNCTION
+    kingres.timepart_set_policy(regclass, interval, interval, interval, text, interval, text[], jsonb, text, interval, boolean),
+    kingres.timepart_unset_policy(regclass),
+    kingres.timepart_partitions(regclass),
+    kingres.timepart_check(interval, timestamptz)
+  TO tp_h_alice, tp_h_bob, tp_h_carol, tp_h_dave, tp_h_zed;
+-- What the current role sees of the history of the tables named tph.<name>.
+CREATE FUNCTION tp.seen(p_tables text[])
+RETURNS TABLE (n bigint, run_id bigint, tbl name, owner name, state text, live boolean, actions bigint)
+LANGUAGE sql STABLE AS $$
+    SELECT row_number() OVER (ORDER BY r.run_id), r.run_id, r.table_name, r.table_owner, r.state,
+           r.table_oid IS NOT NULL,
+           (SELECT count(*) FROM kingres.timepart_run_action a WHERE a.run_id = r.run_id)
+      FROM kingres.timepart_run r
+     WHERE r.table_name = ANY (p_tables) ORDER BY r.run_id
+$$;
+GRANT USAGE ON SCHEMA tp TO tp_h_alice, tp_h_bob, tp_h_carol, tp_h_dave, tp_h_zed;
+-- The runs of every table of this test as a superuser sees them, by role.
+CREATE FUNCTION tp.who_sees(p_run bigint)
+RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_role text;
+    v_out  text := '';
+    v_n    bigint;
+BEGIN
+    FOREACH v_role IN ARRAY ARRAY['tp_h_alice', 'tp_h_alice2', 'tp_h_bob', 'tp_h_carol', 'tp_h_dave', 'tp_h_zed'] LOOP
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_role) THEN
+            EXECUTE format('SET LOCAL ROLE %I', v_role);
+            SELECT count(*) INTO v_n FROM kingres.timepart_run r WHERE r.run_id = p_run;
+            RESET ROLE;
+            IF v_n > 0 THEN v_out := v_out || ' ' || v_role; END IF;
+        END IF;
+    END LOOP;
+    RETURN '{' || trim(v_out) || '}';
+END $$;
+-- ---------------------------------------------------------------------
+-- The review's case: a dropped table, and another role's table of its name.
+-- ---------------------------------------------------------------------
+SET ROLE tp_h_alice;
+CREATE TABLE tph.ta (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.timepart_set_policy('tph.ta', '1 day', create_ahead => '2 days', retention => '5 days');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+RESET ROLE;
+\o /dev/null
+CALL kingres.timepart_run('tph.ta', '2026-03-10 UTC');
+\o
+SELECT n, tbl, owner, state, live, actions FROM tp.seen('{ta}');
+ n | tbl |   owner    | state | live | actions 
+---+-----+------------+-------+------+---------
+ 1 | ta  | tp_h_alice | done  | t    |       2
+(1 row)
+
+SELECT tp.who_sees(min(run_id)) AS who_sees_alice_run FROM kingres.timepart_run WHERE table_name = 'ta';
+   who_sees_alice_run    
+-------------------------
+ {tp_h_alice tp_h_carol}
+(1 row)
+
+SET ROLE tp_h_alice;
+DROP TABLE tph.ta;
+SELECT n, tbl, owner, state, live, actions FROM tp.seen('{ta}');
+ n | tbl |   owner    | state | live | actions 
+---+-----+------------+-------+------+---------
+ 1 | ta  | tp_h_alice | done  | f    |       2
+(1 row)
+
+RESET ROLE;
+-- bob makes a table of the same name
+SET ROLE tp_h_bob;
+CREATE TABLE tph.ta (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT n, tbl, owner, state, live, actions FROM tp.seen('{ta}');
+ n | tbl | owner | state | live | actions 
+---+-----+-------+-------+------+---------
+(0 rows)
+
+SELECT count(*) AS runs_seen_by_bob FROM kingres.timepart_run;
+ runs_seen_by_bob 
+------------------
+                0
+(1 row)
+
+SELECT count(*) AS actions_seen_by_bob FROM kingres.timepart_run_action;
+ actions_seen_by_bob 
+---------------------
+                   0
+(1 row)
+
+SELECT count(*) AS partitions_listed FROM kingres.timepart_partitions('tph.ta');
+ partitions_listed 
+-------------------
+                 0
+(1 row)
+
+SELECT kingres.timepart_set_policy('tph.ta', '1 day', create_ahead => '2 days');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+RESET ROLE;
+\o /dev/null
+CALL kingres.timepart_run('tph.ta', '2026-03-10 UTC');
+\o
+SET ROLE tp_h_bob;
+SELECT n, tbl, owner, state, live, actions FROM tp.seen('{ta}');
+ n | tbl |  owner   | state | live | actions 
+---+-----+----------+-------+------+---------
+ 1 | ta  | tp_h_bob | done  | t    |       2
+(1 row)
+
+SELECT table_name, problem FROM kingres.timepart_check('1 hour', '2026-03-10 UTC') WHERE table_name = 'ta';
+ table_name | problem 
+------------+---------
+(0 rows)
+
+SELECT s.owner, s.state, s.live FROM kingres.timepart_policies p, LATERAL tp.seen('{ta}') s WHERE p.table_name = 'ta' AND s.run_id = p.last_run_id;
+  owner   | state | live 
+----------+-------+------
+ tp_h_bob | done  | t
+(1 row)
+
+RESET ROLE;
+SET ROLE tp_h_alice;
+SELECT n, tbl, owner, state, live, actions FROM tp.seen('{ta}');
+ n | tbl |   owner    | state | live | actions 
+---+-----+------------+-------+------+---------
+ 1 | ta  | tp_h_alice | done  | f    |       2
+(1 row)
+
+RESET ROLE;
+-- the superuser sees both; the history is not lost
+SELECT n, tbl, owner, state, live, actions FROM tp.seen('{ta}');
+ n | tbl |   owner    | state | live | actions 
+---+-----+------------+-------+------+---------
+ 1 | ta  | tp_h_alice | done  | f    |       2
+ 2 | ta  | tp_h_bob   | done  | t    |       2
+(2 rows)
+
+SELECT tp.who_sees(run_id) AS who_sees, table_owner, table_oid IS NOT NULL AS live FROM kingres.timepart_run WHERE table_name = 'ta' ORDER BY run_id;
+        who_sees         | table_owner | live 
+-------------------------+-------------+------
+ {tp_h_alice tp_h_carol} | tp_h_alice  | f
+ {tp_h_bob}              | tp_h_bob    | t
+(2 rows)
+
+-- A table of the same name made by the same role is another table, too:
+-- its list of partitions does not hold the partitions the first one detached.
+SET ROLE tp_h_alice;
+CREATE TABLE tph.tb (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.timepart_set_policy('tph.tb', '1 day', create_ahead => '1 day', retention => '2 days', retention_action => 'detach');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+RESET ROLE;
+\o /dev/null
+CALL kingres.timepart_run('tph.tb', '2026-03-10 UTC');
+CALL kingres.timepart_run('tph.tb', '2026-03-14 UTC');
+\o
+SET ROLE tp_h_alice;
+SELECT partition, attached FROM kingres.timepart_partitions('tph.tb') ORDER BY 1;
+    partition     | attached 
+------------------+----------
+ tph.tb_p20260310 | f
+ tph.tb_p20260312 | t
+ tph.tb_p20260313 | t
+ tph.tb_p20260314 | t
+(4 rows)
+
+DROP TABLE tph.tb;
+CREATE TABLE tph.tb (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT partition, attached FROM kingres.timepart_partitions('tph.tb') ORDER BY 1;
+ partition | attached 
+-----------+----------
+(0 rows)
+
+SELECT n, tbl, owner, state, live, actions FROM tp.seen('{tb}');
+ n | tbl |   owner    | state | live | actions 
+---+-----+------------+-------+------+---------
+ 1 | tb  | tp_h_alice | done  | f    |       1
+ 2 | tb  | tp_h_alice | done  | f    |       4
+(2 rows)
+
+RESET ROLE;
+DROP TABLE IF EXISTS tph.tb_p20260309, tph.tb_p20260310, tph.tb_p20260311;
+NOTICE:  table "tb_p20260309" does not exist, skipping
+NOTICE:  table "tb_p20260311" does not exist, skipping
+DROP TABLE tph.tb;
+-- ---------------------------------------------------------------------
+-- Renames: a table, its schema, and the history stays with the owner.
+-- ---------------------------------------------------------------------
+SET ROLE tp_h_alice;
+CREATE TABLE tph.tc (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.timepart_set_policy('tph.tc', '1 day', create_ahead => '1 day');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+RESET ROLE;
+\o /dev/null
+CALL kingres.timepart_run('tph.tc', '2026-03-10 UTC');
+\o
+SET ROLE tp_h_alice;
+ALTER TABLE tph.tc RENAME TO tc2;
+SELECT n, tbl, owner, state, live, actions FROM tp.seen('{tc,tc2}');
+ n | tbl |   owner    | state | live | actions 
+---+-----+------------+-------+------+---------
+ 1 | tc2 | tp_h_alice | done  | t    |       1
+(1 row)
+
+RESET ROLE;
+CREATE SCHEMA tph_new;
+ALTER SCHEMA tph RENAME TO tph_old;
+ALTER SCHEMA tph_new RENAME TO tph;
+SET ROLE tp_h_alice;
+SELECT n, tbl, owner, state, live, actions FROM tp.seen('{tc,tc2}');
+ n | tbl |   owner    | state | live | actions 
+---+-----+------------+-------+------+---------
+ 1 | tc2 | tp_h_alice | done  | t    |       1
+(1 row)
+
+RESET ROLE;
+DROP SCHEMA tph;
+ALTER SCHEMA tph_old RENAME TO tph;
+SET ROLE tp_h_alice;
+SELECT n, tbl, owner, state, live, actions FROM tp.seen('{tc,tc2}');
+ n | tbl |   owner    | state | live | actions 
+---+-----+------------+-------+------+---------
+ 1 | tc2 | tp_h_alice | done  | t    |       1
+(1 row)
+
+SELECT live FROM tp.seen('{tc2}');
+ live 
+------
+ t
+(1 row)
+
+ALTER TABLE tph.tc2 RENAME TO tc;
+RESET ROLE;
+-- ---------------------------------------------------------------------
+-- A member that inherits the owner's privileges sees the history; one that
+-- does not, until it does SET ROLE.
+-- ---------------------------------------------------------------------
+SELECT tp.who_sees(max(run_id)) AS who_sees_tc FROM kingres.timepart_run WHERE table_name = 'tc';
+       who_sees_tc       
+-------------------------
+ {tp_h_alice tp_h_carol}
+(1 row)
+
+SET ROLE tp_h_dave;
+SELECT count(*) AS dave_noinherit FROM kingres.timepart_run WHERE table_name = 'tc';
+ dave_noinherit 
+----------------
+              0
+(1 row)
+
+RESET ROLE;
+SET ROLE tp_h_carol;
+SELECT count(*) AS carol_inherits FROM kingres.timepart_run WHERE table_name = 'tc';
+ carol_inherits 
+----------------
+              1
+(1 row)
+
+RESET ROLE;
+-- ---------------------------------------------------------------------
+-- ALTER TABLE ... OWNER TO: the earlier runs stay with the earlier owner, the
+-- runs after the change are the new owner's.
+-- ---------------------------------------------------------------------
+ALTER TABLE tph.tc OWNER TO tp_h_bob;
+\o /dev/null
+CALL kingres.timepart_run('tph.tc', '2026-03-11 UTC');
+\o
+SELECT n, tbl, owner, state FROM tp.seen('{tc}');
+ n | tbl |   owner    | state  
+---+-----+------------+--------
+ 1 | tc  | tp_h_alice | done
+ 2 | tc  | tp_h_bob   | failed
+(2 rows)
+
+SELECT left(r.error, 90) AS error FROM kingres.timepart_run r WHERE r.table_name = 'tc' AND r.error IS NOT NULL;
+                                           error                                            
+--------------------------------------------------------------------------------------------
+ 42501: owner_changed: the owner of tph.tc is now "tp_h_bob", the policy was set for "tp_h_
+(1 row)
+
+SET ROLE tp_h_alice;
+SELECT n, owner, state FROM tp.seen('{tc}');
+ n |   owner    | state 
+---+------------+-------
+ 1 | tp_h_alice | done
+(1 row)
+
+RESET ROLE;
+SET ROLE tp_h_bob;
+SELECT n, owner, state FROM tp.seen('{tc}');
+ n |  owner   | state  
+---+----------+--------
+ 1 | tp_h_bob | failed
+(1 row)
+
+SELECT kingres.timepart_set_policy('tph.tc', '1 day', create_ahead => '1 day');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+RESET ROLE;
+\o /dev/null
+CALL kingres.timepart_run('tph.tc', '2026-03-12 UTC');
+\o
+SET ROLE tp_h_bob;
+SELECT n, owner, state FROM tp.seen('{tc}');
+ n |  owner   | state  
+---+----------+--------
+ 1 | tp_h_bob | failed
+ 2 | tp_h_bob | done
+(2 rows)
+
+RESET ROLE;
+SET ROLE tp_h_alice;
+SELECT n, owner, state FROM tp.seen('{tc}');
+ n |   owner    | state 
+---+------------+-------
+ 1 | tp_h_alice | done
+(1 row)
+
+RESET ROLE;
+SELECT n, owner, state FROM tp.seen('{tc}');
+ n |   owner    | state  
+---+------------+--------
+ 1 | tp_h_alice | done
+ 2 | tp_h_bob   | failed
+ 3 | tp_h_bob   | done
+(3 rows)
+
+-- ---------------------------------------------------------------------
+-- K12S-02: a role that is renamed is the same owner.
+-- ---------------------------------------------------------------------
+SET ROLE tp_h_alice;
+CREATE TABLE tph.td (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.timepart_set_policy('tph.td', '1 day', create_ahead => '1 day');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+RESET ROLE;
+SELECT table_owner, created_by FROM kingres.timepart_policy WHERE table_name = 'td';
+ table_owner | created_by 
+-------------+------------
+ tp_h_alice  | tp_h_alice
+(1 row)
+
+ALTER ROLE tp_h_alice RENAME TO tp_h_alice2;
+SELECT table_owner, created_by FROM kingres.timepart_policy WHERE table_name = 'td';
+ table_owner | created_by  
+-------------+-------------
+ tp_h_alice2 | tp_h_alice2
+(1 row)
+
+\o /dev/null
+CALL kingres.timepart_run('tph.td', '2026-03-10 UTC');
+\o
+SELECT state, error FROM tp.last_run('tph', 'td');
+ state | error 
+-------+-------
+ done  | 
+(1 row)
+
+SELECT n, owner, state FROM tp.seen('{td}');
+ n |    owner    | state 
+---+-------------+-------
+ 1 | tp_h_alice2 | done
+(1 row)
+
+SELECT started_by = current_user AS started_by_is_the_session_user FROM kingres.timepart_run WHERE table_name = 'td';
+ started_by_is_the_session_user 
+--------------------------------
+ t
+(1 row)
+
+SET ROLE tp_h_alice2;
+SELECT n, owner, state FROM tp.seen('{td}');
+ n |    owner    | state 
+---+-------------+-------
+ 1 | tp_h_alice2 | done
+(1 row)
+
+SELECT table_owner, created_by FROM kingres.timepart_policy WHERE table_name = 'td';
+ table_owner | created_by  
+-------------+-------------
+ tp_h_alice2 | tp_h_alice2
+(1 row)
+
+SELECT kingres.timepart_set_policy('tph.td', '1 day', create_ahead => '2 days');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+RESET ROLE;
+-- the partitions the run made belong to the renamed role
+SELECT DISTINCT pg_get_userbyid(c.relowner) AS partition_owner
+  FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid WHERE i.inhparent = 'tph.td'::regclass;
+ partition_owner 
+-----------------
+ tp_h_alice2
+(1 row)
+
+-- another role with the name the owner had is not the owner, and the one that
+-- was renamed still is
+CREATE ROLE tp_h_alice NOLOGIN;
+GRANT ALL ON SCHEMA tph TO tp_h_alice;
+GRANT USAGE ON SCHEMA kingres TO tp_h_alice;
+ALTER TABLE tph.td OWNER TO tp_h_alice;
+\o /dev/null
+CALL kingres.timepart_run('tph.td', '2026-03-12 UTC');
+\o
+SELECT state, left(error, 120) AS error FROM tp.last_run('tph', 'td');
+ state  |                                                error                                                
+--------+-----------------------------------------------------------------------------------------------------
+ failed | 42501: owner_changed: the owner of tph.td is now "tp_h_alice", the policy was set for "tp_h_alice2"
+(1 row)
+
+ALTER TABLE tph.td OWNER TO tp_h_alice2;
+\o /dev/null
+CALL kingres.timepart_run('tph.td', '2026-03-13 UTC');
+\o
+SELECT state, error FROM tp.last_run('tph', 'td');
+ state | error 
+-------+-------
+ done  | 
+(1 row)
+
+SELECT n, owner, state FROM tp.seen('{td}');
+ n |    owner    | state  
+---+-------------+--------
+ 1 | tp_h_alice2 | done
+ 2 | tp_h_alice  | failed
+ 3 | tp_h_alice2 | done
+(3 rows)
+
+SELECT tp.who_sees(run_id) AS who_sees_td_run FROM kingres.timepart_run WHERE table_name = 'td' ORDER BY run_id DESC LIMIT 1;
+     who_sees_td_run      
+--------------------------
+ {tp_h_alice2 tp_h_carol}
+(1 row)
+
+-- ---------------------------------------------------------------------
+-- A dropped owner: only superusers see the runs, also when a role of the same
+-- name is made later.
+-- ---------------------------------------------------------------------
+SET ROLE tp_h_zed;
+CREATE TABLE tph.te (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.timepart_set_policy('tph.te', '1 day', create_ahead => '1 day');
+ timepart_set_policy 
+---------------------
+ 
+(1 row)
+
+RESET ROLE;
+\o /dev/null
+CALL kingres.timepart_run('tph.te', '2026-03-10 UTC');
+\o
+SELECT tp.who_sees(run_id) AS who_sees_te FROM kingres.timepart_run WHERE table_name = 'te';
+ who_sees_te 
+-------------
+ {tp_h_zed}
+(1 row)
+
+DROP TABLE tph.te;
+DROP OWNED BY tp_h_zed;
+DROP ROLE tp_h_zed;
+SELECT tp.who_sees(run_id) AS who_sees_te_owner_dropped, table_owner, table_oid IS NULL AS table_gone
+  FROM kingres.timepart_run WHERE table_name = 'te';
+ who_sees_te_owner_dropped | table_owner | table_gone 
+---------------------------+-------------+------------
+ {}                        | tp_h_zed    | t
+(1 row)
+
+CREATE ROLE tp_h_zed NOLOGIN;
+GRANT USAGE ON SCHEMA kingres TO tp_h_zed;
+SELECT tp.who_sees(run_id) AS who_sees_te_new_role_same_name, table_owner
+  FROM kingres.timepart_run WHERE table_name = 'te';
+ who_sees_te_new_role_same_name | table_owner 
+--------------------------------+-------------
+ {}                             | tp_h_zed
+(1 row)
+
+-- ---------------------------------------------------------------------
+-- The same through the other views and functions.
+-- ---------------------------------------------------------------------
+SELECT count(*) AS actions_of_te_seen_by_superuser FROM kingres.timepart_run_action a JOIN kingres.timepart_run r USING (run_id) WHERE r.table_name = 'te';
+ actions_of_te_seen_by_superuser 
+---------------------------------
+                               1
+(1 row)
+
+SET ROLE tp_h_zed;
+SELECT count(*) AS actions_of_te_seen_by_new_zed FROM kingres.timepart_run_action a JOIN kingres.timepart_run r USING (run_id) WHERE r.table_name = 'te';
+ actions_of_te_seen_by_new_zed 
+-------------------------------
+                             0
+(1 row)
+
+SELECT count(*) AS runs_seen_by_new_zed FROM kingres.timepart_run;
+ runs_seen_by_new_zed 
+----------------------
+                    0
+(1 row)
+
+RESET ROLE;
+-- Cleanup of the roles of the test.
+DROP TABLE tph.ta, tph.tc, tph.td CASCADE;
+DROP SCHEMA tph CASCADE;
+DROP FUNCTION tp.seen(text[]), tp.who_sees(bigint);
+DROP OWNED BY tp_h_alice, tp_h_alice2, tp_h_bob, tp_h_carol, tp_h_dave, tp_h_zed;
+DROP ROLE tp_h_alice, tp_h_alice2, tp_h_bob, tp_h_carol, tp_h_dave, tp_h_zed;

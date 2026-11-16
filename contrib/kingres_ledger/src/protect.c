@@ -1059,8 +1059,20 @@ kl_check_catalog_grant(GrantStmt *stmt, const char *relname, Oid extoid,
 
 		foreach(lc, stmt->grantees)
 		{
-			Oid			roleid = get_rolespec_oid(lfirst_node(RoleSpec, lc), true);
+			RoleSpec   *spec = lfirst_node(RoleSpec, lc);
+			Oid			roleid;
 
+			/*
+			 * PUBLIC is not a role and never the owner.  get_rolespec_oid
+			 * raises "role "public" does not exist" for it, which made
+			 * REVOKE ... FROM PUBLIC fail with a message that blames the
+			 * statement.  An operator may withdraw PUBLIC's read access to
+			 * the catalog tables: the functions that publish the chain run
+			 * with the rights of the extension owner and need only EXECUTE.
+			 */
+			if (spec->roletype == ROLESPEC_PUBLIC)
+				continue;
+			roleid = get_rolespec_oid(spec, true);
 			if (OidIsValid(roleid) && roleid == owner)
 				kl_reject("revoke privileges of the owner on table", relname,
 						  KL_CATALOG_LEDGER);

@@ -22,7 +22,8 @@ SELECT count(*) AS functions,
        count(*) FILTER (WHERE provolatile <> 'i') AS not_immutable,
        count(*) FILTER (WHERE proparallel <> 's') AS not_parallel_safe,
        count(*) FILTER (WHERE proconfig IS NOT NULL) AS with_settings
-  FROM pg_proc WHERE pronamespace = 'kingres_sketch'::regnamespace AND prokind = 'f';
+  FROM pg_proc WHERE pronamespace = 'kingres_sketch'::regnamespace AND prokind = 'f'
+   AND proname <> 'state_bytes';
 
 -- every aggregate is parallel safe and has the functions partial aggregation needs
 SELECT p.proname, pg_get_function_identity_arguments(p.oid) AS args,

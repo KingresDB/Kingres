@@ -139,7 +139,7 @@ Tests: thirteen pg_regress tests and twelve TAP tests under `t/`.
 | `ledger_review` | one reproduction for each finding L-01 to L-12 of the review |
 | `ledger_privs` | scan of `pg_proc`: fixed `search_path`, `SECURITY DEFINER` only where needed, qualified references; the default privileges; shadowing by temporary objects |
 | `ledger_preimage` | `ledger_block_preimage`: an independent layout of the 87 bytes, a pinned value, every stored block, refused arguments, privileges |
-| `ledger_head` | `ledger_head` and `ledger_blocks_entries` in a database of their own: an empty ledger, one and five blocks, every bound of a page, malformed stored blocks (`XX001`), privileges, nothing written |
+| `ledger_head` | `ledger_head` and `ledger_blocks_entries` in a database of their own: an empty ledger, one and five blocks, every bound of a page, malformed stored blocks (`XX001`), the removal of the end of the chain (with and without the rows that refer to it), recorded digests, the head's own hash and link, the chain identity on every call, a repeated height, a valid forged successor, privileges, `REVOKE ... FROM PUBLIC` on the catalog tables, nothing written |
 | `001_concurrent_blocks` | concurrent writers while blocks are built |
 | `002_restart_standby` | restart, crash recovery, a streaming standby |
 | `003_preload_and_hooks` | the preload requirement, hook chaining with `pg_stat_statements` |
@@ -356,8 +356,8 @@ last argument.
 | `kingres.ledger_history_row_hash(record) returns bytea` | Row hash of a row of a history table (`SELECT kingres.ledger_history_row_hash(h.*) FROM t_ledger_history h`): the hash its `D` entry carries. | PUBLIC |
 | `kingres.ledger_leaf_hash(bytea)`, `ledger_node_hash(bytea, bytea)`, `ledger_merkle_root(bytea)` (aggregate), `ledger_merkle_path(bytea[], int)`, `ledger_tx_leaf(...)`, `ledger_block_tx_leaf(...)`, `ledger_block_hash(...)`, `ledger_genesis_hash(bytea)`, `ledger_timestamptz_us(timestamptz)` | Primitives used by the SQL functions and useful for independent checks. | PUBLIC |
 | `kingres.ledger_block_preimage(hash_version smallint, height bigint, prev_hash bytea, tx_merkle_root bytea, tx_count int, closed_at timestamptz) returns bytea` | **0.3.** The 87 bytes that `ledger_block_hash` hashes (the same code lays them out), with the same argument checks. `IMMUTABLE`, `STRICT`. | PUBLIC |
-| `kingres.ledger_head() returns table (chain_id bytea, height bigint, block_hash bytea, closed_at_us bigint)` | **0.3.** The latest block without building one and without recording a digest; no row for an empty ledger; an error `XX001` if the chain identity is missing. `STABLE`, `SECURITY DEFINER`. | granted roles (the service role of `kingresd`) |
-| `kingres.ledger_blocks_entries(from_height bigint, max_count int) returns table (height bigint, entry bytea)` | **0.3.** The block preimages from `from_height`, in height order, at most `min(max_count, 10000)` of them. Every block returned is checked first: hash version 1, lengths, no gap, the link to the block before (the genesis hash for block 0), and `SHA-256(entry) = block_hash`; the first failure is an error `XX001` and no row is returned. `STABLE`, runs as the caller (the headers are readable by PUBLIC). | granted roles |
+| `kingres.ledger_head() returns table (chain_id bytea, height bigint, block_hash bytea, closed_at_us bigint)` | **0.3.** The latest block without building one and without recording a digest; no row for an empty ledger. The head is checked before it is returned (its hash recomputed, its link to the block before, the chain identity against block 0) and so is the end of the chain (no transaction row and no recorded digest names a block above it); an error `XX001` otherwise, also when the chain identity is missing. See "Reading the chain for publication" for what that does and does not catch. `STABLE`, `SECURITY DEFINER`. | granted roles (the service role of `kingresd`) |
+| `kingres.ledger_blocks_entries(from_height bigint, max_count int) returns table (height bigint, entry bytea)` | **0.3.** The block preimages from `from_height`, in height order, at most `min(max_count, 10000)` of them. Every block returned is checked first: hash version 1, lengths, no gap and no repeat, the link to the block before (the genesis hash for block 0; for a range that starts later, the block before it is read and its hash recomputed), the chain identity against block 0, and `SHA-256(entry) = block_hash`; the first failure is an error `XX001` and no row is returned. It does not see blocks removed from the end: use `ledger_head`. `STABLE`, `SECURITY DEFINER` (it reads `ledger_blocks` and `ledger_chain` only). | granted roles |
 | `kingres.ledger_hook_active()` | True when the library was loaded through `shared_preload_libraries`. | PUBLIC |
 
 Internal functions (`ledger_capture`, `ledger_record_row`, `ledger_lock_table`,
@@ -439,7 +439,8 @@ DEFINER`:
 | `ledger_verify` | reads every ledger table, every history table and every table under ledger control |
 | `ledger_verify_recorded` | writes `ledger_verification` |
 | `ledger_inclusion_proof` (both forms) | reads the entries and transactions, which the caller may not read; the two-argument form is a wrapper that exists so that grants made on it under 0.1 keep working |
-| `ledger_head` | one statement snapshot of the chain identity and the latest block; defined as the owner so that the answer does not depend on what the caller may read of the ledger tables (it returns a hash and a count, no row data) |
+| `ledger_head` | one statement snapshot of the chain identity, the latest block, and the newest transaction row and recorded digest it is compared with; defined as the owner so that the answer does not depend on what the caller may read of the ledger tables (it returns a hash and a count, no row data) |
+| `ledger_blocks_entries` | reads `ledger_blocks` and `ledger_chain` only, as the owner, so that `EXECUTE` is all a service role needs and an operator may withdraw PUBLIC's `SELECT` on those tables (see "Reading the chain for publication") |
 | `ledger_guard` (event trigger) | must see the ledger tables whatever grants an administrator changed, so that DDL of every role keeps working; it also moves the privileges of the history tables (through `ledger_history_acl_sync`, which is not `SECURITY DEFINER` and is not executable by anybody else) |
 
 All of them have `SET search_path = pg_catalog, pg_temp`, and every reference to
@@ -458,7 +459,7 @@ on their arguments and look nothing up (the list is in the test).
 
 | Object | PUBLIC |
 |---|---|
-| `kingres.ledger_table`, `kingres.ledger_chain`, `kingres.ledger_blocks` | `SELECT` |
+| `kingres.ledger_table`, `kingres.ledger_chain`, `kingres.ledger_blocks` | `SELECT` (an operator may revoke it from PUBLIC: see "Reading the chain for publication") |
 | `kingres.ledger_digest` | `SELECT` on every column except `generated_by` (block-level data only) |
 | `kingres.ledger_entry`, `kingres.ledger_pending`, `kingres.ledger_tx`, `kingres.ledger_verification` | nothing |
 | `kingres.ledger_status` (view) | nothing (it shows how many transactions wait, and the state of the worker) |
@@ -672,8 +673,25 @@ records a digest or writes any table, and the hash format is unchanged.
   `ledger_blocks_entries` are not executable by PUBLIC: they expose hashes,
   counts and close times of blocks, no row data, but the publication is an
   operator's choice. `GRANT EXECUTE` to the service role of `kingresd`;
-  nothing is granted at installation. A role with only that grant can call
-  them and cannot read `ledger_entry`, `ledger_tx` or `ledger_pending`.
+  nothing is granted at installation. Both functions run with the rights of
+  the extension owner and read only `ledger_blocks`, `ledger_chain` and, for
+  `ledger_head`, the newest rows of `ledger_tx` and `ledger_digest`, so a role
+  with only that grant can call them and cannot read `ledger_entry`,
+  `ledger_tx` or `ledger_pending`.
+- **Withdrawing PUBLIC's read access.** `ledger_table`, `ledger_chain`,
+  `ledger_blocks` (and the columns of `ledger_digest`) are readable by
+  PUBLIC after installation because they only describe the chain. An
+  operator who does not want that can `REVOKE SELECT ON ... FROM PUBLIC`
+  (also `REVOKE ALL ON ALL TABLES IN SCHEMA kingres FROM PUBLIC`); it works,
+  and the roles that were granted `EXECUTE` on the two functions keep
+  working, because the functions read as the owner. (The statement used to fail
+  with `role "public" does not exist`: the protection hook asked for the OID
+  of every grantee to compare it with the owner, and PUBLIC has none. Revoking
+  the privileges of the owner is still refused.) After the
+  revoke, `SELECT` on the tables, and with it the export of the headers for
+  `kingres-verify blocks`, needs a grant to the role that exports. The
+  function `ledger_block_preimage` stays executable by PUBLIC: it computes on
+  its arguments and reads nothing.
 - **Paging.** `ledger_blocks_entries(from_height, max_count)` returns the
   blocks with `height >= from_height` in height order, at most
   `min(max_count, 10000)`. An empty chain, a `from_height` past the head and
@@ -681,12 +699,50 @@ records a digest or writes any table, and the hash format is unchanged.
   a NULL argument gives no rows. To read on, ask from the last height plus
   one. `closed_at_us` and the last eight bytes of an entry are microseconds
   since 2000-01-01 00:00:00 UTC, as in the digests.
-- **Damage.** A stored block whose fields do not hash to its `block_hash`,
-  a block with another hash version, a stored value of the wrong length, a
-  missing block or a block that does not follow the one before it is an
-  error `XX001`, never a silently shortened answer, so a publisher that
-  signs what it reads never signs a broken chain. The check uses
-  `pg_catalog.sha256`, not the extension's hash.
+- **What is detected, and what is not.** The two functions check the chain
+  they read. They do not make a database that can be written to trustworthy
+  on their own: a signature, a record kept elsewhere, or the next call of
+  `ledger_verify` is what does.
+
+  Detected (error `XX001`, never a silently shortened or altered answer
+  within what is read):
+
+  | Damage | Where it is found |
+  |---|---|
+  | a changed field (`hash_version`, `prev_hash`, `tx_merkle_root`, `tx_count`, `closed_at`, `block_hash`) of a block that is read | `ledger_blocks_entries`; `ledger_head` for the head |
+  | a block with a wrong link or a wrong hash | both, within what is read |
+  | a gap, a repeated height (the message names the repeated block), a missing block 0, a missing chain identity | `ledger_blocks_entries`; `ledger_head` for block 0, the head and the block before it |
+  | a block before the range that was changed with its stored hash left alone | `ledger_blocks_entries` from `from_height > 0`: that block is read and its hash recomputed, not taken as stored |
+  | a changed chain identity | both, on every call that returns a row (block 0 must link to the genesis hash of the identity) |
+  | the end of the chain removed from `ledger_blocks` and from nothing else | `ledger_head`: a transaction row (`ledger_tx.block_height`) or a recorded digest (`ledger_digest`) names a block above the head; a recorded digest must also name the block that is there |
+
+  Not detected:
+
+  - Blocks removed from the end together with the rows that refer to them.
+    The transaction rows and the digest rows are in the same database and
+    can be removed by whoever can remove blocks: a shorter chain that is
+    valid is answered as the chain. `ledger_head` only catches a removal
+    that left those records behind (an accident, a partial restore, a bug,
+    a careless attacker). `ledger_blocks_entries` reads `ledger_blocks`
+    alone and never sees the end of the chain: a range past the head is
+    "nothing new", which is also what a truncated chain looks like.
+  - A fully valid successor written by someone who can write the table: a
+    block with the right link and the right hash is a block. Nothing in the
+    database can tell it from one the builder wrote; `ledger_verify` reports
+    it (it checks the blocks against the transactions), a digest kept
+    outside the database shows it.
+  - Anything in blocks that are not read: a call reads its range, the block
+    before it, block 0 and, for the head, the newest records. The other
+    blocks are not looked at.
+
+  What a publisher must therefore do: keep its own record of what it
+  published (the size and root of the last checkpoint, the head it saw); at
+  every round call `ledger_head` first and compare it with that record (the
+  head never goes back, and for an equal height the hash is the same); read
+  again the last published block (`from_height = published_size - 1`) and
+  check that its entry is the one published, then read on; and never sign
+  more than it has read. A head that went back, or a published block that
+  changed, is an alarm, not a retry.
 
 ## Hash format version 1
 

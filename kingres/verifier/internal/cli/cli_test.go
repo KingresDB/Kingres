@@ -263,11 +263,11 @@ func TestProofCommandOperation(t *testing.T) {
 		wantOut  string
 		notOut   string
 	}{
-		{"D proof, any operation", []string{"proof", "--proof", dproof, "--digest", d8}, 0, "operation D: a version of a row with this hash was removed", "FAILED"},
+		{"D proof, any operation", []string{"proof", "--proof", dproof, "--digest", d8}, 0, "D: a version of a row with this hash was removed", "FAILED"},
 		{"D proof, --op D", []string{"proof", "--proof", dproof, "--digest", d8, "--op", "D"}, 0, "VERIFIED", "FAILED"},
-		{"D proof, --op any", []string{"proof", "--proof", dproof, "--digest", d8, "--op", "any"}, 0, "operation D", "FAILED"},
+		{"D proof, --op any", []string{"proof", "--proof", dproof, "--digest", d8, "--op", "any"}, 0, "D: a version of a row", "FAILED"},
 		{"D proof, --op I", []string{"proof", "--proof", dproof, "--digest", d8, "--op", "I"}, 1, "FAILED at step binding", "VERIFIED"},
-		{"I proof of the same version, any operation", []string{"proof", "--proof", iproof, "--digest", d8}, 0, "operation I: a version of a row with this hash was inserted", "FAILED"},
+		{"I proof of the same version, any operation", []string{"proof", "--proof", iproof, "--digest", d8}, 0, "I: a version of a row with this hash was inserted", "FAILED"},
 		{"I proof, --op I", []string{"proof", "--proof", iproof, "--digest", d8, "--op", "I"}, 0, "VERIFIED", "FAILED"},
 		{"I proof, --op D", []string{"proof", "--proof", iproof, "--digest", d8, "--op", "D"}, 1, "FAILED at step binding", "VERIFIED"},
 		{"bad --op", []string{"proof", "--proof", dproof, "--digest", d8, "--op", "X"}, 2, "", "VERIFIED"},

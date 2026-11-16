@@ -360,3 +360,11 @@ func (o Object) OnlyKeys(allowed ...string) error {
 	sort.Strings(bad)
 	return fmt.Errorf("%s: unknown field %q, expected only %v", o.v.path, bad[0], allowed)
 }
+
+// Bool returns a boolean value.
+func (v Value) Bool() (bool, error) {
+	if v.kind != KindBool {
+		return false, fmt.Errorf("%s: is %s, expected boolean", v.path, v.kind)
+	}
+	return v.b, nil
+}

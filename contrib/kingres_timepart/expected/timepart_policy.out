@@ -233,7 +233,7 @@ CALL kingres.timepart_run('tp_moved.ren2', '2026-03-11 UTC');
 SELECT count(*) AS runs_of_moved_table FROM kingres.timepart_run WHERE table_name = 'ren2';
  runs_of_moved_table 
 ---------------------
-                   1
+                   2
 (1 row)
 
 DROP TABLE tp_moved.ren2;
@@ -243,10 +243,17 @@ SELECT count(*) AS policies_left FROM kingres.timepart_policy WHERE table_name L
              0
 (1 row)
 
-SELECT count(*) AS history_kept FROM kingres.timepart_run WHERE table_name = 'ren';
+-- the history is kept, under the last name of the table
+SELECT count(*) AS history_kept FROM kingres.timepart_run WHERE table_name = 'ren2';
  history_kept 
 --------------
-            1
+            2
+(1 row)
+
+SELECT count(*) AS history_under_old_name FROM kingres.timepart_run WHERE table_name = 'ren';
+ history_under_old_name 
+------------------------
+                      0
 (1 row)
 
 -- Renaming another table does not touch the policy of this one.

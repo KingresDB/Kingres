@@ -26,13 +26,16 @@
  */
 #include "postgres.h"
 
+#include "access/parallel.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
 #include "libpq/pqformat.h"
+#include "miscadmin.h"
 #include "nodes/miscnodes.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/fmgrprotos.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/typcache.h"
 
@@ -283,6 +286,169 @@ ks_from_bytea_common(FunctionCallInfo fcinfo, int kind, const char *typname,
 	if (!validate(p, len, why))
 		ks_invalid_value(typname, why);
 	PG_RETURN_BYTEA_P(ks_make_bytea(p, len));
+}
+
+/* ---- memory of aggregate states ---- */
+
+/*
+ * The limit, in kilobytes, of the bytes that the aggregate states of one
+ * backend may hold together (a parallel worker is a backend of its own and
+ * has its own count).  PGC_USERSET with a check hook, not PGC_SUSET: any role
+ * may lower its own limit (a role that wants a query of its own to stop
+ * early), but a role that is not a superuser may not raise it above what the
+ * administrator gave it, which is the reset value of the setting (the
+ * configuration file, ALTER DATABASE or ALTER ROLE).  PostgreSQL's own
+ * settings that protect the server (temp_file_limit, max_stack_depth) are
+ * PGC_SUSET; those a user may only tighten have no such context, so the
+ * hook makes the same rule as PGC_SUSET for a raise.
+ */
+#define KS_STATE_LIMIT_DEFAULT_KB	(1024 * 1024)
+
+static int	ks_state_limit_kb = KS_STATE_LIMIT_DEFAULT_KB;
+
+/* The sum of the accounts of the live state contexts of this backend. */
+static int64 ks_state_bytes = 0;
+
+struct KsAcct
+{
+	MemoryContextCallback cb;	/* must stay where it is: a context points to it */
+	MemoryContext cxt;
+	int64		bytes;			/* what this account has added to ks_state_bytes */
+};
+
+/*
+ * The callback of a state context, called when the context is deleted or
+ * reset, whatever the reason: it must not raise an error (it can run while a
+ * transaction aborts) and does not.
+ */
+static void
+ks_acct_reset_callback(void *arg)
+{
+	KsAcct	   *acct = (KsAcct *) arg;
+
+	ks_state_bytes -= acct->bytes;
+	acct->bytes = 0;
+	Assert(ks_state_bytes >= 0);
+}
+
+static void
+ks_state_over_limit(int64 held)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+			 errmsg("aggregate states of kingres_sketch hold %lld bytes in this backend, over the limit of %lld bytes",
+					(long long) held, (long long) ks_state_limit_kb * 1024),
+			 errdetail("Every group, and every parallel worker, has an aggregate state of its own, and work_mem does not limit them."),
+			 errhint("Aggregate fewer groups at once, use a smaller capacity, precision or compression, or ask a superuser to raise kingres_sketch.state_memory_limit.")));
+}
+
+KsAcct *
+ks_acct_create(MemoryContext aggcontext)
+{
+	MemoryContext cxt;
+	KsAcct	   *acct;
+
+	cxt = AllocSetContextCreate(aggcontext, "kingres_sketch aggregate state",
+								ALLOCSET_SMALL_SIZES);
+	acct = (KsAcct *) MemoryContextAllocZero(cxt, sizeof(KsAcct));
+	acct->cxt = cxt;
+	acct->cb.func = ks_acct_reset_callback;
+	acct->cb.arg = acct;
+	MemoryContextRegisterResetCallback(cxt, &acct->cb);
+	ks_acct_update(acct);
+	return acct;
+}
+
+MemoryContext
+ks_acct_context(KsAcct *acct)
+{
+	return acct->cxt;
+}
+
+/*
+ * The counter and the account change together before the check, so that a
+ * failed check leaves them agreeing: the callback takes out exactly what the
+ * account holds.
+ */
+void
+ks_acct_update(KsAcct *acct)
+{
+	int64		now = (int64) MemoryContextMemAllocated(acct->cxt, false);
+
+	ks_state_bytes += now - acct->bytes;
+	acct->bytes = now;
+	if (ks_state_bytes > (int64) ks_state_limit_kb * 1024)
+		ks_state_over_limit(ks_state_bytes);
+}
+
+void
+ks_acct_precheck(Size want)
+{
+	if (ks_state_bytes + (int64) want > (int64) ks_state_limit_kb * 1024)
+		ks_state_over_limit(ks_state_bytes + (int64) want);
+}
+
+void
+ks_acct_release(KsAcct *acct)
+{
+	MemoryContextDelete(acct->cxt);
+}
+
+/*
+ * Check hook: a role that is not a superuser may set the limit up to the
+ * reset value and not above it.  Values that come from the configuration
+ * file, the command line and the per-database and per-role settings (which
+ * only an administrator can store for another role) are not judged, nor are
+ * the values a parallel worker takes over from its leader.
+ */
+static bool
+ks_state_limit_check(int *newval, void **extra, GucSource source)
+{
+	const char *reset;
+	int			ceiling;
+
+	if (source < PGC_S_CLIENT || source == PGC_S_OVERRIDE ||
+		IsParallelWorker() || superuser())
+		return true;
+	reset = GetConfigOptionResetString("kingres_sketch.state_memory_limit");
+	if (reset == NULL || !parse_int(reset, &ceiling, GUC_UNIT_KB, NULL))
+		return true;
+	if (*newval > ceiling)
+	{
+		GUC_check_errcode(ERRCODE_INSUFFICIENT_PRIVILEGE);
+		GUC_check_errmsg("permission denied to raise \"kingres_sketch.state_memory_limit\" above %d kB",
+						 ceiling);
+		GUC_check_errhint("Only a superuser can raise the limit; it can be lowered.");
+		return false;
+	}
+	return true;
+}
+
+void
+_PG_init(void)
+{
+	DefineCustomIntVariable("kingres_sketch.state_memory_limit",
+							"Limit of the memory held by the aggregate states of one backend.",
+							"The aggregates of kingres_sketch (hll, topn, tdigest) keep one state per group and per parallel worker; work_mem does not limit them. A query that would hold more fails with SQLSTATE 54000. A parallel worker counts for itself.",
+							&ks_state_limit_kb,
+							KS_STATE_LIMIT_DEFAULT_KB,
+							1,
+							MAX_KILOBYTES,
+							PGC_USERSET,
+							GUC_UNIT_KB,
+							ks_state_limit_check,
+							NULL,
+							NULL);
+	MarkGUCPrefixReserved("kingres_sketch");
+}
+
+PG_FUNCTION_INFO_V1(kingres_sketch_state_bytes);
+
+/* The bytes held by the aggregate states of this backend now (for tests and monitoring). */
+Datum
+kingres_sketch_state_bytes(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(ks_state_bytes);
 }
 
 /* ---- the aggregate memory context ---- */

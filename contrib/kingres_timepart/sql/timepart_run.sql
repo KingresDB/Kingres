@@ -258,14 +258,14 @@ SELECT count(*) AS partitions FROM tp.parts('tp.r14');
 
 -- Pruning: a run is kept for 90 days from the time of the newest, and at
 -- most 1000 runs per table.
-INSERT INTO kingres.timepart_run (schema_name, table_name, as_of, trigger, state, started_by, finished_at)
-SELECT 'tp', 'pruned', timestamptz '2026-01-01 UTC' + g * interval '1 minute', 'sql', 'done', 'x', now()
+INSERT INTO kingres.timepart_run_data (schema_name, table_name, as_of, trigger, state, started_by, finished_at, table_owner_oid, table_owner)
+SELECT 'tp', 'pruned', timestamptz '2026-01-01 UTC' + g * interval '1 minute', 'sql', 'done', 'x', now(), 0, 'x'
   FROM generate_series(1, 1005) g;
-INSERT INTO kingres.timepart_run (schema_name, table_name, as_of, trigger, state, started_by, finished_at)
-VALUES ('tp', 'pruned', '2025-06-01 UTC', 'sql', 'done', 'x', now()),
-       ('tp', 'pruned_other', '2025-06-01 UTC', 'sql', 'done', 'x', now());
-INSERT INTO kingres.timepart_run (schema_name, table_name, as_of, trigger, state, started_by)
-VALUES ('tp', 'pruned', '2024-06-01 UTC', 'sql', 'running', 'x');
+INSERT INTO kingres.timepart_run_data (schema_name, table_name, as_of, trigger, state, started_by, finished_at, table_owner_oid, table_owner)
+VALUES ('tp', 'pruned', '2025-06-01 UTC', 'sql', 'done', 'x', now(), 0, 'x'),
+       ('tp', 'pruned_other', '2025-06-01 UTC', 'sql', 'done', 'x', now(), 0, 'x');
+INSERT INTO kingres.timepart_run_data (schema_name, table_name, as_of, trigger, state, started_by, table_owner_oid, table_owner)
+VALUES ('tp', 'pruned', '2024-06-01 UTC', 'sql', 'running', 'x', 0, 'x');
 SELECT kingres.timepart_prune_runs('tp', 'pruned', '2026-01-02 UTC') AS deleted;
 SELECT count(*) AS kept, count(*) FILTER (WHERE state = 'running') AS running,
        min(as_of) > '2025-12-31' AS none_old_but_the_running FROM kingres.timepart_run

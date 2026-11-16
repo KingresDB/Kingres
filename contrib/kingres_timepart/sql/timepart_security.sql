@@ -292,8 +292,11 @@ DROP FUNCTION tp.evil_fn(), tp.evil_unset(), tp.evil_plan();
 -- A role writes the policy table directly only for tables it owns, and the
 -- columns the extension decides are pinned.
 SET ROLE tp_other;
+-- the owner and the creator are shown from the catalog and cannot be written
 INSERT INTO kingres.timepart_policy (schema_name, table_name, parent_oid, partition_every, table_owner, created_by)
 VALUES ('tpo', 'victim', 0, '1 day', 'tp_other', 'tp_other');
+INSERT INTO kingres.timepart_policy (schema_name, table_name, parent_oid, partition_every)
+VALUES ('tpo', 'victim', 0, '1 day');
 UPDATE kingres.timepart_policy SET retention = '1 day' WHERE table_name = 'victim';
 DELETE FROM kingres.timepart_policy WHERE table_name = 'victim';
 SELECT count(*) AS other_sees FROM kingres.timepart_policy;
@@ -302,13 +305,15 @@ SELECT retention FROM kingres.timepart_policy WHERE table_name = 'victim';
 SET ROLE tp_owner;
 UPDATE kingres.timepart_policy SET retention = '4 days', table_owner = 'tp_other', created_by = 'tp_other',
        parent_oid = 1, created_at = '2000-01-01' WHERE table_name = 'victim';
+UPDATE kingres.timepart_policy SET retention = '4 days',
+       parent_oid = 1, created_at = '2000-01-01' WHERE table_name = 'victim';
 SELECT retention, table_owner, created_by, parent_oid = 'tpo.victim'::regclass::oid AS hint_pinned,
        created_at > '2020-01-01' AS created_at_kept FROM kingres.timepart_policy WHERE table_name = 'victim';
 UPDATE kingres.timepart_policy SET retention = '1 microsecond' WHERE table_name = 'victim';
 UPDATE kingres.timepart_policy SET timezone = 'Mars/Olympus' WHERE table_name = 'victim';
 UPDATE kingres.timepart_policy SET schema_name = 'tp', table_name = 'canary' WHERE table_name = 'victim';
-INSERT INTO kingres.timepart_policy (schema_name, table_name, parent_oid, partition_every, table_owner, created_by)
-VALUES ('tp', 'canary', 0, '1 day', 'tp_owner', 'tp_owner');
+INSERT INTO kingres.timepart_policy (schema_name, table_name, parent_oid, partition_every)
+VALUES ('tp', 'canary', 0, '1 day');
 DELETE FROM kingres.timepart_policy WHERE table_name = 'victim';
 SELECT count(*) AS policies_of_owner FROM kingres.timepart_policy;
 RESET ROLE;
@@ -376,8 +381,8 @@ SELECT table_name FROM kingres.timepart_policies WHERE table_name IN ('mine', 't
 SELECT count(*) FROM kingres.timepart_policy_data;
 SELECT count(*) FROM kingres.timepart_run_data;
 SELECT count(*) FROM kingres.timepart_run_action_data;
-INSERT INTO kingres.timepart_run_data (schema_name, table_name, as_of, trigger, state, started_by)
-VALUES ('tp', 'theirs3', now(), 'manual', 'done', 'tp_other');
+INSERT INTO kingres.timepart_run_data (schema_name, table_name, as_of, trigger, state, started_by, table_owner_oid, table_owner)
+VALUES ('tp', 'theirs3', now(), 'manual', 'done', 'tp_other', 0, 'tp_other');
 INSERT INTO kingres.timepart_run (schema_name, table_name, as_of, trigger, state, started_by)
 VALUES ('tp', 'theirs3', now(), 'manual', 'done', 'tp_other');
 DELETE FROM kingres.timepart_run;

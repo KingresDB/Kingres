@@ -62,9 +62,9 @@ func TestParseGood(t *testing.T) {
 	if _, err := Parse([]byte(min)); err != nil {
 		t.Fatal(err)
 	}
-	// No keys is a valid file (a later step may need only the other members).
-	if _, err := Parse([]byte(`{"format":1,"origin_prefix":"a.example","keys":[]}`)); err != nil {
-		t.Fatal(err)
+	// No keys is refused: every command refuses it, so trust show must too.
+	if _, err := Parse([]byte(`{"format":1,"origin_prefix":"a.example","keys":[]}`)); err == nil {
+		t.Fatal("a trust file without keys was accepted")
 	}
 }
 
@@ -125,7 +125,18 @@ func TestParseRejections(t *testing.T) {
 		"client key twice":     file(fmt.Sprintf(`"keys":[],"client_keys":[{"key_id":%[1]q,"public_key":%[2]q,"label":"x"},{"key_id":%[1]q,"public_key":%[2]q,"label":"y"}]`, fp(pub)[:32], b64(pub))),
 		"invalid utf8":         "{\"format\":1,\"origin_prefix\":\"a\xff\",\"keys\":[]}",
 	}
+	cases["no keys"] = `{"format":1,"origin_prefix":"a.example","keys":[]}`
+	cases["revoked with a size limit"] = file(`"keys":[` + key(`,"revoked":true,"max_tree_size":5`) + `]`)
+	cases["revoked not a bool"] = file(`"keys":[` + key(`,"revoked":"yes"`) + `]`)
+	cases["max_tree_size zero"] = file(`"keys":[` + key(`,"max_tree_size":0`) + `]`)
+	cases["max_tree_size too large"] = file(`"keys":[` + key(`,"max_tree_size":4611686018427387904`) + `]`)
+	cases["max_tree_size float"] = file(`"keys":[` + key(`,"max_tree_size":5.5`) + `]`)
 	for name, in := range cases {
+		// Every case that says "keys":[] is about another member, so give it
+		// a valid key: otherwise it would be refused for having no key.
+		if name != "no keys" {
+			in = strings.ReplaceAll(in, `"keys":[]`, `"keys":[`+key("")+`]`)
+		}
 		if _, err := Parse([]byte(in)); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
@@ -134,7 +145,7 @@ func TestParseRejections(t *testing.T) {
 		t.Error("oversized file accepted")
 	}
 	// A valid client key is accepted.
-	ok := file(fmt.Sprintf(`"keys":[],"client_keys":[{"key_id":%q,"public_key":%q,"label":"teller-7"}]`, fp(pub)[:32], b64(pub)))
+	ok := file(fmt.Sprintf(`"keys":[`+key("")+`],"client_keys":[{"key_id":%q,"public_key":%q,"label":"teller-7"}]`, fp(pub)[:32], b64(pub)))
 	if f, err := Parse([]byte(ok)); err != nil || len(f.ClientKeys) != 1 {
 		t.Fatalf("client key: %v", err)
 	}
@@ -192,10 +203,30 @@ func TestSignerKeys(t *testing.T) {
 	if _, notes, err := f.SignerKeys(origin, early); err == nil || len(notes) != 1 {
 		t.Errorf("early: %v %v", notes, err)
 	}
-	// After not_after: still used (3.3), with a note.
+	// After not_after the key is not used and the error says why; before it
+	// (here: --now inside the window) it is used.
 	f.Keys[0].NotAfter = ptr(time.Date(2026, 12, 31, 0, 0, 0, 0, time.UTC))
+	if _, notes, err := f.SignerKeys(origin, now); err == nil || len(notes) != 1 || !strings.Contains(err.Error(), "not_after") {
+		t.Errorf("expired: %v %v", notes, err)
+	}
+	if keys, _, err := f.SignerKeys(origin, time.Date(2026, 12, 15, 0, 0, 0, 0, time.UTC)); err != nil || len(keys) != 1 {
+		t.Errorf("inside the window: %v %v", keys, err)
+	}
+	// Revoked is revoked at every time.
+	f.Keys[0].NotAfter = nil
+	f.Keys[0].Revoked = true
+	if _, _, err := f.SignerKeys(origin, time.Date(2026, 12, 15, 0, 0, 0, 0, time.UTC)); err == nil {
+		t.Error("a revoked key was used")
+	}
+	f.Keys[0].Revoked = false
+	// A size limit keeps the key, says so, and applies by size.
+	lim := uint64(100)
+	f.Keys[0].MaxTreeSize = &lim
 	if keys, notes, err := f.SignerKeys(origin, now); err != nil || len(keys) != 1 || len(notes) != 1 {
-		t.Errorf("retired: %v %v %v", keys, notes, err)
+		t.Errorf("limited: %v %v %v", keys, notes, err)
+	}
+	if !f.LimitFor(pub, 100) || f.LimitFor(pub, 101) || f.LimitFor(testKey(2), 1) {
+		t.Error("size limit applied wrongly")
 	}
 	empty := &File{OriginPrefix: "a.example"}
 	if _, _, err := empty.SignerKeys("a.example/x", now); err == nil {
@@ -209,7 +240,7 @@ func ptr(t time.Time) *time.Time { return &t }
 // accepts can be written and read again.
 func FuzzParse(f *testing.F) {
 	f.Add([]byte(goodJSON()))
-	f.Add([]byte(`{"format":1,"origin_prefix":"a","keys":[]}`))
+	f.Add([]byte(`{"format":1,"origin_prefix":"a","keys":[],"x":1}`))
 	f.Add([]byte(`{`))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		tf, err := Parse(data)
@@ -224,4 +255,40 @@ func FuzzParse(f *testing.F) {
 			t.Fatalf("written file does not parse: %v\n%s", err, out)
 		}
 	})
+}
+
+// The members that retire a key are written and read back, and the standing of
+// a key follows them.
+func TestRetiringMembersRoundTrip(t *testing.T) {
+	pub := testKey(1)
+	in := fmt.Sprintf(`{"format":1,"origin_prefix":"a.example","keys":[
+ {"name":"old","public_key":%q,"fingerprint":%q,"not_after":"2026-12-31T00:00:00Z","max_tree_size":500},
+ {"name":"bad","public_key":%q,"fingerprint":%q,"revoked":true},
+ {"name":"off","public_key":%q,"fingerprint":%q,"revoked":false,"max_tree_size":null}]}`,
+		b64(pub), fp(pub), b64(testKey(2)), fp(testKey(2)), b64(testKey(3)), fp(testKey(3)))
+	f, err := Parse([]byte(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := f.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := Parse(out)
+	if err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if g.Keys[0].MaxTreeSize == nil || *g.Keys[0].MaxTreeSize != 500 || !g.Keys[1].Revoked || g.Keys[2].Revoked || g.Keys[2].MaxTreeSize != nil {
+		t.Fatalf("members lost: %+v", g.Keys)
+	}
+	now := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
+	for i, want := range []Standing{Expired, Revoked, Usable} {
+		if got := g.Keys[i].StandingAt(now); got != want {
+			t.Errorf("key %d: %v, want %v", i, got, want)
+		}
+	}
+	// A revoked key stays revoked at a time before its window would have mattered.
+	if g.Keys[1].StandingAt(time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)) != Revoked {
+		t.Error("revoked key came back at an earlier time")
+	}
 }

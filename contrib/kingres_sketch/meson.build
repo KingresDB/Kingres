@@ -41,6 +41,7 @@ tests += {
       'sketch_tdigest',
       'sketch_io',
       'sketch_security',
+      'sketch_memory',
     ],
   },
   'tap': {
@@ -52,6 +53,7 @@ tests += {
       't/005_dump_copy.pl',
       't/006_fuzz.pl',
       't/007_portable_sketches.pl',
+      't/008_memory.pl',
     ],
   },
 }

@@ -1882,8 +1882,8 @@ build to the corrected rule. The verifier's README has the same list with the re
    (`<prefix>/c/<id>/e<N>` or `<prefix>/a/<id>`). The member `name` of a key in the trust file is a label
    only. The cluster-level name `<prefix>` is for the signed events of a later step.
 5. **Validity windows of keys (3.3 against 7.4).** A checkpoint carries no time, and a retired key's
-   checkpoints stay valid. `not_before` is enforced against `--now`; `not_after` is reported and not
-   enforced. Which signatures of a revoked key are still trusted is decided by anchors, as 3.3 says.
+   checkpoints stay valid. `not_before` is enforced against `--now`; `not_after` was reported and not
+   enforced (superseded by 14: it is enforced on `--now`, and `max_tree_size` and `revoked` were added). Which signatures of a revoked key are still trusted is decided by anchors, as 3.3 says.
 6. **Exit status for a malformed note (7.4).** When the note is the thing under test (`checkpoint`), a
    malformed note is status 1. When it is the anchor of trust (`consistency --old`), an unreadable note is
    status 2 and a bad signature or origin is status 1.
@@ -1899,6 +1899,58 @@ build to the corrected rule. The verifier's README has the same list with the re
     root, so a size is only meaningful when it comes from a signed checkpoint. Every command takes sizes
     from checkpoints.
 13. **Sources (4.6, 7.4).** Step 1 reads a directory. `.tar.gz` and HTTP sources belong to step 7.
+14. **Key validity in the trust file (7.2, 7.4; replaces the second half of correction 5).** A checkpoint
+    carries no time that anyone can trust, so a rule that depends on "when the checkpoint was signed"
+    cannot be applied; a rule that depends on a tree size can, because the size is in the signed text.
+    The review of step 1 (finding L7-02) showed that a `not_after` that is only reported looks like a
+    control and is not one: a user who writes the end date of a leaked key into it expects the key to stop
+    counting, and got a `VERIFIED`. The trust file (format 1, not released, so changed in place) now has
+    four validity members per key, and `trust show` says for each one whether and how it is enforced:
+    - `not_before`, `not_after`: enforced, on the time the auditor gives (`--now`, default the system
+      clock), never on the time of the signature. A key outside its window is left out of the keys that
+      may sign, with a note that says why. When no key is left the command ends with status 2 and the
+      error lists each key and why it was left out. This fails closed: after `not_after` the checkpoints
+      of that key are no longer accepted unless the auditor says `--now <a time before not_after>`, which
+      is the auditor's statement and is printed ("fixed by --now"). Reporting only was rejected because
+      the failure mode of a member that does not act is the one the user cannot see; failing closed has a
+      visible failure and a visible remedy.
+    - `revoked` (boolean, default false): the key is never used, at any `--now`. It is the way to say "do
+      not trust this key" for a key that leaked.
+    - `max_tree_size` (integer from 1, default none): a checkpoint counts as signed by this key only when
+      its tree size is at most this. It is the way to retire a key that was good until a known size: the
+      checkpoints it signed up to the size stay valid for ever (3.3), and a checkpoint it signs beyond
+      the size, which a leaked key could produce, is refused (step `key-size`). It does not stop a leaked
+      key from signing a different history at a size within the limit: that is caught only by a
+      checkpoint or a consistency proof the auditor already holds. `revoked` and `max_tree_size` together
+      are refused as contradictory. Unknown members are still refused.
+    A trust file with no key is refused when it is read (it can verify nothing), so `trust show`
+    no longer calls such a file valid; `trust show` also says, for the time it is given, how each key
+    stands and ends with status 2 when no key can be used then, as every verifying command would.
+15. **Rollback and a state file (7.4).** `checkpoint` shows that a checkpoint is signed, not that it is the
+    latest: an older genuine checkpoint verifies, which hides every later entry (L7-03). Its list of what
+    is not proved says so and names the three remedies (keep the last verified checkpoint and run
+    `consistency --old`, `--min-size`, `--state`). `--state FILE` names a file holding the last
+    checkpoint this command verified (the signed note itself, so that it is checked again with the trust
+    file at every use and can be given to `consistency --old`): a smaller size fails (step `rollback`),
+    the same size with another root fails (step `fork`), and the file is replaced atomically after a
+    success. A larger size is accepted but is **not** shown to extend the logged history (that needs
+    tiles): the output says so and points to `consistency`. Replacing the state loses the older
+    checkpoint, so the order for a full check is `consistency --old STATE`, then `checkpoint --state
+    STATE`. A state that does not verify against the trust file is an input error (status 2), never
+    silently replaced.
+16. **What the publication does not hold, and what it holds wrongly (7.4).** One rule for every command
+    (L7-07): a file or directory the auditor names (trust file, `--note`, `--old`, `--new`, `--state`,
+    `--source`) that cannot be read is an input error, status 2. A thing the publication should contain and
+    does not (a checkpoint, a tile, an epoch directory) is status 3 ("could not check"), and the output
+    calls it an alert: a publisher must serve what a checkpoint it signed needs, so absence is at
+    best neglect and at worst a way to hide a failure. A thing the publication holds in a form it must not
+    have (a symbolic link or reparse point on the way, a directory, device or pipe, a file over its size
+    limit, a tile of the wrong size) is a failed verification, status 1 (L7-01, L7-05). Every file is read
+    through one helper that never blocks on open, requires a regular file, and bounds the size before and
+    while reading. Links in a source directory are refused rather than resolved inside it: a publication
+    written by the publisher's tools has no link, and resolving some would need a rule for which aliases
+    are lawful. A file named on the command line may be a link (the auditor chose it) but must be regular
+    after resolution.
 
 Of section 13: item 2 (test vectors) is settled for signed notes (the example key and note of the
 specification are in the tests; the checkpoint example has no published key), item 3 (entry bundles at

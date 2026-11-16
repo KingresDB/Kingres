@@ -7,7 +7,7 @@ EXTENSION = kingres_timepart
 DATA = kingres_timepart--0.1.sql
 PGFILEDESC = "kingres_timepart - time partitioning for KingresDB"
 
-REGRESS = timepart_setup timepart_grid timepart_create timepart_policy timepart_run timepart_retention timepart_names timepart_hostile timepart_security timepart_drop
+REGRESS = timepart_setup timepart_grid timepart_create timepart_policy timepart_run timepart_retention timepart_names timepart_hostile timepart_security timepart_history timepart_privilege timepart_drop
 REGRESS_OPTS = --temp-config $(srcdir)/kingres_timepart.conf
 
 TAP_TESTS = 1

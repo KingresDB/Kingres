@@ -116,3 +116,23 @@ func TestAccessorsNameThePath(t *testing.T) {
 		t.Error("Has")
 	}
 }
+
+func TestBool(t *testing.T) {
+	v, err := Parse([]byte(`{"a":true,"b":false,"c":"true","d":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	o, _ := v.Object()
+	for name, want := range map[string]bool{"a": true, "b": false} {
+		f, _ := o.Field(name)
+		if got, err := f.Bool(); err != nil || got != want {
+			t.Errorf("%s: %v %v", name, got, err)
+		}
+	}
+	for _, name := range []string{"c", "d"} {
+		f, _ := o.Field(name)
+		if _, err := f.Bool(); err == nil {
+			t.Errorf("%s: accepted as a boolean", name)
+		}
+	}
+}

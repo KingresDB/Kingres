@@ -129,7 +129,7 @@ func buildTiles(h []Hash, withPartial bool) fstest.MapFS {
 
 func newReader(t testing.TB, fsys fstest.MapFS, size int) *Reader {
 	t.Helper()
-	r, err := NewReader(FSSource{FS: fsys}, uint64(size))
+	r, err := NewReader(FSSource{Files: FSReader{FS: fsys}}, uint64(size))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -345,7 +345,7 @@ func TestReaderBounds(t *testing.T) {
 func TestFSSourceRefusesEscapes(t *testing.T) {
 	// The source only builds names from numbers, and fs.FS rejects "..";
 	// make sure an unusual index still stays inside.
-	s := FSSource{FS: fstest.MapFS{}}
+	s := FSSource{Files: FSReader{FS: fstest.MapFS{}}}
 	if _, err := s.ReadTile(0, 1<<60, 256); !errors.Is(err, ErrMissing) {
 		t.Fatalf("%v", err)
 	}

@@ -25,6 +25,11 @@ sub q1
 	my ($db, $sql) = @_;
 	return $node->safe_psql($db, "SET timezone = 'UTC'; $sql");
 }
+sub q2
+{
+	my ($n, $db, $sql) = @_;
+	return $n->safe_psql($db, "SET timezone = 'UTC'; $sql");
+}
 
 q1('postgres', q{
 CREATE EXTENSION kingres_timepart;
@@ -51,6 +56,37 @@ SELECT kingres.timepart_set_policy('app.dd', '1 month', create_ahead => '40 days
 CREATE TABLE app.big (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
 SELECT kingres.timepart_set_policy('app.big', '1 hour', create_ahead => '2 years');
 -- awkward names
+-- K12S-01/02: two owners, a table dropped and another made under its name
+CREATE ROLE xa LOGIN;
+CREATE ROLE xb LOGIN;
+CREATE ROLE xc LOGIN;
+GRANT USAGE ON SCHEMA kingres TO xa, xb, xc;
+GRANT USAGE, CREATE ON SCHEMA app TO xa, xb;
+GRANT EXECUTE ON FUNCTION
+    kingres.timepart_set_policy(regclass, interval, interval, interval, text, interval, text[], jsonb, text, interval, boolean),
+    kingres.timepart_partitions(regclass)
+  TO xa, xb;
+SET ROLE xa;
+CREATE TABLE app.xa_t (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.timepart_set_policy('app.xa_t', '1 day', create_ahead => '2 days');
+CREATE TABLE app.shared_name (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.timepart_set_policy('app.shared_name', '1 day', create_ahead => '1 day');
+RESET ROLE;
+SET ROLE xb;
+CREATE TABLE app.xb_t (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.timepart_set_policy('app.xb_t', '1 day', create_ahead => '2 days');
+RESET ROLE;
+CALL kingres.timepart_run('app.xa_t', '2026-03-09 UTC');
+CALL kingres.timepart_run('app.shared_name', '2026-03-09 UTC');
+CALL kingres.timepart_run('app.xb_t', '2026-03-09 UTC');
+SET ROLE xa;
+DROP TABLE app.shared_name;
+RESET ROLE;
+SET ROLE xb;
+CREATE TABLE app.shared_name (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+SELECT kingres.timepart_set_policy('app.shared_name', '1 day', create_ahead => '1 day');
+RESET ROLE;
+CALL kingres.timepart_run('app.shared_name', '2026-03-10 UTC');
 CREATE SCHEMA "Odd ""schema""";
 CREATE TABLE "Odd ""schema""".""""";--" (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
 SELECT kingres.timepart_set_policy('"Odd ""schema""".""""";--"', '1 week', create_ahead => '10 days');
@@ -74,7 +110,7 @@ $node->safe_psql('postgres', q{SELECT kingres.timepart_begin_run('app.det', '202
 my $fingerprint = q{
 SELECT 'policy', count(*), md5(string_agg((to_jsonb(p) - 'parent_oid')::text, '|' ORDER BY p.schema_name, p.table_name)) FROM kingres.timepart_policy p
 UNION ALL
-SELECT 'run', count(*), md5(string_agg(to_jsonb(r)::text, '|' ORDER BY r.run_id)) FROM kingres.timepart_run r
+SELECT 'run', count(*), md5(string_agg((to_jsonb(r) - 'table_oid')::text, '|' ORDER BY r.run_id)) FROM kingres.timepart_run r
 UNION ALL
 SELECT 'action', count(*), md5(string_agg(to_jsonb(a)::text, '|' ORDER BY a.run_id, a.seq)) FROM kingres.timepart_run_action a
 UNION ALL
@@ -99,6 +135,26 @@ is(q1('restored', q{SELECT count(*) FROM pg_event_trigger WHERE evtname LIKE 'ki
 	'2', 'the event triggers are there');
 is(q1('restored', q{SELECT count(*) FROM pg_extension WHERE extname = 'kingres_timepart'}), '1', 'and the extension');
 
+# Who sees what is the same after the restore as before it (K12S-01): the
+# owner of a table sees its runs, also those of a table that was dropped, and
+# not the runs of the table that another role made under its name.
+sub seen
+{
+	my ($n, $db, $role) = @_;
+	return $n->safe_psql($db, q{SET timezone = 'UTC';
+		SELECT string_agg(table_name || ':' || table_owner || ':' || (table_oid IS NOT NULL)::text, ' ' ORDER BY run_id)
+		  FROM kingres.timepart_run WHERE schema_name = 'app' AND table_name IN ('xa_t', 'xb_t', 'shared_name')},
+		extra_params => [ '-U', $role ]);
+}
+my $seen_xa = seen($node, 'postgres', 'xa');
+my $seen_xb = seen($node, 'postgres', 'xb');
+is($seen_xa, 'xa_t:xa:true shared_name:xa:false', 'the original: xa sees its table and the dropped one, not the one of xb');
+is($seen_xb, 'xb_t:xb:true shared_name:xb:true', 'the original: xb sees only its own');
+is(seen($node, 'restored', 'xa'), $seen_xa, 'after the restore xa sees the same (a role that is not a superuser)');
+is(seen($node, 'restored', 'xb'), $seen_xb, 'and xb the same');
+is(q1('restored', q{SELECT count(*) FROM kingres.timepart_run_data WHERE stamp <> kingres.timepart__stamp()}) > 0 ? 'foreign' : 'own',
+	'foreign', 'the rows carry the stamp of the other installation until a run adopts them');
+
 # The OID in the policy is a hint: the restored tables have other OIDs.
 is(q1('restored', q{SELECT count(*) FROM kingres.timepart_policy p WHERE p.parent_oid = to_regclass(format('%I.%I', p.schema_name, p.table_name))::oid}),
 	'0', 'the hints are stale after a restore');
@@ -112,6 +168,21 @@ is(q1('restored', q{SELECT count(*) FROM kingres.timepart_policy WHERE table_nam
 q1('restored', q{DROP TABLE app.unrelated2});
 is(q1('restored', q{SELECT count(*) FROM kingres.timepart_policy WHERE table_name = 'dd'}), '1',
 	'nor does it drop one');
+# The case that the earlier test leaves out: the table of the policy is gone
+# (not restored, or dropped since), and the stale hint is the OID of another
+# table, which is then renamed.  The policy is not moved to it: a row that a
+# backup carried is not followed by OID.
+q1('restored', q{CREATE TABLE app.unrelated3 (ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+	DROP TABLE app.dd;
+	UPDATE kingres.timepart_policy SET parent_oid = 'app.unrelated3'::regclass::oid WHERE table_name = 'dd';
+	ALTER TABLE app.unrelated3 RENAME TO unrelated4;});
+is(q1('restored', q{SELECT schema_name || '.' || table_name FROM kingres.timepart_policy WHERE table_name IN ('dd', 'unrelated3', 'unrelated4')}),
+	'app.dd', 'the policy of a table that is gone is not moved to an unrelated table that is renamed');
+q1('restored', q{ALTER TABLE app.unrelated4 SET SCHEMA public; DROP TABLE public.unrelated4;});
+is(q1('restored', q{SELECT count(*) FROM kingres.timepart_policy WHERE table_name = 'dd'}), '1',
+	'nor deleted when that table is dropped');
+is(q1('restored', q{SELECT count(*) FROM kingres.timepart_check() WHERE problem = 'policy_orphan' AND table_name = 'dd'}), '1',
+	'it is an orphan, as it was');
 # A policy with a stale hint is found by name, and the hint is refreshed.
 my $maxrun = q1('restored', q{SELECT max(run_id) FROM kingres.timepart_run});
 $node->safe_psql('restored', q{SET timezone = 'UTC'; CALL kingres.timepart_run('app.ev', '2026-03-14 00:00 UTC');});
@@ -256,6 +327,60 @@ $node->safe_psql('postgres', 'CREATE DATABASE has_schema2');
 $node->command_ok([ 'psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-d', $node->connstr('has_schema2'), '-f', $d_has ], 'and its restore');
 is(q1('has_schema2', q{SELECT count(*) FROM kingres.timepart_policy}) . q1('has_schema2', q{SELECT x FROM kingres.other}), '11',
 	'with the policy and the table of the other owner of the schema');
+
+# After the runs above, the rows of the restored database are adopted.
+is(q1('restored', q{SELECT count(*) FROM kingres.timepart_run_data WHERE stamp <> kingres.timepart__stamp()}), '0',
+	'a run adopted the rows that the restore brought');
+is(q1('restored', q{SELECT count(*) FROM kingres.timepart_policy_data WHERE stamp <> kingres.timepart__stamp()}), '0',
+	'and the policies');
+is(seen($node, 'restored', 'xa'), $seen_xa, 'adoption does not change who sees what (xa)');
+is(seen($node, 'restored', 'xb'), $seen_xb, 'nor (xb)');
+
+# K12S-02: a restore into another cluster, where the roles are the same by
+# name and have other OIDs.  Who sees what is the same; a role that is renamed
+# afterwards is still the owner.
+my $dump2 = $node->basedir . '/db2.dump';
+$node->command_ok([ 'pg_dump', '-Fc', '-f', $dump2, $node->connstr('postgres') ], 'pg_dump for the other cluster');
+my $node2 = PostgreSQL::Test::Cluster->new('dump2');
+$node2->init;
+$node2->start;
+$node2->safe_psql('postgres', q{
+CREATE ROLE filler1; CREATE ROLE filler2; CREATE ROLE filler3;
+CREATE ROLE xc LOGIN; CREATE ROLE xb LOGIN; CREATE ROLE xa LOGIN;
+CREATE ROLE dbown; CREATE ROLE backup; CREATE ROLE nobody; CREATE ROLE dbown_reader;});
+isnt($node2->safe_psql('postgres', q{SELECT oid FROM pg_roles WHERE rolname = 'xa'}),
+	$node->safe_psql('postgres', q{SELECT oid FROM pg_roles WHERE rolname = 'xa'}),
+	'the role has another OID in the other cluster');
+foreach my $db ('r2', 'r3')
+{
+	$node2->safe_psql('postgres', "CREATE DATABASE $db");
+	$node2->command_ok([ 'pg_restore', '-d', $node2->connstr($db), $dump2 ], "pg_restore into the other cluster ($db)");
+	is(seen($node2, $db, 'xa'), $seen_xa, "$db: xa sees its history, by name, though its OID is another");
+	is(seen($node2, $db, 'xb'), $seen_xb, "$db: xb sees its own only");
+	is($node2->safe_psql($db, q{SELECT count(*) FROM kingres.timepart_run}, extra_params => [ '-U', 'xc' ]), '0',
+		"$db: a role of no table sees nothing");
+	cmp_ok(q2($node2, $db, q{SELECT count(*) FROM kingres.timepart_run_data WHERE stamp <> kingres.timepart__stamp()}), '>', 0,
+		"$db: the rows have the stamp of the other installation");
+}
+# r2: adopt by hand; r3: the scheduler's question adopts, too
+cmp_ok(q2($node2, 'r2', q{SELECT kingres.timepart_adopt()}), '>', 0, 'timepart_adopt() adopts rows of the other cluster');
+is(q2($node2, 'r2', q{SELECT count(*) FROM kingres.timepart_run_data WHERE stamp <> kingres.timepart__stamp()}), '0', 'r2: all of them');
+is(q2($node2, 'r3', q{SELECT count(*) >= 0 FROM kingres.timepart_due('2030-01-01 UTC')}), 't', 'r3: timepart_due answers');
+is(q2($node2, 'r3', q{SELECT count(*) FROM kingres.timepart_run_data WHERE stamp <> kingres.timepart__stamp()}), '0', 'r3: and has adopted the rows');
+# the roles are renamed after that, and are followed
+$node2->safe_psql('postgres', q{ALTER ROLE xa RENAME TO xa2; ALTER ROLE xb RENAME TO xb2;});
+$node2->safe_psql('r2', q{SET timezone = 'UTC'; CALL kingres.timepart_run('app.xa_t', '2026-03-11 UTC');});
+$node2->safe_psql('r3', q{SET timezone = 'UTC'; CALL kingres.timepart_run('app.xb_t', '2026-03-11 UTC');});
+(my $want_a = $seen_xa) =~ s/:xa:/:xa2:/g;
+(my $want_b = $seen_xb) =~ s/:xb:/:xb2:/g;
+is(seen($node2, 'r2', 'xa2'), "$want_a xa_t:xa2:true", 'r2: after a rename the role still owns its policy and sees the old and the new runs');
+is(q2($node2, 'r2', q{SELECT state FROM kingres.timepart_run WHERE table_name = 'xa_t' ORDER BY run_id DESC LIMIT 1}), 'done',
+	'r2: the run after the rename is done, not owner_changed');
+is(seen($node2, 'r2', 'xb2'), $want_b, 'r2: xb (now xb2) sees what it saw');
+is(seen($node2, 'r3', 'xb2'), "$want_b xb_t:xb2:true", 'r3: the renamed role sees its old and new runs');
+is(q2($node2, 'r3', q{SELECT state FROM kingres.timepart_run WHERE table_name = 'xb_t' ORDER BY run_id DESC LIMIT 1}), 'done',
+	'r3: a run after a rename is done too');
+$node2->stop;
 
 $node->stop;
 done_testing();
