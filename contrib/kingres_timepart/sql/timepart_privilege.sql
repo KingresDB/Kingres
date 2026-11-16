@@ -116,7 +116,7 @@ SELECT DISTINCT pg_get_userbyid(c.relowner) AS partition_owner
 -- nothing is left behind in the temporary schema, and no role owns anything
 -- of the extension
 SELECT count(*) AS temp_functions_left FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
- WHERE n.nspname LIKE 'pg\_temp\_%' AND p.proname = 'timepart_exec';
+ WHERE n.nspname LIKE 'pg\_temp\_%' AND p.proname LIKE 'timepart_exec%';
 SELECT count(*) AS functions_owned_by_the_owner FROM pg_proc
  WHERE pronamespace = 'kingres'::regnamespace AND proowner = 'tp_p_mallory'::regrole;
 
@@ -136,7 +136,7 @@ CALL kingres.timepart_run('tpq.t', '2026-03-10 UTC');
 SELECT r.state, a.kind, a.state, left(a.detail, 60) AS detail
   FROM kingres.timepart_run r JOIN kingres.timepart_run_action a USING (run_id) WHERE r.table_name = 't' AND r.schema_name = 'tpq';
 SELECT count(*) AS temp_functions_left FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
- WHERE n.nspname LIKE 'pg\_temp\_%' AND p.proname = 'timepart_exec';
+ WHERE n.nspname LIKE 'pg\_temp\_%' AND p.proname LIKE 'timepart_exec%';
 DROP TABLE tpq.t;
 DROP SCHEMA tpq;
 
