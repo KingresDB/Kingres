@@ -232,6 +232,15 @@ BEGIN
                       HINT = 'Leave columnar tables out of publications.';
         END IF;
     END IF;
+
+    -- A rewriting ALTER TABLE (a type change, a change of access method in
+    -- either direction) replaces the table's file and leaves the stripe rows
+    -- of the old one, which nothing can read any more.  Remove them with the
+    -- command, in its transaction (a rollback brings them back), so that
+    -- columnar_check has nothing to report until the next VACUUM.
+    IF TG_TAG = 'ALTER TABLE' AND EXISTS (SELECT 1 FROM columnar_stripe) THEN
+        PERFORM columnar_reconcile();
+    END IF;
 END;
 $$;
 

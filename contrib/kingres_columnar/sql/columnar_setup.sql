@@ -21,7 +21,9 @@ SHOW shared_preload_libraries;
 SELECT name, setting, unit, vartype, enumvals, context, boot_val,
        CASE WHEN name NOT LIKE '%memory' THEN min_val END AS min_val,
        CASE WHEN name NOT LIKE '%memory' THEN max_val END AS max_val
-  FROM pg_settings WHERE name LIKE 'kingres\_columnar.%' ORDER BY name;
+  FROM pg_settings WHERE name LIKE 'kingres\_columnar.%'
+   AND name NOT LIKE 'kingres\_columnar.fault\_%'	-- developer settings of assertion builds only
+ ORDER BY name;
 
 SHOW kingres_columnar.compression;
 SHOW kingres_columnar.compression_level;

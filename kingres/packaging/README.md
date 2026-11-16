@@ -626,14 +626,16 @@ Verified by the tests against the commit built:
    above the REST port.
 7. `systemctl restart` restarts the database too (by design of `ExecStop`); the
    manager-only restart is a signal.
-8. `kingresd` of this release only accepts the programs of PostgreSQL 18 (`VerifyBinaries`), so on PostgreSQL 19 the package, the image and the compose nodes install and build but their service does not become ready; see "Defects of the product found by these tests".
+8. `kingresd` accepts the programs of PostgreSQL 18 and of PostgreSQL 19 and of no other
+   major (`VerifyBinaries`); the package, the image and the compose nodes of either major
+   become ready.
 
 ## What is not included yet
 
 - **No Patroni, no etcd, no metrics store** (decided: they arrive with the
   high-availability phase; `kingresd` exposes Prometheus-format metrics itself).
-- `kingres-cli`; removing or leaving servers, rebalancing and failover in the compose test
-  (not written; `kingresd` has no heartbeat or failover yet).
+- `kingres-cli`; removing or leaving servers, standbys and rebalancing in the compose test
+  (the test does not exercise them; `kingresd` has no failover yet).
 - RPM, arm64, Windows; package signing and an apt repository; image signing and
   publishing; SBOM; debug symbols package (`-dbgsym`); a `kingres-dev` package;
   man pages beyond one-page stubs; the licences of every compiled-in Go and npm
@@ -645,7 +647,7 @@ Verified by the tests against the commit built:
 
 ## What was run
 
-The release builds and all tests below were run on 2026-11-15 on a 24-core WSL2
+The release builds and all tests below were run on 2026-11-16 on a 24-core WSL2
 machine (Windows 11, Ubuntu 24.04, Docker Engine in the distribution), each major
 from **a committed revision** with the working-tree `kingres/packaging` as an
 overlay (`+overlay` in `BUILD-INFO`); a working tree with unfinished work was
@@ -653,119 +655,66 @@ never built:
 
 | Major | Revision built | PostgreSQL | Artifacts |
 |---|---|---|---|
-| 18 | `kingres-18` at `1a7a04f3c2` | 18.7 | `kingres_0.1.0+pg18-1_amd64.deb` (12,125,000 bytes), image `kingres:0.1.0-pg18` |
-| 19 | `kingres-19` at `19f94d5279` (the sync from `1a7a04f3c2`) | 19rc2 | `kingres_0.1.0+pg19-1_amd64.deb` (12,351,604 bytes), image `kingres:0.1.0-pg19` |
+| 18 | `kingres-18` at `2ccb0c3add` | 18.7 | `kingres_0.1.0+pg18-1_amd64.deb` (12,707,712 bytes), image `kingres:0.1.0-pg18` |
+| 19 | `kingres-19` at `396d26e897` (the sync from `35913a2901`) | 19rc2 | `kingres_0.1.0+pg19-1_amd64.deb` (12,910,784 bytes), image `kingres:0.1.0-pg19` |
 
-The release recipe takes 5 to 7 minutes cold for either major, the image build 78 s
-(18) and 94 s (19) with warm caches, the content size of the image is 73 MB.
+The image build took 112 s (18) and 91 s (19) with warm caches.
 
 | Check | PostgreSQL 18 | PostgreSQL 19 |
 |---|---|---|
-| `test/test-deb.sh` (clean ubuntu:24.04, systemd; the package of the other major as `--other-deb`) | 234 passed, 2 failed, 1 known | 102 passed, 7 failed, 3 groups not run |
-| `test/test-image.sh` | 129 passed, 0 failed, 1 known | 44 passed, 1 failed, 2 groups not run |
-| `test/test-compose.sh` (three nodes joined into one cluster) | 162 passed, 0 failed | 19 passed, 12 failed, the cluster not run |
+| `test/test-deb.sh` (clean ubuntu:24.04, systemd; the package of the other major as `--other-deb`) | 237 passed, 0 failed | 237 passed, 0 failed |
+| `test/test-image.sh` | 130 passed, 0 failed | 130 passed, 0 failed |
+| `test/test-compose.sh` (three nodes joined into one cluster) | 162 passed, 0 failed | 162 passed, 0 failed |
 | `lintian --fail-on error` (2.117) | 0 errors, 0 warnings, 143 information tags | 0 errors, 0 warnings, 145 information tags |
-| `shellcheck -x -P SCRIPTDIR` on every script (`build/*.sh`, `deb/build-deb.sh`, the maintainer scripts `preinst` `postinst` `prerm` `postrm`, `docker/*.sh`, `test/*.sh`) | clean | clean (the same scripts) |
+| `shellcheck -x -P SCRIPTDIR` (0.9.0) on every script (`build/*.sh`, `deb/build-deb.sh`, the maintainer scripts `preinst` `postinst` `prerm` `postrm`, `docker/*.sh`, `test/*.sh`) | clean | clean (the same scripts) |
 
-The compose test counts 162 checks where it counted 194 before: the extension files
-are now checked once, in the image, not on each of the three nodes.
-
-**Not failures of the packaging.** Every failure on PostgreSQL 19, and the two on
-18, have one cause, a defect of `kingresd` (next section): `kingresd` of this
-release refuses to start with the programs of PostgreSQL 19. The two on 18 are the
-checks "API answers" and "setup state" in the step of the package test that installs
-the package of PostgreSQL 19 after a purge: the package installs (and `kingres-psql`
-is that major's) but its service never becomes ready.
-
-- **Known (marked)**: `kingres_shard` cannot be created in a database after
-  `kingres_columnar` (next section).
-- **19, package test**: the 7 checks that failed are the ones after the install that
-  need `kingresd` to run (the service stays `activating`: it exits at start and
-  `Restart=always` starts it again): service active, API answers, process user, setup
-  state, panel index page, favicon, panel on loopback. Not run: the cluster flow, the
-  sandbox, the restarts, stop and start, the upgrade to revision 2, the API and the
-  data after the refusal, the reinstall. **What ran and passed on 19** (102 checks):
-  installation and ownership, the version and the server (`postgres (PostgreSQL)
-  19rc2`, `BUILD-INFO`, `kingres-psql`), the five extensions installed and created in
-  a throw-away server (and the columnar behaviour with and without the preload), the
-  licence files, the command names and man pages, the refusal of the package of
-  PostgreSQL 18 (`apt-get install`, `dpkg -i`, after `apt remove`, over a leftover
-  data directory), the install of the package of PostgreSQL 18 after the purge (that
-  one runs), remove and purge.
-- **19, image test**: the image builds with its labels; 44 checks passed (labels,
-  `postgres --version`, `BUILD-INFO`, the five extensions: files and a throw-away
-  server, the licence files, no secrets). The container never becomes healthy. Not
-  run: panel, identity, token, restart, the cluster, `docker stop/start/restart`, a new
-  container on the volume.
-- **19, compose test**: the image labels and the extension files pass; the three
-  nodes never become healthy (4 failed checks each); the tokens, the cluster and all
-  that follows are not run.
-
-**What would run on 19 once `kingresd` accepts it (diagnostic, not a result of the
-packaging).** To see what comes after, the same tests were run on a scratch copy of
-`kingres-19` in which that one check of `kingresd` was widened (the copy was not
-committed and is not in the repository). The image test passed completely (129
-passed, 0 failed, 1 known: the same as on 18), the compose test of three nodes passed
-(162 passed, 0 failed) and the package test passed (236 passed, 0 failed, 1 known).
-So PostgreSQL 19rc2 runs under `kingresd` with the tested flows (cluster, sharded
-database, ledger, restarts, stop and start, the join of two servers) once that check
-is fixed. That copy was built from `kingres-19` at `757b5044c4`, one revision before
-the one in the table.
+Both majors now give the same numbers: this is the first run in which the tests
+of PostgreSQL 19 that need a running node ran at all, and no check is marked as a
+known failure any more. In these runs the check that `kingres_shard` can be
+created after `kingres_columnar` still carried its marker and passed; the marker
+was then removed and the image test of PostgreSQL 19 was run again on the same
+revision (130 passed, 0 failed).
 
 | Package test, the refusal of the other major | PostgreSQL 18 | PostgreSQL 19 |
 |---|---|---|
-| refused with data present (`apt-get install --allow-downgrades`, `dpkg -i`): same version, programs, postmaster PID, data | passed | passed (the checks of the API and the data are not run) |
-| refused after `apt remove`; refused over a leftover data directory; installs after a purge | passed | passed |
+| refused with data present (`apt-get install --allow-downgrades`, `dpkg -i`): same version, programs, postmaster PID, data | passed | passed |
+| refused after `apt remove`; refused over a leftover data directory; installs after a purge (and its service becomes ready) | passed | passed |
 
-Earlier runs, for the record: the integrator repeated the package test on commit
-`0e35d07ff5` (156 checks, 0 failed), and the first runs of the author gave 150
-(package), 79 (image) and 140 (compose, commit `d546dcc06d`), before the tests were
-extended for two majors, the five extensions and the licences.
+Earlier runs, for the record. On 2026-11-15 (`kingres-18` at `1a7a04f3c2`,
+`kingres-19` at `19f94d5279`) the tests of 18 gave 234 passed, 2 failed, 1 known
+(package), 129 passed, 1 known (image) and 162 passed (compose); on 19 nothing
+that needs a running node ran (102, 44 and 19 checks passed), because `kingresd`
+refused the programs of PostgreSQL 19 (defect 1 below). Before that, the
+integrator repeated the package test on commit `0e35d07ff5` (156 checks, 0
+failed), and the first runs of the author gave 150 (package), 79 (image) and 140
+(compose, commit `d546dcc06d`), before the tests were extended for two majors,
+the five extensions and the licences.
 
-## Defects of the product found by these tests (not fixed here)
+## Defects of the product found by these tests
 
-1. **`kingresd` refuses PostgreSQL 19** (this stops every test of 19 that needs a
-   running node). `kingres/control-plane/internal/cluster/binaries.go`, function
-   `VerifyBinaries`: every program must print `KingresDB` or contain the text
-   `(PostgreSQL) 18` in `--version`. The programs print `postgres (PostgreSQL)
-   19rc2` (they never print `KingresDB`, only `version()` does), so the check fails
-   at the first start and `kingresd` exits with `pg-bin-dir "/opt/kingres/bin":
-   postgres reports "postgres (PostgreSQL) 19rc2", which is not a KingresDB 18
-   build`. Reproduction: start `kingresd` with `pg-bin-dir` pointing at a build of
-   `kingres-19`. The error text and the comment of the function also say 18, and
-   `control-plane/README.md` documents "a directory that is not a KingresDB 18 build
-   stops the server". PostgreSQL 19 changed nothing here: the check was written for
-   18 only.
-2. **`kingres_shard` cannot be created after `kingres_columnar` or
-   `kingres_timepart` in one database** (on 18 and on 19). The install script of
-   `kingres_shard` (`contrib/kingres_shard/kingres_shard--0.5.sql`, line 18, and the
-   scripts of the earlier versions) runs `CREATE SCHEMA kingres;` without
-   `IF NOT EXISTS`, and the control files of `kingres_columnar` and
-   `kingres_timepart` say `schema = kingres`, which makes `CREATE EXTENSION` create
-   the schema first: `ERROR: schema "kingres" already exists`. The tests create
-   `kingres_shard` first (as the product does) and mark the other order as a known
-   failure.
-3. **`kingres_columnar` without the preload is stricter than its README says**: the
-   README says "without the preload the extension still loads and reads, and refuses
-   to write". `CREATE EXTENSION` works, but `CREATE TABLE ... USING columnar` is
-   already refused (`kingres_columnar must be listed in shared_preload_libraries to
-   write columnar tables`), so a table can only exist if it was made with the
-   preload; such a table is read, and a write is refused, once the preload is taken
-   away again (all tested). The extension is in a fix round; this is a point for its
-   README.
-4. **Licence headers** (fixed since): at the revisions these tests were first run
-   on, 48 files of `kingres/control-plane`, `kingres/web` and `kingres/docs` still
-   carried the identifier of the PostgreSQL License in their header, against ADR 0024
-   and the `copyright` file of the package. They carry AGPL-3.0-only as of commit
-   `5555b252a0`.
+All four are fixed; they stay listed because the tests above are what found
+them, and each has a check that fails if it comes back.
 
-The integrator ran the PostgreSQL 18 column again on commit `5555b252a0` with this
-directory on top: image test 129 passed, 0 failed, 1 known; compose test 162 passed,
-0 failed; package built, lintian without errors, package test 202 passed, 0 failed,
-1 known, without the package of the other major (the refusal tests were not run in
-that run). Defects 1 and 2 are being fixed in the control plane and in
-`kingres_shard`; until defect 1 is fixed nothing of PostgreSQL 19 runs under
-`kingresd`.
+1. **`kingresd` refused PostgreSQL 19** (fixed in commit `5196e3da5a`;
+   `kingresd` passes its own integration suite on 19 since `2aba6ea01e`).
+   `VerifyBinaries` in `kingres/control-plane/internal/cluster/binaries.go`
+   accepted only programs that print `(PostgreSQL) 18` in `--version`, so on 19
+   the package, the image and the compose nodes installed and built but their
+   service never became ready. It accepts both majors now.
+2. **`kingres_shard` could not be created after `kingres_columnar` or
+   `kingres_timepart` in one database** (fixed). Its install script ran
+   `CREATE SCHEMA kingres;` and the control files of the other two say
+   `schema = kingres`, which makes `CREATE EXTENSION` create the schema first.
+   The tests create `kingres_shard` first, as the product does, and check the
+   other order as well.
+3. **`kingres_columnar` without the preload was stricter than its README said**
+   (fixed in the README of the extension): `CREATE TABLE ... USING columnar` is
+   refused without the preload, not only a write; a table made with the preload
+   is read without it. The tests check both.
+4. **Licence headers** (fixed in commit `5555b252a0`): 48 files of
+   `kingres/control-plane`, `kingres/web` and `kingres/docs` carried the
+   identifier of the PostgreSQL License in their header, against ADR 0024 and
+   the `copyright` file of the package.
 
 ---
 

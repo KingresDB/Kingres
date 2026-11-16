@@ -29,6 +29,7 @@
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_class.h"
 #include "catalog/storage.h"
 #include "commands/vacuum.h"
 #include "executor/executor.h"
@@ -37,7 +38,9 @@
 #include "storage/bufmgr.h"
 #include "storage/read_stream.h"
 #include "storage/smgr.h"
+#include "storage/lmgr.h"
 #include "utils/rel.h"
+#include "utils/syscache.h"
 #include "utils/snapmgr.h"
 
 #include "kingres_columnar.h"
@@ -389,6 +392,66 @@ kc_finish_bulk_insert(Relation rel, KcInsertOptions options)
  * ------------------------------------------------------------------------
  */
 
+/*
+ * The creation of the table the new file is for.  The new file replaces older
+ * content in three ways and the answer is the same in each: the table's own
+ * creation is carried over, so that a snapshot older than the table, which
+ * never saw any of it, is not told that something was replaced
+ * (kc_check_snapshot_age).
+ *
+ *	 - a table made now: this transaction;
+ *	 - TRUNCATE: the old file's (the caller passes it);
+ *	 - a rewrite (ALTER TABLE, VACUUM FULL, SET ACCESS METHOD): PostgreSQL makes
+ *	   a transient table named "pg_temp_<oid of the table>" in the table's
+ *	   schema, holds the table locked exclusively, and swaps the files in
+ *	   afterwards.  A columnar table gives its own creation; any other table gives
+ *	   the transaction that wrote its pg_class row, which is its creation unless
+ *	   it was altered since (then later, and a snapshot between the two is told
+ *	   the table is empty, as heap tells it after a rewrite).
+ *
+ * The name is only a hint, checked against the lock and the schema, so a
+ * table that a user names like that gets the creation of an unrelated table at
+ * worst, which makes the check stricter or equal to heap's and never lets a
+ * snapshot read a row it should not.
+ */
+static TransactionId
+kc_table_creation_xid(Relation rel)
+{
+	const char *name = RelationGetRelationName(rel);
+	char	   *end;
+	unsigned long oid;
+	HeapTuple	tup;
+	TransactionId xid;
+
+	if (strncmp(name, "pg_temp_", 8) != 0 || name[8] < '1' || name[8] > '9')
+		return GetCurrentTransactionId();
+	errno = 0;
+	oid = strtoul(name + 8, &end, 10);
+	if (errno != 0 || *end != 0 || oid > PG_UINT32_MAX ||
+		!CheckRelationOidLockedByMe((Oid) oid, AccessExclusiveLock, false))
+		return GetCurrentTransactionId();
+
+	tup = SearchSysCache1(RELOID, ObjectIdGetDatum((Oid) oid));
+	if (!HeapTupleIsValid(tup))
+		return GetCurrentTransactionId();
+	if (((Form_pg_class) GETSTRUCT(tup))->relnamespace != RelationGetNamespace(rel))
+	{
+		ReleaseSysCache(tup);
+		return GetCurrentTransactionId();
+	}
+	if (((Form_pg_class) GETSTRUCT(tup))->relam == kc_am_oid())
+	{
+		Relation	old = relation_open((Oid) oid, NoLock);
+
+		xid = kc_rel_ident(old)->table_xid;
+		relation_close(old, NoLock);
+	}
+	else
+		xid = HeapTupleHeaderGetXmin(tup->t_data);
+	ReleaseSysCache(tup);
+	return xid;
+}
+
 static void
 kc_relation_set_new_filelocator(Relation rel, const RelFileLocator *newrlocator,
 								char persistence, TransactionId *freezeXid,
@@ -397,6 +460,7 @@ kc_relation_set_new_filelocator(Relation rel, const RelFileLocator *newrlocator,
 	KcOptions	opts;
 	SMgrRelation srel;
 	bool		truncating = false;
+	TransactionId table_xid = InvalidTransactionId;
 
 	if (persistence != RELPERSISTENCE_PERMANENT)
 		ereport(ERROR,
@@ -420,6 +484,7 @@ kc_relation_set_new_filelocator(Relation rel, const RelFileLocator *newrlocator,
 		KcMetaData	m;
 
 		truncating = true;
+		table_xid = kc_rel_ident(rel)->table_xid;
 		kc_meta_read(rel, &m);
 		opts.codec = m.codec;
 		opts.level = m.level;
@@ -440,7 +505,8 @@ kc_relation_set_new_filelocator(Relation rel, const RelFileLocator *newrlocator,
 
 	srel = RelationCreateStorage(*newrlocator, persistence, true);
 	smgrclose(srel);
-	kc_meta_init_storage(rel, newrlocator, &opts, truncating);
+	kc_meta_init_storage(rel, newrlocator, &opts, truncating,
+						 truncating ? table_xid : kc_table_creation_xid(rel));
 }
 
 static void
@@ -513,6 +579,7 @@ kc_relation_copy_for_cluster(KC_COPY_FOR_CLUSTER_PARAMS)
 	kc_meta_set_options(NewTable, &opts);
 	if (keep_visibility)
 		kc_write_set_frozen(NewTable, true);
+	kc_write_request_reconcile();
 
 	scan = kc_scan_begin(OldTable, NULL, NULL, NULL, 0);
 	slot = table_slot_create(OldTable, NULL);

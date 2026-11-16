@@ -78,6 +78,11 @@ tests += {
       't/013_xid_wraparound.pl',
       't/014_buffers.pl',
       't/015_creation_compaction.pl',
+      't/016_atomic_handover.pl',
+      't/017_stripe_sizes.pl',
+      't/018_maintenance_snapshots.pl',
+      't/019_table_age.pl',
+      't/020_limits_flags_check.pl',
     ],
   },
 }

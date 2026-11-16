@@ -222,7 +222,7 @@ kc_meta_seal(KcMetaData *m)
 static void
 kc_meta_format(Page page, const KcOptions *opts, uint64 next_row,
 			   uint64 next_stripe, uint64 uid, TransactionId xid,
-			   uint32 flags, Oid relid)
+			   uint32 flags, Oid relid, TransactionId table_xid)
 {
 	KcMetaData *m;
 
@@ -241,6 +241,7 @@ kc_meta_format(Page page, const KcOptions *opts, uint64 next_row,
 	m->created_xid = xid;
 	m->flags = flags;
 	m->created_relid = relid;
+	m->table_xid = table_xid;
 	kc_meta_seal(m);
 	/* a standard page: the log can drop the unused middle of it */
 	((PageHeader) page)->pd_lower =
@@ -254,7 +255,8 @@ kc_meta_format(Page page, const KcOptions *opts, uint64 next_row,
  */
 void
 kc_meta_init_storage(Relation rel, const RelFileLocator *rlocator,
-					 const KcOptions *opts, bool replaces_content)
+					 const KcOptions *opts, bool replaces_content,
+					 TransactionId table_xid)
 {
 	SMgrRelation srel = smgropen(*rlocator, INVALID_PROC_NUMBER);
 	BulkWriteState *bulk;
@@ -282,7 +284,7 @@ kc_meta_init_storage(Relation rel, const RelFileLocator *rlocator,
 	}
 	kc_meta_format((Page) buf, opts, 0, 1, uid, GetCurrentTransactionId(),
 			   replaces_content ? KC_META_REPLACES_CONTENT : 0,
-			   RelationGetRelid(rel));
+			   RelationGetRelid(rel), table_xid);
 	smgr_bulk_write(bulk, 0, buf, true);
 	smgr_bulk_finish(bulk);
 	smgrclose(srel);
@@ -468,29 +470,53 @@ kc_meta_freeze(Relation rel, TransactionId oldest_xmin)
 	Buffer		buf = ReadBuffer(rel, 0);
 	Page		page;
 	KcMetaData *m;
-	TransactionId xid;
+	TransactionId cx;
+	TransactionId tx;
+	TransactionId horizon = InvalidTransactionId;
+	TransactionId remaining = InvalidTransactionId;
+	bool		freeze_c;
+	bool		freeze_t;
 
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 	page = BufferGetPage(buf);
 	m = kc_meta_check(rel, page);
-	xid = m->created_xid;
-	if (!TransactionIdIsNormal(xid) || !TransactionIdPrecedes(xid, oldest_xmin))
+	cx = m->created_xid;
+	tx = m->table_xid;
+	freeze_c = TransactionIdIsNormal(cx) && TransactionIdPrecedes(cx, oldest_xmin);
+	freeze_t = TransactionIdIsNormal(tx) && TransactionIdPrecedes(tx, oldest_xmin);
+
+	/* what stays: the oldest normal id the page holds afterwards */
+	if (TransactionIdIsNormal(cx) && !freeze_c)
+		remaining = cx;
+	if (TransactionIdIsNormal(tx) && !freeze_t &&
+		(!TransactionIdIsValid(remaining) || TransactionIdPrecedes(tx, remaining)))
+		remaining = tx;
+	if (!freeze_c && !freeze_t)
 	{
 		UnlockReleaseBuffer(buf);
-		return TransactionIdIsNormal(xid) ? xid : InvalidTransactionId;
+		return remaining;
 	}
 
+	/* the newest id frozen: a standby query that may hold any of them is cancelled */
+	if (freeze_c)
+		horizon = cx;
+	if (freeze_t && (!TransactionIdIsValid(horizon) || TransactionIdFollows(tx, horizon)))
+		horizon = tx;
+
 	START_CRIT_SECTION();
-	m->created_xid = FrozenTransactionId;
+	if (freeze_c)
+		m->created_xid = FrozenTransactionId;
+	if (freeze_t)
+		m->table_xid = FrozenTransactionId;
 	kc_meta_seal(m);
 	MarkBufferDirty(buf);
-	kc_meta_log_xid_change(rel, buf, xid);
+	kc_meta_log_xid_change(rel, buf, horizon);
 	END_CRIT_SECTION();
 	UnlockReleaseBuffer(buf);
 
 	/* every backend caches the id with the relation */
 	CacheInvalidateRelcache(rel);
-	return InvalidTransactionId;
+	return remaining;
 }
 
 /*
@@ -719,6 +745,7 @@ kc_rel_ident(Relation rel)
 		id->created_xid = m.created_xid;
 		id->flags = m.flags;
 		id->created_relid = m.created_relid;
+		id->table_xid = m.table_xid;
 		id->filenode = rel->rd_locator.relNumber;
 		rel->rd_amcache = id;
 	}
@@ -764,6 +791,19 @@ kc_check_snapshot_age(Relation rel, Snapshot snap)
 		return;
 	next = ReadNextTransactionId();
 	if ((uint32) (next - id->created_xid) > (uint32) (1U << 30))
+		return;
+
+	/*
+	 * A snapshot that cannot see the creation of the table itself is older
+	 * than the table: whatever files the table has had since (TRUNCATE, a
+	 * rewrite, a change of access method), nothing existed for this snapshot
+	 * to read before them, so there is nothing older that was replaced and
+	 * the empty table is the right answer, as heap's.  The invariant: an
+	 * error is for content that existed for the snapshot and is gone.
+	 */
+	if (TransactionIdIsNormal(id->table_xid) &&
+		(uint32) (next - id->table_xid) <= (uint32) (1U << 30) &&
+		XidInMVCCSnapshot(id->table_xid, snap))
 		return;
 	if (XidInMVCCSnapshot(id->created_xid, snap))
 		ereport(ERROR,
