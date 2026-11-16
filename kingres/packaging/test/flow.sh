@@ -167,9 +167,8 @@ flow_check_extensions() {
     check_eq "${p}: the instance preloads kingres_shard and kingres_ledger, not kingres_columnar" "kingres_shard,kingres_ledger" \
         "$(svc -d postgres -Atc 'show shared_preload_libraries' 2>/dev/null)"
     check "${p}: create the scratch database ext_check" svc -d postgres -v ON_ERROR_STOP=1 -c 'create database ext_check'
-    # kingres_shard first: its install script runs CREATE SCHEMA kingres, which
-    # fails once kingres_columnar or kingres_timepart (schema = kingres in their
-    # control files) has made the schema (the known defect below).
+    # kingres_shard first, as the product creates them; the other order is
+    # checked below.
     for e in kingres_shard ${KINGRES_EXTENSIONS/kingres_shard/}; do
         if out="$(svc -d ext_check -v ON_ERROR_STOP=1 -c "create extension ${e}" 2>&1)"; then
             pass "${p}: CREATE EXTENSION ${e} in the node's own server"
@@ -184,13 +183,13 @@ flow_check_extensions() {
     out="$(svc -d ext_check -v ON_ERROR_STOP=1 -c 'create table public.col_t (a int) using columnar' 2>&1 || true)"
     check "${p}: a columnar table is refused without the preload (${out:0:100})" bash -c 'grep -q "shared_preload_libraries" <<<"$1"' _ "${out}"
     check "${p}: drop the scratch database" svc -d postgres -v ON_ERROR_STOP=1 -c 'drop database ext_check'
-    # The order matters, see above.  This is a defect of the extension, not of the
-    # package: the install script of kingres_shard has "CREATE SCHEMA kingres;" (no
-    # IF NOT EXISTS), and kingres_columnar and kingres_timepart ask for the same
-    # schema in their control files.
+    # The order must not matter: every extension that uses the schema kingres
+    # installs whether or not another one made the schema first.  An earlier
+    # install script of kingres_shard ran "CREATE SCHEMA kingres;" and failed
+    # after kingres_columnar or kingres_timepart (schema = kingres in their
+    # control files).
     check "${p}: create a second scratch database for the order of the extensions" svc -d postgres -v ON_ERROR_STOP=1 -c 'create database ext_check2'
-    check_known "${p}: kingres_shard can be created after kingres_columnar in one database" \
-        "the install script of kingres_shard runs CREATE SCHEMA kingres, which fails when kingres_columnar (schema = kingres) came first" \
+    check "${p}: kingres_shard can be created after kingres_columnar in one database" \
         flow_shard_after_columnar
     check "${p}: drop the second scratch database" svc -d postgres -v ON_ERROR_STOP=1 -c 'drop database ext_check2'
 }
