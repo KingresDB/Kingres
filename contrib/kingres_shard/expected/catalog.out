@@ -4,8 +4,8 @@ SELECT c.relname
   FROM pg_class c
   WHERE c.relnamespace = 'kingres'::regnamespace AND c.relkind = 'r'
   ORDER BY 1;
-    relname     
-----------------
+     relname     
+-----------------
  bucket_map
  bucket_move
  cluster_secret
@@ -15,45 +15,47 @@ SELECT c.relname
  dtx_epoch
  dtx_incident
  dtx_log
+ dtx_unconfirmed
  local_node
  map_version
  move_marker
  node
  pending_node
-(14 rows)
+(15 rows)
 
 SELECT conrelid::regclass AS tbl, conname, contype
   FROM pg_constraint
   WHERE connamespace = 'kingres'::regnamespace AND contype <> 'n'
   ORDER BY 1::text, 2;
-      tbl       |            conname            | contype 
-----------------+-------------------------------+---------
- bucket_map     | bucket_map_bucket_check       | c
- bucket_map     | bucket_map_colocation_id_fkey | f
- bucket_map     | bucket_map_group_id_check     | c
- bucket_map     | bucket_map_pkey               | p
- bucket_map     | bucket_map_state_check        | c
- bucket_move    | bucket_move_groups_check      | c
- bucket_move    | bucket_move_phase_check       | c
- bucket_move    | bucket_move_pkey              | p
- cluster_secret | cluster_secret_length_check   | c
- colocation     | colocation_bucket_count_check | c
- colocation     | colocation_pkey               | p
- dist_table     | dist_table_colocation_id_fkey | f
- dist_table     | dist_table_method_check       | c
- dist_table     | dist_table_pkey               | p
- dist_table     | dist_table_shape_check        | c
- dtx_applied    | dtx_applied_pkey              | p
- dtx_incident   | dtx_incident_pkey             | p
- dtx_log        | dtx_log_pkey                  | p
- move_marker    | move_marker_pkey              | p
- node           | node_group_id_check           | c
- node           | node_host_port_key            | u
- node           | node_pkey                     | p
- node           | node_port_check               | c
- node           | node_role_check               | c
- pending_node   | pending_node_pkey             | p
-(25 rows)
+       tbl       |            conname            | contype 
+-----------------+-------------------------------+---------
+ bucket_map      | bucket_map_bucket_check       | c
+ bucket_map      | bucket_map_colocation_id_fkey | f
+ bucket_map      | bucket_map_group_id_check     | c
+ bucket_map      | bucket_map_pkey               | p
+ bucket_map      | bucket_map_state_check        | c
+ bucket_move     | bucket_move_groups_check      | c
+ bucket_move     | bucket_move_phase_check       | c
+ bucket_move     | bucket_move_pkey              | p
+ cluster_secret  | cluster_secret_length_check   | c
+ colocation      | colocation_bucket_count_check | c
+ colocation      | colocation_pkey               | p
+ dist_table      | dist_table_colocation_id_fkey | f
+ dist_table      | dist_table_method_check       | c
+ dist_table      | dist_table_pkey               | p
+ dist_table      | dist_table_shape_check        | c
+ dtx_applied     | dtx_applied_pkey              | p
+ dtx_incident    | dtx_incident_pkey             | p
+ dtx_log         | dtx_log_pkey                  | p
+ dtx_unconfirmed | dtx_unconfirmed_pkey          | p
+ move_marker     | move_marker_pkey              | p
+ node            | node_group_id_check           | c
+ node            | node_host_port_key            | u
+ node            | node_pkey                     | p
+ node            | node_port_check               | c
+ node            | node_role_check               | c
+ pending_node    | pending_node_pkey             | p
+(26 rows)
 
 -- Nothing is created outside the kingres schema.
 SELECT count(*) AS tables_outside_kingres

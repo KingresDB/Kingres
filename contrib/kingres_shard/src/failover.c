@@ -68,6 +68,9 @@
 #include "recovery.h"
 
 PG_FUNCTION_INFO_V1(kingres_promote_node);
+PG_FUNCTION_INFO_V1(kingres_promote_node_forced);
+
+#define KS_FORCE_ACK "I have fenced every other node of the cluster and accept that the cluster can split"
 
 typedef struct Participant
 {
@@ -217,6 +220,7 @@ typedef struct PromoState
 	int64		version;
 	bool		in_recovery;
 	int			pending;		/* prepared catalog changes that are still unresolved */
+	char	   *blockers;		/* the same, as a JSON array of {gid, class} */
 } PromoState;
 
 static bool
@@ -226,7 +230,8 @@ read_state(KsConn *kc, PromoState *st)
 
 	memset(st, 0, sizeof(*st));
 	res = kingres_shard_exec_params(kc,
-									"SELECT local_node, term, version, in_recovery::pg_catalog.text, pending "
+									"SELECT local_node, term, version, in_recovery::pg_catalog.text, pending, "
+									"blockers::pg_catalog.text "
 									"FROM " KINGRES_SHARD_SCHEMA ".internal_promotion_state()",
 									0, NULL, NULL, false);
 	if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1)
@@ -239,9 +244,39 @@ read_state(KsConn *kc, PromoState *st)
 	st->version = strtoll(PQgetvalue(res, 0, 2), NULL, 10);
 	st->in_recovery = strcmp(PQgetvalue(res, 0, 3), "true") == 0;
 	st->pending = atoi(PQgetvalue(res, 0, 4));
+	st->blockers = pstrdup(PQgetvalue(res, 0, 5));
 	st->ok = true;
 	PQclear(res);
 	return true;
+}
+
+/*
+ * What stands in the way of a promotion on the nodes asked (S9-04): prepared
+ * transactions that hold a lock on kingres.map_version that a catalog change
+ * conflicts with.  The answer names them, node by node, with the class of each
+ * gid ("cluster": made by a node of this cluster, recovery resolves it; "foreign":
+ * somebody else's, which only an operator can end), so that the caller can tell
+ * "repeat" from "something specific is in the way".
+ */
+static StringInfoData blocked_buf;
+static bool blocked_open = false;
+
+static void
+blocked_reset(void)
+{
+	blocked_open = false;
+}
+
+static void
+note_blocked(int node_id, const char *blockers)
+{
+	if (!blocked_open)
+	{
+		initStringInfo(&blocked_buf);
+		blocked_open = true;
+	}
+	appendStringInfo(&blocked_buf, "%s{\"node\": %d, \"prepared\": %s}",
+					 blocked_buf.len > 0 ? ", " : "", node_id, blockers);
 }
 
 /*
@@ -260,7 +295,9 @@ promotion_complete(const KsCatalog *cat, const KsNode *tgt, bool map_case, List 
 
 	if (map_case)
 	{
-		if (cat->local_node_id != tgt->node_id || RecoveryInProgress())
+		/* A node promoted in PostgreSQL since it last claimed the map group is not complete until it claims it again (S9-02). */
+		if (cat->local_node_id != tgt->node_id || RecoveryInProgress() ||
+			(cat->local_timeline != 0 && cat->local_timeline != (int) GetWALInsertionTimeLine()))
 			return false;
 	}
 	foreach(lc, cat->nodes)
@@ -292,6 +329,8 @@ promotion_complete(const KsCatalog *cat, const KsNode *tgt, bool map_case, List 
 				return false;
 			continue;
 		}
+		if (st.pending > 0)
+			note_blocked(n->node_id, st.blockers);
 		if (st.in_recovery || st.pending > 0 || st.term != cat->term || st.version != cat->map_version)
 			return false;
 		if (n->node_id == tgt->node_id && st.local_node != tgt->node_id)
@@ -330,8 +369,9 @@ static Datum
 promote_result(const char *status, int64 term, List *unreached)
 {
 	char	   *list = unreached_json(unreached);
-	char	   *doc = psprintf("{\"status\": \"%s\", \"term\": " INT64_FORMAT ", \"final\": %s, \"unreached\": %s}",
-							   status, term, strcmp(status, "already") == 0 ? "true" : "false", list);
+	char	   *doc = psprintf("{\"status\": \"%s\", \"term\": " INT64_FORMAT ", \"final\": %s, \"unreached\": %s, \"blocked_by\": [%s]}",
+							   status, term, strcmp(status, "already") == 0 ? "true" : "false", list,
+							   blocked_open ? blocked_buf.data : "");
 
 	return DirectFunctionCall1(jsonb_in, CStringGetDatum(doc));
 }
@@ -356,10 +396,9 @@ promote_result(const char *status, int64 term, List *unreached)
  * the groups (the promoted node counting for its own).  A call is resumable:
  * repeat it after a failure and it finishes what the failed call left.
  */
-Datum
-kingres_promote_node(PG_FUNCTION_ARGS)
+static Datum
+promote_node_impl(int target_id, bool forced)
 {
-	int			target_id = PG_GETARG_INT32(0);
 	const KsCatalog *cat;
 	const KsNode *tgt;
 	const KsNode *old;
@@ -387,6 +426,7 @@ kingres_promote_node(PG_FUNCTION_ARGS)
 				 errmsg("permission denied for function promote_node"),
 				 errdetail("Only superusers can promote a node.")));
 
+	blocked_reset();
 	kingres_shard_lock_catalog();
 	cat = kingres_shard_catalog();
 	if (!cat->present || cat->local_node_id == 0)
@@ -402,6 +442,11 @@ kingres_promote_node(PG_FUNCTION_ARGS)
 	tgt_port = tgt->port;
 	tgt_host = pstrdup(tgt->host);
 	map_case = (tgt_group == KINGRES_SHARD_MAP_GROUP);
+	if (forced && !map_case)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the promotion without a majority is for the map group only"),
+				 errhint("An ordinary group is promoted with kingres.promote_node() on the map group primary.")));
 	old = kingres_shard_group_primary(tgt_group);
 	if (old != NULL && !tgt->is_primary)
 		old_id = old->node_id;
@@ -499,6 +544,7 @@ kingres_promote_node(PG_FUNCTION_ARGS)
 		KsNode	   *n = (KsNode *) lfirst(lc);
 		Participant *p;
 		char	   *err = NULL;
+		bool		live_ok = false;
 
 		if (n->node_id == local_id || !n->is_active)
 			continue;
@@ -530,6 +576,7 @@ kingres_promote_node(PG_FUNCTION_ARGS)
 			p->host = pstrdup(n->host);
 			p->port = n->port;
 			p->kc = pkc;
+			kingres_shard_conn_exempt_sync(pkc);
 			kingres_shard_begin_write_xact(p->kc);
 			parts = lappend(parts, p);
 			continue;
@@ -558,13 +605,38 @@ kingres_promote_node(PG_FUNCTION_ARGS)
 			continue;
 		}
 		/*
+		 * A group counts as reached (S9-02) only when its primary answers now and
+		 * proves it is one: out of recovery and knowing itself by the id the catalog
+		 * gives it.  Nothing this node changed itself counts, and a primary that
+		 * holds a newer catalog term than this node says that this node's catalog is
+		 * the stale one.
+		 */
+		if (map_case && n->group_id != KINGRES_SHARD_MAP_GROUP && n->is_primary && n->node_id != old_id)
+		{
+			PromoState	live;
+
+			if (read_state(p->kc, &live))
+			{
+				if (live.term > cat->term)
+					ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("node %d holds catalog term " INT64_FORMAT ", newer than the " INT64_FORMAT " of this node",
+									n->node_id, live.term, cat->term),
+							 errhint("The catalog of this node is stale: another node has promoted the map group.  This node must not.")));
+				live_ok = (!live.in_recovery && live.local_node == n->node_id);
+			}
+		}
+		/*
 		 * The remote transaction is opened now: a session that is idle when the
 		 * catalog changes below would be closed as a session to a node that is
 		 * no longer a primary.
 		 */
+		if (n->node_id == old_id)
+			kingres_shard_conn_exempt_sync(p->kc);
 		kingres_shard_begin_write_xact(p->kc);
 		parts = lappend(parts, p);
-		if (n->group_id != KINGRES_SHARD_MAP_GROUP && n->node_id != old_id && n->is_primary)
+		if (n->group_id != KINGRES_SHARD_MAP_GROUP && n->node_id != old_id && n->is_primary &&
+			(!map_case || live_ok))
 			reached_groups++;
 	}
 
@@ -597,7 +669,7 @@ kingres_promote_node(PG_FUNCTION_ARGS)
 				electorate = lappend_int(electorate, n->group_id);
 		}
 		nelectors = list_length(electorate);
-		if (nelectors > 0 && reached_groups * 2 <= nelectors)
+		if (!forced && nelectors > 0 && reached_groups * 2 <= nelectors)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("only %d of the %d other shard groups can be reached from this node; the map group cannot be promoted from a minority of them",
@@ -641,7 +713,7 @@ kingres_promote_node(PG_FUNCTION_ARGS)
 					 errhint("This node's catalog is stale; call kingres.promote_node() on the current map group primary.")));
 	}
 	else
-		new_term++;
+		new_term += forced ? 1000 : 1;
 
 	if (!resume)
 	{
@@ -699,4 +771,40 @@ kingres_promote_node(PG_FUNCTION_ARGS)
 	}
 	kingres_shard_fault_point("promote_after_push");
 	PG_RETURN_DATUM(promote_result(resume ? "completed" : "promoted", new_term, unreached));
+}
+
+Datum
+kingres_promote_node(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_DATUM(promote_node_impl(PG_GETARG_INT32(0), false));
+}
+
+/*
+ * kingres.promote_map_group_without_majority(node_id int, acknowledgement text)  (S9-10)
+ *
+ * The way out when the map group cannot be promoted by the rule of the majority because the
+ * other side will never come back: the groups that were lost together with the map group are
+ * half or more of the others.  Deliberately awkward: it is for the operator, not for a control
+ * plane that has not been told so by a human, and the acknowledgement must be this text.  What it
+ * does is promote_node() without the electorate and with a catalog term that is 1000 above the
+ * highest one seen, so that no node that missed the promotion (or any old claim) can override
+ * it.  What it does not do: fence anything.  If any node of the old map group is alive and
+ * reachable by some clients, or any group of the lost side comes back and has promoted its own
+ * map primary, there are two map primaries; the higher term wins wherever the two meet, and what
+ * the other one wrote in the catalog meanwhile is lost.  The operator is the electorate here.
+ */
+Datum
+kingres_promote_node_forced(PG_FUNCTION_ARGS)
+{
+	char	   *ack = text_to_cstring(PG_GETARG_TEXT_PP(1));
+
+	if (strcmp(ack, KS_FORCE_ACK) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("the acknowledgement is not the required text"),
+				 errhint("Pass exactly: %s", KS_FORCE_ACK)));
+	ereport(WARNING,
+			(errmsg("promoting the map group without the rule of the majority, on the operator's word that the old map primary and the groups that were lost are fenced"),
+			 errdetail("The catalog term will jump by 1000, so that no claim made before this one can override it.")));
+	PG_RETURN_DATUM(promote_node_impl(PG_GETARG_INT32(0), true));
 }

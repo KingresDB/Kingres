@@ -101,7 +101,7 @@ sub clear_sync
 	my $old = roles($s1b);
 	my ($rc, $out, $err) = run_sql($s1b, "SELECT kingres.promote_node($idb)");
 	isnt($rc, 0, '[B] the map group is not promoted by a node that cannot commit');
-	like($err, qr/cannot commit/, '[B] and the message says so');
+	like($err, qr/this node cannot commit: its synchronous standbys do not confirm/, '[B] and the message says so');
 	is(roles($s1b), $old, '[B] nothing was changed');
 	is(prepared($n2) . prepared($n3) . prepared($s1b), '000', '[B] nothing is left prepared');
 	clear_sync($s1b);

@@ -68,6 +68,7 @@ typedef struct KsCatalog
 	int64		term;			/* catalog term: raised by every promotion (failover.c) */
 	int64		superseded_by_term; /* 0, or the newer term this node learned of while acting as the map primary */
 	int			local_node_id;	/* 0 when the cluster is not initialized */
+	int			local_timeline; /* WAL timeline recorded when this node became what it is; 0: not recorded (S9-02) */
 	int			local_group_id;	/* -1 when the cluster is not initialized */
 	int			ngroups;		/* number of groups with an active primary */
 	int			ndist_tables;
@@ -79,6 +80,8 @@ typedef struct KsCatalog
 extern void kingres_shard_catalog_init(void);
 extern const KsCatalog *kingres_shard_catalog(void);
 extern bool kingres_shard_cluster_secret(unsigned char *buf, int bufsize, int *len);
+extern bool kingres_shard_previous_secret(unsigned char *buf, int bufsize, int *len);
+extern bool kingres_shard_cluster_secret_for_names(unsigned char *buf, int bufsize, int *len);
 extern int kingres_shard_local_node_id_raw(void);
 extern void kingres_shard_catalog_invalidate(void);
 extern int64 kingres_shard_placement_hash(const KsColocation *coloc);

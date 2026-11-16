@@ -114,9 +114,21 @@ CREATE TABLE kingres.map_version (
 CREATE UNIQUE INDEX map_version_single_row_idx ON kingres.map_version ((true));
 INSERT INTO kingres.map_version VALUES (0);
 
+-- The timeline this server writes WAL on: what tells a node that was promoted in
+-- PostgreSQL from the node the catalog named (S9-02).  A node records it in its
+-- local_node row when it becomes the map group primary in the catalog; a physical
+-- copy carries the row, and when the copy is promoted its timeline is another one.
+CREATE FUNCTION kingres.internal_wal_timeline()
+    RETURNS pg_catalog.int4
+    AS 'MODULE_PATHNAME', 'kingres_internal_wal_timeline'
+    LANGUAGE C STABLE
+    SET search_path = pg_catalog, kingres, pg_temp;
+REVOKE ALL ON FUNCTION kingres.internal_wal_timeline() FROM PUBLIC;
+
 -- Single-row, node-local table (never synchronized): which node this is.
 CREATE TABLE kingres.local_node (
-    node_id int NOT NULL
+    node_id int NOT NULL,
+    timeline int NOT NULL DEFAULT kingres.internal_wal_timeline()
 );
 CREATE UNIQUE INDEX local_node_single_row_idx ON kingres.local_node ((true));
 
@@ -129,6 +141,11 @@ CREATE TABLE kingres.dtx_log (
     gid         text        NOT NULL,
     node_id     int         NOT NULL,
     prepared_at timestamptz NOT NULL,
+    -- true once the participant's synchronous standbys have confirmed that the commit of its part
+    -- is durable (recovery.c, participant_confirmed): only then may the retention forget the row
+    durable     bool        NOT NULL DEFAULT false,
+    -- the participant was a node that was being demoted (S9-05): not waited for, not checked for loss (S9-06)
+    exempt      bool        NOT NULL DEFAULT false,
     CONSTRAINT dtx_log_pkey PRIMARY KEY (gid)
 );
 CREATE INDEX dtx_log_node_idx ON kingres.dtx_log (node_id);
@@ -904,6 +921,10 @@ GRANT USAGE ON SCHEMA kingres TO PUBLIC;
 GRANT SELECT ON kingres.node, kingres.colocation, kingres.dist_table,
     kingres.bucket_map, kingres.map_version, kingres.local_node,
     kingres.nodes, kingres.buckets TO PUBLIC;
+-- map_version stays readable (S9-04): a reader holds ACCESS SHARE, which conflicts only with ACCESS EXCLUSIVE
+-- (never taken at run time) and blocks no catalog change; a prepared transaction of a reader is not counted
+-- by internal_promotion_state, so it cannot keep promote_node from answering "already".
+
 
 -- ---------------------------------------------------------------------------
 -- The cluster secret (review finding S2-04)
@@ -916,6 +937,9 @@ GRANT SELECT ON kingres.node, kingres.colocation, kingres.dist_table,
 -- extension's C code reads it with the heap API.
 CREATE TABLE kingres.cluster_secret (
     secret bytea NOT NULL,
+    -- the secret that the one in force replaced, and when (S9-03); see internal_apply_secret
+    previous bytea,
+    previous_at timestamptz,
     CONSTRAINT cluster_secret_length_check CHECK (pg_catalog.length(secret) >= 32)
 );
 CREATE UNIQUE INDEX cluster_secret_single_row_idx ON kingres.cluster_secret ((true));
@@ -938,14 +962,29 @@ SELECT pg_catalog.decode(pg_catalog.replace(pg_catalog.gen_random_uuid()::pg_cat
  WHERE NOT EXISTS (SELECT 1 FROM kingres.cluster_secret);
 $$;
 
--- Install the secret of the cluster on this node (the hex form of its bytes).
+-- Install the secret of the cluster on this node (the hex form of its bytes).  The
+-- secret it replaces is kept as "previous" (S9-03): a node that holds a rotation
+-- prepared and was not told that it committed still has the old one, and the node
+-- that finishes the rotation proves itself to it with that.  The previous secret is
+-- never accepted from anybody; recovery drops it once every primary has been reached
+-- with the current one.
 CREATE FUNCTION kingres.internal_apply_secret(secret_hex pg_catalog.text)
     RETURNS pg_catalog.void
-    LANGUAGE sql
+    LANGUAGE plpgsql
     SET search_path = pg_catalog, kingres, pg_temp
     AS $$
-DELETE FROM kingres.cluster_secret;
-INSERT INTO kingres.cluster_secret VALUES (pg_catalog.decode(secret_hex, 'hex'));
+DECLARE
+    v_new pg_catalog.bytea := pg_catalog.decode(secret_hex, 'hex');
+BEGIN
+    UPDATE kingres.cluster_secret c
+       SET previous    = CASE WHEN c.secret OPERATOR(pg_catalog.=) v_new THEN c.previous ELSE c.secret END,
+           previous_at = CASE WHEN c.secret OPERATOR(pg_catalog.=) v_new THEN c.previous_at
+                              ELSE pg_catalog.clock_timestamp() END,
+           secret      = v_new;
+    IF NOT FOUND THEN
+        INSERT INTO kingres.cluster_secret (secret) VALUES (v_new);
+    END IF;
+END;
 $$;
 
 -- The token this node would accept from a session of the role on the node with
@@ -1133,19 +1172,9 @@ $$;
 -- This node must be the map group primary.
 CREATE FUNCTION kingres.internal_require_map_group()
     RETURNS void
-    LANGUAGE plpgsql
-    SET search_path = pg_catalog, kingres, pg_temp
-    AS $$
-BEGIN
-    IF NOT EXISTS (SELECT 1
-                     FROM kingres.local_node l
-                     JOIN kingres.node n ON n.node_id OPERATOR(pg_catalog.=) l.node_id
-                    WHERE n.group_id OPERATOR(pg_catalog.=) 0 AND n.role OPERATOR(pg_catalog.=) 'primary') THEN
-        RAISE EXCEPTION 'this function can only run on the map group primary'
-            USING ERRCODE = 'object_not_in_prerequisite_state';
-    END IF;
-END;
-$$;
+    AS 'MODULE_PATHNAME', 'kingres_internal_require_map_group'
+    LANGUAGE C
+    SET search_path = pg_catalog, kingres, pg_temp;
 
 -- The first value of the first row of what a statement returns on a node.
 CREATE FUNCTION kingres.internal_exec_scalar(p_node int, p_sql text, p_timeout_ms int DEFAULT NULL)
@@ -1664,8 +1693,13 @@ $$;
 
 -- On the target: the subscription, with the initial copy, on the slot made
 -- before.  The connection string is built here, from this node's own
--- kingres_shard.node_conninfo.  synchronous_commit = on: after the switch the
--- subscription is gone and nothing can replay what a crash would lose.
+-- kingres_shard.node_conninfo.  synchronous_commit = local (S9, "Not reproduced"): the commit
+-- that moves a table from "finished copy" to "ready" comes after the table-sync worker
+-- dropped its slot on the source, and a commit that waited for the target's standby
+-- (synchronous_commit = on) made a healthy move look as if it had lost its slot when that
+-- standby was slow.  Nothing is lost by not waiting: the switch prepares the target as a
+-- participant, which asks it whether everything it flushed is confirmed by its standbys
+-- (internal_sync_confirm) before the decision.
 CREATE FUNCTION kingres.internal_create_move_subscription(p_name text, p_host text, p_port int)
     RETURNS void
     LANGUAGE plpgsql
@@ -1678,7 +1712,7 @@ BEGIN
     END IF;
     EXECUTE pg_catalog.format('CREATE SUBSCRIPTION %I CONNECTION %L PUBLICATION %I '
                               'WITH (connect = true, create_slot = false, slot_name = %L, copy_data = true, '
-                              'enabled = true, synchronous_commit = ''on'', streaming = ''off'', '
+                              'enabled = true, synchronous_commit = ''local'', streaming = ''off'', '
                               'binary = false, origin = ''any'', disable_on_error = false)',
                               p_name, kingres.internal_subscription_conninfo(p_host, p_port), p_name, p_name);
 END;
@@ -3327,6 +3361,22 @@ CREATE TABLE kingres.dtx_incident (
 COMMENT ON TABLE kingres.dtx_incident IS
     'Node-local: prepared transactions of an earlier timeline that recovery rolled back without a commit decision; never synchronized';
 
+-- Node-local, never synchronized: the participants whose commit decisions this
+-- node keeps beyond kingres_shard.decision_retention because the participant's
+-- synchronous standbys have not confirmed that its second phase is durable
+-- (recovery.c, participant_confirmed).  A row exists while that is so; it is
+-- removed when the standbys confirm or the decisions are gone.  check_cluster()
+-- reports it as decision_unconfirmed.
+CREATE TABLE kingres.dtx_unconfirmed (
+    node_id int         NOT NULL,
+    since   timestamptz NOT NULL,
+    kept    int8        NOT NULL,
+    CONSTRAINT dtx_unconfirmed_pkey PRIMARY KEY (node_id)
+);
+
+COMMENT ON TABLE kingres.dtx_unconfirmed IS
+    'Node-local: participants whose commit decisions are kept without a time limit until their standbys confirm; never synchronized';
+
 -- promote_node(node_id): see src/failover.c.
 CREATE FUNCTION kingres.promote_node(node_id int)
     RETURNS jsonb
@@ -3930,6 +3980,9 @@ SELECT pg_catalog.jsonb_build_object(
                                'gid', i.gid, 'kind', i.kind, 'detected_at', i.detected_at,
                                'gid_timeline', i.gid_timeline, 'current_timeline', i.current_timeline))
                             FROM kingres.dtx_incident i), '[]'::pg_catalog.jsonb),
+    'unconfirmed', COALESCE((SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+                               'node_id', u.node_id, 'since', u.since, 'kept', u.kept))
+                            FROM kingres.dtx_unconfirmed u), '[]'::pg_catalog.jsonb),
     'prepared', COALESCE((SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
                                'gid', x.gid, 'age', extract(epoch FROM pg_catalog.clock_timestamp() OPERATOR(pg_catalog.-) x.prepared),
                                'class', kingres.internal_gid_class(x.gid)))
@@ -4098,6 +4151,21 @@ BEGIN
             detail := pg_catalog.format('rolled back at %s: it belonged to timeline %s and had no commit decision on timeline %s; if the old primary had committed it, other nodes may have too',
                                         x.detected_at, x.gid_timeline, x.current_timeline);
             END IF;
+            RETURN NEXT;
+        END LOOP;
+
+        -- Decisions kept without a time limit because the participant's standbys have not
+        -- confirmed its second phase (S9-01): they are what brings a part back after a
+        -- failover of that participant, and they are not forgotten before it is confirmed.
+        FOR x IN SELECT u.node_id AS pnode, u.since AS detected_at, u.kept
+                   FROM pg_catalog.jsonb_to_recordset(st -> 'unconfirmed')
+                        AS u(node_id pg_catalog.int4, since pg_catalog.timestamptz, kept pg_catalog.int8)
+                  ORDER BY u.since
+        LOOP
+            check_name := 'decision_unconfirmed'; node_id := n.node_id;
+            object := pg_catalog.format('node %s', x.pnode);
+            detail := pg_catalog.format('since %s this node keeps %s commit decision(s) for node %s: its synchronous standbys have not confirmed that its commits are durable, so a failover of it now would bring its part back prepared and recovery needs the decision; they are kept, with no time limit, until the standbys confirm. Start the standby, or take its name out of the primary''s synchronous_standby_names (then the retention applies and the weaker case of the README holds)',
+                                        x.detected_at, x.kept, x.pnode);
             RETURN NEXT;
         END LOOP;
 
@@ -4439,22 +4507,38 @@ $$;
 -- row lock on kingres.map_version; every catalog change writes it).
 CREATE FUNCTION kingres.internal_promotion_state(OUT local_node int, OUT term bigint,
                                                  OUT version bigint, OUT in_recovery bool,
-                                                 OUT pending int)
+                                                 OUT pending int, OUT blockers jsonb)
     RETURNS record
     LANGUAGE sql STABLE
     SET search_path = pg_catalog, kingres, pg_temp
     AS $$
+-- Prepared transactions that hold a lock on kingres.map_version that conflicts with a catalog change
+-- (anything above ACCESS SHARE, which only readers take and which blocks nobody): the ones a
+-- promotion has to wait for, with the class of their gid so that a caller can tell a transaction of
+-- the cluster, which recovery resolves, from one that is somebody else's (S9-04).
+WITH b AS (
+    SELECT DISTINCT x.gid AS gid, kingres.internal_gid_class(x.gid) AS class
+      FROM pg_catalog.pg_locks k
+      JOIN pg_catalog.pg_locks t
+        ON t.virtualtransaction OPERATOR(pg_catalog.=) k.virtualtransaction
+       AND t.locktype OPERATOR(pg_catalog.=) 'transactionid' AND t.pid IS NULL
+      JOIN pg_catalog.pg_prepared_xacts x
+        ON x.transaction OPERATOR(pg_catalog.=) t.transactionid
+     WHERE k.locktype OPERATOR(pg_catalog.=) 'relation'
+       AND k.pid IS NULL
+       AND k.mode OPERATOR(pg_catalog.<>) 'AccessShareLock'
+       AND k.database OPERATOR(pg_catalog.=) (SELECT d.oid FROM pg_catalog.pg_database d
+                                               WHERE d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database())
+       AND k.relation OPERATOR(pg_catalog.=) 'kingres.map_version'::pg_catalog.regclass
+)
 SELECT (SELECT l.node_id FROM kingres.local_node l),
        (SELECT m.term FROM kingres.map_version m),
        (SELECT m.version FROM kingres.map_version m),
        pg_catalog.pg_is_in_recovery(),
-       (SELECT pg_catalog.count(DISTINCT k.virtualtransaction)::pg_catalog.int4
-          FROM pg_catalog.pg_locks k
-         WHERE k.locktype OPERATOR(pg_catalog.=) 'relation'
-           AND k.pid IS NULL
-           AND k.database OPERATOR(pg_catalog.=) (SELECT d.oid FROM pg_catalog.pg_database d
-                                                   WHERE d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database())
-           AND k.relation OPERATOR(pg_catalog.=) 'kingres.map_version'::pg_catalog.regclass);
+       (SELECT pg_catalog.count(*)::pg_catalog.int4 FROM b),
+       COALESCE((SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('gid', b.gid, 'class',
+                        CASE b.class WHEN 'tagged' THEN 'cluster' WHEN 'untagged' THEN 'cluster' ELSE 'foreign' END)
+                        ORDER BY b.gid) FROM b), '[]'::pg_catalog.jsonb);
 $$;
 
 REVOKE ALL ON FUNCTION kingres.internal_promotion_state() FROM PUBLIC;
@@ -4877,3 +4961,94 @@ DELETE FROM kingres.cluster_secret;
 DELETE FROM kingres.node;
 UPDATE kingres.map_version SET version = 0, term = 0, superseded_by_term = 0;
 $$;
+
+-- ---------------------------------------------------------------------------
+-- The check of a planned switchover (S9-07)
+-- ---------------------------------------------------------------------------
+
+-- On the node that hands over, after the application's writes to its group have
+-- stopped: write a record into the WAL, flush it, and return its position.  A node
+-- that has replayed this position has every commit that was acknowledged before it.
+CREATE FUNCTION kingres.switchover_mark()
+    RETURNS pg_catalog.pg_lsn
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+BEGIN
+    IF pg_catalog.pg_is_in_recovery() THEN
+        RAISE EXCEPTION 'this node is in recovery: the mark is written by the node that hands over'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN pg_catalog.pg_logical_emit_message(false, 'kingres_shard', 'switchover', true);
+END;
+$$;
+
+-- On the node that takes over, before or after pg_promote(): has this node replayed the
+-- position?  With the position that switchover_mark() returned, "replayed" means
+-- replay position >= position.  With the "Latest checkpoint location" that pg_controldata
+-- prints for the stopped old primary (the start of its shutdown checkpoint, the last record
+-- it wrote), pass shutdown_checkpoint => true: the record is replayed when the replay
+-- position is beyond its start.  False means that something OLD wrote is not on this node.
+CREATE FUNCTION kingres.switchover_verify(target_lsn pg_catalog.pg_lsn, shutdown_checkpoint pg_catalog.bool DEFAULT false)
+    RETURNS pg_catalog.bool
+    LANGUAGE plpgsql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+DECLARE
+    v_replayed pg_catalog.pg_lsn;
+BEGIN
+    v_replayed := pg_catalog.pg_last_wal_replay_lsn();
+    IF v_replayed IS NULL THEN
+        RETURN false;
+    END IF;
+    IF shutdown_checkpoint THEN
+        RETURN v_replayed OPERATOR(pg_catalog.>) target_lsn;
+    END IF;
+    RETURN v_replayed OPERATOR(pg_catalog.>=) target_lsn;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION kingres.switchover_mark(), kingres.switchover_verify(pg_lsn, bool) FROM PUBLIC;
+COMMENT ON FUNCTION kingres.switchover_mark() IS
+    'Planned switchover: write and flush a WAL record on the old primary and return its position';
+COMMENT ON FUNCTION kingres.switchover_verify(pg_lsn, bool) IS
+    'Planned switchover: has this node (the new primary, before or after pg_promote) replayed what the old primary wrote up to the position';
+
+-- The operator's way out when the map group cannot be promoted by the rule of the majority
+-- because the groups that were lost with it are half or more of the others (S9-10).  Deliberately
+-- awkward: the second argument must be the exact text below, and the catalog term jumps by 1000.
+CREATE FUNCTION kingres.promote_map_group_without_majority(node_id int, acknowledgement text)
+    RETURNS jsonb
+    AS 'MODULE_PATHNAME', 'kingres_promote_node_forced'
+    LANGUAGE C STRICT
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+REVOKE ALL ON FUNCTION kingres.promote_map_group_without_majority(int, text) FROM PUBLIC;
+COMMENT ON FUNCTION kingres.promote_map_group_without_majority(int, text) IS
+    'Promote the map group standby that this node is without the rule of the majority, on the operator''s written word that every other node is fenced; the catalog term jumps by 1000';
+
+-- The check of the name of a standby before it goes into synchronous_standby_names
+-- (README, "Registering a standby", step 2).  On the primary of the group: does a connected
+-- walreceiver that is streaming report this application_name, and does this node's group have
+-- a registered standby?  A name that matches nobody makes every commit that writes in the group
+-- wait for ever.  pg_stat_replication does not say which registered node a walsender serves, so
+-- this answers "some streaming standby of this primary carries the name", which is what the list
+-- is matched against.
+CREATE FUNCTION kingres.standby_name_matches(standby_name pg_catalog.text)
+    RETURNS pg_catalog.bool
+    LANGUAGE sql STABLE
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_replication r
+                WHERE r.application_name OPERATOR(pg_catalog.=) standby_name
+                  AND r.state OPERATOR(pg_catalog.=) 'streaming')
+   AND EXISTS (SELECT 1
+                 FROM kingres.local_node l
+                 JOIN kingres.node me ON me.node_id OPERATOR(pg_catalog.=) l.node_id
+                 JOIN kingres.node s ON s.group_id OPERATOR(pg_catalog.=) me.group_id
+                                    AND s.role OPERATOR(pg_catalog.=) 'standby');
+$$;
+
+REVOKE ALL ON FUNCTION kingres.standby_name_matches(text) FROM PUBLIC;
+COMMENT ON FUNCTION kingres.standby_name_matches(text) IS
+    'On the primary of a group: does a streaming standby carry this application_name (the check before the name goes into synchronous_standby_names)';

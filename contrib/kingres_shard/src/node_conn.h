@@ -60,11 +60,16 @@ typedef struct KsConn
 	char		gid[KS_GID_LEN];
 	/* the session runs with synchronous_commit raised to at least "on" (S7-07) */
 	bool		sync_forced;
+	/* the session was opened with the previous cluster secret (S9-03) */
+	bool		via_previous;
+	/* the participant is a node that is being demoted (S9-05): its standbys are not waited for */
+	bool		sync_exempt;
 	/* an asynchronous fetch of one scan is in flight on conn */
 	void	   *pending_owner;
 	KsPendingFinish pending_finish;
 } KsConn;
 
+extern bool kingres_shard_previous_secret_used;
 extern void kingres_shard_conn_init(void);
 extern int	kingres_shard_set_transmission_modes(void);
 extern void kingres_shard_reset_transmission_modes(int nestlevel);
@@ -97,6 +102,9 @@ extern void kingres_shard_conn_drop_stale(List *nodes);
  * session is not usable.
  */
 extern bool kingres_shard_conn_force_sync(KsConn *kc);
+extern char *kingres_shard_conn_error_text(PGconn *conn);
+extern void kingres_shard_conn_exempt_sync(KsConn *kc);
+extern bool kingres_shard_conn_local_sync(KsConn *kc);
 extern void kingres_shard_conn_unforce_sync(KsConn *kc);
 extern void kingres_shard_note_remote_write(KsConn *kc);
 extern void kingres_shard_begin_write_xact(KsConn *kc);
@@ -122,6 +130,7 @@ extern int	kingres_shard_conn_node_id(const char *host, int port);
  * interrupts, which is why it is bounded.
  */
 extern PGresult *kingres_shard_bounded_exec(PGconn *conn, const char *sql, bool interruptible);
+extern PGresult *kingres_shard_exec_cancel_after_timeout(PGconn *conn, const char *sql);
 
 /* The kingres_shard version host:port reports, asked without a claim (NULL: cannot be asked, "": none). */
 extern char *kingres_shard_remote_extension_version(const char *host, int port);

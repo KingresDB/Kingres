@@ -130,6 +130,7 @@ diag("moves: " . join('; ', @moved));
 # The model.
 my (%order, %item);
 my ($lat_m, $lat_o, $unexpected, $retries, $ops) = (0, 0, 0, 0, 0);
+my %per;
 for my $w (0 .. 2)
 {
 	open(my $m, '<', "$tmp/model$w") or die "no model of writer $w";
@@ -142,12 +143,15 @@ for my $w (0 .. 2)
 		{
 			$lat_m = $1 if $1 > $lat_m;
 			$lat_o = $2 if $2 > $lat_o;
-			$unexpected += $3; $retries += $4; $ops += $5;
+			$unexpected += $3; $retries += $4; $ops += $5; $per{$w} = $5;
 		}
 	}
 	close($m);
 }
-cmp_ok($ops, '>', 200, "the writers ran $ops operations during the moves");
+# What this is for: the moves ran while the writers wrote, and every writer did write.  How many
+# operations they managed depends on the load of the machine, which is not what the test is about
+# (it used to assert more than 200 and failed on a machine whose load average was above 50).
+ok((grep { ($per{$_} // 0) > 0 } 0 .. 2) == 3, "every writer ran during the moves ($ops operations in all)");
 is($unexpected, 0, 'no statement failed except with the retryable stale-map error') or do {
 	for my $w (0 .. 2) { if (open(my $e, '<', "$tmp/werr$w")) { diag($_) while <$e>; close($e); } }
 };

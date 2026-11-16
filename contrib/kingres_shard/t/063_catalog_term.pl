@@ -172,7 +172,7 @@ sub status
 	is($rc, 0, '[C] a statement for group 1 now goes to the new primary');
 	is($s2->safe_psql('postgres', "SELECT count(*) FROM public.kv WHERE id = $k1"), '1', '[C] and was written there');
 	# sync_catalog repairs a node that was missed and did not learn by itself (nothing left to repair here).
-	is($n1->safe_psql('postgres', "SELECT kingres.promote_node($id)"), '{"term": 1, "final": true, "status": "already", "unreached": [2]}',
+	is($n1->safe_psql('postgres', "SELECT kingres.promote_node($id)"), '{"term": 1, "final": true, "status": "already", "unreached": [2], "blocked_by": []}',
 		'[C] a repeated promote_node finds the promotion complete');
 }
 

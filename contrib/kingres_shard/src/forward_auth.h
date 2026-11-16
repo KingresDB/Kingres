@@ -28,6 +28,7 @@ extern void kingres_shard_forward_auth_init(void);
  * cluster that is not initialized or not yet secured).  The result is palloc'd.
  */
 extern char *kingres_shard_forward_token(const char *user, int node_id);
+extern char *kingres_shard_forward_token_previous(const char *user, int node_id);
 
 /*
  * Is this session a forwarded session, one opened by another node of the
@@ -52,8 +53,10 @@ extern bool kingres_shard_session_forwarded(void);
 
 /* Has the claim been proved (and not only made)?  Never raises an error. */
 extern bool kingres_shard_session_verified(void);
+extern bool kingres_shard_session_node_proven(void);
 
 /* The tag of a two-phase transaction identifier (16 hex digits, tag has room for 17 bytes); see forward_auth.c. */
 extern bool kingres_shard_gid_tag(const char *body, char *tag);
+extern bool kingres_shard_gid_tag_previous(const char *body, char *tag);
 
 #endif							/* KINGRES_SHARD_FORWARD_AUTH_H */

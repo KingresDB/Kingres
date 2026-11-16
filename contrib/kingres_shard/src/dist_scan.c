@@ -982,7 +982,7 @@ frag_send_fetch(DsFrag *f)
 		ereport(ERROR,
 				(errcode(ERRCODE_CONNECTION_FAILURE),
 				 errmsg("could not send a command to node %s:%d", f->host, f->port),
-				 errdetail_internal("%s", pchomp(PQerrorMessage(f->kc->conn)))));
+				 errdetail_internal("%s", kingres_shard_conn_error_text(f->kc->conn))));
 	}
 	f->in_flight = true;
 	kingres_shard_conn_set_pending(f->kc, f, ds_finish_pending);
@@ -1091,7 +1091,7 @@ ds_start(KsDistScanState *s)
 				ereport(ERROR,
 						(errcode(ERRCODE_CONNECTION_FAILURE),
 						 errmsg("could not send a command to node %s:%d", f->host, f->port),
-						 errdetail_internal("%s", pchomp(PQerrorMessage(f->kc->conn)))));
+						 errdetail_internal("%s", kingres_shard_conn_error_text(f->kc->conn))));
 			}
 			f->kc->nstatements++;
 			f->in_flight = true;
@@ -1145,7 +1145,7 @@ ds_start(KsDistScanState *s)
 			ereport(ERROR,
 					(errcode(ERRCODE_CONNECTION_FAILURE),
 					 errmsg("could not send a command to node %s:%d", f->host, f->port),
-					 errdetail_internal("%s", pchomp(PQerrorMessage(f->kc->conn)))));
+					 errdetail_internal("%s", kingres_shard_conn_error_text(f->kc->conn))));
 		}
 		f->kc->nstatements++;
 		f->in_flight = true;
