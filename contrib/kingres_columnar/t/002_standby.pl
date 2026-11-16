@@ -338,6 +338,37 @@ is($standby->safe_psql('postgres', fp('tr')),
 log_is_clean($standby, 'standby after the truncations');
 
 ###############################################################################
+# 3b. the freeze of a file's creating transaction id cancels a standby query
+# that may still hold it (C4-05)
+#
+# A table is truncated on the primary, which gives it a new file created by
+# the truncating transaction; VACUUM then freezes that id, which makes the
+# table readable by a snapshot that predates the TRUNCATE.  Such a snapshot
+# on the standby must be cancelled by the recovery conflict of the freeze
+# record, not answered with the empty table the frozen file would show.
+###############################################################################
+
+$primary->safe_psql('postgres', "CREATE TABLE fz (a int) USING columnar; INSERT INTO fz SELECT generate_series(1, 100)");
+catchup($primary, $standby);
+my $lpos = -s $standby->logfile;
+my $sf = $standby->background_psql('postgres', on_error_stop => 0);
+$sf->query_safe("BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM ct");
+$primary->safe_psql('postgres', "TRUNCATE fz; INSERT INTO fz SELECT generate_series(1, 5)");
+# a few transactions, so that the oldest running transaction moves past the truncate
+$primary->safe_psql('postgres', "SELECT txid_current()");
+$primary->safe_psql('postgres', "VACUUM fz");
+is($primary->safe_psql('postgres', "SELECT kingres.columnar_creating_xid('fz')"), '2',
+	'the primary froze the creating transaction id of the truncated table');
+catchup($primary, $standby);
+$standby->wait_for_log(qr/conflict with recovery/, $lpos);
+pass('the freeze record cancelled the standby query that might hold the id');
+my ($fout, $fret) = ('', 0);
+eval { ($fout, $fret) = $sf->query("SELECT count(*) FROM fz") };
+unlike($fout, qr/^\s*0\s*$/, 'the cancelled snapshot is not answered with the empty table');
+eval { $sf->quit };
+log_is_clean($standby, 'standby after the freeze conflict') if 0;
+
+###############################################################################
 # 4. promotion
 ###############################################################################
 
@@ -369,13 +400,9 @@ $standby->safe_psql('postgres', 'VACUUM FULL tr');
 is($standby->safe_psql('postgres', fp('tr')), $new_tr, 'VACUUM FULL keeps tr');
 $standby->safe_psql('postgres', 'VACUUM FULL ct');
 is($standby->safe_psql('postgres', fp('ct')), $new_ct, 'VACUUM FULL keeps ct');
-# A rewrite leaves the catalog rows of the old file until the next
-# reconcile (design 5.5, V5); report what is there, then the next VACUUM of
-# a columnar table must clear it.
-my $orph = check_rows($standby);
-note "columnar_check right after VACUUM FULL: [$orph]";
-like($orph, qr/^(|orphan_catalog_rows - [0-9]+ stripe catalog rows belong to files no relation uses)$/,
-	'after VACUUM FULL nothing is reported but orphan catalog rows');
+# A rewrite removes the catalog rows of the file it replaced in its own
+# transaction (C4-06), so there is nothing to report right after it.
+is(check_rows($standby), '', 'after VACUUM FULL columnar_check reports nothing');
 $standby->safe_psql('postgres', 'VACUUM ct');
 is(check_rows($standby), '', 'columnar_check clean on the promoted node');
 log_is_clean($standby, 'promoted node');

@@ -148,12 +148,38 @@ kc_relation_vacuum(KC_VACUUM_PARAMS)
 
 /*
  * Merge the stripes of fewer than min_rows rows into full ones.  The rows
- * are read from the small stripes visible to a current snapshot, written
- * through the ordinary write buffer, and the old stripes' catalog rows are
- * deleted in the same transaction: readers see the old stripes or the new
- * ones, never both.  The pages of the old stripes stay allocated until the
- * tail is truncated or the table is rewritten.  Returns the number of stripes
- * written.
+ * are read from the small stripes, written through the ordinary write buffer,
+ * and the old stripes' catalog rows are deleted in the same transaction:
+ * readers see the old stripes or the new ones, never both.  The pages of the
+ * old stripes stay allocated until the tail is truncated or the table is
+ * rewritten.  Returns the number of stripes written.
+ *
+ * Invariant: no operation changes which rows a transaction's snapshot sees, for
+ * that transaction or any other.  The stripes this writes are the compacting
+ * transaction's own, and a transaction sees all of its own stripes, so the rows
+ * it copies are exactly the rows it sees afterwards: they must be the rows
+ * its snapshot sees now.
+ *
+ *	 - READ COMMITTED: every statement takes a new snapshot, so the rows seen
+ *	   now are the rows committed now, and the sources are the stripes that are
+ *	   committed (a fresh snapshot, the maintenance rule).  A command that is
+ *	   already running reads the stripes it replaced and not the copies (the
+ *	   copies carry the command id of the compaction).
+ *	 - REPEATABLE READ and SERIALIZABLE: the transaction keeps the snapshot of
+ *	   its first statement, and the copies would be read with it.  Only the
+ *	   stripes that snapshot sees are copied and deleted; a stripe committed
+ *	   after it is neither read nor touched, so it stays invisible to this
+ *	   transaction, as before, and stays for every other snapshot, which sees
+ *	   the sources until this transaction commits and the copies after.  A
+ *	   source that another transaction deleted since (it committed after the
+ *	   snapshot) cannot be deleted again: a serialization failure, as heap
+ *	   gives for a row updated concurrently.
+ *
+ * Other snapshots cannot tell the difference at any time: before this commits
+ * they see the sources and not the copies (the copies' creator is in progress
+ * or newer); after it they see the copies and not the sources.  The copies hold
+ * the rows of the sources and no others, because the sources are only the
+ * stripes the transaction's own snapshot sees.
  */
 int
 kc_compact(Relation rel, uint32 min_rows)
@@ -167,7 +193,8 @@ kc_compact(Relation rel, uint32 min_rows)
 	CommandId	cid = GetCurrentCommandId(true);
 
 	kc_meta_read(rel, &m);
-	scan = kc_scan_begin(rel, NULL, NULL, NULL, KC_SCAN_MAINTENANCE);
+	scan = kc_scan_begin(rel, IsolationUsesXactSnapshot() ? GetTransactionSnapshot() : NULL,
+						 NULL, NULL, KC_SCAN_MAINTENANCE);
 
 	/* keep the small stripes of other transactions, in the scan's list */
 	for (i = 0; i < scan->nstripes; i++)
@@ -195,6 +222,7 @@ kc_compact(Relation rel, uint32 min_rows)
 	 * dependency, and one that is made together with a real write by the same
 	 * transaction keeps that write's checks (kc_write.c).
 	 */
+	kc_write_maintenance_discard();
 	slot = table_slot_create(rel, NULL);
 	PG_TRY();
 	{
@@ -215,9 +243,17 @@ kc_compact(Relation rel, uint32 min_rows)
 	ExecDropSingleTupleTableSlot(slot);
 
 	for (i = 0; i < nsmall; i++)
-		(void) kc_catalog_delete_stripe(kc_rel_ident(rel)->uid,
-										scan->stripes[i].stripe_id);
+	{
+		/* a source another transaction replaced since: its rows are copied twice, so stop */
+		if (kc_catalog_delete_stripe(kc_rel_ident(rel)->uid,
+									 scan->stripes[i].stripe_id) == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("could not serialize access due to concurrent update"),
+					 errdetail("A stripe of \"%s\" was replaced by another transaction while it was being compacted.",
+							   RelationGetRelationName(rel))));
+	}
 	kc_scan_end(scan);
-	kc_write_flush_relation(rel);
+	kc_write_maintenance_flush(rel);
 	return (int) ((rows + m.stripe_rows - 1) / m.stripe_rows);
 }

@@ -63,15 +63,17 @@
  * Limits of a stripe, defined once.  The writer never writes a stripe of
  * more than KC_MAX_STRIPE_ROWS rows (kc_max_stripe_rows(), which a developer
  * setting can only lower), the option stripe_row_count cannot exceed it, and
- * columnar_check reports a stripe above it.  The reader accepts every stripe
- * the writer can have written and more: it refuses only a row count that the
- * catalog column cannot hold sanely, KC_STRIPE_ROWS_READ_LIMIT, so that a
- * stripe above the writer's limit (from a version that merged buffers
- * without a limit) can still be read, copied out and rewritten.
+ * columnar_check reports a stripe above it.  The reader accepts exactly what
+ * the writer can write, KC_STRIPE_ROWS_READ_LIMIT = KC_MAX_STRIPE_ROWS, and
+ * refuses a larger row count in a catalog row before it allocates anything
+ * from it.  A larger limit would only serve stripes that no released build can
+ * have written (0.1 is unreleased, and no build since the limit was introduced
+ * writes more); it would let a damaged catalog row ask the reader for memory
+ * the writer never needs.
  */
 #define KC_MIN_STRIPE_ROWS	1000
 #define KC_MAX_STRIPE_ROWS	10000000
-#define KC_STRIPE_ROWS_READ_LIMIT	PG_INT32_MAX
+#define KC_STRIPE_ROWS_READ_LIMIT	KC_MAX_STRIPE_ROWS
 StaticAssertDecl(KC_MAX_STRIPE_ROWS <= KC_STRIPE_ROWS_READ_LIMIT,
 				 "the reader must accept what the writer writes");
 #define KC_MIN_CHUNK_ROWS	100
@@ -80,6 +82,17 @@ StaticAssertDecl(KC_MAX_STRIPE_ROWS <= KC_STRIPE_ROWS_READ_LIMIT,
 #define KC_CHUNK_BYTE_LIMIT	(32 * 1024 * 1024)	/* raw bytes: closes a group */
 
 /* Block 0 of the main fork.  Payload of a standard page. */
+/*
+ * table_xid is the transaction that created the table, as opposed to created_xid,
+ * which is that of the file.  TRUNCATE and every rewrite give a table a new file
+ * and copy table_xid from the old one (or, for a table that was not columnar
+ * before, take the creation of the old table), so it follows the content
+ * through any chain of replacements.  A snapshot that cannot see it is older
+ * than the table: nothing existed for that snapshot to read, whatever files
+ * the table has had since, and the answer is an empty table, not an error
+ * (kc_check_snapshot_age).  It is an id in the file like created_xid, and
+ * VACUUM freezes it the same way.
+ */
 /*
  * The file replaced the content of a relation that existed (TRUNCATE).  A
  * file without this flag, created for the relation it belongs to, is the first
@@ -103,7 +116,8 @@ typedef struct KcMetaData
 	uint32		crc;			/* CRC-32C of this struct with crc zero */
 	uint32		flags;			/* KC_META_* */
 	uint32		created_relid;	/* relation the file was created for */
-	uint8		reserved[40];
+	uint32		table_xid;		/* transaction that created the table (see below); 0: unknown */
+	uint8		reserved[36];
 } KcMetaData;
 
 /* The special area of every page of a stripe: 24 bytes. */
@@ -296,7 +310,8 @@ extern void kc_rmgr_register(void);
 extern void kc_require_rmgr(void);
 extern bool kc_rmgr_registered;
 extern void kc_meta_init_storage(Relation rel, const RelFileLocator *rlocator,
-								 const KcOptions *opts, bool replaces_content);
+								 const KcOptions *opts, bool replaces_content,
+								 TransactionId table_xid);
 
 /* The identity of a relation's stored content, from the metapage (cached). */
 typedef struct KcIdent
@@ -305,6 +320,7 @@ typedef struct KcIdent
 	TransactionId created_xid;
 	uint32		flags;
 	Oid			created_relid;
+	TransactionId table_xid;
 	Oid			filenode;
 } KcIdent;
 
@@ -365,6 +381,9 @@ extern void kc_write_flush_relation(Relation rel);
 extern void kc_write_discard_relation(Oid relid, bool *had_outer);
 extern void kc_write_set_frozen(Relation rel, bool frozen);
 extern void kc_write_set_maintenance(bool on);
+extern void kc_write_request_reconcile(void);
+extern void kc_write_maintenance_flush(Relation rel);
+extern void kc_write_maintenance_discard(void);
 extern int	kc_write_pending_count(Oid relid);
 extern bool kc_write_pending_get(Oid relid, int ordinal, uint32 *serial);
 

@@ -307,6 +307,24 @@ kc_copy_bytea(Datum d)
 	return (bytea *) PG_DETOAST_DATUM_COPY(d);
 }
 
+/*
+ * The stripe catalog has the columns this build writes and reads, all of them.
+ * Version 0.1 is not released and its format changes in place, so a catalog
+ * made by an earlier build of it (it had one column fewer) is not read: it
+ * is an error that says so, and the extension must be created again in that
+ * database.  No supported database can have one.
+ */
+static void
+kc_catalog_check_shape(TupleDesc desc)
+{
+	if (desc->natts != Natts_kc_stripe)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("the stripe catalog has %d columns, this build uses %d",
+						desc->natts, Natts_kc_stripe),
+				 errhint("The catalog was made by an earlier build of version 0.1; drop and create the extension again.")));
+}
+
 static void
 kc_stripe_from_tuple(TupleDesc desc, HeapTuple tup, KcStripeInfo *si)
 {
@@ -314,12 +332,9 @@ kc_stripe_from_tuple(TupleDesc desc, HeapTuple tup, KcStripeInfo *si)
 	bool		n[Natts_kc_stripe];
 	int			i;
 
-	/* a catalog made before the last column existed has one column fewer */
-	memset(v, 0, sizeof(v));
-	memset(n, 0, sizeof(n));
-	n[Anum_kc_maintenance - 1] = true;
+	kc_catalog_check_shape(desc);
 	heap_deform_tuple(tup, desc, v, n);
-	for (i = 0; i < Natts_kc_stripe - 1; i++)
+	for (i = 0; i < Natts_kc_stripe; i++)
 		if (n[i])
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
@@ -340,8 +355,7 @@ kc_stripe_from_tuple(TupleDesc desc, HeapTuple tup, KcStripeInfo *si)
 	si->col_stats = kc_copy_bytea(v[Anum_kc_col_stats - 1]);
 	si->xmin = HeapTupleHeaderGetXmin(tup->t_data);
 	si->own = TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetXmin(tup->t_data));
-	si->maintenance = desc->natts >= Natts_kc_stripe && !n[Anum_kc_maintenance - 1] &&
-		DatumGetBool(v[Anum_kc_maintenance - 1]);
+	si->maintenance = DatumGetBool(v[Anum_kc_maintenance - 1]);
 	si->visible_rows = si->row_count;
 
 	/* the numbers must be self-consistent before anything is allocated */
@@ -368,8 +382,6 @@ kc_tuple_is_maintenance(TupleDesc desc, HeapTuple tup)
 	bool		isnull;
 	Datum		d;
 
-	if (desc->natts < Natts_kc_stripe)
-		return false;
 	d = heap_getattr(tup, Anum_kc_maintenance, desc, &isnull);
 	return !isnull && DatumGetBool(d);
 }
@@ -585,6 +597,7 @@ kc_catalog_insert(Relation rel, const KcStripeInfo *si, const char *cid_points,
 	bytea	   *cs;
 	HeapTuple	tup;
 
+	kc_catalog_check_shape(RelationGetDescr(cat));
 	cp = palloc(VARHDRSZ + cid_len);
 	SET_VARSIZE(cp, VARHDRSZ + cid_len);
 	memcpy(VARDATA(cp), cid_points, cid_len);

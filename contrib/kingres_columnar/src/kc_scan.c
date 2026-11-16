@@ -100,14 +100,18 @@ kc_scan_begin(Relation rel, Snapshot snapshot, const bool *needed,
 	Snapshot	cs;
 	int			i;
 	int			nvisible;
+	bool		maintenance = false;
 
 	/*
-	 * Maintenance (compaction) reads what is committed, with the rule that its
-	 * own deletions are past, and takes part in no serializable bookkeeping.
+	 * Maintenance (compaction) takes part in no serializable bookkeeping: no
+	 * predicate lock, no dependency, because it changes nothing logically.  It
+	 * reads with the snapshot it is given, or, with none, what is committed
+	 * (kc_compact says which, and why).  Its own earlier deletions are past, and
+	 * the stripes it wrote itself are read in full.
 	 */
 	if (flags & KC_SCAN_MAINTENANCE)
 	{
-		snapshot = NULL;
+		maintenance = true;
 		flags &= ~KC_SCAN_MAINTENANCE;
 	}
 
@@ -142,13 +146,14 @@ kc_scan_begin(Relation rel, Snapshot snapshot, const bool *needed,
 			(needed == NULL || needed[i]);
 
 	kc_check_snapshot_age(rel, snapshot);
-	if (snapshot != NULL)
+	if (snapshot != NULL && !maintenance)
 		PredicateLockRelation(rel, snapshot);
 	cs = kc_catalog_snapshot(snapshot, &mvcc);
-	kc_catalog_snapshot_report_conflicts(cs, mvcc);
+	if (!maintenance)
+		kc_catalog_snapshot_report_conflicts(cs, mvcc);
 	scan->cat_snap = cs;
-	scan->all_own_rows = !mvcc;
-	scan->curcid = mvcc ? snapshot->curcid : InvalidCommandId;
+	scan->all_own_rows = !mvcc || maintenance;
+	scan->curcid = (mvcc && !maintenance) ? snapshot->curcid : InvalidCommandId;
 
 	scan->stripes = kc_catalog_load(rel, cs, &scan->nstripes);
 	nvisible = 0;

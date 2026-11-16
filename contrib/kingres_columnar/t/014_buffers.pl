@@ -203,8 +203,10 @@ SELECT 'BEFORE=' || count(*) FROM kingres.columnar_stripes('pn');
 INSERT INTO pn VALUES (1);
 SELECT 'MID=' || count(*) || '|' || max(row_count) FROM kingres.columnar_stripes('pn');
 COMMIT;");
-	like($out, qr/BEFORE=0\b/, 'the merged rows are still buffered (nothing flushed by the merge)');
-	like($out, qr/MID=15\|1000\b/, 'the next write cuts them into full stripes of 1000 rows and keeps the tail');
+	# the commit of each subtransaction writes the full stripes of its parent's
+	# buffer (C4-03): they exist before the parent writes again, the tail stays
+	like($out, qr/BEFORE=15\b/, 'the commits of the subtransactions wrote the full stripes of the merged buffer');
+	like($out, qr/MID=15\|1000\b/, 'a later write of the parent adds none and keeps the tail');
 	is(stripe_summary('pn'), '16|1000|15002', 'at commit: 16 stripes, none over 1000 rows, no row lost');
 	is($node->safe_psql('postgres', 'SELECT count(*), sum(a) FROM pn'), '15002|3757501',
 		'every row reads back');
