@@ -88,7 +88,7 @@ string in `dist/`).
 
 `npm run e2e` is one command. It needs Windows with WSL2 (distribution `Ubuntu-24.04`, user `kingres`), Go, Chrome or Edge, and
 an installed KingresDB with the current extensions inside WSL (`~/kw-cp/install` when it has `kingres_ledger` 0.2, else
-`~/kingres-work/install`; `E2E_PG_INSTALL` names another). It:
+`~/kingres-work/install`; `E2E_PG_INSTALL` names another, for example a PostgreSQL 19 installation, and the same run then proves the console on that major). It:
 
 1. builds the production panel (`vite build`), then `kingresd` for Linux from `kingres/control-plane` (or uses `KINGRESD_BIN`) with
    the panel embedded: a Go build overlay puts `dist/` in place of the placeholder in `internal/webui/dist` for this build only,

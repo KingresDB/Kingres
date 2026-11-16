@@ -76,6 +76,8 @@ tests += {
       't/011_memory.pl',
       't/012_publications_toast.pl',
       't/013_xid_wraparound.pl',
+      't/014_buffers.pl',
+      't/015_creation_compaction.pl',
     ],
   },
 }

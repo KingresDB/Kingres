@@ -56,8 +56,8 @@ transactions and use `kingres.columnar_compact` afterwards.
 | `kingres.columnar_options(rel)` | The options in force. |
 | `kingres.columnar_info(rel)` | Stripes, chunk groups, rows, bytes on disk, uncompressed bytes, ratio. |
 | `kingres.columnar_stripes(rel)` | One row per visible stripe. |
-| `kingres.columnar_compact(rel, min_rows)` | Merge stripes with fewer than `min_rows` rows (default a quarter of the stripe size); returns the number of stripes written. Owner only. |
-| `kingres.columnar_check(fix)` | Superuser. Reports catalog rows of files nobody uses, stripes beyond the end of the file, stripes whose first page is not theirs, and relations that cannot be read (`unreadable`). `fix` deletes the first two kinds. |
+| `kingres.columnar_compact(rel, min_rows)` | Merge stripes with fewer than `min_rows` rows (default a quarter of the stripe size); returns the number of stripes written. Owner only. It changes nothing logically, so under SERIALIZABLE it creates no dependency (see "Isolation"). |
+| `kingres.columnar_check(fix)` | Superuser. Reports catalog rows of files nobody uses, stripes beyond the end of the file, stripes whose first page is not theirs, stripes with more rows than a stripe may have (`stripe_over_row_limit`: readable, see "Limits"), and relations that cannot be read (`unreadable`). `fix` deletes the first two kinds. |
 | `kingres.columnar_reconcile()` | Superuser. Deletes catalog rows of files no relation uses. |
 
 `SELECT` privilege on the table is needed for `columnar_options`, `columnar_info` and `columnar_stripes`.
@@ -71,6 +71,7 @@ transactions and use `kingres.columnar_compact` afterwards.
 | `kingres_columnar.stripe_row_count` | 150000 | Rows of a full stripe (1000 to 10000000). |
 | `kingres_columnar.chunk_row_count` | 10000 | Rows of a chunk group (100 to 100000). A group also ends when its raw size reaches 32 MB. |
 | `kingres_columnar.write_buffer_memory` | 128MB | Memory for stripes being built, per backend. A soft limit: buffers of an outer subtransaction cannot be flushed early. |
+| `kingres_columnar.max_stripe_rows` | 10000000 | Developer setting, superuser only: lowers the most rows the writer puts in one stripe (and the size above which `columnar_check` reports a stripe), so the limit can be tested with a few thousand rows. It cannot raise the compiled limit and does not touch the reader, so no value can make a table unreadable. |
 | `kingres_columnar.enable_custom_scan` | on | Use the Columnar Scan (projection, skipping). |
 | `kingres_columnar.enable_chunk_skipping` | on | Use minimum and maximum to skip. |
 
@@ -98,8 +99,10 @@ enums, domains and text under a non-`C` collation have none.
 
 One main fork, no other fork.
 
-* Block 0, the metapage: magic, format version (1), options, the next row
-  number and the next stripe id. Changed in place and logged as a whole page.
+* Block 0, the metapage: magic, format version, options, the next row
+  number and the next stripe id, the identity, the creating transaction, the
+  relation the file was created for and a flags word (`REPLACES_CONTENT`: the
+  file replaced the content of an existing table, TRUNCATE). Changed in place and logged as a whole page.
 * Every other block belongs to a stripe: a run of consecutive blocks written
   once, never changed, each with a 24-byte special area (magic, page number,
   page count, writer transaction, stripe id). The payload of the pages, 8144
@@ -117,7 +120,9 @@ One main fork, no other fork.
   the identity of the stored content (a random id and the creating transaction, in
   the metapage, protected by its own checksum): stripe id, first row, counts, first block,
   block count, sizes, the command-id change points of the writer (`cid_points`)
-  and the stripe-level statistics (`col_stats`). A stripe is visible exactly
+  the stripe-level statistics (`col_stats`) and a `maintenance` flag (the stripe
+  was written by `columnar_compact`: it copies rows readers see in the stripes
+  it replaces). A stripe is visible exactly
   when its catalog row is, so rollback, crash recovery, standbys, backup and
   `VACUUM FULL` follow from PostgreSQL's own rules. A byte-for-byte copy of the file (`SET TABLESPACE`, a base backup) keeps
   its identity and so its stripes, with nothing to update; a rewrite or
@@ -132,6 +137,15 @@ One main fork, no other fork.
   some stripe is newer than a snapshot that is still open, or something is in
   progress or recently deleted (`columnar_compact`), the old snapshot would
   have to see a different set of stripes and gets the error instead (below).
+  A snapshot older than the *creation* of a table is a different case: the
+  table's first file (created for that very relation, not by `TRUNCATE`)
+  replaced nothing, every stripe in it is newer than the snapshot, and the
+  snapshot is handed an empty table exactly as heap does (a new partition,
+  `CREATE TABLE AS`, `ATTACH PARTITION` of a table created after the
+  snapshot, a table dropped and created again under the same name). The rule:
+  the error is raised only for a file that replaced older content, that is a
+  file with `REPLACES_CONTENT`, or created for another relation than the one
+  it now belongs to (the temporary relation of a rewrite).
   `TRUNCATE`, `SET ACCESS METHOD` and `ALTER TABLE` that rewrite the rows
   (`ALTER COLUMN TYPE`, `ADD COLUMN` with a volatile default) change what the
   table contains: a snapshot older than the commit does not get an empty table
@@ -139,7 +153,11 @@ One main fork, no other fork.
   rewrite. `CLUSTER` is refused (a columnar table has no index).
 * Transaction ids: a columnar file holds exactly one, in its metapage: that of
   the transaction that created it (`kingres.columnar_creating_xid(rel)`, 2 once
-  frozen). VACUUM freezes it once every snapshot can see it (it precedes the
+  frozen); for a table created in a subtransaction this is the subtransaction's
+  id, which is right for every use made of it (comparison with a snapshot and
+  with the oldest running transaction, `relfrozenxid`, the horizon of the
+  freeze record: plain id comparisons that PostgreSQL makes with subtransaction
+  ids itself). VACUUM freezes it once every snapshot can see it (it precedes the
   oldest transaction still running; the change is WAL-logged and cancels
   hot-standby queries that might hold it) and reports the oldest id that is
   left as the table's `relfrozenxid`. The pages of a stripe hold no
@@ -241,6 +259,26 @@ snapshot isolation as a heap table does, at the granularity of the relation:
 * a scan that skips a stripe because its writer had not committed before the
   snapshot reports the dependency reader-before-writer
   (`CheckForSerializableConflictOut`), as a heap scan does for a tuple it skips.
+  The id in a stripe row is that of the subtransaction that flushed the stripe
+  (a savepoint, an exception block, a flush by size or memory inside one), and
+  the serializable machinery knows top-level transactions only, so the id is
+  mapped to its top-level transaction (`SubTransGetTopmostTransaction`) first;
+  nothing is reported when the id is older than the backend's oldest snapshot
+  xmin (as in heap, which also avoids a `pg_subtrans` lookup for an id whose
+  entry may be gone), when it is the reader's own transaction, or when the
+  writing subtransaction aborted (heap sees such a tuple as dead);
+* `columnar_compact` copies rows that readers see already. Its copies take no
+  conflict-in check, its scan takes no predicate lock, and the stripes it
+  writes carry the `maintenance` flag so that a reader whose snapshot cannot
+  see them reports no dependency on the compacting transaction; heap's
+  `VACUUM FULL` and `CLUSTER` do the same (they only move predicate locks to
+  the relation). A buffer that also holds a row written for another reason
+  keeps all its checks, so a real write of the same transaction is never
+  hidden;
+* `columnar_info`, `columnar_stripes` and the other inspection functions read
+  the stripe catalog and take no part in serializable isolation (no dependency
+  is created or reported, no predicate lock is taken): a decision based on
+  their result has no write-skew protection, as for any catalog query.
 
 The set of transactions that commit is therefore one that heap also allows
 (`t/009_serializable.pl` compares both, with write skew in both orders, the
@@ -278,7 +316,24 @@ Memory and costs worth knowing:
 * Rows of a transaction are buffered until the stripe is full, the buffers
   exceed `kingres_columnar.write_buffer_memory` or the transaction ends; rows
   of an outer subtransaction cannot be flushed from an inner one, so the
-  limit is soft there. A committed subtransaction hands its rows to its parent
+  limit is soft there. The rows of committed subtransactions are merged into
+  their parent's buffer, which can then hold more than a stripe; whatever
+  flush comes next cuts it into stripes of at most the table's stripe size (and
+  never above 10000000 rows, `KC_MAX_STRIPE_ROWS`, the one definition the
+  writer, the option and `columnar_check` share), keeping a short tail
+  buffered when more rows are coming. The reader accepts every stripe the
+  writer can write and larger ones too (up to the 2^31-1 rows the catalog
+  column holds), so a table written by an earlier build that merged without a
+  limit (the reader then refused a stripe over 40 million rows) is read
+  normally; `columnar_check` reports such a stripe as `stripe_over_row_limit`,
+  and `VACUUM FULL` or `ALTER TABLE ... SET ACCESS METHOD` (to heap and back)
+  writes it again within the limit. The merge is exception safe: the slots are
+  reserved first, rows are copied past the parent's count, and the count is
+  raised last. A scan holds the buffers it reads still; one abandoned by an
+  error is never ended, so its hold is remembered in the resource owner that
+  was current when it began (a portal's, or the (sub)transaction's) and
+  released when the error is cleaned up: no error leaves a table unable to
+  flush by size. A committed subtransaction hands its rows to its parent
   and frees its buffer: the memory of a transaction with any number of
   subtransactions (with or without an open cursor) is what its pending rows
   need.
@@ -308,7 +363,7 @@ make USE_PGXS=1 installcheck       # needs a server with the library preloaded
 
 or `kingres/dev/ext.sh kingres_columnar` and `kingres/dev/ext-majors.sh
 kingres_columnar` for PostgreSQL 18 and 19. The tests: eleven `pg_regress` files
-(`sql/`, `expected/`) and thirteen TAP files in `t/`: crash recovery,
+(`sql/`, `expected/`) and fifteen TAP files in `t/`: crash recovery,
 standby and `pg_rewind`, backup/restore/dump, concurrent writers, corruption,
 a randomised comparison against heap (`KC_COMPARE_SEED`, `KC_COMPARE_STEPS`), older snapshots, array validation, serializable isolation against heap twins, the visibility rules and `VACUUM FULL`, memory with many subtransactions, publications and wide rows, and two laps of the transaction id space (`xid_wraparound` module; `KC_SKIP_WRAPAROUND=1` skips).
 `perf/perf.sh` measures size and scan time against heap.

@@ -24,6 +24,7 @@
 #include "fmgr.h"
 #include "storage/bufmgr.h"
 #include "utils/relcache.h"
+#include "utils/resowner.h"
 #include "utils/snapshot.h"
 #include "access/tupdesc.h"
 
@@ -58,15 +59,35 @@
 #define KC_STRIPE_MAGIC		0x4B435331	/* "KCS1" */
 #define KC_STRIPE_VERSION	2
 
-/* Limits that the readers enforce and the writers respect. */
+/*
+ * Limits of a stripe, defined once.  The writer never writes a stripe of
+ * more than KC_MAX_STRIPE_ROWS rows (kc_max_stripe_rows(), which a developer
+ * setting can only lower), the option stripe_row_count cannot exceed it, and
+ * columnar_check reports a stripe above it.  The reader accepts every stripe
+ * the writer can have written and more: it refuses only a row count that the
+ * catalog column cannot hold sanely, KC_STRIPE_ROWS_READ_LIMIT, so that a
+ * stripe above the writer's limit (from a version that merged buffers
+ * without a limit) can still be read, copied out and rewritten.
+ */
 #define KC_MIN_STRIPE_ROWS	1000
 #define KC_MAX_STRIPE_ROWS	10000000
+#define KC_STRIPE_ROWS_READ_LIMIT	PG_INT32_MAX
+StaticAssertDecl(KC_MAX_STRIPE_ROWS <= KC_STRIPE_ROWS_READ_LIMIT,
+				 "the reader must accept what the writer writes");
 #define KC_MIN_CHUNK_ROWS	100
 #define KC_MAX_CHUNK_ROWS	100000
 #define KC_MAX_MINMAX_BYTES	64
 #define KC_CHUNK_BYTE_LIMIT	(32 * 1024 * 1024)	/* raw bytes: closes a group */
 
 /* Block 0 of the main fork.  Payload of a standard page. */
+/*
+ * The file replaced the content of a relation that existed (TRUNCATE).  A
+ * file without this flag, created for the relation it belongs to, is the first
+ * file of that relation: nothing older exists that a snapshot taken before the
+ * file was created could be meant to see (kc_check_snapshot_age).
+ */
+#define KC_META_REPLACES_CONTENT	0x01
+
 typedef struct KcMetaData
 {
 	uint32		magic;
@@ -80,7 +101,9 @@ typedef struct KcMetaData
 	uint64		rel_uid;		/* identity of the stored content, copied with the file */
 	uint32		created_xid;	/* transaction that created this file */
 	uint32		crc;			/* CRC-32C of this struct with crc zero */
-	uint8		reserved[48];
+	uint32		flags;			/* KC_META_* */
+	uint32		created_relid;	/* relation the file was created for */
+	uint8		reserved[40];
 } KcMetaData;
 
 /* The special area of every page of a stripe: 24 bytes. */
@@ -205,6 +228,7 @@ typedef struct KcStripeInfo
 	bytea	   *col_stats;
 	TransactionId xmin;			/* of the catalog row */
 	bool		own;			/* written by the running transaction */
+	bool		maintenance;	/* a copy of rows readers see already (compaction) */
 	uint32		visible_rows;	/* rows of the stripe the snapshot may see */
 } KcStripeInfo;
 
@@ -238,6 +262,8 @@ extern int	kc_guc_compression_level;
 extern int	kc_guc_stripe_rows;
 extern int	kc_guc_chunk_rows;
 extern int	kc_guc_write_buffer_kb;
+extern int	kc_guc_max_stripe_rows;
+extern int	kc_max_stripe_rows(void);
 extern bool kc_guc_enable_custom_scan;
 extern bool kc_guc_enable_chunk_skipping;
 
@@ -270,13 +296,15 @@ extern void kc_rmgr_register(void);
 extern void kc_require_rmgr(void);
 extern bool kc_rmgr_registered;
 extern void kc_meta_init_storage(Relation rel, const RelFileLocator *rlocator,
-								 const KcOptions *opts);
+								 const KcOptions *opts, bool replaces_content);
 
 /* The identity of a relation's stored content, from the metapage (cached). */
 typedef struct KcIdent
 {
 	uint64		uid;
 	TransactionId created_xid;
+	uint32		flags;
+	Oid			created_relid;
 	Oid			filenode;
 } KcIdent;
 
@@ -306,10 +334,12 @@ extern Oid	kc_catalog_index_oid(void);
 extern Oid	kc_am_oid(void);
 extern bool kc_rel_is_columnar(Relation rel);
 extern Snapshot kc_catalog_snapshot(Snapshot snap, bool *is_mvcc);
+extern void kc_catalog_snapshot_report_conflicts(Snapshot snap, bool is_mvcc);
 extern KcStripeInfo *kc_catalog_load(Relation rel, Snapshot snap, int *nstripes);
 extern void kc_catalog_insert(Relation rel, const KcStripeInfo *si,
 							  const char *cid_points, int cid_len,
-							  const char *col_stats, int stats_len, bool frozen);
+							  const char *col_stats, int stats_len, bool frozen,
+							  bool maintenance);
 extern void kc_catalog_delete_uid(uint64 uid);
 extern int	kc_catalog_delete_stripe(uint64 uid, uint64 stripe_id);
 extern bool kc_catalog_uid_in_use(uint64 uid);
@@ -333,8 +363,8 @@ extern void kc_write_row_values(Relation rel, Datum *vals, bool *nulls,
 								CommandId cid);
 extern void kc_write_flush_relation(Relation rel);
 extern void kc_write_discard_relation(Oid relid, bool *had_outer);
-extern void kc_write_pin_relation(Oid relid, int delta);
 extern void kc_write_set_frozen(Relation rel, bool frozen);
+extern void kc_write_set_maintenance(bool on);
 extern int	kc_write_pending_count(Oid relid);
 extern bool kc_write_pending_get(Oid relid, int ordinal, uint32 *serial);
 
@@ -344,8 +374,9 @@ typedef struct KcPendingRef
 	uint32		nrows;			/* rows present when the scan started */
 } KcPendingRef;
 
-extern KcPendingRef *kc_write_pending_refs(Oid relid, uint64 uid, int *n);
-extern void kc_write_pending_release(Oid relid, const KcPendingRef *refs, int n);
+extern uint64 kc_write_hold_acquire(Oid relid, uint64 uid, KcPendingRef **refs,
+									int *n);
+extern void kc_write_hold_release(uint64 hold);
 extern bool kc_write_pending_fetch(Oid relid, const KcPendingRef *ref,
 								   uint32 rowno, Datum **vals, bool **nulls,
 								   int *ncols, CommandId *cid);
@@ -406,7 +437,8 @@ typedef struct KcScan
 	int			npend;
 	int			pend_idx;
 	uint32		pend_row;
-	bool		pinned;
+	uint64		hold;			/* hold on the write buffers (0: none) */
+	ResourceOwner owner;	/* the resource owner that releases it on an error */
 
 	/* position for backward steps */
 	int64		ordinal;		/* rows returned, the next row's index */
@@ -433,6 +465,7 @@ extern KcScan *kc_scan_begin(Relation rel, Snapshot snapshot,
 extern bool kc_scan_next(KcScan *scan, TupleTableSlot *slot);
 extern void kc_scan_rescan(KcScan *scan);
 extern void kc_scan_end(KcScan *scan);
+extern void kc_scan_drop_hold(KcScan *scan);
 extern uint64 kc_scan_stripe_for_block(KcScan *scan, BlockNumber blk,
 									   int *idx);
 extern bool kc_scan_analyze_block(KcScan *scan, Buffer buf);

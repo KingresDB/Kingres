@@ -221,7 +221,8 @@ kc_meta_seal(KcMetaData *m)
 
 static void
 kc_meta_format(Page page, const KcOptions *opts, uint64 next_row,
-			   uint64 next_stripe, uint64 uid, TransactionId xid)
+			   uint64 next_stripe, uint64 uid, TransactionId xid,
+			   uint32 flags, Oid relid)
 {
 	KcMetaData *m;
 
@@ -238,6 +239,8 @@ kc_meta_format(Page page, const KcOptions *opts, uint64 next_row,
 	m->next_stripe_id = next_stripe;
 	m->rel_uid = uid;
 	m->created_xid = xid;
+	m->flags = flags;
+	m->created_relid = relid;
 	kc_meta_seal(m);
 	/* a standard page: the log can drop the unused middle of it */
 	((PageHeader) page)->pd_lower =
@@ -251,7 +254,7 @@ kc_meta_format(Page page, const KcOptions *opts, uint64 next_row,
  */
 void
 kc_meta_init_storage(Relation rel, const RelFileLocator *rlocator,
-					 const KcOptions *opts)
+					 const KcOptions *opts, bool replaces_content)
 {
 	SMgrRelation srel = smgropen(*rlocator, INVALID_PROC_NUMBER);
 	BulkWriteState *bulk;
@@ -277,7 +280,9 @@ kc_meta_init_storage(Relation rel, const RelFileLocator *rlocator,
 		if (tries >= 16)
 			elog(ERROR, "could not find an unused identity for a columnar file");
 	}
-	kc_meta_format((Page) buf, opts, 0, 1, uid, GetCurrentTransactionId());
+	kc_meta_format((Page) buf, opts, 0, 1, uid, GetCurrentTransactionId(),
+			   replaces_content ? KC_META_REPLACES_CONTENT : 0,
+			   RelationGetRelid(rel));
 	smgr_bulk_write(bulk, 0, buf, true);
 	smgr_bulk_finish(bulk);
 	smgrclose(srel);
@@ -712,6 +717,8 @@ kc_rel_ident(Relation rel)
 		id = MemoryContextAlloc(CacheMemoryContext, sizeof(KcIdent));
 		id->uid = m.rel_uid;
 		id->created_xid = m.created_xid;
+		id->flags = m.flags;
+		id->created_relid = m.created_relid;
 		id->filenode = rel->rd_locator.relNumber;
 		rel->rd_amcache = id;
 	}
@@ -723,7 +730,9 @@ kc_rel_ident(Relation rel)
  * cannot see the table's stripes (their catalog rows are newer than it).
  * Heap hands such a snapshot an empty table for TRUNCATE and the rewriting
  * forms of ALTER TABLE; here every such command fails the reader with a
- * serialization failure rather than return nothing.  A transaction id older
+ * serialization failure rather than return nothing.  A file that is the
+ * first of its table (see below) replaced nothing, and the snapshot reads it
+ * as empty, which is the right answer.  A transaction id older
  * than a billion transactions cannot be in any live snapshot, and its
  * comparison would wrap, so it is ignored.
  */
@@ -738,6 +747,20 @@ kc_check_snapshot_age(Relation rel, Snapshot snap)
 	id = kc_rel_ident(rel);
 	if (!TransactionIdIsNormal(id->created_xid) ||
 		TransactionIdIsCurrentTransactionId(id->created_xid))
+		return;
+
+	/*
+	 * The first file of the relation (created for it, and not by TRUNCATE):
+	 * no content existed before it, so a snapshot older than the file is
+	 * meant to see an empty table, and the stripe catalog shows it exactly
+	 * that, every stripe being newer than the snapshot.  That is what heap
+	 * answers for a table created after the snapshot (a new partition, CREATE
+	 * TABLE AS, a table dropped and created again under the same name).  A
+	 * file that came from a rewrite was created for the temporary relation of
+	 * the rewrite, not for this one, so it is not first.
+	 */
+	if (!(id->flags & KC_META_REPLACES_CONTENT) &&
+		id->created_relid == RelationGetRelid(rel))
 		return;
 	next = ReadNextTransactionId();
 	if ((uint32) (next - id->created_xid) > (uint32) (1U << 30))

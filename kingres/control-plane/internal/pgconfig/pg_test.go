@@ -124,13 +124,34 @@ func TestRefusedSetMatchesVersion(t *testing.T) {
 	for _, n := range h {
 		have[strings.ToLower(n)] = true
 	}
-	// The hand-reviewed list of PostgreSQL 18 (guc_tables.c, GUC_SUPERUSER_ONLY) and of the extensions.
+	// The hand-reviewed list of PostgreSQL 18 (guc_tables.c, GUC_SUPERUSER_ONLY) and of the extensions;
+	// since19 holds what PostgreSQL 19 added (SNI: ssl_sni and hosts_file), reviewed on that major only.
 	reviewed := []string{
 		"config_file", "data_directory", "dynamic_library_path", "external_pid_file", "extension_control_path", "hba_file", "ident_file",
 		"jit_provider", "krb_server_keyfile", "log_directory", "log_filename", "oauth_validator_libraries", "output_plugin_libraries",
 		"primary_conninfo", "session_preload_libraries", "shared_preload_libraries", "ssl_ciphers", "ssl_dh_params_file", "ssl_groups",
 		"ssl_max_protocol_version", "ssl_min_protocol_version", "ssl_passphrase_command", "ssl_tls13_ciphers", "unix_socket_directories",
 		"kingres_shard.node_conninfo", "kingres_shard.fault_injection",
+	}
+	since19 := []string{"ssl_sni", "hosts_file"}
+	if pgtest.Major(t, c) >= 19 {
+		reviewed = append(reviewed, since19...)
+		for _, n := range since19 {
+			if !have[n] {
+				t.Errorf("%s must be hidden by PostgreSQL 19", n)
+			}
+			if s, ok := byName(set, n); ok {
+				if cl := Classify(s, have[n]); cl.Kind != KindRefused || cl.Reason.Code == instance.ReasonSuperuserOnly {
+					t.Errorf("%s must be refused with its own reason, not the generic one: %+v", n, cl)
+				}
+			}
+		}
+	} else {
+		for _, n := range since19 {
+			if _, ok := byName(set, n); ok {
+				t.Errorf("%s exists on this major but was added in 19", n)
+			}
+		}
 	}
 	known := map[string]bool{}
 	for _, n := range reviewed {

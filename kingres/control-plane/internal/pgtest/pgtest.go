@@ -244,3 +244,18 @@ func ReleasePorts(ports ...int) {
 		delete(usedPorts, p)
 	}
 }
+
+// Major returns the PostgreSQL major of the instance c is connected to (18 or 19), from the
+// server's own server_version_num, so that a test asserts the behaviour of the major it runs on.
+func Major(t testing.TB, c *pgx.Conn) int {
+	t.Helper()
+	var s string
+	if err := c.QueryRow(context.Background(), "SHOW server_version_num").Scan(&s); err != nil {
+		t.Fatalf("server_version_num: %v", err)
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		t.Fatalf("server_version_num %q: %v", s, err)
+	}
+	return instance.MajorOfVersionNum(n)
+}

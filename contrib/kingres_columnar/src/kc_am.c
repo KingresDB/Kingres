@@ -428,7 +428,6 @@ kc_relation_set_new_filelocator(Relation rel, const RelFileLocator *newrlocator,
 
 		kc_catalog_delete_uid(kc_rel_ident(rel)->uid);
 	}
-	(void) truncating;
 
 	/*
 	 * The new file holds one transaction id, in its metapage: that of the
@@ -441,7 +440,7 @@ kc_relation_set_new_filelocator(Relation rel, const RelFileLocator *newrlocator,
 
 	srel = RelationCreateStorage(*newrlocator, persistence, true);
 	smgrclose(srel);
-	kc_meta_init_storage(rel, newrlocator, &opts);
+	kc_meta_init_storage(rel, newrlocator, &opts, truncating);
 }
 
 static void

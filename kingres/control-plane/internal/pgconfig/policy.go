@@ -112,6 +112,8 @@ var refusedReason = map[string]instance.Reason{
 	"ssl_library":               {Code: instance.ReasonLoadsCode, Text: "it names the TLS library of the server."},
 	"krb_server_keyfile":        {Code: instance.ReasonNamesFile, Text: "it names a key file; set it on the server."},
 	"ssl_dh_params_file":        {Code: instance.ReasonNamesFile, Text: "it names a file; set it on the server."},
+	"hosts_file":                {Code: instance.ReasonNamesFile, Text: "it names the file of host-based TLS settings (PostgreSQL 19); set it on the server."},
+	"ssl_sni":                   {Code: instance.ReasonTLS, Text: "it changes how the cluster's own connections negotiate TLS (PostgreSQL 19); set it on the server."},
 	"ssl_ciphers":               {Code: instance.ReasonTLS, Text: "it changes how the cluster's own connections negotiate TLS; set it on the server."},
 	"ssl_groups":                {Code: instance.ReasonTLS, Text: "it changes how the cluster's own connections negotiate TLS; set it on the server."},
 	"ssl_max_protocol_version":  {Code: instance.ReasonTLS, Text: "it changes how the cluster's own connections negotiate TLS; set it on the server."},

@@ -24,6 +24,7 @@ CREATE TABLE columnar_stripe (
     footer_offset bigint   NOT NULL,
     cid_points    bytea    NOT NULL,
     col_stats     bytea    NOT NULL,
+    maintenance   boolean  NOT NULL DEFAULT false,
     CONSTRAINT columnar_stripe_pkey PRIMARY KEY (rel_uid, stripe_id)
 );
 REVOKE ALL ON TABLE columnar_stripe FROM PUBLIC;
