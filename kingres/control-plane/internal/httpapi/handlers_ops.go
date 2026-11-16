@@ -290,6 +290,10 @@ func (s *Server) taskProblem(r *http.Request, err error) error {
 	switch {
 	case errors.Is(err, task.ErrSubjectBusy):
 		return problem.New(problem.OperationInProgress, "Another operation on this object is still running.")
+	case errors.As(err, new(*task.ExcludedError)):
+		var x *task.ExcludedError
+		errors.As(err, &x)
+		return x.Problem()
 	case errors.Is(err, task.ErrNotFound):
 		return problem.New(problem.NotFound, "No such task.")
 	case errors.Is(err, task.ErrNotCancellable):

@@ -235,6 +235,11 @@ type ServerPlacement struct {
 // when the catalog refuses, the assignment is rolled back.
 func (o *Ops) UpdateServer(ctx context.Context, serverID string, cur ServerPlacement, req api.ServerUpdateRequest) error {
 	return wrap(o.asService(ctx, sysdb.Database, func(tx pgx.Tx) error {
+		// The check "no rebalance is running" and the change that follows are one step: a rebalance cannot be
+		// created (migration 0009 takes the same lock) between the two.
+		if _, err := tx.Exec(ctx, `SELECT kingres_cp.lock_operations()`); err != nil {
+			return err
+		}
 		var group *string
 		var status string
 		err := tx.QueryRow(ctx, `SELECT server_group, status FROM kingres_cp.server WHERE server_id = $1 FOR UPDATE`, serverID).Scan(&group, &status)

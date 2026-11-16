@@ -86,6 +86,48 @@ describe('stop in the middle, start again', () => {
     expect(within(placement).getByText('10.0.0.14')).toBeInTheDocument()
   })
 
+  it('a stopped run can be ended for good: it is recorded as cancelled, not failed', async () => {
+    const user = userEvent.setup()
+    await renderApp('/rebalance')
+    await addServer()
+    mockConfig.taskDurationMs = 3000
+    await user.click(await screen.findByRole('button', { name: /start rebalance/i }))
+    await screen.findByRole('table', { name: /moves in flight/i })
+    const id = getState().rebalance.taskId
+    await user.click(await screen.findByRole('button', { name: /stop rebalance/i }))
+    const stop = await screen.findByRole('dialog', { name: /stop the rebalance/i })
+    await user.click(within(stop).getByRole('button', { name: /^stop rebalance$/i }))
+    await screen.findByTestId('stopped-note', {}, { timeout: 5000 })
+
+    // The task of a stopped run says that it can be cancelled.
+    expect((await endpoints.getTask(id!)).cancellable).toBe(true)
+    await user.click(await screen.findByTestId('end-run'))
+    const dialog = await screen.findByRole('dialog', { name: /end this run for good/i })
+    await user.click(within(dialog).getByRole('button', { name: /^end this run$/i }))
+    await waitFor(() => expect(getState().rebalance.state).toBe('idle'))
+    const report = getState().rebalance.reports[0]!
+    expect(report.id).toBe(id)
+    expect(report.outcome).toBe('cancelled')
+    expect(report.stoppedBy).toBe('operator')
+    expect((await endpoints.getTask(id!)).error?.code).toBe('cancelled')
+  })
+
+  it('the report dialog survives an outcome it does not know and a bucket that moved twice', async () => {
+    const user = userEvent.setup()
+    await renderApp('/rebalance')
+    await addServer()
+    mockConfig.taskDurationMs = 1500
+    await user.click(await screen.findByRole('button', { name: /start rebalance/i }))
+    await waitFor(() => expect(getState().rebalance.state).toBe('idle'), { timeout: 8000 })
+    const report = getState().rebalance.reports[0]!
+    const first = report.moves[0]!
+    // The same bucket twice in one run, and an outcome a newer server may send.
+    report.moves.push({ ...first }, { ...first, outcome: 'weird' as never })
+    await user.click(await screen.findByRole('button', { name: `#${report.id}` }))
+    const moves = await screen.findByTestId('report-moves')
+    expect(within(moves).getByText('weird')).toBeInTheDocument()
+  })
+
   it('a stop is refused with its code when nothing runs', async () => {
     await renderApp('/rebalance')
     await expect(endpoints.stopRebalance()).rejects.toMatchObject({ code: 'rebalance_not_running' })

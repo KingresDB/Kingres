@@ -1200,7 +1200,10 @@ export interface paths {
         /**
          * Start (or resume) a rebalance
          * @description Starts a cluster-wide rebalance as a resumable task (kind `rebalance`, subject `cluster`/`cluster`), or
-         *     starts a stopped one again (the same task: its moves so far are kept and the plan is computed again). There is a
+         *     starts a stopped one again (the same task: its moves so far stay in the report and the plan is computed again). Starting again
+         *     is a new decision of a person: the attempts and the skips of the stopped round do not carry over (each move is checked again
+         *     before it starts), and the options of the request replace the earlier ones (a request without databases means all
+         *     databases). There is a
          *     single cluster-wide rebalance lock: returns 409 (`rebalance_in_progress`) when one is running. The strategy is
          *     "by bucket count": the extension's `kingres.rebalance_plan` is computed again before every move and the first
          *     move of it that is not backing off after a failure is made. **This version runs one move at a time**;
@@ -1213,7 +1216,7 @@ export interface paths {
          *
          *     **A start is refused, before any task exists, with the reason in the problem code (0.9.0):** 409
          *     `rebalance_in_progress` (a run is unfinished and not stopped); `operation_in_progress` (another task adds,
-         *     removes or detaches a server); `failover_in_progress`; `version_mismatch` (the servers do not run the same
+         *     removes or detaches a server); `failover_in_progress` (these two also when the other task is created at the same moment: the check and the creation are one step in the system database, so a rebalance and a server operation are never both created); `version_mismatch` (the servers do not run the same
          *     version of the sharding extension and the same PostgreSQL major); `cluster_inconsistent` (`kingres.check_cluster()`
          *     reports something that makes moving unsafe; the detail names it); `no_receiving_server` (no server should hold
          *     shards); `nothing_to_rebalance` (the plan is empty). The same conditions are checked again before every move; one
@@ -1283,7 +1286,7 @@ export interface paths {
         };
         /**
          * List rebalance reports
-         * @description One report summary per finished, stopped or failed rebalance run, newest first. A stopped run that can still be started again is listed with outcome `stopped`.
+         * @description One report summary per finished, stopped or failed rebalance run, newest first. A stopped run that can still be started again is listed with outcome `stopped`; a run that a person ended for good by cancelling its (stopped or running) task is listed with outcome `cancelled`.
          */
         get: operations["listRebalanceReports"];
         put?: never;
@@ -1379,7 +1382,7 @@ export interface paths {
          * Cancel a task
          * @description Requests cancellation of a `pending`, `running` or `paused` task. Steps already completed are not
          *     undone unless the task kind defines compensation (create database cleans up). The task ends as
-         *     `failed` with error code `cancelled`. Returns 409 for a task that is already `done` or `failed`.
+         *     `failed` with error code `cancelled`. A running task stops at its next step boundary (a rebalance stops like a stop, between moves, and its run is recorded with outcome `cancelled`, not `failed`); a paused task (a stopped rebalance) ends at once. A cancel is a person's decision: it raises no `taskFailed` alert. Returns 409 for a task that is already `done` or `failed`.
          */
         post: operations["cancelTask"];
         delete?: never;
@@ -3914,7 +3917,7 @@ export interface components {
         RebalanceOptions: {
             /** @description Restrict to these databases; omitted or empty means all. */
             databases?: string[];
-            /** @description Concurrent bucket moves; defaults to the cluster setting (4 unless changed). **This version runs one move at a time** and records the value (0.9.0). */
+            /** @description Concurrent bucket moves; defaults to 1 when omitted and is recorded as sent (or 1). **This version runs one move at a time** whatever the value (0.9.0). */
             maxConcurrentMoves?: number;
         };
         /** @description Options of a plan preview. */
@@ -4091,10 +4094,10 @@ export interface components {
              */
             id: number;
             /**
-             * @description How the run ended.
+             * @description How the run ended. `cancelled` (added in 0.9.0): a person cancelled the task (`cancelTask`), also while the run was stopped; `stoppedBy` is `operator`, no `taskFailed` alert is raised and the moves in flight are listed as skipped (`stopped`).
              * @enum {string}
              */
-            outcome: "completed" | "stopped" | "failed";
+            outcome: "completed" | "stopped" | "failed" | "cancelled";
             /**
              * Format: date-time
              * @description Start time.
@@ -4106,7 +4109,7 @@ export interface components {
              */
             finishedAt: string;
             options?: components["schemas"]["RebalanceOptions"];
-            /** @description Added in 0.9.0, optional. For outcome `stopped`: `operator` or `safetyRule`. */
+            /** @description Added in 0.9.0, optional. For outcome `stopped`: `operator` or `safetyRule`; for outcome `cancelled`: `operator`. */
             stoppedBy?: string | null;
             /** @description Added in 0.9.0, optional. Why the run failed or was stopped by a safety rule; null otherwise. */
             error?: string | null;
@@ -4286,7 +4289,7 @@ export interface components {
             error: components["schemas"]["TaskError"] | null;
             /** @description Resource the task works on. */
             subject: components["schemas"]["TaskSubject"] | null;
-            /** @description Whether `POST /tasks/{taskId}/cancel` is accepted now. */
+            /** @description Whether `POST /tasks/{taskId}/cancel` is accepted now: true for a `pending`, `running` or `paused` task that the task engine runs. */
             cancellable: boolean;
             /**
              * Format: date-time

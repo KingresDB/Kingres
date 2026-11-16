@@ -192,9 +192,17 @@ func (c *Client) DoUnchecked(ctx context.Context, serverID, method, path string,
 // for example while its instance is held back until its group lease is won. It is transient.
 var ErrNotReady = errors.New("peerclient: the server is not ready")
 
-// Is makes a 503 service_unavailable answer match ErrNotReady.
+// Is makes a 503 service_unavailable answer match ErrNotReady, and the 409 "fenced" answer of a
+// callee that saw a newer run of the task match fence.ErrFenced (the task engine then stands
+// down instead of failing the task).
 func (e *APIError) Is(target error) bool {
-	return target == ErrNotReady && e.Status == http.StatusServiceUnavailable && e.Code == "service_unavailable"
+	switch target {
+	case ErrNotReady:
+		return e.Status == http.StatusServiceUnavailable && e.Code == "service_unavailable"
+	case fence.ErrFenced:
+		return e.Status == http.StatusConflict && e.Code == "fenced"
+	}
+	return false
 }
 
 // NotReadyBound is how long a task step keeps retrying a server that answers "not ready" before

@@ -163,7 +163,7 @@ function pushReport(
   s: MockState,
   o: {
     id: number
-    outcome: 'completed' | 'stopped' | 'failed'
+    outcome: 'completed' | 'stopped' | 'failed' | 'cancelled'
     startedAt: string
     moves: S['PlannedMove'][]
     doneCount: number
@@ -181,7 +181,7 @@ function pushReport(
     startedAt: o.startedAt,
     finishedAt: nowIso(),
     options: s.rebalance.options ?? {},
-    stoppedBy: o.outcome === 'stopped' ? 'operator' : null,
+    stoppedBy: o.outcome === 'stopped' || o.outcome === 'cancelled' ? 'operator' : null,
     error:
       o.outcome === 'failed' ? '1 bucket move failed and was given up after 3 attempts.' : null,
     totals: {
@@ -245,7 +245,11 @@ function settleStop(s: MockState): void {
   r.state = 'stopped'
   r.stopAskedAt = null
   r.pausedReason = 'Stopped by the operator; start the rebalance again to continue.'
-  if (r.taskId !== null)
+  if (r.taskId !== null) {
+    // The task of a stopped run is paused, and a paused task can be cancelled (contract 0.9.0).
+    const rec = requireTask(s, r.taskId)
+    rec.task.state = 'paused'
+    rec.task.cancellable = true
     pushReport(s, {
       id: r.taskId,
       outcome: 'stopped',
@@ -255,6 +259,7 @@ function settleStop(s: MockState): void {
       failedLast: false,
       before: [],
     })
+  }
 }
 
 function rebalanceStatusView(s: MockState): S['RebalanceStatus'] {
@@ -2342,12 +2347,33 @@ export function createHandlers(): HttpHandler[] {
     },
     getTask: (c) => ok(requireTask(c.s, num(c, 'taskId')).task),
     cancelTask: (c) => {
+      settleStop(c.s)
       const rec = requireTask(c.s, num(c, 'taskId'))
-      if (!rec.task.cancellable || rec.task.state !== 'running')
-        throw problem('task_not_cancellable')
+      if (!rec.task.cancellable) throw problem('task_not_cancellable')
+      const r = c.s.rebalance
+      if (rec.task.kind === 'rebalance' && rec.task.state === 'paused') {
+        // A stopped run that a person ends for good: cancelled, not failed, and no alert.
+        rec.task.state = 'failed'
+        rec.task.cancellable = false
+        rec.task.error = {
+          code: 'cancelled',
+          message: 'The task was canceled before it started.',
+          retryable: false,
+        }
+        const report = r.reports.find((x) => x.id === rec.task.id)
+        if (report) {
+          report.outcome = 'cancelled'
+          report.stoppedBy = 'operator'
+        }
+        r.state = 'idle'
+        r.taskId = null
+        r.pausedReason = null
+        return ok(rec.task)
+      }
+      if (rec.task.state !== 'running') throw problem('task_not_cancellable')
       rec.task.state = 'paused'
       rec.task.cancellable = false
-      if (rec.task.kind === 'rebalance') c.s.rebalance.state = 'stopped'
+      if (rec.task.kind === 'rebalance') r.state = 'stopped'
       return ok(rec.task)
     },
 

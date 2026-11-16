@@ -21,6 +21,10 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
 )
 
+// defaultMaxConcurrentMoves is what a start without maxConcurrentMoves records: this version runs one move at
+// a time (contract RebalanceOptions.maxConcurrentMoves, RB-12).
+const defaultMaxConcurrentMoves = 1
+
 // Step names (shown to users).
 const (
 	StepCheck = "Check that the cluster can rebalance"
@@ -150,36 +154,63 @@ func (s *Service) stepWrite(ctx context.Context, _ *task.Env, rows *PGRows, o Op
 	if err := rows.Settle(ctx, v.Outcome, "", v.Text, after); err != nil {
 		return err
 	}
-	s.audit(ctx, "rebalance."+v.Outcome, rows.TaskID, map[string]any{"movesDone": v.Done, "movesFailed": v.Failed, "movesSkipped": v.Skipped})
+	// A failed run is audited once, by onFail (the step returns the error below); a run that ended well here.
+	if v.Outcome != OutcomeFailed {
+		s.audit(ctx, "rebalance."+v.Outcome, rows.TaskID, map[string]any{"movesDone": v.Done, "movesFailed": v.Failed, "movesSkipped": v.Skipped})
+	}
 	if v.Outcome == OutcomeFailed {
 		return errors.New(v.Text)
 	}
 	return nil
 }
 
-// onFail finishes the run of a task that failed or was cancelled: the report
-// says failed, and a move that was still marked running is not running any more
-// (a cancelled task is not run by anybody; the extension's recovery undoes the
-// move). It uses no lease: the task is over.
+// onFail finishes the run of a task that the engine has just recorded as failed or cancelled (the engine
+// calls it only after its own record succeeded under the lease, so it never runs for a holder that lost the
+// task; it also runs for a paused task that a person cancels). A move still marked running is not running
+// any more (the extension's recovery undoes it).
+//
+// A cancel is the person's decision and not a failure: the run ends as "cancelled" (stopped by the
+// operator; the audit log of cancelTask names who), its moves in flight as cancelled, and no taskFailed
+// alert is raised. Anything else is a failure: outcome "failed", an alert.
 func (s *Service) onFail(ctx context.Context, t task.Task) {
+	cancelled := t.Error != nil && t.Error.Code == task.CodeCanceled
 	text := "The rebalance task failed."
 	if t.Error != nil {
 		text = t.Error.Message
-		if t.Error.Code == task.CodeCanceled {
-			text = "The rebalance task was canceled."
-		}
 	}
 	err := s.sys(ctx, func(c *pgx.Conn) error {
-		if _, err := c.Exec(ctx, `UPDATE kingres_cp.rebalance_move SET state = 'failed', finished_at = clock_timestamp(),
+		tx, err := c.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+		if cancelled {
+			if _, err := tx.Exec(ctx, `UPDATE kingres_cp.rebalance_move SET state = 'cancelled', finished_at = clock_timestamp(),
+				error = 'canceled: the run was canceled while the move was in flight' WHERE task_id = $1 AND state = 'running'`, t.ID); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE kingres_cp.rebalance_run SET outcome = 'cancelled', stopped_by = 'operator', stop_requested = false,
+				finished_at = clock_timestamp(), error = NULL WHERE task_id = $1 AND (outcome IS NULL OR outcome = 'stopped')`, t.ID); err != nil {
+				return err
+			}
+			return tx.Commit(ctx)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE kingres_cp.rebalance_move SET state = 'failed', finished_at = clock_timestamp(),
 			error = 'interrupted: the run ended while the move was in flight' WHERE task_id = $1 AND state = 'running'`, t.ID); err != nil {
 			return err
 		}
-		_, err := c.Exec(ctx, `UPDATE kingres_cp.rebalance_run SET outcome = 'failed', finished_at = clock_timestamp(), error = $2
-			WHERE task_id = $1 AND (outcome IS NULL OR outcome = 'stopped')`, t.ID, clipText(text, 500))
-		return err
+		if _, err := tx.Exec(ctx, `UPDATE kingres_cp.rebalance_run SET outcome = 'failed', finished_at = clock_timestamp(), error = $2
+			WHERE task_id = $1 AND (outcome IS NULL OR outcome = 'stopped')`, t.ID, clipText(text, 500)); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
 	})
 	if err != nil {
-		s.log().Warn("recording the end of a failed rebalance", "task", t.ID, "error", err)
+		s.log().Warn("recording the end of a rebalance", "task", t.ID, "error", err)
+	}
+	if cancelled {
+		s.audit(ctx, "rebalance.cancelled", t.ID, nil)
+		return
 	}
 	s.raiseFailed(ctx, t.ID, text)
 	s.audit(ctx, "rebalance.failed", t.ID, map[string]any{"error": text})
@@ -309,11 +340,15 @@ func (s *Service) Start(ctx context.Context, actor string, o Options) (task.Task
 		return s.resume(ctx, eng, a, actor, o)
 	}
 	if o.MaxConcurrentMoves == 0 {
-		o.MaxConcurrentMoves = 1
+		o.MaxConcurrentMoves = defaultMaxConcurrentMoves
 	}
 	t, err := eng.Submit(ctx, Kind, task.Subject{Type: SubjectType, ID: SubjectID}, input{Options: o}, actor)
 	if errors.Is(err, task.ErrSubjectBusy) {
 		return task.Task{}, problem.New(problem.RebalanceInProgress, "A rebalance is already running.")
+	}
+	var x *task.ExcludedError
+	if errors.As(err, &x) {
+		return task.Task{}, x.Problem()
 	}
 	if err != nil {
 		return task.Task{}, err
@@ -329,17 +364,17 @@ func (s *Service) Start(ctx context.Context, actor string, o Options) (task.Task
 }
 
 func (s *Service) resume(ctx context.Context, eng *task.Engine, a *active, actor string, o Options) (task.Task, error) {
-	var opts *Options
-	if len(o.Databases) > 0 || o.MaxConcurrentMoves != 0 {
-		opts = &o
+	if o.MaxConcurrentMoves == 0 {
+		o.MaxConcurrentMoves = defaultMaxConcurrentMoves
 	}
-	if err := s.sys(ctx, func(c *pgx.Conn) error { return ResumeRun(ctx, c, a.ID, opts) }); err != nil {
-		return task.Task{}, err
-	}
-	if err := eng.Resume(ctx, a.ID); err != nil {
-		if errors.Is(err, task.ErrNotPaused) {
-			return task.Task{}, problem.New(problem.RebalanceInProgress, "A rebalance is already running.")
-		}
+	err := s.sys(ctx, func(c *pgx.Conn) error { return ResumeRun(ctx, c, a.ID, o) })
+	var x *task.ExcludedError
+	switch {
+	case errors.Is(err, task.ErrNotPaused):
+		return task.Task{}, problem.New(problem.RebalanceInProgress, "A rebalance is already running.")
+	case errors.As(err, &x):
+		return task.Task{}, x.Problem()
+	case err != nil:
 		return task.Task{}, err
 	}
 	s.run(eng, a.ID)
@@ -371,7 +406,7 @@ func asProblem(err error) error {
 		return p
 	}
 	slog.Warn("rebalance: the cluster could not be inspected", "error", err)
-	return problem.New(problem.ServiceUnavailable, "The cluster cannot be inspected now: "+clipText(err.Error(), 200)).WithRetryAfter(5)
+	return problem.New(problem.ServiceUnavailable, "The cluster cannot be inspected now; the log of kingresd has the reason.").WithRetryAfter(5)
 }
 
 // Stop asks the running rebalance to stop. It answers once the request is

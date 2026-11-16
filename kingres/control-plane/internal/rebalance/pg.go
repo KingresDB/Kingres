@@ -18,6 +18,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fence"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
 )
 
 // Conns opens service connections on this server (the manager leader, which runs
@@ -49,7 +50,11 @@ type PG struct {
 	MinFreeFraction float64
 	// RecoverWait bounds how long the recovery of a move left behind may take (default 10 min).
 	RecoverWait time.Duration
-	Log         *slog.Logger
+	// GuardHold bounds how long the lease guard of a move start waits for the extension to record the move (default 30 s).
+	GuardHold time.Duration
+	// afterGuard is called with the guard held, before the call (tests).
+	afterGuard func(ctx context.Context)
+	Log        *slog.Logger
 }
 
 func (b *PG) log() *slog.Logger {
@@ -210,9 +215,6 @@ func (b *PG) checkDatabase(ctx context.Context, db string) error {
 			if node != "" {
 				line += " (node " + node + ")"
 			}
-			if detail != "" {
-				line += ": " + clipText(detail, 120)
-			}
 			if name == "extension_version_differs" || name == "server_major_differs" {
 				versions = append(versions, line)
 			} else {
@@ -364,12 +366,85 @@ func (b *PG) syncStandbyMissing(ctx context.Context, db string, group int32) (bo
 	return res != nil && *res == "true", nil
 }
 
-// RunMove implements Backend. The statement runs on a connection of its own.
+// RunMove implements Backend. The statement runs on a connection of its own, after the lease of the
+// run was proved and while the proof is kept (see guard.go): a run that lost its lease starts nothing.
+// It returns ErrLeaseLost, without having called move_bucket, when the guard cannot be had.
 func (b *PG) RunMove(ctx context.Context, m Move) error {
-	return b.with(ctx, m.Database, func(c *pgx.Conn) error {
+	tok, ok := fence.From(ctx)
+	if !ok {
+		return errors.New("rebalance: a call that starts a move without the fence of the task run")
+	}
+	since := time.Now()
+	g, err := acquireGuard(ctx, b.Conns, tok.Task)
+	if err != nil {
+		return err
+	}
+	defer g.release()
+	c, err := b.Conns.ServiceConn(ctx, m.Database)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	watch, err := b.Conns.ServiceConn(ctx, m.Database)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = watch.Close(context.WithoutCancel(ctx)) }()
+	if b.afterGuard != nil {
+		b.afterGuard(ctx)
+	}
+	// The guard's session may have been ended by the server while this process was frozen.
+	if err := g.alive(ctx); err != nil {
+		return err
+	}
+	callCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() {
 		var id int64
-		return c.QueryRow(ctx, `SELECT kingres.move_bucket($1, $2, $3)`, m.Colocation, m.Bucket, m.To).Scan(&id)
-	})
+		errc <- c.QueryRow(callCtx, `SELECT kingres.move_bucket($1, $2, $3)`, m.Colocation, m.Bucket, m.To).Scan(&id)
+	}()
+	// Keep the guard until the extension has recorded the move: from then on a new holder finds the
+	// move by its record and the extension refuses a second move of the bucket.
+	hold := time.NewTimer(b.guardHold())
+	defer hold.Stop()
+	for {
+		select {
+		case err := <-errc:
+			return asMoveError(err)
+		case <-hold.C:
+			// Not recorded in time: do not let a call that nobody can find run on.
+			cancel()
+			<-errc
+			return fmt.Errorf("the extension did not record the move within %s; the call was cancelled", b.guardHold())
+		case <-time.After(100 * time.Millisecond):
+		}
+		if _, found, err := b.findMove(ctx, watch, m.Colocation, m.Bucket, since, 0); err == nil && found {
+			g.release() // idempotent
+			g = nil
+			break
+		}
+	}
+	return asMoveError(<-errc)
+}
+
+// asMoveError marks an error that PostgreSQL raised for the statement (the extension said no and the move
+// is over) as a MoveError. Anything else (EOF, reset, a closed connection) is not an answer about the move.
+// A FATAL error (the backend was terminated, a shutdown) ends the session, not necessarily the move.
+// Only the message is kept: the extension's detail names nodes and remote errors (RB-09).
+func asMoveError(err error) error {
+	var pe *pgconn.PgError
+	if errors.As(err, &pe) && pe.Severity != "FATAL" && pe.Severity != "PANIC" {
+		return &MoveError{Err: errors.New(pe.Message)}
+	}
+	return err
+}
+
+func (b *PG) guardHold() time.Duration {
+	if b.GuardHold > 0 {
+		return b.GuardHold
+	}
+	return guardHold
 }
 
 type extMove struct {
@@ -584,14 +659,14 @@ func runColsOf(a string) string {
 	coalesce(` + a + `placement_before, 'null'::jsonb), coalesce(` + a + `placement_after, 'null'::jsonb), coalesce(` + a + `error, '')`
 }
 
-var runCols = runColsOf("")
+var runCols = runColsOf("") + `, round, coalesce((SELECT t.cancel_requested FROM kingres_cp.task t WHERE t.id = task_id), false)`
 
 // ScanRun reads a run from a row of runCols.
 func ScanRun(row pgx.Row) (Run, error) {
 	var run Run
 	var opts, before, after []byte
 	if err := row.Scan(&run.TaskID, &opts, &run.StartedAt, &run.FinishedAt, &run.Outcome, &run.StopRequested, &run.StoppedBy,
-		&run.Planned, &before, &after, &run.Error); err != nil {
+		&run.Planned, &before, &after, &run.Error, &run.Round, &run.CancelRequested); err != nil {
 		return Run{}, err
 	}
 	_ = json.Unmarshal(opts, &run.Options)
@@ -626,13 +701,14 @@ func (r *PGRows) StartMove(ctx context.Context, m Move, fromServer, toServer str
 		err := tx.QueryRow(ctx, `UPDATE kingres_cp.rebalance_move SET state = 'running', attempts = $5, phase = NULL, percent = 0, move_id = NULL,
 			started_at = clock_timestamp(), finished_at = NULL, error = NULL, from_group = $6, to_group = $7, from_server = $8, to_server = $9
 			WHERE task_id = $1 AND database_name = $2 AND colocation_id = $3 AND bucket = $4 AND state IN ('failed', 'cancelled', 'skipped')
+			AND round = (SELECT round FROM kingres_cp.rebalance_run WHERE task_id = $1)
 			RETURNING seq`, r.TaskID, m.Database, m.Colocation, m.Bucket, attempts, m.From, m.To, fromServer, toServer).Scan(&seq)
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
 		return tx.QueryRow(ctx, `INSERT INTO kingres_cp.rebalance_move (task_id, seq, database_name, colocation_id, bucket, from_group, to_group,
-			from_server, to_server, state, attempts, size_bytes, started_at)
-			SELECT $1, coalesce(max(seq), 0) + 1, $2, $3, $4, $5, $6, $7, $8, 'running', $9, $10, clock_timestamp()
+			from_server, to_server, state, attempts, size_bytes, started_at, round)
+			SELECT $1, coalesce(max(seq), 0) + 1, $2, $3, $4, $5, $6, $7, $8, 'running', $9, $10, clock_timestamp(), (SELECT round FROM kingres_cp.rebalance_run WHERE task_id = $1)
 			FROM kingres_cp.rebalance_move WHERE task_id = $1 RETURNING seq`,
 			r.TaskID, m.Database, m.Colocation, m.Bucket, m.From, m.To, fromServer, toServer, attempts, m.Size).Scan(&seq)
 	})
@@ -665,8 +741,8 @@ func (r *PGRows) FinishMove(ctx context.Context, seq int, state, errText, skipRe
 func (r *PGRows) AddSkipped(ctx context.Context, m Move, fromServer, toServer, reason, detail string) error {
 	return r.leased(ctx, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `INSERT INTO kingres_cp.rebalance_move (task_id, seq, database_name, colocation_id, bucket, from_group, to_group,
-			from_server, to_server, state, attempts, size_bytes, started_at, finished_at, error)
-			SELECT $1, coalesce(max(seq), 0) + 1, $2, $3, $4, $5, $6, $7, $8, 'skipped', 0, $9, clock_timestamp(), clock_timestamp(), $10
+			from_server, to_server, state, attempts, size_bytes, started_at, finished_at, error, round)
+			SELECT $1, coalesce(max(seq), 0) + 1, $2, $3, $4, $5, $6, $7, $8, 'skipped', 0, $9, clock_timestamp(), clock_timestamp(), $10, (SELECT round FROM kingres_cp.rebalance_run WHERE task_id = $1)
 			FROM kingres_cp.rebalance_move WHERE task_id = $1`,
 			r.TaskID, m.Database, m.Colocation, m.Bucket, m.From, m.To, fromServer, toServer, m.Size, clipText(reason+": "+detail, 500))
 		return err
@@ -674,14 +750,14 @@ func (r *PGRows) AddSkipped(ctx context.Context, m Move, fromServer, toServer, r
 }
 
 const moveCols = `seq, database_name, colocation_id, bucket, from_group, to_group, coalesce(from_server, ''), coalesce(to_server, ''), state, attempts,
-	coalesce(move_id, 0), coalesce(phase, ''), percent, size_bytes, started_at, finished_at, coalesce(error, '')`
+	coalesce(move_id, 0), coalesce(phase, ''), percent, size_bytes, started_at, finished_at, coalesce(error, ''), round`
 
 // ScanMove reads a move from a row of moveCols.
 func ScanMove(row pgx.Row) (MoveRow, error) {
 	var m MoveRow
 	var pct float32
 	err := row.Scan(&m.Seq, &m.Move.Database, &m.Move.Colocation, &m.Move.Bucket, &m.Move.From, &m.Move.To, &m.FromServer, &m.ToServer,
-		&m.State, &m.Attempts, &m.ExtMoveID, &m.Phase, &pct, &m.Size, &m.StartedAt, &m.FinishedAt, &m.Error)
+		&m.State, &m.Attempts, &m.ExtMoveID, &m.Phase, &pct, &m.Size, &m.StartedAt, &m.FinishedAt, &m.Error, &m.Round)
 	m.Percent = float64(pct)
 	m.Move.Size = m.Size
 	if m.State == MoveSkipped {
@@ -734,18 +810,37 @@ func RequestStop(ctx context.Context, c *pgx.Conn, taskID int64, by string) (boo
 	return tag.RowsAffected() == 1, err
 }
 
-// ResumeRun clears a stop so that the run goes on (the operator started again).
-func ResumeRun(ctx context.Context, c *pgx.Conn, taskID int64, opts *Options) error {
-	if opts != nil {
-		ob, _ := json.Marshal(*opts)
-		_, err := c.Exec(ctx, `UPDATE kingres_cp.rebalance_run SET options = $2 WHERE task_id = $1`, taskID, ob)
-		if err != nil {
-			return err
-		}
+// ResumeRun starts a stopped run again, in one transaction with the task going from paused to pending:
+// the stop is cleared, the options are the ones of the request (an empty request means all databases:
+// a person who starts again decides again, RB-11) and a new round begins, so that the attempts and the
+// skips of the stopped round do not count (RB-07; their rows stay in the report). The task is resumed
+// here and not by the engine so that the exclusion of the database (migration 0009) and the change of the run
+// are one atomic step. It returns task.ErrNotPaused when the task is not paused and *task.ExcludedError when a
+// change of the servers is unfinished.
+func ResumeRun(ctx context.Context, c *pgx.Conn, taskID int64, opts Options) error {
+	tx, err := c.Begin(ctx)
+	if err != nil {
+		return err
 	}
-	_, err := c.Exec(ctx, `UPDATE kingres_cp.rebalance_run SET outcome = NULL, stop_requested = false, stopped_by = NULL, finished_at = NULL, error = NULL
-		WHERE task_id = $1 AND outcome = 'stopped'`, taskID)
-	return err
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	tag, err := tx.Exec(ctx, `UPDATE kingres_cp.task SET state = 'pending', cancel_requested = false, updated_at = clock_timestamp()
+		WHERE id = $1 AND state = 'paused'`, taskID)
+	if err != nil {
+		var pe *pgconn.PgError
+		if errors.As(err, &pe) && (pe.Code == "KX001" || pe.Code == "KX002") {
+			return &task.ExcludedError{Kind: Kind, Other: pe.Detail}
+		}
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return task.ErrNotPaused
+	}
+	ob, _ := json.Marshal(opts)
+	if _, err := tx.Exec(ctx, `UPDATE kingres_cp.rebalance_run SET options = $2, round = round + 1, outcome = NULL, stop_requested = false,
+		stopped_by = NULL, finished_at = NULL, error = NULL WHERE task_id = $1 AND outcome = 'stopped'`, taskID, ob); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // SortPlacements orders placements by database and server (stable output).

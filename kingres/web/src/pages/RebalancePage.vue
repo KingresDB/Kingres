@@ -73,6 +73,18 @@ const stopMutation = useMutation({
   },
 })
 
+// A stopped run can be ended for good (cancel of its paused task): it is recorded as cancelled, not failed.
+const confirmEnd = ref(false)
+const endMutation = useMutation({
+  mutationFn: () => endpoints.cancelTask(st.value?.taskId ?? 0),
+  onSettled: () => {
+    confirmEnd.value = false
+    void client.invalidateQueries({ queryKey: keys.rebalance })
+    void client.invalidateQueries({ queryKey: keys.rebalanceReports })
+    void client.invalidateQueries({ queryKey: keys.tasks })
+  },
+})
+
 const detailId = ref<number | null>(null)
 
 /** The phase of a move in flight, in words (the extension's phases). */
@@ -100,6 +112,14 @@ const stoppedByText = computed(() =>
         @click="previewMutation.mutate()"
         >Preview plan</GateButton
       >
+      <GateButton
+        v-if="st?.state === 'stopped' && st.taskId"
+        op="cancelTask"
+        variant="danger"
+        data-testid="end-run"
+        @click="confirmEnd = true"
+        >End this run</GateButton
+      >
       <GateButton v-if="running" op="stopRebalance" variant="danger" @click="confirmStop = true"
         >Stop rebalance</GateButton
       >
@@ -118,13 +138,19 @@ const stoppedByText = computed(() =>
   <!-- Outside the boundary: the answer to an action must show even when the status cannot be read
        (for example while the server answers "not available yet" for every rebalance operation). -->
   <div
-    v-if="start.error.value || previewMutation.error.value || stopMutation.error.value"
+    v-if="
+      start.error.value ||
+      previewMutation.error.value ||
+      stopMutation.error.value ||
+      endMutation.error.value
+    "
     class="stack"
     style="margin-bottom: var(--s-3)"
   >
     <ProblemNotice v-if="start.error.value" :error="start.error.value" />
     <ProblemNotice v-if="previewMutation.error.value" :error="previewMutation.error.value" />
     <ProblemNotice v-if="stopMutation.error.value" :error="stopMutation.error.value" />
+    <ProblemNotice v-if="endMutation.error.value" :error="endMutation.error.value" />
   </div>
 
   <QueryBoundary
@@ -154,7 +180,8 @@ const stoppedByText = computed(() =>
             Stopped by {{ stoppedByText }}.
             <SafeName v-if="st.pausedReason" :value="st.pausedReason" kind="text" :max="300" />
             The buckets moved so far stay where they are; <strong>Start again</strong> goes on with
-            the same run and plans the remaining moves again.
+            the same run, plans the remaining moves again and tries every bucket afresh;
+            <strong>End this run</strong> closes it for good.
           </span>
         </p>
         <p
@@ -435,6 +462,22 @@ const stoppedByText = computed(() =>
       </section>
     </div>
   </QueryBoundary>
+
+  <ConfirmDialog
+    v-if="confirmEnd"
+    title="End this run for good?"
+    confirm-label="End this run"
+    danger
+    :busy="endMutation.isPending.value"
+    @cancel="confirmEnd = false"
+    @confirm="endMutation.mutate()"
+  >
+    <p>
+      The stopped run is closed and recorded as <strong>cancelled</strong> in its report; it cannot
+      be started again. Buckets already moved stay where they are. Start a new rebalance to plan the
+      rest.
+    </p>
+  </ConfirmDialog>
 
   <ConfirmDialog
     v-if="confirmStop"

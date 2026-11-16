@@ -17,9 +17,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"time"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
 )
 
@@ -80,6 +82,8 @@ const (
 	OutcomeCompleted = "completed"
 	OutcomeStopped   = "stopped"
 	OutcomeFailed    = "failed"
+	// OutcomeCancelled is a run that a person ended for good by cancelling its task (contract 0.9.0).
+	OutcomeCancelled = "cancelled"
 )
 
 // MoveRow is the record of one move of a run.
@@ -100,6 +104,8 @@ type MoveRow struct {
 	Error      string
 	// SkipReason is set for a skipped move.
 	SkipReason string
+	// Round is the round of the run the move belongs to.
+	Round int
 }
 
 // Run is the record of a run (the report of the contract is read from it).
@@ -114,6 +120,10 @@ type Run struct {
 	Planned       int
 	Before, After []Placement
 	Error         string
+	// Round counts the starts again by a person: attempts and skips are those of the current round.
+	Round int
+	// CancelRequested is the cancel request of the task (the run ends as cancelled).
+	CancelRequested bool
 }
 
 // ErrLeaseLost is returned by Rows when the run that writes is no longer the
@@ -186,6 +196,30 @@ type Backend interface {
 	Cleanup(ctx context.Context)
 }
 
+// MoveError is an error that the extension itself raised for the statement of a move: the statement
+// ended and so did the move (a failure the extension recorded). Any other error of RunMove, a lost
+// connection above all, says nothing about the move: the loop asks the extension what became of it
+// (RB-04) before it records anything or starts another move.
+type MoveError struct{ Err error }
+
+func (e *MoveError) Error() string { return e.Err.Error() }
+func (e *MoveError) Unwrap() error { return e.Err }
+
+// transientTries is how often an inspection of the cluster that failed for a reason that is not a
+// refusal (a refused connection, a timeout) is tried before the run is stopped (RB-05).
+const transientTries = 4
+
+// definiteRecoverWait bounds how long the loop waits for the extension to settle a move that failed with an
+// error of its own (the undo may need a server that is down).
+const definiteRecoverWait = 30 * time.Second
+
+// MaxMovesFactor bounds the moves of a run (RB-06): a run stops, as a safety rule, when the moves it
+// made (done or failed) exceed this multiple of the moves of its first plan plus MovesSlack.
+const (
+	MaxMovesFactor = 3
+	MovesSlack     = 10
+)
+
 // Loop is the rebalance algorithm of step "Move buckets".
 type Loop struct {
 	Backend Backend
@@ -201,6 +235,7 @@ type Loop struct {
 	Sleep func(ctx context.Context, d time.Duration)
 	// OnProgress is called after each recorded change of a move (the audit and tests).
 	OnProgress func(MoveRow)
+	Log        *slog.Logger
 }
 
 func (l *Loop) defaults() {
@@ -237,21 +272,28 @@ func (l *Loop) defaults() {
 // is neither exhausted, backing off nor skipped is the next one.
 func (l *Loop) Moves(ctx context.Context, opts Options) error {
 	l.defaults()
-	dbs, err := l.Backend.Databases(ctx, opts)
+	var dbs []string
+	if err := l.inspect(ctx, func() (err error) { dbs, err = l.Backend.Databases(ctx, opts); return }); err != nil {
+		return l.safetyStop(ctx, err)
+	}
+	skipped := map[string]bool{}
+	// Skips of an earlier part of this round (before a restart) stay skipped; the skips of a round that a
+	// person ended by starting again do not (RB-07).
+	run0, err := l.Rows.Run(ctx)
 	if err != nil {
 		return err
 	}
-	skipped := map[string]bool{}
-	// Skips of an earlier part of this run (before a restart or a stop) stay skipped.
 	rows, err := l.Rows.Moves(ctx)
 	if err != nil {
 		return err
 	}
 	for _, r := range rows {
-		if r.State == MoveSkipped {
+		if r.State == MoveSkipped && r.Round == run0.Round {
 			skipped[r.Move.Key()] = true
 		}
 	}
+	// The moves of this part of the run are counted from here (RB-06).
+	madeBefore, firstPlan, tries := movesMade(rows), -1, 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -263,31 +305,35 @@ func (l *Loop) Moves(ctx context.Context, opts Options) error {
 		if err != nil {
 			return err
 		}
-		if run.StopRequested {
+		if run.StopRequested || run.CancelRequested {
 			return l.stopped(ctx, run)
 		}
-		if err := l.Backend.Check(ctx, dbs); err != nil {
-			// A condition that does not hold any more stops the run so that an
-			// operator can look at it; starting again checks it again.
-			if serr := l.Rows.Settle(ctx, OutcomeStopped, "safetyRule", err.Error(), nil); serr != nil {
-				return serr
-			}
-			return task.Pause("A safety condition does not hold: " + err.Error())
+		// A condition that does not hold any more, or a cluster that cannot be inspected, stops
+		// the run so that an operator can look at it; starting again checks it again.
+		if err := l.inspect(ctx, func() error { return l.Backend.Check(ctx, dbs) }); err != nil {
+			return l.safetyStop(ctx, err)
 		}
-		plan, err := l.Backend.Plan(ctx, dbs)
-		if err != nil {
-			return err
+		var plan []Move
+		if err := l.inspect(ctx, func() (err error) { plan, err = l.Backend.Plan(ctx, dbs); return }); err != nil {
+			return l.safetyStop(ctx, err)
 		}
 		rows, err = l.Rows.Moves(ctx)
 		if err != nil {
 			return err
+		}
+		if firstPlan < 0 {
+			firstPlan = len(plan)
+		}
+		if made := movesMade(rows) - madeBefore; made > MaxMovesFactor*firstPlan+MovesSlack {
+			return l.safetyStop(ctx, &problem.Problem{Detail: fmt.Sprintf(
+				"The run made %d moves for a plan of %d and the plan is not empty: something else keeps changing the placement (for example shouldHaveShards). Look at the report, fix the cause and start again.", made, firstPlan)})
 		}
 		if n := countDone(rows) + len(plan); n > run.Planned {
 			if err := l.Rows.SetPlanned(ctx, n); err != nil {
 				return err
 			}
 		}
-		next, wait, found := l.pick(plan, rows, skipped)
+		next, wait, found := l.pick(plan, roundRows(rows, run.Round), skipped)
 		if !found {
 			if wait > 0 {
 				l.Sleep(ctx, min(wait, l.Poll*4))
@@ -299,7 +345,16 @@ func (l *Loop) Moves(ctx context.Context, opts Options) error {
 		if err := l.Backend.CheckMove(ctx, next.move); err != nil {
 			var se *SkipError
 			if !errors.As(err, &se) {
-				return err
+				if isRefusal(err) {
+					return l.safetyStop(ctx, err)
+				}
+				// A node that cannot be asked now is a reason to wait and look again, not to fail.
+				l.log().Warn("rebalance: checking a move failed; trying again", "move", next.move.Key(), "error", err)
+				l.Sleep(ctx, l.Backoff/6)
+				if tries++; tries >= transientTries {
+					return l.safetyStop(ctx, &inspectError{err})
+				}
+				continue
 			}
 			skipped[next.move.Key()] = true
 			if err := l.Rows.AddSkipped(ctx, next.move, l.Backend.ServerOf(ctx, next.move.Database, next.move.From),
@@ -308,10 +363,89 @@ func (l *Loop) Moves(ctx context.Context, opts Options) error {
 			}
 			continue
 		}
+		tries = 0
 		if err := l.execute(ctx, next.move, next.attempts+1); err != nil {
 			return err
 		}
 	}
+}
+
+// roundRows are the rows of one round of the run: attempts and exhaustion count within a round.
+func roundRows(rows []MoveRow, round int) []MoveRow {
+	var out []MoveRow
+	for _, r := range rows {
+		if r.Round == round {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func movesMade(rows []MoveRow) int {
+	n := 0
+	for _, r := range rows {
+		if r.State != MoveSkipped {
+			n += max(r.Attempts, 1)
+		}
+	}
+	return n
+}
+
+func (l *Loop) log() *slog.Logger {
+	if l.Log == nil {
+		return slog.New(slog.DiscardHandler)
+	}
+	return l.Log
+}
+
+// isRefusal says whether err is a decision of the control plane (a *problem.Problem: a condition that does
+// not hold) and not a failure to ask.
+func isRefusal(err error) bool {
+	var p *problem.Problem
+	return errors.As(err, &p)
+}
+
+// inspect runs one look at the cluster. A refusal is returned at once. Any other error (a refused
+// connection, a timeout) is tried again a few times with a growing wait; when it persists it is
+// returned as an *inspectError (RB-05: the same rule wherever the loop looks at the cluster).
+func (l *Loop) inspect(ctx context.Context, f func() error) error {
+	var err error
+	for i := 0; i < transientTries; i++ {
+		if err = f(); err == nil || isRefusal(err) || ctx.Err() != nil {
+			return err
+		}
+		l.log().Warn("rebalance: the cluster could not be inspected", "try", i+1, "error", err)
+		l.Sleep(ctx, time.Duration(i+1)*l.Backoff/6)
+	}
+	return &inspectError{err}
+}
+
+type inspectError struct{ err error }
+
+func (e *inspectError) Error() string { return e.err.Error() }
+func (e *inspectError) Unwrap() error { return e.err }
+
+// safetyStop records the run as stopped by a safety rule and pauses the task. The text kept in the
+// run is a refusal's own sentence, or, for an error that is not a refusal, a fixed sentence: the
+// text of such an error names roles, databases and sockets and stays in the log (RB-09).
+func (l *Loop) safetyStop(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if errors.Is(err, ErrLeaseLost) {
+		return err
+	}
+	text := "The cluster could not be inspected; the log of kingresd has the reason."
+	var p *problem.Problem
+	if errors.As(err, &p) {
+		text = p.Detail
+	} else {
+		l.log().Warn("rebalance: the run is stopped because the cluster could not be inspected", "error", err)
+	}
+	if serr := l.Rows.Settle(ctx, OutcomeStopped, "safetyRule", text, nil); serr != nil {
+		return serr
+	}
+	return task.Pause("A safety condition does not hold: " + text)
 }
 
 type candidate struct {
@@ -402,11 +536,45 @@ func (l *Loop) execute(ctx context.Context, m Move, attempt int) error {
 	// shutdown) cancels the statement and leaves the move to the recovery.
 	go func() { done <- l.Backend.RunMove(ctx, m) }()
 	cancelled := false
+	var ext int64
 	for {
 		select {
 		case err := <-done:
 			if ctx.Err() != nil {
 				return ctx.Err()
+			}
+			// The lease was gone when the call was to be made: nothing was started, and the
+			// holder does nothing more in the name of the task (the row stays for the new holder).
+			if errors.Is(err, ErrLeaseLost) {
+				return err
+			}
+			if err != nil {
+				var me *MoveError
+				definite := errors.As(err, &me)
+				// The extension decides what became of the move before anything is recorded or another move
+				// starts. A lost connection says nothing about the move (its backend may be alive and finish it:
+				// it is waited for). An error the extension raised ended the statement, but when the undo could
+				// not reach a node (a server is down) the move's row stays in its phase until a recovery settles
+				// it: ask for that now, for a bounded time, and record the failure either way.
+				rctx := ctx
+				if definite {
+					var cancel context.CancelFunc
+					rctx, cancel = context.WithTimeout(ctx, definiteRecoverWait)
+					defer cancel()
+				} else {
+					l.log().Warn("rebalance: the session of a move ended with an error; asking the extension what became of it", "move", m.Key(), "error", err)
+				}
+				state, text, rerr := l.Backend.Recover(rctx, MoveRow{Seq: seq, Move: m, State: MoveRunning, ExtMoveID: ext, StartedAt: started})
+				switch {
+				case rerr != nil && !definite:
+					return fmt.Errorf("settling the move of bucket %s after its session ended: %w", m.Key(), rerr)
+				case rerr != nil:
+					l.log().Warn("rebalance: the extension has not settled a failed move; a recovery will", "move", m.Key(), "error", rerr)
+				case state == MoveDone:
+					return l.settleRecovered(ctx, seq, m, state, text)
+				case !definite:
+					return l.settleRecovered(ctx, seq, m, state, text)
+				}
 			}
 			return l.settleMove(ctx, seq, m, started, err, cancelled)
 		case <-time.After(l.Poll):
@@ -415,6 +583,7 @@ func (l *Loop) execute(ctx context.Context, m Move, attempt int) error {
 			return ctx.Err()
 		}
 		if p, err := l.Backend.Progress(ctx, m, started); err == nil && p.Found {
+			ext = p.ExtMoveID
 			if err := l.Rows.UpdateMove(ctx, seq, p.ExtMoveID, p.Phase, p.Percent); err != nil {
 				return err
 			}
@@ -430,12 +599,29 @@ func (l *Loop) execute(ctx context.Context, m Move, attempt int) error {
 			if err != nil {
 				return err
 			}
-			if run.StopRequested {
+			if run.StopRequested || run.CancelRequested {
 				if stopped, err := l.Backend.CancelMove(ctx, m, started); err == nil && stopped {
 					cancelled = true
 				}
 			}
 		}
+	}
+}
+
+// settleRecovered records the state the extension reports for a move whose session ended without
+// an answer: done, failed (with the extension's reason) or cancelled.
+func (l *Loop) settleRecovered(ctx context.Context, seq int, m Move, state, text string) error {
+	c := context.WithoutCancel(ctx)
+	switch state {
+	case MoveDone:
+		if err := l.Rows.UpdateMove(c, seq, 0, "done", 100); err != nil {
+			return err
+		}
+		return l.Rows.FinishMove(c, seq, MoveDone, "", "", m.Size)
+	case MoveCancelled:
+		return l.Rows.FinishMove(c, seq, MoveCancelled, text, "", nil)
+	default:
+		return l.Rows.FinishMove(c, seq, MoveFailed, text, "", nil)
 	}
 }
 
@@ -486,9 +672,17 @@ func Judge(rows []MoveRow, maxAttempts int) Verdict {
 	if maxAttempts == 0 {
 		maxAttempts = 3
 	}
+	// Only the last round counts for what was given up: an earlier round was ended by a person who started again.
+	last := 0
+	for _, r := range rows {
+		last = max(last, r.Round)
+	}
 	byKey := map[string]MoveRow{}
 	var keys []string
 	for _, r := range rows {
+		if r.Round != last {
+			continue
+		}
 		k := r.Move.Key()
 		prev, ok := byKey[k]
 		if !ok {

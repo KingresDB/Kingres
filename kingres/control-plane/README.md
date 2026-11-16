@@ -1781,6 +1781,37 @@ The task row of an instance stop lives in the database that is about to stop, so
 shutdown; it is corrected to `failed` when the instance does not stop. A crash of `kingresd` between the two leaves a
 `done` task and a running instance. This is a deliberate choice, not an oversight.
 
+### The fencing rule of the task engine
+
+**A holder that lost the lease of a task does nothing more in the name of that task**: no write to the system
+database, no call to a node that starts or changes work, no hook, no alert. The rule belongs to the engine, not to
+a task kind, so that failover can rely on it. How it is kept:
+
+- **Records.** Every state change of a task (`SetStep`, `Renew`, `Finish`, `Pause`, `SetDetail`) names holder and
+  epoch and is refused with `ErrLeaseLost` when either differs; marking a step `running` also needs a lease that
+  has not expired on the database's clock.
+- **Hooks.** `Definition.OnFail` runs only after the engine itself recorded the task as failed or cancelled under
+  its lease (`Finish` succeeded). A run that was refused its lease, or whose callee answered `fenced`
+  (`fence.ErrFenced`), returns `ErrLeaseLost` and records nothing and runs no hook: "the lease is lost" is not a
+  failure of the task, whatever error the step returned because of it (a connection error, a timeout). The hook
+  sees the task as recorded (state `failed`, the error).
+- **Regaining a lease (RB-02).** A lease that ran out while nobody took the task over leaves the task `running`
+  with an expired lease. The leader's next poll claims it again (the epoch grows), settles what the interrupted
+  step left behind and runs the step again from its start, as after a restart. If another server claimed it
+  first, that server owns it and the old holder stands down.
+- **Calls to servers** carry the epoch (`X-Kingres-Fence`) and the callee refuses a lower one than it has seen
+  (see "Carry-overs"). A callee that has not yet seen the newer run cannot refuse; see "Limits that remain".
+- **Calls to a node's instance that start work** (the rebalance's `move_bucket`) are guarded by a lock on the
+  task row held in the system database while the call is issued; see `internal/rebalance` and the section on
+  rebalancing.
+- **Cancel** of a paused task is allowed (`cancellable` is true for pending, running and paused tasks); it ends the
+  task as `failed` with the code `cancelled`, and the hook sees that record.
+
+Tests: `internal/task/fencing_test.go` (`TestSupersededHolderRunsNoHookWhateverTheStepError`,
+`TestExpiredUnclaimedLeaseIsClaimedAgainNotFailed`, `TestHookSeesTheRecordedFailure`,
+`TestCancelPausedTaskIsCancellableAndTheHookSeesTheRecord`, `TestCancelRequestedWhileRunningWinsOverAPause`) on the
+memory store, and `TestPGSupersededHolderRunsNoHook` on a real system database.
+
 ### Limits that remain
 
 - The residual of CP2-06: a process paused between the atomic `running` mark and the first side effect of a
@@ -2352,3 +2383,52 @@ included), on the manager leader. Design: `kingres/docs/design/shard-phase10.md`
 - **Not verified on real servers:** the free-disk check (no server reports its disk yet), the lease check for groups whose primary runs on
   another server (the leader knows only its own leases), a rebalance during a failover (failover is not implemented), and the leader
   change in the middle of a move (the tests restart the leader's `kingresd`; they cannot move the map group).
+
+### Rebalancing after the review (contract 0.9.0)
+
+The review file `kingres/docs/reviews/2026-11-16-kingresd-rebalance.md` found 14 things; what each fix is and where it is proved:
+
+- **Calls to nodes (RB-03).** A lease proved in a transaction that ends before `move_bucket` is called proves nothing about the call, and
+  the extension does not take the fencing epoch. So `PG.RunMove` (`internal/rebalance/guard.go`) keeps the proof alive across the call:
+  it opens a transaction on the system database that locks the task row `FOR KEY SHARE` after checking holder, epoch, state and expiry,
+  checks that this session is still alive, and only then issues `move_bucket` on a second connection. While the guard is held another
+  server **cannot claim the task** (the claim takes the row `FOR UPDATE` and skips a locked row), and the holder's own renewals and records
+  still work (they change no key column). The guard is released as soon as the extension has recorded the move in `kingres.bucket_move`,
+  or the call returned, or 30 s passed (then the call is cancelled, so that nobody runs a call that cannot be found). It is not held for
+  the minutes a copy takes: a frozen holder would keep the lock until the server drops its session (`idle_in_transaction_session_timeout`
+  of 45 s is set on it), and the task could not fail over meanwhile.
+  **The window that remains** is a process that is frozen exactly between the liveness check of the guard and the write of the call on the
+  socket for longer than the idle timeout: its call then reaches the extension after the guard is gone. It is harmless for the data:
+  the extension refuses a second move of the same bucket ("already being moved"), so a move the new holder started, or that exists in the
+  extension's rows, cannot be doubled; what it does not cover is the interleaving where the late call arrives while **no** move of that
+  bucket exists any more (the new holder settled the old row as "not recorded", and has not started its own yet): the late move then runs
+  unrecorded for the run until the next `Recover`/plan sees the bucket on its target or the move's rows in the extension. The end state is
+  correct (the bucket is on the target, check_cluster is clean); the report may miss that move.
+- **Records and hooks (RB-01, RB-02).** See "The fencing rule of the task engine".
+- **A lost connection (RB-04).** An error of `move_bucket` that PostgreSQL raised for the statement at severity ERROR ends the move
+  (`MoveError`). Any other error (EOF, reset, a FATAL termination of the backend) says nothing about the move: the loop asks the extension
+  through `Recover` (`resume_bucket_moves`, waiting while the move's session is alive) before it records anything or starts another
+  move. Proved on real instances by `TestRebalanceUnderFaults`.
+- **Transient errors (RB-05).** `Databases`, `Check` and `Plan` retry an error that is not a refusal (`*problem.Problem`) four times with a
+  growing wait; if it lasts, the run is stopped as a safety stop (outcome `stopped`, `stoppedBy` `safetyRule`, a fixed text; the text of the
+  error goes to the log, RB-09), never a failed task.
+- **Bound (RB-06).** A part of a run stops (safety stop, with the numbers in the report's `error`) when it made more than
+  `3 x the first plan + 10` moves (done, failed or retried): something else keeps changing the placement.
+- **Start again (RB-07, RB-11).** A start of a stopped run is a new decision: the run begins a new *round* (`rebalance_run.round`,
+  `rebalance_move.round`, migration 0010); attempts, exhaustion and skips count within a round; the rows of earlier rounds stay in the
+  report; the options of the request replace the old ones (none selected means all databases). The task is resumed and the run changed in
+  one transaction.
+- **Cancel (RB-08).** `cancellable` is true for a paused task. Cancelling a stopped rebalance ends the run with outcome `cancelled`
+  (stopped by `operator`; the audit log of `cancelTask` names the person), its moves in flight as cancelled, and raises no `taskFailed`
+  alert. Cancelling a running rebalance stops the loop between moves like a stop, and the engine then ends the task as cancelled.
+- **Exclusion (RB-10).** Migration 0009 refuses, in the database and under one advisory lock (`kingres_cp.lock_operations()`), to create
+  a rebalance while a `server.add`, `server.remove`, `server.leave` or `server.failover` task is unfinished, to create such a task while a
+  rebalance is pending or running, and to resume a stopped rebalance in that case (SQLSTATE `KX001`/`KX002`, `task.ExcludedError`, 409 with
+  the contract's codes). `updateServer` takes the same lock for its check of "no rebalance is running" and the change that follows.
+  Not covered by this rule, because the contract does not declare them exclusive: server groups, certificate renewals, standby
+  reconciliation and the other task kinds.
+- **Open.** The system-database writes of the steps of `server.add`, `server.remove`, `server.leave`, `cert.*` and `cluster.init`/`join`
+  are protected by the engine's cancellation of the step context when the lease is lost, and their peer calls by the fence header, but are
+  not themselves conditional on the lease the way the rebalance's are; the detection delay (at most a third of the lease) is the window.
+  The calls of database creation, configuration and standby steps to the local instance carry no guard. `cleanup_moved_buckets(true)` in
+  `remove_node` is cluster-wide (RB-14 c); a connection per call and the full plan before every move (RB-14 a, b) are unchanged.
