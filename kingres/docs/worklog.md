@@ -7,6 +7,162 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-16 (second entry): Fix rounds and their reviews in every extension and in the verifier, the packages on PostgreSQL 19, the design of failover
+
+### What was done
+
+- **`kingres_shard` 0.5.** The fixes for S8 (35913a2901) and their review
+  ([reviews/2026-11-16-kingres-shard-0.5-sequences.md](reviews/2026-11-16-kingres-shard-0.5-sequences.md),
+  ed9a2623b6): ten findings, S9-01 to S9-10, one critical (a committed part
+  rolled back after the retention time with no record) and two high. Their
+  fixes (835b0967ff): a decision is kept until the participant confirmed
+  durability; the WAL timeline of a promotion is recorded and checked;
+  the previous secret is kept for outgoing sessions; `switchover_mark` and
+  `switchover_verify`; `standby_name_matches`; and the chapter "What the
+  control plane calls" rewritten with every answer of the nine sequences
+  and the test that produces it.
+- **`kingres_columnar` 0.1.** The fourth review
+  ([reviews/2026-11-16-kingres-columnar-0.1-third-fixes.md](reviews/2026-11-16-kingres-columnar-0.1-third-fixes.md),
+  2ccb0c3add; two critical) and its fixes (0051c754d2); the fifth review
+  ([reviews/2026-11-16-kingres-columnar-0.1-fourth-fixes.md](reviews/2026-11-16-kingres-columnar-0.1-fourth-fixes.md),
+  57b356d53b), the first without a critical finding (one high, one medium,
+  four low), and its fixes (4cb965bca2).
+- **`kingres_sketch` and `kingres_timepart`.** Three reviews and three fix
+  rounds in one day:
+  [third](reviews/2026-11-16-phase12-extensions-second-fixes.md) (b35416ef1e),
+  fixed in fe25792c14 and 821c33be4b;
+  [fourth](reviews/2026-11-16-phase12-extensions-third-fixes.md) (1e18418ab9),
+  fixed in 89d79e7b84 and d1ef3851ee;
+  [fifth](reviews/2026-11-16-phase12-extensions-fourth-fixes.md) (c19fbcc19c).
+  What changed in substance: the history and the policies of
+  `kingres_timepart` have one model of identity; a superuser's session no
+  longer runs the maintenance for another role's table unless a setting
+  says the owners are trusted, and an owner drives its own tables; a policy
+  acts only when the interface sealed it. `kingres_sketch` bounds the
+  memory of aggregate states with a ceiling that only a superuser sets.
+- **The verifier and `kingres_ledger` 0.3, part A.** Their first review
+  ([reviews/2026-11-16-ledger-phase7-steps-1-2.md](reviews/2026-11-16-ledger-phase7-steps-1-2.md),
+  a51e662ede), the fixes (e4bfa4791e, 714eb98642), the review of the fixes
+  ([reviews/2026-11-16-ledger-phase7-steps-1-2-fixes.md](reviews/2026-11-16-ledger-phase7-steps-1-2-fixes.md),
+  33eb3314cf) and their fixes (c3305464bb, 7a558f2d51). The verifier opens
+  every file through one helper that cannot block or leave a source
+  directory, enforces the validity of keys, keeps the last verified
+  checkpoint in a state file that only moves by a consistency proof, and
+  escapes every string of its text output. The design of phase 7 gained
+  corrections 14 to 19.
+- **The review of the rebalance fixes**
+  ([reviews/2026-11-16-kingresd-rebalance-fixes.md](reviews/2026-11-16-kingresd-rebalance-fixes.md),
+  333a2313c0): thirteen of fourteen fixed, seven new findings, RBR-01 to
+  RBR-07, two medium.
+- **The packages on PostgreSQL 19** (6018981fa0): the package, image and
+  compose tests give the same numbers on both majors; the four defects of
+  the product that these tests had found are fixed.
+- **The design of failover and switchover in the control plane**
+  ([design/ha-phase5-part2.md](design/ha-phase5-part2.md), ce206868d1):
+  the safety argument, the task step by step with every answer of the
+  extension, the proposed contract 0.10.0, the pages of the console, the
+  tests, ten increments.
+
+### How it was verified
+
+Run by the integrator on the tree that was committed, not taken from the
+reports of the authors, unless it says otherwise.
+
+- `kingres_shard` at 835b0967ff: out of tree with both installations
+  named, 18.7: 12 regression tests and 84 TAP files with 7276 tests; 19rc2:
+  7934 tests; in tree on 18, 102 of 102; no compiler warning. A first run
+  of this round in the tree had stopped at one test; that led to the two
+  defects named below.
+- `kingres_columnar` at 4cb965bca2: in tree on 18 twice, 27 of 27; out of
+  tree on 19rc2, 11 regression tests and 23 TAP files with 3494 tests.
+- `kingres_sketch` at d1ef3851ee: in tree on 18 twice, 13 of 13; on 19rc2,
+  8 regression tests and 9 TAP files with 559 tests. `kingres_timepart` at
+  89d79e7b84: in tree twice, 8 of 8; on 19rc2, 14 regression tests and 4
+  TAP files with 216 tests.
+- The verifier at c3305464bb: on Linux three runs of 164 top-level tests,
+  none failing or skipped; on Windows 154 passing and 6 skipped in two
+  runs, and one run in which the temporary directory of one subtest could
+  not be removed (thirty repeats then passed; cause not known).
+  `kingres_ledger` at 7a558f2d51: in tree on 18 twice with the verifier
+  named, 17 of 17; on 19rc2, 388 tests. The four tests of `kingresd` that
+  check inclusion proofs with the verifier pass with it on both majors.
+- The packages: the release build and the package of each major, then per
+  major the package test under systemd (237 checks), the image test (130)
+  and the compose test of three joined nodes (162), none failing; lintian
+  and shellcheck clean.
+- The branch `kingres-19` after each synchronisation: built in the tree
+  without a warning, the suites of the five extensions; at the last one
+  140 passed and one skipped (the test that needs two installations).
+- Three times a run in the PostgreSQL tree failed a test that the authors'
+  and the integrator's out-of-tree runs had passed, and each time
+  something real was behind it: a test of `kingres_sketch` that assumed
+  the library was preloaded, one that named the test database by a name it
+  does not have in a tree build, and in `kingres_shard` a race between two
+  equal timeouts that could answer one situation in two ways, with a
+  recovery call behind it that waited for ever on a participant whose
+  standby was away. The tree run stays part of every verification.
+- Shown by the authors only: that each new test fails without its fix
+  (the reviewers repeated it for most findings of the round before
+  theirs); the repeats of new tests; the timings and memory figures; the
+  fuzz targets of the verifier.
+
+### Needs-verification items
+
+- The twenty statements listed as "to be verified" at the end of
+  [design/ha-phase5-part2.md](design/ha-phase5-part2.md).
+
+### Decisions and deviations
+
+- `kingres_timepart`: cleaning up after code of a table owner that ran in
+  a superuser's session is not possible from SQL, so the protection is a
+  refusal by default with an explicit setting to accept the risk, not an
+  attempt at isolation.
+- `kingres_sketch`: a first version of the memory limit (821c33be4b) could
+  be raised by the role it bounds and made a hash aggregate quadratic in
+  the number of groups (one million groups did not finish). Both were on
+  the published branches for some hours on 2026-11-16 and are fixed in
+  d1ef3851ee. The commit message of 821c33be4b claimed a protection that
+  did not hold; it is corrected here and in the review, not in the
+  message.
+- The verifier: `not_after` and `not_before` of a key are enforced against
+  the clock; a checkpoint the auditor already holds is not judged by the
+  validity window of its key; an absent publication object is exit status
+  3 and never 0.
+- The design of failover departs from the design of phase 5 in one point:
+  a forced failover without a majority is not in this part.
+- Independent reviews are run one at a time from now on, not in parallel.
+
+### Still open
+
+- `kingresd`: not committed. The changes that were meant to end the
+  failures of complete runs are in a working tree; two complete runs of
+  the integration suite on 2026-11-16 (one per major, on a busy machine)
+  each passed 652 tests and failed 3: on 18, a healthy group that refused
+  connections for seconds after another server was removed, and a catalog
+  that `check_cluster()` reports as differing, with a misplaced partition,
+  after a task changed holder; on 19, a follower that refused a read
+  during a short loss of the leader, and a call between servers that
+  failed with a transport error. The causes are being examined together
+  with RBR-01 to RBR-07. Failover, switchover and
+  `restorePreferredPrimaries` are designed and not written.
+- `kingres_shard`: the fixes for S9 were not reviewed again (in progress);
+  a participant that requires no confirmation can lose its part after the
+  retention time, recorded and not prevented.
+- `kingres_columnar`: the fixes for C5 were not reviewed again.
+- `kingres_sketch`, `kingres_timepart`: K12U-01 (documentation); the last
+  review did not cover the seal and the owner-driven path in depth.
+- The verifier and `kingres_ledger`: the fixes for L8 were not reviewed
+  again; a member of `pg_write_all_data` can insert into the ledger
+  tables, a valid successor block included.
+- Phase 7: steps 3 to 25. Phase 2b, phases 9, 10 and 11 and the rest of
+  phase 12 are not started.
+
+### Core patches
+
+None.
+
+---
+
 ## 2026-11-16: The history of both branches rewritten once, rebalancing in the control plane, kingresd on PostgreSQL 19, phase 7 designed and begun, fix rounds and their reviews
 
 ### What was done
