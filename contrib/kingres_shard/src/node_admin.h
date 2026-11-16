@@ -17,6 +17,7 @@
 #include "postgres.h"
 
 extern void kingres_shard_require_map_group(void);
+extern bool kingres_shard_is_recognized_map_primary(void);
 extern void kingres_shard_lock_catalog(void);
 extern void kingres_shard_sync_catalog_internal(void);
 extern bool kingres_shard_reload_catalog(void);

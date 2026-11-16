@@ -18,6 +18,10 @@ use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('dump');
 $node->init;
+# The superuser of this test drives the tables of other roles in its own session, which the
+# extension does not do unless it is told that the owners are trusted.
+$node->append_conf('postgresql.conf', "kingres_timepart.trust_table_owners = on
+");
 $node->start;
 
 sub q1
@@ -153,7 +157,13 @@ is($seen_xb, 'xb_t:xb:true shared_name:xb:true', 'the original: xb sees only its
 is(seen($node, 'restored', 'xa'), $seen_xa, 'after the restore xa sees the same (a role that is not a superuser)');
 is(seen($node, 'restored', 'xb'), $seen_xb, 'and xb the same');
 is(q1('restored', q{SELECT count(*) FROM kingres.timepart_run_data WHERE stamp <> kingres.timepart__stamp()}) > 0 ? 'foreign' : 'own',
-	'foreign', 'the rows carry the stamp of the other installation until a run adopts them');
+	'foreign', 'the rows carry the stamp of the other installation until they are adopted');
+
+# The policies are inert after a restore: nothing is due, a run of a table is
+# recorded as failed and does nothing, and the check says so.  Only a superuser's
+# timepart_adopt() makes them the policies of this installation.
+is(q1('restored', q{SELECT count(*) FROM kingres.timepart_due('2100-01-01 UTC')}), '0', 'nothing is due: the restored policies are not adopted');
+is(q1('restored', q{SELECT count(*) > 0 FROM kingres.timepart_check() WHERE problem = 'policy_unverified'}), 't', 'the check reports them');
 
 # The OID in the policy is a hint: the restored tables have other OIDs.
 is(q1('restored', q{SELECT count(*) FROM kingres.timepart_policy p WHERE p.parent_oid = to_regclass(format('%I.%I', p.schema_name, p.table_name))::oid}),
@@ -183,6 +193,8 @@ is(q1('restored', q{SELECT count(*) FROM kingres.timepart_policy WHERE table_nam
 	'nor deleted when that table is dropped');
 is(q1('restored', q{SELECT count(*) FROM kingres.timepart_check() WHERE problem = 'policy_orphan' AND table_name = 'dd'}), '1',
 	'it is an orphan, as it was');
+# The adoption is the superuser's, and says what it adopts.
+cmp_ok(q1('restored', q{SELECT kingres.timepart_adopt()}), '>', 0, 'timepart_adopt() adopts the policies and the history of the restore');
 # A policy with a stale hint is found by name, and the hint is refreshed.
 my $maxrun = q1('restored', q{SELECT max(run_id) FROM kingres.timepart_run});
 $node->safe_psql('restored', q{SET timezone = 'UTC'; CALL kingres.timepart_run('app.ev', '2026-03-14 00:00 UTC');});
@@ -223,6 +235,8 @@ is(q1('restored_plain', q{SELECT 'policy', count(*) FROM kingres.timepart_policy
 	UNION ALL SELECT 'action', count(*) FROM kingres.timepart_run_action ORDER BY 1}),
 	'the plain dump carries policies, runs and actions');
 my $nextid = q1('restored_plain', q{SELECT kingres.timepart_begin_run('app.ev', '2026-03-20 UTC', 'manual')});
+is(q1('restored_plain', q{SELECT state || ' ' || left(error, 36) FROM kingres.timepart_run WHERE run_id = } . $nextid),
+	'failed 42501: policy_unverified: the policy', 'a run before the adoption fails and says why');
 cmp_ok($nextid, '>', q1('postgres', q{SELECT max(run_id) FROM kingres.timepart_run}),
 	'run numbers go on in the plain restore too');
 
@@ -331,8 +345,8 @@ is(q1('has_schema2', q{SELECT count(*) FROM kingres.timepart_policy}) . q1('has_
 # After the runs above, the rows of the restored database are adopted.
 is(q1('restored', q{SELECT count(*) FROM kingres.timepart_run_data WHERE stamp <> kingres.timepart__stamp()}), '0',
 	'a run adopted the rows that the restore brought');
-is(q1('restored', q{SELECT count(*) FROM kingres.timepart_policy_data WHERE stamp <> kingres.timepart__stamp()}), '0',
-	'and the policies');
+is(q1('restored', q{SELECT count(*) FROM kingres.timepart_policy_data WHERE stamp <> kingres.timepart__stamp()}), '1',
+	'and the policies, but the one of the table that is gone (dd), which stays as it was');
 is(seen($node, 'restored', 'xa'), $seen_xa, 'adoption does not change who sees what (xa)');
 is(seen($node, 'restored', 'xb'), $seen_xb, 'nor (xb)');
 
@@ -343,6 +357,8 @@ my $dump2 = $node->basedir . '/db2.dump';
 $node->command_ok([ 'pg_dump', '-Fc', '-f', $dump2, $node->connstr('postgres') ], 'pg_dump for the other cluster');
 my $node2 = PostgreSQL::Test::Cluster->new('dump2');
 $node2->init;
+$node2->append_conf('postgresql.conf', "kingres_timepart.trust_table_owners = on
+");
 $node2->start;
 $node2->safe_psql('postgres', q{
 CREATE ROLE filler1; CREATE ROLE filler2; CREATE ROLE filler3;
@@ -362,11 +378,13 @@ foreach my $db ('r2', 'r3')
 	cmp_ok(q2($node2, $db, q{SELECT count(*) FROM kingres.timepart_run_data WHERE stamp <> kingres.timepart__stamp()}), '>', 0,
 		"$db: the rows have the stamp of the other installation");
 }
-# r2: adopt by hand; r3: the scheduler's question adopts, too
+# r2 and r3: adopt by hand; the scheduler's question adopts the history only
 cmp_ok(q2($node2, 'r2', q{SELECT kingres.timepart_adopt()}), '>', 0, 'timepart_adopt() adopts rows of the other cluster');
 is(q2($node2, 'r2', q{SELECT count(*) FROM kingres.timepart_run_data WHERE stamp <> kingres.timepart__stamp()}), '0', 'r2: all of them');
-is(q2($node2, 'r3', q{SELECT count(*) >= 0 FROM kingres.timepart_due('2030-01-01 UTC')}), 't', 'r3: timepart_due answers');
-is(q2($node2, 'r3', q{SELECT count(*) FROM kingres.timepart_run_data WHERE stamp <> kingres.timepart__stamp()}), '0', 'r3: and has adopted the rows');
+is(q2($node2, 'r3', q{SELECT count(*) FROM kingres.timepart_due('2030-01-01 UTC')}), '0', 'r3: timepart_due lists nothing: the policies are not adopted');
+is(q2($node2, 'r3', q{SELECT count(*) FROM kingres.timepart_run_data WHERE stamp <> kingres.timepart__stamp()}), '0', 'r3: it has adopted the history, which is only information');
+cmp_ok(q2($node2, 'r3', q{SELECT count(*) FROM kingres.timepart_policy_data WHERE stamp <> kingres.timepart__stamp()}), '>', 0, 'r3: and not the policies');
+cmp_ok(q2($node2, 'r3', q{SELECT kingres.timepart_adopt()}), '>', 0, 'r3: timepart_adopt() adopts them');
 # the roles are renamed after that, and are followed
 $node2->safe_psql('postgres', q{ALTER ROLE xa RENAME TO xa2; ALTER ROLE xb RENAME TO xb2;});
 $node2->safe_psql('r2', q{SET timezone = 'UTC'; CALL kingres.timepart_run('app.xa_t', '2026-03-11 UTC');});

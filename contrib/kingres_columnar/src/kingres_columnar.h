@@ -85,13 +85,15 @@ StaticAssertDecl(KC_MAX_STRIPE_ROWS <= KC_STRIPE_ROWS_READ_LIMIT,
 /*
  * table_xid is the transaction that created the table, as opposed to created_xid,
  * which is that of the file.  TRUNCATE and every rewrite give a table a new file
- * and copy table_xid from the old one (or, for a table that was not columnar
- * before, take the creation of the old table), so it follows the content
- * through any chain of replacements.  A snapshot that cannot see it is older
- * than the table: nothing existed for that snapshot to read, whatever files
- * the table has had since, and the answer is an empty table, not an error
- * (kc_check_snapshot_age).  It is an id in the file like created_xid, and
- * VACUUM freezes it the same way.
+ * and copy table_xid from the old one, so it follows the content through any
+ * chain of replacements.  A table that was not columnar before has it only when
+ * the conversion knows the creation for certain (the table was made in the
+ * converting transaction, or has no storage); otherwise it is 0, "not known",
+ * and the reader asks the catalog what the snapshot saw (kc_check_snapshot_age).
+ * A snapshot that cannot see it is older than the table: nothing existed for
+ * that snapshot to read, whatever files the table has had since, and the answer
+ * is an empty table, not an error.  It is an id in the file like created_xid,
+ * and VACUUM freezes it the same way (0 stays 0).
  */
 /*
  * The file replaced the content of a relation that existed (TRUNCATE).  A
@@ -356,7 +358,7 @@ extern void kc_catalog_insert(Relation rel, const KcStripeInfo *si,
 							  const char *cid_points, int cid_len,
 							  const char *col_stats, int stats_len, bool frozen,
 							  bool maintenance);
-extern void kc_catalog_delete_uid(uint64 uid);
+extern int	kc_catalog_delete_uid(uint64 uid);
 extern int	kc_catalog_delete_stripe(uint64 uid, uint64 stripe_id);
 extern bool kc_catalog_uid_in_use(uint64 uid);
 extern bool kc_catalog_all_visible(Relation rel, TransactionId oldest_xmin);
@@ -381,21 +383,23 @@ extern void kc_write_flush_relation(Relation rel);
 extern void kc_write_discard_relation(Oid relid, bool *had_outer);
 extern void kc_write_set_frozen(Relation rel, bool frozen);
 extern void kc_write_set_maintenance(bool on);
-extern void kc_write_request_reconcile(void);
+extern void kc_write_note_replaced(Relation rel);
+extern int	kc_write_cleanup_replaced(void);
 extern void kc_write_maintenance_flush(Relation rel);
 extern void kc_write_maintenance_discard(void);
-extern int	kc_write_pending_count(Oid relid);
-extern bool kc_write_pending_get(Oid relid, int ordinal, uint32 *serial);
 
+/* the rows [first, nrows) of one buffer: its visible part when the scan began */
 typedef struct KcPendingRef
 {
 	uint32		serial;
-	uint32		nrows;			/* rows present when the scan started */
+	uint32		first;
+	uint32		nrows;
 } KcPendingRef;
 
 extern uint64 kc_write_hold_acquire(Oid relid, uint64 uid, KcPendingRef **refs,
 									int *n);
 extern void kc_write_hold_release(uint64 hold);
+extern void kc_write_hold_check(uint64 hold, Relation rel);
 extern bool kc_write_pending_fetch(Oid relid, const KcPendingRef *ref,
 								   uint32 rowno, Datum **vals, bool **nulls,
 								   int *ncols, CommandId *cid);

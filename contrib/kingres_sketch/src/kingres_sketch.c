@@ -26,6 +26,7 @@
  */
 #include "postgres.h"
 
+#include "access/detoast.h"
 #include "access/parallel.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
@@ -36,6 +37,7 @@
 #include "utils/builtins.h"
 #include "utils/fmgrprotos.h"
 #include "utils/guc.h"
+#include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/typcache.h"
 
@@ -107,11 +109,25 @@ ks_invalid_value(const char *typname, const char *why)
 			 errdetail("%s.", why)));
 }
 
+/*
+ * The working memory of a call that is not an aggregate is not counted (it
+ * is freed with the row), but a value that alone passes the limit is refused
+ * before it is detoasted and unpacked: the unpacked form is as large as the
+ * value and more (see the README for the measured factors).
+ */
+void
+ks_arg_precheck(FunctionCallInfo fcinfo, int argno)
+{
+	ks_acct_precheck(toast_raw_datum_size(PG_GETARG_DATUM(argno)) - VARHDRSZ);
+}
+
 const uint8 *
 ks_arg_bytes(FunctionCallInfo fcinfo, int argno, Size *len)
 {
-	struct varlena *v = pg_detoast_datum_packed((struct varlena *) PG_GETARG_POINTER(argno));
+	struct varlena *v;
 
+	ks_arg_precheck(fcinfo, argno);
+	v = pg_detoast_datum_packed((struct varlena *) PG_GETARG_POINTER(argno));
 	*len = VARSIZE_ANY_EXHDR(v);
 	return (const uint8 *) VARDATA_ANY(v);
 }
@@ -174,6 +190,7 @@ ks_in_common(FunctionCallInfo fcinfo, int kind, const char *typname,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("invalid input syntax for type %s", typname),
 				 errdetail("The value is longer than any valid %s.", typname)));
+	ks_acct_precheck(nbytes);
 	buf = (uint8 *) palloc(nbytes > 0 ? nbytes : 1);
 	for (i = 0; i < nbytes; i++)
 	{
@@ -238,6 +255,7 @@ ks_recv_common(FunctionCallInfo fcinfo, int kind, const char *typname,
 				(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
 				 errmsg("invalid binary input for type %s", typname),
 				 errdetail("The value is longer than any valid %s.", typname)));
+	ks_acct_precheck(nbytes);
 	data = pq_getmsgbytes(buf, nbytes);
 	if (!validate((const uint8 *) data, nbytes, why))
 		ereport(ERROR,
@@ -291,30 +309,87 @@ ks_from_bytea_common(FunctionCallInfo fcinfo, int kind, const char *typname,
 /* ---- memory of aggregate states ---- */
 
 /*
- * The limit, in kilobytes, of the bytes that the aggregate states of one
- * backend may hold together (a parallel worker is a backend of its own and
- * has its own count).  PGC_USERSET with a check hook, not PGC_SUSET: any role
- * may lower its own limit (a role that wants a query of its own to stop
- * early), but a role that is not a superuser may not raise it above what the
- * administrator gave it, which is the reset value of the setting (the
- * configuration file, ALTER DATABASE or ALTER ROLE).  PostgreSQL's own
- * settings that protect the server (temp_file_limit, max_stack_depth) are
- * PGC_SUSET; those a user may only tighten have no such context, so the
- * hook makes the same rule as PGC_SUSET for a raise.
+ * The limit on the bytes that the aggregate states of one backend may hold
+ * together (a parallel worker is a backend of its own and has its own count)
+ * is the smaller of two settings:
+ *
+ *	state_memory_ceiling	PGC_SUSET: the administrator's.  PostgreSQL itself
+ *		refuses to let a role without the privilege store or set a PGC_SUSET
+ *		setting, by SET, set_config, ALTER ROLE, ALTER DATABASE, the SET clause
+ *		of a function and the options of a connection, and it refuses the same
+ *		for a value stored before the library is loaded (a name that is not yet
+ *		known is a placeholder that only a superuser or a holder of GRANT SET
+ *		ON PARAMETER may store, and a placeholder set by a plain SET is applied
+ *		to the real setting with the rights of the role that set it).
+ *	state_memory_limit	PGC_USERSET: any role's own, to lower the limit for a
+ *		query of its own.  -1 means the ceiling alone.
+ *
+ * An earlier version had one USERSET setting and a check hook that judged by
+ * the source of the value; a role could store a value for itself with
+ * ALTER ROLE, which the hook never saw.  A hook cannot know who stored a
+ * value, so the rule is in the context of the setting, which PostgreSQL
+ * enforces at every place a value can enter.
  */
-#define KS_STATE_LIMIT_DEFAULT_KB	(1024 * 1024)
+#define KS_STATE_CEILING_DEFAULT_KB	(1024 * 1024)
 
-static int	ks_state_limit_kb = KS_STATE_LIMIT_DEFAULT_KB;
+static int	ks_state_ceiling_kb = KS_STATE_CEILING_DEFAULT_KB;
+static int	ks_state_limit_kb = -1;
 
 /* The sum of the accounts of the live state contexts of this backend. */
 static int64 ks_state_bytes = 0;
 
+/*
+ * The ceiling that applies when the administrator's value of the ceiling was
+ * lost.  PostgreSQL keeps a value of a setting whose library is not loaded yet
+ * as a placeholder.  A role can pass the setting in the options of its
+ * connection (a source that wins over the configuration file and over
+ * ALTER ROLE and ALTER DATABASE and becomes the reset value of the
+ * placeholder); when the library is loaded, PostgreSQL refuses that value
+ * because the setting is PGC_SUSET, and it has already dropped the
+ * administrator's value for the one it refuses, so the setting is left at its
+ * built-in default, which can be higher than what the administrator gave.  The
+ * loss is seen in _PG_init and the limit of that backend is the smaller of the
+ * ceiling and this failsafe, so that the attempt can only lower the limit of
+ * the role that made it.
+ */
+#define KS_FAILSAFE_KB	1024
+static bool ks_ceiling_lost = false;
+static bool ks_ceiling_applied = false;
+
+static int64
+ks_effective_limit(void)
+{
+	int			kb = ks_state_ceiling_kb;
+
+	if (ks_ceiling_lost && kb > KS_FAILSAFE_KB)
+		kb = KS_FAILSAFE_KB;
+
+	if (ks_state_limit_kb >= 0 && ks_state_limit_kb < kb)
+		kb = ks_state_limit_kb;
+	return (int64) kb * 1024;
+}
+
+/*
+ * The account of one aggregate context: the context that holds all states
+ * made under it, and the bytes charged to the counter for it.  The struct
+ * lives in the context it describes.
+ */
 struct KsAcct
 {
 	MemoryContextCallback cb;	/* must stay where it is: a context points to it */
 	MemoryContext cxt;
+	MemoryContext parent;		/* the aggregate context, the key of the table */
 	int64		bytes;			/* what this account has added to ks_state_bytes */
 };
+
+typedef struct KsAcctEntry
+{
+	MemoryContext parent;		/* hash key */
+	KsAcct	   *acct;
+} KsAcctEntry;
+
+static HTAB *ks_accts = NULL;
+static KsAcct *ks_last = NULL;	/* the account used last: a query has one aggregate context for all its groups */
 
 /*
  * The callback of a state context, called when the context is deleted or
@@ -329,6 +404,10 @@ ks_acct_reset_callback(void *arg)
 	ks_state_bytes -= acct->bytes;
 	acct->bytes = 0;
 	Assert(ks_state_bytes >= 0);
+	if (ks_last == acct)
+		ks_last = NULL;
+	if (ks_accts != NULL)
+		(void) hash_search(ks_accts, &acct->parent, HASH_REMOVE, NULL);
 }
 
 static void
@@ -337,9 +416,9 @@ ks_state_over_limit(int64 held)
 	ereport(ERROR,
 			(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 			 errmsg("aggregate states of kingres_sketch hold %lld bytes in this backend, over the limit of %lld bytes",
-					(long long) held, (long long) ks_state_limit_kb * 1024),
+					(long long) held, (long long) ks_effective_limit()),
 			 errdetail("Every group, and every parallel worker, has an aggregate state of its own, and work_mem does not limit them."),
-			 errhint("Aggregate fewer groups at once, use a smaller capacity, precision or compression, or ask a superuser to raise kingres_sketch.state_memory_limit.")));
+			 errhint("Aggregate fewer groups at once, use a smaller capacity, precision or compression, or ask a superuser to raise kingres_sketch.state_memory_ceiling.")));
 }
 
 KsAcct *
@@ -347,15 +426,40 @@ ks_acct_create(MemoryContext aggcontext)
 {
 	MemoryContext cxt;
 	KsAcct	   *acct;
+	KsAcctEntry *ent;
+	bool		found;
 
-	cxt = AllocSetContextCreate(aggcontext, "kingres_sketch aggregate state",
-								ALLOCSET_SMALL_SIZES);
+	if (ks_last != NULL && ks_last->parent == aggcontext)
+		return ks_last;
+	if (ks_accts == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(MemoryContext);
+		ctl.entrysize = sizeof(KsAcctEntry);
+		ctl.hcxt = TopMemoryContext;
+		ks_accts = hash_create("kingres_sketch aggregate contexts", 8, &ctl,
+							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	ent = (KsAcctEntry *) hash_search(ks_accts, &aggcontext, HASH_FIND, &found);
+	if (found)
+	{
+		ks_last = ent->acct;
+		return ent->acct;
+	}
+
+	cxt = AllocSetContextCreate(aggcontext, "kingres_sketch aggregate states",
+								ALLOCSET_SMALL_MINSIZE, ALLOCSET_SMALL_INITSIZE,
+								8 * 1024 * 1024);
 	acct = (KsAcct *) MemoryContextAllocZero(cxt, sizeof(KsAcct));
 	acct->cxt = cxt;
+	acct->parent = aggcontext;
+	ent = (KsAcctEntry *) hash_search(ks_accts, &aggcontext, HASH_ENTER, &found);
+	ent->acct = acct;
 	acct->cb.func = ks_acct_reset_callback;
 	acct->cb.arg = acct;
 	MemoryContextRegisterResetCallback(cxt, &acct->cb);
-	ks_acct_update(acct);
+	ks_last = acct;
 	return acct;
 }
 
@@ -377,78 +481,93 @@ ks_acct_update(KsAcct *acct)
 
 	ks_state_bytes += now - acct->bytes;
 	acct->bytes = now;
-	if (ks_state_bytes > (int64) ks_state_limit_kb * 1024)
+	if (ks_state_bytes > ks_effective_limit())
 		ks_state_over_limit(ks_state_bytes);
 }
 
 void
 ks_acct_precheck(Size want)
 {
-	if (ks_state_bytes + (int64) want > (int64) ks_state_limit_kb * 1024)
+	if (ks_state_bytes + (int64) want > ks_effective_limit())
 		ks_state_over_limit(ks_state_bytes + (int64) want);
 }
 
-void
-ks_acct_release(KsAcct *acct)
-{
-	MemoryContextDelete(acct->cxt);
-}
-
 /*
- * Check hook: a role that is not a superuser may set the limit up to the
- * reset value and not above it.  Values that come from the configuration
- * file, the command line and the per-database and per-role settings (which
- * only an administrator can store for another role) are not judged, nor are
- * the values a parallel worker takes over from its leader.
+ * Check hook of the ceiling: it accepts everything, and notes that a value
+ * of some source (not the built-in default) was accepted, which _PG_init
+ * needs to know (see ks_ceiling_lost).
  */
 static bool
-ks_state_limit_check(int *newval, void **extra, GucSource source)
+ks_ceiling_check(int *newval, void **extra, GucSource source)
 {
-	const char *reset;
-	int			ceiling;
-
-	if (source < PGC_S_CLIENT || source == PGC_S_OVERRIDE ||
-		IsParallelWorker() || superuser())
-		return true;
-	reset = GetConfigOptionResetString("kingres_sketch.state_memory_limit");
-	if (reset == NULL || !parse_int(reset, &ceiling, GUC_UNIT_KB, NULL))
-		return true;
-	if (*newval > ceiling)
-	{
-		GUC_check_errcode(ERRCODE_INSUFFICIENT_PRIVILEGE);
-		GUC_check_errmsg("permission denied to raise \"kingres_sketch.state_memory_limit\" above %d kB",
-						 ceiling);
-		GUC_check_errhint("Only a superuser can raise the limit; it can be lowered.");
-		return false;
-	}
+	if (source != PGC_S_DEFAULT && source != PGC_S_DYNAMIC_DEFAULT)
+		ks_ceiling_applied = true;
 	return true;
 }
 
 void
 _PG_init(void)
 {
-	DefineCustomIntVariable("kingres_sketch.state_memory_limit",
-							"Limit of the memory held by the aggregate states of one backend.",
-							"The aggregates of kingres_sketch (hll, topn, tdigest) keep one state per group and per parallel worker; work_mem does not limit them. A query that would hold more fails with SQLSTATE 54000. A parallel worker counts for itself.",
-							&ks_state_limit_kb,
-							KS_STATE_LIMIT_DEFAULT_KB,
+	bool		had_reset = false;
+
+	/* a placeholder with a reset value: a value that the definition below will try to apply */
+	if (GetConfigOption("kingres_sketch.state_memory_ceiling", true, false) != NULL)
+	{
+		const char *rs = GetConfigOptionResetString("kingres_sketch.state_memory_ceiling");
+
+		had_reset = (rs != NULL && rs[0] != '\0');
+	}
+	DefineCustomIntVariable("kingres_sketch.state_memory_ceiling",
+							"Ceiling of the memory held by the aggregate states of one backend; only a superuser sets it.",
+							"The aggregates of kingres_sketch (hll, topn, tdigest) keep one state per group and per parallel worker; work_mem does not limit them. A query that would hold more fails with SQLSTATE 54000. The limit of a backend is the smaller of this setting and kingres_sketch.state_memory_limit.",
+							&ks_state_ceiling_kb,
+							KS_STATE_CEILING_DEFAULT_KB,
 							1,
+							MAX_KILOBYTES,
+							PGC_SUSET,
+							GUC_UNIT_KB,
+							ks_ceiling_check,
+							NULL,
+							NULL);
+	if (had_reset && !ks_ceiling_applied)
+	{
+		ks_ceiling_lost = true;
+		ereport(WARNING,
+				(errmsg("the value of kingres_sketch.state_memory_ceiling that was set before the library was loaded was refused, and the ceiling is not known"),
+				 errdetail("The setting can only be set by a superuser; the limit of this session is at most %d kB.",
+						   KS_FAILSAFE_KB),
+				 errhint("Preload the library (shared_preload_libraries) so that the administrator's value cannot be lost.")));
+	}
+	DefineCustomIntVariable("kingres_sketch.state_memory_limit",
+							"Own limit of the memory held by the aggregate states of one backend; -1 means the ceiling alone.",
+							"Any role may set it, to lower the limit for itself; the limit in force is the smaller of this setting and kingres_sketch.state_memory_ceiling.",
+							&ks_state_limit_kb,
+							-1,
+							-1,
 							MAX_KILOBYTES,
 							PGC_USERSET,
 							GUC_UNIT_KB,
-							ks_state_limit_check,
+							NULL,
 							NULL,
 							NULL);
 	MarkGUCPrefixReserved("kingres_sketch");
 }
 
 PG_FUNCTION_INFO_V1(kingres_sketch_state_bytes);
+PG_FUNCTION_INFO_V1(kingres_sketch_state_limit);
 
 /* The bytes held by the aggregate states of this backend now (for tests and monitoring). */
 Datum
 kingres_sketch_state_bytes(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT64(ks_state_bytes);
+}
+
+/* The limit in force in this backend, in bytes: the smaller of the two settings. */
+Datum
+kingres_sketch_state_limit(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(ks_effective_limit());
 }
 
 /* ---- the aggregate memory context ---- */

@@ -136,6 +136,15 @@ SELECT (SELECT count(*) FROM kingres.ledger_digest) AS digests,
 --------------------------------------------------------------------------
 -- Pages: the bounds
 --------------------------------------------------------------------------
+-- The text of the error of ledger_head with the transaction id (the id of a real
+-- transaction, not the same on every run) replaced.
+CREATE FUNCTION public.head_err() RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM * FROM kingres.ledger_head();
+    RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+    RETURN regexp_replace(SQLERRM, 'transaction [0-9]+', 'transaction N');
+END $$;
 CREATE FUNCTION public.page(f bigint, m int) RETURNS text LANGUAGE sql AS $$
     SELECT coalesce(string_agg(e.height::text, ',' ORDER BY e.height), '(none)')
     FROM kingres.ledger_blocks_entries(f, m) e
@@ -473,8 +482,12 @@ SELECT public.page(0, 100) AS entries_after_losing_the_head;
  0,1,2,3
 (1 row)
 
-SELECT * FROM kingres.ledger_head();
-ERROR:  the head is block 3, but transactions of the ledger refer to block 4: the end of the chain was removed
+SELECT public.head_err() AS head;
+                                                                          head                                                                          
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+ the head is block 3, but the row of transaction N in kingres.ledger_tx names block 4: the end of the chain was removed, or the row was written by hand
+(1 row)
+
 SELECT (SELECT count(*) FROM kingres.ledger_verify()) > 0 AS verify_sees_it;
  verify_sees_it 
 ----------------
@@ -488,8 +501,12 @@ DELETE FROM kingres.ledger_blocks WHERE height >= 2;
 :trig_on;
 \c
 SET search_path = public;
-SELECT * FROM kingres.ledger_head();
-ERROR:  the head is block 1, but transactions of the ledger refer to block 4: the end of the chain was removed
+SELECT public.head_err() AS head;
+                                                                          head                                                                          
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+ the head is block 1, but the row of transaction N in kingres.ledger_tx names block 4: the end of the chain was removed, or the row was written by hand
+(1 row)
+
 -- All the blocks removed: the head is not "empty", it is an error.
 :trig_off;
 \c
@@ -498,8 +515,12 @@ DELETE FROM kingres.ledger_blocks;
 :trig_on;
 \c
 SET search_path = public;
-SELECT * FROM kingres.ledger_head();
-ERROR:  the chain has no block, but transactions of the ledger refer to block 4
+SELECT public.head_err() AS head;
+                                          head                                           
+-----------------------------------------------------------------------------------------
+ the chain has no block, but the row of transaction N in kingres.ledger_tx names block 4
+(1 row)
+
 SELECT public.page(0, 100) AS entries_after_losing_everything;
  entries_after_losing_everything 
 ---------------------------------
@@ -563,7 +584,7 @@ DELETE FROM kingres.ledger_tx WHERE block_height = 4;
 \c
 SET search_path = public;
 SELECT * FROM kingres.ledger_head();
-ERROR:  the head is block 3, but a digest was recorded at block 4: the end of the chain was removed
+ERROR:  the head is block 3, but digest 1 in kingres.ledger_digest names block 4: the end of the chain was removed, or the row was written by hand
 :trig_off;
 \c
 SET search_path = public;
@@ -590,7 +611,7 @@ UPDATE kingres.ledger_digest SET block_hash = sha256('not the block');
 \c
 SET search_path = public;
 SELECT * FROM kingres.ledger_head();
-ERROR:  block 4 is not the block a recorded digest names
+ERROR:  block 4 is not the block that digest 2 in kingres.ledger_digest names
 :trig_off;
 \c
 SET search_path = public;

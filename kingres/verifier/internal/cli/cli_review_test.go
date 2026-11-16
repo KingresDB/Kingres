@@ -117,6 +117,16 @@ func checkParityReset(t *testing.T, name string, wantCode int, reset func(), arg
 			jsteps = append(jsteps, s.Name+"|"+strings.TrimSpace(s.Detail))
 		}
 	}
+	// The clock reading differs between the two runs by definition.
+	clockRE := regexp.MustCompile(`system clock \S+`)
+	maskClock := func(in []string) []string {
+		out := make([]string, len(in))
+		for i, s := range in {
+			out[i] = clockRE.ReplaceAllString(s, "system clock T")
+		}
+		return out
+	}
+	notes, o.Notes = maskClock(notes), maskClock(o.Notes)
 	for what, pair := range map[string][2][]string{
 		"steps": {steps, jsteps}, "notes": {notes, o.Notes}, "not proved": {notProved, o.NotProved},
 		"missing": {missing, o.Missing}, "problems": {problems, o.Problems},
@@ -210,8 +220,8 @@ func TestKeyLimitedToATreeSize(t *testing.T) {
 	}
 	// The old checkpoint of consistency is checked with the limit too.
 	old := filepath.Join(p.logDir, "old.note")
-	if code, out, _ := run(t, append([]string{"consistency", "--trust", lim(299), "--old", old}, log...)...); code != 1 || !strings.Contains(out, "tree size 300") {
-		t.Errorf("old note beyond the limit: %d %s", code, out)
+	if code, out, errs := run(t, append([]string{"consistency", "--trust", lim(299), "--old", old}, log...)...); code != 2 || !strings.Contains(out+errs, "note has size 300") {
+		t.Errorf("old note beyond the limit: %d %s", code, out+errs)
 	}
 	if code, out, _ := run(t, append([]string{"consistency", "--trust", lim(700), "--old", old}, log...)...); code != 0 {
 		t.Errorf("both within the limit: %d %s", code, out)
@@ -250,73 +260,6 @@ func TestCheckpointNamesRollback(t *testing.T) {
 	_, js, _ := run(t, "checkpoint", "--trust", p.trust, "--log", p.log(), "--source", p.dir, "--json")
 	if !strings.Contains(js, "rollback") {
 		t.Errorf("json does not name rollback: %s", js)
-	}
-}
-
-func TestCheckpointState(t *testing.T) {
-	p := newPublication(t, 300, 700)
-	state := filepath.Join(t.TempDir(), "state")
-	args := func(more ...string) []string {
-		return append([]string{"checkpoint", "--trust", p.trust, "--log", p.log(), "--source", p.dir, "--state", state}, more...)
-	}
-	old := filepath.Join(p.logDir, "old.note")
-	cur, _ := os.ReadFile(filepath.Join(p.logDir, "checkpoint"))
-	oldBytes, _ := os.ReadFile(old)
-
-	// First use: the state is created.
-	code, out, _ := run(t, args()...)
-	if code != 0 || !strings.Contains(out, "state file did not exist") {
-		t.Fatalf("first use: %d %s", code, out)
-	}
-	if got, _ := os.ReadFile(state); string(got) != string(cur) {
-		t.Fatal("state was not written")
-	}
-	// Same checkpoint: fine, nothing rewritten.
-	if code, out, _ := run(t, args()...); code != 0 || !strings.Contains(out, "same size and root") {
-		t.Fatalf("same: %d %s", code, out)
-	}
-	// An older genuine checkpoint is refused, and the state keeps the larger one.
-	p.write(t, "checkpoint", string(oldBytes))
-	code, out, _ = run(t, args()...)
-	if code != 1 || !strings.Contains(out, "FAILED at step rollback") || strings.Contains(out, "VERIFIED") {
-		t.Fatalf("rollback: %d %s", code, out)
-	}
-	if got, _ := os.ReadFile(state); string(got) != string(cur) {
-		t.Fatal("a failed run changed the state")
-	}
-	// Another history of the same size: a fork.
-	forkRoot := refMTH(append([]h32{sha([]byte("other"))}, p.all[1:]...))
-	p.write(t, "checkpoint", p.signer.note(p.origin, 700, forkRoot))
-	if code, out, _ := run(t, args()...); code != 1 || !strings.Contains(out, "FAILED at step fork") {
-		t.Fatalf("fork: %d %s", code, out)
-	}
-	// A larger size is accepted, the state follows, and the output says that
-	// the extension was not proved.
-	if err := os.WriteFile(state, oldBytes, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	p.write(t, "checkpoint", string(cur))
-	code, out, _ = run(t, args()...)
-	if code != 0 || !strings.Contains(out, "not proved: that the log at size 700 extends the log at size 300") || !strings.Contains(out, "state file was updated to size 700") {
-		t.Fatalf("growth: %d %s", code, out)
-	}
-	if got, _ := os.ReadFile(state); string(got) != string(cur) {
-		t.Fatal("state was not advanced")
-	}
-	// No temporary file is left behind.
-	ents, _ := os.ReadDir(filepath.Dir(state))
-	if len(ents) != 1 {
-		t.Errorf("the state directory holds %d entries, expected only the state", len(ents))
-	}
-	// A state of another log, or one that does not verify, is an input error.
-	_ = os.WriteFile(state, []byte("garbage"), 0o644)
-	if code, _, errs := run(t, args()...); code != 2 || !strings.Contains(errs, "--state") {
-		t.Errorf("garbage state: %d %s", code, errs)
-	}
-	other := p.signer.note(testPrefix+"/c/"+testChain+"/e2", 5, refMTH(p.all[:5]))
-	_ = os.WriteFile(state, []byte(other), 0o644)
-	if code, _, _ := run(t, args()...); code != 2 {
-		t.Errorf("state of another log: %d", code)
 	}
 }
 

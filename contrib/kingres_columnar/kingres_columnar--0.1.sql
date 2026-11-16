@@ -96,9 +96,31 @@ CREATE FUNCTION columnar_creating_xid(rel regclass)
     LANGUAGE C STRICT SECURITY INVOKER
     SET search_path = pg_catalog, kingres, pg_temp;
 
+CREATE FUNCTION columnar_table_xid(rel regclass)
+    RETURNS xid
+    AS 'MODULE_PATHNAME', 'kingres_columnar_table_xid'
+    LANGUAGE C STRICT SECURITY INVOKER
+    SET search_path = pg_catalog, kingres, pg_temp;
+
 CREATE FUNCTION columnar_reconcile()
     RETURNS int
     AS 'MODULE_PATHNAME', 'kingres_columnar_reconcile'
+    LANGUAGE C STRICT SECURITY DEFINER
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+-- The two halves of the clean-up after a rewriting ALTER TABLE (see
+-- columnar_on_rewrite and columnar_check_ddl): the table_rewrite event names
+-- the table that gets a new file, the end of the command removes the stripe
+-- rows of the file it had.
+CREATE FUNCTION columnar_note_rewrite(rel regclass)
+    RETURNS void
+    AS 'MODULE_PATHNAME', 'kingres_columnar_note_rewrite'
+    LANGUAGE C STRICT SECURITY DEFINER
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+CREATE FUNCTION columnar_finish_rewrites()
+    RETURNS int
+    AS 'MODULE_PATHNAME', 'kingres_columnar_finish_rewrites'
     LANGUAGE C STRICT SECURITY DEFINER
     SET search_path = pg_catalog, kingres, pg_temp;
 
@@ -237,15 +259,31 @@ BEGIN
     -- either direction) replaces the table's file and leaves the stripe rows
     -- of the old one, which nothing can read any more.  Remove them with the
     -- command, in its transaction (a rollback brings them back), so that
-    -- columnar_check has nothing to report until the next VACUUM.
-    IF TG_TAG = 'ALTER TABLE' AND EXISTS (SELECT 1 FROM columnar_stripe) THEN
-        PERFORM columnar_reconcile();
+    -- columnar_check has nothing to report until the next VACUUM.  Only the
+    -- files the command replaced are looked at (columnar_on_rewrite named
+    -- them), so the cost does not depend on how many columnar tables exist.
+    IF TG_TAG = 'ALTER TABLE' THEN
+        PERFORM columnar_finish_rewrites();
     END IF;
+END;
+$$;
+
+-- A table that is about to get a new file: the access method notes the file it
+-- has, for the end of the command.
+CREATE FUNCTION columnar_on_rewrite()
+    RETURNS event_trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path = pg_catalog, kingres, pg_temp
+AS $$
+BEGIN
+    PERFORM kingres.columnar_note_rewrite(pg_event_trigger_table_rewrite_oid());
 END;
 $$;
 
 CREATE EVENT TRIGGER kingres_columnar_on_drop ON sql_drop
     EXECUTE FUNCTION columnar_on_drop();
+CREATE EVENT TRIGGER kingres_columnar_on_rewrite ON table_rewrite
+    EXECUTE FUNCTION columnar_on_rewrite();
 CREATE EVENT TRIGGER kingres_columnar_check_ddl ON ddl_command_end
     WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE', 'CREATE TRIGGER', 'CREATE SCHEMA',
                  'CREATE TABLE AS', 'SELECT INTO', 'CREATE MATERIALIZED VIEW',
@@ -253,6 +291,7 @@ CREATE EVENT TRIGGER kingres_columnar_check_ddl ON ddl_command_end
     EXECUTE FUNCTION columnar_check_ddl();
 ALTER EVENT TRIGGER kingres_columnar_on_drop ENABLE ALWAYS;
 ALTER EVENT TRIGGER kingres_columnar_check_ddl ENABLE ALWAYS;
+ALTER EVENT TRIGGER kingres_columnar_on_rewrite ENABLE ALWAYS;
 
 REVOKE ALL ON FUNCTION columnar_handler(internal) FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_set_options(regclass, text, int, int, int) FROM PUBLIC;
@@ -262,11 +301,15 @@ REVOKE ALL ON FUNCTION columnar_stripes(regclass) FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_compact(regclass, int) FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_check(boolean) FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_reconcile() FROM PUBLIC;
+REVOKE ALL ON FUNCTION columnar_note_rewrite(regclass) FROM PUBLIC;
+REVOKE ALL ON FUNCTION columnar_finish_rewrites() FROM PUBLIC;
+REVOKE ALL ON FUNCTION columnar_on_rewrite() FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_on_drop() FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_check_ddl() FROM PUBLIC;
 -- The functions that act on one table check ownership themselves.
 GRANT EXECUTE ON FUNCTION columnar_identity(regclass) TO PUBLIC;
 GRANT EXECUTE ON FUNCTION columnar_creating_xid(regclass) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION columnar_table_xid(regclass) TO PUBLIC;
 GRANT EXECUTE ON FUNCTION columnar_options(regclass), columnar_info(regclass),
     columnar_stripes(regclass), columnar_set_options(regclass, text, int, int, int),
     columnar_compact(regclass, int) TO PUBLIC;

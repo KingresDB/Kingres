@@ -360,13 +360,21 @@ $primary->safe_psql('postgres', "VACUUM fz");
 is($primary->safe_psql('postgres', "SELECT kingres.columnar_creating_xid('fz')"), '2',
 	'the primary froze the creating transaction id of the truncated table');
 catchup($primary, $standby);
-$standby->wait_for_log(qr/conflict with recovery/, $lpos);
-pass('the freeze record cancelled the standby query that might hold the id');
-my ($fout, $fret) = ('', 0);
-eval { ($fout, $fret) = $sf->query("SELECT count(*) FROM fz") };
-unlike($fout, qr/^\s*0\s*$/, 'the cancelled snapshot is not answered with the empty table');
+# a failure to find the conflict is a failed check, not a dead file
+my $cancelled = eval { $standby->wait_for_log(qr/conflict with recovery/, $lpos); 1 };
+ok($cancelled, 'the freeze record cancelled the standby query that might hold the id');
+
+# and the cancelled session is answered with the conflict, never with the empty
+# table that the frozen file would show: its next query fails, or the
+# connection is gone (a recovery conflict terminates an idle transaction)
+my $answer = '';
+my $ran = eval { $answer = $sf->query("SELECT count(*) FROM fz"); 1 };
+my $why = ($ran ? '' : $@) . ($sf->{stderr} // '');
+unlike($answer, qr/^\s*0\s*$/, 'the cancelled snapshot is not answered with the empty table');
+like($why, qr/conflict with recovery|terminating connection|server closed the connection|connection to server was lost|could not read columnar table/i,
+	'the cancelled snapshot is answered with the conflict or the serialization failure');
 eval { $sf->quit };
-log_is_clean($standby, 'standby after the freeze conflict') if 0;
+log_is_clean($standby, 'standby after the freeze conflict');
 
 ###############################################################################
 # 4. promotion

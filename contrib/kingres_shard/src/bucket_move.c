@@ -210,7 +210,7 @@ ctl_run(CtlConn *cc, const char *sql, int timeout_ms)
 
 	if (!PQsendQuery(cc->conn, sql))
 	{
-		char	   *msg = pchomp(PQerrorMessage(cc->conn));
+		char	   *msg = kingres_shard_conn_error_text(cc->conn);
 
 		ctl_discard(cc);
 		ereport(ERROR,
@@ -251,7 +251,7 @@ ctl_run(CtlConn *cc, const char *sql, int timeout_ms)
 					ereport(ERROR,
 							(errcode(ERRCODE_CONNECTION_FAILURE),
 							 errmsg("lost the connection to node %s:%d", cc->host, cc->port),
-							 errdetail_internal("%s", pchomp(PQerrorMessage(cc->conn)))));
+							 errdetail_internal("%s", kingres_shard_conn_error_text(cc->conn))));
 			}
 			res = PQgetResult(cc->conn);
 			if (res == NULL)

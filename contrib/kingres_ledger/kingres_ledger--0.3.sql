@@ -1777,6 +1777,18 @@ BEGIN
            'transaction refers to block ' || t.block_height || ', which does not exist'
       FROM kingres.ledger_tx t
      WHERE NOT EXISTS (SELECT 1 FROM kingres.ledger_blocks b WHERE b.height = t.block_height);
+    -- The same for the recorded digests (0.3): a digest that names a block that
+    -- does not exist.  This is the finding ledger_head stops on, so that an
+    -- operator who got its error finds the row here; it is not restricted to
+    -- the range, like the check above.  A digest that names a block with
+    -- another hash is not checked here (ledger_head stops on the newest one):
+    -- compare a digest that was kept elsewhere with ledger_verify_digest.
+    RETURN QUERY
+    SELECT 'digest_block'::text, 'digest ' || d.digest_id,
+           'digest refers to block ' || d.height || ', which does not exist'
+      FROM kingres.ledger_digest d
+      LEFT JOIN kingres.ledger_blocks b ON b.height = d.height
+     WHERE b.height IS NULL;
     RETURN QUERY
     SELECT 'pending_in_block'::text, 'tx ' || p.ledger_txid,
            'transaction is both pending and in block ' || t.block_height
@@ -2284,6 +2296,31 @@ COMMENT ON FUNCTION kingres.ledger_block_preimage(smallint, bigint, bytea, bytea
 --     digest must name the block that is there.  That catches the removal of
 --     the last blocks from ledger_blocks alone.  It does not catch someone who
 --     removes the same rows from the other tables too.
+--
+-- Why the refusal on a row above the head is right, and for ever (until an
+-- operator acts, see the README, "A row above the head"):
+--   * No honest path leaves such a row.  The builder writes a block, its
+--     transaction rows and the digest in one transaction, and a statement
+--     snapshot (a STABLE function reads the snapshot of the calling query,
+--     and a standby replays a commit whole) shows all of them or none.  The
+--     check was run against writers, builders and digest generators on a
+--     primary and on a hot standby that was replaying, with no false alarm.
+--   * Only a role that can write the table can plant one: a superuser, the
+--     owner, and any member of pg_write_all_data, which bypasses the table
+--     privileges that keep every other role out.  Each of them can already
+--     write a forged but valid block, so the refusal gives such a role no
+--     power over the chain that it does not have; it makes the damage show
+--     where a publisher would otherwise sign over it.
+--   * The row cannot be deleted through SQL (append-only, for every role), so
+--     a publisher that stops here stays stopped until a superuser removes the
+--     row on purpose.  That is intended: a row above the head may be the only
+--     trace of a block that was removed.
+--
+-- What the error tells a role that has EXECUTE and nothing else (a review
+-- note): the number of a block, a transaction id and a digest id, in the
+-- damaged case only.  That is no row data.  The role may read the head of the
+-- chain anyway, and a publisher needs the text to tell the operator which row
+-- to look at, so the details stay in the message.
 CREATE FUNCTION kingres.ledger_head()
     RETURNS TABLE (chain_id bytea, height bigint, block_hash bytea, closed_at_us bigint)
     LANGUAGE plpgsql
@@ -2296,7 +2333,7 @@ DECLARE
     b        record;
     first_pv bytea;
     prev_h   bytea;
-    tx_top   bigint;
+    tx       record;
     dg       record;
     dg_hash  bytea;
 BEGIN
@@ -2312,20 +2349,27 @@ BEGIN
       FROM kingres.ledger_blocks lb
      ORDER BY lb.height DESC
      LIMIT 1;
-    SELECT pg_catalog.max(t.block_height) INTO tx_top FROM kingres.ledger_tx t;
-    SELECT d.height AS dh, d.block_hash AS dhash INTO dg
+    -- The newest transaction row, by the unique index (block_height,
+    -- tx_index), and the newest digest row, by its key: two index probes.
+    SELECT t.block_height AS th, t.ledger_txid AS tid INTO tx
+      FROM kingres.ledger_tx t
+     ORDER BY t.block_height DESC, t.tx_index DESC
+     LIMIT 1;
+    SELECT d.digest_id AS did, d.height AS dh, d.block_hash AS dhash INTO dg
       FROM kingres.ledger_digest d
      ORDER BY d.digest_id DESC
      LIMIT 1;
     IF b.bh IS NULL THEN
         -- No block at all: empty, unless something still records a block.
-        IF tx_top IS NOT NULL THEN
-            RAISE EXCEPTION 'the chain has no block, but transactions of the ledger refer to block %', tx_top
-                USING ERRCODE = 'XX001', HINT = 'Run kingres.ledger_verify().';
+        IF tx.th IS NOT NULL THEN
+            RAISE EXCEPTION 'the chain has no block, but the row of transaction % in kingres.ledger_tx names block %',
+                tx.tid, tx.th
+                USING ERRCODE = 'XX001', HINT = 'Run kingres.ledger_verify(); see the README, "A row above the head".';
         END IF;
         IF dg.dh IS NOT NULL THEN
-            RAISE EXCEPTION 'the chain has no block, but a digest was recorded at block %', dg.dh
-                USING ERRCODE = 'XX001', HINT = 'Run kingres.ledger_verify().';
+            RAISE EXCEPTION 'the chain has no block, but digest % in kingres.ledger_digest names block %',
+                dg.did, dg.dh
+                USING ERRCODE = 'XX001', HINT = 'Run kingres.ledger_verify(); see the README, "A row above the head".';
         END IF;
         RETURN;
     END IF;
@@ -2361,21 +2405,21 @@ BEGIN
         RAISE EXCEPTION 'the identity of the chain does not match block 0'
             USING ERRCODE = 'XX001', HINT = 'Run kingres.ledger_verify().';
     END IF;
-    IF tx_top > b.bh THEN
-        RAISE EXCEPTION 'the head is block %, but transactions of the ledger refer to block %: the end of the chain was removed',
-            b.bh, tx_top
-            USING ERRCODE = 'XX001', HINT = 'Run kingres.ledger_verify().';
+    IF tx.th > b.bh THEN
+        RAISE EXCEPTION 'the head is block %, but the row of transaction % in kingres.ledger_tx names block %: the end of the chain was removed, or the row was written by hand',
+            b.bh, tx.tid, tx.th
+            USING ERRCODE = 'XX001', HINT = 'Run kingres.ledger_verify(); see the README, "A row above the head".';
     END IF;
     IF dg.dh IS NOT NULL THEN
         IF dg.dh > b.bh THEN
-            RAISE EXCEPTION 'the head is block %, but a digest was recorded at block %: the end of the chain was removed',
-                b.bh, dg.dh
-                USING ERRCODE = 'XX001', HINT = 'Run kingres.ledger_verify().';
+            RAISE EXCEPTION 'the head is block %, but digest % in kingres.ledger_digest names block %: the end of the chain was removed, or the row was written by hand',
+                b.bh, dg.did, dg.dh
+                USING ERRCODE = 'XX001', HINT = 'Run kingres.ledger_verify(); see the README, "A row above the head".';
         END IF;
         SELECT x.block_hash INTO dg_hash FROM kingres.ledger_blocks x WHERE x.height = dg.dh;
         IF dg_hash IS DISTINCT FROM dg.dhash THEN
-            RAISE EXCEPTION 'block % is not the block a recorded digest names', dg.dh
-                USING ERRCODE = 'XX001', HINT = 'Run kingres.ledger_verify().';
+            RAISE EXCEPTION 'block % is not the block that digest % in kingres.ledger_digest names', dg.dh, dg.did
+                USING ERRCODE = 'XX001', HINT = 'The chain was rewritten after the digest was recorded, or the digest row was written by hand; see the README, "A row above the head".';
         END IF;
     END IF;
     RETURN QUERY

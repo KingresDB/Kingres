@@ -255,8 +255,10 @@ parse_gid(const char *gid, ParsedGid *out)
 			size_t		blen = strlen(gid) - (KS_GID_TAG_LEN + 1);
 			char	   *body = pnstrdup(gid, blen);
 
-			out->kind = (kingres_shard_gid_tag(body, want) &&
-						 strcmp(want, tok[n - 1]) == 0) ? GID_TAGGED : GID_FORGED;
+			out->kind = ((kingres_shard_gid_tag(body, want) &&
+						  strcmp(want, tok[n - 1]) == 0) ||
+						 (kingres_shard_gid_tag_previous(body, want) &&
+						  strcmp(want, tok[n - 1]) == 0)) ? GID_TAGGED : GID_FORGED;
 			pfree(body);
 		}
 	}
@@ -333,8 +335,8 @@ origin_decision(const char *gid, uint64 fxid, int pid, bool earlier_timeline, bo
 static void
 purge_log(int node_id, const int *node_ids, int nids, TimestampTz listed_at, List *still_prepared, List *listed)
 {
-	Oid			argtypes[5] = {INT4ARRAYOID, TIMESTAMPTZOID, TEXTARRAYOID, INT4OID, INT4OID};
-	Datum		values[5];
+	Oid			argtypes[6] = {INT4ARRAYOID, TIMESTAMPTZOID, TEXTARRAYOID, INT4OID, INT4OID, BOOLOID};
+	Datum		values[6];
 	Datum	   *elems;
 	int			n = list_length(still_prepared);
 	int			i = 0;
@@ -362,13 +364,28 @@ purge_log(int node_id, const int *node_ids, int nids, TimestampTz listed_at, Lis
 	 */
 	values[3] = Int32GetDatum(node_id);
 	values[4] = Int32GetDatum(nids > 1 ? kingres_shard_decision_retention : 0);
+	values[5] = BoolGetDatum(nids > 1);	/* the group has a standby: only durable rows are forgotten */
+	/*
+	 * THE INVARIANT OF THE DECISION LOG (S9-01): a decision is never forgotten
+	 * while the participant that it names might still come back with the
+	 * transaction prepared.  That is possible as long as the participant's
+	 * synchronous standbys have not confirmed what the participant flushed,
+	 * the commit of its part included: a failover to a standby that has the
+	 * PREPARE and not the COMMIT PREPARED brings the part back prepared, and
+	 * without the row recovery would roll back a committed transaction.  So the
+	 * rows of the current primary are subject to the retention only once they are
+	 * marked durable (asked of the participant after the prepared transactions
+	 * were listed, see participant_confirmed); the rows of an unconfirmed
+	 * participant are kept without limit and reported by check_cluster().  The rows of
+	 * the nodes that are not the primary any more were looked at before this.
+	 */
 	if (SPI_execute_with_args("DELETE FROM " KINGRES_SHARD_SCHEMA ".dtx_log "
 							  "WHERE node_id OPERATOR(pg_catalog.=) ANY ($1) "
 							  "AND prepared_at OPERATOR(pg_catalog.<) $2 "
 							  "AND NOT (gid OPERATOR(pg_catalog.=) ANY ($3)) "
 							  "AND (node_id OPERATOR(pg_catalog.<>) $4 "
-							  "OR prepared_at OPERATOR(pg_catalog.<) (pg_catalog.clock_timestamp() OPERATOR(pg_catalog.-) pg_catalog.make_interval(secs => $5)))",
-							  5, argtypes, values, NULL, false, 0) != SPI_OK_DELETE)
+							  "OR ((durable OR NOT $6) AND prepared_at OPERATOR(pg_catalog.<) (pg_catalog.clock_timestamp() OPERATOR(pg_catalog.-) pg_catalog.make_interval(secs => $5))))",
+							  6, argtypes, values, NULL, false, 0) != SPI_OK_DELETE)
 		elog(ERROR, "could not clean kingres.dtx_log");
 
 	/*
@@ -438,6 +455,15 @@ record_incident(const char *gid, int node_id, uint32 gid_tli, TimeLineID current
 				 errhint("Look at the row of this gid in kingres.dtx_incident; the changes of the transaction on that group are lost.")));
 		return;
 	}
+	if (strcmp(kind, "rolled_back_after_retention") == 0)
+	{
+		ereport(WARNING,
+				(errmsg("kingres_shard recovery: prepared transaction \"%s\" on node %d is older than decision_retention and has no commit decision on this node; it was rolled back",
+						gid, node_id),
+				 errdetail("Either its origin never decided (it was lost long ago and this participant was out of reach until now), or it committed and its decision was forgotten after the retention, which happens only for a participant whose standbys cannot confirm a commit (none required)."),
+				 errhint("Look at the row of this gid in kingres.dtx_incident.")));
+		return;
+	}
 	ereport(WARNING,
 			(errmsg("kingres_shard recovery: prepared transaction \"%s\" on node %d belongs to timeline %u and has no commit decision on this node (timeline %u); it was rolled back",
 					gid, node_id, gid_tli, current_tli),
@@ -492,6 +518,7 @@ check_participant_parts(KsConn *kc, int node_id, const int *node_ids, int nids,
 	values[3] = Int32GetDatum(node_id);
 	if (SPI_execute_with_args("SELECT gid FROM " KINGRES_SHARD_SCHEMA ".dtx_log "
 							  "WHERE node_id OPERATOR(pg_catalog.=) ANY ($1) "
+							  "AND NOT exempt "
 							  "AND node_id OPERATOR(pg_catalog.<>) $4 "
 							  "AND prepared_at OPERATOR(pg_catalog.<) $2 "
 							  "AND NOT (gid OPERATOR(pg_catalog.=) ANY ($3))",
@@ -554,6 +581,98 @@ check_participant_parts(KsConn *kc, int node_id, const int *node_ids, int nids,
 }
 
 /*
+ * Are the decisions of this participant safe to forget (S9-01)?  They are when
+ * the participant's synchronous standbys have confirmed everything it has
+ * flushed, asked now, after the prepared transactions of this pass were listed:
+ * every commit whose gid was absent from that list is below the position the
+ * participant flushes at this moment.  A participant that has no decision to
+ * forget, or whose group has no registered standby, needs no question.  The
+ * answer is also written to kingres.dtx_unconfirmed, which check_cluster()
+ * reads, so that a decision that is kept for lack of a confirmation is visible.
+ */
+static bool
+participant_confirmed(KsConn *kc, int node_id, int nids, TimestampTz listed_at, List *still_prepared,
+						 bool demoted)
+{
+	Oid			argtypes[3] = {INT4OID, TIMESTAMPTZOID, TEXTARRAYOID};
+	Datum		values[3];
+	Datum	   *elems;
+	int			n = list_length(still_prepared);
+	int			i = 0;
+	ListCell   *lc;
+	int64		kept;
+	bool		confirmed = true;
+	bool		have_table = OidIsValid(kingres_shard_catalog_relid("dtx_unconfirmed"));
+
+	if (node_id == 0 || nids <= 1)
+		return true;
+	elems = palloc(sizeof(Datum) * Max(n, 1));
+	foreach(lc, still_prepared)
+		elems[i++] = CStringGetTextDatum((char *) lfirst(lc));
+	values[0] = Int32GetDatum(node_id);
+	values[1] = TimestampTzGetDatum(listed_at);
+	values[2] = PointerGetDatum(construct_array_builtin(elems, n, TEXTOID));
+	if (SPI_execute_with_args("SELECT count(*) FROM " KINGRES_SHARD_SCHEMA ".dtx_log "
+							  "WHERE node_id OPERATOR(pg_catalog.=) $1 AND NOT durable "
+							  "AND prepared_at OPERATOR(pg_catalog.<) $2 "
+							  "AND NOT (gid OPERATOR(pg_catalog.=) ANY ($3))",
+							  3, argtypes, values, NULL, true, 1) != SPI_OK_SELECT || SPI_processed != 1)
+		elog(ERROR, "could not read kingres.dtx_log");
+	{
+		bool		isnull;
+
+		kept = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+	}
+	/* A node the catalog does not call the primary (the old primary of a promotion) has no standby to ask. */
+	if (kept > 0 && !demoted)
+	{
+		char	   *qsql = psprintf("SELECT " KINGRES_SHARD_SCHEMA ".internal_sync_confirm(%d)",
+									Min(kingres_shard_node_timeout, 2) * 1000);
+		PGresult   *qres = kingres_shard_exec_params(kc, qsql, 0, NULL, NULL, false);
+
+		confirmed = (qres != NULL && PQresultStatus(qres) == PGRES_TUPLES_OK &&
+					 PQntuples(qres) == 1 && strcmp(PQgetvalue(qres, 0, 0), "t") == 0);
+		if (qres == NULL || PQresultStatus(qres) != PGRES_TUPLES_OK)
+			if (kc->conn == NULL || PQstatus(kc->conn) != CONNECTION_OK)
+				kc->have_error = true;
+		PQclear(qres);
+		pfree(qsql);
+	}
+	if (confirmed && kept > 0 &&
+		SPI_execute_with_args("UPDATE " KINGRES_SHARD_SCHEMA ".dtx_log SET durable = true "
+								  "WHERE node_id OPERATOR(pg_catalog.=) $1 AND NOT durable "
+								  "AND prepared_at OPERATOR(pg_catalog.<) $2 "
+								  "AND NOT (gid OPERATOR(pg_catalog.=) ANY ($3))",
+								  3, argtypes, values, NULL, false, 0) != SPI_OK_UPDATE)
+		elog(ERROR, "could not mark kingres.dtx_log");
+	if (have_table)
+	{
+		Oid			a2[2] = {INT4OID, INT8OID};
+		Datum		v2[2];
+
+		v2[0] = Int32GetDatum(node_id);
+		v2[1] = Int64GetDatum(kept);
+		if (confirmed)
+		{
+			if (SPI_execute_with_args("DELETE FROM " KINGRES_SHARD_SCHEMA ".dtx_unconfirmed "
+									  "WHERE node_id OPERATOR(pg_catalog.=) $1",
+									  1, a2, v2, NULL, false, 0) != SPI_OK_DELETE)
+				elog(ERROR, "could not clean kingres.dtx_unconfirmed");
+		}
+		else if (SPI_execute_with_args("INSERT INTO " KINGRES_SHARD_SCHEMA ".dtx_unconfirmed (node_id, since, kept) "
+									   "VALUES ($1, pg_catalog.clock_timestamp(), $2) "
+									   "ON CONFLICT (node_id) DO UPDATE SET kept = EXCLUDED.kept",
+									   2, a2, v2, NULL, false, 0) != SPI_OK_INSERT)
+			elog(ERROR, "could not record in kingres.dtx_unconfirmed");
+	}
+	if (!confirmed)
+		ereport(LOG,
+				(errmsg("kingres_shard recovery: the standbys of node %d have not confirmed what it flushed; its %lld decision(s) are kept until they do",
+						node_id, (long long) kept)));
+	return confirmed;
+}
+
+/*
  * kingres_shard_recover_prepared
  *
  * See the file header.  Returns the number of prepared transactions committed
@@ -583,6 +702,11 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 	TimeLineID	current_tli;
 	int			resolved = 0;
 	bool		sync_wait_failed = false;
+	List	   *all_prepared = NIL;	/* every prepared gid seen on any node in this pass */
+	int			expected_primaries = 0;
+	int			purged_primaries = 0;
+	bool		any_via_previous = false;	/* a node needed the previous cluster secret (S9-03) */
+	TimestampTz pass_start = GetCurrentTimestamp();
 	const char *old_format_until = "-infinity";
 
 	if (!cat->present || cat->local_node_id == 0)
@@ -628,6 +752,8 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 		r->host = MemoryContextStrdup(callercxt, n->host);
 		r->port = n->port;
 		nodes = lappend(nodes, r);
+		if (!r->standby)
+			expected_primaries++;
 	}
 	if (extra_host != NULL)
 	{
@@ -639,6 +765,7 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 		r->host = MemoryContextStrdup(callercxt, extra_host);
 		r->port = extra_port;
 		nodes = lappend(nodes, r);
+		expected_primaries++;
 	}
 
 	if (SPI_connect() != SPI_OK_CONNECT)
@@ -692,7 +819,7 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 		char	   *err = NULL;
 		KsConn	   *kc;
 		PGresult   *res;
-		const char *params[2];
+		const char *params[3];
 		TimestampTz listed_at;
 		List	   *gids = NIL;
 		List	   *old_flags = NIL;
@@ -717,6 +844,8 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 			ereport(ERROR,
 					(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 					 errmsg("recover_prepared_transactions() cannot run in a transaction that has operated on remote nodes")));
+		if (kc->via_previous)
+			any_via_previous = true;
 		if (r->standby)
 		{
 			PGresult   *rres = kingres_shard_exec_params(kc, "SELECT pg_catalog.pg_is_in_recovery()::pg_catalog.text",
@@ -759,7 +888,12 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 				continue;
 		}
 		/* The COMMIT PREPARED and ROLLBACK PREPARED below are acknowledged by this node's standby (S7-07). */
-		if (!kingres_shard_conn_force_sync(kc))
+		/*
+		 * A node that the catalog calls a standby and that is out of recovery is the one being
+		 * promoted or the old primary that was demoted: its standbys are not waited for (S9-05;
+		 * the old primary names the node that replaced it).
+		 */
+		if (!(r->standby ? kingres_shard_conn_local_sync(kc) : kingres_shard_conn_force_sync(kc)))
 		{
 			ereport(LOG,
 					(errmsg("kingres_shard recovery: could not set up the session on node %d, skipped", r->node_id)));
@@ -769,18 +903,20 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 		/* Both formats; parse_gid() and the group of the origin say which are ours. */
 		params[0] = "kingres\\_%";
 		params[1] = old_format_until;
+		params[2] = psprintf("%d", kingres_shard_decision_retention);
 		res = kingres_shard_exec_params(kc,
-										"SELECT gid, prepared OPERATOR(pg_catalog.<) $2::pg_catalog.timestamptz "
+										"SELECT gid, prepared OPERATOR(pg_catalog.<) $2::pg_catalog.timestamptz, "
+										"prepared OPERATOR(pg_catalog.<) (pg_catalog.clock_timestamp() OPERATOR(pg_catalog.-) pg_catalog.make_interval(secs => $3::pg_catalog.int4)) "
 										"FROM pg_catalog.pg_prepared_xacts "
 										"WHERE database OPERATOR(pg_catalog.=) pg_catalog.current_database() "
 										"AND gid LIKE $1 ORDER BY prepared",
-										2, NULL, params, false);
+										3, NULL, params, false);
 		if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK)
 		{
 			ereport(LOG,
 					(errmsg("kingres_shard recovery: could not list the prepared transactions of node %d (%s:%d)",
 							r->node_id, r->host, r->port),
-					 errdetail_internal("%s", kc->conn ? pchomp(PQerrorMessage(kc->conn)) : "")));
+					 errdetail_internal("%s", kingres_shard_conn_error_text(kc->conn))));
 			PQclear(res);
 			if (kc->conn == NULL || PQstatus(kc->conn) != CONNECTION_OK)
 				kc->have_error = true;
@@ -790,14 +926,17 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 		for (i = 0; i < ntup; i++)
 		{
 			gids = lappend(gids, pstrdup(PQgetvalue(res, i, 0)));
-			old_flags = lappend_int(old_flags, strcmp(PQgetvalue(res, i, 1), "t") == 0);
+			old_flags = lappend_int(old_flags, (strcmp(PQgetvalue(res, i, 1), "t") == 0 ? 1 : 0) |
+									(strcmp(PQgetvalue(res, i, 2), "t") == 0 ? 2 : 0));
 		}
 		PQclear(res);
+		all_prepared = list_concat(all_prepared, list_copy(gids));
 
 		forboth(lc2, gids, lc3, old_flags)
 		{
 			char	   *gid = (char *) lfirst(lc2);
-			bool		before_cutoff = (bool) lfirst_int(lc3);
+			bool		before_cutoff = (lfirst_int(lc3) & 1) != 0;
+			bool		past_retention = (lfirst_int(lc3) & 2) != 0;
 			ParsedGid	pg;
 			int			origin_group;
 			bool		earlier;
@@ -864,7 +1003,15 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 			}
 			sql = psprintf("%s PREPARED %s", commit ? "COMMIT" : "ROLLBACK",
 						   quote_literal_cstr(gid));
-			res = kingres_shard_exec_params(kc, sql, 0, NULL, NULL, false);
+			/*
+			 * COMMIT PREPARED and ROLLBACK PREPARED wait for the participant's standbys, and a session
+			 * of a user has no timeout for that wait (the worker's statement_timeout does not apply to
+			 * a commit): bounded by node_timeout, then cancelled, as every other wait on a node (S9).
+			 * The cancelled command has completed on the participant; its standby is asked below.
+			 */
+			res = kingres_shard_exec_cancel_after_timeout(kc->conn, sql);
+			if (res == NULL)
+				kc->have_error = true;
 			if (res != NULL && PQresultStatus(res) == PGRES_COMMAND_OK)
 			{
 				resolved++;
@@ -878,7 +1025,7 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 				 * not confirmed it, the decision row is kept for this pass at least, and
 				 * the retention keeps it after that (purge_log).
 				 */
-				if (commit)
+				if (commit && !r->standby)
 				{
 					char	   *qsql = psprintf("SELECT " KINGRES_SHARD_SCHEMA ".internal_sync_confirm(%d)",
 												Min(kingres_shard_node_timeout, 5) * 1000);
@@ -899,6 +1046,8 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 				}
 				if (!commit && earlier)
 					record_incident(gid, r->node_id, pg.tli, current_tli, "rolled_back_after_failover");
+				else if (!commit && past_retention)
+					record_incident(gid, r->node_id, pg.tli, current_tli, "rolled_back_after_retention");
 			}
 			else if (res != NULL &&
 					 kingres_shard_result_sqlstate(res) == ERRCODE_UNDEFINED_OBJECT)
@@ -910,13 +1059,12 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 				ereport(WARNING,
 						(errmsg("kingres_shard recovery: could not %s prepared transaction \"%s\" on node %d",
 								commit ? "commit" : "roll back", gid, r->node_id),
-						 errdetail_internal("%s", kc->conn ? pchomp(PQerrorMessage(kc->conn)) : "")));
+						 errdetail_internal("%s", kingres_shard_conn_error_text(kc->conn))));
 				still_prepared = lappend(still_prepared, gid);
 			}
 			PQclear(res);
 		}
 
-		kingres_shard_conn_unforce_sync(kc);
 		{
 			int		   *ids = palloc(sizeof(int) * (list_length(cat->nodes) + 1));
 			int			nids = 0;
@@ -931,20 +1079,76 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 					if (gn->group_id == r->group_id && gn->node_id != r->node_id)
 						ids[nids++] = gn->node_id;
 				}
+			/* Asked in the session that is still forced to wait for the standbys. */
+			(void) participant_confirmed(kc, r->node_id, nids, listed_at, still_prepared, r->standby);
+			kingres_shard_conn_unforce_sync(kc);
 			/* A participant that failed over and lost its part is found out before the decision is forgotten. */
-			if (!check_participant_parts(kc, r->node_id, ids, nids, listed_at, still_prepared, current_tli))
+			/* A node that the catalog does not call the primary is not where lost parts are looked for (S9-06). */
+			if (!r->standby &&
+				!check_participant_parts(kc, r->node_id, ids, nids, listed_at, still_prepared, current_tli))
 				continue;
 			purge_log(r->node_id, ids, nids, listed_at, still_prepared, gids);
+			if (!r->standby && r->node_id != 0)
+				purged_primaries++;
+			/* A session that needed the previous secret is not kept: the next one is made with the current one. */
+			if (kc->via_previous)
+				kc->have_error = true;
 		}
 	}
 
-	/* Rows of nodes that left the cluster have nothing left to resolve. */
-	if (SPI_execute("DELETE FROM " KINGRES_SHARD_SCHEMA ".dtx_log d "
-					"WHERE d.node_id OPERATOR(pg_catalog.>) 0 "
-					"AND NOT EXISTS (SELECT 1 FROM " KINGRES_SHARD_SCHEMA ".node n "
-					"WHERE n.node_id OPERATOR(pg_catalog.=) d.node_id)",
+	/*
+	 * Rows of nodes that left the cluster have nothing left to resolve, but only
+	 * when this pass looked at every primary and none of them holds the
+	 * transaction prepared: a node that was removed may have been the primary
+	 * of a group whose new primary still has the part prepared (S9-01).
+	 */
+	if (purged_primaries >= expected_primaries)
+	{
+		Oid			argtypes[2] = {TIMESTAMPTZOID, TEXTARRAYOID};
+		Datum		values[2];
+		Datum	   *elems;
+		int			i = 0;
+		ListCell   *lc4;
+
+		elems = palloc(sizeof(Datum) * Max(list_length(all_prepared), 1));
+		foreach(lc4, all_prepared)
+			elems[i++] = CStringGetTextDatum((char *) lfirst(lc4));
+		values[0] = TimestampTzGetDatum(pass_start);
+		values[1] = PointerGetDatum(construct_array_builtin(elems, i, TEXTOID));
+		if (SPI_execute_with_args("DELETE FROM " KINGRES_SHARD_SCHEMA ".dtx_log d "
+								  "WHERE d.node_id OPERATOR(pg_catalog.>) 0 "
+								  "AND d.prepared_at OPERATOR(pg_catalog.<) $1 "
+								  "AND NOT (d.gid OPERATOR(pg_catalog.=) ANY ($2)) "
+								  "AND NOT EXISTS (SELECT 1 FROM " KINGRES_SHARD_SCHEMA ".node n "
+								  "WHERE n.node_id OPERATOR(pg_catalog.=) d.node_id)",
+								  2, argtypes, values, NULL, false, 0) != SPI_OK_DELETE)
+			elog(ERROR, "could not clean kingres.dtx_log");
+	}
+	/*
+	 * The previous cluster secret is kept for the nodes that missed the commit of a
+	 * rotation (S9-03).  When this pass reached every primary with the current one
+	 * nobody needs it any more: no node holds a rotation prepared that it has not
+	 * been told about, and a session that needed it would have said so.
+	 */
+	{
+		unsigned char pbuf[128];
+		int			plen = 0;
+
+		if (purged_primaries >= expected_primaries && !any_via_previous &&
+			kingres_shard_previous_secret(pbuf, sizeof(pbuf), &plen))
+		{
+			explicit_bzero(pbuf, sizeof(pbuf));
+			if (SPI_execute("UPDATE " KINGRES_SHARD_SCHEMA ".cluster_secret SET previous = NULL, previous_at = NULL "
+							"WHERE previous IS NOT NULL", false, 0) != SPI_OK_UPDATE)
+				elog(ERROR, "could not clear the previous cluster secret");
+		}
+	}
+	if (OidIsValid(kingres_shard_catalog_relid("dtx_unconfirmed")) &&
+		SPI_execute("DELETE FROM " KINGRES_SHARD_SCHEMA ".dtx_unconfirmed u "
+					"WHERE NOT EXISTS (SELECT 1 FROM " KINGRES_SHARD_SCHEMA ".dtx_log l "
+					"WHERE l.node_id OPERATOR(pg_catalog.=) u.node_id)",
 					false, 0) != SPI_OK_DELETE)
-		elog(ERROR, "could not clean kingres.dtx_log");
+		elog(ERROR, "could not clean kingres.dtx_unconfirmed");
 
 	/*
 	 * A pending address is forgotten once the node is registered (the

@@ -137,14 +137,15 @@ compute_token(const unsigned char *secret, int secret_len, const char *role,
 	return true;
 }
 
-char *
-kingres_shard_forward_token(const char *user, int node_id)
+static char *
+forward_token_of(const char *user, int node_id, bool previous)
 {
 	unsigned char secret[KS_SECRET_MAX];
 	int			secret_len = 0;
 	char	   *hex;
 
-	if (!kingres_shard_cluster_secret(secret, sizeof(secret), &secret_len))
+	if (!(previous ? kingres_shard_previous_secret(secret, sizeof(secret), &secret_len) :
+		  kingres_shard_cluster_secret(secret, sizeof(secret), &secret_len)))
 		return NULL;
 	hex = palloc(KS_FORWARD_TOKEN_HEX_LEN + 1);
 	if (!compute_token(secret, secret_len, user, get_database_name(MyDatabaseId),
@@ -154,6 +155,19 @@ kingres_shard_forward_token(const char *user, int node_id)
 				 errmsg("could not compute the token for a node-to-node connection")));
 	explicit_bzero(secret, sizeof(secret));
 	return hex;
+}
+
+char *
+kingres_shard_forward_token(const char *user, int node_id)
+{
+	return forward_token_of(user, node_id, false);
+}
+
+/* The token made with the previous secret, or NULL when there is none (S9-03). */
+char *
+kingres_shard_forward_token_previous(const char *user, int node_id)
+{
+	return forward_token_of(user, node_id, true);
 }
 
 /* Compare two strings of the same length in time that does not depend on where they differ. */
@@ -236,6 +250,18 @@ kingres_shard_session_verified(void)
 	return forwarded_verified;
 }
 
+/*
+ * Did this session prove that it is a node session, by the token?  Not the same as
+ * kingres_shard_session_forwarded(): a node that is not part of a cluster has no
+ * secret to check a claim against and believes it (nothing to protect), which is
+ * not enough for a function that a role could use to hold a backend (S9-09).
+ */
+bool
+kingres_shard_session_node_proven(void)
+{
+	return kingres_shard_session_forwarded() && kingres_shard_session_verified();
+}
+
 bool
 kingres_shard_session_forwarded(void)
 {
@@ -277,8 +303,8 @@ kingres_internal_forward_token(PG_FUNCTION_ARGS)
  * zeros, which verifies on every node of such a cluster and means nothing.  tag
  * has room for 17 bytes.  False only when the HMAC cannot be computed.
  */
-bool
-kingres_shard_gid_tag(const char *body, char *tag)
+static bool
+gid_tag_of(const char *body, char *tag, bool previous)
 {
 	unsigned char secret[KS_SECRET_MAX];
 	int			secret_len = 0;
@@ -287,7 +313,12 @@ kingres_shard_gid_tag(const char *body, char *tag)
 	char		hex[2 * PG_SHA256_DIGEST_LENGTH + 1];
 	bool		ok;
 
-	if (!kingres_shard_cluster_secret(secret, sizeof(secret), &secret_len))
+	if (previous)
+	{
+		if (!kingres_shard_previous_secret(secret, sizeof(secret), &secret_len))
+			return false;
+	}
+	else if (!kingres_shard_cluster_secret_for_names(secret, sizeof(secret), &secret_len))
 	{
 		memset(tag, '0', 16);
 		tag[16] = '\0';
@@ -308,6 +339,24 @@ kingres_shard_gid_tag(const char *body, char *tag)
 	memcpy(tag, hex, 16);
 	tag[16] = '\0';
 	return true;
+}
+
+bool
+kingres_shard_gid_tag(const char *body, char *tag)
+{
+	return gid_tag_of(body, tag, false);
+}
+
+/*
+ * The tag made with the previous secret (S9-03): the name of a rotation's own
+ * prepared transaction is tagged with the secret that the rotation replaces,
+ * and recovery must still know it as ours once the origin holds the new one.
+ * False when there is no previous secret.
+ */
+bool
+kingres_shard_gid_tag_previous(const char *body, char *tag)
+{
+	return gid_tag_of(body, tag, true);
 }
 
 /*

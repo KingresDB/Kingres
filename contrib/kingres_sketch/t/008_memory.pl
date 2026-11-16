@@ -3,7 +3,8 @@
 #
 # The memory of aggregate states (K12S-03): one state per group and per
 # parallel worker, not limited by work_mem, bounded by the setting
-# kingres_sketch.state_memory_limit.
+# kingres_sketch.state_memory_ceiling and the own limit of a role,
+# state_memory_limit.
 #
 #   * the reproduction of the review: many groups of a topn aggregate with
 #     large items.  With the default limit the query runs (and the peak of the
@@ -14,8 +15,7 @@
 #     "parallel worker"); a limit above what any worker needs but below what the
 #     leader holds after the deserialisation and the combine fails in the
 #     leader; in both cases the counter of the session is zero afterwards;
-#   * who may raise the limit, by SET, by the options of a connection (a
-#     setting made before the library is loaded too) and by ALTER ROLE;
+#   * (who may set the ceiling and the limit: 009_memory_ceiling.pl);
 #   * many failing queries in a row leave the counter at zero.
 #
 # Nothing here depends on timing.
@@ -84,7 +84,7 @@ SKIP:
 		"SET kingres_sketch.state_memory_limit = '64MB';\n$groups");
 	like($e2, qr/ERROR:  aggregate states of kingres_sketch hold \d+ bytes in this backend, over the limit of 67108864 bytes/,
 		'limit 64MB: the query fails with the message');
-	like($e2, qr/HINT:  .*kingres_sketch\.state_memory_limit/s, 'the hint names the setting');
+	like($e2, qr/HINT:  .*kingres_sketch\.state_memory_ceiling/s, 'the hint names the setting');
 	cmp_ok($a2 - $b2, '<', 160_000,
 		"limit 64MB: the peak of a fresh backend stays bounded (" . ($a2 - $b2) . " kB)");
 }
@@ -154,46 +154,8 @@ is($node->safe_psql('postgres',
 is($node->safe_psql('postgres', "$par $q; SELECT kingres_sketch.state_bytes();"),
 	"20000\n0", 'the counter is zero after a completed parallel query');
 
-# ---- who may raise it ----
-
-sub as_user
-{
-	my ($sql, %opt) = @_;
-	my ($o, $e);
-	local $ENV{PGOPTIONS} = $opt{options} if defined $opt{options};
-	$node->psql('postgres', $sql, stdout => \$o, stderr => \$e,
-		extra_params => ['-U', 'ks_user'], on_error_stop => 0);
-	return ($o, $e);
-}
-
-# the library is loaded first: before that, a setting of the prefix is a placeholder and is judged when the library loads (below)
-my $load = "SELECT kingres_sketch.state_bytes(); ";
-($out, $err) = as_user($load . "SET kingres_sketch.state_memory_limit = '2GB';");
-like($err, qr/permission denied to raise "kingres_sketch.state_memory_limit"/, 'a role cannot raise the limit with SET');
-($out, $err) = as_user($load . "SET kingres_sketch.state_memory_limit = '10MB'; SHOW kingres_sketch.state_memory_limit; "
-	  . "RESET kingres_sketch.state_memory_limit; SHOW kingres_sketch.state_memory_limit;");
-is($err, '', 'a role can lower it and reset it');
-like($out, qr/10MB.*1GB/s, 'the values are 10MB, then the default again');
-
-# a setting made at the connection, before the library is loaded in the session
-($out, $err) = as_user("SELECT kingres_sketch.state_bytes(); SHOW kingres_sketch.state_memory_limit;",
-	options => '-c kingres_sketch.state_memory_limit=8GB');
-like($err, qr/WARNING:  permission denied to raise/, 'a raise in the connection options is refused when the library loads');
-like($out, qr/1GB/, 'and the limit is the default');
-($out, $err) = as_user("SELECT kingres_sketch.state_bytes(); SHOW kingres_sketch.state_memory_limit;",
-	options => '-c kingres_sketch.state_memory_limit=10MB');
-like($out, qr/10MB/, 'a lower value in the connection options holds');
-
-# the administrator gives a role a higher ceiling by ALTER ROLE
-$node->safe_psql('postgres', "ALTER ROLE ks_user SET kingres_sketch.state_memory_limit = '4GB'");
-($out, $err) = as_user($load . "SHOW kingres_sketch.state_memory_limit; SET kingres_sketch.state_memory_limit = '3GB'; "
-	  . "SHOW kingres_sketch.state_memory_limit; SET kingres_sketch.state_memory_limit = '5GB'; "
-	  . "RESET kingres_sketch.state_memory_limit; SHOW kingres_sketch.state_memory_limit;");
-like($out, qr/4GB.*3GB.*4GB/s, 'the role setting is the ceiling: 4GB, 3GB, then 4GB after RESET');
-like($err, qr/permission denied to raise.*4194304 kB/s, 'above the role setting it is refused');
-($out, $err) = as_user($load . "ALTER ROLE ks_user SET kingres_sketch.state_memory_limit = '8GB';");
-like($err, qr/permission denied/, "a role cannot raise its own stored setting");
-$node->safe_psql('postgres', "ALTER ROLE ks_user RESET kingres_sketch.state_memory_limit");
+# Who may set the ceiling and the limit, and what the next session of a role
+# sees, is tested in 009_memory_ceiling.pl.
 
 # ---- no leak over many failures ----
 

@@ -73,30 +73,31 @@ SELECT kingres.drop_old_time_partitions('tpo.o1', '2026-03-02 UTC');
 SELECT count(*) AS visible_policies FROM kingres.timepart_policy;
 SELECT count(*) AS visible_runs FROM kingres.timepart_run;
 SELECT count(*) AS visible_locks FROM kingres.timepart_lock;
--- The administration functions are not for the owner, even with EXECUTE.
+-- The functions that drive a run are the superuser's and the owner's of the
+-- table, and only with EXECUTE.  Pruning the history and adopting a backup are
+-- the superuser's alone, with EXECUTE granted or not.
 RESET ROLE;
-GRANT EXECUTE ON FUNCTION kingres.timepart_begin_run(regclass, timestamptz, text),
-                          kingres.timepart_due(timestamptz),
-                          kingres.timepart_finish_run(bigint),
-                          kingres.timepart_prune_runs(name, name, timestamptz) TO tp_owner;
-GRANT EXECUTE ON PROCEDURE kingres.timepart_run(regclass, timestamptz, text[], bigint),
-                           kingres.timepart_run_phase(bigint, text) TO tp_owner;
+GRANT EXECUTE ON FUNCTION kingres.timepart_prune_runs(name, name, timestamptz),
+                          kingres.timepart_adopt(boolean) TO tp_owner;
+SELECT kingres.timepart_grant_driver('tp_owner');
 SET ROLE tp_owner;
-SELECT kingres.timepart_begin_run('tpo.o1', '2026-03-10 UTC');
-SELECT * FROM kingres.timepart_due('2100-01-01 UTC');
-SELECT kingres.timepart_finish_run(1);
 SELECT kingres.timepart_prune_runs('tpo', 'o1', '2026-03-10 UTC');
+SELECT kingres.timepart_adopt();
+SELECT kingres.timepart_grant_driver('tp_other');
+-- The owner reads what is due for its tables and starts a run of its own table.
+-- This session is the session of a superuser that switched role, so the
+-- owner's code is not run in it: the action is refused and the run says why.
+SELECT * FROM kingres.timepart_due('2100-01-01 UTC');
+SELECT kingres.timepart_begin_run('tpo.o1', '2026-03-10 UTC') > 0 AS began;
+SELECT kingres.timepart_run_action((SELECT max(run_id) FROM kingres.timepart_run), 'create');
+SELECT state, left(error, 80) AS error FROM kingres.timepart_run ORDER BY run_id DESC LIMIT 1;
+SELECT kingres.timepart_finish_run((SELECT max(run_id) FROM kingres.timepart_run));
 CALL kingres.timepart_run('tpo.o1', '2026-03-10 UTC');
-CALL kingres.timepart_run_phase(1, 'create');
-SELECT kingres.timepart_run_action(1, 'create');
 RESET ROLE;
 -- Without EXECUTE the function cannot even be called.
-REVOKE EXECUTE ON FUNCTION kingres.timepart_begin_run(regclass, timestamptz, text),
-                           kingres.timepart_due(timestamptz),
-                           kingres.timepart_finish_run(bigint),
-                           kingres.timepart_prune_runs(name, name, timestamptz) FROM tp_owner;
-REVOKE EXECUTE ON PROCEDURE kingres.timepart_run(regclass, timestamptz, text[], bigint),
-                            kingres.timepart_run_phase(bigint, text) FROM tp_owner;
+SELECT kingres.timepart_revoke_driver('tp_owner');
+REVOKE EXECUTE ON FUNCTION kingres.timepart_prune_runs(name, name, timestamptz),
+                           kingres.timepart_adopt(boolean) FROM tp_owner;
 SET ROLE tp_nogrant;
 SELECT kingres.create_time_partitions('tpo.o1', '1 day', '2026-03-05 UTC', '2026-03-01 UTC');
 SELECT kingres.timepart_set_policy('tpo.o1', '1 day');

@@ -162,7 +162,7 @@ $secret = secret_of($n1);
 {
 	$n2->safe_psql('postgres', q{
 		CREATE FUNCTION public.boom() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'boom'; END $$;
-		CREATE TRIGGER boom BEFORE INSERT ON kingres.cluster_secret FOR EACH ROW EXECUTE FUNCTION public.boom();
+		CREATE TRIGGER boom BEFORE INSERT OR UPDATE ON kingres.cluster_secret FOR EACH ROW EXECUTE FUNCTION public.boom();
 	});
 	my ($rc, $out, $err) = run_sql($n1, 'SELECT kingres.sync_catalog()');
 	isnt($rc, 0, 'the push fails when the node refuses the secret');

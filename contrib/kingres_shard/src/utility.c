@@ -1509,14 +1509,16 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 
 			if (d.propagate && !kingres_shard_session_forwarded())
 			{
-				const KsNode *self;
 				ListCell   *lc;
 
-				self = kingres_shard_node_by_id(cat->local_node_id);
-				if (self == NULL || self->group_id != KINGRES_SHARD_MAP_GROUP || !self->is_primary)
+				if (!kingres_shard_is_recognized_map_primary())
 				{
+					const KsNode *self = kingres_shard_node_by_id(cat->local_node_id);
 					const KsNode *mg = kingres_shard_group_primary(KINGRES_SHARD_MAP_GROUP);
 
+					/* The catalog calls this node the map primary but PostgreSQL promoted it since: say so (S9-02). */
+					if (self != NULL && self->group_id == KINGRES_SHARD_MAP_GROUP && self->is_primary)
+						kingres_shard_require_map_group();
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("%s on a distributed or reference table must run on the map group primary",

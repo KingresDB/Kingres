@@ -222,5 +222,201 @@ SELECT 'OUT=' || count(*) || ',' || coalesce(sum(a), 0) FROM tv;");
 	is($res{columnar}, $res{heap}, "$end: what the transaction sees and what is left equal the heap twin ($res{heap})");
 }
 
+
+# ------------------------------------------------------------------------
+# C5-01.  The memory allowance holds whatever the width of the rows and
+# however they are grouped into statements and subtransactions.  The defect:
+# the flush at the commit of a subtransaction asked for a number of rows
+# (max(chunk_row_count, 1000)) and never for bytes, so a loop of exception
+# blocks that wrote rows of 100 kB kept chunk_row_count rows in memory whatever
+# write_buffer_memory said (954 MB against 128 MB in the review).
+#
+# The bound (README, "Memory"): the buffers of the running subtransaction are
+# written as soon as the buffers together are over the allowance, so what is
+# held is at most the allowance and the row being written.  What enclosing
+# subtransactions hold cannot be written by an inner one: it counts, and the
+# inner level writes its own buffers once they are half of the allowance, so an
+# open level that holds rows adds less than half of it.  The measure is the
+# memory contexts of the buffers, sampled after every statement and every
+# block, so it includes the allocator's unused part of a block.
+# ------------------------------------------------------------------------
+
+$node->safe_psql('postgres', q{
+CREATE FUNCTION kcmem() RETURNS bigint LANGUAGE sql AS
+$$ SELECT coalesce(sum(total_bytes), 0)::bigint FROM pg_backend_memory_contexts
+    WHERE name IN ('kingres_columnar rows', 'kingres_columnar write buffers') $$;
+CREATE FUNCTION kcnote() RETURNS bool LANGUAGE sql AS
+$$ SELECT set_config('kc.peak', greatest(coalesce(nullif(current_setting('kc.peak', true), '')::bigint, 0), kcmem())::text, false) IS NOT NULL $$;
+});
+
+my $MB = 1024 * 1024;
+my $ALLOW = 8;			# MB
+my $PAD = "repeat('x', 100000)";
+
+sub wide_fresh
+{
+	my ($tables) = @_;
+
+	foreach my $t (@$tables)
+	{
+		$node->safe_psql('postgres', "DROP TABLE IF EXISTS $t; CREATE TABLE $t (id int, pad text) USING columnar;");
+	}
+}
+
+# runs a DO block body that keeps the peak in the variable peak; returns
+# (peak, rows, stripes, rows of the smallest stripe but the last)
+sub wide_case
+{
+	my ($tables, $setup, $body, $after) = @_;
+
+	wide_fresh($tables);
+	$after //= '';
+	my $t = $tables->[0];
+	my ($out, $err) = script("
+SET kingres_columnar.write_buffer_memory = '${ALLOW}MB';
+BEGIN;
+$setup
+DO \$\$ DECLARE peak bigint := 0; m bigint; BEGIN
+$body
+RAISE NOTICE 'PEAK=%', peak; END \$\$;
+$after
+COMMIT;");
+	my ($peak) = $err =~ /PEAK=(\d+)/;
+	my $rows = $node->safe_psql('postgres', "SELECT sum(c) FROM (" .
+		join(' UNION ALL ', map { "SELECT count(*) c FROM $_" } @$tables) . ") s");
+	my $shape = $node->safe_psql('postgres', "
+		WITH s AS (SELECT row_number() OVER (ORDER BY stripe_id DESC) rn, row_count FROM kingres.columnar_stripes('$t'))
+		SELECT count(*) || ',' || coalesce(min(row_count) FILTER (WHERE rn > 1), 0) FROM s");
+	my ($nstripes, $small) = split /,/, $shape;
+	unlike($err, qr/ERROR/, "the case runs without an error") or diag($err);
+	return ($peak, $rows, $nstripes, $small);
+}
+
+my $SAMPLE = 'm := kcmem(); IF m > peak THEN peak := m; END IF;';
+my $WITHIN = $ALLOW * $MB + 1 * $MB;		# the allowance, a row and an allocator block
+
+# plain statements
+{
+	my ($peak, $rows, $n, $small) = wide_case(['tw'], '',
+		"FOR i IN 1..400 LOOP INSERT INTO tw VALUES (i, $PAD); $SAMPLE END LOOP;");
+	is($rows, 400, 'wide rows, one statement each: no row lost');
+	cmp_ok($peak, '<=', $WITHIN, "wide rows, one statement each: peak $peak bytes, within the allowance and a row");
+	cmp_ok($small, '>=', 40, "wide rows, one statement each: no stripe but the last under half the allowance ($small rows)");
+}
+
+# one statement, sampled inside it
+{
+	wide_fresh(['tw']);
+	my ($out, $err) = script("
+SET kingres_columnar.write_buffer_memory = '${ALLOW}MB';
+SELECT set_config('kc.peak', '0', false);
+INSERT INTO tw SELECT g, $PAD FROM generate_series(1, 300) g WHERE kcnote();
+SELECT 'PEAK=' || current_setting('kc.peak');");
+	my ($peak) = $out =~ /PEAK=(\d+)/;
+	cmp_ok($peak, '<=', $WITHIN, "one INSERT of 300 wide rows: peak $peak bytes, within the allowance and a row");
+	is($node->safe_psql('postgres', 'SELECT count(*) FROM tw'), 300, 'one INSERT of 300 wide rows: no row lost');
+}
+
+# the loop of exception blocks of the review
+{
+	my ($peak, $rows, $n, $small) = wide_case(['tw'], '',
+		"FOR i IN 1..400 LOOP BEGIN INSERT INTO tw VALUES (i, $PAD); EXCEPTION WHEN division_by_zero THEN NULL; END; $SAMPLE END LOOP;");
+	is($rows, 400, 'exception blocks, wide rows: no row lost');
+	cmp_ok($peak, '<=', $WITHIN, "exception blocks, wide rows: peak $peak bytes, within the allowance and a row");
+	cmp_ok($n, '<=', 12, "exception blocks, wide rows: $n stripes for 400 rows of 100 kB");
+	cmp_ok($small, '>=', 40, "exception blocks, wide rows: no stripe but the last under half the allowance ($small rows)");
+}
+
+# narrow and wide in one block
+{
+	my ($peak, $rows, $n, $small) = wide_case(['tw'], '',
+		"FOR i IN 1..300 LOOP BEGIN INSERT INTO tw SELECT g, repeat('y', 200) FROM generate_series(1, 10) g;
+		  INSERT INTO tw VALUES (i, $PAD); EXCEPTION WHEN division_by_zero THEN NULL; END; $SAMPLE END LOOP;");
+	is($rows, 3300, 'narrow and wide rows in each block: no row lost');
+	cmp_ok($peak, '<=', $WITHIN, "narrow and wide rows in each block: peak $peak bytes");
+	cmp_ok($small, '>=', 40, "narrow and wide rows in each block: no stripe but the last under 40 rows ($small)");
+}
+
+# narrow rows in small blocks: the stripes stay as large as the minimum rule says
+{
+	my ($peak, $rows, $n, $small) = wide_case(['tn'], '',
+		"FOR i IN 1..6000 LOOP BEGIN INSERT INTO tn SELECT g, repeat('y', 200) FROM generate_series(1, 7) g;
+		  EXCEPTION WHEN division_by_zero THEN NULL; END; $SAMPLE END LOOP;");
+	is($rows, 42000, 'narrow rows in blocks of 7: no row lost');
+	cmp_ok($peak, '<=', 1.5 * $ALLOW * $MB, "narrow rows in blocks of 7: peak $peak bytes, within 1.5 times the allowance");
+	cmp_ok($small, '>=', 1000, "narrow rows in blocks of 7: no stripe but the last under 1000 rows ($small)");
+}
+
+# three levels of subtransactions, the outer ones holding little
+{
+	my ($peak, $rows) = wide_case(['tw'], '',
+		"BEGIN INSERT INTO tw VALUES (0, $PAD);
+		  BEGIN INSERT INTO tw VALUES (0, $PAD);
+		    FOR i IN 1..300 LOOP BEGIN INSERT INTO tw VALUES (i, $PAD); EXCEPTION WHEN division_by_zero THEN NULL; END; $SAMPLE END LOOP;
+		  EXCEPTION WHEN division_by_zero THEN NULL; END;
+		EXCEPTION WHEN division_by_zero THEN NULL; END;");
+	is($rows, 302, 'three levels, wide rows: no row lost');
+	cmp_ok($peak, '<=', $WITHIN, "three levels, wide rows: peak $peak bytes");
+}
+
+# three levels, the outer one holding almost the allowance: what it holds cannot
+# be written by the levels inside, and the middle level adds less than half
+{
+	my ($peak, $rows) = wide_case(['tw'], "INSERT INTO tw SELECT g, $PAD FROM generate_series(1, 70) g;",
+		"BEGIN
+		  BEGIN
+		    FOR i IN 1..300 LOOP BEGIN INSERT INTO tw VALUES (i, $PAD); EXCEPTION WHEN division_by_zero THEN NULL; END; $SAMPLE END LOOP;
+		  EXCEPTION WHEN division_by_zero THEN NULL; END;
+		EXCEPTION WHEN division_by_zero THEN NULL; END;");
+	is($rows, 370, 'the outer level holds 7 MB: no row lost');
+	cmp_ok($peak, '<=', 1.5 * $ALLOW * $MB + 1 * $MB,
+		"the outer level holds 7 MB: peak $peak bytes, less than the allowance and half of it more");
+}
+
+# a cursor open on the table: the buffer it reads is held, the rows after it are
+# written under the allowance
+{
+	my ($peak, $rows, $n, $small) = wide_case(['tw'],
+		"INSERT INTO tw SELECT g, $PAD FROM generate_series(1, 10) g;
+		 DECLARE c CURSOR FOR SELECT id FROM tw; FETCH 1 FROM c;",
+		"FOR i IN 1..400 LOOP BEGIN INSERT INTO tw VALUES (100 + i, $PAD); EXCEPTION WHEN division_by_zero THEN NULL; END;
+		  INSERT INTO tw VALUES (1000 + i, $PAD); $SAMPLE END LOOP;",
+		"FETCH ALL FROM c;");
+	is($rows, 810, 'a cursor open on the table: no row lost');
+	cmp_ok($peak, '<=', $WITHIN + 1 * $MB,
+		"a cursor open on the table: peak $peak bytes, the allowance, the 10 rows it holds and a row");
+	cmp_ok($small, '>=', 10, "a cursor open on the table: no stripe but the last under 10 rows ($small)");
+	wide_fresh(['tw']);
+	my ($out) = script("
+BEGIN;
+INSERT INTO tw SELECT g, $PAD FROM generate_series(1, 10) g;
+DECLARE c CURSOR FOR SELECT id FROM tw ORDER BY id;
+FETCH 3 FROM c;
+SET kingres_columnar.write_buffer_memory = '1MB';
+INSERT INTO tw SELECT g, $PAD FROM generate_series(101, 140) g;
+FETCH ALL FROM c;
+COMMIT;");
+	my @ids = $out =~ /^(\d+)$/mg;
+	is(join(',', @ids), '1,2,3,4,5,6,7,8,9,10',
+		'a cursor open while rows are written and flushed: it returns the rows it began with, once each');
+}
+
+# many tables, each holding a little
+{
+	my @t = map { "tm$_" } 1 .. 24;
+	wide_fresh(\@t);
+	my ($out, $err) = script("
+SET kingres_columnar.write_buffer_memory = '${ALLOW}MB';
+BEGIN;
+DO \$\$ DECLARE peak bigint := 0; m bigint; BEGIN FOR i IN 1..480 LOOP
+  EXECUTE format('INSERT INTO tm%s VALUES (%s, repeat(''x'', 100000))', 1 + i % 24, i); $SAMPLE
+END LOOP; RAISE NOTICE 'PEAK=%', peak; END \$\$;
+COMMIT;");
+	my ($peak) = $err =~ /PEAK=(\d+)/;
+	cmp_ok($peak, '<=', $WITHIN, "24 tables, wide rows in turn: peak $peak bytes");
+	is($node->safe_psql('postgres', 'SELECT sum(c) FROM (' . join(' UNION ALL ', map { "SELECT count(*) c FROM $_" } @t) . ') s'),
+		480, '24 tables, wide rows in turn: no row lost');
+}
+
 $node->stop;
 done_testing();

@@ -79,10 +79,10 @@ func VerifyConsistency(first, second uint64, firstRoot, secondRoot Hash, path []
 		return fmt.Errorf("%w: consistency path has %d hashes, too few for sizes %d and %d", ErrPath, len(path), first, second)
 	}
 	if fr != firstRoot {
-		return fmt.Errorf("consistency path leads to the old root %x, expected %x", fr, firstRoot)
+		return fmt.Errorf("%w: it leads to %x, expected %x", ErrOldRoot, fr, firstRoot)
 	}
 	if sr != secondRoot {
-		return fmt.Errorf("consistency path leads to the new root %x, expected %x", sr, secondRoot)
+		return fmt.Errorf("%w: it leads to %x, expected %x", ErrNewRoot, sr, secondRoot)
 	}
 	return nil
 }

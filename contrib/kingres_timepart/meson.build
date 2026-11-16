@@ -26,6 +26,8 @@ tests += {
       'timepart_security',
       'timepart_history',
       'timepart_privilege',
+      'timepart_forged',
+      'timepart_owner_code',
       'timepart_drop',
     ],
     'regress_args': ['--temp-config', files('kingres_timepart.conf')],
@@ -38,6 +40,7 @@ tests += {
       't/001_locks.pl',
       't/002_interrupt.pl',
       't/003_dump_restore.pl',
+      't/004_owner_and_races.pl',
     ],
   },
 }

@@ -431,10 +431,19 @@ CREATE FUNCTION sketch_kind(bytea) RETURNS text
 COMMENT ON FUNCTION sketch_kind(bytea) IS 'kind of a valid sketch value or aggregate state; an error for bytes that are not one';
 
 -- The bytes held now by the aggregate states of the calling backend: the
--- counter that the setting kingres_sketch.state_memory_limit bounds.  A
+-- counter that the limit bounds (the smaller of the settings
+-- kingres_sketch.state_memory_ceiling and kingres_sketch.state_memory_limit).  A
 -- parallel worker counts for itself, so the function is parallel restricted
 -- (it runs in the leader, whose count is the one of the session).
 CREATE FUNCTION state_bytes() RETURNS bigint
 	AS 'MODULE_PATHNAME', 'kingres_sketch_state_bytes'
 	LANGUAGE C VOLATILE STRICT PARALLEL RESTRICTED;
-COMMENT ON FUNCTION state_bytes() IS 'bytes held by the aggregate states of this backend now; bounded by kingres_sketch.state_memory_limit';
+COMMENT ON FUNCTION state_bytes() IS 'bytes held by the aggregate states of this backend now; bounded by state_limit()';
+
+-- The limit in force in the calling backend, in bytes: the smaller of the
+-- ceiling that only a superuser sets and the role's own limit.  Parallel
+-- restricted for the same reason as state_bytes().
+CREATE FUNCTION state_limit() RETURNS bigint
+	AS 'MODULE_PATHNAME', 'kingres_sketch_state_limit'
+	LANGUAGE C VOLATILE STRICT PARALLEL RESTRICTED;
+COMMENT ON FUNCTION state_limit() IS 'the limit in force for the aggregate states of this backend, in bytes: the smaller of kingres_sketch.state_memory_ceiling and kingres_sketch.state_memory_limit';

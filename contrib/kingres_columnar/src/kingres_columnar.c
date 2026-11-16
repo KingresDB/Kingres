@@ -53,6 +53,8 @@ PG_FUNCTION_INFO_V1(kingres_columnar_stripes);
 PG_FUNCTION_INFO_V1(kingres_columnar_compact);
 PG_FUNCTION_INFO_V1(kingres_columnar_check);
 PG_FUNCTION_INFO_V1(kingres_columnar_reconcile);
+PG_FUNCTION_INFO_V1(kingres_columnar_note_rewrite);
+PG_FUNCTION_INFO_V1(kingres_columnar_finish_rewrites);
 PG_FUNCTION_INFO_V1(kingres_columnar_identity);
 
 bool		kc_rmgr_registered = false;
@@ -428,6 +430,49 @@ kingres_columnar_reconcile(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(kc_catalog_reconcile());
 }
 
+/*
+ * columnar_note_rewrite(rel): the table_rewrite event trigger tells the access
+ * method that a table is about to get a new file.  Whether it does is decided
+ * later, when the command is over (columnar_finish_rewrites), by looking at the
+ * file the table has then.
+ */
+Datum
+kingres_columnar_note_rewrite(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	Relation	rel = try_relation_open(relid, NoLock);
+
+	if (rel != NULL)
+	{
+		kc_write_note_replaced(rel);
+		relation_close(rel, NoLock);
+	}
+	PG_RETURN_VOID();
+}
+
+/*
+ * columnar_finish_rewrites(): remove the stripe rows of the files this
+ * transaction replaced, whose table has another file now.  Run at the end of
+ * ALTER TABLE; the cost is that of the files the command replaced, none for a
+ * command that replaced no columnar file.  Returns the number of rows deleted.
+ */
+Datum
+kingres_columnar_finish_rewrites(PG_FUNCTION_ARGS)
+{
+	bool		pushed = false;
+	int			n;
+
+	if (!ActiveSnapshotSet())
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
+		pushed = true;
+	}
+	n = kc_write_cleanup_replaced();
+	if (pushed)
+		PopActiveSnapshot();
+	PG_RETURN_INT32(n);
+}
+
 static void
 kc_check_one(Oid relid, bool fix, ReturnSetInfo *rsinfo)
 {
@@ -451,7 +496,7 @@ kc_check_one(Oid relid, bool fix, ReturnSetInfo *rsinfo)
 		for (i = 0; i < n; i++)
 		{
 			const char *problem = NULL;
-			char		detail[200];
+			char		detail[256];
 			Datum		values[3];
 			bool		nulls[3] = {false, false, false};
 
@@ -485,16 +530,17 @@ kc_check_one(Oid relid, bool fix, ReturnSetInfo *rsinfo)
 				UnlockReleaseBuffer(buf);
 			}
 			/*
-			 * A stripe over the limit the writer keeps to.  Versions that merged
-			 * the buffers of subtransactions without a limit could write one;
-			 * the reader accepts it, so the data can be read, and a rewrite
-			 * (VACUUM FULL, SET ACCESS METHOD) cuts it into stripes within the
-			 * limit.
+			 * A stripe over the limit the writer keeps to now.  The reader's limit is
+			 * the highest the writer can have (KC_MAX_STRIPE_ROWS) and a stripe over
+			 * that is refused as a corrupt catalog row before it gets here, so what is
+			 * reported is a stripe that is readable but larger than the developer
+			 * setting max_stripe_rows allows today.  A rewrite (VACUUM FULL, SET
+			 * ACCESS METHOD) cuts it into stripes within the limit.
 			 */
 			if (problem == NULL && s[i].row_count > (uint32) kc_max_stripe_rows())
 			{
 				problem = "stripe_over_row_limit";
-				snprintf(detail, sizeof(detail), "stripe " UINT64_FORMAT " has %u rows, more than the %d a stripe may have; it can be read, and VACUUM FULL or SET ACCESS METHOD writes it again within the limit",
+				snprintf(detail, sizeof(detail), "stripe " UINT64_FORMAT " has %u rows, more than the %d the setting max_stripe_rows allows; it can be read, and VACUUM FULL or SET ACCESS METHOD writes it again within the limit",
 						 s[i].stripe_id, s[i].row_count, kc_max_stripe_rows());
 			}
 			if (problem == NULL)
@@ -652,4 +698,24 @@ kingres_columnar_creating_xid(PG_FUNCTION_ARGS)
 	kc_meta_read(rel, &m);
 	relation_close(rel, AccessShareLock);
 	PG_RETURN_TRANSACTIONID(m.created_xid);
+}
+
+/*
+ * columnar_table_xid(rel): the transaction id of the metapage that stands for
+ * the table's creation (see KcMetaData): 0 when it is not known (a table that
+ * came from another access method), 2 (frozen) once VACUUM has frozen it.  For
+ * tests and for administrators.
+ */
+PG_FUNCTION_INFO_V1(kingres_columnar_table_xid);
+
+Datum
+kingres_columnar_table_xid(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	Relation	rel = kc_open_columnar(relid, AccessShareLock, false);
+	KcMetaData	m;
+
+	kc_meta_read(rel, &m);
+	relation_close(rel, AccessShareLock);
+	PG_RETURN_TRANSACTIONID(m.table_xid);
 }

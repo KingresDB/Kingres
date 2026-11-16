@@ -208,8 +208,8 @@ catscan_end(CatScan *cs)
  * table or its row does not exist.  The table is read with the heap API: no
  * role has a privilege on it, and the caller is the extension's own code.
  */
-bool
-kingres_shard_cluster_secret(unsigned char *buf, int bufsize, int *len)
+static bool
+read_secret_attr(int attno, bool committed_view, unsigned char *buf, int bufsize, int *len)
 {
 	Oid			relid = kingres_shard_catalog_relid("cluster_secret");
 	Relation	rel;
@@ -231,9 +231,30 @@ kingres_shard_cluster_secret(unsigned char *buf, int bufsize, int *len)
 	tup = systable_getnext(scan);
 	if (tup != NULL)
 	{
-		bool		isnull;
-		Datum		d = heap_getattr(tup, 1, RelationGetDescr(rel), &isnull);
+		bool		isnull = true;
+		Datum		d = (Datum) 0;
 
+		/*
+		 * The committed view (S9-03): when this transaction wrote the row (a rotation
+		 * of the secret that has not committed), the secret that counts for the name
+		 * of a prepared transaction is the one it replaced: the names are verified by
+		 * the origin after the rotation committed (the replaced secret is then its
+		 * previous one) or after it rolled back (it is the current one).
+		 */
+		if (committed_view && attno == 1 &&
+			TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetXmin(tup->t_data)) &&
+			2 <= RelationGetDescr(rel)->natts)
+		{
+			bool		pnull;
+
+			(void) heap_getattr(tup, 2, RelationGetDescr(rel), &pnull);
+			if (!pnull)
+				attno = 2;
+		}
+
+		/* The previous secret (attribute 2) does not exist in a table older than the library. */
+		if (attno <= RelationGetDescr(rel)->natts)
+			d = heap_getattr(tup, attno, RelationGetDescr(rel), &isnull);
 		if (!isnull)
 		{
 			bytea	   *b = DatumGetByteaPP(d);
@@ -250,6 +271,30 @@ kingres_shard_cluster_secret(unsigned char *buf, int bufsize, int *len)
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
 	return found;
+}
+
+bool
+kingres_shard_cluster_secret(unsigned char *buf, int bufsize, int *len)
+{
+	return read_secret_attr(1, false, buf, bufsize, len);
+}
+
+/*
+ * The secret that the one in force replaced (S9-03): a node that holds a rotation
+ * prepared and was not told it committed still has it, and the node that can finish
+ * the rotation proves itself to that node with it.  Never used to accept a session.
+ */
+bool
+kingres_shard_previous_secret(unsigned char *buf, int bufsize, int *len)
+{
+	return read_secret_attr(2, false, buf, bufsize, len);
+}
+
+/* The secret that names of prepared transactions are made with: the current one as other sessions see it. */
+bool
+kingres_shard_cluster_secret_for_names(unsigned char *buf, int bufsize, int *len)
+{
+	return read_secret_attr(1, true, buf, bufsize, len);
 }
 
 /*
@@ -400,6 +445,14 @@ catalog_load(void)
 					DatumGetInt32(heap_getattr(tup, 1,
 											   RelationGetDescr(cs.rel),
 											   &isnull));
+				cat.local_timeline = 0;
+				if (RelationGetDescr(cs.rel)->natts >= 2)
+				{
+					Datum		d = heap_getattr(tup, 2, RelationGetDescr(cs.rel), &isnull);
+
+					if (!isnull)
+						cat.local_timeline = DatumGetInt32(d);
+				}
 			}
 			catscan_end(&cs);
 			foreach(lc, cat.nodes)

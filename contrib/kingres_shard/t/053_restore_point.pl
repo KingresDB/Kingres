@@ -178,6 +178,9 @@ else
 		'restored: no distributed transaction is half committed');
 	is($n3->safe_psql('postgres', "SELECT count(*) FROM (SELECT txn FROM public.kv GROUP BY txn HAVING count(*) <> 2) s"), '0',
 		'restored: and the other nodes agree');
+	# A restored map primary is on a new timeline: the catalog does not recognise it as the map primary until
+	# it has claimed the map group again, with the majority rule (S9-02).
+	like($n1->safe_psql('postgres', 'SELECT kingres.promote_node(1)'), qr/"status": "(promoted|completed)"/, 'restored: the map primary claims the map group again');
 	$n1->safe_psql('postgres', 'SELECT kingres.recover_prepared_transactions()');
 	is($n1->safe_psql('postgres', "SELECT count(*) FROM kingres.check_cluster()"), '0', 'restored: the cluster check finds nothing wrong');
 }

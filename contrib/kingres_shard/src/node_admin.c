@@ -51,6 +51,35 @@ PG_FUNCTION_INFO_V1(kingres_add_node);
 PG_FUNCTION_INFO_V1(kingres_remove_node);
 PG_FUNCTION_INFO_V1(kingres_sync_catalog);
 PG_FUNCTION_INFO_V1(kingres_rotate_secret);
+PG_FUNCTION_INFO_V1(kingres_internal_require_map_group);
+
+/*
+ * Is this node the map group primary as far as PostgreSQL says as well as the
+ * catalog?  THE INVARIANT OF EVERY CATALOG CHANGE (S9-02): none is accepted from a
+ * node that is not the map primary by a claim that a majority of the electorate
+ * supports.  A standby of the map group that was promoted in PostgreSQL still
+ * holds the old primary's catalog and the old primary's node id, so the catalog
+ * calls it the map primary; what tells it apart is the WAL timeline, which the
+ * node records in local_node when it becomes the map primary in the catalog
+ * (promote_node, with the majority rule) and which a promotion in PostgreSQL
+ * changes.  A node that has no timeline recorded (a catalog older than the
+ * library) is taken as recognised.
+ */
+bool
+kingres_shard_is_recognized_map_primary(void)
+{
+	const KsCatalog *cat = kingres_shard_catalog();
+	const KsNode *self;
+
+	if (!cat->present || cat->local_node_id == 0)
+		return false;
+	self = kingres_shard_node_by_id(cat->local_node_id);
+	if (self == NULL || self->group_id != KINGRES_SHARD_MAP_GROUP || !self->is_primary)
+		return false;
+	if (RecoveryInProgress())
+		return false;
+	return cat->local_timeline == 0 || cat->local_timeline == (int) GetWALInsertionTimeLine();
+}
 
 /*
  * kingres_shard_require_map_group
@@ -78,7 +107,71 @@ kingres_shard_require_map_group(void)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("this function can only run on the map group primary"),
 				 errdetail("This node is node %d.", cat->local_node_id)));
+	if (!kingres_shard_is_recognized_map_primary())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("this node was promoted in PostgreSQL after the catalog named it the map group primary, and the catalog has not recognised the promotion"),
+				 errdetail("The catalog of this node is the old map primary's.  Nothing that changes a catalog is accepted here until kingres.promote_node(%d) has run on this node: it needs the primaries of a strict majority of the other groups.",
+						   cat->local_node_id),
+				 errhint("Call kingres.promote_node(%d) on this node.", cat->local_node_id)));
 	kingres_shard_refuse_if_superseded();
+}
+
+/*
+ * S9-08: a catalog change commits on every primary, and a primary whose list of
+ * synchronous standbys names a standby that is not there makes the PREPARE of its part
+ * wait until node_timeout, then fail with KS005 two timeouts and five seconds later (125 s
+ * by default).  The wrong order (remove_node before the name is taken out of the list, a
+ * typo in a name) is found out at once instead: every other primary is asked whether it
+ * can commit, as promote_node asks the node it promotes, and the call is refused before it
+ * changes anything.
+ */
+static void
+require_primaries_can_commit(void)
+{
+	const KsCatalog *cat = kingres_shard_catalog();
+	ListCell   *lc;
+	int			ms = kingres_shard_node_timeout >= 2 ? Min(kingres_shard_node_timeout, 5) * 1000 - 1000 : 500;
+
+	foreach(lc, cat->nodes)
+	{
+		const KsNode *n = (const KsNode *) lfirst(lc);
+		char	   *err = NULL;
+		PGconn	   *conn;
+		PGresult   *res;
+		char		sql[160];
+		bool		ok;
+
+		if (n->node_id == cat->local_node_id || !n->is_active || !n->is_primary)
+			continue;
+		conn = kingres_shard_connect_control(n->host, n->port, &err);
+		if (conn == NULL)
+			continue;			/* a node that cannot be reached is the business of the call itself */
+		snprintf(sql, sizeof(sql), "SELECT " KINGRES_SHARD_SCHEMA ".internal_sync_probe(%d)", ms);
+		res = kingres_shard_bounded_exec(conn, sql, true);
+		ok = (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1 ||
+			  strcmp(PQgetvalue(res, 0, 0), "t") == 0);
+		PQclear(res);
+		PQfinish(conn);
+		if (!ok)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("node %d cannot commit: its synchronous standbys do not confirm", n->node_id),
+					 errdetail("The change would have to commit on that node, and its synchronous_standby_names names a standby that is not connected to it."),
+					 errhint("On node %d set synchronous_standby_names to the standbys that exist (or to an empty string) and reload the configuration, then repeat the call.  Nothing was changed.",
+							 n->node_id)));
+	}
+}
+
+/*
+ * kingres.internal_require_map_group(): the check of every SQL function that changes the
+ * catalog, the same as the C ones make (S9-02).
+ */
+Datum
+kingres_internal_require_map_group(PG_FUNCTION_ARGS)
+{
+	kingres_shard_require_map_group();
+	PG_RETURN_VOID();
 }
 
 /*
@@ -263,6 +356,7 @@ kingres_sync_catalog(PG_FUNCTION_ARGS)
 
 	kingres_shard_lock_catalog();
 	kingres_shard_require_map_group();
+	require_primaries_can_commit();
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
 	spi_run("SELECT " KINGRES_SHARD_SCHEMA ".internal_ensure_secret()", SPI_OK_SELECT, 0, NULL, NULL);
@@ -333,6 +427,7 @@ kingres_rotate_secret(PG_FUNCTION_ARGS)
 
 	kingres_shard_lock_catalog();
 	kingres_shard_require_map_group();
+	require_primaries_can_commit();
 
 	cat = kingres_shard_catalog();
 	foreach(lc, cat->nodes)
@@ -854,6 +949,7 @@ kingres_add_node(PG_FUNCTION_ARGS)
 
 	kingres_shard_lock_catalog();
 	kingres_shard_require_map_group();
+	require_primaries_can_commit();
 
 	if (strcmp(role, "primary") != 0 && strcmp(role, "standby") != 0)
 		ereport(ERROR,
@@ -1088,6 +1184,7 @@ kingres_remove_node(PG_FUNCTION_ARGS)
 
 	kingres_shard_lock_catalog();
 	kingres_shard_require_map_group();
+	require_primaries_can_commit();
 
 	cat = kingres_shard_catalog();
 	n = kingres_shard_node_by_id(node_id);

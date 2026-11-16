@@ -22,11 +22,15 @@
 #include "postgres.h"
 
 #include "access/bufmask.h"
+#include "access/genam.h"
+#include "access/table.h"
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog_internal.h"
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
+#include "catalog/indexing.h"
+#include "catalog/pg_class.h"
 #include "catalog/storage.h"
 #include "miscadmin.h"
 #include "port/pg_crc32c.h"
@@ -36,6 +40,7 @@
 #include "storage/lmgr.h"
 #include "storage/smgr.h"
 #include "storage/standby.h"
+#include "utils/fmgroids.h"
 #include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -753,6 +758,29 @@ kc_rel_ident(Relation rel)
 }
 
 /*
+ * Is there a version of rel's pg_class row that the snapshot sees?  That is
+ * what "the table existed for the snapshot" means, and no later change of the
+ * row (a GRANT, a new owner, a storage option) can alter the answer, because
+ * the version the snapshot sees stays in the catalog while the snapshot lives.
+ */
+static bool
+kc_table_existed_for(Relation rel, Snapshot snap)
+{
+	Relation	pgclass = table_open(RelationRelationId, AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	bool		found;
+
+	ScanKeyInit(&key, Anum_pg_class_oid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(RelationGetRelid(rel)));
+	scan = systable_beginscan(pgclass, ClassOidIndexId, true, snap, 1, &key);
+	found = HeapTupleIsValid(systable_getnext(scan));
+	systable_endscan(scan);
+	table_close(pgclass, AccessShareLock);
+	return found;
+}
+
+/*
  * A snapshot taken before the file was created by a rewrite or a TRUNCATE
  * cannot see the table's stripes (their catalog rows are newer than it).
  * Heap hands such a snapshot an empty table for TRUNCATE and the rewriting
@@ -799,11 +827,27 @@ kc_check_snapshot_age(Relation rel, Snapshot snap)
 	 * rewrite, a change of access method), nothing existed for this snapshot
 	 * to read before them, so there is nothing older that was replaced and
 	 * the empty table is the right answer, as heap's.  The invariant: an
-	 * error is for content that existed for the snapshot and is gone.
+	 * error is for content that existed for the snapshot and is gone, and an
+	 * empty table is never given in place of such content.
 	 */
 	if (TransactionIdIsNormal(id->table_xid) &&
 		(uint32) (next - id->table_xid) <= (uint32) (1U << 30) &&
 		XidInMVCCSnapshot(id->table_xid, snap))
+		return;
+
+	/*
+	 * No creation is recorded: the table came from another access method (or
+	 * from a file of an earlier build) and the extension could not tell when
+	 * the table was made, nor prove that it was empty.  The creation of the
+	 * table cannot be guessed from the transaction that last wrote its
+	 * pg_class row, which any GRANT or ALTER TABLE moves forward.  The catalog
+	 * itself knows what the snapshot saw: an old version of that row stays
+	 * until nothing can see it, so if no version of it is visible to the
+	 * snapshot, the table did not exist for it and the empty table is the
+	 * right answer; if one is, content may have existed and the error stands.
+	 */
+	if (id->table_xid == InvalidTransactionId &&
+		!kc_table_existed_for(rel, snap))
 		return;
 	if (XidInMVCCSnapshot(id->created_xid, snap))
 		ereport(ERROR,

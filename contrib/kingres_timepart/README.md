@@ -189,25 +189,73 @@ unrelated object. The rows of the policy and of the history therefore carry a
 installation and is never in a dump, because it is in a function and not in
 the data.
 
-- A row with the stamp of this installation was written here; its OIDs are its
-  identity. A role that is renamed is the same role (`ALTER ROLE ... RENAME`
+- A history row with the stamp of this installation was written here; its OIDs are
+  its identity. A role that is renamed is the same role (`ALTER ROLE ... RENAME`
   changes nothing: no run fails with `owner_changed`, no run is hidden), a table
   that is renamed or moved to another schema is the same table, a role that was
   dropped is gone for good, and a table or role made later with the same name
-  is another one.
-- A row with another stamp was restored from a backup; its OIDs mean nothing,
-  and its names are its identity: a role is the role of that name, a run's table
-  is the table of that schema and name that the recorded owner owns. The first
-  `timepart_due` or `timepart_begin_run` after the restore (or `kingres.timepart_adopt()`,
-  which both call first) replaces the OIDs by those of the roles and tables of this
-  cluster and gives the rows the stamp of this installation, so a role that is
-  renamed after that is followed (a role renamed between the restore and that
-  first call is not: its rows name the old name; call `timepart_adopt()` right
-  after a restore into a cluster whose roles are not yet final). A row whose owner role does not exist in this
-  cluster is left as it is: only a superuser sees it, until a role of that name is
-  made. Restoring into the same cluster, or into another one where the roles
-  have the same names, gives the same visibility as before the dump (tested, in
-  a cluster where the role OIDs are not the same).
+  is another one. (OIDs wrap around after 2^32 objects; a role dropped and a
+  role made after the wrap with the same OID would be taken for each other:
+  that is not defended against.)
+- A history row with another stamp was restored from a backup; its OIDs mean
+  nothing, and its names are its identity: a role is the role of that name, a run's
+  table is the table of that schema and name that the recorded owner owns. The
+  next `timepart_due` or `timepart_begin_run` for the table (or
+  `kingres.timepart_adopt()`) gives such rows the OIDs of this cluster and the
+  stamp of this installation, so a role that is renamed after that is followed.
+  A row whose owner role does not exist in this cluster stays as it is: only a
+  superuser sees it.
+- **A policy row is not trusted by its stamp.** The stamp is readable by every
+  role (it is in the source of a function) and a row is data, so a stamp in a row
+  proves nothing: a policy row shaped by hand, with the real schema, table and
+  owner of a table and the stamp of this installation, made the maintenance act
+  on a table whose owner never set a policy (review K12T-03; on the earlier code
+  it dropped the ten old partitions of the victim). The maintenance acts only on
+  a policy that has a **seal**: a row of `kingres.timepart_policy_seal` with a
+  fingerprint of the fields that decide what is done (the intervals, the time
+  zone, the retention and its action, the columnar fields, `enabled`, the
+  owner). The seal is written by the interface only: `timepart_set_policy`, a
+  write by the owner through the view `timepart_policy` after its checks, and
+  `timepart_adopt`. It is not in the dump (the table is not registered with
+  `pg_extension_config_dump`), so a restore starts without seals; it goes with
+  the policy (`DELETE`, `DROP TABLE`, `TRUNCATE`) and moves with a rename. A
+  field of the policy changed by hand (`UPDATE` of the table by a superuser)
+  breaks the seal; the schedule and the OID hint do not. A policy without a
+  seal is inert: `timepart_due` does not list it, `timepart_begin_run` records a
+  failed run with `policy_unverified`, `timepart_run_action` does nothing, and
+  `timepart_check` reports `policy_unverified`.
+- **Adoption** (`timepart_adopt(own_stamp boolean default false)`, superuser,
+  explicit: nothing calls it for policies) seals a policy row only if the table
+  of that name exists and is partitioned, the role the row names as owner is the
+  role that owns the table now, the values pass the checks of
+  `timepart_set_policy`, and the row does not carry the stamp of this
+  installation (a restore brings the stamp of the installation that made the
+  backup; a row with ours that is not sealed was not written by the interface,
+  and is refused with a `WARNING` that says to set the policy again, unless the
+  caller passes `true` and says that it knows the row). It says `NOTICE: policy
+  of s.t adopted: ...` for every row it adopts and `WARNING` for every one it
+  refuses; read them after a restore.
+- **What a hostile dump can and cannot cause.** It cannot make anything act by
+  itself: the policy rows of a dump are inert until a superuser calls
+  `timepart_adopt()`; it cannot attach a policy to a table whose owner is not the
+  role it names, to a table that does not exist, to a role that does not exist
+  or to a superuser who does not own the table; it cannot get values past the
+  checks; the seal cannot be in a dump. It can, once the superuser adopts what
+  the dump brought, give a table a policy of the dump's choosing if the dump
+  names the table and its real owner (that is indistinguishable from a backup
+  in which that owner's table had that policy): with the shortest retention
+  that the checks allow, the next run drops the old partitions. So read what
+  `timepart_adopt()` says, and `SELECT * FROM kingres.timepart_policy` before it
+  (a superuser sees the rows), when the dump is not your own. It can replace
+  the policy of a table by a row of another content (a restore over live rows),
+  which then is inert: the table is not maintained until its policy is set
+  again. A superuser who restores arbitrary SQL has lost anyway.
+  History rows that a dump brings are only information: a run row names an
+  owner and is shown to that role (a forged one can show a role a run that did
+  not happen, and cannot make anything act); a role that does not exist or a
+  superuser is seen by superusers only; a row that says `running` for a backend
+  that is not there is marked `interrupted` by the next run (tested in
+  `timepart_forged`).
 - The event trigger that follows a rename or drops the policy of a dropped
   table acts only on rows with the stamp of this installation, so the OID in a
   restored policy, which may be the OID of an unrelated table, cannot make
@@ -262,9 +310,10 @@ Superuser only (the scheduler and `psql` of an administrator):
 | `CALL kingres.timepart_run_phase(run_id bigint, phase text)` | `timepart_run_action` in a loop with a `COMMIT` after each call. Idempotent: it re-plans from the catalog at the run's `as_of` and does what is left. |
 | `kingres.timepart_finish_run(run_id bigint) returns void` | Final state, `next_run_at`, pruning. Calling it again does nothing more. |
 | `kingres.timepart_action_timeout() returns integer` | The `statement_timeout`, in milliseconds, that a driver sets before it calls `timepart_run_action` (setting `kingres_timepart.action_timeout_ms`, default 300000). |
-| `kingres.timepart_due(as_of_time timestamptz default now()) returns table (schema_name name, table_name name, as_of timestamptz)` | Enabled policies whose `next_run_at` is at or before the time, oldest first. Calls `timepart_adopt()` first. |
+| `kingres.timepart_due(as_of_time timestamptz default now()) returns table (schema_name name, table_name name, as_of timestamptz)` | Enabled, sealed policies whose `next_run_at` is at or before the time, oldest first: all of them for a superuser (after adopting the history of a restore), the caller's own tables for another role. |
 | `kingres.timepart_prune_runs(schema_name name, table_name name, as_of timestamptz default now()) returns bigint` | Delete old runs of a table; returns the number. |
-| `kingres.timepart_adopt() returns bigint` | Give the policies and runs that a backup carried here the roles and tables of this installation (see "Identity"); returns the number of rows changed. Called by every `timepart_begin_run`. |
+| `kingres.timepart_adopt(own_stamp boolean default false) returns bigint` | Superuser. Adopt the policies (after the checks of the catalog, see "Identity") and the history that a backup carried here. |
+| `kingres.timepart_grant_driver(role name)`, `kingres.timepart_revoke_driver(role name)` | Superuser. Give a role, or take from it, the EXECUTE to drive the maintenance of its own tables from its own session. |
 
 `timepart_set_policy`, `timepart_unset_policy`, `timepart_plan`, `timepart_partitions` and
 `timepart_check` are `SECURITY INVOKER`: they judge `current_user`. The functions that need
@@ -449,14 +498,48 @@ function or procedure (checked by the test `timepart_retention`).
   one thing SQL has is the frame of a `SECURITY DEFINER` function: inside it
   `SET ROLE`, `RESET ROLE`, `set_config('role', ...)` and `SET SESSION
   AUTHORIZATION` are refused (`cannot set parameter "role" within
-  security-definer function`). So for each action the extension makes a
-  `SECURITY DEFINER` function in the **temporary schema of the session**,
-  gives it to the table owner (`ALTER FUNCTION ... OWNER TO`), calls it with the
-  statements, and drops it, in the transaction of the action (`timepart__exec_as`).
-  The owner's code then runs with the owner as `current_user` and with no way
-  back; no other session can see the function (it is not committed), no object
-  of the extension is owned by a table owner (a role can be dropped at any
-  time), and a failed action rolls the function back with its subtransaction.
+  security-definer function`). That is all the frame of a `SECURITY DEFINER`
+  function (`timepart__exec_as`) does, and it is **not isolation**: the owner's
+  code runs inside the superuser's session and transaction, and was tested to
+  leave behind, there, an object in the temporary schema (a view named like a
+  catalog view, which the superuser's next `SELECT FROM pg_roles` runs the
+  owner's function through, as the superuser: review K12T-02), a cursor `WITH
+  HOLD` (its query runs at commit as the superuser), a prepared statement, a
+  setting changed with `set_config(..., false)` (for example `statement_timeout`),
+  a session level advisory lock and a `LISTEN`. (A deferred trigger fires as the
+  owner, on both majors.) No cleanup from SQL is complete: a `LISTEN` pending or a
+  cached plan cannot be seen, and a setting of the owner cannot be told from the
+  superuser's own. So there are two ways, and the extension offers no third:
+  - **The owner drives its own table, from its own session** (isolated: its
+    code runs there, as it, with its own rights, and what it leaves is in its
+    own session). `kingres.timepart_grant_driver('role')` gives a role the
+    EXECUTE it needs (`timepart_revoke_driver` takes it back); the role then
+    calls `CALL kingres.timepart_run('s.t')`, or `timepart_due`,
+    `timepart_begin_run`, `timepart_run_phase`/`timepart_run_action` and
+    `timepart_finish_run` step by step, for the tables it owns. The functions
+    that write the history for it are `SECURITY DEFINER` and judge the caller by
+    `session_user` and by the role the invoking function runs as, which must both
+    be a superuser or the owner of the table; a role that was switched to with
+    `SET ROLE` in a superuser's session is judged as the role it set, and its
+    action is refused (it is a superuser's session). Such a driver sees in
+    `timepart_due` the policies of its own tables only and changes nothing.
+    The history of a table that its owner drives is only as true as the owner:
+    it can write the history of its own table.
+  - **A superuser drives it in its own session**, which runs the owner's code
+    there. That is refused for a table whose owner is not a superuser (a
+    superuser's own code is trusted as the session's), with a run that fails
+    `owner_code_not_trusted`, unless the session says
+    `SET kingres_timepart.trust_table_owners = on` (or the server does, in
+    `postgresql.conf`), which means: the owners of the tables are trusted as
+    the superuser is. With it, everything listed above is possible, so use it
+    only for owners that you trust, and drive the rest as themselves or with
+    one connection per owner that is that owner. (`dblink` from inside needs a
+    password that the server asks for, `dblink_connect_u` and `COPY ...
+    PROGRAM` need rights that the role does not have; tested in
+    `004_owner_and_races.pl`.) The frame uses a name of its own every time, so
+    a leftover function of the owner in the temporary schema cannot stop later
+    actions of other tables; before, one named `timepart_exec` did (any table's
+    maintenance in that session failed with "already exists").
   `create_time_partitions`, `drop_old_time_partitions`, `timepart_create_one` and
   `timepart_retire_one` are `SECURITY INVOKER` and run the DDL as whoever calls
   them: a superuser who calls them for another role's table runs that role's
@@ -494,9 +577,27 @@ function or procedure (checked by the test `timepart_retention`).
   change the partitions. After an owner change the policy must be set again by
   the new owner, and the old partitions, owned by the old owner, cannot be
   dropped by the new one until their owner is changed too.
-- **Superuser only:** `timepart_run`, `timepart_run_phase`, `timepart_run_action`,
-  `timepart_begin_run`, `timepart_finish_run`, `timepart_due`,
-  `timepart_adopt` and `timepart_prune_runs`, and EXECUTE on them is revoked from `PUBLIC`.
+- **Who may call what:** `timepart_adopt`, `timepart_prune_runs`,
+  `timepart_grant_driver` and `timepart_revoke_driver` are the superuser's
+  alone. `timepart_run`, `timepart_run_phase`, `timepart_run_action`,
+  `timepart_begin_run`, `timepart_finish_run` and `timepart_due` are the
+  superuser's and, for the tables it owns, the owner's (see above); EXECUTE on
+  all of them is revoked from `PUBLIC`. `timepart_due` is `VOLATILE` because a
+  superuser's call adopts the history rows of a restore; any other caller's call
+  reads only and lists the caller's own sealed policies.
+- **The views.** The policy and history views are `security_barrier`; a
+  function that a role puts in a `WHERE` clause over them does not see a row
+  of another role's table (tested for the three views with a function that
+  records what it is given, in `timepart_security`).
+- **Events that race a run.** A rename, a drop or a change of owner of a table
+  between two actions, or while one waits for the table, ends in a consistent
+  state (tested in `004_owner_and_races.pl`): a rename moves the policy, its
+  seal and the history and the run goes on by the new name; a drop removes the
+  policy and its seal, the history stays without a table and the run fails; a
+  change of owner fails the next action with `owner_changed`. The steps of an
+  action take only a key share lock on the run row, so the event trigger of the
+  DDL is not held up by a step that waits for the table (it was: a deadlock).
+  Which of the two comes first is for the lock manager.
 - **Quoting.** Every identifier goes into dynamic SQL with `format('%I')` and
   every literal with `%L`. Names of partitions are generated and always quoted.
   The test `timepart_names` runs tables, schemas, columns and a role with
@@ -736,17 +837,20 @@ The design is `kingres/docs/design/analytics-phase12-storage.md`, section 4.4 an
 `timepart_retention`, `timepart_names`, `timepart_hostile`, `timepart_security`, `timepart_history` (who
 sees the history, renamed roles and tables, owner changes, dropped roles),
 `timepart_privilege` (the code of a table owner while a superuser runs the
-maintenance), `timepart_drop` (`DROP EXTENSION` and `CREATE EXTENSION`, also where
+maintenance), `timepart_forged` (policy and history rows shaped by hand, the seal), `timepart_owner_code` (the refusal, what the acknowledgement gives away, the owner's own session), `timepart_drop` (`DROP EXTENSION` and `CREATE EXTENSION`, also where
 the user has objects of the same names)).
 Every one passes an `as_of` time; none reads the clock. `t/` holds the TAP tests:
 `001_locks.pl` (a long transaction holding the parent, readers and writers,
 one run per table, a role that holds advisory locks, a foreign key), `002_interrupt.pl` (a backend killed and the server
-crashed in the middle of a run, then repeated) and `003_dump_restore.pl`
+crashed in the middle of a run, then repeated), `003_dump_restore.pl`
 (`pg_dump` and restore by a superuser, a role with only `pg_read_all_data` and a
 database owner, then a run; a restore by a role that is not a superuser is
 refused; the extension in a database whose schema `kingres` exists already; who sees
 what before and after a restore, also into another cluster where the role OIDs
-differ and a role is renamed afterwards).
+differ and a role is renamed afterwards), `004_owner_and_races.pl` (a server
+without the acknowledgement setting; a rename, a change of owner and a drop of
+the table while an action waits for it; forged rows restored with `COPY`;
+`dblink` and `COPY ... PROGRAM` from the owner's code).
 
 Build and test against a KingresDB installation, out of tree:
 

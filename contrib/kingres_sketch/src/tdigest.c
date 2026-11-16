@@ -1155,7 +1155,6 @@ kingres_sketch_tdigest_agg_deserial(PG_FUNCTION_ARGS)
 	MemoryContextSwitchTo(old);
 	if (st == NULL)
 	{
-		ks_acct_release(acct);
 		ks_invalid_value("tdigest", why);
 	}
 	st->acct = acct;

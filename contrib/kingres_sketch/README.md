@@ -39,9 +39,11 @@ Licence: GNU Affero General Public License, version 3 (AGPL-3.0-only).
 ## Installing
 
 The extension has a fixed schema, `kingres_sketch`, and is not relocatable. It
-needs no `shared_preload_libraries` entry and no restart. It has one setting,
-`kingres_sketch.state_memory_limit`, with a default that leaves ordinary queries
-alone (see "Memory of aggregate states and its limit").
+needs no `shared_preload_libraries` entry and no restart. It has two settings, `kingres_sketch.state_memory_ceiling` (the administrator's, only
+a superuser sets it) and `kingres_sketch.state_memory_limit` (a role's own), with
+defaults that leave ordinary queries alone (see "Memory of aggregate states and
+its limit"). Preloading the library (`shared_preload_libraries`) is not needed,
+but it makes the ceiling hold against every way a role can set it, see there.
 
 ```sql
 CREATE EXTENSION kingres_sketch;
@@ -155,7 +157,8 @@ exact function.
 | Function | Meaning |
 |---|---|
 | `self_test()` | One line of text that must be equal on every node that exchanges sketches (see "The hash"; nothing compares it yet). |
-| `state_bytes()` | The bytes held now by the aggregate states of the calling backend, the counter that `kingres_sketch.state_memory_limit` bounds (see "Memory of aggregate states and its limit"). `PARALLEL RESTRICTED`: it runs in the leader. |
+| `state_bytes()` | The bytes held now by the aggregate states of the calling backend, the counter that the limit bounds (see "Memory of aggregate states and its limit"). `PARALLEL RESTRICTED`: it runs in the leader. |
+| `state_limit()` | The limit in force in the calling backend, in bytes: the smaller of `kingres_sketch.state_memory_ceiling` and `kingres_sketch.state_memory_limit`. |
 | `sketch_kind(bytea)` | The kind (`hll`, `topn`, `tdigest`, or `tdigest_state` for the state of `approx_percentile`) of a byte string that is a valid sketch or aggregate state; error `22023` for any other bytes. It runs the validation of the input and deserial functions. |
 
 ## Aggregates, partial aggregation and NULL
@@ -337,12 +340,11 @@ bytes over 600000 rows and 300 groups held about 740 MB (a backend that was idle
 at 19 MB went to 742 MB), and the same query with more groups or longer items
 holds proportionally more. `hll` and `tdigest` grow the same way, only less per
 state. What one state holds, measured with `state_bytes()` while the states are
-alive (this includes the memory context that each state has, about 1 KB, and
-the unused part of its blocks):
+alive (this includes the unused part of the blocks of the context):
 
 | State | Held |
 |---|---|
-| any state with few values (`topn` of a few items, `hll` sparse with 100 items, `tdigest` of 10 values) | 2 to 3 KB |
+| a state with few values (`topn` of a few items, `hll` sparse, `tdigest` of a few values) | from under 100 bytes to about 1 KB; the counter moves in the steps of the blocks of the context, up to 8 MB |
 | `topn`, capacity 1000, full, short items | 84 KB |
 | `topn`, 20000 items of 900 bytes | 24 MB (1250 bytes per counter) |
 | `hll`, precision 14, dense | 20 KB |
@@ -355,62 +357,133 @@ items hold 100000 times the figure of one. A worker is a backend with its own
 account: with two workers the same query holds each worker's states in the
 worker and the deserialized states, with the combined one, in the leader.
 
-**The limit.** `kingres_sketch.state_memory_limit` (default `1GB`, from 1 kB to
-2 TB; a plain number is in kilobytes) is the most that the aggregate states of
-one backend may hold together. A query that would pass it fails with SQLSTATE
-`54000` (`program_limit_exceeded`) and the message `aggregate states of
-kingres_sketch hold N bytes in this backend, over the limit of M bytes`, with a
-hint, and the backend's peak stays near the limit (the test `008_memory.pl`: with
-a limit of 64 MB the query of the review fails and a fresh backend goes from
-19 MB to under 160 MB, where without a limit it went to 742 MB). The limit
-counts `hll`, `topn` and `tdigest` states, `approx_count_distinct` and
-`approx_percentile` too, and counts the states a worker builds, the states a
-leader deserializes from the workers (before one is built, the length of the
-serialized state is checked against what is left) and the states made by the
-combine and union aggregates. It is checked when a state has grown, after the
-memory is taken, so a query can pass the limit by one step of one state (the
-largest step is a `topn` state of capacity 100000 doubling, a few MB, or up to
-100 MB for a deserialized value of the largest size, which the length check
-above refuses before it is built when it would not fit) and is stopped there.
-What the limit does not count: the functions that are not aggregates
-(`hll_add`, `topn_union` and the others work on values and are bounded by the
-per-call figures above), the transient memory of a call (the detoasted argument,
-the serialized result), and anything else the query uses. The default of `1GB`
-is one that no ordinary query reaches (the 300-group query above holds 740 MB);
-a server of a few GB that runs parallel queries with many groups should set a
-lower value, or lower `max_parallel_workers_per_gather`.
+**The limit.** The limit of a backend is the smaller of two settings: the
+**ceiling**, `kingres_sketch.state_memory_ceiling` (`PGC_SUSET`, default `1GB`,
+from 1 kB to 2 TB; a plain number is in kilobytes), which only a superuser sets,
+and the role's own **limit**, `kingres_sketch.state_memory_limit` (any role may
+set it; the default `-1` means "the ceiling alone"). `state_limit()` returns the
+limit in force, in bytes. The limit is the most that the aggregate states of one
+backend may hold together. A query that would pass it fails with SQLSTATE `54000`
+(`program_limit_exceeded`) and the message `aggregate states of kingres_sketch
+hold N bytes in this backend, over the limit of M bytes`, with a hint, and the
+backend's peak stays near the limit (the test `008_memory.pl`: with a limit of
+64 MB the query of the review fails and a fresh backend goes from 19 MB to under
+160 MB, where without a limit it went to 742 MB). The limit counts `hll`, `topn`
+and `tdigest` states, `approx_count_distinct` and `approx_percentile` too, and
+counts the states a worker builds, the states a leader deserializes from the
+workers (before one is built, the length of the serialized state is checked
+against what is left) and the states made by the combine and union aggregates.
+It is checked when a state has grown, after the memory is taken, so a query can
+pass the limit by one step of one state: the memory context of the states grows
+in blocks of up to 8 MB, and the largest single step is a `topn` array
+doubling, a few MB. The default of `1GB` is one that no ordinary query reaches
+(the 300-group query above holds 740 MB); a server of a few GB that runs
+parallel queries with many groups should set a lower ceiling, or lower
+`max_parallel_workers_per_gather`. A parallel worker counts for itself, so a
+parallel query can hold the limit once in the leader and once in each worker
+(`1 + workers` times); the workers take the ceiling and the limit of their
+leader, so no value that the leader's role could not set reaches them.
 
-*Who may set it.* The point of the limit is to protect the server, so a role must
-not be able to raise it for itself, and any role may lower it for its own
-queries. The setting is `PGC_USERSET` with a check hook: a role that is not a
-superuser may set any value up to the **reset value**, the value that the
-administrator gave it in `postgresql.conf`, with `ALTER DATABASE ... SET` or
-with `ALTER ROLE ... SET` (default `1GB`), and `RESET` returns to that value. A
-higher value is refused with `permission denied to raise
-"kingres_sketch.state_memory_limit" above N kB` by `SET`, `SET LOCAL`, a
-function's `SET` clause, `ALTER ROLE ... SET` and `ALTER DATABASE ... SET`; a
-superuser may set any value, and so may an administrator who stores a higher
-ceiling for a role (`ALTER ROLE r SET kingres_sketch.state_memory_limit =
-'4GB'`). A value given before the library is loaded in the session (in the
-options of a connection, or by `SET` as the first statement) is judged when the
-library loads: a raise by a role that may not is dropped with a warning and the
-limit is the reset value. Until the library is loaded in a session, which the
-first call of a function of the extension does, `SHOW
-kingres_sketch.state_memory_limit` answers `unrecognized configuration
-parameter`. Workers take the value of their leader. PostgreSQL's
-own settings of this kind (`temp_file_limit`, `max_stack_depth`) are
-`PGC_SUSET`; a `PGC_SUSET` setting would not let a role lower the limit for
-itself, and a `GRANT SET ON PARAMETER` would give it the right to raise it too.
+*All the states of one aggregate node share one memory context.* An earlier
+version gave every state a context of its own so that its memory could be
+counted; that cost more than a kilobyte per state and, because PostgreSQL walks
+the child contexts of a hash aggregate on every new group, made a hash aggregate
+of many groups unusably slow (50000 groups took 7.5 s, 100000 groups 77 s, a
+million groups did not finish, against 1.0 s without any accounting; measured on
+18.7). Now the states of the three types made under one aggregate context (the
+whole node for a hash aggregate, one group for a sorted aggregate, which resets
+its context after every group) live in one child context that carries the
+account. One million small groups need the same memory and time as before the
+limit existed; a sorted aggregate pays about 0.15 microseconds per group for
+making the context.
 
-*The counter does not leak.* The account of a state lives in the memory
-context of the state, and a reset callback of that context gives the account back,
-so the counter is correct whatever ends the state: the end of a group, the end of
-the query, an error in the middle of a query, a subtransaction that aborts, a
-cursor that is closed (a cursor that is left open holds its states and counts
-them until it is closed). `state_bytes()` shows it, and the tests check that it is
-zero after a completed query, a failed one, an aborted subtransaction, forty
-failures in a row, a closed cursor and a parallel query that fails in a worker or
-in the leader.
+*Who may set what.* The point of the ceiling is to protect the server, so a role
+must not be able to raise it by any means, and any role may lower the limit for
+its own queries. That rule is not made by a check of the value (a first version
+judged the source of a value and a role walked around it with `ALTER ROLE
+<itself> SET`: a check hook cannot know who stored a value) but by the context of
+the setting, which PostgreSQL itself enforces at every place a value can enter:
+
+| What a role does | Result |
+|---|---|
+| `SET`, `SET LOCAL`, `set_config` of the ceiling | `permission denied to set parameter` |
+| `ALTER ROLE <itself or another role> SET` the ceiling, also `IN DATABASE`, also by a role with `CREATEROLE` | `permission denied to set parameter` |
+| `ALTER DATABASE ... SET` the ceiling by a database owner who is not a superuser | `permission denied to set parameter` |
+| the `SET` clause of a function the role owns (`CREATE FUNCTION`, `ALTER FUNCTION`) | `permission denied to set parameter` |
+| the ceiling in the options of a connection (`PGOPTIONS`, `options=`) | the connection is refused when the library is preloaded; when it is not, see below |
+| the role's own limit, by any of these ways | allowed, and it only lowers the limit: the limit in force is the smaller of the two |
+| `RESET`, `RESET ALL` | go back to what the administrator gave |
+| `SET ROLE` to an ordinary role | the session keeps the ceiling it had (a superuser's own `SET` stays); the ordinary role cannot raise it |
+| a `SECURITY DEFINER` function of a superuser called by a role | runs with the settings of the caller's session; the role cannot raise the ceiling for it |
+| a role that is a member of a superuser role and takes it (`SET ROLE`) | has the superuser's rights and may set the ceiling for that session: it is a superuser then, not an exception |
+| a parallel worker | takes the values of its leader |
+
+The administrator's ways work: `postgresql.conf`, `ALTER SYSTEM`, `ALTER
+DATABASE ... SET` and `ALTER ROLE ... SET` by a superuser (a value for one role
+may be higher than the server's, which is how an administrator gives a role
+more). **`GRANT SET ON PARAMETER kingres_sketch.state_memory_ceiling TO r`**
+gives `r` the right to set the ceiling, by `SET` and by `ALTER ROLE` and `ALTER
+DATABASE`, and nobody else; it is the administrator's decision to hand the right
+on. `REVOKE` does not remove a value the role has stored: the administrator
+resets it (`ALTER ROLE r RESET ...`).
+
+*A library that is not preloaded.* PostgreSQL treats a setting whose library is
+not loaded yet as a placeholder: a role may `SET` it (the value is judged, and
+dropped with a warning, when the library loads), but may not store it with
+`ALTER ROLE`, `ALTER DATABASE` or a function's `SET` clause (only a superuser or
+a holder of `GRANT SET ON PARAMETER` may); so before the library is loaded in a
+session even the role's own limit cannot be stored (call a function of the
+extension first, then `ALTER ROLE`). One path goes around that: a value in the
+options of a connection becomes the reset value of the placeholder, and when the
+library loads and refuses it, PostgreSQL has already dropped the administrator's
+value, and the ceiling falls back to the built-in `1GB`, which can be higher
+than the administrator's. The library sees this in `_PG_init` (a value was
+waiting and none was accepted), warns, and the limit of that session is at most
+1 MB; it can only lower the limit of the role that tried. To avoid the case
+altogether, preload the library (`shared_preload_libraries`), where such a
+connection is refused. Until the library is loaded in a session, `SHOW` of the
+settings answers `unrecognized configuration parameter`.
+
+*The counter does not leak.* The account lives in the memory context of the
+states, and a reset callback of that context gives it back, so the counter is
+correct whatever ends the states: the end of a group, the end of the query, an
+error in the middle of a query, a subtransaction that aborts, a cursor that is
+closed (a cursor that is left open holds its states and counts them until it is
+closed). `state_bytes()` shows it, and the tests check that it is zero after a
+completed query, a failed one, an aborted subtransaction, forty failures in a
+row, a closed cursor, a sorted aggregate, `DISTINCT`, `GROUPING SETS`, a window
+and a parallel query that fails in a worker or in the leader.
+
+*What the limit does not count, and by how much a role can pass it.* Measured on
+18.7 as the peak of a fresh backend (VmHWM, 15 MB idle) with values of the
+largest `topn` size (100000 items of 1000 bytes, 101800020 bytes):
+
+| Not counted | Peak above an idle backend |
+|---|---|
+| `topn_total` of one stored value | 211 MB (2.1 times the value) |
+| `topn_add` of one item to a stored value | 318 MB |
+| `topn_union` of two values | 321 MB; four values in one nested expression 753 MB: the working memory of a call is freed at the end of the row, so an expression holds the operands of all its calls at once |
+| cast `bytea` to `topn` (a valid value of the largest size) | 313 MB |
+| binary input (`COPY ... FORMAT binary`) of the largest value | 404 MB (4 times) |
+| text input of the largest value (hex digits, twice the size; the figure includes writing the text first) | 1.1 GB |
+| `hll_union`, `tdigest_union` of the largest values | 5 MB |
+| the final function and the result of an aggregate (`topn` of 100000 items: counted 114 MB, peak 333 MB) | about 2 to 3 times the counted state, for the group that is being finished |
+
+A hash aggregate that does not fit `work_mem` spills tuples, not states, and
+processes the batches one after the other, resetting the aggregate context (and
+so the account) for each; a query with 1000 groups of 200-byte items and a
+`work_mem` of 64 kB peaked at 2 MB. What the limit does bound: **a value that
+alone is larger than what is left of the limit is refused before it is
+detoasted or unpacked** (`topn_union(a, b)` on 100 MB values under a limit of 16
+MB fails with 54000 and the backend goes from 15 MB to 19 MB), by every function
+that reads a sketch, by the input and receive functions and by the casts. So
+under a limit smaller than the values the uncounted memory of one call is nil;
+under a limit at least as large as the values it is up to about 4 times a value
+per call (the table), times the number of large operands of one expression. The
+values themselves are bounded by the sizes in "Untrusted input and limits"; an
+administrator who needs a hard bound sets the ceiling to a fraction of the
+memory available to a backend, and keeps the values that roles may store (for
+example with a `CHECK` on `length(v::bytea)`) below it.
 
 ## Format
 
@@ -549,7 +622,7 @@ crash or a read past the value. `pg_input_is_valid` works on all three types.
 | tdigest compression | 10 to 10000 |
 | tdigest weight | 1 to 2^63 - 1; the total must fit in a `bigint` |
 | largest value | hll 196612 bytes, topn about 104 MB, tdigest about 320 KB |
-| memory held by the aggregate states of a backend | `kingres_sketch.state_memory_limit`, default 1 GB; one state per group and per worker (see "Memory of aggregate states and its limit") |
+| memory held by the aggregate states of a backend | the smaller of `kingres_sketch.state_memory_ceiling` (superuser, default 1 GB) and `kingres_sketch.state_memory_limit` (a role's own); one state per group and per worker (see "Memory of aggregate states and its limit") |
 | working memory of a call on the largest value (peak of the backend, an idle backend is 15.6 MB) | hll: about 4 MB over an idle backend (unions of precision 18, the aggregate over six values); topn: up to 513 MB, 5.2 times the value (`topn_union_agg` over values with different items; see the section "topn"); tdigest: about 4 MB over an idle backend for unions at compression 10000, 8 MB for `tdigest_agg` of 300000 values |
 | counts | `bigint`; an overflow is `22003` |
 
@@ -647,7 +720,7 @@ margin of 2.
   `topn` and the exact centroids of a `tdigest` depend on the order of rows and
   merges.
 - A `GROUP BY` with many groups multiplies the state size, and so do parallel
-  workers; `work_mem` does not limit it, `kingres_sketch.state_memory_limit` does
+  workers; `work_mem` does not limit it, the limit of `kingres_sketch.state_memory_ceiling` does
   (see "Memory of aggregate states and its limit"); choose a smaller precision,
   capacity or compression for such a query.
 - The aggregates have no moving-aggregate form (`MSFUNC`), so a window with a
@@ -675,6 +748,9 @@ The tests: `sql/` and `expected/` (pg_regress: `sketch_setup`, `sketch_hll`,
 `sketch_topn`, `sketch_tdigest`, `sketch_io`, `sketch_security`, `sketch_memory`)
 and `t/` (TAP: the accuracy of each sketch, parallel and partitionwise
 aggregation, dump and restore and `COPY`, a fuzz test of corrupted values that
-should be run on a server built with assertions, and `008_memory.pl`: the limit
-of the memory of aggregate states, the peak of a backend, parallel workers and
-who may raise the limit).
+should be run on a server built with assertions, `008_memory.pl`: the limit
+of the memory of aggregate states, the peak of a backend and parallel workers,
+and `009_memory_ceiling.pl`: every way a role can try to raise the limit, each
+followed by the next session of the role, on a server that preloads the library
+and on one that does not).  The regression tests pass with and without the
+library in `shared_preload_libraries`.

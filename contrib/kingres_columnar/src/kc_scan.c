@@ -181,6 +181,8 @@ kc_scan_begin(Relation rel, Snapshot snapshot, const bool *needed,
 		scan->hold = kc_write_hold_acquire(RelationGetRelid(rel),
 										   kc_rel_ident(rel)->uid,
 										   &scan->pend, &scan->npend);
+		if (scan->npend > 0)
+			scan->pend_row = scan->pend[0].first;
 		if (scan->hold != 0 && owner != NULL)
 		{
 			ResourceOwnerRemember(owner, UInt64GetDatum(scan->hold),
@@ -203,7 +205,7 @@ kc_scan_rescan(KcScan *scan)
 	scan->stripe_idx = 0;
 	scan->have_group = false;
 	scan->pend_idx = 0;
-	scan->pend_row = 0;
+	scan->pend_row = scan->npend > 0 ? scan->pend[0].first : 0;
 	scan->ordinal = 0;
 	scan->hit_end = false;
 	MemoryContextReset(scan->group_cxt);
@@ -466,13 +468,15 @@ kc_next_pending(KcScan *scan, TupleTableSlot *slot)
 		CommandId	cid;
 		int			c;
 
+		kc_write_hold_check(scan->hold, scan->rel);
 		if (!kc_write_pending_fetch(RelationGetRelid(scan->rel), ref,
 									scan->pend_row, &vals, &nulls, &ncols, &cid) ||
 			(!scan->all_own_rows && cid >= scan->curcid))
 		{
 			/* command ids never decrease in a buffer: this one is done */
 			scan->pend_idx++;
-			scan->pend_row = 0;
+			scan->pend_row = scan->pend_idx < scan->npend ?
+				scan->pend[scan->pend_idx].first : 0;
 			continue;
 		}
 		ExecClearTuple(slot);

@@ -353,6 +353,20 @@ target_node_id(const char *host, int port)
 }
 
 /*
+ * S9-03: a node that holds a rotation of the cluster secret prepared and has
+ * not been told that it committed still holds the old secret and refuses the
+ * sessions made with the new one, which is what the node that can finish the
+ * rotation (the origin, by recovery) has.  Such a session is opened with the
+ * previous secret, which every node keeps when it applies a new one; it is
+ * never accepted from anybody, it only lets this node prove itself to a node
+ * that has not switched yet.  Set only around the retry in connect_to_node.
+ */
+static bool connect_with_previous = false;
+
+/* Did this backend need the previous secret to reach a node?  Recovery keeps the secret while so. */
+bool		kingres_shard_previous_secret_used = false;
+
+/*
  * connect_to_node
  *
  * Open a new libpq connection to host:port as the current user.  Returns
@@ -417,7 +431,14 @@ connect_to_node_as(const char *host, int port, const char *user, int claim_id,
 	 * of the cluster (forward_auth.c): it is made for this role and for the id
 	 * of the node that receives it.
 	 */
-	token = kingres_shard_forward_token(user, claim_id >= 0 ? claim_id : target_node_id(host, port));
+	token = connect_with_previous ?
+		kingres_shard_forward_token_previous(user, claim_id >= 0 ? claim_id : target_node_id(host, port)) :
+		kingres_shard_forward_token(user, claim_id >= 0 ? claim_id : target_node_id(host, port));
+	if (connect_with_previous && token == NULL)
+	{
+		*errmsg_out = pstrdup("this node holds no previous cluster secret");
+		return NULL;
+	}
 	options = psprintf("-c kingres_shard.forwarded=on%s%s -c DateStyle=ISO,MDY "
 					   "-c IntervalStyle=postgres -c extra_float_digits=3 "
 					   "-c standard_conforming_strings=on -c bytea_output=hex "
@@ -557,6 +578,50 @@ connect_to_node(const char *host, int port, const char *user, char **errmsg_out)
 		PQfinish(conn);
 		conn = NULL;
 	}
+
+	/*
+	 * The node may be one that missed the commit of a rotation of the secret:
+	 * try the sessions again with the previous secret, for the ids of the node
+	 * as above.
+	 */
+	{
+		unsigned char probe_buf[128];
+		int			probe_len = 0;
+
+		if (kingres_shard_previous_secret(probe_buf, sizeof(probe_buf), &probe_len))
+		{
+			List	   *ids = lcons_int(tried, list_copy(alts));
+			ListCell   *lcp;
+
+			explicit_bzero(probe_buf, sizeof(probe_buf));
+			PG_TRY();
+			{
+				connect_with_previous = true;
+				foreach(lcp, ids)
+				{
+					char	   *err3 = NULL;
+
+					conn = connect_to_node_as(host, port, user, lfirst_int(lcp), &err3);
+					if (conn == NULL)
+						continue;
+					if (probe_session(conn, &err3))
+					{
+						kingres_shard_previous_secret_used = true;
+						break;
+					}
+					PQfinish(conn);
+					conn = NULL;
+				}
+			}
+			PG_FINALLY();
+			{
+				connect_with_previous = false;
+			}
+			PG_END_TRY();
+			if (conn != NULL)
+				return conn;
+		}
+	}
 	return connect_to_node_as(host, port, user, -1, errmsg_out);
 }
 
@@ -637,6 +702,8 @@ kingres_shard_get_conn(const char *host, int port, bool missing_ok,
 		kc->wrote = false;
 		kc->prepared = false;
 		kc->sync_forced = false;
+		kc->via_previous = false;
+		kc->sync_exempt = false;
 		kc->gid[0] = '\0';
 		kc->pending_owner = NULL;
 		kc->pending_finish = NULL;
@@ -669,7 +736,9 @@ kingres_shard_get_conn(const char *host, int port, bool missing_ok,
 
 	if (kc->conn == NULL)
 	{
+		kingres_shard_previous_secret_used = false;
 		kc->conn = connect_to_node(kc->host, kc->port, kc->user, &err);
+		kc->via_previous = kingres_shard_previous_secret_used;
 		kc->have_error = false;
 
 		/*
@@ -745,6 +814,7 @@ discard_connection(KsConn *kc)
 	kc->wrote = false;
 	kc->prepared = false;
 	kc->sync_forced = false;
+	kc->sync_exempt = false;
 	kc->pending_owner = NULL;
 	kc->pending_finish = NULL;
 }
@@ -1163,6 +1233,26 @@ kingres_shard_cancel_with_deadline(PGconn *conn)
 }
 
 /*
+ * The text of the last error of a connection, never empty (S9: "could not prepare the
+ * transaction on node H:P: " with nothing after the colon).  libpq has no text when the
+ * wait ran out and the command was cancelled, or when the answer never came.
+ */
+char *
+kingres_shard_conn_error_text(PGconn *conn)
+{
+	char	   *msg;
+
+	if (conn == NULL)
+		return pstrdup("there is no connection to the node");
+	msg = pchomp(PQerrorMessage(conn));
+	if (msg[0] == '\0')
+		return pstrdup(PQstatus(conn) == CONNECTION_OK ?
+					   "the node did not answer (the wait ran out, or the answer was not read)" :
+					   "the connection to the node was lost");
+	return msg;
+}
+
+/*
  * Wait for the answer of the query that is in flight on conn, for at most
  * kingres_shard.node_timeout seconds, and return its last result (NULL when it
  * has none).  *failed is set when the wait ran out (the running command is
@@ -1247,6 +1337,29 @@ kingres_shard_bounded_exec(PGconn *conn, const char *sql, bool interruptible)
 }
 
 /*
+ * Like kingres_shard_bounded_exec(), for a command that waits for a standby (COMMIT PREPARED,
+ * ROLLBACK PREPARED): when node_timeout runs out the command is cancelled, which ends the wait
+ * with a warning, and its result (completed on the node, its standby not confirmed) is read
+ * within another node_timeout.  NULL only when the connection broke or even that did not come.
+ */
+PGresult *
+kingres_shard_exec_cancel_after_timeout(PGconn *conn, const char *sql)
+{
+	bool		failed;
+	PGresult   *res;
+
+	if (conn == NULL || PQstatus(conn) != CONNECTION_OK || !PQsendQuery(conn, sql))
+		return NULL;
+	res = bounded_get_last(conn, true, &failed);
+	if (!failed)
+		return res;
+	if (PQstatus(conn) != CONNECTION_OK)
+		return NULL;
+	res = bounded_get_last(conn, true, &failed);
+	return failed ? NULL : res;
+}
+
+/*
  * kingres_shard_conn_collect_quiet
  *
  * Read the answer of the query in flight on kc, as an abort path may: the wait
@@ -1293,7 +1406,7 @@ exec_internal(KsConn *kc, const char *sql)
 				(errcode(ERRCODE_CONNECTION_FAILURE),
 				 errmsg("could not send a command to node %s:%d",
 						kc->host, kc->port),
-				 errdetail_internal("%s", pchomp(PQerrorMessage(kc->conn)))));
+				 errdetail_internal("%s", kingres_shard_conn_error_text(kc->conn))));
 	}
 	res = libpqsrv_get_result_last(kc->conn, PG_WAIT_EXTENSION);
 	kc->in_query = false;
@@ -1325,7 +1438,7 @@ kingres_shard_exec(KsConn *kc, const char *sql)
 				(errcode(ERRCODE_CONNECTION_FAILURE),
 				 errmsg("could not send a command to node %s:%d",
 						kc->host, kc->port),
-				 errdetail_internal("%s", pchomp(PQerrorMessage(kc->conn)))));
+				 errdetail_internal("%s", kingres_shard_conn_error_text(kc->conn))));
 	}
 	res = libpqsrv_get_result_last(kc->conn, PG_WAIT_EXTENSION);
 	kc->in_query = false;
@@ -1360,7 +1473,7 @@ kingres_shard_exec_params(KsConn *kc, const char *sql, int nparams,
 				(errcode(ERRCODE_CONNECTION_FAILURE),
 				 errmsg("could not send a command to node %s:%d",
 						kc->host, kc->port),
-				 errdetail_internal("%s", pchomp(PQerrorMessage(kc->conn)))));
+				 errdetail_internal("%s", kingres_shard_conn_error_text(kc->conn))));
 	}
 	res = libpqsrv_get_result_last(kc->conn, PG_WAIT_EXTENSION);
 	kc->in_query = false;
@@ -1480,7 +1593,7 @@ kingres_shard_report_error(KsConn *kc, PGresult *res, const char *sql)
 	if (PQstatus(kc->conn) != CONNECTION_OK)
 		kc->have_error = true;
 	if (primary == NULL)
-		primary = pchomp(PQerrorMessage(kc->conn));
+		primary = kingres_shard_conn_error_text(kc->conn);
 
 	/*
 	 * The other node holds a newer catalog term than this one (S7-06): this node
@@ -1592,7 +1705,7 @@ kingres_internal_dtx_applied(PG_FUNCTION_ARGS)
 	bool		nulls[2] = {false, false};
 	HeapTuple	tup;
 
-	if (!superuser() && !kingres_shard_session_forwarded())
+	if (!superuser() && !kingres_shard_session_node_proven())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied for function internal_dtx_applied")));
@@ -1646,6 +1759,33 @@ kingres_shard_conn_force_sync(KsConn *kc)
 	return ok;
 }
 
+/*
+ * Mark the session of a node that is being demoted: its PREPARE and COMMIT PREPARED do
+ * not wait for its standbys and are not asked about them (S9-05).  Cleared when the
+ * transaction ends.
+ */
+void
+kingres_shard_conn_exempt_sync(KsConn *kc)
+{
+	kc->sync_exempt = true;
+}
+
+/* synchronous_commit = local on an idle session: recovery commits what a demoted node left, without waiting for the standby it names. */
+bool
+kingres_shard_conn_local_sync(KsConn *kc)
+{
+	PGresult   *res;
+	bool		ok;
+
+	res = kingres_shard_exec_params(kc, "SELECT set_config('synchronous_commit', 'local', false)",
+									0, NULL, NULL, false);
+	ok = (res != NULL && PQresultStatus(res) == PGRES_TUPLES_OK);
+	PQclear(res);
+	if (ok)
+		kc->sync_forced = true;
+	return ok;
+}
+
 /* Undo kingres_shard_conn_force_sync() on an idle session; a failure only leaves the stricter setting. */
 void
 kingres_shard_conn_unforce_sync(KsConn *kc)
@@ -1665,6 +1805,7 @@ static void
 reset_xact_state(KsConn *kc)
 {
 	kc->xact_depth = 0;
+	kc->sync_exempt = false;
 	kc->nstatements = 0;
 	kc->tz_applied[0] = '\0';
 	kc->wrote = false;
@@ -1728,7 +1869,7 @@ abort_connection(KsConn *kc)
 			ereport(WARNING,
 					(errmsg("could not roll back prepared transaction \"%s\" on node %s:%d; recovery will resolve it",
 							kc->gid, kc->host, kc->port),
-					 errdetail_internal("%s", res ? pchomp(PQerrorMessage(kc->conn)) : "no result")));
+					 errdetail_internal("%s", res ? kingres_shard_conn_error_text(kc->conn) : "no result")));
 			PQclear(res);
 			discard_connection(kc);
 			reset_xact_state(kc);
@@ -1799,8 +1940,13 @@ prepare_collect(KsConn *kc, bool *prepared, int *confirmed, bool *timed_out)
 				kingres_shard_cancel_with_deadline(kc->conn);
 				cancelled = true;
 				*timed_out = true;
+				/*
+				 * After the cancel the participant still answers its own question (internal_sync_confirm,
+				 * at most min(node_timeout, 5) seconds) before the batch ends: wait for that answer, or
+				 * the refusal "did not confirm" and "no answer" are a race of two equal timeouts.
+				 */
 				deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
-													   (int64) kingres_shard_node_timeout * 1000);
+													   (int64) Max(kingres_shard_node_timeout, Min(kingres_shard_node_timeout, 5) + 2) * 1000);
 				continue;
 			}
 			rc = WaitLatchOrSocket(MyLatch,
@@ -1873,12 +2019,26 @@ prepare_one(KsConn *kc)
 	 * waits at most five seconds (or node_timeout, if shorter) for a standby that
 	 * is behind with the few records written since the PREPARE.
 	 */
-	snprintf(sql, sizeof(sql),
-			 "SELECT " KINGRES_SHARD_SCHEMA ".internal_dtx_applied('%s'); "
-			 "SELECT set_config('synchronous_commit', CASE WHEN current_setting('synchronous_commit') = 'remote_apply' THEN 'remote_apply' ELSE 'on' END, false); "
-			 "PREPARE TRANSACTION '%s'; "
-			 "SELECT " KINGRES_SHARD_SCHEMA ".internal_sync_confirm(%d)",
-			 kc->gid, kc->gid, Min(kingres_shard_node_timeout, 5) * 1000);
+	/*
+	 * A participant that is being demoted (S9-05: the old primary of a promotion) does
+	 * not wait for its standbys and is not asked: it is about to stop being a primary,
+	 * its confirmation is not what makes the promotion durable, and the standby it
+	 * names is the node that was promoted in its place.
+	 */
+	if (kc->sync_exempt)
+		snprintf(sql, sizeof(sql),
+				 "SELECT " KINGRES_SHARD_SCHEMA ".internal_dtx_applied('%s'); "
+				 "SELECT set_config('synchronous_commit', 'local', false); "
+				 "PREPARE TRANSACTION '%s'; "
+				 "SELECT true",
+				 kc->gid, kc->gid);
+	else
+		snprintf(sql, sizeof(sql),
+				 "SELECT " KINGRES_SHARD_SCHEMA ".internal_dtx_applied('%s'); "
+				 "SELECT set_config('synchronous_commit', CASE WHEN current_setting('synchronous_commit') = 'remote_apply' THEN 'remote_apply' ELSE 'on' END, false); "
+				 "PREPARE TRANSACTION '%s'; "
+				 "SELECT " KINGRES_SHARD_SCHEMA ".internal_sync_confirm(%d)",
+				 kc->gid, kc->gid, Min(kingres_shard_node_timeout, 5) * 1000);
 	kingres_shard_conn_quiesce(kc);
 	kc->in_query = true;
 	if (!PQsendQuery(kc->conn, sql))
@@ -1889,7 +2049,7 @@ prepare_one(KsConn *kc)
 				(errcode(ERRCODE_CONNECTION_FAILURE),
 				 errmsg("could not send PREPARE TRANSACTION to node %s:%d",
 						kc->host, kc->port),
-				 errdetail_internal("%s", pchomp(PQerrorMessage(kc->conn)))));
+				 errdetail_internal("%s", kingres_shard_conn_error_text(kc->conn))));
 	}
 	res = prepare_collect(kc, &prepared, &confirmed, &timed_out);
 	kc->in_query = false;
@@ -1915,7 +2075,9 @@ prepare_one(KsConn *kc)
 		int			sqlstate = kingres_shard_result_sqlstate(res);
 		char	   *remote = (res != NULL && PQresultErrorField(res, PG_DIAG_MESSAGE_PRIMARY) != NULL) ?
 			pstrdup(PQresultErrorField(res, PG_DIAG_MESSAGE_PRIMARY)) :
-			pchomp(PQerrorMessage(kc->conn));
+			(res == NULL && timed_out) ?
+			psprintf("the node did not answer within kingres_shard.node_timeout (%d s), nor in the time it gets after the command was cancelled", kingres_shard_node_timeout) :
+			kingres_shard_conn_error_text(kc->conn);
 		bool		said_no = (prepared && res != NULL &&
 							   PQresultStatus(res) == PGRES_TUPLES_OK && confirmed == 0);
 
@@ -1997,8 +2159,8 @@ log_decision(void)
 	hash_seq_init(&scan, conn_hash);
 	while ((kc = (KsConn *) hash_seq_search(&scan)) != NULL)
 	{
-		Datum		values[3];
-		bool		nulls[3] = {false, false, false};
+		Datum		values[5];
+		bool		nulls[5] = {false, false, false, false, false};
 		HeapTuple	tup;
 
 		if (!kc->prepared)
@@ -2006,6 +2168,10 @@ log_decision(void)
 		values[0] = CStringGetTextDatum(kc->gid);
 		values[1] = Int32GetDatum(kingres_shard_conn_node_id(kc->host, kc->port));
 		values[2] = TimestampTzGetDatum(now);
+		/* Not durable until the participant's standbys confirm its second phase (recovery.c). */
+		values[3] = BoolGetDatum(kc->sync_exempt);
+		/* A demoted participant is not checked for the loss of its part either (S9-06). */
+		values[4] = BoolGetDatum(kc->sync_exempt);
 		tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
 		CatalogTupleInsert(rel, tup);
 		heap_freetuple(tup);
@@ -2245,15 +2411,18 @@ postcommit(void)
 			ereport(WARNING,
 					(errmsg("could not commit prepared transaction \"%s\" on node %s:%d; recovery will commit it",
 							kc->gid, kc->host, kc->port),
-					 errdetail_internal("%s", res ? pchomp(PQerrorMessage(kc->conn)) : "no result")));
+					 errdetail_internal("%s", res ? kingres_shard_conn_error_text(kc->conn) : "no result")));
 			PQclear(res);
 			discard_connection(kc);
 		}
 		else
 		{
-			/* The participant's standby is asked below, for every participant at once. */
+			/* The participant's standby is asked below, for every participant at once (not a demoted one). */
 			PQclear(res);
-			kc->commit_sent = true;
+			if (kc->sync_exempt)
+				reset_xact_state(kc);
+			else
+				kc->commit_sent = true;
 			continue;
 		}
 		reset_xact_state(kc);

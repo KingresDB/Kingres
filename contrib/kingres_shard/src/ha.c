@@ -74,6 +74,7 @@ PG_FUNCTION_INFO_V1(kingres_internal_restore_barrier);
 PG_FUNCTION_INFO_V1(kingres_internal_mark_victim);
 PG_FUNCTION_INFO_V1(kingres_internal_dtx_identity);
 PG_FUNCTION_INFO_V1(kingres_internal_unmark_victim);
+PG_FUNCTION_INFO_V1(kingres_internal_wal_timeline);
 PG_FUNCTION_INFO_V1(kingres_internal_sync_confirm);
 PG_FUNCTION_INFO_V1(kingres_internal_sync_probe);
 
@@ -524,6 +525,18 @@ kingres_shard_wait_confirmed(XLogRecPtr target, int mode, int timeout_ms)
 }
 
 /*
+ * kingres.internal_wal_timeline() returns int: the timeline this server writes WAL
+ * on (0 while it is in recovery).  See the local_node table and S9-02.
+ */
+Datum
+kingres_internal_wal_timeline(PG_FUNCTION_ARGS)
+{
+	if (RecoveryInProgress())
+		PG_RETURN_INT32(0);
+	PG_RETURN_INT32((int32) GetWALInsertionTimeLine());
+}
+
+/*
  * kingres.internal_sync_confirm(timeout_ms int) returns boolean
  *
  * The participant's answer to "is what you just did durable?" (S8-01).  The
@@ -545,7 +558,7 @@ kingres_internal_sync_confirm(PG_FUNCTION_ARGS)
 {
 	int			timeout_ms = PG_GETARG_INT32(0);
 
-	if (!superuser() && !kingres_shard_session_forwarded())
+	if (!superuser() && !kingres_shard_session_node_proven())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied for function internal_sync_confirm")));
@@ -585,7 +598,7 @@ kingres_shard_probe_sync(int timeout_ms)
 Datum
 kingres_internal_sync_probe(PG_FUNCTION_ARGS)
 {
-	if (!superuser() && !kingres_shard_session_forwarded())
+	if (!superuser() && !kingres_shard_session_node_proven())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied for function internal_sync_probe")));

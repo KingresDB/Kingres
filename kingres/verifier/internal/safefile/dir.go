@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"sort"
 	"strings"
 )
 
@@ -167,4 +168,36 @@ func (d *Dir) SubDirs(rel string) (dirs, others []string, err error) {
 		}
 	}
 	return dirs, others, nil
+}
+
+// RegularNames lists the names of the regular files directly in the root of the
+// directory, sorted, and separately the names of the entries that are neither
+// regular files nor directories (links, pipes, devices), which the caller may
+// refuse by name: a pipe called x.json must not be skipped silently. At most MaxDirEntries entries are read; a larger directory wraps
+// ErrTooLarge. The names are returned as names, never as a pattern: a directory
+// whose name has glob characters is just a directory.
+func (d *Dir) RegularNames() (names, others []string, err error) {
+	f, err := d.root.Open(".")
+	if err != nil {
+		return nil, nil, err
+	}
+	defer f.Close()
+	ents, err := f.ReadDir(MaxDirEntries + 1)
+	if err != nil && len(ents) == 0 && !errors.Is(err, io.EOF) {
+		return nil, nil, fmt.Errorf("listing %s: %w", d.name, err)
+	}
+	if len(ents) > MaxDirEntries {
+		return nil, nil, fmt.Errorf("%s %w (more than %d entries)", clipPath(d.name), ErrTooLarge, MaxDirEntries)
+	}
+	for _, en := range ents {
+		switch {
+		case en.Type().IsRegular():
+			names = append(names, en.Name())
+		case !en.IsDir():
+			others = append(others, en.Name())
+		}
+	}
+	sort.Strings(names)
+	sort.Strings(others)
+	return names, others, nil
 }

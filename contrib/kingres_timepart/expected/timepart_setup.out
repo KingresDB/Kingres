@@ -31,7 +31,7 @@ SELECT count(*) FILTER (WHERE c.relkind = 'r') AS tables,
    AND d.refclassid = 'pg_extension'::regclass;
  tables | views | sequences 
 --------+-------+-----------
-      4 |     4 |         1
+      5 |     4 |         1
 (1 row)
 
 SELECT evtname, evtevent, evtenabled FROM pg_event_trigger

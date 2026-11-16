@@ -13,7 +13,7 @@ targets=(
   "chain FuzzParseDigest" "chain FuzzParseBlocks" "format FuzzDecodeHex" "format FuzzEncodeRow"
   "jsonx FuzzParse" "proof FuzzVerify" "rowfile FuzzParse"
   "signednote FuzzParse" "checkpoint FuzzVerify" "tlog FuzzParseTilePath" "tlog FuzzParseTile"
-  "trust FuzzParse" "cli FuzzParseLogSpec" "safefile FuzzCleanRel"
+  "trust FuzzParse" "cli FuzzParseLogSpec" "cli FuzzUntrusted" "cli FuzzHostileText" "safefile FuzzCleanRel"
 )
 for t in "${targets[@]}"; do
   set -- $t

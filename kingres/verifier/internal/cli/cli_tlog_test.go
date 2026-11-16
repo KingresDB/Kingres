@@ -365,6 +365,16 @@ func TestConsistencyCommand(t *testing.T) {
 		"wrong old root":    args("--old", "300:"+base64.StdEncoding.EncodeToString(badRoot[:])),
 		"old larger":        args("--old", "701:"+base64.StdEncoding.EncodeToString(oldRoot[:])),
 		"equal size, other": args("--old", "700:"+base64.StdEncoding.EncodeToString(oldRoot[:])),
+	}
+	for name, a := range fails {
+		code, out, _ := run(t, a...)
+		if code != 1 || strings.Contains(out, "VERIFIED") {
+			t.Errorf("%s: exit %d, %s", name, code, out)
+		}
+	}
+	// Input errors: status 2.
+	for name, a := range map[string][]string{
+		"no old": args(),
 		"old note forged": func() []string {
 			f := filepath.Join(t.TempDir(), "o")
 			_ = os.WriteFile(f, []byte(newSigner(2).note(p.origin, 300, oldRoot)), 0o644)
@@ -375,16 +385,6 @@ func TestConsistencyCommand(t *testing.T) {
 			_ = os.WriteFile(f, []byte(p.signer.note(testPrefix+"/c/"+testChain+"/e9", 300, oldRoot)), 0o644)
 			return args("--old", f)
 		}(),
-	}
-	for name, a := range fails {
-		code, out, _ := run(t, a...)
-		if code != 1 || strings.Contains(out, "VERIFIED") {
-			t.Errorf("%s: exit %d, %s", name, code, out)
-		}
-	}
-	// Input errors: status 2.
-	for name, a := range map[string][]string{
-		"no old":           args(),
 		"old not a note":   args("--old", filepath.Join(p.logDir, "tile", "0", "000")),
 		"old missing":      args("--old", filepath.Join(p.dir, "missing")),
 		"size root junk":   args("--old", "300:!!!"),

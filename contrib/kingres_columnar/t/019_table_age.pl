@@ -121,11 +121,15 @@ foreach my $cmd ('TRUNCATE x', 'VACUUM FULL x', 'ALTER TABLE x ADD COLUMN b floa
 	if ($cmd =~ /VACUUM FULL/)
 	{
 		# every row is older than every snapshot: the rewrite keeps what each sees
-		ok($col =~ /^(2|ERROR:.*could not read columnar table)/, "$cmd of content older than the snapshot: the snapshot's rows or the failure ($col)");
+		is($col, '2', "$cmd of content older than the snapshot: the snapshot's rows");
 	}
 	elsif ($cmd =~ /heap/)
 	{
-		ok($col =~ /^(0|2|ERROR:)/, "$cmd of content older than the snapshot: no wrong rows ($col)");
+		# heap's own rewrite of the table: the rows are written by the rewriting
+		# transaction, which the older snapshot cannot see, so heap answers an empty
+		# table; any other answer (the rows of a later transaction, or an error from
+		# the extension) would be wrong
+		is($col, '0', "$cmd of content older than the snapshot: the table is heap's again and answers as heap does after a rewrite");
 	}
 	else
 	{

@@ -43,11 +43,18 @@ SELECT proname, prokind FROM members
 -- SECURITY DEFINER is used by the functions that write the policy and
 -- history tables for a caller that has no right on them, and by nothing else.
 SELECT proname FROM members WHERE prosecdef ORDER BY proname;
-        proname        
------------------------
+            proname             
+--------------------------------
+ timepart__begin_run
+ timepart__finish_run
+ timepart__is_sealed
  timepart__on_ddl_end
  timepart__on_sql_drop
-(2 rows)
+ timepart__policy_seal_trg
+ timepart__policy_seal_truncate
+ timepart__step_begin
+ timepart__step_end
+(9 rows)
 
 -- No function is executable by PUBLIC except the pure helpers and the two
 -- DDL steps that run with the caller's own rights.
@@ -63,13 +70,17 @@ SELECT proname FROM members
  timepart__create_rows
  timepart__create_stmts
  timepart__eff
+ timepart__exec_direct
+ timepart__is_sealed
  timepart__key_info
  timepart__lock_timeout
+ timepart__mark_seal
  timepart__misaligned
  timepart__oid
  timepart__on_grid
  timepart__owns
  timepart__plan_rows
+ timepart__policy_stamp
  timepart__policy_trg
  timepart__require_owner
  timepart__require_superuser
@@ -90,7 +101,7 @@ SELECT proname FROM members
  timepart_interval_parts
  timepart_part_name
  timepart_retire_one
-(35 rows)
+(39 rows)
 
 -- The policy and the history are shown to a role through security_barrier
 -- views (the rows of the tables it owns); the base tables and the lock table
@@ -108,11 +119,12 @@ SELECT relname, c.relkind AS kind, c.relrowsecurity AS rls,
  timepart_policies        | v    | f   | {security_invoker=true}                       | t            | f
  timepart_policy          | v    | f   | {security_barrier=true,check_option=cascaded} | t            | t
  timepart_policy_data     | r    | f   |                                               | f            | f
+ timepart_policy_seal     | r    | f   |                                               | f            | f
  timepart_run             | v    | f   | {security_barrier=true}                       | t            | f
  timepart_run_action      | v    | f   | {security_barrier=true}                       | t            | f
  timepart_run_action_data | r    | f   |                                               | f            | f
  timepart_run_data        | r    | f   |                                               | f            | f
-(8 rows)
+(9 rows)
 
 -- No object of the extension outside its schema.
 SELECT count(*) AS outside_schema FROM pg_depend d
@@ -131,8 +143,10 @@ SELECT proname FROM members m
          proname         
 -------------------------
  timepart_action_timeout
+ timepart_grant_driver
+ timepart_revoke_driver
  timepart_run_action
-(2 rows)
+(4 rows)
 
 -- Tables of the owner.
 GRANT USAGE ON SCHEMA tpo TO tp_other, tp_member, tp_noinherit, tp_nogrant;
@@ -193,37 +207,74 @@ SELECT count(*) AS visible_runs FROM kingres.timepart_run;
 
 SELECT count(*) AS visible_locks FROM kingres.timepart_lock;
 ERROR:  permission denied for table timepart_lock
--- The administration functions are not for the owner, even with EXECUTE.
+-- The functions that drive a run are the superuser's and the owner's of the
+-- table, and only with EXECUTE.  Pruning the history and adopting a backup are
+-- the superuser's alone, with EXECUTE granted or not.
 RESET ROLE;
-GRANT EXECUTE ON FUNCTION kingres.timepart_begin_run(regclass, timestamptz, text),
-                          kingres.timepart_due(timestamptz),
-                          kingres.timepart_finish_run(bigint),
-                          kingres.timepart_prune_runs(name, name, timestamptz) TO tp_owner;
-GRANT EXECUTE ON PROCEDURE kingres.timepart_run(regclass, timestamptz, text[], bigint),
-                           kingres.timepart_run_phase(bigint, text) TO tp_owner;
+GRANT EXECUTE ON FUNCTION kingres.timepart_prune_runs(name, name, timestamptz),
+                          kingres.timepart_adopt(boolean) TO tp_owner;
+SELECT kingres.timepart_grant_driver('tp_owner');
+ timepart_grant_driver 
+-----------------------
+ 
+(1 row)
+
 SET ROLE tp_owner;
-SELECT kingres.timepart_begin_run('tpo.o1', '2026-03-10 UTC');
-ERROR:  permission denied: only a superuser may call this function
-SELECT * FROM kingres.timepart_due('2100-01-01 UTC');
-ERROR:  permission denied: only a superuser may call this function
-SELECT kingres.timepart_finish_run(1);
-ERROR:  permission denied: only a superuser may call this function
 SELECT kingres.timepart_prune_runs('tpo', 'o1', '2026-03-10 UTC');
 ERROR:  permission denied: only a superuser may call this function
-CALL kingres.timepart_run('tpo.o1', '2026-03-10 UTC');
+SELECT kingres.timepart_adopt();
 ERROR:  permission denied: only a superuser may call this function
-CALL kingres.timepart_run_phase(1, 'create');
-ERROR:  permission denied for function timepart_run_action
-SELECT kingres.timepart_run_action(1, 'create');
-ERROR:  permission denied for function timepart_run_action
+SELECT kingres.timepart_grant_driver('tp_other');
+ERROR:  permission denied for function timepart_grant_driver
+-- The owner reads what is due for its tables and starts a run of its own table.
+-- This session is the session of a superuser that switched role, so the
+-- owner's code is not run in it: the action is refused and the run says why.
+SELECT * FROM kingres.timepart_due('2100-01-01 UTC');
+ schema_name | table_name |         as_of          
+-------------+------------+------------------------
+ tpo         | o1         | 2100-01-01 00:00:00+00
+(1 row)
+
+SELECT kingres.timepart_begin_run('tpo.o1', '2026-03-10 UTC') > 0 AS began;
+ began 
+-------
+ t
+(1 row)
+
+SELECT kingres.timepart_run_action((SELECT max(run_id) FROM kingres.timepart_run), 'create');
+ timepart_run_action 
+---------------------
+ f
+(1 row)
+
+SELECT state, left(error, 80) AS error FROM kingres.timepart_run ORDER BY run_id DESC LIMIT 1;
+ state  |                                      error                                       
+--------+----------------------------------------------------------------------------------
+ failed | 42501: owner_code_not_trusted: the code of the owner of tpo.o1 would run in the 
+(1 row)
+
+SELECT kingres.timepart_finish_run((SELECT max(run_id) FROM kingres.timepart_run));
+ timepart_finish_run 
+---------------------
+ 
+(1 row)
+
+CALL kingres.timepart_run('tpo.o1', '2026-03-10 UTC');
+ run_id 
+--------
+   1064
+(1 row)
+
 RESET ROLE;
 -- Without EXECUTE the function cannot even be called.
-REVOKE EXECUTE ON FUNCTION kingres.timepart_begin_run(regclass, timestamptz, text),
-                           kingres.timepart_due(timestamptz),
-                           kingres.timepart_finish_run(bigint),
-                           kingres.timepart_prune_runs(name, name, timestamptz) FROM tp_owner;
-REVOKE EXECUTE ON PROCEDURE kingres.timepart_run(regclass, timestamptz, text[], bigint),
-                            kingres.timepart_run_phase(bigint, text) FROM tp_owner;
+SELECT kingres.timepart_revoke_driver('tp_owner');
+ timepart_revoke_driver 
+------------------------
+ 
+(1 row)
+
+REVOKE EXECUTE ON FUNCTION kingres.timepart_prune_runs(name, name, timestamptz),
+                           kingres.timepart_adopt(boolean) FROM tp_owner;
 SET ROLE tp_nogrant;
 SELECT kingres.create_time_partitions('tpo.o1', '1 day', '2026-03-05 UTC', '2026-03-01 UTC');
 ERROR:  permission denied for function create_time_partitions

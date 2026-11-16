@@ -62,6 +62,14 @@
 
 #include "kingres_columnar.h"
 
+/*
+ * The largest block a buffer's memory context takes from the allocator.  The
+ * context of a buffer grows by doubling blocks up to this, and what is unused of
+ * the last block is held memory the buffer's accounting (kc_charge) does not see,
+ * so the size is kept small: the slack of a buffer is at most one block.
+ */
+#define KC_BUF_MAX_BLOCK	(1024 * 1024)
+
 /* the rows of a buffer that a flush did not write, in memory of their own */
 typedef struct KcTail
 {
@@ -90,8 +98,26 @@ typedef struct KcWriteBuf
 	CommandId  *cids;
 	uint32	   *sizes;			/* bytes of each by-reference value, else 0 */
 	int			refs;			/* scans that hold a reference to this buffer */
+
+	/*
+	 * Memory charged for this buffer: the by-reference values (the space their
+	 * chunks take, headers and rounding included) and the arrays of row slots
+	 * (their capacity, not their fill).  This is what counts against
+	 * write_buffer_memory (kc_total_bytes is the sum over all buffers), so the
+	 * allowance is about memory and not about payload.
+	 */
 	Size		bytes;
 	KcOptions	opts;
+
+	/*
+	 * The visible part of a buffer is the rows [vis_from, nrows) (see
+	 * kc_buf_visible_from): every reader takes it from there.  The rows before
+	 * vis_from are already in a stripe that a prepared hand-over has written
+	 * (kc_merge_flush_prepare) and are read from it; until the hand-over is
+	 * published the buffer still holds them, because an abort of the
+	 * subtransaction takes the stripe away again.
+	 */
+	uint32		vis_from;
 
 	/*
 	 * A hand-over to the parent that kc_subxact_prepare has made ready and
@@ -101,6 +127,8 @@ typedef struct KcWriteBuf
 	uint32		merge_base;		/* its row count when the rows were copied */
 	uint32		merge_rows;		/* these rows' count when they were copied */
 	char	   *merge_chunk;	/* their by-reference values, in merge_into's context */
+	Size		merge_charge;	/* what merge_chunk is charged when it is published */
+	uint32		merge_written;	/* rows of the combined sequence already written as stripes */
 	bool		tail_ready;		/* a flush wrote the front; "tail" replaces merge_into's rows */
 	KcTail		tail;
 } KcWriteBuf;
@@ -108,7 +136,6 @@ typedef struct KcWriteBuf
 typedef struct KcRelState
 {
 	Oid			relid;			/* hash key */
-	int			pins;
 	bool		frozen;			/* stripes get a frozen creator (kc_write_set_frozen) */
 	List	   *bufs;			/* KcWriteBuf *, outermost first */
 } KcRelState;
@@ -119,11 +146,44 @@ static HTAB *kc_holds = NULL;
 static Size kc_total_bytes = 0;
 static uint32 kc_next_serial = 1;
 
+/*
+ * Bytes written to buffers since the last look for something to flush under
+ * memory pressure that found nothing worth writing: the look costs a pass
+ * over all buffers, so it is not repeated for every row while the memory that
+ * is over the allowance cannot be written by the running subtransaction.
+ */
+static Size kc_bytes_since_look = 0;
+
+/*
+ * Between the two phases of a subtransaction's hand-over (kc_subxact_prepare,
+ * kc_subxact_publish) the buffers are in a state that only phase two may
+ * change.  Code of another extension that runs between them may read the table
+ * (readers use the visible part of a buffer) but not write it.
+ */
+static bool kc_handover_prepared = false;
+
+/* a hold taken while a hand-over was prepared that its publication broke */
+static bool kc_broken_any = false;
+
 /* set while compaction copies rows through the buffers (kc_write_set_maintenance) */
 static bool kc_maintenance_write = false;
 
-/* a rewrite happened in this transaction: its old file's stripe rows are removed at commit */
-static bool kc_reconcile_pending = false;
+/*
+ * The files this transaction replaced (a rewrite, VACUUM FULL, a change of
+ * access method): the table and the identity of the file it had.  The stripe
+ * rows of such a file are of no use to anyone once the new file is in place, and
+ * the access method has no callback when a file goes away, so the rows are
+ * removed by the command that replaced the file or, at the latest, at commit
+ * (kc_write_cleanup_replaced), and come back if the transaction aborts.  The
+ * list is in the memory of the top-level transaction and starts empty.
+ */
+typedef struct KcReplaced
+{
+	Oid			relid;
+	uint64		uid;
+} KcReplaced;
+
+static List *kc_replaced = NIL;
 
 /*
  * The rows compaction copies: a buffer of its own, never in a relation's list,
@@ -266,6 +326,9 @@ kc_state_reset(void)
 	kc_maintenance_write = false;
 	kc_maint_buf = NULL;
 	kc_total_bytes = 0;
+	kc_bytes_since_look = 0;
+	kc_handover_prepared = false;
+	kc_broken_any = false;
 }
 
 static KcRelState *
@@ -283,7 +346,6 @@ kc_state_get(Oid relid, bool create)
 	st = hash_search(kc_states, &relid, create ? HASH_ENTER : HASH_FIND, &found);
 	if (st && !found)
 	{
-		st->pins = 0;
 		st->frozen = false;
 		st->bufs = NIL;
 	}
@@ -302,7 +364,7 @@ kc_buf_make(Relation rel, int ncols)
 	cxt = AllocSetContextCreate(kc_write_cxt, "kingres_columnar rows",
 								ALLOCSET_DEFAULT_MINSIZE,
 								ALLOCSET_SMALL_INITSIZE,
-								ALLOCSET_DEFAULT_MAXSIZE);
+								KC_BUF_MAX_BLOCK);
 	b = MemoryContextAllocZero(kc_write_cxt, sizeof(KcWriteBuf));
 	b->serial = kc_next_serial++;
 	b->relid = RelationGetRelid(rel);
@@ -342,12 +404,39 @@ kc_buf_clear(KcWriteBuf *b)
 	b->cids = NULL;
 	b->sizes = NULL;
 	b->bytes = 0;
+	b->vis_from = 0;
 }
 
 /* ------------------------------------------------------------------------
  * Appending rows
  * ------------------------------------------------------------------------
  */
+
+/* The memory of one row slot of a buffer of ncols columns, in the arrays. */
+static Size
+kc_slot_bytes(int ncols)
+{
+	return (Size) ncols * (sizeof(Datum) + sizeof(bool) + sizeof(uint32)) +
+		sizeof(CommandId);
+}
+
+/* Charge (or, negative, give back) memory to a buffer and to the total. */
+static void
+kc_charge(KcWriteBuf *b, int64 delta)
+{
+	if (delta >= 0)
+	{
+		b->bytes += (Size) delta;
+		kc_total_bytes += (Size) delta;
+	}
+	else
+	{
+		Size		d = Min(b->bytes, (Size) -delta);
+
+		b->bytes -= d;
+		kc_total_bytes -= Min(kc_total_bytes, d);
+	}
+}
 
 static void
 kc_buf_reserve(KcWriteBuf *b, uint32 extra)
@@ -385,12 +474,17 @@ kc_buf_reserve(KcWriteBuf *b, uint32 extra)
 			memset(&b->sizes[oldn], 0,
 				   sizeof(uint32) * ((Size) ncap * b->ncols - oldn));
 		}
+		kc_charge(b, (int64) (ncap - b->cap) * (int64) kc_slot_bytes(b->ncols));
 		b->cap = ncap;
 		MemoryContextSwitchTo(old);
 	}
 }
 
-/* Copy one value into the buffer's memory; returns the datum and its size. */
+/*
+ * Copy one value into the buffer's memory; returns the datum and its size.
+ * The chunk the copy takes is charged to the buffer at once, even if the row
+ * is never completed: the memory is held until the buffer is cleared.
+ */
 static Datum
 kc_copy_value(KcWriteBuf *b, Form_pg_attribute att, Datum v, Size *sz)
 {
@@ -411,6 +505,7 @@ kc_copy_value(KcWriteBuf *b, Form_pg_attribute att, Datum v, Size *sz)
 		memcpy(p, DatumGetPointer(v), att->attlen);
 		res = PointerGetDatum(p);
 		*sz = att->attlen;
+		kc_charge(b, (int64) GetMemoryChunkSpace(p));
 	}
 	else
 	{
@@ -424,6 +519,7 @@ kc_copy_value(KcWriteBuf *b, Form_pg_attribute att, Datum v, Size *sz)
 			pfree(flat);
 		res = PointerGetDatum(p);
 		*sz = len;
+		kc_charge(b, (int64) GetMemoryChunkSpace(p));
 	}
 	MemoryContextSwitchTo(old);
 	return res;
@@ -449,12 +545,9 @@ kc_buf_widen(KcWriteBuf *b, Relation rel)
 
 	if (b->nrows == 0)
 	{
+		/* nothing to keep: the arrays and every value go with the context */
+		kc_buf_clear(b);
 		b->ncols = new_ncols;
-		b->vals = NULL;
-		b->nulls = NULL;
-		b->cids = NULL;
-		b->sizes = NULL;
-		b->cap = 0;
 		return;
 	}
 	KC_FAULT(KC_FAULT_ALLOC);
@@ -486,18 +579,31 @@ kc_buf_widen(KcWriteBuf *b, Relation rel)
 			ns[(Size) r * new_ncols + c] = isnull ? 0 : (uint32) sz;
 		}
 	}
+	pfree(b->vals);
+	pfree(b->nulls);
+	pfree(b->sizes);
 	b->vals = nv;
 	b->nulls = nn;
 	b->sizes = ns;
+	kc_charge(b, ((int64) kc_slot_bytes(new_ncols) - (int64) kc_slot_bytes(old_ncols)) *
+			  (int64) b->cap);
 	b->ncols = new_ncols;
 	MemoryContextSwitchTo(old);
 }
 
-/* Is a buffer one that the running subtransaction may flush now? */
+/*
+ * Is a buffer one that the running subtransaction may flush now?  Its rows
+ * must be its own (a stripe carries the id of the subtransaction that writes
+ * it, and rows of an enclosing one would be lost with an abort of this one)
+ * and no scan may be reading it by position (a scan holds the buffers that had
+ * rows when it began; rows written after that go to a buffer of their own,
+ * which no scan reads, so a scan on a table does not stop the table's later
+ * rows from leaving memory).
+ */
 static bool
 kc_buf_flushable(KcRelState *st, KcWriteBuf *b)
 {
-	return st->pins == 0 && b->subid == GetCurrentSubTransactionId();
+	return b->refs == 0 && b->subid == GetCurrentSubTransactionId();
 }
 
 static void kc_write_stripe(KcRelState *st, KcWriteBuf *b, Relation rel,
@@ -506,6 +612,7 @@ static void kc_flush_buf(KcRelState *st, KcWriteBuf *b, Relation rel);
 static void kc_flush_buf_ex(KcRelState *st, KcWriteBuf *b, Relation rel,
 							bool keep_tail);
 static uint32 kc_stripe_limit(const KcOptions *opts);
+static void kc_coalesce(KcRelState *st);
 
 /*
  * Rows buffered for a file the relation no longer has (it was truncated or
@@ -536,51 +643,97 @@ kc_min_flush_rows(const KcOptions *opts)
 	return Min(kc_stripe_limit(opts), Max(opts->chunk_rows, (uint32) KC_MIN_STRIPE_ROWS));
 }
 
+/* The memory allowance of the write buffers, in bytes. */
+static Size
+kc_allowance(void)
+{
+	return (Size) kc_guc_write_buffer_kb * 1024;
+}
+
+/*
+ * The memory that makes a buffer a real part of the allowance: half of it.  A
+ * buffer that holds this much is written whatever its row count.
+ */
+static Size
+kc_bytes_worth(void)
+{
+	return kc_allowance() / 2;
+}
+
+/*
+ * A buffer is worth a stripe of its own when it has the rows for one
+ * (kc_min_flush_rows) or when its memory is a real part of the allowance
+ * (kc_bytes_worth).  The row minimum only keeps stripes from being tiny; it
+ * never decides about memory: a buffer that is big in bytes is written
+ * whatever its row count, so wide rows cannot hide behind a minimum made for
+ * narrow ones.
+ */
 static bool
 kc_worth_flushing(KcWriteBuf *b)
 {
 	return b->nrows >= kc_min_flush_rows(&b->opts) ||
-		b->bytes >= (Size) kc_guc_write_buffer_kb * 1024 / 8;
+		b->bytes >= kc_bytes_worth();
 }
 
-/* Flush the largest flushable buffer of any relation; false if none. */
-static bool
-kc_flush_largest(void)
+/*
+ * The write buffers are over the allowance: write buffers of the running
+ * subtransaction as stripes, the largest first, until they are within it or
+ * nothing is left that the running subtransaction may write.  A buffer that
+ * is not worth a stripe by itself is written only while the memory of all the
+ * flushable buffers together is a real part of the allowance (half of it),
+ * which is what keeps many tables with small buffers within the allowance
+ * without making a tiny stripe of every few rows of one table when it is
+ * the rows of an enclosing subtransaction that fill the memory.  What is left
+ * over the allowance then is below half of it per open level of
+ * subtransaction (kc_subxact_prepare writes the rest when a level commits).
+ */
+static void
+kc_flush_pressure(void)
 {
-	HASH_SEQ_STATUS seq;
-	KcRelState *st;
-	KcRelState *best_st = NULL;
-	KcWriteBuf *best = NULL;
-	Relation	rel;
+	Size		allowance = kc_allowance();
 
-	hash_seq_init(&seq, kc_states);
-	while ((st = hash_seq_search(&seq)) != NULL)
+	if (kc_states == NULL)
+		return;
+	while (kc_total_bytes > allowance)
 	{
-		ListCell   *lc;
+		HASH_SEQ_STATUS seq;
+		KcRelState *st;
+		KcRelState *best_st = NULL;
+		KcWriteBuf *best = NULL;
+		Size		flushable = 0;
+		Relation	rel;
 
-		foreach(lc, st->bufs)
+		hash_seq_init(&seq, kc_states);
+		while ((st = hash_seq_search(&seq)) != NULL)
 		{
-			KcWriteBuf *b = lfirst(lc);
+			ListCell   *lc;
 
-			if (b->nrows > 0 && kc_buf_flushable(st, b) && kc_worth_flushing(b) &&
-				(best == NULL || b->bytes > best->bytes))
+			foreach(lc, st->bufs)
 			{
-				best = b;
-				best_st = st;
+				KcWriteBuf *b = lfirst(lc);
+
+				if (b->nrows == 0 || !kc_buf_flushable(st, b))
+					continue;
+				flushable += b->bytes;
+				if (best == NULL || b->bytes > best->bytes)
+				{
+					best = b;
+					best_st = st;
+				}
 			}
 		}
+		if (best == NULL || (!kc_worth_flushing(best) && flushable < kc_bytes_worth()))
+			break;
+		rel = try_table_open(best->relid, RowExclusiveLock);
+		if (rel == NULL)
+		{
+			kc_buf_clear(best);
+			continue;
+		}
+		kc_flush_buf(best_st, best, rel);
+		table_close(rel, NoLock);
 	}
-	if (best == NULL)
-		return false;
-	rel = try_table_open(best->relid, RowExclusiveLock);
-	if (rel == NULL)
-	{
-		kc_buf_clear(best);
-		return true;
-	}
-	kc_flush_buf(best_st, best, rel);
-	table_close(rel, NoLock);
-	return true;
+	kc_bytes_since_look = 0;
 }
 
 static void kc_buf_free(KcWriteBuf *b);
@@ -644,6 +797,20 @@ kc_write_maintenance_discard(void)
 	}
 }
 
+/* Has a hand-over that is prepared and not yet published rows of this relation? */
+static bool
+kc_rel_handover_prepared(KcRelState *st)
+{
+	ListCell   *lc;
+
+	foreach(lc, st->bufs)
+	{
+		if (((KcWriteBuf *) lfirst(lc))->merge_into != NULL)
+			return true;
+	}
+	return false;
+}
+
 void
 kc_write_row_values(Relation rel, Datum *vals, bool *nulls, CommandId cid)
 {
@@ -652,7 +819,21 @@ kc_write_row_values(Relation rel, Datum *vals, bool *nulls, CommandId cid)
 	KcWriteBuf *b = NULL;
 	MemoryContext old = CurrentMemoryContext;
 	int			c;
-	Size		rowbytes = 0;
+	Size		before = kc_total_bytes;
+
+	/*
+	 * The two phases of a subtransaction's hand-over leave the buffers in a
+	 * state that only the second phase may change.  Nothing in PostgreSQL
+	 * writes between them; code of another extension that does gets an error,
+	 * and the subtransaction aborts cleanly, rather than rows that are lost or
+	 * written twice (kc_subxact_prepare).
+	 */
+	if (kc_handover_prepared && kc_rel_handover_prepared(st))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("columnar table \"%s\" cannot be written while a subtransaction is being committed",
+						RelationGetRelationName(rel)),
+				 errdetail("A callback of another module wrote to the table between the two phases of the commit of a subtransaction.")));
 
 	/*
 	 * A write conflicts with transactions that read the table (SSI), except
@@ -671,7 +852,12 @@ kc_write_row_values(Relation rel, Datum *vals, bool *nulls, CommandId cid)
 	else if (st->bufs != NIL)
 	{
 		b = llast(st->bufs);
-		if (b->subid != GetCurrentSubTransactionId() ||
+
+		/*
+		 * A buffer that a scan reads by position takes no more rows: they go
+		 * to a buffer of their own, which can be written while the scan lasts.
+		 */
+		if (b->subid != GetCurrentSubTransactionId() || b->refs > 0 ||
 			b->uid != kc_rel_ident(rel)->uid)
 			b = NULL;
 	}
@@ -692,7 +878,6 @@ kc_write_row_values(Relation rel, Datum *vals, bool *nulls, CommandId cid)
 			b->vals[idx] = (Datum) 0;
 			b->nulls[idx] = true;
 			b->sizes[idx] = 0;
-			rowbytes += 1;
 			continue;
 		}
 		{
@@ -701,17 +886,18 @@ kc_write_row_values(Relation rel, Datum *vals, bool *nulls, CommandId cid)
 			b->vals[idx] = kc_copy_value(b, att, vals[c], &sz);
 			b->nulls[idx] = false;
 			b->sizes[idx] = (uint32) sz;
-			rowbytes += sizeof(Datum) + 1 + sz;
 		}
 	}
 	b->cids[b->nrows] = cid;
 	b->nrows++;
-	b->bytes += rowbytes + sizeof(CommandId);
-	kc_total_bytes += rowbytes + sizeof(CommandId);
 
+	/*
+	 * The compaction buffer is private and written as stripes when it holds a
+	 * stripe of rows or the allowance, whichever comes first.
+	 */
 	if (kc_maintenance_write)
 	{
-		if (b->nrows >= kc_stripe_limit(&b->opts))
+		if (b->nrows >= kc_stripe_limit(&b->opts) || b->bytes >= kc_allowance())
 			kc_write_maintenance_flush(rel);
 		return;
 	}
@@ -726,11 +912,19 @@ kc_write_row_values(Relation rel, Datum *vals, bool *nulls, CommandId cid)
 			table_close(r, NoLock);
 		}
 	}
-	else if (kc_total_bytes > (Size) kc_guc_write_buffer_kb * 1024)
-	{
-		/* soft limit: when only outer-level or pinned buffers exist, go on */
-		(void) kc_flush_largest();
-	}
+
+	/*
+	 * The memory allowance, by bytes: whatever the width of the rows and
+	 * however they are grouped into statements and subtransactions, what is
+	 * over it is written as soon as the running subtransaction may write it.
+	 * The look costs a pass over the buffers, so while it finds nothing to
+	 * write (the memory that is over belongs to enclosing subtransactions) it
+	 * is repeated only after a sixty-fourth of the allowance in new rows.
+	 */
+	kc_bytes_since_look += kc_total_bytes > before ? kc_total_bytes - before : 0;
+	if (kc_total_bytes > kc_allowance() &&
+		(before <= kc_allowance() || kc_bytes_since_look >= kc_allowance() / 64))
+		kc_flush_pressure();
 }
 
 void
@@ -1051,7 +1245,7 @@ kc_buf_tail_build(KcWriteBuf *b, uint32 from, uint32 total, KcTail *t)
 	ncxt = AllocSetContextCreate(kc_write_cxt, "kingres_columnar rows",
 								 ALLOCSET_DEFAULT_MINSIZE,
 								 ALLOCSET_SMALL_INITSIZE,
-								 ALLOCSET_DEFAULT_MAXSIZE);
+								 KC_BUF_MAX_BLOCK);
 	old = MemoryContextSwitchTo(ncxt);
 	PG_TRY();
 	{
@@ -1075,15 +1269,15 @@ kc_buf_tail_build(KcWriteBuf *b, uint32 from, uint32 total, KcTail *t)
 
 					memcpy(p, DatumGetPointer(d), sz);
 					d = PointerGetDatum(p);
+					bytes += GetMemoryChunkSpace(p);
 				}
 				nv[dst + c] = d;
 				nn[dst + c] = b->nulls[src + c];
 				ns[dst + c] = sz;
-				bytes += b->nulls[src + c] ? 1 : sizeof(Datum) + 1 + sz;
 			}
 			nc[r] = b->cids[from + r];
-			bytes += sizeof(CommandId);
 		}
+		bytes += (Size) cap * kc_slot_bytes(b->ncols);
 	}
 	PG_CATCH();
 	{
@@ -1120,6 +1314,7 @@ kc_buf_tail_install(KcWriteBuf *b, KcTail *t)
 	b->nrows = t->nrows;
 	b->cap = t->cap;
 	b->bytes = t->bytes;
+	b->vis_from = 0;
 	MemoryContextDelete(ocxt);
 }
 
@@ -1262,6 +1457,7 @@ kc_write_flush_relation(Relation rel)
 
 	if (st == NULL)
 		return;
+	kc_coalesce(st);
 	foreach(lc, st->bufs)
 	{
 		KcWriteBuf *b = lfirst(lc);
@@ -1311,15 +1507,73 @@ kc_write_set_maintenance(bool on)
 }
 
 /*
- * A rewrite (VACUUM FULL) replaced this table's file: the stripe rows of the
- * old file are of no use to anyone once this transaction commits, so they are
- * removed with it, at pre-commit, and come back if it aborts.  Otherwise they
- * wait for the next VACUUM and columnar_check reports them meanwhile.
+ * rel's file is about to be replaced by this transaction (a rewrite): note the
+ * file's identity.  Called under the exclusive lock the rewrite holds.  Noting
+ * a file twice is the same as once; noting one that is then not replaced
+ * (the command fails, or decides against it) does nothing, because the
+ * cleanup compares the identity with the file the relation has by then.
  */
 void
-kc_write_request_reconcile(void)
+kc_write_note_replaced(Relation rel)
 {
-	kc_reconcile_pending = true;
+	MemoryContext old;
+	KcReplaced *r;
+	uint64		uid;
+	ListCell   *lc;
+
+	if (!kc_rel_is_columnar(rel))
+		return;
+	uid = kc_rel_ident(rel)->uid;
+	foreach(lc, kc_replaced)
+	{
+		r = lfirst(lc);
+
+		if (r->relid == RelationGetRelid(rel) && r->uid == uid)
+			return;
+	}
+	old = MemoryContextSwitchTo(TopTransactionContext);
+	r = palloc(sizeof(KcReplaced));
+	r->relid = RelationGetRelid(rel);
+	r->uid = uid;
+	kc_replaced = lappend(kc_replaced, r);
+	MemoryContextSwitchTo(old);
+}
+
+/*
+ * Remove the stripe rows of every noted file that its table no longer has:
+ * the table has another file now (a rewrite, a rewrite into another access
+ * method), or is not columnar any more.  Only these files are looked at, so
+ * the cost is that of what the command did and not of the number of columnar
+ * tables, and two commands on different tables share no row.  A row that
+ * another session deleted meanwhile is gone, which is the purpose; one it is
+ * still deleting is left to it.  Needs an active snapshot.  Returns the
+ * number of rows deleted.
+ */
+int
+kc_write_cleanup_replaced(void)
+{
+	List	   *todo = kc_replaced;
+	ListCell   *lc;
+	int			n = 0;
+
+	kc_replaced = NIL;
+	foreach(lc, todo)
+	{
+		KcReplaced *r = lfirst(lc);
+		Relation	rel = try_table_open(r->relid, AccessShareLock);
+		bool		replaced = true;
+
+		if (rel != NULL)
+		{
+			/* a relation this transaction did not give a new file keeps its rows */
+			replaced = !kc_rel_is_columnar(rel) || kc_rel_ident(rel)->uid != r->uid;
+			table_close(rel, AccessShareLock);
+		}
+		if (replaced)
+			n += kc_catalog_delete_uid(r->uid);
+	}
+	list_free_deep(todo);
+	return n;
 }
 
 void
@@ -1333,8 +1587,10 @@ kc_write_set_frozen(Relation rel, bool frozen)
 /*
  * Holds.  A scan of a relation that has buffered rows reads the buffers
  * directly, and for that it holds the buffers still (no flush, no reset, no
- * merge into another buffer): a reference on every buffer it reads and a pin
- * on the relation.  The hold is recorded here, under an id, and not only in
+ * rows merged into them): a reference on every buffer it reads.  A buffer that
+ * is held takes no more rows (kc_write_row_values starts another), so what a
+ * scan reads never changes under it, and the buffers written after it began are
+ * not its concern and can be flushed.  The hold is recorded here, under an id, and not only in
  * the scan, because a scan abandoned by an error never runs its end (the
  * executor is not shut down for a failed portal or a failed query).  The scan
  * also remembers the hold in a resource owner (kc_scan.c), and the owner calls
@@ -1349,7 +1605,22 @@ typedef struct KcHold
 	Oid			relid;
 	int			n;
 	KcPendingRef *refs;			/* in kc_write_cxt */
+	bool		in_window;		/* taken between the two phases of a hand-over */
+	bool		broken;			/* ... and the publication changed what it reads */
 } KcHold;
+
+/*
+ * The visible part of a buffer: the rows [first, end) that a reader may take
+ * from it.  The one definition every reader uses (kc_write_hold_acquire names
+ * it in the reference a scan keeps, and kc_write_pending_fetch holds the scan
+ * to it).  The rows before first are in a stripe a prepared hand-over wrote.
+ */
+static void
+kc_buf_visible(const KcWriteBuf *b, uint32 *first, uint32 *end)
+{
+	*first = b->vis_from;
+	*end = b->nrows;
+}
 
 static uint64 kc_next_hold = 1;
 
@@ -1380,8 +1651,11 @@ kc_write_hold_acquire(Oid relid, uint64 uid, KcPendingRef **refs_out, int *n_out
 	foreach(lc, st->bufs)
 	{
 		KcWriteBuf *b = lfirst(lc);
+		uint32		first;
+		uint32		end;
 
-		if (b->nrows > 0 && b->uid == uid)
+		kc_buf_visible(b, &first, &end);
+		if (end > first && b->uid == uid)
 			count++;
 	}
 	if (count == 0)
@@ -1407,11 +1681,15 @@ kc_write_hold_acquire(Oid relid, uint64 uid, KcPendingRef **refs_out, int *n_out
 	foreach(lc, st->bufs)
 	{
 		KcWriteBuf *b = lfirst(lc);
+		uint32		first;
+		uint32		end;
 
-		if (b->nrows == 0 || b->uid != uid)
+		kc_buf_visible(b, &first, &end);
+		if (end <= first || b->uid != uid)
 			continue;
 		res[i].serial = b->serial;
-		res[i].nrows = b->nrows;
+		res[i].first = first;
+		res[i].nrows = end;
 		b->refs++;
 		i++;
 	}
@@ -1420,7 +1698,8 @@ kc_write_hold_acquire(Oid relid, uint64 uid, KcPendingRef **refs_out, int *n_out
 	h->relid = relid;
 	h->n = count;
 	h->refs = kept;
-	st->pins++;
+	h->in_window = kc_handover_prepared;
+	h->broken = false;
 	*refs_out = res;
 	*n_out = count;
 	return id;
@@ -1445,8 +1724,6 @@ kc_write_hold_release(uint64 id)
 	st = kc_state_get(h->relid, false);
 	if (st != NULL)
 	{
-		if (st->pins > 0)
-			st->pins--;
 		for (i = 0; i < h->n; i++)
 		{
 			ListCell   *lc;
@@ -1469,6 +1746,49 @@ kc_write_hold_release(uint64 id)
 }
 
 /*
+ * A scan that began between the two phases of a hand-over reads buffers that
+ * the second phase rearranges: it cannot go on afterwards.  Reading in that
+ * window to the end (a query of a callback) is the use that matters, and a
+ * cursor that outlives it gets this error rather than other rows than it
+ * began with.
+ */
+void
+kc_write_hold_check(uint64 id, Relation rel)
+{
+	KcHold	   *h;
+
+	if (!kc_broken_any || kc_holds == NULL)
+		return;
+	h = hash_search(kc_holds, &id, HASH_FIND, NULL);
+	if (h != NULL && h->broken)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("the scan of columnar table \"%s\" cannot go on: it began while a subtransaction was being committed",
+						RelationGetRelationName(rel))));
+}
+
+/* The second phase of a hand-over is done: holds taken before it cannot go on. */
+static void
+kc_holds_break_window(void)
+{
+	HASH_SEQ_STATUS seq;
+	KcHold	   *h;
+
+	if (kc_holds == NULL)
+		return;
+	hash_seq_init(&seq, kc_holds);
+	while ((h = hash_seq_search(&seq)) != NULL)
+	{
+		if (h->in_window)
+		{
+			h->in_window = false;
+			h->broken = true;
+			kc_broken_any = true;
+		}
+	}
+}
+
+/*
  * Row rowno of the buffer the reference names.  The pointers stay valid until
  * the next insert into the relation (the by-reference values much longer).
  */
@@ -1487,7 +1807,7 @@ kc_write_pending_fetch(Oid relid, const KcPendingRef *ref, uint32 rowno,
 
 		if (b->serial != ref->serial)
 			continue;
-		if (rowno >= ref->nrows || rowno >= b->nrows)
+		if (rowno < ref->first || rowno >= ref->nrows || rowno >= b->nrows)
 			return false;
 		*vals = &b->vals[(Size) rowno * b->ncols];
 		*nulls = &b->nulls[(Size) rowno * b->ncols];
@@ -1535,6 +1855,7 @@ kc_flush_all(void)
 		ListCell   *lc;
 		Relation	rel = NULL;
 
+		kc_coalesce(st);
 		foreach(lc, st->bufs)
 		{
 			KcWriteBuf *b = lfirst(lc);
@@ -1570,7 +1891,7 @@ kc_xact_callback(XactEvent event, void *arg)
 		case XACT_EVENT_PRE_COMMIT:
 		case XACT_EVENT_PRE_PREPARE:
 			kc_flush_all();
-			if (kc_reconcile_pending)
+			if (kc_replaced != NIL)
 			{
 				/* the catalog deletes want a snapshot; none is active at pre-commit */
 				bool		pushed = false;
@@ -1580,7 +1901,7 @@ kc_xact_callback(XactEvent event, void *arg)
 					PushActiveSnapshot(GetTransactionSnapshot());
 					pushed = true;
 				}
-				(void) kc_catalog_reconcile();
+				(void) kc_write_cleanup_replaced();
 				if (pushed)
 					PopActiveSnapshot();
 			}
@@ -1588,7 +1909,7 @@ kc_xact_callback(XactEvent event, void *arg)
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_PREPARE:
 		case XACT_EVENT_ABORT:
-			kc_reconcile_pending = false;
+			kc_replaced = NIL;
 			kc_state_reset();
 			break;
 		default:
@@ -1619,15 +1940,29 @@ kc_xact_callback(XactEvent event, void *arg)
  * parent and the stripe stands or falls with the parent, as the rows do.
  * Only buffers of the parent itself may be written this way: those of a
  * grandparent would be lost with the parent's abort.
+ *
+ * Between the phases the stripe and the buffers both hold those rows.  A
+ * reader in that window (a callback of another extension that runs after this
+ * one) must see each row once, so the rows of a buffer that are in a stripe
+ * are not part of its visible part (vis_from, kc_buf_visible); a write there
+ * is refused (kc_handover_prepared).  A scan that began in the window is
+ * stopped when phase two has rearranged the buffers it reads
+ * (kc_write_hold_check).
  * ------------------------------------------------------------------------
  */
 
-/* Is b, a committing subtransaction's buffer, to be merged into prev? */
+/*
+ * Is b, a committing subtransaction's buffer, to be merged into prev?  Neither
+ * buffer may be one that a scan reads by position (a scan keeps the rows it
+ * began with, and the merged rows would have to move or be written under
+ * it); b then stays a buffer of its own and becomes the parent's.
+ */
 static bool
 kc_can_merge(KcWriteBuf *prev, KcWriteBuf *b, SubTransactionId parentSubid)
 {
 	return prev != NULL && prev->subid == parentSubid &&
-		prev->ncols == b->ncols && prev->uid == b->uid && b->refs == 0;
+		prev->ncols == b->ncols && prev->uid == b->uid &&
+		b->refs == 0 && prev->refs == 0;
 }
 
 /*
@@ -1666,6 +2001,8 @@ kc_buf_merge_prepare(KcWriteBuf *prev, KcWriteBuf *b)
 	b->merge_base = base;
 	b->merge_rows = b->nrows;
 	b->merge_chunk = chunk;
+	b->merge_charge = chunk ? GetMemoryChunkSpace(chunk) : 0;
+	b->merge_written = 0;
 	for (r = 0; r < b->nrows; r++)
 	{
 		Size		src = (Size) r * b->ncols;
@@ -1691,33 +2028,31 @@ kc_buf_merge_prepare(KcWriteBuf *prev, KcWriteBuf *b)
 }
 
 /*
- * The buffers a committing subtransaction hands to its parent may have made
- * the parent's buffer a stripe or more, or used up the memory allowance, and
- * the parent cannot flush by itself while the child runs.  Write the rows now
- * (prev's slots [0, total) hold them, the child's behind the parent's), as
- * stripes of the table's size, so that the stripes of a table do not depend on
- * how its rows were grouped into subtransactions.  With the memory allowance
- * used up everything goes except a tail too short to be worth a stripe;
- * otherwise only whole stripes go.  The tail is built here and installed in
- * phase two.  A scan that reads these buffers (a pin) keeps them whole.
+ * Write rows [b->merge_written, upto) of the rows a prepared hand-over holds
+ * (prev's slots [0, prev->nrows + b->merge_rows): the parent's, then the
+ * child's) as stripes, and make the rows from upto on the tail that phase two
+ * installs.  This is the part of a hand-over that writes: because the parent
+ * cannot flush while the child runs, a committing child writes the stripes
+ * that the parent's buffer, now larger, calls for, so that the stripes of a
+ * table do not depend on how its rows were grouped into subtransactions.
+ * It can be called again for the same pair with a larger upto (memory
+ * pressure after the whole stripes); the tail it replaces is dropped only
+ * when the new one is built, so an error leaves the earlier state.  The rows
+ * written are then hidden from readers of the buffers (vis_from).
  */
 static void
-kc_merge_flush_prepare(KcRelState *st, KcWriteBuf *prev, KcWriteBuf *b)
+kc_merge_flush_prepare(KcRelState *st, KcWriteBuf *prev, KcWriteBuf *b,
+					   uint32 upto)
 {
-	uint32		total = prev->nrows + b->nrows;
+	uint32		total = prev->nrows + b->merge_rows;
 	uint32		limit = kc_stripe_limit(&prev->opts);
-	bool		over = kc_total_bytes > (Size) kc_guc_write_buffer_kb * 1024;
-	uint32		towrite;
-	uint32		done = 0;
+	uint32		done = b->merge_written;
 	Relation	rel;
 	bool		pushed = false;
+	KcTail		tail;
 
-	if (st->pins > 0)
-		return;
-	towrite = total - total % limit;
-	if (over && total - towrite >= kc_min_flush_rows(&prev->opts))
-		towrite = total;
-	if (towrite == 0)
+	Assert(b->merge_into == prev);
+	if (upto <= done)
 		return;
 
 	/* dropped in this transaction: the rows are discarded with the buffer */
@@ -1735,9 +2070,9 @@ kc_merge_flush_prepare(KcRelState *st, KcWriteBuf *prev, KcWriteBuf *b)
 		pushed = true;
 	}
 	KC_FAULT(KC_FAULT_FLUSH);
-	while (done < towrite)
+	while (done < upto)
 	{
-		uint32		n = Min(limit, towrite - done);
+		uint32		n = Min(limit, upto - done);
 
 		kc_write_stripe(st, prev, rel, done, n, false);
 		done += n;
@@ -1746,7 +2081,18 @@ kc_merge_flush_prepare(KcRelState *st, KcWriteBuf *prev, KcWriteBuf *b)
 	if (pushed)
 		PopActiveSnapshot();
 
-	kc_buf_tail_build(prev, towrite, total, &b->tail);
+	/*
+	 * The stripes are written; whatever happens next, the rows in them must
+	 * not be read from the buffers as well.
+	 */
+	prev->vis_from = Min(upto, prev->nrows);
+	b->vis_from = upto > prev->nrows ? upto - prev->nrows : 0;
+	b->merge_written = upto;
+
+	kc_buf_tail_build(prev, upto, total, &tail);
+	if (b->tail_ready)
+		MemoryContextDelete(b->tail.cxt);
+	b->tail = tail;
 	b->tail_ready = true;
 }
 
@@ -1767,7 +2113,8 @@ kc_buf_merge_publish(KcWriteBuf *b)
 	else
 	{
 		prev->nrows = b->merge_base + b->merge_rows;
-		prev->bytes += b->bytes;
+		kc_charge(prev, (int64) b->merge_charge);
+		kc_total_bytes -= Min(kc_total_bytes, b->bytes);
 		b->bytes = 0;
 	}
 	/* the values live in the parent's memory now */
@@ -1788,17 +2135,122 @@ kc_buf_free(KcWriteBuf *b)
 	pfree(b);
 }
 
-/* Phase one for the whole subtransaction: every relation, all or nothing. */
+/*
+ * Buffers of one relation that belong to the same subtransaction and are not
+ * read by a scan become one: the buffers a scan made another buffer necessary
+ * for are joined again when rows have to be written, so that the stripes come
+ * out as they would have without the scan.  Rows keep their order.  Can fail
+ * (memory), before anything is changed for the pair it works on.
+ */
+static void
+kc_coalesce(KcRelState *st)
+{
+	ListCell   *lc;
+	KcWriteBuf *prev = NULL;
+
+	foreach(lc, st->bufs)
+	{
+		KcWriteBuf *b = lfirst(lc);
+
+		if (prev != NULL && b->subid == prev->subid && b->ncols == prev->ncols &&
+			b->uid == prev->uid && b->refs == 0 && prev->refs == 0 &&
+			b->merge_into == NULL && prev->vis_from == 0)
+		{
+			if (b->nrows > 0)
+			{
+				kc_buf_merge_prepare(prev, b);
+				kc_buf_merge_publish(b);
+			}
+			st->bufs = foreach_delete_current(st->bufs, lc);
+			kc_buf_free(b);
+			continue;
+		}
+		prev = b;
+	}
+}
+
+/*
+ * A buffer of the committing subtransaction that is a real part of the
+ * allowance is written by the subtransaction itself, as its own flush: its
+ * rows are its own, and a copy of them into the parent's buffer would hold
+ * them twice for the length of the commit.
+ */
+static void
+kc_flush_own_buffer(KcRelState *st, KcWriteBuf *b)
+{
+	Relation	rel;
+	bool		pushed = false;
+
+	rel = try_table_open(b->relid, RowExclusiveLock);
+	if (rel == NULL)
+	{
+		kc_buf_clear(b);
+		return;
+	}
+	if (!ActiveSnapshotSet())
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
+		pushed = true;
+	}
+	kc_flush_buf(st, b, rel);
+	table_close(rel, NoLock);
+	if (pushed)
+		PopActiveSnapshot();
+}
+
+/* One buffer handed over: the child's, the parent's it is merged into. */
+typedef struct KcPair
+{
+	KcRelState *st;
+	KcWriteBuf *prev;
+	KcWriteBuf *b;
+} KcPair;
+
+/* Memory a prepared pair holds once phase two is done. */
+static Size
+kc_pair_after(const KcPair *p)
+{
+	return p->b->tail_ready ? p->b->tail.bytes : p->prev->bytes + p->b->merge_charge;
+}
+
+/* Rows a prepared pair holds once phase two is done. */
+static uint32
+kc_pair_rows_after(const KcPair *p)
+{
+	return p->prev->nrows + p->b->merge_rows - p->b->merge_written;
+}
+
+/*
+ * Phase one for the whole subtransaction: every relation, all or nothing.
+ *
+ * First every buffer is made ready: a big one is written by the child (its own
+ * flush), a small one is copied into its parent's buffer, which is written as
+ * whole stripes when it holds that many rows.  Then, if the buffers are still
+ * over the memory allowance, the merged buffers are written, the largest
+ * first, until they are within it, by the same rule as kc_flush_pressure: a
+ * merged buffer that is not worth a stripe by itself is written only while the
+ * merged buffers together are half of the allowance.  The rule makes the
+ * memory of a loop of subtransactions, whatever the width of its rows,
+ * independent of the number of iterations.
+ */
 static void
 kc_subxact_prepare(SubTransactionId mySubid, SubTransactionId parentSubid)
 {
 	HASH_SEQ_STATUS seq;
 	KcRelState *st;
+	KcPair		stackpairs[8];
+	KcPair	   *pairs = stackpairs;
+	int			npairs = 0;
+	int			cap = lengthof(stackpairs);
+	Size		allowance = kc_allowance();
+	Size		effective;
+	int			i;
 
 	hash_seq_init(&seq, kc_states);
 	while ((st = hash_seq_search(&seq)) != NULL)
 	{
 		KcWriteBuf *prev = NULL;
+		bool		busy = false;	/* prev already takes a buffer of this child */
 		ListCell   *lc;
 
 		foreach(lc, st->bufs)
@@ -1808,20 +2260,101 @@ kc_subxact_prepare(SubTransactionId mySubid, SubTransactionId parentSubid)
 			if (b->subid != mySubid)
 			{
 				prev = b;
+				busy = false;
 				continue;
 			}
-			if (kc_can_merge(prev, b, parentSubid))
+			if (!busy && kc_can_merge(prev, b, parentSubid))
 			{
-				if (b->nrows > 0)
+				if (b->nrows == 0)
+					continue;
+				if (kc_total_bytes + b->bytes > allowance && kc_worth_flushing(b))
 				{
-					kc_buf_merge_prepare(prev, b);
-					kc_merge_flush_prepare(st, prev, b);
+					kc_flush_own_buffer(st, b);
+					continue;
+				}
+				kc_buf_merge_prepare(prev, b);
+				busy = true;
+				if (npairs == cap)
+				{
+					/*
+					 * Not in the current context: it is the CurTransactionContext of
+					 * the committing subtransaction, which PostgreSQL keeps (8 kB a
+					 * subtransaction, until the top-level transaction ends) as soon as
+					 * anything has been allocated in it, even if it is freed again.
+					 */
+					cap *= 2;
+					if (pairs == stackpairs)
+					{
+						pairs = MemoryContextAlloc(kc_write_cxt, sizeof(KcPair) * cap);
+						memcpy(pairs, stackpairs, sizeof(stackpairs));
+					}
+					else
+						pairs = repalloc(pairs, sizeof(KcPair) * cap);
+				}
+				pairs[npairs].st = st;
+				pairs[npairs].prev = prev;
+				pairs[npairs].b = b;
+				npairs++;
+				{
+					uint32		total = prev->nrows + b->nrows;
+					uint32		limit = kc_stripe_limit(&prev->opts);
+
+					if (total - total % limit > 0)
+						kc_merge_flush_prepare(st, prev, b, total - total % limit);
 				}
 			}
 			else
+			{
 				prev = b;
+				busy = false;
+			}
 		}
 	}
+
+	/* what the memory would be once phase two has installed the tails */
+	effective = kc_total_bytes;
+	for (i = 0; i < npairs; i++)
+	{
+		Size		before = pairs[i].prev->bytes + pairs[i].b->bytes;
+		Size		after = kc_pair_after(&pairs[i]);
+
+		effective -= Min(effective, before > after ? before - after : 0);
+	}
+	while (effective > allowance)
+	{
+		int			best = -1;
+		Size		together = 0;
+
+		for (i = 0; i < npairs; i++)
+		{
+			if (kc_pair_rows_after(&pairs[i]) == 0)
+				continue;
+			together += kc_pair_after(&pairs[i]);
+			if (best < 0 || kc_pair_after(&pairs[i]) > kc_pair_after(&pairs[best]))
+				best = i;
+		}
+		if (best < 0)
+			break;
+		if (kc_pair_rows_after(&pairs[best]) < kc_min_flush_rows(&pairs[best].prev->opts) &&
+			kc_pair_after(&pairs[best]) < kc_bytes_worth() && together < kc_bytes_worth())
+			break;
+		{
+			KcPair	   *p = &pairs[best];
+			Size		was = kc_pair_after(p);
+			Size		now;
+
+			kc_merge_flush_prepare(p->st, p->prev, p->b,
+								   p->prev->nrows + p->b->merge_rows);
+			now = kc_pair_after(p);
+			effective -= Min(effective, was > now ? was - now : 0);
+			if (kc_pair_rows_after(p) != 0)
+				break;			/* not written (dropped or converted): no progress */
+		}
+	}
+	if (pairs != stackpairs)
+		pfree(pairs);
+	if (npairs > 0)
+		kc_handover_prepared = true;
 }
 
 /* Phase two for the whole subtransaction.  Cannot fail. */
@@ -1850,18 +2383,22 @@ kc_subxact_publish(SubTransactionId mySubid, SubTransactionId parentSubid)
 
 			/*
 			 * The rows now belong to the parent subtransaction.  A buffer that
-			 * a scan holds a reference to keeps its identity (the scan names
-			 * it by serial and row count) and is only handed over; any other
-			 * is merged into the parent's buffer when there is one, with or
-			 * without scans open on the table.
+			 * phase one prepared is merged into the parent's (a scan that
+			 * began in between is stopped, see kc_write_hold_check); an empty
+			 * one is dropped; any other keeps its identity, because a scan
+			 * names it by serial and row count, and is only handed over.
 			 */
-			if (kc_can_merge(prev, b, parentSubid) &&
-				(b->nrows == 0 ||
-				 (b->merge_into == prev && b->merge_rows == b->nrows &&
-				  b->merge_base == prev->nrows)))
+			if (b->merge_into != NULL)
 			{
-				if (b->nrows > 0)
-					kc_buf_merge_publish(b);
+				Assert(b->merge_into == prev && b->merge_rows == b->nrows &&
+					   b->merge_base == prev->nrows);
+				kc_buf_merge_publish(b);
+				st->bufs = foreach_delete_current(st->bufs, lc);
+				kc_buf_free(b);
+			}
+			else if (b->nrows == 0 && prev != NULL && prev->subid == parentSubid &&
+					 prev->ncols == b->ncols && prev->uid == b->uid)
+			{
 				st->bufs = foreach_delete_current(st->bufs, lc);
 				kc_buf_free(b);
 			}
@@ -1871,6 +2408,11 @@ kc_subxact_publish(SubTransactionId mySubid, SubTransactionId parentSubid)
 				prev = b;
 			}
 		}
+	}
+	if (kc_handover_prepared)
+	{
+		kc_holds_break_window();
+		kc_handover_prepared = false;
 	}
 }
 
@@ -1891,10 +2433,18 @@ kc_subxact_abort(SubTransactionId mySubid)
 
 			if (b->subid == mySubid)
 			{
+				/* the stripes of a prepared hand-over go with the subtransaction */
+				if (b->merge_into != NULL)
+					b->merge_into->vis_from = 0;
 				st->bufs = foreach_delete_current(st->bufs, lc);
 				kc_buf_free(b);
 			}
 		}
+	}
+	if (kc_handover_prepared)
+	{
+		kc_holds_break_window();
+		kc_handover_prepared = false;
 	}
 }
 

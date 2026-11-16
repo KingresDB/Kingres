@@ -920,7 +920,6 @@ kingres_sketch_hll_agg_deserial(PG_FUNCTION_ARGS)
 	MemoryContextSwitchTo(old);
 	if (st == NULL)
 	{
-		ks_acct_release(acct);
 		ks_invalid_value("hll", why);
 	}
 	st->acct = acct;

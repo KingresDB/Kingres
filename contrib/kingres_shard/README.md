@@ -363,11 +363,15 @@ schema through `"$user"`; qualify names or fix `search_path`.
 | `kingres.remove_node(node_id int)` | Unregister a node whose group owns no buckets (a standby: whatever its group owns; a primary that has standbys: not before them); its catalog is cleared if reachable. |
 | `kingres.promote_node(node_id int) returns jsonb` | Superuser. Makes a promoted standby the primary of its group and the former primary a standby, in one two-phase transaction; raises the map version and the catalog term; resumable; skips the nodes it cannot reach and lists them. Refuses, changing nothing, when the node that commits cannot get its synchronous standbys to confirm. Answers `{"status": "promoted"|"completed"|"already", "term", "unreached"}`. On the map group primary, for group 0 on the promoted node itself. See "High availability". |
 | `kingres.catalog_status` (view) | The catalog term of this node, whether it has been superseded as the map group primary, and its map version. For superusers; exists on every node. |
+| `kingres.promote_map_group_without_majority(node_id int, acknowledgement text) returns jsonb` | Superuser, on the promoted standby of the map group. The operator's way out when the majority rule refuses for ever; needs the exact acknowledgement text (README, failover of the map group); the catalog term jumps by 1000. |
+| `kingres.standby_name_matches(standby_name text) returns bool` | Superuser, on the primary of a group: does a streaming standby carry this `application_name` (the check before a name goes into `synchronous_standby_names`)? |
+| `kingres.switchover_mark() returns pg_lsn` | Superuser, on the old primary of a planned switchover, after the writes stopped: writes and flushes a WAL record and returns its position. |
+| `kingres.switchover_verify(target_lsn pg_lsn, shutdown_checkpoint bool default false) returns bool` | Superuser, on the new primary (before or after `pg_promote()`): has this node replayed what the old primary wrote up to the position? The step that can fail in a planned switchover. |
 | `kingres.create_restore_point(name text) returns table(node_id, group_id, restore_lsn)` | Map group primary, superuser. A restore point on every primary with no distributed transaction half way through its commit. |
 | `kingres.standby_status() returns table(...)` | Map group primary, superuser. The standbys with their replication state as their primary sees it. |
 | `kingres.detect_distributed_deadlocks() returns int` | Map group primary, superuser. One pass of the distributed deadlock detector (the recovery worker runs it); returns the number of transactions cancelled. |
 | `kingres.sync_catalog()` | Push the catalog to every active primary node, atomically. |
-| `kingres.rotate_secret()` | Map group primary, superuser. Replaces the secret behind the tokens of node-to-node sessions on every active primary, atomically. Refuses while a distributed transaction of the cluster is prepared on any node (its tag would stop verifying). Sessions another node opens while the commit is in flight may be refused once; repeat the statement. |
+| `kingres.rotate_secret()` | Map group primary, superuser. Replaces the secret behind the tokens of node-to-node sessions on every active primary, atomically. Refuses while a distributed transaction of the cluster is prepared on any node (its tag would stop verifying). Sessions another node opens while the commit is in flight may be refused once; repeat the statement. A node that dies between the PREPARE and the COMMIT PREPARED of the rotation is reached by the node that finishes it with the secret that the rotation replaced (every node keeps it as "previous" and never accepts a session with it); recovery commits the rotation by itself and drops the previous secret in the first pass of a node's recovery (the worker, or `recover_prepared_transactions()`, on that node) that reaches every primary with the current secret and needs no session made with the previous one: the pass that commits a stranded node's rotation needs it and keeps it, the next pass drops it (S9-03, `t/076` asserts both). |
 | `kingres.create_distributed_table(relation regclass, dist_column name, colocate_with regclass default null, bucket_count int default null)` | Map group primary only. See below. |
 | `kingres.create_reference_table(relation regclass)` | Map group primary only. Makes an ordinary table a reference table: creates it on every node and copies its rows. Writers are blocked while it copies. |
 | `kingres.recover_prepared_transactions() returns int` | Commits or rolls back the prepared transactions this node originated, on every active primary (itself included); returns how many it resolved. Superuser. Runs in a `READ COMMITTED` transaction; not on a standby. |
@@ -449,7 +453,7 @@ the files of the extension, because the dump creates the extension.
 | `kingres_shard.recovery_interval` | 30s | Seconds between runs of the recovery worker; 0 disables it. `sighup`. |
 | `kingres_shard.deadlock_check_interval` | 2s | Seconds between passes of the distributed deadlock detector; 0 disables it. `sighup`. |
 | `kingres_shard.deadlock_confirm_delay` | 200ms | Time between the two readings of the wait-for graph that confirm a cycle. `sighup`. |
-| `kingres_shard.decision_retention` | 300s | How long the commit decisions of a transaction that is over are kept when the participant's group has a standby, so that the origin can find a participant that lost its part after a failover. The participants' marks in `kingres.dtx_applied` are kept as long as this and a minute; set it the same on every node. `sighup`. |
+| `kingres_shard.decision_retention` | 300s | How long the commit decisions of a transaction that is over are kept when the participant's group has a standby, so that the origin can find a participant that lost its part after a failover. The time counts from the moment the participant's synchronous standbys have confirmed everything it flushed (S9-01): until then the decisions are kept without limit and `check_cluster()` reports `decision_unconfirmed`. A prepared transaction with no decision that is older than this is rolled back and recorded (`rolled_back_after_retention`). The participants' marks in `kingres.dtx_applied` are kept as long as this and a minute; set it the same on every node. `sighup`. |
 | `kingres_shard.node_conninfo` | empty | Connection options appended to every node-to-node connection, see below. Server configuration only (`sighup`: `postgresql.conf` or `ALTER SYSTEM`), never per role or per database. |
 | `kingres_shard.node_connect_timeout` | 5s | Connection timeout between nodes. |
 | `kingres_shard.node_timeout` | 60s | The longest the phases that cannot be left waiting may wait for a node (`COMMIT PREPARED`, the cleanup after an abort, savepoint rollbacks, the recovery worker), and, as `tcp_user_timeout` and keepalives, the time after which a connection to a node that does not answer at all is dead. The cancel request sent when a wait runs out is bounded too (a third of this value, at most `node_connect_timeout`, at least a second), so a node whose postmaster is stopped delays the committing session by `node_timeout` plus that, not until it resumes (S3-07). The recovery worker takes the value of the server configuration, whatever `ALTER DATABASE ... SET` says (S3-16); so for `node_connect_timeout`. |
@@ -1341,10 +1345,10 @@ grace period) gets the weaker guarantees of 12.
 | 6 | It does not stop an application that writes ordinary tables on a demoted node: the control plane must fence it | fencing | `t/049` |
 | 7 | `promote_node` runs on every node that can be reached, in one two-phase transaction, **resumably**, and says what it did (below) | - | `t/049`, `t/063`, `t/064` |
 | 8 | A statement in flight across a promotion answers completely and correctly, or fails with an error that can be retried; it never answers with a part. A scan or fan-out planned against the old primary fails with `KS001`; a cursor and its rescan behave the same; `COPY (SELECT ...) TO` reads every row; `COPY FROM` into a distributed table is refused, as without a promotion | - | `t/049`, `t/054`, `t/069` |
-| 9 | The map group is promoted from the promoted node only when it reaches the primary of a **strict majority of the groups other than the map group** (a cluster with no other group has no electorate; a tie is not a majority), so two sides of a partition cannot both promote it; a node that missed a promotion cannot override the new catalog (catalog term, below) and learns it from the first node it talks to. The rule does not stop the old primary from taking writes: that is fencing | fencing | `t/063`, `t/064`, `t/071` |
-| 10 | The identifier of a two-phase transaction names the origin group, the timeline and a keyed tag; recovery touches only the identifiers whose tag verifies; the older forms are resolved if prepared before the node came to 0.5; `rotate_secret()` refuses while a transaction with a valid tag is prepared on any node | cluster secret | `t/050`, `t/051`, `t/067`, `t/072` |
-| 11 | **With a synchronous standby the outcome of a distributed transaction is atomic across a failover of the origin's group or of a participant's group.** The second phase is sent only after the origin's commit record is known to be acknowledged as the configuration requires. A participant's `PREPARE` counts as done only when the participant **confirms** that its record is durable by its own rule (`internal_sync_confirm`, a result of the same batch, not a warning): otherwise the origin aborts and the client gets `KS005`, nothing committed. A participant's `COMMIT PREPARED` is asked the same; an unconfirmed one leaves the transaction committed everywhere, the client gets a `WARNING`, and the decision is kept for `decision_retention` so that recovery commits the part again if the participant fails over to a standby that lacks it. Recovery asks the same of the `COMMIT PREPARED` it sends. All of it is acknowledged by the participant's own synchronous standby whatever its `synchronous_commit` is. The weaker case that PostgreSQL itself has: a list of standbys that is emptied during a wait releases the wait, and then nothing is required | synchronous standby | `t/050`, `t/061`, `t/062`, `t/070` |
-| 12 | **Without one** a failover can lose a committed transaction's part, on the origin or on a participant; the extension notices and records it (`kingres.dtx_incident`, `check_cluster()`): `prepared_rolled_back_after_failover` and `participant_lost_committed_transaction` | `decision_retention` for the second | `t/050`, `t/068` |
+| 9 | The map group is promoted from the promoted node only when it reaches the primary of a **strict majority of the groups other than the map group** (a cluster with no other group has no electorate; a tie is not a majority), so two sides of a partition cannot both promote it; **no catalog change of any kind is accepted from a node that is not the map primary by such a claim** (S9-02): a standby of the map group that was promoted in PostgreSQL still holds the old primary's catalog and node id, and until `promote_node` has run on it with the majority it refuses `promote_node` of an ordinary group, `add_node`, `remove_node`, `sync_catalog`, `rotate_secret`, `set_node_property`, `move_bucket`, `create_distributed_table` and DDL on distributed tables ("this node was promoted in PostgreSQL after the catalog named it the map group primary"); a group counts as reached only when its primary answers now and proves it is one (out of recovery, knowing itself by its id); a node that missed a promotion cannot override the new catalog (catalog term, below) and learns it from the first node it talks to. The rule does not stop the old primary from taking writes: that is fencing | fencing | `t/063`, `t/064`, `t/071`, `t/077` |
+| 10 | The identifier of a two-phase transaction names the origin group, the timeline and a keyed tag; recovery touches only the identifiers whose tag verifies; the older forms are resolved if prepared before the node came to 0.5; `rotate_secret()` refuses while a transaction with a valid tag is prepared on any node; **a node that holds a rotation prepared can always be reached by the node that can finish it** (S9-03) | cluster secret | `t/050`, `t/051`, `t/067`, `t/072`, `t/076` |
+| 11 | **With a synchronous standby the outcome of a distributed transaction is atomic across a failover of the origin's group or of a participant's group.** The second phase is sent only after the origin's commit record is known to be acknowledged as the configuration requires. A participant's `PREPARE` counts as done only when the participant **confirms** that its record is durable by its own rule (`internal_sync_confirm`, a result of the same batch, not a warning): otherwise the origin aborts and the client gets `KS005`, nothing committed. A participant's `COMMIT PREPARED` is asked the same; an unconfirmed one leaves the transaction committed everywhere, the client gets a `WARNING`, and **the decision is kept until the participant's standbys have confirmed everything the participant flushed, with no time limit** (S9-01; `decision_retention` counts only from then on) so that recovery commits the part again whenever the participant fails over to a standby that lacks it. Recovery asks the same of the `COMMIT PREPARED` it sends. All of it is acknowledged by the participant's own synchronous standby whatever its `synchronous_commit` is. The weaker case that PostgreSQL itself has: a list of standbys that is emptied during a wait releases the wait, and then nothing is required | synchronous standby | `t/050`, `t/061`, `t/062`, `t/070` |
+| 12 | **Without one** a failover can lose a committed transaction's part, on the origin or on a participant; the extension notices and records it (`kingres.dtx_incident`, `check_cluster()`): `prepared_rolled_back_after_failover` and `participant_lost_committed_transaction` | `decision_retention` for the second | `t/050`, `t/068`, `t/075` |
 | 13 | Distributed deadlock detection finds a cycle across nodes and cancels the youngest transaction; **no false positive**, and no label a client can set is believed: the identity of a remote session comes from the node that opened it, kept in shared memory by a session that proved to be a node session | - | `t/052`, `t/065` |
 | 14 | The victim gets SQLSTATE `40P01`, `distributed deadlock detected`; a victim mark that did not lead to a cancel of its wait never changes another error | - | `t/052`, `t/065` |
 | 15 | `create_restore_point`: barrier, wait for second phases, restore points on every primary; the barrier is lowered on every way out of the function (cancel, timeout, termination of the backend, error, loss of a node connection) and a node drops the barrier of a session that ended | - | `t/053`, `t/066` |
@@ -1430,7 +1434,7 @@ Run by the control plane **after** the old primary was fenced and the standby wa
 PostgreSQL (`pg_promote`); the preconditions are in "What the control plane calls". It refuses
 unless the node is out of recovery, runs the same extension version and library, **and can
 commit**. The answer is `{"status": ..., "term": <catalog term>, "final": <bool>,
-"unreached": [<node ids>]}`. `final` is `true` only for `already`: the answer is made before the
+"unreached": [<node ids>], "blocked_by": [<prepared transactions in the way>]}`. `final` is `true` only for `already`: the answer is made before the
 commit of the call, and a commit that waits for the synchronous standbys of the node that runs it can
 be ended by a cancel, a termination or a shutdown with a warning and an ordinary result, leaving the
 change prepared on the other nodes (the case found in review: S8-02). `promoted` and `completed`
@@ -1449,6 +1453,10 @@ is called, the repeated call included** (S8-05): the primaries that cannot be re
 the other nodes of the promoted group that cannot be reached (the old primary among them). A
 node of the group that can be reached and is out of recovery (an old primary that is running, another
 promoted standby) is told, and a repeated call tells it again if it holds an older term.
+
+`blocked_by` names, node by node, the prepared transactions that hold a lock on the catalog's version row that a catalog change conflicts with (`{"node": N, "prepared": [{"gid": ..., "class": "cluster" | "foreign"}]}`) and that a repeated call found in the way (S9-04): `cluster` ones are resolved by recovery; a `foreign` one (a prepared transaction that is not the cluster's, made by a superuser) is for the operator (only a superuser can take a conflicting lock), and the caller stops repeating after two identical answers (README sequence 2). A lock of `ACCESS SHARE`, the only one an ordinary role can take, blocks nobody and is not counted.
+
+**The old primary is not waited for (S9-05).** When OLD can be reached it takes part in the call like every other primary, and its `PREPARE` and `COMMIT PREPARED` do not wait for its synchronous standbys and are not asked about them: it is about to stop being a primary, its list names the node that was just promoted, and its confirmation is not what makes the promotion durable. The decision rows of such a participant are marked and are not looked at for a lost part (S9-06). `t/079`.
 
 **The node must be able to commit (S8-02).** A promoted standby has the
 `synchronous_standby_names` of the primary it was copied from. A list that names standbys that
@@ -1493,6 +1501,8 @@ them") and changes nothing. The rule is about who may *promote*; it does not sto
 primary, or a side that does not promote, from serving its own group's data (guarantee 6): fencing
 does, before the call. Tested by stopping the nodes of the other side, for three and four groups, two
 standbys of the map group on the two sides, one and two groups (`t/063`, `t/071`).
+
+**Without a majority (S9-10).** `kingres.promote_map_group_without_majority(node_id, acknowledgement)` is the operator's way out when the rule refuses for ever; see README sequence 3. It is `promote_node` for the map group without the electorate and with a catalog term 1000 above the highest seen. `t/081`.
 
 **Resumable.** A failure after the decision of the two-phase transaction (the map group
 primary stopped, a `COMMIT PREPARED` failed) leaves the change prepared on the promoted
@@ -1601,8 +1611,8 @@ requires nothing and answers `true`, as a commit does. What the origin does:
 | PREPARE, before the decision | `true` | goes on |
 | PREPARE, before the decision | `false`, an error (the wait was cancelled again), no answer, or the node did not answer within `node_timeout` | the prepare failed: the transaction aborts, the client gets an error with SQLSTATE `KS005` ("did not confirm that its part of the transaction is durable"), nothing is committed anywhere; the prepared transactions are rolled back (`ROLLBACK PREPARED`, bounded by `node_timeout`, else recovery finds no decision row and rolls them back) |
 | COMMIT PREPARED, after the decision | `true` | done |
-| COMMIT PREPARED, after the decision | `false` or no answer | the transaction stays committed everywhere (it cannot be undone), the client gets a `WARNING` that names the node, and the decision row is kept for `decision_retention` seconds: if the participant fails over to a standby that lacks the commit, its part comes back prepared and recovery commits it again; after the retention only the incident record (`participant_lost`) is left |
-| COMMIT PREPARED sent by recovery | `false` | `recover_prepared_transactions()` and the worker log it, count the transaction as resolved and keep its decision row for this pass and, through the retention, afterwards |
+| COMMIT PREPARED, after the decision | `false` or no answer | the transaction stays committed everywhere (it cannot be undone), the client gets a `WARNING` that names the node, and the decision row is **kept until the participant's standbys confirm** (S9-01): if the participant fails over to a standby that lacks the commit, its part comes back prepared and recovery commits it again, however long after the commit that is |
+| COMMIT PREPARED sent by recovery | `false` | `recover_prepared_transactions()` and the worker log it, count the transaction as resolved and keep its decision row until the participant's standbys confirm |
 
 A node that gets the extension in the very transaction that is prepared (`add_node`) has no
 schema to ask after the PREPARE; it is not in the cluster yet and the question is skipped for it.
@@ -1618,7 +1628,7 @@ cancels the participant's backend (which ends the wait with a warning), the part
 "no" after at most `min(node_timeout, 5)` seconds, and the origin aborts with `KS005`: the client
 waits at most about `2 x node_timeout + 5` seconds, holds row locks for that long, and gets an
 error that says which node and what bounded it. The second phase is bounded by `node_timeout` per
-participant (then "recovery will commit it"). The state left: nothing committed anywhere, a
+participant (then "recovery will commit it"), and so is the `COMMIT PREPARED` or `ROLLBACK PREPARED` that recovery sends, also from `recover_prepared_transactions()` in a session of a user (S9: it used to wait for ever for a standby that is away; after `node_timeout` it is cancelled, the participant has completed it locally, and its standby is asked afterwards). After the cancel of a `PREPARE` the origin waits for the participant's own answer, `min(node_timeout, 5)` seconds, before it gives up. The state left: nothing committed anywhere, a
 participant's prepared transaction that is rolled back by the origin or, when it cannot be reached, by
 recovery. The client's own cancel on the origin has always been safe and ends the wait at once (the
 transaction aborts before the decision, or is left to recovery after it). The operator's way out of a
@@ -1665,6 +1675,25 @@ back to confirm; use a fast shutdown (`t/070` 8).
   `check_cluster()` shows it as `participant_lost_committed_transaction` (`t/068`). The
   look is made once per group failover and costs nothing before it. A loss that happens
   after the retention is over is not found.
+- **A decision is never forgotten while a participant might still hold the transaction
+  prepared (S9-01).** The retention above starts only when the participant's synchronous
+  standbys have confirmed everything it flushed, the commit of its part included (the origin
+  asks the participant after it has listed its prepared transactions; `kingres.dtx_log.durable`
+  records the answer). Until then the decision rows of that participant are kept without limit
+  and `check_cluster()` reports `decision_unconfirmed` (node, since when, how many). What grows
+  without bound while a participant's standby never comes back is those rows (a few dozen
+  bytes per distributed transaction that touched it) and, in its group's WAL, nothing more; the
+  operator ends it by starting the standby, or by taking its name out of the participant's
+  `synchronous_standby_names` (then the participant requires nothing, the rows are released and
+  the retention applies as in the weaker case), or by `remove_node` of the standby. A prepared
+  transaction that recovery cannot match to a decision is rolled back as presumed abort only
+  while the origin could not have decided: when it is older than `decision_retention` (a decision
+  of it might have been forgotten, which only a participant that required no confirmation allows),
+  the rollback is recorded as an incident `rolled_back_after_retention` and shown by
+  `check_cluster()` as `prepared_rolled_back_after_failover`, so that it is never silent
+  (`t/075`). The same rule holds when the origin itself fails over, the retention setting is
+  changed, or every node is restarted: the state is in `kingres.dtx_log`, which replicates, not
+  in memory.
 - Writes acknowledged to a client by a primary whose standby did not have them are lost
   as in any asynchronous replication.
 
@@ -1740,6 +1769,8 @@ lowers the barriers it still owes over the control sessions it holds (an abort c
 a late lowering never lowers a newer barrier (the generation must match). The timer
 remains the last resort. (`t/066`.)
 
+**A restored map primary must claim the map group again (S9-02):** a restore ends on a new timeline, which is what tells the catalog that a node was promoted without it, so after the restore run `SELECT kingres.promote_node(<the map primary's node id>)` on the map primary (it needs the majority of the other groups, which are restored too; answers `completed` or `promoted`, repeat until `already`; `t/053`).
+
 **Restoring every server to that name** (`recovery_target_name = name`) gives a state in
 which no distributed transaction is half committed (tested with a restore of three servers
 made under a multi-node write load: `t/053`).
@@ -1763,12 +1794,23 @@ What it does not give:
 ### What the control plane calls
 
 Everything below is a single SQL call on a named node, and every call is safe to repeat.
-Where a sequence says "answers", the list is complete: a call can end in one of those
-ways and in no other except a connection that breaks or a timeout of the caller, which
-is treated as "the call did not finish, repeat it" (see "A call that did not finish").
-Every answer named here is produced by a test; the test is named. The names used:
-**MAP** is the primary of the map group, **OLD** the primary of the group that failed,
-**NEW** the standby that is promoted, **OTHERS** the other standbys of that group.
+Where a sequence says "answers", the list is complete for what a test has produced: a call can
+end in one of those ways and in no other except a connection that breaks or a timeout of the
+caller, which is treated as "the call did not finish, repeat it" (see sequence 9). Every answer
+named here is produced by a test; the test is named (`t/073` and `t/082` drive the sequences as
+written). The names used: **MAP** is the primary of the map group, **OLD** the primary of the
+group that failed, **NEW** the standby that is promoted, **OTHERS** the other standbys of that
+group.
+
+#### Bounds that apply to every call
+
+| what | bound |
+|---|---|
+| client timeout of `promote_node` | at least `3 x node_timeout + node_connect_timeout x (number of nodes)`; its expiry means "did not finish". *Not produced by a test:* a formula from the settings, not a measured time (a cancelled call is: `t/082`) |
+| the repeat loop of `promote_node` | at most **10 calls**, 2 s apart, ending at `already`. If `"blocked_by"` names the same transaction in two answers in a row, stop repeating: see the table of sequence 2. *Not produced by a test:* the number 10 and the 2 s are a recommendation; the tests loop at most 6 times (`t/078`) and end at `already` within 3 calls (`t/071`, `t/073`) |
+| a refused call | at once (the probe for "can commit" waits at most `min(node_timeout, 5) - 1` seconds per node), except a commit that waits for a standby: `2 x node_timeout + 5` seconds, then `KS005`. The refusals and `KS005` are produced by tests (`t/071`, `t/081`, `t/084`, `t/070`); *their duration is not asserted* (it depends on the load of the machine) |
+| the second phase of a distributed commit | `node_timeout` per participant, then "recovery will commit it" (`t/076` produces the warning; the bound itself is not asserted) |
+| waiting for the worker | `kingres_shard.recovery_interval` per pass (`t/009`); call `recover_prepared_transactions()` instead of waiting |
 
 #### Preconditions of every failover and switchover
 
@@ -1788,7 +1830,7 @@ Every answer named here is produced by a test; the test is named. The names used
    not in recovery") for as long as it runs as a primary, and `catalog_status` on it shows
    the term it holds (a node that was not told holds the old one). Nothing shows which writes
    it took; before rebuilding it, compare what it holds with `pg_rewind --dry-run` or keep its
-   data directory for an audit (`t/049`, `t/063`).
+   data directory for an audit (`t/049`, `t/063` show the listing in `unreached` and the term; *not produced by a test:* the loss of the writes of an unfenced OLD, which is the review's observation).
 2. **Which standby to promote.** The one that has the most WAL. Read the position of every
    standby of the group: `SELECT pg_last_wal_receive_lsn()` on each (the flushed position of what
    it has received; `pg_last_wal_replay_lsn()` is smaller or equal), and promote the standby
@@ -1805,24 +1847,23 @@ Every answer named here is produced by a test; the test is named. The names used
    (right after `pg_promote()` at the latest) set on NEW the list of the standbys that will
    follow it, or an empty string while there are none, and reload (`ALTER SYSTEM SET
    synchronous_standby_names = ''; SELECT pg_reload_conf();`). `promote_node` checks that
-   NEW can commit and refuses, changing nothing, when it cannot (below). Names in the list are
+   NEW can commit and refuses, changing nothing, when it cannot. Names in the list are
    the `application_name` of the standbys: put `application_name=<name>` in each
-   standby's `primary_conninfo`. `kingres.standby_status()` tells whether a name matches: the
-   column `sync_state` of a standby named in the list is `sync` (FIRST) or `quorum` (ANY),
-   `potential` while a better one is in front, and `async` when no name matches it. The lists
-   of the other groups' primaries are not touched by a promotion.
+   standby's `primary_conninfo` and **check the name before it goes into a list** (sequence 1, `kingres.standby_name_matches`, `t/084`).
+   The lists of the other groups' primaries are not touched by a promotion. OLD's own list may
+   keep naming NEW: OLD is not waited for (sequence 4).
 4. **The settings that bound the calls.** `kingres_shard.node_timeout` (default 60 s) bounds
    every wait on another node that must not last for ever; `kingres_shard.node_connect_timeout`
    (default 5 s) the connection to a node; `kingres_shard.decision_retention` (default 300 s,
-   the same on every node) how long a commit decision is kept. A `promote_node` that has
-   unreachable nodes spends up to `node_connect_timeout` on each of them and up to
-   `node_timeout` more on a node that accepts connections and does not answer; give the call
-   a client timeout of at least `3 x node_timeout + node_connect_timeout x (number of nodes)`
-   and treat its expiry as "did not finish" (below).
+   the same on every node) how long a commit decision is kept once its participant's standbys
+   have confirmed it (`t/075`). *Not produced by a test:* the default values.
 5. **Where each call runs.** `promote_node` for an ordinary group, `add_node`, `remove_node`,
    `sync_catalog`, `standby_status`, `check_cluster`, `create_restore_point`: on MAP.
-   `promote_node` for the map group: on the promoted node itself. `recover_prepared_transactions`:
-   on the node that originated the transactions (in practice on MAP and on NEW).
+   `promote_node` for the map group, and `switchover_verify` of a map group switchover: on the
+   promoted node itself (NEW). `switchover_mark`: on OLD. `recover_prepared_transactions`: on the
+   node that originated the transactions (in practice on MAP and on NEW). A node that was
+   promoted in PostgreSQL and is not yet the map primary in the catalog refuses every catalog
+   change (guarantee 9).
 
 #### Postconditions (every sequence ends with these)
 
@@ -1833,7 +1874,9 @@ Every answer named here is produced by a test; the test is named. The names used
   they are told by `sync_catalog()` or learn it).
 - `SELECT count(*) FROM pg_prepared_xacts WHERE gid LIKE 'kingres\_h%'` is 0 on every primary,
   after `SELECT kingres.recover_prepared_transactions()` on NEW and on MAP if it is not.
-- `SELECT * FROM kingres.check_cluster()` on MAP shows only what the sequence says it may.
+- `SELECT * FROM kingres.check_cluster()` on MAP shows only what the sequence says it may
+  (`standby_unreachable` for OLD until it is rebuilt; `decision_unconfirmed` while a
+  participant's standby is away). The promotion's own transactions leave no incident (S9-06).
 - `SELECT * FROM kingres.standby_status()` on MAP: every standby `streaming`, `problem` empty,
   `sync_state` as the list says.
 - **The group is healthy again** when NEW is the primary of the group on every node, the
@@ -1841,117 +1884,164 @@ Every answer named here is produced by a test; the test is named. The names used
   is empty or every node in it has been fenced or rebuilt, and `check_cluster()` shows nothing
   for the group.
 
-#### Registering a standby
+#### 1. Registering a standby
 
 Precondition: the standby streams from its primary (`pg_basebackup -R`, `primary_conninfo`
 with `application_name=<name>`) and is in recovery.
 
 1. MAP: `SELECT kingres.add_node('<host>', <port>, <group_id>, 'standby')`.
-   - The node id (an integer): store it. A `WARNING ... cannot be reached` means the standby was
-     registered without being checked (guarantee 2); repeat step 3 until it is clean.
-   - An error "is not in recovery, so it is not a standby", "is not a copy of the primary of group N" or a major
-     version error: nothing was registered; fix the standby (`t/048`).
-2. Primary of the group: add `<name>` to `synchronous_standby_names` (`ANY 1 (<name>, ...)`), reload.
-   A commit that touches the group waits for the standby from then on: register it first,
-   name it second, and only when it streams.
-3. MAP: `SELECT * FROM kingres.standby_status()`: the row of the node shows `streaming`, `sync_state`
-   `quorum` or `sync`, `problem` empty. `async` here means that the name does not match its
-   `application_name`.
 
-#### Failover of an ordinary group (OLD is dead, fenced; NEW is a standby of the group)
+   | answer | action |
+   |---|---|
+   | the node id (an integer) | store it |
+   | `WARNING:  standby H:P could not be reached; it is registered anyway` | the standby was registered without being checked (guarantee 2, `t/084`); repeat step 3 until it is clean |
+   | error "this function can only run on the map group primary" | wrong node (`t/082`) |
+   | error "is not in recovery, so it is not a standby" (`t/048`), "is not a copy of the primary of group N" (`t/048`, `t/082`) | nothing was registered; fix the standby |
+   | a major version error | *not produced by a test in this chapter:* `t/046` produces the refusal of a node of another major by `add_node` (the text is that test's) |
+   | error "node ... is already registered as node N" | it is registered; use N (`t/082`) |
+   | error "node N cannot commit: its synchronous standbys do not confirm" | the list of the primary of some group names a standby that is not there (S9-08): fix that list first; nothing was changed (`t/084`) |
+
+2. **Check the name before it goes into the list.** On the primary of the group:
+   `SELECT kingres.standby_name_matches('<name>')` must answer `t`: a streaming standby of this
+   primary carries exactly that `application_name` and the group has a registered standby (`f` for a
+   typo, for a standby that is not streaming and for a group without a standby; `t/084`). It does
+   not say which registered node the walsender serves: `pg_stat_replication` does not. A name that matches nobody
+   makes every commit that writes in the group wait for ever (PostgreSQL's wait has no timeout) and a
+   commit that also writes in another group fail with `KS005`; it is released the moment the list is
+   corrected. Then add the name to `synchronous_standby_names` (`ANY 1 (<name>, ...)`) and reload.
+3. MAP: `SELECT * FROM kingres.standby_status()`: the row of the node shows `streaming`, `sync_state`
+   `quorum` or `sync`, `problem` empty. `async` means that the name does not match its
+   `application_name`: put the previous list back at once. (`check_cluster()` shows nothing for an
+   `async` standby that no list names; that is by design.) (`t/048`, `t/082`)
+
+#### 2. Failover of an ordinary group (OLD is dead, fenced; NEW is a standby of the group)
 
 Preconditions: 1, 2 and 3 above. NEW has been promoted with `pg_promote()` and accepts connections.
 
 1. NEW: set `synchronous_standby_names` to the standbys that will follow (or `''`), reload.
-2. MAP: `SELECT kingres.promote_node(<NEW node id>)`.
+2. MAP: `SELECT kingres.promote_node(<NEW node id>)`, repeated at most 10 times until `already`.
+   The answer is `{"status": ..., "term": T, "final": bool, "unreached": [ids], "blocked_by": [...]}`.
 
    | answer | what the caller does |
    |---|---|
-   | `{"status": "promoted", "term": T, "final": false, "unreached": []}` | repeat the call (it is cheap) until it answers `already`, then go to 3 (`t/071` A) |
-   | `{"status": "promoted", ..., "unreached": [ids]}` | the same; the listed nodes were not told: fence them if they are primaries (OLD is one), and run `sync_catalog()` on MAP when they are back (`t/049`, `t/063`) |
-   | `{"status": "completed", ..., "final": false}` | an earlier call or a crash had left it half done and this call finished it (`t/064`); repeat until `already` |
-   | `{"status": "already", ..., "final": true}` | done; go to 3. `unreached` lists the nodes of the group that cannot be reached now, the old primary among them (`t/064`, `t/071`) |
-   | error "node N cannot commit: its synchronous standbys do not confirm" | NEW's list names standbys that are not connected: do 1, repeat 2. Nothing was changed (`t/071` A) |
-   | error "this node cannot commit ..." | the same for MAP's own list (the node that runs the call commits the change): fix it there, repeat (`t/071` B) |
+   | `promoted`, `final` false | repeat the call (it is cheap) until `already`, then go to 3 (`t/071` A) |
+   | `promoted` or `completed` with `"unreached": [ids]` | the same; the listed nodes were not told: fence them if they are primaries (OLD is one), and run `sync_catalog()` on MAP when they are back (`t/049`, `t/063`) |
+   | `completed`, `final` false | an earlier call or a crash had left it half done and this call finished it (`t/064`); repeat |
+   | `already`, `final` true | done; go to 3. `unreached` lists the nodes of the group that cannot be reached now, OLD among them if it is down (`t/064`, `t/071`) |
+   | any status with `blocked_by` not empty | a prepared transaction that holds a lock on the catalog's version row on that node is in the way. `"class": "cluster"`: recovery resolves it, repeat. `"class": "foreign"` (somebody's own prepared transaction): stop after two identical answers; the operator ends it (`ROLLBACK PREPARED '<gid>'` on that node if it is theirs and unwanted) and the next repeat answers `already`. An ordinary role can only hold ACCESS SHARE on the table (it may read it), which blocks nothing and is not counted (S9-04, `t/078`) |
+   | error "node N cannot commit: its synchronous standbys do not confirm" | NEW's list names standbys that are not connected: fix that node's list, repeat. Nothing was changed (`t/071` A) |
+   | error "this node cannot commit: its synchronous standbys do not confirm" | the same for MAP's own list (`t/071` B) |
    | error "node N is still in recovery" | `pg_promote()` has not finished; wait, repeat (`t/071` G) |
-   | error "could not connect to node N ..., which is to become the primary" | NEW does not accept connections; repeat when it does (`t/071` G) |
-   | error "kingres_shard: ... did not confirm that its part of the transaction is durable" (SQLSTATE `KS005`) | a participant of the call (a primary of another group) cannot get its own standby to confirm; nothing was committed; fix that node's list or standby and repeat (`t/070`) |
-   | error "this function can only run on the map group primary" | the call went to the wrong node (`t/049`) |
-   | any other error, or the connection breaks, or the client times out | the call did not finish: repeat it on the same node (below) |
+   | error "could not connect to node N (H:P), which is to become the primary of group G" | NEW does not accept connections; repeat when it does (`t/084` B) |
+   | error "node N does not exist" | wrong id (`t/082`) |
+   | `NULL` (no error) | the argument was NULL; the function is strict (`t/082`) |
+   | error "kingres_shard: ... did not confirm that its part of the transaction is durable" (SQLSTATE `KS005`) | a participant of the call (a primary of another group) cannot get its own standby to confirm, after `2 x node_timeout + 5` s; nothing was committed; fix that node's list or standby and repeat. `t/084` B and `t/070` produce KS005 with that text for a distributed commit; *not produced by a test:* KS005 out of `promote_node` itself (it probes first, so the refusal above comes before it) |
+   | error "could not prepare the transaction on node H:P: the node did not answer within kingres_shard.node_timeout (N s), nor in the time it gets after the command was cancelled" (connection-failure class) | a participant of the call does not answer even after its wait was cancelled (the node is hung, not just without its standby); nothing was committed, and recovery rolls back what it may have prepared; repeat when the node answers. *Not produced by a test* (it needs a participant that stays silent after a cancel, which a test can only make with a stopped process); it is the other end of the same wait as the KS005 above, and the origin now waits for the participant's own answer (`min(node_timeout, 5)` s) after the cancel so that the KS005 refusal is the answer of a standby that is away (S9, t/073 B) |
+   | error "could not prepare ... on node H:P: <text>" with any other text | the participant's own error (for example prepared transactions disabled) or "terminating connection" when its backend was terminated (`t/070`); the text after the colon is never empty |
+   | error "this function can only run on the map group primary" | wrong node (`t/049`, `t/082`) |
+   | error "this node was promoted in PostgreSQL after the catalog named it the map group primary ..." | the call went to the promoted standby of the map group before its own `promote_node`: do the map-group sequence first (S9-02, `t/077`) |
+   | any other error, or the connection breaks, or the client times out | the call did not finish: repeat it on the same node (sequence 9) |
 
 3. Re-point the other standbys of the group (OTHERS), if any: on each, set `primary_conninfo` to NEW
    (with its `application_name`), reload or restart. A standby that is behind NEW follows it
    over the timeline switch; one that is ahead of NEW cannot (rebuild it with `pg_rewind` or
    `pg_basebackup`); that is why NEW was chosen by position.
 4. NEW: when OTHERS stream, set `synchronous_standby_names = 'ANY 1 (<their names>)'`, reload.
-5. MAP: postconditions. `check_cluster()` may show `standby_unreachable` for OLD until it is rebuilt,
-   and `prepared_rolled_back_after_failover` or `participant_lost_committed_transaction` rows,
-   each of which names a transaction to look at (guarantee 12). Run `SELECT
-   kingres.recover_prepared_transactions()` on NEW (the worker does it every `recovery_interval`
-   too) and look again: what the old primary left prepared is resolved by the decision
-   log that NEW holds (`t/050`, `t/068`).
-6. OLD: see "Re-adding an old primary as a standby".
+5. MAP: postconditions. Run `SELECT kingres.recover_prepared_transactions()` on NEW (the worker does
+   it every `recovery_interval` too) and look at `check_cluster()`: `standby_unreachable` for OLD until
+   it is rebuilt, and `prepared_rolled_back_after_failover` or `participant_lost_committed_transaction`
+   rows, each of which names a transaction to look at (guarantee 12) (`t/050`, `t/068`).
+6. OLD: see sequence 6.
 
-#### Failover of the map group (OLD map primary is dead, fenced; NEW is its standby)
+#### 3. Failover of the map group (OLD map primary is dead, fenced; NEW is its standby)
 
 Preconditions: 1, 2, 3, and a majority (below). NEW has been promoted with `pg_promote()`.
 
 1. NEW: set `synchronous_standby_names`, reload.
-2. **On NEW itself**: `SELECT kingres.promote_node(<NEW node id>)`. The rule: NEW must reach the primary
-   of a **strict majority of the groups other than the map group** (the electorate: the map
-   group is not counted, it is what is being replaced and it has a node on each side of a
-   partition; a tie is not a majority; a cluster with no other group has no electorate and
-   needs nothing; with one other group that group must be reachable). Two sides of a partition
-   therefore cannot both promote the map group (`t/063` D, `t/071` C, D, E, F).
+2. **On NEW itself**: `SELECT kingres.promote_node(<NEW node id>)`, repeated at most 10 times until `already`.
+   NEW must reach the primary of a **strict majority of the groups other than the map group**, and a
+   group counts only when its primary answers now and says it is one. Until this call has been
+   accepted NEW changes no catalog (guarantee 9); in particular it does not promote any ordinary
+   group.
 
    | answer | what the caller does |
    |---|---|
    | `promoted` / `completed` (`final` false), then `already` (`final` true); `unreached` as above | repeat until `already`, then go to 3 |
-   | error "only k of the n other shard groups can be reached from this node; the map group cannot be promoted from a minority of them" | nothing was changed. Bring unreachable nodes back, or promote from a node that reaches more than half of the other groups; if every node of the other side is really dead, the control plane decides to bring some of them back first: the extension will not promote without a majority (`t/063` D, `t/071` C) |
-   | error "node N cannot commit ...", "this node cannot commit ..." | the list of NEW (it runs the commit); fix and repeat (`t/071` B) |
-   | error "this node is still in recovery", "is registered on port", "is not a copy of the primary of group 0" | the call went to a node that is not the promoted standby of the map group (`t/049` D) |
+   | error "only k of the n other shard groups can be reached from this node; the map group cannot be promoted from a minority of them" | nothing was changed. Bring unreachable nodes back, or promote from a node that reaches more than half of the other groups. If the other side is really gone for good, see "When the majority will never come back" below (`t/063` D, `t/071` C, `t/077`) |
+   | error "node N holds catalog term T, newer than the T0 of this node" | another node has promoted the map group already: this node must not; rebuild it as a standby of that one (`t/084` C) |
+   | error "this node cannot commit: its synchronous standbys do not confirm" | the list of NEW (it runs the commit); fix and repeat (`t/071` B) |
+   | error "cannot acquire lock mode ExclusiveLock on database objects while recovery is in progress" (PostgreSQL's) | the call went to the standby before `pg_promote()` (`t/084` C); the extension's own "this node is still in recovery" is behind that lock and is *not produced by a test* |
+   | error "this node is not a copy of the primary of group 0 and cannot become it" | the call went to a node that is not the standby of the map group (`t/084` C) |
+   | error "node N is registered on port P, this server listens on port Q" | the node row of NEW names another port than the server listens on (`t/084` C) |
    | errors that name `KS005`, a broken connection or a timeout | repeat on NEW |
 
 3. NEW: `SELECT kingres.sync_catalog()` once the nodes in `"unreached"` are back; `SELECT
-   kingres.recover_prepared_transactions()`.
-4. OTHERS and the lists as in the previous sequence (steps 3 and 4). The clients of the cluster connect to any
+   kingres.recover_prepared_transactions()`. Then the failover of any ordinary group that failed with it
+   (sequence 2, **from NEW**, which is MAP now).
+4. OTHERS and the lists as in sequence 2 (steps 3 and 4). The clients of the cluster connect to any
    node; the connection string of MAP that the control plane stores changes to NEW.
 5. If the old map primary comes back unfenced it refuses every catalog change from then on and `SELECT *
    FROM kingres.catalog_status` on it shows `superseded = true`: rebuild it as a standby (`t/063` A).
-   Postconditions as above, read on NEW.
 
-#### Failover when OLD is reachable but must be demoted
+**When the majority will never come back.** A cluster of two groups, or one that lost half or more
+of the other groups together with the map group, cannot promote its map group by the rule, and the
+rule is the only protection against two sides each promoting one. There is a way out that is
+deliberately awkward: on NEW, after every other node of the cluster is fenced (stopped or cut off
+for good; the operator is the electorate), `SELECT kingres.promote_map_group_without_majority(<NEW
+node id>, 'I have fenced every other node of the cluster and accept that the cluster can split')`.
+It is `promote_node` without the electorate and with a catalog term 1000 above the highest one
+seen, so that no node that missed it, and no claim made before it, can override it; it does not
+fence anything. If a node of the lost side is alive and comes back with a promotion of its own, the
+higher term wins wherever the two meet and what the other wrote into the catalog is lost
+(`t/081`). Then continue with step 3.
 
-OLD answers on the network (a partition on the control plane's side, a stuck disk, a decision to move) and
-the control plane promotes NEW anyway. Fence it first (precondition 1): **stop OLD**. If it cannot be
-stopped, cut it off from the clients and from the other nodes at the network, and still treat it as
-unreached afterwards. If it can be reached by the cluster and stays up (the control plane
-chose not to stop it before the call), the call is the same as the failover of an ordinary group and OLD
-is told with the others: its node row becomes `standby`, it keeps its data, it forwards the statements of
-distributed tables to NEW, refuses forwarded fragments with the retryable `KS001`, and is
-in no group for routing (`t/049` B). The answer lists no `unreached` node for it. That is still not a
-fence (guarantee 6): stop OLD right after the call, and rebuild it before it comes back.
+#### 4. Failover when OLD is reachable but must be demoted
 
-#### Planned switchover without loss (OLD is healthy and is to hand over to NEW)
+OLD answers on the network (a partition on the control plane's side, a stuck disk, a decision to
+move) and the control plane promotes NEW anyway. Fence it first (precondition 1): **stop OLD**. If it
+cannot be stopped, cut it off from the clients and from the other nodes at the network, and still
+treat it as unreached afterwards. If it can be reached by the cluster and stays up, the call is the
+same as sequence 2, with nothing to prepare on OLD: OLD is a participant of the call and is **not
+waited for** (S9-05): its `PREPARE` and `COMMIT PREPARED` do not wait for its standbys, it is not
+asked to confirm them, and its `synchronous_standby_names` may keep naming NEW, which no longer
+streams from it. Its node row becomes `standby`, it keeps its data, it forwards the statements of
+distributed tables to NEW, refuses forwarded fragments with the retryable `KS001`, and is in no group
+for routing; `unreached` does not list it. The promotion's own transactions leave no
+`participant_lost_committed_transaction` (S9-06). That is still not a fence (guarantee 6): stop OLD
+right after the call, and rebuild it before it comes back (`t/049` B, `t/079`).
+
+#### 5. Planned switchover without loss (OLD is healthy and is to hand over to NEW)
 
 Precondition: NEW streams from OLD and is named in OLD's `synchronous_standby_names`, or is caught up
-(see step 2).
+(step 4 checks it as a step that fails).
 
 1. Stop the writes of the application to the group (the control plane stops sending them, or sets
    `default_transaction_read_only` for the role and terminates the sessions). Wait for distributed
    transactions in flight to end: `SELECT count(*) FROM pg_prepared_xacts WHERE gid LIKE
    'kingres\_h%'` is 0 on every primary.
-2. Stop OLD cleanly: `pg_ctl stop -m fast` (the shutdown sends the WAL that it has to its standbys before it
+2. OLD: `SELECT kingres.switchover_mark()` writes a record into the WAL, flushes it and returns its
+   position **M** (keep it). Every commit that was acknowledged before it is below M.
+3. Stop OLD cleanly: `pg_ctl stop -m fast` (the shutdown sends the WAL that it has to its standbys before it
    ends). A **smart** shutdown does not do this: it waits for sessions, and a session that waits for
    its standby is not helped, because the node that is shutting down refuses the standby's
-   connection; use fast (`t/070` 8). Without the stop, wait until `pg_current_wal_flush_lsn()` on OLD equals
-   `pg_last_wal_receive_lsn()` on NEW (and `replay_lag_bytes` of `standby_status()` is 0).
-3. NEW: `pg_promote()`, then set the list (step 1 of the failover).
-4. MAP: `SELECT kingres.promote_node(<NEW node id>)`: `promoted`, `unreached` is `[<OLD>]` for the stopped OLD (`t/073` A).
-5. OLD becomes a standby of NEW (next sequence). Nothing is lost: the standby had all the WAL of OLD
-   (`t/073` A reads the row written before the switchover from the new primary).
+   connection; use fast (`t/070` 8). *Without the stop* (OLD stays up, writes stopped): go on to step 4
+   and treat OLD as in sequence 4 afterwards.
+4. **The check, which can fail.** On NEW (before or after `pg_promote()`, in recovery or not):
+   `SELECT kingres.switchover_verify('<M>')` must be `t`. Poll it for a few seconds while NEW may still be
+   receiving. If it stays `f`, **do not promote**: NEW is missing what OLD wrote. Start OLD again, let NEW
+   catch up, and repeat from step 1; if OLD cannot be started the missing rows are lost, and promoting is a
+   failover with loss (sequence 2, guarantee 12). With OLD stopped, the second check: read **X**, the
+   "Latest checkpoint location" that `pg_controldata <OLD's data directory>` prints (the start of the
+   shutdown checkpoint, the last record OLD wrote), and `SELECT kingres.switchover_verify('<X>', true)` on
+   NEW must be `t` too (NEW has replayed that record; it catches writes that were made after the mark). In
+   `t/080` NEW is disconnected before the last writes: both checks say `f`, and the rows are indeed missing
+   from NEW once it is promoted. The check passes on the map group's NEW as well, run on NEW.
+5. NEW: `pg_promote()`, then set the list (step 1 of sequence 2).
+6. MAP: `SELECT kingres.promote_node(<NEW node id>)` as in sequence 2 (**for the map group, on NEW itself**, as
+   in sequence 3): `promoted`, `unreached` is `[<OLD>]` for the stopped OLD (`t/073` A), then `already`.
+7. OLD becomes a standby of NEW (sequence 6). Nothing is lost: NEW had all the WAL of OLD (`t/073` A, `t/080`).
 
-#### Re-adding an old primary as a standby
+#### 6. Re-adding an old primary as a standby
 
 Precondition: OLD is stopped, and NEW is the primary of the group in the catalog.
 
@@ -1960,31 +2050,37 @@ Precondition: OLD is stopped, and NEW is the primary of the group in the catalog
    or a failover with an unreachable OLD it may have WAL that NEW does not have: run `pg_rewind` against NEW
    (or rebuild with `pg_basebackup`), then the same.
 2. Its node row is already `standby` (the promotion made it so); nothing is called. If it was removed with
-   `remove_node`, register it again (first sequence).
+   `remove_node`, register it again (sequence 1).
 3. MAP: `standby_status()` shows it `streaming`; `catalog_status` on OLD shows the term of NEW and
    `superseded = false` (it exists on a hot standby too, `t/073` A, `t/063`).
-4. NEW: add it to `synchronous_standby_names` if it is to be synchronous.
+4. NEW: check the name (sequence 1, step 2) and add it to `synchronous_standby_names` if it is to be synchronous.
 
-#### Restoring the preferred primary (failing back)
+#### 7. Restoring the preferred primary (failing back)
 
-The preferred node P was OLD, is now a standby of the group (previous sequence) and streams. It is a
-planned switchover in the other direction: stop writes, stop NEW cleanly, `pg_promote()` on P, set P's
-list, MAP: `SELECT kingres.promote_node(<P node id>)`. The term goes up by one (`"term": 2` after one
-earlier promotion); `unreached` lists the stopped NEW (`t/073` A). Then re-add NEW as a standby.
+The preferred node P was OLD, is now a standby of the group (sequence 6) and streams. It is a
+planned switchover in the other direction (sequence 5, P as NEW): the term goes up by one (`"term": 2`
+after one earlier promotion); `unreached` lists the stopped NEW (`t/073` A). Then re-add NEW as a standby.
 
-#### Removing a dead standby
+#### 8. Removing a dead standby
 
 1. On the primary of its group: take its name out of `synchronous_standby_names` (or replace the list by
    the standbys that exist, or `''`), reload. **Do this first.** While the name is in the list, every commit
    that writes in the group waits for a standby that is gone: for the origin of a distributed transaction
-   that touches the group the wait ends after `node_timeout` with an error `KS005`, "did not confirm
-   that its part of the transaction is durable" (`t/073` B); for a transaction that
-   writes only in that group it is PostgreSQL's wait with no end.
-2. MAP: `SELECT kingres.remove_node(<standby node id>)`: it returns nothing; an error "still has the standby node N"
-   says that a primary that still has standbys cannot be removed before them (`t/048`).
+   that touches the group the wait ends after `2 x node_timeout + 5` seconds with `KS005`, "did not confirm
+   that its part of the transaction is durable" (`t/073` B); for a transaction that writes only in that group it
+   is PostgreSQL's wait with no end.
+2. MAP: `SELECT kingres.remove_node(<standby node id>)`: it returns nothing.
+
+   | answer | action |
+   |---|---|
+   | nothing | done |
+   | error "node N cannot commit: its synchronous standbys do not confirm" | step 1 was not done (the wrong order is refused at once, S9-08, `t/081`): do it, repeat |
+   | error "cannot remove node N: shard group G still has the standby node M" | a primary that still has standbys cannot be removed before them (`t/048`) |
+   | error "node N does not exist" | wrong id |
+
 3. MAP: `standby_status()` has no row for it and `check_cluster()` no `standby_*` row (`t/073` B).
 
-#### A call that did not finish
+#### 9. A call that did not finish
 
 A `promote_node` that returns an error not listed above, whose connection broke, or that the
 control plane gave up on (its own timeout; a cancel is as good as a crash here) leaves the cluster in one of two
@@ -1992,12 +2088,13 @@ states, and the same call settles both: before the decision of its two-phase tra
 was changed and nothing is left prepared (the repeated call answers `promoted`); after it the change
 is committed on MAP and may be left prepared on other nodes (the repeated call answers `completed`, and the
 worker's recovery pass does the same by itself within `recovery_interval`). Call it again, on the same
-node, until it answers `already` (`"final": true`): `promoted` and `completed` are made before the
+node, until it answers `already` (`"final": true`), at most 10 times: `promoted` and `completed` are made before the
 call's commit, and a commit whose wait for the standbys of the node that runs it was cancelled
 leaves the change prepared on the other nodes, with a `WARNING` on the session that says so (the
-extension refuses beforehand when it can see that the standbys do not confirm, which is the case
-that was found in review; the rest is a race, and `final` is what makes it harmless). Tested with kills of MAP at every fault point
-(`t/064`).
+extension refuses beforehand when it can see that the standbys do not confirm; the rest is a race, and
+`final` is what makes it harmless). A client that cancels the call is a client that gave up: the same repeat
+settles it (`t/064`, `t/082`). After ten calls without `already`, read `blocked_by`, `unreached` and the log
+of MAP, and stop.
 
 #### Detecting damage afterwards
 

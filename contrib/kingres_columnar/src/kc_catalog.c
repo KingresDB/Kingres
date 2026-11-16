@@ -309,30 +309,47 @@ kc_copy_bytea(Datum d)
 
 /*
  * The stripe catalog has the columns this build writes and reads, all of them.
- * Version 0.1 is not released and its format changes in place, so a catalog
- * made by an earlier build of it (it had one column fewer) is not read: it
- * is an error that says so, and the extension must be created again in that
- * database.  No supported database can have one.
+ * Version 0.1 is not released and its format changes in place; the one earlier
+ * shape that databases may still have is the catalog of the build before the one
+ * that added the column "maintenance", with 13 columns.  Nothing is read or
+ * written through a catalog of another shape, but the error says how to repair
+ * it without losing anything: adding the column with its default makes every
+ * table readable at once, the old rows being, by definition, rows that are not
+ * copies made by compaction.  A hint to drop and create the extension again
+ * would drop the tables with their data (their access method is part of the
+ * extension), so it is never given.
  */
 static void
-kc_catalog_check_shape(TupleDesc desc)
+kc_catalog_check_shape(Relation cat)
 {
-	if (desc->natts != Natts_kc_stripe)
+	int			natts = RelationGetDescr(cat)->natts;
+
+	if (natts == Natts_kc_stripe)
+		return;
+	if (natts == Natts_kc_stripe - 1)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("the stripe catalog has %d columns, this build uses %d",
-						desc->natts, Natts_kc_stripe),
-				 errhint("The catalog was made by an earlier build of version 0.1; drop and create the extension again.")));
+						natts, Natts_kc_stripe),
+				 errhint("The catalog was made by an earlier build of version 0.1. As the owner of the extension, run: ALTER TABLE %s.%s ADD COLUMN maintenance boolean NOT NULL DEFAULT false. Nothing is lost.",
+						 quote_identifier(get_namespace_name(RelationGetNamespace(cat))),
+						 quote_identifier(RelationGetRelationName(cat)))));
+	ereport(ERROR,
+			(errcode(ERRCODE_DATA_CORRUPTED),
+			 errmsg("the stripe catalog has %d columns, this build uses %d",
+					natts, Natts_kc_stripe),
+			 errhint("The catalog does not belong to this build and cannot be repaired by it; restore it from a backup of the database.")));
 }
 
 static void
-kc_stripe_from_tuple(TupleDesc desc, HeapTuple tup, KcStripeInfo *si)
+kc_stripe_from_tuple(Relation cat, HeapTuple tup, KcStripeInfo *si)
 {
+	TupleDesc	desc = RelationGetDescr(cat);
 	Datum		v[Natts_kc_stripe];
 	bool		n[Natts_kc_stripe];
 	int			i;
 
-	kc_catalog_check_shape(desc);
+	kc_catalog_check_shape(cat);
 	heap_deform_tuple(tup, desc, v, n);
 	for (i = 0; i < Natts_kc_stripe; i++)
 		if (n[i])
@@ -469,7 +486,7 @@ kc_catalog_load(Relation rel, Snapshot snap, int *nstripes)
 			res = res ? repalloc(res, sizeof(KcStripeInfo) * cap)
 				: palloc(sizeof(KcStripeInfo) * cap);
 		}
-		kc_stripe_from_tuple(RelationGetDescr(cat), tup, &res[n]);
+		kc_stripe_from_tuple(cat, tup, &res[n]);
 		n++;
 	}
 	systable_endscan(scan);
@@ -597,7 +614,7 @@ kc_catalog_insert(Relation rel, const KcStripeInfo *si, const char *cid_points,
 	bytea	   *cs;
 	HeapTuple	tup;
 
-	kc_catalog_check_shape(RelationGetDescr(cat));
+	kc_catalog_check_shape(cat);
 	cp = palloc(VARHDRSZ + cid_len);
 	SET_VARSIZE(cp, VARHDRSZ + cid_len);
 	memcpy(VARDATA(cp), cid_points, cid_len);
@@ -650,8 +667,38 @@ kc_catalog_insert(Relation rel, const KcStripeInfo *si, const char *cid_points,
 	table_close(cat, RowExclusiveLock);
 }
 
-/* Delete the rows of one stored content that are visible (to us, now). */
-void
+/*
+ * Delete a stripe row.  A row that is already gone is what the caller wanted:
+ * another session (VACUUM, columnar_reconcile, a cleanup of its own) deleted
+ * it, or an earlier command of this transaction did, and the answer is false,
+ * not an error.  With wait, a deletion that another transaction has begun
+ * and not finished is waited for; without it the row is left to that
+ * transaction (false), so a cleanup never makes anyone wait.
+ */
+static bool
+kc_catalog_delete_tuple(Relation cat, ItemPointer tid, bool wait)
+{
+	TM_FailureData tmfd;
+	TM_Result	res;
+
+	res = KC_HEAP_DELETE(cat, tid, wait, &tmfd);
+	switch (res)
+	{
+		case TM_Ok:
+			return true;
+		case TM_SelfModified:
+		case TM_Deleted:
+		case TM_Updated:
+		case TM_BeingModified:
+			return false;
+		default:
+			elog(ERROR, "unexpected result %d deleting a stripe catalog row", (int) res);
+	}
+	return false;
+}
+
+/* Delete the rows of one stored content that are visible (to us, now); returns how many. */
+int
 kc_catalog_delete_uid(uint64 uid)
 {
 	Relation	cat = table_open(kc_catalog_oid(), RowExclusiveLock);
@@ -659,6 +706,7 @@ kc_catalog_delete_uid(uint64 uid)
 	SysScanDesc scan;
 	HeapTuple	tup;
 	Snapshot	vsnap;
+	int			n = 0;
 
 	ScanKeyInit(&key, Anum_kc_uid, BTEqualStrategyNumber, F_INT8EQ,
 				Int64GetDatum((int64) uid));
@@ -666,10 +714,12 @@ kc_catalog_delete_uid(uint64 uid)
 	scan = systable_beginscan(cat, kc_catalog_index_oid(), true,
 							  SnapshotAny, 1, &key);
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
-		if (kc_tuple_visible(tup, vsnap, NULL))
-			CatalogTupleDelete(cat, &tup->t_self);
+		if (kc_tuple_visible(tup, vsnap, NULL) &&
+			kc_catalog_delete_tuple(cat, &tup->t_self, true))
+			n++;
 	systable_endscan(scan);
 	table_close(cat, RowExclusiveLock);
+	return n;
 }
 
 /* Delete one stripe's row; returns the number of rows deleted. */
@@ -693,8 +743,8 @@ kc_catalog_delete_stripe(uint64 uid, uint64 stripe_id)
 	{
 		if (!kc_tuple_visible(tup, vsnap, NULL))
 			continue;
-		CatalogTupleDelete(cat, &tup->t_self);
-		n++;
+		if (kc_catalog_delete_tuple(cat, &tup->t_self, true))
+			n++;
 	}
 	systable_endscan(scan);
 	table_close(cat, RowExclusiveLock);
@@ -838,9 +888,9 @@ kc_reconcile_ex(bool dry)
 			continue;
 		if (nlive == 0 || bsearch(&uid, live, nlive, sizeof(uint64), kc_u64_cmp) == NULL)
 		{
-			if (!dry)
-				CatalogTupleDelete(cat, &tup->t_self);
-			ndel++;
+			/* a row that another session is deleting or deleted is not ours to count */
+			if (dry || kc_catalog_delete_tuple(cat, &tup->t_self, false))
+				ndel++;
 		}
 	}
 	systable_endscan(scan);

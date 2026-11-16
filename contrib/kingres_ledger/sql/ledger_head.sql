@@ -60,6 +60,15 @@ SELECT (SELECT count(*) FROM kingres.ledger_digest) AS digests,
 --------------------------------------------------------------------------
 -- Pages: the bounds
 --------------------------------------------------------------------------
+-- The text of the error of ledger_head with the transaction id (the id of a real
+-- transaction, not the same on every run) replaced.
+CREATE FUNCTION public.head_err() RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM * FROM kingres.ledger_head();
+    RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+    RETURN regexp_replace(SQLERRM, 'transaction [0-9]+', 'transaction N');
+END $$;
 CREATE FUNCTION public.page(f bigint, m int) RETURNS text LANGUAGE sql AS $$
     SELECT coalesce(string_agg(e.height::text, ',' ORDER BY e.height), '(none)')
     FROM kingres.ledger_blocks_entries(f, m) e
@@ -269,7 +278,7 @@ DELETE FROM kingres.ledger_blocks WHERE height = 4;
 \c
 SET search_path = public;
 SELECT public.page(0, 100) AS entries_after_losing_the_head;
-SELECT * FROM kingres.ledger_head();
+SELECT public.head_err() AS head;
 SELECT (SELECT count(*) FROM kingres.ledger_verify()) > 0 AS verify_sees_it;
 :trig_off;
 \c
@@ -278,7 +287,7 @@ DELETE FROM kingres.ledger_blocks WHERE height >= 2;
 :trig_on;
 \c
 SET search_path = public;
-SELECT * FROM kingres.ledger_head();
+SELECT public.head_err() AS head;
 -- All the blocks removed: the head is not "empty", it is an error.
 :trig_off;
 \c
@@ -287,7 +296,7 @@ DELETE FROM kingres.ledger_blocks;
 :trig_on;
 \c
 SET search_path = public;
-SELECT * FROM kingres.ledger_head();
+SELECT public.head_err() AS head;
 SELECT public.page(0, 100) AS entries_after_losing_everything;
 -- What is not detected: the same removal together with the transaction rows
 -- of the removed blocks, which someone who can write the ledger tables can
