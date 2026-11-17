@@ -147,34 +147,38 @@ SELECT started_by, state FROM kingres.ledger_verification WHERE verification_id 
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 -- 120 rows without entries: 120 problems, 100 of them kept
 INSERT INTO docs SELECT 1000 + g, 'smuggled', NULL FROM generate_series(1, 120) g;
 SELECT kingres.ledger_verify_recorded() AS vid \gset
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT state, problem_count, jsonb_array_length(problems) AS kept, problems -> 0 ->> 'check' AS first_check,
        (problems -> 0 ->> 'object') AS first_object,
        finished_at IS NOT NULL AS finished
 FROM kingres.ledger_verification WHERE verification_id = :vid;
   state   | problem_count | kept | first_check | first_object | finished 
 ----------+---------------+------+-------------+--------------+----------
- problems |           125 |  100 | trigger     | public.docs  | t
+ problems |           126 |  100 | trigger     | public.docs  | t
 (1 row)
 
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM docs WHERE id >= 1000;
 SELECT count(*) AS problems_after_cleanup FROM kingres.ledger_verify();
  problems_after_cleanup 
 ------------------------
-                      5
+                      6
 (1 row)
 
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT count(*) AS problems_after_restore FROM kingres.ledger_verify();
  problems_after_restore 
 ------------------------
@@ -201,7 +205,7 @@ SELECT append_only_tables = (SELECT count(*) FROM kingres.ledger_table WHERE mod
 FROM kingres.ledger_status;
  append_only_count | updatable_count | latest_block | latest_hash | pending_transactions | nothing_waiting | last_digest | last_verification | last_verification_state | last_verification_problems 
 -------------------+-----------------+--------------+-------------+----------------------+-----------------+-------------+-------------------+-------------------------+----------------------------
- t                 | t               | t            | t           |                    0 | t               | t           | t                 | problems                |                        125
+ t                 | t               | t            | t           |                    0 | t               | t           | t                 | problems                |                        126
 (1 row)
 
 INSERT INTO docs VALUES (701, 'pending', NULL);
@@ -274,6 +278,7 @@ RESET ROLE;
 --------------------------------------------------------------------------
 \set VERBOSITY sqlstate
 -- append-only for every role, the owner included
+RESET kingres_ledger.allow_manual_write;
 UPDATE kingres.ledger_digest SET height = 0;
 ERROR:  KL001
 DELETE FROM kingres.ledger_digest;

@@ -346,6 +346,7 @@ WHERE NOT EXISTS (SELECT 1 FROM accounts a WHERE e.row_hash = kingres.ledger_row
 --------------------------------------------------------------------------
 -- Append-only enforcement by the triggers
 --------------------------------------------------------------------------
+SET kingres_ledger.allow_manual_write = on;
 DO $$
 DECLARE
     stmt text;
@@ -384,6 +385,7 @@ NOTICE:  DELETE FROM kingres.ledger_chain -> KL001 table "ledger_chain" is an ap
 NOTICE:  TRUNCATE kingres.ledger_chain -> KL001 table "ledger_chain" is an append-only ledger table
 NOTICE:  INSERT INTO kingres.ledger_chain (singleton, chain_id) VALUES (false, decode(repeat('00', 32), 'hex')) -> 23514 new row for relation "ledger_chain" violates check constraint "ledger_chain_singleton_check"
 NOTICE:  INSERT INTO kingres.ledger_chain (chain_id) VALUES (decode(repeat('00', 32), 'hex')) -> 23505 duplicate key value violates unique constraint "ledger_chain_pkey"
+RESET kingres_ledger.allow_manual_write;
 -- The blocking triggers also hold under session_replication_role = replica.
 SET session_replication_role = replica;
 UPDATE accounts SET balance = 0;
@@ -580,6 +582,7 @@ JOIN kingres.ledger_table t USING (table_id) WHERE t.relid = 'with_enum'::regcla
 
 -- Now that blocks, transactions and entries exist, every statement that
 -- would modify them is rejected, for every role.
+SET kingres_ledger.allow_manual_write = on;
 DO $$
 DECLARE
     stmt text;
@@ -589,7 +592,6 @@ BEGIN
         'DELETE FROM kingres.ledger_blocks',
         'TRUNCATE kingres.ledger_blocks',
         'UPDATE kingres.ledger_tx SET tx_index = tx_index',
-        'DELETE FROM kingres.ledger_tx',
         'UPDATE kingres.ledger_entry SET seq = seq',
         'DELETE FROM kingres.ledger_table',
         'TRUNCATE kingres.ledger_table, kingres.ledger_entry']
@@ -606,7 +608,14 @@ NOTICE:  UPDATE kingres.ledger_blocks SET height = height -> KL001 table "ledger
 NOTICE:  DELETE FROM kingres.ledger_blocks -> KL001 table "ledger_blocks" is an append-only ledger table
 NOTICE:  TRUNCATE kingres.ledger_blocks -> KL001 table "ledger_blocks" is an append-only ledger table
 NOTICE:  UPDATE kingres.ledger_tx SET tx_index = tx_index -> KL001 table "ledger_tx" is an append-only ledger table
-NOTICE:  DELETE FROM kingres.ledger_tx -> KL001 table "ledger_tx" is an append-only ledger table
 NOTICE:  UPDATE kingres.ledger_entry SET seq = seq -> KL001 table "ledger_entry" is an append-only ledger table
 NOTICE:  DELETE FROM kingres.ledger_table -> KL001 table "ledger_table" is an append-only ledger table
 NOTICE:  TRUNCATE kingres.ledger_table, kingres.ledger_entry -> KL001 table "ledger_table" is an append-only ledger table
+RESET kingres_ledger.allow_manual_write;
+-- Transaction rows and recorded digests are the two kinds of row that a
+-- superuser who turned the setting on may delete (ledger_remove_stray removes
+-- them, README "A row above the head"); without it the guard refuses.
+DELETE FROM kingres.ledger_tx;
+ERROR:  table "ledger_tx" is an append-only ledger table
+DELETE FROM kingres.ledger_digest;
+ERROR:  table "ledger_digest" is an append-only ledger table

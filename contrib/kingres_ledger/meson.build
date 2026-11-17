@@ -2,6 +2,7 @@
 
 kingres_ledger_sources = files(
   'src/capture.c',
+  'src/guard.c',
   'src/history.c',
   'src/kingres_ledger.c',
   'src/merkle.c',
@@ -55,6 +56,8 @@ tests += {
       'ledger_preimage',
       'ledger_head',
       'ledger_stray',
+      'ledger_guard',
+      'ledger_manual',
     ],
     'regress_args': ['--temp-config', files('kingres_ledger.conf')],
     # The tests need shared_preload_libraries = 'kingres_ledger', which a
@@ -76,6 +79,9 @@ tests += {
       't/011_upgrade_0_3.pl',
       't/012_publish_read.pl',
       't/013_head_inflight.pl',
+      't/014_guard.pl',
+      't/015_recipe.pl',
+      't/016_dump_upgrade.pl',
     ],
   },
 }

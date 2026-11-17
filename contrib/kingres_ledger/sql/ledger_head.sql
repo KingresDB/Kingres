@@ -13,6 +13,7 @@ DROP DATABASE IF EXISTS kl_head_t;
 CREATE DATABASE kl_head_t;
 \c kl_head_t
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 \set VERBOSITY terse
 CREATE EXTENSION kingres_ledger;
 
@@ -152,10 +153,12 @@ END $$;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_blocks SET tx_count = tx_count + 1 WHERE height = 2;
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.page(0, 2) AS before_the_bad_block;
 SELECT public.page(0, 3) AS reaching_the_bad_block;
 SELECT public.page(2, 1) AS starting_at_the_bad_block;
@@ -164,10 +167,12 @@ SELECT height FROM kingres.ledger_head();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.page(0, 100) AS restored;
 
 -- 2. A block whose stored hash was replaced: it fails, and so does the
@@ -175,74 +180,90 @@ SELECT public.page(0, 100) AS restored;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_blocks SET block_hash = sha256('forged') WHERE height = 3;
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.page(0, 3) AS before_the_bad_block;
 SELECT public.page(3, 1) AS the_bad_block;
 SELECT public.page(4, 1) AS the_block_after;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 
 -- 3. A block that was deleted from the middle: a gap, found whichever side the page starts.
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM kingres.ledger_blocks WHERE height = 2;
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.page(0, 2) AS before_the_gap;
 SELECT public.page(0, 4) AS across_the_gap;
 SELECT public.page(3, 2) AS after_the_gap;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 
 -- 4. A stored hash version that is not 1, and a stored root of the wrong length.
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_blocks SET hash_version = 2 WHERE height = 1;
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.page(1, 1) AS version_two;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 UPDATE kingres.ledger_blocks SET tx_merkle_root = '\x00' WHERE height = 4;
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.page(4, 1) AS short_root;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 
 -- 5. The first block no longer follows from the chain identity.
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_chain SET chain_id = sha256('another chain');
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.page(0, 1) AS first_block_other_chain;
 SELECT public.page(1, 1) AS second_block_other_chain;
 SELECT height FROM kingres.ledger_head();
@@ -250,19 +271,23 @@ SELECT height FROM kingres.ledger_head();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM kingres.ledger_chain;
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT * FROM kingres.ledger_head();
 SELECT public.page(0, 1) AS no_chain_identity;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.page(0, 100) AS restored_again;
 SELECT count(*) AS problems FROM kingres.ledger_verify();
 
@@ -273,29 +298,35 @@ SELECT count(*) AS problems FROM kingres.ledger_verify();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM kingres.ledger_blocks WHERE height = 4;
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.page(0, 100) AS entries_after_losing_the_head;
 SELECT public.head_err() AS head;
 SELECT (SELECT count(*) FROM kingres.ledger_verify()) > 0 AS verify_sees_it;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM kingres.ledger_blocks WHERE height >= 2;
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.head_err() AS head;
 -- All the blocks removed: the head is not "empty", it is an error.
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM kingres.ledger_blocks;
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.head_err() AS head;
 SELECT public.page(0, 100) AS entries_after_losing_everything;
 -- What is not detected: the same removal together with the transaction rows
@@ -304,20 +335,24 @@ SELECT public.page(0, 100) AS entries_after_losing_everything;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 DELETE FROM kingres.ledger_blocks WHERE height = 4;
 DELETE FROM kingres.ledger_tx WHERE block_height = 4;
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT height FROM kingres.ledger_head();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 
 -- 8. A digest that was recorded remembers the block it named.
 SELECT (kingres.ledger_generate_digest() ->> 'height')::bigint AS digest_height;
@@ -325,35 +360,43 @@ SELECT height FROM kingres.ledger_head();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM kingres.ledger_blocks WHERE height = 4;
 DELETE FROM kingres.ledger_tx WHERE block_height = 4;
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT * FROM kingres.ledger_head();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT kingres.ledger_generate_digest() IS NOT NULL AS digest_again;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_digest SET block_hash = sha256('not the block');
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT * FROM kingres.ledger_head();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT height FROM kingres.ledger_head();
 
 -- 9. What ledger_head checks of the head itself.
@@ -361,14 +404,17 @@ SELECT height FROM kingres.ledger_head();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_blocks SET tx_count = tx_count + 1 WHERE height = 4;
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT * FROM kingres.ledger_head();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 -- A head with the right hash for a link that is wrong.
 DELETE FROM kingres.ledger_blocks WHERE height = 4;
@@ -379,62 +425,75 @@ FROM public.saved_blocks b WHERE b.height = 4;
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT * FROM kingres.ledger_head();
 SELECT public.page(4, 1) AS wrong_link_through_entries;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 -- Block 0 gone while the head is above it.
 DELETE FROM kingres.ledger_blocks WHERE height = 0;
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT * FROM kingres.ledger_head();
 SELECT public.page(1, 2) AS from_one_without_block_zero;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 
 -- 10. The chain identity is checked on every call, not only from block 0.
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_chain SET chain_id = sha256('another chain');
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.page(3, 1) AS middle_block_other_chain;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 
 -- 11. A height that is there twice (the primary key made non-unique, as
 -- someone with catalog access could): the message names that block.
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE pg_index SET indisunique = false, indisprimary = false
  WHERE indexrelid = 'kingres.ledger_blocks_pkey'::regclass;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 INSERT INTO kingres.ledger_blocks SELECT * FROM public.saved_blocks WHERE height = 3;
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.page(2, 5) AS duplicated_height;
 SELECT public.page(0, 100) AS duplicated_height_from_zero;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM kingres.ledger_blocks WHERE height = 3;
 INSERT INTO kingres.ledger_blocks SELECT * FROM public.saved_blocks WHERE height = 3;
 UPDATE pg_index SET indisunique = true, indisprimary = true
@@ -442,6 +501,7 @@ UPDATE pg_index SET indisunique = true, indisprimary = true
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.page(0, 100) AS restored_after_duplicate;
 
 -- 12. A fully valid successor written by someone who can write the table is
@@ -451,6 +511,7 @@ SELECT public.page(0, 100) AS restored_after_duplicate;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 INSERT INTO kingres.ledger_blocks
 SELECT 5, 1, b.block_hash, b.tx_merkle_root, 0, b.closed_at,
        sha256(kingres.ledger_block_preimage(1::smallint, 5, b.block_hash, b.tx_merkle_root, 0, b.closed_at))
@@ -458,16 +519,19 @@ FROM public.saved_blocks b WHERE b.height = 4;
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.page(4, 5) AS forged_valid_successor;
 SELECT height FROM kingres.ledger_head();
 SELECT count(*) > 0 AS verify_sees_the_successor FROM kingres.ledger_verify();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT count(*) AS problems_after_all FROM kingres.ledger_verify();
 
 -- 13. PUBLIC's read access to the catalog tables is the operator's to

@@ -103,6 +103,7 @@ sub fingerprint
 #--------------------------------------------------------------------------
 $node->safe_psql('postgres', 'CREATE DATABASE old01');
 $node->safe_psql('old01', q{
+	SET kingres_ledger.allow_manual_write = on;
 	CREATE EXTENSION kingres_ledger VERSION '0.1';
 	CREATE SCHEMA app;
 	CREATE TABLE app.accounts (id int PRIMARY KEY, owner_name text NOT NULL, balance numeric(12,2));
@@ -115,7 +116,7 @@ $node->safe_psql('old01', q{
 is($node->safe_psql('old01',
 		q{SELECT extversion FROM pg_extension WHERE extname = 'kingres_ledger'}),
 	'0.1', 'the old database has version 0.1');
-my $old_digest = $node->safe_psql('old01', 'SELECT kingres.ledger_generate_digest()');
+my $old_digest = $node->safe_psql('old01', 'SET kingres_ledger.allow_manual_write = on; SELECT kingres.ledger_generate_digest()');
 $node->safe_psql('old01', q{INSERT INTO app.accounts VALUES (5, 'erin', 50)});
 my $old_proof_row = $node->safe_psql('old01',
 	q{SELECT encode(kingres.ledger_row_hash(a.*), 'hex') FROM app.accounts a WHERE id = 1});
@@ -151,7 +152,7 @@ is($node->safe_psql('old01',
 		  . q{(SELECT table_id FROM kingres.ledger_table WHERE relid = 'app.accounts'::regclass), }
 		  . qq{decode('$old_proof_row', 'hex'))}),
 	't', 'and with the table and row it is for');
-my $tip = $node->safe_psql('old01', 'SELECT kingres.ledger_generate_digest()');
+my $tip = $node->safe_psql('old01', 'SET kingres_ledger.allow_manual_write = on; SELECT kingres.ledger_generate_digest()');
 is($node->safe_psql('old01', qq{SELECT kingres.ledger_verify_digest('$tip'::jsonb)}),
 	't', 'a digest taken after the upgrade verifies');
 
@@ -161,7 +162,7 @@ my ($ret, $stdout, $stderr) = $node->psql('old01',
 	extra_params => [ '-v', 'VERBOSITY=sqlstate' ]);
 like($stderr, qr/KL001/, 'the upgraded append-only table still rejects UPDATE');
 $node->safe_psql('old01', q{INSERT INTO app.accounts VALUES (6, 'frank', 60)});
-$node->safe_psql('old01', 'SELECT kingres.ledger_build_block()');
+$node->safe_psql('old01', 'SET kingres_ledger.allow_manual_write = on; SELECT kingres.ledger_build_block()');
 is($node->safe_psql('old01', 'SELECT count(*) FROM kingres.ledger_verify()'),
 	'0', 'and verifies after more writes');
 
@@ -215,7 +216,7 @@ is($node->safe_psql('new02',
 		       || ' ' || coalesce(last_digest_id::text, 'none') || ' ' || coalesce(last_verification_id::text, 'none')
 		    FROM kingres.ledger_status}),
 	'0 0 none 0 none none none', 'the status of an empty ledger');
-is($node->safe_psql('new02', 'SELECT kingres.ledger_verify_recorded()'),
+is($node->safe_psql('new02', 'SET kingres_ledger.allow_manual_write = on; SELECT kingres.ledger_verify_recorded()'),
 	'1', 'the first recorded verification has id 1');
 
 # Protection: the same statements are rejected in both.

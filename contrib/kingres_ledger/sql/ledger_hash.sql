@@ -187,6 +187,7 @@ BEGIN;
 -- DDL statement, would reject them; the test switches it off for this
 -- transaction.
 SET LOCAL event_triggers = off;
+SET LOCAL kingres_ledger.allow_manual_write = on;
 CREATE TABLE hash_t (id int, name text, note text);
 INSERT INTO kingres.ledger_table (relid, mode) VALUES ('hash_t', 'append_only');
 INSERT INTO hash_t VALUES (7, U&'h\00e9llo', NULL);

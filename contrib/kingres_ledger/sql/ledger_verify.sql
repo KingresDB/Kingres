@@ -203,68 +203,83 @@ UPDATE docs SET body = 'blocked' WHERE id = 1;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE docs SET body = 'one' WHERE id = 1;
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT count(*) AS problems FROM kingres.ledger_verify();
 
 -- 1. A modified row.
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE docs SET body = 'tampered' WHERE id = 3;
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT * FROM public.vreport();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT count(*) AS problems_after_restore FROM kingres.ledger_verify();
 
 -- 2. A deleted row.
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM docs WHERE id = 7;
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT * FROM public.vreport();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 
 -- 3. A row inserted without an entry.
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 INSERT INTO docs VALUES (99, 'smuggled', NULL);
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT * FROM public.vreport();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 
 -- 4. A modified entry (and no change of the data).
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_entry SET row_hash = sha256('other')
 WHERE (ledger_txid, seq) = (SELECT ledger_txid, seq FROM kingres.ledger_entry
                             WHERE table_id = (SELECT table_id FROM kingres.ledger_table WHERE relid = 'docs'::regclass)
@@ -272,19 +287,23 @@ WHERE (ledger_txid, seq) = (SELECT ledger_txid, seq FROM kingres.ledger_entry
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT * FROM public.vreport();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 
 -- 5. A deleted entry.
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM kingres.ledger_entry
 WHERE (ledger_txid, seq) = (SELECT ledger_txid, seq FROM kingres.ledger_entry
                             WHERE table_id = (SELECT table_id FROM kingres.ledger_table WHERE relid = 'docs'::regclass)
@@ -292,19 +311,23 @@ WHERE (ledger_txid, seq) = (SELECT ledger_txid, seq FROM kingres.ledger_entry
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT * FROM public.vreport();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 
 -- 6. A modified block.
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 -- One second earlier: the block is then also earlier than its predecessor,
 -- which the block time check reports at block 1, outside the range that is
 -- checked from block 2 on.
@@ -312,53 +335,64 @@ UPDATE kingres.ledger_blocks SET closed_at = closed_at - interval '1 second' WHE
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT * FROM public.vreport();
 SELECT count(*) AS problems_outside_range FROM kingres.ledger_verify(2);
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 
 -- 7. A modified transaction root, and a modified transaction count of a block.
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_tx SET merkle_root = sha256('forged')
 WHERE ledger_txid = (SELECT min(ledger_txid) FROM kingres.ledger_tx);
 UPDATE kingres.ledger_blocks SET tx_count = tx_count + 1 WHERE height = 0;
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT * FROM public.vreport();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 
 -- 7b. The user recorded for a transaction in a block is covered by the hashes.
 SELECT ledger_txid AS first_tx FROM kingres.ledger_tx ORDER BY ledger_txid LIMIT 1 \gset
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_tx SET user_name = 'mallory' WHERE ledger_txid = :first_tx;
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT * FROM public.vreport();
 SELECT kingres.ledger_verify_digest(:'d3') AS digest_still_matches_stored_blocks;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT count(*) AS problems_after_restore FROM kingres.ledger_verify();
 
 -- 7c. The user recorded in the work queue, before the block is built, is NOT
@@ -368,10 +402,12 @@ INSERT INTO docs VALUES (12, 'twelve', NULL);
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_pending SET user_name = 'mallory';
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT count(*) AS problems_with_tampered_pending_user FROM kingres.ledger_verify();
 SELECT kingres.ledger_build_block() IS NOT NULL AS built;
 SELECT count(*) AS problems_after_build FROM kingres.ledger_verify();
@@ -379,10 +415,12 @@ SELECT user_name FROM kingres.ledger_tx ORDER BY ledger_txid DESC LIMIT 1;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 
 -- 8. A transaction removed from the work queue before it is in a block, and an
 -- entry that belongs to no transaction.
@@ -390,58 +428,70 @@ INSERT INTO docs VALUES (11, 'eleven', NULL);
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM kingres.ledger_pending;
 INSERT INTO kingres.ledger_entry
 SELECT 1000000000, 0, table_id, 'I', sha256('ghost') FROM kingres.ledger_table LIMIT 1;
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT * FROM public.vreport();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT count(*) AS problems_after_cleanup FROM kingres.ledger_verify();
 
 -- 9. A transaction in a block and in the work queue at the same time.
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 INSERT INTO kingres.ledger_pending
 SELECT ledger_txid, user_name FROM kingres.ledger_tx ORDER BY ledger_txid LIMIT 1;
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT * FROM public.vreport();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 
 -- 10. A trigger left disabled is reported by the verification.
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT check_name, object, detail FROM kingres.ledger_verify()
 WHERE object IN ('public.docs', 'kingres.ledger_blocks') ORDER BY 1, 2, 3;
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE pg_trigger SET tgenabled = 'O'
 WHERE tgname = 'kingres_ledger_capture' AND tgrelid = 'docs'::regclass;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT check_name, object, detail FROM kingres.ledger_verify();
 UPDATE pg_trigger SET tgenabled = 'A'
 WHERE tgname = 'kingres_ledger_capture' AND tgrelid = 'docs'::regclass;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT count(*) AS problems_after_rearm FROM kingres.ledger_verify();
 
 -- 11. The whole chain rewritten consistently from block 1 on: the ledger is
@@ -451,6 +501,7 @@ SELECT kingres.ledger_verify_digest(:'d3') AS digest_before_rewrite;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DO $$
 DECLARE
     h bigint;
@@ -473,6 +524,13 @@ END $$;
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
+-- The digests that the database recorded name the old hashes: ledger_verify
+-- reports them (digest_hash).  An attacker who rewrites the chain has to remove
+-- them too (a superuser with the manual-write setting can); only a digest kept
+-- outside the database cannot be taken away.
+SELECT count(*) AS problems_with_stale_recorded_digests FROM kingres.ledger_verify();
+DELETE FROM kingres.ledger_digest;
 SELECT count(*) AS problems_after_consistent_rewrite FROM kingres.ledger_verify();
 SELECT kingres.ledger_verify_digest(:'d1') AS d1_after_rewrite,
        kingres.ledger_verify_digest(:'d2') AS d2_after_rewrite,
@@ -489,9 +547,11 @@ FROM docs d WHERE id = 4;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT count(*) AS problems_after_restore FROM kingres.ledger_verify();
 SELECT kingres.ledger_verify_digest(:'d3') AS digest_after_restore;

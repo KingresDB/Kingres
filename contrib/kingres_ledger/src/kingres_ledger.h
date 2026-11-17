@@ -23,6 +23,7 @@
 
 /* The differences between the PostgreSQL majors; see the file. */
 #include "pg_compat.h"
+#include "utils/relcache.h"
 
 /* Version of the hash formats implemented by this code (see README). */
 #define KL_HASH_VERSION 1
@@ -82,6 +83,7 @@
 #define KL_TRIGGER_CAPTURE		"kingres_ledger_capture"
 #define KL_TRIGGER_BLOCK_MODIFY	"kingres_ledger_block_modify"
 #define KL_TRIGGER_BLOCK_TRUNCATE "kingres_ledger_block_truncate"
+#define KL_TRIGGER_GUARD_WRITE "kingres_ledger_guard_write"
 
 /* C symbols of the functions that the protection code has to recognise. */
 #define KL_SYM_CAPTURE			"kingres_ledger_capture"
@@ -90,6 +92,10 @@
 #define KL_SYM_LOCK_TABLE		"kingres_ledger_lock_table"
 #define KL_SYM_HISTORY_SYNC		"kingres_ledger_history_sync"
 #define KL_SYM_HISTORY_ACL_SYNC	"kingres_ledger_history_acl_sync"
+#define KL_SYM_INTERNAL_WRITE	"kingres_ledger_internal_write"
+
+/* Version of the SQL scripts that this library needs. */
+#define KL_SCRIPT_VERSION		"0.3"
 
 /* Attribute number of history_relid in kingres.ledger_table (version 0.2). */
 #define KL_LEDGER_TABLE_HISTORY_ATTNO 5
@@ -98,6 +104,8 @@
 extern int	kl_max_block_transactions;
 
 /* GUC: how often the launcher looks for pending transactions, in ms; 0 = off. */
+extern int	kl_max_clock_skew;
+
 extern int	kl_block_interval;
 
 /* GUC: the longest one worker may run for one database, in ms; 0 = no limit. */
@@ -139,6 +147,17 @@ extern void kl_mark_dirty(Oid dboid);
 
 /* protect.c */
 extern void kl_protect_init(void);
+
+/* guard.c */
+extern void kl_guard_init(void);
+extern void kl_guard_install(void);
+extern void kl_write_enter(void);
+extern void kl_write_leave(void);
+extern void kl_write_reset(void);
+extern bool kl_manual_delete_allowed(Relation rel);
+extern bool kl_pending_delete_allowed(Relation rel);
+extern bool kl_insert_allowed(void);
+extern void kl_refuse_write_rel(Relation rel, bool is_insert);
 
 /* history.c */
 extern void kl_sync_all_history_acls(Oid extowner);

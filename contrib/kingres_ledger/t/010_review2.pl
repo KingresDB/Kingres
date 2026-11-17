@@ -159,7 +159,7 @@ ok(wait_for($h, 'fx', 'SELECT count(*) FROM kingres.ledger_pending', '0', 30),
 	'fx: the enabling transaction is built');
 $h->safe_psql('fx', q(UPDATE pg_trigger SET tgenabled = 'D' WHERE tgrelid = 'kingres.ledger_chain'::regclass));
 my $chain = $h->safe_psql('fx', q(SELECT encode(chain_id, 'hex') FROM kingres.ledger_chain));
-$h->safe_psql('fx', q(DELETE FROM kingres.ledger_chain));
+$h->safe_psql('fx', q(SET kingres_ledger.allow_manual_write = on; DELETE FROM kingres.ledger_chain));
 my $fails_before = log_count($h, qr/the block worker for database \d+ failed/);
 $h->safe_psql('fx', q(INSERT INTO public.t VALUES (1)));
 sleep 14;
@@ -175,7 +175,7 @@ ok($h->safe_psql('fx', q(SELECT worker_retry_after > now() FROM kingres.ledger_s
 my $fails = log_count($h, qr/the block worker for database \d+ failed/) - $fails_before;
 cmp_ok($fails, '<=', 8, 'the log has one line per attempt and not one per interval');
 is(log_count($h, qr/exited with exit code/), 0, 'no worker exited with an error code');
-$h->safe_psql('fx', qq(INSERT INTO kingres.ledger_chain (chain_id) VALUES (decode('$chain', 'hex'))));
+$h->safe_psql('fx', qq(SET kingres_ledger.allow_manual_write = on; INSERT INTO kingres.ledger_chain (chain_id) VALUES (decode('$chain', 'hex'))));
 ok(wait_for($h, 'fx', 'SELECT count(*) FROM kingres.ledger_pending', '0', 90),
 	'when the cause is gone the transaction is built by the next attempt');
 is($h->safe_psql('fx', q(SELECT worker_state || ' ' || worker_consecutive_failures FROM kingres.ledger_status)),

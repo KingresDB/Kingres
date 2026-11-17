@@ -31,7 +31,7 @@ INSERT INTO pure_primitives VALUES
     ('ledger_merkle_final'), ('ledger_merkle_path'), ('ledger_tx_leaf'),
     ('ledger_block_tx_leaf'), ('ledger_block_hash'), ('ledger_block_preimage'),
     ('ledger_genesis_hash'),
-    ('ledger_timestamptz_us'), ('ledger_verify_proof'), ('ledger_hook_active'),
+    ('ledger_timestamptz_us'), ('ledger_verify_proof'), ('ledger_hook_active'), ('ledger_binary_upgrade'),
     ('ledger_outer_user');
 
 -- A function without a fixed search_path that is not on the list.

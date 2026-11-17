@@ -111,7 +111,7 @@ cmp_ok(q1($primary, 'SELECT count(*) FROM kingres.ledger_digest'), '>', 0, 'dige
 $primary->wait_for_catchup($standby);
 my $head = q1($primary, 'SELECT height FROM kingres.ledger_head()');
 is(q1($standby, 'SELECT height FROM kingres.ledger_head()'), $head, 'the standby has the primary head');
-q1($primary, q(INSERT INTO kingres.ledger_tx
+q1($primary, q(SET kingres_ledger.allow_manual_write = on; INSERT INTO kingres.ledger_tx
 	VALUES (900000007, 7777, 0, 1, sha256('x'), 'x')));
 $primary->wait_for_catchup($standby);
 foreach my $node ($primary, $standby)

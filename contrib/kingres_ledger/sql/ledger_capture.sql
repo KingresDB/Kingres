@@ -225,6 +225,7 @@ WHERE NOT EXISTS (SELECT 1 FROM accounts a WHERE e.row_hash = kingres.ledger_row
 --------------------------------------------------------------------------
 -- Append-only enforcement by the triggers
 --------------------------------------------------------------------------
+SET kingres_ledger.allow_manual_write = on;
 DO $$
 DECLARE
     stmt text;
@@ -251,6 +252,7 @@ BEGIN
         END;
     END LOOP;
 END $$;
+RESET kingres_ledger.allow_manual_write;
 
 -- The blocking triggers also hold under session_replication_role = replica.
 SET session_replication_role = replica;
@@ -355,6 +357,7 @@ JOIN kingres.ledger_table t USING (table_id) WHERE t.relid = 'with_enum'::regcla
 
 -- Now that blocks, transactions and entries exist, every statement that
 -- would modify them is rejected, for every role.
+SET kingres_ledger.allow_manual_write = on;
 DO $$
 DECLARE
     stmt text;
@@ -364,7 +367,6 @@ BEGIN
         'DELETE FROM kingres.ledger_blocks',
         'TRUNCATE kingres.ledger_blocks',
         'UPDATE kingres.ledger_tx SET tx_index = tx_index',
-        'DELETE FROM kingres.ledger_tx',
         'UPDATE kingres.ledger_entry SET seq = seq',
         'DELETE FROM kingres.ledger_table',
         'TRUNCATE kingres.ledger_table, kingres.ledger_entry']
@@ -377,3 +379,9 @@ BEGIN
         END;
     END LOOP;
 END $$;
+RESET kingres_ledger.allow_manual_write;
+-- Transaction rows and recorded digests are the two kinds of row that a
+-- superuser who turned the setting on may delete (ledger_remove_stray removes
+-- them, README "A row above the head"); without it the guard refuses.
+DELETE FROM kingres.ledger_tx;
+DELETE FROM kingres.ledger_digest;

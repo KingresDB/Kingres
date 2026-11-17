@@ -228,7 +228,8 @@ kl_is_internal_function(Oid funcoid, Oid extoid)
 		kl_is_ledger_function(funcoid, extoid, KL_SYM_RECORD_ROW) ||
 		kl_is_ledger_function(funcoid, extoid, KL_SYM_LOCK_TABLE) ||
 		kl_is_ledger_function(funcoid, extoid, KL_SYM_HISTORY_SYNC) ||
-		kl_is_ledger_function(funcoid, extoid, KL_SYM_HISTORY_ACL_SYNC);
+		kl_is_ledger_function(funcoid, extoid, KL_SYM_HISTORY_ACL_SYNC) ||
+		kl_is_ledger_function(funcoid, extoid, KL_SYM_INTERNAL_WRITE);
 }
 
 /*
@@ -1229,10 +1230,21 @@ kl_check_statement(Node *parsetree, const char *queryString)
 		case T_AlterFunctionStmt:
 		case T_AlterEnumStmt:
 		case T_ViewStmt:
+		case T_LockStmt:
 			break;
 		default:
 			return;
 	}
+
+	/*
+	 * pg_upgrade restores the schema of the old cluster in binary upgrade mode:
+	 * the extension is created empty and every member is added with ALTER
+	 * EXTENSION ... ADD, which this hook refuses everywhere else.  Only the
+	 * upgrade can reach a server in that mode (it is started with -b by
+	 * pg_upgrade, for a superuser, on a new cluster nobody else is using).
+	 */
+	if (IsBinaryUpgrade)
+		return;
 
 	/* Nothing to protect where the extension is not installed. */
 	extoid = get_extension_oid(KL_EXTENSION_NAME, true);
@@ -1430,6 +1442,39 @@ kl_check_statement(Node *parsetree, const char *queryString)
 							 errmsg("cannot rename a value of enum type \"%s\": a ledger table has a column of this type",
 									format_type_be(typid)),
 							 errhint("The binary form of an enum value is its label, which is part of the row hash.")));
+			}
+			break;
+
+		case T_LockStmt:
+			{
+				LockStmt   *stmt = (LockStmt *) parsetree;
+				ListCell   *rl;
+
+				/*
+				 * pg_maintain may take any lock on any table, ACCESS EXCLUSIVE
+				 * included, and a lock that is held until the transaction ends
+				 * stops the block builder and every reader of the chain.  The
+				 * ledger's own functions run as a superuser, and a superuser can
+				 * stop the server anyway.
+				 */
+				if (stmt->mode <= RowExclusiveLock || superuser())
+					break;
+				foreach(rl, stmt->relations)
+				{
+					relid = kl_rv_relid(lfirst_node(RangeVar, rl), NoLock);
+					/*
+					 * Only a role that the lock would be allowed to: any other gets
+					 * the ordinary "permission denied" from the command itself.
+					 * pg_maintain and pg_write_all_data are such roles.
+					 */
+					if (OidIsValid(relid) &&
+						kl_classify(relid, extoid) == KL_CATALOG_LEDGER &&
+						pg_class_aclmask(relid, GetUserId(),
+										 ACL_UPDATE | ACL_DELETE | ACL_TRUNCATE | ACL_MAINTAIN,
+										 ACLMASK_ANY) != 0)
+						kl_reject("lock with a mode that blocks readers or writers table",
+								  get_rel_name(relid), KL_CATALOG_LEDGER);
+				}
 			}
 			break;
 

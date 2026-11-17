@@ -4,18 +4,873 @@
 -- three functions that read the chain for tile publication,
 -- kingres.ledger_block_preimage, kingres.ledger_head and
 -- kingres.ledger_blocks_entries, and one more check in ledger_verify (a
--- recorded digest that names a missing block).  The result is the same set of objects,
+-- recorded digest that names a missing block), and the SQL of the write guard
+-- (src/guard.c): the function through which the other functions write the
+-- ledger tables, the table ledger_removed and the function ledger_remove_stray,
+-- the guard triggers, the checks of ledger_verify for every recorded digest, for
+-- a block in the future and for a block or transaction with nothing in it, and
+-- the clock limit of ledger_build_block.  The result is the same set of objects,
 -- privileges and protection as installing kingres_ledger--0.3.sql directly;
--- the test t/011_upgrade_0_3.pl compares the two.  No table, block, digest
--- or proof is touched, no entry is written, and hash format 1 is unchanged.
+-- the test t/011_upgrade_0_3.pl compares the two.  No block, digest or proof is
+-- touched, no entry is written, and hash format 1 is unchanged.
 --
 -- Load the new library first (restart the server): the new functions need
--- the 0.3 library.  A 0.3 library works with the 0.2 SQL.
+-- the 0.3 library, and the 0.3 library refuses what the SQL of 0.2 writes (it
+-- says to run this script).
 --
 -- Portions Copyright (c) 2026, RooyeKhat Media Co
 -- SPDX-License-Identifier: AGPL-3.0-only
 
 \echo Use "ALTER EXTENSION kingres_ledger UPDATE TO '0.3'" to load this file. \quit
+
+--------------------------------------------------------------------------
+-- The write guard (src/guard.c)
+--------------------------------------------------------------------------
+-- The library refuses every statement that writes a ledger table unless the
+-- code of the extension writes.  The SQL functions of the extension write
+-- through this function, which raises the marker around one of a fixed list
+-- of statements and nothing else.  Only the owner has EXECUTE, and the hook
+-- refuses every GRANT on it.  Until this script has run, the 0.3 library
+-- refuses the writes of the older functions and says to run ALTER EXTENSION
+-- UPDATE.
+CREATE FUNCTION kingres.ledger_internal_write(op int, VARIADIC args "any")
+    RETURNS bigint
+    AS 'MODULE_PATHNAME', 'kingres_ledger_internal_write'
+    LANGUAGE C VOLATILE
+    SET search_path = pg_catalog, pg_temp;
+COMMENT ON FUNCTION kingres.ledger_internal_write(int, VARIADIC "any") IS
+    'Internal: run one fixed statement that writes a ledger table, with the write guard open; for the functions of the extension only.';
+REVOKE ALL ON FUNCTION kingres.ledger_internal_write(int, VARIADIC "any") FROM PUBLIC;
+
+CREATE FUNCTION kingres.ledger_binary_upgrade() RETURNS boolean
+    AS 'MODULE_PATHNAME', 'kingres_ledger_binary_upgrade'
+    LANGUAGE C STABLE;
+COMMENT ON FUNCTION kingres.ledger_binary_upgrade() IS
+    'True in a server that pg_upgrade started to restore a schema (binary upgrade mode); the event triggers do nothing there.';
+
+
+-- The ProcessUtility hook looks at a statement before it runs, and has to
+-- resolve names to do so; a rename that happens in between could make it look
+-- at another table than the statement changes.  This event trigger looks at
+-- what the statement did, by OID, and raises an error, which rolls the
+-- statement back, when
+--   * a ledger table, one of its columns, or a column of a ledger catalog
+--     table was dropped, whatever dependency path led there (DROP ...
+--     CASCADE included);
+--   * a ledger table is rewritten;
+--   * after any DDL command a ledger table or the ledger catalog is no
+--     longer what ledger_enable made it: a trigger missing, disabled, of the
+--     wrong shape or with another function, a child or parent table, a
+--     partition, rules, an unlogged table, a generated column, a column of a
+--     type that ledger_enable rejects.
+-- SECURITY DEFINER, because it must see the ledger tables whatever the role
+-- that runs the DDL may read, and so that an administrator who tightens the
+-- privileges on the ledger tables cannot make every DDL statement of every
+-- role fail.  It writes nothing.
+CREATE OR REPLACE FUNCTION kingres.ledger_guard() RETURNS event_trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+    d record;
+BEGIN
+    -- pg_upgrade creates the members of the extension one at a time, in a server
+    -- of its own: the event triggers would find each other missing.
+    IF kingres.ledger_binary_upgrade() THEN
+        RETURN;
+    END IF;
+    IF TG_EVENT = 'sql_drop' THEN
+        FOR d IN
+            SELECT o.object_type, o.object_identity
+              FROM pg_catalog.pg_event_trigger_dropped_objects() o
+             WHERE o.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+               AND o.object_type IN ('table', 'table column')
+               AND (EXISTS (SELECT 1 FROM kingres.ledger_table t
+                             WHERE t.relid::pg_catalog.oid = o.objid
+                                OR t.history_relid::pg_catalog.oid = o.objid)
+                    OR (o.object_type = 'table column'
+                        AND kingres.ledger_is_member('pg_catalog.pg_class'::pg_catalog.regclass, o.objid)))
+        LOOP
+            RAISE EXCEPTION 'cannot drop % %: it belongs to a ledger table or to the ledger',
+                d.object_type, d.object_identity
+                USING ERRCODE = 'KL002',
+                      HINT = 'Ledger tables are append-only; the ledger can only be switched off outside the database. A DROP ... CASCADE that reaches a column or a table of the ledger is rejected.';
+        END LOOP;
+    ELSIF TG_EVENT = 'table_rewrite' THEN
+        IF EXISTS (SELECT 1 FROM kingres.ledger_table t
+                    WHERE t.relid::pg_catalog.oid = pg_catalog.pg_event_trigger_table_rewrite_oid()
+                       OR t.history_relid::pg_catalog.oid = pg_catalog.pg_event_trigger_table_rewrite_oid())
+           OR kingres.ledger_is_member('pg_catalog.pg_class'::pg_catalog.regclass,
+                                        pg_catalog.pg_event_trigger_table_rewrite_oid()) THEN
+            RAISE EXCEPTION 'cannot rewrite table %: it is a ledger table or part of the ledger',
+                pg_event_trigger_table_rewrite_oid()::pg_catalog.regclass
+                USING ERRCODE = 'KL002',
+                      HINT = 'A rewrite changes how the rows are stored; the ledger tables cannot be rewritten by ALTER TABLE.';
+        END IF;
+    ELSE
+        -- ADD COLUMN on an updatable table: the history table follows it, in
+        -- the same transaction and before the checks below.
+        FOR d IN
+            SELECT t.relid::pg_catalog.oid AS relid, t.history_relid::pg_catalog.oid AS hist
+              FROM kingres.ledger_table t
+             WHERE t.history_relid IS NOT NULL
+               AND EXISTS (SELECT 1 FROM pg_catalog.pg_event_trigger_ddl_commands() c
+                            WHERE c.command_tag = 'ALTER TABLE'
+                              AND c.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                              AND c.objid = t.relid::pg_catalog.oid)
+        LOOP
+            PERFORM kingres.ledger_history_sync(d.relid::pg_catalog.regclass,
+                                                d.hist::pg_catalog.regclass);
+        END LOOP;
+        -- The privileges on every history table follow the owner of its
+        -- table (ALTER TABLE ... OWNER TO, REASSIGN OWNED, GRANT ... ON ALL
+        -- TABLES IN SCHEMA); a table that is already right costs a cache
+        -- lookup.
+        FOR d IN
+            SELECT t.relid::pg_catalog.oid AS relid, t.history_relid::pg_catalog.oid AS hist
+              FROM kingres.ledger_table t
+             WHERE t.history_relid IS NOT NULL
+        LOOP
+            PERFORM kingres.ledger_history_acl_sync(d.relid::pg_catalog.regclass,
+                                                    d.hist::pg_catalog.regclass);
+        END LOOP;
+        FOR d IN SELECT x.check_name, x.object, x.detail
+                   FROM kingres.ledger_all_defects() x LIMIT 1
+        LOOP
+            RAISE EXCEPTION 'the statement leaves the ledger broken (%: %: %)',
+                d.check_name, d.object, d.detail
+                USING ERRCODE = 'KL002',
+                      HINT = 'Ledger tables are append-only; the statement was rolled back.';
+        END LOOP;
+    END IF;
+END
+$fn$;
+COMMENT ON FUNCTION kingres.ledger_guard() IS
+    'Event trigger function: rejects, at the point of action, every statement that drops, rewrites or breaks a ledger table or the ledger.';
+
+--------------------------------------------------------------------------
+-- The record of what an operator removed (0.3)
+--------------------------------------------------------------------------
+
+-- The rows that an operator took out of the ledger with ledger_remove_stray,
+-- as they were, with who did it, when and why.  Append-only like the others;
+-- ledger_verify reports every row of it (operator_removal) for as long as it
+-- exists, so a removal is never silent.  Not readable by PUBLIC: the rows are
+-- copies of ledger rows.
+CREATE TABLE kingres.ledger_removed (
+    removal_id   bigint GENERATED ALWAYS AS IDENTITY,
+    removed_at   timestamptz NOT NULL,
+    removed_by   name        NOT NULL,
+    reason       text        NOT NULL,
+    source_table name        NOT NULL,
+    row_data     jsonb       NOT NULL,
+    CONSTRAINT ledger_removed_pkey PRIMARY KEY (removal_id),
+    CONSTRAINT ledger_removed_source_check
+        CHECK (source_table IN ('ledger_tx', 'ledger_digest'))
+);
+COMMENT ON TABLE kingres.ledger_removed IS
+    'Rows that an operator removed from the ledger tables with ledger_remove_stray, as they were; append-only, and reported by ledger_verify as operator_removal.';
+REVOKE ALL ON kingres.ledger_removed FROM PUBLIC;
+
+CREATE TRIGGER kingres_ledger_block_modify
+    BEFORE UPDATE OR DELETE ON kingres.ledger_removed
+    FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify();
+CREATE TRIGGER kingres_ledger_block_truncate
+    BEFORE TRUNCATE ON kingres.ledger_removed
+    FOR EACH STATEMENT EXECUTE FUNCTION kingres.ledger_block_modify();
+ALTER TABLE kingres.ledger_removed ENABLE ALWAYS TRIGGER kingres_ledger_block_modify;
+ALTER TABLE kingres.ledger_removed ENABLE ALWAYS TRIGGER kingres_ledger_block_truncate;
+
+-- The guard trigger (src/guard.c).  The ledger tables take an insert, and the
+-- queue a delete, only from the code of the extension.  The executor hook
+-- refuses every other statement before a row is built; this trigger is for the
+-- writers that never reach it: the logical replication apply worker and the
+-- table synchronisation worker.  ENABLE ALWAYS, like the others, so that
+-- session_replication_role = replica does not skip it.
+CREATE TRIGGER kingres_ledger_guard_write
+    BEFORE INSERT ON kingres.ledger_table
+    FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify();
+CREATE TRIGGER kingres_ledger_guard_write
+    BEFORE INSERT ON kingres.ledger_chain
+    FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify();
+CREATE TRIGGER kingres_ledger_guard_write
+    BEFORE INSERT ON kingres.ledger_entry
+    FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify();
+CREATE TRIGGER kingres_ledger_guard_write
+    BEFORE INSERT ON kingres.ledger_tx
+    FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify();
+CREATE TRIGGER kingres_ledger_guard_write
+    BEFORE INSERT ON kingres.ledger_blocks
+    FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify();
+CREATE TRIGGER kingres_ledger_guard_write
+    BEFORE INSERT ON kingres.ledger_digest
+    FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify();
+CREATE TRIGGER kingres_ledger_guard_write
+    BEFORE INSERT ON kingres.ledger_verification
+    FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify();
+CREATE TRIGGER kingres_ledger_guard_write
+    BEFORE INSERT ON kingres.ledger_removed
+    FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify();
+CREATE TRIGGER kingres_ledger_guard_write
+    BEFORE INSERT OR DELETE ON kingres.ledger_pending
+    FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify();
+ALTER TABLE kingres.ledger_table ENABLE ALWAYS TRIGGER kingres_ledger_guard_write;
+ALTER TABLE kingres.ledger_chain ENABLE ALWAYS TRIGGER kingres_ledger_guard_write;
+ALTER TABLE kingres.ledger_entry ENABLE ALWAYS TRIGGER kingres_ledger_guard_write;
+ALTER TABLE kingres.ledger_pending ENABLE ALWAYS TRIGGER kingres_ledger_guard_write;
+ALTER TABLE kingres.ledger_tx ENABLE ALWAYS TRIGGER kingres_ledger_guard_write;
+ALTER TABLE kingres.ledger_blocks ENABLE ALWAYS TRIGGER kingres_ledger_guard_write;
+ALTER TABLE kingres.ledger_digest ENABLE ALWAYS TRIGGER kingres_ledger_guard_write;
+ALTER TABLE kingres.ledger_verification ENABLE ALWAYS TRIGGER kingres_ledger_guard_write;
+ALTER TABLE kingres.ledger_removed ENABLE ALWAYS TRIGGER kingres_ledger_guard_write;
+
+
+-- The problems of the ledger catalog tables and of the event triggers that
+-- guard everything: the append-only triggers, no children, rules, policies
+-- or row security, no foreign triggers.  The object is reported as
+-- kingres.<table>.
+CREATE OR REPLACE FUNCTION kingres.ledger_catalog_defects()
+    RETURNS TABLE (check_name text, object text, detail text)
+    LANGUAGE plpgsql STABLE
+    SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+    v_spec record;
+    v_oid  oid;
+    v_rel  pg_catalog.pg_class%ROWTYPE;
+    v_evt  text;
+BEGIN
+    -- (table, trigger type of kingres_ledger_block_modify)
+    FOR v_spec IN
+        SELECT s.tbl, s.modtype, s.guardtype
+          FROM (VALUES ('ledger_table', 27, 7), ('ledger_chain', 27, 7),
+                       ('ledger_entry', 27, 7), ('ledger_pending', 19, 15),
+                       ('ledger_tx', 27, 7), ('ledger_blocks', 27, 7),
+                       ('ledger_digest', 27, 7), ('ledger_verification', 27, 7),
+                       ('ledger_removed', 27, 7)) AS s(tbl, modtype, guardtype)
+    LOOP
+        v_oid := pg_catalog.to_regclass(pg_catalog.format('kingres.%I', v_spec.tbl))::pg_catalog.oid;
+        IF v_oid IS NULL
+           OR NOT kingres.ledger_is_member('pg_catalog.pg_class'::pg_catalog.regclass, v_oid) THEN
+            RETURN QUERY SELECT 'table_missing'::text, 'kingres.' || v_spec.tbl,
+                'the table of the ledger is missing or is not a member of the extension';
+            CONTINUE;
+        END IF;
+        SELECT k.* INTO v_rel FROM pg_catalog.pg_class k WHERE k.oid = v_oid;
+        IF v_rel.relkind <> 'r' OR v_rel.relpersistence <> 'p' THEN
+            RETURN QUERY SELECT 'table_state'::text, 'kingres.' || v_spec.tbl,
+                'the table is not a permanent ordinary table';
+        END IF;
+        IF v_rel.relrowsecurity OR v_rel.relforcerowsecurity
+           OR EXISTS (SELECT 1 FROM pg_catalog.pg_policy p WHERE p.polrelid = v_oid) THEN
+            RETURN QUERY SELECT 'table_state'::text, 'kingres.' || v_spec.tbl,
+                'the table has row security or policies';
+        END IF;
+        IF v_rel.relispartition
+           OR EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i
+                       WHERE i.inhrelid = v_oid OR i.inhparent = v_oid) THEN
+            RETURN QUERY SELECT 'inheritance'::text, 'kingres.' || v_spec.tbl,
+                'the table takes part in inheritance or partitioning';
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite r WHERE r.ev_class = v_oid) THEN
+            RETURN QUERY SELECT 'table_state'::text, 'kingres.' || v_spec.tbl,
+                'the table has rules';
+        END IF;
+        IF NOT kingres.ledger_trigger_ok(v_oid, 'kingres_ledger_block_modify',
+                   'kingres_ledger_block_modify', false, v_spec.modtype, NULL) THEN
+            RETURN QUERY SELECT 'trigger'::text, 'kingres.' || v_spec.tbl,
+                'trigger kingres_ledger_block_modify is missing, disabled or not ENABLE ALWAYS';
+        END IF;
+        IF NOT kingres.ledger_trigger_ok(v_oid, 'kingres_ledger_block_truncate',
+                   'kingres_ledger_block_modify', false, 34, NULL) THEN
+            RETURN QUERY SELECT 'trigger'::text, 'kingres.' || v_spec.tbl,
+                'trigger kingres_ledger_block_truncate is missing, disabled or not ENABLE ALWAYS';
+        END IF;
+        IF NOT kingres.ledger_trigger_ok(v_oid, 'kingres_ledger_guard_write',
+                   'kingres_ledger_block_modify', false, v_spec.guardtype, NULL) THEN
+            RETURN QUERY SELECT 'trigger'::text, 'kingres.' || v_spec.tbl,
+                'trigger kingres_ledger_guard_write is missing, disabled or not ENABLE ALWAYS';
+        END IF;
+        RETURN QUERY
+        SELECT 'trigger'::text, 'kingres.' || v_spec.tbl,
+               'unexpected trigger ' || g.tgname
+          FROM pg_catalog.pg_trigger g
+         WHERE g.tgrelid = v_oid AND NOT g.tgisinternal
+           AND NOT kingres.ledger_is_member('pg_catalog.pg_proc'::pg_catalog.regclass, g.tgfoid);
+    END LOOP;
+
+    -- The event triggers that enforce the rules at the point of action.
+    FOREACH v_evt IN ARRAY ARRAY['ddl_command_end', 'sql_drop', 'table_rewrite']
+    LOOP
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_event_trigger e
+             WHERE e.evtevent = v_evt AND e.evtenabled = 'A' AND e.evttags IS NULL
+               AND kingres.ledger_is_member('pg_catalog.pg_event_trigger'::pg_catalog.regclass, e.oid)
+               AND kingres.ledger_is_member('pg_catalog.pg_proc'::pg_catalog.regclass, e.evtfoid)) THEN
+            RETURN QUERY SELECT 'event_trigger'::text, 'event ' || v_evt,
+                'the event trigger of the extension is missing, disabled or not ENABLE ALWAYS';
+        END IF;
+    END LOOP;
+END
+$fn$;
+COMMENT ON FUNCTION kingres.ledger_catalog_defects() IS
+    'The problems of the ledger catalog tables and of the event triggers of the extension.';
+
+-- The way out for a row that stops ledger_head and that no honest write
+-- leaves (README, "A row above the head"): a transaction row that names a block
+-- above the head (the end of the chain was removed), and a recorded digest that
+-- names a block that is not there or another hash than the block has.  What it
+-- removes it first copies into kingres.ledger_removed, as it was; the
+-- transactions of the removed blocks are queued again (their entries are still
+-- there), so the next block is built from them and no entry is left without a
+-- block.  It is an act of a superuser who asked for it: the session must have
+-- kingres_ledger.allow_manual_write on, and the caller must be a superuser
+-- (a superuser acting as another role is not).  No trigger is switched off and
+-- no other session is affected: the setting is the only thing that opens the
+-- tables, for this session.
+--
+-- SECURITY DEFINER only so that the owner's search_path and the table lock are
+-- the same whoever the superuser is; the checks below are on the caller.
+CREATE OR REPLACE FUNCTION kingres.ledger_remove_stray(reason text) RETURNS bigint
+    LANGUAGE plpgsql
+    SECURITY DEFINER
+    SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+    who    name := kingres.ledger_outer_user();
+    head   bigint;
+    n_tx   bigint;
+    n_dg   bigint;
+    ts     timestamptz := pg_catalog.clock_timestamp();
+BEGIN
+    IF reason IS NULL OR pg_catalog.btrim(reason) = '' THEN
+        RAISE EXCEPTION 'say why the rows are removed' USING ERRCODE = '22004';
+    END IF;
+    IF NOT COALESCE((SELECT r.rolsuper FROM pg_catalog.pg_roles r WHERE r.rolname = who), false) THEN
+        RAISE EXCEPTION 'only a superuser can remove rows of the ledger tables'
+            USING ERRCODE = '42501';
+    END IF;
+    IF pg_catalog.current_setting('kingres_ledger.allow_manual_write') <> 'on' THEN
+        RAISE EXCEPTION 'removing rows of the ledger tables is a manual write'
+            USING ERRCODE = '42501',
+                  HINT = 'Run SET kingres_ledger.allow_manual_write = on in this session first.';
+    END IF;
+
+    -- No builder runs while the rows are taken out.
+    LOCK TABLE kingres.ledger_chain IN EXCLUSIVE MODE;
+    SELECT COALESCE(pg_catalog.max(b.height), -1) INTO head FROM kingres.ledger_blocks b;
+
+    INSERT INTO kingres.ledger_removed (removed_at, removed_by, reason, source_table, row_data)
+    SELECT ts, who, reason, 'ledger_tx', pg_catalog.to_jsonb(t)
+      FROM kingres.ledger_tx t WHERE t.block_height > head
+     ORDER BY t.ledger_txid;
+    GET DIAGNOSTICS n_tx = ROW_COUNT;
+    INSERT INTO kingres.ledger_pending (ledger_txid, user_name)
+    SELECT t.ledger_txid, t.user_name
+      FROM kingres.ledger_tx t
+     WHERE t.block_height > head
+       AND EXISTS (SELECT 1 FROM kingres.ledger_entry e WHERE e.ledger_txid = t.ledger_txid)
+       AND NOT EXISTS (SELECT 1 FROM kingres.ledger_pending p WHERE p.ledger_txid = t.ledger_txid);
+    DELETE FROM kingres.ledger_tx t WHERE t.block_height > head;
+
+    INSERT INTO kingres.ledger_removed (removed_at, removed_by, reason, source_table, row_data)
+    SELECT ts, who, reason, 'ledger_digest', pg_catalog.to_jsonb(d)
+      FROM kingres.ledger_digest d
+     WHERE NOT EXISTS (SELECT 1 FROM kingres.ledger_blocks b
+                        WHERE b.height = d.height AND b.block_hash = d.block_hash)
+     ORDER BY d.digest_id;
+    GET DIAGNOSTICS n_dg = ROW_COUNT;
+    DELETE FROM kingres.ledger_digest d
+     WHERE NOT EXISTS (SELECT 1 FROM kingres.ledger_blocks b
+                        WHERE b.height = d.height AND b.block_hash = d.block_hash);
+    RETURN n_tx + n_dg;
+END
+$fn$;
+COMMENT ON FUNCTION kingres.ledger_remove_stray(text) IS
+    'Superuser, with kingres_ledger.allow_manual_write on in the session: copy to ledger_removed and remove the transaction rows above the head (their transactions are queued again) and the recorded digests that name a missing block or another hash; returns the number of rows removed.';
+
+-- Runs ledger_verify and records the run in kingres.ledger_verification;
+-- returns the id of the record.  The record is written when the run is over:
+-- PostgreSQL has no autonomous transaction, so a "running" row that survives
+-- a failure of the caller's transaction cannot be written (the table allows
+-- the state, but nothing writes it, because the table is append-only).  A
+-- failure of ledger_verify itself is caught and recorded with the state
+-- 'failed' and the error message; the function then returns normally and
+-- warns.  If the caller's own transaction rolls back, the record is gone with
+-- it.  blocks_checked is the number of blocks in the range; rows_checked the
+-- number of ledger entries of the transactions in those blocks.  The
+-- problems are the rows of ledger_verify, at most 100 of them (the count is
+-- exact).
+--
+-- SECURITY DEFINER because it writes kingres.ledger_verification, which no
+-- other role may write; the caller needs EXECUTE only, which PUBLIC does not
+-- have.  started_by is the role that called it.
+CREATE OR REPLACE FUNCTION kingres.ledger_verify_recorded(from_height bigint DEFAULT 0,
+                                                to_height bigint DEFAULT NULL)
+    RETURNS bigint
+    LANGUAGE plpgsql
+    SECURITY DEFINER
+    SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+    max_problems constant int := 100;
+    started   timestamptz := pg_catalog.clock_timestamp();
+    who       name := kingres.ledger_outer_user();
+    lo        bigint := COALESCE(from_height, 0);
+    hi        bigint;
+    n_problems int;
+    n_blocks  bigint;
+    n_rows    bigint;
+    probs     jsonb;
+    vid       bigint;
+    err_text  text;
+    err_state text;
+BEGIN
+    IF lo < 0 OR (to_height IS NOT NULL AND to_height < lo) THEN
+        RAISE EXCEPTION 'invalid height range % .. %', from_height, to_height
+            USING ERRCODE = '22023';
+    END IF;
+    SELECT COALESCE(to_height, pg_catalog.max(b.height), -1) INTO hi
+      FROM kingres.ledger_blocks b;
+
+    BEGIN
+        SELECT pg_catalog.count(*)::int,
+               COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+                            'check', p.check_name, 'object', p.object, 'detail', p.detail))
+                        FILTER (WHERE p.rn <= max_problems), '[]'::jsonb)
+          INTO n_problems, probs
+          FROM (SELECT v.check_name, v.object, v.detail,
+                       pg_catalog.row_number() OVER () AS rn
+                  FROM kingres.ledger_verify(from_height, to_height) v) p;
+        SELECT pg_catalog.count(*) INTO n_blocks
+          FROM kingres.ledger_blocks b WHERE b.height BETWEEN lo AND hi;
+        SELECT COALESCE(pg_catalog.sum(t.entry_count), 0) INTO n_rows
+          FROM kingres.ledger_tx t WHERE t.block_height BETWEEN lo AND hi;
+        vid := kingres.ledger_internal_write(6, started, who, lo, hi,
+                CASE WHEN n_problems = 0 THEN 'clean' ELSE 'problems' END,
+                n_problems, n_blocks, n_rows,
+                CASE WHEN n_problems = 0 THEN NULL ELSE probs END);
+    -- A run that was cancelled (statement_timeout, pg_cancel_backend, Ctrl-C)
+    -- is recorded as failed too: OTHERS does not catch query_canceled.  What
+    -- cannot be recorded: a run that ends the session (pg_terminate_backend,
+    -- transaction_timeout, a crash, a lost connection) and a run whose
+    -- calling transaction rolls back.
+    EXCEPTION
+        WHEN query_canceled THEN
+            err_text := SQLERRM;
+            err_state := SQLSTATE;
+        WHEN OTHERS THEN
+            err_text := SQLERRM;
+            err_state := SQLSTATE;
+    END;
+    IF err_state IS NOT NULL THEN
+        vid := kingres.ledger_internal_write(7, started, who, lo, hi,
+                pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
+                    'check', 'verification_failed', 'object', NULL::pg_catalog.text,
+                    'detail', pg_catalog.left(err_text, 1000), 'sqlstate', err_state)));
+        RAISE WARNING 'ledger verification % failed: %', vid, err_text;
+    END IF;
+    RETURN vid;
+END
+$fn$;
+COMMENT ON FUNCTION kingres.ledger_verify_recorded(bigint, bigint) IS
+    'Run ledger_verify and record the run (state, counts, the first 100 problems) in kingres.ledger_verification; returns the id. A failure of the verification itself is recorded as state failed. Not executable by PUBLIC.';
+
+-- SECURITY DEFINER because it calls the block builder and reads the ledger.
+CREATE OR REPLACE FUNCTION kingres.ledger_generate_digest() RETURNS jsonb
+    LANGUAGE plpgsql
+    SECURITY DEFINER
+    SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+    b     kingres.ledger_blocks%ROWTYPE;
+    chain bytea;
+    dig   jsonb;
+BEGIN
+    PERFORM kingres.ledger_build_block();
+    SELECT * INTO b FROM kingres.ledger_blocks lb ORDER BY lb.height DESC LIMIT 1;
+    IF NOT FOUND THEN
+        RETURN NULL;
+    END IF;
+    SELECT c.chain_id INTO chain FROM kingres.ledger_chain c;
+    dig := pg_catalog.jsonb_build_object(
+        'database', pg_catalog.current_database(),
+        'chain_id', pg_catalog.encode(chain, 'hex'),
+        'hash_version', b.hash_version,
+        'height', b.height,
+        'block_hash', pg_catalog.encode(b.block_hash, 'hex'),
+        'block_closed_at', pg_catalog.to_char(b.closed_at AT TIME ZONE 'UTC',
+                                              'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+        'generated_at', pg_catalog.to_char(pg_catalog.clock_timestamp() AT TIME ZONE 'UTC',
+                                           'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
+    -- A convenience record, not a root of trust.
+    PERFORM kingres.ledger_internal_write(5,
+            (dig ->> 'generated_at')::pg_catalog.timestamptz, kingres.ledger_outer_user(),
+            b.height, b.block_hash, dig);
+    RETURN dig;
+END
+$fn$;
+COMMENT ON FUNCTION kingres.ledger_generate_digest() IS
+    'Close a block if needed, record and return the digest (chain identity, height and block hash) of the latest block as JSON; NULL when the ledger is empty (nothing is recorded then).';
+
+-- Closes a block from the pending transactions.  Only one builder runs at a
+-- time: they serialise on a table lock on kingres.ledger_chain, which only
+-- the extension owner can take (the lock mode conflicts with every writer,
+-- and no other role has a privilege that allows it); an advisory lock would
+-- be available to every role, which could then stop all block building.
+-- READ COMMITTED is required: the builder must see the block written by the
+-- previous builder, which a REPEATABLE READ snapshot taken earlier would not.
+--
+-- SECURITY DEFINER because it writes the ledger tables, which no other role
+-- may write.
+CREATE OR REPLACE FUNCTION kingres.ledger_build_block() RETURNS bigint
+    LANGUAGE plpgsql
+    SECURITY DEFINER
+    SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+    max_tx   int;
+    txids    bigint[];
+    h        bigint;
+    prev     bytea;
+    prev_at  timestamptz;
+    chain    bytea;
+    txroot   bytea;
+    n        int;
+    closed   timestamptz;
+    bh       bytea;
+    skew     bigint;
+BEGIN
+    IF pg_catalog.current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'ledger_build_block requires the READ COMMITTED isolation level'
+            USING ERRCODE = '0A000';
+    END IF;
+
+    LOCK TABLE kingres.ledger_chain IN EXCLUSIVE MODE;
+
+    max_tx := pg_catalog.current_setting('kingres_ledger.max_block_transactions')::int;
+
+    -- Pending transactions are committed ones: their pending row became
+    -- visible together with their entries.
+    SELECT pg_catalog.array_agg(p.ledger_txid ORDER BY p.ledger_txid)
+      INTO txids
+      FROM (SELECT lp.ledger_txid
+              FROM kingres.ledger_pending lp
+             ORDER BY lp.ledger_txid
+             LIMIT max_tx) p;
+    IF txids IS NULL THEN
+        RETURN NULL;
+    END IF;
+
+    SELECT c.chain_id INTO chain FROM kingres.ledger_chain c;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'the identity of the chain is missing'
+            USING ERRCODE = 'XX001', HINT = 'Run kingres.ledger_verify().';
+    END IF;
+
+    SELECT b.height + 1, b.block_hash, b.closed_at INTO h, prev, prev_at
+      FROM kingres.ledger_blocks b ORDER BY b.height DESC LIMIT 1;
+    IF NOT FOUND THEN
+        h := 0;
+        prev := kingres.ledger_genesis_hash(chain);
+        prev_at := NULL;
+    END IF;
+
+    -- The writes of a block (the transaction rows, the block, the end of the
+    -- queue) go through the one function that may write the ledger tables:
+    -- ops 2, 3 and 4 of kingres.ledger_internal_write.
+    PERFORM kingres.ledger_internal_write(2, h, txids);
+
+    SELECT pg_catalog.count(*)::int,
+           kingres.ledger_merkle_root(
+               kingres.ledger_block_tx_leaf(t.ledger_txid, t.entry_count, t.merkle_root, t.user_name)
+               ORDER BY t.tx_index)
+      INTO n, txroot
+      FROM kingres.ledger_tx t
+     WHERE t.block_height = h;
+
+    -- The time of a block is the server's clock, but it never goes back (the
+    -- verifier and ledger_verify require it): a clock that was set back a
+    -- little, or a standby promoted with a clock that is behind, gives the time
+    -- of the previous block.  A previous block that is far ahead of the clock
+    -- is not that: every block after it would carry its time, for ever.  The
+    -- builder refuses (nothing is lost, the transactions stay pending) until a
+    -- superuser who has looked at the clock sets kingres_ledger.max_clock_skew
+    -- to 0; ledger_verify keeps reporting the block that is ahead of the
+    -- clock whatever the setting is.
+    closed := pg_catalog.clock_timestamp();
+    IF prev_at IS NOT NULL AND closed < prev_at THEN
+        skew := (SELECT s.setting::pg_catalog.int8 FROM pg_catalog.pg_settings s
+                  WHERE s.name = 'kingres_ledger.max_clock_skew');
+        IF skew > 0 AND prev_at - closed > skew * interval '1 millisecond' THEN
+            RAISE EXCEPTION 'block % was closed at %, which is ahead of the clock of this server by more than kingres_ledger.max_clock_skew',
+                h - 1, prev_at
+                USING ERRCODE = 'KL004',
+                      DETAIL = pg_catalog.format('The clock of this server reads %s.', closed),
+                      HINT = 'Check the clock of the server. Every later block would carry the time of that block. A superuser who has checked it can set kingres_ledger.max_clock_skew to 0; ledger_verify keeps reporting the block.';
+        END IF;
+        closed := prev_at;
+    END IF;
+    bh := kingres.ledger_block_hash(1::smallint, h, prev, txroot, n, closed);
+
+    PERFORM kingres.ledger_internal_write(3, h, prev, txroot, n, closed, bh);
+    PERFORM kingres.ledger_internal_write(4, txids);
+    RETURN h;
+END
+$fn$;
+COMMENT ON FUNCTION kingres.ledger_build_block() IS
+    'Close a block from the pending transactions; returns the new height, or NULL when nothing was pending.';
+
+-- ledger_enable is SECURITY DEFINER because it writes the ledger tables and
+-- creates triggers on a table that the ledger owner does not own; it
+-- therefore checks by hand that the role that called it owns the table.  It
+-- is not executable by PUBLIC: putting a table under ledger control cannot be
+-- undone, so it is an administrative decision.  The administrator grants
+--   GRANT EXECUTE ON FUNCTION kingres.ledger_enable(regclass, text) TO role;
+-- to the roles that may make that decision for the tables they own.
+--
+-- The table is locked first, by OID, and everything after that works from
+-- the OID.  The statement runs in READ COMMITTED, so each statement sees
+-- every row that was committed before the lock was granted.  The triggers are
+-- created and armed first and the table is registered last, so that the
+-- event trigger, which checks every registered table, never sees a table
+-- that is half set up; the hook treats the table as protected from the
+-- moment its capture trigger is ENABLE ALWAYS.
+CREATE OR REPLACE FUNCTION kingres.ledger_enable(relation regclass,
+                                       mode text DEFAULT 'append_only')
+    RETURNS void
+    LANGUAGE plpgsql
+    SECURITY DEFINER
+    SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+    rel   pg_catalog.pg_class%ROWTYPE;
+    nsp   text;
+    col   record;
+    prob  text;
+    tid   int;
+    supr  boolean;
+    hname text;
+    hcols text;
+    hid   oid;
+    old_mode text;
+    owner_name name;
+BEGIN
+    IF NOT kingres.ledger_hook_active() THEN
+        RAISE EXCEPTION 'kingres_ledger must be loaded through shared_preload_libraries'
+            USING ERRCODE = 'KL003',
+                  DETAIL = 'Without the library loaded at server start nothing stops a privileged user from switching the ledger off.',
+                  HINT = 'Add kingres_ledger to shared_preload_libraries and restart the server.';
+    END IF;
+    IF relation IS NULL THEN
+        RAISE EXCEPTION 'relation must not be NULL' USING ERRCODE = '22004';
+    END IF;
+    IF mode IS DISTINCT FROM 'append_only' AND mode IS DISTINCT FROM 'updatable' THEN
+        RAISE EXCEPTION 'ledger mode "%" is not supported yet', mode
+            USING ERRCODE = '0A000',
+                  HINT = 'The modes are "append_only" and "updatable".';
+    END IF;
+    IF pg_catalog.current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'ledger_enable requires the READ COMMITTED isolation level'
+            USING ERRCODE = '0A000',
+                  DETAIL = 'A snapshot taken before the table was locked would not show every committed row, and the rows it misses could never be entered.';
+    END IF;
+    SELECT r.rolsuper INTO supr FROM pg_catalog.pg_roles r WHERE r.rolname = current_user;
+    IF NOT COALESCE(supr, false) THEN
+        RAISE EXCEPTION 'the owner of the kingres_ledger extension must be a superuser'
+            USING ERRCODE = '42501',
+                  DETAIL = 'ledger_enable creates triggers on tables owned by other roles.';
+    END IF;
+    IF relation::pg_catalog.oid < 16384 THEN
+        RAISE EXCEPTION 'table "%" is in a system schema and cannot be a ledger table', relation::pg_catalog.text
+            USING ERRCODE = '0A000';
+    END IF;
+
+    -- Own the table (checked for the calling role) and lock it, by OID,
+    -- before anything is read: concurrent writers wait, rows inserted before
+    -- this point are entered below, rows inserted after it are captured by
+    -- the trigger.
+    PERFORM kingres.ledger_lock_table(relation);
+
+    SELECT c.* INTO rel FROM pg_catalog.pg_class c WHERE c.oid = relation;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'relation with OID % does not exist', relation::pg_catalog.oid
+            USING ERRCODE = '42P01';
+    END IF;
+    SELECT n.nspname INTO nsp FROM pg_catalog.pg_namespace n WHERE n.oid = rel.relnamespace;
+
+    IF rel.relkind = 'p' THEN
+        RAISE EXCEPTION 'partitioned table "%" cannot be a ledger table yet', rel.relname
+            USING ERRCODE = '0A000';
+    END IF;
+    IF rel.relkind <> 'r' THEN
+        RAISE EXCEPTION '"%" is not an ordinary table', rel.relname
+            USING ERRCODE = '42809';
+    END IF;
+    IF rel.relpersistence <> 'p' THEN
+        RAISE EXCEPTION 'temporary and unlogged table "%" cannot be a ledger table', rel.relname
+            USING ERRCODE = '0A000';
+    END IF;
+    IF nsp = 'kingres' THEN
+        -- A role named like the schema puts it first in the default
+        -- search_path, so this is easy to hit by accident.
+        RAISE EXCEPTION 'table "%" is in schema "kingres", which is reserved for KingresDB objects', rel.relname
+            USING ERRCODE = '0A000',
+                  HINT = 'Create the table in another schema, or schema-qualify its name.';
+    END IF;
+    IF nsp = 'information_schema' OR nsp LIKE 'pg!_%' ESCAPE '!' THEN
+        RAISE EXCEPTION 'table "%" is in a system schema and cannot be a ledger table', rel.relname
+            USING ERRCODE = '0A000';
+    END IF;
+    IF rel.relispartition OR rel.relhassubclass
+       OR EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i
+                   WHERE i.inhrelid = rel.oid OR i.inhparent = rel.oid) THEN
+        RAISE EXCEPTION 'table "%" takes part in inheritance and cannot be a ledger table yet', rel.relname
+            USING ERRCODE = '0A000';
+    END IF;
+    IF rel.relhasrules OR EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite r WHERE r.ev_class = rel.oid) THEN
+        RAISE EXCEPTION 'table "%" has rules and cannot be a ledger table yet', rel.relname
+            USING ERRCODE = '0A000';
+    END IF;
+
+    -- Every column must be hashable in a stable way.  Generated columns,
+    -- stored or virtual, are rejected: the value of a virtual column is not
+    -- stored (a whole-row value expands it, a stored tuple does not), and a
+    -- stored one depends on an expression that a dependency cascade or a
+    -- later ALTER can drop, which would silently drop the column and change
+    -- every hash.
+    FOR col IN
+        SELECT a.attname, a.atttypid, a.attgenerated
+        FROM pg_catalog.pg_attribute a
+        WHERE a.attrelid = rel.oid AND a.attnum > 0 AND NOT a.attisdropped
+        ORDER BY a.attnum
+    LOOP
+        IF col.attgenerated <> '' THEN
+            RAISE EXCEPTION 'column "%" is a generated column, which is not supported', col.attname
+                USING ERRCODE = '0A000';
+        END IF;
+        prob := kingres.ledger_type_problem(col.atttypid);
+        IF prob IS NOT NULL THEN
+            RAISE EXCEPTION 'column "%" %', col.attname, prob
+                USING ERRCODE = '0A000';
+        END IF;
+    END LOOP;
+
+    SELECT lt.mode INTO old_mode FROM kingres.ledger_table lt WHERE lt.relid = rel.oid;
+    IF FOUND THEN
+        IF old_mode <> mode THEN
+            RAISE EXCEPTION 'table "%" is a ledger table of mode "%"; converting it to "%" is not supported yet',
+                rel.relname, old_mode, mode
+                USING ERRCODE = '0A000',
+                      HINT = 'The mode of a ledger table is permanent.';
+        END IF;
+        RAISE EXCEPTION 'table "%" is already under ledger control', rel.relname
+            USING ERRCODE = '42710';
+    END IF;
+
+    IF mode = 'updatable' THEN
+        -- The history table has three columns of its own, so the table must
+        -- not use their names, and its name must fit.
+        FOR col IN
+            SELECT a.attname FROM pg_catalog.pg_attribute a
+             WHERE a.attrelid = rel.oid AND a.attnum > 0 AND NOT a.attisdropped
+               AND a.attname IN ('ledger_txid', 'ledger_seq', 'ledger_op')
+        LOOP
+            RAISE EXCEPTION 'column "%" of table "%" has the name of a column of the history table', col.attname, rel.relname
+                USING ERRCODE = '0A000',
+                      HINT = 'Rename the column before putting the table under ledger control in mode "updatable".';
+        END LOOP;
+        hname := rel.relname || '_ledger_history';
+        IF pg_catalog.octet_length(hname) > 63 THEN
+            RAISE EXCEPTION 'the name of the history table of "%" would be longer than 63 bytes', rel.relname
+                USING ERRCODE = '0A000',
+                      HINT = 'Rename the table to a shorter name.';
+        END IF;
+        IF pg_catalog.to_regclass(pg_catalog.format('%I.%I', nsp, hname)) IS NOT NULL THEN
+            RAISE EXCEPTION 'relation "%" already exists', hname
+                USING ERRCODE = '42P07';
+        END IF;
+    END IF;
+
+    tid := pg_catalog.nextval(
+        pg_catalog.pg_get_serial_sequence('kingres.ledger_table', 'table_id')::pg_catalog.regclass)::int;
+
+    IF mode = 'updatable' THEN
+        -- The history table: the columns of the table (names and types, in
+        -- order), no constraints, no defaults, no identity, and the three
+        -- columns of its own.  It belongs to the extension owner; the owner
+        -- of the table may read it.
+        SELECT pg_catalog.string_agg(
+                   pg_catalog.format('%I %s', a.attname,
+                                     pg_catalog.format_type(a.atttypid, a.atttypmod)),
+                   ', ' ORDER BY a.attnum)
+          INTO hcols
+          FROM pg_catalog.pg_attribute a
+         WHERE a.attrelid = rel.oid AND a.attnum > 0 AND NOT a.attisdropped;
+        EXECUTE pg_catalog.format(
+            'CREATE TABLE %I.%I (%s, ledger_txid bigint, ledger_seq integer, ledger_op "char") USING heap',
+            nsp, hname, hcols);
+        SELECT c.oid INTO hid FROM pg_catalog.pg_class c
+         WHERE c.relnamespace = rel.relnamespace AND c.relname = hname;
+        EXECUTE pg_catalog.format(
+            'CREATE TRIGGER kingres_ledger_block_modify BEFORE UPDATE OR DELETE ON %I.%I FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify()',
+            nsp, hname);
+        EXECUTE pg_catalog.format(
+            'CREATE TRIGGER kingres_ledger_block_truncate BEFORE TRUNCATE ON %I.%I FOR EACH STATEMENT EXECUTE FUNCTION kingres.ledger_block_modify()',
+            nsp, hname);
+        -- Nothing but the ledger inserts into the history table, and the ledger
+        -- does it through the table access method, which fires no trigger.
+        EXECUTE pg_catalog.format(
+            'CREATE TRIGGER kingres_ledger_block_insert BEFORE INSERT ON %I.%I FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify()',
+            nsp, hname);
+        EXECUTE pg_catalog.format('ALTER TABLE %I.%I ENABLE ALWAYS TRIGGER kingres_ledger_block_modify', nsp, hname);
+        EXECUTE pg_catalog.format('ALTER TABLE %I.%I ENABLE ALWAYS TRIGGER kingres_ledger_block_truncate', nsp, hname);
+        EXECUTE pg_catalog.format('ALTER TABLE %I.%I ENABLE ALWAYS TRIGGER kingres_ledger_block_insert', nsp, hname);
+        -- Who may read the old versions: the owner of the table and the
+        -- extension owner, nobody else, whatever default privileges say.
+        PERFORM kingres.ledger_history_acl_sync(rel.oid::pg_catalog.regclass,
+                                                hid::pg_catalog.regclass);
+
+        EXECUTE pg_catalog.format(
+            'CREATE TRIGGER kingres_ledger_capture AFTER INSERT OR UPDATE OR DELETE ON %I.%I FOR EACH ROW EXECUTE FUNCTION kingres.ledger_capture(%L)',
+            nsp, rel.relname, tid::text);
+        EXECUTE pg_catalog.format(
+            'CREATE TRIGGER kingres_ledger_block_truncate BEFORE TRUNCATE ON %I.%I FOR EACH STATEMENT EXECUTE FUNCTION kingres.ledger_block_modify()',
+            nsp, rel.relname);
+        EXECUTE pg_catalog.format('ALTER TABLE %I.%I ENABLE ALWAYS TRIGGER kingres_ledger_block_truncate', nsp, rel.relname);
+        EXECUTE pg_catalog.format('ALTER TABLE %I.%I ENABLE ALWAYS TRIGGER kingres_ledger_capture', nsp, rel.relname);
+    ELSE
+        EXECUTE pg_catalog.format(
+            'CREATE TRIGGER kingres_ledger_capture AFTER INSERT ON %I.%I FOR EACH ROW EXECUTE FUNCTION kingres.ledger_capture(%L)',
+            nsp, rel.relname, tid::text);
+        EXECUTE pg_catalog.format(
+            'CREATE TRIGGER kingres_ledger_block_modify BEFORE UPDATE OR DELETE ON %I.%I FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify()',
+            nsp, rel.relname);
+        EXECUTE pg_catalog.format(
+            'CREATE TRIGGER kingres_ledger_block_truncate BEFORE TRUNCATE ON %I.%I FOR EACH STATEMENT EXECUTE FUNCTION kingres.ledger_block_modify()',
+            nsp, rel.relname);
+
+        -- The order matters for the protection hook: the capture trigger is
+        -- armed last, which is what lets these statements through.
+        EXECUTE pg_catalog.format('ALTER TABLE %I.%I ENABLE ALWAYS TRIGGER kingres_ledger_block_modify', nsp, rel.relname);
+        EXECUTE pg_catalog.format('ALTER TABLE %I.%I ENABLE ALWAYS TRIGGER kingres_ledger_block_truncate', nsp, rel.relname);
+        EXECUTE pg_catalog.format('ALTER TABLE %I.%I ENABLE ALWAYS TRIGGER kingres_ledger_capture', nsp, rel.relname);
+    END IF;
+
+    -- The registration is a write of a ledger table: it goes through the one
+    -- function that may write them (op 1: kingres.ledger_table).
+    PERFORM kingres.ledger_internal_write(1, tid, rel.oid::pg_catalog.regclass,
+                                          mode, hid::pg_catalog.regclass);
+
+    -- Rows that already exist are entered by this transaction.  "kl_r.*" is
+    -- the whole row whatever the columns of the table are called.
+    EXECUTE pg_catalog.format(
+        'SELECT kingres.ledger_record_row(%L::int, kl_r.*) FROM ONLY %I.%I AS kl_r',
+        tid, nsp, rel.relname);
+END
+$fn$;
+COMMENT ON FUNCTION kingres.ledger_enable(regclass, text) IS
+    'Put a table under ledger control, for good, in mode append_only (the default) or updatable (with a history table); existing rows are entered by the calling transaction. Needs READ COMMITTED, ownership of the table and EXECUTE, which is not granted to PUBLIC.';
 
 --------------------------------------------------------------------------
 -- Reading the chain for publication (0.3, part A)
@@ -71,16 +926,13 @@ COMMENT ON FUNCTION kingres.ledger_block_preimage(smallint, bigint, bytea, bytea
 --     and a standby replays a commit whole) shows all of them or none.  The
 --     check was run against writers, builders and digest generators on a
 --     primary and on a hot standby that was replaying, with no false alarm.
---   * Only a role that can write the table can plant one: a superuser, the
---     owner, and any member of pg_write_all_data, which bypasses the table
---     privileges that keep every other role out.  Each of them can already
---     write a forged but valid block, so the refusal gives such a role no
---     power over the chain that it does not have; it makes the damage show
---     where a publisher would otherwise sign over it.
---   * The row cannot be deleted through SQL (append-only, for every role), so
---     a publisher that stops here stays stopped until a superuser removes the
---     row on purpose.  That is intended: a row above the head may be the only
---     trace of a block that was removed.
+--   * Only a superuser who turned kingres_ledger.allow_manual_write on can
+--     plant one (src/guard.c); a member of pg_write_all_data is refused like
+--     every other role.  A row that was planted before the guard existed, or by
+--     a superuser, makes the publisher stop here, and it stays stopped until a
+--     superuser removes the row on purpose with ledger_remove_stray, which
+--     keeps a copy: a row above the head may be the only trace of a block that
+--     was removed.
 --
 -- What the error tells a role that has EXECUTE and nothing else (a review
 -- note): the number of a block, a transaction id and a digest id, in the
@@ -331,12 +1183,23 @@ COMMENT ON FUNCTION kingres.ledger_blocks_entries(bigint, int) IS
 
 REVOKE ALL ON FUNCTION kingres.ledger_head() FROM PUBLIC;
 REVOKE ALL ON FUNCTION kingres.ledger_blocks_entries(bigint, int) FROM PUBLIC;
+REVOKE ALL ON FUNCTION kingres.ledger_remove_stray(text) FROM PUBLIC;
 
 
 
--- ledger_verify gains the check "digest_block" (a recorded digest names a block
--- that does not exist); CREATE OR REPLACE keeps the grants and the
--- dependencies of the function.
+-- Recomputes everything in the range and returns one row per problem.
+--
+-- Each check is one statement so that it sees one snapshot; run the function
+-- in a REPEATABLE READ transaction to get one snapshot for all checks.  The
+-- comparison of each ledger table with its entries is not restricted to the
+-- range, because rows have no block of their own.
+--
+-- SECURITY DEFINER because it reads every ledger table and every ledger
+-- catalog table, which the caller may not be allowed to read; the caller
+-- needs EXECUTE only.  Row security is switched off so that a role without
+-- BYPASSRLS fails loudly instead of silently seeing fewer rows.  A table
+-- that cannot be checked (a hostile or broken one) is reported as a finding
+-- for that table and the verification goes on with the next one.
 CREATE OR REPLACE FUNCTION kingres.ledger_verify(from_height bigint DEFAULT 0,
                                        to_height bigint DEFAULT NULL)
     RETURNS TABLE (check_name text, object text, detail text)
@@ -430,6 +1293,38 @@ BEGIN
               FROM kingres.ledger_blocks b) s
      WHERE s.height BETWEEN lo AND hi AND s.closed_at < s.prev_at;
 
+    -- A block closed later than the time of this verification (by more than
+    -- the skew the builder tolerates, one hour when that setting is 0): the
+    -- clock was ahead, or the row was written by hand.  Block times never go
+    -- back, so every later block carries that time or a later one; one row
+    -- says where it starts and how many blocks are affected.
+    RETURN QUERY
+    SELECT 'block_time'::text, 'block ' || f.height,
+           'closed_at is later than the time of this verification; ' || f.n
+           || ' block(s) from here on are closed in the future (the clock was ahead, or the block was written by hand)'
+      FROM (SELECT pg_catalog.min(b.height) AS height, pg_catalog.count(*) AS n
+              FROM kingres.ledger_blocks b
+             WHERE b.height BETWEEN lo AND hi
+               AND b.closed_at > pg_catalog.clock_timestamp()
+                   + COALESCE(NULLIF((SELECT s.setting::pg_catalog.int8 FROM pg_catalog.pg_settings s
+                                       WHERE s.name = 'kingres_ledger.max_clock_skew'), 0),
+                              3600000) * interval '1 millisecond') f
+     WHERE f.n > 0;
+
+    -- The builder closes a block for at least one transaction, and a
+    -- transaction exists for at least one entry; a row that says otherwise was
+    -- not written by the builder.
+    RETURN QUERY
+    SELECT 'block_empty'::text, 'block ' || b.height,
+           'the block has no transaction, which the builder never writes'
+      FROM kingres.ledger_blocks b
+     WHERE b.height BETWEEN lo AND hi AND b.tx_count = 0;
+    RETURN QUERY
+    SELECT 'tx_empty'::text, 'tx ' || t.ledger_txid,
+           'the transaction has no entry, which the builder never writes'
+      FROM kingres.ledger_tx t
+     WHERE t.block_height BETWEEN lo AND hi AND t.entry_count = 0;
+
     -- Every block hash is the hash of its header.
     RETURN QUERY
     SELECT 'block_hash'::text, 'block ' || b.height,
@@ -501,17 +1396,42 @@ BEGIN
       FROM kingres.ledger_tx t
      WHERE NOT EXISTS (SELECT 1 FROM kingres.ledger_blocks b WHERE b.height = t.block_height);
     -- The same for the recorded digests (0.3): a digest that names a block that
-    -- does not exist.  This is the finding ledger_head stops on, so that an
-    -- operator who got its error finds the row here; it is not restricted to
-    -- the range, like the check above.  A digest that names a block with
-    -- another hash is not checked here (ledger_head stops on the newest one):
-    -- compare a digest that was kept elsewhere with ledger_verify_digest.
+    -- does not exist, a digest whose hash is not the hash of the block it
+    -- names, and a digest document that does not say what the row says.  Every
+    -- digest is checked, whatever the range, because these are the findings
+    -- ledger_head stops on: an operator who got its error finds the row here,
+    -- with its id.  A digest that was kept outside the database is compared
+    -- with ledger_verify_digest.
     RETURN QUERY
     SELECT 'digest_block'::text, 'digest ' || d.digest_id,
            'digest refers to block ' || d.height || ', which does not exist'
       FROM kingres.ledger_digest d
       LEFT JOIN kingres.ledger_blocks b ON b.height = d.height
      WHERE b.height IS NULL;
+    RETURN QUERY
+    SELECT 'digest_hash'::text, 'digest ' || d.digest_id,
+           'digest names block ' || d.height || ' with hash ' || pg_catalog.encode(d.block_hash, 'hex')
+           || ', but the block has hash ' || pg_catalog.encode(b.block_hash, 'hex')
+      FROM kingres.ledger_digest d
+      JOIN kingres.ledger_blocks b ON b.height = d.height
+     WHERE d.block_hash IS DISTINCT FROM b.block_hash;
+    RETURN QUERY
+    SELECT 'digest_json'::text, 'digest ' || d.digest_id,
+           'the digest document does not agree with the height, the hash or the chain identity'::text
+      FROM kingres.ledger_digest d
+     WHERE d.digest ->> 'height' IS DISTINCT FROM d.height::pg_catalog.text
+        OR d.digest ->> 'block_hash' IS DISTINCT FROM pg_catalog.encode(d.block_hash, 'hex')
+        OR (chain IS NOT NULL
+            AND d.digest ->> 'chain_id' IS DISTINCT FROM pg_catalog.encode(chain, 'hex'));
+
+    -- What an operator removed with ledger_remove_stray: one finding for every
+    -- row that was taken out, for as long as the record exists.
+    RETURN QUERY
+    SELECT 'operator_removal'::text, 'removal ' || r.removal_id,
+           'a row of ' || r.source_table || ' was removed by ' || r.removed_by
+           || ' at ' || r.removed_at || ': ' || r.reason
+      FROM kingres.ledger_removed r
+     ORDER BY r.removal_id;
     RETURN QUERY
     SELECT 'pending_in_block'::text, 'tx ' || p.ledger_txid,
            'transaction is both pending and in block ' || t.block_height

@@ -81,12 +81,14 @@ SELECT started_by, state FROM kingres.ledger_verification WHERE verification_id 
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 -- 120 rows without entries: 120 problems, 100 of them kept
 INSERT INTO docs SELECT 1000 + g, 'smuggled', NULL FROM generate_series(1, 120) g;
 SELECT kingres.ledger_verify_recorded() AS vid \gset
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT state, problem_count, jsonb_array_length(problems) AS kept, problems -> 0 ->> 'check' AS first_check,
        (problems -> 0 ->> 'object') AS first_object,
        finished_at IS NOT NULL AS finished
@@ -94,11 +96,13 @@ FROM kingres.ledger_verification WHERE verification_id = :vid;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM docs WHERE id >= 1000;
 SELECT count(*) AS problems_after_cleanup FROM kingres.ledger_verify();
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT count(*) AS problems_after_restore FROM kingres.ledger_verify();
 
 --------------------------------------------------------------------------
@@ -147,6 +151,7 @@ RESET ROLE;
 --------------------------------------------------------------------------
 \set VERBOSITY sqlstate
 -- append-only for every role, the owner included
+RESET kingres_ledger.allow_manual_write;
 UPDATE kingres.ledger_digest SET height = 0;
 DELETE FROM kingres.ledger_digest;
 TRUNCATE kingres.ledger_digest;

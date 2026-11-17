@@ -95,6 +95,7 @@ kl_xact_callback(XactEvent event, void *arg)
 			kl_state.next_seq = 0;
 			kl_state.pending_written = false;
 			kl_state.pending_subid = InvalidSubTransactionId;
+			kl_write_reset();
 			kl_table_cache_reset();
 			break;
 		default:
@@ -169,6 +170,32 @@ kl_prepare_plan(const char *sql, int nargs, Oid *argtypes)
 }
 
 /*
+ * kl_execute_guarded
+ *		Run one of the two inserts with the write marker raised (guard.c).  The
+ *		statements are fixed, their arguments are values, and the tables they
+ *		write have no code of a user that could run inside them (see the
+ *		comment at kingres_ledger_internal_write); the marker is lowered on
+ *		every way out.
+ */
+static int
+kl_execute_guarded(SPIPlanPtr plan, Datum *values)
+{
+	int			rc = 0;
+
+	kl_write_enter();
+	PG_TRY();
+	{
+		rc = SPI_execute_plan(plan, values, NULL, false, 0);
+	}
+	PG_FINALLY();
+	{
+		kl_write_leave();
+	}
+	PG_END_TRY();
+	return rc;
+}
+
+/*
  * kl_record_entry
  *		Append one entry for the current transaction.
  *
@@ -217,7 +244,7 @@ kl_record_entry(int32 table_id, char op, const uint8 *row_hash,
 		namestrcpy(&uname, GetUserNameFromId(GetOuterUserId(), false));
 		values[0] = Int64GetDatum((int64) txid);
 		values[1] = NameGetDatum(&uname);
-		rc = SPI_execute_plan(kl_pending_plan, values, NULL, false, 0);
+		rc = kl_execute_guarded(kl_pending_plan, values);
 		if (rc != SPI_OK_INSERT)
 			elog(ERROR, "could not queue ledger transaction: %s",
 				 SPI_result_code_string(rc));
@@ -243,7 +270,7 @@ kl_record_entry(int32 table_id, char op, const uint8 *row_hash,
 	values[2] = Int32GetDatum(table_id);
 	values[3] = CharGetDatum(op);
 	values[4] = PointerGetDatum(hash_datum);
-	rc = SPI_execute_plan(kl_entry_plan, values, NULL, false, 0);
+	rc = kl_execute_guarded(kl_entry_plan, values);
 	if (rc != SPI_OK_INSERT)
 		elog(ERROR, "could not write ledger entry: %s",
 			 SPI_result_code_string(rc));
@@ -490,7 +517,36 @@ kingres_ledger_block_modify(PG_FUNCTION_ARGS)
 				 errmsg("ledger_block_modify must be called as a trigger")));
 	trigdata = (TriggerData *) fcinfo->context;
 
-	/* INSERT: the only trigger that fires on an insert is the one of a history table. */
+	/*
+	 * The guard trigger of the ledger tables (kingres_ledger_guard_write):
+	 * the tables take an insert, and the queue a delete, only from the code
+	 * of the extension (guard.c).  ExecutorCheckPerms_hook refuses the others
+	 * before a row is built; this trigger is for the writers that never call
+	 * it, the logical replication apply worker and the table synchronisation
+	 * worker.
+	 */
+	if (strcmp(trigdata->tg_trigger->tgname, KL_TRIGGER_GUARD_WRITE) == 0)
+	{
+		if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
+		{
+			if (!kl_insert_allowed())
+				kl_refuse_write_rel(trigdata->tg_relation, true);
+		}
+		else if (!kl_pending_delete_allowed(trigdata->tg_relation))
+			kl_refuse_write_rel(trigdata->tg_relation, false);
+		return PointerGetDatum(trigdata->tg_trigtuple);
+	}
+
+	/*
+	 * A superuser who turned allow_manual_write on may delete the rows that
+	 * ledger_remove_stray removes (guard.c); nothing else.
+	 */
+	if (TRIGGER_FIRED_BY_DELETE(trigdata->tg_event) &&
+		TRIGGER_FIRED_FOR_ROW(trigdata->tg_event) &&
+		kl_manual_delete_allowed(trigdata->tg_relation))
+		return PointerGetDatum(trigdata->tg_trigtuple);
+
+	/* INSERT: the only other trigger that fires on an insert is the one of a history table. */
 	if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
 		ereport(ERROR,
 				(errcode(ERRCODE_KL_APPEND_ONLY),

@@ -134,6 +134,7 @@ SELECT (SELECT count(*) FROM kingres.ledger_entry) || ' '
 #--------------------------------------------------------------------------
 $node->safe_psql('postgres', 'CREATE DATABASE old02');
 $node->safe_psql('old02', q{
+	SET kingres_ledger.allow_manual_write = on;
 	CREATE EXTENSION kingres_ledger VERSION '0.2';
 	CREATE SCHEMA app;
 	CREATE TABLE app.accounts (id int PRIMARY KEY, owner_name text NOT NULL, balance numeric(12,2));
@@ -154,9 +155,9 @@ $node->safe_psql('old02', q{
 is($node->safe_psql('old02',
 		q{SELECT extversion FROM pg_extension WHERE extname = 'kingres_ledger'}),
 	'0.2', 'the old database has version 0.2');
-my $old_digest = $node->safe_psql('old02', 'SELECT kingres.ledger_generate_digest()');
+my $old_digest = $node->safe_psql('old02', 'SET kingres_ledger.allow_manual_write = on; SELECT kingres.ledger_generate_digest()');
 $node->safe_psql('old02', q{INSERT INTO app.accounts VALUES (6, 'frank', 60)});
-$node->safe_psql('old02', 'SELECT kingres.ledger_verify_recorded()');
+$node->safe_psql('old02', 'SET kingres_ledger.allow_manual_write = on; SELECT kingres.ledger_verify_recorded()');
 my $row_i = $node->safe_psql('old02',
 	q{SELECT encode(kingres.ledger_row_hash(a.*), 'hex') FROM app.accounts a WHERE id = 1});
 my $proof_i = $node->safe_psql('old02',
@@ -174,6 +175,15 @@ my $old_height = $node->safe_psql('old02', 'SELECT max(height) FROM kingres.ledg
 # The new functions do not exist yet.
 my ($ret, $err) = sqlstate_of('old02', 'SELECT * FROM kingres.ledger_head()');
 like($err, qr/42883/, 'ledger_head does not exist in 0.2');
+
+# The 0.3 library does not write the ledger through the SQL of 0.2: the old
+# block builder is refused, with the statement to run, and nothing is written
+# (the capture trigger is part of the library and keeps working).
+my ($r0, $o0, $e0) = $node->psql('old02', 'SELECT kingres.ledger_build_block()');
+isnt($r0, 0, 'the block builder of the 0.2 SQL is refused by the 0.3 library');
+like($e0, qr/version 0\.2.*ALTER EXTENSION kingres_ledger UPDATE/s,
+	'and the error says which version the SQL is and what to run');
+is($node->safe_psql('old02', $ledger_state), $old_state, 'and nothing was written');
 
 #--------------------------------------------------------------------------
 # Upgrade.
@@ -245,13 +255,14 @@ is($node->safe_psql('new03', q{SELECT extversion FROM pg_extension WHERE extname
 	'0.3', 'a plain CREATE EXTENSION installs 0.3');
 $node->safe_psql('postgres', 'CREATE DATABASE old01');
 $node->safe_psql('old01', q{
+	SET kingres_ledger.allow_manual_write = on;
 	CREATE EXTENSION kingres_ledger VERSION '0.1';
 	CREATE TABLE public.t (id int PRIMARY KEY);
 	SELECT kingres.ledger_enable('public.t');
 	INSERT INTO public.t VALUES (1);
 	SELECT kingres.ledger_build_block();
 });
-my $d01 = $node->safe_psql('old01', 'SELECT kingres.ledger_generate_digest()');
+my $d01 = $node->safe_psql('old01', 'SET kingres_ledger.allow_manual_write = on; SELECT kingres.ledger_generate_digest()');
 $node->safe_psql('old01', 'ALTER EXTENSION kingres_ledger UPDATE');
 is($node->safe_psql('old01', q{SELECT extversion FROM pg_extension WHERE extname = 'kingres_ledger'}),
 	'0.3', 'a 0.1 database reaches 0.3 in one command (through 0.2)');
@@ -262,6 +273,7 @@ my $fp_new = fingerprint('new03');
 my $fp_old = fingerprint('old02');
 my $fp_old1 = fingerprint('old01');
 ok(length($fp_new) > 1000, 'the fingerprint covers the extension');
+cmp_ok(scalar(my @fp_lines = split(/\n/, $fp_new)), '>=', 200, 'and has the lines of a full catalog dump');
 like($fp_new, qr/function (kingres\.)?ledger_head\(\)/, 'and includes the new functions');
 like($fp_new, qr/def=[0-9a-f]{32}/, 'and the definition of each function');
 is($fp_old, $fp_new, 'upgrading 0.2 to 0.3 gives the objects of installing 0.3');

@@ -123,7 +123,7 @@ tests:
 kingres/dev/ext.sh kingres_ledger all     # sync build install regress tap
 ```
 
-Tests: thirteen pg_regress tests and twelve TAP tests under `t/`.
+Tests: sixteen pg_regress tests and sixteen TAP tests under `t/`.
 
 | Test | What it covers |
 |---|---|
@@ -140,7 +140,9 @@ Tests: thirteen pg_regress tests and twelve TAP tests under `t/`.
 | `ledger_privs` | scan of `pg_proc`: fixed `search_path`, `SECURITY DEFINER` only where needed, qualified references; the default privileges; shadowing by temporary objects |
 | `ledger_preimage` | `ledger_block_preimage`: an independent layout of the 87 bytes, a pinned value, every stored block, refused arguments, privileges |
 | `ledger_head` | `ledger_head` and `ledger_blocks_entries` in a database of their own: an empty ledger, one and five blocks, every bound of a page, malformed stored blocks (`XX001`), the removal of the end of the chain (with and without the rows that refer to it), recorded digests, the head's own hash and link, the chain identity on every call, a repeated height, a valid forged successor, privileges, `REVOKE ... FROM PUBLIC` on the catalog tables, nothing written |
-| `ledger_stray` | a row above the head (L8-08): who can write one (a plain role cannot, a member of `pg_write_all_data` can), the error of `ledger_head` that names the row and the table, `ledger_verify` naming the same row, that no SQL removes it, the recovery of this README step by step, an empty chain with a stray digest |
+| `ledger_stray` | a row above the head (L8-08) and a digest with another hash (L9-02): who can write one (nobody but a superuser who asks), the error of `ledger_head` that names the row and the table, `ledger_verify` naming the same row, that no SQL removes it, `ledger_remove_stray` step by step and the record it keeps, an empty chain with a stray digest |
+| `ledger_manual` | what a superuser's hand leaves (L9-01 second half, L9-14): a valid block written by hand with a time in 2100 and no transaction, `ledger_head` that accepts it, `ledger_verify` that reports it (`block_time`, `block_empty`), the builder that refuses to build on it (`KL004`) with the transactions left pending, the limit that only a superuser lifts, the block that then carries the time, a transaction with no entry (`tx_empty`), a pending row deleted by hand (`entry_orphan`) and a member of `pg_write_all_data` that cannot |
+| `ledger_guard` | the write guard (L9-01): the nine tables against `INSERT`, `ON CONFLICT`, `MERGE`, a view and a `SECURITY DEFINER` function of a member of `pg_write_all_data`, `DELETE` and `UPDATE`, as that member, as a role with nothing, as a superuser and as a superuser with `allow_manual_write` on; every statement that is allowed is rolled back and `ledger_verify` finds nothing; where the setting can and cannot be set; the function that writes is not grantable; the honest flows with the setting off |
 | `001_concurrent_blocks` | concurrent writers while blocks are built |
 | `002_restart_standby` | restart, crash recovery, a streaming standby |
 | `003_preload_and_hooks` | the preload requirement, hook chaining with `pg_stat_statements` |
@@ -154,6 +156,9 @@ Tests: thirteen pg_regress tests and twelve TAP tests under `t/`.
 | `011_upgrade_0_3` | `ALTER EXTENSION UPDATE` from 0.2 and from 0.1 to 0.3 with append-only and updatable tables, blocks, digests, proofs of `I` and `D` and a recorded verification: all still verify, the upgrade writes nothing, the result equals a direct installation of 0.3 (catalog fingerprint with the full definition of every function), `pg_dump` and restore |
 | `012_publish_read` | the reads for publication: an independent recomputation with `Digest::SHA` (hashes, fields, links, the RFC 6962 root), tiles and a signed checkpoint checked by the Go verifier when `KINGRES_VERIFY` names it, concurrent calls under load, a standby, the bound of 10000 entries |
 | `013_head_inflight` | `ledger_head` under load: writers, block builders and digest generators on a primary, readers on it and on a hot standby that replays (single statements, a loop in a `DO` block, `REPEATABLE READ`): no call may fail; then a planted row is refused on both, with the row named |
+| `014_guard` | a member of `pg_write_all_data` attacks every table with 100 statements per table from its own sessions while writers, builders and digest generators run (not one statement succeeds, the ledger verifies, no block time of the attacker); `COPY FROM` into the nine tables as the member, as a superuser and with the setting on; a hot standby replays and verifies; a subscription that publishes a ledger table of another server is refused by the guard trigger, in the synchronisation of the table and in the apply worker |
+| `015_recipe` | the statements of the README recipe, read out of the README and run literally for four kinds of damage (a transaction row above the head, a digest above the head, a digest with another hash, the head block removed): `ledger_head` answers, `ledger_verify` reports exactly the `operator_removal` findings, the rows are in `ledger_removed` and in the file, no trigger is switched off, a member still cannot write, the chain goes on |
+| `016_dump_upgrade` | `pg_dump` and a restore with the guard (a new empty ledger, nothing written by hand), and `pg_upgrade` of a cluster with a ledger (binary upgrade mode): the chain, the blocks and a digest of before verify, the builder and the capture work, the guard is on |
 
 The regress tests need `shared_preload_libraries = 'kingres_ledger'` (the
 in-tree `check` target and `kingres/dev/ext.sh` set it).
@@ -205,8 +210,11 @@ the protection hook trusts only the first script of a command, and the step to
 0.3 replaces `ledger_verify`. The result is the
 same set of objects, privileges and protection as `CREATE EXTENSION
 kingres_ledger VERSION '0.3'` (`t/011_upgrade_0_3.pl` compares them,
-including the definition of every function). The 0.3 library works with the
-0.2 SQL; the 0.3 SQL needs the 0.3 library.
+including the definition of every function). The 0.3 SQL needs the 0.3 library,
+and the 0.3 library needs the 0.3 SQL to write the ledger: with the SQL of 0.1
+or 0.2 the library refuses what the old functions write and says to run `ALTER
+EXTENSION kingres_ledger UPDATE` (see "Who can write the ledger tables"); the
+capture trigger keeps working, the block builder does not until the update.
 
 **Upgrade from 0.1.** `ALTER EXTENSION kingres_ledger UPDATE` (the script is
 `kingres_ledger--0.1--0.2.sql`; load the new library first: restart the server,
@@ -424,10 +432,13 @@ Settings:
 | `kingres_ledger.max_block_transactions` | 100000 | A block is closed with at most this many transactions; the rest wait for the next block. Superuser setting (`PGC_SUSET`). |
 | `kingres_ledger.block_interval` | 10s | How often the launcher looks for pending transactions; `0` switches the block-building workers off. Server setting (`PGC_SIGHUP`, `postgresql.conf` or `ALTER SYSTEM` and a reload; a database or role setting has no effect on the launcher). |
 | `kingres_ledger.worker_timeout` | 60s | The longest one block-building worker may work on one database; it cancels itself after this time (an error, recorded as a failure, with a growing delay before the next attempt) and the launcher terminates it five seconds later if it does not react. A round of the launcher also stops starting workers when it has used this much time, and continues with the other databases in the next round. `0` means no limit. Server setting (`PGC_SIGHUP`). |
+| `kingres_ledger.max_clock_skew` | 1h | How far the previous block may be ahead of the clock of the server before `ledger_build_block` refuses to build (error `KL004`); `0` means no limit. Superuser setting (see "Who can write the ledger tables", "The time of a block") |
+| `kingres_ledger.allow_manual_write` | off | A superuser may write the ledger tables by hand in this session. Superuser setting that can be turned on only with `SET` in a session (see "Who can write the ledger tables") |
 
 Errors raised by the extension: SQLSTATE `KL001` (modification of an
 append-only table), `KL002` (statement rejected by the protection hook or by
-the event trigger), `KL003` (library not preloaded).
+the event trigger), `KL003` (library not preloaded), `KL004` (the previous block
+is closed ahead of the clock). A write that the guard refuses is `42501`.
 
 ## Privileges
 
@@ -440,9 +451,10 @@ DEFINER`:
 | `ledger_capture` | writes the entry of every inserted row; ordinary roles have no privilege on the ledger tables |
 | `ledger_record_row` | writes the entries of the rows that exist when a table is enabled |
 | `ledger_enable` | creates triggers on a table that the owner does not own, and writes `ledger_table` (it checks that the calling role owns the table) |
-| `ledger_build_block` | writes blocks and transactions |
+| `ledger_build_block` | writes blocks and transactions (through `ledger_internal_write`) |
 | `ledger_generate_digest` | calls the block builder and writes `ledger_digest` |
 | `ledger_verify` | reads every ledger table, every history table and every table under ledger control |
+| `ledger_remove_stray` | removes rows that stop `ledger_head` and keeps a copy in `ledger_removed`; a superuser, with `allow_manual_write` on, and no other role (see "A row above the head") |
 | `ledger_verify_recorded` | writes `ledger_verification` |
 | `ledger_inclusion_proof` (both forms) | reads the entries and transactions, which the caller may not read; the two-argument form is a wrapper that exists so that grants made on it under 0.1 keep working |
 | `ledger_head` | one statement snapshot of the chain identity, the latest block, and the newest transaction row and recorded digest it is compared with; defined as the owner so that the answer does not depend on what the caller may read of the ledger tables (it returns a hash and a count, no row data) |
@@ -782,22 +794,31 @@ statements, in a loop inside a `DO` block and in `REPEATABLE READ`; no call
 failed). So the row is either what is left of a block that was removed from
 `ledger_blocks`, or it was written by hand.
 
-*Who can write one.* Nobody can change or delete a row of these tables
-through SQL, and no role can be granted `INSERT` on them (the hook refuses the
-`GRANT`, and a role without a grant gets `permission denied`). A new row can be
-inserted by a superuser, by the owner of the extension's tables, and by every
-member of the predefined role `pg_write_all_data`, because that role bypasses
-table privileges (tested with `INSERT INTO kingres.ledger_tx ...` and
-`INSERT INTO kingres.ledger_digest ...` as such a member; the same member could
-also insert into `ledger_pending`, `ledger_entry` and `ledger_blocks`, which is why a forged valid successor
-block is a listed limit). Each of these roles can already write damage that is
-worse than a stray row, so the refusal gives them no power over the chain that
-they did not have: it makes the damage visible where a publisher would
-otherwise sign over it. It is nevertheless a way to stop a publisher with one
-statement, and it stays stopped, because no SQL removes the row (the tables are
-append-only for every role). That is on purpose: the row may be the only trace
-of a block that was removed. Give `pg_write_all_data` only to roles that you
-trust with the ledger.
+*Who can write one.* A superuser who asks for it, and nobody else. Since the
+write guard (see "Who can write the ledger tables"), a row of a ledger table
+exists only because the code of the extension wrote it, or because a superuser
+turned `kingres_ledger.allow_manual_write` on in a session and wrote it by hand;
+a member of `pg_write_all_data`, which bypasses table privileges, is refused
+like every other role (`cannot write to table "ledger_tx": only the code of the
+ledger writes its tables`). That keeps the recovery below an act of a superuser
+and not of whoever planted the row. A row that was planted before the guard
+existed, or by a superuser, or a restore that wrote rows by hand, is exactly as
+dangerous as it was: the guard cannot see the past.
+
+Other things that stop `ledger_head` for good, with the same way out:
+
+- **A recorded digest with another hash than its block** (L9-02): `ledger_head`
+  compares the newest digest row with the block it names and refuses when they
+  differ (`block 0 is not the block that digest 3 in kingres.ledger_digest
+  names`). `ledger_verify` now checks every recorded digest, whatever the range:
+  `digest_block` (the block does not exist), `digest_hash` (the block has
+  another hash) and `digest_json` (the digest document does not say what the
+  row says), each with `digest <id>` as the object. A rewritten chain makes
+  every earlier recorded digest a `digest_hash` finding (an attacker has to
+  remove them too, which needs the same setting).
+- **A removed head block**: the block row alone was removed from
+  `ledger_blocks`, which leaves its transaction rows (`ledger_tx`) and the digest
+  of it behind, both above the head.
 
 *What to check first, before anything is removed.*
 
@@ -808,45 +829,84 @@ trust with the ledger.
    outside the database: the size of the last checkpoint of the publication, a
    digest you stored elsewhere. If B is not above all of them, the block
    existed and was published or digested, and it was removed. That is damage,
-   not a stray row: do not remove the row. Restore the database from a backup
-   or a point in time that has block B (the blocks come back with their rows),
-   or accept the divergence in the publication.
+   not a stray row: do not remove the row yet. Restore the database from a
+   backup or a point in time that has block B (the blocks come back with their
+   rows), or accept the divergence in the publication (see below).
 3. Find out who wrote the row: the server log (`log_statement`, an audit
    extension) and the members of `pg_write_all_data` (`SELECT roleid::regrole,
    member::regrole FROM pg_auth_members WHERE roleid = 'pg_write_all_data'::regrole`).
 
-*How to remove it.* Only when step 2 shows that B is above everything that was
-ever published or digested outside the database, and `ledger_verify` shows
-nothing else. This is the break-glass method that the list below names as a
-limit (an edit of `pg_trigger` by a superuser): switch the delete trigger of
-the one table off in the catalog, remove the rows above the head in a session
-opened afterwards (the test of this extension does so; a session that was
-already connected may still use the old trigger), switch the trigger on, and keep a record of what you did outside
-the database.
+*How to remove it.* A superuser, in one session, with the setting on. The
+function `kingres.ledger_remove_stray(reason)` does the work: it takes the
+builder lock, copies every transaction row above the head and every recorded
+digest that names a missing block or another hash into `kingres.ledger_removed`
+(as they were, with who, when and why), queues the transactions of the removed
+rows again when they have entries (so that no entry is left without a block and
+the next block is built from them), and deletes the rows. No trigger is
+switched off and no other session is affected: the setting is the only thing
+that opens the tables, and only for the session that turned it on. The
+statements below write the rows to a file first, because the copy in the
+database is part of the database and an auditor must hold one that is not.
 
+<!-- recipe: remove-stray -->
 ```sql
--- as a superuser; for kingres.ledger_digest use that table and "height"
-UPDATE pg_trigger SET tgenabled = 'D'
- WHERE tgrelid = 'kingres.ledger_tx'::regclass AND tgname = 'kingres_ledger_block_modify';
-\c
-DELETE FROM kingres.ledger_tx
- WHERE block_height > coalesce((SELECT max(b.height) FROM kingres.ledger_blocks b), -1);
-UPDATE pg_trigger SET tgenabled = 'A'
- WHERE tgrelid = 'kingres.ledger_tx'::regclass AND tgname = 'kingres_ledger_block_modify';
-\c
+\pset tuples_only on
+\pset format unaligned
+\o stray-rows.json
+SELECT jsonb_pretty(jsonb_build_object(
+    'transactions', (SELECT coalesce(jsonb_agg(to_jsonb(t)), '[]')
+                       FROM kingres.ledger_tx t
+                      WHERE t.block_height > coalesce((SELECT max(b.height) FROM kingres.ledger_blocks b), -1)),
+    'digests', (SELECT coalesce(jsonb_agg(to_jsonb(d)), '[]')
+                  FROM kingres.ledger_digest d
+                 WHERE NOT EXISTS (SELECT 1 FROM kingres.ledger_blocks b
+                                    WHERE b.height = d.height AND b.block_hash = d.block_hash))));
+\o
+SET kingres_ledger.allow_manual_write = on;
+SELECT kingres.ledger_remove_stray('rows above the head found by ledger_head');
+RESET kingres_ledger.allow_manual_write;
 SELECT * FROM kingres.ledger_head();
-SELECT count(*) FROM kingres.ledger_verify();      -- 0
-SELECT tgrelid::regclass, tgenabled FROM pg_trigger
- WHERE tgname = 'kingres_ledger_block_modify';     -- every row 'A'
+SELECT check_name, object FROM kingres.ledger_verify();
 ```
 
+What `ledger_verify` then reports is exactly this and nothing else: one
+`operator_removal` finding for every row that was removed (`object` is
+`removal <id>`, the detail says which table, by whom, when and why), for as long
+as the record exists. There is no `entry_orphan` and no `tx_block`: the entries of
+a removed transaction are queued again and built into the next block (a row that
+was written by hand has no entries and is not queued). The removed rows can
+be read with `SELECT * FROM kingres.ledger_removed` (only the extension owner,
+a superuser, and roles that were granted `SELECT` on it); `row_data` is the row
+as `to_jsonb` shows it. **Tell the auditor** what was removed: the file
+`stray-rows.json` and the number of the removal records. The record is covered
+by no hash and by no digest (a block does not contain it; adding it to a block
+would change the hash format), so a digest taken later does not prove that it was
+not edited; what proves a removal is the file and the report kept outside the
+database.
+
+*A pending row that was deleted by hand* (a superuser with the setting on; a
+member of `pg_write_all_data` cannot) means that the entries of that transaction
+belong to no block and to no pending transaction: the rows exist in the user table
+and are no longer covered by any block. `ledger_verify` reports them as
+`entry_orphan`, for good (tested in `ledger_manual`); the role name of the
+transaction is not recoverable, so the extension offers no way to queue it
+again. Treat it like a removed block: say so to the auditor.
+
 *What it means for the publication.* Removing rows above the head changes no
-block, so nothing that was published is touched, and the publisher goes on
-from the head it had. It does not make a removed block come back: if blocks
-that were published are missing, the head is below what the publisher has
-signed, which is an alarm of the publisher (a head that went back) whatever
-rows are deleted. Deleting the rows then only removes the evidence, which is
-why step 2 comes first.
+block. If the rows were a stray row or a stray digest, nothing that was
+published is touched, and the publisher goes on from the head it had. If the
+rows are what a **removed block** left behind, the block itself is gone and the
+recipe does not bring it back: the next block that is built is another block
+with the same transactions, with another time and another hash, at the same
+height. A publisher or an auditor that holds a checkpoint beyond the removed
+block (a tile log that was signed at a larger size, a digest of that block) will
+see **a fork**: the head went back, and the block at that height is not the
+published one. That is correct, and it must stay visible: it is what happened.
+Do not sign over it; start a new publication state, say what was removed and
+why, and keep the old state file. Deleting the rows without the record would
+only have removed the evidence, which is why step 2 comes first and the record
+is kept.
+
 
 
 ## Hash format version 1
@@ -1211,6 +1271,186 @@ sizes come from the authenticated values and the index must be checked against
 them). A proof for a row that is in a block older than the digest needs the
 chain of headers in between, so its size is linear in the number of blocks
 between them.
+## Who can write the ledger tables
+
+**The rule.** A row of a table of the ledger (the nine `kingres.ledger_*`
+tables) exists only because the code of the extension wrote it, or because a
+superuser asked to write it by hand, as an explicit act. Nobody who is not a
+superuser changes, removes, adds to or forges history without `ledger_verify`
+reporting it, and no honest sequence brings the ledger into a state that it
+refuses. A member of `pg_write_all_data` bypasses table privileges, so before
+the guard it could insert a block, a transaction row, a digest or a pending
+row; with a block whose time it chose it made every later honest block carry
+that time (finding L9-01). It cannot any more. A member of `pg_maintain`, a
+member of `pg_read_all_data`, the owner of an application table and a role with
+`CREATE` on a schema are not superusers and cannot either.
+
+**The guard has two parts, in `src/guard.c`.**
+
+1. `ExecutorCheckPerms_hook` refuses every statement that inserts, updates or
+   deletes a row of those tables, before any row is built, with `cannot write
+   to table "<name>": only the code of the ledger writes its tables` (SQLSTATE
+   `42501`; an `UPDATE` or `DELETE` of the append-only tables says `table "<name>"
+   is an append-only ledger table`, `KL001`, as it always did). The hook has the
+   same signature on PostgreSQL 18 and 19. It is called from
+   `ExecCheckPermissions` (`src/backend/executor/execMain.c`) for every plan
+   that `ExecutorStart` starts, for `COPY FROM` (`DoCopy` in `copy.c`), for the
+   plans that SPI runs, and, on 19, for the foreign key check that does not go
+   through the executor (`ri_CheckPermissions` in `ri_triggers.c`); the call
+   comes after the privilege check and does not depend on its result, so it
+   happens for a superuser too. That covers `INSERT`, `INSERT ... ON CONFLICT`,
+   `MERGE`, writes through an updatable view, through a rule, from a trigger,
+   from a `SECURITY DEFINER` function, from a foreign key action, and `COPY`.
+   `SELECT ... FOR UPDATE` (and the foreign key checks) set the same bit as an
+   `UPDATE` privilege but update no column; the hook ignores a statement whose
+   only write bit is that one. Partitions and inheritance children cannot be
+   ledger tables (the protection refuses them).
+2. A `BEFORE INSERT` row trigger on every table (`kingres_ledger_guard_write`;
+   on `ledger_pending` also `BEFORE DELETE`), `ENABLE ALWAYS`, for the writers
+   that never call `ExecCheckPermissions`: the logical replication apply worker
+   and the table synchronisation worker check privileges themselves
+   (`TargetPrivilegesCheck` in `worker.c`) and write through
+   `ExecSimpleRelationInsert`, which fires triggers. (The review proposed the
+   hook alone and said that it sees the apply worker; on both majors it does not.)
+
+**What is not seen.** `TRUNCATE` and `ALTER TABLE` are utility statements
+(`TRUNCATE` is stopped by its trigger, `ALTER TABLE` by the `ProcessUtility`
+hook); large objects are not rows of these tables; C code of another extension
+that writes the heap directly is not an executor statement and is out of scope;
+file-level and catalog-level changes are in "What the protections cannot stop".
+`LOCK TABLE` of a ledger table in a mode that blocks readers or writers
+(`pg_maintain` may take any lock on any table, and holding `ACCESS EXCLUSIVE`
+on `ledger_blocks` stops the builder and every reader: finding L9-14) is refused
+for a role that the lock would have been allowed to; the ledger's own functions
+and superusers are not affected. `VACUUM`, `CLUSTER`, `REINDEX` and `ANALYZE` by
+`pg_maintain` change no row of the chain.
+
+**How the extension's own writes are told apart.** By a marker that only the
+extension's C code raises, never SQL: a backend-local depth counter, raised and
+lowered (in a `PG_FINALLY` block) around the statements that the library itself
+runs, and zeroed at the end of every transaction. The capture code
+(`capture.c`) raises it around its two `INSERT`s (`ledger_pending`,
+`ledger_entry`), and `kingres.ledger_internal_write(op, VARIADIC args)` raises
+it around one of seven fixed statements (register a table, the transaction
+rows of a block, the block, the end of the queue, a recorded digest, a recorded
+verification, a failed verification), which `ledger_enable`,
+`ledger_build_block`, `ledger_generate_digest` and `ledger_verify_recorded` call
+instead of writing. The statement texts are in the C file; the arguments are
+values, never text that is run. The function is not `SECURITY DEFINER`, only
+the extension owner (a superuser) has `EXECUTE` on it, and every `GRANT` on it is
+refused by the protection hook, so no role that is not a superuser can call it;
+those who can are superusers, who can change the catalogs anyway. There is no
+SQL function that raises the marker for a statement of the caller's own: a
+begin and an end function would leave it raised after an error, in a
+subtransaction, in a cursor opened inside and read outside, in a `RETURNING`,
+default or trigger of the caller; this design has none of them. The rule "the
+current user is the owner and the session user is somebody else" was not used:
+it also holds inside every `SECURITY DEFINER` function of a superuser and
+during an extension script of another extension.
+
+*Where user code could run while the marker is raised, and what stops it.* The
+marker is raised around a single `SPI` statement and nothing else. The tables
+that statement writes have no trigger but the blocking ones (they raise errors),
+no policy, no rule and no default or `CHECK` expression other than constants,
+`now()` and `clock_timestamp()`; their indexes have no expression; their column
+types are built in; the foreign key checks are system triggers. The protection
+hook refuses `CREATE TRIGGER`, `CREATE RULE`, `CREATE POLICY` and `CREATE INDEX`
+on them, and the event triggers report a table that has any. The functions the
+statements call are `pg_catalog`'s and the extension's, named with the schema,
+under `search_path = pg_catalog, pg_temp`, so no operator or function that a role
+created is found. Column defaults, `CHECK` constraints, index expressions, type
+input functions and row-level security of **user** tables are not involved: the
+user's row is read by the capture trigger before the marker is raised and is
+hashed in C, and `ledger_enable` reads the existing rows with `ledger_record_row`,
+which hashes in C. Statement-level event triggers fire on DDL, not on these
+statements, and only a superuser can create one.
+
+**A superuser who writes by hand.** A superuser's direct `INSERT` is refused
+too, unless the superuser turned on `kingres_ledger.allow_manual_write` in the
+session (`SET kingres_ledger.allow_manual_write = on`; `RESET` turns it off). It
+is `PGC_SUSET`, off, and a check hook refuses `on` from any source but a `SET`
+of a session: not in `postgresql.conf`, not with `ALTER SYSTEM`, `ALTER ROLE`,
+`ALTER DATABASE`, not as a connection option or an environment variable. It
+counts only when both the current user and the session user are superusers: a
+`SET ROLE` to somebody else, a `SECURITY DEFINER` function of a role that is not
+a superuser, or a role that was given the right to set the parameter with `GRANT
+SET ON PARAMETER` get nothing from it. With it on, `INSERT` works on every ledger
+table, and `DELETE` works on `ledger_tx`, `ledger_digest` and `ledger_pending`
+(the rows that `ledger_remove_stray` takes away); `UPDATE` and `TRUNCATE` stay
+refused by their triggers, as always. Writing by hand is how a ledger is
+damaged on purpose; `ledger_verify` reports what it leaves, and the break-glass
+recipe of this README ("A row above the head") is the one use that is documented.
+
+**The statements of the extension's own script** (`CREATE EXTENSION`, `ALTER
+EXTENSION UPDATE`) are allowed to write while that script runs (it writes the
+identity of the chain). In pg_upgrade's binary upgrade mode (a server that only
+pg_upgrade reaches) the `ProcessUtility` hook and the event triggers do nothing: the
+extension is created empty and its members are added one by one, and the first
+event trigger would find the others missing (`kingres.ledger_binary_upgrade()` says
+whether the server is in that mode). The ledger tables arrive as files, not as rows.
+
+**History that exists already.** The guard cannot detect rows that a member of
+`pg_write_all_data` wrote before it existed. What an auditor can still check:
+the digests and the checkpoints that were kept outside the database (a forged
+block that was never published is not in them, and every block after it differs
+from what was published); `ledger_verify`, which reports a transaction with no
+entry (`tx_empty`), a block with no transaction (`block_empty`), a block closed
+in the future (`block_time`), a block time that goes back, a transaction or
+digest row above the head, a digest whose hash is not its block's, and entries
+and rows that do not match; and the `user_name` of the transactions against the
+audit log of the server for the time of the block. A forged block that has the
+right link, hash and root and a plausible time, and whose transactions have
+entries that match rows, cannot be told from a real one inside the database.
+
+**The time of a block.** A block time is the clock of the server when the
+builder runs, and never earlier than the block before (the verifier and
+`ledger_verify` require it). One block with a time far ahead would therefore
+give its time to every later block, silently and for ever (a forged block, or an
+honest server whose clock was set to the year 2100 for a minute). The rule, which
+changes no hash: **the builder refuses to build a block when the previous block
+was closed more than `kingres_ledger.max_clock_skew` ahead of its own clock**
+(default one hour, at most about 24 days, `PGC_SUSET`; error `KL004`; nothing is
+lost, the transactions stay pending), and `ledger_verify` reports the first block that was closed later
+than the time of the verification by more than that (`block_time`, with the
+number of blocks that carry a later time), whatever the setting is. A superuser
+who has looked at the clock and decided to go on sets
+`kingres_ledger.max_clock_skew = 0` (no limit); the finding stays until real time
+passes the block, which is intended: the times are wrong and the ledger says so.
+A clock that is set back a little (less than the limit, a standby promoted with a
+clock that is behind) still gives the time of the previous block.
+
+**Upgrades.** The guard is in the library; the functions that write are in the
+SQL of version 0.3. A database whose SQL is 0.1 or 0.2, with the 0.3 library, is
+**refused with the statement to run** and is never half protected: the old
+functions write with plain statements, which the library refuses (`cannot write
+to table "ledger_blocks": the SQL of extension "kingres_ledger" is version 0.2,
+and this library writes the ledger only through the functions of version 0.3`,
+hint `Run ALTER EXTENSION kingres_ledger UPDATE.`). The capture trigger is part
+of the library and keeps working; the block builder and the workers fail until
+the update, and the transactions stay pending. The update is `ALTER EXTENSION
+kingres_ledger UPDATE`, from 0.1 (directly) or from 0.2; the three ways to 0.3
+(a new installation, from 0.2, from 0.1) give the same catalog, which
+`t/011_upgrade_0_3.pl` compares. A superuser who must build a block before the
+update sets the manual-write setting for that session.
+
+**Dump, restore and replication.** `pg_dump` does not dump the ledger tables
+(they are not configuration tables of the extension), so a restore writes
+nothing into them but the identity of the new chain, which `CREATE EXTENSION`
+writes: a restored database has a new, empty ledger, it does not verify as the
+old one, and `ledger_verify` names the capture trigger of every table that is not
+registered. Take physical backups, or use `pg_upgrade`, which carries the files
+(tested in `016_dump_upgrade`). There is no supported way to load a ledger with
+`COPY`: the new chain's row cannot be replaced (its triggers refuse `UPDATE` and
+`DELETE`). **Logical replication** into a ledger table of the extension is
+refused by the guard trigger for every role (a superuser's subscription too: the
+apply worker cannot turn the setting on), which is right: a subscriber's chain
+has its own identity. Replicating a **user** ledger table works (the capture
+trigger writes the entries with the marker raised, in the apply worker). A
+**standby** replays the write-ahead log, which does not go through the executor,
+so the rows of the primary appear on it and the guard sees nothing (tested in
+`002_restart_standby`, `009_worker`, `012_publish_read`, `013_head_inflight` and
+`014_guard`).
+
 ## Protection against being switched off
 
 Two layers enforce the rules, both for every role including superusers, both
@@ -1311,16 +1551,16 @@ This is the complete list that is known. Each item is either detected after the
 fact by `ledger_verify` (and always by a digest taken before it), or outside what
 the database can see.
 
-- Rows inserted by a role that can write the tables. `INSERT` is checked by
-  table privileges only, and a member of `pg_write_all_data`, the owner and a
-  superuser bypass or hold them: they can insert rows into the ledger tables
-  (a transaction row or a digest row above the head, a pending transaction
-  with entries, a block). Update, delete and truncate stay refused for every
-  role. What such rows do to the chain is found by `ledger_verify` and, for the
-  head, by `ledger_head` (see "A row above the head"); a block with the right
-  link and the right hash is not found (see "What is detected, and what is
-  not"). Do not give `pg_write_all_data` to roles that you do not trust with
-  the ledger.
+- Rows that a superuser writes: with `kingres_ledger.allow_manual_write` on a
+  superuser can insert into every ledger table (and delete transaction rows,
+  digests and pending rows); without it nobody can, a member of
+  `pg_write_all_data` included (see "Who can write the ledger tables"). What such
+  rows do to the chain is found by `ledger_verify` and, for the head, by
+  `ledger_head` (see "A row above the head"); a block with the right link, the
+  right hash and a plausible time, whose transactions have entries that match
+  rows, is not found (see "What is detected, and what is not"). Rows that a
+  member of `pg_write_all_data` wrote **before** the guard existed are not
+  detected by it either; see "History that exists already" there.
 - Direct modification of the system catalogs (for example `UPDATE pg_trigger`
   by a superuser), and anything done at file level (a tool that edits heap
   pages, such as `pg_surgery`), or to a copy of the data directory.
@@ -1365,11 +1605,14 @@ the database can see.
   external digest detects these. A restored or cloned database has the same
   chain identity as the original until they diverge.
 - Dump and restore (`pg_dump`): the ledger tables are not dumped. A restored
-  database has the triggers of its tables but an empty ledger; inserts into a
-  restored ledger table fail (the entry refers to a table id that is not
+  database has the triggers of its tables but a new, empty ledger; inserts into
+  a restored ledger table fail (the entry refers to a table id that is not
   registered), and `ledger_verify` reports the capture trigger of an unregistered
-  table. Use physical backups and standbys.
-- The clock: block times are the server's clock, kept from going backwards.
+  table. Use physical backups, standbys and `pg_upgrade` (tested).
+- The clock: block times are the server's clock, kept from going backwards; a
+  clock that jumped ahead gives its time to the blocks after it, which
+  `ledger_verify` reports and the builder refuses to extend (see "Who can write
+  the ledger tables", "The time of a block").
 - **Updatable tables.** Everything that changes a row through SQL fires the
   capture trigger, which is `ENABLE ALWAYS`; the ways around it are the ones
   above (catalog edits, event triggers off for the `ADD COLUMN` follow-up,
@@ -1473,7 +1716,13 @@ it has been looked at, not by how likely it is to be wrong.
 6. **Cancellation is swallowed on purpose** in `ledger_verify_recorded` (it records
    a cancelled run and returns normally). A caller that sends several statements
    in one request and cancels the first will see the others run.
-7. **Not run at all**: `EXEC_BACKEND` (Windows) builds, `pg_upgrade`, a standby that
+7. **The write guard** (`src/guard.c`): the list of what the executor hook sees
+   (check it against the callers of `ExecCheckPermissions` of the major you run, and
+   against any new way to write a relation that does not call it, as the apply
+   worker did not), the marker around the statements of the library (every other
+   `SPI` call of the library must be a read), and the two places that decide
+   "allowed" (`kl_write_allowed`, the check hook of `allow_manual_write`).
+8. **Not run at all**: `EXEC_BACKEND` (Windows) builds, a standby that
    is promoted while a worker is running a failure delay, and concurrent `ALTER
    TABLE ... OWNER TO` of the same table by two sessions.
 
