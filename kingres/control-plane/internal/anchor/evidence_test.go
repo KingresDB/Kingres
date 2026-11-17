@@ -16,10 +16,12 @@ var (
 	goldenWORM = WORMEvidence{
 		Endpoint: "https://s3.example.net", Bucket: "anchors", Key: "kingres-anchors/ab12/00000000000000000017.note",
 		VersionID: "3HL4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY", ETag: `"d41d8cd98f00b204e9800998ecf8427e"`,
+		ObjectSHA256: strings.Repeat("cd", 32), ContentLength: 321,
 		LockMode: "COMPLIANCE", RetainUntil: "2036-12-01T10:00:00Z", LastModified: "2026-12-01T10:00:01Z", RecordedBy: "cluster",
 	}
 	goldenWORMJSON = `{"endpoint":"https://s3.example.net","bucket":"anchors","key":"kingres-anchors/ab12/00000000000000000017.note",` +
-		`"version_id":"3HL4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY","etag":"\"d41d8cd98f00b204e9800998ecf8427e\"","lock_mode":"COMPLIANCE",` +
+		`"version_id":"3HL4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY","etag":"\"d41d8cd98f00b204e9800998ecf8427e\"",` +
+		`"object_sha256":"` + strings.Repeat("cd", 32) + `","content_length":321,"lock_mode":"COMPLIANCE",` +
 		`"retain_until":"2036-12-01T10:00:00Z","last_modified":"2026-12-01T10:00:01Z","recorded_by":"cluster"}`
 
 	goldenTSA = TSAEvidence{
@@ -30,9 +32,10 @@ var (
 		`"serial":"123456789012345678901234567890","policy":"1.2.3.4.1","recorded_by":"cluster"}`
 
 	otsDigest  = strings.Repeat("ab", 32)
-	goldenOTS  = OTSEvidence{Digest: otsDigest, Calendars: []OTSCalendar{{URI: "https://a.example", FragmentB64: "AQID"}, {URI: "https://b.example", FragmentB64: "BAUG"}}, Bitcoin: &OTSBitcoin{Height: 358391, CalendarURI: "https://b.example"}}
-	goldenOTSJ = `{"digest":"` + otsDigest + `","calendars":[{"uri":"https://a.example","fragment_b64":"AQID"},{"uri":"https://b.example","fragment_b64":"BAUG"}],` +
-		`"bitcoin":{"height":358391,"calendar_uri":"https://b.example"}}`
+	otsRoot    = strings.Repeat("12", 32)
+	goldenOTS  = OTSEvidence{Digest: otsDigest, SubmittedAt: "2026-12-01T10:00:00Z", Calendars: []OTSCalendar{{URI: "https://a.example", FragmentB64: "AQID"}, {URI: "https://b.example", FragmentB64: "BAUG"}}, Bitcoin: &OTSBitcoin{Height: 958391, CalendarURI: "https://b.example", MerkleRoot: otsRoot, Status: BitcoinClaimed}}
+	goldenOTSJ = `{"digest":"` + otsDigest + `","submitted_at":"2026-12-01T10:00:00Z","calendars":[{"uri":"https://a.example","fragment_b64":"AQID"},{"uri":"https://b.example","fragment_b64":"BAUG"}],` +
+		`"bitcoin":{"height":958391,"calendar_uri":"https://b.example","merkle_root":"` + otsRoot + `","status":"claimed","header":""}}`
 )
 
 func TestEvidenceGoldenBytes(t *testing.T) {
@@ -48,9 +51,9 @@ func TestEvidenceGoldenBytes(t *testing.T) {
 		}
 	}
 	// pending OTS: bitcoin is null, calendars is [] and never null
-	p := OTSEvidence{Digest: otsDigest}
+	p := OTSEvidence{Digest: otsDigest, SubmittedAt: "2026-12-01T10:00:00Z"}
 	got, err := EncodeEvidence(&p)
-	if err != nil || string(got) != `{"digest":"`+otsDigest+`","calendars":[],"bitcoin":null}` {
+	if err != nil || string(got) != `{"digest":"`+otsDigest+`","submitted_at":"2026-12-01T10:00:00Z","calendars":[],"bitcoin":null}` {
 		t.Fatalf("%s %v", got, err)
 	}
 	// AWS endpoint is the empty string, not absent
@@ -97,6 +100,9 @@ func TestEvidenceRejects(t *testing.T) {
 	for name, w := range map[string]WORMEvidence{
 		"no-bucket":     mut(func(w *WORMEvidence) { w.Bucket = "" }),
 		"no-key":        mut(func(w *WORMEvidence) { w.Key = "" }),
+		"no-version":    mut(func(w *WORMEvidence) { w.VersionID = "" }),
+		"no-sha":        mut(func(w *WORMEvidence) { w.ObjectSHA256 = "" }),
+		"upper-sha":     mut(func(w *WORMEvidence) { w.ObjectSHA256 = strings.Repeat("CD", 32) }),
 		"bad-mode":      mut(func(w *WORMEvidence) { w.LockMode = "compliance" }),
 		"sub-second":    mut(func(w *WORMEvidence) { w.RetainUntil = "2036-12-01T10:00:00.5Z" }),
 		"offset":        mut(func(w *WORMEvidence) { w.LastModified = "2026-12-01T11:00:01+01:00" }),
@@ -111,15 +117,16 @@ func TestEvidenceRejects(t *testing.T) {
 	}
 	tm := func(f func(*TSAEvidence)) TSAEvidence { w := goldenTSA; f(&w); return w }
 	for name, e := range map[string]TSAEvidence{
-		"no-url":     tm(func(e *TSAEvidence) { e.TSAURL = "" }),
-		"empty-tok":  tm(func(e *TSAEvidence) { e.TokenDERB64 = "" }),
-		"bad-b64":    tm(func(e *TSAEvidence) { e.TokenDERB64 = "!!" }),
-		"unpadded":   tm(func(e *TSAEvidence) { e.TokenDERB64 = "MAMCAQE" }),
-		"serial-0x":  tm(func(e *TSAEvidence) { e.Serial = "0x10" }),
-		"serial-neg": tm(func(e *TSAEvidence) { e.Serial = "-1" }),
-		"serial-lz":  tm(func(e *TSAEvidence) { e.Serial = "007" }),
-		"no-policy":  tm(func(e *TSAEvidence) { e.Policy = "" }),
-		"gen-time":   tm(func(e *TSAEvidence) { e.GenTime = "2026-12-01 10:00:02" }),
+		"no-url":      tm(func(e *TSAEvidence) { e.TSAURL = "" }),
+		"empty-tok":   tm(func(e *TSAEvidence) { e.TokenDERB64 = "" }),
+		"bad-b64":     tm(func(e *TSAEvidence) { e.TokenDERB64 = "!!" }),
+		"unpadded":    tm(func(e *TSAEvidence) { e.TokenDERB64 = "MAMCAQE" }),
+		"b64-newline": tm(func(e *TSAEvidence) { e.TokenDERB64 = "MAMC\nAQE=" }),
+		"serial-0x":   tm(func(e *TSAEvidence) { e.Serial = "0x10" }),
+		"serial-neg":  tm(func(e *TSAEvidence) { e.Serial = "-1" }),
+		"serial-lz":   tm(func(e *TSAEvidence) { e.Serial = "007" }),
+		"no-policy":   tm(func(e *TSAEvidence) { e.Policy = "" }),
+		"gen-time":    tm(func(e *TSAEvidence) { e.GenTime = "2026-12-01 10:00:02" }),
 	} {
 		if _, err := EncodeEvidence(e); err == nil {
 			t.Errorf("tsa %s accepted", name)
@@ -128,6 +135,8 @@ func TestEvidenceRejects(t *testing.T) {
 	om := func(f func(*OTSEvidence)) OTSEvidence {
 		w := goldenOTS
 		w.Calendars = append([]OTSCalendar(nil), w.Calendars...)
+		b := *w.Bitcoin
+		w.Bitcoin = &b
 		f(&w)
 		return w
 	}
@@ -136,8 +145,25 @@ func TestEvidenceRejects(t *testing.T) {
 		"upper-digest": om(func(e *OTSEvidence) { e.Digest = strings.ToUpper(otsDigest) }),
 		"dup-calendar": om(func(e *OTSEvidence) { e.Calendars[1].URI = e.Calendars[0].URI }),
 		"empty-frag":   om(func(e *OTSEvidence) { e.Calendars[0].FragmentB64 = "" }),
-		"unknown-cal":  om(func(e *OTSEvidence) { e.Bitcoin = &OTSBitcoin{Height: 1, CalendarURI: "https://z.example"} }),
-		"huge-height":  om(func(e *OTSEvidence) { e.Bitcoin = &OTSBitcoin{Height: 1 << 40, CalendarURI: "https://a.example"} }),
+		"unknown-cal": om(func(e *OTSEvidence) {
+			e.Bitcoin = &OTSBitcoin{Height: 1, CalendarURI: "https://z.example", MerkleRoot: otsRoot, Status: BitcoinClaimed}
+		}),
+		"huge-height": om(func(e *OTSEvidence) {
+			e.Bitcoin = &OTSBitcoin{Height: 1 << 40, CalendarURI: "https://a.example", MerkleRoot: otsRoot, Status: BitcoinClaimed}
+		}),
+		"limit+1": om(func(e *OTSEvidence) {
+			e.Bitcoin = &OTSBitcoin{Height: MaxBitcoinHeight + 1, CalendarURI: "https://a.example", MerkleRoot: otsRoot, Status: BitcoinClaimed}
+		}),
+		"no-status":    om(func(e *OTSEvidence) { e.Bitcoin.Status = "" }),
+		"anchored":     om(func(e *OTSEvidence) { e.Bitcoin.Status = "anchored" }),
+		"short-root":   om(func(e *OTSEvidence) { e.Bitcoin.MerkleRoot = "12" }),
+		"claim-header": om(func(e *OTSEvidence) { e.Bitcoin.Header = strings.Repeat("12", 80) }),
+		"checked-none": om(func(e *OTSEvidence) { e.Bitcoin.Status = BitcoinHeaderChecked }),
+		"checked-root": om(func(e *OTSEvidence) {
+			e.Bitcoin.Status, e.Bitcoin.Header = BitcoinHeaderChecked, strings.Repeat("00", 80)
+		}),
+		"no-submitted": om(func(e *OTSEvidence) { e.SubmittedAt = "" }),
+		"frag-b64-nl":  om(func(e *OTSEvidence) { e.Calendars[0].FragmentB64 = "AQ\nID" }),
 	} {
 		if _, err := EncodeEvidence(e); err == nil {
 			t.Errorf("ots %s accepted", name)
@@ -178,14 +204,66 @@ func TestParseRejectsUnknownAndTrailing(t *testing.T) {
 			t.Errorf("accepted %q", s)
 		}
 	}
-	// whitespace is tolerated on parse, and the canonical form is restored on encode
-	spaced := strings.ReplaceAll(goldenWORMJSON, ",", ", ")
-	w, err := ParseWORMEvidence([]byte(" " + spaced + "\n"))
+	if _, err := ParseWORMEvidence([]byte(goldenWORMJSON)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A1-14: the parsers accept the canonical encoding and nothing else, so that a
+// stored file cannot be altered without changing what it parses to, and a
+// verifier written from the text (exact names, no duplicates, compact) reads
+// the same as this one.
+func TestParseIsCanonicalOnly(t *testing.T) {
+	digest := hex.EncodeToString(bytes.Repeat([]byte{7}, 32))
+	tev, _ := EncodeEvidence(goldenTSA)
+	oev, _ := EncodeEvidence(goldenOTS)
+	cases := map[string]string{
+		"upper-case-name": strings.Replace(goldenWORMJSON, `"bucket"`, `"BUCKET"`, 1),
+		"escaped-name":    strings.Replace(goldenWORMJSON, `"bucket"`, `"buck\u0065t"`, 1),
+		"duplicate":       strings.Replace(goldenWORMJSON, `"bucket":"anchors"`, `"bucket":"x","bucket":"anchors"`, 1),
+		"spaces":          strings.ReplaceAll(goldenWORMJSON, ",", ", "),
+		"leading-space":   " " + goldenWORMJSON,
+		"trailing-nl":     goldenWORMJSON + "\n",
+		"escaped-value":   strings.Replace(goldenWORMJSON, `"anchors"`, `"anchor\u0073"`, 1),
+		"reordered":       `{"bucket":"anchors",` + strings.TrimPrefix(strings.Replace(goldenWORMJSON, `"bucket":"anchors",`, "", 1), "{"),
+	}
+	for name, s := range cases {
+		if _, err := ParseWORMEvidence([]byte(s)); err == nil {
+			t.Errorf("worm evidence %s accepted", name)
+		}
+	}
+	if _, err := ParseTSAEvidence([]byte(strings.Replace(string(tev), `"serial"`, `"Serial"`, 1))); err == nil {
+		t.Error("tsa evidence with a name in another case accepted")
+	}
+	if _, err := ParseOTSEvidence([]byte(strings.Replace(string(oev), `"bitcoin"`, `"Bitcoin"`, 1))); err == nil {
+		t.Error("ots evidence with a name in another case accepted")
+	}
+	if _, err := ParseOTSEvidence([]byte(strings.Replace(string(oev), `"calendars":[`, `"calendars":null,"x":[`, 1))); err == nil {
+		t.Error("ots evidence with null calendars accepted")
+	}
+	// the same for a whole file: every variation of a canonical file is refused
+	ev, _ := EncodeEvidence(goldenWORM)
+	file, err := EncodeEvidenceFile(EvidenceFile{Kind: KindWORM, Origin: "o", Size: 1, PayloadSHA256: digest, CreatedAt: t0, Evidence: ev})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b, _ := EncodeEvidence(w); string(b) != goldenWORMJSON {
-		t.Fatal("not canonical")
+	if _, err := ParseEvidenceFile(file); err != nil {
+		t.Fatal(err)
+	}
+	fs := string(file)
+	for name, s := range map[string]string{
+		"upper-case-name": strings.Replace(fs, `"origin"`, `"Origin"`, 1),
+		"escaped-name":    strings.Replace(fs, `"origin"`, `"orig\u0069n"`, 1),
+		"duplicate":       strings.Replace(fs, `"size":1`, `"size":2,"size":1`, 1),
+		"spaces":          strings.Replace(fs, `"size":1`, `"size": 1`, 1),
+		"newline":         fs + "\n",
+		"inner-spaces":    strings.Replace(fs, `"bucket":"anchors"`, `"bucket" : "anchors"`, 1),
+		"size-1.0":        strings.Replace(fs, `"size":1,`, `"size":1.0,`, 1),
+		"invalid-utf8":    strings.Replace(fs, `"origin":"o"`, "\"origin\":\"o\xff\"", 1),
+	} {
+		if _, err := ParseEvidenceFile([]byte(s)); err == nil {
+			t.Errorf("file %s accepted", name)
+		}
 	}
 }
 

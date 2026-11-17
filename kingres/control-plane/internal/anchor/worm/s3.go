@@ -202,6 +202,11 @@ func (s *s3) statusError(op string, r *response) *anchor.Error {
 	}
 	e.Text = text
 	switch {
+	case code == "RequestTimeTooSkewed":
+		// the cause is a clock (ours or the store's), not the credentials: it
+		// is retried with backoff and the text names the clock
+		e.Class, e.Code = anchor.ClassRetryable, "clock_skew"
+		e.Text = "the store says the clock of this server and its own differ too much (RequestTimeTooSkewed): check the time of both"
 	case r.status >= 300 && r.status < 400:
 		e.Class, e.Code, e.Text = anchor.ClassPermanent, "redirect", "the store answered with a redirect (wrong endpoint or region?); redirects are not followed"
 	case r.status == http.StatusNotFound && (code == "NoSuchBucket" || code == "ObjectLockConfigurationNotFoundError"):

@@ -99,6 +99,16 @@ kc_relation_vacuum(KC_VACUUM_PARAMS)
 	if (!kc_rel_is_columnar(rel))
 		return;
 
+	/*
+	 * Deletes catalog rows and shortens the file: nothing where the server
+	 * forbids an error.  VACUUM runs outside a transaction block and never at
+	 * such a moment, so only a module that calls the access method itself gets
+	 * here; a vacuum that is skipped loses nothing, the next one does the same
+	 * work.
+	 */
+	if (kc_entry_refused("vacuum", RelationGetRelationName(rel), false))
+		return;
+
 	/* the catalog reads below need a snapshot */
 	if (!ActiveSnapshotSet())
 	{

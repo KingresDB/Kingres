@@ -2235,6 +2235,38 @@ build to the corrected rule. The verifier's README has the same list with the re
     at most 4,096 bytes and what is outside the chain at most 1 MiB, checked while the document is read;
     a larger one fails at the parse step. The memory of a proof is bounded by one header whatever the
     file holds.
+60. **What "anchored" means for OpenTimestamps (replaces 6.5 step 3; the first form made a record
+    anchored on the word of a calendar).** A Bitcoin attestation that a calendar returns is a claim. It
+    is accepted as a claim only after the checks that need no block header: the message it sits on is 32
+    bytes, the path from the digest is made of allowed operations and is recomputed from the digest, the
+    height is possible for the time of submission, and no other root is claimed at the same height. The
+    record then has the state `claimed`, which the contract shows as pending and which never counts as
+    anchored. It is `anchored` only when a source of block headers that the operator configures returned
+    the header of that height and the claim matched it (the merkle root, the proof of work, the block
+    time against the submission and the clock); the header is stored in the evidence. That the header is
+    on the best chain is for the auditor to check.
+61. **Evidence as written (replaces the evidence part of 35).** The WORM evidence adds the SHA-256 and the
+    length of the object, and its version id is never empty. The OpenTimestamps evidence adds the time of
+    submission, and its Bitcoin member holds the height, the calendar, the merkle root, a status
+    (`claimed` or `header_checked`) and the header. The parsers accept the canonical bytes only, so
+    evidence is stored as text, not as a JSON column that reorders it.
+62. **RFC 3161 (6.4; adds to 36).** A token whose time is further from the clock than a tolerance (300
+    seconds by default) in either direction is refused, and the chain must be valid now as well as at the
+    time of the token. Added checks: an RSA key of at least 2,048 bits, the issuer in the
+    signing-certificate attribute, the name of the authority in the token, the key usage of the signer.
+63. **WORM (6.3; adds to 38).** Compliance is the default mode; governance is an explicit choice with a
+    warning, since a principal with the bypass permission can delete the version. The time of the store
+    is bounded against the clock. The read-back is by version id; a later version written by somebody
+    else is not a conflict when our locked version exists; a version of ours that was stored without a
+    lock gets its retention applied by the next attempt.
+64. **The record of an anchor (6.6; replaces the counting in 38).** One table of states and events; an
+    event that is not allowed leaves the record unchanged. Refusals are counted apart from other
+    failures (the fourth refusal in a row fails the record); retryable failures end after 200 attempts or
+    7 days, with the alert. Every fragment of an OpenTimestamps proof has its own budget of lookups in a
+    round, and the answer of one calendar that is bad, oversized or implausible is dropped alone.
+65. **Clients and payloads (6.8).** The packages never use a proxy from the environment; the HTTP client
+    is built from given roots with TLS 1.2 or later and timeouts. Every target checks that the digest of
+    a payload is the SHA-256 of its note.
 
 Of section 13: item 2 (test vectors) is settled for signed notes (the example key and note of the
 specification are in the tests; the checkpoint example has no published key), item 3 (entry bundles at

@@ -65,6 +65,7 @@ int			kc_guc_compression = KC_CODEC_AUTO;
 int			kc_guc_compression_level = 3;
 int			kc_guc_stripe_rows = 150000;
 int			kc_guc_max_stripe_rows = KC_MAX_STRIPE_ROWS;
+int			kc_guc_orphan_notes_max = KC_ORPHAN_NOTES_MAX;
 int			kc_guc_chunk_rows = 10000;
 int			kc_guc_write_buffer_kb = 131072;
 bool		kc_guc_enable_custom_scan = true;
@@ -96,7 +97,13 @@ kc_object_access(ObjectAccessType access, Oid classId, Oid objectId, int subId,
 {
 	if (kc_prev_object_access_hook)
 		kc_prev_object_access_hook(access, classId, objectId, subId, arg);
-	if (access == OAT_DROP && classId == RelationRelationId && subId == 0)
+	/*
+	 * A drop runs in a live transaction, so the note is made; a module that
+	 * calls the hook where an error is forbidden gets a warning and no note (the
+	 * leftover rows of the file are removed by VACUUM and columnar_check(true)).
+	 */
+	if (access == OAT_DROP && classId == RelationRelationId && subId == 0 &&
+		!kc_entry_refused("drop note", NULL, false))
 		kc_write_note_dropped(objectId);
 }
 
@@ -141,6 +148,17 @@ _PG_init(void)
 							"Most rows the writer puts in one stripe (testing: lowers the compiled limit).",
 							NULL, &kc_guc_max_stripe_rows, KC_MAX_STRIPE_ROWS,
 							KC_MIN_STRIPE_ROWS, KC_MAX_STRIPE_ROWS,
+							PGC_SUSET, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+	/*
+	 * A developer setting, for tests: it lowers the number of files that the
+	 * commit of a transaction keeps for the next transaction to clean up (the
+	 * ones another module dropped after the cleanup had run), so that the limit
+	 * can be tested with a handful of tables.  It cannot raise the compiled limit.
+	 */
+	DefineCustomIntVariable("kingres_columnar.orphan_notes_max",
+							"Most files kept for the next transaction to clean up after (testing: lowers the compiled limit).",
+							NULL, &kc_guc_orphan_notes_max, KC_ORPHAN_NOTES_MAX,
+							1, KC_ORPHAN_NOTES_MAX,
 							PGC_SUSET, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 	DefineCustomIntVariable("kingres_columnar.chunk_row_count",
 							"Rows of a chunk group of a new columnar table.",
@@ -235,6 +253,9 @@ kingres_columnar_set_options(PG_FUNCTION_ARGS)
 	KcMetaData	m;
 	KcOptions	opts;
 
+	/* writes the metapage: refused where the server forbids an error */
+	if (kc_entry_refused("columnar_set_options", NULL, true))
+		PG_RETURN_VOID();
 	if (PG_ARGISNULL(0))
 		ereport(ERROR,
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
@@ -421,6 +442,9 @@ kingres_columnar_compact(PG_FUNCTION_ARGS)
 	uint32		minrows;
 	int			n;
 
+	/* writes stripes and catalog rows: refused where the server forbids an error */
+	if (kc_entry_refused("columnar_compact", NULL, true))
+		PG_RETURN_INT32(0);
 	if (PG_ARGISNULL(0))
 		ereport(ERROR,
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
@@ -454,6 +478,9 @@ kingres_columnar_compact(PG_FUNCTION_ARGS)
 Datum
 kingres_columnar_reconcile(PG_FUNCTION_ARGS)
 {
+	/* deletes catalog rows; skipping it loses nothing, the next call does it */
+	if (kc_entry_refused("columnar_reconcile", NULL, false))
+		PG_RETURN_INT32(0);
 	PG_RETURN_INT32(kc_catalog_reconcile());
 }
 
@@ -497,13 +524,18 @@ Datum
 kingres_columnar_note_rewrite(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
+	Relation	rel;
+
+	/* a note in memory only, but it reads the catalog: refused where an error is forbidden */
+	if (kc_entry_refused("columnar_note_rewrite", NULL, false))
+		PG_RETURN_VOID();
 	/*
 	 * Called from the table_rewrite event trigger of the earlier script, where
 	 * the rewrite holds the relation exclusively, and by hand: a lock of our own
 	 * (a relation is never opened without one) makes it safe for both, and a
 	 * note of a file the table still has deletes nothing.
 	 */
-	Relation	rel = try_relation_open(relid, AccessShareLock);
+	rel = try_relation_open(relid, AccessShareLock);
 
 	if (rel != NULL)
 	{
@@ -525,6 +557,9 @@ kingres_columnar_finish_rewrites(PG_FUNCTION_ARGS)
 	bool		pushed = false;
 	int			n;
 
+	/* deletes catalog rows; the commit does the same work, so skipping it loses nothing */
+	if (kc_entry_refused("columnar_finish_rewrites", NULL, false))
+		PG_RETURN_INT32(0);
 	if (!ActiveSnapshotSet())
 	{
 		PushActiveSnapshot(GetTransactionSnapshot());
@@ -539,7 +574,8 @@ kingres_columnar_finish_rewrites(PG_FUNCTION_ARGS)
 static void
 kc_check_one(Oid relid, bool fix, ReturnSetInfo *rsinfo)
 {
-		Relation	rel = try_relation_open(relid, fix ? ShareUpdateExclusiveLock : AccessShareLock);
+		LOCKMODE	lockmode = fix ? ShareUpdateExclusiveLock : AccessShareLock;
+		Relation	rel;
 		bool		mvcc;
 		Snapshot	cs;
 		int			n;
@@ -547,10 +583,30 @@ kc_check_one(Oid relid, bool fix, ReturnSetInfo *rsinfo)
 		KcStripeInfo *s;
 		BlockNumber nblocks;
 
+		/*
+		 * Never wait for a lock: a prepared transaction that holds a table
+		 * exclusively (a prepared TRUNCATE, a rewrite) keeps it until someone
+		 * ends it, and the check would wait with it, without end.  A table that
+		 * cannot be locked now is reported as not checked and the rest goes on.
+		 */
+		if (!ConditionalLockRelationOid(relid, lockmode))
+		{
+			Datum		values[3];
+			bool		nulls[3] = {false, false, false};
+
+			values[0] = CStringGetTextDatum("not_checked");
+			values[1] = ObjectIdGetDatum(relid);
+			values[2] = CStringGetTextDatum("the table is locked by another transaction, possibly a prepared one, and was not checked; end that transaction and run the check again");
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+			return;
+		}
+		rel = try_relation_open(relid, NoLock);
 		if (rel == NULL || !kc_rel_is_columnar(rel))
 		{
 			if (rel)
-				relation_close(rel, NoLock);
+				relation_close(rel, lockmode);
+			else
+				UnlockRelationOid(relid, lockmode);
 			return;
 		}
 		cs = kc_catalog_snapshot(GetActiveSnapshot(), &mvcc);
@@ -684,6 +740,10 @@ kingres_columnar_check(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
 				 errmsg("cannot repair columnar tables during recovery")));
 	InitMaterializedSRF(fcinfo, 0);
+
+	/* the repair deletes catalog rows: refused where the server forbids an error */
+	if (fix && kc_entry_refused("columnar_check(true)", NULL, false))
+		return (Datum) 0;
 
 	pgclass = table_open(RelationRelationId, AccessShareLock);
 	scan = table_beginscan_catalog(pgclass, 0, NULL);

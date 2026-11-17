@@ -33,7 +33,7 @@ type fakeCal struct {
 }
 
 func newFakeCal(t *testing.T, tls bool) *fakeCal {
-	f := &fakeCal{t: t, mode: "ok", height: 800000}
+	f := &fakeCal{t: t, mode: "ok", height: 950000}
 	h := http.HandlerFunc(f.handle)
 	if tls {
 		f.srv = httptest.NewTLSServer(h)
@@ -153,6 +153,7 @@ func (f *fakeCal) handle(w http.ResponseWriter, r *http.Request) {
 		n := NewNode(c)
 		x, _ := n.Child(Op{Tag: TagAppend, Arg: []byte("sibling-from-bitcoin-merkle-path")})
 		x, _ = x.Child(Op{Tag: TagSHA256})
+		x, _ = x.Child(Op{Tag: TagSHA256}) // a merkle node is a double SHA-256
 		a, _ := NewBitcoin(height)
 		x.AddAttestation(a)
 		b, _ := n.Serialize()

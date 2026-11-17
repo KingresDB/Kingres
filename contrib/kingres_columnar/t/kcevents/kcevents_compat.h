@@ -51,4 +51,44 @@ kce_table_tuple_update(Relation rel, ItemPointer tid, TupleTableSlot *slot,
 #endif
 }
 
+/* a sequential scan with the default flags: 19 takes the flags as an argument */
+static inline TableScanDesc
+kce_beginscan(Relation rel, Snapshot snap)
+{
+#if PG_VERSION_NUM >= 190000
+	return table_beginscan(rel, snap, 0, NULL, SO_NONE);
+#else
+	return table_beginscan(rel, snap, 0, NULL);
+#endif
+}
+
+/* 19 gives table_index_fetch_begin a flags argument */
+static inline IndexFetchTableData *
+kce_index_fetch_begin(Relation rel)
+{
+#if PG_VERSION_NUM >= 190000
+	return table_index_fetch_begin(rel, 0);
+#else
+	return table_index_fetch_begin(rel);
+#endif
+}
+
+/* 19 gives table_relation_copy_for_cluster a snapshot argument */
+static inline void
+kce_copy_for_cluster(Relation old_rel, Relation new_rel, TransactionId oldest_xmin,
+					 TransactionId *xid_cutoff, MultiXactId *multi_cutoff,
+					 double *num_tuples, double *tups_vacuumed,
+					 double *tups_recently_dead)
+{
+#if PG_VERSION_NUM >= 190000
+	table_relation_copy_for_cluster(old_rel, new_rel, NULL, false, oldest_xmin,
+									InvalidSnapshot, xid_cutoff, multi_cutoff,
+									num_tuples, tups_vacuumed, tups_recently_dead);
+#else
+	table_relation_copy_for_cluster(old_rel, new_rel, NULL, false, oldest_xmin,
+									xid_cutoff, multi_cutoff,
+									num_tuples, tups_vacuumed, tups_recently_dead);
+#endif
+}
+
 #endif							/* KCEVENTS_COMPAT_H */

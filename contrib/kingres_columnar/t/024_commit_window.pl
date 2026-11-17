@@ -27,28 +27,13 @@ use strict;
 use warnings FATAL => 'all';
 
 use FindBin;
+use lib $FindBin::RealBin;
+use KcProbe qw(build_module);
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
-my $src = "$FindBin::RealBin/kcprobe/kcprobe.c";
-my $dir = PostgreSQL::Test::Utils::tempdir();
-my $pg_config = $ENV{PG_CONFIG} || 'pg_config';
-my $inc = `$pg_config --includedir-server 2>/dev/null`;
-chomp $inc;
-my $cc = `$pg_config --cc 2>/dev/null`;
-chomp $cc;
-$cc = 'cc' if $cc eq '';
-
-my $built = 0;
-if ($inc ne '' && -f $src && -d $inc)
-{
-	my $out = `$cc -shared -fPIC -I"$inc" -o "$dir/kcprobe.so" "$src" 2>&1`;
-	$built = ($? == 0 && -f "$dir/kcprobe.so");
-	diag("building the probe module failed: $out") unless $built;
-}
-plan skip_all => 'the probe module (t/kcprobe/kcprobe.c) could not be built here: it needs a C compiler and the server headers'
-  unless $built;
+my $dir = build_module('kcprobe');
 
 foreach my $order ('after', 'before')
 {

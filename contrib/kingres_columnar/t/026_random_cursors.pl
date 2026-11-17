@@ -25,21 +25,27 @@
 #   ceiling   nested savepoints of wide rows until the write buffers reach their
 #             ceiling: the error is the answer, and the comparison is skipped
 #
-# What the episodes reach is counted, not assumed: each episode ends by reading
-# kingres.columnar_write_paths() of its own session, and the file fails when a path
-# that it claims to reach was never taken in the run (write-through after the
-# commit-time flush and in the window, memory-pressure flushes, a committing
-# subtransaction's own flush, the hand-over's flush, the flush of a full stripe, a
-# flush refused because a hand-over was prepared, the ceiling of a write).  The
-# ceiling of a hand-over cannot be reached by random statements (it takes cursors
-# and four levels at exact sizes) and is the scripted case below.
+# What the file reaches is counted, not assumed, and the two parts are held to
+# different standards (C8-07: a test that fails without a defect is worse than no
+# test).  A scripted prelude takes each path of the write side that the file claims
+# to reach once, by construction, with the exact statements that reach it (write-
+# through after the commit-time flush and in the window, memory-pressure flushes, a
+# committing subtransaction's own flush, the hand-over's flush, the flush of a full
+# stripe, a flush refused because a hand-over was prepared, the ceiling of a write,
+# the ceiling of a hand-over), and the file fails when the prelude does not take one:
+# that is a change of the code and not of a seed.  The random part then compares with
+# the heap twin, and the counters of its episodes are reported at the end, with a
+# note for a path that this run's random episodes did not take: it says whether the
+# generator still reaches the paths on average, and it is not asserted per run,
+# because with a random seed an assertion on a count would fail one run in thirty.
 #
 # The seed is random for each run, printed, and replayed with KC_FUZZ_SEED; the
 # number of episodes is KC_FUZZ_EPISODES (default 90).  A failure prints the
 # script of the episode that differed.
 #
-# Needs a compiler and the server's headers for the probe module; where it cannot
-# be built the test is skipped with the reason.
+# Needs a compiler and the server's headers for the probe module (KcProbe.pm: a
+# machine without a compiler skips the file with a message that names the module,
+# a build that fails fails the file).
 #
 # Portions Copyright (c) 2026, RooyeKhat Media Co
 # SPDX-License-Identifier: AGPL-3.0-only
@@ -227,6 +233,80 @@ $PATHS_SQL");
 		'scripted: the release of a level that would leave more than twice the allowance is refused');
 	count_paths($out, \%scripted);
 	cmp_ok($scripted{ceiling_handover} // 0, '==', 1, '... and the path counter saw it');
+}
+
+# ------------------------------------------------------------------------
+# The scripted prelude: every path the file names, taken once by construction.
+# Each script runs in a session of its own (the counters are the session's), on
+# columnar tables only; the result of each is checked against the number of rows it
+# wrote.  The sizes are those that reach the path with the allowance of 1 MB and the
+# stripe size of 1000 rows of table p (the numbers were measured; the accounting is
+# deterministic).
+# ------------------------------------------------------------------------
+{
+	my $set = "SET kingres_columnar.write_buffer_memory = '1MB';\n";
+	my @prelude = (
+		[ 'size_flush', "BEGIN;
+INSERT INTO p SELECT g, repeat('f', 20) FROM generate_series(1, 3500) g;
+COMMIT;" ],
+		[ 'pressure_flush', "BEGIN;
+INSERT INTO p SELECT g, repeat('a', 1000) FROM generate_series(1, 3000) g;
+COMMIT;" ],
+		[ 'own_flush', "BEGIN;
+INSERT INTO p VALUES (1, 'a');
+DO \$\$ BEGIN BEGIN INSERT INTO p SELECT g + 10, repeat('b', 280000) FROM generate_series(1, 2) g; EXCEPTION WHEN raise_exception THEN NULL; END; END \$\$;
+COMMIT;" ],
+		[ 'handover_flush', "BEGIN;
+INSERT INTO p SELECT g, repeat('c', 20) FROM generate_series(1, 900) g;
+SAVEPOINT s;
+INSERT INTO p SELECT g + 5000, repeat('c', 20) FROM generate_series(1, 200) g;
+RELEASE s;
+COMMIT;" ],
+		[ 'late_commit', "BEGIN;
+SET LOCAL kcprobe.commit_sql = 'INSERT INTO q SELECT g, \$\$w\$\$ FROM generate_series(1, 3) g';
+INSERT INTO p VALUES (1, 'a');
+COMMIT;" ],
+		# the window between the two phases of a hand-over: a COPY into a table made in the
+		# transaction meets a prepared buffer (the script of t/022): late_window and prepared_skip
+		[ 'late_window', "BEGIN;
+CREATE TABLE r (id int, pad text) USING columnar;
+SELECT kingres.columnar_set_options('r', stripe_row_count => 1000, chunk_row_count => 100);
+INSERT INTO r SELECT g, 'x' FROM generate_series(1, 999) g;
+SAVEPOINT s;
+INSERT INTO r VALUES (10001, 'x');
+SET kcprobe.sql = 'COPY r (id) FROM PROGRAM \$\$seq 20001 20007\$\$';
+RELEASE s;
+SET kcprobe.sql = '';
+COMMIT;" ],
+	);
+	foreach my $pr (@prelude)
+	{
+		my ($path, $sql) = @$pr;
+		$node->safe_psql('postgres', 'TRUNCATE p, h, q; DROP TABLE IF EXISTS r');
+		my ($out, $err) = run($set . $sql . "\n" . $PATHS_SQL);
+		unlike($err, qr/ERROR|TRAP|server closed/, "prelude: the statements for $path run without an error");
+		my %one;
+		count_paths($out, \%one);
+		$scripted{$_} += $one{$_} foreach keys %one;
+		cmp_ok($one{$path} // 0, '>', 0, "prelude: $path was taken (" . ($one{$path} // 0) . " times)");
+	}
+	# the window script reaches the guard that keeps prepared buffers from being flushed too
+	cmp_ok($scripted{prepared_skip} // 0, '>', 0, 'prelude: prepared_skip was taken (the guard of a prepared hand-over)');
+	$node->safe_psql('postgres', 'DROP TABLE IF EXISTS r');
+
+	# the ceiling of a write: nested savepoints of wide rows that nothing can write
+	{
+		$node->safe_psql('postgres', 'TRUNCATE p, h, q');
+		my $sql = "BEGIN;\n"
+			. join('', map { "SAVEPOINT s$_;\nINSERT INTO p SELECT g + $_ * 10, repeat('x', 250000) FROM generate_series(1, 2) g;\n" } 1 .. 10)
+			. "ROLLBACK;\n";
+		my ($out, $err) = run($set . $sql . $PATHS_SQL);
+		like($err, qr/the write buffers of columnar tables hold \d+ bytes, more than the limit of 2097152 bytes/, 'prelude: nested savepoints of wide rows reach the limit of the write buffers');
+		my %one;
+		count_paths($out, \%one);
+		$scripted{$_} += $one{$_} foreach keys %one;
+		cmp_ok($one{ceiling_write} // 0, '>', 0, 'prelude: ceiling_write was taken (' . ($one{ceiling_write} // 0) . ' times)');
+	}
 }
 
 # ------------------------------------------------------------------------
@@ -474,17 +554,23 @@ for my $n (1 .. $episodes)
 	}
 }
 diag('profiles: ' . join(' ', map { "$_=$profiles{$_}" } sort keys %profiles));
-diag('paths taken: ' . join(' ', map { "$_=" . ($paths{$_} // 0) } sort grep { $_ ne 'bytes_held' } keys %paths));
+diag('paths taken: ' . join(' ', map { "$_=" . ($paths{$_} // 0) } sort grep { $_ ne 'bytes_held' && $_ ne 'orphans_kept' } keys %paths));
 
 is($differences, 0, "$episodes episodes of savepoints, cursors and writes under memory pressure: no difference from the heap twin in $checks comparisons");
 cmp_ok($refused, '<=', int($episodes * 0.4), "... and at most 40 percent of the episodes ran into the limit of the buffers' memory ($refused; the ceiling profile does by design)");
 cmp_ok($checks, '>=', $episodes, '... and the episodes did compare something');
 
-# the paths the episodes claim to reach: each taken at least once, or the generator no longer reaches it
+# the paths the file claims to reach: each is taken by the prelude (asserted above, by
+# construction); how often the random episodes of this run took it is reported, because it
+# says whether the generator still reaches the paths on average, and is not asserted: the
+# count of a path that is rare in a random run (prepared_skip: 0 in about one run in thirty)
+# is a property of the seed and not of the code
 foreach my $path (qw(late_commit late_window pressure_flush own_flush handover_flush size_flush prepared_skip ceiling_write))
 {
 	my $hits = $paths{$path} // 0;
-	cmp_ok($hits, '>', 0, "path $path was taken by the random episodes ($hits times)");
+	my $by = $scripted{$path} // 0;
+	diag("path $path: the prelude $by times, the random episodes $hits times" . ($hits == 0 ? ' (REPORT: the random part of this run did not take it)' : ''));
+	cmp_ok($by, '>', 0, "path $path is taken by the scripted prelude ($by times; the random part took it $hits times)");
 }
 
 $node->stop;

@@ -43,9 +43,10 @@ SELECT name, setting, unit, vartype, enumvals, context, boot_val,
  kingres_columnar.enable_chunk_skipping | on       |      | bool    |                           | user      | on       |         | 
  kingres_columnar.enable_custom_scan    | on       |      | bool    |                           | user      | on       |         | 
  kingres_columnar.max_stripe_rows       | 10000000 |      | integer |                           | superuser | 10000000 | 1000    | 10000000
+ kingres_columnar.orphan_notes_max      | 10000    |      | integer |                           | superuser | 10000    | 1       | 10000
  kingres_columnar.stripe_row_count      | 150000   |      | integer |                           | user      | 150000   | 1000    | 10000000
  kingres_columnar.write_buffer_memory   | 131072   | kB   | integer |                           | user      | 131072   |         | 
-(8 rows)
+(9 rows)
 
 SHOW kingres_columnar.compression;
  kingres_columnar.compression 

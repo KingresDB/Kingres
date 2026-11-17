@@ -20,7 +20,11 @@
 // attribute and named by the sid; its extended key usage extension critical
 // and holding id-kp-timeStamping alone; a chain to the configured trust
 // anchors with validity checked at genTime and the timeStamping key usage
-// required of the whole chain. Nothing is stored, no goroutine outlives a
+// required of the whole chain; an RSA signer key of at least 2048 bits; the
+// ESSCertID issuer, when present, the certificate's issuer; the TSTInfo tsa
+// name, when present, a name of the certificate; the key usage of the signer,
+// when present, allowing a signature. Submit also bounds the time against the
+// clock (below). Nothing is stored, no goroutine outlives a
 // call, the context is the timeout (Config.TimeoutSeconds, default 20, only
 // bounds it further), responses are read up to MaxResponseBytes, a redirect
 // is followed only to the same host, port and scheme (three hops at most)
@@ -44,10 +48,31 @@
 // seconds, in UTC, format "2006-01-02T15:04:05Z"; serial is the TSTInfo serial
 // in decimal; policy is the TSTInfo policy. Receipt.EvidenceTime is genTime
 // (with its sub-seconds); Receipt.State is "anchored" at once; NextCheck is nil.
+// The URL has no query and no user information (the file is public). The token
+// is accepted by Submit only if genTime is within Config.MaxSkewSeconds (default
+// 300) of the clock in either direction (code "time_skew", class refused) and
+// the signing certificate chains to the roots at the clock as well as at
+// genTime (code "chain_not_trusted_now", class refused): a token dated inside
+// the validity window of a certificate that has expired is never recorded as
+// anchored now. This is applied by Submit, the method of the interface, and not
+// by VerifyStoredToken, because stored evidence is judged at genTime alone (the
+// right rule for evidence years later).
 //
 // A later check of stored evidence is VerifyEvidence (token as in
 // VerifyStoredToken, then gen_time, serial and policy of the evidence equal
 // the token's). VerifyStoredToken does not check the nonce, which is not kept.
+// What a verifier written from this text must reproduce: the digest the token
+// stamps is SHA-256 of the checkpoint text (payload_sha256 of the file, not in
+// the evidence); the chain is built to the verifier's own roots with the
+// validity checked at genTime and not at the verifier's clock; the signer
+// certificate carries id-kp-timeStamping alone, critical. The tokens in stored
+// evidence are strict DER (the cluster stored only tokens that passed that
+// reader), so a verifier that also reads BER reads them all; it should not
+// accept a new token that is BER. tsa_url is informational and not part of
+// what is signed. The certificates carried by the token are not covered by any
+// signature except the signer's, which is bound by its ESSCertID hash: the
+// stored bytes of an intermediate or a root that the token carries are not
+// authenticated, which is why the roots are the verifier's own.
 //
 // # What the caller must do
 //
@@ -64,9 +89,9 @@
 //     anchor.CodeOf gives a stable tag (the Code* constants and "tsa_waiting",
 //     "tsa_rejected", "tsa_unavailable", "tsa_revocation", "no_token",
 //     "content_type", "http_status", "transport").
-//   - Raise the ledgerAnchorBehind alert when SubmitDetailed returns a
-//     Warning with Code "skew" (genTime more than MaxSkew, 5 minutes, from the
-//     clock). The anchor itself is kept.
+//   - Raise ledgerAnchorBehind from the age of the newest anchor, not from the
+//     token: a token whose genTime is more than the tolerance from the clock is
+//     not recorded at all (time_skew).
 //   - Make Submit idempotent per Payload.ID at the record level: every call
 //     sends a new nonce and gets a new token; the first stored token wins.
 //
@@ -96,6 +121,11 @@
 //
 // # Choices where the design is silent or differs from an RFC
 //
+//   - A reply of another media type (a captive portal, a proxy page, an error
+//     page that answers 200) is retryable, and a token in BER (indefinite length
+//     or a constructed OCTET STRING, which some authorities emit) is refused for
+//     ever as bad_der: use another authority or ask the operator of this one for
+//     DER.
 //   - Signature digests: SHA-256, SHA-384 and SHA-512 (the design text names
 //     256 and 384). The SignerInfo digestAlgorithm decides; a signature
 //     algorithm OID that names a digest must agree with it. Signature
@@ -113,8 +143,12 @@
 //   - SignedData version and SignerInfo version: 1 or 3.
 //   - The policy: when Config.PolicyOID is set the token's policy must equal
 //     it; otherwise any policy is accepted and recorded.
-//   - The TSTInfo "tsa" field is not used. A TSTInfo extension is accepted if
-//     it is not critical (RFC 3161 section 2.4.2) and ignored.
+//   - The TSTInfo "tsa" field, when present, must be the subject, a directoryName,
+//     DNS name, URI or e-mail address of the subject alternative name of the
+//     signer (RFC 3161 2.4.2); a GeneralName of another kind does not match.
+//     A TSTInfo extension is accepted if it is not critical and ignored.
+//   - The RSA key of the signer must have 2048 bits or more (the floor of the
+//     toolchain would let 1024 pass, and a GODEBUG setting lower still).
 //   - A token whose certificate chain reaches a configured trust anchor at
 //     genTime is accepted even if the certificate has expired since.
 //   - Media types: the reply must be application/timestamp-reply or
@@ -125,8 +159,8 @@
 //     calls every rejection failed, but those two are transient by name.
 //   - http and https TSA URLs are accepted (public authorities answer over
 //     plain http and the token is self-authenticating); HTTP Basic
-//     credentials are sent over whatever scheme the URL has, so use https when
-//     they are set. User information inside the URL is refused.
+//     credentials over http:// are refused unless Config.AllowInsecure is set.
+//     User information and a query inside the URL are refused.
 //   - The request nonce is 64 random bits read as an unsigned integer (zero is
 //     replaced by one), so it is positive and may take nine DER bytes.
 //   - The trust bundle must contain at least one self-signed certificate; a

@@ -20,7 +20,32 @@
  *	  kcevents.count  how many rows to write at that moment (default 1)
  *	  kcevents.op     what to do there: insert (default), bulk (a batch with
  *	                  table_multi_insert), delete, update, lock, speculative,
- *	                  finish (table_finish_bulk_insert)
+ *	                  finish (table_finish_bulk_insert), and one operation for
+ *	                  every other entry point of the table access method:
+ *	                  ntrunc (relation_nontransactional_truncate), setnew
+ *	                  (relation_set_new_filelocator), copydata
+ *	                  (relation_copy_data), cluster (relation_copy_for_cluster),
+ *	                  vacuum (relation_vacuum), scan (scan_begin,
+ *	                  scan_getnextslot, scan_end), size (relation_size),
+ *	                  estimate (relation_estimate_size), idxfetch (the index
+ *	                  fetch callbacks), fetchrow (tuple_fetch_row_version),
+ *	                  tidvalid (tuple_tid_valid), idxdel (index_delete_tuples),
+ *	                  idxbuild (index_build_range_scan), idxvalidate
+ *	                  (index_validate_scan), sample (the TABLESAMPLE callbacks);
+ *	                  and, for the other entry points of the extension: objhook
+ *	                  (the object access hook, for a drop of the table), fn
+ *	                  (the SQL functions registered with kcevents_fn)
+ *	  kcevents.crit   on: run the operation inside a critical section, which
+ *	                  makes a build with assertions trap any allocation that the
+ *	                  access method makes on the way (the refusal path of the
+ *	                  extension allocates nothing)
+ *	  kcevents.once   on: act at the first moment the setting names and not again
+ *	                  in the same transaction (a script with several savepoints
+ *	                  then makes one call and not one for each of them)
+ *	  kcevents.hook_raise
+ *	                  on: an emit_log_hook that raises an ERROR for a message
+ *	                  that contains "refused on columnar" (what a hook of
+ *	                  another module may do to any WARNING)
  *
  *	  kcevents_open(table)   open the table (RowExclusiveLock) and hold it
  *	                         until the end of the transaction, for the writes
@@ -28,6 +53,17 @@
  *	  kcevents_crit()        write one row inside a critical section (what a
  *	                         caller must never do; shows what the server does)
  *	  kcevents_writes()      how many writes the module has made
+ *	  kcevents_fn(name, nargs)
+ *	                         register a C function of the extension (the name of
+ *	                         its symbol, and how many arguments it takes) to be
+ *	                         called by the op fn, the way another module calls it
+ *	                         directly: the first argument is the table, the others
+ *	                         null; the list is forgotten at the end of the
+ *	                         transaction
+ *	  kcevents_walk(table)   one row for every callback of the table's access
+ *	                         method routine: its offset, its name and the
+ *	                         decision the extension has recorded for it (null:
+ *	                         none)
  *	  kcevents_write_now(table, value)
  *	                         write one row now (declared PARALLEL SAFE by the
  *	                         tests: what a table does when a worker writes)
@@ -46,11 +82,16 @@
  */
 #include "postgres.h"
 
+#include "access/relscan.h"
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "catalog/objectaccess.h"
+#include "catalog/pg_class.h"
+#include "commands/vacuum.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "storage/ipc.h"
 #include "utils/builtins.h"
@@ -58,6 +99,8 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/resowner.h"
+#include "utils/snapmgr.h"
+#include "utils/tuplestore.h"
 
 #include "kcevents_compat.h"
 
@@ -67,15 +110,217 @@ PG_FUNCTION_INFO_V1(kcevents_open);
 PG_FUNCTION_INFO_V1(kcevents_crit);
 PG_FUNCTION_INFO_V1(kcevents_writes);
 PG_FUNCTION_INFO_V1(kcevents_write_now);
+PG_FUNCTION_INFO_V1(kcevents_fn);
+PG_FUNCTION_INFO_V1(kcevents_walk);
 
 static char *kce_at = NULL;
 static char *kce_op = NULL;
 static int	kce_value = 1;
 static int	kce_count = 1;
+static bool kce_crit = false;
+static bool kce_once = false;
+static bool kce_fired = false;
+static bool kce_hook_raise = false;
+
+#define KCE_MAX_FNS 8
+static PGFunction kce_fns[KCE_MAX_FNS];
+static int	kce_fn_nargs[KCE_MAX_FNS];
+static int	kce_nfns = 0;
+static Snapshot kce_snap = NULL;
+static bool kce_released = false;
+static emit_log_hook_type kce_prev_emit_log_hook = NULL;
 
 static Relation kce_rel = NULL;
 static TupleTableSlot *kce_slot = NULL;
 static int64 kce_writes = 0;
+
+/* a number for a file that no relation has; the callbacks that make a file are given it */
+static RelFileLocator
+kce_new_locator(void)
+{
+	RelFileLocator nl = kce_rel->rd_locator;
+
+	nl.relNumber = kce_rel->rd_locator.relNumber + 1000000;
+	return nl;
+}
+
+/*
+ * The operations for the entry points of the table access method other than the
+ * writes (and for those of the extension itself).  Each logs "kcevents: <op>
+ * done" with what it saw, so that a test can tell a call that returned from one
+ * that raised.  Returns true when op named one of them.
+ */
+static bool
+kce_entry_op(const char *op)
+{
+	ItemPointerData tid;
+
+	ItemPointerSet(&tid, 0, 1);
+	if (strcmp(op, "ntrunc") == 0)
+	{
+		table_relation_nontransactional_truncate(kce_rel);
+		ereport(LOG, (errmsg("kcevents: ntrunc done")));
+	}
+	else if (strcmp(op, "setnew") == 0)
+	{
+		RelFileLocator nl = kce_new_locator();
+		TransactionId fx = 12345;
+		MultiXactId mm = 12345;
+
+		table_relation_set_new_filelocator(kce_rel, &nl, kce_rel->rd_rel->relpersistence, &fx, &mm);
+		ereport(LOG, (errmsg("kcevents: setnew done newfile=%u freeze=%u", nl.relNumber, fx)));
+	}
+	else if (strcmp(op, "copydata") == 0)
+	{
+		RelFileLocator nl = kce_new_locator();
+
+		table_relation_copy_data(kce_rel, &nl);
+		ereport(LOG, (errmsg("kcevents: copydata done newfile=%u", nl.relNumber)));
+	}
+	else if (strcmp(op, "cluster") == 0)
+	{
+		TransactionId xc = 0;
+		MultiXactId mc = 0;
+		double		nt = -1,
+					tv = -1,
+					td = -1;
+
+		kce_copy_for_cluster(kce_rel, kce_rel, 0, &xc, &mc, &nt, &tv, &td);
+		ereport(LOG, (errmsg("kcevents: cluster done tuples=%.0f", nt)));
+	}
+	else if (strcmp(op, "vacuum") == 0)
+	{
+		VacuumParams vp;
+
+		memset(&vp, 0, sizeof(vp));
+		table_relation_vacuum(kce_rel, &vp, NULL);
+		ereport(LOG, (errmsg("kcevents: vacuum done")));
+	}
+	else if (strcmp(op, "scan") == 0)
+	{
+		TableScanDesc scan = kce_beginscan(kce_rel, kce_snap);
+		TupleTableSlot *slot = table_slot_create(kce_rel, NULL);
+		int			n = 0;
+
+		while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+			n++;
+		ExecDropSingleTupleTableSlot(slot);
+		table_endscan(scan);
+		ereport(LOG, (errmsg("kcevents: scan done rows=%d", n)));
+	}
+	else if (strcmp(op, "size") == 0)
+	{
+		ereport(LOG, (errmsg("kcevents: size done bytes=%lld",
+							 (long long) table_relation_size(kce_rel, MAIN_FORKNUM))));
+	}
+	else if (strcmp(op, "estimate") == 0)
+	{
+		int32		widths[MaxHeapAttributeNumber];
+		BlockNumber pages = 0;
+		double		tuples = -1,
+					allvis = -1;
+
+		memset(widths, 0, sizeof(widths));
+		table_relation_estimate_size(kce_rel, widths, &pages, &tuples, &allvis);
+		ereport(LOG, (errmsg("kcevents: estimate done pages=%u tuples=%.0f", pages, tuples)));
+	}
+	else if (strcmp(op, "idxfetch") == 0)
+	{
+		IndexFetchTableData *f = kce_index_fetch_begin(kce_rel);
+		bool		call_again = true,
+					all_dead = true;
+		bool		found;
+
+		found = table_index_fetch_tuple(f, &tid, kce_snap, kce_slot, &call_again, &all_dead);
+		table_index_fetch_reset(f);
+		table_index_fetch_end(f);
+		ereport(LOG, (errmsg("kcevents: idxfetch done found=%d", (int) found)));
+	}
+	else if (strcmp(op, "fetchrow") == 0)
+	{
+		bool		found = table_tuple_fetch_row_version(kce_rel, &tid, kce_snap, kce_slot);
+
+		ereport(LOG, (errmsg("kcevents: fetchrow done found=%d", (int) found)));
+	}
+	else if (strcmp(op, "tidvalid") == 0)
+	{
+		/* a descriptor that names only the relation: the callback is refused or an error before it reads anything */
+		TableScanDescData fake;
+		bool		valid;
+
+		memset(&fake, 0, sizeof(fake));
+		fake.rs_rd = kce_rel;
+		valid = table_tuple_tid_valid(&fake, &tid);
+		ereport(LOG, (errmsg("kcevents: tidvalid done valid=%d", (int) valid)));
+	}
+	else if (strcmp(op, "idxdel") == 0)
+	{
+		TM_IndexDeleteOp del;
+		TransactionId x;
+
+		memset(&del, 0, sizeof(del));
+		x = table_index_delete_tuples(kce_rel, &del);
+		ereport(LOG, (errmsg("kcevents: idxdel done xid=%u", x)));
+	}
+	else if (strcmp(op, "idxbuild") == 0)
+	{
+		double		n = kce_rel->rd_tableam->index_build_range_scan(kce_rel, NULL, NULL, false, false, false,
+																	0, InvalidBlockNumber, NULL, NULL, NULL);
+
+		ereport(LOG, (errmsg("kcevents: idxbuild done tuples=%.0f", n)));
+	}
+	else if (strcmp(op, "idxvalidate") == 0)
+	{
+		table_index_validate_scan(kce_rel, NULL, NULL, kce_snap, NULL);
+		ereport(LOG, (errmsg("kcevents: idxvalidate done")));
+	}
+	else if (strcmp(op, "sample") == 0)
+	{
+		TableScanDescData fake;
+		bool		b;
+		bool		t;
+
+		memset(&fake, 0, sizeof(fake));
+		fake.rs_rd = kce_rel;
+		b = kce_rel->rd_tableam->scan_sample_next_block(&fake, NULL);
+		t = kce_rel->rd_tableam->scan_sample_next_tuple(&fake, NULL, kce_slot);
+		ereport(LOG, (errmsg("kcevents: sample done block=%d tuple=%d", (int) b, (int) t)));
+	}
+	else if (strcmp(op, "objhook") == 0)
+	{
+		if (object_access_hook)
+			object_access_hook(OAT_DROP, RelationRelationId, RelationGetRelid(kce_rel), 0, NULL);
+		ereport(LOG, (errmsg("kcevents: objhook done")));
+	}
+	else if (strcmp(op, "fn") == 0)
+	{
+		int			i;
+
+		for (i = 0; i < kce_nfns; i++)
+		{
+			LOCAL_FCINFO(fcinfo, KCE_MAX_FNS);
+			int			a;
+
+			InitFunctionCallInfoData(*fcinfo, NULL, kce_fn_nargs[i],
+									 InvalidOid, NULL, NULL);
+			for (a = 0; a < kce_fn_nargs[i]; a++)
+			{
+				fcinfo->args[a].value = (Datum) 0;
+				fcinfo->args[a].isnull = true;
+			}
+			if (kce_fn_nargs[i] > 0)
+			{
+				fcinfo->args[0].value = ObjectIdGetDatum(RelationGetRelid(kce_rel));
+				fcinfo->args[0].isnull = false;
+			}
+			(void) kce_fns[i] (fcinfo);
+			ereport(LOG, (errmsg("kcevents: fn %d done", i)));
+		}
+	}
+	else
+		return false;
+	return true;
+}
 
 /*
  * The other things a module can do to a table through the access method: a
@@ -92,6 +337,8 @@ kce_other(const char *op)
 	TM_Result	res = TM_Ok;
 
 	ItemPointerSet(&tid, 0, 1);
+	if (kce_entry_op(op))
+		return;
 	if (strcmp(op, "bulk") == 0)
 	{
 		TupleTableSlot **slots = palloc(sizeof(TupleTableSlot *) * kce_count);
@@ -193,8 +440,15 @@ static void
 kce_event(const char *name)
 {
 	ereport(LOG, (errmsg("kcevents: event %s", name)));
-	if (kce_selected(name))
+	if (kce_selected(name) && !(kce_once && kce_fired))
+	{
+		kce_fired = true;
+		if (kce_crit)
+			START_CRIT_SECTION();
 		kce_write();
+		if (kce_crit)
+			END_CRIT_SECTION();
+	}
 }
 
 /*
@@ -206,6 +460,15 @@ static void
 kce_forget(void)
 {
 	kce_rel = NULL;
+	kce_fired = false;
+	kce_nfns = 0;
+	if (kce_snap != NULL)
+	{
+		/* registered with the transaction's owner, which is still there at the events (not at the release phases) */
+		if (!kce_released)
+			UnregisterSnapshotFromOwner(kce_snap, TopTransactionResourceOwner);
+		kce_snap = NULL;
+	}
 	if (kce_slot != NULL)
 	{
 		ExecDropSingleTupleTableSlot(kce_slot);
@@ -287,6 +550,8 @@ kce_release_callback(ResourceReleasePhase phase, bool isCommit, bool isTopLevel,
 	switch (phase)
 	{
 		case RESOURCE_RELEASE_BEFORE_LOCKS:
+			/* the owner has released the snapshot already */
+			kce_released = true;
 			kce_event("res_before_locks");
 			break;
 		case RESOURCE_RELEASE_LOCKS:
@@ -316,6 +581,9 @@ kcevents_open(PG_FUNCTION_ARGS)
 	kce_forget();
 	kce_rel = table_open(relid, RowExclusiveLock);
 	old = MemoryContextSwitchTo(TopMemoryContext);
+	/* a snapshot of its own, for the operations that read (they run where none may be taken) */
+	kce_released = false;
+	kce_snap = RegisterSnapshotOnOwner(GetTransactionSnapshot(), TopTransactionResourceOwner);
 	/* a copy of the descriptor: not reference counted, so nothing to unpin later */
 	kce_slot = MakeSingleTupleTableSlot(CreateTupleDescCopy(RelationGetDescr(kce_rel)),
 										&TTSOpsVirtual);
@@ -371,6 +639,82 @@ kcevents_write_now(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(value);
 }
 
+Datum
+kcevents_fn(PG_FUNCTION_ARGS)
+{
+	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+
+	if (kce_nfns >= KCE_MAX_FNS)
+		elog(ERROR, "too many functions");
+	kce_fns[kce_nfns] = (PGFunction) load_external_function("kingres_columnar", name, true, NULL);
+	kce_fn_nargs[kce_nfns] = PG_GETARG_INT32(1);
+	kce_nfns++;
+	PG_RETURN_VOID();
+}
+
+/*
+ * The members of the routine of a table's access method, the way the test
+ * that every one has a decision walks them: every slot after the node tag that
+ * is not null, asked of the extension (kc_am_decision, exported by it).
+ */
+typedef const char *(*kce_decision_fn) (Size offset, const char **member, const char **why);
+
+Datum
+kcevents_walk(PG_FUNCTION_ARGS)
+{
+	text	   *name = PG_GETARG_TEXT_PP(0);
+	Oid			relid = DatumGetObjectId(DirectFunctionCall1(regclassin,
+															 CStringGetDatum(text_to_cstring(name))));
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Relation	rel = table_open(relid, AccessShareLock);
+	const char *base = (const char *) rel->rd_tableam;
+	kce_decision_fn decide = (kce_decision_fn) load_external_function("kingres_columnar", "kc_am_decision", true, NULL);
+	Size		off;
+
+	InitMaterializedSRF(fcinfo, 0);
+	for (off = offsetof(TableAmRoutine, slot_callbacks); off + sizeof(void *) <= sizeof(TableAmRoutine); off += sizeof(void *))
+	{
+		void	   *fn;
+		const char *member = NULL;
+		const char *why = NULL;
+		const char *decision;
+		Datum		values[4];
+		bool		nulls[4] = {false, false, false, false};
+
+		memcpy(&fn, base + off, sizeof(fn));
+		if (fn == NULL)
+			continue;
+		decision = decide(off, &member, &why);
+		values[0] = Int64GetDatum((int64) off);
+		if (member != NULL)
+			values[1] = CStringGetTextDatum(member);
+		else
+			nulls[1] = true;
+		if (decision != NULL)
+			values[2] = CStringGetTextDatum(decision);
+		else
+			nulls[2] = true;
+		if (why != NULL)
+			values[3] = CStringGetTextDatum(why);
+		else
+			nulls[3] = true;
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	table_close(rel, AccessShareLock);
+	return (Datum) 0;
+}
+
+/* a hook that raises an error for a refusal of the extension, as a hook of another module may for any message */
+static void
+kce_emit_log_hook(ErrorData *edata)
+{
+	if (kce_hook_raise && edata->elevel == WARNING && edata->message != NULL &&
+		strstr(edata->message, "refused on columnar") != NULL)
+		elog(ERROR, "kcevents: the log hook raises for a refusal of the extension");
+	if (kce_prev_emit_log_hook)
+		kce_prev_emit_log_hook(edata);
+}
+
 void
 _PG_init(void)
 {
@@ -379,7 +723,7 @@ _PG_init(void)
 							   NULL, &kce_at, "",
 							   PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomStringVariable("kcevents.op",
-							   "What to do at that moment: insert (default), bulk, delete, update, lock, speculative.",
+							   "What to do at that moment: insert (default), bulk, delete, update, lock, speculative, and the entry-point operations named in the header of the module.",
 							   NULL, &kce_op, "insert",
 							   PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomIntVariable("kcevents.value",
@@ -390,6 +734,20 @@ _PG_init(void)
 							"How many rows to write at that moment.",
 							NULL, &kce_count, 1, 1, 1000000,
 							PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("kcevents.crit",
+							 "Run the operation inside a critical section.",
+							 NULL, &kce_crit, false,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("kcevents.once",
+							 "Act only once per transaction at the moment named.",
+							 NULL, &kce_once, false,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("kcevents.hook_raise",
+							 "Raise an error from the log hook for a refusal of the extension.",
+							 NULL, &kce_hook_raise, false,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+	kce_prev_emit_log_hook = emit_log_hook;
+	emit_log_hook = kce_emit_log_hook;
 	RegisterXactCallback(kce_xact_callback, NULL);
 	RegisterSubXactCallback(kce_subxact_callback, NULL);
 	RegisterResourceReleaseCallback(kce_release_callback, NULL);

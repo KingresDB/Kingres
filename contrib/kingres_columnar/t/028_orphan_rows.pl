@@ -21,8 +21,19 @@
 # reads the identities of the live files with a dirty snapshot of pg_class, so the
 # file of a table that another session is creating, uncommitted, keeps its rows.
 #
-# Needs a compiler and the server's headers for the probe module; skipped with the
-# reason where it cannot be built.
+# And three more things the later reviews asked for (C8-05, C8-06 and the survivors M10
+# and M17 of the mutants):
+#   3. the kept files are bounded (a cap, kingres_columnar.orphan_notes_max, lowered here to
+#      a handful of files; the compiled value is 10000) and are forgotten once a transaction
+#      has adopted them (the counter orphans_kept of columnar_write_paths) so that no later
+#      transaction of the backend adopts the same notes again;
+#   4. columnar_check does not wait for a lock a prepared transaction holds: it reports the
+#      table as not checked (not_checked) and goes on, with and without fix;
+#   5. keeping the notes at XACT_EVENT_COMMIT allocates nothing: a build with assertions
+#      keeps the work in a critical section, where an allocation traps (every late drop of
+#      this file reaches it).
+#
+# Needs a compiler and the server's headers for the probe module (KcProbe.pm).
 #
 # Portions Copyright (c) 2026, RooyeKhat Media Co
 # SPDX-License-Identifier: AGPL-3.0-only
@@ -37,13 +48,14 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
+# a case that fails because the code under test is wrong must not hang the file on a lock that is never released
+$ENV{PGOPTIONS} = '-c statement_timeout=240s';
+
 my $dir = build_module('kcprobe');
-plan skip_all => 'the probe module (t/kcprobe/kcprobe.c) could not be built here: it needs a C compiler and the server headers'
-  unless defined $dir;
 
 my $node = PostgreSQL::Test::Cluster->new('colorphan');
 $node->init;
-$node->append_conf('postgresql.conf', "shared_preload_libraries = '$dir/kcprobe,kingres_columnar'\n");
+$node->append_conf('postgresql.conf', "shared_preload_libraries = '$dir/kcprobe,kingres_columnar'\nmax_prepared_transactions = 10\n");
 $node->start;
 $node->safe_psql('postgres', 'CREATE EXTENSION kingres_columnar');
 
@@ -155,6 +167,75 @@ BEGIN; SET LOCAL kcprobe.commit_sql = 'SELECT 1'; DO \$\$ BEGIN BEGIN DROP TABLE
 	is(orphans(), 0, '... columnar_check(true) removes them');
 	q1("CREATE TABLE z (a int) USING columnar; INSERT INTO z SELECT generate_series(1, 2500)");
 	is(q1('SELECT count(*) FROM z'), 2500, '... and a table made afterwards is not touched by any of it');
+}
+
+# ------------------------------------------------------------------------
+# 4. The files kept for the next transaction: bounded, and forgotten when adopted
+# ------------------------------------------------------------------------
+{
+	# both numbers in one statement: the statement is itself the transaction that adopts the notes
+	my $BOTH = "SELECT 'KEPT=' || (SELECT hits FROM kingres.columnar_write_paths() WHERE path = 'orphans_kept') || ' ORPH=' || (SELECT coalesce(sum((regexp_match(detail, '^(\\d+) '))[1]::int), 0) FROM kingres.columnar_check() WHERE check_name = 'orphan_catalog_rows');";
+	q1("DROP TABLE IF EXISTS x CASCADE; DROP TABLE IF EXISTS k1, k2, k3, k4, k5, k6, k7, k8");
+	foreach my $i (1 .. 8)
+	{
+		q1("CREATE TABLE k$i (a int) USING columnar; INSERT INTO k$i SELECT generate_series(1, 10)");
+	}
+	q1("SELECT kingres.columnar_reconcile()");
+
+	# no cap below the number of files: all eight are kept, and the next transaction deletes their rows
+	my ($out, $err) = script("SET event_triggers = off;
+BEGIN; SET LOCAL kcprobe.commit_sql = 'DROP TABLE k1, k2, k3, k4, k5, k6, k7, k8'; SELECT 1; COMMIT;
+$BOTH
+$BOTH
+$BOTH
+$CLEANED");
+	unlike($err, qr/ERROR|TRAP/, 'eight tables dropped by another module after the cleanup: no error');
+	like($out, qr/KEPT=8 ORPH=8\b.*KEPT=0 ORPH=0\b.*KEPT=0 ORPH=0\b/s,
+		'the commit keeps all eight files (orphans_kept 8), the next transaction deletes their eight stripe rows and forgets the notes (0), and nothing adopts them again');
+	like($out, qr/CLEANED=8\b/, '... the eight rows were cleaned exactly once (a note that is never forgotten would be adopted by every later transaction)');
+	is(orphans(), 0, '... and columnar_check has nothing to report');
+
+	# a cap of three: the commit keeps three, the other five are left to columnar_check(true)
+	foreach my $i (1 .. 8)
+	{
+		q1("CREATE TABLE k$i (a int) USING columnar; INSERT INTO k$i SELECT generate_series(1, 10)");
+	}
+	q1("SELECT kingres.columnar_reconcile()");
+	($out, $err) = script("SET event_triggers = off; SET kingres_columnar.orphan_notes_max = 3;
+BEGIN; SET LOCAL kcprobe.commit_sql = 'DROP TABLE k1, k2, k3, k4, k5, k6, k7, k8'; SELECT 1; COMMIT;
+$BOTH
+$BOTH
+$BOTH");
+	unlike($err, qr/ERROR|TRAP/, 'the same with a cap of three: no error');
+	like($out, qr/KEPT=3 ORPH=8\b.*KEPT=0 ORPH=5\b.*KEPT=0 ORPH=5\b/s,
+		'with a cap of three the commit keeps three of the eight files; the next transaction deletes three rows sets and five are left, and stay left');
+	is(orphans(), 5, '... five stripe rows are reported by columnar_check');
+	q1("SELECT * FROM kingres.columnar_check(true)");
+	is(orphans(), 0, '... and columnar_check(true) removes them');
+	like(q1("SELECT setting FROM pg_settings WHERE name = 'kingres_columnar.orphan_notes_max'"), qr/^10000$/, 'the compiled cap is 10000 (the setting only lowers it)');
+}
+
+# ------------------------------------------------------------------------
+# 5. columnar_check does not wait behind a prepared transaction (C8-05)
+# ------------------------------------------------------------------------
+{
+	fresh_x();
+	q1("DROP TABLE IF EXISTS w; CREATE TABLE w (a int) USING columnar; INSERT INTO w VALUES (1)");
+	$node->safe_psql('postgres', "BEGIN; TRUNCATE x; PREPARE TRANSACTION 'holder'");
+	foreach my $fix ('false', 'true')
+	{
+		my ($out, $err) = script("SET statement_timeout = '30s'; SET lock_timeout = 0;
+SELECT 'CHK=' || check_name || ':' || relation::regclass::text FROM kingres.columnar_check($fix) WHERE check_name <> 'orphan_catalog_rows' ORDER BY 1;");
+		unlike($err, qr/statement timeout|canceling/, "columnar_check($fix) behind a prepared TRUNCATE does not wait for it");
+		like($out, qr/CHK=not_checked:x\b/, "columnar_check($fix) reports the locked table as not_checked");
+		unlike($out, qr/CHK=\w+:w\b/, "columnar_check($fix) checked the other table and found nothing");
+		like((script("SET statement_timeout = '30s'; SELECT detail FROM kingres.columnar_check($fix) WHERE check_name = 'not_checked';"))[0], qr/locked by another transaction, possibly a prepared one/,
+			"columnar_check($fix) says why the table was not checked");
+	}
+	$node->safe_psql('postgres', "COMMIT PREPARED 'holder'");
+	is(q1("SELECT count(*) FROM kingres.columnar_check(true) WHERE check_name = 'not_checked'"), 0, 'after the prepared transaction ended the table is checked');
+	is(orphans(), 0, '... and nothing is reported');
+	q1("DROP TABLE w");
 }
 
 $node->stop;

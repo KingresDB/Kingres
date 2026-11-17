@@ -74,6 +74,9 @@
  */
 #define KC_MIN_STRIPE_ROWS	1000
 #define KC_MAX_STRIPE_ROWS	10000000
+
+/* the most files a commit keeps for the next transaction to clean up after (kc_write.c) */
+#define KC_ORPHAN_NOTES_MAX	10000
 #define KC_STRIPE_ROWS_READ_LIMIT	KC_MAX_STRIPE_ROWS
 StaticAssertDecl(KC_MAX_STRIPE_ROWS <= KC_STRIPE_ROWS_READ_LIMIT,
 				 "the reader must accept what the writer writes");
@@ -280,6 +283,7 @@ extern int	kc_guc_stripe_rows;
 extern int	kc_guc_chunk_rows;
 extern int	kc_guc_write_buffer_kb;
 extern int	kc_guc_max_stripe_rows;
+extern int	kc_guc_orphan_notes_max;
 extern int	kc_max_stripe_rows(void);
 extern bool kc_guc_enable_custom_scan;
 extern bool kc_guc_enable_chunk_skipping;
@@ -384,6 +388,7 @@ extern void kc_write_rows(Relation rel, TupleTableSlot **slots, int nslots,
 						  CommandId cid);
 extern bool kc_write_row_values(Relation rel, Datum *vals, bool *nulls,
 								CommandId cid);
+extern bool kc_entry_refused(const char *what, const char *name, bool fails_txn);
 extern bool kc_write_refused(Relation rel, const char *what);
 extern int	kc_write_path_count(void);
 extern const char *kc_write_path_get(int i, uint64 *hits);
