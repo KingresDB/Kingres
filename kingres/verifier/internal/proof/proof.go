@@ -46,7 +46,10 @@ type Proof struct {
 	TxIndex    uint64
 	TxPath     []merkle.Hash
 	Block      format.Header
-	Chain      []format.Header
+	// Chain is the headers after the block, when the proof was parsed by Parse.
+	// A proof read by ParseStream holds none: only ChainLen, the number of them.
+	Chain    []format.Header
+	ChainLen uint64
 }
 
 // Error is a failed verification step.
@@ -84,6 +87,18 @@ func Parse(data []byte) (*Proof, error) {
 	if err != nil {
 		return nil, err
 	}
+	p, err := fromValue(v)
+	if err != nil {
+		return nil, err
+	}
+	p.Chain = chainHeaders
+	p.ChainLen = uint64(len(chainHeaders))
+	return p, nil
+}
+
+// fromValue reads the members of a parsed proof other than the elements of
+// chain.
+func fromValue(v jsonx.Value) (*Proof, error) {
 	o, err := v.Object()
 	if err != nil {
 		return nil, err
@@ -160,7 +175,6 @@ func Parse(data []byte) (*Proof, error) {
 	if _, err := o.Array("chain"); err != nil {
 		return nil, err
 	}
-	p.Chain = chainHeaders
 	return &p, nil
 }
 
@@ -239,6 +253,12 @@ type Step struct {
 // Verify runs the verification steps against the trusted digest d. On
 // failure the error is an *Error naming the step.
 func Verify(p *Proof, d chain.Digest, exp Expect) (*Result, error) {
+	return verifyWith(p, d, exp, func() (format.Header, error) { return reach(p, d) })
+}
+
+// verifyWith is Verify with the walk along the chain of headers left to the
+// caller: in memory (reach), or read again from the file (reachStream).
+func verifyWith(p *Proof, d chain.Digest, exp Expect, walk func() (format.Header, error)) (*Result, error) {
 	res := &Result{BlockHeight: p.Block.Height, DigestHeight: d.Height}
 	pass := func(name, detail string) { res.Steps = append(res.Steps, Step{name, detail}) }
 
@@ -299,7 +319,7 @@ func Verify(p *Proof, d chain.Digest, exp Expect) (*Result, error) {
 	pass(StepBlockHash, fmt.Sprintf("block %d hash recomputed", p.Block.Height))
 
 	// Step 4: reach the digest.
-	cur, err := reach(p, d)
+	cur, err := walk()
 	if err != nil {
 		return nil, err
 	}

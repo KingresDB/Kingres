@@ -162,21 +162,37 @@ type parser struct {
 }
 
 func parse(data []byte, l Limits, stream string, each func(Value) error) (Value, error) {
-	if !utf8.Valid(data) {
-		return Value{}, errors.New("input is not valid UTF-8, expected a UTF-8 JSON document")
-	}
-	if err := checkEscapes(data, l.MaxString); err != nil {
-		return Value{}, err
-	}
-	dec := json.NewDecoder(bytes.NewReader(data))
+	return ParseReader(bytes.NewReader(data), l, stream, each)
+}
+
+// ParseReader is ParseStreaming over a reader: the document is read in pieces
+// and checked as it goes (UTF-8, escapes, the length of a string, a run of white
+// space), so that the memory of a parse is a constant plus a small multiple of
+// the largest single value whatever the size of the document. The document is
+// accepted only when the whole of it was read and was valid; each is called for
+// the elements as they come, so a caller that acts on them must not treat them
+// as verified until ParseReader returns without an error. With each nil it is
+// Parse over a reader.
+func ParseReader(r io.Reader, l Limits, stream string, each func(Value) error) (Value, error) {
+	cr := &checkedReader{r: r, max: l.MaxString}
+	dec := json.NewDecoder(cr)
 	dec.UseNumber()
 	p := &parser{dec: dec, lim: l, stream: stream, each: each}
 	v, err := p.value(nil, 0)
+	if cr.err != nil {
+		return Value{}, cr.err // what the checks found comes first, as before
+	}
 	if err != nil {
 		return Value{}, err
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		if cr.err != nil {
+			return Value{}, cr.err
+		}
 		return Value{}, errors.New("unexpected data after the JSON document, expected end of input")
+	}
+	if cr.err != nil {
+		return Value{}, cr.err
 	}
 	return v, nil
 }
@@ -272,7 +288,7 @@ func (p *parser) streamMember(at *locator) (Value, error) {
 func (p *parser) finish(tok json.Token, at *locator, depth int) (Value, error) {
 	switch t := tok.(type) {
 	case json.Delim:
-		if depth > p.lim.MaxDepth {
+		if depth >= p.lim.MaxDepth {
 			return Value{}, fmt.Errorf("%s: nesting deeper than %d levels", at, p.lim.MaxDepth)
 		}
 		if t == '{' {
@@ -307,90 +323,6 @@ func (p *parser) array(at *locator, depth int) (Value, error) {
 		return Value{}, fmt.Errorf("%s: invalid JSON: %w", at, err)
 	}
 	return Value{kind: KindArray, at: at, arr: arr}, nil
-}
-
-// checkEscapes rejects unpaired UTF-16 surrogate escapes in strings, which
-// encoding/json would turn into U+FFFD without a word, and strings longer than
-// maxString as written (checked before the decoder allocates them). Syntax
-// errors are left to the decoder.
-func checkEscapes(data []byte, maxString int) error {
-	inStr := false
-	start := 0
-	space := 0
-	for i := 0; i < len(data); i++ {
-		c := data[i]
-		if !inStr {
-			// The decoder keeps a run of white space in its buffer until the next
-			// token: a file that is all white space would be held whole, twice.
-			if c == ' ' || c == 0x0a || c == 0x09 || c == 0x0d {
-				if space++; space > MaxSpaceRun {
-					return fmt.Errorf("a run of more than %d white space characters, expected a smaller document", MaxSpaceRun)
-				}
-				continue
-			}
-			space = 0
-			if c == '"' {
-				inStr = true
-				start = i
-			}
-			continue
-		}
-		if i-start > maxString+1 {
-			return fmt.Errorf("a string is longer than %d bytes, expected a smaller document", maxString)
-		}
-		switch c {
-		case '"':
-			inStr = false
-		case '\\':
-			if i+1 >= len(data) {
-				return nil
-			}
-			if data[i+1] != 'u' {
-				i++
-				continue
-			}
-			r, ok := hex4(data, i+2)
-			if !ok {
-				return nil
-			}
-			i += 5
-			switch {
-			case r >= 0xD800 && r < 0xDC00:
-				if i+6 < len(data) && data[i+1] == '\\' && data[i+2] == 'u' {
-					if r2, ok2 := hex4(data, i+3); ok2 && r2 >= 0xDC00 && r2 < 0xE000 {
-						i += 6
-						continue
-					}
-				}
-				return errors.New("string has an unpaired high surrogate escape, expected a valid Unicode escape")
-			case r >= 0xDC00 && r < 0xE000:
-				return errors.New("string has an unpaired low surrogate escape, expected a valid Unicode escape")
-			}
-		}
-	}
-	return nil
-}
-
-func hex4(data []byte, at int) (rune, bool) {
-	if at+4 > len(data) {
-		return 0, false
-	}
-	var r rune
-	for _, c := range data[at : at+4] {
-		var d byte
-		switch {
-		case c >= '0' && c <= '9':
-			d = c - '0'
-		case c >= 'a' && c <= 'f':
-			d = c - 'a' + 10
-		case c >= 'A' && c <= 'F':
-			d = c - 'A' + 10
-		default:
-			return 0, false
-		}
-		r = r<<4 | rune(d)
-	}
-	return r, true
 }
 
 // Object returns the value as an object.
@@ -536,4 +468,219 @@ func (v Value) Bool() (bool, error) {
 		return false, fmt.Errorf("%s: is %s, expected boolean", v.Path(), v.kind)
 	}
 	return v.b, nil
+}
+
+// checkedReader passes bytes on to the decoder after checking them, and keeps
+// the first thing it found. It rejects invalid UTF-8, unpaired UTF-16 surrogate
+// escapes in strings (which encoding/json would turn into U+FFFD without a
+// word), strings longer than max as written (before the decoder holds them) and
+// a run of white space longer than MaxSpaceRun. Syntax errors are left to the
+// decoder. The checks are a state machine over the bytes, so that a document is
+// checked in the pieces it is read in and never held whole.
+type checkedReader struct {
+	r   io.Reader
+	max int
+	err error
+
+	carry []byte // the start of a UTF-8 sequence that a piece ended in
+	state byte
+	strN  int // bytes of the current string so far, after its opening quote
+	hexN  int
+	hexV  rune
+	space int
+	done  bool // the escape check stopped: the decoder reports the syntax error
+}
+
+const (
+	stNormal   = iota
+	stString   // inside a string
+	stEscape   // after a backslash
+	stHex      // reading the four digits of \u
+	stHighBack // after a high surrogate: a backslash must follow
+	stHighU    // after that backslash: a u must follow
+	stHighHex  // reading the four digits of the second \u
+)
+
+func (c *checkedReader) Read(p []byte) (int, error) {
+	if c.err != nil {
+		return 0, c.err
+	}
+	n, err := c.r.Read(p)
+	if n > 0 {
+		if cerr := c.check(p[:n]); cerr != nil {
+			c.err = cerr
+			return 0, cerr
+		}
+	}
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			if len(c.carry) > 0 {
+				c.err = errors.New("input is not valid UTF-8, expected a UTF-8 JSON document")
+				return n, c.err
+			}
+			if c.state == stHighBack || c.state == stHighU || c.state == stHighHex {
+				c.err = errors.New("string has an unpaired high surrogate escape, expected a valid Unicode escape")
+				return n, c.err
+			}
+		}
+		return n, err
+	}
+	return n, nil
+}
+
+var errNotUTF8 = errors.New("input is not valid UTF-8, expected a UTF-8 JSON document")
+
+// check feeds the bytes of one piece to the checks in the order they come, so
+// that what is reported does not depend on how the document was cut into
+// pieces. A UTF-8 sequence that the piece ends in is held back for the next.
+func (c *checkedReader) check(b []byte) error {
+	if len(c.carry) > 0 {
+		for len(c.carry) < utf8.UTFMax && !utf8.FullRune(c.carry) && len(b) > 0 {
+			c.carry = append(c.carry, b[0])
+			b = b[1:]
+		}
+		if !utf8.FullRune(c.carry) {
+			return nil
+		}
+		if err := c.rune(c.carry); err != nil {
+			return err
+		}
+		c.carry = c.carry[:0]
+	}
+	for len(b) > 0 {
+		if b[0] < utf8.RuneSelf {
+			if err := c.step(b[0]); err != nil {
+				return err
+			}
+			b = b[1:]
+			continue
+		}
+		if !utf8.FullRune(b) {
+			c.carry = append(c.carry[:0], b...)
+			return nil
+		}
+		n := 1
+		if _, size := utf8.DecodeRune(b); size > 1 {
+			n = size
+		}
+		if err := c.rune(b[:n]); err != nil {
+			return err
+		}
+		b = b[n:]
+	}
+	return nil
+}
+
+// rune checks one complete sequence and feeds its bytes to the escape check.
+func (c *checkedReader) rune(seq []byte) error {
+	if r, n := utf8.DecodeRune(seq); r == utf8.RuneError && n <= 1 {
+		return errNotUTF8
+	}
+	for _, ch := range seq {
+		if err := c.step(ch); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func hexVal(ch byte) (rune, bool) {
+	switch {
+	case ch >= '0' && ch <= '9':
+		return rune(ch - '0'), true
+	case ch >= 'a' && ch <= 'f':
+		return rune(ch-'a') + 10, true
+	case ch >= 'A' && ch <= 'F':
+		return rune(ch-'A') + 10, true
+	}
+	return 0, false
+}
+
+var (
+	errHigh = errors.New("string has an unpaired high surrogate escape, expected a valid Unicode escape")
+	errLow  = errors.New("string has an unpaired low surrogate escape, expected a valid Unicode escape")
+)
+
+func (c *checkedReader) step(ch byte) error {
+	if c.done {
+		return nil
+	}
+	switch c.state {
+	case stNormal:
+		// The decoder keeps a run of white space in its buffer until the next
+		// token: a file that is all white space would be held whole, twice.
+		if ch == ' ' || ch == 0x0a || ch == 0x09 || ch == 0x0d {
+			if c.space++; c.space > MaxSpaceRun {
+				return fmt.Errorf("a run of more than %d white space characters, expected a smaller document", MaxSpaceRun)
+			}
+			return nil
+		}
+		c.space = 0
+		if ch == '"' {
+			c.state, c.strN = stString, 0
+		}
+		return nil
+	case stHighBack:
+		if ch != '\\' {
+			return errHigh
+		}
+		c.state = stHighU
+		return nil
+	case stHighU:
+		if ch != 'u' {
+			return errHigh
+		}
+		c.state, c.hexN, c.hexV = stHighHex, 0, 0
+		return nil
+	case stHighHex:
+		d, ok := hexVal(ch)
+		if !ok {
+			return errHigh
+		}
+		c.hexV = c.hexV<<4 | d
+		if c.hexN++; c.hexN == 4 {
+			if c.hexV < 0xDC00 || c.hexV >= 0xE000 {
+				return errHigh
+			}
+			c.state = stString
+		}
+		return nil
+	}
+	// inside a string: every byte counts against the length
+	if c.strN++; c.strN > c.max+1 {
+		return fmt.Errorf("a string is longer than %d bytes, expected a smaller document", c.max)
+	}
+	switch c.state {
+	case stString:
+		switch ch {
+		case '"':
+			c.state = stNormal
+		case '\\':
+			c.state = stEscape
+		}
+	case stEscape:
+		if ch == 'u' {
+			c.state, c.hexN, c.hexV = stHex, 0, 0
+		} else {
+			c.state = stString
+		}
+	case stHex:
+		d, ok := hexVal(ch)
+		if !ok {
+			c.done = true // not a valid escape: the decoder says so
+			return nil
+		}
+		c.hexV = c.hexV<<4 | d
+		if c.hexN++; c.hexN == 4 {
+			switch {
+			case c.hexV >= 0xD800 && c.hexV < 0xDC00:
+				c.state = stHighBack
+			case c.hexV >= 0xDC00 && c.hexV < 0xE000:
+				return errLow
+			default:
+				c.state = stString
+			}
+		}
+	}
+	return nil
 }

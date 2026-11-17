@@ -144,7 +144,7 @@ func checkArgPath(path string) error {
 func checkWindowsPath(path string) error {
 	p := strings.ReplaceAll(path, "/", `\`)
 	if strings.HasPrefix(p, `\\.\`) || strings.HasPrefix(p, `\\?\GLOBALROOT`) {
-		return fmt.Errorf("%q %w (the device namespace is not a file)", clipPath(path), ErrNotRegular)
+		return fmt.Errorf("%q %w (the device namespace is not a file)", path, ErrNotRegular)
 	}
 	rest := strings.TrimPrefix(p, `\\?\`)
 	for i, comp := range strings.Split(rest, `\`) {
@@ -152,10 +152,10 @@ func checkWindowsPath(path string) error {
 			continue // a drive letter
 		}
 		if strings.Contains(comp, ":") {
-			return fmt.Errorf("%q %w (a colon names an alternate data stream)", clipPath(path), ErrNotRegular)
+			return fmt.Errorf("%q %w (a colon names an alternate data stream)", path, ErrNotRegular)
 		}
 		if reservedWindowsName(comp) {
-			return fmt.Errorf("%q %w (a reserved device name)", clipPath(path), ErrNotRegular)
+			return fmt.Errorf("%q %w (a reserved device name)", path, ErrNotRegular)
 		}
 	}
 	return nil
@@ -186,13 +186,6 @@ func reservedWindowsName(comp string) bool {
 		}
 	}
 	return false
-}
-
-func clipPath(s string) string {
-	if len(s) > 120 {
-		return strings.ToValidUTF8(s[:120], "?") + "..."
-	}
-	return s
 }
 
 // limitedFile is an open regular file that fails with ErrTooLarge when more than

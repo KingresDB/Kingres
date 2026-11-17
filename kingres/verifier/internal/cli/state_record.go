@@ -90,7 +90,7 @@ func decodeRecord(data []byte) (*stateRecord, error) {
 		}
 		key, _ := kt.(string)
 		if seen[key] {
-			return nil, fmt.Errorf("not a state file: the member %q appears twice", clipArg(key))
+			return nil, fmt.Errorf("not a state file: the member %q appears twice", key)
 		}
 		seen[key] = true
 		var target any
@@ -110,7 +110,7 @@ func decodeRecord(data []byte) (*stateRecord, error) {
 		case "note":
 			target = &rec.Note
 		default:
-			return nil, fmt.Errorf("not a state file: unknown member %q", clipArg(key))
+			return nil, fmt.Errorf("not a state file: unknown member %q", key)
 		}
 		if err := dec.Decode(target); err != nil {
 			return nil, fmt.Errorf("not a state file: member %q: %w", key, err)

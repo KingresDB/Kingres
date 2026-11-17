@@ -113,7 +113,7 @@ func memCommands(t testing.TB) []struct {
 		{"proof digest", []string{"proof", "--proof", fx("proofs/acc1.json"), "--digest", "@"}, maxDigestFile},
 		{"row-hash columns", []string{"row-hash", "--table-id", "1", "--columns", "@"}, maxFileSize},
 		{"digest-chain file", []string{"digest-chain", "@"}, maxDigestFile},
-		{"blocks export", []string{"blocks", "--blocks", "@", "--chain-id", zeroHash}, maxBlocksSize / 64},
+		{"blocks export", []string{"blocks", "--blocks", "@", "--chain-id", zeroHash}, 16 << 20},
 		{"blocks digest", []string{"blocks", "--blocks", fx("blocks.jsonl"), "--digest", "@"}, maxDigestFile},
 		{"checkpoint trust", []string{"checkpoint", "--trust", "@", "--log", log, "--note", "@"}, trust.MaxFileSize},
 		{"consistency old", []string{"consistency", "--trust", trustFile, "--log", log, "--old", "@"}, maxStateFile},

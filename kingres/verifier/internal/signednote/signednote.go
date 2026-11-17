@@ -19,6 +19,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -220,14 +221,14 @@ func Parse(data []byte) (*Note, error) {
 func parseSigLine(line string) (Signature, error) {
 	rest, ok := strings.CutPrefix(line, emDashPrefix)
 	if !ok {
-		return Signature{}, fmt.Errorf("signature line %q does not start with an em dash and a space", clip(line))
+		return Signature{}, fmt.Errorf("signature line %q does not start with an em dash and a space", line)
 	}
 	name, b64, ok := strings.Cut(rest, " ")
 	if !ok || strings.Contains(b64, " ") {
-		return Signature{}, fmt.Errorf("signature line %q does not have the form em dash, name, space, base64", clip(line))
+		return Signature{}, fmt.Errorf("signature line %q does not have the form em dash, name, space, base64", line)
 	}
 	if !ValidName(name) {
-		return Signature{}, fmt.Errorf("signature line has the invalid key name %q", clip(name))
+		return Signature{}, fmt.Errorf("signature line has the invalid key name %q", name)
 	}
 	raw, err := DecodeBase64(b64)
 	if err != nil {
@@ -239,13 +240,6 @@ func parseSigLine(line string) (Signature, error) {
 	return Signature{Name: name, ID: binary.BigEndian.Uint32(raw[:4]), Sig: raw[4:]}, nil
 }
 
-func clip(s string) string {
-	if len(s) > 60 {
-		return strings.ToValidUTF8(s[:60], "?") + "..."
-	}
-	return s
-}
-
 // Verify checks the note against the trusted keys. A signature whose name
 // and key id match no trusted key is ignored (the specification: "MUST ignore
 // signatures from unknown keys, even if they share a name or ID (but not
@@ -255,13 +249,9 @@ func clip(s string) string {
 // signature the note is rejected too. It returns the keys whose signatures
 // verified.
 func Verify(n *Note, keys []Key) ([]Key, error) {
-	index := map[[2]string]Key{}
-	for _, k := range keys {
-		id := [2]string{k.Name, fmt.Sprint(k.ID())}
-		if prev, dup := index[id]; dup && !bytes.Equal(prev.Public, k.Public) {
-			return nil, fmt.Errorf("%w: %q %08x", ErrAmbiguousTrustedKey, k.Name, k.ID())
-		}
-		index[id] = k
+	index, err := indexKeys(keys)
+	if err != nil {
+		return nil, err
 	}
 	var ok []Key
 	for _, s := range n.Signatures {
@@ -278,6 +268,91 @@ func Verify(n *Note, keys []Key) ([]Key, error) {
 		return nil, ErrNoTrustedSignature
 	}
 	return ok, nil
+}
+
+// VerifyHeld is Verify for a note the auditor already holds (a state file, an old
+// checkpoint). It judges the note by the signatures that verify and by nothing
+// else: a signature line that names a key of keys and does not verify is not
+// evidence of anything and is counted in wrong instead of rejecting the note,
+// because a note stored by an earlier version of this program may carry lines
+// that no key ever verified (they were stored as sent), and a later change of
+// the trust file must not turn such a note into one no run accepts. With no
+// verified signature the note is rejected, with ErrBadSignature when some line
+// named a key and did not verify (so that the message can say a wrong one was
+// seen) and with ErrNoTrustedSignature otherwise.
+func VerifyHeld(n *Note, keys []Key) (verified []Key, wrong int, err error) {
+	index, err := indexKeys(keys)
+	if err != nil {
+		return nil, 0, err
+	}
+	for _, s := range n.Signatures {
+		k, known := index[[2]string{s.Name, fmt.Sprint(s.ID)}]
+		if !known {
+			continue
+		}
+		if len(s.Sig) != ed25519.SignatureSize || !ed25519.Verify(k.Public, n.Text, s.Sig) {
+			wrong++
+			continue
+		}
+		verified = append(verified, k)
+	}
+	if len(verified) == 0 {
+		if wrong > 0 {
+			return nil, wrong, ErrBadSignature
+		}
+		return nil, 0, ErrNoTrustedSignature
+	}
+	return verified, wrong, nil
+}
+
+func indexKeys(keys []Key) (map[[2]string]Key, error) {
+	index := map[[2]string]Key{}
+	for _, k := range keys {
+		id := [2]string{k.Name, fmt.Sprint(k.ID())}
+		if prev, dup := index[id]; dup && !bytes.Equal(prev.Public, k.Public) {
+			return nil, fmt.Errorf("%w: %q %08x", ErrAmbiguousTrustedKey, k.Name, k.ID())
+		}
+		index[id] = k
+	}
+	return index, nil
+}
+
+// Canonical is the form in which a verified note is stored and compared: the
+// text, the blank line, and only the signature lines of the keys in verified,
+// written again from the parsed signature (so that every byte of it is one the
+// parser read as that signature) in the order of key name and key id. A line
+// that no key of verified signed (a key the trust file does not know, a key it
+// does but did not count, a line that does not verify) is not in it, and the
+// order and number of such lines in the note as it was served change nothing
+// in the result. The caller must pass the keys whose signatures it verified
+// over n.Text; for a note that came out of Parse and a verified set the result
+// parses again, and verifies under every set of keys that holds one of them.
+func Canonical(n *Note, verified []Key) []byte {
+	want := map[[2]string]bool{}
+	for _, k := range verified {
+		want[[2]string{k.Name, fmt.Sprint(k.ID())}] = true
+	}
+	var sigs []Signature
+	for _, s := range n.Signatures {
+		if want[[2]string{s.Name, fmt.Sprint(s.ID)}] {
+			sigs = append(sigs, s)
+		}
+	}
+	sort.Slice(sigs, func(i, j int) bool {
+		if sigs[i].Name != sigs[j].Name {
+			return sigs[i].Name < sigs[j].Name
+		}
+		return sigs[i].ID < sigs[j].ID
+	})
+	var b bytes.Buffer
+	b.Write(n.Text)
+	b.WriteByte('\n')
+	for _, s := range sigs {
+		var id [4]byte
+		binary.BigEndian.PutUint32(id[:], s.ID)
+		b.WriteString(emDashPrefix + s.Name + " " + base64.StdEncoding.EncodeToString(append(id[:], s.Sig...)) + "\n")
+	}
+	return b.Bytes()
 }
 
 // checkLines enforces MaxLineLength on every line of the note and MaxTextLines

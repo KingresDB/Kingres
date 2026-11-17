@@ -4,6 +4,7 @@ package cli
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -21,11 +22,12 @@ import (
 // its site with its status fails too. A site that no portable scenario can
 // reach is a row with a reason in why, and nothing else.
 type exitRow struct {
-	site   string
-	status int
-	args   func(t *testing.T) []string
-	why    string // set when no scenario reaches it: the reason
-	unix   bool   // the scenario works only where file modes are permissions
+	site    string
+	status  int
+	args    func(t *testing.T) []string
+	why     string // set when no scenario reaches it: the reason
+	unix    bool   // the scenario works only where file modes are permissions
+	failOut bool   // the standard output refuses every write
 }
 
 type exitEnv struct {
@@ -128,7 +130,8 @@ func exitRows(x *exitEnv) []exitRow {
 	}
 
 	// ---- Run and the flag parser ----
-	add(row("Run:exitUsage#1", 2), row("Run:exitUsage#2", 2, "nonsense"), row("parseFlags:exitUsage#1", 2, "proof", "--nope"))
+	add(exitRow{site: "Run:exitUsage#1", status: 2, failOut: true, args: func(*testing.T) []string { return []string{"version"} }})
+	add(row("dispatch:exitUsage#1", 2), row("dispatch:exitUsage#2", 2, "nonsense"), row("parseFlags:exitUsage#1", 2, "proof", "--nope"))
 	add(flagCases("Proof", "proof")...)
 	add(flagCases("RowHash", "row-hash")...)
 	add(flagCases("DigestChain", "digest-chain")...)
@@ -173,7 +176,22 @@ func exitRows(x *exitEnv) []exitRow {
 		row("runDigestChain:inputError#1", 2, "digest-chain"),
 		fn("runDigestChain:inputError#2", 2, func(t *testing.T) []string { return []string{"digest-chain", missing()} }),
 		fn("runDigestChain:inputError#3", 2, func(t *testing.T) []string { return []string{"digest-chain", tmp("d.json", "garbage")} }),
-		never("runDigestChain:inputError#4", 2, "OpenDir fails after the Stat of the same path only on a race or a permission error"),
+		exitRow{site: "runDigestChain:inputError#4", status: 2, unix: true, args: func(t *testing.T) []string {
+			d := t.TempDir()
+			dir := filepath.Join(d, "digests")
+			if err := os.Mkdir(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			writeTemp(t, dir, "a.json", "{}")
+			if err := os.Chmod(dir, 0o000); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+			if _, err := os.ReadDir(dir); err == nil {
+				t.Skip("this user can read a directory without permission")
+			}
+			return []string{"digest-chain", dir}
+		}},
 		fn("runDigestChain:inputError#5", 2, func(t *testing.T) []string {
 			d := t.TempDir()
 			writeTemp(t, d, "d.json", "garbage")
@@ -228,8 +246,19 @@ func exitRows(x *exitEnv) []exitRow {
 			_ = os.Mkdir(filepath.Join(x.p.logDir, "checkpoint"), 0o755)
 			return x.cp()
 		}),
-		never("runCheckpoint:finishPub#2", 2, "a permission error on the checkpoint file, which no portable test can make"),
+		exitRow{site: "runCheckpoint:finishPub#2", status: 2, unix: true, args: func(t *testing.T) []string {
+			f := filepath.Join(x.p.logDir, "checkpoint")
+			if err := os.Chmod(f, 0o000); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(f, 0o644) })
+			if _, err := os.ReadFile(f); err == nil {
+				t.Skip("this user can read a file without permission")
+			}
+			return x.cp()
+		}},
 		fn("runCheckpoint:inputError#1", 2, func(t *testing.T) []string { return x.cp("--trust", trustWith(t, x.p, `,"revoked":true`)) }),
+		never("runCheckpoint:inputError#2", 2, "guard: a note that verifyNote accepted always parses again"),
 		fn("runCheckpoint:finishFailed#1", 1, func(t *testing.T) []string {
 			x.p.write(t, "checkpoint", "garbage\n")
 			return x.cp()
@@ -272,15 +301,7 @@ func exitRows(x *exitEnv) []exitRow {
 			st := x.stateAt300()
 			return []string{"checkpoint", "--trust", x.p.trust, "--log", x.p.log(), "--source", x.p.trust, "--note", filepath.Join(x.p.logDir, "checkpoint"), "--state", st}
 		}),
-		fn("applyState:fail#11", 2, func(t *testing.T) []string {
-			// a note that is good as a new checkpoint and that a later run would
-			// refuse as a held one (a wrong signature of a revoked key)
-			k2 := newSigner(2)
-			good := x.p.signer.note(x.p.origin, 700, refMTH(x.p.all))
-			wrong := strings.Split(k2.note(x.p.origin, 699, refMTH(x.p.all[:699])), "\n\n")[1]
-			tr := trustOf(t, keySpec{"k1", x.p.signer, ""}, keySpec{"k2", k2, `,"revoked":true`})
-			return []string{"checkpoint", "--trust", tr, "--log", x.p.log(), "--source", x.p.dir, "--note", tmp("n", good+wrong), "--state", filepath.Join(t.TempDir(), "s")}
-		}),
+		never("applyState:fail#11", 2, "guard: the state is written in the canonical form of the verified note, which reads back by construction (TestReadBackRefusesWhatALaterRunWouldNotRead calls readBack with a file that does not)"),
 		exitRow{site: "applyState:fail#12", status: 2, unix: true, args: func(t *testing.T) []string {
 			d := t.TempDir()
 			st := filepath.Join(d, "s")
@@ -445,7 +466,10 @@ func exitRows(x *exitEnv) []exitRow {
 		fn("runTrustInit:inputError#8", 2, func(t *testing.T) []string {
 			return init("--public-key", pubB64, "--out", tmp("exists.json", "x"))
 		}),
-		never("runTrustInit:inputError#9", 2, "the disk fails while the file is written"),
+		fn("runTrustInit:inputError#9", 2, func(t *testing.T) []string {
+			failTrustWrite(t)
+			return init("--public-key", pubB64, "--out", filepath.Join(t.TempDir(), "never.json"))
+		}),
 		never("runTrustInit:inputError#10", 2, "the disk fails while the file is closed"),
 		row("runTrustShow:inputError#1", 2, "trust", "show"),
 		fn("runTrustShow:inputError#2", 2, func(t *testing.T) []string { return []string{"trust", "show", "--trust", missing()} }),
@@ -521,7 +545,13 @@ func TestEveryExitSiteHasARowAndAScenario(t *testing.T) {
 			rec.hits = map[string]map[int]bool{}
 			rec.mu.Unlock()
 			args := row.args(t)
-			code, out, errs := run(t, args...)
+			var code int
+			var out, errs string
+			if row.failOut {
+				code, out, errs = runFailingStdout(t, args...)
+			} else {
+				code, out, errs = run(t, args...)
+			}
 			if code != r.status {
 				t.Fatalf("status %d, want %d\n%.400s%.400s", code, r.status, out, errs)
 			}
@@ -641,4 +671,12 @@ func TestReadmeTableOfStatusesIsTheTableOfTheCode(t *testing.T) {
 			t.Error("blocks can end with 3 in the table")
 		}
 	}
+}
+
+// failTrustWrite makes the write of a trust file fail for the rest of the test.
+func failTrustWrite(t *testing.T) {
+	t.Helper()
+	old := trustWrite
+	trustWrite = func(*os.File, []byte) (int, error) { return 0, errors.New("no space left on device") }
+	t.Cleanup(func() { trustWrite = old })
 }

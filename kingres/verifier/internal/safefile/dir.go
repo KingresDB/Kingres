@@ -42,7 +42,7 @@ func OpenDir(path string) (*Dir, error) {
 		return nil, err
 	}
 	if !st.IsDir() {
-		return nil, fmt.Errorf("%s %w (a directory is needed, it is %s)", clipPath(path), ErrNotRegular, kind(st.Mode()))
+		return nil, fmt.Errorf("%s %w (a directory is needed, it is %s)", path, ErrNotRegular, kind(st.Mode()))
 	}
 	r, err := os.OpenRoot(path)
 	if err != nil {
@@ -68,16 +68,16 @@ func CleanRel(rel string) ([]string, error) {
 	}
 	parts := strings.Split(rel, "/")
 	if len(parts) > 16 {
-		return nil, fmt.Errorf("path %q has too many components", clipPath(rel))
+		return nil, fmt.Errorf("path %q has too many components", rel)
 	}
 	for _, p := range parts {
 		switch {
 		case p == "" || p == "." || p == "..":
-			return nil, fmt.Errorf("path %q has an empty, . or .. component", clipPath(rel))
+			return nil, fmt.Errorf("path %q has an empty, . or .. component", rel)
 		case len(p) > 255:
-			return nil, fmt.Errorf("path %q has a component longer than 255 bytes", clipPath(rel))
+			return nil, fmt.Errorf("path %q has a component longer than 255 bytes", rel)
 		case strings.ContainsAny(p, `\:`+"\x00"):
-			return nil, fmt.Errorf("path %q has a backslash, colon or NUL", clipPath(rel))
+			return nil, fmt.Errorf("path %q has a backslash, colon or NUL", rel)
 		}
 	}
 	return parts, nil
@@ -157,11 +157,11 @@ func (d *Dir) readOpen(rel string, limit int64) ([]byte, error) {
 func CleanName(name string) error {
 	switch {
 	case name == "" || name == "." || name == "..":
-		return fmt.Errorf("name %q is not a file name", clipPath(name))
+		return fmt.Errorf("name %q is not a file name", name)
 	case len(name) > 255:
-		return fmt.Errorf("name %q is longer than 255 bytes", clipPath(name))
+		return fmt.Errorf("name %q is longer than 255 bytes", name)
 	case strings.ContainsAny(name, "/") || strings.IndexByte(name, 0) >= 0:
-		return fmt.Errorf("name %q has a slash or a NUL, so it is not one entry of the directory", clipPath(name))
+		return fmt.Errorf("name %q has a slash or a NUL, so it is not one entry of the directory", name)
 	}
 	return nil
 }
@@ -226,7 +226,7 @@ func (d *Dir) RegularNames() (names, others []string, err error) {
 		return nil, nil, fmt.Errorf("listing %s: %w", d.name, err)
 	}
 	if len(ents) > MaxDirEntries {
-		return nil, nil, fmt.Errorf("%s %w (more than %d entries)", clipPath(d.name), ErrTooLarge, MaxDirEntries)
+		return nil, nil, fmt.Errorf("%s %w (more than %d entries)", d.name, ErrTooLarge, MaxDirEntries)
 	}
 	for _, en := range ents {
 		switch {

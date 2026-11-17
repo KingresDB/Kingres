@@ -17,7 +17,7 @@ func openNoFollow(path string, flag int, perm os.FileMode) (*os.File, error) {
 	f, err := os.OpenFile(path, flag|syscall.O_NOFOLLOW|openFlags, perm) // #nosec G304 -- a file of the verifier, next to the state the auditor named
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
-			return nil, fmt.Errorf("%s %w", clipPath(path), ErrLink)
+			return nil, fmt.Errorf("%s %w", path, ErrLink)
 		}
 		return nil, err
 	}

@@ -376,3 +376,66 @@ func FuzzParseBounds(f *testing.F) {
 		}
 	})
 }
+
+func TestCanonicalDropsWhatNoKeyVerified(t *testing.T) {
+	text := "origin/x\n1\nAAAA\n"
+	k1, k2, k3 := testKey(1), testKey(2), testKey(3)
+	line := func(k testKeyPair, sig []byte) string {
+		var id [4]byte
+		binary.BigEndian.PutUint32(id[:], KeyID("origin/x", k.pub))
+		return "\u2014 origin/x " + base64.StdEncoding.EncodeToString(append(id[:], sig...)) + "\n"
+	}
+	sig := func(k testKeyPair) []byte { return ed25519.Sign(k.priv, []byte(text)) }
+	note := text + "\n" + line(k3, make([]byte, 64)) + line(k2, sig(k2)) + line(k1, sig(k1))
+	n, err := Parse([]byte(note))
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := []Key{{"origin/x", k1.pub}, {"origin/x", k2.pub}, {"origin/x", k3.pub}}
+	// k3 is a line nobody signed: VerifyHeld counts it as wrong, and does not reject.
+	ok, wrong, err := VerifyHeld(n, keys)
+	if err != nil || len(ok) != 2 || wrong != 1 {
+		t.Fatalf("VerifyHeld: %v %d %v", ok, wrong, err)
+	}
+	// Verify rejects the whole note, as before, for a new checkpoint.
+	if _, err := Verify(n, keys); !errors.Is(err, ErrBadSignature) {
+		t.Fatalf("Verify: %v", err)
+	}
+	c := Canonical(n, ok)
+	n2, err := Parse(c)
+	if err != nil || len(n2.Signatures) != 2 {
+		t.Fatalf("canonical: %v %q", err, c)
+	}
+	if again, _ := Verify(n2, keys); len(again) != 2 {
+		t.Fatalf("the canonical form does not verify under the keys that signed it")
+	}
+	// Whatever the order and the junk of the note as served, the canonical form is the same.
+	note2 := text + "\n" + line(k1, sig(k1)) + line(k2, sig(k2))
+	n3, _ := Parse([]byte(note2))
+	if !bytes.Equal(Canonical(n3, ok), c) {
+		t.Fatalf("not canonical:\n%q\n%q", Canonical(n3, ok), c)
+	}
+	// Nothing verifies: no key is left.
+	if _, _, err := VerifyHeld(n, []Key{{"origin/x", testKey(9).pub}}); !errors.Is(err, ErrNoTrustedSignature) {
+		t.Fatalf("unknown only: %v", err)
+	}
+	bad := text + "\n" + line(k1, make([]byte, 64))
+	nb, _ := Parse([]byte(bad))
+	if _, wrong, err := VerifyHeld(nb, keys); !errors.Is(err, ErrBadSignature) || wrong != 1 {
+		t.Fatalf("wrong only: %d %v", wrong, err)
+	}
+}
+
+type testKeyPair struct {
+	priv ed25519.PrivateKey
+	pub  ed25519.PublicKey
+}
+
+func testKey(seed byte) testKeyPair {
+	s := make([]byte, ed25519.SeedSize)
+	for i := range s {
+		s[i] = seed
+	}
+	k := ed25519.NewKeyFromSeed(s)
+	return testKeyPair{k, k.Public().(ed25519.PublicKey)}
+}

@@ -213,6 +213,14 @@ func TestBlocksExportThatEndsEarly(t *testing.T) {
 	if code != 0 || info["head_height"] != float64(3) || info["complete_export_shown"] != false || info["blocks"] != float64(4) {
 		t.Errorf("json: %d %v", code, info)
 	}
+	// L10-17: a script that reads only the status concludes a pass, so the JSON
+	// carries the member it tests: nothing ties this chain to a digest.
+	if info["anchored_to_digest"] != false {
+		t.Errorf("anchored_to_digest of an export with no digest: %v", info["anchored_to_digest"])
+	}
+	if code, o := jsonOf(t, "blocks", "--blocks", cut, "--digest", fx("digests/d0.json")); code != 0 || o["info"].(map[string]any)["anchored_to_digest"] != true {
+		t.Errorf("anchored_to_digest of an export with a digest: %d %v", code, o["info"])
+	}
 	// with a digest above the cut, the cut is a failure
 	if code, out, _ := run(t, "blocks", "--blocks", cut, "--digest", fx("digests/d8.json")); code != 1 || !strings.Contains(out, "FAILED at step digest") {
 		t.Errorf("a cut before the digest: %d %s", code, out)

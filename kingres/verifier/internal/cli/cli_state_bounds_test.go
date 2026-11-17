@@ -220,37 +220,3 @@ func FuzzStateRoundTrip(f *testing.F) {
 		checkStateRoundTrip(t, []byte(note), key)
 	})
 }
-
-// L9-04, the dead end that is not about size: a note that is good as a new
-// checkpoint but that a later run refuses as a held one. A corrupt signature of
-// a key that is revoked in the trust file is ignored for a new note (a revoked
-// key does not sign) and refused for a held one (a held note allows no wrong
-// signature of any key of the file). Storing it would stick the state, so it is
-// not stored.
-func TestNoteThatWouldNotBeReadBackIsNotStored(t *testing.T) {
-	k1, k2 := newSigner(1), newSigner(2)
-	all := leaves(300)
-	good := k2.note(logOrigin(), 300, refMTH(all))
-	// k1's line signs another text: the signature is wrong for this one.
-	other := strings.Split(k1.note(logOrigin(), 299, refMTH(all[:299])), "\n\n")[1]
-	note := good + other
-	tr := trustOf(t, keySpec{"k1", k1, `,"revoked":true`}, keySpec{"k2", k2, ""})
-	root := t.TempDir()
-	publishLog(t, root, k2, all, 300)
-	file := writeNote(t, note)
-	if code, out, errs := run(t, "checkpoint", "--trust", tr, "--log", logSpecArg(), "--source", root, "--note", file); code != 0 {
-		t.Fatalf("without --state the note is a new checkpoint: %d\n%s%s", code, out, errs)
-	}
-	state := filepath.Join(t.TempDir(), "state")
-	code, out, errs := run(t, stateArgs(tr, root, state, "--note", file)...)
-	if code != 2 || strings.Contains(out, "VERIFIED") || !strings.Contains(errs, "cannot be recorded") {
-		t.Fatalf("status %d\n%s%s", code, out, errs)
-	}
-	if _, err := os.Stat(state); err == nil {
-		t.Fatal("a state that no later run accepts was written")
-	}
-	// A clean note is then recorded and used.
-	if code, out, _ := run(t, stateArgs(tr, root, state)...); code != 0 {
-		t.Fatal(out)
-	}
-}

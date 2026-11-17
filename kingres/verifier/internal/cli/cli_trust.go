@@ -86,11 +86,15 @@ func (e *env) runTrustInit(args []string) int {
 	if err != nil {
 		return e.inputError(cmd, *asJSON, fmt.Errorf("not writing %s: %w", *out, err))
 	}
-	if _, err := fh.Write(data); err != nil {
+	// The file was made by this command (O_EXCL), so a failed write takes it away
+	// again: a file with nothing in it would make the next run refuse the name.
+	if _, err := trustWrite(fh, data); err != nil {
 		_ = fh.Close()
+		_ = os.Remove(*out)
 		return e.inputError(cmd, *asJSON, err)
 	}
 	if err := fh.Close(); err != nil {
+		_ = os.Remove(*out)
 		return e.inputError(cmd, *asJSON, err)
 	}
 	note := "keep this file where the cluster's administrators cannot change it; a trust file that came from the cluster proves nothing"
@@ -194,3 +198,6 @@ func (e *env) runTrustShow(args []string) int {
 	r.headline = fmt.Sprintf("%s is well formed for the origin prefix %s; %d of %d key(s) can be used at %s.", *path, f.OriginPrefix, usable, len(f.Keys), timeText(now))
 	return e.finishOK(r, *asJSON)
 }
+
+// trustWrite writes the trust file; a test replaces it to make the disk fail.
+var trustWrite = func(f *os.File, data []byte) (int, error) { return f.Write(data) }

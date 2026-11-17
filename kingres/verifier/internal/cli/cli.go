@@ -40,10 +40,16 @@ const (
 
 const (
 	maxFileSize = 16 << 20
+	// maxProofSize is the size of a proof file that is refused: none that a file
+	// system holds. A proof carries one header for each block after its block, and
+	// is read in pieces (see package proof), so memory does not depend on its size.
+	maxProofSize = 1 << 62
 	// maxDigestFile bounds one digest file: a digest is a few hundred bytes, and
 	// a file of more than 64 KiB is not one.
 	maxDigestFile = 64 << 10
-	maxBlocksSize = 1 << 30
+	// maxBlocksSize likewise: an export of the block headers is read line by line
+	// and one header is kept.
+	maxBlocksSize = 1 << 62
 	// maxDigestFiles and maxDigestTotal bound what digest-chain reads.
 	maxDigestFiles = 1024
 	maxDigestTotal = 16 << 20
@@ -76,8 +82,37 @@ type env struct {
 }
 
 // Run executes the command line args (without the program name) and returns
-// the exit status.
+// the exit status. A write to the standard output that failed (a closed
+// descriptor, a full disk) changes status 0 into status 2: 0 says that the
+// verdict was printed, and a verdict nobody could read is not that.
 func Run(args []string, stdout, stderr io.Writer, version string) int {
+	ow := &errWriter{w: stdout}
+	code := dispatch(args, ow, stderr, version)
+	if ow.err != nil && code == ExitOK {
+		fmt.Fprintf(stderr, "kingres-verify: the result could not be written to the standard output (%s): nothing here was reported to you, so do not rely on this run; if --state was given the state file may have been updated\n", untrusted(ow.err.Error()))
+		return exit(ExitUsage)
+	}
+	return code
+}
+
+// errWriter remembers the first error of the writer it wraps.
+type errWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (e *errWriter) Write(p []byte) (int, error) {
+	n, err := e.w.Write(p)
+	if err == nil && n < len(p) {
+		err = io.ErrShortWrite
+	}
+	if err != nil && e.err == nil {
+		e.err = err
+	}
+	return n, err
+}
+
+func dispatch(args []string, stdout, stderr io.Writer, version string) int {
 	e := &env{stdout: stdout, stderr: stderr, version: version}
 	if len(args) == 0 {
 		fmt.Fprint(stderr, usageText)
@@ -212,16 +247,21 @@ func (e *env) runProof(args []string) int {
 	if err != nil {
 		return e.inputError(cmd, *asJSON, err)
 	}
-	proofData, err := readArg(*proofPath, maxFileSize)
+	// The proof is read from the file in pieces and twice (package proof): its
+	// size is not limited, because a proof of an old row is large, and its memory
+	// does not depend on its size.
+	open := func() (io.ReadCloser, error) { return safefile.OpenArg(*proofPath, maxProofSize) }
+	probe, err := open()
 	if err != nil {
 		return e.inputError(cmd, *asJSON, err)
 	}
+	_ = probe.Close()
 	r := &result{cmd: cmd}
-	p, err := proof.Parse(proofData)
+	p, sum, err := proof.ParseStream(open)
 	if err != nil {
 		return e.finishFailed(r, *asJSON, proof.StepParse, err)
 	}
-	res, err := proof.Verify(p, d, exp)
+	res, err := proof.VerifyStream(p, sum, d, exp, open)
 	if res != nil {
 		for _, s := range res.Steps {
 			r.ok(s.Name, s.Detail)
@@ -503,6 +543,11 @@ func (e *env) runBlocks(args []string) int {
 	r.info = map[string]any{
 		"blocks": stream.Blocks, "head_height": head.Height, "head_hash": format.EncodeHex(head.BlockHash[:]),
 		"complete_export_shown": false,
+		// anchored_to_digest is what a script tests: false means that nothing
+		// ties this chain to a digest kept outside the database, so a chain that
+		// was rewritten from the genesis block verifies too (status 0 says that the
+		// headers form a chain, not that the chain is the one that was published).
+		"anchored_to_digest": haveDigest,
 	}
 	if haveDigest {
 		r.ok("digest", fmt.Sprintf("the chain reaches the digest at height %d", d.Height))
