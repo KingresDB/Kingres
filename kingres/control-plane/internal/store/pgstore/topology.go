@@ -33,14 +33,18 @@ type primaryReading struct {
 	ok       bool
 }
 
-// matches tells whether a walsender belongs to the standby node. The agent
-// that creates standbys is specified to set application_name to
-// "kingres_node_<node_id>"; the node id alone and the node's host as client
-// address are accepted as well.
-func (w walSender) matches(n node) bool {
+// matches tells whether a walsender belongs to the standby node. The standbys
+// kingresd creates carry the application name of their record (managed:
+// "kingres_standby_<standby id>", found through the node id the registration
+// stored); the older forms "kingres_node_<node_id>", the node id alone and the
+// node's host as client address are accepted as well.
+func (w walSender) matches(n node, managed string) bool {
 	id := strconv.Itoa(int(n.ID))
 	switch w.AppName {
 	case "kingres_node_" + id, "node_" + id, "node" + id, id:
+		return true
+	}
+	if managed != "" && w.AppName == managed {
 		return true
 	}
 	return w.ClientAddr != "" && w.ClientAddr == n.Host
@@ -127,10 +131,17 @@ func (s *Store) ReplicationTopology(ctx context.Context) (api.ReplicationTopolog
 		return api.ReplicationTopology{}, fmt.Errorf("reading replication topology: %w", err)
 	}
 
+	managed := map[int32]string{}
+	if list, err := s.opts.HA.Standbys().List(ctx); err == nil {
+		for _, sb := range list {
+			if sb.CatalogNode != 0 {
+				managed[sb.CatalogNode] = "kingres_standby_" + strconv.FormatInt(sb.ID, 10)
+			}
+		}
+	}
 	topo := api.ReplicationTopology{GeneratedAt: s.now().UTC(), Groups: make([]api.ShardGroup, 0, len(groupIDs))}
 	for i, g := range groupIDs {
-		sg := buildGroup(cat, g, readings[i])
-		addManagedStandbys(ctx, &sg, g, readings[i], s.opts.HA.Standbys())
+		sg := buildGroup(cat, g, readings[i], managed)
 		sg.Lease = leaseView(s.opts.HA, g)
 		topo.Groups = append(topo.Groups, sg)
 	}
@@ -138,7 +149,7 @@ func (s *Store) ReplicationTopology(ctx context.Context) (api.ReplicationTopolog
 }
 
 // buildGroup assembles one shard group of the topology.
-func buildGroup(cat *catalog, g int32, rd primaryReading) api.ShardGroup {
+func buildGroup(cat *catalog, g int32, rd primaryReading, managed map[int32]string) api.ShardGroup {
 	nodes := cat.groups[g]
 	group := api.ShardGroup{
 		ID: g, IsMapGroup: g == 0, Health: "healthy",
@@ -172,7 +183,7 @@ func buildGroup(cat *catalog, g int32, rd primaryReading) api.ShardGroup {
 			m.State = "running"
 			streaming := false
 			for i, w := range rd.senders {
-				if used[i] || !w.matches(n) {
+				if used[i] || !w.matches(n, managed[n.ID]) {
 					continue
 				}
 				used[i] = true

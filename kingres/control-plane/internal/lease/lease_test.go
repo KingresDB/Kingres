@@ -182,6 +182,12 @@ func (v *fakeVoter) Grant(ctx context.Context, server string, req Request) (Repl
 	if down || g == nil {
 		return Reply{}, errors.New("unreachable")
 	}
+	switch {
+	case req.Release:
+		return g.Release(req.Group, "a")
+	case req.TransferTo != "":
+		return g.Transfer(req.Group, "a", req.TransferTo, time.Duration(req.DurationMs)*time.Millisecond)
+	}
 	return g.Grant(req.Group, "a", time.Duration(req.DurationMs)*time.Millisecond, req.DryRun)
 }
 
@@ -287,10 +293,10 @@ func TestEnforcedLossFencesBeforeAnotherHolderCanBeGranted(t *testing.T) {
 	if freeAt-fencedAt < margin-200*time.Millisecond {
 		t.Fatalf("the margin between fence (+%v) and grant (+%v) is below the safety margin", fencedAt, freeAt)
 	}
-	if _, err := os.Stat(filepath.Join(r.dir, "lease", FencedMarker)); err != nil {
+	if _, err := os.Stat(filepath.Join(r.dir, "lease", "fenced.1")); err != nil {
 		t.Fatal("the fence marker was not written")
 	}
-	if err := Gate(filepath.Join(r.dir, "lease"))(1); err == nil {
+	if err := Gate(filepath.Join(r.dir, "lease"), testPrimary)(1); err == nil {
 		t.Fatal("the start gate must refuse while the marker exists")
 	}
 }
@@ -334,7 +340,7 @@ func TestLeaseRegainedStartsTheFencedPrimaryAndClearsTheMarker(t *testing.T) {
 	if up, _, starts := r.inst.state(); !up || starts != 1 {
 		t.Fatal("the primary must start again once the lease is held")
 	}
-	if err := Gate(filepath.Join(r.dir, "lease"))(1); err != nil {
+	if err := Gate(filepath.Join(r.dir, "lease"), testPrimary)(1); err != nil {
 		t.Fatal("the gate must open again")
 	}
 	want := []string{AuditLeaseLost, AuditLeaseFenced, AuditLeaseAcquired}

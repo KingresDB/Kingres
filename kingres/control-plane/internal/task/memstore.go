@@ -291,7 +291,10 @@ func (m *MemStore) Resume(_ context.Context, id int64) error {
 }
 
 // serverOps are the kinds that exclude a rebalance (and are excluded by it), see migration 0009.
-var serverOps = map[string]bool{"server.add": true, "server.remove": true, "server.leave": true, "server.failover": true}
+var serverOps = map[string]bool{"server.add": true, "server.remove": true, "server.leave": true, "server.failover": true, "replication.restorePreferredPrimaries": true}
+
+// failoverClass are the kinds of which at most one is unfinished at any time (migration 0011, KX003).
+var failoverClass = map[string]bool{"server.failover": true, "replication.restorePreferredPrimaries": true}
 
 // excludedLocked is the rule of the database trigger for a task of kind about to be created.
 func (m *MemStore) excludedLocked(kind string) error {
@@ -301,6 +304,8 @@ func (m *MemStore) excludedLocked(kind string) error {
 			return &ExcludedError{Kind: kind, Other: o.Kind}
 		case serverOps[kind] && o.Kind == "rebalance" && (o.State == Pending || o.State == Running):
 			return &ExcludedError{Kind: kind, Other: "rebalance"}
+		case failoverClass[kind] && failoverClass[o.Kind] && o.State.Active():
+			return &ExcludedError{Kind: kind, Other: o.Kind}
 		}
 	}
 	return nil

@@ -77,6 +77,10 @@ version 1, the caller \"2\"."}` when the number is missing or different.
 | `POST /internal/v1/standby/plan` | leader | the complete list of the cluster's standbys with a version; stored by every server, applied at once by the server that runs a group's primary; see "Standbys" |
 | `POST /internal/v1/standby/create`, `/remove`, `/rebuild` | leader | create (slot on the primary, `pg_basebackup`, start in recovery), delete, or make again the standby instance of a group on this server |
 | `GET /internal/v1/standby/status` | leader | the standby instances of this server and, for the group whose primary it runs, the synchronous setting, streaming standbys, slots and the standbys whose slot was lost |
+| `GET /internal/v1/failover/position?group=<g>` | any peer | read-only: the position of the instance of this server that serves the group (see "The read calls of the failover") |
+| `GET /internal/v1/liveness` | any peer | this server's heartbeat view of every other server (state and silence) |
+| `GET /internal/v1/failover/state?group=<g>` | leader | this server's knowledge of one group: its instances and their roles, the lease, an adoption or a hand-over, the freeze, the catalog term |
+| `POST /internal/v1/failover/freeze`, `/unfreeze`, `/standbys-gone` | leader | hold the synchronous list of a group while its failover is decided (it lapses by itself); take the standbys of a failed server out of the lists at once |
 | `POST /internal/v1/config/state` | leader | the effective values, sources, pending restarts and file errors of the settings of this server's instances (the metadata of every parameter with `meta`), the parameters PostgreSQL hides from ordinary users, the revision and hash of the override file; see "Configuration" |
 | `POST /internal/v1/config/apply` | leader | the override values of this server at a revision and the database-level values: the server re-validates, writes `kingres-config.conf` of each instance, has PostgreSQL check it before the reload, reloads and answers per parameter (applied, pendingRestart, failed) |
 | `POST /internal/v1/config/check` | leader | PostgreSQL's verdict on one value (layers 2 and 3 of the validation) |
@@ -297,7 +301,8 @@ lease). The call is refused while the server is not clustered (`409`/`not_availa
 ```
 {"server": "10.0.0.11",
  "grants":  [{"group": 2, "holder": "10.0.0.12", "remainingMs": 7300}],
- "leases":  [{"group": 1, "holder": "10.0.0.11", "state": "held", "remainingMillis": 3900, "enforced": true}]}
+ "leases":  [{"group": 1, "holder": "10.0.0.11", "state": "held", "remainingMillis": 3900, "enforced": true}],
+ "durationMs": 10000, "marginMs": 3000}
 ```
 
 `grants` are the leases this server granted (remaining time, margin not included); `leases` merges the leases this server
@@ -305,6 +310,24 @@ holds or lost (`state` `held`, `lost`) with the ones it granted to others (`gran
 the lease stops the instance. `state` `none` is a group whose lease this server has not held yet in this run, for example
 while its primary instance waits to be started until the lease is held (the wait marker, README "Decisions (leases)" 7):
 nothing was lost, so no `leaseLost` event or alert exists for it.
+
+`durationMs` and `marginMs` are the lease duration and the margin of the answering server (added with the failover groundwork):
+the safety argument needs them equal on every server, so a failover compares them first and refuses when two servers differ.
+
+**Hand-over and release (added with the failover groundwork).** `POST /lease/grant` also takes
+
+```
+{"group": 1, "durationMs": 10000, "transferTo": "10.0.0.12"}   -> 200 {"granted": true, "holder": "10.0.0.12"}
+{"group": 1, "durationMs": 10000, "release": true}              -> 200 {"granted": true}
+```
+
+`transferTo` is executed only when the caller (named by its certificate) is the holder of record at this grantor, even when its
+lease has not run out: the holder becomes the named server (which must be in the peer directory, `400 bad_request` otherwise) for a fresh
+duration from the receipt, the change is on disk before the answer, and there is no instant at which the group has no holder, so the
+old holder cannot be granted it again. From any other caller it answers `granted: false` with the holder and `waitMs`. `release` deletes
+the grant of the caller when it is the holder (a group with no grant answers `granted: true`); it is for a holder that has confirmed that
+no primary runs under the lease and that its fence marker is on disk. Neither lets anybody but the holder move a lease: the argument of
+"Why this is safe" in the README holds unchanged. The caller of `transferTo` is responsible for not acting under the lease any more.
 
 Fault hook (tests only, `fault-dir`): a call from a server listed in `blockInbound` is dropped without an answer after
 its certificate was verified, and a call to a server listed in `blockOutbound` fails as unreachable, before the network
@@ -339,9 +362,24 @@ and from callers that are not the leader, and a call without it is never fenced.
 An unknown leader is asked for again (three times, 200 ms apart) before a leader-only call is refused with
 `not_leader`; a joining server is not asked.
 
+### The read calls of the failover, and the freeze
+
+Types: `cmd/kingresd/ha_failover.go`, `internal/standby/freeze.go`. A `GET` carries its parameters in the query string.
+
+| Call | Answer |
+|---|---|
+| `GET /failover/position?group=<g>` (any peer) | `{server, group, instanceId, role, inRecovery, timeline, receiveLsn, replayLsn, receiverState, systemIdentifier, catalogTerm}` of the instance of this server whose role file names the group (a standby in preference); `receiveLsn` is the flushed WAL position (the received one in recovery, the current flush position of a primary), `catalogTerm` is `null` when the instance has no catalog or it cannot be read. `404 no_instance` when this server runs no instance of the group, `503 unavailable` when it cannot be read. Read-only. |
+| `GET /liveness` (any peer) | `{server, peers: [{server, state: live\|suspect\|dead\|unknown, silenceMs}]}`: the heartbeat tracker of the answering server; a failover asks every server to corroborate a death. |
+| `GET /failover/state?group=<g>` (leader) | `{server, group, instances: [{id, port, role, origin, group, term, running, inRecovery}], holds, leaseState, adopted, attached, relinquished, frozen, catalogTerm, preparedTransactions, destination}`: what this server knows of the group; a task that is not sure what its last call did asks it. |
+| `POST /failover/freeze` (leader) | `{group, ttlMs, task, epoch}` -> `{}`: the synchronous list of the group is never emptied while the freeze lasts (at most 10 minutes; renewed by repeating the call). |
+| `POST /failover/unfreeze` (leader) | `{group}` -> `{}` |
+| `POST /failover/standbys-gone` (leader) | `{server, ttlMs, clear}` -> `{}`: the standbys that run on `server` are not planned any more for the lists of the primaries of this server, so a list that names them is emptied at once and not after `standby-sync-grace`; the list of a frozen group is not touched. Lapses after `ttlMs` (at most 10 minutes) or with `clear`. |
+
+All of these only change what the standby agent reads from memory: nothing is written to an instance.
+
 ### A server that waits for its lease
 
-A server whose instance is held back until its group lease is won (the fence marker `<data-dir>/lease/fenced` or the wait marker `<data-dir>/lease/waitlease` exists, or its instance is not running) cannot read the catalog and knows no leader. Every call that needs the leader (`LeaderOnly`, `LeaderOrJoining`, `ToLeader`) is then answered `503` with the code `service_unavailable` and `Retry-After: 2`, never `403 not_leader` (which means "the caller is not the leader"). The caller treats it as transient: a task step retries with a pause growing from 1 s to 8 s for up to 5 minutes and then fails naming the server; other callers get the 503. The REST sign-in on that server answers `503 service_unavailable` with `Retry-After: 5` in the same window.
+A server whose instance is held back until its group lease is won (the fence marker `<data-dir>/lease/fenced.<group>` or the wait marker `<data-dir>/lease/waitlease.<group>` of the group of the instance exists (a marker without the suffix, left by an earlier version, holds for every group until the first lease round renames it), or its instance is not running) cannot read the catalog and knows no leader. Every call that needs the leader (`LeaderOnly`, `LeaderOrJoining`, `ToLeader`) is then answered `503` with the code `service_unavailable` and `Retry-After: 2`, never `403 not_leader` (which means "the caller is not the leader"). The caller treats it as transient: a task step retries with a pause growing from 1 s to 8 s for up to 5 minutes and then fails naming the server; other callers get the 503. The REST sign-in on that server answers `503 service_unavailable` with `Retry-After: 5` in the same window.
 
 ## Configuration
 
@@ -357,3 +395,26 @@ JSON `{"error": "<code>", "message": "..."}`. Codes: `no_certificate`,
 `certificate_refused` (401), `version_mismatch` (409), `not_leader` (403),
 `not_found` (404), `identity_unproven` (401: the proof of a forwarded or gather-authorize request, or the assertion of a gather request, is missing or wrong), `not_member` (403: the caller holds a certificate but is not a member of the cluster), `forbidden` (403: a task call about an instance that is not the caller's), `bad_request` (400), `statement_failed` (422), `ca_unavailable` (503: the leader does not hold
 the CA key), `certificate_revoked` (409), `fenced` (409: the task run that made the call was superseded by a newer one), `failed` (500).
+
+### Repeating a call (review ST-03)
+
+A client that did not get an answer repeats a call that a task step made (the connection broke under it) at most three times with the same
+fence token; a client time limit that ended after the connection was made is not repeated. What the second execution of each call does:
+
+| Call | Second execution |
+|---|---|
+| `POST /instance/create` | no-op when the instance exists (it trusts, starts, waits) |
+| `POST /instance/start`, `/stop` | no-op (under the lifecycle lock; the wait for the lock ends with the caller's context) |
+| `POST /instance/remove`, `/node/finish`, `/node/reset` | no-op, or answered as done / certificate refused |
+| `POST /instance/trust`, `/pki/install`, `/peers`, `/config/apply`, `/standby/plan`, `/globals/apply` | rewrite the same files or rows and reload |
+| `POST /apply` | `database.create` checks that the database exists; the other kinds were not all read |
+| `POST /standby/create`, `/remove` | no-op (they check what exists), serialized by the agent |
+| `POST /standby/rebuild` | **no-op for a standby that is of the generation asked for** (changed in this step) |
+| `POST /config/restart` | **no-op with `ifPending` when nothing waits for a restart** (changed in this step; a call without it restarts) |
+| `POST /failover/freeze`, `/unfreeze`, `/standbys-gone` | set the same state in memory |
+| `POST /lease/grant` | a renewal; `transferTo` by the caller that is no longer the holder is refused (`granted: false`); `release` of a free group answers `granted: true` |
+| `POST /task/record`, `/settle`, `/reserve`, `/leave-cluster`, `/leave-status`, `/add-server`, `/forward`, `/pki/renew`, `/exec`, `/heartbeat` | made by servers outside a step, or repeated by design; not repeated by the client |
+| `GET` calls | reads |
+
+The failover steps of the next increment (promote, repoint, rebuild) must be no-ops on a second execution in the same way: check what exists
+before acting, or carry a state that makes the second execution see the first.

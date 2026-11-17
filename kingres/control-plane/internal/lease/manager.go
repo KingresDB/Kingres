@@ -71,6 +71,10 @@ type Config struct {
 	Voter                   Voter
 	Source                  Source
 	Instance                Instance
+	// InstanceFor returns the primary instance of a group this server runs; it replaces
+	// Instance when set (after a failover a server runs primaries that are not
+	// instance 1). false: no instance of this server serves the group now.
+	InstanceFor func(group int32) (Instance, bool)
 	// Enforced tells whether losing the lease of the group stops the instance (a
 	// group with a standby). It is asked at the moment of the decision.
 	Enforced func(group int32) bool
@@ -78,6 +82,10 @@ type Config struct {
 	Dir string
 	// WatchdogFile is the file the watchdog reads (empty: no watchdog).
 	WatchdogFile string
+	// WatchdogFileFor and EnsureWatchdogFor are the per group forms of the two fields
+	// around this one: each primary instance has its own lease file and its own watchdog.
+	WatchdogFileFor   func(group int32) string
+	EnsureWatchdogFor func(group int32)
 	// EnsureWatchdog makes sure the watchdog runs next to the instance; called
 	// after a successful renewal of an enforced group.
 	EnsureWatchdog func()
@@ -95,6 +103,11 @@ type groupState struct {
 	// its outcome: until then the instance is not judged (see Check).
 	roundDone bool
 	lost      bool
+	// rounds counts the finished rounds; refused and waitMs are what the last round that did not
+	// reach a majority learned (AdoptionStatus).
+	rounds  int
+	refused map[string]string
+	waitMs  int64
 }
 
 // Manager is the holder side of the lease protocol. It implements ha.Leases.
@@ -113,11 +126,15 @@ type Manager struct {
 	// starting is set while the instance is being started after the lease was won;
 	// the start runs beside the renewal rounds, so that the lease is renewed while
 	// PostgreSQL starts or recovers. wg tracks it (tests wait on it).
-	starting bool
+	starting map[int32]bool
 	wg       sync.WaitGroup
 	// enf is what the lease manager last knew about which groups are enforced
 	// (loaded lazily from the lease directory, see recordEnforced).
 	enf map[int32]bool
+	// adopted are the groups renewed although the catalog does not name this server as
+	// their primary (adopt.go); relinq the groups whose lease was given up and is not renewed.
+	adopted map[int32]*adoption
+	relinq  map[int32]bool
 }
 
 const (
@@ -141,7 +158,8 @@ func New(c Config) (*Manager, error) {
 	if err := os.MkdirAll(c.Dir, 0o700); err != nil {
 		return nil, fmt.Errorf("lease: creating %s: %w", c.Dir, err)
 	}
-	m := &Manager{c: c, groups: map[int32]*groupState{}, base: uint64(time.Now().UnixNano())}
+	m := &Manager{c: c, groups: map[int32]*groupState{}, starting: map[int32]bool{}, adopted: map[int32]*adoption{}, relinq: map[int32]bool{}, base: uint64(time.Now().UnixNano())}
+	m.loadRelinquished()
 	if b, err := os.ReadFile(filepath.Join(c.Dir, topologyFile)); err == nil {
 		var t Topology
 		if json.Unmarshal(b, &t) == nil {
@@ -156,15 +174,19 @@ func New(c Config) (*Manager, error) {
 // started (the wait marker), does not start until the manager holds a lease and
 // removes the marker. A standby instance this server runs for another server's
 // group belongs to that group's lease, not to this one, and is never held back.
-func Gate(dir string) func(id int) error {
+func Gate(dir string, primaryGroup func(id int) (group int32, primary bool)) func(id int) error {
 	return func(id int) error {
-		if instance.IsStandbyDirID(id) {
+		group, primary := primaryGroup(id)
+		if !primary {
 			return nil
 		}
-		if _, err := os.Stat(filepath.Join(dir, FencedMarker)); err == nil {
+		if markerExists(dir, RelinquishedMarker, group) {
+			return fmt.Errorf("%w: this server gave the lease of the group up", instance.ErrLeaseRequired)
+		}
+		if markerExists(dir, FencedMarker, group) {
 			return fmt.Errorf("%w: the lease of the group was lost", instance.ErrLeaseRequired)
 		}
-		if waitMarkerExists(dir) {
+		if waitMarkerExists(dir, group) {
 			return fmt.Errorf("%w: the lease of the group is not held yet", instance.ErrLeaseRequired)
 		}
 		return nil
@@ -190,17 +212,22 @@ func (m *Manager) Renew(ctx context.Context) {
 	m.mu.Lock()
 	if err == nil {
 		changed := !sameTopology(m.topo, topo)
+		migrateLegacyMarkers(m.c.Dir, topo.Groups)
 		m.topo, m.haveT = topo, true
 		if changed {
 			m.saveTopologyLocked()
 		}
 	}
 	t, ok := m.topo, m.haveT
+	var groups []int32
+	if ok {
+		groups = m.groupsToRenewLocked(t)
+	}
 	m.mu.Unlock()
 	if !ok {
 		return
 	}
-	for _, g := range t.Groups {
+	for _, g := range groups {
 		m.round(ctx, g, t.Members)
 	}
 }
@@ -236,32 +263,54 @@ func (m *Manager) round(ctx context.Context, group int32, members []string) {
 	req := Request{Group: group, DurationMs: m.c.Duration.Milliseconds()}
 	rctx, cancel := context.WithTimeout(ctx, m.c.Duration-m.c.Margin)
 	defer cancel()
-	results := make(chan bool, len(members))
+	type vote struct {
+		server  string
+		granted bool
+		reply   Reply
+	}
+	results := make(chan vote, len(members))
 	for _, s := range members {
 		go func() {
 			if s == m.c.Self {
 				r, err := m.c.Grantor.Grant(group, m.c.Self, m.c.Duration, false)
-				results <- err == nil && r.Granted
+				results <- vote{s, err == nil && r.Granted, r}
 				return
 			}
 			r, err := m.c.Voter.Grant(rctx, s, req)
-			results <- err == nil && r.Granted
+			results <- vote{s, err == nil && r.Granted, r}
 		}()
 	}
 	granted := 0
 	ok := false
+	refused := map[string]string{}
+	var waits []int64
 	for i := 0; i < len(members); i++ {
-		if <-results {
+		v := <-results
+		if v.granted {
 			granted++
+		} else if v.reply.Holder != "" {
+			refused[v.server] = v.reply.Holder
+			waits = append(waits, v.reply.WaitMs)
 		}
 		if granted >= need {
 			ok = true
 			break
 		}
 	}
+	var waitMs int64
+	if !ok && len(waits) >= need-granted && need-granted > 0 {
+		sort.Slice(waits, func(i, j int) bool { return waits[i] < waits[j] })
+		waitMs = waits[need-granted-1]
+	}
 	m.mu.Lock()
 	st := m.state(group)
 	st.roundDone = true
+	st.rounds++
+	if ok {
+		st.refused, st.waitMs = nil, 0
+	} else {
+		st.refused, st.waitMs = refused, waitMs
+	}
 	wasLost := st.lost
 	if ok && start+m.c.Duration > st.validUntil {
 		st.validUntil, st.have = start+m.c.Duration, true
@@ -283,15 +332,15 @@ func (m *Manager) acquired(ctx context.Context, group int32, wasLost bool) {
 	enforced := m.c.Enforced(group)
 	m.recordEnforced(group, enforced)
 	m.mu.Lock()
-	if m.starting {
+	if m.starting[group] {
 		m.mu.Unlock()
 		return // the start that is under way finishes the work below
 	}
-	if Waiting(m.c.Dir) {
+	if Waiting(m.c.Dir, group) {
 		// The primary was fenced, or kingresd found it stopped at its start while the
 		// lease is enforced: the lease is held, so it may start. This runs beside the
 		// next rounds: a start with crash recovery can take longer than a lease.
-		m.starting = true
+		m.starting[group] = true
 		m.wg.Add(1)
 		m.mu.Unlock()
 		go func() {
@@ -308,18 +357,33 @@ func (m *Manager) acquired(ctx context.Context, group int32, wasLost bool) {
 // acquired does for a running one. A failed start puts the markers back, so that
 // nothing but this path starts the primary and the next round tries again.
 func (m *Manager) startPrimary(ctx context.Context, group int32, wasLost bool) {
-	defer func() { m.mu.Lock(); m.starting = false; m.mu.Unlock() }()
+	defer func() { m.mu.Lock(); delete(m.starting, group); m.mu.Unlock() }()
 	m.op.Lock()
 	marks := map[string]bool{}
 	for _, n := range []string{FencedMarker, WaitMarker} {
-		p := filepath.Join(m.c.Dir, n)
-		if _, err := os.Stat(p); err == nil {
-			marks[p] = true
-			_ = os.Remove(p)
+		if markerExists(m.c.Dir, n, group) {
+			marks[MarkerPath(m.c.Dir, n, group)] = true
+			removeMarker(m.c.Dir, n, group)
 		}
 	}
 	if len(marks) > 0 {
-		if err := m.c.Instance.Start(ctx); err != nil {
+		inst, have := m.instance(group)
+		var err error
+		if !have {
+			err = fmt.Errorf("no instance of this server serves shard group %d", group)
+		} else {
+			err = inst.Start(ctx)
+		}
+		if err == nil && markerExists(m.c.Dir, FencedMarker, group) {
+			// A fence arrived while the start ran (it did not wait for it): the instance that came up must not
+			// stay up. The fence wrote its marker before it looked at the instance.
+			sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			_ = inst.StopImmediate(sctx)
+			cancel()
+			m.op.Unlock()
+			return
+		}
+		if err != nil {
 			m.c.Log.Error("starting the primary after the lease was won", "group", group, "error", err)
 			for p := range marks {
 				_ = pki.WriteFile(p, []byte("waiting for the group lease\n"), 0o600) // not started: stay held back
@@ -338,9 +402,9 @@ func (m *Manager) afterAcquired(ctx context.Context, group int32, wasLost bool) 
 		m.c.Log.Warn("the group lease is held again", "group", group)
 		m.audit(ctx, AuditLeaseAcquired, group, "the lease was obtained again after it was lost")
 	}
-	if m.c.Enforced(group) && m.c.EnsureWatchdog != nil {
+	if m.c.Enforced(group) {
 		m.writeWatchdogFile(group)
-		m.c.EnsureWatchdog()
+		m.ensureWatchdog(group)
 	}
 }
 
@@ -358,7 +422,7 @@ func (m *Manager) Check(ctx context.Context) {
 		if !st.roundDone || st.lost {
 			continue
 		}
-		if !st.have && waitMarkerExists(m.c.Dir) {
+		if !st.have && waitMarkerExists(m.c.Dir, g) {
 			// This kingresd has not started the primary yet because it holds no
 			// lease: there is nothing to fence and nothing was lost, the lease is
 			// simply not held yet (state "none"). The first round that wins it starts
@@ -377,6 +441,12 @@ func (m *Manager) Check(ctx context.Context) {
 }
 
 func (m *Manager) lose(ctx context.Context, group int32) {
+	if a := m.adoptionOf(group); a != nil && !a.attached {
+		// A lease that guards no instance (the fence holder of a failover, or the server that is
+		// about to promote a standby): there is nothing to stop and no marker to write.
+		m.c.Log.Warn("an adopted group lease was lost", "group", group, "kind", a.kind)
+		return
+	}
 	enforced := m.c.Enforced(group)
 	m.c.Log.Warn("the group lease was lost", "group", group, "enforced", enforced)
 	m.audit(ctx, AuditLeaseLost, group, fmt.Sprintf("no majority renewed the lease in time; enforced=%t", enforced))
@@ -391,12 +461,17 @@ func (m *Manager) lose(ctx context.Context, group int32) {
 // Fence stops the primary instance with an immediate shutdown after writing the
 // marker that keeps it from starting without a lease.
 func (m *Manager) Fence(ctx context.Context, group int32) error {
-	m.op.Lock()
-	defer m.op.Unlock()
-	if err := pki.WriteFile(filepath.Join(m.c.Dir, FencedMarker), []byte("fenced\n"), 0o600); err != nil {
+	// A fence never waits behind anything (ST-04): not behind m.op, which a start of the primary holds
+	// across its Start, and StopImmediate takes no lifecycle lock. A start that is under way is stopped
+	// again by the check at its end (startPrimary).
+	if err := pki.WriteFile(FencedPath(m.c.Dir, group), []byte("fenced\n"), 0o600); err != nil {
 		return fmt.Errorf("writing the fence marker: %w", err)
 	}
-	if up, err := m.c.Instance.Running(ctx); err == nil && !up {
+	inst, have := m.instance(group)
+	if !have {
+		return nil // no instance of this server serves the group: the marker is all there is to do
+	}
+	if up, err := inst.Running(ctx); err == nil && !up {
 		// Nothing runs that could be stopped: the marker keeps it from starting
 		// without a lease, and no stop is claimed in the audit log.
 		return nil
@@ -405,7 +480,7 @@ func (m *Manager) Fence(ctx context.Context, group int32) error {
 	// does not happen is the failure the whole protocol exists to prevent.
 	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
-	if err := m.c.Instance.StopImmediate(sctx); err != nil {
+	if err := inst.StopImmediate(sctx); err != nil {
 		return fmt.Errorf("stopping the primary: %w", err)
 	}
 	m.audit(ctx, AuditLeaseFenced, group, "the primary instance was stopped with an immediate shutdown")
@@ -512,10 +587,13 @@ var _ ha.Leases = (*Manager)(nil)
 func (m *Manager) Confirming() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if !m.haveT || waitMarkerExists(m.c.Dir) {
-		return false // unknown groups, or an instance that is held back anyway
+	if !m.haveT {
+		return false // unknown groups
 	}
 	for _, g := range m.topo.Groups {
+		if waitMarkerExists(m.c.Dir, g) {
+			continue // an instance that is held back anyway
+		}
 		st := m.groups[g]
 		if st != nil && (st.lost || (st.have && m.c.Clock.Mono() < st.validUntil-m.c.Margin)) {
 			continue
@@ -525,4 +603,34 @@ func (m *Manager) Confirming() bool {
 		}
 	}
 	return false
+}
+
+// instance is the primary instance of the group on this server.
+func (m *Manager) instance(group int32) (Instance, bool) {
+	if m.c.InstanceFor != nil {
+		return m.c.InstanceFor(group)
+	}
+	return m.c.Instance, m.c.Instance != nil
+}
+
+func (m *Manager) watchdogFile(group int32) string {
+	if m.c.WatchdogFileFor != nil {
+		return m.c.WatchdogFileFor(group)
+	}
+	return m.c.WatchdogFile
+}
+
+func (m *Manager) ensureWatchdog(group int32) {
+	switch {
+	case m.c.EnsureWatchdogFor != nil:
+		m.c.EnsureWatchdogFor(group)
+	case m.c.EnsureWatchdog != nil:
+		m.c.EnsureWatchdog()
+	}
+}
+
+func (m *Manager) adoptionOf(group int32) *adoption {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.adopted[group]
 }

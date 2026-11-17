@@ -54,6 +54,7 @@ func main() {
 		return // another watchdog already watches this instance
 	}
 	var seq uint64
+	var off bool               // kingresd wrote "off": the lease is not enforced for this instance now, nothing to fence on
 	start := time.Now()        // carries the monotonic reading
 	var deadline time.Duration // since start; 0: no lease seen yet, fence at once
 	for {
@@ -67,13 +68,15 @@ func main() {
 			var f struct {
 				Seq     uint64 `json:"seq"`
 				ValidMs int64  `json:"validMs"`
+				Off     bool   `json:"off"`
 			}
 			if json.Unmarshal(b, &f) == nil && f.Seq != seq {
 				seq = f.Seq
+				off = f.Off
 				deadline = time.Since(start) + time.Duration(f.ValidMs)*time.Millisecond
 			}
 		}
-		if time.Since(start) >= deadline {
+		if !off && time.Since(start) >= deadline {
 			fence(*marker, *pgctl, *data)
 		}
 		time.Sleep(*poll)

@@ -13,6 +13,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fault"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ha"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/leader"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/lease"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/membership"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/monitor"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ops"
@@ -56,6 +57,10 @@ type haDeps struct {
 	Audit func(ctx context.Context, ev audit.Event)
 	// Standby is the standby machinery (nil without an internal API).
 	Standby *standbyParts
+	// LeaseMgr is the lease manager (nil until startLeases ran); EntryDestination says where the
+	// client entry point sends a new connection now (nil without an entry point).
+	LeaseMgr         *lease.Manager
+	EntryDestination func(ctx context.Context) string
 	// BG is the context of background work; background goroutines are added to WG
 	// and must end when BG ends.
 	BG context.Context
@@ -66,7 +71,7 @@ type haDeps struct {
 // liveness first (leases and standbys read it), then leases, standbys and the
 // client entry point.
 func startHA(d *haDeps) error {
-	for _, f := range []func(*haDeps) error{startLiveness, startLeases, startStandbys, startClientProxy} {
+	for _, f := range []func(*haDeps) error{startLiveness, startLeases, startStandbys, startClientProxy, startFailoverCalls} {
 		if err := f(d); err != nil {
 			return err
 		}

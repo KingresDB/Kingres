@@ -142,6 +142,9 @@ type CheckResponse struct {
 // RestartRequest restarts one local instance.
 type RestartRequest struct {
 	Instance int `json:"instance"`
+	// IfPending makes the call a no-op for an instance that runs and has nothing pending a restart: a task
+	// step that repeats the call because the answer was lost must not restart the instance twice (ST-03).
+	IfPending bool `json:"ifPending,omitempty"`
 }
 
 // TimeResponse is the answer of the clock probe: the wall clock is read as late as possible.
@@ -174,8 +177,8 @@ func (a *Agent) conn(ctx context.Context, id int) (*pgx.Conn, error) {
 	return a.Svc.ServiceConnAt(ctx, id, mk.Port, "postgres")
 }
 
-func roleOf(id int) string {
-	if instance.IsStandbyDirID(id) {
+func (a *Agent) roleOf(id int) string {
+	if !a.mgr().IsWritable(id) {
 		return "standby"
 	}
 	return "primary"
@@ -297,7 +300,7 @@ func (a *Agent) State(ctx context.Context, req StateRequest) (StateResponse, err
 		if err != nil {
 			continue
 		}
-		info := InstanceInfo{ID: id, Role: roleOf(id), Port: mk.Port, Token: a.mgr().PostmasterToken(id)}
+		info := InstanceInfo{ID: id, Role: a.roleOf(id), Port: mk.Port, Token: a.mgr().PostmasterToken(id)}
 		up, _ := a.mgr().Running(ctx, id)
 		info.Running = up
 		if up {
@@ -416,7 +419,7 @@ func (a *Agent) Apply(ctx context.Context, req ApplyRequest) (ApplyResponse, err
 	var hiddenSet map[string]bool
 	for _, id := range a.instanceIDs() {
 		if _, err := a.mgr().EnsureConfig(id); err != nil {
-			if instance.IsStandbyDirID(id) {
+			if !a.mgr().IsWritable(id) {
 				// A standby that is still being created has no data directory yet: it gets the file once it exists
 				// (the leader brings servers up to date, see Run).
 				waiting = fmt.Sprintf("standby instance %d is not ready yet", id)
@@ -440,7 +443,7 @@ func (a *Agent) Apply(ctx context.Context, req ApplyRequest) (ApplyResponse, err
 		cfg, _ := a.mgr().ConfigPath(id)
 		c, err := a.conn(ctx, id)
 		if err != nil {
-			if instance.IsStandbyDirID(id) {
+			if !a.mgr().IsWritable(id) {
 				// A standby that is starting or recovering does not accept connections yet: it has the
 				// file and reads it at the next reload; it is reported as waiting, not as failed.
 				if err := a.mgr().WriteConfig(id, text); err != nil {
@@ -780,11 +783,14 @@ func (a *Agent) Check(ctx context.Context, req CheckRequest) (CheckResponse, err
 
 // RestartInstance restarts one local instance and waits until it accepts connections (and a standby
 // streams again). It returns when the instance is back or after at most two minutes.
-func (a *Agent) RestartInstance(ctx context.Context, id int) error {
+func (a *Agent) RestartInstance(ctx context.Context, id int, ifPending bool) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if _, err := a.mgr().Managed(id); err != nil {
 		return err
+	}
+	if ifPending && !a.restartNeeded(ctx, id) {
+		return nil // it was restarted already (by an earlier try of this call): nothing waits for a restart
 	}
 	if err := a.mgr().Restart(ctx, id); err != nil {
 		return err
@@ -794,7 +800,7 @@ func (a *Agent) RestartInstance(ctx context.Context, id int) error {
 		c, err := a.conn(ctx, id)
 		if err == nil {
 			ok := true
-			if instance.IsStandbyDirID(id) {
+			if !a.mgr().IsWritable(id) {
 				var n int
 				_ = c.QueryRow(ctx, "SELECT count(*) FROM pg_catalog.pg_stat_wal_receiver WHERE status = 'streaming'").Scan(&n)
 				ok = n > 0
@@ -888,4 +894,23 @@ func (a *Agent) now() time.Time {
 		return a.Now()
 	}
 	return time.Now()
+}
+
+// restartNeeded says whether the instance has to be restarted now: it is stopped (it must be started), or a setting
+// waits for a restart. A question that cannot be answered is "yes": the restart is the safe side of a repeat only
+// when the instance is known to be fine, so an unknown state restarts.
+func (a *Agent) restartNeeded(ctx context.Context, id int) bool {
+	if up, err := a.mgr().Running(ctx, id); err != nil || !up {
+		return true
+	}
+	c, err := a.conn(ctx, id)
+	if err != nil {
+		return true
+	}
+	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	var n int
+	if err := c.QueryRow(ctx, `SELECT count(*) FROM pg_catalog.pg_settings WHERE pending_restart`).Scan(&n); err != nil {
+		return true
+	}
+	return n > 0
 }

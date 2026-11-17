@@ -87,7 +87,70 @@ func (o *Ops) lifecycleCtl() (LifecycleControl, error) {
 	if !ok || l == nil {
 		return nil, problem.New(problem.UnsupportedOp, "This server is not configured to manage a PostgreSQL instance (pg-bin-dir).")
 	}
-	return l, nil
+	return primaries{inner: l, ids: o.writableIDs}, nil
+}
+
+// writableIDs are the instances the server-level operations act on.
+func (o *Ops) writableIDs() []int {
+	if o.WritableIDs != nil {
+		if ids := o.WritableIDs(); len(ids) > 0 {
+			return ids
+		}
+	}
+	return []int{cluster.NodeID}
+}
+
+// primaries applies the start, stop and restart of "this server's instance" to every
+// primary the server runs (after a failover that need not be instance 1; the id the
+// callers pass is ignored). The standbys are the agent's business, as before. The state
+// is "running" while any of them runs.
+type primaries struct {
+	inner LifecycleControl
+	ids   func() []int
+}
+
+func (p primaries) Running(ctx context.Context, _ int) (bool, error) {
+	var first error
+	for _, id := range p.ids() {
+		up, err := p.inner.Running(ctx, id)
+		if err != nil && first == nil {
+			first = err
+		}
+		if up {
+			return true, nil
+		}
+	}
+	return false, first
+}
+
+func (p primaries) Start(ctx context.Context, _ int) error {
+	for _, id := range p.ids() {
+		if up, err := p.inner.Running(ctx, id); err == nil && up {
+			continue
+		}
+		if err := p.inner.Start(ctx, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p primaries) Stop(ctx context.Context, _ int) error {
+	for _, id := range p.ids() {
+		if err := p.inner.Stop(ctx, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p primaries) Restart(ctx context.Context, _ int) error {
+	for _, id := range p.ids() {
+		if err := p.inner.Restart(ctx, id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // stateLocked derives the state from the in-memory state and whether the

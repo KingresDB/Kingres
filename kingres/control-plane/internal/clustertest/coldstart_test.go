@@ -282,7 +282,7 @@ func TestOrderlyStopOutlastingTheLeaseIsNotFencedByTheWatchdog(t *testing.T) {
 		t.Fatalf("the orderly stop ended although a backend holds it: %v", err)
 	default:
 	}
-	if _, err := os.Stat(filepath.Join(victim.DataDir, "lease", lease.FencedMarker)); err == nil {
+	if lease.AnyFenced(filepath.Join(victim.DataDir, "lease")) {
 		t.Error("the watchdog fenced an instance that was being stopped on purpose")
 	}
 	signal("CONT")

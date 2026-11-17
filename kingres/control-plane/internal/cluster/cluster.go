@@ -264,7 +264,7 @@ func (s *Service) Resume(bg context.Context) error {
 	if s.mgr.Exists(NodeID) && (s.setup.State() != setup.Uninitialized || s.Joining()) {
 		ctx, cancel := context.WithTimeout(bg, 2*time.Minute)
 		defer cancel()
-		if err := s.mgr.Start(ctx, NodeID); err != nil {
+		if err := s.startWritable(ctx); err != nil {
 			if errors.Is(err, instance.ErrLeaseRequired) {
 				// The instance fenced itself (lease lost) and may not run as a primary
 				// until the lease manager holds a lease again; it starts it then.
@@ -300,16 +300,11 @@ func (s *Service) StopInstance(ctx context.Context) error {
 	if !s.Enabled() || !s.mgr.Exists(NodeID) {
 		return nil
 	}
-	var first error
-	for _, id := range s.mgr.IDs() {
-		if id != NodeID {
-			if err := s.mgr.Stop(ctx, id); err != nil && first == nil {
-				first = err
-			}
+	first := s.stopStandbys(ctx)
+	for _, id := range s.WritableIDs() {
+		if err := s.mgr.Stop(ctx, id); err != nil {
+			return err
 		}
-	}
-	if err := s.mgr.Stop(ctx, NodeID); err != nil {
-		return err
 	}
 	return first
 }
@@ -318,20 +313,15 @@ func (s *Service) StopInstance(ctx context.Context) error {
 // (kingresd -stop-instances): the primary instance is asked for a fast shutdown
 // without waiting, requested is called with the identity of the postmaster that
 // was asked, and only then the stop is awaited (instance.Manager.StopForShutdown).
-func (s *Service) StopInstanceForShutdown(ctx context.Context, requested func(postmaster string)) error {
+func (s *Service) StopInstanceForShutdown(ctx context.Context, requested func(id int, postmaster string)) error {
 	if !s.Enabled() || !s.mgr.Exists(NodeID) {
 		return nil
 	}
-	var first error
-	for _, id := range s.mgr.IDs() {
-		if id != NodeID {
-			if err := s.mgr.Stop(ctx, id); err != nil && first == nil {
-				first = err
-			}
+	first := s.stopStandbys(ctx)
+	for _, id := range s.WritableIDs() {
+		if err := s.mgr.StopForShutdown(ctx, id, func(pm string) { requested(id, pm) }); err != nil {
+			return err
 		}
-	}
-	if err := s.mgr.StopForShutdown(ctx, NodeID, requested); err != nil {
-		return err
 	}
 	return first
 }
@@ -385,8 +375,27 @@ func newUUID() (string, error) {
 
 func itoa(i int) string { return strconv.Itoa(i) }
 
-// ServiceConn opens a connection to database db as the service role. The
-// caller closes it.
+// ServiceConn opens a connection to database db as the service role. What is per
+// server lives on the home instance (instance NodeID), which is where it goes,
+// except that a server that runs the primary of the map group in another directory
+// (a promoted standby) is reached there: the orchestration of the cluster asks the
+// map primary. Code that needs the primary of a group or every writable
+// instance uses PrimaryConn and EachWritable (roles.go). The caller closes it.
 func (s *Service) ServiceConn(ctx context.Context, db string) (*pgx.Conn, error) {
+	// The orchestration of the cluster (the catalog, distributed DDL, the system database) goes to the
+	// primary of the map group when this server runs it, whichever directory that is; anything else,
+	// and every server that does not run it, uses the home instance.
+	if li, ok := s.PrimaryOf(0); ok && li.Role.Group == 0 && li.ID != NodeID {
+		return s.InstanceConn(ctx, li.ID, db)
+	}
+	return s.homeConn(ctx, db)
+}
+
+// homeConn is the connection to the home instance.
+func (s *Service) homeConn(ctx context.Context, db string) (*pgx.Conn, error) {
+	if s.mgr != nil && s.mgr.Exists(NodeID) && s.mgr.IsCopy(NodeID) {
+		// The home instance was rebuilt from another server's copy: it has no password of ours.
+		return s.ServiceConnAt(ctx, NodeID, s.cfg.PGPort, db)
+	}
 	return s.connect(ctx, db)
 }

@@ -2428,7 +2428,7 @@ the store's epoch check refuses it.
 
 ### What part 2 must add
 
-- **Catalog registration of standbys:** implement `standby.CatalogRegistrar` (`internal/standby/catalog.go`: `Register`, `Unregister`) with kingres_shard 0.5 and pass it as `Leader.Registrar` in `newStandbyParts` (`cmd/kingresd/ha_standby.go`) instead of `SkipCatalog{}`. The task step is `standby.register_in_catalog`; store the node id in `kingres_cp.standby.catalog_node_id` and drop `pgstore.ManagedStandbyInstanceBase`.
+- **Catalog registration of standbys:** done in increment 0 of part 2 (see "Failover groundwork" at the end of this file).
 - **Promotion:** set `Agent.Frozen` during a failover decision; obtain the lease through `POST /lease/grant` (use `dryRun` to wait for the old lease); make `Agent.maintainPrimary/Status/Create`, `catalogTopology` and `localInstance` in `ha_leases.go` and the watchdog files use the instance id of the group's primary instead of instance 1; repoint the other standbys (`primary_conninfo`); rebuild the old primary with `POST /standby/rebuild` and `diverged: true`; remove `lease.FencedMarker` when a server becomes a standby.
 - **Automatic failover** reads `ha.Liveness.State/Silence` (count `autoFailover.timeoutSeconds` from the dead transition) and `Leases`.
 - The 60-second leader memory (decision 8) must be revisited with leader moves.
@@ -2557,7 +2557,9 @@ another holder took over, in the complete runs, showed what the first of them hi
   `TestVoidGuardOfALostLeaseMakesNoCall`).
 - **RBR-05, a move is found by an identity.** Before the call `Backend.Mark` reads the highest move id of the extension; the record of the call is
   the one of the bucket with a higher id. No clock of this process is compared with the extension's. A row left by an earlier holder that never saw
-  its record is found by the time the row was started, read from the system database, which is on the server of the extension.
+  its record is found by the time the row was started, read from the system database, and compared with the extension's `started_at`:
+  that is a comparison of the clocks of two servers (the system database is on the leader's server, which need not be the extension's map
+  primary), with no tolerance, and it is not usable across a failover of the map group primary (review ST-05; not changed yet).
 - **RBR-06, rebalance and failover.** The design of the failover (`kingres/docs/design/ha-phase5-part2.md`, section 4.5) stops the rebalance first,
   because a pending or running rebalance excludes a `server.failover` task (migration 0009) and a rebalance with a stuck move (a dead target) would
   hold an automatic failover back. The rebalance offers what that needs: `Service.StopForFailover(ctx, serverID)` sets the flag of a stop with
@@ -2578,3 +2580,167 @@ another holder took over, in the complete runs, showed what the first of them hi
   removal of a node: not narrowed, because the function has no argument for a group (the request to the extension is `cleanup_moved_buckets(force,
   group)`); it is used only when the removal is refused for a group that takes part in a move, and what it did is now in the log and in the audit log
   (`cleanupMovedBucketsForced`, with the number of moves finished). (d) was fixed in the first round.
+
+## Failover groundwork (increments 0 to 2 of ha-phase5-part2.md)
+
+The failover itself (`failoverServer`, `restorePreferredPrimaries`, the map group bootstrap, automatic failover) is not built yet and
+still answers 422 `unsupported_operation`. These increments lay what it stands on; the design is
+`kingres/docs/design/ha-phase5-part2.md`, section 10.
+
+### Increment 0: the standbys are in the sharding catalog
+
+What exists now:
+
+- **`standby.PGRegistrar`** (`internal/standby/catalog.go`) implements `CatalogRegistrar` over `kingres.add_node(host, port, group, 'standby')`
+  and `kingres.remove_node(node)` of kingres_shard 0.5, on the leader's connection to the system database (it runs the primary of the map
+  group). `Register` is idempotent (a standby that is in the catalog answers its node id; the answer `42710` "already registered" is read as
+  that) and checks `standby_status()` afterwards (a problem is logged, not fatal). Refusals carry their SQLSTATE (`CatalogError`): `KS007`, `KS008`,
+  `KS009` and `55P03` are marked retryable (the next check repeats; a node that did not answer is never asked again inside one call), `KS010`
+  is not; kingresd never reads the text. Every call has a deadline of 5 minutes (the extension's bound is `2 x node_timeout + 2 s` per node
+  that does not answer): its expiry is "did not finish", repeated by the next check (sequence 9). `SkipCatalog` is gone.
+- **The step `standby.register_in_catalog` is `done`, never `skipped`.** It registers every ready standby that has no `catalog_node_id`, not only
+  the ones its own task made, stores the node id in `kingres_cp.standby.catalog_node_id` and pushes the list again. The leader's check
+  (`work.Register`) also starts a task for ready standbys that are not in the catalog: this is how a cluster made before the registration
+  existed converges by itself (test `TestStandbysMadeBeforeTheRegistrationAreRegisteredByThemselves`).
+- **The name goes into the list only after the catalog knows the standby.** `Entry.CatalogNode` travels in the plan; the primary's agent
+  (`Agent.mayName`) names a standby in `synchronous_standby_names` only when the standby is registered, streams, its name is safe to write
+  (`SafeName`: lower case letters, digits and `_`; the extension's check is case-insensitive and treats `*` as every standby) and
+  `kingres.standby_name_matches(name)` answers true on the primary. A name that is in the list already stays until the plan drops the standby
+  (it was checked when it went in), so an upgraded cluster never flaps. Test `TestMayNameNeedsRegistrationStreamingAndTheExtension`.
+- **Removal in the order of the extension's sequence 8.** The plan without the standby is pushed (the primary's agent applies it at once), then
+  the standby's server deletes the instance, then `remove_node`; a refusal `KS009` ("cannot commit": the list still names it) is repeated for up
+  to a minute (`Leader.UnregisterWait`), and the record of the standby is deleted only after the catalog row is gone (a record that is gone cannot
+  be found again to finish the removal). A rebuild that changes the standby's port removes the old row and registers a new one (a node is its
+  host and port, sequence 6). `PurgeServer` (a server that is removed or leaves) does the same for every standby it takes along, before the
+  membership task unregisters the server's own nodes.
+- **The replication view reads the standbys from the catalog.** `pgstore.ManagedStandbyInstanceBase` and `addManagedStandbys` are removed:
+  `buildGroup` lists the catalog's standby nodes, finds each one's walsender through the application name of its record (`kingres_standby_<id>`,
+  found through `catalog_node_id`) and the instance id of a standby is its real node id. A standby that is created and not yet registered is not
+  in the view for the few seconds until it is.
+- `membership` ignores standby rows where a primary is meant (`catalogFacts`: a standby of the map group does not make its server the leader).
+
+Still refused: `failoverServer`, `restorePreferredPrimaries` (422 `unsupported_operation`).
+
+### Increment 1: the instance mapping (no behaviour of its own)
+
+Before this increment the code assumed that the primary of a server's group is instance 1 of the server and that the directories from
+100 up are standbys. After a failover that is false: a server can run two primaries (its own instance 1 and the promoted standby in
+directory `100 + group`), or none (instance 1 became a standby). The mapping below replaces the assumption everywhere; on a cluster that
+never had a failover every answer is what it was (instance 1), which is what the existing suites show.
+
+- **Role files** (`internal/instance/role.go`). An instance directory keeps its id for life; `kingres-role.json` next to the marker says
+  what it serves: `{group, role: primary|standby, origin: own|copy, term}`. `origin: own` is data this server initialised (its service
+  role has this server's password); `copy` is a physical copy of another server's instance, reached by peer authentication on the
+  private socket. The file is written with fsync and an atomic replace at creation (`Init`: primary, own, group unknown; `InitStandby`:
+  standby, copy, group = id - 100). A directory without a file is what the older layout made of its id (`DefaultRole`); a file that
+  cannot be read is an error and is never replaced by the default (`MustRole` falls back to the id's default, which for a directory from
+  100 up is a standby and never writable). `cluster.Service.SyncRoles` runs with every lease round (the topology read): it creates the
+  files an older layout lacks and names the group of an instance from the catalog row of its port; it never changes the role or the
+  origin of a file that exists (a promotion writes those, with the instance it concerns).
+- **`cluster.Service`** (`internal/cluster/roles.go`): `LocalInstances`, `WritableInstances`/`WritableIDs`, `PrimaryOf(group)`,
+  `InstanceConn`, `PrimaryConn(group, db)`, `SystemConn`, `EachWritable`, `ConnectID`, `AccessSourceID`, `SystemInstance`. `ServiceConn`
+  stays "the home instance" except that a server that runs the primary of the **map group** in another directory is reached there (the
+  orchestration of the cluster, the catalog and the system database always ask the map primary). Peer or password authentication follows
+  `origin`, not the directory id (`IsStandbyDirID` is gone from every decision).
+- **Leases per group.** `lease.Config.InstanceFor`, `WatchdogFileFor`, `EnsureWatchdogFor`; the markers are `fenced.<group>` and
+  `waitlease.<group>` (`lease.FencedPath`, `MarkerPath`); `lease.Gate(dir, primaryGroup)` holds back only a primary whose own group is
+  fenced or waiting; the start of a primary after its lease was won is per group; there is one watchdog per primary instance, each with
+  its own lease file (`instances/<id>/lease.json`), lock (`watchdog.<id>.lock`) and stand-down file (`standdown.<id>`, also the old name for
+  instance 1 for a watchdog that was started by the earlier version). A marker without the suffix, left by the earlier version, holds
+  for every group of the server until the first lease round has read the catalog and renamed it to the groups of the server
+  (`migrateLegacyMarkers`); an upgrade never loses a fence and never keeps one for ever.
+- **The standby agent per group.** `maintainPrimaries` serves every primary the server runs (the settings, the managed file, the reload and
+  the slots of that instance; one `SyncState` per group); `Status.Primaries` carries all of them (`Primary` is the first, for a leader of
+  the earlier version); the leader reads any of them (`Status.primaryOf`). `Entry.InstanceID` names the standby's directory; the standbys
+  of a server are the directories whose role file says standby.
+- **The client entry point** chooses among every primary the server runs (`Env.LocalPorts`): the lowest group whose lease is held, on that
+  instance's own port; a catalog primary on this host whose port is not one of the server's primaries is not local.
+- **Fan-outs and server-level operations.** Roles, databases and the access rules (`ApplyRoles`, `DropRole`, `ApplyDatabases`,
+  `ApplyTrust`, `ApplyRules`, `ApplyStoredRules`) are applied to every writable instance of the server, standbys get them by replication and
+  by the copy of the rules (`SyncAccess` from `AccessSourceID`); reads (`CollectRoles`, `CollectGlobals`, the sign-in verifier, the
+  proxy's role connections) go to `ConnectID` (the map primary if local, else the first primary). The start, stop and restart operations
+  of "this server's instance" act on every primary the server runs (standbys stay the agent's business, as before); the orderly stop
+  of the service stops every standby first, then every primary, and the watchdog of each is told to stand down.
+- Decisions: the managed settings of an instance other than the home one keep their own port and recovery settings (only the
+  certificate paths are rewritten); `cluster.NodeID` stays the name of the home instance; a server whose home instance is a standby and that
+  runs no primary uses the home instance for what it must read.
+
+Tests: unit (`internal/instance/role_test.go`, `internal/lease/marker_test.go`, `TestLocalPortsChooseTheHeldPrimaryOfTheLowestGroup`) and cluster
+(`TestRoleFilesFollowTheCatalog`, `TestAnOldLayoutConvergesByItself`, and T18 `TestInstanceMappingAfterAHandFailover`: group 1 failed over by
+hand with `pg_promote`, the extension's `promote_node` and the role file, after which the server's lease, role files, the replication view and
+the fan-out of a role are checked for both primaries; the restart of a server with two primaries is not tested on a cluster, because with the old
+primary's server dead a restart of one of the two left costs the majority and the leader rightly fences itself: the markers and `PrepareStart`
+per group are covered by unit tests).
+
+Still refused: `failoverServer`, `restorePreferredPrimaries` (422 `unsupported_operation`).
+
+### Increment 2: the lease additions, the read calls, the freeze, the engine gate and migration 0011
+
+Nothing of this starts a failover; it is what the failover task of the next increment calls and what keeps it safe.
+
+- **Grantor** (`internal/lease/transfer.go`): `Grantor.Transfer(group, caller, to, duration)` makes `to` the holder for a fresh duration, only
+  when the caller is the holder of record (even before its lease ran out), atomically (there is no instant without a holder, so the
+  old holder cannot be granted the group again) and on disk before the answer; `Grantor.Release` deletes the holder's grant. They are
+  reached through `POST /lease/grant` with `transferTo` or `release` (`Request`), never for another caller. `GET /lease/state` also
+  carries `durationMs` and `marginMs` of the answering server, so the failover can refuse when two servers differ (the argument of
+  the README, "Why this is safe", needs them equal).
+- **Holder side** (`internal/lease/adopt.go`): `Adopt(group, kind)` renews the lease of a group the catalog does not name this server as
+  the primary of (kind `fence`: no instance, nothing is fenced when it is lost; kind `holder`: the server that is about to run the
+  primary), `AdoptionStatus(group)` says from the last round whether it is held, how long until enough grantors would grant and who
+  refused (a step waits on it; no second protocol), `Attach(group)` makes the lease guard the instance from then on (a loss fences it, the
+  watchdog covers it), `Transfer(ctx, group, to)` hands the lease over at a majority and stops renewing (marker `relinquished.<g>`, kept
+  across a restart), `ReleaseGroup` is the same with the grants deleted, `Relinquish` stops renewing **but keeps judging** (`Check`
+  still fences when the lease that was held ends, minus the margin) and keeps the primary from starting (`lease.Gate`),
+  `Unrelinquish` takes it back. A group the catalog names this server as the primary of ends its adoption.
+- **The read calls** (`cmd/kingresd/ha_failover.go`, `internal-api.md` "The read calls of the failover"): `GET /failover/position`,
+  `GET /liveness`, `GET /failover/state`; read-only, none of them changes an instance. A `GET` carries its parameters as the query string,
+  which the internal API now hands the handler as the body of the call.
+- **The freeze and `standbys-gone` on the agent** (`internal/standby/freeze.go`): `Agent.Freeze/Unfreeze` (a freeze lapses after its
+  ttl, at most 10 minutes, on the monotonic clock) make `SyncState.Decide` leave the list of the group alone; `StandbysGone` takes the standbys
+  of a failed server out of the lists of the other groups at once (not of a frozen group). Calls: `POST /failover/freeze`, `/unfreeze`,
+  `/failover/standbys-gone` (leader only; in memory only, nothing is written to an instance).
+- **The engine gate and the cancel guard** (`internal/task`): `Options.Gate` (while it answers false the engine claims nothing, `RunNow`
+  leaves the task pending and a run in progress stands down at the next step boundary, recording nothing and running no hook), and
+  `Definition.Cancellable` (the guard of a kind; `Engine.Cancel` and `task.Cancellable`, which the REST layer reports as
+  `Task.cancellable`, give the same answer). Nothing in the product sets the gate yet (the bootstrap of the map group does, increment 5).
+- **Migration 0011**: `failover_run`, `failover_group`, `failover_event`, `group_replication_state`, `standby.diverged`, and the exclusion
+  function (the trigger is the one of migration 0009): `replication.restorePreferredPrimaries` excludes a rebalance and is excluded by it;
+  at most one task of the failover class is unfinished (`KX003`); the record of an `instance.stop` or `instance.restart` of an instance
+  that is the old or new node of a group of an unfinished failover run is refused (`KX004`, 409 `failover_in_progress`; the instance
+  operation then does not run and is not kept in memory). `config.restart` is in the trigger's list but its task has no instance subject,
+  so the check never applies to it (it is a task of the engine and a failover pauses nothing it needs).
+
+Tests: T16 (`internal/task/gate_test.go`, `internal/rebalance/failover_exclusion_pg_test.go`), T17 (`internal/lease/failover_test.go`), T19
+(`internal/standby/freeze_test.go`), and the read calls on a cluster (`TestFailoverReadCalls`).
+
+Still refused: `failoverServer`, `restorePreferredPrimaries` (422 `unsupported_operation`).
+
+### Review ST-01 to ST-13 of 2026-11-17: what was fixed in this step
+
+Separate from the increments above (own files and tests; see the report of the work).
+
+- **ST-01, the watchdog fenced a healthy primary when its group stopped being enforced.** The invariant now: *a watchdog never fences on a
+  lease file that kingresd stopped writing on purpose.* The lease file has a field `off` (`lease.WatchdogFile.Off`, read by
+  `cmd/kingres-watchdog`): at every renewal of a group that is not enforced kingresd writes `{"off": true}` to the file of the instance when
+  the file exists (so the change of enforcement is told within one renewal, long before the last `validMs` runs out; a restarted kingresd
+  tells it again; a group that never had a watchdog gets no file), the watchdog suspends its deadline while the last file it read says
+  `off`, and a later file without it arms it again. `Manager.DisarmWatchdog(group)` is the same call for the failover (a demotion makes
+  the instance a standby: its watchdog must not fence it on a lapsed file). Tests: `TestTheWatchdogFileFollowsEnforcementBothWays`
+  (unit, both directions and the restart), `TestWatchdogDoesNotFenceAfterTheLeaseWasSwitchedOff` (the watchdog itself),
+  `TestSwitchingEnforcementOnAndOffNeverFencesAHealthyPrimary` (a cluster: the replica count to 0 and back three times, every instance sampled
+  every 100 ms, no fault hook), and `TestRemovingAServerCostsNoOtherGroupItsLease` now runs with real standbys and without `ForceEnforce`.
+- **ST-02, an observation that failed was read as "not running".** In `RunMove` an error of `findMove` or of `callRunning` is "unknown": the
+  observation session is made again and the loop goes on; a call whose state is unknown is never withdrawn (the bound `maxCallWait` still ends the
+  wait). Test: `TestABrokenObservationSessionDoesNotCancelARecordedMove` (a real PostgreSQL, the observation session terminated with
+  `pg_terminate_backend`, the extension's record inserted afterwards).
+- **ST-03, a repeated call repeated its work.** `/standby/rebuild` is a no-op for a standby that is of the generation asked for (the generation
+  is in the standby's meta file; the rewind path updates it); `/config/restart` from a task step carries `ifPending` and is a no-op for an
+  instance that runs with nothing pending a restart; a request that timed out on the client's side after the connection was made is not repeated
+  (`peerclient.clientTimedOut`; a failed dial is). The list of every internal POST handler and what a second execution does is in
+  `internal-api.md`, "Repeating a call". Not done: an idempotency key per step run and attempt remembered by the callee.
+- **ST-04, the fence waited behind a start.** The lifecycle lock of an instance is a channel that a waiter leaves when its context ends;
+  `Manager.Fence` does not take `m.op` (a start holds it); a start that was under way when a fence arrived is stopped again when it returns
+  (the marker the fence wrote is there). Tests: `TestTheLifecycleLockWaitEndsWithTheContext`, `TestAFenceDoesNotWaitForAStartAndTheStartDoesNotSurviveIt`.
+- **ST-12, statements that were not true:** the text of RBR-05 above is corrected.
+- **Not done in this step:** ST-05 (rows left by an earlier holder are still found by comparing the system database's clock with the
+  extension's), ST-06 (retried `StartMove` and `AddSkipped` can still duplicate a row), ST-07, ST-08, ST-09 (the mutants), ST-10, ST-11, ST-13.

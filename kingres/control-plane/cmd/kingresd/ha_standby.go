@@ -54,6 +54,8 @@ func newStandbyParts(cfg config.Config, svc *cluster.Service, self string, log *
 		Call:        members.Client.Do,
 		StartTask:   opsSvc.StartTask,
 		ServiceConn: svc.ServiceConn,
+		// The catalog is written on the leader, which runs the primary of the map group.
+		Registrar: &standby.PGRegistrar{Log: log, Conn: func(ctx context.Context) (*pgx.Conn, error) { return svc.ServiceConn(ctx, sysdb.Database) }},
 		// The leader is read from the catalog with a query of its own, not through the shared
 		// resolver: its cache must only ever be filled by the code that is meant to use it (a
 		// server that is still joining would otherwise cache an empty answer from this loop).

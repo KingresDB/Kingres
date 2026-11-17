@@ -62,7 +62,7 @@ func (p *Proxy) Refresh() error {
 	for r := range p.roles {
 		next = append(next, r)
 	}
-	return p.svc.mgr.WriteIdent(NodeID, p.osUser, next)
+	return p.svc.writeIdentAll(p.osUser, next)
 }
 
 // Reset empties the map (kingresd start). The instance must be running or
@@ -71,7 +71,7 @@ func (p *Proxy) Reset() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.roles = map[string]struct{}{}
-	return p.svc.mgr.WriteIdent(NodeID, p.osUser, nil)
+	return p.svc.writeIdentAll(p.osUser, nil)
 }
 
 // Allow maps the role; call it after a successful sign-in only.
@@ -90,10 +90,10 @@ func (p *Proxy) Allow(ctx context.Context, role string) error {
 	}
 	next = append(next, role)
 	sort.Strings(next)
-	if err := p.svc.mgr.WriteIdent(NodeID, p.osUser, next); err != nil {
+	if err := p.svc.writeIdentAll(p.osUser, next); err != nil {
 		return err
 	}
-	if err := p.svc.mgr.Reload(ctx, NodeID); err != nil {
+	if err := p.svc.reloadAll(ctx); err != nil {
 		return err
 	}
 	p.roles[role] = struct{}{}
@@ -112,8 +112,8 @@ func (p *Proxy) Revoke(ctx context.Context, role string) {
 	for r := range p.roles {
 		next = append(next, r)
 	}
-	if err := p.svc.mgr.WriteIdent(NodeID, p.osUser, next); err == nil {
-		_ = p.svc.mgr.Reload(ctx, NodeID)
+	if err := p.svc.writeIdentAll(p.osUser, next); err == nil {
+		_ = p.svc.reloadAll(ctx)
 	}
 }
 
@@ -126,7 +126,8 @@ func (p *Proxy) Connect(ctx context.Context, db, role string) (*pgx.Conn, error)
 	if !ok {
 		return nil, ErrNotEnabled
 	}
-	sock, err := p.svc.mgr.SocketDir(NodeID)
+	cid := p.svc.ConnectID()
+	sock, err := p.svc.mgr.SocketDir(cid)
 	if err != nil {
 		return nil, err
 	}
@@ -134,7 +135,7 @@ func (p *Proxy) Connect(ctx context.Context, db, role string) (*pgx.Conn, error)
 	if err != nil {
 		return nil, err
 	}
-	cfg.Host, cfg.Port, cfg.Database, cfg.User = filepath.ToSlash(sock), uint16(p.svc.cfg.PGPort), db, role //nolint:gosec // port validated 1024..65535 by the configuration
+	cfg.Host, cfg.Port, cfg.Database, cfg.User = filepath.ToSlash(sock), uint16(p.svc.portOf(cid)), db, role //nolint:gosec // port validated 1024..65535 by the configuration
 	cfg.Password, cfg.TLSConfig, cfg.Fallbacks = "", nil, nil
 	cfg.ConnectTimeout = 5 * time.Second
 	// A statement of a signed-in role can select a value of any size; the driver would

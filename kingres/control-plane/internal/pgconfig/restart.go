@@ -128,7 +128,7 @@ func (l *Leader) restartSteps(input json.RawMessage) ([]task.Step, error) {
 				if !l.pendingNow(ctx, e.Server, e.Instance) {
 					return nil
 				}
-				if err := l.callServer(ctx, e.Server, CallRestart, RestartRequest{Instance: e.Instance}, nil); err != nil {
+				if err := l.callServer(ctx, e.Server, CallRestart, RestartRequest{Instance: e.Instance, IfPending: true}, nil); err != nil {
 					return fmt.Errorf("instance %d on server %s: %w", e.Instance, e.Server, err)
 				}
 				return nil

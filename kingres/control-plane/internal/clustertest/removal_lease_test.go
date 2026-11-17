@@ -18,7 +18,10 @@ import (
 // 100 ms from the start of the removal until well after it, and so is a connection to each of their instances: not
 // one sample may show a lease that is not held, or an instance that refuses a connection.
 func TestRemovingAServerCostsNoOtherGroupItsLease(t *testing.T) {
-	c, groups := leaseCluster(t, true)
+	// ST-01: the groups are enforced because they have real standbys, not because the fault hook says so: the
+	// removal takes the standbys of the removed server away, and the groups that stay must not be fenced by their watchdogs.
+	c, groups := leaseCluster(t, false, standbyArgs...)
+	waitStandbys(t, c, 1)
 	leader, victim := c.Nodes[0], c.Nodes[2]
 	stay := c.Nodes[:2]
 	var mu sync.Mutex

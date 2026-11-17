@@ -45,6 +45,12 @@ type Request struct {
 	// DryRun asks whether the lease would be granted now, without granting it (used
 	// by tests and by the failover code of part 2 to wait for the old lease).
 	DryRun bool `json:"dryRun,omitempty"`
+	// TransferTo, when set, hands the lease of the group from the caller (which must be the
+	// holder of record) to the named server for a fresh duration, with no instant in which the
+	// group has no holder (Grantor.Transfer).
+	TransferTo string `json:"transferTo,omitempty"`
+	// Release deletes the grant of the group when the caller is its holder (Grantor.Release).
+	Release bool `json:"release,omitempty"`
 }
 
 // Reply is the answer of a grantor.

@@ -30,7 +30,6 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pki"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/serverinfo"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/setup"
-	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
 )
 
@@ -142,18 +141,18 @@ func serveInternal(ctx context.Context, d internalDeps) {
 		// of an instance that was not running when kingresd started) cannot read the catalog: its
 		// callers get 503 service_unavailable and wait, not 403 not_leader.
 		Unavailable: func() bool {
-			if lease.Waiting(filepath.Join(d.dataDir, leaseDirName)) {
+			if lease.Waiting(filepath.Join(d.dataDir, leaseDirName), d.svc.SystemInstance().Role.Group) {
 				return true
 			}
 			// The instance is not (yet) running: right after the lease was won it is starting.
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
-			running, err := d.svc.Manager().Running(ctx, cluster.NodeID)
+			running, err := d.svc.Manager().Running(ctx, d.svc.SystemInstance().ID)
 			if err == nil && !running {
 				return true
 			}
 			// Running but not accepting connections yet (starting, recovering): the catalog cannot be read.
-			c, cerr := d.svc.ServiceConn(ctx, sysdb.Database)
+			c, cerr := d.svc.SystemConn(ctx)
 			if cerr != nil {
 				return true
 			}

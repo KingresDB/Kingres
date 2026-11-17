@@ -60,7 +60,15 @@ func startClientProxy(d *haDeps) error {
 		return nil
 	}
 	if h.ClientListen != "" {
-		if err := listen("primary", h.ClientListen, primaryResolver(d)); err != nil {
+		res := primaryResolver(d)
+		d.EntryDestination = func(ctx context.Context) string {
+			dest, err := res(ctx)
+			if err != nil {
+				return ""
+			}
+			return dest.Addr
+		}
+		if err := listen("primary", h.ClientListen, res); err != nil {
 			return err
 		}
 	}
@@ -113,6 +121,13 @@ func addProxyMetrics(r *monitor.Ring, host, prefix string, s clientproxy.Stats, 
 func primaryResolver(d *haDeps) clientproxy.Resolver {
 	return clientproxy.PrimaryResolver(clientproxy.Env{
 		Self: d.ServerHost, LocalPort: d.Cfg.PGPort,
+		LocalPorts: func() []int {
+			var ports []int
+			for _, li := range d.Svc.WritableInstances() {
+				ports = append(ports, li.Port)
+			}
+			return ports
+		},
 		Nodes: func(ctx context.Context) ([]clientproxy.Node, error) {
 			c, err := d.Svc.ServiceConn(ctx, sysdb.Database)
 			if err != nil {

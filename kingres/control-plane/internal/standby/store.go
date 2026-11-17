@@ -40,7 +40,7 @@ type Record struct {
 // synchronous_standby_names).
 func (r Record) Entry(primaryPort int) Entry {
 	return Entry{ID: r.ID, Group: r.Group, Server: r.Server, PrimaryServer: r.PrimaryServer, PrimaryPort: primaryPort,
-		Port: r.Port, Ready: r.State == stateReady, Generation: r.Generation}
+		Port: r.Port, Ready: r.State == stateReady, Generation: r.Generation, CatalogNode: r.catalogNode(), InstanceID: r.InstanceID}
 }
 
 // SysFunc runs f with a service connection to the system database (the leader's).
@@ -181,4 +181,19 @@ func wrapErr(what string, err error) error {
 		return nil
 	}
 	return fmt.Errorf("standby: %s: %w", what, err)
+}
+
+func (r Record) catalogNode() int32 {
+	if r.CatalogNode == nil {
+		return 0
+	}
+	return *r.CatalogNode
+}
+
+// setCatalogNode stores the node id the catalog gave the standby (0 clears it).
+func (s store) setCatalogNode(ctx context.Context, id int64, node int32) error {
+	return wrapErr("storing the catalog node of a standby", s.sys(ctx, func(c *pgx.Conn) error {
+		_, err := c.Exec(ctx, `UPDATE kingres_cp.standby SET catalog_node_id = nullif($2, 0), updated_at = now() WHERE standby_id = $1`, id, node)
+		return err
+	}))
 }
