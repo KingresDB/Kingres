@@ -578,3 +578,35 @@ func (r *memRows) UndoStart(_ context.Context, seq, attempts int, why string) er
 	x.State, x.Attempts, x.FinishedAt, x.Error = MoveFailed, attempts-1, &now, why
 	return nil
 }
+
+// SetMark keeps the mark with the row, as the real rows do.
+func (r *memRows) SetMark(_ context.Context, seq int, mark int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.guard(); err != nil {
+		return err
+	}
+	r.moves[seq-1].After, r.moves[seq-1].Marked = mark, true
+	return nil
+}
+
+// ST-05: the loop keeps the mark of every move with the row before it makes the call, so that a holder that
+// takes over has it.
+func TestEveryMoveKeepsItsMarkWithItsRow(t *testing.T) {
+	c := newCluster(map[int32]int32{0: 1, 1: 1}, map[int32]int32{0: 2, 1: 2})
+	r := &memRows{}
+	_, _ = r.CreateRun(context.Background(), Options{}, nil)
+	l := testLoop(c, r)
+	if err := l.Moves(ctxWithFence(), Options{}); err != nil {
+		t.Fatal(err)
+	}
+	moves, _ := r.Moves(context.Background())
+	if len(moves) != 2 {
+		t.Fatalf("%d moves", len(moves))
+	}
+	for _, m := range moves {
+		if !m.Marked {
+			t.Errorf("the row of %s has no mark", m.Move.Key())
+		}
+	}
+}

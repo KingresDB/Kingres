@@ -68,3 +68,29 @@ func TestWrappersKeepTheProofKeyer(t *testing.T) {
 		t.Fatalf("key %v err %v", key, err)
 	}
 }
+
+// ST-10: callers beyond the bound are not kept waiting while the instance cannot be reached.
+func TestRetryingLimitedAnswersAtOnceBeyondTheBound(t *testing.T) {
+	f := &flaky{failures: 1 << 20, err: ErrUnavailable}
+	a := RetryingLimited(f, 3*time.Second, 2)
+	done := make(chan struct{}, 2)
+	for i := 0; i < 2; i++ {
+		go func() { _, _ = a.CurrentRoles(context.Background(), "u"); done <- struct{}{} }()
+	}
+	for f.calls.Load() < 4 { // both waiters are inside their wait (each made at least two calls)
+		time.Sleep(10 * time.Millisecond)
+	}
+	start := time.Now()
+	_, err := a.CurrentRoles(context.Background(), "u")
+	if !errors.Is(err, ErrUnavailable) || time.Since(start) > time.Second {
+		t.Fatalf("the third caller waited %v (%v)", time.Since(start), err)
+	}
+	for i := 0; i < 2; i++ {
+		<-done
+	}
+	// after the waiters left, a caller waits again
+	f2 := &flaky{failures: 2, err: ErrUnavailable}
+	if _, err := RetryingLimited(f2, 3*time.Second, 2).CurrentRoles(context.Background(), "u"); err != nil {
+		t.Fatal(err)
+	}
+}

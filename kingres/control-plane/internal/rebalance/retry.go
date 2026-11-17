@@ -84,3 +84,7 @@ func (r *retryRows) Moves(ctx context.Context) (rows []MoveRow, err error) {
 func (r *retryRows) Settle(ctx context.Context, outcome, stoppedBy, errText string, after []Placement) error {
 	return r.do(ctx, func() error { return r.Rows.Settle(ctx, outcome, stoppedBy, errText, after) })
 }
+
+func (r *retryRows) SetMark(ctx context.Context, seq int, mark int64) error {
+	return r.do(ctx, func() error { return r.Rows.SetMark(ctx, seq, mark) })
+}

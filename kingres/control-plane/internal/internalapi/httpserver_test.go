@@ -69,3 +69,52 @@ func TestACallLongerThanTheResponseTimeoutIsAnswered(t *testing.T) {
 		t.Fatalf("answer: %d %s", resp.StatusCode, b)
 	}
 }
+
+// The deadline set at the first byte of the answer ends a peer that does not read it: without it the handler
+// would block on the write for as long as the peer holds its end open (a goroutine and a socket per peer).
+func TestAPeerThatDoesNotReadTheAnswerIsEnded(t *testing.T) {
+	certPEM, keyPEM, err := pki.NewBootstrapCert(pki.Names{CommonName: "127.0.0.1"}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pair, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	big := strings.Repeat("x", 48<<20) // far more than the socket buffers hold
+	be := internalapi.Backend{Bootstrap: func(context.Context, string, *http.Request, []byte) (any, error) {
+		return map[string]string{"big": big}, nil
+	}}
+	srv := internalapi.NewHTTPServer("", internalapi.New(nil, be, nil, nil), internalapi.TLSConfig(pair), nil, time.Second)
+	closed := make(chan struct{})
+	srv.ConnState = func(_ net.Conn, s http.ConnState) {
+		if s == http.StateClosed {
+			select {
+			case closed <- struct{}{}:
+			default:
+			}
+		}
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.ServeTLS(ln, "", "") }()
+	t.Cleanup(func() { _ = srv.Close() })
+	conn, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13}) //nolint:gosec // the test's own certificate
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	req := "POST " + internalapi.Prefix + "/bootstrap/prepare HTTP/1.1\r\nHost: x\r\n" + internalapi.HeaderVersion + ": " + internalapi.Version +
+		"\r\nContent-Length: 2\r\n\r\n{}"
+	if _, err := conn.Write([]byte(req)); err != nil {
+		t.Fatal(err)
+	}
+	// the peer reads nothing; the server must end the connection by itself
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the server still holds the connection of a peer that does not read the answer")
+	}
+}

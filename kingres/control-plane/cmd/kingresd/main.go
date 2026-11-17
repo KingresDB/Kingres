@@ -251,12 +251,16 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	}
 	// A request waits (bounded) for an instance that cannot be asked for a moment, and nobody is signed
 	// in against an instance the lease watchdog may still fence (lease.Manager.Confirming).
-	checkedAuthn := auth.Retrying(auth.Gated(authn, func() error {
+	gatedAuthn := auth.Gated(authn, func() error {
 		if c, ok := haReg.Leases().(interface{ Confirming() bool }); ok && c.Confirming() {
 			return errors.New("this server has not renewed the lease of its group since it started")
 		}
 		return nil
-	}), auth.DefaultUnavailableWait)
+	})
+	checkedAuthn := auth.Retrying(gatedAuthn, auth.DefaultUnavailableWait)
+	// The join call of the internal API is reachable without a client certificate: at most a few of its callers
+	// wait for an unavailable instance at the same time (ST-10).
+	joinAuthn := auth.RetryingLimited(gatedAuthn, auth.DefaultUnavailableWait, 8)
 	sessions := auth.NewStore(cfg.SessionTTL, cfg.MaxSessions, time.Now)
 	web, err := webui.Handler()
 	if err != nil {
@@ -326,7 +330,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 					log.Error("writing the audit log", "error", err)
 				}
 			}}
-		receiver = &membership.Receiver{M: members, Authn: checkedAuthn, VerifyToken: svc.VerifyToken}
+		receiver = &membership.Receiver{M: members, Authn: joinAuthn, VerifyToken: svc.VerifyToken}
 		members.OnCertificateInstalled = func() { pc.ForgetAll(); members.Client.ForgetAll(); certHooks.run() }
 		opsSvc.Fanout, opsSvc.Local, opsSvc.InstanceOwner = members, svc, members.InstanceBelongsTo
 		stby, err = newStandbyParts(cfg, svc, serverHost, log, members.Audit, members, opsSvc, haReg)
