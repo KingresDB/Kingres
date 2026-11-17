@@ -1635,7 +1635,8 @@ existing object's meaning and writes no entry). The cluster-wide orchestration i
 statement on that group's primary; it refuses to run while the groups' `kingres_ledger` versions
 differ from the installed library, naming the server); the Overview tab shows a button when a group
 reports 0.2. The existing `versionMismatch` alert covers mixed versions. A cluster on 0.2 keeps
-working with everything that exists: `kingresd` detects the version by object (as it does for 0.1,
+working with everything that exists (not so since the write guard, see correction 25 in section 14:
+the applications keep writing, and what writes the ledger itself waits for the update): `kingresd` detects the version by object (as it does for 0.1,
 `ops/ledger.go` `ledgerRecords`) and answers `unsupported_operation` for the new operations that need
 0.3 (`ledger_head`, `ledger_blocks_entries`, client keys); publication needs 0.3 and says so.
 Digests and proofs made before the upgrade verify after it (a test).
@@ -2000,6 +2001,168 @@ build to the corrected rule. The verifier's README has the same list with the re
     is given, with a point as the decimal mark, and times are printed with their fraction; the window is inclusive.
     (e) `blocks` reads its export line by line and keeps one header (1.2 million blocks, 400 MB of input, used 12 MB
     where the whole-file version used 1.15 GB).
+20. **Who writes the ledger tables (5, 9.3; closes the gap that a member of `pg_write_all_data` could
+    insert a valid successor block).** The nine tables of the ledger are written by the C code of the
+    extension, by the scripts of the extension while they run, and by a superuser acting as itself who has
+    set `kingres_ledger.allow_manual_write` in the session; by nothing else, whatever privilege the role
+    holds. The code raises a marker that lives in the backend and that no SQL function raises or lowers; the
+    functions of the extension write through fixed statements inside it. The setting cannot come from a
+    configuration file, from `ALTER SYSTEM`, `ALTER ROLE`, `ALTER DATABASE` or a connection option. Two
+    things enforce the rule: `ExecutorCheckPerms_hook` (the same signature on 18 and 19) and a trigger
+    before INSERT and DELETE on each of the nine tables. An UPDATE or DELETE is refused with the message it
+    always had (`KL001`).
+21. **Why the trigger is needed beside the hook.** The apply worker and the table synchronisation worker of
+    logical replication do not call `ExecutorCheckPerms_hook`, on 18 or on 19. The trigger is what refuses
+    a subscription that writes a ledger table.
+22. **The time of a block (3.1).** `ledger_build_block` refuses (`KL004`) to build on a block that was
+    closed more than `kingres_ledger.max_clock_skew` (one hour by default, a superuser's setting, `0` for
+    no limit) ahead of the clock of the server; the transactions stay pending. `ledger_verify` reports a
+    block closed in the future whatever the setting is (`block_time`), a block with no transaction
+    (`block_empty`) and a transaction with no entry (`tx_empty`). The hash format is unchanged.
+23. **Recorded digests are checked (6).** `ledger_verify` checks every recorded digest against the chain:
+    the block it names (`digest_block`), the hash (`digest_hash`) and the document (`digest_json`). A
+    chain that was rewritten makes the digests recorded before it findings.
+24. **Removing what a hand left (9.4).** `kingres.ledger_remove_stray(reason)` is for the case that rows
+    were written above the head by hand: superuser only, with the manual-write setting on, under the lock of
+    the builder. It copies the rows above the head and every digest that names a missing block or another
+    hash into `kingres.ledger_removed`, puts the transactions that have entries back in the queue and
+    deletes the rows; no trigger is switched off. `ledger_verify` then reports one `operator_removal` for
+    each removed row, for good. That record is covered by no hash (covering it would change the hash
+    format), so the operator hands the exported record to the auditor; a removed block that had been
+    published is a fork to an auditor, which is intended.
+25. **A library newer than the SQL (9.5).** The guard is in the library and the functions that write are
+    in the SQL of the same version. A database whose SQL is 0.1 or 0.2 is refused with the statement to run
+    (`ALTER EXTENSION kingres_ledger UPDATE`) and is never half protected. The capture triggers are in the
+    library and keep working, so the applications are not stopped; the block builder, the workers and the
+    calls of the control plane wait for the update, and the transactions stay pending. `kingresd` checks
+    the version before it enables the ledger on a table, makes a digest or records a verification, and
+    answers 422 `unsupported_operation` with that statement, not the "forbidden" that PostgreSQL's
+    "insufficient privilege" would become.
+26. **`pg_upgrade`.** In binary upgrade mode the hook, the trigger and the event triggers do nothing
+    (`IsBinaryUpgrade`, `ledger_binary_upgrade()`), so `pg_upgrade` carries a ledger to the next major
+    as it is.
+27. **`LOCK TABLE`.** A lock stronger than `ROW EXCLUSIVE` on a table of the ledger is refused also for a
+    role that PostgreSQL would let take it (`pg_maintain`, `pg_write_all_data`): such a lock stops the
+    capture triggers and with them every write of every ledger table of the applications.
+28. **Dump and restore.** `pg_dump` does not dump the tables of the ledger. A restored database has a new,
+    empty ledger with a new identity; it does not verify as the old one, and `ledger_verify` names every
+    table whose capture trigger came with the dump. A ledger is carried by a physical backup or by
+    `pg_upgrade`, not by a dump.
+29. **The verifier: bounds on what it reads and stores, and a fifth exit status (7.4; adds to 17 to 19).**
+    (a) A signed note is at most 64 KiB, 32 lines of text, 32 signature lines and 1,024 bytes a line, and a
+    checkpoint has at most 16 extension lines; a digest is at most 64 KiB. Before a state is stored it is
+    read back through the functions that will read it, so the verifier never writes a state that a later
+    run cannot read. (b) The JSON reader has limits on nesting, values, members, key and string length and
+    white space, and the peak memory of every command that reads a file is measured. (c) Exit status 4: a
+    fork or a rollback was found (what status 1 says) and the conflicting checkpoint could not be saved;
+    evidence is said to be saved only when a file with that content is there. (d) The lock is one file per
+    directory (`.kingres-state.lock`), opened without following a link; on Unix the directory of the state
+    must be private to the user, or `--allow-shared-state-dir` is given and the output says so. (e) The
+    escaping of the text output is one to one, and a clipped value is marked in a way that no input can
+    print. (f) The table of exit statuses is derived from the source and tested, and `blocks` states what
+    it did and did not show about an export.
+30. **The invariant of the guard, and how it holds (5, 9.3; replaces the mechanism of correction 20).** No
+    statement that a role can issue writes a table of the ledger, whatever the role inherits or owns, except
+    through the public functions of the extension doing what they are documented to do, and a superuser
+    acting as itself with `kingres_ledger.allow_manual_write` set in the session. The first form of the guard
+    had a function, `kingres.ledger_internal_write`, that took a statement number and its values and was
+    protected by its ACL only; a member of the role that owns the extension, an owner that lost SUPERUSER
+    and a superuser without the setting could call it. It is removed. No function that SQL can call takes
+    the content of a write: the functions that write are C entry points that read the ledger and compute
+    every value they write (the block builder, the digest, the recorded verification, the registration of a
+    table and of the rows it holds, `ledger_register_table`), and the capture trigger, which checks on
+    insert, as it did on update and delete, that the identity in its argument is the one the registry has
+    for the table. `ledger_history_sync` and `ledger_history_acl_sync`, which changed a table of the
+    caller's choice through the catalog API, refuse a caller that is not a superuser.
+31. **A write by hand leaves a record (9.3, 9.4).** The guard trigger of the tables that hold the chain
+    writes a row into `kingres.ledger_removed` with the action `inserted` (who, when, the table, the row as
+    JSON) in the transaction of the write, and `ledger_verify` reports one `manual_write` finding per
+    table for as long as the record exists. No hash covers the record. A delete by hand is recorded only
+    when `ledger_remove_stray` makes it.
+32. **What can stop the builder (corrects 27).** The builder and `ledger_remove_stray` take turns on a
+    lock on the object of the extension, with a sub-object number that no statement uses, and not on a
+    table lock. A lock above `ACCESS SHARE` on a catalog table of the ledger is refused to a role that is
+    not a superuser; a row lock on any of the nine tables is refused to everybody who has not turned the
+    manual-write setting on; `CLUSTER` and `REINDEX` of such a table are refused inside a transaction
+    block or a function. One maintenance statement on a large table still holds its lock while it runs.
+33. **The refusal of older SQL has its own SQLSTATE (adds to 25).** `KL005`, with the message and the
+    hint unchanged; `42501` stays for the other refusals of the guard.
+34. **The same tests on both majors.** The suites of the extension gave one test fewer on 19 than on 18
+    because one test skipped, without saying so, a setting that PostgreSQL 19 refuses
+    (`standard_conforming_strings = off`); it now asserts the refusal there. Tests of honest paths run with
+    the guard closed, and the manual-write setting is used only where a test writes a row by hand.
+35. **Evidence of an anchor, as written (6.2, 7.4).** Evidence is compact JSON with its members in a fixed
+    order and every member present; times are UTC in whole seconds; a parser refuses unknown members. The
+    WORM evidence holds no note (endpoint, bucket, key, version, ETag, lock mode, retention date, time of
+    the store): the verifier takes the note from the publication or from the object it fetches. The TSA
+    evidence holds the token, which is the CMS `ContentInfo` exactly as the authority sent it, not the
+    whole `TimeStampResp`. The OpenTimestamps evidence holds one fragment per calendar (the tree of
+    operations rooted at the digest) and, once upgraded, the height of the Bitcoin block and the calendar
+    that attested it; it carries no time until an auditor supplies the block header.
+36. **RFC 3161 (6.4).** SHA-512 is accepted beside SHA-256 and SHA-384 as the digest of a signature; both
+    forms of the signing-certificate attribute are accepted; a token with unsigned attributes is refused,
+    and so is DER that is not strict. A rejection of the authority with `systemFailure` or
+    `timeNotAvailable` is retried; every other rejection counts as refused.
+37. **OpenTimestamps (6.5).** The operations are append, prepend, SHA-1, RIPEMD-160 and SHA-256;
+    `keccak256`, `reverse` and `hexlify` are refused by name (one example of the reference client uses
+    `keccak256`), other tags as unknown; an attestation of an unknown kind is kept as it is. A proof is at
+    most 1 MiB and 8,192 nodes.
+38. **Refused answers (6.6).** A refused answer (credentials, a missing bucket, a lock that is not enabled,
+    a rejection of the authority) is tried again after 1, 5 and 15 minutes; the fourth refusal in a row
+    fails the record. The WORM target has no "submitted" state: a read-back that fails after the object
+    was stored is retried, and the retry finds the object through the answer 412. The WORM client follows
+    no redirect at all; the other two follow one to the same host and scheme, three times at most.
+39. **Configuration and test vectors (6.8, 7.6).** The WORM and OpenTimestamps targets have a field
+    `allowInsecure` that permits an endpoint without TLS. The test vectors of other projects (the AWS
+    signature test suite, the examples of the reference OpenTimestamps client) are not kept in the
+    repository: a manifest of their sums and a script that fetches them from a pinned commit are, and the
+    tests that need them skip without them.
+40. **What the state of the verifier holds (7.4; adds to 17 and 29).** The state and the evidence of a
+    fork hold the canonical form of the verified note: the text, a blank line, and the signature lines of
+    the keys that verified and counted, written again from the parsed signature in the order of key name
+    and key id. Nothing that a publisher without a key can add or vary is stored (lines of unknown keys,
+    lines of keys that did not count, their order and number). A later change of the trust file never
+    makes a stored state unreadable and never makes it accept less. A note under test keeps the strict
+    rule: a line that names a usable key and does not verify refuses the note. A note that is held is
+    judged by the signatures that verify. States written before this correction are still read.
+41. **The private path of the state (7.4; replaces the check of one directory in 18).** On Unix every
+    component of the path, links included, must be changeable only by the auditor or by root (a sticky
+    directory is accepted above the directory that holds the state); the holding directory, the state and
+    the lock file are held to a stricter rule, and the name is looked at again after the lock is taken. A
+    lock file that is not private is replaced. On Windows none of this is checked.
+    `--allow-shared-state-dir` accepts the risk and prints its note.
+42. **No size limit on a proof or on a block export (4.8, 7.4; replaces the caps of 16 MiB and 1 GiB in
+    19 and 29).** A proof carries one header for every block after its block, so the proof of a row older
+    than about six days was larger than 16 MiB. A proof is read in pieces and twice: the first reading
+    checks the whole file and keeps no header, the second walks the headers, and the hashes of the two
+    readings must be equal. The peak memory for the proof of a row one year old (1.06 GB) is about 13 MiB.
+43. **A verdict that was not written is not status 0 (7.4; adds to 19).** A failed write to the standard
+    output turns status 0 into 2 and says so on the standard error; a verdict that is not 0 keeps its
+    status.
+44. **One cut and one escape rule in the output (adds to 19).** The only cut of a value is the one of the
+    output layer, after escaping, at a character boundary. A backslash is written as two, and the README
+    states the rule so that a decoder written from it reads the output back.
+45. **`blocks` does not claim more than it shows (adds to 29).** Status 0 means that the headers form a
+    chain from the genesis hash; `info.anchored_to_digest` says whether a digest ties that chain to
+    anything outside the database.
+46. **Smaller points of the verifier.** A `trust init` that fails to write removes the file it made. The
+    nesting limit of the JSON reader is 32 levels exactly.
+47. **The key file and the key set in `kingresd` (3.2, 3.3).** The key file is a magic line and compact
+    JSON; a sealed key uses PBKDF2-HMAC-SHA256 with 600,000 to 6,000,000 iterations and AES-256-GCM, with
+    the magic line, the name of the derivation, the iteration count and the salt as authenticated header;
+    a file that is not canonical byte for byte is refused. A key set has at most 16 keys (the limit of the
+    trust file). Retiring or revoking a key needs another active key. A retired key is written to the
+    trust file without `not_after` (correction 14). **At a rotation the latest checkpoint of every log
+    is signed again with the new key**: a log that stops growing would otherwise keep only the signature
+    of the old one.
+48. **Tiles (4.4, 4.5).** A checkpoint of size 0 is signed and written, and no tile exists for it. Tiles
+    are built from the frontier; only the partial tiles at the right edge (one per level, and the partial
+    entry bundle) are read, once when the log is opened, and checked against the frontier. Each append
+    writes the partial tile of the new size and leaves the older ones. After a crash a log whose tiles are
+    ahead of its frontier is opened again and the same leaves are appended: identical tiles are not an
+    error, different ones are the divergence of 4.7. The verifier of step 1 reads no entry bundle, so a
+    damaged bundle is found only by the audit of the publisher; a later step of the verifier reads the
+    bundles on the path of `proof --bundle`.
 
 Of section 13: item 2 (test vectors) is settled for signed notes (the example key and note of the
 specification are in the tests; the checkpoint example has no published key), item 3 (entry bundles at
