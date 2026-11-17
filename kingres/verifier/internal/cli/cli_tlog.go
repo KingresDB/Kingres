@@ -363,8 +363,9 @@ func (e *env) runCheckpoint(args []string) int {
 			"same size with another root, or a path that does not lead to the stored root is status 1: the\n"+
 			"state stays as it is and the conflicting note is saved beside it. Missing tiles are status 3\n"+
 			"and the state stays. The file is locked while in use (another run waits up to 10 s). A state\n"+
-			"that cannot serve (signed by a revoked key, beyond a max_tree_size) is status 2 and the output\n"+
-			"says how to go on without deleting it.", exitTextWith3)
+			"that no key of the trust file signed is status 2 and the output says how to go on without\n"+
+			"deleting it; one that rests only on a revoked key, or beyond a max_tree_size, is still your\n"+
+			"anchor, and the output says so.", exitTextWith3)
 	trustPath := fs.String("trust", "", "trust file (JSON)")
 	logFlag := fs.String("log", "", "the log: chain:<64 hex>[:e<N>] or aggregate:<64 hex>")
 	source := fs.String("source", ".", "directory of the publication or bundle")
@@ -434,14 +435,14 @@ func (e *env) runCheckpoint(args []string) int {
 	if *statePath == "" {
 		r.notProved = append([]string{rollbackLine}, r.notProved...)
 	} else {
-		canon, dropped, cerr := canonicalOf(data, signers)
+		served, canon, kept, dropped, cerr := in.canonicalOf(data)
 		if cerr != nil {
 			return e.inputError(cmd, *asJSON, cerr)
 		}
 		if dropped > 0 {
-			r.notes = append(r.notes, fmt.Sprintf("the note as served has %d signature line(s) that were not counted: the state and any saved evidence keep only the %d that verified", dropped, len(signers)))
+			r.notes = append(r.notes, fmt.Sprintf("the note as served has %d signature line(s) that were not counted (they verify under no key of the trust file): the state and any saved evidence keep only the %d that verify (counted or not)", dropped, len(kept)))
 		}
-		if code, done := e.applyState(r, in, cp, canon, signers, *statePath, *asJSON, *allowShared); done {
+		if code, done := e.applyState(r, in, cp, served, canon, kept, *statePath, *asJSON, *allowShared); done {
 			return code
 		}
 	}
@@ -464,8 +465,8 @@ func (e *env) runConsistency(args []string) int {
 			"proof is empty and no tile is read; the output says so. A tile that is absent gives\n"+
 			"status 3, a tile that is present and wrong gives status 1. --old FILE may be a note you\n"+
 			"kept or a state file written by checkpoint --state; a note that cannot serve as your\n"+
-			"anchor (no key of the trust file signed it, or only a revoked one, or beyond its\n"+
-			"max_tree_size) is status 2. This command writes nothing: use checkpoint --state to\n"+
+			"anchor (no key of the trust file signed it; for a plain note also only a revoked key, or\n"+
+			"beyond its max_tree_size) is status 2. This command writes nothing: use checkpoint --state to\n"+
 			"prove the extension and record it in one run.", exitTextWith3)
 	trustPath := fs.String("trust", "", "trust file (JSON)")
 	logFlag := fs.String("log", "", "the log: chain:<64 hex>[:e<N>] or aggregate:<64 hex>")
@@ -492,6 +493,7 @@ func (e *env) runConsistency(args []string) int {
 	// finding about the log.
 	var oldCP *checkpoint.Checkpoint
 	oldSigned := false
+	oldWeak, oldWeakWhy := false, ""
 	if m := sizeRootRE.FindStringSubmatch(*oldFlag); m != nil {
 		size, err := strconv.ParseUint(m[1], 10, 64)
 		rb, derr := signednote.DecodeBase64(m[2])
@@ -520,7 +522,10 @@ func (e *env) runConsistency(args []string) int {
 			return e.inputError(cmd, *asJSON, fmt.Errorf("--old %s is not a signed note: %w", *oldFlag, err))
 		}
 		oldSigned = true
-		cp, _, oldNotes, verr := in.verifyHeld(oldData, rec, "--old "+*oldFlag)
+		// A state file of this program is the auditor's own record: it stays an
+		// anchor when its keys are no longer counted (see verifyHeld). A plain note
+		// handed in is not, and keeps the strict rule.
+		held, oldNotes, verr := in.verifyHeld(oldData, rec, "--old "+*oldFlag, rec != nil)
 		if verr != nil {
 			var ie *inputErr
 			if errors.As(verr, &ie) {
@@ -532,7 +537,8 @@ func (e *env) runConsistency(args []string) int {
 		if rec != nil {
 			r.notes = append(r.notes, fmt.Sprintf("--old is a state file, recorded at %s", rec.VerifiedAt))
 		}
-		oldCP = cp
+		oldCP = held.cp
+		oldWeak, oldWeakWhy = held.weak, held.weakWhy
 	}
 	var newData []byte
 	if *newFlag != "" {
@@ -569,6 +575,9 @@ func (e *env) runConsistency(args []string) int {
 	}
 	if !oldSigned {
 		r.notProved = append(r.notProved, "that the old size and root are the checkpoint you meant: they were given without a signature")
+	}
+	if oldWeak {
+		r.notProved = append(r.notProved, "that the old checkpoint was genuine: it rests only on keys the trust file no longer counts ("+oldWeakWhy+")")
 	}
 	r.headline = fmt.Sprintf("the log at size %d extends the log at size %d.", newCP.Size, oldCP.Size)
 	if oldCP.Size == 0 || oldCP.Size == newCP.Size {

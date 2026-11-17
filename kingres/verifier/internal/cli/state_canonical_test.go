@@ -299,6 +299,8 @@ const (
 	stRetired
 	stFuture
 	stRevoked
+	// stLimited is a key that counts only up to tree size 400 (max_tree_size).
+	stLimited
 )
 
 func (s standing) extra() string {
@@ -309,6 +311,8 @@ func (s standing) extra() string {
 		return `,"not_before":"2999-01-01T00:00:00Z"`
 	case stRevoked:
 		return `,"revoked":true`
+	case stLimited:
+		return `,"max_tree_size":400`
 	}
 	return ""
 }
@@ -419,12 +423,12 @@ func TestStateSurvivesEveryChangeOfTheTrustFile(t *testing.T) {
 				if c, o, e := run(t, "consistency", "--trust", tr, "--log", logSpecArg(), "--source", root, "--old", state); c != 0 {
 					t.Fatalf("seed %d step %d: the state just written is refused by the trust file that wrote it: %d\n%s%s", seed, step, c, o, e)
 				}
-				if got := sigLines(storedNote(t, state)); len(got) != countUsable(signedIdx, st) {
-					t.Fatalf("seed %d step %d: the state keeps %d lines, %d verified and counted:\n%s", seed, step, len(got), countUsable(signedIdx, st), storedNote(t, state))
+				if got := sigLines(storedNote(t, state)); len(got) != countInFile(signedIdx, st) {
+					t.Fatalf("seed %d step %d: the state keeps %d lines, %d verify under a key of the trust file (any standing):\n%s", seed, step, len(got), countInFile(signedIdx, st), storedNote(t, state))
 				}
 				counted = map[int]bool{}
 				for _, i := range signedIdx {
-					if s, in := st[i]; in && s == stUsable {
+					if _, in := st[i]; in {
 						counted[i] = true
 					}
 				}
@@ -468,7 +472,7 @@ func TestStateSurvivesEveryChangeOfTheTrustFile(t *testing.T) {
 					}
 					keepsOne := false
 					for i := range counted {
-						if s, in := alt[i]; in && s != stRevoked {
+						if _, in := alt[i]; in {
 							keepsOne = true
 						}
 					}
@@ -487,10 +491,13 @@ func TestStateSurvivesEveryChangeOfTheTrustFile(t *testing.T) {
 	}
 }
 
-func countUsable(signed []int, st map[int]standing) int {
+// countInFile is how many of the signing keys are in the trust file at all:
+// the state keeps every line that verifies under a key of the file, whatever the
+// standing of the key (L12-01).
+func countInFile(signed []int, st map[int]standing) int {
 	n := 0
 	for _, i := range signed {
-		if s, in := st[i]; in && s == stUsable {
+		if _, in := st[i]; in {
 			n++
 		}
 	}
@@ -498,13 +505,14 @@ func countUsable(signed []int, st map[int]standing) int {
 }
 
 // heldUnusable says whether the state held cannot serve under this trust file:
-// none of the keys that signed it is in the file and unrevoked.
+// none of the keys that signed it is in the file (a key that is revoked, retired
+// or limited is still there, and still verifies the state).
 func heldUnusable(counted map[int]bool, st map[int]standing) bool {
 	if len(counted) == 0 {
 		return false
 	}
 	for i := range counted {
-		if s, in := st[i]; in && s != stRevoked {
+		if _, in := st[i]; in {
 			return false
 		}
 	}
@@ -563,8 +571,15 @@ func TestReadBackRefusesWhatALaterRunWouldNotRead(t *testing.T) {
 	if err := in.readBack(enc(good), cp, []byte(good)); err != nil {
 		t.Fatalf("a good file is refused: %v", err)
 	}
-	if err := in.readBack(enc(onlyRevoked), cp, []byte(onlyRevoked)); err == nil || !strings.Contains(err.Error(), "cannot be recorded") || strings.Contains(err.Error(), "must not be deleted") {
+	// A note of a revoked key only is a state a later run reads (L12-01).
+	if err := in.readBack(enc(onlyRevoked), cp, []byte(onlyRevoked)); err != nil {
 		t.Fatalf("a note of a revoked key only: %v", err)
+	}
+	// A note that no key of the file signed is not.
+	k3 := newSigner(3)
+	nobody := signedBy(300, all, []signer{k3})
+	if err := in.readBack(enc(nobody), cp, []byte(nobody)); err == nil || !strings.Contains(err.Error(), "cannot be recorded") || strings.Contains(err.Error(), "must not be deleted") {
+		t.Fatalf("a note that no key of the file signed: %v", err)
 	}
 	// the file reads back, but as another note than the one verified
 	if err := in.readBack(enc(good), cp, []byte(good+"x")); err == nil {

@@ -55,26 +55,39 @@ func rebaseAdvice(what string, claimedSize uint64, haveSize bool) string {
 //     was judged when it was kept. A key retired by not_after must not make the
 //     auditor discard what they hold.
 //
+// What a held note rests on (L12-01). The identity of a held checkpoint is its
+// signed text, and the signature lines that were stored with it are only what a
+// publisher without a key happened to serve; so the held note is usable when its
+// text verifies under any key of the trust file, whatever the standing of that
+// key now. When every key that verified it is revoked or beyond its limit the
+// state is still the anchor, flagged as resting on keys the file no longer
+// counts (lenient): the anchor only ever makes a run stricter (a smaller size, a
+// fork, or a larger size that is not proved to extend it is a failure), so
+// keeping it cannot make anything pass that would fail without it, while
+// refusing it would let the choice of lines a publisher served decide whether
+// later runs can go on. A note that is not a state of this program (--old FILE
+// with a plain note) keeps the strict rule: it is refused then.
+//
 // Every failure is an input error (status 2) in both commands: the thing the
 // auditor holds cannot serve as their anchor. The error says what to do and
 // never says to delete the file.
-func (in *logInputs) verifyHeld(note []byte, rec *stateRecord, what string) (*checkpoint.Checkpoint, []signednote.Key, []string, error) {
+func (in *logInputs) verifyHeld(note []byte, rec *stateRecord, what string, lenient bool) (*heldNote, []string, error) {
 	origin := in.spec.origin(in.trust.OriginPrefix)
 	keys, err := in.trust.AllKeys(origin)
 	if err != nil {
-		return nil, nil, nil, &inputErr{err}
+		return nil, nil, &inputErr{err}
 	}
-	cp, signers, wrong, _, err := checkpoint.VerifyHeld(note, keys, origin)
+	cp, signers, wrong, parsed, err := checkpoint.VerifyHeld(note, keys, origin)
 	if err != nil {
 		var ce *checkpoint.Error
 		if errors.As(err, &ce) && ce.Step == checkpoint.StepSignature {
-			return nil, nil, nil, &inputErr{fmt.Errorf("%s has no signature of a key of the trust file that verifies (%w): the trust file or the log is not the one this note was made with. %s", what, err, rebaseAdvice(what, 0, false))}
+			return nil, nil, &inputErr{fmt.Errorf("%s has no signature of a key of the trust file that verifies (%w): the trust file or the log is not the one this note was made with. %s", what, err, rebaseAdvice(what, 0, false))}
 		}
-		return nil, nil, nil, &inputErr{fmt.Errorf("%s is not a checkpoint of this log: %w", what, err)}
+		return nil, nil, &inputErr{fmt.Errorf("%s is not a checkpoint of this log: %w", what, err)}
 	}
 	if rec != nil {
 		if err := rec.agrees(cp); err != nil {
-			return nil, nil, nil, &inputErr{fmt.Errorf("%s: %w. %s", what, err, rebaseAdvice(what, cp.Size, true))}
+			return nil, nil, &inputErr{fmt.Errorf("%s: %w. %s", what, err, rebaseAdvice(what, cp.Size, true))}
 		}
 	}
 	var accepted []signednote.Key
@@ -94,11 +107,18 @@ func (in *logInputs) verifyHeld(note []byte, rec *stateRecord, what string) (*ch
 			}
 		}
 	}
+	h := &heldNote{cp: cp, note: parsed, verified: signers, accepted: accepted}
 	if len(accepted) == 0 {
-		return nil, nil, nil, &inputErr{fmt.Errorf("%s cannot be used as your earlier checkpoint: %s. %s", what, strings.Join(why, "; "), rebaseAdvice(what, cp.Size, true))}
-	}
-	for _, w := range why {
-		notes = append(notes, "also on the note: "+w+"; not counted")
+		if !lenient {
+			return nil, nil, &inputErr{fmt.Errorf("%s cannot be used as your earlier checkpoint: %s. %s", what, strings.Join(why, "; "), rebaseAdvice(what, cp.Size, true))}
+		}
+		h.weak = true
+		h.weakWhy = strings.Join(why, "; ")
+		notes = append(notes, fmt.Sprintf("%s rests only on keys that the trust file no longer counts (%s): it is kept as your anchor, because it is what the log said when you verified it and it only makes this run stricter; it is not shown to be genuine now, and the next checkpoint signed by a key you trust that extends it replaces it", what, h.weakWhy))
+	} else {
+		for _, w := range why {
+			notes = append(notes, "also on the note: "+w+"; not counted")
+		}
 	}
 	if wrong > 0 {
 		// A held note is judged by the signatures that verify. A line that names a
@@ -106,7 +126,28 @@ func (in *logInputs) verifyHeld(note []byte, rec *stateRecord, what string) (*ch
 		// cannot take away what a verified signature shows.
 		notes = append(notes, fmt.Sprintf("%s has %d signature line(s) that name a key of the trust file and do not verify: ignored, the note is judged by the signatures that verify", what, wrong))
 	}
-	return cp, accepted, notes, nil
+	return h, notes, nil
+}
+
+// heldNote is a note the auditor holds, judged by verifyHeld.
+type heldNote struct {
+	cp   *checkpoint.Checkpoint
+	note *signednote.Note
+	// verified are the keys of the trust file, of any standing, whose line on the
+	// note verifies over its text; accepted are those of them that count (not
+	// revoked, within their size limit).
+	verified []signednote.Key
+	accepted []signednote.Key
+	// weak is true when no verified key counts: the note is the anchor as a
+	// record of what was verified, and weakWhy says why the keys do not count.
+	weak    bool
+	weakWhy string
+}
+
+// allKeys returns every key of the trust file as a note key of the log, whatever
+// its standing: the keys a signature line is verified against when it is stored.
+func (in *logInputs) allKeys() ([]signednote.Key, error) {
+	return in.trust.AllKeys(in.spec.origin(in.trust.OriginPrefix))
 }
 
 // ignoredSignatures names the signatures on a note under test that belong to
@@ -186,7 +227,14 @@ func (in *logInputs) proveExtension(oldCP, newCP *checkpoint.Checkpoint) (tiles,
 // means exactly that (or that the state was empty and is now recorded, or that
 // nothing changed). It returns done=true with the exit status when the command
 // ends here.
-func (e *env) applyState(r *result, in *logInputs, cp *checkpoint.Checkpoint, canon []byte, signers []signednote.Key, statePath string, asJSON, allowShared bool) (int, bool) {
+//
+// What is stored (L12-01, L12-03): the identity of a checkpoint is its signed
+// text, never its signature lines. canon is the served note reduced to its text
+// and every line that verifies under any key of the trust file (signers are the
+// keys of those lines); when the state already holds the same text, the lines of
+// both are merged, so that which of the genuine lines a publisher served on
+// which run changes nothing that is stored, saved or decided.
+func (e *env) applyState(r *result, in *logInputs, cp *checkpoint.Checkpoint, served *signednote.Note, canon []byte, signers []signednote.Key, statePath string, asJSON, allowShared bool) (int, bool) {
 	fail := func(err error) (int, bool) {
 		return e.inputError(r.cmd, asJSON, err), true
 	}
@@ -208,16 +256,23 @@ func (e *env) applyState(r *result, in *logInputs, cp *checkpoint.Checkpoint, ca
 		return fail(fmt.Errorf("--state %s: cannot take the lock: %w", statePath, err))
 	}
 	defer lock.Release()
+	keys, kerr := in.allKeys()
+	if kerr != nil {
+		return fail(kerr)
+	}
 
 	var old *checkpoint.Checkpoint
+	var held *heldNote
+	storedExists := true
 	stored, err := safefile.ReadArg(path, maxStateFile)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
+		storedExists = false
 		r.notes = append(r.notes, "the state file did not exist and was created: rollback and forks are checked against it from the next run on")
 	case err != nil:
 		return fail(fmt.Errorf("--state: %w", err))
 	default:
-		held, rec, derr := decodeHeld(stored)
+		heldBytes, rec, derr := decodeHeld(stored)
 		if derr != nil {
 			if errors.Is(derr, errEmptyHeld) {
 				return fail(fmt.Errorf("--state %s: %w. If you made it yourself (touch, or a redirect), it holds nothing to lose: remove it and run again, or give another name. If it ever held a state and lost it, restore your copy; with none, start a new record with checkpoint --state NEWFILE --min-size N, N being the size you believe the log had when you last verified it, and use NEWFILE from then on", statePath, derr))
@@ -225,7 +280,7 @@ func (e *env) applyState(r *result, in *logInputs, cp *checkpoint.Checkpoint, ca
 			return fail(fmt.Errorf("--state %s: %w", statePath, derr))
 		}
 		var hnotes []string
-		old, _, hnotes, err = in.verifyHeld(held, rec, "--state "+statePath)
+		held, hnotes, err = in.verifyHeld(heldBytes, rec, "--state "+statePath, true)
 		if err != nil {
 			var ie *inputErr
 			if errors.As(err, &ie) {
@@ -233,6 +288,7 @@ func (e *env) applyState(r *result, in *logInputs, cp *checkpoint.Checkpoint, ca
 			}
 			return fail(err)
 		}
+		old = held.cp
 		r.notes = appendNew(r.notes, hnotes)
 	}
 
@@ -250,14 +306,25 @@ func (e *env) applyState(r *result, in *logInputs, cp *checkpoint.Checkpoint, ca
 		r.ok("state", fmt.Sprintf("no earlier checkpoint was recorded: size %d is recorded now", cp.Size))
 		r.notProved = append(r.notProved, "that this checkpoint is not already a rollback: the state file was empty, so nothing earlier was known")
 	case cp.Size < old.Size:
-		return e.conflict(r, asJSON, path, "rollback", cp, canon, old, fmt.Errorf("the checkpoint has size %d, smaller than %d, the size of the last checkpoint you verified: the log went back, or an old checkpoint is being shown", cp.Size, old.Size)), true
+		return e.conflict(r, asJSON, keys, path, "rollback", cp, canon, old, fmt.Errorf("the checkpoint has size %d, smaller than %d, the size of the last checkpoint you verified: the log went back, or an old checkpoint is being shown", cp.Size, old.Size)), true
 	case cp.Size == old.Size && cp.Root != old.Root:
-		return e.conflict(r, asJSON, path, "fork", cp, canon, old, fmt.Errorf("two trusted checkpoints of this log have the same size %d and different roots (%x and %x): the log has two histories", cp.Size, old.Root, cp.Root)), true
+		return e.conflict(r, asJSON, keys, path, "fork", cp, canon, old, fmt.Errorf("two trusted checkpoints of this log have the same size %d and different roots (%x and %x): the log has two histories", cp.Size, old.Root, cp.Root)), true
 	case cp.Size == old.Size:
 		r.ok("state", fmt.Sprintf("same size and root as the last verified checkpoint (%d): nothing to prove", old.Size))
 		write = false
 		out = outcome{action: "unchanged", proved: true, oldSize: old.Size}
 		extends = fmt.Sprintf("is the same as the checkpoint in the state file (size %d)", old.Size)
+		// The same text is the same checkpoint, whichever of its genuine signature
+		// lines each side carries: the state keeps the union, so that a state made
+		// from a note served with fewer lines does not stay weaker than one made from
+		// the whole note.
+		if bytes.Equal(held.note.Text, served.Text) {
+			if merged, mkeys, merr := signednote.Merge(keys, held.note, served); merr == nil && len(mkeys) > len(held.verified) {
+				canon, signers, write = merged, mkeys, true
+				out.action = "signatures_added"
+				r.notes = append(r.notes, fmt.Sprintf("the state file already held this checkpoint with %d genuine signature line(s); the note served now adds %d: the state keeps the union, the checkpoint itself is the same (a checkpoint is its signed text, not the lines that were served with it)", len(held.verified), len(mkeys)-len(held.verified)))
+			}
+		}
 	case old.Size == 0:
 		r.ok("state", fmt.Sprintf("the recorded checkpoint is the empty tree, a prefix of every tree: nothing to prove for size %d", cp.Size))
 		out = outcome{action: "advanced", proved: true, oldSize: old.Size}
@@ -273,7 +340,7 @@ func (e *env) applyState(r *result, in *logInputs, cp *checkpoint.Checkpoint, ca
 				r.notes = append(r.notes, fmt.Sprintf("the state file was not changed: it stays at size %d", old.Size))
 				return e.finishFailed(r, asJSON, "tiles", perr), true
 			case errors.Is(perr, merkle.ErrOldRoot):
-				return e.conflict(r, asJSON, path, "fork", cp, canon, old, fmt.Errorf("the log at size %d does not extend the log at size %d of the state file: both are signed by a key of the trust file, so the log has two histories (%w)", cp.Size, old.Size, perr)), true
+				return e.conflict(r, asJSON, keys, path, "fork", cp, canon, old, fmt.Errorf("the log at size %d does not extend the log at size %d of the state file: both are signed by a key of the trust file, so the log has two histories (%w)", cp.Size, old.Size, perr)), true
 			}
 			var ie *inputErr
 			if errors.As(perr, &ie) {
@@ -290,18 +357,28 @@ func (e *env) applyState(r *result, in *logInputs, cp *checkpoint.Checkpoint, ca
 		extends = fmt.Sprintf("extends the checkpoint of size %d in the state file", old.Size)
 	}
 	r.notProved = append(r.notProved, "that the state file is the one you left: it is your record, keep it where the publisher cannot write")
+	if held != nil && held.weak {
+		r.notProved = append(r.notProved, "that the checkpoint the state file held was genuine: it rested only on keys the trust file no longer counts ("+held.weakWhy+"), and what this run proved is that the new checkpoint is consistent with it")
+	}
 	if write {
-		data, err := encodeState(cp, canon, signers, in.now)
+		data, err := encodeStateFn(cp, canon, signers, in.now)
 		if err == nil {
 			if err = in.readBack(data, cp, canon); err != nil {
 				return fail(err)
 			}
-			err = statefile.Replace(path, data)
+			err = statefile.ReplaceIfUnchanged(path, data, stored, storedExists, maxStateFile)
+			if errors.Is(err, statefile.ErrStateChanged) {
+				return fail(fmt.Errorf("--state %s: %w: another run, or a program that does not take the lock, wrote it after this run read it, so this run wrote nothing (a decision made on an older state must not replace a newer one); run it again", statePath, err))
+			}
 		}
 		if err != nil {
 			return fail(fmt.Errorf("the checkpoint verified but --state %s could not be updated, so later runs do not know it: %w", statePath, err))
 		}
-		r.notes = append(r.notes, fmt.Sprintf("the state file was updated to size %d", cp.Size))
+		if out.action == "signatures_added" {
+			r.notes = append(r.notes, "the state file was updated: same checkpoint, more signature lines")
+		} else {
+			r.notes = append(r.notes, fmt.Sprintf("the state file was updated to size %d", cp.Size))
+		}
 	}
 	if extends != "" {
 		r.headline = fmt.Sprintf("the checkpoint of %s at size %d is signed by a trusted key and %s.", cp.Origin, cp.Size, extends)
@@ -316,8 +393,28 @@ func (e *env) applyState(r *result, in *logInputs, cp *checkpoint.Checkpoint, ca
 // is, the conflicting checkpoint is saved beside it, and the output says where
 // both are. Two notes signed by the same key for trees that are not one history
 // are the proof of misbehaviour.
-func (e *env) conflict(r *result, asJSON bool, statePath, step string, cp *checkpoint.Checkpoint, note []byte, old *checkpoint.Checkpoint, cause error) int {
-	saved, serr := statefile.SaveConflict(statePath, cp.Size, cp.Root[:], note)
+func (e *env) conflict(r *result, asJSON bool, keys []signednote.Key, statePath, step string, cp *checkpoint.Checkpoint, note []byte, old *checkpoint.Checkpoint, cause error) int {
+	// An evidence file is one per signed text: the same text served with other
+	// genuine lines is the same file, extended (L12-03), never another name.
+	merge := func(have []byte) ([]byte, bool) {
+		hn, err := signednote.Parse(have)
+		if err != nil {
+			return nil, false
+		}
+		sn, err := signednote.Parse(note)
+		if err != nil || !bytes.Equal(hn.Text, sn.Text) {
+			return nil, false
+		}
+		merged, mk, err := signednote.Merge(keys, hn, sn)
+		if err != nil {
+			return nil, false
+		}
+		if _, hk, herr := signednote.Merge(keys, hn); herr == nil && len(hk) >= len(mk) {
+			return have, true // nothing to add: the file stays as it is
+		}
+		return merged, true
+	}
+	saved, serr := statefile.SaveConflictMerging(statePath, cp.Size, cp.Root[:], note, merge)
 	code := ExitFailed
 	info := map[string]any{"action": "kept", "old_size": old.Size, "new_size": cp.Size, "extension_proved": false, "evidence_saved": serr == nil}
 	switch {
@@ -334,6 +431,9 @@ func (e *env) conflict(r *result, asJSON bool, statePath, step string, cp *check
 		enc := base64.StdEncoding.EncodeToString(note)
 		info["note_base64"] = enc
 		r.notes = append(r.notes, "the note to keep, as base64 of its exact bytes (decode it into a file): "+enc)
+	case saved.Existing && saved.Extended:
+		r.notes = append(r.notes, fmt.Sprintf("evidence: the state file %s (size %d) was not changed, and this very conflicting signed checkpoint (size %d) was already saved to %s by an earlier run, with fewer signature lines: the file now holds the lines of both (a checkpoint is its signed text); keep both files", statePath, old.Size, cp.Size, saved.Path))
+		info["conflict_file"] = saved.Path
 	case saved.Existing:
 		r.notes = append(r.notes, fmt.Sprintf("evidence: the state file %s (size %d) was not changed, and this very conflicting signed checkpoint (size %d) was already saved to %s by an earlier run; keep both files", statePath, old.Size, cp.Size, saved.Path))
 		info["conflict_file"] = saved.Path
@@ -359,9 +459,9 @@ func (e *env) conflict(r *result, asJSON bool, statePath, step string, cp *check
 func (in *logInputs) readBack(data []byte, cp *checkpoint.Checkpoint, note []byte) error {
 	held, rec, err := decodeHeld(data)
 	if err == nil {
-		var back *checkpoint.Checkpoint
-		back, _, _, err = in.verifyHeld(held, rec, readBackWhat)
-		if err == nil && (back.Origin != cp.Origin || back.Size != cp.Size || back.Root != cp.Root || !bytes.Equal(held, note)) {
+		var back *heldNote
+		back, _, err = in.verifyHeld(held, rec, readBackWhat, true)
+		if err == nil && (back.cp.Origin != cp.Origin || back.cp.Size != cp.Size || back.cp.Root != cp.Root || !bytes.Equal(held, note)) {
 			err = errors.New("the state file that would be written does not read back as the checkpoint that was verified")
 		}
 	}
@@ -378,14 +478,28 @@ func (in *logInputs) readBack(data []byte, cp *checkpoint.Checkpoint, note []byt
 // readBackWhat names the file that readBack checks, in the messages.
 const readBackWhat = "the state file that would be written"
 
+// encodeStateFn is encodeState; a test replaces it to put a state that a later
+// run would not read in front of readBack, which nothing else can reach.
+var encodeStateFn = encodeState
+
 // canonicalOf is the form in which a verified note is stored and saved as
-// evidence (signednote.Canonical): its text and the signature lines of the keys
-// that verified, and nothing a publisher without a key could add or vary. It
-// also says how many lines of the note as served are not in it.
-func canonicalOf(note []byte, signers []signednote.Key) ([]byte, int, error) {
+// evidence (signednote.Merge of the note with itself): its text and every
+// signature line that verifies under a key of the trust file, of any standing,
+// and nothing a publisher without a key could add or vary. It returns the parsed
+// note, the keys of the lines kept, and how many lines of the note as served are
+// not in it.
+func (in *logInputs) canonicalOf(note []byte) (*signednote.Note, []byte, []signednote.Key, int, error) {
 	parsed, err := signednote.Parse(note)
 	if err != nil {
-		return nil, 0, fmt.Errorf("the verified note does not parse again: %w", err)
+		return nil, nil, nil, 0, fmt.Errorf("the verified note does not parse again: %w", err)
 	}
-	return signednote.Canonical(parsed, signers), len(parsed.Signatures) - len(signers), nil
+	keys, err := in.allKeys()
+	if err != nil {
+		return nil, nil, nil, 0, err
+	}
+	canon, verified, err := signednote.Merge(keys, parsed)
+	if err != nil {
+		return nil, nil, nil, 0, fmt.Errorf("the verified note has no line that verifies under a key of the trust file: %w", err)
+	}
+	return parsed, canon, verified, len(parsed.Signatures) - len(verified), nil
 }

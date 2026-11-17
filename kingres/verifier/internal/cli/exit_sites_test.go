@@ -11,7 +11,10 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/checkpoint"
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/signednote"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/statefile"
 )
 
@@ -290,19 +293,44 @@ func exitRows(x *exitEnv) []exitRow {
 			}
 			return x.cp("--state", filepath.Join(d, "s"))
 		}),
-		fn("applyState:fail#5", 2, func(t *testing.T) []string { return x.cp("--state", t.TempDir()) }),
-		fn("applyState:fail#6", 2, func(t *testing.T) []string { return x.cp("--state", tmp("s", "")) }),
-		fn("applyState:fail#7", 2, func(t *testing.T) []string { return x.cp("--state", tmp("s", "{garbage")) }),
-		fn("applyState:fail#8", 2, func(t *testing.T) []string {
+		never("applyState:fail#5", 2, "guard: the origin was checked below the trusted prefix by verifyNote before the state is looked at"),
+		fn("applyState:fail#6", 2, func(t *testing.T) []string { return x.cp("--state", t.TempDir()) }),
+		fn("applyState:fail#7", 2, func(t *testing.T) []string { return x.cp("--state", tmp("s", "")) }),
+		fn("applyState:fail#8", 2, func(t *testing.T) []string { return x.cp("--state", tmp("s", "{garbage")) }),
+		fn("applyState:fail#9", 2, func(t *testing.T) []string {
 			return x.cp("--state", tmp("s", newSigner(7).note(x.p.origin, 300, refMTH(x.p.all[:300]))))
 		}),
-		never("applyState:fail#9", 2, "guard: verifyHeld returns only input errors"),
-		fn("applyState:fail#10", 2, func(t *testing.T) []string {
+		never("applyState:fail#10", 2, "guard: verifyHeld returns only input errors"),
+		fn("applyState:fail#11", 2, func(t *testing.T) []string {
 			st := x.stateAt300()
 			return []string{"checkpoint", "--trust", x.p.trust, "--log", x.p.log(), "--source", x.p.trust, "--note", filepath.Join(x.p.logDir, "checkpoint"), "--state", st}
 		}),
-		never("applyState:fail#11", 2, "guard: the state is written in the canonical form of the verified note, which reads back by construction (TestReadBackRefusesWhatALaterRunWouldNotRead calls readBack with a file that does not)"),
-		exitRow{site: "applyState:fail#12", status: 2, unix: true, args: func(t *testing.T) []string {
+		// The read-back guard and the second look at the state are reached through
+		// the seam encodeStateFn, which sits between the decision and the write.
+		fn("applyState:fail#12", 2, func(t *testing.T) []string {
+			st := x.stateAt300()
+			t.Cleanup(func() { encodeStateFn = encodeState })
+			encodeStateFn = func(cp *checkpoint.Checkpoint, note []byte, signers []signednote.Key, now time.Time) ([]byte, error) {
+				return encodeState(cp, append(append([]byte(nil), note...), 'x'), signers, now)
+			}
+			return x.cp("--state", st)
+		}),
+		fn("applyState:fail#13", 2, func(t *testing.T) []string {
+			st := x.stateAt300()
+			t.Cleanup(func() { encodeStateFn = encodeState })
+			encodeStateFn = func(cp *checkpoint.Checkpoint, note []byte, signers []signednote.Key, now time.Time) ([]byte, error) {
+				b, err := os.ReadFile(st)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(st, append(b, '\n'), 0o600); err != nil { // a rival writer
+					t.Fatal(err)
+				}
+				return encodeState(cp, note, signers, now)
+			}
+			return x.cp("--state", st)
+		}),
+		exitRow{site: "applyState:fail#14", status: 2, unix: true, args: func(t *testing.T) []string {
 			d := t.TempDir()
 			st := filepath.Join(d, "s")
 			if err := os.WriteFile(filepath.Join(d, ".kingres-state.lock"), nil, 0o600); err != nil {

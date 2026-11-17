@@ -42,7 +42,33 @@ type Limits struct {
 	// MaxString is the length of one string as written in the document, in
 	// bytes (an escape counts as written).
 	MaxString int
+	// MaxElement is the size in bytes, white space included, of one element of
+	// the streamed array. It is checked token by token while the element is read,
+	// so an element is refused before it has been held whole: without it one
+	// element may hold MaxValues strings of MaxString bytes, a gigabyte (L12-05).
+	// Zero means no limit (it only applies to a streamed document).
+	MaxElement int
+	// MaxRest is the size in bytes of everything of a streamed document outside
+	// the streamed member, with the same effect for the members around it.
+	MaxRest int
 }
+
+// MaxElementBytes is the most bytes one block header of a proof may take. A
+// header has seven members (height, hash_version, prev_hash, tx_merkle_root,
+// tx_count, closed_at_us, block_hash): the names and punctuation are 105 bytes,
+// the three hashes 198, the numbers at most 19 + 1 + 10 + 20 digits, so a
+// compact header is at most about 355 bytes and one written with an indent and
+// carriage returns about 450. 4,096 leaves room for any layout a program
+// writes, and for members this verifier ignores.
+const MaxElementBytes = 4096
+
+// MaxRestBytes is the most bytes of a proof outside its chain. The members are
+// a few hashes and numbers, two paths of at most merkle.MaxPathLength hashes
+// (about 5 KiB each), one header and two names: under 20 KiB for every honest
+// proof. 1 MiB leaves room for a long user_name and for members that are
+// ignored, and keeps what a hostile file can make the reader hold outside the
+// chain at a constant.
+const MaxRestBytes = 1 << 20
 
 // MaxDepth is the deepest nesting accepted by default.
 const MaxDepth = 32
@@ -56,7 +82,7 @@ const MaxNumber = 64
 
 // DefaultLimits are the limits of Parse: far above what a digest, a block
 // header, a trust file or one proof element needs, far below what hurts.
-var DefaultLimits = Limits{MaxDepth: MaxDepth, MaxValues: 1 << 14, MaxMembers: 1 << 10, MaxKey: 256, MaxString: 1 << 16}
+var DefaultLimits = Limits{MaxDepth: MaxDepth, MaxValues: 1 << 14, MaxMembers: 1 << 10, MaxKey: 256, MaxString: 1 << 16, MaxElement: MaxElementBytes, MaxRest: MaxRestBytes}
 
 // Kind is the JSON type of a Value.
 type Kind int
@@ -159,6 +185,28 @@ type parser struct {
 	count  int
 	stream string
 	each   func(Value) error
+	// elemStart is the input offset where the element this parser reads began
+	// (an inner parser, MaxElement); streamed is the number of bytes the
+	// streamed member took and inStream is true while it is read (the outer
+	// parser, MaxRest).
+	elemStart int64
+	elemOnly  bool
+	streamed  int64
+	inStream  bool
+}
+
+// tick checks the bytes read so far against MaxElement and MaxRest. It is called
+// after every token, so a hostile value is refused after one more token (a
+// string is at most MaxString bytes), not after it has been read whole.
+func (p *parser) tick(at *locator) error {
+	off := p.dec.InputOffset()
+	if p.elemOnly && p.lim.MaxElement > 0 && off-p.elemStart > int64(p.lim.MaxElement) {
+		return fmt.Errorf("%s: an element of more than %d bytes, expected a block header of about 350 bytes", at, p.lim.MaxElement)
+	}
+	if p.each != nil && !p.inStream && p.lim.MaxRest > 0 && off-p.streamed > int64(p.lim.MaxRest) {
+		return fmt.Errorf("%s: more than %d bytes outside the member %q, expected a smaller document", at, p.lim.MaxRest, p.stream)
+	}
+	return nil
 }
 
 func parse(data []byte, l Limits, stream string, each func(Value) error) (Value, error) {
@@ -208,6 +256,9 @@ func (p *parser) value(at *locator, depth int) (Value, error) {
 	if err != nil {
 		return Value{}, fmt.Errorf("%s: invalid JSON: %w", at, err)
 	}
+	if err := p.tick(at); err != nil {
+		return Value{}, err
+	}
 	return p.finish(tok, at, depth)
 }
 
@@ -221,6 +272,9 @@ func (p *parser) object(at *locator, depth int) (Value, error) {
 		key, ok := kt.(string)
 		if !ok {
 			return Value{}, fmt.Errorf("%s: expected an object key", at)
+		}
+		if err := p.tick(at); err != nil {
+			return Value{}, err
 		}
 		if len(key) > p.lim.MaxKey {
 			return Value{}, fmt.Errorf("%s: a key of %d bytes, expected at most %d", at, len(key), p.lim.MaxKey)
@@ -249,6 +303,9 @@ func (p *parser) object(at *locator, depth int) (Value, error) {
 	if _, err := p.dec.Token(); err != nil {
 		return Value{}, fmt.Errorf("%s: invalid JSON: %w", at, err)
 	}
+	if err := p.tick(at); err != nil {
+		return Value{}, err
+	}
 	return Value{kind: KindObject, at: at, obj: obj}, nil
 }
 
@@ -265,10 +322,13 @@ func (p *parser) streamMember(at *locator) (Value, error) {
 	if d, isDelim := tok.(json.Delim); !isDelim || d != '[' {
 		return p.finish(tok, at, 1)
 	}
+	startOff := p.dec.InputOffset()
+	p.inStream = true
 	n := 0
 	for p.dec.More() {
-		// Each element is a document of its own as far as the count goes.
-		inner := &parser{dec: p.dec, lim: p.lim}
+		// Each element is a document of its own as far as the count goes, and has
+		// its own size limit, counted from where it starts.
+		inner := &parser{dec: p.dec, lim: p.lim, elemOnly: true, elemStart: p.dec.InputOffset()}
 		el, err := inner.value(&locator{parent: at, index: n, isIdx: true}, 2)
 		if err != nil {
 			return Value{}, err
@@ -281,6 +341,8 @@ func (p *parser) streamMember(at *locator) (Value, error) {
 	if _, err := p.dec.Token(); err != nil {
 		return Value{}, fmt.Errorf("%s: invalid JSON: %w", at, err)
 	}
+	p.streamed += p.dec.InputOffset() - startOff
+	p.inStream = false
 	return Value{kind: KindArray, at: at}, nil
 }
 
@@ -321,6 +383,9 @@ func (p *parser) array(at *locator, depth int) (Value, error) {
 	}
 	if _, err := p.dec.Token(); err != nil {
 		return Value{}, fmt.Errorf("%s: invalid JSON: %w", at, err)
+	}
+	if err := p.tick(at); err != nil {
+		return Value{}, err
 	}
 	return Value{kind: KindArray, at: at, arr: arr}, nil
 }

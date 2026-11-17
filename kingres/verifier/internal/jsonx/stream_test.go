@@ -220,19 +220,22 @@ func (spacesReader) Read(p []byte) (int, error) {
 
 // L10-18: the README says nesting 32 and the code accepted 33 arrays when the
 // innermost was empty.
+// The documented limit is 32 levels (README, "Limits and memory"): the number is
+// written out here, not taken from the constant, so that changing the constant
+// fails this test (L12-08).
 func TestNestingLimitIsExactlyTheDocumentedOne(t *testing.T) {
 	for _, c := range []struct {
 		name       string
 		open, shut string
 	}{{"arrays", "[", "]"}, {"objects", `{"a":`, "}"}} {
-		for depth := MaxDepth - 1; depth <= MaxDepth+1; depth++ {
+		for depth := 31; depth <= 33; depth++ {
 			inner := "1"
 			if c.name == "arrays" {
 				inner = ""
 			}
 			doc := strings.Repeat(c.open, depth) + inner + strings.Repeat(c.shut, depth)
 			_, err := Parse([]byte(doc))
-			if want := depth > MaxDepth; (err != nil) != want {
+			if want := depth > 32; (err != nil) != want {
 				t.Errorf("%s nested %d deep: error %v, want error %v", c.name, depth, err, want)
 			}
 		}

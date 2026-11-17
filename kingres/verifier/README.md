@@ -61,7 +61,7 @@ committed). `go.mod` has no `require` line: only the standard library is used.
 |---|---|
 | 0 | everything that was asked for was verified (`VERIFIED` or `CONSISTENT` is printed) |
 | 1 | a verification failed (the failed step is named), or the publication holds a file in a form it must not have (a symbolic link on the way, a directory, device or named pipe, a file over its size limit, a tile of the wrong size), or the thing under test cannot be parsed (a proof, a block export, a checkpoint note); the word `VERIFIED` is never printed |
-| 2 | usage or input error: a flag is missing or wrong, a file or directory **you named** cannot be read (it is absent, not a regular file, too large) or is malformed (digest, columns file, trust file, state file), or no key of the trust file can be used at the time given, or **a checkpoint you hold** (`--state`, `--old FILE`) cannot serve as your anchor (no key of the trust file signed it, or only a revoked one, or one beyond its `max_tree_size`), or the state file stayed locked by another run for 10 seconds, or **the result could not be written** to the standard output (a closed descriptor, a full disk, a short write: the line `could not be written to the standard output` is on the standard error), in text and in `--json`, on every command: a verdict nobody could read is not status 0. A run whose verdict is not 0 keeps its status when its output cannot be written; nothing was verified |
+| 2 | usage or input error: a flag is missing or wrong, a file or directory **you named** cannot be read (it is absent, not a regular file, too large) or is malformed (digest, columns file, trust file, state file), or no key of the trust file can be used at the time given, or **a checkpoint you hold** (`--state`, `--old FILE`) cannot serve as your anchor (no key of the trust file signed it; for a plain note given as `--old FILE` also: only a revoked key, or one beyond its `max_tree_size`, signed it; see "Checkpoints you hold"), or the state file stayed locked by another run for 10 seconds, or the lock file belongs to another user, or **the result could not be written** to the standard output (a full disk, a short write, a closed pipe: the line `could not be written to the standard output` is on the standard error; a closed descriptor: see "The standard output"), in text and in `--json`, on every command: a verdict nobody could read is not status 0. A run whose verdict is not 0 keeps its status when its output cannot be written; nothing was verified |
 | 3 | incomplete: nothing failed, but **the publication does not contain something that was asked for** (a checkpoint, a tile, the directory of a log); `INCOMPLETE` is printed and the missing items are listed; `VERIFIED` is never printed. **Treat 3 as an alert, never as "probably fine"**: a publisher must serve the tiles of every checkpoint it signed, so one that withholds exactly the tiles that would show a fork gets status 3 and not status 1, and a missing file is at best neglect. Only the commands of phase 7 (`checkpoint`, `consistency`) can end with 3; a failure always wins over an incomplete check |
 | 4 | a fork or a rollback was found, which is what status 1 says for it, **and the conflicting checkpoint could not be saved** (every name for the evidence is taken by a file with other content, or the disk refuses it); `FAILED at step fork` (or `rollback`) is printed with a note that says `was NOT saved`. The finding stands and is as serious as a 1: act on the fork and save the note you were shown yourself. Only `checkpoint --state` can end with 4 |
 
@@ -97,6 +97,33 @@ asked for. A publisher that wants to hide a fork can withhold exactly the tile o
 that would have shown it, and the run then ends with 3 and not with 1; it can never end with
 0. Treat 3 like 1 when you decide what to do, and ask the publisher for the missing files.
 
+**The standard output** (L12-04, L12-09). A Go program started with its standard output closed
+(`>&-`) does not see a closed descriptor: on Unix the runtime opens the null device on every one of the
+descriptors 0, 1 and 2 that is closed at start, and a write to it succeeds, so the verdict was lost and the
+status was 0. What the program can still see, after the runtime changed it, is how the replacement was
+opened: the runtime opens the null device for reading **and** writing, and a shell that is asked for no output
+(`>/dev/null`, `>>/dev/null`) opens it for writing only. So, on Linux, macOS and the BSDs
+(`internal/stdio`, called first by `cmd/kingres-verify`, for every command including `version` and `--help`):
+
+- a standard output that is the null device opened for reading and writing is taken for a closed
+  descriptor: nothing is run, the standard error says `the standard output is closed ... nothing was run`,
+  and the status is 2;
+- a standard output that is the null device opened for writing only is what a caller who wants the status and
+  no text asks for: the program runs as usual, and a verdict that is not 0 keeps its status;
+- a file, a pipe and a terminal are normal.
+
+The cost is one refusal that is not a closed descriptor: `1<>/dev/null`, which opens the null device for
+reading and writing on purpose, is refused as well; write `>/dev/null`. What is not detected: a descriptor
+that was closed and then given by the parent to something that accepts writes and loses them, and any system
+other than those named (no check is made there). On Windows a closed standard output is a null or invalid
+handle, which the runtime does not replace by the null device: the write fails, and the run ends with status 2
+and `could not be written` like any failed write; `> NUL` is the null device and is accepted. A reader that
+closes a pipe early kills the program with SIGPIPE (the shell sees 141, also when SIGPIPE is ignored); a
+reader that takes only the first bytes (`head -c 5`) leaves status 0 and a cut line, because the whole output
+fitted in the pipe: the program cannot know, and it is the caller's cut. Tests: `TestClosedStandardOutputIsStatus2`,
+`TestStandardOutputThatTheUserChoseRuns` (Unix) and `TestClosedStandardOutputOnWindowsIsStatus2` start the
+program as a child.
+
 Text and JSON are made from one structure: every `ok` step, `note`, `not proved`,
 `missing` and `problems` line of the text is a member of the JSON (`steps`,
 `notes`, `not_proved`, `missing`, `problems`) and the other way round; a test fails when a
@@ -121,8 +148,11 @@ such string is written by one function, and what it writes can be read back exac
   `\UNNNNNNNN` above U+FFFF, in lower case hex;
 - a value of more than 2,048 bytes is cut at a character boundary and ends with
   `\...(cut: N of M bytes shown)`: `\.` is never written for any other input, so no input can
-  print the marker, and M is the original length. **This is the only cut**: it is made after
-  escaping, at a character boundary, so it cannot split an escape or a multi-byte character. The
+  print the marker, and M is the original length. **This is the only cut**: it is made on the raw
+  value, **before** escaping, at a character boundary, so it cannot split a multi-byte character, and
+  an escape is never cut because it is made after the cut. The escaped text is longer than the cut: a
+  control character is four bytes, so 3,000 bytes of `0x01` print as 8,192 bytes and the marker, at
+  most four times the 2,048 that are shown (`TestTheCutIsMadeBeforeTheEscape`). The
   older cuts of a value at 60, 80, 100 or 120 bytes before it was escaped (which could split a
   character, made two values print alike and made a value that ends in `...` look cut) are gone;
 - everything else is written as it is.
@@ -352,7 +382,7 @@ what the auditor says (the time given with `--now`), and nothing else:
 | Member | Effect |
 |---|---|
 | `not_before`, `not_after` | enforced on `--now` (default the system clock, printed in the output with its fraction of a second), inclusive at both ends (a time equal to `not_after` is still inside, one nanosecond later is not): a key outside its window is left out, with a note that says why; if no key is left the command ends with status 2 and lists each key and why. After `not_after` a retired key's checkpoints therefore stop verifying as **new** checkpoints unless you give an earlier `--now`, which is your statement and is printed. **A checkpoint you already hold** (`--state`, `--old FILE`) is not subject to the window: see "Checkpoints you hold". The window is measured on the clock of the machine you run on: a machine whose clock was set back still accepts a key whose `not_after` has passed, so for a key that leaked use `revoked`, which does not depend on the clock. This fails closed: a member that only reported would look like a control and not be one. `--now` must be an RFC 3339 time with a point as the decimal mark; an empty `--now` (an unset shell variable) is an error, never the clock |
-| `revoked` (true or false) | true: the key is never used for a new checkpoint, whatever `--now` says, and its signature on a checkpoint you hold is not accepted either. A note signed by a revoked key and by a valid one is accepted through the valid key, and the output says that a signature of the revoked key was on it and was not counted |
+| `revoked` (true or false) | true: the key is never used for a new checkpoint, whatever `--now` says. A revocation says that the key must not be trusted **for new notes**, from now on; it does not make a checkpoint you already verified and stored unknown to you: such a state stays your anchor (it only ever makes a run stricter), flagged in the output as resting on a key the file no longer counts (see "Checkpoints you hold"). A note signed by a revoked key and by a valid one is accepted through the valid key, and the output says that a signature of the revoked key was on it and was not counted. There is no `compromised_since` member: a checkpoint carries no time that anyone can trust, so a "since" cannot be applied; `max_tree_size` is the form of it that the data proves |
 | `max_tree_size` (an integer from 1) | a checkpoint counts as signed by this key only if its tree size is at most this: the way to retire a key at a known size so that what it signed stays valid and what it signs later (a leaked key) is refused, step `key-size`. It does not stop a leaked key from signing a different history at a smaller size: only a checkpoint or consistency proof you already hold catches that. The limit is applied to a checkpoint you hold too. `trust show` cannot know the size of your log, so a key it reports as usable may still be refused for a larger checkpoint. `revoked` and `max_tree_size` together are refused |
 
 **`checkpoint`** verifies one checkpoint note: the note is well formed, at
@@ -401,8 +431,8 @@ proved: that this is the latest checkpoint ... (rollback)"). There are three way
 `verified_at`, `verified_by` the fingerprints of the keys, `note` the signed note **in its canonical
 form**, see "What the state holds"). The facts are
 for the reader, and they must agree with the note (see "What a state file must be"); the decision
-is the note's: it still has to carry a valid signature of a key of the trust file that is not
-revoked (a person who can write the file can also delete it). `verified_by` and `verified_at` are
+is the note's: it still has to carry a valid signature of a key of the trust file, of any
+standing (a person who can write the file can also delete it). `verified_by` and `verified_at` are
 information for a person: no decision uses them, and they are not compared with anything but their
 form.
 It may be a link (the state is replaced where the link points, the link stays a link; a link to
@@ -415,52 +445,90 @@ Windows meet a sharing error while the file is replaced; run it again. A crash l
 one, whole, and at worst a temporary file that the next run removes (tested by stopping after each
 step, on both platforms). Old state files that are a plain signed note are still read.
 
-**What the state holds (the canonical form).** The invariant: **what is stored in the state, and
-what is saved as evidence of a fork, is exactly what was verified, in a canonical form that depends
-only on verified content. A later change of the trust file (a key added, retired, removed, a window
-changed) never makes a stored state unreadable and never makes it accept less.** Nobody who holds
-no trusted key can put a byte into the state, or make the output of a run differ, with anything the
-signature does not cover. The canonical form of a note is
+**What the state holds (the canonical form).** The invariant, in one sentence: **the identity of a
+checkpoint is its signed text (origin, size, root, extension lines) and never its signature lines; the
+lines of one text only accumulate, so a state keeps the union of every line that verified for that text,
+two notes with the same text are the same checkpoint (no fork, no evidence file of their own, no
+status 4), and a state is usable as long as its text verified once under a key of the trust file,
+whatever became of that key afterwards.** The last clause is right because a revocation says that
+a key must not be trusted for **new** notes from now on; it does not say that a checkpoint you verified
+and stored is unknown to you, and a note carries no time that anyone can trust, so a "compromised
+since" cannot be applied to it (the trust file has `revoked` and `max_tree_size`, and no
+`compromised_since`, for that reason). A held state only ever makes a run stricter (a smaller size, a fork,
+and a larger size that is not proved to extend it are failures), so keeping one that rests on a revoked
+key cannot make anything pass that would fail without it; refusing it would make the choice of lines that a
+publisher served decide whether later runs can go on (L12-01). It is not shown to be genuine now, and the
+output says so ("Checkpoints you hold"). Nobody who holds no trusted key can put a byte into the state,
+choose by serving some of the genuine lines what a later run does, or make the exit status, the name of an
+evidence file or the stored state differ by anything that no verified signature covers. A later change
+of the trust file (a key added, retired, revoked, limited, a window changed) never makes a stored state
+unreadable and never makes it accept less. The canonical form of a note is
 
 1. the text of the note, which is what the signatures cover (origin, size, root, extension lines);
 2. one blank line;
-3. the signature lines of the keys whose signature **verified over that text and counted in this
-   run** (a key usable at `--now`, not revoked, within its `max_tree_size`), each written again from
-   the parsed signature, in the order of key name and key id.
+3. the signature lines of **every** key of the trust file, whatever its standing now (usable, retired,
+   not yet valid, revoked, beyond its `max_tree_size`), whose signature **verifies** over that text,
+   each written again from the parsed signature, in the order of key name and key id. (Until this
+   round it was the lines of the keys that counted in the run; which lines a state held then depended on
+   the standing of the keys that day and on which of the genuine lines a publisher served.)
 
-Every input byte of a note and where it goes:
+When the state already holds the same text, the lines of the note served and of the note held are
+merged: the union of the lines that verify. The state is rewritten only when it gains a line
+(`info.state.action` is `signatures_added`, and the note says so; otherwise `unchanged`, and the file
+is not touched). The evidence of a fork or rollback is merged the same way (below).
 
-| Input | Covered by a verified signature | What happens |
+Every input of a note, of a state, of a publication, and what it can change. "Covered" means that a
+signature that verified covers it:
+
+| Input | Covered | What it can change |
 |---|---|---|
-| the text (origin, size, root, the extension lines) | yes | stored |
-| the blank line before the signatures | no, structure | written again |
-| a signature line of a key that verified and counted | yes | stored, written again from the parsed values |
-| a signature line of a key of the trust file that verified and did not count (revoked, outside its window, over its `max_tree_size`) | not counted | **dropped**; the output names it ("carries a signature of key ...") |
-| a signature line that names a key that is not usable now (retired, not yet valid, revoked) and does not verify | no | **dropped**; the output says "carries a line that names key ... and does not verify", it is never called a signature |
-| a signature line that names a usable key and does not verify | no | a **new** note is refused (status 1, step `signature`) and nothing is stored; a **held** note ignores it with a note |
-| a signature line of a key the trust file does not know | no | **dropped**, counted in "N signature lines that were not counted" |
-| the order of the signature lines, how many unknown ones there are | no | does not matter: the stored note is the same bytes |
-| a line that is not a well formed signature line, a repeated key name and key id, a control character, a missing newline | no | the note is refused as malformed, nothing is stored |
+| the text (origin, size, root, the extension lines) | yes | it is the identity of the checkpoint; stored as it is |
+| the blank line before the signatures | no, structure | written again; nothing |
+| a signature line of a key of the trust file that verifies, counted or not (revoked, outside its window, over its `max_tree_size`) | yes | stored, merged with the lines the state already holds; the output names the ones that were not counted |
+| a signature line that names a key of the file that is not usable now and does not verify | no | dropped; the output says "carries a line that names key ... and does not verify", it is never called a signature; no effect on the status |
+| a signature line that names a usable key and does not verify | no | a **new** note is refused (status 1, step `signature`) and nothing is stored; a **held** note ignores it with a note. A publisher can refuse any note by serving it wrongly or not at all, and this is the same refusal: it never moves or changes the state |
+| a signature line of a key the trust file does not know | no | dropped, counted in "N signature lines that were not counted" |
+| the order of the signature lines, how many unknown ones there are | no | nothing: the stored note is the same bytes |
+| which of the genuine lines are present (a subset of them, one or all) | the lines are, their absence is not | the state keeps the union of the lines served over the runs; the status, the size stored, the evidence name and the verdict of every later run do not depend on which. A note whose served lines include none that counts is refused, which is the refusal above |
+| a line repeated (same key name and key id), a line that is not a well formed signature line, a control character, a missing newline | no | the note is refused as malformed (status 1), nothing is stored |
+| the tiles | the hashes are checked against the signed roots | only the tiles on the proof path are read, and each is hashed into the signed new root: a changed tile is status 1, a missing one status 3, and neither moves the state |
+| the names and number of the files of the publication (a directory listing, a second epoch directory, a bundle) | no | only names built from the log named on the command line are opened; a listing is read only to find the one epoch when `:e<N>` is not given (at most 1,024 entries), and a second epoch makes that a status 2 that asks for `:e<N>`: a refusal, never another state |
+| the names of the files beside the state (the evidence names, the lock file, the temporary files) | no | built by the program from the state's name, the size and the whole root; an existing file is looked at by its exact name and a link is never followed |
+| the members of the state record other than `note` (`verified_at`, `verified_by`, `log`, `size`, `root`) | no | information for a person; `log`, `size` and `root` must agree with the note, and no decision uses the others |
 
-The place where this is done is one function (`signednote.Canonical`, called through `canonicalOf`
-before anything is stored or saved), so the number of unknown lines a publisher appends changes nothing
-that a run writes or decides: the same size and root with ten different sets of junk lines is one
-evidence file, status 1 and not status 4 (L10-09). The canonical note keeps every signature that
-counted, so it verifies under every trust file that still holds one of the keys that signed it, is
-not revoked and has not lowered its size limit; a key added later, a key retired or a window changed
-changes nothing (windows are not applied to a note you hold). A trust file that no longer holds, or
-has revoked, **every** key that signed the state cannot read it: that is status 2, with the advice
-that keeps the protection ("Checkpoints you hold"), and it is the auditor's decision about trust, not
-something a publisher can plant. A note you **hold** (`--state`, `--old FILE`) is judged by the
-signatures that verify: a line that names a key of the file and does not verify is ignored, with a note
-(a state written by the version before this one holds the note as it was served, including such
-lines, and is still read; the next time it advances, the new state is canonical; a state that does
-not advance is not rewritten). A note **under test** keeps the strict rule: a line that names a usable key
-and does not verify refuses the note, because that is a note somebody tampered with, and a refusal never
-moves the state. `TestStateSurvivesEveryChangeOfTheTrustFile` (random sequences of trust files, of
-signers and of junk lines) and `FuzzStateFromNote` test the invariant: a run that ends with status 0
-leaves a state its own trust file reads back, a run that does not leaves the state as it was, and a
-later trust file that holds a key that signed the state reads it.
+The place where the lines are chosen is one function (`signednote.Merge`, called through
+`canonicalOf` before anything is stored or saved), so the number and the order of the lines a publisher
+serves changes nothing that a run writes or decides: the same size and root with ten different sets of
+junk lines, or with every subset of the genuine lines, is one evidence file, status 1 and not status 4
+(L10-09, L12-03). The canonical note keeps every line that verifies, so it verifies under every trust
+file that still holds one of the keys that signed it, whatever its standing. A note you **hold** (`--state`,
+`--old FILE`) is judged by the signatures that verify: a line that names a key of the file and does not
+verify is ignored, with a note (a state written by an earlier version holds the note as it was served,
+including such lines, or only the lines of the keys that counted, and is still read; it is rewritten when
+it advances or gains a line, and then it is canonical). A note **under test** keeps the strict rule: a line
+that names a usable key and does not verify refuses the note, because that is a note somebody tampered with,
+and a refusal never moves the state.
+
+**The one way left to make a held state unreadable, and what to do.** No sequence made of a
+publisher that serves some of the genuine lines, a party without a key that drops, reorders or adds
+lines, and changes of the trust file in which the keys stay in it (added, retired, revoked, limited,
+a window changed) ends in a run that is refused when the same sequence with the genuine notes served whole
+would not be: `TestKeylessAdversaryNeverChangesTheOutcome` (150 sequences of 8 runs with 4 keys and 25 with 16 keys, in two worlds side by
+side) and `FuzzKeylessAdversary` test exactly that. The one change that can is **deleting from the trust file
+every key whose line the state holds**: the auditor then says that they no longer pin any key that vouched
+for the state, no run can check the state against a key, and `checkpoint --state` and `consistency --old` end
+with status 2, say which it is, and give the one command that restores the protection (`checkpoint --state
+NEWFILE --min-size N`, the rebase of "Checkpoints you hold"), which works (`TestRefusedStateNamesTheRebaseAndTheRebaseWorks`).
+To retire a key use `not_after`, `max_tree_size` or `revoked`, which keep every state readable; deleting a
+key is not a retirement. What a record would have to do to survive a deletion (be believed without a
+signature) is a decision that was not taken: whoever can write your state file can delete it or put an older
+genuine checkpoint in it, but could also put any size in a record that nothing checks, and the signature is
+what makes the record more than that.
+
+`TestStateSurvivesEveryChangeOfTheTrustFile` (random sequences of trust files, of signers and of junk
+lines), `FuzzStateFromNote` and the two tests of the keyless party above test the invariant: a run that ends
+with status 0 leaves a state its own trust file reads back, a run that does not leaves the state as it was,
+and a later trust file that holds a key that signed the state reads it.
 
 **What a state file must be, and what the verifier never writes.** The invariant is that the
 verifier never writes a state it would not read back, and every limit on what is read is a limit
@@ -508,13 +576,14 @@ walked component by component from the root, links followed:
   is stricter: owned by the user running this command, and not writable by group or others even with
   the sticky bit, because whoever can create a name there can plant the lock or the evidence;
 - every link on the way is owned by root or by the user running this command, and its target is
-  checked the same way (at most 40 links); a `..` after a link means the parent of the target;
+  checked the same way (at most 40 links); a `..` after a link means the parent of the target, in a relative name too (L12-06);
 - the state itself, when it exists, is owned by the user running this command and not writable by
   group or others;
-- the lock file is owned by the user running this command with no access for group or others (mode
-  0600); one that is not (a file of mode 0666 kept from a time the directory was shared, a file of
-  another owner) is removed and made again, so that nobody who kept the old one open or holds its
-  lock for ever blocks you (L10-12). A directory of mode 0711 is accepted: others can look a name up
+- the lock file is owned by the user running this command, with mode 0600; one of another owner is
+  refused (status 2, with the command to remove it by hand) and is never removed by the program; one
+  with access for group or others (a file of mode 0666 or 0640 kept from a time the directory was shared)
+  is locked as it is and its mode is made 0600 in place; it is never replaced (L12-02, "The rule of the
+  lock file"). A directory of mode 0711 is accepted: others can look a name up
   and nothing more, the state is 0600 and holds nothing that is secret;
 - after the lock is taken the name is resolved and checked again, and the run stops if it leads
   somewhere else.
@@ -547,42 +616,90 @@ one name on a system that ignores case): the second waits up to 10 seconds and t
 status 2. It does **not** cover two names of one file in different directories (a hard link from
 another directory: a run replaces the name it was given, which does not change the other link),
 a program that does not take it, or a user who can write the directory (see above): use one name
-for a state. The lock file is checked for its owner and mode and replaced when it is not private to
-you (see above); a lock that another user holds in a directory you own is therefore not a way to stop
-the auditor, and a lock left by a process that died is released by the system. A lock held by a live
-process of your own that never ends is status 2 after 10 seconds, with nothing changed: look for that process.
+for a state.
+
+**The rule of the lock file: it is never removed and never replaced while it can be held** (L12-02).
+A run that replaced a lock file that was "not private" (remove, then create) could hold a different file
+from the one another run held, two runs then held "the" lock together, and a late writer moved the state
+backwards (four goroutines on a lock file of mode 0644 did it in the second round; processes do it as well).
+The lock file is now opened as it is and locked first; then, on Unix, when its mode gives group or others any
+access, the mode is made 0600 in place with `fchmod` on the descriptor that holds the lock (a file of mode
+0640 is tightened as 0644 is); a lock file that another user owns is **refused** with status 2 and the
+command to remove it by hand (it is not removed by the program, which cannot know that nobody holds it); and
+after the lock is taken the name is looked at again, and when it no longer leads to the file that was locked
+(somebody removed the file by hand) the lock is dropped and the file the name leads to now is locked. Whoever
+keeps an old lock file open therefore holds the very file the auditor locks: the auditor waits up to 10
+seconds for them (status 2, nothing changed) and does not walk around them. A lock left by a process that died
+is released by the system. A lock held by a live process of your own that never ends is status 2 after 10
+seconds, with nothing changed: look for that process.
+
+**A write never moves the state over one it did not read** (L12-02). Independently of the lock, the file is
+read again immediately before the rename and the run writes nothing, with status 2 and a message that says so,
+when it is not the bytes the decision was made on (`statefile.ReplaceIfUnchanged`): a late writer, one that does
+not take the lock or holds a lock on another file, cannot replace a newer state with one decided on an older.
+What is left is the few microseconds between that read and the rename, for a writer that ignores the lock; no
+call of the file system closes it without one. The earlier statement that the state "is read again under the
+lock" was true and was not enough: the read happened at the start, and the write at the end, with nothing
+between them to see another writer. `TestStateAcrossRealProcessesNeverMovesBackwards` runs eight processes at
+once against a lock file of mode 0644, eight rounds, with a watcher on Unix, and `TestLockExcludesRealProcesses`
+and `TestLockExcludesRealProcessesOnALooseLockFile` run four processes on the lock itself, on Linux and on
+Windows.
 
 **The evidence of a fork.** When `--state` finds a fork or a rollback the conflicting note is saved
 beside the state as `<state>.conflict-<size>-<the whole root in 64 hex>` (the state's name is
 shortened above 100 bytes), created exclusively and never through a link. What is saved is the
 note in its canonical form ("What the state holds"), so the same signed note served with any number of
-other signature lines is the same bytes. When a file is already
-at that name its content is compared: the same note is "already saved" (an earlier run saved it),
-**another content is never called saved**: the next name (`-2`, `-3` and so on, 8 in all) is used. If
+other signature lines is the same bytes. The identity of the evidence is the signed text, as for the
+state: when a file is already at that name and holds the **same text**, it is the evidence already saved
+(an earlier run saved it) and the lines of both notes are merged into it, atomically, when the note
+served now has a genuine line that the file lacks (the note says "with fewer signature lines: the file now
+holds the lines of both"); so every subset of the genuine lines of a checkpoint is one file, and a publisher
+without a key cannot use up the names (15 subsets of 4 keys gave 8 files and 7 times status 4 before:
+L12-03). **Another text is never called saved**: a file with other content (another note, a file somebody
+put there, a write that was cut short) takes the next name (`-2`, `-3` and so on, 8 in all), which only a
+text that was really signed with the same size and root can reach (extension lines differ). The number of
+evidence files is bounded by the number of checkpoints that the log ever signed, one for each that is
+replayed as a rollback, and not by anything a party without a key chooses; the program does not count them,
+because a limit would be a way to force status 4. If
 none can be used or the disk refuses, the output says `was NOT saved`, `--json` has
 `info.state.evidence_saved` false and `conflict_file` null, the finding is printed as for a fork,
 and the status is **4**, which is not 0 and is not the 1 of the fork itself: act on the fork and
 save the note you were shown yourself. **The note is in the output** (L10-09): a note line with the
 base64 of its exact bytes (decode it into a file), and `info.state.note_base64` in `--json`.
 
-**Checkpoints you hold** (`--state`, `--old FILE`; design correction 17). A checkpoint you kept is
+**Checkpoints you hold** (`--state`, `--old FILE`; design corrections 17 and 60). A checkpoint you kept is
 a statement about the past, so it is judged differently from a checkpoint under test, and the same
-way in both commands: at least one signature must verify against a key of the trust file (a line that
-names a key of the file and does not verify is ignored, and the output says how many: the note is
-judged by the signatures that verify, "What the state holds"); a **revoked** key's signature is not accepted; a key limited by
-`max_tree_size` counts only up to its size; the **validity window is not applied** (a note signed by a
-key since retired by `not_after`, or not yet valid, stays usable, and a note says so). Retiring a key
-by `not_after` therefore does not make you discard your state. Anything else (not signed by a key you
-trust, malformed, another log, a revoked key, beyond a key's limit) is **status 2** in both commands,
-never 1: the thing you hold cannot serve as your anchor. When the cause is a revoked key, a size beyond
-a key's limit or a changed trust file, the message does **not** say to delete the state (with no
-state a rollback is no longer noticed). It says to keep the file, obtain a checkpoint of the log
-signed by a key you trust from a source you trust, and run `checkpoint --state NEWFILE --min-size N`
-with N the size you believe the log had (the old note says what it claims, which nothing
-authenticates), and to use NEWFILE from then on. What trusting the record costs: whoever can write your
-state file can also delete it or put an older genuine checkpoint in it, which weakens the protection
-the same way; they cannot make a revoked key's note acceptable.
-A key that leaked should be marked `revoked`; `not_after` is only as good as the clock.
+way in both commands for a state file:
+
+- at least one signature line must verify against a key of the trust file, **whatever the standing of
+  that key now** (a line that names a key of the file and does not verify is ignored, and the output says
+  how many: the note is judged by the signatures that verify, "What the state holds");
+- the text decides, not the lines that were served with it. A state whose verifying keys are **all revoked
+  or beyond their `max_tree_size`** is still your anchor, in `checkpoint --state` and in
+  `consistency --old STATE`: the output says `rests only on keys that the trust file no longer counts`, names
+  each key and why, and lists as not proved that the checkpoint it held was genuine; a smaller size is a
+  rollback and a root that does not extend it is a fork as ever, and the first checkpoint that extends it and
+  is signed by a key that counts replaces it. This is the answer to the question of what a revocation does to a
+  state you already hold: it does not make it unknown. (Before this round it was refused, which let a
+  publisher decide it: a note signed by two keys that was served with the line of one of them left a state
+  that held only that key, and after that key was revoked every run ended with status 2, where the whole
+  note would have left a state that worked: L12-01.) A plain note given as `--old FILE` is not a record of
+  what you verified when the key was good, so it keeps the strict reading: a revoked key, or a size beyond a
+  key's limit, makes it status 2;
+- the **validity window is not applied** (a note signed by a key since retired by `not_after`, or not yet
+  valid, stays usable, and a note says so). Retiring a key by `not_after` therefore does not make you discard
+  your state.
+
+Anything else (not signed by any key of the file, which includes a key that was deleted from the file,
+malformed, another log) is **status 2** in both commands, never 1: the thing you hold cannot serve as your
+anchor. The message does **not** say to delete the state (with no state a rollback is no longer noticed).
+It says to keep the file, obtain a checkpoint of the log signed by a key you trust from a source you trust,
+and run `checkpoint --state NEWFILE --min-size N` with N the size you believe the log had (the old note says
+what it claims, which nothing authenticates), and to use NEWFILE from then on. That command is the rebase:
+it records the first checkpoint of NEWFILE without a comparison, refuses one smaller than N, and from then on
+NEWFILE catches a rollback. What trusting the record costs: whoever can write your state file can also delete
+it or put an older genuine checkpoint in it, which weakens the protection the same way. A key that leaked
+should be marked `revoked`; `not_after` is only as good as the clock.
 
 **`consistency`** checks that the log at the new checkpoint (`--new`, default
 the checkpoint in `--source`) extends the log at the old one (`--old`: a note
@@ -698,6 +815,8 @@ the shape of the input. **Memory is a constant plus a small multiple of the larg
 | A trust file's members | 16 keys, 1,024 client keys, 32 time-stamp roots, 200 bytes in a label, 1 MiB in all |
 | A source directory, a digest directory | 1,024 entries |
 | JSON, every file | nesting 32; 16,384 values in a document (a proof counts the elements of `chain` one by one, not together); 1,024 members in an object; 256 bytes in a key; 64 KiB in a string as written (a `send_hex` of a columns file may be 16 MiB); 64 characters in a number; 65,536 characters of white space in a row |
+| One element of a proof's `chain` | **4,096 bytes**, white space included, checked token by token while it is read: a block header is at most about 355 bytes compact and 450 indented (seven members, three hashes of 64 hex characters, three numbers), so the limit is a factor of ten above what any program writes; a larger element is `FAILED at step parse`, refused before it has been held (L12-05) |
+| A proof outside its `chain` | 1 MiB (an honest proof outside the chain is under 20 KiB: two paths of at most 64 hashes, one header, a few numbers and names), checked the same way |
 | A proof's `chain` | read element by element, **no header is kept** (below): the file is read twice, once to check every element and drop it, once to walk from the block of the row to the digest holding one header, and the SHA-256 of the two readings must be equal |
 
 What the JSON reader does about each: a document that exceeds a limit is refused at the first
@@ -725,15 +844,17 @@ time: a proof is read twice, about 22 seconds for the 1.06 GB proof of a row of 
 size that is refused; a file that does not end is read until the disk does.
 
 Measured on Linux, peak resident set of a child process (VmHWM; a run of `version` is 6 MiB),
-the worst of nine hostile shapes (zeros in an array, a nesting of 16 million, a million members, a
+the worst of ten hostile shapes (zeros in an array, a nesting of 16 million, a million members, a
 million equal keys, one string of the whole file, a file of white space or of newlines, and a file
-of `{}` lines) for each command that reads a file, at the largest size the command accepts and at 16 MiB:
+of `{}` lines, and one element of a proof's chain made of strings of 65,000 bytes) for each command that reads a file, at the largest size the command accepts and at 16 MiB:
 
 | Command and file | Peak resident set |
 |---|---|
 | `proof --proof` (16 MiB) | 13 MiB (it was 29 MiB) |
 | `proof --proof`, a valid proof with 60,009 headers (20 MB, refused by the old cap) | 11 MiB (refused before) |
 | `proof --proof`, a valid proof of **a row one year old at one block in 10 seconds**: 3,153,600 headers, 1,061,653,051 bytes | **12.6 MiB**, 22 seconds (two runs: 12,912 and 12,544 KiB, `/usr/bin/time -v`) |
+| `proof --proof`, **one element of the chain that holds 3,000 strings of 65,000 bytes** (a file of 195 MB; the shape of L12-05, a file of 1,040,064,023 bytes with 16,000 of them held 1,036,732 KiB before) | **5 MiB** (5,084 KiB), refused in under 10 ms at the first 4 KiB of the element (before: 198,844 KiB) |
+| `proof --proof`, 3,000 members of 65,000 bytes beside the chain (195 MB) | **6 MiB** (6,048 KiB), refused after the first 1 MiB outside the chain (before: 71,932 KiB, refused at the 1,025th member) |
 | `proof --digest`, `digest-chain` (64 KiB; 16 MiB is refused unread, 6 MiB) | 14 MiB |
 | `row-hash --columns` (16 MiB, the worst case is one string of the whole file) | 72 MiB |
 | `blocks --blocks` (16 MiB of lines) | 8 MiB |
@@ -821,6 +942,7 @@ Run one with `go test ./internal/proof -run '^$' -fuzz '^FuzzVerify$' -fuzztime 
 | `internal/rowfile` | the columns file of `row-hash` |
 | `internal/safefile` | the one way every file is opened: never blocking, regular files only, bounded size, no link below a source directory |
 | `internal/statefile` | the state file: lock, atomic replace with a crash test, link resolution, the place for conflicting evidence |
+| `internal/stdio` | tells the null device that the runtime puts in place of a closed standard output from the one the user asked for |
 | `internal/cli` | the command line (`cmd/kingres-verify` is a thin `main`) |
 
 ## Decisions where the documentation is silent
@@ -1170,7 +1292,7 @@ of the tree). The design has the decisions as corrections 40 and later.
 Changes of interface that a caller can see: status 2 for a result that could not be written (before: 0);
 no size limit on `--proof` and `--blocks` (before 16 MiB and 1 GiB, status 2 or 1 for a larger file);
 `checkpoint --state` refuses a path with a component another user can change (before: only the
-last directory), and the lock file is replaced when it is not private; the state and the evidence file
+last directory), and the lock file is replaced when it is not private (withdrawn in L12-02: it let two runs hold the lock together); the state and the evidence file
 hold the canonical note (before: the note as served), a held note ignores lines that do not verify
 (before: status 2); a note line `the note to keep ...` and `info.state.note_base64` on status 4; the
 notes `the note as served has N signature line(s) that were not counted ...`, `... has N signature line(s)
@@ -1210,3 +1332,71 @@ of the lock, the constants of the loop that replaces a lock file (an extra attem
 already replaced, the error paths of `writeAndSync` and of the removal of a half written evidence file
 (they need a file system that fails a write), the `consistency` error that `applyState` never sees, and
 the test-only hook `traceExit`.
+
+## Findings of the review of the fourth fixes (L12) and what was changed
+
+The review (`kingres/docs/reviews/2026-11-17-kingres-verifier-fourth-fixes.md`) confirmed that nothing
+unverified was accepted and that the state never moved backwards, and found that a party without a key
+still had a choice that mattered: which of the genuine signature lines of a note the auditor saw. The
+standard of this round: nobody who holds no trusted key can bring the auditor's state into a condition from
+which the protection is lost or from which no later run can go on, or decide the exit status of a run by
+something no signature covers.
+
+| Finding | What was changed | Where it is described |
+|---|---|---|
+| L12-01 the publisher chooses the key a state rests on | the identity of a checkpoint is its signed text; the state keeps the union of every line that verifies under any key of the file; a held state is usable while its text verified under a key of the file, whatever the key became (a state on a revoked key is flagged and used as the stricter anchor) | "What the state holds", "Checkpoints you hold" |
+| L12-03 subsets of lines force status 4 | evidence is one file per signed text, extended with the lines of the same text; no limit that a party could use up | "The evidence of a fork" |
+| L12-02 two holders of one lock | a lock file is never removed or replaced: locked first, mode tightened in place with `fchmod`, a foreign owner refused; the name is looked at again after the lock; the write refuses to replace a state that is not the one that was read | "What the lock does and does not protect" |
+| L12-04 closed standard output | a standard output that is the null device opened for reading and writing is refused with status 2 | "The standard output" |
+| L12-05 one element of 1 GiB | one element of a proof's chain is at most 4,096 bytes, what is outside the chain at most 1 MiB, checked while reading | "Limits and memory" |
+| L12-06 `..` after a link in a relative `--state` | the name is not cleaned before the link is followed, in the check and in the name used | "Where the state may be" |
+| L12-07 the cut is before the escape | the README says so | "Text from the inputs is escaped" |
+| L12-08 guards that cannot fail | the nesting limit is a literal 32 in its test; a lock file of mode 0640 is tightened and tested; the read-back guard is reached through a seam and tested | tests |
+| L12-09, L12-10 | said in "The standard output" (a reader that cuts the output); the order of the verdict and the state write is left as it was, see below | below |
+
+**Interface changes a caller can see.**
+
+- `checkpoint --state` and `consistency --old STATE` with a state whose verifying keys are all revoked or
+  beyond their `max_tree_size`: **status 0 and a note, where it was status 2**. The output says `rests only
+  on keys that the trust file no longer counts` and lists as not proved that the held checkpoint was
+  genuine; a plain note as `--old FILE` keeps status 2. A state that no key of the file verifies (a key was
+  deleted from the file) is status 2 as before, and its message names `checkpoint --state NEWFILE
+  --min-size N`.
+- A new value of `info.state.action`: `signatures_added` (the same checkpoint, more genuine lines, the state
+  was rewritten). `unchanged` is as before and means the file was not touched.
+- The state and the evidence files hold the lines that verify under any key of the file, counted or not
+  (before: the counted ones). The note `the note as served has N signature line(s) that were not counted`
+  now says `(they verify under no key of the trust file)`.
+- An evidence file that exists for the same text is extended in place (atomically) with the lines of the
+  note served; the note says so. The name is as before.
+- A lock file of another owner is refused (status 2, the command to remove it by hand); a lock file with
+  group or other access is kept and tightened (before: removed and made again).
+- A state that changed between the read and the write is not overwritten: status 2, `wrote nothing`.
+- A standard output that is the null device opened for reading and writing is status 2 on every command, with
+  a line on the standard error (before: status 0 and no output); `>/dev/null` is unchanged.
+- A proof element of more than 4,096 bytes, or more than 1 MiB of a proof outside its chain, is `FAILED at
+  step parse` (status 1), where it was held in memory whole.
+- A relative `--state sl/../s` with `sl` a link goes to the parent of the target, as the system takes it;
+  before it went to `./s`.
+- No new flag, no new exit status, no new file name. The table of exit statuses is unchanged and is still
+  derived from the source (the sites of `applyState` were renumbered and two reached through a test seam).
+
+**States written by earlier versions** are read: a state that holds the note as served, or only the lines of
+the keys that counted, is used as it is; it is rewritten (canonical, with the union) when it advances or when
+a note of the same text brings a line it lacks, and is not touched otherwise. A state written by this version
+is read by the previous one when a key that counted still counts, and is refused by it, with its advice to
+rebase, only when that was already so.
+
+**What is left.** Deleting from the trust file every key whose line a state holds still makes the state
+unreadable, with the rebase as the way on (see "The one way left ..."): to be readable without a key a state
+would have to be believed without its signature, which was not decided. The few microseconds between the last
+read of the state and the rename are open for a writer that ignores the lock. The status of a run that cannot
+write its verdict after it moved the state is 2 and the state stays moved (L12-10): the standard error says so;
+writing the verdict first would not be better, since then a verdict could be shown for a state that was not
+written. The property tests run with a trust file of 4 keys and with one of 16 (the most it may hold), and two epochs of
+one chain have a test of their own (`TestTwoEpochsKeepTheirOwnState`). The swap loops against the path check and against the proof file were run with one
+account (`TestStateDirectorySwapped...`, `TestProofFileSwapped...`): they show that a state written through
+a link that is swapped between private directories stays coherent and that a proof that changes between its
+two readings is refused with that reason, and not that a second account cannot do more; the check needs a
+swapper that may change a component the walk required to be owned by the auditor or by root, which one
+account is.

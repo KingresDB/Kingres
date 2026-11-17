@@ -204,18 +204,24 @@ func TestHeldNoteMessagesNameTheCause(t *testing.T) {
 	publishNote(t, root, all, 700, signedBy(700, all, []signer{k2}))
 	fp16 := func(s signer) string { return s.fp()[:16] }
 
-	// the only key that signed the state is revoked: the cause, the size it claims, the fingerprint
+	// the only key that signed the state is revoked: the state is still the anchor
+	// (L12-01), and the output names the cause, the fingerprint, and what it does
+	// not show
 	revoked := trustOf(t, keySpec{"k1", k1, `,"revoked":true`}, keySpec{"k2", k2, ""})
-	code, out, errs := run(t, stateArgs(revoked, root, state)...)
-	for _, want := range []string{"is revoked in the trust file, so its signatures are not evidence", "the note claims 300", "(" + fp16(k1) + ")", "--min-size", "must not be deleted"} {
-		if code != 2 || !strings.Contains(errs, want) {
+	state2 := filepath.Join(t.TempDir(), "state")
+	if err := os.WriteFile(state2, []byte(fileText(t, state)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, out, errs := run(t, stateArgs(revoked, root, state2)...)
+	for _, want := range []string{"is revoked in the trust file, so its signatures are not evidence", "(" + fp16(k1) + ")", "rests only on keys that the trust file no longer counts", "that the checkpoint the state file held was genuine"} {
+		if code != 0 || !strings.Contains(out, want) {
 			t.Errorf("a revoked signer, want %q: %d\n%s%s", want, code, out, errs)
 		}
 	}
-	// no key of the file signed it at all
+	// no key of the file signed it at all: refused, with the advice that keeps the size
 	other := trustOf(t, keySpec{"k2", k2, ""})
 	code, _, errs = run(t, stateArgs(other, root, state)...)
-	if code != 2 || !strings.Contains(errs, "has no signature of a key of the trust file that verifies") || strings.Contains(errs, "the note claims") || !strings.Contains(errs, "must not be deleted") {
+	if code != 2 || !strings.Contains(errs, "has no signature of a key of the trust file that verifies") || strings.Contains(errs, "the note claims") || !strings.Contains(errs, "must not be deleted") || !strings.Contains(errs, "--min-size") {
 		t.Errorf("no key signed it: %d\n%s", code, errs)
 	}
 	// a note that names a revoked key and a valid one: the revoked one is named, with its fingerprint, and a key of the file that is not on the note is not named
@@ -237,7 +243,7 @@ func TestHeldNoteMessagesNameTheCause(t *testing.T) {
 	// what was dropped is counted: two lines that were not counted, one that verified
 	publishNote(t, root, all, 700, signedBy(700, all, []signer{k2}, third, junkLine(logOrigin(), newSigner(78))))
 	code, o = jsonOf(t, stateArgs(three, root, filepath.Join(t.TempDir(), "s"))...)
-	if code != 0 || !strings.Contains(listOf(o, "notes"), "the note as served has 2 signature line(s) that were not counted: the state and any saved evidence keep only the 1 that verified") {
+	if code != 0 || !strings.Contains(listOf(o, "notes"), "the note as served has 2 signature line(s) that were not counted (they verify under no key of the trust file): the state and any saved evidence keep only the 1 that verify (counted or not)") {
 		t.Errorf("the count of lines that were not stored: %d\n%s", code, listOf(o, "notes"))
 	}
 }
