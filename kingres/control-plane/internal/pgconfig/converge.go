@@ -15,6 +15,8 @@ import (
 const (
 	convergeEvery = 30 * time.Second
 	retryAfter    = time.Minute
+	// maxRetryAfter is the longest wait between two attempts for a server that keeps failing (ST-08).
+	maxRetryAfter = 10 * time.Minute
 )
 
 // Run is the leader's loop that brings servers up to date. A server that was down during a change
@@ -67,10 +69,15 @@ func (l *Leader) Run(ctx context.Context) {
 			// The wait between two attempts is for an attempt that did not work: a server that is behind
 			// a configuration that was not tried yet (its group changed since) is brought up to date at once.
 			h := HashOf(text)
-			if p, ok := last[s.ID]; ok && p.hash == h && time.Since(p.at) < retryAfter {
+			p, seen := last[s.ID]
+			if seen && p.hash == h && time.Since(p.at) < retryWait(p.tries) {
 				continue
 			}
-			last[s.ID] = attempt{at: time.Now(), hash: h}
+			tries := 1
+			if seen && p.hash == h {
+				tries = p.tries + 1
+			}
+			last[s.ID] = attempt{at: time.Now(), hash: h, tries: tries}
 			need = append(need, s.ID)
 		}
 		if len(need) == 0 {
@@ -87,4 +94,20 @@ func (l *Leader) Run(ctx context.Context) {
 type attempt struct {
 	at   time.Time
 	hash string
+	// tries counts the attempts made for this configuration without the server ever being seen up to date.
+	tries int
+}
+
+// retryWait is the wait before the next attempt for a server that was tried tries times for the same
+// configuration and is still not up to date: one minute, then twice as long each time, at most ten minutes
+// (ST-08: a server that can never apply the configuration must not cost a task every minute).
+func retryWait(tries int) time.Duration {
+	d := retryAfter
+	for i := 1; i < tries && d < maxRetryAfter; i++ {
+		d *= 2
+	}
+	if d > maxRetryAfter {
+		d = maxRetryAfter
+	}
+	return d
 }

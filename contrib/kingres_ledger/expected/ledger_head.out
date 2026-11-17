@@ -632,7 +632,7 @@ UPDATE kingres.ledger_digest SET block_hash = sha256('not the block');
 \c
 SET search_path = public;
 SELECT * FROM kingres.ledger_head();
-ERROR:  block 4 is not the block that digest 2 in kingres.ledger_digest names
+ERROR:  block 4 is not the block that digest 1 in kingres.ledger_digest names
 :trig_off;
 \c
 SET search_path = public;

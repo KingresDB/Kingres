@@ -510,7 +510,8 @@ Four failures that showed only in a complete run on a loaded machine led to thes
   go through `auth.Retrying`: an unreachable instance (`ErrUnavailable`) is asked again with a growing pause for up
   to 10 s (`auth.DefaultUnavailableWait`), shorter than the request timeout. An answer (`ErrInvalidCredentials`) is
   never retried, and after the wait the request is still refused with 503 and `Retry-After`: a role that cannot be
-  checked fails closed, only the wait is new. The internal API asks the catalog about the caller's membership for
+  checked fails closed, only the wait is new. The join call of the internal API (reachable without a client certificate) lets at most 8 callers wait at
+  the same time (`auth.RetryingLimited`, ST-10); the others get 503 at once. The internal API asks the catalog about the caller's membership for
   up to 5 s before it answers 503 `unavailable`, so a follower's certificate renewal does not see a leader whose
   own instance restarts for a moment as "the manager leader answered 503".
 - **No sign-in against an instance that is about to be stopped.** `lease.Manager.Confirming` is true while an
@@ -526,7 +527,8 @@ Four failures that showed only in a complete run on a loaded machine led to thes
 - **A server that is behind a configuration not tried yet is brought up to date at once.** The leader's loop that brings servers up to date
   waits a minute between two attempts for one server; the wait now applies to a repeat of an attempt at the same configuration (by its hash)
   that was not seen to work: a server that is seen up to date is forgotten, so one whose group changed a minute after an earlier catch-up is not left behind. Found by
-  running `TestConfigServerGroupAndServerLevels` several times against one cluster.
+  running `TestConfigServerGroupAndServerLevels` several times against one cluster. A server that keeps failing is tried again after one minute, then two,
+  four and eight, at most ten minutes (`retryWait`, review ST-08); the task list is not pruned (open).
 - **One start or stop of an instance at a time.** The restart of a standby failed after 60 s with `pg_ctl stop: server does not shut
   down` although the instance had shut down and was running again: `pg_ctl stop -w` waits until the pid file is gone, and the agent
   of the standbys had started the standby again in the moment it was down, which put a new pid file there. That hang is what made
@@ -2557,9 +2559,10 @@ another holder took over, in the complete runs, showed what the first of them hi
   `TestVoidGuardOfALostLeaseMakesNoCall`).
 - **RBR-05, a move is found by an identity.** Before the call `Backend.Mark` reads the highest move id of the extension; the record of the call is
   the one of the bucket with a higher id. No clock of this process is compared with the extension's. A row left by an earlier holder that never saw
-  its record is found by the time the row was started, read from the system database, and compared with the extension's `started_at`:
-  that is a comparison of the clocks of two servers (the system database is on the leader's server, which need not be the extension's map
-  primary), with no tolerance, and it is not usable across a failover of the map group primary (review ST-05; not changed yet).
+  its record is found by the mark that is kept with the row (migration 0012, `rebalance_move.ext_mark`, written before the call), so that a holder that
+  takes over has it and no clock is compared (review ST-05). Only a row made before the mark was kept is found by the time it was started, with a
+  tolerance of 10 s for the difference of the two clocks. A recovery of a move that is not settled waits as long as its session is alive (the
+  extension's `internal_move_alive`) and for at most `RecoverWait` otherwise (ST-07).
 - **RBR-06, rebalance and failover.** The design of the failover (`kingres/docs/design/ha-phase5-part2.md`, section 4.5) stops the rebalance first,
   because a pending or running rebalance excludes a `server.failover` task (migration 0009) and a rebalance with a stuck move (a dead target) would
   hold an automatic failover back. The rebalance offers what that needs: `Service.StopForFailover(ctx, serverID)` sets the flag of a stop with

@@ -106,6 +106,21 @@
  */
 #define KL_BUILDER_LOCK_SUBID	0x4B4C
 
+/*
+ * The locks that serialise the allocation of the identifiers of the registry
+ * (KL_REGISTRY_LOCK_SUBID: ledger_enable and ledger_register_table),
+ * of the recorded verifications (KL_VERIFY_LOCK_SUBID) and of the records of
+ * removals and manual writes (KL_REMOVED_LOCK_SUBID).  The identifiers of the
+ * recorded digests are taken under the lock of the builders.  Same kind of lock
+ * as the builders' (the extension's own object, a sub-object number that no
+ * statement uses).  Nothing takes an identifier from a sequence: a role that
+ * holds nextval and setval on a sequence (every member of pg_write_all_data
+ * does) could stop the writers by moving it, and no hook sees a call of setval.
+ */
+#define KL_REGISTRY_LOCK_SUBID	0x4B4D
+#define KL_VERIFY_LOCK_SUBID	0x4B4E
+#define KL_REMOVED_LOCK_SUBID	0x4B4F
+
 /* Version of the SQL scripts that this library needs. */
 #define KL_SCRIPT_VERSION		"0.3"
 
@@ -122,6 +137,15 @@ extern int	kl_block_interval;
 
 /* GUC: the longest one worker may run for one database, in ms; 0 = no limit. */
 extern int	kl_worker_timeout;
+
+/*
+ * GUC: how long a role that is not a superuser may hold one of the locks of
+ * the extension (the builders', the registry's, the verifications'), in ms,
+ * counted from the moment it got the lock; 0 = no limit.  A session that is
+ * still in the same transaction when the time is up is ended.  Only a
+ * superuser can change it.
+ */
+extern int	kl_lock_hold_limit;
 
 /* True when the library was loaded through shared_preload_libraries. */
 extern bool kl_preloaded;
@@ -178,6 +202,8 @@ extern Oid	kl_extension_oid(void);
 
 /* write.c: the functions that write the ledger, and the record of a manual write */
 extern void kl_record_manual_insert(Relation rel, HeapTuple tuple);
+extern void kl_lock_extension_object(int subid);
+extern void kl_hold_progress(void);
 
 /* capture.c */
 extern void kl_record_existing_row(int32 table_id, HeapTupleHeader header);

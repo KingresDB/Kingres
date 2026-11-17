@@ -97,8 +97,9 @@ type MoveRow struct {
 	Attempts   int
 	// ExtMoveID is the id of the extension's own record, 0 while unknown.
 	ExtMoveID int64
-	// After is the mark taken before the call (in memory only: a row read from the system database has none).
+	// After is the mark taken before the call, kept with the row (ST-05); Marked says that it is known (0 is a mark).
 	After      int64
+	Marked     bool
 	Phase      string
 	Percent    float64
 	Size       *int64
@@ -145,6 +146,8 @@ type Rows interface {
 	// A move of the same bucket that failed or was skipped before keeps its row.
 	StartMove(ctx context.Context, m Move, fromServer, toServer string, attempts int) (seq int, err error)
 	UpdateMove(ctx context.Context, seq int, extID int64, phase string, percent float64) error
+	// SetMark keeps the mark taken before the call with the row (a holder that takes over needs it).
+	SetMark(ctx context.Context, seq int, mark int64) error
 	FinishMove(ctx context.Context, seq int, state, errText, skipReason string, size *int64) error
 	// UndoStart takes back the record of a start that did not happen (the call was not made, or was
 	// withdrawn before the extension recorded the move): attempts is the number the start used, and the
@@ -662,6 +665,12 @@ func (l *Loop) execute(ctx context.Context, m Move, attempt int) error {
 	if err != nil {
 		return l.notStarted(ctx, seq, attempt, &NotStartedError{err})
 	}
+	if err := l.Rows.SetMark(ctx, seq, after); err != nil {
+		if errors.Is(err, ErrLeaseLost) {
+			return err
+		}
+		return l.notStarted(ctx, seq, attempt, &NotStartedError{err})
+	}
 	ref := Ref{After: after}
 	done := make(chan error, 1)
 	go func() { done <- l.Backend.RunMove(ctx, m, after) }()
@@ -749,7 +758,7 @@ func (l *Loop) finishCall(ctx context.Context, m Move, seq, attempt int, ref Ref
 		} else {
 			l.log().Warn("rebalance: the session of a move ended with an error; asking the extension what became of it", "move", m.Key(), "error", err)
 		}
-		state, text, rerr := l.recoverWatched(rctx, MoveRow{Seq: seq, Move: m, State: MoveRunning, ExtMoveID: ref.ID, After: ref.After, StartedAt: ref.Since})
+		state, text, rerr := l.recoverWatched(rctx, MoveRow{Seq: seq, Move: m, State: MoveRunning, ExtMoveID: ref.ID, After: ref.After, Marked: ref.Since.IsZero(), StartedAt: ref.Since})
 		switch {
 		case errors.Is(rerr, errStopWhileWaiting):
 			return rerr

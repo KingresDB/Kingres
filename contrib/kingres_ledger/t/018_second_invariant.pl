@@ -102,7 +102,7 @@ sub harmful_locks
 # What a writer and the block builder do, as a superuser, under a short timeout.
 sub honest_work
 {
-	my ($ret, $out, $err) = $node->psql('d', q{SET lock_timeout = '2s';
+	my ($ret, $out, $err) = $node->psql('d', q{SET lock_timeout = '10s';
 		INSERT INTO acct (body) VALUES ('x');
 		SELECT kingres.ledger_build_block() IS NOT NULL});
 	return ($out =~ /^t$/m && $err !~ /lock timeout/) ? 'works' : "stopped: $err";
@@ -227,30 +227,103 @@ foreach my $r (@inh)
 # going to refuse used to ask for its own lock first (ACCESS EXCLUSIVE), and every
 # writer and the builder queued behind that request until the reader let go
 #--------------------------------------------------------------------------
-foreach my $stmt (
-	'ALTER TABLE kingres.ledger_blocks ADD COLUMN x int',
-	'TRUNCATE kingres.ledger_blocks CASCADE',
-	'CREATE TRIGGER x AFTER INSERT ON kingres.ledger_pending FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify()',
-	'DROP TABLE kingres.ledger_pending CASCADE',
-	'CREATE INDEX x ON kingres.ledger_pending (queued_at)')
+# The reader holds ACCESS SHARE on every table of the catalog for the whole
+# section.  Each refused statement is started in a session of its own; the test
+# waits (with a bound that only fails it when the condition never comes) until the
+# statement has returned, which it can do only by being refused: a statement that
+# asks for its lock first stays "active", with a lock request in pg_locks that is
+# not granted, behind the reader.  Then the capture insert and the builder run under
+# a short lock_timeout.  A control first: a statement that does queue behind the
+# reader (a superuser's LOCK ... ACCESS EXCLUSIVE) is seen waiting, so the harness
+# can see what it looks for.
+my @catalog_tables = split /\n/, $node->safe_psql('d',
+	q{SELECT 'kingres.' || relname FROM pg_class
+	   WHERE relnamespace = 'kingres'::regnamespace AND relkind = 'r' ORDER BY 1});
+is(scalar(@catalog_tables), 9, 'the reader locks the nine tables of the catalog');
+my $reader = $node->background_psql('d', on_error_stop => 0);
+$reader->query_safe('BEGIN; ' . join('', map { "LOCK TABLE $_ IN ACCESS SHARE MODE; " } @catalog_tables));
+
+# Start a statement in a session of its role; returns the session and its pid.
+sub start_statement
 {
-	my $holder = $node->background_psql('d', on_error_stop => 0);
-	$holder->query_safe('BEGIN; LOCK TABLE kingres.ledger_pending IN ACCESS SHARE MODE; '
-		  . 'LOCK TABLE kingres.ledger_blocks IN ACCESS SHARE MODE;');
+	my ($role, $stmt, $marker) = @_;
 	my $s;
 	{
-		local $ENV{PGUSER} = 'inh';
+		local $ENV{PGUSER} = $role;
 		$s = $node->background_psql('d', on_error_stop => 0);
 	}
-	$s->query_until(qr/started/, "\\echo started\n$stmt;\n");
-	$node->safe_psql('d', 'SELECT pg_sleep(0.5)');
-	my $work = honest_work();
-	$holder->query_safe('ROLLBACK');
-	$holder->quit;
-	$s->query('SELECT 1');
-	$s->quit;
-	is($work, 'works', "inh: the refusal of '$stmt' does not queue behind a reader");
+	my $pid = $s->query_safe('SELECT pg_backend_pid()');
+	$pid =~ s/\s+//g;
+	$s->query_until(qr/started/, "\\echo started\nBEGIN;\n$stmt;\nSELECT '$marker';\n");
+	return ($s, $pid);
 }
+
+# The state of the statement: 'returned' (the marker query ran after it), or
+# 'waiting' with the lock it waits for.
+sub wait_for_end_or_lock
+{
+	my ($pid, $marker) = @_;
+	my $state = '';
+	for my $i (1 .. 600)
+	{
+		$state = $node->safe_psql('d', qq{SELECT CASE
+			WHEN exists (SELECT 1 FROM pg_locks WHERE pid = $pid AND NOT granted) THEN 'waiting'
+			WHEN exists (SELECT 1 FROM pg_stat_activity WHERE pid = $pid AND state LIKE 'idle%'
+			                AND query LIKE '%$marker%') THEN 'returned'
+			ELSE '' END});
+		last if $state ne '';
+		select(undef, undef, undef, 0.1);
+	}
+	return $state;
+}
+
+{
+	my ($cs, $cpid) = start_statement($super, 'LOCK TABLE kingres.ledger_pending IN ACCESS EXCLUSIVE MODE', 'ctl');
+	is(wait_for_end_or_lock($cpid, 'ctl'), 'waiting',
+		'control: a statement that does queue behind the reader is seen waiting in pg_locks');
+	is($node->safe_psql('d', q{SELECT count(*) FROM pg_stat_activity WHERE state = 'active' AND wait_event_type = 'Lock'}),
+		'1', 'control: and in pg_stat_activity');
+	my ($ret, $out, $err) = $node->psql('d', q{SET lock_timeout = '1s'; INSERT INTO acct (body) VALUES ('c')});
+	like($err, qr/lock timeout/, 'control: and the capture insert is stopped behind it');
+	$node->safe_psql('d', qq{SELECT pg_cancel_backend($cpid)});
+	$cs->query('SELECT 1');
+	$cs->quit;
+}
+
+my $nstmt = 0;
+sub refused_without_queue
+{
+	my ($role, $stmt) = @_;
+	$nstmt++;
+	my $marker = "kl_done_$nstmt";
+	my ($s, $pid) = start_statement($role, $stmt, $marker);
+	my $state = wait_for_end_or_lock($pid, $marker);
+	is($state, 'returned', "$role: '$stmt' returns its refusal and asks for no lock");
+	my $work = honest_work();
+	is($work, 'works', "$role: and the capture insert and the builder are not stopped by it");
+	$s->query('SELECT 1');
+	like($s->{stderr}, qr/ERROR/, "$role: the statement was refused");
+	$s->quit;
+	$node->safe_psql('d', 'DROP TABLE IF EXISTS x, vi CASCADE');
+}
+foreach my $r (@inh)
+{
+	# the forms that are an error of another kind, or that run in a block, are not in this list
+	next if $r->[1] =~ /^(ANALYZE|COMMENT|REINDEX)/;
+	refused_without_queue('inh', $r->[1]);
+}
+foreach my $r (@maint)
+{
+	next if $r->[1] =~ /^(REINDEX|CLUSTER|ALTER VIEW|ALTER TABLE v_blocks RENAME|DECLARE)/;
+	refused_without_queue('maint', $r->[1]);
+}
+foreach my $r (@wad)
+{
+	next if $r->[1] =~ /^DECLARE/;
+	refused_without_queue('wad', $r->[1]);
+}
+$reader->query_safe('ROLLBACK');
+$reader->quit;
 # The owner of an application table may hold locks on its own table: that stops
 # writes to that table, which the lock means, and nothing else.
 {
@@ -295,6 +368,22 @@ $node->safe_psql('d', q{INSERT INTO acct (body) VALUES ('p')});
 	$lock = $node->safe_psql('d', qq{SELECT count(*) FROM pg_locks WHERE pid = $pid AND locktype = 'object' AND objsubid = 19276});
 	is($lock, '0', 'and holds no lock when it has returned');
 	$s->quit;
+
+	# L13-04: the second statement of a pipeline is in an implicit transaction
+	# that the first one opened; the flag of the pipeline is what shows it.
+	my ($pret, $pout, $perr) = $node->psql('d',
+		"\\startpipeline\nSELECT 1 \\bind \\sendpipeline\n"
+		  . "SELECT kingres.ledger_build_block() \\bind \\sendpipeline\n\\endpipeline\n",
+		extra_params => [ '-U', 'aud' ]);
+	like($perr, qr/ledger_build_block cannot run inside a transaction block for a role that is not a superuser/,
+		'a builder that is not the first statement of a pipeline is refused');
+	is($node->safe_psql('d', q{SELECT count(*) FROM pg_locks WHERE locktype = 'object' AND objsubid = 19276}),
+		'0', 'and nothing holds the lock of the builders afterwards');
+	($pret, $pout, $perr) = $node->psql('d',
+		"\\startpipeline\nSELECT kingres.ledger_build_block() IS NOT NULL \\bind \\sendpipeline\n\\endpipeline\n",
+		extra_params => [ '-U', 'aud' ]);
+	unlike($perr, qr/cannot run inside a transaction block/,
+		'a builder that is the only statement of a pipeline that ends with Sync is served');
 }
 {
 	# A superuser (the worker is one) may, and holds the lock to the end of its

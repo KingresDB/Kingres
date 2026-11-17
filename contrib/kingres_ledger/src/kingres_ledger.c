@@ -58,6 +58,9 @@ int			kl_worker_timeout = 60000;
 /* GUC: how far the previous block may be ahead of the clock, in ms; 0 = no limit. */
 int			kl_max_clock_skew = 3600000;
 
+/* GUC: how long a role that is not a superuser may hold a lock of the extension, in ms; 0 = no limit. */
+int			kl_lock_hold_limit = 60000;
+
 /* Set in _PG_init when loaded through shared_preload_libraries. */
 bool		kl_preloaded = false;
 
@@ -113,6 +116,19 @@ _PG_init(void)
 							"The builder refuses to build a block whose predecessor was closed later than this; the chain keeps block times that never go back, so a block closed in the future would otherwise give its time to every later block. 0 means no limit.",
 							&kl_max_clock_skew,
 							3600000,
+							0,
+							2147483647,
+							PGC_SUSET,
+							GUC_UNIT_MS,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("kingres_ledger.lock_hold_limit",
+							"How long a role that is not a superuser may hold a lock of the ledger.",
+							"The block builders, ledger_enable and ledger_verify_recorded hold a lock of the extension until the end of the transaction of the caller. A session of a role that is not a superuser that is still in that transaction this long after it got the lock is ended, so that no such role can stop the builders, or the capture that depends on them, for longer than the administrator allows. The setting cannot be changed by the role it limits. 0 means no limit.",
+							&kl_lock_hold_limit,
+							60000,
 							0,
 							2147483647,
 							PGC_SUSET,
@@ -202,6 +218,8 @@ kl_check_owner(Oid relid)
  *		The ownership is checked before the lock is requested, so a role that
  *		does not own the table cannot make anybody wait, and again after the
  *		lock is granted, because the owner may have changed while waiting.
+ *		Then it takes the lock of the registry (see below), under which
+ *		ledger_enable takes the next identifier of the table.
  */
 Datum
 kingres_ledger_lock_table(PG_FUNCTION_ARGS)
@@ -211,5 +229,15 @@ kingres_ledger_lock_table(PG_FUNCTION_ARGS)
 	kl_check_owner(relid);
 	LockRelationOid(relid, ShareRowExclusiveLock);
 	kl_check_owner(relid);
+
+	/*
+	 * The identifier of the table is the next free one of the registry, taken
+	 * under this lock (ledger_enable, and ledger_register_table which checks
+	 * it); no sequence is read.  The lock comes after the table lock, never
+	 * before: a role that holds a lock on its own table and calls
+	 * ledger_enable from another session would otherwise hold this lock while
+	 * it waits for itself.
+	 */
+	kl_lock_extension_object(KL_REGISTRY_LOCK_SUBID);
 	PG_RETURN_VOID();
 }

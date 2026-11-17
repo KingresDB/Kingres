@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 )
 
@@ -28,9 +29,22 @@ func Retrying(a Authenticator, wait time.Duration) Authenticator {
 	return &retrying{a: a, wait: wait}
 }
 
+// RetryingLimited is Retrying with a bound on the callers that wait at the same time: while maxWaiting callers
+// are already waiting for an instance that cannot be reached, another one is answered ErrUnavailable at once
+// (ST-10: a caller that is not authenticated, such as a join request, must not hold a goroutine and a socket
+// for the whole wait, as many as it can open).
+func RetryingLimited(a Authenticator, wait time.Duration, maxWaiting int) Authenticator {
+	r := Retrying(a, wait).(*retrying)
+	r.maxWaiting = int32(maxWaiting)
+	return r
+}
+
 type retrying struct {
-	a    Authenticator
-	wait time.Duration
+	a Authenticator
+	// maxWaiting bounds the callers that wait at once (0: no bound); waiting counts them.
+	maxWaiting int32
+	waiting    atomic.Int32
+	wait       time.Duration
 }
 
 func (r *retrying) Authenticate(ctx context.Context, username, password string) ([]string, error) {
@@ -48,10 +62,19 @@ func (r *retrying) CurrentRoles(ctx context.Context, username string) ([]string,
 func (r *retrying) do(ctx context.Context, f func() error) error {
 	deadline := time.Now().Add(r.wait)
 	pause := 200 * time.Millisecond
+	counted := false
 	for {
 		err := f()
 		if err == nil || !errors.Is(err, ErrUnavailable) || ctx.Err() != nil {
 			return err
+		}
+		if !counted && r.maxWaiting > 0 {
+			if r.waiting.Add(1) > r.maxWaiting {
+				r.waiting.Add(-1)
+				return err
+			}
+			counted = true
+			defer r.waiting.Add(-1)
 		}
 		if time.Now().Add(pause).After(deadline) {
 			return err

@@ -188,7 +188,7 @@ $node->safe_psql('lk', q{
 	INSERT INTO docs VALUES (1, 'a');
 });
 $node->safe_psql('lk', 'CREATE SEQUENCE docs_seq START 100');
-my $honest = q{SET lock_timeout = '3s';
+my $honest = q{SET lock_timeout = '60s';
 	INSERT INTO docs VALUES (nextval('docs_seq'), 'x');
 	SELECT kingres.ledger_build_block() IS NOT NULL};
 foreach my $mode ('ROW SHARE', 'ROW EXCLUSIVE', 'SHARE UPDATE EXCLUSIVE', 'SHARE ROW EXCLUSIVE')
@@ -333,6 +333,30 @@ like(err_of('ss', 'CREATE EXTENSION kl_evil'), qr/cannot write to table "ledger_
 	'the script of another extension cannot write the ledger tables');
 is($node->safe_psql('ss', q{SELECT count(*) FROM pg_extension WHERE extname = 'kl_evil'}), '0',
 	'and the extension was not created');
+# L13-04: and its script may not drop the ledger either.  The object access hook
+# lets the statements of the extension's own script through, and only those: the
+# test is "the script that runs is the script of this extension", not "a script
+# runs".  A second extension whose script drops a ledger object, in a database
+# where a table is under ledger control, is refused, and the drop of the language
+# that the ledger functions are written in (which would take every event trigger
+# of the ledger with it) is one.
+foreach my $drop ('DROP EXTENSION plpgsql CASCADE', 'DROP FUNCTION kingres.ledger_head()',
+	'DROP TABLE kingres.ledger_blocks CASCADE')
+{
+	my $name = 'kl_evil_drop';
+	append_to_file("$extdir/extension/$name.control",
+		"comment = 'a second extension that drops'\ndefault_version = '1.0'\nrelocatable = true\n");
+	append_to_file("$extdir/extension/$name--1.0.sql", "$drop;\n");
+	like(err_of('lk', "CREATE EXTENSION $name"), qr/ERROR:.*(belongs to the ledger|cannot drop|ledger)/s,
+		"the script of another extension cannot run '$drop'");
+	is($node->safe_psql('lk', qq{SELECT count(*) FROM pg_extension WHERE extname IN ('$name')}), '0',
+		'and the extension was not created');
+	is($node->safe_psql('lk', q{SELECT (SELECT count(*) FROM pg_extension WHERE extname IN ('kingres_ledger', 'plpgsql'))
+		|| ' ' || (SELECT count(*) FROM pg_event_trigger WHERE evtname LIKE 'kingres_ledger%')
+		|| ' ' || (SELECT count(*) FROM pg_proc WHERE proname = 'ledger_head')}), '2 3 1',
+		'and the ledger, its event triggers and its functions are all there');
+	unlink "$extdir/extension/$name.control", "$extdir/extension/$name--1.0.sql";
+}
 # The guard remembers which extension it guards; when the extension is dropped
 # and created again in one session (a new OID), it must follow.
 $node->safe_psql('postgres', 'CREATE DATABASE cc');

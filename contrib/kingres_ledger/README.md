@@ -123,7 +123,7 @@ tests:
 kingres/dev/ext.sh kingres_ledger all     # sync build install regress tap
 ```
 
-Tests: seventeen pg_regress tests and seventeen TAP tests under `t/`.
+Tests: eighteen pg_regress tests and twenty TAP tests under `t/`.
 
 | Test | What it covers |
 |---|---|
@@ -144,6 +144,7 @@ Tests: seventeen pg_regress tests and seventeen TAP tests under `t/`.
 | `ledger_manual` | what a superuser's hand leaves (L9-01 second half, L9-14): a valid block written by hand with a time in 2100 and no transaction, `ledger_head` that accepts it, `ledger_verify` that reports it (`block_time`, `block_empty`), the builder that refuses to build on it (`KL004`) with the transactions left pending, the limit that only a superuser lifts, the block that then carries the time, a transaction with no entry (`tx_empty`), a pending row deleted by hand (`entry_orphan`) and a member of `pg_write_all_data` that cannot |
 | `ledger_guard` | the write guard (L9-01): the nine tables against `INSERT`, `ON CONFLICT`, `MERGE`, a view and a `SECURITY DEFINER` function of a member of `pg_write_all_data`, `DELETE`, `UPDATE` and `SELECT ... FOR UPDATE`, as that member, as a role with nothing, as a superuser and as a superuser with `allow_manual_write` on; every statement that is allowed is rolled back and `ledger_verify` finds nothing; where the setting can and cannot be set; that no function takes the content of a write; the honest flows with the setting off |
 | `ledger_paths` | the invariant and the paths to it (L10-01 to L10-03, L10-13): a member of the owner role with `INHERIT` and no `SET` on every table and every internal function, a hand-made capture trigger and a hand-made registration, the superuser with no setting, the setting in the hands of a role that was given `SET ON PARAMETER` (also through a `SECURITY DEFINER` function of a superuser and after `SET ROLE`), every lock mode and every row lock on every table as `pg_maintain` and as a member of `pg_write_all_data`, `REINDEX` and `CLUSTER` in a transaction block, the marker lowered after the capture trigger, the builder, the digest, the recorded verification, `ledger_enable`, and after a failed statement in a subtransaction, in an exception block and in the capture trigger, the record that a write by hand leaves, the clauses of the digest check and the units of the clock limit |
+| `ledger_stops` | the second invariant (L11-01 to L11-05, L13-01): every statement that reaches a ledger object through a path it does not name, the rule for the owner of a ledger table, and the identity sequences of the registry and of the records moved to 1, to their maximum, into the middle and far ahead by a member of `pg_write_all_data` and by a member of the owner role, with every writer working after each move |
 | `001_concurrent_blocks` | concurrent writers while blocks are built |
 | `002_restart_standby` | restart, crash recovery, a streaming standby |
 | `003_preload_and_hooks` | the preload requirement, hook chaining with `pg_stat_statements` |
@@ -161,6 +162,9 @@ Tests: seventeen pg_regress tests and seventeen TAP tests under `t/`.
 | `015_recipe` | the statements of the README recipe, read out of the README and run literally for four kinds of damage (a transaction row above the head, a digest above the head, a digest with another hash, the head block removed): `ledger_head` answers, `ledger_verify` reports exactly the `operator_removal` findings, the rows are in `ledger_removed` and in the file, no trigger is switched off, a member still cannot write, the chain goes on |
 | `017_guard_paths` | an owner of the extension that lost `SUPERUSER`; every way a setting can arrive (`PGOPTIONS`, `postgresql.conf`, `ALTER ROLE`, `ALTER DATABASE`, `ALTER SYSTEM`, a `SET` clause, `SET LOCAL`, `set_config`); a real subscription whose table synchronisation and apply workers write (inserts and deletes) the ledger tables of the subscriber, which only the guard trigger sees; the block builder against locks and advisory locks that other sessions hold; the honest path with the guard closed |
 | `016_dump_upgrade` | `pg_dump` and a restore with the guard (a new empty ledger, nothing written by hand), and `pg_upgrade` of a cluster with a ledger (binary upgrade mode): the chain, the blocks and a digest of before verify, the builder and the capture work, the guard is on |
+| `018_second_invariant` | the second invariant with a second session: the locks that a role keeps in an open transaction, the refusals of the owner role that must not queue behind a reader (about fifty statements, each started in a session of its own and waited for from `pg_locks` and `pg_stat_activity`, with a control that is seen waiting), the builders refused in a transaction block and in a pipeline, prepared transactions, two registrations at once |
+| `019_ids_and_hold` | L13-01 and L13-02: the identity sequences moved by `pg_write_all_data` and by the owner role (eight scenarios, every writer, `ledger_remove_stray` and a manual write included), and the limit of the extension's own (`kingres_ledger.lock_hold_limit`) against a pipeline without Sync, a long statement with every timeout of PostgreSQL switched off, `ledger_verify_recorded` and `ledger_enable` in a transaction, a superuser outside the limit |
+| `020_not_covered` | what the third review of the guard listed as not covered: loopbacks through dblink and postgres_fdw, `CREATE SUBSCRIPTION` with the initial copy into an application ledger table, `ATTACH PARTITION` of a table with a foreign key to a ledger table, `DROP EXTENSION plpgsql CASCADE` racing the first `ledger_enable` |
 
 The regress tests need `shared_preload_libraries = 'kingres_ledger'` (the
 in-tree `check` target and `kingres/dev/ext.sh` set it).
@@ -392,7 +396,7 @@ grant them.
 |---|---|
 | `kingres.ledger_digest` | one row per digest this database generated (`ledger_generate_digest`), also when nothing changed since the last one: `digest_id`, `generated_at`, `generated_by`, `height`, `block_hash`, `digest` (exactly what the function returned). PUBLIC can read it except the column `generated_by` (the name of an operator). **A convenience, not a root of trust**: the table is in the database, whoever can rewrite the chain can rewrite it, and `ledger_verify` does not compare it with the chain; to check a recorded digest call `ledger_verify_digest(digest)`; keep a copy outside the database. |
 | `kingres.ledger_verification` | one row per `ledger_verify_recorded` run: `verification_id`, `started_at`, `finished_at`, `started_by`, `from_height`, `to_height` (the heights actually checked), `state` (`clean`, `problems`, `failed`; `running` is allowed by the table but never written: see below), `problem_count`, `blocks_checked` (blocks in the range), `rows_checked` (ledger entries of the transactions in those blocks), `problems` (a JSON array of `{check, object, detail}`, at most the first 100; `problem_count` is exact; NULL when clean). |
-| `kingres.ledger_status` | one row: `append_only_tables`, `updatable_tables`, `latest_block_height`, `latest_block_hash`, `latest_block_closed_at`, `pending_transactions`, `oldest_pending_age` (the clock time since the oldest pending transaction wrote its first entry; NULL when nothing is pending or for a transaction that was queued by 0.1), `last_digest_id`, `last_digest_at`, `last_digest_height`, `last_verification_id`, `last_verification_at`, `last_verification_state`, `last_verification_problems`, and what the block-building worker knows about this database: `worker_state` (`ok`, `busy` when the builder lock was taken, `failed`, `no_extension`, `never_visited`, `not_running` when the library is not preloaded), `worker_consecutive_failures`, `worker_retry_after` (when the next attempt follows a failure) and `worker_last_error`. |
+| `kingres.ledger_status` | one row: `append_only_tables`, `updatable_tables`, `latest_block_height`, `latest_block_hash`, `latest_block_closed_at`, `pending_transactions`, `oldest_pending_age` (the clock time since the oldest pending transaction wrote its first entry; NULL when nothing is pending or for a transaction that was queued by 0.1), `last_digest_id`, `last_digest_at`, `last_digest_height`, `last_verification_id`, `last_verification_at`, `last_verification_state`, `last_verification_problems`, and what the block-building worker knows about this database: `worker_state` (`ok`, `busy` when the builder lock was taken, `failed`, `no_extension`, `never_visited`, `not_running` when the library is not preloaded), `worker_consecutive_failures`, `worker_retry_after` (when the next attempt follows a failure) and `worker_last_error`, and `database_owner` and `database_owner_is_superuser` (a database owner that is not a superuser can drop the database, and the ledger with it: see "What a role that is not a superuser can stop or remove", exception 6). |
 
 `ledger_verify_recorded` writes its row when the run is over. PostgreSQL has
 no autonomous transaction, and the table is append-only, so a row in state
@@ -435,6 +439,7 @@ Settings:
 | `kingres_ledger.block_interval` | 10s | How often the launcher looks for pending transactions; `0` switches the block-building workers off. Server setting (`PGC_SIGHUP`, `postgresql.conf` or `ALTER SYSTEM` and a reload; a database or role setting has no effect on the launcher). |
 | `kingres_ledger.worker_timeout` | 60s | The longest one block-building worker may work on one database; it cancels itself after this time (an error, recorded as a failure, with a growing delay before the next attempt) and the launcher terminates it five seconds later if it does not react. A round of the launcher also stops starting workers when it has used this much time, and continues with the other databases in the next round. `0` means no limit. Server setting (`PGC_SIGHUP`). |
 | `kingres_ledger.max_clock_skew` | 1h | How far the previous block may be ahead of the clock of the server before `ledger_build_block` refuses to build (error `KL004`); `0` means no limit. Superuser setting (see "Who can write the ledger tables", "The time of a block") |
+| `kingres_ledger.lock_hold_limit` | 60s | How long a role that is not a superuser may hold a lock of the extension (the builders', the registry's, the verifications'; each is held to the end of the transaction of the caller) counted from the moment it got the lock; the session of a role that is still in that transaction when the time is up is ended, as if an administrator had terminated it ("terminating connection due to administrator command"), and the lock goes with it. Work that makes progress (`ledger_enable` entering the rows of a large table) gets a new period at every thousand rows. Superusers, the block-building workers included, are not limited. Superuser setting (`PGC_SUSET`): the role it limits cannot change it, which is why it is used and not `statement_timeout`, `transaction_timeout` or `idle_in_transaction_session_timeout` (the role can switch each of them off for its own session, and the last does not reach a pipeline that is waiting for its `Sync`). `0` means no limit. |
 | `kingres_ledger.allow_manual_write` | off | A superuser may write the ledger tables by hand in this session. Superuser setting that can be turned on only with `SET` in a session (see "Who can write the ledger tables") |
 
 Errors raised by the extension: SQLSTATE `KL001` (modification of an
@@ -489,7 +494,7 @@ on their arguments and look nothing up (the list is in the test).
 | `kingres.ledger_status` (view) | nothing (it shows how many transactions wait, and the state of the worker) |
 | the history table of an updatable table | nothing; `SELECT` for the owner of the ledger table only, kept by the extension (see "Updatable tables"); no grant is possible |
 | `ledger_history_acl_sync`, `ledger_history_sync`, `ledger_worker_state`, `ledger_lock_table`, `ledger_register_table`, `ledger_capture` | nothing |
-| the identity sequences of `ledger_digest` and `ledger_verification` | nothing |
+| the identity sequences of `ledger_table`, `ledger_digest`, `ledger_verification` and `ledger_removed` | nothing (and none is read: see "What a role that is not a superuser can stop or remove"; a member of `pg_write_all_data` holds `USAGE` and `UPDATE` on every sequence, which no grant or revoke changes) |
 | `ledger_enable`, `ledger_build_block`, `ledger_generate_digest`, `ledger_verify`, `ledger_verify_recorded`, `ledger_verify_digest`, `ledger_inclusion_proof` | nothing |
 | `ledger_row_hash`, `ledger_history_row_hash`, `ledger_verify_proof`, the hash primitives, `ledger_hook_active` | `EXECUTE` |
 
@@ -717,8 +722,10 @@ records a digest or writes any table, and the hash format is unchanged.
 - **Withdrawing PUBLIC's read access.** `ledger_table`, `ledger_chain`,
   `ledger_blocks` (and the columns of `ledger_digest`) are readable by
   PUBLIC after installation because they only describe the chain. An
-  operator who does not want that can `REVOKE SELECT ON ... FROM PUBLIC`
-  (also `REVOKE ALL ON ALL TABLES IN SCHEMA kingres FROM PUBLIC`); it works,
+  operator who does not want that, and who is a superuser, can `REVOKE SELECT
+  ON ... FROM PUBLIC` (also `REVOKE ALL ON ALL TABLES IN SCHEMA kingres FROM
+  PUBLIC`; a role that is not a superuser, a member of the owner role included,
+  is refused with `KL002`: L13-06); it works,
   and the roles that were granted `EXECUTE` on the two functions keep
   working, because the functions read as the owner. (The statement used to fail
   with `role "public" does not exist`: the protection hook asked for the OID
@@ -1390,7 +1397,7 @@ computes every value:
   first 100 problems (an error is caught in a subtransaction and recorded as
   `failed`);
 - `ledger_register_table` (the last step of `ledger_enable`) takes the identity from
-  the capture trigger of the table (a value that the registry's sequence issued),
+  the capture trigger of the table (it must be the next free identifier of the registry, `max(table_id) + 1`, which `ledger_enable` took under the registry's lock; no sequence is read),
   the mode from the events of that trigger, the history table from the catalogs,
   refuses a table that `ledger_table_defects` finds anything wrong with, and
   enters the rows of the table; it refuses a table that is already registered and
@@ -1559,11 +1566,14 @@ so the rows of the primary appear on it and the guard sees nothing (tested in
 ## What a role that is not a superuser can stop or remove
 
 **The second invariant, in one sentence.** *A role that is not a superuser cannot
-stop the block builder or the capture of rows for longer than one of its own
-statements runs, and cannot remove the ledger or the protection of a ledger
-table.* ("Who can write the ledger tables" is the first one: nobody but the
-extension writes a row.) A superuser can stop the server, edit the catalogs and
-drop the database, and is outside both. The roles the invariant is about are the
+stop the block builder or the capture of rows for longer than
+`kingres_ledger.lock_hold_limit` (60 seconds unless the administrator says
+otherwise; only a superuser can change it), and cannot remove the ledger or the
+protection of a ledger table, in a database that a superuser owns.* ("Who can
+write the ledger tables" is the first one: nobody but the extension writes a
+row.) A superuser can stop the server, edit the catalogs and drop the database,
+and is outside both; so is the owner of a database that is not a superuser, for
+`DROP DATABASE` (exception 6). The roles the invariant is about are the
 ones that hold a great deal short of the attribute: a member of the owner role
 with `INHERIT` and no `SET` (it owns every table, function and event trigger of
 the extension, and holds `REFERENCES`, `TRUNCATE`, `UPDATE` and `EXECUTE` on all
@@ -1574,33 +1584,96 @@ application table.
 
 **The exceptions, all of them.**
 
-1. A statement of the role that runs long. A role that may call a builder holds
-   the lock of the builders for the time its statement runs; so does any
-   statement that holds a lock for as long as it runs (`VACUUM FULL`, `CLUSTER`,
-   `REINDEX` of a large table, by a member of `pg_maintain`). Set
-   `statement_timeout` for roles you do not trust.
+1. A lock of the extension is held for as long as the role keeps the
+   transaction that took it, and for no longer than
+   `kingres_ledger.lock_hold_limit`. The block builders, `ledger_enable` and
+   `ledger_verify_recorded` take a lock of the extension's own (the builders',
+   the registry's, the verifications') that is held to the end of the transaction of
+   the caller, and has to be: a builder that started while another one's block was
+   uncommitted would wait on its rows or build the same height. What the
+   server cannot see when the call is made: a statement that goes on after the call
+   (`SELECT ledger_build_block(), pg_sleep(...)`), and the first `Execute` of an
+   extended-protocol pipeline whose client never sends `Sync` (the flag that says
+   "pipeline" is set after the first `Execute`, and the backend is `active`, not
+   idle). The settings of PostgreSQL that look like a remedy are none:
+   `statement_timeout` and `transaction_timeout` can be switched off by the role
+   for its own session, whatever the administrator set for it with `ALTER ROLE`
+   (the role's `SET` wins), and `idle_in_transaction_session_timeout` does not
+   reach a pipeline that waits for its `Sync`. The rule is the extension's own: when a role
+   that is not a superuser takes one of the locks, a timer starts; if the role is
+   still in the same transaction `kingres_ledger.lock_hold_limit` later, its
+   session is ended (as `pg_terminate_backend` ends it: "terminating connection
+   due to administrator command"), the transaction rolls back and the lock goes
+   with it. The timer is switched off when the transaction ends. The setting is
+   a superuser setting (`PGC_SUSET`): the role it limits cannot change it, and
+   `ALTER ROLE ... SET` by the administrator holds. The wait for the lock is not
+   counted, and work that makes progress (`ledger_enable` entering the rows of a
+   large table, a thousand at a time) gets a new period. Superusers, the
+   block-building workers among them, are not limited. A statement of a role that
+   takes another kind of lock for as long as it runs (`VACUUM FULL`, `CLUSTER`,
+   `REINDEX` of a large table, by a member of `pg_maintain`) holds that lock of
+   PostgreSQL's for the time it runs: it conflicts with nothing the builder and
+   the capture take (see below); set `statement_timeout` for roles you do not
+   trust only as a convenience, it is not a guarantee.
 2. The owner of an application table, and the roles that inherit from it, may
    lock that table. Writes to that table wait, which is what a lock on a table
    means; nothing else waits: the builder and the capture of other tables do not
-   touch it, and the lock is not on a table of the ledger.
-3. A client that speaks the extended protocol in pipeline mode and does not send
-   `Sync` keeps an implicit transaction open after the call of a builder, which the
-   server cannot see when the call is made (the flag that says "pipeline" is set
-   after the first `Execute`). `idle_in_transaction_session_timeout` ends it; set
-   it for the roles that may call a builder. Everything else that keeps a
-   transaction open is refused (below).
-4. `setval()` of the registry's sequence is a function call, which no hook sees.
-   A member of the owner role can set the sequence back: the next `ledger_enable`
-   fails on the primary key of `ledger_table` (nothing is registered, nothing
-   collides, nothing is forged, the table that was being enabled is not left half
-   made), and capture goes on. A superuser sets it forward again. `ALTER
-   SEQUENCE` is refused to every role that is not a superuser.
+   touch it, and the lock is not on a table of the ledger. A transaction that
+   called `ledger_enable` for a table keeps the registry's lock until it ends (at
+   most `kingres_ledger.lock_hold_limit` for a role that is not a superuser, counted
+   again at every thousand rows entered), which makes another `ledger_enable`
+   wait for it; `ledger_enable` is DDL.
+3. A builder is refused (`25001`) in a transaction block, a savepoint, an
+   `EXCEPTION` block, a multi-command string and after the first statement of a
+   pipeline, for a role that is not a superuser; the first `Execute` of a pipeline
+   is the part that cannot be refused, and exception 1 covers it.
+4. The identity sequences are not used. A member of `pg_write_all_data` holds
+   `USAGE` and `UPDATE` on every sequence (the role attribute is not an ACL entry:
+   there is nothing to revoke, and nothing the extension could take away that
+   would stay away across `pg_dump`, restore, `pg_upgrade` and `ALTER EXTENSION
+   UPDATE`), the owner role holds them too, and `setval()` and `nextval()` are
+   function calls that no hook sees. So no writer takes an identifier from a
+   sequence: `ledger_enable` takes `max(table_id) + 1` under the registry's lock,
+   `ledger_generate_digest` the next free `digest_id` under the builders' lock
+   (greater than any digest that `ledger_remove_stray` took out),
+   `ledger_verify_recorded` the next `verification_id` under the verifications'
+   lock, `ledger_remove_stray` and the record of a manual write the next
+   `removal_id` under a lock of their own. The identifiers are in no hash (the
+   leaf of an entry carries `table_id`, which existing tables keep; the digest
+   document, the block hash and the leaves carry no other identifier), so
+   nothing a role does to a sequence changes anything that is verified. The
+   sequences stay, because the columns are identity columns for the rows that a
+   superuser inserts by hand, and each writer sets the sequence to the
+   identifier it took, so a sequence that was moved is put right by the next
+   writer and a row inserted by hand with the default takes the next
+   identifier. `ALTER SEQUENCE` is refused to every role that is not a
+   superuser, as before.
 5. A table that has an armed capture trigger and no row in the registry (a
    restored database, a hand-made registration that failed) can be written,
    re-enabled and dropped by nobody but a superuser through the catalogs; this
    is documented in "Dump, restore and replication".
-6. What a superuser does: `DROP DATABASE`, a catalog edit, `event_triggers = off`,
-   a server started without the library, the files.
+6. What a superuser does: a catalog edit, `event_triggers = off`, a server
+   started without the library, the files, `DROP DATABASE`. **And what the owner
+   of a database does, who is not a superuser: `DROP DATABASE`.** The ownership
+   of a database is enough to drop it, from another database, with the ledger in
+   it; no hook of a library that is loaded in the database that is dropped sees a
+   drop that is run from another database, and the extension cannot prevent
+   it. What protects a deployment: **every database that holds a ledger is owned
+   by a superuser** (the control plane creates it, or runs `ALTER DATABASE ...
+   OWNER TO`), and the digests are kept outside the database (which is the
+   point of a digest: a ledger that was dropped is detected by the copy that is
+   elsewhere). The extension reports it: `kingres.ledger_status` has the columns
+   `database_owner` and `database_owner_is_superuser`, and `ledger_enable` raises
+   a warning when the database is owned by a role that is not a superuser.
+7. The read access to the ledger is not covered by the invariant, which is about
+   writing and about stopping. `REVOKE` of the privileges of PUBLIC on the
+   tables of the catalog is refused to a role that is not a superuser (a member of
+   the owner role could take the `SELECT` that the registry, the chain identity
+   and the block headers have from every application role; the same class as the
+   schema's `USAGE`, L11-05), `ALTER DEFAULT PRIVILEGES` in the schema `kingres`
+   changes nothing that exists, and `REVOKE EXECUTE` on a function that PUBLIC
+   may call is left to the owner: what it stops is the reading and the
+   publication by plain roles, never the builder or the capture.
 
 **What stops the builder and the capture.** Everything the two do in a table or a
 row of the ledger conflicts only with a lock that a role must request. A role
@@ -1616,8 +1689,26 @@ and its instances), by what the statement *reaches*, not by what it names:
 | `ALTER TABLE`, `DROP`, `CREATE TRIGGER`/`INDEX`/`RULE`/`POLICY`, `RENAME`, `SET SCHEMA`, `INHERITS`, `ATTACH PARTITION` on a ledger catalog table, by the owner role | statement hook, **without taking the lock first**: until this round the hook locked the table with the lock the statement would take, as the owner, and then rejected the statement; the request for `ACCESS EXCLUSIVE` waited behind any reader of the table (`pg_dump`, `ledger_verify`), with every capture trigger and the builder queued behind it, for as long as the reader ran (a statement that fails keeps no lock; the harm was the wait; the ledger catalog tables are never locked by the hook now) |
 | a foreign key that references a ledger catalog table: `ALTER TABLE ... ADD FOREIGN KEY`, `CREATE TABLE ... REFERENCES`, `ADD COLUMN ... REFERENCES` (it takes `SHARE ROW EXCLUSIVE` on the referenced table, and puts its system triggers on every write) | statement hook |
 | `CLUSTER`, `REINDEX` (not `CONCURRENTLY`) in a transaction block or a function | statement hook (as before) |
-| a builder called inside a transaction block, a multi-command string, a savepoint or an `EXCEPTION` block, by a role that is not a superuser (the lock of the builders is held to the end of the transaction, and has to be) | the builders themselves: `ledger_build_block` and `ledger_generate_digest` raise `25001` (`cannot run inside a transaction block for a role that is not a superuser`); as a statement of their own they hold the lock for the statement |
+| a builder called inside a transaction block, a multi-command string, a savepoint, an `EXCEPTION` block or after the first statement of a pipeline, by a role that is not a superuser (the lock of the builders is held to the end of the transaction, and has to be) | the builders themselves: `ledger_build_block` and `ledger_generate_digest` raise `25001` (`cannot run inside a transaction block for a role that is not a superuser`); as a statement of their own they hold the lock for the statement, and `kingres_ledger.lock_hold_limit` ends the session of a role that keeps it longer (exception 1) |
 | advisory locks, `LOCK` on an extension object | not a route: the builder waits on a lock of the extension's own object with a sub-object number that no statement uses |
+
+**A window that is left open (L13-07).** The check of `LOCK` looks the name up
+without a lock, and `LOCK` looks it up again when it runs; with two schemas on
+the `search_path` and a second session that creates a view over a catalog table in
+the first one at exactly that moment, the second lookup could land on the view.
+114,000 attempts in 90 seconds did not hit it once: the interval is two
+syscache lookups. It is left because it cannot be closed from the hook for
+what it costs: the hook cannot hand the OID it resolved to `LOCK` (the statement
+is resolved again by core, and rewriting the statement for a cached utility
+tree would change what a function that locks by an unqualified name means under
+another `search_path`), and a check after the lock was taken (which would be
+the only other way) has no deterministic test, because the interval cannot be
+made to happen on demand. What the window can give is a lock that the role holds
+until its transaction ends, which stops the builder for as long as the role keeps
+that transaction; a lock that waits for a lock is not new, and the administrator's
+remedy is `pg_terminate_backend`. The role that could use it has to be able to
+create a view in a schema that comes first in its `search_path`, and to race a
+second session of its own against the hook.
 
 What is not refused because it conflicts with nothing the builder and the capture
 take: `ANALYZE`, `VACUUM`, `REINDEX CONCURRENTLY`, `COMMENT`, `CREATE STATISTICS`
@@ -1661,11 +1752,11 @@ dependency is refused, and the drop it would cause is refused by the hook too),
 `ALTER EVENT TRIGGER ... DISABLE/OWNER`, `ALTER FUNCTION ... OWNER/SET SCHEMA`,
 `ALTER TABLE ... OWNER/SET SCHEMA` of a catalog table, `REASSIGN OWNED`.
 
-**The schema and the sequence (L11-05).** `GRANT` and `REVOKE` on the schema
+**The schema and the sequences (L11-05, L13-01).** `GRANT` and `REVOKE` on the schema
 `kingres` and `ALTER SCHEMA kingres OWNER TO` are refused to a role that is not a
 superuser (a member of the owner role could take `USAGE` from PUBLIC, and every
 application role would lose the functions, or give the schema away). `ALTER
-SEQUENCE` of the registry's sequence, `GRANT` of anything but `SELECT` on a
+SEQUENCE` of a sequence of the extension, `GRANT` of anything but `SELECT` on a
 sequence of the extension, `ALTER SEQUENCE ... OWNER TO` and the rest of what the
 hook refuses on a table of the catalog are refused to every role that is not a
 superuser. `CREATE FUNCTION`, `CREATE TABLE` and the like in the schema stay what
@@ -1693,7 +1784,15 @@ ALWAYS`, and only a superuser can set it). This is the one rule that
 `ledger_stops` runs, statement by statement, as the owner of an append-only and of
 an updatable table, with the outcome of each.
 
-**What a control plane must know.** `ledger_build_block` and
+**What a control plane must know.** The session of a role that is not a superuser
+that keeps a transaction open for `kingres_ledger.lock_hold_limit` (60 seconds)
+after `ledger_build_block`, `ledger_generate_digest`, `ledger_verify_recorded` or
+`ledger_enable` is ended; give the calls that must run inside a longer transaction
+to a superuser service role, or raise the limit for that role with `ALTER ROLE ...
+SET kingres_ledger.lock_hold_limit` (only a superuser can). Create every database
+that holds a ledger with a superuser as owner, and keep the digests outside the
+database (exception 6); `ledger_status` shows the owner. The identity sequences
+are not read by anything: no repair is ever needed after `setval`. `ledger_build_block` and
 `ledger_generate_digest` called by a role that is not a superuser must be called
 as a statement of their own (autocommit, or inside a function that is itself one
 statement); the worker and every superuser may call them anywhere. `KL002` can

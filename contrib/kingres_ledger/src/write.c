@@ -27,6 +27,11 @@
  * every table, and a role that holds one must not be able to stop the
  * builder.
  *
+ * The identifiers of the rows that ledger_generate_digest,
+ * ledger_verify_recorded, ledger_remove_stray, a manual write and
+ * ledger_enable write are taken by these functions, under a lock, and not from
+ * the sequences of the identity columns (see kl_follow_sequence below).
+ *
  * Portions Copyright (c) 2026, RooyeKhat Media Co
  * SPDX-License-Identifier: AGPL-3.0-only
  *
@@ -51,6 +56,7 @@
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "storage/latch.h"
 #include "storage/lmgr.h"
 #include "utils/acl.h"
 #include "utils/array.h"
@@ -61,6 +67,7 @@
 #include "utils/rel.h"
 #include "utils/ruleutils.h"
 #include "utils/snapmgr.h"
+#include "utils/timeout.h"
 #include "utils/timestamp.h"
 
 #include "kingres_ledger.h"
@@ -141,9 +148,16 @@ kl_first(int col, Datum *value)
  *		builder for a role that is not a superuser keeps the call outside such a
  *		block), and not after the first Execute of a pipeline (the flag of the
  *		pipeline reports the rest).
- *		What remains: a statement that runs long (set statement_timeout for
- *		such roles), and the first Execute of an extended-protocol pipeline that
- *		the client does not Sync (idle_in_transaction_session_timeout ends it).
+ *		What remains is a statement that runs long, and the first Execute of an
+ *		extended-protocol pipeline that the client does not Sync: the server
+ *		cannot see either when the call is made, and the settings that look
+ *		like a remedy (statement_timeout, idle_in_transaction_session_timeout,
+ *		transaction_timeout) are the role's own to change, and do not apply to
+ *		a pipeline that is waiting for its Sync (the backend is "active").  The
+ *		bound is the extension's own: kl_hold_arm (below) ends the session of a
+ *		role that is not a superuser when it holds a lock of the extension
+ *		for longer than kingres_ledger.lock_hold_limit, which only a superuser
+ *		can change.
  *		A superuser can stop the server anyway, and the workers are superusers.
  */
 static void
@@ -160,13 +174,151 @@ kl_refuse_open_transaction(const char *fname)
 				 errhint("Call it as a statement of its own, outside BEGIN ... COMMIT, a savepoint and an EXCEPTION block.")));
 }
 
+/*
+ * The bound on how long a role that is not a superuser holds a lock of the
+ * extension (L13-02).  The locks are held to the end of the transaction of the
+ * caller, and have to be (see kl_refuse_open_transaction): a block that is not
+ * committed must not be invisible to the next builder.  What a caller can do
+ * with that, without being a superuser: a pipeline whose client never sends
+ * Sync keeps the transaction open with the backend "active", where no timeout
+ * of PostgreSQL reaches it; a statement that sleeps after the call runs as
+ * long as the role lets it, because every timeout of PostgreSQL that bounds a
+ * statement or a transaction can be set to 0 by the role for its own session.
+ * So the bound is a timer of our own, armed when a role that is not a
+ * superuser has the lock, switched off when the transaction ends, and
+ * unreachable from SQL (the limit is a superuser setting).  When it fires, the
+ * session ends as if an administrator had terminated it: the transaction rolls
+ * back and the lock goes with it.  It is raised again by whatever makes
+ * progress (kl_hold_progress: ledger_enable entering the rows of a large
+ * table), so that honest work that takes long is not ended, and a call that
+ * only waits is.
+ */
+static int	kl_hold_timeout_id = -1;
+static bool kl_hold_armed = false;
+static bool kl_hold_callback_registered = false;
+
+/* In the signal handler: end the session the way a terminate request does. */
+static void
+kl_hold_timeout_handler(void)
+{
+	ProcDiePending = true;
+	InterruptPending = true;
+	SetLatch(MyLatch);
+}
+
+static void
+kl_hold_xact_callback(XactEvent event, void *arg)
+{
+	switch (event)
+	{
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PREPARE:
+		case XACT_EVENT_PARALLEL_COMMIT:
+		case XACT_EVENT_PARALLEL_ABORT:
+			if (kl_hold_armed)
+			{
+				disable_timeout(kl_hold_timeout_id, false);
+				kl_hold_armed = false;
+			}
+			break;
+		default:
+			break;
+	}
+}
+
+static void
+kl_hold_arm(void)
+{
+	if (kl_lock_hold_limit <= 0 || superuser_arg(GetOuterUserId()))
+		return;
+	if (!kl_hold_callback_registered)
+	{
+		RegisterXactCallback(kl_hold_xact_callback, NULL);
+		kl_hold_callback_registered = true;
+	}
+	if (kl_hold_timeout_id < 0)
+		kl_hold_timeout_id = RegisterTimeout(USER_TIMEOUT, kl_hold_timeout_handler);
+	if (!kl_hold_armed)
+	{
+		enable_timeout_after(kl_hold_timeout_id, kl_lock_hold_limit);
+		kl_hold_armed = true;
+	}
+}
+
+/* Work that makes progress while a lock is held gets a new full period. */
+void
+kl_hold_progress(void)
+{
+	if (kl_hold_armed && kl_lock_hold_limit > 0)
+		enable_timeout_after(kl_hold_timeout_id, kl_lock_hold_limit);
+}
+
+/*
+ * Wait for a lock on the extension's own object with a sub-object number that
+ * no statement uses (the builders', the registry's, the verifications'; see
+ * kingres_ledger.h) and, for a caller that is not a superuser, start the
+ * clock of kingres_ledger.lock_hold_limit.  The time spent waiting for the
+ * lock is not counted.
+ */
+void
+kl_lock_extension_object(int subid)
+{
+	LockDatabaseObject(ExtensionRelationId,
+					   get_extension_oid(KL_EXTENSION_NAME, false),
+					   subid, ExclusiveLock);
+	kl_hold_arm();
+}
+
 /* Wait for the lock that serialises the block builders (see the file header). */
 static void
 kl_lock_builders(void)
 {
-	LockDatabaseObject(ExtensionRelationId,
-					   get_extension_oid(KL_EXTENSION_NAME, false),
-					   KL_BUILDER_LOCK_SUBID, ExclusiveLock);
+	kl_lock_extension_object(KL_BUILDER_LOCK_SUBID);
+}
+
+/*
+ * The identifiers of the rows that these functions write are not taken from the
+ * sequences of the identity columns.  A role that holds nextval and setval on
+ * a sequence (every member of pg_write_all_data does, with no grant to
+ * revoke) could move it to the maximum, and no hook sees a call of setval:
+ * every writer would then fail for everybody until a superuser repaired it.
+ * Each writer takes the next identifier itself, as the maximum of the rows
+ * there are plus one, in the statement that inserts the row and under the lock
+ * that already serialises the writers of that table (the builders' lock for
+ * digests, one of the locks above for the rest), so the value cannot collide
+ * and a forged sequence changes nothing.  The columns stay identity columns
+ * for the rows that a superuser inserts by hand (README), and each writer sets
+ * the sequence to follow the identifier it took (kl_follow_sequence), which
+ * also heals a sequence that was moved; no writer reads it.
+ */
+#define KL_SQL_NEXT_DIGEST_ID \
+	"(SELECT GREATEST(COALESCE(pg_catalog.max(x.digest_id), 0), " \
+	"COALESCE((SELECT pg_catalog.max((r.row_data OPERATOR(pg_catalog.->>) 'digest_id')::pg_catalog.int8) " \
+	"FROM kingres.ledger_removed r " \
+	"WHERE r.source_table OPERATOR(pg_catalog.=) 'ledger_digest' " \
+	"AND r.action OPERATOR(pg_catalog.=) 'removed'), 0)) + 1 " \
+	"FROM kingres.ledger_digest x)"
+
+#define KL_SQL_NEXT_VERIFICATION_ID \
+	"(SELECT COALESCE(pg_catalog.max(x.verification_id), 0) + 1 FROM kingres.ledger_verification x)"
+
+/* Set the sequence of an identity column to the identifier that was taken. */
+static void
+kl_follow_sequence(const char *table, const char *column, int64 id)
+{
+	Oid			types[3];
+	Datum		values[3];
+
+	types[0] = TEXTOID;
+	types[1] = TEXTOID;
+	types[2] = INT8OID;
+	values[0] = CStringGetTextDatum(table);
+	values[1] = CStringGetTextDatum(column);
+	values[2] = Int64GetDatum(id);
+	kl_run("SELECT pg_catalog.setval("
+		   "pg_catalog.pg_get_serial_sequence($1, $2)::pg_catalog.regclass, $3)",
+		   3, types, values, NULL, false);
 }
 
 static char *
@@ -401,10 +553,14 @@ kingres_ledger_generate_digest(PG_FUNCTION_ARGS)
 		elog(ERROR, "SPI_connect failed");
 	(void) kl_build_block_core(&h);
 
-	/* A convenience record, not a root of trust. */
+	/*
+	 * A convenience record, not a root of trust.  The identifier is taken
+	 * under the lock of the builders, which kl_build_block_core holds.
+	 */
 	kl_run("INSERT INTO kingres.ledger_digest "
-		   "(generated_at, generated_by, height, block_hash, digest) "
-		   "SELECT g.ts, kingres.ledger_outer_user(), b.height, b.block_hash, "
+		   "(digest_id, generated_at, generated_by, height, block_hash, digest) "
+		   "OVERRIDING SYSTEM VALUE "
+		   "SELECT " KL_SQL_NEXT_DIGEST_ID ", g.ts, kingres.ledger_outer_user(), b.height, b.block_hash, "
 		   "pg_catalog.jsonb_build_object("
 		   "'database', pg_catalog.current_database(), "
 		   "'chain_id', pg_catalog.encode(c.chain_id, 'hex'), "
@@ -419,12 +575,17 @@ kingres_ledger_generate_digest(PG_FUNCTION_ARGS)
 		   "CROSS JOIN (SELECT lb.* FROM kingres.ledger_blocks lb "
 		   "ORDER BY lb.height DESC LIMIT 1) b "
 		   "LEFT JOIN kingres.ledger_chain c ON true "
-		   "RETURNING digest",
+		   "RETURNING digest, digest_id",
 		   0, NULL, NULL, NULL, true);
 	if (kl_first(1, &d))
 	{
+		Datum		idd;
+
 		result = SPI_datumTransfer(d, false, -1);
 		have = true;
+		if (kl_first(2, &idd))
+			kl_follow_sequence("kingres.ledger_digest", "digest_id",
+							   DatumGetInt64(idd));
 	}
 	SPI_finish();
 	if (!have)
@@ -557,15 +718,19 @@ kingres_ledger_verify_recorded(PG_FUNCTION_ARGS)
 		memset(nulls, ' ', sizeof(nulls));
 		if (n_problems == 0 || !have_probs)
 			nulls[8] = 'n';
+		/* The identifier is the next free one, taken under a lock of ours. */
+		kl_lock_extension_object(KL_VERIFY_LOCK_SUBID);
 		kl_run("INSERT INTO kingres.ledger_verification "
-			   "(started_at, finished_at, started_by, from_height, to_height, state, "
+			   "(verification_id, started_at, finished_at, started_by, from_height, to_height, state, "
 			   "problem_count, blocks_checked, rows_checked, problems) "
-			   "VALUES ($1, pg_catalog.clock_timestamp(), $2, $3, $4, $5, $6, $7, $8, $9) "
+			   "OVERRIDING SYSTEM VALUE "
+			   "VALUES (" KL_SQL_NEXT_VERIFICATION_ID ", $1, pg_catalog.clock_timestamp(), $2, $3, $4, $5, $6, $7, $8, $9) "
 			   "RETURNING verification_id",
 			   9, types, values, nulls, true);
 		if (!kl_first(1, &d))
 			elog(ERROR, "ledger verification record returned no row");
 		vid = DatumGetInt64(d);
+		kl_follow_sequence("kingres.ledger_verification", "verification_id", vid);
 
 		ReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(oldcxt);
@@ -603,10 +768,12 @@ kingres_ledger_verify_recorded(PG_FUNCTION_ARGS)
 		values[3] = Int64GetDatum(hi);
 		values[4] = CStringGetTextDatum(edata->message ? edata->message : "");
 		values[5] = CStringGetTextDatum(unpack_sql_state(edata->sqlerrcode));
+		kl_lock_extension_object(KL_VERIFY_LOCK_SUBID);
 		kl_run("INSERT INTO kingres.ledger_verification "
-			   "(started_at, finished_at, started_by, from_height, to_height, state, "
+			   "(verification_id, started_at, finished_at, started_by, from_height, to_height, state, "
 			   "problem_count, problems) "
-			   "VALUES ($1, pg_catalog.clock_timestamp(), $2, $3, $4, 'failed', NULL, "
+			   "OVERRIDING SYSTEM VALUE "
+			   "VALUES (" KL_SQL_NEXT_VERIFICATION_ID ", $1, pg_catalog.clock_timestamp(), $2, $3, $4, 'failed', NULL, "
 			   "pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object("
 			   "'check', 'verification_failed', 'object', NULL::pg_catalog.text, "
 			   "'detail', pg_catalog.left($5, 1000), 'sqlstate', $6))) "
@@ -615,6 +782,7 @@ kingres_ledger_verify_recorded(PG_FUNCTION_ARGS)
 		if (!kl_first(1, &d))
 			elog(ERROR, "ledger verification record returned no row");
 		vid = DatumGetInt64(d);
+		kl_follow_sequence("kingres.ledger_verification", "verification_id", vid);
 		ereport(WARNING,
 				(errmsg("ledger verification " INT64_FORMAT " failed: %s",
 						(int64) vid, edata->message ? edata->message : "")));
@@ -710,8 +878,14 @@ kingres_ledger_remove_stray(PG_FUNCTION_ARGS)
 	values[2] = PG_GETARG_DATUM(0);
 	values[3] = Int64GetDatum(head);
 
-	kl_run("INSERT INTO kingres.ledger_removed (removed_at, removed_by, reason, source_table, row_data) "
-		   "SELECT $1, $2, $3, 'ledger_tx', pg_catalog.to_jsonb(t) "
+	/* The identifiers of the records: the next free ones, under a lock of ours. */
+	kl_lock_extension_object(KL_REMOVED_LOCK_SUBID);
+	kl_run("INSERT INTO kingres.ledger_removed "
+		   "(removal_id, removed_at, removed_by, reason, source_table, row_data) "
+		   "OVERRIDING SYSTEM VALUE "
+		   "SELECT (SELECT COALESCE(pg_catalog.max(x.removal_id), 0) FROM kingres.ledger_removed x) "
+		   "+ pg_catalog.row_number() OVER (ORDER BY t.ledger_txid), "
+		   "$1, $2, $3, 'ledger_tx', pg_catalog.to_jsonb(t) "
 		   "FROM kingres.ledger_tx t WHERE t.block_height > $4 ORDER BY t.ledger_txid",
 		   4, types, values, NULL, false);
 	n_tx = SPI_processed;
@@ -724,8 +898,12 @@ kingres_ledger_remove_stray(PG_FUNCTION_ARGS)
 	kl_run("DELETE FROM kingres.ledger_tx t WHERE t.block_height > $1",
 		   1, &types[3], &values[3], NULL, false);
 
-	kl_run("INSERT INTO kingres.ledger_removed (removed_at, removed_by, reason, source_table, row_data) "
-		   "SELECT $1, $2, $3, 'ledger_digest', pg_catalog.to_jsonb(d) "
+	kl_run("INSERT INTO kingres.ledger_removed "
+		   "(removal_id, removed_at, removed_by, reason, source_table, row_data) "
+		   "OVERRIDING SYSTEM VALUE "
+		   "SELECT (SELECT COALESCE(pg_catalog.max(x.removal_id), 0) FROM kingres.ledger_removed x) "
+		   "+ pg_catalog.row_number() OVER (ORDER BY d.digest_id), "
+		   "$1, $2, $3, 'ledger_digest', pg_catalog.to_jsonb(d) "
 		   "FROM kingres.ledger_digest d "
 		   "WHERE NOT EXISTS (SELECT 1 FROM kingres.ledger_blocks b "
 		   "WHERE b.height = d.height AND b.block_hash = d.block_hash) "
@@ -736,6 +914,15 @@ kingres_ledger_remove_stray(PG_FUNCTION_ARGS)
 		   "WHERE NOT EXISTS (SELECT 1 FROM kingres.ledger_blocks b "
 		   "WHERE b.height = d.height AND b.block_hash = d.block_hash)",
 		   0, NULL, NULL, NULL, false);
+
+	if (n_tx + n_dg > 0)
+	{
+		kl_run("SELECT pg_catalog.max(x.removal_id) FROM kingres.ledger_removed x",
+			   0, NULL, NULL, NULL, false);
+		if (kl_first(1, &d))
+			kl_follow_sequence("kingres.ledger_removed", "removal_id",
+							   DatumGetInt64(d));
+	}
 
 	SPI_finish();
 	PG_RETURN_INT64(n_tx + n_dg);
@@ -748,7 +935,7 @@ kingres_ledger_remove_stray(PG_FUNCTION_ARGS)
  *		and enter the rows that it already contains, in the calling
  *		transaction.  Everything that is written is computed here from the
  *		catalogs: the table_id is the one in the capture trigger, which must
- *		be a value that the registry's sequence has issued, the mode is the
+ *		be the next free id of the registry (no sequence), the mode is the
  *		mode of that trigger (UPDATE in its events means updatable), the
  *		history table is the table that ledger_enable names after the table,
  *		and the entries are the rows of the table.  A table that
@@ -842,11 +1029,18 @@ kingres_ledger_register_table(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
 				 errmsg("table \"%s\" is already under ledger control", relname)));
 
-	/* The id must have been issued by the registry; a later one would collide with a real table. */
-	kl_run("SELECT pg_catalog.pg_sequence_last_value("
-		   "pg_catalog.pg_get_serial_sequence('kingres.ledger_table', 'table_id')::pg_catalog.regclass)",
+	/*
+	 * The id must be the one ledger_enable took: the next free one of the
+	 * registry, taken under the registry's lock (ledger_lock_table took it
+	 * for ledger_enable; a call that is not made by ledger_enable takes it
+	 * here, after the lock of the table).  A larger id would collide with a
+	 * table that is enabled later, a smaller one is in use.  No sequence is
+	 * read: a role could set it to any value.
+	 */
+	kl_lock_extension_object(KL_REGISTRY_LOCK_SUBID);
+	kl_run("SELECT COALESCE(pg_catalog.max(x.table_id), 0) + 1 FROM kingres.ledger_table x",
 		   0, NULL, NULL, NULL, false);
-	if (!kl_first(1, &d) || (int64) tid > DatumGetInt64(d))
+	if (!kl_first(1, &d) || (int64) tid != DatumGetInt64(d))
 		ereport(ERROR,
 				(errcode(ERRCODE_KL_PROTECTED),
 				 errmsg("table id %ld was not issued by the ledger", tid)));
@@ -866,6 +1060,7 @@ kingres_ledger_register_table(PG_FUNCTION_ARGS)
 	kl_run("INSERT INTO kingres.ledger_table (table_id, relid, mode, history_relid) "
 		   "OVERRIDING SYSTEM VALUE VALUES ($1, $2, $3, $4)",
 		   4, types, values, nulls, true);
+	kl_follow_sequence("kingres.ledger_table", "table_id", (int64) tid);
 
 	/* Whatever ledger_enable was meant to make, this is what it made. */
 	types[0] = OIDOID;
@@ -904,6 +1099,8 @@ kingres_ledger_register_table(PG_FUNCTION_ARGS)
 		SPI_cursor_fetch(portal, true, 1000);
 		if (SPI_processed == 0)
 			break;
+		/* Entering the rows of a large table is work, not a stall: see kl_hold_progress. */
+		kl_hold_progress();
 		for (k = 0; k < SPI_processed; k++)
 		{
 			bool		isnull;
@@ -956,10 +1153,26 @@ kl_record_manual_insert(Relation rel, HeapTuple tuple)
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
+	/*
+	 * Only a superuser gets here (the setting is theirs).  The record of a
+	 * manual write into ledger_removed is never made, so the row that is being
+	 * inserted cannot be one that this identifier could collide with.
+	 */
+	kl_lock_extension_object(KL_REMOVED_LOCK_SUBID);
 	kl_run("INSERT INTO kingres.ledger_removed "
-		   "(removed_at, removed_by, reason, source_table, row_data, action) "
-		   "VALUES (pg_catalog.clock_timestamp(), $1, $2, $3, "
-		   "$4::pg_catalog.text::pg_catalog.jsonb, 'inserted')",
+		   "(removal_id, removed_at, removed_by, reason, source_table, row_data, action) "
+		   "OVERRIDING SYSTEM VALUE "
+		   "VALUES ((SELECT COALESCE(pg_catalog.max(x.removal_id), 0) + 1 FROM kingres.ledger_removed x), "
+		   "pg_catalog.clock_timestamp(), $1, $2, $3, "
+		   "$4::pg_catalog.text::pg_catalog.jsonb, 'inserted') "
+		   "RETURNING removal_id",
 		   4, types, values, NULL, true);
+	{
+		Datum		idd;
+
+		if (kl_first(1, &idd))
+			kl_follow_sequence("kingres.ledger_removed", "removal_id",
+							   DatumGetInt64(idd));
+	}
 	SPI_finish();
 }

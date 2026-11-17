@@ -559,9 +559,10 @@ type extMove struct {
 }
 
 // findMove finds the extension's record of a move. By its id when that is known (ref.ID, or id). Else by the
-// identity the call carried: the record of the bucket with an id above the mark taken before the call. Only
-// for a row that an earlier holder left without either, by the time the row was started, read from the system
-// database, which is on the server of the extension (a clock of this process is never compared with it).
+// identity the call carried: the record of the bucket with an id above the mark taken before the call (the mark
+// is kept with the row, so that a holder that takes over has it). Only for a row made before the mark was kept
+// (ref.Since is set), by the time the row was started with a tolerance for the difference of the two clocks
+// (ST-05): the row's time is the clock of the system database, the record's the clock of the map group primary.
 func (b *PG) findMove(ctx context.Context, c *pgx.Conn, colocation, bucket int32, ref Ref, id int64) (extMove, bool, error) {
 	var e extMove
 	var err error
@@ -578,7 +579,7 @@ func (b *PG) findMove(ctx context.Context, c *pgx.Conn, colocation, bucket int32
 	default:
 		err = c.QueryRow(ctx, `SELECT move_id, phase, coalesce(detail, '') FROM kingres.bucket_move
 			WHERE colocation_id = $1 AND bucket = $2 AND started_at >= $3 ORDER BY move_id DESC LIMIT 1`,
-			colocation, bucket, ref.Since).Scan(&e.id, &e.phase, &e.err)
+			colocation, bucket, ref.Since.Add(-sinceTolerance)).Scan(&e.id, &e.phase, &e.err)
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		return extMove{}, false, nil
@@ -639,10 +640,16 @@ func (b *PG) CancelMove(ctx context.Context, m Move, ref Ref) (bool, error) {
 	return stopped, err
 }
 
+// sinceTolerance is how far the record of the extension may be before the row of the loop when the two are
+// matched by time (only rows made before the mark was kept): the clocks of two servers differ.
+const sinceTolerance = 10 * time.Second
+
 // Recover implements Backend: the extension's recovery decides. resume_bucket_moves
 // undoes a move that did not reach its switch and completes one that did; it
 // never touches a move whose session is alive, so a move that a leader still
-// runs is waited for, not taken.
+// runs is waited for, not taken. The wait is bounded by RecoverWait only while the move is not alive: a move
+// whose session holds the extension's mark of a live move is waited for as long as it lives (ST-07; a copy is
+// unbounded by design), and the run can be stopped meanwhile (the loop watches it).
 func (b *PG) Recover(ctx context.Context, r MoveRow) (string, string, error) {
 	wait := b.RecoverWait
 	if wait == 0 {
@@ -651,9 +658,13 @@ func (b *PG) Recover(ctx context.Context, r MoveRow) (string, string, error) {
 	deadline := time.Now().Add(wait)
 	for {
 		var state, text string
-		var settled bool
+		var settled, alive bool
 		err := b.with(ctx, r.Move.Database, func(c *pgx.Conn) error {
-			e, ok, err := b.findMove(ctx, c, r.Move.Colocation, r.Move.Bucket, Ref{After: r.After, Since: r.StartedAt}, r.ExtMoveID)
+			ref := Ref{After: r.After}
+			if !r.Marked {
+				ref.Since = r.StartedAt
+			}
+			e, ok, err := b.findMove(ctx, c, r.Move.Colocation, r.Move.Bucket, ref, r.ExtMoveID)
 			if err != nil {
 				return err
 			}
@@ -669,8 +680,15 @@ func (b *PG) Recover(ctx context.Context, r MoveRow) (string, string, error) {
 			case "cancelled":
 				state, text, settled = MoveCancelled, e.err, true
 			default:
-				_, err := c.Exec(ctx, `SELECT kingres.resume_bucket_moves()`)
-				return err
+				if _, err := c.Exec(ctx, `SELECT kingres.resume_bucket_moves()`); err != nil {
+					return err
+				}
+				// A live session is waited for as long as it lives; an answer that cannot be had counts as
+				// not alive (the bound applies).
+				var live bool
+				if err := c.QueryRow(ctx, `SELECT kingres.internal_move_alive($1)`, e.id).Scan(&live); err == nil && live {
+					alive = true
+				}
 			}
 			return nil
 		})
@@ -679,6 +697,9 @@ func (b *PG) Recover(ctx context.Context, r MoveRow) (string, string, error) {
 		}
 		if settled {
 			return state, clipText(text, 500), nil
+		}
+		if alive {
+			deadline = time.Now().Add(wait)
 		}
 		if time.Now().After(deadline) {
 			return "", "", fmt.Errorf("the move is still not settled after %s; run kingres.resume_bucket_moves() on the map group primary and check kingres.check_cluster()", wait)
@@ -815,8 +836,16 @@ func (r *PGRows) SetPlanned(ctx context.Context, n int) error {
 func (r *PGRows) StartMove(ctx context.Context, m Move, fromServer, toServer string, attempts int) (int, error) {
 	var seq int
 	err := r.leased(ctx, func(tx pgx.Tx) error {
+		// ST-06: the write is repeated when its answer was lost. The row of this attempt that the first execution
+		// made is the answer; a second row for it would count one move twice.
+		if e := tx.QueryRow(ctx, `SELECT seq FROM kingres_cp.rebalance_move WHERE task_id = $1 AND database_name = $2 AND colocation_id = $3
+			AND bucket = $4 AND state = 'running' AND attempts = $5 AND move_id IS NULL
+			AND round = (SELECT round FROM kingres_cp.rebalance_run WHERE task_id = $1)`,
+			r.TaskID, m.Database, m.Colocation, m.Bucket, attempts).Scan(&seq); e == nil {
+			return nil
+		}
 		err := tx.QueryRow(ctx, `UPDATE kingres_cp.rebalance_move SET state = 'running', attempts = $5, phase = NULL, percent = 0, move_id = NULL,
-			started_at = clock_timestamp(), finished_at = NULL, error = NULL, from_group = $6, to_group = $7, from_server = $8, to_server = $9
+			started_at = clock_timestamp(), finished_at = NULL, error = NULL, ext_mark = NULL, from_group = $6, to_group = $7, from_server = $8, to_server = $9
 			WHERE task_id = $1 AND database_name = $2 AND colocation_id = $3 AND bucket = $4 AND state IN ('failed', 'cancelled', 'skipped')
 			AND round = (SELECT round FROM kingres_cp.rebalance_run WHERE task_id = $1)
 			RETURNING seq`, r.TaskID, m.Database, m.Colocation, m.Bucket, attempts, m.From, m.To, fromServer, toServer).Scan(&seq)
@@ -860,21 +889,28 @@ func (r *PGRows) AddSkipped(ctx context.Context, m Move, fromServer, toServer, r
 		_, err := tx.Exec(ctx, `INSERT INTO kingres_cp.rebalance_move (task_id, seq, database_name, colocation_id, bucket, from_group, to_group,
 			from_server, to_server, state, attempts, size_bytes, started_at, finished_at, error, round)
 			SELECT $1, coalesce(max(seq), 0) + 1, $2, $3, $4, $5, $6, $7, $8, 'skipped', 0, $9, clock_timestamp(), clock_timestamp(), $10, (SELECT round FROM kingres_cp.rebalance_run WHERE task_id = $1)
-			FROM kingres_cp.rebalance_move WHERE task_id = $1`,
+			FROM kingres_cp.rebalance_move WHERE task_id = $1
+			HAVING NOT EXISTS (SELECT 1 FROM kingres_cp.rebalance_move WHERE task_id = $1 AND database_name = $2 AND colocation_id = $3
+				AND bucket = $4 AND state = 'skipped' AND error = $10
+				AND round = (SELECT round FROM kingres_cp.rebalance_run WHERE task_id = $1))`,
 			r.TaskID, m.Database, m.Colocation, m.Bucket, m.From, m.To, fromServer, toServer, m.Size, clipText(reason+": "+detail, 500))
 		return err
 	})
 }
 
 const moveCols = `seq, database_name, colocation_id, bucket, from_group, to_group, coalesce(from_server, ''), coalesce(to_server, ''), state, attempts,
-	coalesce(move_id, 0), coalesce(phase, ''), percent, size_bytes, started_at, finished_at, coalesce(error, ''), round`
+	coalesce(move_id, 0), coalesce(phase, ''), percent, size_bytes, started_at, finished_at, coalesce(error, ''), round, ext_mark`
 
 // ScanMove reads a move from a row of moveCols.
 func ScanMove(row pgx.Row) (MoveRow, error) {
 	var m MoveRow
 	var pct float32
+	var mark *int64
 	err := row.Scan(&m.Seq, &m.Move.Database, &m.Move.Colocation, &m.Move.Bucket, &m.Move.From, &m.Move.To, &m.FromServer, &m.ToServer,
-		&m.State, &m.Attempts, &m.ExtMoveID, &m.Phase, &pct, &m.Size, &m.StartedAt, &m.FinishedAt, &m.Error, &m.Round)
+		&m.State, &m.Attempts, &m.ExtMoveID, &m.Phase, &pct, &m.Size, &m.StartedAt, &m.FinishedAt, &m.Error, &m.Round, &mark)
+	if mark != nil {
+		m.After, m.Marked = *mark, true
+	}
 	m.Percent = float64(pct)
 	m.Move.Size = m.Size
 	if m.State == MoveSkipped {
@@ -1006,4 +1042,13 @@ func (b *PG) maxCallWait() time.Duration {
 		return b.MaxCallWait
 	}
 	return guardMaxWait
+}
+
+// SetMark implements Rows: the mark is kept with the row of the move, so that a holder that takes over
+// finds the record of the call without comparing clocks (ST-05).
+func (r *PGRows) SetMark(ctx context.Context, seq int, mark int64) error {
+	return r.leased(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE kingres_cp.rebalance_move SET ext_mark = $3 WHERE task_id = $1 AND seq = $2`, r.TaskID, seq, mark)
+		return err
+	})
 }

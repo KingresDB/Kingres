@@ -396,6 +396,19 @@ func exitRows(x *exitEnv) []exitRow {
 		fn("applyState:conflict#3", 1, fork(false)), fn("applyState:conflict#3", 4, fork(true)),
 		fn("conflict:finishFailedWith#1", 1, fork(false)), fn("conflict:finishFailedWith#1", 4, fork(true)),
 	)
+	// a conflict with a held checkpoint that rests only on a revoked key (L14-02):
+	// status 1; never 4, which is for a fork whose evidence was lost
+	add(
+		fn("weakConflict:finishFailedWith#1", 1, func(t *testing.T) []string {
+			st := x.stateAt700()
+			s2 := newSigner(77)
+			tr := trustOf(t, keySpec{"old", x.p.signer, `,"revoked":true`}, keySpec{"new", s2, ""})
+			dir := t.TempDir()
+			publishLog(t, dir, s2, x.p.all, 300)
+			return []string{"checkpoint", "--trust", tr, "--log", x.p.log(), "--source", dir, "--state", st}
+		}),
+		never("weakConflict:finishFailedWith#1", 4, "a conflict with a state that rests only on keys the trust file no longer counts is not a finding about the log, so a lost evidence file is not status 4"),
+	)
 
 	// ---- finishPub, the router of the publication problems ----
 	add(
@@ -620,7 +633,7 @@ func commandOfSite(site string) string {
 		return "digest-chain"
 	case "runBlocks":
 		return "blocks"
-	case "runCheckpoint", "applyState", "conflict":
+	case "runCheckpoint", "applyState", "conflict", "weakConflict":
 		return "checkpoint"
 	case "runConsistency":
 		return "consistency"

@@ -160,11 +160,11 @@ END $$;
 SELECT public.p_run_super();
 SELECT who, form, outcome FROM p_results ORDER BY form;
 SELECT check_name, object FROM kingres.ledger_verify() ORDER BY 1, 2;
--- A registration that is half made: the identity was issued (an enable that was
--- rolled back used it), the table has the capture trigger and nothing else of a
+-- A registration that is half made: the identity is the next free one (as an enable
+-- would take it), the table has the capture trigger and nothing else of a
 -- ledger table.  ledger_register_table refuses it, with ledger_table_defects.
-BEGIN; CREATE TABLE p_gap (id int); SELECT kingres.ledger_enable('p_gap') IS NULL AS enabled; ROLLBACK;
-SELECT last_value AS gap_id FROM kingres.ledger_table_table_id_seq \gset
+-- (the next free identifier of the registry: no table has it yet)
+SELECT COALESCE(max(table_id), 0) + 1 AS gap_id FROM kingres.ledger_table \gset
 \c - kl_p_inh
 SET search_path = public;
 CREATE TABLE p_half (id int);

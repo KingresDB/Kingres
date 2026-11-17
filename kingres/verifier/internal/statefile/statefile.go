@@ -146,16 +146,19 @@ var errStop = errors.New("stopped by the test")
 
 // removeLeftovers deletes temporary files of this state that an earlier
 // crashed run left. The caller holds the lock, so nobody else is writing.
-func removeLeftovers(path string) {
-	ents, err := os.ReadDir(filepath.Dir(path))
+func removeLeftovers(path string) { removeTemps(filepath.Dir(path), tmpPrefix(path)) }
+
+// removeTemps deletes the files of dir whose names start with pre and end in
+// ".tmp".
+func removeTemps(dir, pre string) {
+	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
-	pre := tmpPrefix(path)
 	for _, e := range ents {
 		n := e.Name()
 		if len(n) > len(pre) && n[:len(pre)] == pre && filepath.Ext(n) == ".tmp" {
-			_ = os.Remove(filepath.Join(filepath.Dir(path), n))
+			_ = os.Remove(filepath.Join(dir, n))
 		}
 	}
 }
@@ -164,12 +167,32 @@ func removeLeftovers(path string) {
 // directory, flushed, renamed over the state, and the directory flushed, so
 // that after a crash at any point the state is the old file or the new one,
 // whole. The caller holds the lock.
-func Replace(path string, data []byte) (err error) {
+func Replace(path string, data []byte) error {
+	p, err := Prepare(path, data)
+	if err != nil {
+		return err
+	}
+	return p.Commit()
+}
+
+// Prepared is a new state that is written and flushed in a temporary file and
+// not yet in place (L14-04). Replace is Prepare and Commit; a caller that must
+// look at the state once more before it moves it does so between the two, so that
+// the time between that look and the rename is only the rename.
+type Prepared struct {
+	path, tmp string
+	stopped   bool
+}
+
+// Prepare creates the temporary file beside the state, writes data to it and
+// flushes it. Nothing of the state changes. The caller holds the lock. It must
+// be followed by Commit or by Abort.
+func Prepare(path string, data []byte) (p *Prepared, err error) {
 	dir := filepath.Dir(path)
 	removeLeftovers(path)
 	f, err := ops.CreateTemp(dir, tmpPrefix(path)+"*.tmp")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	tmp := f.Name()
 	stopped := false
@@ -194,32 +217,53 @@ func Replace(path string, data []byte) (err error) {
 	_ = f.Chmod(mode)
 	if _, err = f.Write(data); err != nil {
 		_ = f.Close()
-		return err
+		return nil, err
 	}
 	if err = step("written"); err != nil {
 		_ = f.Close()
-		return fail(err)
+		return nil, fail(err)
 	}
 	if err = f.Sync(); err != nil {
 		_ = f.Close()
-		return err
+		return nil, err
 	}
 	if err = f.Close(); err != nil {
-		return err
+		return nil, err
 	}
 	if err = step("synced"); err != nil {
-		return fail(err)
+		return nil, fail(err)
 	}
-	if err = ops.Rename(tmp, path); err != nil {
+	return &Prepared{path: path, tmp: tmp}, nil
+}
+
+// Abort removes the temporary file of a state that will not be put in place.
+func (p *Prepared) Abort() { _ = os.Remove(p.tmp) }
+
+// Commit renames the temporary file over the state and flushes the directory.
+// After an error the temporary file is removed, unless the error is a test's
+// stand-in for the end of the process.
+func (p *Prepared) Commit() (err error) {
+	defer func() {
+		if err != nil && !p.stopped {
+			_ = os.Remove(p.tmp)
+		}
+	}()
+	fail := func(e error) error {
+		if errors.Is(e, errStop) {
+			p.stopped = true
+		}
+		return e
+	}
+	if err = ops.Rename(p.tmp, p.path); err != nil {
 		return err
 	}
 	if err = step("renamed"); err != nil {
 		return fail(err)
 	}
-	if err = ops.SyncDir(dir); err != nil {
+	if err = ops.SyncDir(filepath.Dir(p.path)); err != nil {
 		return err
 	}
-	return step("dirsynced")
+	return fail(step("dirsynced"))
 }
 
 // ErrStateChanged is returned by ReplaceIfUnchanged when the file on disk is not
@@ -227,29 +271,41 @@ func Replace(path string, data []byte) (err error) {
 var ErrStateChanged = errors.New("the state file changed while this run was working on it")
 
 // ReplaceIfUnchanged is Replace for a caller that decided on the content it read
-// earlier (was; existed says whether there was a file): it reads the file again
-// immediately before the rename and refuses, writing nothing, when it is not
-// what was read. The lock already excludes every run of this program; this is the
-// second line, so that a writer that does not take the lock, or one that holds a
-// lock on another file, can not be overwritten by a decision made on an older
-// state (L12-02: a late writer moved the state backwards). What is left is the
-// time between this read and the rename, a few microseconds, for a writer that
-// ignores the lock; no file system call closes it without a lock.
+// earlier (was; existed says whether there was a file): the new state is first
+// written and flushed in a temporary file (Prepare), then the state is read again
+// and the run refuses, writing nothing, when it is not what was read, and only
+// then is the temporary file renamed over it (Commit). The lock already excludes
+// every run of this program; this is the second line, so that a writer that does
+// not take the lock, or one that holds a lock on another file, can not be
+// overwritten by a decision made on an older state (L12-02: a late writer moved
+// the state backwards). What is left is the time between that read and the
+// rename, for a writer that ignores the lock (L14-04: the README gives the
+// measured figure); no call of the file system closes it without a lock.
 func ReplaceIfUnchanged(path string, data, was []byte, existed bool, limit int64) error {
+	p, err := Prepare(path, data)
+	if err != nil {
+		return err
+	}
 	now, err := safefile.ReadArg(path, limit)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		if existed {
-			return fmt.Errorf("%w: it is gone", ErrStateChanged)
+			err = fmt.Errorf("%w: it is gone", ErrStateChanged)
+		} else {
+			err = nil
 		}
 	case err != nil:
-		return fmt.Errorf("%w: %v", ErrStateChanged, err)
+		err = fmt.Errorf("%w: %v", ErrStateChanged, err)
 	case !existed:
-		return fmt.Errorf("%w: it did not exist and does now", ErrStateChanged)
+		err = fmt.Errorf("%w: it did not exist and does now", ErrStateChanged)
 	case !bytes.Equal(now, was):
-		return fmt.Errorf("%w: its content is not what was read", ErrStateChanged)
+		err = fmt.Errorf("%w: its content is not what was read", ErrStateChanged)
 	}
-	return Replace(path, data)
+	if err != nil {
+		p.Abort()
+		return err
+	}
+	return p.Commit()
 }
 
 // ConflictPath is where the evidence of a fork or rollback is kept: next to
@@ -309,18 +365,15 @@ func SaveConflict(path string, size uint64, root []byte, note []byte) (Saved, er
 // therefore one file, whichever of them were served on which run (L12-03).
 func SaveConflictMerging(path string, size uint64, root []byte, note []byte, merge func(have []byte) (merged []byte, same bool)) (Saved, error) {
 	base := ConflictPath(path, size, root)
+	removeTemps(filepath.Dir(path), evidencePrefix(path))
 	var last error
 	for i := 0; i < maxConflictNames; i++ {
 		p := base
 		if i > 0 {
 			p = fmt.Sprintf("%s-%d", base, i+1)
 		}
-		f, err := safefile.OpenNoFollow(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		err := createEvidence(path, p, note)
 		if err == nil {
-			if err = writeAndSync(f, note); err != nil {
-				_ = os.Remove(p)
-				return Saved{Path: p}, err
-			}
 			return Saved{Path: p}, nil
 		}
 		if !errors.Is(err, os.ErrExist) {
@@ -349,6 +402,115 @@ func SaveConflictMerging(path string, size uint64, root []byte, note []byte, mer
 		last = fmt.Errorf("%s exists and is not this note", p)
 	}
 	return Saved{Path: base}, fmt.Errorf("%w (%d names tried, the last: %v)", ErrConflictNames, maxConflictNames, last)
+}
+
+// evidencePrefix is the start of the temporary files of the evidence beside one
+// state.
+func evidencePrefix(state string) string { return ".kingres-evidence-" + tag(state) + "-" }
+
+// linkFn is how a finished temporary file is given its final name; a test
+// replaces it. Production code never sets it.
+var linkFn = os.Link
+
+// createEvidence creates the file p with data, and never a file that is empty or
+// half written (L14-09): the data is written and flushed to a temporary file in
+// the same directory and the file is then linked to its name, which fails when
+// the name exists (os.ErrExist, a link at the name included: the link call does not
+// follow one). A stop at any point leaves a temporary file, which the next run
+// removes, and no file at the name. A file system that cannot link gets the
+// older way, an exclusive create and a write, which can leave an empty file after a
+// stop; the next run then takes another name for the evidence.
+func createEvidence(state, p string, data []byte) error {
+	dir := filepath.Dir(p)
+	f, err := ops.CreateTemp(dir, evidencePrefix(state)+"*.tmp")
+	if err != nil {
+		return createEvidenceInPlace(p, data)
+	}
+	tmp := f.Name()
+	stopped := false
+	defer func() {
+		if !stopped {
+			_ = os.Remove(tmp)
+		}
+	}()
+	_ = f.Chmod(0o600)
+	if _, err = f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err = step("evidence-written"); err != nil {
+		_ = f.Close()
+		stopped = errors.Is(err, errStop)
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	if err = linkFn(tmp, p); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return err
+		}
+		return createEvidenceInPlace(p, data)
+	}
+	if err = step("evidence-linked"); err != nil {
+		stopped = errors.Is(err, errStop)
+		return err
+	}
+	return ops.SyncDir(dir)
+}
+
+// createEvidenceInPlace is the exclusive create and write, for a file system
+// that cannot link.
+func createEvidenceInPlace(p string, data []byte) error {
+	f, err := safefile.OpenNoFollow(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if err = writeAndSync(f, data); err != nil {
+		_ = os.Remove(p)
+		return err
+	}
+	return nil
+}
+
+// WeakConflictPath is the one name of the evidence of a conflict with a held
+// checkpoint that rests only on keys the trust file no longer counts: it
+// depends on the held checkpoint and on nothing that the log serves, so that the
+// conflicts of any number of runs, and of any number of sizes of the log, are
+// one file at most.
+func WeakConflictPath(path string, heldSize uint64, heldRoot []byte) string {
+	base := filepath.Base(path)
+	if len(base) > 100 {
+		base = "state-" + tag(path)
+	}
+	return filepath.Join(filepath.Dir(path), fmt.Sprintf("%s.conflict-weak-%d-%x", base, heldSize, heldRoot))
+}
+
+// SaveWeakConflict keeps the first note that conflicted with a held checkpoint
+// that rests only on keys the trust file no longer counts, and no later one: a
+// log that grows would otherwise make a file at each run. The name is
+// WeakConflictPath. When the name is taken, valid says whether what is there is
+// a note of this kind (a file someone put there is not); the note is not added
+// to it, and Saved.Existing is true.
+func SaveWeakConflict(path string, heldSize uint64, heldRoot []byte, note []byte, valid func(have []byte) bool) (Saved, error) {
+	p := WeakConflictPath(path, heldSize, heldRoot)
+	removeTemps(filepath.Dir(path), evidencePrefix(path))
+	err := createEvidence(path, p, note)
+	if err == nil {
+		return Saved{Path: p}, nil
+	}
+	if !errors.Is(err, os.ErrExist) {
+		return Saved{Path: p}, err
+	}
+	have, rerr := safefile.ReadNoFollow(p, 2*MaxEvidence)
+	if rerr != nil || !valid(have) {
+		return Saved{Path: p}, fmt.Errorf("%s exists and is not a signed checkpoint of this log", p)
+	}
+	return Saved{Path: p, Existing: true}, nil
 }
 
 func writeAndSync(f *os.File, data []byte) error {

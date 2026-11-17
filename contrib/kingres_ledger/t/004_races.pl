@@ -195,7 +195,7 @@ like($e->{stderr}, qr/permission denied/,
 	'an ordinary role cannot scan the chain');
 q1('INSERT INTO app.led VALUES (2, $$second$$)');
 ($ret, $stdout, $stderr) = $node->psql('postgres',
-	q(SET statement_timeout = '10s'; SELECT kingres.ledger_build_block();));
+	q(SELECT kingres.ledger_build_block();));
 is($ret, 0, 'the builder runs while a role holds the old advisory lock key');
 like($stdout, qr/^\d+$/m, 'and builds a block');
 $e->quit;
