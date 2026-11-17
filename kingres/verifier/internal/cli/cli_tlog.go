@@ -23,7 +23,7 @@ import (
 
 // exitTextWith3 is the exit status line of the commands that can end with
 // status 3.
-const exitTextWith3 = "0 verified, 1 verification failed, 2 usage or input error,\n3 incomplete: nothing failed, but something asked for could not be checked, for example a file\nthe publication should hold is not there. Treat 3 as an alert, never as \"probably fine\"."
+const exitTextWith3 = "0 verified, 1 verification failed, 2 usage or input error,\n3 incomplete: nothing failed, but something asked for could not be checked, for example a file\nthe publication should hold is not there. Treat 3 as an alert, never as \"probably fine\".\n4 (checkpoint --state only) a fork or a rollback was found, as 1 says, and its evidence could not be saved: keep the note you were shown."
 
 // ---- the log named on the command line ----
 
@@ -355,7 +355,7 @@ const rollbackLine = "that this is the latest checkpoint: an older genuine check
 	"Keep the last checkpoint you verified and run consistency --old <that file>, or give --state FILE, or give --min-size"
 
 func (e *env) runCheckpoint(args []string) int {
-	fs, asJSON := e.newFlagsWithExit("checkpoint", "--trust FILE --log chain:<id>[:e<N>]|aggregate:<id> [--source DIR | --note FILE] [--min-size N] [--state FILE] [--now TIME] [--json]",
+	fs, asJSON := e.newFlagsWithExit("checkpoint", "--trust FILE --log chain:<id>[:e<N>]|aggregate:<id> [--source DIR | --note FILE] [--min-size N] [--state FILE [--allow-shared-state-dir]] [--now TIME] [--json]",
 		"Verify a signed checkpoint of a tile log: the note is well formed, at least one signature is\n"+
 			"by a key of the trust file that may be used now, no signature of such a key is wrong, the\n"+
 			"origin is the one of the named log below the trusted prefix, the tree size is within what\n"+
@@ -378,6 +378,7 @@ func (e *env) runCheckpoint(args []string) int {
 	note := fs.String("note", "", "checkpoint file to verify instead of the one in --source")
 	minSize := fs.Uint64("min-size", 0, "fail when the tree size is smaller than this")
 	statePath := fs.String("state", "", "state file: the last checkpoint proved here; moves only to a checkpoint proved to extend it")
+	allowShared := fs.Bool("allow-shared-state-dir", false, "accept a state directory or file that another user owns or that group or others can write (Unix); refused by default")
 	nowFlag := fs.String("now", "", "time for key validity windows, RFC 3339 (default: system clock)")
 	if code, done := e.parseFlags(fs, args); done {
 		return code
@@ -439,7 +440,7 @@ func (e *env) runCheckpoint(args []string) int {
 	}
 	if *statePath == "" {
 		r.notProved = append([]string{rollbackLine}, r.notProved...)
-	} else if code, done := e.applyState(r, in, cp, data, signers, *statePath, *asJSON); done {
+	} else if code, done := e.applyState(r, in, cp, data, signers, *statePath, *asJSON, *allowShared); done {
 		return code
 	}
 	return e.finishOK(r, *asJSON)
@@ -505,7 +506,7 @@ func (e *env) runConsistency(args []string) int {
 		// (malformed, not signed by a key they trust, a revoked key, beyond a
 		// key's limit) means it cannot serve as their anchor: status 2, as for
 		// --state. A wrong history is found by the proof below, as status 1.
-		fileData, err := readArg(*oldFlag, 3*signednote.MaxNoteSize)
+		fileData, err := readArg(*oldFlag, maxStateFile)
 		if err != nil {
 			return e.inputError(cmd, *asJSON, err)
 		}
@@ -517,7 +518,7 @@ func (e *env) runConsistency(args []string) int {
 			return e.inputError(cmd, *asJSON, fmt.Errorf("--old %s is not a signed note: %w", clipArg(*oldFlag), err))
 		}
 		oldSigned = true
-		cp, _, oldNotes, verr := in.verifyHeld(oldData, "--old "+clipArg(*oldFlag))
+		cp, _, oldNotes, verr := in.verifyHeld(oldData, rec, "--old "+clipArg(*oldFlag))
 		if verr != nil {
 			var ie *inputErr
 			if errors.As(verr, &ie) {

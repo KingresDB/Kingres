@@ -60,16 +60,42 @@ committed). `go.mod` has no `require` line: only the standard library is used.
 | Status | Meaning |
 |---|---|
 | 0 | everything that was asked for was verified (`VERIFIED` or `CONSISTENT` is printed) |
-| 1 | a verification failed (the failed step is named), or the publication holds a file in a form it must not have (a symbolic link on the way, a directory, device or named pipe, a file over its size limit, a tile of the wrong size); the word `VERIFIED` is never printed |
-| 2 | usage or input error: a flag is missing or wrong, a file or directory **you named** cannot be read (it is absent, not a regular file, too large) or is malformed (digest, columns file, trust file, state file, block export when it cannot be parsed as an export), or no key of the trust file can be used at the time given, or **a checkpoint you hold** (`--state`, `--old FILE`) cannot serve as your anchor (no key of the trust file signed it, or only a revoked one, or one beyond its `max_tree_size`), or the state file stayed locked by another run for 10 seconds; nothing was verified |
+| 1 | a verification failed (the failed step is named), or the publication holds a file in a form it must not have (a symbolic link on the way, a directory, device or named pipe, a file over its size limit, a tile of the wrong size), or the thing under test cannot be parsed (a proof, a block export, a checkpoint note); the word `VERIFIED` is never printed |
+| 2 | usage or input error: a flag is missing or wrong, a file or directory **you named** cannot be read (it is absent, not a regular file, too large) or is malformed (digest, columns file, trust file, state file), or no key of the trust file can be used at the time given, or **a checkpoint you hold** (`--state`, `--old FILE`) cannot serve as your anchor (no key of the trust file signed it, or only a revoked one, or one beyond its `max_tree_size`), or the state file stayed locked by another run for 10 seconds; nothing was verified |
 | 3 | incomplete: nothing failed, but **the publication does not contain something that was asked for** (a checkpoint, a tile, the directory of a log); `INCOMPLETE` is printed and the missing items are listed; `VERIFIED` is never printed. **Treat 3 as an alert, never as "probably fine"**: a publisher must serve the tiles of every checkpoint it signed, so one that withholds exactly the tiles that would show a fork gets status 3 and not status 1, and a missing file is at best neglect. Only the commands of phase 7 (`checkpoint`, `consistency`) can end with 3; a failure always wins over an incomplete check |
+| 4 | a fork or a rollback was found, which is what status 1 says for it, **and the conflicting checkpoint could not be saved** (every name for the evidence is taken by a file with other content, or the disk refuses it); `FAILED at step fork` (or `rollback`) is printed with a note that says `was NOT saved`. The finding stands and is as serious as a 1: act on the fork and save the note you were shown yourself. Only `checkpoint --state` can end with 4 |
 
-A malformed **proof** is a failed verification (status 1, step `parse`): the
-proof is the thing under test. A malformed **digest** is an input error
+A malformed **proof** or **block export** is a failed verification (status 1, step
+`parse`): it is the thing under test. A malformed **digest** is an input error
 (status 2): the trusted anchor is unusable. `--json` prints one JSON object
 (`command`, `verified`, `steps`, `failed_step`, `error`, `notes`, `not_proved`, `info`, `problems`,
-and for status 3 `incomplete` and `missing`)
-instead of text; the exit status is the same.
+for status 3 `incomplete` and `missing`, and `invalid_utf8` when a string had bytes that
+are not UTF-8) instead of text; the exit status is the same.
+
+**Which command ends with which status.** The statuses of each command are the ones its exit
+sites in the source can give; `TestEveryExitSiteHasARowAndAScenario` reads the sites from the
+source (every call of a finish function, of the flag parser and of `exit`) and fails when one
+has no row or when the scenario of a row does not reach it with its status, and
+`TestReadmeTableOfStatusesIsTheTableOfTheCode` fails when this table differs from the rows.
+Status 0 of a command that has none for a failure is a success; `trust` alone is a missing or
+unknown subcommand.
+
+| Command | Statuses it can end with |
+|---|---|
+| `proof` | 0, 1, 2 |
+| `row-hash` | 0, 2 |
+| `digest-chain` | 0, 1, 2 |
+| `blocks` | 0, 1, 2 |
+| `checkpoint` | 0, 1, 2, 3, 4 |
+| `consistency` | 0, 1, 2, 3 |
+| `trust init` | 0, 2 |
+| `trust show` | 0, 2 |
+| `trust` | 2 |
+
+**Status 3 is not a pass.** It means that the publication did not contain something that was
+asked for. A publisher that wants to hide a fork can withhold exactly the tile or the file
+that would have shown it, and the run then ends with 3 and not with 1; it can never end with
+0. Treat 3 like 1 when you decide what to do, and ask the publisher for the missing files.
 
 Text and JSON are made from one structure: every `ok` step, `note`, `not proved`,
 `missing` and `problems` line of the text is a member of the JSON (`steps`,
@@ -79,18 +105,40 @@ how the run was made (the clock that was used, a key that was left out and why, 
 file that was written); `not_proved` is what a success does not show. A failed result
 carries its notes too.
 
-**Text from the inputs is escaped.** A file name, a key of a JSON file, a label, a path
+**Text from the inputs is escaped, one to one.** A file name, a key of a JSON file, a label, a path
 on the command line or an error text that quotes them can come from the publisher or the
 database server. In the text output (and on the standard error, in both formats) every
-such string is written by one function: control characters (newline, carriage return,
-tab, escape, the C1 range, DEL) become `\n`, `\r`, `\t`, `\xNN`; bytes that are not UTF-8
-become `\xNN`; the Unicode bidirectional marks and overrides, the line and paragraph
-separators, the byte order mark and the other format characters become `\uNNNN`; a value
-longer than 2,048 bytes is cut and says how much was cut. A backslash is left as it is.
+such string is written by one function, and what it writes can be read back exactly:
+
+- a backslash is written `\`, so that no input can write an escape or the cut marker;
+- a control character (the C0 range, newline and tab included, and DEL) is written `\xNN`
+  (a newline is `\x0a`, escape `\x1b`); a byte that is not part of valid UTF-8 is written `\xNN`
+  too, with `NN` of 80 or more, which a valid character never gives;
+- any other character that changes how text is drawn or split or that is not printable (the
+  C1 range, the bidirectional marks, overrides and isolates, the line and paragraph separators,
+  the byte order mark, zero width and other format characters) is written `\uNNNN`, or
+  `\UNNNNNNNN` above U+FFFF, in lower case hex;
+- a value of more than 2,048 bytes is cut at a character boundary and ends with
+  `\...(cut: N of M bytes shown)`: `\.` is never written for any other input, so no input can
+  print the marker, and M is the original length;
+- everything else is written as it is.
+
+To read it back: `\` is a backslash, `\xNN` the byte NN, `\uNNNN` and `\UNNNNNNNN` the
+character, and the cut marker ends the text. A message that quotes a value between double
+quotes was quoted by Go first (`%q`) and then escaped, so undo the escape first and then Go's
+quoting. A real newline and the two characters backslash and `n` print differently
+(`\x0a` and `\n`), and `TestUntrustedIsOneToOne` and a fuzz target test that two different
+inputs never print the same and that the original comes back when it was not cut.
 So no input can start a line (`VERIFIED:`, `FAILED at step`, `  ok  `, `  note:` ...) or
-move the terminal, and a test fails when code outside the output layer prints. The JSON
-output is ordinary JSON and carries the strings as they are (the encoder escapes them);
-do not copy it to a terminal without a tool that does the same.
+move the terminal, and `TestNoPrintOutsideTheOutputLayer` reads the source and fails when code
+outside the output layer prints anything but literals or a value that went through the function.
+
+The JSON output escapes the same characters: everything above that the text writes as an
+escape is written in the JSON as a `\uXXXX` escape (a pair of them above U+FFFF), so a JSON
+file shown on a terminal cannot move it either; `<`, `>` and `&` are written as they are.
+A JSON string cannot carry bytes that are not UTF-8: each becomes U+FFFD and the object has
+`"invalid_utf8": true` (a real U+FFFD in the input does not set it). The JSON gives the
+strings as they are, without the doubled backslash: a program reads them, a person reads the text.
 
 ## Subcommands
 
@@ -196,8 +244,15 @@ decrease in generation order (otherwise the database went back to an earlier
 state). At least two digests are required. Exit status 1 lists every problem.
 A directory is listed by name (a directory called `x[ab]` is that directory, never a
 pattern) and is read through the same helper as a source: at most 1,024 entries, no link
-followed. At most 1,024 digest files are read in all (named or in a directory), at most
-64 MiB together (each at most 16 MiB); more is status 2.
+followed. At most 1,024 digest files are read in all (named or in a directory), each at most
+64 KiB (a digest is a few hundred bytes) and 16 MiB together; more is status 2.
+
+**Names in a digest directory.** A name the directory listing returns is a name, whatever
+it holds (a colon, a space, a leading dash, a backslash on Linux): it is never read as a
+path, so only what cannot be one entry is refused (nothing, `.`, `..`, a slash, a NUL, more
+than 255 bytes). The export command of this README (below) makes names without a colon
+(`digest-20261114T172153Z.json`), which every file system holds, and a test runs the very text
+of that command, as far as it can run without a database, and reads the directory it fills.
 
 It does **not** prove that the blocks between the digests are intact, that any
 row is in the ledger, or that any digest is authentic; `generated_at` is not
@@ -222,7 +277,24 @@ with the file: a measured run over 1.2 million blocks (a 400 MB file) used 12 MB
 resident memory, where reading the whole file and all headers (the earlier version) used
 1.15 GB (2.9 times the file). A line is at most 1 MiB and the file at most 1 GiB. The
 first problem in file order is reported, so a later damage is found only if no earlier
-one stops the run (a parse failure and a chain failure are both status 1).
+one stops the run (a parse failure and a chain failure are both status 1, because the
+export is the thing under test). A read error, a line over the limit or a line that is
+cut in the middle after a good start is such a failure at the step `parse`, never "verified
+up to the cut".
+
+**What `blocks` establishes, and what it does not.** What it proves is that the blocks it
+read are a chain: from the genesis hash of this chain id, dense heights, every hash
+recomputed, times that do not go back, and with `--digest` a block at the digest's height
+that the digest names. The output says how far that goes: `the N block headers read (heights
+0 to H) form an unbroken chain from the genesis hash`, with the hash of block H, and in
+`--json` `info.blocks`, `info.head_height`, `info.head_hash` and `info.complete_export_shown`
+(always `false`). **It cannot tell a complete export from one that was cut**: the hash of a
+block does not say whether another follows, so an export that ends at any block verifies the
+same way. Without `--digest` the output says that; with one it says that the digest covers up
+to its height and that blocks after it, or an end before the head of the ledger, are not
+covered. An export that ends before the digest's height is a failure at the step `digest`.
+To know that the export is the whole chain, compare block H with a digest you hold of height
+H or above, or with the head the ledger reported when you made the export.
 
 Each line has the header fields: `height`, `hash_version`, `prev_hash`,
 `tx_merkle_root`, `tx_count`, `closed_at_us` (microseconds since 2000-01-01 UTC,
@@ -250,7 +322,7 @@ built from the public C2SP texts `signed-note`, `tlog-checkpoint` and
 ```
 kingres-verify trust init --origin-prefix P (--public-key B64 | --public-key-file F) --fingerprint HEX [--name LABEL] [--out FILE|-]
 kingres-verify trust show --trust trust.json [--now TIME] [--json]
-kingres-verify checkpoint --trust trust.json --log chain:<id>[:e<N>]|aggregate:<id> [--source DIR | --note FILE] [--min-size N] [--state FILE] [--now TIME] [--json]
+kingres-verify checkpoint --trust trust.json --log chain:<id>[:e<N>]|aggregate:<id> [--source DIR | --note FILE] [--min-size N] [--state FILE [--allow-shared-state-dir]] [--now TIME] [--json]
 kingres-verify consistency --trust trust.json --log <as above> --old NOTEFILE|SIZE:ROOT [--new NOTEFILE] [--source DIR] [--now TIME] [--json]
 ```
 
@@ -306,8 +378,7 @@ proved: that this is the latest checkpoint ... (rollback)"). There are three way
   state and says that nothing earlier was known. The same checkpoint again changes nothing and
   needs no tile. A smaller size, the same size with another root, or a path that does not lead to
   the stored root is **status 1**: the state is left untouched, the conflicting note is saved
-  next to it as `<state>.conflict-<size>-<first 8 hex of the root>` (a name of more than 100
-  bytes is shortened), and the output names both files: two notes signed by the same key for
+  next to it as `<state>.conflict-<size>-<root in hex>` (see "The evidence of a fork"), and the output names both files: two notes signed by the same key for
   trees that are not one history are the proof of misbehaviour, so **keep both**. A smaller size
   is reported as `rollback` and may be an old genuine checkpoint or another history; this run does
   not tell which. If the tiles are missing the result is **status 3** and the state stays; if a tile
@@ -324,18 +395,78 @@ proved: that this is the latest checkpoint ... (rollback)"). There are three way
 
 **The state file** is a small JSON record (`format`, `log` the origin, `size`, `root`,
 `verified_at`, `verified_by` the fingerprints of the keys, `note` the signed note). The facts are
-for the reader; no decision depends on them (a person who can write the file can also delete it,
-and the note still has to carry a valid signature of a key of the trust file that is not revoked).
+for the reader, and they must agree with the note (see "What a state file must be"); the decision
+is the note's: it still has to carry a valid signature of a key of the trust file that is not
+revoked (a person who can write the file can also delete it).
 It may be a link (the state is replaced where the link points, the link stays a link; a link to
-nothing is refused). A new state file has mode 0644, a replaced one keeps its mode. The helper
-files (`.kingres-state-<12 hex>.lock` and the temporary file) have a short name that does not depend on
-the length of the state's name. The state file is locked with `flock` (Linux, macOS) or `LockFileEx`
-(Windows) on `.kingres-state-<12 hex>.lock` next to it for the whole read, check, proof and replace;
-another run waits up to 10 seconds and then ends with status 2 (nothing changed), so two runs
-never move the state backwards. A reader that does not take the lock (`consistency --old STATE`) can on
+nothing is refused). A new state file has mode 0600, a replaced one keeps its mode. The temporary file has a short
+name that does not depend on the length of the state's name. The state file is locked with `flock`
+(Linux, macOS) or `LockFileEx` (Windows) on `.kingres-state.lock` in its directory for the whole read,
+check, proof and replace; another run waits up to 10 seconds and then ends with status 2 (nothing
+changed), so two runs never move the state backwards. A reader that does not take the lock (`consistency --old STATE`) can on
 Windows meet a sharing error while the file is replaced; run it again. A crash leaves the old state or the new
 one, whole, and at worst a temporary file that the next run removes (tested by stopping after each
 step, on both platforms). Old state files that are a plain signed note are still read.
+
+**What a state file must be, and what the verifier never writes.** The invariant is that the
+verifier never writes a state it would not read back, and every limit on what is read is a limit
+on what is written, by the same code. A note is bounded where it is parsed (see "Limits"): at most
+64 KiB, 32 lines of text, 32 signatures and 1,024 bytes a line, and at most 16 extension lines
+in a checkpoint, so a signed checkpoint that exceeds them (a validly signed note with an
+extension line of 700,000 characters made a state of 4.2 MB that no later run could read) is
+refused **before anything is stored**, as a failed `parse` (status 1), with the state and the
+folder untouched. The record built from a note is at most twice its size plus a few hundred bytes
+(`<`, `>` and `&` are not rewritten), and the limit on reading a state is that size plus 16 KiB
+(144 KiB), the same constant as on writing. Before a state is stored it is **read back** through
+the functions the next run uses (the same decoder, the same trust file, the same checks of
+"Checkpoints you hold") and must give the checkpoint that was verified: a note that is good as
+a new checkpoint but that a later run would refuse as a held one (a wrong signature of a key
+that is revoked now is ignored for a new note and refused for a held one) is not stored; the
+run ends with status 2, says `cannot be recorded`, and the state is unchanged. The decoder of
+a state is strict: one object, every member exactly once (`format`, `log`, `size`, `root`,
+`verified_at`, `verified_by`, `note`), no unknown member, no text after the record (white space
+is allowed), format 1, the right types, a `verified_at` that is a time, at most 32 fingerprints,
+and the `log`, `size` and `root` of the record must be those of the note it holds (the note
+decides, a record that says otherwise was damaged or edited). Anything else is status 2 and the
+file is never changed or removed. **An empty state file is not "no state"**: a state that lost
+its content (a disk that kept the name and not the data after a power loss) must not make the next
+run record a first checkpoint without any check against a rollback. It is status 2 and says
+so; if you made the file yourself with `touch` it holds nothing to lose (remove it or give
+another name); if it ever held a state, restore your copy, or start a new record with
+`checkpoint --state NEWFILE --min-size N`.
+
+**Where the state may be.** The state is your protection against a rollback, so it must be in a
+directory that only **you** can write and that you own. On Linux and macOS the verifier checks
+the directory (and the state file when it exists): when it belongs to another user or group or
+others can write it (mode `022` bits), `checkpoint --state` is **refused** with status 2 and nothing
+is created, and `--allow-shared-state-dir` accepts it, with a note in the output. A user who can
+write the directory can replace or delete the state, plant a link at the name of the lock or of
+the evidence, or hold the lock for ever. On Windows the access control list of the folder is not
+read: keep the state in a folder only you can write. A new state file, its lock file and the files
+of evidence have mode 0600 (a replaced state keeps its mode). The lock file and the evidence
+are opened **without following a link** and must be regular files (`internal/safefile`, `O_NOFOLLOW`
+on Unix, the reparse point flag on Windows): a link at the name of the lock is status 2 and nothing
+is created where it points.
+
+**What the lock does and does not protect.** The lock is `.kingres-state.lock` in the directory of
+the state (not named after the file), taken with `flock` or `LockFileEx` for the whole read, check,
+proof and replace. It excludes every other run of this program that uses a state in that
+directory, whatever name it gives the file (a hard link in the same directory, two spellings of
+one name on a system that ignores case): the second waits up to 10 seconds and then ends with
+status 2. It does **not** cover two names of one file in different directories (a hard link from
+another directory: a run replaces the name it was given, which does not change the other link),
+a program that does not take it, or a user who can write the directory (see above): use one name
+for a state.
+
+**The evidence of a fork.** When `--state` finds a fork or a rollback the conflicting note is saved
+beside the state as `<state>.conflict-<size>-<the whole root in 64 hex>` (the state's name is
+shortened above 100 bytes), created exclusively and never through a link. When a file is already
+at that name its content is compared: the same note is "already saved" (an earlier run saved it),
+**another content is never called saved**: the next name (`-2`, `-3` and so on, 8 in all) is used. If
+none can be used or the disk refuses, the output says `was NOT saved`, `--json` has
+`info.state.evidence_saved` false and `conflict_file` null, the finding is printed as for a fork,
+and the status is **4**, which is not 0 and is not the 1 of the fork itself: act on the fork and
+save the note you were shown yourself.
 
 **Checkpoints you hold** (`--state`, `--old FILE`; design correction 17). A checkpoint you kept is
 a statement about the past, so it is judged differently from a checkpoint under test, and the same
@@ -388,14 +519,15 @@ Windows the device names (`NUL`, `CON`, `COM1`, ...), the device namespace
 (`\\.\`) and alternate data streams are refused by name. A directory of digests
 or a directory of epochs is read at most 1,024 entries.
 
-**What is status 2, 3 or 1** (one rule for every command, tested path by path in
+**What is status 2, 3 or 1** (one rule for every command, tested site by site in
+`TestEveryExitSiteHasARowAndAScenario` and, for `checkpoint` and `consistency`, in
 `TestExitStatusFollowsTheRule`):
 
 | Status | When | Examples |
 |---|---|---|
 | 2 | what **you** named or hold cannot be used | a missing or malformed `--trust`, `--source`, `--note`, `--old`, `--state`; a held checkpoint no key of the trust file can vouch for (also a bad signature or another log); no key usable at `--now`; `--now` empty or malformed; two epochs of the chain in the source and no `:e<N>` in `--log` (you must name one); the lock of the state; a file of the publication that exists but that your account cannot read (permission denied: it is your copy, so it is not the publisher's absence) |
 | 3 | what the publication **should hold and does not** | no checkpoint file, no tile, a chain directory that holds no epoch directory (with or without `:e<N>`), no chain directory |
-| 1 | what the publication holds in a form it must not have, or the thing **under test** fails | a link, a pipe, a directory, a file over its limit, a tile of the wrong size; `--note`, `--new` or the checkpoint of the source that is malformed, forged, of another log or beyond a key's limit; a wrong root; a fork or a rollback with `--state` |
+| 1 | what the publication holds in a form it must not have, or the thing **under test** fails | a link, a pipe, a directory, a file over its limit, a tile of the wrong size; `--note`, `--new` or the checkpoint of the source that is malformed, forged, of another log or beyond a key's limit; a wrong root; a fork or a rollback with `--state` (4 when its evidence could not be saved) |
 
 A held checkpoint is status 2 and the thing under test status 1 because the first is your anchor
 (a wrong one is your problem) and the second is the claim being checked.
@@ -407,14 +539,14 @@ Formats, with the specification they follow:
   from one or more lines `U+2014 SP name SP base64(4-byte key id || signature)`.
   Key names are non-empty without Unicode spaces or `+`. Base64 must be
   canonical (RFC 4648 3.5), which is checked by re-encoding. Two lines with the
-  same name and key id are rejected (tlog-checkpoint). At most 32 signatures
-  and 1 MiB. Key id = `SHA-256(name || 0x0A || 0x01 || public key)[:4]`.
+  same name and key id are rejected (tlog-checkpoint). At most 32 signatures,
+  32 lines of text, 1,024 bytes a line and 64 KiB in all. Key id = `SHA-256(name || 0x0A || 0x01 || public key)[:4]`.
   A line whose name and key id match no trusted key is ignored; a line that
   matches one must verify, or the whole note is rejected (the specification
   says SHOULD); no verified line means rejection.
 - **Checkpoint** (tlog-checkpoint): at least three non-empty lines, origin,
   size as a canonical decimal below 2^62, root as canonical base64 of 32 bytes;
-  further lines are extension lines, kept and reported but without meaning here.
+  further lines are extension lines (at most 16), kept and reported but without meaning here.
   The origin follows tlog-cosignature: at most 255 bytes, no spaces, `+` or
   control characters. A size 0 checkpoint must carry the hash of the empty
   string. The key name of a log's signature is its origin
@@ -447,6 +579,55 @@ the design and the specification differ, the specification was followed (see
 `kingres-verify version`, `kingres-verify --help`, `kingres-verify <command> --help`
 (all exit with status 0).
 
+## Limits and memory
+
+The files the verifier reads come from a database server, a publisher or a directory somebody
+else filled, and a note can be signed by a key of your trust file and still be hostile. What one
+input can make the program allocate, store or print is therefore bounded by constants, never by
+the shape of the input. **Memory is a constant plus a small multiple of the largest single value
+(one string, one streamed element), never a multiple of the input.**
+
+| What | Limit |
+|---|---|
+| A proof, a columns file | 16 MiB |
+| A digest file | 64 KiB each, 1,024 files and 16 MiB together for `digest-chain` |
+| A trust file | 1 MiB |
+| A signed note (a checkpoint, `--old`, `--new`) | 64 KiB, 32 lines of text, 32 signature lines, 1,024 bytes a line; a checkpoint has at most 16 extension lines |
+| A state file | 144 KiB (twice the largest note and 16 KiB for the rest) |
+| A block export | 1 GiB, 1 MiB a line |
+| A source directory, a digest directory | 1,024 entries |
+| JSON, every file | nesting 32; 16,384 values in a document (a proof counts the elements of `chain` one by one, not together); 1,024 members in an object; 256 bytes in a key; 64 KiB in a string as written (a `send_hex` of a columns file may be 16 MiB); 64 characters in a number; 65,536 characters of white space in a row |
+| A proof's `chain` | read element by element; the headers kept are about 100 bytes each and a header is at least 230 bytes of the file |
+
+What the JSON reader does about each: a document that exceeds a limit is refused at the first
+value that does (`more than 16384 values`, `a string is longer than 65536 bytes`, `nesting deeper
+than 32 levels`), so eight million zeros in a 16 MiB file are not turned into eight million
+nodes (the first version held 2.0 to 2.4 GiB for such a file: a tree of values, each with the
+text of its path); the path of a value is built only when an error says it. A file is read into one
+buffer of its size (not by doubling); the white space between two tokens is bounded because the
+decoder keeps it until the next token.
+
+Measured on Linux, peak resident set of a child process (VmHWM; a run of `version` is 6 MiB),
+the worst of nine hostile shapes (zeros in an array, a nesting of 16 million, a million members, a
+million equal keys, one string of the whole file, a file of white space or of newlines, and a file
+of `{}` lines) for each command that reads a file, at the largest size the command accepts and at 16 MiB:
+
+| Command and file | Peak resident set |
+|---|---|
+| `proof --proof` (16 MiB) | 29 MiB |
+| `proof --proof` with a chain of 49,618 valid headers (15 MiB) | 50 MiB |
+| `proof --digest`, `digest-chain` (64 KiB; 16 MiB is refused unread, 6 MiB) | 14 MiB |
+| `row-hash --columns` (16 MiB, the worst case is one string of the whole file) | 72 MiB |
+| `blocks --blocks` (16 MiB of lines) | 8 MiB |
+| `blocks --digest`, `checkpoint --note`, `--trust`, `consistency --old`, `trust show` | at most 15 MiB |
+| `digest-chain` over a directory of four files of 16 MiB (the review's case, 3.1 GiB before) | 6 MiB (the first is refused by its size, unread) |
+
+`TestPeakResidentSetOfACommandOnAHostileFile` (Linux; it runs the test binary as a child and
+reads its `VmHWM`) fails above the size of the file times five plus 8 MiB over the baseline, and
+`TestAllocationDoesNotGrowWithTheShapeOfTheInput` (every system, in the process of the test)
+measures the peak of the heap with the collector made eager and fails above the same bound. The
+first one is skipped on Windows, which has no `VmHWM`; the second runs there.
+
 ## Exporting from a database
 
 Run these where the database is, then copy the files to the auditor's machine
@@ -454,7 +635,7 @@ Run these where the database is, then copy the files to the auditor's machine
 
 ```
 # digest (builds a block first if transactions are pending); store it OUTSIDE the database
-psql -X -At -c "SELECT kingres.ledger_generate_digest()" > digest-$(date -u +%FT%TZ).json
+psql -X -At -c "SELECT kingres.ledger_generate_digest()" > digest-$(date -u +%Y%m%dT%H%M%SZ).json
 
 # inclusion proof for one row (the row hash is computed by the server here;
 # the auditor recomputes it with row-hash from data they hold)
@@ -768,3 +949,50 @@ these in the verifier; the design has the decisions as corrections 17 to 19.
   on a note is named, `trust show` says what it cannot know.
 - **L8-11**: `blocks` streams; `row-hash --json` no longer says `"verified": true`; the message
   for a regular file given as a source no longer says "special file".
+
+## Findings of the review of the second fixes (L9) and what was changed
+
+The third review (`kingres/docs/reviews/2026-11-17-ledger-phase7-steps-1-2-second-fixes.md`)
+found these in the verifier; each fix has a test that fails without it (shown by removing the
+fix in a copy of the tree).
+
+- **L9-04** (a validly signed note with a long extension line made a state of 4.2 MB that no later
+  run could read): the note is bounded where it is parsed, the record is bounded by the same
+  constant on writing and on reading, and a state is read back through the reader's own functions
+  before it is stored ("What a state file must be"); a property test and a fuzz target write
+  every state they can and read it back.
+- **L9-05** (2 GiB for a 16 MiB JSON file): caps on depth, values, members, key and string
+  length, white space, and the elements of a proof's chain streamed ("Limits and memory"), with a
+  measurement of the peak memory of every command that reads a file.
+- **L9-06**: a directory of digests is read by the names its listing gives; the export command
+  makes names without a colon.
+- **L9-07**: evidence is claimed saved only when a file with its content is there; status 4 when
+  it could not be saved.
+- **L9-08, L9-12**: the lock is opened without following a link, is one per directory, the
+  directory of the state must be private (Unix), and the README says what the lock does not cover.
+- **L9-09**: the table of statuses is derived from the source and tested; `blocks` is status 1 for
+  an export that cannot be parsed.
+- **L9-10**: the escaping is one to one, the cut is marked in a way no input can print, and the JSON
+  escapes what the text escapes.
+- **L9-11**: tests for the mutants that survived (the JSON `extends_state`, the strictness of the
+  state, a stored size of 1, a read error in `blocks`, the printed time, the order of the flushes
+  of the state), and a statement of what `blocks` does and does not show about an export that ends.
+- **L9-13**: the failure seen on Windows (a test directory that cannot be removed at the end of
+  a test, "The directory is not empty") was reproduced, about once in 150 runs of a state
+  command and about once in three runs of the whole suite on a machine with a file scanner, and
+  it is not the program: no handle of the program is left open after a run (a test counts them on
+  Windows, before and after a collection, over 60 runs of three commands), and the directory can
+  be removed some 12 ms later by the same process without anything being closed, so the holder is
+  outside it (a scanner opens a new file for a moment). Nothing was added to retry it. The memory
+  tests write smaller files on Windows so that they give such a scanner less to read. The tests of
+  the state package are named `TestStateFile...`, so the filter `-run 'State|HeldNote'` runs them.
+- **L9-15**: an empty state file is status 2 with advice that keeps the protection.
+
+Changes of interface that a caller can see: exit status 4; the flag `--allow-shared-state-dir`;
+`blocks` output (the headline, one more "not proved" line and `info.blocks`, `info.head_height`,
+`info.head_hash`, `info.complete_export_shown`); `info.extends_state` and
+`info.state.extension_proved` are `false` (not null) for a first use; `info.state.evidence_saved`;
+`"invalid_utf8"`; the state file name `<state>.conflict-<size>-<64 hex>`; the lock file
+`.kingres-state.lock`; a new state file has mode 0600; notes over 64 KiB, with a line over 1,024
+bytes or with more than 16 extension lines are refused; digests over 64 KiB are refused;
+escapes in the text output (`\` for a backslash, `\x0a` for a newline, a cut marker).

@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/problem"
@@ -95,7 +96,9 @@ type MoveRow struct {
 	State      string
 	Attempts   int
 	// ExtMoveID is the id of the extension's own record, 0 while unknown.
-	ExtMoveID  int64
+	ExtMoveID int64
+	// After is the mark taken before the call (in memory only: a row read from the system database has none).
+	After      int64
 	Phase      string
 	Percent    float64
 	Size       *int64
@@ -143,6 +146,10 @@ type Rows interface {
 	StartMove(ctx context.Context, m Move, fromServer, toServer string, attempts int) (seq int, err error)
 	UpdateMove(ctx context.Context, seq int, extID int64, phase string, percent float64) error
 	FinishMove(ctx context.Context, seq int, state, errText, skipReason string, size *int64) error
+	// UndoStart takes back the record of a start that did not happen (the call was not made, or was
+	// withdrawn before the extension recorded the move): attempts is the number the start used, and the
+	// bucket is as if that try had not been made. why is kept as the reason.
+	UndoStart(ctx context.Context, seq, attempts int, why string) error
 	// AddSkipped records a move that was not started, with the reason.
 	AddSkipped(ctx context.Context, m Move, fromServer, toServer, reason, detail string) error
 	Moves(ctx context.Context) ([]MoveRow, error)
@@ -180,14 +187,20 @@ type Backend interface {
 	ServerOf(ctx context.Context, db string, group int32) string
 	// CheckMove verifies the conditions of one move; a *SkipError skips it.
 	CheckMove(ctx context.Context, m Move) error
+	// Mark returns the identity after which the record of the next call for m is: the highest id the
+	// extension has given to a move. The move that the call makes is the one of the bucket with an id above
+	// it, which is told without comparing two clocks (RBR-05).
+	Mark(ctx context.Context, m Move) (after int64, err error)
 	// RunMove executes the move and returns when the bucket is on the target (or
-	// the move failed). It blocks; the loop watches it with Progress.
-	RunMove(ctx context.Context, m Move) error
+	// the move failed). It blocks; the loop watches it with Progress. after is the Mark taken before.
+	// It returns a *NotStartedError when it is certain that no move was started, and it does not
+	// cancel a call that the extension has recorded when ctx ends: the extension owns that move from then on.
+	RunMove(ctx context.Context, m Move, after int64) error
 	// Progress reads the extension's record of the move.
-	Progress(ctx context.Context, m Move, since time.Time) (Progress, error)
+	Progress(ctx context.Context, m Move, ref Ref) (Progress, error)
 	// CancelMove asks the extension to stop the move; stopped is false when it has
 	// passed the point where it can be stopped (it then runs to its end).
-	CancelMove(ctx context.Context, m Move, since time.Time) (stopped bool, err error)
+	CancelMove(ctx context.Context, m Move, ref Ref) (stopped bool, err error)
 	// Recover settles a move that a previous run left running, through the
 	// extension's own functions (resume_bucket_moves). It returns the state the
 	// move ended in: MoveDone, MoveFailed or MoveCancelled.
@@ -195,6 +208,27 @@ type Backend interface {
 	// Cleanup drops the orphan tables whose delay is over (best effort).
 	Cleanup(ctx context.Context)
 }
+
+// Ref says which record of the extension is the move of a call: the one with this id when it is known, else
+// the one of the bucket with an id above After, else (a row left by an earlier holder, whose mark is gone) the
+// one that began at or after Since, both times read from the system database, which is the extension's server.
+type Ref struct {
+	ID    int64
+	After int64
+	Since time.Time
+}
+
+// NotStartedError says that no move was started: the guard or a connection could not be had, the call was
+// cancelled before the extension recorded the move, or the cluster is too busy to accept it. It is not an
+// attempt at the move; the loop takes the try back and tries again later, a bounded number of times.
+type NotStartedError struct{ Err error }
+
+func (e *NotStartedError) Error() string { return "the move was not started: " + e.Err.Error() }
+func (e *NotStartedError) Unwrap() error { return e.Err }
+
+// notStartedTries is how many tries in a row may end without a move being started before the run is
+// stopped (a safety stop): the cluster is busy or the extension does not accept moves, which a person should see.
+const notStartedTries = 3
 
 // MoveError is an error that the extension itself raised for the statement of a move: the statement
 // ended and so did the move (a failure the extension recorded). Any other error of RunMove, a lost
@@ -236,6 +270,9 @@ type Loop struct {
 	// OnProgress is called after each recorded change of a move (the audit and tests).
 	OnProgress func(MoveRow)
 	Log        *slog.Logger
+
+	// notStartedRun counts the tries in a row that started no move (see notStarted).
+	notStartedRun int
 }
 
 func (l *Loop) defaults() {
@@ -272,6 +309,20 @@ func (l *Loop) defaults() {
 // is neither exhausted, backing off nor skipped is the next one.
 func (l *Loop) Moves(ctx context.Context, opts Options) error {
 	l.defaults()
+	// Every write of the loop is tried again when the system database cannot be reached for a moment; when it
+	// stays unreachable the run is paused, after the move in flight has been waited for (RBR-02).
+	if _, wrapped := l.Rows.(*retryRows); !wrapped {
+		l.Rows = &retryRows{Rows: l.Rows, l: l}
+	}
+	err := l.moves(ctx, opts)
+	var ie *inspectError
+	if errors.As(err, &ie) {
+		return l.safetyStop(ctx, err)
+	}
+	return err
+}
+
+func (l *Loop) moves(ctx context.Context, opts Options) error {
 	var dbs []string
 	if err := l.inspect(ctx, func() (err error) { dbs, err = l.Backend.Databases(ctx, opts); return }); err != nil {
 		return l.safetyStop(ctx, err)
@@ -299,6 +350,9 @@ func (l *Loop) Moves(ctx context.Context, opts Options) error {
 			return err
 		}
 		if err := l.recoverLeftovers(ctx); err != nil {
+			if errors.Is(err, errStopWhileWaiting) {
+				return l.stoppedWhileWaiting(ctx)
+			}
 			return err
 		}
 		run, err := l.Rows.Run(ctx)
@@ -365,6 +419,9 @@ func (l *Loop) Moves(ctx context.Context, opts Options) error {
 		}
 		tries = 0
 		if err := l.execute(ctx, next.move, next.attempts+1); err != nil {
+			if errors.Is(err, errStopWhileWaiting) {
+				return l.stoppedWhileWaiting(ctx)
+			}
 			return err
 		}
 	}
@@ -437,13 +494,22 @@ func (l *Loop) safetyStop(ctx context.Context, err error) error {
 	}
 	text := "The cluster could not be inspected; the log of kingresd has the reason."
 	var p *problem.Problem
+	var ns *NotStartedError
 	if errors.As(err, &p) {
 		text = p.Detail
+	} else if errors.As(err, &ns) {
+		text = "The extension did not accept a move several times in a row; the cluster may be busy with another operation. The log of kingresd has the reason."
+		l.log().Warn("rebalance: the run is stopped because moves cannot be started", "error", err)
 	} else {
 		l.log().Warn("rebalance: the run is stopped because the cluster could not be inspected", "error", err)
 	}
 	if serr := l.Rows.Settle(ctx, OutcomeStopped, "safetyRule", text, nil); serr != nil {
-		return serr
+		if errors.Is(serr, ErrLeaseLost) || ctx.Err() != nil {
+			return serr
+		}
+		// The run cannot be recorded as stopped (the system database is the reason, or one of them): pausing
+		// the task is still right, and a start again begins a new round from the rows as they are.
+		l.log().Warn("rebalance: the stop of the run could not be recorded", "error", serr)
 	}
 	return task.Pause("A safety condition does not hold: " + text)
 }
@@ -497,6 +563,50 @@ func countDone(rows []MoveRow) int {
 	return n
 }
 
+// errStopWhileWaiting is the end of a wait for the extension (the settling of a move that an earlier run
+// left, or the one of a session that ended) because the operator asked to stop: the move stays as it is, in the
+// extension's hands, and the run pauses. A stop must not wait for a stuck move: a failover has to stop
+// the rebalance first and cannot wait for the longest bound of a move (README, "Rebalancing and failover").
+var errStopWhileWaiting = errors.New("rebalance: stopped while waiting for a move")
+
+// recoverWatched is Backend.Recover with the stop of the run watched: while the extension is waited for,
+// the run's stop and cancel flags are read every poll, and a request ends the wait with errStopWhileWaiting.
+func (l *Loop) recoverWatched(ctx context.Context, r MoveRow) (state, text string, err error) {
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var stopped atomic.Bool
+	go func() {
+		t := time.NewTicker(l.Poll)
+		defer t.Stop()
+		for {
+			select {
+			case <-wctx.Done():
+				return
+			case <-t.C:
+				if run, rerr := l.rawRows().Run(wctx); rerr == nil && (run.StopRequested || run.CancelRequested) {
+					stopped.Store(true)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	state, text, err = l.Backend.Recover(wctx, r)
+	if err != nil && stopped.Load() && ctx.Err() == nil {
+		return "", "", errStopWhileWaiting
+	}
+	return state, text, err
+}
+
+// rawRows are the rows without the retries: for the polls that run while a move is in flight, which must not
+// be held up by a wait of their own.
+func (l *Loop) rawRows() Rows {
+	if r, ok := l.Rows.(*retryRows); ok {
+		return r.Rows
+	}
+	return l.Rows
+}
+
 // recoverLeftovers settles the moves that an earlier run of the task left
 // running (the leader died, lost its lease or was restarted): the extension's own
 // recovery decides, never this code (resume_bucket_moves undoes what did not
@@ -510,7 +620,10 @@ func (l *Loop) recoverLeftovers(ctx context.Context) error {
 		if r.State != MoveRunning {
 			continue
 		}
-		state, text, err := l.Backend.Recover(ctx, r)
+		state, text, err := l.recoverWatched(ctx, r)
+		if errors.Is(err, errStopWhileWaiting) {
+			return err
+		}
 		if err != nil {
 			return fmt.Errorf("recovering the move of bucket %s: %w", r.Move.Key(), err)
 		}
@@ -521,91 +634,152 @@ func (l *Loop) recoverLeftovers(ctx context.Context) error {
 	return nil
 }
 
+// stoppedWhileWaiting ends the run as stopped after a wait that the stop of the operator cut short.
+func (l *Loop) stoppedWhileWaiting(ctx context.Context) error {
+	run, err := l.Rows.Run(ctx)
+	if err != nil {
+		return err
+	}
+	return l.stopped(ctx, run)
+}
+
 // execute runs one move and watches it. The stop request is polled with the
 // progress: a move that has not reached its switch is cancelled through the
 // extension (it undoes itself and the bucket stays where it was); a move that has
 // is allowed to finish, because the switch is atomic and cannot be interrupted.
+//
+// Once the extension has recorded the move it is the extension's: a run that loses its lease or stops does not
+// cancel the call (see PG.RunMove), it stops watching, and the holder that follows settles the move through the
+// extension. A failure of the system database while the call is in flight is not a reason to leave it
+// either: the call goes on and finishes, the polls are skipped, and what became of the move is recorded when
+// it is over, with the same retries as every other write (RBR-02).
 func (l *Loop) execute(ctx context.Context, m Move, attempt int) error {
-	started := l.Now()
 	seq, err := l.Rows.StartMove(ctx, m, l.Backend.ServerOf(ctx, m.Database, m.From), l.Backend.ServerOf(ctx, m.Database, m.To), attempt)
 	if err != nil {
 		return err
 	}
+	after, err := l.Backend.Mark(ctx, m)
+	if err != nil {
+		return l.notStarted(ctx, seq, attempt, &NotStartedError{err})
+	}
+	ref := Ref{After: after}
 	done := make(chan error, 1)
-	// The move runs on a connection of its own; cancelling ctx (a lost lease, a
-	// shutdown) cancels the statement and leaves the move to the recovery.
-	go func() { done <- l.Backend.RunMove(ctx, m) }()
+	go func() { done <- l.Backend.RunMove(ctx, m, after) }()
 	cancelled := false
-	var ext int64
 	for {
 		select {
 		case err := <-done:
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			// The lease was gone when the call was to be made: nothing was started, and the
-			// holder does nothing more in the name of the task (the row stays for the new holder).
-			if errors.Is(err, ErrLeaseLost) {
-				return err
-			}
-			if err != nil {
-				var me *MoveError
-				definite := errors.As(err, &me)
-				// The extension decides what became of the move before anything is recorded or another move
-				// starts. A lost connection says nothing about the move (its backend may be alive and finish it:
-				// it is waited for). An error the extension raised ended the statement, but when the undo could
-				// not reach a node (a server is down) the move's row stays in its phase until a recovery settles
-				// it: ask for that now, for a bounded time, and record the failure either way.
-				rctx := ctx
-				if definite {
-					var cancel context.CancelFunc
-					rctx, cancel = context.WithTimeout(ctx, definiteRecoverWait)
-					defer cancel()
-				} else {
-					l.log().Warn("rebalance: the session of a move ended with an error; asking the extension what became of it", "move", m.Key(), "error", err)
-				}
-				state, text, rerr := l.Backend.Recover(rctx, MoveRow{Seq: seq, Move: m, State: MoveRunning, ExtMoveID: ext, StartedAt: started})
-				switch {
-				case rerr != nil && !definite:
-					return fmt.Errorf("settling the move of bucket %s after its session ended: %w", m.Key(), rerr)
-				case rerr != nil:
-					l.log().Warn("rebalance: the extension has not settled a failed move; a recovery will", "move", m.Key(), "error", rerr)
-				case state == MoveDone:
-					return l.settleRecovered(ctx, seq, m, state, text)
-				case !definite:
-					return l.settleRecovered(ctx, seq, m, state, text)
-				}
-			}
-			return l.settleMove(ctx, seq, m, started, err, cancelled)
+			return l.finishCall(ctx, m, seq, attempt, ref, err, cancelled)
 		case <-time.After(l.Poll):
 		case <-ctx.Done():
 			// Leave the row running: the next run settles it with Recover.
 			return ctx.Err()
 		}
-		if p, err := l.Backend.Progress(ctx, m, started); err == nil && p.Found {
-			ext = p.ExtMoveID
-			if err := l.Rows.UpdateMove(ctx, seq, p.ExtMoveID, p.Phase, p.Percent); err != nil {
-				return err
-			}
-			if l.OnProgress != nil {
-				l.OnProgress(MoveRow{Seq: seq, Move: m, State: MoveRunning, ExtMoveID: p.ExtMoveID, Phase: p.Phase, Percent: p.Percent})
-			}
+		if err := l.watch(ctx, m, seq, &ref, &cancelled); err != nil {
+			return err
 		}
-		// A stop is asked again at every poll until the extension has cancelled
-		// the move: a move that is switching answers that it cannot be cancelled
-		// now and may fall back to catching up, so the next poll can succeed.
-		if !cancelled {
-			run, err := l.Rows.Run(ctx)
-			if err != nil {
+	}
+}
+
+// watch is one poll of a move in flight: the progress is recorded and a stop is passed on. It fails only with
+// ErrLeaseLost; every other failure to reach the system database is skipped, the next poll tries again.
+func (l *Loop) watch(ctx context.Context, m Move, seq int, ref *Ref, cancelled *bool) error {
+	rows := l.rawRows()
+	if p, err := l.Backend.Progress(ctx, m, *ref); err == nil && p.Found {
+		ref.ID = p.ExtMoveID
+		if err := rows.UpdateMove(ctx, seq, p.ExtMoveID, p.Phase, p.Percent); err != nil {
+			if errors.Is(err, ErrLeaseLost) {
 				return err
 			}
-			if run.StopRequested || run.CancelRequested {
-				if stopped, err := l.Backend.CancelMove(ctx, m, started); err == nil && stopped {
-					cancelled = true
-				}
+			l.log().Warn("rebalance: the progress of a move could not be recorded; the move goes on", "move", m.Key(), "error", err)
+			return nil
+		}
+		if l.OnProgress != nil {
+			l.OnProgress(MoveRow{Seq: seq, Move: m, State: MoveRunning, ExtMoveID: p.ExtMoveID, Phase: p.Phase, Percent: p.Percent})
+		}
+	}
+	// A stop is asked again at every poll until the extension has cancelled
+	// the move: a move that is switching answers that it cannot be cancelled
+	// now and may fall back to catching up, so the next poll can succeed.
+	if !*cancelled {
+		run, err := rows.Run(ctx)
+		if err != nil {
+			if errors.Is(err, ErrLeaseLost) {
+				return err
+			}
+			return nil
+		}
+		if run.StopRequested || run.CancelRequested {
+			if stopped, err := l.Backend.CancelMove(ctx, m, *ref); err == nil && stopped {
+				*cancelled = true
 			}
 		}
 	}
+	return nil
+}
+
+// finishCall settles the move after its call returned.
+func (l *Loop) finishCall(ctx context.Context, m Move, seq, attempt int, ref Ref, err error, cancelled bool) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	// The lease was gone when the call was to be made: nothing was started, and the
+	// holder does nothing more in the name of the task (the row stays for the new holder).
+	if errors.Is(err, ErrLeaseLost) {
+		return err
+	}
+	var ns *NotStartedError
+	if errors.As(err, &ns) {
+		return l.notStarted(ctx, seq, attempt, ns)
+	}
+	l.notStartedRun = 0
+	if err != nil {
+		var me *MoveError
+		definite := errors.As(err, &me)
+		// The extension decides what became of the move before anything is recorded or another move
+		// starts. A lost connection says nothing about the move (its backend may be alive and finish it:
+		// it is waited for). An error the extension raised ended the statement, but when the undo could
+		// not reach a node (a server is down) the move's row stays in its phase until a recovery settles
+		// it: ask for that now, for a bounded time, and record the failure either way.
+		rctx := ctx
+		if definite {
+			var cancel context.CancelFunc
+			rctx, cancel = context.WithTimeout(ctx, definiteRecoverWait)
+			defer cancel()
+		} else {
+			l.log().Warn("rebalance: the session of a move ended with an error; asking the extension what became of it", "move", m.Key(), "error", err)
+		}
+		state, text, rerr := l.recoverWatched(rctx, MoveRow{Seq: seq, Move: m, State: MoveRunning, ExtMoveID: ref.ID, After: ref.After, StartedAt: ref.Since})
+		switch {
+		case errors.Is(rerr, errStopWhileWaiting):
+			return rerr
+		case rerr != nil && !definite:
+			return fmt.Errorf("settling the move of bucket %s after its session ended: %w", m.Key(), rerr)
+		case rerr != nil:
+			l.log().Warn("rebalance: the extension has not settled a failed move; a recovery will", "move", m.Key(), "error", rerr)
+		case state == MoveDone:
+			return l.settleRecovered(ctx, seq, m, state, text)
+		case !definite:
+			return l.settleRecovered(ctx, seq, m, state, text)
+		}
+	}
+	return l.settleMove(ctx, seq, m, err, cancelled)
+}
+
+// notStarted takes back a try that started nothing and, when that keeps happening, stops the run: the
+// cluster is busy or the extension does not accept moves, which a person should look at. It is not an
+// attempt at the move (RBR-01).
+func (l *Loop) notStarted(ctx context.Context, seq, attempt int, ns *NotStartedError) error {
+	l.log().Warn("rebalance: a move was not started; it will be tried again", "error", ns.Err)
+	if err := l.Rows.UndoStart(ctx, seq, attempt, ns.Error()); err != nil {
+		return err
+	}
+	if l.notStartedRun++; l.notStartedRun >= notStartedTries {
+		l.notStartedRun = 0
+		return l.safetyStop(ctx, ns)
+	}
+	l.Sleep(ctx, l.Backoff/6)
+	return nil
 }
 
 // settleRecovered records the state the extension reports for a move whose session ended without
@@ -625,7 +799,7 @@ func (l *Loop) settleRecovered(ctx context.Context, seq int, m Move, state, text
 	}
 }
 
-func (l *Loop) settleMove(ctx context.Context, seq int, m Move, started time.Time, err error, cancelled bool) error {
+func (l *Loop) settleMove(ctx context.Context, seq int, m Move, err error, cancelled bool) error {
 	c := context.WithoutCancel(ctx)
 	switch {
 	case err == nil:
@@ -695,7 +869,7 @@ func Judge(rows []MoveRow, maxAttempts int) Verdict {
 	sort.Strings(keys)
 	var v Verdict
 	var bad []string
-	for _, r := range rows {
+	for _, r := range Current(rows) {
 		switch r.State {
 		case MoveDone:
 			v.Done++
@@ -727,6 +901,27 @@ func join(s []string, limit int) string {
 			out += ", "
 		}
 		out += x
+	}
+	return out
+}
+
+// Current are the rows that count in the totals of a run: every row of a move that was made, and the last row of
+// each bucket that was not. A failed, skipped or cancelled row of a bucket that has a later row (a round that a person
+// started again tried it once more, or moved it) is history: it stays in the report and is not counted again
+// (RBR-03).
+func Current(rows []MoveRow) []MoveRow {
+	last := map[string]int{}
+	for _, r := range rows {
+		if k := r.Move.Key(); r.Seq > last[k] {
+			last[k] = r.Seq
+		}
+	}
+	var out []MoveRow
+	for _, r := range rows {
+		if (r.State == MoveFailed || r.State == MoveSkipped || r.State == MoveCancelled) && r.Seq < last[r.Move.Key()] {
+			continue
+		}
+		out = append(out, r)
 	}
 	return out
 }

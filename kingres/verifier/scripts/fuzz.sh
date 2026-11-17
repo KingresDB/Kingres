@@ -11,9 +11,11 @@ secs="${1:-8}"
 export GOMAXPROCS="${GOMAXPROCS:-2}"
 targets=(
   "chain FuzzParseDigest" "chain FuzzParseBlocks" "format FuzzDecodeHex" "format FuzzEncodeRow"
-  "jsonx FuzzParse" "proof FuzzVerify" "rowfile FuzzParse"
-  "signednote FuzzParse" "checkpoint FuzzVerify" "tlog FuzzParseTilePath" "tlog FuzzParseTile"
-  "trust FuzzParse" "cli FuzzParseLogSpec" "cli FuzzUntrusted" "cli FuzzHostileText" "safefile FuzzCleanRel"
+  "jsonx FuzzParse" "jsonx FuzzParseLimits" "proof FuzzVerify" "rowfile FuzzParse"
+  "signednote FuzzParse" "signednote FuzzParseBounds" "checkpoint FuzzVerify" "checkpoint FuzzParseExtensions"
+  "tlog FuzzParseTilePath" "tlog FuzzParseTile"
+  "trust FuzzParse" "cli FuzzParseLogSpec" "cli FuzzUntrusted" "cli FuzzHostileText" "cli FuzzUntrustedOneToOne"
+  "cli FuzzStateRoundTrip" "safefile FuzzCleanRel"
 )
 for t in "${targets[@]}"; do
   set -- $t

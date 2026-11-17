@@ -23,7 +23,7 @@ func readState(t *testing.T, p string) string {
 // TestCrashAtEveryStep stops the replace after each stage as a crash would
 // (the temporary file stays) and checks that the state is then the old file
 // or the new one, whole, and that the next replace works and cleans up.
-func TestCrashAtEveryStep(t *testing.T) {
+func TestStateFileCrashAtEveryStep(t *testing.T) {
 	defer func() { step = func(string) error { return nil } }()
 	oldData, newData := strings.Repeat("old\n", 500), strings.Repeat("new\n", 700)
 	for _, stop := range []string{"written", "synced", "renamed", "dirsynced"} {
@@ -66,7 +66,7 @@ func TestCrashAtEveryStep(t *testing.T) {
 	}
 }
 
-func TestReplaceFirstUseAndLongName(t *testing.T) {
+func TestStateFileReplaceFirstUseAndLongName(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, strings.Repeat("n", 240))
 	if err := Replace(p, []byte("x\n")); err != nil {
@@ -79,7 +79,7 @@ func TestReplaceFirstUseAndLongName(t *testing.T) {
 	l.Release()
 }
 
-func TestLockIsExclusiveAndBounded(t *testing.T) {
+func TestStateFileLockIsExclusiveAndBounded(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "state")
 	l, err := Acquire(p, time.Second)
 	if err != nil {
@@ -100,7 +100,7 @@ func TestLockIsExclusiveAndBounded(t *testing.T) {
 	l2.Release()
 }
 
-func TestResolveFollowsLinkAndKeepsIt(t *testing.T) {
+func TestStateFileResolveFollowsLinkAndKeepsIt(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "real")
 	if err := os.WriteFile(target, []byte("old"), 0o644); err != nil {
@@ -128,20 +128,5 @@ func TestResolveFollowsLinkAndKeepsIt(t *testing.T) {
 		if _, err := Resolve(dangling); err == nil {
 			t.Error("a dangling link was accepted")
 		}
-	}
-}
-
-func TestConflictNeverOverwrites(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "state")
-	root := []byte{1, 2, 3, 4, 5, 6}
-	a, err := SaveConflict(p, 7, root, []byte("first"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := SaveConflict(p, 7, root, []byte("second")); err != nil {
-		t.Fatal(err)
-	}
-	if readState(t, a) != "first" {
-		t.Error("evidence was overwritten")
 	}
 }

@@ -434,6 +434,61 @@ func (s *Service) Stop(ctx context.Context, actor string) error {
 	return nil
 }
 
+// StopForFailover asks the rebalance that is running to stop because the server serverID has to be failed over (the
+// design of the failover, section 4.5, stops the rebalance first: a rebalance excludes a failover while it is
+// pending or running, migration 0009, and a rebalance with a stuck move would hold an automatic failover back for as long as the
+// move takes to settle). It is the flag of Stop with the stopped-by value "safetyRule" (a value of the contract,
+// no new one is needed). It reports whether a rebalance was running; nothing running is not an error. The caller
+// waits for the stop with WaitStopped.
+//
+// What makes the stop short, even for a stuck move: the loop reads the flag at every poll of a move in flight,
+// while it waits for a move that a run left behind (Recover) and while a call waits for the extension, and a wait
+// ends at the flag; a move that is switching is not interrupted and ends within the extension's own bounds.
+func (s *Service) StopForFailover(ctx context.Context, serverID string) (bool, error) {
+	a, err := s.active(ctx)
+	if err != nil {
+		return false, err
+	}
+	if a == nil || a.State == task.Paused {
+		return false, nil
+	}
+	var ok bool
+	if err := s.sys(ctx, func(c *pgx.Conn) error {
+		var err error
+		ok, err = RequestStop(ctx, c, a.ID, "safetyRule")
+		return err
+	}); err != nil {
+		return false, err
+	}
+	if ok {
+		s.audit(ctx, "rebalance.stop_requested", a.ID, map[string]any{"actor": "system", "reason": "failover of server " + serverID})
+	}
+	return ok, nil
+}
+
+// WaitStopped waits until no rebalance is pending or running (it is paused, or it has ended), for at most bound,
+// and says whether that happened. The check is the one of the exclusion: a paused rebalance does not exclude a failover.
+func (s *Service) WaitStopped(ctx context.Context, bound time.Duration) (bool, error) {
+	deadline := time.Now().Add(bound)
+	for {
+		a, err := s.active(ctx)
+		if err != nil {
+			return false, err
+		}
+		if a == nil || a.State == task.Paused {
+			return true, nil
+		}
+		if time.Now().After(deadline) {
+			return false, nil
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Reads
 
@@ -538,6 +593,7 @@ func (s *Service) Status(ctx context.Context) (api.RebalanceStatus, error) {
 
 func progressOf(run Run, moves []MoveRow) api.RebalanceProgress {
 	var p api.RebalanceProgress
+	moves = Current(moves)
 	for _, m := range moves {
 		switch m.State {
 		case MoveDone:
@@ -566,12 +622,18 @@ func progressOf(run Run, moves []MoveRow) api.RebalanceProgress {
 	return p
 }
 
+// currentMoves selects the rows of a run that count in its totals (see Current): not a failed, skipped or
+// cancelled row of a bucket that has a later row.
+const currentMoves = `kingres_cp.rebalance_move m WHERE m.task_id = r.task_id AND NOT (m.state IN ('failed', 'skipped', 'cancelled') AND EXISTS
+		(SELECT 1 FROM kingres_cp.rebalance_move x WHERE x.task_id = m.task_id AND x.database_name = m.database_name
+			AND x.colocation_id = m.colocation_id AND x.bucket = m.bucket AND x.seq > m.seq))`
+
 var summarySQL = `SELECT ` + runColsOf("r.") + `, t.updated_at,
-	(SELECT count(*) FROM kingres_cp.rebalance_move m WHERE m.task_id = r.task_id AND m.state = 'done'),
-	(SELECT count(*) FROM kingres_cp.rebalance_move m WHERE m.task_id = r.task_id AND m.state = 'failed'),
-	(SELECT count(*) FROM kingres_cp.rebalance_move m WHERE m.task_id = r.task_id AND m.state IN ('skipped', 'cancelled')),
-	(SELECT count(*) FROM kingres_cp.rebalance_move m WHERE m.task_id = r.task_id),
-	(SELECT coalesce(sum(size_bytes), 0) FROM kingres_cp.rebalance_move m WHERE m.task_id = r.task_id AND m.state = 'done')
+	(SELECT count(*) FROM ` + currentMoves + ` AND m.state = 'done'),
+	(SELECT count(*) FROM ` + currentMoves + ` AND m.state = 'failed'),
+	(SELECT count(*) FROM ` + currentMoves + ` AND m.state IN ('skipped', 'cancelled')),
+	(SELECT count(*) FROM ` + currentMoves + `),
+	(SELECT coalesce(sum(size_bytes), 0) FROM ` + currentMoves + ` AND m.state = 'done')
 	FROM kingres_cp.rebalance_run r JOIN kingres_cp.task t ON t.id = r.task_id`
 
 func scanSummary(row pgx.Row) (api.RebalanceReportSummary, error) {

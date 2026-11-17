@@ -439,7 +439,7 @@ func TestStateLockWaitIsBounded(t *testing.T) {
 
 // ---- L8-07 ----
 
-func TestStateThroughALinkAndWithALongName(t *testing.T) {
+func TestStateWithALongName(t *testing.T) {
 	s := newSigner(1)
 	tr := trustOf(t, keySpec{"k", s, ""})
 	all := leaves(700)
@@ -450,14 +450,28 @@ func TestStateThroughALinkAndWithALongName(t *testing.T) {
 	if code, out, errs := run(t, stateArgs(tr, root, long)...); code != 0 {
 		t.Fatalf("a 200 byte name: %d %s %s", code, out, errs)
 	}
+}
+
+// The link part is its own test, so that a system that cannot make a link
+// reports a skip and not a pass.
+func TestStateThroughALink(t *testing.T) {
+	s := newSigner(1)
+	tr := trustOf(t, keySpec{"k", s, ""})
+	all := leaves(700)
+	root := t.TempDir()
+	dir := t.TempDir()
+	publishLog(t, root, s, all, 300)
+	long := filepath.Join(dir, "first")
+	if code, out, errs := run(t, stateArgs(tr, root, long)...); code != 0 {
+		t.Fatalf("a state: %d %s %s", code, out, errs)
+	}
 	target := filepath.Join(dir, "real")
 	link := filepath.Join(dir, "link")
 	if err := os.WriteFile(target, []byte(fileText(t, long)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(target, link); err != nil {
-		t.Logf("no link here (%v): the link part is skipped", err)
-		return
+		t.Skipf("no link can be made here: %v", err)
 	}
 	publishLog(t, root, s, all, 700)
 	if code, out, errs := run(t, stateArgs(tr, root, link)...); code != 0 {

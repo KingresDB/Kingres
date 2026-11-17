@@ -22,6 +22,11 @@ import (
 // so an origin, is at most 255 bytes.
 const MaxOriginLength = 255
 
+// MaxExtensionLines is the most extension lines a checkpoint may carry. They are
+// opaque to the verifier, and the state file keeps the whole note, so they are
+// bounded (with the line length of signednote) instead of being stored as sent.
+const MaxExtensionLines = 16
+
 // Checkpoint is the parsed text of a checkpoint.
 type Checkpoint struct {
 	Origin string
@@ -106,6 +111,9 @@ func Parse(text []byte) (*Checkpoint, error) {
 	copy(cp.Root[:], rootBytes)
 	if cp.Size == 0 && cp.Root != merkle.EmptyRoot() {
 		return nil, errors.New("checkpoint of size 0 does not have the root of the empty tree (the hash of the empty string)")
+	}
+	if len(lines)-3 > MaxExtensionLines {
+		return nil, fmt.Errorf("checkpoint has %d extension lines, expected at most %d", len(lines)-3, MaxExtensionLines)
 	}
 	cp.Extensions = lines[3:]
 	return cp, nil

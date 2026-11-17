@@ -17,6 +17,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/audit"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/clock"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/cluster"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fault"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ha"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/lease"
@@ -57,7 +58,7 @@ func startLeases(d *haDeps) error {
 	wd := &watchdogRunner{d: d, leaseDir: leaseDir, instDir: instDir}
 	mgr, err := lease.New(lease.Config{
 		Self: d.ServerHost, Clock: clk, Duration: d.Cfg.HA.LeaseDuration, Renew: d.Cfg.HA.LeaseRenew, Margin: d.Cfg.HA.LeaseMargin,
-		Grantor: grantor, Voter: peerVoter{pc}, Source: catalogTopology{d: d}, Instance: localInstance{d.Svc},
+		Grantor: grantor, Voter: peerVoter{pc: pc, fault: d.Fault}, Source: catalogTopology{d: d}, Instance: localInstance{d.Svc},
 		// Self-fencing is enforced only for a group that has a standby: with none,
 		// nothing could be promoted, and stopping the only copy would only cost
 		// availability. The standby manager answers from local knowledge.
@@ -106,9 +107,18 @@ type leaseState struct {
 }
 
 // peerVoter asks another server's grantor over the internal API.
-type peerVoter struct{ pc *peerclient.Client }
+type peerVoter struct {
+	pc    *peerclient.Client
+	fault *fault.Hook
+}
 
 func (v peerVoter) Grant(ctx context.Context, server string, req lease.Request) (lease.Reply, error) {
+	if d := v.fault.GrantDelay(); d > 0 {
+		select {
+		case <-time.After(d):
+		case <-ctx.Done():
+		}
+	}
 	var r lease.Reply
 	err := v.pc.Do(ctx, server, http.MethodPost, "/lease/grant", req, &r)
 	return r, err

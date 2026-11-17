@@ -203,3 +203,33 @@ func FuzzVerify(f *testing.F) {
 		}
 	})
 }
+
+func TestParseBoundsTheExtensionLines(t *testing.T) {
+	root := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	text := func(n int) []byte {
+		s := "a.example/log\n7\n" + root + "\n"
+		for i := 0; i < n; i++ {
+			s += "ext\n"
+		}
+		return []byte(s)
+	}
+	if _, err := Parse(text(MaxExtensionLines)); err != nil {
+		t.Fatalf("at the limit: %v", err)
+	}
+	if _, err := Parse(text(MaxExtensionLines + 1)); err == nil {
+		t.Fatal("one extension line over the limit was accepted")
+	}
+}
+
+// FuzzParseExtensions: whatever Parse accepts has at most MaxExtensionLines
+// extension lines, so the note that holds them is bounded.
+func FuzzParseExtensions(f *testing.F) {
+	f.Add([]byte("a.example/log\n7\n" + rootB64 + "\next\n"))
+	f.Add([]byte("a.example/log\n7\n" + rootB64 + "\n" + strings.Repeat("e\n", MaxExtensionLines+1)))
+	f.Fuzz(func(t *testing.T, text []byte) {
+		cp, err := Parse(text)
+		if err == nil && len(cp.Extensions) > MaxExtensionLines {
+			t.Fatalf("%d extension lines were accepted", len(cp.Extensions))
+		}
+	})
+}

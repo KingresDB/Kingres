@@ -216,12 +216,20 @@ func TestHeartbeatsAndLiveness(t *testing.T) {
 			code, _ := body["code"].(string)
 			return st, code
 		}
-		// Shorter than the bound (12 s): every read on the isolated follower still works.
+		// Shorter than the bound (12 s) and than what the lease of the follower's own primary covers: every
+		// read on the isolated follower still works. The follower runs the primary of a group that has a
+		// standby, and without a majority that instance runs only as long as the lease it holds (7 s after a
+		// round, 5 s before the next one). So the test starts when the lease has just been renewed, which also
+		// means that the instance is up: the subtest before this one leaves it fenced for a moment when its
+		// partition outlasts the lease, and a read right after that fails because the instance is not there,
+		// which is the lease doing its job and not a follower that stops serving for a short loss.
+		lvLeaseJustRenewed(t, n0, n2)
 		c.Partition(n2)
 		defer c.HealAll()
-		for end := time.Now().Add(5 * time.Second); time.Now().Before(end); time.Sleep(500 * time.Millisecond) {
+		const blip = 4 * time.Second
+		for end := time.Now().Add(blip); time.Now().Before(end); time.Sleep(500 * time.Millisecond) {
 			if st, code := get(n2); st != 200 {
-				t.Fatalf("a read on the follower failed after %s without the leader: %d %s", 5*time.Second, st, code)
+				t.Fatalf("a read on the follower failed after %s without the leader: %d %s\n%s", blip, st, code, n2.LogTail(3000))
 			}
 		}
 		c.HealAll()
@@ -282,5 +290,24 @@ func TestHeartbeatsAndLiveness(t *testing.T) {
 		if list["dead"]+list["suspect"] != 0 {
 			t.Errorf("statuses after the step: %v", list)
 		}
+	})
+}
+
+// lvLeaseJustRenewed waits until the lease of the group that n runs the primary of has just been renewed
+// (more than 6 s left of the 7 s a round gives), as seen by the server `as`, and the server answers a read.
+func lvLeaseJustRenewed(t *testing.T, as, n *clustertest.Node) {
+	t.Helper()
+	lvPoll(t, "the lease of the follower's group to have just been renewed", func() bool {
+		s, err := leaseState(as, n)
+		if err != nil {
+			return false
+		}
+		for _, l := range s.Leases {
+			if l.Holder == n.Host && l.State == "held" && l.RemainingMillis > 6000 {
+				st, _ := n.Do("GET", "/servers", nil, nil)
+				return st == 200
+			}
+		}
+		return false
 	})
 }

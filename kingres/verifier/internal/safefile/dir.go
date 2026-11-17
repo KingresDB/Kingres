@@ -92,6 +92,11 @@ func (d *Dir) walk(rel string, wantDir bool) error {
 	if err != nil {
 		return err
 	}
+	return d.walkParts(parts, rel, wantDir)
+}
+
+// walkParts is walk for a path that is already split and checked.
+func (d *Dir) walkParts(parts []string, rel string, wantDir bool) error {
 	for i := range parts {
 		sub := strings.Join(parts[:i+1], "/")
 		st, err := d.root.Lstat(sub)
@@ -128,6 +133,11 @@ func (d *Dir) ReadFile(rel string, limit int64) ([]byte, error) {
 	if err := d.walk(rel, false); err != nil {
 		return nil, err
 	}
+	return d.readOpen(rel, limit)
+}
+
+// readOpen opens a path that walk has checked and reads it.
+func (d *Dir) readOpen(rel string, limit int64) ([]byte, error) {
 	f, err := d.root.OpenFile(rel, os.O_RDONLY|openFlags, 0)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -137,6 +147,35 @@ func (d *Dir) ReadFile(rel string, limit int64) ([]byte, error) {
 	}
 	defer f.Close()
 	return readAll(f, rel, limit)
+}
+
+// CleanName validates a name taken from a listing of the directory. It is not
+// a path: whatever the system lists as one entry is a name (a colon, a space,
+// a leading dash), and only what could not be one entry is refused: nothing,
+// a dot name, a separator, a NUL, more than 255 bytes. CleanRel is the rule for
+// paths the program builds; the two are different questions.
+func CleanName(name string) error {
+	switch {
+	case name == "" || name == "." || name == "..":
+		return fmt.Errorf("name %q is not a file name", clipPath(name))
+	case len(name) > 255:
+		return fmt.Errorf("name %q is longer than 255 bytes", clipPath(name))
+	case strings.ContainsAny(name, "/") || strings.IndexByte(name, 0) >= 0:
+		return fmt.Errorf("name %q has a slash or a NUL, so it is not one entry of the directory", clipPath(name))
+	}
+	return nil
+}
+
+// ReadEntry reads the regular file called name in the root of the directory
+// (a name the listing returned, see CleanName), with the checks of ReadFile.
+func (d *Dir) ReadEntry(name string, limit int64) ([]byte, error) {
+	if err := CleanName(name); err != nil {
+		return nil, err
+	}
+	if err := d.walkParts([]string{name}, name, false); err != nil {
+		return nil, err
+	}
+	return d.readOpen(name, limit)
 }
 
 // SubDirs lists the directory rel: the names of its subdirectories, and the

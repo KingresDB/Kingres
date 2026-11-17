@@ -21,8 +21,12 @@ import (
 // the column type's binary send function produces (empty for a zero length
 // value). NULL columns are left out. Unknown members are rejected, because a
 // misspelled member would otherwise change the hash silently.
+// MaxHexString is the longest send_hex accepted, as written: a column value of
+// 8 MiB. The file is at most 16 MiB (the commands), so one value can be most of it.
+const MaxHexString = 16 << 20
+
 func Parse(data []byte) ([]format.Column, error) {
-	v, err := jsonx.Parse(data)
+	v, err := jsonx.ParseLimits(data, jsonx.Limits{MaxDepth: jsonx.MaxDepth, MaxValues: 1 << 14, MaxMembers: 1 << 10, MaxKey: 256, MaxString: MaxHexString})
 	if err != nil {
 		return nil, err
 	}

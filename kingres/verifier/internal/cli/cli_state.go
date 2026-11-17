@@ -4,15 +4,12 @@ package cli
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"strings"
-	"time"
 
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/checkpoint"
-	"github.com/KingresDB/Kingres/kingres/verifier/internal/format"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/merkle"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/safefile"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/signednote"
@@ -20,62 +17,6 @@ import (
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/tlog"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/trust"
 )
-
-// The state file (correction 15 and 17 of the design) is the auditor's record
-// of the last checkpoint this tool proved. It holds the signed note itself, so
-// that it is checked again with the trust file at every use and so that it is
-// evidence a third party can check, and a few facts about when and under which
-// key it was judged. The facts are for the reader; no decision depends on them
-// (a person who can write the file can also delete it, and a note still has to
-// carry a valid signature of a key of the trust file that is not revoked).
-
-const maxStateFile = 3 << 20
-
-type stateRecord struct {
-	Format     int      `json:"format"`
-	Log        string   `json:"log"`
-	Size       uint64   `json:"size"`
-	Root       string   `json:"root"`
-	VerifiedAt string   `json:"verified_at"`
-	VerifiedBy []string `json:"verified_by"`
-	Note       string   `json:"note"`
-}
-
-func encodeState(cp *checkpoint.Checkpoint, note []byte, signers []signednote.Key, now time.Time) ([]byte, error) {
-	rec := stateRecord{
-		Format: 1, Log: cp.Origin, Size: cp.Size, Root: format.EncodeHex(cp.Root[:]),
-		VerifiedAt: now.Format(time.RFC3339Nano), VerifiedBy: signerPrints(signers), Note: string(note),
-	}
-	b, err := json.MarshalIndent(rec, "", "  ")
-	if err != nil {
-		return nil, err
-	}
-	return append(b, '\n'), nil
-}
-
-// decodeHeld reads a file that holds a checkpoint the auditor kept: a state
-// file or a plain signed note. For a state file it returns the record too.
-func decodeHeld(data []byte) ([]byte, *stateRecord, error) {
-	if !bytes.HasPrefix(data, []byte("{")) {
-		if len(data) > signednote.MaxNoteSize {
-			return nil, nil, fmt.Errorf("note %s: %d bytes, expected at most %d", safefile.ErrTooLarge, len(data), signednote.MaxNoteSize)
-		}
-		return data, nil, nil
-	}
-	var rec stateRecord
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&rec); err != nil {
-		return nil, nil, fmt.Errorf("not a state file: %w", err)
-	}
-	if dec.More() {
-		return nil, nil, errors.New("not a state file: text after the record")
-	}
-	if rec.Format != 1 {
-		return nil, nil, fmt.Errorf("state file format %d is not known, expected 1", rec.Format)
-	}
-	return []byte(rec.Note), &rec, nil
-}
 
 // rebaseAdvice is what the auditor is told when a held checkpoint cannot be
 // used. It never says to delete the file: with no state a rollback is not
@@ -85,7 +26,7 @@ func rebaseAdvice(what string, claimedSize uint64, haveSize bool) string {
 	if haveSize {
 		size += " (the note claims " + fmt.Sprint(claimedSize) + ", which nothing here authenticates)"
 	}
-	if what == "--old" {
+	if strings.HasPrefix(what, "--old") {
 		return "Use a note signed by a key you trust, or give SIZE:ROOT from another source you trust."
 	}
 	return "The file was not changed and must not be deleted: keep it, it is what the log said to you. " +
@@ -110,7 +51,7 @@ func rebaseAdvice(what string, claimedSize uint64, haveSize bool) string {
 // Every failure is an input error (status 2) in both commands: the thing the
 // auditor holds cannot serve as their anchor. The error says what to do and
 // never says to delete the file.
-func (in *logInputs) verifyHeld(note []byte, what string) (*checkpoint.Checkpoint, []signednote.Key, []string, error) {
+func (in *logInputs) verifyHeld(note []byte, rec *stateRecord, what string) (*checkpoint.Checkpoint, []signednote.Key, []string, error) {
 	origin := in.spec.origin(in.trust.OriginPrefix)
 	keys, err := in.trust.AllKeys(origin)
 	if err != nil {
@@ -124,11 +65,16 @@ func (in *logInputs) verifyHeld(note []byte, what string) (*checkpoint.Checkpoin
 		}
 		return nil, nil, nil, &inputErr{fmt.Errorf("%s is not a checkpoint of this log: %w", what, err)}
 	}
+	if rec != nil {
+		if err := rec.agrees(cp); err != nil {
+			return nil, nil, nil, &inputErr{fmt.Errorf("%s: %w. %s", what, err, rebaseAdvice(what, cp.Size, true))}
+		}
+	}
 	var accepted []signednote.Key
 	var notes, why []string
 	for _, s := range signers {
 		k, _ := in.trust.KeyFor(s.Public)
-		id := fmt.Sprintf("key %q (%s)", untrusted(k.Name), k.Fingerprint[:16])
+		id := fmt.Sprintf("key %q (%s)", k.Name, k.Fingerprint[:16])
 		switch {
 		case k.Revoked:
 			why = append(why, id+" is revoked in the trust file, so its signatures are not evidence of what the log was")
@@ -182,7 +128,7 @@ func (in *logInputs) ignoredSignatures(note []byte, counted []signednote.Key) []
 			}
 		}
 		if !was {
-			out = append(out, fmt.Sprintf("the note also carries a signature of key %q (%s), which was not counted: %s", untrusted(k.Name), k.Fingerprint[:16], k.Why(in.now)))
+			out = append(out, fmt.Sprintf("the note also carries a signature of key %q (%s), which was not counted: %s", k.Name, k.Fingerprint[:16], k.Why(in.now)))
 		}
 	}
 	return out
@@ -219,13 +165,19 @@ func (in *logInputs) proveExtension(oldCP, newCP *checkpoint.Checkpoint) (tiles,
 // means exactly that (or that the state was empty and is now recorded, or that
 // nothing changed). It returns done=true with the exit status when the command
 // ends here.
-func (e *env) applyState(r *result, in *logInputs, cp *checkpoint.Checkpoint, note []byte, signers []signednote.Key, statePath string, asJSON bool) (int, bool) {
+func (e *env) applyState(r *result, in *logInputs, cp *checkpoint.Checkpoint, note []byte, signers []signednote.Key, statePath string, asJSON, allowShared bool) (int, bool) {
 	fail := func(err error) (int, bool) {
 		return e.inputError(r.cmd, asJSON, err), true
 	}
 	path, err := statefile.Resolve(statePath)
 	if err != nil {
 		return fail(fmt.Errorf("--state %s: %w", statePath, err))
+	}
+	if perr := statefile.CheckPrivate(path); perr != nil {
+		if !allowShared {
+			return fail(fmt.Errorf("--state %s: %w: another user could replace or delete the state, or plant files beside it, and the protection against a rollback would be gone. Keep the state in a directory that only you can write (for example chmod 700), or pass --allow-shared-state-dir to accept the risk", clipArg(statePath), perr))
+		}
+		r.notes = append(r.notes, fmt.Sprintf("the state is kept where others may be able to change it (%v): accepted by --allow-shared-state-dir", perr))
 	}
 	lock, err := statefile.Acquire(path, statefile.LockWait)
 	if err != nil {
@@ -244,12 +196,15 @@ func (e *env) applyState(r *result, in *logInputs, cp *checkpoint.Checkpoint, no
 	case err != nil:
 		return fail(fmt.Errorf("--state: %w", err))
 	default:
-		held, _, derr := decodeHeld(stored)
+		held, rec, derr := decodeHeld(stored)
 		if derr != nil {
+			if errors.Is(derr, errEmptyHeld) {
+				return fail(fmt.Errorf("--state %s: %w. If you made it yourself (touch, or a redirect), it holds nothing to lose: remove it and run again, or give another name. If it ever held a state and lost it, restore your copy; with none, start a new record with checkpoint --state NEWFILE --min-size N, N being the size you believe the log had when you last verified it, and use NEWFILE from then on", clipArg(statePath), derr))
+			}
 			return fail(fmt.Errorf("--state %s: %w", clipArg(statePath), derr))
 		}
 		var hnotes []string
-		old, _, hnotes, err = in.verifyHeld(held, "--state "+clipArg(statePath))
+		old, _, hnotes, err = in.verifyHeld(held, rec, "--state "+clipArg(statePath))
 		if err != nil {
 			var ie *inputErr
 			if errors.As(err, &ie) {
@@ -262,11 +217,11 @@ func (e *env) applyState(r *result, in *logInputs, cp *checkpoint.Checkpoint, no
 
 	type outcome struct {
 		action   string
-		proved   any
+		proved   bool
 		oldSize  any
 		tilesMsg string
 	}
-	out := outcome{action: "created", oldSize: nil}
+	out := outcome{action: "created", proved: false, oldSize: nil}
 	write := true
 	extends := ""
 	switch {
@@ -317,6 +272,9 @@ func (e *env) applyState(r *result, in *logInputs, cp *checkpoint.Checkpoint, no
 	if write {
 		data, err := encodeState(cp, note, signers, in.now)
 		if err == nil {
+			if err = in.readBack(data, cp, note); err != nil {
+				return fail(err)
+			}
 			err = statefile.Replace(path, data)
 		}
 		if err != nil {
@@ -339,15 +297,53 @@ func (e *env) applyState(r *result, in *logInputs, cp *checkpoint.Checkpoint, no
 // are the proof of misbehaviour.
 func (e *env) conflict(r *result, asJSON bool, statePath, step string, cp *checkpoint.Checkpoint, note []byte, old *checkpoint.Checkpoint, cause error) int {
 	saved, serr := statefile.SaveConflict(statePath, cp.Size, cp.Root[:], note)
-	if serr != nil {
-		r.notes = append(r.notes, fmt.Sprintf("the conflicting checkpoint (size %d) could NOT be saved to %s: %v; save the note you were shown yourself", cp.Size, saved, serr))
-	} else {
-		r.notes = append(r.notes, fmt.Sprintf("evidence: the state file %s (size %d) was not changed, and the conflicting signed checkpoint (size %d) was saved to %s; keep both files", statePath, old.Size, cp.Size, saved))
+	code := ExitFailed
+	info := map[string]any{"action": "kept", "old_size": old.Size, "new_size": cp.Size, "extension_proved": false, "evidence_saved": serr == nil}
+	switch {
+	case serr != nil:
+		// The finding stands, and so does the failure; what is added is that the
+		// evidence is not on disk, which must never be claimed. The status says so
+		// apart from the fork itself.
+		code = ExitEvidenceLost
+		r.notes = append(r.notes, fmt.Sprintf("the conflicting signed checkpoint (size %d) was NOT saved: %v; the state file %s (size %d) was not changed; save the note you were shown yourself, it is the proof of the conflict", cp.Size, serr, statePath, old.Size))
+		info["conflict_file"] = nil
+	case saved.Existing:
+		r.notes = append(r.notes, fmt.Sprintf("evidence: the state file %s (size %d) was not changed, and this very conflicting signed checkpoint (size %d) was already saved to %s by an earlier run; keep both files", statePath, old.Size, cp.Size, saved.Path))
+		info["conflict_file"] = saved.Path
+	default:
+		r.notes = append(r.notes, fmt.Sprintf("evidence: the state file %s (size %d) was not changed, and the conflicting signed checkpoint (size %d) was saved to %s; keep both files", statePath, old.Size, cp.Size, saved.Path))
+		info["conflict_file"] = saved.Path
 	}
 	if step == "rollback" {
 		r.notes = append(r.notes, "a smaller size can be an old genuine checkpoint (rollback) or another history: this run does not tell which")
 	}
-	r.info["state"] = map[string]any{"action": "kept", "old_size": old.Size, "new_size": cp.Size, "extension_proved": false, "conflict_file": saved}
+	r.info["state"] = info
 	r.info["extends_state"] = false
-	return e.finishFailed(r, asJSON, step, cause)
+	return e.finishFailedWith(r, asJSON, step, cause, code)
+}
+
+// readBack reads the file that is about to be stored the way the next run
+// reads it (decodeHeld, then verifyHeld with the same trust file) and requires
+// the very checkpoint and note that were verified. A note that passes as a new
+// checkpoint but would be refused as a held one (a corrupt signature of a key
+// that is revoked now is ignored for a new note and refused for a held one) is
+// never stored: the protection against rollback would be stuck on a file no
+// later run accepts.
+func (in *logInputs) readBack(data []byte, cp *checkpoint.Checkpoint, note []byte) error {
+	held, rec, err := decodeHeld(data)
+	if err == nil {
+		var back *checkpoint.Checkpoint
+		back, _, _, err = in.verifyHeld(held, rec, "the state file that would be written")
+		if err == nil && (back.Origin != cp.Origin || back.Size != cp.Size || back.Root != cp.Root || !bytes.Equal(held, note)) {
+			err = errors.New("the state file that would be written does not read back as the checkpoint that was verified")
+		}
+	}
+	if err != nil {
+		var ie *inputErr
+		if errors.As(err, &ie) {
+			err = ie.error
+		}
+		return fmt.Errorf("this checkpoint cannot be recorded, because a later run would not accept the state file made from it (%w); the state file was not changed", err)
+	}
+	return nil
 }

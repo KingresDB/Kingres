@@ -72,9 +72,22 @@ func readAll(f statReader, name string, limit int64) ([]byte, error) {
 	}
 	// The size can change after the Stat: read at most one byte more than the
 	// limit and refuse if it is there.
-	data, err := io.ReadAll(io.LimitReader(f, limit+1))
-	if err != nil {
+	// The buffer is made once, of the size the file has now plus the one byte
+	// that shows it grew: io.ReadAll would grow it by doubling and hold up to
+	// three times the file while it does.
+	data := make([]byte, st.Size()+1)
+	n, err := io.ReadFull(io.LimitReader(f, limit+1), data)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("reading %s: %w", name, err)
+	}
+	data = data[:n]
+	if err == nil {
+		// The file is larger than it was: read what may still be there.
+		rest, rerr := io.ReadAll(io.LimitReader(f, limit+1-int64(n)))
+		if rerr != nil {
+			return nil, fmt.Errorf("reading %s: %w", name, rerr)
+		}
+		data = append(data, rest...)
 	}
 	if int64(len(data)) > limit {
 		return nil, fmt.Errorf("%s %w (more than %d bytes)", name, ErrTooLarge, limit)

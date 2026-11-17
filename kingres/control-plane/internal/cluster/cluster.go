@@ -19,10 +19,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fault"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/instance"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pgconninfo"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/setup"
@@ -69,6 +71,8 @@ type Config struct {
 	TLSCertFile, TLSKeyFile string
 	// Logger receives diagnostics, never secrets.
 	Logger *slog.Logger
+	// Fault is the fault-injection hook of the tests (nil in production).
+	Fault *fault.Hook
 }
 
 // Service creates the cluster and manages the local instance.
@@ -83,8 +87,10 @@ type Service struct {
 
 	pki      pkiState
 	memberMu sync.Mutex
-	proxyMu  sync.Mutex
-	identRef func() error
+	// resetting is set while ResetMember deletes the certificates (see Resetting).
+	resetting atomic.Bool
+	proxyMu   sync.Mutex
+	identRef  func() error
 
 	mu       sync.Mutex
 	dsnSinks []func(dsn string) error

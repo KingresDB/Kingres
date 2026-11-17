@@ -37,7 +37,16 @@ func rowsOf(t *testing.T, n *clustertest.Node) (int, int64) {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	t.Fatalf("node %d: counting the rows: %v", n.Index, err)
+	nodes := ""
+	if rws, qerr := n.ServicePG("rb").Query(context.Background(), `SELECT host || ':' || port || ' ' || role FROM kingres.node ORDER BY node_id`); qerr == nil {
+		for rws.Next() {
+			var s string
+			_ = rws.Scan(&s)
+			nodes += s + "; "
+		}
+		rws.Close()
+	}
+	t.Fatalf("node %d: counting the rows: %v (catalog of this node: %s)", n.Index, err, nodes)
 	return 0, 0
 }
 
@@ -494,9 +503,9 @@ func TestRebalance(t *testing.T) {
 		if n := primaryBuckets(t, leader)[victim.Host]; n != 0 {
 			t.Errorf("the drained server owns %d buckets", n)
 		}
-		if out := leader.Expect(200, "GET", fmt.Sprintf("/tasks/%v", id), nil); out["state"] != "done" {
-			t.Errorf("task: %v", out["state"])
-		}
+		// The report is written by the last step, the task is recorded as done a moment after it: wait for that, do
+		// not read it in between (the report is what the contract promises as soon as the run is over).
+		leader.WaitTaskDone(id, time.Minute)
 	})
 
 	t.Run("a server that should not hold shards is emptied and removed", func(t *testing.T) {

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -492,3 +493,36 @@ func (m *Manager) Info() []ha.LeaseInfo {
 }
 
 var _ ha.Leases = (*Manager)(nil)
+
+// Confirming tells whether an enforced group whose primary this server runs is not
+// yet confirmed by a lease: it has none that is valid and the manager has not yet
+// judged it lost. That is the time before the first renewal round of this kingresd
+// has finished: a restarted kingresd finds the instance running, but the watchdog
+// still counts down the lease the previous kingresd renewed and fences the
+// instance when it runs out before the first round has written a new one. Until
+// the round is done the instance may disappear at any moment, so the API must not
+// sign anybody in against it (the window is at most one round, duration minus
+// margin).
+//
+// It is not true while a renewal fails but the lease still holds: the instance
+// runs until the lease ends, and a follower that lost its leader for a few seconds
+// must go on serving. When the lease ends the manager marks the group lost and
+// fences the instance (see Check); from then on the instance is simply not there,
+// which the requests meet in the usual way.
+func (m *Manager) Confirming() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.haveT || waitMarkerExists(m.c.Dir) {
+		return false // unknown groups, or an instance that is held back anyway
+	}
+	for _, g := range m.topo.Groups {
+		st := m.groups[g]
+		if st != nil && (st.lost || (st.have && m.c.Clock.Mono() < st.validUntil-m.c.Margin)) {
+			continue
+		}
+		if m.c.Enforced(g) || (st == nil && slices.Contains(readEnforced(m.c.Dir).Groups, g)) {
+			return true
+		}
+	}
+	return false
+}

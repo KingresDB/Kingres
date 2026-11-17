@@ -418,3 +418,70 @@ func (r *rig) settle(t *testing.T) {
 	}
 	t.Fatal("the grantors did not record the round")
 }
+
+// A restarted kingresd that finds an enforced primary running is "confirming"
+// until its first round is done: the watchdog still counts down the lease of the
+// previous run, so the API must not sign anybody in meanwhile.
+func TestConfirmingUntilTheFirstRoundAfterAStartIsDone(t *testing.T) {
+	r := newRig(t, []string{"a", "b"}, true)
+	r.m.Renew(context.Background())
+	m2, err := New(Config{Self: "a", Clock: r.clk, Duration: dur, Renew: time.Second, Margin: margin, Dir: filepath.Join(r.dir, "lease"),
+		Grantor: r.m.c.Grantor, Voter: r.voter, Source: fakeSource{r.m.topo}, Instance: r.inst,
+		Enforced: func(int32) bool { return true }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m2.Confirming() {
+		t.Fatal("a restarted manager of an enforced group must be confirming before its first round")
+	}
+	m2.Renew(context.Background())
+	if m2.Confirming() {
+		t.Fatal("still confirming after the first round")
+	}
+	// A group that is not enforced never holds the API back.
+	m3, err := New(Config{Self: "a", Clock: r.clk, Duration: dur, Renew: time.Second, Margin: margin, Dir: filepath.Join(r.dir, "lease"),
+		Grantor: r.m.c.Grantor, Voter: r.voter, Source: fakeSource{r.m.topo}, Instance: r.inst})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Remove(filepath.Join(r.dir, "lease", enforcedFile))
+	if m3.Confirming() {
+		t.Fatal("an unenforced group was held back")
+	}
+}
+
+// A renewal that fails while the lease still holds does not make the group "confirming": the instance
+// runs until the lease ends and the API serves meanwhile (a follower that lost its leader for a few seconds
+// keeps working). When the lease has ended the manager judges the group lost and fences it, which the
+// requests meet as an instance that is not there; Confirming is only for the time before the first round.
+func TestConfirmingIsNotTrueWhileAFailedRenewalLeavesTheLeaseValid(t *testing.T) {
+	ctx := context.Background()
+	r := newRig(t, []string{"a", "b", "c"}, true)
+	r.m.Renew(ctx)
+	if r.m.Confirming() {
+		t.Fatal("confirming after a round that won the lease")
+	}
+	r.voter.down["b"], r.voter.down["c"] = true, true
+	for i := 0; i < 2; i++ {
+		r.clk.Advance(2 * time.Second)
+		r.m.Renew(ctx) // fails: no majority
+		r.m.Check(ctx)
+		if !r.m.Holds(1) {
+			t.Fatal("the lease must still hold in the first seconds of the loss")
+		}
+		if r.m.Confirming() {
+			t.Fatalf("confirming %d s into a loss that the lease still covers: sign-ins would be refused well before the lease ends", 2*(i+1))
+		}
+	}
+	r.clk.Advance(dur) // well past the end of the lease
+	r.m.Check(ctx)
+	if r.m.Holds(1) {
+		t.Fatal("the lease must have ended")
+	}
+	if running, stops, _ := r.inst.state(); running || stops == 0 {
+		t.Fatal("an enforced group that lost its lease must be fenced")
+	}
+	if r.m.Confirming() {
+		t.Fatal("a group that was judged lost is being fenced, not confirmed")
+	}
+}

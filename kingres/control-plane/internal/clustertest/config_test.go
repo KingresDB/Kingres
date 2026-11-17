@@ -33,7 +33,20 @@ func cfgChange(name, level, scope string, value any) map[string]any {
 // cfgApply sends a change, waits for its task and returns the finished task.
 func cfgApply(t *testing.T, n *clustertest.Node, changes ...map[string]any) map[string]any {
 	t.Helper()
-	body := n.Expect(202, "POST", "/config/changes", map[string]any{"changes": changes})
+	// One configuration task runs at a time. A change of a server's group makes the leader bring that server up to
+	// date in a task of its own, which may still be running when the test goes on: the product answers 409
+	// operation_in_progress for that time, and asking again is what a client does.
+	var body map[string]any
+	for end := time.Now().Add(2 * time.Minute); ; time.Sleep(500 * time.Millisecond) {
+		st, b := n.Do("POST", "/config/changes", map[string]any{"changes": changes}, nil)
+		if st == 202 {
+			body = b
+			break
+		}
+		if st != 409 || b["code"] != "operation_in_progress" || time.Now().After(end) {
+			t.Fatalf("node %d: POST /config/changes: status %d, want 202: %v", n.Index, st, b)
+		}
+	}
 	return n.WaitTask(clustertest.TaskID(body), 5*time.Minute)
 }
 
@@ -633,14 +646,20 @@ func TestConfigPendingRestartAndRestartTask(t *testing.T) {
 	if got := items(t, leader.Expect(200, "GET", "/config/parameters?pendingRestart=true", nil)); len(got) != 1 || got[0]["name"] != "shared_buffers" {
 		t.Errorf("pendingRestart filter: %v", got)
 	}
-	sv := leader.Expect(200, "GET", "/config/servers", nil)
+	// The state of a server is read from its instances as they are now: while its standby is being started again after the
+	// restart of an earlier run the server is "waiting" ("Instance 101 is not running"), which is true and passes.
+	var sv map[string]any
+	until(t, time.Minute, "the server to show its pending restart", func() bool {
+		sv = leader.Expect(200, "GET", "/config/servers", nil)
+		for _, s := range items(t, sv) {
+			if s["serverId"] == n2.Host {
+				return s["state"] == "pendingRestart" && len(anyList(s["pendingRestart"])) == 1
+			}
+		}
+		return false
+	})
 	if err := checkResp(chk, "listConfigServers", "200", sv); err != nil {
 		t.Errorf("response does not match the contract: %v", err)
-	}
-	for _, s := range items(t, sv) {
-		if s["serverId"] == n2.Host && (s["state"] != "pendingRestart" || len(anyList(s["pendingRestart"])) != 1) {
-			t.Errorf("server state: %v", s)
-		}
 	}
 	sum := leader.Expect(200, "GET", "/config/summary", nil)
 	if l := anyList(sum["serversPendingRestart"]); len(l) != 1 || l[0] != n2.Host {

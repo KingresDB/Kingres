@@ -543,6 +543,11 @@ func TestRevokedServerLeavesWithForceOnly(t *testing.T) {
 	}
 	// Removing it from the cluster does not wait for a server that has reset itself.
 	body = leader.Expect(202, "DELETE", "/servers/"+victim.Host, nil)
+	defer func() {
+		if t.Failed() {
+			t.Logf("the log of the server that left:\n%s", victim.LogTail(8000))
+		}
+	}()
 	leader.WaitTaskDone(clustertest.TaskID(body), 2*time.Minute)
 	if got := leader.Servers()[victim.Host]; got != nil {
 		t.Errorf("the removed server is still listed: %v", got)

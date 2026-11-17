@@ -14,14 +14,14 @@ import (
 // apply); retryAfter keeps a server that fails again from being tried over and over.
 const (
 	convergeEvery = 30 * time.Second
-	retryAfter    = 10 * time.Minute
+	retryAfter    = time.Minute
 )
 
 // Run is the leader's loop that brings servers up to date. A server that was down during a change
 // is already waited for by the task of that change (it never gives up); this loop covers the rest:
 // a new server, a server that moved to another server group, a hand-edited file.
 func (l *Leader) Run(ctx context.Context) {
-	last := map[string]time.Time{}
+	last := map[string]attempt{}
 	t := time.NewTicker(convergeEvery)
 	defer t.Stop()
 	every := l.ClockEvery
@@ -57,13 +57,20 @@ func (l *Leader) Run(ctx context.Context) {
 				continue
 			}
 			text, err := instance.RenderConfig(0, req.Values)
-			if err != nil || HashOf(text) == st.ConfigHash {
+			if err != nil {
 				continue
 			}
-			if time.Since(last[s.ID]) < retryAfter {
+			if HashOf(text) == st.ConfigHash {
+				delete(last, s.ID) // up to date: an earlier attempt worked, the next difference is a new matter
 				continue
 			}
-			last[s.ID] = time.Now()
+			// The wait between two attempts is for an attempt that did not work: a server that is behind
+			// a configuration that was not tried yet (its group changed since) is brought up to date at once.
+			h := HashOf(text)
+			if p, ok := last[s.ID]; ok && p.hash == h && time.Since(p.at) < retryAfter {
+				continue
+			}
+			last[s.ID] = attempt{at: time.Now(), hash: h}
 			need = append(need, s.ID)
 		}
 		if len(need) == 0 {
@@ -74,4 +81,10 @@ func (l *Leader) Run(ctx context.Context) {
 			l.Log.Warn("starting the task that brings servers up to date failed", "error", err)
 		}
 	}
+}
+
+// attempt is the last time a server was brought up to date, and the configuration it was brought up to.
+type attempt struct {
+	at   time.Time
+	hash string
 }

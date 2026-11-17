@@ -9,6 +9,8 @@ import (
 	"os"
 	"syscall"
 	"time"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/safefile"
 )
 
 func rename(from, to string) error { return os.Rename(from, to) }
@@ -31,9 +33,11 @@ func syncDir(dir string) error {
 // Lock is an exclusive lock on the lock file of a state.
 type Lock struct{ f *os.File }
 
-// Acquire takes the lock, polling for at most wait.
+// Acquire takes the lock, polling for at most wait. The lock file is opened
+// without following a link and must be a regular file (safefile.OpenNoFollow).
+// See lockName for what the lock covers.
 func Acquire(path string, wait time.Duration) (*Lock, error) {
-	f, err := os.OpenFile(lockName(path), os.O_RDWR|os.O_CREATE, 0o644) // #nosec G304 -- next to the state
+	f, err := safefile.OpenNoFollow(lockName(path), os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, err
 	}

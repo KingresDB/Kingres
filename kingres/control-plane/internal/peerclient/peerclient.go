@@ -50,6 +50,9 @@ var ErrUnreachable = errors.New("peerclient: the server cannot be reached")
 // not change it.
 var ErrNotMember = errors.New("peerclient: the server does not present a certificate of this cluster")
 
+// errBlocked marks the failure that the fault hook of the tests makes on purpose.
+var errBlocked = errors.New("blocked on purpose")
+
 // APIError is an error answer of the internal API.
 type APIError struct {
 	Status  int
@@ -209,11 +212,43 @@ func (e *APIError) Is(target error) bool {
 // the step fails (a variable so that tests can shorten it).
 var NotReadyBound = 5 * time.Minute
 
+// transportTries is how often a call that is safe to repeat is made when the connection fails under
+// it (one transient failure must not end a task step).
+const transportTries = 3
+
+// repeatable says whether a call may be made again after the connection failed under it, when it is
+// not known whether the server received the first one. A reading (GET) always may. Of the calls that
+// change something, the ones a task step makes may too: the engine runs a step again from its start after
+// any interruption (a restart of kingresd, a lease that was taken over), so every call of a step has to
+// give the same result when it is repeated, and a repeat that arrives after a newer run of the task has
+// started is refused by the callee through the fence. A call outside a task (a forwarded request of a
+// person, a certificate renewal, a lease request that the rounds repeat anyway) is not repeated here.
+func repeatable(inStep bool, method string) bool { return inStep || method == http.MethodGet }
+
+// transient says whether err is a failure of the connection that another try may not meet: not a
+// refusal of the callee, not a server that is not a member, not a certificate that is revoked, not a
+// partition that a test made on purpose, not the end of the caller's own time.
+func transient(ctx context.Context, err error) bool {
+	return errors.Is(err, ErrUnreachable) && ctx.Err() == nil && !errors.Is(err, errBlocked) && !errors.Is(err, pki.ErrRevoked)
+}
+
 func (c *Client) do(ctx context.Context, serverID string, checkRevoked bool, method, path string, in, out any) error {
 	_, inStep := fence.From(ctx)
 	start := time.Now()
+	tries := 0
 	for delay := time.Second; ; {
 		err := c.doOnce(ctx, serverID, checkRevoked, method, path, in, out)
+		if err != nil && repeatable(inStep, method) && transient(ctx, err) && tries+1 < transportTries {
+			tries++
+			// The connection may be spoiled: do not reuse it.
+			c.Forget(serverID)
+			select {
+			case <-ctx.Done():
+				return err
+			case <-time.After(time.Duration(tries) * 400 * time.Millisecond):
+			}
+			continue
+		}
 		// A task step (its context carries the fence) waits for a server that is not ready; a
 		// request of a user does not (it gets the 503 and its Retry-After).
 		if err == nil || !inStep || !errors.Is(err, ErrNotReady) {
@@ -235,7 +270,7 @@ func (c *Client) do(ctx context.Context, serverID string, checkRevoked bool, met
 
 func (c *Client) doOnce(ctx context.Context, serverID string, checkRevoked bool, method, path string, in, out any) error {
 	if c.cfg.Fault.OutboundBlocked(serverID) {
-		return fmt.Errorf("%w: %s: blocked by the fault hook", ErrUnreachable, serverID)
+		return fmt.Errorf("%w: %w: %s: blocked by the fault hook", ErrUnreachable, errBlocked, serverID)
 	}
 	p, ok := c.cfg.Peers.Get(serverID)
 	if !ok {

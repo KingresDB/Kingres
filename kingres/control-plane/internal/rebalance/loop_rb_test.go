@@ -39,7 +39,7 @@ func (c *lossCluster) enter() {
 	}
 }
 
-func (c *lossCluster) RunMove(ctx context.Context, m Move) error {
+func (c *lossCluster) RunMove(ctx context.Context, m Move, after int64) error {
 	c.enter()
 	if m.Bucket == c.lose && !c.loseDone.Swap(true) {
 		c.settled = make(chan struct{})
@@ -56,7 +56,7 @@ func (c *lossCluster) RunMove(ctx context.Context, m Move) error {
 		return io.ErrUnexpectedEOF
 	}
 	defer c.inflight.Add(-1)
-	return c.fakeCluster.RunMove(ctx, m)
+	return c.fakeCluster.RunMove(ctx, m, after)
 }
 
 // Recover waits for the backend, as the extension does for a move that is alive, and reports what it found.
@@ -205,8 +205,8 @@ func TestNonConvergingPlanStopsTheRun(t *testing.T) {
 // undoing flips the wish of the plan after every move, like two automations toggling shouldHaveShards.
 type undoing struct{ *fakeCluster }
 
-func (u *undoing) RunMove(ctx context.Context, m Move) error {
-	err := u.fakeCluster.RunMove(ctx, m)
+func (u *undoing) RunMove(ctx context.Context, m Move, after int64) error {
+	err := u.fakeCluster.RunMove(ctx, m, after)
 	u.fakeCluster.mu.Lock()
 	u.fakeCluster.target[m.Bucket] = m.From
 	u.fakeCluster.mu.Unlock()

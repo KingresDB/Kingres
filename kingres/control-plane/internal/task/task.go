@@ -74,7 +74,18 @@ const (
 	// CodeStepInterrupted means a NonIdempotent step had started when the
 	// previous run ended, so whether its effect happened is unknown.
 	CodeStepInterrupted = "step_interrupted"
+	// CodeFenced means a server kept refusing the calls of the task because it had seen a newer run of it than
+	// this server's lease can have (see MaxFencedRuns).
+	CodeFenced = "fenced"
 )
+
+// MaxFencedRuns bounds the runs of one task, in a row, that end because a callee refused their fence while
+// the store still lets them hold the lease. Each such run stands down, its lease runs out and the next claim has a
+// higher epoch, so a callee that has seen a newer run than this server can reach (for instance after a restore of
+// the system database, which makes task ids and epochs repeat) is caught up with after some passes; it is never
+// caught up with when its mark is far ahead. Then the task fails, with the alert of its kind, instead of looping with a
+// lease period between passes and nothing to see.
+const MaxFencedRuns = 5
 
 // Task is a persisted task.
 type Task struct {
@@ -332,6 +343,9 @@ type Engine struct {
 	log        *slog.Logger
 	tries      int
 	faultFn    FaultFunc
+	// fenced counts, per task, the runs in a row that a callee refused (see MaxFencedRuns).
+	fencedMu sync.Mutex
+	fenced   map[int64]int
 }
 
 // Options configure an Engine.
@@ -562,7 +576,7 @@ func (e *Engine) run(ctx context.Context, t Task, started time.Time, secrets map
 			// superseded, or its lease ran out. It stands down and does nothing more in the
 			// name of the task (no record, no hook, no alert); see leaseLost.
 			if leaseLost(err) {
-				return ErrLeaseLost
+				return e.standDown(ctx, t, i, st, err)
 			}
 			var pe *PauseError
 			if errors.As(err, &pe) && runCtx.Err() == nil {
@@ -600,6 +614,7 @@ func (e *Engine) run(ctx context.Context, t Task, started time.Time, secrets map
 			return e.fail(ctx, t, i, st, &Error{Code: CodeStepFailed, Step: st.Name, Retryable: true, Message: clip(err.Error())})
 		}
 		e.fault(FaultStepRan, t.ID, i)
+		e.clearFenced(t.ID)
 		cancelReq, err := e.setStep(ctx, t, i, StepDone, percent(i+1, len(def.Steps)))
 		if err != nil {
 			return err
@@ -765,6 +780,37 @@ func (e *Engine) onFail(ctx context.Context, t Task, te *Error) {
 // grows, the interrupted step runs again from its start, as after a restart).
 func leaseLost(err error) bool {
 	return errors.Is(err, ErrLeaseLost) || errors.Is(err, fence.ErrFenced)
+}
+
+// standDown ends a run that was refused for its lease or its fence: it records nothing and says, in the log, which
+// task, step, holder and epoch stood down and why (a quiet end hid a task that looped). A callee that refuses the
+// fence while the store still holds this lease for the run is counted, and after MaxFencedRuns runs in a
+// row the task fails (the engine's own record, under its lease, then the hook of its kind).
+func (e *Engine) standDown(ctx context.Context, t Task, i int, st Step, err error) error {
+	fenced := errors.Is(err, fence.ErrFenced) && !errors.Is(err, ErrLeaseLost)
+	e.log.Warn("task run stands down", "task", t.ID, "kind", t.Kind, "step", st.Name, "holder", e.holder, "epoch", t.Epoch, "fencedByCallee", fenced, "error", err)
+	if !fenced {
+		return ErrLeaseLost
+	}
+	e.fencedMu.Lock()
+	if e.fenced == nil {
+		e.fenced = map[int64]int{}
+	}
+	e.fenced[t.ID]++
+	n := e.fenced[t.ID]
+	e.fencedMu.Unlock()
+	if n < MaxFencedRuns {
+		return ErrLeaseLost
+	}
+	e.clearFenced(t.ID)
+	return e.fail(ctx, t, i, st, &Error{Code: CodeFenced, Step: st.Name, Retryable: true,
+		Message: fmt.Sprintf("A server refused the calls of this task %d times in a row because it has seen a newer run of it than this server's (epoch %d): %s", MaxFencedRuns, t.Epoch, clip(err.Error()))})
+}
+
+func (e *Engine) clearFenced(id int64) {
+	e.fencedMu.Lock()
+	delete(e.fenced, id)
+	e.fencedMu.Unlock()
 }
 
 func (e *Engine) finish(ctx context.Context, t Task, s State, te *Error) error {

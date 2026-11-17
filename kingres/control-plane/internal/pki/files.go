@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -198,24 +199,33 @@ func NewBootstrapCert(n Names, now time.Time) (certPEM, keyPEM []byte, err error
 		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kb}), nil
 }
 
+// bootstrapMu serializes the creation of the bootstrap certificate: the handshakes
+// of several callers that arrive while the files do not exist yet (right after a
+// server reset itself) would each create a key pair and leave a certificate that
+// does not belong to the key, which no later call repairs.
+var bootstrapMu sync.Mutex
+
 // EnsureBootstrapCert returns the bootstrap certificate of dir, creating it
-// when missing, and its fingerprint.
+// when missing or when the two files do not make a pair, and its fingerprint.
 func EnsureBootstrapCert(dir string, n Names, now time.Time) (tls.Certificate, string, error) {
+	bootstrapMu.Lock()
+	defer bootstrapMu.Unlock()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return tls.Certificate{}, "", err
 	}
 	cp, kp := filepath.Join(dir, BootstrapCertFile), filepath.Join(dir, BootstrapKeyFile)
-	if _, err := os.Stat(kp); err != nil {
-		c, k, err := NewBootstrapCert(n, now)
-		if err != nil {
-			return tls.Certificate{}, "", err
-		}
-		if err := WriteFile(kp, k, 0o600); err != nil {
-			return tls.Certificate{}, "", err
-		}
-		if err := WriteFile(cp, c, 0o644); err != nil { //nolint:gosec // a certificate is public
-			return tls.Certificate{}, "", err
-		}
+	if pair, err := tls.LoadX509KeyPair(cp, kp); err == nil {
+		return pair, Fingerprint(pair.Certificate[0]), nil
+	}
+	c, k, err := NewBootstrapCert(n, now)
+	if err != nil {
+		return tls.Certificate{}, "", err
+	}
+	if err := WriteFile(kp, k, 0o600); err != nil {
+		return tls.Certificate{}, "", err
+	}
+	if err := WriteFile(cp, c, 0o644); err != nil { //nolint:gosec // a certificate is public
+		return tls.Certificate{}, "", err
 	}
 	pair, err := tls.LoadX509KeyPair(cp, kp)
 	if err != nil {
