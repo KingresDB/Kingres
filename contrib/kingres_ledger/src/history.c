@@ -66,6 +66,25 @@ PG_FUNCTION_INFO_V1(kingres_ledger_history_sync);
 PG_FUNCTION_INFO_V1(kingres_ledger_history_acl_sync);
 
 /*
+ * kl_require_superuser_caller
+ *		The two SQL entries below take two table OIDs and change one of them
+ *		through the catalog API, with none of the checks of the statements.
+ *		Their callers are ledger_enable and the event trigger, which run as the
+ *		extension owner, a superuser.  A role that only inherits the owner's
+ *		EXECUTE (a member of the owner role without SET, an owner that lost the
+ *		attribute) is not one, and must not be able to add a column to, or
+ *		change the privileges of, a table of its choice.
+ */
+static void
+kl_require_superuser_caller(void)
+{
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("only the extension owner, as a superuser, can call this function")));
+}
+
+/*
  * kingres.ledger_history_sync(relation regclass, history regclass) returns boolean
  *		Add to the history table the columns that the ledger table has gained
  *		(ADD COLUMN), in one ALTER TABLE so that the history table matches the
@@ -86,13 +105,19 @@ kingres_ledger_history_sync(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
 	Oid			histid = PG_GETARG_OID(1);
-	Relation	rel = table_open(relid, AccessShareLock);
-	Relation	hist = table_open(histid, AccessShareLock);
-	TupleDesc	td = RelationGetDescr(rel);
-	TupleDesc	hd = RelationGetDescr(hist);
+	Relation	rel;
+	Relation	hist;
+	TupleDesc	td;
+	TupleDesc	hd;
 	List	   *cmds = NIL;
 	int			i;
 	int			j;
+
+	kl_require_superuser_caller();
+	rel = table_open(relid, AccessShareLock);
+	hist = table_open(histid, AccessShareLock);
+	td = RelationGetDescr(rel);
+	hd = RelationGetDescr(hist);
 
 	if (hist->rd_rel->relkind != RELKIND_RELATION)
 		ereport(ERROR,
@@ -355,6 +380,7 @@ kl_sync_history_acl(Oid relid, Oid histid)
 Datum
 kingres_ledger_history_acl_sync(PG_FUNCTION_ARGS)
 {
+	kl_require_superuser_caller();
 	PG_RETURN_BOOL(kl_sync_history_acl(PG_GETARG_OID(0), PG_GETARG_OID(1)));
 }
 

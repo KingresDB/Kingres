@@ -557,8 +557,8 @@ SELECT kingres.ledger_build_block();
 ERROR:  permission denied for function ledger_build_block
 SELECT kingres.ledger_generate_digest();
 ERROR:  permission denied for function ledger_generate_digest
-SELECT kingres.ledger_record_row(1, ROW(1));
-ERROR:  permission denied for function ledger_record_row
+SELECT kingres.ledger_register_table('pg_class'::regclass);
+ERROR:  permission denied for function ledger_register_table
 RESET ROLE;
 -- An owner role can enable its table and write to it as itself.
 SET ROLE kl_owner;

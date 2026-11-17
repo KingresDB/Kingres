@@ -174,7 +174,6 @@ UPDATE pg_trigger SET tgenabled = 'A'
 WHERE tgname IN ('kingres_ledger_capture', 'kingres_ledger_block_modify', 'kingres_ledger_block_truncate');
 \c
 SET search_path = public;
-SET kingres_ledger.allow_manual_write = on;
 SELECT count(*) AS problems_with_a_future_block FROM kingres.ledger_verify();
 INSERT INTO docs VALUES (500, 'after a clock that was ahead', NULL);
 SELECT kingres.ledger_build_block() AS new_height \gset
@@ -204,7 +203,6 @@ UPDATE pg_trigger SET tgenabled = 'A'
 WHERE tgname IN ('kingres_ledger_capture', 'kingres_ledger_block_modify', 'kingres_ledger_block_truncate');
 \c
 SET search_path = public;
-SET kingres_ledger.allow_manual_write = on;
 SELECT check_name, regexp_replace(object, '[0-9]+', 'N') AS object, detail FROM kingres.ledger_verify();
 SELECT kingres.ledger_verify_digest(
            jsonb_set(:'dg2'::jsonb, '{block_hash}',
@@ -227,6 +225,5 @@ UPDATE pg_trigger SET tgenabled = 'A'
 WHERE tgname IN ('kingres_ledger_capture', 'kingres_ledger_block_modify', 'kingres_ledger_block_truncate');
 \c
 SET search_path = public;
-SET kingres_ledger.allow_manual_write = on;
 SELECT count(*) AS problems_after_repair FROM kingres.ledger_verify();
 SELECT kingres.ledger_verify_digest(:'dg2') AS digest_after_repair;

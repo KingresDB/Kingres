@@ -72,11 +72,12 @@ SELECT height FROM kingres.ledger_head();
 (1 row)
 
 SELECT check_name, object, detail FROM kingres.ledger_verify() ORDER BY 1, 2;
- check_name  | object  |                                                                             detail                                                                              
--------------+---------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------
- block_empty | block 1 | the block has no transaction, which the builder never writes
- block_time  | block 1 | closed_at is later than the time of this verification; 1 block(s) from here on are closed in the future (the clock was ahead, or the block was written by hand)
-(2 rows)
+  check_name  |        object         |                                                                             detail                                                                              
+--------------+-----------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+ block_empty  | block 1               | the block has no transaction, which the builder never writes
+ block_time   | block 1               | closed_at is later than the time of this verification; 1 block(s) from here on are closed in the future (the clock was ahead, or the block was written by hand)
+ manual_write | kingres.ledger_blocks | 1 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+(3 rows)
 
 -- An honest transaction, and the builder: refused, nothing lost.
 INSERT INTO docs VALUES (2, 'b');

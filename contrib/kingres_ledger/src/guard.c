@@ -22,17 +22,15 @@
  *	  1. The code of the extension is writing: a backend-local depth counter,
  *		 raised and lowered by kl_write_enter and kl_write_leave around the
  *		 statements that this library itself executes (the capture code in
- *		 capture.c and kingres.ledger_internal_write below).  SQL cannot raise
- *		 it: the only SQL-callable function that does is
- *		 ledger_internal_write, whose EXECUTE is held by the extension owner
- *		 alone (nobody can be granted it: the ProcessUtility hook refuses the
- *		 GRANT), and it runs one of a fixed list of statements, each of which
- *		 touches nothing but ledger tables and functions of the extension and
- *		 their arguments: no trigger, default, check constraint, index
- *		 expression, policy or operator of a user runs inside it (see the
- *		 comment at ledger_internal_write).  The counter is lowered in a
- *		 PG_FINALLY block, and zeroed by the transaction callback, so an error
- *		 or a rolled back subtransaction cannot leave it raised.
+ *		 capture.c and the functions of write.c).  SQL cannot raise it, and no
+ *		 SQL-callable function takes the content of a write as an argument:
+ *		 the functions that write (ledger_build_block, ledger_generate_digest,
+ *		 ledger_verify_recorded, ledger_register_table, the capture trigger)
+ *		 are C entry points that read the ledger and compute every value they
+ *		 write, and the statements they run are fixed text (see write.c).  The
+ *		 counter is lowered in a PG_FINALLY block, and zeroed by the
+ *		 transaction callback, so an error or a rolled back subtransaction
+ *		 cannot leave it raised.
  *	  2. The script of the extension itself is running (CREATE EXTENSION or
  *		 ALTER EXTENSION UPDATE, creating_extension for this extension): the
  *		 script writes the identity of the chain.
@@ -77,7 +75,6 @@
 #include "catalog/pg_type.h"
 #include "commands/extension.h"
 #include "executor/executor.h"
-#include "executor/spi.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "nodes/parsenodes.h"
@@ -90,8 +87,6 @@
 #include "utils/syscache.h"
 
 #include "kingres_ledger.h"
-
-PG_FUNCTION_INFO_V1(kingres_ledger_internal_write);
 
 /* Raised by the code of the extension while it writes; see the file header. */
 static int	kl_write_depth = 0;
@@ -123,6 +118,20 @@ void
 kl_write_reset(void)
 {
 	kl_write_depth = 0;
+}
+
+/* Whether the code of the extension is running a statement of its own. */
+bool
+kl_write_active(void)
+{
+	return kl_write_depth > 0;
+}
+
+/* Whether kingres_ledger.allow_manual_write is on in this session. */
+bool
+kl_manual_setting_on(void)
+{
+	return kl_allow_manual_write;
 }
 
 /*
@@ -158,6 +167,13 @@ kl_manual_write_allowed(void)
 		superuser_arg(GetUserId()) && superuser_arg(GetOuterUserId());
 }
 
+/* A superuser, acting as itself, in a session where the setting is on. */
+bool
+kl_manual_write_ok(void)
+{
+	return kl_manual_write_allowed();
+}
+
 /*
  * The OID of the extension, cached: the triggers of the ledger tables ask for
  * it once per row.  Forgotten when pg_extension changes (a DROP or a CREATE).
@@ -171,7 +187,7 @@ kl_extoid_invalidate(Datum arg, int cacheid, uint32 hashvalue)
 	kl_extoid_cache = InvalidOid;
 }
 
-static Oid
+Oid
 kl_extension_oid(void)
 {
 	if (!kl_extoid_callback_registered)
@@ -275,7 +291,7 @@ kl_refuse_write(Oid relid, Oid extoid, AclMode writes)
 
 	if (version != NULL && strcmp(version, KL_SCRIPT_VERSION) != 0)
 		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				(errcode(ERRCODE_KL_SCRIPT_VERSION),
 				 errmsg("cannot write to table \"%s\": the SQL of extension \"%s\" is version %s, and this library writes the ledger only through the functions of version %s",
 						get_rel_name(relid), KL_EXTENSION_NAME, version,
 						KL_SCRIPT_VERSION),
@@ -311,11 +327,11 @@ kl_ExecutorCheckPerms(List *rangeTable, List *rtePermInfos,
 		RTEPermissionInfo *perminfo = lfirst_node(RTEPermissionInfo, lc);
 		AclMode		writes = perminfo->requiredPerms &
 			(ACL_INSERT | ACL_UPDATE | ACL_DELETE | ACL_TRUNCATE);
+		/* SELECT ... FOR UPDATE and the foreign key checks: a row lock. */
+		bool		rowlock = (writes == ACL_UPDATE &&
+							   bms_is_empty(perminfo->updatedCols));
 
 		if (writes == 0)
-			continue;
-		/* SELECT ... FOR UPDATE and the foreign key checks: a row lock. */
-		if (writes == ACL_UPDATE && bms_is_empty(perminfo->updatedCols))
 			continue;
 		if (!extoid_known)
 		{
@@ -328,6 +344,21 @@ kl_ExecutorCheckPerms(List *rangeTable, List *rtePermInfos,
 			continue;
 		if (!ereport_on_violation)
 			return false;
+
+		/*
+		 * A row lock changes no row, but a lock that a role holds until its
+		 * transaction ends makes the block builder (its DELETE from the
+		 * queue) and the capture triggers (the foreign key checks) wait for
+		 * it, so it is refused like a write.  The extension's own statements
+		 * are allowed above; the foreign key checks that they cause run while
+		 * the marker is raised.
+		 */
+		if (rowlock)
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("cannot lock rows of table \"%s\": only the code of the ledger takes locks on its tables",
+							get_rel_name(perminfo->relid)),
+					 errdetail("A row lock held by another role would stop the block builder and the capture triggers.")));
 		kl_refuse_write(perminfo->relid, extoid, writes);
 	}
 	return true;
@@ -365,158 +396,6 @@ kl_guard_install(void)
 }
 
 /*
- * What kingres.ledger_internal_write runs.  Each statement is fixed text with
- * numbered parameters; the arguments are values and never text that is run.
- * The statements name the schema, and the function has a fixed search_path
- * (pg_catalog, pg_temp), so nothing a session sets changes what they mean.
- */
-typedef struct KlWriteOp
-{
-	int			nargs;
-	Oid			argtypes[9];
-	bool		returns_id;		/* RETURNING one bigint */
-	const char *sql;
-} KlWriteOp;
-
-static const KlWriteOp kl_write_ops[] = {
-	/* 1: register a table */
-	{4, {INT4OID, REGCLASSOID, TEXTOID, REGCLASSOID}, false,
-		"INSERT INTO kingres.ledger_table (table_id, relid, mode, history_relid) "
-	"OVERRIDING SYSTEM VALUE VALUES ($1, $2, $3, $4)"},
-	/* 2: the transaction rows of a block */
-	{2, {INT8OID, INT8ARRAYOID}, false,
-		"INSERT INTO kingres.ledger_tx "
-		"(ledger_txid, block_height, tx_index, entry_count, merkle_root, user_name) "
-		"SELECT p.ledger_txid, $1, "
-		"(pg_catalog.row_number() OVER (ORDER BY p.ledger_txid) - 1)::pg_catalog.int4, "
-		"r.cnt, r.root, p.user_name "
-		"FROM kingres.ledger_pending p "
-		"CROSS JOIN LATERAL ("
-		"SELECT pg_catalog.count(*)::pg_catalog.int4 AS cnt, "
-		"kingres.ledger_merkle_root("
-		"kingres.ledger_tx_leaf(e.seq, e.table_id, e.op, e.row_hash) ORDER BY e.seq) AS root "
-		"FROM kingres.ledger_entry e WHERE e.ledger_txid = p.ledger_txid) r "
-		"WHERE p.ledger_txid = ANY ($2)"},
-	/* 3: the block */
-	{6, {INT8OID, BYTEAOID, BYTEAOID, INT4OID, TIMESTAMPTZOID, BYTEAOID}, false,
-		"INSERT INTO kingres.ledger_blocks "
-		"(height, hash_version, prev_hash, tx_merkle_root, tx_count, closed_at, block_hash) "
-	"VALUES ($1, 1, $2, $3, $4, $5, $6)"},
-	/* 4: the transactions leave the queue */
-	{1, {INT8ARRAYOID}, false,
-	"DELETE FROM kingres.ledger_pending WHERE ledger_txid = ANY ($1)"},
-	/* 5: a recorded digest */
-	{5, {TIMESTAMPTZOID, NAMEOID, INT8OID, BYTEAOID, JSONBOID}, false,
-		"INSERT INTO kingres.ledger_digest "
-		"(generated_at, generated_by, height, block_hash, digest) "
-	"VALUES ($1, $2, $3, $4, $5)"},
-	/* 6: a recorded verification that ran */
-	{9, {TIMESTAMPTZOID, NAMEOID, INT8OID, INT8OID, TEXTOID, INT4OID, INT8OID, INT8OID, JSONBOID}, true,
-		"INSERT INTO kingres.ledger_verification "
-		"(started_at, finished_at, started_by, from_height, to_height, state, "
-		"problem_count, blocks_checked, rows_checked, problems) "
-		"VALUES ($1, pg_catalog.clock_timestamp(), $2, $3, $4, $5, $6, $7, $8, $9) "
-	"RETURNING verification_id"},
-	/* 7: a recorded verification that failed */
-	{5, {TIMESTAMPTZOID, NAMEOID, INT8OID, INT8OID, JSONBOID}, true,
-		"INSERT INTO kingres.ledger_verification "
-		"(started_at, finished_at, started_by, from_height, to_height, state, "
-		"problem_count, problems) "
-		"VALUES ($1, pg_catalog.clock_timestamp(), $2, $3, $4, 'failed', NULL, $5) "
-	"RETURNING verification_id"}
-};
-
-/*
- * kingres.ledger_internal_write(op int, VARIADIC args "any") returns bigint
- *		Run one of the fixed statements above with the marker raised, and
- *		return the number of rows it changed (the new id for the two
- *		statements that return one).
- *
- * Who can call it.  Nobody but the extension owner has EXECUTE, and the
- * ProcessUtility hook refuses every GRANT on it, so a role that is not a
- * superuser reaches it only through a SECURITY DEFINER function of the
- * extension.  A superuser who calls it directly writes the ledger without
- * the setting; a superuser can change the catalogs anyway, and this is no
- * way for anybody else.
- *
- * What can run while the marker is raised.  Only the statement above, in an
- * SPI connection of its own.  The tables it writes have no trigger but the
- * blocking ones (which raise errors), no policy, no rule, and no default or
- * check expression other than constant ones, now() and clock_timestamp();
- * their indexes have no expression; the types of the columns are built in;
- * the foreign key checks are system triggers.  The functions the statements
- * name are pg_catalog's and the extension's, found by schema qualification
- * and by a search_path that has nothing in front of pg_catalog.  A role
- * cannot add a trigger, a rule, a policy or an index to these tables (the
- * ProcessUtility hook and the event triggers refuse), and no user code is
- * an argument: the arguments are values.  The one thing that could run user
- * code is a statement-level event trigger on the statement; event triggers
- * fire on DDL, not on these statements, and only a superuser can create one.
- */
-Datum
-kingres_ledger_internal_write(PG_FUNCTION_ARGS)
-{
-	int32		op = PG_GETARG_INT32(0);
-	const KlWriteOp *spec;
-	Datum		values[9];
-	char		nulls[9];
-	int			nargs = PG_NARGS() - 1;
-	int			i;
-	int			rc = 0;
-	int64		result = 0;
-
-	if (op < 1 || op > (int32) lengthof(kl_write_ops))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("unknown ledger write %d", op)));
-	spec = &kl_write_ops[op - 1];
-	if (nargs != spec->nargs)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("ledger write %d takes %d arguments, not %d",
-						op, spec->nargs, nargs)));
-	for (i = 0; i < nargs; i++)
-	{
-		if (get_fn_expr_argtype(fcinfo->flinfo, i + 1) != spec->argtypes[i])
-			ereport(ERROR,
-					(errcode(ERRCODE_DATATYPE_MISMATCH),
-					 errmsg("argument %d of ledger write %d has the wrong type",
-							i + 1, op)));
-		values[i] = PG_GETARG_DATUM(i + 1);
-		nulls[i] = PG_ARGISNULL(i + 1) ? 'n' : ' ';
-	}
-
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "SPI_connect failed");
-	kl_write_enter();
-	PG_TRY();
-	{
-		rc = SPI_execute_with_args(spec->sql, nargs, (Oid *) spec->argtypes,
-								   values, nulls, false, 0);
-	}
-	PG_FINALLY();
-	{
-		kl_write_leave();
-	}
-	PG_END_TRY();
-	if (rc < 0)
-		elog(ERROR, "ledger write %d failed: %s", op, SPI_result_code_string(rc));
-	if (spec->returns_id)
-	{
-		bool		isnull;
-
-		if (SPI_processed != 1 || SPI_tuptable == NULL)
-			elog(ERROR, "ledger write %d returned no row", op);
-		result = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
-											 SPI_tuptable->tupdesc, 1, &isnull));
-	}
-	else
-		result = (int64) SPI_processed;
-	SPI_finish();
-	PG_RETURN_INT64(result);
-}
-
-/*
  * kl_manual_delete_allowed
  *		Whether a DELETE of a row of this table is allowed to a superuser who
  *		turned allow_manual_write on: the transaction rows and the recorded
@@ -543,7 +422,7 @@ kl_manual_delete_allowed(Relation rel)
  * kl_pending_delete_allowed
  *		Whether a DELETE of a row of kingres.ledger_pending is allowed: the
  *		block builder takes the transactions it put in a block off the queue
- *		through ledger_internal_write; nobody else does.
+ *		(write.c); nobody else does.
  */
 bool
 kl_pending_delete_allowed(Relation rel)
@@ -569,6 +448,29 @@ kl_insert_allowed(void)
 	Oid			extoid = kl_extension_oid();
 
 	return OidIsValid(extoid) && kl_write_allowed(extoid);
+}
+
+/*
+ * kl_insert_is_manual
+ *		Whether an insert into this table of the ledger, which kl_insert_allowed
+ *		has just allowed, is a superuser's manual write: the code of the
+ *		extension is not writing, no script of the extension is running, and
+ *		the setting is on.  Such a write is recorded (kl_record_manual_insert),
+ *		except in the queue and in the record itself.
+ */
+bool
+kl_insert_is_manual(Relation rel)
+{
+	const char *name = RelationGetRelationName(rel);
+	Oid			extoid;
+
+	if (strcmp(name, "ledger_pending") == 0 || strcmp(name, "ledger_removed") == 0)
+		return false;
+	extoid = kl_extension_oid();
+	if (!OidIsValid(extoid) || kl_write_depth > 0 ||
+		(creating_extension && CurrentExtensionObject == extoid))
+		return false;
+	return kl_manual_write_allowed();
 }
 
 /*

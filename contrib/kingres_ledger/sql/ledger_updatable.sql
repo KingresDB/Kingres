@@ -494,7 +494,6 @@ SELECT count(*) AS problems_before FROM kingres.ledger_verify();
 :trig_off;
 \c
 SET search_path = public;
-SET kingres_ledger.allow_manual_write = on;
 -- 1. a current row changed without entries
 BEGIN;
 UPDATE pr SET v = 'tampered' WHERE id = 1;
@@ -503,7 +502,6 @@ SELECT * FROM ureport();
 ROLLBACK;
 \c
 SET search_path = public;
-SET kingres_ledger.allow_manual_write = on;
 -- 2. a current row removed
 BEGIN;
 DELETE FROM pr WHERE id = 2;
@@ -512,7 +510,6 @@ SELECT * FROM ureport();
 ROLLBACK;
 \c
 SET search_path = public;
-SET kingres_ledger.allow_manual_write = on;
 -- 3. a history row changed
 BEGIN;
 UPDATE pr_ledger_history SET v = 'tampered' WHERE id = 3;
@@ -521,7 +518,6 @@ SELECT * FROM ureport();
 ROLLBACK;
 \c
 SET search_path = public;
-SET kingres_ledger.allow_manual_write = on;
 -- 4. a history row removed
 BEGIN;
 DELETE FROM pr_ledger_history WHERE id = 3;
@@ -542,7 +538,6 @@ SELECT * FROM ureport();
 ROLLBACK;
 \c
 SET search_path = public;
-SET kingres_ledger.allow_manual_write = on;
 -- 6. an old version put back as the current row
 BEGIN;
 INSERT INTO pr SELECT id, v FROM pr_ledger_history WHERE id = 3;
@@ -551,7 +546,6 @@ SELECT * FROM ureport();
 ROLLBACK;
 \c
 SET search_path = public;
-SET kingres_ledger.allow_manual_write = on;
 -- 7. a history row duplicated
 BEGIN;
 INSERT INTO pr_ledger_history SELECT * FROM pr_ledger_history WHERE id = 3;
@@ -560,7 +554,6 @@ SELECT * FROM ureport();
 ROLLBACK;
 \c
 SET search_path = public;
-SET kingres_ledger.allow_manual_write = on;
 -- 8. a history row that points to another entry, and one that claims another operation
 BEGIN;
 UPDATE pr_ledger_history SET ledger_seq = ledger_seq + 100 WHERE id = 3;
@@ -569,7 +562,6 @@ SELECT * FROM ureport();
 ROLLBACK;
 \c
 SET search_path = public;
-SET kingres_ledger.allow_manual_write = on;
 BEGIN;
 UPDATE pr_ledger_history SET ledger_op = 'I' WHERE id = 3;
 :trig_on;
@@ -577,7 +569,6 @@ SELECT * FROM ureport();
 ROLLBACK;
 \c
 SET search_path = public;
-SET kingres_ledger.allow_manual_write = on;
 -- 9. a history row with an invented content (no entry)
 BEGIN;
 INSERT INTO pr_ledger_history VALUES (77, 'invented', 1, 1, 'D');
@@ -625,11 +616,9 @@ SELECT check_name, object FROM ureport();
 ROLLBACK;
 \c
 SET search_path = public;
-SET kingres_ledger.allow_manual_write = on;
 :trig_on;
 \c
 SET search_path = public;
-SET kingres_ledger.allow_manual_write = on;
 SELECT count(*) AS problems_after FROM kingres.ledger_verify();
 
 --------------------------------------------------------------------------

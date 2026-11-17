@@ -80,9 +80,9 @@ SELECT state, problem_count, problems IS NULL AS no_problems, started_by = curre
        blocks_checked = (SELECT count(*) FROM kingres.ledger_blocks) AS all_blocks,
        rows_checked = (SELECT sum(entry_count) FROM kingres.ledger_tx) AS all_entries
 FROM kingres.ledger_verification WHERE verification_id = :vid;
- state | problem_count | no_problems | by_caller | finished | from_height | to_the_tip | all_blocks | all_entries 
--------+---------------+-------------+-----------+----------+-------------+------------+------------+-------------
- clean |             0 | t           | t         | t        |           0 | t          | t          | t
+  state   | problem_count | no_problems | by_caller | finished | from_height | to_the_tip | all_blocks | all_entries 
+----------+---------------+-------------+-----------+----------+-------------+------------+------------+-------------
+ problems |             3 | f           | t         | t        |           0 | t          | t          | t
 (1 row)
 
 SELECT count(*) - :runs_before AS runs_recorded FROM kingres.ledger_verification;
@@ -94,9 +94,9 @@ SELECT count(*) - :runs_before AS runs_recorded FROM kingres.ledger_verification
 -- a range
 SELECT kingres.ledger_verify_recorded(1, 2) AS vid \gset
 SELECT state, from_height, to_height, blocks_checked FROM kingres.ledger_verification WHERE verification_id = :vid;
- state | from_height | to_height | blocks_checked 
--------+-------------+-----------+----------------
- clean |           1 |         2 |              2
+  state   | from_height | to_height | blocks_checked 
+----------+-------------+-----------+----------------
+ problems |           1 |         2 |              2
 (1 row)
 
 -- ledger_verify itself records nothing
@@ -104,7 +104,7 @@ SELECT count(*) AS before FROM kingres.ledger_verification \gset
 SELECT count(*) AS problems FROM kingres.ledger_verify();
  problems 
 ----------
-        0
+        3
 (1 row)
 
 SELECT count(*) - :before AS recorded_by_ledger_verify FROM kingres.ledger_verification;
@@ -134,9 +134,9 @@ SET ROLE kl_r_agent;
 SELECT kingres.ledger_verify_recorded() AS vid \gset
 RESET ROLE;
 SELECT started_by, state FROM kingres.ledger_verification WHERE verification_id = :vid;
- started_by | state 
-------------+-------
- kl_r_agent | clean
+ started_by |  state   
+------------+----------
+ kl_r_agent | problems
 (1 row)
 
 --------------------------------------------------------------------------
@@ -147,42 +147,38 @@ SELECT started_by, state FROM kingres.ledger_verification WHERE verification_id 
 :trig_off;
 \c
 SET search_path = public;
-SET kingres_ledger.allow_manual_write = on;
 -- 120 rows without entries: 120 problems, 100 of them kept
 INSERT INTO docs SELECT 1000 + g, 'smuggled', NULL FROM generate_series(1, 120) g;
 SELECT kingres.ledger_verify_recorded() AS vid \gset
 :trig_on;
 \c
 SET search_path = public;
-SET kingres_ledger.allow_manual_write = on;
 SELECT state, problem_count, jsonb_array_length(problems) AS kept, problems -> 0 ->> 'check' AS first_check,
        (problems -> 0 ->> 'object') AS first_object,
        finished_at IS NOT NULL AS finished
 FROM kingres.ledger_verification WHERE verification_id = :vid;
-  state   | problem_count | kept | first_check | first_object | finished 
-----------+---------------+------+-------------+--------------+----------
- problems |           126 |  100 | trigger     | public.docs  | t
+  state   | problem_count | kept | first_check  |     first_object      | finished 
+----------+---------------+------+--------------+-----------------------+----------
+ problems |           129 |  100 | manual_write | kingres.ledger_blocks | t
 (1 row)
 
 :trig_off;
 \c
 SET search_path = public;
-SET kingres_ledger.allow_manual_write = on;
 DELETE FROM docs WHERE id >= 1000;
 SELECT count(*) AS problems_after_cleanup FROM kingres.ledger_verify();
  problems_after_cleanup 
 ------------------------
-                      6
+                      9
 (1 row)
 
 :trig_on;
 \c
 SET search_path = public;
-SET kingres_ledger.allow_manual_write = on;
 SELECT count(*) AS problems_after_restore FROM kingres.ledger_verify();
  problems_after_restore 
 ------------------------
-                      0
+                      3
 (1 row)
 
 --------------------------------------------------------------------------
@@ -205,7 +201,7 @@ SELECT append_only_tables = (SELECT count(*) FROM kingres.ledger_table WHERE mod
 FROM kingres.ledger_status;
  append_only_count | updatable_count | latest_block | latest_hash | pending_transactions | nothing_waiting | last_digest | last_verification | last_verification_state | last_verification_problems 
 -------------------+-----------------+--------------+-------------+----------------------+-----------------+-------------+-------------------+-------------------------+----------------------------
- t                 | t               | t            | t           |                    0 | t               | t           | t                 | problems                |                        126
+ t                 | t               | t            | t           |                    0 | t               | t           | t                 | problems                |                        129
 (1 row)
 
 INSERT INTO docs VALUES (701, 'pending', NULL);
@@ -357,7 +353,7 @@ ERROR:  2BP01
 SELECT count(*) AS problems FROM kingres.ledger_verify();
  problems 
 ----------
-        0
+        3
 (1 row)
 
 -- The record of a verification that found problems stays: it is append-only too

@@ -108,10 +108,11 @@ SELECT * FROM kingres.ledger_head();
 ERROR:  the head is block 2, but the row of transaction 900000001 in kingres.ledger_tx names block 77: the end of the chain was removed, or the row was written by hand
 RESET ROLE;
 SELECT * FROM kingres.ledger_verify();
- check_name |    object    |                        detail                        
-------------+--------------+------------------------------------------------------
- tx_block   | tx 900000001 | transaction refers to block 77, which does not exist
-(1 row)
+  check_name  |      object       |                                                detail                                                 
+--------------+-------------------+-------------------------------------------------------------------------------------------------------
+ tx_block     | tx 900000001      | transaction refers to block 77, which does not exist
+ manual_write | kingres.ledger_tx | 1 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+(2 rows)
 
 -- Nothing but the one finding; ledger_blocks_entries does not read the row.
 SELECT count(*) AS entries FROM kingres.ledger_blocks_entries(0, 100);
@@ -160,17 +161,19 @@ SELECT height FROM kingres.ledger_head();
 
 -- Nothing is left of the row but what the operator kept, and ledger_verify says so.
 SELECT check_name, object, left(detail, 40) AS detail FROM kingres.ledger_verify();
-    check_name    |  object   |                  detail                  
-------------------+-----------+------------------------------------------
- operator_removal | removal 1 | a row of ledger_tx was removed by kingre
-(1 row)
+    check_name    |      object       |                  detail                  
+------------------+-------------------+------------------------------------------
+ operator_removal | removal 2         | a row of ledger_tx was removed by kingre
+ manual_write     | kingres.ledger_tx | 1 row(s) were inserted by hand with king
+(2 rows)
 
 SELECT removal_id, source_table, removed_by = session_user AS by_the_caller, reason, row_data ->> 'block_height' AS block_height
   FROM kingres.ledger_removed ORDER BY removal_id;
- removal_id | source_table | by_the_caller |        reason         | block_height 
-------------+--------------+---------------+-----------------------+--------------
-          1 | ledger_tx    | t             | a row written by hand | 77
-(1 row)
+ removal_id | source_table | by_the_caller |                      reason                      | block_height 
+------------+--------------+---------------+--------------------------------------------------+--------------
+          1 | ledger_tx    | t             | manual write (kingres_ledger.allow_manual_write) | 77
+          2 | ledger_tx    | t             | a row written by hand                            | 77
+(2 rows)
 
 -- A row that has no entries is not queued again (a block would hold a transaction
 -- of nothing).
@@ -207,11 +210,13 @@ RESET kingres_ledger.allow_manual_write;
 SELECT * FROM kingres.ledger_head();
 ERROR:  the head is block 2, but digest 2 in kingres.ledger_digest names block 88: the end of the chain was removed, or the row was written by hand
 SELECT check_name, object FROM kingres.ledger_verify() WHERE check_name <> 'operator_removal';
-  check_name  |  object  
---------------+----------
+  check_name  |        object         
+--------------+-----------------------
  digest_block | digest 2
  digest_json  | digest 2
-(2 rows)
+ manual_write | kingres.ledger_digest
+ manual_write | kingres.ledger_tx
+(4 rows)
 
 SET kingres_ledger.allow_manual_write = on;
 INSERT INTO kingres.ledger_digest (generated_at, generated_by, height, block_hash, digest)
@@ -220,13 +225,15 @@ RESET kingres_ledger.allow_manual_write;
 SELECT * FROM kingres.ledger_head();
 ERROR:  block 0 is not the block that digest 3 in kingres.ledger_digest names
 SELECT check_name, object FROM kingres.ledger_verify() WHERE check_name <> 'operator_removal';
-  check_name  |  object  
---------------+----------
+  check_name  |        object         
+--------------+-----------------------
  digest_block | digest 2
  digest_hash  | digest 3
  digest_json  | digest 2
  digest_json  | digest 3
-(4 rows)
+ manual_write | kingres.ledger_digest
+ manual_write | kingres.ledger_tx
+(6 rows)
 
 SET kingres_ledger.allow_manual_write = on;
 SELECT kingres.ledger_remove_stray('digests that name no block or another hash') AS removed;
@@ -243,20 +250,22 @@ SELECT height FROM kingres.ledger_head();
 (1 row)
 
 SELECT check_name, object FROM kingres.ledger_verify() WHERE check_name <> 'operator_removal';
- check_name | object 
-------------+--------
-(0 rows)
+  check_name  |        object         
+--------------+-----------------------
+ manual_write | kingres.ledger_digest
+ manual_write | kingres.ledger_tx
+(2 rows)
 
 SELECT count(*) AS removal_records FROM kingres.ledger_removed;
  removal_records 
 -----------------
-               3
+               6
 (1 row)
 
 SELECT count(*) AS verify_findings FROM kingres.ledger_verify();
  verify_findings 
 -----------------
-               3
+               5
 (1 row)
 
 -- The chain goes on, and the removed rows are in none of it.
@@ -280,9 +289,11 @@ SELECT height FROM kingres.ledger_head();
 (1 row)
 
 SELECT check_name FROM kingres.ledger_verify() WHERE check_name <> 'operator_removal';
- check_name 
-------------
-(0 rows)
+  check_name  
+--------------
+ manual_write
+ manual_write
+(2 rows)
 
 --------------------------------------------------------------------------
 -- An empty chain with a row that names a block.
@@ -307,11 +318,12 @@ RESET kingres_ledger.allow_manual_write;
 SELECT * FROM kingres.ledger_head();
 ERROR:  the chain has no block, but digest 1 in kingres.ledger_digest names block 5
 SELECT * FROM kingres.ledger_verify();
-  check_name  |  object  |                                       detail                                       
---------------+----------+------------------------------------------------------------------------------------
- digest_block | digest 1 | digest refers to block 5, which does not exist
- digest_json  | digest 1 | the digest document does not agree with the height, the hash or the chain identity
-(2 rows)
+  check_name  |        object         |                                                detail                                                 
+--------------+-----------------------+-------------------------------------------------------------------------------------------------------
+ digest_block | digest 1              | digest refers to block 5, which does not exist
+ digest_json  | digest 1              | the digest document does not agree with the height, the hash or the chain identity
+ manual_write | kingres.ledger_digest | 1 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+(3 rows)
 
 \c :orig_db
 SET search_path = public;

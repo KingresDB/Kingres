@@ -23,6 +23,7 @@
 
 /* The differences between the PostgreSQL majors; see the file. */
 #include "pg_compat.h"
+#include "access/htup.h"
 #include "utils/relcache.h"
 
 /* Version of the hash formats implemented by this code (see README). */
@@ -70,6 +71,8 @@
 #define ERRCODE_KL_APPEND_ONLY	MAKE_SQLSTATE('K','L','0','0','1')
 #define ERRCODE_KL_PROTECTED	MAKE_SQLSTATE('K','L','0','0','2')
 #define ERRCODE_KL_NOT_PRELOADED MAKE_SQLSTATE('K','L','0','0','3')
+#define ERRCODE_KL_CLOCK_SKEW	MAKE_SQLSTATE('K','L','0','0','4')
+#define ERRCODE_KL_SCRIPT_VERSION MAKE_SQLSTATE('K','L','0','0','5')
 
 /*
  * Names used to find the extension and the objects it creates.  Functions and
@@ -88,11 +91,20 @@
 /* C symbols of the functions that the protection code has to recognise. */
 #define KL_SYM_CAPTURE			"kingres_ledger_capture"
 #define KL_SYM_BLOCK_MODIFY		"kingres_ledger_block_modify"
+#define KL_SYM_REGISTER_TABLE	"kingres_ledger_register_table"
 #define KL_SYM_RECORD_ROW		"kingres_ledger_record_row"
 #define KL_SYM_LOCK_TABLE		"kingres_ledger_lock_table"
 #define KL_SYM_HISTORY_SYNC		"kingres_ledger_history_sync"
 #define KL_SYM_HISTORY_ACL_SYNC	"kingres_ledger_history_acl_sync"
-#define KL_SYM_INTERNAL_WRITE	"kingres_ledger_internal_write"
+
+/*
+ * The subid of the lock that serialises the block builders and
+ * ledger_remove_stray: a lock on the extension's own object with a sub-object
+ * number that no statement of SQL uses (every DDL on an extension locks it
+ * with the number 0), so no role can take or hold it but through the code of
+ * the extension.
+ */
+#define KL_BUILDER_LOCK_SUBID	0x4B4C
 
 /* Version of the SQL scripts that this library needs. */
 #define KL_SCRIPT_VERSION		"0.3"
@@ -157,7 +169,21 @@ extern void kl_write_reset(void);
 extern bool kl_manual_delete_allowed(Relation rel);
 extern bool kl_pending_delete_allowed(Relation rel);
 extern bool kl_insert_allowed(void);
+extern bool kl_insert_is_manual(Relation rel);
 extern void kl_refuse_write_rel(Relation rel, bool is_insert);
+extern bool kl_write_active(void);
+extern bool kl_manual_setting_on(void);
+extern bool kl_manual_write_ok(void);
+extern Oid	kl_extension_oid(void);
+
+/* write.c: the functions that write the ledger, and the record of a manual write */
+extern void kl_record_manual_insert(Relation rel, HeapTuple tuple);
+
+/* capture.c */
+extern void kl_record_existing_row(int32 table_id, HeapTupleHeader header);
+
+/* kingres_ledger.c */
+extern void kl_check_owner(Oid relid);
 
 /* history.c */
 extern void kl_sync_all_history_acls(Oid extowner);

@@ -92,7 +92,7 @@ BEGIN
             EXCEPTION
                 WHEN SQLSTATE 'U0001' THEN res := 'allowed';
                 WHEN OTHERS THEN
-                    res := CASE WHEN SQLERRM LIKE 'cannot write to table%' THEN 'refused by the guard'
+                    res := CASE WHEN SQLERRM LIKE 'cannot write to table%' OR SQLERRM LIKE 'cannot lock rows%' THEN 'refused by the guard'
                                 WHEN SQLSTATE = 'KL001' THEN 'refused as append-only'
                                 WHEN SQLSTATE = '42501' THEN 'permission denied'
                                 ELSE SQLSTATE || ' ' || SQLERRM END;
@@ -158,24 +158,21 @@ ALTER ROLE kl_g_member RESET kingres_ledger.allow_manual_write;
 SELECT count(*) AS settings_stored
   FROM pg_db_role_setting WHERE setconfig::text LIKE '%allow_manual_write%';
 
--- Nobody can be granted the function that writes, or can call it.
-SELECT proname, has_function_privilege('public', p.oid, 'EXECUTE') AS public_can
-  FROM pg_proc p WHERE proname = 'ledger_internal_write';
-GRANT EXECUTE ON FUNCTION kingres.ledger_internal_write(int, VARIADIC "any") TO kl_g_member;
-SET ROLE kl_g_member;
-SELECT kingres.ledger_internal_write(4, ARRAY[900001]::bigint[]);
-RESET ROLE;
+-- L10-01, L10-02: there is no function that takes the content of a write.
+SELECT count(*) AS internal_write_functions FROM pg_proc WHERE proname = 'ledger_internal_write';
 
 -- pg_maintain (L9-14) changes no row of the chain, but may take any lock on any
 -- table: a lock that is held for the whole transaction stops the block builder
 -- and every reader.  The ledger refuses the locks that block readers or writers
 -- to a role that the lock would have been allowed to; a role with nothing gets
--- the usual error, a lock that blocks nobody is allowed, and VACUUM works.
+-- the usual error, a lock that blocks nobody (ACCESS SHARE) is allowed, and
+-- VACUUM works.
 CREATE ROLE kl_g_maint IN ROLE pg_maintain;
 GRANT USAGE ON SCHEMA kingres TO kl_g_maint;
 SET ROLE kl_g_maint;
 BEGIN; LOCK TABLE kingres.ledger_blocks IN ACCESS EXCLUSIVE MODE; ROLLBACK;
 BEGIN; LOCK TABLE kingres.ledger_chain IN SHARE ROW EXCLUSIVE MODE; ROLLBACK;
+BEGIN; LOCK TABLE kingres.ledger_blocks IN ACCESS SHARE MODE; ROLLBACK;
 BEGIN; LOCK TABLE kingres.ledger_blocks IN ROW EXCLUSIVE MODE; ROLLBACK;
 VACUUM kingres.ledger_blocks;
 SET ROLE kl_g_member;

@@ -174,7 +174,7 @@ kl_prepare_plan(const char *sql, int nargs, Oid *argtypes)
  *		Run one of the two inserts with the write marker raised (guard.c).  The
  *		statements are fixed, their arguments are values, and the tables they
  *		write have no code of a user that could run inside them (see the
- *		comment at kingres_ledger_internal_write); the marker is lowered on
+ *		comment at kl_run in write.c); the marker is lowered on
  *		every way out.
  */
 static int
@@ -419,6 +419,8 @@ kingres_ledger_capture(PG_FUNCTION_ARGS)
 	uint8		hash[KL_HASH_LEN];
 	uint64		txid;
 	int32		seq;
+	int32		registered;
+	Oid			history;
 
 	if (!CALLED_AS_TRIGGER(fcinfo))
 		ereport(ERROR,
@@ -446,6 +448,34 @@ kingres_ledger_capture(PG_FUNCTION_ARGS)
 				 errmsg("invalid table id \"%s\" in ledger trigger",
 						trigger->tgargs[0])));
 
+	/*
+	 * The trigger argument must be the table_id that the registry has for this
+	 * relation, for an insert as for an update or a delete: the trigger is the
+	 * only thing that says which table the entries are for, and a role that
+	 * may create the trigger on a table of its own (the owner of the extension
+	 * and the roles that inherit its privileges) must not be able to record
+	 * entries under the identity of another table.
+	 */
+	if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
+	{
+		/* The registry of 0.1 has no history table: ask for the identity only. */
+		history = InvalidOid;
+		registered = kl_lookup_table_id(RelationGetRelid(trigdata->tg_relation));
+		if (registered < 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_TABLE),
+					 errmsg("table \"%s\" is not under ledger control",
+							RelationGetRelationName(trigdata->tg_relation))));
+	}
+	else
+		history = kl_lookup_history(RelationGetRelid(trigdata->tg_relation), &registered);
+	if (registered != (int32) table_id)
+		ereport(ERROR,
+				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
+				 errmsg("ledger trigger of table \"%s\" has table id %ld, the ledger has %d",
+						RelationGetRelationName(trigdata->tg_relation),
+						table_id, registered)));
+
 	if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
 	{
 		kl_row_hash_tuple(RelationGetDescr(trigdata->tg_relation),
@@ -457,21 +487,8 @@ kingres_ledger_capture(PG_FUNCTION_ARGS)
 		/*
 		 * UPDATE and DELETE: only an updatable table may see them (an
 		 * append-only table has the blocking trigger and a capture trigger
-		 * that is AFTER INSERT only; this check is the second line).  The
-		 * trigger argument must be the table_id that the registry has for
-		 * this relation: the trigger is the only thing that says which
-		 * table the entries are for.
+		 * that is AFTER INSERT only; this check is the second line).
 		 */
-		int32		registered;
-		Oid			history = kl_lookup_history(RelationGetRelid(trigdata->tg_relation),
-												&registered);
-
-		if (registered != (int32) table_id)
-			ereport(ERROR,
-					(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
-					 errmsg("ledger trigger of table \"%s\" has table id %ld, the ledger has %d",
-							RelationGetRelationName(trigdata->tg_relation),
-							table_id, registered)));
 		if (!OidIsValid(history))
 			ereport(ERROR,
 					(errcode(ERRCODE_KL_APPEND_ONLY),
@@ -531,6 +548,9 @@ kingres_ledger_block_modify(PG_FUNCTION_ARGS)
 		{
 			if (!kl_insert_allowed())
 				kl_refuse_write_rel(trigdata->tg_relation, true);
+			/* A superuser's write by hand leaves a record (README). */
+			if (kl_insert_is_manual(trigdata->tg_relation))
+				kl_record_manual_insert(trigdata->tg_relation, trigdata->tg_trigtuple);
 		}
 		else if (!kl_pending_delete_allowed(trigdata->tg_relation))
 			kl_refuse_write_rel(trigdata->tg_relation, false);
@@ -577,21 +597,47 @@ kingres_ledger_block_modify(PG_FUNCTION_ARGS)
 }
 
 /*
- * kingres.ledger_record_row(table_id int, row record) returns void
- *		Enter one existing row into the ledger.  Used by ledger_enable for
- *		the rows a table already contains when it is put under ledger
- *		control; it goes through the same code as the insert trigger so both
- *		share the sequence counter of the transaction.
- *
- * SECURITY DEFINER and not executable by PUBLIC: it writes the ledger.  It
- * refuses a table_id that does not belong to the row's type, so even a
- * caller with access cannot record a row under another table's identity.
+ * kingres.ledger_record_row(table_id int, row_data record) returns void
+ *		Only for the SQL of versions 0.1 and 0.2, whose ledger_enable calls it
+ *		(the update to 0.3 drops it, and ledger_enable then enters the rows
+ *		through kingres.ledger_register_table).  It takes a table_id and a row,
+ *		so it would write entries of its caller's choice, and it is therefore
+ *		refused unless the caller is a superuser acting as itself with
+ *		kingres_ledger.allow_manual_write on: the one thing that may write the
+ *		ledger by hand.  A role that is not a superuser cannot call it in any
+ *		case (EXECUTE is the owner's alone, and the protection hook refuses
+ *		every GRANT on it).
  */
 Datum
 kingres_ledger_record_row(PG_FUNCTION_ARGS)
 {
 	int32		table_id = PG_GETARG_INT32(0);
 	HeapTupleHeader header = PG_GETARG_HEAPTUPLEHEADER(1);
+
+	if (!kl_manual_write_ok())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("kingres.ledger_record_row belongs to the SQL of versions 0.1 and 0.2 of extension \"%s\" and enters the row it is given",
+						KL_EXTENSION_NAME),
+				 errhint("Run ALTER EXTENSION %s UPDATE. A superuser can call it only with kingres_ledger.allow_manual_write on.",
+						 KL_EXTENSION_NAME)));
+	kl_record_existing_row(table_id, header);
+	PG_RETURN_VOID();
+}
+
+/*
+ * kl_record_existing_row
+ *		Enter one existing row of a ledger table into the ledger.  Called by
+ *		kingres_ledger_register_table (write.c) for the rows a table already
+ *		contains when it is put under ledger control; it goes through the same
+ *		code as the insert trigger so both share the sequence counter of the
+ *		transaction.  No SQL function does this: a function that took a row
+ *		and a table_id as arguments would write entries of the caller's choice.
+ *		The row type must be the row type of the table that has this table_id.
+ */
+void
+kl_record_existing_row(int32 table_id, HeapTupleHeader header)
+{
 	uint8		hash[KL_HASH_LEN];
 	uint64		txid;
 	int32		seq;
@@ -603,5 +649,4 @@ kingres_ledger_record_row(PG_FUNCTION_ARGS)
 
 	kl_row_hash_composite(header, table_id, false, hash);
 	kl_record_entry(table_id, KL_OP_INSERT, hash, &txid, &seq);
-	PG_RETURN_VOID();
 }

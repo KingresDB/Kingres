@@ -342,7 +342,7 @@ ROLLBACK;
 SET ROLE kl_other;
 SELECT kingres.ledger_build_block();
 SELECT kingres.ledger_generate_digest();
-SELECT kingres.ledger_record_row(1, ROW(1));
+SELECT kingres.ledger_register_table('pg_class'::regclass);
 RESET ROLE;
 
 -- An owner role can enable its table and write to it as itself.

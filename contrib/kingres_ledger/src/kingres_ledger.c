@@ -181,7 +181,7 @@ kingres_ledger_outer_user(PG_FUNCTION_ARGS)
  *		through role membership), and "does not exist" when the relation is
  *		gone.
  */
-static void
+void
 kl_check_owner(Oid relid)
 {
 	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relid)))

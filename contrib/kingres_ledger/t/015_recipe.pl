@@ -110,11 +110,14 @@ sub plant_manual
 
 sub after_checks
 {
-	my ($db, $dir, $removed) = @_;
+	my ($db, $dir, $removed, $planted) = @_;
+	# The row that the test planted by hand is itself recorded (manual_write);
+	# the recipe removes the row and keeps that record.
+	my $expect = ($planted ? "manual_write x$planted," : '') . "operator_removal x$removed";
 	is($node->safe_psql($db, 'SELECT height FROM kingres.ledger_head()'), '2', "[$db] ledger_head answers");
-	is(findings($db), "operator_removal x$removed",
+	is(findings($db), $expect,
 		"[$db] ledger_verify reports exactly the $removed removals the README lists");
-	is($node->safe_psql($db, 'SELECT count(*) FROM kingres.ledger_removed'), $removed,
+	is($node->safe_psql($db, q(SELECT count(*) FROM kingres.ledger_removed WHERE action = 'removed')), $removed,
 		"[$db] every removed row is in kingres.ledger_removed");
 	ok(-s "$dir/stray-rows.json", "[$db] the recipe wrote the rows to a file");
 	is($node->safe_psql($db, q(SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
@@ -131,7 +134,7 @@ sub after_checks
 		"[$db] the chain goes on");
 	is($node->safe_psql($db, q(SELECT count(*) FROM kingres.ledger_pending)), '0',
 		"[$db] and the queue is empty");
-	is(findings($db), "operator_removal x$removed", "[$db] and nothing new is reported");
+	is(findings($db), $expect, "[$db] and nothing new is reported");
 }
 
 #--------------------------------------------------------------------------
@@ -141,9 +144,9 @@ make_db('rc1');
 plant_manual('rc1', q(INSERT INTO kingres.ledger_tx VALUES (900000001, 77, 0, 1, sha256('x'), 'x')));
 my ($ret, $out, $err) = $node->psql('rc1', 'SELECT * FROM kingres.ledger_head()');
 like($err, qr/the row of transaction 900000001 in kingres\.ledger_tx names block 77/, '[rc1] ledger_head stops');
-is(findings('rc1'), 'tx_block x1', '[rc1] and ledger_verify names the row');
+is(findings('rc1'), 'manual_write x1,tx_block x1', '[rc1] and ledger_verify names the row (and the write by hand)');
 my ($stdout, $dir) = run_recipe('rc1');
-after_checks('rc1', $dir, 1);
+after_checks('rc1', $dir, 1, 1);
 
 #--------------------------------------------------------------------------
 # 2. A digest row above the head.
@@ -154,7 +157,7 @@ plant_manual('rc2', q(INSERT INTO kingres.ledger_digest (generated_at, generated
 ($ret, $out, $err) = $node->psql('rc2', 'SELECT * FROM kingres.ledger_head()');
 like($err, qr/digest \d+ in kingres\.ledger_digest names block 88/, '[rc2] ledger_head stops');
 ($stdout, $dir) = run_recipe('rc2');
-after_checks('rc2', $dir, 1);
+after_checks('rc2', $dir, 1, 1);
 
 #--------------------------------------------------------------------------
 # 3. A digest row with another hash than its block (L9-02).
@@ -165,9 +168,9 @@ plant_manual('rc3', q(INSERT INTO kingres.ledger_digest (generated_at, generated
 ($ret, $out, $err) = $node->psql('rc3', 'SELECT * FROM kingres.ledger_head()');
 like($err, qr/block 0 is not the block that digest \d+ in kingres\.ledger_digest names/, '[rc3] ledger_head stops');
 like($node->safe_psql('rc3', q(SELECT string_agg(check_name || ' ' || object, ',' ORDER BY check_name) FROM kingres.ledger_verify())),
-	qr/^digest_hash digest \d+,digest_json digest \d+$/, '[rc3] and ledger_verify names the digest row (L9-02)');
+	qr/^digest_hash digest \d+,digest_json digest \d+,manual_write kingres\.ledger_digest$/, '[rc3] and ledger_verify names the digest row (L9-02)');
 ($stdout, $dir) = run_recipe('rc3');
-after_checks('rc3', $dir, 1);
+after_checks('rc3', $dir, 1, 1);
 
 #--------------------------------------------------------------------------
 # 4. The head block removed: its transaction rows and its digest stay.

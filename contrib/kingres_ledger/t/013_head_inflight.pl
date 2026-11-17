@@ -121,8 +121,8 @@ foreach my $node ($primary, $standby)
 	isnt($ret, 0, "ledger_head refuses on the $name");
 	like($err, qr/the head is block \Q$head\E, but the row of transaction 900000007 in kingres\.ledger_tx names block 7777/,
 		"the error on the $name names the row, the table and the block");
-	is(q1($node, q(SELECT string_agg(check_name || ' ' || object, ',') FROM kingres.ledger_verify())),
-		'tx_block tx 900000007', "ledger_verify on the $name reports the same row");
+	is(q1($node, q(SELECT string_agg(check_name || ' ' || object, ',' ORDER BY check_name) FROM kingres.ledger_verify())),
+		'manual_write kingres.ledger_tx,tx_block tx 900000007', "ledger_verify on the $name reports the same row, and the write by hand");
 }
 
 $standby->stop;

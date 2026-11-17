@@ -85,7 +85,7 @@ FROM members m WHERE m.prosecdef ORDER BY 1, 2;
  ledger_head            | 
  ledger_inclusion_proof | relation regclass, row_hash bytea
  ledger_inclusion_proof | relation regclass, row_hash bytea, op "char"
- ledger_record_row      | table_id integer, row_data record
+ ledger_register_table  | relation regclass
  ledger_remove_stray    | reason text
  ledger_verify          | from_height bigint, to_height bigint
  ledger_verify_recorded | from_height bigint, to_height bigint
@@ -138,7 +138,6 @@ ORDER BY 1, 2;
  ledger_hook_active      |                                                                                                                                                                                                                                               | t
  ledger_inclusion_proof  | relation regclass, row_hash bytea                                                                                                                                                                                                             | f
  ledger_inclusion_proof  | relation regclass, row_hash bytea, op "char"                                                                                                                                                                                                  | f
- ledger_internal_write   | op integer, VARIADIC args "any"                                                                                                                                                                                                               | f
  ledger_is_member        | p_classid oid, p_objid oid                                                                                                                                                                                                                    | t
  ledger_leaf_hash        | data bytea                                                                                                                                                                                                                                    | t
  ledger_lock_table       | relation regclass                                                                                                                                                                                                                             | f
@@ -147,7 +146,7 @@ ORDER BY 1, 2;
  ledger_merkle_path      | leaf_hashes bytea[], leaf_index integer                                                                                                                                                                                                       | t
  ledger_node_hash        | left_hash bytea, right_hash bytea                                                                                                                                                                                                             | t
  ledger_outer_user       |                                                                                                                                                                                                                                               | t
- ledger_record_row       | table_id integer, row_data record                                                                                                                                                                                                             | f
+ ledger_register_table   | relation regclass                                                                                                                                                                                                                             | f
  ledger_remove_stray     | reason text                                                                                                                                                                                                                                   | f
  ledger_row_hash         | record                                                                                                                                                                                                                                        | t
  ledger_table_defects    | p_relid oid, p_table_id integer                                                                                                                                                                                                               | t
@@ -162,7 +161,7 @@ ORDER BY 1, 2;
  ledger_verify_proof     | proof jsonb, digest jsonb, expected_table_id integer, expected_row_hash bytea, expected_op "char"                                                                                                                                             | t
  ledger_verify_recorded  | from_height bigint, to_height bigint                                                                                                                                                                                                          | f
  ledger_worker_state     | OUT state text, OUT visits bigint, OUT failures bigint, OUT consecutive_failures integer, OUT last_attempt timestamp with time zone, OUT last_success timestamp with time zone, OUT retry_after timestamp with time zone, OUT last_error text | f
-(46 rows)
+(45 rows)
 
 -- ... and which table PUBLIC can read or write.
 SELECT c.relname,
@@ -216,7 +215,7 @@ SET search_path = pg_temp, public;
 SELECT count(*) AS problems_with_shadows FROM kingres.ledger_verify();
  problems_with_shadows 
 -----------------------
-                     0
+                     3
 (1 row)
 
 INSERT INTO docs VALUES (600, 'shadow', NULL);

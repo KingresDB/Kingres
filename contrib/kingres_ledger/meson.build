@@ -10,6 +10,7 @@ kingres_ledger_sources = files(
   'src/protect.c',
   'src/row_hash.c',
   'src/worker.c',
+  'src/write.c',
 )
 
 if host_system == 'windows'
@@ -58,6 +59,7 @@ tests += {
       'ledger_stray',
       'ledger_guard',
       'ledger_manual',
+      'ledger_paths',
     ],
     'regress_args': ['--temp-config', files('kingres_ledger.conf')],
     # The tests need shared_preload_libraries = 'kingres_ledger', which a
@@ -82,6 +84,7 @@ tests += {
       't/014_guard.pl',
       't/015_recipe.pl',
       't/016_dump_upgrade.pl',
+      't/017_guard_paths.pl',
     ],
   },
 }

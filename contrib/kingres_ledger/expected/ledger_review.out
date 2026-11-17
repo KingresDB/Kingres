@@ -92,7 +92,7 @@ JOIN kingres.ledger_table t USING (table_id) WHERE t.relid = 'r_x'::regclass;
 SELECT count(*) AS problems FROM kingres.ledger_verify();
  problems 
 ----------
-        0
+        3
 (1 row)
 
 -- One broken table is reported as a finding and does not stop the others.
@@ -115,18 +115,21 @@ INSERT INTO r_other VALUES (1, 'row');
 UPDATE pg_attribute SET atttypid = 'aclitem'::regtype
 WHERE attrelid = 'r_broken'::regclass AND attname = 'z';
 SELECT * FROM public.vreport();
- check_name  |     object      |                                      detail                                       
--------------+-----------------+-----------------------------------------------------------------------------------
- column      | public.r_broken | column "z" has type aclitem without a binary send function
- table_error | public.r_broken | the table cannot be checked: no binary output function available for type aclitem
-(2 rows)
+  check_name  |        object         |                                                 detail                                                  
+--------------+-----------------------+---------------------------------------------------------------------------------------------------------
+ column       | public.r_broken       | column "z" has type aclitem without a binary send function
+ manual_write | kingres.ledger_blocks | 84 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_entry  | 301 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_tx     | 204 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ table_error  | public.r_broken       | the table cannot be checked: no binary output function available for type aclitem
+(5 rows)
 
 UPDATE pg_attribute SET atttypid = 'text'::regtype
 WHERE attrelid = 'r_broken'::regclass AND attname = 'z';
 SELECT count(*) AS problems_after_repair FROM kingres.ledger_verify();
  problems_after_repair 
 -----------------------
-                     0
+                     3
 (1 row)
 
 --------------------------------------------------------------------------
@@ -176,10 +179,13 @@ INSERT INTO pg_inherits (inhrelid, inhparent, inhseqno, inhdetachpending)
 VALUES ('r_kid'::regclass, 'r_led'::regclass, 1, false);
 UPDATE pg_class SET relhassubclass = true WHERE oid = 'r_led'::regclass;
 SELECT * FROM public.vreport();
- check_name  |    object    |                                                detail                                                 
--------------+--------------+-------------------------------------------------------------------------------------------------------
- inheritance | public.r_led | table public.r_kid is a child of this table, so rows can be read through it that have no ledger entry
-(1 row)
+  check_name  |        object         |                                                 detail                                                  
+--------------+-----------------------+---------------------------------------------------------------------------------------------------------
+ inheritance  | public.r_led          | table public.r_kid is a child of this table, so rows can be read through it that have no ledger entry
+ manual_write | kingres.ledger_blocks | 84 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_entry  | 301 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_tx     | 204 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+(4 rows)
 
 DELETE FROM pg_inherits WHERE inhrelid = 'r_kid'::regclass;
 UPDATE pg_class SET relhassubclass = false WHERE oid = 'r_led'::regclass;
@@ -187,7 +193,7 @@ DROP TABLE r_kid;
 SELECT count(*) AS problems_after_cleanup FROM kingres.ledger_verify();
  problems_after_cleanup 
 ------------------------
-                      0
+                      3
 (1 row)
 
 --------------------------------------------------------------------------
@@ -264,7 +270,7 @@ SELECT count(*) > 0 AS auditor_reads_entries FROM kingres.ledger_entry;
 SELECT count(*) AS auditor_problems FROM kingres.ledger_verify();
  auditor_problems 
 ------------------
-                0
+                3
 (1 row)
 
 SELECT kingres.ledger_verify_digest('{}') AS auditor_verify_digest;
@@ -355,7 +361,7 @@ SELECT pg_temp.try(ARRAY[
     'ALTER EVENT TRIGGER kingres_ledger_guard_end OWNER TO kl_owner',
     'DROP EVENT TRIGGER kingres_ledger_guard_end',
     'GRANT EXECUTE ON FUNCTION kingres.ledger_capture() TO PUBLIC',
-    'GRANT EXECUTE ON FUNCTION kingres.ledger_record_row(int, record) TO kl_other',
+    'GRANT EXECUTE ON FUNCTION kingres.ledger_register_table(regclass) TO kl_other',
     'GRANT INSERT ON kingres.ledger_entry TO kl_other',
     'GRANT ALL ON kingres.ledger_blocks TO kl_other',
     'REVOKE SELECT ON kingres.ledger_blocks FROM CURRENT_USER',
@@ -370,7 +376,7 @@ NOTICE:  rejected: ALTER EVENT TRIGGER kingres_ledger_guard_end RENAME TO other_
 NOTICE:  rejected: ALTER EVENT TRIGGER kingres_ledger_guard_end OWNER TO kl_owner -> KL002 cannot change the owner of a function or an event trigger of the ledger
 NOTICE:  rejected: DROP EVENT TRIGGER kingres_ledger_guard_end -> 2BP01 cannot drop event trigger kingres_ledger_guard_end because extension kingres_ledger requires it
 NOTICE:  rejected: GRANT EXECUTE ON FUNCTION kingres.ledger_capture() TO PUBLIC -> KL002 cannot grant or revoke privileges on an internal function of the ledger
-NOTICE:  rejected: GRANT EXECUTE ON FUNCTION kingres.ledger_record_row(int, record) TO kl_other -> KL002 cannot grant or revoke privileges on an internal function of the ledger
+NOTICE:  rejected: GRANT EXECUTE ON FUNCTION kingres.ledger_register_table(regclass) TO kl_other -> KL002 cannot grant or revoke privileges on an internal function of the ledger
 NOTICE:  rejected: GRANT INSERT ON kingres.ledger_entry TO kl_other -> KL002 cannot grant any privilege other than SELECT on table "ledger_entry": it is part of the ledger
 NOTICE:  rejected: GRANT ALL ON kingres.ledger_blocks TO kl_other -> KL002 cannot grant all privileges on table "ledger_blocks": it is part of the ledger
 NOTICE:  rejected: REVOKE SELECT ON kingres.ledger_blocks FROM CURRENT_USER -> KL002 cannot revoke privileges of the owner on table "ledger_blocks": it is part of the ledger
@@ -398,7 +404,7 @@ DROP FUNCTION kingres.ledger_capture(int);
 SELECT count(*) AS problems_after_repair FROM kingres.ledger_verify();
  problems_after_repair 
 -----------------------
-                     0
+                     3
 (1 row)
 
 --------------------------------------------------------------------------
@@ -570,7 +576,7 @@ INSERT INTO r_led VALUES (2, 'two', 'ok', ARRAY[1, 2]);
 SELECT count(*) AS problems_after_add_column FROM kingres.ledger_verify();
  problems_after_add_column 
 ---------------------------
-                         0
+                         3
 (1 row)
 
 -- Documented limitation: the ledger follows the table by OID, not by name.
@@ -582,7 +588,7 @@ INSERT INTO r_led VALUES (99, 'not in the ledger');
 SELECT count(*) AS problems_with_fresh_table_under_old_name FROM kingres.ledger_verify();
  problems_with_fresh_table_under_old_name 
 ------------------------------------------
-                                        0
+                                        3
 (1 row)
 
 SELECT t.relid::regclass AS ledger_table FROM kingres.ledger_table t
@@ -656,7 +662,7 @@ SELECT pg_get_userbyid(relowner) AS owner_after_reassign FROM pg_class WHERE oid
 SELECT count(*) AS problems_after_reassign FROM kingres.ledger_verify();
  problems_after_reassign 
 -------------------------
-                       0
+                       3
 (1 row)
 
 --------------------------------------------------------------------------
@@ -673,7 +679,7 @@ SELECT count(*) AS rows_hashed FROM r_x q WHERE kingres.ledger_row_hash(q.*) IS 
 SELECT count(*) AS problems_in_parallel_mode FROM kingres.ledger_verify();
  problems_in_parallel_mode 
 ---------------------------
-                         0
+                         3
 (1 row)
 
 SELECT kingres.ledger_verify_proof(:'pf'::jsonb, :'dg'::jsonb) AS proof_in_parallel_mode;
@@ -690,7 +696,7 @@ RESET debug_parallel_query;
 SELECT count(*) AS problems_before FROM kingres.ledger_verify();
  problems_before 
 -----------------
-               0
+               3
 (1 row)
 
 UPDATE pg_trigger SET tgenabled = 'D'
@@ -703,12 +709,15 @@ WHERE tgrelid = 'r_other'::regclass AND tgname LIKE 'kingres_ledger%';
 UPDATE pg_attribute SET atttypid = 'aclitem'::regtype
 WHERE attrelid = 'r_broken'::regclass AND attname = 'z';
 SELECT * FROM public.vreport();
- check_name  |     object      |                                      detail                                       
--------------+-----------------+-----------------------------------------------------------------------------------
- column      | public.r_broken | column "z" has type aclitem without a binary send function
- table_error | public.r_broken | the table cannot be checked: no binary output function available for type aclitem
- table_rows  | public.r_other  | row hash <hash>: 1 row(s) in the table, 0 entry(ies) in the ledger
-(3 rows)
+  check_name  |        object         |                                                 detail                                                  
+--------------+-----------------------+---------------------------------------------------------------------------------------------------------
+ column       | public.r_broken       | column "z" has type aclitem without a binary send function
+ manual_write | kingres.ledger_blocks | 84 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_entry  | 301 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_tx     | 204 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ table_error  | public.r_broken       | the table cannot be checked: no binary output function available for type aclitem
+ table_rows   | public.r_other        | row hash <hash>: 1 row(s) in the table, 0 entry(ies) in the ledger
+(6 rows)
 
 UPDATE pg_attribute SET atttypid = 'text'::regtype
 WHERE attrelid = 'r_broken'::regclass AND attname = 'z';
@@ -722,7 +731,7 @@ WHERE tgrelid = 'r_other'::regclass AND tgname LIKE 'kingres_ledger%';
 SELECT count(*) AS problems_after_cleanup FROM kingres.ledger_verify();
  problems_after_cleanup 
 ------------------------
-                      0
+                      3
 (1 row)
 
 -- REINDEX of the ledger catalog tables, also CONCURRENTLY, changes nothing
@@ -732,6 +741,6 @@ REINDEX TABLE CONCURRENTLY kingres.ledger_blocks;
 SELECT count(*) AS problems_after_reindex FROM kingres.ledger_verify();
  problems_after_reindex 
 ------------------------
-                      0
+                      3
 (1 row)
 

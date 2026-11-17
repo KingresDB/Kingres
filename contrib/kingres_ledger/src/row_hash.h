@@ -23,6 +23,7 @@ extern void kl_row_hash_composite(HeapTupleHeader header, int32 table_id,
 								  bool history, uint8 *out);
 extern int32 kl_table_id_for_type(Oid typeid);
 extern Oid	kl_lookup_history(Oid relid, int32 *table_id);
+extern int32 kl_lookup_table_id(Oid relid);
 extern bool kl_is_history_column(const char *name);
 extern void kl_table_cache_reset(void);
 

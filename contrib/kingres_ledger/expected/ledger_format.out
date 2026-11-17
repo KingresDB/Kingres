@@ -281,11 +281,10 @@ UPDATE pg_trigger SET tgenabled = 'A'
 WHERE tgname IN ('kingres_ledger_capture', 'kingres_ledger_block_modify', 'kingres_ledger_block_truncate');
 \c
 SET search_path = public;
-SET kingres_ledger.allow_manual_write = on;
 SELECT count(*) AS problems_with_a_future_block FROM kingres.ledger_verify();
  problems_with_a_future_block 
 ------------------------------
-                            0
+                            3
 (1 row)
 
 INSERT INTO docs VALUES (500, 'after a clock that was ahead', NULL);
@@ -302,7 +301,7 @@ WHERE b.height = :new_height;
 SELECT count(*) AS problems_after_clamp FROM kingres.ledger_verify();
  problems_after_clamp 
 ----------------------
-                    0
+                    3
 (1 row)
 
 SELECT kingres.ledger_generate_digest() AS dg2 \gset
@@ -330,12 +329,14 @@ UPDATE pg_trigger SET tgenabled = 'A'
 WHERE tgname IN ('kingres_ledger_capture', 'kingres_ledger_block_modify', 'kingres_ledger_block_truncate');
 \c
 SET search_path = public;
-SET kingres_ledger.allow_manual_write = on;
 SELECT check_name, regexp_replace(object, '[0-9]+', 'N') AS object, detail FROM kingres.ledger_verify();
- check_name | object  |                          detail                           
-------------+---------+-----------------------------------------------------------
- block_time | block N | closed_at is earlier than closed_at of the previous block
-(1 row)
+  check_name  |        object         |                                                 detail                                                  
+--------------+-----------------------+---------------------------------------------------------------------------------------------------------
+ block_time   | block N               | closed_at is earlier than closed_at of the previous block
+ manual_write | kingres.ledger_blocks | 84 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_entry  | 301 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_tx     | 204 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+(4 rows)
 
 SELECT kingres.ledger_verify_digest(
            jsonb_set(:'dg2'::jsonb, '{block_hash}',
@@ -363,11 +364,10 @@ UPDATE pg_trigger SET tgenabled = 'A'
 WHERE tgname IN ('kingres_ledger_capture', 'kingres_ledger_block_modify', 'kingres_ledger_block_truncate');
 \c
 SET search_path = public;
-SET kingres_ledger.allow_manual_write = on;
 SELECT count(*) AS problems_after_repair FROM kingres.ledger_verify();
  problems_after_repair 
 -----------------------
-                     0
+                     3
 (1 row)
 
 SELECT kingres.ledger_verify_digest(:'dg2') AS digest_after_repair;
