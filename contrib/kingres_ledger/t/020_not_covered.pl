@@ -169,7 +169,9 @@ $node->safe_psql('d', q{
 my $pubconn = $pub->connstr('postgres');
 $pubconn =~ s/'/''/g;
 $node->safe_psql('d', "CREATE SUBSCRIPTION sf CONNECTION '$pubconn' PUBLICATION pf WITH (copy_data = true)");
-$node->wait_for_subscription_sync($pub, 'sf');
+# the subscription is in database d: pg_subscription_rel is a catalog of the database, and the default of the
+# helper (postgres) would find it empty there and not wait for the copy at all
+$node->wait_for_subscription_sync($pub, 'sf', 'd');
 is($node->safe_psql('d', q{SELECT count(*) FROM feed}), '3', 'the initial copy filled the ledger table');
 is($node->safe_psql('d', q{SELECT count(*) FROM kingres.ledger_entry
 	WHERE table_id = (SELECT table_id FROM kingres.ledger_table WHERE relid = 'feed'::regclass)}),
@@ -241,7 +243,7 @@ for my $i (1 .. 6)
 	{
 		$order = 'drop first';
 		$first->query('BEGIN; DROP EXTENSION plpgsql CASCADE;');
-		$second->query_until(qr/started/, "\\echo started\nSELECT kingres.ledger_enable('t');\nSELECT 'e_done';\n");
+		$second->query_until(qr/started/, "\\echo started\nSET client_min_messages = error;\nSELECT kingres.ledger_enable('t');\nSELECT 'e_done';\n");
 		# wait until the enable is blocked or has finished
 		$node->poll_query_until($db, qq{SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $pid2
 			AND (wait_event_type = 'Lock' OR (state LIKE 'idle%' AND query LIKE '%e_done%')))});
@@ -250,6 +252,7 @@ for my $i (1 .. 6)
 	else
 	{
 		$order = 'enable first';
+		$second->query_safe(q{SET client_min_messages = error});
 		$second->query_safe(q{SELECT kingres.ledger_enable('t')});
 		$first->query_until(qr/started/, "\\echo started\nDROP EXTENSION plpgsql CASCADE;\nSELECT 'd_done';\n");
 		$node->poll_query_until($db, qq{SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $pid1

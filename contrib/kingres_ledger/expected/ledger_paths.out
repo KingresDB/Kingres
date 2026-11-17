@@ -46,6 +46,7 @@ GRANT SET ON PARAMETER kingres_ledger.allow_manual_write TO kl_p_gset;
 CREATE TABLE docs (id int PRIMARY KEY, body text);
 GRANT ALL ON docs TO kl_p_plain, kl_p_member;
 SELECT kingres.ledger_enable('docs');
+WARNING:  database "kl_paths_t" can be dropped, and the ledger with it, by roles that are not superusers: kl_p_inh
  ledger_enable 
 ---------------
  
@@ -536,6 +537,7 @@ SELECT public.p_blk() AS after_the_recorded_verification;
 
 CREATE TABLE p_new (id int);
 SELECT kingres.ledger_enable('p_new');
+WARNING:  database "kl_paths_t" can be dropped, and the ledger with it, by roles that are not superusers: kl_p_inh
  ledger_enable 
 ---------------
  

@@ -116,6 +116,11 @@
  * statement uses).  Nothing takes an identifier from a sequence: a role that
  * holds nextval and setval on a sequence (every member of pg_write_all_data
  * does) could stop the writers by moving it, and no hook sees a call of setval.
+ *
+ * The order of the locks, for every writer: a lock on the table of ledger_enable,
+ * then the builders', the registry's, the verifications', the removals' (the
+ * numbers below are in that order).  A transaction that takes more than one takes
+ * the earlier first; a write by hand takes all four (kl_lock_for_manual_write).
  */
 #define KL_REGISTRY_LOCK_SUBID	0x4B4D
 #define KL_VERIFY_LOCK_SUBID	0x4B4E
@@ -194,6 +199,7 @@ extern bool kl_manual_delete_allowed(Relation rel);
 extern bool kl_pending_delete_allowed(Relation rel);
 extern bool kl_insert_allowed(void);
 extern bool kl_insert_is_manual(Relation rel);
+extern bool kl_insert_by_hand(void);
 extern void kl_refuse_write_rel(Relation rel, bool is_insert);
 extern bool kl_write_active(void);
 extern bool kl_manual_setting_on(void);
@@ -203,6 +209,8 @@ extern Oid	kl_extension_oid(void);
 /* write.c: the functions that write the ledger, and the record of a manual write */
 extern void kl_record_manual_insert(Relation rel, HeapTuple tuple);
 extern void kl_lock_extension_object(int subid);
+extern void kl_lock_for_manual_write(Relation rel);
+extern HeapTuple kl_manual_write_identifier(Relation rel, HeapTuple tuple);
 extern void kl_hold_progress(void);
 
 /* capture.c */

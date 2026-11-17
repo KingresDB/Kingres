@@ -192,6 +192,15 @@ CREATE TABLE kingres.ledger_removed (
         CHECK (action IN ('removed', 'inserted'))
 );
 
+-- The largest digest identifier that ledger_remove_stray took out (ledger_generate_digest
+-- never gives it again), read under the lock of the builders: an index, so that the
+-- read does not grow with every manual write and every removal (L15-09).  The expression
+-- uses built-in operators only.
+CREATE INDEX ledger_removed_digest_idx ON kingres.ledger_removed
+    ((((row_data OPERATOR(pg_catalog.->>) 'digest_id'))::pg_catalog.int8))
+    WHERE source_table OPERATOR(pg_catalog.=) 'ledger_digest'
+      AND action OPERATOR(pg_catalog.=) 'removed';
+
 COMMENT ON TABLE kingres.ledger_table IS
     'Tables under ledger control; table_id is the identity used inside hashes.';
 COMMENT ON TABLE kingres.ledger_chain IS
@@ -1213,8 +1222,7 @@ DECLARE
     hid   oid;
     old_mode text;
     owner_name name;
-    dbo_name name;
-    dbo_super boolean;
+    droppers text;
 BEGIN
     IF NOT kingres.ledger_hook_active() THEN
         RAISE EXCEPTION 'kingres_ledger must be loaded through shared_preload_libraries'
@@ -1423,18 +1431,29 @@ BEGIN
         EXECUTE pg_catalog.format('ALTER TABLE %I.%I ENABLE ALWAYS TRIGGER kingres_ledger_capture', nsp, rel.relname);
     END IF;
 
-    -- Say what the ledger cannot do: the owner of a database can drop it (a
-    -- DROP DATABASE of another database runs no hook of a library loaded in
-    -- this one), and with it the ledger.  Only a database that a superuser owns
-    -- is out of reach of every role that is not a superuser (README, "What a
-    -- role that is not a superuser can stop or remove", L13-03).
-    SELECT r.rolname, r.rolsuper INTO dbo_name, dbo_super
-      FROM pg_catalog.pg_database d JOIN pg_catalog.pg_roles r ON r.oid = d.datdba
-     WHERE d.datname = pg_catalog.current_database();
-    IF NOT COALESCE(dbo_super, true) THEN
-        RAISE WARNING 'database "%" is owned by role "%", which is not a superuser and can drop the database, and the ledger with it',
-            pg_catalog.current_database(), dbo_name
-            USING HINT = 'Make a superuser the owner of every database that holds a ledger: ALTER DATABASE ... OWNER TO.';
+    -- Say what the ledger cannot do: a role that can drop this database drops
+    -- the ledger with it (a DROP DATABASE run from another database goes
+    -- through no hook of a library loaded in this one).  The roles are those
+    -- that PostgreSQL's dropdb lets through, for a role that is not a
+    -- superuser: the current user must be the owner of the database or have
+    -- the privileges of the owner (object_ownercheck, has_privs_of_role:
+    -- membership with INHERIT, directly or through a chain), and the current
+    -- user is what SET ROLE made it, so a role that can SET ROLE (membership
+    -- with SET, directly or through a chain) to such a role, or to a
+    -- superuser, can drop it as well.  Only a database whose owner is a
+    -- superuser role without members that are not superusers is out of reach
+    -- of every role that is not a superuser (README, "What a role that is not
+    -- a superuser can stop or remove", exception 6; L13-03, L15-01).
+    SELECT pg_catalog.string_agg(r.rolname::pg_catalog.text, ', ' ORDER BY r.rolname) INTO droppers
+      FROM pg_catalog.pg_database d, pg_catalog.pg_roles r
+     WHERE d.datname = pg_catalog.current_database() AND NOT r.rolsuper
+       AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles x
+                    WHERE (x.oid = r.oid OR pg_catalog.pg_has_role(r.oid, x.oid, 'SET'))
+                      AND (x.rolsuper OR pg_catalog.pg_has_role(x.oid, d.datdba, 'USAGE')));
+    IF droppers IS NOT NULL THEN
+        RAISE WARNING 'database "%" can be dropped, and the ledger with it, by roles that are not superusers: %',
+            pg_catalog.current_database(), droppers
+            USING HINT = 'Make a superuser role that has no members (or only superusers) the owner of every database that holds a ledger (ALTER DATABASE ... OWNER TO), do not grant it to a role that is not a superuser, and keep the digests outside the database. kingres.ledger_status lists the roles.';
     END IF;
 
     -- The registration and the entry of the rows that exist already are
@@ -2259,12 +2278,20 @@ SELECT (SELECT pg_catalog.count(*) FROM kingres.ledger_table t WHERE t.mode = 'a
        ws.retry_after AS worker_retry_after,
        ws.last_error AS worker_last_error,
        dbo.rolname AS database_owner,
-       dbo.rolsuper AS database_owner_is_superuser
+       dbo.rolsuper AS database_owner_is_superuser,
+       dbd.droppers AS database_droppers,
+       (pg_catalog.cardinality(dbd.droppers) > 0) AS database_droppable_by_non_superuser
   FROM (SELECT 1) one
   CROSS JOIN LATERAL kingres.ledger_worker_state() ws
   CROSS JOIN (SELECT r.rolname, r.rolsuper
                 FROM pg_catalog.pg_database d JOIN pg_catalog.pg_roles r ON r.oid = d.datdba
                WHERE d.datname = pg_catalog.current_database()) dbo
+  CROSS JOIN (SELECT COALESCE(pg_catalog.array_agg(r.rolname ORDER BY r.rolname), '{}'::pg_catalog.name[]) AS droppers
+                FROM pg_catalog.pg_database d, pg_catalog.pg_roles r
+               WHERE d.datname = pg_catalog.current_database() AND NOT r.rolsuper
+                 AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles x
+                              WHERE (x.oid = r.oid OR pg_catalog.pg_has_role(r.oid, x.oid, 'SET'))
+                                AND (x.rolsuper OR pg_catalog.pg_has_role(x.oid, d.datdba, 'USAGE')))) dbd
   LEFT JOIN LATERAL (SELECT b.height, b.block_hash, b.closed_at
                        FROM kingres.ledger_blocks b
                       ORDER BY b.height DESC LIMIT 1) lb ON true
@@ -2276,7 +2303,7 @@ SELECT (SELECT pg_catalog.count(*) FROM kingres.ledger_table t WHERE t.mode = 'a
                       WHERE v.finished_at IS NOT NULL
                       ORDER BY v.verification_id DESC LIMIT 1) lv ON true;
 COMMENT ON VIEW kingres.ledger_status IS
-    'One row: the number of append-only and updatable ledger tables, the latest block, the pending transactions and the age of the oldest, the last digest and the last finished verification, and the state of the block-building worker for this database (ok, failed with the delay before the next attempt and the last error, ...), and the owner of the database with whether it is a superuser (a database owner that is not one can drop the database, and the ledger with it). Not readable by PUBLIC.';
+    'One row: the number of append-only and updatable ledger tables, the latest block, the pending transactions and the age of the oldest, the last digest and the last finished verification, and the state of the block-building worker for this database (ok, failed with the delay before the next attempt and the last error, ...), and the owner of the database with whether it is a superuser, and the roles that are not superusers and can drop the database, and the ledger with it (database_droppers: the owner if it is not a superuser, every role with the privileges of the owner, every role that can SET ROLE to one of those or to a superuser; computed as PostgreSQL does). Not readable by PUBLIC.';
 
 REVOKE ALL ON FUNCTION kingres.ledger_verify_recorded(bigint, bigint) FROM PUBLIC;
 REVOKE ALL ON kingres.ledger_status FROM PUBLIC;

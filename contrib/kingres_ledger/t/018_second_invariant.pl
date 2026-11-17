@@ -462,8 +462,9 @@ $node->safe_psql('d', q{CREATE TABLE twice (id int)});
 {
 	my $a = $node->background_psql('d', on_error_stop => 0);
 	my $b = $node->background_psql('d', on_error_stop => 0);
-	$a->query_safe(q{BEGIN; SELECT kingres.ledger_enable('twice') IS NULL;});
-	$b->query_until(qr/started/, "\\echo started\nSELECT kingres.ledger_enable('twice');\n");
+	# The warning about who can drop the database is true here (L15-01) and is not the subject.
+	$a->query_safe(q{SET client_min_messages = error; BEGIN; SELECT kingres.ledger_enable('twice') IS NULL;});
+	$b->query_until(qr/started/, "\\echo started\nSET client_min_messages = error;\nSELECT kingres.ledger_enable('twice');\n");
 	$a->query_safe('COMMIT');
 	$b->query('SELECT 1');
 	like($b->{stderr}, qr/already|ledger table|ledger control/, 'the second registration of a table is refused');

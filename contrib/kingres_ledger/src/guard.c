@@ -451,26 +451,37 @@ kl_insert_allowed(void)
 }
 
 /*
- * kl_insert_is_manual
- *		Whether an insert into this table of the ledger, which kl_insert_allowed
- *		has just allowed, is a superuser's manual write: the code of the
+ * kl_insert_by_hand
+ *		Whether an insert into a table of the ledger, which kl_insert_allowed
+ *		has just allowed, is a superuser's write by hand: the code of the
  *		extension is not writing, no script of the extension is running, and
- *		the setting is on.  Such a write is recorded (kl_record_manual_insert),
- *		except in the queue and in the record itself.
+ *		the setting is on.  Such a write takes the locks of the writers before
+ *		the row exists (kl_lock_for_manual_write).
+ */
+bool
+kl_insert_by_hand(void)
+{
+	Oid			extoid = kl_extension_oid();
+
+	if (!OidIsValid(extoid) || kl_write_depth > 0 ||
+		(creating_extension && CurrentExtensionObject == extoid))
+		return false;
+	return kl_manual_write_allowed();
+}
+
+/*
+ * kl_insert_is_manual
+ *		Whether a write by hand is recorded (kl_record_manual_insert): every
+ *		one, except in the queue and in the record itself.
  */
 bool
 kl_insert_is_manual(Relation rel)
 {
 	const char *name = RelationGetRelationName(rel);
-	Oid			extoid;
 
 	if (strcmp(name, "ledger_pending") == 0 || strcmp(name, "ledger_removed") == 0)
 		return false;
-	extoid = kl_extension_oid();
-	if (!OidIsValid(extoid) || kl_write_depth > 0 ||
-		(creating_extension && CurrentExtensionObject == extoid))
-		return false;
-	return kl_manual_write_allowed();
+	return kl_insert_by_hand();
 }
 
 /*

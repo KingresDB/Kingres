@@ -156,6 +156,7 @@ foreach my $role (qw(wad inh))
 		as_role($role, "SELECT public.move_seqs('$mode')");
 		my $tag = "$role/$mode";
 		my ($ret, $out, $err) = $node->psql('d', qq{
+			SET client_min_messages = error;
 			CREATE TABLE t$n (id int);
 			SELECT kingres.ledger_enable('t$n');
 			INSERT INTO t$n VALUES (1);});
