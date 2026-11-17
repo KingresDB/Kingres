@@ -113,7 +113,8 @@ opened: the runtime opens the null device for reading **and** writing, and a she
 - a file, a pipe and a terminal are normal.
 
 The cost is one refusal that is not a closed descriptor: `1<>/dev/null`, which opens the null device for
-reading and writing on purpose, is refused as well; write `>/dev/null`. What is not detected: a descriptor
+reading and writing on purpose, is refused as well; write `>/dev/null`, or say that it is on purpose (the
+paragraph after the tests). What is not detected: a descriptor
 that was closed and then given by the parent to something that accepts writes and loses them, and any system
 other than those named (no check is made there). On Windows a closed standard output is a null or invalid
 handle, which the runtime does not replace by the null device: the write fails, and the run ends with status 2
@@ -123,6 +124,32 @@ reader that takes only the first bytes (`head -c 5`) leaves status 0 and a cut l
 fitted in the pipe: the program cannot know, and it is the caller's cut. Tests: `TestClosedStandardOutputIsStatus2`,
 `TestStandardOutputThatTheUserChoseRuns` (Unix) and `TestClosedStandardOutputOnWindowsIsStatus2` start the
 program as a child.
+
+**A caller that gives the null device on purpose** (L14-01). Python's `subprocess.DEVNULL`, `daemon(3)` and
+the usual double-fork recipes open `/dev/null` for reading and writing, which the program cannot tell from the
+runtime's stand-in for a closed descriptor (nothing in the descriptor tells them apart), so by default they
+get the refusal above: status 2, nothing run. Such a caller says what it did with the environment variable
+**`KINGRES_VERIFY_NO_OUTPUT=1`**: "the standard output I gave you is the null device on purpose, the status is
+the only answer I read". The program then runs as usual and writes its verdict to the null device, where it is
+lost, and the status is the answer. Only the value `1` counts (`0`, an empty value and anything else keep the
+refusal, and the refusal names the variable), and it changes nothing when the standard output is anything but
+that null device: a pipe, a file and a terminal show the verdict as ever. The cost: a really closed descriptor
+(`>&-`) with the variable set is accepted too, because nothing can tell it from the null device; a caller that
+sets the variable has said that it does not read the output. How to call the program:
+
+- Python: `subprocess.run([...], stdout=subprocess.DEVNULL, env={**os.environ, "KINGRES_VERIFY_NO_OUTPUT": "1"})`
+  and read `returncode`. The standard error may be a pipe: an input error is still written there.
+- C with `daemon(3)`, and any double-fork recipe that opens `/dev/null` with `O_RDWR`: `setenv("KINGRES_VERIFY_NO_OUTPUT", "1", 1)`
+  before `execve`, or run `env KINGRES_VERIFY_NO_OUTPUT=1 kingres-verify ...` as the program.
+- A shell: `>/dev/null` needs nothing; for `1<>/dev/null` write `KINGRES_VERIFY_NO_OUTPUT=1 kingres-verify ... 1<>/dev/null`.
+- systemd, `StandardOutput=null`: not run here, and I believe it opens the null device for writing only, which is accepted
+  without the variable; `Environment=KINGRES_VERIFY_NO_OUTPUT=1` in the unit makes it work either way and is harmless.
+  cron and a terminal give a mail or a terminal, which is a normal output.
+- Windows: nothing is needed. A closed handle fails the write (status 2, `could not be written`), and `NUL` (what
+  `subprocess.DEVNULL` opens there) is accepted; the variable is read and changes nothing.
+
+Tests: `TestNullStandardOutputGivenOnPurposeRunsWhenTheCallerSaysSo`, `TestPythonDevnullCallerWithAndWithoutTheVariable`
+(the real `subprocess.DEVNULL`; skipped where there is no `python3`), `TestNullStandardOutputOnWindowsRunsWithOrWithoutTheVariable`.
 
 Text and JSON are made from one structure: every `ok` step, `note`, `not proved`,
 `missing` and `problems` line of the text is a member of the JSON (`steps`,
@@ -456,13 +483,15 @@ and stored is unknown to you, and a note carries no time that anyone can trust, 
 since" cannot be applied to it (the trust file has `revoked` and `max_tree_size`, and no
 `compromised_since`, for that reason). A held state only ever makes a run stricter (a smaller size, a fork,
 and a larger size that is not proved to extend it are failures), so keeping one that rests on a revoked
-key cannot make anything pass that would fail without it; refusing it would make the choice of lines that a
+key cannot make a run pass that the held text does not allow (it can make a run fail that would pass without it, which is the point of
+keeping it, and the output of such a failure says whose word it rests on: "A conflict with a state that rests on keys that no longer count"); refusing it would make the choice of lines that a
 publisher served decide whether later runs can go on (L12-01). It is not shown to be genuine now, and the
 output says so ("Checkpoints you hold"). Nobody who holds no trusted key can put a byte into the state,
 choose by serving some of the genuine lines what a later run does, or make the exit status, the name of an
 evidence file or the stored state differ by anything that no verified signature covers. A later change
 of the trust file (a key added, retired, revoked, limited, a window changed) never makes a stored state
-unreadable and never makes it accept less. The canonical form of a note is
+unreadable, except by removing every key whose line the state holds (L14-08, "The one way left to make a held
+state unreadable"), and never makes it accept less. The canonical form of a note is
 
 1. the text of the note, which is what the signatures cover (origin, size, root, extension lines);
 2. one blank line;
@@ -520,7 +549,9 @@ for the state, no run can check the state against a key, and `checkpoint --state
 with status 2, say which it is, and give the one command that restores the protection (`checkpoint --state
 NEWFILE --min-size N`, the rebase of "Checkpoints you hold"), which works (`TestRefusedStateNamesTheRebaseAndTheRebaseWorks`).
 To retire a key use `not_after`, `max_tree_size` or `revoked`, which keep every state readable; deleting a
-key is not a retirement. What a record would have to do to survive a deletion (be believed without a
+key is not a retirement. A run that meets a state whose every line is of a key the file no longer holds says
+so (status 2): it names the key ids of the note, says that removing a key did it and that a key is marked
+revoked and never deleted, and gives the rebase (`TestLineOfAKeyThatLeftTheFileMakesNothingUsable`). What a record would have to do to survive a deletion (be believed without a
 signature) is a decision that was not taken: whoever can write your state file can delete it or put an older
 genuine checkpoint in it, but could also put any size in a record that nothing checks, and the signature is
 what makes the record more than that.
@@ -637,8 +668,26 @@ seconds, with nothing changed: look for that process.
 read again immediately before the rename and the run writes nothing, with status 2 and a message that says so,
 when it is not the bytes the decision was made on (`statefile.ReplaceIfUnchanged`): a late writer, one that does
 not take the lock or holds a lock on another file, cannot replace a newer state with one decided on an older.
-What is left is the few microseconds between that read and the rename, for a writer that ignores the lock; no
-call of the file system closes it without one. The earlier statement that the state "is read again under the
+What is left is the time between that read and the rename, for a writer that ignores the lock; no call of the
+file system closes it without a lock. Since L14-04 the new state is written and flushed in a temporary file
+first (`statefile.Prepare`) and the state is read again only then, immediately before the rename
+(`Commit`); before, the read came first and the window was the whole write of the temporary file, which this
+README called "a few microseconds". The window is measured, not argued: a second writer that ignores the lock
+(temporary file and rename, no flush) starts at a random time between 0 and twice the duration of the call, and a
+run is lost when the call returned nil and the rival's bytes are gone. Linux (WSL2, ext4, a call takes about
+40 ms), 1,200 attempts for each version: before 265 lost (22.1 percent), after 1 lost (0.08 percent), 169 refused
+because the rival was seen. Windows 11 (NTFS, a call takes about 9 ms), 3,000 attempts: before 1,346 lost (44.9
+percent), after 189 lost (6.3 percent), 1,084 refused. The Windows figure is high because the rename asks for a
+write through to disk (`MOVEFILE_WRITE_THROUGH`, the only way to ask for the flush of the directory there) and
+the rename call takes about as long as the window: on Windows the window is the rename, milliseconds and not
+microseconds, and a state that matters must not be written by a program that ignores the lock.
+`TestMeasureTheWindowOfAWriterThatIgnoresTheLock` repeats it
+(`KINGRES_WINDOW_ATTEMPTS=N go test -run Measure -v ./internal/statefile`, a few minutes for a few thousand).
+A rename that Windows refuses because another program has the state open without sharing delete (a backup, a
+scanner, a viewer: access denied, a sharing or a lock violation) is tried again every 20 ms for 3 seconds
+(L14-05), and then ends the run with status 2 and the message `another program may have the file open
+without sharing delete ...: close it and run again, nothing was changed`; the state is unchanged
+(`TestRenameWaitsForAProgramThatHoldsTheStateAndGivesUp`, `TestRenameSucceedsWhenTheProgramLetsGoInTime`). The earlier statement that the state "is read again under the
 lock" was true and was not enough: the read happened at the start, and the write at the end, with nothing
 between them to see another writer. `TestStateAcrossRealProcessesNeverMovesBackwards` runs eight processes at
 once against a lock file of mode 0644, eight rounds, with a watcher on Unix, and `TestLockExcludesRealProcesses`
@@ -653,7 +702,7 @@ other signature lines is the same bytes. The identity of the evidence is the sig
 state: when a file is already at that name and holds the **same text**, it is the evidence already saved
 (an earlier run saved it) and the lines of both notes are merged into it, atomically, when the note
 served now has a genuine line that the file lacks (the note says "with fewer signature lines: the file now
-holds the lines of both"); so every subset of the genuine lines of a checkpoint is one file, and a publisher
+holds N signature line(s)" and what they are, see "Lines of one text only accumulate"); so every subset of the genuine lines of a checkpoint is one file, and a publisher
 without a key cannot use up the names (15 subsets of 4 keys gave 8 files and 7 times status 4 before:
 L12-03). **Another text is never called saved**: a file with other content (another note, a file somebody
 put there, a write that was cut short) takes the next name (`-2`, `-3` and so on, 8 in all), which only a
@@ -666,6 +715,53 @@ none can be used or the disk refuses, the output says `was NOT saved`, `--json` 
 and the status is **4**, which is not 0 and is not the 1 of the fork itself: act on the fork and
 save the note you were shown yourself. **The note is in the output** (L10-09): a note line with the
 base64 of its exact bytes (decode it into a file), and `info.state.note_base64` in `--json`.
+
+A new evidence file is written and flushed to a temporary file in the same directory and then **linked** to its
+name (`link`, which fails when the name exists and never follows a link at the name), so that a stop between
+the create and the write cannot leave an empty file that takes one of the eight names (L14-09,
+`TestEvidenceFileIsNeverEmptyAtItsName`); a stop leaves a temporary file, which the next run removes. On a file
+system that cannot link the older exclusive create is used (`TestEvidenceFileWhereTheFileSystemCannotLink`).
+
+**Lines of one text only accumulate** (L14-03). When an evidence file or a state is rewritten with more lines
+of the same text, the lines it holds are kept as they are, also the line of a key that has left the trust file
+since (it was verified when it was stored and is bound to the text, and it cannot be verified now), and only the
+new lines are verified. The output says what the file holds: `N signature line(s), M verify under a key of the
+trust file and K are of keys the trust file does not hold: kept as stored, not verified now, and they make
+nothing usable`. Such a line decides nothing: a note is usable when its text verifies under any key of the
+trust file, and a line of a key the file does not hold is not one of those lines, so a state with no other line
+is refused as before (status 2). Lines of keys the file holds that do not verify are dropped, as before. Under
+the 32 lines a note may carry, the lines that do not verify are left out first
+(`TestEvidenceKeepsTheLineOfAKeyThatLeftTheTrustFile`, `TestStateKeepsTheLineOfAKeyThatLeftTheTrustFile`,
+`TestMergeStoredKeepsWhatIsStoredAndVerifiesWhatIsNew`). A state written by an earlier version holds the note as it
+was served, and the lines of keys the file does not hold that it carries are kept with it.
+
+**A conflict with a state that rests on keys that no longer count** (L14-02). When the held checkpoint rests
+only on keys the trust file no longer counts (revoked, or beyond their `max_tree_size`: "Checkpoints you
+hold"), a fork, a rollback or a failed extension is not an accusation of the log: a thief who signed a forked
+log while its key counted leaves exactly such a state, and then meets the honest log. The failure line says
+so: that the state rests only on the named keys and why, that it may have been signed by a stolen key, that the
+conflict may come from the state and not from the log, and the rebase (`checkpoint --state NEWFILE --min-size N`,
+with the size the state holds named and said to be unauthenticated). The sentence "both are signed by a key of
+the trust file" is printed only for a state that counts. `consistency --old STATE` words it the same way.
+The status is **1**: a verification failed (the held checkpoint is used as the anchor, as decided, and what is
+served does not agree with it). It is not 2, which says that the held checkpoint cannot serve as the anchor and
+is not the case, and not 4, which is a finding about the log whose evidence was lost, which this is not
+established to be. The evidence is **one file for the held state**,
+`<state>.conflict-weak-<held size>-<held root in hex>`: the first conflicting note served against it, and never
+one per run or per size (before, a log that grew made a file at every run). Its name depends on the held
+state and on nothing the log serves, and a later conflict says that one is already kept. It is kept and not
+dropped because a log that really forked after a key was rotated looks the same. A file at that name that is
+not a signed note of the log is not taken for evidence (`was NOT saved`, status still 1). In the JSON,
+`info.state.anchor_weak` is true or false for every run that read a state, and when true
+`info.state.anchor_weak_keys` is a list of `{name, fingerprint, reason}`; `consistency --old STATE` has
+`info.old_anchor_weak` and `info.old_anchor_weak_keys`. Which lines a state holds is what the publisher served on the
+run that made it, so a publisher without a key decides whether a state is of this kind; what it changes is the
+wording and the number of evidence files of a later conflict (one, not one per size), and neither the status nor
+the size nor the held text (`TestKeylessAdversaryNeverChangesTheOutcome` compares those at every step, and the names of the
+files only while no state of a run has been of this kind). Tests: `TestThiefStateMeetsTheHonestLogAndTheOutputSaysWhoMayBeWrong`,
+`TestThiefStateInTheJSON`, `TestThiefStateKeepsOneEvidenceFileWhateverTheNumberOfRuns`, `TestThiefStateRebaseWorks`,
+`TestStateThatCountsKeepsTheOldWordsAndEvidence`, `TestConsistencyAgainstAThiefStateSaysWhoMayBeWrong`,
+`TestWeakAnchorIsInTheJSONOfASuccess`, `TestWeakConflictKeepsOneFileForTheHeldState`.
 
 **Checkpoints you hold** (`--state`, `--old FILE`; design corrections 17 and 60). A checkpoint you kept is
 a statement about the past, so it is judged differently from a checkpoint under test, and the same
@@ -942,7 +1038,7 @@ Run one with `go test ./internal/proof -run '^$' -fuzz '^FuzzVerify$' -fuzztime 
 | `internal/rowfile` | the columns file of `row-hash` |
 | `internal/safefile` | the one way every file is opened: never blocking, regular files only, bounded size, no link below a source directory |
 | `internal/statefile` | the state file: lock, atomic replace with a crash test, link resolution, the place for conflicting evidence |
-| `internal/stdio` | tells the null device that the runtime puts in place of a closed standard output from the one the user asked for |
+| `internal/stdio` | tells the null device that the runtime puts in place of a closed standard output from the one the user asked for, and reads `KINGRES_VERIFY_NO_OUTPUT` with which a caller says it gave the null device on purpose |
 | `internal/cli` | the command line (`cmd/kingres-verify` is a thin `main`) |
 
 ## Decisions where the documentation is silent
@@ -1389,8 +1485,8 @@ rebase, only when that was already so.
 
 **What is left.** Deleting from the trust file every key whose line a state holds still makes the state
 unreadable, with the rebase as the way on (see "The one way left ..."): to be readable without a key a state
-would have to be believed without its signature, which was not decided. The few microseconds between the last
-read of the state and the rename are open for a writer that ignores the lock. The status of a run that cannot
+would have to be believed without its signature, which was not decided. The time between the last
+read of the state and the rename is open for a writer that ignores the lock (measured in L14-04, see "A write never moves the state over one it did not read"). The status of a run that cannot
 write its verdict after it moved the state is 2 and the state stays moved (L12-10): the standard error says so;
 writing the verdict first would not be better, since then a verdict could be shown for a state that was not
 written. The property tests run with a trust file of 4 keys and with one of 16 (the most it may hold), and two epochs of
@@ -1400,3 +1496,49 @@ a link that is swapped between private directories stays coherent and that a pro
 two readings is refused with that reason, and not that a second account cannot do more; the check needs a
 swapper that may change a component the walk required to be owned by the auditor or by root, which one
 account is.
+
+## Findings of the review of the fifth fixes (L14) and what was changed
+
+The review (`kingres/docs/reviews/2026-11-17-kingres-verifier-fifth-fixes.md`) found no wrong verdict, no
+accepted rollback or fork, and no way for a party without a key to move or weaken the state. It accepted the
+decision of the fourth round about revoked keys (a held state that rests only on keys the trust file no longer
+counts stays the anchor) on the condition that a conflict with such a state is worded and kept as what it is.
+The round is small and changes no verdict.
+
+| Finding | What was changed | Where it is described |
+|---|---|---|
+| L14-02 a fork against a state on a revoked key accuses the log, names no way out, saves a file at every run | the failure line says that the state rests only on the named keys, that it may have been signed by a stolen key and that the conflict may come from the state, and gives the rebase; the sentence "both are signed by a key of the trust file" is printed only when true; one evidence file for the held state, never one per run; status stays 1; the JSON has `anchor_weak` and the keys | "A conflict with a state that rests on keys that no longer count" |
+| L14-01 a caller that gives the null device read-write is refused | `KINGRES_VERIFY_NO_OUTPUT=1` says it was on purpose; the refusal stays the default and names the variable; Python, `daemon(3)`, a shell, systemd and Windows are named | "The standard output" |
+| L14-04 the window of a writer that ignores the lock is not microseconds | the temporary file is written and flushed first, the state is read and renamed after; the window is measured | "A write never moves the state over one it did not read" |
+| L14-03 extending a state or an evidence file drops the line of a key that left the trust file | lines already stored are kept as stored and only new lines are verified; the output says what the file holds | "Lines of one text only accumulate" |
+| L14-05 a program that holds the state open fails a verified run on Windows | the rename is tried again for 3 seconds, then the message says that another program may hold the file | "A write never moves the state over one it did not read" |
+| L14-06 guards no test catches | tests for the evidence that is not rewritten, for `consistency --old STATE` on a weak state, and for the text check of `Merge`; the two redundant guards (M29: the equal-text test before the merge, M30: the origin compared in `readBack`) are deleted, not tested | tests |
+| L14-07 the weak anchor is not in the JSON | `info.state.anchor_weak`, `info.state.anchor_weak_keys`; for `consistency`: `info.old_anchor_weak`, `info.old_anchor_weak_keys` | "A conflict with a state that rests on keys that no longer count" |
+| L14-08 the removal dead end | the README sentence is limited to what is true; a state whose every line is of a key the file no longer holds is refused with the key ids and the reason | "The one way left to make a held state unreadable" |
+| L14-09 a new evidence file is created, then written | written to a temporary file and linked into place | "The evidence of a fork" |
+
+**Interface changes a caller can see.**
+
+- The environment variable `KINGRES_VERIFY_NO_OUTPUT=1` (new). Without it nothing changes; the refusal of a null
+  standard output opened for reading and writing now names it.
+- A fork, a rollback or a failed extension against a state that rests only on keys the trust file no longer
+  counts: the status is still 1 and the step is still `fork` or `rollback`; the failure line and the notes are
+  longer and say what is said above; the evidence file is `<state>.conflict-weak-<held size>-<held root>` (one
+  for the state) and not `<state>.conflict-<size>-<root>` for each size served.
+- New JSON members: `info.state.anchor_weak` (every run with `--state` that does not end before the state is read),
+  `info.state.anchor_weak_keys`, `info.old_anchor_weak`, `info.old_anchor_weak_keys` (`consistency --old`).
+- The note of an evidence file or a state that gained a line says how many lines it holds and of what kind; a
+  line of a key that left the trust file is kept in it.
+- The message for a state none of whose keys the trust file holds names the key ids and says that removing a key
+  did it.
+- On Windows a rename that another program blocks is tried again for 3 seconds before the run ends with status
+  2; the message says that another program may hold the file.
+- No new flag, no new exit status. The table of exit statuses is unchanged and is still derived from the source (the new site
+  `weakConflict` has a row of its own, status 1; status 4 is stated as unreachable from it).
+
+**States and evidence written by earlier versions** are read as they were.
+
+**What is left.** The window of a writer that ignores the lock is the rename call, measured above (0.08 percent
+on Linux, 6.3 percent on Windows with 3,000 attempts). Whether a state counts as "weak" depends on the lines the
+publisher served on the run that made it: it is not a choice of the verdict, only of the wording and of the
+number of evidence files of a later conflict. `systemd` was not run.

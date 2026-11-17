@@ -425,6 +425,7 @@ func runAdversaryWorld(t *testing.T, ch chooser, steps int, seedName string, nke
 		publishNote(t, root, all, size, note)
 		return writeNote(t, note)
 	}
+	weakSeen := false
 	for step := 0; step < steps; step++ {
 		st := map[int]standing{}
 		for i := 0; i < nkeys; i++ {
@@ -566,7 +567,17 @@ func runAdversaryWorld(t *testing.T, ch chooser, steps int, seedName string, nke
 				}
 			}
 		}
-		if fmt.Sprint(evidenceNames(filepath.Dir(stA))) != fmt.Sprint(evidenceNames(filepath.Dir(stB))) {
+		// A state that rests only on keys the trust file no longer counts keeps one
+		// evidence file for its conflicts and not one per size (L14-02). Which lines a
+		// state holds is what the publisher served on the run that made it, so a
+		// keyless adversary decides whether the state of its world is such a state, and
+		// with it the number of evidence files of the conflicts that follow; the names
+		// are compared only while neither state has been weak. Everything else is
+		// compared at every step: the status, the first line, the size, the held text.
+		if strings.Contains(outA+outB, "rests only on keys that the trust file no longer counts") {
+			weakSeen = true
+		}
+		if !weakSeen && fmt.Sprint(evidenceNames(filepath.Dir(stA))) != fmt.Sprint(evidenceNames(filepath.Dir(stB))) {
 			t.Fatalf("%s: the evidence names differ: %v and %v", desc, evidenceNames(filepath.Dir(stA)), evidenceNames(filepath.Dir(stB)))
 		}
 	}

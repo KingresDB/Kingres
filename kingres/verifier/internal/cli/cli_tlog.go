@@ -493,7 +493,7 @@ func (e *env) runConsistency(args []string) int {
 	// finding about the log.
 	var oldCP *checkpoint.Checkpoint
 	oldSigned := false
-	oldWeak, oldWeakWhy := false, ""
+	var oldHeld *heldNote
 	if m := sizeRootRE.FindStringSubmatch(*oldFlag); m != nil {
 		size, err := strconv.ParseUint(m[1], 10, 64)
 		rb, derr := signednote.DecodeBase64(m[2])
@@ -538,7 +538,7 @@ func (e *env) runConsistency(args []string) int {
 			r.notes = append(r.notes, fmt.Sprintf("--old is a state file, recorded at %s", rec.VerifiedAt))
 		}
 		oldCP = held.cp
-		oldWeak, oldWeakWhy = held.weak, held.weakWhy
+		oldHeld = held
 	}
 	var newData []byte
 	if *newFlag != "" {
@@ -564,11 +564,25 @@ func (e *env) runConsistency(args []string) int {
 	} else {
 		r.ok("old-checkpoint", fmt.Sprintf("size %d, root given on the command line (not authenticated)", oldCP.Size))
 	}
+	// Against a held checkpoint that rests only on keys the trust file no longer
+	// counts, a failure is not an accusation of the log (L14-02): the failure line
+	// says so and names the rebase. The status stays 1.
+	weakWrap := func(err error) error {
+		if oldHeld != nil && oldHeld.weak {
+			return fmt.Errorf("%w (%s. %s)", err, weakCause(oldHeld), weakAdvice(oldCP.Size))
+		}
+		return err
+	}
 	if oldCP.Size > newCP.Size {
-		return e.finishFailed(r, *asJSON, "sizes", fmt.Errorf("the new checkpoint has size %d, smaller than the old size %d: the log went back", newCP.Size, oldCP.Size))
+		if oldHeld != nil && oldHeld.weak {
+			r.info = map[string]any{"old_size": oldCP.Size, "new_size": newCP.Size}
+			oldWeakInfo(r.info, oldHeld)
+		}
+		return e.finishFailed(r, *asJSON, "sizes", weakWrap(fmt.Errorf("the new checkpoint has size %d, smaller than the old size %d: the log went back", newCP.Size, oldCP.Size)))
 	}
 	r.ok("sizes", fmt.Sprintf("old %d, new %d", oldCP.Size, newCP.Size))
 	r.info = map[string]any{"old_size": oldCP.Size, "new_size": newCP.Size, "old_root": format.EncodeHex(oldCP.Root[:]), "new_root": format.EncodeHex(newCP.Root[:])}
+	oldWeakInfo(r.info, oldHeld)
 	r.notProved = []string{
 		"that the entries behind the hashes are what the operator says: this checks the tree hashes only",
 		"that nobody else was shown a different history: a split view needs a witness or a monitor",
@@ -576,15 +590,15 @@ func (e *env) runConsistency(args []string) int {
 	if !oldSigned {
 		r.notProved = append(r.notProved, "that the old size and root are the checkpoint you meant: they were given without a signature")
 	}
-	if oldWeak {
-		r.notProved = append(r.notProved, "that the old checkpoint was genuine: it rests only on keys the trust file no longer counts ("+oldWeakWhy+")")
+	if oldHeld != nil && oldHeld.weak {
+		r.notProved = append(r.notProved, "that the old checkpoint was genuine: it rests only on keys the trust file no longer counts ("+oldHeld.weakWhy+")")
 	}
 	r.headline = fmt.Sprintf("the log at size %d extends the log at size %d.", newCP.Size, oldCP.Size)
 	if oldCP.Size == 0 || oldCP.Size == newCP.Size {
 		// The proof is empty: no tile is read, and the output must not say
 		// that tiles were checked.
 		if err := merkle.VerifyConsistency(oldCP.Size, newCP.Size, oldCP.Root, newCP.Root, nil); err != nil {
-			return e.finishFailed(r, *asJSON, "consistency", err)
+			return e.finishFailed(r, *asJSON, "consistency", weakWrap(err))
 		}
 		r.ok("tiles", "no tile was needed: the proof is empty, nothing was read from the source")
 		if oldCP.Size == 0 {
@@ -615,7 +629,7 @@ func (e *env) runConsistency(args []string) int {
 	}
 	r.ok("tiles", fmt.Sprintf("read %d tile(s) on the proof path of the tree of size %d: %d proof hash(es); no other tile was read", reader.TilesRead(), newCP.Size, len(path)))
 	if err := merkle.VerifyConsistency(oldCP.Size, newCP.Size, oldCP.Root, newCP.Root, path); err != nil {
-		return e.finishFailed(r, *asJSON, "consistency", err)
+		return e.finishFailed(r, *asJSON, "consistency", weakWrap(err))
 	}
 	r.ok("consistency", "RFC 9162 2.1.4.2: both roots follow from the proof hashes")
 	r.notProved = append(r.notProved, "the tile directory as a whole: only the tiles on the proof path were read, a damaged tile elsewhere is not noticed")

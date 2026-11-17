@@ -65,3 +65,33 @@ func TestClosedStandardOutputOnWindowsIsStatus2(t *testing.T) {
 		t.Fatalf("version to the null device: status %d %q", state.ExitCode(), msg)
 	}
 }
+
+// L14-01 on Windows: nothing is refused there, so the variable changes nothing;
+// the null device (what Python's subprocess.DEVNULL opens as "nul") runs with and
+// without it.
+func TestNullStandardOutputOnWindowsRunsWithOrWithoutTheVariable(t *testing.T) {
+	nul, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nul.Close()
+	for _, extra := range [][]string{nil, {"KINGRES_VERIFY_NO_OUTPUT=1"}} {
+		r, w, _ := os.Pipe()
+		attr := &syscall.ProcAttr{
+			Env:   append(append(os.Environ(), asMain+"=1"), extra...),
+			Files: []uintptr{nul.Fd(), nul.Fd(), w.Fd()},
+		}
+		pid, handle, err := syscall.StartProcess(os.Args[0], []string{os.Args[0], "version"}, attr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.Close()
+		p, _ := os.FindProcess(pid)
+		state, _ := p.Wait()
+		_ = syscall.CloseHandle(syscall.Handle(handle))
+		msg, _ := io.ReadAll(r)
+		if state.ExitCode() != 0 {
+			t.Errorf("the null device with %v: status %d %q", extra, state.ExitCode(), msg)
+		}
+	}
+}

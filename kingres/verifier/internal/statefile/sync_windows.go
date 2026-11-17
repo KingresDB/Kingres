@@ -5,6 +5,7 @@
 package statefile
 
 import (
+	"fmt"
 	"os"
 	"syscall"
 	"time"
@@ -25,9 +26,23 @@ const (
 	errLockViolation        = syscall.Errno(33)
 )
 
+// renameWait is how long a rename that Windows refuses because another program
+// has the file open is tried again (L14-05): a scanner or a backup that reads
+// the state without sharing delete holds it for a moment, and the run has
+// verified a checkpoint it would otherwise lose. A test shortens it.
+var renameWait = 3 * time.Second
+
+const (
+	errAccessDenied     = syscall.Errno(5)
+	errSharingViolation = syscall.Errno(32)
+)
+
 // rename replaces the target and asks for the move to be written through to
 // disk before it returns: Windows has no way to flush a directory, and this is
-// the flag that gives the same guarantee.
+// the flag that gives the same guarantee. A refusal that a program holding the
+// target open causes (access denied, a sharing or a lock violation) is tried
+// again every 20 ms for renameWait, and then the error says that another program
+// may hold the file.
 func rename(from, to string) error {
 	f, err := syscall.UTF16PtrFromString(from)
 	if err != nil {
@@ -38,11 +53,21 @@ func rename(from, to string) error {
 		return err
 	}
 	const replaceExisting, writeThrough = 0x1, 0x8
-	r, _, e := procMove.Call(uintptr(unsafe.Pointer(f)), uintptr(unsafe.Pointer(t)), replaceExisting|writeThrough)
-	if r == 0 {
-		return &os.LinkError{Op: "rename", Old: from, New: to, Err: e}
+	deadline := time.Now().Add(renameWait)
+	for {
+		r, _, e := procMove.Call(uintptr(unsafe.Pointer(f)), uintptr(unsafe.Pointer(t)), replaceExisting|writeThrough)
+		if r != 0 {
+			return nil
+		}
+		busy := e == errAccessDenied || e == errSharingViolation || e == errLockViolation
+		if !busy {
+			return &os.LinkError{Op: "rename", Old: from, New: to, Err: e}
+		}
+		if time.Now().After(deadline) {
+			return &os.LinkError{Op: "rename", Old: from, New: to, Err: fmt.Errorf("%w; another program may have the file open without sharing delete (a backup, a virus scanner, an indexer, a viewer), tried for %s: close it and run again, nothing was changed", e, renameWait)}
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	return nil
 }
 
 func syncDir(string) error { return nil }

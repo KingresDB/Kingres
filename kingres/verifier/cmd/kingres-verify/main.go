@@ -25,8 +25,8 @@ func main() {
 // a verdict written there is lost, and a run that cannot show its verdict is
 // not status 0. It then runs the command.
 func realMain() int {
-	if stdio.Substituted(os.Stdout) {
-		fmt.Fprintln(os.Stderr, "kingres-verify: the standard output is closed (it is the null device opened for reading and writing, which is what the runtime puts in place of a closed descriptor): the verdict could not be shown, so nothing was run. Give a file or a pipe; for no output at all write >/dev/null")
+	if stdio.Refused(os.Stdout, os.Getenv) {
+		fmt.Fprintln(os.Stderr, "kingres-verify: the standard output is closed (it is the null device opened for reading and writing, which is what the runtime puts in place of a closed descriptor): the verdict could not be shown, so nothing was run. Give a file or a pipe; for no output at all write >/dev/null. A caller that gave the null device on purpose (Python subprocess.DEVNULL, daemon(3), a service manager) sets "+stdio.NoOutputEnv+"=1 and gets the status as the only answer")
 		return cli.ExitUsage
 	}
 	return cli.Run(os.Args[1:], os.Stdout, os.Stderr, version)

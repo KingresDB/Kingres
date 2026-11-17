@@ -410,6 +410,101 @@ func Merge(keys []Key, notes ...*Note) ([]byte, []Key, error) {
 	return canonicalBytes(notes[0].Text, sigs), verified, nil
 }
 
+// Stored is the result of MergeStored.
+type Stored struct {
+	// Bytes is the canonical form of the text with every line kept: the lines
+	// that verify now and the lines kept as they were stored.
+	Bytes []byte
+	// Verified are the keys whose lines in Bytes verify now.
+	Verified []Key
+	// Unverifiable is how many lines in Bytes are of keys that keys does not
+	// hold: they were stored with the text, are kept as they are, and cannot be
+	// verified now.
+	Unverifiable int
+	// Added is how many lines the served note brought that the stored note did
+	// not have (each verified).
+	Added int
+	// Dropped is how many unverifiable stored lines did not fit under
+	// MaxSignatures and were left out.
+	Dropped int
+}
+
+// MergeStored is Merge for a text that is already stored (a state, an evidence
+// file) and a note of the same text that is served now (L14-03). Lines of one
+// text only accumulate, and a line that is stored was verified when it was stored
+// and is bound to the text, so it is kept as it is when the file is rewritten:
+//
+//   - a stored line of a key that keys holds is kept when it verifies and
+//     dropped when it does not (it names a key we know and is wrong);
+//   - a stored line of a key that keys does not hold (the key left the trust
+//     file) cannot be verified now and is kept as stored; it is counted in
+//     Unverifiable, and it makes nothing usable: whether a note is usable is
+//     decided by VerifyHeld from the lines that verify, and ignores it;
+//   - a line of the served note is taken only when it is new (another key name
+//     or key id than every stored line), and only when it verifies under a key
+//     of keys.
+//
+// Under MaxSignatures lines the unverifiable lines that do not fit are left out
+// (counted in Dropped); a line that verifies is never left out for one that
+// does not. It is an error when the texts differ, and ErrNoTrustedSignature when
+// no line verifies.
+func MergeStored(keys []Key, stored, served *Note) (*Stored, error) {
+	if !bytes.Equal(stored.Text, served.Text) {
+		return nil, ErrDifferentText
+	}
+	index, err := indexKeys(keys)
+	if err != nil {
+		return nil, err
+	}
+	taken := map[[2]string]bool{}
+	var good, loose []Signature
+	var verified []Key
+	for _, s := range stored.Signatures {
+		id := [2]string{s.Name, fmt.Sprint(s.ID)}
+		if taken[id] {
+			continue
+		}
+		k, known := index[id]
+		switch {
+		case !known:
+			taken[id] = true
+			loose = append(loose, s)
+		case len(s.Sig) == ed25519.SignatureSize && ed25519.Verify(k.Public, stored.Text, s.Sig):
+			taken[id] = true
+			good = append(good, s)
+			verified = append(verified, k)
+		}
+	}
+	added := 0
+	for _, s := range served.Signatures {
+		id := [2]string{s.Name, fmt.Sprint(s.ID)}
+		k, known := index[id]
+		if !known || taken[id] {
+			continue
+		}
+		if len(s.Sig) != ed25519.SignatureSize || !ed25519.Verify(k.Public, served.Text, s.Sig) {
+			continue
+		}
+		taken[id] = true
+		good = append(good, s)
+		verified = append(verified, k)
+		added++
+	}
+	if len(good) == 0 {
+		return nil, ErrNoTrustedSignature
+	}
+	dropped := 0
+	if room := MaxSignatures - len(good); len(loose) > room {
+		if room < 0 {
+			room = 0
+		}
+		dropped = len(loose) - room
+		loose = loose[:room]
+	}
+	all := append(append([]Signature{}, good...), loose...)
+	return &Stored{Bytes: canonicalBytes(stored.Text, all), Verified: verified, Unverifiable: len(loose), Added: added, Dropped: dropped}, nil
+}
+
 // checkLines enforces MaxLineLength on every line of the note and MaxTextLines
 // on the text. The checks run before anything is converted or stored.
 func checkLines(data, text []byte) error {
