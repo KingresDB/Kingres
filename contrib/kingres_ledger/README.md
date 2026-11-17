@@ -525,6 +525,14 @@ GRANT EXECUTE ON FUNCTION kingres.ledger_worker_state() TO ledger_agent;   -- th
 ```
 
 (The block-building workers need no grant: they run as the extension owner.)
+A role that is not a superuser must call `ledger_build_block` and
+`ledger_generate_digest` as a statement of its own, not inside `BEGIN ... COMMIT`,
+a multi-command string, a savepoint or the `EXCEPTION` block of a PL/pgSQL
+function (`25001`; a subtransaction cannot be told from a savepoint): the lock that serialises
+the builders is held to the end of the transaction, and a role that kept the
+transaction open would stop the block builder of the server for as long as it
+liked (finding L11-03; see "What a role that is not a superuser can stop or
+remove").
 
 **An auditor role** that verifies the ledger and builds proofs needs `EXECUTE`
 only (the functions run as the owner):
@@ -1352,7 +1360,8 @@ statement takes. A single maintenance statement on a large table (`VACUUM FULL`,
 `CLUSTER`, `REINDEX`) therefore still holds its lock for as long as it runs: that
 is the price of granting `MAINTAIN`, not a way to keep it. `VACUUM`, `ANALYZE` and
 `REINDEX CONCURRENTLY` conflict with no write. A superuser can stop the server
-anyway.
+anyway. What else a role that is not a superuser could hold, and how each way is
+refused, is in "What a role that is not a superuser can stop or remove".
 
 **How the extension's own writes are told apart, and why no other path exists.** By
 a marker that only the extension's C code raises, never SQL: a backend-local depth
@@ -1547,6 +1556,159 @@ so the rows of the primary appear on it and the guard sees nothing (tested in
 `002_restart_standby`, `009_worker`, `012_publish_read`, `013_head_inflight` and
 `014_guard`).
 
+## What a role that is not a superuser can stop or remove
+
+**The second invariant, in one sentence.** *A role that is not a superuser cannot
+stop the block builder or the capture of rows for longer than one of its own
+statements runs, and cannot remove the ledger or the protection of a ledger
+table.* ("Who can write the ledger tables" is the first one: nobody but the
+extension writes a row.) A superuser can stop the server, edit the catalogs and
+drop the database, and is outside both. The roles the invariant is about are the
+ones that hold a great deal short of the attribute: a member of the owner role
+with `INHERIT` and no `SET` (it owns every table, function and event trigger of
+the extension, and holds `REFERENCES`, `TRUNCATE`, `UPDATE` and `EXECUTE` on all
+of them), a member of `pg_maintain` (`LOCK` in any mode on any table), a member of
+`pg_write_all_data` (row locks and `LOCK` up to `ROW EXCLUSIVE` and beyond, on
+any table), a role that was granted `EXECUTE` on a builder, and the owner of an
+application table.
+
+**The exceptions, all of them.**
+
+1. A statement of the role that runs long. A role that may call a builder holds
+   the lock of the builders for the time its statement runs; so does any
+   statement that holds a lock for as long as it runs (`VACUUM FULL`, `CLUSTER`,
+   `REINDEX` of a large table, by a member of `pg_maintain`). Set
+   `statement_timeout` for roles you do not trust.
+2. The owner of an application table, and the roles that inherit from it, may
+   lock that table. Writes to that table wait, which is what a lock on a table
+   means; nothing else waits: the builder and the capture of other tables do not
+   touch it, and the lock is not on a table of the ledger.
+3. A client that speaks the extended protocol in pipeline mode and does not send
+   `Sync` keeps an implicit transaction open after the call of a builder, which the
+   server cannot see when the call is made (the flag that says "pipeline" is set
+   after the first `Execute`). `idle_in_transaction_session_timeout` ends it; set
+   it for the roles that may call a builder. Everything else that keeps a
+   transaction open is refused (below).
+4. `setval()` of the registry's sequence is a function call, which no hook sees.
+   A member of the owner role can set the sequence back: the next `ledger_enable`
+   fails on the primary key of `ledger_table` (nothing is registered, nothing
+   collides, nothing is forged, the table that was being enabled is not left half
+   made), and capture goes on. A superuser sets it forward again. `ALTER
+   SEQUENCE` is refused to every role that is not a superuser.
+5. A table that has an armed capture trigger and no row in the registry (a
+   restored database, a hand-made registration that failed) can be written,
+   re-enabled and dropped by nobody but a superuser through the catalogs; this
+   is documented in "Dump, restore and replication".
+6. What a superuser does: `DROP DATABASE`, a catalog edit, `event_triggers = off`,
+   a server started without the library, the files.
+
+**What stops the builder and the capture.** Everything the two do in a table or a
+row of the ledger conflicts only with a lock that a role must request. A role
+could request such a lock in these ways, each of which is refused (finding L11-01
+and its instances), by what the statement *reaches*, not by what it names:
+
+| Way to take the lock | Where it is refused |
+|---|---|
+| `LOCK TABLE` of a ledger table above `ACCESS SHARE` | statement hook |
+| `LOCK TABLE` of a view, of a view over a view, `LOCK TABLE ONLY`, a list with a view in it, a view with a subquery, a join or a CTE, the status view | statement hook: the stored query of the view is followed to the end (the view is locked `ACCESS SHARE` while it is read, so its owner cannot redefine it between the check and the lock) |
+| `SELECT ... FOR UPDATE / NO KEY UPDATE / SHARE / KEY SHARE`, directly, through a view, in a cursor | executor hook (`ExecutorCheckPerms_hook` sees the base table of a view with its row lock bit) |
+| `TRUNCATE` of a ledger catalog table, `CASCADE` included | statement hook, before anything is locked (the trigger refuses it too, but only after the request for `ACCESS EXCLUSIVE` on the table and on everything that references it has waited its turn behind any reader, with every writer queued behind the request) |
+| `ALTER TABLE`, `DROP`, `CREATE TRIGGER`/`INDEX`/`RULE`/`POLICY`, `RENAME`, `SET SCHEMA`, `INHERITS`, `ATTACH PARTITION` on a ledger catalog table, by the owner role | statement hook, **without taking the lock first**: until this round the hook locked the table with the lock the statement would take, as the owner, and then rejected the statement; the request for `ACCESS EXCLUSIVE` waited behind any reader of the table (`pg_dump`, `ledger_verify`), with every capture trigger and the builder queued behind it, for as long as the reader ran (a statement that fails keeps no lock; the harm was the wait; the ledger catalog tables are never locked by the hook now) |
+| a foreign key that references a ledger catalog table: `ALTER TABLE ... ADD FOREIGN KEY`, `CREATE TABLE ... REFERENCES`, `ADD COLUMN ... REFERENCES` (it takes `SHARE ROW EXCLUSIVE` on the referenced table, and puts its system triggers on every write) | statement hook |
+| `CLUSTER`, `REINDEX` (not `CONCURRENTLY`) in a transaction block or a function | statement hook (as before) |
+| a builder called inside a transaction block, a multi-command string, a savepoint or an `EXCEPTION` block, by a role that is not a superuser (the lock of the builders is held to the end of the transaction, and has to be) | the builders themselves: `ledger_build_block` and `ledger_generate_digest` raise `25001` (`cannot run inside a transaction block for a role that is not a superuser`); as a statement of their own they hold the lock for the statement |
+| advisory locks, `LOCK` on an extension object | not a route: the builder waits on a lock of the extension's own object with a sub-object number that no statement uses |
+
+What is not refused because it conflicts with nothing the builder and the capture
+take: `ANALYZE`, `VACUUM`, `REINDEX CONCURRENTLY`, `COMMENT`, `CREATE STATISTICS`
+(`SHARE UPDATE EXCLUSIVE`), `ACCESS SHARE` (readers, `pg_dump`), and `ALTER VIEW`
+of a view (it locks the view, not what it reads). Each is tested by `t/018`.
+
+**What removes the ledger.** The extension is dropped with everything it holds
+when something it depends on is dropped with `CASCADE`. Its SQL and PL/pgSQL
+functions (twelve of them: `ledger_type_problem`, `ledger_table_defects`,
+`ledger_history_defects`, `ledger_catalog_defects`, `ledger_all_defects`,
+`ledger_guard`, `ledger_enable`, `ledger_verify_digest`, `ledger_verify`,
+`ledger_inclusion_proof`, `ledger_head`, `ledger_blocks_entries`) depend on the
+language `plpgsql`, so a member of the owner role (which owns the bootstrap
+extension `plpgsql` through its membership) could run `DROP EXTENSION plpgsql
+CASCADE`, which dropped `kingres_ledger` with its nine tables, its event triggers
+and the capture trigger of every ledger table (finding L11-02). The dependency
+stays: rewriting those functions in C is not done in 0.3 (`ledger_verify` alone is
+four hundred lines of SQL). What closes the class is a hook that does not depend
+on the shape of a statement: **`object_access_hook` with `OAT_DROP`** is called by
+the dependency code for every object that any `DROP` removes, whatever statement
+and whatever path led to it, before the object goes. While any table is under
+ledger control (the registry is not empty), nothing of the ledger may be dropped
+by any role, superusers included: the extension, its schema, a member of it (a
+table, the sequence, the view, a function, an event trigger), a ledger table and
+its history table or a column of either, an index of a ledger catalog table, and
+the ledger triggers (capture, blocking) of a ledger table. The refusal is `KL002`
+with the object named. The statements of the extension's own install and update
+script are the one exception (they replace functions), and nothing is refused
+when no table is under ledger control: `DROP EXTENSION kingres_ledger` is then an
+ordinary statement, there being no ledger to lose. The statement hook and the
+event triggers say the same earlier, with a message that fits the statement;
+this is the check that does not depend on the statement. The routes that are
+tested (`ledger_stops`): `DROP EXTENSION plpgsql CASCADE`, `DROP LANGUAGE
+plpgsql CASCADE`, `DROP SCHEMA kingres CASCADE`, `DROP SCHEMA public CASCADE`
+(the schema of a ledger table), `DROP OWNED BY` the owner role and the owner of a
+table, `DROP EXTENSION kingres_ledger [CASCADE]`, `DROP TABLE ... CASCADE`, `DROP
+FUNCTION ledger_capture CASCADE`, `DROP EVENT TRIGGER`, `DROP TRIGGER`, `ALTER
+EXTENSION ... ADD/DROP/SET SCHEMA`, `ALTER ... DEPENDS ON EXTENSION` of a
+function, of the capture trigger and of a trigger of a catalog table (the
+dependency is refused, and the drop it would cause is refused by the hook too),
+`ALTER EVENT TRIGGER ... DISABLE/OWNER`, `ALTER FUNCTION ... OWNER/SET SCHEMA`,
+`ALTER TABLE ... OWNER/SET SCHEMA` of a catalog table, `REASSIGN OWNED`.
+
+**The schema and the sequence (L11-05).** `GRANT` and `REVOKE` on the schema
+`kingres` and `ALTER SCHEMA kingres OWNER TO` are refused to a role that is not a
+superuser (a member of the owner role could take `USAGE` from PUBLIC, and every
+application role would lose the functions, or give the schema away). `ALTER
+SEQUENCE` of the registry's sequence, `GRANT` of anything but `SELECT` on a
+sequence of the extension, `ALTER SEQUENCE ... OWNER TO` and the rest of what the
+hook refuses on a table of the catalog are refused to every role that is not a
+superuser. `CREATE FUNCTION`, `CREATE TABLE` and the like in the schema stay what
+they were: nothing of the extension looks anything up by name in it that is not
+qualified, so they do nothing (tested: the fixed statements and the event
+triggers give the same results).
+
+**What the owner of a ledger table may do: one rule.** *The owner of an
+application table that is under ledger control may do to it anything that changes
+neither what is recorded nor how it is recorded; it may not do what removes or
+weakens the capture, or changes a row that was hashed.* Concretely it may rename
+the table, add a nullable column without a default, set a default or `NOT NULL`,
+add a check constraint or a foreign key to another table, drop a constraint, make
+and drop an index, make its own triggers (not named like the ledger's), enable
+row security and make a policy, set storage parameters, change the owner (the
+history table follows), grant and revoke, lock it, analyze it, create views of it
+and tables that reference it. It may not drop the table or its history table,
+drop, rename, replace, disable or re-enable the capture trigger or the blocking
+triggers (every `ALTER TABLE ... DISABLE/ENABLE TRIGGER`, any form), drop a
+column, change a column type, rename a column, add a column with a default, a
+`NOT NULL`, an identity or a generated value, change the persistence, make a rule,
+make the table a parent, a child or a partition, move it to another schema, or
+truncate it (`session_replication_role` does not help: the triggers are `ENABLE
+ALWAYS`, and only a superuser can set it). This is the one rule that
+`ledger_stops` runs, statement by statement, as the owner of an append-only and of
+an updatable table, with the outcome of each.
+
+**What a control plane must know.** `ledger_build_block` and
+`ledger_generate_digest` called by a role that is not a superuser must be called
+as a statement of their own (autocommit, or inside a function that is itself one
+statement); the worker and every superuser may call them anywhere. `KL002` can
+now come from a statement that did not name a ledger object (a drop through a
+dependency, a lock through a view, a foreign key); `25001` comes from a builder in
+a block. A table of the catalog is never locked by the statement hook any more, so
+a statement that is refused leaves no lock behind.
+`ledger_enable` and `ledger_register_table` check the ownership of the table for the
+role outside any `SECURITY DEFINER` function (`GetOuterUserId`): a `SECURITY
+DEFINER` wrapper that is owned by the owner of a table and calls `ledger_enable`
+fails for every caller that is not that owner, which is intended (finding N4).
+A table with an armed capture trigger and no row in the registry (after a restore,
+or after a hand-made registration that failed) cannot be written, enabled again or
+dropped by anybody but a superuser through the catalogs (finding N2).
+
 ## Protection against being switched off
 
 Two layers enforce the rules, both for every role including superusers, both
@@ -1574,8 +1736,15 @@ kingres_ledger` while any ledger table exists, `DROP SCHEMA` and `DROP OWNED`
 that would drop a ledger table, `DROP TYPE/DOMAIN ... CASCADE` and `DROP
 EXTENSION ... CASCADE` that would drop a column of a ledger table, and `ALTER TYPE
 ... RENAME VALUE` of an enum that a ledger column uses (the label is part of the
-row hash). The hook does nothing in a database where the extension is not
-installed. It always calls the previous hook.
+row hash). Since the second invariant (the section before this one) it also
+rejects `TRUNCATE` of a ledger catalog table, a foreign key that references one,
+`LOCK` of a view that reaches one, `ALTER ... DEPENDS ON EXTENSION` of a ledger
+object, and, for a role that is not a superuser, `GRANT`/`REVOKE` on the schema
+`kingres`, `ALTER SCHEMA kingres OWNER TO` and `ALTER SEQUENCE` of the
+extension's sequences. The hook does nothing in a database where the extension is
+not installed. It always calls the previous hook. A second hook,
+`object_access_hook` (`OAT_DROP`), rejects the drop of anything that belongs to
+the ledger through any dependency while tables are under ledger control.
 
 **No "inside our own code" switch.** The hook has no global flag, setting or
 state that turns a check off while the extension works. The audit of every such
@@ -1620,7 +1789,12 @@ statements that name a table, the hook therefore resolves the name once, takes
 the lock that the statement is going to take, and decides on the OID; while the
 lock is held the name cannot move. A role that does not own the table takes no
 lock (so it cannot make anybody wait), and a second role that cooperates can
-still move a name under such a statement; the next layer covers that.
+still move a name under such a statement; the next layer covers that. A table of
+the ledger catalog is never locked by the hook, even for its owner: the names of
+these tables cannot move (renaming, replacing and moving them are rejected), and a
+request for a lock that the hook made before it rejected the statement waited
+behind any reader of the table, with the builder and the capture queued behind the
+request (second invariant: a statement that fails keeps no lock, but it waited).
 
 **The event triggers** (`ddl_command_end`, `sql_drop`, `table_rewrite`; all
 `ENABLE ALWAYS`) enforce the rules at the point of action, by OID, from what a

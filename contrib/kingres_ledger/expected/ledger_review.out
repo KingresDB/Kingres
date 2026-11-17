@@ -450,7 +450,7 @@ SELECT kingres.ledger_enable('r_domcol');
 
 SELECT pg_temp.try(ARRAY['DROP TYPE r_base CASCADE', 'DROP DOMAIN r_dom CASCADE']);
 NOTICE:  drop cascades to 2 other objects
-NOTICE:  rejected: DROP TYPE r_base CASCADE -> KL002 cannot drop table column public.r_domcol.d: it belongs to a ledger table or to the ledger
+NOTICE:  rejected: DROP TYPE r_base CASCADE -> KL002 cannot drop column d of table r_domcol: it belongs to the ledger, and tables are under ledger control
 NOTICE:  rejected: DROP DOMAIN r_dom CASCADE -> KL002 cannot drop type "r_dom" with CASCADE: a ledger table has a column of this type
  try 
 -----

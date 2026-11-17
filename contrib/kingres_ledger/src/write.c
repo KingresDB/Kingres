@@ -124,6 +124,42 @@ kl_first(int col, Datum *value)
 	return !isnull;
 }
 
+/*
+ * kl_refuse_open_transaction
+ *		The lock that serialises the builders is held until the end of the
+ *		transaction of the caller, and it has to be: a builder that started
+ *		while another one's block was uncommitted would wait on that block's
+ *		rows, or build the same height.  A role that may call a builder (an
+ *		auditor, the agent of the README) could therefore stop the worker, and
+ *		every other builder, for as long as it keeps a transaction open after
+ *		the call (L11-03).  A role that is not a superuser may call the
+ *		builders only as a statement of its own, so that the lock is held for
+ *		the time of that statement and no longer: not inside BEGIN ... COMMIT,
+ *		not in a multi-command string (an implicit block), not in a
+ *		subtransaction (a savepoint, and also the EXCEPTION block of a PL/pgSQL
+ *		function, which looks the same from here: a function that calls a
+ *		builder for a role that is not a superuser keeps the call outside such a
+ *		block), and not after the first Execute of a pipeline (the flag of the
+ *		pipeline reports the rest).
+ *		What remains: a statement that runs long (set statement_timeout for
+ *		such roles), and the first Execute of an extended-protocol pipeline that
+ *		the client does not Sync (idle_in_transaction_session_timeout ends it).
+ *		A superuser can stop the server anyway, and the workers are superusers.
+ */
+static void
+kl_refuse_open_transaction(const char *fname)
+{
+	if (superuser_arg(GetOuterUserId()))
+		return;
+	if (IsTransactionBlock() || (MyXactFlags & XACT_FLAGS_PIPELINING) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("%s cannot run inside a transaction block for a role that is not a superuser",
+						fname),
+				 errdetail("It holds the lock of the block builders until the end of the transaction, and the block builder of the server would wait for it."),
+				 errhint("Call it as a statement of its own, outside BEGIN ... COMMIT, a savepoint and an EXCEPTION block.")));
+}
+
 /* Wait for the lock that serialises the block builders (see the file header). */
 static void
 kl_lock_builders(void)
@@ -336,6 +372,7 @@ kingres_ledger_build_block(PG_FUNCTION_ARGS)
 	int64		h = 0;
 	bool		built;
 
+	kl_refuse_open_transaction("ledger_build_block");
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
 	built = kl_build_block_core(&h);
@@ -359,6 +396,7 @@ kingres_ledger_generate_digest(PG_FUNCTION_ARGS)
 	Datum		result = (Datum) 0;
 	bool		have = false;
 
+	kl_refuse_open_transaction("ledger_generate_digest");
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
 	(void) kl_build_block_core(&h);
@@ -848,8 +886,11 @@ kingres_ledger_register_table(PG_FUNCTION_ARGS)
 	 * The lookups of the entry code (the registry, by the row type) run with
 	 * the snapshot that is active, and it must see the registration that was
 	 * just written: a new snapshot, as every statement of ledger_enable had.
+	 * No CommandCounterIncrement is needed first: the statement above that
+	 * looks for defects is not read-only for SPI, which advances the counter
+	 * before it runs, after the registration was written (L11-04: the call
+	 * that was here changed nothing a test could see).
 	 */
-	CommandCounterIncrement();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	sql = psprintf("SELECT kl_r FROM ONLY %s AS kl_r",
 				   quote_qualified_identifier(nspname, relname));
