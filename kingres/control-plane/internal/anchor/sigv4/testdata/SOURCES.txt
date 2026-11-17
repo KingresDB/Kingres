@@ -25,3 +25,10 @@ THIRD-PARTY FILES (third_party/, not committed with our own files)
   checked against third_party.sha256 (a file with another sum, or a file that is
   not listed, fails TestThirdPartyManifest). When the directory is absent the
   tests that need it skip with a message naming it, and all others run.
+
+Vectors of our own (not in this directory)
+  own_vectors_test.go holds nine requests with their canonical request, string
+  to sign and Authorization header, produced once by an independent
+  implementation of the algorithm (written from the AWS documentation, sharing
+  no code with this package). The signature of the "vanilla" request is the one
+  that the AWS suite documents for get-vanilla. They are part of the test binary.

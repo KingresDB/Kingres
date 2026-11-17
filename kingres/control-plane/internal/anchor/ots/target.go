@@ -32,8 +32,15 @@ const (
 	// MaxFragment is the largest stored fragment (a calendar answer is at most
 	// MaxCalendarResponse; upgrades merge more in).
 	MaxFragment = 64 << 10
+	// PerFragmentLookups is how many GET requests one calendar's fragment may
+	// cause in one Upgrade call (distinct commitments, in tree order). The
+	// budget is per fragment, so a calendar that fills its fragment with
+	// pending attestations spends only its own share.
+	PerFragmentLookups = 4
 	// MaxUpgradeLookups bounds the GET requests of one Upgrade call.
-	MaxUpgradeLookups = 32
+	MaxUpgradeLookups = MaxCalendars * PerFragmentLookups
+	// MaxHeaderChecks bounds the headers asked of a HeaderSource in one call.
+	MaxHeaderChecks = 8
 	// FirstCheck is the delay before the first upgrade attempt.
 	FirstCheck = 10 * time.Minute
 )
@@ -119,15 +126,21 @@ type Options struct {
 	Rand io.Reader
 	// UserAgent is sent to the calendars.
 	UserAgent string
+	// Headers, when not nil, is the operator's source of Bitcoin block
+	// headers. With it a claim is checked against the header of its height
+	// and the record is anchored only when the check passes; without it a
+	// claim stays a claim (receipt state "claimed").
+	Headers HeaderSource
 }
 
 // Target is the OpenTimestamps target. It implements anchor.Target and is
 // safe for concurrent use.
 type Target struct {
-	cfg  Config
-	cal  *CalendarClient
-	now  anchor.Clock
-	rand io.Reader
+	cfg     Config
+	cal     *CalendarClient
+	now     anchor.Clock
+	rand    io.Reader
+	headers HeaderSource
 }
 
 var _ anchor.Target = (*Target)(nil)
@@ -146,7 +159,7 @@ func New(cfg Config, opt Options) (*Target, error) {
 	if rd == nil {
 		rd = rand.Reader
 	}
-	return &Target{cfg: n, cal: NewCalendarClient(opt.Client, opt.UserAgent, now), now: now, rand: rd}, nil
+	return &Target{cfg: n, cal: NewCalendarClient(opt.Client, opt.UserAgent, now), now: now, rand: rd, headers: opt.Headers}, nil
 }
 
 // Config returns the normalized configuration.
@@ -193,11 +206,18 @@ type calResult struct {
 // MinCalendars calendars have a fragment. Otherwise the error is a
 // *PartialError.
 func (t *Target) SubmitWithPrior(ctx context.Context, p anchor.Payload, prior *anchor.OTSEvidence) (anchor.Receipt, error) {
+	if err := anchor.CheckPayload(anchor.KindOTS, p); err != nil {
+		return anchor.Receipt{}, err
+	}
 	digest := p.Digest[:]
 	have := map[string][]byte{}
+	submittedAt := anchor.FormatTime(t.now())
 	if prior != nil {
 		if prior.Digest != hex.EncodeToString(digest) {
 			return anchor.Receipt{}, anchor.Errorf(anchor.ClassPermanent, anchor.KindOTS, "submit", "prior_digest", "prior evidence is for another digest")
+		}
+		if _, err := anchor.ParseTime(prior.SubmittedAt); err == nil {
+			submittedAt = prior.SubmittedAt
 		}
 		for _, c := range prior.Calendars {
 			f, err := base64.StdEncoding.DecodeString(c.FragmentB64)
@@ -241,8 +261,8 @@ func (t *Target) SubmitWithPrior(ctx context.Context, p anchor.Payload, prior *a
 	}
 	wg.Wait()
 
-	ev := anchor.OTSEvidence{Digest: hex.EncodeToString(digest), Calendars: []anchor.OTSCalendar{}}
-	answered, retryable := 0, 0
+	ev := anchor.OTSEvidence{Digest: hex.EncodeToString(digest), SubmittedAt: submittedAt, Calendars: []anchor.OTSCalendar{}}
+	answered, retryable, refused := 0, 0, 0
 	var firstErr error
 	for _, r := range results {
 		if r.frag != nil {
@@ -253,14 +273,25 @@ func (t *Target) SubmitWithPrior(ctx context.Context, p anchor.Payload, prior *a
 		if firstErr == nil {
 			firstErr = r.err
 		}
-		if anchor.IsRetryable(r.err) {
+		switch {
+		case anchor.IsRetryable(r.err):
 			retryable++
+		case anchor.IsRefused(r.err):
+			refused++
 		}
 	}
 	if answered < t.cfg.MinCalendars {
-		class := anchor.ClassRetryable
-		if answered+retryable < t.cfg.MinCalendars {
-			class = anchor.ClassPermanent
+		// A calendar that was only unreachable, slow or refused (401, 403) may
+		// answer later: retryable, or refused (1, 5 and 15 minutes, then
+		// failed) when the hope rests on a calendar that refused. Only when
+		// the calendars that gave a wrong answer make the minimum out of
+		// reach is it permanent.
+		class := anchor.ClassPermanent
+		switch {
+		case answered+retryable >= t.cfg.MinCalendars:
+			class = anchor.ClassRetryable
+		case answered+retryable+refused >= t.cfg.MinCalendars:
+			class = anchor.ClassRefused
 		}
 		e := &anchor.Error{Class: class, Target: anchor.KindOTS, Op: "submit", Code: "too_few_calendars",
 			Text: fmt.Sprintf("%d of %d calendars answered, %d needed", answered, len(results), t.cfg.MinCalendars), Err: firstErr}
@@ -275,131 +306,6 @@ func (t *Target) SubmitWithPrior(ctx context.Context, p anchor.Payload, prior *a
 	return anchor.Receipt{State: anchor.ReceiptSubmitted, Evidence: raw, NextCheck: &next}, nil
 }
 
-// Upgrade implements anchor.Target: it asks the calendars named by the
-// pending attestations of the receipt's fragments (only calendars of the
-// configuration; one outside it is never asked) for the Bitcoin attestation.
-// A calendar's 404 means "not yet" and is not an error. When some fragment
-// holds a Bitcoin attestation the receipt is "anchored" and EvidenceTime is
-// nil (the time is the header's, known to the verifier). An error is
-// returned only when every lookup failed.
-func (t *Target) Upgrade(ctx context.Context, r anchor.Receipt) (anchor.Receipt, error) {
-	if r.State == anchor.ReceiptAnchored {
-		return r, nil
-	}
-	ev, err := anchor.ParseOTSEvidence(r.Evidence)
-	if err != nil {
-		return r, anchor.Errorf(anchor.ClassPermanent, anchor.KindOTS, "upgrade", "evidence", "the evidence is not readable")
-	}
-	digest, _ := hex.DecodeString(ev.Digest)
-	allowed := map[string]bool{}
-	for _, c := range t.cfg.Calendars {
-		allowed[c] = true
-	}
-	roots := make([]*Node, len(ev.Calendars))
-	for i, c := range ev.Calendars {
-		f, _ := base64.StdEncoding.DecodeString(c.FragmentB64)
-		n, err := ParseFragment(f, digest)
-		if err != nil {
-			return r, anchor.Errorf(anchor.ClassPermanent, anchor.KindOTS, "upgrade", "evidence", "a stored fragment is not readable")
-		}
-		roots[i] = n
-	}
-	type look struct {
-		node *Node
-		att  Attestation
-		base string
-	}
-	var looks []look
-	for _, root := range roots {
-		root.Walk(func(n *Node) {
-			for _, a := range n.Attestations {
-				if a.Kind != AttPending || len(looks) >= MaxUpgradeLookups {
-					continue
-				}
-				if base, err := NormalizeCalendarURL(a.URI, t.cfg.AllowInsecure); err == nil && allowed[base] {
-					looks = append(looks, look{n, a, base})
-				}
-			}
-		})
-	}
-	var lastErr error
-	failed, ok := 0, 0
-	changed := false
-	for _, l := range looks {
-		cctx, cancel := context.WithTimeout(ctx, CallTimeout)
-		got, found, err := t.cal.GetTimestamp(cctx, l.base, l.node.Msg)
-		cancel()
-		if err != nil {
-			failed++
-			lastErr = err
-			continue
-		}
-		ok++
-		if !found || len(BitcoinClaims(got)) == 0 {
-			continue
-		}
-		if err := l.node.Merge(got); err != nil {
-			failed++
-			lastErr = anchor.Errorf(anchor.ClassPermanent, anchor.KindOTS, "upgrade", "merge", "cannot merge the answer of a calendar: %s", shortErr(err))
-			continue
-		}
-		removePending(l.node, l.att)
-		changed = true
-	}
-	if failed > 0 && ok == 0 && !changed {
-		return r, lastErr
-	}
-	next := t.now().Add(FirstCheck)
-	if !changed && ev.Bitcoin == nil {
-		out := r
-		out.State = anchor.ReceiptSubmitted
-		if out.NextCheck == nil {
-			out.NextCheck = &next
-		}
-		return out, nil
-	}
-	cals := make([]anchor.OTSCalendar, 0, len(roots))
-	btc := ev.Bitcoin
-	for i, root := range roots {
-		b, err := root.Serialize()
-		if err != nil || len(b) > MaxFragment {
-			return r, anchor.Errorf(anchor.ClassPermanent, anchor.KindOTS, "upgrade", "fragment", "the upgraded fragment is empty or larger than %d bytes", MaxFragment)
-		}
-		cals = append(cals, anchor.OTSCalendar{URI: ev.Calendars[i].URI, FragmentB64: base64.StdEncoding.EncodeToString(b)})
-		if btc == nil {
-			if claims := BitcoinClaims(root); len(claims) > 0 {
-				min := claims[0].Att.Height
-				for _, c := range claims {
-					if c.Att.Height < min {
-						min = c.Att.Height
-					}
-				}
-				btc = &anchor.OTSBitcoin{Height: min, CalendarURI: ev.Calendars[i].URI}
-			}
-		}
-	}
-	ev.Calendars = cals
-	ev.Bitcoin = btc
-	raw, err := anchor.EncodeEvidence(ev)
-	if err != nil {
-		return r, anchor.Errorf(anchor.ClassPermanent, anchor.KindOTS, "upgrade", "evidence", "cannot encode the evidence")
-	}
-	if btc != nil {
-		return anchor.Receipt{State: anchor.ReceiptAnchored, Evidence: raw}, nil
-	}
-	return anchor.Receipt{State: anchor.ReceiptSubmitted, Evidence: raw, NextCheck: &next}, nil
-}
-
-func removePending(n *Node, a Attestation) {
-	out := n.Attestations[:0]
-	for _, x := range n.Attestations {
-		if compareAtt(x, a) != 0 {
-			out = append(out, x)
-		}
-	}
-	n.Attestations = out
-}
-
 // Expired reports whether a submitted anchor created at createdAt has waited
 // for a Bitcoin attestation longer than timeoutDays (0 means the default).
 func Expired(createdAt, now time.Time, timeoutDays int) bool {
@@ -407,34 +313,6 @@ func Expired(createdAt, now time.Time, timeoutDays int) bool {
 		timeoutDays = DefaultUpgradeTimeoutDays
 	}
 	return !now.Before(createdAt.Add(time.Duration(timeoutDays) * 24 * time.Hour))
-}
-
-// BuildFile merges every calendar fragment of ev into one tree and returns
-// the detached timestamp file for the digest (file hash operation SHA-256).
-func BuildFile(ev anchor.OTSEvidence) (*File, error) {
-	if err := ev.Validate(); err != nil {
-		return nil, err
-	}
-	digest, _ := hex.DecodeString(ev.Digest)
-	if len(ev.Calendars) == 0 {
-		return nil, errors.New("ots: evidence holds no fragment")
-	}
-	var root *Node
-	for _, c := range ev.Calendars {
-		f, _ := base64.StdEncoding.DecodeString(c.FragmentB64)
-		n, err := ParseFragment(f, digest)
-		if err != nil {
-			return nil, fmt.Errorf("ots: fragment of a calendar: %w", err)
-		}
-		if root == nil {
-			root = n
-			continue
-		}
-		if err := root.Merge(n); err != nil {
-			return nil, err
-		}
-	}
-	return &File{HashOp: TagSHA256, Root: root}, nil
 }
 
 // Export returns the bytes of the detached .ots file for the evidence:

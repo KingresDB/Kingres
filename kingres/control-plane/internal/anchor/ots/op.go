@@ -8,6 +8,8 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/anchor"
 )
 
 // Limits of the format (taken from the reference library) and of this package.
@@ -23,7 +25,7 @@ const (
 	// recursion limit of 256: a root and 255 chained operations).
 	MaxDepth = 256
 	// MaxHeight is the highest block height of a blockchain attestation.
-	MaxHeight = 1<<32 - 1
+	MaxHeight = anchor.MaxBitcoinHeight
 	// MaxProofSize is the largest detached file or fragment parsed (this
 	// package's own limit; the reference has none).
 	MaxProofSize = 1 << 20

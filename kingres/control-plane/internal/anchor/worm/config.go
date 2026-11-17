@@ -45,7 +45,10 @@ type Config struct {
 	KeyPrefix string `json:"keyPrefix"`
 	// PathStyle defaults to true when Endpoint is set, else false.
 	PathStyle *bool `json:"pathStyle"`
-	// Mode is "governance" (default) or "compliance".
+	// Mode is "compliance" (the default: nobody, the account root included,
+	// can delete or shorten the retention before it ends) or "governance" (an
+	// explicit choice that Warnings and Test report: a principal with
+	// s3:BypassGovernanceRetention can delete the version).
 	Mode string `json:"mode"`
 	// RetentionDays defaults to 3650, range 1 to 36500.
 	RetentionDays int `json:"retentionDays"`
@@ -57,6 +60,25 @@ type Config struct {
 	// AllowInsecure permits an http:// endpoint (a test store on a private
 	// network). Without it every URL must be https.
 	AllowInsecure bool `json:"allowInsecure"`
+	// MaxSkewSeconds is the tolerance between the store's Last-Modified of a
+	// fresh write and the clock of Submit, both ways (0 means 300; the range
+	// is 1 to 86400). A store whose time is further off is refused (code
+	// "store_time_skew").
+	MaxSkewSeconds int `json:"maxSkewSeconds"`
+}
+
+// MaxMaxSkewSeconds is the largest MaxSkewSeconds.
+const MaxMaxSkewSeconds = 86400
+
+// Warnings lists what an operator must be told about the configuration: the
+// governance mode, in which a principal with s3:BypassGovernanceRetention can
+// still delete an anchored object (so an anchor is not the same assurance as
+// in compliance mode).
+func (c Config) Warnings() []string {
+	if c.Mode == ModeGovernance {
+		return []string{"governance mode: a principal with s3:BypassGovernanceRetention can delete or shorten the retention of an anchored object; only compliance mode cannot be bypassed"}
+	}
+	return nil
 }
 
 // ParseConfig parses and validates the JSON configuration, rejecting
@@ -107,7 +129,7 @@ func (c Config) Normalize() (Config, error) {
 	}
 	switch c.Mode {
 	case "":
-		c.Mode = ModeGovernance
+		c.Mode = ModeCompliance
 	case ModeGovernance, ModeCompliance:
 	default:
 		return c, errors.New("worm: mode must be governance or compliance")
@@ -124,6 +146,9 @@ func (c Config) Normalize() (Config, error) {
 	case IfNoneMatchAuto, IfNoneMatchOn, IfNoneMatchOff:
 	default:
 		return c, errors.New("worm: ifNoneMatch must be auto, on or off")
+	}
+	if c.MaxSkewSeconds < 0 || c.MaxSkewSeconds > MaxMaxSkewSeconds {
+		return c, fmt.Errorf("worm: maxSkewSeconds must be 0 to %d", MaxMaxSkewSeconds)
 	}
 	if len(c.CABundlePath) > 1024 {
 		return c, errors.New("worm: caBundlePath is too long")

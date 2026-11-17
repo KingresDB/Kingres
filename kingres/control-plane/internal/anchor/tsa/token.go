@@ -14,6 +14,7 @@ import (
 	"crypto/x509"
 	"encoding/asn1"
 	"encoding/base64"
+	"fmt"
 	"math/big"
 	"time"
 
@@ -26,7 +27,10 @@ const (
 	MaxCertificates = 16
 	// MaxSkew is the distance between genTime and the clock beyond which a
 	// token is accepted with a warning (design 6.4 step 4).
-	MaxSkew = 5 * time.Minute
+	DefaultMaxSkew = 5 * time.Minute
+	// MinRSABits is the smallest RSA signer key accepted, whatever the
+	// toolchain's own floor is.
+	MinRSABits = 2048
 )
 
 // Object identifiers (dotted).
@@ -72,11 +76,77 @@ const (
 	CodeEKU              = "bad_extended_key_usage"
 	CodeChain            = "chain_not_trusted"
 	CodeNoRoots          = "no_roots"
+	CodeTime             = "time_skew"
+	CodeChainNow         = "chain_not_trusted_now"
+	CodeTSAName          = "tsa_name_mismatch"
+	CodeKeyUsage         = "bad_key_usage"
 	CodeEvidenceMismatch = "evidence_mismatch"
 )
 
 func fail(code, text string) *anchor.Error {
 	return anchor.Errorf(anchor.ClassPermanent, anchor.KindTSA, "verify-token", code, "%s", text)
+}
+
+// failRefused is a failure that an operator or the authority can fix (the
+// clock, the authority's certificate): retried after 1, 5 and 15 minutes,
+// then failed with the alert.
+func failRefused(code, text string) *anchor.Error {
+	return anchor.Errorf(anchor.ClassRefused, anchor.KindTSA, "verify-token", code, "%s", text)
+}
+
+// tsaNameMatches reports whether the GeneralName of the TSTInfo tsa field
+// (RFC 3161 2.4.2: it must correspond to one of the subject names of the
+// certificate) is the subject, a directoryName, DNS name, URI or e-mail
+// address of the subject alternative name of the signer.
+func tsaNameMatches(b []byte, c *x509.Certificate) bool {
+	g, err := oneTLV(b)
+	if err != nil {
+		return false
+	}
+	switch g.tag {
+	case 0xa4: // directoryName
+		if bytes.Equal(g.content, c.RawSubject) {
+			return true
+		}
+		for _, e := range c.Extensions {
+			if e.Id.String() != "2.5.29.17" {
+				continue
+			}
+			top, err := oneTLV(e.Value)
+			if err != nil {
+				return false
+			}
+			names, err := children(top.content)
+			if err != nil {
+				return false
+			}
+			for _, n := range names {
+				if n.tag == 0xa4 && bytes.Equal(n.content, g.content) {
+					return true
+				}
+			}
+		}
+		return false
+	case 0x82:
+		for _, n := range c.DNSNames {
+			if n == string(g.content) {
+				return true
+			}
+		}
+	case 0x86:
+		for _, u := range c.URIs {
+			if u.String() == string(g.content) {
+				return true
+			}
+		}
+	case 0x81:
+		for _, m := range c.EmailAddresses {
+			if m == string(g.content) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Expect is what a token must match.
@@ -88,6 +158,16 @@ type Expect struct {
 	Nonce *big.Int
 	// Policy, when not empty, must be the token's policy (dotted OID).
 	Policy string
+	// Now, when not zero, is the clock of a Submit: genTime must be within
+	// MaxSkew of it, in both directions (code "time_skew"), and the signing
+	// certificate must also chain to the roots at Now, not only at genTime
+	// (code "chain_not_trusted_now"), so that an authority whose certificate
+	// has expired cannot hand out tokens dated inside its old validity
+	// window. A stored token is checked with Now zero: its certificate is
+	// judged at genTime alone.
+	Now time.Time
+	// MaxSkew is the tolerance for Now; zero means DefaultMaxSkew.
+	MaxSkew time.Duration
 }
 
 // TokenInfo is what a verified token says.
@@ -307,6 +387,7 @@ type tstInfo struct {
 	accuracy time.Duration
 	ordering bool
 	nonce    *big.Int
+	tsaName  []byte // the GeneralName of the tsa field, nil when absent
 }
 
 func parseTSTInfo(b []byte) (*tstInfo, *anchor.Error) {
@@ -395,7 +476,8 @@ func parseTSTInfo(b []byte) (*tstInfo, *anchor.Error) {
 		}
 		i++
 	}
-	if i < len(f) && f[i].tag == 0xa0 { // tsa [0] GeneralName: not used
+	if i < len(f) && f[i].tag == 0xa0 { // tsa [0] GeneralName: compared with the signer's names
+		t.tsaName = f[i].content
 		i++
 	}
 	if i < len(f) && f[i].tag == 0xa1 { // extensions: any critical one is refused
@@ -553,6 +635,20 @@ func checkESS(a *attrs, cert *x509.Certificate) *anchor.Error {
 		if err != nil || n.Cmp(cert.SerialNumber) != 0 {
 			return bad("ESSCertID serial number does not match the certificate")
 		}
+		// the issuer: GeneralNames with a directoryName that must be the
+		// certificate's issuer (a GeneralName of another kind is not compared)
+		if is[0].tag != tagSequence {
+			return bad("ESSCertID issuerSerial is malformed")
+		}
+		names, err := children(is[0].content)
+		if err != nil {
+			return bad("ESSCertID issuerSerial is malformed")
+		}
+		for _, g := range names {
+			if g.tag == 0xa4 && !bytes.Equal(g.content, cert.RawIssuer) {
+				return bad("ESSCertID issuer does not match the certificate")
+			}
+		}
 	}
 	return nil
 }
@@ -690,11 +786,17 @@ func VerifyToken(tokenDER []byte, e Expect, roots, intermediates *x509.CertPool)
 	if subtle.ConstantTimeCompare(at.digest, sum(alg.hash, pt.eContent)) != 1 {
 		return nil, fail(CodeMessageDigest, "the messageDigest attribute is not the digest of the TSTInfo")
 	}
+	if info.tsaName != nil && !tsaNameMatches(info.tsaName, signer) {
+		return nil, fail(CodeTSAName, "the tsa name of the TSTInfo is not a name of the signing certificate")
+	}
 	signed := append([]byte(nil), pt.si.attrsRaw...)
 	signed[0] = tagSet
 	hs := sum(alg.hash, signed)
 	switch pk := signer.PublicKey.(type) {
 	case *rsa.PublicKey:
+		if pk.N.BitLen() < MinRSABits {
+			return nil, fail(CodeAlgorithm, "the signing certificate has an RSA key shorter than 2048 bits")
+		}
 		if !alg.rsa || rsa.VerifyPKCS1v15(pk, alg.hash, hs, pt.si.signature) != nil {
 			return nil, fail(CodeSignature, "the signature does not verify under the signing certificate")
 		}
@@ -707,6 +809,18 @@ func VerifyToken(tokenDER []byte, e Expect, roots, intermediates *x509.CertPool)
 	}
 	if aerr := checkEKU(signer); aerr != nil {
 		return nil, aerr
+	}
+	if signer.KeyUsage != 0 && signer.KeyUsage&(x509.KeyUsageDigitalSignature|x509.KeyUsageContentCommitment) == 0 {
+		return nil, fail(CodeKeyUsage, "the key usage of the signing certificate allows neither digitalSignature nor contentCommitment")
+	}
+	if !e.Now.IsZero() {
+		max := e.MaxSkew
+		if max <= 0 {
+			max = DefaultMaxSkew
+		}
+		if d := SkewOf(info.genTime, e.Now); d > max || d < -max {
+			return nil, failRefused(CodeTime, fmt.Sprintf("genTime differs from the clock by %s, more than the tolerance of %s", d.Round(time.Second), max))
+		}
 	}
 	if roots == nil {
 		return nil, fail(CodeNoRoots, "no trust anchors are configured")
@@ -724,6 +838,12 @@ func VerifyToken(tokenDER []byte, e Expect, roots, intermediates *x509.CertPool)
 		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageTimeStamping}}
 	if _, err := signer.Verify(opts); err != nil {
 		return nil, fail(CodeChain, "the signing certificate does not chain to a trusted root at genTime: "+shortErr(err))
+	}
+	if !e.Now.IsZero() {
+		opts.CurrentTime = e.Now
+		if _, err := signer.Verify(opts); err != nil {
+			return nil, failRefused(CodeChainNow, "the signing certificate does not chain to a trusted root at the clock (an expired or not yet valid authority certificate): "+shortErr(err))
+		}
 	}
 	return &TokenInfo{GenTime: info.genTime, Accuracy: info.accuracy, Ordering: info.ordering, Policy: info.policy,
 		Serial: info.serial, Nonce: info.nonce, Signer: signer, SignatureAlgorithm: alg.name}, nil

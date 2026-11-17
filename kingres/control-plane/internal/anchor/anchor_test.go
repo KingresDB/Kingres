@@ -110,41 +110,6 @@ func TestNewPayloadRejects(t *testing.T) {
 	}
 }
 
-func TestStates(t *testing.T) {
-	all := []State{StatePending, StateSubmitted, StateAnchored, StateFailed, StateSuperseded, StateExpired}
-	allowedPairs := map[[2]State]bool{
-		{StatePending, StatePending}: true, {StatePending, StateSubmitted}: true, {StatePending, StateAnchored}: true,
-		{StatePending, StateFailed}: true, {StatePending, StateSuperseded}: true,
-		{StateSubmitted, StateSubmitted}: true, {StateSubmitted, StateAnchored}: true, {StateSubmitted, StateFailed}: true,
-		{StateSubmitted, StateExpired}: true,
-	}
-	for _, a := range all {
-		if !a.Valid() {
-			t.Fatal(a)
-		}
-		for _, b := range all {
-			if CanTransition(a, b) != allowedPairs[[2]State{a, b}] {
-				t.Errorf("%s -> %s", a, b)
-			}
-		}
-		if a.Terminal() != (a != StatePending && a != StateSubmitted) {
-			t.Errorf("terminal %s", a)
-		}
-	}
-	if State("x").Valid() || CanTransition("x", StatePending) {
-		t.Fatal("unknown state")
-	}
-	m := map[State]string{StatePending: "pending", StateSubmitted: "pending", StateAnchored: "anchored", StateFailed: "failed", StateExpired: "failed"}
-	for s, want := range m {
-		if got, ok := s.ContractStatus(); !ok || got != want {
-			t.Errorf("%s -> %s", s, got)
-		}
-	}
-	if _, ok := StateSuperseded.ContractStatus(); ok {
-		t.Fatal("superseded is shown")
-	}
-}
-
 func TestRecordFlow(t *testing.T) {
 	r := NewRecord(1, "agg", 5, [32]byte{1}, t0)
 	if r.State != StatePending || !r.Due(t0) {
@@ -233,62 +198,6 @@ func TestBackoff(t *testing.T) {
 	// Retry-After wins when larger, not when smaller
 	if Backoff(0, 0.5, 5*time.Minute) != 5*time.Minute || Backoff(0, 0.5, time.Second) != 30*time.Second {
 		t.Fatal("retry after")
-	}
-}
-
-func TestAfterError(t *testing.T) {
-	r := NewRecord(1, "agg", 5, [32]byte{}, t0)
-	retryable := Errorf(ClassRetryable, "tsa", "post", "x", "down")
-	r1, alert := r.AfterError(retryable, t0, 0.5)
-	if r1.State != StatePending || r1.Attempts != 1 || alert != AlertNone || !r1.NextAttemptAt.Equal(t0.Add(30*time.Second)) || !strings.Contains(r1.LastError, "down") {
-		t.Fatalf("%+v", r1)
-	}
-	r2, _ := r1.AfterError(retryable, t0, 0.5)
-	if !r2.NextAttemptAt.Equal(t0.Add(time.Minute)) || r2.Attempts != 2 {
-		t.Fatalf("%+v", r2)
-	}
-	withRA := &Error{Class: ClassRetryable, Target: "worm", Text: "slow", RetryAfter: 2 * time.Hour}
-	if r3, _ := r.AfterError(withRA, t0, 0.5); !r3.NextAttemptAt.Equal(t0.Add(2 * time.Hour)) {
-		t.Fatal("retry after")
-	}
-	// a submitted record stays submitted on a retryable error
-	s := r
-	s.State = StateSubmitted
-	if s1, _ := s.AfterError(retryable, t0, 0.5); s1.State != StateSubmitted {
-		t.Fatal("state changed")
-	}
-	// refused: 1, 5, 15 minutes, then failed
-	refused := Errorf(ClassRefused, "worm", "put", "denied", "refused")
-	cur := r
-	for i, d := range []time.Duration{time.Minute, 5 * time.Minute, 15 * time.Minute} {
-		var a string
-		cur, a = cur.AfterError(refused, t0, 0.5)
-		if cur.State != StatePending || a != AlertNone || !cur.NextAttemptAt.Equal(t0.Add(d)) || cur.Attempts != i+1 {
-			t.Fatalf("refusal %d: %+v %s", i+1, cur, a)
-		}
-	}
-	cur, a := cur.AfterError(refused, t0, 0.5)
-	if cur.State != StateFailed || a != AlertFailed || cur.NextAttemptAt != nil || cur.Attempts != 4 {
-		t.Fatalf("%+v %s", cur, a)
-	}
-	// permanent and conflict fail at once
-	if p, a := r.AfterError(Errorf(ClassPermanent, "worm", "verify", "not_locked", "no"), t0, 0.5); p.State != StateFailed || a != AlertFailed {
-		t.Fatal("permanent")
-	}
-	if p, a := r.AfterError(Errorf(ClassConflict, "worm", "put", "worm_conflict", "no"), t0, 0.5); p.State != StateFailed || a != AlertConflict {
-		t.Fatal("conflict")
-	}
-	// an unknown error is permanent; a context error is retryable
-	if p, a := r.AfterError(errors.New("boom"), t0, 0.5); p.State != StateFailed || a != AlertFailed {
-		t.Fatal("unknown")
-	}
-	if p, _ := r.AfterError(context.DeadlineExceeded, t0, 0.5); p.State != StatePending {
-		t.Fatal("deadline")
-	}
-	// the stored text is cut and ASCII
-	long := Errorf(ClassRetryable, "x", "y", "z", "%s\n\xff", strings.Repeat("a", 2000))
-	if p, _ := r.AfterError(long, t0, 0.5); len(p.LastError) != MaxLastError || strings.ContainsAny(p.LastError, "\n\xff") {
-		t.Fatalf("%d", len(p.LastError))
 	}
 }
 

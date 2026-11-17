@@ -488,8 +488,11 @@ func ParseFragment(b, msg []byte) (*Node, error) {
 	return n, nil
 }
 
-// Magic is the header of a detached timestamp file.
-var Magic = []byte("\x00OpenTimestamps\x00\x00Proof\x00\xbf\x89\xe2\xe8\x84\xe8\x92\x94")
+// magic is the header of a detached timestamp file (31 bytes).
+const magic = "\x00OpenTimestamps\x00\x00Proof\x00\xbf\x89\xe2\xe8\x84\xe8\x92\x94"
+
+// Magic returns a copy of the 31 bytes that start a detached timestamp file.
+func Magic() []byte { return []byte(magic) }
 
 // MajorVersion is the only supported major version of the file format.
 const MajorVersion = 1
@@ -507,8 +510,8 @@ func ParseFile(b []byte) (*File, error) {
 		return nil, ErrTooLarge
 	}
 	r := reader{b: b}
-	m, err := r.bytes(len(Magic))
-	if err != nil || !bytes.Equal(m, Magic) {
+	m, err := r.bytes(len(magic))
+	if err != nil || string(m) != magic {
 		return nil, ErrBadMagic
 	}
 	v, err := r.byte()
@@ -554,7 +557,7 @@ func (f *File) Serialize() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := append([]byte(nil), Magic...)
+	out := []byte(magic)
 	out = append(out, MajorVersion, f.HashOp)
 	out = append(out, f.Root.Msg...)
 	out = append(out, body...)

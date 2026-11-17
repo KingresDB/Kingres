@@ -27,6 +27,7 @@ const (
 	DefaultTimeoutSeconds = 20
 	MaxTimeoutSeconds     = 300
 	MaxBundleCerts        = 64
+	MaxMaxSkewSeconds     = 86400
 	maxRedirects          = 3
 )
 
@@ -37,6 +38,14 @@ type Config struct {
 	PolicyOID      string `json:"policyOid,omitempty"`
 	CABundlePath   string `json:"caBundlePath"` // read by the caller, not by this package
 	TimeoutSeconds int    `json:"timeoutSeconds,omitempty"`
+	// MaxSkewSeconds is the tolerance between genTime and the clock of
+	// Submit, both ways: a token dated further off is refused (code
+	// "time_skew"). 0 means 300; the range is 1 to 86400.
+	MaxSkewSeconds int `json:"maxSkewSeconds,omitempty"`
+	// AllowInsecure permits HTTP Basic credentials over an http:// URL (the
+	// token is self-authenticating, the credentials are not). Without it a
+	// target with a username and an http URL is refused.
+	AllowInsecure bool `json:"allowInsecure,omitempty"`
 }
 
 // ParseConfig parses and validates the JSON configuration. Unknown members
@@ -54,6 +63,11 @@ func ParseConfig(cfg json.RawMessage) (Config, error) {
 	u, err := url.Parse(c.URL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.Fragment != "" {
 		return c, errors.New("tsa: config: url must be an http or https URL without user information")
+	}
+	if u.RawQuery != "" || u.ForceQuery {
+		// the URL goes into the public evidence file: a key in the query
+		// would be published
+		return c, errors.New("tsa: config: url must not have a query")
 	}
 	if len(c.URL) > 2048 {
 		return c, errors.New("tsa: config: url is too long")
@@ -76,6 +90,9 @@ func ParseConfig(cfg json.RawMessage) (Config, error) {
 	}
 	if c.TimeoutSeconds < 0 || c.TimeoutSeconds > MaxTimeoutSeconds {
 		return c, fmt.Errorf("tsa: config: timeoutSeconds must be 0 to %d", MaxTimeoutSeconds)
+	}
+	if c.MaxSkewSeconds < 0 || c.MaxSkewSeconds > MaxMaxSkewSeconds {
+		return c, fmt.Errorf("tsa: config: maxSkewSeconds must be 0 to %d", MaxMaxSkewSeconds)
 	}
 	return c, nil
 }
@@ -165,6 +182,9 @@ func New(o Options) (*Target, error) {
 	if o.Roots == nil {
 		return nil, errors.New("tsa: trust anchors are required")
 	}
+	if o.Username != "" && strings.HasPrefix(cfg.URL, "http://") && !cfg.AllowInsecure {
+		return nil, errors.New("tsa: HTTP Basic credentials over http:// need allowInsecure")
+	}
 	t := &Target{cfg: cfg, roots: o.Roots, inter: o.Intermediates, user: o.Username.Reveal, pass: o.Password.Reveal, clean: anchor.NewRedactor(o.Username, o.Password).Clean,
 		client: anchor.Client(o.Client, maxRedirects), clock: o.Clock, rand: o.Rand}
 	if t.clock == nil {
@@ -185,46 +205,42 @@ func (t *Target) Validate(cfg json.RawMessage) error {
 	return err
 }
 
-// Warning is a condition that does not stop the anchor.
-type Warning struct {
-	Code string // "skew"
-	Text string
-	Skew time.Duration // genTime minus the clock, for "skew"
-}
+// (the Warning type is gone: the skew bound is applied by Submit itself)
 
 // Upgrade implements anchor.Target: a TSA receipt is final, it is returned unchanged.
 func (t *Target) Upgrade(ctx context.Context, r anchor.Receipt) (anchor.Receipt, error) {
 	return r, nil
 }
 
-// Submit implements anchor.Target. See SubmitDetailed.
-func (t *Target) Submit(ctx context.Context, p anchor.Payload) (anchor.Receipt, error) {
-	r, _, err := t.SubmitDetailed(ctx, p)
-	return r, err
+// maxSkew is the tolerance between genTime and the clock.
+func (t *Target) maxSkew() time.Duration {
+	if t.cfg.MaxSkewSeconds > 0 {
+		return time.Duration(t.cfg.MaxSkewSeconds) * time.Second
+	}
+	return DefaultMaxSkew
 }
 
-// SubmitDetailed does design 6.4 steps 1 to 5 and also returns the warnings
-// (genTime more than MaxSkew from the clock: the anchor is kept, the caller
-// raises ledgerAnchorBehind with the skew).
-func (t *Target) SubmitDetailed(ctx context.Context, p anchor.Payload) (anchor.Receipt, []Warning, error) {
+// Submit implements anchor.Target: design 6.4 steps 1 to 5. The token is
+// verified before it is accepted, and the time it states is bounded by the
+// clock here, in the method of the interface: a genTime further from the
+// clock than the tolerance (Config.MaxSkewSeconds, default 5 minutes), in
+// either direction, is a failed verification (code "time_skew", class
+// refused), and the signing certificate must chain to the roots at the clock
+// as well as at genTime ("chain_not_trusted_now").
+func (t *Target) Submit(ctx context.Context, p anchor.Payload) (anchor.Receipt, error) {
+	if err := anchor.CheckPayload(anchor.KindTSA, p); err != nil {
+		return anchor.Receipt{}, err
+	}
 	info, der, err := t.exchange(ctx, p.Digest)
 	if err != nil {
-		return anchor.Receipt{}, nil, err
+		return anchor.Receipt{}, err
 	}
 	ev, err := anchor.EncodeEvidence(EvidenceFromToken(t.cfg.URL, info, der))
 	if err != nil {
-		return anchor.Receipt{}, nil, anchor.Errorf(anchor.ClassPermanent, anchor.KindTSA, "evidence", "evidence", "%s", err.Error())
+		return anchor.Receipt{}, anchor.Errorf(anchor.ClassPermanent, anchor.KindTSA, "evidence", "evidence", "%s", err.Error())
 	}
 	gt := info.GenTime.UTC()
-	return anchor.Receipt{State: anchor.ReceiptAnchored, Evidence: ev, EvidenceTime: &gt}, t.warnings(info), nil
-}
-
-func (t *Target) warnings(info *TokenInfo) []Warning {
-	skew := SkewOf(info.GenTime, t.clock())
-	if skew > MaxSkew || skew < -MaxSkew {
-		return []Warning{{Code: "skew", Text: fmt.Sprintf("genTime differs from the local clock by %s", skew.Round(time.Second)), Skew: skew}}
-	}
-	return nil
+	return anchor.Receipt{State: anchor.ReceiptAnchored, Evidence: ev, EvidenceTime: &gt}, nil
 }
 
 // Test implements anchor.Target: a real request for the SHA-256 of the empty
@@ -239,11 +255,7 @@ func (t *Target) Test(ctx context.Context) anchor.TestResult {
 	res.Add("time-stamp request", anchor.CheckOK, "token granted and verified against the trust anchors")
 	res.Add("token", anchor.CheckOK, "genTime %s, policy %s, signer %s", anchor.FormatTime(info.GenTime), info.Policy,
 		t.clean(info.Signer.Subject.String(), 200))
-	if w := t.warnings(info); len(w) > 0 {
-		res.Add("clock", anchor.CheckWarning, "%s", w[0].Text)
-	} else {
-		res.Add("clock", anchor.CheckOK, "genTime is within %s of the local clock", MaxSkew)
-	}
+	res.Add("clock", anchor.CheckOK, "genTime is within %s of the local clock and the certificate is valid now", t.maxSkew())
 	return res
 }
 
@@ -286,7 +298,10 @@ func (t *Target) exchange(ctx context.Context, digest [32]byte) (*TokenInfo, []b
 	}
 	if mt, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type")); err != nil ||
 		(mt != "application/timestamp-reply" && mt != "application/timestamp-response") {
-		return nil, nil, anchor.Errorf(anchor.ClassPermanent, anchor.KindTSA, "post", "content_type", "response is not application/timestamp-reply")
+		// a captive portal, a proxy or an error page that answers 200 with
+		// something else: it may pass, so it is retried (and bounded by the
+		// limits of the record)
+		return nil, nil, anchor.Errorf(anchor.ClassRetryable, anchor.KindTSA, "post", "content_type", "response is not application/timestamp-reply")
 	}
 	raw, err := anchor.ReadLimited(resp.Body, MaxResponseBytes)
 	if err != nil {
@@ -316,7 +331,7 @@ func (t *Target) exchange(ctx context.Context, digest [32]byte) (*TokenInfo, []b
 	default:
 		return nil, nil, anchor.Errorf(anchor.ClassPermanent, anchor.KindTSA, "post", "tsa_revocation", "the TSA answered with revocation status %d", pr.Status)
 	}
-	info, err := VerifyToken(pr.Token, Expect{Digest: digest, Nonce: nonce, Policy: t.cfg.PolicyOID}, t.roots, t.inter)
+	info, err := VerifyToken(pr.Token, Expect{Digest: digest, Nonce: nonce, Policy: t.cfg.PolicyOID, Now: t.clock(), MaxSkew: t.maxSkew()}, t.roots, t.inter)
 	if err != nil {
 		return nil, nil, err
 	}

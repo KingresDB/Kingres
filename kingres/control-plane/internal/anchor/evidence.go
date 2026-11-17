@@ -48,17 +48,24 @@ func ParseTime(s string) (time.Time, error) {
 	return t, nil
 }
 
-// WORMEvidence is the evidence of a WORM anchor (design 6.3 step 5).
+// WORMEvidence is the evidence of a WORM anchor (design 6.3 step 5 and
+// correction 70).
 type WORMEvidence struct {
-	Endpoint     string `json:"endpoint"` // "" for AWS
-	Bucket       string `json:"bucket"`
-	Key          string `json:"key"`
-	VersionID    string `json:"version_id"`
-	ETag         string `json:"etag"`
-	LockMode     string `json:"lock_mode"`     // "GOVERNANCE" or "COMPLIANCE"
-	RetainUntil  string `json:"retain_until"`  // TimeLayout
-	LastModified string `json:"last_modified"` // TimeLayout, the store's clock
-	RecordedBy   string `json:"recorded_by"`   // "cluster"
+	Endpoint  string `json:"endpoint"` // "" for AWS
+	Bucket    string `json:"bucket"`
+	Key       string `json:"key"`
+	VersionID string `json:"version_id"` // the version that was read back; never empty
+	ETag      string `json:"etag"`
+	// ObjectSHA256 is the lower case hex SHA-256 of the object's bytes (the
+	// signed note) that the cluster wrote and read back from VersionID, and
+	// ContentLength their number: a verifier compares them with what it
+	// fetches or holds.
+	ObjectSHA256  string `json:"object_sha256"`
+	ContentLength uint64 `json:"content_length"`
+	LockMode      string `json:"lock_mode"`     // "GOVERNANCE" or "COMPLIANCE"
+	RetainUntil   string `json:"retain_until"`  // TimeLayout
+	LastModified  string `json:"last_modified"` // TimeLayout, the store's clock, bounded against the cluster's clock
+	RecordedBy    string `json:"recorded_by"`   // "cluster"
 }
 
 // TSAEvidence is the evidence of an RFC 3161 anchor (design 6.4 step 5).
@@ -77,17 +84,62 @@ type OTSCalendar struct {
 	FragmentB64 string `json:"fragment_b64"` // standard base64, padded, of the serialized timestamp
 }
 
-// OTSBitcoin states which fragment carries a Bitcoin attestation.
+// Values of OTSBitcoin.Status.
+const (
+	// BitcoinClaimed: a calendar claims the attestation; it passed every check
+	// that needs no block header; nothing checked it against the chain.
+	BitcoinClaimed = "claimed"
+	// BitcoinHeaderChecked: the attestation was checked against the 80-byte
+	// block header carried in the member "header" (merkle root, proof of
+	// work, time). The header's source is the operator's, not the chain's
+	// consensus: an auditor still checks the header against a node.
+	BitcoinHeaderChecked = "header_checked"
+)
+
+// MaxBitcoinHeight is the largest block height accepted anywhere (the parser
+// of package ots and OTSEvidence.Validate use the same limit).
+const MaxBitcoinHeight = 1<<31 - 1
+
+// OTSBitcoin summarises the Bitcoin attestation of an anchor. It names ONE
+// attestation, the one with the lowest height among those that passed the
+// checks; the fragments may hold others, and a verifier checks every Bitcoin
+// attestation of every fragment, not only this one.
 type OTSBitcoin struct {
 	Height      uint64 `json:"height"`
-	CalendarURI string `json:"calendar_uri"`
+	CalendarURI string `json:"calendar_uri"` // the calendar whose fragment holds it
+	// MerkleRoot is the lower case hex of the 32-byte message that the
+	// attestation sits on (what the operations lead to from the digest), in
+	// the byte order in which it sits in a block header (bytes 36 to 68).
+	MerkleRoot string `json:"merkle_root"`
+	Status     string `json:"status"` // BitcoinClaimed or BitcoinHeaderChecked
+	// Header is the 160 hex digits of the block header that was checked, and
+	// "" when Status is BitcoinClaimed.
+	Header string `json:"header"`
 }
 
-// OTSEvidence is the evidence of an OpenTimestamps anchor (design 6.5 step 2).
+// OTSEvidence is the evidence of an OpenTimestamps anchor (design 6.5 step
+// 2 and correction 70).
 type OTSEvidence struct {
-	Digest    string        `json:"digest"` // hex of the 32-byte digest
-	Calendars []OTSCalendar `json:"calendars"`
-	Bitcoin   *OTSBitcoin   `json:"bitcoin"` // null until a Bitcoin attestation exists
+	Digest string `json:"digest"` // hex of the 32-byte digest
+	// SubmittedAt is the cluster's clock when the digest was first accepted
+	// by enough calendars (TimeLayout). It bounds the heights that can
+	// attest the digest: a block older than this cannot.
+	SubmittedAt string        `json:"submitted_at"`
+	Calendars   []OTSCalendar `json:"calendars"`
+	Bitcoin     *OTSBitcoin   `json:"bitcoin"` // null until a Bitcoin attestation exists
+}
+
+func isLowerHex(s string, n int) bool {
+	if len(s) != 2*n {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func printableASCII(s string, max int) bool {
@@ -105,9 +157,12 @@ func printableASCII(s string, max int) bool {
 // Validate checks the evidence.
 func (e WORMEvidence) Validate() error {
 	if !printableASCII(e.Endpoint, 2048) || !printableASCII(e.Bucket, 255) || e.Bucket == "" ||
-		!printableASCII(e.Key, 1024) || e.Key == "" || !printableASCII(e.VersionID, 1024) ||
+		!printableASCII(e.Key, 1024) || e.Key == "" || !printableASCII(e.VersionID, 1024) || e.VersionID == "" ||
 		!printableASCII(e.ETag, 256) {
 		return errors.New("anchor: worm evidence has a missing or malformed text field")
+	}
+	if !isLowerHex(e.ObjectSHA256, 32) {
+		return errors.New("anchor: worm evidence object_sha256 must be 64 lower case hex digits")
 	}
 	if e.LockMode != "GOVERNANCE" && e.LockMode != "COMPLIANCE" {
 		return errors.New("anchor: worm evidence lock_mode must be GOVERNANCE or COMPLIANCE")
@@ -130,7 +185,7 @@ func (e TSAEvidence) Validate() error {
 		return errors.New("anchor: tsa evidence has a missing or malformed text field")
 	}
 	tok, err := base64.StdEncoding.DecodeString(e.TokenDERB64)
-	if err != nil || len(tok) == 0 || len(tok) > MaxTokenDER {
+	if err != nil || len(tok) == 0 || len(tok) > MaxTokenDER || base64.StdEncoding.EncodeToString(tok) != e.TokenDERB64 {
 		return errors.New("anchor: tsa evidence token_der_b64 is malformed or too large")
 	}
 	if _, err := ParseTime(e.GenTime); err != nil {
@@ -160,12 +215,32 @@ func (e OTSEvidence) Validate() error {
 			return errors.New("anchor: ots evidence has a malformed or repeated calendar uri")
 		}
 		seen[c.URI] = true
-		if f, err := base64.StdEncoding.DecodeString(c.FragmentB64); err != nil || len(f) == 0 {
+		if f, err := base64.StdEncoding.DecodeString(c.FragmentB64); err != nil || len(f) == 0 || base64.StdEncoding.EncodeToString(f) != c.FragmentB64 {
 			return errors.New("anchor: ots evidence has a malformed fragment")
 		}
 	}
-	if e.Bitcoin != nil && (!seen[e.Bitcoin.CalendarURI] || e.Bitcoin.Height > 1<<31) {
-		return errors.New("anchor: ots evidence bitcoin names no known calendar or an impossible height")
+	if _, err := ParseTime(e.SubmittedAt); err != nil {
+		return err
+	}
+	if b := e.Bitcoin; b != nil {
+		if !seen[b.CalendarURI] || b.Height > MaxBitcoinHeight {
+			return errors.New("anchor: ots evidence bitcoin names no known calendar or an impossible height")
+		}
+		if !isLowerHex(b.MerkleRoot, 32) {
+			return errors.New("anchor: ots evidence bitcoin merkle_root must be 64 lower case hex digits")
+		}
+		switch b.Status {
+		case BitcoinClaimed:
+			if b.Header != "" {
+				return errors.New("anchor: ots evidence bitcoin header must be empty for a claim")
+			}
+		case BitcoinHeaderChecked:
+			if !isLowerHex(b.Header, 80) || b.Header[72:136] != b.MerkleRoot {
+				return errors.New("anchor: ots evidence bitcoin header must be 160 hex digits holding the merkle root")
+			}
+		default:
+			return errors.New("anchor: ots evidence bitcoin status must be claimed or header_checked")
+		}
 	}
 	return nil
 }
@@ -236,32 +311,77 @@ func strictDecode(raw []byte, v any) error {
 	return nil
 }
 
-// ParseWORMEvidence parses and validates WORM evidence. Unknown members are rejected.
-func ParseWORMEvidence(raw []byte) (WORMEvidence, error) {
+// requireCanonical refuses raw unless it is, byte for byte, what
+// canonicalJSON writes for the parsed value v: member names in the exact case
+// and order, no repeated member, no white space, no escape that the encoder
+// would not write, no null where a value is required. A reader that wrote
+// from the text of doc.go rejects the same input.
+func requireCanonical(raw []byte, v any) error {
+	canon, err := canonicalJSON(v)
+	if err != nil || !bytes.Equal(canon, raw) {
+		return errors.New("anchor: evidence is not in the canonical encoding")
+	}
+	return nil
+}
+
+func parseWORM(raw []byte, strict bool) (WORMEvidence, error) {
 	var e WORMEvidence
 	if err := strictDecode(raw, &e); err != nil {
 		return e, err
 	}
-	return e, e.Validate()
+	if err := e.Validate(); err != nil {
+		return e, err
+	}
+	if strict {
+		return e, requireCanonical(raw, e)
+	}
+	return e, nil
 }
 
-// ParseTSAEvidence parses and validates TSA evidence.
-func ParseTSAEvidence(raw []byte) (TSAEvidence, error) {
+func parseTSA(raw []byte, strict bool) (TSAEvidence, error) {
 	var e TSAEvidence
 	if err := strictDecode(raw, &e); err != nil {
 		return e, err
 	}
-	return e, e.Validate()
+	if err := e.Validate(); err != nil {
+		return e, err
+	}
+	if strict {
+		return e, requireCanonical(raw, e)
+	}
+	return e, nil
 }
 
-// ParseOTSEvidence parses and validates OpenTimestamps evidence.
-func ParseOTSEvidence(raw []byte) (OTSEvidence, error) {
+func parseOTS(raw []byte, strict bool) (OTSEvidence, error) {
 	var e OTSEvidence
 	if err := strictDecode(raw, &e); err != nil {
 		return e, err
 	}
-	return e, e.Validate()
+	if e.Calendars == nil {
+		return e, errors.New("anchor: ots evidence calendars must be an array")
+	}
+	if err := e.Validate(); err != nil {
+		return e, err
+	}
+	if strict {
+		return e, requireCanonical(raw, e)
+	}
+	return e, nil
 }
+
+// ParseWORMEvidence parses and validates WORM evidence. The input must be in
+// the canonical encoding (what EncodeEvidence writes) byte for byte: unknown
+// members, a member name in another case or spelled with an escape, a
+// repeated member, white space and any other variation are rejected.
+func ParseWORMEvidence(raw []byte) (WORMEvidence, error) { return parseWORM(raw, true) }
+
+// ParseTSAEvidence parses and validates TSA evidence (canonical input only,
+// see ParseWORMEvidence).
+func ParseTSAEvidence(raw []byte) (TSAEvidence, error) { return parseTSA(raw, true) }
+
+// ParseOTSEvidence parses and validates OpenTimestamps evidence (canonical
+// input only, see ParseWORMEvidence).
+func ParseOTSEvidence(raw []byte) (OTSEvidence, error) { return parseOTS(raw, true) }
 
 // EvidenceFile is the public file a/<aggregate_id>/anchors/<size>/<target id>.json
 // of the publication (design 6.2).
@@ -285,21 +405,6 @@ type evidenceFileJSON struct {
 	Evidence      json.RawMessage `json:"evidence"`
 }
 
-func checkEvidenceKind(kind string, raw []byte) error {
-	var err error
-	switch kind {
-	case KindWORM:
-		_, err = ParseWORMEvidence(raw)
-	case KindTSA:
-		_, err = ParseTSAEvidence(raw)
-	case KindOTS:
-		_, err = ParseOTSEvidence(raw)
-	default:
-		err = fmt.Errorf("anchor: unknown evidence kind %q", kind)
-	}
-	return err
-}
-
 // EncodeEvidenceFile validates f and encodes it canonically (members in the
 // order format, kind, origin, size, payload_sha256, created_at, evidence;
 // compact; no trailing newline). The evidence member is re-encoded from its
@@ -321,22 +426,31 @@ func EncodeEvidenceFile(f EvidenceFile) ([]byte, error) {
 	})
 }
 
+// CanonicalEvidence reads evidence of the given kind in any JSON spelling (a
+// jsonb column of PostgreSQL returns the members in another order and with
+// white space), validates it, and returns the canonical encoding that the
+// parsers and the evidence file require. Unknown members, trailing data and
+// values that break the rules are still refused.
+func CanonicalEvidence(kind string, raw []byte) (json.RawMessage, error) {
+	return canonicalEvidence(kind, raw)
+}
+
 func canonicalEvidence(kind string, raw []byte) (json.RawMessage, error) {
 	switch kind {
 	case KindWORM:
-		e, err := ParseWORMEvidence(raw)
+		e, err := parseWORM(raw, false)
 		if err != nil {
 			return nil, err
 		}
 		return EncodeEvidence(e)
 	case KindTSA:
-		e, err := ParseTSAEvidence(raw)
+		e, err := parseTSA(raw, false)
 		if err != nil {
 			return nil, err
 		}
 		return EncodeEvidence(e)
 	case KindOTS:
-		e, err := ParseOTSEvidence(raw)
+		e, err := parseOTS(raw, false)
 		if err != nil {
 			return nil, err
 		}
@@ -359,17 +473,20 @@ func ParseEvidenceFile(b []byte) (EvidenceFile, error) {
 	if j.Format != EvidenceFormat {
 		return f, fmt.Errorf("anchor: unsupported evidence format %d", j.Format)
 	}
-	if err := checkEvidenceKind(j.Kind, j.Evidence); err != nil {
-		return f, err
-	}
 	t, err := ParseTime(j.CreatedAt)
 	if err != nil {
 		return f, err
 	}
 	f = EvidenceFile{Kind: j.Kind, Origin: j.Origin, Size: j.Size, PayloadSHA256: j.PayloadSHA256, CreatedAt: t, Evidence: j.Evidence}
-	// reject anything EncodeEvidenceFile would reject (origin, digest)
-	if _, err := EncodeEvidenceFile(f); err != nil {
+	// reject anything EncodeEvidenceFile would reject (kind, origin, digest,
+	// the evidence for the kind) and anything that is not exactly what it
+	// writes: the file must be canonical byte for byte
+	canon, err := EncodeEvidenceFile(f)
+	if err != nil {
 		return EvidenceFile{}, err
+	}
+	if !bytes.Equal(canon, b) {
+		return EvidenceFile{}, errors.New("anchor: evidence file is not in the canonical encoding")
 	}
 	return f, nil
 }

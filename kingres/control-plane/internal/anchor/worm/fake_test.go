@@ -5,14 +5,17 @@ package worm
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/md5"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -87,6 +90,12 @@ type fakeS3 struct {
 	defaultDays    int
 	echoSecrets    bool // put the credentials in error texts
 	failSig        bool
+
+	listPage        int // versions per page of a listing (0: all)
+	listCalls       int
+	retentionCalls  int
+	retentionStatus int           // answer PutObjectRetention with this status
+	skew            time.Duration // added to the Last-Modified of new versions
 }
 
 func newFakeS3() *fakeS3 {
@@ -200,7 +209,7 @@ func (f *fakeS3) checkSig(r *http.Request, body []byte) string {
 			return "header " + h + " not signed"
 		}
 	}
-	if r.Method == "PUT" {
+	if _, isRetention := r.URL.Query()["retention"]; r.Method == "PUT" && !isRetention {
 		for _, h := range []string{"content-type", "x-amz-checksum-sha256"} {
 			if !contains(signed, h) {
 				return "header " + h + " not signed on put"
@@ -281,6 +290,10 @@ func (f *fakeS3) serve(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, `<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>%s</ObjectLockConfiguration>`, rule)
 			return
 		}
+		if _, ok := q["versions"]; ok {
+			f.listVersions(w, q)
+			return
+		}
 		f.errXML(w, 400, "InvalidRequest", "unknown bucket operation")
 		return
 	}
@@ -294,7 +307,112 @@ func (f *fakeS3) serve(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// listVersions answers ListObjectVersions: the versions of the keys with the
+// prefix, key by key, the newest version of a key first; paged by listPage.
+func (f *fakeS3) listVersions(w http.ResponseWriter, q url.Values) {
+	prefix := q.Get("prefix")
+	var keys []string
+	for k := range f.objects {
+		if strings.HasPrefix(k, prefix) {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	type entry struct{ key, id string }
+	var all []entry
+	for _, k := range keys {
+		vs := f.objects[k]
+		for i := len(vs) - 1; i >= 0; i-- {
+			all = append(all, entry{k, vs[i].id})
+		}
+	}
+	start := 0
+	if km, vm := q.Get("key-marker"), q.Get("version-id-marker"); km != "" {
+		for i, e := range all {
+			if e.key == km && e.id == vm {
+				start = i + 1
+			}
+		}
+	}
+	end, trunc := len(all), false
+	if f.listPage > 0 && start+f.listPage < len(all) {
+		end, trunc = start+f.listPage, true
+	}
+	var sb strings.Builder
+	sb.WriteString(`<?xml version="1.0" encoding="UTF-8"?><ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`)
+	fmt.Fprintf(&sb, "<Name>%s</Name><Prefix>%s</Prefix><IsTruncated>%v</IsTruncated>", fakeBucket, prefix, trunc)
+	if trunc {
+		fmt.Fprintf(&sb, "<NextKeyMarker>%s</NextKeyMarker><NextVersionIdMarker>%s</NextVersionIdMarker>", all[end-1].key, all[end-1].id)
+	}
+	for _, e := range all[start:end] {
+		fmt.Fprintf(&sb, "<Version><Key>%s</Key><VersionId>%s</VersionId><IsLatest>false</IsLatest></Version>", e.key, e.id)
+	}
+	sb.WriteString("</ListVersionsResult>")
+	f.listCalls++
+	w.Header().Set("Content-Type", "application/xml")
+	_, _ = io.WriteString(w, sb.String())
+}
+
+// addVersion puts a version under key by hand (another principal, another
+// writer): locked with the mode and retention given, or unlocked when mode is "".
+func (f *fakeS3) addVersion(key string, body []byte, mode string, retain time.Time) *fakeVersion {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	h := sha256.Sum256(body)
+	f.nextID++
+	v := &fakeVersion{body: append([]byte(nil), body...), lastMod: time.Now().UTC().Truncate(time.Second),
+		sum: base64.StdEncoding.EncodeToString(h[:]), id: "v" + strconv.Itoa(f.nextID) + "-" + hex.EncodeToString(h[:4]), mode: mode}
+	if mode != "" {
+		v.retain = retain.UTC().Format("2006-01-02T15:04:05.000Z")
+	}
+	f.objects[key] = append(f.objects[key], v)
+	return v
+}
+
+// putRetention is PutObjectRetention on one version.
+func (f *fakeS3) putRetention(w http.ResponseWriter, r *http.Request, key string, body []byte) {
+	f.retentionCalls++
+	if f.retentionStatus != 0 {
+		f.errXML(w, f.retentionStatus, "AccessDenied", "Access Denied")
+		return
+	}
+	md := md5.Sum(body)
+	if r.Header.Get("Content-MD5") != base64.StdEncoding.EncodeToString(md[:]) {
+		f.errXML(w, 400, "InvalidDigest", "Content-MD5 missing or wrong")
+		return
+	}
+	var rx struct {
+		Mode            string `xml:"Mode"`
+		RetainUntilDate string `xml:"RetainUntilDate"`
+	}
+	if err := xml.Unmarshal(body, &rx); err != nil || rx.Mode == "" {
+		f.errXML(w, 400, "MalformedXML", "bad retention")
+		return
+	}
+	for _, v := range f.objects[key] {
+		if v.id == r.URL.Query().Get("versionId") {
+			if v.mode != "" && v.mode != rx.Mode {
+				f.errXML(w, 403, "AccessDenied", "the mode of a locked version cannot be changed")
+				return
+			}
+			t, err := time.Parse(time.RFC3339, rx.RetainUntilDate)
+			if err != nil {
+				f.errXML(w, 400, "MalformedXML", "bad date")
+				return
+			}
+			v.mode, v.retain = rx.Mode, t.UTC().Format("2006-01-02T15:04:05.000Z")
+			w.WriteHeader(200)
+			return
+		}
+	}
+	f.errXML(w, 404, "NoSuchVersion", "no such version")
+}
+
 func (f *fakeS3) put(w http.ResponseWriter, r *http.Request, key string, body []byte) {
+	if _, ok := r.URL.Query()["retention"]; ok {
+		f.putRetention(w, r, key, body)
+		return
+	}
 	if f.hang != nil {
 		f.mu.Unlock()
 		select {
@@ -339,7 +457,7 @@ func (f *fakeS3) put(w http.ResponseWriter, r *http.Request, key string, body []
 		f.errXML(w, 412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold")
 		return
 	}
-	v := &fakeVersion{body: append([]byte(nil), body...), lastMod: time.Now().UTC().Truncate(time.Second)}
+	v := &fakeVersion{body: append([]byte(nil), body...), lastMod: time.Now().Add(f.skew).UTC().Truncate(time.Second)}
 	h := sha256.Sum256(body)
 	v.sum = base64.StdEncoding.EncodeToString(h[:])
 	f.nextID++

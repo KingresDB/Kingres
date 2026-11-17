@@ -93,15 +93,19 @@ func TestSubmitUpgradeExport(t *testing.T) {
 	}
 	// only calendar B confirms
 	b.mu.Lock()
-	b.bitcoin, b.height = true, 811111
+	b.bitcoin, b.height = true, 960000
 	b.mu.Unlock()
 	rc3, err := tg.Upgrade(context.Background(), rc2)
-	if err != nil || rc3.State != anchor.ReceiptAnchored || rc3.EvidenceTime != nil || rc3.NextCheck != nil {
+	// no header source is configured: a calendar's attestation is a claim, not an anchor
+	if err != nil || rc3.State != anchor.ReceiptClaimed || rc3.EvidenceTime != nil || rc3.NextCheck != nil {
 		t.Fatalf("upgrade: %+v %v", rc3, err)
 	}
 	ev3, _ := anchor.ParseOTSEvidence(rc3.Evidence)
-	if ev3.Bitcoin == nil || ev3.Bitcoin.Height != 811111 || ev3.Bitcoin.CalendarURI != b.url() {
+	if ev3.Bitcoin == nil || ev3.Bitcoin.Height != 960000 || ev3.Bitcoin.CalendarURI != b.url() || ev3.Bitcoin.Status != anchor.BitcoinClaimed || ev3.Bitcoin.Header != "" {
 		t.Fatalf("bitcoin %+v", ev3.Bitcoin)
+	}
+	if ev3.SubmittedAt != anchor.FormatTime(testNow) {
+		t.Fatalf("submitted_at %s", ev3.SubmittedAt)
 	}
 	// calendar A keeps its pending attestation, B's was replaced
 	for _, c := range ev3.Calendars {
@@ -123,14 +127,14 @@ func TestSubmitUpgradeExport(t *testing.T) {
 			t.Errorf("%s: %d pending %d bitcoin", c.URI, pend, btc)
 		}
 	}
-	// anchored receipts are returned unchanged and no request is made
+	// claimed receipts (no header source) are returned unchanged and no request is made
 	_, g0 := b.counts()
 	rc4, err := tg.Upgrade(context.Background(), rc3)
-	if err != nil || !bytes.Equal(rc4.Evidence, rc3.Evidence) {
-		t.Fatal("anchored upgrade changed")
+	if err != nil || rc4.State != anchor.ReceiptClaimed || !bytes.Equal(rc4.Evidence, rc3.Evidence) {
+		t.Fatal("claimed upgrade changed")
 	}
 	if _, g1 := b.counts(); g1 != g0 {
-		t.Error("anchored receipt triggered a request")
+		t.Error("claimed receipt triggered a request")
 	}
 	// the exported file: parses, re-serialises identically, holds both a pending and a bitcoin leaf
 	file, err := Export(ev3)
@@ -154,7 +158,7 @@ func TestSubmitUpgradeExport(t *testing.T) {
 	if kinds[AttPending] != 1 || kinds[AttBitcoin] != 1 {
 		t.Errorf("leaves %v", kinds)
 	}
-	if !bytes.HasPrefix(file, Magic) {
+	if !bytes.HasPrefix(file, Magic()) {
 		t.Error("magic")
 	}
 	// the evidence file of the publication round trips
@@ -320,7 +324,7 @@ func TestUpgradeSkipsForeignCalendars(t *testing.T) {
 	att, _ := NewPending(evil.url())
 	x.AddAttestation(att)
 	raw, _ := n.Serialize()
-	ev := anchor.OTSEvidence{Digest: p.DigestHex(), Calendars: []anchor.OTSCalendar{{URI: a.url(), FragmentB64: base64.StdEncoding.EncodeToString(raw)}}}
+	ev := anchor.OTSEvidence{Digest: p.DigestHex(), SubmittedAt: anchor.FormatTime(testNow), Calendars: []anchor.OTSCalendar{{URI: a.url(), FragmentB64: base64.StdEncoding.EncodeToString(raw)}}}
 	enc, _ := anchor.EncodeEvidence(ev)
 	rc, err := tg.Upgrade(context.Background(), anchor.Receipt{State: anchor.ReceiptSubmitted, Evidence: enc})
 	if err != nil || rc.State != anchor.ReceiptSubmitted {

@@ -111,7 +111,7 @@ func TestSubmitPathStyle(t *testing.T) {
 	rc, ev := mustSubmit(t, tg, p)
 	noSigErrors(t, f)
 	key := "kingres-anchors/" + aggID + "/00000000000000000017.note"
-	if ev.Key != key || ev.Bucket != fakeBucket || ev.LockMode != "GOVERNANCE" || ev.RecordedBy != "cluster" || ev.Endpoint != f.srv.URL {
+	if ev.Key != key || ev.Bucket != fakeBucket || ev.LockMode != "COMPLIANCE" || ev.RecordedBy != "cluster" || ev.Endpoint != f.srv.URL {
 		t.Fatalf("evidence %+v", ev)
 	}
 	vs := f.stored(key)
@@ -125,7 +125,7 @@ func TestSubmitPathStyle(t *testing.T) {
 	put := f.requests()[0]
 	h := put.header
 	if put.method != "PUT" || h.Get("If-None-Match") != "*" || h.Get("Content-Type") != "text/plain; charset=utf-8" ||
-		h.Get("X-Amz-Object-Lock-Mode") != "GOVERNANCE" {
+		h.Get("X-Amz-Object-Lock-Mode") != "COMPLIANCE" {
 		t.Fatalf("put headers %v", h)
 	}
 	sum := sha256.Sum256(p.SignedNote)
@@ -220,12 +220,14 @@ func TestConflictHugeObject(t *testing.T) {
 func TestExistingNotLockedIsFailure(t *testing.T) {
 	f := newFakeS3()
 	f.noLock = true
+	f.retentionStatus = 403 // and the store does not take the retention afterwards either
 	defer f.close()
 	tg := newTarget(t, f)
 	p := testPayload(t, "4", 1)
 	_, err := tg.Submit(context.Background(), p)
 	expectErr(t, err, anchor.ClassPermanent, "not_locked")
-	// the object is there, same bytes, still unlocked: the retry reports the same
+	// the object is there, same bytes, still unlocked and the store refuses the
+	// retention: the retry reports it, with what the operator must do
 	_, err = tg.Submit(context.Background(), p)
 	expectErr(t, err, anchor.ClassPermanent, "not_locked")
 }
@@ -274,14 +276,15 @@ func TestReadBackMismatch(t *testing.T) {
 	})
 }
 
-func TestNoVersionIDStillVerifies(t *testing.T) {
+// A store that returns no version id cannot hold an object lock and cannot
+// give evidence that names a version: not anchored (permanent, with a text
+// that says why).
+func TestNoVersionIDIsNotAnAnchor(t *testing.T) {
 	f := newFakeS3()
 	f.noVersionID = true
 	defer f.close()
-	_, ev := mustSubmit(t, newTarget(t, f), testPayload(t, "4", 1))
-	if ev.VersionID != "" {
-		t.Fatal(ev.VersionID)
-	}
+	_, err := newTarget(t, f).Submit(context.Background(), testPayload(t, "4", 1))
+	expectErr(t, err, anchor.ClassPermanent, "no_version_id")
 }
 
 func TestPutAnswers(t *testing.T) {
@@ -699,7 +702,7 @@ func TestConfig(t *testing.T) {
 		}
 	}
 	c, err := ParseConfig(json.RawMessage(base + `}`))
-	if err != nil || c.KeyPrefix != DefaultKeyPrefix || c.Mode != "governance" || c.RetentionDays != 3650 || c.IfNoneMatch != "auto" || *c.PathStyle {
+	if err != nil || c.KeyPrefix != DefaultKeyPrefix || c.Mode != "compliance" || len(c.Warnings()) != 0 || c.RetentionDays != 3650 || c.IfNoneMatch != "auto" || *c.PathStyle {
 		t.Fatalf("defaults %+v %v", c, err)
 	}
 	c, err = ParseConfig(json.RawMessage(base + `,"endpoint":"https://Store.Example:9000","keyPrefix":"/p/q/"}`))

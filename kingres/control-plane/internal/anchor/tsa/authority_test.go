@@ -155,6 +155,14 @@ type authOpts struct {
 	notBefore time.Time // of the TSA certificate; zero: an hour ago
 	notAfter  time.Time // zero: ten years
 	ski       bool
+	// tsaKeyBits, when not 0, gives the TSA certificate a fresh RSA key of
+	// that size (the signature algorithm of the token follows); the chain
+	// above it keeps the keyAlg
+	tsaKeyBits int
+	// tsaSAN adds a subject alternative name (a DNS name) to the TSA certificate
+	tsaSAN string
+	// tsaKeyUsage replaces the digitalSignature key usage of the TSA certificate
+	tsaKeyUsage x509.KeyUsage
 }
 
 type authority struct {
@@ -176,6 +184,13 @@ func newAuthority(t testing.TB, o authOpts) *authority {
 	now := time.Now().UTC()
 	a := &authority{keyAlg: o.keyAlg}
 	a.rootKey, a.interKey, a.tsaKey = newKey(o.keyAlg, 0), newKey(o.keyAlg, 1), newKey(o.keyAlg, 2)
+	if o.tsaKeyBits != 0 {
+		k, err := rsa.GenerateKey(rand.Reader, o.tsaKeyBits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		a.tsaKey = k
+	}
 	mk := func(tmpl, parent *x509.Certificate, pub crypto.PublicKey, signer crypto.Signer) *x509.Certificate {
 		der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, pub, signer)
 		if err != nil {
@@ -204,6 +219,12 @@ func newAuthority(t testing.TB, o authOpts) *authority {
 	}
 	tsaT := &x509.Certificate{SerialNumber: nextSerial(), Subject: pkix.Name{CommonName: "Test TSA", Organization: []string{"Test"}},
 		NotBefore: nb, NotAfter: na, KeyUsage: x509.KeyUsageDigitalSignature}
+	if o.tsaKeyUsage != 0 {
+		tsaT.KeyUsage = o.tsaKeyUsage
+	}
+	if o.tsaSAN != "" {
+		tsaT.DNSNames = []string{o.tsaSAN}
+	}
 	if o.ski {
 		tsaT.SubjectKeyId = []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
 	}
@@ -256,6 +277,7 @@ type issueOpts struct {
 	nonce               *big.Int
 	nonceOverride       *big.Int
 	dropNonce           bool
+	tsaName             []byte // GeneralName for the tsa field of the TSTInfo
 	accuracy            bool
 	genTimeText         string // override
 	digestAlg           string // "sha256" default
@@ -325,6 +347,9 @@ func (a *authority) token(req *tsReq, o issueOpts) []byte {
 	}
 	if n != nil && !o.dropNonce {
 		parts = append(parts, intB(n))
+	}
+	if o.tsaName != nil {
+		parts = append(parts, tl(0xa0, o.tsaName))
 	}
 	if o.critExt {
 		parts = append(parts, tl(0xa1, seq(seq(oidB("1.2.3.99"), []byte{1, 1, 0xff}, octet([]byte{5, 0})))))
@@ -407,6 +432,9 @@ func (a *authority) signerInfo(o issueOpts, tst []byte) []byte {
 		attrs = append(attrs, seq(oidB("1.2.840.113549.1.9.16.2.47"), set(seq(seq(seq(octet(certHash("sha256")), is))))))
 	case "v2badserial":
 		is := seq(seq(tl(0xa4, a.tsa.RawIssuer)), intI(7))
+		attrs = append(attrs, seq(oidB("1.2.840.113549.1.9.16.2.47"), set(seq(seq(seq(octet(certHash("sha256")), is))))))
+	case "v2badissuer":
+		is := seq(seq(tl(0xa4, a.root.RawSubject)), intB(a.tsa.SerialNumber))
 		attrs = append(attrs, seq(oidB("1.2.840.113549.1.9.16.2.47"), set(seq(seq(seq(octet(certHash("sha256")), is))))))
 	case "none":
 	}

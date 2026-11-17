@@ -144,7 +144,7 @@ func TestRefusedByName(t *testing.T) {
 	// unknown tag
 	f, _ := ParseFile(mustRead(t, "testdata/third_party/opentimestamps-client-examples/incomplete.txt.ots"))
 	b, _ := f.Serialize()
-	pos := len(Magic) + 2 + 32
+	pos := len(Magic()) + 2 + 32
 	b2 := append([]byte(nil), b...)
 	b2[pos] = 0x42
 	_, err := ParseFile(b2)
@@ -187,7 +187,7 @@ func TestTruncationsAndTrailing(t *testing.T) {
 
 func TestBadMagicAndVersion(t *testing.T) {
 	b := mustRead(t, "testdata/third_party/opentimestamps-client-examples/hello-world.txt.ots")
-	for _, i := range []int{0, 1, 10, len(Magic) - 1} {
+	for _, i := range []int{0, 1, 10, len(Magic()) - 1} {
 		c := append([]byte(nil), b...)
 		c[i] ^= 1
 		if _, err := ParseFile(c); !errors.Is(err, ErrBadMagic) {
@@ -195,7 +195,7 @@ func TestBadMagicAndVersion(t *testing.T) {
 		}
 	}
 	c := append([]byte(nil), b...)
-	c[len(Magic)] = 2
+	c[len(Magic())] = 2
 	if _, err := ParseFile(c); !errors.Is(err, ErrVersion) {
 		t.Errorf("version 2: %v", err)
 	}

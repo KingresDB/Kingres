@@ -46,7 +46,7 @@ func newEnv(t *testing.T, mod func(*Options)) *env {
 	e := &env{t: t, a: newAuthority(t, authOpts{})}
 	e.srv = httptest.NewServer(http.HandlerFunc(e.serve))
 	t.Cleanup(e.srv.Close)
-	o := Options{Config: Config{URL: e.srv.URL + "/tsa", CABundlePath: "unused", TimeoutSeconds: 5},
+	o := Options{Config: Config{URL: e.srv.URL + "/tsa", CABundlePath: "unused", TimeoutSeconds: 5, AllowInsecure: true},
 		Roots: e.a.rootPool, Intermediates: e.a.interPool, Username: testUser, Password: testPass,
 		Client: e.srv.Client()}
 	if mod != nil {
@@ -95,12 +95,9 @@ func testPayload(t *testing.T) anchor.Payload {
 func TestSubmitSuccess(t *testing.T) {
 	e := newEnv(t, nil)
 	p := testPayload(t)
-	rc, warn, err := e.target.SubmitDetailed(context.Background(), p)
+	rc, err := e.target.Submit(context.Background(), p)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if len(warn) != 0 {
-		t.Fatalf("warnings %v", warn)
 	}
 	if rc.State != anchor.ReceiptAnchored || rc.EvidenceTime == nil || rc.NextCheck != nil {
 		t.Fatalf("receipt %+v", rc)
@@ -417,19 +414,7 @@ func TestRedirects(t *testing.T) {
 	}
 }
 
-func TestSkewWarning(t *testing.T) {
-	e := newEnv(t, func(o *Options) { o.Clock = func() time.Time { return time.Now().Add(-10 * time.Minute) } })
-	rc, warn, err := e.target.SubmitDetailed(context.Background(), testPayload(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rc.State != anchor.ReceiptAnchored || len(warn) != 1 || warn[0].Code != "skew" || warn[0].Skew < 9*time.Minute {
-		t.Fatalf("%+v %+v", rc, warn)
-	}
-	e = newEnv(t, func(o *Options) { o.Clock = func() time.Time { return time.Now().Add(-4 * time.Minute) } })
-	if _, warn, _ := e.target.SubmitDetailed(context.Background(), testPayload(t)); len(warn) != 0 {
-		t.Fatalf("4 minutes of skew warned: %v", warn)
-	}
+func TestSkewOf(t *testing.T) {
 	if SkewOf(time.Unix(1000, 0), time.Unix(400, 0)) != 10*time.Minute {
 		t.Fatal("SkewOf")
 	}
@@ -461,9 +446,10 @@ func TestTestMethod(t *testing.T) {
 	if res.OK() || res.Checks[0].Status != anchor.CheckFailed {
 		t.Fatalf("%+v", res)
 	}
+	// a clock an hour off: the token is not accepted, the test says so
 	e = newEnv(t, func(o *Options) { o.Clock = func() time.Time { return time.Now().Add(time.Hour) } })
 	res = e.target.Test(context.Background())
-	if !res.OK() || res.Checks[2].Status != anchor.CheckWarning {
+	if res.OK() || res.Checks[0].Status != anchor.CheckFailed || !strings.Contains(res.Checks[0].Text, "clock") {
 		t.Fatalf("%+v", res)
 	}
 }
@@ -558,7 +544,7 @@ func TestNoSecretInOutput(t *testing.T) {
 	})
 	_, errCut := e.target.Submit(context.Background(), testPayload(t))
 	e.set(nil)
-	rc, _, errOK := e.target.SubmitDetailed(context.Background(), testPayload(t))
+	rc, errOK := e.target.Submit(context.Background(), testPayload(t))
 	if errOK != nil {
 		t.Fatal(errOK)
 	}
@@ -567,7 +553,7 @@ func TestNoSecretInOutput(t *testing.T) {
 	cfg := Config{URL: e.srv.URL, CABundlePath: "p"}
 	opts := Options{Config: cfg, Username: testUser, Password: testPass}
 	objs := []any{e.target, *e.target, opts, &opts, cfg, rc, res, info, errReject, err401, errCut, anchor.Secret(testPass),
-		&Response{StatusText: "x"}, Warning{Text: "w"}, Request{Nonce: big.NewInt(1)}}
+		&Response{StatusText: "x"}, Request{Nonce: big.NewInt(1)}}
 	for _, o := range objs {
 		for _, f := range []string{"%v", "%+v", "%#v", "%s", "%q", "%x", "%d"} {
 			s := fmt.Sprintf(f, o)

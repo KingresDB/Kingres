@@ -50,7 +50,11 @@
 // it from a pinned commit into testdata/third_party and verifies it against
 // testdata/third_party.sha256. It is test data only, read at run time by the
 // tests, never embedded and never part of a binary. Without it the tests that
-// need it skip and every other test runs. See testdata/SOURCES.txt.
+// need it skip and every other test runs. The properties it tests (path
+// normalisation, escaping, query order, header folding, the session token, S3
+// paths that are not normalised) are also tested with vectors of our own
+// (own_vectors_test.go), produced once by an independent implementation of
+// the algorithm; they are part of the test binary. See testdata/SOURCES.txt.
 //
 // # What it does not do
 //

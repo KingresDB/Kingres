@@ -26,7 +26,11 @@ const (
 // Receipt states (a subset of the record states).
 const (
 	ReceiptSubmitted = "submitted"
-	ReceiptAnchored  = "anchored"
+	// ReceiptClaimed is a receipt whose attestation passed every check that
+	// needs no outside data but was not checked against a block header (kind
+	// ots only). It is not an anchor.
+	ReceiptClaimed  = "claimed"
+	ReceiptAnchored = "anchored"
 )
 
 // Clock is the time source of the package: every function that needs the
@@ -158,12 +162,38 @@ func NewPayload(aggregateIDHex string, signedNote []byte) (Payload, error) {
 	}, nil
 }
 
+// Check reports whether p is exactly what NewPayload builds from p.SignedNote
+// and the aggregate id of p.ID: every field, the digest included. A zero
+// Payload, a digest that is not SHA-256 of the note text and a text that is
+// not the head of the signed note are all refused.
+func (p Payload) Check() error {
+	q, err := NewPayload(p.AggregateID(), p.SignedNote)
+	if err != nil {
+		return err
+	}
+	if q.ID != p.ID || q.Origin != p.Origin || q.Size != p.Size || q.Digest != p.Digest ||
+		!bytes.Equal(q.NoteText, p.NoteText) || !bytes.Equal(q.SignedNote, p.SignedNote) {
+		return fmt.Errorf("anchor: payload fields are not those of its signed note")
+	}
+	return nil
+}
+
+// CheckPayload is Check as an *Error of class permanent with the code
+// "bad_payload", for a target to return at the start of Submit: every target
+// refuses a payload that was not built consistently (use NewPayload).
+func CheckPayload(target string, p Payload) error {
+	if err := p.Check(); err != nil {
+		return Errorf(ClassPermanent, target, "submit", "bad_payload", "payload is inconsistent (use anchor.NewPayload): %s", err.Error())
+	}
+	return nil
+}
+
 // DigestHex returns the digest in lower case hexadecimal (payload_sha256).
 func (p Payload) DigestHex() string { return hex.EncodeToString(p.Digest[:]) }
 
 // Receipt is the result of Submit and Upgrade.
 type Receipt struct {
-	// State is ReceiptSubmitted or ReceiptAnchored.
+	// State is ReceiptSubmitted, ReceiptClaimed or ReceiptAnchored.
 	State string
 	// Evidence is the evidence object in its canonical encoding (the
 	// "evidence" member of the evidence file, see EncodeEvidence).
