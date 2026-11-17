@@ -40,9 +40,10 @@ $n1->stop('immediate', fail_ok => 1);
 $n1->start;
 is(prepared($n2), '1', 'the participant holds a transaction in doubt');
 my $secret = $n1->safe_psql('postgres', "SELECT kingres.internal_forward_token('postgres', 2)");
-($rc, $out, $err) = run_sql($n1, 'SELECT kingres.rotate_secret()');
-isnt($rc, 0, 'rotate_secret refuses');
-like($err, qr/distributed transactions are in doubt/, 'and says why');
+($rc, $out, $err) = run_sql($n1, "\\set VERBOSITY verbose\nSELECT kingres.rotate_secret()");
+isnt($rc, 0, "rotate_secret refuses");
+like($err, qr/distributed transactions are in doubt/, "and says why");
+like($err, qr/KS013/, "with SQLSTATE KS013");
 like($err, qr/node 2 \(1\)/, 'and where');
 is($n1->safe_psql('postgres', "SELECT kingres.internal_forward_token('postgres', 2)"), $secret,
 	'the secret is unchanged');

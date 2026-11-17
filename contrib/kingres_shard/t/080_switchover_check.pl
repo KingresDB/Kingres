@@ -9,8 +9,8 @@
 #
 #   OLD: SELECT kingres.switchover_mark()          -- a WAL record, flushed; returns its position M
 #   OLD: stopped (pg_ctl stop -m fast)
-#   NEW: SELECT kingres.switchover_verify(M)       -- true when NEW has replayed it
-#   NEW: SELECT kingres.switchover_verify(X, true) -- X: "Latest checkpoint location" that
+#   NEW: SELECT kingres.switchover_replayed(M)     -- true when NEW has replayed the mark (only that)
+#   NEW: SELECT kingres.switchover_verify(X, 'shut down') -- X: "Latest checkpoint location" that
 #                                                     pg_controldata prints for the stopped OLD
 #
 # Both are tested here: with NEW streaming (true), and with NEW disconnected before the
@@ -63,14 +63,14 @@ foreach my $group (1, 0)
 		$old->safe_psql('postgres', 'CREATE TABLE public.t1 (a int); INSERT INTO public.t1 SELECT generate_series(1, 100)');
 		my $mark = $old->safe_psql('postgres', 'SELECT kingres.switchover_mark()');
 		like($mark, qr/^[0-9A-F]+\/[0-9A-F]+$/, "[$prefix] the mark is a WAL position");
-		ok($new->poll_query_until('postgres', "SELECT kingres.switchover_verify('$mark')"),
+		ok($new->poll_query_until('postgres', "SELECT kingres.switchover_replayed('$mark')"),
 			"[$prefix] NEW has replayed the mark: the check is true");
 		$old->stop('fast');
 		my $x = checkpoint_location($old);
-		ok($new->poll_query_until('postgres', "SELECT kingres.switchover_verify('$x', true)"),
+		ok($new->poll_query_until('postgres', "SELECT kingres.switchover_verify('$x', 'shut down')"),
 			"[$prefix] and it has replayed the shutdown checkpoint of OLD (group $group)");
 		promote_standby($new);
-		is($new->safe_psql('postgres', "SELECT kingres.switchover_verify('$mark')"), 't',
+		is($new->safe_psql('postgres', "SELECT kingres.switchover_replayed('$mark')"), 't',
 			"[$prefix] the check also works after NEW is promoted");
 		is($new->safe_psql('postgres', 'SELECT count(*) FROM public.t1'), '100', "[$prefix] nothing is missing");
 	}
@@ -88,14 +88,14 @@ foreach my $group (1, 0)
 		my $mark = $old->safe_psql('postgres', 'SELECT kingres.switchover_mark()');
 		$old->stop('fast');
 		my $x = checkpoint_location($old);
-		is($new->safe_psql('postgres', "SELECT kingres.switchover_verify('$mark')"), 'f',
+		is($new->safe_psql('postgres', "SELECT kingres.switchover_replayed('$mark')"), 'f',
 			"[$prefix] the check on NEW is false: it did not get the writes");
-		is($new->safe_psql('postgres', "SELECT kingres.switchover_verify('$x', true)"), 'f',
+		is($new->safe_psql('postgres', "SELECT kingres.switchover_verify('$x', 'shut down')"), 'f',
 			"[$prefix] and so is the check against the shutdown checkpoint of the stopped OLD");
 		promote_standby($new);
 		is($new->safe_psql('postgres', 'SELECT count(*) FROM public.t1'), '100',
 			"[$prefix] the three acknowledged rows are indeed gone from NEW (what the check protects against)");
-		is($new->safe_psql('postgres', "SELECT kingres.switchover_verify('$mark')"), 'f', "[$prefix] and it still says no after the promotion");
+		is($new->safe_psql('postgres', "SELECT kingres.switchover_replayed('$mark')"), 'f', "[$prefix] and it still says no after the promotion");
 	}
 }
 

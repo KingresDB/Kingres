@@ -44,10 +44,17 @@
 #include "postgres.h"
 
 #include "access/parallel.h"
+#include "access/timeline.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "access/xlog_internal.h"
+#include "access/xlogreader.h"
+#include "access/xlogrecovery.h"
+#include "access/xlogutils.h"
+#include "catalog/pg_control.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "mb/pg_wchar.h"
 #include "replication/message.h"
 #include "replication/syncrep.h"
 #include "replication/walsender.h"
@@ -62,6 +69,7 @@
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/jsonb.h"
+#include "utils/pg_lsn.h"
 #include "utils/timestamp.h"
 #include "utils/wait_classes.h"
 
@@ -75,6 +83,7 @@ PG_FUNCTION_INFO_V1(kingres_internal_mark_victim);
 PG_FUNCTION_INFO_V1(kingres_internal_dtx_identity);
 PG_FUNCTION_INFO_V1(kingres_internal_unmark_victim);
 PG_FUNCTION_INFO_V1(kingres_internal_wal_timeline);
+PG_FUNCTION_INFO_V1(kingres_switchover_verify);
 PG_FUNCTION_INFO_V1(kingres_internal_sync_confirm);
 PG_FUNCTION_INFO_V1(kingres_internal_sync_probe);
 
@@ -534,6 +543,205 @@ kingres_internal_wal_timeline(PG_FUNCTION_ARGS)
 	if (RecoveryInProgress())
 		PG_RETURN_INT32(0);
 	PG_RETURN_INT32((int32) GetWALInsertionTimeLine());
+}
+
+/*
+ * kingres.internal_sync_name_matches(list_name text, application_name text) returns bool
+ *
+ * Would an element of synchronous_standby_names that reads list_name match a standby that
+ * streams under application_name?  The decision of SyncRepGetStandbyPriority(): the names
+ * are compared with pg_strcasecmp(), and the element "*" matches every standby (S10-03).
+ * list_name may be written as in the list: in double quotes, with "" for a quote inside, or
+ * bare.  Both names are cut to NAMEDATALEN - 1 bytes, as the walsender cuts the
+ * application_name and the list scanner cuts its identifiers.
+ */
+PG_FUNCTION_INFO_V1(kingres_internal_sync_name_matches);
+
+Datum
+kingres_internal_sync_name_matches(PG_FUNCTION_ARGS)
+{
+	char	   *elem = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *app = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	size_t		len = strlen(elem);
+	char	   *name;
+
+	if (len >= 2 && elem[0] == '"' && elem[len - 1] == '"')
+	{
+		char	   *out = palloc(len);
+		size_t		o = 0;
+
+		for (size_t i = 1; i < len - 1; i++)
+		{
+			if (elem[i] == '"' && i + 1 < len - 1 && elem[i + 1] == '"')
+				i++;
+			out[o++] = elem[i];
+		}
+		out[o] = '\0';
+		name = out;
+	}
+	else
+		name = elem;
+	if (strlen(name) >= NAMEDATALEN)
+		name[pg_mbcliplen(name, strlen(name), NAMEDATALEN - 1)] = '\0';
+	if (strlen(app) >= NAMEDATALEN)
+		app[pg_mbcliplen(app, strlen(app), NAMEDATALEN - 1)] = '\0';
+	PG_RETURN_BOOL(pg_strcasecmp(name, app) == 0 || strcmp(name, "*") == 0);
+}
+
+static void
+switchover_unproven(const char *what, XLogRecPtr x)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_KINGRES_SWITCHOVER_UNPROVEN),
+			 errmsg("the switchover cannot be proven loss-free: %s", what),
+			 errdetail("Position given: %X/%X.", LSN_FORMAT_ARGS(x)),
+			 errhint("Treat the promotion of this node as a failover: rows that the old primary acknowledged after the last record this node has may be missing.")));
+}
+
+/*
+ * kingres.switchover_verify(shutdown_checkpoint pg_lsn, cluster_state text) returns bool
+ *
+ * The proof that a planned switchover loses nothing (S10-01).  The stopped old primary
+ * wrote nothing after its shutdown checkpoint if, and only if, it was shut down cleanly;
+ * so this node has every WAL record the old primary wrote when:
+ *
+ *	- the caller read "Database cluster state: shut down" from pg_controldata of the
+ *	  stopped node (only a clean shutdown writes that state, and then the checkpoint
+ *	  that the control file names is the last record of the node; this is the part
+ *	  that only the caller can see: the control file of the old node is on another
+ *	  machine); any other text raises KS006;
+ *	- the record at the position (pg_controldata's "Latest checkpoint location") is,
+ *	  in this node's own WAL, a shutdown checkpoint, and this node has replayed
+ *	  exactly up to the end of it: nothing before it is missing (WAL is contiguous)
+ *	  and nothing follows it.  The record is read here, not believed: a position of
+ *	  another node or timeline, one that is no record start, and a checkpoint that is
+ *	  not a shutdown checkpoint raise KS006.  After promotion the end of the record
+ *	  must be the point where this node left the timeline of the record.
+ *
+ * True: proven.  False: not yet (the record has not been replayed); ask again.  An
+ * error: it can never be proven, the caller handles the promotion as a failover.
+ */
+Datum
+kingres_switchover_verify(PG_FUNCTION_ARGS)
+{
+	XLogRecPtr	x;
+	char	   *state;
+	XLogReaderState *reader;
+	ReadLocalXLogPageNoWaitPrivate priv;
+	XLogRecord *record;
+	char	   *errormsg = NULL;
+	RmgrId		rmid;
+	uint8		info;
+	XLogRecPtr	end;
+	bool		is_shutdown_cp = false;
+	CheckPoint	cp;
+	MemoryContext oldcxt = CurrentMemoryContext;
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		ereport(ERROR,
+				(errcode(ERRCODE_KINGRES_SWITCHOVER_UNPROVEN),
+				 errmsg("the switchover cannot be proven loss-free: the position and the cluster state of the old primary are both required"),
+				 errhint("Pass \"Latest checkpoint location\" and \"Database cluster state\" from pg_controldata of the stopped old primary.")));
+	x = PG_GETARG_LSN(0);
+	state = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	if (strcmp(state, "shut down") != 0)
+		switchover_unproven(psprintf("the old primary's database cluster state is \"%s\", not \"shut down\": it did not stop cleanly",
+									 state), x);
+	if (x == InvalidXLogRecPtr)
+		switchover_unproven("the position is not valid", x);
+
+	/* A record starts at a multiple of 8, after the header of its page. */
+	if (x % 8 != 0 || !XRecOffIsValid(x))
+		switchover_unproven("no WAL record can start at this position", x);
+
+	memset(&priv, 0, sizeof(priv));
+	reader = XLogReaderAllocate(wal_segment_size, NULL,
+								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+										   .segment_open = &wal_segment_open,
+										   .segment_close = &wal_segment_close),
+								&priv);
+	if (reader == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of memory"),
+				 errdetail("Failed while allocating a WAL reading processor.")));
+	record = NULL;
+	PG_TRY();
+	{
+		XLogBeginRead(reader, x);
+		record = XLogReadRecord(reader, &errormsg);
+	}
+	PG_CATCH();
+	{
+		/* a segment that is gone, a page that cannot be read: not provable */
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(oldcxt);
+		edata = CopyErrorData();
+		FlushErrorState();
+		XLogReaderFree(reader);
+		switchover_unproven(psprintf("the WAL at this position cannot be read on this node: %s",
+									 edata->message), x);
+	}
+	PG_END_TRY();
+	if (record == NULL)
+	{
+		bool		not_yet = priv.end_of_wal;
+		char	   *msg = errormsg ? pstrdup(errormsg) : NULL;
+
+		XLogReaderFree(reader);
+		if (not_yet)
+			PG_RETURN_BOOL(false);
+		switchover_unproven(psprintf("no WAL record starts at this position on this node%s%s",
+									 msg ? ": " : "", msg ? msg : ""), x);
+	}
+	rmid = XLogRecGetRmid(reader);
+	info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
+	end = reader->EndRecPtr;
+	if (rmid == RM_XLOG_ID && info == XLOG_CHECKPOINT_SHUTDOWN &&
+		XLogRecGetDataLen(reader) >= sizeof(CheckPoint))
+	{
+		memcpy(&cp, XLogRecGetData(reader), sizeof(CheckPoint));
+		is_shutdown_cp = true;
+	}
+	XLogReaderFree(reader);
+
+	if (!is_shutdown_cp)
+		switchover_unproven("the record at this position is not a shutdown checkpoint", x);
+
+	if (RecoveryInProgress())
+	{
+		XLogRecPtr	replayed = GetXLogReplayRecPtr(NULL);
+
+		if (replayed < end)
+			PG_RETURN_BOOL(false);
+		if (replayed > end)
+			switchover_unproven(psprintf("this node has replayed WAL beyond the shutdown checkpoint (to %X/%X): something follows it",
+										 LSN_FORMAT_ARGS(replayed)), x);
+		PG_RETURN_BOOL(true);
+	}
+	else
+	{
+		/* Promoted: the record must be the very end of the timeline it was written on. */
+		List	   *history = readTimeLineHistory(GetWALInsertionTimeLine());
+		ListCell   *lc;
+
+		foreach(lc, history)
+		{
+			TimeLineHistoryEntry *e = (TimeLineHistoryEntry *) lfirst(lc);
+
+			if (e->tli != cp.ThisTimeLineID)
+				continue;
+			if (e->end == InvalidXLogRecPtr)
+				switchover_unproven("this node has not left the timeline of the shutdown checkpoint: it is not a promoted standby of the old primary", x);
+			if (e->end != end)
+				switchover_unproven(psprintf("this node left the timeline of the shutdown checkpoint at %X/%X, not at its end %X/%X: WAL follows it or is missing",
+											 LSN_FORMAT_ARGS(e->end), LSN_FORMAT_ARGS(end)), x);
+			PG_RETURN_BOOL(true);
+		}
+		switchover_unproven("the shutdown checkpoint is not on the history of this node's timeline", x);
+	}
+	PG_RETURN_BOOL(false);		/* not reached */
 }
 
 /*

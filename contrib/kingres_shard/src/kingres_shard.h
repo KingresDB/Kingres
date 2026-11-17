@@ -62,6 +62,48 @@
 #define ERRCODE_KINGRES_NOT_DURABLE MAKE_SQLSTATE('K','S','0','0','5')
 
 /*
+ * SQLSTATE of "this switchover cannot be proven loss-free" (ha.c, S10-01): the stopped
+ * old primary was not shut down cleanly, or the position given is not a shutdown
+ * checkpoint that this node has replayed as the last record of the old primary.  The
+ * caller treats the promotion as a failover (README, planned switchover).
+ */
+#define ERRCODE_KINGRES_SWITCHOVER_UNPROVEN MAKE_SQLSTATE('K','S','0','0','6')
+
+/*
+ * SQLSTATE of "a node accepted the session and did not answer within kingres_shard.node_timeout"
+ * (node_conn.c, S10-02).  The node is named in the message.  A caller must not repeat the call
+ * against that node: it probes the node and fences or restarts it.
+ */
+#define ERRCODE_KINGRES_NODE_TIMEOUT MAKE_SQLSTATE('K','S','0','0','7')
+
+/*
+ * SQLSTATE of "another call that changes the catalog is running here and did not end within
+ * node_timeout" (node_admin.c, S10-07): nothing was changed; repeat the call later.
+ */
+#define ERRCODE_KINGRES_BUSY MAKE_SQLSTATE('K','S','0','0','8')
+
+/*
+ * SQLSTATEs of the refusals of the high-availability calls that a control plane reacts to differently
+ * (S10-08).  Their texts are unchanged.  One code per reaction, not per sentence:
+ *   KS009  the node cannot commit: its synchronous standbys do not confirm; fix the list or the
+ *          standby, then repeat;
+ *   KS010  the call went to the wrong node (not the map group primary, superseded, another port,
+ *          not a copy of the map group); send it where the message and hint say;
+ *   KS011  the node is still in recovery: promote it in PostgreSQL first, then repeat;
+ *   KS012  the promotion would not be safe (a newer catalog term exists, or only a minority of the
+ *          groups can be reached): not a retry, a decision of the operator;
+ *   KS013  distributed transactions are in doubt: run recovery, wait until check_cluster() shows
+ *          none, repeat.
+ * The other refusals stay 55000: they are mistakes of the person who calls (a node that is not a
+ * standby, a node of another version) and no control plane reacts to them automatically.
+ */
+#define ERRCODE_KINGRES_CANNOT_COMMIT MAKE_SQLSTATE('K','S','0','0','9')
+#define ERRCODE_KINGRES_WRONG_NODE MAKE_SQLSTATE('K','S','0','1','0')
+#define ERRCODE_KINGRES_IN_RECOVERY MAKE_SQLSTATE('K','S','0','1','1')
+#define ERRCODE_KINGRES_UNSAFE_PROMOTION MAKE_SQLSTATE('K','S','0','1','2')
+#define ERRCODE_KINGRES_IN_DOUBT MAKE_SQLSTATE('K','S','0','1','3')
+
+/*
  * The text that starts the statement of every fragment of a distributed scan
  * (dist_scan.c).  A forwarded session runs a plain read of a distributed table
  * as the local rows of the table only when the statement carries it; without

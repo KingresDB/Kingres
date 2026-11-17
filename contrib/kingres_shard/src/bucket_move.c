@@ -238,7 +238,8 @@ ctl_run(CtlConn *cc, const char *sql, int timeout_ms)
 					ereport(ERROR,
 							(errcode(ERRCODE_QUERY_CANCELED),
 							 errmsg("timed out after %d ms waiting for node %s:%d",
-									timeout_ms, cc->host, cc->port)));
+									timeout_ms, cc->host, cc->port),
+							 errdetail("The node accepted the session and did not answer: %.100s", sql)));
 				rc = WaitLatchOrSocket(MyLatch,
 									   WL_LATCH_SET | WL_SOCKET_READABLE | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 									   PQsocket(cc->conn), Min(ms, 1000L), PG_WAIT_EXTENSION);

@@ -233,7 +233,7 @@ kingres_shard_refuse_if_superseded(void)
 
 	if (seen > cat->term)
 		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				(errcode(ERRCODE_KINGRES_WRONG_NODE),
 				 errmsg("this node has been superseded as the map group primary"),
 				 errdetail("Its catalog has term " INT64_FORMAT ", the cluster is at term " INT64_FORMAT ".",
 						   cat->term, seen),

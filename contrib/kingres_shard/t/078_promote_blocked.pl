@@ -93,4 +93,26 @@ sub loop_promote
 	like($a[-1], qr/"status": "already".*"blocked_by": \[\]/s, "[$prefix] once it is gone the next repeats end with already");
 }
 
+# --- the blocker changes between two calls (S10 "Not reproduced") -----------------------------
+# Each answer names what is in the way now, not what was in the way before: the first call names
+# one transaction, the operator ends it and another one appears, the next call names that one
+# and not the first, and when nothing is left the loop ends.
+{
+	my ($prefix, $n1, $n3, $s2, $id2) = setup();
+	$n3->safe_psql('postgres', "BEGIN; LOCK TABLE kingres.map_version IN ROW EXCLUSIVE MODE; PREPARE TRANSACTION 'first_in_the_way'");
+	# the first call promotes; the one after it finds what is in the way (as in the loop above)
+	$n1->safe_psql('postgres', "SELECT kingres.promote_node($id2)");
+	my $a1 = $n1->safe_psql('postgres', "SELECT kingres.promote_node($id2)");
+	like($a1, qr/"gid": "first_in_the_way", "class": "foreign"/, "[$prefix] the first call names the first transaction");
+	$n3->safe_psql('postgres', "ROLLBACK PREPARED 'first_in_the_way'");
+	$n3->safe_psql('postgres', "BEGIN; LOCK TABLE kingres.map_version IN ROW EXCLUSIVE MODE; PREPARE TRANSACTION 'second_in_the_way'");
+	my $a2 = $n1->safe_psql('postgres', "SELECT kingres.promote_node($id2)");
+	like($a2, qr/"gid": "second_in_the_way", "class": "foreign"/, "[$prefix] the next call names the second one");
+	unlike($a2, qr/first_in_the_way/, "[$prefix] and not the first, which is gone");
+	like($a2, qr/"final": false/, "[$prefix] it is not final");
+	$n3->safe_psql('postgres', "ROLLBACK PREPARED 'second_in_the_way'");
+	my @a = loop_promote($n1, $id2, 4);
+	like($a[-1], qr/"status": "already".*"blocked_by": \[\]/s, "[$prefix] once nothing is left the loop ends with already");
+}
+
 done_testing();
