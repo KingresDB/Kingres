@@ -19,6 +19,7 @@
 #include "access/htup_details.h"
 #include "access/tableam.h"
 #include "access/xlogreader.h"
+#include "catalog/pg_class.h"
 #include "executor/tuptable.h"
 #include "nodes/execnodes.h"
 #include "fmgr.h"
@@ -361,6 +362,8 @@ extern void kc_catalog_insert(Relation rel, const KcStripeInfo *si,
 extern int	kc_catalog_delete_uid(uint64 uid);
 extern int	kc_catalog_delete_stripe(uint64 uid, uint64 stripe_id);
 extern bool kc_catalog_uid_in_use(uint64 uid);
+extern uint64 kc_catalog_file_uid(Form_pg_class cl);
+extern bool kc_catalog_available(void);
 extern bool kc_catalog_all_visible(Relation rel, TransactionId oldest_xmin);
 extern uint64 kc_catalog_row_total(Relation rel, Snapshot snap, uint64 *stripes,
 								   uint64 *groups, uint64 *raw_bytes);
@@ -377,6 +380,8 @@ extern void kc_footer_free(KcFooter *f);
  */
 extern void kc_write_init(void);
 extern void kc_write_row(Relation rel, TupleTableSlot *slot, CommandId cid);
+extern void kc_write_rows(Relation rel, TupleTableSlot **slots, int nslots,
+						  CommandId cid);
 extern void kc_write_row_values(Relation rel, Datum *vals, bool *nulls,
 								CommandId cid);
 extern void kc_write_flush_relation(Relation rel);
@@ -384,6 +389,7 @@ extern void kc_write_discard_relation(Oid relid, bool *had_outer);
 extern void kc_write_set_frozen(Relation rel, bool frozen);
 extern void kc_write_set_maintenance(bool on);
 extern void kc_write_note_replaced(Relation rel);
+extern void kc_write_note_dropped(Oid relid);
 extern int	kc_write_cleanup_replaced(void);
 extern void kc_write_maintenance_flush(Relation rel);
 extern void kc_write_maintenance_discard(void);

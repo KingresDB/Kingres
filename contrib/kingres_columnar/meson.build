@@ -86,6 +86,9 @@ tests += {
       't/021_table_creation.pl',
       't/022_handover_window.pl',
       't/023_rewrite_cleanup.pl',
+      't/024_commit_window.pl',
+      't/025_memory_bound.pl',
+      't/026_random_cursors.pl',
     ],
   },
 }

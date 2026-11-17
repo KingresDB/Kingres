@@ -112,6 +112,19 @@ INSERT INTO s1 VALUES (1, 'other');
 SELECT kingres.columnar_set_options('s1', compression => 'none');
 SELECT kingres.columnar_compact('s1');
 SELECT * FROM kingres.columnar_stripe;
+-- the identity and the creation ids of a table are information about its content: they need SELECT on it
+SELECT kingres.columnar_identity('s1') IS NOT NULL AS has_identity;
+SELECT kingres.columnar_creating_xid('s1') IS NOT NULL AS has_creating_xid;
+SELECT kingres.columnar_table_xid('s1') IS NOT NULL AS has_table_xid;
+SELECT count(*) FROM kingres.columnar_stripes('s1');
+SELECT count(*) FROM kingres.columnar_options('s1');
+SELECT stripes FROM kingres.columnar_info('s1');
+RESET ROLE;
+-- a role with SELECT may ask
+SET ROLE regress_kc_reader;
+SELECT kingres.columnar_identity('s1') IS NOT NULL AS has_identity;
+SELECT kingres.columnar_creating_xid('s1') IS NOT NULL AS has_creating_xid;
+SELECT kingres.columnar_table_xid('s1') IS NOT NULL AS has_table_xid;
 RESET ROLE;
 
 -- ownership: the new owner may change the options

@@ -62,7 +62,16 @@ and use `kingres.columnar_compact` afterwards.
 | `kingres.columnar_reconcile()` | Superuser. Deletes catalog rows of files no relation uses (it reads the first block of every columnar file of the database). A row that another session is deleting or has deleted is left to it, never an error. |
 | `kingres.columnar_identity(rel)`, `kingres.columnar_creating_xid(rel)`, `kingres.columnar_table_xid(rel)` | The identity of the stored content, the id of the transaction that created the file (2 once frozen) and the id that stands for the creation of the table (0 when it is not known, 2 once frozen): what the metapage holds (see "On-disk format"). |
 
-`SELECT` privilege on the table is needed for `columnar_options`, `columnar_info` and `columnar_stripes`.
+`SELECT` privilege on the table is needed for `columnar_options`,
+`columnar_info`, `columnar_stripes`, `columnar_identity`, `columnar_creating_xid`
+and `columnar_table_xid`: the last three return a stable identifier of the
+stored content and transaction ids, which say when the table was made and
+rewritten.  PostgreSQL's size functions (`pg_relation_size`) ask for nothing
+because they return a size; these return identifiers of a table's content, so
+they ask for what reading the table asks for, as `columnar_info` and
+`columnar_stripes` already did (a role without the privilege gets "permission
+denied for table", tested in `columnar_security`).  `columnar_set_options` and
+`columnar_compact` need ownership.
 
 ### Settings
 
@@ -72,7 +81,7 @@ and use `kingres.columnar_compact` afterwards.
 | `kingres_columnar.compression_level` | 3 | zstd level (1 to 19); lz4 and pglz ignore it. |
 | `kingres_columnar.stripe_row_count` | 150000 | Rows of a full stripe (1000 to 10000000). |
 | `kingres_columnar.chunk_row_count` | 10000 | Rows of a chunk group (100 to 100000). A group also ends when its raw size reaches 32 MB. |
-| `kingres_columnar.write_buffer_memory` | 128MB | Memory for the rows of stripes being built, per backend, all tables together (1MB to the largest value). A bound with stated exceptions, see "Memory and costs": the buffers are written as soon as they are over it and the running subtransaction may write them. A buffer that a running scan reads is never flushed under it. A flush that memory asks for writes whole buffers, the largest first, and a buffer is written alone only when it has `max(chunk_row_count, 1000)` rows or half of this memory, so the stripes of a table do not depend on how its rows were grouped into subtransactions. |
+| `kingres_columnar.write_buffer_memory` | 128MB | Memory for the rows of stripes being built, per backend, all tables together (1MB to the largest value). A soft limit with a hard ceiling of twice this value, see "Memory and costs": the buffers are written as soon as they are over it and the running subtransaction may write them, and a write that would go on from above the ceiling is refused with an error. A buffer that a running scan reads is never flushed under it. A flush that memory asks for writes whole buffers, the largest first, and a buffer is written alone only when it has `max(chunk_row_count, 1000)` rows or half of this memory, so the stripes of a table do not depend on how its rows were grouped into subtransactions. |
 | `kingres_columnar.max_stripe_rows` | 10000000 | Developer setting, superuser only: lowers the most rows the writer puts in one stripe (and the size above which `columnar_check` reports a stripe), so the limit can be tested with a few thousand rows. It cannot raise the compiled limit and does not touch the reader, so no value can make a table unreadable. |
 | `kingres_columnar.fault_point`, `kingres_columnar.fault_nth` | off, 0 | Developer settings, superuser only, present only when the server is built with assertions (`USE_ASSERT_CHECKING`): make the nth allocation of the write path (`alloc`), the nth relation of a subtransaction's hand-over to its parent (`merge`) or the nth relation of a flush (`flush`) fail once with "out of memory". Used by `t/016_atomic_handover.pl`; absent from production builds. |
 | `kingres_columnar.enable_custom_scan` | on | Use the Columnar Scan (projection, skipping). |
@@ -250,23 +259,50 @@ that lock cancels conflicting queries), deletes catalog rows of dead files and
 resets the insert counters so autovacuum does not repeat. Space in the middle
 of the file is not reused: pages of rolled-back or crashed loads and of stripes
 replaced by `columnar_compact` stay until they are at the end or the table is
-rewritten with `VACUUM FULL`. The catalog rows of the old file of a rewrite
-(`VACUUM FULL`, a rewriting `ALTER TABLE`, a change of access method,
-`REFRESH MATERIALIZED VIEW`) are deleted by the transaction that replaced the
-file, at the end of the `ALTER TABLE` command or at its pre-commit, and come
-back if it rolls back, so `columnar_check` has nothing to report afterwards. The
-access method is told when a table gets a new file (a rewrite creates a
-transient table, and for a change away from columnar the `table_rewrite` event
-trigger names the table), keeps the identity of the file each such table had in
-the transaction, and removes the rows of exactly those files whose table has
-another file by then: the cost is that of what the command did, it is the same
-for an `ALTER TABLE` of any table in a database with ten or five thousand
-columnar tables, and two commands on different tables share no row, so neither
-waits for the other. A row that another session deleted meanwhile (`VACUUM`,
-`columnar_reconcile()`) is already gone and not an error; one that it is
-deleting is left to it. A `DROP TABLE` removes the rows of its files at once
-(by `columnar_reconcile`, which reads the first block of every columnar file),
-and `VACUUM` removes the rows of any file that is left (a crash, a restore).
+rewritten with `VACUUM FULL`.
+
+How the stripe rows of a file that goes away are removed.  Correctness never
+depends on an event trigger firing; the triggers are only a way to do it earlier.
+The access method itself learns that a file goes away: it hooks the drop of a
+relation (an object access hook), and every way a columnar file is replaced or
+dropped ends in the drop of a relation that holds it: `DROP TABLE`, `DROP
+SCHEMA`, `DROP OWNED`, `DROP EXTENSION`, and every rewrite (`VACUUM FULL`, a
+rewriting `ALTER TABLE`, a change of access method in either direction,
+`REFRESH MATERIALIZED VIEW`), which makes a transient table, swaps the files and
+drops the transient table, which then holds the OLD file, whatever access method
+the table has become.  The hook notes the identity of that file (read from its
+first block) in the memory of the transaction, for the subtransaction that
+dropped it (a rollback to a savepoint takes the note back, a release hands it to
+the parent).  The stripe rows of the noted files whose relation is gone, or has
+another file by then, are deleted by the transaction that dropped them, at the
+latest at its pre-commit or pre-prepare, and come back if it rolls back.  A note
+of a file that is still in use (a drop that was rolled back, a rewrite that
+failed) deletes nothing.  The two event triggers (`DROP`, and `ALTER TABLE`) call
+the same cleanup at the end of the command, so that `columnar_check` has nothing
+to report inside the transaction either; without them (`event_triggers = off`,
+a trigger disabled, single-user mode, a database whose install script is an
+earlier one) the rows are removed at the commit instead, which is tested for
+every command above (`t/023_rewrite_cleanup.pl`).  The cost is that of the
+files the command replaced, the same for an `ALTER TABLE` or a `DROP TABLE` in a
+database with ten or five thousand columnar tables, and two commands on
+different tables share no row, so neither waits for the other.  A row that
+another session deleted meanwhile (`VACUUM`, `columnar_reconcile()`) is already
+gone and not an error; one that it is deleting is left to it.  `VACUUM`,
+`columnar_check(true)` and `columnar_reconcile()` remove the rows of any file
+that is left (a crash, a restore) and read the first block of every columnar
+file; leftover rows can never be mistaken for the stripes of a later file,
+because a new file draws an identity that no row of the catalog, live or dead,
+has.  A database whose install script is an earlier one (it has a
+`table_rewrite` trigger and an `ALTER TABLE` trigger that runs the full
+reconcile after every `ALTER TABLE`, or lacks the newer functions) works fully:
+the cleanup is done by the access method, its old triggers only add the cost of
+the full reconcile.  To get the current trigger functions, run the `CREATE
+FUNCTION columnar_on_drop()` and `CREATE FUNCTION columnar_check_ddl()`
+statements of `kingres_columnar--0.1.sql` as `CREATE OR REPLACE FUNCTION`, as
+superuser; the old `table_rewrite` trigger can stay (it only names a file that
+the access method names itself, and `columnar_note_rewrite` is still there for
+it; tested in `t/023`).  The stripe catalog of an earlier shape is refused
+with the statement that repairs it, as before.
 
 `ANALYZE` samples blocks: a page of a stripe stands for the rows at the same
 relative position in the stripe. It ignores rows buffered by the running
@@ -380,39 +416,96 @@ Memory and costs worth knowing:
   stripe is full, the buffers are over `kingres_columnar.write_buffer_memory`
   (A) or the transaction ends.  What counts is memory, not payload: the space
   of every by-reference value (its chunk in the allocator, header and rounding
-  included) and of the arrays of row slots (their capacity), per buffer, and a
-  buffer's memory context takes blocks of at most 1 MB, so what the allocator
-  holds beyond that is less than one block per buffer.  The bound, measured
-  as the memory contexts of the buffers after every statement and every
-  subtransaction (`t/017_stripe_sizes.pl`, rows of 200 bytes and of 100 kB, one
-  statement at a time, in loops of exception blocks, three levels deep, with a
-  cursor open, over 24 tables):
-  * the buffers of the running (sub)transaction are written, the largest
-    first, as soon as the buffers together are over A, so after every row they
-    hold at most A and the row being written (and the allocator's slack of
-    the last block of each buffer, below 1 MB each);
-  * rows of enclosing subtransactions (savepoints, exception blocks) cannot be
-    written by an inner one, because a stripe carries the id of the
-    subtransaction that writes it and the rows would be lost with an abort of
-    the inner one.  They count against A, and the inner level writes its own
-    buffers when the buffers together are over A, but a buffer of less than
-    `max(chunk_row_count, 1000)` rows and half of A is written only while the
-    flushable buffers together are half of A, so that a few rows are never made
-    a stripe because outer levels hold the memory.  An open level that holds
-    rows adds less than half of A to the bound, one such level per level of
-    nesting that holds rows;
+  included), the arrays of row slots (their capacity), and 2 kB for every
+  buffer that exists (its context and header, which an empty buffer still
+  holds), so the number of buffers, whether levels of subtransaction, relations,
+  partitions or buffers that cursors keep apart, is part of the bound and not
+  beside it.  One accounting covers the whole backend.  **The bound**, which
+  follows from the setting alone: with A = `write_buffer_memory` and R the bytes
+  of the row being written,
+  * the buffers hold at most 2A + R after every write (the ceiling, twice the
+    allowance, enforced where a row is added: a write that finds more than 2A
+    held, after writing everything that may be written, is refused with the
+    error "the write buffers of columnar tables hold N bytes, more than the
+    limit of M bytes", whatever the number of subtransaction levels, cursors,
+    relations and partitions) and at most A when everything they hold may be
+    written;
+  * for the length of the commit of a subtransaction its rows exist twice (the
+    copy in the parent's buffer and the original), so the buffers hold at most
+    2 * (2A + R) between the two phases of the hand-over; a hand-over that would
+    leave more than 2A in the parent is refused (the subtransaction aborts
+    cleanly);
+  * the memory the backend takes is at most 2 * (2A + R) for the buffers (the
+    allocator's blocks, at most 1 MB each, add up to as much as the rows),
+    + (2A + R) for the rows of a committing subtransaction, + S for the stripe
+    being built (the compressed bytes and a chunk of at most 32 MB raw; it
+    depends on the stripe size and the width of the rows, not on A, and is not
+    counted) + what the backend needs to run the statements.  Measured as the
+    peak size of the backend (`VmPeak`), not by a counter of the extension
+    (`t/025_memory_bound.pl`): 60 nested levels of 3.6 MB under A = 8 MB grew
+    the backend by 19 MB (206 MB held before the limit existed), 40 cursors
+    22 MB (114 MB before), 1 500 partitions and 1 500 tables of one or five rows
+    under A = 1 MB by 1 to 2 MB more than the same load into heap tables, rows
+    of 5 MB under 8 MB by 40 MB (a stripe being built);
+  * what is written, and when.  The buffers of the running (sub)transaction are
+    written, the largest first, as soon as the buffers together are over A, so
+    when everything may be written they hold at most A and the row being
+    written; an empty buffer left over is freed with the state of its relation
+    (the next row makes them again).  Rows of enclosing subtransactions
+    (savepoints, exception blocks) cannot be written by an inner one: a stripe
+    carries the id of the subtransaction that writes it, and the rows would be
+    lost with an abort of the inner one (the earlier rounds' hand-over writes
+    the parent's rows from the committing child only because the rows stay in the
+    buffer until the child's id is the parent's).  A write that is refused at
+    the ceiling is therefore the answer where writing cannot help, and it is
+    exact: the transaction can release or commit its levels, close its cursors,
+    or raise the setting.  A buffer of less than `max(chunk_row_count, 1000)`
+    rows and half of A is written only while the flushable buffers together
+    are half of A, so that a few rows are never made a stripe because outer
+    levels hold the memory;
   * a cursor on the table holds the buffers that had rows when it began (they
     are read by position and are neither written nor merged under it, and take
-    no more rows); rows written after that go to a buffer of their own that
-    is written under A.  The held rows count against A, so the bound is A plus
-    what the cursor holds, which is what the table had buffered when it
-    began; the buffers are joined again for the last flush at commit;
+    no more rows); rows written after that go to a buffer of their own that is
+    written under A.  The held rows count against the ceiling, which bounds
+    the number of cursors that can hold rows at once by it;
   * for the length of the commit of a subtransaction its buffers of less than
-    half of A exist twice (they are copied into the parent's buffer before
-    the original is freed); a bigger one is written by the subtransaction
-    itself instead of being copied when the copy would take the memory over A;
-  * a flush needs memory of its own to build a stripe (the compressed bytes and
-    a chunk of at most 32 MB raw), which is not counted.
+    half of A exist twice, as above; a bigger one is written by the
+    subtransaction itself instead of being copied when the copy would take
+    the memory over A.
+  The stripes of a table depend on the data and the options, not on the grouping
+  into subtransactions, except where the bound forces a flush: when the buffers
+  are over A and the running subtransaction may write them (the largest first),
+  when a hand-over leaves more than A, and (with a stripe of one row or more,
+  never more than the stripe size) for rows written after the commit-time
+  flush, below.
+
+* Rows that reach the access method after its own commit-time flush.  The access
+  method writes every buffer in its pre-commit (and pre-prepare) callback.
+  PostgreSQL runs callbacks of other modules that were registered earlier (a
+  module listed before this one in `shared_preload_libraries`) after it, and
+  they may run SQL.  Everything that can write after the flush and before the
+  commit record is: such callbacks (`XACT_EVENT_PRE_COMMIT`, `PRE_PREPARE`;
+  in a parallel worker a write is refused); the callbacks of a committing
+  subtransaction that run after the first phase of its hand-over (see below);
+  and nothing else in `CommitTransaction` and `PrepareTransaction`: deferred
+  triggers and portals run before the callbacks, `PreCommit_on_commit_actions`
+  acts only on temporary tables (a columnar table cannot be temporary or
+  unlogged, so `ON COMMIT DELETE ROWS` and `ON COMMIT DROP` never reach one),
+  and the notify, large object and serializable steps write no tables.  A row
+  written from then on is written to a stripe at once (write-through), in the
+  caller's memory and outside the buffers, so it is committed with its
+  transaction whatever the order of the libraries; a `COPY` or a multi-row
+  insert is one stripe per batch, and a single row is a stripe of one row
+  (correct, and rare; `VACUUM` and `columnar_compact` join small stripes).  A
+  delete or an update is refused with an error, as always (the table is
+  append-only).  A write after the point where the transaction state is no
+  longer "in progress" (`XACT_EVENT_COMMIT`, `SUBXACT_EVENT_COMMIT_SUB`) is
+  refused with an error and never dropped silently; an error in
+  `SUBXACT_EVENT_COMMIT_SUB`, which PostgreSQL treats as the abort of a
+  subtransaction that has committed, is the one thing this extension cannot
+  undo for the rows it has already handed to the parent, and no module should
+  raise one.  Tested with the probe module and a heap twin, both load orders, on
+  both majors (`t/024_commit_window.pl`).
 
 * The rows of a committing subtransaction are handed to its parent in two
   phases (see `kc_write.c`): everything that can fail (memory, the flush) is
@@ -432,9 +525,16 @@ Memory and costs worth knowing:
   reader there sees only the part of each buffer that is not in a stripe (one
   definition of the visible part of a buffer, used by every reader); PostgreSQL
   itself runs nothing between the phases, but a callback of another extension
-  can: a read there sees each row once, a write to a table whose rows are being
-  handed over is refused with an error (and the subtransaction aborts cleanly),
-  and a cursor opened there cannot go on after the phases are done and says so,
+  can: a read there sees each row once, a write to any table (the one whose
+  rows are being handed over or another) is written to a stripe at once, as
+  above, and no buffer is touched: from the moment a buffer is prepared until
+  it is published or dropped, nothing flushes, frees, moves or adds to it (no
+  chooser of a victim for the memory limit, no flush of a relation, no join of
+  buffers sees it as flushable), which the production build keeps as well as the
+  one with assertions (`t/022_handover_window.pl`, run on a server built without
+  assertions as well: a write to other tables under memory pressure in the
+  window gave 7000 rows for 4000 before); a truncate of a table whose rows are
+  being handed over, that no SQL can reach, is refused with an error; and a cursor opened there cannot go on after the phases are done and says so,
   rather than read other rows than it began with.  Whatever flush comes next
   cuts a buffer into stripes of at most the table's stripe size (and never above
   10000000 rows, `KC_MAX_STRIPE_ROWS`, the one definition the writer, the option
@@ -486,7 +586,7 @@ make USE_PGXS=1 installcheck       # needs a server with the library preloaded
 
 or `kingres/dev/ext.sh kingres_columnar` and `kingres/dev/ext-majors.sh
 kingres_columnar` for PostgreSQL 18 and 19. The tests are eleven `pg_regress`
-files (`sql/`, `expected/`) and twenty-three TAP files in `t/`: crash recovery,
+files (`sql/`, `expected/`) and twenty-six TAP files in `t/`: crash recovery,
 standby and `pg_rewind`, backup/restore/dump, concurrent writers, corruption,
 a randomised comparison against heap (`KC_COMPARE_SEED`, `KC_COMPARE_STEPS`),
 older snapshots, array validation, serializable isolation against heap twins,
@@ -497,10 +597,17 @@ grouping, row width and cursor (`t/017`), the maintenance commands against
 older snapshots, tables older and younger than a snapshot (`t/019`) and the
 creation of a table from every source (`t/021`), limits and flags, a reader or
 writer between the two phases of a hand-over (`t/022`), the cleanup after a
-rewrite, concurrent commands and a stripe catalog of the earlier shape
-(`t/023`), and two laps of the transaction id space.
+rewrite (also with event triggers off or disabled, in single-user mode and in a
+database made by an earlier script), concurrent commands and a stripe catalog of
+the earlier shape (`t/023`), a callback of another module that writes after the
+access method's own commit-time flush, in both load orders, against a heap twin
+(`t/024`), the bound on the memory of the write buffers measured as the memory of
+the backend, for levels of subtransaction, cursors, relations, partitions and wide
+rows (`t/025`), a seeded random comparison with heap of cursors, savepoints and
+writes under memory pressure (`t/026`; `KC_FUZZ_SEED`, `KC_FUZZ_EPISODES`), and
+two laps of the transaction id space.
 
-Three files do not run everywhere, and say why when they are skipped:
+Four files do not run everywhere, and say why when they are skipped:
 
 * `t/016_atomic_handover.pl` needs the developer settings `fault_point` and
   `fault_nth`, which exist only in a server built with assertions
@@ -512,8 +619,12 @@ Three files do not run everywhere, and say why when they are skipped:
   PostgreSQL tree and takes minutes; `KC_SKIP_WRAPAROUND=1` skips it.  The
   freezing of the ids of the metapage is also tested without it, in
   `t/021_table_creation.pl`;
-* `t/022_handover_window.pl` builds the probe module `t/kcprobe/kcprobe.c` with
-  the compiler and headers of the installation (`pg_config`), and is skipped,
-  with that reason, where it cannot.
+* `t/022_handover_window.pl` and `t/024_commit_window.pl` build the probe module
+  `t/kcprobe/kcprobe.c` (callbacks at the end of a subtransaction and at the
+  pre-commit and pre-prepare, which run SQL from the setting `kcprobe.sql` or
+  `kcprobe.commit_sql`) with the compiler and headers of the installation
+  (`pg_config`), and are skipped, with that reason, where they cannot;
+* `t/025_memory_bound.pl` reads `/proc/self/status` and is skipped where there is
+  no `/proc`.
 
 `perf/perf.sh` measures size and scan time against heap.

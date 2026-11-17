@@ -3,7 +3,8 @@
 # C5-03.  A reader or a writer that runs between the two phases of the hand-over
 # of a subtransaction's buffers to its parent (a callback of another extension
 # at the end of the subtransaction, which PostgreSQL itself never has) must see
-# every row once, and a write there must not be lost or doubled: it is refused.
+# every row once, and a write there must not be lost or doubled: it goes to a
+# stripe at once and touches no prepared buffer (C6-01, C6-02: section 5).
 # The defect: phase one writes the stripes the parent's buffer calls for and
 # leaves the rows in the buffers until phase two, so a reader in the window
 # found the rows twice (2002 for 1002), and a write took the branch of phase two
@@ -153,13 +154,15 @@ SELECT 'FINAL=' || count(*) || ' ' || sum(a) FROM p;");
 }
 
 # ------------------------------------------------------------------------
-# 2. A write in the window to a table whose rows are being handed over is
-#    refused cleanly; the subtransaction is rolled back, the parent's rows stay
+# 2. A write in the window to a table whose rows are being handed over goes to
+#    a stripe at once (C6-01, C6-02): the buffers that are prepared are not
+#    touched, so the row is neither lost nor doubled, and the child's rows and
+#    the parent's are all there once
 # ------------------------------------------------------------------------
 foreach my $c ([999, 3], [5, 3], [2500, 700])
 {
 	my ($np, $nc) = @$c;
-	my $sumnp = $np * ($np + 1) / 2;
+	my $sumnp = $np * ($np + 1) / 2 + $nc * 10000 + $nc * ($nc + 1) / 2 - 1;
 	fresh(1000, 100);
 	my ($out, $err) = script("
 BEGIN;
@@ -175,10 +178,51 @@ SET kcprobe.sql = '';
 SELECT 'IN=' || count(*) || ' ' || coalesce(min(a), 0) FROM p;
 COMMIT;
 SELECT 'FINAL=' || count(*) || ' ' || sum(a) FROM p;");
-	like($err, qr/caught: columnar table "p" cannot be written while a subtransaction is being committed/,
-		"parent $np, child $nc: a write between the phases is refused");
-	like($out, qr/IN=$np 1\b/, "... the parent's rows are all there, no row of the child, nothing doubled");
-	like($out, qr/FINAL=$np $sumnp\b/, "... and the commit writes each of them once");
+	unlike($err, qr/caught|ERROR/, "parent $np, child $nc: a write between the phases is not refused");
+	my $all = $np + $nc + 1;
+	like($out, qr/IN=$all -1\b/, "... the parent's rows, the child's and the late row are all there, nothing doubled");
+	like($out, qr/FINAL=$all $sumnp\b/, "... and the commit keeps each of them once");
+}
+
+# an error in the window after a write-through aborts the subtransaction with the stripe
+{
+	fresh(1000, 100);
+	my ($out, $err) = script("
+BEGIN;
+INSERT INTO p SELECT generate_series(1, 20);
+SET kcprobe.sql = 'INSERT INTO p VALUES (-1); SELECT 1/0';
+DO \$\$ BEGIN
+  BEGIN
+    INSERT INTO p SELECT generate_series(10001, 10005);
+  EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'caught: %', sqlerrm;
+  END;
+END \$\$;
+SET kcprobe.sql = '';
+COMMIT;
+SELECT 'FINAL=' || count(*) || ' ' || sum(a) FROM p;");
+	like($err, qr/caught: division by zero/, 'a failing callback in the window');
+	like($out, qr/FINAL=20 210\b/, '... aborts the subtransaction with its rows and the late row: the parent keeps its own');
+}
+
+# a truncate of the table in the window empties it, as heap does: the prepared
+# rows belong to the old file and are not read, whatever the hand-over then does
+{
+	fresh(1000, 100);
+	my ($out, $err) = script("
+BEGIN;
+INSERT INTO p SELECT generate_series(1, 20);
+SET kcprobe.sql = 'TRUNCATE p';
+DO \$\$ BEGIN
+  BEGIN
+    INSERT INTO p SELECT generate_series(10001, 10005);
+  EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'caught: %', sqlerrm;
+  END;
+END \$\$;
+SET kcprobe.sql = '';
+COMMIT;
+SELECT 'FINAL=' || count(*) FROM p;");
+	unlike($err, qr/caught|ERROR/, 'a truncate between the phases: no error');
+	like($out, qr/FINAL=0\b/, '... and the table is empty at the end, as it is for heap');
 }
 
 # a write to a table the subtransaction did not write in the window is fine
@@ -292,6 +336,68 @@ SELECT 'N=' || count(*) FROM tw;");
 	cmp_ok($peak, '<=', $A + 2 * 1024 * 1024,
 		"300 children of one wide row: $peak bytes at the busiest window, within the allowance and a copy of one row");
 	like($out, qr/N=380\b/, '... and the rows are all there');
+}
+
+# ------------------------------------------------------------------------
+# 5. C6-02: a write to ANOTHER columnar table in the window, under memory
+#    pressure, must not flush the buffer that is prepared for the hand-over.
+#    The defect: the memory pressure flush chose the prepared child buffer (it
+#    was flushable), wrote it as a stripe, and phase two then published rows
+#    that were in a stripe already: an assertion failure, and without
+#    assertions the child's rows twice (7000 rows for 4000).
+#    The invariant: from the moment a buffer is prepared until it is published
+#    or dropped, nothing flushes, frees, moves or adds to it.
+# ------------------------------------------------------------------------
+{
+	$node->safe_psql('postgres', q{
+DROP TABLE IF EXISTS pp, q1, q2, q3, hp, hq;
+CREATE TABLE pp (id int, pad text) USING columnar;
+CREATE TABLE q1 (id int, pad text) USING columnar;
+CREATE TABLE q2 (id int, pad text) USING columnar;
+CREATE TABLE q3 (id int, pad text) USING columnar;
+CREATE TABLE hp (id int, pad text);
+CREATE TABLE hq (id int, pad text);
+SELECT kingres.columnar_set_options('pp', stripe_row_count => 100000);});
+	my $probe = join('; ', map {
+		"INSERT INTO $_ SELECT g, repeat(\$\$z\$\$, 1000) FROM generate_series(1, 2200) g" } qw(q1 q2 q3));
+	my $scenario = sub
+	{
+		my ($tbl, $set) = @_;
+		return "
+SET kingres_columnar.write_buffer_memory = '8MB';
+BEGIN;
+INSERT INTO $tbl SELECT g, repeat('x', 1000) FROM generate_series(1, 1000) g;
+SAVEPOINT s;
+INSERT INTO $tbl SELECT g + 100000, repeat('y', 1000) FROM generate_series(1, 3000) g;
+$set
+RELEASE s;
+SET kcprobe.sql = '';
+SELECT 'IN=' || count(*) || '/' || count(DISTINCT id) FROM $tbl;
+COMMIT;
+SELECT 'FINAL=' || count(*) || '/' || count(DISTINCT id) FROM $tbl;";
+	};
+	my ($out, $err) = script($scenario->('pp', "SET kcprobe.sql = '$probe';"));
+	unlike($err, qr/TRAP|server closed|ERROR/, 'a write to other tables in the window under memory pressure: no error, no assertion failure');
+	like($out, qr/IN=4000\/4000/, '... the table being handed over has each row once inside the transaction');
+	like($out, qr/FINAL=4000\/4000/, '... and after the commit');
+	is($node->safe_psql('postgres', 'SELECT (SELECT count(*) FROM q1) || \'/\' || (SELECT count(*) FROM q2) || \'/\' || (SELECT count(*) FROM q3)'),
+		'2200/2200/2200', '... and the tables written in the window have all their rows, once');
+	is($node->safe_psql('postgres', "SELECT sum(row_count) FROM kingres.columnar_stripes('pp')"), 4000,
+		'... the stripes of the table hold 4000 rows, not 7000');
+
+	# the same against the heap twin: the same counts
+	($out, $err) = script($scenario->('hp', ''));
+	like($out, qr/FINAL=4000\/4000/, 'the heap twin of the scenario: 4000 rows');
+
+	# the window is also safe when the other tables are written by a statement that
+	# reads the table being handed over
+	$node->safe_psql('postgres', 'TRUNCATE pp, q1, q2, q3');
+	($out, $err) = script($scenario->('pp',
+		"SET kcprobe.sql = 'INSERT INTO q1 SELECT g, repeat(\$\$z\$\$, 1000) FROM generate_series(1, 6000) g; INSERT INTO q2 SELECT id, pad FROM pp';"));
+	unlike($err, qr/TRAP|ERROR/, 'a write to another table that also reads the table being handed over: no error');
+	like($out, qr/FINAL=4000\/4000/, '... the table has each row once');
+	is($node->safe_psql('postgres', 'SELECT (SELECT count(*) FROM q1) || \'/\' || (SELECT count(*) FROM q2)'),
+		'6000/4000', '... and the other tables got what the callback wrote');
 }
 
 $node->stop;

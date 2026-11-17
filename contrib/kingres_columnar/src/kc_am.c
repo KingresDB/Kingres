@@ -337,9 +337,9 @@ kc_multi_insert(Relation rel, TupleTableSlot **slots, int nslots, CommandId cid,
 	int			i;
 
 	kc_require_rmgr();
+	kc_write_rows(rel, slots, nslots, cid);
 	for (i = 0; i < nslots; i++)
 	{
-		kc_write_row(rel, slots[i], cid);
 		slots[i]->tts_tableOid = RelationGetRelid(rel);
 		kc_set_insert_tid(slots[i]);
 	}

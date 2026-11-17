@@ -809,6 +809,39 @@ kc_uid_of_file(Form_pg_class cl, bool *unknown)
 }
 
 /*
+ * The identity of the file a pg_class row names, or 0 when it has none or the
+ * first block is not a metapage of ours.  For the object access hook, which
+ * sees a relation that is being dropped (a table, or the transient table that
+ * holds the old file of a rewrite) and must note which stored content goes
+ * with it.
+ */
+uint64
+kc_catalog_file_uid(Form_pg_class cl)
+{
+	bool		unknown = false;
+
+	return kc_uid_of_file(cl, &unknown);
+}
+
+/*
+ * Is the stripe catalog there?  The cleanup of replaced files runs at commit,
+ * and a transaction that drops the extension has no catalog left to clean:
+ * its rows went with the table.
+ */
+bool
+kc_catalog_available(void)
+{
+	Oid			extoid = get_extension_oid(KC_EXTENSION_NAME, true);
+	Oid			nspoid;
+
+	if (!OidIsValid(extoid))
+		return false;
+	nspoid = get_extension_schema(extoid);
+	return OidIsValid(get_relname_relid(KC_CATALOG_NAME, nspoid)) &&
+		OidIsValid(get_relname_relid(KC_CATALOG_PKEY, nspoid));
+}
+
+/*
  * A table access method has no callback at DROP, and a rewrite leaves the old
  * file's rows behind, so the rows whose stored content no relation owns any
  * more are removed here: after a drop, at the end of VACUUM, and by

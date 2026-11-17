@@ -146,10 +146,9 @@ SELECT count(*) AS catalog_rows FROM kingres.columnar_stripe;
 -- the event triggers are always enabled
 SELECT evtname, evtevent, evtenabled FROM pg_event_trigger
  WHERE evtname LIKE 'kingres\_columnar%' ORDER BY evtname;
-           evtname           |    evtevent     | evtenabled 
------------------------------+-----------------+------------
- kingres_columnar_check_ddl  | ddl_command_end | A
- kingres_columnar_on_drop    | sql_drop        | A
- kingres_columnar_on_rewrite | table_rewrite   | A
-(3 rows)
+          evtname           |    evtevent     | evtenabled 
+----------------------------+-----------------+------------
+ kingres_columnar_check_ddl | ddl_command_end | A
+ kingres_columnar_on_drop   | sql_drop        | A
+(2 rows)
 
