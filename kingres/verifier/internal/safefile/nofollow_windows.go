@@ -52,7 +52,7 @@ func openNoFollow(path string, flag int, perm os.FileMode) (*os.File, error) {
 	}
 	if info.FileAttributes&fileAttributeReparse != 0 {
 		_ = syscall.CloseHandle(h)
-		return nil, fmt.Errorf("%s %w", clipPath(path), ErrLink)
+		return nil, fmt.Errorf("%s %w", path, ErrLink)
 	}
 	return os.NewFile(uintptr(h), path), nil
 }

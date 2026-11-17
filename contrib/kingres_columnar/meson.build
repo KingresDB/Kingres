@@ -89,6 +89,10 @@ tests += {
       't/024_commit_window.pl',
       't/025_memory_bound.pl',
       't/026_random_cursors.pl',
+      't/027_ending_writes.pl',
+      't/028_orphan_rows.pl',
+      't/029_chain_parallel_backup.pl',
+      't/030_late_stripes.pl',
     ],
   },
 }

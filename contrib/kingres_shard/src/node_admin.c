@@ -407,14 +407,13 @@ push_secret(KsConn *kc)
  * cluster secret with it (made first if this node has none: the step that
  * secures a cluster upgraded from 0.1).
  */
-Datum
-kingres_sync_catalog(PG_FUNCTION_ARGS)
+static Datum
+kingres_sync_catalog_body(PG_FUNCTION_ARGS)
 {
 	const KsCatalog *cat;
 	ListCell   *lc;
 	List	   *targets = NIL;
 
-	kingres_shard_control_begin();
 	kingres_shard_lock_catalog();
 	kingres_shard_require_map_group();
 	require_primaries_can_commit();
@@ -461,6 +460,12 @@ kingres_sync_catalog(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+Datum
+kingres_sync_catalog(PG_FUNCTION_ARGS)
+{
+	return kingres_shard_control_call(kingres_sync_catalog_body, fcinfo);
+}
+
 /*
  * kingres.rotate_secret() returns void
  *
@@ -475,8 +480,8 @@ kingres_sync_catalog(PG_FUNCTION_ARGS)
  * secret, or a copy of a node that left the control of the operator, is made
  * useless.
  */
-Datum
-kingres_rotate_secret(PG_FUNCTION_ARGS)
+static Datum
+kingres_rotate_secret_body(PG_FUNCTION_ARGS)
 {
 	const KsCatalog *cat;
 	ListCell   *lc;
@@ -486,7 +491,6 @@ kingres_rotate_secret(PG_FUNCTION_ARGS)
 	Datum		values[1];
 	Oid			argtypes[1] = {TEXTOID};
 
-	kingres_shard_control_begin();
 	kingres_shard_lock_catalog();
 	kingres_shard_require_map_group();
 	require_primaries_can_commit();
@@ -562,6 +566,41 @@ kingres_rotate_secret(PG_FUNCTION_ARGS)
 					 errhint("Run kingres.recover_prepared_transactions() on the origin of each, wait until kingres.check_cluster() shows none, and rotate again.")));
 	}
 
+	/*
+	 * A node that missed the last rotation can be reached only with the secret that the rotation
+	 * replaced, which is kept as "previous" for exactly that reason (S11-04).  A second rotation
+	 * would replace it again: the node would hold a secret that nobody has, could not be reached,
+	 * and could not be promoted.  So while the previous secret is kept, every standby of the
+	 * catalog must be reached with the current one first.
+	 */
+	{
+		unsigned char pbuf[128];
+		int			plen = 0;
+
+		if (kingres_shard_previous_secret(pbuf, sizeof(pbuf), &plen))
+		{
+			explicit_bzero(pbuf, sizeof(pbuf));
+			foreach(lc, cat->nodes)
+			{
+				KsNode	   *n = (KsNode *) lfirst(lc);
+				char	   *serr = NULL;
+				KsConn	   *skc;
+
+				if (n->node_id == cat->local_node_id || !n->is_active || n->is_primary)
+					continue;
+				skc = kingres_shard_get_conn(n->host, n->port, true, &serr);
+				if (skc == NULL || skc->via_previous)
+					ereport(ERROR,
+							(errcode(ERRCODE_KINGRES_SECRET_UNKNOWN),
+							 errmsg("the cluster secret cannot be rotated again yet: standby %d (%s:%d) has not confirmed the last rotation",
+									n->node_id, n->host, n->port),
+							 errdetail("%s", skc == NULL ? (serr ? serr : "it cannot be reached") :
+									   "it accepts only the previous secret, which a second rotation would drop"),
+							 errhint("Start the standby and let it replay the WAL, run kingres.recover_prepared_transactions() until it has confirmed the secret, and rotate again; or remove the standby from the cluster with kingres.remove_node().")));
+			}
+		}
+	}
+
 	if (!pg_strong_random(raw, sizeof(raw)))
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
@@ -581,6 +620,12 @@ kingres_rotate_secret(PG_FUNCTION_ARGS)
 	foreach(lc, conns)
 		push_secret((KsConn *) lfirst(lc));
 	PG_RETURN_VOID();
+}
+
+Datum
+kingres_rotate_secret(PG_FUNCTION_ARGS)
+{
+	return kingres_shard_control_call(kingres_rotate_secret_body, fcinfo);
 }
 
 /*
@@ -945,13 +990,14 @@ check_standby_node(const char *host, int port, int group_id)
  * outside the user's transaction.
  */
 static void
-record_pending_node(const char *host, int port)
+record_pending_node(const char *host, int port, int node_id)
 {
 	const KsCatalog *cat = kingres_shard_catalog();
 	const KsNode *self = kingres_shard_node_by_id(cat->local_node_id);
 	KsConn	   *kc;
-	const char *params[2];
+	const char *params[3];
 	char		portstr[16];
+	char		idstr[16];
 	PGresult   *res;
 
 	if (!OidIsValid(kingres_shard_catalog_relid("pending_node")))
@@ -964,13 +1010,15 @@ record_pending_node(const char *host, int port)
 		return;
 	kc = kingres_shard_get_conn(self->host, self->port, false, NULL);
 	snprintf(portstr, sizeof(portstr), "%d", port);
+	snprintf(idstr, sizeof(idstr), "%d", node_id);
 	params[0] = host;
 	params[1] = portstr;
+	params[2] = node_id > 0 ? idstr : NULL;
 	res = kingres_shard_exec_params(kc,
-									 "INSERT INTO " KINGRES_SHARD_SCHEMA ".pending_node (host, port, created_at) "
-									 "VALUES ($1::pg_catalog.text, $2::pg_catalog.int4, pg_catalog.clock_timestamp()) "
-									 "ON CONFLICT (host, port) DO UPDATE SET created_at = excluded.created_at",
-									 2, NULL, params, true);
+									 "INSERT INTO " KINGRES_SHARD_SCHEMA ".pending_node (host, port, created_at, node_id) "
+									 "VALUES ($1::pg_catalog.text, $2::pg_catalog.int4, pg_catalog.clock_timestamp(), $3::pg_catalog.int4) "
+									 "ON CONFLICT (host, port) DO UPDATE SET created_at = excluded.created_at, node_id = excluded.node_id",
+									 3, NULL, params, true);
 	PQclear(res);
 }
 
@@ -984,8 +1032,8 @@ record_pending_node(const char *host, int port)
  * no buckets until a table is created afterwards (or, in phase 4, a
  * rebalance).
  */
-Datum
-kingres_add_node(PG_FUNCTION_ARGS)
+static Datum
+kingres_add_node_body(PG_FUNCTION_ARGS)
 {
 	char	   *host;
 	int			port;
@@ -1009,7 +1057,6 @@ kingres_add_node(PG_FUNCTION_ARGS)
 	port = PG_GETARG_INT32(1);
 	role = PG_ARGISNULL(3) ? pstrdup("primary") : text_to_cstring(PG_GETARG_TEXT_PP(3));
 
-	kingres_shard_control_begin();
 	kingres_shard_lock_catalog();
 	kingres_shard_require_map_group();
 	require_primaries_can_commit();
@@ -1101,7 +1148,7 @@ kingres_add_node(PG_FUNCTION_ARGS)
 	 */
 	if (is_primary)
 	{
-		record_pending_node(host, port);
+		record_pending_node(host, port, 0);
 		kc = kingres_shard_get_conn(host, port, false, NULL);
 		kingres_shard_begin_write_xact(kc);
 		check_acl_roles_on_node(kc, host, port);
@@ -1222,6 +1269,12 @@ kingres_add_node(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(node_id);
 }
 
+Datum
+kingres_add_node(PG_FUNCTION_ARGS)
+{
+	return kingres_shard_control_call(kingres_add_node_body, fcinfo);
+}
+
 /*
  * kingres.remove_node(node_id int) returns void
  *
@@ -1229,8 +1282,8 @@ kingres_add_node(PG_FUNCTION_ARGS)
  * own catalog is cleared when it can be reached; if it cannot, a warning says
  * so (a dead node must still be removable).
  */
-Datum
-kingres_remove_node(PG_FUNCTION_ARGS)
+static Datum
+kingres_remove_node_body(PG_FUNCTION_ARGS)
 {
 	int			node_id = PG_GETARG_INT32(0);
 	const KsCatalog *cat;
@@ -1245,7 +1298,6 @@ kingres_remove_node(PG_FUNCTION_ARGS)
 	bool		isnull;
 	int			nbuckets;
 
-	kingres_shard_control_begin();
 	kingres_shard_lock_catalog();
 	kingres_shard_require_map_group();
 	require_primaries_can_commit();
@@ -1318,7 +1370,19 @@ kingres_remove_node(PG_FUNCTION_ARGS)
 	if (reset_remote)
 	{
 		char	   *err = NULL;
-		KsConn	   *kc = kingres_shard_get_conn(host, port, true, &err);
+		KsConn	   *kc;
+
+		/*
+		 * The node leaves the catalog in this transaction, and recovery visits only the nodes of
+		 * the catalog: a call killed after its commit would leave the part prepared on the removed
+		 * node for ever, with its locks (S11-05).  Recovery visits the nodes that are listed as
+		 * pending too, so the address is written down first, outside this transaction.
+		 */
+		SPI_finish();
+		record_pending_node(host, port, node_id);
+		if (SPI_connect() != SPI_OK_CONNECT)
+			elog(ERROR, "SPI_connect failed");
+		kc = kingres_shard_get_conn(host, port, true, &err);
 
 		if (kc == NULL)
 			ereport(WARNING,
@@ -1342,6 +1406,12 @@ kingres_remove_node(PG_FUNCTION_ARGS)
 
 	kingres_shard_sync_catalog_internal();
 	PG_RETURN_VOID();
+}
+
+Datum
+kingres_remove_node(PG_FUNCTION_ARGS)
+{
+	return kingres_shard_control_call(kingres_remove_node_body, fcinfo);
 }
 
 /*

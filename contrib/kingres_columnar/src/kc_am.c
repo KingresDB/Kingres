@@ -305,8 +305,16 @@ static void
 kc_tuple_insert(Relation rel, TupleTableSlot *slot, CommandId cid,
 				KcInsertOptions options, struct BulkInsertStateData *bistate)
 {
-	kc_require_rmgr();
-	kc_write_row(rel, slot, cid);
+	/*
+	 * Where the server forbids an error (the end of a transaction, a critical
+	 * section) the write is refused with a warning, here and in every callback
+	 * below that would otherwise raise one (kc_write_refused).
+	 */
+	if (!kc_write_refused(rel, "row"))
+	{
+		kc_require_rmgr();
+		kc_write_row(rel, slot, cid);
+	}
 	slot->tts_tableOid = RelationGetRelid(rel);
 	kc_set_insert_tid(slot);
 }
@@ -316,6 +324,8 @@ kc_tuple_insert_speculative(Relation rel, TupleTableSlot *slot, CommandId cid,
 							KcInsertOptions options, struct BulkInsertStateData *bistate,
 							uint32 specToken)
 {
+	if (kc_write_refused(rel, "row"))
+		return;
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("INSERT ... ON CONFLICT DO UPDATE is not supported on columnar tables")));
@@ -325,6 +335,8 @@ static void
 kc_tuple_complete_speculative(Relation rel, TupleTableSlot *slot,
 							  uint32 specToken, bool succeeded)
 {
+	if (kc_write_refused(rel, "row"))
+		return;
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("INSERT ... ON CONFLICT DO UPDATE is not supported on columnar tables")));
@@ -336,8 +348,11 @@ kc_multi_insert(Relation rel, TupleTableSlot **slots, int nslots, CommandId cid,
 {
 	int			i;
 
-	kc_require_rmgr();
-	kc_write_rows(rel, slots, nslots, cid);
+	if (!kc_write_refused(rel, "rows"))
+	{
+		kc_require_rmgr();
+		kc_write_rows(rel, slots, nslots, cid);
+	}
 	for (i = 0; i < nslots; i++)
 	{
 		slots[i]->tts_tableOid = RelationGetRelid(rel);
@@ -348,6 +363,9 @@ kc_multi_insert(Relation rel, TupleTableSlot **slots, int nslots, CommandId cid,
 static TM_Result
 kc_tuple_delete(KC_DELETE_PARAMS)
 {
+	/* nothing was deleted: the row is not there for this table (and a warning says why) */
+	if (kc_write_refused(rel, "delete"))
+		return TM_Invisible;
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("columnar tables are append-only: UPDATE and DELETE are not supported")));
@@ -357,6 +375,8 @@ kc_tuple_delete(KC_DELETE_PARAMS)
 static TM_Result
 kc_tuple_update(KC_UPDATE_PARAMS)
 {
+	if (kc_write_refused(rel, "update"))
+		return TM_Invisible;
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("columnar tables are append-only: UPDATE and DELETE are not supported")));
@@ -368,6 +388,8 @@ kc_tuple_lock(Relation rel, ItemPointer tid, Snapshot snapshot,
 			  TupleTableSlot *slot, CommandId cid, LockTupleMode mode,
 			  LockWaitPolicy wait_policy, uint8 flags, TM_FailureData *tmfd)
 {
+	if (kc_write_refused(rel, "row lock"))
+		return TM_Invisible;
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("columnar tables do not support row locks")));

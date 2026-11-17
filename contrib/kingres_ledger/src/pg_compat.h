@@ -25,6 +25,7 @@
 #define KINGRES_LEDGER_PG_COMPAT_H
 
 #include "nodes/miscnodes.h"
+#include "nodes/parsenodes.h"
 #include "utils/numeric.h"
 
 /*
@@ -70,6 +71,32 @@ kl_numeric_to_int8(Numeric num, bool *have_error)
 #else
 #define kl_numeric_to_int8(num, have_error) \
 	numeric_int8_opt_error((num), (have_error))
+#endif
+
+/*
+ * KL_T_CLUSTER_STMT, kl_cluster_stmt_relation
+ *		The node tag of the CLUSTER statement and the table it names (NULL for
+ *		the form that names none).
+ *
+ * PostgreSQL 19 replaced ClusterStmt by RepackStmt (REPACK; CLUSTER is one of
+ * its commands) and names the table in a VacuumRelation.
+ */
+#if PG_VERSION_NUM >= 190000
+#define KL_T_CLUSTER_STMT T_RepackStmt
+static inline RangeVar *
+kl_cluster_stmt_relation(Node *stmt)
+{
+	VacuumRelation *vr = ((RepackStmt *) stmt)->relation;
+
+	return vr ? vr->relation : NULL;
+}
+#else
+#define KL_T_CLUSTER_STMT T_ClusterStmt
+static inline RangeVar *
+kl_cluster_stmt_relation(Node *stmt)
+{
+	return ((ClusterStmt *) stmt)->relation;
+}
 #endif
 
 #endif							/* KINGRES_LEDGER_PG_COMPAT_H */

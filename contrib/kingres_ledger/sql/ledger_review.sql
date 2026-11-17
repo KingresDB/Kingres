@@ -208,7 +208,7 @@ SELECT pg_temp.try(ARRAY[
     'ALTER EVENT TRIGGER kingres_ledger_guard_end OWNER TO kl_owner',
     'DROP EVENT TRIGGER kingres_ledger_guard_end',
     'GRANT EXECUTE ON FUNCTION kingres.ledger_capture() TO PUBLIC',
-    'GRANT EXECUTE ON FUNCTION kingres.ledger_record_row(int, record) TO kl_other',
+    'GRANT EXECUTE ON FUNCTION kingres.ledger_register_table(regclass) TO kl_other',
     'GRANT INSERT ON kingres.ledger_entry TO kl_other',
     'GRANT ALL ON kingres.ledger_blocks TO kl_other',
     'REVOKE SELECT ON kingres.ledger_blocks FROM CURRENT_USER',

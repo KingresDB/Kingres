@@ -235,7 +235,7 @@ JOIN pg_depend d ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid
                 AND d.refclassid = 'pg_extension'::regclass AND d.deptype = 'e'
 WHERE has_function_privilege('public', p.oid, 'execute')
   AND p.proname IN ('ledger_history_acl_sync', 'ledger_history_sync', 'ledger_worker_state',
-                    'ledger_lock_table', 'ledger_record_row', 'ledger_capture')
+                    'ledger_lock_table', 'ledger_register_table', 'ledger_capture')
 ORDER BY 1;
 
 --------------------------------------------------------------------------

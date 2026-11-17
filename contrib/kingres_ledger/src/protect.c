@@ -94,6 +94,7 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
+#include "commands/defrem.h"
 #include "commands/event_trigger.h"
 #include "commands/extension.h"
 #include "commands/tablecmds.h"
@@ -225,6 +226,7 @@ kl_is_internal_function(Oid funcoid, Oid extoid)
 {
 	return kl_is_ledger_function(funcoid, extoid, KL_SYM_CAPTURE) ||
 		kl_is_ledger_function(funcoid, extoid, KL_SYM_BLOCK_MODIFY) ||
+		kl_is_ledger_function(funcoid, extoid, KL_SYM_REGISTER_TABLE) ||
 		kl_is_ledger_function(funcoid, extoid, KL_SYM_RECORD_ROW) ||
 		kl_is_ledger_function(funcoid, extoid, KL_SYM_LOCK_TABLE) ||
 		kl_is_ledger_function(funcoid, extoid, KL_SYM_HISTORY_SYNC) ||
@@ -1193,12 +1195,66 @@ kl_is_own_script(Oid extoid, const char *queryString)
 }
 
 /*
+ * kl_check_maintenance
+ *		CLUSTER and REINDEX (not CONCURRENTLY) of a ledger catalog table by a
+ *		role that is not a superuser (pg_maintain).  They lock the table in a
+ *		mode that conflicts with the writes of the capture triggers and of the
+ *		block builder (SHARE, ACCESS EXCLUSIVE), and inside a transaction block
+ *		or a function the lock is held until that transaction ends, for as long
+ *		as the role likes.  They are allowed as a statement of their own, which
+ *		holds the lock for the time the statement takes and no longer.  VACUUM
+ *		cannot run in a transaction block, so VACUUM FULL needs no check.
+ */
+static void
+kl_check_maintenance(Node *parsetree, bool is_top_level, Oid extoid)
+{
+	RangeVar   *rv;
+	Oid			relid;
+	const char *what;
+	bool		is_index = false;
+
+	if (superuser())
+		return;
+	if (nodeTag(parsetree) == KL_T_CLUSTER_STMT)
+	{
+		rv = kl_cluster_stmt_relation(parsetree);
+		what = "CLUSTER of a ledger catalog table";
+	}
+	else
+	{
+		ReindexStmt *stmt = (ReindexStmt *) parsetree;
+		ListCell   *lc;
+
+		if (stmt->kind != REINDEX_OBJECT_TABLE && stmt->kind != REINDEX_OBJECT_INDEX)
+			return;
+		foreach(lc, stmt->params)
+		{
+			DefElem    *opt = lfirst_node(DefElem, lc);
+
+			if (strcmp(opt->defname, "concurrently") == 0 && defGetBoolean(opt))
+				return;
+		}
+		rv = stmt->relation;
+		is_index = (stmt->kind == REINDEX_OBJECT_INDEX);
+		what = "REINDEX of a ledger catalog table";
+	}
+	if (rv == NULL)
+		return;
+	relid = kl_rv_relid(rv, NoLock);
+	if (is_index && OidIsValid(relid))
+		relid = IndexGetRelation(relid, true);
+	if (!OidIsValid(relid) || kl_classify(relid, extoid) != KL_CATALOG_LEDGER)
+		return;
+	PreventInTransactionBlock(is_top_level, what);
+}
+
+/*
  * kl_check_statement
  *		Dispatch on the statement type.  Unlisted statements are not
  *		inspected and cost nothing.
  */
 static void
-kl_check_statement(Node *parsetree, const char *queryString)
+kl_check_statement(Node *parsetree, const char *queryString, bool is_top_level)
 {
 	Oid			extoid;
 	Oid			relid;
@@ -1229,10 +1285,23 @@ kl_check_statement(Node *parsetree, const char *queryString)
 		case T_AlterFunctionStmt:
 		case T_AlterEnumStmt:
 		case T_ViewStmt:
+		case T_LockStmt:
+		case KL_T_CLUSTER_STMT:
+		case T_ReindexStmt:
 			break;
 		default:
 			return;
 	}
+
+	/*
+	 * pg_upgrade restores the schema of the old cluster in binary upgrade mode:
+	 * the extension is created empty and every member is added with ALTER
+	 * EXTENSION ... ADD, which this hook refuses everywhere else.  Only the
+	 * upgrade can reach a server in that mode (it is started with -b by
+	 * pg_upgrade, for a superuser, on a new cluster nobody else is using).
+	 */
+	if (IsBinaryUpgrade)
+		return;
 
 	/* Nothing to protect where the extension is not installed. */
 	extoid = get_extension_oid(KL_EXTENSION_NAME, true);
@@ -1433,6 +1502,49 @@ kl_check_statement(Node *parsetree, const char *queryString)
 			}
 			break;
 
+		case KL_T_CLUSTER_STMT:
+		case T_ReindexStmt:
+			kl_check_maintenance(parsetree, is_top_level, extoid);
+			break;
+
+		case T_LockStmt:
+			{
+				LockStmt   *stmt = (LockStmt *) parsetree;
+				ListCell   *rl;
+
+				/*
+				 * pg_maintain may take any lock on any table, ACCESS EXCLUSIVE
+				 * included, and a role that may write every table may take ROW
+				 * SHARE and ROW EXCLUSIVE; a lock that is held until the
+				 * transaction ends makes the capture triggers (ROW EXCLUSIVE on the
+				 * queue, the entries and the registry) and the block builder wait.
+				 * The builder takes no table lock of its own (see write.c), so what
+				 * conflicts with it is whatever conflicts with the writes, and every
+				 * mode above ACCESS SHARE is refused.  The ledger's own code takes no
+				 * lock with a LOCK statement, and a superuser can stop the server
+				 * anyway.
+				 */
+				if (stmt->mode <= AccessShareLock || superuser())
+					break;
+				foreach(rl, stmt->relations)
+				{
+					relid = kl_rv_relid(lfirst_node(RangeVar, rl), NoLock);
+					/*
+					 * Only a role that the lock would be allowed to: any other gets
+					 * the ordinary "permission denied" from the command itself.
+					 * pg_maintain and pg_write_all_data are such roles.
+					 */
+					if (OidIsValid(relid) &&
+						kl_classify(relid, extoid) == KL_CATALOG_LEDGER &&
+						pg_class_aclmask(relid, GetUserId(),
+										 ACL_UPDATE | ACL_DELETE | ACL_TRUNCATE | ACL_MAINTAIN,
+										 ACLMASK_ANY) != 0)
+						kl_reject("lock with a mode that blocks readers or writers table",
+								  get_rel_name(relid), KL_CATALOG_LEDGER);
+				}
+			}
+			break;
+
 		default:
 			break;
 	}
@@ -1477,7 +1589,8 @@ kl_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 	bool		owner_change;
 
 	kl_note_script(queryString);
-	kl_check_statement(pstmt->utilityStmt, queryString);
+	kl_check_statement(pstmt->utilityStmt, queryString,
+					   context == PROCESS_UTILITY_TOPLEVEL);
 	owner_change = kl_may_change_owner(pstmt->utilityStmt);
 
 	if (prev_ProcessUtility)

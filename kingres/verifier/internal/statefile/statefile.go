@@ -270,3 +270,27 @@ func writeAndSync(f *os.File, data []byte) error {
 	}
 	return f.Close()
 }
+
+// AcquireChecked takes the lock of the state named by typed, whose resolved
+// path is resolved, and then looks again: the name must still lead to the same
+// path, and when enforce is set the private check passes again. The first check
+// was made before the lock, possibly while another run held it for seconds; this
+// one is what the run relies on.
+func AcquireChecked(typed, resolved string, wait time.Duration, enforce bool) (*Lock, error) {
+	lock, err := Acquire(resolved, wait)
+	if err != nil {
+		return nil, err
+	}
+	again, rerr := Resolve(typed)
+	if rerr == nil && again != resolved {
+		rerr = fmt.Errorf("the name now leads to %s, not to %s", again, resolved)
+	}
+	if rerr == nil && enforce {
+		rerr = CheckPrivate(typed)
+	}
+	if rerr != nil {
+		lock.Release()
+		return nil, fmt.Errorf("the state path changed while the lock was taken, so nothing was changed: %w", rerr)
+	}
+	return lock, nil
+}

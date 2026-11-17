@@ -92,7 +92,7 @@ type ParsedPath struct {
 func ParseTilePath(p string) (ParsedPath, error) {
 	var out ParsedPath
 	fail := func(why string) (ParsedPath, error) {
-		return ParsedPath{}, fmt.Errorf("%w: %q: %s", ErrBadPath, clip(p), why)
+		return ParsedPath{}, fmt.Errorf("%w: %q: %s", ErrBadPath, p, why)
 	}
 	parts := strings.Split(p, "/")
 	if len(parts) < 3 || parts[0] != "tile" {
@@ -144,13 +144,6 @@ func ParseTilePath(p string) (ParsedPath, error) {
 	}
 	out.Index = n
 	return out, nil
-}
-
-func clip(s string) string {
-	if len(s) > 80 {
-		return s[:80] + "..."
-	}
-	return s
 }
 
 // canonicalDecimal parses digits without a sign or leading zeros, at most max.

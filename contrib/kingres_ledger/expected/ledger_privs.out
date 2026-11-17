@@ -33,7 +33,7 @@ INSERT INTO pure_primitives VALUES
     ('ledger_merkle_final'), ('ledger_merkle_path'), ('ledger_tx_leaf'),
     ('ledger_block_tx_leaf'), ('ledger_block_hash'), ('ledger_block_preimage'),
     ('ledger_genesis_hash'),
-    ('ledger_timestamptz_us'), ('ledger_verify_proof'), ('ledger_hook_active'),
+    ('ledger_timestamptz_us'), ('ledger_verify_proof'), ('ledger_hook_active'), ('ledger_binary_upgrade'),
     ('ledger_outer_user');
 -- A function without a fixed search_path that is not on the list.
 SELECT m.oid::regprocedure AS function_without_fixed_search_path
@@ -85,10 +85,11 @@ FROM members m WHERE m.prosecdef ORDER BY 1, 2;
  ledger_head            | 
  ledger_inclusion_proof | relation regclass, row_hash bytea
  ledger_inclusion_proof | relation regclass, row_hash bytea, op "char"
- ledger_record_row      | table_id integer, row_data record
+ ledger_register_table  | relation regclass
+ ledger_remove_stray    | reason text
  ledger_verify          | from_height bigint, to_height bigint
  ledger_verify_recorded | from_height bigint, to_height bigint
-(12 rows)
+(13 rows)
 
 -- Unqualified references in the SQL and PL/pgSQL functions: a table of the
 -- extension after FROM, JOIN, INTO, UPDATE or TABLE, or a call of a function
@@ -116,6 +117,7 @@ ORDER BY 1, 2;
          proname         |                                                                                                                     args                                                                                                                      | public_can_execute 
 -------------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------------------
  ledger_all_defects      |                                                                                                                                                                                                                                               | t
+ ledger_binary_upgrade   |                                                                                                                                                                                                                                               | t
  ledger_block_hash       | hash_version smallint, height bigint, prev_hash bytea, tx_merkle_root bytea, tx_count integer, closed_at timestamp with time zone                                                                                                             | t
  ledger_block_modify     |                                                                                                                                                                                                                                               | t
  ledger_block_preimage   | hash_version smallint, height bigint, prev_hash bytea, tx_merkle_root bytea, tx_count integer, closed_at timestamp with time zone                                                                                                             | t
@@ -144,7 +146,8 @@ ORDER BY 1, 2;
  ledger_merkle_path      | leaf_hashes bytea[], leaf_index integer                                                                                                                                                                                                       | t
  ledger_node_hash        | left_hash bytea, right_hash bytea                                                                                                                                                                                                             | t
  ledger_outer_user       |                                                                                                                                                                                                                                               | t
- ledger_record_row       | table_id integer, row_data record                                                                                                                                                                                                             | f
+ ledger_register_table   | relation regclass                                                                                                                                                                                                                             | f
+ ledger_remove_stray     | reason text                                                                                                                                                                                                                                   | f
  ledger_row_hash         | record                                                                                                                                                                                                                                        | t
  ledger_table_defects    | p_relid oid, p_table_id integer                                                                                                                                                                                                               | t
  ledger_timestamptz_us   | ts timestamp with time zone                                                                                                                                                                                                                   | t
@@ -158,7 +161,7 @@ ORDER BY 1, 2;
  ledger_verify_proof     | proof jsonb, digest jsonb, expected_table_id integer, expected_row_hash bytea, expected_op "char"                                                                                                                                             | t
  ledger_verify_recorded  | from_height bigint, to_height bigint                                                                                                                                                                                                          | f
  ledger_worker_state     | OUT state text, OUT visits bigint, OUT failures bigint, OUT consecutive_failures integer, OUT last_attempt timestamp with time zone, OUT last_success timestamp with time zone, OUT retry_after timestamp with time zone, OUT last_error text | f
-(43 rows)
+(45 rows)
 
 -- ... and which table PUBLIC can read or write.
 SELECT c.relname,
@@ -179,10 +182,11 @@ ORDER BY 1;
  ledger_digest       | f                 | f
  ledger_entry        | f                 | f
  ledger_pending      | f                 | f
+ ledger_removed      | f                 | f
  ledger_table        | t                 | f
  ledger_tx           | f                 | f
  ledger_verification | f                 | f
-(8 rows)
+(9 rows)
 
 -- The event triggers of the extension are in place and ENABLE ALWAYS.
 SELECT e.evtevent, e.evtenabled
@@ -211,7 +215,7 @@ SET search_path = pg_temp, public;
 SELECT count(*) AS problems_with_shadows FROM kingres.ledger_verify();
  problems_with_shadows 
 -----------------------
-                     0
+                     3
 (1 row)
 
 INSERT INTO docs VALUES (600, 'shadow', NULL);

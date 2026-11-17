@@ -352,6 +352,7 @@ SELECT * FROM public.vreport();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
  restore_all 
 -------------
@@ -364,7 +365,7 @@ SET search_path = public;
 SELECT count(*) AS problems_after_restore FROM kingres.ledger_verify();
  problems_after_restore 
 ------------------------
-                      0
+                      3
 (1 row)
 
 -- 2. A deleted row.
@@ -376,14 +377,18 @@ DELETE FROM docs WHERE id = 7;
 \c
 SET search_path = public;
 SELECT * FROM public.vreport();
- check_name |   object    |                               detail                               
-------------+-------------+--------------------------------------------------------------------
- table_rows | public.docs | row hash <hash>: 0 row(s) in the table, 1 entry(ies) in the ledger
-(1 row)
+  check_name  |        object         |                                                 detail                                                 
+--------------+-----------------------+--------------------------------------------------------------------------------------------------------
+ manual_write | kingres.ledger_blocks | 7 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_entry  | 25 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_tx     | 17 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ table_rows   | public.docs           | row hash <hash>: 0 row(s) in the table, 1 entry(ies) in the ledger
+(4 rows)
 
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
  restore_all 
 -------------
@@ -402,14 +407,18 @@ INSERT INTO docs VALUES (99, 'smuggled', NULL);
 \c
 SET search_path = public;
 SELECT * FROM public.vreport();
- check_name |   object    |                               detail                               
-------------+-------------+--------------------------------------------------------------------
- table_rows | public.docs | row hash <hash>: 1 row(s) in the table, 0 entry(ies) in the ledger
-(1 row)
+  check_name  |        object         |                                                 detail                                                 
+--------------+-----------------------+--------------------------------------------------------------------------------------------------------
+ manual_write | kingres.ledger_blocks | 14 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_entry  | 50 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_tx     | 34 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ table_rows   | public.docs           | row hash <hash>: 1 row(s) in the table, 0 entry(ies) in the ledger
+(4 rows)
 
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
  restore_all 
 -------------
@@ -423,6 +432,7 @@ SET search_path = public;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_entry SET row_hash = sha256('other')
 WHERE (ledger_txid, seq) = (SELECT ledger_txid, seq FROM kingres.ledger_entry
                             WHERE table_id = (SELECT table_id FROM kingres.ledger_table WHERE relid = 'docs'::regclass)
@@ -431,16 +441,20 @@ WHERE (ledger_txid, seq) = (SELECT ledger_txid, seq FROM kingres.ledger_entry
 \c
 SET search_path = public;
 SELECT * FROM public.vreport();
- check_name |     object     |                               detail                               
-------------+----------------+--------------------------------------------------------------------
- table_rows | public.docs    | row hash <hash>: 0 row(s) in the table, 1 entry(ies) in the ledger
- table_rows | public.docs    | row hash <hash>: 1 row(s) in the table, 0 entry(ies) in the ledger
- tx_root    | tx N (block 3) | merkle_root <hash> differs from the recomputed root
-(3 rows)
+  check_name  |        object         |                                                 detail                                                 
+--------------+-----------------------+--------------------------------------------------------------------------------------------------------
+ manual_write | kingres.ledger_blocks | 21 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_entry  | 75 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_tx     | 51 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ table_rows   | public.docs           | row hash <hash>: 0 row(s) in the table, 1 entry(ies) in the ledger
+ table_rows   | public.docs           | row hash <hash>: 1 row(s) in the table, 0 entry(ies) in the ledger
+ tx_root      | tx N (block 3)        | merkle_root <hash> differs from the recomputed root
+(6 rows)
 
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
  restore_all 
 -------------
@@ -454,6 +468,7 @@ SET search_path = public;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM kingres.ledger_entry
 WHERE (ledger_txid, seq) = (SELECT ledger_txid, seq FROM kingres.ledger_entry
                             WHERE table_id = (SELECT table_id FROM kingres.ledger_table WHERE relid = 'docs'::regclass)
@@ -462,15 +477,19 @@ WHERE (ledger_txid, seq) = (SELECT ledger_txid, seq FROM kingres.ledger_entry
 \c
 SET search_path = public;
 SELECT * FROM public.vreport();
- check_name |     object     |                               detail                               
-------------+----------------+--------------------------------------------------------------------
- table_rows | public.docs    | row hash <hash>: 1 row(s) in the table, 0 entry(ies) in the ledger
- tx_root    | tx N (block 6) | entry_count is 1 but 0 entries exist
-(2 rows)
+  check_name  |        object         |                                                 detail                                                  
+--------------+-----------------------+---------------------------------------------------------------------------------------------------------
+ manual_write | kingres.ledger_blocks | 28 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_entry  | 100 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_tx     | 68 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ table_rows   | public.docs           | row hash <hash>: 1 row(s) in the table, 0 entry(ies) in the ledger
+ tx_root      | tx N (block 6)        | entry_count is 1 but 0 entries exist
+(5 rows)
 
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
  restore_all 
 -------------
@@ -484,6 +503,7 @@ SET search_path = public;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 -- One second earlier: the block is then also earlier than its predecessor,
 -- which the block time check reports at block 1, outside the range that is
 -- checked from block 2 on.
@@ -492,21 +512,25 @@ UPDATE kingres.ledger_blocks SET closed_at = closed_at - interval '1 second' WHE
 \c
 SET search_path = public;
 SELECT * FROM public.vreport();
- check_name | object  |                          detail                           
-------------+---------+-----------------------------------------------------------
- block_hash | block 1 | stored block_hash <hash> differs from the recomputed hash
- block_time | block 1 | closed_at is earlier than closed_at of the previous block
-(2 rows)
+  check_name  |        object         |                                                 detail                                                  
+--------------+-----------------------+---------------------------------------------------------------------------------------------------------
+ block_hash   | block 1               | stored block_hash <hash> differs from the recomputed hash
+ block_time   | block 1               | closed_at is earlier than closed_at of the previous block
+ manual_write | kingres.ledger_blocks | 35 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_entry  | 125 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_tx     | 85 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+(5 rows)
 
 SELECT count(*) AS problems_outside_range FROM kingres.ledger_verify(2);
  problems_outside_range 
 ------------------------
-                      0
+                      3
 (1 row)
 
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
  restore_all 
 -------------
@@ -520,6 +544,7 @@ SET search_path = public;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_tx SET merkle_root = sha256('forged')
 WHERE ledger_txid = (SELECT min(ledger_txid) FROM kingres.ledger_tx);
 UPDATE kingres.ledger_blocks SET tx_count = tx_count + 1 WHERE height = 0;
@@ -527,16 +552,20 @@ UPDATE kingres.ledger_blocks SET tx_count = tx_count + 1 WHERE height = 0;
 \c
 SET search_path = public;
 SELECT * FROM public.vreport();
-  check_name   |     object     |                          detail                           
----------------+----------------+-----------------------------------------------------------
- block_hash    | block 0        | stored block_hash <hash> differs from the recomputed hash
- block_tx_root | block 0        | tx_count is 4 but the block has 3 transactions
- tx_root       | tx N (block 0) | merkle_root <hash> differs from the recomputed root
-(3 rows)
+  check_name   |        object         |                                                 detail                                                  
+---------------+-----------------------+---------------------------------------------------------------------------------------------------------
+ block_hash    | block 0               | stored block_hash <hash> differs from the recomputed hash
+ block_tx_root | block 0               | tx_count is 4 but the block has 3 transactions
+ manual_write  | kingres.ledger_blocks | 42 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write  | kingres.ledger_entry  | 150 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write  | kingres.ledger_tx     | 102 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ tx_root       | tx N (block 0)        | merkle_root <hash> differs from the recomputed root
+(6 rows)
 
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
  restore_all 
 -------------
@@ -551,15 +580,19 @@ SELECT ledger_txid AS first_tx FROM kingres.ledger_tx ORDER BY ledger_txid LIMIT
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_tx SET user_name = 'mallory' WHERE ledger_txid = :first_tx;
 :trig_on;
 \c
 SET search_path = public;
 SELECT * FROM public.vreport();
-  check_name   | object  |                         detail                         
----------------+---------+--------------------------------------------------------
- block_tx_root | block 0 | tx_merkle_root <hash> differs from the recomputed root
-(1 row)
+  check_name   |        object         |                                                 detail                                                  
+---------------+-----------------------+---------------------------------------------------------------------------------------------------------
+ block_tx_root | block 0               | tx_merkle_root <hash> differs from the recomputed root
+ manual_write  | kingres.ledger_blocks | 49 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write  | kingres.ledger_entry  | 175 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write  | kingres.ledger_tx     | 119 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+(4 rows)
 
 SELECT kingres.ledger_verify_digest(:'d3') AS digest_still_matches_stored_blocks;
  digest_still_matches_stored_blocks 
@@ -570,6 +603,7 @@ SELECT kingres.ledger_verify_digest(:'d3') AS digest_still_matches_stored_blocks
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
  restore_all 
 -------------
@@ -582,7 +616,7 @@ SET search_path = public;
 SELECT count(*) AS problems_after_restore FROM kingres.ledger_verify();
  problems_after_restore 
 ------------------------
-                      0
+                      3
 (1 row)
 
 -- 7c. The user recorded in the work queue, before the block is built, is NOT
@@ -592,6 +626,7 @@ INSERT INTO docs VALUES (12, 'twelve', NULL);
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_pending SET user_name = 'mallory';
 :trig_on;
 \c
@@ -599,7 +634,7 @@ SET search_path = public;
 SELECT count(*) AS problems_with_tampered_pending_user FROM kingres.ledger_verify();
  problems_with_tampered_pending_user 
 -------------------------------------
-                                   0
+                                   3
 (1 row)
 
 SELECT kingres.ledger_build_block() IS NOT NULL AS built;
@@ -611,7 +646,7 @@ SELECT kingres.ledger_build_block() IS NOT NULL AS built;
 SELECT count(*) AS problems_after_build FROM kingres.ledger_verify();
  problems_after_build 
 ----------------------
-                    0
+                    3
 (1 row)
 
 SELECT user_name FROM kingres.ledger_tx ORDER BY ledger_txid DESC LIMIT 1;
@@ -623,6 +658,7 @@ SELECT user_name FROM kingres.ledger_tx ORDER BY ledger_txid DESC LIMIT 1;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
  restore_all 
 -------------
@@ -638,6 +674,7 @@ INSERT INTO docs VALUES (11, 'eleven', NULL);
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM kingres.ledger_pending;
 INSERT INTO kingres.ledger_entry
 SELECT 1000000000, 0, table_id, 'I', sha256('ghost') FROM kingres.ledger_table LIMIT 1;
@@ -645,16 +682,20 @@ SELECT 1000000000, 0, table_id, 'I', sha256('ghost') FROM kingres.ledger_table L
 \c
 SET search_path = public;
 SELECT * FROM public.vreport();
-  check_name  |      object      |                               detail                               
---------------+------------------+--------------------------------------------------------------------
- entry_orphan | tx N             | 1 entries belong to no block and to no pending transaction
- entry_orphan | tx N             | 1 entries belong to no block and to no pending transaction
- table_rows   | public.with_enum | row hash <hash>: 0 row(s) in the table, 1 entry(ies) in the ledger
-(3 rows)
+  check_name  |        object         |                                                 detail                                                  
+--------------+-----------------------+---------------------------------------------------------------------------------------------------------
+ entry_orphan | tx N                  | 1 entries belong to no block and to no pending transaction
+ entry_orphan | tx N                  | 1 entries belong to no block and to no pending transaction
+ manual_write | kingres.ledger_blocks | 63 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_entry  | 226 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_tx     | 153 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ table_rows   | public.with_enum      | row hash <hash>: 0 row(s) in the table, 1 entry(ies) in the ledger
+(6 rows)
 
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
  restore_all 
 -------------
@@ -667,27 +708,32 @@ SET search_path = public;
 SELECT count(*) AS problems_after_cleanup FROM kingres.ledger_verify();
  problems_after_cleanup 
 ------------------------
-                      0
+                      3
 (1 row)
 
 -- 9. A transaction in a block and in the work queue at the same time.
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 INSERT INTO kingres.ledger_pending
 SELECT ledger_txid, user_name FROM kingres.ledger_tx ORDER BY ledger_txid LIMIT 1;
 :trig_on;
 \c
 SET search_path = public;
 SELECT * FROM public.vreport();
-    check_name    | object |                   detail                   
-------------------+--------+--------------------------------------------
- pending_in_block | tx N   | transaction is both pending and in block 0
-(1 row)
+    check_name    |        object         |                                                 detail                                                  
+------------------+-----------------------+---------------------------------------------------------------------------------------------------------
+ manual_write     | kingres.ledger_blocks | 70 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write     | kingres.ledger_entry  | 251 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write     | kingres.ledger_tx     | 170 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ pending_in_block | tx N                  | transaction is both pending and in block 0
+(4 rows)
 
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
  restore_all 
 -------------
@@ -703,14 +749,15 @@ SET search_path = public;
 SET search_path = public;
 SELECT check_name, object, detail FROM kingres.ledger_verify()
 WHERE object IN ('public.docs', 'kingres.ledger_blocks') ORDER BY 1, 2, 3;
- check_name |        object         |                                     detail                                      
-------------+-----------------------+---------------------------------------------------------------------------------
- trigger    | kingres.ledger_blocks | trigger kingres_ledger_block_modify is missing, disabled or not ENABLE ALWAYS
- trigger    | kingres.ledger_blocks | trigger kingres_ledger_block_truncate is missing, disabled or not ENABLE ALWAYS
- trigger    | public.docs           | trigger kingres_ledger_block_modify is missing, disabled or not ENABLE ALWAYS
- trigger    | public.docs           | trigger kingres_ledger_block_truncate is missing, disabled or not ENABLE ALWAYS
- trigger    | public.docs           | trigger kingres_ledger_capture is missing, disabled or not ENABLE ALWAYS
-(5 rows)
+  check_name  |        object         |                                                 detail                                                 
+--------------+-----------------------+--------------------------------------------------------------------------------------------------------
+ manual_write | kingres.ledger_blocks | 77 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ trigger      | kingres.ledger_blocks | trigger kingres_ledger_block_modify is missing, disabled or not ENABLE ALWAYS
+ trigger      | kingres.ledger_blocks | trigger kingres_ledger_block_truncate is missing, disabled or not ENABLE ALWAYS
+ trigger      | public.docs           | trigger kingres_ledger_block_modify is missing, disabled or not ENABLE ALWAYS
+ trigger      | public.docs           | trigger kingres_ledger_block_truncate is missing, disabled or not ENABLE ALWAYS
+ trigger      | public.docs           | trigger kingres_ledger_capture is missing, disabled or not ENABLE ALWAYS
+(6 rows)
 
 :trig_on;
 \c
@@ -720,10 +767,13 @@ WHERE tgname = 'kingres_ledger_capture' AND tgrelid = 'docs'::regclass;
 \c
 SET search_path = public;
 SELECT check_name, object, detail FROM kingres.ledger_verify();
- check_name |   object    |                                  detail                                  
-------------+-------------+--------------------------------------------------------------------------
- trigger    | public.docs | trigger kingres_ledger_capture is missing, disabled or not ENABLE ALWAYS
-(1 row)
+  check_name  |        object         |                                                 detail                                                  
+--------------+-----------------------+---------------------------------------------------------------------------------------------------------
+ manual_write | kingres.ledger_blocks | 77 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_entry  | 276 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_tx     | 187 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ trigger      | public.docs           | trigger kingres_ledger_capture is missing, disabled or not ENABLE ALWAYS
+(4 rows)
 
 UPDATE pg_trigger SET tgenabled = 'A'
 WHERE tgname = 'kingres_ledger_capture' AND tgrelid = 'docs'::regclass;
@@ -732,7 +782,7 @@ SET search_path = public;
 SELECT count(*) AS problems_after_rearm FROM kingres.ledger_verify();
  problems_after_rearm 
 ----------------------
-                    0
+                    3
 (1 row)
 
 -- 11. The whole chain rewritten consistently from block 1 on: the ledger is
@@ -747,6 +797,7 @@ SELECT kingres.ledger_verify_digest(:'d3') AS digest_before_rewrite;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DO $$
 DECLARE
     h bigint;
@@ -769,10 +820,22 @@ END $$;
 :trig_on;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
+-- The digests that the database recorded name the old hashes: ledger_verify
+-- reports them (digest_hash).  An attacker who rewrites the chain has to remove
+-- them too (a superuser with the manual-write setting can); only a digest kept
+-- outside the database cannot be taken away.
+SELECT count(*) AS problems_with_stale_recorded_digests FROM kingres.ledger_verify();
+ problems_with_stale_recorded_digests 
+--------------------------------------
+                                    8
+(1 row)
+
+DELETE FROM kingres.ledger_digest;
 SELECT count(*) AS problems_after_consistent_rewrite FROM kingres.ledger_verify();
  problems_after_consistent_rewrite 
 -----------------------------------
-                                 0
+                                 3
 (1 row)
 
 SELECT kingres.ledger_verify_digest(:'d1') AS d1_after_rewrite,
@@ -805,6 +868,7 @@ FROM docs d WHERE id = 4;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
  restore_all 
 -------------
@@ -817,7 +881,7 @@ SET search_path = public;
 SELECT count(*) AS problems_after_restore FROM kingres.ledger_verify();
  problems_after_restore 
 ------------------------
-                      0
+                      3
 (1 row)
 
 SELECT kingres.ledger_verify_digest(:'d3') AS digest_after_restore;

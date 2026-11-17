@@ -107,9 +107,12 @@ SELECT * FROM uentries('inv', 'r.id') ORDER BY tx, seq;
 (3 rows)
 
 SELECT * FROM ureport();
- check_name | object | detail 
-------------+--------+--------
-(0 rows)
+  check_name  |        object         |                                                 detail                                                  
+--------------+-----------------------+---------------------------------------------------------------------------------------------------------
+ manual_write | kingres.ledger_blocks | 84 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_entry  | 301 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_tx     | 204 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+(3 rows)
 
 -- Not supported, with clear errors.
 SELECT kingres.ledger_enable('inv', 'append_only');
@@ -171,7 +174,7 @@ LEFT JOIN kingres.ledger_entry e ON e.ledger_txid = h.ledger_txid AND e.seq = h.
 SELECT count(*) AS problems FROM kingres.ledger_verify();
  problems 
 ----------
-        0
+        3
 (1 row)
 
 -- An UPDATE that changes nothing still writes D and I.
@@ -235,7 +238,7 @@ SELECT count(*) - :history_before AS history_rows_added_by_the_savepoint_transac
 SELECT count(*) AS problems FROM kingres.ledger_verify();
  problems 
 ----------
-        0
+        3
 (1 row)
 
 -- Rows are locked, not changed, by SELECT ... FOR UPDATE.
@@ -262,7 +265,7 @@ ERROR:  table "inv" is an updatable ledger table and cannot be truncated
 SELECT count(*) AS problems FROM kingres.ledger_verify();
  problems 
 ----------
-        0
+        3
 (1 row)
 
 --------------------------------------------------------------------------
@@ -282,7 +285,7 @@ SELECT id, qty FROM inv WHERE id IN (1, 5) ORDER BY id;
 SELECT count(*) AS problems FROM kingres.ledger_verify();
  problems 
 ----------
-        0
+        3
 (1 row)
 
 -- MERGE: update, delete and insert in one statement
@@ -305,7 +308,7 @@ SELECT id, item, qty, note FROM inv ORDER BY id;
 SELECT count(*) AS problems FROM kingres.ledger_verify();
  problems 
 ----------
-        0
+        3
 (1 row)
 
 -- UPDATE ... FROM, DELETE ... USING, RETURNING
@@ -325,7 +328,7 @@ DELETE FROM inv USING (VALUES (7)) s(i) WHERE inv.id = s.i RETURNING inv.id;
 SELECT count(*) AS problems FROM kingres.ledger_verify();
  problems 
 ----------
-        0
+        3
 (1 row)
 
 -- Through an updatable view
@@ -336,7 +339,7 @@ INSERT INTO inv_v VALUES (8, 'view', 8, NULL);
 SELECT count(*) AS problems FROM kingres.ledger_verify();
  problems 
 ----------
-        0
+        3
 (1 row)
 
 -- COPY
@@ -344,7 +347,7 @@ COPY inv FROM stdin;
 SELECT count(*) AS problems FROM kingres.ledger_verify();
  problems 
 ----------
-        0
+        3
 (1 row)
 
 -- session_replication_role = replica does not skip the triggers
@@ -356,7 +359,7 @@ RESET session_replication_role;
 SELECT count(*) AS problems FROM kingres.ledger_verify();
  problems 
 ----------
-        0
+        3
 (1 row)
 
 -- A prepared transaction
@@ -367,7 +370,7 @@ COMMIT PREPARED 'kl_u_prepared';
 SELECT count(*) AS problems FROM kingres.ledger_verify();
  problems 
 ----------
-        0
+        3
 (1 row)
 
 -- Foreign keys: ON DELETE CASCADE, ON UPDATE CASCADE and SET NULL actions
@@ -402,7 +405,7 @@ SELECT count(*) AS history_rows FROM fk_child_ledger_history;
 SELECT count(*) AS problems FROM kingres.ledger_verify();
  problems 
 ----------
-        0
+        3
 (1 row)
 
 -- Triggers on the table that change the row before and after the capture
@@ -450,7 +453,7 @@ SELECT id, val, note FROM trg ORDER BY id;
 SELECT count(*) AS problems FROM kingres.ledger_verify();
  problems 
 ----------
-        0
+        3
 (1 row)
 
 SELECT op, count(*) FROM uentries('trg', 'r.id') GROUP BY op ORDER BY op;
@@ -486,7 +489,7 @@ SELECT id, c, d FROM typ2 ORDER BY id;
 SELECT count(*) AS problems FROM kingres.ledger_verify();
  problems 
 ----------
-        0
+        3
 (1 row)
 
 SELECT count(*) AS history_rows FROM typ2_ledger_history;
@@ -519,7 +522,7 @@ UPDATE typ SET j = NULL, arr = NULL, ba = '\x', c = NULL WHERE id = 2;
 SELECT count(*) AS problems FROM kingres.ledger_verify();
  problems 
 ----------
-        0
+        3
 (1 row)
 
 SELECT count(*) AS history_rows, bool_and(kingres.ledger_history_row_hash(h.*) IN
@@ -561,7 +564,7 @@ SELECT id, extra, extra2, extra3 FROM inv_ledger_history ORDER BY ledger_txid DE
 SELECT count(*) AS problems FROM kingres.ledger_verify();
  problems 
 ----------
-        0
+        3
 (1 row)
 
 -- Rejected: a default, NOT NULL, the history columns' names, a column of an unsupported type
@@ -581,7 +584,7 @@ ERROR:  the statement leaves the ledger broken (column: public.inv: column "bad"
 SELECT count(*) AS problems FROM kingres.ledger_verify();
  problems 
 ----------
-        0
+        3
 (1 row)
 
 -- A transaction that adds a column and writes in the same transaction
@@ -593,7 +596,7 @@ COMMIT;
 SELECT count(*) AS problems FROM kingres.ledger_verify();
  problems 
 ----------
-        0
+        3
 (1 row)
 
 -- ... and one that rolls back
@@ -609,7 +612,7 @@ SELECT count(*) AS history_has_extra5 FROM pg_attribute WHERE attrelid = 'inv_le
 SELECT count(*) AS problems FROM kingres.ledger_verify();
  problems 
 ----------
-        0
+        3
 (1 row)
 
 --------------------------------------------------------------------------
@@ -728,7 +731,7 @@ RESET ROLE;
 SELECT count(*) AS problems FROM kingres.ledger_verify();
  problems 
 ----------
-        0
+        3
 (1 row)
 
 --------------------------------------------------------------------------
@@ -790,7 +793,7 @@ RESET ROLE;
 SELECT count(*) AS problems FROM kingres.ledger_verify();
  problems 
 ----------
-        0
+        3
 (1 row)
 
 --------------------------------------------------------------------------
@@ -969,7 +972,7 @@ SELECT kingres.ledger_build_block() IS NOT NULL AS block_built;
 SELECT count(*) AS problems_before FROM kingres.ledger_verify();
  problems_before 
 -----------------
-               0
+               3
 (1 row)
 
 \set trig_off 'UPDATE pg_trigger SET tgenabled = ''D'' WHERE tgname LIKE ''kingres_ledger_%'' AND tgrelid IN (SELECT oid FROM pg_class WHERE relname IN (''pr'', ''pr_ledger_history'', ''ledger_entry'', ''ledger_table''))'
@@ -986,7 +989,7 @@ SELECT kingres.ledger_build_block() IS NOT NULL AS block_built;
 SELECT count(*) AS problems_before FROM kingres.ledger_verify();
  problems_before 
 -----------------
-               0
+               3
 (1 row)
 
 :trig_off;
@@ -997,11 +1000,14 @@ BEGIN;
 UPDATE pr SET v = 'tampered' WHERE id = 1;
 :trig_on;
 SELECT * FROM ureport();
- check_name |  object   |                               detail                               
-------------+-----------+--------------------------------------------------------------------
- table_rows | public.pr | row hash <hash>: 0 row(s) in the table, 1 entry(ies) in the ledger
- table_rows | public.pr | row hash <hash>: 1 row(s) in the table, 0 entry(ies) in the ledger
-(2 rows)
+  check_name  |        object         |                                                 detail                                                  
+--------------+-----------------------+---------------------------------------------------------------------------------------------------------
+ manual_write | kingres.ledger_blocks | 84 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_entry  | 301 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_tx     | 204 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ table_rows   | public.pr             | row hash <hash>: 0 row(s) in the table, 1 entry(ies) in the ledger
+ table_rows   | public.pr             | row hash <hash>: 1 row(s) in the table, 0 entry(ies) in the ledger
+(5 rows)
 
 ROLLBACK;
 \c
@@ -1011,10 +1017,13 @@ BEGIN;
 DELETE FROM pr WHERE id = 2;
 :trig_on;
 SELECT * FROM ureport();
- check_name |  object   |                               detail                               
-------------+-----------+--------------------------------------------------------------------
- table_rows | public.pr | row hash <hash>: 0 row(s) in the table, 1 entry(ies) in the ledger
-(1 row)
+  check_name  |        object         |                                                 detail                                                  
+--------------+-----------------------+---------------------------------------------------------------------------------------------------------
+ manual_write | kingres.ledger_blocks | 84 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_entry  | 301 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_tx     | 204 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ table_rows   | public.pr             | row hash <hash>: 0 row(s) in the table, 1 entry(ies) in the ledger
+(4 rows)
 
 ROLLBACK;
 \c
@@ -1024,10 +1033,13 @@ BEGIN;
 UPDATE pr_ledger_history SET v = 'tampered' WHERE id = 3;
 :trig_on;
 SELECT * FROM ureport();
-  check_name  |  object   |                                 detail                                 
---------------+-----------+------------------------------------------------------------------------
- history_rows | public.pr | history row of tx N seq N does not hash to the row hash of its D entry
-(1 row)
+  check_name  |        object         |                                                 detail                                                  
+--------------+-----------------------+---------------------------------------------------------------------------------------------------------
+ history_rows | public.pr             | history row of tx N seq N does not hash to the row hash of its D entry
+ manual_write | kingres.ledger_blocks | 84 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_entry  | 301 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_tx     | 204 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+(4 rows)
 
 ROLLBACK;
 \c
@@ -1037,14 +1049,18 @@ BEGIN;
 DELETE FROM pr_ledger_history WHERE id = 3;
 :trig_on;
 SELECT * FROM ureport();
-  check_name  |  object   |                  detail                  
---------------+-----------+------------------------------------------
- history_rows | public.pr | D entry of tx N seq N has no history row
-(1 row)
+  check_name  |        object         |                                                 detail                                                  
+--------------+-----------------------+---------------------------------------------------------------------------------------------------------
+ history_rows | public.pr             | D entry of tx N seq N has no history row
+ manual_write | kingres.ledger_blocks | 84 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_entry  | 301 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_tx     | 204 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+(4 rows)
 
 ROLLBACK;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 -- 5. a D entry removed together with its history row (a block that was built
 -- has covered it: the transaction root no longer matches)
 BEGIN;
@@ -1053,11 +1069,14 @@ DELETE FROM kingres.ledger_entry e USING pr_ledger_history h
 DELETE FROM pr_ledger_history WHERE id = 3;
 :trig_on;
 SELECT * FROM ureport();
- check_name |     object      |                               detail                               
-------------+-----------------+--------------------------------------------------------------------
- table_rows | public.pr       | row hash <hash>: 0 row(s) in the table, 1 entry(ies) in the ledger
- tx_root    | tx N (block 16) | entry_count is 1 but 0 entries exist
-(2 rows)
+  check_name  |        object         |                                                 detail                                                  
+--------------+-----------------------+---------------------------------------------------------------------------------------------------------
+ manual_write | kingres.ledger_blocks | 84 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_entry  | 301 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_tx     | 204 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ table_rows   | public.pr             | row hash <hash>: 0 row(s) in the table, 1 entry(ies) in the ledger
+ tx_root      | tx N (block 16)       | entry_count is 1 but 0 entries exist
+(5 rows)
 
 ROLLBACK;
 \c
@@ -1067,10 +1086,13 @@ BEGIN;
 INSERT INTO pr SELECT id, v FROM pr_ledger_history WHERE id = 3;
 :trig_on;
 SELECT * FROM ureport();
- check_name |  object   |                               detail                               
-------------+-----------+--------------------------------------------------------------------
- table_rows | public.pr | row hash <hash>: 1 row(s) in the table, 0 entry(ies) in the ledger
-(1 row)
+  check_name  |        object         |                                                 detail                                                  
+--------------+-----------------------+---------------------------------------------------------------------------------------------------------
+ manual_write | kingres.ledger_blocks | 84 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_entry  | 301 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_tx     | 204 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ table_rows   | public.pr             | row hash <hash>: 1 row(s) in the table, 0 entry(ies) in the ledger
+(4 rows)
 
 ROLLBACK;
 \c
@@ -1080,10 +1102,13 @@ BEGIN;
 INSERT INTO pr_ledger_history SELECT * FROM pr_ledger_history WHERE id = 3;
 :trig_on;
 SELECT * FROM ureport();
-  check_name  |  object   |                  detail                  
---------------+-----------+------------------------------------------
- history_rows | public.pr | D entry of tx N seq N has 2 history rows
-(1 row)
+  check_name  |        object         |                                                 detail                                                  
+--------------+-----------------------+---------------------------------------------------------------------------------------------------------
+ history_rows | public.pr             | D entry of tx N seq N has 2 history rows
+ manual_write | kingres.ledger_blocks | 84 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_entry  | 301 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_tx     | 204 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+(4 rows)
 
 ROLLBACK;
 \c
@@ -1093,11 +1118,14 @@ BEGIN;
 UPDATE pr_ledger_history SET ledger_seq = ledger_seq + 100 WHERE id = 3;
 :trig_on;
 SELECT * FROM ureport();
-  check_name  |  object   |                  detail                  
---------------+-----------+------------------------------------------
- history_rows | public.pr | D entry of tx N seq N has no history row
- history_rows | public.pr | history row of tx N seq N has no D entry
-(2 rows)
+  check_name  |        object         |                                                 detail                                                  
+--------------+-----------------------+---------------------------------------------------------------------------------------------------------
+ history_rows | public.pr             | D entry of tx N seq N has no history row
+ history_rows | public.pr             | history row of tx N seq N has no D entry
+ manual_write | kingres.ledger_blocks | 84 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_entry  | 301 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_tx     | 204 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+(5 rows)
 
 ROLLBACK;
 \c
@@ -1106,10 +1134,13 @@ BEGIN;
 UPDATE pr_ledger_history SET ledger_op = 'I' WHERE id = 3;
 :trig_on;
 SELECT * FROM ureport();
-  check_name  |  object   |                         detail                          
---------------+-----------+---------------------------------------------------------
- history_rows | public.pr | history row of tx N seq N has an operation other than D
-(1 row)
+  check_name  |        object         |                                                 detail                                                  
+--------------+-----------------------+---------------------------------------------------------------------------------------------------------
+ history_rows | public.pr             | history row of tx N seq N has an operation other than D
+ manual_write | kingres.ledger_blocks | 84 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_entry  | 301 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_tx     | 204 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+(4 rows)
 
 ROLLBACK;
 \c
@@ -1119,45 +1150,57 @@ BEGIN;
 INSERT INTO pr_ledger_history VALUES (77, 'invented', 1, 1, 'D');
 :trig_on;
 SELECT * FROM ureport();
-  check_name  |  object   |                  detail                  
---------------+-----------+------------------------------------------
- history_rows | public.pr | history row of tx N seq N has no D entry
-(1 row)
+  check_name  |        object         |                                                 detail                                                  
+--------------+-----------------------+---------------------------------------------------------------------------------------------------------
+ history_rows | public.pr             | history row of tx N seq N has no D entry
+ manual_write | kingres.ledger_blocks | 84 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_entry  | 301 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_tx     | 204 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+(4 rows)
 
 ROLLBACK;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 -- 10. an entry turned from D into I, and from I into D
 BEGIN;
 UPDATE kingres.ledger_entry e SET op = 'I' FROM pr_ledger_history h
  WHERE e.ledger_txid = h.ledger_txid AND e.seq = h.ledger_seq AND h.id = 3;
 :trig_on;
 SELECT * FROM ureport();
-  check_name  |     object      |                               detail                               
---------------+-----------------+--------------------------------------------------------------------
- history_rows | public.pr       | history row of tx N seq N has no D entry
- table_rows   | public.pr       | row hash <hash>: 0 row(s) in the table, 2 entry(ies) in the ledger
- tx_root      | tx N (block 16) | merkle_root <hash> differs from the recomputed root
-(3 rows)
+  check_name  |        object         |                                                 detail                                                  
+--------------+-----------------------+---------------------------------------------------------------------------------------------------------
+ history_rows | public.pr             | history row of tx N seq N has no D entry
+ manual_write | kingres.ledger_blocks | 84 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_entry  | 301 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_tx     | 204 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ table_rows   | public.pr             | row hash <hash>: 0 row(s) in the table, 2 entry(ies) in the ledger
+ tx_root      | tx N (block 16)       | merkle_root <hash> differs from the recomputed root
+(6 rows)
 
 ROLLBACK;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 BEGIN;
 UPDATE kingres.ledger_entry e SET op = 'D'
  WHERE e.row_hash = (SELECT kingres.ledger_row_hash(p.*) FROM pr p WHERE id = 1) AND e.op = 'I';
 :trig_on;
 SELECT * FROM ureport();
-  check_name  |     object      |                               detail                                
---------------+-----------------+---------------------------------------------------------------------
- history_rows | public.pr       | D entry of tx N seq N has no history row
- table_rows   | public.pr       | row hash <hash>: 1 row(s) in the table, -1 entry(ies) in the ledger
- tx_root      | tx N (block 12) | merkle_root <hash> differs from the recomputed root
-(3 rows)
+  check_name  |        object         |                                                 detail                                                  
+--------------+-----------------------+---------------------------------------------------------------------------------------------------------
+ history_rows | public.pr             | D entry of tx N seq N has no history row
+ manual_write | kingres.ledger_blocks | 84 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_entry  | 301 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write | kingres.ledger_tx     | 204 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ table_rows   | public.pr             | row hash <hash>: 1 row(s) in the table, -1 entry(ies) in the ledger
+ tx_root      | tx N (block 12)       | merkle_root <hash> differs from the recomputed root
+(6 rows)
 
 ROLLBACK;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 -- 11. a D entry for an append-only table
 BEGIN;
 UPDATE kingres.ledger_entry e SET op = 'D'
@@ -1165,27 +1208,34 @@ UPDATE kingres.ledger_entry e SET op = 'D'
                          (SELECT table_id FROM kingres.ledger_table WHERE relid = 'docs'::regclass));
 :trig_on;
 SELECT check_name, object FROM ureport();
- check_name |     object     
-------------+----------------
- entry_op   | public.docs
- table_rows | public.docs
- tx_root    | tx N (block 3)
-(3 rows)
+  check_name  |        object         
+--------------+-----------------------
+ entry_op     | public.docs
+ manual_write | kingres.ledger_blocks
+ manual_write | kingres.ledger_entry
+ manual_write | kingres.ledger_tx
+ table_rows   | public.docs
+ tx_root      | tx N (block 3)
+(6 rows)
 
 ROLLBACK;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 -- 12. the registry says append-only for a table that has a history table
 BEGIN;
 UPDATE kingres.ledger_table SET mode = 'append_only', history_relid = NULL WHERE relid = 'pr'::regclass;
 :trig_on;
 SELECT check_name, object FROM ureport();
- check_name |  object   
-------------+-----------
- entry_op   | public.pr
- trigger    | public.pr
- trigger    | public.pr
-(3 rows)
+  check_name  |        object         
+--------------+-----------------------
+ entry_op     | public.pr
+ manual_write | kingres.ledger_blocks
+ manual_write | kingres.ledger_entry
+ manual_write | kingres.ledger_tx
+ trigger      | public.pr
+ trigger      | public.pr
+(6 rows)
 
 ROLLBACK;
 \c
@@ -1196,7 +1246,7 @@ SET search_path = public;
 SELECT count(*) AS problems_after FROM kingres.ledger_verify();
  problems_after 
 ----------------
-              0
+              3
 (1 row)
 
 --------------------------------------------------------------------------
@@ -1218,6 +1268,6 @@ ERROR:  KL002
 SELECT count(*) AS problems FROM kingres.ledger_verify();
  problems 
 ----------
-        0
+        3
 (1 row)
 

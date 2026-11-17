@@ -5,6 +5,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -300,4 +301,17 @@ func TestProofCommandOperation(t *testing.T) {
 	if res.Info["op"] != "D" {
 		t.Errorf("info.op = %v, want D", res.Info["op"])
 	}
+}
+
+// failingWriter refuses every write, as a closed descriptor or a full disk does.
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("no space left on device") }
+
+// runFailingStdout is run with a standard output that cannot be written.
+func runFailingStdout(t *testing.T, args ...string) (code int, stdout, stderr string) {
+	t.Helper()
+	var errb bytes.Buffer
+	code = Run(args, failingWriter{}, &errb, "test")
+	return code, "", errb.String()
 }

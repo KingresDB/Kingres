@@ -160,11 +160,14 @@ CREATE TABLE kingres.pending_node (
     host       text        NOT NULL,
     port       int         NOT NULL,
     created_at timestamptz NOT NULL,
+    -- the id the node had in the catalog when remove_node() wrote the row (S11-05): the node still
+    -- answers to it until the removal commits, and a prepared part of the removal must be reached
+    node_id    int,
     CONSTRAINT pending_node_pkey PRIMARY KEY (host, port)
 );
 
 COMMENT ON TABLE kingres.pending_node IS
-    'Node-local: addresses add_node() prepared a transaction on before registering them; never synchronized';
+    'Node-local: addresses add_node() prepared a transaction on before registering them, and nodes that remove_node() takes out of the catalog; never synchronized';
 
 COMMENT ON TABLE kingres.node IS
     'Every PostgreSQL instance of the cluster, with its shard group and role';

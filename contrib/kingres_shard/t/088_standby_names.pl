@@ -55,6 +55,42 @@ foreach my $c (@cases)
 		"standby_name_matches('$elem') agrees with PostgreSQL");
 }
 
+# --- long names (S11-06): the standby's name is cut by the server to 63 bytes, the elements of the
+# list are not.  Two more standbys: one of 62 bytes and one of 200, which the server shows as 63.
+my $long62 = 'y' x 62;
+my $long200 = 'x' x 200;
+my $s62 = make_standby($n[1], $long62);
+my $s200 = make_standby($n[1], $long200);
+ok($n[1]->poll_query_until('postgres', "SELECT count(*) = 3 FROM pg_stat_replication WHERE state = 'streaming'"),
+	'all three standbys stream (wait_for_catchup cannot find the one whose name the server cut)');
+is($n[1]->safe_psql('postgres', "SELECT string_agg(length(application_name)::text, ',' ORDER BY length(application_name)) FROM pg_stat_replication"),
+	'9,62,63', 'the server shows the names with 9, 62 and 63 bytes (200 is cut to 63)');
+my @long = (
+	[ 'y' x 62, 1 ], [ 'y' x 63, 0 ], [ 'x' x 62, 0 ], [ 'x' x 63, 1 ], [ 'x' x 64, 0 ], [ 'x' x 65, 0 ], [ 'x' x 200, 0 ],
+	[ '"' . ('x' x 63) . '"', 1 ], [ '"' . ('x' x 64) . '"', 0 ], [ '"' . ('x' x 200) . '"', 0 ],
+);
+foreach my $c (@long)
+{
+	my ($elem, $expect) = @$c;
+	my $label = length($elem) > 20 ? substr($elem, 0, 3) . '...(' . length($elem) . ' bytes)' : $elem;
+	$n[1]->append_conf('postgresql.conf', "synchronous_standby_names = 'ANY 1 ($elem)'\n");
+	$n[1]->reload;
+	my $got = $n[1]->poll_query_until('postgres',
+		"SELECT count(*) " . ($expect ? ">= 1" : "= 0") . " FROM pg_stat_replication WHERE sync_state = 'quorum'")
+	  ? $expect : 1 - $expect;
+	is($got, $expect, "PostgreSQL: the element $label " . ($expect ? 'matches' : 'does not match') . " a standby");
+	is($n[1]->safe_psql('postgres', "SELECT kingres.standby_name_matches('$elem')"), $expect ? 't' : 'f',
+		"standby_name_matches agrees for $label");
+}
+# names that cannot be written bare make PostgreSQL reject the whole list, so nothing matches them
+foreach my $elem ('My-Standby', 'any', 'FIRST', '1abc', 'a b')
+{
+	is($n[1]->safe_psql('postgres', "SELECT kingres.internal_sync_name_matches('$elem', '$elem')"), 'f',
+		"a bare element $elem that the list scanner does not read as a name matches nothing");
+}
+is($n[1]->safe_psql('postgres', q{SELECT kingres.internal_sync_name_matches('"My-Standby"', 'my-standby')}), 't',
+	'the same name in double quotes matches');
+
 # the primary of a group without a registered standby answers false whatever the name
 is($n[0]->safe_psql('postgres', "SELECT kingres.standby_name_matches('*')"), 'f',
 	'a node whose group has no standby answers false');

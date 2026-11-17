@@ -13,6 +13,7 @@ DROP DATABASE IF EXISTS kl_head_t;
 CREATE DATABASE kl_head_t;
 \c kl_head_t
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 \set VERBOSITY terse
 CREATE EXTENSION kingres_ledger;
 
@@ -152,6 +153,7 @@ END $$;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_blocks SET tx_count = tx_count + 1 WHERE height = 2;
 :trig_on;
 \c
@@ -164,6 +166,7 @@ SELECT height FROM kingres.ledger_head();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
@@ -175,6 +178,7 @@ SELECT public.page(0, 100) AS restored;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_blocks SET block_hash = sha256('forged') WHERE height = 3;
 :trig_on;
 \c
@@ -185,6 +189,7 @@ SELECT public.page(4, 1) AS the_block_after;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
@@ -194,6 +199,7 @@ SET search_path = public;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM kingres.ledger_blocks WHERE height = 2;
 :trig_on;
 \c
@@ -204,6 +210,7 @@ SELECT public.page(3, 2) AS after_the_gap;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
@@ -213,6 +220,7 @@ SET search_path = public;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_blocks SET hash_version = 2 WHERE height = 1;
 :trig_on;
 \c
@@ -221,6 +229,7 @@ SELECT public.page(1, 1) AS version_two;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 UPDATE kingres.ledger_blocks SET tx_merkle_root = '\x00' WHERE height = 4;
 :trig_on;
@@ -230,6 +239,7 @@ SELECT public.page(4, 1) AS short_root;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
@@ -239,6 +249,7 @@ SET search_path = public;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_chain SET chain_id = sha256('another chain');
 :trig_on;
 \c
@@ -250,6 +261,7 @@ SELECT height FROM kingres.ledger_head();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM kingres.ledger_chain;
 :trig_on;
 \c
@@ -259,6 +271,7 @@ SELECT public.page(0, 1) AS no_chain_identity;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
@@ -273,6 +286,7 @@ SELECT count(*) AS problems FROM kingres.ledger_verify();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM kingres.ledger_blocks WHERE height = 4;
 :trig_on;
 \c
@@ -283,6 +297,7 @@ SELECT (SELECT count(*) FROM kingres.ledger_verify()) > 0 AS verify_sees_it;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM kingres.ledger_blocks WHERE height >= 2;
 :trig_on;
 \c
@@ -292,6 +307,7 @@ SELECT public.head_err() AS head;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM kingres.ledger_blocks;
 :trig_on;
 \c
@@ -304,6 +320,7 @@ SELECT public.page(0, 100) AS entries_after_losing_everything;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 DELETE FROM kingres.ledger_blocks WHERE height = 4;
 DELETE FROM kingres.ledger_tx WHERE block_height = 4;
@@ -314,6 +331,7 @@ SELECT height FROM kingres.ledger_head();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
@@ -325,6 +343,7 @@ SELECT height FROM kingres.ledger_head();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM kingres.ledger_blocks WHERE height = 4;
 DELETE FROM kingres.ledger_tx WHERE block_height = 4;
 :trig_on;
@@ -334,6 +353,7 @@ SELECT * FROM kingres.ledger_head();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
@@ -342,6 +362,7 @@ SELECT kingres.ledger_generate_digest() IS NOT NULL AS digest_again;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_digest SET block_hash = sha256('not the block');
 :trig_on;
 \c
@@ -350,6 +371,7 @@ SELECT * FROM kingres.ledger_head();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
@@ -361,6 +383,7 @@ SELECT height FROM kingres.ledger_head();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_blocks SET tx_count = tx_count + 1 WHERE height = 4;
 :trig_on;
 \c
@@ -369,6 +392,7 @@ SELECT * FROM kingres.ledger_head();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 -- A head with the right hash for a link that is wrong.
 DELETE FROM kingres.ledger_blocks WHERE height = 4;
@@ -384,6 +408,7 @@ SELECT public.page(4, 1) AS wrong_link_through_entries;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 -- Block 0 gone while the head is above it.
 DELETE FROM kingres.ledger_blocks WHERE height = 0;
@@ -395,6 +420,7 @@ SELECT public.page(1, 2) AS from_one_without_block_zero;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
@@ -404,6 +430,7 @@ SET search_path = public;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_chain SET chain_id = sha256('another chain');
 :trig_on;
 \c
@@ -412,6 +439,7 @@ SELECT public.page(3, 1) AS middle_block_other_chain;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c
@@ -426,6 +454,7 @@ UPDATE pg_index SET indisunique = false, indisprimary = false
  WHERE indexrelid = 'kingres.ledger_blocks_pkey'::regclass;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 INSERT INTO kingres.ledger_blocks SELECT * FROM public.saved_blocks WHERE height = 3;
 :trig_on;
 \c
@@ -435,6 +464,7 @@ SELECT public.page(0, 100) AS duplicated_height_from_zero;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM kingres.ledger_blocks WHERE height = 3;
 INSERT INTO kingres.ledger_blocks SELECT * FROM public.saved_blocks WHERE height = 3;
 UPDATE pg_index SET indisunique = true, indisprimary = true
@@ -451,6 +481,7 @@ SELECT public.page(0, 100) AS restored_after_duplicate;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 INSERT INTO kingres.ledger_blocks
 SELECT 5, 1, b.block_hash, b.tx_merkle_root, 0, b.closed_at,
        sha256(kingres.ledger_block_preimage(1::smallint, 5, b.block_hash, b.tx_merkle_root, 0, b.closed_at))
@@ -464,6 +495,7 @@ SELECT count(*) > 0 AS verify_sees_the_successor FROM kingres.ledger_verify();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
 :trig_on;
 \c

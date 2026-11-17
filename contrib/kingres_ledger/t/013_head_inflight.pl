@@ -111,7 +111,7 @@ cmp_ok(q1($primary, 'SELECT count(*) FROM kingres.ledger_digest'), '>', 0, 'dige
 $primary->wait_for_catchup($standby);
 my $head = q1($primary, 'SELECT height FROM kingres.ledger_head()');
 is(q1($standby, 'SELECT height FROM kingres.ledger_head()'), $head, 'the standby has the primary head');
-q1($primary, q(INSERT INTO kingres.ledger_tx
+q1($primary, q(SET kingres_ledger.allow_manual_write = on; INSERT INTO kingres.ledger_tx
 	VALUES (900000007, 7777, 0, 1, sha256('x'), 'x')));
 $primary->wait_for_catchup($standby);
 foreach my $node ($primary, $standby)
@@ -121,8 +121,8 @@ foreach my $node ($primary, $standby)
 	isnt($ret, 0, "ledger_head refuses on the $name");
 	like($err, qr/the head is block \Q$head\E, but the row of transaction 900000007 in kingres\.ledger_tx names block 7777/,
 		"the error on the $name names the row, the table and the block");
-	is(q1($node, q(SELECT string_agg(check_name || ' ' || object, ',') FROM kingres.ledger_verify())),
-		'tx_block tx 900000007', "ledger_verify on the $name reports the same row");
+	is(q1($node, q(SELECT string_agg(check_name || ' ' || object, ',' ORDER BY check_name) FROM kingres.ledger_verify())),
+		'manual_write kingres.ledger_tx,tx_block tx 900000007', "ledger_verify on the $name reports the same row, and the write by hand");
 }
 
 $standby->stop;

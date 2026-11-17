@@ -92,6 +92,19 @@ extern int64 kingres_shard_partition_set_identity(int n, const Oid *oids);
 extern int64 kingres_shard_partition_identity_now(Oid parent);
 extern const KsDistTable *kingres_shard_lookup_dist_table(Oid relid);
 extern const KsColocation *kingres_shard_lookup_colocation(int colocation_id);
+
+/*
+ * The buckets of a colocation group.  Code that walks the buckets, or asks
+ * which group owns one, uses these and never reads bucket_count or
+ * bucket_group itself, and never assumes that the numbers of the buckets are
+ * 0 .. n - 1 (design/shard-phase2b.md, section 4.7; hashing.h has the lookup
+ * from a hash value).  The i-th bucket, for i in 0 .. nbuckets - 1, is
+ * kingres_shard_coloc_bucket(); the group that owns a bucket is -1 when the
+ * bucket is not mapped or is not a bucket of the group.
+ */
+extern int	kingres_shard_coloc_nbuckets(const KsColocation *coloc);
+extern int	kingres_shard_coloc_bucket(const KsColocation *coloc, int i);
+extern int	kingres_shard_bucket_group(const KsColocation *coloc, int bucket);
 extern const KsNode *kingres_shard_group_primary(int group_id);
 extern const KsNode *kingres_shard_node_by_id(int node_id);
 extern Oid	kingres_shard_catalog_relid(const char *relname);

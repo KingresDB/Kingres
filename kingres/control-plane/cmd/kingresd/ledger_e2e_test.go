@@ -133,10 +133,22 @@ func TestLedgerDigestsVerificationsAndUpdatableTables(t *testing.T) {
 	if ls["verificationState"] != nil {
 		t.Errorf("0.1 status invents a verification state: %v", ls)
 	}
-	if s, o, _ := e.call("PUT", "/databases/old01/schemas/public/tables/x/ledger", map[string]any{"mode": "updatable"}, nil); s != 404 && s != 422 {
-		t.Errorf("updatable on 0.1: %d %v", s, o)
+	// A database on 0.2 has the records, but the installed library writes
+	// the ledger only through the functions of its own version: both calls
+	// say what to run. (After the update, below, they are accepted.)
+	if _, err := oc.Exec(context.Background(), "alter extension kingres_ledger update to '0.2'"); err != nil {
+		t.Fatal(err)
 	}
-	// Upgraded in place, the same database gets the 0.2 features.
+	for _, p := range []string{"/databases/old01/ledger/digests", "/databases/old01/ledger/verifications"} {
+		s, o, _ := e.call("POST", p, nil, nil)
+		if s != 422 || problemCode(o) != "unsupported_operation" || !strings.Contains(fmt.Sprint(o["detail"]), "ALTER EXTENSION kingres_ledger UPDATE") {
+			t.Errorf("POST %s on 0.2: %d %v", p, s, o)
+		}
+	}
+	if s, o, _ := e.call("PUT", "/databases/old01/schemas/public/tables/x/ledger", map[string]any{"mode": "updatable"}, nil); s != 404 && s != 422 {
+		t.Errorf("updatable before the update: %d %v", s, o)
+	}
+	// Upgraded in place, the same database gets the features of the current version.
 	if _, err := oc.Exec(context.Background(), "alter extension kingres_ledger update"); err != nil {
 		t.Fatal(err)
 	}

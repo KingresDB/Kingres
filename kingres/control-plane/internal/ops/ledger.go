@@ -55,6 +55,28 @@ func needRecords(ctx context.Context, x execer) error {
 	return nil
 }
 
+// needCurrentLedger refuses a call that writes the ledger when the SQL of the
+// extension in this database is not the version of the installed library.
+// The library writes the ledger tables only through the functions of its own
+// version (kingres_ledger README, "Upgrades"): with older SQL PostgreSQL
+// answers "insufficient privilege", which would reach the caller as
+// "forbidden" and say nothing of what to do. The capture triggers keep
+// working in such a database; what waits for the update is everything that
+// this file and EnableLedger call.
+func needCurrentLedger(ctx context.Context, x execer) error {
+	var have, want string
+	if err := x.QueryRow(ctx, `SELECT
+		coalesce((SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'kingres_ledger'), ''),
+		coalesce((SELECT default_version FROM pg_catalog.pg_available_extensions WHERE name = 'kingres_ledger'), '')`).Scan(&have, &want); err != nil {
+		return err
+	}
+	if have == "" || want == "" || have == want {
+		return nil
+	}
+	return problem.New(problem.UnsupportedOp, "This database has kingres_ledger "+have+" and the installed library is "+want+
+		"; the ledger is written again after ALTER EXTENSION kingres_ledger UPDATE in this database.")
+}
+
 type digestRow struct {
 	id          int64
 	at          time.Time
@@ -101,6 +123,9 @@ func (o *Ops) GenerateDigest(ctx context.Context, db, actor string) (api.LedgerD
 	var chain string
 	err := o.asService(ctx, db, func(tx pgx.Tx) error {
 		if err := needRecords(ctx, tx); err != nil {
+			return err
+		}
+		if err := needCurrentLedger(ctx, tx); err != nil {
 			return err
 		}
 		var dig []byte
@@ -254,7 +279,12 @@ func (o *Ops) PrepareVerification(ctx context.Context, db string, req api.Ledger
 	if req.DigestID != nil {
 		return nil, problem.New(problem.UnsupportedOp, "Verifying against a recorded digest is not supported yet.")
 	}
-	err := o.asService(ctx, db, func(tx pgx.Tx) error { return needRecords(ctx, tx) })
+	err := o.asService(ctx, db, func(tx pgx.Tx) error {
+		if err := needRecords(ctx, tx); err != nil {
+			return err
+		}
+		return needCurrentLedger(ctx, tx)
+	})
 	if err != nil {
 		return nil, wrap(err)
 	}
@@ -295,6 +325,12 @@ func (o *Ops) stepVerifyLedger(ctx context.Context, env *task.Env) error {
 		// Nothing is new since the last clean run: check the head block again, so
 		// that the task that is reported done has a record of what it checked.
 		from = *top
+	}
+	// The record of a verification is a write: say what to run, not
+	// "insufficient privilege", when the SQL of the extension is older than
+	// the library.
+	if err := needCurrentLedger(ctx, c); err != nil {
+		return err
 	}
 	var id int64
 	if err := c.QueryRow(ctx, "SELECT kingres.ledger_verify_recorded($1, NULL)", from).Scan(&id); err != nil {

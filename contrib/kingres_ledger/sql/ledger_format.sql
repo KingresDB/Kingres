@@ -162,11 +162,14 @@ UPDATE pg_trigger SET tgenabled = 'D'
 WHERE tgname IN ('kingres_ledger_capture', 'kingres_ledger_block_modify', 'kingres_ledger_block_truncate');
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_blocks b
 SET closed_at = closed_at + interval '1 hour',
     block_hash = kingres.ledger_block_hash(b.hash_version, b.height, b.prev_hash, b.tx_merkle_root,
                                             b.tx_count, b.closed_at + interval '1 hour')
 WHERE b.height = :last_height;
+-- A digest recorded for a block that was rewritten no longer names its hash.
+DELETE FROM kingres.ledger_digest d WHERE d.height = :last_height;
 UPDATE pg_trigger SET tgenabled = 'A'
 WHERE tgname IN ('kingres_ledger_capture', 'kingres_ledger_block_modify', 'kingres_ledger_block_truncate');
 \c
@@ -188,11 +191,14 @@ UPDATE pg_trigger SET tgenabled = 'D'
 WHERE tgname IN ('kingres_ledger_capture', 'kingres_ledger_block_modify', 'kingres_ledger_block_truncate');
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_blocks b
 SET closed_at = closed_at - interval '2 hours',
     block_hash = kingres.ledger_block_hash(b.hash_version, b.height, b.prev_hash, b.tx_merkle_root,
                                             b.tx_count, b.closed_at - interval '2 hours')
 WHERE b.height = (SELECT max(height) FROM kingres.ledger_blocks);
+DELETE FROM kingres.ledger_digest d
+ WHERE NOT EXISTS (SELECT 1 FROM kingres.ledger_blocks b WHERE b.height = d.height AND b.block_hash = d.block_hash);
 UPDATE pg_trigger SET tgenabled = 'A'
 WHERE tgname IN ('kingres_ledger_capture', 'kingres_ledger_block_modify', 'kingres_ledger_block_truncate');
 \c
@@ -207,11 +213,14 @@ UPDATE pg_trigger SET tgenabled = 'D'
 WHERE tgname IN ('kingres_ledger_capture', 'kingres_ledger_block_modify', 'kingres_ledger_block_truncate');
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_blocks b
 SET closed_at = closed_at + interval '2 hours',
     block_hash = kingres.ledger_block_hash(b.hash_version, b.height, b.prev_hash, b.tx_merkle_root,
                                             b.tx_count, b.closed_at + interval '2 hours')
 WHERE b.height = (SELECT max(height) FROM kingres.ledger_blocks);
+DELETE FROM kingres.ledger_digest d
+ WHERE NOT EXISTS (SELECT 1 FROM kingres.ledger_blocks b WHERE b.height = d.height AND b.block_hash = d.block_hash);
 UPDATE pg_trigger SET tgenabled = 'A'
 WHERE tgname IN ('kingres_ledger_capture', 'kingres_ledger_block_modify', 'kingres_ledger_block_truncate');
 \c

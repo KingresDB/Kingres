@@ -251,5 +251,136 @@ ROLLBACK;}, stdout => \$out, stderr => \$err, on_error_stop => 0);
 	cmp_ok($mx, '>=', 8 * $MB, '... and the measure sees the buffers (they do hold some)');
 }
 
+# ------------------------------------------------------------------------
+# 6. C7-04: one large value.  The bound above treats the stripe being built (S)
+#    as a number the caller chooses; for a value larger than a chunk group it is
+#    the largest term.  A value of V bytes is held by the executor (V), copied into
+#    the buffer (V), copied into the contiguous raw chunk that is encoded (V), and
+#    its compressed output exists with its copy in the stripe blob (up to 2 V
+#    more): S <= 2 (32 MB + V) + 2A + V, with V the largest value, the term the
+#    README states.  A 64 MB value under the smallest allowance, compared with a
+#    heap twin of the same statement (which has the expression's own memory):
+#    the backend grows by at most the stated bound, and by at most 4 V more than
+#    heap does.  The README's earlier bound (3 R plus a stripe term chosen by the
+#    caller) is smaller than what this takes.
+# ------------------------------------------------------------------------
+{
+	my $A = 1 * $MB;
+	my $V = 64 * $MB;
+	$node->safe_psql('postgres', q{
+DROP TABLE IF EXISTS tv, hv;
+CREATE TABLE tv (id int, pad text) USING columnar;
+CREATE TABLE hv (id int, pad text);});
+	my %g;
+	foreach my $t ('tv', 'hv')
+	{
+		my ($out, $err, $grow) = measured("SET kingres_columnar.write_buffer_memory = '1MB'; BEGIN;
+INSERT INTO $t SELECT 1, repeat('x', $V);
+COMMIT;");
+		unlike($err, qr/ERROR/, "one value of 64 MB into $t: no error");
+		$g{$t} = $grow;
+	}
+	my $large = bound($A, $V, 2 * (32 * $MB + $V) + 2 * $A + $V);
+	cmp_ok($g{tv}, '<=', $large,
+		sprintf('a value of 64 MB: the backend grew by %.0f MB, within the stated bound of %.0f MB', $g{tv} / $MB, $large / $MB));
+	cmp_ok($g{tv}, '<=', $g{hv} + 4 * $V,
+		sprintf('... and by at most 4 V more than heap (%.0f MB against %.0f MB)', $g{tv} / $MB, $g{hv} / $MB));
+	is($node->safe_psql('postgres', 'SELECT count(*) || \'/\' || max(length(pad)) FROM tv'), '1/' . $V, '... and the value is stored whole');
+}
+
+# ------------------------------------------------------------------------
+# 7. C7-03: the constants of the ceiling, each pinned by a measurement that fails
+#    when the constant changes.  The settings are the smallest allowance (1 MB).
+#      the factor:      the error names the limit, exactly twice the setting
+#      the charge:      what one empty-ish buffer costs, measured as the bytes the
+#                       accounting holds (kingres.columnar_write_paths, bytes_held):
+#                       2048 for the buffer and 272 for its first 16 row slots of
+#                       one int column; and the number of nested one-row levels
+#                       that fit under the ceiling follows from it (904)
+#      the hand-over:   a level whose release would leave more than the ceiling in
+#                       its parent is refused, though no write was
+# ------------------------------------------------------------------------
+{
+	$node->safe_psql('postgres', q{
+DROP TABLE IF EXISTS tn, tc;
+CREATE TABLE tn (a int) USING columnar;
+CREATE TABLE tc (id int, pad text) USING columnar;
+SELECT kingres.columnar_set_options('tc', stripe_row_count => 1000000);});
+	my $held = "SELECT 'HELD=' || hits FROM kingres.columnar_write_paths() WHERE path = 'bytes_held';";
+
+	# the charge of a buffer: one level per row, the accounting read at 1, 2 and 3 levels
+	my ($out, $err) = ('', '');
+	$node->psql('postgres', "SET kingres_columnar.write_buffer_memory = '1MB'; BEGIN;
+INSERT INTO tn VALUES (1);\n$held
+SAVEPOINT s1; INSERT INTO tn VALUES (1);\n$held
+SAVEPOINT s2; INSERT INTO tn VALUES (1);\n$held
+ROLLBACK;", stdout => \$out, stderr => \$err);
+	my @h = $out =~ /HELD=(\d+)/g;
+	is(scalar(@h), 3, 'the accounting is readable at three points');
+	my $charge = $h[1] - $h[0];
+	cmp_ok($charge, '>=', 2300, "the charge of one more level (a buffer and the room for 16 rows of one int column) is $charge bytes: at least the 2048 of the buffer");
+	cmp_ok($charge, '<=', 2340, "... and at most that and the 272 bytes of its row slots (a change of the 2 kB per buffer changes this)");
+	is($h[2] - $h[1], $charge, '... every level costs the same');
+
+	# the charge of a tail that a flush keeps (a buffer that holds more rows than a stripe,
+	# which the developer setting max_stripe_rows makes of 5000 buffered rows): five stripes
+	# are written, one row stays in a buffer of its own, and the accounting holds that buffer
+	# and nothing else (2048 for the buffer, 272 for its 16 row slots)
+	$node->safe_psql('postgres', "DROP TABLE IF EXISTS ts; CREATE TABLE ts (a int) USING columnar");
+	($out, $err) = ('', '');
+	$node->psql('postgres', "SET kingres_columnar.write_buffer_memory = '128MB'; BEGIN;
+INSERT INTO ts SELECT generate_series(1, 5000);
+SET kingres_columnar.max_stripe_rows = 1000;
+INSERT INTO ts VALUES (1);\n$held
+COMMIT;
+SELECT 'STRIPES=' || count(*) FROM kingres.columnar_stripes('ts');", stdout => \$out, stderr => \$err);
+	my ($tailheld) = $out =~ /HELD=(\d+)/;
+	cmp_ok($tailheld, '>=', 2300, "a flush that keeps a tail of one row: the accounting holds $tailheld bytes, the buffer of the tail (a tail not charged holds none)");
+	cmp_ok($tailheld, '<=', 2340, '... and not more than the buffer and its row slots');
+	like($out, qr/STRIPES=6\b/, '... five stripes were written by that flush, and the last row by the commit');
+
+	# the factor and the number of levels under the ceiling
+	my $script = join("\n", map { "SAVEPOINT s$_; INSERT INTO tn VALUES ($_); SELECT 'LEVEL $_';" } 1 .. 1100);
+	($out, $err) = ('', '');
+	$node->psql('postgres', "SET kingres_columnar.write_buffer_memory = '1MB'; BEGIN;\n$script\nROLLBACK;", stdout => \$out, stderr => \$err);
+	like($err, qr/hold \d+ bytes, more than the limit of 2097152 bytes/, 'nested one-row levels under 1 MB: the limit the error names is 2097152 bytes, twice the setting');
+	my $levels = () = $out =~ /LEVEL \d+/g;
+	my $want = int(2097152 / $charge) + 1;
+	cmp_ok($levels, '>=', $want - 3, "$levels levels fit under the ceiling (the charge and the factor give $want)");
+	cmp_ok($levels, '<=', $want + 3, '... not more (the README states this number)');
+	($out, $err) = ('', '');
+	$node->psql('postgres', "SET kingres_columnar.write_buffer_memory = '2MB'; BEGIN;\n$script\n" . join("\n", map { "SAVEPOINT t$_; INSERT INTO tn VALUES ($_);" } 1 .. 1000) . "\nROLLBACK;", stdout => \$out, stderr => \$err);
+	like($err, qr/more than the limit of 4194304 bytes/, 'under 2 MB the limit is 4194304 bytes');
+
+	# the ceiling of a hand-over (t/026 has the same script)
+	($out, $err) = ('', '');
+	$node->psql('postgres', "SET kingres_columnar.write_buffer_memory = '1MB';
+SELECT * FROM kingres.columnar_write_paths(true) WHERE false;
+BEGIN;
+INSERT INTO tc SELECT g, repeat('x', 100000) FROM generate_series(1, 10) g;
+SAVEPOINT s1;
+INSERT INTO tc SELECT g, repeat('x', 100000) FROM generate_series(1, 5) g;
+SAVEPOINT s2;
+INSERT INTO tc SELECT g, repeat('x', 100000) FROM generate_series(1, 5) g;
+DECLARE cur CURSOR FOR SELECT count(*) FROM tc;
+FETCH 1 FROM cur;
+SAVEPOINT s3;
+INSERT INTO tc SELECT g, repeat('x', 100000) FROM generate_series(1, 1) g;
+SELECT 'AT3=' || hits FROM kingres.columnar_write_paths() WHERE path = 'bytes_held';
+RELEASE s3;
+ROLLBACK;
+SELECT 'HANDOVER=' || hits FROM kingres.columnar_write_paths() WHERE path = 'ceiling_handover';
+SELECT 'WRITE=' || hits FROM kingres.columnar_write_paths() WHERE path = 'ceiling_write';",
+		stdout => \$out, stderr => \$err, on_error_stop => 0);
+	my ($at3) = $out =~ /AT3=(\d+)/;
+	cmp_ok($at3, '<=', 2 * 1024 * 1024 + 150000, 'hand-over: the fourth level holds the memory just over the ceiling, by its last row');
+	cmp_ok($at3, '>', 2 * 1024 * 1024, '... over it, though the write that did it passed (the ceiling is checked before a row is added)');
+	like($err, qr/would hold $at3 bytes after this subtransaction, more than the limit of 2097152 bytes/,
+		'the release of the level that would leave more than the ceiling in its parent is refused');
+	like($out, qr/HANDOVER=1\b/, '... and counted as the ceiling of a hand-over, not of a write');
+	like($out, qr/WRITE=0\b/, '... no write was refused');
+	is($node->safe_psql('postgres', 'SELECT count(*) FROM tc'), 0, '... and the transaction left nothing');
+}
+
 $node->stop;
 done_testing();

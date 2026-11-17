@@ -526,6 +526,7 @@ SELECT * FROM ureport();
 ROLLBACK;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 -- 5. a D entry removed together with its history row (a block that was built
 -- has covered it: the transaction root no longer matches)
 BEGIN;
@@ -576,6 +577,7 @@ SELECT * FROM ureport();
 ROLLBACK;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 -- 10. an entry turned from D into I, and from I into D
 BEGIN;
 UPDATE kingres.ledger_entry e SET op = 'I' FROM pr_ledger_history h
@@ -585,6 +587,7 @@ SELECT * FROM ureport();
 ROLLBACK;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 BEGIN;
 UPDATE kingres.ledger_entry e SET op = 'D'
  WHERE e.row_hash = (SELECT kingres.ledger_row_hash(p.*) FROM pr p WHERE id = 1) AND e.op = 'I';
@@ -593,6 +596,7 @@ SELECT * FROM ureport();
 ROLLBACK;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 -- 11. a D entry for an append-only table
 BEGIN;
 UPDATE kingres.ledger_entry e SET op = 'D'
@@ -603,6 +607,7 @@ SELECT check_name, object FROM ureport();
 ROLLBACK;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 -- 12. the registry says append-only for a table that has a history table
 BEGIN;
 UPDATE kingres.ledger_table SET mode = 'append_only', history_relid = NULL WHERE relid = 'pr'::regclass;

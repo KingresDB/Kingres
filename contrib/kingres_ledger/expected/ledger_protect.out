@@ -265,7 +265,7 @@ RESET ROLE;
 SELECT count(*) AS problems FROM kingres.ledger_verify();
  problems 
 ----------
-        0
+        3
 (1 row)
 
 SELECT count(*) AS armed_triggers FROM pg_trigger
@@ -311,7 +311,7 @@ ALTER TABLE lp2 RENAME TO lp;
 SELECT count(*) AS problems_after_add_column FROM kingres.ledger_verify();
  problems_after_add_column 
 ---------------------------
-                         0
+                         3
 (1 row)
 
 INSERT INTO lp (id, a, note, extra1) VALUES (2, 20, 'y', 'with extra');
@@ -319,7 +319,7 @@ INSERT INTO lp (id, a, note) VALUES (3, 30, 'z');
 SELECT count(*) AS problems_after_inserts FROM kingres.ledger_verify();
  problems_after_inserts 
 ------------------------
-                      0
+                      3
 (1 row)
 
 SELECT kingres.ledger_generate_digest() IS NOT NULL AS digest_ok;
@@ -331,7 +331,7 @@ SELECT kingres.ledger_generate_digest() IS NOT NULL AS digest_ok;
 SELECT count(*) AS problems_after_block FROM kingres.ledger_verify();
  problems_after_block 
 ----------------------
-                    0
+                    3
 (1 row)
 
 -- Types that ledger columns use: an extension that provides the type cannot
@@ -361,7 +361,7 @@ ALTER TYPE colour RENAME TO color;
 SELECT count(*) AS problems_after_type_changes FROM kingres.ledger_verify();
  problems_after_type_changes 
 -----------------------------
-                           0
+                           3
 (1 row)
 
 -- A table enabled in the transaction that tries to drop it.

@@ -21,5 +21,17 @@ func FuzzVerify(f *testing.F) {
 		if (err1 == nil) != (err2 == nil) {
 			t.Error("verification is not deterministic")
 		}
+		// the proof read in pieces and twice says what the proof in memory says
+		sp, sum, serr := ParseStream(sourceOf(data))
+		if serr != nil {
+			t.Fatalf("Parse accepts what ParseStream refuses: %v", serr)
+		}
+		_, err3 := VerifyStream(sp, sum, d5, Expect{}, sourceOf(data))
+		if (err1 == nil) != (err3 == nil) {
+			t.Errorf("buffered %v, streamed %v", err1, err3)
+		}
+		if _, _, perr := ParseStream(sourceOf(data)); perr != nil {
+			t.Fatalf("not deterministic: %v", perr)
+		}
 	})
 }

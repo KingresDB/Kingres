@@ -552,8 +552,9 @@ kingres_internal_wal_timeline(PG_FUNCTION_ARGS)
  * streams under application_name?  The decision of SyncRepGetStandbyPriority(): the names
  * are compared with pg_strcasecmp(), and the element "*" matches every standby (S10-03).
  * list_name may be written as in the list: in double quotes, with "" for a quote inside, or
- * bare.  Both names are cut to NAMEDATALEN - 1 bytes, as the walsender cuts the
- * application_name and the list scanner cuts its identifiers.
+ * bare (then it must be an identifier of the list's scanner).  Only the standby's name is cut to
+ * NAMEDATALEN - 1 bytes, as the server cuts the application_name; the elements of the list
+ * are not (S11-06).
  */
 PG_FUNCTION_INFO_V1(kingres_internal_sync_name_matches);
 
@@ -581,8 +582,30 @@ kingres_internal_sync_name_matches(PG_FUNCTION_ARGS)
 	}
 	else
 		name = elem;
-	if (strlen(name) >= NAMEDATALEN)
-		name[pg_mbcliplen(name, strlen(name), NAMEDATALEN - 1)] = '\0';
+
+	/*
+	 * A name that is not in double quotes is an identifier of the scanner of the list
+	 * (syncrep_scanner.l): a letter, an underscore or a byte above 127, then those and digits and
+	 * dollar signs; ANY and FIRST are keywords, and "*" is the one other token.  Anything else makes
+	 * PostgreSQL reject the whole list, so no standby matches it (S11-06).
+	 */
+	if (name == elem && strcmp(name, "*") != 0)
+	{
+		const unsigned char *p = (const unsigned char *) name;
+
+		if (!(p[0] == '_' || (p[0] >= 'a' && p[0] <= 'z') || (p[0] >= 'A' && p[0] <= 'Z') || p[0] >= 0x80) ||
+			pg_strcasecmp(name, "ANY") == 0 || pg_strcasecmp(name, "FIRST") == 0)
+			PG_RETURN_BOOL(false);
+		for (p++; *p; p++)
+			if (!(*p == '_' || *p == '$' || (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p >= 0x80))
+				PG_RETURN_BOOL(false);
+	}
+
+	/*
+	 * Only the name of the standby is cut to NAMEDATALEN - 1 bytes, where the server takes it from the
+	 * startup packet; the elements of the list are not cut, so an element of 64 bytes or more matches
+	 * nothing (S11-06).  The element "*" matches every standby.
+	 */
 	if (strlen(app) >= NAMEDATALEN)
 		app[pg_mbcliplen(app, strlen(app), NAMEDATALEN - 1)] = '\0';
 	PG_RETURN_BOOL(pg_strcasecmp(name, app) == 0 || strcmp(name, "*") == 0);
@@ -650,8 +673,13 @@ kingres_switchover_verify(PG_FUNCTION_ARGS)
 	if (x == InvalidXLogRecPtr)
 		switchover_unproven("the position is not valid", x);
 
-	/* A record starts at a multiple of 8, after the header of its page. */
-	if (x % 8 != 0 || !XRecOffIsValid(x))
+	/*
+	 * The first segment of a cluster is segment 1: WAL below wal_segment_size does not exist.  The
+	 * reader asserts on a position in the first page (its address is InvalidXLogRecPtr, S11-03),
+	 * so no position that cannot hold a record reaches it.  A record starts at a multiple of 8,
+	 * after the header of its page.
+	 */
+	if (x < (XLogRecPtr) wal_segment_size || x % 8 != 0 || !XRecOffIsValid(x))
 		switchover_unproven("no WAL record can start at this position", x);
 
 	memset(&priv, 0, sizeof(priv));

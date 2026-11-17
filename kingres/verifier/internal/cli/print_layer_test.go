@@ -22,8 +22,8 @@ type use struct{ fn, ident string }
 
 func TestNoPrintOutsideTheOutputLayer(t *testing.T) {
 	allowed := map[use]string{
-		{"Run", "version"}:               "the version of the program, set at build time",
-		{"Run", "usageText"}:             "a constant of the program",
+		{"dispatch", "version"}:          "the version of the program, set at build time",
+		{"dispatch", "usageText"}:        "a constant of the program",
 		{"newFlagsWithExit", "name"}:     "the name of a command, a literal at every call",
 		{"newFlagsWithExit", "synopsis"}: "a literal at every call",
 		{"newFlagsWithExit", "help"}:     "a literal at every call",

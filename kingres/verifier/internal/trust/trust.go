@@ -86,16 +86,9 @@ func Fingerprint(pub []byte) string {
 func NormalizeFingerprint(s string) (string, error) {
 	t := strings.ToLower(strings.NewReplacer(":", "", " ", "").Replace(s))
 	if _, err := format.DecodeHash(t); err != nil {
-		return "", fmt.Errorf("fingerprint %q is not 64 hex characters: %w", clip(s), err)
+		return "", fmt.Errorf("fingerprint %q is not 64 hex characters: %w", s, err)
 	}
 	return t, nil
-}
-
-func clip(s string) string {
-	if len(s) > 80 {
-		return strings.ToValidUTF8(s[:80], "?") + "..."
-	}
-	return s
 }
 
 // ValidPrefix checks an origin prefix: a name (no spaces, no plus, no control
@@ -120,7 +113,7 @@ func ValidPrefix(p string) error {
 // match: that is the whole point of the check.
 func New(prefix, keyName string, pub []byte, typedFingerprint string) (*File, error) {
 	if err := ValidPrefix(prefix); err != nil {
-		return nil, fmt.Errorf("origin prefix %q: %w", clip(prefix), err)
+		return nil, fmt.Errorf("origin prefix %q: %w", prefix, err)
 	}
 	if len(pub) != ed25519.PublicKeySize {
 		return nil, fmt.Errorf("public key has %d bytes, expected %d", len(pub), ed25519.PublicKeySize)
@@ -256,7 +249,7 @@ func parseKey(kv jsonx.Value) (Key, error) {
 		return Key{}, err
 	}
 	if fp != Fingerprint(pub) {
-		return Key{}, fmt.Errorf("%s.fingerprint is %q, expected %s, the SHA-256 of public_key (a typo in the key or the fingerprint)", o.Path(), clip(fp), Fingerprint(pub))
+		return Key{}, fmt.Errorf("%s.fingerprint is %q, expected %s, the SHA-256 of public_key (a typo in the key or the fingerprint)", o.Path(), fp, Fingerprint(pub))
 	}
 	k.Fingerprint = fp
 	if k.NotBefore, err = optionalTime(o, "not_before"); err != nil {
@@ -316,7 +309,7 @@ func optionalTime(o jsonx.Object, name string) (*time.Time, error) {
 	}
 	t, err := time.Parse(time.RFC3339, s)
 	if err != nil || !strings.HasSuffix(s, "Z") {
-		return nil, fmt.Errorf("%s: %q is not an RFC 3339 time in UTC ending in Z", v.Path(), clip(s))
+		return nil, fmt.Errorf("%s: %q is not an RFC 3339 time in UTC ending in Z", v.Path(), s)
 	}
 	return &t, nil
 }
@@ -491,7 +484,7 @@ func (f *File) KeyFor(pub []byte) (Key, bool) {
 // The notes say, for every key that was left out or is limited, why.
 func (f *File) SignerKeys(origin string, now time.Time) ([]signednote.Key, []string, error) {
 	if origin != f.OriginPrefix && !strings.HasPrefix(origin, f.OriginPrefix+"/") {
-		return nil, nil, fmt.Errorf("origin %q is not below the trusted prefix %q", clip(origin), f.OriginPrefix)
+		return nil, nil, fmt.Errorf("origin %q is not below the trusted prefix %q", origin, f.OriginPrefix)
 	}
 	var keys []signednote.Key
 	var notes []string
@@ -578,7 +571,7 @@ func (f *File) Marshal() ([]byte, error) {
 // the signature is worth (correction 17 of the design).
 func (f *File) AllKeys(origin string) ([]signednote.Key, error) {
 	if origin != f.OriginPrefix && !strings.HasPrefix(origin, f.OriginPrefix+"/") {
-		return nil, fmt.Errorf("origin %q is not below the trusted prefix %q", clip(origin), f.OriginPrefix)
+		return nil, fmt.Errorf("origin %q is not below the trusted prefix %q", origin, f.OriginPrefix)
 	}
 	var keys []signednote.Key
 	for _, k := range f.Keys {

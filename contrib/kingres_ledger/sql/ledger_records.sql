@@ -147,6 +147,7 @@ RESET ROLE;
 --------------------------------------------------------------------------
 \set VERBOSITY sqlstate
 -- append-only for every role, the owner included
+RESET kingres_ledger.allow_manual_write;
 UPDATE kingres.ledger_digest SET height = 0;
 DELETE FROM kingres.ledger_digest;
 TRUNCATE kingres.ledger_digest;

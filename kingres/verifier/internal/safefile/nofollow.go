@@ -30,11 +30,11 @@ func OpenNoFollow(path string, flag int, perm os.FileMode) (*os.File, error) {
 	st, err := f.Stat()
 	if err != nil {
 		_ = f.Close()
-		return nil, fmt.Errorf("%s: %w", clipPath(path), err)
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	if !st.Mode().IsRegular() {
 		_ = f.Close()
-		return nil, fmt.Errorf("%s %w (it is %s)", clipPath(path), ErrNotRegular, kind(st.Mode()))
+		return nil, fmt.Errorf("%s %w (it is %s)", path, ErrNotRegular, kind(st.Mode()))
 	}
 	return f, nil
 }

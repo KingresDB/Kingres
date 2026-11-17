@@ -2600,3 +2600,74 @@ is still needed.
 
 Added when phase 2b is implemented, in the form of the notes of the earlier
 phases.
+
+### Step 1 (compatibility, bucket lookup, harness)
+
+Found when the design was checked against the code as it was on 2026-11-17,
+after version 0.5 was finished; where they differ the code was followed.
+
+1. **Test numbers (section 14, 16.2).** The highest TAP file is `097`, so the
+   names `055` to `069` of this document are all taken by tests of 0.5. Step 1
+   uses `098_foundation` (part A of the design's `055_fragment_foundation`) and
+   `099_harness_selftest`; later tests start at `100`. Step 1 also adds one
+   regression test that the design does not list, `bucket_lookup`.
+2. **Build files.** The `Makefile` has no list of TAP tests (`t/*.pl` are
+   run); only `meson.build` lists them. `REGRESS` is in both.
+3. **Where buckets are walked (4.7).** `kingres_bucket_for_*` do not loop: they
+   call `kingres_shard_bucket`. `catalog.c` loops over the buckets for the
+   placement number, and `planner.c` read `bucket_group[bucket]` directly in
+   two more places; all use the new accessors now. `bucket_count` is also read
+   in `bucket_move.c` (the `MODULUS` of `internal_attach_bucket`), so the files
+   that may read it are `catalog`, `hashing`, `dist_table` and `bucket_move`;
+   `098_foundation` checks this. `fanout.c` and `dist_table.c` needed no change.
+4. **Names in `pg_compat.h` (2.3).** The code already had
+   `ks_onconflict_action_shippable(action)`; `KS_ONCONFLICT_IS_SELECT` stands
+   next to it. `ks_result_adopt` returns the new pointer: on 19
+   `libpqsrv_PGresultSetParent` returns a new wrapper and the old pointer must
+   not be used. `KS_SET_PLAN_ORIGIN` takes `(pstmt, origin)`, with
+   `KS_PLAN_ORIGIN_UNKNOWN`. The settings of a partial plan are
+   `KS_PARTIAL_PLAN_GUCS`, pairs of name and value:
+   `max_parallel_workers_per_gather = 0`, `enable_partitionwise_aggregate =
+   off`, and on 19 `enable_eager_aggregate = off`.
+5. **Plan profiles of the harness (16.2).** Section 13 has no setting for
+   `nopruning`, so a test passes its own settings. A setting of a profile is
+   applied only on a node that has it, so until step 6 the profile `scan` is
+   the defaults (`missing_profile_gucs` lists what is absent).
+   `compare_tables` takes options. `compare()` prints a NULL as `<NULL>`;
+   before, a NULL and an empty string compared equal (no existing test
+   depended on it).
+6. **Section 14 and "Sources read".** `kingres_shard--0.5.sql` and the script
+   from 0.4 are committed, `default_version` is `0.5`, and the tests of 0.5
+   are `t/048` to `t/097`.
+7. **Verified as the design says.** `enable_eager_aggregate` is on by default
+   on 19 and `enable_partitionwise_aggregate` is off on both; on 19
+   `PLAN_STMT_UNKNOWN` is 0; `PlannedStmt` has `subrtinfos`, `rowMarkRelids`,
+   `elidedNodes` and `extension_state`; `OnConflictExpr.lockStrength` exists;
+   the result wrapper is made in `CurrentMemoryContext`; `remote_scan.c`
+   builds a `PlannedStmt` by hand; a node that is not the primary of its group
+   has `local_group_id = -2`.
+
+Of the compatibility definitions only `KS_PARTIAL_PLAN_GUCS` is exercised at
+run time in this step (its names are checked against the server); the others
+are compiled on both majors and first used by later steps.
+
+### What steps 2 and 3 will find changed
+
+- `type_ok` already excludes `money` (`shippable.c`, `t/055_ship_limits.pl`).
+- `dist_scan.c` already has the fault points `scan_begin`, `scan_started`,
+  `scan_after_placement`, `scan_after_declare` and `scan_after_check`, which
+  overlap the `frag_*` points of this document; `fault.c` has no table of
+  points, only the names at the call sites.
+- `kingres_shard_ensure_fresh_partitions` and `check_partitions_in_snapshot`
+  are in `bucket_move.c`, which the file list of step 2 omits.
+- `node_conn.c` does much more than this document assumes: the scope of a
+  control call, the protocol for a statement that is in flight or pending
+  (`kingres_shard_conn_set_pending`, `kingres_shard_conn_quiesce`,
+  `kingres_shard_conn_abandon_pending`, `kingres_shard_conn_drop_inflight`),
+  the forced wait for a participant's synchronous standby,
+  `kingres_shard_begin_write_xact` and `kingres_shard_note_remote_write`, the
+  note of a lost session that makes `COMMIT` fail, and
+  `kingres_shard_remote_extension_version`, which the version probe of step 2
+  can reuse. The batch sender of step 3 and the drain of a fragment must
+  register with the pending protocol, and a batch that writes must go through
+  `kingres_shard_begin_write_xact` and `kingres_shard_note_remote_write`.

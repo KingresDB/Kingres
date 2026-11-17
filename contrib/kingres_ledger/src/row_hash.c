@@ -93,7 +93,7 @@ kl_table_cache_reset(void)
  * The query is fully qualified and uses OPERATOR(pg_catalog.=) so that no
  * object of a schema earlier in the search_path can capture it.
  */
-static int32
+int32
 kl_lookup_table_id(Oid relid)
 {
 	Datum		values[1];

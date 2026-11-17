@@ -48,6 +48,8 @@ funcs AS (
          || ' par=' || p.proparallel::text || ' strict=' || p.proisstrict
          || ' kind=' || p.prokind::text || ' lang=' || l.lanname
          || ' cfg=' || COALESCE(p.proconfig::text, '-')
+         || ' owner=' || pg_get_userbyid(p.proowner)::text || ' leak=' || p.proleakproof
+         || ' cost=' || p.procost || ' rows=' || p.prorows
          || ' acl=' || COALESCE(p.proacl::text, '-')
          || ' src=' || md5(p.prosrc || '|' || COALESCE(p.probin, ''))
          || ' ret=' || pg_get_function_result(p.oid)
@@ -56,15 +58,22 @@ funcs AS (
     FROM members m JOIN pg_proc p ON m.classid = 'pg_proc'::regclass AND p.oid = m.objid
     JOIN pg_language l ON l.oid = p.prolang),
 rels AS (
-  SELECT c.oid, c.relname, c.relkind, c.relacl, c.relpersistence
+  SELECT c.oid, c.relname, c.relkind, c.relacl, c.relpersistence, c.relowner, c.reloptions,
+         c.relrowsecurity, c.relforcerowsecurity, c.relreplident
     FROM members m JOIN pg_class c ON m.classid = 'pg_class'::regclass AND c.oid = m.objid),
 tbls AS (
   SELECT 'relation ' || r.relname || ' kind=' || r.relkind::text || ' acl=' || COALESCE(r.relacl::text, '-')
+         || ' owner=' || pg_get_userbyid(r.relowner)::text || ' opts=' || COALESCE(r.reloptions::text, '-')
+         || ' rls=' || r.relrowsecurity || '/' || r.relforcerowsecurity || ' replident=' || r.relreplident::text
          || ' comment=' || COALESCE(obj_description(r.oid, 'pg_class'), '-') AS line FROM rels r),
 cols AS (
   SELECT 'column ' || r.relname || '.' || a.attnum || ' ' || a.attname || ' '
          || format_type(a.atttypid, a.atttypmod) || ' notnull=' || a.attnotnull
-         || ' identity=' || a.attidentity::text || ' default='
+         || ' identity=' || a.attidentity::text
+         || ' colacl=' || COALESCE(a.attacl::text, '-')
+         || ' opts=' || COALESCE((SELECT string_agg(o, ',' ORDER BY o) FROM unnest(a.attoptions) o
+                                   WHERE o NOT LIKE 'pg\_attver=%'), '-') || ' storage=' || a.attstorage::text
+         || ' coll=' || a.attcollation::regcollation::text || ' default='
          || COALESCE(pg_get_expr(d.adbin, d.adrelid), '-') AS line
     FROM rels r JOIN pg_attribute a ON a.attrelid = r.oid AND a.attnum > 0 AND NOT a.attisdropped
     LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
@@ -81,18 +90,37 @@ trg AS (
     FROM rels r JOIN pg_trigger t ON t.tgrelid = r.oid AND NOT t.tgisinternal),
 evt AS (
   SELECT 'event trigger ' || e.evtname || ' ' || e.evtevent || ' enabled=' || e.evtenabled::text
-         || ' func=' || e.evtfoid::regproc::text AS line
+         || ' func=' || e.evtfoid::regproc::text || ' owner=' || pg_get_userbyid(e.evtowner)::text
+         || ' tags=' || COALESCE(e.evttags::text, '-') AS line
     FROM members m JOIN pg_event_trigger e ON m.classid = 'pg_event_trigger'::regclass AND e.oid = m.objid),
 cnt AS (
   SELECT 'members ' || m.classid::regclass::text || ' ' || count(*) AS line
     FROM members m GROUP BY m.classid),
 chain AS (
-  SELECT 'schema acl ' || COALESCE(n.nspacl::text, '-') AS line
-    FROM pg_namespace n WHERE n.nspname = 'kingres')
+  SELECT 'schema acl ' || COALESCE(n.nspacl::text, '-') || ' owner=' || pg_get_userbyid(n.nspowner)::text AS line
+    FROM pg_namespace n WHERE n.nspname = 'kingres'),
+-- the privileges that the extension script recorded at installation, and the
+-- default privileges of the database (none of the three databases has any)
+initp AS (
+  SELECT 'initprivs ' || CASE p.classoid
+                           WHEN 'pg_class'::regclass THEN p.objoid::regclass::text
+                           WHEN 'pg_proc'::regclass THEN p.objoid::regprocedure::text
+                           ELSE p.classoid::regclass::text || ':' || p.objoid END
+         || '.' || p.objsubid || ' ' || p.privtype::text || ' ' || p.initprivs::text AS line
+    FROM pg_init_privs p
+   WHERE p.objoid IN (SELECT objid FROM members)),
+defacl AS (
+  SELECT 'default acl ' || pg_get_userbyid(d.defaclrole)::text || ' ' || d.defaclobjtype::text || ' '
+         || COALESCE(d.defaclnamespace::regnamespace::text, '-') || ' ' || d.defaclacl::text AS line
+    FROM pg_default_acl d),
+ext2 AS (
+  SELECT 'extension ' || e.extname || ' owner=' || pg_get_userbyid(e.extowner)::text
+         || ' relocatable=' || e.extrelocatable AS line FROM pg_extension e WHERE e.extname = 'kingres_ledger')
 SELECT line FROM (
   SELECT line FROM funcs UNION ALL SELECT line FROM tbls UNION ALL SELECT line FROM cols
   UNION ALL SELECT line FROM cons UNION ALL SELECT line FROM idx UNION ALL SELECT line FROM trg
-  UNION ALL SELECT line FROM evt UNION ALL SELECT line FROM cnt UNION ALL SELECT line FROM chain) u
+  UNION ALL SELECT line FROM evt UNION ALL SELECT line FROM cnt UNION ALL SELECT line FROM chain
+  UNION ALL SELECT line FROM initp UNION ALL SELECT line FROM defacl UNION ALL SELECT line FROM ext2) u
 ORDER BY line
 };
 
@@ -134,6 +162,7 @@ SELECT (SELECT count(*) FROM kingres.ledger_entry) || ' '
 #--------------------------------------------------------------------------
 $node->safe_psql('postgres', 'CREATE DATABASE old02');
 $node->safe_psql('old02', q{
+	SET kingres_ledger.allow_manual_write = on;
 	CREATE EXTENSION kingres_ledger VERSION '0.2';
 	CREATE SCHEMA app;
 	CREATE TABLE app.accounts (id int PRIMARY KEY, owner_name text NOT NULL, balance numeric(12,2));
@@ -154,9 +183,9 @@ $node->safe_psql('old02', q{
 is($node->safe_psql('old02',
 		q{SELECT extversion FROM pg_extension WHERE extname = 'kingres_ledger'}),
 	'0.2', 'the old database has version 0.2');
-my $old_digest = $node->safe_psql('old02', 'SELECT kingres.ledger_generate_digest()');
+my $old_digest = $node->safe_psql('old02', 'SET kingres_ledger.allow_manual_write = on; SELECT kingres.ledger_generate_digest()');
 $node->safe_psql('old02', q{INSERT INTO app.accounts VALUES (6, 'frank', 60)});
-$node->safe_psql('old02', 'SELECT kingres.ledger_verify_recorded()');
+$node->safe_psql('old02', 'SET kingres_ledger.allow_manual_write = on; SELECT kingres.ledger_verify_recorded()');
 my $row_i = $node->safe_psql('old02',
 	q{SELECT encode(kingres.ledger_row_hash(a.*), 'hex') FROM app.accounts a WHERE id = 1});
 my $proof_i = $node->safe_psql('old02',
@@ -174,6 +203,34 @@ my $old_height = $node->safe_psql('old02', 'SELECT max(height) FROM kingres.ledg
 # The new functions do not exist yet.
 my ($ret, $err) = sqlstate_of('old02', 'SELECT * FROM kingres.ledger_head()');
 like($err, qr/42883/, 'ledger_head does not exist in 0.2');
+
+# The 0.3 library does not write the ledger through the SQL of 0.2: the old
+# block builder is refused, with the statement to run, and nothing is written
+# (the capture trigger is part of the library and keeps working).
+my ($r0, $o0, $e0) = $node->psql('old02', 'SELECT kingres.ledger_build_block()');
+isnt($r0, 0, 'the block builder of the 0.2 SQL is refused by the 0.3 library');
+like($e0, qr/version 0\.2.*ALTER EXTENSION kingres_ledger UPDATE/s,
+	'and the error says which version the SQL is and what to run');
+is($node->safe_psql('old02', $ledger_state), $old_state, 'and nothing was written');
+# Every function of the old SQL that writes is refused, and so is a statement
+# of the caller's own, each with the code KL005 of this refusal (and not the
+# 42501 of the others); the setting that the database was built with is not set
+# in these sessions.
+$node->safe_psql('old02', 'CREATE TABLE app.late (id int)');
+foreach my $stmt (
+	'SELECT kingres.ledger_generate_digest()',
+	'SELECT kingres.ledger_verify_recorded()',
+	q{SELECT kingres.ledger_enable('app.late')},
+	q{INSERT INTO kingres.ledger_digest (generated_at, generated_by, height, block_hash, digest) SELECT now(), 'x', 0, block_hash, '{}' FROM kingres.ledger_blocks LIMIT 1})
+{
+	my ($rs, $es) = sqlstate_of('old02', $stmt);
+	like($es, qr/KL005/, "[old02] refused with its own SQLSTATE KL005: $stmt");
+	my ($rm, $om, $em) = $node->psql('old02', $stmt);
+	like($em, qr/version 0\.2, and this library writes the ledger only through the functions of version 0\.3/,
+		"[old02] and the message names both versions: $stmt");
+	like($em, qr/Run ALTER EXTENSION kingres_ledger UPDATE/, "[old02] and the hint says what to run: $stmt");
+}
+is($node->safe_psql('old02', $ledger_state), $old_state, 'and none of them wrote anything');
 
 #--------------------------------------------------------------------------
 # Upgrade.
@@ -245,13 +302,35 @@ is($node->safe_psql('new03', q{SELECT extversion FROM pg_extension WHERE extname
 	'0.3', 'a plain CREATE EXTENSION installs 0.3');
 $node->safe_psql('postgres', 'CREATE DATABASE old01');
 $node->safe_psql('old01', q{
+	SET kingres_ledger.allow_manual_write = on;
 	CREATE EXTENSION kingres_ledger VERSION '0.1';
 	CREATE TABLE public.t (id int PRIMARY KEY);
 	SELECT kingres.ledger_enable('public.t');
 	INSERT INTO public.t VALUES (1);
 	SELECT kingres.ledger_build_block();
 });
-my $d01 = $node->safe_psql('old01', 'SELECT kingres.ledger_generate_digest()');
+my $d01 = $node->safe_psql('old01', 'SET kingres_ledger.allow_manual_write = on; SELECT kingres.ledger_generate_digest()');
+# something is pending, so that the old builder has a write to refuse
+$node->safe_psql('old01', q{INSERT INTO public.t VALUES (2)});
+my $state01_sql = q{SELECT (SELECT count(*) FROM kingres.ledger_entry) || ' '
+    || (SELECT count(*) FROM kingres.ledger_pending) || ' '
+    || (SELECT count(*) FROM kingres.ledger_blocks) || ' '
+    || (SELECT count(*) FROM kingres.ledger_tx) || ' '
+    || (SELECT count(*) FROM kingres.ledger_table)};
+my $state01 = $node->safe_psql('old01', $state01_sql);
+$node->safe_psql('old01', 'CREATE TABLE public.late (id int)');
+foreach my $stmt (
+	'SELECT kingres.ledger_build_block()',
+	'SELECT kingres.ledger_generate_digest()',
+	q{SELECT kingres.ledger_enable('public.late')})
+{
+	my ($rs, $es) = sqlstate_of('old01', $stmt);
+	like($es, qr/KL005/, "[old01] refused with its own SQLSTATE KL005: $stmt");
+	my ($rm, $om, $em) = $node->psql('old01', $stmt);
+	like($em, qr/version 0\.1, and this library writes the ledger only through the functions of version 0\.3/,
+		"[old01] and the message names both versions: $stmt");
+}
+is($node->safe_psql('old01', $state01_sql), $state01, 'and none of them wrote anything at 0.1');
 $node->safe_psql('old01', 'ALTER EXTENSION kingres_ledger UPDATE');
 is($node->safe_psql('old01', q{SELECT extversion FROM pg_extension WHERE extname = 'kingres_ledger'}),
 	'0.3', 'a 0.1 database reaches 0.3 in one command (through 0.2)');
@@ -262,8 +341,11 @@ my $fp_new = fingerprint('new03');
 my $fp_old = fingerprint('old02');
 my $fp_old1 = fingerprint('old01');
 ok(length($fp_new) > 1000, 'the fingerprint covers the extension');
+cmp_ok(scalar(my @fp_lines = split(/\n/, $fp_new)), '>=', 200, 'and has the lines of a full catalog dump');
 like($fp_new, qr/function (kingres\.)?ledger_head\(\)/, 'and includes the new functions');
 like($fp_new, qr/def=[0-9a-f]{32}/, 'and the definition of each function');
+like($fp_new, qr/column ledger_digest\.[0-9]+ generated_at .* colacl=\{=r\//, 'and the privileges on columns (the grant on ledger_digest)');
+like($fp_new, qr/ owner=\S+ /, 'and the owners');
 is($fp_old, $fp_new, 'upgrading 0.2 to 0.3 gives the objects of installing 0.3');
 is($fp_old1, $fp_new, 'upgrading 0.1 to 0.3 gives the objects of installing 0.3');
 foreach my $pair ([ $fp_old, 'old02' ], [ $fp_old1, 'old01' ])

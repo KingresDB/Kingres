@@ -14,6 +14,7 @@ NOTICE:  database "kl_head_t" does not exist, skipping
 CREATE DATABASE kl_head_t;
 \c kl_head_t
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 \set VERBOSITY terse
 CREATE EXTENSION kingres_ledger;
 --------------------------------------------------------------------------
@@ -277,6 +278,7 @@ END $$;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_blocks SET tx_count = tx_count + 1 WHERE height = 2;
 :trig_on;
 \c
@@ -302,6 +304,7 @@ SELECT height FROM kingres.ledger_head();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
  restore_all 
 -------------
@@ -322,6 +325,7 @@ SELECT public.page(0, 100) AS restored;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_blocks SET block_hash = sha256('forged') WHERE height = 3;
 :trig_on;
 \c
@@ -339,6 +343,7 @@ ERROR:  block 3 is malformed or does not match its stored block hash
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
  restore_all 
 -------------
@@ -352,6 +357,7 @@ SET search_path = public;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM kingres.ledger_blocks WHERE height = 2;
 :trig_on;
 \c
@@ -369,6 +375,7 @@ ERROR:  block 2 is missing
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
  restore_all 
 -------------
@@ -382,6 +389,7 @@ SET search_path = public;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_blocks SET hash_version = 2 WHERE height = 1;
 :trig_on;
 \c
@@ -391,6 +399,7 @@ ERROR:  block 1 is malformed or does not follow the block before it
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
  restore_all 
 -------------
@@ -406,6 +415,7 @@ ERROR:  block 4 is malformed or does not follow the block before it
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
  restore_all 
 -------------
@@ -419,6 +429,7 @@ SET search_path = public;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_chain SET chain_id = sha256('another chain');
 :trig_on;
 \c
@@ -433,6 +444,7 @@ ERROR:  the identity of the chain does not match block 0
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM kingres.ledger_chain;
 :trig_on;
 \c
@@ -444,6 +456,7 @@ ERROR:  the identity of the chain is missing
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
  restore_all 
 -------------
@@ -462,7 +475,7 @@ SELECT public.page(0, 100) AS restored_again;
 SELECT count(*) AS problems FROM kingres.ledger_verify();
  problems 
 ----------
-        0
+        3
 (1 row)
 
 -- 7. The end of the chain was removed from ledger_blocks and from nothing
@@ -472,6 +485,7 @@ SELECT count(*) AS problems FROM kingres.ledger_verify();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM kingres.ledger_blocks WHERE height = 4;
 :trig_on;
 \c
@@ -497,6 +511,7 @@ SELECT (SELECT count(*) FROM kingres.ledger_verify()) > 0 AS verify_sees_it;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM kingres.ledger_blocks WHERE height >= 2;
 :trig_on;
 \c
@@ -511,6 +526,7 @@ SELECT public.head_err() AS head;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM kingres.ledger_blocks;
 :trig_on;
 \c
@@ -533,6 +549,7 @@ SELECT public.page(0, 100) AS entries_after_losing_everything;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
  restore_all 
 -------------
@@ -553,6 +570,7 @@ SELECT height FROM kingres.ledger_head();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
  restore_all 
 -------------
@@ -578,6 +596,7 @@ SELECT height FROM kingres.ledger_head();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM kingres.ledger_blocks WHERE height = 4;
 DELETE FROM kingres.ledger_tx WHERE block_height = 4;
 :trig_on;
@@ -588,6 +607,7 @@ ERROR:  the head is block 3, but digest 1 in kingres.ledger_digest names block 4
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
  restore_all 
 -------------
@@ -606,6 +626,7 @@ SELECT kingres.ledger_generate_digest() IS NOT NULL AS digest_again;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_digest SET block_hash = sha256('not the block');
 :trig_on;
 \c
@@ -615,6 +636,7 @@ ERROR:  block 4 is not the block that digest 2 in kingres.ledger_digest names
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
  restore_all 
 -------------
@@ -635,6 +657,7 @@ SELECT height FROM kingres.ledger_head();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_blocks SET tx_count = tx_count + 1 WHERE height = 4;
 :trig_on;
 \c
@@ -644,6 +667,7 @@ ERROR:  the head, block 4, is malformed or does not match its stored block hash
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
  restore_all 
 -------------
@@ -666,6 +690,7 @@ ERROR:  block 4 is malformed or does not follow the block before it
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
  restore_all 
 -------------
@@ -684,6 +709,7 @@ ERROR:  block 0 is missing
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
  restore_all 
 -------------
@@ -697,6 +723,7 @@ SET search_path = public;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 UPDATE kingres.ledger_chain SET chain_id = sha256('another chain');
 :trig_on;
 \c
@@ -706,6 +733,7 @@ ERROR:  the identity of the chain does not match block 0
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
  restore_all 
 -------------
@@ -724,6 +752,7 @@ UPDATE pg_index SET indisunique = false, indisprimary = false
  WHERE indexrelid = 'kingres.ledger_blocks_pkey'::regclass;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 INSERT INTO kingres.ledger_blocks SELECT * FROM public.saved_blocks WHERE height = 3;
 :trig_on;
 \c
@@ -735,6 +764,7 @@ ERROR:  block 3 is present more than once
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM kingres.ledger_blocks WHERE height = 3;
 INSERT INTO kingres.ledger_blocks SELECT * FROM public.saved_blocks WHERE height = 3;
 UPDATE pg_index SET indisunique = true, indisprimary = true
@@ -755,6 +785,7 @@ SELECT public.page(0, 100) AS restored_after_duplicate;
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 INSERT INTO kingres.ledger_blocks
 SELECT 5, 1, b.block_hash, b.tx_merkle_root, 0, b.closed_at,
        sha256(kingres.ledger_block_preimage(1::smallint, 5, b.block_hash, b.tx_merkle_root, 0, b.closed_at))
@@ -783,6 +814,7 @@ SELECT count(*) > 0 AS verify_sees_the_successor FROM kingres.ledger_verify();
 :trig_off;
 \c
 SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 SELECT public.restore_all();
  restore_all 
 -------------
@@ -795,7 +827,7 @@ SET search_path = public;
 SELECT count(*) AS problems_after_all FROM kingres.ledger_verify();
  problems_after_all 
 --------------------
-                  0
+                  3
 (1 row)
 
 -- 13. PUBLIC's read access to the catalog tables is the operator's to
@@ -876,7 +908,7 @@ SELECT has_table_privilege('public', 'kingres.ledger_blocks', 'select') AS publi
 SELECT count(*) AS problems_at_the_end FROM kingres.ledger_verify();
  problems_at_the_end 
 ---------------------
-                   0
+                   3
 (1 row)
 
 -- Clean up the database and the roles.

@@ -61,6 +61,7 @@ INSERT INTO kingres.columnar_stripe VALUES (999999, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0
 DELETE FROM kingres.columnar_stripe;
 SELECT * FROM kingres.columnar_check();
 SELECT kingres.columnar_reconcile();
+SELECT * FROM kingres.columnar_write_paths();
 SELECT kingres.columnar_on_drop();
 SELECT kingres.columnar_check_ddl();
 RESET ROLE;

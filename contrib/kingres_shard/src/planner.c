@@ -269,7 +269,7 @@ restrict_to_value(Analysis *a, DistRef *ref, Node *key)
 		if (c->constisnull)
 			return;
 		if (kingres_shard_try_bucket(coloc->dist_type, coloc->collation,
-									  coloc->bucket_count, c->consttype,
+									  coloc, c->consttype,
 									  c->constvalue, false, &bucket))
 			ref->bucket = bucket;
 	}
@@ -700,9 +700,10 @@ plan_distributed_write(Query *parse, DistRef *ref, const KsCatalog *cat, List *r
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("a statement for several shard groups cannot be run from a parallel worker")));
 
-	for (b = 0; b < ref->dt->coloc->bucket_count; b++)
+	for (b = 0; b < kingres_shard_coloc_nbuckets(ref->dt->coloc); b++)
 	{
-		int			g = ref->dt->coloc->bucket_group[b];
+		int			g = kingres_shard_bucket_group(ref->dt->coloc,
+												   kingres_shard_coloc_bucket(ref->dt->coloc, b));
 
 		if (g >= 0 && !list_member_int(groups, g))
 			groups = lappend_int(groups, g);
@@ -752,9 +753,9 @@ all_buckets_local(const KsColocation *coloc, int local_group)
 {
 	int			b;
 
-	for (b = 0; b < coloc->bucket_count; b++)
+	for (b = 0; b < kingres_shard_coloc_nbuckets(coloc); b++)
 	{
-		if (coloc->bucket_group[b] != local_group)
+		if (kingres_shard_bucket_group(coloc, kingres_shard_coloc_bucket(coloc, b)) != local_group)
 			return false;
 	}
 	return true;
@@ -922,7 +923,7 @@ plan_forwarded(Query *parse, const char *query_string, int cursorOptions,
 		}
 		if (ref->bucket >= 0)
 		{
-			if (ref->dt->coloc->bucket_group[ref->bucket] != cat->local_group_id)
+			if (kingres_shard_bucket_group(ref->dt->coloc, ref->bucket) != cat->local_group_id)
 				ereport(ERROR,
 						(errcode(ERRCODE_KINGRES_STALE_MAP),
 						 errmsg("bucket %d of %s is not on this node (stale map version " INT64_FORMAT ")",
@@ -1624,7 +1625,7 @@ planner_hook_body(Query *parse, const char *query_string,
 		return kingres_shard_make_deferred_plan(parse, relids);
 	}
 
-	group = first->dt->coloc->bucket_group[bucket];
+	group = kingres_shard_bucket_group(first->dt->coloc, bucket);
 	if (group < 0)
 		elog(ERROR, "bucket %d of colocation group %d has no owner",
 			 bucket, colocation_id);

@@ -42,6 +42,7 @@
 PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(kingres_ledger_hook_active);
+PG_FUNCTION_INFO_V1(kingres_ledger_binary_upgrade);
 PG_FUNCTION_INFO_V1(kingres_ledger_outer_user);
 PG_FUNCTION_INFO_V1(kingres_ledger_lock_table);
 
@@ -53,6 +54,9 @@ int			kl_block_interval = 10000;
 
 /* GUC: the longest one worker may run for one database, in ms; 0 = no limit. */
 int			kl_worker_timeout = 60000;
+
+/* GUC: how far the previous block may be ahead of the clock, in ms; 0 = no limit. */
+int			kl_max_clock_skew = 3600000;
 
 /* Set in _PG_init when loaded through shared_preload_libraries. */
 bool		kl_preloaded = false;
@@ -104,6 +108,21 @@ _PG_init(void)
 							NULL,
 							NULL);
 
+	DefineCustomIntVariable("kingres_ledger.max_clock_skew",
+							"How far the previous block may be ahead of the clock of the server when a block is built.",
+							"The builder refuses to build a block whose predecessor was closed later than this; the chain keeps block times that never go back, so a block closed in the future would otherwise give its time to every later block. 0 means no limit.",
+							&kl_max_clock_skew,
+							3600000,
+							0,
+							2147483647,
+							PGC_SUSET,
+							GUC_UNIT_MS,
+							NULL,
+							NULL,
+							NULL);
+
+	kl_guard_init();
+
 	MarkGUCPrefixReserved("kingres_ledger");
 
 	kl_capture_init();
@@ -112,6 +131,7 @@ _PG_init(void)
 	{
 		kl_preloaded = true;
 		kl_protect_init();
+		kl_guard_install();
 		kl_worker_init();
 	}
 }
@@ -125,6 +145,18 @@ Datum
 kingres_ledger_hook_active(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_BOOL(kl_preloaded);
+}
+
+/*
+ * kingres.ledger_binary_upgrade() returns boolean
+ *		True in a server that pg_upgrade started for the restore of a schema
+ *		(binary upgrade mode).  The event triggers of the extension are created
+ *		one at a time there, and the first one would see the others missing.
+ */
+Datum
+kingres_ledger_binary_upgrade(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(IsBinaryUpgrade);
 }
 
 /*
@@ -149,7 +181,7 @@ kingres_ledger_outer_user(PG_FUNCTION_ARGS)
  *		through role membership), and "does not exist" when the relation is
  *		gone.
  */
-static void
+void
 kl_check_owner(Oid relid)
 {
 	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relid)))

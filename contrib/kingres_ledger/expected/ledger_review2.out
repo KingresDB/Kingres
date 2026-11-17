@@ -63,7 +63,7 @@ INSERT INTO r2_acc VALUES (1, 'one');
 SELECT count(*) AS problems_at_start FROM r2report();
  problems_at_start 
 -------------------
-                 0
+                 3
 (1 row)
 
 --------------------------------------------------------------------------
@@ -157,7 +157,7 @@ UPDATE r2_acc SET extra9 = 'nine' WHERE id = 2;
 SELECT count(*) AS problems_after_add_column FROM r2report();
  problems_after_add_column 
 ---------------------------
-                         0
+                         3
 (1 row)
 
 DROP FUNCTION public.r2_evil();
@@ -268,7 +268,7 @@ ERROR:  cannot grant privileges on table "r2_acc_ledger_history": it is a histor
 SELECT count(*) AS problems_after_owner_changes FROM r2report();
  problems_after_owner_changes 
 ------------------------------
-                            0
+                            3
 (1 row)
 
 -- GRANT ... ON ALL TABLES IN SCHEMA cannot be told apart by the hook; the
@@ -291,7 +291,7 @@ SELECT * FROM r2acl('r2_acc_ledger_history');
 SELECT count(*) AS problems_after_grant_all_tables FROM r2report();
  problems_after_grant_all_tables 
 ---------------------------------
-                               0
+                               3
 (1 row)
 
 -- Default privileges of the extension owner must not open a history table.
@@ -323,7 +323,7 @@ ALTER DEFAULT PRIVILEGES FOR ROLE :"extension_owner" IN SCHEMA public REVOKE SEL
 SELECT count(*) AS problems_with_default_privileges FROM r2report();
  problems_with_default_privileges 
 ----------------------------------
-                                0
+                                3
 (1 row)
 
 -- ledger_verify reports a history table whose privileges are not those of the
@@ -332,29 +332,38 @@ SELECT count(*) AS problems_with_default_privileges FROM r2report();
 UPDATE pg_class SET relacl = relacl || makeaclitem('kl2_bob'::regrole, relowner, 'SELECT', false)
 WHERE oid = 'r2_acc_ledger_history'::regclass;
 SELECT * FROM r2report();
-     check_name     |    object     |                                                                         detail                                                                         
---------------------+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------
- history_privileges | public.r2_acc | public.r2_acc_ledger_history: kl2_bob has the privilege SELECT, which the rule gives only to the owner of the table and the owner of the history table
-(1 row)
+     check_name     |        object         |                                                                         detail                                                                         
+--------------------+-----------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------
+ history_privileges | public.r2_acc         | public.r2_acc_ledger_history: kl2_bob has the privilege SELECT, which the rule gives only to the owner of the table and the owner of the history table
+ manual_write       | kingres.ledger_blocks | 84 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write       | kingres.ledger_entry  | 301 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write       | kingres.ledger_tx     | 204 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+(4 rows)
 
 UPDATE pg_class SET relacl = NULL WHERE oid = 'r2_dflt_ledger_history'::regclass;
 SELECT * FROM r2report();
-     check_name     |     object     |                                                                         detail                                                                         
---------------------+----------------+--------------------------------------------------------------------------------------------------------------------------------------------------------
- history_privileges | public.r2_acc  | public.r2_acc_ledger_history: kl2_bob has the privilege SELECT, which the rule gives only to the owner of the table and the owner of the history table
- history_privileges | public.r2_dflt | public.r2_dflt_ledger_history: the owner of the table cannot read the history table
-(2 rows)
+     check_name     |        object         |                                                                         detail                                                                         
+--------------------+-----------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------
+ history_privileges | public.r2_acc         | public.r2_acc_ledger_history: kl2_bob has the privilege SELECT, which the rule gives only to the owner of the table and the owner of the history table
+ history_privileges | public.r2_dflt        | public.r2_dflt_ledger_history: the owner of the table cannot read the history table
+ manual_write       | kingres.ledger_blocks | 84 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write       | kingres.ledger_entry  | 301 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write       | kingres.ledger_tx     | 204 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+(5 rows)
 
 UPDATE pg_attribute SET attacl = ARRAY[makeaclitem('kl2_carol'::regrole,
            (SELECT relowner FROM pg_class WHERE oid = 'r2_acc_ledger_history'::regclass), 'SELECT', false)]
 WHERE attrelid = 'r2_acc_ledger_history'::regclass AND attname = 'v';
 SELECT * FROM r2report();
-     check_name     |     object     |                                                                         detail                                                                         
---------------------+----------------+--------------------------------------------------------------------------------------------------------------------------------------------------------
- history_privileges | public.r2_acc  | public.r2_acc_ledger_history: column "v" has column privileges
- history_privileges | public.r2_acc  | public.r2_acc_ledger_history: kl2_bob has the privilege SELECT, which the rule gives only to the owner of the table and the owner of the history table
- history_privileges | public.r2_dflt | public.r2_dflt_ledger_history: the owner of the table cannot read the history table
-(3 rows)
+     check_name     |        object         |                                                                         detail                                                                         
+--------------------+-----------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------
+ history_privileges | public.r2_acc         | public.r2_acc_ledger_history: column "v" has column privileges
+ history_privileges | public.r2_acc         | public.r2_acc_ledger_history: kl2_bob has the privilege SELECT, which the rule gives only to the owner of the table and the owner of the history table
+ history_privileges | public.r2_dflt        | public.r2_dflt_ledger_history: the owner of the table cannot read the history table
+ manual_write       | kingres.ledger_blocks | 84 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write       | kingres.ledger_entry  | 301 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+ manual_write       | kingres.ledger_tx     | 204 row(s) were inserted by hand with kingres_ledger.allow_manual_write on (see kingres.ledger_removed)
+(6 rows)
 
 -- any DDL command repairs them (the event trigger runs the same rule)
 COMMENT ON TABLE r2_acc IS 'r2';
@@ -389,7 +398,7 @@ SELECT * FROM r2acl('r2_dflt_ledger_history');
 SELECT count(*) AS problems_after_repair FROM r2report();
  problems_after_repair 
 -----------------------
-                     0
+                     3
 (1 row)
 
 --------------------------------------------------------------------------
@@ -491,7 +500,7 @@ JOIN pg_depend d ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid
                 AND d.refclassid = 'pg_extension'::regclass AND d.deptype = 'e'
 WHERE has_function_privilege('public', p.oid, 'execute')
   AND p.proname IN ('ledger_history_acl_sync', 'ledger_history_sync', 'ledger_worker_state',
-                    'ledger_lock_table', 'ledger_record_row', 'ledger_capture')
+                    'ledger_lock_table', 'ledger_register_table', 'ledger_capture')
 ORDER BY 1;
  proname 
 ---------
@@ -531,7 +540,7 @@ SELECT count(*) AS history_rows FROM r2_spt_ledger_history;
 SELECT count(*) AS problems_after_savepoint FROM r2report();
  problems_after_savepoint 
 --------------------------
-                        0
+                        3
 (1 row)
 
 -- The same in an exception block, with an append-only table that is enabled
@@ -561,7 +570,7 @@ SELECT count(*) AS history_rows FROM r2_blk_ledger_history;
 SELECT count(*) AS problems_after_exception_block FROM r2report();
  problems_after_exception_block 
 --------------------------------
-                              0
+                              3
 (1 row)
 
 -- Subtransactions that commit keep what they did.
@@ -597,7 +606,7 @@ SELECT count(*) AS history_rows FROM r2_keep_ledger_history;
 SELECT count(*) AS problems_after_release FROM r2report();
  problems_after_release 
 ------------------------
-                      0
+                      3
 (1 row)
 
 --------------------------------------------------------------------------
@@ -648,7 +657,7 @@ SELECT count(*) AS history_rows FROM r2_frz_ledger_history;
 SELECT count(*) AS problems_after_copy_freeze FROM r2report();
  problems_after_copy_freeze 
 ----------------------------
-                          0
+                          3
 (1 row)
 
 BEGIN;
@@ -664,7 +673,7 @@ COMMIT;
 SELECT count(*) AS problems_after_copy_freeze_append_only FROM r2report();
  problems_after_copy_freeze_append_only 
 ----------------------------------------
-                                      0
+                                      3
 (1 row)
 
 --------------------------------------------------------------------------
@@ -715,7 +724,7 @@ SELECT kingres.ledger_generate_digest() IS NOT NULL AS digest;
 SELECT count(*) AS problems_with_hostile_settings FROM kingres.ledger_verify();
  problems_with_hostile_settings 
 --------------------------------
-                              0
+                              3
 (1 row)
 
 SELECT kingres.ledger_verify_recorded() IS NOT NULL AS recorded;
@@ -735,6 +744,6 @@ SET search_path = public;
 SELECT count(*) AS problems_after_hostile_settings FROM r2report();
  problems_after_hostile_settings 
 ---------------------------------
-                               0
+                               3
 (1 row)
 

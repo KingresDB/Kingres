@@ -54,6 +54,7 @@ PG_FUNCTION_INFO_V1(kingres_columnar_stripes);
 PG_FUNCTION_INFO_V1(kingres_columnar_compact);
 PG_FUNCTION_INFO_V1(kingres_columnar_check);
 PG_FUNCTION_INFO_V1(kingres_columnar_reconcile);
+PG_FUNCTION_INFO_V1(kingres_columnar_write_paths);
 PG_FUNCTION_INFO_V1(kingres_columnar_note_rewrite);
 PG_FUNCTION_INFO_V1(kingres_columnar_finish_rewrites);
 PG_FUNCTION_INFO_V1(kingres_columnar_identity);
@@ -457,6 +458,33 @@ kingres_columnar_reconcile(PG_FUNCTION_ARGS)
 }
 
 /*
+ * columnar_write_paths(reset): the counters of the write side of this backend
+ * (kc_write.c, KcPath), one row each.
+ */
+Datum
+kingres_columnar_write_paths(PG_FUNCTION_ARGS)
+{
+	bool		reset = PG_GETARG_BOOL(0);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	int			i;
+
+	InitMaterializedSRF(fcinfo, 0);
+	for (i = 0; i < kc_write_path_count(); i++)
+	{
+		uint64		hits;
+		Datum		values[2];
+		bool		nulls[2] = {false, false};
+
+		values[0] = CStringGetTextDatum(kc_write_path_get(i, &hits));
+		values[1] = Int64GetDatum((int64) hits);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	if (reset)
+		kc_write_paths_reset();
+	return (Datum) 0;
+}
+
+/*
  * columnar_note_rewrite(rel): kept for databases whose install script is the
  * one of an earlier build, which has a table_rewrite event trigger that calls
  * it.  The access method no longer needs the trigger (it notes a file when the
@@ -469,12 +497,18 @@ Datum
 kingres_columnar_note_rewrite(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
-	Relation	rel = try_relation_open(relid, NoLock);
+	/*
+	 * Called from the table_rewrite event trigger of the earlier script, where
+	 * the rewrite holds the relation exclusively, and by hand: a lock of our own
+	 * (a relation is never opened without one) makes it safe for both, and a
+	 * note of a file the table still has deletes nothing.
+	 */
+	Relation	rel = try_relation_open(relid, AccessShareLock);
 
 	if (rel != NULL)
 	{
 		kc_write_note_replaced(rel);
-		relation_close(rel, NoLock);
+		relation_close(rel, AccessShareLock);
 	}
 	PG_RETURN_VOID();
 }

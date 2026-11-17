@@ -213,9 +213,10 @@ remote_groups_of(const KsDistTable *dt, const KsCatalog *cat)
 	int			b;
 	ListCell   *lc;
 
-	for (b = 0; b < dt->coloc->bucket_count; b++)
+	for (b = 0; b < kingres_shard_coloc_nbuckets(dt->coloc); b++)
 	{
-		int			g = dt->coloc->bucket_group[b];
+		int			g = kingres_shard_bucket_group(dt->coloc,
+												   kingres_shard_coloc_bucket(dt->coloc, b));
 
 		if (g >= 0 && g != cat->local_group_id && !list_member_int(groups, g))
 			groups = lappend_int(groups, g);
@@ -338,13 +339,13 @@ ds_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		best = (Path *) create_group_result_path(root, rel, rel->reltarget,
 										   list_make1(makeBoolConst(false, false)));
 
-	for (b = 0; b < dt->coloc->bucket_count; b++)
-		if (dt->coloc->bucket_group[b] == cat->local_group_id)
+	for (b = 0; b < kingres_shard_coloc_nbuckets(dt->coloc); b++)
+		if (kingres_shard_bucket_group(dt->coloc, kingres_shard_coloc_bucket(dt->coloc, b)) == cat->local_group_id)
 			local_buckets++;
 	local_rows = Max(best->rows, 0);
 	nremote = list_length(remote);
 	if (local_buckets > 0)
-		remote_rows = local_rows * (dt->coloc->bucket_count - local_buckets) / local_buckets;
+		remote_rows = local_rows * (kingres_shard_coloc_nbuckets(dt->coloc) - local_buckets) / local_buckets;
 	else
 		remote_rows = 1000.0 * nremote;
 

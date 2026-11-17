@@ -570,6 +570,14 @@ fetch_remote(KsRemoteScanState *s)
 	values = kingres_shard_params_to_text(params, &types, &nparams);
 	res = kingres_shard_exec_params(kc, s->sql, nparams, types, values, false);
 
+	/*
+	 * A statement that was not carried out is an error, never "zero rows" (S11-01, S11-12): the
+	 * connection broke before an answer came.  The caller sees the statement fail; the
+	 * transaction aborts.
+	 */
+	if (res == NULL)
+		kingres_shard_report_error(kc, NULL, s->sql);
+
 	if (res != NULL && PQresultStatus(res) != PGRES_COMMAND_OK &&
 		PQresultStatus(res) != PGRES_TUPLES_OK)
 	{

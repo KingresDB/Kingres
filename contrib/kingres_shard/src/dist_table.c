@@ -328,8 +328,8 @@ choose_colocation(Oid coltype, Oid collation, Oid colocate_with,
  * local DDL is transactional, and the remote nodes' work is committed in the
  * pre-commit callback (not atomically, see node_admin.c).
  */
-Datum
-kingres_create_distributed_table(PG_FUNCTION_ARGS)
+static Datum
+kingres_create_distributed_table_body(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
 	char	   *column = pstrdup(NameStr(*PG_GETARG_NAME(1)));
@@ -356,7 +356,6 @@ kingres_create_distributed_table(PG_FUNCTION_ARGS)
 	StringInfoData script;
 	Oid			newrelid;
 
-	kingres_shard_control_begin();
 	kingres_shard_lock_catalog();
 	kingres_shard_require_map_group();
 	local_group = kingres_shard_catalog()->local_group_id;
@@ -502,6 +501,12 @@ kingres_create_distributed_table(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+Datum
+kingres_create_distributed_table(PG_FUNCTION_ARGS)
+{
+	return kingres_shard_control_call(kingres_create_distributed_table_body, fcinfo);
+}
+
 PG_FUNCTION_INFO_V1(kingres_create_reference_table);
 
 /*
@@ -621,8 +626,8 @@ kingres_shard_copy_table_rows(Oid relid, List *conns)
  * writes to it run on every node.  Map group primary only.  Writers are
  * blocked while the rows are copied (an EXCLUSIVE lock); readers are not.
  */
-Datum
-kingres_create_reference_table(PG_FUNCTION_ARGS)
+static Datum
+kingres_create_reference_table_body(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
 	MemoryContext callercxt = CurrentMemoryContext;
@@ -634,7 +639,6 @@ kingres_create_reference_table(PG_FUNCTION_ARGS)
 	ListCell   *lc;
 	StringInfoData script;
 
-	kingres_shard_control_begin();
 	kingres_shard_lock_catalog();
 	kingres_shard_require_map_group();
 	LockRelationOid(relid, ExclusiveLock);
@@ -687,4 +691,10 @@ kingres_create_reference_table(PG_FUNCTION_ARGS)
 
 	kingres_shard_sync_catalog_internal();
 	PG_RETURN_VOID();
+}
+
+Datum
+kingres_create_reference_table(PG_FUNCTION_ARGS)
+{
+	return kingres_shard_control_call(kingres_create_reference_table_body, fcinfo);
 }

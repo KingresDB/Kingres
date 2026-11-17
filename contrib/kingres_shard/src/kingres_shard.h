@@ -102,6 +102,12 @@
 #define ERRCODE_KINGRES_IN_RECOVERY MAKE_SQLSTATE('K','S','0','1','1')
 #define ERRCODE_KINGRES_UNSAFE_PROMOTION MAKE_SQLSTATE('K','S','0','1','2')
 #define ERRCODE_KINGRES_IN_DOUBT MAKE_SQLSTATE('K','S','0','1','3')
+/*
+ *   KS014  a node holds a cluster secret that the node that asks does not accept or hold (S11-04): a
+ *          standby that missed a rotation, and was promoted or is asked about.  Not a transient
+ *          refusal: do not repeat; rebuild the node from a node that has the current secret.
+ */
+#define ERRCODE_KINGRES_SECRET_UNKNOWN MAKE_SQLSTATE('K','S','0','1','4')
 
 /*
  * The text that starts the statement of every fragment of a distributed scan

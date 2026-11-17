@@ -1,18 +1,45 @@
 # contrib/kingres_columnar/t/026_random_cursors.pl
 #
-# C6-07.  A seeded, deterministic comparison with a heap twin of what cursors,
-# savepoints, exception blocks and writes do together.  Every episode is one
-# transaction in which the same statements are run against a columnar table and
-# a heap table: inserts of random width and number (under a small allowance, so
-# that memory pressure writes stripes while cursors are open), inserts from the
-# table itself, savepoints, rollbacks to them and releases, blocks that fail,
-# cursors with partial fetches, and checks.  The rows a cursor returns, taken
-# over its whole life, and every check of the table must be those of the heap
-# twin.  The seed is printed (and can be set with KC_FUZZ_SEED).
+# C6-07, C7-02.  A seeded random comparison with a heap twin of what cursors,
+# savepoints, exception blocks and writes do together, under real memory
+# pressure, with the operations that reach the paths of the write side that a
+# plain load never reaches.  Every episode is one transaction in which the same
+# statements are run against columnar tables and heap tables: inserts of random
+# width and number, inserts from the table itself, savepoints, rollbacks to them
+# and releases, blocks that fail, cursors with partial fetches, and checks.  The
+# rows a cursor returns, taken over its whole life, and every check of the tables
+# must be those of the heap twins.
 #
-# It is the test that finds a buffer that is flushed under an open cursor (the
-# cursor then misses rows or reads some twice): no deterministic test of the
-# earlier rounds did.  A targeted case of the same defect comes first.
+# Three profiles of episode:
+#   normal    narrow and wide rows under an allowance of 2 MB (the original test)
+#   pressure  an allowance of 1 MB and rows of up to 300 kB, so that memory pressure
+#             writes stripes while subtransactions commit and cursors are open; a
+#             module of this test (t/kcprobe/kcprobe.c, loaded before the access
+#             method, so its callbacks run after the access method's) runs
+#             statements at the end of every subtransaction (between the two phases
+#             of the hand-over of the rows to the parent) and at the pre-commit
+#             (after the access method has written its buffers): rows written to the
+#             same table and to others, and a COPY into a table made in the
+#             transaction, which is what reaches the guards that keep a prepared
+#             hand-over from being flushed
+#   ceiling   nested savepoints of wide rows until the write buffers reach their
+#             ceiling: the error is the answer, and the comparison is skipped
+#
+# What the episodes reach is counted, not assumed: each episode ends by reading
+# kingres.columnar_write_paths() of its own session, and the file fails when a path
+# that it claims to reach was never taken in the run (write-through after the
+# commit-time flush and in the window, memory-pressure flushes, a committing
+# subtransaction's own flush, the hand-over's flush, the flush of a full stripe, a
+# flush refused because a hand-over was prepared, the ceiling of a write).  The
+# ceiling of a hand-over cannot be reached by random statements (it takes cursors
+# and four levels at exact sizes) and is the scripted case below.
+#
+# The seed is random for each run, printed, and replayed with KC_FUZZ_SEED; the
+# number of episodes is KC_FUZZ_EPISODES (default 90).  A failure prints the
+# script of the episode that differed.
+#
+# Needs a compiler and the server's headers for the probe module; where it cannot
+# be built the test is skipped with the reason.
 #
 # Portions Copyright (c) 2026, RooyeKhat Media Co
 # SPDX-License-Identifier: AGPL-3.0-only
@@ -20,26 +47,34 @@
 use strict;
 use warnings FATAL => 'all';
 
+use FindBin;
+use lib $FindBin::RealBin;
+use KcProbe qw(build_module);
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
-my $seed = defined $ENV{KC_FUZZ_SEED} ? $ENV{KC_FUZZ_SEED} : 20261117;
-my $episodes = defined $ENV{KC_FUZZ_EPISODES} ? $ENV{KC_FUZZ_EPISODES} : 70;
-diag("KC_FUZZ_SEED=$seed KC_FUZZ_EPISODES=$episodes");
+my $dir = build_module('kcprobe');
+plan skip_all => 'the probe module (t/kcprobe/kcprobe.c) could not be built here: it needs a C compiler and the server headers'
+  unless defined $dir;
+
+my $seed = defined $ENV{KC_FUZZ_SEED} ? $ENV{KC_FUZZ_SEED} : (int(time) ^ ($$ << 10)) & 0x7fffffff;
+my $episodes = defined $ENV{KC_FUZZ_EPISODES} ? $ENV{KC_FUZZ_EPISODES} : 90;
+diag("KC_FUZZ_SEED=$seed KC_FUZZ_EPISODES=$episodes (replay with KC_FUZZ_SEED=$seed)");
+note("seed $seed");
 srand($seed);
 
 my $node = PostgreSQL::Test::Cluster->new('colrandcur');
 $node->init;
-$node->append_conf('postgresql.conf', q{
-shared_preload_libraries = 'kingres_columnar'
-});
+$node->append_conf('postgresql.conf', "shared_preload_libraries = '$dir/kcprobe,kingres_columnar'\n");
 $node->start;
 $node->safe_psql('postgres', q{
 CREATE EXTENSION kingres_columnar;
 CREATE TABLE p (id int, pad text) USING columnar;
 SELECT kingres.columnar_set_options('p', stripe_row_count => 1000, chunk_row_count => 100);
 CREATE TABLE h (id int, pad text);
+CREATE TABLE q (id int, pad text) USING columnar;
+CREATE TABLE hq (id int, pad text);
 CREATE FUNCTION fetchlog(cur text, k int, tag text) RETURNS int LANGUAGE plpgsql AS $$
 DECLARE c refcursor := cur; r record; n int := 0;
 BEGIN
@@ -60,6 +95,23 @@ sub run
 
 	$node->psql('postgres', $sql, stdout => \$out, stderr => \$err, on_error_stop => 0);
 	return ($out, $err);
+}
+
+# how often each path was taken, over all episodes of the random part
+my %paths;
+my $PATHS_SQL = "SELECT 'PATHS ' || string_agg(path || '=' || hits, ' ' ORDER BY path) FROM kingres.columnar_write_paths();";
+
+sub count_paths
+{
+	my ($out, $into) = @_;
+	if ($out =~ /^PATHS (.*)$/m)
+	{
+		foreach my $kv (split / /, $1)
+		{
+			my ($k, $v) = split /=/, $kv;
+			$into->{$k} += $v;
+		}
+	}
 }
 
 # ------------------------------------------------------------------------
@@ -143,16 +195,61 @@ COMMIT;";
 }
 
 # ------------------------------------------------------------------------
+# The ceiling of a hand-over (scripted: random statements do not reach it).
+# Allowance 1 MB, so a ceiling of 2 MB.  Three levels hold 1.0, 0.5 and 0.5 MB
+# (each below what writing is worth); a cursor holds their rows, so the fourth
+# level's row cannot be merged into the third level's buffer nor written; the
+# write itself passes (the ceiling is checked before a row is added) and the
+# release of the level is refused: it would leave 2.11 MB in the parent.
+# ------------------------------------------------------------------------
+my %scripted;
+{
+	$node->safe_psql('postgres', q{
+DROP TABLE IF EXISTS c;
+CREATE TABLE c (id int, pad text) USING columnar;
+SELECT kingres.columnar_set_options('c', stripe_row_count => 1000000);});
+	my ($out, $err) = run("
+SET kingres_columnar.write_buffer_memory = '1MB';
+BEGIN;
+INSERT INTO c SELECT g, repeat('x', 100000) FROM generate_series(1, 10) g;
+SAVEPOINT s1;
+INSERT INTO c SELECT g, repeat('x', 100000) FROM generate_series(1, 5) g;
+SAVEPOINT s2;
+INSERT INTO c SELECT g, repeat('x', 100000) FROM generate_series(1, 5) g;
+DECLARE cur CURSOR FOR SELECT count(*) FROM c;
+FETCH 1 FROM cur;
+SAVEPOINT s3;
+INSERT INTO c SELECT g, repeat('x', 100000) FROM generate_series(1, 1) g;
+RELEASE s3;
+ROLLBACK;
+$PATHS_SQL");
+	like($err, qr/would hold \d+ bytes after this subtransaction, more than the limit of 2097152 bytes/,
+		'scripted: the release of a level that would leave more than twice the allowance is refused');
+	count_paths($out, \%scripted);
+	cmp_ok($scripted{ceiling_handover} // 0, '==', 1, '... and the path counter saw it');
+}
+
+# ------------------------------------------------------------------------
 # The random episodes
 # ------------------------------------------------------------------------
 my @widths = (20, 300, 4000, 30000);
+my @pwidths = (300, 3000, 40000, 120000, 300000);
 my $differences = 0;
 my $refused = 0;
 my $checks = 0;
+my %profiles;
+
+# the statement each probe setting runs, over the tables of the episode
+my @probe_sql = (
+	"INSERT INTO q SELECT g, repeat(\$\$w\$\$, 50) FROM generate_series(1, 3) g; INSERT INTO hq SELECT g, repeat(\$\$w\$\$, 50) FROM generate_series(1, 3) g",
+	"INSERT INTO p VALUES (-1, \$\$w\$\$); INSERT INTO h VALUES (-1, \$\$w\$\$)",
+	"COPY r (id) FROM PROGRAM \$\$seq 1 20\$\$; COPY hr (id) FROM PROGRAM \$\$seq 1 20\$\$",
+	"INSERT INTO r SELECT g, repeat(\$\$v\$\$, 200) FROM generate_series(1, 30) g; INSERT INTO hr SELECT g, repeat(\$\$v\$\$, 200) FROM generate_series(1, 30) g",
+);
 
 sub episode
 {
-	my ($n) = @_;
+	my ($n, $profile) = @_;
 	my @sql;
 	my @sp;							# open savepoints, by number
 	my @curs;						# open cursors: [ name, depth when opened ]
@@ -160,23 +257,51 @@ sub episode
 	my $nsp = 0;
 	my $next = 1;
 	my $chk = 0;
-	my $steps = 8 + int(rand(18));
+	my $pressure = $profile ne 'normal';
+	my $steps = $profile eq 'ceiling' ? 6 + int(rand(8)) : 8 + int(rand(18));
 	my %drained;
+	# Rows a cursor returns without ORDER BY come in the order of the table's stripes
+	# and buffers, which is not the order heap has (memory pressure writes the largest
+	# buffer first), so cursors are compared as sets, and only when every fetch of the
+	# cursor is still logged at the end: a ROLLBACK TO a savepoint older than a fetch
+	# takes the log of that fetch away (not the position of the cursor).
+	my %fetched_at;					# cursor number => depths at which it was fetched
+	my %tainted;
+	my $maxsp = $pressure ? 6 : 3;
+	my $maxcur = $pressure ? 3 : 4;
+	my @w = $pressure ? @pwidths : @widths;
+	my $budget = $pressure ? 700000 : 300000;
 
-	push @sql, "SET kingres_columnar.write_buffer_memory = '2MB';";
-	push @sql, "TRUNCATE p, h;";
+	push @sql, "SET kingres_columnar.write_buffer_memory = '" . ($pressure ? '1MB' : '2MB') . "';";
+	push @sql, "DROP TABLE IF EXISTS r, hr;";
+	push @sql, "TRUNCATE p, h, q, hq;";
 	push @sql, "CREATE TEMP TABLE fl (tag text, id int);";
 	push @sql, "BEGIN;";
-	my $both = sub { my ($f) = @_; return join(' ', map { $f->($_) } 'p', 'h'); };
+	# a table made in the transaction: a COPY into it flushes it (the bulk-insert end)
+	push @sql, "CREATE TABLE r (id int, pad text) USING columnar; CREATE TABLE hr (id int, pad text);";
+	if ($profile eq 'pressure')
+	{
+		# the probe writes at the end of every subtransaction and at the pre-commit
+		push @sql, "SET LOCAL kcprobe.sql = '" . $probe_sql[int(rand(@probe_sql))] . "';" if rand() < 0.6;
+		push @sql, "SET LOCAL kcprobe.commit_sql = '" . $probe_sql[int(rand(@probe_sql))] . "';" if rand() < 0.6;
+	}
+	my $both = sub
+	{
+		my ($f) = @_;
+		my $pair = rand() < 0.75 ? ['p', 'h'] : ['r', 'hr'];
+		return join(' ', map { $f->($_) } @$pair);
+	};
 	my $check = sub
 	{
 		$chk++;
-		push @sql, "SELECT 'CHK$chk p=' || (SELECT count(*) || ':' || coalesce(sum(id), 0) || ':' || coalesce(sum(length(pad)), 0) FROM p) || ' h=' || (SELECT count(*) || ':' || coalesce(sum(id), 0) || ':' || coalesce(sum(length(pad)), 0) FROM h);";
+		my $one = sub { my ($t) = @_; return "(SELECT count(*) || ':' || coalesce(sum(id), 0) || ':' || coalesce(sum(length(pad)), 0) FROM $t)"; };
+		push @sql, "SELECT 'CHK$chk p=' || " . join(" || '/' || ", map { $one->($_) } qw(p r q)) . " || ' h=' || " . join(" || '/' || ", map { $one->($_) } qw(h hr hq)) . ";";
 	};
 	my $drain = sub
 	{
 		my ($c) = @_;
 		$drained{$c->[0]} = 1;
+		push @{ $fetched_at{$c->[0]} }, scalar(@sp);
 		push @sql, "SELECT fetchlog('cp$c->[0]', 1000000, 'cp$c->[0]'), fetchlog('ch$c->[0]', 1000000, 'ch$c->[0]');";
 		push @sql, "CLOSE cp$c->[0]; CLOSE ch$c->[0];";
 	};
@@ -184,19 +309,59 @@ sub episode
 	for my $s (1 .. $steps)
 	{
 		my $r = rand();
-		if ($r < 0.30)
+		if ($profile eq 'ceiling')
 		{
-			my $w = $widths[int(rand(@widths))];
-			my $rows = 1 + int(rand(int(300000 / $w) < 1500 ? int(300000 / $w) : 1500));
+			# deeper and deeper, each level a few hundred kB: the ceiling ends the episode
+			my $width = 250000;
+			my $rows = 1 + int(rand(2));
 			my $base = $next;
 			$next += $rows;
-			push @sql, $both->(sub { "INSERT INTO $_[0] SELECT g + $base, repeat('x', $w) FROM generate_series(1, $rows) g;" });
+			$nsp++;
+			push @sp, $nsp;
+			push @sql, "SAVEPOINT s$nsp;";
+			push @sql, $both->(sub { "INSERT INTO $_[0] SELECT g + $base, repeat('x', $width) FROM generate_series(1, $rows) g;" });
+			next;
+		}
+		# (as the first step of an episode the memory is empty, so the child's commit is
+		# what writes the big buffer; later the memory pressure writes it before that)
+		if ($pressure && ($s == 1 ? rand() < 0.5 : rand() < 0.12))
+		{
+			# a subtransaction whose commit has something to do: one big child (half the
+			# allowance and more, which the commit writes itself), or a child that writes
+			# the table made in the transaction (so that a COPY into it, run between the
+			# phases of the hand-over, meets a prepared buffer)
+			my $base = $next;
+			if (rand() < 0.5)
+			{
+				# the parent holds a row of the table first: only then is the child's buffer
+				# merged into the parent's, and a big one written by the child itself
+				$next += 3;
+				push @sql, "INSERT INTO p VALUES ($base, \$\$a\$\$); INSERT INTO h VALUES ($base, \$\$a\$\$);";
+				push @sql, "DO \$\$ BEGIN BEGIN "
+					. join(' ', map { "INSERT INTO $_ SELECT g + $base, repeat('b', 280000) FROM generate_series(1, 2) g;" } 'p', 'h')
+					. " EXCEPTION WHEN raise_exception THEN NULL; END; END \$\$;";
+			}
+			else
+			{
+				$next += 5;
+				push @sql, "DO \$\$ BEGIN BEGIN "
+					. join(' ', map { "INSERT INTO $_ SELECT g + $base, repeat('r', 100) FROM generate_series(1, 5) g;" } 'r', 'hr')
+					. " EXCEPTION WHEN raise_exception THEN NULL; END; END \$\$;";
+			}
+		}
+		elsif ($r < 0.30)
+		{
+			my $width = $w[int(rand(@w))];
+			my $rows = 1 + int(rand(int($budget / $width) < 1500 ? int($budget / $width) : 1500));
+			my $base = $next;
+			$next += $rows;
+			push @sql, $both->(sub { "INSERT INTO $_[0] SELECT g + $base, repeat('x', $width) FROM generate_series(1, $rows) g;" });
 		}
 		elsif ($r < 0.38)
 		{
-			push @sql, $both->(sub { "INSERT INTO $_[0] SELECT id + 1000000, pad FROM $_[0] WHERE id % 5 = 0;" });
+			push @sql, "INSERT INTO p SELECT id + 1000000, pad FROM p WHERE id % 5 = 0; INSERT INTO h SELECT id + 1000000, pad FROM h WHERE id % 5 = 0;";
 		}
-		elsif ($r < 0.48 && @sp < 3)
+		elsif ($r < 0.48 && @sp < $maxsp)
 		{
 			$nsp++;
 			push @sp, $nsp;
@@ -206,6 +371,11 @@ sub episode
 		{
 			my $k = int(rand(@sp));				# index into @sp
 			push @sql, "ROLLBACK TO s$sp[$k];";
+			# the fetches made after that savepoint was made are not logged any more
+			foreach my $cn (keys %fetched_at)
+			{
+				$tainted{$cn} = 1 if grep { $_ > $k } @{ $fetched_at{$cn} };
+			}
 			# the subtransactions after s$sp[$k] are gone, and the cursors opened since it was made
 			splice(@sp, $k + 1);
 			@curs = grep { $_->[1] <= $k } @curs;
@@ -218,17 +388,16 @@ sub episode
 		}
 		elsif ($r < 0.72)
 		{
-			my $w = $widths[int(rand(@widths))];
-			my $rows = 1 + int(rand(int(200000 / $w) < 800 ? int(200000 / $w) : 800));
+			my $width = $w[int(rand(@w))];
+			my $rows = 1 + int(rand(int(($budget * 2 / 3) / $width) < 800 ? int(($budget * 2 / 3) / $width) : 800));
 			my $base = $next;
 			$next += $rows;
 			my $fail = rand() < 0.5 ? 'true' : 'false';
 			push @sql, "DO \$\$ BEGIN BEGIN "
-				. join(' ', map { "INSERT INTO $_ SELECT g + $base, repeat('e', $w) FROM generate_series(1, $rows) g;" } 'p', 'h')
+				. join(' ', map { "INSERT INTO $_ SELECT g + $base, repeat('e', $width) FROM generate_series(1, $rows) g;" } 'p', 'h')
 				. " IF $fail THEN RAISE EXCEPTION 'x'; END IF; EXCEPTION WHEN raise_exception THEN NULL; END; END \$\$;";
-			$next += 0;
 		}
-		elsif ($r < 0.80 && @curs < 4)
+		elsif ($r < 0.80 && @curs < $maxcur)
 		{
 			$ncur++;
 			push @curs, [ $ncur, scalar(@sp) ];
@@ -238,6 +407,7 @@ sub episode
 		{
 			my $c = $curs[int(rand(@curs))];
 			my $k = 1 + int(rand(400));
+			push @{ $fetched_at{$c->[0]} }, scalar(@sp);
 			push @sql, "SELECT fetchlog('cp$c->[0]', $k, 'cp$c->[0]'), fetchlog('ch$c->[0]', $k, 'ch$c->[0]');";
 		}
 		elsif ($r < 0.94 && @curs)
@@ -256,15 +426,27 @@ sub episode
 	$check->();
 	my $commit = rand() < 0.7;
 	push @sql, $commit ? "COMMIT;" : "ROLLBACK;";
-	push @sql, "SELECT 'FIN p=' || (SELECT count(*) || ':' || coalesce(sum(id), 0) || ':' || coalesce(md5(string_agg(id || '/' || length(pad), ',' ORDER BY id, length(pad))), '') FROM p) || ' h=' || (SELECT count(*) || ':' || coalesce(sum(id), 0) || ':' || coalesce(md5(string_agg(id || '/' || length(pad), ',' ORDER BY id, length(pad))), '') FROM h);";
+	my $fin = sub { my ($t) = @_; return "(SELECT count(*) || ':' || coalesce(sum(id), 0) || ':' || coalesce(md5(string_agg(id || '/' || length(pad), ',' ORDER BY id, length(pad))), '') FROM $t)"; };
+	push @sql, "SELECT 'FIN p=' || " . join(" || '/' || ", map { $fin->($_) } qw(p q)) . " || ' h=' || " . join(" || '/' || ", map { $fin->($_) } qw(h hq)) . ";";
 	push @sql, "SELECT 'LOG ' || tag || ' ' || count(*) || ':' || sum(id) || ':' || md5(string_agg(id::text, ',' ORDER BY id)) FROM fl GROUP BY tag ORDER BY tag;";
+	push @sql, $PATHS_SQL;
+	delete @drained{ keys %tainted };
 	return (join("\n", @sql), \%drained);
 }
 
 for my $n (1 .. $episodes)
 {
-	my ($script, $drained) = episode($n);
+	my $x = rand();
+	my $profile = $x < 0.40 ? 'normal' : $x < 0.88 ? 'pressure' : 'ceiling';
+	$profiles{$profile}++;
+	my ($script, $drained) = episode($n, $profile);
 	my ($out, $err) = run($script);
+	count_paths($out, \%paths);
+	if ($ENV{KC_FUZZ_TRACE})
+	{
+		my ($pl) = $out =~ /^PATHS (.*)$/m;
+		diag("episode $n ($profile): " . ($script =~ /repeat\('b', 280000\)/ ? 'BIG ' : '') . ($pl // 'no paths line') . ($err =~ /ERROR/ ? ' ERROR' : ''));
+	}
 	if ($err =~ /write buffers of columnar tables/)
 	{
 		# the limit of the buffers' memory is an answer the heap twin does not have
@@ -274,12 +456,11 @@ for my $n (1 .. $episodes)
 	if ($err =~ /ERROR/)
 	{
 		$differences++;
-		diag("episode $n failed:\n$err\n--- script ---\n$script");
+		diag("episode $n ($profile) failed:\n$err\n--- script ---\n$script");
 		next;
 	}
-	my %chk;
-	while ($out =~ /^CHK(\d+) p=(\S+) h=(\S+)/mg) { $checks++; $differences++, diag("episode $n check $1: columnar $2, heap $3\n$script") if $2 ne $3; }
-	if ($out =~ /^FIN p=(\S+) h=(\S+)/m) { $checks++; $differences++, diag("episode $n final: columnar $1, heap $2\n$script") if $1 ne $2; }
+	while ($out =~ /^CHK(\d+) p=(\S+) h=(\S+)/mg) { $checks++; $differences++, diag("episode $n ($profile) check $1: columnar $2, heap $3\n$script") if $2 ne $3; }
+	if ($out =~ /^FIN p=(\S+) h=(\S+)/m) { $checks++; $differences++, diag("episode $n ($profile) final: columnar $1, heap $2\n$script") if $1 ne $2; }
 	my %log;
 	while ($out =~ /^LOG c([ph])(\d+) (\S+)/mg) { $log{$2}{$1} = $3; }
 	foreach my $c (grep { $drained->{$_} } keys %log)
@@ -288,13 +469,23 @@ for my $n (1 .. $episodes)
 		if (($log{$c}{p} // 'none') ne ($log{$c}{h} // 'none'))
 		{
 			$differences++;
-			diag("episode $n cursor $c: columnar " . ($log{$c}{p} // 'none') . ", heap " . ($log{$c}{h} // 'none') . "\n$script");
+			diag("episode $n ($profile) cursor $c: columnar " . ($log{$c}{p} // 'none') . ", heap " . ($log{$c}{h} // 'none') . "\n$script");
 		}
 	}
 }
+diag('profiles: ' . join(' ', map { "$_=$profiles{$_}" } sort keys %profiles));
+diag('paths taken: ' . join(' ', map { "$_=" . ($paths{$_} // 0) } sort grep { $_ ne 'bytes_held' } keys %paths));
+
 is($differences, 0, "$episodes episodes of savepoints, cursors and writes under memory pressure: no difference from the heap twin in $checks comparisons");
-cmp_ok($refused, '<=', int($episodes / 10), "... and at most a tenth of the episodes ran into the limit of the buffers' memory ($refused)");
-cmp_ok($checks, '>=', $episodes * 3, '... and the episodes did compare something');
+cmp_ok($refused, '<=', int($episodes * 0.4), "... and at most 40 percent of the episodes ran into the limit of the buffers' memory ($refused; the ceiling profile does by design)");
+cmp_ok($checks, '>=', $episodes, '... and the episodes did compare something');
+
+# the paths the episodes claim to reach: each taken at least once, or the generator no longer reaches it
+foreach my $path (qw(late_commit late_window pressure_flush own_flush handover_flush size_flush prepared_skip ceiling_write))
+{
+	my $hits = $paths{$path} // 0;
+	cmp_ok($hits, '>', 0, "path $path was taken by the random episodes ($hits times)");
+}
 
 $node->stop;
 done_testing();

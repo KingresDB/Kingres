@@ -187,10 +187,10 @@ is($primary->safe_psql('db1', 'SELECT max(tx_count) FROM kingres.ledger_blocks W
 	'2', 'of at most two transactions');
 
 #--------------------------------------------------------------------------
-# The builder lock is taken: the worker gives up quietly.
+# The builder lock is taken (by a builder whose transaction stays open): the worker gives up quietly.
 #--------------------------------------------------------------------------
 my $holder = $primary->background_psql('db2');
-$holder->query_safe('BEGIN; LOCK TABLE kingres.ledger_chain IN EXCLUSIVE MODE;');
+$holder->query_safe('BEGIN; SELECT kingres.ledger_build_block();');
 $primary->safe_psql('db2', q(INSERT INTO public.w VALUES (30, 'locked')));
 sleep 4;
 is($primary->safe_psql('db2', 'SELECT count(*) FROM kingres.ledger_pending'),

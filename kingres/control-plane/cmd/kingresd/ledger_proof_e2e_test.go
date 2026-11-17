@@ -380,14 +380,32 @@ func TestInclusionProofOnLedger01(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.sql(t, "pf01", "create table public.t (id int primary key)")
-	e.expect(t, 200, "PUT", "/databases/pf01/schemas/public/tables/t/ledger", map[string]any{"mode": "appendOnly"})
+	// The installed library writes the ledger only through the functions of
+	// its own version, so a database whose SQL is older is told what to run;
+	// it is not "forbidden".
+	st, raw := e.rawCall("PUT", "/databases/pf01/schemas/public/tables/t/ledger", map[string]any{"mode": "appendOnly"})
+	wantProblemRaw(t, st, raw, 422, "unsupported_operation")
+	if !strings.Contains(string(raw), "ALTER EXTENSION kingres_ledger UPDATE") {
+		t.Errorf("the refusal does not say what to run: %s", raw)
+	}
+	// What such a database holds was written before the library was replaced.
+	// Here a superuser's session writes it by hand, which the library allows
+	// for one session.
+	for _, q := range []string{
+		"set kingres_ledger.allow_manual_write = on",
+		"select kingres.ledger_enable('public.t'::regclass, 'append_only')",
+	} {
+		if _, err := sc.Exec(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
 	e.sql(t, "pf01", "insert into public.t values (1)")
 	if _, err := sc.Exec(ctx, "select kingres.ledger_build_block()"); err != nil {
 		t.Fatal(err)
 	}
 	key := map[string]any{"id": 1}
 	// The insert proof works with 0.1; removed versions need 0.2.
-	st, raw := e.proof("pf01", map[string]any{"schema": "public", "table": "t", "primaryKey": key})
+	st, raw = e.proof("pf01", map[string]any{"schema": "public", "table": "t", "primaryKey": key})
 	if st != 200 {
 		t.Fatalf("0.1 proof: %d %s", st, raw)
 	}
@@ -406,6 +424,16 @@ func TestInclusionProofOnLedger01(t *testing.T) {
 	valid(t, "listLedgerVerifications", "200", out)
 	if items := out["items"].([]any); len(items) != 0 || out["nextCursor"] != nil {
 		t.Errorf("verifications of a 0.1 database: %v", out)
+	}
+	// After the update the same request is accepted, and what was written
+	// under 0.1 still has its proof.
+	if _, err := sc.Exec(ctx, "reset kingres_ledger.allow_manual_write; alter extension kingres_ledger update"); err != nil {
+		t.Fatal(err)
+	}
+	e.sql(t, "pf01", "create table public.u (id int primary key)")
+	e.expect(t, 200, "PUT", "/databases/pf01/schemas/public/tables/u/ledger", map[string]any{"mode": "appendOnly"})
+	if st, raw = e.proof("pf01", map[string]any{"schema": "public", "table": "t", "primaryKey": key}); st != 200 {
+		t.Errorf("proof of a 0.1 row after the update: %d %s", st, raw)
 	}
 	e.mustTask(t, "DELETE", "/databases/pf01", nil)
 }

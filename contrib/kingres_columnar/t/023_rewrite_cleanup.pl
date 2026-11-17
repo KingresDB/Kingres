@@ -296,6 +296,61 @@ COMMIT;");
 	}
 }
 
+# C7-03: the two defenses of the cleanup, each by a case the other cannot decide.
+#
+# (1) A note follows the subtransaction that made it: it goes with an abort and
+#     becomes the parent's with a release.  Where the file was replaced by a rewrite
+#     the table that holds the note is the transient one, which does not exist
+#     after a rollback, so the comparison with the file the table has cannot tell
+#     "replaced" from "rolled back": only the note's own life does.  A released
+#     savepoint inside one that is rolled back (the review's shape, event
+#     triggers off so that no command-end cleanup consumes the note first) must
+#     leave the rows; a note that stayed with the released savepoint would empty
+#     the table.  The same with two releases, and with a single rolled back
+#     savepoint; and a release that is followed by a commit must still remove them.
+# (2) The comparison: a note of a file that the table still has deletes nothing.
+#     Nothing in a rollback can make a note of a file in use that the note's life
+#     does not already take away, but a note can be made of a file that is not
+#     replaced at all (columnar_note_rewrite, kept for databases with the earlier
+#     script, called for a table that is then not rewritten); the commit must
+#     delete nothing for it.
+{
+	foreach my $c (['DROP TABLE x', 'a DROP'], ['ALTER TABLE x ALTER COLUMN b TYPE bigint', 'a rewriting ALTER TABLE'],
+		['ALTER TABLE x SET ACCESS METHOD heap', 'SET ACCESS METHOD heap'])
+	{
+		my ($sql, $name) = @$c;
+		foreach my $shape (
+			['SAVEPOINT a; SAVEPOINT b; %S%; RELEASE b; ROLLBACK TO a;', 'a released savepoint inside one that is rolled back'],
+			['SAVEPOINT a; SAVEPOINT b; SAVEPOINT c; %S%; RELEASE c; RELEASE b; ROLLBACK TO a;', 'two releases, then a rollback to the outermost'],
+			['SAVEPOINT a; %S%; ROLLBACK TO a;', 'a rolled back savepoint'])
+		{
+			my ($t, $sname) = @$shape;
+			(my $body = $t) =~ s/%S%/$sql/;
+			fresh_x();
+			script("SET event_triggers = off; BEGIN; $body COMMIT;");
+			is(q1('SELECT count(*) FROM x'), 5000, "$name, $sname, event triggers off: the table keeps its rows");
+			cmp_ok(stripe_rows('x'), '>=', 5, '... and its stripe rows');
+		}
+		# released and committed: the file is gone and so are its rows
+		fresh_x();
+		my $uid = q1("SELECT kingres.columnar_identity('x')");
+		script("SET event_triggers = off; BEGIN; SAVEPOINT a; SAVEPOINT b; $sql; RELEASE b; RELEASE a; COMMIT;");
+		is(q1("SELECT count(*) FROM kingres.columnar_stripe WHERE rel_uid = $uid"), 0, "$name, released twice and committed: the old file's rows are removed at the commit");
+		is(orphans(), 0, '... and nothing is left over');
+	}
+
+	fresh_x();
+	q1(q{CREATE FUNCTION kingres.columnar_note_rewrite(rel regclass) RETURNS void
+		AS '$libdir/kingres_columnar', 'kingres_columnar_note_rewrite' LANGUAGE C STRICT SECURITY DEFINER
+		SET search_path = pg_catalog, kingres, pg_temp});
+	script("BEGIN; SELECT kingres.columnar_note_rewrite('x'); INSERT INTO x VALUES (1, 1); COMMIT;");
+	is(q1('SELECT count(*) FROM x'), 5001, 'a file noted and then not replaced (columnar_note_rewrite without a rewrite): the commit deletes nothing');
+	cmp_ok(stripe_rows('x'), '>=', 5, '... the stripe rows are still there');
+	script("BEGIN; SAVEPOINT a; SELECT kingres.columnar_note_rewrite('x'); RELEASE a; COMMIT;");
+	is(q1('SELECT count(*) FROM x'), 5001, '... also when the note was made in a savepoint that was released');
+	q1("DROP FUNCTION kingres.columnar_note_rewrite(regclass)");
+}
+
 # a stripe row that another session deleted and committed while the cleanup waited for it is
 # gone, which is what the cleanup wanted: not an error
 {

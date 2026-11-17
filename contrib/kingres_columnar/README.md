@@ -60,6 +60,7 @@ and use `kingres.columnar_compact` afterwards.
 | `kingres.columnar_compact(rel, min_rows)` | Merge stripes with fewer than `min_rows` rows (default a quarter of the stripe size); returns the number of stripes written. Owner only. It changes nothing logically: for every transaction, the one that calls it and every other, the rows each snapshot sees are the same before and after, and under SERIALIZABLE it creates no dependency (see "Isolation"). |
 | `kingres.columnar_check(fix)` | Superuser. Reports catalog rows of files nobody uses, stripes beyond the end of the file, stripes whose first page is not theirs, stripes with more rows than the developer setting `max_stripe_rows` lets a stripe have today (`stripe_over_row_limit`: readable, a rewrite writes them again), and relations that cannot be read (`unreadable`, with the reason). `fix` deletes the first two kinds. |
 | `kingres.columnar_reconcile()` | Superuser. Deletes catalog rows of files no relation uses (it reads the first block of every columnar file of the database). A row that another session is deleting or has deleted is left to it, never an error. |
+| `kingres.columnar_write_paths(reset)` | Superuser (grantable). How often each path of the write side was taken in this session (`late_commit`, `late_window`, `pressure_flush`, `own_flush`, `handover_flush`, `size_flush`, `prepared_skip`, `ceiling_write`, `ceiling_handover`, `refused_ending`, `orphans_cleaned`) and, as `bytes_held`, the memory the write buffers are charged for now; with `reset` the counts start again. A diagnostic, and what the tests of those paths read. |
 | `kingres.columnar_identity(rel)`, `kingres.columnar_creating_xid(rel)`, `kingres.columnar_table_xid(rel)` | The identity of the stored content, the id of the transaction that created the file (2 once frozen) and the id that stands for the creation of the table (0 when it is not known, 2 once frozen): what the metapage holds (see "On-disk format"). |
 
 `SELECT` privilege on the table is needed for `columnar_options`,
@@ -304,6 +305,25 @@ the access method names itself, and `columnar_note_rewrite` is still there for
 it; tested in `t/023`).  The stripe catalog of an earlier shape is refused
 with the statement that repairs it, as before.
 
+What can still leave stripe rows behind is a leak and never an emptied table
+(`t/028_orphan_rows.pl`): (1) a callback of another module (loaded before this
+one, so that its pre-commit runs after ours) that drops or rewrites a columnar
+table at pre-commit with event triggers off: the transaction's own cleanup has
+run and the commit cannot delete rows, so the access method keeps the dropped
+files (at most 10 000) and the next transaction of the same backend that reaches
+its pre-commit deletes the rows of those that are gone, with the same
+comparison as always (`columnar_write_paths` counts them as `orphans_cleaned`);
+a backend that ends first leaves the rows; (2) a session that did not load the
+library (the server runs without `shared_preload_libraries`, the extension
+still installed) and drops a columnar table with event triggers off: no hook
+runs there, and the rows stay.  Both are found by `columnar_check()`
+(`orphan_catalog_rows`, with the number of rows) and removed by
+`columnar_check(true)`, `columnar_reconcile()` and `VACUUM`; the removal reads
+the identity of every live columnar file with a dirty snapshot of `pg_class`, so
+the file of a table that another session is creating, uncommitted, keeps its
+rows, and a new file always draws an identity that no row of the catalog, live
+or dead, has, so leftover rows are never taken for the stripes of a later file.
+
 `ANALYZE` samples blocks: a page of a stripe stands for the rows at the same
 relative position in the stripe. It ignores rows buffered by the running
 transaction.
@@ -438,9 +458,23 @@ Memory and costs worth knowing:
   * the memory the backend takes is at most 2 * (2A + R) for the buffers (the
     allocator's blocks, at most 1 MB each, add up to as much as the rows),
     + (2A + R) for the rows of a committing subtransaction, + S for the stripe
-    being built (the compressed bytes and a chunk of at most 32 MB raw; it
-    depends on the stripe size and the width of the rows, not on A, and is not
-    counted) + what the backend needs to run the statements.  Measured as the
+    being built (not counted by the accounting, but part of this bound) + what
+    the backend needs to run the statements (12 MB in the tests).  S is the
+    raw chunk the encoder builds (the rows of one chunk group: at most 32 MB,
+    or one value if that is larger), its compressed output, and the compressed
+    stripe so far, which is at most as large as the buffers it was made from:
+    **S <= 2 * (32 MB + V) + 2A + V**, with V the largest single value of the
+    statement (a text or bytea of up to 1 GB).  For a large value that is the
+    largest term: a value of V bytes is held by the executor (V), copied into
+    the buffer (V), copied into the raw chunk (V) and compressed (its output
+    and the copy of it in the stripe: up to 2 V more), so one value of V bytes
+    takes **at most 4 V more than the same insert into heap** (measured for a
+    64 MB text: 5.0 V in all against heap's 2.9 V; a 100 MB value 4.8 V against
+    2.9 V, a 400 MB one 4.8 V against 2.9 V, so a value at the 1 GB limit of
+    PostgreSQL takes about 5 GB).  An earlier version of this paragraph said
+    3 R plus an S that the caller chooses, which is not a bound for such a
+    value; the number is pinned by a measurement with a 64 MB value in `t/025`.
+    Measured as the
     peak size of the backend (`VmPeak`), not by a counter of the extension
     (`t/025_memory_bound.pl`): 60 nested levels of 3.6 MB under A = 8 MB grew
     the backend by 19 MB (206 MB held before the limit existed), 40 cursors
@@ -459,7 +493,13 @@ Memory and costs worth knowing:
     buffer until the child's id is the parent's).  A write that is refused at
     the ceiling is therefore the answer where writing cannot help, and it is
     exact: the transaction can release or commit its levels, close its cursors,
-    or raise the setting.  A buffer of less than `max(chunk_row_count, 1000)`
+    or raise the setting.  A level of subtransaction that wrote a row costs
+    the 2 kB of its buffer and the room for its first 16 rows (2 320 bytes for
+    a table of one int column), so at the smallest setting (A = 1 MB, a ceiling
+    of 2 MB) 904 nested savepoints of one row each reach the ceiling where heap
+    does not, and at the default of 128 MB about 115 000 do; the charge is
+    pinned by a measurement of the accounting (`bytes_held`) and the number of
+    levels by a run in `t/025`.  A buffer of less than `max(chunk_row_count, 1000)`
     rows and half of A is written only while the flushable buffers together
     are half of A, so that a few rows are never made a stripe because outer
     levels hold the memory;
@@ -495,17 +535,83 @@ Memory and costs worth knowing:
   written from then on is written to a stripe at once (write-through), in the
   caller's memory and outside the buffers, so it is committed with its
   transaction whatever the order of the libraries; a `COPY` or a multi-row
-  insert is one stripe per batch, and a single row is a stripe of one row
-  (correct, and rare; `VACUUM` and `columnar_compact` join small stripes).  A
-  delete or an update is refused with an error, as always (the table is
-  append-only).  A write after the point where the transaction state is no
-  longer "in progress" (`XACT_EVENT_COMMIT`, `SUBXACT_EVENT_COMMIT_SUB`) is
-  refused with an error and never dropped silently; an error in
-  `SUBXACT_EVENT_COMMIT_SUB`, which PostgreSQL treats as the abort of a
-  subtransaction that has committed, is the one thing this extension cannot
-  undo for the rows it has already handed to the parent, and no module should
-  raise one.  Tested with the probe module and a heap twin, both load orders, on
-  both majors (`t/024_commit_window.pl`).
+  insert is one stripe per batch, and a single row (an `INSERT`, or each row of
+  an `INSERT ... SELECT`) is a stripe of one row.  That is correct and rare, and
+  it has a price, measured with 100 000 rows written one at a time by a callback
+  at pre-commit: 100 000 stripes and 819 200 000 bytes on disk (8 192 bytes, one
+  page, for each row of 4 bytes), written in 2.6 s, read by a full scan in 0.52 s
+  where the same rows in one stripe take 0.006 s (`t/030_late_stripes.pl` pins
+  the shape with 5 000 rows).  `VACUUM` does not join the stripes (an earlier
+  comment in the code said it did); `columnar_compact` does (0.9 s for those
+  100 000 rows, to one stripe of 245 760 bytes), but the pages of the old
+  stripes stay in the file until `VACUUM FULL` returns them.  An operator whose
+  module writes late runs `columnar_compact` and, to return the space, `VACUUM
+  FULL`; the module's own remedy is to write its rows with `COPY` or one
+  multi-row statement.  A delete or an update is refused with an error, as
+  always (the table is append-only), where an error is allowed.  Tested with the
+  probe module and a heap twin, both load orders, on both majors
+  (`t/024_commit_window.pl`).
+
+* Writes while a transaction is ending (C7-01).  The invariant: **at every
+  event of the transaction and subtransaction callbacks, and at every other
+  moment at which PostgreSQL forbids an error, a write that reaches the access
+  method is either done correctly or refused in a way that the server survives
+  and that the caller sees (a warning), and the access method never raises an
+  error there.**  PostgreSQL escalates an ERROR at those moments: in a critical
+  section, at `XACT_EVENT_COMMIT` (after the commit record: "cannot abort
+  transaction ... it was already committed", a PANIC), at `XACT_EVENT_PREPARE`
+  (a failed assertion in `procarray.c`), at `XACT_EVENT_ABORT` and
+  `SUBXACT_EVENT_ABORT_SUB` ("ERRORDATA_STACK_SIZE exceeded", a PANIC), at
+  `SUBXACT_EVENT_COMMIT_SUB` (the subtransaction is aborted after it committed)
+  and in the phases of the release of a resource owner.  Version 0.1 as first
+  written raised an error there ("cannot be written now: the transaction is
+  ending"), which stopped the server; it now warns and discards the row.  What
+  heap does at the same moments was found with a module that writes a row with
+  `table_tuple_insert` into a table it holds open at the event a setting names
+  (`t/kcevents/kcevents.c`), run by hand on a heap table against a server built
+  with assertions and one built without (PostgreSQL 18.7, both load orders; the
+  access method's column is `t/027_ending_writes.pl`, which compares with a heap
+  twin only at the moments where heap writes without stopping the server):
+
+  | Moment | heap, server with assertions | heap, production build | columnar before | columnar now |
+  |---|---|---|---|---|
+  | `XACT_EVENT_PRE_COMMIT`, `PRE_PREPARE` | writes | writes | writes at once (write-through) | the same |
+  | `SUBXACT_EVENT_START_SUB`, `PRE_COMMIT_SUB` | writes | writes | writes (a buffer, or write-through in the window) | the same |
+  | `XACT_EVENT_COMMIT` | stops: `Assert(IsTransactionState())` in `relcache.c` | writes; the row is committed | PANIC | warning, row not written; the commit stands |
+  | `XACT_EVENT_PREPARE` | stops (the same assertion) | writes; `COMMIT PREPARED` commits the row | assertion failure in `procarray.c` | warning, row not written; the prepared transaction is intact |
+  | `XACT_EVENT_ABORT` | stops (the same assertion) | writes a row of the aborted transaction, which nobody sees | PANIC (error stack) | warning, row not written (an aborting transaction's row would vanish anyway) |
+  | `SUBXACT_EVENT_COMMIT_SUB` | stops (the same assertion) | writes; the row commits with the parent | the subtransaction aborted | warning, row not written; the subtransaction's other rows commit |
+  | `SUBXACT_EVENT_ABORT_SUB` | stops (the same assertion) | writes a row of the aborted subtransaction, which nobody sees | PANIC (error stack) | warning, row not written (as for an abort) |
+  | resource owner release, the three phases | ERROR "ResourceOwnerEnlarge called after release started", escalated to a PANIC | the same | PANIC | warning, row not written |
+  | inside a critical section | stops (`allowInCritSection` assertion in `mcxt.c`) | writes | writes when no allocation is needed, else the same assertion | warning, row not written |
+  | `proc_exit` callbacks | no transaction and no relation to write to; nothing of the access method runs there | | | |
+
+  The server survives at every moment, which heap does not: with assertions it
+  stops at every moment of the table except the first two rows, and in a
+  production build at the three phases of the release of a resource owner (the
+  same PANIC).  Where heap writes in a production build (the commit, the
+  prepare, the commit of a subtransaction, a critical section) the access
+  method does not keep the row: writing a stripe reads the catalogs and
+  allocates memory, which PostgreSQL forbids at the same moments (that is the
+  assertion heap trips in a build with assertions), and a failure in it, an
+  error, would be the PANIC again.  The choice per event is therefore between a
+  refusal and a stop of the server, and the refusal is the least bad: in a transaction or subtransaction that is aborting the row is lost
+  anyway, which is exactly what the warning says; where the commit record
+  exists already (`XACT_EVENT_COMMIT`, `XACT_EVENT_PREPARE` before the
+  `COMMIT PREPARED`, `SUBXACT_EVENT_COMMIT_SUB`) a row written by another
+  module at that moment is lost with a warning, and nothing else of the
+  transaction is touched.  Keeping the row for a later safe moment (the next
+  transaction of the backend) was considered and rejected: the row would appear
+  in a snapshot of a transaction that did not write it, and for a prepared
+  transaction that is rolled back later it would be a row that never
+  committed.  The other callbacks of the access method that raise an error
+  (delete, update, row lock, speculative insert) warn and return "not found"
+  (`TM_Invisible`) at those moments, and the flush that ends a `COPY` does
+  nothing there.  `columnar_write_paths()` counts the refusals as
+  `refused_ending`.  The module that finds a row missing writes at the wrong
+  moment: write at `XACT_EVENT_PRE_COMMIT` or `PRE_PREPARE`, or in a
+  transaction of its own.  Tested for every moment, both load orders, both
+  majors, with a heap twin where heap writes (`t/027_ending_writes.pl`).
 
 * The rows of a committing subtransaction are handed to its parent in two
   phases (see `kc_write.c`): everything that can fail (memory, the flush) is
@@ -586,7 +692,7 @@ make USE_PGXS=1 installcheck       # needs a server with the library preloaded
 
 or `kingres/dev/ext.sh kingres_columnar` and `kingres/dev/ext-majors.sh
 kingres_columnar` for PostgreSQL 18 and 19. The tests are eleven `pg_regress`
-files (`sql/`, `expected/`) and twenty-six TAP files in `t/`: crash recovery,
+files (`sql/`, `expected/`) and thirty TAP files in `t/`: crash recovery,
 standby and `pg_rewind`, backup/restore/dump, concurrent writers, corruption,
 a randomised comparison against heap (`KC_COMPARE_SEED`, `KC_COMPARE_STEPS`),
 older snapshots, array validation, serializable isolation against heap twins,
@@ -603,11 +709,20 @@ the earlier shape (`t/023`), a callback of another module that writes after the
 access method's own commit-time flush, in both load orders, against a heap twin
 (`t/024`), the bound on the memory of the write buffers measured as the memory of
 the backend, for levels of subtransaction, cursors, relations, partitions and wide
-rows (`t/025`), a seeded random comparison with heap of cursors, savepoints and
-writes under memory pressure (`t/026`; `KC_FUZZ_SEED`, `KC_FUZZ_EPISODES`), and
-two laps of the transaction id space.
+rows, a value larger than a chunk group, and each constant of the ceiling pinned by
+a measurement (`t/025`), a random comparison with heap of cursors, savepoints
+and writes under real memory pressure, with a probe that writes in the window
+of a hand-over and after the commit-time flush, whose seed is random per run,
+printed, replayed with `KC_FUZZ_SEED` (`KC_FUZZ_EPISODES`, `KC_FUZZ_TRACE`), and
+which fails when a path of the write side that it claims to reach was never
+taken (`t/026`), a write at every event of the end of a transaction and
+subtransaction, the release of a resource owner and a critical section, in both
+load orders (`t/027`), stripe rows left behind and the way to find and remove
+them (`t/028`), `COMMIT AND CHAIN`, a parallel leader and a base backup under
+load, restored (`t/029`), the cost of rows written late (`t/030`), and two laps
+of the transaction id space.
 
-Four files do not run everywhere, and say why when they are skipped:
+Some files do not run everywhere, and say why when they are skipped:
 
 * `t/016_atomic_handover.pl` needs the developer settings `fault_point` and
   `fault_nth`, which exist only in a server built with assertions
@@ -619,11 +734,18 @@ Four files do not run everywhere, and say why when they are skipped:
   PostgreSQL tree and takes minutes; `KC_SKIP_WRAPAROUND=1` skips it.  The
   freezing of the ids of the metapage is also tested without it, in
   `t/021_table_creation.pl`;
-* `t/022_handover_window.pl` and `t/024_commit_window.pl` build the probe module
+* `t/022`, `t/024`, `t/026`, `t/028`, `t/029` and `t/030` build the probe module
   `t/kcprobe/kcprobe.c` (callbacks at the end of a subtransaction and at the
   pre-commit and pre-prepare, which run SQL from the setting `kcprobe.sql` or
-  `kcprobe.commit_sql`) with the compiler and headers of the installation
-  (`pg_config`), and are skipped, with that reason, where they cannot;
+  `kcprobe.commit_sql`), and `t/027` builds `t/kcevents/kcevents.c` (a callback
+  for every event of the transaction and subtransaction callbacks, for the
+  three phases of the release of a resource owner and for the exit of the
+  process, which writes with the table access method calls into a table it holds
+  open at the moment its setting `kcevents.at` names), both through
+  `t/KcProbe.pm`, with the compiler and headers of the installation
+  (`pg_config`) as the modules of `src/test/modules` are built for their tests;
+  they are never installed, and the files are skipped, with that reason, where
+  they cannot be built;
 * `t/025_memory_bound.pl` reads `/proc/self/status` and is skipped where there is
   no `/proc`.
 

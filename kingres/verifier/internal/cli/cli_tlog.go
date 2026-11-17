@@ -42,7 +42,7 @@ var epochDirRE = regexp.MustCompile(`^e([1-9][0-9]{0,8})$`)
 func parseLogSpec(s string) (logSpec, error) {
 	m := logSpecRE.FindStringSubmatch(s)
 	if m == nil {
-		return logSpec{}, fmt.Errorf("--log %q is not chain:<64 lower case hex>[:e<N>] or aggregate:<64 lower case hex>", clipArg(s))
+		return logSpec{}, fmt.Errorf("--log %q is not chain:<64 lower case hex>[:e<N>] or aggregate:<64 lower case hex>", s)
 	}
 	ls := logSpec{kind: m[1], id: m[2]}
 	if m[3] != "" {
@@ -56,13 +56,6 @@ func parseLogSpec(s string) (logSpec, error) {
 		ls.epoch, ls.hasEpoch = n, true
 	}
 	return ls, nil
-}
-
-func clipArg(s string) string {
-	if len(s) > 100 {
-		return strings.ToValidUTF8(s[:100], "?") + "..."
-	}
-	return s
 }
 
 // rel is the directory of the log below the publication root (design 4.6).
@@ -166,7 +159,7 @@ func parseNow(a nowArg) (time.Time, bool, error) {
 		if err == nil {
 			err = errors.New("the fraction of a second uses a point, not a comma")
 		}
-		return time.Time{}, false, fmt.Errorf("--now %q is not an RFC 3339 time: %w", clipArg(a.val), err)
+		return time.Time{}, false, fmt.Errorf("--now %q is not an RFC 3339 time: %w", a.val, err)
 	}
 	return t.UTC(), true, nil
 }
@@ -440,8 +433,17 @@ func (e *env) runCheckpoint(args []string) int {
 	}
 	if *statePath == "" {
 		r.notProved = append([]string{rollbackLine}, r.notProved...)
-	} else if code, done := e.applyState(r, in, cp, data, signers, *statePath, *asJSON, *allowShared); done {
-		return code
+	} else {
+		canon, dropped, cerr := canonicalOf(data, signers)
+		if cerr != nil {
+			return e.inputError(cmd, *asJSON, cerr)
+		}
+		if dropped > 0 {
+			r.notes = append(r.notes, fmt.Sprintf("the note as served has %d signature line(s) that were not counted: the state and any saved evidence keep only the %d that verified", dropped, len(signers)))
+		}
+		if code, done := e.applyState(r, in, cp, canon, signers, *statePath, *asJSON, *allowShared); done {
+			return code
+		}
 	}
 	return e.finishOK(r, *asJSON)
 }
@@ -494,7 +496,7 @@ func (e *env) runConsistency(args []string) int {
 		size, err := strconv.ParseUint(m[1], 10, 64)
 		rb, derr := signednote.DecodeBase64(m[2])
 		if err != nil || size >= tlog.MaxTreeSize || derr != nil || len(rb) != 32 {
-			return e.inputError(cmd, *asJSON, fmt.Errorf("--old %q: expected a size below %d and a canonical base64 root of 32 bytes", clipArg(*oldFlag), tlog.MaxTreeSize))
+			return e.inputError(cmd, *asJSON, fmt.Errorf("--old %q: expected a size below %d and a canonical base64 root of 32 bytes", *oldFlag, tlog.MaxTreeSize))
 		}
 		oldCP = &checkpoint.Checkpoint{Size: size}
 		copy(oldCP.Root[:], rb)
@@ -512,13 +514,13 @@ func (e *env) runConsistency(args []string) int {
 		}
 		oldData, rec, err := decodeHeld(fileData)
 		if err != nil {
-			return e.inputError(cmd, *asJSON, fmt.Errorf("--old %s: %w", clipArg(*oldFlag), err))
+			return e.inputError(cmd, *asJSON, fmt.Errorf("--old %s: %w", *oldFlag, err))
 		}
 		if _, err := signednote.Parse(oldData); err != nil {
-			return e.inputError(cmd, *asJSON, fmt.Errorf("--old %s is not a signed note: %w", clipArg(*oldFlag), err))
+			return e.inputError(cmd, *asJSON, fmt.Errorf("--old %s is not a signed note: %w", *oldFlag, err))
 		}
 		oldSigned = true
-		cp, _, oldNotes, verr := in.verifyHeld(oldData, rec, "--old "+clipArg(*oldFlag))
+		cp, _, oldNotes, verr := in.verifyHeld(oldData, rec, "--old "+*oldFlag)
 		if verr != nil {
 			var ie *inputErr
 			if errors.As(verr, &ie) {

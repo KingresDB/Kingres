@@ -40,8 +40,11 @@
  * after it and may write: from the flush on, a row goes straight to a stripe
  * (kc_write_late) and no buffer is touched; the same holds between the two
  * phases of a hand-over, where the buffers are prepared and must not be
- * changed.  A write where the transaction is not in progress any more is an
- * error (kc_write_check_state).
+ * changed.  A write at a moment where PostgreSQL forbids an error (after the
+ * commit or abort of a transaction or subtransaction has begun, in a critical
+ * section) is refused with a warning and never with an error, which the
+ * server would make a PANIC (kc_write_refused, README "Writes while a
+ * transaction is ending").
  *
  * The invariant of memory: the memory of the buffers of one backend is bounded
  * by a number that follows from write_buffer_memory (A) alone: the buffers are
@@ -107,6 +110,70 @@
  * cursor reads): a write that would go beyond it is refused with an error.
  */
 #define KC_CEILING_FACTOR	2
+
+/*
+ * How often each path of the write side was taken in this backend, for tests
+ * and for diagnosis (kingres.columnar_write_paths).  A test that claims to
+ * reach a path asserts that its count is not zero; the counters cost an
+ * increment and are kept in every build.
+ */
+typedef enum KcPath
+{
+	KC_PATH_LATE_COMMIT,		/* write-through after the commit-time flush */
+	KC_PATH_LATE_WINDOW,		/* write-through between the two phases of a hand-over */
+	KC_PATH_PRESSURE_FLUSH,		/* memory pressure wrote a buffer */
+	KC_PATH_OWN_FLUSH,			/* a committing subtransaction wrote its own big buffer */
+	KC_PATH_HANDOVER_FLUSH,		/* a hand-over wrote stripes (parent's buffer over the stripe size or the allowance) */
+	KC_PATH_SIZE_FLUSH,			/* a buffer was written because it held a full stripe */
+	KC_PATH_PREPARED_SKIP,		/* a flush was refused because a hand-over was prepared or the commit flush was done */
+	KC_PATH_CEILING_WRITE,		/* a write was refused at the ceiling */
+	KC_PATH_CEILING_HANDOVER,	/* a hand-over was refused at the ceiling */
+	KC_PATH_REFUSED_ENDING,		/* a write was refused: the transaction state forbids an error */
+	KC_PATH_ORPHANS_CLEANED,	/* stripe rows of a file dropped after the cleanup, removed later */
+	KC_PATH_COUNT
+} KcPath;
+
+static const char *const kc_path_names[KC_PATH_COUNT] = {
+	"late_commit", "late_window", "pressure_flush", "own_flush", "handover_flush",
+	"size_flush", "prepared_skip", "ceiling_write", "ceiling_handover",
+	"refused_ending", "orphans_cleaned"
+};
+
+static uint64 kc_path_hits[KC_PATH_COUNT];
+
+#define KC_PATH(p) (kc_path_hits[p]++)
+
+static Size kc_total_bytes_for_report(void);
+
+/*
+ * The rows the SQL function reports: one per path, then "bytes_held", the memory
+ * the write buffers are charged for right now (not a count, never reset): the
+ * number the allowance and the ceiling are about, so a test can measure what a
+ * buffer, a level of subtransaction or a row costs.
+ */
+int
+kc_write_path_count(void)
+{
+	return KC_PATH_COUNT + 1;
+}
+
+const char *
+kc_write_path_get(int i, uint64 *hits)
+{
+	if (i == KC_PATH_COUNT)
+	{
+		*hits = kc_total_bytes_for_report();
+		return "bytes_held";
+	}
+	*hits = kc_path_hits[i];
+	return kc_path_names[i];
+}
+
+void
+kc_write_paths_reset(void)
+{
+	memset(kc_path_hits, 0, sizeof(kc_path_hits));
+}
 
 /* the rows of a buffer that a flush did not write, in memory of their own */
 typedef struct KcTail
@@ -187,6 +254,12 @@ static HTAB *kc_states = NULL;
 static HTAB *kc_holds = NULL;
 static Size kc_total_bytes = 0;
 static uint32 kc_next_serial = 1;
+
+static Size
+kc_total_bytes_for_report(void)
+{
+	return kc_total_bytes;
+}
 
 /*
  * Bytes written to buffers since the last look for something to flush under
@@ -695,9 +768,13 @@ kc_buf_widen(KcWriteBuf *b, Relation rel)
 static bool
 kc_buf_flushable(KcRelState *st, KcWriteBuf *b)
 {
-	return !kc_handover_prepared && !kc_commit_flushed &&
-		b->merge_into == NULL && !b->tail_ready &&
-		b->refs == 0 && b->subid == GetCurrentSubTransactionId();
+	if (kc_handover_prepared || kc_commit_flushed ||
+		b->merge_into != NULL || b->tail_ready)
+	{
+		KC_PATH(KC_PATH_PREPARED_SKIP);
+		return false;
+	}
+	return b->refs == 0 && b->subid == GetCurrentSubTransactionId();
 }
 
 static void kc_write_stripe(KcRelState *st, KcWriteBuf *b, Relation rel,
@@ -792,8 +869,13 @@ kc_flush_pressure(void)
 	 * buffer may be written then except by the hand-over (kc_buf_flushable
 	 * says so for each buffer; this says it for the whole look).
 	 */
-	if (kc_states == NULL || kc_handover_prepared || kc_commit_flushed)
+	if (kc_states == NULL)
 		return;
+	if (kc_handover_prepared || kc_commit_flushed)
+	{
+		KC_PATH(KC_PATH_PREPARED_SKIP);
+		return;
+	}
 	while (kc_total_bytes > allowance)
 	{
 		HASH_SEQ_STATUS seq;
@@ -833,6 +915,7 @@ kc_flush_pressure(void)
 		{
 			kc_flush_buf(best_st, best, rel);
 			table_close(rel, NoLock);
+			KC_PATH(KC_PATH_PRESSURE_FLUSH);
 		}
 
 		/*
@@ -945,12 +1028,58 @@ kc_write_is_late(void)
 }
 
 /*
- * Whether a row may be written at all now.  PostgreSQL gives no write to the
- * access method outside a running transaction, but code of another module can
- * reach it from a callback at the commit (XACT_EVENT_COMMIT and
- * SUBXACT_EVENT_COMMIT_SUB, where the buffers have been written or handed
- * over and nothing will look at a new one), and a parallel worker must not
- * write.  Both are errors, never a row that is dropped.
+ * The moments at which PostgreSQL forbids an error.  An ERROR raised there is
+ * made a PANIC (a critical section; the commit path after the commit record,
+ * "cannot abort transaction ... it was already committed"; the abort path, "error
+ * stack"; a failed assertion in the callbacks of PREPARE TRANSACTION), so the
+ * access method must never raise one for a write that reaches it there; and
+ * the access method cannot write at such a moment either, because writing a
+ * stripe reads the catalogs and allocates memory, which PostgreSQL forbids
+ * there as well (a write into a heap table at those moments stops a server
+ * built with assertions, t/028_ending_writes.pl and the README say which).
+ * What it can do is refuse without an error: kc_write_refused says so with a
+ * WARNING and the caller then discards the row.  In an aborting transaction or
+ * subtransaction that is exactly what the row's fate is anyway; in one that
+ * is committing (XACT_EVENT_COMMIT, XACT_EVENT_PREPARE, SUBXACT_EVENT_COMMIT_SUB)
+ * the row is lost, with the warning that says so, which is the least bad of
+ * what is left: the alternative is a stop of the server, and the row is lost
+ * with that too.
+ *
+ * The states: IsTransactionState() is true only while the transaction is in
+ * progress; the callbacks at pre-commit, pre-prepare, the start of a
+ * subtransaction and the first phase of its commit are in that state, and a
+ * write there is done (kc_write_late and the buffers).
+ */
+static bool
+kc_write_state_forbids_error(void)
+{
+	return CritSectionCount > 0 || !IsTransactionState();
+}
+
+/*
+ * Whether a write must be refused now (see above); warns and counts when it
+ * must.  Never raises an error.  what is "row" or "rows".
+ */
+bool
+kc_write_refused(Relation rel, const char *what)
+{
+	if (!kc_write_state_forbids_error())
+		return false;
+	KC_PATH(KC_PATH_REFUSED_ENDING);
+	ereport(WARNING,
+			(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+			 errmsg("%s not written to columnar table \"%s\": %s",
+					what, RelationGetRelationName(rel),
+					CritSectionCount > 0 ? "inside a critical section" :
+					"the transaction is not in progress"),
+			 errdetail("Code of another module wrote to the table at a moment where the server forbids an error and the table cannot be written: in a critical section, or after the commit or abort of the transaction or subtransaction has begun (XACT_EVENT_COMMIT, XACT_EVENT_PREPARE, XACT_EVENT_ABORT, SUBXACT_EVENT_COMMIT_SUB, SUBXACT_EVENT_ABORT_SUB, the release of resources).  Nothing was stored; if the transaction was committing, the data is lost."),
+			 errhint("Write at XACT_EVENT_PRE_COMMIT or XACT_EVENT_PRE_PREPARE, or in a transaction of its own.")));
+	return true;
+}
+
+/*
+ * Whether a row may be written at all now, after kc_write_refused said no to
+ * refusing: a parallel worker must not write (an error: the state allows it).
  */
 static void
 kc_write_check_state(Relation rel)
@@ -960,12 +1089,6 @@ kc_write_check_state(Relation rel)
 				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
 				 errmsg("cannot insert into columnar table \"%s\" in a parallel worker",
 						RelationGetRelationName(rel))));
-	if (!IsTransactionState())
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
-				 errmsg("columnar table \"%s\" cannot be written now: the transaction is ending",
-						RelationGetRelationName(rel)),
-				 errdetail("A callback of another module wrote to the table after the commit of the transaction or subtransaction had passed the point where the rows are written.")));
 }
 
 /* Put one row into the arrays of a buffer.  May fail (memory), before it changes nrows. */
@@ -1010,7 +1133,8 @@ kc_buf_put_row(KcWriteBuf *b, TupleDesc desc, Datum *vals, bool *nulls, CommandI
  * the one that wrote the rows; if a later callback fails and the transaction
  * aborts, they go with it.  A row written one at a time is a stripe of one
  * row: correct, and rare (only code that runs after the access method's
- * callback gets here); VACUUM and columnar_compact() join small stripes.
+ * callback gets here).  Only columnar_compact() joins small stripes (VACUUM
+ * does not): the cost of one stripe per row, measured, is in the README.
  */
 static void
 kc_write_late(Relation rel, Datum **vv, bool **nn, int nrows, CommandId cid)
@@ -1023,6 +1147,7 @@ kc_write_late(Relation rel, Datum **vv, bool **nn, int nrows, CommandId cid)
 	bool		pushed = false;
 	int			i;
 
+	KC_PATH(kc_handover_prepared ? KC_PATH_LATE_WINDOW : KC_PATH_LATE_COMMIT);
 	b = kc_buf_make(rel, desc->natts, CurrentMemoryContext, false);
 	for (i = 0; i < nrows; i++)
 		kc_buf_put_row(b, desc, vv[i], nn[i], cid);
@@ -1056,6 +1181,8 @@ kc_write_rows(Relation rel, TupleTableSlot **slots, int nslots, CommandId cid)
 {
 	int			i;
 
+	if (nslots > 0 && kc_write_refused(rel, "rows"))
+		return;
 	if (nslots > 0 && kc_write_is_late())
 	{
 		Datum	  **vv = palloc(sizeof(Datum *) * nslots);
@@ -1086,7 +1213,8 @@ kc_ceiling(void)
 	return kc_allowance() * KC_CEILING_FACTOR;
 }
 
-void
+/* Returns false, after a warning, when the row was refused (kc_write_refused). */
+bool
 kc_write_row_values(Relation rel, Datum *vals, bool *nulls, CommandId cid)
 {
 	TupleDesc	desc = RelationGetDescr(rel);
@@ -1095,6 +1223,8 @@ kc_write_row_values(Relation rel, Datum *vals, bool *nulls, CommandId cid)
 	MemoryContext old = CurrentMemoryContext;
 	Size		before = kc_total_bytes;
 
+	if (kc_write_refused(rel, "row"))
+		return false;
 	kc_write_check_state(rel);
 
 	/*
@@ -1113,7 +1243,7 @@ kc_write_row_values(Relation rel, Datum *vals, bool *nulls, CommandId cid)
 	if (kc_write_is_late())
 	{
 		kc_write_late(rel, &vals, &nulls, 1, cid);
-		return;
+		return true;
 	}
 
 	st = kc_state_get(RelationGetRelid(rel), true);
@@ -1132,12 +1262,15 @@ kc_write_row_values(Relation rel, Datum *vals, bool *nulls, CommandId cid)
 		/* the look may have dropped the state of a relation, this one's too */
 		st = kc_state_get(RelationGetRelid(rel), true);
 		if (kc_total_bytes > kc_ceiling())
+		{
+			KC_PATH(KC_PATH_CEILING_WRITE);
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("the write buffers of columnar tables hold " UINT64_FORMAT " bytes, more than the limit of " UINT64_FORMAT " bytes",
 							(uint64) kc_total_bytes, (uint64) kc_ceiling()),
 					 errdetail("The limit is twice kingres_columnar.write_buffer_memory.  Rows of enclosing subtransactions and rows that an open cursor reads cannot be written yet."),
 					 errhint("Release or commit subtransactions, close cursors, or raise kingres_columnar.write_buffer_memory.")));
+		}
 	}
 
 	if (kc_maintenance_write)
@@ -1174,7 +1307,7 @@ kc_write_row_values(Relation rel, Datum *vals, bool *nulls, CommandId cid)
 	{
 		if (b->nrows >= kc_stripe_limit(&b->opts) || b->bytes >= kc_allowance())
 			kc_write_maintenance_flush(rel);
-		return;
+		return true;
 	}
 
 	if (b->nrows >= kc_stripe_limit(&b->opts) && kc_buf_flushable(st, b))
@@ -1185,6 +1318,7 @@ kc_write_row_values(Relation rel, Datum *vals, bool *nulls, CommandId cid)
 		{
 			kc_flush_buf_ex(st, b, r, true);
 			table_close(r, NoLock);
+			KC_PATH(KC_PATH_SIZE_FLUSH);
 		}
 	}
 
@@ -1200,14 +1334,15 @@ kc_write_row_values(Relation rel, Datum *vals, bool *nulls, CommandId cid)
 	if (kc_total_bytes > kc_allowance() &&
 		(before <= kc_allowance() || kc_bytes_since_look >= kc_allowance() / 64))
 		kc_flush_pressure();
+	return true;
 }
 
 void
 kc_write_row(Relation rel, TupleTableSlot *slot, CommandId cid)
 {
 	slot_getallattrs(slot);
-	kc_write_row_values(rel, slot->tts_values, slot->tts_isnull, cid);
-	pgstat_count_heap_insert(rel, 1);
+	if (kc_write_row_values(rel, slot->tts_values, slot->tts_isnull, cid))
+		pgstat_count_heap_insert(rel, 1);
 }
 
 /* ------------------------------------------------------------------------
@@ -1736,7 +1871,8 @@ kc_write_flush_relation(Relation rel)
 	KcRelState *st = kc_state_get(RelationGetRelid(rel), false);
 	ListCell   *lc;
 
-	if (st == NULL)
+	/* where an error is forbidden nothing is written (kc_write_state_forbids_error) */
+	if (st == NULL || kc_write_state_forbids_error())
 		return;
 	kc_coalesce(st);
 	foreach(lc, st->bufs)
@@ -2260,6 +2396,81 @@ kc_flush_all(void)
 		PopActiveSnapshot();
 }
 
+/*
+ * Files noted as going away after the cleanup of the transaction had run (a
+ * callback of another module that drops or rewrites a table at pre-commit with
+ * event triggers off): the transaction commits, and nothing in it can delete the
+ * stripe rows any more, because it is not in progress.  They are kept, as
+ * (relation, identity) pairs, and the next transaction of this backend that
+ * reaches its pre-commit deletes the rows of those that are gone (the same
+ * comparison as the cleanup of the transaction itself, so a file still in use
+ * keeps its rows).  A backend that exits first leaves them to VACUUM and
+ * columnar_check(true), which find every such row.  At most KC_ORPHAN_MAX files
+ * are kept; any beyond are left to the same two.
+ */
+#define KC_ORPHAN_MAX	10000
+
+static List *kc_orphans = NIL;
+static bool kc_orphans_adopted = false;
+
+static void
+kc_orphans_keep(void)
+{
+	ListCell   *lc;
+	MemoryContext old;
+
+	if (kc_replaced == NIL || !kc_commit_flushed)
+		return;
+	old = MemoryContextSwitchTo(TopMemoryContext);
+	foreach(lc, kc_replaced)
+	{
+		KcReplaced *r = lfirst(lc);
+		KcReplaced *c;
+
+		if (list_length(kc_orphans) >= KC_ORPHAN_MAX)
+			break;
+		c = palloc(sizeof(KcReplaced));
+		*c = *r;
+		kc_orphans = lappend(kc_orphans, c);
+	}
+	MemoryContextSwitchTo(old);
+}
+
+/* make the kept files part of this transaction's notes, to be cleaned with them */
+static void
+kc_orphans_adopt(void)
+{
+	ListCell   *lc;
+	MemoryContext old;
+
+	if (kc_orphans == NIL)
+		return;
+	old = MemoryContextSwitchTo(TopTransactionContext);
+	foreach(lc, kc_orphans)
+	{
+		KcReplaced *r = lfirst(lc);
+		KcReplaced *c = palloc(sizeof(KcReplaced));
+
+		*c = *r;
+		c->subid = GetCurrentSubTransactionId();
+		kc_replaced = lappend(kc_replaced, c);
+	}
+	MemoryContextSwitchTo(old);
+	kc_orphans_adopted = true;
+}
+
+/* the transaction that adopted the kept files has committed: their rows are deleted */
+static void
+kc_orphans_done(void)
+{
+	if (kc_orphans_adopted)
+	{
+		list_free_deep(kc_orphans);
+		kc_orphans = NIL;
+	}
+	kc_orphans_adopted = false;
+}
+
 static void
 kc_xact_callback(XactEvent event, void *arg)
 {
@@ -2276,24 +2487,36 @@ kc_xact_callback(XactEvent event, void *arg)
 			 */
 			kc_commit_flushed = true;
 			kc_flush_all();
+			if (event == XACT_EVENT_PRE_COMMIT)
+				kc_orphans_adopt();
 			if (kc_replaced != NIL)
 			{
 				/* the catalog deletes want a snapshot; none is active at pre-commit */
 				bool		pushed = false;
+				int			n;
 
 				if (!ActiveSnapshotSet())
 				{
 					PushActiveSnapshot(GetTransactionSnapshot());
 					pushed = true;
 				}
-				(void) kc_write_cleanup_replaced();
+				n = kc_write_cleanup_replaced();
+				if (kc_orphans_adopted)
+					kc_path_hits[KC_PATH_ORPHANS_CLEANED] += n;
 				if (pushed)
 					PopActiveSnapshot();
 			}
 			break;
 		case XACT_EVENT_COMMIT:
+			/* files dropped after the cleanup: kept for the next transaction */
+			kc_orphans_done();
+			kc_orphans_keep();
+			kc_replaced = NIL;
+			kc_state_reset();
+			break;
 		case XACT_EVENT_PREPARE:
 		case XACT_EVENT_ABORT:
+			kc_orphans_adopted = false;
 			kc_replaced = NIL;
 			kc_state_reset();
 			break;
@@ -2467,6 +2690,7 @@ kc_merge_flush_prepare(KcRelState *st, KcWriteBuf *prev, KcWriteBuf *b,
 	table_close(rel, NoLock);
 	if (pushed)
 		PopActiveSnapshot();
+	KC_PATH(KC_PATH_HANDOVER_FLUSH);
 
 	/*
 	 * The stripes are written; whatever happens next, the rows in them must
@@ -2605,6 +2829,7 @@ kc_flush_own_buffer(KcRelState *st, KcWriteBuf *b)
 	table_close(rel, NoLock);
 	if (pushed)
 		PopActiveSnapshot();
+	KC_PATH(KC_PATH_OWN_FLUSH);
 }
 
 /* One buffer handed over: the child's, the parent's it is merged into. */
@@ -2778,12 +3003,15 @@ kc_subxact_prepare(SubTransactionId mySubid, SubTransactionId parentSubid)
 	 * made.
 	 */
 	if (effective > kc_ceiling())
+	{
+		KC_PATH(KC_PATH_CEILING_HANDOVER);
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("the write buffers of columnar tables would hold " UINT64_FORMAT " bytes after this subtransaction, more than the limit of " UINT64_FORMAT " bytes",
 						(uint64) effective, (uint64) kc_ceiling()),
 				 errdetail("The limit is twice kingres_columnar.write_buffer_memory.  Rows of enclosing subtransactions and rows that an open cursor reads cannot be written yet."),
 				 errhint("Release or commit subtransactions, close cursors, or raise kingres_columnar.write_buffer_memory.")));
+	}
 }
 
 /* Phase two for the whole subtransaction.  Cannot fail. */

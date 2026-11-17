@@ -126,6 +126,18 @@ my @hostile = (
 # PostgreSQL 19 forces standard_conforming_strings on: a database cannot be
 # set to "off" any more, so that case exists on 18 only.
 @hostile = grep { !($_->[0] eq 'standard_conforming_strings' && $h->pg_version->major >= 19) } @hostile;
+# L10-19: this file has one test fewer on 19 than on 18, and this is the one.  The
+# case is skipped on 19 because the premise does not exist there; a test says
+# so, so that both majors run the same number of tests and a change of 19 that
+# allows the setting again is noticed (the case would then have to run).
+if ($h->pg_version->major >= 19)
+{
+	my ($sret, $sout, $serr) = $h->psql('w1',
+		q(ALTER DATABASE w1 SET standard_conforming_strings = 'off'),
+		extra_params => [ '-U', 'dbo' ]);
+	isnt($sret, 0,
+		'with standard_conforming_strings = off on the database the transactions are built into a block: the case does not exist on this major (the setting is refused)');
+}
 my $n = 0;
 my $super = $h->safe_psql('postgres', 'SELECT current_user');
 foreach my $s (@hostile)
@@ -159,7 +171,7 @@ ok(wait_for($h, 'fx', 'SELECT count(*) FROM kingres.ledger_pending', '0', 30),
 	'fx: the enabling transaction is built');
 $h->safe_psql('fx', q(UPDATE pg_trigger SET tgenabled = 'D' WHERE tgrelid = 'kingres.ledger_chain'::regclass));
 my $chain = $h->safe_psql('fx', q(SELECT encode(chain_id, 'hex') FROM kingres.ledger_chain));
-$h->safe_psql('fx', q(DELETE FROM kingres.ledger_chain));
+$h->safe_psql('fx', q(SET kingres_ledger.allow_manual_write = on; DELETE FROM kingres.ledger_chain));
 my $fails_before = log_count($h, qr/the block worker for database \d+ failed/);
 $h->safe_psql('fx', q(INSERT INTO public.t VALUES (1)));
 sleep 14;
@@ -175,7 +187,7 @@ ok($h->safe_psql('fx', q(SELECT worker_retry_after > now() FROM kingres.ledger_s
 my $fails = log_count($h, qr/the block worker for database \d+ failed/) - $fails_before;
 cmp_ok($fails, '<=', 8, 'the log has one line per attempt and not one per interval');
 is(log_count($h, qr/exited with exit code/), 0, 'no worker exited with an error code');
-$h->safe_psql('fx', qq(INSERT INTO kingres.ledger_chain (chain_id) VALUES (decode('$chain', 'hex'))));
+$h->safe_psql('fx', qq(SET kingres_ledger.allow_manual_write = on; INSERT INTO kingres.ledger_chain (chain_id) VALUES (decode('$chain', 'hex'))));
 ok(wait_for($h, 'fx', 'SELECT count(*) FROM kingres.ledger_pending', '0', 90),
 	'when the cause is gone the transaction is built by the next attempt');
 is($h->safe_psql('fx', q(SELECT worker_state || ' ' || worker_consecutive_failures FROM kingres.ledger_status)),
@@ -400,7 +412,7 @@ cmp_ok($d->safe_psql('dst', q(SELECT count(*) FROM kingres.ledger_verify() WHERE
 	'>=', 2, 'ledger_verify reports the capture triggers of tables that are not registered');
 my ($iret, $iout, $ierr) = $d->psql('dst', q(INSERT INTO public.ao VALUES (3, 'c')));
 isnt($iret, 0, 'an insert into a restored ledger table fails (it is not entered in a ledger that does not know it)');
-like($ierr, qr/ledger_entry_table_id_fkey|violates foreign key/, 'because the entry refers to a table id that is not registered');
+like($ierr, qr/table "ao" is not under ledger control/, 'because the capture trigger finds that the registry does not know the table');
 $d->stop;
 
 done_testing();
