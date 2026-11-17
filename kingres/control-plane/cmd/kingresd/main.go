@@ -175,15 +175,15 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	if svc.Enabled() {
 		// An instance that fenced itself (its group lease was lost) is not started as a
 		// primary again until the lease manager holds a lease (package lease).
-		svc.Manager().SetStartGate(lease.Gate(filepath.Join(cfg.DataDir, leaseDirName)))
+		svc.Manager().SetStartGate(lease.Gate(filepath.Join(cfg.DataDir, leaseDirName), svc.GateInfo))
 	}
 	if stopOnly {
 		sctx, scancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
 		defer scancel()
 		// The watchdog is told to stand down once the fast shutdown was requested, never
 		// before; only this path does it (see lease.StandDown).
-		return svc.StopInstanceForShutdown(sctx, func(postmaster string) {
-			if err := lease.StandDown(filepath.Join(cfg.DataDir, leaseDirName), postmaster); err != nil {
+		return svc.StopInstanceForShutdown(sctx, func(id int, postmaster string) {
+			if err := lease.StandDown(filepath.Join(cfg.DataDir, leaseDirName), id, postmaster); err != nil {
 				log.Warn("telling the lease watchdog that the instance stops on purpose", "error", err)
 			}
 		})
@@ -192,14 +192,25 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		// A primary that is not running at the start waits for its group lease before
 		// kingresd starts it, when the lease of the group is enforced; one that runs
 		// (kingresd was restarted) is left alone and judged after the first round.
-		up, rerr := svc.Manager().Running(ctx, cluster.NodeID)
-		if rerr != nil {
-			return fmt.Errorf("looking at the local instance: %w", rerr)
+		var rerr error
+		running := func(g int32) bool {
+			li, ok := svc.PrimaryOf(g)
+			if !ok {
+				return false
+			}
+			up, err := svc.Manager().Running(ctx, li.ID)
+			if err != nil {
+				rerr = err
+			}
+			return up
 		}
-		if wait, perr := lease.PrepareStart(filepath.Join(cfg.DataDir, leaseDirName), up); perr != nil {
+		if wait, perr := lease.PrepareStart(filepath.Join(cfg.DataDir, leaseDirName), running); perr != nil {
 			return fmt.Errorf("preparing the lease directory: %w", perr)
 		} else if wait {
 			log.Info("the local instance is not running and the lease of its group is enforced: it starts once the lease is held")
+		}
+		if rerr != nil {
+			return fmt.Errorf("looking at the local instance: %w", rerr)
 		}
 	}
 	dsn := cfg.PostgresDSN
@@ -260,7 +271,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 			return err
 		}
 		ring = monitor.NewRing(1440, 2000)
-		opsSvc = &ops.Ops{Service: svc, Roles: proxy, Instances: svc.Manager(), ServerHost: serverHost, PGPort: cfg.PGPort, Log: log}
+		opsSvc = &ops.Ops{Service: svc, Roles: proxy, Instances: svc.Manager(), WritableIDs: svc.WritableIDs, ServerHost: serverHost, PGPort: cfg.PGPort, Log: log}
 	}
 	deps := httpapi.Deps{
 		Logger: log, Store: pg, Setup: node, Sessions: sessions, Authenticator: checkedAuthn, Audit: sink,
@@ -450,7 +461,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		rctx, rcancel := context.WithTimeout(bgCtx, 30*time.Second)
 		if err := opsSvc.ApplyStoredRules(rctx); err != nil {
 			log.Warn("applying the stored network rules", "error", err)
-		} else if err := svc.Manager().Reload(rctx, cluster.NodeID); err != nil {
+		} else if err := reloadWritable(rctx, svc); err != nil {
 			log.Warn("reloading the instance", "error", err)
 		}
 		rcancel()
@@ -573,5 +584,16 @@ func (m monSource) ServiceConn(ctx context.Context, db string) (*pgx.Conn, error
 }
 
 func (m monSource) InstanceRunning(ctx context.Context) (bool, error) {
-	return m.svc.Manager().Running(ctx, cluster.NodeID)
+	return m.svc.Manager().Running(ctx, m.svc.SystemInstance().ID)
+}
+
+// reloadWritable reloads every primary instance of this server.
+func reloadWritable(ctx context.Context, svc *cluster.Service) error {
+	var first error
+	for _, id := range svc.WritableIDs() {
+		if err := svc.Manager().Reload(ctx, id); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
 }

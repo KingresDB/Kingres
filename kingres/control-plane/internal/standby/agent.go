@@ -22,7 +22,6 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/ha"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/instance"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pki"
-	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
 )
 
 // Agent is the part of the standby machinery that runs on every server: it
@@ -40,9 +39,12 @@ type Agent struct {
 	Clock clock.Clock
 	// Audit records a state-changing operation in the audit log of this server.
 	Audit func(ctx context.Context, ev audit.Event)
-	// Frozen reports that a failover of the group is being decided (nil: never).
-	// No failover exists in this phase; the hook is where phase 2 plugs in.
+	// Frozen reports that a failover of the group is being decided (nil: never); a freeze
+	// asked for by the internal call (Freeze) counts as well.
 	Frozen func(group int32) bool
+	// NameMatches asks the extension whether a name matches a streaming standby of this
+	// server's primary (kingres.standby_name_matches); nil: ask the database.
+	NameMatches func(ctx context.Context, dir int, name string) (bool, error)
 	// Grace, SlotWarn and SlotLimit are the settings standby-sync-grace,
 	// slot-retention-warn-bytes and slot-retention-limit-bytes.
 	Grace     time.Duration
@@ -57,11 +59,15 @@ type Agent struct {
 
 	opMu sync.Mutex // one create, remove or rebuild at a time
 
-	mu       sync.Mutex
-	group    *int32
-	syncs    map[int32]*SyncState
-	primary  *PrimaryStatus
-	slotWarn map[int64]int64
+	mu        sync.Mutex
+	syncs     map[int32]*SyncState
+	primaries map[int32]*PrimaryStatus
+	// frozen and gone are the freeze of a group and the servers whose standbys are declared
+	// gone, each with the monotonic time it lapses at (freeze.go).
+	frozen   map[int32]time.Duration
+	gone     map[string]time.Duration
+	rounds   int64
+	slotWarn map[int32]map[int64]int64
 	access   map[string]fileStamp
 	kick     chan struct{}
 }
@@ -91,7 +97,10 @@ func NewAgent(a *Agent) (*Agent, error) {
 	}
 	a.local = l
 	a.syncs = map[int32]*SyncState{}
-	a.slotWarn = map[int64]int64{}
+	a.slotWarn = map[int32]map[int64]int64{}
+	a.primaries = map[int32]*PrimaryStatus{}
+	a.frozen = map[int32]time.Duration{}
+	a.gone = map[string]time.Duration{}
 	a.access = map[string]fileStamp{}
 	a.kick = make(chan struct{}, 1)
 	return a, nil
@@ -105,7 +114,7 @@ func (a *Agent) List(context.Context) ([]ha.Standby, error) {
 	st := a.local.snapshot()
 	out := make([]ha.Standby, 0, len(st.Standbys))
 	for _, e := range st.Standbys {
-		s := ha.Standby{ID: e.ID, Group: e.Group, ServerID: e.Server, Port: e.Port, State: "starting"}
+		s := ha.Standby{ID: e.ID, Group: e.Group, ServerID: e.Server, Port: e.Port, CatalogNode: e.CatalogNode, State: "starting"}
 		if e.Ready {
 			s.State = "running"
 		}
@@ -151,7 +160,7 @@ func (a *Agent) Plan(ctx context.Context, p PlanRequest) error {
 
 func validEntry(e Entry) error {
 	if e.ID < 1 || e.Group < 0 || e.Group > 1<<16 || e.Server == "" || e.PrimaryServer == "" || len(e.Server) > 255 || len(e.PrimaryServer) > 255 ||
-		e.PrimaryPort < 1 || e.PrimaryPort > 65535 || e.Port < 0 || e.Port > 65535 {
+		e.PrimaryPort < 1 || e.PrimaryPort > 65535 || e.Port < 0 || e.Port > 65535 || e.InstanceID < 0 || e.InstanceID > 1<<20 {
 		return errors.New("standby: the entry is not valid")
 	}
 	return nil
@@ -182,7 +191,7 @@ func (a *Agent) once(ctx context.Context) {
 	rctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	a.superviseStandbys(rctx)
-	if err := a.maintainPrimary(rctx); err != nil && ctx.Err() == nil {
+	if err := a.maintainPrimaries(rctx); err != nil && ctx.Err() == nil {
 		a.Log.Debug("standby: maintaining the primary side", "error", err)
 	}
 }
@@ -213,15 +222,22 @@ func (a *Agent) writeMeta(id int, e Entry) error {
 	return pki.WriteFile(filepath.Join(dir, metaFile), b, 0o600)
 }
 
-// localStandbys lists the standby instances of this server that are complete.
-func (a *Agent) localStandbys() []Entry {
-	var out []Entry
+// localStandby is a standby instance of this server with the directory that holds it.
+type localStandby struct {
+	Dir int
+	Entry
+}
+
+// localStandbys lists the standby instances of this server that are complete: the
+// directories whose role file says standby and that carry the file naming the standby.
+func (a *Agent) localStandbys() []localStandby {
+	var out []localStandby
 	for _, id := range a.mgr().IDs() {
-		if !instance.IsStandbyDirID(id) {
+		if a.mgr().IsWritable(id) {
 			continue
 		}
 		if e, err := a.metaOf(id); err == nil {
-			out = append(out, e)
+			out = append(out, localStandby{Dir: id, Entry: e})
 		}
 	}
 	return out
@@ -255,31 +271,24 @@ func (a *Agent) freePort() (int, error) {
 	return 0, errors.New("standby: no free port for the standby instance")
 }
 
-// localGroup is the shard group whose primary runs on this server (the
-// catalog's row of this host and port with the role primary), false when the
-// catalog does not say (before the cluster has one).
-func (a *Agent) localGroup(ctx context.Context) (int32, bool) {
-	a.mu.Lock()
-	if a.group != nil {
-		g := *a.group
-		a.mu.Unlock()
-		return g, true
+// localPrimary is a primary instance this server runs and the shard group it serves.
+type localPrimary struct {
+	Dir   int
+	Group int32
+}
+
+// localPrimaries are the primary instances of this server with their groups, read
+// from the role files every round (after a failover a server runs a primary that is
+// not instance 1, or none). An instance whose group is not known yet is skipped until
+// the catalog has named it (cluster.Service.SyncRoles).
+func (a *Agent) localPrimaries() []localPrimary {
+	var out []localPrimary
+	for _, li := range a.Svc.WritableInstances() {
+		if li.Role.Group >= 0 {
+			out = append(out, localPrimary{Dir: li.ID, Group: li.Role.Group})
+		}
 	}
-	a.mu.Unlock()
-	c, err := a.Svc.ServiceConn(ctx, sysdb.Database)
-	if err != nil {
-		return 0, false
-	}
-	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
-	var g int32
-	if err := c.QueryRow(ctx, `SELECT group_id FROM kingres.node WHERE host = $1 AND port = $2 AND role = 'primary' ORDER BY node_id LIMIT 1`,
-		a.Self, a.Svc.PGPort()).Scan(&g); err != nil {
-		return 0, false
-	}
-	a.mu.Lock()
-	a.group = &g
-	a.mu.Unlock()
-	return g, true
+	return out
 }
 
 // sortedIDs is a helper for stable output.
@@ -287,6 +296,15 @@ func sortedIDs(m map[int64]bool) []int64 {
 	out := make([]int64, 0, len(m))
 	for id := range m {
 		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+func (a *Agent) primaryGroups() []int32 {
+	out := make([]int32, 0, len(a.primaries))
+	for g := range a.primaries {
+		out = append(out, g)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out

@@ -23,10 +23,12 @@ func (s *Service) ServiceConnAt(ctx context.Context, id, port int, db string) (*
 	if !s.Enabled() {
 		return nil, ErrDisabled
 	}
-	// A standby is a copy of another server's data and has that server's service password: it is
-	// reached by peer authentication over its private socket instead (instance.StandbyIdentMap).
+	// An instance that is a copy of another server's data (a standby, or a promoted standby) has that
+	// server's service password: it is reached by peer authentication over its private socket instead
+	// (instance.StandbyIdentMap). The role file says which; the directory id decides only for a directory
+	// that has none.
 	pw := ""
-	if !instance.IsStandbyDirID(id) {
+	if !s.mgr.IsCopy(id) {
 		var err error
 		if pw, err = s.readCredentials(); err != nil {
 			return nil, errors.New("no service credentials")

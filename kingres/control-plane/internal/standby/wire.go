@@ -2,7 +2,11 @@
 
 package standby
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/instance"
+)
 
 // Entry is one standby of the cluster as every server knows it. The leader keeps
 // the authoritative records in kingres_cp.standby and pushes the whole list to
@@ -27,6 +31,15 @@ type Entry struct {
 	// Generation counts the rebuilds of this standby: a plan with a higher
 	// generation than the one whose slot was lost clears the "needs a rebuild" mark.
 	Generation int64 `json:"generation"`
+	// CatalogNode is the node id of the standby in the sharding catalog (kingres.node),
+	// 0 until it is registered. Its primary names it in synchronous_standby_names only
+	// from then on (kingres_shard 0.5, sequence 1: the name is checked against the
+	// registered standby of the group).
+	CatalogNode int32 `json:"catalogNode,omitempty"`
+	// InstanceID is the directory id of the standby instance on its server (0: the
+	// directory of the standby of the group, instance.StandbyDirID). A directory keeps its
+	// id for life; the role file says what it serves.
+	InstanceID int `json:"instanceId,omitempty"`
 }
 
 // SlotName is the physical slot of a standby on its primary; AppName the
@@ -115,4 +128,33 @@ type Status struct {
 	PlanVersion int64          `json:"planVersion"`
 	Standbys    []LocalStatus  `json:"standbys"`
 	Primary     *PrimaryStatus `json:"primary,omitempty"`
+	// Primaries are the primaries this server runs, one per group (after a failover a
+	// server can run more than one); Primary is the first of them, for a leader of an
+	// earlier version.
+	Primaries []PrimaryStatus `json:"primaries,omitempty"`
+	// Rounds counts the passes of the agent over this server's primaries since it started; a test
+	// or a step that waits for "the agent has looked again" compares two readings.
+	Rounds int64 `json:"rounds"`
+}
+
+// dir is the instance directory id of the standby on its server.
+func (e Entry) dir() int {
+	if e.InstanceID > 0 {
+		return e.InstanceID
+	}
+	return instance.StandbyDirID(e.Group)
+}
+
+// primaryOf is the status of the primary of group that this server runs, or nil. A
+// status from a server of an earlier version has only Primary.
+func (s Status) primaryOf(group int32) *PrimaryStatus {
+	for i := range s.Primaries {
+		if s.Primaries[i].Group == group {
+			return &s.Primaries[i]
+		}
+	}
+	if len(s.Primaries) == 0 && s.Primary != nil && s.Primary.Group == group {
+		return s.Primary
+	}
+	return nil
 }

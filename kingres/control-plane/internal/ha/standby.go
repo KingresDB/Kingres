@@ -13,6 +13,10 @@ type Standby struct {
 	ServerID string
 	// Port is the port of the standby instance on that server.
 	Port int
+	// CatalogNode is the node id of the standby in the sharding catalog, 0 until it is
+	// registered; the replication view lists the catalog's nodes and uses it to find
+	// the standby's walsender.
+	CatalogNode int32
 	// State is the process state of the instance.
 	State string
 	// Streaming says whether the standby is connected to its primary.

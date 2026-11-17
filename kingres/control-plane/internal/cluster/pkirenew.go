@@ -99,9 +99,7 @@ func (s *Service) InstallRenewed(ctx context.Context, caPEM, certPEM, crlPEM str
 		return err
 	}
 	if s.mgr != nil && s.mgr.Exists(NodeID) {
-		if up, _ := s.mgr.Running(ctx, NodeID); up {
-			return s.mgr.Reload(ctx, NodeID)
-		}
+		return s.reloadAll(ctx)
 	}
 	return nil
 }
@@ -116,11 +114,17 @@ func (s *Service) MigrateSystem(ctx context.Context) error {
 	if !s.Enabled() || !s.mgr.Exists(NodeID) {
 		return nil
 	}
-	c, err := s.connect(ctx, sysdb.Database)
+	c, err := s.SystemConn(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	// A server whose system database is a standby (it ran its group's primary before a failover and
+	// runs no map primary) gets the schema by replication: there is nothing to write here.
+	var recovery bool
+	if err := c.QueryRow(ctx, `SELECT pg_is_in_recovery()`).Scan(&recovery); err == nil && recovery {
+		return nil
+	}
 	if _, err := sysdb.Migrate(ctx, c); err != nil {
 		return fmt.Errorf("upgrading the system database: %w", err)
 	}

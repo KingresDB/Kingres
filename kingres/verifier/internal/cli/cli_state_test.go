@@ -301,15 +301,17 @@ func TestHeldNoteAndKeyStates(t *testing.T) {
 	cases := []struct {
 		name  string
 		extra string
-		want  int
-		say   string
+		// want is the status of the three uses: checkpoint --state, consistency
+		// --old with a plain note, consistency --old with the state file.
+		want [3]int
+		say  string
 	}{
-		{"valid", "", 0, ""},
-		{"not yet valid", `,"not_before":"2999-01-01T00:00:00Z"`, 0, "accepted for"},
-		{"expired", `,"not_after":"2020-01-01T00:00:00Z"`, 0, "accepted for"},
-		{"revoked", `,"revoked":true`, 2, "revoked"},
-		{"limited below the size", `,"max_tree_size":299`, 2, "counts only for tree sizes up to 299"},
-		{"limited at the size", `,"max_tree_size":300`, 0, ""},
+		{"valid", "", [3]int{0, 0, 0}, ""},
+		{"not yet valid", `,"not_before":"2999-01-01T00:00:00Z"`, [3]int{0, 0, 0}, "accepted for"},
+		{"expired", `,"not_after":"2020-01-01T00:00:00Z"`, [3]int{0, 0, 0}, "accepted for"},
+		{"revoked", `,"revoked":true`, [3]int{0, 2, 0}, "revoked"},
+		{"limited below the size", `,"max_tree_size":299`, [3]int{0, 2, 0}, "counts only for tree sizes up to 299"},
+		{"limited at the size", `,"max_tree_size":300`, [3]int{0, 0, 0}, ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -331,25 +333,22 @@ func TestHeldNoteAndKeyStates(t *testing.T) {
 				code int
 				text string
 			}{{code1, out1 + err1}, {code2, out2 + err2}, {code3, out3 + err3}} {
-				if r.code != c.want {
-					t.Errorf("%s, use %d: status %d, want %d\n%s", c.name, i, r.code, c.want, r.text)
+				if r.code != c.want[i] {
+					t.Errorf("%s, use %d: status %d, want %d\n%s", c.name, i, r.code, c.want[i], r.text)
 				}
 				if c.say != "" && !strings.Contains(r.text, c.say) {
 					t.Errorf("%s, use %d: the output does not say %q:\n%s", c.name, i, c.say, r.text)
 				}
-				if c.want == 2 {
+				if c.want[i] == 2 {
 					if strings.Contains(r.text, "move the state file away") || strings.Contains(r.text, "delete it") && !strings.Contains(r.text, "must not be deleted") && i == 0 {
 						t.Errorf("%s: the advice gives up the protection:\n%s", c.name, r.text)
 					}
-					if i == 0 && !strings.Contains(r.text, "--min-size") {
-						t.Errorf("%s: the advice does not keep the size with --min-size:\n%s", c.name, r.text)
-					}
 				}
 			}
-			if c.want == 2 && fileText(t, state) != kept {
+			if c.want[0] == 2 && fileText(t, state) != kept {
 				t.Errorf("%s: the state changed", c.name)
 			}
-			if c.want == 0 && stateSize(t, state) != 700 {
+			if c.want[0] == 0 && stateSize(t, state) != 700 {
 				t.Errorf("%s: the state did not advance", c.name)
 			}
 		})

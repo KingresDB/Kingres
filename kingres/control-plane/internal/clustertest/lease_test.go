@@ -261,8 +261,8 @@ func TestPartitionedPrimaryWithStandbyStopsBeforeANewHolderCouldBeGranted(t *tes
 	if instanceAccepts(victim) {
 		t.Fatal("the fenced primary came back without a lease")
 	}
-	if _, err := os.Stat(filepath.Join(victim.DataDir, "lease", lease.FencedMarker)); err != nil {
-		t.Fatalf("no fence marker: %v", err)
+	if !lease.AnyFenced(filepath.Join(victim.DataDir, "lease")) {
+		t.Fatal("no fence marker")
 	}
 	// Healed: the lease is obtained again and the primary starts; writes resume.
 	_, before := w.last()
@@ -353,8 +353,8 @@ func TestWatchdogStopsThePrimaryWhenKingresdIsDead(t *testing.T) {
 		t.Fatal("the instance runs although kingresd is dead and the lease is over")
 	}
 	_ = freeAt
-	if _, err := os.Stat(filepath.Join(victim.DataDir, "lease", lease.FencedMarker)); err != nil {
-		t.Fatalf("the watchdog left no marker: %v", err)
+	if !lease.AnyFenced(filepath.Join(victim.DataDir, "lease")) {
+		t.Fatal("the watchdog left no marker")
 	}
 	// kingresd comes back: it must not start the primary until it holds a lease, and it
 	// starts it as soon as it does.

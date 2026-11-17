@@ -137,6 +137,10 @@ func (p *PeerRecorder) Reserve(ctx context.Context) int64 {
 // active task.
 const remoteBusy = "subject_busy"
 
+// remoteFailover is the code the leader answers when the instance belongs to a group that is being
+// failed over (migration 0011, KX004): its stop or restart is refused until the failover has ended.
+const remoteFailover = "failover_in_progress"
+
 // mapRemote turns the leader's answer into the error the callers know.
 func mapRemote(err error) error {
 	if err == nil {
@@ -145,6 +149,9 @@ func mapRemote(err error) error {
 	var ae *peerclient.APIError
 	if errors.As(err, &ae) && ae.Code == remoteBusy {
 		return task.ErrSubjectBusy
+	}
+	if errors.As(err, &ae) && ae.Code == remoteFailover {
+		return &task.ExcludedError{Kind: "instance", Other: "server.failover"}
 	}
 	return err
 }
@@ -272,6 +279,8 @@ func (o *Ops) HandleTaskCall(ctx context.Context, key, peer string, body []byte)
 		switch {
 		case errors.Is(err, task.ErrSubjectBusy):
 			return nil, busy
+		case errors.As(err, new(*task.ExcludedError)):
+			return nil, &internalapi.CallError{Status: http.StatusConflict, Code: remoteFailover, Message: "The instance belongs to a shard group that is being failed over."}
 		case err != nil:
 			return nil, unavailable
 		}

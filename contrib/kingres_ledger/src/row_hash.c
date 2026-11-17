@@ -39,6 +39,7 @@
 #include "fmgr.h"
 #include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
+#include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/memutils.h"
@@ -57,32 +58,84 @@ static MemoryContext kl_work_cxt = NULL;
 /* Whether PrepareClientEncoding(PG_UTF8) has been done in this backend. */
 static bool kl_utf8_prepared = false;
 
-/* One-entry cache of the last relid to table_id lookup, valid per transaction. */
-static Oid	kl_cached_relid = InvalidOid;
-static int32 kl_cached_table_id = 0;
+/*
+ * The identity that the registry has for a relation, kept for the rest of
+ * the transaction in a hash table of its own (one entry per ledger table
+ * that the transaction wrote): the capture trigger asks for it on every row,
+ * for insert as for update and delete, and rows of several tables may
+ * alternate (a trigger of an application that writes a second ledger table,
+ * a bulk load through a view).  The first version kept one entry, and an
+ * alternation cost an SPI lookup (about 7 microseconds) on every row.
+ *
+ * Why it cannot serve a stale identity: only a positive answer is stored; a
+ * row of the registry is never updated or deleted (the ledger tables are
+ * append-only, and a ledger table cannot be dropped, so a relation id is not
+ * reused), so an answer that was true once is true for as long as the row
+ * can be seen; and everything that could make a stored answer wrong is
+ * dropped by the callbacks of capture.c: the end of the transaction, in
+ * every way (commit, abort, prepare), and the abort of a subtransaction (a
+ * registration that was rolled back to a savepoint, finding L2-05).  A
+ * lookup that finds nothing (a table that is not registered yet) is not
+ * stored, so a registration made later in the same transaction is found.
+ */
+typedef struct KlIdEntry
+{
+	Oid			relid;			/* hash key */
+	int32		table_id;
+} KlIdEntry;
+
+typedef struct KlHistEntry
+{
+	Oid			relid;			/* hash key */
+	int32		table_id;
+	Oid			history;
+} KlHistEntry;
+
+static MemoryContext kl_cache_cxt = NULL;
+static HTAB *kl_id_hash = NULL;
+static HTAB *kl_hist_hash = NULL;
+
+/* The last answer of kl_lookup_table_id, in front of the hash: a run of rows of one table. */
+static Oid	kl_last_relid = InvalidOid;
+static int32 kl_last_table_id = 0;
 
 /* Saved plan of the table_id lookup. */
 static SPIPlanPtr kl_lookup_plan = NULL;
-
-/* One-entry cache of the last history lookup, valid per transaction. */
-static Oid	kl_hist_cached_relid = InvalidOid;
-static Oid	kl_hist_cached_history = InvalidOid;
-static int32 kl_hist_cached_table_id = 0;
 
 /* Saved plans of the history lookups. */
 static SPIPlanPtr kl_hist_plan = NULL;
 static SPIPlanPtr kl_hist_by_history_plan = NULL;
 
+static HTAB *
+kl_cache_create(const char *name, Size entrysize)
+{
+	HASHCTL		ctl;
+
+	if (kl_cache_cxt == NULL)
+		kl_cache_cxt = AllocSetContextCreate(TopMemoryContext,
+											 "kingres_ledger registry cache",
+											 ALLOCSET_SMALL_SIZES);
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(Oid);
+	ctl.entrysize = entrysize;
+	ctl.hcxt = kl_cache_cxt;
+	return hash_create(name, 32, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
 /*
  * kl_table_cache_reset
- *		Forget the cached relid to table_id mapping.  Called at transaction
- *		end, so a rolled back ledger_enable cannot leave a stale entry.
+ *		Forget the cached relid to table_id mappings.  Called at transaction
+ *		end and at the abort of a subtransaction, so a rolled back
+ *		ledger_enable cannot leave a stale entry.
  */
 void
 kl_table_cache_reset(void)
 {
-	kl_cached_relid = InvalidOid;
-	kl_hist_cached_relid = InvalidOid;
+	if (kl_id_hash != NULL || kl_hist_hash != NULL)
+		MemoryContextReset(kl_cache_cxt);
+	kl_id_hash = NULL;
+	kl_hist_hash = NULL;
+	kl_last_relid = InvalidOid;
 }
 
 /*
@@ -100,8 +153,19 @@ kl_lookup_table_id(Oid relid)
 	int32		result = -1;
 	int			rc;
 
-	if (OidIsValid(kl_cached_relid) && kl_cached_relid == relid)
-		return kl_cached_table_id;
+	if (OidIsValid(relid) && relid == kl_last_relid)
+		return kl_last_table_id;
+	if (kl_id_hash != NULL)
+	{
+		KlIdEntry  *hit = hash_search(kl_id_hash, &relid, HASH_FIND, NULL);
+
+		if (hit != NULL)
+		{
+			kl_last_relid = relid;
+			kl_last_table_id = hit->table_id;
+			return hit->table_id;
+		}
+	}
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
@@ -140,8 +204,28 @@ kl_lookup_table_id(Oid relid)
 
 	if (result >= 0)
 	{
-		kl_cached_relid = relid;
-		kl_cached_table_id = result;
+		/*
+		 * A transaction that writes one table keeps one answer and builds no
+		 * hash table (the cost of a table per transaction would show in a
+		 * workload of single-row transactions); the second table makes the
+		 * hash, which then holds the first answer too.
+		 */
+		if (OidIsValid(kl_last_relid) && kl_last_relid != relid)
+		{
+			KlIdEntry  *ent;
+
+			if (kl_id_hash == NULL)
+			{
+				kl_id_hash = kl_cache_create("kingres_ledger table ids",
+											 sizeof(KlIdEntry));
+				ent = hash_search(kl_id_hash, &kl_last_relid, HASH_ENTER, NULL);
+				ent->table_id = kl_last_table_id;
+			}
+			ent = hash_search(kl_id_hash, &relid, HASH_ENTER, NULL);
+			ent->table_id = result;
+		}
+		kl_last_relid = relid;
+		kl_last_table_id = result;
 	}
 	return result;
 }
@@ -380,10 +464,15 @@ kl_lookup_history(Oid relid, int32 *table_id)
 	int32		tid = -1;
 	int			rc;
 
-	if (OidIsValid(kl_hist_cached_relid) && kl_hist_cached_relid == relid)
+	if (kl_hist_hash != NULL)
 	{
-		*table_id = kl_hist_cached_table_id;
-		return kl_hist_cached_history;
+		KlHistEntry *hit = hash_search(kl_hist_hash, &relid, HASH_FIND, NULL);
+
+		if (hit != NULL)
+		{
+			*table_id = hit->table_id;
+			return hit->history;
+		}
 	}
 
 	if (SPI_connect() != SPI_OK_CONNECT)
@@ -428,9 +517,16 @@ kl_lookup_history(Oid relid, int32 *table_id)
 				(errcode(ERRCODE_UNDEFINED_TABLE),
 				 errmsg("table \"%s\" is not under ledger control",
 						get_rel_name(relid))));
-	kl_hist_cached_relid = relid;
-	kl_hist_cached_table_id = tid;
-	kl_hist_cached_history = history;
+	{
+		KlHistEntry *ent;
+
+		if (kl_hist_hash == NULL)
+			kl_hist_hash = kl_cache_create("kingres_ledger history ids",
+										   sizeof(KlHistEntry));
+		ent = hash_search(kl_hist_hash, &relid, HASH_ENTER, NULL);
+		ent->table_id = tid;
+		ent->history = history;
+	}
 	*table_id = tid;
 	return history;
 }

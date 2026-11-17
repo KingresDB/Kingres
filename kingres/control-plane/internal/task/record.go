@@ -115,6 +115,9 @@ func (s *PGStore) Record(ctx context.Context, t Task) (Task, error) {
 	if errors.As(err, &pe) && pe.Code == "23505" {
 		return Task{}, ErrSubjectBusy
 	}
+	if x := excluded(t.Kind, err); x != nil {
+		return Task{}, x
+	}
 	if err != nil {
 		return Task{}, err
 	}
@@ -208,5 +211,11 @@ var recordedKinds = map[string]bool{"instance.start": true, "instance.stop": tru
 // Cancellable reports whether a cancel request is accepted for the task: it
 // is not finished and the engine runs it.
 func Cancellable(t Task) bool {
-	return t.State.Active() && !recordedKinds[t.Kind]
+	if !t.State.Active() || recordedKinds[t.Kind] {
+		return false
+	}
+	if g, ok := guards.Load(t.Kind); ok && !g.(func(Task) bool)(t) {
+		return false
+	}
+	return true
 }

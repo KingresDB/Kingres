@@ -113,6 +113,9 @@ func (m *Manager) InitStandby(ctx context.Context, s StandbySpec) (err error) {
 	if err := os.WriteFile(filepath.Join(dir, MarkerName), mk, 0o600); err != nil {
 		return err
 	}
+	if err := m.WriteRole(s.ID, Role{Group: int32(s.ID - StandbyBaseID), Role: RoleStandby, Origin: OriginCopy}); err != nil {
+		return err
+	}
 	if err := m.SetTrust(s.ID, s.Trust); err != nil {
 		return err
 	}

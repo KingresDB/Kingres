@@ -22,7 +22,7 @@ DATA = kingres_ledger--0.1.sql kingres_ledger--0.2.sql kingres_ledger--0.3.sql \
 	kingres_ledger--0.1--0.3.sql
 PGFILEDESC = "kingres_ledger - tamper-evident ledger tables for KingresDB"
 
-REGRESS = ledger_setup ledger_hash ledger_capture ledger_verify ledger_protect ledger_format ledger_review ledger_updatable ledger_records ledger_review2 ledger_privs ledger_preimage ledger_head ledger_stray ledger_guard ledger_manual ledger_paths
+REGRESS = ledger_setup ledger_hash ledger_capture ledger_verify ledger_protect ledger_format ledger_review ledger_updatable ledger_records ledger_review2 ledger_privs ledger_preimage ledger_head ledger_stray ledger_guard ledger_manual ledger_paths ledger_stops
 REGRESS_OPTS = --temp-config $(srcdir)/kingres_ledger.conf
 
 TAP_TESTS = 1

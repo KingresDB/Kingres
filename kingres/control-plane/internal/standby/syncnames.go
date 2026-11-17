@@ -108,3 +108,52 @@ func (s *SyncState) Decide(in SyncInput) SyncDecision {
 	d.WithoutSynchronousStandby = waited > in.Grace
 	return d
 }
+
+// ListedNames returns the names in a synchronous_standby_names value as the
+// primary has it ("ANY 1 (a, b)", "FIRST 2 (a, b)", "a, b", names in double
+// quotes). Names compare without regard to case in PostgreSQL, so the result is
+// keyed by the lower-cased name.
+func ListedNames(list string) map[string]bool {
+	out := map[string]bool{}
+	s := strings.TrimSpace(list)
+	if i := strings.IndexByte(s, '('); i >= 0 {
+		s = s[i+1:]
+		if j := strings.LastIndexByte(s, ')'); j >= 0 {
+			s = s[:j]
+		}
+	}
+	for _, p := range strings.Split(s, ",") {
+		p = strings.Trim(strings.TrimSpace(p), `"`)
+		if p != "" {
+			out[strings.ToLower(p)] = true
+		}
+	}
+	return out
+}
+
+// SafeName reports whether a standby name may be written into the list as it is:
+// the extension's check (kingres.standby_name_matches) is PostgreSQL's own, but
+// the list is rendered here, and a name with a quote, a comma, a space or the
+// wildcard would change what the list means (kingres_shard README, sequence 1).
+func SafeName(name string) bool {
+	if name == "" || name == "*" {
+		return false
+	}
+	for _, r := range name {
+		if !(r == '_' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9') {
+			return false
+		}
+	}
+	return true
+}
+
+// StreamingUnder reports whether a walsender with this application name streams,
+// comparing without regard to case as the primary does.
+func StreamingUnder(streaming map[string]bool, name string) bool {
+	for app, ok := range streaming {
+		if ok && strings.EqualFold(app, name) {
+			return true
+		}
+	}
+	return false
+}

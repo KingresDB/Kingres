@@ -68,7 +68,10 @@ func CheckPrivate(typed string) error {
 		if err != nil {
 			return err
 		}
-		typed = filepath.Join(wd, typed)
+		// Joined without cleaning: filepath.Join would drop a ".." that follows a
+		// link, and the walk below takes ".." as the system does, after the link
+		// was replaced by its target (L12-06).
+		typed = wd + string(filepath.Separator) + typed
 	}
 	w := &walker{}
 	return w.walk(typed)

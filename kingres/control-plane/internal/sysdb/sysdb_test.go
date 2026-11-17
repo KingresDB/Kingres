@@ -49,7 +49,7 @@ func TestMigrateIdempotent(t *testing.T) {
 	c := newDB(t)
 	ctx := context.Background()
 	v, err := sysdb.Migrate(ctx, c)
-	if err != nil || v != 10 {
+	if err != nil || v != 11 {
 		t.Fatalf("first run: %d %v", v, err)
 	}
 	for _, tbl := range []string{"task", "ledger_digest_actor", "database_setting", "cluster_setting", "server", "certificate", "server_group", "alert", "network_rule", "schema_migration"} {
@@ -58,10 +58,10 @@ func TestMigrateIdempotent(t *testing.T) {
 		}
 	}
 	v, err = sysdb.Migrate(ctx, c)
-	if err != nil || v != 10 {
+	if err != nil || v != 11 {
 		t.Fatalf("second run: %d %v", v, err)
 	}
-	if n := scalar[int](t, c, "SELECT count(*) FROM kingres_cp.schema_migration"); n != 10 {
+	if n := scalar[int](t, c, "SELECT count(*) FROM kingres_cp.schema_migration"); n != 11 {
 		t.Errorf("%d migration rows after two runs", n)
 	}
 	// The unique index enforces one unfinished task per subject.
@@ -116,8 +116,8 @@ func TestBinaryOlderThanSchemaRefuses(t *testing.T) {
 	if _, err := sysdb.Migrate(ctx, c); err != nil {
 		t.Fatal(err)
 	}
-	// Pretend a newer binary applied migration 11.
-	if _, err := c.Exec(ctx, "INSERT INTO kingres_cp.schema_migration (version, name) VALUES (11, '0011_future.sql')"); err != nil {
+	// Pretend a newer binary applied migration 12.
+	if _, err := c.Exec(ctx, "INSERT INTO kingres_cp.schema_migration (version, name) VALUES (12, '0012_future.sql')"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := sysdb.Migrate(ctx, c); !errors.Is(err, sysdb.ErrSchemaTooNew) {

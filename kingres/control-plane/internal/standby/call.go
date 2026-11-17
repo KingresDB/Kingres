@@ -67,6 +67,8 @@ func (a *Agent) HandleCall(ctx context.Context, key string, body []byte) (res an
 		return res, mapErr(err)
 	case CallStatus:
 		return a.Status(ctx), nil
+	case CallFreeze, CallUnfreeze, CallStandbysGone:
+		return a.handleFreezeCall(ctx, key, body)
 	}
 	return nil, &internalapi.CallError{Status: http.StatusNotFound, Code: "not_found", Message: "No such call."}
 }

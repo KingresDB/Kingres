@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -229,7 +230,22 @@ func repeatable(inStep bool, method string) bool { return inStep || method == ht
 // refusal of the callee, not a server that is not a member, not a certificate that is revoked, not a
 // partition that a test made on purpose, not the end of the caller's own time.
 func transient(ctx context.Context, err error) bool {
-	return errors.Is(err, ErrUnreachable) && ctx.Err() == nil && !errors.Is(err, errBlocked) && !errors.Is(err, pki.ErrRevoked)
+	return errors.Is(err, ErrUnreachable) && ctx.Err() == nil && !errors.Is(err, errBlocked) && !errors.Is(err, pki.ErrRevoked) && !clientTimedOut(err)
+}
+
+// clientTimedOut says that the client's own time limit ended while it waited for the answer of a connection that
+// was made (ST-03): the callee may be working or hung, and the same call at the full limit again is the wrong answer to
+// it. A timeout while the connection was made (dial) is a failure that no request has seen, and is repeated.
+func clientTimedOut(err error) bool {
+	var ne net.Error
+	if !errors.As(err, &ne) || !ne.Timeout() {
+		return false
+	}
+	var oe *net.OpError
+	if errors.As(err, &oe) && oe.Op == "dial" {
+		return false
+	}
+	return true
 }
 
 func (c *Client) do(ctx context.Context, serverID string, checkRevoked bool, method, path string, in, out any) error {

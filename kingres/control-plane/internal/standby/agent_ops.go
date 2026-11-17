@@ -43,7 +43,7 @@ func (a *Agent) createLocked(ctx context.Context, e Entry) (CreateResponse, erro
 	if !a.Svc.Enabled() || !a.mgr().Exists(cluster.NodeID) {
 		return CreateResponse{}, errors.New("standby: this server has no instance")
 	}
-	id := instance.StandbyDirID(e.Group)
+	id := e.dir()
 	if a.mgr().Exists(id) {
 		if m, err := a.metaOf(id); err == nil {
 			if m.ID != e.ID {
@@ -68,11 +68,11 @@ func (a *Agent) createLocked(ctx context.Context, e Entry) (CreateResponse, erro
 	if err != nil {
 		return CreateResponse{}, fmt.Errorf("standby: building the replication connection: %w", err)
 	}
-	base, err := a.mgr().Settings(cluster.NodeID)
+	base, err := a.mgr().Settings(a.Svc.AccessSourceID())
 	if err != nil {
 		return CreateResponse{}, fmt.Errorf("standby: reading the settings of the primary instance: %w", err)
 	}
-	trust, err := a.mgr().Trust(cluster.NodeID)
+	trust, err := a.mgr().Trust(a.Svc.AccessSourceID())
 	if err != nil {
 		return CreateResponse{}, fmt.Errorf("standby: reading the trust of the primary instance: %w", err)
 	}
@@ -166,7 +166,7 @@ func (a *Agent) Remove(ctx context.Context, e Entry) error {
 }
 
 func (a *Agent) removeLocked(ctx context.Context, e Entry) error {
-	id := instance.StandbyDirID(e.Group)
+	id := e.dir()
 	if a.mgr().Exists(id) {
 		if m, err := a.metaOf(id); err == nil && m.ID != e.ID {
 			return ErrConflict // the directory holds another standby: not this one's to remove
@@ -195,9 +195,20 @@ func (a *Agent) Rebuild(ctx context.Context, e Entry, diverged bool) (CreateResp
 	}
 	a.opMu.Lock()
 	defer a.opMu.Unlock()
-	id := instance.StandbyDirID(e.Group)
+	id := e.dir()
+	if a.mgr().Exists(id) && e.Generation > 0 {
+		// ST-03: the call is repeated when its answer was lost. A standby that is of the generation asked for was
+		// rebuilt by the first execution: a second one is a no-op (it only makes sure the instance runs).
+		if m, err := a.metaOf(id); err == nil && m.ID == e.ID && m.Generation >= e.Generation {
+			return a.startExisting(ctx, id, m)
+		}
+	}
 	if diverged && a.mgr().Exists(id) {
 		if err := a.rewindLocked(ctx, id, e); err == nil {
+			if m, merr := a.metaOf(id); merr == nil {
+				m.Generation = e.Generation
+				_ = a.writeMeta(id, m)
+			}
 			a.audit(ctx, "standbyInstanceRebuilt", strconv.FormatInt(e.ID, 10), audit.OutcomeSuccess, map[string]any{"group": e.Group, "server": a.Self, "method": "pg_rewind"})
 			return a.startExisting(ctx, id, e)
 		} else {
@@ -243,7 +254,8 @@ func (a *Agent) superviseStandbys(ctx context.Context) {
 	for _, p := range plan.Standbys {
 		in[p.ID] = true
 	}
-	for _, e := range a.localStandbys() {
+	for _, lsb := range a.localStandbys() {
+		e, id := lsb.Entry, lsb.Dir
 		// A standby the list does not name was removed while this server could not be
 		// reached (or by an administrator's task that this server missed): it goes.
 		if plan.Version > 0 && !in[e.ID] {
@@ -252,7 +264,6 @@ func (a *Agent) superviseStandbys(ctx context.Context) {
 			}
 			continue
 		}
-		id := instance.StandbyDirID(e.Group)
 		up, err := a.mgr().Running(ctx, id)
 		if err != nil {
 			continue
@@ -285,7 +296,7 @@ func (a *Agent) syncAccess(ctx context.Context, id int) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return a.mgr().SyncAccess(ctx, cluster.NodeID, id, u.Username)
+	return a.mgr().SyncAccess(ctx, a.Svc.AccessSourceID(), id, u.Username)
 }
 
 // certificatesChanged reports whether the certificate, CA or CRL file of this
@@ -314,8 +325,8 @@ func (a *Agent) Status(ctx context.Context) Status {
 	if !a.Svc.Enabled() {
 		return st
 	}
-	for _, e := range a.localStandbys() {
-		id := instance.StandbyDirID(e.Group)
+	for _, lsb := range a.localStandbys() {
+		e, id := lsb.Entry, lsb.Dir
 		ls := LocalStatus{ID: e.ID, Group: e.Group, Port: e.Port, Generation: e.Generation}
 		ls.Running, _ = a.mgr().Running(ctx, id)
 		if ls.Running {
@@ -324,8 +335,12 @@ func (a *Agent) Status(ctx context.Context) Status {
 		st.Standbys = append(st.Standbys, ls)
 	}
 	a.mu.Lock()
-	if a.primary != nil {
-		p := *a.primary
+	st.Rounds = a.rounds
+	for _, g := range a.primaryGroups() {
+		st.Primaries = append(st.Primaries, *a.primaries[g])
+	}
+	if len(st.Primaries) > 0 {
+		p := st.Primaries[0]
 		st.Primary = &p
 	}
 	a.mu.Unlock()

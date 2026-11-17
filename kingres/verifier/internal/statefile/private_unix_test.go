@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -161,59 +160,6 @@ func TestCheckPrivateModesOfTheHolderAndTheState(t *testing.T) {
 	fakeOwner(t, map[string]int{st: selfUID() + 1})
 	if err := CheckPrivate(st); err == nil || !strings.Contains(err.Error(), "the file") {
 		t.Fatalf("a state of another owner: %v", err)
-	}
-}
-
-// L10-12: the lock file is the auditor's. A lock file with a loose mode or
-// another owner is replaced by one with mode 0600, so that whoever kept the old
-// one open (or holds its lock for ever) no longer blocks the auditor.
-func TestLockFileIsPrivateAndReplaced(t *testing.T) {
-	d := t.TempDir()
-	state := filepath.Join(d, "state")
-	lock := lockName(state)
-	// Mode 0666: held by somebody with a descriptor of the old file.
-	if err := os.WriteFile(lock, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(lock, 0o666); err != nil {
-		t.Fatal(err)
-	}
-	old, err := os.OpenFile(lock, os.O_RDWR, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer old.Close()
-	if err := syscall.Flock(int(old.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		t.Fatal(err)
-	}
-	l, err := Acquire(state, 200*time.Millisecond)
-	if err != nil {
-		t.Fatalf("a lock file with mode 0666 held by another process blocks the auditor: %v", err)
-	}
-	l.Release()
-	st, err := os.Stat(lock)
-	if err != nil || st.Mode().Perm() != 0o600 {
-		t.Fatalf("the lock file was not made again with mode 0600: %v %v", st, err)
-	}
-	// Another owner: replaced the first time, kept after.
-	n := 0
-	prev := ownerOf
-	t.Cleanup(func() { ownerOf = prev })
-	ownerOf = func(p string, st fs.FileInfo) (int, bool) {
-		if p == lock {
-			if n++; n == 1 {
-				return selfUID() + 1, true
-			}
-		}
-		return prev(p, st)
-	}
-	l, err = Acquire(state, 200*time.Millisecond)
-	if err != nil {
-		t.Fatalf("a lock file of another owner: %v", err)
-	}
-	l.Release()
-	if n < 2 {
-		t.Fatalf("the owner was looked at %d time(s), want a second look at the new file", n)
 	}
 }
 

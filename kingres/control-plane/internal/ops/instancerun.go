@@ -105,6 +105,10 @@ func (o *Ops) openTask(ctx context.Context, rec TaskRecorder, t task.Task) (out 
 		return got, true, nil
 	case errors.Is(err, task.ErrSubjectBusy):
 		return task.Task{}, false, problem.New(problem.OperationInProgress, "Another operation on this instance is still running.")
+	case errors.As(err, new(*task.ExcludedError)):
+		// The instance belongs to a shard group that a failover is working on (migration 0011, KX004): the
+		// stop or restart must not run now, and it is not kept in memory to run later.
+		return task.Task{}, false, problem.New(problem.FailoverInProgress, "A failover of this instance's shard group is in progress; try again when it has finished.")
 	}
 	o.Log.Warn("the task of an instance operation cannot be written now; it is kept in memory", "kind", t.Kind, "error", err)
 	if t.ID == 0 {

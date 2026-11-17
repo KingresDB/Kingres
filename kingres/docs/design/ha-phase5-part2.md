@@ -1985,3 +1985,84 @@ increment named.
     `preferredPrimaryServerId` rely on). Increment 0.
 20. Whether the contract check script and the generated client accept a `Task` with `id` 0 in a 202 body
     (the script requires a `Task` body and a `Location` header). Increment 5.
+
+## Found while building
+
+### Increments 0 to 2 (2026-11-17)
+
+Where this document and the code differ after the first three increments;
+the code was followed, and where the README of `kingres_shard` and this
+document differed, the README.
+
+**Statements of "To be verified" that are settled.**
+
+- 19 (node ids across `promote_node`): settled by reading the extension:
+  `promote_node` changes the `role` of the rows by `node_id` and never an id.
+  A test against a running cluster belongs to increment 3.
+- 9 (a promoted instance is reached through the paths of a primary): shown by
+  the cluster test of a group failed over by hand (`pg_promote`,
+  `promote_node` and the role file): the lease manager, the standby agent,
+  the fan-out of roles and the service connection reach the instance whose
+  origin is a copy. Not covered by it: the role connections of the client
+  entry point and the sign-in paths, which use the same function.
+- 18 (a server whose home instance is a standby): by reading only. One writer
+  that would have failed there was found and changed: the migration of the
+  system database is skipped on an instance that is in recovery. No test has
+  such a server.
+- 11 (the exclusion of instance operations during a failover): the trigger of
+  migration 0011 refuses `instance.stop` and `instance.restart` of an instance
+  of a group with an unfinished failover (`KX004`, answered as 409
+  `failover_in_progress`), and at most one failover-class task is unfinished
+  (`KX003`). It cannot see `config.restart`, whose subject is not an instance:
+  that task needs a check of its own in its step, in increment 3.
+
+**Section 1.5.** The registration of a standby in the catalog of the
+extension is done by `kingresd` now: the step `standby.register_in_catalog`
+is `done`, never `skipped`, and a standby made before the registration
+existed is registered by the next check of the leader.
+
+**Section 3.1.1.** `release` is `Manager.ReleaseGroup`. A transfer or a
+release deletes the manager's state of the group; `Relinquish` keeps it, and
+a relinquished group is not renewed and holds its instance back, also across
+a restart (a marker `relinquished.<group>`).
+
+**Section 3.1.2.** `GET /liveness` and `GET /failover/position` are answered
+to any peer, `GET /failover/state` by the leader only, and a GET carries its
+parameters in the query string.
+
+**Section 3.7.** `lease.Gate` takes a function from an instance id to its
+group and whether it is a primary, not an id. The lifecycle operations of the
+contract (start, stop, restart of a server's instances) act on the primaries
+of the server; its standbys stay the business of the standby agent, and are
+stopped with the server only in the orderly stop.
+
+**The answers of `add_node`.** It can answer `42710` (already registered),
+which the registration reads as success after reading the row back, and
+`42704` (the group has no primary), which is a refusal. Neither was in this
+document.
+
+**Deadlines of control calls.** The table of bounds in the README of the
+extension is not used for deadlines: the reviews of 2026-11-17 changed the
+bound twice. Each control call has a named deadline (five minutes by default)
+and a timeout means "read the state and repeat", in a session of its own set
+to READ COMMITTED, one statement per call.
+
+**The order of naming a standby.** `standby_name_matches` needs the standby
+to be registered, so the order is: registration, then the name in
+`synchronous_standby_names`. A name that is already in the list stays, so a
+cluster that is upgraded does not change its list.
+
+**Not followed yet.** The third review of the call sequences asks that nodes
+are registered by address and not by a host name (a name that does not
+resolve is not bounded); standbys are still registered by the server's host
+string, which may be a name.
+
+**For increment 3.** A separate step that reads the result back after
+`add_node`, `remove_node`, `sync_catalog` and `rotate_secret` (a success of
+those calls is not proof for a node that was slow or restarted during the
+call); the watchdog is told explicitly whenever the set of primaries of a
+server or its enforcement changes; a node is not fenced or marked failed on
+`KS007` alone; `KS014` is never repeated; after a failover the standbys of
+the dead primary are removed from the catalog before the secret is rotated;
+nothing sets the gate of the task engine yet: the bootstrap of the map group
+(increment 5) must.

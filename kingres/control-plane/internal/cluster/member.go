@@ -167,9 +167,7 @@ func (s *Service) InstallPKI(ctx context.Context, req wire.PKIRequest) error {
 		return err
 	}
 	if s.mgr != nil && s.mgr.Exists(NodeID) {
-		if up, _ := s.mgr.Running(ctx, NodeID); up {
-			return s.mgr.Reload(ctx, NodeID)
-		}
+		return s.reloadAll(ctx)
 	}
 	return nil
 }
@@ -201,9 +199,7 @@ func (s *Service) PublishLocalCRL(ctx context.Context) error {
 		return err
 	}
 	if s.mgr != nil && s.mgr.Exists(NodeID) {
-		if up, _ := s.mgr.Running(ctx, NodeID); up {
-			return s.mgr.Reload(ctx, NodeID)
-		}
+		return s.reloadAll(ctx)
 	}
 	return nil
 }
@@ -313,8 +309,10 @@ func (s *Service) ApplyTrust(ctx context.Context, req wire.TrustRequest) error {
 		}
 		trust.Peers = append(trust.Peers, instance.NodePeer{ServerID: p.ServerID, CIDRs: cidrs})
 	}
-	if err := s.mgr.SetTrust(NodeID, trust); err != nil {
-		return err
+	for _, id := range s.ruleIDs() {
+		if err := s.mgr.SetTrust(id, trust); err != nil {
+			return err
+		}
 	}
 	cur, err := s.mgr.Settings(NodeID)
 	if errors.Is(err, os.ErrNotExist) {
@@ -329,19 +327,31 @@ func (s *Service) ApplyTrust(ctx context.Context, req wire.TrustRequest) error {
 	if err != nil {
 		return err
 	}
-	if err := s.mgr.WriteManaged(NodeID, next); err != nil {
-		return err
-	}
-	if err := s.mgr.WriteHBA(NodeID, HBARules(req.Rules), req.TLSRequired); err != nil {
-		return err
+	for _, id := range s.ruleIDs() {
+		// The managed settings of an instance hold its own port and its own recovery settings: only the
+		// certificate paths and the ones the cluster sets are taken from the home instance's.
+		w := next
+		if id != NodeID {
+			curID, err := s.mgr.Settings(id)
+			if err != nil {
+				return fmt.Errorf("reading the settings of instance %d: %w", id, err)
+			}
+			w, err = s.withTLS(curID)
+			if err != nil {
+				return err
+			}
+		}
+		if err := s.mgr.WriteManaged(id, w); err != nil {
+			return err
+		}
+		if err := s.mgr.WriteHBA(id, HBARules(req.Rules), req.TLSRequired); err != nil {
+			return err
+		}
 	}
 	if err := s.identRefresh(); err != nil {
 		return err
 	}
-	if up, _ := s.mgr.Running(ctx, NodeID); up {
-		return s.mgr.Reload(ctx, NodeID)
-	}
-	return nil
+	return s.reloadAll(ctx)
 }
 
 // CreateInstance creates this server's instance (once) with the cluster's
@@ -393,7 +403,7 @@ func (s *Service) InstanceStatus(ctx context.Context) wire.InstanceStatus {
 	st := wire.InstanceStatus{NodeState: string(s.setup.State())}
 	if s.Enabled() && s.mgr.Exists(NodeID) {
 		st.Exists = true
-		st.Running, _ = s.mgr.Running(ctx, NodeID)
+		st.Running, _ = s.mgr.Running(ctx, s.WritableIDs()[0])
 	}
 	return st
 }
@@ -403,8 +413,10 @@ func (s *Service) StartInstance(ctx context.Context) error {
 	if !s.Enabled() || !s.mgr.Exists(NodeID) {
 		return errors.New("this server has no instance")
 	}
-	if err := s.mgr.Start(ctx, NodeID); err != nil {
-		return err
+	for _, id := range s.WritableIDs() {
+		if err := s.mgr.Start(ctx, id); err != nil {
+			return err
+		}
 	}
 	return s.waitReady(ctx)
 }
@@ -419,7 +431,7 @@ func (s *Service) RemoveInstance(ctx context.Context) error {
 	// The standbys this server runs for other servers' groups go with it: a server that
 	// is removed or reset must leave no PostgreSQL process behind.
 	for _, id := range s.mgr.IDs() {
-		if instance.IsStandbyDirID(id) {
+		if id != NodeID {
 			if err := s.mgr.Remove(ctx, id); err != nil {
 				return err
 			}
@@ -489,11 +501,10 @@ func (s *Service) ApplyRules(ctx context.Context, rules []api.NetworkAccessRule,
 	if !s.Enabled() || !s.mgr.Exists(NodeID) {
 		return errors.New("this server has no instance")
 	}
-	if err := s.mgr.WriteHBA(NodeID, HBARules(rules), tlsRequired); err != nil {
-		return err
+	for _, id := range s.ruleIDs() {
+		if err := s.mgr.WriteHBA(id, HBARules(rules), tlsRequired); err != nil {
+			return err
+		}
 	}
-	if up, _ := s.mgr.Running(ctx, NodeID); up {
-		return s.mgr.Reload(ctx, NodeID)
-	}
-	return nil
+	return s.reloadAll(ctx)
 }

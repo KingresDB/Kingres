@@ -163,7 +163,7 @@ func (e *ExcludedError) Error() string {
 // excluded maps the database error of the exclusion trigger, nil for any other error.
 func excluded(kind string, err error) error {
 	var pe *pgconn.PgError
-	if errors.As(err, &pe) && (pe.Code == "KX001" || pe.Code == "KX002") {
+	if errors.As(err, &pe) && (pe.Code == "KX001" || pe.Code == "KX002" || pe.Code == "KX003" || pe.Code == "KX004") {
 		return &ExcludedError{Kind: kind, Other: pe.Detail}
 	}
 	return nil
@@ -280,6 +280,11 @@ type Definition struct {
 	// canceled (not when it was only interrupted): it cleans up what the steps
 	// that ran created. Its error is only logged.
 	OnFail func(ctx context.Context, t Task)
+	// Cancellable, when set, says whether a cancel request is accepted for a task of
+	// this kind in its present state (the cancel guard). A failover is not
+	// cancellable once its irreversible step is done: it rolls forward only. Nil: every
+	// unfinished task is cancellable.
+	Cancellable func(t Task) bool
 }
 
 func (d Definition) steps(input json.RawMessage) ([]Step, error) {
@@ -340,9 +345,11 @@ type Engine struct {
 	now func() time.Time
 	// renewEvery replaces the renewal ticker (tests).
 	renewEvery <-chan time.Time
-	log        *slog.Logger
-	tries      int
-	faultFn    FaultFunc
+	// gate, when set and false, keeps the engine from claiming or running (Options.Gate).
+	gate    func() bool
+	log     *slog.Logger
+	tries   int
+	faultFn FaultFunc
 	// fenced counts, per task, the runs in a row that a callee refused (see MaxFencedRuns).
 	fencedMu sync.Mutex
 	fenced   map[int64]int
@@ -364,6 +371,13 @@ type Options struct {
 	// StoreTries is how many times a store write is tried, one second apart
 	// (default 30).
 	StoreTries int
+	// Gate, when set, is asked before every claim and between the steps of a run: while it
+	// returns false the engine neither claims nor runs anything (a run stands down quietly at
+	// the next step boundary, records nothing and runs no hook; its lease lapses and the task
+	// is claimed again once the gate is open). A server that was promoted in PostgreSQL as the
+	// map group's standby but is not yet the recognised primary of the map group keeps it
+	// closed (design ha-phase5-part2.md, 3.4).
+	Gate func() bool
 	// Fault, when set, is called at the named crash points (see FaultFunc).
 	// Production code leaves it nil; the crash-injection tests set it.
 	Fault FaultFunc
@@ -372,7 +386,7 @@ type Options struct {
 // NewEngine builds an engine. Definitions must have at least one step each.
 func NewEngine(s Store, defs []Definition, o Options) (*Engine, error) {
 	e := &Engine{store: s, defs: map[string]Definition{}, holder: o.Holder, lease: o.Lease, poll: o.Poll,
-		now: o.Now, log: o.Logger, tries: o.StoreTries, faultFn: o.Fault, renewEvery: o.RenewEvery}
+		now: o.Now, log: o.Logger, tries: o.StoreTries, faultFn: o.Fault, renewEvery: o.RenewEvery, gate: o.Gate}
 	if e.holder == "" {
 		return nil, errors.New("task: a holder id is required")
 	}
@@ -399,6 +413,9 @@ func NewEngine(s Store, defs []Definition, o Options) (*Engine, error) {
 			return nil, fmt.Errorf("task: duplicate definition %q", d.Kind)
 		}
 		e.defs[d.Kind] = d
+		if d.Cancellable != nil {
+			guards.Store(d.Kind, d.Cancellable)
+		}
 	}
 	return e, nil
 }
@@ -431,6 +448,9 @@ func (e *Engine) Submit(ctx context.Context, kind string, subj Subject, input an
 // with the given in-memory secrets (they are dropped when the run ends). It
 // is how a request that carries a password starts its task.
 func (e *Engine) RunNow(ctx context.Context, id int64, secrets map[string]string) error {
+	if e.gateClosed() {
+		return nil // the task stays pending; the poll claims it once the gate is open
+	}
 	started := e.now()
 	t, err := e.store.ClaimID(ctx, id, e.holder, e.lease)
 	if err != nil {
@@ -444,6 +464,9 @@ func (e *Engine) RunNow(ctx context.Context, id int64, secrets map[string]string
 
 // RunOnce claims and runs one available task. It reports whether it ran one.
 func (e *Engine) RunOnce(ctx context.Context) (bool, error) {
+	if e.gateClosed() {
+		return false, nil
+	}
 	e.claimMu.RLock()
 	started := e.now()
 	t, err := e.store.Claim(ctx, e.holder, e.lease)
@@ -479,6 +502,11 @@ func (e *Engine) Cancel(ctx context.Context, id int64) error {
 	t, gerr := e.store.Get(ctx, id)
 	if gerr == nil && recordedKinds[t.Kind] {
 		return ErrNotCancellable // written by its owner, not run by the engine
+	}
+	if gerr == nil {
+		if def, ok := e.def(t.Kind); ok && def.Cancellable != nil && !def.Cancellable(t) {
+			return ErrNotCancellable // the guard of the kind: past the point of no return
+		}
 	}
 	if err := e.store.RequestCancel(ctx, id, e.now()); err != nil {
 		return err
@@ -552,6 +580,10 @@ func (e *Engine) run(ctx context.Context, t Task, started time.Time, secrets map
 	for i := t.DoneSteps(); i < len(def.Steps); i++ {
 		if runCtx.Err() != nil || guard.expired() {
 			return runCtx.Err() // lease lost or shutdown: the next leader resumes here
+		}
+		if e.gateClosed() {
+			e.log.Info("task engine: the gate is closed; the run stands down at a step boundary", "task", t.ID, "kind", t.Kind, "step", i)
+			return nil
 		}
 		st := def.Steps[i]
 		if st.NonIdempotent && i < len(t.Steps) && t.Steps[i].State == StepRunning {
@@ -916,9 +948,15 @@ func (e *ExcludedError) Problem() *problem.Problem {
 	switch {
 	case e.Other == "rebalance":
 		return problem.New(problem.RebalanceInProgress, "A rebalance is running; wait until it has finished.")
-	case e.Other == "server.failover":
+	case e.Other == "server.failover" || e.Other == "replication.restorePreferredPrimaries":
 		return problem.New(problem.FailoverInProgress, "A failover is in progress; the buckets stay where they are until it has finished.")
 	default:
 		return problem.New(problem.OperationInProgress, "Another operation changes the servers ("+e.Other+"); wait until it has finished.")
 	}
 }
+
+// guards holds the cancel guards of the registered definitions, by kind, so that the
+// answer of the REST layer (Cancellable) and the engine's own check (Cancel) are the same.
+var guards sync.Map // kind -> func(Task) bool
+
+func (e *Engine) gateClosed() bool { return e.gate != nil && !e.gate() }

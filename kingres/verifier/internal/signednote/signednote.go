@@ -338,6 +338,12 @@ func Canonical(n *Note, verified []Key) []byte {
 			sigs = append(sigs, s)
 		}
 	}
+	return canonicalBytes(n.Text, sigs)
+}
+
+// canonicalBytes writes the text, a blank line and the lines in the order of
+// key name and key id.
+func canonicalBytes(text []byte, sigs []Signature) []byte {
 	sort.Slice(sigs, func(i, j int) bool {
 		if sigs[i].Name != sigs[j].Name {
 			return sigs[i].Name < sigs[j].Name
@@ -345,7 +351,7 @@ func Canonical(n *Note, verified []Key) []byte {
 		return sigs[i].ID < sigs[j].ID
 	})
 	var b bytes.Buffer
-	b.Write(n.Text)
+	b.Write(text)
 	b.WriteByte('\n')
 	for _, s := range sigs {
 		var id [4]byte
@@ -353,6 +359,55 @@ func Canonical(n *Note, verified []Key) []byte {
 		b.WriteString(emDashPrefix + s.Name + " " + base64.StdEncoding.EncodeToString(append(id[:], s.Sig...)) + "\n")
 	}
 	return b.Bytes()
+}
+
+// ErrDifferentText is returned by Merge for notes whose texts are not the same
+// bytes: they are not the same checkpoint.
+var ErrDifferentText = errors.New("the notes do not have the same text")
+
+// Merge is the union of the signatures of one checkpoint. The identity of a
+// checkpoint is its signed text and never its signature lines: notes with the
+// same text are the same checkpoint, whichever of the genuine lines each one
+// carries. Merge writes the canonical form of that text with every line that
+// verifies under keys in any of the notes (a line is taken once for a key name
+// and key id), and returns the keys whose lines verified. A line that does not
+// verify, or names a key that is not in keys, is not in the result. It is an
+// error when the texts differ, and ErrNoTrustedSignature when no line of any
+// note verifies. The order and the number of the lines in the notes, and
+// which notes carry which, change nothing in the result.
+func Merge(keys []Key, notes ...*Note) ([]byte, []Key, error) {
+	if len(notes) == 0 {
+		return nil, nil, errors.New("no note to merge")
+	}
+	index, err := indexKeys(keys)
+	if err != nil {
+		return nil, nil, err
+	}
+	taken := map[[2]string]bool{}
+	var sigs []Signature
+	var verified []Key
+	for _, n := range notes {
+		if !bytes.Equal(n.Text, notes[0].Text) {
+			return nil, nil, ErrDifferentText
+		}
+		for _, s := range n.Signatures {
+			id := [2]string{s.Name, fmt.Sprint(s.ID)}
+			k, known := index[id]
+			if !known || taken[id] {
+				continue
+			}
+			if len(s.Sig) != ed25519.SignatureSize || !ed25519.Verify(k.Public, n.Text, s.Sig) {
+				continue
+			}
+			taken[id] = true
+			sigs = append(sigs, s)
+			verified = append(verified, k)
+		}
+	}
+	if len(sigs) == 0 {
+		return nil, nil, ErrNoTrustedSignature
+	}
+	return canonicalBytes(notes[0].Text, sigs), verified, nil
 }
 
 // checkLines enforces MaxLineLength on every line of the note and MaxTextLines

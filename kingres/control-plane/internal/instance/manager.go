@@ -237,6 +237,10 @@ func (m *Manager) Init(ctx context.Context, s Spec) (err error) {
 	if err := os.WriteFile(filepath.Join(dir, MarkerName), mk, 0o600); err != nil {
 		return err
 	}
+	// The instance serves the group the catalog names for its host and port; that is not known yet.
+	if err := m.WriteRole(s.ID, Role{Group: GroupUnknown, Role: RolePrimary, Origin: OriginOwn}); err != nil {
+		return err
+	}
 	pw := filepath.Join(dir, "pwfile")
 	if err := os.WriteFile(pw, []byte(s.SuperuserPassword+"\n"), 0o600); err != nil {
 		return err
@@ -335,7 +339,11 @@ func (m *Manager) Running(ctx context.Context, id int) (bool, error) {
 // Start starts the instance and waits until it accepts connections. Starting
 // a running instance is not an error.
 func (m *Manager) Start(ctx context.Context, id int) error {
-	defer m.lifecycle(id)()
+	unlock, err := m.lifecycle(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	return m.start(ctx, id)
 }
 
@@ -372,7 +380,11 @@ func (m *Manager) start(ctx context.Context, id int) error {
 // Stop stops the instance with a fast shutdown and waits. Stopping a stopped
 // instance is not an error.
 func (m *Manager) Stop(ctx context.Context, id int) error {
-	defer m.lifecycle(id)()
+	unlock, err := m.lifecycle(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	return m.stop(ctx, id)
 }
 
@@ -390,7 +402,11 @@ func (m *Manager) stop(ctx context.Context, id int) error {
 
 // Restart stops (if running) and starts the instance.
 func (m *Manager) Restart(ctx context.Context, id int) error {
-	defer m.lifecycle(id)()
+	unlock, err := m.lifecycle(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if err := m.stop(ctx, id); err != nil {
 		return err
 	}
@@ -404,12 +420,25 @@ func (m *Manager) Restart(ctx context.Context, id int) error {
 // (StopImmediate, StopForShutdown) do not take the lock.
 var lifecycleLocks sync.Map
 
-// lifecycle takes the lock of an instance and returns the function that gives it back.
-func (m *Manager) lifecycle(id int) func() {
+// lifecycle takes the lock of an instance and returns the function that gives it back. The wait for the
+// lock ends with the caller's context (ST-04): a caller that gave itself a time limit is not held up for as
+// long as the holder takes, and the holder's own context is not the waiter's. The lock is a channel of
+// one so that it can be waited for with a select.
+func (m *Manager) lifecycle(ctx context.Context, id int) (func(), error) {
 	data, _ := m.DataDir(id)
-	mu, _ := lifecycleLocks.LoadOrStore(data, new(sync.Mutex))
-	mu.(*sync.Mutex).Lock()
-	return mu.(*sync.Mutex).Unlock
+	v, _ := lifecycleLocks.LoadOrStore(data, make(chan struct{}, 1))
+	ch := v.(chan struct{})
+	select {
+	case ch <- struct{}{}:
+		return func() { <-ch }, nil
+	default:
+	}
+	select {
+	case ch <- struct{}{}:
+		return func() { <-ch }, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("instance: waiting for another start, stop or restart of instance %d: %w", id, ctx.Err())
+	}
 }
 
 // Reload asks a running instance to re-read its configuration files.

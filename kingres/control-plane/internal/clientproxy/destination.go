@@ -28,6 +28,11 @@ type Env struct {
 	// primary instance, which is reached on the loopback address.
 	Self      string
 	LocalPort int
+	// LocalPorts, when set, lists the ports of every primary instance of this server (after a
+	// failover a server can run several, none of them on LocalPort): a primary of the catalog
+	// on this host is local only when its port is one of them, and the connection goes to
+	// that port. Nil: the catalog's primary on this host is local and is on LocalPort.
+	LocalPorts func() []int
 	// Nodes reads the instances of the catalog (this server's own copy).
 	Nodes func(ctx context.Context) ([]Node, error)
 	// LeaseKnown tells whether a lease manager is running and knows leases at all;
@@ -105,18 +110,36 @@ func PrimaryResolver(e Env) Resolver {
 			return Destination{}, err
 		}
 		var primaries []Node
-		var own *Node // this server's primary, active or not: it fixes where the ring starts
+		var own *Node     // this server's primary of the lowest group, active or not: it fixes where the ring starts
+		var usable []Node // this server's primaries that are active and whose lease is held, lowest group first
+		localPorts := map[int]bool{}
+		if e.LocalPorts != nil {
+			for _, p := range e.LocalPorts() {
+				localPorts[p] = true
+			}
+		}
+		isLocal := func(n Node) bool {
+			return n.Primary && n.Host == e.Self && (e.LocalPorts == nil || localPorts[n.Port])
+		}
 		for i, n := range nodes {
-			if n.Primary && n.Host == e.Self && own == nil {
+			if isLocal(n) && (own == nil || n.Group < own.Group) {
 				own = &nodes[i]
+			}
+			if isLocal(n) && n.Active && (e.LeaseKnown == nil || !e.LeaseKnown() || e.HoldsLease(n.Group)) {
+				usable = append(usable, n)
 			}
 			if n.Primary && n.Active {
 				primaries = append(primaries, n)
 			}
 		}
 		sort.Slice(primaries, func(i, j int) bool { return primaries[i].Group < primaries[j].Group })
-		if own != nil && own.Active && (e.LeaseKnown == nil || !e.LeaseKnown() || e.HoldsLease(own.Group)) {
-			return Destination{Addr: net.JoinHostPort("127.0.0.1", strconv.Itoa(e.LocalPort)), Key: "local:" + strconv.Itoa(int(own.Group))}, nil
+		sort.Slice(usable, func(i, j int) bool { return usable[i].Group < usable[j].Group })
+		if len(usable) > 0 {
+			port := e.LocalPort
+			if e.LocalPorts != nil {
+				port = usable[0].Port
+			}
+			return Destination{Addr: net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), Key: "local:" + strconv.Itoa(int(usable[0].Group))}, nil
 		}
 		if e.PeerEntryPort == 0 || (e.IsPeer != nil && e.IsPeer(RemoteAddr(ctx))) {
 			return Destination{}, ErrNoDestination

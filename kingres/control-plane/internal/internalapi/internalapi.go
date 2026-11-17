@@ -131,6 +131,14 @@ var Calls = map[string]Policy{
 	"POST /standby/rebuild": LeaderOnly,
 	"GET /standby/status":   LeaderOnly,
 
+	// The read calls and the freeze of the failover (internal-api.md, "Failover groundwork").
+	"GET /failover/position":       AnyPeer,
+	"GET /liveness":                AnyPeer,
+	"GET /failover/state":          LeaderOnly,
+	"POST /failover/freeze":        LeaderOnly,
+	"POST /failover/unfreeze":      LeaderOnly,
+	"POST /failover/standbys-gone": LeaderOnly,
+
 	// Configuration from the console (phase 13): the leader reads and sets the parameters of every
 	// server; any server answers the clock probe.
 	"POST /config/state":   LeaderOnly,
@@ -151,6 +159,8 @@ var handled = map[string]bool{
 	"POST /pki/renew": true, "GET /pki/csr": true,
 	"POST /heartbeat": true, "POST /lease/grant": true, "GET /lease/state": true, "POST /standby/plan": true,
 	"POST /standby/create": true, "POST /standby/remove": true, "POST /standby/rebuild": true, "GET /standby/status": true,
+	"GET /failover/position": true, "GET /liveness": true, "GET /failover/state": true, "POST /failover/freeze": true,
+	"POST /failover/unfreeze": true, "POST /failover/standbys-gone": true,
 	"POST /config/state": true, "POST /config/apply": true, "POST /config/check": true, "POST /config/restart": true, "GET /time": true,
 }
 
@@ -572,6 +582,9 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request, key, peer string
 	if err != nil {
 		fail(w, http.StatusBadRequest, "bad_request", "The body could not be read.")
 		return
+	}
+	if r.Method == http.MethodGet && len(body) == 0 {
+		body = []byte(r.URL.RawQuery) // a GET carries its parameters in the query; the handler reads them from here
 	}
 	res, err := s.be.Handle(r.Context(), key, peer, body)
 	if err != nil {

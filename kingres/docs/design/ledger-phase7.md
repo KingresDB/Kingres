@@ -2163,6 +2163,78 @@ build to the corrected rule. The verifier's README has the same list with the re
     error, different ones are the divergence of 4.7. The verifier of step 1 reads no entry bundle, so a
     damaged bundle is found only by the audit of the publisher; a later step of the verifier reads the
     bundles on the path of `proof --bundle`.
+49. **A second invariant of the guard: what a role can stop or remove (5, 9.3).** A role that is not a
+    superuser cannot stop the block builder or the capture of rows for longer than one of its own
+    statements runs, and cannot remove the ledger or the protection of a ledger table. The exceptions are
+    named in the README of the extension: a statement of the role that runs long; the locks that the owner
+    of an application table takes on its own table; a client in pipeline mode that never sends Sync
+    (ended by `idle_in_transaction_session_timeout`); `setval` on the sequence of the registry, which no
+    hook sees (the next `ledger_enable` then fails on the primary key and nothing is registered or
+    forged); a table that has an armed capture trigger and no row in the registry; and what a superuser
+    does.
+50. **A refusal of a lock is about the relation that is locked, not the one that is named (corrects 27
+    and 32).** `LOCK TABLE` of a view locks the tables of its stored query, so the statement hook follows
+    views, and views over views, to the end. A statement that fails releases its locks at once; the harm
+    of a statement that is going to be refused is its wait for the lock behind a reader, with every
+    writer queued behind it. So the hook never asks for a lock on a catalog table of the ledger before it
+    has decided, and `TRUNCATE` of one is refused before any lock. A foreign key that references a catalog
+    table of the ledger is refused (it takes a strong lock when it is created and puts triggers on the
+    table).
+51. **Nothing of the ledger is dropped through a dependency.** `object_access_hook` sees every object
+    that any `DROP` removes. While a table is under ledger control, nothing that belongs to the ledger
+    (the extension, its schema and members, the ledger tables and their history tables and columns, the
+    capture triggers) can be dropped by any role, through any cascade, except by the scripts of the
+    extension itself; with an empty registry `DROP EXTENSION` is the ordinary statement. This closes the
+    drop through `DROP EXTENSION plpgsql CASCADE`; twelve functions of 0.3 are still written in PL/pgSQL.
+    `ALTER ... DEPENDS ON EXTENSION` of an object of the ledger is refused.
+52. **The builders run as a statement of their own.** The lock of the builder must be held to the end of
+    the transaction (released earlier, the next builder would wait for the rows of the uncommitted block
+    or build the same height). So a caller that is not a superuser may call `ledger_build_block` and
+    `ledger_generate_digest` only as a statement of its own: inside a transaction block, a savepoint or
+    an exception block of PL/pgSQL the call is refused (`25001`). Superusers and the worker are unchanged,
+    which is what `kingresd` uses.
+53. **The owner of a ledger table, the schema and the sequences.** The owner of a table under ledger
+    control may do what changes neither what is recorded nor how; the list is in the README and is run
+    statement by statement by a test. `GRANT`, `REVOKE` and a change of owner on the schema of the
+    extension, and `ALTER SEQUENCE` on its sequences, are refused to a role that is not a superuser.
+54. **The registry lookup of the capture trigger** is a hash for the transaction with one entry in front
+    of it; it holds positive answers only and is dropped at the end of the transaction and when a
+    subtransaction aborts. Rows that alternate between two ledger tables cost about 7 percent more CPU
+    than before the guard (20 percent with the first form of the lookup).
+55. **What a held checkpoint rests on (7.4; replaces the clause of 17 that makes the past signatures of a
+    revoked key unusable as an anchor).** The identity of a checkpoint is its signed text (origin, size,
+    root, extension lines) and never its signature lines. A held checkpoint is usable when its text
+    verifies under any key of the trust file, whatever the standing of that key now: a revocation says
+    that the key must not be trusted for new notes, not that a checkpoint the auditor already verified is
+    unknown to them, and a held checkpoint only ever makes a run stricter. One that rests only on revoked
+    or over-limit keys stays the anchor, is named so in the output with a line that it was not shown
+    genuine now, and is replaced by the first checkpoint that extends it and is signed by a key that
+    counts. A plain note given as `--old FILE` keeps the strict rule. The trust file has no "compromised
+    since": a checkpoint carries no time that can be trusted, and `max_tree_size` is the form of "since"
+    that the data proves. Removing from the trust file every key that signed a held checkpoint is the one
+    change that makes the state unreadable (status 2, with the rebase named); a key is retired by
+    `not_after`, `max_tree_size` or `revoked`, not by deleting it.
+56. **The lines of one text only accumulate (7.4; replaces the canonical form of 40).** The canonical
+    form holds the text and every line that verifies under any key of the trust file, written again in
+    the order of key name and key id. A served note with the text of the held one is merged into it, and
+    the state is rewritten only when it gains a line. The evidence of a fork or rollback is one file per
+    signed text, extended in place with new lines of that text. Which of the genuine lines a party
+    without a key serves changes neither the status, the stored size, the name of an evidence file nor
+    the verdict of a later run; there is no limit on the number of evidence files, since a limit would be
+    a lever for status 4.
+57. **The lock file is never replaced, and a write never goes over a state it did not read (7.4;
+    replaces "a lock file that is not private is replaced" in 41; adds to 18).** The lock file is locked
+    as it is and then made private in place; one that belongs to another user is refused with the command
+    to remove it; the name is checked again after the lock. Just before the rename the state is read
+    again, and a run that finds other bytes than the ones it decided on writes nothing (status 2).
+58. **A closed standard output (adds to 43).** A standard output that is the null device opened for
+    reading and writing is what the runtime puts in place of a closed descriptor: status 2 on every
+    command, with a line on the standard error. The null device opened for writing only is the caller's
+    request for no output and runs as usual.
+59. **A limit on one element of a proof (4.8, 7.4; adds to 42).** One element of the chain of a proof is
+    at most 4,096 bytes and what is outside the chain at most 1 MiB, checked while the document is read;
+    a larger one fails at the parse step. The memory of a proof is bounded by one header whatever the
+    file holds.
 
 Of section 13: item 2 (test vectors) is settled for signed notes (the example key and note of the
 specification are in the tests; the checkpoint example has no published key), item 3 (entry bundles at

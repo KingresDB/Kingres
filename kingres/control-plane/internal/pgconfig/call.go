@@ -65,7 +65,7 @@ func (a *Agent) HandleCall(ctx context.Context, key string, body []byte) (any, e
 		if err := json.Unmarshal(body, &r); err != nil {
 			return nil, bad(errors.New("the body is not a restart request"))
 		}
-		if err := a.RestartInstance(ctx, r.Instance); err != nil {
+		if err := a.RestartInstance(ctx, r.Instance, r.IfPending); err != nil {
 			return nil, fail(err)
 		}
 		return struct{}{}, nil

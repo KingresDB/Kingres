@@ -50,7 +50,9 @@ type Leader struct {
 	IsLeader func(ctx context.Context) bool
 	// ServiceConn opens a service connection to a database of this server.
 	ServiceConn func(ctx context.Context, db string) (*pgx.Conn, error)
-	// Registrar records standbys in the sharding catalog (SkipCatalog today).
+	// Registrar records standbys in the sharding catalog (kingres.add_node and
+	// remove_node of kingres_shard 0.5; nil in a unit test that has no catalog: the
+	// step then ends as skipped).
 	Registrar CatalogRegistrar
 	Audit     func(ctx context.Context, ev audit.Event)
 	Log       *slog.Logger
@@ -59,6 +61,9 @@ type Leader struct {
 	// RetryAfter is how long a failed create or rebuild waits before the next try
 	// (default 30 s).
 	RetryAfter time.Duration
+	// UnregisterWait is the pause between two tries of a catalog removal that the
+	// extension refused with KS009 because the primary still names the standby (default 5 s).
+	UnregisterWait time.Duration
 
 	st   store
 	kick chan struct{}
@@ -81,8 +86,8 @@ func NewLeader(l *Leader) *Leader {
 	if l.RetryAfter == 0 {
 		l.RetryAfter = 30 * time.Second
 	}
-	if l.Registrar == nil {
-		l.Registrar = SkipCatalog{}
+	if l.UnregisterWait == 0 {
+		l.UnregisterWait = 5 * time.Second
 	}
 	if l.Log == nil {
 		l.Log = slog.New(slog.DiscardHandler)
@@ -198,10 +203,13 @@ type work struct {
 	Remove   []Entry
 	Resume   []Entry
 	Rebuild  []Entry
+	// Register are the ready standbys that are not in the catalog yet (a new one, or
+	// one made by a version before the registration existed).
+	Register []Entry
 }
 
 func (w work) empty() bool {
-	return len(w.Add)+len(w.Remove)+len(w.Resume)+len(w.Rebuild) == 0
+	return len(w.Add)+len(w.Remove)+len(w.Resume)+len(w.Rebuild)+len(w.Register) == 0
 }
 
 // diff compares the records with what the catalog and the replica count ask for.
@@ -246,6 +254,8 @@ func (l *Leader) diff(t topology, recs []Record, replicas int) work {
 				w.Resume = append(w.Resume, r.Entry(g.Port))
 			case r.NeedsRebuild:
 				w.Rebuild = append(w.Rebuild, r.Entry(g.Port))
+			case r.State == stateReady && r.CatalogNode == nil && r.Port > 0:
+				w.Register = append(w.Register, r.Entry(g.Port))
 			}
 		}
 	}
@@ -344,8 +354,8 @@ func (l *Leader) round(ctx context.Context) error {
 	statuses := l.poll(ctx, t)
 	for _, r := range recs {
 		for _, s := range statuses {
-			if s.Primary != nil && s.Primary.Group == r.Group {
-				for _, id := range s.Primary.NeedsRebuild {
+			if ps := s.primaryOf(r.Group); ps != nil {
+				for _, id := range ps.NeedsRebuild {
 					if id == r.ID && !r.NeedsRebuild && r.State == stateReady {
 						if err := l.st.flagRebuild(ctx, r.ID); err == nil {
 							l.Log.Warn("standby: a standby lost its slot and will be rebuilt", "standby", r.ID, "group", r.Group)
@@ -460,10 +470,11 @@ func (l *Leader) underReplicated(ctx context.Context, t topology, replicas int, 
 	l.mu.Lock()
 	for _, g := range t.groups {
 		st, ok := statuses[g.Primary]
-		if !ok || st.Primary == nil || st.Primary.Group != g.ID {
+		ps := st.primaryOf(g.ID)
+		if !ok || ps == nil {
 			continue
 		}
-		have := len(st.Primary.Streaming)
+		have := len(ps.Streaming)
 		possible := min(replicas, len(t.ring)-1)
 		if have >= replicas {
 			l.underFor[g.ID] = 0
@@ -721,11 +732,13 @@ func (l *Leader) removeStandby(ctx context.Context, env *task.Env, e Entry) erro
 		// removes standbys that are not in the list), the record goes now.
 		_ = env.SetDetail(ctx, fmt.Sprintf("Server %s cannot be reached; its standby is removed when it is back.", rec.Server))
 	}
+	// The catalog row goes before the record: a record that is gone cannot be found
+	// again to finish the removal (a refusal here is repeated by the next check).
+	if err := l.unregister(ctx, entry); err != nil {
+		return fmt.Errorf("removing the standby from the catalog: %w", err)
+	}
 	if err := l.st.delete(ctx, rec.ID); err != nil {
 		return err
-	}
-	if err := l.Registrar.Unregister(ctx, entry); err != nil && !errors.Is(err, ErrCatalogUnsupported) {
-		return fmt.Errorf("removing the standby from the catalog: %w", err)
 	}
 	l.audit(ctx, env, "standbyRemoved", entry, audit.OutcomeSuccess, nil)
 	return l.publish(ctx)
@@ -759,6 +772,17 @@ func (l *Leader) rebuildStandby(ctx context.Context, env *task.Env, e Entry) err
 		l.audit(ctx, env, "standbyRebuilt", entry, audit.OutcomeFailure, nil)
 		return fmt.Errorf("rebuilding the standby of shard group %d on %s: %w", e.Group, rec.Server, err)
 	}
+	if rec.CatalogNode != nil && res.Port != 0 && res.Port != rec.Port {
+		// The catalog names a node by host and port: a standby that came back on another
+		// port is a new node (extension, sequence 6). The old row goes (it is not in the
+		// list while it rebuilds), the step that registers makes the new one.
+		if err := l.unregister(ctx, rec.Entry(g.Port)); err != nil {
+			return fmt.Errorf("removing the old catalog row of a rebuilt standby: %w", err)
+		}
+		if err := l.st.setCatalogNode(ctx, rec.ID, 0); err != nil {
+			return err
+		}
+	}
 	if err := l.st.setState(ctx, rec.ID, stateReady, res.Port); err != nil {
 		return err
 	}
@@ -779,42 +803,77 @@ func (l *Leader) groupOf(ctx context.Context, id int32) (groupInfo, error) {
 	return g, nil
 }
 
-// registerInCatalog is the one step that records standbys in the sharding
-// catalog. With the registrar of this phase it ends the step as skipped (the
-// contract's step state, with the reason as the task detail); the standbys work
-// without being in the catalog.
-func (l *Leader) registerInCatalog(ctx context.Context, env *task.Env, w work) error {
-	skipped := false
-	for _, es := range [][]Entry{w.Add, w.Resume, w.Rebuild} {
-		for _, e := range es {
-			rec, found, err := l.st.get(ctx, e.ID)
-			if e.ID == 0 {
-				var recs []Record
-				if recs, err = l.st.list(ctx); err == nil {
-					for _, r := range recs {
-						if r.Group == e.Group && r.Server == e.Server {
-							rec, found = r, true
-						}
-					}
-				}
-			}
-			if err != nil || !found {
-				continue
-			}
-			g, _ := l.groupOf(ctx, rec.Group)
-			if err := l.Registrar.Register(ctx, rec.Entry(g.Port)); err != nil {
-				if errors.Is(err, ErrCatalogUnsupported) {
-					skipped = true
-					continue
-				}
-				return fmt.Errorf("registering the standby in the catalog: %w", err)
-			}
-		}
-	}
-	if skipped {
+// registerInCatalog is the step that records the ready standbys in the sharding
+// catalog (kingres_shard 0.5, sequence 1) and stores the node id the catalog gave
+// them; the list pushed afterwards carries it, and from then on the primary of the
+// group names the standby in synchronous_standby_names. It looks at every ready
+// standby that has no node id, not only at the ones this task made, so that a
+// standby made before the registration existed, or one whose earlier registration
+// was refused, is registered by the next task.
+func (l *Leader) registerInCatalog(ctx context.Context, env *task.Env, _ work) error {
+	if l.Registrar == nil {
 		return task.Skip(ErrCatalogUnsupported.Error())
 	}
-	return nil
+	recs, err := l.st.list(ctx)
+	if err != nil {
+		return err
+	}
+	t, err := l.readTopology(ctx)
+	if err != nil {
+		return err
+	}
+	changed := false
+	var firstErr error
+	for _, rec := range recs {
+		if rec.State != stateReady || rec.CatalogNode != nil || rec.Port == 0 {
+			continue
+		}
+		g, ok := t.group(rec.Group)
+		if !ok {
+			continue
+		}
+		id, err := l.Registrar.Register(ctx, rec.Entry(g.Port))
+		if err != nil {
+			l.Log.Warn("standby: registering a standby in the catalog", "standby", rec.ID, "group", rec.Group, "error", err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("registering the standby of shard group %d on %s in the catalog: %w", rec.Group, rec.Server, err)
+			}
+			continue
+		}
+		if err := l.st.setCatalogNode(ctx, rec.ID, id); err != nil {
+			return err
+		}
+		changed = true
+		_ = env.SetDetail(ctx, fmt.Sprintf("Registered the standby of shard group %d on %s as node %d.", rec.Group, rec.Server, id))
+	}
+	if changed {
+		if err := l.publish(ctx); err != nil {
+			return err
+		}
+	}
+	return firstErr
+}
+
+// unregister takes a standby out of the catalog (sequence 8). The list of its
+// primary has stopped naming it (the plan without it was pushed before this
+// call); until that primary's agent has applied the plan the extension refuses the
+// call with KS009 ("cannot commit"), which is repeated for a short time.
+func (l *Leader) unregister(ctx context.Context, e Entry) error {
+	if l.Registrar == nil {
+		return nil
+	}
+	var err error
+	for i := 0; i < 12; i++ {
+		if err = l.Registrar.Unregister(ctx, e); err == nil || !IsCatalogCode(err, sqlstateCannotCommit) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(l.UnregisterWait):
+		}
+	}
+	return err
 }
 
 // PurgeServer removes every standby that has to go with a server that is being
@@ -862,10 +921,10 @@ func (l *Leader) PurgeServer(ctx context.Context, server string) error {
 		if err != nil && !errors.Is(err, peerclient.ErrUnreachable) {
 			l.Log.Warn("standby: removing a standby of a server that goes", "standby", r.ID, "server", r.Server, "error", err)
 		}
-		if err := l.st.delete(ctx, r.ID); err != nil {
-			return err
+		if err := l.unregister(ctx, entry); err != nil {
+			return fmt.Errorf("removing a standby from the catalog: %w", err)
 		}
-		if err := l.Registrar.Unregister(ctx, entry); err != nil && !errors.Is(err, ErrCatalogUnsupported) {
+		if err := l.st.delete(ctx, r.ID); err != nil {
 			return err
 		}
 	}

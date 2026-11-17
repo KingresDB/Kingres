@@ -48,14 +48,39 @@ func Resolve(path string) (string, error) {
 	if st, lerr := os.Lstat(path); lerr == nil && st.Mode()&os.ModeSymlink != 0 {
 		return "", fmt.Errorf("%s is a link to a file that does not exist", path)
 	}
-	dir, err := filepath.EvalSymlinks(filepath.Dir(path))
+	// The directory is the text before the last separator as typed: filepath.Dir
+	// would clean it first, and "sl/../s" would then lose the ".." that follows a
+	// link (the parent of the link's target, as the system takes it) and name
+	// "./s" (L12-06).
+	dirText, base := splitLast(path)
+	dir, err := filepath.EvalSymlinks(dirText)
 	if err != nil {
 		return "", err
 	}
 	if dir, err = filepath.Abs(dir); err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, filepath.Base(path)), nil
+	return filepath.Join(dir, base), nil
+}
+
+// splitLast splits a path at its last separator without cleaning either half:
+// the directory text keeps every "." and ".." as typed, and is "." for a bare
+// name. A trailing separator is dropped first, so "d/" is the name "d".
+func splitLast(path string) (dir, base string) {
+	for len(path) > 1 && os.IsPathSeparator(path[len(path)-1]) {
+		path = path[:len(path)-1]
+	}
+	i := len(path) - 1
+	for i >= 0 && !os.IsPathSeparator(path[i]) {
+		i--
+	}
+	if i < 0 {
+		return ".", path
+	}
+	if i == 0 || i == len(filepath.VolumeName(path)) {
+		return path[:i+1], path[i+1:] // the root of the volume keeps its separator
+	}
+	return path[:i], path[i+1:]
 }
 
 // tag is a short name that depends only on the base name of the state, so
@@ -197,6 +222,36 @@ func Replace(path string, data []byte) (err error) {
 	return step("dirsynced")
 }
 
+// ErrStateChanged is returned by ReplaceIfUnchanged when the file on disk is not
+// the one the caller decided on.
+var ErrStateChanged = errors.New("the state file changed while this run was working on it")
+
+// ReplaceIfUnchanged is Replace for a caller that decided on the content it read
+// earlier (was; existed says whether there was a file): it reads the file again
+// immediately before the rename and refuses, writing nothing, when it is not
+// what was read. The lock already excludes every run of this program; this is the
+// second line, so that a writer that does not take the lock, or one that holds a
+// lock on another file, can not be overwritten by a decision made on an older
+// state (L12-02: a late writer moved the state backwards). What is left is the
+// time between this read and the rename, a few microseconds, for a writer that
+// ignores the lock; no file system call closes it without a lock.
+func ReplaceIfUnchanged(path string, data, was []byte, existed bool, limit int64) error {
+	now, err := safefile.ReadArg(path, limit)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		if existed {
+			return fmt.Errorf("%w: it is gone", ErrStateChanged)
+		}
+	case err != nil:
+		return fmt.Errorf("%w: %v", ErrStateChanged, err)
+	case !existed:
+		return fmt.Errorf("%w: it did not exist and does now", ErrStateChanged)
+	case !bytes.Equal(now, was):
+		return fmt.Errorf("%w: its content is not what was read", ErrStateChanged)
+	}
+	return Replace(path, data)
+}
+
 // ConflictPath is where the evidence of a fork or rollback is kept: next to
 // the state, with the size and the whole root in the name (64 hex characters) so that two
 // different conflicting checkpoints never overwrite each other.
@@ -221,7 +276,14 @@ type Saved struct {
 	// Existing is true when a file with exactly this content was already
 	// there: the evidence is saved, by an earlier run.
 	Existing bool
+	// Extended is true when the file was there for the same checkpoint and was
+	// rewritten with more genuine signature lines (SaveConflictMerging).
+	Extended bool
 }
+
+// MaxEvidence is the most bytes of an evidence file that are read back: a note
+// is at most 64 KiB.
+const MaxEvidence = 64 << 10
 
 // SaveConflict writes the conflicting signed note beside the state and claims
 // it saved only when a file with exactly this content is there. The file is
@@ -232,6 +294,20 @@ type Saved struct {
 // names, and then it is an error: the caller must say that the evidence is not
 // saved.
 func SaveConflict(path string, size uint64, root []byte, note []byte) (Saved, error) {
+	return SaveConflictMerging(path, size, root, note, nil)
+}
+
+// SaveConflictMerging is SaveConflict for notes whose identity is not their
+// bytes. A file that is already at a name is shown to merge (when it is not nil)
+// together with the note: merge returns the bytes the file should hold and
+// whether the file is the same checkpoint as the note (same). A file that is the
+// same checkpoint with the same bytes is the evidence already saved; one that is
+// the same checkpoint with other bytes (it holds fewer genuine signature lines
+// than the note, or more) is replaced, in the same directory and atomically, by
+// the merged bytes, and Saved.Extended says so; a file that is not the same
+// checkpoint takes the next name. The signature lines of one signed text are
+// therefore one file, whichever of them were served on which run (L12-03).
+func SaveConflictMerging(path string, size uint64, root []byte, note []byte, merge func(have []byte) (merged []byte, same bool)) (Saved, error) {
 	base := ConflictPath(path, size, root)
 	var last error
 	for i := 0; i < maxConflictNames; i++ {
@@ -249,6 +325,22 @@ func SaveConflict(path string, size uint64, root []byte, note []byte) (Saved, er
 		}
 		if !errors.Is(err, os.ErrExist) {
 			return Saved{Path: p}, err
+		}
+		if merge != nil {
+			have, rerr := safefile.ReadNoFollow(p, 2*MaxEvidence)
+			if rerr == nil {
+				if merged, same := merge(have); same {
+					if bytes.Equal(merged, have) {
+						return Saved{Path: p, Existing: true}, nil
+					}
+					if rerr := Replace(p, merged); rerr != nil {
+						return Saved{Path: p}, rerr
+					}
+					return Saved{Path: p, Existing: true, Extended: true}, nil
+				}
+			}
+			last = fmt.Errorf("%s exists and is not this checkpoint", p)
+			continue
 		}
 		have, rerr := safefile.ReadNoFollow(p, int64(len(note))+1)
 		if rerr == nil && bytes.Equal(have, note) {

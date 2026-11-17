@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -23,7 +24,6 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/lease"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/peerclient"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/setup"
-	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
 )
 
 // leaseDirName is the directory below the data directory that holds the grants,
@@ -51,19 +51,19 @@ func startLeases(d *haDeps) error {
 	pc := peerclient.New(peerclient.Config{Self: d.ServerHost, PKIDir: d.Svc.PKIDir(), Peers: d.Peers, Revoked: d.Svc.RevokedSerials,
 		Timeout: d.Cfg.HA.LeaseDuration - d.Cfg.HA.LeaseMargin, Fault: d.Fault})
 	d.OnCertificateInstalled(pc.ForgetAll)
-	instDir, err := d.Svc.Manager().Dir(cluster.NodeID)
-	if err != nil {
-		return err
-	}
-	wd := &watchdogRunner{d: d, leaseDir: leaseDir, instDir: instDir}
+	wd := &watchdogs{d: d, leaseDir: leaseDir, byInstance: map[int]*watchdogRunner{}}
 	mgr, err := lease.New(lease.Config{
 		Self: d.ServerHost, Clock: clk, Duration: d.Cfg.HA.LeaseDuration, Renew: d.Cfg.HA.LeaseRenew, Margin: d.Cfg.HA.LeaseMargin,
-		Grantor: grantor, Voter: peerVoter{pc: pc, fault: d.Fault}, Source: catalogTopology{d: d}, Instance: localInstance{d.Svc},
+		Grantor: grantor, Voter: peerVoter{pc: pc, fault: d.Fault}, Source: catalogTopology{d: d},
+		InstanceFor: func(g int32) (lease.Instance, bool) {
+			li, ok := d.Svc.PrimaryOf(g)
+			return localInstance{d.Svc, li.ID}, ok
+		},
 		// Self-fencing is enforced only for a group that has a standby: with none,
 		// nothing could be promoted, and stopping the only copy would only cost
 		// availability. The standby manager answers from local knowledge.
 		Enforced: func(g int32) bool { return d.Fault.ForceEnforce() || d.Registry.Standbys().HasStandby(g) },
-		Dir:      leaseDir, WatchdogFile: filepath.Join(instDir, "lease.json"), EnsureWatchdog: wd.ensure, Log: d.Log,
+		Dir:      leaseDir, WatchdogFileFor: wd.leaseFile, EnsureWatchdogFor: wd.ensure, Log: d.Log,
 		Audit: func(ctx context.Context, action string, group int32, detail string) {
 			d.Audit(ctx, audit.Event{Actor: "system", Source: "system", Action: action, ResourceType: "shardGroup", ResourceID: fmt.Sprint(group),
 				Outcome: audit.OutcomeSuccess, Details: map[string]any{"detail": detail}})
@@ -73,6 +73,7 @@ func startLeases(d *haDeps) error {
 		return err
 	}
 	d.Registry.SetLeases(mgr)
+	d.LeaseMgr = mgr
 
 	d.Calls.Register("POST /lease/grant", func(_ context.Context, peer string, body []byte) (any, error) {
 		if _, ok := d.Peers.Get(peer); !ok {
@@ -82,7 +83,20 @@ func startLeases(d *haDeps) error {
 		if err := json.Unmarshal(body, &req); err != nil || req.DurationMs <= 0 || req.DurationMs > int64(time.Minute/time.Millisecond) {
 			return nil, &internalapi.CallError{Status: http.StatusBadRequest, Code: "bad_request", Message: "A group and a duration of at most one minute are required."}
 		}
-		rep, err := grantor.Grant(req.Group, peer, time.Duration(req.DurationMs)*time.Millisecond, req.DryRun)
+		dur := time.Duration(req.DurationMs) * time.Millisecond
+		var rep lease.Reply
+		var err error
+		switch {
+		case req.Release:
+			rep, err = grantor.Release(req.Group, peer)
+		case req.TransferTo != "":
+			if _, ok := d.Peers.Get(req.TransferTo); !ok {
+				return nil, &internalapi.CallError{Status: http.StatusBadRequest, Code: "bad_request", Message: "The server to hand the lease to is not a server of this cluster."}
+			}
+			rep, err = grantor.Transfer(req.Group, peer, req.TransferTo, dur)
+		default:
+			rep, err = grantor.Grant(req.Group, peer, dur, req.DryRun)
+		}
 		if err != nil {
 			// The grant could not be recorded: it is not granted.
 			d.Log.Error("recording a lease grant", "error", err)
@@ -91,7 +105,8 @@ func startLeases(d *haDeps) error {
 		return rep, nil
 	})
 	d.Calls.Register("GET /lease/state", func(context.Context, string, []byte) (any, error) {
-		return leaseState{Server: d.ServerHost, Grants: grantor.Snapshot(), Leases: mgr.Info()}, nil
+		return leaseState{Server: d.ServerHost, Grants: grantor.Snapshot(), Leases: mgr.Info(),
+			DurationMs: d.Cfg.HA.LeaseDuration.Milliseconds(), MarginMs: grantor.Margin().Milliseconds()}, nil
 	})
 
 	d.WG.Add(1)
@@ -104,6 +119,10 @@ type leaseState struct {
 	Server string         `json:"server"`
 	Grants []lease.Entry  `json:"grants"`
 	Leases []ha.LeaseInfo `json:"leases"`
+	// DurationMs and MarginMs are the lease duration and the margin of the answering server: the
+	// safety argument needs them equal on every server, so a failover compares them first.
+	DurationMs int64 `json:"durationMs"`
+	MarginMs   int64 `json:"marginMs"`
 }
 
 // peerVoter asks another server's grantor over the internal API.
@@ -124,17 +143,19 @@ func (v peerVoter) Grant(ctx context.Context, server string, req lease.Request) 
 	return r, err
 }
 
-// localInstance is the primary instance of this server.
-type localInstance struct{ svc *cluster.Service }
+// localInstance is one primary instance of this server (the directory id is what the
+// role files say serves the group).
+type localInstance struct {
+	svc *cluster.Service
+	id  int
+}
 
 func (l localInstance) Running(ctx context.Context) (bool, error) {
-	return l.svc.Manager().Running(ctx, cluster.NodeID)
+	return l.svc.Manager().Running(ctx, l.id)
 }
-func (l localInstance) Start(ctx context.Context) error {
-	return l.svc.Manager().Start(ctx, cluster.NodeID)
-}
+func (l localInstance) Start(ctx context.Context) error { return l.svc.Manager().Start(ctx, l.id) }
 func (l localInstance) StopImmediate(ctx context.Context) error {
-	return l.svc.Manager().StopImmediate(ctx, cluster.NodeID)
+	return l.svc.Manager().StopImmediate(ctx, l.id)
 }
 
 // catalogTopology reads which group this server runs the primary of, and the
@@ -151,7 +172,7 @@ func (c catalogTopology) Topology(ctx context.Context) (lease.Topology, error) {
 	if c.d.Node.State() != setup.Clustered {
 		return lease.Topology{}, nil
 	}
-	conn, err := c.d.Svc.ServiceConn(ctx, sysdb.Database)
+	conn, err := c.d.Svc.SystemConn(ctx)
 	if err != nil {
 		return lease.Topology{}, fmt.Errorf("reading the catalog: %w", err)
 	}
@@ -162,21 +183,32 @@ func (c catalogTopology) Topology(ctx context.Context) (lease.Topology, error) {
 	}
 	defer rows.Close()
 	hosts := map[string]bool{}
-	var groups []int32
+	var catalog []cluster.CatalogRow
 	for rows.Next() {
-		var host, role string
-		var port int
-		var group int32
-		if err := rows.Scan(&host, &port, &group, &role); err != nil {
+		var r cluster.CatalogRow
+		if err := rows.Scan(&r.Host, &r.Port, &r.Group, &r.Role); err != nil {
 			return lease.Topology{}, fmt.Errorf("reading kingres.node: %w", err)
 		}
-		hosts[host] = true
-		if host == c.d.ServerHost && port == c.d.Cfg.PGPort && role == "primary" {
-			groups = append(groups, group)
-		}
+		hosts[r.Host] = true
+		catalog = append(catalog, r)
 	}
 	if err := rows.Err(); err != nil {
 		return lease.Topology{}, fmt.Errorf("reading kingres.node: %w", err)
+	}
+	// The role files follow the catalog (a directory made before they existed gets one, an instance whose
+	// group was not known gets it), and the groups this server holds the lease of are the catalog's
+	// primaries on a port of one of its primary instances.
+	c.d.Svc.SyncRoles(c.d.ServerHost, catalog)
+	var groups []int32
+	for _, r := range catalog {
+		if r.Host != c.d.ServerHost || r.Role != "primary" {
+			continue
+		}
+		for _, li := range c.d.Svc.WritableInstances() {
+			if li.Port == r.Port {
+				groups = append(groups, r.Group)
+			}
+		}
 	}
 	t := lease.Topology{Groups: groups}
 	for h := range hosts {
@@ -195,6 +227,8 @@ type watchdogRunner struct {
 	d        *haDeps
 	leaseDir string
 	instDir  string
+	group    int32
+	instance int
 
 	mu     sync.Mutex
 	exited chan struct{}
@@ -244,8 +278,8 @@ func (w *watchdogRunner) ensure() {
 	}
 	cmd := exec.CommandContext(context.Background(), bin, //nolint:gosec // our own program, arguments are paths of this server
 		"-lease-file", filepath.Join(w.instDir, "lease.json"), "-data", filepath.Join(w.instDir, "pgdata"),
-		"-pg-ctl", filepath.Join(binDir, "pg_ctl"), "-marker", filepath.Join(w.leaseDir, lease.FencedMarker),
-		"-lock", filepath.Join(w.leaseDir, "watchdog.lock"), "-standdown", filepath.Join(w.leaseDir, lease.StandDownFile))
+		"-pg-ctl", filepath.Join(binDir, "pg_ctl"), "-marker", lease.FencedPath(w.leaseDir, w.group),
+		"-lock", filepath.Join(w.leaseDir, "watchdog."+strconv.Itoa(w.instance)+".lock"), "-standdown", lease.StandDownPath(w.leaseDir, w.instance))
 	cmd.Stdout, cmd.Stderr = logf, logf
 	detach(cmd)
 	if err := cmd.Start(); err != nil {
@@ -256,4 +290,48 @@ func (w *watchdogRunner) ensure() {
 	exited := make(chan struct{})
 	w.exited = exited
 	go func() { _ = cmd.Wait(); _ = logf.Close(); close(exited) }()
+}
+
+// watchdogs keeps one watchdog per primary instance of this server: each has its own
+// lease file, its own fence marker (the marker of its group), its own lock and its own
+// stand-down file, so that the lease of one group never stops or releases the
+// instance of another.
+type watchdogs struct {
+	d          *haDeps
+	leaseDir   string
+	mu         sync.Mutex
+	byInstance map[int]*watchdogRunner
+}
+
+// leaseFile is the file the watchdog of the group's primary instance reads; empty when this server
+// runs no primary of the group.
+func (w *watchdogs) leaseFile(group int32) string {
+	li, ok := w.d.Svc.PrimaryOf(group)
+	if !ok {
+		return ""
+	}
+	dir, err := w.d.Svc.Manager().Dir(li.ID)
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "lease.json")
+}
+
+func (w *watchdogs) ensure(group int32) {
+	li, ok := w.d.Svc.PrimaryOf(group)
+	if !ok {
+		return
+	}
+	dir, err := w.d.Svc.Manager().Dir(li.ID)
+	if err != nil {
+		return
+	}
+	w.mu.Lock()
+	r := w.byInstance[li.ID]
+	if r == nil || r.group != group {
+		r = &watchdogRunner{d: w.d, leaseDir: w.leaseDir, instDir: dir, group: group, instance: li.ID}
+		w.byInstance[li.ID] = r
+	}
+	w.mu.Unlock()
+	r.ensure()
 }

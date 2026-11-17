@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/audit"
-	"github.com/KingresDB/Kingres/kingres/control-plane/internal/cluster"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/monitor"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/sysdb"
 )
 
 // syncNamesKey is the setting this agent owns in the managed configuration of the
@@ -33,14 +33,34 @@ type slotRow struct {
 // that retains too much WAL raises an alert and then is dropped, a standby whose
 // slot is lost is marked for a rebuild, and synchronous_standby_names follows the
 // rule of SyncState.Decide.
-func (a *Agent) maintainPrimary(ctx context.Context) error {
-	g, ok := a.localGroup(ctx)
-	if !ok {
-		return nil
+func (a *Agent) maintainPrimaries(ctx context.Context) error {
+	primaries := a.localPrimaries()
+	served := map[int32]bool{}
+	var first error
+	for _, lp := range primaries {
+		served[lp.Group] = true
+		if err := a.maintainPrimary(ctx, lp); err != nil && first == nil {
+			first = err
+		}
 	}
+	// A group this server does not run the primary of any more has nothing to report.
+	a.mu.Lock()
+	for g := range a.primaries {
+		if !served[g] {
+			delete(a.primaries, g)
+			delete(a.slotWarn, g)
+		}
+	}
+	a.rounds++
+	a.mu.Unlock()
+	return first
+}
+
+func (a *Agent) maintainPrimary(ctx context.Context, lp localPrimary) error {
+	g := lp.Group
 	st := a.local.snapshot()
 	entries := st.entriesOfGroup(g)
-	c, err := a.Svc.ServiceConn(ctx, "postgres")
+	c, err := a.Svc.InstanceConn(ctx, lp.Dir, "postgres")
 	if err != nil {
 		return fmt.Errorf("connecting to the primary instance: %w", err)
 	}
@@ -104,6 +124,17 @@ func (a *Agent) maintainPrimary(ctx context.Context) error {
 		}
 	}
 
+	// What the primary names now: a standby already in the list stays (it was checked when it went in);
+	// a new name goes in only when the standby is registered in the catalog, streams, and the extension
+	// agrees that the name matches it (kingres_shard 0.5, sequence 1 step 2).
+	settings, err := a.mgr().Settings(lp.Dir)
+	if err != nil {
+		return fmt.Errorf("reading the managed settings: %w", err)
+	}
+	listed := ListedNames(settings.Extra[syncNamesKey])
+	frozen := a.isFrozen(g)
+	gone := a.goneServers()
+
 	ps := &PrimaryStatus{Group: g, Streaming: []int64{}, Slots: []SlotStatus{}, NeedsRebuild: []int64{}}
 	warned := map[int64]int64{}
 	needs := map[int64]bool{}
@@ -146,7 +177,9 @@ func (a *Agent) maintainPrimary(ctx context.Context) error {
 				map[string]any{"group": g, "reason": "retention limit exceeded", "retainedBytes": s.retained})
 			continue
 		}
-		names = append(names, AppName(e.ID))
+		if !dropGoneEntry(e, gone, frozen) && a.mayName(ctx, lp.Dir, e, listed, streaming) {
+			names = append(names, AppName(e.ID))
+		}
 		if streaming[AppName(e.ID)] {
 			streamingIDs[e.ID] = true
 			ps.Streaming = append(ps.Streaming, e.ID)
@@ -155,10 +188,6 @@ func (a *Agent) maintainPrimary(ctx context.Context) error {
 	ps.NeedsRebuild = sortedIDs(needs)
 
 	// synchronous_standby_names.
-	settings, err := a.mgr().Settings(cluster.NodeID)
-	if err != nil {
-		return fmt.Errorf("reading the managed settings: %w", err)
-	}
 	applied := settings.Extra[syncNamesKey]
 	a.mu.Lock()
 	ss := a.syncs[g]
@@ -166,7 +195,6 @@ func (a *Agent) maintainPrimary(ctx context.Context) error {
 		ss = &SyncState{}
 		a.syncs[g] = ss
 	}
-	frozen := a.Frozen != nil && a.Frozen(g)
 	d := ss.Decide(SyncInput{Now: a.Clock.Mono(), Planned: names, Streaming: streaming, Applied: applied, Frozen: frozen, Grace: a.Grace})
 	a.mu.Unlock()
 	if d.Set != nil {
@@ -180,10 +208,10 @@ func (a *Agent) maintainPrimary(ctx context.Context) error {
 		} else {
 			next.Extra[syncNamesKey] = *d.Set
 		}
-		if err := a.mgr().WriteManaged(cluster.NodeID, next); err != nil {
+		if err := a.mgr().WriteManaged(lp.Dir, next); err != nil {
 			return fmt.Errorf("writing synchronous_standby_names: %w", err)
 		}
-		if err := a.mgr().Reload(ctx, cluster.NodeID); err != nil {
+		if err := a.mgr().Reload(ctx, lp.Dir); err != nil {
 			return fmt.Errorf("reloading the primary instance: %w", err)
 		}
 		applied = *d.Set
@@ -192,7 +220,7 @@ func (a *Agent) maintainPrimary(ctx context.Context) error {
 	}
 	ps.SynchronousStandbyNames, ps.Without = applied, d.WithoutSynchronousStandby
 	a.mu.Lock()
-	a.primary, a.slotWarn = ps, warned
+	a.primaries[g], a.slotWarn[g] = ps, warned
 	a.mu.Unlock()
 	return nil
 }
@@ -206,20 +234,61 @@ func (a *Agent) maintainPrimary(ctx context.Context) error {
 func (a *Agent) Probe(_ context.Context, _ time.Time) ([]monitor.Condition, map[string]bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.primary == nil {
+	if len(a.primaries) == 0 {
 		return nil, nil
 	}
 	var conds []monitor.Condition
-	g := a.primary.Group
-	if a.primary.Without {
-		conds = append(conds, monitor.Condition{Kind: "groupWithoutSynchronousStandby", Severity: "warning",
-			Subject: fmt.Sprintf("server:%s|group:%d", a.Self, g),
-			Message: fmt.Sprintf("Shard group %d is running without a synchronous standby: its standbys have not streamed for longer than the grace period, so commits are acknowledged by the primary on server %s alone and a failure of that server now loses them.", g, a.Self)})
-	}
-	for id, bytesRetained := range a.slotWarn {
-		conds = append(conds, monitor.Condition{Kind: "replicationLagHigh", Severity: "warning",
-			Subject: fmt.Sprintf("server:%s|group:%d|standby:%d", a.Self, g, id),
-			Message: fmt.Sprintf("The slot of standby %d of shard group %d retains %d bytes of WAL on server %s; it is dropped at the retention limit and the standby is then rebuilt.", id, g, bytesRetained, a.Self)})
+	for _, g := range a.primaryGroups() {
+		ps := a.primaries[g]
+		if ps.Without {
+			conds = append(conds, monitor.Condition{Kind: "groupWithoutSynchronousStandby", Severity: "warning",
+				Subject: fmt.Sprintf("server:%s|group:%d", a.Self, g),
+				Message: fmt.Sprintf("Shard group %d is running without a synchronous standby: its standbys have not streamed for longer than the grace period, so commits are acknowledged by the primary on server %s alone and a failure of that server now loses them.", g, a.Self)})
+		}
+		for id, bytesRetained := range a.slotWarn[g] {
+			conds = append(conds, monitor.Condition{Kind: "replicationLagHigh", Severity: "warning",
+				Subject: fmt.Sprintf("server:%s|group:%d|standby:%d", a.Self, g, id),
+				Message: fmt.Sprintf("The slot of standby %d of shard group %d retains %d bytes of WAL on server %s; it is dropped at the retention limit and the standby is then rebuilt.", id, g, bytesRetained, a.Self)})
+		}
 	}
 	return conds, map[string]bool{"groupWithoutSynchronousStandby": true, "replicationLagHigh": true}
+}
+
+// mayName says whether the name of a standby may be in synchronous_standby_names
+// now. A name that is in the list stays until the plan drops the standby. A new
+// one needs the standby's node id (it is registered, which the extension's check
+// of the name requires), a streaming walsender of that name, a name that is safe
+// to render, and the extension's own answer (kingres.standby_name_matches on this
+// primary): a name that matches nobody makes every commit of the group wait for
+// ever.
+func (a *Agent) mayName(ctx context.Context, dir int, e Entry, listed map[string]bool, streaming map[string]bool) bool {
+	name := AppName(e.ID)
+	if listed[strings.ToLower(name)] {
+		return true
+	}
+	if e.CatalogNode == 0 || !SafeName(name) || !StreamingUnder(streaming, name) {
+		return false
+	}
+	match := a.NameMatches
+	if match == nil {
+		match = a.nameMatchesInDatabase
+	}
+	ok, err := match(ctx, dir, name)
+	if err != nil {
+		a.Log.Debug("standby: the extension could not check a standby name", "name", name, "error", err)
+		return false
+	}
+	return ok
+}
+
+// nameMatchesInDatabase asks the extension on this server's primary.
+func (a *Agent) nameMatchesInDatabase(ctx context.Context, dir int, name string) (bool, error) {
+	c, err := a.Svc.InstanceConn(ctx, dir, sysdb.Database)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	var ok bool
+	err = c.QueryRow(ctx, `SELECT kingres.standby_name_matches($1)`, name).Scan(&ok)
+	return ok, err
 }

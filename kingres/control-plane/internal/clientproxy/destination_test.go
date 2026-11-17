@@ -118,3 +118,37 @@ func TestAConnectionFromAnotherServerIsNeverForwardedAgain(t *testing.T) {
 		t.Fatalf("a peer's connection is served locally when the lease is held: %+v %v", d, err)
 	}
 }
+
+// A server that runs more than one primary (after a failover) is reached on the port
+// of the primary whose lease it holds, lowest group first; the primary that was
+// instance 1 and is a standby now is not a destination.
+func TestLocalPortsChooseTheHeldPrimaryOfTheLowestGroup(t *testing.T) {
+	nodes := []Node{
+		{ID: 1, Group: 0, Host: "a", Port: 5001, Primary: false, Active: true}, // the old home instance, now a standby
+		{ID: 2, Group: 1, Host: "a", Port: 7001, Primary: true, Active: true},  // a promoted standby
+		{ID: 3, Group: 2, Host: "a", Port: 7002, Primary: true, Active: true},
+		{ID: 4, Group: 3, Host: "b", Port: 5002, Primary: true, Active: true},
+	}
+	e := env("a", nodes)
+	e.LocalPorts = func() []int { return []int{7001, 7002} }
+	d, err := resolve(t, e)
+	if err != nil || d.Addr != "127.0.0.1:7001" || d.Key != "local:1" {
+		t.Fatalf("%+v %v", d, err)
+	}
+	e.HoldsLease = func(g int32) bool { return g == 2 }
+	d, err = resolve(t, e)
+	if err != nil || d.Addr != "127.0.0.1:7002" || d.Key != "local:2" {
+		t.Fatalf("only the lease of group 2 is held: %+v %v", d, err)
+	}
+	e.HoldsLease = func(int32) bool { return false }
+	d, err = resolve(t, e)
+	if err != nil || d.Addr != "b:5432" {
+		t.Fatalf("no lease held: forward to the next server: %+v %v", d, err)
+	}
+	// A catalog primary on this host whose port is not one of the local primaries is not local.
+	e = env("a", nodes)
+	e.LocalPorts = func() []int { return []int{9999} }
+	if d, err = resolve(t, e); err != nil || d.Addr != "b:5432" {
+		t.Fatalf("%+v %v", d, err)
+	}
+}

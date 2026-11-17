@@ -23,7 +23,7 @@ func (r *rig) restart(t *testing.T, running bool) (m *Manager, waiting bool) {
 	r.inst.mu.Unlock()
 	r.audit = nil
 	dir := filepath.Join(r.dir, "lease")
-	waiting, err := PrepareStart(dir, running)
+	waiting, err := PrepareStart(dir, func(int32) bool { return running })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func TestColdStartWithoutAMajorityStartsNothingAndFencesNothing(t *testing.T) {
 	if !waiting {
 		t.Fatal("the lease is enforced and the instance is not running: it must wait for the lease")
 	}
-	if err := Gate(dir)(1); err == nil {
+	if err := Gate(dir, testPrimary)(1); err == nil {
 		t.Fatal("the start gate must refuse while the instance waits for its lease")
 	}
 	r.voter.down["b"], r.voter.down["c"] = true, true // the others are still starting
@@ -68,7 +68,7 @@ func TestColdStartWithoutAMajorityStartsNothingAndFencesNothing(t *testing.T) {
 	if len(r.audit) != 0 {
 		t.Fatalf("audit events for a server that never held the lease in this run: %v", r.audit)
 	}
-	if _, err := os.Stat(filepath.Join(dir, FencedMarker)); err == nil {
+	if _, err := os.Stat(filepath.Join(dir, "fenced.1")); err == nil {
 		t.Fatal("a fence marker was written for an instance that was never started")
 	}
 	if i := m.Info(); len(i) != 1 || i[0].State != StateNone || !i[0].Enforced {
@@ -84,7 +84,7 @@ func TestColdStartWithoutAMajorityStartsNothingAndFencesNothing(t *testing.T) {
 	if !m.Holds(1) {
 		t.Fatal("the lease must be held")
 	}
-	if err := Gate(dir)(1); err != nil {
+	if err := Gate(dir, testPrimary)(1); err != nil {
 		t.Fatalf("the gate must open once the instance was started: %v", err)
 	}
 	r.clk.Advance(2 * time.Second)
@@ -111,7 +111,7 @@ func TestRunningInstanceIsKeptAcrossARestartOfTheManager(t *testing.T) {
 	if waiting {
 		t.Fatal("a running instance must not wait")
 	}
-	if err := Gate(filepath.Join(r.dir, "lease"))(1); err != nil {
+	if err := Gate(filepath.Join(r.dir, "lease"), testPrimary)(1); err != nil {
 		t.Fatal("the gate must be open for a running instance")
 	}
 	r.clk.Advance(dur * 2) // a long time before the first round has finished
@@ -134,18 +134,18 @@ func TestRunningInstanceIsKeptAcrossARestartOfTheManager(t *testing.T) {
 // server's own lease.
 func TestGateNeverHoldsBackAStandby(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := PrepareStart(dir, true); err != nil {
+	if _, err := PrepareStart(dir, func(int32) bool { return true }); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{FencedMarker, WaitMarker} {
+	for _, name := range []string{FencedMarker + ".1", WaitMarker + ".1"} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := Gate(dir)(1); err == nil {
+	if err := Gate(dir, testPrimary)(1); err == nil {
 		t.Fatal("the primary must be held back")
 	}
-	if err := Gate(dir)(instance.StandbyBaseID + 2); err != nil {
+	if err := Gate(dir, testPrimary)(instance.StandbyBaseID + 2); err != nil {
 		t.Fatalf("a standby must not be held back: %v", err)
 	}
 }
@@ -169,7 +169,7 @@ func TestOperatorStoppedInstanceIsNotStartedOnAcquisition(t *testing.T) {
 	if up, stops, starts := r.inst.state(); up || starts != 0 || stops != 0 {
 		t.Fatalf("running=%v stops=%d starts=%d: an instance stopped on purpose stays stopped", up, stops, starts)
 	}
-	if Waiting(filepath.Join(r.dir, "lease")) {
+	if Waiting(filepath.Join(r.dir, "lease"), 1) {
 		t.Fatal("an operator's stop must not create a marker")
 	}
 }
@@ -185,7 +185,7 @@ func TestNotEnforcedGroupStartsAtOnceAndBehavesAsBefore(t *testing.T) {
 	if waiting {
 		t.Fatal("a group that is not enforced must not wait")
 	}
-	if err := Gate(filepath.Join(r.dir, "lease"))(1); err != nil {
+	if err := Gate(filepath.Join(r.dir, "lease"), testPrimary)(1); err != nil {
 		t.Fatalf("the gate must let kingresd start the instance at once: %v", err)
 	}
 	r.inst.mu.Lock()
@@ -221,7 +221,7 @@ func TestEnforcedRecordFollowsTheManager(t *testing.T) {
 	if got := readEnforced(dir).Groups; len(got) != 0 {
 		t.Fatalf("a group that is no longer enforced must leave the record: %v", got)
 	}
-	if w, err := PrepareStart(dir, false); err != nil || w {
+	if w, err := PrepareStart(dir, func(int32) bool { return false }); err != nil || w {
 		t.Fatalf("no enforced group: no waiting (%v, %v)", w, err)
 	}
 }
@@ -235,13 +235,13 @@ func TestFailedStartAfterAcquisitionIsRetried(t *testing.T) {
 	m.c.Instance = &failingStart{fakeInstance: r.inst, left: 1}
 	m.Renew(ctx)
 	m.wg.Wait()
-	if !Waiting(filepath.Join(r.dir, "lease")) {
+	if !Waiting(filepath.Join(r.dir, "lease"), 1) {
 		t.Fatal("a failed start must keep the marker")
 	}
 	r.clk.Advance(2 * time.Second)
 	m.Renew(ctx)
 	m.wg.Wait()
-	if up, _, _ := r.inst.state(); !up || Waiting(filepath.Join(r.dir, "lease")) {
+	if up, _, _ := r.inst.state(); !up || Waiting(filepath.Join(r.dir, "lease"), 1) {
 		t.Fatal("the next round must start the instance")
 	}
 }
@@ -258,3 +258,7 @@ func (f *failingStart) Start(ctx context.Context) error {
 	}
 	return f.fakeInstance.Start(ctx)
 }
+
+// testPrimary is the layout of the tests: the instances from 100 up are standbys, the others
+// are primaries of group 1.
+func testPrimary(id int) (int32, bool) { return 1, id < instance.StandbyBaseID }

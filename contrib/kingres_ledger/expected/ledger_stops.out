@@ -1,0 +1,1020 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+--
+-- ledger_stops: the second invariant (L11-01 to L11-05).  A role that is not a
+-- superuser cannot stop the block builder or the capture of rows for longer
+-- than one of its own statements runs, and cannot remove the ledger or the
+-- protection of a ledger table.  This test runs the roles that have everything
+-- but the attribute (a member of the owner role with INHERIT and no SET,
+-- pg_maintain, pg_write_all_data), and the owner of an application table, against
+-- every statement that reaches a ledger object through a path that the statement
+-- does not name: a view, a cascade, a dependency.  The locks that a role would
+-- keep in a transaction are the concern of t/018_second_invariant.pl, which needs
+-- a second session; what this file shows is that each of those statements is
+-- refused or harmless, and the rule for the owner of a ledger table.
+-- Works in a database of its own.
+SET search_path = public;
+\set VERBOSITY terse
+SELECT current_database() AS orig_db \gset
+SELECT current_user AS owner_name \gset
+DROP DATABASE IF EXISTS kl_stops_t;
+NOTICE:  database "kl_stops_t" does not exist, skipping
+DROP DATABASE IF EXISTS kl_stops_e;
+NOTICE:  database "kl_stops_e" does not exist, skipping
+DROP ROLE IF EXISTS kl_s_inh;
+NOTICE:  role "kl_s_inh" does not exist, skipping
+DROP ROLE IF EXISTS kl_s_inh2;
+NOTICE:  role "kl_s_inh2" does not exist, skipping
+DROP ROLE IF EXISTS kl_s_maint;
+NOTICE:  role "kl_s_maint" does not exist, skipping
+DROP ROLE IF EXISTS kl_s_wad;
+NOTICE:  role "kl_s_wad" does not exist, skipping
+DROP ROLE IF EXISTS kl_s_app;
+NOTICE:  role "kl_s_app" does not exist, skipping
+DROP ROLE IF EXISTS kl_s_aud;
+NOTICE:  role "kl_s_aud" does not exist, skipping
+CREATE ROLE kl_s_inh LOGIN;
+GRANT :"owner_name" TO kl_s_inh WITH INHERIT TRUE, SET FALSE;
+CREATE ROLE kl_s_inh2 LOGIN;
+GRANT :"owner_name" TO kl_s_inh2 WITH INHERIT TRUE, SET FALSE;
+CREATE ROLE kl_s_maint LOGIN IN ROLE pg_maintain;
+CREATE ROLE kl_s_wad LOGIN IN ROLE pg_write_all_data;
+CREATE ROLE kl_s_app LOGIN;
+CREATE ROLE kl_s_aud LOGIN;
+CREATE DATABASE kl_stops_t;
+\c kl_stops_t
+SET search_path = public;
+\set VERBOSITY terse
+CREATE EXTENSION kingres_ledger;
+GRANT USAGE ON SCHEMA kingres TO PUBLIC;
+GRANT CREATE ON SCHEMA public TO kl_s_inh, kl_s_inh2, kl_s_maint, kl_s_wad, kl_s_app, kl_s_aud;
+GRANT EXECUTE ON FUNCTION kingres.ledger_build_block(), kingres.ledger_generate_digest() TO kl_s_aud;
+CREATE TABLE docs (id int PRIMARY KEY, body text);
+ALTER TABLE docs OWNER TO kl_s_app;
+CREATE TABLE upd (id int PRIMARY KEY, body text);
+ALTER TABLE upd OWNER TO kl_s_app;
+CREATE TABLE plain (id int PRIMARY KEY);
+GRANT ALL ON plain TO PUBLIC;
+SELECT kingres.ledger_enable('docs');
+ ledger_enable 
+---------------
+ 
+(1 row)
+
+SELECT kingres.ledger_enable('upd', 'updatable');
+ ledger_enable 
+---------------
+ 
+(1 row)
+
+GRANT SELECT ON docs TO PUBLIC;
+GRANT kl_s_aud TO kl_s_app;
+INSERT INTO docs VALUES (1, 'a'), (2, 'b');
+INSERT INTO upd VALUES (1, 'a');
+SELECT kingres.ledger_build_block() AS block;
+ block 
+-------
+     0
+(1 row)
+
+SELECT count(*) AS findings FROM kingres.ledger_verify();
+ findings 
+----------
+        0
+(1 row)
+
+CREATE TABLE s_results (ord serial, who text, form text, outcome text);
+GRANT ALL ON s_results TO PUBLIC;
+GRANT ALL ON SEQUENCE s_results_ord_seq TO PUBLIC;
+-- A statement of the caller, tried inside a block that undoes it; the outcome is
+-- "ran" or the SQLSTATE of its error (KL002 is the protection, KL001 the
+-- append-only error, 42501 a privilege).
+CREATE FUNCTION public.s_try(who text, form text, stmt text) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE res text;
+BEGIN
+    BEGIN
+        EXECUTE stmt;
+        RAISE EXCEPTION 'undo' USING ERRCODE = 'U0001';
+    EXCEPTION
+        WHEN SQLSTATE 'U0001' THEN res := 'ran';
+        WHEN OTHERS THEN res := SQLSTATE;
+    END;
+    INSERT INTO public.s_results (who, form, outcome) VALUES (who, form, res);
+END $$;
+GRANT EXECUTE ON FUNCTION public.s_try(text, text, text) TO PUBLIC;
+--------------------------------------------------------------------------
+-- L11-01: a lock reaches a ledger table through a view
+--------------------------------------------------------------------------
+-- The views are made by the roles themselves (the lock is taken with the
+-- privileges of the view's owner), and are views over a ledger table, over a
+-- view, with a subquery, with a join, and over the status view.
+\c - kl_s_maint
+SET search_path = public;
+CREATE VIEW v_blocks AS SELECT * FROM kingres.ledger_blocks;
+CREATE VIEW v_pend AS SELECT * FROM kingres.ledger_pending;
+CREATE VIEW vv_pend AS SELECT * FROM v_pend;
+CREATE VIEW vvv_pend AS SELECT * FROM vv_pend;
+CREATE VIEW v_sub AS SELECT id FROM docs WHERE id IN (SELECT height FROM kingres.ledger_blocks);
+CREATE VIEW v_join AS SELECT d.id FROM docs d JOIN kingres.ledger_tx t ON t.tx_index = d.id;
+CREATE VIEW v_status AS SELECT * FROM kingres.ledger_status;
+CREATE VIEW v_cte AS WITH c AS (SELECT * FROM kingres.ledger_entry) SELECT count(*) FROM c;
+CREATE VIEW v_user AS SELECT * FROM docs;
+CREATE VIEW v_harmless AS SELECT * FROM plain;
+\c - kl_s_wad
+SET search_path = public;
+CREATE VIEW w_blocks AS SELECT * FROM kingres.ledger_blocks;
+CREATE VIEW w_pend AS SELECT * FROM kingres.ledger_pending;
+CREATE VIEW ww_pend AS SELECT * FROM w_pend;
+CREATE VIEW w_user AS SELECT * FROM docs;
+CREATE VIEW w_harmless AS SELECT * FROM plain;
+\c - :owner_name
+SET search_path = public;
+CREATE FUNCTION public.s_run_locks() RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    r text := CASE current_user WHEN 'kl_s_maint' THEN 'pg_maintain' ELSE 'pg_write_all_data' END;
+    v text;
+    m text;
+BEGIN
+    PERFORM public.s_try(r, 'direct: lock ledger_blocks access exclusive', 'LOCK TABLE kingres.ledger_blocks IN ACCESS EXCLUSIVE MODE');
+    PERFORM public.s_try(r, 'direct: lock ledger_pending row exclusive', 'LOCK TABLE kingres.ledger_pending IN ROW EXCLUSIVE MODE');
+    PERFORM public.s_try(r, 'direct: lock ledger_blocks access share', 'LOCK TABLE kingres.ledger_blocks IN ACCESS SHARE MODE');
+    FOREACH v IN ARRAY CASE current_user
+        WHEN 'kl_s_maint' THEN ARRAY['v_blocks', 'v_pend', 'vv_pend', 'vvv_pend', 'v_sub', 'v_join', 'v_status', 'v_cte']
+        ELSE ARRAY['w_blocks', 'w_pend', 'ww_pend'] END
+    LOOP
+        FOREACH m IN ARRAY ARRAY['ACCESS EXCLUSIVE', 'EXCLUSIVE', 'SHARE ROW EXCLUSIVE', 'SHARE', 'ROW EXCLUSIVE', 'ROW SHARE']
+        LOOP
+            PERFORM public.s_try(r, 'view ' || v || ': lock ' || lower(m), format('LOCK TABLE %I IN %s MODE', v, m));
+        END LOOP;
+        PERFORM public.s_try(r, 'view ' || v || ': lock only, access exclusive', format('LOCK TABLE ONLY %I IN ACCESS EXCLUSIVE MODE', v));
+        PERFORM public.s_try(r, 'view ' || v || ': lock access share', format('LOCK TABLE %I IN ACCESS SHARE MODE', v));
+        PERFORM public.s_try(r, 'view ' || v || ': lock among others', format('LOCK TABLE plain, %I IN ACCESS EXCLUSIVE MODE', v));
+    END LOOP;
+    PERFORM public.s_try(r, 'view of a user table: lock access exclusive',
+                         format('LOCK TABLE %I IN ACCESS EXCLUSIVE MODE', CASE current_user WHEN 'kl_s_maint' THEN 'v_user' ELSE 'w_user' END));
+    PERFORM public.s_try(r, 'view of an ordinary table: lock access exclusive',
+                         format('LOCK TABLE %I IN ACCESS EXCLUSIVE MODE', CASE current_user WHEN 'kl_s_maint' THEN 'v_harmless' ELSE 'w_harmless' END));
+    PERFORM public.s_try(r, 'ordinary table: lock access exclusive', 'LOCK TABLE plain IN ACCESS EXCLUSIVE MODE');
+    -- Row locks, through a view and through a cursor.
+    FOREACH m IN ARRAY ARRAY['UPDATE', 'NO KEY UPDATE', 'SHARE', 'KEY SHARE']
+    LOOP
+        PERFORM public.s_try(r, 'direct: select for ' || lower(m), format('SELECT * FROM kingres.ledger_pending FOR %s', m));
+        PERFORM public.s_try(r, 'view: select for ' || lower(m),
+                             format('SELECT * FROM %I FOR %s', CASE current_user WHEN 'kl_s_maint' THEN 'vv_pend' ELSE 'ww_pend' END, m));
+    END LOOP;
+    PERFORM public.s_try(r, 'cursor over a view: for update',
+                         format('DECLARE c CURSOR FOR SELECT * FROM %I FOR UPDATE', CASE current_user WHEN 'kl_s_maint' THEN 'vv_pend' ELSE 'ww_pend' END));
+    -- ALTER of a view locks the view, not what it reads.
+    PERFORM public.s_try(r, 'alter view: set a security barrier',
+                         format('ALTER VIEW %I SET (security_barrier = true)', CASE current_user WHEN 'kl_s_maint' THEN 'v_blocks' ELSE 'w_blocks' END));
+    PERFORM public.s_try(r, 'alter table of a view: rename',
+                         format('ALTER TABLE %I RENAME TO %I', CASE current_user WHEN 'kl_s_maint' THEN 'v_blocks' ELSE 'w_blocks' END, 'zz_renamed'));
+    -- Maintenance as a statement of its own is honest; the others are refused in a block.
+    PERFORM public.s_try(r, 'analyze ledger_blocks', 'ANALYZE kingres.ledger_blocks');
+    PERFORM public.s_try(r, 'reindex ledger_blocks in a function', 'REINDEX TABLE kingres.ledger_blocks');
+    PERFORM public.s_try(r, 'cluster ledger_blocks in a function', 'CLUSTER kingres.ledger_blocks USING ledger_blocks_pkey');
+END $$;
+\c - kl_s_maint
+SET search_path = public;
+SELECT public.s_run_locks();
+ s_run_locks 
+-------------
+ 
+(1 row)
+
+\c - kl_s_wad
+SET search_path = public;
+SELECT public.s_run_locks();
+WARNING:  permission denied to analyze "ledger_blocks", skipping it
+ s_run_locks 
+-------------
+ 
+(1 row)
+
+\c - :owner_name
+SET search_path = public;
+SELECT who, form, outcome FROM s_results ORDER BY ord;
+        who        |                       form                       | outcome 
+-------------------+--------------------------------------------------+---------
+ pg_maintain       | direct: lock ledger_blocks access exclusive      | KL002
+ pg_maintain       | direct: lock ledger_pending row exclusive        | KL002
+ pg_maintain       | direct: lock ledger_blocks access share          | ran
+ pg_maintain       | view v_blocks: lock access exclusive             | KL002
+ pg_maintain       | view v_blocks: lock exclusive                    | KL002
+ pg_maintain       | view v_blocks: lock share row exclusive          | KL002
+ pg_maintain       | view v_blocks: lock share                        | KL002
+ pg_maintain       | view v_blocks: lock row exclusive                | KL002
+ pg_maintain       | view v_blocks: lock row share                    | KL002
+ pg_maintain       | view v_blocks: lock only, access exclusive       | KL002
+ pg_maintain       | view v_blocks: lock access share                 | ran
+ pg_maintain       | view v_blocks: lock among others                 | KL002
+ pg_maintain       | view v_pend: lock access exclusive               | KL002
+ pg_maintain       | view v_pend: lock exclusive                      | KL002
+ pg_maintain       | view v_pend: lock share row exclusive            | KL002
+ pg_maintain       | view v_pend: lock share                          | KL002
+ pg_maintain       | view v_pend: lock row exclusive                  | KL002
+ pg_maintain       | view v_pend: lock row share                      | KL002
+ pg_maintain       | view v_pend: lock only, access exclusive         | KL002
+ pg_maintain       | view v_pend: lock access share                   | ran
+ pg_maintain       | view v_pend: lock among others                   | KL002
+ pg_maintain       | view vv_pend: lock access exclusive              | KL002
+ pg_maintain       | view vv_pend: lock exclusive                     | KL002
+ pg_maintain       | view vv_pend: lock share row exclusive           | KL002
+ pg_maintain       | view vv_pend: lock share                         | KL002
+ pg_maintain       | view vv_pend: lock row exclusive                 | KL002
+ pg_maintain       | view vv_pend: lock row share                     | KL002
+ pg_maintain       | view vv_pend: lock only, access exclusive        | KL002
+ pg_maintain       | view vv_pend: lock access share                  | ran
+ pg_maintain       | view vv_pend: lock among others                  | KL002
+ pg_maintain       | view vvv_pend: lock access exclusive             | KL002
+ pg_maintain       | view vvv_pend: lock exclusive                    | KL002
+ pg_maintain       | view vvv_pend: lock share row exclusive          | KL002
+ pg_maintain       | view vvv_pend: lock share                        | KL002
+ pg_maintain       | view vvv_pend: lock row exclusive                | KL002
+ pg_maintain       | view vvv_pend: lock row share                    | KL002
+ pg_maintain       | view vvv_pend: lock only, access exclusive       | KL002
+ pg_maintain       | view vvv_pend: lock access share                 | ran
+ pg_maintain       | view vvv_pend: lock among others                 | KL002
+ pg_maintain       | view v_sub: lock access exclusive                | KL002
+ pg_maintain       | view v_sub: lock exclusive                       | KL002
+ pg_maintain       | view v_sub: lock share row exclusive             | KL002
+ pg_maintain       | view v_sub: lock share                           | KL002
+ pg_maintain       | view v_sub: lock row exclusive                   | KL002
+ pg_maintain       | view v_sub: lock row share                       | KL002
+ pg_maintain       | view v_sub: lock only, access exclusive          | KL002
+ pg_maintain       | view v_sub: lock access share                    | ran
+ pg_maintain       | view v_sub: lock among others                    | KL002
+ pg_maintain       | view v_join: lock access exclusive               | KL002
+ pg_maintain       | view v_join: lock exclusive                      | KL002
+ pg_maintain       | view v_join: lock share row exclusive            | KL002
+ pg_maintain       | view v_join: lock share                          | KL002
+ pg_maintain       | view v_join: lock row exclusive                  | KL002
+ pg_maintain       | view v_join: lock row share                      | KL002
+ pg_maintain       | view v_join: lock only, access exclusive         | KL002
+ pg_maintain       | view v_join: lock access share                   | ran
+ pg_maintain       | view v_join: lock among others                   | KL002
+ pg_maintain       | view v_status: lock access exclusive             | KL002
+ pg_maintain       | view v_status: lock exclusive                    | KL002
+ pg_maintain       | view v_status: lock share row exclusive          | KL002
+ pg_maintain       | view v_status: lock share                        | KL002
+ pg_maintain       | view v_status: lock row exclusive                | KL002
+ pg_maintain       | view v_status: lock row share                    | KL002
+ pg_maintain       | view v_status: lock only, access exclusive       | KL002
+ pg_maintain       | view v_status: lock access share                 | ran
+ pg_maintain       | view v_status: lock among others                 | KL002
+ pg_maintain       | view v_cte: lock access exclusive                | KL002
+ pg_maintain       | view v_cte: lock exclusive                       | KL002
+ pg_maintain       | view v_cte: lock share row exclusive             | KL002
+ pg_maintain       | view v_cte: lock share                           | KL002
+ pg_maintain       | view v_cte: lock row exclusive                   | KL002
+ pg_maintain       | view v_cte: lock row share                       | KL002
+ pg_maintain       | view v_cte: lock only, access exclusive          | KL002
+ pg_maintain       | view v_cte: lock access share                    | ran
+ pg_maintain       | view v_cte: lock among others                    | KL002
+ pg_maintain       | view of a user table: lock access exclusive      | ran
+ pg_maintain       | view of an ordinary table: lock access exclusive | ran
+ pg_maintain       | ordinary table: lock access exclusive            | ran
+ pg_maintain       | direct: select for update                        | 42501
+ pg_maintain       | view: select for update                          | 42501
+ pg_maintain       | direct: select for no key update                 | 42501
+ pg_maintain       | view: select for no key update                   | 42501
+ pg_maintain       | direct: select for share                         | 42501
+ pg_maintain       | view: select for share                           | 42501
+ pg_maintain       | direct: select for key share                     | 42501
+ pg_maintain       | view: select for key share                       | 42501
+ pg_maintain       | cursor over a view: for update                   | 42501
+ pg_maintain       | alter view: set a security barrier               | ran
+ pg_maintain       | alter table of a view: rename                    | ran
+ pg_maintain       | analyze ledger_blocks                            | ran
+ pg_maintain       | reindex ledger_blocks in a function              | 25001
+ pg_maintain       | cluster ledger_blocks in a function              | 25001
+ pg_write_all_data | direct: lock ledger_blocks access exclusive      | KL002
+ pg_write_all_data | direct: lock ledger_pending row exclusive        | KL002
+ pg_write_all_data | direct: lock ledger_blocks access share          | ran
+ pg_write_all_data | view w_blocks: lock access exclusive             | KL002
+ pg_write_all_data | view w_blocks: lock exclusive                    | KL002
+ pg_write_all_data | view w_blocks: lock share row exclusive          | KL002
+ pg_write_all_data | view w_blocks: lock share                        | KL002
+ pg_write_all_data | view w_blocks: lock row exclusive                | KL002
+ pg_write_all_data | view w_blocks: lock row share                    | KL002
+ pg_write_all_data | view w_blocks: lock only, access exclusive       | KL002
+ pg_write_all_data | view w_blocks: lock access share                 | ran
+ pg_write_all_data | view w_blocks: lock among others                 | KL002
+ pg_write_all_data | view w_pend: lock access exclusive               | KL002
+ pg_write_all_data | view w_pend: lock exclusive                      | KL002
+ pg_write_all_data | view w_pend: lock share row exclusive            | KL002
+ pg_write_all_data | view w_pend: lock share                          | KL002
+ pg_write_all_data | view w_pend: lock row exclusive                  | KL002
+ pg_write_all_data | view w_pend: lock row share                      | KL002
+ pg_write_all_data | view w_pend: lock only, access exclusive         | KL002
+ pg_write_all_data | view w_pend: lock access share                   | ran
+ pg_write_all_data | view w_pend: lock among others                   | KL002
+ pg_write_all_data | view ww_pend: lock access exclusive              | KL002
+ pg_write_all_data | view ww_pend: lock exclusive                     | KL002
+ pg_write_all_data | view ww_pend: lock share row exclusive           | KL002
+ pg_write_all_data | view ww_pend: lock share                         | KL002
+ pg_write_all_data | view ww_pend: lock row exclusive                 | KL002
+ pg_write_all_data | view ww_pend: lock row share                     | KL002
+ pg_write_all_data | view ww_pend: lock only, access exclusive        | KL002
+ pg_write_all_data | view ww_pend: lock access share                  | ran
+ pg_write_all_data | view ww_pend: lock among others                  | KL002
+ pg_write_all_data | view of a user table: lock access exclusive      | ran
+ pg_write_all_data | view of an ordinary table: lock access exclusive | ran
+ pg_write_all_data | ordinary table: lock access exclusive            | ran
+ pg_write_all_data | direct: select for update                        | 42501
+ pg_write_all_data | view: select for update                          | 42501
+ pg_write_all_data | direct: select for no key update                 | 42501
+ pg_write_all_data | view: select for no key update                   | 42501
+ pg_write_all_data | direct: select for share                         | 42501
+ pg_write_all_data | view: select for share                           | 42501
+ pg_write_all_data | direct: select for key share                     | 42501
+ pg_write_all_data | view: select for key share                       | 42501
+ pg_write_all_data | cursor over a view: for update                   | 42501
+ pg_write_all_data | alter view: set a security barrier               | ran
+ pg_write_all_data | alter table of a view: rename                    | ran
+ pg_write_all_data | analyze ledger_blocks                            | ran
+ pg_write_all_data | reindex ledger_blocks in a function              | 25001
+ pg_write_all_data | cluster ledger_blocks in a function              | 25001
+(139 rows)
+
+TRUNCATE s_results;
+--------------------------------------------------------------------------
+-- L11-02: the ledger is dropped through something it depends on
+--------------------------------------------------------------------------
+-- Every statement below is run by the owner role's inheriting member (not a
+-- superuser) and by a superuser; each is undone if it ran.  Afterwards the
+-- extension, its tables and the capture triggers are all there.
+CREATE FUNCTION public.s_run_drops() RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    r text := CASE WHEN (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) THEN 'superuser' ELSE 'inheriting member' END;
+BEGIN
+    PERFORM public.s_try(r, 'drop extension kingres_ledger', 'DROP EXTENSION kingres_ledger');
+    PERFORM public.s_try(r, 'drop extension kingres_ledger cascade', 'DROP EXTENSION kingres_ledger CASCADE');
+    PERFORM public.s_try(r, 'drop extension plpgsql cascade', 'DROP EXTENSION plpgsql CASCADE');
+    PERFORM public.s_try(r, 'drop language plpgsql cascade', 'DROP LANGUAGE plpgsql CASCADE');
+    PERFORM public.s_try(r, 'drop schema kingres cascade', 'DROP SCHEMA kingres CASCADE');
+    PERFORM public.s_try(r, 'drop schema public cascade', 'DROP SCHEMA public CASCADE');
+    PERFORM public.s_try(r, 'drop owned by the owner role', format('DROP OWNED BY %I', current_setting('kl.owner')));
+    PERFORM public.s_try(r, 'drop owned by the owner of a ledger table', 'DROP OWNED BY kl_s_app');
+    PERFORM public.s_try(r, 'drop table kingres.ledger_blocks cascade', 'DROP TABLE kingres.ledger_blocks CASCADE');
+    PERFORM public.s_try(r, 'drop table docs cascade', 'DROP TABLE docs CASCADE');
+    PERFORM public.s_try(r, 'drop view ledger_status', 'DROP VIEW kingres.ledger_status');
+    PERFORM public.s_try(r, 'drop function ledger_capture cascade', 'DROP FUNCTION kingres.ledger_capture() CASCADE');
+    PERFORM public.s_try(r, 'drop function ledger_guard cascade', 'DROP FUNCTION kingres.ledger_guard() CASCADE');
+    PERFORM public.s_try(r, 'drop event trigger', 'DROP EVENT TRIGGER kingres_ledger_guard_end');
+    PERFORM public.s_try(r, 'drop trigger capture', 'DROP TRIGGER kingres_ledger_capture ON docs');
+    PERFORM public.s_try(r, 'alter extension drop table', 'ALTER EXTENSION kingres_ledger DROP TABLE kingres.ledger_chain');
+    PERFORM public.s_try(r, 'alter extension drop function', 'ALTER EXTENSION kingres_ledger DROP FUNCTION kingres.ledger_capture()');
+    PERFORM public.s_try(r, 'alter extension add table', 'ALTER EXTENSION kingres_ledger ADD TABLE plain');
+    PERFORM public.s_try(r, 'alter extension set schema', 'ALTER EXTENSION kingres_ledger SET SCHEMA public');
+    PERFORM public.s_try(r, 'function depends on extension', 'ALTER FUNCTION kingres.ledger_capture() DEPENDS ON EXTENSION plpgsql');
+    PERFORM public.s_try(r, 'capture trigger depends on extension', 'ALTER TRIGGER kingres_ledger_capture ON docs DEPENDS ON EXTENSION plpgsql');
+    PERFORM public.s_try(r, 'catalog trigger depends on extension', 'ALTER TRIGGER kingres_ledger_block_modify ON kingres.ledger_blocks DEPENDS ON EXTENSION plpgsql');
+    PERFORM public.s_try(r, 'create a trigger of its own with the capture function', 'CREATE TRIGGER s_t AFTER INSERT ON plain FOR EACH ROW EXECUTE FUNCTION kingres.ledger_capture(''1'')');
+    PERFORM public.s_try(r, 'alter event trigger disable', 'ALTER EVENT TRIGGER kingres_ledger_guard_drop DISABLE');
+    PERFORM public.s_try(r, 'alter event trigger owner', 'ALTER EVENT TRIGGER kingres_ledger_guard_end OWNER TO kl_s_inh');
+    PERFORM public.s_try(r, 'alter function owner', 'ALTER FUNCTION kingres.ledger_capture() OWNER TO kl_s_inh');
+    PERFORM public.s_try(r, 'alter function set schema', 'ALTER FUNCTION kingres.ledger_capture() SET SCHEMA public');
+    PERFORM public.s_try(r, 'alter table owner (catalog)', 'ALTER TABLE kingres.ledger_chain OWNER TO kl_s_inh');
+    PERFORM public.s_try(r, 'alter table set schema (catalog)', 'ALTER TABLE kingres.ledger_chain SET SCHEMA public');
+    PERFORM public.s_try(r, 'reassign owned', 'REASSIGN OWNED BY kl_s_app TO kl_s_inh');
+    PERFORM public.s_try(r, 'create table inheriting a catalog table', 'CREATE TABLE s_child () INHERITS (kingres.ledger_blocks)');
+    PERFORM public.s_try(r, 'create a rule on a catalog table', 'CREATE RULE s_r AS ON INSERT TO kingres.ledger_blocks DO INSTEAD NOTHING');
+    PERFORM public.s_try(r, 'create a policy on a catalog table', 'CREATE POLICY s_p ON kingres.ledger_blocks USING (true)');
+    PERFORM public.s_try(r, 'truncate a catalog table', 'TRUNCATE kingres.ledger_blocks');
+    PERFORM public.s_try(r, 'truncate a catalog table cascade', 'TRUNCATE kingres.ledger_blocks CASCADE');
+    PERFORM public.s_try(r, 'truncate a ledger table', 'TRUNCATE docs');
+    PERFORM public.s_try(r, 'foreign key to the queue (create table)', 'CREATE TABLE s_fk (x bigint REFERENCES kingres.ledger_pending (ledger_txid))');
+    PERFORM public.s_try(r, 'foreign key to the blocks (table constraint)', 'CREATE TABLE s_fk (x bigint, FOREIGN KEY (x) REFERENCES kingres.ledger_blocks (height))');
+    PERFORM public.s_try(r, 'foreign key to the blocks (add constraint)', 'CREATE TABLE s_fk (x bigint); ALTER TABLE s_fk ADD FOREIGN KEY (x) REFERENCES kingres.ledger_blocks (height)');
+    PERFORM public.s_try(r, 'foreign key to the blocks (add column)', 'CREATE TABLE s_fk (y int); ALTER TABLE s_fk ADD COLUMN x bigint REFERENCES kingres.ledger_blocks (height)');
+    PERFORM public.s_try(r, 'foreign key to the chain (named constraint)', 'CREATE TABLE s_fk (x bytea CONSTRAINT s_c REFERENCES kingres.ledger_chain (chain_id))');
+    PERFORM public.s_try(r, 'foreign key to an ordinary table', 'CREATE TABLE s_fk (x int REFERENCES plain (id))');
+END $$;
+SELECT set_config('kl.owner', :'owner_name', false) \gset
+\c - kl_s_inh
+SET search_path = public;
+SELECT set_config('kl.owner', :'owner_name', false) \gset
+SELECT public.s_run_drops();
+NOTICE:  drop cascades to 23 other objects
+ s_run_drops 
+-------------
+ 
+(1 row)
+
+\c - :owner_name
+SET search_path = public;
+SELECT set_config('kl.owner', :'owner_name', false) \gset
+SELECT public.s_run_drops();
+NOTICE:  drop cascades to 23 other objects
+ s_run_drops 
+-------------
+ 
+(1 row)
+
+SELECT who, form, outcome FROM s_results ORDER BY ord;
+        who        |                         form                          | outcome 
+-------------------+-------------------------------------------------------+---------
+ inheriting member | drop extension kingres_ledger                         | KL002
+ inheriting member | drop extension kingres_ledger cascade                 | KL002
+ inheriting member | drop extension plpgsql cascade                        | KL002
+ inheriting member | drop language plpgsql cascade                         | 2BP01
+ inheriting member | drop schema kingres cascade                           | KL002
+ inheriting member | drop schema public cascade                            | KL002
+ inheriting member | drop owned by the owner role                          | KL002
+ inheriting member | drop owned by the owner of a ledger table             | KL002
+ inheriting member | drop table kingres.ledger_blocks cascade              | KL002
+ inheriting member | drop table docs cascade                               | KL002
+ inheriting member | drop view ledger_status                               | KL002
+ inheriting member | drop function ledger_capture cascade                  | 2BP01
+ inheriting member | drop function ledger_guard cascade                    | 2BP01
+ inheriting member | drop event trigger                                    | 2BP01
+ inheriting member | drop trigger capture                                  | KL002
+ inheriting member | alter extension drop table                            | KL002
+ inheriting member | alter extension drop function                         | KL002
+ inheriting member | alter extension add table                             | KL002
+ inheriting member | alter extension set schema                            | KL002
+ inheriting member | function depends on extension                         | KL002
+ inheriting member | capture trigger depends on extension                  | KL002
+ inheriting member | catalog trigger depends on extension                  | KL002
+ inheriting member | create a trigger of its own with the capture function | ran
+ inheriting member | alter event trigger disable                           | KL002
+ inheriting member | alter event trigger owner                             | KL002
+ inheriting member | alter function owner                                  | KL002
+ inheriting member | alter function set schema                             | KL002
+ inheriting member | alter table owner (catalog)                           | KL002
+ inheriting member | alter table set schema (catalog)                      | KL002
+ inheriting member | reassign owned                                        | 42501
+ inheriting member | create table inheriting a catalog table               | KL002
+ inheriting member | create a rule on a catalog table                      | KL002
+ inheriting member | create a policy on a catalog table                    | KL002
+ inheriting member | truncate a catalog table                              | KL001
+ inheriting member | truncate a catalog table cascade                      | KL001
+ inheriting member | truncate a ledger table                               | 42501
+ inheriting member | foreign key to the queue (create table)               | KL002
+ inheriting member | foreign key to the blocks (table constraint)          | KL002
+ inheriting member | foreign key to the blocks (add constraint)            | KL002
+ inheriting member | foreign key to the blocks (add column)                | KL002
+ inheriting member | foreign key to the chain (named constraint)           | KL002
+ inheriting member | foreign key to an ordinary table                      | ran
+ superuser         | drop extension kingres_ledger                         | KL002
+ superuser         | drop extension kingres_ledger cascade                 | KL002
+ superuser         | drop extension plpgsql cascade                        | KL002
+ superuser         | drop language plpgsql cascade                         | 2BP01
+ superuser         | drop schema kingres cascade                           | KL002
+ superuser         | drop schema public cascade                            | KL002
+ superuser         | drop owned by the owner role                          | KL002
+ superuser         | drop owned by the owner of a ledger table             | KL002
+ superuser         | drop table kingres.ledger_blocks cascade              | KL002
+ superuser         | drop table docs cascade                               | KL002
+ superuser         | drop view ledger_status                               | KL002
+ superuser         | drop function ledger_capture cascade                  | 2BP01
+ superuser         | drop function ledger_guard cascade                    | 2BP01
+ superuser         | drop event trigger                                    | 2BP01
+ superuser         | drop trigger capture                                  | KL002
+ superuser         | alter extension drop table                            | KL002
+ superuser         | alter extension drop function                         | KL002
+ superuser         | alter extension add table                             | KL002
+ superuser         | alter extension set schema                            | KL002
+ superuser         | function depends on extension                         | KL002
+ superuser         | capture trigger depends on extension                  | KL002
+ superuser         | catalog trigger depends on extension                  | KL002
+ superuser         | create a trigger of its own with the capture function | ran
+ superuser         | alter event trigger disable                           | KL002
+ superuser         | alter event trigger owner                             | KL002
+ superuser         | alter function owner                                  | KL002
+ superuser         | alter function set schema                             | KL002
+ superuser         | alter table owner (catalog)                           | KL002
+ superuser         | alter table set schema (catalog)                      | KL002
+ superuser         | reassign owned                                        | ran
+ superuser         | create table inheriting a catalog table               | KL002
+ superuser         | create a rule on a catalog table                      | KL002
+ superuser         | create a policy on a catalog table                    | KL002
+ superuser         | truncate a catalog table                              | KL001
+ superuser         | truncate a catalog table cascade                      | KL001
+ superuser         | truncate a ledger table                               | KL001
+ superuser         | foreign key to the queue (create table)               | KL002
+ superuser         | foreign key to the blocks (table constraint)          | KL002
+ superuser         | foreign key to the blocks (add constraint)            | KL002
+ superuser         | foreign key to the blocks (add column)                | KL002
+ superuser         | foreign key to the chain (named constraint)           | KL002
+ superuser         | foreign key to an ordinary table                      | ran
+(84 rows)
+
+TRUNCATE s_results;
+SELECT (SELECT count(*) FROM pg_extension WHERE extname = 'kingres_ledger') AS extensions,
+       (SELECT count(*) FROM pg_class WHERE relnamespace = 'kingres'::regnamespace AND relname LIKE 'ledger!_%' ESCAPE '!' AND relkind = 'r') AS catalog_tables,
+       (SELECT count(*) FROM pg_trigger WHERE tgname = 'kingres_ledger_capture' AND NOT tgisinternal) AS capture_triggers,
+       (SELECT count(*) FROM pg_event_trigger) AS event_triggers;
+ extensions | catalog_tables | capture_triggers | event_triggers 
+------------+----------------+------------------+----------------
+          1 |              9 |                2 |              3
+(1 row)
+
+SELECT count(*) AS findings FROM kingres.ledger_verify();
+ findings 
+----------
+        0
+(1 row)
+
+-- The tables still refuse what they refused.
+SELECT kingres.ledger_enable('plain');
+ ledger_enable 
+---------------
+ 
+(1 row)
+
+UPDATE docs SET body = 'x' WHERE id = 1;
+ERROR:  table "docs" is an append-only ledger table
+DELETE FROM docs;
+ERROR:  table "docs" is an append-only ledger table
+-- A cascade that reaches nothing of the ledger is still an ordinary statement,
+-- and so is the drop of the extension when no table is under ledger control.
+CREATE DATABASE kl_stops_e;
+\c kl_stops_e
+SET search_path = public;
+CREATE EXTENSION kingres_ledger;
+DROP EXTENSION kingres_ledger;
+CREATE EXTENSION kingres_ledger;
+DROP EXTENSION plpgsql CASCADE;
+NOTICE:  drop cascades to extension kingres_ledger
+SELECT count(*) AS extensions_left FROM pg_extension WHERE extname IN ('kingres_ledger', 'plpgsql');
+ extensions_left 
+-----------------
+               0
+(1 row)
+
+\c kl_stops_t
+SET search_path = public;
+--------------------------------------------------------------------------
+-- The owner of a ledger table: one rule.  It may do to its table what changes
+-- neither what is recorded nor how it is recorded; it may not do what removes
+-- or weakens the capture, or changes a row that was hashed.
+--------------------------------------------------------------------------
+CREATE FUNCTION public.s_run_owner() RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    t text;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['docs', 'upd']
+    LOOP
+        -- what it may do
+        PERFORM public.s_try('owner', t || ': rename the table', format('ALTER TABLE %I RENAME TO %I', t, t || '_r'));
+        PERFORM public.s_try('owner', t || ': add a nullable column', format('ALTER TABLE %I ADD COLUMN n int', t));
+        PERFORM public.s_try('owner', t || ': set a default', format('ALTER TABLE %I ALTER COLUMN body SET DEFAULT ''d''', t));
+        PERFORM public.s_try('owner', t || ': set not null', format('ALTER TABLE %I ALTER COLUMN body SET NOT NULL', t));
+        PERFORM public.s_try('owner', t || ': add a check constraint', format('ALTER TABLE %I ADD CONSTRAINT s_chk CHECK (id > 0)', t));
+        PERFORM public.s_try('owner', t || ': add a foreign key to an ordinary table', format('ALTER TABLE %I ADD FOREIGN KEY (id) REFERENCES plain (id) NOT VALID', t));
+        PERFORM public.s_try('owner', t || ': drop its primary key', format('ALTER TABLE %I DROP CONSTRAINT %I', t, t || '_pkey'));
+        PERFORM public.s_try('owner', t || ': create an index', format('CREATE INDEX s_i ON %I (body)', t));
+        PERFORM public.s_try('owner', t || ': drop an index', format('CREATE INDEX s_i2 ON %I (body); DROP INDEX s_i2', t));
+        PERFORM public.s_try('owner', t || ': create its own trigger', format('CREATE TRIGGER s_trg AFTER INSERT ON %I FOR EACH ROW EXECUTE FUNCTION public.s_noop()', t));
+        PERFORM public.s_try('owner', t || ': enable row level security', format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t));
+        PERFORM public.s_try('owner', t || ': create a policy', format('CREATE POLICY s_pol ON %I USING (true)', t));
+        PERFORM public.s_try('owner', t || ': set a storage parameter', format('ALTER TABLE %I SET (fillfactor = 70)', t));
+        PERFORM public.s_try('owner', t || ': grant', format('GRANT SELECT ON %I TO PUBLIC', t));
+        PERFORM public.s_try('owner', t || ': lock it', format('LOCK TABLE %I IN ACCESS EXCLUSIVE MODE', t));
+        PERFORM public.s_try('owner', t || ': vacuum-class maintenance (analyze)', format('ANALYZE %I', t));
+        PERFORM public.s_try('owner', t || ': change the owner', format('ALTER TABLE %I OWNER TO kl_s_aud', t));
+        PERFORM public.s_try('owner', t || ': create a view over it', format('CREATE VIEW s_view_%s AS SELECT * FROM %I', t, t));
+        PERFORM public.s_try('owner', t || ': create a table that references it', format('CREATE TABLE s_ref (x int REFERENCES %I (id))', t));
+        -- what it may not do
+        PERFORM public.s_try('owner', t || ': drop the table', format('DROP TABLE %I', t));
+        PERFORM public.s_try('owner', t || ': drop the schema it is in', 'DROP SCHEMA public CASCADE');
+        PERFORM public.s_try('owner', t || ': drop its capture trigger', format('DROP TRIGGER kingres_ledger_capture ON %I', t));
+        PERFORM public.s_try('owner', t || ': disable its capture trigger', format('ALTER TABLE %I DISABLE TRIGGER kingres_ledger_capture', t));
+        PERFORM public.s_try('owner', t || ': disable all its triggers', format('ALTER TABLE %I DISABLE TRIGGER ALL', t));
+        PERFORM public.s_try('owner', t || ': disable user triggers', format('ALTER TABLE %I DISABLE TRIGGER USER', t));
+        PERFORM public.s_try('owner', t || ': enable its trigger for replicas only', format('ALTER TABLE %I ENABLE REPLICA TRIGGER kingres_ledger_capture', t));
+        PERFORM public.s_try('owner', t || ': rename its capture trigger', format('ALTER TRIGGER kingres_ledger_capture ON %I RENAME TO s_x', t));
+        PERFORM public.s_try('owner', t || ': replace its capture trigger', format('CREATE OR REPLACE TRIGGER kingres_ledger_capture AFTER INSERT ON %I FOR EACH ROW EXECUTE FUNCTION public.s_noop()', t));
+        PERFORM public.s_try('owner', t || ': make its trigger depend on an extension', format('ALTER TRIGGER kingres_ledger_capture ON %I DEPENDS ON EXTENSION plpgsql', t));
+        PERFORM public.s_try('owner', t || ': drop a column', format('ALTER TABLE %I DROP COLUMN body', t));
+        PERFORM public.s_try('owner', t || ': change a column type', format('ALTER TABLE %I ALTER COLUMN body TYPE varchar(5)', t));
+        PERFORM public.s_try('owner', t || ': rename a column', format('ALTER TABLE %I RENAME COLUMN body TO b', t));
+        PERFORM public.s_try('owner', t || ': add a column with a default', format('ALTER TABLE %I ADD COLUMN n int DEFAULT 0', t));
+        PERFORM public.s_try('owner', t || ': add a not null column', format('ALTER TABLE %I ADD COLUMN n int NOT NULL', t));
+        PERFORM public.s_try('owner', t || ': add a generated column', format('ALTER TABLE %I ADD COLUMN n int GENERATED ALWAYS AS (id) STORED', t));
+        PERFORM public.s_try('owner', t || ': set unlogged', format('ALTER TABLE %I SET UNLOGGED', t));
+        PERFORM public.s_try('owner', t || ': move to another schema', format('ALTER TABLE %I SET SCHEMA kingres', t));
+        PERFORM public.s_try('owner', t || ': create a rule', format('CREATE RULE s_rule AS ON INSERT TO %I DO INSTEAD NOTHING', t));
+        PERFORM public.s_try('owner', t || ': make a child of it', format('CREATE TABLE s_ch () INHERITS (%I)', t));
+        PERFORM public.s_try('owner', t || ': attach it as a partition', format('CREATE TABLE s_part (id int, body text) PARTITION BY RANGE (id); ALTER TABLE s_part ATTACH PARTITION %I FOR VALUES FROM (0) TO (100)', t));
+        PERFORM public.s_try('owner', t || ': truncate it', format('TRUNCATE %I', t));
+        PERFORM public.s_try('owner', t || ': set session_replication_role', 'SET session_replication_role = replica');
+        IF t = 'upd' THEN
+            PERFORM public.s_try('owner', t || ': drop its history table', 'DROP TABLE upd_ledger_history');
+        END IF;
+    END LOOP;
+END $$;
+CREATE FUNCTION public.s_noop() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
+GRANT EXECUTE ON FUNCTION public.s_noop() TO PUBLIC;
+\c - kl_s_app
+SET search_path = public;
+SELECT public.s_run_owner();
+ s_run_owner 
+-------------
+ 
+(1 row)
+
+\c - :owner_name
+SET search_path = public;
+SELECT who, form, outcome FROM s_results ORDER BY ord;
+  who  |                     form                      | outcome 
+-------+-----------------------------------------------+---------
+ owner | docs: rename the table                        | ran
+ owner | docs: add a nullable column                   | ran
+ owner | docs: set a default                           | ran
+ owner | docs: set not null                            | ran
+ owner | docs: add a check constraint                  | ran
+ owner | docs: add a foreign key to an ordinary table  | ran
+ owner | docs: drop its primary key                    | ran
+ owner | docs: create an index                         | ran
+ owner | docs: drop an index                           | ran
+ owner | docs: create its own trigger                  | ran
+ owner | docs: enable row level security               | ran
+ owner | docs: create a policy                         | ran
+ owner | docs: set a storage parameter                 | ran
+ owner | docs: grant                                   | ran
+ owner | docs: lock it                                 | ran
+ owner | docs: vacuum-class maintenance (analyze)      | ran
+ owner | docs: change the owner                        | ran
+ owner | docs: create a view over it                   | ran
+ owner | docs: create a table that references it       | ran
+ owner | docs: drop the table                          | KL002
+ owner | docs: drop the schema it is in                | KL002
+ owner | docs: drop its capture trigger                | KL002
+ owner | docs: disable its capture trigger             | KL002
+ owner | docs: disable all its triggers                | KL002
+ owner | docs: disable user triggers                   | KL002
+ owner | docs: enable its trigger for replicas only    | KL002
+ owner | docs: rename its capture trigger              | KL002
+ owner | docs: replace its capture trigger             | KL002
+ owner | docs: make its trigger depend on an extension | KL002
+ owner | docs: drop a column                           | KL002
+ owner | docs: change a column type                    | KL002
+ owner | docs: rename a column                         | KL002
+ owner | docs: add a column with a default             | KL002
+ owner | docs: add a not null column                   | KL002
+ owner | docs: add a generated column                  | KL002
+ owner | docs: set unlogged                            | KL002
+ owner | docs: move to another schema                  | KL002
+ owner | docs: create a rule                           | KL002
+ owner | docs: make a child of it                      | KL002
+ owner | docs: attach it as a partition                | KL002
+ owner | docs: truncate it                             | KL001
+ owner | docs: set session_replication_role            | 42501
+ owner | upd: rename the table                         | ran
+ owner | upd: add a nullable column                    | ran
+ owner | upd: set a default                            | ran
+ owner | upd: set not null                             | ran
+ owner | upd: add a check constraint                   | ran
+ owner | upd: add a foreign key to an ordinary table   | ran
+ owner | upd: drop its primary key                     | ran
+ owner | upd: create an index                          | ran
+ owner | upd: drop an index                            | ran
+ owner | upd: create its own trigger                   | ran
+ owner | upd: enable row level security                | ran
+ owner | upd: create a policy                          | ran
+ owner | upd: set a storage parameter                  | ran
+ owner | upd: grant                                    | ran
+ owner | upd: lock it                                  | ran
+ owner | upd: vacuum-class maintenance (analyze)       | ran
+ owner | upd: change the owner                         | ran
+ owner | upd: create a view over it                    | ran
+ owner | upd: create a table that references it        | ran
+ owner | upd: drop the table                           | KL002
+ owner | upd: drop the schema it is in                 | KL002
+ owner | upd: drop its capture trigger                 | KL002
+ owner | upd: disable its capture trigger              | KL002
+ owner | upd: disable all its triggers                 | KL002
+ owner | upd: disable user triggers                    | KL002
+ owner | upd: enable its trigger for replicas only     | KL002
+ owner | upd: rename its capture trigger               | KL002
+ owner | upd: replace its capture trigger              | KL002
+ owner | upd: make its trigger depend on an extension  | KL002
+ owner | upd: drop a column                            | KL002
+ owner | upd: change a column type                     | KL002
+ owner | upd: rename a column                          | KL002
+ owner | upd: add a column with a default              | KL002
+ owner | upd: add a not null column                    | KL002
+ owner | upd: add a generated column                   | KL002
+ owner | upd: set unlogged                             | KL002
+ owner | upd: move to another schema                   | KL002
+ owner | upd: create a rule                            | KL002
+ owner | upd: make a child of it                       | KL002
+ owner | upd: attach it as a partition                 | KL002
+ owner | upd: truncate it                              | KL001
+ owner | upd: set session_replication_role             | 42501
+ owner | upd: drop its history table                   | KL002
+(85 rows)
+
+TRUNCATE s_results;
+-- ...and the table captures what it wrote, whatever the owner did.
+SELECT count(*) AS findings FROM kingres.ledger_verify();
+ findings 
+----------
+        0
+(1 row)
+
+INSERT INTO docs VALUES (3, 'c');
+SELECT kingres.ledger_build_block() AS block;
+ block 
+-------
+     1
+(1 row)
+
+SELECT count(*) AS findings FROM kingres.ledger_verify();
+ findings 
+----------
+        0
+(1 row)
+
+--------------------------------------------------------------------------
+-- L11-05: the schema, its privileges and the registry's sequence
+--------------------------------------------------------------------------
+CREATE FUNCTION public.s_run_schema() RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    r text := CASE WHEN (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) THEN 'superuser' ELSE 'inheriting member' END;
+BEGIN
+    PERFORM public.s_try(r, 'revoke usage on schema kingres from public', 'REVOKE USAGE ON SCHEMA kingres FROM PUBLIC');
+    PERFORM public.s_try(r, 'grant create on schema kingres', 'GRANT CREATE ON SCHEMA kingres TO kl_s_app');
+    PERFORM public.s_try(r, 'alter schema kingres owner', 'ALTER SCHEMA kingres OWNER TO kl_s_app');
+    PERFORM public.s_try(r, 'alter schema kingres rename', 'ALTER SCHEMA kingres RENAME TO kingres_x');
+    PERFORM public.s_try(r, 'restart the registry sequence', 'ALTER SEQUENCE kingres.ledger_table_table_id_seq RESTART WITH 1');
+    PERFORM public.s_try(r, 'alter the registry sequence increment', 'ALTER SEQUENCE kingres.ledger_table_table_id_seq INCREMENT BY 5');
+    PERFORM public.s_try(r, 'alter the owner of the registry sequence', 'ALTER SEQUENCE kingres.ledger_table_table_id_seq OWNER TO kl_s_app');
+    PERFORM public.s_try(r, 'grant update on the registry sequence', 'GRANT UPDATE ON SEQUENCE kingres.ledger_table_table_id_seq TO kl_s_app');
+    PERFORM public.s_try(r, 'grant usage on all sequences of the schema', 'GRANT USAGE ON ALL SEQUENCES IN SCHEMA kingres TO kl_s_app');
+    PERFORM public.s_try(r, 'grant select on the registry sequence', 'GRANT SELECT ON SEQUENCE kingres.ledger_table_table_id_seq TO kl_s_app');
+    PERFORM public.s_try(r, 'create a function in the schema', 'CREATE FUNCTION kingres.s_f() RETURNS int LANGUAGE sql AS ''SELECT 1''');
+    PERFORM public.s_try(r, 'create a table in the schema', 'CREATE TABLE kingres.s_t (x int)');
+END $$;
+\c - kl_s_inh
+SET search_path = public;
+SELECT public.s_run_schema();
+ s_run_schema 
+--------------
+ 
+(1 row)
+
+\c - :owner_name
+SET search_path = public;
+SELECT public.s_run_schema();
+ s_run_schema 
+--------------
+ 
+(1 row)
+
+SELECT who, form, outcome FROM s_results ORDER BY ord;
+        who        |                    form                    | outcome 
+-------------------+--------------------------------------------+---------
+ inheriting member | revoke usage on schema kingres from public | KL002
+ inheriting member | grant create on schema kingres             | KL002
+ inheriting member | alter schema kingres owner                 | KL002
+ inheriting member | alter schema kingres rename                | KL002
+ inheriting member | restart the registry sequence              | KL002
+ inheriting member | alter the registry sequence increment      | KL002
+ inheriting member | alter the owner of the registry sequence   | KL002
+ inheriting member | grant update on the registry sequence      | KL002
+ inheriting member | grant usage on all sequences of the schema | KL002
+ inheriting member | grant select on the registry sequence      | ran
+ inheriting member | create a function in the schema            | ran
+ inheriting member | create a table in the schema               | ran
+ superuser         | revoke usage on schema kingres from public | ran
+ superuser         | grant create on schema kingres             | ran
+ superuser         | alter schema kingres owner                 | ran
+ superuser         | alter schema kingres rename                | KL002
+ superuser         | restart the registry sequence              | ran
+ superuser         | alter the registry sequence increment      | ran
+ superuser         | alter the owner of the registry sequence   | KL002
+ superuser         | grant update on the registry sequence      | KL002
+ superuser         | grant usage on all sequences of the schema | KL002
+ superuser         | grant select on the registry sequence      | ran
+ superuser         | create a function in the schema            | ran
+ superuser         | create a table in the schema               | ran
+(24 rows)
+
+TRUNCATE s_results;
+-- A sequence that is set back (setval is a function: nothing sees it) makes the
+-- next registration fail on the key of the registry; nothing collides, nothing
+-- is forged, and the table that was being enabled is not left half made.
+SELECT last_value AS seq_last FROM kingres.ledger_table_table_id_seq \gset
+\c - kl_s_inh
+SET search_path = public;
+SELECT setval('kingres.ledger_table_table_id_seq', 1) AS reset;
+ reset 
+-------
+     1
+(1 row)
+
+CREATE TABLE s_after (id int);
+\c - :owner_name
+SET search_path = public;
+SELECT kingres.ledger_enable('s_after');
+ERROR:  duplicate key value violates unique constraint "ledger_table_pkey"
+SELECT count(*) AS registered FROM kingres.ledger_table WHERE relid = 's_after'::regclass;
+ registered 
+------------
+          0
+(1 row)
+
+SELECT count(*) AS leftover_triggers FROM pg_trigger WHERE tgrelid = 's_after'::regclass;
+ leftover_triggers 
+-------------------
+                 0
+(1 row)
+
+SELECT setval('kingres.ledger_table_table_id_seq', :seq_last) AS restored;
+ restored 
+----------
+        3
+(1 row)
+
+SELECT kingres.ledger_enable('s_after');
+ ledger_enable 
+---------------
+ 
+(1 row)
+
+SELECT count(*) AS findings FROM kingres.ledger_verify();
+ findings 
+----------
+        0
+(1 row)
+
+--------------------------------------------------------------------------
+-- L11-03: what a role that may call a builder can hold
+--------------------------------------------------------------------------
+INSERT INTO docs VALUES (4, 'd');
+\c - kl_s_aud
+SET search_path = public;
+SELECT kingres.ledger_build_block() IS NOT NULL AS built_alone;
+ built_alone 
+-------------
+ t
+(1 row)
+
+BEGIN;
+SELECT kingres.ledger_build_block();
+ERROR:  ledger_build_block cannot run inside a transaction block for a role that is not a superuser
+ROLLBACK;
+BEGIN;
+SELECT kingres.ledger_generate_digest();
+ERROR:  ledger_generate_digest cannot run inside a transaction block for a role that is not a superuser
+ROLLBACK;
+BEGIN;
+SAVEPOINT s;
+SELECT kingres.ledger_generate_digest();
+ERROR:  ledger_generate_digest cannot run inside a transaction block for a role that is not a superuser
+ROLLBACK;
+SELECT kingres.ledger_generate_digest() IS NOT NULL AS digest_alone;
+ digest_alone 
+--------------
+ t
+(1 row)
+
+-- A function that calls the builder is one statement.
+CREATE FUNCTION public.s_build() RETURNS bigint LANGUAGE sql AS $$ SELECT kingres.ledger_build_block() $$;
+SELECT public.s_build() IS NULL AS built_in_a_function;
+ built_in_a_function 
+---------------------
+ t
+(1 row)
+
+\c - :owner_name
+SET search_path = public;
+-- A superuser may, as the worker does.
+BEGIN;
+SELECT kingres.ledger_build_block() IS NULL AS superuser_in_a_block;
+ superuser_in_a_block 
+----------------------
+ t
+(1 row)
+
+-- The lock is the one the builders wait on: a lock on the extension's own
+-- object, with the sub-object number that no statement uses, in EXCLUSIVE mode.
+SELECT l.mode, l.granted FROM pg_locks l
+ WHERE l.locktype = 'object' AND l.classid = 'pg_extension'::regclass
+   AND l.objsubid = 19276 AND l.pid = pg_backend_pid();
+     mode      | granted 
+---------------+---------
+ ExclusiveLock | t
+(1 row)
+
+ROLLBACK;
+--------------------------------------------------------------------------
+-- L11-04: the checks of ledger_register_table that no test could fail
+--------------------------------------------------------------------------
+-- A registration that is complete in every way but ownership: the table is made
+-- by hand by one member of the owner role (the identity was issued, the
+-- triggers are armed, capture last) and another member, who does not own it,
+-- asks for it to be registered.
+BEGIN; CREATE TABLE s_gap (id int); SELECT kingres.ledger_enable('s_gap') IS NULL AS enabled; ROLLBACK;
+ enabled 
+---------
+ f
+(1 row)
+
+SELECT last_value AS gap_id FROM kingres.ledger_table_table_id_seq \gset
+\c - kl_s_inh
+SET search_path = public;
+CREATE TABLE s_hand (id int);
+INSERT INTO s_hand VALUES (1);
+CREATE TRIGGER kingres_ledger_capture AFTER INSERT ON s_hand FOR EACH ROW EXECUTE FUNCTION kingres.ledger_capture(:'gap_id');
+CREATE TRIGGER kingres_ledger_block_modify BEFORE UPDATE OR DELETE ON s_hand FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify();
+CREATE TRIGGER kingres_ledger_block_truncate BEFORE TRUNCATE ON s_hand FOR EACH STATEMENT EXECUTE FUNCTION kingres.ledger_block_modify();
+ALTER TABLE s_hand ENABLE ALWAYS TRIGGER kingres_ledger_block_modify;
+ALTER TABLE s_hand ENABLE ALWAYS TRIGGER kingres_ledger_block_truncate;
+ALTER TABLE s_hand ENABLE ALWAYS TRIGGER kingres_ledger_capture;
+-- An unlogged table, made the same way: the check of the persistence gives its own answer.
+BEGIN;
+CREATE UNLOGGED TABLE s_unl (id int);
+CREATE TRIGGER kingres_ledger_capture AFTER INSERT ON s_unl FOR EACH ROW EXECUTE FUNCTION kingres.ledger_capture(:'gap_id');
+ALTER TABLE s_unl ENABLE ALWAYS TRIGGER kingres_ledger_capture;
+SELECT kingres.ledger_register_table('s_unl'::regclass);
+ERROR:  "s_unl" cannot be a ledger table
+ROLLBACK;
+\c - kl_s_inh2
+SET search_path = public;
+SELECT kingres.ledger_register_table('s_hand'::regclass);
+ERROR:  must be owner of table s_hand
+SELECT count(*) AS registered_by_the_other FROM kingres.ledger_table WHERE relid = 's_hand'::regclass;
+ registered_by_the_other 
+-------------------------
+                       0
+(1 row)
+
+\c - kl_s_inh
+SET search_path = public;
+SELECT kingres.ledger_register_table('s_hand'::regclass);
+ ledger_register_table 
+-----------------------
+ 
+(1 row)
+
+SELECT count(*) AS registered_by_the_owner, (SELECT count(*) FROM kingres.ledger_entry WHERE table_id = :gap_id) AS entries
+  FROM kingres.ledger_table WHERE relid = 's_hand'::regclass;
+ registered_by_the_owner | entries 
+-------------------------+---------
+                       1 |       1
+(1 row)
+
+\c - :owner_name
+SET search_path = public;
+-- The row that the table already held was entered by the registration, as
+-- ledger_enable enters it, and a row inserted afterwards is captured at once.
+INSERT INTO s_hand VALUES (2);
+SELECT count(*) AS entries_after FROM kingres.ledger_entry WHERE table_id = :gap_id;
+ entries_after 
+---------------
+             2
+(1 row)
+
+SELECT kingres.ledger_build_block() IS NOT NULL AS built;
+ built 
+-------
+ t
+(1 row)
+
+SELECT count(*) AS findings FROM kingres.ledger_verify();
+ findings 
+----------
+        0
+(1 row)
+
+--------------------------------------------------------------------------
+-- A write by hand leaves a record; the writes of the extension do not, whatever
+-- the setting says (M22)
+--------------------------------------------------------------------------
+SET kingres_ledger.allow_manual_write = on;
+INSERT INTO docs VALUES (10, 'under the setting');
+SELECT kingres.ledger_build_block() IS NOT NULL AS built_under_the_setting;
+ built_under_the_setting 
+-------------------------
+ t
+(1 row)
+
+SELECT kingres.ledger_generate_digest() IS NOT NULL AS digest_under_the_setting;
+ digest_under_the_setting 
+--------------------------
+ t
+(1 row)
+
+SELECT kingres.ledger_verify_recorded() > 0 AS recorded_under_the_setting;
+ recorded_under_the_setting 
+----------------------------
+ t
+(1 row)
+
+RESET kingres_ledger.allow_manual_write;
+SELECT count(*) AS manual_records FROM kingres.ledger_removed WHERE action = 'inserted';
+ manual_records 
+----------------
+              0
+(1 row)
+
+SELECT count(*) AS findings FROM kingres.ledger_verify();
+ findings 
+----------
+        0
+(1 row)
+

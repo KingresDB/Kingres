@@ -53,7 +53,7 @@ func (m *Manager) catalogFacts(ctx context.Context, id string) (removalFacts, er
 		return f, err
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
-	rows, err := c.Query(ctx, `SELECT group_id, is_active FROM kingres.node WHERE host = $1`, id)
+	rows, err := c.Query(ctx, `SELECT group_id, is_active, role FROM kingres.node WHERE host = $1`, id)
 	if err != nil {
 		return f, err
 	}
@@ -61,7 +61,8 @@ func (m *Manager) catalogFacts(ctx context.Context, id string) (removalFacts, er
 	for rows.Next() {
 		var g int32
 		var up bool
-		if err := rows.Scan(&g, &up); err != nil {
+		var role string
+		if err := rows.Scan(&g, &up, &role); err != nil {
 			rows.Close()
 			return f, err
 		}
@@ -69,7 +70,8 @@ func (m *Manager) catalogFacts(ctx context.Context, id string) (removalFacts, er
 		if up {
 			active++
 		}
-		if g == 0 {
+		// a standby of the map group does not make its server the manager leader
+		if g == 0 && role == "primary" {
 			f.HostsMapGroup = true
 		}
 	}

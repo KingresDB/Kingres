@@ -38,7 +38,7 @@ WHERE m.rolname !~ '^pg_' AND m.rolname <> $1 AND r.rolname <> $1`
 // CollectRoles reads the named roles (all roles when names is empty) from the
 // local instance, with their memberships.
 func (s *Service) CollectRoles(ctx context.Context, names ...string) ([]wire.RoleSpec, error) {
-	c, err := s.connect(ctx, "postgres")
+	c, err := s.InstanceConn(ctx, s.ConnectID(), "postgres")
 	if err != nil {
 		return nil, fmt.Errorf("connecting to the instance: %w", err)
 	}
@@ -103,7 +103,7 @@ func (s *Service) CollectGlobals(ctx context.Context) (wire.Globals, error) {
 		return g, err
 	}
 	g.Roles = roles
-	c, err := s.connect(ctx, "postgres")
+	c, err := s.InstanceConn(ctx, s.ConnectID(), "postgres")
 	if err != nil {
 		return g, err
 	}
@@ -158,7 +158,7 @@ func (s *Service) CollectGlobals(ctx context.Context) (wire.Globals, error) {
 }
 
 func (s *Service) databaseExtensions(ctx context.Context, db string) ([]string, error) {
-	c, err := s.connect(ctx, db)
+	c, err := s.InstanceConn(ctx, s.ConnectID(), db)
 	if err != nil {
 		return nil, err
 	}
@@ -238,7 +238,18 @@ func (s *Service) ApplyRoles(ctx context.Context, roles []wire.RoleSpec) error {
 			return err
 		}
 	}
-	c, err := s.connect(ctx, "postgres")
+	for _, id := range s.WritableIDs() {
+		if err := s.applyRolesAt(ctx, id, roles); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// applyRolesAt applies the roles to one instance; a server that runs the primaries of several
+// groups has several PostgreSQL clusters, each with its own roles.
+func (s *Service) applyRolesAt(ctx context.Context, id int, roles []wire.RoleSpec) error {
+	c, err := s.InstanceConn(ctx, id, "postgres")
 	if err != nil {
 		return fmt.Errorf("connecting to the instance: %w", err)
 	}
@@ -310,15 +321,12 @@ func (s *Service) DropRole(ctx context.Context, name string) error {
 	if _, err := sqlx.NewIdent(name); err != nil || strings.HasPrefix(name, "pg_") || name == instance.ServiceRole {
 		return fmt.Errorf("role name %q cannot be dropped", truncName(name))
 	}
-	c, err := s.connect(ctx, "postgres")
-	if err != nil {
-		return err
-	}
-	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
-	if err := execB(ctx, c, new(sqlx.Builder).Text("DROP ROLE IF EXISTS").ID(sqlx.MustIdent(name))); err != nil {
-		return errors.New("the role could not be dropped")
-	}
-	return nil
+	return s.EachWritable(ctx, "postgres", func(c *pgx.Conn) error {
+		if err := execB(ctx, c, new(sqlx.Builder).Text("DROP ROLE IF EXISTS").ID(sqlx.MustIdent(name))); err != nil {
+			return errors.New("the role could not be dropped")
+		}
+		return nil
+	})
 }
 
 var (
@@ -329,20 +337,29 @@ var (
 // ApplyDatabases creates the databases that do not exist and installs the
 // extensions each uses (kingres_shard excepted: kingres.add_node installs it).
 func (s *Service) ApplyDatabases(ctx context.Context, dbs []wire.DatabaseSpec) error {
-	c, err := s.connect(ctx, "postgres")
+	for _, id := range s.WritableIDs() {
+		if err := s.applyDatabasesAt(ctx, id, dbs); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) applyDatabasesAt(ctx context.Context, id int, dbs []wire.DatabaseSpec) error {
+	c, err := s.InstanceConn(ctx, id, "postgres")
 	if err != nil {
 		return fmt.Errorf("connecting to the instance: %w", err)
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
 	for _, d := range dbs {
-		if err := s.applyDatabase(ctx, c, d); err != nil {
+		if err := s.applyDatabase(ctx, id, c, d); err != nil {
 			return fmt.Errorf("copying database %s: %w", truncName(d.Name), err)
 		}
 	}
 	return nil
 }
 
-func (s *Service) applyDatabase(ctx context.Context, c *pgx.Conn, d wire.DatabaseSpec) error {
+func (s *Service) applyDatabase(ctx context.Context, id int, c *pgx.Conn, d wire.DatabaseSpec) error {
 	name, err := sqlx.NewIdent(d.Name)
 	if err != nil {
 		return errors.New("invalid database name")
@@ -380,7 +397,7 @@ func (s *Service) applyDatabase(ctx context.Context, c *pgx.Conn, d wire.Databas
 	if len(d.Extensions) == 0 {
 		return nil
 	}
-	dc, err := s.connect(ctx, d.Name)
+	dc, err := s.InstanceConn(ctx, id, d.Name)
 	if err != nil {
 		return err
 	}

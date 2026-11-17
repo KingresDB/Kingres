@@ -71,6 +71,9 @@ func hostileShapes(t testing.TB, dir string, size int) map[string]string {
 		"newlines":   bytes.Repeat([]byte("\n"), size),
 		// a million short objects, one per line: an export that is all one kind
 		"objects": fill("", "{}\n", ""),
+		// one element of a proof's chain that holds strings of 65,000 bytes (L12-05:
+		// the limits of the reader allowed 16,384 of them, a gigabyte, in one element)
+		"strings-in-an-element": fill(`{"chain":[{"x":[`, `"`+strings.Repeat("A", 65000)+`",`, `"z"]}]}`),
 	}
 	out := map[string]string{}
 	for name, data := range shapes {

@@ -439,6 +439,14 @@ func (b *PG) RunMove(ctx context.Context, m Move, after int64) error {
 		var id int64
 		errc <- c.QueryRow(callCtx, `SELECT kingres.move_bucket($1, $2, $3)`, m.Colocation, m.Bucket, m.To).Scan(&id)
 	}()
+	// reopen replaces the observation session after it failed; if that fails too the old one stays and the next
+	// pass tries again.
+	reopen := func() {
+		if nw, err := b.Conns.ServiceConn(ctx, m.Database); err == nil {
+			_ = watch.Close(context.WithoutCancel(ctx))
+			watch = nw
+		}
+	}
 	withdraw := func(why error) error {
 		cancel()
 		<-errc
@@ -459,7 +467,11 @@ func (b *PG) RunMove(ctx context.Context, m Move, after int64) error {
 			return ctx.Err()
 		case <-time.After(100 * time.Millisecond):
 		}
-		if e, found, err := b.findMove(ctx, watch, m.Colocation, m.Bucket, Ref{After: after}, 0); err == nil && found && e.id > after {
+		e, found, ferr := b.findMove(ctx, watch, m.Colocation, m.Bucket, Ref{After: after}, 0)
+		if ferr != nil {
+			// ST-02: a failed observation says nothing about the call. The session is made again; the loop goes on.
+			reopen()
+		} else if found && e.id > after {
 			g.release() // idempotent
 			break
 		}
@@ -483,7 +495,14 @@ func (b *PG) RunMove(ctx context.Context, m Move, after int64) error {
 			if now.Sub(start) >= b.maxCallWait() {
 				return withdraw(fmt.Errorf("the extension did not record the move within %s", b.maxCallWait()))
 			}
-			if running, _ := b.callRunning(ctx, watch, pid); !running {
+			running, rerr := b.callRunning(ctx, watch, pid)
+			if rerr != nil {
+				// ST-02: "unknown" is not "not running": a call whose state is unknown is never cancelled. The wait is
+				// bounded by maxCallWait above; the observation goes on a new session.
+				reopen()
+				running = true
+			}
+			if !running {
 				return withdraw(fmt.Errorf("the extension did not record the move within %s and the call is not running", b.guardHold()))
 			}
 			hold = now.Add(b.guardHold()) // waiting for a lock or a node: still the call of this run

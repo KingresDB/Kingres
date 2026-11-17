@@ -172,9 +172,13 @@ func (o *Ops) stepApplyRules(ctx context.Context, env *task.Env) error {
 	if err != nil {
 		return err
 	}
-	err = o.Instances.WriteHBA(cluster.NodeID, toHBA(p.Rules), p.TLSRequired)
-	if err == nil {
-		err = o.Instances.Reload(ctx, cluster.NodeID)
+	for _, id := range o.writableIDs() {
+		if err = o.Instances.WriteHBA(id, toHBA(p.Rules), p.TLSRequired); err == nil {
+			err = o.Instances.Reload(ctx, id)
+		}
+		if err != nil {
+			break
+		}
 	}
 	o.applyState.mu.Lock()
 	defer o.applyState.mu.Unlock()
@@ -192,8 +196,10 @@ func (o *Ops) ApplyStoredRules(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := o.Instances.WriteHBA(cluster.NodeID, toHBA(cur.Rules), cur.TLSRequired); err != nil {
-		return err
+	for _, id := range o.writableIDs() {
+		if err := o.Instances.WriteHBA(id, toHBA(cur.Rules), cur.TLSRequired); err != nil {
+			return err
+		}
 	}
 	o.applyState.mu.Lock()
 	o.applyState.applied = cur.Revision

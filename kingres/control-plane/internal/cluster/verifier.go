@@ -19,7 +19,7 @@ import (
 // or has no password yields scram.ErrNotSCRAM: for the proof of a forwarded
 // request they all mean "nothing can be proven".
 func (s *Service) RoleVerifier(ctx context.Context, role string) (string, error) {
-	c, err := s.connect(ctx, "postgres")
+	c, err := s.InstanceConn(ctx, s.ConnectID(), "postgres")
 	if err != nil {
 		return "", fmt.Errorf("connecting to read a verifier: %w", err)
 	}

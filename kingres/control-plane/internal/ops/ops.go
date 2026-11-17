@@ -55,6 +55,11 @@ type Ops struct {
 	SessionEnder func(role string)
 	// Instances writes pg_hba.conf and reloads the local instance.
 	Instances InstanceControl
+	// WritableIDs lists the instance directories of this server that are a primary: the
+	// ones the access rules are written to and the start, stop and restart of this
+	// server's instance act on (nil: instance 1 only, the layout of a server that never
+	// had a failover).
+	WritableIDs func() []int
 	// Recorder writes the tasks of instance start and stop (PeerRecorder on a
 	// server that may not be the leader); nil records in this server's own task
 	// engine.

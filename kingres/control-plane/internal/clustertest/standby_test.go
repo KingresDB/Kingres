@@ -114,18 +114,25 @@ func waitStandbys(t *testing.T, c *clustertest.Cluster, want int) {
 // private socket as the service role (peer authentication, no password).
 func standbyConn(t *testing.T, n *clustertest.Node, g, port int, db string) *pgx.Conn {
 	t.Helper()
-	cfg, err := pgx.ParseConfig("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg.Host, cfg.Port, cfg.Database, cfg.User = filepath.Join(n.Dir, "s", strconv.Itoa(100+g)), uint16(port), db, "kingresd" //nolint:gosec // test ports
-	cfg.TLSConfig, cfg.Fallbacks, cfg.ConnectTimeout = nil, nil, 10*time.Second
-	c, err := pgx.ConnectConfig(context.Background(), cfg)
+	c, err := tryStandbyConn(n, g, port, db)
 	if err != nil {
 		t.Fatalf("node %d: connecting to the standby of group %d: %v", n.Index, g, err)
 	}
 	t.Cleanup(func() { _ = c.Close(context.Background()) })
 	return c
+}
+
+// tryStandbyConn is standbyConn for a loop that waits for a standby which may
+// be absent for a while (it is being rebuilt): the caller closes the
+// connection and decides what a failure means.
+func tryStandbyConn(n *clustertest.Node, g, port int, db string) (*pgx.Conn, error) {
+	cfg, err := pgx.ParseConfig("")
+	if err != nil {
+		return nil, err
+	}
+	cfg.Host, cfg.Port, cfg.Database, cfg.User = filepath.Join(n.Dir, "s", strconv.Itoa(100+g)), uint16(port), db, "kingresd" //nolint:gosec // test ports
+	cfg.TLSConfig, cfg.Fallbacks, cfg.ConnectTimeout = nil, nil, 10*time.Second
+	return pgx.ConnectConfig(context.Background(), cfg)
 }
 
 func nodeOf(c *clustertest.Cluster, host string) *clustertest.Node {
@@ -218,9 +225,10 @@ func TestStandbysAreCreatedForEveryGroupAndStream(t *testing.T) {
 			for _, s := range steps {
 				if st := s.(map[string]any); st["name"] == "standby.register_in_catalog" {
 					found = true
-					// The step is skipped on purpose: the contract's state, with the reason in the detail.
-					if st["state"] != "skipped" {
-						t.Errorf("the step standby.register_in_catalog is %v, want skipped", st["state"])
+					// Since the registration exists the step is done (the first task may have found nothing to
+					// register: a step that has nothing to do is done too); it is never skipped.
+					if st["state"] != "done" {
+						t.Errorf("the step standby.register_in_catalog is %v, want done", st["state"])
 					}
 				}
 			}
@@ -537,7 +545,14 @@ func TestSlotRetentionAlertsThenDropsThenTheStandbyIsRebuilt(t *testing.T) {
 	holder.Start()
 	waitStandbys(t, c, 1)
 	until(t, 2*time.Minute, "the rebuilt standby to hold every row", func() bool {
-		sc := standbyConn(t, holder, 0, topology(t, c.Leader())[0][0].port, "postgres")
+		// The standby is rebuilt after the slot was dropped: while that goes
+		// on its instance is stopped and its socket is absent, which is a
+		// reason to wait and not a failure.
+		sc, err := tryStandbyConn(holder, 0, topology(t, c.Leader())[0][0].port, "postgres")
+		if err != nil {
+			return false
+		}
+		defer func() { _ = sc.Close(ctx) }()
 		var n int
 		return sc.QueryRow(ctx, `SELECT count(*) FROM retain_probe`).Scan(&n) == nil && n == 18000
 	})
