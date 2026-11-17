@@ -131,7 +131,9 @@ func checkParityReset(t *testing.T, name string, wantCode int, reset func(), arg
 		"steps": {steps, jsteps}, "notes": {notes, o.Notes}, "not proved": {notProved, o.NotProved},
 		"missing": {missing, o.Missing}, "problems": {problems, o.Problems},
 	} {
-		if !equal(pair[0], pair[1]) {
+		// The text output writes every string through untrusted (a backslash is
+		// doubled), the JSON writes it as it is: the same line, in two notations.
+		if !equal(pair[0], untrustedAll(pair[1])) {
 			t.Errorf("%s: %s differ between formats\ntext: %q\njson: %q", name, what, pair[0], pair[1])
 		}
 	}

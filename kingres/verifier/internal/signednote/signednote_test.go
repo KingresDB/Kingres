@@ -3,6 +3,7 @@
 package signednote
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
@@ -309,5 +310,69 @@ func FuzzParse(f *testing.F) {
 			}
 		}
 		_, _ = Verify(n, []Key{k})
+	})
+}
+
+// L9-04: the size of a note, the length of its lines and the lines of its text
+// are bounded at the one place every note passes through, so that what a
+// signer can make the verifier store is bounded.
+func TestParseBoundsTheShapeOfANote(t *testing.T) {
+	priv, _ := newPair(t, 1)
+	sign := func(text string) string {
+		return text + "\n" + signLine("a.example/log", priv, text)
+	}
+	lines := func(n int) string {
+		var b strings.Builder
+		b.WriteString("origin\n")
+		for i := 1; i < n; i++ {
+			b.WriteString("l\n")
+		}
+		return b.String()
+	}
+	cases := []struct {
+		name string
+		note string
+		ok   bool
+	}{
+		{"text lines at the limit", sign(lines(MaxTextLines)), true},
+		{"one text line over", sign(lines(MaxTextLines + 1)), false},
+		{"line at the limit", sign("o\n" + strings.Repeat("x", MaxLineLength) + "\n"), true},
+		{"line one over", sign("o\n" + strings.Repeat("x", MaxLineLength+1) + "\n"), false},
+		{"a line of 700000 bytes", sign("o\n" + strings.Repeat("<", 700000) + "\n"), false},
+	}
+	for _, c := range cases {
+		_, err := Parse([]byte(c.note))
+		if (err == nil) != c.ok {
+			t.Errorf("%s: err %v, accepted should be %v", c.name, err, c.ok)
+		}
+	}
+}
+
+// FuzzParseBounds checks the bounds of a note for any input: whatever Parse
+// accepts is within the size, the line length, the lines of text and the
+// signatures that bound what a signer can make the verifier store.
+func FuzzParseBounds(f *testing.F) {
+	f.Add([]byte(specNote))
+	f.Add([]byte("o\n" + strings.Repeat("x", MaxLineLength+1) + "\n\n\u2014 a AAAAAA==\n"))
+	f.Add([]byte(strings.Repeat("l\n", MaxTextLines+2) + "\n\u2014 a AAAAAA==\n"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		n, err := Parse(data)
+		if err != nil {
+			return
+		}
+		if len(data) > MaxNoteSize {
+			t.Fatalf("a note of %d bytes was accepted", len(data))
+		}
+		if len(n.Signatures) > MaxSignatures {
+			t.Fatalf("%d signatures were accepted", len(n.Signatures))
+		}
+		if c := bytes.Count(n.Text, []byte("\n")); c > MaxTextLines {
+			t.Fatalf("%d lines of text were accepted", c)
+		}
+		for _, l := range bytes.Split(data, []byte("\n")) {
+			if len(l) > MaxLineLength {
+				t.Fatalf("a line of %d bytes was accepted", len(l))
+			}
+		}
 	})
 }

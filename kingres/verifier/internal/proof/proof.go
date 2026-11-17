@@ -71,7 +71,16 @@ func fail(step, format string, args ...any) *Error {
 // tx_root, user_name, tx_index, tx_path, block and chain are required;
 // relation is informational and optional. Unknown members are ignored.
 func Parse(data []byte) (*Proof, error) {
-	v, err := jsonx.Parse(data)
+	// The chain of headers is the one member that grows with the proof: it is
+	// read element by element, so the memory of the parse is the headers kept
+	// (about 100 bytes each, one per 230 bytes or more of input) and never a tree
+	// of the whole file.
+	var chainHeaders []format.Header
+	v, err := jsonx.ParseStreaming(data, jsonx.DefaultLimits, "chain", func(el jsonx.Value) error {
+		h, err := chain.ParseHeader(el)
+		chainHeaders = append(chainHeaders, h)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -148,17 +157,10 @@ func Parse(data []byte) (*Proof, error) {
 	if p.Block, err = chain.ParseHeader(bv); err != nil {
 		return nil, err
 	}
-	items, err := o.Array("chain")
-	if err != nil {
+	if _, err := o.Array("chain"); err != nil {
 		return nil, err
 	}
-	for _, it := range items {
-		h, err := chain.ParseHeader(it)
-		if err != nil {
-			return nil, err
-		}
-		p.Chain = append(p.Chain, h)
-	}
+	p.Chain = chainHeaders
 	return &p, nil
 }
 

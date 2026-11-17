@@ -11,7 +11,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/chain"
@@ -33,14 +32,21 @@ const (
 	// ExitIncomplete means nothing failed, but something that was asked for
 	// could not be checked with the inputs and flags given.
 	ExitIncomplete = 3
+	// ExitEvidenceLost means a fork or a rollback was found (what status 1 says)
+	// and the conflicting checkpoint could not be saved: the finding stands and
+	// the auditor must keep the note they were shown themselves.
+	ExitEvidenceLost = 4
 )
 
 const (
-	maxFileSize   = 16 << 20
+	maxFileSize = 16 << 20
+	// maxDigestFile bounds one digest file: a digest is a few hundred bytes, and
+	// a file of more than 64 KiB is not one.
+	maxDigestFile = 64 << 10
 	maxBlocksSize = 1 << 30
 	// maxDigestFiles and maxDigestTotal bound what digest-chain reads.
 	maxDigestFiles = 1024
-	maxDigestTotal = 64 << 20
+	maxDigestTotal = 16 << 20
 )
 
 const usageText = `kingres-verify checks the tamper-evident ledger of KingresDB without trusting the database.
@@ -60,7 +66,8 @@ Commands:
 
 Run "kingres-verify <command> --help" for the flags of a command.
 Exit status: 0 verified, 1 verification failed, 2 usage or input error,
-3 incomplete (nothing failed, but something asked for could not be checked).
+3 incomplete (nothing failed, but something asked for could not be checked: an alert, not a pass),
+4 a fork or rollback was found and its evidence could not be saved (checkpoint --state).
 `
 
 type env struct {
@@ -74,15 +81,15 @@ func Run(args []string, stdout, stderr io.Writer, version string) int {
 	e := &env{stdout: stdout, stderr: stderr, version: version}
 	if len(args) == 0 {
 		fmt.Fprint(stderr, usageText)
-		return ExitUsage
+		return exit(ExitUsage)
 	}
 	switch args[0] {
 	case "-h", "--help", "help":
 		fmt.Fprint(stdout, usageText)
-		return ExitOK
+		return exit(ExitOK)
 	case "version", "--version":
 		fmt.Fprintf(stdout, "kingres-verify %s (hash format version %d)\n", version, format.HashVersion)
-		return ExitOK
+		return exit(ExitOK)
 	case "proof":
 		return e.runProof(args[1:])
 	case "row-hash":
@@ -98,8 +105,8 @@ func Run(args []string, stdout, stderr io.Writer, version string) int {
 	case "trust":
 		return e.runTrust(args[1:])
 	}
-	fmt.Fprintf(stderr, "kingres-verify: unknown command %s, expected one of proof, row-hash, digest-chain, blocks, checkpoint, consistency, trust, version\n", untrusted(strconv.Quote(args[0])))
-	return ExitUsage
+	fmt.Fprintf(stderr, "kingres-verify: unknown command %s, expected one of proof, row-hash, digest-chain, blocks, checkpoint, consistency, trust, version\n", untrusted(fmt.Sprintf("%q", args[0])))
+	return exit(ExitUsage)
 }
 
 // newFlags creates a flag set that prints its help to stdout.
@@ -127,10 +134,10 @@ func (e *env) newFlagsWithExit(name, synopsis, help, exitText string) (*flag.Fla
 func (e *env) parseFlags(fs *flag.FlagSet, args []string) (code int, done bool) {
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			return ExitOK, true
+			return exit(ExitOK), true
 		}
 		fmt.Fprintf(e.stderr, "kingres-verify %s: %s\nRun \"kingres-verify %s --help\".\n", fs.Name(), untrusted(err.Error()), fs.Name())
-		return ExitUsage, true
+		return exit(ExitUsage), true
 	}
 	return 0, false
 }
@@ -197,7 +204,7 @@ func (e *env) runProof(args []string) int {
 	default:
 		return e.inputError(cmd, *asJSON, fmt.Errorf("--op %q is not I, D or any", *opFlag))
 	}
-	digestData, err := readArg(*digestPath, maxFileSize)
+	digestData, err := readArg(*digestPath, maxDigestFile)
 	if err != nil {
 		return e.inputError(cmd, *asJSON, err)
 	}
@@ -304,13 +311,13 @@ func (e *env) runRowHash(args []string) int {
 			info["encoding"] = format.EncodeHex(enc)
 		}
 		e.printJSON(jsonOutput{Command: cmd, Verified: false, Info: info, Notes: []string{"row-hash computes a hash and verifies nothing: verified is false by design, use proof to check an entry"}})
-		return ExitOK
+		return exit(ExitOK)
 	}
 	fmt.Fprintf(e.stdout, "%x\n", h)
 	if *showEnc {
 		fmt.Fprintf(e.stdout, "encoding %x\n", enc)
 	}
-	return ExitOK
+	return exit(ExitOK)
 }
 
 // ---- digest-chain ----
@@ -364,7 +371,7 @@ func (e *env) runDigestChain(args []string) int {
 			return e.inputError(cmd, *asJSON, err)
 		}
 		if !st.IsDir() {
-			data, err := readArg(p, maxFileSize)
+			data, err := readArg(p, maxDigestFile)
 			if err == nil {
 				err = add(p, data)
 			}
@@ -391,7 +398,7 @@ func (e *env) runDigestChain(args []string) int {
 				continue
 			}
 			var data []byte
-			if data, err = dir.ReadFile(n, maxFileSize); err == nil {
+			if data, err = dir.ReadEntry(n, maxDigestFile); err == nil {
 				err = add(filepath.Join(p, n), data)
 			}
 		}
@@ -442,7 +449,7 @@ func (e *env) runBlocks(args []string) int {
 	haveDigest := *digestPath != ""
 	switch {
 	case haveDigest:
-		data, err := readArg(*digestPath, maxFileSize)
+		data, err := readArg(*digestPath, maxDigestFile)
 		if err != nil {
 			return e.inputError(cmd, *asJSON, err)
 		}
@@ -479,7 +486,7 @@ func (e *env) runBlocks(args []string) int {
 	if haveDigest {
 		dp = &d
 	}
-	count, err := chain.StreamBlocks(f, cid, dp)
+	stream, err := chain.StreamBlocks(f, cid, dp)
 	if err != nil {
 		var se *chain.StreamError
 		if errors.As(err, &se) {
@@ -490,17 +497,30 @@ func (e *env) runBlocks(args []string) int {
 		}
 		return e.inputError(cmd, *asJSON, err)
 	}
-	r.ok("chain", fmt.Sprintf("%d blocks, heights 0 to %d, recomputed from the genesis hash", count, count-1))
-	r.headline = "the exported block headers form an unbroken chain from the genesis hash."
+	head := stream.Head
+	r.ok("chain", fmt.Sprintf("%d blocks, heights 0 to %d, recomputed from the genesis hash; the last block read is %d, hash %x", stream.Blocks, head.Height, head.Height, head.BlockHash))
+	r.headline = fmt.Sprintf("the %d block headers read (heights 0 to %d) form an unbroken chain from the genesis hash.", stream.Blocks, head.Height)
+	r.info = map[string]any{
+		"blocks": stream.Blocks, "head_height": head.Height, "head_hash": format.EncodeHex(head.BlockHash[:]),
+		"complete_export_shown": false,
+	}
 	if haveDigest {
 		r.ok("digest", fmt.Sprintf("the chain reaches the digest at height %d", d.Height))
-		r.headline = fmt.Sprintf("the exported block headers form an unbroken chain from the genesis hash and reach the digest at height %d.", d.Height)
+		r.headline = fmt.Sprintf("the %d block headers read (heights 0 to %d) form an unbroken chain from the genesis hash and reach the digest at height %d.", stream.Blocks, head.Height, d.Height)
+		r.info["digest_height"] = d.Height
 	}
 	r.notProved = []string{"this checks the exported headers only: not any transaction, row or table, which needs inclusion proofs"}
+	// What an export that ends proves is what it holds: a cut after any block
+	// verifies the same way, because the hash of a block does not say whether
+	// another follows. Only a digest kept outside the database ties an end.
 	if !haveDigest {
-		r.notProved = append(r.notProved, "no --digest was given: nothing ties this chain to a digest kept outside the database, so a chain that was rewritten from the genesis block verifies too")
+		r.notProved = append(r.notProved,
+			fmt.Sprintf("that the export is complete: it ends at block %d, hash %x, and an export cut at any earlier block verifies the same way; to show that this is the head, give --digest of a height at or above %d, or compare the hash with the head you were told", head.Height, head.BlockHash, head.Height),
+			"no --digest was given: nothing ties this chain to a digest kept outside the database, so a chain that was rewritten from the genesis block verifies too")
 	} else {
-		r.notProved = append(r.notProved, "blocks after the digest's height are not covered by the digest; the digest must have been kept outside the database's control")
+		r.notProved = append(r.notProved,
+			fmt.Sprintf("that the export is complete: it holds blocks up to %d, and the digest covers up to height %d; blocks after the digest height are not covered, and an export cut after the digest height verifies the same way", head.Height, d.Height),
+			"the digest must have been kept outside the database's control")
 	}
 	return e.finishOK(r, *asJSON)
 }

@@ -3,8 +3,12 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"reflect"
+	"runtime"
+	"unicode/utf8"
 )
 
 // Every command builds one result and hands it to one of the finish
@@ -50,6 +54,11 @@ type jsonOutput struct {
 	// Incomplete and Missing are used by exit status 3 only.
 	Incomplete bool     `json:"incomplete,omitempty"`
 	Missing    []string `json:"missing,omitempty"`
+	// InvalidUTF8 is set when a string of the output held bytes that are not
+	// UTF-8 (a file name, a text of the database) and the JSON, which has no way
+	// to carry them, shows each as U+FFFD. The text output shows such a byte as
+	// \xNN; here the loss is said once, in this member.
+	InvalidUTF8 bool `json:"invalid_utf8,omitempty"`
 }
 
 type stepJSON struct {
@@ -58,10 +67,83 @@ type stepJSON struct {
 	Detail string `json:"detail,omitempty"`
 }
 
-func (e *env) printJSON(v any) {
-	enc := json.NewEncoder(e.stdout)
+// printJSON writes the result as JSON. The JSON is escaped as far as the text
+// output is: every character that untrusted writes as an escape is written as a
+// \u escape here (a C1 control, DEL, a bidirectional mark, a separator, a format
+// character), so that a file that shows the JSON on a terminal cannot be moved
+// by it; the characters <, > and & are not rewritten (the output is not HTML).
+// Bytes that are not UTF-8 cannot be in a JSON string: they become U+FFFD and
+// the member invalid_utf8 says so.
+func (e *env) printJSON(v jsonOutput) {
+	v.InvalidUTF8 = holdsInvalidUTF8(reflect.ValueOf(v))
+	b := encodeJSON(v)
+	_, _ = e.stdout.Write(escapeJSONText(b))
+}
+
+func encodeJSON(v jsonOutput) []byte {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(v)
+	return buf.Bytes()
+}
+
+// holdsInvalidUTF8 reports whether any string of the value, a key of a map
+// included, has bytes that are not UTF-8. It looks at the strings before they
+// are encoded because the encoder replaces such bytes by U+FFFD without a word,
+// and a U+FFFD that was in the input must not be reported as a replacement.
+func holdsInvalidUTF8(v reflect.Value) bool {
+	switch v.Kind() {
+	case reflect.String:
+		return !utf8.ValidString(v.String())
+	case reflect.Interface, reflect.Pointer:
+		return !v.IsNil() && holdsInvalidUTF8(v.Elem())
+	case reflect.Slice, reflect.Array:
+		for i := 0; i < v.Len(); i++ {
+			if holdsInvalidUTF8(v.Index(i)) {
+				return true
+			}
+		}
+	case reflect.Map:
+		for it := v.MapRange(); it.Next(); {
+			if holdsInvalidUTF8(it.Key()) || holdsInvalidUTF8(it.Value()) {
+				return true
+			}
+		}
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i++ {
+			if v.Type().Field(i).IsExported() && holdsInvalidUTF8(v.Field(i)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// escapeJSONText rewrites every character of an encoded document that
+// mustEscape names as a \u escape (a pair of them above U+FFFF).
+func escapeJSONText(b []byte) []byte {
+	var out bytes.Buffer
+	out.Grow(len(b))
+	for i := 0; i < len(b); {
+		r, n := utf8.DecodeRune(b[i:])
+		switch {
+		case r == utf8.RuneError && n <= 1:
+			out.WriteString(`\ufffd`)
+		case r < 0x7f || !mustEscape(r):
+			// ASCII controls inside strings were escaped by the encoder; the
+			// newlines and spaces that are left are the layout of the document.
+			out.Write(b[i : i+n])
+		case r > 0xffff:
+			r -= 0x10000
+			fmt.Fprintf(&out, `\u%04x\u%04x`, 0xd800+(r>>10), 0xdc00+(r&0x3ff))
+		default:
+			fmt.Fprintf(&out, `\u%04x`, r)
+		}
+		i += n
+	}
+	return out.Bytes()
 }
 
 // errLine is the one line that reports a usage or input problem on the
@@ -86,6 +168,7 @@ func (e *env) printLines(prefix string, lines []string) {
 
 // finishOK prints a verified result and returns the exit status 0.
 func (e *env) finishOK(r *result, asJSON bool) int {
+	traceExit(ExitOK)
 	if asJSON {
 		e.printJSON(jsonOutput{Command: r.cmd, Verified: true, Steps: r.steps, Info: r.info, Notes: r.notes, NotProved: r.notProved})
 		return ExitOK
@@ -103,20 +186,28 @@ func (e *env) finishOK(r *result, asJSON bool) int {
 
 // finishFailed prints a failed verification and returns the exit status 1.
 func (e *env) finishFailed(r *result, asJSON bool, step string, err error) int {
+	return e.finishFailedWith(r, asJSON, step, err, ExitFailed)
+}
+
+// finishFailedWith is finishFailed with the status of the caller: the same
+// output, a status that says more than 1.
+func (e *env) finishFailedWith(r *result, asJSON bool, step string, err error, code int) int {
+	traceExit(code)
 	steps := append(append([]stepJSON{}, r.steps...), stepJSON{Name: step, OK: false, Detail: err.Error()})
 	if asJSON {
 		e.printJSON(jsonOutput{Command: r.cmd, Steps: steps, FailedAt: step, Error: err.Error(), Info: r.info, Notes: r.notes})
-		return ExitFailed
+		return code
 	}
 	fmt.Fprintf(e.stdout, "FAILED at step %s: %s\n", untrusted(step), untrusted(err.Error()))
 	e.printSteps(r.steps)
 	e.printLines("note: ", r.notes)
-	return ExitFailed
+	return code
 }
 
 // finishProblems prints the findings of digest-chain: INCONSISTENT and the
 // list, exit status 1.
 func (e *env) finishProblems(r *result, asJSON bool) int {
+	traceExit(ExitFailed)
 	if asJSON {
 		e.printJSON(jsonOutput{Command: r.cmd, Problems: r.problems, Info: r.info, Notes: r.notes})
 		return ExitFailed
@@ -132,6 +223,7 @@ func (e *env) finishProblems(r *result, asJSON bool) int {
 // reassurance: the publisher may have withheld exactly the part that would
 // have failed (see the README, "Exit status 3").
 func (e *env) finishIncomplete(r *result, asJSON bool, missing []string) int {
+	traceExit(ExitIncomplete)
 	if asJSON {
 		e.printJSON(jsonOutput{Command: r.cmd, Steps: r.steps, Incomplete: true, Missing: missing, Info: r.info, Notes: r.notes, NotProved: r.notProved})
 		return ExitIncomplete
@@ -147,6 +239,7 @@ func (e *env) finishIncomplete(r *result, asJSON bool, missing []string) int {
 
 // inputError reports a usage or input problem (exit status 2).
 func (e *env) inputError(cmd string, asJSON bool, err error) int {
+	traceExit(ExitUsage)
 	if asJSON {
 		e.printJSON(jsonOutput{Command: cmd, InputErr: true, Error: err.Error()})
 	}
@@ -157,6 +250,7 @@ func (e *env) inputError(cmd string, asJSON bool, err error) int {
 // finishInputWith prints what was found and then the input error: the exit
 // status is 2 but the reader still sees the steps and notes that explain it.
 func (e *env) finishInputWith(r *result, asJSON bool, err error) int {
+	traceExit(ExitUsage)
 	if asJSON {
 		e.printJSON(jsonOutput{Command: r.cmd, InputErr: true, Error: err.Error(), Steps: r.steps, Info: r.info, Notes: r.notes})
 		e.errLine(r.cmd, err)
@@ -166,4 +260,27 @@ func (e *env) finishInputWith(r *result, asJSON bool, err error) int {
 	e.printLines("note: ", r.notes)
 	e.errLine(r.cmd, err)
 	return ExitUsage
+}
+
+// trace is set by a test only. It is called with the exit status and the stack
+// of every place that ends a run, so that a test can tell which of the places in
+// the source a scenario reached (TestEveryExitSiteHasARowAndAScenario).
+var trace func(status int, pcs []uintptr)
+
+// traceExit reports the status a run ends with to the test hook, from the
+// function that ends it and every function above it.
+func traceExit(status int) {
+	if trace == nil {
+		return
+	}
+	pcs := make([]uintptr, 32)
+	n := runtime.Callers(2, pcs)
+	trace(status, pcs[:n])
+}
+
+// exit is the way a run that does not go through a finish function ends with a
+// status: usage text, version, a flag error, an unknown command.
+func exit(status int) int {
+	traceExit(status)
+	return status
 }

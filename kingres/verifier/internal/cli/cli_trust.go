@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/signednote"
@@ -16,7 +15,7 @@ import (
 func (e *env) runTrust(args []string) int {
 	if len(args) == 0 {
 		fmt.Fprintln(e.stderr, "kingres-verify trust: expected init or show")
-		return ExitUsage
+		return exit(ExitUsage)
 	}
 	switch args[0] {
 	case "init":
@@ -25,13 +24,13 @@ func (e *env) runTrust(args []string) int {
 		return e.runTrustShow(args[1:])
 	case "follow":
 		fmt.Fprintln(e.stderr, "kingres-verify trust follow: not built yet (it needs the key events of the publication)")
-		return ExitUsage
+		return exit(ExitUsage)
 	case "-h", "--help", "help":
 		fmt.Fprint(e.stdout, "Usage: kingres-verify trust init|show [flags]\n\n  init  write a trust file from a public key you typed or pasted and its fingerprint\n  show  print a trust file and say, for each key, how it stands now and which of its members are enforced\n\nExit status: 0 ok, 2 usage or input error (including a trust file that no command could use).\n")
-		return ExitOK
+		return exit(ExitOK)
 	}
-	fmt.Fprintf(e.stderr, "kingres-verify trust: unknown subcommand %s, expected init or show\n", untrusted(strconv.Quote(args[0])))
-	return ExitUsage
+	fmt.Fprintf(e.stderr, "kingres-verify trust: unknown subcommand %s, expected init or show\n", untrusted(fmt.Sprintf("%q", args[0])))
+	return exit(ExitUsage)
 }
 
 func (e *env) runTrustInit(args []string) int {
@@ -81,7 +80,7 @@ func (e *env) runTrustInit(args []string) int {
 	}
 	if *out == "-" {
 		_, _ = e.stdout.Write(data)
-		return ExitOK
+		return exit(ExitOK)
 	}
 	fh, err := os.OpenFile(*out, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644) // #nosec G304 -- the path is a command line argument
 	if err != nil {
@@ -97,11 +96,11 @@ func (e *env) runTrustInit(args []string) int {
 	note := "keep this file where the cluster's administrators cannot change it; a trust file that came from the cluster proves nothing"
 	if *asJSON {
 		e.printJSON(jsonOutput{Command: cmd, Verified: true, Notes: []string{note}, Info: map[string]any{"file": *out, "fingerprint": f.Keys[0].Fingerprint, "origin_prefix": f.OriginPrefix}})
-		return ExitOK
+		return exit(ExitOK)
 	}
 	fmt.Fprintf(e.stdout, "wrote %s: origin prefix %s, key %s (fingerprint %s)\n", untrusted(*out), untrusted(f.OriginPrefix), untrusted(f.Keys[0].Name), f.Keys[0].Fingerprint)
 	fmt.Fprintf(e.stdout, "  note: %s\n", note)
-	return ExitOK
+	return exit(ExitOK)
 }
 
 // trustShowHeading is the verdict word of trust show: it is not a verification

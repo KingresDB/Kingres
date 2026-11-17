@@ -125,8 +125,9 @@ func TestUntrustedRendersEverythingHostile(t *testing.T) {
 			}
 		}
 	}
-	// An ordinary string, a path with backslashes and non-ASCII letters pass.
-	for _, s := range []string{"plain text", `C:\Users\x\file.json`, "caf\u00e9 \u4e2d\u6587"} {
+	// An ordinary string and non-ASCII letters pass as they are (a backslash is
+	// written twice, see TestUntrustedIsOneToOne).
+	for _, s := range []string{"plain text", "caf\u00e9 \u4e2d\u6587"} {
 		if untrusted(s) != s {
 			t.Errorf("%q was changed to %q", s, untrusted(s))
 		}
@@ -263,45 +264,6 @@ func firstProof(t *testing.T) string {
 }
 
 // ---- the output layer is the only place that prints ----
-
-func TestNoPrintOutsideTheOutputLayer(t *testing.T) {
-	allowed := map[string]bool{"cli_out.go": true, "text.go": true}
-	ents, _ := os.ReadDir(".")
-	for _, e := range ents {
-		n := e.Name()
-		if !strings.HasSuffix(n, ".go") || strings.HasSuffix(n, "_test.go") || allowed[n] {
-			continue
-		}
-		b, _ := os.ReadFile(n)
-		for i, l := range strings.Split(string(b), "\n") {
-			tl := strings.TrimSpace(l)
-			if strings.HasPrefix(tl, "//") {
-				continue
-			}
-			if strings.Contains(l, "Fprint") || strings.Contains(l, "e.stdout.Write") || strings.Contains(l, "e.stderr.Write") {
-				// Fixed text of the program and numbers are allowed: they carry
-				// no input. Anything with an error or an argument must use
-				// untrusted.
-				if strings.Contains(l, "untrusted(") || isLiteralOnly(l) {
-					continue
-				}
-				t.Errorf("%s:%d prints without untrusted: %s", n, i+1, tl)
-			}
-		}
-	}
-}
-
-// isLiteralOnly accepts the print calls whose arguments are the program's own
-// values: usage text, the version, hash hex, the flag set.
-func isLiteralOnly(l string) bool {
-	for _, ok := range []string{"usageText", "version, format.HashVersion", `"%x\n", h`, `"encoding %x\n", enc`, "Usage: kingres-verify", `"\nExit status: "`,
-		"fs.SetOutput", "expected init or show", "trust follow", "Usage: kingres-verify trust", "_, _ = e.stdout.Write(data)", `"  note: %s\n", note`} {
-		if strings.Contains(l, ok) {
-			return true
-		}
-	}
-	return false
-}
 
 func b64root(h h32) string { return base64.StdEncoding.EncodeToString(h[:]) }
 

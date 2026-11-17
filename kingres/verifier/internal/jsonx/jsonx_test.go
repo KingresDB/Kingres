@@ -3,6 +3,7 @@
 package jsonx
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -134,5 +135,110 @@ func TestBool(t *testing.T) {
 		if _, err := f.Bool(); err == nil {
 			t.Errorf("%s: accepted as a boolean", name)
 		}
+	}
+}
+
+// L9-05: what one document can make the reader hold is bounded by caps, not by
+// the size of the file.
+func TestLimits(t *testing.T) {
+	small := Limits{MaxDepth: 4, MaxValues: 10, MaxMembers: 3, MaxKey: 5, MaxString: 8}
+	tests := []struct {
+		name string
+		in   string
+		ok   bool
+	}{
+		{"values at the limit", `[0,0,0,0,0,0,0,0,0]`, true},
+		{"one value over", `[0,0,0,0,0,0,0,0,0,0]`, false},
+		{"members at the limit", `{"a":0,"b":0,"c":0}`, true},
+		{"one member over", `{"a":0,"b":0,"c":0,"d":0}`, false},
+		{"key at the limit", `{"abcde":0}`, true},
+		{"key one over", `{"abcdef":0}`, false},
+		{"string at the limit", `["12345678"]`, true},
+		{"string one over", `["123456789"]`, false},
+		{"escapes count as written", `["\u0041\u0041"]`, false},
+		{"depth at the limit", `[[[[0]]]]`, true},
+		{"depth one over", `[[[[[0]]]]]`, false},
+		{"a long number", `[` + strings.Repeat("1", MaxNumber+1) + `]`, false},
+		{"a run of white space", "[" + strings.Repeat(" ", MaxSpaceRun+1) + "0]", false},
+	}
+	for _, tt := range tests {
+		_, err := ParseLimits([]byte(tt.in), small)
+		if tt.name == "a long number" || tt.name == "a run of white space" {
+			_, err = ParseLimits([]byte(tt.in), DefaultLimits)
+		}
+		if (err == nil) != tt.ok {
+			t.Errorf("%s: err %v, accepted should be %v", tt.name, err, tt.ok)
+		}
+	}
+	// A document of many values is refused by the default limits too, long
+	// before it is a tree.
+	if _, err := Parse([]byte("[" + strings.Repeat("0,", 1<<20) + "0]")); err == nil {
+		t.Error("a million values were accepted")
+	}
+}
+
+func TestPathsAreBuiltFromTheLocation(t *testing.T) {
+	v, err := Parse([]byte(`{"a":[{"b":1},{"c":[true]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	o, _ := v.Object()
+	arr, _ := o.Array("a")
+	second, _ := arr[1].Object()
+	c, _ := second.Array("c")
+	if got := c[0].Path(); got != "$.a[1].c[0]" {
+		t.Errorf("path %q", got)
+	}
+	if got := v.Path(); got != "$" {
+		t.Errorf("root path %q", got)
+	}
+}
+
+func TestParseStreamingDeliversElementsOneByOne(t *testing.T) {
+	var seen []string
+	v, err := ParseStreaming([]byte(`{"x":1,"chain":[{"h":1},{"h":2},{"h":3}],"y":"z"}`), DefaultLimits, "chain", func(e Value) error {
+		o, err := e.Object()
+		if err != nil {
+			return err
+		}
+		n, err := o.Int64("h", 0, 9)
+		seen = append(seen, strings.Repeat("#", int(n)))
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(seen, ",") != "#,##,###" {
+		t.Errorf("elements %v", seen)
+	}
+	o, _ := v.Object()
+	if arr, err := o.Array("chain"); err != nil || len(arr) != 0 {
+		t.Errorf("the streamed member keeps %d elements (%v)", len(arr), err)
+	}
+	if s, err := o.String("y"); err != nil || s != "z" {
+		t.Errorf("a member after the stream: %q %v", s, err)
+	}
+	// An error of the callback stops the parse and is the error returned.
+	stop := errors.New("stop")
+	if _, err := ParseStreaming([]byte(`{"chain":[1,2,3]}`), DefaultLimits, "chain", func(Value) error { return stop }); !errors.Is(err, stop) {
+		t.Errorf("callback error: %v", err)
+	}
+	// A member that is not an array is an ordinary value, and a stream of a
+	// million elements costs no memory but is limited per element.
+	if v, err := ParseStreaming([]byte(`{"chain":7}`), DefaultLimits, "chain", func(Value) error { return stop }); err != nil || v.Kind() != KindObject {
+		t.Errorf("a number member: %v", err)
+	}
+	big := "{\"chain\":[" + strings.Repeat("[0,0],", 100000) + "[0]]}"
+	n := 0
+	if _, err := ParseStreaming([]byte(big), DefaultLimits, "chain", func(Value) error { n++; return nil }); err != nil || n != 100001 {
+		t.Errorf("a long stream: %d elements, %v", n, err)
+	}
+	// The same document is refused by Parse: 200 thousand values.
+	if _, err := Parse([]byte(big)); err == nil {
+		t.Error("Parse took a document the stream exists for")
+	}
+	// Duplicate keys and depth still apply to a document that streams.
+	if _, err := ParseStreaming([]byte(`{"chain":[],"chain":[]}`), DefaultLimits, "chain", func(Value) error { return nil }); err == nil {
+		t.Error("a duplicate streamed key was accepted")
 	}
 }

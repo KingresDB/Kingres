@@ -28,12 +28,23 @@ import (
 // (signed-note, "Signature types").
 const SigTypeEd25519 byte = 0x01
 
-// Limits. The specification says verifiers SHOULD cap the number of
-// signatures but MUST accept at least 16; the size cap keeps a hostile note
-// from using memory.
+// Limits of a note. The specification says verifiers SHOULD cap the number of
+// signatures but MUST accept at least 16. The other caps keep a hostile note,
+// even one signed by a key of the trust file, from using memory and from
+// growing the state file that stores it (the verifier never writes a state it
+// would not read back, so what a note may hold is bounded here, at the one
+// place every note passes through): a checkpoint is an origin of at most 255
+// bytes, a size, a root and a few short extension lines, and a signature line
+// is at most about 350 bytes, so 32 signatures and 32 lines of text fit in
+// well under 64 KiB.
 const (
 	MaxSignatures = 32
-	MaxNoteSize   = 1 << 20
+	MaxNoteSize   = 64 << 10
+	// MaxLineLength is the longest line of a note, text or signature, without
+	// its newline.
+	MaxLineLength = 1024
+	// MaxTextLines is the most lines the text of a note may have.
+	MaxTextLines = 32
 )
 
 // emDashPrefix starts every signature line: U+2014 then a space.
@@ -157,7 +168,9 @@ func DecodeBase64(s string) ([]byte, error) {
 // signature, a signature line that is not "em dash, space, name, space,
 // base64", an invalid name, non-canonical base64, a signature shorter than
 // the four byte key id, and (checkpoint specification) two lines with the
-// same name and key id. More than MaxSignatures lines are refused.
+// same name and key id. More than MaxSignatures lines are refused, and so are a note of more than
+// MaxNoteSize bytes, a line of more than MaxLineLength bytes and a text of more
+// than MaxTextLines lines (see the constants for why they exist).
 func Parse(data []byte) (*Note, error) {
 	if len(data) > MaxNoteSize {
 		return nil, fmt.Errorf("note has %d bytes, expected at most %d", len(data), MaxNoteSize)
@@ -178,6 +191,9 @@ func Parse(data []byte) (*Note, error) {
 		return nil, errors.New("note has no blank line between the text and the signatures")
 	}
 	text, sigPart := data[:i+1], data[i+2:]
+	if err := checkLines(data, text); err != nil {
+		return nil, err
+	}
 	if len(sigPart) == 0 {
 		return nil, errors.New("note has no signature line")
 	}
@@ -262,4 +278,26 @@ func Verify(n *Note, keys []Key) ([]Key, error) {
 		return nil, ErrNoTrustedSignature
 	}
 	return ok, nil
+}
+
+// checkLines enforces MaxLineLength on every line of the note and MaxTextLines
+// on the text. The checks run before anything is converted or stored.
+func checkLines(data, text []byte) error {
+	if n := bytes.Count(text, []byte("\n")); n > MaxTextLines {
+		return fmt.Errorf("note text has %d lines, expected at most %d", n, MaxTextLines)
+	}
+	for len(data) > 0 {
+		i := bytes.IndexByte(data, '\n')
+		if i < 0 {
+			i = len(data)
+		}
+		if i > MaxLineLength {
+			return fmt.Errorf("note has a line of %d bytes, expected at most %d", i, MaxLineLength)
+		}
+		if i == len(data) {
+			break
+		}
+		data = data[i+1:]
+	}
+	return nil
 }

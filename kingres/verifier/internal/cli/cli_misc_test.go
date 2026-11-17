@@ -54,11 +54,13 @@ func TestDigestChainDirectoryCaps(t *testing.T) {
 func TestDigestChainTotalSizeCap(t *testing.T) {
 	d0, _ := os.ReadFile(fx("digests/d0.json"))
 	dir := t.TempDir()
-	pad := make([]byte, 13<<20)
+	// 257 files of 64 KiB each: every file is within its own limit, together they
+	// are more than 16 MiB.
+	pad := make([]byte, maxDigestFile-len(d0))
 	for i := range pad {
 		pad[i] = ' '
 	}
-	for i := 0; i < 6; i++ {
+	for i := 0; i < 257; i++ {
 		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("d%d.json", i)), append(append([]byte{}, d0...), pad...), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -148,5 +150,25 @@ func TestRowHashJSONDoesNotClaimVerification(t *testing.T) {
 	_, out, _ := run(t, "row-hash", "--table-id", "1", "--columns", f, "--json")
 	if !strings.Contains(out, `"verified": false`) {
 		t.Errorf("%s", out)
+	}
+}
+
+// L9-05: a digest is a few hundred bytes; a file of more than 64 KiB is refused
+// before it is parsed, by every command that reads a digest.
+func TestDigestFileLimit(t *testing.T) {
+	d0, _ := os.ReadFile(fx("digests/d0.json"))
+	big := filepath.Join(t.TempDir(), "big.json")
+	if err := os.WriteFile(big, append(d0, make([]byte, 64<<10)...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"digest-chain", big},
+		{"digest-chain", "--digests", filepath.Dir(big)},
+		{"blocks", "--blocks", big, "--digest", big},
+		{"proof", "--proof", big, "--digest", big},
+	} {
+		if code, _, errs := run(t, args...); code != 2 || !strings.Contains(errs, "larger than the limit") {
+			t.Errorf("%v: %d %s", args[0], code, errs)
+		}
 	}
 }
