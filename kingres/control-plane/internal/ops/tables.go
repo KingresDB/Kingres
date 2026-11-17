@@ -211,6 +211,9 @@ func (o *Ops) EnableLedger(ctx context.Context, db, schema, table string, req ap
 		if mode == "updatable" && !ledgerSupportsUpdatable(version) {
 			return problem.New(problem.UnsupportedOp, "Updatable ledger tables need kingres_ledger 0.2; version "+version+" is installed.")
 		}
+		if err := needCurrentLedger(ctx, tx); err != nil {
+			return err
+		}
 		var already bool
 		if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM kingres.ledger_table WHERE relid = to_regclass($1))", qualified(schema, table)).Scan(&already); err != nil {
 			return err
