@@ -125,11 +125,15 @@ var transitions = map[State]map[Event]State{
 		EventExpire:           StateExpired,
 	},
 	StateClaimed: {
-		EventReceiptClaimed:  StateClaimed,
-		EventReceiptAnchored: StateAnchored,
-		EventWait:            StateClaimed,
-		EventFail:            StateFailed,
-		EventConflict:        StateFailed,
+		// a header contradicted the claim and no other plausible claim is left:
+		// the record is submitted again, to wait for the other calendars
+		EventReceiptSubmitted: StateSubmitted,
+		EventReceiptClaimed:   StateClaimed,
+		EventReceiptAnchored:  StateAnchored,
+		EventWait:             StateClaimed,
+		EventFail:             StateFailed,
+		EventConflict:         StateFailed,
+		EventExpire:           StateExpired,
 	},
 	StateFailed: {
 		EventRetry: StatePending,
@@ -235,8 +239,9 @@ func (r Record) Retry(now time.Time) (Record, error) {
 
 // ApplyReceipt applies the successful result of Submit or Upgrade. It
 // refuses (error, record unchanged) a receipt that the table does not allow
-// from the record's state: nothing leaves anchored, and a claimed record is
-// not made submitted again.
+// from the record's state: nothing leaves anchored, and a claimed record
+// becomes submitted again only through a "submitted" receipt (every claim was
+// dropped and other calendars may still deliver).
 func (r Record) ApplyReceipt(rc Receipt, now time.Time) (Record, error) {
 	var ev Event
 	switch rc.State {
@@ -456,11 +461,24 @@ func UpgradeInterval(age time.Duration) time.Duration {
 	return time.Hour
 }
 
-// ExpireIfDue moves a submitted record to expired when it is older than
-// timeout (OpenTimestamps: upgradeTimeoutDays) and reports whether it did.
-// Only a submitted record expires: a claimed one has its claim already.
-func (r Record) ExpireIfDue(now time.Time, timeout time.Duration) (Record, bool) {
-	if r.State != StateSubmitted || now.Sub(r.CreatedAt) < timeout {
+// ExpireIfDue moves a record to expired when it has waited longer than its
+// timeout, counted from CreatedAt, and reports whether it did: a submitted
+// record after timeout (OpenTimestamps: upgradeTimeoutDays), a claimed one
+// after claimedTimeout, which is longer (ots.ClaimedTimeout): a claim is a
+// calendar's word that nothing checked, the record keeps asking the other
+// calendars and the header source, and it must end one day. Records in any
+// other state are not touched.
+func (r Record) ExpireIfDue(now time.Time, timeout, claimedTimeout time.Duration) (Record, bool) {
+	var limit time.Duration
+	switch r.State {
+	case StateSubmitted:
+		limit = timeout
+	case StateClaimed:
+		limit = claimedTimeout
+	default:
+		return r, false
+	}
+	if now.Sub(r.CreatedAt) < limit {
 		return r, false
 	}
 	out, err := r.step(EventExpire)

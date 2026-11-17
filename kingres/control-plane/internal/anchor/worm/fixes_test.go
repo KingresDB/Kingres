@@ -189,12 +189,23 @@ func TestEvidenceNamesTheObject(t *testing.T) {
 // A1-07: the time that the store states is bounded against the clock, on a
 // fresh write and on the object an earlier attempt wrote.
 func TestStoreTimeIsBounded(t *testing.T) {
-	for name, skew := range map[string]time.Duration{"ahead-1h": time.Hour, "behind-1h": -time.Hour, "ahead-20y": 20 * 365 * 24 * time.Hour, "behind-20y": -20 * 365 * 24 * time.Hour} {
+	type bad struct {
+		skew  time.Duration
+		class anchor.Class
+		code  string
+	}
+	for name, c := range map[string]bad{
+		"ahead-1h":   {time.Hour, anchor.ClassRefused, "store_time_skew"},
+		"ahead-20y":  {20 * 365 * 24 * time.Hour, anchor.ClassRefused, "store_time_skew"},
+		"behind-1h":  {-time.Hour, anchor.ClassPermanent, "store_time_early"},
+		"behind-20y": {-20 * 365 * 24 * time.Hour, anchor.ClassPermanent, "store_time_early"},
+	} {
 		f := newFakeS3()
-		f.skew = skew
+		f.skew = c.skew
 		_, err := newTarget(t, f).Submit(context.Background(), testPayload(t, "11", 1))
-		ae := expectErr(t, err, anchor.ClassRefused, "store_time_skew")
-		if !strings.Contains(ae.Error(), "clock") {
+		ae := expectErr(t, err, c.class, c.code)
+		// the cause is in the code and the text: a clock, not credentials
+		if !strings.Contains(ae.Error(), "clock") || !strings.Contains(ae.Error(), "not of credentials") {
 			t.Errorf("%s: %v", name, ae)
 		}
 		f.close()
@@ -211,17 +222,21 @@ func TestStoreTimeIsBounded(t *testing.T) {
 	defer f.close()
 	tg := newTarget(t, f, func(c *Config, o *Options) { c.MaxSkewSeconds = 2 * 3600 })
 	mustSubmit(t, tg, testPayload(t, "11", 1))
-	// the object of an earlier attempt: Last-Modified 20 years ago or 5 years ahead
-	for _, lm := range map[string]time.Duration{"old": -20 * 365 * 24 * time.Hour, "future": 5 * 365 * 24 * time.Hour} {
+	// the object of an earlier attempt: Last-Modified 20 years before the
+	// first attempt, or 5 years ahead of the clock
+	for _, c := range map[string]bad{
+		"old":    {-20 * 365 * 24 * time.Hour, anchor.ClassPermanent, "store_time_early"},
+		"future": {5 * 365 * 24 * time.Hour, anchor.ClassRefused, "store_time_skew"},
+	} {
 		g := newFakeS3()
 		tg := newTarget(t, g)
 		p := testPayload(t, "12", 1)
 		v := g.addVersion(keyOf("12"), p.SignedNote, "COMPLIANCE", time.Now().Add(30*24*time.Hour))
 		g.mu.Lock()
-		v.lastMod = time.Now().Add(lm).UTC().Truncate(time.Second)
+		v.lastMod = time.Now().Add(c.skew).UTC().Truncate(time.Second)
 		g.mu.Unlock()
 		_, err := tg.Submit(context.Background(), p)
-		expectErr(t, err, anchor.ClassRefused, "store_time_skew")
+		expectErr(t, err, c.class, c.code)
 		g.close()
 	}
 	// a recent earlier object is fine

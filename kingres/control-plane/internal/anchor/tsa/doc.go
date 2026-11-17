@@ -88,7 +88,12 @@
 //     5, status 0 or 1 without a token, a wrong content type) is permanent.
 //     anchor.CodeOf gives a stable tag (the Code* constants and "tsa_waiting",
 //     "tsa_rejected", "tsa_unavailable", "tsa_revocation", "no_token",
-//     "content_type", "http_status", "transport").
+//     "content_type", "http_status", "transport"). The alert text must come
+//     from the code and the text of the error, not from the class: "time_skew"
+//     and "chain_not_trusted_now" are of class refused (retried 1, 5, 15
+//     minutes, then failed) and are problems of clocks and of the authority's
+//     certificate, not of credentials, and their text says so and says what to
+//     do.
 //   - Raise ledgerAnchorBehind from the age of the newest anchor, not from the
 //     token: a token whose genTime is more than the tolerance from the clock is
 //     not recorded at all (time_skew).
@@ -143,9 +148,14 @@
 //   - SignedData version and SignerInfo version: 1 or 3.
 //   - The policy: when Config.PolicyOID is set the token's policy must equal
 //     it; otherwise any policy is accepted and recorded.
-//   - The TSTInfo "tsa" field, when present, must be the subject, a directoryName,
-//     DNS name, URI or e-mail address of the subject alternative name of the
-//     signer (RFC 3161 2.4.2); a GeneralName of another kind does not match.
+//   - The TSTInfo "tsa" field, when present, must correspond to a name of the
+//     signing certificate (RFC 3161 2.4.2): the subject or a directoryName of
+//     the subject alternative name, compared by the decoded attribute values
+//     (any string type, case ignored, white space folded, as RFC 5280 7.1
+//     describes) and not by the bytes; a DNS name (case ignored), URI, e-mail
+//     address or IP address of the alternative names; or an otherName that is
+//     one of them byte for byte. The token is refused (tsa_name_mismatch) only
+//     when no name of the certificate corresponds.
 //     A TSTInfo extension is accepted if it is not critical and ignored.
 //   - The RSA key of the signer must have 2048 bits or more (the floor of the
 //     toolchain would let 1024 pass, and a GODEBUG setting lower still).

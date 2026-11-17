@@ -16,19 +16,33 @@
 //  3. On 200 the version is read back: HEAD with versionId and
 //     x-amz-checksum-mode ENABLED, then GET of that version. The object must
 //     carry the configured lock mode and a retain-until date not earlier than
-//     requested (5 minutes of tolerance when it was just written, 8 days when an
-//     earlier attempt wrote it) and in the future; Content-Length, the version
-//     id (which must exist: no version id is no anchor, Code "no_version_id")
-//     and, when the store returns it, the sha256 checksum must match; the
-//     bytes of THAT version must equal the note; Last-Modified must be present
-//     and within Config.MaxSkewSeconds (default 300) of the clock for a fresh
-//     write, or within 8 days before and the tolerance after the clock for
-//     an object an earlier attempt wrote (Code "store_time_skew", class refused:
-//     the time the evidence states is the store's clock, and a store with a
-//     wrong clock is refused rather than believed). A store that accepts the
-//     put without locking is reported as a permanent error with Code
-//     "not_locked". A failed read-back is retryable for a transport failure or
-//     a 5xx and refused (a few tries, then failed) for any other answer.
+//     requested less RetentionTolerance (5 minutes) and in the future;
+//     Content-Length, the version id (which must exist: no version id is no
+//     anchor, Code "no_version_id") and, when the store returns it, the
+//     sha256 checksum must match; the bytes of THAT version must equal the
+//     note; Last-Modified must be present and bounded against two clocks of
+//     ours. It is never later than the clock plus the tolerance
+//     (Config.MaxSkewSeconds, default 300): else Code "store_time_skew",
+//     class refused (the store is ahead; it passes when the clocks agree).
+//     It is never earlier than the time of the first attempt of the record
+//     (Payload.FirstAttempt, required) less the tolerance: else Code
+//     "store_time_early", class permanent (the store is behind, or the
+//     object belongs to an earlier record; the object is locked and keeps its
+//     time, so a retry would find the same object). For an object that this
+//     call has just written the time must also be within the tolerance of
+//     the clock. The time the evidence states is the store's clock, and a
+//     store with a wrong clock is refused rather than believed, now and on
+//     every later attempt for that object (the second attempt does not judge
+//     the object by a wider rule than the first). An existing, complete,
+//     locked version of our own bytes has no other age limit, so a crash
+//     recovery or an operator who takes a month to fix a bucket still
+//     completes the key. The text of both errors says that it is a problem
+//     of clocks, not of credentials. A store that accepts the put without
+//     locking is reported as a permanent error with Code "not_locked". A
+//     failed read-back is retryable for a transport failure or a 5xx and
+//     refused (a few tries, then failed) for any other answer. A first
+//     attempt later than the clock plus the tolerance is Code
+//     "first_attempt_ahead", retryable, and nothing is sent.
 //  4. On 412, or 409 ConditionalRequestConflict, the key is read: the latest
 //     version when its bytes equal the note, otherwise the versions of the key
 //     are listed (newest first, at most MaxVersionsChecked read) and every
@@ -36,13 +50,17 @@
 //     version over the key is therefore not a conflict as long as our version is
 //     there. Only when no version of the key holds the note is it an error of
 //     class conflict (Code "worm_conflict"); nothing is ever overwritten.
-//     A version of ours that has no lock, or a retention shorter than asked in
-//     the configured mode, gets the retention applied (PutObjectRetention on
-//     that version, with Content-MD5) and is verified again: an object that an
-//     earlier Submit left unlocked is completed by the next one. When the store
-//     refuses, the error (Code "not_locked") names the key, the version, the
-//     mode and the date, and says to apply them with the store's tools and to
-//     Retry; a version locked in another mode is never touched.
+//     A version of ours that has no lock, or a retention earlier than the
+//     first attempt asked (the first attempt's time plus retentionDays) less
+//     RetentionTolerance, in the configured mode, gets the retention applied
+//     (PutObjectRetention on that version, with Content-MD5, until the
+//     retention asked now) and is verified again: an object that an earlier
+//     Submit left unlocked or locked too short is completed by the next one.
+//     When the store refuses, the error (Code "not_locked") names the key, the
+//     version, the mode and the date, and says to apply them with the store's
+//     tools and to Retry (which works after any delay); a version locked in
+//     another mode is never touched. Nothing is repaired on an object whose
+//     time is refused.
 //  5. With ifNoneMatch "auto" a store that answers the put with 501, or 400
 //     that does not mention the lock, is handled by a check before the write
 //     (HEAD of the key, put without the header when absent). "on" refuses such
@@ -66,7 +84,7 @@
 // retain_until and last_modified the values the store returned (whole
 // seconds, UTC), recorded_by always "cluster". Receipt.State is "anchored"
 // and Receipt.EvidenceTime is last_modified, the store's clock, which was
-// bounded against the cluster's clock. What a verifier does: VerifyNote (the
+// bounded against the cluster's clock and against the first attempt of the record. What a verifier does: VerifyNote (the
 // note in hand, from the publication or fetched, is exactly the object that
 // the evidence describes by SHA-256 and length, is a well-formed signed note
 // whose text hashes to payload_sha256 of the file, and sits at the key of the
@@ -117,8 +135,16 @@
 //
 // Load the credentials and the CA bundle, build the *http.Client with
 // anchor.NewHTTPClient (no proxy from the environment, the roots of the bundle,
-// timeouts; whatever client is passed, this package uses no proxy), call Submit
-// for due records and keep the first evidence for a key, raise the alerts that
-// anchor.Record.AfterError names, and warn when retain_until approaches. This
-// package does not store anything, retry, or delete objects.
+// timeouts; whatever client is passed, this package uses no proxy), build every
+// Payload with anchor.NewPayload and the time of the first attempt for this key
+// (the creation time of the first record of the checkpoint for this target is
+// never later; a Retry of a failed record keeps it), call Submit for due
+// records and keep the first evidence for a key, raise the alerts that
+// anchor.Record.AfterError names, and warn when retain_until approaches. The
+// text of an alert must come from the code and the text of the error
+// (anchor.CodeOf, Error()), not from its class: "store_time_skew" and
+// "store_time_early" are about clocks, "first_attempt_ahead" about the clock of
+// this server, and none of them is about credentials although the first is of
+// class refused. This package does not store anything, retry, or delete
+// objects.
 package worm

@@ -378,14 +378,14 @@ func FuzzNewPayload(f *testing.F) {
 	f.Add([]byte("o\n1\n" + base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32)) + "\n\n\xe2\x80\x94 n AAAA\n"))
 	f.Add([]byte(""))
 	f.Fuzz(func(t *testing.T, b []byte) {
-		p, err := NewPayload("ab", b)
+		p, err := NewPayload("ab", b, t0)
 		if err != nil {
 			return
 		}
 		if !bytes.Equal(p.SignedNote, b) || !bytes.HasPrefix(b, p.NoteText) || bytes.Count(p.NoteText, []byte("\n")) != 3 {
 			t.Fatal("payload does not match its input")
 		}
-		if _, err := NewPayload("ab", p.SignedNote); err != nil {
+		if _, err := NewPayload("ab", p.SignedNote, t0); err != nil {
 			t.Fatal(err)
 		}
 	})

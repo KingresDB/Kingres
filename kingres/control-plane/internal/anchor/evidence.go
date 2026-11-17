@@ -49,7 +49,7 @@ func ParseTime(s string) (time.Time, error) {
 }
 
 // WORMEvidence is the evidence of a WORM anchor (design 6.3 step 5 and
-// correction 70).
+// correction 61).
 type WORMEvidence struct {
 	Endpoint  string `json:"endpoint"` // "" for AWS
 	Bucket    string `json:"bucket"`
@@ -118,7 +118,7 @@ type OTSBitcoin struct {
 }
 
 // OTSEvidence is the evidence of an OpenTimestamps anchor (design 6.5 step
-// 2 and correction 70).
+// 2 and corrections 60 and 61).
 type OTSEvidence struct {
 	Digest string `json:"digest"` // hex of the 32-byte digest
 	// SubmittedAt is the cluster's clock when the digest was first accepted
@@ -410,7 +410,7 @@ type evidenceFileJSON struct {
 // compact; no trailing newline). The evidence member is re-encoded from its
 // parsed form, so the bytes are canonical even if f.Evidence was not.
 func EncodeEvidenceFile(f EvidenceFile) ([]byte, error) {
-	if !printableASCII(f.Origin, MaxOriginLen) || f.Origin == "" {
+	if !ValidOrigin(f.Origin) {
 		return nil, errors.New("anchor: evidence file origin is missing or malformed")
 	}
 	if d, err := hex.DecodeString(f.PayloadSHA256); err != nil || len(d) != 32 || strings.ToLower(f.PayloadSHA256) != f.PayloadSHA256 {

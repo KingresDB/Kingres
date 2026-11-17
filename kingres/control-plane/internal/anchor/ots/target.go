@@ -131,6 +131,14 @@ type Options struct {
 	// and the record is anchored only when the check passes; without it a
 	// claim stays a claim (receipt state "claimed").
 	Headers HeaderSource
+
+	// headerWork replaces the proof-of-work check of a header, and fragmentLimit
+	// the largest stored fragment: only the tests of this package set them (a
+	// header that holds a merkle root made of SHA-256 operations cannot be mined
+	// in a test, and the limits of the other sizes keep a real call from
+	// reaching a fragment past MaxFragment).
+	headerWork    func([]byte) (HeaderResult, error)
+	fragmentLimit int
 }
 
 // Target is the OpenTimestamps target. It implements anchor.Target and is
@@ -141,6 +149,10 @@ type Target struct {
 	now     anchor.Clock
 	rand    io.Reader
 	headers HeaderSource
+	// work is the proof-of-work check of a header (CheckHeader), fragLimit the
+	// largest stored fragment (MaxFragment); see Options.
+	work      func([]byte) (HeaderResult, error)
+	fragLimit int
 }
 
 var _ anchor.Target = (*Target)(nil)
@@ -159,7 +171,15 @@ func New(cfg Config, opt Options) (*Target, error) {
 	if rd == nil {
 		rd = rand.Reader
 	}
-	return &Target{cfg: n, cal: NewCalendarClient(opt.Client, opt.UserAgent, now), now: now, rand: rd, headers: opt.Headers}, nil
+	work := opt.headerWork
+	if work == nil {
+		work = CheckHeader
+	}
+	limit := opt.fragmentLimit
+	if limit <= 0 {
+		limit = MaxFragment
+	}
+	return &Target{cfg: n, cal: NewCalendarClient(opt.Client, opt.UserAgent, now), now: now, rand: rd, headers: opt.Headers, work: work, fragLimit: limit}, nil
 }
 
 // Config returns the normalized configuration.
@@ -304,6 +324,27 @@ func (t *Target) SubmitWithPrior(ctx context.Context, p anchor.Payload, prior *a
 	}
 	next := t.now().Add(FirstCheck)
 	return anchor.Receipt{State: anchor.ReceiptSubmitted, Evidence: raw, NextCheck: &next}, nil
+}
+
+// ClaimedTimeoutFactor is how many times longer than the timeout of a submitted
+// record a claimed one is kept before it expires: it holds a claim that nothing
+// checked, and it keeps asking the other calendars and the header source.
+const ClaimedTimeoutFactor = 4
+
+// Timeout is how long a submitted record waits for a Bitcoin attestation
+// (timeoutDays 0 means the default); it is the timeout argument of
+// anchor.Record.ExpireIfDue.
+func Timeout(timeoutDays int) time.Duration {
+	if timeoutDays <= 0 {
+		timeoutDays = DefaultUpgradeTimeoutDays
+	}
+	return time.Duration(timeoutDays) * 24 * time.Hour
+}
+
+// ClaimedTimeout is how long a claimed record waits (ClaimedTimeoutFactor times
+// Timeout); it is the claimedTimeout argument of anchor.Record.ExpireIfDue.
+func ClaimedTimeout(timeoutDays int) time.Duration {
+	return ClaimedTimeoutFactor * Timeout(timeoutDays)
 }
 
 // Expired reports whether a submitted anchor created at createdAt has waited

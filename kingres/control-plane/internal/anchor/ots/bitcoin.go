@@ -69,12 +69,6 @@ func CompactToTarget(bits uint32) (*big.Int, error) {
 	return t, nil
 }
 
-// headerWork is the work check that CheckAgainstHeader and the header source
-// of Upgrade use. A test replaces it, because a header that passes the real
-// check cannot be made without mining and a merkle root that is the result of
-// a chain of SHA-256 operations cannot be put in a real header.
-var headerWork = CheckHeader
-
 // CheckHeader checks that the header hashes to a value not above its own
 // target and that the target is not easier than the main chain's limit
 // (0x1d00ffff). It does not and cannot show that the header is on the best chain.
@@ -112,7 +106,7 @@ func CheckHeader(header []byte) (HeaderResult, error) {
 // digest lead to, the merkle root the proof commits to) must equal the
 // header's merkle root field. The result carries the header time.
 func CheckAgainstHeader(root *Node, height uint64, header []byte) (HeaderResult, error) {
-	res, err := headerWork(header)
+	res, err := CheckHeader(header)
 	if err != nil {
 		return res, err
 	}

@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -37,12 +38,25 @@ const (
 // time takes one (or a time.Time). time.Now is a valid Clock.
 type Clock func() time.Time
 
-// Limits of the payload.
+// Limits of the payload. The verifier (kingres-verify, module kingres/verifier)
+// enforces the same limits on every note it reads; the two modules cannot
+// import each other, so the values are repeated here and a test of this
+// package reads the verifier's source constants and compares them.
 const (
-	// MaxSignedNote is the largest signed note accepted as a payload.
+	// MaxSignedNote is the largest signed note accepted as a payload (the
+	// verifier accepts up to 64 KiB; a note of the ledger is far smaller).
 	MaxSignedNote = 16 << 10
-	// MaxOriginLen is the longest origin accepted.
-	MaxOriginLen = 256
+	// MaxOriginLen is the longest origin accepted (verifier: MaxOriginLength).
+	MaxOriginLen = 255
+	// MaxSignatureLines is the most signature lines of a note (verifier:
+	// signednote.MaxSignatures).
+	MaxSignatureLines = 32
+	// MaxNoteLineLen is the longest line of a note, text or signature, without
+	// its newline (verifier: signednote.MaxLineLength).
+	MaxNoteLineLen = 1024
+	// TreeSizeLimit is the exclusive upper bound of a tree size (verifier:
+	// tlog.MaxTreeSize, 2^62).
+	TreeSizeLimit uint64 = 1 << 62
 )
 
 // Target is the interface of section 6.2 of the design. Implementations are
@@ -77,6 +91,13 @@ type Payload struct {
 	SignedNote []byte
 	// Digest is SHA-256(NoteText).
 	Digest [32]byte
+	// FirstAttempt is the time of the first attempt to anchor this checkpoint
+	// at the target for this key (the record's first Submit, or its creation,
+	// which is never later). It is required: NewPayload takes it and Check
+	// refuses a zero value. The WORM target bounds the time of an object that
+	// an earlier attempt wrote by it. For a Retry of a failed record it stays
+	// the time of the original first attempt. Whole seconds, UTC.
+	FirstAttempt time.Time
 }
 
 // AggregateID returns the part of ID before the slash.
@@ -88,15 +109,50 @@ func (p Payload) AggregateID() string {
 	return p.ID[:i]
 }
 
+// ValidOrigin reports whether s can be the origin of a note, by the rule of
+// the verifier (kingres-verify): 1 to MaxOriginLen bytes of valid UTF-8 with
+// no Unicode white space, no plus sign and no control character.
+func ValidOrigin(s string) bool {
+	if s == "" || len(s) > MaxOriginLen || !utf8.ValidString(s) {
+		return false
+	}
+	for _, r := range s {
+		if unicode.IsSpace(r) || r == '+' || r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 // NewPayload builds the payload of the signed note of aggregate aggregateIDHex
-// (lower case hexadecimal, 1 to 128 digits). It checks only the shape the
-// anchoring depends on: valid UTF-8 without control characters other than
-// newline; text of exactly three non-empty lines (origin, size in ASCII
-// decimal without sign or leading zeros, root as standard base64 of 32 bytes);
-// a blank line; at least one signature line (U+2014, a space, a name, a space,
-// base64). It does not verify a signature: that is the signer's and the
-// verifier's job.
-func NewPayload(aggregateIDHex string, signedNote []byte) (Payload, error) {
+// (lower case hexadecimal, 1 to 128 digits) for the checkpoint whose first
+// attempt to be anchored at the target was at firstAttempt (required, see
+// Payload.FirstAttempt). The shape rules are those of ParsePayload.
+func NewPayload(aggregateIDHex string, signedNote []byte, firstAttempt time.Time) (Payload, error) {
+	if firstAttempt.IsZero() {
+		return Payload{}, fmt.Errorf("anchor: the time of the first attempt is required")
+	}
+	p, err := ParsePayload(aggregateIDHex, signedNote)
+	if err != nil {
+		return Payload{}, err
+	}
+	p.FirstAttempt = firstAttempt.UTC().Truncate(time.Second)
+	return p, nil
+}
+
+// ParsePayload checks the shape of a signed note and returns its payload
+// without a time of first attempt (a zero FirstAttempt, which Check refuses):
+// for a reader of stored notes, such as an independent verifier, that has no
+// attempt to speak of. It checks the shape the anchoring depends on, with the
+// limits of the verifier (kingres-verify), so that nothing is anchored that
+// the verifier would call malformed: valid UTF-8 without control characters
+// other than newline; no line longer than MaxNoteLineLen; text of exactly
+// three non-empty lines (an origin by ValidOrigin, a size in ASCII decimal
+// without sign or leading zeros and below TreeSizeLimit, a root as standard
+// base64 of 32 bytes); a blank line; one to MaxSignatureLines signature lines
+// (U+2014, a space, a name, a space, base64). It does not verify a signature:
+// that is the signer's and the verifier's job.
+func ParsePayload(aggregateIDHex string, signedNote []byte) (Payload, error) {
 	if len(aggregateIDHex) == 0 || len(aggregateIDHex) > 128 {
 		return Payload{}, fmt.Errorf("anchor: aggregate id must have 1 to 128 hex digits")
 	}
@@ -125,7 +181,16 @@ func NewPayload(aggregateIDHex string, signedNote []byte) (Payload, error) {
 	if len(sigs) == 0 || sigs[len(sigs)-1] != '\n' {
 		return Payload{}, fmt.Errorf("anchor: signed note signatures must end in a newline")
 	}
-	for _, l := range strings.Split(strings.TrimSuffix(string(sigs), "\n"), "\n") {
+	sigLines := strings.Split(strings.TrimSuffix(string(sigs), "\n"), "\n")
+	if len(sigLines) > MaxSignatureLines {
+		return Payload{}, fmt.Errorf("anchor: signed note has more than %d signature lines", MaxSignatureLines)
+	}
+	for _, l := range strings.Split(string(signedNote), "\n") {
+		if len(l) > MaxNoteLineLen {
+			return Payload{}, fmt.Errorf("anchor: signed note has a line longer than %d bytes", MaxNoteLineLen)
+		}
+	}
+	for _, l := range sigLines {
 		rest, ok := strings.CutPrefix(l, "\xe2\x80\x94 ")
 		name, b64, ok2 := strings.Cut(rest, " ")
 		if !ok || !ok2 || name == "" || b64 == "" {
@@ -139,15 +204,12 @@ func NewPayload(aggregateIDHex string, signedNote []byte) (Payload, error) {
 	if len(lines) != 3 || lines[0] == "" || lines[1] == "" || lines[2] == "" {
 		return Payload{}, fmt.Errorf("anchor: note text must be three non-empty lines")
 	}
-	if len(lines[0]) > MaxOriginLen {
-		return Payload{}, fmt.Errorf("anchor: origin is longer than %d bytes", MaxOriginLen)
-	}
-	if strings.ContainsAny(lines[0], " \t") {
-		return Payload{}, fmt.Errorf("anchor: origin contains a space")
+	if !ValidOrigin(lines[0]) {
+		return Payload{}, fmt.Errorf("anchor: origin is not valid: 1 to %d bytes of UTF-8 without white space, plus signs or control characters", MaxOriginLen)
 	}
 	sz, err := strconv.ParseUint(lines[1], 10, 64)
-	if err != nil || strconv.FormatUint(sz, 10) != lines[1] {
-		return Payload{}, fmt.Errorf("anchor: note size is not canonical decimal")
+	if err != nil || strconv.FormatUint(sz, 10) != lines[1] || sz >= TreeSizeLimit {
+		return Payload{}, fmt.Errorf("anchor: note size is not a canonical decimal below 2^62")
 	}
 	if root, err := base64.StdEncoding.DecodeString(lines[2]); err != nil || len(root) != 32 {
 		return Payload{}, fmt.Errorf("anchor: note root is not base64 of 32 bytes")
@@ -167,7 +229,10 @@ func NewPayload(aggregateIDHex string, signedNote []byte) (Payload, error) {
 // Payload, a digest that is not SHA-256 of the note text and a text that is
 // not the head of the signed note are all refused.
 func (p Payload) Check() error {
-	q, err := NewPayload(p.AggregateID(), p.SignedNote)
+	if p.FirstAttempt.IsZero() {
+		return fmt.Errorf("anchor: payload has no time of first attempt (use anchor.NewPayload)")
+	}
+	q, err := ParsePayload(p.AggregateID(), p.SignedNote)
 	if err != nil {
 		return err
 	}

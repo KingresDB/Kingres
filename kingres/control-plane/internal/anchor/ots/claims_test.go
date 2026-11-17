@@ -303,20 +303,15 @@ func (f *fakeHeaders) Header(ctx context.Context, h uint64) ([]byte, error) {
 	return nil, errors.New("no such block")
 }
 
-// noWork replaces the proof-of-work check, for the tests of the path from the
+// noWorkFn replaces the proof-of-work check (Options.headerWork), for the tests of the path from the
 // claim to a header: a header that holds a merkle root computed by SHA-256
 // operations cannot be mined in a test. The real work check is tested on the
 // real headers (TestRealHeadersPassCheck and the others).
-func noWork(t *testing.T) {
-	t.Helper()
-	old := headerWork
-	headerWork = func(h []byte) (HeaderResult, error) {
-		if len(h) != HeaderSize {
-			return HeaderResult{}, ErrBadHeader
-		}
-		return HeaderResult{Time: time.Unix(int64(binary.LittleEndian.Uint32(h[68:72])), 0).UTC()}, nil
+func noWorkFn(h []byte) (HeaderResult, error) {
+	if len(h) != HeaderSize {
+		return HeaderResult{}, ErrBadHeader
 	}
-	t.Cleanup(func() { headerWork = old })
+	return HeaderResult{Time: time.Unix(int64(binary.LittleEndian.Uint32(h[68:72])), 0).UTC()}, nil
 }
 
 func syntheticHeader(root []byte, tm time.Time) []byte {
@@ -347,12 +342,11 @@ func headerSetup(t *testing.T) (cal *scriptCal, rc anchor.Receipt, root []byte) 
 // time that fits; the header is stored, EvidenceTime is its time, and the
 // evidence checks again with nothing but its own bytes.
 func TestHeaderSourceAnchors(t *testing.T) {
-	noWork(t)
 	cal, rc, root := headerSetup(t)
 	bt := testNow.Add(40 * time.Minute)
 	hdr := syntheticHeader(root, bt)
 	src := &fakeHeaders{m: map[uint64][]byte{goodHeight: hdr}}
-	tg := upgradeTarget(t, Options{Headers: src}, cal.url())
+	tg := upgradeTarget(t, Options{Headers: src, headerWork: noWorkFn}, cal.url())
 	out, err := tg.Upgrade(context.Background(), rc)
 	if err != nil || out.State != anchor.ReceiptAnchored || out.EvidenceTime == nil || !out.EvidenceTime.Equal(bt) {
 		t.Fatalf("%+v %v", out, err)
@@ -362,18 +356,18 @@ func TestHeaderSourceAnchors(t *testing.T) {
 		t.Fatalf("%+v", ev.Bitcoin)
 	}
 	// the verifier needs nothing else: the header is in the evidence
-	chk, err := CheckEvidence(ev, testNow.Add(time.Hour), nil)
+	chk, err := checkEvidence(ev, testNow.Add(time.Hour), nil, noWorkFn)
 	if err != nil || chk.Status != anchor.BitcoinHeaderChecked || !chk.Claims[chk.Best].HeaderTime.Equal(bt) {
 		t.Fatalf("%+v %v", chk, err)
 	}
 	// and when the verifier supplies its own header, the same result
-	chk, err = CheckEvidence(ev, testNow.Add(time.Hour), func(h uint64) ([]byte, bool) { return hdr, h == goodHeight })
+	chk, err = checkEvidence(ev, testNow.Add(time.Hour), func(h uint64) ([]byte, bool) { return hdr, h == goodHeight }, noWorkFn)
 	if err != nil || chk.Status != anchor.BitcoinHeaderChecked {
 		t.Fatalf("%+v %v", chk, err)
 	}
 	// a header of the verifier that has another root makes the claim false
 	other := syntheticHeader(sha([]byte("another root")), bt)
-	chk, err = CheckEvidence(ev, testNow.Add(time.Hour), func(h uint64) ([]byte, bool) { return other, h == goodHeight })
+	chk, err = checkEvidence(ev, testNow.Add(time.Hour), func(h uint64) ([]byte, bool) { return other, h == goodHeight }, noWorkFn)
 	if err == nil && chk.Status == anchor.BitcoinHeaderChecked && chk.Claims[0].HeaderProblem == "" {
 		t.Fatal("a header with another merkle root passed")
 	}
@@ -382,7 +376,7 @@ func TestHeaderSourceAnchors(t *testing.T) {
 	b := *ev.Bitcoin
 	b.Header = hex.EncodeToString(other)
 	bad.Bitcoin = &b
-	if _, err := CheckEvidence(bad, testNow.Add(time.Hour), nil); err == nil {
+	if _, err := checkEvidence(bad, testNow.Add(time.Hour), nil, noWorkFn); err == nil {
 		t.Fatal("evidence with a header that does not hold the root accepted")
 	}
 }
@@ -390,42 +384,53 @@ func TestHeaderSourceAnchors(t *testing.T) {
 // The merkle root of the header is compared as it stands in bytes 36 to 68: a
 // header that holds the reversed root does not anchor the claim.
 func TestHeaderSourceRootNotReversed(t *testing.T) {
-	noWork(t)
 	cal, rc, root := headerSetup(t)
 	rev := make([]byte, 32)
 	for i := range rev {
 		rev[i] = root[31-i]
 	}
 	src := &fakeHeaders{m: map[uint64][]byte{goodHeight: syntheticHeader(rev, testNow.Add(time.Minute))}}
-	out, err := upgradeTarget(t, Options{Headers: src}, cal.url()).Upgrade(context.Background(), rc)
-	if err != nil || out.State == anchor.ReceiptAnchored {
+	out, err := upgradeTarget(t, Options{Headers: src, headerWork: noWorkFn}, cal.url()).Upgrade(context.Background(), rc)
+	if err == nil || !anchor.IsConflict(err) || out.State == anchor.ReceiptAnchored {
 		t.Fatalf("%s %v", out.State, err)
 	}
 }
 
 func TestHeaderSourceFailures(t *testing.T) {
-	noWork(t)
 	cal, rc, root := headerSetup(t)
-	// a header with another root: the claim is false, the receipt stays submitted
+	// a header with another root: the claim is false and is dropped; nothing is
+	// left that could deliver, so a calendar lied: an error of class conflict
+	// and the receipt as it was
 	src := &fakeHeaders{m: map[uint64][]byte{goodHeight: syntheticHeader(sha([]byte("x")), testNow.Add(time.Minute))}}
-	out, err := upgradeTarget(t, Options{Headers: src}, cal.url()).Upgrade(context.Background(), rc)
-	if err != nil || out.State != anchor.ReceiptSubmitted {
-		t.Fatalf("false claim: %s %v", out.State, err)
+	_, err := upgradeTarget(t, Options{Headers: src, headerWork: noWorkFn}, cal.url()).Upgrade(context.Background(), rc)
+	if err == nil || !anchor.IsConflict(err) || anchor.CodeOf(err) != "claim_contradicted" {
+		t.Fatalf("false claim: %v", err)
 	}
-	// the block is older than the digest, and in the future
-	for name, tm := range map[string]time.Time{"older": testNow.Add(-BlockTimeSlack - time.Minute), "future": testNow.Add(FutureSlack + time.Hour)} {
-		src := &fakeHeaders{m: map[uint64][]byte{goodHeight: syntheticHeader(root, tm)}}
-		out, err := upgradeTarget(t, Options{Headers: src}, cal.url()).Upgrade(context.Background(), rc)
-		if err != nil || out.State == anchor.ReceiptAnchored {
+	// a block that is older than the digest contradicts the claim too
+	src = &fakeHeaders{m: map[uint64][]byte{goodHeight: syntheticHeader(root, testNow.Add(-BlockTimeSlack-time.Minute))}}
+	_, err = upgradeTarget(t, Options{Headers: src, headerWork: noWorkFn}, cal.url()).Upgrade(context.Background(), rc)
+	if err == nil || !anchor.IsConflict(err) {
+		t.Fatalf("older block: %v", err)
+	}
+	// a block time in the future (our clock may be wrong) and a header that
+	// fails the work check (the source may be wrong) contradict nothing: the
+	// claim stays, as a claim, to be checked again
+	future := &fakeHeaders{m: map[uint64][]byte{goodHeight: syntheticHeader(root, testNow.Add(FutureSlack+time.Hour))}}
+	synthetic := &fakeHeaders{m: map[uint64][]byte{goodHeight: syntheticHeader(root, testNow.Add(time.Minute))}}
+	for name, o := range map[string]Options{
+		"future":    {Headers: future, headerWork: noWorkFn},
+		"no-work":   {Headers: synthetic}, // the real work check: a synthetic header does not pass it
+		"too-short": {Headers: &fakeHeaders{m: map[uint64][]byte{goodHeight: []byte{1, 2, 3}}}},
+	} {
+		out, err := upgradeTarget(t, o, cal.url()).Upgrade(context.Background(), rc)
+		if err != nil || out.State != anchor.ReceiptClaimed || out.NextCheck == nil {
 			t.Errorf("%s: %s %v", name, out.State, err)
+			continue
 		}
-	}
-	// the work check is applied (the real one): a synthetic header does not pass it
-	headerWork = CheckHeader
-	src = &fakeHeaders{m: map[uint64][]byte{goodHeight: syntheticHeader(root, testNow.Add(time.Minute))}}
-	out, err = upgradeTarget(t, Options{Headers: src}, cal.url()).Upgrade(context.Background(), rc)
-	if err != nil || out.State == anchor.ReceiptAnchored {
-		t.Fatalf("a header without work anchored: %s %v", out.State, err)
+		ev, _ := anchor.ParseOTSEvidence(out.Evidence)
+		if ev.Bitcoin == nil || ev.Bitcoin.Status != anchor.BitcoinClaimed || len(ev.Calendars) != 1 {
+			t.Errorf("%s: the claim was dropped or called checked: %+v", name, ev.Bitcoin)
+		}
 	}
 }
 
@@ -433,10 +438,9 @@ func TestHeaderSourceFailures(t *testing.T) {
 // the next call with a working source anchors it; a claimed receipt with a
 // source that contradicts it, and nothing else, is an error of class conflict.
 func TestHeaderSourceUnavailableThenAvailable(t *testing.T) {
-	noWork(t)
 	cal, rc, root := headerSetup(t)
 	src := &fakeHeaders{err: errors.New("node unreachable")}
-	tg := upgradeTarget(t, Options{Headers: src}, cal.url())
+	tg := upgradeTarget(t, Options{Headers: src, headerWork: noWorkFn}, cal.url())
 	out, err := tg.Upgrade(context.Background(), rc)
 	if err != nil || out.State != anchor.ReceiptClaimed || out.NextCheck == nil || !out.NextCheck.Equal(testNow.Add(FirstCheck)) {
 		t.Fatalf("%+v %v", out, err)
@@ -525,9 +529,7 @@ func TestMalformedAnswerOfOneCalendarCostsOnlyThatCalendar(t *testing.T) {
 // A calendar whose answers would make its stored fragment larger than
 // MaxFragment loses those answers; the others' fragments are kept.
 func TestBloatedFragmentOfOneCalendarIsDropped(t *testing.T) {
-	old := fragmentLimit
-	fragmentLimit = 15000
-	t.Cleanup(func() { fragmentLimit = old })
+	const fragmentLimit = 15000
 	digest := sha([]byte("digest under test"))
 	h, a := newScriptCal(t), newScriptCal(t)
 	// H's fragment has 16 branches, each ending in a pending attestation for H with its own commitment
@@ -570,10 +572,10 @@ func TestBloatedFragmentOfOneCalendarIsDropped(t *testing.T) {
 	if node, err := ParseFragment(hfrag, digest); err != nil {
 		t.Fatal(err)
 	} else if b, _ := node.Serialize(); !bytes.Equal(b, hfrag) {
-		t.Skip("test fragment is not canonical")
+		t.Fatal("the test fragment is not canonical: the test cannot prove the oversize path (a change of the canonical order must not turn this into a skip)")
 	}
 	rc := receiptOf(t, evidenceFor(t, digest, frags, []string{h.url(), a.url()}))
-	tg := upgradeTarget(t, Options{}, h.url(), a.url())
+	tg := upgradeTarget(t, Options{fragmentLimit: fragmentLimit}, h.url(), a.url())
 	rc.State = anchor.ReceiptSubmitted
 	cur := rc
 	out, err := tg.Upgrade(context.Background(), cur)
@@ -630,8 +632,12 @@ func TestNoStarvationByAHostileFirstCalendar(t *testing.T) {
 		t.Fatalf("%s %v", out.State, err)
 	}
 	asked := a.asked()
-	if len(asked) > PerFragmentLookups+1 {
-		t.Errorf("the honest calendar was asked %d times; a hostile fragment may cost %d", len(asked), PerFragmentLookups)
+	// literals: the budget of the design is 4 requests per fragment and 64 per call
+	if PerFragmentLookups != 4 || MaxUpgradeLookups != 64 {
+		t.Fatalf("the budget changed: %d %d", PerFragmentLookups, MaxUpgradeLookups)
+	}
+	if len(asked) > 4+1 {
+		t.Errorf("the honest calendar was asked %d times; a hostile fragment may cost 4", len(asked))
 	}
 	own := hex.EncodeToString(ca)
 	found := false
@@ -642,7 +648,7 @@ func TestNoStarvationByAHostileFirstCalendar(t *testing.T) {
 		t.Error("the honest calendar was not asked for its own commitment")
 	}
 	// and a hostile fragment costs a bounded number of requests in total
-	if len(a.asked())+len(h.asked()) > MaxUpgradeLookups {
+	if len(a.asked())+len(h.asked()) > 64 {
 		t.Errorf("%d requests in one call", len(a.asked())+len(h.asked()))
 	}
 }
@@ -677,13 +683,16 @@ func TestEveryCalendarIsAskedEveryRound(t *testing.T) {
 	}
 }
 
-// All lookups fail: the class is the most hopeful one among them.
+// All lookups fail: the class is the most hopeful one among them, and permanent
+// answers of every calendar make the round retryable, not permanent.
 func TestUpgradeErrorClass(t *testing.T) {
 	digest := sha([]byte("digest under test"))
 	for name, c := range map[string]struct {
 		status int
 		class  anchor.Class
-	}{"503": {503, anchor.ClassRetryable}, "403": {403, anchor.ClassRefused}, "400": {400, anchor.ClassPermanent}} {
+	}{"503": {503, anchor.ClassRetryable}, "403": {403, anchor.ClassRefused},
+		// A2-08: a round of permanent answers is retryable (until the expiry of the record)
+		"400": {400, anchor.ClassRetryable}, "410": {410, anchor.ClassRetryable}} {
 		cal := newScriptCal(t)
 		cal.status = c.status
 		f, _ := submittedFragment(digest, cal.url(), 1)

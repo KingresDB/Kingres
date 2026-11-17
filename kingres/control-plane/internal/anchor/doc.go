@@ -2,7 +2,7 @@
 
 // Package anchor is the library half of anchoring a signed checkpoint of the
 // ledger at an outside party (design: kingres/docs/design/ledger-phase7.md,
-// section 6 and corrections 70 to 76 of section 14). It defines the Target
+// section 6 and corrections 60 to 65 of section 14). It defines the Target
 // interface, the payload, the receipt, the anchor record with its states and
 // its state machine, the classification of errors, the retry arithmetic, the
 // HTTP client the targets are meant to be given, and the canonical encoding of
@@ -12,9 +12,14 @@
 //
 // # What it guarantees
 //
-//   - No storage, no scheduler, no goroutine that outlives a call, no global
-//     state. Every network call takes a context (its deadline is the timeout)
-//     and an *http.Client supplied by the caller; time comes from a Clock
+//   - No storage, no scheduler, no goroutine that outlives a call, and no
+//     package-level state that a call reads or writes: the package-level
+//     variables are sentinel errors and read-only tables (a test of the
+//     package lists them, so a new one must be added on purpose); what a test
+//     needs to replace (the work check of a header, the limit of a fragment)
+//     is an unexported option of the target. Every network call takes a
+//     context (its deadline is the timeout) and an *http.Client supplied by
+//     the caller; time comes from a Clock
 //     argument and nothing is read from the environment. The functions on
 //     Record are pure: they return a changed copy, or refuse and return the
 //     record unchanged.
@@ -42,11 +47,24 @@
 // # Payload
 //
 // A Payload is one signed aggregate checkpoint (a signed note, C2SP
-// signed-note). NewPayload checks the shape the anchoring depends on and
-// computes Digest = SHA-256(NoteText), where NoteText is the three lines
-// (origin, size in ASCII decimal, root as standard base64 of 32 bytes), each
-// ending in a newline, without the blank line and the signature lines. ID is
-// "<aggregate id hex>/<size>". NewPayload does not verify a signature.
+// signed-note) and the time of the first attempt to anchor it for the key.
+// NewPayload(aggregateID, signedNote, firstAttempt) checks the shape the
+// anchoring depends on and computes Digest = SHA-256(NoteText), where NoteText
+// is the three lines (origin, size in ASCII decimal, root as standard base64
+// of 32 bytes), each ending in a newline, without the blank line and the
+// signature lines. ID is "<aggregate id hex>/<size>". The time of the first
+// attempt is required (a zero one is refused by NewPayload and by every
+// Submit): it is the time of the first Submit of the record for this key, or
+// its creation, which is never later; a Retry keeps it. The WORM target
+// bounds the time of the store by it (see package worm); the others do not
+// use it. The shape rules are the limits of the verifier (kingres-verify), the
+// same numbers, which a test reads from the verifier's source when it is
+// beside this package: an origin of 1 to MaxOriginLen (255) bytes of UTF-8
+// without white space, plus signs or control characters; a size below
+// TreeSizeLimit (2^62); at most MaxSignatureLines (32) signature lines; no
+// line longer than MaxNoteLineLen (1024) bytes; a note of at most
+// MaxSignedNote bytes. ParsePayload applies the same shape rules without a
+// time, for a reader of stored notes. Neither verifies a signature.
 //
 // # The states of a record, and what each means
 //
@@ -56,7 +74,11 @@
 //	claimed     OpenTimestamps only: the calendars claim a Bitcoin attestation
 //	            that passed every check that needs no block header; nothing
 //	            checked it against the chain. NOT anchored: it must never be
-//	            shown or counted as anchored (contract status "pending")
+//	            shown or counted as anchored (contract status "pending"). It
+//	            keeps asking the calendars whose fragments are still pending,
+//	            falls back to submitted when a header contradicts the claim and
+//	            another calendar can still deliver, and expires after its own,
+//	            longer timeout (ExpireIfDue)
 //	anchored    final and verified as far as the kind allows (below)
 //	failed      a person must act (Record.Retry)
 //	superseded  a newer checkpoint replaced it before it was submitted
@@ -150,15 +172,25 @@
 // Every target returns *Error. ClassOf says what to do (design 6.6):
 //
 //	retryable  unreachable, timeout, 5xx, 429, TSA "waiting", a clock that the
-//	           store finds wrong: Backoff, and RetryAfterOf when larger; bounded
-//	           by Limits (an attempt limit and an age limit)
+//	           store finds wrong, a round of calendar answers that were all
+//	           permanent failures: Backoff, and RetryAfterOf when larger;
+//	           bounded by Limits (an attempt limit and an age limit)
 //	refused    401, 403, bucket missing, lock not enabled, TSA rejection, a time
-//	           that is not accepted, a read-back that fails with a 4xx: retried
-//	           after 1, 5 and 15 minutes (RefusedRetryDelay); the fourth
+//	           that is not accepted (a store or a TSA ahead of the clock, a TSA
+//	           certificate not valid now), a read-back that fails with a 4xx:
+//	           retried after 1, 5 and 15 minutes (RefusedRetryDelay); the fourth
 //	           consecutive refusal fails the record
-//	permanent  malformed answer, unlocked object, bad token: failed, no retry
+//	permanent  malformed answer, unlocked object, bad token, an object whose
+//	           time is earlier than the first attempt: failed, no retry
 //	conflict   the store holds other content under the key: failed, no retry,
 //	           alert ledgerAnchorConflict
+//
+// The class says what to do with the record; it does not say what is wrong.
+// "Refused" covers credentials and also clocks, and the alert text must come
+// from the code and the text of the error (CodeOf, Error()), which carry the
+// cause ("store_time_skew", "time_skew", "chain_not_trusted_now" say clock or
+// certificate validity and say what to do), never from the class: an alert that
+// reads "credentials" for a skewed clock sends the operator to the wrong place.
 //
 // Record.AfterError applies this to a record and names the alert to raise. It
 // counts consecutive refusals apart from the failures of any other kind
@@ -168,6 +200,9 @@
 // (from Record.FailingSince) fails the record with ledgerAnchorFailed.
 //
 // # What the caller must do
+//
+// Build every payload with the time of the first attempt for the key, keep it
+// across retries, and use the code and the text of an error for the alert.
 //
 // Store the records (kingres_cp.ledger_anchor, with the columns refusals,
 // retryables and failing_since besides attempts; the evidence as text, or as
@@ -181,6 +216,7 @@
 // it is claimed, with status "claimed"), build the *http.Client with
 // NewHTTPClient from the CA bundle, load credentials, raise the alerts, show a
 // "claimed" record as claimed and never count it toward anchor.minimumAnchored,
-// and run ExpireIfDue and UpgradeInterval for OpenTimestamps. This package
-// does none of these.
+// and run ExpireIfDue (with ots.Timeout and ots.ClaimedTimeout) and
+// UpgradeInterval for OpenTimestamps, for submitted and claimed records
+// alike. This package does none of these.
 package anchor

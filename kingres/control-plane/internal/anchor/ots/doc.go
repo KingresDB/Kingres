@@ -80,10 +80,29 @@
 // proof-of-work check of CheckHeader, the merkle root as it stands in bytes 36
 // to 68, and a block time not older than the submission (less BlockTimeSlack)
 // and not more than FutureSlack ahead of the clock. The header is kept in the
-// evidence and EvidenceTime is its time. A source that cannot be reached leaves
-// the claim a claim, to be checked again (Receipt.NextCheck); a header that
-// contradicts a claim makes the claim false, and when nothing else is plausible
-// Upgrade returns an error of class conflict (code "claim_contradicted").
+// evidence and EvidenceTime is its time. A source that cannot be reached, a
+// header that fails the work check and a block time ahead of the clock leave
+// the claim a claim, to be checked again (Receipt.NextCheck): the fault may be
+// the source's or the clock's. A header that contradicts a claim (another
+// merkle root, a block older than the digest) makes the claim false, and a
+// false claim is dropped from the fragments exactly as an implausible one is
+// (with the fragment of that calendar when nothing else is left of it). The
+// record is not failed for it while another calendar can still deliver: when
+// no plausible claim is left the receipt is "submitted" again (a claimed record
+// falls back to submitted) and the calendars that still hold a pending
+// attestation are asked in the next round. Only when a claim was contradicted
+// and nothing is left that could deliver does Upgrade return an error of class
+// conflict (code "claim_contradicted": a calendar lied), with the receipt
+// untouched.
+//
+// A claimed receipt is not final: Upgrade asks the calendars whose fragments
+// still hold pending attestations again, so that a calendar that answered first
+// with a plausible false claim cannot keep the proofs of the honest calendars
+// from being collected; with a HeaderSource it also checks the claims against
+// the headers, and the header of the honest calendar's block anchors the
+// record. Without a source, a claimed receipt with nothing pending is returned
+// as it is and no request is made. A claimed record expires after its own
+// timeout, ClaimedTimeout (4 times Timeout, the timeout of a submitted one).
 //
 // # Evidence (stored by the caller, see package anchor)
 //
@@ -168,13 +187,20 @@
 //
 // Keep the evidence of a PartialError and pass it to SubmitWithPrior at the
 // next attempt (its submitted_at is kept); call Upgrade for every "submitted"
-// record when its NextCheck is due and for a "claimed" one when a header
-// source is configured (the receipt's NextCheck says when); decide expiry with
-// Expired; keep the credentials of nothing (there are none). It must not call
-// Upgrade concurrently for one record. A permanent error of Upgrade ends the
-// record: the old receipt is untouched, and the error is only returned when
-// every lookup failed. Implement HeaderSource over a node you trust, or leave
-// it out and present the result as a claim.
+// or "claimed" record when its NextCheck is due (a claimed receipt has one
+// while a calendar can still deliver or a header could not be checked; one
+// without waits for an explicit Upgrade, for instance after a header source
+// was configured; the receipt's NextCheck is the first-check delay, and the
+// scheduler may stretch it with anchor.UpgradeInterval); decide expiry with
+// anchor.Record.ExpireIfDue, Timeout and ClaimedTimeout (or Expired); keep the
+// credentials of nothing (there are none). It must not call Upgrade
+// concurrently for one record. A permanent error of Upgrade ends the record:
+// the old receipt is untouched. It is returned only for a stored fragment that
+// cannot be read; a round in which every lookup failed is retryable even when
+// every failure was permanent (a gateway that answered with HTML once, a 410):
+// the record keeps waiting until it expires or the limits of the retries end
+// it. Implement HeaderSource over a node you trust, or leave it out and present
+// the result as a claim.
 //
 // # What it does not do
 //

@@ -21,7 +21,7 @@ import (
 const goldenTable = `
 pending    receipt_submitted=submitted receipt_claimed=- receipt_anchored=anchored error_wait=pending error_fail=failed error_conflict=failed supersede=superseded expire=- operator_retry=-
 submitted  receipt_submitted=submitted receipt_claimed=claimed receipt_anchored=anchored error_wait=submitted error_fail=failed error_conflict=failed supersede=- expire=expired operator_retry=-
-claimed    receipt_submitted=- receipt_claimed=claimed receipt_anchored=anchored error_wait=claimed error_fail=failed error_conflict=failed supersede=- expire=- operator_retry=-
+claimed    receipt_submitted=submitted receipt_claimed=claimed receipt_anchored=anchored error_wait=claimed error_fail=failed error_conflict=failed supersede=- expire=expired operator_retry=-
 anchored   receipt_submitted=- receipt_claimed=- receipt_anchored=- error_wait=- error_fail=- error_conflict=- supersede=- expire=- operator_retry=-
 failed     receipt_submitted=- receipt_claimed=- receipt_anchored=- error_wait=- error_fail=- error_conflict=- supersede=- expire=- operator_retry=pending
 superseded receipt_submitted=- receipt_claimed=- receipt_anchored=- error_wait=- error_fail=- error_conflict=- supersede=- expire=- operator_retry=-
@@ -105,7 +105,7 @@ func drive(r Record, ev Event) (Record, error) {
 	case EventSupersede:
 		return r.Supersede()
 	case EventExpire:
-		out, did := r.ExpireIfDue(now, time.Hour)
+		out, did := r.ExpireIfDue(now, time.Hour, time.Hour)
 		if !did {
 			return r, ErrNotAllowed
 		}

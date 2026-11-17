@@ -85,7 +85,7 @@ func testPayload(t *testing.T) anchor.Payload {
 	t.Helper()
 	root := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32))
 	note := "kingres.example/agg\n17\n" + root + "\n\n" + string(rune(0x2014)) + " kingres.example/agg " + base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 68)) + "\n"
-	p, err := anchor.NewPayload("ab12", []byte(note))
+	p, err := anchor.NewPayload("ab12", []byte(note), time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}

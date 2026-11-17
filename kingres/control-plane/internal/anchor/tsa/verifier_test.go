@@ -41,7 +41,7 @@ func TestIndependentVerifierOfStoredEvidence(t *testing.T) {
 		t.Fatalf("%+v", file)
 	}
 	// 1. the note: its text hashes to payload_sha256 (the digest the token must stamp)
-	p, err := anchor.NewPayload("ab12", ownNote())
+	p, err := anchor.ParsePayload("ab12", ownNote())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -22,13 +22,14 @@ import (
 
 // Bounds of the time checks and of the search for our version.
 const (
-	// DefaultMaxSkew is the tolerance between the store's Last-Modified of a
-	// fresh write and the clock of Submit.
+	// DefaultMaxSkew is the tolerance of the store's time: Last-Modified of a
+	// fresh write against the clock of Submit, and Last-Modified of an
+	// existing object against the time of the first attempt (below) and the
+	// clock.
 	DefaultMaxSkew = 5 * time.Minute
-	// MaxExistingAge is how old an object that an earlier attempt wrote may
-	// be (a crash between the write and the record; the retries are bounded
-	// by the age limit of the record, 7 days by default).
-	MaxExistingAge = 8 * 24 * time.Hour
+	// RetentionTolerance is how much earlier than asked the retention date
+	// of an object may be (the store rounds, and the write takes time).
+	RetentionTolerance = 5 * time.Minute
 	// MaxVersionsChecked bounds the versions of one key that are read.
 	MaxVersionsChecked = 25
 	// MaxListPages bounds the pages of a version listing.
@@ -48,7 +49,7 @@ func (t *Target) maxSkew() time.Duration {
 var errRepairable = errors.New("worm: the lock can be applied to the existing version")
 
 // Submit implements anchor.Target (design 6.3, steps 1 to 5, with the
-// corrections 70 and 71). It is idempotent: when the key exists with the same
+// correction 63). It is idempotent: when the key exists with the same
 // bytes it verifies and returns that object (a crash before the record was
 // written). A key that holds only other bytes gives an *anchor.Error of
 // ClassConflict and nothing is overwritten; a foreign later version over the
@@ -61,8 +62,15 @@ var errRepairable = errors.New("worm: the lock can be applied to the existing ve
 // the error says exactly what the operator must do.
 //
 // The evidence carries the version that was read back, the SHA-256 of its
-// bytes and their length, and the store's Last-Modified, which must be within
-// the tolerance of the clock (Config.MaxSkewSeconds).
+// bytes and their length, and the store's Last-Modified. The time of the
+// store is bounded against two clocks of ours: it is never later than now plus
+// the tolerance (Config.MaxSkewSeconds), and never earlier than the first
+// attempt of the record (p.FirstAttempt) minus the tolerance; for an object
+// that this call has just written it must also be within the tolerance of
+// now. An existing, complete, locked version of our own bytes has no other age
+// limit. A store whose clock was refused for a fresh write is therefore
+// refused on every later attempt for that object (Code store_time_early,
+// permanent; store_time_skew, refused, when the store is ahead).
 func (t *Target) Submit(ctx context.Context, p anchor.Payload) (anchor.Receipt, error) {
 	if err := anchor.CheckPayload(anchor.KindWORM, p); err != nil {
 		return anchor.Receipt{}, err
@@ -72,32 +80,46 @@ func (t *Target) Submit(ctx context.Context, p anchor.Payload) (anchor.Receipt, 
 	cfg := t.s.cfg
 	key := ObjectKey(cfg.KeyPrefix, p.AggregateID(), p.Size)
 	now := t.s.clock()
-	retain := now.Add(time.Duration(cfg.RetentionDays) * 24 * time.Hour).UTC().Truncate(time.Second)
+	days := time.Duration(cfg.RetentionDays) * 24 * time.Hour
+	first := p.FirstAttempt.UTC().Truncate(time.Second)
+	if first.After(now.Add(t.maxSkew())) {
+		return anchor.Receipt{}, anchor.Errorf(anchor.ClassRetryable, anchor.KindWORM, "submit", "first_attempt_ahead",
+			"the time of the first attempt of this record (%s) is later than the clock of this server (%s) plus the tolerance of %s: check the clock of this server and of the server that created the record",
+			anchor.FormatTime(first), anchor.FormatTime(now), t.maxSkew())
+	}
+	w := want{
+		retain: now.Add(days).UTC().Truncate(time.Second),
+		// the retention that the first attempt asked: what an existing
+		// object is measured by (a later attempt asks for a later date, and a
+		// version that satisfied the first request is not repaired for that)
+		floor: first.Add(days).UTC().Truncate(time.Second),
+		first: first,
+	}
 	body := p.SignedNote
 
 	useINM := cfg.IfNoneMatch != IfNoneMatchOff
 	if !useINM {
-		return t.checkThenPut(ctx, key, body, retain)
+		return t.checkThenPut(ctx, key, body, w)
 	}
-	r, err := t.put(ctx, key, body, retain, true, true)
+	r, err := t.put(ctx, key, body, w.retain, true, true)
 	if err != nil {
 		return anchor.Receipt{}, err
 	}
 	switch {
 	case r.status == 200:
-		return t.verify(ctx, key, body, r.header.Get(hdrVersion), r.header.Get("ETag"), retain, true)
+		return t.verify(ctx, key, body, r.header.Get(hdrVersion), r.header.Get("ETag"), w, true)
 	case r.status == 412 || r.status == 409:
 		code, _ := ParseS3Error(r.body)
 		if r.status == 409 && code != "ConditionalRequestConflict" {
 			return anchor.Receipt{}, t.s.statusError("put", r)
 		}
-		return t.existing(ctx, key, body, retain, r.status == 409)
+		return t.existing(ctx, key, body, w, r.status == 409)
 	case (r.status == 501 || r.status == 400) && cfg.IfNoneMatch == IfNoneMatchAuto:
 		code, msg := ParseS3Error(r.body)
 		if r.status == 400 && isLockComplaint(code, msg) {
 			return anchor.Receipt{}, t.s.statusError("put", r)
 		}
-		return t.checkThenPut(ctx, key, body, retain)
+		return t.checkThenPut(ctx, key, body, w)
 	case (r.status == 501 || r.status == 400) && cfg.IfNoneMatch == IfNoneMatchOn:
 		code, msg := ParseS3Error(r.body)
 		if r.status == 400 && isLockComplaint(code, msg) {
@@ -113,26 +135,26 @@ func (t *Target) Submit(ctx context.Context, p anchor.Payload) (anchor.Receipt, 
 // checkThenPut is the fallback without If-None-Match: HEAD the key, then
 // put when it is absent. It is not atomic; object lock is what keeps an
 // existing version safe.
-func (t *Target) checkThenPut(ctx context.Context, key string, body []byte, retain time.Time) (anchor.Receipt, error) {
+func (t *Target) checkThenPut(ctx context.Context, key string, body []byte, w want) (anchor.Receipt, error) {
 	h, err := t.head(ctx, "check", key, "")
 	if err != nil {
 		return anchor.Receipt{}, err
 	}
 	switch h.status {
 	case 200:
-		return t.existing(ctx, key, body, retain, false)
+		return t.existing(ctx, key, body, w, false)
 	case 404:
 	default:
 		return anchor.Receipt{}, t.s.statusError("check", h)
 	}
-	r, err := t.put(ctx, key, body, retain, false, true)
+	r, err := t.put(ctx, key, body, w.retain, false, true)
 	if err != nil {
 		return anchor.Receipt{}, err
 	}
 	if r.status != 200 {
 		return anchor.Receipt{}, t.s.statusError("put", r)
 	}
-	return t.verify(ctx, key, body, r.header.Get(hdrVersion), r.header.Get("ETag"), retain, true)
+	return t.verify(ctx, key, body, r.header.Get(hdrVersion), r.header.Get("ETag"), w, true)
 }
 
 // existing handles "the key is already there": it looks for OUR version, the
@@ -140,7 +162,7 @@ func (t *Target) checkThenPut(ctx context.Context, key string, body []byte, reta
 // not ours (a foreign later version, or a delete marker) the versions of the
 // key are listed and each one with the bytes of the note is tried. Only when
 // no version of the key holds the note is it a conflict.
-func (t *Target) existing(ctx context.Context, key string, body []byte, retain time.Time, transient bool) (anchor.Receipt, error) {
+func (t *Target) existing(ctx context.Context, key string, body []byte, w want, transient bool) (anchor.Receipt, error) {
 	g, err := t.get(ctx, "get", key, "")
 	if err != nil {
 		var ae *anchor.Error
@@ -152,7 +174,7 @@ func (t *Target) existing(ctx context.Context, key string, body []byte, retain t
 	if g != nil {
 		switch {
 		case g.status == 200 && bytes.Equal(g.body, body):
-			return t.complete(ctx, key, body, g.header.Get(hdrVersion), g.header.Get("ETag"), retain)
+			return t.complete(ctx, key, body, g.header.Get(hdrVersion), g.header.Get("ETag"), w)
 		case g.status != 200 && g.status != 404:
 			return anchor.Receipt{}, t.s.statusError("get", g)
 		}
@@ -172,7 +194,7 @@ func (t *Target) existing(ctx context.Context, key string, body []byte, retain t
 	}
 	var last error
 	for _, v := range vers {
-		rc, err := t.complete(ctx, key, body, v, "", retain)
+		rc, err := t.complete(ctx, key, body, v, "", w)
 		if err == nil {
 			return rc, nil
 		}
@@ -184,15 +206,15 @@ func (t *Target) existing(ctx context.Context, key string, body []byte, retain t
 // complete verifies an existing version and, when it has no lock (or a
 // shorter retention than asked, in the configured mode), applies the retention
 // to that version and verifies again.
-func (t *Target) complete(ctx context.Context, key string, body []byte, version, etag string, retain time.Time) (anchor.Receipt, error) {
-	rc, err := t.verify(ctx, key, body, version, etag, retain, false)
+func (t *Target) complete(ctx context.Context, key string, body []byte, version, etag string, w want) (anchor.Receipt, error) {
+	rc, err := t.verify(ctx, key, body, version, etag, w, false)
 	if err == nil || !errors.Is(err, errRepairable) {
 		return rc, err
 	}
-	if rerr := t.applyRetention(ctx, key, version, retain); rerr != nil {
+	if rerr := t.applyRetention(ctx, key, version, w.retain); rerr != nil {
 		return anchor.Receipt{}, rerr
 	}
-	return t.verify(ctx, key, body, version, etag, retain, false)
+	return t.verify(ctx, key, body, version, etag, w, false)
 }
 
 type retentionXML struct {
@@ -323,24 +345,52 @@ func mismatch(what string) *anchor.Error {
 	return anchor.Errorf(anchor.ClassPermanent, anchor.KindWORM, "verify", "readback_mismatch", "read back differs from what was written: %s", what)
 }
 
-func timeSkew(what string, d time.Duration, max time.Duration) *anchor.Error {
+// want is what one Submit asks of the store and of the object it finds.
+type want struct {
+	// retain is the retention date asked now (also what a repair applies).
+	retain time.Time
+	// floor is the retention date that the first attempt asked: an existing
+	// object is measured by it, so that a crash recovery long after the first
+	// attempt does not extend the retention of a version that satisfied the
+	// first request.
+	floor time.Time
+	// first is the time of the first attempt of the record.
+	first time.Time
+}
+
+// timeAhead is the error for a store time later than the clock plus the
+// tolerance. The object stays as it is; the fix is a clock, so it is refused
+// (tried again after 1, 5 and 15 minutes: the clock of this server may catch
+// up), not permanent. The code and the text carry the cause: this is not a
+// problem of credentials.
+func timeAhead(what string, d time.Duration, max time.Duration) *anchor.Error {
 	return anchor.Errorf(anchor.ClassRefused, anchor.KindWORM, "verify", "store_time_skew",
-		"%s differs from the clock of this server by %s, more than the tolerance of %s: the time the store states is not accepted (check the clock of the store and of this server)",
+		"%s is %s ahead of the clock of this server, more than the tolerance of %s: the time the store states is not accepted; this is a problem of clocks, not of credentials: correct the clock of the store or of this server, then Retry",
 		what, d.Round(time.Second), max)
+}
+
+// timeEarly is the error for a store time earlier than the first attempt of
+// the record minus the tolerance: the store's clock is behind, or the object
+// is older than this record. The object is locked and keeps its time, and
+// every later attempt finds the same object, so nothing is gained by trying
+// again: permanent, with what the operator can do.
+func timeEarly(what string, lmt, first time.Time, max time.Duration) *anchor.Error {
+	return anchor.Errorf(anchor.ClassPermanent, anchor.KindWORM, "verify", "store_time_early",
+		"%s (%s) is earlier than the first attempt of this record (%s) by more than the tolerance of %s: the clock of the store is behind, or the object was written for an earlier record of the same checkpoint; this is a problem of clocks, not of credentials; the object is locked and keeps its time, so correct the clock of the store, then change the keyPrefix of the target and Retry, or, if the object is a valid earlier anchor of this checkpoint, create the record with the time of the first attempt that wrote it",
+		what, anchor.FormatTime(lmt), anchor.FormatTime(first), max)
 }
 
 // verify reads one version back (design 6.3 step 3): HEAD of the version for
 // the lock mode, the retention date, Last-Modified, length, checksum and
 // version id; GET of that version for the bytes. fresh is true for an object
-// this call has just written: the retention date may then be at most five
-// minutes earlier than requested and Last-Modified must be within the
-// tolerance of the clock; an object that an earlier attempt wrote (fresh
-// false) may be up to MaxExistingAge old.
-func (t *Target) verify(ctx context.Context, key string, body []byte, version, etag string, retain time.Time, fresh bool) (anchor.Receipt, error) {
-	tol := MaxExistingAge
-	if fresh {
-		tol = 5 * time.Minute
-	}
+// this call has just written: the retention date may then be at most
+// RetentionTolerance earlier than asked now and Last-Modified must be within
+// the tolerance of the clock. An object that an earlier attempt wrote (fresh
+// false) must have a retention date not earlier than the first attempt asked
+// less RetentionTolerance (and not in the past), else it is repairable, and a
+// Last-Modified not earlier than the first attempt less the tolerance and not
+// later than the clock plus the tolerance; it has no other age limit.
+func (t *Target) verify(ctx context.Context, key string, body []byte, version, etag string, w want, fresh bool) (anchor.Receipt, error) {
 	retry := func(e *anchor.Error) (anchor.Receipt, error) {
 		// a failed read-back after a good write is not a verdict on the
 		// object: a transport failure or a 5xx is retried with backoff; any
@@ -369,6 +419,30 @@ func (t *Target) verify(ctx context.Context, key string, body []byte, version, e
 		return anchor.Receipt{}, anchor.Errorf(anchor.ClassPermanent, anchor.KindWORM, "verify", "no_version_id",
 			"the store returned no version id: object lock needs a bucket with versioning, and the evidence names the version")
 	}
+	// the time of the store first: nothing is repaired on an object whose
+	// time is refused
+	lm := h.header.Get("Last-Modified")
+	lmt, err2 := http.ParseTime(lm)
+	if lm == "" || err2 != nil {
+		return anchor.Receipt{}, anchor.Errorf(anchor.ClassPermanent, anchor.KindWORM, "verify", "no_last_modified", "the store returned no usable Last-Modified")
+	}
+	lmt = lmt.UTC().Truncate(time.Second)
+	now := t.s.clock()
+	skew := t.maxSkew()
+	what := "the Last-Modified of the existing object"
+	lower := w.first.Add(-skew)
+	if fresh {
+		what = "the Last-Modified of the object"
+		if l := now.Add(-skew); l.After(lower) {
+			lower = l
+		}
+	}
+	if d := lmt.Sub(now); d > skew {
+		return anchor.Receipt{}, timeAhead(what, d, skew)
+	}
+	if lmt.Before(lower) {
+		return anchor.Receipt{}, timeEarly(what, lmt, w.first, skew)
+	}
 	mode := h.header.Get(hdrMode)
 	if mode == "" {
 		return anchor.Receipt{}, repairable(notLocked("no lock mode on the object"))
@@ -385,8 +459,11 @@ func (t *Target) verify(ctx context.Context, key string, body []byte, version, e
 		return anchor.Receipt{}, notLocked("retain-until date is not RFC 3339")
 	}
 	rt = rt.UTC().Truncate(time.Second)
-	now := t.s.clock()
-	min := retain.Add(-tol)
+	asked := w.floor
+	if fresh {
+		asked = w.retain
+	}
+	min := asked.Add(-RetentionTolerance)
 	if min.Before(now) {
 		min = now
 	}
@@ -396,20 +473,6 @@ func (t *Target) verify(ctx context.Context, key string, body []byte, version, e
 			repairable(e)
 		}
 		return anchor.Receipt{}, e
-	}
-	lm := h.header.Get("Last-Modified")
-	lmt, err2 := http.ParseTime(lm)
-	if lm == "" || err2 != nil {
-		return anchor.Receipt{}, anchor.Errorf(anchor.ClassPermanent, anchor.KindWORM, "verify", "no_last_modified", "the store returned no usable Last-Modified")
-	}
-	lmt = lmt.UTC().Truncate(time.Second)
-	skew := t.maxSkew()
-	if fresh {
-		if d := lmt.Sub(now); d > skew || d < -skew {
-			return anchor.Receipt{}, timeSkew("the Last-Modified of the object", d, skew)
-		}
-	} else if lmt.After(now.Add(skew)) || lmt.Before(now.Add(-MaxExistingAge)) {
-		return anchor.Receipt{}, timeSkew("the Last-Modified of the existing object", lmt.Sub(now), skew)
 	}
 	if cl := h.header.Get("Content-Length"); cl != strconv.Itoa(len(body)) {
 		return anchor.Receipt{}, mismatch("content length")
@@ -464,7 +527,7 @@ func VerifyNote(ev anchor.WORMEvidence, aggregateID string, signedNote []byte, p
 	if hex.EncodeToString(sum[:]) != ev.ObjectSHA256 || uint64(len(signedNote)) != ev.ContentLength {
 		return errors.New("worm: the note is not the object the evidence describes")
 	}
-	p, err := anchor.NewPayload(aggregateID, signedNote)
+	p, err := anchor.ParsePayload(aggregateID, signedNote)
 	if err != nil {
 		return fmt.Errorf("worm: %w", err)
 	}

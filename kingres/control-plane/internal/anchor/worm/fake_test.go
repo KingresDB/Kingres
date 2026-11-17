@@ -96,6 +96,8 @@ type fakeS3 struct {
 	retentionCalls  int
 	retentionStatus int           // answer PutObjectRetention with this status
 	skew            time.Duration // added to the Last-Modified of new versions
+	headVersion     string        // answer HEAD of a version with this version id
+	listExact       int           // pad a version listing to exactly this many bytes
 }
 
 func newFakeS3() *fakeS3 {
@@ -349,6 +351,9 @@ func (f *fakeS3) listVersions(w http.ResponseWriter, q url.Values) {
 	}
 	sb.WriteString("</ListVersionsResult>")
 	f.listCalls++
+	if n := f.listExact - sb.Len(); n > 0 {
+		sb.WriteString(strings.Repeat(" ", n))
+	}
 	w.Header().Set("Content-Type", "application/xml")
 	_, _ = io.WriteString(w, sb.String())
 }
@@ -527,6 +532,9 @@ func (f *fakeS3) read(w http.ResponseWriter, r *http.Request, key string) {
 	}
 	if !f.noVersionID {
 		w.Header().Set("X-Amz-Version-Id", v.id)
+		if r.Method == "HEAD" && f.headVersion != "" {
+			w.Header().Set("X-Amz-Version-Id", f.headVersion)
+		}
 	}
 	if v.mode != "" {
 		w.Header().Set("X-Amz-Object-Lock-Mode", v.mode)

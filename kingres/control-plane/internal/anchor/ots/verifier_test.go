@@ -30,7 +30,7 @@ func TestIndependentVerifierOfStoredEvidence(t *testing.T) {
 	root := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32))
 	sig := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 68))
 	note := []byte("kingres.example/agg\n17\n" + root + "\n\n" + string(rune(0x2014)) + " kingres.example/agg " + sig + "\n")
-	p, err := anchor.NewPayload("ab12", note)
+	p, err := anchor.ParsePayload("ab12", note)
 	if err != nil {
 		t.Fatal(err)
 	}

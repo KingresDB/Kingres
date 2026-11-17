@@ -14,7 +14,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/anchor"
 )
 
-// What "anchored" means for an OpenTimestamps record (correction 70):
+// What "anchored" means for an OpenTimestamps record (correction 60):
 //
 //   - kingresd holds no block headers, so it cannot verify a Bitcoin
 //     attestation by itself. A calendar's Bitcoin attestation is a CLAIM.
@@ -121,6 +121,11 @@ type ClaimCheck struct {
 	// claim did not match.
 	HeaderChecked bool
 	HeaderProblem string
+	// HeaderTransient is true when the header could not judge the claim: it
+	// failed the work check (the source is at fault) or its time is ahead of
+	// the clock (the clock may be). HeaderProblem says why; such a claim is not
+	// called false and is not dropped.
+	HeaderTransient bool
 }
 
 // Plausible reports whether the claim passed the checks without a header, was
@@ -214,11 +219,12 @@ func checkFragments(roots []*Node, uris []string, submitted, now time.Time) []Cl
 // applyHeader checks one claim against a header: the header's own work
 // check, the merkle root, and a block time that fits the submission and the
 // clock.
-func applyHeader(c *ClaimCheck, header []byte, submitted, now time.Time) {
+func applyHeader(c *ClaimCheck, header []byte, submitted, now time.Time, work func([]byte) (HeaderResult, error)) {
 	c.Header = append([]byte(nil), header...)
-	res, err := headerWork(header)
+	res, err := work(header)
 	if err != nil {
 		c.HeaderProblem = "the header is not valid: " + shortErr(err)
+		c.HeaderTransient = true
 		return
 	}
 	c.HeaderTime = res.Time
@@ -232,6 +238,7 @@ func applyHeader(c *ClaimCheck, header []byte, submitted, now time.Time) {
 	}
 	if res.Time.After(now.Add(FutureSlack)) {
 		c.HeaderProblem = "the block time is in the future"
+		c.HeaderTransient = true
 		return
 	}
 	c.HeaderChecked = true
@@ -303,6 +310,12 @@ func parseEvidenceTrees(ev anchor.OTSEvidence) (digest []byte, roots []*Node, ur
 // or its "bitcoin" summary does not match the fragments (or, when the summary
 // says header_checked, the header it carries).
 func CheckEvidence(ev anchor.OTSEvidence, now time.Time, headers HeaderFunc) (*EvidenceCheck, error) {
+	return checkEvidence(ev, now, headers, CheckHeader)
+}
+
+// checkEvidence is CheckEvidence with the work check as an argument (the tests
+// of this package replace it; the package has no variable to set).
+func checkEvidence(ev anchor.OTSEvidence, now time.Time, headers HeaderFunc, work func([]byte) (HeaderResult, error)) (*EvidenceCheck, error) {
 	_, roots, uris, submitted, err := parseEvidenceTrees(ev)
 	if err != nil {
 		return nil, err
@@ -314,7 +327,7 @@ func CheckEvidence(ev anchor.OTSEvidence, now time.Time, headers HeaderFunc) (*E
 			continue
 		}
 		if h, ok := headers(c.Height); ok {
-			applyHeader(c, h, submitted, now)
+			applyHeader(c, h, submitted, now, work)
 		}
 	}
 	if b := ev.Bitcoin; b != nil {
@@ -327,7 +340,7 @@ func CheckEvidence(ev anchor.OTSEvidence, now time.Time, headers HeaderFunc) (*E
 			found = true
 			if b.Status == anchor.BitcoinHeaderChecked {
 				hb, _ := hex.DecodeString(b.Header)
-				applyHeader(c, hb, submitted, now)
+				applyHeader(c, hb, submitted, now, work)
 				if !c.HeaderChecked {
 					return nil, fmt.Errorf("ots: the header in the evidence does not check: %s", c.HeaderProblem)
 				}

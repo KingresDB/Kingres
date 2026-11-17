@@ -25,8 +25,9 @@ import (
 const (
 	// MaxCertificates is the most certificates accepted in a token.
 	MaxCertificates = 16
-	// MaxSkew is the distance between genTime and the clock beyond which a
-	// token is accepted with a warning (design 6.4 step 4).
+	// DefaultMaxSkew is the distance between genTime and the clock, in either
+	// direction, beyond which a token is refused (code time_skew, class
+	// refused; correction 62 of the design).
 	DefaultMaxSkew = 5 * time.Minute
 	// MinRSABits is the smallest RSA signer key accepted, whatever the
 	// toolchain's own floor is.
@@ -92,61 +93,6 @@ func fail(code, text string) *anchor.Error {
 // then failed with the alert.
 func failRefused(code, text string) *anchor.Error {
 	return anchor.Errorf(anchor.ClassRefused, anchor.KindTSA, "verify-token", code, "%s", text)
-}
-
-// tsaNameMatches reports whether the GeneralName of the TSTInfo tsa field
-// (RFC 3161 2.4.2: it must correspond to one of the subject names of the
-// certificate) is the subject, a directoryName, DNS name, URI or e-mail
-// address of the subject alternative name of the signer.
-func tsaNameMatches(b []byte, c *x509.Certificate) bool {
-	g, err := oneTLV(b)
-	if err != nil {
-		return false
-	}
-	switch g.tag {
-	case 0xa4: // directoryName
-		if bytes.Equal(g.content, c.RawSubject) {
-			return true
-		}
-		for _, e := range c.Extensions {
-			if e.Id.String() != "2.5.29.17" {
-				continue
-			}
-			top, err := oneTLV(e.Value)
-			if err != nil {
-				return false
-			}
-			names, err := children(top.content)
-			if err != nil {
-				return false
-			}
-			for _, n := range names {
-				if n.tag == 0xa4 && bytes.Equal(n.content, g.content) {
-					return true
-				}
-			}
-		}
-		return false
-	case 0x82:
-		for _, n := range c.DNSNames {
-			if n == string(g.content) {
-				return true
-			}
-		}
-	case 0x86:
-		for _, u := range c.URIs {
-			if u.String() == string(g.content) {
-				return true
-			}
-		}
-	case 0x81:
-		for _, m := range c.EmailAddresses {
-			if m == string(g.content) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // Expect is what a token must match.
@@ -819,7 +765,7 @@ func VerifyToken(tokenDER []byte, e Expect, roots, intermediates *x509.CertPool)
 			max = DefaultMaxSkew
 		}
 		if d := SkewOf(info.genTime, e.Now); d > max || d < -max {
-			return nil, failRefused(CodeTime, fmt.Sprintf("genTime differs from the clock by %s, more than the tolerance of %s", d.Round(time.Second), max))
+			return nil, failRefused(CodeTime, fmt.Sprintf("genTime differs from the clock by %s, more than the tolerance of %s: a problem of clocks (the authority's or this server's), not of credentials; correct the clock, then Retry", d.Round(time.Second), max))
 		}
 	}
 	if roots == nil {
@@ -842,7 +788,7 @@ func VerifyToken(tokenDER []byte, e Expect, roots, intermediates *x509.CertPool)
 	if !e.Now.IsZero() {
 		opts.CurrentTime = e.Now
 		if _, err := signer.Verify(opts); err != nil {
-			return nil, failRefused(CodeChainNow, "the signing certificate does not chain to a trusted root at the clock (an expired or not yet valid authority certificate): "+shortErr(err))
+			return nil, failRefused(CodeChainNow, "the signing certificate does not chain to a trusted root at the clock (an expired or not yet valid certificate of the authority, or a clock that is wrong): not a problem of credentials; renew the roots and intermediates of the CA bundle or ask the authority, or correct the clock, then Retry: "+shortErr(err))
 		}
 	}
 	return &TokenInfo{GenTime: info.genTime, Accuracy: info.accuracy, Ordering: info.ordering, Policy: info.policy,
