@@ -3,6 +3,7 @@
 package ots
 
 import (
+	_ "embed"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -19,11 +20,18 @@ type hdr struct {
 }
 
 // testdata/headers.txt: "<height> <block id> <80-byte header hex>" lines
-// (real headers of the Bitcoin main chain, see testdata/SOURCES.txt).
+// (real headers of the Bitcoin main chain, see testdata/SOURCES.txt). The
+// file is part of the test binary: the integration runs of the module build
+// the tests on one machine and run them on another, where the source
+// directory is absent.
+//
+//go:embed testdata/headers.txt
+var headersTxt string
+
 func headers(t testing.TB) map[uint64]hdr {
 	t.Helper()
 	out := map[uint64]hdr{}
-	for _, l := range strings.Split(strings.TrimSpace(string(mustRead(t, "testdata/headers.txt"))), "\n") {
+	for _, l := range strings.Split(strings.TrimSpace(headersTxt), "\n") {
 		f := strings.Fields(l)
 		if len(f) != 3 {
 			t.Fatalf("bad line %q", l)
