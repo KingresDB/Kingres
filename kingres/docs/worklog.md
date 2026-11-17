@@ -7,6 +7,244 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-17: kingresd stabilised, a write guard for the ledger, fix rounds and their reviews in four components, phase 2b and the libraries of phase 7 begun
+
+### What was done
+
+- **`kingresd`** (6c6725b1d1). The changes that end the failures of
+  complete runs, together with the fixes for RBR-01 to RBR-07: the
+  listener between servers has no write timeout; one lifecycle lock per
+  data directory; the client between servers repeats calls that are safe to
+  repeat; a `move_bucket` call is not cancelled once the extension recorded
+  the move; a task that was fenced five times ends with the code `fenced`.
+  Its review
+  ([reviews/2026-11-17-kingresd-stabilisation-and-rebalance-second-fixes.md](reviews/2026-11-17-kingresd-stabilisation-and-rebalance-second-fixes.md),
+  3d41a7f5e6): no critical finding, two high, three medium, five low,
+  ST-01 to ST-10. ST-01 explains the failure that the last entry listed
+  without a cause (a healthy group that refuses connections after another
+  server was removed): when a group stops being enforced the lease file is
+  no longer written, the watchdog is not told, and it stops the healthy
+  primary.
+- **`kingres_shard` 0.5**, three reviews and two fix rounds. The review
+  of the S9 fixes
+  ([reviews/2026-11-16-kingres-shard-0.5-second-sequences.md](reviews/2026-11-16-kingres-shard-0.5-second-sequences.md),
+  b9415ab424) found one critical defect in the proof of a planned
+  switchover; its fixes (30b6092d5f) brought a new proof (the new primary
+  replayed the shutdown checkpoint of the old one as its last record) and
+  a deadline on every call of a control plane. The review of those
+  ([reviews/2026-11-17-kingres-shard-0.5-third-sequences.md](reviews/2026-11-17-kingres-shard-0.5-third-sequences.md),
+  241846dd0b) found two critical and two high, the worst a regression of
+  that round: the deadline stayed on for the rest of the transaction, so a
+  later statement of the user to a node that did not answer in time was
+  dropped with a warning and `COMMIT` succeeded (S11-01; on both published
+  branches from 30b6092d5f until 4210c4a8a9). Its fixes (4210c4a8a9): the
+  deadline is a depth around each control call that the data path never
+  reads; a statement that was not carried out is an error; a lost session
+  that carried writes of the user makes `COMMIT` fail; the previous secret
+  is kept until every standby confirmed the current one (`KS014`). The
+  review of those
+  ([reviews/2026-11-17-kingres-shard-0.5-fourth-sequences.md](reviews/2026-11-17-kingres-shard-0.5-fourth-sequences.md),
+  82191a0ab0) confirmed them and found one high, again introduced by the
+  round (see "Still open").
+- **The design of failover** ([design/ha-phase5-part2.md](design/ha-phase5-part2.md),
+  c96cd73147) follows the new proof of a switchover.
+- **`kingres_columnar` 0.1**, two reviews and two fix rounds: the sixth
+  review
+  ([reviews/2026-11-17-kingres-columnar-0.1-fifth-fixes.md](reviews/2026-11-17-kingres-columnar-0.1-fifth-fixes.md),
+  df30ed5218) and its fixes (72aaa4d312: a write after the flush at commit
+  goes through to the file, prepared buffers are never flushed, a ceiling
+  on the memory of the write buffers, cleanup through the object access
+  hook); the seventh review
+  ([reviews/2026-11-17-kingres-columnar-0.1-sixth-fixes.md](reviews/2026-11-17-kingres-columnar-0.1-sixth-fixes.md),
+  134d395ae7), with no wrong answer and no lost row and one high finding
+  (a write while the transaction is ending stops the server), and its
+  fixes (59d88c68ee).
+- **The verifier and `kingres_ledger` 0.3, part A**, three reviews and
+  two fix rounds. The third review
+  ([reviews/2026-11-17-ledger-phase7-steps-1-2-second-fixes.md](reviews/2026-11-17-ledger-phase7-steps-1-2-second-fixes.md),
+  9c03a08781) found that a member of `pg_write_all_data` forges a block.
+  The fixes: the verifier (8d22b961e1: bounds on what it reads, exit
+  status 4) and the extension (fe2e4d2ce2: the ledger tables are written
+  by the code of the extension and by nothing else). The fourth review
+  ([reviews/2026-11-17-ledger-phase7-steps-1-2-third-fixes.md](reviews/2026-11-17-ledger-phase7-steps-1-2-third-fixes.md),
+  3eff168baa) found that a member of the role that owns the extension
+  could call the internal write function. The fixes: the extension
+  (1d4f742142: no function that SQL can call takes the content of a
+  write; a write by hand leaves a record; `KL005`) and the verifier
+  (777272e016: a stored state holds only what was verified, no size
+  limit on a proof, the whole path of the state must be private, a
+  verdict that could not be written is never status 0). The fifth review,
+  of the extension
+  ([reviews/2026-11-17-kingres-ledger-0.3-guard-second-review.md](reviews/2026-11-17-kingres-ledger-0.3-guard-second-review.md),
+  1067b7498b): the rule for writes held; two high findings about what a
+  role can stop or remove.
+- **`kingresd` and the write guard** (0e48dc52d1). The library writes the
+  ledger only through the functions of its own SQL version, so the API
+  answered "forbidden" for a database on 0.1 or 0.2. It now checks the
+  version before it enables the ledger on a table, makes a digest or
+  records a verification, and answers 422 with the statement to run.
+- **Phase 2b, step 1** (3cc9a270a4): one place computes a bucket from a
+  value, the definitions that later steps need on both majors, and the
+  comparison harness of the tests; no change of behaviour.
+- **Phase 7, libraries for anchoring** (a3397d9baf): new packages of
+  `kingresd` for AWS signatures, objects under S3 Object Lock, RFC 3161
+  time stamps and OpenTimestamps, not yet used by `kingresd`.
+- **Designs**: the phase 7 design gained corrections 20 to 48, the phase
+  2b design the notes of step 1 (9ad7460cbd).
+
+### How it was verified
+
+Run by the integrator on the tree that was committed, not taken from the
+reports of the authors, unless it says otherwise.
+
+- `kingresd` at 6c6725b1d1: build for Windows and Linux, vet, format, the
+  unit tests of 41 packages, the contract check; one complete run of the
+  integration suite on each major, 675 passed, none failed or skipped.
+- `kingres_shard`: at 30b6092d5f, out of tree with both installations
+  named, 92 TAP files with 7670 tests on 18.7 and 8328 on 19rc2, in tree
+  110 of 110; at 4210c4a8a9, 97 files with 7999 and 8657 tests, in tree
+  118 of 118; at 3cc9a270a4, 13 regression tests and 99 files with 8730
+  and 9389 tests, in tree 121 of 121 (with the suite of `kingres_ledger`).
+  No compiler warning in any of them.
+- `kingres_columnar`: at 72aaa4d312, in tree on 18 twice, 30 of 30, and
+  on 19rc2 26 TAP files with 3695 tests; at 59d88c68ee, in tree twice, 34
+  of 34, and on 19rc2 30 files with 4150 tests.
+- The verifier: at 8d22b961e1, on Linux three runs of 210 top-level
+  tests, on Windows three runs of 193 passing and 13 skipped; at
+  777272e016, on Linux three runs of 282 (one skipped, a measurement), on
+  Windows three runs of 251 passing and 15 skipped (tests for Unix). The
+  committed extension out of tree with the verifier of 777272e016 named:
+  612 tests on 18.7 and on 19rc2.
+- `kingres_ledger`: at fe2e4d2ce2, in tree on 18 twice with the verifier
+  named, 20 of 20, and on 19rc2 527 tests; at 1d4f742142, in tree twice,
+  21 of 21, and on 19rc2 17 regression tests and 17 TAP files with 612
+  tests.
+- The ledger-related tests of `kingresd` (five packages and the cluster
+  tests named Ledger or Alert) against the extensions of 1d4f742142 and
+  4210c4a8a9 and the verifier of 777272e016, from an export of the
+  committed control plane with the version check: 111 and 4 tests on 18.7,
+  111 and 4 on 19rc2, none failing or skipped. Against fe2e4d2ce2 without
+  the version check `TestInclusionProofOnLedger01` had failed on both
+  majors, which is how the "forbidden" above was found. The complete
+  integration suite was not run after 6c6725b1d1.
+- The anchoring packages at a3397d9baf: format and vet clean; on Windows
+  with the third-party vectors present the five packages pass; on Linux
+  without them (what the commit holds) 124 top-level tests pass and 17
+  skip, twice, and twice more with the race detector.
+- The branch `kingres-19` after each synchronisation: built in the tree
+  without a warning, the suites of the five extensions; at the last one
+  (6879a6b0ab) 166 passed and one was skipped (the test that needs two
+  installations).
+- Shown by the authors and the reviewers only: that each new test fails
+  without its fix; the mutants; the timings and memory figures; the fuzz
+  runs; the checks of time-stamp tokens against openssl.
+
+### Needs-verification items
+
+- The statements listed as "to be verified" at the end of
+  [design/ha-phase5-part2.md](design/ha-phase5-part2.md); four of them
+  were settled by the author of the failover work, which is not committed
+  yet.
+
+### Decisions and deviations
+
+- **Order of work.** Parts of phase 2b and of phase 7 that depend on
+  nothing unfinished and will not need rewriting are written in parallel
+  with phase 5 (decided with the owner of the project on 2026-11-17; before,
+  2b was to wait for phases 4 and 5). Step 2 of phase 2b waits for the
+  fixes of S12, because it changes the same connection code.
+- `kingres_ledger`: a library that is newer than the SQL of a database
+  refuses to write that ledger until `ALTER EXTENSION kingres_ledger
+  UPDATE`; the capture triggers keep working. This departs from section
+  9.5 of the design of phase 7 (correction 25). A dump does not carry a
+  ledger; a physical backup or `pg_upgrade` does (correction 28).
+- `kingres_columnar`: a write that reaches a columnar table while its
+  transaction is ending is refused with a warning and the row is not
+  written. The review of that round judged this the least bad behaviour
+  for the commit, prepare and abort events, the release phases of a
+  resource owner and a critical section (a heap table stops a server with
+  assertions at nine of thirteen such moments, and its row written at the
+  commit event is not durable), and found it too weak where the
+  transaction is still alive (see "Still open", C8-02).
+- Test vectors of other projects (the AWS signature test suite, the
+  examples of the reference OpenTimestamps client) are not in the
+  repository: a manifest of their sums and a script that fetches them from
+  a pinned commit are, and the tests that need them skip without them.
+  Whether to keep them in the repository under their own licences is an
+  open question for the owner of the project.
+- The verifier has a fifth exit status, 4, and no size limit on a proof.
+- The control plane was changed by the integrator for the version check
+  while another author had uncommitted work in the same directory; the
+  four files were committed on their own and tested from an export of the
+  committed tree.
+- New work that could collide with a fix round is written in a git
+  worktree of its own and brought to the branch as one commit.
+
+### Still open
+
+- **`kingres_shard`, on both published branches:** S12-01 (high,
+  introduced by the fixes for S11): `remove_node`, `add_node`,
+  `rotate_secret` and `sync_catalog` can return success with no warning
+  although a node that went silent at the very end of the call did not
+  get its part; a caller must read the result back. S12-03: the time
+  budget per node ends a call against a healthy node that answers slowly,
+  with `KS007`. S12-02 and S12-04 to S12-06. The fixes are being written.
+  Partly done in the round before and stated in the README of the
+  extension: S11-07, S11-08, S11-11.
+- **`kingres_ledger`, on both published branches:** L11-01 (high): a
+  member of `pg_maintain` or `pg_write_all_data` stops the builder and
+  every capture with `LOCK TABLE` on a view over a ledger table. L11-02
+  (high): a member of the role that owns the extension drops it, and with
+  it the protection of every ledger table, through `DROP EXTENSION plpgsql
+  CASCADE`. L11-03 to L11-05. Rows that alternate between two ledger
+  tables cost 25 to 35 percent more CPU than before the guard. The fixes
+  are being written. Rows forged before the guard existed cannot be told
+  from real ones inside the database; the records of
+  `ledger_remove_stray` and of writes by hand are covered by no hash.
+- **`kingresd`, on both published branches:** ST-01 (do not set
+  `defaultReplicaCount` to 0 and do not remove the last standby of a
+  group on a cluster with enforcement on: the watchdog stops the healthy
+  primary), ST-02 to ST-10. The first three increments of failover
+  (standbys registered in the catalog, the instance mapping, the lease
+  additions and read calls) and the fixes for ST-01 to ST-04 are written
+  and being verified; two of their new cluster tests failed in some
+  repeats on an overloaded machine and passed in all repeats on an idle
+  one, and whether load alone explains it is not established. Failover
+  itself, switchover and `restorePreferredPrimaries` are not written.
+- **`kingres_columnar`, on both published branches:** the eighth review
+  ([reviews/2026-11-17-kingres-columnar-0.1-seventh-fixes.md](reviews/2026-11-17-kingres-columnar-0.1-seventh-fixes.md))
+  found no wrong answer and no lost row for a caller that does nothing
+  PostgreSQL forbids, and one high, two medium and three low. C8-01
+  (high): a truncation of a columnar table by the code of another module
+  at the events at the end of a transaction is not guarded and ends in a
+  PANIC, a backend that loops, or on 19 a table that cannot be read.
+  C8-02: at the commit of a subtransaction and in a critical section the
+  transaction is still alive, and the refused row is dropped with a
+  warning while the transaction commits. C8-07: the random comparison
+  test fails by itself about once in thirty runs. The fixes are to be
+  written.
+- The verifier: the fixes for L10 were not reviewed again; a second
+  local account was simulated, not used, and nothing of the private path
+  is checked on Windows.
+- Not reviewed yet: step 1 of phase 2b; the anchoring packages, which
+  were also never run against a real object store, a public time-stamp
+  authority or the reference OpenTimestamps client.
+- `kingres_sketch`, `kingres_timepart`: K12U-01 (documentation); the seal
+  and the owner-driven path were not reviewed in depth.
+- Phase 7: of 25 steps, the first two and the libraries of three more.
+  Phase 2b: steps 2 to 13. Phases 9, 10 and 11 and the rest of phase 12
+  are not started.
+- The build machine: WSL failed twice on this day because the system
+  drive of the host was full (the build cache of Go and the work areas of
+  finished reviews); every run in flight was lost both times and
+  repeated. No file of the repository was affected.
+
+### Core patches
+
+None.
+
+---
+
 ## 2026-11-16 (second entry): Fix rounds and their reviews in every extension and in the verifier, the packages on PostgreSQL 19, the design of failover
 
 ### What was done
