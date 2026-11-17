@@ -95,6 +95,7 @@ typedef struct RecNode
 	char	   *host;
 	int			port;
 	bool		standby;		/* a standby of the catalog: looked at only when it is out of recovery */
+	int			claim_id;		/* the id a node that remove_node() took out of the catalog still answers to, or 0 */
 } RecNode;
 
 /*
@@ -691,8 +692,8 @@ kingres_shard_recover_prepared(void)
  * (a switch of a bucket move that was decided, a catalog change) holds row locks
  * on the catalog tables that promote_node() writes there, so it is resolved first.
  */
-int
-kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *extra_host, int extra_port)
+static int
+recover_prepared_with_body(int extra_id, int extra_group, const char *extra_host, int extra_port)
 {
 	MemoryContext callercxt = CurrentMemoryContext;
 	const KsCatalog *cat = kingres_shard_catalog();
@@ -706,10 +707,10 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 	int			expected_primaries = 0;
 	int			purged_primaries = 0;
 	bool		any_via_previous = false;	/* a node needed the previous cluster secret (S9-03) */
+	int			unconfirmed_standbys = 0;	/* a standby that could not be asked: it may hold an older secret (S11-04) */
 	TimestampTz pass_start = GetCurrentTimestamp();
 	const char *old_format_until = "-infinity";
 
-	kingres_shard_control_begin();
 	if (!cat->present || cat->local_node_id == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -748,6 +749,7 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 			continue;
 		r = MemoryContextAlloc(callercxt, sizeof(RecNode));
 		r->standby = !n->is_primary;
+		r->claim_id = 0;
 		r->node_id = n->node_id;
 		r->group_id = n->group_id;
 		r->host = MemoryContextStrdup(callercxt, n->host);
@@ -761,6 +763,7 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 		RecNode    *r = MemoryContextAlloc(callercxt, sizeof(RecNode));
 
 		r->standby = false;
+		r->claim_id = 0;
 		r->node_id = extra_id;
 		r->group_id = extra_group;
 		r->host = MemoryContextStrdup(callercxt, extra_host);
@@ -789,7 +792,7 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 	 * them: if the origin died, the registration was rolled back with the rest
 	 * and only this table remembers the node.
 	 */
-	if (SPI_execute("SELECT p.host, p.port FROM " KINGRES_SHARD_SCHEMA ".pending_node p "
+	if (SPI_execute("SELECT p.host, p.port, p.node_id FROM " KINGRES_SHARD_SCHEMA ".pending_node p "
 					"WHERE NOT EXISTS (SELECT 1 FROM " KINGRES_SHARD_SCHEMA ".node n "
 					"WHERE n.host OPERATOR(pg_catalog.=) p.host AND n.port OPERATOR(pg_catalog.=) p.port)",
 					true, 0) != SPI_OK_SELECT)
@@ -810,6 +813,18 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 													   SPI_tuptable->tupdesc, 1));
 			r->port = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i],
 												  SPI_tuptable->tupdesc, 2, &isnull));
+			/*
+			 * A node that remove_node() takes out of the catalog still holds the catalog and the
+			 * secret it had until the removal commits, and accepts only the session that claims
+			 * its old id (S11-05).  Its id is not used for anything else: the decision log is
+			 * found by the gid.
+			 */
+			{
+				int			old_id = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i],
+																 SPI_tuptable->tupdesc, 3, &isnull));
+
+				r->claim_id = (!isnull && old_id > 0) ? old_id : 0;
+			}
 			nodes = lappend(nodes, r);
 		}
 	}
@@ -830,11 +845,16 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 		int			i;
 		int			ntup;
 
+		if (r->claim_id > 0)
+			kingres_shard_conn_expect_node(r->host, r->port, r->claim_id);
 		kc = kingres_shard_get_conn(r->host, r->port, true, &err);
 		if (kc == NULL)
 		{
 			if (r->standby)
+			{
+				unconfirmed_standbys++;
 				continue;
+			}
 			ereport((MyBackendType == B_BG_WORKER || r->node_id == 0) ? LOG : WARNING,
 					(errmsg("kingres_shard recovery: node %d (%s:%d) is not reachable, skipped",
 							r->node_id, r->host, r->port),
@@ -898,7 +918,9 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 		if (!(r->standby ? kingres_shard_conn_local_sync(kc) : kingres_shard_conn_force_sync(kc)))
 		{
 			ereport(MyBackendType == B_BG_WORKER ? LOG : WARNING,
-					(errmsg("kingres_shard recovery: could not set up the session on node %d, skipped", r->node_id)));
+					(errmsg("kingres_shard recovery: could not set up the session on node %d (%s:%d), skipped",
+							r->node_id, r->host, r->port),
+					 errdetail_internal("%s", kingres_shard_conn_error_text(kc->conn))));
 			continue;
 		}
 		listed_at = GetCurrentTimestamp();
@@ -1137,7 +1159,7 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 		unsigned char pbuf[128];
 		int			plen = 0;
 
-		if (purged_primaries >= expected_primaries && !any_via_previous &&
+		if (purged_primaries >= expected_primaries && !any_via_previous && unconfirmed_standbys == 0 &&
 			kingres_shard_previous_secret(pbuf, sizeof(pbuf), &plen))
 		{
 			bool		all_told = true;
@@ -1221,6 +1243,29 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 
 	SPI_finish();
 	return resolved;
+}
+
+/*
+ * The recovery pass runs in the scope of a control-plane call (S11-01), whoever calls it: the SQL
+ * function, promote_node() and the recovery worker.
+ */
+int
+kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *extra_host, int extra_port)
+{
+	KsControlScope scope;
+	volatile int result = 0;
+
+	kingres_shard_control_enter(&scope);
+	PG_TRY();
+	{
+		result = recover_prepared_with_body(extra_id, extra_group, extra_host, extra_port);
+	}
+	PG_FINALLY();
+	{
+		kingres_shard_control_leave(&scope);
+	}
+	PG_END_TRY();
+	return result;
 }
 
 /*

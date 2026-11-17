@@ -173,6 +173,11 @@ tests += {
       't/090_readd_old_primary.pl',
       't/091_answer_rows.pl',
       't/092_recovery_gone.pl',
+      't/093_control_scope.pl',
+      't/094_verify_positions.pl',
+      't/095_standby_secret.pl',
+      't/096_call_bounds.pl',
+      't/097_verify_checks.pl',
     ],
   },
 }

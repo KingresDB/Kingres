@@ -106,6 +106,49 @@ probe_timeout_ms(void)
 }
 
 /*
+ * Why the node did not answer the question, for the error that refuses the promotion (S11-04,
+ * S11-09): the text of what it said, and whether it is the refusal of a node that holds a cluster
+ * secret that this node does not accept (a standby that missed a rotation: KS014, nothing to
+ * repeat), or a node that accepted the session and did not answer (KS007).
+ */
+static int
+target_failure(PGconn *conn, PGresult *res, char **why)
+{
+	if (res != NULL && PQresultErrorMessage(res)[0] != '\0')
+		*why = pchomp(PQresultErrorMessage(res));
+	else
+		*why = kingres_shard_conn_error_text(conn);
+	if (strstr(*why, "claims to have been opened by another node") != NULL)
+		return ERRCODE_KINGRES_SECRET_UNKNOWN;
+	if (res == NULL && PQstatus(conn) == CONNECTION_OK)
+		return ERRCODE_KINGRES_NODE_TIMEOUT;
+	return ERRCODE_CONNECTION_FAILURE;
+}
+
+static void
+target_refuse(const KsNode *tgt, int code, const char *what, const char *why)
+{
+	if (code == ERRCODE_KINGRES_SECRET_UNKNOWN)
+		ereport(ERROR,
+				(errcode(code),
+				 errmsg("node %d (%s:%d) does not accept the session of this node: it holds a cluster secret that no node of the cluster has",
+						tgt->node_id, tgt->host, tgt->port),
+				 errdetail("The node said: %s", why),
+				 errhint("The node missed a rotation of the cluster secret and the previous secret is no longer kept (or it missed two).  Repeating does not help: build the node again from a base backup of a node that has the current secret (kingres.remove_node(), then kingres.add_node()), or promote another standby of the group.")));
+	if (code == ERRCODE_KINGRES_NODE_TIMEOUT)
+		ereport(ERROR,
+				(errcode(code),
+				 errmsg("node %d (%s:%d), which is to become the primary of group %d, did not answer within %d seconds",
+						tgt->node_id, tgt->host, tgt->port, tgt->group_id, kingres_shard_node_timeout),
+				 errdetail("It accepted the session and was asked: %s", what),
+				 errhint("The node is up but does not answer: look at its locks (pg_locks) and its backends (pg_stat_activity).  Nothing was changed.")));
+	ereport(ERROR,
+			(errcode(code),
+			 errmsg("could not ask node %d (%s:%d) %s", tgt->node_id, tgt->host, tgt->port, what),
+			 errdetail_internal("%s", why)));
+}
+
+/*
  * Ask the node that is to be promoted what it is: out of recovery, the same
  * version of the extension and of the library as this node.  A session of its
  * own (not part of the transaction), so that a refusal leaves nothing behind.
@@ -120,12 +163,23 @@ check_target_node(const KsNode *tgt)
 	char	   *libver;
 
 	if (conn == NULL)
+	{
+		/* a node that accepted the session and did not answer is KS007, as everywhere (S11-09) */
+		if (kingres_shard_connect_failure_code() == ERRCODE_KINGRES_NODE_TIMEOUT ||
+			kingres_shard_connect_failure_code() == ERRCODE_LOCK_NOT_AVAILABLE)
+			ereport(ERROR,
+					(errcode(kingres_shard_connect_failure_code()),
+					 errmsg("node %d (%s:%d), which is to become the primary of group %d, did not answer within %d seconds",
+							tgt->node_id, tgt->host, tgt->port, tgt->group_id, kingres_shard_node_timeout),
+					 errdetail_internal("%s", err),
+					 errhint("The node is up but does not answer: look at its locks (pg_locks) and its backends (pg_stat_activity).  Nothing was changed.")));
 		ereport(ERROR,
 				(errcode(ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION),
 				 errmsg("could not connect to node %d (%s:%d), which is to become the primary of group %d",
 						tgt->node_id, tgt->host, tgt->port, tgt->group_id),
 				 errdetail_internal("%s", err),
 				 errhint("Promote the standby with pg_promote() and wait until it accepts connections, then call kingres.promote_node().")));
+	}
 
 	res = kingres_shard_bounded_exec(conn,
 									 "SELECT pg_catalog.pg_is_in_recovery()::pg_catalog.text, "
@@ -134,12 +188,12 @@ check_target_node(const KsNode *tgt)
 									 true);
 	if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1)
 	{
+		char	   *why;
+		int			code = target_failure(conn, res, &why);
+
 		PQclear(res);
 		PQfinish(conn);
-		ereport(ERROR,
-				(errcode(ERRCODE_CONNECTION_FAILURE),
-				 errmsg("could not ask node %d (%s:%d) whether it is in recovery",
-						tgt->node_id, tgt->host, tgt->port)));
+		target_refuse(tgt, code, "whether it is in recovery", why);
 	}
 	if (strcmp(PQgetvalue(res, 0, 0), "false") != 0)
 	{
@@ -155,6 +209,15 @@ check_target_node(const KsNode *tgt)
 	PQclear(res);
 
 	res = kingres_shard_bounded_exec(conn, "SELECT " KINGRES_SHARD_SCHEMA ".version()", true);
+	if (res == NULL && PQstatus(conn) == CONNECTION_OK)
+	{
+		/* the node accepted the session and does not answer (S11-09): not "another library" */
+		char	   *why;
+		int			code = target_failure(conn, res, &why);
+
+		PQfinish(conn);
+		target_refuse(tgt, code, "which library it runs", why);
+	}
 	if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1)
 		libver = pstrdup("(unknown)");
 	else
@@ -186,12 +249,12 @@ check_target_node(const KsNode *tgt)
 		res = kingres_shard_bounded_exec(conn, sql, true);
 		if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1)
 		{
+			char	   *why;
+			int			code = target_failure(conn, res, &why);
+
 			PQclear(res);
 			PQfinish(conn);
-			ereport(ERROR,
-					(errcode(ERRCODE_CONNECTION_FAILURE),
-					 errmsg("could not ask node %d (%s:%d) whether it can commit",
-							tgt->node_id, tgt->host, tgt->port)));
+			target_refuse(tgt, code, "whether it can commit", why);
 		}
 		if (strcmp(PQgetvalue(res, 0, 0), "t") != 0)
 		{
@@ -397,7 +460,7 @@ promote_result(const char *status, int64 term, List *unreached)
  * repeat it after a failure and it finishes what the failed call left.
  */
 static Datum
-promote_node_impl(int target_id, bool forced)
+promote_node_body(int target_id, bool forced)
 {
 	const KsCatalog *cat;
 	const KsNode *tgt;
@@ -427,7 +490,6 @@ promote_node_impl(int target_id, bool forced)
 				 errdetail("Only superusers can promote a node.")));
 
 	blocked_reset();
-	kingres_shard_control_begin();
 	kingres_shard_lock_catalog();
 	cat = kingres_shard_catalog();
 	if (!cat->present || cat->local_node_id == 0)
@@ -773,6 +835,27 @@ promote_node_impl(int target_id, bool forced)
 	kingres_shard_fault_point("promote_after_push");
 	PG_RETURN_DATUM(promote_result(resume ? "completed" : "promoted", new_term, unreached));
 }
+
+/* promote_node() and force_promote_node() run in the scope of a control-plane call (S11-01). */
+static Datum
+promote_node_impl(int target_id, bool forced)
+{
+	KsControlScope scope;
+	Datum		result;
+
+	kingres_shard_control_enter(&scope);
+	PG_TRY();
+	{
+		result = promote_node_body(target_id, forced);
+	}
+	PG_FINALLY();
+	{
+		kingres_shard_control_leave(&scope);
+	}
+	PG_END_TRY();
+	return result;
+}
+
 
 Datum
 kingres_promote_node(PG_FUNCTION_ARGS)

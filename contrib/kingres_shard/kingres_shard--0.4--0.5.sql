@@ -2197,3 +2197,9 @@ $$;
 REVOKE ALL ON FUNCTION kingres.standby_name_matches(text) FROM PUBLIC;
 COMMENT ON FUNCTION kingres.standby_name_matches(text) IS
     'On the primary of a group: does a streaming standby carry this application_name (the check before the name goes into synchronous_standby_names)';
+
+-- S11-05: remove_node() writes down the address and the id of the node it takes out of the catalog,
+-- so that recovery can resolve a part of the removal that was left prepared on it.
+ALTER TABLE kingres.pending_node ADD COLUMN node_id int;
+COMMENT ON TABLE kingres.pending_node IS
+    'Node-local: addresses add_node() prepared a transaction on before registering them, and nodes that remove_node() takes out of the catalog; never synchronized';

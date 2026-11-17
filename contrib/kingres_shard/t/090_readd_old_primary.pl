@@ -11,6 +11,7 @@
 #   A. pg_rewind: OLD's own crash recovery first (pg_rewind does it, or start and stop it cleanly),
 #      then pg_rewind against NEW, then standby.signal and primary_conninfo; the node row is already
 #      a standby, nothing is registered; OLD streams, and the rows that only OLD had are gone;
+#   C. without wal_keep_size and with the WAL since the divergence recycled, pg_rewind stops: the reason for B;
 #   B. the fallback, a fresh base backup of NEW on another address: a different node.  The old row is
 #      taken out of the lists and removed (remove_node), the new one added (add_node); check_cluster()
 #      reports the old row as standby_unreachable until then and nothing afterwards.
@@ -27,9 +28,9 @@ use KingresShardTest qw(make_cluster make_standby register_standby wait_catchup 
 
 sub setup
 {
-	my ($prefix) = @_;
+	my ($prefix, %opt) = @_;
 	my @n = make_cluster($prefix, 2, replication => 1);
-	$n[1]->append_conf('postgresql.conf', "wal_keep_size = '256MB'\n");
+	$n[1]->append_conf('postgresql.conf', "wal_keep_size = '256MB'\n") unless $opt{no_keep};
 	$n[1]->restart;
 	$n[0]->safe_psql('postgres', q{
 		CREATE TABLE public.kv (id int PRIMARY KEY, val text);
@@ -89,6 +90,22 @@ sub setup
 	is($map->safe_psql('postgres', "SELECT replication_state FROM kingres.standby_status() WHERE node_id = 2"), 'streaming', "[ra] standby_status shows OLD streaming");
 	is($old->safe_psql('postgres', 'SELECT superseded FROM kingres.catalog_status'), 'f', "[ra] catalog_status on OLD: not superseded");
 	is($map->safe_psql('postgres', "SELECT count(*) FROM kingres.check_cluster() WHERE check_name LIKE 'standby%'"), '0', "[ra] check_cluster shows no standby problem");
+}
+
+# --- C. without wal_keep_size and with the WAL since the divergence recycled, pg_rewind stops ---------
+# The README names this as the reason for the fallback below (S10-06, S11-10): the case produces it.
+{
+	my ($map, $old, $new, $id) = setup('rc', no_keep => 1);
+	for my $i (1 .. 8)
+	{
+		$new->safe_psql('postgres', "INSERT INTO public.t1 SELECT generate_series(1000 * $i, 1000 * $i + 50); SELECT pg_switch_wal(); CHECKPOINT");
+	}
+	my ($out, $err);
+	my $ok = IPC::Run::run([ 'pg_rewind', '--target-pgdata', $old->data_dir, '--source-server',
+			'host=' . $new->host . ' port=' . $new->port . ' dbname=postgres' ],
+		'>', \$out, '2>', \$err);
+	ok(!$ok, "[rc] pg_rewind of OLD fails when the WAL since the divergence is gone");
+	like($err, qr/could not find previous WAL record|could not open file|requested WAL segment/, "[rc] with the error that the README names ($err)");
 }
 
 # --- B. the fallback: a base backup on another address is a new node ---------------------------

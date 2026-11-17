@@ -134,6 +134,9 @@ static void append_dtx_label(StringInfo buf);
 static void remember_timezone(KsConn *kc);
 static void sync_timezone(KsConn *kc);
 static void discard_connection(KsConn *kc);
+static void restore_lock_timeout(KsConn *kc);
+static PGresult *bounded_get_last_limit(PGconn *conn, bool interruptible, int64 limit_ms, bool *failed);
+static void end_of_xact(void);
 
 /*
  * kingres_shard_conn_init
@@ -375,7 +378,6 @@ bool		kingres_shard_previous_secret_used = false;
  * again for every session it would open to the same node.
  */
 static int	connect_failure_code = 0;
-static bool connect_session_bound = false;	/* the session just returned has its lock_timeout set */
 static char *connect_failure_msg = NULL;
 typedef struct StuckNode
 {
@@ -386,10 +388,104 @@ typedef struct StuckNode
 
 static List *stuck_nodes = NIL;	/* the nodes that did not answer in this transaction */
 
+/* How many control-plane calls are running, one inside the other (kingres_shard_control_enter) */
+static int	control_depth = 0;
+
 static int
 control_lock_timeout_ms(void)
 {
 	return Max(kingres_shard_node_timeout * 750, 250);
+}
+
+/*
+ * S11-07: the time that one control-plane call gives one node.  Every wait for a node of a call is
+ * limited by node_timeout (a statement that is not answered) and by what is left of the node's
+ * budget for the whole call, 2 x node_timeout + 2 seconds: a node that answers every statement just
+ * before node_timeout cannot hold a call up for node_timeout per statement.  The budget is spent by
+ * the waits for its answers (the statements of the call and the first statement of its sessions);
+ * the connection phase is bounded by node_connect_timeout and by the memory of a node that did not
+ * connect (it is tried once per call, not twice).  Both go with the call (kingres_shard_control_leave).
+ */
+typedef struct NodeSpent
+{
+	char		key[KS_CONN_HOST_LEN + 16];
+	int64		spent_ms;
+} NodeSpent;
+
+static List *node_spent_list = NIL;
+
+static int64
+control_node_budget_ms(void)
+{
+	return ((int64) kingres_shard_node_timeout * 2 + 2) * 1000;
+}
+
+static NodeSpent *
+node_spent_entry(const char *host, int port)
+{
+	ListCell   *lc;
+	char		key[KS_CONN_HOST_LEN + 16];
+	MemoryContext old;
+	NodeSpent  *s;
+
+	snprintf(key, sizeof(key), "%s:%d", host, port);
+	foreach(lc, node_spent_list)
+		if (strcmp(((NodeSpent *) lfirst(lc))->key, key) == 0)
+			return (NodeSpent *) lfirst(lc);
+	old = MemoryContextSwitchTo(TopMemoryContext);
+	s = palloc0(sizeof(NodeSpent));
+	strlcpy(s->key, key, sizeof(s->key));
+	node_spent_list = lappend(node_spent_list, s);
+	MemoryContextSwitchTo(old);
+	return s;
+}
+
+/* How long the next wait for the node may last: node_timeout, or what its budget has left. */
+static int64
+node_wait_limit_ms(const char *host, int port)
+{
+	int64		left = control_node_budget_ms() - node_spent_entry(host, port)->spent_ms;
+
+	return Min((int64) kingres_shard_node_timeout * 1000, Max(left, 0));
+}
+
+static void
+node_spend(const char *host, int port, TimestampTz since)
+{
+	node_spent_entry(host, port)->spent_ms +=
+		Max((GetCurrentTimestamp() - since) / 1000, 0);
+}
+
+static void
+forget_node_budgets(void)
+{
+	list_free_deep(node_spent_list);
+	node_spent_list = NIL;
+}
+
+/*
+ * kingres_shard_bounded_exec() for a node of a control-plane call: the wait is limited by the
+ * node's budget as well.  Returns NULL with the connection still up when the node did not answer.
+ */
+static PGresult *
+budgeted_exec(PGconn *conn, const char *host, int port, const char *sql, bool interruptible)
+{
+	TimestampTz t0;
+	int64		limit;
+	bool		failed;
+	PGresult   *res;
+
+	if (control_depth == 0)
+		return kingres_shard_bounded_exec(conn, sql, interruptible);
+	limit = node_wait_limit_ms(host, port);
+	if (limit <= 0 || conn == NULL || PQstatus(conn) != CONNECTION_OK)
+		return NULL;
+	t0 = GetCurrentTimestamp();
+	if (!PQsendQuery(conn, sql))
+		return NULL;
+	res = bounded_get_last_limit(conn, interruptible, limit, &failed);
+	node_spend(host, port, t0);
+	return failed ? NULL : res;
 }
 
 static StuckNode *
@@ -429,6 +525,52 @@ node_label(const char *host, int port)
 	int			id = kingres_shard_conn_node_id(host, port);
 
 	return id > 0 ? psprintf("%d (%s:%d)", id, host, port) : psprintf("%s:%d", host, port);
+}
+
+/*
+ * S11-01: a session that carried the writes of the user's transaction was closed.  Its writes
+ * are rolled back by the node, the other nodes of the transaction would commit: the transaction
+ * must not.  The note lives until the transaction ends (a savepoint that is rolled back does not
+ * clear it: the writes of an outer level are lost with the session), and is looked at before
+ * anything is committed or prepared (conn_xact_callback).
+ */
+static char *session_lost_msg = NULL;
+static bool in_xact_end = false;	/* inside the callback of the end of a transaction */
+
+static void
+note_session_lost(KsConn *kc)
+{
+	MemoryContext old;
+
+	if (session_lost_msg != NULL)
+		return;
+	old = MemoryContextSwitchTo(TopMemoryContext);
+	/* the catalog is not read in an aborting transaction */
+	session_lost_msg = psprintf("the session to node %s was closed while this transaction had written through it",
+								IsTransactionState() ? node_label(kc->host, kc->port) :
+								psprintf("%s:%d", kc->host, kc->port));
+	MemoryContextSwitchTo(old);
+}
+
+static void
+check_session_lost(void)
+{
+	if (session_lost_msg != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("%s", session_lost_msg),
+				 errdetail("What the transaction wrote on that node was rolled back with the session, so committing the rest would apply the transaction on some nodes only."),
+				 errhint("Roll the transaction back and repeat it.")));
+}
+
+static void
+forget_session_lost(void)
+{
+	if (session_lost_msg != NULL)
+	{
+		pfree(session_lost_msg);
+		session_lost_msg = NULL;
+	}
 }
 
 /*
@@ -571,48 +713,34 @@ probe_session(PGconn *conn, const char *host, int port, char **errmsg_out)
 {
 	PGresult   *res;
 	bool		ok;
+	bool		control = kingres_shard_control_active();
 
 	/*
-	 * In a control-plane call the node's own lock wait is bounded first (a utility command, it
-	 * does not wait for a lock), so that a node whose first query waits for a lock of another
-	 * session says so instead of being cancelled from far away (S10-02).  A command that is not
-	 * answered while the connection is still up is a node that does not answer; a connection that
-	 * is gone (the node refused the session, which is what the callers below look for) is not.
+	 * In a control-plane call the node's own lock wait is bounded for this one statement, so
+	 * that a node whose first query waits for a lock of another session says so instead of
+	 * being cancelled from far away (S10-02).  The three commands are one simple query, so one
+	 * implicit transaction: the setting is gone when it ends, whichever way it ends, and the
+	 * session that the caller gets carries nothing (S11-02).  A command that is not answered
+	 * while the connection is still up is a node that does not answer; a connection that is
+	 * gone (the node refused the session, which is what the callers below look for) is not.
 	 */
-	connect_session_bound = false;
-	if (kingres_shard_control_active)
+	if (control)
 	{
-		char		set[64];
+		char		sql[160];
 
-		snprintf(set, sizeof(set), "SET lock_timeout = %d", control_lock_timeout_ms());
-		res = kingres_shard_bounded_exec(conn, set, false);
+		snprintf(sql, sizeof(sql), "SET lock_timeout = %d; SELECT 1; RESET lock_timeout",
+				 control_lock_timeout_ms());
+		res = budgeted_exec(conn, host, port, sql, false);
+	}
+	else
+		res = kingres_shard_bounded_exec(conn, "SELECT 1", false);
+	ok = (res != NULL && PQresultStatus(res) == (control ? PGRES_COMMAND_OK : PGRES_TUPLES_OK));
+	if (!ok && control)
+	{
 		if (res == NULL && PQstatus(conn) == CONNECTION_OK)
 		{
 			connect_failure_code = ERRCODE_KINGRES_NODE_TIMEOUT;
 			*errmsg_out = psprintf("node %s did not answer within %d seconds: it accepted the session and did not answer its first command",
-								   node_label(host, port), kingres_shard_node_timeout);
-			connect_failure_msg = *errmsg_out;
-			note_stuck(host, port, connect_failure_code, connect_failure_msg);
-			return false;
-		}
-		if (res == NULL || PQresultStatus(res) != PGRES_COMMAND_OK)
-		{
-			/* the node refused the session: its text decides what the callers try next */
-			*errmsg_out = kingres_shard_scrub_conn_error(kingres_shard_conn_error_text(conn));
-			PQclear(res);
-			return false;
-		}
-		connect_session_bound = true;
-		PQclear(res);
-	}
-	res = kingres_shard_bounded_exec(conn, "SELECT 1", false);
-	ok = (res != NULL && PQresultStatus(res) == PGRES_TUPLES_OK);
-	if (!ok && kingres_shard_control_active)
-	{
-		if (res == NULL && PQstatus(conn) == CONNECTION_OK)
-		{
-			connect_failure_code = ERRCODE_KINGRES_NODE_TIMEOUT;
-			*errmsg_out = psprintf("node %s did not answer within %d seconds: it accepted the session and did not answer its first query",
 								   node_label(host, port), kingres_shard_node_timeout);
 			connect_failure_msg = *errmsg_out;
 			note_stuck(host, port, connect_failure_code, connect_failure_msg);
@@ -649,8 +777,24 @@ probe_session(PGconn *conn, const char *host, int port, char **errmsg_out)
  * attempt is returned, so that the statement that follows fails with the
  * message it always had (version differences are explained there).
  */
+static PGconn *connect_to_node_inner(const char *host, int port, const char *user, char **errmsg_out);
+
+/*
+ * A node that could not be connected to is not tried again in the same call (S11-07): one call
+ * pays node_connect_timeout once for it, not for every session it would open.
+ */
 static PGconn *
 connect_to_node(const char *host, int port, const char *user, char **errmsg_out)
+{
+	PGconn	   *conn = connect_to_node_inner(host, port, user, errmsg_out);
+
+	if (conn == NULL && control_depth > 0 && connect_failure_code == 0 && *errmsg_out != NULL)
+		note_stuck(host, port, 0, *errmsg_out);
+	return conn;
+}
+
+static PGconn *
+connect_to_node_inner(const char *host, int port, const char *user, char **errmsg_out)
 {
 	PGconn	   *conn;
 	char	   *perr = NULL;
@@ -661,8 +805,7 @@ connect_to_node(const char *host, int port, const char *user, char **errmsg_out)
 	const KsCatalog *cat;
 
 	connect_failure_code = 0;
-	connect_session_bound = false;
-	if (kingres_shard_control_active)
+	if (control_depth > 0)
 	{
 		StuckNode  *s = node_is_stuck(host, port);
 
@@ -779,6 +922,13 @@ connect_to_node(const char *host, int port, const char *user, char **errmsg_out)
 	return connect_to_node_as(host, port, user, -1, errmsg_out);
 }
 
+/* The SQLSTATE of the last refusal that kingres_shard_connect_control() could name (KS007, 55P03), or 0. */
+int
+kingres_shard_connect_failure_code(void)
+{
+	return connect_failure_code;
+}
+
 /*
  * kingres_shard_connect_control
  *
@@ -859,6 +1009,9 @@ kingres_shard_get_conn(const char *host, int port, bool missing_ok,
 		kc->via_previous = false;
 		kc->sync_exempt = false;
 		kc->lock_bound = false;
+		kc->lock_touched = false;
+
+		kc->wrote_user = false;
 		kc->gid[0] = '\0';
 		kc->pending_owner = NULL;
 		kc->pending_finish = NULL;
@@ -895,7 +1048,9 @@ kingres_shard_get_conn(const char *host, int port, bool missing_ok,
 		kc->conn = connect_to_node(kc->host, kc->port, kc->user, &err);
 		kc->via_previous = kingres_shard_previous_secret_used;
 		kc->have_error = false;
-		kc->lock_bound = (kc->conn != NULL && connect_session_bound);
+		kc->lock_bound = false;
+		kc->lock_touched = false;
+
 		/* The node is up and did not answer, or gave up a lock wait (S10-02): say so, with its own SQLSTATE. */
 		if (kc->conn == NULL && connect_failure_code != 0 && !missing_ok)
 			ereport(ERROR,
@@ -959,6 +1114,15 @@ kingres_shard_get_conn(const char *host, int port, bool missing_ok,
 static void
 discard_connection(KsConn *kc)
 {
+	/*
+	 * A session that carried the writes of the user's transaction (S11-01) cannot be closed
+	 * without the transaction knowing: whatever the reason, the transaction must not commit.
+	 * Every closing of a session goes through here.  The callbacks of the end of the transaction
+	 * are exempt (the transaction is ending, and they clear the note).
+	 */
+	if (kc->conn != NULL && !in_xact_end &&
+		(kc->wrote_user || (kc->xact_depth > 0 && IsolationUsesXactSnapshot())))
+		note_session_lost(kc);
 	if (kc->conn != NULL)
 	{
 		/*
@@ -976,10 +1140,13 @@ discard_connection(KsConn *kc)
 	kc->in_query = false;
 	kc->have_error = false;
 	kc->wrote = false;
+	kc->wrote_user = false;
 	kc->prepared = false;
 	kc->sync_forced = false;
 	kc->sync_exempt = false;
 	kc->lock_bound = false;
+	kc->lock_touched = false;
+
 	kc->pending_owner = NULL;
 	kc->pending_finish = NULL;
 }
@@ -997,6 +1164,10 @@ kingres_shard_forget_xact(KsConn *kc)
 	kc->nstatements = 0;
 	kc->tz_applied[0] = '\0';
 	kc->wrote = false;
+	kc->wrote_user = false;
+	kc->lock_bound = false;
+	kc->lock_touched = false;
+
 }
 
 /*
@@ -1092,6 +1263,9 @@ kingres_shard_conn_quiesce(KsConn *kc)
 {
 	if (kc->pending_owner != NULL)
 		kc->pending_finish(kc->pending_owner, false);
+	/* a statement of a user never runs under the lock_timeout of a control call (S11-02) */
+	if (kc->lock_bound && control_depth == 0)
+		restore_lock_timeout(kc);
 }
 
 /* The same where an error is not possible: an abort callback. */
@@ -1426,10 +1600,9 @@ kingres_shard_conn_error_text(PGconn *conn)
  * only when asked (the abort callbacks must not).
  */
 static PGresult *
-bounded_get_last(PGconn *conn, bool interruptible, bool *failed)
+bounded_get_last_limit(PGconn *conn, bool interruptible, int64 limit_ms, bool *failed)
 {
-	TimestampTz deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
-													   (int64) kingres_shard_node_timeout * 1000);
+	TimestampTz deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), limit_ms);
 	PGresult   *last = NULL;
 
 	*failed = false;
@@ -1479,6 +1652,13 @@ bounded_get_last(PGconn *conn, bool interruptible, bool *failed)
 			break;
 	}
 	return last;
+}
+
+/* The wait of node_timeout seconds that every statement of a node session gets. */
+static PGresult *
+bounded_get_last(PGconn *conn, bool interruptible, bool *failed)
+{
+	return bounded_get_last_limit(conn, interruptible, (int64) kingres_shard_node_timeout * 1000, failed);
 }
 
 /*
@@ -1551,12 +1731,63 @@ kingres_shard_conn_collect_quiet(KsConn *kc)
 	return failed ? NULL : res;
 }
 
-bool		kingres_shard_control_active = false;
+/*
+ * The dynamic extent of the control-plane calls that are running (S11-01).  A control call is a
+ * function of the SQL interface that runs inside kingres_shard_control_call() (or between
+ * kingres_shard_control_enter() and kingres_shard_control_leave() in a PG_TRY): the depth is
+ * raised on entry and put back to the value it had on every way out, including an error that a
+ * PL/pgSQL block catches, so that no state outlives the call; and when the depth is back at zero
+ * the call's other state goes with it (the nodes it found stuck, the lock_timeout of the node
+ * sessions).  Nothing else changes it, and the end of a transaction forces it to zero as a last
+ * resort (conn_xact_callback).
+ */
+
+bool
+kingres_shard_control_active(void)
+{
+	return control_depth > 0;
+}
+
+static void restore_lock_timeouts(void);
 
 void
-kingres_shard_control_begin(void)
+kingres_shard_control_enter(KsControlScope *scope)
 {
-	kingres_shard_control_active = true;
+	scope->saved_depth = control_depth;
+	control_depth++;
+}
+
+void
+kingres_shard_control_leave(KsControlScope *scope)
+{
+	control_depth = scope->saved_depth;
+	if (control_depth == 0)
+	{
+		list_free_deep(stuck_nodes);
+		stuck_nodes = NIL;
+		forget_node_budgets();
+		restore_lock_timeouts();
+	}
+}
+
+/* A function of the SQL interface that is a control-plane call: its body runs in the scope. */
+Datum
+kingres_shard_control_call(PGFunction body, FunctionCallInfo fcinfo)
+{
+	KsControlScope scope;
+	Datum		result;
+
+	kingres_shard_control_enter(&scope);
+	PG_TRY();
+	{
+		result = body(fcinfo);
+	}
+	PG_FINALLY();
+	{
+		kingres_shard_control_leave(&scope);
+	}
+	PG_END_TRY();
+	return result;
 }
 
 /* The first words of a statement, for a message. */
@@ -1588,23 +1819,30 @@ control_deadline(KsConn *kc, const char *sql, int elevel)
 {
 	char	   *what = abbreviate_sql(sql);
 	char	   *who = node_label(kc->host, kc->port);
+	bool		used_up = (node_wait_limit_ms(kc->host, kc->port) <= 0);
+	char	   *msg = used_up ?
+		psprintf("node %s did not answer within the %d seconds that one call gives a node (its answers are slow)", who,
+				 (int) (control_node_budget_ms() / 1000)) :
+		psprintf("node %s did not answer within %d seconds", who, kingres_shard_node_timeout);
 
 	kc->in_query = false;
-	note_stuck(kc->host, kc->port, ERRCODE_KINGRES_NODE_TIMEOUT,
-			   psprintf("node %s did not answer within %d seconds", who, kingres_shard_node_timeout));
+	note_stuck(kc->host, kc->port, ERRCODE_KINGRES_NODE_TIMEOUT, msg);
 	discard_connection(kc);
 	ereport(elevel,
 			(errcode(ERRCODE_KINGRES_NODE_TIMEOUT),
-			 errmsg("node %s did not answer within %d seconds", who, kingres_shard_node_timeout),
+			 errmsg_internal("%s", msg),
 			 errdetail("It accepted the session and was waiting for its answer to: %s", what),
 			 errhint("The node is up but does not answer: look at its locks (pg_locks) and its backends (pg_stat_activity), or fence it.  Repeating the call does not help while it stays so.")));
 }
 
 /*
- * Before the first statement of a control-plane call on a node session: the node gives up a
- * lock wait by itself, a little before our own deadline, so that the answer says "lock not
- * available" instead of a cancel from far away.  Reset when the transaction ends
- * (release_control_sessions).  False when the node did not answer.
+ * Before a statement of a control-plane call on a node session that is in a remote transaction:
+ * the node gives up a lock wait by itself, a little before our own deadline, so that the answer
+ * says "lock not available" instead of a cancel from far away.  The setting is SET LOCAL: it can
+ * not outlive the remote transaction, whichever way that ends.  It is given back when the call
+ * ends (restore_lock_timeouts), so that the statements of the user that follow in the same
+ * transaction run with the node's own setting (S11-02).  A session that is in no transaction has
+ * no such wait bound: the deadline of the caller is the bound.  False when the node did not answer.
  */
 static bool
 control_session_ready(KsConn *kc)
@@ -1612,14 +1850,30 @@ control_session_ready(KsConn *kc)
 	PGresult   *res;
 	char		sql[64];
 
-	if (kc->lock_bound || kc->conn == NULL)
+	if (kc->lock_bound || kc->conn == NULL || kc->xact_depth == 0 || kc->have_error ||
+		PQtransactionStatus(kc->conn) != PQTRANS_INTRANS)
 		return true;
-	snprintf(sql, sizeof(sql), "SET lock_timeout = %d", control_lock_timeout_ms());
-	res = kingres_shard_bounded_exec(kc->conn, sql, true);
+	if (node_wait_limit_ms(kc->host, kc->port) <= 0)
+		return false;
+	snprintf(sql, sizeof(sql), "SET LOCAL lock_timeout = %d", control_lock_timeout_ms());
+	res = budgeted_exec(kc->conn, kc->host, kc->port, sql, true);
 	if (res == NULL)
 		return false;
 	if (PQresultStatus(res) == PGRES_COMMAND_OK)
+	{
 		kc->lock_bound = true;
+		kc->lock_touched = true;
+	}
+	else
+	{
+		/*
+		 * The node refused the statement.  The check that a node makes of the claim of a session
+		 * (its catalog term, S7-06) is made at the first statement after BEGIN, so the refusal that
+		 * the call's own statement would have got comes here; the transaction on the node is
+		 * aborted now and nothing after this could say why.
+		 */
+		kingres_shard_report_error(kc, res, sql);
+	}
 	PQclear(res);
 	return true;
 }
@@ -1635,11 +1889,23 @@ control_get_result(KsConn *kc, bool *timed_out)
 {
 	bool		failed;
 	PGresult   *res;
+	int64		limit;
+	TimestampTz t0;
 
 	*timed_out = false;
-	if (!kingres_shard_control_active)
+	if (control_depth == 0)
 		return libpqsrv_get_result_last(kc->conn, PG_WAIT_EXTENSION);
-	res = bounded_get_last(kc->conn, true, &failed);
+	limit = node_wait_limit_ms(kc->host, kc->port);
+	if (limit <= 0)
+	{
+		/* the node has used its time: the statement in flight is cancelled and the call gives up on it */
+		kingres_shard_cancel_with_deadline(kc->conn);
+		*timed_out = true;
+		return NULL;
+	}
+	t0 = GetCurrentTimestamp();
+	res = bounded_get_last_limit(kc->conn, true, limit, &failed);
+	node_spend(kc->host, kc->port, t0);
 	if (failed)
 	{
 		*timed_out = (PQstatus(kc->conn) == CONNECTION_OK);
@@ -1648,39 +1914,72 @@ control_get_result(KsConn *kc, bool *timed_out)
 	return res;
 }
 
-/* At the end of the transaction: give the node sessions of a control-plane call their own lock_timeout back. */
+/*
+ * Give the node's own lock_timeout back to the remote transaction of kc (S11-02).  Nothing is
+ * thrown: it runs where a call ends, also on its error path.  A session that cannot be asked now
+ * (a query in flight, a failed remote transaction) keeps the flag; the rollback to the savepoint
+ * or of the transaction that must come before it can be used again ends the setting, and the
+ * places that start a user statement (kingres_shard_conn_quiesce) look at the flag once more.
+ */
 static void
-release_control_sessions(void)
+restore_lock_timeout(KsConn *kc)
+{
+	PGresult   *res;
+
+	if (!kc->lock_bound)
+		return;
+	if (kc->conn == NULL || PQstatus(kc->conn) != CONNECTION_OK)
+	{
+		kc->lock_bound = false;
+		kc->lock_touched = false;
+		return;
+	}
+	if (kc->in_query || kc->have_error || kc->pending_owner != NULL)
+		return;
+	switch (PQtransactionStatus(kc->conn))
+	{
+		case PQTRANS_IDLE:
+			kc->lock_bound = false;		/* SET LOCAL went with its transaction */
+			return;
+		case PQTRANS_INTRANS:
+			break;
+		default:
+			return;
+	}
+	res = kingres_shard_bounded_exec(kc->conn, "RESET lock_timeout", false);
+	if (res != NULL && PQresultStatus(res) == PGRES_COMMAND_OK)
+		kc->lock_bound = false;
+	else
+		discard_connection(kc);
+	PQclear(res);
+}
+
+static void
+restore_lock_timeouts(void)
 {
 	HASH_SEQ_STATUS scan;
 	KsConn	   *kc;
 
-	kingres_shard_control_active = false;
-	list_free_deep(stuck_nodes);
-	stuck_nodes = NIL;
 	if (conn_hash == NULL)
 		return;
 	hash_seq_init(&scan, conn_hash);
 	while ((kc = (KsConn *) hash_seq_search(&scan)) != NULL)
-	{
-		PGresult   *res;
+		restore_lock_timeout(kc);
+}
 
-		if (!kc->lock_bound)
-			continue;
-		kc->lock_bound = false;
-		if (kc->conn == NULL)
-			continue;
-		if (kc->in_query || kc->have_error || PQstatus(kc->conn) != CONNECTION_OK ||
-			PQtransactionStatus(kc->conn) != PQTRANS_IDLE)
-		{
-			discard_connection(kc);
-			continue;
-		}
-		res = kingres_shard_bounded_exec(kc->conn, "RESET lock_timeout", false);
-		if (res == NULL || PQresultStatus(res) != PGRES_COMMAND_OK)
-			discard_connection(kc);
-		PQclear(res);
-	}
+/*
+ * The end of a top-level transaction (commit, prepare or abort): nothing of a control call or of
+ * a lost session survives it.  The scopes have restored themselves long before this on every way
+ * out of a call, so this is the last resort that makes "left set" impossible (S11-02).
+ */
+static void
+end_of_xact(void)
+{
+	control_depth = 0;
+	list_free_deep(stuck_nodes);
+	stuck_nodes = NIL;
+	forget_node_budgets();
+	forget_session_lost();
 }
 
 /*
@@ -1695,7 +1994,7 @@ exec_internal(KsConn *kc, const char *sql)
 	bool		timed_out;
 
 	kingres_shard_conn_quiesce(kc);
-	if (kingres_shard_control_active && !control_session_ready(kc))
+	if (control_depth > 0 && !control_session_ready(kc))
 		control_deadline(kc, sql, ERROR);
 	kc->in_query = true;
 	if (!PQsendQuery(kc->conn, sql))
@@ -1732,7 +2031,7 @@ kingres_shard_exec(KsConn *kc, const char *sql)
 	bool		timed_out;
 
 	kingres_shard_conn_quiesce(kc);
-	if (kingres_shard_control_active && !control_session_ready(kc))
+	if (control_depth > 0 && !control_session_ready(kc))
 		control_deadline(kc, sql, ERROR);
 	kc->in_query = true;
 	if (!PQsendQuery(kc->conn, sql))
@@ -1775,10 +2074,10 @@ kingres_shard_exec_params(KsConn *kc, const char *sql, int nparams,
 	 * A session that a deadline closed earlier in this call (S10-02): a caller that tolerates
 	 * failure gets "no answer", as for any node that cannot be asked.
 	 */
-	if (kc->conn == NULL && !throw_on_error)
+	if (kc->conn == NULL && !throw_on_error && control_depth > 0)
 		return NULL;
 	kingres_shard_conn_quiesce(kc);
-	if (kingres_shard_control_active && !control_session_ready(kc))
+	if (control_depth > 0 && !control_session_ready(kc))
 	{
 		control_deadline(kc, sql, throw_on_error ? ERROR : WARNING);
 		return NULL;
@@ -1977,7 +2276,7 @@ kingres_shard_report_error(KsConn *kc, PGresult *res, const char *sql)
 	 * say which node, and what it was waiting for, instead of a bare "canceling statement due to
 	 * lock timeout" that the caller cannot place.
 	 */
-	if (sqlstate == ERRCODE_LOCK_NOT_AVAILABLE && kingres_shard_control_active)
+	if (sqlstate == ERRCODE_LOCK_NOT_AVAILABLE && control_depth > 0)
 	{
 		int			id = kingres_shard_conn_node_id(kc->host, kc->port);
 
@@ -2013,6 +2312,8 @@ void
 kingres_shard_note_remote_write(KsConn *kc)
 {
 	kc->wrote = true;
+	if (control_depth == 0)
+		kc->wrote_user = true;
 }
 
 /*
@@ -2025,6 +2326,8 @@ kingres_shard_begin_write_xact(KsConn *kc)
 {
 	kingres_shard_begin_xact(kc);
 	kc->wrote = true;
+	if (control_depth == 0)
+		kc->wrote_user = true;
 }
 
 /*
@@ -2153,6 +2456,10 @@ reset_xact_state(KsConn *kc)
 	kc->nstatements = 0;
 	kc->tz_applied[0] = '\0';
 	kc->wrote = false;
+	kc->wrote_user = false;
+	kc->lock_bound = false;
+	kc->lock_touched = false;
+
 	kc->prepared = false;
 	kc->commit_sent = false;
 	kc->gid[0] = '\0';
@@ -2846,19 +3153,38 @@ conn_xact_callback(XactEvent event, void *arg)
 	KsConn	   *kc;
 
 	if (conn_hash == NULL)
+	{
+		/* No session was ever opened, but the state of a control call may still be set (S11-02). */
+		switch (event)
+		{
+			case XACT_EVENT_COMMIT:
+			case XACT_EVENT_PARALLEL_COMMIT:
+			case XACT_EVENT_PREPARE:
+			case XACT_EVENT_ABORT:
+			case XACT_EVENT_PARALLEL_ABORT:
+				end_of_xact();
+				break;
+			default:
+				break;
+		}
 		return;
+	}
 
 	switch (event)
 	{
 		case XACT_EVENT_PARALLEL_PRE_COMMIT:
+			check_session_lost();
 			precommit(true);
 			break;
 
 		case XACT_EVENT_PRE_COMMIT:
+			check_session_lost();
 			precommit(false);
 			break;
 
 		case XACT_EVENT_PRE_PREPARE:
+			/* A session that was closed under writes leaves xact_depth 0: look at the note too. */
+			check_session_lost();
 			hash_seq_init(&scan, conn_hash);
 			while ((kc = (KsConn *) hash_seq_search(&scan)) != NULL)
 			{
@@ -2873,25 +3199,31 @@ conn_xact_callback(XactEvent event, void *arg)
 			break;
 
 		case XACT_EVENT_COMMIT:
+			in_xact_end = true;
 			postcommit();
-			release_control_sessions();
+			end_of_xact();
+			in_xact_end = false;
 			kingres_shard_ha_commit_leave();
 			break;
 
 		case XACT_EVENT_PARALLEL_COMMIT:
 		case XACT_EVENT_PREPARE:
+			in_xact_end = true;
 			hash_seq_init(&scan, conn_hash);
 			while ((kc = (KsConn *) hash_seq_search(&scan)) != NULL)
 				reset_xact_state(kc);
-			release_control_sessions();
+			end_of_xact();
+			in_xact_end = false;
 			break;
 
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
+			in_xact_end = true;
 			hash_seq_init(&scan, conn_hash);
 			while ((kc = (KsConn *) hash_seq_search(&scan)) != NULL)
 				abort_connection(kc);
-			release_control_sessions();
+			end_of_xact();
+			in_xact_end = false;
 			kingres_shard_ha_commit_leave();
 			break;
 	}
@@ -2974,6 +3306,20 @@ conn_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 				if (res == NULL || PQresultStatus(res) != PGRES_COMMAND_OK)
 					kc->have_error = true;
 				PQclear(res);
+			}
+
+			/*
+			 * A SET LOCAL lock_timeout of a control call that was made before the
+			 * savepoint is still in force after the rollback to it (S11-02): give it
+			 * back, or, while a control call still runs, let it be set again.
+			 */
+			if (!kc->have_error && kc->lock_touched)
+			{
+				kc->lock_bound = true;
+				if (control_depth == 0)
+					restore_lock_timeout(kc);
+				else
+					kc->lock_bound = false;
 			}
 		}
 		kc->xact_depth--;
