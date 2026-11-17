@@ -342,6 +342,10 @@ BEGIN
     PERFORM public.s_try(r, 'grant select on the registry sequence', 'GRANT SELECT ON SEQUENCE kingres.ledger_table_table_id_seq TO kl_s_app');
     PERFORM public.s_try(r, 'create a function in the schema', 'CREATE FUNCTION kingres.s_f() RETURNS int LANGUAGE sql AS ''SELECT 1''');
     PERFORM public.s_try(r, 'create a table in the schema', 'CREATE TABLE kingres.s_t (x int)');
+    PERFORM public.s_try(r, 'revoke select on ledger_table from public', 'REVOKE SELECT ON kingres.ledger_table FROM PUBLIC');
+    PERFORM public.s_try(r, 'revoke all on all tables of the schema from public', 'REVOKE ALL ON ALL TABLES IN SCHEMA kingres FROM PUBLIC');
+    PERFORM public.s_try(r, 'revoke select on a column of ledger_digest from public', 'REVOKE SELECT (block_hash) ON kingres.ledger_digest FROM PUBLIC');
+    PERFORM public.s_try(r, 'revoke select on ledger_blocks from another role', 'REVOKE SELECT ON kingres.ledger_blocks FROM kl_s_app');
 END $$;
 \c - kl_s_inh
 SET search_path = public;
@@ -351,21 +355,121 @@ SET search_path = public;
 SELECT public.s_run_schema();
 SELECT who, form, outcome FROM s_results ORDER BY ord;
 TRUNCATE s_results;
--- A sequence that is set back (setval is a function: nothing sees it) makes the
--- next registration fail on the key of the registry; nothing collides, nothing
--- is forged, and the table that was being enabled is not left half made.
-SELECT last_value AS seq_last FROM kingres.ledger_table_table_id_seq \gset
-\c - kl_s_inh
+-- L13-01: nothing takes an identifier from a sequence.  A member of
+-- pg_write_all_data holds nextval and setval on every sequence (no grant to
+-- revoke), and setval is a function that no hook sees: the identity sequences
+-- of the registry and of the records are moved here, to 1 (back), to their
+-- maximum, into the middle of the used values and far ahead by a loop of
+-- nextval, by that role and by a member of the owner role; the writers
+-- (ledger_enable, ledger_generate_digest, ledger_verify_recorded) work after
+-- each move, take the next free identifier, and leave the sequence following it.
+CREATE FUNCTION public.s_move_seqs(mode text) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE s record;
+BEGIN
+    FOR s IN SELECT sequencename AS n, max_value AS mx FROM pg_sequences WHERE schemaname = 'kingres' ORDER BY 1 LOOP
+        IF mode = 'burn' THEN
+            PERFORM count(nextval(format('kingres.%I', s.n)::regclass)) FROM generate_series(1, 2000);
+        ELSE
+            PERFORM setval(format('kingres.%I', s.n)::regclass,
+                           CASE mode WHEN 'back' THEN 1 WHEN 'max' THEN s.mx ELSE 3 END);
+        END IF;
+    END LOOP;
+END $$;
+GRANT EXECUTE ON FUNCTION public.s_move_seqs(text) TO PUBLIC;
+CREATE FUNCTION public.s_ids_ok() RETURNS TABLE (what text, dense boolean) LANGUAGE sql AS $$
+    SELECT 'registry', (SELECT count(*) = max(table_id) FROM kingres.ledger_table)
+    UNION ALL SELECT 'digests', (SELECT count(*) = max(digest_id) FROM kingres.ledger_digest)
+    UNION ALL SELECT 'verifications', (SELECT count(*) = max(verification_id) FROM kingres.ledger_verification)
+$$;
+\c - kl_s_wad
 SET search_path = public;
-SELECT setval('kingres.ledger_table_table_id_seq', 1) AS reset;
-CREATE TABLE s_after (id int);
+SELECT public.s_move_seqs('back');
 \c - :owner_name
 SET search_path = public;
-SELECT kingres.ledger_enable('s_after');
-SELECT count(*) AS registered FROM kingres.ledger_table WHERE relid = 's_after'::regclass;
-SELECT count(*) AS leftover_triggers FROM pg_trigger WHERE tgrelid = 's_after'::regclass;
-SELECT setval('kingres.ledger_table_table_id_seq', :seq_last) AS restored;
-SELECT kingres.ledger_enable('s_after');
+CREATE TABLE s_seq_1 (id int);
+SELECT kingres.ledger_enable('s_seq_1') IS NULL AS enabled;
+INSERT INTO s_seq_1 VALUES (1);
+SELECT kingres.ledger_generate_digest() IS NOT NULL AS digest;
+SELECT kingres.ledger_verify_recorded() > 0 AS recorded;
+SELECT * FROM public.s_ids_ok() ORDER BY 1;
+\c - kl_s_wad
+SET search_path = public;
+SELECT public.s_move_seqs('max');
+\c - :owner_name
+SET search_path = public;
+CREATE TABLE s_seq_2 (id int);
+SELECT kingres.ledger_enable('s_seq_2') IS NULL AS enabled;
+INSERT INTO s_seq_2 VALUES (1);
+SELECT kingres.ledger_generate_digest() IS NOT NULL AS digest;
+SELECT kingres.ledger_verify_recorded() > 0 AS recorded;
+SELECT * FROM public.s_ids_ok() ORDER BY 1;
+\c - kl_s_wad
+SET search_path = public;
+SELECT public.s_move_seqs('middle');
+\c - :owner_name
+SET search_path = public;
+CREATE TABLE s_seq_3 (id int);
+SELECT kingres.ledger_enable('s_seq_3') IS NULL AS enabled;
+INSERT INTO s_seq_3 VALUES (1);
+SELECT kingres.ledger_generate_digest() IS NOT NULL AS digest;
+SELECT kingres.ledger_verify_recorded() > 0 AS recorded;
+SELECT * FROM public.s_ids_ok() ORDER BY 1;
+\c - kl_s_wad
+SET search_path = public;
+SELECT public.s_move_seqs('burn');
+\c - :owner_name
+SET search_path = public;
+CREATE TABLE s_seq_4 (id int);
+SELECT kingres.ledger_enable('s_seq_4') IS NULL AS enabled;
+INSERT INTO s_seq_4 VALUES (1);
+SELECT kingres.ledger_generate_digest() IS NOT NULL AS digest;
+SELECT kingres.ledger_verify_recorded() > 0 AS recorded;
+SELECT * FROM public.s_ids_ok() ORDER BY 1;
+\c - kl_s_inh
+SET search_path = public;
+SELECT public.s_move_seqs('back');
+\c - :owner_name
+SET search_path = public;
+CREATE TABLE s_seq_5 (id int);
+SELECT kingres.ledger_enable('s_seq_5') IS NULL AS enabled;
+INSERT INTO s_seq_5 VALUES (1);
+SELECT kingres.ledger_generate_digest() IS NOT NULL AS digest;
+SELECT kingres.ledger_verify_recorded() > 0 AS recorded;
+SELECT * FROM public.s_ids_ok() ORDER BY 1;
+\c - kl_s_inh
+SET search_path = public;
+SELECT public.s_move_seqs('max');
+\c - :owner_name
+SET search_path = public;
+CREATE TABLE s_seq_6 (id int);
+SELECT kingres.ledger_enable('s_seq_6') IS NULL AS enabled;
+INSERT INTO s_seq_6 VALUES (1);
+SELECT kingres.ledger_generate_digest() IS NOT NULL AS digest;
+SELECT kingres.ledger_verify_recorded() > 0 AS recorded;
+SELECT * FROM public.s_ids_ok() ORDER BY 1;
+\c - kl_s_inh
+SET search_path = public;
+SELECT public.s_move_seqs('middle');
+\c - :owner_name
+SET search_path = public;
+CREATE TABLE s_seq_7 (id int);
+SELECT kingres.ledger_enable('s_seq_7') IS NULL AS enabled;
+INSERT INTO s_seq_7 VALUES (1);
+SELECT kingres.ledger_generate_digest() IS NOT NULL AS digest;
+SELECT kingres.ledger_verify_recorded() > 0 AS recorded;
+SELECT * FROM public.s_ids_ok() ORDER BY 1;
+\c - kl_s_inh
+SET search_path = public;
+SELECT public.s_move_seqs('burn');
+\c - :owner_name
+SET search_path = public;
+CREATE TABLE s_seq_8 (id int);
+SELECT kingres.ledger_enable('s_seq_8') IS NULL AS enabled;
+INSERT INTO s_seq_8 VALUES (1);
+SELECT kingres.ledger_generate_digest() IS NOT NULL AS digest;
+SELECT kingres.ledger_verify_recorded() > 0 AS recorded;
+SELECT * FROM public.s_ids_ok() ORDER BY 1;
+SELECT count(*) AS findings FROM kingres.ledger_verify();
 SELECT count(*) AS findings FROM kingres.ledger_verify();
 
 --------------------------------------------------------------------------
@@ -408,8 +512,8 @@ ROLLBACK;
 -- by hand by one member of the owner role (the identity was issued, the
 -- triggers are armed, capture last) and another member, who does not own it,
 -- asks for it to be registered.
-BEGIN; CREATE TABLE s_gap (id int); SELECT kingres.ledger_enable('s_gap') IS NULL AS enabled; ROLLBACK;
-SELECT last_value AS gap_id FROM kingres.ledger_table_table_id_seq \gset
+-- (the next free identifier of the registry: no table has it yet)
+SELECT COALESCE(max(table_id), 0) + 1 AS gap_id FROM kingres.ledger_table \gset
 \c - kl_s_inh
 SET search_path = public;
 CREATE TABLE s_hand (id int);

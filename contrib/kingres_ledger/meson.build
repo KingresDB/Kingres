@@ -87,6 +87,8 @@ tests += {
       't/016_dump_upgrade.pl',
       't/017_guard_paths.pl',
       't/018_second_invariant.pl',
+      't/019_ids_and_hold.pl',
+      't/020_not_covered.pl',
     ],
   },
 }

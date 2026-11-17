@@ -1129,12 +1129,25 @@ kl_check_catalog_grant(GrantStmt *stmt, const char *relname, Oid extoid,
 			 * PUBLIC is not a role and never the owner.  get_rolespec_oid
 			 * raises "role "public" does not exist" for it, which made
 			 * REVOKE ... FROM PUBLIC fail with a message that blames the
-			 * statement.  An operator may withdraw PUBLIC's read access to
-			 * the catalog tables: the functions that publish the chain run
-			 * with the rights of the extension owner and need only EXECUTE.
+			 * statement.  The read access of PUBLIC to the catalog tables
+			 * (the registered tables, the identity of the chain, the block
+			 * headers) is the administrator's to withdraw: a role that is
+			 * not a superuser (a member of the owner role) could take it
+			 * from every application role, and the publication of the chain
+			 * by plain roles would stop (L13-06; the same class as the
+			 * USAGE of the schema, L11-05).  The functions that publish the
+			 * chain run with the rights of the extension owner and need only
+			 * EXECUTE, and the builder and the capture do not read with the
+			 * rights of PUBLIC at all.  A history table has no grants for
+			 * PUBLIC to lose.
 			 */
 			if (spec->roletype == ROLESPEC_PUBLIC)
+			{
+				if (!history && !superuser())
+					kl_reject("revoke the privileges of PUBLIC on table", relname,
+							  KL_CATALOG_LEDGER);
 				continue;
+			}
 			roleid = get_rolespec_oid(spec, true);
 			if (OidIsValid(roleid) && roleid == owner)
 				kl_reject("revoke privileges of the owner on table", relname,

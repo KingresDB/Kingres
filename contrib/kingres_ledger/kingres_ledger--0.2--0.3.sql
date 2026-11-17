@@ -441,6 +441,8 @@ DECLARE
     hid   oid;
     old_mode text;
     owner_name name;
+    dbo_name name;
+    dbo_super boolean;
 BEGIN
     IF NOT kingres.ledger_hook_active() THEN
         RAISE EXCEPTION 'kingres_ledger must be loaded through shared_preload_libraries'
@@ -578,8 +580,14 @@ BEGIN
         END IF;
     END IF;
 
-    tid := pg_catalog.nextval(
-        pg_catalog.pg_get_serial_sequence('kingres.ledger_table', 'table_id')::pg_catalog.regclass)::int;
+    -- The next free identifier of the registry.  It is taken under the lock
+    -- of the registry (ledger_lock_table took it, after the lock of the
+    -- table), and not from the sequence of the identity column: a role that
+    -- holds nextval and setval on every sequence (a member of
+    -- pg_write_all_data) could move it, and ledger_enable would fail for
+    -- everybody.  ledger_register_table checks that the identifier is this one.
+    SELECT COALESCE(pg_catalog.max(lt.table_id), 0) + 1 INTO tid
+      FROM kingres.ledger_table lt;
 
     IF mode = 'updatable' THEN
         -- The history table: the columns of the table (names and types, in
@@ -641,6 +649,20 @@ BEGIN
         EXECUTE pg_catalog.format('ALTER TABLE %I.%I ENABLE ALWAYS TRIGGER kingres_ledger_block_modify', nsp, rel.relname);
         EXECUTE pg_catalog.format('ALTER TABLE %I.%I ENABLE ALWAYS TRIGGER kingres_ledger_block_truncate', nsp, rel.relname);
         EXECUTE pg_catalog.format('ALTER TABLE %I.%I ENABLE ALWAYS TRIGGER kingres_ledger_capture', nsp, rel.relname);
+    END IF;
+
+    -- Say what the ledger cannot do: the owner of a database can drop it (a
+    -- DROP DATABASE of another database runs no hook of a library loaded in
+    -- this one), and with it the ledger.  Only a database that a superuser owns
+    -- is out of reach of every role that is not a superuser (README, "What a
+    -- role that is not a superuser can stop or remove", L13-03).
+    SELECT r.rolname, r.rolsuper INTO dbo_name, dbo_super
+      FROM pg_catalog.pg_database d JOIN pg_catalog.pg_roles r ON r.oid = d.datdba
+     WHERE d.datname = pg_catalog.current_database();
+    IF NOT COALESCE(dbo_super, true) THEN
+        RAISE WARNING 'database "%" is owned by role "%", which is not a superuser and can drop the database, and the ledger with it',
+            pg_catalog.current_database(), dbo_name
+            USING HINT = 'Make a superuser the owner of every database that holds a ledger: ALTER DATABASE ... OWNER TO.';
     END IF;
 
     -- The registration and the entry of the rows that exist already are
@@ -1368,3 +1390,47 @@ END
 $fn$;
 COMMENT ON FUNCTION kingres.ledger_verify(bigint, bigint) IS
     'Recompute the ledger in the given block range; one row per problem, no rows when consistent. Not executable by PUBLIC.';
+
+-- The status view says who owns the database (L13-03): the owner of a database
+-- that is not a superuser can drop it, and the ledger with it.
+CREATE OR REPLACE VIEW kingres.ledger_status AS
+SELECT (SELECT pg_catalog.count(*) FROM kingres.ledger_table t WHERE t.mode = 'append_only')
+           AS append_only_tables,
+       (SELECT pg_catalog.count(*) FROM kingres.ledger_table t WHERE t.mode = 'updatable')
+           AS updatable_tables,
+       lb.height AS latest_block_height,
+       lb.block_hash AS latest_block_hash,
+       lb.closed_at AS latest_block_closed_at,
+       (SELECT pg_catalog.count(*) FROM kingres.ledger_pending p) AS pending_transactions,
+       (SELECT pg_catalog.clock_timestamp() - pg_catalog.min(p.queued_at)
+          FROM kingres.ledger_pending p) AS oldest_pending_age,
+       ld.digest_id AS last_digest_id,
+       ld.generated_at AS last_digest_at,
+       ld.height AS last_digest_height,
+       lv.verification_id AS last_verification_id,
+       lv.finished_at AS last_verification_at,
+       lv.state AS last_verification_state,
+       lv.problem_count AS last_verification_problems,
+       ws.state AS worker_state,
+       ws.consecutive_failures AS worker_consecutive_failures,
+       ws.retry_after AS worker_retry_after,
+       ws.last_error AS worker_last_error,
+       dbo.rolname AS database_owner,
+       dbo.rolsuper AS database_owner_is_superuser
+  FROM (SELECT 1) one
+  CROSS JOIN LATERAL kingres.ledger_worker_state() ws
+  CROSS JOIN (SELECT r.rolname, r.rolsuper
+                FROM pg_catalog.pg_database d JOIN pg_catalog.pg_roles r ON r.oid = d.datdba
+               WHERE d.datname = pg_catalog.current_database()) dbo
+  LEFT JOIN LATERAL (SELECT b.height, b.block_hash, b.closed_at
+                       FROM kingres.ledger_blocks b
+                      ORDER BY b.height DESC LIMIT 1) lb ON true
+  LEFT JOIN LATERAL (SELECT d.digest_id, d.generated_at, d.height
+                       FROM kingres.ledger_digest d
+                      ORDER BY d.digest_id DESC LIMIT 1) ld ON true
+  LEFT JOIN LATERAL (SELECT v.verification_id, v.finished_at, v.state, v.problem_count
+                       FROM kingres.ledger_verification v
+                      WHERE v.finished_at IS NOT NULL
+                      ORDER BY v.verification_id DESC LIMIT 1) lv ON true;
+COMMENT ON VIEW kingres.ledger_status IS
+    'One row: the number of append-only and updatable ledger tables, the latest block, the pending transactions and the age of the oldest, the last digest and the last finished verification, and the state of the block-building worker for this database (ok, failed with the delay before the next attempt and the last error, ...), and the owner of the database with whether it is a superuser (a database owner that is not one can drop the database, and the ledger with it). Not readable by PUBLIC.';

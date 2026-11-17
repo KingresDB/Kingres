@@ -173,11 +173,16 @@ $h->safe_psql('fx', q(UPDATE pg_trigger SET tgenabled = 'D' WHERE tgrelid = 'kin
 my $chain = $h->safe_psql('fx', q(SELECT encode(chain_id, 'hex') FROM kingres.ledger_chain));
 $h->safe_psql('fx', q(SET kingres_ledger.allow_manual_write = on; DELETE FROM kingres.ledger_chain));
 my $fails_before = log_count($h, qr/the block worker for database \d+ failed/);
+my $failing_since = time();
 $h->safe_psql('fx', q(INSERT INTO public.t VALUES (1)));
-sleep 14;
+ok(wait_for($h, 'fx', q(SELECT worker_consecutive_failures >= 5 FROM kingres.ledger_status), 't', 120),
+	'a failing worker is retried');
 my $consecutive = $h->safe_psql('fx', q(SELECT worker_consecutive_failures FROM kingres.ledger_status));
-cmp_ok($consecutive, '>=', 2, 'a failing worker is retried');
-cmp_ok($consecutive, '<=', 8, 'but with a growing delay: at an interval of 0.3 s there would be about 45 attempts in 14 s');
+# The bound is on the shortest time that five failures can take, which a slow
+# machine only lengthens: the delay doubles from 0.3 s, so the fifth failure
+# comes after 0.3 + 0.6 + 1.2 + 2.4 = 4.5 s at the earliest; at the interval of
+# 0.3 s alone there would have been five failures in 1.5 s.
+cmp_ok(time() - $failing_since, '>=', 4, 'but with a growing delay between the attempts');
 is($h->safe_psql('fx', q(SELECT worker_state FROM kingres.ledger_status)),
 	'failed', 'ledger_status shows the failure');
 like($h->safe_psql('fx', q(SELECT worker_last_error FROM kingres.ledger_status)),
@@ -310,8 +315,10 @@ $m->safe_psql('postgres', q(
 	CREATE TABLE public.t (id int);
 	SELECT kingres.ledger_enable('public.t');
 ));
+my $slot_offset = -s $m->logfile;
 $m->safe_psql('postgres', q(INSERT INTO public.t VALUES (1)));
-sleep 3;
+ok($m->wait_for_log(qr/no background worker slot free for database/, $slot_offset),
+	'the launcher says that no worker slot is free');
 is($m->safe_psql('postgres', q(SELECT count(*) FROM kingres.ledger_pending)), '1',
 	'with no worker slot free for the workers the transaction stays pending');
 like(slurp_file($m->logfile), qr/no background worker slot free for database/, 'the launcher says why');

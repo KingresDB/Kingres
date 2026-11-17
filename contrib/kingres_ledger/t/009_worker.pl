@@ -52,6 +52,17 @@ sub assert_workers_fine
 	  or diag(join("\n", @bad));
 }
 
+# After the interval is set to 0 no worker may be left that started before: a
+# worker that is already running would still build what is pending when it looks.
+# The wait is for that condition (no worker process), not for a time.
+sub wait_no_workers
+{
+	my ($node) = @_;
+	return $node->poll_query_until('postgres',
+		q(SELECT count(*) = 0 FROM pg_stat_activity
+		   WHERE backend_type = 'kingres_ledger worker'), 't');
+}
+
 my $primary = PostgreSQL::Test::Cluster->new('primary');
 $primary->init(allows_streaming => 1);
 $primary->append_conf(
@@ -127,10 +138,9 @@ is($primary->safe_psql('plain', q(SELECT count(*) FROM pg_extension WHERE extnam
 #--------------------------------------------------------------------------
 $primary->safe_psql('postgres', q(ALTER SYSTEM SET kingres_ledger.block_interval = 0));
 $primary->reload;
-sleep 2;
+ok(wait_no_workers($primary), 'no worker is running');
 my $height = $primary->safe_psql('db1', 'SELECT coalesce(max(height), -1) FROM kingres.ledger_blocks');
 $primary->safe_psql('db1', q(INSERT INTO public.w VALUES (2, 'b')));
-sleep 3;
 is($primary->safe_psql('db1', 'SELECT count(*) FROM kingres.ledger_pending'),
 	'1', 'with block_interval = 0 the transaction stays pending');
 is($primary->safe_psql('db1', 'SELECT coalesce(max(height), -1) FROM kingres.ledger_blocks'),
@@ -152,7 +162,7 @@ ok( $primary->poll_query_until('db2',
 
 $primary->safe_psql('postgres', q(ALTER SYSTEM SET kingres_ledger.block_interval = 0));
 $primary->reload;
-sleep 2;
+ok(wait_no_workers($primary), 'no worker is running before the restart');
 $primary->safe_psql('db1', q(INSERT INTO public.w VALUES (3, 'c')));
 $primary->safe_psql('db2', q(INSERT INTO public.w VALUES (3, 'c')));
 $primary->safe_psql('postgres', q(ALTER SYSTEM SET kingres_ledger.block_interval = '500ms'));
@@ -172,7 +182,7 @@ $after_restart = -s $primary->logfile;
 #--------------------------------------------------------------------------
 $primary->safe_psql('postgres', q(ALTER SYSTEM SET kingres_ledger.block_interval = 0));
 $primary->reload;
-sleep 2;
+ok(wait_no_workers($primary), 'no worker is running before the bounded blocks');
 $primary->safe_psql('db1', q(ALTER DATABASE db1 SET kingres_ledger.max_block_transactions = 2));
 $primary->safe_psql('db1', "INSERT INTO public.w VALUES ($_, 'bounded')") for (20 .. 26);
 $height = $primary->safe_psql('db1', 'SELECT max(height) FROM kingres.ledger_blocks');
@@ -191,8 +201,10 @@ is($primary->safe_psql('db1', 'SELECT max(tx_count) FROM kingres.ledger_blocks W
 #--------------------------------------------------------------------------
 my $holder = $primary->background_psql('db2');
 $holder->query_safe('BEGIN; SELECT kingres.ledger_build_block();');
+my $busy_offset = -s $primary->logfile;
 $primary->safe_psql('db2', q(INSERT INTO public.w VALUES (30, 'locked')));
-sleep 4;
+ok($primary->wait_for_log(qr/the block builder is busy in database/, $busy_offset),
+	'the worker says that the block builder is busy');
 is($primary->safe_psql('db2', 'SELECT count(*) FROM kingres.ledger_pending'),
 	'1', 'while the builder lock is held nothing is built');
 like(slurp_file($primary->logfile), qr/the block builder is busy in database/,
@@ -213,7 +225,6 @@ my $standby = PostgreSQL::Test::Cluster->new('standby');
 $standby->init_from_backup($primary, 'b1', has_streaming => 1);
 $standby->start;
 $primary->wait_for_catchup($standby);
-sleep 3;
 is($standby->safe_psql('postgres',
 		q(SELECT count(*) FROM pg_stat_activity WHERE backend_type LIKE 'kingres_ledger%')),
 	'0', 'a standby has no launcher and no worker');
