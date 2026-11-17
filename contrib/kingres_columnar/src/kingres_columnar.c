@@ -26,6 +26,7 @@
 #include "access/relation.h"
 #include "access/table.h"
 #include "access/xact.h"
+#include "catalog/objectaccess.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_authid.h"
@@ -74,6 +75,29 @@ static struct config_enum_entry kc_compression_options[8];
  * Module load
  * ------------------------------------------------------------------------
  */
+
+static object_access_hook_type kc_prev_object_access_hook = NULL;
+
+/*
+ * A table access method has no callback when a file goes away, and a rewrite
+ * (a type change, VACUUM FULL, a change of access method in either direction)
+ * leaves the old file with the transient table that is dropped at the end of
+ * it.  The drop of a relation is the one event that every such path goes
+ * through, whether or not an event trigger fires, so the access method learns
+ * of the files that go away here and the stripe rows of those files are
+ * removed by the transaction that dropped them (kc_write_cleanup_replaced).
+ * The event triggers of the extension only do it earlier, at the end of the
+ * command; correctness does not depend on them.
+ */
+static void
+kc_object_access(ObjectAccessType access, Oid classId, Oid objectId, int subId,
+				 void *arg)
+{
+	if (kc_prev_object_access_hook)
+		kc_prev_object_access_hook(access, classId, objectId, subId, arg);
+	if (access == OAT_DROP && classId == RelationRelationId && subId == 0)
+		kc_write_note_dropped(objectId);
+}
 
 void
 _PG_init(void)
@@ -124,7 +148,7 @@ _PG_init(void)
 							PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomIntVariable("kingres_columnar.write_buffer_memory",
 							"Memory of one backend for stripes being built, all tables together.",
-							"A soft limit: buffers of an outer subtransaction cannot be flushed early.",
+							"A soft limit: buffers of an outer subtransaction cannot be flushed early; twice this is a hard ceiling that refuses the write.",
 							&kc_guc_write_buffer_kb, 131072, 1024, MAX_KILOBYTES,
 							PGC_USERSET, GUC_UNIT_KB, NULL, NULL, NULL);
 	DefineCustomBoolVariable("kingres_columnar.enable_custom_scan",
@@ -145,6 +169,8 @@ _PG_init(void)
 	kc_slot_ops_init();
 	kc_write_init();
 	kc_cscan_init();
+	kc_prev_object_access_hook = object_access_hook;
+	object_access_hook = kc_object_access;
 }
 
 void
@@ -431,10 +457,13 @@ kingres_columnar_reconcile(PG_FUNCTION_ARGS)
 }
 
 /*
- * columnar_note_rewrite(rel): the table_rewrite event trigger tells the access
- * method that a table is about to get a new file.  Whether it does is decided
- * later, when the command is over (columnar_finish_rewrites), by looking at the
- * file the table has then.
+ * columnar_note_rewrite(rel): kept for databases whose install script is the
+ * one of an earlier build, which has a table_rewrite event trigger that calls
+ * it.  The access method no longer needs the trigger (it notes a file when the
+ * relation that holds it is dropped: kc_write_note_dropped); noting a file
+ * twice is the same as once.  Whether the file was replaced is decided later,
+ * when the command is over (columnar_finish_rewrites), by looking at the file
+ * the table has then.
  */
 Datum
 kingres_columnar_note_rewrite(PG_FUNCTION_ARGS)

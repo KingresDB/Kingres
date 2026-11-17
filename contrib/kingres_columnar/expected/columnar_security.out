@@ -22,15 +22,13 @@ SELECT p.proname, pg_get_function_identity_arguments(p.oid) AS args, l.lanname A
  columnar_handler         | internal                                                                                                     | c       | f                |                                              | f
  columnar_identity        | rel regclass                                                                                                 | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | t
  columnar_info            | rel regclass                                                                                                 | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | t
- columnar_note_rewrite    | rel regclass                                                                                                 | c       | t                | {"search_path=pg_catalog, kingres, pg_temp"} | f
  columnar_on_drop         |                                                                                                              | plpgsql | t                | {"search_path=pg_catalog, kingres, pg_temp"} | f
- columnar_on_rewrite      |                                                                                                              | plpgsql | t                | {"search_path=pg_catalog, kingres, pg_temp"} | f
  columnar_options         | rel regclass                                                                                                 | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | t
  columnar_reconcile       |                                                                                                              | c       | t                | {"search_path=pg_catalog, kingres, pg_temp"} | f
  columnar_set_options     | rel regclass, compression text, compression_level integer, stripe_row_count integer, chunk_row_count integer | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | t
  columnar_stripes         | rel regclass                                                                                                 | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | t
  columnar_table_xid       | rel regclass                                                                                                 | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | t
-(16 rows)
+(14 rows)
 
 -- every function that runs with the rights of its owner or without a pinned search_path is listed above;
 -- none may be missing the pin
@@ -53,10 +51,10 @@ SELECT classid::regclass AS catalog, count(*) AS objects
      catalog      | objects 
 ------------------+---------
  pg_type          |       2
- pg_proc          |      16
+ pg_proc          |      14
  pg_class         |       1
  pg_am            |       1
- pg_event_trigger |       3
+ pg_event_trigger |       2
 (5 rows)
 
 -- the stripe catalog: nobody but its owner has a privilege
@@ -232,6 +230,40 @@ SELECT kingres.columnar_compact('s1');
 ERROR:  must be owner of table s1
 SELECT * FROM kingres.columnar_stripe;
 ERROR:  permission denied for table columnar_stripe
+-- the identity and the creation ids of a table are information about its content: they need SELECT on it
+SELECT kingres.columnar_identity('s1') IS NOT NULL AS has_identity;
+ERROR:  permission denied for table s1
+SELECT kingres.columnar_creating_xid('s1') IS NOT NULL AS has_creating_xid;
+ERROR:  permission denied for table s1
+SELECT kingres.columnar_table_xid('s1') IS NOT NULL AS has_table_xid;
+ERROR:  permission denied for table s1
+SELECT count(*) FROM kingres.columnar_stripes('s1');
+ERROR:  permission denied for table s1
+SELECT count(*) FROM kingres.columnar_options('s1');
+ERROR:  permission denied for table s1
+SELECT stripes FROM kingres.columnar_info('s1');
+ERROR:  permission denied for table s1
+RESET ROLE;
+-- a role with SELECT may ask
+SET ROLE regress_kc_reader;
+SELECT kingres.columnar_identity('s1') IS NOT NULL AS has_identity;
+ has_identity 
+--------------
+ t
+(1 row)
+
+SELECT kingres.columnar_creating_xid('s1') IS NOT NULL AS has_creating_xid;
+ has_creating_xid 
+------------------
+ t
+(1 row)
+
+SELECT kingres.columnar_table_xid('s1') IS NOT NULL AS has_table_xid;
+ has_table_xid 
+---------------
+ t
+(1 row)
+
 RESET ROLE;
 -- ownership: the new owner may change the options
 ALTER TABLE s1 OWNER TO regress_kc_other;

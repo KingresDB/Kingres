@@ -107,15 +107,214 @@ foreach my $c (@cmds)
 	is(orphans(), 0, "$name, rolled back: nothing left over");
 }
 
-# a session that turned the event triggers off leaves nothing either: the
-# access method knows which files its rewrites replaced
+# C6-04, C6-05: correctness never depends on an event trigger firing.  A session
+# that turned the event triggers off, a trigger that is disabled, a database whose
+# install script is an earlier one (it has no trigger the access method now uses),
+# single-user mode: whatever replaces or drops a file, nothing is left over once
+# the transaction has committed, and the table reads.  The access method itself
+# notes the files that go away (the drop of the relation that holds them); the
+# triggers only do it at the end of the command instead of at the commit.
+{
+	my @cmds2 = (
+		['type change (columnar to columnar)', 'ALTER TABLE x ALTER COLUMN b TYPE bigint'],
+		['SET ACCESS METHOD heap (columnar to heap)', 'ALTER TABLE x SET ACCESS METHOD heap'],
+		['ADD COLUMN with a volatile default', 'ALTER TABLE x ADD COLUMN c float DEFAULT random()'],
+		['DROP TABLE', 'DROP TABLE x'],
+		['VACUUM FULL', 'VACUUM FULL x'],
+		['TRUNCATE', 'TRUNCATE x'],
+	);
+	my %modes = (
+		'event_triggers = off' => [ 'SET event_triggers = off;', '' ],
+		'the triggers disabled' => [ '', '' ],
+	);
+	foreach my $mode ('event_triggers = off', 'the triggers disabled')
+	{
+		if ($mode eq 'the triggers disabled')
+		{
+			q1("ALTER EVENT TRIGGER kingres_columnar_on_drop DISABLE; ALTER EVENT TRIGGER kingres_columnar_check_ddl DISABLE");
+		}
+		foreach my $c (@cmds2)
+		{
+			my ($name, $sql) = @$c;
+			my $pre = $modes{$mode}[0];
+			fresh_x();
+			my $uid = q1("SELECT kingres.columnar_identity('x')");
+			my $n0 = stripe_rows('x');
+			script("$pre $sql;");
+			is(q1("SELECT count(*) FROM kingres.columnar_stripe WHERE rel_uid = $uid"), 0,
+				"$mode, $name: no stripe row of the old file is left");
+			is(orphans(), 0, "$mode, $name: nothing left over");
+			unless ($sql =~ /DROP TABLE|TRUNCATE/)
+			{
+				is(q1('SELECT count(*) FROM x'), 5000, "$mode, $name: the table reads");
+			}
+
+			# in a transaction block, committed
+			next if $sql =~ /^VACUUM/;
+			fresh_x();
+			$uid = q1("SELECT kingres.columnar_identity('x')");
+			script("$pre BEGIN; $sql; COMMIT;");
+			is(q1("SELECT count(*) FROM kingres.columnar_stripe WHERE rel_uid = $uid"), 0,
+				"$mode, $name, in a transaction block: no stripe row of the old file is left");
+
+			# and rolled back: the old file is back whole
+			fresh_x();
+			$uid = q1("SELECT kingres.columnar_identity('x')");
+			script("$pre BEGIN; $sql; ROLLBACK;");
+			is(stripe_rows('x'), $n0, "$mode, $name, rolled back: the stripe rows of the old file are all there");
+			is(q1('SELECT count(*) || \',\' || sum(a) FROM x'), '5000,12502500', "$mode, $name, rolled back: the table reads as before");
+		}
+		if ($mode eq 'the triggers disabled')
+		{
+			q1("ALTER EVENT TRIGGER kingres_columnar_on_drop ENABLE ALWAYS; ALTER EVENT TRIGGER kingres_columnar_check_ddl ENABLE ALWAYS");
+		}
+	}
+
+	# the files of a partitioned table, a schema and an extension-free cascade
+	q1("DROP TABLE IF EXISTS pt CASCADE; DROP SCHEMA IF EXISTS sch CASCADE;
+		CREATE TABLE pt (a int) PARTITION BY RANGE (a);
+		CREATE TABLE pt1 PARTITION OF pt FOR VALUES FROM (0) TO (100000) USING columnar;
+		INSERT INTO pt SELECT g FROM generate_series(1, 4000) g;
+		CREATE SCHEMA sch; CREATE TABLE sch.s1 (a int) USING columnar; INSERT INTO sch.s1 SELECT g FROM generate_series(1, 4000) g;");
+	script("SET event_triggers = off; DROP TABLE pt; DROP SCHEMA sch CASCADE;");
+	is(orphans(), 0, 'event_triggers = off: DROP of a partitioned table and DROP SCHEMA CASCADE leave nothing');
+
+	# single-user mode never fires event triggers; the library is loaded as in any server
+	fresh_x();
+	my $uid = q1("SELECT kingres.columnar_identity('x')");
+	$node->stop;
+	my $input = "ALTER TABLE x SET ACCESS METHOD heap;\n\n";
+	my $ok = PostgreSQL::Test::Utils::run_log([ 'postgres', '--single', '-j', '-D', $node->data_dir, 'postgres' ], '<', \$input);
+	ok($ok, 'single-user mode: a change away from columnar runs');
+	$node->start;
+	is(q1("SELECT count(*) FROM kingres.columnar_stripe WHERE rel_uid = $uid"), 0, 'single-user mode: the old file\'s rows are removed with the commit');
+	is(orphans(), 0, 'single-user mode: nothing left over');
+	is(q1('SELECT count(*) || \',\' || (SELECT amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.relname = \'x\') FROM x'),
+		'5000,heap', 'single-user mode: the table is heap and has its rows');
+
+	# leftover rows can never be read as stripes of a later file: a new file draws an identity
+	# that no row of the catalog (live or dead) has, so rows left by a missed cleanup are never
+	# found by the reader of another file
+	fresh_x();
+	$uid = q1("SELECT kingres.columnar_identity('x')");
+	q1("INSERT INTO kingres.columnar_stripe
+		SELECT rel_uid + 1000003, stripe_id, first_row, row_count, chunk_groups, natts, first_block,
+		       block_count, blob_len, raw_bytes, footer_offset, cid_points, col_stats, maintenance
+		  FROM kingres.columnar_stripe WHERE rel_uid = $uid");
+	my $leftover = $uid + 1000003;
+	is(q1("SELECT kingres.columnar_identity('x') <> $leftover"), 't', 'a leftover row of another identity is not the table\'s');
+	is(q1('SELECT count(*) FROM x'), 5000, '... and the reader does not take it');
+	my @used = map { q1("CREATE TABLE ni$_ (a int) USING columnar; SELECT kingres.columnar_identity('ni$_')") } 1 .. 20;
+	is(scalar(grep { $_ == $leftover } @used), 0, '... new files draw identities that the catalog does not use');
+	q1("DROP TABLE ni$_") for 1 .. 20;
+	q1("SELECT kingres.columnar_reconcile()");
+	is(orphans(), 0, '... and the next cleanup removes it');
+}
+
+# C6-05: a database made by an earlier install script (a table_rewrite trigger
+# that calls columnar_note_rewrite, a DROP trigger that runs the full reconcile)
+# works fully, and its trigger functions can be replaced by the current ones
+{
+	my $pgc = $ENV{PG_CONFIG} || 'pg_config';
+	my $share = `$pgc --sharedir 2>/dev/null`;
+	chomp $share;
+	my $script = "$share/extension/kingres_columnar--0.1.sql";
+	my $text = '';
+	if (-f $script) { open(my $fh, '<', $script) or die; local $/; $text = <$fh>; close $fh; }
+
+	q1(q{CREATE FUNCTION kingres.columnar_note_rewrite(rel regclass) RETURNS void
+		AS '$libdir/kingres_columnar', 'kingres_columnar_note_rewrite' LANGUAGE C STRICT SECURITY DEFINER
+		SET search_path = pg_catalog, kingres, pg_temp;
+		CREATE FUNCTION kingres.old_on_rewrite() RETURNS event_trigger LANGUAGE plpgsql SECURITY DEFINER
+		SET search_path = pg_catalog, kingres, pg_temp AS $$ BEGIN
+		  PERFORM kingres.columnar_note_rewrite(pg_event_trigger_table_rewrite_oid()); END; $$;
+		CREATE EVENT TRIGGER old_on_rewrite ON table_rewrite EXECUTE FUNCTION kingres.old_on_rewrite();
+		CREATE OR REPLACE FUNCTION kingres.columnar_on_drop() RETURNS event_trigger LANGUAGE plpgsql SECURITY DEFINER
+		SET search_path = pg_catalog, kingres, pg_temp AS $$ BEGIN
+		  IF EXISTS (SELECT 1 FROM pg_event_trigger_dropped_objects() WHERE object_type IN ('table', 'materialized view')) THEN
+		    PERFORM kingres.columnar_reconcile(); END IF; END; $$;});
+	foreach my $c (@cmds)
+	{
+		my ($name, $sql) = @$c;
+		next if $sql =~ /^VACUUM/;
+		fresh_x();
+		my $uid = q1("SELECT kingres.columnar_identity('x')");
+		script("$sql;");
+		is(q1("SELECT count(*) FROM kingres.columnar_stripe WHERE rel_uid = $uid"), 0, "earlier script, $name: no stripe row of the old file is left");
+		is(orphans(), 0, "earlier script, $name: nothing left over");
+	}
+	SKIP:
+	{
+		skip 'the install script is not readable here', 3 unless $text =~ /CREATE FUNCTION columnar_on_drop\(\)/;
+		foreach my $fn ('columnar_on_drop', 'columnar_check_ddl')
+		{
+			my ($def) = $text =~ /(CREATE FUNCTION \Q$fn\E\(\).*?\n\$\$;)/s;
+			$def =~ s/^CREATE FUNCTION /CREATE OR REPLACE FUNCTION kingres./;
+			my ($out, $err) = script($def);
+			unlike($err, qr/ERROR/, "the current $fn replaces the old one with CREATE OR REPLACE");
+		}
+		fresh_x();
+		my $uid = q1("SELECT kingres.columnar_identity('x')");
+		script("ALTER TABLE x SET ACCESS METHOD heap;");
+		is(orphans(), 0, '... and the cleanup still leaves nothing over');
+	}
+	q1("DROP EVENT TRIGGER old_on_rewrite; DROP FUNCTION kingres.old_on_rewrite(); DROP FUNCTION kingres.columnar_note_rewrite(regclass)");
+}
+
+# C6-07: what a failed rewrite or a rolled-back one leaves behind must not be
+# deleted by the cleanup (the table would be emptied), and the cleanup at the end
+# of the command has run when the command is over, not at the commit
+{
+	fresh_x();
+	my $n0 = stripe_rows('x');
+	script("BEGIN;
+DO \$\$ BEGIN BEGIN ALTER TABLE x ALTER COLUMN b TYPE int2 USING (b / (b - 4000));
+	EXCEPTION WHEN division_by_zero THEN NULL; END; END \$\$;
+ALTER TABLE x ADD COLUMN c int;
+COMMIT;");
+	is(q1('SELECT count(*) FROM x'), 5000, 'a failed rewrite in a block, then another command and a commit: the table keeps its rows');
+	is(orphans(), 0, '... and nothing is left over');
+
+	fresh_x();
+	q1("ALTER EVENT TRIGGER kingres_columnar_check_ddl DISABLE; ALTER EVENT TRIGGER kingres_columnar_on_drop DISABLE");
+	script("BEGIN; SAVEPOINT s; ALTER TABLE x ALTER COLUMN b TYPE bigint; ROLLBACK TO s; ALTER TABLE x ADD COLUMN c int; COMMIT;");
+	is(q1('SELECT count(*) FROM x'), 5000, 'a rewrite rolled back to a savepoint, the triggers disabled, then a commit: the table keeps its rows');
+	q1("ALTER EVENT TRIGGER kingres_columnar_check_ddl ENABLE ALWAYS; ALTER EVENT TRIGGER kingres_columnar_on_drop ENABLE ALWAYS");
+
+	fresh_x();
+	script("BEGIN; SAVEPOINT s; DROP TABLE x; ROLLBACK TO s; INSERT INTO x VALUES (1, 1); COMMIT;");
+	is(q1('SELECT count(*) FROM x'), 5001, 'a DROP rolled back to a savepoint, then a commit: the table keeps its rows');
+
+	# the cleanup at the end of the command: inside the transaction, after the command, nothing is left
+	foreach my $c (['ALTER TABLE x ALTER COLUMN b TYPE bigint', 'a rewriting ALTER TABLE'],
+		['ALTER TABLE x SET ACCESS METHOD heap', 'SET ACCESS METHOD heap'], ['DROP TABLE x', 'DROP TABLE'])
+	{
+		my ($sql, $name) = @$c;
+		fresh_x();
+		my ($out, $err) = script("BEGIN; $sql; SELECT 'O=' || count(*) FROM kingres.columnar_check() WHERE check_name = 'orphan_catalog_rows'; ROLLBACK;");
+		like($out, qr/O=0\b/, "$name: when the command is over, inside its transaction, no stripe row of the old file is left");
+	}
+}
+
+# a stripe row that another session deleted and committed while the cleanup waited for it is
+# gone, which is what the cleanup wanted: not an error
 {
 	fresh_x();
 	my $uid = q1("SELECT kingres.columnar_identity('x')");
-	script("SET event_triggers = off; ALTER TABLE x ALTER COLUMN b TYPE bigint;");
-	is(q1("SELECT count(*) FROM kingres.columnar_stripe WHERE rel_uid = $uid"), 0,
-		'event triggers off: the rewrite removed the old file\'s rows with its own commit');
-	is(orphans(), 0, 'event triggers off: nothing left over');
+	my $a = $node->background_psql('postgres', on_error_stop => 1);
+	$a->query_safe("BEGIN");
+	$a->query_safe("DELETE FROM kingres.columnar_stripe WHERE rel_uid = $uid AND stripe_id = (SELECT min(stripe_id) FROM kingres.columnar_stripe WHERE rel_uid = $uid)");
+	my $b = $node->background_psql('postgres', on_error_stop => 0);
+	my $bpid = $b->query_safe("SELECT pg_backend_pid()");
+	$b->query_until(qr/started/, "\\echo started\nALTER TABLE x SET ACCESS METHOD heap;\n");
+	$node->poll_query_until('postgres', "SELECT wait_event_type = 'Lock' FROM pg_stat_activity WHERE pid = $bpid")
+		or diag('session B did not start to wait');
+	$a->query_safe("COMMIT");
+	my $res = $b->query("SELECT 'AFTER=' || count(*) FROM x");
+	like($res, qr/AFTER=5000/, 'a row deleted and committed by another session while the cleanup waited for it: the command finishes, the table has its rows');
+	$b->quit;
+	$a->quit;
+	is(orphans(), 0, '... and nothing is left over');
 }
 
 # a materialized view
@@ -342,6 +541,16 @@ COMMIT;");
 	unlike($err, qr/ERROR/, 'a replica session: a rewrite and an insert');
 	is(q1("SELECT count(*) FROM kingres.columnar_stripe WHERE rel_uid = $uid"), 0, 'a replica session: the rewrite removed the old file\'s rows');
 	is(orphans(), 0, 'a replica session: nothing is left over');
+}
+
+# the last: dropping the extension drops the tables and the catalog in one command; the
+# files the access method noted have no catalog to be cleaned from, which is not an error
+{
+	fresh_x();
+	my ($out, $err) = script("DROP EXTENSION kingres_columnar CASCADE;");
+	unlike($err, qr/ERROR/, 'DROP EXTENSION ... CASCADE with columnar tables: no error');
+	is(q1("SELECT count(*) FROM pg_extension WHERE extname = 'kingres_columnar'"), 0, '... and the extension is gone');
+	is(q1("SELECT count(*) FROM pg_class WHERE relname = 'x'"), 0, '... with its tables');
 }
 
 $node->stop;

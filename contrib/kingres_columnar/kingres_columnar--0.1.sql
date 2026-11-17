@@ -108,23 +108,24 @@ CREATE FUNCTION columnar_reconcile()
     LANGUAGE C STRICT SECURITY DEFINER
     SET search_path = pg_catalog, kingres, pg_temp;
 
--- The two halves of the clean-up after a rewriting ALTER TABLE (see
--- columnar_on_rewrite and columnar_check_ddl): the table_rewrite event names
--- the table that gets a new file, the end of the command removes the stripe
--- rows of the file it had.
-CREATE FUNCTION columnar_note_rewrite(rel regclass)
-    RETURNS void
-    AS 'MODULE_PATHNAME', 'kingres_columnar_note_rewrite'
-    LANGUAGE C STRICT SECURITY DEFINER
-    SET search_path = pg_catalog, kingres, pg_temp;
-
+-- The clean-up of the files a command replaced or dropped, at the end of the
+-- command.  The access method notes such a file itself, when the relation that
+-- holds it is dropped (an object access hook: no event trigger is needed for
+-- that), and removes the stripe rows of the noted files at the latest when the
+-- transaction commits or prepares.  The event triggers below only call this
+-- function so that it happens at the end of the command and not at the commit.
 CREATE FUNCTION columnar_finish_rewrites()
     RETURNS int
     AS 'MODULE_PATHNAME', 'kingres_columnar_finish_rewrites'
     LANGUAGE C STRICT SECURITY DEFINER
     SET search_path = pg_catalog, kingres, pg_temp;
 
--- Remove the stripe rows of files no relation uses any more after a DROP.
+-- Remove the stripe rows of the files a DROP took away, at the end of the
+-- command: only the files the command dropped are looked at (the access method
+-- noted them when the relations were dropped), so the cost does not depend on
+-- how many columnar tables exist.  Without this trigger (event triggers off,
+-- the trigger disabled, single-user mode) the same rows are removed when the
+-- transaction commits.
 CREATE FUNCTION columnar_on_drop()
     RETURNS event_trigger
     LANGUAGE plpgsql SECURITY DEFINER
@@ -133,7 +134,7 @@ AS $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_event_trigger_dropped_objects()
                 WHERE object_type IN ('table', 'materialized view')) THEN
-        PERFORM kingres.columnar_reconcile();
+        PERFORM kingres.columnar_finish_rewrites();
     END IF;
 END;
 $$;
@@ -257,33 +258,20 @@ BEGIN
 
     -- A rewriting ALTER TABLE (a type change, a change of access method in
     -- either direction) replaces the table's file and leaves the stripe rows
-    -- of the old one, which nothing can read any more.  Remove them with the
-    -- command, in its transaction (a rollback brings them back), so that
-    -- columnar_check has nothing to report until the next VACUUM.  Only the
-    -- files the command replaced are looked at (columnar_on_rewrite named
-    -- them), so the cost does not depend on how many columnar tables exist.
+    -- of the old one, which nothing can read any more.  The access method
+    -- notes the old file itself (when the transient table that holds it is
+    -- dropped) and removes its rows at the latest at commit; this removes them
+    -- with the command, so that columnar_check has nothing to report until the
+    -- next VACUUM.  Only the files the command replaced are looked at, so the
+    -- cost does not depend on how many columnar tables exist.
     IF TG_TAG = 'ALTER TABLE' THEN
         PERFORM columnar_finish_rewrites();
     END IF;
 END;
 $$;
 
--- A table that is about to get a new file: the access method notes the file it
--- has, for the end of the command.
-CREATE FUNCTION columnar_on_rewrite()
-    RETURNS event_trigger
-    LANGUAGE plpgsql SECURITY DEFINER
-    SET search_path = pg_catalog, kingres, pg_temp
-AS $$
-BEGIN
-    PERFORM kingres.columnar_note_rewrite(pg_event_trigger_table_rewrite_oid());
-END;
-$$;
-
 CREATE EVENT TRIGGER kingres_columnar_on_drop ON sql_drop
     EXECUTE FUNCTION columnar_on_drop();
-CREATE EVENT TRIGGER kingres_columnar_on_rewrite ON table_rewrite
-    EXECUTE FUNCTION columnar_on_rewrite();
 CREATE EVENT TRIGGER kingres_columnar_check_ddl ON ddl_command_end
     WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE', 'CREATE TRIGGER', 'CREATE SCHEMA',
                  'CREATE TABLE AS', 'SELECT INTO', 'CREATE MATERIALIZED VIEW',
@@ -291,7 +279,6 @@ CREATE EVENT TRIGGER kingres_columnar_check_ddl ON ddl_command_end
     EXECUTE FUNCTION columnar_check_ddl();
 ALTER EVENT TRIGGER kingres_columnar_on_drop ENABLE ALWAYS;
 ALTER EVENT TRIGGER kingres_columnar_check_ddl ENABLE ALWAYS;
-ALTER EVENT TRIGGER kingres_columnar_on_rewrite ENABLE ALWAYS;
 
 REVOKE ALL ON FUNCTION columnar_handler(internal) FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_set_options(regclass, text, int, int, int) FROM PUBLIC;
@@ -301,9 +288,7 @@ REVOKE ALL ON FUNCTION columnar_stripes(regclass) FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_compact(regclass, int) FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_check(boolean) FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_reconcile() FROM PUBLIC;
-REVOKE ALL ON FUNCTION columnar_note_rewrite(regclass) FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_finish_rewrites() FROM PUBLIC;
-REVOKE ALL ON FUNCTION columnar_on_rewrite() FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_on_drop() FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_check_ddl() FROM PUBLIC;
 -- The functions that act on one table check ownership themselves.
