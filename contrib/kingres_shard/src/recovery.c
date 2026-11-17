@@ -709,6 +709,7 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 	TimestampTz pass_start = GetCurrentTimestamp();
 	const char *old_format_until = "-infinity";
 
+	kingres_shard_control_begin();
 	if (!cat->present || cat->local_node_id == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -834,7 +835,7 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 		{
 			if (r->standby)
 				continue;
-			ereport(LOG,
+			ereport((MyBackendType == B_BG_WORKER || r->node_id == 0) ? LOG : WARNING,
 					(errmsg("kingres_shard recovery: node %d (%s:%d) is not reachable, skipped",
 							r->node_id, r->host, r->port),
 					 errdetail_internal("%s", err ? err : "")));
@@ -880,7 +881,8 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 					ereport(LOG,
 							(errmsg("kingres_shard recovery: could not bound the session on node %d, skipped",
 									r->node_id),
-							 errdetail_internal("%s", sres ? PQresultErrorMessage(sres) : "no result")));
+							 errdetail_internal("%s", (sres != NULL && PQresultErrorMessage(sres)[0] != '\0') ?
+											PQresultErrorMessage(sres) : kingres_shard_conn_error_text(kc->conn))));
 				PQclear(sres);
 				pfree(set);
 			}
@@ -895,7 +897,7 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 		 */
 		if (!(r->standby ? kingres_shard_conn_local_sync(kc) : kingres_shard_conn_force_sync(kc)))
 		{
-			ereport(LOG,
+			ereport(MyBackendType == B_BG_WORKER ? LOG : WARNING,
 					(errmsg("kingres_shard recovery: could not set up the session on node %d, skipped", r->node_id)));
 			continue;
 		}
@@ -913,7 +915,7 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 										3, NULL, params, false);
 		if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK)
 		{
-			ereport(LOG,
+			ereport(MyBackendType == B_BG_WORKER ? LOG : WARNING,
 					(errmsg("kingres_shard recovery: could not list the prepared transactions of node %d (%s:%d)",
 							r->node_id, r->host, r->port),
 					 errdetail_internal("%s", kingres_shard_conn_error_text(kc->conn))));
@@ -1001,6 +1003,7 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 					continue;
 				}
 			}
+			kingres_shard_fault_point("recovery_before_resolve");
 			sql = psprintf("%s PREPARED %s", commit ? "COMMIT" : "ROLLBACK",
 						   quote_literal_cstr(gid));
 			/*
@@ -1137,8 +1140,40 @@ kingres_shard_recover_prepared_with(int extra_id, int extra_group, const char *e
 		if (purged_primaries >= expected_primaries && !any_via_previous &&
 			kingres_shard_previous_secret(pbuf, sizeof(pbuf), &plen))
 		{
+			bool		all_told = true;
+			ListCell   *lcw;
+
 			explicit_bzero(pbuf, sizeof(pbuf));
-			if (SPI_execute("UPDATE " KINGRES_SHARD_SCHEMA ".cluster_secret SET previous = NULL, previous_at = NULL "
+
+			/*
+			 * Every primary accepted a session made with the current secret, so every primary
+			 * has it and no rotation is in doubt anywhere: tell them to forget the previous
+			 * one too (S10-04).  A node that cannot be told keeps it, and this node keeps its
+			 * own until the pass that reaches all of them.
+			 */
+			foreach(lcw, nodes)
+			{
+				RecNode    *w = (RecNode *) lfirst(lcw);
+				char	   *werr = NULL;
+				KsConn	   *wkc;
+				PGresult   *wres;
+
+				if (w->standby || w->node_id == cat->local_node_id)
+					continue;
+				wkc = kingres_shard_get_conn(w->host, w->port, true, &werr);
+				if (wkc == NULL || wkc->xact_depth > 0)
+				{
+					all_told = false;
+					continue;
+				}
+				wres = kingres_shard_exec_params(wkc, "SELECT " KINGRES_SHARD_SCHEMA ".internal_drop_previous_secret()",
+												 0, NULL, NULL, false);
+				if (wres == NULL || PQresultStatus(wres) != PGRES_TUPLES_OK)
+					all_told = false;
+				PQclear(wres);
+			}
+			if (all_told &&
+				SPI_execute("UPDATE " KINGRES_SHARD_SCHEMA ".cluster_secret SET previous = NULL, previous_at = NULL "
 							"WHERE previous IS NOT NULL", false, 0) != SPI_OK_UPDATE)
 				elog(ERROR, "could not clear the previous cluster secret");
 		}

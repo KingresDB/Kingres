@@ -85,6 +85,19 @@ BEGIN
 END;
 $$;
 
+-- Forget the previous cluster secret on this node (S10-04).  A recovery pass that reached every
+-- primary with the current secret knows that no node still needs the previous one, and tells
+-- the others to forget it: until then a leaked old secret keeps one of its powers (the tag of a
+-- prepared transaction's name made with it counts).
+CREATE FUNCTION kingres.internal_drop_previous_secret()
+    RETURNS pg_catalog.void
+    LANGUAGE sql
+    SET search_path = pg_catalog, kingres, pg_temp
+    AS $$
+UPDATE kingres.cluster_secret SET previous = NULL, previous_at = NULL WHERE previous IS NOT NULL;
+$$;
+REVOKE ALL ON FUNCTION kingres.internal_drop_previous_secret() FROM PUBLIC;
+
 -- A decision is forgotten only once its participant's standbys have confirmed the commit (S9-01).
 ALTER TABLE kingres.dtx_log ADD COLUMN durable bool NOT NULL DEFAULT false;
 ALTER TABLE kingres.dtx_log ADD COLUMN exempt bool NOT NULL DEFAULT false;
@@ -845,8 +858,22 @@ BEGIN
               WHERE nd.is_active AND nd.role OPERATOR(pg_catalog.=) 'primary' ORDER BY nd.node_id
     LOOP
         BEGIN
-            st := kingres.internal_exec_scalar(n.node_id, 'SELECT kingres.internal_local_state()::pg_catalog.text', 20000)::pg_catalog.jsonb;
-        EXCEPTION WHEN OTHERS THEN
+            st := kingres.internal_exec_scalar(n.node_id, 'SELECT kingres.internal_local_state()::pg_catalog.text')::pg_catalog.jsonb;
+        EXCEPTION WHEN OTHERS OR query_canceled THEN
+            -- A node that accepted the session and did not answer within node_timeout (S10-02): the call
+            -- does not wait for it again; a cancel by the caller is not swallowed.
+            IF SQLSTATE OPERATOR(pg_catalog.=) '57014' THEN
+                IF SQLERRM OPERATOR(pg_catalog.!~) 'timed out after' THEN
+                    RAISE;
+                END IF;
+                check_name := 'node_unreachable'; node_id := n.node_id;
+                object := pg_catalog.format('%s:%s', n.host, n.port);
+                detail := pg_catalog.format('the node did not answer within node_timeout (%s): %s', SQLERRM,
+                                            'it accepted the session and was waiting for its answer to the cluster state question; the other checks of this node are skipped');
+                RETURN NEXT;
+                v_skip := pg_catalog.array_append(v_skip, n.node_id);
+                CONTINUE;
+            END IF;
             -- A node that runs another version of the library refuses the claim of the session of
             -- this node to come from a node of the cluster, and that looks like a lost connection.
             -- Ask for its version over a session that claims nothing, and say the versions
@@ -2055,13 +2082,11 @@ BEGIN
 END;
 $$;
 
--- On the node that takes over, before or after pg_promote(): has this node replayed the
--- position?  With the position that switchover_mark() returned, "replayed" means
--- replay position >= position.  With the "Latest checkpoint location" that pg_controldata
--- prints for the stopped old primary (the start of its shutdown checkpoint, the last record
--- it wrote), pass shutdown_checkpoint => true: the record is replayed when the replay
--- position is beyond its start.  False means that something OLD wrote is not on this node.
-CREATE FUNCTION kingres.switchover_verify(target_lsn pg_catalog.pg_lsn, shutdown_checkpoint pg_catalog.bool DEFAULT false)
+-- On the node that takes over, before or after pg_promote(): has this node replayed the mark
+-- that switchover_mark() returned?  This says only that: replay position >= mark.  It does NOT
+-- say that nothing is lost: whatever the old primary wrote after the mark is not covered (S10-01).
+-- The proof is switchover_verify() below.
+CREATE FUNCTION kingres.switchover_replayed(mark_lsn pg_catalog.pg_lsn)
     RETURNS pg_catalog.bool
     LANGUAGE plpgsql STABLE
     SET search_path = pg_catalog, kingres, pg_temp
@@ -2073,18 +2098,29 @@ BEGIN
     IF v_replayed IS NULL THEN
         RETURN false;
     END IF;
-    IF shutdown_checkpoint THEN
-        RETURN v_replayed OPERATOR(pg_catalog.>) target_lsn;
-    END IF;
-    RETURN v_replayed OPERATOR(pg_catalog.>=) target_lsn;
+    RETURN v_replayed OPERATOR(pg_catalog.>=) mark_lsn;
 END;
 $$;
 
-REVOKE ALL ON FUNCTION kingres.switchover_mark(), kingres.switchover_verify(pg_lsn, bool) FROM PUBLIC;
+-- The proof that a planned switchover loses nothing (S10-01), on the node that takes over,
+-- after the old primary has stopped: the arguments are "Latest checkpoint location" and
+-- "Database cluster state" of pg_controldata of the stopped old primary.  True only when the
+-- state is exactly 'shut down' and this node's own WAL holds a shutdown checkpoint at the
+-- position, replayed as the very last record.  False: not replayed yet, ask again.  An error
+-- (KS006): it can never be proven, handle the promotion as a failover.
+CREATE FUNCTION kingres.switchover_verify(shutdown_checkpoint pg_catalog.pg_lsn, cluster_state pg_catalog.text)
+    RETURNS pg_catalog.bool
+    AS 'MODULE_PATHNAME', 'kingres_switchover_verify'
+    LANGUAGE C STABLE
+    SET search_path = pg_catalog, kingres, pg_temp;
+
+REVOKE ALL ON FUNCTION kingres.switchover_mark(), kingres.switchover_replayed(pg_lsn), kingres.switchover_verify(pg_lsn, text) FROM PUBLIC;
 COMMENT ON FUNCTION kingres.switchover_mark() IS
     'Planned switchover: write and flush a WAL record on the old primary and return its position';
-COMMENT ON FUNCTION kingres.switchover_verify(pg_lsn, bool) IS
-    'Planned switchover: has this node (the new primary, before or after pg_promote) replayed what the old primary wrote up to the position';
+COMMENT ON FUNCTION kingres.switchover_replayed(pg_lsn) IS
+    'Planned switchover: has this node replayed the mark (only that: nothing is said about what the old primary wrote after it)';
+COMMENT ON FUNCTION kingres.switchover_verify(pg_lsn, text) IS
+    'Planned switchover: true only when this node has replayed the stopped old primary''s shutdown checkpoint as the last record and the old primary''s state is shut down; false: not yet; error KS006: cannot be proven';
 
 -- The same check as the C functions that change the catalog make (S9-02): the node must be the
 -- map group primary in the catalog and in PostgreSQL, and not superseded.
@@ -2126,6 +2162,16 @@ BEGIN
 END;
 $$;
 
+-- Would an element of synchronous_standby_names that reads list_name match a standby that streams
+-- under application_name?  What PostgreSQL decides: names compared without regard to case, and
+-- the element * matches every standby (S10-03).
+CREATE FUNCTION kingres.internal_sync_name_matches(list_name pg_catalog.text, application_name pg_catalog.text)
+    RETURNS pg_catalog.bool
+    AS 'MODULE_PATHNAME', 'kingres_internal_sync_name_matches'
+    LANGUAGE C IMMUTABLE STRICT
+    SET search_path = pg_catalog, kingres, pg_temp;
+REVOKE ALL ON FUNCTION kingres.internal_sync_name_matches(text, text) FROM PUBLIC;
+
 -- The check of the name of a standby before it goes into synchronous_standby_names
 -- (README, "Registering a standby", step 2).  On the primary of the group: does a connected
 -- walreceiver that is streaming report this application_name, and does this node's group have
@@ -2139,7 +2185,7 @@ CREATE FUNCTION kingres.standby_name_matches(standby_name pg_catalog.text)
     SET search_path = pg_catalog, kingres, pg_temp
     AS $$
 SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_replication r
-                WHERE r.application_name OPERATOR(pg_catalog.=) standby_name
+                WHERE kingres.internal_sync_name_matches(standby_name, r.application_name)
                   AND r.state OPERATOR(pg_catalog.=) 'streaming')
    AND EXISTS (SELECT 1
                  FROM kingres.local_node l

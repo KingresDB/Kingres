@@ -124,12 +124,14 @@ use KingresShardTest qw(make_cluster keys_of_group make_standby register_standby
 	$n1->stop('immediate');
 	promote_standby($sm);
 	$sm->safe_psql('postgres', "UPDATE kingres.node SET port = port + 1000 WHERE node_id = $id");
-	($rc, $out, $err) = run_sql($sm, "SELECT kingres.promote_node($id)");
+	($rc, $out, $err) = run_sql($sm, "\\set VERBOSITY verbose\nSELECT kingres.promote_node($id)");
+	like($err, qr/KS010/, "[C] SQLSTATE KS010: the call went to the wrong node");
 	like($err, qr/node $id is registered on port \d+, this server listens on port \d+/,
 		'[C] a node registered on another port than the server listens on');
 	$sm->safe_psql('postgres', "UPDATE kingres.node SET port = port - 1000 WHERE node_id = $id");
 	$n2->safe_psql('postgres', 'UPDATE kingres.map_version SET term = 5');
-	($rc, $out, $err) = run_sql($sm, "SELECT kingres.promote_node($id)");
+	($rc, $out, $err) = run_sql($sm, "\\set VERBOSITY verbose\nSELECT kingres.promote_node($id)");
+	like($err, qr/KS012/, "[C] SQLSTATE KS012: not a retry");
 	like($err, qr/node 2 holds catalog term 5, newer than the 0 of this node/,
 		'[C] a primary that holds a newer catalog term: this node must not promote');
 }

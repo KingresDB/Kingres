@@ -146,7 +146,7 @@ check_target_node(const KsNode *tgt)
 		PQclear(res);
 		PQfinish(conn);
 		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				(errcode(ERRCODE_KINGRES_IN_RECOVERY),
 				 errmsg("node %d (%s:%d) is still in recovery",
 						tgt->node_id, tgt->host, tgt->port),
 				 errhint("Promote the standby with pg_promote() first; kingres.promote_node() only changes the catalog of the cluster.")));
@@ -198,7 +198,7 @@ check_target_node(const KsNode *tgt)
 			PQclear(res);
 			PQfinish(conn);
 			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					(errcode(ERRCODE_KINGRES_CANNOT_COMMIT),
 					 errmsg("node %d (%s:%d) cannot commit: its synchronous standbys do not confirm",
 							tgt->node_id, tgt->host, tgt->port),
 					 errdetail("The node has the synchronous_standby_names of the primary it was copied from, which names standbys that are not connected to it."),
@@ -427,6 +427,7 @@ promote_node_impl(int target_id, bool forced)
 				 errdetail("Only superusers can promote a node.")));
 
 	blocked_reset();
+	kingres_shard_control_begin();
 	kingres_shard_lock_catalog();
 	cat = kingres_shard_catalog();
 	if (!cat->present || cat->local_node_id == 0)
@@ -466,18 +467,18 @@ promote_node_impl(int target_id, bool forced)
 		 */
 		if (RecoveryInProgress())
 			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					(errcode(ERRCODE_KINGRES_IN_RECOVERY),
 					 errmsg("this node is still in recovery"),
 					 errhint("Promote the standby with pg_promote() first, then run kingres.promote_node() on it.")));
 		if (!tgt->is_primary && old != NULL && cat->local_node_id != old_id && cat->local_node_id != target_id)
 			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					(errcode(ERRCODE_KINGRES_WRONG_NODE),
 					 errmsg("this node is not a copy of the primary of group 0 and cannot become it"),
 					 errdetail("Its local node id is %d, the primary of group 0 is node %d.",
 							   cat->local_node_id, old_id)));
 		if (PostPortNumber != tgt_port)
 			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					(errcode(ERRCODE_KINGRES_WRONG_NODE),
 					 errmsg("node %d is registered on port %d, this server listens on port %d",
 							target_id, tgt_port, PostPortNumber),
 					 errhint("Run kingres.promote_node() on the standby that was promoted.")));
@@ -492,7 +493,7 @@ promote_node_impl(int target_id, bool forced)
 	 */
 	if (!kingres_shard_probe_sync(probe_timeout_ms()))
 		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				(errcode(ERRCODE_KINGRES_CANNOT_COMMIT),
 				 errmsg("this node cannot commit: its synchronous standbys do not confirm"),
 				 errdetail("synchronous_standby_names is \"%s\", and no standby confirmed a new WAL record within %d ms.",
 						   SyncRepStandbyNames ? SyncRepStandbyNames : "", probe_timeout_ms()),
@@ -619,7 +620,7 @@ promote_node_impl(int target_id, bool forced)
 			{
 				if (live.term > cat->term)
 					ereport(ERROR,
-							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							(errcode(ERRCODE_KINGRES_UNSAFE_PROMOTION),
 							 errmsg("node %d holds catalog term " INT64_FORMAT ", newer than the " INT64_FORMAT " of this node",
 									n->node_id, live.term, cat->term),
 							 errhint("The catalog of this node is stale: another node has promoted the map group.  This node must not.")));
@@ -671,7 +672,7 @@ promote_node_impl(int target_id, bool forced)
 		nelectors = list_length(electorate);
 		if (!forced && nelectors > 0 && reached_groups * 2 <= nelectors)
 			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					(errcode(ERRCODE_KINGRES_UNSAFE_PROMOTION),
 					 errmsg("only %d of the %d other shard groups can be reached from this node; the map group cannot be promoted from a minority of them",
 							reached_groups, nelectors),
 					 errhint("Promote it from a node that can reach more than half of the groups other than the map group, or bring the unreachable nodes back first.  The old primary of the map group must be fenced before this call.")));
@@ -707,7 +708,7 @@ promote_node_impl(int target_id, bool forced)
 	{
 		if (new_term > cat->term)
 			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					(errcode(ERRCODE_KINGRES_UNSAFE_PROMOTION),
 					 errmsg("a node holds catalog term " INT64_FORMAT ", newer than the " INT64_FORMAT " of this node",
 							new_term, cat->term),
 					 errhint("This node's catalog is stale; call kingres.promote_node() on the current map group primary.")));

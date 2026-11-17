@@ -64,12 +64,23 @@ typedef struct KsConn
 	bool		via_previous;
 	/* the participant is a node that is being demoted (S9-05): its standbys are not waited for */
 	bool		sync_exempt;
+	/* the session runs with lock_timeout set for a control-plane call (S10-02); reset when the transaction ends */
+	bool		lock_bound;
 	/* an asynchronous fetch of one scan is in flight on conn */
 	void	   *pending_owner;
 	KsPendingFinish pending_finish;
 } KsConn;
 
 extern bool kingres_shard_previous_secret_used;
+
+/*
+ * A control-plane call (promote_node, add_node, ...) is running in this transaction (S10-02):
+ * every statement it sends to a node is bounded by node_timeout, and the node session gets a
+ * lock_timeout, so that a node that accepts the session and does not answer ends the call
+ * with an answer that names it.  The data path of ordinary statements is not affected.
+ */
+extern bool kingres_shard_control_active;
+extern void kingres_shard_control_begin(void);
 extern void kingres_shard_conn_init(void);
 extern int	kingres_shard_set_transmission_modes(void);
 extern void kingres_shard_reset_transmission_modes(int nestlevel);

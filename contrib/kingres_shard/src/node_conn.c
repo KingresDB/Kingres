@@ -367,6 +367,71 @@ static bool connect_with_previous = false;
 bool		kingres_shard_previous_secret_used = false;
 
 /*
+ * A node that accepts the session and does not answer (S10-02).  In a control-plane call the
+ * first statement of a new session is sent after a lock_timeout of the node's own; when it is
+ * not answered within node_timeout (KS007) or the node gives up a lock wait (55P03), the reason is
+ * kept here for the caller of connect_to_node() (get_conn raises it with its SQLSTATE), and the
+ * node is remembered for the rest of the transaction, so that a call does not wait node_timeout
+ * again for every session it would open to the same node.
+ */
+static int	connect_failure_code = 0;
+static bool connect_session_bound = false;	/* the session just returned has its lock_timeout set */
+static char *connect_failure_msg = NULL;
+typedef struct StuckNode
+{
+	char		key[KS_CONN_HOST_LEN + 16];
+	int			code;
+	char	   *msg;
+} StuckNode;
+
+static List *stuck_nodes = NIL;	/* the nodes that did not answer in this transaction */
+
+static int
+control_lock_timeout_ms(void)
+{
+	return Max(kingres_shard_node_timeout * 750, 250);
+}
+
+static StuckNode *
+node_is_stuck(const char *host, int port)
+{
+	ListCell   *lc;
+	char		key[KS_CONN_HOST_LEN + 16];
+
+	snprintf(key, sizeof(key), "%s:%d", host, port);
+	foreach(lc, stuck_nodes)
+		if (strcmp(((StuckNode *) lfirst(lc))->key, key) == 0)
+			return (StuckNode *) lfirst(lc);
+	return NULL;
+}
+
+/* Remember what the first failure to get an answer from the node said, for the rest of the transaction. */
+static void
+note_stuck(const char *host, int port, int code, const char *msg)
+{
+	MemoryContext old;
+	StuckNode  *s;
+
+	if (node_is_stuck(host, port))
+		return;
+	old = MemoryContextSwitchTo(TopMemoryContext);
+	s = palloc0(sizeof(StuckNode));
+	snprintf(s->key, sizeof(s->key), "%s:%d", host, port);
+	s->code = code;
+	s->msg = pstrdup(msg);
+	stuck_nodes = lappend(stuck_nodes, s);
+	MemoryContextSwitchTo(old);
+}
+
+static char *
+node_label(const char *host, int port)
+{
+	int			id = kingres_shard_conn_node_id(host, port);
+
+	return id > 0 ? psprintf("%d (%s:%d)", id, host, port) : psprintf("%s:%d", host, port);
+}
+
+/*
  * connect_to_node
  *
  * Open a new libpq connection to host:port as the current user.  Returns
@@ -486,7 +551,7 @@ connect_to_node_as(const char *host, int port, const char *user, int claim_id,
 		PQconninfoFree(extra);
 	if (conn == NULL || PQstatus(conn) != CONNECTION_OK)
 	{
-		*errmsg_out = conn ? kingres_shard_scrub_conn_error(PQerrorMessage(conn))
+		*errmsg_out = conn ? kingres_shard_scrub_conn_error(kingres_shard_conn_error_text(conn))
 			: pstrdup("out of memory");
 		if (conn)
 			PQfinish(conn);
@@ -502,13 +567,70 @@ connect_to_node_as(const char *host, int port, const char *user, int claim_id,
  * the error when the node refuses the session.
  */
 static bool
-probe_session(PGconn *conn, char **errmsg_out)
+probe_session(PGconn *conn, const char *host, int port, char **errmsg_out)
 {
-	PGresult   *res = kingres_shard_bounded_exec(conn, "SELECT 1", false);
-	bool		ok = (res != NULL && PQresultStatus(res) == PGRES_TUPLES_OK);
+	PGresult   *res;
+	bool		ok;
 
+	/*
+	 * In a control-plane call the node's own lock wait is bounded first (a utility command, it
+	 * does not wait for a lock), so that a node whose first query waits for a lock of another
+	 * session says so instead of being cancelled from far away (S10-02).  A command that is not
+	 * answered while the connection is still up is a node that does not answer; a connection that
+	 * is gone (the node refused the session, which is what the callers below look for) is not.
+	 */
+	connect_session_bound = false;
+	if (kingres_shard_control_active)
+	{
+		char		set[64];
+
+		snprintf(set, sizeof(set), "SET lock_timeout = %d", control_lock_timeout_ms());
+		res = kingres_shard_bounded_exec(conn, set, false);
+		if (res == NULL && PQstatus(conn) == CONNECTION_OK)
+		{
+			connect_failure_code = ERRCODE_KINGRES_NODE_TIMEOUT;
+			*errmsg_out = psprintf("node %s did not answer within %d seconds: it accepted the session and did not answer its first command",
+								   node_label(host, port), kingres_shard_node_timeout);
+			connect_failure_msg = *errmsg_out;
+			note_stuck(host, port, connect_failure_code, connect_failure_msg);
+			return false;
+		}
+		if (res == NULL || PQresultStatus(res) != PGRES_COMMAND_OK)
+		{
+			/* the node refused the session: its text decides what the callers try next */
+			*errmsg_out = kingres_shard_scrub_conn_error(kingres_shard_conn_error_text(conn));
+			PQclear(res);
+			return false;
+		}
+		connect_session_bound = true;
+		PQclear(res);
+	}
+	res = kingres_shard_bounded_exec(conn, "SELECT 1", false);
+	ok = (res != NULL && PQresultStatus(res) == PGRES_TUPLES_OK);
+	if (!ok && kingres_shard_control_active)
+	{
+		if (res == NULL && PQstatus(conn) == CONNECTION_OK)
+		{
+			connect_failure_code = ERRCODE_KINGRES_NODE_TIMEOUT;
+			*errmsg_out = psprintf("node %s did not answer within %d seconds: it accepted the session and did not answer its first query",
+								   node_label(host, port), kingres_shard_node_timeout);
+			connect_failure_msg = *errmsg_out;
+			note_stuck(host, port, connect_failure_code, connect_failure_msg);
+			return false;
+		}
+		if (res != NULL && kingres_shard_result_sqlstate(res) == ERRCODE_LOCK_NOT_AVAILABLE)
+		{
+			connect_failure_code = ERRCODE_LOCK_NOT_AVAILABLE;
+			*errmsg_out = psprintf("lock not available on node %s: its first query did not get a lock within its lock timeout (another session holds a lock on a catalog table there)",
+								   node_label(host, port));
+			PQclear(res);
+			connect_failure_msg = *errmsg_out;
+			note_stuck(host, port, connect_failure_code, connect_failure_msg);
+			return false;
+		}
+	}
 	if (!ok)
-		*errmsg_out = kingres_shard_scrub_conn_error(PQerrorMessage(conn));
+		*errmsg_out = kingres_shard_scrub_conn_error(kingres_shard_conn_error_text(conn));
 	PQclear(res);
 	return ok;
 }
@@ -530,7 +652,7 @@ probe_session(PGconn *conn, char **errmsg_out)
 static PGconn *
 connect_to_node(const char *host, int port, const char *user, char **errmsg_out)
 {
-	PGconn	   *conn = connect_to_node_as(host, port, user, -1, errmsg_out);
+	PGconn	   *conn;
 	char	   *perr = NULL;
 	int			tried;
 	int			group = -1;
@@ -538,12 +660,32 @@ connect_to_node(const char *host, int port, const char *user, char **errmsg_out)
 	ListCell   *lc;
 	const KsCatalog *cat;
 
+	connect_failure_code = 0;
+	connect_session_bound = false;
+	if (kingres_shard_control_active)
+	{
+		StuckNode  *s = node_is_stuck(host, port);
+
+		/* The node did not answer earlier in this call: it is not asked again, and says what it said then. */
+		if (s != NULL)
+		{
+			connect_failure_code = s->code;
+			*errmsg_out = connect_failure_msg = s->msg;
+			return NULL;
+		}
+	}
+	conn = connect_to_node_as(host, port, user, -1, errmsg_out);
 	if (conn == NULL)
 		return NULL;
-	if (probe_session(conn, &perr))
+	if (probe_session(conn, host, port, &perr))
 		return conn;
 	PQfinish(conn);
 	conn = NULL;
+	if (connect_failure_code != 0)
+	{
+		*errmsg_out = connect_failure_msg;
+		return NULL;
+	}
 	if (perr == NULL || strstr(perr, "claims to have been opened by another node") == NULL)
 		return connect_to_node_as(host, port, user, -1, errmsg_out);
 
@@ -573,10 +715,15 @@ connect_to_node(const char *host, int port, const char *user, char **errmsg_out)
 		conn = connect_to_node_as(host, port, user, lfirst_int(lc), &err2);
 		if (conn == NULL)
 			continue;
-		if (probe_session(conn, &err2))
+		if (probe_session(conn, host, port, &err2))
 			return conn;
 		PQfinish(conn);
 		conn = NULL;
+		if (connect_failure_code != 0)
+		{
+			*errmsg_out = connect_failure_msg;
+			return NULL;
+		}
 	}
 
 	/*
@@ -604,13 +751,15 @@ connect_to_node(const char *host, int port, const char *user, char **errmsg_out)
 					conn = connect_to_node_as(host, port, user, lfirst_int(lcp), &err3);
 					if (conn == NULL)
 						continue;
-					if (probe_session(conn, &err3))
+					if (probe_session(conn, host, port, &err3))
 					{
 						kingres_shard_previous_secret_used = true;
 						break;
 					}
 					PQfinish(conn);
 					conn = NULL;
+					if (connect_failure_code != 0)
+						break;
 				}
 			}
 			PG_FINALLY();
@@ -620,6 +769,11 @@ connect_to_node(const char *host, int port, const char *user, char **errmsg_out)
 			PG_END_TRY();
 			if (conn != NULL)
 				return conn;
+			if (connect_failure_code != 0)
+			{
+				*errmsg_out = connect_failure_msg;
+				return NULL;
+			}
 		}
 	}
 	return connect_to_node_as(host, port, user, -1, errmsg_out);
@@ -704,6 +858,7 @@ kingres_shard_get_conn(const char *host, int port, bool missing_ok,
 		kc->sync_forced = false;
 		kc->via_previous = false;
 		kc->sync_exempt = false;
+		kc->lock_bound = false;
 		kc->gid[0] = '\0';
 		kc->pending_owner = NULL;
 		kc->pending_finish = NULL;
@@ -740,6 +895,15 @@ kingres_shard_get_conn(const char *host, int port, bool missing_ok,
 		kc->conn = connect_to_node(kc->host, kc->port, kc->user, &err);
 		kc->via_previous = kingres_shard_previous_secret_used;
 		kc->have_error = false;
+		kc->lock_bound = (kc->conn != NULL && connect_session_bound);
+		/* The node is up and did not answer, or gave up a lock wait (S10-02): say so, with its own SQLSTATE. */
+		if (kc->conn == NULL && connect_failure_code != 0 && !missing_ok)
+			ereport(ERROR,
+					(errcode(connect_failure_code),
+					 errmsg_internal("%s", err),
+					 connect_failure_code == ERRCODE_KINGRES_NODE_TIMEOUT ?
+					 errhint("The node is up but does not answer: look at its locks (pg_locks) and its backends (pg_stat_activity), or fence it.  Repeating the call does not help while it stays so.") :
+					 errhint("Another session on that node holds a lock that this call needs (see pg_locks there); repeat the call when it is gone.")));
 
 		/*
 		 * One PostgreSQL major per cluster (review finding S6-09).  A node that
@@ -815,6 +979,7 @@ discard_connection(KsConn *kc)
 	kc->prepared = false;
 	kc->sync_forced = false;
 	kc->sync_exempt = false;
+	kc->lock_bound = false;
 	kc->pending_owner = NULL;
 	kc->pending_finish = NULL;
 }
@@ -1386,6 +1551,138 @@ kingres_shard_conn_collect_quiet(KsConn *kc)
 	return failed ? NULL : res;
 }
 
+bool		kingres_shard_control_active = false;
+
+void
+kingres_shard_control_begin(void)
+{
+	kingres_shard_control_active = true;
+}
+
+/* The first words of a statement, for a message. */
+static char *
+abbreviate_sql(const char *sql)
+{
+	char	   *s = pstrdup(sql);
+	char	   *p;
+
+	for (p = s; *p; p++)
+		if (*p == '\n' || *p == '\r' || *p == '\t')
+			*p = ' ';
+	if (strlen(s) > 90)
+	{
+		s[87] = '\0';
+		return psprintf("%s...", s);
+	}
+	return s;
+}
+
+/*
+ * The node did not answer within node_timeout (S10-02).  The statement has been cancelled;
+ * the session is closed, which ends whatever the node was doing for it (a wait for a lock,
+ * a transaction that was open).  Says which node did not answer and what it was asked.
+ * With elevel WARNING it returns, and the caller gets no result.
+ */
+static void
+control_deadline(KsConn *kc, const char *sql, int elevel)
+{
+	char	   *what = abbreviate_sql(sql);
+	char	   *who = node_label(kc->host, kc->port);
+
+	kc->in_query = false;
+	note_stuck(kc->host, kc->port, ERRCODE_KINGRES_NODE_TIMEOUT,
+			   psprintf("node %s did not answer within %d seconds", who, kingres_shard_node_timeout));
+	discard_connection(kc);
+	ereport(elevel,
+			(errcode(ERRCODE_KINGRES_NODE_TIMEOUT),
+			 errmsg("node %s did not answer within %d seconds", who, kingres_shard_node_timeout),
+			 errdetail("It accepted the session and was waiting for its answer to: %s", what),
+			 errhint("The node is up but does not answer: look at its locks (pg_locks) and its backends (pg_stat_activity), or fence it.  Repeating the call does not help while it stays so.")));
+}
+
+/*
+ * Before the first statement of a control-plane call on a node session: the node gives up a
+ * lock wait by itself, a little before our own deadline, so that the answer says "lock not
+ * available" instead of a cancel from far away.  Reset when the transaction ends
+ * (release_control_sessions).  False when the node did not answer.
+ */
+static bool
+control_session_ready(KsConn *kc)
+{
+	PGresult   *res;
+	char		sql[64];
+
+	if (kc->lock_bound || kc->conn == NULL)
+		return true;
+	snprintf(sql, sizeof(sql), "SET lock_timeout = %d", control_lock_timeout_ms());
+	res = kingres_shard_bounded_exec(kc->conn, sql, true);
+	if (res == NULL)
+		return false;
+	if (PQresultStatus(res) == PGRES_COMMAND_OK)
+		kc->lock_bound = true;
+	PQclear(res);
+	return true;
+}
+
+/*
+ * The answer of the statement in flight on kc.  In a control-plane call the wait is bounded by
+ * node_timeout and *timed_out says that the node did not answer (the caller reports it, after
+ * kc is closed); otherwise it waits for ever, as the statements of a user do (they can be
+ * cancelled by the user).
+ */
+static PGresult *
+control_get_result(KsConn *kc, bool *timed_out)
+{
+	bool		failed;
+	PGresult   *res;
+
+	*timed_out = false;
+	if (!kingres_shard_control_active)
+		return libpqsrv_get_result_last(kc->conn, PG_WAIT_EXTENSION);
+	res = bounded_get_last(kc->conn, true, &failed);
+	if (failed)
+	{
+		*timed_out = (PQstatus(kc->conn) == CONNECTION_OK);
+		return NULL;
+	}
+	return res;
+}
+
+/* At the end of the transaction: give the node sessions of a control-plane call their own lock_timeout back. */
+static void
+release_control_sessions(void)
+{
+	HASH_SEQ_STATUS scan;
+	KsConn	   *kc;
+
+	kingres_shard_control_active = false;
+	list_free_deep(stuck_nodes);
+	stuck_nodes = NIL;
+	if (conn_hash == NULL)
+		return;
+	hash_seq_init(&scan, conn_hash);
+	while ((kc = (KsConn *) hash_seq_search(&scan)) != NULL)
+	{
+		PGresult   *res;
+
+		if (!kc->lock_bound)
+			continue;
+		kc->lock_bound = false;
+		if (kc->conn == NULL)
+			continue;
+		if (kc->in_query || kc->have_error || PQstatus(kc->conn) != CONNECTION_OK ||
+			PQtransactionStatus(kc->conn) != PQTRANS_IDLE)
+		{
+			discard_connection(kc);
+			continue;
+		}
+		res = kingres_shard_bounded_exec(kc->conn, "RESET lock_timeout", false);
+		if (res == NULL || PQresultStatus(res) != PGRES_COMMAND_OK)
+			discard_connection(kc);
+		PQclear(res);
+	}
+}
+
 /*
  * exec_internal
  *
@@ -1395,8 +1692,11 @@ static void
 exec_internal(KsConn *kc, const char *sql)
 {
 	PGresult   *res;
+	bool		timed_out;
 
 	kingres_shard_conn_quiesce(kc);
+	if (kingres_shard_control_active && !control_session_ready(kc))
+		control_deadline(kc, sql, ERROR);
 	kc->in_query = true;
 	if (!PQsendQuery(kc->conn, sql))
 	{
@@ -1408,7 +1708,9 @@ exec_internal(KsConn *kc, const char *sql)
 						kc->host, kc->port),
 				 errdetail_internal("%s", kingres_shard_conn_error_text(kc->conn))));
 	}
-	res = libpqsrv_get_result_last(kc->conn, PG_WAIT_EXTENSION);
+	res = control_get_result(kc, &timed_out);
+	if (timed_out)
+		control_deadline(kc, sql, ERROR);
 	kc->in_query = false;
 	if (res == NULL || (PQresultStatus(res) != PGRES_COMMAND_OK &&
 						PQresultStatus(res) != PGRES_TUPLES_OK))
@@ -1427,8 +1729,11 @@ PGresult *
 kingres_shard_exec(KsConn *kc, const char *sql)
 {
 	PGresult   *res;
+	bool		timed_out;
 
 	kingres_shard_conn_quiesce(kc);
+	if (kingres_shard_control_active && !control_session_ready(kc))
+		control_deadline(kc, sql, ERROR);
 	kc->in_query = true;
 	if (!PQsendQuery(kc->conn, sql))
 	{
@@ -1440,7 +1745,9 @@ kingres_shard_exec(KsConn *kc, const char *sql)
 						kc->host, kc->port),
 				 errdetail_internal("%s", kingres_shard_conn_error_text(kc->conn))));
 	}
-	res = libpqsrv_get_result_last(kc->conn, PG_WAIT_EXTENSION);
+	res = control_get_result(kc, &timed_out);
+	if (timed_out)
+		control_deadline(kc, sql, ERROR);
 	kc->in_query = false;
 	kc->nstatements++;
 	if (res == NULL || (PQresultStatus(res) != PGRES_COMMAND_OK &&
@@ -1462,8 +1769,20 @@ kingres_shard_exec_params(KsConn *kc, const char *sql, int nparams,
 						   const char *const *values, bool throw_on_error)
 {
 	PGresult   *res;
+	bool		timed_out;
 
+	/*
+	 * A session that a deadline closed earlier in this call (S10-02): a caller that tolerates
+	 * failure gets "no answer", as for any node that cannot be asked.
+	 */
+	if (kc->conn == NULL && !throw_on_error)
+		return NULL;
 	kingres_shard_conn_quiesce(kc);
+	if (kingres_shard_control_active && !control_session_ready(kc))
+	{
+		control_deadline(kc, sql, throw_on_error ? ERROR : WARNING);
+		return NULL;
+	}
 	kc->in_query = true;
 	if (!PQsendQueryParams(kc->conn, sql, nparams, types, values, NULL, NULL, 0))
 	{
@@ -1475,7 +1794,12 @@ kingres_shard_exec_params(KsConn *kc, const char *sql, int nparams,
 						kc->host, kc->port),
 				 errdetail_internal("%s", kingres_shard_conn_error_text(kc->conn))));
 	}
-	res = libpqsrv_get_result_last(kc->conn, PG_WAIT_EXTENSION);
+	res = control_get_result(kc, &timed_out);
+	if (timed_out)
+	{
+		control_deadline(kc, sql, throw_on_error ? ERROR : WARNING);
+		return NULL;
+	}
 	kc->in_query = false;
 	kc->nstatements++;
 	if (throw_on_error && (res == NULL ||
@@ -1646,6 +1970,26 @@ kingres_shard_report_error(KsConn *kc, PGresult *res, const char *sql)
 							kc->host, kc->port),
 					 errdetail("The node said: %s", primary),
 					 errhint("Every node of a cluster must run the same version of kingres_shard; run ALTER EXTENSION kingres_shard UPDATE on the nodes that run an older one.")));
+	}
+
+	/*
+	 * A lock wait that ended by the node's own lock_timeout (a control-plane call sets it, S10-02):
+	 * say which node, and what it was waiting for, instead of a bare "canceling statement due to
+	 * lock timeout" that the caller cannot place.
+	 */
+	if (sqlstate == ERRCODE_LOCK_NOT_AVAILABLE && kingres_shard_control_active)
+	{
+		int			id = kingres_shard_conn_node_id(kc->host, kc->port);
+
+		ereport(ERROR,
+				(errcode(sqlstate),
+				 errmsg("lock not available on node %s: the node did not get a lock within its lock timeout",
+						id > 0 ? psprintf("%d (%s:%d)", id, kc->host, kc->port) :
+						psprintf("%s:%d", kc->host, kc->port)),
+				 errdetail("The node said: %s", primary),
+				 errhint("Another session on that node holds a lock that this call needs (see pg_locks there); repeat the call when it is gone."),
+				 context ? errcontext("%s", context) : 0,
+				 errcontext("remote node %s:%d", kc->host, kc->port)));
 	}
 
 	ereport(ERROR,
@@ -2530,6 +2874,7 @@ conn_xact_callback(XactEvent event, void *arg)
 
 		case XACT_EVENT_COMMIT:
 			postcommit();
+			release_control_sessions();
 			kingres_shard_ha_commit_leave();
 			break;
 
@@ -2538,6 +2883,7 @@ conn_xact_callback(XactEvent event, void *arg)
 			hash_seq_init(&scan, conn_hash);
 			while ((kc = (KsConn *) hash_seq_search(&scan)) != NULL)
 				reset_xact_state(kc);
+			release_control_sessions();
 			break;
 
 		case XACT_EVENT_ABORT:
@@ -2545,6 +2891,7 @@ conn_xact_callback(XactEvent event, void *arg)
 			hash_seq_init(&scan, conn_hash);
 			while ((kc = (KsConn *) hash_seq_search(&scan)) != NULL)
 				abort_connection(kc);
+			release_control_sessions();
 			kingres_shard_ha_commit_leave();
 			break;
 	}

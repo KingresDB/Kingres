@@ -356,6 +356,7 @@ kingres_create_distributed_table(PG_FUNCTION_ARGS)
 	StringInfoData script;
 	Oid			newrelid;
 
+	kingres_shard_control_begin();
 	kingres_shard_lock_catalog();
 	kingres_shard_require_map_group();
 	local_group = kingres_shard_catalog()->local_group_id;
@@ -633,6 +634,7 @@ kingres_create_reference_table(PG_FUNCTION_ARGS)
 	ListCell   *lc;
 	StringInfoData script;
 
+	kingres_shard_control_begin();
 	kingres_shard_lock_catalog();
 	kingres_shard_require_map_group();
 	LockRelationOid(relid, ExclusiveLock);

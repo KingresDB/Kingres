@@ -33,7 +33,9 @@
 #include "miscadmin.h"
 #include "nodes/value.h"
 #include "parser/parse_func.h"
+#include "utils/resowner.h"
 #include "storage/lmgr.h"
+#include "storage/proc.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
@@ -104,12 +106,12 @@ kingres_shard_require_map_group(void)
 	if (self == NULL || self->group_id != KINGRES_SHARD_MAP_GROUP ||
 		!self->is_primary)
 		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				(errcode(ERRCODE_KINGRES_WRONG_NODE),
 				 errmsg("this function can only run on the map group primary"),
 				 errdetail("This node is node %d.", cat->local_node_id)));
 	if (!kingres_shard_is_recognized_map_primary())
 		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				(errcode(ERRCODE_KINGRES_WRONG_NODE),
 				 errmsg("this node was promoted in PostgreSQL after the catalog named it the map group primary, and the catalog has not recognised the promotion"),
 				 errdetail("The catalog of this node is the old map primary's.  Nothing that changes a catalog is accepted here until kingres.promote_node(%d) has run on this node: it needs the primaries of a strict majority of the other groups.",
 						   cat->local_node_id),
@@ -155,7 +157,7 @@ require_primaries_can_commit(void)
 		PQfinish(conn);
 		if (!ok)
 			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					(errcode(ERRCODE_KINGRES_CANNOT_COMMIT),
 					 errmsg("node %d cannot commit: its synchronous standbys do not confirm", n->node_id),
 					 errdetail("The change would have to commit on that node, and its synchronous_standby_names names a standby that is not connected to it."),
 					 errhint("On node %d set synchronous_standby_names to the standbys that exist (or to an empty string) and reload the configuration, then repeat the call.  Nothing was changed.",
@@ -199,7 +201,65 @@ kingres_shard_lock_catalog(void)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_TABLE),
 				 errmsg("the catalog table kingres.map_version does not exist")));
-	LockRelationOid(relid, ExclusiveLock);
+
+	/*
+	 * Not for ever (S10-07): a second caller behind a first that is stuck would hang as long
+	 * as the first.  It waits at most node_timeout (or its own lock_timeout when that is
+	 * shorter), then is refused with KS008, having changed nothing.
+	 */
+	if (ConditionalLockRelationOid(relid, ExclusiveLock))
+		return;
+	{
+		int			nest = NewGUCNestLevel();
+		char		buf[32];
+		bool		busy = false;
+		MemoryContext oldcxt = CurrentMemoryContext;
+		ResourceOwner oldowner = CurrentResourceOwner;
+
+		if (LockTimeout == 0 || LockTimeout > kingres_shard_node_timeout * 1000)
+		{
+			snprintf(buf, sizeof(buf), "%d", kingres_shard_node_timeout * 1000);
+			(void) set_config_option("lock_timeout", buf, PGC_USERSET, PGC_S_SESSION,
+									 GUC_ACTION_SAVE, true, 0, false);
+		}
+		/*
+		 * In a subtransaction, as PL/pgSQL does for an exception block: an error that is caught
+		 * must not leave the lock wait half undone.  The lock, once granted, belongs to the
+		 * outer transaction when the subtransaction is released.
+		 */
+		BeginInternalSubTransaction(NULL);
+		PG_TRY();
+		{
+			LockRelationOid(relid, ExclusiveLock);
+			ReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(oldcxt);
+			CurrentResourceOwner = oldowner;
+		}
+		PG_CATCH();
+		{
+			ErrorData  *edata;
+
+			MemoryContextSwitchTo(oldcxt);
+			edata = CopyErrorData();
+			FlushErrorState();
+			RollbackAndReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(oldcxt);
+			CurrentResourceOwner = oldowner;
+			/* the lock timeout is the only error that is ours to translate */
+			if (edata->sqlerrcode != ERRCODE_LOCK_NOT_AVAILABLE)
+				ReThrowError(edata);
+			busy = true;
+		}
+		PG_END_TRY();
+		AtEOXact_GUC(true, nest);
+		if (busy)
+			ereport(ERROR,
+					(errcode(ERRCODE_KINGRES_BUSY),
+					 errmsg("another call that changes the catalog is running on this node, and did not end within %d seconds",
+							kingres_shard_node_timeout),
+					 errdetail("Calls that change the catalog (add_node, remove_node, promote_node, sync_catalog, rotate_secret, create_distributed_table and others) run one at a time; this one waited for the lock on kingres.map_version and changed nothing."),
+					 errhint("Repeat the call later.  If the first call does not end, find its session in pg_stat_activity and the node that it waits for (its answer names it).")));
+	}
 }
 
 /*
@@ -354,6 +414,7 @@ kingres_sync_catalog(PG_FUNCTION_ARGS)
 	ListCell   *lc;
 	List	   *targets = NIL;
 
+	kingres_shard_control_begin();
 	kingres_shard_lock_catalog();
 	kingres_shard_require_map_group();
 	require_primaries_can_commit();
@@ -425,6 +486,7 @@ kingres_rotate_secret(PG_FUNCTION_ARGS)
 	Datum		values[1];
 	Oid			argtypes[1] = {TEXTOID};
 
+	kingres_shard_control_begin();
 	kingres_shard_lock_catalog();
 	kingres_shard_require_map_group();
 	require_primaries_can_commit();
@@ -494,7 +556,7 @@ kingres_rotate_secret(PG_FUNCTION_ARGS)
 		}
 		if (total > 0)
 			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					(errcode(ERRCODE_KINGRES_IN_DOUBT),
 					 errmsg("the cluster secret cannot be rotated while distributed transactions are in doubt"),
 					 errdetail("%d prepared transaction(s) of this cluster: %s.", total, where.data),
 					 errhint("Run kingres.recover_prepared_transactions() on the origin of each, wait until kingres.check_cluster() shows none, and rotate again.")));
@@ -796,7 +858,7 @@ ask_node(const char *host, int port, const char *sql, char **err_out)
 		!PQgetisnull(res, 0, 0))
 		value = pstrdup(PQgetvalue(res, 0, 0));
 	else
-		*err_out = pstrdup(PQerrorMessage(conn));
+		*err_out = kingres_shard_conn_error_text(conn);
 	PQclear(res);
 	PQfinish(conn);
 	return value;
@@ -947,6 +1009,7 @@ kingres_add_node(PG_FUNCTION_ARGS)
 	port = PG_GETARG_INT32(1);
 	role = PG_ARGISNULL(3) ? pstrdup("primary") : text_to_cstring(PG_GETARG_TEXT_PP(3));
 
+	kingres_shard_control_begin();
 	kingres_shard_lock_catalog();
 	kingres_shard_require_map_group();
 	require_primaries_can_commit();
@@ -1182,6 +1245,7 @@ kingres_remove_node(PG_FUNCTION_ARGS)
 	bool		isnull;
 	int			nbuckets;
 
+	kingres_shard_control_begin();
 	kingres_shard_lock_catalog();
 	kingres_shard_require_map_group();
 	require_primaries_can_commit();

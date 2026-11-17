@@ -99,9 +99,10 @@ sub clear_sync
 	$n1->stop('immediate');
 	promote_standby($s1b);
 	my $old = roles($s1b);
-	my ($rc, $out, $err) = run_sql($s1b, "SELECT kingres.promote_node($idb)");
+	my ($rc, $out, $err) = run_sql($s1b, "\\set VERBOSITY verbose\nSELECT kingres.promote_node($idb)");
 	isnt($rc, 0, '[B] the map group is not promoted by a node that cannot commit');
 	like($err, qr/this node cannot commit: its synchronous standbys do not confirm/, '[B] and the message says so');
+	like($err, qr/KS009/, "[B] SQLSTATE KS009");
 	is(roles($s1b), $old, '[B] nothing was changed');
 	is(prepared($n2) . prepared($n3) . prepared($s1b), '000', '[B] nothing is left prepared');
 	clear_sync($s1b);
@@ -136,9 +137,10 @@ sub clear_sync
 
 	# Side A: the standby sa and node 2.  Side B: the standby sb and node 3.
 	$n2->start;
-	my ($rc, $out, $err) = run_sql($sa, "SELECT kingres.promote_node($ida)");
+	my ($rc, $out, $err) = run_sql($sa, "\\set VERBOSITY verbose\nSELECT kingres.promote_node($ida)");
 	isnt($rc, 0, '[C] side A (itself and one of the two other groups) does not promote the map group');
 	like($err, qr/1 of the 2 other shard groups/, '[C] one of two is half, which is not a majority');
+	like($err, qr/KS012/, "[C] SQLSTATE KS012");
 	$n2->stop('immediate');
 	$n3->start;
 	($rc, $out, $err) = run_sql($sb, "SELECT kingres.promote_node($idb)");
