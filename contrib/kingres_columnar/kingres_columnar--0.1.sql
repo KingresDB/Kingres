@@ -108,6 +108,18 @@ CREATE FUNCTION columnar_reconcile()
     LANGUAGE C STRICT SECURITY DEFINER
     SET search_path = pg_catalog, kingres, pg_temp;
 
+-- How often each path of the write side was taken in this session (a
+-- diagnostic, and what the tests of the paths read): rows written at once after
+-- the commit-time flush or between the phases of a hand-over, buffers written
+-- under memory pressure, by a committing subtransaction or because they held a
+-- full stripe, writes refused at the ceiling or at a moment where the server
+-- forbids an error, and so on.  With reset the counters start again.
+CREATE FUNCTION columnar_write_paths(reset boolean DEFAULT false)
+    RETURNS TABLE (path text, hits bigint)
+    AS 'MODULE_PATHNAME', 'kingres_columnar_write_paths'
+    LANGUAGE C STRICT SECURITY INVOKER
+    SET search_path = pg_catalog, kingres, pg_temp;
+
 -- The clean-up of the files a command replaced or dropped, at the end of the
 -- command.  The access method notes such a file itself, when the relation that
 -- holds it is dropped (an object access hook: no event trigger is needed for
@@ -288,6 +300,7 @@ REVOKE ALL ON FUNCTION columnar_stripes(regclass) FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_compact(regclass, int) FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_check(boolean) FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_reconcile() FROM PUBLIC;
+REVOKE ALL ON FUNCTION columnar_write_paths(boolean) FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_finish_rewrites() FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_on_drop() FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_check_ddl() FROM PUBLIC;

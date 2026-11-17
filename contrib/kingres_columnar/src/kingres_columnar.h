@@ -382,8 +382,12 @@ extern void kc_write_init(void);
 extern void kc_write_row(Relation rel, TupleTableSlot *slot, CommandId cid);
 extern void kc_write_rows(Relation rel, TupleTableSlot **slots, int nslots,
 						  CommandId cid);
-extern void kc_write_row_values(Relation rel, Datum *vals, bool *nulls,
+extern bool kc_write_row_values(Relation rel, Datum *vals, bool *nulls,
 								CommandId cid);
+extern bool kc_write_refused(Relation rel, const char *what);
+extern int	kc_write_path_count(void);
+extern const char *kc_write_path_get(int i, uint64 *hits);
+extern void kc_write_paths_reset(void);
 extern void kc_write_flush_relation(Relation rel);
 extern void kc_write_discard_relation(Oid relid, bool *had_outer);
 extern void kc_write_set_frozen(Relation rel, bool frozen);

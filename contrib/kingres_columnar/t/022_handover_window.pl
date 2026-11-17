@@ -400,5 +400,44 @@ SELECT 'FINAL=' || count(*) || '/' || count(DISTINCT id) FROM $tbl;";
 		'6000/4000', '... and the other tables got what the callback wrote');
 }
 
+# ------------------------------------------------------------------------
+# 6. C7-03: a COPY (or any command that ends with the flush of the relation) into
+#    a table made in the transaction, run in the window, with rows of that table
+#    pending in the parent and in the child.  With writes in the window going to
+#    stripes (section 2) this is the one way left to ask the access method to
+#    flush a buffer that a hand-over has prepared: the end of the COPY flushes the
+#    relation (a table made in the transaction must have its rows in stripes), and
+#    what it must not do is write the prepared buffers, which phase two publishes:
+#    that is a doubled row, and an assertion failure in a build with assertions.
+#    The guards (kc_buf_flushable, kc_flush_pressure) refuse; the path counter
+#    prepared_skip says they were reached.
+# ------------------------------------------------------------------------
+foreach my $c ([999, 1], [5, 1], [2500, 1])
+{
+	my ($np, $nc) = @$c;
+	my $all = $np + $nc + 7;
+	my $sum = $np * ($np + 1) / 2 + 10001 + (20001 + 20007) * 7 / 2;
+	my ($out, $err) = script("
+SELECT * FROM kingres.columnar_write_paths(true) WHERE false;
+BEGIN;
+CREATE TABLE r (a int) USING columnar;
+SELECT kingres.columnar_set_options('r', stripe_row_count => 1000, chunk_row_count => 100);
+INSERT INTO r SELECT generate_series(1, $np);
+SAVEPOINT s;
+INSERT INTO r SELECT generate_series(10001, 10000 + $nc);
+SET kcprobe.sql = 'COPY r (a) FROM PROGRAM \$\$seq 20001 20007\$\$';
+RELEASE s;
+SET kcprobe.sql = '';
+SELECT 'IN=' || count(*) || ' ' || sum(a) || ' ' || count(DISTINCT a) FROM r;
+COMMIT;
+SELECT 'FINAL=' || count(*) || ' ' || sum(a) || ' ' || count(DISTINCT a) FROM r;
+SELECT 'SKIP=' || hits FROM kingres.columnar_write_paths() WHERE path = 'prepared_skip';
+DROP TABLE r;");
+	unlike($err, qr/TRAP|server closed|ERROR/, "COPY into a table made in the transaction in the window, parent $np rows, child $nc: no error, no assertion failure");
+	like($out, qr/IN=$all $sum $all\b/, "... each row once inside the transaction ($all)");
+	like($out, qr/FINAL=$all $sum $all\b/, "... and after the commit");
+	like($out, qr/SKIP=[1-9]/, '... and the guard that keeps prepared buffers from being flushed was reached');
+}
+
 $node->stop;
 done_testing();
