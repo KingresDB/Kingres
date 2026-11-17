@@ -757,10 +757,14 @@ kingres_shard_placement_hash(const KsColocation *coloc)
 			ngp++;
 		}
 	}
-	for (b = 0; b < coloc->bucket_count; b++)
-		if (coloc->bucket_group[b] >= 0)
-			h += bucket_term(b, coloc->bucket_group[b],
-							 primary_of(gp, ngp, coloc->bucket_group[b]));
+	for (b = 0; b < kingres_shard_coloc_nbuckets(coloc); b++)
+	{
+		int			bucket = kingres_shard_coloc_bucket(coloc, b);
+		int			group = kingres_shard_bucket_group(coloc, bucket);
+
+		if (group >= 0)
+			h += bucket_term(bucket, group, primary_of(gp, ngp, group));
+	}
 	pfree(gp);
 	return (int64) h;
 }
@@ -866,6 +870,32 @@ kingres_shard_lookup_colocation(int colocation_id)
 			return c;
 	}
 	return NULL;
+}
+
+/*
+ * The buckets of a colocation group (catalog.h).  Today the buckets of a group
+ * are numbered 0 .. bucket_count - 1; these three functions are the only
+ * place besides the loading code that knows it.
+ */
+int
+kingres_shard_coloc_nbuckets(const KsColocation *coloc)
+{
+	return coloc->bucket_count;
+}
+
+int
+kingres_shard_coloc_bucket(const KsColocation *coloc, int i)
+{
+	Assert(i >= 0 && i < coloc->bucket_count);
+	return i;
+}
+
+int
+kingres_shard_bucket_group(const KsColocation *coloc, int bucket)
+{
+	if (bucket < 0 || bucket >= coloc->bucket_count)
+		return -1;
+	return coloc->bucket_group[bucket];
 }
 
 /*

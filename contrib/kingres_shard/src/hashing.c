@@ -37,9 +37,9 @@ PG_FUNCTION_INFO_V1(kingres_bucket_for_relation);
 PG_FUNCTION_INFO_V1(kingres_bucket_for_colocation);
 
 /*
- * kingres_shard_try_bucket
+ * kingres_shard_hash_of_value
  *
- * Compute the bucket of one value.  column_type is the type of the
+ * Compute the hash of one value.  column_type is the type of the
  * distribution column (which decides the hash operator family),
  * value_type the type of the datum.  They are equal or binary coercible in
  * the common case; otherwise the hash operator family of the column must
@@ -52,14 +52,12 @@ PG_FUNCTION_INFO_V1(kingres_bucket_for_colocation);
  * propagate.
  */
 bool
-kingres_shard_try_bucket(Oid column_type, Oid collation, int bucket_count,
-						  Oid value_type, Datum value, bool isnull,
-						  int *bucket)
+kingres_shard_hash_of_value(Oid column_type, Oid collation, Oid value_type,
+							 Datum value, bool isnull, uint64 *hash)
 {
 	TypeCacheEntry *tce;
 	FmgrInfo	finfo;
 	FmgrInfo   *finfop;
-	uint64		hash;
 
 	tce = lookup_type_cache(column_type,
 							TYPECACHE_HASH_EXTENDED_PROC_FINFO |
@@ -82,9 +80,43 @@ kingres_shard_try_bucket(Oid column_type, Oid collation, int bucket_count,
 		finfop = &finfo;
 	}
 
-	hash = compute_partition_hash_value(1, finfop, &collation, &value,
-										&isnull);
-	*bucket = (int) (hash % (uint64) bucket_count);
+	*hash = compute_partition_hash_value(1, finfop, &collation, &value,
+										 &isnull);
+	return true;
+}
+
+/*
+ * kingres_shard_bucket_for_hash
+ *
+ * The number of the bucket that holds a hash value in a colocation group:
+ * hash % bucket_count, the remainder PostgreSQL itself uses to choose the
+ * partition of a row (MODULUS bucket_count).  The one place that computes it.
+ */
+int
+kingres_shard_bucket_for_hash(const KsColocation *coloc, uint64 hash)
+{
+	return (int) (hash % (uint64) coloc->bucket_count);
+}
+
+/*
+ * kingres_shard_try_bucket
+ *
+ * The bucket of one value in a colocation group: the hash of the value
+ * (kingres_shard_hash_of_value) and the bucket that holds it
+ * (kingres_shard_bucket_for_hash).  Returns false when the value cannot be
+ * hashed for the column.
+ */
+bool
+kingres_shard_try_bucket(Oid column_type, Oid collation,
+						  const KsColocation *coloc, Oid value_type,
+						  Datum value, bool isnull, int *bucket)
+{
+	uint64		hash;
+
+	if (!kingres_shard_hash_of_value(column_type, collation, value_type,
+									  value, isnull, &hash))
+		return false;
+	*bucket = kingres_shard_bucket_for_hash(coloc, hash);
 	return true;
 }
 
@@ -95,12 +127,13 @@ kingres_shard_try_bucket(Oid column_type, Oid collation, int bucket_count,
  * column is an error.
  */
 int
-kingres_shard_bucket(Oid column_type, Oid collation, int bucket_count,
-					  Oid value_type, Datum value, bool isnull)
+kingres_shard_bucket(Oid column_type, Oid collation,
+					  const KsColocation *coloc, Oid value_type,
+					  Datum value, bool isnull)
 {
 	int			bucket;
 
-	if (!kingres_shard_try_bucket(column_type, collation, bucket_count,
+	if (!kingres_shard_try_bucket(column_type, collation, coloc,
 								   value_type, value, isnull, &bucket))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
@@ -130,8 +163,7 @@ bucket_for_colocation_entry(FunctionCallInfo fcinfo,
 				 errmsg("could not determine the type of the key value")));
 
 	PG_RETURN_INT32(kingres_shard_bucket(coloc->dist_type, coloc->collation,
-										  coloc->bucket_count, value_type,
-										  value, isnull));
+										  coloc, value_type, value, isnull));
 }
 
 /*

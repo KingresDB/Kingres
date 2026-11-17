@@ -64,6 +64,7 @@ tests += {
       'version',
       'catalog',
       'bucket_for',
+      'bucket_lookup',
       'distribute',
       'routing_single',
       'security',
@@ -178,6 +179,8 @@ tests += {
       't/095_standby_secret.pl',
       't/096_call_bounds.pl',
       't/097_verify_checks.pl',
+      't/098_foundation.pl',
+      't/099_harness_selftest.pl',
     ],
   },
 }

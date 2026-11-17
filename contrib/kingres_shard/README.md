@@ -221,7 +221,11 @@ PROVE_TESTS=t/013_dist_scan.pl kingres/dev/ext.sh kingres_shard tap
 ```
 
 - `sql/` and `expected/`: pg_regress tests on one node (`version`, `catalog`,
-  `bucket_for`, `distribute`, `routing_single`; `security`: the search_path and
+  `bucket_for`, `bucket_lookup` (the bucket of boundary values, NULL and values of every
+  supported key type, under every collation and for a value of another width than the
+  column, and the bucket in the plan for a constant; its expected file was recorded
+  before the bucket lookup was moved into one place, so it fails if any bucket moves),
+  `distribute`, `routing_single`; `security`: the search_path and
   `SECURITY DEFINER` scan of every function, the temporary-schema attack, the
   routing switches; `utility_guard`: utility statements on a cluster with a
   second, fictitious shard group; `routing_decisions`: collations, functions
@@ -312,13 +316,25 @@ PROVE_TESTS=t/013_dist_scan.pl kingres/dev/ext.sh kingres_shard tap
   a connection to a node of another major), `059_restore_node` (every step of "Restoring a
   node"), `060_shared_schema` (every order of creating and dropping the extensions that share
   the schema `kingres`, and a dump and restore).
+  Foundation of phase 2b (no change of behaviour): `098_foundation` (nothing but
+  `hashing.c` computes a bucket, and nothing but `pg_compat.h` tests the version of
+  PostgreSQL; the check is tested on snippets it must refuse; the settings listed for a
+  partial fragment exist on the server) and `099_harness_selftest` (every helper of the
+  comparison harness is shown to fail when it should).
   `t/KingresShardTest.pm` builds clusters (and standbys); `t/KingresShardCompare.pm` is the
   comparison harness: it loads the same data into a three-node cluster and a
-  single node and compares query results, and repeats every query under four
+  single node and compares query results (a NULL is shown as `<NULL>`, so it never equals
+  an empty string), and repeats every query under four
   non-default session profiles (`DateStyle`, `IntervalStyle`,
   `extra_float_digits`, `TimeZone`, `bytea_output`, `lc_*`; `profiles => 0`
   switches that off for one query). Later phases add queries to the list in
-  `013_dist_scan.pl`.
+  `013_dist_scan.pl`. For the pushdown paths of phase 2b it also runs a query under plan
+  profiles (`plans => ['scan', 'pushed', 'nopartial']`: every result must equal the single
+  node's and the row-moving scan's), asserts the plan (`path => 'Kingres Fragment Scan'`, so
+  a test cannot pass because nothing was pushed), normalizes floats and the elements of
+  aggregated arrays and strings (`normalize`), loads data with `COPY FROM STDIN`
+  (`copy_in`), compares a whole table after a write (`compare_tables`) and generates
+  queries from templates with a seed that is printed (`KS_SEED`).
 
 ## Quick start
 
