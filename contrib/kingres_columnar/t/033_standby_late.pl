@@ -9,7 +9,10 @@
 # because a call was refused while it was still alive, and files dropped after the
 # clean-up.  The standby must hold what the primary holds, replay without a
 # consistency failure, and after promotion the tables read, check clean and take
-# writes.
+# writes.  A reader on the hot standby that holds the table which is dropped late (C9)
+# is ended by the standby as for any other DROP (max_standby_streaming_delay), the
+# drop and the clean-up of the next transaction replay, and the rest of the standby
+# goes on reading.
 #
 # Needs a compiler and the server's headers (KcProbe.pm).
 #
@@ -74,10 +77,28 @@ like($e, qr/was refused earlier in this transaction, so it cannot commit/, 'the 
 run("SET kcevents.at = 'commit_sub'; BEGIN; SELECT kcevents_open('lost'); SAVEPOINT s; INSERT INTO lost VALUES (2); RELEASE s; ROLLBACK;");
 run("INSERT INTO lost VALUES (3)");
 
+# a hot standby reader of the table that is dropped late: it reads the table before the drop (the
+# standby serves it) and holds it open across the drop
+$standby->append_conf('postgresql.conf', "max_standby_streaming_delay = '1s'\n");
+$standby->reload;
+is($standby->safe_psql('postgres', 'SELECT count(*) FROM gone'), 100, 'hot standby: the table that is about to be dropped late reads on the standby');
+my $reader = $standby->background_psql('postgres', on_error_stop => 0);
+$reader->query('BEGIN; SELECT count(*) FROM gone;');
+
 # a file dropped after the clean-up, and the next transaction of the session
 run("SET event_triggers = off; BEGIN; SET LOCAL kcprobe.commit_sql = 'DROP TABLE gone'; SELECT 1; COMMIT; SELECT 1; SELECT 1;");
 
 $primary->wait_for_catchup($standby);
+
+# the drop replayed over the reader (it was cancelled after the delay), and the stripe rows of the
+# dropped file are gone on the standby too
+$standby->poll_query_until('postgres', "SELECT to_regclass('public.gone') IS NULL");
+is($standby->safe_psql('postgres', "SELECT to_regclass('public.gone') IS NULL"), 't', 'hot standby: the late drop replayed under a reader');
+is($standby->safe_psql('postgres', 'SELECT pg_is_in_recovery()'), 't', 'hot standby: the standby is still in recovery and answering');
+is($standby->safe_psql('postgres', 'SELECT count(*) FROM kingres.columnar_stripe WHERE rel_uid NOT IN (SELECT kingres.columnar_identity(c.oid) FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE a.amname = \'columnar\')'), 0,
+	'hot standby: no stripe row of the dropped file is left');
+like(slurp_file($standby->logfile), qr/conflict with recovery/, 'hot standby: the reader was ended by the conflict with the drop, as for any table');
+eval { $reader->quit; };
 
 foreach my $t ('late', 'win', 'trunc', 'lost')
 {

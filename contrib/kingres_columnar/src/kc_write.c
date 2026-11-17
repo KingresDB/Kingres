@@ -1068,7 +1068,12 @@ kc_write_is_late(void)
  *	 KC_END_LIVE  the top-level transaction is still alive and can still abort
  *	   cleanly: the commit of a subtransaction (SUBXACT_EVENT_COMMIT_SUB, and
  *	   the release of its resources) and a critical section entered by a
- *	   transaction in progress.  The refusal is remembered (statics, so that
+ *	   transaction in progress BEFORE this module's own pre-commit or
+ *	   pre-prepare callback has run.  A critical section entered after it (a
+ *	   callback of another module that runs later) is DECIDED, not LIVE:
+ *	   nothing of this module runs again before the commit record, so no error
+ *	   can be raised for a remembered refusal, and the warning says so (C9-01).
+ *	   The refusal is remembered (statics, so that
  *	   nothing is allocated) and raised as an ERROR at the next moment an error
  *	   is allowed: the pre-commit of the subtransaction that would have owned
  *	   the lost data, the pre-commit or pre-prepare of the top-level
@@ -1114,11 +1119,31 @@ static SubTransactionId kc_lost_owner = InvalidSubTransactionId;
 static char kc_lost_what[48];
 static char kc_lost_name[NAMEDATALEN];
 
+/*
+ * Whether a critical section is open at a moment at which this module's own
+ * pre-commit (or pre-prepare) callback has already run: a callback of another
+ * module that runs after it entered the critical section.  Nothing of this
+ * extension runs between that moment and the commit record (PostgreSQL's own
+ * work after the pre-commit callbacks, CommitTransaction and PrepareTransaction,
+ * has no hook that an extension can use, and an error is allowed there only for
+ * PostgreSQL's own checks), so a call refused then cannot be remembered and
+ * raised later: the refusal is final, like one at XACT_EVENT_COMMIT.
+ */
+static bool
+kc_crit_after_own_precommit(void)
+{
+	return IsTransactionState() && CritSectionCount > 0 && kc_commit_flushed;
+}
+
 static KcEnding
 kc_ending(void)
 {
 	if (IsTransactionState())
-		return CritSectionCount > 0 ? KC_END_LIVE : KC_END_NONE;
+	{
+		if (CritSectionCount == 0)
+			return KC_END_NONE;
+		return kc_crit_after_own_precommit() ? KC_END_DECIDED : KC_END_LIVE;
+	}
 	if (GetCurrentTransactionNestLevel() > 1)
 	{
 		SubTransactionId cur = GetCurrentSubTransactionId();
@@ -1165,9 +1190,9 @@ kc_lost_raise(void)
 					  kc_lost_name)
 			 : errmsg("a call to %s was refused earlier in this transaction, so it cannot commit",
 					  kc_lost_what),
-			 errdetail("%d call(s) were refused at a moment where the server forbids an error and the transaction was still open (the commit of a subtransaction, or a critical section); the first was \"%s\".  What they were to do was not done.",
+			 errdetail("Code of another module (not a statement of this session) called the table at a moment where the server forbids an error: %d call(s) were refused while the transaction was still open (the commit of a subtransaction, or a critical section); the first was \"%s\".  What they were to do was not done.",
 					   kc_lost_count, kc_lost_what),
-			 errhint("Roll back, and write only at XACT_EVENT_PRE_COMMIT or XACT_EVENT_PRE_PREPARE or earlier.")));
+			 errhint("Roll back, and write only at XACT_EVENT_PRE_COMMIT or XACT_EVENT_PRE_PREPARE or earlier, outside a critical section.")));
 }
 
 /*
@@ -1200,17 +1225,27 @@ kc_entry_refused(const char *what, const char *name, bool fails_txn)
 	 * error from it, which at the commit of a subtransaction aborts that
 	 * subtransaction, and then nothing is lost that needs remembering.
 	 */
+	/*
+	 * The text of each cell is true of that cell (C9-01, C9-05): what happens to
+	 * the transaction depends on whether the call may be skipped (fails_txn),
+	 * and on whether an error can still be raised for it later (ending).
+	 */
 	ereport(WARNING,
 			(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
 			 errmsg("%s refused%s%s%s: %s",
 					what,
 					name ? " on columnar table \"" : "", name ? name : "", name ? "\"" : "",
 					CritSectionCount > 0 ? "inside a critical section" :
+					ending == KC_END_LIVE ? "at the commit of a subtransaction" :
 					"the transaction is not in progress"),
-			 errdetail(ending == KC_END_LIVE && fails_txn
+			 errdetail(!fails_txn
+					   ? "Code of another module called the table at a moment where the server forbids an error, and the table cannot be changed then.  Nothing was done; skipping this call loses nothing of the transaction (VACUUM, the commit or a later call does the same work)."
+					   : ending == KC_END_LIVE
 					   ? "Code of another module called the table at a moment where the server forbids an error, and the table cannot be changed then: in a critical section, or at the commit of a subtransaction.  Nothing was done; the transaction is still open and fails with an error at its next pre-commit."
-					   : "Code of another module called the table at a moment where the server forbids an error, and the table cannot be changed then: in a critical section, or after the commit or abort of the transaction or subtransaction has begun (XACT_EVENT_COMMIT, XACT_EVENT_PREPARE, XACT_EVENT_ABORT, SUBXACT_EVENT_ABORT_SUB, the release of resources).  Nothing was done; if the transaction was committing, the data is lost."),
-			 errhint("Write at XACT_EVENT_PRE_COMMIT or XACT_EVENT_PRE_PREPARE, or in a transaction of its own.")));
+					   : kc_crit_after_own_precommit()
+					   ? "Code of another module called the table inside a critical section that it entered after this extension's own pre-commit (or pre-prepare) callback had run.  Nothing of this extension runs again before the commit record, so no error can be raised for this call.  Nothing was done; if the transaction commits (or prepares) it does so without this call."
+					   : "Code of another module called the table at a moment where the server forbids an error, and the table cannot be changed then: in a critical section, or after the commit or abort of the transaction or subtransaction has begun (XACT_EVENT_COMMIT, XACT_EVENT_PREPARE, XACT_EVENT_ABORT, SUBXACT_EVENT_ABORT_SUB, the release of resources).  Nothing was done; the transaction cannot be failed for it any more: if it commits or prepares it does so without this call, and an aborting transaction or subtransaction loses its data anyway."),
+			 errhint("Write at XACT_EVENT_PRE_COMMIT or XACT_EVENT_PRE_PREPARE, outside a critical section, or in a transaction of its own.")));
 	if (ending == KC_END_LIVE && fails_txn)
 	{
 		SubTransactionId owner = GetCurrentSubTransactionId();
@@ -1236,6 +1271,62 @@ bool
 kc_write_refused(Relation rel, const char *what)
 {
 	return kc_entry_refused(what, RelationGetRelationName(rel), true);
+}
+
+/* whether an error is forbidden now (the decision of kc_ending, for the SQL functions that read) */
+bool
+kc_error_forbidden(void)
+{
+	return kc_ending() != KC_END_NONE;
+}
+
+/*
+ * Whether a subtransaction cannot be started now (C9-03).  A function that
+ * begins one (columnar_check does, for each table) can only do so where the
+ * server lets its own code do it: BeginInternalSubTransaction ends the session
+ * with a FATAL for a subtransaction that is starting, committing or aborting,
+ * and the call changes the state of a transaction that is not in progress, so
+ * the moments are:
+ *
+ *	 - no transaction in progress (IsTransactionState: the commit, prepare and
+ *	   abort of the top-level transaction, the abort and the commit of a
+ *	   subtransaction, the release of a resource owner, the exit of the process);
+ *	 - a critical section (a subtransaction allocates);
+ *	 - a subtransaction between its PRE_COMMIT_SUB and its end, as this module's
+ *	   own callback saw it (kc_sub_precommitted).
+ *
+ * What this module cannot see is the start of a subtransaction
+ * (SUBXACT_EVENT_START_SUB: the state is "in progress" and nothing marks the
+ * end of the event), and the pre-commit of a subtransaction when another module's
+ * callback runs before this module's own; there the server's own FATAL for a
+ * subtransaction begun in that state applies, as it does to any code, heap's
+ * PL/pgSQL exception blocks among them (README).  The pre-commit and the
+ * pre-prepare of the top-level transaction are fine.
+ *
+ * Nothing is raised and nothing is allocated; the caller answers "nothing was
+ * checked".
+ */
+bool
+kc_subxact_refused(const char *what)
+{
+	const char *why;
+
+	if (CritSectionCount > 0)
+		why = "inside a critical section";
+	else if (!IsTransactionState())
+		why = "the transaction is not in progress";
+	else if (GetCurrentTransactionNestLevel() > 1 &&
+			 kc_sub_precommitted == GetCurrentSubTransactionId())
+		why = "the subtransaction is committing";
+	else
+		return false;
+	KC_PATH(KC_PATH_REFUSED_ENDING);
+	ereport(WARNING,
+			(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+			 errmsg("%s refused: %s", what, why),
+			 errdetail("The call starts a subtransaction for each table it looks at, which the server cannot do at this moment (it ends the session, or allocates where that is forbidden).  Nothing was checked, and the empty answer of a call that was refused is not an answer that the tables are clean."),
+			 errhint("Call it from a statement, or at XACT_EVENT_PRE_COMMIT or XACT_EVENT_PRE_PREPARE.")));
+	return true;
 }
 
 /*

@@ -34,7 +34,10 @@
  *	                  (index_validate_scan), sample (the TABLESAMPLE callbacks);
  *	                  and, for the other entry points of the extension: objhook
  *	                  (the object access hook, for a drop of the table), fn
- *	                  (the SQL functions registered with kcevents_fn)
+ *	                  (the C functions registered with kcevents_fn), sqlfn
+ *	                  (the SQL functions registered with kcevents_sql, called
+ *	                  through the function manager with a result-set context
+ *	                  and an active snapshot, as the executor calls them)
  *	  kcevents.crit   on: run the operation inside a critical section, which
  *	                  makes a build with assertions trap any allocation that the
  *	                  access method makes on the way (the refusal path of the
@@ -60,6 +63,28 @@
  *	                         directly: the first argument is the table, the others
  *	                         null; the list is forgotten at the end of the
  *	                         transaction
+ *	  kcevents_sql(fn, arg, symbol)
+ *	                         register an SQL function of the extension (its
+ *	                         oid, e.g. 'kingres.columnar_check(boolean)'::
+ *	                         regprocedure::oid) to be called by the op sqlfn:
+ *	                         its first argument is the table's oid when arg is
+ *	                         -1, else arg as an integer (a boolean: 0 or 1),
+ *	                         the others are null; the list is forgotten at the
+ *	                         end of the transaction.  Called through the
+ *	                         function manager (what the executor does), or,
+ *	                         with a symbol (the name of its C function in
+ *	                         kingres_columnar), by its address with no
+ *	                         FmgrInfo, the way a C module calls it: the
+ *	                         function manager's own wrapper for a function with
+ *	                         a SET clause reads the catalogs, which a build with
+ *	                         assertions refuses where no transaction is in
+ *	                         progress, so only a direct call reaches the
+ *	                         function itself there; a direct call cannot serve
+ *	                         a function that returns a set (it needs the
+ *	                         catalogs to find its result type).  Each call logs
+ *	                         "kcevents: sqlfn <name> done rows=<n> isnull=<0|1>
+ *	                         bool=<0|1>" (rows of a result set, and the result
+ *	                         read as a boolean)
  *	  kcevents_walk(table)   one row for every callback of the table's access
  *	                         method routine: its offset, its name and the
  *	                         decision the extension has recorded for it (null:
@@ -88,6 +113,7 @@
 #include "access/xact.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_class.h"
+#include "executor/executor.h"
 #include "commands/vacuum.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
@@ -96,6 +122,7 @@
 #include "storage/ipc.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/resowner.h"
@@ -111,6 +138,7 @@ PG_FUNCTION_INFO_V1(kcevents_crit);
 PG_FUNCTION_INFO_V1(kcevents_writes);
 PG_FUNCTION_INFO_V1(kcevents_write_now);
 PG_FUNCTION_INFO_V1(kcevents_fn);
+PG_FUNCTION_INFO_V1(kcevents_sql);
 PG_FUNCTION_INFO_V1(kcevents_walk);
 
 static char *kce_at = NULL;
@@ -126,6 +154,18 @@ static bool kce_hook_raise = false;
 static PGFunction kce_fns[KCE_MAX_FNS];
 static int	kce_fn_nargs[KCE_MAX_FNS];
 static int	kce_nfns = 0;
+/* the SQL functions the op sqlfn calls through the function manager */
+#define KCE_MAX_SQLFNS 8
+typedef struct KceSqlFn
+{
+	FmgrInfo	flinfo;
+	PGFunction	direct;			/* not NULL: call this, with no FmgrInfo */
+	int			arg;
+	ExprContext *econtext;
+	char		name[NAMEDATALEN];
+} KceSqlFn;
+static KceSqlFn kce_sqlfns[KCE_MAX_SQLFNS];
+static int	kce_nsqlfns = 0;
 static Snapshot kce_snap = NULL;
 static bool kce_released = false;
 static emit_log_hook_type kce_prev_emit_log_hook = NULL;
@@ -291,6 +331,57 @@ kce_entry_op(const char *op)
 		if (object_access_hook)
 			object_access_hook(OAT_DROP, RelationRelationId, RelationGetRelid(kce_rel), 0, NULL);
 		ereport(LOG, (errmsg("kcevents: objhook done")));
+	}
+	else if (strcmp(op, "sqlfn") == 0)
+	{
+		int			i;
+
+		for (i = 0; i < kce_nsqlfns; i++)
+		{
+			KceSqlFn   *f = &kce_sqlfns[i];
+			LOCAL_FCINFO(fcinfo, KCE_MAX_FNS);
+			ReturnSetInfo rsinfo;
+			Datum		result;
+			bool		pushed = false;
+			int			nargs = f->flinfo.fn_nargs;
+			int			a;
+			long long	rows = 0;
+
+			memset(&rsinfo, 0, sizeof(rsinfo));
+			rsinfo.type = T_ReturnSetInfo;
+			rsinfo.econtext = f->econtext;
+			rsinfo.allowedModes = (int) (SFRM_ValuePerCall | SFRM_Materialize);
+			rsinfo.returnMode = SFRM_ValuePerCall;
+			rsinfo.isDone = ExprSingleResult;
+			InitFunctionCallInfoData(*fcinfo, f->direct ? NULL : &f->flinfo, nargs, InvalidOid,
+									 NULL, (Node *) &rsinfo);
+			for (a = 0; a < nargs; a++)
+			{
+				fcinfo->args[a].value = (Datum) 0;
+				fcinfo->args[a].isnull = true;
+			}
+			if (nargs > 0)
+			{
+				fcinfo->args[0].value = f->arg == -1 ? ObjectIdGetDatum(RelationGetRelid(kce_rel))
+					: Int32GetDatum(f->arg);
+				fcinfo->args[0].isnull = false;
+			}
+			/* what the executor gives a function: an active snapshot (where the owner still has ours); a call by address
+			 * in a critical section does without, as it needs none and pushing one allocates */
+			if (!ActiveSnapshotSet() && kce_snap != NULL && !kce_released && (CritSectionCount == 0 || f->direct == NULL))
+			{
+				PushActiveSnapshot(kce_snap);
+				pushed = true;
+			}
+			result = f->direct ? f->direct(fcinfo) : FunctionCallInvoke(fcinfo);
+			if (pushed)
+				PopActiveSnapshot();
+			if (rsinfo.setResult != NULL)
+				rows = (long long) tuplestore_tuple_count(rsinfo.setResult);
+			ereport(LOG, (errmsg("kcevents: sqlfn %s done rows=%lld isnull=%d bool=%d",
+								 f->name, rows, (int) fcinfo->isnull,
+								 fcinfo->isnull ? 0 : (int) DatumGetBool(result))));
+		}
 	}
 	else if (strcmp(op, "fn") == 0)
 	{
@@ -462,6 +553,7 @@ kce_forget(void)
 	kce_rel = NULL;
 	kce_fired = false;
 	kce_nfns = 0;
+	kce_nsqlfns = 0;
 	if (kce_snap != NULL)
 	{
 		/* registered with the transaction's owner, which is still there at the events (not at the release phases) */
@@ -649,6 +741,36 @@ kcevents_fn(PG_FUNCTION_ARGS)
 	kce_fns[kce_nfns] = (PGFunction) load_external_function("kingres_columnar", name, true, NULL);
 	kce_fn_nargs[kce_nfns] = PG_GETARG_INT32(1);
 	kce_nfns++;
+	PG_RETURN_VOID();
+}
+
+/*
+ * kcevents_sql(fn, arg): register an SQL function for the op sqlfn.  Everything
+ * the call needs that allocates is made here, in a statement, so that the call
+ * itself allocates only what the function does.
+ */
+Datum
+kcevents_sql(PG_FUNCTION_ARGS)
+{
+	Oid			fn = PG_GETARG_OID(0);
+	int			arg = PG_GETARG_INT32(1);
+	char	   *symbol = PG_ARGISNULL(2) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(2));
+	KceSqlFn   *f;
+	MemoryContext old;
+
+	if (kce_nsqlfns >= KCE_MAX_SQLFNS)
+		elog(ERROR, "too many functions");
+	f = &kce_sqlfns[kce_nsqlfns];
+	old = MemoryContextSwitchTo(TopMemoryContext);
+	fmgr_info_cxt(fn, &f->flinfo, TopMemoryContext);
+	f->econtext = CreateStandaloneExprContext();
+	MemoryContextSwitchTo(old);
+	f->arg = arg;
+	f->direct = NULL;
+	if (symbol != NULL)
+		f->direct = (PGFunction) load_external_function("kingres_columnar", symbol, true, NULL);
+	strlcpy(f->name, get_func_name(fn), sizeof(f->name));
+	kce_nsqlfns++;
 	PG_RETURN_VOID();
 }
 

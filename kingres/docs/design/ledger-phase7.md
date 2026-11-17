@@ -2285,6 +2285,29 @@ build to the corrected rule. The verifier's README has the same list with the re
     owner of every database that holds a ledger, which the control plane must ensure, and keeps digests
     outside the database. `ledger_status` reports the owner and whether it is a superuser, and
     `ledger_enable` warns when it is not.
+69. **A weak anchor does not accuse the log (7.4; adds to 55).** When a held checkpoint that rests only
+    on revoked or over-limit keys disagrees with the log that is served, the failure line names the keys
+    the state rests on and why they no longer count, says that the conflict may come from the state and
+    not from the log, and gives the rebase command. "Both are signed by a key of the trust file" is
+    printed only for a state that counts. The evidence of such a conflict is one file per held state,
+    not one per run. The JSON carries the fact in `info.state.anchor_weak` with the keys and the reason.
+    The exit status stays 1.
+70. **The null device on purpose (adds to 58).** A caller that gives the null device opened for reading
+    and writing as the standard output on purpose (a process library's "discard", a daemon) sets
+    `KINGRES_VERIFY_NO_OUTPUT=1`. The refusal stays the default, and its line names the variable.
+71. **The order of the replacement of the state (7.4; adds to 57).** The temporary file is written and
+    flushed first, and the state is read again only then, just before the rename. The lock is what
+    excludes another run; this second reading only narrows the window for a writer that ignores the lock
+    and does not close it. Measured with such writers: 0.08 percent of them overwritten on Linux (22
+    percent with the reading before the write), 6 percent on Windows (45 before), where the rename with
+    write-through is itself the window. The README of the verifier gives the figures.
+72. **A stored signature line is kept as stored (7.4; adds to 56).** When a state or an evidence file is
+    rewritten, every line it holds stays, also the line of a key that has left the trust file. Such a
+    line makes nothing usable: usability is decided from the trust file of the run, as in 55.
+73. **Files on Windows (7.4).** A rename that another program blocks (a scanner, an indexer) is retried
+    for three seconds before the run fails with status 2. On every platform a new evidence file is
+    written under a temporary name and linked into place, so that a reader never sees half of one and an
+    existing file of that name is never replaced.
 
 Of section 13: item 2 (test vectors) is settled for signed notes (the example key and note of the
 specification are in the tests; the checkpoint example has no published key), item 3 (entry bundles at

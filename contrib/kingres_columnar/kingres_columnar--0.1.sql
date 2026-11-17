@@ -84,6 +84,15 @@ CREATE FUNCTION columnar_check(fix boolean DEFAULT false)
     LANGUAGE C STRICT SECURITY INVOKER
     SET search_path = pg_catalog, kingres, pg_temp;
 
+-- The strict form of columnar_check: true only when every columnar table was
+-- checked and nothing was found.  false for any row columnar_check() would
+-- return, a table that could not be locked at once (not_checked) included.
+CREATE FUNCTION columnar_check_clean()
+    RETURNS boolean
+    AS 'MODULE_PATHNAME', 'kingres_columnar_check_clean'
+    LANGUAGE C STRICT SECURITY INVOKER
+    SET search_path = pg_catalog, kingres, pg_temp;
+
 CREATE FUNCTION columnar_identity(rel regclass)
     RETURNS bigint
     AS 'MODULE_PATHNAME', 'kingres_columnar_identity'
@@ -299,6 +308,7 @@ REVOKE ALL ON FUNCTION columnar_info(regclass) FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_stripes(regclass) FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_compact(regclass, int) FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_check(boolean) FROM PUBLIC;
+REVOKE ALL ON FUNCTION columnar_check_clean() FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_reconcile() FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_write_paths(boolean) FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_finish_rewrites() FROM PUBLIC;
