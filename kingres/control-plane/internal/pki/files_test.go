@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -154,5 +155,54 @@ func TestWriteFileFlushesBeforeAndAfterTheRename(t *testing.T) {
 	}
 	if left, _ := filepath.Glob(filepath.Join(dir, ".pki-*")); len(left) != 0 {
 		t.Errorf("temporary files left: %v", left)
+	}
+}
+
+// Handshakes that arrive while the bootstrap files do not exist (a server has just reset itself and
+// every other server calls it) all ask for the certificate at once: they must all get the same,
+// whole pair, and the files must stay a pair for the calls after them.
+func TestBootstrapCertIsCreatedOnceUnderConcurrentCalls(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "pki")
+	n := Names{CommonName: "127.0.0.3", DNS: []string{"localhost"}}
+	const callers = 24
+	fps := make([]string, callers)
+	errs := make([]error, callers)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, fps[i], errs[i] = EnsureBootstrapCert(dir, n, t0)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	for i := range fps {
+		if errs[i] != nil {
+			t.Fatalf("caller %d: %v", i, errs[i])
+		}
+		if fps[i] != fps[0] {
+			t.Fatalf("caller %d got another certificate than caller 0", i)
+		}
+	}
+	if _, fp, err := EnsureBootstrapCert(dir, n, t0); err != nil || fp != fps[0] {
+		t.Fatalf("the files are not a pair after the calls: %v", err)
+	}
+}
+
+// Half of a pair (a crash between the two writes) is replaced, not kept for ever.
+func TestBootstrapCertWithoutItsCertificateIsMadeAgain(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "pki")
+	n := Names{CommonName: "127.0.0.3"}
+	if _, _, err := EnsureBootstrapCert(dir, n, t0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, BootstrapCertFile)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := EnsureBootstrapCert(dir, n, t0); err != nil {
+		t.Fatalf("a key without its certificate must not stay broken: %v", err)
 	}
 }

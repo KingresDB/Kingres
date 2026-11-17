@@ -202,7 +202,8 @@ func (f *fakeCluster) CheckMove(_ context.Context, m Move) error {
 	}
 	return nil
 }
-func (f *fakeCluster) RunMove(ctx context.Context, m Move) error {
+func (f *fakeCluster) Mark(context.Context, Move) (int64, error) { return 0, nil }
+func (f *fakeCluster) RunMove(ctx context.Context, m Move, _ int64) error {
 	f.mu.Lock()
 	f.runs = append(f.runs, fmt.Sprintf("%d", m.Bucket))
 	ch := f.block[m.Bucket]
@@ -232,10 +233,10 @@ func (f *fakeCluster) RunMove(ctx context.Context, m Move) error {
 	f.owner[m.Bucket] = m.To
 	return nil
 }
-func (f *fakeCluster) Progress(context.Context, Move, time.Time) (Progress, error) {
+func (f *fakeCluster) Progress(context.Context, Move, Ref) (Progress, error) {
 	return Progress{Found: true, ExtMoveID: 7, Phase: "copying", Percent: 30}, nil
 }
-func (f *fakeCluster) CancelMove(_ context.Context, m Move, _ time.Time) (bool, error) {
+func (f *fakeCluster) CancelMove(_ context.Context, m Move, _ Ref) (bool, error) {
 	f.mu.Lock()
 	can := f.canCancel
 	ch := f.block[m.Bucket]
@@ -267,7 +268,7 @@ func (f *fakeCluster) Recover(_ context.Context, r MoveRow) (string, string, err
 }
 func (f *fakeCluster) Cleanup(context.Context) { f.cleaned++ }
 
-func testLoop(c Backend, r *memRows) *Loop {
+func testLoop(c Backend, r Rows) *Loop {
 	now := time.Unix(5000, 0)
 	var mu sync.Mutex
 	return &Loop{Backend: c, Rows: r, MaxAttempts: 3, Backoff: time.Second, Poll: 5 * time.Millisecond,
@@ -558,4 +559,22 @@ func TestJudge(t *testing.T) {
 	if v := Judge(rows[:1], 3); v.Outcome != OutcomeCompleted {
 		t.Errorf("%+v", v)
 	}
+}
+
+// UndoStart takes back a try that started nothing: no row for a first try, a failed row with the attempts of
+// the tries before it for a later one.
+func (r *memRows) UndoStart(_ context.Context, seq, attempts int, why string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.guard(); err != nil {
+		return err
+	}
+	x := &r.moves[seq-1]
+	if attempts <= 1 {
+		r.moves = r.moves[:seq-1] // the real rows delete it; it is the newest here
+		return nil
+	}
+	now := time.Unix(5000, 0)
+	x.State, x.Attempts, x.FinishedAt, x.Error = MoveFailed, attempts-1, &now, why
+	return nil
 }

@@ -40,6 +40,16 @@ type Spec struct {
 	// ForceEnforce makes the lease manager treat every group as having a standby
 	// (self-fencing enforced), for tests that run before standbys exist.
 	ForceEnforce bool `json:"forceEnforce,omitempty"`
+	// DirectoryDelayMs holds a finishing server.add task for that long between reading the
+	// servers of the cluster and writing the peer directory, which makes the window in
+	// which another task introduces a server as wide as a test needs.
+	DirectoryDelayMs int64 `json:"directoryDelayMs,omitempty"`
+	// GrantDelayMs makes every lease request this server sends wait that long before it is
+	// sent (then fail when the server is also blocked): a renewal round that takes long.
+	GrantDelayMs int64 `json:"grantDelayMs,omitempty"`
+	// FinishDelayMs holds a joining server between preparing its system database and
+	// declaring itself a member.
+	FinishDelayMs int64 `json:"finishDelayMs,omitempty"`
 }
 
 // Hook reads the fault file. A nil *Hook means "no faults" and is valid.
@@ -105,4 +115,28 @@ func (h *Hook) ClockOffset() time.Duration {
 // (a test stand-in for "the group has a standby").
 func (h *Hook) ForceEnforce() bool {
 	return h != nil && h.load().ForceEnforce
+}
+
+// DirectoryDelay is the pause of DirectoryDelayMs.
+func (h *Hook) DirectoryDelay() time.Duration {
+	if h == nil {
+		return 0
+	}
+	return time.Duration(h.load().DirectoryDelayMs) * time.Millisecond
+}
+
+// FinishDelay is the pause of FinishDelayMs.
+func (h *Hook) FinishDelay() time.Duration {
+	if h == nil {
+		return 0
+	}
+	return time.Duration(h.load().FinishDelayMs) * time.Millisecond
+}
+
+// GrantDelay is the pause of GrantDelayMs.
+func (h *Hook) GrantDelay() time.Duration {
+	if h == nil {
+		return 0
+	}
+	return time.Duration(h.load().GrantDelayMs) * time.Millisecond
 }

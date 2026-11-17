@@ -90,12 +90,25 @@ func (s *PGStore) Get(ctx context.Context, id int64) (Task, error) {
 // The lease is written and compared with clock_timestamp() of the database:
 // every server asks the same clock, so servers whose own clocks differ agree on
 // whether a lease has expired. $2 is the lease length in seconds.
+//
+// A task whose guard is held (see GuardKey) is not claimed: the claim tries the exclusive advisory lock of the task
+// and skips the row when a guard holds it shared, as it skips a row that another claim has locked.
 const claimSQL = `UPDATE kingres_cp.task SET state = 'running', lease_holder = $1,
 	lease_expires_at = clock_timestamp() + make_interval(secs => $2::float8), lease_epoch = lease_epoch + 1, updated_at = clock_timestamp()
 	WHERE id = (SELECT id FROM kingres_cp.task
 	            WHERE %s AND (state = 'pending' OR (state = 'running' AND lease_expires_at <= clock_timestamp()))
+	              AND pg_try_advisory_xact_lock(` + guardKeyBase + ` + id)
 	            ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED)
 	RETURNING ` + cols
+
+// guardKeyBase is the start of the advisory lock keys of the guards of tasks.
+const guardKeyBase = "5278100627742580736::bigint"
+
+// GuardKey is the key of the advisory lock that a guard of the task holds (shared) while it must not be claimed
+// by another server: a call that starts work is on its way, and a new holder that settled the task's records
+// meanwhile would not know about it (internal/rebalance, guard.go). An advisory lock and not a lock on the row
+// of the task: a lock on the row keeps a schema change of the table and a delete of the row waiting too.
+func GuardKey(taskID int64) int64 { return 5278100627742580736 + taskID }
 
 // Claim implements Store.
 func (s *PGStore) Claim(ctx context.Context, holder string, lease time.Duration) (*Task, error) {

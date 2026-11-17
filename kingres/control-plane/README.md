@@ -103,6 +103,10 @@ manager itself in a throwaway directory under `~/kw-cp/test`, on a slice of 200 
 .\scripts\run-integration.ps1 -Install ~/kw-cp19/install   # the same suite on another installation
 ```
 
+`KINGRES_TEST_KEEP=1` (with `KINGRES_TEST_VERBOSE=1`, which keeps the request lines in the logs) keeps the directories of a run,
+the logs of every `kingresd` and every instance, after it ends, for a post-mortem (the next run reaps them; copy what is
+needed first). Both reach WSL through `WSLENV`.
+
 `-Install` is a path inside WSL (`~` and `$HOME` are expanded there); it reaches the tests as `KINGRES_INSTALL`, so the
 suite runs on whatever major that installation is (18 or 19, `cluster.SupportedMajors`). Without it the default stays
 `~/kw-cp/install`. An installation of another major is made as described in `docs/dev/testing.md` (a copy of the
@@ -497,6 +501,73 @@ fast shutdown and exits. For the service unit: `KillMode=process`, `TimeoutStopS
 `systemctl restart` then also restarts the database (ExecStop runs on restart); to restart only the manager send
 it `SIGTERM` (`systemctl kill --kill-whom=main -s TERM kingres`) and let `Restart=` bring it back. kingresd sends
 `READY=1` (after the API listens) and `STOPPING=1` to `NOTIFY_SOCKET` (standard library only, no-op when unset).
+
+### Waiting for the instance and for the leader (flaky-run fixes)
+
+Four failures that showed only in a complete run on a loaded machine led to these rules.
+
+- **A request waits for the instance before it fails.** Sign-in, the re-check of a session's role and the join check
+  go through `auth.Retrying`: an unreachable instance (`ErrUnavailable`) is asked again with a growing pause for up
+  to 10 s (`auth.DefaultUnavailableWait`), shorter than the request timeout. An answer (`ErrInvalidCredentials`) is
+  never retried, and after the wait the request is still refused with 503 and `Retry-After`: a role that cannot be
+  checked fails closed, only the wait is new. The internal API asks the catalog about the caller's membership for
+  up to 5 s before it answers 503 `unavailable`, so a follower's certificate renewal does not see a leader whose
+  own instance restarts for a moment as "the manager leader answered 503".
+- **No sign-in against an instance that is about to be stopped.** `lease.Manager.Confirming` is true while an
+  enforced group this server runs the primary of has no valid lease and the manager has not yet judged it lost: in
+  particular before the first round after a start of kingresd, when the watchdog still counts down the lease of the
+  previous run. `auth.Gated` makes sign-in and role checks answer `ErrUnavailable` meanwhile, and `Retrying` waits
+  for the round. It is **not** true while a renewal fails and the lease still holds (a follower that lost its
+  leader for a few seconds goes on serving: the instance runs until the lease ends), and not after the lease ended:
+  the manager then fences the instance and the requests meet an instance that is not there, in the usual way.
+  Tests: `TestConfirmingIsNotTrueWhileAFailedRenewalLeavesTheLeaseValid` (both directions, unit),
+  `TestConfirmingUntilTheFirstRoundAfterAStartIsDone`, `TestNoSignInAgainstAnInstanceTheLeaseIsAboutToStop` (fault
+  `grantDelayMs`).
+- **A server that is behind a configuration not tried yet is brought up to date at once.** The leader's loop that brings servers up to date
+  waits a minute between two attempts for one server; the wait now applies to a repeat of an attempt at the same configuration (by its hash)
+  that was not seen to work: a server that is seen up to date is forgotten, so one whose group changed a minute after an earlier catch-up is not left behind. Found by
+  running `TestConfigServerGroupAndServerLevels` several times against one cluster.
+- **One start or stop of an instance at a time.** The restart of a standby failed after 60 s with `pg_ctl stop: server does not shut
+  down` although the instance had shut down and was running again: `pg_ctl stop -w` waits until the pid file is gone, and the agent
+  of the standbys had started the standby again in the moment it was down, which put a new pid file there. That hang is what made
+  the call outlast the write timeout below (the step then failed with the TLS error). `instance.Manager` now serializes `Start`,
+  `Stop` and `Restart` of one instance (by its data directory); the shutdown paths that must not wait (`StopImmediate`,
+  `StopForShutdown`) do not take the lock. Test: `TestAStartDuringAStopDoesNotMakeTheStopFail` (a fake `pg_ctl`; it fails
+  with the old code with the very message above).
+- **A long call is answered, not cut.** The internal listener had a write timeout of 60 s counted from the request. A call
+  that takes longer (a restart of an instance under load, a statement that runs for minutes) was ended under the
+  caller, and a TLS connection that is closed after a failed write has moved its record counter on: the caller saw
+  `local error: tls: bad record MAC` instead of a timeout, and a task step failed on a healthy server. The listener
+  (`internalapi.NewHTTPServer`) has no write timeout; the write of the answer is bounded (30 s) from its first byte.
+  Test: `TestACallLongerThanTheResponseTimeoutIsAnswered` (it also shows the old configuration failing).
+- **A step repeats a call that a broken connection failed.** `peerclient.Client.Do` repeats a call, up to three tries
+  with a short pause and the connections of that server dropped, when the connection failed under it and the
+  call may be repeated: every GET, and every call a task step makes (the engine runs a step again from its start after
+  any interruption, so the calls of a step already have to give the same result when repeated, and the callee
+  refuses a repeat that comes after a newer run through the fence). A call outside a task that changes something
+  (a forwarded request of a person, a certificate renewal) is never repeated: it may have been done once. Not
+  repeated either: a server that is no member, a revoked certificate, a partition of a test. Test:
+  `TestAConnectionThatFailsUnderACallIsRetriedWhereTheCallMayBeRepeated`.
+- **A reset has no window with a handshake failure, and the bootstrap certificate is made once.** `ResetMember` deletes the
+  certificates and then records the state `uninitialized`; between the two the internal listener presented nothing
+  (`tls: internal error`, which the leader took for a server that cannot be reached). While `Service.Resetting()` it
+  presents the bootstrap certificate, so the leader's call meets "not a member of this cluster" (`internalCertificate`,
+  test `TestInternalCertificateDuringAReset`). `pki.EnsureBootstrapCert` is serialized and checks that the two files make a
+  pair: handshakes that arrive at once while the files do not exist yet each made a key pair, and the files could end up
+  as the key of one and the certificate of another, which nothing repaired (`TestBootstrapCertIsCreatedOnceUnderConcurrentCalls`).
+- **A joining server is a member only when its own connection works.** `FinishMember` prepares the system database
+  and publishes the service connection before the node state becomes `clustered`; the state used to come first, so
+  a client that signed in the moment the state changed hit the settings of the instance of an earlier membership
+  (503 "The role of this session cannot be checked right now"). Test:
+  `TestServerThatJoinedAnswersRoleChecksAsSoonAsItIsAMember` (fault `finishDelayMs`).
+- **The peer directory is merged, never replaced, by the task that finishes an add.** `distributePeers` used to
+  replace the leader's copy with a list read earlier, which dropped a server that another `server.add` task had just
+  introduced: the later task then failed with "no internal address is known" or waited ten minutes at "Wait for the
+  new server to hold its certificate". The leader's copy now keeps entries it was not told to remove, the add task
+  puts the address from its own input back when it is missing, and the waiting step shows what it waits for in its
+  detail. Test: `TestServerIntroducedWhileAnotherAddFinishesIsNotLostFromTheDirectory` (fault `directoryDelayMs`).
+
+The new fields of the fault file (`directoryDelayMs`, `grantDelayMs`, `finishDelayMs`) exist for these tests only.
 
 ### Identity of the signed-in role
 
@@ -1806,6 +1877,14 @@ a task kind, so that failover can rely on it. How it is kept:
   rebalancing.
 - **Cancel** of a paused task is allowed (`cancellable` is true for pending, running and paused tasks); it ends the
   task as `failed` with the code `cancelled`, and the hook sees that record.
+- **Standing down is logged, and a fence that never clears is bounded (RBR-07).** A run that is refused its lease or
+  its fence logs `task run stands down` with the task, kind, step, holder, epoch and the reason. A callee that refuses the
+  fence while the store still lets this server hold the lease (its mark is above any epoch reached, as after a restore
+  of the system database that makes task ids and epochs repeat) used to make the task loop for ever, a lease
+  period per pass, with nothing to see. After `task.MaxFencedRuns` (5) such runs in a row the engine records the task as failed under its
+  own lease, with the code `fenced`, and the hook of its kind runs (the rebalance raises `taskFailed` there). A holder
+  that does not hold the lease any more cannot record that, and does nothing, as before. Test:
+  `TestACalleeThatAlwaysRefusesTheFenceFailsTheTaskAfterABound`.
 
 Tests: `internal/task/fencing_test.go` (`TestSupersededHolderRunsNoHookWhateverTheStepError`,
 `TestExpiredUnclaimedLeaseIsClaimedAgainNotFailed`, `TestHookSeesTheRecordedFailure`,
@@ -1889,8 +1968,12 @@ learn of a revoked role. Decision, and exactly which decisions need the leader:
 - Everything that needs no session is unchanged: the health and readiness probes, `getSession` and the start of a
   stopped instance in the stopped state (these use `LastGood`, bounded to one hour and flagged `degraded`, as before).
 - A blip shorter than the bound changes nothing: `TestHeartbeatsAndLiveness/a_short_blip...` reads on an isolated
-  follower for five seconds and every read answers 200. The default bound of 30 s is three times the default
-  failure timeout.
+  follower for four seconds, starting when its group lease has just been renewed, and every read answers 200. The
+  follower runs the primary of a group that has a standby, and without a majority that instance runs only as long as
+  the lease it holds (5 to 7 s with the default lease settings), so "short" is shorter than that, whatever the bound
+  of 30 s says about authorizing sessions; a partition that lasts longer fences the primary of the isolated server and
+  its reads fail with 503 until the lease is back, which is the lease doing its job. The default bound of 30 s is three
+  times the default failure timeout.
 - The residue that stays: for up to `leader-loss-bound` after the contact is lost a follower authorizes from its copy,
   as it did before (a role revoked on the leader during that time can still work on the isolated follower for that
   long). The leader is told by the heartbeat only; a leader that is reachable but whose kingresd is wedged is judged
@@ -2390,12 +2473,13 @@ The review file `kingres/docs/reviews/2026-11-16-kingresd-rebalance.md` found 14
 
 - **Calls to nodes (RB-03).** A lease proved in a transaction that ends before `move_bucket` is called proves nothing about the call, and
   the extension does not take the fencing epoch. So `PG.RunMove` (`internal/rebalance/guard.go`) keeps the proof alive across the call:
-  it opens a transaction on the system database that locks the task row `FOR KEY SHARE` after checking holder, epoch, state and expiry,
-  checks that this session is still alive, and only then issues `move_bucket` on a second connection. While the guard is held another
-  server **cannot claim the task** (the claim takes the row `FOR UPDATE` and skips a locked row), and the holder's own renewals and records
-  still work (they change no key column). The guard is released as soon as the extension has recorded the move in `kingres.bucket_move`,
-  or the call returned, or 30 s passed (then the call is cancelled, so that nobody runs a call that cannot be found). It is not held for
-  the minutes a copy takes: a frozen holder would keep the lock until the server drops its session (`idle_in_transaction_session_timeout`
+  it opens a session on the system database that takes the shared advisory lock of the task (`task.GuardKey`) and then checks holder,
+  epoch, state and expiry, checks that this session is still alive, and only then issues `move_bucket` on a second connection. While the
+  guard is held another server **cannot claim the task** (the claim tries the exclusive advisory lock and skips the task), and everything else
+  works: the holder's own renewals and records, and also a schema change of the task table or a delete of the row, which the lock on the row
+  that the guard first took (`FOR KEY SHARE`) kept waiting (RBR-04). The guard is released as soon as the extension has recorded the move in
+  `kingres.bucket_move`, or the call returned, or the call was withdrawn (see "Rebalancing after the second review"). It is not held for
+  the minutes a copy takes: a frozen holder would keep the lock until the server drops its session (`idle_session_timeout`
   of 45 s is set on it), and the task could not fail over meanwhile.
   **The window that remains** is a process that is frozen exactly between the liveness check of the guard and the write of the call on the
   socket for longer than the idle timeout: its call then reaches the extension after the guard is gone. It is harmless for the data:
@@ -2427,8 +2511,70 @@ The review file `kingres/docs/reviews/2026-11-16-kingresd-rebalance.md` found 14
   the contract's codes). `updateServer` takes the same lock for its check of "no rebalance is running" and the change that follows.
   Not covered by this rule, because the contract does not declare them exclusive: server groups, certificate renewals, standby
   reconciliation and the other task kinds.
-- **Open.** The system-database writes of the steps of `server.add`, `server.remove`, `server.leave`, `cert.*` and `cluster.init`/`join`
+- **Open (of the first review).** The system-database writes of the steps of `server.add`, `server.remove`, `server.leave`, `cert.*` and `cluster.init`/`join`
   are protected by the engine's cancellation of the step context when the lease is lost, and their peer calls by the fence header, but are
   not themselves conditional on the lease the way the rebalance's are; the detection delay (at most a third of the lease) is the window.
   The calls of database creation, configuration and standby steps to the local instance carry no guard. `cleanup_moved_buckets(true)` in
   `remove_node` is cluster-wide (RB-14 c); a connection per call and the full plan before every move (RB-14 a, b) are unchanged.
+
+### Rebalancing after the second review (RBR-01 to RBR-07, and what a complete run showed)
+
+The review `kingres/docs/reviews/2026-11-16-kingresd-rebalance-fixes.md` found seven things in the fix round; a manager whose task
+another holder took over, in the complete runs, showed what the first of them hides. What each rule is, and where it is proved:
+
+- **A call that has a record is not cancelled (the failures of "a manager whose task another holder took over").** The loop used to
+  cancel the call of `move_bucket` when its context ended (a lost lease, a stop, a shutdown). A cancel that arrives while the move is
+  switching ends the session in the middle of the two-phase commit of the switch: the move stays in `switching` ("waiting for the write
+  lock of the bucket", writes to that bucket wait) until the recovery of the extension undoes it after `2 x node_timeout`, or it leaves
+  prepared transactions that make `check_cluster` report `catalog_differs` and `partition_misplaced`, which stops the run of the next
+  holder as a safety stop. Now the call has a context of its own that only the end of the run *before the record* can cancel. From the
+  record on the move is the extension's: a holder that lost the task stops watching and writes nothing, the call runs to its end, and the
+  holder that follows finds the live move by its record and waits for it (`resume_bucket_moves` never touches a live session).
+  Tests: `TestRebalanceTakeoverInTheSwitch` and `TestRebalanceTakeoverAtTheCatchUp` (the move is held at a fault point of the extension,
+  the task is taken over, the first holder stands down, the move is released), `TestRebalanceUnderFaults`.
+- **RBR-01, a slow record is not an attempt.** The guard is held until the record exists, but a call that waits for the cluster lock of the
+  extension (a long `add_node`, a distribution of a large table) has no record for as long as it waits. After `GuardHold` (30 s) the loop asks
+  the database what the backend of the call is doing (`pg_stat_activity`): a call that is active, a lock wait included, is waited for, up to
+  `MaxCallWait` (5 min), with a statement on the session of the guard every 5 s so that the idle timeout of the server does not end it. A call
+  that is not running any more, or has waited the 5 min, is withdrawn: `NotStartedError`, and the loop takes the try back (`Rows.UndoStart`: no
+  row for a first try, the earlier attempts for a later one), so that it is **not an attempt at the bucket**. Three in a row
+  (`notStartedTries`) stop the run as a safety stop with a text of its own; they never give a bucket up. The same holds when the guard or a
+  connection cannot be had before the call. Tests: `TestAWithdrawnCallIsNotAnAttempt`, `TestWithdrawnCallsInARowStopTheRunWithoutFailingTheBucket`,
+  and on a real cluster `TestRebalanceCallWaitsForTheClusterLockBeyondTheGuardHold` (a session holds `kingres.map_version` in exclusive mode for
+  40 s while the call waits).
+- **RBR-02, the system database away while a move is in flight.** Every write of the loop goes through `retryRows` (four tries with a growing
+  wait, as the checks). While a move is in flight the polls are single tries that are skipped when they fail, and the loop does not return
+  before the call has: what became of the move is recorded when it is over (with the retries), so the move is never orphaned and never reported
+  as failed for the blip. When the database stays away the run is paused (a safety stop: outcome `stopped` when that can be recorded, else only
+  the task is paused) and a start again goes on. Tests: `TestABlipOfTheSystemDatabaseMidMoveDoesNotFailTheMove`,
+  `TestASystemDatabaseThatStaysAwayPausesTheRun`.
+- **RBR-03, the totals count a bucket once.** A failed, skipped or cancelled row of a bucket that has a later row (a round that a person started
+  again repaired it) is history: `rebalance.Current` and the same predicate in `summarySQL` leave it out of progress, summary and verdict. Test:
+  `TestTotalsDoNotCountTheRowsOfAnEarlierRoundThatWereRepaired`.
+- **RBR-04, what the guard blocks.** An advisory lock replaces the lock on the row (see above): `TestGuardBlocksOnlyTheClaim`. A guard whose session
+  ended for another reason than a lost lease (a restart of the system database, the idle timeout) is a void proof, not a lost lease: `RunMove`
+  proves the lease again, and only a lease that is gone is `ErrLeaseLost` (`TestVoidGuardOfAValidLeaseIsTakenAgain`,
+  `TestVoidGuardOfALostLeaseMakesNoCall`).
+- **RBR-05, a move is found by an identity.** Before the call `Backend.Mark` reads the highest move id of the extension; the record of the call is
+  the one of the bucket with a higher id. No clock of this process is compared with the extension's. A row left by an earlier holder that never saw
+  its record is found by the time the row was started, read from the system database, which is on the server of the extension.
+- **RBR-06, rebalance and failover.** The design of the failover (`kingres/docs/design/ha-phase5-part2.md`, section 4.5) stops the rebalance first,
+  because a pending or running rebalance excludes a `server.failover` task (migration 0009) and a rebalance with a stuck move (a dead target) would
+  hold an automatic failover back. The rebalance offers what that needs: `Service.StopForFailover(ctx, serverID)` sets the flag of a stop with
+  `stoppedBy` `safetyRule` and says whether a rebalance was running (a task that is still `pending` has no run yet: ask again), and
+  `Service.WaitStopped(ctx, bound)` waits until the task is paused or has ended and says whether it did within the bound. **The stop works while a move
+  is stuck**: the flag is read at every poll of a move in flight, while the loop waits for a move that an earlier run left (`Recover`, up to 10
+  minutes) and while a call waits for a lock, and each of those waits ends at the flag; the row of the stuck move stays `running` for the recovery of
+  the extension and the next start. A move that is switching is not interrupted (the extension ends it within its own bounds). The failover that
+  calls this goes on asking, raises its alert after its own limit and never gives up; nothing resumes the rebalance afterwards, a person starts it
+  again. Tests: `TestAStopEndsTheWaitForAStuckMove`, `TestStopForFailoverSetsTheFlagAndWaitStoppedWaitsForThePause`.
+- **RBR-07, a fence that never clears.** See "The fencing rule of the task engine": a stand-down is logged with its reason, and after
+  `task.MaxFencedRuns` runs in a row the task fails with the code `fenced` and the rebalance raises its alert.
+- **RB-14 of the first review.** (a) A connection per call: not changed. A poll opens at most three connections on the local socket every 500 ms
+  while a move runs; a connection that the loop keeps would have to survive a restart of the instance and a change of the leader, for a gain of a few
+  milliseconds a poll. (b) The full plan before every move: not changed, because it cannot be made cheaper from here. `rebalance_plan(max_moves)` limits
+  the rows it returns, but the sizes of the buckets are read for every source group before the limit is applied, so a prefix of the plan costs the same
+  as the plan; a cheaper plan needs a change of the extension (sizes only for the groups of the first moves). (c) `cleanup_moved_buckets(true)` in the
+  removal of a node: not narrowed, because the function has no argument for a group (the request to the extension is `cleanup_moved_buckets(force,
+  group)`); it is used only when the removal is refused for a group that takes part in a move, and what it did is now in the log and in the audit log
+  (`cleanupMovedBucketsForced`, with the number of moves finished). (d) was fixed in the first round.

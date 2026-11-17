@@ -82,22 +82,11 @@ type internalDeps struct {
 func serveInternal(ctx context.Context, d internalDeps) {
 	dir := d.svc.PKIDir()
 	var logOnce sync.Once
-	get := func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-		if pair, err := tls.LoadX509KeyPair(filepath.Join(dir, cluster.ServerCertFile), filepath.Join(dir, cluster.ServerKeyFile)); err == nil {
-			return &pair, nil
-		}
-		if d.node.State() != setup.Uninitialized {
-			return nil, errors.New("no server certificate")
-		}
-		pair, fp, err := pki.EnsureBootstrapCert(dir, d.svc.ServerNames(), time.Now())
-		if err != nil {
-			return nil, err
-		}
+	get := internalCertificate(dir, d.svc.ServerNames, d.node.State, d.svc.Resetting, func(fp string) {
 		logOnce.Do(func() {
 			d.log.Info("bootstrap certificate of the internal API", "sha256", pki.FormatFingerprint(fp))
 		})
-		return &pair, nil
-	}
+	})
 	if d.node.State() == setup.Uninitialized {
 		// Log the fingerprint at start so that the administrator can pin it.
 		if _, fp, err := pki.EnsureBootstrapCert(dir, d.svc.ServerNames(), time.Now()); err == nil && !d.svc.Joining() {
@@ -188,11 +177,8 @@ func serveInternal(ctx context.Context, d internalDeps) {
 			return execLocal(ctx, d.svc, r)
 		},
 	}
-	srv := &http.Server{
-		Addr: d.addr, Handler: internalapi.New(d.svc, be, d.log, nil), TLSConfig: internalapi.TLSConfigFunc(get),
-		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 120 * time.Second,
-		MaxHeaderBytes: 64 << 10, ErrorLog: slog.NewLogLogger(d.log.Handler(), slog.LevelWarn),
-	}
+	srv := internalapi.NewHTTPServer(d.addr, internalapi.New(d.svc, be, d.log, nil), internalapi.TLSConfigFunc(get),
+		slog.NewLogLogger(d.log.Handler(), slog.LevelWarn), internalapi.ResponseTimeout)
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", d.addr)
 	if err != nil {
@@ -423,5 +409,31 @@ func newIdentityChecker(keys fwdproof.KeySource, self string) func(context.Conte
 			return fwdproof.ErrInvalid
 		}
 		return c.Check(ctx, req.ProofMessage(kind, peer, self), *req.Proof)
+	}
+}
+
+// internalCertificate chooses the certificate of a handshake of the internal API: the cluster
+// certificate once the server has one, before that (an uninitialized server) the bootstrap
+// certificate, which a joining or adding server pins or records. A server that is a member and has no
+// certificate presents nothing: it must not offer a certificate that nobody can pin. The exception is
+// a server that is resetting itself: it has deleted its certificates and is about to say so in its
+// state; for that moment it already presents the bootstrap certificate, so that a call of the leader
+// that arrives in between meets "not a member of this cluster" and not a handshake failure that it
+// would treat as a server that cannot be reached.
+func internalCertificate(dir string, names func() pki.Names, state func() setup.State, resetting func() bool,
+	onBootstrap func(fingerprint string)) func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+	return func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+		if pair, err := tls.LoadX509KeyPair(filepath.Join(dir, cluster.ServerCertFile), filepath.Join(dir, cluster.ServerKeyFile)); err == nil {
+			return &pair, nil
+		}
+		if state() != setup.Uninitialized && !resetting() {
+			return nil, errors.New("no server certificate")
+		}
+		pair, fp, err := pki.EnsureBootstrapCert(dir, names(), time.Now())
+		if err != nil {
+			return nil, err
+		}
+		onBootstrap(fp)
+		return &pair, nil
 	}
 }

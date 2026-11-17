@@ -442,16 +442,21 @@ func (s *Service) FinishMember(clusterID, clusterName string) error {
 		return nil
 	}
 	host := s.cfg.ServerHost
-	if err := s.setup.Transition(setup.Clustered, clusterID, clusterName, &host); err != nil {
-		return err
-	}
+	// The state becomes "clustered" last: a client that sees it signs in and the next request
+	// re-checks its role with the service connection, which must by then be the one of the
+	// instance this join created (a server that joins again has new service credentials; the
+	// old connection settings fail the password check).
 	mctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	if err := s.MigrateSystem(mctx); err != nil {
 		s.log.Error("preparing the system database of the new member", "error", err)
 	}
+	if d := s.cfg.Fault.FinishDelay(); d > 0 {
+		s.log.Info("the fault hook holds the end of a join", "for", d.String())
+		time.Sleep(d)
+	}
 	s.publishDSN()
-	return nil
+	return s.setup.Transition(setup.Clustered, clusterID, clusterName, &host)
 }
 
 // ResetMember returns a server to the state of a fresh install (design D5 and
@@ -462,6 +467,8 @@ func (s *Service) ResetMember(ctx context.Context) error {
 	if !s.Enabled() {
 		return ErrDisabled
 	}
+	s.resetting.Store(true)
+	defer s.resetting.Store(false)
 	if err := s.RemoveInstance(ctx); err != nil {
 		return err
 	}
@@ -470,6 +477,11 @@ func (s *Service) ResetMember(ctx context.Context) error {
 	}
 	return s.setup.Reset()
 }
+
+// Resetting tells whether ResetMember is running. Between the deletion of the certificates and the
+// change of the state the server is a member without a certificate; the internal API presents its
+// bootstrap certificate for that time (see internalCertificate in cmd/kingresd).
+func (s *Service) Resetting() bool { return s.resetting.Load() }
 
 // ApplyRules writes the managed network rules (with the certificate rules for
 // the other servers) to pg_hba.conf and reloads the instance.

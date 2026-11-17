@@ -235,3 +235,39 @@ func TestPGSupersededHolderRunsNoHook(t *testing.T) {
 		t.Errorf("state %s holder %q error %v hooks %d", got.State, got.Holder, got.Error, hooks.Load())
 	}
 }
+
+// RBR-07: a callee that keeps refusing the fence of a task that the store still lets this server hold (its
+// mark is above any epoch that is reached, as after a restore of the system database) made the task loop
+// for ever, a lease period per pass, silently. After MaxFencedRuns passes the task fails and its hook runs (the
+// rebalance raises its alert there); before that every pass leaves the task running and runs no hook.
+func TestACalleeThatAlwaysRefusesTheFenceFailsTheTaskAfterABound(t *testing.T) {
+	clk := newClock()
+	st := task.NewMemStoreClock(clk.Now)
+	var hooks atomic.Int32
+	var runs int
+	d := task.Definition{Kind: "test.kind",
+		Steps: []task.Step{{Name: "call a server", Run: func(context.Context, *task.Env) error {
+			runs++
+			return fmt.Errorf("calling a server: %w", fence.ErrFenced)
+		}}},
+		OnFail: func(context.Context, task.Task) { hooks.Add(1) }}
+	a := engine(t, st, "A", clk, d)
+	ctx := context.Background()
+	tk, _ := a.Submit(ctx, "test.kind", task.Subject{Type: "x", ID: "1"}, nil, "u")
+	for pass := 1; pass < task.MaxFencedRuns; pass++ {
+		if _, err := a.RunOnce(ctx); !errors.Is(err, task.ErrLeaseLost) {
+			t.Fatalf("pass %d: %v, want the run to stand down", pass, err)
+		}
+		if got, _ := a.Get(ctx, tk.ID); got.State != task.Running || hooks.Load() != 0 {
+			t.Fatalf("pass %d: state %s, hooks %d: a pass below the bound must leave the task running", pass, got.State, hooks.Load())
+		}
+		clk.Add(time.Minute) // the lease of the run that stood down ends; the next poll claims the task again
+	}
+	if ran, err := a.RunOnce(ctx); !ran || err != nil {
+		t.Fatalf("the last pass: %v %v", ran, err)
+	}
+	got, _ := a.Get(ctx, tk.ID)
+	if got.State != task.Failed || got.Error == nil || got.Error.Code != task.CodeFenced || hooks.Load() != 1 || runs != task.MaxFencedRuns {
+		t.Fatalf("after the bound: state %s error %+v hooks %d runs %d", got.State, got.Error, hooks.Load(), runs)
+	}
+}

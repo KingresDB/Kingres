@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -334,6 +335,11 @@ func (m *Manager) Running(ctx context.Context, id int) (bool, error) {
 // Start starts the instance and waits until it accepts connections. Starting
 // a running instance is not an error.
 func (m *Manager) Start(ctx context.Context, id int) error {
+	defer m.lifecycle(id)()
+	return m.start(ctx, id)
+}
+
+func (m *Manager) start(ctx context.Context, id int) error {
 	if _, err := m.Managed(id); err != nil {
 		return err
 	}
@@ -366,6 +372,11 @@ func (m *Manager) Start(ctx context.Context, id int) error {
 // Stop stops the instance with a fast shutdown and waits. Stopping a stopped
 // instance is not an error.
 func (m *Manager) Stop(ctx context.Context, id int) error {
+	defer m.lifecycle(id)()
+	return m.stop(ctx, id)
+}
+
+func (m *Manager) stop(ctx context.Context, id int) error {
 	if up, err := m.Running(ctx, id); err != nil || !up {
 		return err
 	}
@@ -379,10 +390,26 @@ func (m *Manager) Stop(ctx context.Context, id int) error {
 
 // Restart stops (if running) and starts the instance.
 func (m *Manager) Restart(ctx context.Context, id int) error {
-	if err := m.Stop(ctx, id); err != nil {
+	defer m.lifecycle(id)()
+	if err := m.stop(ctx, id); err != nil {
 		return err
 	}
-	return m.Start(ctx, id)
+	return m.start(ctx, id)
+}
+
+// lifecycleLocks serializes the starts and stops of one instance, by its data directory. `pg_ctl stop -w` waits until the
+// pid file of the instance is gone: a start by another caller between the shutdown and that check
+// (the standby agent starting a standby that a restart has just stopped) puts a new pid file there and the stop
+// waits for the whole of its time and fails, though the instance did shut down. The shutdown paths that must not wait
+// (StopImmediate, StopForShutdown) do not take the lock.
+var lifecycleLocks sync.Map
+
+// lifecycle takes the lock of an instance and returns the function that gives it back.
+func (m *Manager) lifecycle(id int) func() {
+	data, _ := m.DataDir(id)
+	mu, _ := lifecycleLocks.LoadOrStore(data, new(sync.Mutex))
+	mu.(*sync.Mutex).Lock()
+	return mu.(*sync.Mutex).Unlock
 }
 
 // Reload asks a running instance to re-read its configuration files.

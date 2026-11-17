@@ -50,8 +50,10 @@ type PG struct {
 	MinFreeFraction float64
 	// RecoverWait bounds how long the recovery of a move left behind may take (default 10 min).
 	RecoverWait time.Duration
-	// GuardHold bounds how long the lease guard of a move start waits for the extension to record the move (default 30 s).
-	GuardHold time.Duration
+	// GuardHold is how long a call may be unrecorded before it is asked what it is doing (default 30 s); a call that
+	// waits for a lock is waited for beyond it, up to MaxCallWait (default 5 min).
+	GuardHold   time.Duration
+	MaxCallWait time.Duration
 	// afterGuard is called with the guard held, before the call (tests).
 	afterGuard func(ctx context.Context)
 	Log        *slog.Logger
@@ -366,66 +368,150 @@ func (b *PG) syncStandbyMissing(ctx context.Context, db string, group int32) (bo
 	return res != nil && *res == "true", nil
 }
 
+// Mark implements Backend: the highest id the extension has given to a move, on the map group primary of the
+// database the move is in.
+func (b *PG) Mark(ctx context.Context, m Move) (int64, error) {
+	var after int64
+	err := b.with(ctx, m.Database, func(c *pgx.Conn) error {
+		return c.QueryRow(ctx, `SELECT coalesce(max(move_id), 0) FROM kingres.bucket_move`).Scan(&after)
+	})
+	return after, err
+}
+
+// guardKeepAlive is how often the guard's session does something while the call waits: the server ends a
+// session that is idle in its transaction (guardIdleTimeout), and a call that waits for a lock must not lose
+// its guard to that.
+const guardKeepAlive = 5 * time.Second
+
+// guardMaxWait bounds, from the start of the call, how long it may stay unrecorded while it is running.
+const guardMaxWait = 5 * time.Minute
+
 // RunMove implements Backend. The statement runs on a connection of its own, after the lease of the
 // run was proved and while the proof is kept (see guard.go): a run that lost its lease starts nothing.
 // It returns ErrLeaseLost, without having called move_bucket, when the guard cannot be had.
-func (b *PG) RunMove(ctx context.Context, m Move) error {
+//
+// Until the extension has recorded the move the call is the run's: the guard is kept (and kept alive), and the call is
+// cancelled when the run ends or when it has not been recorded after guardHold and is not running any more or after
+// guardMaxWait; that is a *NotStartedError, not an attempt. A call that waits for a lock (the cluster lock of the
+// extension, which a long operation of another session can hold) is running: it is waited for, as long as the guard
+// holds, which means as long as the run still holds the task (RBR-01). From the record on the move is the extension's:
+// the call is not cancelled when ctx ends, so a holder that lost the task or was stopped does not cut a move in the
+// middle of its switch (which leaves prepared transactions for the recovery); the one that follows finds the live
+// move by its record and waits for it.
+func (b *PG) RunMove(ctx context.Context, m Move, after int64) error {
 	tok, ok := fence.From(ctx)
 	if !ok {
 		return errors.New("rebalance: a call that starts a move without the fence of the task run")
 	}
-	since := time.Now()
 	g, err := acquireGuard(ctx, b.Conns, tok.Task)
 	if err != nil {
-		return err
+		return notStartedUnless(err)
 	}
-	defer g.release()
+	defer func() { g.release() }()
 	c, err := b.Conns.ServiceConn(ctx, m.Database)
 	if err != nil {
-		return err
+		return notStartedUnless(err)
 	}
 	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
 	watch, err := b.Conns.ServiceConn(ctx, m.Database)
 	if err != nil {
-		return err
+		return notStartedUnless(err)
 	}
 	defer func() { _ = watch.Close(context.WithoutCancel(ctx)) }()
 	if b.afterGuard != nil {
 		b.afterGuard(ctx)
 	}
-	// The guard's session may have been ended by the server while this process was frozen.
+	// The guard's session may have been ended by the server while this process was frozen, or for another
+	// reason than a lost lease (a restart of the system database, an idle timeout): the lease is then proved
+	// again, and only a lease that is really gone is a lost lease (RBR-04).
 	if err := g.alive(ctx); err != nil {
-		return err
+		g.release()
+		if g, err = acquireGuard(ctx, b.Conns, tok.Task); err != nil {
+			return notStartedUnless(err)
+		}
 	}
-	callCtx, cancel := context.WithCancel(ctx)
+	// The call has a context of its own: ctx ends it only while it is not recorded.
+	callCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancel()
+	pid := c.PgConn().PID()
 	errc := make(chan error, 1)
 	go func() {
 		var id int64
 		errc <- c.QueryRow(callCtx, `SELECT kingres.move_bucket($1, $2, $3)`, m.Colocation, m.Bucket, m.To).Scan(&id)
 	}()
-	// Keep the guard until the extension has recorded the move: from then on a new holder finds the
-	// move by its record and the extension refuses a second move of the bucket.
-	hold := time.NewTimer(b.guardHold())
-	defer hold.Stop()
+	withdraw := func(why error) error {
+		cancel()
+		<-errc
+		return &NotStartedError{Err: why}
+	}
+	start := time.Now()
+	hold := start.Add(b.guardHold())
+	nextAlive := start.Add(guardKeepAlive)
+	ctxDone := ctx.Done()
 	for {
 		select {
 		case err := <-errc:
 			return asMoveError(err)
-		case <-hold.C:
-			// Not recorded in time: do not let a call that nobody can find run on.
+		case <-ctxDone:
+			// The run ended before the extension recorded the move: nobody can find the call, so it goes.
 			cancel()
 			<-errc
-			return fmt.Errorf("the extension did not record the move within %s; the call was cancelled", b.guardHold())
+			return ctx.Err()
 		case <-time.After(100 * time.Millisecond):
 		}
-		if _, found, err := b.findMove(ctx, watch, m.Colocation, m.Bucket, since, 0); err == nil && found {
+		if e, found, err := b.findMove(ctx, watch, m.Colocation, m.Bucket, Ref{After: after}, 0); err == nil && found && e.id > after {
 			g.release() // idempotent
-			g = nil
 			break
 		}
+		now := time.Now()
+		if now.After(nextAlive) {
+			nextAlive = now.Add(guardKeepAlive)
+			if err := g.alive(ctx); err != nil {
+				// The proof is void while the call has no record: prove the lease again, or take the call back.
+				g.release()
+				if g, err = acquireGuard(ctx, b.Conns, tok.Task); err != nil {
+					if errors.Is(err, ErrLeaseLost) {
+						cancel()
+						<-errc
+						return err
+					}
+					return withdraw(err)
+				}
+			}
+		}
+		if now.After(hold) {
+			if now.Sub(start) >= b.maxCallWait() {
+				return withdraw(fmt.Errorf("the extension did not record the move within %s", b.maxCallWait()))
+			}
+			if running, _ := b.callRunning(ctx, watch, pid); !running {
+				return withdraw(fmt.Errorf("the extension did not record the move within %s and the call is not running", b.guardHold()))
+			}
+			hold = now.Add(b.guardHold()) // waiting for a lock or a node: still the call of this run
+		}
+		continue
 	}
+	// Recorded: the call runs to its end on its own.
 	return asMoveError(<-errc)
+}
+
+// notStartedUnless marks an error before the call was made as "nothing was started" unless it says that the lease
+// is gone, which the loop treats as its own case.
+func notStartedUnless(err error) error {
+	if errors.Is(err, ErrLeaseLost) {
+		return err
+	}
+	return &NotStartedError{Err: err}
+}
+
+// callRunning asks the database what the backend of the call is doing: it is running when it is active (a lock
+// wait counts: it is the statement waiting), and not when it has ended or is idle.
+func (b *PG) callRunning(ctx context.Context, c *pgx.Conn, pid uint32) (bool, error) {
+	var state *string
+	err := c.QueryRow(ctx, `SELECT state FROM pg_catalog.pg_stat_activity WHERE pid = $1`, int32(pid)).Scan(&state)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil && state != nil && *state == "active", err
 }
 
 // asMoveError marks an error that PostgreSQL raised for the statement (the extension said no and the move
@@ -453,15 +539,27 @@ type extMove struct {
 	err   string
 }
 
-func (b *PG) findMove(ctx context.Context, c *pgx.Conn, colocation, bucket int32, since time.Time, id int64) (extMove, bool, error) {
+// findMove finds the extension's record of a move. By its id when that is known (ref.ID, or id). Else by the
+// identity the call carried: the record of the bucket with an id above the mark taken before the call. Only
+// for a row that an earlier holder left without either, by the time the row was started, read from the system
+// database, which is on the server of the extension (a clock of this process is never compared with it).
+func (b *PG) findMove(ctx context.Context, c *pgx.Conn, colocation, bucket int32, ref Ref, id int64) (extMove, bool, error) {
 	var e extMove
 	var err error
-	if id != 0 {
+	if id == 0 {
+		id = ref.ID
+	}
+	switch {
+	case id != 0:
 		err = c.QueryRow(ctx, `SELECT move_id, phase, coalesce(detail, '') FROM kingres.bucket_move WHERE move_id = $1`, id).Scan(&e.id, &e.phase, &e.err)
-	} else {
+	case ref.Since.IsZero():
+		err = c.QueryRow(ctx, `SELECT move_id, phase, coalesce(detail, '') FROM kingres.bucket_move
+			WHERE colocation_id = $1 AND bucket = $2 AND move_id > $3 ORDER BY move_id DESC LIMIT 1`,
+			colocation, bucket, ref.After).Scan(&e.id, &e.phase, &e.err)
+	default:
 		err = c.QueryRow(ctx, `SELECT move_id, phase, coalesce(detail, '') FROM kingres.bucket_move
 			WHERE colocation_id = $1 AND bucket = $2 AND started_at >= $3 ORDER BY move_id DESC LIMIT 1`,
-			colocation, bucket, since.Add(-10*time.Second)).Scan(&e.id, &e.phase, &e.err)
+			colocation, bucket, ref.Since).Scan(&e.id, &e.phase, &e.err)
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		return extMove{}, false, nil
@@ -488,10 +586,10 @@ func phasePercent(phase string) float64 {
 }
 
 // Progress implements Backend.
-func (b *PG) Progress(ctx context.Context, m Move, since time.Time) (Progress, error) {
+func (b *PG) Progress(ctx context.Context, m Move, ref Ref) (Progress, error) {
 	var p Progress
 	err := b.with(ctx, m.Database, func(c *pgx.Conn) error {
-		e, ok, err := b.findMove(ctx, c, m.Colocation, m.Bucket, since, 0)
+		e, ok, err := b.findMove(ctx, c, m.Colocation, m.Bucket, ref, 0)
 		if err != nil || !ok {
 			return err
 		}
@@ -502,10 +600,10 @@ func (b *PG) Progress(ctx context.Context, m Move, since time.Time) (Progress, e
 }
 
 // CancelMove implements Backend.
-func (b *PG) CancelMove(ctx context.Context, m Move, since time.Time) (bool, error) {
+func (b *PG) CancelMove(ctx context.Context, m Move, ref Ref) (bool, error) {
 	var stopped bool
 	err := b.with(ctx, m.Database, func(c *pgx.Conn) error {
-		e, ok, err := b.findMove(ctx, c, m.Colocation, m.Bucket, since, 0)
+		e, ok, err := b.findMove(ctx, c, m.Colocation, m.Bucket, ref, 0)
 		if err != nil || !ok {
 			return err
 		}
@@ -536,7 +634,7 @@ func (b *PG) Recover(ctx context.Context, r MoveRow) (string, string, error) {
 		var state, text string
 		var settled bool
 		err := b.with(ctx, r.Move.Database, func(c *pgx.Conn) error {
-			e, ok, err := b.findMove(ctx, c, r.Move.Colocation, r.Move.Bucket, r.StartedAt, r.ExtMoveID)
+			e, ok, err := b.findMove(ctx, c, r.Move.Colocation, r.Move.Bucket, Ref{After: r.After, Since: r.StartedAt}, r.ExtMoveID)
 			if err != nil {
 				return err
 			}
@@ -867,4 +965,26 @@ func onNode(ctx context.Context, c *pgx.Conn, node int32, sql string) (*string, 
 		return out, c.QueryRow(ctx, sql).Scan(&out)
 	}
 	return out, c.QueryRow(ctx, `SELECT kingres.internal_exec_scalar($1, $2)`, node, sql).Scan(&out)
+}
+
+// UndoStart implements Rows: the try that started nothing is taken back. A first try leaves no row; a later
+// one leaves the row as failed with the attempts of the tries before it, so that it counts for nothing and
+// the back-off of the earlier failure applies.
+func (r *PGRows) UndoStart(ctx context.Context, seq, attempts int, why string) error {
+	return r.leased(ctx, func(tx pgx.Tx) error {
+		if attempts <= 1 {
+			_, err := tx.Exec(ctx, `DELETE FROM kingres_cp.rebalance_move WHERE task_id = $1 AND seq = $2 AND state = 'running' AND move_id IS NULL`, r.TaskID, seq)
+			return err
+		}
+		_, err := tx.Exec(ctx, `UPDATE kingres_cp.rebalance_move SET state = 'failed', attempts = $3, phase = NULL, finished_at = clock_timestamp(), error = $4
+			WHERE task_id = $1 AND seq = $2 AND state = 'running' AND move_id IS NULL`, r.TaskID, seq, attempts-1, clipText(why, 500))
+		return err
+	})
+}
+
+func (b *PG) maxCallWait() time.Duration {
+	if b.MaxCallWait > 0 {
+		return b.MaxCallWait
+	}
+	return guardMaxWait
 }

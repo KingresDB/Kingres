@@ -163,10 +163,11 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 			log.Warn("the internal API is not on the port above the REST API: other servers find it there when they join or add this server", "listen", cfg.Listen, "internal-listen", cfg.InternalListen)
 		}
 	}
+	faultHook := fault.New(cfg.HA.FaultDir)
 	svc, err := cluster.New(cluster.Config{
 		DataDir: cfg.DataDir, BinDir: binDir, SocketDir: cfg.SocketDir, PGPort: cfg.PGPort, PGListen: cfg.PGListen,
 		ServerHost: serverHost, TLSCertFile: cfg.TLSCertFile, TLSKeyFile: cfg.TLSKeyFile, Logger: log,
-		InternalPort: internalPort, Version: version, CertificateLifetime: cfg.CertificateLifetime,
+		InternalPort: internalPort, Version: version, CertificateLifetime: cfg.CertificateLifetime, Fault: faultHook,
 	}, node)
 	if err != nil {
 		return fmt.Errorf("preparing instance management: %w", err)
@@ -216,7 +217,6 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	}
 	haReg := ha.NewRegistry()
 	haCalls := newCallTable()
-	faultHook := fault.New(cfg.HA.FaultDir)
 	fenceMem, ferr := fence.Open(cfg.DataDir)
 	if ferr != nil {
 		log.Warn("the memory of fenced task runs", "error", ferr)
@@ -238,6 +238,14 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	if svc.Enabled() {
 		authn.SetVerifierSource(svc.RoleVerifier)
 	}
+	// A request waits (bounded) for an instance that cannot be asked for a moment, and nobody is signed
+	// in against an instance the lease watchdog may still fence (lease.Manager.Confirming).
+	checkedAuthn := auth.Retrying(auth.Gated(authn, func() error {
+		if c, ok := haReg.Leases().(interface{ Confirming() bool }); ok && c.Confirming() {
+			return errors.New("this server has not renewed the lease of its group since it started")
+		}
+		return nil
+	}), auth.DefaultUnavailableWait)
 	sessions := auth.NewStore(cfg.SessionTTL, cfg.MaxSessions, time.Now)
 	web, err := webui.Handler()
 	if err != nil {
@@ -255,7 +263,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		opsSvc = &ops.Ops{Service: svc, Roles: proxy, Instances: svc.Manager(), ServerHost: serverHost, PGPort: cfg.PGPort, Log: log}
 	}
 	deps := httpapi.Deps{
-		Logger: log, Store: pg, Setup: node, Sessions: sessions, Authenticator: authn, Audit: sink,
+		Logger: log, Store: pg, Setup: node, Sessions: sessions, Authenticator: checkedAuthn, Audit: sink,
 		Web: web, Version: version, Commit: commit, Hostname: hostname, ListenAddr: cfg.Listen,
 		LoopbackOnly: !cfg.AllowRemoteSetup, SetupService: svc, DataDir: cfg.DataDir, Ops: opsSvc, Started: started, Metrics: ring, MetricsToken: cfg.MetricsToken,
 		LogDir: svc.LogDir, MaxBodyBytes: cfg.MaxBodyBytes,
@@ -300,14 +308,14 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		opsSvc.Recorder = opsSvc.NewPeerRecorder(func(ctx context.Context) (string, bool, error) {
 			return lastLeader.resolve(ctx, leaders, serverHost)
 		}, pc)
-		members = &membership.Manager{Svc: svc, Ops: opsSvc, Peers: peerDir, Client: peerclient.New(peerclient.Config{Self: serverHost, PKIDir: svc.PKIDir(), Peers: peerDir, Revoked: svc.RevokedSerials, Timeout: 10 * time.Minute, Fault: faultHook}), Leaders: leaders, Self: serverHost, Version: version, Log: log, GatherSigner: gatherSigner,
+		members = &membership.Manager{Svc: svc, Ops: opsSvc, Peers: peerDir, Client: peerclient.New(peerclient.Config{Self: serverHost, PKIDir: svc.PKIDir(), Peers: peerDir, Revoked: svc.RevokedSerials, Timeout: 10 * time.Minute, Fault: faultHook}), Leaders: leaders, Self: serverHost, Version: version, Log: log, GatherSigner: gatherSigner, Fault: faultHook,
 			SelfPeer: peers.Peer{ServerID: serverHost, InternalAddr: net.JoinHostPort(serverHost, iport)},
 			Audit: func(ctx context.Context, ev audit.Event) {
 				if _, err := sink.Append(ctx, ev); err != nil {
 					log.Error("writing the audit log", "error", err)
 				}
 			}}
-		receiver = &membership.Receiver{M: members, Authn: authn, VerifyToken: svc.VerifyToken}
+		receiver = &membership.Receiver{M: members, Authn: checkedAuthn, VerifyToken: svc.VerifyToken}
 		members.OnCertificateInstalled = func() { pc.ForgetAll(); members.Client.ForgetAll(); certHooks.run() }
 		opsSvc.Fanout, opsSvc.Local, opsSvc.InstanceOwner = members, svc, members.InstanceBelongsTo
 		stby, err = newStandbyParts(cfg, svc, serverHost, log, members.Audit, members, opsSvc, haReg)

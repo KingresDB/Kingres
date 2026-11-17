@@ -20,6 +20,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/api"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/audit"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/cluster"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fault"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fwdproof"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/leader"
@@ -59,6 +60,8 @@ type Manager struct {
 	// GatherSigner signs the assertions of gather calls when this server is the
 	// leader (see Gatherer.Ask).
 	GatherSigner *fwdproof.Signer
+	// Fault is the fault-injection hook of the tests (nil in production).
+	Fault *fault.Hook
 	// Standbys removes the standbys that go with a server that is removed or leaves
 	// (nil: none are managed).
 	Standbys interface {
@@ -546,12 +549,16 @@ func (m *Manager) stepAddWait(ctx context.Context, env *task.Env) error {
 	if in.Pinned {
 		mode = "pinned by the administrator"
 	}
+	base := ""
 	if in.Fingerprint != "" {
-		_ = env.SetDetail(ctx, fmt.Sprintf("Certificate of the new server seen on first contact, SHA-256 %s (%s).", fp, mode))
+		base = fmt.Sprintf("Certificate of the new server seen on first contact, SHA-256 %s (%s).", fp, mode)
+		_ = env.SetDetail(ctx, base)
 	}
+	m.ensurePeer(in)
 	deadline := time.Now().Add(10 * time.Minute)
 	var last error
 	for time.Now().Before(deadline) {
+		m.ensurePeer(in)
 		var st wire.InstanceStatus
 		if last = m.do(ctx, in.ServerID, "GET", "/instance/status", nil, &st); last == nil {
 			return nil
@@ -560,6 +567,7 @@ func (m *Manager) stepAddWait(ctx context.Context, env *task.Env) error {
 		if errors.As(last, &ae) && ae.Status == 401 {
 			return fmt.Errorf("the new server refused our certificate: %w", last)
 		}
+		_ = env.SetDetail(ctx, strings.TrimSpace(base+fmt.Sprintf(" Waiting for %s to answer with its certificate of this cluster (last answer: %s).", in.ServerID, errorText(last))))
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -582,6 +590,7 @@ func (m *Manager) stepAddPrepare(ctx context.Context, env *task.Env) error {
 	if err != nil {
 		return err
 	}
+	m.ensurePeer(in)
 	ca, err := m.Svc.CA()
 	if err != nil {
 		return err
@@ -781,7 +790,12 @@ func (m *Manager) distributePeers(ctx context.Context, env *task.Env, without st
 	for i, p := range infos {
 		list[i] = peers.Peer{ServerID: p.ServerID, InternalAddr: p.InternalAddress, Ordinal: p.Ordinal}
 	}
-	if err := m.Peers.Replace(list); err != nil {
+	if d := m.Fault.DirectoryDelay(); d > 0 {
+		m.log().Info("the fault hook holds the write of the peer directory", "for", d.String())
+		time.Sleep(d)
+		m.log().Info("writing the peer directory", "servers", len(list), "without", without)
+	}
+	if err := m.recordDirectory(list, without); err != nil {
 		return err
 	}
 	for _, p := range infos {
@@ -864,4 +878,33 @@ func (m *Manager) addFailed(ctx context.Context, t task.Task) {
 	}
 	// 3. What was signed for it is revoked.
 	m.discardPending(ctx, in.ServerID)
+}
+
+// recordDirectory writes the leader's own copy of the peer directory. It adds and
+// updates the servers of list and drops only the one that is being removed: the
+// directory also holds a server that another task is adding right now (it is
+// pending, so it is not in list), and a task that replaced the whole file from a
+// list read a moment before made that task fail with "no internal address is
+// known" or wait for a server it could no longer reach.
+func (m *Manager) recordDirectory(list []peers.Peer, without string) error {
+	for _, p := range list {
+		if err := m.Peers.Put(p); err != nil {
+			return err
+		}
+	}
+	if without != "" {
+		return m.Peers.Delete(without)
+	}
+	return nil
+}
+
+// ensurePeer puts the address of the server being added back into the directory
+// when it is missing: the task knows it from its input, and a step that cannot
+// find it would otherwise wait for a server it will never be able to call.
+func (m *Manager) ensurePeer(in addInput) {
+	if _, ok := m.Peers.Get(in.ServerID); ok || in.InternalAddress == "" {
+		return
+	}
+	m.log().Warn("the address of a server that is being added was missing from the directory; recorded again", "server", in.ServerID)
+	_ = m.Peers.Put(peers.Peer{ServerID: in.ServerID, InternalAddr: in.InternalAddress})
 }

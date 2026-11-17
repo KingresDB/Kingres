@@ -453,7 +453,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// A forwarded operation is gated by the backend's Forward (it must answer the stopped
 	// instance of the leader in the documented way, see cmd/kingresd forwardGate).
 	if policy == ToLeader && key != "POST /forward" && s.be.Member != nil {
-		member, err := s.be.Member(r.Context(), peer)
+		member, err := s.isMember(r.Context(), peer)
 		switch {
 		case err != nil:
 			s.log.Error("internal call refused", "reason", "membership unknown", "call", key, "peer", peer, "error", err)
@@ -613,11 +613,9 @@ func TLSConfigFunc(get func(*tls.ClientHelloInfo) (*tls.Certificate, error)) *tl
 // dropConnection closes the connection without an answer, as a network that
 // loses the packets would look to the caller (the fault hook of the tests).
 func dropConnection(w http.ResponseWriter) {
-	if hj, ok := w.(http.Hijacker); ok {
-		if c, _, err := hj.Hijack(); err == nil {
-			_ = c.Close()
-			return
-		}
+	if c, _, err := http.NewResponseController(w).Hijack(); err == nil {
+		_ = c.Close()
+		return
 	}
 	panic(http.ErrAbortHandler)
 }
@@ -651,4 +649,26 @@ func (s *Server) notReady(ctx context.Context) bool {
 func failNotReady(w http.ResponseWriter) {
 	w.Header().Set("Retry-After", "2")
 	fail(w, http.StatusServiceUnavailable, "service_unavailable", "This server cannot serve yet: its instance waits for its group lease.")
+}
+
+// memberWait bounds how long a call waits for the catalog when it cannot say
+// whether the caller is a member: the leader's own instance may be restarting for a
+// moment (fenced and started again by the lease manager), which a caller should not
+// see as a refusal. After the bound the call is refused (fail closed).
+const memberWait = 5 * time.Second
+
+// isMember asks Backend.Member again, with short pauses, while it fails.
+func (s *Server) isMember(ctx context.Context, peer string) (bool, error) {
+	deadline := time.Now().Add(memberWait)
+	for {
+		ok, err := s.be.Member(ctx, peer)
+		if err == nil || time.Now().Add(s.leaderRetry).After(deadline) {
+			return ok, err
+		}
+		select {
+		case <-ctx.Done():
+			return ok, err
+		case <-time.After(s.leaderRetry):
+		}
+	}
 }

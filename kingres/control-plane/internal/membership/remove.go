@@ -135,7 +135,14 @@ func (m *Manager) unregisterNode(ctx context.Context, db, host string) error {
 			// waiting for the delay after which the old copies of the buckets are dropped, and the extension
 			// refuses to remove a group that takes part in a move. The server is going away with its data, so
 			// the old copies are dropped now (cleanup_moved_buckets(true)), and the removal tries again.
-			if _, cerr := c.Exec(ctx, `SELECT kingres.cleanup_moved_buckets(true)`); cerr == nil {
+			// The extension cannot limit this to the groups of the server that goes (there is no argument for it): it
+			// finishes every move that is cleaning, also those of buckets that moved between other servers, whose old
+			// copies are then dropped before their retention delay is over. That is said in the log and the audit log
+			// with the number, so that it is not silent (RB-14 c).
+			var finished int
+			if cerr := c.QueryRow(ctx, `SELECT kingres.cleanup_moved_buckets(true)`).Scan(&finished); cerr == nil {
+				m.log().Warn("removing a server finished the moves in the cleaning phase of the whole cluster before their retention delay", "server", host, "database", db, "moves", finished)
+				m.audit(ctx, "system", "cleanupMovedBucketsForced", host, audit.OutcomeSuccess, map[string]any{"database": db, "moves": finished})
 				_, err = c.Exec(ctx, `SELECT kingres.remove_node($1)`, id)
 			}
 		}

@@ -204,10 +204,16 @@ func TestStandbysAreCreatedForEveryGroupAndStream(t *testing.T) {
 	if _, err := sc.Exec(context.Background(), `CREATE TABLE must_fail (x int)`); err == nil {
 		t.Fatal("a write on the standby succeeded")
 	}
-	// The standby task says in its detail that the catalog registration was skipped.
+	// A reconcile that runs meanwhile (the replica count is changed here, as any later change of the
+	// cluster would) has its steps pending or running: only the tasks that ended say what happened to
+	// the step. The contract promises the state "skipped" for a step that was not run, not for one
+	// that has not been reached.
+	if st, task, _ := c.Leader().DoH("PATCH", "/settings/cluster", map[string]any{"defaultReplicaCount": 2}, map[string]string{"Prefer": "respond-async"}); st != 202 {
+		t.Fatalf("raising the replica count: %d %v", st, task)
+	}
 	found := false
 	for _, tk := range items(t, c.Leader().Expect(200, "GET", "/tasks?limit=50", nil)) {
-		if tk["kind"] == "standby.reconcile" {
+		if tk["kind"] == "standby.reconcile" && tk["state"] == "done" {
 			steps, _ := tk["progress"].(map[string]any)["steps"].([]any)
 			for _, s := range steps {
 				if st := s.(map[string]any); st["name"] == "standby.register_in_catalog" {

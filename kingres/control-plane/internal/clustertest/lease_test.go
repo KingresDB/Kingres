@@ -516,3 +516,34 @@ func waitWatchdog(t *testing.T, n *clustertest.Node) {
 	}
 	t.Fatalf("the watchdog of node %d does not run\n%s", n.Index, leaseDiag(n))
 }
+
+// A kingresd that is restarted next to a primary that still runs must not sign
+// anybody in against it while the lease of its group is not held: the watchdog and the
+// lease manager are about to stop that instance, and a session signed in just before
+// finds it gone ("the role of this session cannot be checked right now"). The server is
+// cut off from the others before kingresd starts, so no round can win the lease.
+func TestNoSignInAgainstAnInstanceTheLeaseIsAboutToStop(t *testing.T) {
+	c, _ := leaseCluster(t, true)
+	victim := c.Nodes[1]
+	waitWatchdog(t, victim)
+	victim.Stop()
+	victim.SetFaults(fault.Spec{BlockOutbound: []string{"*"}, BlockInbound: []string{"*"}, GrantDelayMs: 3000}) // a round that takes 3 s and fails
+	time.Sleep(time.Second)                                                                                     // less than the 4 s the old lease still lets the primary run
+	victim.Start()
+	signedIn := 0
+	deadline := time.Now().Add(9 * time.Second)
+	for time.Now().Before(deadline) {
+		if victim.Login(clustertest.AdminUser, clustertest.AdminPass) {
+			signedIn++
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if signedIn > 0 {
+		t.Errorf("%d sign-ins succeeded on a server whose primary had no lease", signedIn)
+	}
+	victim.Heal()
+	waitLogin(t, victim)
+	if st, out := victim.Do("GET", "/alerts?limit=1", nil, nil); st != 200 {
+		t.Errorf("after the lease is back: %d %v", st, out)
+	}
+}

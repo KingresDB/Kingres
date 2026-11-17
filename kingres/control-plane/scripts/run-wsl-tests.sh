@@ -149,8 +149,12 @@ unlock
 cleanup() {
   trap - EXIT
   stop_root "$ROOT"
-  rm -rf "$ROOT"
-  rm -f "$LEDGER/$(basename "$ROOT")"
+  # KINGRES_TEST_KEEP keeps the directories of the run (the logs of every kingresd and instance)
+  # for a post-mortem. Its ledger entry stays, so the next run reaps them: copy what is needed first.
+  if [ -z "${KINGRES_TEST_KEEP:-}" ]; then
+    rm -rf "$ROOT"
+    rm -f "$LEDGER/$(basename "$ROOT")"
+  fi
   [ "$SLICE_N" -ge 0 ] && rm -rf "$SLICES/s$SLICE_N"
 }
 trap cleanup EXIT
