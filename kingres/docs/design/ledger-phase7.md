@@ -2267,6 +2267,24 @@ build to the corrected rule. The verifier's README has the same list with the re
 65. **Clients and payloads (6.8).** The packages never use a proxy from the environment; the HTTP client
     is built from given roots with TLS 1.2 or later and timeouts. Every target checks that the digest of
     a payload is the SHA-256 of its note.
+66. **Identifiers do not come from sequences (replaces the exception about `setval` in 49).** A member
+    of `pg_write_all_data` holds the right to move every sequence through the role itself, which nothing
+    can revoke, and no hook sees `setval`. So no writer of the ledger takes an identifier from a
+    sequence: the registry of tables, the digests, the recorded verifications and the removal records
+    each take the maximum plus one under a lock of the writer and set the sequence to follow. No
+    identifier is part of a hash.
+67. **How long a role may hold a lock of the ledger (replaces the remedies named in 49 and 52).** A role
+    that is not a superuser holds a lock of the extension for at most
+    `kingres_ledger.lock_hold_limit` (one minute by default; only a superuser sets it): a session that
+    is still in the same transaction at that time is ended. The earlier advice does not hold:
+    `idle_in_transaction_session_timeout` does not end a pipeline that waits for Sync, and a role can
+    switch off `statement_timeout` and `transaction_timeout` for itself. Superusers and the workers
+    are not limited.
+68. **The owner of the database (9.3).** A database can be dropped by its owner, who need not be a
+    superuser, and nothing loaded in that database can prevent it. A deployment makes a superuser the
+    owner of every database that holds a ledger, which the control plane must ensure, and keeps digests
+    outside the database. `ledger_status` reports the owner and whether it is a superuser, and
+    `ledger_enable` warns when it is not.
 
 Of section 13: item 2 (test vectors) is settled for signed notes (the example key and note of the
 specification are in the tests; the checkpoint example has no published key), item 3 (entry bundles at
