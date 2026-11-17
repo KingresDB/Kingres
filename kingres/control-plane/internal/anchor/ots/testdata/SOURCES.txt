@@ -1,0 +1,39 @@
+Test data of package ots
+
+OUR OWN FILES (this directory, not third-party)
+  SOURCES.txt, third_party.sha256, fetch-third-party.sh, and:
+
+  headers.txt
+    Lines "<height> <block id> <80-byte header, hex>" of real Bitcoin main chain
+    blocks: height 0 (genesis) and the heights named by the Bitcoin attestations
+    of the examples (129405, 358391, 465751, 466906, 912095). Fetched on
+    2026-11-17 from https://blockstream.info/api/block-height/<height> and
+    https://blockstream.info/api/block/<id>/header. A header is self-checking:
+    the tests recompute its double SHA-256 against the block id and the target
+    of its bits field. Block headers are facts of the public chain.
+
+  Vectors constructed by the tests themselves (not from the reference client):
+    fragments and calendar answers of the fake calendar (fake_test.go), the
+    depth, node-budget, size and length boundary files (proof_test.go), the
+    merge halves (the real two-calendars proof split by the test and merged
+    back). RIPEMD-160 vectors are the published ones:
+    https://homes.esat.kuleuven.be/~bosselae/ripemd160.html
+
+THIRD-PARTY FILES (third_party/, not committed with our own files)
+  third_party/opentimestamps-client-examples/: the whole examples directory of
+  https://github.com/opentimestamps/opentimestamps-client at commit
+  cd71c7609421bed2a07b9642a3c02a58c9fd2cdf (the last commit that touched that
+  directory), with its original names and sub-directories invalid/ and sha1/.
+  The .ots files were written by the reference client or library (real vectors,
+  not constructed), except the three in invalid/, which are deliberately broken
+  files of the same project. The sample files (hello-world.txt, merkle1.txt,
+  ...) are the files the proofs are for. gdp2q25-2nd.pdf.ots was built by hand
+  by a third party with the reference library (see gdp2q25-2nd.pdf.ots.txt).
+  Licence of the project: LGPL-3.0-or-later.
+
+  The directory is test data only: it is read by tests at run time, never
+  embedded, never linked, never part of a binary. It is fetched by
+  fetch-third-party.sh and checked against third_party.sha256 (a file with
+  another sum, or a file that is not listed, fails TestThirdPartyManifest).
+  When the directory is absent the tests that need it skip with a message naming
+  it, and all others run.

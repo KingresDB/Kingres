@@ -1,0 +1,27 @@
+Test data of package sigv4
+
+OUR OWN FILES (this directory, not third-party)
+  SOURCES.txt, third_party.sha256, fetch-third-party.sh.
+  The four examples of the Amazon S3 documentation in sigv4_test.go are
+  written into the test itself ("Signature Calculations for the Authorization
+  Header: Transferring Payload in a Single Chunk (AWS Signature Version 4)",
+  with the example credentials of that page).
+
+THIRD-PARTY FILES (third_party/, not committed with our own files)
+  third_party/aws-sig-v4-test-suite/: the "AWS Signature Version 4 test suite"
+  (files .req, .creq, .sts, .authz, .sreq per case, with its LICENSE and NOTICE),
+  as kept in the botocore project, directory tests/unit/auth/aws4_testsuite of
+  https://github.com/boto/botocore, at commit
+  32302bc372dde1b6173b60f8b85d671e24a0d414 (the last commit that touched that
+  directory; the files equal those of the develop branch head when they were
+  checked). Licence: Apache-2.0 (the LICENSE and NOTICE files travel with the
+  data). Copyright Amazon.com, Inc. or its affiliates.
+  Credentials of the suite: AKIDEXAMPLE / wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY,
+  region us-east-1, service "service", date 20150830T123600Z. Upstream keeps ten
+  cases in the groups normalize-path and post-sts-token; here they sit flat.
+
+  The directory is test data only: it is read by tests at run time, never
+  embedded, never part of a binary. It is fetched by fetch-third-party.sh and
+  checked against third_party.sha256 (a file with another sum, or a file that is
+  not listed, fails TestThirdPartyManifest). When the directory is absent the
+  tests that need it skip with a message naming it, and all others run.
