@@ -942,7 +942,7 @@ headers is for the operator to learn from the **Test** button, which checks it.
 console needs the type-"compliance" confirmation and shows the retention date), `retentionDays`
 (default 3650, range 1 to 36500), `ifNoneMatch` (`auto` | `on` | `off`; `auto` uses it and falls back
 to a check-before-write when the store rejects it with 501 or 400), `caBundlePath` (PEM, optional).
-**Secret**: access key id and secret access key (and an optional session token), 6.8.
+**Secret**: access key id and secret access key (and an optional session token), 6.8. (Replaced by correction 63 of section 14.)
 
 **Submit (steps, exact):**
 
@@ -959,10 +959,10 @@ to a check-before-write when the store rejects it with 501 or 400), `caBundlePat
    body the earlier attempt succeeded (a crash before the record was written): treat as success, read
    the version as in 3. If the bytes differ: **conflict**: a different aggregate checkpoint of the
    same size exists in the bucket. State `failed`, alert `ledgerAnchorConflict` (critical), no retry,
-   no overwrite. This is exactly what rewriting history looks like to the cluster.
+   no overwrite. This is exactly what rewriting history looks like to the cluster. (Replaced by correction 63 of section 14.)
 5. Evidence: `{"endpoint": "...", "bucket": "...", "key": "...", "version_id": "...", "etag": "...",
    "lock_mode": "COMPLIANCE", "retain_until": "...", "last_modified": "...", "recorded_by": "cluster"}`.
-   `EvidenceTime` = `last_modified`.
+   `EvidenceTime` = `last_modified`. (Replaced by correction 61 of section 14.)
 
 **What the verifier checks later (7.4):** the note bytes in the evidence or fetched equal a
 well-formed signed note whose text hashes to the payload digest and whose signature verifies under
@@ -1000,7 +1000,7 @@ username and password.
    RFC 3161 requires; the certificate chains to `caBundlePath` with the validity checked **at
    `genTime`**; the CMS signature verifies (RSA PKCS#1 v1.5 or ECDSA, SHA-256 or SHA-384; others
    rejected); `genTime` is within 5 minutes of the leader's clock, else the record is accepted but the
-   alert `ledgerAnchorBehind` carries the skew.
+   alert `ledgerAnchorBehind` carries the skew. (Replaced by correction 62 of section 14.)
 5. Evidence: `{"tsa_url": "...", "token_der_b64": "...", "gen_time": "...", "serial": "...",
    "policy": "...", "recorded_by": "cluster"}`. `EvidenceTime` = `genTime`; the record is `anchored`
    at once (no upgrade).
@@ -1045,7 +1045,7 @@ number configured if smaller), `upgradeTimeoutDays` (default 7). No secret.
    not needed (whether the reference client's `stamp` adds one is not verified here).
 2. If at least `minCalendars` answered: the record is `submitted`, evidence `{"digest": d_hex,
    "calendars": [{"uri": "...", "fragment_b64": "..."}], "bitcoin": null}`; with fewer it stays
-   `pending` and is retried (a calendar that answered is not asked again; its fragment is kept).
+   `pending` and is retried (a calendar that answered is not asked again; its fragment is kept). (Replaced by correction 61 of section 14.)
 3. **Upgrade**, a job every 10 minutes for the first 3 hours and then every hour, for each
    `submitted` record: for each pending attestation in each fragment, take the commitment (the
    digest at that point of the operation tree) and `GET <uri>/timestamp/<hex commitment>`.
@@ -1056,7 +1056,7 @@ number configured if smaller), `upgradeTimeoutDays` (default 7). No secret.
    fetch Bitcoin data (no node, no explorer is trusted by the server), so the time is stated as
    "included in Bitcoin block height H" and the verifier computes the block time from a header the
    **auditor** supplies. After `upgradeTimeoutDays` without a Bitcoin attestation the record is
-   `expired` and the alert `ledgerAnchorFailed` fires.
+   `expired` and the alert `ledgerAnchorFailed` fires. (Replaced by correction 60 of section 14.)
 4. Export: the `.ots` detached timestamp file of the record is assembled from the fragments on
    demand (`downloadLedgerAnchor`) as `magic || version || file-hash-op || d || tree`, in the
    serialization of the reference library; it can be checked by the reference client too
@@ -1077,8 +1077,8 @@ that block, with an error of the order of hours (the architecture note says abou
 
 | Case | Behaviour |
 |---|---|
-| Target unreachable, timeout, 5xx, 429 | Record stays `pending`; `attempts + 1`; next attempt after `min(30 s * 2^attempts, 1 h)` with 20 percent jitter; the first success resets. `Retry-After` is honoured if larger |
-| Authentication or authorisation error (401, 403, TSA 2 "rejection" for a policy, bucket missing, lock not enabled) | `failed` after 3 attempts at 1, 5 and 15 minutes (it may be a propagation delay), alert `ledgerAnchorFailed` (critical) with the error text without any secret; needs an edit of the target or "Retry" |
+| Target unreachable, timeout, 5xx, 429 | Record stays `pending`; `attempts + 1`; next attempt after `min(30 s * 2^attempts, 1 h)` with 20 percent jitter; the first success resets. `Retry-After` is honoured if larger (Replaced by correction 64 of section 14.) |
+| Authentication or authorisation error (401, 403, TSA 2 "rejection" for a policy, bucket missing, lock not enabled) | `failed` after 3 attempts at 1, 5 and 15 minutes (it may be a propagation delay), alert `ledgerAnchorFailed` (critical) with the error text without any secret; needs an edit of the target or "Retry" (Replaced by correction 64 of section 14.) |
 | WORM conflict (4) | `failed`, no retry, alert `ledgerAnchorConflict` (critical) |
 | Target accepts but the store did not lock (3) | `failed`, alert `ledgerAnchorFailed` |
 | OpenTimestamps: fewer than `minCalendars` answer | `pending`, retried; anchored only when the minimum answered; one calendar's failure does not block the others |
@@ -2308,6 +2308,82 @@ build to the corrected rule. The verifier's README has the same list with the re
     for three seconds before the run fails with status 2. On every platform a new evidence file is
     written under a temporary name and linked into place, so that a reader never sees half of one and an
     existing file of that name is never replaced.
+74. **Who can drop the database (9.3; replaces the first two sentences of 68 and amends the second
+    invariant of 49).** A role that is not a superuser cannot remove the ledger or the protection of a
+    ledger table by any statement that runs in the database that holds it. `DROP DATABASE` from another
+    database is open to superusers, to the owner, to every role with the privileges of the owner (a
+    membership with INHERIT, directly or through a chain), and to every role that can `SET ROLE` to one of
+    those or to a superuser; a superuser as the owner is therefore not enough, and the words "in a
+    database that a superuser owns" are withdrawn. What protects a deployment: the owner is a superuser
+    role without members that are not superusers, no role that is not a superuser may `SET ROLE` to a
+    superuser, and the digests are kept outside the database. `ledger_status` reports whether such a role
+    exists and lists them (`database_droppable_by_non_superuser`, `database_droppers`), and `ledger_enable`
+    warns with the same list. It is not a finding of `ledger_verify`: it is a property of the roles that
+    changes with the next GRANT and damages nothing, and a row of `ledger_verify` means damage.
+75. **A lock of the ledger and PREPARE (adds to 67).** A transaction of a role that is not a superuser
+    and that holds a lock of the extension cannot be prepared (`0A000`): a prepared transaction would
+    keep the lock beyond every limit. A superuser may prepare; the limit never covered a superuser. With
+    `kingres_ledger.lock_hold_limit = 0` nothing is tracked.
+76. **What the limit follows (adds to 67).** The limit follows the locks per subtransaction: a lock that
+    went with a rolled back savepoint no longer counts, and the timer is cleared at commit, at abort, at
+    `COMMIT AND CHAIN` and `ROLLBACK AND CHAIN`, and when the subtransaction that took the last lock
+    aborts. The server log names the role, the locks and the limit of a session that the limit ended; the
+    client sees the same FATAL as for a session ended by an administrator.
+77. **What an identifier is (replaces the wording of 66).** An identifier is the key of a row among the
+    rows that exist: the largest identifier committed now plus one, taken under the lock of the writer
+    and read with a snapshot taken after the lock was granted. It is not used once only: after a rollback
+    the next writer takes it again, and it means a row only after the transaction that took it has
+    committed. A caller of `ledger_verify_recorded` in a longer transaction keeps the identifier it
+    returns only after the commit. The builders, `ledger_enable`, `ledger_register_table` and
+    `ledger_remove_stray` require READ COMMITTED; `ledger_verify_recorded` and the record of a write by
+    hand work at every isolation level.
+78. **One order of locks for every writer.** The table lock of `ledger_enable`, then the locks of the
+    builders, the registry, the verifications and the removals. A write by hand (a superuser with
+    `allow_manual_write`) takes all four first, and an identifier made by hand that a writer took in the
+    meantime is replaced by the next free one.
+79. **A wait for a lock of the extension can be ended.** A cancel, a timeout or a termination ends the
+    wait for any lock of the extension at once. Only the run of `ledger_verify` inside
+    `ledger_verify_recorded` is caught, and the record of a run that was cancelled is written only when
+    the lock is free.
+80. **Smaller points of the same round.** An index on `ledger_removed` ends the scan of that table under
+    the lock of the builders. A role that is not a superuser cannot revoke from PUBLIC the EXECUTE of a
+    function of the extension (`KL002`).
+81. **WORM: the time of the store and the first attempt (6.3; replaces the time bound of 63).** A
+    payload carries the time of the first attempt to anchor the checkpoint for the key (the creation of
+    the record, kept by a Retry), and every target refuses a payload without it. The time that the store
+    states for a version is never later than the clock plus the tolerance (300 seconds by default) and
+    never earlier than the first attempt less the tolerance; for a version just written it must also be
+    within the tolerance of the clock. A version of our own bytes that is complete and locked has no
+    other age limit, so a recovery after a crash, or an operator who takes a month to repair a bucket,
+    still completes the key. A store whose clock was refused for a fresh write is refused again on every
+    later attempt, because the object is found again and judged by the same rule. A store ahead of the
+    clock is refused (code `store_time_skew`); a store behind the first attempt is permanent (code
+    `store_time_early`), with a text that says it is a matter of clocks and not of credentials and what
+    to do. An existing version whose retention is earlier than the first attempt asked, less five
+    minutes, gets the retention applied and is verified again. Not closed: a store behind by more than
+    the tolerance and by less than the duration of the first submit can pass on a retry, with a time
+    within the tolerance plus thirty seconds of the first attempt; closing it needs the caller to
+    remember the refusal. The first attempt of a key is the earliest creation time among the records for
+    the same target, log and size, which the wiring must ensure.
+82. **OpenTimestamps: a claim does not end the collection (6.5; replaces the end of 60).** A record in
+    the state `claimed` keeps asking the calendars whose fragments still hold pending attestations, until
+    it is anchored with a checked header, expires, or nothing is pending. A claim that a block header
+    contradicts is dropped from the fragments as an implausible one is; a header that cannot be used, or
+    a block time ahead of the clock, contradicts nothing. When no plausible claim is left the record
+    falls back to `submitted` while another calendar can still deliver, and fails with a conflict only
+    when a claim was contradicted and nothing is left that could deliver. A `claimed` record expires
+    after four times the timeout of a submitted one. A round in which every lookup failed is retryable
+    even when every failure was permanent; only a stored fragment that cannot be read is permanent.
+83. **The limits of a payload (6.8; adds to 65).** They are those of the verifier: an origin of 1 to 255
+    bytes of UTF-8 without white space, plus signs or control characters, a size below 2^62, at most 32
+    signature lines, no line longer than 1,024 bytes. The two modules repeat the numbers, and a test of
+    the library reads them from the source of the verifier.
+84. **RFC 3161 names and the text of an alert (6.4, 6.6; adds to 62 and 64).** The name in a token
+    corresponds to the certificate when it is the subject or a name of the subject alternative name,
+    compared by decoded attribute values (any string type, case and white space folded), or the same DNS
+    name, address or other name; a token is refused only when no name of the certificate corresponds. The
+    alert for a failure is worded from the code and the text of the error and not from its class: the
+    class "refused" covers credentials and also clocks and the validity of a certificate.
 
 Of section 13: item 2 (test vectors) is settled for signed notes (the example key and note of the
 specification are in the tests; the checkpoint example has no published key), item 3 (entry bundles at
