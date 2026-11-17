@@ -35,6 +35,20 @@ kingres_columnar = shared_module('kingres_columnar',
 )
 contrib_targets += kingres_columnar
 
+# The two modules that the TAP tests use (t/kcevents, t/kcprobe) are compiled here
+# too, and never installed: a tree that cannot build them fails the build, loudly,
+# where the tests would otherwise have to build them (t/KcProbe.pm does that again,
+# with the installed headers, for a run out of tree).
+shared_module('kcevents',
+  files('t/kcevents/kcevents.c'),
+  include_directories: include_directories('t/kcevents'),
+  kwargs: pg_test_mod_args,
+)
+shared_module('kcprobe',
+  files('t/kcprobe/kcprobe.c'),
+  kwargs: pg_test_mod_args,
+)
+
 install_data(
   'kingres_columnar--0.1.sql',
   'kingres_columnar.control',
@@ -93,6 +107,9 @@ tests += {
       't/028_orphan_rows.pl',
       't/029_chain_parallel_backup.pl',
       't/030_late_stripes.pl',
+      't/031_entry_points.pl',
+      't/032_module_build.pl',
+      't/033_standby_late.pl',
     ],
   },
 }

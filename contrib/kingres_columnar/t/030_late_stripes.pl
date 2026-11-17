@@ -28,8 +28,6 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 
 my $dir = build_module('kcprobe');
-plan skip_all => 'the probe module (t/kcprobe/kcprobe.c) could not be built here: it needs a C compiler and the server headers'
-  unless defined $dir;
 
 my $node = PostgreSQL::Test::Cluster->new('collate');
 $node->init;

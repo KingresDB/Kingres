@@ -130,13 +130,15 @@ typedef enum KcPath
 	KC_PATH_CEILING_HANDOVER,	/* a hand-over was refused at the ceiling */
 	KC_PATH_REFUSED_ENDING,		/* a write was refused: the transaction state forbids an error */
 	KC_PATH_ORPHANS_CLEANED,	/* stripe rows of a file dropped after the cleanup, removed later */
+	KC_PATH_REFUSED_LIVE,		/* ... of those refusals, the ones whose top-level transaction was still alive (it then fails at its next pre-commit) */
+	KC_PATH_LOST_RAISED,		/* the error raised for a refusal of that kind */
 	KC_PATH_COUNT
 } KcPath;
 
 static const char *const kc_path_names[KC_PATH_COUNT] = {
 	"late_commit", "late_window", "pressure_flush", "own_flush", "handover_flush",
 	"size_flush", "prepared_skip", "ceiling_write", "ceiling_handover",
-	"refused_ending", "orphans_cleaned"
+	"refused_ending", "orphans_cleaned", "refused_live", "lost_raised"
 };
 
 static uint64 kc_path_hits[KC_PATH_COUNT];
@@ -144,17 +146,20 @@ static uint64 kc_path_hits[KC_PATH_COUNT];
 #define KC_PATH(p) (kc_path_hits[p]++)
 
 static Size kc_total_bytes_for_report(void);
+static int	kc_orphans_kept_for_report(void);
 
 /*
- * The rows the SQL function reports: one per path, then "bytes_held", the memory
- * the write buffers are charged for right now (not a count, never reset): the
- * number the allowance and the ceiling are about, so a test can measure what a
- * buffer, a level of subtransaction or a row costs.
+ * The rows the SQL function reports: one per path, then two that are not
+ * counts and are never reset: "bytes_held", the memory the write buffers are
+ * charged for right now (the number the allowance and the ceiling are about, so a
+ * test can measure what a buffer, a level of subtransaction or a row costs), and
+ * "orphans_kept", the number of files noted at the commit of this backend's last
+ * transaction that the next transaction deletes the stripe rows of.
  */
 int
 kc_write_path_count(void)
 {
-	return KC_PATH_COUNT + 1;
+	return KC_PATH_COUNT + 2;
 }
 
 const char *
@@ -164,6 +169,11 @@ kc_write_path_get(int i, uint64 *hits)
 	{
 		*hits = kc_total_bytes_for_report();
 		return "bytes_held";
+	}
+	if (i == KC_PATH_COUNT + 1)
+	{
+		*hits = (uint64) kc_orphans_kept_for_report();
+		return "orphans_kept";
 	}
 	*hits = kc_path_hits[i];
 	return kc_path_names[i];
@@ -1032,49 +1042,200 @@ kc_write_is_late(void)
  * made a PANIC (a critical section; the commit path after the commit record,
  * "cannot abort transaction ... it was already committed"; the abort path, "error
  * stack"; a failed assertion in the callbacks of PREPARE TRANSACTION), so the
- * access method must never raise one for a write that reaches it there; and
- * the access method cannot write at such a moment either, because writing a
- * stripe reads the catalogs and allocates memory, which PostgreSQL forbids
+ * access method must never raise one for a call that reaches it there; and
+ * it cannot do the work either, because writing a stripe or changing the
+ * catalog reads the catalogs and allocates memory, which PostgreSQL forbids
  * there as well (a write into a heap table at those moments stops a server
- * built with assertions, t/028_ending_writes.pl and the README say which).
- * What it can do is refuse without an error: kc_write_refused says so with a
- * WARNING and the caller then discards the row.  In an aborting transaction or
- * subtransaction that is exactly what the row's fate is anyway; in one that
- * is committing (XACT_EVENT_COMMIT, XACT_EVENT_PREPARE, SUBXACT_EVENT_COMMIT_SUB)
- * the row is lost, with the warning that says so, which is the least bad of
- * what is left: the alternative is a stop of the server, and the row is lost
- * with that too.
+ * built with assertions; the README says which).  What it can do is refuse
+ * without an error: kc_entry_refused is the one place that decides "may this
+ * entry point touch storage or the catalog now", and every entry point that
+ * does (all callbacks of the table access method, the SQL functions that
+ * write, the object access hook) asks it first, so that the next entry point
+ * has one function to call and the test that walks the routine (t/kcevents)
+ * fails when one has no decision recorded (kc_am_decisions in kc_am.c).
+ *
+ * What a refusal means depends on what is still possible, and the answer is
+ * one of two:
+ *
+ *	 KC_END_DECIDED  the fate of the (sub)transaction is settled: the commit
+ *	   or prepare of the top-level transaction has begun (XACT_EVENT_COMMIT,
+ *	   XACT_EVENT_PREPARE), or the transaction or subtransaction is aborting
+ *	   (XACT_EVENT_ABORT, SUBXACT_EVENT_ABORT_SUB), or no transaction runs (the
+ *	   exit of the process).  Nothing better than a WARNING exists: an aborting
+ *	   transaction loses the data anyway, and a committed one cannot be changed
+ *	   any more.
+ *
+ *	 KC_END_LIVE  the top-level transaction is still alive and can still abort
+ *	   cleanly: the commit of a subtransaction (SUBXACT_EVENT_COMMIT_SUB, and
+ *	   the release of its resources) and a critical section entered by a
+ *	   transaction in progress.  The refusal is remembered (statics, so that
+ *	   nothing is allocated) and raised as an ERROR at the next moment an error
+ *	   is allowed: the pre-commit of the subtransaction that would have owned
+ *	   the lost data, the pre-commit or pre-prepare of the top-level
+ *	   transaction, or the next write to a columnar table.  The transaction
+ *	   then cannot commit having lost a row or an operation.  The WARNING
+ *	   still comes first, because it names the cause at the moment it happens.
  *
  * The states: IsTransactionState() is true only while the transaction is in
  * progress; the callbacks at pre-commit, pre-prepare, the start of a
  * subtransaction and the first phase of its commit are in that state, and a
- * write there is done (kc_write_late and the buffers).
+ * call there is served (kc_write_late and the buffers).  The commit or the
+ * abort of a subtransaction is told apart by what this module saw: it saw
+ * PRE_COMMIT_SUB before every COMMIT_SUB, so a subtransaction that passed it
+ * and has not ended is committing, whichever module's callback runs first;
+ * once this module's own callback has run it knows the end (kc_sub_ended).
+ * An abort after the pre-commit (another module's error between the two) is
+ * taken for a commit until this module's ABORT_SUB callback runs, which
+ * forgets the refusal that belonged to the subtransaction.
  */
+typedef enum KcEnding
+{
+	KC_END_NONE,				/* an error is allowed */
+	KC_END_DECIDED,				/* the fate of the transaction is settled */
+	KC_END_LIVE					/* the top-level transaction can still abort */
+} KcEnding;
+
+/* the subtransaction whose PRE_COMMIT_SUB was seen and whose end was not */
+static SubTransactionId kc_sub_precommitted = InvalidSubTransactionId;
+
+/* the end of a subtransaction this module's callback saw; valid while it is the current one */
+static SubTransactionId kc_sub_ended = InvalidSubTransactionId;
+static SubTransactionId kc_sub_ended_parent = InvalidSubTransactionId;
+static bool kc_sub_ended_committed = false;
+
+/*
+ * A call refused while the top-level transaction was alive: how many, the
+ * outermost subtransaction that owns what was lost (it and every one around it
+ * cannot commit; one that aborts forgets it), and the first one's name, in
+ * static memory because it is set where nothing may be allocated.
+ */
+static int	kc_lost_count = 0;
+static SubTransactionId kc_lost_owner = InvalidSubTransactionId;
+static char kc_lost_what[48];
+static char kc_lost_name[NAMEDATALEN];
+
+static KcEnding
+kc_ending(void)
+{
+	if (IsTransactionState())
+		return CritSectionCount > 0 ? KC_END_LIVE : KC_END_NONE;
+	if (GetCurrentTransactionNestLevel() > 1)
+	{
+		SubTransactionId cur = GetCurrentSubTransactionId();
+
+		if (kc_sub_ended == cur)
+			return kc_sub_ended_committed ? KC_END_LIVE : KC_END_DECIDED;
+		if (kc_sub_precommitted == cur)
+			return KC_END_LIVE;
+	}
+	return KC_END_DECIDED;
+}
+
 static bool
 kc_write_state_forbids_error(void)
 {
-	return CritSectionCount > 0 || !IsTransactionState();
+	return kc_ending() != KC_END_NONE;
+}
+
+static void
+kc_lost_clear(void)
+{
+	kc_lost_count = 0;
+	kc_lost_owner = InvalidSubTransactionId;
+}
+
+/* the end of a top-level transaction: nothing of the subtransactions is left */
+static void
+kc_ending_reset(void)
+{
+	kc_lost_clear();
+	kc_sub_precommitted = InvalidSubTransactionId;
+	kc_sub_ended = InvalidSubTransactionId;
+}
+
+/* the error that a refusal of the LIVE kind turns into where one is allowed */
+static pg_noreturn void
+kc_lost_raise(void)
+{
+	KC_PATH(KC_PATH_LOST_RAISED);
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+			 kc_lost_name[0] != 0
+			 ? errmsg("a call on columnar table \"%s\" was refused earlier in this transaction, so it cannot commit",
+					  kc_lost_name)
+			 : errmsg("a call to %s was refused earlier in this transaction, so it cannot commit",
+					  kc_lost_what),
+			 errdetail("%d call(s) were refused at a moment where the server forbids an error and the transaction was still open (the commit of a subtransaction, or a critical section); the first was \"%s\".  What they were to do was not done.",
+					   kc_lost_count, kc_lost_what),
+			 errhint("Roll back, and write only at XACT_EVENT_PRE_COMMIT or XACT_EVENT_PRE_PREPARE or earlier.")));
 }
 
 /*
- * Whether a write must be refused now (see above); warns and counts when it
- * must.  Never raises an error.  what is "row" or "rows".
+ * Whether the call named what, on the columnar table (or other object) named
+ * name (NULL: none), must be refused now (see above); warns and counts when it
+ * must.  Never raises an error where one is forbidden.  fails_txn says that
+ * what the call was to do cannot be skipped without the transaction being wrong
+ * (a write, a truncate, a new file): a refusal in a live transaction makes it
+ * fail at its next pre-commit, and a call of this kind after such a refusal
+ * raises at once.  A call whose skipping loses nothing (a vacuum, a note about a
+ * dropped file, the clean-up of leftovers, which later transactions repeat)
+ * passes false.  The refusal path allocates nothing of its own (static
+ * counters and strings; the message is formatted by ereport in ErrorContext, which
+ * PostgreSQL allows in a critical section).
  */
+bool
+kc_entry_refused(const char *what, const char *name, bool fails_txn)
+{
+	KcEnding	ending = kc_ending();
+
+	if (ending == KC_END_NONE)
+	{
+		if (fails_txn && kc_lost_count > 0)
+			kc_lost_raise();
+		return false;
+	}
+	KC_PATH(KC_PATH_REFUSED_ENDING);
+	/*
+	 * The warning first: a hook of another module (emit_log_hook) can raise an
+	 * error from it, which at the commit of a subtransaction aborts that
+	 * subtransaction, and then nothing is lost that needs remembering.
+	 */
+	ereport(WARNING,
+			(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+			 errmsg("%s refused%s%s%s: %s",
+					what,
+					name ? " on columnar table \"" : "", name ? name : "", name ? "\"" : "",
+					CritSectionCount > 0 ? "inside a critical section" :
+					"the transaction is not in progress"),
+			 errdetail(ending == KC_END_LIVE && fails_txn
+					   ? "Code of another module called the table at a moment where the server forbids an error, and the table cannot be changed then: in a critical section, or at the commit of a subtransaction.  Nothing was done; the transaction is still open and fails with an error at its next pre-commit."
+					   : "Code of another module called the table at a moment where the server forbids an error, and the table cannot be changed then: in a critical section, or after the commit or abort of the transaction or subtransaction has begun (XACT_EVENT_COMMIT, XACT_EVENT_PREPARE, XACT_EVENT_ABORT, SUBXACT_EVENT_ABORT_SUB, the release of resources).  Nothing was done; if the transaction was committing, the data is lost."),
+			 errhint("Write at XACT_EVENT_PRE_COMMIT or XACT_EVENT_PRE_PREPARE, or in a transaction of its own.")));
+	if (ending == KC_END_LIVE && fails_txn)
+	{
+		SubTransactionId owner = GetCurrentSubTransactionId();
+
+		KC_PATH(KC_PATH_REFUSED_LIVE);
+		if (kc_sub_ended == owner && kc_sub_ended_committed)
+			owner = kc_sub_ended_parent;
+		if (kc_lost_count == 0)
+		{
+			strlcpy(kc_lost_what, what, sizeof(kc_lost_what));
+			strlcpy(kc_lost_name, name ? name : "", sizeof(kc_lost_name));
+			kc_lost_owner = owner;
+		}
+		else if (owner < kc_lost_owner)
+			kc_lost_owner = owner;
+		kc_lost_count++;
+	}
+	return true;
+}
+
+/* the same, for a call on a relation */
 bool
 kc_write_refused(Relation rel, const char *what)
 {
-	if (!kc_write_state_forbids_error())
-		return false;
-	KC_PATH(KC_PATH_REFUSED_ENDING);
-	ereport(WARNING,
-			(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
-			 errmsg("%s not written to columnar table \"%s\": %s",
-					what, RelationGetRelationName(rel),
-					CritSectionCount > 0 ? "inside a critical section" :
-					"the transaction is not in progress"),
-			 errdetail("Code of another module wrote to the table at a moment where the server forbids an error and the table cannot be written: in a critical section, or after the commit or abort of the transaction or subtransaction has begun (XACT_EVENT_COMMIT, XACT_EVENT_PREPARE, XACT_EVENT_ABORT, SUBXACT_EVENT_COMMIT_SUB, SUBXACT_EVENT_ABORT_SUB, the release of resources).  Nothing was stored; if the transaction was committing, the data is lost."),
-			 errhint("Write at XACT_EVENT_PRE_COMMIT or XACT_EVENT_PRE_PREPARE, or in a transaction of its own.")));
-	return true;
+	return kc_entry_refused(what, RelationGetRelationName(rel), true);
 }
 
 /*
@@ -1181,7 +1342,7 @@ kc_write_rows(Relation rel, TupleTableSlot **slots, int nslots, CommandId cid)
 {
 	int			i;
 
-	if (nslots > 0 && kc_write_refused(rel, "rows"))
+	if (nslots > 0 && kc_write_refused(rel, "multi insert"))
 		return;
 	if (nslots > 0 && kc_write_is_late())
 	{
@@ -1223,7 +1384,7 @@ kc_write_row_values(Relation rel, Datum *vals, bool *nulls, CommandId cid)
 	MemoryContext old = CurrentMemoryContext;
 	Size		before = kc_total_bytes;
 
-	if (kc_write_refused(rel, "row"))
+	if (kc_write_refused(rel, "insert"))
 		return false;
 	kc_write_check_state(rel);
 
@@ -2408,50 +2569,61 @@ kc_flush_all(void)
  * columnar_check(true), which find every such row.  At most KC_ORPHAN_MAX files
  * are kept; any beyond are left to the same two.
  */
-#define KC_ORPHAN_MAX	10000
+#define KC_ORPHAN_MAX	KC_ORPHAN_NOTES_MAX
 
-static List *kc_orphans = NIL;
+/*
+ * The kept files live in static memory, an array that is never allocated or
+ * freed: they are noted at XACT_EVENT_COMMIT, where an allocation that fails is
+ * a PANIC, so that moment moves 24 bytes per file and nothing else.  The array
+ * is bss: pages that are never written are never made by the system.
+ */
+static KcReplaced kc_orphans[KC_ORPHAN_MAX];
+static int	kc_orphans_n = 0;
 static bool kc_orphans_adopted = false;
+
+static int
+kc_orphans_kept_for_report(void)
+{
+	return kc_orphans_n;
+}
 
 static void
 kc_orphans_keep(void)
 {
 	ListCell   *lc;
-	MemoryContext old;
 
 	if (kc_replaced == NIL || !kc_commit_flushed)
 		return;
-	old = MemoryContextSwitchTo(TopMemoryContext);
+#ifdef USE_ASSERT_CHECKING
+	/* a build with assertions traps an allocation here, as it would in the critical section it stands for */
+	START_CRIT_SECTION();
+#endif
 	foreach(lc, kc_replaced)
 	{
-		KcReplaced *r = lfirst(lc);
-		KcReplaced *c;
-
-		if (list_length(kc_orphans) >= KC_ORPHAN_MAX)
+		if (kc_orphans_n >= kc_guc_orphan_notes_max)
 			break;
-		c = palloc(sizeof(KcReplaced));
-		*c = *r;
-		kc_orphans = lappend(kc_orphans, c);
+		kc_orphans[kc_orphans_n++] = *((KcReplaced *) lfirst(lc));
 	}
-	MemoryContextSwitchTo(old);
+#ifdef USE_ASSERT_CHECKING
+	END_CRIT_SECTION();
+#endif
 }
 
 /* make the kept files part of this transaction's notes, to be cleaned with them */
 static void
 kc_orphans_adopt(void)
 {
-	ListCell   *lc;
+	int			i;
 	MemoryContext old;
 
-	if (kc_orphans == NIL)
+	if (kc_orphans_n == 0)
 		return;
 	old = MemoryContextSwitchTo(TopTransactionContext);
-	foreach(lc, kc_orphans)
+	for (i = 0; i < kc_orphans_n; i++)
 	{
-		KcReplaced *r = lfirst(lc);
 		KcReplaced *c = palloc(sizeof(KcReplaced));
 
-		*c = *r;
+		*c = kc_orphans[i];
 		c->subid = GetCurrentSubTransactionId();
 		kc_replaced = lappend(kc_replaced, c);
 	}
@@ -2464,10 +2636,7 @@ static void
 kc_orphans_done(void)
 {
 	if (kc_orphans_adopted)
-	{
-		list_free_deep(kc_orphans);
-		kc_orphans = NIL;
-	}
+		kc_orphans_n = 0;
 	kc_orphans_adopted = false;
 }
 
@@ -2478,6 +2647,13 @@ kc_xact_callback(XactEvent event, void *arg)
 	{
 		case XACT_EVENT_PRE_COMMIT:
 		case XACT_EVENT_PRE_PREPARE:
+			/*
+			 * A call was refused while this transaction was alive (the commit
+			 * of a subtransaction, a critical section): it cannot commit.  An
+			 * error is allowed here, and it is the last moment that one is.
+			 */
+			if (kc_lost_count > 0)
+				kc_lost_raise();
 			/*
 			 * Callbacks of other modules that run after this one can still
 			 * write: from here a write goes to a stripe at once
@@ -2513,12 +2689,14 @@ kc_xact_callback(XactEvent event, void *arg)
 			kc_orphans_keep();
 			kc_replaced = NIL;
 			kc_state_reset();
+			kc_ending_reset();
 			break;
 		case XACT_EVENT_PREPARE:
 		case XACT_EVENT_ABORT:
 			kc_orphans_adopted = false;
 			kc_replaced = NIL;
 			kc_state_reset();
+			kc_ending_reset();
 			break;
 		default:
 			break;
@@ -3109,6 +3287,41 @@ static void
 kc_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 					SubTransactionId parentSubid, void *arg)
 {
+	/*
+	 * What the refusal rule needs to know (kc_ending), kept even when this
+	 * module has no buffers: the first thing, so that a callback of another
+	 * module that runs after this one finds the end of the subtransaction
+	 * recorded.
+	 */
+	switch (event)
+	{
+		case SUBXACT_EVENT_PRE_COMMIT_SUB:
+			/* a refusal that this subtransaction owns: it cannot commit */
+			if (kc_lost_count > 0 && kc_lost_owner == mySubid)
+				kc_lost_raise();
+			kc_sub_precommitted = mySubid;
+			break;
+		case SUBXACT_EVENT_COMMIT_SUB:
+			kc_sub_ended = mySubid;
+			kc_sub_ended_parent = parentSubid;
+			kc_sub_ended_committed = true;
+			kc_sub_precommitted = InvalidSubTransactionId;
+			/* what it lost is now the parent's, which cannot commit either */
+			if (kc_lost_count > 0 && kc_lost_owner == mySubid)
+				kc_lost_owner = parentSubid;
+			break;
+		case SUBXACT_EVENT_ABORT_SUB:
+			kc_sub_ended = mySubid;
+			kc_sub_ended_parent = parentSubid;
+			kc_sub_ended_committed = false;
+			kc_sub_precommitted = InvalidSubTransactionId;
+			/* what it lost goes with it */
+			if (kc_lost_count > 0 && kc_lost_owner == mySubid)
+				kc_lost_clear();
+			break;
+		default:
+			break;
+	}
 	kc_replaced_subxact(event, mySubid, parentSubid);
 	if (kc_states == NULL)
 		return;
