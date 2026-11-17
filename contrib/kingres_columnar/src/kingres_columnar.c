@@ -53,6 +53,7 @@ PG_FUNCTION_INFO_V1(kingres_columnar_info);
 PG_FUNCTION_INFO_V1(kingres_columnar_stripes);
 PG_FUNCTION_INFO_V1(kingres_columnar_compact);
 PG_FUNCTION_INFO_V1(kingres_columnar_check);
+PG_FUNCTION_INFO_V1(kingres_columnar_check_clean);
 PG_FUNCTION_INFO_V1(kingres_columnar_reconcile);
 PG_FUNCTION_INFO_V1(kingres_columnar_write_paths);
 PG_FUNCTION_INFO_V1(kingres_columnar_note_rewrite);
@@ -240,6 +241,39 @@ kc_open_columnar(Oid relid, LOCKMODE lockmode, bool need_owner)
 	return rel;
 }
 
+/*
+ * The table of a function that only reads, opened with AccessShareLock.  Where
+ * the server forbids an error (the end of a transaction, a critical section: a
+ * module of another extension calls the function there) a lock that has to be
+ * waited for is not taken: the wait can end in a deadlock error, which is a
+ * PANIC there, and the transaction cannot be cancelled.  The lock is asked for
+ * without waiting; a table that is locked exclusively gets a WARNING and the
+ * answer "nothing" (NULL, or no rows), which the caller sees (C9-03).  Where an
+ * error is allowed this is kc_open_columnar.
+ */
+static Relation
+kc_open_columnar_read(Oid relid, const char *what)
+{
+	if (kc_error_forbidden())
+	{
+		Relation	rel;
+
+		if (!ConditionalLockRelationOid(relid, AccessShareLock))
+		{
+			ereport(WARNING,
+					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+					 errmsg("%s refused: the table is locked exclusively by another transaction and the server forbids an error here, where a wait could end in one", what),
+					 errdetail("Nothing was read; the answer is empty (null or no rows).")));
+			return NULL;
+		}
+		/* the lock is ours now: opening takes it again without waiting, and the extra one goes at once */
+		rel = kc_open_columnar(relid, AccessShareLock, false);
+		UnlockRelationOid(relid, AccessShareLock);
+		return rel;
+	}
+	return kc_open_columnar(relid, AccessShareLock, false);
+}
+
 /* ------------------------------------------------------------------------
  * Options
  * ------------------------------------------------------------------------
@@ -332,12 +366,14 @@ Datum
 kingres_columnar_options(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
-	Relation	rel = kc_open_columnar(relid, AccessShareLock, false);
+	Relation	rel = kc_open_columnar_read(relid, "columnar_options");
 	KcMetaData	m;
 	TupleDesc	tupdesc;
 	Datum		values[4];
 	bool		nulls[4] = {false, false, false, false};
 
+	if (rel == NULL)
+		PG_RETURN_NULL();
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 	kc_meta_read(rel, &m);
@@ -358,12 +394,12 @@ Datum
 kingres_columnar_info(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
-	Relation	rel = kc_open_columnar(relid, AccessShareLock, false);
+	Relation	rel = kc_open_columnar_read(relid, "columnar_info");
 	TupleDesc	tupdesc;
 	Datum		values[6];
 	bool		nulls[6] = {false, false, false, false, false, false};
 	bool		mvcc;
-	Snapshot	cs = kc_catalog_snapshot(GetActiveSnapshot(), &mvcc);
+	Snapshot	cs;
 	int			n;
 	int			i;
 	KcStripeInfo *s;
@@ -373,6 +409,9 @@ kingres_columnar_info(PG_FUNCTION_ARGS)
 				disk = 0,
 				raw = 0;
 
+	if (rel == NULL)
+		PG_RETURN_NULL();
+	cs = kc_catalog_snapshot(GetActiveSnapshot(), &mvcc);
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 	s = kc_catalog_load(rel, cs, &n);
@@ -402,14 +441,18 @@ kingres_columnar_stripes(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	Relation	rel = kc_open_columnar(relid, AccessShareLock, false);
+	Relation	rel;
 	bool		mvcc;
-	Snapshot	cs = kc_catalog_snapshot(GetActiveSnapshot(), &mvcc);
+	Snapshot	cs;
 	int			n;
 	int			i;
 	KcStripeInfo *s;
 
 	InitMaterializedSRF(fcinfo, 0);
+	rel = kc_open_columnar_read(relid, "columnar_stripes");
+	if (rel == NULL)
+		return (Datum) 0;
+	cs = kc_catalog_snapshot(GetActiveSnapshot(), &mvcc);
 	s = kc_catalog_load(rel, cs, &n);
 	for (i = 0; i < n; i++)
 	{
@@ -571,8 +614,39 @@ kingres_columnar_finish_rewrites(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(n);
 }
 
+/*
+ * Where the rows of a check go: into the result set of columnar_check, or only
+ * counted (columnar_check_clean, which answers true when there is none).
+ */
+typedef struct KcCheckSink
+{
+	ReturnSetInfo *rsinfo;		/* NULL: count only */
+	int64		rows;
+} KcCheckSink;
+
 static void
-kc_check_one(Oid relid, bool fix, ReturnSetInfo *rsinfo)
+kc_check_row(KcCheckSink *sink, const char *name, Oid relid, const char *detail)
+{
+	Datum		values[3];
+	bool		nulls[3] = {false, false, false};
+
+	sink->rows++;
+	if (sink->rsinfo == NULL)
+		return;
+	values[0] = CStringGetTextDatum(name);
+	if (OidIsValid(relid))
+		values[1] = ObjectIdGetDatum(relid);
+	else
+	{
+		values[1] = (Datum) 0;
+		nulls[1] = true;
+	}
+	values[2] = CStringGetTextDatum(detail);
+	tuplestore_putvalues(sink->rsinfo->setResult, sink->rsinfo->setDesc, values, nulls);
+}
+
+static void
+kc_check_one(Oid relid, bool fix, KcCheckSink *sink)
 {
 		LOCKMODE	lockmode = fix ? ShareUpdateExclusiveLock : AccessShareLock;
 		Relation	rel;
@@ -587,17 +661,15 @@ kc_check_one(Oid relid, bool fix, ReturnSetInfo *rsinfo)
 		 * Never wait for a lock: a prepared transaction that holds a table
 		 * exclusively (a prepared TRUNCATE, a rewrite) keeps it until someone
 		 * ends it, and the check would wait with it, without end.  A table that
-		 * cannot be locked now is reported as not checked and the rest goes on.
+		 * cannot be locked now is reported as not checked, which is a row like
+		 * any other (C9-04: a caller that tests for the absence of rows, or
+		 * asks columnar_check_clean, cannot mistake it for a clean table),
+		 * and the rest goes on.
 		 */
 		if (!ConditionalLockRelationOid(relid, lockmode))
 		{
-			Datum		values[3];
-			bool		nulls[3] = {false, false, false};
-
-			values[0] = CStringGetTextDatum("not_checked");
-			values[1] = ObjectIdGetDatum(relid);
-			values[2] = CStringGetTextDatum("the table is locked by another transaction, possibly a prepared one, and was not checked; end that transaction and run the check again");
-			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+			kc_check_row(sink, "not_checked", relid,
+						 "the table is locked by another transaction (a prepared one, or ordinary DDL or VACUUM FULL that is running) and was not checked; this is not a clean result: end or wait for that transaction and run the check again");
 			return;
 		}
 		rel = try_relation_open(relid, NoLock);
@@ -616,8 +688,6 @@ kc_check_one(Oid relid, bool fix, ReturnSetInfo *rsinfo)
 		{
 			const char *problem = NULL;
 			char		detail[256];
-			Datum		values[3];
-			bool		nulls[3] = {false, false, false};
 
 			if (s[i].first_block + s[i].block_count > nblocks)
 			{
@@ -664,10 +734,7 @@ kc_check_one(Oid relid, bool fix, ReturnSetInfo *rsinfo)
 			}
 			if (problem == NULL)
 				continue;
-			values[0] = CStringGetTextDatum(problem);
-			values[1] = ObjectIdGetDatum(RelationGetRelid(rel));
-			values[2] = CStringGetTextDatum(detail);
-			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+			kc_check_row(sink, problem, RelationGetRelid(rel), detail);
 			if (fix && strcmp(problem, "stripe_beyond_file") == 0)
 				(void) kc_catalog_delete_stripe(kc_rel_ident(rel)->uid, s[i].stripe_id);
 		}
@@ -679,7 +746,7 @@ kc_check_one(Oid relid, bool fix, ReturnSetInfo *rsinfo)
  * reported as a row, not as an error that hides every other relation.
  */
 static void
-kc_check_guarded(Oid relid, bool fix, ReturnSetInfo *rsinfo)
+kc_check_guarded(Oid relid, bool fix, KcCheckSink *sink)
 {
 	MemoryContext oldcxt = CurrentMemoryContext;
 	ResourceOwner oldowner = CurrentResourceOwner;
@@ -688,7 +755,7 @@ kc_check_guarded(Oid relid, bool fix, ReturnSetInfo *rsinfo)
 	MemoryContextSwitchTo(oldcxt);
 	PG_TRY();
 	{
-		kc_check_one(relid, fix, rsinfo);
+		kc_check_one(relid, fix, sink);
 		ReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(oldcxt);
 		CurrentResourceOwner = oldowner;
@@ -696,8 +763,6 @@ kc_check_guarded(Oid relid, bool fix, ReturnSetInfo *rsinfo)
 	PG_CATCH();
 	{
 		ErrorData  *ed;
-		Datum		values[3];
-		bool		nulls[3] = {false, false, false};
 
 		MemoryContextSwitchTo(oldcxt);
 		ed = CopyErrorData();
@@ -705,10 +770,7 @@ kc_check_guarded(Oid relid, bool fix, ReturnSetInfo *rsinfo)
 		RollbackAndReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(oldcxt);
 		CurrentResourceOwner = oldowner;
-		values[0] = CStringGetTextDatum("unreadable");
-		values[1] = ObjectIdGetDatum(relid);
-		values[2] = CStringGetTextDatum(ed->message);
-		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+		kc_check_row(sink, "unreadable", relid, ed->message);
 	}
 	PG_END_TRY();
 }
@@ -719,31 +781,15 @@ kc_check_guarded(Oid relid, bool fix, ReturnSetInfo *rsinfo)
  * their file (fix deletes the catalog row: the data is unreadable), and
  * stripes whose first page does not belong to them (reported only).
  */
-Datum
-kingres_columnar_check(PG_FUNCTION_ARGS)
+static void
+kc_check_run(bool fix, KcCheckSink *sink)
 {
-	bool		fix = PG_GETARG_BOOL(0);
-	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	Relation	pgclass;
 	TableScanDesc scan;
 	HeapTuple	tup;
 	List	   *relids = NIL;
 	ListCell   *lc;
 	Oid			amoid = kc_am_oid();
-
-	if (!superuser())
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be superuser to run columnar_check")));
-	if (fix && RecoveryInProgress())
-		ereport(ERROR,
-				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
-				 errmsg("cannot repair columnar tables during recovery")));
-	InitMaterializedSRF(fcinfo, 0);
-
-	/* the repair deletes catalog rows: refused where the server forbids an error */
-	if (fix && kc_entry_refused("columnar_check(true)", NULL, false))
-		return (Datum) 0;
 
 	pgclass = table_open(RelationRelationId, AccessShareLock);
 	scan = table_beginscan_catalog(pgclass, 0, NULL);
@@ -760,13 +806,11 @@ kingres_columnar_check(PG_FUNCTION_ARGS)
 
 	foreach(lc, relids)
 	{
-		kc_check_guarded(lfirst_oid(lc), fix, rsinfo);
+		kc_check_guarded(lfirst_oid(lc), fix, sink);
 	}
 
 	{
 		int			d;
-		Datum		values[3];
-		bool		nulls[3] = {false, true, false};
 
 		if (fix)
 			d = kc_catalog_reconcile();
@@ -778,13 +822,66 @@ kingres_columnar_check(PG_FUNCTION_ARGS)
 
 			snprintf(detail, sizeof(detail), "%d stripe catalog rows belong to files no relation uses%s",
 					 d, fix ? " (deleted)" : "");
-			values[0] = CStringGetTextDatum("orphan_catalog_rows");
-			values[1] = (Datum) 0;
-			values[2] = CStringGetTextDatum(detail);
-			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+			kc_check_row(sink, "orphan_catalog_rows", InvalidOid, detail);
 		}
 	}
+}
+
+/*
+ * columnar_check(fix) is a read of the catalog and the files, except that it
+ * begins a subtransaction for each table, and its own decision follows from
+ * that (C9-03): where the server cannot begin one it is refused with a WARNING
+ * and the answer is empty (kc_subxact_refused), which is not an answer that
+ * the tables are clean, and the warning says so.  The superuser test comes
+ * after the refusal because an error is not allowed at those moments.
+ */
+Datum
+kingres_columnar_check(PG_FUNCTION_ARGS)
+{
+	bool		fix = PG_GETARG_BOOL(0);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	KcCheckSink sink;
+
+	if (kc_subxact_refused(fix ? "columnar_check(true)" : "columnar_check(false)"))
+		return (Datum) 0;
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to run columnar_check")));
+	if (fix && RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("cannot repair columnar tables during recovery")));
+	InitMaterializedSRF(fcinfo, 0);
+	sink.rsinfo = rsinfo;
+	sink.rows = 0;
+	kc_check_run(fix, &sink);
 	return (Datum) 0;
+}
+
+/*
+ * columnar_check_clean(): the strict form (C9-04).  True only when every
+ * columnar table was checked and nothing was found: it is false for any row
+ * columnar_check() would return, a table that could not be locked
+ * (not_checked) included, so that a script that asks "is it clean" cannot pass
+ * on a table that was not looked at.  Refused where a subtransaction cannot be
+ * begun (false, with the warning).
+ */
+Datum
+kingres_columnar_check_clean(PG_FUNCTION_ARGS)
+{
+	KcCheckSink sink;
+
+	if (kc_subxact_refused("columnar_check_clean"))
+		PG_RETURN_BOOL(false);
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to run columnar_check_clean")));
+	sink.rsinfo = NULL;
+	sink.rows = 0;
+	kc_check_run(false, &sink);
+	PG_RETURN_BOOL(sink.rows == 0);
 }
 
 /*
@@ -796,9 +893,12 @@ Datum
 kingres_columnar_identity(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
-	Relation	rel = kc_open_columnar(relid, AccessShareLock, false);
-	uint64		uid = kc_rel_ident(rel)->uid;
+	Relation	rel = kc_open_columnar_read(relid, "columnar_identity");
+	uint64		uid;
 
+	if (rel == NULL)
+		PG_RETURN_NULL();
+	uid = kc_rel_ident(rel)->uid;
 	relation_close(rel, AccessShareLock);
 	PG_RETURN_INT64((int64) uid);
 }
@@ -815,9 +915,11 @@ Datum
 kingres_columnar_creating_xid(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
-	Relation	rel = kc_open_columnar(relid, AccessShareLock, false);
+	Relation	rel = kc_open_columnar_read(relid, "columnar_creating_xid");
 	KcMetaData	m;
 
+	if (rel == NULL)
+		PG_RETURN_NULL();
 	kc_meta_read(rel, &m);
 	relation_close(rel, AccessShareLock);
 	PG_RETURN_TRANSACTIONID(m.created_xid);
@@ -835,9 +937,11 @@ Datum
 kingres_columnar_table_xid(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
-	Relation	rel = kc_open_columnar(relid, AccessShareLock, false);
+	Relation	rel = kc_open_columnar_read(relid, "columnar_table_xid");
 	KcMetaData	m;
 
+	if (rel == NULL)
+		PG_RETURN_NULL();
 	kc_meta_read(rel, &m);
 	relation_close(rel, AccessShareLock);
 	PG_RETURN_TRANSACTIONID(m.table_xid);

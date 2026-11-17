@@ -16,6 +16,12 @@
 #
 # It takes several minutes; KC_SKIP_WRAPAROUND=1 skips it.
 #
+# The waits for autovacuum are bounded for a busy machine (15 minutes each, not the
+# 3 of poll_query_until), autovacuum logs every run (log_autovacuum_min_duration = 0),
+# and a wait that gives up says what the log shows autovacuum did with the table: it
+# ran and did not advance relfrozenxid (a defect of relation_vacuum), or it did not
+# run in time (a machine too slow), so a failure is never ambiguous.
+#
 # Portions Copyright (c) 2026, RooyeKhat Media Co
 # SPDX-License-Identifier: AGPL-3.0-only
 
@@ -37,6 +43,7 @@ autovacuum_naptime = 1s
 autovacuum_freeze_max_age = 150000000
 vacuum_freeze_min_age = 1000000
 log_min_messages = warning
+log_autovacuum_min_duration = 0
 });
 $node->start;
 
@@ -64,6 +71,30 @@ my $has_fn = $node->safe_psql('postgres',
 	q{SELECT count(*) FROM pg_proc WHERE proname = 'columnar_creating_xid'});
 cmp_ok($x, '>', 3, "the table was created by transaction $x");
 
+# wait for a condition, up to 15 minutes; on failure die with what autovacuum did with table c
+sub wait_for
+{
+	my ($sql, $what) = @_;
+	my $deadline = time() + 900;
+	while (time() < $deadline)
+	{
+		return 1 if $node->safe_psql('postgres', $sql) eq 't';
+		sleep 1;
+	}
+	# The columnar vacuum prints no "automatic vacuum of table" line, so what the statistics say
+	# is what tells whether autovacuum visited the table (the log lines are shown as well)
+	my $stat = $node->safe_psql('postgres',
+		q{SELECT autovacuum_count || ' automatic vacuum(s), last at ' || coalesce(last_autovacuum::text, 'never') || ', age(relfrozenxid) ' || (SELECT age(relfrozenxid) FROM pg_class WHERE relname = 'c') FROM pg_stat_user_tables WHERE relname = 'c'});
+	my $ran = $stat =~ /^[1-9]/;
+	my @lines = grep { /automatic (?:aggressive )?vacuum (?:to prevent wraparound )?of table "[^"]*\.c":/ } split /\n/, slurp_file($node->logfile);
+	diag("log lines about the table: " . (@lines ? join("\n", @lines) : 'none'));
+	my $says = $ran
+	  ? "autovacuum RAN on the table ($stat) and relfrozenxid did not advance: a defect of relation_vacuum"
+	  : "autovacuum did not visit the table in time ($stat): a machine too slow, not a defect of the code";
+	diag("load: " . (-r '/proc/loadavg' ? slurp_file('/proc/loadavg') : 'unknown'));
+	die "$what; $says";
+}
+
 sub current_xid
 {
 	return $node->safe_psql('postgres', q{SELECT pg_current_xact_id()::text::bigint});
@@ -76,12 +107,10 @@ sub consume_to
 	while ($target - current_xid() > 100_000_000)
 	{
 		$node->safe_psql('postgres', 'SELECT consume_xids(100000000)');
-		$node->poll_query_until('postgres',
-			q{SELECT age(relfrozenxid) < 140000000 FROM pg_class WHERE relname = 'c'})
-		  or die 'autovacuum did not advance relfrozenxid of the columnar table';
-		$node->poll_query_until('postgres',
-			q{SELECT age(datfrozenxid) < 400000000 FROM pg_database WHERE datname = 'postgres'})
-		  or die 'datfrozenxid did not advance';
+		wait_for(q{SELECT age(relfrozenxid) < 140000000 FROM pg_class WHERE relname = 'c'},
+			'autovacuum did not advance relfrozenxid of the columnar table');
+		wait_for(q{SELECT age(datfrozenxid) < 400000000 FROM pg_database WHERE datname = 'postgres'},
+			'datfrozenxid did not advance');
 	}
 	my $left = $target - current_xid();
 	$node->safe_psql('postgres', "SELECT consume_xids($left)") if $left > 0;

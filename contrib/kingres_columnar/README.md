@@ -58,7 +58,8 @@ and use `kingres.columnar_compact` afterwards.
 | `kingres.columnar_info(rel)` | Stripes, chunk groups, rows, bytes on disk, uncompressed bytes, ratio. |
 | `kingres.columnar_stripes(rel)` | One row per visible stripe. |
 | `kingres.columnar_compact(rel, min_rows)` | Merge stripes with fewer than `min_rows` rows (default a quarter of the stripe size); returns the number of stripes written. Owner only. It changes nothing logically: for every transaction, the one that calls it and every other, the rows each snapshot sees are the same before and after, and under SERIALIZABLE it creates no dependency (see "Isolation"). |
-| `kingres.columnar_check(fix)` | Superuser. Reports catalog rows of files nobody uses, stripes beyond the end of the file, stripes whose first page is not theirs, stripes with more rows than the developer setting `max_stripe_rows` lets a stripe have today (`stripe_over_row_limit`: readable, a rewrite writes them again), and relations that cannot be read (`unreadable`, with the reason). `fix` deletes the first two kinds. It never waits for a lock: a table that another transaction holds (a prepared `TRUNCATE` or rewrite keeps its lock until someone ends it) is reported as `not_checked`, with the reason, and the rest is checked. |
+| `kingres.columnar_check(fix)` | Superuser. Reports catalog rows of files nobody uses, stripes beyond the end of the file, stripes whose first page is not theirs, stripes with more rows than the developer setting `max_stripe_rows` lets a stripe have today (`stripe_over_row_limit`: readable, a rewrite writes them again), and relations that cannot be read (`unreadable`, with the reason). `fix` deletes the first two kinds. It never waits for a lock: a table that another transaction holds in a conflicting mode (a prepared `TRUNCATE` or rewrite keeps its lock until someone ends it; ordinary DDL, `VACUUM FULL` or a `LOCK TABLE` that is running does the same for its duration) is reported as `not_checked`, with the reason, and the rest is checked. **What a caller must look for: any row at all means "not clean".** `not_checked` is not an error row and not a clean result: it says that this table was not looked at, so a monitor that tests for the names of the error rows (`stripe_beyond_file`, `unreadable`, `page_header_mismatch`, `orphan_catalog_rows`) would pass over a damaged table that happens to be locked.  A monitor tests that the result is empty, or uses `columnar_check_clean()`.  Where PostgreSQL cannot begin a subtransaction (a callback of another module at the end of a transaction, in a critical section: see "Writes while a transaction is ending") the call is refused with a WARNING and returns no rows, which is not a clean result either; no statement of a session is ever in that state. |
+| `kingres.columnar_check_clean()` | Superuser. The strict form of `columnar_check()`: `true` only when every columnar table was checked and nothing was found, `false` for any row `columnar_check()` would return, a `not_checked` table included (and for a refused call, with the warning).  It is never `true` for a table that was not looked at, so a script that tests this function and not the names of rows cannot pass silently; when it is `false`, `columnar_check()` says why. |
 | `kingres.columnar_reconcile()` | Superuser. Deletes catalog rows of files no relation uses (it reads the first block of every columnar file of the database). A row that another session is deleting or has deleted is left to it, never an error. |
 | `kingres.columnar_write_paths(reset)` | Superuser (grantable). How often each path of the write side was taken in this session (`late_commit`, `late_window`, `pressure_flush`, `own_flush`, `handover_flush`, `size_flush`, `prepared_skip`, `ceiling_write`, `ceiling_handover`, `refused_ending`, `orphans_cleaned`, `refused_live`, `lost_raised`) and, as `bytes_held` and `orphans_kept`, two numbers that are not counts: the memory the write buffers are charged for now, and the files the backend's last commit noted for its next transaction to clean up after; with `reset` the counts start again. A diagnostic, and what the tests of those paths read. |
 | `kingres.columnar_identity(rel)`, `kingres.columnar_creating_xid(rel)`, `kingres.columnar_table_xid(rel)` | The identity of the stored content, the id of the transaction that created the file (2 once frozen) and the id that stands for the creation of the table (0 when it is not known, 2 once frozen): what the metapage holds (see "On-disk format"). |
@@ -553,13 +554,14 @@ Memory and costs worth knowing:
   probe module and a heap twin, both load orders, on both majors
   (`t/024_commit_window.pl`).
 
-* Writes while a transaction is ending (C7-01, C8-01, C8-02, C8-03).  The
+* Writes while a transaction is ending (C7-01, C8-01, C8-02, C8-03, C9-01, C9-03, C9-05).  The
   invariant: **at every event of the transaction and subtransaction callbacks,
   and at every other moment at which PostgreSQL forbids an error, a call that
   reaches the access method is either done correctly or refused in a way that
   the server survives and that the caller sees, and the access method never
   raises an error there; and a transaction never commits having lost a call
-  that it could still have failed for.**  PostgreSQL escalates an ERROR at
+  that it could still have failed for, and what a warning says of the
+  transaction is true at the moment it is given.**  PostgreSQL escalates an ERROR at
   those moments: in a critical section, at `XACT_EVENT_COMMIT` (after the
   commit record: "cannot abort transaction ... it was already committed", a
   PANIC), at `XACT_EVENT_PREPARE` (a failed assertion in `procarray.c`), at
@@ -586,7 +588,8 @@ Memory and costs worth knowing:
     is touched.  A prepared transaction is intact.
   * *The top-level transaction is still alive*: `SUBXACT_EVENT_COMMIT_SUB` (the
     top-level transaction has not committed, and can still abort cleanly) and a
-    critical section entered by a transaction that is in progress.  The call is
+    critical section entered by a transaction that is in progress **before the
+    extension's own pre-commit (or pre-prepare) callback has run**.  The call is
     refused with the WARNING, and the refusal is remembered (a counter and a
     name, in static memory: nothing is allocated where an allocation is
     forbidden).  The transaction then **fails with an error at the next moment
@@ -608,6 +611,31 @@ Memory and costs worth knowing:
     PANIC, for heap as for columnar: not the access method's doing).  A client
     that is gone when the warning is sent changes nothing either.
 
+  * *A critical section entered after the extension's own pre-commit callback*
+    (C9-01): a callback of another module that runs after the extension's own
+    at `XACT_EVENT_PRE_COMMIT` or `XACT_EVENT_PRE_PREPARE` (the module is
+    loaded before the extension in `shared_preload_libraries`, which makes its
+    callbacks run after) and enters a critical section there.  This moment is
+    **decided**, not alive.  PostgreSQL still allows an error between the
+    pre-commit callbacks and the commit record (the serialization failure check
+    is one), but nothing there is a callback that an extension can register
+    for the purpose: `CommitTransaction` and `PrepareTransaction` call the
+    pre-commit callbacks, then run PostgreSQL's own closing work (the
+    deferred-trigger manager, `ON COMMIT` actions, pending file syncs, large
+    objects, `NOTIFY`, the serializable check), then write the commit or
+    prepare record, on PostgreSQL 18 and 19 alike (read in both sources); the
+    only extension code that can run in that stretch is the object access hook,
+    for an `ON COMMIT DROP` table, which a transaction need not have, and the
+    extension's own callback has run by then.  A refusal cannot be remembered
+    and raised later, so the call is refused with the warning "Nothing was
+    done; if the transaction commits (or prepares) it does so without this
+    call", and the transaction commits (or prepares) without it.  With the
+    module loaded after the extension (its callbacks run before) the same
+    critical section is alive, and the transaction fails at the extension's
+    pre-commit.  A module that must not lose a call writes at
+    `XACT_EVENT_PRE_COMMIT` or `PRE_PREPARE` outside a critical section, where
+    the call is carried out (written at once, see above).
+
   What heap does at the same moments was found with a module that writes a row
   with `table_tuple_insert` into a table it holds open at the event a setting
   names (`t/kcevents/kcevents.c`), run on a heap table against a server built
@@ -626,7 +654,7 @@ Memory and costs worth knowing:
   | `SUBXACT_EVENT_COMMIT_SUB` | stops (the same assertion) | writes; the row commits with the parent, durable | the subtransaction aborted | warning, and the transaction fails with an error at its next pre-commit (alive) |
   | `SUBXACT_EVENT_ABORT_SUB` | stops (the same assertion) | writes a row of the aborted subtransaction, which nobody sees | PANIC (error stack) | warning (decided; as for an abort) |
   | resource owner release, the three phases | ERROR "ResourceOwnerEnlarge called after release started", escalated to a PANIC | the same | PANIC | warning (decided) |
-  | inside a critical section | stops (`allowInCritSection` assertion in `mcxt.c`) | writes | writes when no allocation is needed, else the same assertion | warning, and the transaction fails with an error at its next pre-commit (alive); decided if the critical section is entered at one of the moments above |
+  | inside a critical section | stops (`allowInCritSection` assertion in `mcxt.c`) | writes | writes when no allocation is needed, else the same assertion | warning, and the transaction fails with an error at its next pre-commit (alive), if the critical section was entered before the extension's own pre-commit callback ran; decided (warning: "if the transaction commits (or prepares) it does so without this call") if it was entered after it, at `XACT_EVENT_PRE_COMMIT` or `PRE_PREPARE` by a callback that runs later, and if it is entered at one of the moments above |
   | `proc_exit` callbacks | no transaction and no relation to write to; nothing of the access method runs there | | | |
 
   The server survives at every moment, which heap does not: with assertions it
@@ -665,16 +693,27 @@ Memory and costs worth knowing:
   | `slot_callbacks`, `parallelscan_*`, `index_fetch_reset`, `index_fetch_end`, `tuple_get_latest_tid`, `tuple_satisfies_snapshot`, `relation_needs_toast_table`, `relation_toast_am` | nostorage | nothing to do |
   | the object access hook (a drop of a relation) | guarded | warning, the file is not noted (its leftover rows are removed by `VACUUM` and `columnar_check(true)`) |
   | `columnar_compact`, `columnar_set_options` | guarded | warning, nothing done |
-  | `columnar_reconcile`, `columnar_finish_rewrites`, `columnar_note_rewrite`, `columnar_check(true)` | guarded | warning, skipped (the commit or the next call does the same work) |
-  | the other SQL functions (`columnar_options`, `_info`, `_stripes`, `_identity`, `_creating_xid`, `_table_xid`, `_write_paths`, `_handler`, `columnar_check(false)`) | reads | the same as the reads above |
+  | `columnar_reconcile`, `columnar_finish_rewrites`, `columnar_note_rewrite` | guarded | warning, skipped (the commit or the next call does the same work) |
+  | `columnar_check(false)`, `columnar_check(true)`, `columnar_check_clean()` (C9-03) | guarded: *needs a subtransaction* | warning, nothing checked, and no row (`columnar_check_clean()`: `false`), at every moment at which PostgreSQL cannot begin a subtransaction (`BeginInternalSubTransaction` ends the session with a FATAL for a subtransaction that is starting, committing or aborting, and the call allocates): no transaction in progress (`XACT_EVENT_COMMIT`, `PREPARE`, `ABORT`, `SUBXACT_EVENT_COMMIT_SUB`, `ABORT_SUB`, the release phases, the exit of the process), a critical section, and a subtransaction between its pre-commit and its end as the extension's callback saw it.  Served at `XACT_EVENT_PRE_COMMIT` and `PRE_PREPARE`.  Two moments the extension cannot see: `SUBXACT_EVENT_START_SUB`, and `SUBXACT_EVENT_PRE_COMMIT_SUB` when the other module's callback runs before the extension's; there the server's own FATAL applies, as it does to a PL/pgSQL exception block on a heap table.  A refused call is not an answer that the tables are clean; no statement of a session is ever in these states |
+  | the other SQL functions (`columnar_options`, `_info`, `_stripes`, `_identity`, `_creating_xid`, `_table_xid`, `_write_paths`, `_handler`) | reads | work wherever PostgreSQL lets a heap table be read, with one rule of their own (C9-03): where an error is forbidden the table's `ACCESS SHARE` lock is asked for without waiting (a wait could end in a deadlock error, a PANIC there); a table locked exclusively by another transaction gets a warning and a null (or empty) answer.  A table the transaction holds a lock on is never refused |
   | the transaction and subtransaction callbacks of the extension | they are the moments | what they do at each (flush, hand-over, clean-up, remembering the refusal) was designed for it; the memory the commit event needs is static (below) |
   | the planner hook and the executor methods of the Columnar Scan, the event trigger functions, the redo of the resource manager | not reachable | they need a transaction in progress (planning, executing, DDL) or recovery, and none of them runs where an error is forbidden |
 
   A caller sees, at a moment where the fate is decided, the warning
   `<what> refused on columnar table "t": the transaction is not in progress`
-  (`inside a critical section`), with a detail that says what was not done; where
-  the transaction is alive the same warning, with the detail that it fails at
-  its next pre-commit, and later the error above.  `columnar_write_paths()`
+  (`inside a critical section`), with a detail that says what was not done and
+  what that means for the transaction: "if it commits or prepares it does so
+  without this call" (decided), "if the transaction commits (or prepares) it
+  does so without this call" (a critical section after the extension's own
+  pre-commit), "skipping this call loses nothing of the transaction" (a call
+  that may be skipped); where the transaction is alive (`<what> refused on
+  columnar table "t": at the commit of a subtransaction`, or inside a critical
+  section before the extension's pre-commit) the same warning, with the detail
+  that the transaction fails at its next pre-commit, and later the error, whose
+  detail says that code of another module called the table at a moment where
+  the server forbids an error.  The text of the warning is true in every cell of
+  the table above (`t/031_entry_points.pl` checks the primary message and the
+  class of the detail in each).  `columnar_write_paths()`
   counts the refusals as `refused_ending`, those made while the transaction was
   alive as `refused_live`, the errors raised for them as `lost_raised`, and
   reports as `orphans_kept` the files the commit of the backend's last
@@ -804,7 +843,7 @@ the way to find and remove them (`t/028`), `COMMIT AND CHAIN`, a parallel leader
 and a base backup under load, restored (`t/029`), the cost of rows written late
 (`t/030`), every entry point of the access method at every moment where an error
 is forbidden, and the walk that fails for a callback without a decision (`t/031`),
-the way a module that cannot be built is treated (`t/032`), the same write paths on a standby with `wal_consistency_checking = all` and across a promotion (`t/033`), and two laps of the
+the way a module that cannot be built is treated (`t/032`), the same write paths on a standby with `wal_consistency_checking = all` and across a promotion, and a late drop under a hot standby's reader (`t/033`), logical decoding of transactions that had a refused call (`t/034`), and two laps of the
 transaction id space.
 
 Some files do not run everywhere, and say why when they are skipped:

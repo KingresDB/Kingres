@@ -390,6 +390,8 @@ extern bool kc_write_row_values(Relation rel, Datum *vals, bool *nulls,
 								CommandId cid);
 extern bool kc_entry_refused(const char *what, const char *name, bool fails_txn);
 extern bool kc_write_refused(Relation rel, const char *what);
+extern bool kc_error_forbidden(void);
+extern bool kc_subxact_refused(const char *what);
 extern int	kc_write_path_count(void);
 extern const char *kc_write_path_get(int i, uint64 *hits);
 extern void kc_write_paths_reset(void);

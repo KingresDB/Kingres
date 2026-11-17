@@ -33,7 +33,9 @@
 # committing subtransaction's own flush, the hand-over's flush, the flush of a full
 # stripe, a flush refused because a hand-over was prepared, the ceiling of a write,
 # the ceiling of a hand-over), and the file fails when the prelude does not take one:
-# that is a change of the code and not of a seed.  The random part then compares with
+# that is a change of the code and not of a seed.  A path that is taken must also be a path
+# that is right (C9-02): after each scripted path the tables are read back and compared with a
+# heap twin that ran the same statements (count, sum, and the order of ids and widths).  The random part then compares with
 # the heap twin, and the counters of its episodes are reported at the end, with a
 # note for a path that this run's random episodes did not take: it says whether the
 # generator still reaches the paths on average, and it is not asserted per run,
@@ -279,16 +281,49 @@ RELEASE s;
 SET kcprobe.sql = '';
 COMMIT;" ],
 	);
+	# the same statements on the heap twins: p -> h, q -> hq, r -> hr, no access method, no options
+	my $twin = sub
+	{
+		my ($text) = @_;
+		$text =~ s/^[^\n]*columnar_set_options[^\n]*\n//mg;
+		$text =~ s/ USING columnar//g;
+		$text =~ s/\bp\b/h/g;
+		$text =~ s/\bq\b/hq/g;
+		$text =~ s/\br\b/hr/g;
+		return $text;
+	};
+	# what a table holds: how many rows, their sum, and a digest of the ids with the widths, in order
+	my $state = sub
+	{
+		my ($t) = @_;
+		return "SELECT 'STATE $t ' || count(*) || ':' || coalesce(sum(id), 0) || ':' || coalesce(md5(string_agg(id || '/' || length(pad), ',' ORDER BY id, length(pad))), '') FROM $t;";
+	};
 	foreach my $pr (@prelude)
 	{
 		my ($path, $sql) = @$pr;
-		$node->safe_psql('postgres', 'TRUNCATE p, h, q; DROP TABLE IF EXISTS r');
+		$node->safe_psql('postgres', 'TRUNCATE p, h, q, hq; DROP TABLE IF EXISTS r, hr');
 		my ($out, $err) = run($set . $sql . "\n" . $PATHS_SQL);
 		unlike($err, qr/ERROR|TRAP|server closed/, "prelude: the statements for $path run without an error");
 		my %one;
 		count_paths($out, \%one);
 		$scripted{$_} += $one{$_} foreach keys %one;
 		cmp_ok($one{$path} // 0, '>', 0, "prelude: $path was taken (" . ($one{$path} // 0) . " times)");
+		# and it is right: the tables hold what the heap twins hold after the same statements
+		my @pairs = ([ 'p', 'h' ], [ 'q', 'hq' ]);
+		push @pairs, [ 'r', 'hr' ] if $sql =~ /CREATE TABLE r /;
+		my ($tout, $terr) = run($twin->($set . $sql) . "\n");
+		unlike($terr, qr/ERROR|TRAP|server closed/, "prelude: the statements for $path run on the heap twins without an error");
+		foreach my $pair (@pairs)
+		{
+			my ($c) = run($state->($pair->[0]));
+			my ($h) = run($state->($pair->[1]));
+			$c =~ s/^STATE \S+ //m;
+			$h =~ s/^STATE \S+ //m;
+			chomp($c);
+			chomp($h);
+			ok(length($c) > 0 && $c eq $h, "prelude: $path: the table $pair->[0] holds what its heap twin holds ($c)")
+			  or diag("columnar $c, heap $h");
+		}
 	}
 	# the window script reaches the guard that keeps prepared buffers from being flushed too
 	cmp_ok($scripted{prepared_skip} // 0, '>', 0, 'prelude: prepared_skip was taken (the guard of a prepared hand-over)');
@@ -306,6 +341,12 @@ COMMIT;" ],
 		count_paths($out, \%one);
 		$scripted{$_} += $one{$_} foreach keys %one;
 		cmp_ok($one{ceiling_write} // 0, '>', 0, 'prelude: ceiling_write was taken (' . ($one{ceiling_write} // 0) . ' times)');
+		# the transaction rolled back: nothing of it is left in either table
+		my ($c) = run($state->('p'));
+		my ($h) = run($state->('h'));
+		$c =~ s/^STATE \S+ //m;
+		$h =~ s/^STATE \S+ //m;
+		is($c, $h, 'prelude: ceiling_write: the rolled back transaction left the table as the heap twin is');
 	}
 }
 

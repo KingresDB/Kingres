@@ -29,6 +29,12 @@
 #      transaction of the backend adopts the same notes again;
 #   4. columnar_check does not wait for a lock a prepared transaction holds: it reports the
 #      table as not checked (not_checked) and goes on, with and without fix;
+#   4b. (C9-04) a table that cannot be locked gives a row like any other, so a result
+#      that is not empty is not clean, and columnar_check_clean() is the strict form: false
+#      for a locked table (a prepared TRUNCATE, ordinary DDL that is running), true when every
+#      table was checked and nothing was found.  A monitor that filters on the names of the
+#      error rows passes over a locked table; the test shows it, and that the strict form
+#      does not;
 #   5. keeping the notes at XACT_EVENT_COMMIT allocates nothing: a build with assertions
 #      keeps the work in a critical section, where an allocation traps (every late drop of
 #      this file reaches it).
@@ -229,12 +235,35 @@ SELECT 'CHK=' || check_name || ':' || relation::regclass::text FROM kingres.colu
 		unlike($err, qr/statement timeout|canceling/, "columnar_check($fix) behind a prepared TRUNCATE does not wait for it");
 		like($out, qr/CHK=not_checked:x\b/, "columnar_check($fix) reports the locked table as not_checked");
 		unlike($out, qr/CHK=\w+:w\b/, "columnar_check($fix) checked the other table and found nothing");
-		like((script("SET statement_timeout = '30s'; SELECT detail FROM kingres.columnar_check($fix) WHERE check_name = 'not_checked';"))[0], qr/locked by another transaction, possibly a prepared one/,
+		like((script("SET statement_timeout = '30s'; SELECT detail FROM kingres.columnar_check($fix) WHERE check_name = 'not_checked';"))[0], qr/locked by another transaction \(a prepared one, or ordinary DDL.*not a clean result/,
 			"columnar_check($fix) says why the table was not checked");
 	}
+	# C9-04: what a monitor sees while the table is locked
+	is(q1("SELECT kingres.columnar_check_clean()"), 'f', 'C9-04: columnar_check_clean() is false while a table is locked (not checked is not clean)');
+	cmp_ok(q1("SELECT count(*) FROM kingres.columnar_check()"), '>', 0, 'C9-04: columnar_check() returns a row, so "no row" is the test for clean');
+	is(q1("SELECT count(*) FROM kingres.columnar_check() WHERE check_name IN ('stripe_beyond_file', 'unreadable', 'page_header_mismatch', 'orphan_catalog_rows')"), 0,
+		'C9-04: a monitor that filters on the names of the error rows sees nothing while the table is locked (which is why the README says: any row is not clean)');
 	$node->safe_psql('postgres', "COMMIT PREPARED 'holder'");
 	is(q1("SELECT count(*) FROM kingres.columnar_check(true) WHERE check_name = 'not_checked'"), 0, 'after the prepared transaction ended the table is checked');
 	is(orphans(), 0, '... and nothing is reported');
+	is(q1("SELECT kingres.columnar_check_clean()"), 't', 'C9-04: columnar_check_clean() is true when every table was checked and nothing was found');
+
+	# ordinary DDL that is running (an ACCESS EXCLUSIVE lock), not a prepared transaction
+	my $ddl = $node->background_psql('postgres', on_error_stop => 1);
+	$ddl->query_safe("BEGIN; LOCK TABLE w IN ACCESS EXCLUSIVE MODE");
+	is(q1("SELECT kingres.columnar_check_clean()"), 'f', 'C9-04: false while ordinary DDL holds the table');
+	like(q1("SELECT string_agg(check_name || ':' || relation::regclass::text, ',') FROM kingres.columnar_check()"), qr/^not_checked:w$/,
+		'C9-04: the answer of columnar_check() is the one not_checked row');
+	$ddl->query_safe("ROLLBACK");
+	$ddl->quit;
+	is(q1("SELECT kingres.columnar_check_clean()"), 't', 'C9-04: true again when the lock is gone');
+	is(q1("SELECT count(*) FROM kingres.columnar_check()"), 0, '... and columnar_check() has no row');
+
+	# a damaged catalog is not clean either, and the repair makes it clean
+	q1("INSERT INTO kingres.columnar_stripe VALUES (999999, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0, '\\x', '\\x')");
+	is(q1("SELECT kingres.columnar_check_clean()"), 'f', 'C9-04: a catalog row of a file nobody uses is not clean');
+	q1("SELECT * FROM kingres.columnar_check(true)");
+	is(q1("SELECT kingres.columnar_check_clean()"), 't', '... and clean again after columnar_check(true)');
 	q1("DROP TABLE w");
 }
 

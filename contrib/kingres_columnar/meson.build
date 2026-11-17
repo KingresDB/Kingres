@@ -110,6 +110,7 @@ tests += {
       't/031_entry_points.pl',
       't/032_module_build.pl',
       't/033_standby_late.pl',
+      't/034_decoding.pl',
     ],
   },
 }

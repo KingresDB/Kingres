@@ -145,7 +145,7 @@ CREATE FUNCTION kcevents_writes() RETURNS bigint AS '$dir/kcevents', 'kcevents_w
 		}
 		else
 		{
-			like($err, qr/WARNING:  insert refused on columnar table "t": (the transaction is not in progress|inside a critical section)/,
+			like($err, qr/WARNING:  insert refused on columnar table "t": (the transaction is not in progress|inside a critical section|at the commit of a subtransaction)/,
 				"$order: $name: refused with a warning, not an error that the server turns into a PANIC");
 			if ($live)
 			{
@@ -220,6 +220,27 @@ CREATE FUNCTION kcevents_writes() RETURNS bigint AS '$dir/kcevents', 'kcevents_w
 		($out, $err) = $run->('none', 't', "BEGIN; SELECT kcevents_open('t'); INSERT INTO t VALUES (100); SAVEPOINT a; SELECT kcevents_crit(); RELEASE a; COMMIT;");
 		is($rows->('t'), '', "$order: a critical section in a savepoint that is released: the transaction fails at its pre-commit");
 		like($err, $lost, "$order: ... with the refusal error");
+
+		# C9-06: what the extension remembers of the subtransactions of one transaction must be gone
+		# when the next one begins.  Subtransaction ids start again in every transaction, so a
+		# subtransaction that committed as number 2 in the first would, if it were remembered, make
+		# the abort of the subtransaction that is number 2 in the second look like a commit: where the
+		# module's callback runs before the access method's (the order "before") the refusal at that
+		# abort would be taken for one of a live transaction and fail the commit that follows.  One
+		# session, two transactions; without the reset at XACT_EVENT_COMMIT the second fails.
+		{
+			$fresh->();
+			my $off = $log_from->();
+			($out, $err) = $run->('abort_sub', 't',
+				"BEGIN; SAVEPOINT s; INSERT INTO t VALUES (1); RELEASE s; COMMIT;
+SET kcevents.at = 'abort_sub'; SET kcevents.once = on;
+BEGIN; SELECT kcevents_open('t'); SAVEPOINT s; INSERT INTO t VALUES (2); ROLLBACK TO s; INSERT INTO t VALUES (3); COMMIT;");
+			$alive->('a subtransaction number 2 that aborts after one that committed as number 2', $off);
+			like($err, qr/WARNING:  insert refused on columnar table "t": the transaction is not in progress/,
+				"$order: C9-06: the refusal at the abort of the second transaction's subtransaction is made (decided)");
+			unlike($err, $lost, "$order: C9-06: ... and it is not taken for the refusal of a live transaction: the commit stands");
+			is($rows->('t'), '1,3', "$order: C9-06: the rows of both transactions are there");
+		}
 
 		# the decided moments stay what they were: a warning and nothing else, with a savepoint around
 		foreach my $at ('commit', 'prepare', 'abort')

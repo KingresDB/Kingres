@@ -43,6 +43,34 @@
 #     triggers and the redo of the resource manager: none of them can run where an
 #     error is forbidden (they need a transaction in progress, or recovery).
 #
+# C9-01.  A critical section entered at XACT_EVENT_PRE_COMMIT or XACT_EVENT_PRE_PREPARE
+# by a callback that runs after the extension's own is not "alive": nothing of the
+# extension runs again before the commit record, so no error can be raised for the
+# refusal, and the transaction commits (prepares) without the call; the warning says so
+# ("after this extension's own pre-commit ... callback had run").  With the order
+# reversed the same critical section is alive and the transaction fails.  Both cells
+# are run for every entry point, in both orders, and the rule that holds for every
+# cell is checked in each: the primary message names the moment, and the detail of
+# the warning says what is true of that cell (the transaction fails at its next
+# pre-commit; it cannot be failed any more; it commits without the call; the call may
+# be skipped and nothing is lost).
+#
+# C9-03.  columnar_check(false), columnar_check(true) and columnar_check_clean() begin a
+# subtransaction for each table, which PostgreSQL cannot do where a transaction is
+# not in progress, in a critical section, and between the pre-commit and the end of a
+# subtransaction: they are refused there with a warning, nothing is checked, and the
+# session lives (without the refusal it ends with a FATAL, and at the abort of a
+# subtransaction leaves a lock behind).  They work at XACT_EVENT_PRE_COMMIT and
+# PRE_PREPARE.  The SQL functions that read are called through the function manager at
+# the same moments on a build without assertions (the relation cache asserts a
+# transaction in progress, for heap as for columnar), and a table that is locked
+# exclusively by another session is not waited for there (a wait that ends in a
+# deadlock error is a PANIC where an error is forbidden).  Not run, and why: the
+# start of a subtransaction (SUBXACT_EVENT_START_SUB) and, in the order "before", its
+# pre-commit: the extension cannot tell that it is there, and PostgreSQL's own FATAL
+# for a subtransaction begun there applies (heap's exception blocks end the session
+# the same way).
+#
 # It needs a compiler and the server's headers (KcProbe.pm).
 #
 # Portions Copyright (c) 2026, RooyeKhat Media Co
@@ -88,6 +116,11 @@ my @moments = (
 	[ 'res_after_locks', 'commit', 'decided', "$base,100", "$base,100" ],
 	[ 'commit_sub', 'sub', 'live', "$base,100,101", $base ],
 	[ 'none', 'crit', 'live', "$base,100", $base ],
+	# C9-01: a critical section entered at the pre-commit (pre-prepare) event of the top-level
+	# transaction by the module: after the extension's own callback (the order "after") the refusal
+	# is final, before it (the order "before") the transaction is alive and fails there
+	[ 'pre_commit', 'commit', 'precrit', "$base,100", $base, "SET kcevents.crit = on;\n", 'a critical section at pre_commit' ],
+	[ 'pre_prepare', 'prepare', 'precrit', "$base,100", $base, "SET kcevents.crit = on;\n", 'a critical section at pre_prepare' ],
 );
 
 # the operations: op => [ warning text, fails the transaction when refused while it is alive,
@@ -127,6 +160,7 @@ CREATE EXTENSION kingres_columnar;
 CREATE FUNCTION kcevents_open(text) RETURNS void AS '$dir/kcevents', 'kcevents_open' LANGUAGE C;
 CREATE FUNCTION kcevents_crit() RETURNS void AS '$dir/kcevents', 'kcevents_crit' LANGUAGE C;
 CREATE FUNCTION kcevents_fn(text, int) RETURNS void AS '$dir/kcevents', 'kcevents_fn' LANGUAGE C;
+CREATE FUNCTION kcevents_sql(oid, int, text DEFAULT NULL) RETURNS void AS '$dir/kcevents', 'kcevents_sql' LANGUAGE C;
 CREATE FUNCTION kcevents_walk(text) RETURNS TABLE (off bigint, member text, decision text, why text)
 	AS '$dir/kcevents', 'kcevents_walk' LANGUAGE C;
 CREATE FUNCTION kingres.columnar_note_rewrite(rel regclass) RETURNS void
@@ -148,14 +182,27 @@ CREATE FUNCTION kingres.columnar_note_rewrite(rel regclass) RETURNS void
 	my $log_from = sub { return -s $node->logfile; };
 	my $fnlist = {
 		fn_write => "SELECT kcevents_fn('kingres_columnar_compact', 2); SELECT kcevents_fn('kingres_columnar_set_options', 5);",
+		sqld_check_false => "SELECT kcevents_sql('kingres.columnar_check(boolean)'::regprocedure::oid, 0, 'kingres_columnar_check');",
+		sqld_check_true => "SELECT kcevents_sql('kingres.columnar_check(boolean)'::regprocedure::oid, 1, 'kingres_columnar_check');",
+		sqld_check_clean => "SELECT kcevents_sql('kingres.columnar_check_clean()'::regprocedure::oid, 0, 'kingres_columnar_check_clean');",
+		sql_check_false => "SELECT kcevents_sql('kingres.columnar_check(boolean)'::regprocedure::oid, 0);",
+		sql_check_true => "SELECT kcevents_sql('kingres.columnar_check(boolean)'::regprocedure::oid, 1);",
+		sql_check_clean => "SELECT kcevents_sql('kingres.columnar_check_clean()'::regprocedure::oid, 0);",
+		sql_options => "SELECT kcevents_sql('kingres.columnar_options(regclass)'::regprocedure::oid, -1);",
+		sql_info => "SELECT kcevents_sql('kingres.columnar_info(regclass)'::regprocedure::oid, -1);",
+		sql_stripes => "SELECT kcevents_sql('kingres.columnar_stripes(regclass)'::regprocedure::oid, -1);",
+		sql_identity => "SELECT kcevents_sql('kingres.columnar_identity(regclass)'::regprocedure::oid, -1);",
+		sql_creating_xid => "SELECT kcevents_sql('kingres.columnar_creating_xid(regclass)'::regprocedure::oid, -1);",
+		sql_table_xid => "SELECT kcevents_sql('kingres.columnar_table_xid(regclass)'::regprocedure::oid, -1);",
+		sql_write_paths => "SELECT kcevents_sql('kingres.columnar_write_paths(boolean)'::regprocedure::oid, 0);",
 		fn_safe => "SELECT kcevents_fn('kingres_columnar_reconcile', 0); SELECT kcevents_fn('kingres_columnar_finish_rewrites', 0); SELECT kcevents_fn('kingres_columnar_note_rewrite', 1);",
 	};
 	# run a script at a moment with an operation; returns (stdout, stderr, log text)
 	my $run = sub
 	{
 		my ($at, $script, $op, $extra) = @_;
-		my $realop = $op =~ /^fn_/ ? 'fn' : $op;
-		my $reg = $op =~ /^fn_/ ? $fnlist->{$op} : '';
+		my $realop = $op =~ /^fn_/ ? 'fn' : $op =~ /^sqld?_/ ? 'sqlfn' : $op;
+		my $reg = $op =~ /^(?:fn|sqld?)_/ ? $fnlist->{$op} : '';
 		(my $s = $script) =~ s/%F%/$reg/;
 		my ($out, $err) = ('', '');
 		my $off = $log_from->();
@@ -220,14 +267,21 @@ CREATE FUNCTION kingres.columnar_note_rewrite(rel regclass) RETURNS void
 
 		foreach my $m (@moments)
 		{
-			my ($at, $script, $mkind, $want_ok, $want_fail) = @$m;
-			my $name = "$op at " . ($at eq 'none' ? 'a critical section' : $at);
+			my ($at, $script, $mkind, $want_ok, $want_fail, $extra, $label) = @$m;
+			my $late = 0;
+			if ($mkind eq 'precrit')
+			{
+				$late = $order eq 'after';
+				$mkind = $late ? 'decided' : 'live';
+			}
+			my $crit = $at eq 'none' || defined $extra;
+			my $name = "$op at " . ($label // ($at eq 'none' ? 'a critical section' : $at));
 
 			# reads that allocate and open relations: not on a build with assertions (see above);
 			# at a release phase they need the buffer pin that PostgreSQL itself forbids there
 			# (size and estimate read the file's length: they allocate in PostgreSQL's smgr, which a
 			# critical section forbids, again PostgreSQL's rule)
-			if (($kind eq 'r' && ($assertions || $at =~ /^res_/)) || ($kind eq 's' && $assertions && $at eq 'none'))
+			if (($kind eq 'r' && ($assertions || $at =~ /^res_/)) || ($kind eq 's' && $assertions && $crit))
 			{
 				SKIP:
 				{
@@ -239,7 +293,7 @@ CREATE FUNCTION kingres.columnar_note_rewrite(rel regclass) RETURNS void
 			# size and estimate read the file's length only; at a release phase the smgr is fine too
 
 			$fresh->();
-			my ($out, $err, $log) = $run->($at, $script{$script}, $op);
+			my ($out, $err, $log) = $run->($at, $script{$script}, $op, $extra);
 			$alive->($name, $log);
 			my $survives = !$fails || $mkind eq 'decided';
 			is($rows->(), $survives ? $want_ok : $want_fail,
@@ -250,12 +304,28 @@ CREATE FUNCTION kingres.columnar_note_rewrite(rel regclass) RETURNS void
 			{
 				cmp_ok(scalar(() = $err =~ /WARNING:  $what refused(?: on columnar table "t")?: /g), '>=', 1,
 					"$order: $name: refused with a warning that names it");
+				# the rule of the round: the text is true of the cell it is given in (C9-01, C9-05).  The
+				# primary message names the moment; the detail says what happens to the transaction.
+				my $want_primary = $crit ? qr/inside a critical section/
+				  : $at eq 'commit_sub' ? qr/at the commit of a subtransaction/
+				  : qr/the transaction is not in progress/;
+				like($err, qr/WARNING:  $what refused(?: on columnar table "t")?: $want_primary/,
+					"$order: $name: the message names the moment");
+				my $want_detail = !$fails ? qr/skipping this call loses nothing of the transaction/
+				  : $mkind eq 'live' ? qr/the transaction is still open and fails with an error at its next pre-commit/
+				  : $late ? qr/after this extension's own pre-commit \(or pre-prepare\) callback had run.*if the transaction commits \(or prepares\) it does so without this call/s
+				  : qr/the transaction cannot be failed for it any more: if it commits or prepares it does so without this call/;
+				like($err, $want_detail, "$order: $name: the detail says what is true of this cell");
+				unlike($err, qr/fails with an error at its next pre-commit/, "$order: $name: ... and promises no error that cannot come")
+				  unless $mkind eq 'live' && $fails;
 				my $done = $op =~ /^fn_/ ? scalar(() = $log =~ /kcevents: fn \d+ done/g) : scalar(() = $log =~ /kcevents: $op done/g);
 				is($done, $ndone, "$order: $name: the call returned ($ndone) and raised nothing");
 				if ($fails && $mkind eq 'live')
 				{
 					like($err, qr/ERROR:  a call (?:on columnar table "t"|to \w+) was refused earlier in this transaction, so it cannot commit/,
 						"$order: $name: the transaction that is still alive fails with an error at its pre-commit");
+					like($err, qr/DETAIL:  Code of another module \(not a statement of this session\) called the table at a moment where the server forbids an error/,
+						"$order: $name: ... and the error says that code of another module did it");
 				}
 				else
 				{
@@ -346,6 +416,157 @@ CREATE FUNCTION kingres.columnar_note_rewrite(rel regclass) RETURNS void
 			my ($out, $err, $log) = $run->($at, $script{$script}, $op, "SET kcevents.crit = on;\n");
 			$alive->("$op at $at inside a critical section", $log);
 			like($err, qr/WARNING:  \S.* refused(?: on columnar table "t")?: /, "$order: $op at $at inside a critical section: refused, allocating nothing");
+		}
+	}
+
+	# ------------------------------------------------------------------
+	# C9-03: the SQL functions called through the function manager, as the executor calls
+	# them (a result-set context, an active snapshot), at the moments where PostgreSQL
+	# cannot begin a subtransaction.  columnar_check(false), columnar_check(true) and
+	# columnar_check_clean() are refused with a warning and the session lives; without
+	# the refusal PostgreSQL ends the session with a FATAL (and at the abort of a
+	# subtransaction leaves a lock that nothing releases)
+	# ------------------------------------------------------------------
+	{
+		my @cells = (
+			# name, at, script, rows afterwards, why it is refused, extra
+			[ 'commit', 'commit', 'commit', "$base,100", 'not' ],
+			[ 'prepare', 'prepare', 'prepare', "$base,100", 'not' ],
+			[ 'abort', 'abort', 'abort', $base, 'not' ],
+			[ 'abort_sub', 'abort_sub', 'subabort', "$base,100", 'not' ],
+			[ 'res_before_locks', 'res_before_locks', 'commit', "$base,100", 'not' ],
+			[ 'res_locks', 'res_locks', 'commit', "$base,100", 'not' ],
+			[ 'res_after_locks', 'res_after_locks', 'commit', "$base,100", 'not' ],
+			[ 'commit_sub', 'commit_sub', 'sub', "$base,100,101", 'not' ],
+			[ 'a critical section', 'none', 'crit', "$base,100", 'crit' ],
+			[ 'a critical section at pre_commit', 'pre_commit', 'commit', "$base,100", 'crit', "SET kcevents.crit = on;\n" ],
+			[ 'a critical section at pre_prepare', 'pre_prepare', 'prepare', "$base,100", 'crit', "SET kcevents.crit = on;\n" ],
+		);
+		# the pre-commit of a subtransaction: the extension knows it only when its callback ran first
+		push @cells, [ 'pre_commit_sub', 'pre_commit_sub', 'sub', "$base,100,101", 'subcommitting' ] if $order eq 'after';
+		my %fname = (sqld_check_false => 'columnar_check', sqld_check_true => 'columnar_check', sqld_check_clean => 'columnar_check_clean', sql_check_false => 'columnar_check', sql_check_true => 'columnar_check', sql_check_clean => 'columnar_check_clean');
+		my $callee = sub { my ($op) = @_; return $op =~ /check_false$/ ? 'columnar_check\(false\)' : $op =~ /check_true$/ ? 'columnar_check\(true\)' : 'columnar_check_clean'; };
+		# called by the address of the C function, the way a C module calls it (see the header of
+		# kcevents.c: the function manager's wrapper reads the catalogs, which a build with
+		# assertions refuses where no transaction is in progress)
+
+		foreach my $op ('sqld_check_false', 'sqld_check_true', 'sqld_check_clean')
+		{
+			foreach my $c (@cells)
+			{
+				my ($label, $at, $script, $want, $why, $extra) = @$c;
+				my $name = "$op at $label";
+				my $text = $why eq 'crit' ? 'inside a critical section' : $why eq 'subcommitting' ? 'the subtransaction is committing' : 'the transaction is not in progress';
+
+				$fresh->();
+				my ($out, $err, $log) = $run->($at, $script{$script}, $op, $extra);
+				$alive->($name, $log);
+				unlike($log, qr/FATAL/, "$order: $name: no FATAL: the session was not ended");
+				my $cre = $callee->($op);
+				like($err, qr/WARNING:  $cre refused: $text/, "$order: $name: refused with a warning that says why");
+				like($err, qr/Nothing was checked, and the empty answer of a call that was refused is not an answer that the tables are clean/,
+					"$order: $name: ... and that the empty answer is not a clean bill");
+				unlike($err, qr/ERROR:/, "$order: $name: no error") unless $at eq 'abort';
+				like($log, qr/kcevents: sqlfn $fname{$op} done rows=0 isnull=0 bool=0/, "$order: $name: the call returned, with no rows (false for the strict form)");
+				is($rows->(), $want, "$order: $name: the transaction ended as it would have (a check writes nothing)");
+				is($q->("SELECT count(*) FROM pg_locks WHERE locktype = 'relation' AND relation = 't'::regclass AND pid IS NULL"), 0,
+					"$order: $name: no lock was left behind");
+				is($q->("SELECT kingres.columnar_check_clean()"), 't', "$order: $name: the tables are clean afterwards");
+			}
+		}
+
+		# where PostgreSQL lets a subtransaction begin (the pre-commit and the pre-prepare of the top-level
+		# transaction) the functions work
+		foreach my $op ('sql_check_false', 'sql_check_true', 'sql_check_clean')
+		{
+			foreach my $m (['pre_commit', 'commit'], ['pre_prepare', 'prepare'])
+			{
+				my ($at, $script) = @$m;
+				my $name = "$op at $at";
+				$fresh->();
+				my ($out, $err, $log) = $run->($at, $script{$script}, $op);
+				$alive->($name, $log);
+				unlike($log, qr/FATAL/, "$order: $name: no FATAL");
+				unlike($err, qr/refused|ERROR:/, "$order: $name: works: no refusal, no error");
+				like($log, qr/kcevents: sqlfn $fname{$op} done rows=0 isnull=0 bool=@{[ $op eq 'sql_check_clean' ? 1 : 0 ]}/, "$order: $name: it ran, and found the tables clean");
+				is($rows->(), "$base,100", "$order: $name: the transaction committed what it wrote");
+			}
+		}
+
+		# the other SQL functions, which read: through the function manager at the moments where an
+		# error is forbidden.  The relation cache of a build with assertions asserts a transaction in
+		# progress there (heap's too), so only a build without assertions runs them; each returns and
+		# changes nothing
+		foreach my $op ('sql_options', 'sql_info', 'sql_stripes', 'sql_identity', 'sql_creating_xid', 'sql_table_xid', 'sql_write_paths')
+		{
+			foreach my $c (@cells)
+			{
+				my ($label, $at, $script, $want, $why, $extra) = @$c;
+				next if $at =~ /^res_/ || $at eq 'pre_commit_sub';
+				my $name = "$op at $label";
+				if ($assertions)
+				{
+					SKIP:
+					{
+						skip "$order: $name: a read at a moment where an error is forbidden is PostgreSQL's own rule on a build with assertions", 1;
+						ok(1);
+					}
+					next;
+				}
+				$fresh->();
+				my ($out, $err, $log) = $run->($at, $script{$script}, $op, $extra);
+				$alive->($name, $log);
+				unlike($log, qr/FATAL/, "$order: $name: no FATAL");
+				like($log, qr/kcevents: sqlfn \w+ done/, "$order: $name: the call returned");
+				unlike($err, qr/ERROR:/, "$order: $name: no error") unless $at eq 'abort';
+				is($rows->(), $want, "$order: $name: the table has what the transaction wrote");
+				is($q->("SELECT kingres.columnar_check_clean()"), 't', "$order: $name: the tables are clean afterwards");
+			}
+		}
+
+		# a table that another session holds exclusively is not waited for where an error is forbidden
+		# (a wait could end in a deadlock error, a PANIC there): a warning and a null answer.  A wait
+		# cannot be cancelled there (the commit holds interrupts), so a call that waits would hang this
+		# file: the client is given 30 seconds, and the lock is then released so that the backend goes on.
+		{
+			$fresh->();
+			$q->("DROP TABLE IF EXISTS u; CREATE TABLE u (a int) USING columnar; INSERT INTO u VALUES (1)");
+			my $uoid = $q->("SELECT 'u'::regclass::oid");
+			my $b = $node->background_psql('postgres', on_error_stop => 1);
+			# columnar_stripes returns a set: it cannot be called by its address (it needs the catalogs to
+			# find its result type), and the function manager's own wrapper reads them where no transaction
+			# is in progress, so it runs only on a build without assertions
+			foreach my $fn ('columnar_info', 'columnar_options', 'columnar_stripes', 'columnar_identity', 'columnar_creating_xid', 'columnar_table_xid')
+			{
+				my $name = "$fn of a table locked exclusively by another session, at commit";
+				if ($fn eq 'columnar_stripes' && $assertions)
+				{
+					SKIP:
+					{
+						skip "$order: $name: a set-returning function is called through the function manager, which a build with assertions refuses here", 1;
+						ok(1);
+					}
+					next;
+				}
+				my $sym = $fn eq 'columnar_stripes' ? 'NULL' : "'kingres_$fn'";
+				$fresh->();
+				my ($out, $err) = ('', '');
+				my $off = $log_from->();
+				$b->query_safe("BEGIN; LOCK TABLE u IN ACCESS EXCLUSIVE MODE");
+				my $timed_out = 0;
+				$node->psql('postgres', "SET kcevents.at = 'commit'; SET kcevents.op = 'sqlfn';
+BEGIN; SELECT kcevents_open('t'); SELECT kcevents_sql('kingres.$fn(regclass)'::regprocedure::oid, $uoid, $sym); INSERT INTO t VALUES (100); COMMIT;
+RESET kcevents.at; RESET kcevents.op;", stdout => \$out, stderr => \$err, on_error_stop => 0, timeout => 30, timed_out => \$timed_out);
+				$b->query_safe("ROLLBACK");
+				ok(!$timed_out, "$order: $name: returned at once (it did not wait for the lock)");
+				$node->poll_query_until('postgres', "SELECT count(*) = 0 FROM pg_stat_activity WHERE backend_type = 'client backend' AND pid <> pg_backend_pid() AND state <> 'idle'");
+				my $log = slurp_file($node->logfile, $off);
+				$alive->($name, $log);
+				like($err, qr/WARNING:  $fn refused: the table is locked exclusively by another transaction/, "$order: $name: refused with a warning, not waited for");
+				like($log, qr/kcevents: sqlfn $fn done rows=0 isnull=[01]/, "$order: $name: the answer is null or no rows");
+				is($rows->(), "$base,100", "$order: $name: the transaction committed");
+			}
+			$b->quit;
 		}
 	}
 
