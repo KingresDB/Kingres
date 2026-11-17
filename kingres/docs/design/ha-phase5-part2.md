@@ -104,7 +104,9 @@ Each is in `contrib/kingres_shard/README.md`; the number of the guarantee or of 
 | `promote_node(node_id)` answers `{"status": promoted \| completed \| already, "term", "final", "unreached", "blocked_by"}`; the caller repeats until `already` with `final` true; it refuses unless NEW is out of recovery, runs the same library and can commit; OLD is not waited for when it can be reached | guarantee 7, sequence 2, 9 |
 | The catalog term is raised by every `promote_node`; a node refuses a catalog push or a forwarded statement of an older term with `KS002`; a map primary that is superseded refuses every catalog change | "The catalog term" |
 | The map group is promoted on NEW itself; NEW must reach the primary of a strict majority of the groups other than the map group; until it has been accepted NEW changes no catalog; `promote_map_group_without_majority(node_id, acknowledgement)` is the operator's way out | guarantee 9, sequence 3 |
-| `switchover_mark()` on OLD returns M; `switchover_verify(M)` and `switchover_verify(X, true)` on NEW, X being "Latest checkpoint location" of `pg_controldata` of OLD's data directory | sequence 5 |
+| `switchover_mark()` on OLD returns M; `switchover_replayed(M)` on NEW says that NEW has replayed up to M and nothing more; the proof is `switchover_verify(X, state)` on NEW, X being "Latest checkpoint location" and state "Database cluster state" of `pg_controldata` of OLD's data directory, read after OLD stopped: `t` proven, `f` not replayed yet, error `KS006` never provable (the state is not `shut down`, or X is not OLD's shutdown checkpoint as the last record in NEW's WAL) | sequence 5 |
+| The refusals a caller must tell apart carry SQLSTATEs: `KS006` switchover not provable, `KS007` a node did not answer within `node_timeout` (do not repeat against that node), `KS008` another catalog call is running on the node (repeat later), `KS009` the node cannot commit, `KS010` wrong node, `KS011` still in recovery, `KS012` promotion not safe (an operator's decision), `KS013` transactions in doubt; `kingresd` decides by the SQLSTATE, never by the text | "SQLSTATEs of the answers" |
+| While a catalog call runs, every statement to a node waits at most `node_timeout`; a call ends within `2 x node_timeout + 2` s for each node that does not answer (`promote_node` and `check_cluster`: see the README table); a lock held on a node answers `KS007` or `55P03`, both naming the node | "Bounds that apply to every call" |
 | `recover_prepared_transactions()` on NEW and MAP; `check_cluster()` rows `standby_unreachable`, `standby_not_streaming`, `standby_not_in_recovery`, `prepared_rolled_back_after_failover`, `participant_lost_committed_transaction`, `decision_unconfirmed`, `foreign_prepared_transaction`; incidents are kept 30 days | "Detecting damage afterwards", guarantee 11, 12 |
 | The extension does not fence and never edits `synchronous_standby_names`; a promoted standby inherits its primary's list and every commit on it then waits for ever | precondition 1 and 3 |
 | Bounds: `promote_node` client timeout at least `3 x node_timeout + node_connect_timeout x nodes`; repeat loop at most 10 calls 2 s apart; a refused call at once; a commit that waits for a standby `2 x node_timeout + 5` s then `KS005` | "Bounds that apply to every call" |
@@ -396,9 +398,9 @@ promoted meanwhile). The receiving server acts on its own instances only.
 | `POST /failover/freeze`, `/unfreeze` | leader | the server of OLD | `{group, ttlMs, task}`: sets or clears the freeze; it lapses after `ttlMs` unless renewed (the task renews it every 30 s while it runs); `Agent.Frozen` reads it |
 | `POST /failover/standbys-gone` | leader | every server that runs the primary of some group | `{server}`: the agent treats the standbys on that server as not planned, so its list is emptied now and not after the grace (step F0b) |
 | `POST /failover/lease` | leader | the fence holder, then NEW's server | `{group, role: "fence" \| "holder", transferTo?, waitMs, expectedTerm}`: `Adopt`, or `Transfer` first, and report `AdoptionStatus` |
-| `POST /failover/demote` | leader | the server of OLD | `{group, mode: "fast" \| "immediate", expectedTerm, transferTo, mark}`: `Relinquish`, optionally `switchover_mark()`, stop the instance, confirm it is not running, read `pg_controldata`, then `transferTo` (or `release`); answer `{stopped, clean, mark, checkpoint, transferred}` |
+| `POST /failover/demote` | leader | the server of OLD | `{group, mode: "fast" \| "immediate", expectedTerm, transferTo, mark}`: `Relinquish`, optionally `switchover_mark()`, stop the instance, confirm it is not running, read `pg_controldata` (after the stop, as the last thing before the answer), then `transferTo` (or `release`); answer `{stopped, clean, mark, checkpoint, clusterState, transferred}`, `clusterState` being the text of "Database cluster state" as printed and `clean` true only when it is exactly `shut down` |
 | `POST /failover/quiesce`, `/unquiesce` | leader | the server of OLD | switchover only (section 5.2): stop writes to the group, and let them in again |
-| `POST /failover/verify` | leader | NEW's server | `{group, mark, checkpoint}`: `switchover_verify(mark)` and `switchover_verify(checkpoint, true)` on NEW's instance; answers both booleans |
+| `POST /failover/verify` | leader | NEW's server | `{group, mark, checkpoint, clusterState}`: `switchover_replayed(mark)` and `switchover_verify(checkpoint, clusterState)` on NEW's instance; answers `{replayed, verified, unprovable, detail}`: `unprovable` is true when the proof raised `KS006` (the text in `detail`) |
 | `POST /failover/promote` | leader (or the bootstrap, locally) | NEW's server | step F6: the lease check, the empty list, `pg_promote`, the role file, `Attach` |
 | `POST /failover/promote-node` | leader | NEW's server | map group only: `SELECT kingres.promote_node(id)` on NEW's own instance, answer as JSON; the repeat loop is the caller's |
 | `POST /failover/prepared` | leader | NEW's server | `SELECT kingres.recover_prepared_transactions()` on NEW's instance, and the count of `kingres_h%` prepared transactions there |
@@ -1210,9 +1212,9 @@ These replace F1 to F6 of section 3.3 for `mode: graceful`; F7 to F13 are the sa
 | S1. Freeze | F1 | as F1 |
 | S2. Stop the writes | `POST /failover/quiesce {group, task}` on OLD's server: (1) the client entry point of that server stops sending new connections to the instance (`clientproxy` hold flag, per group); (2) the access rules of the instance are replaced by the **hold rules**: only the replication connections of the standbys and the private socket of `kingresd`, written with `WriteHBA` and reloaded (so neither a client nor another node of the extension can open a new session); (3) every other session is ended with `pg_terminate_backend`, repeated every second until none is left except `kingresd`'s (bound 30 s); (4) `default_transaction_read_only = on` is not trusted (a session can override it) and is not used | `quiesced` go on; sessions remain after 30 s: **repeat** the termination, then fail `cannot_quiesce` after 2 minutes and roll back (5.3) |
 | S3. Let distributed transactions end | wait until `SELECT count(*) FROM pg_prepared_xacts WHERE gid LIKE 'kingres\_h%'` is 0 on every primary (`GET /failover/state`), calling `recover_prepared_transactions()` on MAP every 10 s (extension sequence 5, step 1) | zero: go on; not zero after 60 s: roll back (5.3), `prepared_transactions_pending` |
-| S4. Mark | `POST /failover/demote {mark: true, mode: "fast"}` on OLD's server calls `SELECT kingres.switchover_mark()` and keeps **M** | answer `mark`; an error here: roll back |
-| S5. Stop OLD cleanly | the same call: `Relinquish`, then `pg_ctl stop -m fast` (never smart: README sequence 5 step 3; bound 120 s, then a second try, then fail and roll back: it is not turned into `-m immediate`, because an immediate stop is not a clean one and the verification below would be the only protection), confirm not running, read **X** from `pg_controldata` ("Latest checkpoint location"), then `release` the lease (the instance is stopped and the marker is on disk) | `clean: true`, `mark`, `checkpoint` |
-| S6. Verify | `POST /failover/verify {mark: M, checkpoint: X}` on NEW's server; polled every second for 30 s while NEW may still be receiving: `switchover_verify(M)` must be `t` and then `switchover_verify(X, true)` must be `t` | both `t`: go on. Either stays `f` for 30 s: **do not promote** (the extension: "NEW is missing what OLD wrote"): roll back (5.3) and fail `standby_behind` |
+| S4. Mark | `POST /failover/demote {mark: true, mode: "fast"}` on OLD's server calls `SELECT kingres.switchover_mark()` and keeps **M**; before the stop, `POST /failover/verify {mark: M}` on NEW's server must answer `replayed` within 10 s (README sequence 5, step 2) | answer `mark`; an error here, or NEW does not replay M: roll back, `standby_behind` |
+| S5. Stop OLD cleanly | the same call: `Relinquish`, then `pg_ctl stop -m fast` (never smart: README sequence 5 step 3; bound 120 s, then a second try, then fail and roll back: it is not turned into `-m immediate`, because an immediate stop is not a clean one and the verification below would be the only protection), confirm not running, read **X** ("Latest checkpoint location") and the state ("Database cluster state") from `pg_controldata`, then `release` the lease (the instance is stopped and the marker is on disk) | `clean: true`, `mark`, `checkpoint`, `clusterState: "shut down"`; any other state: the stop was not clean, roll back (5.3) and fail `switchover_unproven` without asking NEW |
+| S6. Verify | `POST /failover/verify {mark: M, checkpoint: X, clusterState}` on NEW's server; polled every second for 30 s while NEW may still be receiving: `switchover_verify(X, state)` must be `t` | `t`: go on. Stays `f` for 30 s: **do not promote** (the extension: "NEW is missing what OLD wrote"): roll back (5.3) and fail `standby_behind`. `KS006`: it can never be proven (X is not a shutdown checkpoint at the end of NEW's WAL): **do not promote**, roll back (5.3) and fail `switchover_unproven`; a switchover never turns itself into a failover |
 | S7. Take the lease | `POST /failover/lease {group, role: "holder"}` on NEW's server: the lease was released at S5, so the first round obtains it; if it was not released the step waits as F3 | held: go on |
 | S8. Promote | F6 (`POST /failover/promote`), the same handler, with the lease check and the empty list; after this the point of no return is passed | as F6 |
 
@@ -1240,8 +1242,9 @@ runs once and is recorded under the task's lease like any step.
    NEW's server adopts only at S7.
 2. S7 reached but S8 not: `Transfer` the lease back to OLD's server (or let it lapse), then as 1.
 3. S2 to S4 (OLD still running): restore the rules, lift the hold flag, unfreeze.
-4. The task is recorded `failed` (code `standby_behind`, `cannot_quiesce`, `prepared_transactions_pending`,
-   `cancelled`) with the report; the alert `taskFailed` (for the first three), not for a cancel.
+4. The task is recorded `failed` (code `standby_behind`, `switchover_unproven`, `cannot_quiesce`,
+   `prepared_transactions_pending`, `cancelled`) with the report; the alert `taskFailed` (for the first
+   four), not for a cancel.
 5. After S8 the cancel is refused (409 `task_not_cancellable`) and the task rolls forward only.
 
 A rollback never runs after S8, and never because a hook ran: the task engine's rule (RB-01) is kept.
@@ -1557,7 +1560,7 @@ what 7.2 says.
 
 `superseded`, `lease_still_held`, `lease_held_elsewhere`, `lease_lost`, `quorum_unavailable`, `no_candidate`,
 `target_not_available`, `split_promotion`, `promote_timeout`, `promote_incomplete`, `not_map_primary`,
-`bad_promote_target`, `standby_behind`, `cannot_quiesce`, `prepared_transactions_pending`, `cancelled`,
+`bad_promote_target`, `standby_behind`, `switchover_unproven`, `cannot_quiesce`, `prepared_transactions_pending`, `cancelled`,
 `step_interrupted` (the engine's, not used by these tasks), `step_failed` (the engine's). Clients tolerate
 codes they do not know.
 
@@ -1773,7 +1776,7 @@ definition of done.
 | T11b | I6 | `TestOldPrimaryNeverReturns` | `standby-replace-after` 20 s, the old server stays down | `groupUnderReplicated` raised, `oldPrimaryNotRebuilt` after 10 s of the shortened rule, the record removed in the order of sequence 8 (the list first: no commit blocks, a distributed commit does not get `KS005`), a replacement created on another server |
 | T11c | I6 | `TestOldPrimaryRunningUnfenced` | stop its `kingresd` and its watchdog, keep the instance (the rare case), cut it off, fail over, let it back | F7's last-resort demote stops it, `oldPrimaryRunning` is raised, the report states the window, the rebuild discards the writes |
 | T12 | switchover | `TestSwitchoverAndBack` (loop) | `Writers` at `sync`; `failoverServer` `graceful`; then `restorePreferredPrimaries` | zero acknowledged commits lost, the old primary adopted with method `clean` (no rewind), the write pause (S2 to F12) is measured and reported, the term rises by one each time, `unreached` is `[<old>]` at F7; the map group last |
-| T12b | switchover | `TestSwitchoverVerificationFails` | break NEW's replication (closed port) just before S6 | `switchover_verify` stays false, the task rolls back: OLD started again, rules restored, writes accepted again, `standby_behind`, NEW never promoted |
+| T12b | switchover | `TestSwitchoverVerificationFails` | break NEW's replication (closed port) just before S6 | `switchover_verify` stays false, the task rolls back (a second case: OLD killed instead of stopped, the state is not `shut down`, `switchover_unproven`): OLD started again, rules restored, writes accepted again, `standby_behind`, NEW never promoted |
 | T12c | switchover | `TestCancelBeforeAndAfterThePointOfNoReturn` | cancel at S2, S3, S5, S6, S7 and after S8 | before S8 the rollback of 5.3 and `cancelled`; after it 409 `task_not_cancellable` and the task finishes |
 | T13 | auto | `TestAutomaticFailoverRules` | `timeoutSeconds` 30 and lease settings shortened by flags | disabled: nothing; limit reached: nothing and the alert, then `resetAutoFailoverCounter` and it proceeds; no standby: `failoverBlocked`; asynchronous standby with a `sync` database: `failoverNeedsDecision` and no promotion; all-async: promotes; a rebalance running: stopped first; a server that returns before the timeout: nothing; a one-way cut: nothing |
 | T14 | fencing | `TestStalledProcessesDoNotJudge` | pause the leader's `kingresd` for longer than the timeout, resume; step the wall clock of a server by an offset during F3 and F6 | no failover starts from the stall; the clock step changes no decision |
@@ -1922,6 +1925,12 @@ is in the section named).
     `default_transaction_read_only` (5.2).
 15. A forced failover without a majority is **not** in this part; `ha-phase5.md` promised it (4.7, 11.4).
 16. The task id of a map-group bootstrap is 0 until the task is recorded (3.4, 11.5).
+17. After the second review of the extension's call sequences
+    ([reviews/2026-11-16-kingres-shard-0.5-second-sequences.md](../reviews/2026-11-16-kingres-shard-0.5-second-sequences.md))
+    the proof of a switchover takes the control file's state as well as the checkpoint position and has
+    three answers; a proof that can never be given fails the task with `switchover_unproven` and rolls
+    back, it does not promote (5.2, S4 to S6). `kingresd` reads the SQLSTATE of a refusal of the
+    extension, and a node that did not answer (`KS007`) is not asked again by the same step (1.4).
 
 ## To be verified
 
