@@ -69,6 +69,7 @@ bool		kingres_shard_enable_routing = true;
 bool		kingres_shard_forwarded = false;
 int			kingres_shard_node_connect_timeout = 5;
 int			kingres_shard_node_timeout = 60;
+int			kingres_shard_control_call_timeout = 0;
 char	   *kingres_shard_node_conninfo = NULL;
 int			kingres_shard_recovery_interval = 30;
 bool		kingres_shard_enable_distributed_scan = true;
@@ -152,6 +153,18 @@ _PG_init(void)
 							"Bounds COMMIT PREPARED, the cleanup of aborted transactions and every wait of the recovery worker; also the time a connection to an unresponsive node survives.",
 							&kingres_shard_node_timeout,
 							60, 1, 3600,
+							PGC_USERSET, GUC_UNIT_S,
+							NULL, NULL, NULL);
+
+	/*
+	 * S13-02: an opt-in bound for the whole of a control-plane call.  0 (the default) means none: a call
+	 * that is working is bounded per statement by node_timeout and nothing else.
+	 */
+	DefineCustomIntVariable("kingres_shard.control_call_timeout",
+							"Seconds after which a control-plane call that is still working is ended as a whole (0: no limit).",
+							"Counted from the start of the call; checked between the statements that the call sends to nodes, and every wait is cut to what is left.  The error (KS015) does not say that a node is dead.",
+							&kingres_shard_control_call_timeout,
+							0, 0, 86400,
 							PGC_USERSET, GUC_UNIT_S,
 							NULL, NULL, NULL);
 

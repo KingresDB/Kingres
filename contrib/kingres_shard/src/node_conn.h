@@ -71,6 +71,15 @@ typedef struct KsConn
 	 * not commit afterwards.  The writes of a control call are its own business: it decides per node.
 	 */
 	bool		wrote_user;
+	/*
+	 * a statement of a control-plane call (inside kingres_shard_control_call) was sent through this
+	 * session in the current transaction (S13-01): the statements the extension sends to it that end
+	 * its work (COMMIT TRANSACTION, RELEASE, ROLLBACK TO) wait at most node_timeout, however the
+	 * control depth is when they are sent.
+	 */
+	bool		control_work;
+	/* the id of the registered node at host:port when the session was got, 0 if none (for messages) */
+	int			node_id;
 	/* an asynchronous fetch of one scan is in flight on conn */
 	void	   *pending_owner;
 	KsPendingFinish pending_finish;

@@ -74,7 +74,7 @@ use KingresShardTest qw(make_cluster keys_of_group make_standby register_standby
 	($rc, $out, $err) = run_sql($n1,
 		"SET kingres_shard.node_timeout = 2; BEGIN; INSERT INTO public.kv VALUES ($ka, 'a'); INSERT INTO public.kv VALUES ($kb, 'b'); COMMIT;",
 		extra_params => [ '-v', 'VERBOSITY=verbose' ]);
-	like($err, qr/ERROR:  KS005: node \S+:\d+ did not confirm that its part of the transaction is durable on its synchronous standby/,
+	like($err, qr/ERROR:  KS005: node (?:\d+ \()?\S+:\d+\)? did not confirm that its part of the transaction is durable on its synchronous standby/,
 		'[B] a participant whose standby is away: KS005 with that text');
 }
 

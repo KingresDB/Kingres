@@ -1308,6 +1308,14 @@ kingres_add_node(PG_FUNCTION_ARGS)
 }
 
 /*
+ * S13-06: a node that was let go without clearing its catalog still holds the cluster secret, and the nodes of
+ * the cluster accept its sessions until the secret is rotated.
+ */
+#define REMOVED_NODE_HINT \
+	"The removed node still holds its catalog and the cluster secret, so the nodes of the cluster still accept its sessions: " \
+	"run kingres.rotate_secret() (it no longer includes this node) to shut it out, and reset the node when it is back."
+
+/*
  * clear_removed_node
  *
  * The removed node's own catalog is cleared in the transaction of the removal.  A node that
@@ -1323,7 +1331,7 @@ kingres_add_node(PG_FUNCTION_ARGS)
  * node_conn.c on its own state only, which abandoning the session resets.
  */
 static void
-clear_removed_node(KsConn *kc, const char *host, int port)
+clear_removed_node(KsConn *kc, int node_id, const char *host, int port)
 {
 	MemoryContext oldcxt = CurrentMemoryContext;
 
@@ -1341,14 +1349,20 @@ clear_removed_node(KsConn *kc, const char *host, int port)
 
 		MemoryContextSwitchTo(oldcxt);
 		edata = CopyErrorData();
-		if (ERRCODE_TO_CATEGORY(edata->sqlerrcode) == ERRCODE_OPERATOR_INTERVENTION)
+		/*
+		 * The user's cancel and the time of the call as a whole (KS015, S13-02) are not a node that stopped
+		 * answering: the call goes on with them as an error, it does not let the node go.
+		 */
+		if (ERRCODE_TO_CATEGORY(edata->sqlerrcode) == ERRCODE_OPERATOR_INTERVENTION ||
+			edata->sqlerrcode == ERRCODE_KINGRES_CALL_TIMEOUT)
 			PG_RE_THROW();
 		FlushErrorState();
 		kingres_shard_conn_abandon(kc);
 		ereport(WARNING,
 				(errcode(edata->sqlerrcode),
-				 errmsg("could not reach node %s:%d; its catalog was not cleared", host, port),
-				 errdetail_internal("%s", edata->message)));
+				 errmsg("could not reach node %d (%s:%d); its catalog was not cleared", node_id, host, port),
+				 errdetail_internal("%s", edata->message),
+				 errhint("%s", REMOVED_NODE_HINT)));
 		FreeErrorData(edata);
 	}
 	PG_END_TRY();
@@ -1465,10 +1479,11 @@ kingres_remove_node_body(PG_FUNCTION_ARGS)
 
 		if (kc == NULL)
 			ereport(WARNING,
-					(errmsg("could not reach node %s:%d; its catalog was not cleared", host, port),
-					 errdetail_internal("%s", err)));
+					(errmsg("could not reach node %d (%s:%d); its catalog was not cleared", node_id, host, port),
+					 errdetail_internal("%s", err),
+					 errhint("%s", REMOVED_NODE_HINT)));
 		else
-			clear_removed_node(kc, host, port);
+			clear_removed_node(kc, node_id, host, port);
 	}
 
 	argtypes[0] = INT4OID;

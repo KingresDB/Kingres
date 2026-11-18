@@ -21,7 +21,14 @@
 # answers of a connection are not delayed), turn_log (a file to which every delayed answer appends a line:
 # the number of statements that a call sent to the node), chunk_log (a file to which every
 # chunk from the client appends "<connection> <number of the chunk>", so that a test knows how many
-# chunks a call sends: the sweep over swallow_after runs up to that number).
+# chunks a call sends: the sweep over swallow_after runs up to that number), text_log (a file to which every chunk
+# from the client appends "<connection> <number of the chunk> <its first 100 bytes, printable>": the sweeps find the
+# chunk that carries a RELEASE, a COMMIT, a PREPARE), and three more ways to fail at the n-th chunk of a connection, which
+# the sweeps run like swallow_after (S13-05): close_after (the chunk after the n-th closes the connection), lose_answer
+# (the node gets the n-th chunk and what it answers is dropped, the connection stays open), error_at (the node never gets
+# the n-th chunk; the client is answered with an ErrorResponse, XX000, and a ReadyForQuery that says "failed transaction").
+# A statement that spans several chunks is cut by error_at into a protocol error on the node, which ends as a closed
+# connection.
 
 package KsProxy;
 
@@ -42,7 +49,7 @@ sub new
 	  or die "proxy listen: $!";
 	my $self = bless { %opt, listen => $listen, port => $listen->sockport, kids => [] }, $class;
 	$self->{ctl} //= ($ENV{TESTDATADIR} // ".") . "/ksproxy_$$" . "_" . $self->{port};
-	$self->set(map { $_ => $self->{$_} } grep { defined $self->{$_} } qw(delay swallow_after swallow_all start_delay skip_chunks delay_turn skip_turns chunk_log turn_log));
+	$self->set(map { $_ => $self->{$_} } grep { defined $self->{$_} } qw(delay swallow_after swallow_all start_delay skip_chunks delay_turn skip_turns chunk_log turn_log text_log close_after lose_answer error_at));
 	my $pid = fork();
 	die "fork: $!" unless defined $pid;
 	if ($pid == 0)
@@ -100,7 +107,7 @@ sub set
 sub options
 {
 	my ($self) = @_;
-	my %o = map { $_ => $self->{$_} } grep { defined $self->{$_} } qw(delay swallow_after swallow_all start_delay skip_chunks delay_turn skip_turns chunk_log turn_log);
+	my %o = map { $_ => $self->{$_} } grep { defined $self->{$_} } qw(delay swallow_after swallow_all start_delay skip_chunks delay_turn skip_turns chunk_log turn_log text_log close_after lose_answer error_at);
 	if (open(my $h, '<', $self->{ctl}))
 	{
 		%o = ();
@@ -140,6 +147,26 @@ sub serve
 					print $lh "$$ $chunks\n";
 					close $lh;
 				}
+				if ($o->{text_log} && open(my $xh, '>>', $o->{text_log}))
+				{
+					my $t = substr($buf, 0, 100);
+					$t =~ s/[^ -~]/./g;
+					print $xh "$$ $chunks $t\n";
+					close $xh;
+				}
+				# close_after n: the chunk after the n-th closes the connection (both sides), so the client sees it closed
+				return if defined $o->{close_after} && $o->{close_after} ne '' && $chunks > $o->{close_after};
+				# error_at n: the node never sees the n-th chunk; the client is answered with an ErrorResponse and a
+				# ReadyForQuery that says "failed transaction": the answer of a node that refused the statement.  For
+				# the startup packet it is a FATAL error and the connection is closed.
+				if (defined $o->{error_at} && $o->{error_at} ne '' && $chunks == $o->{error_at})
+				{
+					my $sev = $chunks == 1 ? 'FATAL' : 'ERROR';
+					my $f = "S$sev\0V$sev\0CXX000\0Mfault injected by the test forwarder\0\0";
+					syswrite($c, pack('A1 N', 'E', 4 + length($f)) . $f . ($chunks == 1 ? '' : pack('A1 N A1', 'Z', 5, 'E')));
+					return if $chunks == 1;
+					next;
+				}
 				$swallowing = 1
 				  if defined $o->{swallow_after} && $o->{swallow_after} ne '' && $chunks > $o->{swallow_after};
 				syswrite($s, $buf) unless $swallowing;
@@ -151,6 +178,8 @@ sub serve
 			else
 			{
 				next if $swallowing;
+				# lose_answer n: what the node sends while the n-th chunk of the client is the last one is dropped
+				next if defined $o->{lose_answer} && $o->{lose_answer} ne '' && $chunks == $o->{lose_answer};
 				$schunks++;
 				sleep $o->{start_delay} if $schunks == 1 && $o->{start_delay};
 				sleep $o->{delay} if $o->{delay} && $schunks > ($o->{skip_chunks} // 0);

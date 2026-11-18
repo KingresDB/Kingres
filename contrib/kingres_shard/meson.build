@@ -190,6 +190,11 @@ tests += {
       't/104_s12_fixes.pl',
       't/105_fragment_foundation.pl',
       't/106_scan_failover.pl',
+      't/107_s13_fixes.pl',
+      't/108_sweep_modes.pl',
+      't/109_sweep_variants.pl',
+      't/110_sweep_promote_scenarios.pl',
+      't/111_two_nodes.pl',
     ],
   },
 }

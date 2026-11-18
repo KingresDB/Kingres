@@ -114,7 +114,8 @@ sub has_previous { return $_[0]->safe_psql('postgres', 'SELECT previous IS NOT N
 	my ($rc, $out, $err) = run_sql($map, "\\set VERBOSITY verbose\nSELECT kingres.promote_node($id)");
 	isnt($rc, 0, "[$prefix] promote_node refuses the node that holds another secret");
 	like($err, qr/KS014/, "[$prefix] with KS014, not 08006 ($err)");
-	like($err, qr/holds a cluster secret that no node of the cluster has/, "[$prefix] and says what is wrong");
+	like($err, qr/hold cluster secrets that do not match, and either may be the one that is behind/, "[$prefix] and says what is wrong, naming both possibilities (S13-04)");
+	like($err, qr/ask a third node of the cluster/, "[$prefix] and how to tell them apart before anything is rebuilt");
 	like($err, qr/base backup|remove_node/, "[$prefix] and what to do");
 	unlike($err, qr/08006/, "[$prefix] not the bare connection failure");
 	$sb->stop('immediate');
