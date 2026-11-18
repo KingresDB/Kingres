@@ -351,7 +351,7 @@ func TestKeyIDCollisionIsReportedAsWhatItIs(t *testing.T) {
 	}
 	// Re-signing with the trusted keys known names both.
 	one, _ := SignCheckpoint(bg, c, a)
-	_, err = ResignCheckpoint(bg, one, []ed25519.PublicKey{a.Public(), b.Public()}, b)
+	_, err = ResignCheckpoint(bg, one, usable(a.Public(), b.Public()), b)
 	wantCollision(t, "ResignCheckpoint", err, a, b, true)
 	// Two such keys among the trusted ones: the verifier cannot tell the
 	// lines apart and refuses; so does VerifyNote and VerifyCheckpoint.
@@ -447,7 +447,7 @@ func TestResignCheckpointVerifiesWhatItKeeps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	trusted := []ed25519.PublicKey{k1.Public()}
+	trusted := usable(k1.Public())
 	two, err := ResignCheckpoint(bg, one, trusted, k2)
 	if err != nil {
 		t.Fatal(err)
@@ -457,11 +457,11 @@ func TestResignCheckpointVerifiesWhatItKeeps(t *testing.T) {
 	}
 	// Nothing verifies under the trusted keys: refused, and no signature of
 	// the new key is attached to text that nobody verified.
-	for name, trusted := range map[string][]ed25519.PublicKey{
+	for name, trusted := range map[string][]ledgerkeys.TrustKey{
 		"no trusted key":       nil,
-		"another trusted key":  {stranger.Public()},
-		"the new key only":     {k2.Public()},
-		"a key of no size":     {ed25519.PublicKey{1}},
+		"another trusted key":  usable(stranger.Public()),
+		"the new key only":     usable(k2.Public()),
+		"a key of no size":     usable(ed25519.PublicKey{1}),
 		"a trusted key, empty": {},
 	} {
 		out, err := ResignCheckpoint(bg, one, trusted, k2)
@@ -484,7 +484,7 @@ func TestResignCheckpointVerifiesWhatItKeeps(t *testing.T) {
 	bad := bytes.Clone(two)
 	i := bytes.Index(bad, []byte("\n\n")) + 2 + len("\u2014 ") + len(c.Origin) + 1 + 10
 	bad[i] ^= 1
-	if _, err := ResignCheckpoint(bg, bad, []ed25519.PublicKey{k1.Public(), k2.Public()}, testKey(t, 91)); err == nil {
+	if _, err := ResignCheckpoint(bg, bad, usable(k1.Public(), k2.Public()), testKey(t, 91)); err == nil {
 		t.Error("a note with a damaged line was re-signed")
 	}
 	// A note signed by an untrusted key only: the unknown line is ignored by

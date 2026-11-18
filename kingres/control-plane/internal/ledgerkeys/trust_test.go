@@ -68,7 +68,7 @@ func TestTrustFileContent(t *testing.T) {
 	s = okSet(t)(s.Activate(fp(2), t0.Add(2*time.Hour), 0))
 	s = okSet(t)(s.Retire(fp(1), t0.Add(3*time.Hour), AtMost(77)))
 	s = okSet(t)(mustAdd(s, 3, "", t0.Add(90*time.Minute)))
-	s = okSet(t)(s.Revoke(fp(3), t0.Add(4*time.Hour), t0, "x"))
+	s = okSet(t)(s.Revoke(fp(3), t0.Add(4*time.Hour), t0.Add(90*time.Minute), "x"))
 	es, err := TrustEntries(s, TrustOptions{})
 	if err != nil || len(es) != 3 {
 		t.Fatalf("%v %v", err, es)

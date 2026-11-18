@@ -69,8 +69,10 @@ const (
 	// refuses the whole file for any other value.
 	MaxTrustTreeSize uint64 = 1<<62 - 1
 	// MaxActivationLeadDays is how far after the latest time the set records
-	// (a creation, activation, retirement or revocation of any key) Activate
-	// accepts an activation time: 366 days. See Activate.
+	// (a creation, activation, retirement or revocation of any key) Add,
+	// Activate, Retire and Revoke accept a time: 366 days, the tolerance of the
+	// package against a clock that is wrong by years. See Set.RecordLimit and
+	// correction 107.
 	MaxActivationLeadDays = 366
 )
 
@@ -85,10 +87,17 @@ var (
 	ErrInvalidArgument = errors.New("ledgerkeys: invalid argument")
 	ErrNotAllowed      = errors.New("ledgerkeys: the key may not sign this")
 	// ErrInvalidTime marks a time that a transition refuses: zero, outside the
-	// years 1 to 9999 (the trust file cannot write others), or an activation
-	// too far after everything the set records. It is also an
+	// years 1 to 9999 (the trust file cannot write others), a time more than
+	// MaxActivationLeadDays after everything the set records, or an activation
+	// or a compromised-since before the creation of the key. It is also an
 	// ErrInvalidArgument.
 	ErrInvalidTime = errors.New("ledgerkeys: invalid time")
+	// ErrNotInForce: Signers found no key that may sign at the time asked, but
+	// the set holds an active key whose activation time is later (a clock that
+	// stepped back, or an activation that is still to come). It is NOT
+	// ErrNoActiveKey and not a sign of a damaged set: the key becomes usable at
+	// its activation time (see NotInForceError). The caller still must not sign.
+	ErrNotInForce = errors.New("ledgerkeys: the active key is not in force yet")
 	// ErrNoActiveKey: no key of the set may sign checkpoints. Signers returns
 	// it when no key is active at the time asked. Validate returns it for a
 	// set that has been in service (some key has left the state next) and
@@ -96,6 +105,23 @@ var (
 	// (before its first activation), are legal and do not return it.
 	ErrNoActiveKey = errors.New("ledgerkeys: no key of the set is active")
 )
+
+// NotInForceError is the error of Signers when the set holds an active key but
+// none is in force at the time asked. From is the activation time of the first
+// such key: the key becomes usable then, and the set is not damaged.
+type NotInForceError struct {
+	Fingerprint string
+	From, Now   time.Time
+}
+
+// Error says what happened and what it is not.
+func (e *NotInForceError) Error() string {
+	return fmt.Sprintf("%s: key %s is active from %s and the time asked is %s; this is not a damaged set (a clock that stepped back, or an activation still to come): do not sign until then",
+		ErrNotInForce.Error(), shortFP(e.Fingerprint), e.From.Format(time.RFC3339), e.Now.Format(time.RFC3339))
+}
+
+// Is reports whether target is ErrNotInForce.
+func (e *NotInForceError) Is(target error) bool { return target == ErrNotInForce }
 
 // TreeBound is the decision about the largest tree a retired key may still
 // sign, which Retire needs: either a size (AtMost) or an explicit Unbounded.
@@ -332,6 +358,19 @@ func (s Set) Validate() error {
 		if err != nil {
 			return err
 		}
+		// The times of a key are in the order a key can have: creation, then
+		// activation, then retirement or revocation (K3-05, correction 107).
+		if !k.ActivatedAt.IsZero() && k.ActivatedAt.Before(k.CreatedAt) {
+			return fmt.Errorf("%w: %w: key %s was activated before it was created", ErrInvalidArgument, ErrInvalidTime, fp[:16])
+		}
+		if k.State == StateRevoked {
+			if k.CompromisedSince.Before(k.CreatedAt) {
+				return fmt.Errorf("%w: %w: key %s is compromised since a time before it was created", ErrInvalidArgument, ErrInvalidTime, fp[:16])
+			}
+			if k.RevokedAt.Before(k.ActivatedAt) || k.RevokedAt.Before(k.RetiredAt) {
+				return fmt.Errorf("%w: key %s was revoked before it was activated or retired", ErrInvalidArgument, fp[:16])
+			}
+		}
 		if k.State != StateRetired && k.MaxTreeSize != 0 {
 			return fmt.Errorf("%w: MaxTreeSize is only for a retired key", ErrInvalidArgument)
 		}
@@ -407,9 +446,13 @@ func firstError(errs ...error) error {
 	return nil
 }
 
-// Add enters a new key in state next, without looking at key id collisions
-// (see AddChecked, which a caller that publishes logs uses instead). now must
-// be a time of the years 1 to 9999 (ErrInvalidTime otherwise).
+// Add enters a new key in state next, WITHOUT looking at key id collisions. It
+// is for tests and for a set that is under no origin yet; a caller that
+// publishes logs uses AddChecked, because a collision that gets into the set
+// cannot be cured (correction 101), and TrustFile refuses to write a trust file
+// for a set that holds one under the origins it is given (K3-08). now must be a
+// time of the years 1 to 9999 and not later than RecordLimit (ErrInvalidTime
+// otherwise).
 func (s Set) Add(pub ed25519.PublicKey, label string, now time.Time) (Set, error) {
 	return s.add(pub, label, now, nil)
 }
@@ -423,6 +466,13 @@ func (s Set) Add(pub ed25519.PublicKey, label string, now time.Time) (Set, error
 // transition; this is the one place where it can be refused. origins are the
 // key names of every log the key will sign (the origins of all the logs of the
 // cluster, one per log and epoch); at least one is needed.
+//
+// It looks at the pairs that contain the NEW key and at nothing else: an old
+// colliding pair already in the set (found after the fact, or from an origin
+// that did not exist when the two keys were added) does not stop a new key
+// that collides with neither, and the error names the new key and the key it
+// collides with, never the old pair (K3-02, correction 107). Use CheckSetKeyIDs
+// to see every pair of a set.
 func (s Set) AddChecked(pub ed25519.PublicKey, label string, now time.Time, origins ...string) (Set, error) {
 	if len(origins) == 0 {
 		return nil, fmt.Errorf("%w: AddChecked needs at least one origin to check the key id under", ErrInvalidArgument)
@@ -437,6 +487,9 @@ func (s Set) AddChecked(pub ed25519.PublicKey, label string, now time.Time, orig
 
 func (s Set) add(pub ed25519.PublicKey, label string, now time.Time, origins []string) (Set, error) {
 	if err := checkTime("the creation time", norm(now)); err != nil {
+		return nil, err
+	}
+	if err := s.checkAhead("the creation time", norm(now)); err != nil {
 		return nil, err
 	}
 	if len(pub) != ed25519.PublicKeySize {
@@ -458,12 +511,51 @@ func (s Set) add(pub ed25519.PublicKey, label string, now time.Time, origins []s
 		}
 	}
 	out := append(s.clone(), k)
+	fp := k.Fingerprint()
 	for _, o := range origins {
-		if err := CheckSetKeyIDs(out, TrustOptions{IncludeNext: true}, o); err != nil {
+		all, err := setCollisions(out, TrustOptions{IncludeNext: true}, o)
+		if err != nil {
+			return nil, err
+		}
+		var mine []KeyIDCollision
+		for _, c := range all {
+			if c.A == fp || c.B == fp {
+				mine = append(mine, c)
+			}
+		}
+		if err := collisionError(mine); err != nil {
 			return nil, err
 		}
 	}
 	return out, nil
+}
+
+// RecordLimit is the latest time Add, Activate, Retire and Revoke accept: the
+// latest time the set records (a creation, activation, retirement or revocation
+// of any key) plus MaxActivationLeadDays. A set with no key has no limit and
+// returns the zero time. The package has no clock, so this is how it limits a
+// time that is wrong by years: no operation can record a time beyond it, so no
+// operation can push the limit of the next one far ahead. A set whose latest
+// record is older than that (idle for more than a year) is brought forward in
+// steps: the caller passes min(now, RecordLimit()) to the operation that must
+// record a time before the real one (see Add and the package documentation).
+func (s Set) RecordLimit() time.Time {
+	l := s.latest()
+	if l.IsZero() {
+		return time.Time{}
+	}
+	return l.AddDate(0, 0, MaxActivationLeadDays)
+}
+
+// checkAhead refuses a time later than RecordLimit.
+func (s Set) checkAhead(what string, t time.Time) error {
+	limit := s.RecordLimit()
+	if limit.IsZero() || !t.After(limit) {
+		return nil
+	}
+	return fmt.Errorf("%w: %w: %s %s is more than %d days after the latest time the set records (%s): a clock error? "+
+		"A set that was idle for longer is brought forward in steps, with a time of at most RecordLimit() (%s) for the operation that records a time before the real one",
+		ErrInvalidArgument, ErrInvalidTime, what, t.Format(time.RFC3339), MaxActivationLeadDays, s.latest().Format(time.RFC3339), limit.Format(time.RFC3339))
 }
 
 // latest is the latest time the set records: the creation, activation,
@@ -485,17 +577,22 @@ func (s Set) latest() time.Time {
 // the default is DefaultOverlapDays when overlapDays is 0), after which it is
 // due to retire. A third active key is refused.
 //
-// now must be a time of the years 1 to 9999, and not later than the latest
-// time the set records (creations, activations, retirements and revocations of
-// any key) plus MaxActivationLeadDays. The package has no clock, so this is
-// all it can say about a clock error: it catches an activation time that is
-// far beyond everything the set holds (the year 2099 for a set that was last
-// changed in 2026, which would make the key "not in force" for decades), at
-// the moment it happens. It cannot catch a wrong time within
-// MaxActivationLeadDays of the last record, a time that is wrong but earlier
-// than the records, or a set that is simply old; a key that waited more than
-// MaxActivationLeadDays as next is refused too (add a fresh key, whose creation
-// time is recent, and revoke the stale one if it must go). A key that is
+// now must be a time of the years 1 to 9999, not before the creation of the
+// key (a clock that stepped back: try again when it has passed it), and not
+// later than RecordLimit, the latest time the set records (creations,
+// activations, retirements and revocations of any key) plus
+// MaxActivationLeadDays. Add, Retire and Revoke refuse a time beyond the same
+// limit, so no operation can record a far time that would move the limit of the
+// next one (K3-03). The package has no clock, so this is all it can say about a
+// clock error: it catches a time that is far beyond everything the set holds
+// (the year 2099 for a set that was last changed in 2026, which would make the
+// key "not in force" for decades), at the moment it happens. It cannot catch a
+// wrong time within MaxActivationLeadDays of the last record, a clock that is
+// wrong consistently, or a time that is wrong but earlier than the records; the
+// daemon compares its clock with a second source before every transition. A key
+// that waited more than MaxActivationLeadDays as next is refused too: see the
+// package documentation for the order that works (add a fresh key at
+// RecordLimit, activate it, then revoke the stale one). A key that is
 // active but not yet in force (activation later than the time of the call)
 // does not sign, does not count as the other key of Retire or Revoke, and can
 // itself be retired (see Retire).
@@ -522,9 +619,12 @@ func (s Set) Activate(fp string, now time.Time, overlapDays int) (Set, error) {
 	if err := checkTime("the activation time", now); err != nil {
 		return nil, err
 	}
-	if limit := s.latest().AddDate(0, 0, MaxActivationLeadDays); now.After(limit) {
-		return nil, fmt.Errorf("%w: %w: the activation time %s is more than %d days after the latest time the set records (%s): a clock error? An activation that far ahead would leave the key not in force for a long time",
-			ErrInvalidArgument, ErrInvalidTime, now.Format(time.RFC3339), MaxActivationLeadDays, s.latest().Format(time.RFC3339))
+	if err := s.checkAhead("the activation time", now); err != nil {
+		return nil, err
+	}
+	if now.Before(s[i].CreatedAt) {
+		return nil, fmt.Errorf("%w: %w: the activation time %s is before the creation of the key (%s): a clock that stepped back? Try again when the clock has passed it",
+			ErrInvalidArgument, ErrInvalidTime, now.Format(time.RFC3339), s[i].CreatedAt.Format(time.RFC3339))
 	}
 	if active == 1 {
 		end := now.AddDate(0, 0, overlapDays)
@@ -598,6 +698,9 @@ func (s Set) Retire(fp string, now time.Time, bound TreeBound) (Set, error) {
 	if err := checkTime("the time of the retirement", now); err != nil {
 		return nil, err
 	}
+	if err := s.checkAhead("the time of the retirement", now); err != nil {
+		return nil, err
+	}
 	if !s.otherActive(fp, now) {
 		return nil, s.noOtherSigner(fp)
 	}
@@ -620,7 +723,11 @@ func (s Set) Retire(fp string, now time.Time, bound TreeBound) (Set, error) {
 // pass now for "now"). A key in any state but revoked can be revoked, and the
 // event is signed by a different active key whose activation time is not later
 // than now, so one must exist. reason is at most MaxReasonSize bytes of
-// printable ASCII.
+// printable ASCII. now is bounded by RecordLimit like every recorded time, and
+// compromisedSince is not before the creation of the key (ErrInvalidTime),
+// unless now itself is before the creation (a clock behind the record), when it
+// is recorded as the creation. The time recorded as the revocation is never
+// before the creation, activation or retirement of the key.
 func (s Set) Revoke(fp string, now, compromisedSince time.Time, reason string) (Set, error) {
 	i := s.find(fp)
 	if i < 0 {
@@ -636,6 +743,9 @@ func (s Set) Revoke(fp string, now, compromisedSince time.Time, reason string) (
 	if err := checkTime("compromised-since", compromisedSince); err != nil {
 		return nil, err
 	}
+	if err := s.checkAhead("the time of the revocation", now); err != nil {
+		return nil, err
+	}
 	if !s.otherActive(fp, now) {
 		return nil, s.noOtherSigner(fp)
 	}
@@ -645,14 +755,27 @@ func (s Set) Revoke(fp string, now, compromisedSince time.Time, reason string) (
 	if compromisedSince.After(now) {
 		return nil, fmt.Errorf("%w: compromised-since must not be after the time of the revocation", ErrInvalidArgument)
 	}
+	// A key cannot be compromised before it exists (K3-05). The one exception is
+	// a clock that is behind the creation of the key (now itself is before it):
+	// a revocation is never refused for the time the clock shows, so
+	// compromised-since is then recorded as the creation.
+	if compromisedSince.Before(s[i].CreatedAt) {
+		if !now.Before(s[i].CreatedAt) {
+			return nil, fmt.Errorf("%w: %w: compromised-since %s is before the creation of the key (%s): a key cannot be compromised before it exists; pass the creation time or later",
+				ErrInvalidArgument, ErrInvalidTime, compromisedSince.Format(time.RFC3339), s[i].CreatedAt.Format(time.RFC3339))
+		}
+		compromisedSince = s[i].CreatedAt
+	}
 	out := s.clone()
 	k := &out[i]
-	// A revocation must not fail because the clock is behind the creation of
-	// the key: RevokedAt is never before CreatedAt (Validate), so a time before
-	// it is recorded as the creation time.
+	// A revocation must not fail because the clock is behind the record of the
+	// key: RevokedAt is never before CreatedAt, ActivatedAt or RetiredAt
+	// (Validate), so an earlier time is recorded as the latest of them.
 	revokedAt := now
-	if revokedAt.Before(k.CreatedAt) {
-		revokedAt = k.CreatedAt
+	for _, u := range []time.Time{k.CreatedAt, k.ActivatedAt, k.RetiredAt} {
+		if revokedAt.Before(u) {
+			revokedAt = u
+		}
 	}
 	k.State, k.RevokedAt, k.CompromisedSince, k.Reason = StateRevoked, revokedAt, compromisedSince, reason
 	k.OverlapEnds, k.MaxTreeSize = time.Time{}, 0
@@ -664,14 +787,27 @@ func (s Set) Revoke(fp string, now, compromisedSince time.Time, reason string) (
 // whose activation is not later than now, the older first. At most two. It
 // returns ErrNoActiveKey (and no keys) when none may sign, so a caller cannot
 // sign with an empty list by forgetting to check its length.
+//
+// When no key may sign only because every active key has an activation time
+// later than now (a clock that stepped back by a second or an hour, or an
+// activation still to come), the error is a *NotInForceError (ErrNotInForce),
+// which says when the first of them becomes usable, and is NOT ErrNoActiveKey:
+// the set is not damaged and the caller's alarm is not the one for a damaged
+// set. The caller still does not sign until then (K3-06).
 func (s Set) Signers(now time.Time) ([]Key, error) {
 	var out []Key
+	var waiting *NotInForceError
 	for _, k := range s {
 		if k.MaySign(PurposeCheckpoint, "", now) == nil {
 			out = append(out, k)
+		} else if k.State == StateActive && now.Before(k.ActivatedAt) && (waiting == nil || k.ActivatedAt.Before(waiting.From)) {
+			waiting = &NotInForceError{Fingerprint: k.Fingerprint(), From: k.ActivatedAt, Now: norm(now)}
 		}
 	}
 	if len(out) == 0 {
+		if waiting != nil {
+			return nil, waiting
+		}
 		return nil, fmt.Errorf("%w at %s (%d keys in the set)", ErrNoActiveKey, norm(now).Format(time.RFC3339), len(s))
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].ActivatedAt.Before(out[j].ActivatedAt) })

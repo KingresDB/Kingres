@@ -45,8 +45,11 @@
 //     SignNote, ParseNote, VerifyNote: the checkpoint text (origin, size, root,
 //     optional extension lines) and signed notes with several signature lines,
 //     signed through ledgerkeys.Signer under the key name that is the origin.
-//     ResignCheckpoint refuses a note that carries a line it cannot account for
-//     (ErrUntrustedLine) and every key id collision among the keys it is given.
+//     ResignCheckpoint takes the entries of the trust file with the standing of
+//     each key (ledgerkeys.TrustEntries), refuses a note that rests only on a
+//     revoked key or on a retired key beyond its bound (ErrNoVouchingSignature),
+//     a note that carries a line it cannot account for (ErrUntrustedLine) and
+//     every key id collision among the keys it is given.
 //   - BlockEntry (the 87 bytes of design 4.3) and AggregateEntry (5.2: canonical
 //     and total, up to 512 members), and the origins of the logs (ChainOrigin,
 //     AggregateOrigin).
@@ -81,8 +84,12 @@
 // returned as it is, wrapped so that errors.Is finds the cause: a full disk
 // looks like a full disk. The classification follows the documentation of
 // link(2) and CreateHardLink and is tested by injecting each error; it was
-// not run against a real file system without hard links. The publication
-// directory therefore needs a file system with hard
+// not run against a real file system without hard links. EPERM is wider than
+// "no hard links": link(2) also gives it for a directory that is immutable or
+// append-only (chattr +i or +a) and for a rule that refuses new links, so the
+// text of ErrHardLinksRequired names both and the operator looks at the
+// directory (lsattr -d); nothing is published in either case (K3-09). The
+// publication directory therefore needs a file system with hard
 // links (ext4, XFS, btrfs and NTFS have them; FAT, exFAT and some network and
 // container file systems do not).
 //
@@ -153,11 +160,18 @@
 //     this package, and the operator decides (restore the same leaves, or start a
 //     new log).
 //   - At a key rotation, add the new key's signature to the latest checkpoint of
-//     every log with ResignCheckpoint, giving it as the trusted keys EVERY public
-//     key of the trust file for the log, whatever its state (usable, retired,
-//     revoked, and the next keys the file lists): the note is verified under
-//     them first and refused when no line of it verifies, so a new signature is
-//     never attached to text that nobody verified. Before it signs anything
+//     every log with ResignCheckpoint, giving it as the trusted keys EVERY entry
+//     of the trust file for the log (ledgerkeys.TrustEntries, with IncludeNext
+//     when the file lists the next keys), whatever its state: the note is
+//     verified under them first and refused when no line of it verifies, so a new
+//     signature is never attached to text that nobody verified. It is also
+//     refused (ErrNoVouchingSignature) when no line that verifies is of a key the
+//     verifier counts for a fresh checkpoint of that size (a line of a revoked key,
+//     or of a retired key whose max_tree_size is below the size, vouches for
+//     nothing: the verifier refuses such a note, and the signature of a good key
+//     would make it genuine; correction 107). A line of such a key beside a line
+//     of a key that counts is kept. The window of a key (not_before, not_after)
+//     is not applied, since the package has no clock. Before it signs anything
 //     ResignCheckpoint refuses a new signer, or a trusted key, whose key id
 //     equals that of another key among them, also one that has no line in the
 //     note (ErrKeyIDCollision), and a note that has a line under the name of the
@@ -181,10 +195,82 @@
 //     origin, with ledgerkeys.Set.AddChecked (or ledgerkeys.CheckSetKeyIDs on the
 //     set as it will be); the package ledgerkeys says what the operator does when
 //     a collision is found after the fact.
+//   - Sign only the checkpoint that Log.Checkpoint() returns. SignCheckpoint
+//     signs whatever Checkpoint it is given (any size, any root) and Open does not
+//     look at the stored checkpoint, so nothing in the package stops a caller from
+//     signing a smaller tree than the one published (a rollback) or a second root
+//     for a size already signed (a fork) (K3-11).
 //   - Keep a partial tile for every size that has a checkpoint until clients can no
 //     longer ask for it; DirStore has no pruning.
 //   - Hold the divergence rules of design 4.7 itself: compare the leaves it reads
 //     with the published ones (CheckLink, ErrConflict) and stop the log.
+//
+// # Duties of the caller
+//
+// What the daemon that wires this package must do, in one place. "Nothing in the
+// API" means the duty can be forgotten without an error; "the API refuses" means
+// forgetting it gives one. The duties of the key package (ledgerkeys) are in its
+// documentation; the two that touch this package are repeated here.
+//
+//   - One writer per log. The package takes no lock. Forgotten: a second writer
+//     at another width succeeds silently, the checkpoint is last writer wins and
+//     the fork is found late. Nothing in the API.
+//   - The order of a round: Append, persist the frontier (with size and root, in
+//     one atomic write), sign, PutCheckpoint. Forgotten: the checkpoint is ahead
+//     of the frontier after a crash. The frontier ahead of the tiles cannot
+//     happen and tiles ahead are repaired, but nothing makes the three calls a
+//     unit.
+//   - Open with the stored frontier, size and root; for the first round the empty
+//     frontier. Forgotten: ErrFrontierRoot, or a log that starts from nothing over
+//     existing tiles. The API checks the frontier against the root.
+//   - Append once per checkpoint. Forgotten: no partial tile for the sizes in
+//     between, so a reader of an earlier size cannot be served. Nothing in the
+//     API.
+//   - Crash repair: Open with AllowTilesAhead and append the same leaves again;
+//     other leaves give ErrConflict, which is a stop for the operator. The leaves
+//     must be reproducible. Forgotten: a round rebuilt with another closing time
+//     or order leaves a log that cannot be extended. Never use AllowTilesAhead on
+//     a normal start.
+//   - On ErrConflict stop the log and alarm; never repair or delete tiles.
+//     Forgotten: a bug or an attacker makes the log diverge and the daemon goes
+//     on.
+//   - Sign only Log.Checkpoint(): never a smaller tree than the one published,
+//     never two roots for one size. Forgotten: a rollback or a fork signed by the
+//     server itself. Nothing in the API: SignCheckpoint takes any Checkpoint
+//     (K3-11).
+//   - During a key overlap give SignCheckpoint every signer that
+//     ledgerkeys.Set.Signers returns. Forgotten: auditors that hold only one of
+//     the trust files cannot verify the checkpoint. Nothing in the API.
+//   - At a rotation re-sign the latest checkpoint of every log that no longer
+//     grows, with ResignCheckpoint and the entries of the trust file. The API now
+//     refuses a note that rests only on a revoked key or on a retired key beyond
+//     its bound, a collision and a line it cannot account for; it does not know
+//     which logs have stopped growing.
+//   - Run Audit from time to time. The verifier reads no entry bundle.
+//     Forgotten: a damaged bundle is found by nobody. Its cost is linear in the
+//     size.
+//   - Keep every partial tile of a size that has a checkpoint; there is no
+//     pruning. Forgotten: a reader of an old checkpoint finds no tile (status 3
+//     for the auditors). Nothing in the API says "keep" to a backup or cleaning
+//     layer.
+//   - Use a file system with hard links and honoured flushes, NoSync false in
+//     production (the zero value is right); on Windows the flush of a directory
+//     is missing. Forgotten: ErrHardLinksRequired at the first put (also for a
+//     directory that is immutable or append-only), or lost tiles after a power
+//     loss on a disk that lies.
+//   - Use a Reader for a request or a batch and drop it (no eviction; one that
+//     lives long holds up to a million tiles at 2^28 leaves). Forgotten: slow
+//     memory growth.
+//   - Call RemoveTemporaryFiles only at start, with no write running. Forgotten:
+//     it deletes the temporary file of a running put.
+//   - Pass a context and expect it to be honoured at the start of a store call, at
+//     each tile of Audit and in the checkpoint retry; a hung call of the operating
+//     system is not interrupted.
+//   - Check divergence with CheckLink and the leaves it reads (design 4.7).
+//     Forgotten: the publisher does not monitor itself.
+//   - Alarm on: ErrNoVouchingSignature, ErrUntrustedLine, ErrKeyIDCollision,
+//     ErrCheckpointBusy for longer than a few tries, ErrConflict, ErrTilesAhead
+//     outside a restart, ErrHardLinksRequired. Forgotten: silent stops.
 //
 // # What it does not do
 //

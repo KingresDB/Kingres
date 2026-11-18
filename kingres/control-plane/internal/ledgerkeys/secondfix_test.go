@@ -256,18 +256,19 @@ func TestActivationToleranceAgainstTheRecordedTimes(t *testing.T) {
 	var u Set
 	u = okSet(t)(mustAdd(u, 1, "", t0))
 	u = okSet(t)(u.Activate(fp(1), t0, 0))
-	nowLate := t0.AddDate(5, 0, 0)
-	u = okSet(t)(mustAdd(u, 2, "", nowLate))
-	if _, err := u.Activate(fp(2), nowLate.Add(time.Hour), 0); err != nil {
-		t.Errorf("an activation of a key added just before, in a set that was idle for 5 years: %v", err)
+	nowLate := t0.AddDate(0, 0, 700) // idle for almost two years
+	u = okSet(t)(mustAdd(u, 2, "", u.RecordLimit()))
+	if _, err := u.Activate(fp(2), nowLate, 0); err != nil {
+		t.Errorf("an activation of a key added at the limit, in a set that was idle for 700 days: %v", err)
 	}
 	// What it cannot see: a time that is wrong but within the tolerance of the
 	// records, and a time that is earlier than the records.
 	if _, err := s.Activate(fp(1), t0.Add(200*24*time.Hour), 0); err != nil {
 		t.Errorf("a wrong time within the tolerance is accepted by design: %v", err)
 	}
-	if _, err := s.Activate(fp(1), t0.Add(-200*24*time.Hour), 0); err != nil {
-		t.Errorf("a time before the records is accepted by design: %v", err)
+	later := okSet(t)(mustAdd(s, 2, "", t0.Add(100*24*time.Hour)))
+	if _, err := later.Activate(fp(1), t0.Add(10*24*time.Hour), 0); err != nil {
+		t.Errorf("a time before the latest record, after the creation, is accepted by design: %v", err)
 	}
 }
 
@@ -277,7 +278,7 @@ func TestClockStepsBack(t *testing.T) {
 	var s Set
 	s = okSet(t)(mustAdd(s, 1, "", t0))
 	s = okSet(t)(s.Activate(fp(1), t0.Add(10*24*time.Hour), 0))
-	s = okSet(t)(mustAdd(s, 2, "", t0.Add(10*24*time.Hour)))
+	s = okSet(t)(mustAdd(s, 2, "", t0))
 	s = okSet(t)(s.Activate(fp(2), t0.Add(24*time.Hour), 0)) // 9 days before fp(1) was activated
 	// Both are in force after the later activation; the order is by activation.
 	ks, err := s.Signers(t0.Add(11 * 24 * time.Hour))
@@ -371,9 +372,11 @@ func TestOperationsWithAnyTimesKeepTheSetValidAndUsable(t *testing.T) {
 				k := s[rng.Intn(len(s))]
 				out, err = s.Revoke(k.Fingerprint(), now, now.Add(-time.Duration(rng.Intn(100))*time.Hour), "x")
 			default:
-				// The keys that are due can be retired now.
-				for _, fp := range s.DueForRetirement(now) {
-					if _, err := s.Retire(fp, now, Unbounded()); err != nil {
+				// The keys that are due can be retired now (at the latest time the
+				// set accepts when the clock is far ahead of the records).
+				tn := clampToLimit(s, now)
+				for _, fp := range s.DueForRetirement(tn) {
+					if _, err := s.Retire(fp, tn, Unbounded()); err != nil {
 						t.Fatalf("round %d: a key that is due cannot be retired: %v\n%s", round, err, s.Summary())
 					}
 				}
@@ -388,6 +391,7 @@ func TestOperationsWithAnyTimesKeepTheSetValidAndUsable(t *testing.T) {
 			s = out
 			// Retire and CanSign agree: a key can be retired now exactly when
 			// another active key may sign the retirement now.
+			now = clampToLimit(s, now)
 			for _, k := range s {
 				if k.State != StateActive {
 					continue

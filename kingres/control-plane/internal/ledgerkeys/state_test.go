@@ -183,7 +183,7 @@ func TestRevokeNeedsAnotherActiveKey(t *testing.T) {
 		t.Fatalf("revoking with only a next key: %v", err)
 	}
 	s = okSet(t)(s.Activate(fp(2), t0.Add(time.Minute), 0))
-	since := t0.Add(-48 * time.Hour)
+	since := t0
 	s = okSet(t)(s.Revoke(fp(1), t0.Add(time.Hour), since, "laptop stolen"))
 	k, _ := s.Get(fp(1))
 	if k.State != StateRevoked || !k.CompromisedSince.Equal(since) || k.Reason != "laptop stolen" || !k.OverlapEnds.IsZero() {

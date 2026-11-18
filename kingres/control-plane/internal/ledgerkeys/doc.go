@@ -23,13 +23,16 @@
 //   - Set, Key, State: the key state machine of design 3.3 (next, active,
 //     retired, revoked; at most two active keys; overlap of a rotation;
 //     what a key in each state may sign) as pure logic. It has no storage.
-//     Add, AddChecked, Activate, Retire (with a TreeBound: AtMost or
-//     Unbounded), Revoke, Signers, DueForRetirement, CanSign, MaySign,
-//     Validate, Summary, and the constants MaxKeys, MaxActive,
-//     MaxActivationLeadDays and ErrInvalidTime.
+//     Add (for tests and for a set under no origin yet), AddChecked, Activate,
+//     Retire (with a TreeBound: AtMost or Unbounded), Revoke, Signers,
+//     DueForRetirement, CanSign, MaySign, RecordLimit, Validate, Summary, and
+//     the constants MaxKeys, MaxActive, MaxActivationLeadDays; the errors
+//     ErrInvalidTime, ErrNoActiveKey and ErrNotInForce (with NotInForceError,
+//     which says when the key becomes usable).
 //   - TrustFile and TrustEntries: the keys member of trust.json, in the bytes
-//     that kingres-verify trust writes and reads. ValidPrefix checks an origin
-//     prefix.
+//     that kingres-verify trust writes and reads (TrustFile also refuses a set
+//     with a key id collision under the prefix or under the origins it is given).
+//     ValidPrefix checks an origin prefix.
 //
 // # What it guarantees
 //
@@ -85,10 +88,12 @@
 // Persist the Set after every transition (kingres_cp.ledger_signing_key): the
 // package returns the new Set and keeps nothing. Serialise transitions (one
 // task at a time). Re-sign the latest checkpoint of every log with the new key
-// set at a rotation (ledgerlog.ResignCheckpoint, which takes every key of the
-// trust file as the trusted keys): a log that grows no more keeps
-// the signatures it has, and a retired key's signature alone is fine for the
-// verifier only while the trust file still lists that key. Publish the trust
+// set at a rotation (ledgerlog.ResignCheckpoint, which takes every entry of the
+// trust file, TrustEntries, with the standing of each key, and refuses a note
+// that rests only on a revoked key or on a retired key beyond its bound): a log
+// that grows no more keeps the signatures it has, and a retired key's signature
+// alone is fine for the verifier only while the trust file still lists that
+// key. The full list is under "Duties of the caller" below. Publish the trust
 // file entries to the operator; the verifier never takes first trust from the
 // publication. Delete the file of a retired or revoked key on every holder.
 //
@@ -100,38 +105,97 @@
 // whose keys are all next (before its first activation) and the empty set are
 // legal and do not give ErrNoActiveKey. A set where a key is active in the
 // record but its activation time has not come is legal too; Signers(now) then
-// returns ErrNoActiveKey until that time, and a caller that signs must treat
-// that error as "do not sign", never as an empty list. Validate also refuses
-// the damage it can see: a time that is zero or outside the years 1 to 9999
-// (ErrInvalidTime), fields that do not belong to the state (a Reason or
-// CompromisedSince on a key that is not revoked, a MaxTreeSize or an
-// OverlapEnds where none belongs), times in the wrong order (retired before
-// activated, revoked before created), and two active keys that do not have
-// exactly one OverlapEnds, equal to the activation of the other key plus a whole
-// number of days from 1 to 365. What it cannot tell apart: a set in which every
-// key was flipped back to next with its times cleared looks like a new set that
-// was never used; and a marker moved to the key that was activated last looks
-// like the set that Activate makes after a future or backward activation time
-// (see Activate), so only the whole-day rule catches it, and only when the move
-// does not happen to keep it.
+// returns ErrNotInForce (a *NotInForceError that says when the key becomes
+// usable; it is NOT ErrNoActiveKey, because the set is not damaged: a clock that
+// stepped back by a second must not raise the alarm of a damaged set), and a
+// caller that signs must treat either error as "do not sign", never as an
+// empty list. Validate also refuses the damage it can see: a time that is zero
+// or outside the years 1 to 9999 (ErrInvalidTime), fields that do not belong to
+// the state (a Reason or CompromisedSince on a key that is not revoked, a
+// MaxTreeSize or an OverlapEnds where none belongs), times in the wrong order
+// (see "The order of the times of a key" below), and two active keys that do
+// not have exactly one OverlapEnds, equal to the activation of the other key
+// plus a whole number of days from 1 to 365. What it cannot tell apart: a set
+// in which every key was flipped back to next with its times cleared looks like
+// a new set that was never used; and a marker moved to the key that was
+// activated last looks like the set that Activate makes after a future or
+// backward activation time (see Activate), so only the whole-day rule catches
+// it, and only when the move does not happen to keep it. Nor can it see a
+// changed value that has no second copy: the activation time (not_before), the
+// bound of a retired key (max_tree_size; set to 0 it becomes unbounded), the
+// label, the public key and the creation time all change what the trust file
+// says and are all valid whatever they are. The daemon therefore keeps the
+// trust file it published (or its hash) with each transition and compares it
+// with TrustFile(...) after every load (K3-10).
 //
 // Times. The package has no clock; the caller passes the time of each call. Add,
 // Activate, Retire and Revoke refuse the zero time and a time outside the years
 // 1 to 9999 (ErrInvalidTime), which no later call could repair: the zero time
 // makes Validate refuse the whole set for ever, and a year of five digits makes
-// the verifier refuse the trust file. Activate also refuses a time more than
-// MaxActivationLeadDays (366) after the latest time the set records, which
-// catches a clock that is wrong by years at the moment it is wrong and nothing
-// else (it cannot see a time that is wrong within that tolerance, or one that is
-// earlier than the records; a next key that waited longer than the tolerance
-// cannot be activated either: add a fresh key and revoke the stale one). A key
-// that is active but not yet in force does not sign and is not the "other key"
-// of Retire or Revoke; DueForRetirement, Retire, Revoke and CanSign agree about
+// the verifier refuse the trust file. They also ALL refuse a time later than
+// RecordLimit, the latest time the set records (the creation, activation,
+// retirement or revocation of any key) plus MaxActivationLeadDays (366), the
+// same tolerance for every operation, so that no operation can record a far
+// time that would move the limit of the next one (the limit of Activate alone
+// was removed by one far time recorded by Add, Retire or Revoke; correction
+// 107). An empty set has no limit.
+//
+// What this does not see, and the daemon holds: a clock that is wrong by less
+// than the tolerance, a clock that is wrong in the same way for every call, and
+// a time that is earlier than the records. Before any transition the daemon
+// compares its clock with a second source (another host, the database, a
+// signed time) and passes no time that it did not read itself. A key that is
+// active but not yet in force does not sign and is not the "other key" of
+// Retire or Revoke; DueForRetirement, Retire, Revoke and CanSign agree about
 // which keys are in force, and such a key can be retired without a revocation
 // (it is recorded as retired at the time it would have come into force). A
-// clock that steps back is tolerated: Retire and Revoke record the later of
-// the time given and the activation (or creation) of the key, so a revocation
-// is never refused for its time.
+// clock that steps back is tolerated: Retire and Revoke record the latest of
+// the time given and the creation, activation and retirement of the key, so a
+// revocation is never refused for its time.
+//
+// An idle set. The limit is relative to the records and not to a clock, so a
+// set whose latest record is more than 366 days old refuses the real time. This
+// is the one exception that keeps it usable: it may record a time up to
+// RecordLimit, again and again. The caller passes min(now, RecordLimit()) to
+// the operation that records, and each operation moves the limit up to a year
+// ahead of the last record, so the set is brought forward by ordinary operations
+// in steps and no key place is spent on it. A rotation after up to two years of
+// idleness: Add at RecordLimit (the creation is recorded up to a year early,
+// which only orders the keys), then Activate at the real time. After longer:
+// Activate at RecordLimit too, and Retire and Revoke likewise. The record then
+// lags the real time, so the overlap runs from the recorded activation and may
+// already be over (DueForRetirement says so; the daemon decides when it
+// retires, the old key signs until then). A revocation is never delayed for
+// this: Revoke at t = min(now, RecordLimit()) with compromised-since
+// min(since, t); an earlier compromised-since is the safe direction, and the
+// trust file carries no revocation time. A set restored from a backup has the
+// time of the backup as its latest record, so a real time within a year of it
+// is accepted as it is; a set whose first key is added has no limit, but that
+// key, like every next key, cannot be activated more than a year after its
+// creation. A next key that waited longer (a rotation announced more than 366
+// days ahead, or a backup older than the key) is replaced in this order, which
+// works: Add a fresh key at min(now, RecordLimit()); Activate the fresh key at
+// the real time; Revoke the stale key (the revocation needs the fresh key in
+// force, so it cannot come first: ErrNoOtherSigner). The stale key stays in
+// the trust file as revoked and takes one of the 16 places. Auditors who pinned
+// it (the trust file with IncludeNext) must be given the new trust file, which
+// pins the fresh key, before they can read what the fresh key signs; until then
+// they hold a key that never signs.
+//
+// The order of the times of a key (K3-05). A key has its times in the order a
+// key can have: creation, then activation, then retirement or revocation. Activate
+// refuses a time before the creation (a clock that stepped back: try again when
+// it has passed it); Revoke refuses a compromised-since before the creation (a
+// key cannot be compromised before it exists), except when the time of the
+// call itself is before the creation, when it is recorded as the creation, so a
+// revocation is not refused for the clock; the time recorded as the revocation
+// is never before the creation, activation or retirement; and Validate refuses
+// a stored key whose times are out of that order. CompromisedSince, RetiredAt,
+// RevokedAt, OverlapEnds and Reason are not written to the trust file (it has
+// only revoked, not_before, not_after and max_tree_size): for the verifier a
+// revocation has no date, and a revoked key's signature is never accepted at
+// any --now, which is why compromised-since is kept in the record and in the
+// key-revoked statement the daemon logs (design 3.2.4) and not in the file.
 //
 // Key id collisions: the key id of a signature line is 32 bits of a hash of the
 // key name (the origin of a log) and the key. Two keys of a set can have the
@@ -152,7 +216,17 @@
 // CheckSetKeyIDs applies the same rule to a key set as the trust file would list
 // it (with and without the next keys, as TrustOptions.IncludeNext says) and an
 // origin, and says which of the two paths refuse (KeyIDCollision.Fresh and
-// Held). The caller names every origin the key will sign: one per log and
+// Held). AddChecked looks at the pairs that contain the new key and at nothing
+// else, so an old colliding pair already in the set does not stop a new key that
+// collides with neither, and its error names the new key; CheckSetKeyIDs reports
+// EVERY colliding pair (the error is the first pair that stops fresh checkpoints,
+// KeyIDCollision.Fresh, and KeyIDCollision.Also lists the others), so a pair that
+// stops fresh checkpoints is never hidden behind one that only affects notes
+// already held. Add does not check: it is for tests and for a set under no origin
+// yet, and TrustFile refuses to write a trust file in which two listed keys
+// collide under the prefix or under the origins it is given (ErrKeyIDCollision),
+// so a collision that Add let in is not published without a word. The caller
+// names every origin the key will sign: one per log and
 // epoch, so that is every log of the cluster that exists or will. The chance is
 // about 10^-4 for a set of 16 keys and 10^4 logs. ledgerlog reports a collision
 // of a note as ErrKeyIDCollision with both fingerprints. A key that has not
@@ -203,6 +277,86 @@
 // the trust file would still have to list every key the old checkpoints rest
 // on. Plan for it: rotate rarely, and treat 14 keys as the time to prepare the
 // next generation.
+//
+// # Duties of the caller
+//
+// What the daemon that wires this package must do. The marks say what the API
+// does for it: "the API refuses" where forgetting the duty gives an error,
+// "nothing in the API" where it can be forgotten without a sign. The duties of
+// the log package (ledgerlog) are in its documentation.
+//
+//   - Persist the Set after every transition (kingres_cp.ledger_signing_key).
+//     Forgotten: the key states roll back after a restart (a retired key signs
+//     again, a revoked key is active), and a rolled back set is valid, so
+//     Validate cannot see it. Nothing in the API: transitions are pure functions
+//     and the old Set stays usable.
+//   - Serialise transitions: one task at a time, from the set just stored.
+//     Forgotten: two tasks start from one stored set and the second write erases
+//     the first transition, for instance a revocation. Nothing in the API (no
+//     sequence number).
+//   - Read the clock from a trusted source and compare it with a second one
+//     before every transition; never pass a stored or a user-given time. The
+//     API refuses the zero time, years outside 1 to 9999 and any time later than
+//     RecordLimit, so no operation records a far time; it does not see a clock
+//     that is wrong by less than 366 days or consistently wrong. Forgotten: a
+//     key activated at a wrong time is not in force for up to a year (a single
+//     key: the daemon cannot sign), or not_before in the trust file is ahead of
+//     the clocks of the auditors. After a long idle, pass min(now,
+//     RecordLimit()) as described under "Times".
+//   - Add a key with AddChecked and every origin that exists or will exist (every
+//     log of every epoch), never with Add; when a new origin appears (a new epoch
+//     or prefix) check the whole set with CheckSetKeyIDs; write the trust file
+//     with TrustFile and the same origins. Forgotten: two keys with one key id
+//     stop every auditor's state file for that log for ever, also when one of
+//     them is revoked, and nothing cures it. The API now refuses what it can see:
+//     AddChecked is not closed by an old pair, and TrustFile refuses a collision
+//     under the origins it is given; Add and an origin that is never named are
+//     still unchecked.
+//   - Validate after every load. An error is an alarm and no signing. Tell the
+//     two errors of Signers apart: ErrNoActiveKey is a damaged set (alarm),
+//     ErrNotInForce is a clock behind an activation (wait until the time it
+//     names, check the clock). Forgotten: a damaged row is used as it is
+//     (Signers, Retire and the others do not call Validate). The API returns an
+//     error and never an empty list of signers.
+//   - Keep the trust file you published (or its hash) with each transition and
+//     compare it with TrustFile(...) after every load. Forgotten: a changed
+//     bound, activation time or label is invisible, because Validate has no
+//     second copy to compare with. Nothing in the API.
+//   - Choose the TreeBound at Retire: at least the largest size of any log the
+//     key ever signed (all logs, all epochs), or Unbounded. Too low: the verifier
+//     refuses the newest checkpoints the key signed, for everybody. Unbounded: a
+//     key that leaks later can sign larger trees for ever. The API refuses the
+//     zero bound, and cannot know the right one.
+//   - At each rotation re-sign the latest checkpoint of every log that no longer
+//     grows (ledgerlog.ResignCheckpoint, with TrustEntries). Forgotten: such a
+//     log keeps only the old key's signature, fine while that key is retired and
+//     bounded, unreadable if it is revoked. The API now refuses a note that rests
+//     only on a revoked key or a retired key beyond its bound; nothing lists the
+//     logs to re-sign.
+//   - During an overlap sign every checkpoint with every key Signers returns
+//     (two lines). Forgotten: auditors who hold the old trust file, or only the
+//     new one, cannot verify it. Nothing in the API: the signers are a variadic
+//     list.
+//   - Build, sign and log the key-added, key-retired and key-revoked statements
+//     (design 3.2.4) with CanSign; the package builds none. Forgotten: transitions
+//     have no audit trail and auditors who pinned one key never learn the new
+//     one. Nothing in the API.
+//   - Poll DueForRetirement and retire when you decide to. Forgotten: two keys
+//     sign for ever and a retired key is never retired. Nothing is automatic.
+//   - Publish the trust file entries, delete the key file of a retired or
+//     revoked key on every holder, and back up the key files and the passphrase.
+//     Forgotten: auditors on an old trust file; a retired key that leaks later; a
+//     lost active key with no second active key means no signing.
+//   - Alarm on: a Validate failure, ErrNoActiveKey, a due retirement,
+//     ErrTooManyKeys and 14 or more keys, ErrKeyIDCollision, every revocation,
+//     ErrUntrustedLine, ErrNoVouchingSignature, ErrCheckpointBusy for longer than
+//     a few tries, ErrConflict, ErrTilesAhead outside a restart,
+//     ErrHardLinksRequired. Forgotten: silent stops. The errors are typed; there
+//     is no alert hook.
+//   - Never, automatically: revoke, choose Unbounded, add a key with Add,
+//     activate a stale next key, re-sign a note that no vouching key signed,
+//     take a time from outside. Each is irreversible or hides a divergence, and
+//     each is a plain call.
 //
 // # What it does not do
 //

@@ -128,13 +128,27 @@ type keyJSON struct {
 // the bytes kingres-verify writes for the same content (2-space indented JSON
 // in the member order of the design, times as RFC 3339 UTC, a final
 // newline), with empty tsa_roots, client_keys and witnesses.
-func TrustFile(prefix string, set Set, opt TrustOptions) ([]byte, error) {
+//
+// It refuses to write a file in which two listed keys have the same key id
+// under the prefix itself (a valid origin of the verifier) or under any of the
+// origins given (the origins of the logs, which lie below the prefix), with the
+// same typed error as AddChecked and CheckSetKeyIDs (ErrKeyIDCollision, every
+// pair in the error), so that a set built with the unchecked Add does not get
+// its collision published without a word (K3-08, correction 107). The
+// prefix alone is not enough for the logs: pass their origins. A caller that
+// has no origin to give and wrote no key with Add has nothing to fear.
+func TrustFile(prefix string, set Set, opt TrustOptions, origins ...string) ([]byte, error) {
 	if err := ValidPrefix(prefix); err != nil {
 		return nil, fmt.Errorf("%w: origin prefix %q: %v", ErrInvalidArgument, clip(prefix), err)
 	}
 	entries, err := TrustEntries(set, opt)
 	if err != nil {
 		return nil, err
+	}
+	for _, o := range append([]string{prefix}, origins...) {
+		if err := CheckSetKeyIDs(set, opt, o); err != nil {
+			return nil, err
+		}
 	}
 	return marshalTrust(prefix, entries)
 }
