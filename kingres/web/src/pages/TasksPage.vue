@@ -17,7 +17,7 @@ import { endpoints } from '@/api/endpoints'
 import { keys, usePagedQuery } from '@/api/queries'
 import FailoverReportDialog from '@/components/FailoverReportDialog.vue'
 import { isFailoverTaskKind } from '@/lib/failover'
-import { taskKindLabel, TASK_STATE } from '@/lib/status'
+import { taskKindLabel, taskSubjectText, TASK_STATE } from '@/lib/status'
 import { formatAgo } from '@/lib/format'
 import type { TaskState } from '@/api/types'
 
@@ -100,7 +100,7 @@ const hasReport = (t: { kind: string; state: string }): boolean =>
             <td>
               <SafeName
                 v-if="t.subject"
-                :value="`${t.subject.type} ${t.subject.id}`"
+                :value="taskSubjectText(t.subject)"
                 kind="text"
                 :max="120"
               />

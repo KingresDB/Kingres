@@ -5,6 +5,8 @@
 // response bodies are typed with the generated schema types.
 import { evaluateAccess } from '@/lib/network-rules'
 import { applyPending, configHandlers } from './config'
+import { ledgerHandlers } from './ledger'
+import { AGGREGATE_SIZE, anchoringOf, digestAnchorsOf, l7, publicationOf } from './ledger-view'
 import type { HttpHandler } from 'msw'
 import type { components } from '@/api/schema'
 import type { OperationId } from '@/api/operations.generated'
@@ -110,6 +112,19 @@ function db(s: MockState, name: string) {
   const rec = s.databases.find((d) => d.info.name === name)
   if (!rec) throw problem('not_found', `Database "${name}" does not exist.`)
   return rec
+}
+
+/** 0.11.0: what a status says about the publication and the anchoring of a database (only when a ledger exists). */
+function withPhase7(
+  s: MockState,
+  rec: ReturnType<typeof db>,
+  status: S['LedgerStatus'],
+): S['LedgerStatus'] {
+  return {
+    ...status,
+    publication: publicationOf(s, rec),
+    anchoring: anchoringOf(s, rec),
+  }
 }
 
 /** The server that serves this panel in the mock. */
@@ -1297,6 +1312,7 @@ async function executeStatement(ctx: Ctx): Promise<S['QueryResult']> {
 export function createHandlers(): HttpHandler[] {
   const h: Partial<Record<OperationId, Handler>> = {
     ...configHandlers(),
+    ...ledgerHandlers(),
     getHealth: () => ok({ status: 'ok' }),
     getReadiness: (c) =>
       ok({
@@ -2716,9 +2732,12 @@ export function createHandlers(): HttpHandler[] {
       ok({
         items: c.s.databases
           .filter((d) => d.info.ledger.mode !== 'off')
-          .map((d) => ledgerStatusOf(c.s, d)),
+          .map((d) => withPhase7(c.s, d, ledgerStatusOf(c.s, d))),
       }),
-    getLedgerStatus: (c) => ok(ledgerStatusOf(c.s, db(c.s, c.params.databaseName ?? ''))),
+    getLedgerStatus: (c) => {
+      const rec = db(c.s, c.params.databaseName ?? '')
+      return ok(withPhase7(c.s, rec, ledgerStatusOf(c.s, rec)))
+    },
     listLedgerBlocks: (c) => {
       const rec = db(c.s, c.params.databaseName ?? '')
       const status = ledgerStatusOf(c.s, rec, true)
@@ -2726,16 +2745,29 @@ export function createHandlers(): HttpHandler[] {
         c.url.searchParams.get('shardGroupId') ?? status.chains[0]?.shardGroupId ?? 0,
       )
       const head = c.s.ledger.heights[gid] ?? 1000
-      const blocks = Array.from({ length: Math.min(300, head + 1) }, (_, i) =>
-        ledgerBlock(gid, head - i),
-      )
+      // 0.11.0: a block is signed when a signed checkpoint of the chain log covers it (the newest few are not covered yet).
+      const signedUpTo =
+        l7(c.s).settings.publication.enabled &&
+        l7(c.s).signing.keys.some((k) => k.state === 'active')
+          ? head - 3
+          : -1
+      const blocks = Array.from({ length: Math.min(300, head + 1) }, (_, i) => ({
+        ...ledgerBlock(gid, head - i),
+        signed: head - i <= signedUpTo,
+      }))
       return ok(paginate(blocks, c.url))
     },
     listLedgerDigests: (c) => ({
       status: 200,
       rawJson: digestJson(
         paginate(
-          c.s.ledger.digests.filter((d) => d.databaseName === c.params.databaseName),
+          c.s.ledger.digests
+            .filter((d) => d.databaseName === c.params.databaseName)
+            .map((d) =>
+              d.aggregateSize && d.anchors.length === 0
+                ? { ...d, anchors: digestAnchorsOf(c.s, d.databaseName, d.aggregateSize) }
+                : d,
+            ),
           c.url,
         ),
       ),
@@ -2764,6 +2796,9 @@ export function createHandlers(): HttpHandler[] {
         })),
         aggregateHash:
           rec.info.sharding.enabled && uncovered.length === 0 ? fakeHash(`agg-${id}`) : null,
+        ...(rec.info.sharding.enabled && uncovered.length === 0
+          ? { aggregateSize: AGGREGATE_SIZE }
+          : {}),
         anchors: [],
         complete: uncovered.length === 0,
         uncoveredShardGroupIds: uncovered,

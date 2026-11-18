@@ -156,7 +156,7 @@ describe('ledger lists with more than one page (W-14)', () => {
         HttpResponse.json({ items: [], nextCursor: 'more' }),
       ),
     )
-    await renderApp('/ledger')
+    await renderApp('/ledger?tab=digests')
     // Empty pages with a cursor still say that there is more.
     mockServer.use(
       http.get('*/api/v1/databases/:name/ledger/digests', () =>

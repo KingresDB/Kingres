@@ -116,8 +116,8 @@ describe('the ledger proof form', () => {
   it('refuses a number that cannot be sent exactly, instead of sending another number', async () => {
     const writes = recordWrites()
     const user = userEvent.setup()
-    await renderApp('/ledger')
-    await screen.findByText(/status of shop/i)
+    await renderApp('/ledger?tab=digests')
+    await screen.findByRole('heading', { name: 'Digests' })
     const key = screen.getByLabelText(/primary key/i)
     await user.clear(key)
     await user.click(key)

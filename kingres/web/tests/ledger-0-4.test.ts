@@ -49,10 +49,11 @@ beforeEach(() => {
 })
 afterEach(() => vi.restoreAllMocks())
 
-async function openLedger() {
+/** The Ledger page on its Overview (status, verification, blocks) or on the Digests tab (digests, proofs). */
+async function openLedger(tab: 'overview' | 'digests' = 'overview') {
   const user = userEvent.setup()
-  await renderApp('/ledger')
-  await screen.findByText(/status of shop/i)
+  await renderApp(tab === 'digests' ? '/ledger?tab=digests' : '/ledger')
+  await screen.findByRole('heading', { name: tab === 'digests' ? 'Digests' : /status of shop/i })
   return user
 }
 
@@ -66,7 +67,7 @@ async function askProof(user: ReturnType<typeof userEvent.setup>, key: string) {
 
 describe('inclusion proof download', () => {
   it('saves the proof exactly as the server sent it (same characters, not re-serialized)', async () => {
-    const user = await openLedger()
+    const user = await openLedger('digests')
     await askProof(user, '{"id": 7}')
     const proof = await screen.findByTestId('proof')
     await user.click(within(proof).getByRole('button', { name: /download proof\.json/i }))
@@ -78,7 +79,7 @@ describe('inclusion proof download', () => {
   })
 
   it('shows the proof without positions and says how to check it with the verifier', async () => {
-    const user = await openLedger()
+    const user = await openLedger('digests')
     await askProof(user, '{"id": 7}')
     const proof = await screen.findByTestId('proof')
     expect(within(proof).getByText(/entry path/i)).toBeInTheDocument()
@@ -98,7 +99,7 @@ describe('inclusion proof download', () => {
 
 describe('digest document download', () => {
   it('saves a chain document with its own key order, spacing and an integer above 2^53', async () => {
-    const user = await openLedger()
+    const user = await openLedger('digests')
     await user.click(
       await screen.findByRole('button', { name: /download document of chain 1 of digest 3/i }),
     )
@@ -115,7 +116,7 @@ describe('digest document download', () => {
   })
 
   it('offers the documents of a digest that was just generated', async () => {
-    const user = await openLedger()
+    const user = await openLedger('digests')
     const before = getState().ledger.digests.length
     await user.click(screen.getByRole('button', { name: /^generate digest$/i }))
     await waitFor(() => expect(getState().ledger.digests.length).toBe(before + 1))
@@ -137,7 +138,7 @@ describe('digest document download', () => {
 
 describe('refusals of createInclusionProof', () => {
   it('explains a row that is not in a block yet and offers to generate a digest', async () => {
-    const user = await openLedger()
+    const user = await openLedger('digests')
     await askProof(user, '{"id": 424242}')
     const notice = await screen.findByText(/row not in a block yet/i)
     const box = notice.closest('[data-code]') as HTMLElement
@@ -156,14 +157,14 @@ describe('refusals of createInclusionProof', () => {
     ['{"id": 404404}', 'not_found', /hides it from your database role/i],
     ['{"id": 403403}', 'forbidden', /no privilege on this table/i],
   ])('shows %s as %s with the server text', async (key, code, text) => {
-    const user = await openLedger()
+    const user = await openLedger('digests')
     await askProof(user, key)
     expect(await screen.findByTestId('proof-hint')).toHaveTextContent(text)
     expect(document.querySelector('[data-code]')?.getAttribute('data-code')).toBe(code)
   })
 
   it('refuses a removed version of an append-only table with the server explanation', async () => {
-    const user = await openLedger()
+    const user = await openLedger('digests')
     await user.selectOptions(screen.getByLabelText('Entry'), 'D')
     await user.type(screen.getByLabelText(/transaction id of the removed version/i), '48000123')
     await askProof(user, '{"id": 7}')
@@ -172,7 +173,7 @@ describe('refusals of createInclusionProof', () => {
 
   it('keeps the calm notice for an operation the server does not implement yet', async () => {
     mockConfig.unsupported.add('createInclusionProof')
-    const user = await openLedger()
+    const user = await openLedger('digests')
     await askProof(user, '{"id": 7}')
     expect(await screen.findByText(/not available on this server version yet/i)).toBeInTheDocument()
   })

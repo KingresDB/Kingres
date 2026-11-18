@@ -114,10 +114,11 @@ function seedIncomplete(): void {
   })
 }
 
-async function openLedger() {
+/** The Ledger page on its Overview (status, verification) or on the Digests tab. */
+async function openLedger(tab: 'overview' | 'digests' = 'overview') {
   const user = userEvent.setup()
-  const app = await renderApp('/ledger')
-  await screen.findByText(/status of shop/i)
+  const app = await renderApp(tab === 'digests' ? '/ledger?tab=digests' : '/ledger')
+  await screen.findByRole('heading', { name: tab === 'digests' ? 'Digests' : /status of shop/i })
   return { user, ...app }
 }
 const section = (name: string) =>
@@ -183,7 +184,7 @@ describe('ledger page', () => {
 
   it('the digest list names the groups a digest does not cover and shows no aggregate hash', async () => {
     seedIncomplete()
-    await openLedger()
+    await openLedger('digests')
     const list = section('Digests')
     const note = await within(list).findByTestId('digest-coverage-4')
     expect(note).toHaveTextContent(
@@ -198,7 +199,7 @@ describe('ledger page', () => {
 
   it('says next to a download that the digest does not cover a group, and saves the bytes unchanged', async () => {
     seedIncomplete()
-    const { user } = await openLedger()
+    const { user } = await openLedger('digests')
     const list = section('Digests')
     const button = await within(list).findByRole('button', {
       name: 'Download document of chain 1 of digest 4',
@@ -215,7 +216,7 @@ describe('ledger page', () => {
   })
 
   it('a download of a complete digest has no coverage warning', async () => {
-    const { user } = await openLedger()
+    const { user } = await openLedger('digests')
     await user.click(
       await within(section('Digests')).findByRole('button', {
         name: 'Download document of chain 1 of digest 3',
@@ -228,7 +229,7 @@ describe('ledger page', () => {
   it('a hostile group number does not break the layout', async () => {
     seedIncomplete()
     getState().ledger.digests[0]!.uncoveredShardGroupIds = [2147483647, 0, -1]
-    await openLedger()
+    await openLedger('digests')
     const note = await within(section('Digests')).findByTestId('digest-coverage-4')
     expect(note).toHaveTextContent(/shard groups 2147483647, 0, -1/)
   })
@@ -253,8 +254,8 @@ describe('the mock follows the contract', () => {
   it('with incompleteLedger a new digest leaves a group out and has no aggregate hash', async () => {
     mockConfig.incompleteLedger = true
     const user = userEvent.setup()
-    await renderApp('/ledger')
-    await screen.findByText(/status of shop/i)
+    await renderApp('/ledger?tab=digests')
+    await screen.findByRole('heading', { name: 'Digests' })
     await user.click(await screen.findByRole('button', { name: /generate digest/i }))
     const list = section('Digests')
     await waitFor(() => expect(within(list).getAllByRole('rowheader').length).toBe(2))

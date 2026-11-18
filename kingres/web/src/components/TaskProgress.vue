@@ -9,6 +9,7 @@ import { useAnnounce } from '@/composables/useAnnounce'
 import { TASK_STATE } from '@/lib/status'
 import { skippedReason } from '@/lib/standby'
 import { hasGroupSteps, stepBlocks, stepName } from '@/lib/failover'
+import { keyTaskErrorHint } from '@/lib/ledger-signing'
 import type { Task, TaskStep } from '@/api/types'
 
 const props = defineProps<{ task: Task | null; pollError?: unknown }>()
@@ -64,6 +65,10 @@ const blocks = computed(() => {
 })
 const grouped = computed(() => hasGroupSteps(props.task?.progress.steps ?? []))
 const taskSkip = computed(() => skippedReason(props.task?.detail))
+// 0.11.0: a key task of the ledger has words for the error codes it can end with (the code itself is not shown as text).
+const errorHint = computed(() =>
+  props.task?.kind.startsWith('ledger.key.') ? keyTaskErrorHint(props.task.error?.code) : null,
+)
 watch(announcementKey, (key) => {
   if (key) announce(summary.value, props.task?.state === 'failed' ? 'assertive' : 'polite')
 })
@@ -146,6 +151,7 @@ watch(
         ></span
       >
     </p>
+    <p v-if="errorHint" class="muted" data-testid="task-error-hint">{{ errorHint }}</p>
     <p v-if="pollError" class="muted" role="alert">
       Lost contact with the server while following this task. Reload to see its state.
     </p>

@@ -391,6 +391,162 @@ export const endpoints = {
       ),
     ),
 
+  // --- ledger of phase 7 (0.11.0): settings, signing, publication, anchoring, aggregates, bundles, client keys
+  getLedgerSettings: () => j(api.GET('/ledger/settings')),
+  updateLedgerSettings: (body: S['LedgerSettingsUpdate']) =>
+    j(api.PUT('/ledger/settings', { body })),
+  getLedgerSigning: () => j(api.GET('/ledger/signing')),
+  /** 202 + task `ledger.key.create` (the first key) or `ledger.key.rotate`. */
+  createLedgerSigningKey: async (body: S['CreateLedgerSigningKeyRequest'] = {}): Promise<Task> =>
+    (await j(api.POST('/ledger/signing/keys', { body }))) as Task,
+  /** 202 + task `ledger.key.retire`. */
+  retireLedgerSigningKey: async (fingerprint: string): Promise<Task> =>
+    (await j(
+      api.POST('/ledger/signing/keys/{fingerprint}/retire', {
+        params: { path: { fingerprint } },
+        body: {},
+      }),
+    )) as Task,
+  /** 202 + task `ledger.key.revoke`. */
+  revokeLedgerSigningKey: async (
+    fingerprint: string,
+    body: S['RevokeLedgerSigningKeyRequest'],
+  ): Promise<Task> =>
+    (await j(
+      api.POST('/ledger/signing/keys/{fingerprint}/revoke', {
+        params: { path: { fingerprint } },
+        body,
+      }),
+    )) as Task,
+  /** The trust file exactly as the server sent it (the bytes are saved unchanged; it is a download, not something to edit). */
+  getLedgerTrustFile: (): Promise<string> =>
+    j(api.GET('/ledger/signing/trust-file', { parseAs: 'text' })) as Promise<string>,
+  getLedgerPublication: () => j(api.GET('/ledger/publication')),
+  listLedgerAnchorTargets: () => j(api.GET('/ledger/anchor-targets')),
+  createLedgerAnchorTarget: (body: S['LedgerAnchorTargetCreate']) =>
+    j(api.POST('/ledger/anchor-targets', { body })),
+  getLedgerAnchorTarget: (targetId: number) =>
+    j(api.GET('/ledger/anchor-targets/{targetId}', { params: { path: { targetId } } })),
+  updateLedgerAnchorTarget: (targetId: number, body: S['LedgerAnchorTargetUpdate']) =>
+    j(api.PATCH('/ledger/anchor-targets/{targetId}', { params: { path: { targetId } }, body })),
+  deleteLedgerAnchorTarget: (targetId: number) =>
+    j(api.DELETE('/ledger/anchor-targets/{targetId}', { params: { path: { targetId } } })),
+  testLedgerAnchorTarget: (targetId: number) =>
+    j(
+      api.POST('/ledger/anchor-targets/{targetId}/test', {
+        params: { path: { targetId } },
+        body: {},
+      }),
+    ),
+  getLedgerAggregate: (databaseName: string, size?: number) =>
+    j(
+      api.GET('/databases/{databaseName}/ledger/aggregate', {
+        params: { path: { databaseName }, query: size === undefined ? {} : { size } },
+      }),
+    ),
+  listLedgerAggregates: (databaseName: string, q: Page = {}) =>
+    j(
+      api.GET('/databases/{databaseName}/ledger/aggregates', {
+        params: { path: { databaseName }, query: q },
+      }),
+    ),
+  listLedgerAnchors: (
+    databaseName: string,
+    q: Page & { targetId?: number; state?: S['LedgerAnchorState'] } = {},
+  ) =>
+    j(
+      api.GET('/databases/{databaseName}/ledger/anchors', {
+        params: { path: { databaseName }, query: q },
+      }),
+    ),
+  /** 201 with the records that were created (no task). */
+  anchorLedgerNow: (databaseName: string) =>
+    j(
+      api.POST('/databases/{databaseName}/ledger/anchors', {
+        params: { path: { databaseName } },
+        body: {},
+      }),
+    ),
+  retryLedgerAnchor: (databaseName: string, anchorId: number) =>
+    j(
+      api.POST('/databases/{databaseName}/ledger/anchors/{anchorId}/retry', {
+        params: { path: { databaseName, anchorId } },
+        body: {},
+      }),
+    ),
+  downloadLedgerAnchor: (databaseName: string, anchorId: number, format: 'json' | 'ots' | 'tsr') =>
+    j(
+      api.GET('/databases/{databaseName}/ledger/anchors/{anchorId}/evidence', {
+        params: { path: { databaseName, anchorId }, query: { format } },
+        parseAs: 'blob',
+      }),
+    ) as Promise<Blob>,
+  /** 202 + task `ledger.bundle.create`. */
+  createLedgerBundle: async (databaseName: string, body: S['LedgerBundleRequest']): Promise<Task> =>
+    (await j(
+      api.POST('/databases/{databaseName}/ledger/bundles', {
+        params: { path: { databaseName } },
+        body,
+      }),
+    )) as Task,
+  getLedgerBundle: (databaseName: string, bundleId: number) =>
+    j(
+      api.GET('/databases/{databaseName}/ledger/bundles/{bundleId}', {
+        params: { path: { databaseName, bundleId } },
+        parseAs: 'blob',
+      }),
+    ) as Promise<Blob>,
+  listLedgerClientKeys: (databaseName: string) =>
+    j(
+      api.GET('/databases/{databaseName}/ledger/client-keys', {
+        params: { path: { databaseName } },
+      }),
+    ),
+  registerLedgerClientKey: (databaseName: string, body: S['RegisterLedgerClientKeyRequest']) =>
+    j(
+      api.POST('/databases/{databaseName}/ledger/client-keys', {
+        params: { path: { databaseName } },
+        body,
+      }),
+    ),
+  revokeLedgerClientKey: (databaseName: string, keyId: string, reason: string) =>
+    j(
+      api.POST('/databases/{databaseName}/ledger/client-keys/{keyId}/revoke', {
+        params: { path: { databaseName, keyId } },
+        body: { reason },
+      }),
+    ),
+  setTableSignaturePolicy: (databaseName: string, schemaName: string, tableName: string) =>
+    j(
+      api.PUT(
+        '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/ledger/signature-policy',
+        {
+          params: { path: { databaseName, schemaName, tableName } },
+          body: { policy: 'required' },
+        },
+      ),
+    ),
+  /** 202 + task `ledger.upgrade`. */
+  upgradeLedgerExtension: async (databaseName: string): Promise<Task> =>
+    (await j(
+      api.POST('/databases/{databaseName}/ledger/upgrade', {
+        params: { path: { databaseName } },
+        body: {},
+      }),
+    )) as Task,
+  /** 202 + task `ledger.epoch.start`. */
+  acknowledgeLedgerDivergence: async (
+    databaseName: string,
+    shardGroupId: number,
+    body: S['AcknowledgeLedgerDivergenceRequest'],
+  ): Promise<Task> =>
+    (await j(
+      api.POST('/databases/{databaseName}/ledger/chains/{shardGroupId}/acknowledge', {
+        params: { path: { databaseName, shardGroupId } },
+        body,
+      }),
+    )) as Task,
+
   // --- configuration (0.8.0)
   listConfigParameters: (
     q: Page & {

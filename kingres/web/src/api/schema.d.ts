@@ -2350,6 +2350,560 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ledger/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the cluster settings of ledger publication and anchoring
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     The cluster-wide settings of the ledger that the console changes: publication (enabled, origin prefix, public URL, interval) and anchoring (interval, how many anchored targets are the minimum, whether anchoring is required). `publication.originPrefixLocked` is true once a checkpoint exists: the prefix is part of every signed origin and cannot change then.
+         */
+        get: operations["getLedgerSettings"];
+        /**
+         * Change the cluster settings of ledger publication and anchoring
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     Every member is optional; a member that is absent is left as it is. Ranges: `publication.intervalSeconds` 10 to 3600, `anchor.intervalSeconds` 60 to 86400, `anchor.minimumAnchored` 1 to 8; a value outside its range is 400 `validation_failed`. 409 `origin_prefix_locked` when `originPrefix` is given a different value after a checkpoint exists. The answer is the settings after the change.
+         */
+        put: operations["updateLedgerSettings"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ledger/signing": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the signing keys of the ledger
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     The cluster identifier, the signing mode, whether the key files are sealed with a passphrase, the servers that hold a copy of the private key (the manager leader and the candidates of the leader), every key with its state and dates, and the signed events of the key history (key added, retired, revoked). **No private key, seed or passphrase is ever part of the answer.** `backupAdvised` is true from the creation, rotation or revocation of a key until an operator says a backup was made. Before the first key exists `keys` is empty and `clusterId` is null.
+         */
+        get: operations["getLedgerSigning"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ledger/signing/keys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create the first signing key, or rotate to a new one
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     The first key: `kingresd` generates it, stores it, distributes it to the holders and activates it (task `ledger.key.create`). Any later call is a planned rotation (task `ledger.key.rotate`): a new key is generated and distributed, the `key-added` event is signed by both keys, both keys sign for `overlapDays` (default 30), and then the old key is retired. `publicKey` is for the signing mode `command` only and is refused with 422 `unsupported_operation` in mode `file`. 409 `operation_in_progress` when a key task is running; 409 `signing_key_missing` for a rotation when no key is active. The task's subject is `ledgerKey` with the id `signing` (one key task at a time, cluster-wide).
+         */
+        post: operations["createLedgerSigningKey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ledger/signing/keys/{fingerprint}/retire": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Fingerprint of a signing key, 64 lower-case hexadecimal characters (the SHA-256 of the public key). */
+                fingerprint: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retire a signing key now
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     Ends the overlap of a rotation at once (task `ledger.key.retire`): the key stops signing, a `key-retired` event signed by another key records it, and its private file is deleted from every holder. A retired key's old checkpoints stay valid. 409 `last_signing_key` when no other key is active and in force; 404 for an unknown fingerprint; 409 `conflict` for a key that is not active; 409 `operation_in_progress` when another key task is running.
+         */
+        post: operations["retireLedgerSigningKey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ledger/signing/keys/{fingerprint}/revoke": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Fingerprint of a signing key, 64 lower-case hexadecimal characters (the SHA-256 of the public key). */
+                fingerprint: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Revoke a signing key (compromise)
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     For a key that was or may have been stolen (task `ledger.key.revoke`). `kingresd` publishes a `key-revoked` event signed by a different active key and deletes the private file from every holder. A signature of a revoked key is rejected by the verifier unless an anchor proves the statement older than `compromisedSince`. `confirm` must equal the fingerprint, otherwise 400 `validation_failed`. 404 for an unknown fingerprint; 409 `last_signing_key` when no other key is active and in force (create a key first); 409 `operation_in_progress`. An auditor whose only pinned key is revoked needs a new trust file out of band.
+         */
+        post: operations["revokeLedgerSigningKey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ledger/signing/trust-file": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Download the trust file for kingres-verify
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     The public parts of the trust file of `kingres-verify` (origin prefix and the public keys with their standing), served as `application/json` with `Content-Disposition: attachment; filename="trust.json"`. It holds no secret. An auditor must compare the fingerprint with one obtained out of band: the file is not a source of first trust. 409 `signing_key_missing` when no key exists.
+         */
+        get: operations["getLedgerTrustFile"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ledger/publication": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the state of the ledger publication
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     Whether publication is enabled, the listener (address, TLS, running), every published log with its size, state and last checkpoint time, and the last checks. Nothing is published before the collector exists; until then `logs` is empty.
+         */
+        get: operations["getLedgerPublication"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ledger/anchor-targets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List anchor targets
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     Every configured anchor target (WORM store, RFC 3161 authority, OpenTimestamps) with its non-secret configuration, whether credentials are set (never their value), its last test and the time of its newest anchor. Not paginated.
+         */
+        get: operations["listLedgerAnchorTargets"];
+        put?: never;
+        /**
+         * Add an anchor target
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     Credentials are write-only: they are stored in a sealed file on the servers and never returned. 400 `validation_failed` for a configuration of the wrong shape; 409 `already_exists` for a name in use.
+         */
+        post: operations["createLedgerAnchorTarget"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ledger/anchor-targets/{targetId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identifier of an anchor target. */
+                targetId: number;
+            };
+            cookie?: never;
+        };
+        /**
+         * Get an anchor target
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     One target, as listed by `listLedgerAnchorTargets`. 404 for an unknown id.
+         */
+        get: operations["getLedgerAnchorTarget"];
+        put?: never;
+        post?: never;
+        /**
+         * Delete an anchor target
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     The anchor records of the target stay and name the target by its name. 404 for an unknown id.
+         */
+        delete: operations["deleteLedgerAnchorTarget"];
+        options?: never;
+        head?: never;
+        /**
+         * Change an anchor target
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     Any of `name`, `enabled`, `config` and `credentials` (which replaces the stored credentials). The `kind` cannot change: 409 `immutable_field`. 400 `validation_failed`; 404; 409 `already_exists` for a name in use.
+         */
+        patch: operations["updateLedgerAnchorTarget"];
+        trace?: never;
+    };
+    "/ledger/anchor-targets/{targetId}/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identifier of an anchor target. */
+                targetId: number;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Test an anchor target
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     Runs the named checks of the target now and synchronously. A failure of the remote side is a failed check in the result, not an HTTP error. 404 for an unknown id.
+         */
+        post: operations["testLedgerAnchorTarget"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/databases/{databaseName}/ledger/aggregate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Get an aggregate checkpoint of a database
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     The aggregate of the chains of every shard group of the database at one size (the newest when `size` is absent): its signed checkpoint, the members with their heights and hashes, the anchors and the statement of what the aggregate proves. 404 for an unknown database or a size that was not published; 409 `ledger_not_published` when the database has no published aggregate.
+         */
+        get: operations["getLedgerAggregate"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/databases/{databaseName}/ledger/aggregates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List the aggregate checkpoints of a database
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     A page of aggregates, newest first, without members. Cursor paging as for every large list. 404 for an unknown database.
+         */
+        get: operations["listLedgerAggregates"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/databases/{databaseName}/ledger/anchors": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List the anchor records of a database
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     A page of anchor records, newest first, optionally of one target or one state. Cursor paging as for every large list. 404 for an unknown database.
+         */
+        get: operations["listLedgerAnchors"];
+        put?: never;
+        /**
+         * Anchor the newest aggregate now
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     Creates the anchor records of the newest aggregate checkpoint for every enabled target without waiting for the interval, and answers 201 with the records (the submission itself is done by the anchoring job, so there is no task). 404 for an unknown database; 409 `ledger_not_published`; 409 `conflict` when no target is enabled.
+         */
+        post: operations["anchorLedgerNow"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/databases/{databaseName}/ledger/anchors/{anchorId}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Identifier of an anchor record. */
+                anchorId: number;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retry a failed anchor record
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     Puts a record in state `failed` or `expired` back to `pending`. 404 for an unknown record; 409 `conflict` for a record in another state.
+         */
+        post: operations["retryLedgerAnchor"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/databases/{databaseName}/ledger/anchors/{anchorId}/evidence": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Identifier of an anchor record. */
+                anchorId: number;
+            };
+            cookie?: never;
+        };
+        /**
+         * Download the evidence of an anchor
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     The evidence file of an anchored record in `json` (all kinds), `ots` (OpenTimestamps) or `tsr` (RFC 3161). 404 for an unknown record or one without evidence; 422 `unprocessable` for a format the kind does not have.
+         */
+        get: operations["downloadLedgerAnchor"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/databases/{databaseName}/ledger/bundles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create a bundle for offline verification
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     Starts a task (`ledger.bundle.create`) that packs the tiles, checkpoints, anchors and, when asked, inclusion proofs into one archive for `kingres-verify`; the task's result names the bundle. 404 for an unknown database; 409 `ledger_not_published`.
+         */
+        post: operations["createLedgerBundle"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/databases/{databaseName}/ledger/bundles/{bundleId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Identifier of a bundle. */
+                bundleId: number;
+            };
+            cookie?: never;
+        };
+        /**
+         * Download a bundle
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     The archive, kept for 24 hours. 404 for an unknown bundle; 410 for one whose time has passed.
+         */
+        get: operations["getLedgerBundle"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/databases/{databaseName}/ledger/client-keys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List the registered client keys of a database
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     The keys clients registered to sign ledger entries. 404 for an unknown database; 422 `unsupported_operation` when `kingres_ledger` is older than 0.3.
+         */
+        get: operations["listLedgerClientKeys"];
+        put?: never;
+        /**
+         * Register a client key
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     Registers a public Ed25519 key. 400 `validation_failed`; 404; 409 `already_exists`; 422 `unsupported_operation` for `kingres_ledger` older than 0.3 or a server without OpenSSL.
+         */
+        post: operations["registerLedgerClientKey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/databases/{databaseName}/ledger/client-keys/{keyId}/revoke": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Key id of a client key, 8 lower-case hexadecimal characters. */
+                keyId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Revoke a client key
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     A revoked key signs no further entry; entries it signed before stay valid. 404; 409 `conflict` when the key is already revoked.
+         */
+        post: operations["revokeLedgerClientKey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/ledger/signature-policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Require client signatures for a ledger table
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     Sets the signature policy of a ledger table to `required`. It cannot go back. 404; 409 `conflict` when the policy is already `required`; 422 `unprocessable` when the table is not a ledger table; 422 `unsupported_operation` for `kingres_ledger` older than 0.3.
+         */
+        put: operations["setTableSignaturePolicy"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/databases/{databaseName}/ledger/upgrade": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Upgrade the kingres_ledger extension of a database
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     Runs `ALTER EXTENSION kingres_ledger UPDATE` on every shard group of the database (task `ledger.upgrade`). A group that cannot be upgraded fails the task, whose error names the server. 404; 409 `operation_in_progress`.
+         */
+        post: operations["upgradeLedgerExtension"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/databases/{databaseName}/ledger/chains/{shardGroupId}/acknowledge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Shard group whose chain is meant. */
+                shardGroupId: number;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Acknowledge a diverged chain and start a new epoch
+         * @description Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+         *     After a restore or a loss at failover the chain of a shard group no longer extends its published log. The operator states what happened and the task `ledger.epoch.start` closes the old epoch and opens a new log. `confirm` must equal the database name (400 `validation_failed` otherwise). 404; 409 `chain_not_diverged` when the chain is not diverged.
+         */
+        post: operations["acknowledgeLedgerDivergence"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/alerts": {
         parameters: {
             query?: never;
@@ -2472,6 +3026,8 @@ export interface components {
          *     `server_hosts_map_group`, `last_server` (`removeServer`, `leaveCluster`), `server_group_not_empty`
          *     (`deleteServerGroup`), `ledger_entry_pending` (`createInclusionProof`).
          *
+         *     Added in 0.11.0 (409, ledger phase 7): `ledger_not_published` (the database has no published aggregate: `getLedgerAggregate`, `anchorLedgerNow`, `createLedgerBundle`), `origin_prefix_locked` (`updateLedgerSettings`: a checkpoint exists, the prefix cannot change), `signing_key_missing` (`createLedgerSigningKey` for a rotation when no key is active; `getLedgerTrustFile` when no key exists), `last_signing_key` (`retireLedgerSigningKey`, `revokeLedgerSigningKey`: no other key is active and in force) and `chain_not_diverged` (`acknowledgeLedgerDivergence`). Clients must tolerate codes they do not know.
+         *
          *     Added in 0.9.0 (409, rebalancing): `nothing_to_rebalance` (`startRebalance`: the plan is empty),
          *     `rebalance_not_running` (`stopRebalance`), `cluster_inconsistent` (`kingres.check_cluster()` reports something that
          *     makes moving buckets unsafe), `version_mismatch` (the servers do not run the same version of the sharding
@@ -2503,7 +3059,7 @@ export interface components {
          *     system database was stopped on purpose; start it with `startThisServerInstance`).
          * @enum {string}
          */
-        ProblemCode: "bad_request" | "validation_failed" | "unauthenticated" | "invalid_credentials" | "session_expired" | "csrf_token_invalid" | "forbidden" | "setup_token_invalid" | "not_found" | "method_not_allowed" | "conflict" | "already_exists" | "immutable_field" | "rebalance_in_progress" | "operation_in_progress" | "task_not_cancellable" | "last_admin" | "role_in_use" | "optimistic_lock_failed" | "no_replica_available" | "instance_already_running" | "instance_already_stopped" | "server_owns_buckets" | "server_hosts_map_group" | "last_server" | "server_group_not_empty" | "ledger_entry_pending" | "quorum_unavailable" | "system_database_stopped" | "unprocessable" | "sql_error" | "unsupported_operation" | "node_state_invalid" | "node_uninitialized" | "map_group_unavailable" | "leader_unavailable" | "rate_limited" | "service_unavailable" | "internal_error" | "certificate_revoked" | "certificate_authority_unavailable" | "internal_api_disabled" | "workbench_busy" | "config_parameter_unknown" | "config_parameter_managed" | "config_parameter_refused" | "config_level_not_allowed" | "config_value_below_floor" | "config_change_superseded" | "config_restart_order_conflict" | "nothing_pending" | "nothing_to_rebalance" | "rebalance_not_running" | "cluster_inconsistent" | "version_mismatch" | "failover_in_progress" | "group_degraded" | "insufficient_disk" | "no_receiving_server" | "failover_needs_decision" | "lease_settings_differ";
+        ProblemCode: "bad_request" | "validation_failed" | "unauthenticated" | "invalid_credentials" | "session_expired" | "csrf_token_invalid" | "forbidden" | "setup_token_invalid" | "not_found" | "method_not_allowed" | "conflict" | "already_exists" | "immutable_field" | "rebalance_in_progress" | "operation_in_progress" | "task_not_cancellable" | "last_admin" | "role_in_use" | "optimistic_lock_failed" | "no_replica_available" | "instance_already_running" | "instance_already_stopped" | "server_owns_buckets" | "server_hosts_map_group" | "last_server" | "server_group_not_empty" | "ledger_entry_pending" | "quorum_unavailable" | "system_database_stopped" | "unprocessable" | "sql_error" | "unsupported_operation" | "node_state_invalid" | "node_uninitialized" | "map_group_unavailable" | "leader_unavailable" | "rate_limited" | "service_unavailable" | "internal_error" | "certificate_revoked" | "certificate_authority_unavailable" | "internal_api_disabled" | "workbench_busy" | "config_parameter_unknown" | "config_parameter_managed" | "config_parameter_refused" | "config_level_not_allowed" | "config_value_below_floor" | "config_change_superseded" | "config_restart_order_conflict" | "nothing_pending" | "nothing_to_rebalance" | "rebalance_not_running" | "cluster_inconsistent" | "version_mismatch" | "failover_in_progress" | "group_degraded" | "insufficient_disk" | "no_receiving_server" | "failover_needs_decision" | "lease_settings_differ" | "ledger_not_published" | "origin_prefix_locked" | "signing_key_missing" | "last_signing_key" | "chain_not_diverged";
         /** @description One invalid field of a request. */
         ValidationIssue: {
             /** @description JSON Pointer (RFC 6901) to the invalid property of the request body, or the name of the invalid query or path parameter. */
@@ -4576,10 +5132,10 @@ export interface components {
         TaskState: "pending" | "running" | "paused" | "failed" | "done";
         /**
          * @description Kind of task. Each kind has one fixed `subject.type`; the table is in the README
-         *     (section "Task kinds and subjects"). `standby.reconcile` is added in 0.7.0.
+         *     (section "Task kinds and subjects"). `standby.reconcile` is added in 0.7.0; the `ledger.key.*`, `ledger.bundle.create`, `ledger.epoch.start` and `ledger.upgrade` kinds in 0.11.0.
          * @enum {string}
          */
-        TaskKind: "cluster.init" | "cluster.join" | "server.add" | "server.remove" | "server.failover" | "server.leave" | "instance.start" | "instance.stop" | "instance.restart" | "database.create" | "database.update" | "database.drop" | "table.distribute" | "rebalance" | "replication.restorePreferredPrimaries" | "ledger.verify" | "networkAccess.apply" | "replicate.apply" | "certificate.renew" | "certificate.revoke" | "standby.reconcile" | "config.apply" | "config.restart";
+        TaskKind: "cluster.init" | "cluster.join" | "server.add" | "server.remove" | "server.failover" | "server.leave" | "instance.start" | "instance.stop" | "instance.restart" | "database.create" | "database.update" | "database.drop" | "table.distribute" | "rebalance" | "replication.restorePreferredPrimaries" | "ledger.verify" | "networkAccess.apply" | "replicate.apply" | "certificate.renew" | "certificate.revoke" | "standby.reconcile" | "config.apply" | "config.restart" | "ledger.key.create" | "ledger.key.rotate" | "ledger.key.retire" | "ledger.key.revoke" | "ledger.key.distribute" | "ledger.bundle.create" | "ledger.epoch.start" | "ledger.upgrade";
         /** @description One step of a task. */
         TaskStep: {
             /** @description Step name. */
@@ -4637,11 +5193,11 @@ export interface components {
              * @description Resource type.
              * @enum {string}
              */
-            type: "cluster" | "server" | "instance" | "database" | "table" | "rebalance" | "replication" | "ledgerVerification" | "networkAccess" | "config";
+            type: "cluster" | "server" | "instance" | "database" | "table" | "rebalance" | "replication" | "ledgerVerification" | "networkAccess" | "config" | "ledgerKey";
             /**
              * @description Resource identifier: database name; server id (`ServerId`); instance id (`node_id`) as a decimal
              *     string; `database/schema.table` for a table; the verification id; the task id for a rebalance;
-             *     the literal `cluster`, `preferred-primaries` or `network-access` for the singleton subjects.
+             *     the literal `cluster`, `preferred-primaries`, `network-access` or (0.11.0, type `ledgerKey`) `signing` for the singleton subjects.
              *     See the README table "Task kinds and subjects".
              */
             id: string;
@@ -4935,7 +5491,7 @@ export interface components {
          *     `failure`. Read-only operations are not audited except `executeQuery`.
          * @enum {string}
          */
-        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "enableTableLedger" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert" | "renewServerCertificates" | "revokeServerCertificates" | "certificateRenewed" | "certificateRenewalFailed" | "cancelStatement" | "leaseLost" | "leaseFenced" | "leaseAcquired" | "standbyCreated" | "standbyRemoved" | "standbyRebuilt" | "standbyInstanceStarted" | "standbyInstanceRemoved" | "standbyInstanceRebuilt" | "synchronousStandbyNamesChanged" | "replicationSlotDropped" | "applyConfigChange" | "revertConfigChange" | "restartPendingInstances" | "resetAutoFailoverCounter" | "failoverGroupStarted" | "failoverGroupPromoted" | "failoverGroupFailed" | "oldPrimaryRebuilt";
+        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "enableTableLedger" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert" | "renewServerCertificates" | "revokeServerCertificates" | "certificateRenewed" | "certificateRenewalFailed" | "cancelStatement" | "leaseLost" | "leaseFenced" | "leaseAcquired" | "standbyCreated" | "standbyRemoved" | "standbyRebuilt" | "standbyInstanceStarted" | "standbyInstanceRemoved" | "standbyInstanceRebuilt" | "synchronousStandbyNamesChanged" | "replicationSlotDropped" | "applyConfigChange" | "revertConfigChange" | "restartPendingInstances" | "resetAutoFailoverCounter" | "failoverGroupStarted" | "failoverGroupPromoted" | "failoverGroupFailed" | "oldPrimaryRebuilt" | "updateLedgerSettings" | "createLedgerSigningKey" | "retireLedgerSigningKey" | "revokeLedgerSigningKey" | "createLedgerAnchorTarget" | "updateLedgerAnchorTarget" | "deleteLedgerAnchorTarget" | "testLedgerAnchorTarget" | "anchorLedgerNow" | "retryLedgerAnchor" | "createLedgerBundle" | "registerLedgerClientKey" | "revokeLedgerClientKey" | "setTableSignaturePolicy" | "upgradeLedgerExtension" | "acknowledgeLedgerDivergence";
         /** @description One audit log entry. */
         AuditEvent: {
             /**
@@ -5492,6 +6048,33 @@ export interface components {
             complete?: boolean;
             /** @description Added in 0.7.0, optional. The shard groups whose chains are not in `chains`; empty when `complete`. */
             uncoveredShardGroupIds?: number[];
+            /** @description Added in 0.11.0, optional. Publication of this database's logs. */
+            publication?: {
+                /** @description Whether publication is enabled. */
+                enabled: boolean;
+                /**
+                 * Format: date-time
+                 * @description When the newest checkpoint was signed.
+                 */
+                lastCheckpointAt: string | null;
+                /** @description One of `off`, `ok`, `behind`, `diverged`. Clients must tolerate values they do not know. */
+                state: string;
+            };
+            /** @description Added in 0.11.0, optional. Anchoring of this database's aggregate. */
+            anchoring?: {
+                /** @description Enabled targets. */
+                targets: number;
+                /**
+                 * Format: date-time
+                 * @description Evidence time of the newest anchored aggregate.
+                 */
+                newestAnchoredAt: string | null;
+                /**
+                 * @description State of the anchoring.
+                 * @enum {string}
+                 */
+                state: "none" | "ok" | "behind" | "failed";
+            };
         };
         /** @description Ledger status of all ledger-enabled databases. */
         LedgerStatusList: {
@@ -5523,7 +6106,7 @@ export interface components {
             hashVersion: number;
             /** @description Transactions in the block. */
             transactionCount: number;
-            /** @description Whether the block carries a server signature. */
+            /** @description Redefined in 0.11.0. True when the block is covered by a signed checkpoint of its chain log, that is when the size of the newest signed checkpoint is greater than the height. Before 0.11.0 it was always false (no server signature existed). A block is not signed by itself; a checkpoint signs a size and a root. */
             signed: boolean;
         };
         /** @description A page of blocks. */
@@ -5609,6 +6192,11 @@ export interface components {
             }[];
             /** @description Merkle root over the chain heads for a sharded database; null otherwise. */
             aggregateHash: components["schemas"]["Sha256Hex"] | null;
+            /**
+             * Format: int64
+             * @description Added in 0.11.0, optional. The size of the aggregate log this digest belongs to; null until the aggregate exists.
+             */
+            aggregateSize?: number | null;
             /** @description Anchoring destinations; empty until anchoring is configured. */
             anchors: components["schemas"]["DigestAnchor"][];
             /** @description Added in 0.6.0, optional (a 0.6.0 server always sends it). True when `chains` holds the chain of every shard group of the database; false when `uncoveredShardGroupIds` is not empty. */
@@ -5635,6 +6223,8 @@ export interface components {
              * @description Digest to verify against; null uses the latest digest.
              */
             digestId?: number | null;
+            /** @description Added in 0.11.0, optional. What to check: `chain` (the chain itself, the default), `publication` (re-read the chains from block 0, compare with the published leaves and verify the stored checkpoints) and `anchors`. A server that does not implement a check answers 422 `unsupported_operation` for it. */
+            checks?: ("chain" | "publication" | "anchors")[];
         };
         /** @description A discrepancy found by a verification. */
         LedgerInconsistency: {
@@ -5952,8 +6542,555 @@ export interface components {
          * @enum {string}
          */
         AlertState: "open" | "acknowledged" | "resolved";
+        /** @description Added in 0.11.0. The body of an operation that takes no input. An empty object or no body at all is accepted. */
+        LedgerEmptyRequest: Record<string, never>;
+        /** @description Added in 0.11.0. The cluster settings of ledger publication and anchoring (design of phase 7, section 8.4). */
+        LedgerSettingsCluster: {
+            /** @description Publication of the signed logs. */
+            publication: {
+                /** @description Whether the logs are published. Off by default. */
+                enabled: boolean;
+                /** @description The name under which every signature of the cluster is made (no scheme, no trailing slash, at most 160 bytes). The default is chosen by `kingresd` and should be confirmed by the operator. */
+                originPrefix: string;
+                /** @description Where the publication is reachable from outside, for the links the console shows; null when not set. */
+                publicUrl: string | null;
+                /** @description How often the logs are extended and checkpoints are signed. */
+                intervalSeconds: number;
+                /** @description True once a checkpoint was signed; the prefix cannot change then. */
+                originPrefixLocked: boolean;
+            };
+            /** @description Anchoring of aggregate checkpoints. */
+            anchor: {
+                /** @description How often the newest aggregate checkpoint is submitted to the targets. */
+                intervalSeconds: number;
+                /** @description How many targets must have anchored a checkpoint before it counts as anchored. */
+                minimumAnchored: number;
+                /** @description When true, the absence of anchors raises the alert `ledgerNotAnchored` as a warning instead of info. Nothing is blocked either way. */
+                required: boolean;
+            };
+        };
+        /** @description Added in 0.11.0. The same shape as `LedgerSettingsCluster`; every member is optional and a member that is absent is left as it is. `originPrefixLocked` is read-only and ignored. */
+        LedgerSettingsUpdate: {
+            /** @description Publication settings to change. */
+            publication?: {
+                /** @description Whether the logs are published. */
+                enabled?: boolean;
+                /** @description The origin prefix; refused with 409 `origin_prefix_locked` once a checkpoint exists. */
+                originPrefix?: string;
+                /** @description The public URL; null clears it. */
+                publicUrl?: string | null;
+                /** @description Publication interval in seconds. */
+                intervalSeconds?: number;
+            };
+            /** @description Anchoring settings to change. */
+            anchor?: {
+                /** @description Anchoring interval in seconds. */
+                intervalSeconds?: number;
+                /** @description Minimum number of anchored targets. */
+                minimumAnchored?: number;
+                /** @description Whether the absence of anchors is a warning. */
+                required?: boolean;
+            };
+        };
         /**
-         * @description Alert type. Clients must tolerate kinds they do not know. Added in 0.8.0: `clockDifference` (a server's clock differs from the manager leader's by more than `ClusterSettings.clock.maxDifferenceMs`, less the uncertainty of the measurement; `warning`, `critical` at ten times the threshold; `kingresd` does not set the system clock, run NTP or chrony). Added in 0.7.0: `leaseLost` (the `kingresd` that
+         * @description Added in 0.11.0. State of a signing key. `next` was generated and does not sign yet, `active` signs (two keys are active during the overlap of a rotation), `retired` signs nothing more and its old signatures stay valid, `revoked` is compromised.
+         * @enum {string}
+         */
+        LedgerSigningKeyState: "next" | "active" | "retired" | "revoked";
+        /** @description Added in 0.11.0. A signing key. Only public information; the private key never leaves the servers that hold it. */
+        LedgerSigningKey: {
+            /** @description SHA-256 of the public key, lower-case hexadecimal. The console shows it in groups of four characters; an auditor compares it with the value obtained out of band. */
+            fingerprint: string;
+            /** @description The 32-byte Ed25519 public key, standard base64 with padding. */
+            publicKey: string;
+            state: components["schemas"]["LedgerSigningKeyState"];
+            /**
+             * Format: date-time
+             * @description When the key was created.
+             */
+            createdAt: string;
+            /**
+             * Format: date-time
+             * @description When the key came (or comes) into force; null while `next`.
+             */
+            activatedAt: string | null;
+            /**
+             * Format: date-time
+             * @description When the key was retired; null otherwise.
+             */
+            retiredAt: string | null;
+            /**
+             * Format: date-time
+             * @description When the key was revoked; null otherwise.
+             */
+            revokedAt: string | null;
+            /**
+             * Format: date-time
+             * @description The time since which a revoked key is considered compromised, as the operator stated it; null otherwise.
+             */
+            compromisedSince: string | null;
+            /**
+             * Format: int64
+             * @description Optional. For a retired key, the largest tree size it may still sign (the `max_tree_size` of the trust file); null when unbounded or not retired.
+             */
+            maxTreeSize?: number | null;
+        };
+        /** @description Added in 0.11.0. One signed event of the key history, in the order of `seq` (numbered from 0 without gaps). */
+        LedgerSigningEvent: {
+            /**
+             * Format: int64
+             * @description Sequence number of the event.
+             */
+            seq: number;
+            /** @description `key-added`, `key-retired` or `key-revoked` (later steps add `epoch-closed`, `chain-retired` and `group-removed`). Clients must tolerate values they do not know. */
+            type: string;
+            /**
+             * Format: date-time
+             * @description When the event was made, whole seconds.
+             */
+            time: string;
+        };
+        /**
+         * @description Added in 0.11.0. The signing state of the ledger. It holds no secret: no seed, no private key and no
+         *     passphrase is ever part of it.
+         */
+        LedgerSigning: {
+            /** @description The public cluster identifier (32 random bytes, hexadecimal), created with the first key; null before. */
+            clusterId: string | null;
+            /**
+             * @description Where the private key lives. `file` is the key file on the holders; `command` is an external signer (a later step).
+             * @enum {string}
+             */
+            mode: "file" | "command";
+            /** @description Whether this server's key files are sealed with a passphrase. When false the key is clear text on disk, as `ca.key` is, and the console says so. */
+            passphraseProtected: boolean;
+            /** @description The servers that hold a copy of the private key (the manager leader and the candidates of the leader). A server that is not a holder never has the file. */
+            holders: components["schemas"]["ServerId"][];
+            /** @description Every key of the set, oldest first. */
+            keys: components["schemas"]["LedgerSigningKey"][];
+            /** @description The signed events of the key history, oldest first. */
+            events: components["schemas"]["LedgerSigningEvent"][];
+            /** @description Optional. True from the creation, rotation or revocation of a key until the operator confirms that a backup of the key directory was made. A reminder, not a proof. */
+            backupAdvised?: boolean;
+            /** @description Optional. True when the key ring was replaced after the loss of every key (auditors then need a new trust file out of band). */
+            discontinuity?: boolean;
+            /** @description Optional. Why this server does not sign, in words, when the stored key set is damaged or not in force; null when it can sign. Never contains a secret. */
+            signerAlarm?: string | null;
+        };
+        /** @description Added in 0.11.0. Options of the creation or rotation of a signing key. */
+        CreateLedgerSigningKeyRequest: {
+            /**
+             * @description For a rotation, how many days both keys sign.
+             * @default 30
+             */
+            overlapDays?: number;
+            /** @description The public key of an external signer, standard base64 of 32 bytes. Only for the signing mode `command`; refused with 422 `unsupported_operation` in mode `file`. */
+            publicKey?: string;
+            /** @description Optional. The operator states that a backup of the key directory was made; clears `backupAdvised`. Not a proof. */
+            backupMade?: boolean;
+        };
+        /** @description Added in 0.11.0. What the operator states when a signing key is revoked. */
+        RevokeLedgerSigningKeyRequest: {
+            /**
+             * Format: date-time
+             * @description The time since which the key is considered compromised. An earlier time is the safe direction. Never later than now.
+             */
+            compromisedSince: string;
+            /** @description Free text of at most 200 bytes of printable ASCII, published in the event. */
+            reason: string;
+            /** @description Must equal the fingerprint of the key; any other value is 400 `validation_failed`. */
+            confirm: string;
+        };
+        /**
+         * @description Added in 0.11.0. The public parts of the trust file of `kingres-verify` (design of phase 7, section 7.2), the
+         *     same bytes the verifier reads. The file is not a source of first trust: an auditor compares the fingerprint
+         *     with one obtained out of band.
+         */
+        LedgerTrustFile: {
+            /** @description Format of the file; 1. */
+            format: number;
+            /** @description The origin prefix of the cluster. */
+            origin_prefix: string;
+            /** @description The public keys with their standing. */
+            keys: {
+                /** @description A label only. */
+                name: string;
+                /** @description Standard base64 of the 32-byte key. */
+                public_key: string;
+                /** @description SHA-256 of the key */
+                fingerprint: string;
+                /**
+                 * Format: date-time
+                 * @description When the key may start to sign.
+                 */
+                not_before: string | null;
+                /**
+                 * Format: date-time
+                 * @description Never set by `kingresd` (a retired key's old checkpoints stay valid).
+                 */
+                not_after: string | null;
+                /** @description True for a revoked key. */
+                revoked: boolean;
+                /**
+                 * Format: int64
+                 * @description The largest tree size a retired key may sign; null when unbounded.
+                 */
+                max_tree_size: number | null;
+            }[];
+            /** @description Roots of time-stamp authorities (a later step). */
+            tsa_roots: string[];
+            /** @description Client keys (a later step). */
+            client_keys: {
+                [key: string]: unknown;
+            }[];
+            /** @description Witnesses (none yet). */
+            witnesses: {
+                [key: string]: unknown;
+            }[];
+        };
+        /** @description Added in 0.11.0. One published log. */
+        LedgerPublicationLog: {
+            /**
+             * @description A chain log (one per shard group and epoch) or an aggregate log (one per database).
+             * @enum {string}
+             */
+            kind: "chain" | "aggregate";
+            /** @description The origin of the log. */
+            origin: string;
+            /**
+             * Format: int64
+             * @description Size of the log.
+             */
+            size: number;
+            /**
+             * Format: date-time
+             * @description When the newest checkpoint was signed; null when none was.
+             */
+            lastCheckpointAt: string | null;
+            /**
+             * @description State of the log.
+             * @enum {string}
+             */
+            state: "active" | "diverged" | "closed";
+        };
+        /** @description Added in 0.11.0. The state of the ledger publication. */
+        LedgerPublication: {
+            /** @description Whether publication is enabled. */
+            enabled: boolean;
+            /** @description The HTTP listener that serves the publication. */
+            listener: {
+                /** @description Listen address; null when no listener is configured. */
+                address: string | null;
+                /** @description Whether the listener uses TLS (plain HTTP is a warning). */
+                tls: boolean;
+                /** @description Whether it runs. */
+                running: boolean;
+            };
+            /** @description The published logs. */
+            logs: components["schemas"]["LedgerPublicationLog"][];
+            /**
+             * Format: date-time
+             * @description When the newest checkpoint of any log was signed.
+             */
+            lastCheckpointAt: string | null;
+            /** @description The last checks of the publication (what the audit job found); members are added by later steps. */
+            checks: {
+                [key: string]: unknown;
+            };
+        };
+        /**
+         * @description Added in 0.11.0. Kind of an anchor target. `worm` is an S3 Object Lock store, `tsa` an RFC 3161 time-stamp authority, `ots` OpenTimestamps.
+         * @enum {string}
+         */
+        LedgerAnchorKind: "worm" | "tsa" | "ots";
+        /**
+         * @description Added in 0.11.0. State of an anchor record. `pending` waits to be submitted, `submitted` was accepted and is not final, `anchored` is final, `failed` needs a person, `superseded` was replaced by a newer checkpoint, `expired` was never confirmed in time.
+         * @enum {string}
+         */
+        LedgerAnchorState: "pending" | "submitted" | "anchored" | "failed" | "superseded" | "expired";
+        /** @description Added in 0.11.0. An anchor target. Credentials are write-only and never part of it. */
+        LedgerAnchorTarget: {
+            /**
+             * Format: int64
+             * @description Identifier.
+             */
+            id: number;
+            kind: components["schemas"]["LedgerAnchorKind"];
+            /** @description A unique name. */
+            name: string;
+            /** @description Whether the target is used. */
+            enabled: boolean;
+            /** @description The non-secret configuration; its shape depends on `kind`. */
+            config: {
+                [key: string]: unknown;
+            };
+            /** @description Whether credentials are stored. Their value is never returned. */
+            credentialsSet: boolean;
+            /** @description The result of the last test; null when never tested. */
+            lastTest: components["schemas"]["LedgerAnchorTest"] | null;
+            /**
+             * Format: date-time
+             * @description Evidence time of the newest anchor of this target; null when none.
+             */
+            newestAnchoredAt: string | null;
+            /**
+             * @description The state of the target as the alerts see it.
+             * @enum {string}
+             */
+            state: "none" | "ok" | "behind" | "failed";
+        };
+        /** @description Added in 0.11.0. The anchor targets. */
+        LedgerAnchorTargetList: {
+            /** @description The targets. */
+            items: components["schemas"]["LedgerAnchorTarget"][];
+        };
+        /** @description Added in 0.11.0. A new anchor target. */
+        LedgerAnchorTargetCreate: {
+            kind: components["schemas"]["LedgerAnchorKind"];
+            /** @description A unique name. */
+            name: string;
+            /**
+             * @description Whether the target is used.
+             * @default false
+             */
+            enabled?: boolean;
+            /** @description The non-secret configuration; its shape depends on `kind`. */
+            config: {
+                [key: string]: unknown;
+            };
+            /** @description Write-only credentials; stored in a sealed file and never returned or logged. */
+            credentials?: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description Added in 0.11.0. Changes to an anchor target; every member is optional. `kind` cannot change (409 `immutable_field`). */
+        LedgerAnchorTargetUpdate: {
+            kind?: components["schemas"]["LedgerAnchorKind"];
+            /** @description The new name. */
+            name?: string;
+            /** @description Whether the target is used. */
+            enabled?: boolean;
+            /** @description The new non-secret configuration. */
+            config?: {
+                [key: string]: unknown;
+            };
+            /** @description New credentials */
+            credentials?: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description Added in 0.11.0. The result of the test of an anchor target. */
+        LedgerAnchorTest: {
+            /** @description The named checks. */
+            checks: {
+                /** @description Name of the check. */
+                name: string;
+                /**
+                 * @description Result.
+                 * @enum {string}
+                 */
+                status: "ok" | "warning" | "failed";
+                /** @description What was found; never contains a credential. */
+                detail: string;
+            }[];
+            /** @description True when no check failed. */
+            ok: boolean;
+            /**
+             * Format: date-time
+             * @description Optional. When the test ran.
+             */
+            testedAt?: string;
+        };
+        /** @description Added in 0.11.0. One chain in an aggregate. */
+        LedgerAggregateMember: {
+            /**
+             * Format: int32
+             * @description Shard group.
+             */
+            shardGroupId: number;
+            /** @description Public chain identifier */
+            chainId: string;
+            /** @description Epoch of the chain log. */
+            epoch: number;
+            /**
+             * Format: int64
+             * @description Head block height.
+             */
+            height: number;
+            blockHash: components["schemas"]["Sha256Hex"];
+            /** @description Root of the chain log */
+            logRoot: string;
+            /** @description Flags of the member. */
+            flags: string[];
+        };
+        /** @description Added in 0.11.0. An aggregate checkpoint without its members. */
+        LedgerAggregateSummary: {
+            /**
+             * Format: int64
+             * @description Size of the aggregate log.
+             */
+            size: number;
+            /** @description Root of the aggregate log */
+            root: string;
+            /** @description The signed checkpoint (a signed note). */
+            checkpoint: string;
+            /**
+             * Format: date-time
+             * @description When the aggregate entry was made.
+             */
+            generatedAt: string;
+            /** @description True when every shard group of the database is covered. */
+            complete: boolean;
+            /** @description Shard groups that are not covered. */
+            uncoveredShardGroupIds: number[];
+        };
+        /** @description Added in 0.11.0. An aggregate checkpoint with its members, its anchors and the statement of what it proves. */
+        LedgerAggregate: components["schemas"]["LedgerAggregateSummary"] & {
+            /** @description The chains covered. */
+            members: components["schemas"]["LedgerAggregateMember"][];
+            /** @description The anchor records of this checkpoint. */
+            anchors: components["schemas"]["LedgerAnchor"][];
+            /** @description The text of what the aggregate proves and does not prove. */
+            statement: string;
+        };
+        /** @description Added in 0.11.0. A page of aggregates, newest first. */
+        LedgerAggregatePage: {
+            /** @description The aggregates without members. */
+            items: components["schemas"]["LedgerAggregateSummary"][];
+            nextCursor: components["schemas"]["NextCursor"];
+        };
+        /** @description Added in 0.11.0. An anchor record of an aggregate checkpoint at one target. */
+        LedgerAnchor: {
+            /**
+             * Format: int64
+             * @description Identifier.
+             */
+            id: number;
+            /**
+             * Format: int64
+             * @description The target; null after the target was deleted.
+             */
+            targetId: number | null;
+            /** @description Name of the target (kept after it is deleted). */
+            targetName: string;
+            kind: components["schemas"]["LedgerAnchorKind"];
+            /**
+             * Format: int64
+             * @description Size of the anchored aggregate checkpoint.
+             */
+            aggregateSize: number;
+            state: components["schemas"]["LedgerAnchorState"];
+            /** @description Attempts so far. */
+            attempts: number;
+            /**
+             * Format: date-time
+             * @description When the next attempt is due.
+             */
+            nextAttemptAt: string | null;
+            /**
+             * Format: date-time
+             * @description When the record became anchored.
+             */
+            anchoredAt: string | null;
+            /**
+             * Format: date-time
+             * @description The time the target vouches for
+             */
+            evidenceTime: string | null;
+            /** @description The last error in words; never contains a credential. */
+            lastError: string | null;
+        };
+        /** @description Added in 0.11.0. A page of anchor records. */
+        LedgerAnchorPage: {
+            /** @description Records, newest first. */
+            items: components["schemas"]["LedgerAnchor"][];
+            nextCursor: components["schemas"]["NextCursor"];
+        };
+        /** @description Added in 0.11.0. Anchor records. */
+        LedgerAnchorList: {
+            /** @description The records. */
+            items: components["schemas"]["LedgerAnchor"][];
+        };
+        /** @description Added in 0.11.0. What a bundle holds. */
+        LedgerBundleRequest: {
+            /** @description The logs to include; all when absent. */
+            logs?: string[];
+            /**
+             * Format: int64
+             * @description Only the part of each log after this size.
+             */
+            sinceSize?: number;
+            /** @description Whether to include the anchor evidence. */
+            includeAnchors: boolean;
+            /** @description Inclusion proofs to include (the bundle then reveals those rows' hashes to whoever holds it). */
+            proofs?: components["schemas"]["InclusionProofRequest"][];
+        };
+        /** @description Added in 0.11.0. A registered client key. */
+        LedgerClientKey: {
+            /** @description Key id */
+            keyId: string;
+            /** @description The 32-byte public key */
+            publicKey: string;
+            /** @description The role the key is bound to; null when unbound. */
+            roleName: string | null;
+            /** @description Label. */
+            label: string;
+            /** @description Who registered it. */
+            registeredBy: string;
+            /**
+             * Format: date-time
+             * @description When.
+             */
+            registeredAt: string;
+            /**
+             * Format: date-time
+             * @description When it was revoked.
+             */
+            revokedAt: string | null;
+            /** @description Why it was revoked. */
+            revocationReason: string | null;
+        };
+        /** @description Added in 0.11.0. Registered client keys. */
+        LedgerClientKeyList: {
+            /** @description The keys. */
+            items: components["schemas"]["LedgerClientKey"][];
+        };
+        /** @description Added in 0.11.0. A client key to register. */
+        RegisterLedgerClientKeyRequest: {
+            /** @description The 32-byte Ed25519 public key */
+            publicKey: string;
+            /** @description Optional role the key is bound to. */
+            roleName?: string;
+            /** @description Label. */
+            label: string;
+        };
+        /** @description Added in 0.11.0. Why a client key is revoked. */
+        RevokeLedgerClientKeyRequest: {
+            /** @description Reason. */
+            reason: string;
+        };
+        /** @description Added in 0.11.0. The signature policy of a ledger table. */
+        SignaturePolicyRequest: {
+            /**
+             * @description The only value; the policy cannot go back.
+             * @enum {string}
+             */
+            policy: "required";
+        };
+        /** @description Added in 0.11.0. What the operator states about a diverged chain. */
+        AcknowledgeLedgerDivergenceRequest: {
+            /**
+             * @description What happened.
+             * @enum {string}
+             */
+            kind: "restore" | "failoverLoss" | "other";
+            /** @description Free text. */
+            reason: string;
+            /** @description Must equal the database name. */
+            confirm: string;
+        };
+        /**
+         * @description Alert type. Clients must tolerate kinds they do not know. Added in 0.11.0 (ledger phase 7; subjects at `AlertSubject`): `ledgerNotAnchored` (a database has ledger tables and no anchor target is enabled; `info`, `warning` when the setting `anchor.required` is on), `ledgerAnchorBehind` (`warning`, `critical`), `ledgerAnchorFailed` (an anchor record is `failed` or `expired`; `critical`), `ledgerAnchorConflict` (the store holds a different object under the name of an anchor; `critical`), `ledgerChainDiverged` (a chain no longer extends its published log; `critical`), `ledgerGroupUnread` (a shard group's chain could not be read; `warning`, `critical`), `ledgerPublicationBehind` (the newest signed checkpoint of a chain is older than five publication intervals while its head advanced; `warning`), `ledgerSignerUnavailable` (no checkpoint could be signed for two rounds, or the key set is damaged, or the key file is missing on the leader; `critical`) and `ledgerDigestOverdue` (no digest within twice `digestIntervalSeconds`; `warning`). Added in 0.8.0: `clockDifference` (a server's clock differs from the manager leader's by more than `ClusterSettings.clock.maxDifferenceMs`, less the uncertainty of the measurement; `warning`, `critical` at ten times the threshold; `kingresd` does not set the system clock, run NTP or chrony). Added in 0.7.0: `leaseLost` (the `kingresd` that
          *     runs the primary of a shard group could not renew the group's lease in time; for a group with a standby the
          *     instance was stopped (fenced), for a group without one it keeps running and this alert is the only effect;
          *     `critical`), `groupWithoutSynchronousStandby` (the group's standby has been unreachable for longer than the
@@ -5967,7 +7104,7 @@ export interface components {
          *     `server:<leader>|behind:<server>`, `warning` after a minute, `critical` after ten).
          * @enum {string}
          */
-        AlertKind: "serverDown" | "serverSuspect" | "underReplicatedBuckets" | "unavailableBuckets" | "replicationLagHigh" | "diskSpaceLow" | "memoryPressure" | "rebalanceNeeded" | "autoFailoverTriggered" | "autoFailoverLimitReached" | "mapGroupUnavailable" | "ledgerVerificationFailed" | "ledgerPendingTooOld" | "versionMismatch" | "certificateExpiring" | "certificateRenewalFailed" | "replicationPending" | "taskFailed" | "leaseLost" | "groupWithoutSynchronousStandby" | "groupUnderReplicated" | "clockDifference" | "failoverNeedsDecision" | "failoverBlocked" | "failoverDataLoss" | "splitPromotion" | "oldPrimaryRunning" | "oldPrimaryNotStopped" | "oldPrimaryNotRebuilt";
+        AlertKind: "serverDown" | "serverSuspect" | "underReplicatedBuckets" | "unavailableBuckets" | "replicationLagHigh" | "diskSpaceLow" | "memoryPressure" | "rebalanceNeeded" | "autoFailoverTriggered" | "autoFailoverLimitReached" | "mapGroupUnavailable" | "ledgerVerificationFailed" | "ledgerPendingTooOld" | "versionMismatch" | "certificateExpiring" | "certificateRenewalFailed" | "replicationPending" | "taskFailed" | "leaseLost" | "groupWithoutSynchronousStandby" | "groupUnderReplicated" | "clockDifference" | "failoverNeedsDecision" | "failoverBlocked" | "failoverDataLoss" | "splitPromotion" | "oldPrimaryRunning" | "oldPrimaryNotStopped" | "oldPrimaryNotRebuilt" | "ledgerNotAnchored" | "ledgerAnchorBehind" | "ledgerAnchorFailed" | "ledgerAnchorConflict" | "ledgerChainDiverged" | "ledgerGroupUnread" | "ledgerPublicationBehind" | "ledgerSignerUnavailable" | "ledgerDigestOverdue";
         /** @description An alert. */
         Alert: {
             /**
@@ -6015,6 +7152,7 @@ export interface components {
          *     `behindServerId` the server that is behind (the one the panel must name). `leaseLost`,
          *     `groupWithoutSynchronousStandby`, `groupUnderReplicated`: `shardGroupId`, and `serverId` the server that
          *     runs the group's primary. `clockDifference` (0.8.0): `serverId` is the server whose clock differs. `versionMismatch`: all null.
+         *     Added in 0.11.0: `ledgerNotAnchored`, `ledgerDigestOverdue`: `databaseName`. `ledgerAnchorBehind`, `ledgerAnchorFailed`: `aspect` is `target:<id>`. `ledgerAnchorConflict`: `databaseName` and `aspect` `target:<id>`. `ledgerChainDiverged`, `ledgerGroupUnread`, `ledgerPublicationBehind`: `databaseName` and `shardGroupId`. `ledgerSignerUnavailable`: all null.
          *     `taskId` (0.9.0, optional) names a task the alert is about, so that a client can link to it; `kingresd` sets it for
          *     `taskFailed` alerts (the only kind about a task; `kingresd` raises it for a rebalance that ended failed, subject `task:<id>`), and no other kind sets it.
          */
@@ -9202,6 +10340,870 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getLedgerSettings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The settings. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LedgerSettingsCluster"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    updateLedgerSettings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LedgerSettingsUpdate"];
+            };
+        };
+        responses: {
+            /** @description The settings after the change. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LedgerSettingsCluster"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getLedgerSigning: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The signing state. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LedgerSigning"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    createLedgerSigningKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["CreateLedgerSigningKeyRequest"];
+            };
+        };
+        responses: {
+            202: components["responses"]["AcceptedTask"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    retireLedgerSigningKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Fingerprint of a signing key, 64 lower-case hexadecimal characters (the SHA-256 of the public key). */
+                fingerprint: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["LedgerEmptyRequest"];
+            };
+        };
+        responses: {
+            202: components["responses"]["AcceptedTask"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    revokeLedgerSigningKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Fingerprint of a signing key, 64 lower-case hexadecimal characters (the SHA-256 of the public key). */
+                fingerprint: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RevokeLedgerSigningKeyRequest"];
+            };
+        };
+        responses: {
+            202: components["responses"]["AcceptedTask"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getLedgerTrustFile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The trust file. */
+            200: {
+                headers: {
+                    /** @description attachment; filename="trust.json" */
+                    "Content-Disposition"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LedgerTrustFile"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getLedgerPublication: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The publication. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LedgerPublication"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    listLedgerAnchorTargets: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The targets. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LedgerAnchorTargetList"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    createLedgerAnchorTarget: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LedgerAnchorTargetCreate"];
+            };
+        };
+        responses: {
+            /** @description The target. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LedgerAnchorTarget"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getLedgerAnchorTarget: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identifier of an anchor target. */
+                targetId: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The target. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LedgerAnchorTarget"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    deleteLedgerAnchorTarget: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identifier of an anchor target. */
+                targetId: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The target was deleted. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    updateLedgerAnchorTarget: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identifier of an anchor target. */
+                targetId: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LedgerAnchorTargetUpdate"];
+            };
+        };
+        responses: {
+            /** @description The target after the change. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LedgerAnchorTarget"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    testLedgerAnchorTarget: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identifier of an anchor target. */
+                targetId: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["LedgerEmptyRequest"];
+            };
+        };
+        responses: {
+            /** @description The result of the test. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LedgerAnchorTest"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getLedgerAggregate: {
+        parameters: {
+            query?: {
+                /** @description Size of the aggregate log; the newest when absent. */
+                size?: number;
+            };
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The aggregate. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LedgerAggregate"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    listLedgerAggregates: {
+        parameters: {
+            query?: {
+                /** @description Maximum number of items to return. */
+                limit?: components["parameters"]["Limit"];
+                /** @description Opaque cursor taken from `nextCursor` of the previous page. Omit for the first page. */
+                cursor?: components["parameters"]["Cursor"];
+            };
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A page of aggregates. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LedgerAggregatePage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    listLedgerAnchors: {
+        parameters: {
+            query?: {
+                /** @description Only the records of this target. */
+                targetId?: number;
+                /** @description Only the records in this state. */
+                state?: components["schemas"]["LedgerAnchorState"];
+                /** @description Maximum number of items to return. */
+                limit?: components["parameters"]["Limit"];
+                /** @description Opaque cursor taken from `nextCursor` of the previous page. Omit for the first page. */
+                cursor?: components["parameters"]["Cursor"];
+            };
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A page of anchor records. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LedgerAnchorPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    anchorLedgerNow: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["LedgerEmptyRequest"];
+            };
+        };
+        responses: {
+            /** @description The records that were created, one per enabled target. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LedgerAnchorList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    retryLedgerAnchor: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Identifier of an anchor record. */
+                anchorId: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["LedgerEmptyRequest"];
+            };
+        };
+        responses: {
+            /** @description The record. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LedgerAnchor"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    downloadLedgerAnchor: {
+        parameters: {
+            query?: {
+                /** @description Format of the evidence file. */
+                format?: "json" | "ots" | "tsr";
+            };
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Identifier of an anchor record. */
+                anchorId: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The evidence file. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                    "application/octet-stream": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    createLedgerBundle: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LedgerBundleRequest"];
+            };
+        };
+        responses: {
+            202: components["responses"]["AcceptedTask"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getLedgerBundle: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Identifier of a bundle. */
+                bundleId: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The bundle. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/gzip": string;
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    listLedgerClientKeys: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The keys. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LedgerClientKeyList"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    registerLedgerClientKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RegisterLedgerClientKeyRequest"];
+            };
+        };
+        responses: {
+            /** @description The key. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LedgerClientKey"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    revokeLedgerClientKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Key id of a client key, 8 lower-case hexadecimal characters. */
+                keyId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RevokeLedgerClientKeyRequest"];
+            };
+        };
+        responses: {
+            /** @description The key. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LedgerClientKey"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    setTableSignaturePolicy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Schema name. */
+                schemaName: components["parameters"]["SchemaName"];
+                /** @description Table name. */
+                tableName: components["parameters"]["TableName"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SignaturePolicyRequest"];
+            };
+        };
+        responses: {
+            /** @description The table. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Table"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    upgradeLedgerExtension: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["LedgerEmptyRequest"];
+            };
+        };
+        responses: {
+            202: components["responses"]["AcceptedTask"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    acknowledgeLedgerDivergence: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name. */
+                databaseName: components["parameters"]["DatabaseName"];
+                /** @description Shard group whose chain is meant. */
+                shardGroupId: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AcknowledgeLedgerDivergenceRequest"];
+            };
+        };
+        responses: {
+            202: components["responses"]["AcceptedTask"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["Conflict"];
             422: components["responses"]["UnprocessableEntity"];
             503: components["responses"]["ServiceUnavailable"];
         };

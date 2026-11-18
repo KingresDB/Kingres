@@ -115,6 +115,9 @@ export const keys = {
   clusterSettings: ['clusterSettings'] as const,
   ledgerStatus: ['ledgerStatus'] as const,
   ledger: (name: string) => ['ledger', name] as const,
+  ledgerSettings: ['ledgerSettings'] as const,
+  ledgerSigning: ['ledgerSigning'] as const,
+  ledgerPublication: ['ledgerPublication'] as const,
   alerts: ['alerts'] as const,
   logs: ['logs'] as const,
   metrics: ['metrics'] as const,
@@ -417,6 +420,33 @@ export const useLedgerStatusList = () =>
     queryKey: keys.ledgerStatus,
     queryFn: ledgerStatusList,
     refetchInterval: every(POLL.normal),
+  })
+
+/** 0.11.0: the settings of publication and anchoring (cluster-wide). */
+export const useLedgerSettings = (enabled: MaybeRefOrGetter<boolean> = true) =>
+  useQuery({
+    queryKey: keys.ledgerSettings,
+    queryFn: endpoints.getLedgerSettings,
+    refetchInterval: every(POLL.slow),
+    enabled: computed(() => toValue(enabled)),
+  })
+
+/** 0.11.0: the signing keys of the ledger, their events and the servers that hold them. Public information only. */
+export const useLedgerSigning = (enabled: MaybeRefOrGetter<boolean> = true) =>
+  useQuery({
+    queryKey: keys.ledgerSigning,
+    queryFn: endpoints.getLedgerSigning,
+    refetchInterval: every(POLL.normal),
+    enabled: computed(() => toValue(enabled)),
+  })
+
+/** 0.11.0: the listener and the logs of the publication (a server may answer 422 `unsupported_operation` for now). */
+export const useLedgerPublication = (enabled: MaybeRefOrGetter<boolean> = true) =>
+  useQuery({
+    queryKey: keys.ledgerPublication,
+    queryFn: endpoints.getLedgerPublication,
+    refetchInterval: every(POLL.normal),
+    enabled: computed(() => toValue(enabled)),
   })
 
 // --- this server ------------------------------------------------------------------------------

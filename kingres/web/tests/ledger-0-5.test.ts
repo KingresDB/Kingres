@@ -69,8 +69,8 @@ function manyDigests(n: number): void {
 
 async function openLedger() {
   const user = userEvent.setup()
-  const app = await renderApp('/ledger')
-  await screen.findByText(/status of shop/i)
+  const app = await renderApp('/ledger?tab=digests')
+  await screen.findByRole('heading', { name: 'Digests' })
   return { user, ...app }
 }
 

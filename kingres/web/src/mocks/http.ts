@@ -9,6 +9,7 @@ import { API_BASE_PATH } from '@/api/client'
 import { auditActions, operations, type OperationId } from '@/api/operations.generated'
 import { canCall } from '@/api/roles'
 import type { AuditAction, Problem, ProblemCode, Task } from '@/api/types'
+import { syncLedgerAlerts } from './ledger-view'
 import { createMockState, mockConfig, tickTasks, tickHa, findTask, type MockState } from './state'
 
 let state: MockState = createMockState()
@@ -103,6 +104,11 @@ const STATUS: Record<ProblemCode, number> = {
   group_degraded: 409,
   failover_needs_decision: 409,
   lease_settings_differ: 409,
+  ledger_not_published: 409,
+  origin_prefix_locked: 409,
+  signing_key_missing: 409,
+  last_signing_key: 409,
+  chain_not_diverged: 409,
   insufficient_disk: 409,
   no_receiving_server: 409,
   unprocessable: 422,
@@ -164,6 +170,8 @@ export interface Reply {
   body?: unknown
   /** A JSON text sent byte for byte (a document that a verifier reads must not be re-serialized). */
   rawJson?: string
+  /** Bytes sent as they are (an archive, an evidence file); `Content-Type` comes from `headers`. */
+  rawBody?: Uint8Array
   headers?: Record<string, string>
 }
 
@@ -227,6 +235,7 @@ export function register(operationId: OperationId, handler: Handler): HttpHandle
     const s = getState()
     tickTasks(s)
     tickHa(s)
+    syncLedgerAlerts(s)
     try {
       precheck(s, operationId, request)
       const dryRun = new URL(request.url).searchParams.get('dryRun') === 'true'
@@ -268,6 +277,8 @@ export function register(operationId: OperationId, handler: Handler): HttpHandle
           status: reply.status,
           headers: { ...headers, 'Content-Type': 'application/json' },
         })
+      if (reply.rawBody !== undefined)
+        return new HttpResponse(reply.rawBody as BodyInit, { status: reply.status, headers })
       if (reply.status === 204 || reply.body === undefined)
         return new HttpResponse(null, { status: reply.status, headers })
       return HttpResponse.json(reply.body as Record<string, unknown>, {

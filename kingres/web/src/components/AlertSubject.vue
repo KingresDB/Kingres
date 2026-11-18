@@ -33,15 +33,46 @@ const linkable = (id: string): boolean => canServer.value && isAddressableSegmen
 
 /** Words for the qualifiers the contract names; any other one is shown as sent. */
 const ASPECT: Record<string, string> = { ca: 'Cluster certificate authority' }
+// 0.11.0: `target:<id>` is an anchor target of the ledger (the number only; anything else is shown as sent).
 const aspectText = computed(() => {
   const a = subject.value.aspect
-  return a === null || a === undefined ? null : (ASPECT[a] ?? null)
+  if (a === null || a === undefined) return null
+  const target = /^target:(\d{1,18})$/.exec(a)
+  return target ? `Anchor target ${target[1]}` : (ASPECT[a] ?? null)
 })
 // 0.10.0: an alert about a failover links to where its progress and report are shown.
 const isFailoverAlert = computed(() =>
   ['failoverNeedsDecision', 'failoverBlocked', 'failoverDataLoss'].includes(props.alert.kind),
 )
 const canFailover = computed(() => session.can('getFailoverStatus'))
+// 0.11.0: an alert about the ledger links to the tab of the Ledger page where it is explained and handled.
+const LEDGER_TAB: Record<string, string | undefined> = {
+  ledgerSignerUnavailable: 'signing',
+  ledgerPublicationBehind: 'publication',
+  ledgerChainDiverged: 'publication',
+  ledgerGroupUnread: 'publication',
+}
+const isLedgerAlert = computed(() => props.alert.kind.startsWith('ledger'))
+const canLedger = computed(() => session.can('listLedgerStatus'))
+const ledgerLink = computed(() => {
+  const db = subject.value.databaseName
+  const tab = LEDGER_TAB[props.alert.kind]
+  return {
+    name: 'ledger',
+    query: {
+      ...(db !== null && isAddressableSegment(db) ? { db } : {}),
+      ...(tab ? { tab } : {}),
+    },
+  }
+})
+const ledgerLinkText = computed(() => {
+  const tab = LEDGER_TAB[props.alert.kind]
+  return tab === 'signing'
+    ? 'Signing keys of the ledger'
+    : tab === 'publication'
+      ? 'Publication of the ledger'
+      : 'Ledger page'
+})
 const isPending = computed(() => props.alert.kind === 'replicationPending')
 // 0.8.0: a clock that differs is explained and handled on the Time tab of the Configuration page.
 const canTime = computed(
@@ -50,6 +81,7 @@ const canTime = computed(
 const any = computed(
   () =>
     (isFailoverAlert.value && canFailover.value) ||
+    (isLedgerAlert.value && canLedger.value) ||
     subject.value.serverId !== null ||
     subject.value.behindServerId !== null ||
     subject.value.shardGroupId !== null ||
@@ -99,6 +131,9 @@ const any = computed(
       <RouterLink :to="{ name: 'replication', hash: '#failover-top' }"
         >Failover progress and report</RouterLink
       >
+    </li>
+    <li v-if="isLedgerAlert && canLedger" data-testid="alert-ledger">
+      <RouterLink :to="ledgerLink">{{ ledgerLinkText }}</RouterLink>
     </li>
     <li v-if="canTime" data-testid="alert-clock">
       <RouterLink :to="{ name: 'configuration', query: { tab: 'time' } }"

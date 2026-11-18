@@ -246,7 +246,7 @@ describe('the production build under the content security policy', () => {
     await collect('stopped state ended')
 
     mockConfig.incompleteLedger = true
-    await page.goto(`${server.url}/ledger`, { waitUntil: 'networkidle0' })
+    await page.goto(`${server.url}/ledger?tab=digests`, { waitUntil: 'networkidle0' })
     await settled(page)
     await clickText(page, 'Generate digest')
     await page.waitForSelector('[data-testid^="digest-coverage-"]', { timeout: 20_000 })

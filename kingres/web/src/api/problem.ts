@@ -370,6 +370,42 @@ const entries: Record<ProblemCode, Entry> = {
       'A failover needs every server to use the same lease duration and margin. Make the settings equal, then try again.',
     withDetail: true,
   },
+  ledger_not_published: {
+    tone: 'info',
+    heading: 'The ledger is not published yet',
+    message:
+      'This database has no published aggregate yet. Turn publication on under Publication on the Ledger page and wait for the first checkpoint, then try again.',
+    withDetail: true,
+    retryable: true,
+  },
+  origin_prefix_locked: {
+    tone: 'warning',
+    heading: 'The origin prefix can no longer be changed',
+    message:
+      'Every signature of the cluster is made under the origin prefix, so it is fixed once a signing key or a checkpoint exists. Another prefix needs a new cluster generation, not a setting.',
+    withDetail: true,
+  },
+  signing_key_missing: {
+    tone: 'warning',
+    heading: 'There is no signing key',
+    message:
+      'This needs an active signing key of the ledger. Create the first key under Signing on the Ledger page.',
+    withDetail: true,
+  },
+  last_signing_key: {
+    tone: 'warning',
+    heading: 'This is the last signing key in force',
+    message:
+      'No other key is active, so ending this one would leave the ledger without a signer and no key would authorise the next. Add a new key first (a rotation), then end this one.',
+    withDetail: true,
+  },
+  chain_not_diverged: {
+    tone: 'info',
+    heading: 'This chain has not diverged',
+    message:
+      'Only a chain that no longer extends its published log can be acknowledged. Read the state of the chain again.',
+    withDetail: true,
+  },
   group_degraded: {
     tone: 'warning',
     heading: 'A shard group is degraded',

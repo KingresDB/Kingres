@@ -12,6 +12,7 @@ import LineChart from '@/components/LineChart.vue'
 import AlertSubject from '@/components/AlertSubject.vue'
 import ClientEntryPointCharts from '@/components/ClientEntryPointCharts.vue'
 import ConfigSummaryCard from '@/components/config/ConfigSummaryCard.vue'
+import LedgerSummaryCard from '@/components/ledger/LedgerSummaryCard.vue'
 import PartialNotice from '@/components/PartialNotice.vue'
 import { useCompletenessAnnouncement } from '@/composables/useCompletenessAnnouncement'
 import { completenessOf, mergeCompleteness } from '@/lib/partial'
@@ -36,6 +37,7 @@ const canCluster = computed(() => session.can('getCluster'))
 const canAlerts = computed(() => session.can('listAlerts'))
 const canTasks = computed(() => session.can('listTasks'))
 const canConfig = computed(() => session.can('getConfigSummary'))
+const canLedger = computed(() => session.can('listLedgerStatus'))
 const cluster = useCluster(canCluster)
 // A stats-only account cannot read /cluster; GET /cluster/summary is open to it.
 const summary = useClusterSummary(() => !canCluster.value)
@@ -229,6 +231,7 @@ const metricsUnsupported = computed(() =>
     </section>
     <ClientEntryPointCharts v-if="!metricsUnsupported" />
     <ConfigSummaryCard v-if="canConfig" />
+    <LedgerSummaryCard v-if="canLedger" />
     <div v-if="canAlerts || canTasks" class="grid-2">
       <section v-if="canAlerts" class="card" aria-labelledby="alerts-h">
         <div class="row-between">
