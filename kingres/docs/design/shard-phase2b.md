@@ -2736,3 +2736,130 @@ Where the code differs from sections 4, 5.1, 6.5 and 17:
 - The fix round for the fifth review of the call sequences (S13) changes
   `node_conn.c` after this step: `RELEASE SAVEPOINT`, `ROLLBACK TO` and the
   `COMMIT` of a session that carried the work of a control call are bounded.
+
+### Steps 3 and 4 (the batch sender, the row router for INSERT, COPY FROM), and the fixes for two reviews
+
+Built together with the fixes for the review of steps 1 and 2
+(`reviews/2026-11-18-kingres-shard-phase2b-steps-1-2.md`, P2B-01 to P2B-09)
+and for the sixth review of the call sequences
+(`reviews/2026-11-18-kingres-shard-0.5-sixth-sequences.md`, S14). What differs
+from the text above:
+
+**The local part is recognised by a flag, not by a mark in the text (replaces
+the nonce of 4.4).** The review showed that the text of the statement that
+SPI runs is part of the error context, so SQL code that the statement itself
+runs (a CHECK function of the table, a default, a domain) could read the
+nonce and plan nested statements without routing. The caller now arms a
+one-shot flag right before the SPI call (the local part of the fan-out, and
+the local batch of the router), the first call of the planner hook of that
+call consumes it (SPI plans before it executes, so no nested statement can
+come first), and it is disarmed when the call ends. The statement text carries
+no mark. The guard against a write of a reference table by such a plan is
+unchanged and stays in front.
+
+**The marker of an insert fragment** is `/* kingres:insert-fragment place=<n>
+[ident=<n>] */`, not `kingres:frag v=2 kind=insert`: step 2 did not build the
+v=2 marker machinery. It is accepted only in a forwarded session. A statement
+that carries a fragment marker and that no rule accepts is refused with
+`0A000` ("this node does not accept the fragment that another node sent it"),
+not with `KS001`, whose advice to repeat cannot help.
+
+**The batch specification** carries the deparsed `ON CONFLICT` and `RETURNING`
+texts with a tuple descriptor and a tuplestore, not a list of expressions;
+`kingres_shard_batch_finish` returns the row count and
+`kingres_shard_batch_end` was added. The key attribute is counted among the
+columns that are sent. A caller of `add` has the transmission modes in force.
+
+**The wire statement** uses an unqualified `unnest(...)` of several arguments
+(only that form is recognised in FROM), writes type names with their type
+modifier (without it `bpchar` reads as `character(1)` and cut values), and
+casts every source column to the type of its column, so the router always
+hashes a value of the type of the column. A column the statement does not name
+whose default is a constant is left out; the key and identity columns are
+always sent. The output function of every value runs in a short-lived context.
+
+**A batch in flight is cancelled, not waited for, when the statement ends.**
+The cancel is bounded by about a third of `node_timeout`; a node that does not
+answer in that time loses its session and the transaction cannot commit.
+
+**The placement check is per statement**: one probe before the first batch and
+one after the last, never per batch. A bucket cannot move into or out of a
+group the statement wrote while it runs: the statement holds ROW EXCLUSIVE on
+the table of every group it wrote, and the switch of a move waits for it (the
+move gives up after its attempts). So the case of 10.2, "a bucket that moves
+into a group the statement wrote", does not disturb the statement, the moved
+bucket carries the rows, and the probe after the last batch is a second line
+that fails fast. The check of a statement reads only its own colocation group,
+through the primary key of the bucket map.
+
+**Refused, each with a reason and a test**: `ON CONFLICT DO UPDATE` (and `DO
+SELECT` on 19); a `WITH` clause on the INSERT; an insert whose rewritten
+statement has check options (a view WITH CHECK OPTION, a row-level security
+policy: the groups do not know the view); a security barrier view or a view of
+another owner in the source; `RETURNING` with OLD or NEW; an inference clause
+with an explicit collation or operator class; `session_replication_role`
+other than origin. A single row with a constant key is recognised only when
+it folds to a constant. With `enable_bulk_routing` off the 2a refusals are
+returned word for word.
+
+**COPY FROM** is handled in the utility hook and does not call `DoCopy`; it
+repeats the checks of `DoCopy`, verified against PostgreSQL 18 and 19 (the
+roles for a server file and a program, the permission check with column
+privileges, a read-only transaction, parallel mode), and refuses any table
+with row-level security enabled, which is stricter. `FREEZE`, `WHERE`,
+`ON_ERROR`, `REJECT_LIMIT` and `LOG_VERBOSITY` are refused by name; the formats
+and the other options are passed to `BeginCopyFrom`. Rows are converted to
+text once per chunk (at most 1000 rows or `insert_batch_bytes`). A forwarded
+session, a reference table and a bucket partition still refuse COPY FROM, and
+`pg_stat_progress_copy` is not updated.
+
+**EXPLAIN** shows the target, the batch rows, the conflict action and the
+source of a row router, not a remote statement.
+
+**Fault points** beyond the five of the design: `bulk_before_probe`,
+`bulk_before_local_batch`, `bulk_before_send`, `bulk_after_send`,
+`bulk_before_wait`, `bulk_after_last_batch`, `bulk_before_recheck`.
+
+**Tests** take the next free numbers: `t/112` (the 056 router part and the 058
+insert part of the design), `t/113` (064 router part), `t/114` (066 router
+part and 067 batch and log part), `t/115` (057 and 058 copy part), `t/116`
+(064 moves and failover), `t/117` (memory), the regression test `bulk_plans`;
+`t/118` holds the tests of the fixes for the review of steps 1 and 2, and
+`t/119` the nested subtransactions of the sixth review of the call sequences.
+The older tests that asserted a refusal these steps remove assert the new
+behaviour and, with the switch off, the old refusal.
+
+**From the reviews, in the scan and the connection code**: a restriction that
+deparses with `COLLATE` is accepted by the receiving group when its collation
+passes the collation rule; the count of range-table entries that detects an
+expanded SQL-language function applies only when the statement calls one (a
+set operation with an arm that contradicts itself was refused by it); the
+terms of a pruned scan are evaluated in a context that is deleted at once and
+the text of the cursor statement is freed at every start; `RELEASE SAVEPOINT`
+is sent before the subtransaction commits, no callback of a subtransaction
+raises an error, and a broken session is brought to a depth that every level
+above it skips.
+
+**Open after this round**: the names of nodes in the older messages (S14-07);
+no test for the cut of the connect and of the first command to
+`control_call_timeout` (the raw sessions of the control calls stay outside
+that limit, as the README states); three test points of P2B-05 (a probe of two
+tables in another order, a standby that is the only registered node of its
+group, a stale cache at the origin).
+
+### What step 5 will find changed
+
+- `kingres_shard_plan_row_router` is called from the planner hook after the
+  check of an UPDATE of the key and before the first reference is looked at;
+  the colocated `INSERT ... SELECT` (P6) can use it as its fallback.
+- The refusal of `DO UPDATE` says that a colocated `INSERT ... SELECT` is
+  shipped whole and allows it; step 5 makes that true or changes the words,
+  and the expected output of `bulk_plans` with it.
+- For the local part of P6: `kingres_shard_local_part_take` and
+  `kingres_shard_spi_local_part`. Also to reuse:
+  `kingres_shard_conn_send_params`, `kingres_shard_conn_cancel_and_drop`,
+  `kingres_shard_coloc_copy`, `KS_INSERT_MARKER_PREFIX`, `is_insert_fragment`.
+- A fragment of a new kind needs its acceptance rule on the receiving side;
+  what no rule accepts is `0A000`. The receiving side decides on text that was
+  deparsed and parsed again, so a rule is tested by that round trip
+  (`t/118` has the pattern).
