@@ -101,7 +101,7 @@ static bool kl_removing_stray = false;
  *		search_path pg_catalog, pg_temp, so nothing a role created is found.
  *		No argument is text that is run.
  */
-static int
+int
 kl_run(const char *sql, int nargs, const Oid *argtypes, Datum *values,
 	   const char *nulls, bool guarded)
 {
@@ -126,7 +126,7 @@ kl_run(const char *sql, int nargs, const Oid *argtypes, Datum *values,
 }
 
 /* Column "col" (1-based) of the first row of the last result; false if none or NULL. */
-static bool
+bool
 kl_first(int col, Datum *value)
 {
 	bool		isnull;
@@ -840,7 +840,7 @@ kl_lock_for_manual_write(Relation rel)
 }
 
 /* Set the sequence of an identity column to the identifier that was taken. */
-static void
+void
 kl_follow_sequence(const char *table, const char *column, int64 id)
 {
 	Oid			types[3];

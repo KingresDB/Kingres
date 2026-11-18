@@ -55,9 +55,14 @@
  * under ledger control it rejects the drop of anything that belongs to the
  * ledger, which a statement hook cannot do for a cascade.
  *
- * The hook has no "inside our own code" state that relaxes a check, with one
- * exception that is scoped to the statement text: the statements of the
- * extension's own install or upgrade script (see kl_is_own_script).
+ * The hook has no "inside our own code" state that relaxes a check, with two
+ * exceptions that are scoped to the statement text: the statements of the
+ * extension's own install or upgrade script (see kl_is_own_script), and, while
+ * that script runs, the two statements that ledger_register_internal (sign.c)
+ * issues to arm the capture trigger of one of the tables of client signatures
+ * with the identifier the registry gives it, which no literal of the script can
+ * name (kl_internal_stmt_active).  The three tables of client signatures are
+ * ledger catalog tables like the others (members of the extension).
  *
  * Name resolution.  The statement itself resolves the names in it again
  * after the hook has looked at them.  If the hook resolved a name without a
@@ -271,7 +276,8 @@ kl_is_internal_function(Oid funcoid, Oid extoid)
 		kl_is_ledger_function(funcoid, extoid, KL_SYM_RECORD_ROW) ||
 		kl_is_ledger_function(funcoid, extoid, KL_SYM_LOCK_TABLE) ||
 		kl_is_ledger_function(funcoid, extoid, KL_SYM_HISTORY_SYNC) ||
-		kl_is_ledger_function(funcoid, extoid, KL_SYM_HISTORY_ACL_SYNC);
+		kl_is_ledger_function(funcoid, extoid, KL_SYM_HISTORY_ACL_SYNC) ||
+		kl_is_ledger_function(funcoid, extoid, KL_SYM_REGISTER_INTERNAL);
 }
 
 /*
@@ -473,14 +479,79 @@ kl_rv_relid(const RangeVar *rv, LOCKMODE lockmode)
 }
 
 /*
+ * kl_internal_table_unused
+ *		Whether the relation is one of the three tables of client signatures
+ *		(0.3, part B), which the script registers in kingres.ledger_table in
+ *		every database, and holds no row.  Such a table is not "a table under
+ *		ledger control" in the sense of the rules that apply "while tables are
+ *		under ledger control" (the extension of a database that has put no table
+ *		under ledger control can be dropped, README): there is no ledger to
+ *		lose, as no entry has ever been written.  A table that holds a row (a
+ *		registered key, a revocation, an attestation) counts, and so does the
+ *		extension then: the rows are entries of the chain.
+ */
+static bool
+kl_internal_table_unused(Oid relid)
+{
+	/*
+	 * The OIDs of the three tables as they were when they last existed: a DROP
+	 * EXTENSION removes them one object at a time and asks again after each
+	 * (kl_object_access), when the registry still names the ones that are gone.
+	 * Every statement that gets here first (the statement hook, which looks at
+	 * the registry before the drop) fills it while the tables exist.
+	 */
+	static Oid	known[3] = {InvalidOid, InvalidOid, InvalidOid};
+	static const char *const names[3] = {KL_TABLE_CLIENT_KEY, KL_TABLE_CLIENT_REVOKE,
+	KL_TABLE_ATTESTATION};
+	Oid			nspoid = get_namespace_oid(KL_SCHEMA_NAME, true);
+	bool		internal = false;
+	Relation	rel;
+	SysScanDesc scan;
+	Snapshot	snap;
+	bool		found;
+	int			i;
+
+	if (OidIsValid(nspoid))
+	{
+		for (i = 0; i < 3; i++)
+		{
+			Oid			oid = get_relname_relid(names[i], nspoid);
+
+			if (OidIsValid(oid))
+				known[i] = oid;
+		}
+	}
+	if (!OidIsValid(relid))
+		return false;
+	for (i = 0; i < 3; i++)
+		if (known[i] == relid)
+			internal = true;
+	if (!internal)
+		return false;
+	/* Gone already: it was dropped by a statement that was allowed to. */
+	if (get_rel_name(relid) == NULL)
+		return true;
+	rel = table_open(relid, AccessShareLock);
+	snap = RegisterSnapshot(GetLatestSnapshot());
+	scan = systable_beginscan(rel, InvalidOid, false, snap, 0, NULL);
+	found = HeapTupleIsValid(systable_getnext(scan));
+	systable_endscan(scan);
+	UnregisterSnapshot(snap);
+	table_close(rel, AccessShareLock);
+	return !found;
+}
+
+/*
  * kl_ledger_relids
- *		The relids of all tables registered in kingres.ledger_table.
+ *		The relids of all tables registered in kingres.ledger_table, except
+ *		the tables of client signatures while they hold no row.
  *		Uses the latest snapshot so that a table registered by the current
  *		transaction is seen.
  */
 static List *
 kl_ledger_relids(void)
 {
+
 	List	   *result = NIL;
 	Oid			nspoid = get_namespace_oid(KL_SCHEMA_NAME, true);
 	Oid			tableoid;
@@ -503,7 +574,7 @@ kl_ledger_relids(void)
 		bool		isnull;
 		Datum		d = heap_getattr(tup, 2, RelationGetDescr(rel), &isnull);
 
-		if (!isnull)
+		if (!isnull && !kl_internal_table_unused(DatumGetObjectId(d)))
 			result = lappend_oid(result, DatumGetObjectId(d));
 		/* The history table of an updatable table is dropped with it. */
 		if (HeapTupleHeaderGetNatts(tup->t_data) >= KL_LEDGER_TABLE_HISTORY_ATTNO)
@@ -1337,8 +1408,19 @@ kl_note_script(const char *queryString)
 static bool
 kl_is_own_script(Oid extoid, const char *queryString)
 {
-	return creating_extension && CurrentExtensionObject == extoid &&
-		kl_script_query != NULL && queryString == kl_script_query;
+	if (!creating_extension || CurrentExtensionObject != extoid)
+		return false;
+	/*
+	 * The one more statement that the script runs by way of the extension's own
+	 * code: ledger_register_internal arms the capture trigger of the tables of
+	 * client signatures, whose argument is the identifier the registry gives
+	 * (sign.c, kl_internal_stmt_active), so it cannot be written in the script.
+	 * The text is the one that function is running now, and only while the
+	 * script runs.
+	 */
+	if (kl_internal_stmt_active(queryString))
+		return true;
+	return kl_script_query != NULL && queryString == kl_script_query;
 }
 
 /*

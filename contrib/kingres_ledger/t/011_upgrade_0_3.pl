@@ -23,9 +23,13 @@
 use strict;
 use warnings FATAL => 'all';
 
+use FindBin;
+use lib $FindBin::RealBin;
+
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use KlSign qw(have_openssl new_key sign_message message_bytes hex_of unhex_of random_nonce);
 
 my $node = PostgreSQL::Test::Cluster->new('upgrade03');
 $node->init;
@@ -124,10 +128,27 @@ SELECT line FROM (
 ORDER BY line
 };
 
+# The capture trigger of each of the three tables of client signatures has, as its argument,
+# the next free identifier of the registry when the table was registered: 1 to 3 in a new
+# database, after the tables of the user in an upgraded one.  The fingerprint hides that number
+# (the test below checks it) and compares everything else.
 sub fingerprint
 {
 	my ($db) = @_;
-	return $node->safe_psql($db, $fingerprint);
+	my $fp = $node->safe_psql($db, $fingerprint);
+	$fp =~ s/(trigger ledger_(?:client_key|client_key_revocation|attestation) kingres_ledger_capture .*ledger_capture\(')\d+/${1}N/g;
+	return $fp;
+}
+
+sub internal_ids
+{
+	my ($db) = @_;
+	return $node->safe_psql($db, q{SELECT string_agg(c.relname || '=' || lt.table_id || ':' ||
+		(SELECT substring(pg_get_triggerdef(g.oid) from 'ledger_capture\(''(\d+)''\)')
+		   FROM pg_trigger g WHERE g.tgrelid = lt.relid AND g.tgname = 'kingres_ledger_capture'),
+		',' ORDER BY c.relname)
+		FROM kingres.ledger_table lt JOIN pg_class c ON c.oid = lt.relid
+		WHERE c.relnamespace = 'kingres'::regnamespace});
 }
 
 sub sqlstate_of
@@ -239,8 +260,12 @@ $node->safe_psql('old02', 'ALTER EXTENSION kingres_ledger UPDATE');
 is($node->safe_psql('old02',
 		q{SELECT extversion FROM pg_extension WHERE extname = 'kingres_ledger'}),
 	'0.3', 'the extension is at 0.3 after ALTER EXTENSION UPDATE');
-is($node->safe_psql('old02', $ledger_state), $old_state,
-	'the upgrade wrote nothing to the ledger tables');
+# The upgrade registers the three tables of client signatures (three rows of the registry,
+# the last number of the state) and writes nothing else: no entry, no block, no digest.
+my $after_state = $old_state;
+$after_state =~ s/(\d+)$/$1 + 3/e;
+is($node->safe_psql('old02', $ledger_state), $after_state,
+	'the upgrade wrote nothing to the ledger tables but the registration of the three tables of client signatures');
 is($node->safe_psql('old02', 'SELECT count(*) FROM kingres.ledger_verify()'),
 	'0', 'the ledger verifies after the upgrade');
 is(blocks_line('old02'), $old_blocks, 'the blocks are unchanged by the upgrade');
@@ -266,7 +291,7 @@ is($node->safe_psql('old02', q{
 	'the preimages of the blocks made by 0.2 hash to their stored hashes');
 is($node->safe_psql('old02', q{SELECT height FROM kingres.ledger_head()}), $old_height,
 	'ledger_head sees the head of the old ledger');
-is($node->safe_psql('old02', $ledger_state), $old_state,
+is($node->safe_psql('old02', $ledger_state), $after_state,
 	'and the new functions wrote nothing');
 
 # Work continues: new blocks, a digest after the upgrade, a proof against it.
@@ -348,6 +373,14 @@ like($fp_new, qr/column ledger_digest\.[0-9]+ generated_at .* colacl=\{=r\//, 'a
 like($fp_new, qr/ owner=\S+ /, 'and the owners');
 is($fp_old, $fp_new, 'upgrading 0.2 to 0.3 gives the objects of installing 0.3');
 is($fp_old1, $fp_new, 'upgrading 0.1 to 0.3 gives the objects of installing 0.3');
+# The identifiers of the three tables: 1 to 3 in the new database, and the next free ones after
+# the tables of the user in the upgraded ones (two tables in old02, one in old01).
+is(internal_ids('new03'), 'ledger_attestation=3:3,ledger_client_key=1:1,ledger_client_key_revocation=2:2',
+	'a new database registers the three tables of client signatures as 1 to 3, and the trigger agrees');
+is(internal_ids('old02'), 'ledger_attestation=5:5,ledger_client_key=3:3,ledger_client_key_revocation=4:4',
+	'the upgrade of a database with two ledger tables gives them 3 to 5, and the trigger agrees');
+is(internal_ids('old01'), 'ledger_attestation=4:4,ledger_client_key=2:2,ledger_client_key_revocation=3:3',
+	'and one with one ledger table 2 to 4');
 foreach my $pair ([ $fp_old, 'old02' ], [ $fp_old1, 'old01' ])
 {
 	if ($pair->[0] ne $fp_new)
@@ -365,13 +398,78 @@ is($node->safe_psql('new03', 'SELECT count(*) FROM kingres.ledger_head()'), '0',
 is($node->safe_psql('new03', 'SELECT count(*) FROM kingres.ledger_blocks_entries(0, 10)'), '0',
 	'ledger_blocks_entries of an empty ledger has no row');
 
+
+#--------------------------------------------------------------------------
+# Client signatures (part B) work in a database that was upgraded, from 0.2 and from 0.1,
+# as in one that was installed: register a key, attest a row, the ledger verifies, and
+# the three tables are registered, protected and not readable by PUBLIC.
+#--------------------------------------------------------------------------
+$node->safe_psql('new03', q{CREATE TABLE public.t3 (id int PRIMARY KEY); SELECT kingres.ledger_enable('public.t3');});
+foreach my $case ([ 'old02', 'app.accounts', q{ROW(100, 'zed', 1.00)}, q{(100, 'zed', 1.00)} ],
+	[ 'old01', 'public.t', q{ROW(100)}, q{(100)} ],
+	[ 'new03', 'public.t3', q{ROW(100)}, q{(100)} ])
+{
+	my ($db, $table, $row, $values) = @$case;
+	is($node->safe_psql($db, q{SELECT string_agg(c.relname || ':' || lt.mode, ',' ORDER BY c.relname)
+		FROM kingres.ledger_table lt JOIN pg_class c ON c.oid = lt.relid
+		WHERE c.relnamespace = 'kingres'::regnamespace}),
+		'ledger_attestation:append_only,ledger_client_key:append_only,ledger_client_key_revocation:append_only',
+		"[$db] the three tables of client signatures are registered as append-only ledger tables");
+	is($node->safe_psql($db, q{SELECT count(*) FROM pg_class c WHERE c.relnamespace = 'kingres'::regnamespace
+		AND c.relname IN ('ledger_attestation', 'ledger_client_key', 'ledger_client_key_revocation')
+		AND has_table_privilege('public', c.oid, 'select')}), '0',
+		"[$db] and PUBLIC cannot read them");
+	is($node->safe_psql($db, q{SELECT string_agg(p.proname, ',' ORDER BY p.proname) FROM pg_proc p
+		WHERE p.pronamespace = 'kingres'::regnamespace AND p.proname IN ('ledger_attest', 'ledger_client_key_register',
+		'ledger_client_key_revoke', 'ledger_set_signature_policy', 'ledger_register_internal', 'ledger_attestation_message')
+		AND has_function_privilege('public', p.oid, 'execute')}),
+		'ledger_attestation_message',
+		"[$db] only the message function is executable by PUBLIC");
+	is($node->safe_psql($db, q{SELECT a.attname FROM pg_attribute a WHERE a.attrelid = 'kingres.ledger_table'::regclass
+		AND a.attnum IN (6, 7) ORDER BY a.attnum}) =~ s/\n/,/gr,
+		'signature_policy,signature_required_from', "[$db] ledger_table has the two columns after history_relid");
+	is($node->safe_psql($db, q{SELECT client_keys_active || ' ' || attestations || ' ' || required_tables FROM kingres.ledger_status}),
+		'0 0 0', "[$db] ledger_status has the three columns at the end");
+}
+SKIP:
+{
+	skip 'the openssl command (3.0 or later) is needed to make Ed25519 signatures', 12 unless have_openssl();
+	my $dir = PostgreSQL::Test::Utils::tempdir;
+	foreach my $case ([ 'old02', 'app.accounts', q{ROW(100, 'zed', 1.00)}, q{(100, 'zed', 1.00)} ],
+		[ 'old01', 'public.t', q{ROW(100)}, q{(100)} ],
+		[ 'new03', 'public.t3', q{ROW(100)}, q{(100)} ])
+	{
+		my ($db, $table, $row, $values) = @$case;
+		my $key = new_key($dir, "k_$db");
+		my $keyid = $node->safe_psql($db, sprintf(q{SELECT encode(kingres.ledger_client_key_register(decode('%s', 'hex'), NULL, 'upgrade test'), 'hex')}, hex_of($key->{pub})));
+		is($keyid, hex_of($key->{key_id}), "[$db] a key is registered, with the identifier SHA-256(public key)[:16]");
+		my $chain = unhex_of($node->safe_psql($db, q{SELECT encode(chain_id, 'hex') FROM kingres.ledger_chain}));
+		my $tid = $node->safe_psql($db, "SELECT table_id FROM kingres.ledger_table WHERE relid = '$table'::regclass");
+		my $hash = $node->safe_psql($db, "SELECT encode(kingres.ledger_row_hash($row\::$table), 'hex')");
+		my $nonce = random_nonce();
+		my $sig = sign_message($key, message_bytes(chain_id => $chain, table_id => $tid, op => 'I',
+				row_hash => unhex_of($hash), key_id => $key->{key_id}, nonce => $nonce));
+		$node->safe_psql($db, sprintf(q{BEGIN; INSERT INTO %s VALUES %s; SELECT kingres.ledger_attest('%s', decode('%s', 'hex'), 'I', decode('%s', 'hex'), decode('%s', 'hex'), decode('%s', 'hex')); COMMIT;},
+				$table, $values, $table, $hash, $keyid, hex_of($nonce), hex_of($sig)));
+		is($node->safe_psql($db, 'SELECT count(*) FROM kingres.ledger_attestation'), '1', "[$db] an attested write");
+		$node->safe_psql($db, 'SELECT kingres.ledger_build_block()');
+		is($node->safe_psql($db, 'SELECT count(*) FROM kingres.ledger_verify()'), '0', "[$db] and the ledger verifies");
+		$node->safe_psql($db, sprintf(q{SELECT kingres.ledger_set_signature_policy('%s', 'required')}, $table));
+		my ($r, $o, $e) = $node->psql($db, "INSERT INTO $table VALUES $values" =~ s/100/101/r, extra_params => [ '-v', 'VERBOSITY=sqlstate' ]);
+		like($e, qr/KL010/, "[$db] the policy required is enforced");
+	}
+}
+
 # Protection: the same statements are rejected in all three.
 foreach my $db ('old02', 'old01', 'new03')
 {
 	foreach my $stmt (
 		'DROP TABLE kingres.ledger_blocks',
 		'ALTER TABLE kingres.ledger_table ADD COLUMN x int',
-		'TRUNCATE kingres.ledger_blocks')
+		'TRUNCATE kingres.ledger_blocks',
+		'DROP TABLE kingres.ledger_attestation',
+		'TRUNCATE kingres.ledger_client_key',
+		'ALTER TABLE kingres.ledger_client_key_revocation ADD COLUMN x int')
 	{
 		my ($r, $e) = sqlstate_of($db, $stmt);
 		like($e, qr/KL00[12]/, "[$db] rejected: $stmt");
@@ -390,8 +488,8 @@ my ($rout, $rerr) = run_command([ 'psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1',
 is($rerr, '', 'the dump restores without an error');
 is($node->safe_psql('restored03', q{SELECT extversion FROM pg_extension WHERE extname = 'kingres_ledger'}),
 	'0.3', 'the restored database has the extension at 0.3');
-is($node->safe_psql('restored03', 'SELECT count(*) FROM app.accounts'), '7',
-	'the rows of the ledger table are restored');
+is($node->safe_psql('restored03', 'SELECT count(*) FROM app.accounts'), have_openssl() ? '8' : '7',
+	'the rows of the ledger table are restored (the seven of the test and the one that the attestation test above wrote)');
 is($node->safe_psql('restored03', 'SELECT count(*) FROM kingres.ledger_head()'), '0',
 	'but the restored ledger is empty: ledger_head has no row');
 is($node->safe_psql('restored03', 'SELECT count(*) FROM kingres.ledger_blocks_entries(0, 10)'), '0',

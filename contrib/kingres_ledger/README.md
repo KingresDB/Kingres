@@ -6,9 +6,11 @@ Tamper-evident ledger tables for KingresDB (a thin fork of PostgreSQL 18.7),
 version 0.3. Version 0.1 (phase 6, first increment) has append-only tables;
 version 0.2 adds updatable ledger tables with a history table, background
 workers that build the blocks, and the records an operator needs (recorded
-digests and verifications and a status view); version 0.3 (part A of the
-extension work of phase 7) adds three read-only functions for tile
-publication (see "Reading the chain for publication"). The designs are
+digests and verifications and a status view); version 0.3 (the extension work of
+phase 7) adds, in part A, three read-only functions for tile publication (see
+"Reading the chain for publication") and, in part B, client signatures: a
+registry of client keys, the attestation of a ledger entry with an Ed25519
+signature and a signature policy of a table (see "Client signatures"). The designs are
 [`kingres/docs/design/ledger-mvp.md`](../../kingres/docs/design/ledger-mvp.md)
 (0.1, including its implementation notes) and
 [`kingres/docs/design/ledger-0.2.md`](../../kingres/docs/design/ledger-0.2.md)
@@ -123,7 +125,7 @@ tests:
 kingres/dev/ext.sh kingres_ledger all     # sync build install regress tap
 ```
 
-Tests: eighteen pg_regress tests and thirty TAP tests under `t/`.
+Tests: nineteen pg_regress tests and thirty-four TAP tests under `t/`.
 
 | Test | What it covers |
 |---|---|
@@ -145,6 +147,7 @@ Tests: eighteen pg_regress tests and thirty TAP tests under `t/`.
 | `ledger_guard` | the write guard (L9-01): the nine tables against `INSERT`, `ON CONFLICT`, `MERGE`, a view and a `SECURITY DEFINER` function of a member of `pg_write_all_data`, `DELETE`, `UPDATE` and `SELECT ... FOR UPDATE`, as that member, as a role with nothing, as a superuser and as a superuser with `allow_manual_write` on; every statement that is allowed is rolled back and `ledger_verify` finds nothing; where the setting can and cannot be set; that no function takes the content of a write; the honest flows with the setting off |
 | `ledger_paths` | the invariant and the paths to it (L10-01 to L10-03, L10-13): a member of the owner role with `INHERIT` and no `SET` on every table and every internal function, a hand-made capture trigger and a hand-made registration, the superuser with no setting, the setting in the hands of a role that was given `SET ON PARAMETER` (also through a `SECURITY DEFINER` function of a superuser and after `SET ROLE`), every lock mode and every row lock on every table as `pg_maintain` and as a member of `pg_write_all_data`, `REINDEX` and `CLUSTER` in a transaction block, the marker lowered after the capture trigger, the builder, the digest, the recorded verification, `ledger_enable`, and after a failed statement in a subtransaction, in an exception block and in the capture trigger, the record that a write by hand leaves, the clauses of the digest check and the units of the clock limit |
 | `ledger_stops` | the second invariant (L11-01 to L11-05, L13-01): every statement that reaches a ledger object through a path it does not name, the rule for the owner of a ledger table, and the identity sequences of the registry and of the records moved to 1, to their maximum, into the middle and far ahead by a member of `pg_write_all_data` and by a member of the owner role, with every writer working after each move |
+| `ledger_sign` | client signatures with fixtures (the chain identity is fixed, the signatures were made once with the openssl command): the message byte for byte, the registry (every refusal), `ledger_attest` and every error `KL010` to `KL014` (no entry, another operation or hash, an unknown, revoked or foreign key, a signature of another chain, operation or key, a replayed nonce), the policy `required` at `COMMIT`, `PREPARE TRANSACTION` and across savepoints, the three tables against the guard (a member of `pg_write_all_data`, a superuser without the setting, `DROP`, `ALTER`, `GRANT`, `DROP EXTENSION`), proofs of a key, a revocation and an attestation, and what `ledger_verify` says of a deleted, a changed, an unknown and a duplicated attestation, of a key that is not the hash of its public key and of an unattested entry |
 | `001_concurrent_blocks` | concurrent writers while blocks are built |
 | `002_restart_standby` | restart, crash recovery, a streaming standby |
 | `003_preload_and_hooks` | the preload requirement, hook chaining with `pg_stat_statements` |
@@ -175,9 +178,20 @@ Tests: eighteen pg_regress tests and thirty TAP tests under `t/`.
 | `029_enable_credit` | L19-02: the credit of `ledger_enable` (a statement that takes longer than the limit completes), no credit while the builders' lock is held, the bound `enable_credit_limit` (a table, and the loop of the review that creates and enables table after table), who can set the settings, and what the registry's lock held during a large entering blocks (another `ledger_enable`) and does not (the builder, the capture); a developer setting makes the large table of a known least cost, so no duration is measured |
 | `030_hold_property` | the property: random sequences of statements by a role that is not a superuser (calls, calls in blocks, savepoints, multi-command strings, pipelines, errors, `DO` blocks that catch or end with an error) leave it alive, holding nothing, in the state of a model; random `DO` blocks with caught errors, nested blocks and sleeps against a model of the time a lock is held |
 | `031_server_file_roles` | L19-05: the members of `pg_execute_server_program` and `pg_write_server_files` (directly, through a chain, by `SET` only) in `database_droppers`, the holder of `ADMIN OPTION` in `database_potential_droppers`, a member of every other predefined role listed nowhere, the real drop by a member of `pg_execute_server_program` and a file written into the data directory by a member of `pg_write_server_files` |
+| `032_attest_policy` | client signatures with fresh keys and a real chain (the message encoded independently of the server, signatures by the openssl command, skipped without openssl 3): the install script registered the three tables under the hook, `ledger_attest` in a transaction block, every error, the proof of an attestation against a digest, the policy `required` (`COMMIT`, `PREPARE TRANSACTION`, savepoints, nested and released savepoints, an `EXCEPTION` block, `UPDATE` as two attestations, `DELETE`), the check `unattested_entry` from the switch on, crash recovery of an attested write, a streaming standby |
+| `033_attest_concurrency` | the same key and nonce in two overlapping transactions (the second waits, then `KL014` or success), a key revoked while a `REPEATABLE READ` transaction with an older snapshot is open, the same key registered by two sessions, four writers attesting every row of a table with the policy `required` while the builder runs |
+| `034_internal_tables` | the three tables as ledger tables (the first step of part B): a database that holds none in use drops the extension as before and one with a registered key does not, directly or through a dependency; 15 statements of every kind against each table by a member of the owner role, of `pg_write_all_data`, of `pg_maintain` and a plain role, and by the superuser; the statement the script runs for `ledger_register_internal` refused outside it; a write by hand and its record; the script of another extension, the table synchronisation worker and the apply worker of logical replication refused |
+| `035_no_openssl` | the extension built with `-DKL_NO_OPENSSL` by PGXS and loaded in place of the real one: `ledger_attest` raises `0A000`, the registry, the message, the policy and `ledger_verify` work (skipped without PGXS or make) |
 
 The regress tests need `shared_preload_libraries = 'kingres_ledger'` (the
 in-tree `check` target and `kingres/dev/ext.sh` set it).
+
+The TAP tests `032_attest_policy` and `033_attest_concurrency` make Ed25519
+signatures with the `openssl` command (3.0 or later; `t/KlSign.pm` has the helpers,
+including an encoding of the signed message that does not use the server's) and
+are skipped, with the reason, without it; `035_no_openssl` builds the extension a
+second time with PGXS and `make` and is skipped without them. The regress test
+`ledger_sign` uses fixed signatures and needs neither.
 
 The optional verifier check of `012_publish_read` needs a built
 `kingres-verify` (see `kingres/verifier`) and the `openssl` command; run it
@@ -531,7 +545,7 @@ the event trigger), `KL003` (library not preloaded), `KL004` (the previous block
 is closed ahead of the clock), `KL005` (the SQL of the extension is older than the
 library: `cannot write to table "...": the SQL of extension "kingres_ledger" is
 version X, and this library writes the ledger only through the functions of
-version Y`, with the hint `Run ALTER EXTENSION kingres_ledger UPDATE.`), `KL006` (a call that would take a lock of the extension that is earlier in the order of the locks than one the transaction holds, with a hint that names the order; see "The order of the locks"). Any other
+version Y`, with the hint `Run ALTER EXTENSION kingres_ledger UPDATE.`), `KL006` (a call that would take a lock of the extension that is earlier in the order of the locks than one the transaction holds, with a hint that names the order; see "The order of the locks"), and, for client signatures, `KL010` (a transaction leaves an entry of a table with the signature policy `required` without an attestation: at `COMMIT` and at `PREPARE TRANSACTION`), `KL011` (`ledger_attest` finds no such entry in this transaction, or every one is attested), `KL012` (the key is unknown, revoked or not allowed for the role), `KL013` (the signature does not verify) and `KL014` (the nonce was used with the key before); `ledger_attest` raises `0A000` on a server built without OpenSSL. Any other
 write that the guard refuses is `42501`.
 
 ## Privileges
@@ -553,6 +567,7 @@ DEFINER`:
 | `ledger_inclusion_proof` (both forms) | reads the entries and transactions, which the caller may not read; the two-argument form is a wrapper that exists so that grants made on it under 0.1 keep working |
 | `ledger_head` | one statement snapshot of the chain identity, the latest block, and the newest transaction row and recorded digest it is compared with; defined as the owner so that the answer does not depend on what the caller may read of the ledger tables (it returns a hash and a count, no row data) |
 | `ledger_blocks_entries` | reads `ledger_blocks` and `ledger_chain` only, as the owner, so that `EXECUTE` is all a service role needs and an operator may withdraw PUBLIC's `SELECT` on those tables (see "Reading the chain for publication") |
+| `ledger_client_key_register`, `ledger_client_key_revoke`, `ledger_attest`, `ledger_set_signature_policy` | write the three tables of client signatures (and, for the policy, the one update of `ledger_table` that the code of the extension makes), which no other role may write (see "Client signatures") |
 | `ledger_guard` (event trigger) | must see the ledger tables whatever grants an administrator changed, so that DDL of every role keeps working; it also moves the privileges of the history tables (through `ledger_history_acl_sync`, which is not `SECURITY DEFINER` and is not executable by anybody else) |
 
 All of them have `SET search_path = pg_catalog, pg_temp`, and every reference to
@@ -573,12 +588,13 @@ on their arguments and look nothing up (the list is in the test).
 |---|---|
 | `kingres.ledger_table`, `kingres.ledger_chain`, `kingres.ledger_blocks` | `SELECT` (an operator may revoke it from PUBLIC: see "Reading the chain for publication") |
 | `kingres.ledger_digest` | `SELECT` on every column except `generated_by` (block-level data only) |
-| `kingres.ledger_entry`, `kingres.ledger_pending`, `kingres.ledger_tx`, `kingres.ledger_verification` | nothing |
+| `kingres.ledger_entry`, `kingres.ledger_pending`, `kingres.ledger_tx`, `kingres.ledger_verification`, `kingres.ledger_client_key`, `kingres.ledger_client_key_revocation`, `kingres.ledger_attestation` | nothing |
 | `kingres.ledger_status` (view) | nothing (it shows how many transactions wait, and the state of the worker) |
 | the history table of an updatable table | nothing; `SELECT` for the owner of the ledger table only, kept by the extension (see "Updatable tables"); no grant is possible |
 | `ledger_history_acl_sync`, `ledger_history_sync`, `ledger_worker_state`, `ledger_lock_table`, `ledger_register_table`, `ledger_capture` | nothing |
 | the identity sequences of `ledger_table`, `ledger_digest`, `ledger_verification` and `ledger_removed` | nothing (and none is read: see "What a role that is not a superuser can stop or remove"; a member of `pg_write_all_data` holds `USAGE` and `UPDATE` on every sequence, which no grant or revoke changes) |
-| `ledger_enable`, `ledger_build_block`, `ledger_generate_digest`, `ledger_verify`, `ledger_verify_recorded`, `ledger_verify_digest`, `ledger_inclusion_proof` | nothing |
+| `ledger_enable`, `ledger_build_block`, `ledger_generate_digest`, `ledger_verify`, `ledger_verify_recorded`, `ledger_verify_digest`, `ledger_inclusion_proof`, `ledger_attest`, `ledger_client_key_register`, `ledger_client_key_revoke`, `ledger_set_signature_policy`, `ledger_register_internal` | nothing |
+| `ledger_attestation_message` | `EXECUTE` |
 | `ledger_row_hash`, `ledger_history_row_hash`, `ledger_verify_proof`, the hash primitives, `ledger_hook_active` | `EXECUTE` |
 
 The entries, the work queue and the transaction table are not readable by
@@ -1013,6 +1029,192 @@ only have removed the evidence, which is why step 2 comes first and the record
 is kept.
 
 
+
+## Client signatures
+
+Version 0.3 (part B of the extension work of phase 7; design
+`kingres/docs/design/ledger-phase7.md`, sections 3.6 to 3.8 and 8.1) lets a
+client sign the rows it writes. A **client attestation** is an Ed25519 signature,
+made with a key the client holds, over one ledger entry of one row version: "the
+holder of key K wrote (or removed) this row version in this chain". The server
+never signs for a client and never sees a private key. Nothing changes in hash
+format version 1; the existing format tests pass unmodified.
+
+What an attestation proves: that the holder of K's private key signed exactly that
+`row_hash` for that table, operation and chain; that the signature is in the chain
+no later than the block that holds it (and, through anchors, no later than the
+anchor's time); that K was registered, and not revoked in an earlier block, when
+the attestation was made. What it does not prove: that the client saw more than the
+hash (**the client must recompute the row hash from its own data**, with
+`kingres-verify row-hash` or the encoding of "Hash format version 1" in its own
+library, and must not sign a hash that the server returned without doing so); that
+the row was not deleted later (the ledger covers that); that the holder of the key
+is the person named (the label and the role of a key are what an administrator
+chose); that rows without an attestation were not written by someone else (the
+policy "required" and the checks of `ledger_verify`, below).
+
+### The objects
+
+Three tables, **ledger tables of the extension itself**: they are registered in
+`kingres.ledger_table` as append-only tables by the install and upgrade scripts
+(`kingres.ledger_register_internal`, callable by those scripts only), the capture
+trigger enters their rows into the chain like those of any ledger table, so blocks,
+proofs, digests and `ledger_verify` cover them and no new hash tag exists. The
+guard (see "Who can write the ledger tables") treats them like the other nine
+tables: nobody writes them but the code of the extension, nobody drops, truncates,
+alters, locks or reaches them through a dependency, a superuser who turned
+`kingres_ledger.allow_manual_write` on leaves the record of a write by hand, and
+PUBLIC cannot read them (an administrator grants `SELECT` to the service role and
+the auditors).
+
+| Table | Rows |
+|---|---|
+| `ledger_client_key` | `key_id` (16 bytes, the first 16 of the SHA-256 of the public key), `algorithm` (`ed25519`), `public_key` (32 bytes), `role_name` (NULL: any role may attest with the key), `label` (at most 200 characters), `registered_by`, `registered_at` |
+| `ledger_client_key_revocation` | `key_id`, `reason` (at most 200 characters), `revoked_by`, `revoked_at`; one row per revoked key |
+| `ledger_attestation` | `ledger_txid`, `seq` (the entry), `key_id`, `nonce` (16 bytes), `signature` (64 bytes); the entry is attested once, and `(key_id, nonce)` is unique |
+
+A key is active when it has no revocation row. A revoked key's attestations made in
+blocks **before** the revocation's block stay valid; the verifier's rule is that an
+attestation counts when the height of the block of its transaction is lower than
+the height of the block of the revocation (the same block counts as after, because
+the order inside a block is by transaction id, not by commit order).
+
+`kingres.ledger_table` gets two columns after `history_relid` (the fifth, which
+`protect.c` reads by position): `signature_policy text NOT NULL DEFAULT 'optional'`
+(`optional` or `required`) and `signature_required_from bigint` (the transaction
+that switched the policy to `required`; NULL while it is `optional`). The policy is
+not covered by a hash: a superuser can switch it back by editing the catalog, and
+what was written meanwhile is not found by `ledger_verify`.
+
+| Function | Does |
+|---|---|
+| `ledger_client_key_register(public_key bytea, role_name name, label text) returns bytea` | checks the lengths (32 bytes), that the role exists and the label, inserts the key and returns its `key_id`; the same key cannot be registered twice (`23505`), a revoked key is never registered again |
+| `ledger_client_key_revoke(key_id bytea, reason text) returns void` | inserts the revocation; an unknown key and a key that is revoked already are `KL012` |
+| `ledger_attest(relation regclass, row_hash bytea, op "char", key_id bytea, nonce bytea, signature bytea) returns void` | in the current transaction: finds the entry (the table, the hash and the operation `I` or `D`; the first one of this transaction that has no attestation yet), checks the key (registered, not revoked as of now, `role_name` NULL or the role that called), verifies the signature over the message below, inserts the attestation row (its own entry is written by the capture trigger) and tells the capture code that the entry is attested |
+| `ledger_attestation_message(chain_id bytea, table_id int, op "char", row_hash bytea, key_id bytea, nonce bytea) returns bytea` | PUBLIC; the message below, for a client that wants to compare its own encoding |
+| `ledger_set_signature_policy(relation regclass, policy text) returns void` | the owner of the table (and a role granted `EXECUTE`): `optional` to `required`, never back; the tables of the ledger itself have no policy |
+
+All of them are `SECURITY DEFINER` with a fixed `search_path` and are not
+executable by PUBLIC except the message function; an administrator grants `EXECUTE`
+on `ledger_attest` to the roles that write ledger tables, and on the registry
+functions to the service role. None takes a lock of the extension (the rows have no
+identifier to allocate), so none is subject to the rule that a role that is not a
+superuser calls a lock-taking function only as a statement of its own, and
+`ledger_attest` runs inside the transaction that wrote the entry, as it must: in a
+transaction block, after a savepoint, in an `EXCEPTION` block.
+
+### The message
+
+The client signs these bytes with plain Ed25519 (RFC 8032), 136 bytes (`||` is
+concatenation, integers big-endian):
+
+```
+"kingres-ledger/client-signature/v1" || 0x00 ||
+chain_id (32 bytes) || u32 table_id || u8 op ('I' = 0x49, 'D' = 0x44) ||
+row_hash (32 bytes) || key_id (16 bytes) || nonce (16 bytes)
+```
+
+`chain_id` makes a signature useless in another chain. The nonce (16 random bytes
+that the client chooses for each attestation) makes a replay in the chain a unique
+key violation (`KL014`); a replay by someone who rewrites the table is a duplicate
+`(key_id, nonce)` that `ledger_verify` reports (`attestation_duplicate`).
+
+### The client's workflow
+
+1. Read `chain_id` (`kingres.ledger_chain`) and `table_id` (`kingres.ledger_table`);
+   both are readable by PUBLIC.
+2. Compute the row hash from the row it holds ("Hash format version 1").
+3. In the same transaction as the write, call `ledger_attest(...)`. When the server
+   fills columns the client cannot know (`now()`, a serial), the client inserts
+   `... RETURNING kingres.ledger_row_hash(t.*)`, **recomputes the hash from its own
+   copy of the data and compares**, signs, and calls `ledger_attest` in the same
+   transaction (one more round trip).
+4. An `UPDATE` of an updatable table is two entries (the old version removed, `D`,
+   and the new one inserted, `I`) and needs two attestations; a `DELETE` needs one.
+
+### The policy "required"
+
+For a table with the policy, the capture code keeps the entries of the transaction
+that still lack an attestation (one record per entry, in memory, only for tables
+with the policy) and clears one when `ledger_attest` accepts it. At `PRE_COMMIT`
+and at `PRE_PREPARE` any entry left raises **`KL010`**, "ledger entry without
+client signature": at `COMMIT`, and at `PREPARE TRANSACTION`, where nobody could add
+the attestation later. The records follow the subtransactions: an entry written in
+a savepoint that is rolled back is gone with its attestation, and an attestation
+made in a savepoint that is rolled back leaves its entry owed again. Every entry
+counts, `I` and `D`. A trigger that changes a row again produces entries the
+client did not foresee, so `required` is for tables written by statements the client
+controls. A server without OpenSSL cannot attest, so no write to a table with the
+policy can commit there.
+
+`ledger_verify` gains the check `unattested_entry`: an entry of a table with the
+policy that has no attestation row, for the entries of the transactions after the
+one that switched the policy on (`signature_required_from`) and not before (the
+switching transaction itself is covered by the check at commit). A
+transaction that was already running when the policy was switched can appear once.
+The standalone verifier checks one entry at a time.
+
+### What `ledger_verify` adds
+
+| Check | Reports |
+|---|---|
+| `attestation_duplicate` | two attestations with the same key and nonce, or of the same entry |
+| `client_key_unknown` | an attestation, or a revocation, that names a key with no registration |
+| `client_key_id` | a key whose `key_id` is not the first 16 bytes of the SHA-256 of its public key |
+| `attestation_orphan` | an attestation of an entry that does not exist |
+| `unattested_entry` | see above |
+
+The three tables are compared with their entries like every ledger table
+(`table_rows`), so a deleted, changed or inserted key, revocation or attestation is
+found there. `ledger_verify` does not verify the signatures: that is the job of the
+standalone verifier, one entry at a time, from a proof of the entry and the proof of
+the key.
+
+### What the tables mean for the rest of the extension
+
+- The table identifiers of the three tables are the next free ones of the registry
+  when the script ran: 1 to 3 in a new database, after the tables of the user in an
+  upgraded one. No code may assume a number: find them by name in
+  `kingres.ledger_table`.
+- `ledger_status` counts the tables of the user only in `append_only_tables`; the
+  three tables are not in it. It has three new columns at the end:
+  `client_keys_active` (keys without a revocation), `attestations` (rows of
+  `ledger_attestation`) and `required_tables` (tables with the policy `required`).
+- "A database with no table under ledger control" now means: no table of the user
+  and no row in any of the three tables. Such a database can drop the extension as
+  before; a database in which a key has been registered cannot.
+- The upgrade from 0.2 (and 0.1) registers the three tables and writes no entry:
+  nothing changes in a block, a digest or a proof that exists.
+- `pg_dump` and a restore keep the limit of "Dump and restore": the restored
+  database has a new, empty ledger, and so no keys.
+
+### OpenSSL
+
+The signature is verified with OpenSSL (`EVP_DigestVerify` with Ed25519), compiled
+when PostgreSQL was built with it. Without it `ledger_attest` raises `0A000`,
+"client signatures need a server built with OpenSSL", and the rest of the extension
+(the registry, the policy, `ledger_verify`) works; `t/035_no_openssl.pl` builds the
+extension that way and checks it.
+
+### Cost
+
+One Ed25519 verification (about 90 microseconds with OpenSSL 3 on the machine of the
+measurement), one row of about 250 bytes and its entry. Measured on PostgreSQL 18
+(cassert off, debugoptimized build, one session, `synchronous_commit = off`, 3000
+rows a run, three runs): inserting a row in a ledger table takes about 30
+microseconds in the server (the capture trigger included), and the same insert with
+`ledger_attest` about 200: **`ledger_attest` adds about 175 microseconds** (170 to
+185 in the three runs), of which the verification is about 90; the rest is the
+search of the entry, the read of the key, the row and its capture. As a whole
+statement stream from `psql` (`BEGIN; INSERT; COMMIT` against `BEGIN; INSERT;
+SELECT ledger_attest(...); COMMIT`, which also adds a round trip) the time per
+transaction goes from about 315 to about 790 microseconds with `synchronous_commit =
+off`, and from about 3.1 to about 3.9 milliseconds with `synchronous_commit = on`
+(the flush dominates). Writes without an attestation are unchanged, except that the
+first write of a table in a transaction reads the policy together with the
+identifier (one statement, as before). The statements of `ledger_attest` are
+prepared once per session; the first version ran them as text and took about 400
+microseconds.
 
 ## Hash format version 1
 
@@ -2494,8 +2696,9 @@ it has been looked at, not by how likely it is to be wrong.
 
 ## Limitations of this version
 
-- No client or server signatures, no external anchoring, no per-shard
-  aggregate digest (phase 7). No conversion between the modes of a table, no
+- No server signatures, no external anchoring, no per-shard aggregate digest
+  (phase 7; client signatures are in "Client signatures"; `ledger_verify` does not
+  verify them, the standalone verifier does). No conversion between the modes of a table, no
   partitioned or inheriting tables, `TRUNCATE` is rejected for both modes.
 - A history table's name is `<table>_ledger_history` and must fit in 63 bytes.
   An `UPDATE` that changes nothing writes two entries and a history row.

@@ -46,6 +46,7 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 
 #include "kingres_ledger.h"
@@ -69,6 +70,30 @@ typedef struct KlTxState
 
 static KlTxState kl_state = {0, 0, false, InvalidSubTransactionId};
 
+/*
+ * The entries of this transaction that a table with the signature policy
+ * "required" owes an attestation (sign.c, 3.7 of the design): one record for
+ * each such entry, in the order of their sequence numbers.  Only tables with
+ * the policy are tracked, so a transaction that writes none costs nothing.
+ * "created" and "attested" are the (sub)transactions that wrote the entry and
+ * that accepted its attestation; both follow the subtransaction stack the way
+ * the pending row does: the entry and its attestation are rows, and a row
+ * that went with a rolled back savepoint is not there at commit.  At pre-commit
+ * and pre-prepare an entry that has no attestation fails the transaction
+ * (KL010).
+ */
+typedef struct KlRequired
+{
+	int32		seq;			/* sequence number of the entry */
+	int32		table_id;
+	SubTransactionId created;	/* the subtransaction that wrote the entry */
+	SubTransactionId attested;	/* the one that attested it, or Invalid */
+} KlRequired;
+
+static KlRequired *kl_req = NULL;
+static int	kl_nreq = 0;
+static int	kl_reqmax = 0;
+
 /* Saved SPI plans of the two inserts, prepared on first use. */
 static SPIPlanPtr kl_entry_plan = NULL;
 static SPIPlanPtr kl_pending_plan = NULL;
@@ -79,11 +104,48 @@ static SPIPlanPtr kl_pending_plan = NULL;
  *		whichever way.  The cached relid to table_id mapping is dropped too,
  *		because a rolled back ledger_enable must not leave it behind.
  */
+/*
+ * kl_check_attested
+ *		At pre-commit and pre-prepare: every entry of a table with the policy
+ *		"required" has the attestation that ledger_attest accepted, or the
+ *		transaction fails with KL010.  A transaction cannot be prepared with
+ *		an entry that lacks one either: nobody could add it after the prepare.
+ */
+static void
+kl_check_attested(void)
+{
+	int			i;
+	int			missing = 0;
+	int32		first_table = -1;
+
+	for (i = 0; i < kl_nreq; i++)
+	{
+		if (kl_req[i].attested == InvalidSubTransactionId)
+		{
+			if (missing == 0)
+				first_table = kl_req[i].table_id;
+			missing++;
+		}
+	}
+	if (missing > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_KL_UNATTESTED),
+				 errmsg("ledger entry without client signature"),
+				 errdetail("%d ledger entr%s of this transaction %s no attestation; the first is for the ledger table with table_id %d, which has the signature policy required.",
+						   missing, missing == 1 ? "y" : "ies",
+						   missing == 1 ? "has" : "have", first_table),
+				 errhint("Call kingres.ledger_attest for every row version that the transaction wrote or removed in that table (an UPDATE is two entries), in the same transaction.")));
+}
+
 static void
 kl_xact_callback(XactEvent event, void *arg)
 {
 	switch (event)
 	{
+		case XACT_EVENT_PRE_COMMIT:
+		case XACT_EVENT_PRE_PREPARE:
+			kl_check_attested();
+			break;
 		case XACT_EVENT_COMMIT:
 			/* Tell the launcher that this database has pending transactions. */
 			if (kl_state.pending_written)
@@ -95,6 +157,14 @@ kl_xact_callback(XactEvent event, void *arg)
 			kl_state.next_seq = 0;
 			kl_state.pending_written = false;
 			kl_state.pending_subid = InvalidSubTransactionId;
+			kl_nreq = 0;
+			/* A transaction with very many owed entries does not keep the memory. */
+			if (kl_reqmax > 65536)
+			{
+				pfree(kl_req);
+				kl_req = NULL;
+				kl_reqmax = 0;
+			}
 			kl_write_reset();
 			kl_table_cache_reset();
 			break;
@@ -127,6 +197,40 @@ kl_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	 */
 	if (event == SUBXACT_EVENT_ABORT_SUB)
 		kl_table_cache_reset();
+
+	/* The entries that must be attested follow the subtransaction stack. */
+	if (kl_nreq > 0)
+	{
+		int			i;
+		int			j;
+
+		if (event == SUBXACT_EVENT_COMMIT_SUB)
+		{
+			for (i = 0; i < kl_nreq; i++)
+			{
+				if (kl_req[i].created == mySubid)
+					kl_req[i].created = parentSubid;
+				if (kl_req[i].attested == mySubid)
+					kl_req[i].attested = parentSubid;
+			}
+		}
+		else if (event == SUBXACT_EVENT_ABORT_SUB)
+		{
+			/*
+			 * An entry written in the subtransaction is gone with it, and so is
+			 * an attestation made in it (the entry is then owed one again).
+			 */
+			for (i = 0, j = 0; i < kl_nreq; i++)
+			{
+				if (kl_req[i].created == mySubid)
+					continue;
+				if (kl_req[i].attested == mySubid)
+					kl_req[i].attested = InvalidSubTransactionId;
+				kl_req[j++] = kl_req[i];
+			}
+			kl_nreq = j;
+		}
+	}
 
 	if (!kl_state.pending_written || kl_state.pending_subid != mySubid)
 		return;
@@ -204,7 +308,7 @@ kl_execute_guarded(SPIPlanPtr plan, Datum *values)
  * session's current user as seen outside this SECURITY DEFINER function.
  */
 static void
-kl_record_entry(int32 table_id, char op, const uint8 *row_hash,
+kl_record_entry(int32 table_id, char op, const uint8 *row_hash, bool required,
 				uint64 *txid_out, int32 *seq_out)
 {
 	uint64		txid = U64FromFullTransactionId(GetTopFullTransactionId());
@@ -276,6 +380,26 @@ kl_record_entry(int32 table_id, char op, const uint8 *row_hash,
 			 SPI_result_code_string(rc));
 	*txid_out = txid;
 	*seq_out = kl_state.next_seq;
+
+	/* An entry of a table with the policy "required" is owed an attestation. */
+	if (required)
+	{
+		if (kl_req == NULL)
+		{
+			kl_reqmax = 64;
+			kl_req = MemoryContextAlloc(TopMemoryContext, sizeof(KlRequired) * kl_reqmax);
+		}
+		else if (kl_nreq == kl_reqmax)
+		{
+			kl_reqmax *= 2;
+			kl_req = repalloc(kl_req, sizeof(KlRequired) * kl_reqmax);
+		}
+		kl_req[kl_nreq].seq = kl_state.next_seq;
+		kl_req[kl_nreq].table_id = table_id;
+		kl_req[kl_nreq].created = GetCurrentSubTransactionId();
+		kl_req[kl_nreq].attested = InvalidSubTransactionId;
+		kl_nreq++;
+	}
 	kl_state.next_seq++;
 
 	/* hash_datum lives in the SPI procedure context, freed here. */
@@ -421,6 +545,7 @@ kingres_ledger_capture(PG_FUNCTION_ARGS)
 	int32		seq;
 	int32		registered;
 	Oid			history;
+	bool		required = false;
 
 	if (!CALLED_AS_TRIGGER(fcinfo))
 		ereport(ERROR,
@@ -460,7 +585,8 @@ kingres_ledger_capture(PG_FUNCTION_ARGS)
 	{
 		/* The registry of 0.1 has no history table: ask for the identity only. */
 		history = InvalidOid;
-		registered = kl_lookup_table_id(RelationGetRelid(trigdata->tg_relation));
+		registered = kl_lookup_table_id_policy(RelationGetRelid(trigdata->tg_relation),
+											&required);
 		if (registered < 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_TABLE),
@@ -468,7 +594,8 @@ kingres_ledger_capture(PG_FUNCTION_ARGS)
 							RelationGetRelationName(trigdata->tg_relation))));
 	}
 	else
-		history = kl_lookup_history(RelationGetRelid(trigdata->tg_relation), &registered);
+		history = kl_lookup_history_policy(RelationGetRelid(trigdata->tg_relation),
+											&registered, &required);
 	if (registered != (int32) table_id)
 		ereport(ERROR,
 				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
@@ -480,7 +607,7 @@ kingres_ledger_capture(PG_FUNCTION_ARGS)
 	{
 		kl_row_hash_tuple(RelationGetDescr(trigdata->tg_relation),
 						  trigdata->tg_trigtuple, (int32) table_id, false, hash);
-		kl_record_entry((int32) table_id, KL_OP_INSERT, hash, &txid, &seq);
+		kl_record_entry((int32) table_id, KL_OP_INSERT, hash, required, &txid, &seq);
 	}
 	else
 	{
@@ -498,7 +625,7 @@ kingres_ledger_capture(PG_FUNCTION_ARGS)
 		/* The old version of the row leaves: entry D and a history row. */
 		kl_row_hash_tuple(RelationGetDescr(trigdata->tg_relation),
 						  trigdata->tg_trigtuple, (int32) table_id, false, hash);
-		kl_record_entry((int32) table_id, KL_OP_DELETE, hash, &txid, &seq);
+		kl_record_entry((int32) table_id, KL_OP_DELETE, hash, required, &txid, &seq);
 		kl_insert_history(history, trigdata->tg_relation, trigdata->tg_trigtuple,
 						  txid, seq);
 
@@ -507,7 +634,7 @@ kingres_ledger_capture(PG_FUNCTION_ARGS)
 		{
 			kl_row_hash_tuple(RelationGetDescr(trigdata->tg_relation),
 							  trigdata->tg_newtuple, (int32) table_id, false, hash);
-			kl_record_entry((int32) table_id, KL_OP_INSERT, hash, &txid, &seq);
+			kl_record_entry((int32) table_id, KL_OP_INSERT, hash, required, &txid, &seq);
 		}
 	}
 
@@ -567,6 +694,17 @@ kingres_ledger_block_modify(PG_FUNCTION_ARGS)
 			kl_refuse_write_rel(trigdata->tg_relation, false);
 		return PointerGetDatum(rettup);
 	}
+
+	/*
+	 * The one update of a ledger table that the code of the extension makes:
+	 * ledger_set_signature_policy switches a table from "optional" to "required"
+	 * (guard.c).  Nothing else of the registry changes.
+	 */
+	if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event) &&
+		TRIGGER_FIRED_FOR_ROW(trigdata->tg_event) &&
+		kl_policy_update_allowed(trigdata->tg_relation, trigdata->tg_trigtuple,
+								 trigdata->tg_newtuple))
+		return PointerGetDatum(trigdata->tg_newtuple);
 
 	/*
 	 * A superuser who turned allow_manual_write on may delete the rows that
@@ -668,5 +806,35 @@ kl_record_existing_row(int32 table_id, HeapTupleHeader header)
 				 errmsg("row does not belong to ledger table %d", table_id)));
 
 	kl_row_hash_composite(header, table_id, false, hash);
-	kl_record_entry(table_id, KL_OP_INSERT, hash, &txid, &seq);
+	kl_record_entry(table_id, KL_OP_INSERT, hash, false, &txid, &seq);
+}
+
+/*
+ * kl_attest_mark
+ *		ledger_attest accepted the attestation of the entry with this sequence
+ *		number in the current (sub)transaction: the entry is no longer owed one.
+ *		An entry of a table without the policy is not tracked, and nothing
+ *		happens.  The records are in the order of the sequence numbers, so the
+ *		entry is found by bisection.
+ */
+void
+kl_attest_mark(int32 seq)
+{
+	int			lo = 0;
+	int			hi = kl_nreq - 1;
+
+	while (lo <= hi)
+	{
+		int			mid = lo + (hi - lo) / 2;
+
+		if (kl_req[mid].seq == seq)
+		{
+			kl_req[mid].attested = GetCurrentSubTransactionId();
+			return;
+		}
+		if (kl_req[mid].seq < seq)
+			lo = mid + 1;
+		else
+			hi = mid - 1;
+	}
 }

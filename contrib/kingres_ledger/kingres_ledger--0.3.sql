@@ -13,6 +13,13 @@
 -- other functions of src/write.c, the capture trigger), and by a superuser who
 -- turned allow_manual_write on.  Hash format 1 and every earlier object are as in 0.2.
 --
+-- Part B adds client signatures (src/sign.c; design 3.6 to 3.8 and 8.1): three
+-- tables that are ledger tables themselves (ledger_client_key,
+-- ledger_client_key_revocation, ledger_attestation), registered by
+-- ledger_register_internal while this script runs, the functions that write them,
+-- two columns of ledger_table (signature_policy, signature_required_from), the
+-- checks of ledger_verify and the columns of ledger_status that go with them.
+--
 -- kingres_ledger--0.1--0.2.sql and kingres_ledger--0.2--0.3.sql upgrade the
 -- earlier versions to the objects this script creates; the tests
 -- t/007_upgrade.pl and t/011_upgrade_0_3.pl compare the results.  Anything
@@ -66,12 +73,22 @@ CREATE TABLE kingres.ledger_table (
     -- The history table of an updatable table; NULL for an append-only one.
     -- This column must stay the fifth: protect.c reads it by position.
     history_relid regclass,
+    -- The signature policy (0.3, part B): the sixth and seventh columns.  The
+    -- policy only goes from optional to required, and the transaction that
+    -- switched it is kept, so that ledger_verify asks for an attestation only
+    -- of the entries from then on.  Not covered by a hash.
+    signature_policy text NOT NULL DEFAULT 'optional',
+    signature_required_from bigint,
     CONSTRAINT ledger_table_pkey PRIMARY KEY (table_id),
     CONSTRAINT ledger_table_relid_key UNIQUE (relid),
     CONSTRAINT ledger_table_history_relid_key UNIQUE (history_relid),
     CONSTRAINT ledger_table_mode_check CHECK (mode IN ('append_only', 'updatable')),
     CONSTRAINT ledger_table_history_check
-        CHECK ((mode = 'updatable') = (history_relid IS NOT NULL))
+        CHECK ((mode = 'updatable') = (history_relid IS NOT NULL)),
+    CONSTRAINT ledger_table_signature_policy_check
+        CHECK (signature_policy IN ('optional', 'required')),
+    CONSTRAINT ledger_table_signature_from_check
+        CHECK ((signature_policy = 'required') = (signature_required_from IS NOT NULL))
 );
 
 -- The identity of this chain: one row, random, written when the extension is
@@ -187,7 +204,9 @@ CREATE TABLE kingres.ledger_removed (
     CONSTRAINT ledger_removed_pkey PRIMARY KEY (removal_id),
     CONSTRAINT ledger_removed_source_check
         CHECK (source_table IN ('ledger_table', 'ledger_chain', 'ledger_entry', 'ledger_tx',
-                                'ledger_blocks', 'ledger_digest', 'ledger_verification')),
+                                'ledger_blocks', 'ledger_digest', 'ledger_verification',
+                                'ledger_client_key', 'ledger_client_key_revocation',
+                                'ledger_attestation')),
     CONSTRAINT ledger_removed_action_check
         CHECK (action IN ('removed', 'inserted'))
 );
@@ -980,7 +999,9 @@ BEGIN
                        ('ledger_entry', 27, 7), ('ledger_pending', 19, 15),
                        ('ledger_tx', 27, 7), ('ledger_blocks', 27, 7),
                        ('ledger_digest', 27, 7), ('ledger_verification', 27, 7),
-                       ('ledger_removed', 27, 7)) AS s(tbl, modtype, guardtype)
+                       ('ledger_removed', 27, 7), ('ledger_client_key', 27, 7),
+                       ('ledger_client_key_revocation', 27, 7),
+                       ('ledger_attestation', 27, 7)) AS s(tbl, modtype, guardtype)
     LOOP
         v_oid := pg_catalog.to_regclass(pg_catalog.format('kingres.%I', v_spec.tbl))::pg_catalog.oid;
         IF v_oid IS NULL
@@ -2090,6 +2111,75 @@ BEGIN
         END;
     END LOOP;
 
+    -- Client signatures (0.3, part B).  The three tables are ledger tables and
+    -- are compared with their entries like every other ledger table, so a
+    -- deleted, changed or inserted attestation, key or revocation is a table_rows
+    -- finding.  These checks are about what the rows say.  A key or an
+    -- attestation row whose signature does not verify is for the verifier
+    -- (kingres-verify attestation): the signatures are checked from the proof of
+    -- an entry, one at a time.
+    RETURN QUERY
+    SELECT 'attestation_duplicate'::text,
+           'key ' || pg_catalog.encode(a.key_id, 'hex') || ' nonce ' || pg_catalog.encode(a.nonce, 'hex'),
+           pg_catalog.count(*) || ' attestations use the same client key and nonce'
+      FROM kingres.ledger_attestation a
+     GROUP BY a.key_id, a.nonce
+    HAVING pg_catalog.count(*) > 1;
+    RETURN QUERY
+    SELECT 'attestation_duplicate'::text,
+           'tx ' || a.ledger_txid || ' seq ' || a.seq,
+           pg_catalog.count(*) || ' attestations of the same entry'
+      FROM kingres.ledger_attestation a
+     GROUP BY a.ledger_txid, a.seq
+    HAVING pg_catalog.count(*) > 1;
+    RETURN QUERY
+    SELECT 'client_key_unknown'::text,
+           'tx ' || a.ledger_txid || ' seq ' || a.seq,
+           'the attestation names client key ' || pg_catalog.encode(a.key_id, 'hex')
+           || ', which is not registered'
+      FROM kingres.ledger_attestation a
+     WHERE NOT EXISTS (SELECT 1 FROM kingres.ledger_client_key k WHERE k.key_id = a.key_id);
+    RETURN QUERY
+    SELECT 'client_key_unknown'::text,
+           'key ' || pg_catalog.encode(r.key_id, 'hex'),
+           'a revocation names a client key that is not registered'
+      FROM kingres.ledger_client_key_revocation r
+     WHERE NOT EXISTS (SELECT 1 FROM kingres.ledger_client_key k WHERE k.key_id = r.key_id);
+    RETURN QUERY
+    SELECT 'client_key_id'::text,
+           'key ' || pg_catalog.encode(k.key_id, 'hex'),
+           'the key identifier is not the first 16 bytes of the SHA-256 of the public key'
+      FROM kingres.ledger_client_key k
+     WHERE k.key_id IS DISTINCT FROM pg_catalog.substr(pg_catalog.sha256(k.public_key), 1, 16);
+    RETURN QUERY
+    SELECT 'attestation_orphan'::text,
+           'tx ' || a.ledger_txid || ' seq ' || a.seq,
+           'the attestation is for an entry that does not exist'
+      FROM kingres.ledger_attestation a
+     WHERE NOT EXISTS (SELECT 1 FROM kingres.ledger_entry e
+                        WHERE e.ledger_txid = a.ledger_txid AND e.seq = a.seq);
+    -- An entry of a table with the signature policy required that has no
+    -- attestation, for the transactions after the one that switched the policy
+    -- on: the entries before were written when attestations were not asked for
+    -- (and the ones of the switching transaction itself are tracked from the
+    -- switch on, by the commit check).  A
+    -- transaction that was already running when the policy was switched can
+    -- show up here once; the policy is not covered by a hash, so a superuser
+    -- who switched it off by editing the catalog is not seen (README).
+    RETURN QUERY
+    SELECT 'unattested_entry'::text,
+           'tx ' || e.ledger_txid || ' seq ' || e.seq,
+           'the entry of ledger table_id ' || e.table_id
+           || ' has no attestation, and the table has had the signature policy required since transaction '
+           || t.signature_required_from
+      FROM kingres.ledger_entry e
+      JOIN kingres.ledger_table t ON t.table_id = e.table_id
+     WHERE t.signature_policy = 'required'
+       AND t.signature_required_from < e.ledger_txid
+       AND NOT EXISTS (SELECT 1 FROM kingres.ledger_attestation a
+                        WHERE a.ledger_txid = e.ledger_txid AND a.seq = e.seq)
+     ORDER BY e.ledger_txid, e.seq;
+
     -- A capture trigger of the extension on a table that is not registered
     -- (for example in a database that was restored from a dump, which keeps
     -- the triggers of the tables but not the ledger).
@@ -2289,6 +2379,183 @@ REVOKE ALL ON FUNCTION kingres.ledger_inclusion_proof(regclass, bytea) FROM PUBL
 REVOKE ALL ON FUNCTION kingres.ledger_inclusion_proof(regclass, bytea, "char") FROM PUBLIC;
 
 --------------------------------------------------------------------------
+-- Client signatures (0.3, part B): the tables, the functions
+--------------------------------------------------------------------------
+-- kingres/docs/design/ledger-phase7.md, 3.6 to 3.8 and 8.1; src/sign.c.  A
+-- client attestation is an Ed25519 signature by a key the client holds over
+-- one ledger entry of one row version.  The registry of the keys, the
+-- revocations and the attestations are rows of three tables of the extension
+-- that are ledger tables themselves: registered in ledger_table as append-only
+-- tables by ledger_register_internal below, entered into the chain by the
+-- capture trigger, covered by blocks, proofs and ledger_verify, and written by
+-- the code of the extension only (the guard refuses every other statement that
+-- writes them, whatever the role holds).  Nothing here changes hash format 1.
+
+CREATE TABLE kingres.ledger_client_key (
+    key_id        bytea       NOT NULL,
+    algorithm     text        NOT NULL,
+    public_key    bytea       NOT NULL,
+    role_name     name,
+    label         text        NOT NULL,
+    registered_by name        NOT NULL,
+    registered_at timestamptz NOT NULL,
+    CONSTRAINT ledger_client_key_pkey PRIMARY KEY (key_id),
+    CONSTRAINT ledger_client_key_key_id_check CHECK (octet_length(key_id) = 16),
+    CONSTRAINT ledger_client_key_algorithm_check CHECK (algorithm = 'ed25519'),
+    CONSTRAINT ledger_client_key_public_key_check CHECK (octet_length(public_key) = 32),
+    CONSTRAINT ledger_client_key_label_check CHECK (char_length(label) <= 200)
+);
+
+CREATE TABLE kingres.ledger_client_key_revocation (
+    key_id     bytea       NOT NULL,
+    reason     text        NOT NULL,
+    revoked_by name        NOT NULL,
+    revoked_at timestamptz NOT NULL,
+    CONSTRAINT ledger_client_key_revocation_pkey PRIMARY KEY (key_id),
+    CONSTRAINT ledger_client_key_revocation_key_id_check CHECK (octet_length(key_id) = 16),
+    CONSTRAINT ledger_client_key_revocation_reason_check CHECK (char_length(reason) <= 200)
+);
+
+CREATE TABLE kingres.ledger_attestation (
+    ledger_txid bigint NOT NULL,
+    seq         int    NOT NULL,
+    key_id      bytea  NOT NULL,
+    nonce       bytea  NOT NULL,
+    signature   bytea  NOT NULL,
+    CONSTRAINT ledger_attestation_pkey PRIMARY KEY (ledger_txid, seq),
+    CONSTRAINT ledger_attestation_key_nonce_key UNIQUE (key_id, nonce),
+    CONSTRAINT ledger_attestation_key_id_check CHECK (octet_length(key_id) = 16),
+    CONSTRAINT ledger_attestation_nonce_check CHECK (octet_length(nonce) = 16),
+    CONSTRAINT ledger_attestation_signature_check CHECK (octet_length(signature) = 64)
+);
+
+COMMENT ON TABLE kingres.ledger_client_key IS
+    'Registered client keys (Ed25519): key_id is the first 16 bytes of the SHA-256 of the public key; role_name NULL lets any role attest with it. A ledger table itself, written by ledger_client_key_register only.';
+COMMENT ON TABLE kingres.ledger_client_key_revocation IS
+    'Revocations of client keys, one row per revoked key. A ledger table itself, written by ledger_client_key_revoke only.';
+COMMENT ON TABLE kingres.ledger_attestation IS
+    'One row per attested ledger entry (ledger_txid, seq): the client key, a nonce and the Ed25519 signature. A ledger table itself, written by ledger_attest only.';
+
+-- Not readable by PUBLIC, like the entries: the service role and the
+-- administrators are granted SELECT (README).
+REVOKE ALL ON kingres.ledger_client_key, kingres.ledger_client_key_revocation,
+    kingres.ledger_attestation FROM PUBLIC;
+
+-- The same triggers as the other ledger tables: no update, delete or
+-- truncate, and the guard trigger for the writers that never reach the
+-- executor hook.  The capture trigger is armed by ledger_register_internal.
+CREATE TRIGGER kingres_ledger_block_modify
+    BEFORE UPDATE OR DELETE ON kingres.ledger_client_key
+    FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify();
+CREATE TRIGGER kingres_ledger_block_truncate
+    BEFORE TRUNCATE ON kingres.ledger_client_key
+    FOR EACH STATEMENT EXECUTE FUNCTION kingres.ledger_block_modify();
+CREATE TRIGGER kingres_ledger_guard_write
+    BEFORE INSERT ON kingres.ledger_client_key
+    FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify();
+CREATE TRIGGER kingres_ledger_block_modify
+    BEFORE UPDATE OR DELETE ON kingres.ledger_client_key_revocation
+    FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify();
+CREATE TRIGGER kingres_ledger_block_truncate
+    BEFORE TRUNCATE ON kingres.ledger_client_key_revocation
+    FOR EACH STATEMENT EXECUTE FUNCTION kingres.ledger_block_modify();
+CREATE TRIGGER kingres_ledger_guard_write
+    BEFORE INSERT ON kingres.ledger_client_key_revocation
+    FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify();
+CREATE TRIGGER kingres_ledger_block_modify
+    BEFORE UPDATE OR DELETE ON kingres.ledger_attestation
+    FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify();
+CREATE TRIGGER kingres_ledger_block_truncate
+    BEFORE TRUNCATE ON kingres.ledger_attestation
+    FOR EACH STATEMENT EXECUTE FUNCTION kingres.ledger_block_modify();
+CREATE TRIGGER kingres_ledger_guard_write
+    BEFORE INSERT ON kingres.ledger_attestation
+    FOR EACH ROW EXECUTE FUNCTION kingres.ledger_block_modify();
+ALTER TABLE kingres.ledger_client_key ENABLE ALWAYS TRIGGER kingres_ledger_block_modify;
+ALTER TABLE kingres.ledger_client_key ENABLE ALWAYS TRIGGER kingres_ledger_block_truncate;
+ALTER TABLE kingres.ledger_client_key ENABLE ALWAYS TRIGGER kingres_ledger_guard_write;
+ALTER TABLE kingres.ledger_client_key_revocation ENABLE ALWAYS TRIGGER kingres_ledger_block_modify;
+ALTER TABLE kingres.ledger_client_key_revocation ENABLE ALWAYS TRIGGER kingres_ledger_block_truncate;
+ALTER TABLE kingres.ledger_client_key_revocation ENABLE ALWAYS TRIGGER kingres_ledger_guard_write;
+ALTER TABLE kingres.ledger_attestation ENABLE ALWAYS TRIGGER kingres_ledger_block_modify;
+ALTER TABLE kingres.ledger_attestation ENABLE ALWAYS TRIGGER kingres_ledger_block_truncate;
+ALTER TABLE kingres.ledger_attestation ENABLE ALWAYS TRIGGER kingres_ledger_guard_write;
+
+-- Registers one of the three tables above as an append-only ledger table:
+-- arms its capture trigger with the next identifier of the registry and writes
+-- the row of the registry; for this script only (src/sign.c).  The tables
+-- hold no row, so no entry is written, and an upgrade writes none.  It takes
+-- no content from its caller; not executable by anybody else.
+CREATE FUNCTION kingres.ledger_register_internal(relation regclass) RETURNS void
+    AS 'MODULE_PATHNAME', 'kingres_ledger_register_internal'
+    LANGUAGE C VOLATILE STRICT
+    SET search_path = pg_catalog, pg_temp;
+COMMENT ON FUNCTION kingres.ledger_register_internal(regclass) IS
+    'Internal: register a table of client signatures as a ledger table; callable by the install and upgrade scripts of the extension only.';
+REVOKE ALL ON FUNCTION kingres.ledger_register_internal(regclass) FROM PUBLIC;
+
+SELECT kingres.ledger_register_internal('kingres.ledger_client_key'::regclass);
+SELECT kingres.ledger_register_internal('kingres.ledger_client_key_revocation'::regclass);
+SELECT kingres.ledger_register_internal('kingres.ledger_attestation'::regclass);
+
+-- The message a client signs, byte exact (README, "Client signatures"): the
+-- tag "kingres-ledger/client-signature/v1" and a zero byte, the chain
+-- identity, u32 table_id, the operation byte, the row hash, the key
+-- identifier and the nonce.  A pure function, for a client that wants to
+-- compare its own encoding.
+CREATE FUNCTION kingres.ledger_attestation_message(chain_id bytea, table_id int,
+                                                    op "char", row_hash bytea,
+                                                    key_id bytea, nonce bytea)
+    RETURNS bytea
+    AS 'MODULE_PATHNAME', 'kingres_ledger_attestation_message'
+    LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+COMMENT ON FUNCTION kingres.ledger_attestation_message(bytea, int, "char", bytea, bytea, bytea) IS
+    'The 136 bytes a client signs for one entry: the tag kingres-ledger/client-signature/v1, a zero byte, chain_id (32 bytes), u32 table_id, the operation byte (I or D), row_hash (32), key_id (16) and nonce (16).';
+
+-- SECURITY DEFINER because they write the ledger tables above, which no other
+-- role may write; the caller needs EXECUTE only, which an administrator
+-- grants (PUBLIC has none).  They take no lock of the extension, so they run
+-- inside the transaction of the caller, as ledger_attest must.
+CREATE FUNCTION kingres.ledger_client_key_register(public_key bytea, role_name name,
+                                                    label text)
+    RETURNS bytea
+    AS 'MODULE_PATHNAME', 'kingres_ledger_client_key_register'
+    LANGUAGE C VOLATILE SECURITY DEFINER
+    SET search_path = pg_catalog, pg_temp;
+COMMENT ON FUNCTION kingres.ledger_client_key_register(bytea, name, text) IS
+    'Register an Ed25519 client key (32 bytes); returns its key_id, the first 16 bytes of the SHA-256 of the public key. role_name NULL lets any role attest with it. Not executable by PUBLIC.';
+
+CREATE FUNCTION kingres.ledger_client_key_revoke(key_id bytea, reason text)
+    RETURNS void
+    AS 'MODULE_PATHNAME', 'kingres_ledger_client_key_revoke'
+    LANGUAGE C VOLATILE SECURITY DEFINER
+    SET search_path = pg_catalog, pg_temp;
+COMMENT ON FUNCTION kingres.ledger_client_key_revoke(bytea, text) IS
+    'Revoke a client key. Attestations made in blocks before the revocation stay valid. Not executable by PUBLIC.';
+
+CREATE FUNCTION kingres.ledger_attest(relation regclass, row_hash bytea, op "char",
+                                       key_id bytea, nonce bytea, signature bytea)
+    RETURNS void
+    AS 'MODULE_PATHNAME', 'kingres_ledger_attest'
+    LANGUAGE C VOLATILE SECURITY DEFINER
+    SET search_path = pg_catalog, pg_temp;
+COMMENT ON FUNCTION kingres.ledger_attest(regclass, bytea, "char", bytea, bytea, bytea) IS
+    'Attest one ledger entry of the current transaction with a registered client key: the Ed25519 signature must verify over ledger_attestation_message. KL011 no such entry, KL012 key unknown, revoked or not allowed for this role, KL013 bad signature, KL014 nonce reused; 0A000 on a server built without OpenSSL. Not executable by PUBLIC.';
+
+CREATE FUNCTION kingres.ledger_set_signature_policy(relation regclass, policy text)
+    RETURNS void
+    AS 'MODULE_PATHNAME', 'kingres_ledger_set_signature_policy'
+    LANGUAGE C VOLATILE SECURITY DEFINER
+    SET search_path = pg_catalog, pg_temp;
+COMMENT ON FUNCTION kingres.ledger_set_signature_policy(regclass, text) IS
+    'Switch a ledger table from the signature policy optional to required, for good: a transaction that writes an entry of the table without attesting it fails at commit (KL010). The caller owns the table. Not executable by PUBLIC.';
+
+REVOKE ALL ON FUNCTION kingres.ledger_client_key_register(bytea, name, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION kingres.ledger_client_key_revoke(bytea, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION kingres.ledger_attest(regclass, bytea, "char", bytea, bytea, bytea) FROM PUBLIC;
+REVOKE ALL ON FUNCTION kingres.ledger_set_signature_policy(regclass, text) FROM PUBLIC;
+
+--------------------------------------------------------------------------
 -- Records for operators
 --------------------------------------------------------------------------
 
@@ -2322,7 +2589,10 @@ COMMENT ON FUNCTION kingres.ledger_verify_recorded(bigint, bigint) IS
 -- the ledger tables; it is therefore not readable by PUBLIC (the number of
 -- pending transactions tells how active the database is).
 CREATE VIEW kingres.ledger_status AS
-SELECT (SELECT pg_catalog.count(*) FROM kingres.ledger_table t WHERE t.mode = 'append_only')
+SELECT (SELECT pg_catalog.count(*) FROM kingres.ledger_table t
+         WHERE t.mode = 'append_only'
+           AND NOT kingres.ledger_is_member('pg_catalog.pg_class'::pg_catalog.regclass,
+                                            t.relid::pg_catalog.oid))
            AS append_only_tables,
        (SELECT pg_catalog.count(*) FROM kingres.ledger_table t WHERE t.mode = 'updatable')
            AS updatable_tables,
@@ -2347,7 +2617,13 @@ SELECT (SELECT pg_catalog.count(*) FROM kingres.ledger_table t WHERE t.mode = 'a
        dbo.rolsuper AS database_owner_is_superuser,
        dbd.droppers AS database_droppers,
        (pg_catalog.cardinality(dbd.droppers) > 0) AS database_droppable_by_non_superuser,
-       dbd.potential AS database_potential_droppers
+       dbd.potential AS database_potential_droppers,
+       (SELECT pg_catalog.count(*) FROM kingres.ledger_client_key k
+         WHERE NOT EXISTS (SELECT 1 FROM kingres.ledger_client_key_revocation r
+                            WHERE r.key_id = k.key_id)) AS client_keys_active,
+       (SELECT pg_catalog.count(*) FROM kingres.ledger_attestation) AS attestations,
+       (SELECT pg_catalog.count(*) FROM kingres.ledger_table t
+         WHERE t.signature_policy = 'required') AS required_tables
   FROM (SELECT 1) one
   CROSS JOIN LATERAL kingres.ledger_worker_state() ws
   CROSS JOIN (SELECT r.rolname, r.rolsuper
@@ -2404,7 +2680,7 @@ SELECT (SELECT pg_catalog.count(*) FROM kingres.ledger_table t WHERE t.mode = 'a
                       WHERE v.finished_at IS NOT NULL
                       ORDER BY v.verification_id DESC LIMIT 1) lv ON true;
 COMMENT ON VIEW kingres.ledger_status IS
-    'One row: the number of append-only and updatable ledger tables, the latest block, the pending transactions and the age of the oldest, the last digest and the last finished verification, and the state of the block-building worker for this database (ok, failed with the delay before the next attempt and the last error, ...), and the owner of the database with whether it is a superuser, and the roles that are not superusers and can drop the database, and the ledger with it (database_droppers: the owner if it is not a superuser, every role with the privileges of the owner, every role that can SET ROLE to one of those or to a superuser; computed as PostgreSQL does; for a database owned by pg_database_owner, every role that owns a database of the cluster is taken as the owner), and the roles that cannot now and can make themselves able to without a superuser (database_potential_droppers: ADMIN OPTION, directly or through a chain, on a role that can drop it; a role with CREATEROLE has it on the roles it created; the members of pg_execute_server_program and pg_write_server_files count as superusers here, and the roles with ADMIN OPTION on those two as the second kind). Not readable by PUBLIC.';
+    'One row: the number of append-only and updatable ledger tables, the latest block, the pending transactions and the age of the oldest, the last digest and the last finished verification, and the state of the block-building worker for this database (ok, failed with the delay before the next attempt and the last error, ...), and the owner of the database with whether it is a superuser, and the roles that are not superusers and can drop the database, and the ledger with it (database_droppers: the owner if it is not a superuser, every role with the privileges of the owner, every role that can SET ROLE to one of those or to a superuser; computed as PostgreSQL does; for a database owned by pg_database_owner, every role that owns a database of the cluster is taken as the owner), and the roles that cannot now and can make themselves able to without a superuser (database_potential_droppers: ADMIN OPTION, directly or through a chain, on a role that can drop it; a role with CREATEROLE has it on the roles it created; the members of pg_execute_server_program and pg_write_server_files count as superusers here, and the roles with ADMIN OPTION on those two as the second kind), and the client signatures (client_keys_active: registered keys that are not revoked; attestations: rows of ledger_attestation; required_tables: tables with the signature policy required). The tables of the ledger itself (the three of client signatures) are not counted in append_only_tables. Not readable by PUBLIC.';
 
 REVOKE ALL ON FUNCTION kingres.ledger_verify_recorded(bigint, bigint) FROM PUBLIC;
 REVOKE ALL ON kingres.ledger_status FROM PUBLIC;

@@ -239,7 +239,7 @@ SELECT count(*) AS findings FROM kingres.ledger_verify();
 SELECT count(*) AS rows_of_ledger_table FROM kingres.ledger_table;
  rows_of_ledger_table 
 ----------------------
-                    1
+                    4
 (1 row)
 
 -- The messages.

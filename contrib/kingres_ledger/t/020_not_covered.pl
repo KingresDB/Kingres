@@ -264,7 +264,8 @@ for my $i (1 .. 6)
 	$second->quit;
 	my $state = $node->safe_psql($db, q{SELECT
 		(SELECT count(*) FROM pg_extension WHERE extname = 'kingres_ledger') || ' '
-		|| (SELECT count(*) FROM pg_trigger WHERE tgname = 'kingres_ledger_capture')});
+		|| (SELECT count(*) FROM pg_trigger WHERE tgname = 'kingres_ledger_capture'
+		    AND tgrelid::regclass::text NOT LIKE 'kingres.%')});
 	$outcome{"$order: $state"}++;
 	ok($state eq '1 1' || $state eq '1 0' || $state eq '0 0',
 		"race $i ($order): the database has the ledger ($state) or no trace of it, never a capture trigger without it");

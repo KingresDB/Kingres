@@ -32,7 +32,7 @@ INSERT INTO pure_primitives VALUES
     ('ledger_leaf_hash'), ('ledger_node_hash'), ('ledger_merkle_accum'),
     ('ledger_merkle_final'), ('ledger_merkle_path'), ('ledger_tx_leaf'),
     ('ledger_block_tx_leaf'), ('ledger_block_hash'), ('ledger_block_preimage'),
-    ('ledger_genesis_hash'),
+    ('ledger_genesis_hash'), ('ledger_attestation_message'),
     ('ledger_timestamptz_us'), ('ledger_verify_proof'), ('ledger_hook_active'), ('ledger_binary_upgrade'),
     ('ledger_outer_user');
 -- A function without a fixed search_path that is not on the list.
@@ -74,22 +74,26 @@ FROM pure_primitives pp WHERE NOT EXISTS (SELECT 1 FROM members m WHERE m.pronam
 -- The functions that run as the extension owner, and only those.
 SELECT m.proname, pg_get_function_identity_arguments(m.oid) AS args
 FROM members m WHERE m.prosecdef ORDER BY 1, 2;
-        proname         |                     args                     
-------------------------+----------------------------------------------
- ledger_blocks_entries  | from_height bigint, max_count integer
- ledger_build_block     | 
- ledger_capture         | 
- ledger_enable          | relation regclass, mode text
- ledger_generate_digest | 
- ledger_guard           | 
- ledger_head            | 
- ledger_inclusion_proof | relation regclass, row_hash bytea
- ledger_inclusion_proof | relation regclass, row_hash bytea, op "char"
- ledger_register_table  | relation regclass
- ledger_remove_stray    | reason text
- ledger_verify          | from_height bigint, to_height bigint
- ledger_verify_recorded | from_height bigint, to_height bigint
-(13 rows)
+           proname           |                                           args                                           
+-----------------------------+------------------------------------------------------------------------------------------
+ ledger_attest               | relation regclass, row_hash bytea, op "char", key_id bytea, nonce bytea, signature bytea
+ ledger_blocks_entries       | from_height bigint, max_count integer
+ ledger_build_block          | 
+ ledger_capture              | 
+ ledger_client_key_register  | public_key bytea, role_name name, label text
+ ledger_client_key_revoke    | key_id bytea, reason text
+ ledger_enable               | relation regclass, mode text
+ ledger_generate_digest      | 
+ ledger_guard                | 
+ ledger_head                 | 
+ ledger_inclusion_proof      | relation regclass, row_hash bytea
+ ledger_inclusion_proof      | relation regclass, row_hash bytea, op "char"
+ ledger_register_table       | relation regclass
+ ledger_remove_stray         | reason text
+ ledger_set_signature_policy | relation regclass, policy text
+ ledger_verify               | from_height bigint, to_height bigint
+ ledger_verify_recorded      | from_height bigint, to_height bigint
+(17 rows)
 
 -- Unqualified references in the SQL and PL/pgSQL functions: a table of the
 -- extension after FROM, JOIN, INTO, UPDATE or TABLE, or a call of a function
@@ -114,54 +118,60 @@ SELECT m.proname,
 FROM members m
 WHERE m.prokind <> 'a'
 ORDER BY 1, 2;
-         proname         |                                                                                                                     args                                                                                                                      | public_can_execute 
--------------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------------------
- ledger_all_defects      |                                                                                                                                                                                                                                               | t
- ledger_binary_upgrade   |                                                                                                                                                                                                                                               | t
- ledger_block_hash       | hash_version smallint, height bigint, prev_hash bytea, tx_merkle_root bytea, tx_count integer, closed_at timestamp with time zone                                                                                                             | t
- ledger_block_modify     |                                                                                                                                                                                                                                               | t
- ledger_block_preimage   | hash_version smallint, height bigint, prev_hash bytea, tx_merkle_root bytea, tx_count integer, closed_at timestamp with time zone                                                                                                             | t
- ledger_block_tx_leaf    | ledger_txid bigint, entry_count integer, merkle_root bytea, user_name name                                                                                                                                                                    | t
- ledger_blocks_entries   | from_height bigint, max_count integer                                                                                                                                                                                                         | f
- ledger_build_block      |                                                                                                                                                                                                                                               | f
- ledger_capture          |                                                                                                                                                                                                                                               | f
- ledger_catalog_defects  |                                                                                                                                                                                                                                               | t
- ledger_enable           | relation regclass, mode text                                                                                                                                                                                                                  | f
- ledger_generate_digest  |                                                                                                                                                                                                                                               | f
- ledger_genesis_hash     | chain_id bytea                                                                                                                                                                                                                                | t
- ledger_guard            |                                                                                                                                                                                                                                               | t
- ledger_head             |                                                                                                                                                                                                                                               | f
- ledger_history_acl_sync | relation regclass, history regclass                                                                                                                                                                                                           | f
- ledger_history_defects  | p_hist oid, p_relid oid                                                                                                                                                                                                                       | t
- ledger_history_row_hash | record                                                                                                                                                                                                                                        | t
- ledger_history_sync     | relation regclass, history regclass                                                                                                                                                                                                           | f
- ledger_hook_active      |                                                                                                                                                                                                                                               | t
- ledger_inclusion_proof  | relation regclass, row_hash bytea                                                                                                                                                                                                             | f
- ledger_inclusion_proof  | relation regclass, row_hash bytea, op "char"                                                                                                                                                                                                  | f
- ledger_is_member        | p_classid oid, p_objid oid                                                                                                                                                                                                                    | t
- ledger_leaf_hash        | data bytea                                                                                                                                                                                                                                    | t
- ledger_lock_table       | relation regclass                                                                                                                                                                                                                             | f
- ledger_merkle_accum     | internal, bytea                                                                                                                                                                                                                               | t
- ledger_merkle_final     | internal                                                                                                                                                                                                                                      | t
- ledger_merkle_path      | leaf_hashes bytea[], leaf_index integer                                                                                                                                                                                                       | t
- ledger_node_hash        | left_hash bytea, right_hash bytea                                                                                                                                                                                                             | t
- ledger_outer_user       |                                                                                                                                                                                                                                               | t
- ledger_register_table   | relation regclass                                                                                                                                                                                                                             | f
- ledger_remove_stray     | reason text                                                                                                                                                                                                                                   | f
- ledger_row_hash         | record                                                                                                                                                                                                                                        | t
- ledger_table_defects    | p_relid oid, p_table_id integer                                                                                                                                                                                                               | t
- ledger_timestamptz_us   | ts timestamp with time zone                                                                                                                                                                                                                   | t
- ledger_trigger_ok       | p_relid oid, p_name name, p_symbol text, p_secdef boolean, p_type integer, p_args bytea                                                                                                                                                       | t
- ledger_tx_leaf          | seq integer, table_id integer, op "char", row_hash bytea                                                                                                                                                                                      | t
- ledger_type_problem     | p_typid oid                                                                                                                                                                                                                                   | t
- ledger_verify           | from_height bigint, to_height bigint                                                                                                                                                                                                          | f
- ledger_verify_digest    | digest jsonb                                                                                                                                                                                                                                  | f
- ledger_verify_proof     | proof jsonb, digest jsonb                                                                                                                                                                                                                     | t
- ledger_verify_proof     | proof jsonb, digest jsonb, expected_table_id integer, expected_row_hash bytea                                                                                                                                                                 | t
- ledger_verify_proof     | proof jsonb, digest jsonb, expected_table_id integer, expected_row_hash bytea, expected_op "char"                                                                                                                                             | t
- ledger_verify_recorded  | from_height bigint, to_height bigint                                                                                                                                                                                                          | f
- ledger_worker_state     | OUT state text, OUT visits bigint, OUT failures bigint, OUT consecutive_failures integer, OUT last_attempt timestamp with time zone, OUT last_success timestamp with time zone, OUT retry_after timestamp with time zone, OUT last_error text | f
-(45 rows)
+           proname           |                                                                                                                     args                                                                                                                      | public_can_execute 
+-----------------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------------------
+ ledger_all_defects          |                                                                                                                                                                                                                                               | t
+ ledger_attest               | relation regclass, row_hash bytea, op "char", key_id bytea, nonce bytea, signature bytea                                                                                                                                                      | f
+ ledger_attestation_message  | chain_id bytea, table_id integer, op "char", row_hash bytea, key_id bytea, nonce bytea                                                                                                                                                        | t
+ ledger_binary_upgrade       |                                                                                                                                                                                                                                               | t
+ ledger_block_hash           | hash_version smallint, height bigint, prev_hash bytea, tx_merkle_root bytea, tx_count integer, closed_at timestamp with time zone                                                                                                             | t
+ ledger_block_modify         |                                                                                                                                                                                                                                               | t
+ ledger_block_preimage       | hash_version smallint, height bigint, prev_hash bytea, tx_merkle_root bytea, tx_count integer, closed_at timestamp with time zone                                                                                                             | t
+ ledger_block_tx_leaf        | ledger_txid bigint, entry_count integer, merkle_root bytea, user_name name                                                                                                                                                                    | t
+ ledger_blocks_entries       | from_height bigint, max_count integer                                                                                                                                                                                                         | f
+ ledger_build_block          |                                                                                                                                                                                                                                               | f
+ ledger_capture              |                                                                                                                                                                                                                                               | f
+ ledger_catalog_defects      |                                                                                                                                                                                                                                               | t
+ ledger_client_key_register  | public_key bytea, role_name name, label text                                                                                                                                                                                                  | f
+ ledger_client_key_revoke    | key_id bytea, reason text                                                                                                                                                                                                                     | f
+ ledger_enable               | relation regclass, mode text                                                                                                                                                                                                                  | f
+ ledger_generate_digest      |                                                                                                                                                                                                                                               | f
+ ledger_genesis_hash         | chain_id bytea                                                                                                                                                                                                                                | t
+ ledger_guard                |                                                                                                                                                                                                                                               | t
+ ledger_head                 |                                                                                                                                                                                                                                               | f
+ ledger_history_acl_sync     | relation regclass, history regclass                                                                                                                                                                                                           | f
+ ledger_history_defects      | p_hist oid, p_relid oid                                                                                                                                                                                                                       | t
+ ledger_history_row_hash     | record                                                                                                                                                                                                                                        | t
+ ledger_history_sync         | relation regclass, history regclass                                                                                                                                                                                                           | f
+ ledger_hook_active          |                                                                                                                                                                                                                                               | t
+ ledger_inclusion_proof      | relation regclass, row_hash bytea                                                                                                                                                                                                             | f
+ ledger_inclusion_proof      | relation regclass, row_hash bytea, op "char"                                                                                                                                                                                                  | f
+ ledger_is_member            | p_classid oid, p_objid oid                                                                                                                                                                                                                    | t
+ ledger_leaf_hash            | data bytea                                                                                                                                                                                                                                    | t
+ ledger_lock_table           | relation regclass                                                                                                                                                                                                                             | f
+ ledger_merkle_accum         | internal, bytea                                                                                                                                                                                                                               | t
+ ledger_merkle_final         | internal                                                                                                                                                                                                                                      | t
+ ledger_merkle_path          | leaf_hashes bytea[], leaf_index integer                                                                                                                                                                                                       | t
+ ledger_node_hash            | left_hash bytea, right_hash bytea                                                                                                                                                                                                             | t
+ ledger_outer_user           |                                                                                                                                                                                                                                               | t
+ ledger_register_internal    | relation regclass                                                                                                                                                                                                                             | f
+ ledger_register_table       | relation regclass                                                                                                                                                                                                                             | f
+ ledger_remove_stray         | reason text                                                                                                                                                                                                                                   | f
+ ledger_row_hash             | record                                                                                                                                                                                                                                        | t
+ ledger_set_signature_policy | relation regclass, policy text                                                                                                                                                                                                                | f
+ ledger_table_defects        | p_relid oid, p_table_id integer                                                                                                                                                                                                               | t
+ ledger_timestamptz_us       | ts timestamp with time zone                                                                                                                                                                                                                   | t
+ ledger_trigger_ok           | p_relid oid, p_name name, p_symbol text, p_secdef boolean, p_type integer, p_args bytea                                                                                                                                                       | t
+ ledger_tx_leaf              | seq integer, table_id integer, op "char", row_hash bytea                                                                                                                                                                                      | t
+ ledger_type_problem         | p_typid oid                                                                                                                                                                                                                                   | t
+ ledger_verify               | from_height bigint, to_height bigint                                                                                                                                                                                                          | f
+ ledger_verify_digest        | digest jsonb                                                                                                                                                                                                                                  | f
+ ledger_verify_proof         | proof jsonb, digest jsonb                                                                                                                                                                                                                     | t
+ ledger_verify_proof         | proof jsonb, digest jsonb, expected_table_id integer, expected_row_hash bytea                                                                                                                                                                 | t
+ ledger_verify_proof         | proof jsonb, digest jsonb, expected_table_id integer, expected_row_hash bytea, expected_op "char"                                                                                                                                             | t
+ ledger_verify_recorded      | from_height bigint, to_height bigint                                                                                                                                                                                                          | f
+ ledger_worker_state         | OUT state text, OUT visits bigint, OUT failures bigint, OUT consecutive_failures integer, OUT last_attempt timestamp with time zone, OUT last_success timestamp with time zone, OUT retry_after timestamp with time zone, OUT last_error text | f
+(51 rows)
 
 -- ... and which table PUBLIC can read or write.
 SELECT c.relname,
@@ -175,18 +185,21 @@ JOIN pg_depend d ON d.classid = 'pg_class'::regclass AND d.objid = c.oid
 JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'kingres_ledger'
 WHERE c.relkind = 'r'
 ORDER BY 1;
-       relname       | public_can_select | public_can_do_more 
----------------------+-------------------+--------------------
- ledger_blocks       | t                 | f
- ledger_chain        | t                 | f
- ledger_digest       | f                 | f
- ledger_entry        | f                 | f
- ledger_pending      | f                 | f
- ledger_removed      | f                 | f
- ledger_table        | t                 | f
- ledger_tx           | f                 | f
- ledger_verification | f                 | f
-(9 rows)
+           relname            | public_can_select | public_can_do_more 
+------------------------------+-------------------+--------------------
+ ledger_attestation           | f                 | f
+ ledger_blocks                | t                 | f
+ ledger_chain                 | t                 | f
+ ledger_client_key            | f                 | f
+ ledger_client_key_revocation | f                 | f
+ ledger_digest                | f                 | f
+ ledger_entry                 | f                 | f
+ ledger_pending               | f                 | f
+ ledger_removed               | f                 | f
+ ledger_table                 | t                 | f
+ ledger_tx                    | f                 | f
+ ledger_verification          | f                 | f
+(12 rows)
 
 -- The event triggers of the extension are in place and ENABLE ALWAYS.
 SELECT e.evtevent, e.evtenabled

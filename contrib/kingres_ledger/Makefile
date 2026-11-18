@@ -13,6 +13,7 @@ OBJS = \
 	src/proof.o \
 	src/protect.o \
 	src/row_hash.o \
+	src/sign.o \
 	src/worker.o \
 	src/write.o
 
@@ -22,7 +23,7 @@ DATA = kingres_ledger--0.1.sql kingres_ledger--0.2.sql kingres_ledger--0.3.sql \
 	kingres_ledger--0.1--0.3.sql
 PGFILEDESC = "kingres_ledger - tamper-evident ledger tables for KingresDB"
 
-REGRESS = ledger_setup ledger_hash ledger_capture ledger_verify ledger_protect ledger_format ledger_review ledger_updatable ledger_records ledger_review2 ledger_privs ledger_preimage ledger_head ledger_stray ledger_guard ledger_manual ledger_paths ledger_stops
+REGRESS = ledger_setup ledger_hash ledger_capture ledger_verify ledger_protect ledger_format ledger_review ledger_updatable ledger_records ledger_review2 ledger_privs ledger_preimage ledger_head ledger_stray ledger_guard ledger_manual ledger_paths ledger_stops ledger_sign
 REGRESS_OPTS = --temp-config $(srcdir)/kingres_ledger.conf
 
 TAP_TESTS = 1
@@ -39,3 +40,6 @@ top_builddir = ../..
 include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk
 endif
+
+# Client signatures verify Ed25519 with OpenSSL when the server has it (src/sign.c).
+SHLIB_LINK += $(filter -lssl -lcrypto, $(LIBS))

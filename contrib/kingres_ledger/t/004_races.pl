@@ -98,7 +98,7 @@ like($aout, qr/number of transactions actually processed: [1-9]/,
 is( q1(q(SELECT count(*) FROM pg_trigger g JOIN kingres.ledger_table t ON t.relid = g.tgrelid
 	      WHERE g.tgname LIKE 'kingres_ledger%' AND g.tgenabled <> 'A')),
 	'0', 'no ledger trigger was disabled by the rename race');
-is( q1(q(SELECT c.relpersistence FROM pg_class c JOIN kingres.ledger_table t ON t.relid = c.oid)),
+is( q1(q(SELECT c.relpersistence FROM pg_class c JOIN kingres.ledger_table t ON t.relid = c.oid WHERE NOT kingres.ledger_is_member('pg_class'::regclass, c.oid))),
 	'p', 'the ledger table is still logged');
 is(q1('SELECT count(*) FROM kingres.ledger_verify()'),
 	'0', 'the ledger verifies after the race');

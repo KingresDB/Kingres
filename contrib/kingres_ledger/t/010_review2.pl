@@ -413,8 +413,8 @@ diag("restore stderr: $rerr") if $rerr;
 is($d->safe_psql('dst', q(SELECT count(*) FROM public.ao)) . ',' . $d->safe_psql('dst', q(SELECT count(*) FROM public.up)) . ',' .
 	$d->safe_psql('dst', q(SELECT count(*) FROM public.up_ledger_history)),
 	'2,2,1', 'the rows of the tables and of the history table are restored');
-is($d->safe_psql('dst', q(SELECT count(*) FROM kingres.ledger_table)), '0',
-	'but the registry of the ledger is empty in the restored database');
+is($d->safe_psql('dst', q(SELECT count(*) FROM kingres.ledger_table)), '3',
+	'but the registry of the ledger holds only the three tables of client signatures in the restored database');
 cmp_ok($d->safe_psql('dst', q(SELECT count(*) FROM kingres.ledger_verify() WHERE check_name = 'trigger')),
 	'>=', 2, 'ledger_verify reports the capture triggers of tables that are not registered');
 my ($iret, $iout, $ierr) = $d->psql('dst', q(INSERT INTO public.ao VALUES (3, 'c')));

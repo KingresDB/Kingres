@@ -239,7 +239,7 @@ foreach my $r (@inh)
 my @catalog_tables = split /\n/, $node->safe_psql('d',
 	q{SELECT 'kingres.' || relname FROM pg_class
 	   WHERE relnamespace = 'kingres'::regnamespace AND relkind = 'r' ORDER BY 1});
-is(scalar(@catalog_tables), 9, 'the reader locks the nine tables of the catalog');
+is(scalar(@catalog_tables), 12, 'the reader locks the twelve tables of the catalog (nine, and the three of client signatures)');
 my $reader = $node->background_psql('d', on_error_stop => 0);
 $reader->query_safe('BEGIN; ' . join('', map { "LOCK TABLE $_ IN ACCESS SHARE MODE; " } @catalog_tables));
 
@@ -415,7 +415,7 @@ foreach my $stmt (
 }
 is($node->safe_psql('d', q{SELECT (SELECT count(*) FROM pg_extension WHERE extname = 'kingres_ledger')
 	|| ' ' || (SELECT count(*) FROM pg_trigger WHERE tgname = 'kingres_ledger_capture')
-	|| ' ' || (SELECT count(*) FROM pg_event_trigger)}), '1 2 3', 'the extension, the capture triggers and the event triggers are all there');
+	|| ' ' || (SELECT count(*) FROM pg_event_trigger)}), '1 5 3', 'the extension, the capture triggers (two tables of the user and the three of client signatures) and the event triggers are all there');
 my ($uret, $uout, $uerr) = $node->psql('d', q{UPDATE docs SET body = 'x'});
 like($uerr, qr/append-only/, 'and the table still refuses an update');
 
