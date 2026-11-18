@@ -2610,6 +2610,33 @@ build to the corrected rule. The verifier's README has the same list with the re
     rollback served to that run was then reported as verified. Skipping only the run's own file would
     not be enough: a run of another state in the same directory would still delete it. The cleanup
     also never removes the file the run was told to use or its lock.
+105. **WORM and the record (6.3, 6.6; adds to 95).** The refusal for a store that does not keep user
+    metadata says what holds for each case: when the header was dropped, a Retry finds the object and
+    accepts it under the wide window, and the evidence says `attempt: null`; when it came back changed
+    or repeated, a Retry is refused for good, a new generation does not help, and only another store
+    or gateway does. The Test button writes its probe with the attempt header and requires the echo,
+    compares the time the store states for the probe with the clock within the tolerance, and tries
+    the retention call on the probe in the configured mode (a warning when it is refused: the repair
+    path needs it); the probe leaves one empty version under `<prefix>/_probe/`, locked for ten
+    minutes. A refusal whose verdict is final (an object that carries its attempt and lies outside its
+    window) fails the record at once, not after three waits. The row of a record holds the start of
+    the first submit and the generation; the payload of a call is built from the record; a new
+    generation is exactly one step with a start later than the old one, written together with the
+    state, and still only an operator's choice. When no version with our bytes passed and the walk
+    over the versions stopped at its bound (25), the error says that our own version may be hidden
+    behind later copies and does not send the operator to a new generation.
+106. **OpenTimestamps: bounds per calendar, memory across a Retry, the age of the table (6.5; adds to
+    96).** The claims kept aside and the memory of dropped claims are bounded for each calendar (8 and
+    32 entries; 128 and 512 in all). A calendar over its own share loses its own surplus claims and
+    never a claim of another calendar; a claim contradicted for the first time is never dropped
+    because a list is full. An answer of one calendar with more than eight Bitcoin attestations is
+    refused whole as an implausible answer of that calendar. A new submission from prior evidence
+    carries the claims kept aside that still name an attestation of a kept fragment, and the claims
+    dropped; a target that can resume from prior evidence says so through an optional interface, and
+    a Retry of a record that holds evidence goes through it. The package gives the age of the newest
+    entry of its table of real headers against a time the caller states; the daemon warns when it is
+    older than a year, and extending the table is a duty of every release (it is older than a year at
+    the time of this correction).
 
 Of section 13: item 2 (test vectors) is settled for signed notes (the example key and note of the
 specification are in the tests; the checkpoint example has no published key), item 3 (entry bundles at
