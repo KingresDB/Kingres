@@ -117,6 +117,16 @@
 #define KL_BUILDER_LOCK_SUBID	0x4B4C
 
 /*
+ * Not a lock of the extension: the mark of the lock that ledger_set_signature_policy
+ * holds on the table whose policy it switches (SHARE ROW EXCLUSIVE, which
+ * writers of the table wait for).  It stands in the list of held locks so that
+ * the timer of the hold limit covers it for a role that is not a superuser, and
+ * it comes first in the order of the locks, like the lock on the table of
+ * ledger_enable.  Nothing waits on this number.
+ */
+#define KL_POLICY_HOLD_SUBID	0x4B4B
+
+/*
  * The locks that serialise the allocation of the identifiers of the registry
  * (KL_REGISTRY_LOCK_SUBID: ledger_enable and ledger_register_table),
  * of the recorded verifications (KL_VERIFY_LOCK_SUBID) and of the records of
@@ -223,6 +233,9 @@ kl_put_u64(uint8 *p, uint64 v)
 /* capture.c */
 extern void kl_capture_init(void);
 
+/* capture.c */
+extern void kl_seed_required(int32 table_id, const int32 *seqs, int nseqs);
+
 /* worker.c */
 extern void kl_worker_init(void);
 extern void kl_mark_dirty(Oid dboid);
@@ -258,6 +271,7 @@ extern void kl_lock_extension_object(int subid);
 extern void kl_lock_for_manual_write(Relation rel);
 extern HeapTuple kl_manual_write_identifier(Relation rel, HeapTuple tuple);
 extern void kl_hold_credit(TimestampTz began);
+extern void kl_lock_table_for_policy(Oid relid);
 extern void kl_enable_batch_pause(void);
 extern void kl_require_own_statement(const char *fname);
 extern void kl_check_lock_order(int subid);

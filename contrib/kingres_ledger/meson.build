@@ -2,6 +2,7 @@
 
 kingres_ledger_sources = files(
   'src/capture.c',
+  'src/ed25519_check.c',
   'src/guard.c',
   'src/history.c',
   'src/kingres_ledger.c',
@@ -109,6 +110,10 @@ tests += {
       't/033_attest_concurrency.pl',
       't/034_internal_tables.pl',
       't/035_no_openssl.pl',
+      't/036_policy_switch.pl',
+      't/037_attest_savepoints.pl',
+      't/038_public_key_check.pl',
+      't/039_signature_paths.pl',
     ],
   },
 }

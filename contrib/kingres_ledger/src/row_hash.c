@@ -43,6 +43,7 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/memutils.h"
+#include "utils/snapmgr.h"
 #include "utils/typcache.h"
 
 #include "kingres_ledger.h"
@@ -78,12 +79,20 @@ static bool kl_utf8_prepared = false;
  * registration that was rolled back to a savepoint, finding L2-05).  A
  * lookup that finds nothing (a table that is not registered yet) is not
  * stored, so a registration made later in the same transaction is found.
+ *
+ * The signature policy is the exception to "true once, true for as long as":
+ * it goes from optional to required.  It is kept only in an answer that a
+ * writer asked for with its lock on the table held (kl_lookup_id), and the
+ * switch cannot commit while any writer holds that lock, so for such an answer
+ * it is true until the transaction ends (L21-02).  The policy that a reader
+ * saw is never kept.
  */
 typedef struct KlIdEntry
 {
 	Oid			relid;			/* hash key */
 	int32		table_id;
 	bool		required;		/* signature_policy is required */
+	bool		policy_known;	/* "required" was read for a writer (kl_lookup_id) */
 } KlIdEntry;
 
 typedef struct KlHistEntry
@@ -92,6 +101,7 @@ typedef struct KlHistEntry
 	int32		table_id;
 	Oid			history;
 	bool		required;
+	bool		policy_known;
 } KlHistEntry;
 
 static MemoryContext kl_cache_cxt = NULL;
@@ -102,6 +112,7 @@ static HTAB *kl_hist_hash = NULL;
 static Oid	kl_last_relid = InvalidOid;
 static int32 kl_last_table_id = 0;
 static bool kl_last_required = false;
+static bool kl_last_policy_known = false;
 
 /* Saved plan of the table_id lookup. */
 static SPIPlanPtr kl_lookup_plan = NULL;
@@ -140,61 +151,52 @@ kl_table_cache_reset(void)
 	kl_id_hash = NULL;
 	kl_hist_hash = NULL;
 	kl_last_relid = InvalidOid;
+	kl_last_policy_known = false;
 }
 
 /*
- * kl_lookup_table_id
- *		Find the ledger table_id of a relation through kingres.ledger_table.
- *		Returns -1 when the relation is not under ledger control.
- *
- * The query is fully qualified and uses OPERATOR(pg_catalog.=) so that no
- * object of a schema earlier in the search_path can capture it.
+ * kl_push_latest
+ *		Make the snapshot that sees everything committed now the active one, for
+ *		the one read that needs it (the signature policy of a table, below, and
+ *		ledger_attest for the key).  Returns whether a snapshot was pushed, which
+ *		the caller pops: without an active snapshot there is nothing to replace.
  */
-int32
-kl_lookup_table_id(Oid relid)
+bool
+kl_push_latest(void)
 {
-	bool		required;
-
-	return kl_lookup_table_id_policy(relid, &required);
+	if (!ActiveSnapshotSet())
+		return false;
+	PushActiveSnapshot(GetLatestSnapshot());
+	return true;
 }
 
 /*
- * kl_lookup_table_id_policy
- *		The same, and whether the table has the signature policy "required"
- *		(0.3 part B).  The policy is read by the statement that reads the
- *		identity, from the row as JSON, so that the one statement serves every
- *		version of the SQL: the registry of 0.1 and 0.2 has no such column and
- *		its answer is "not required".  It is kept with the identity for the rest
- *		of the transaction; ledger_set_signature_policy drops the cache when it
- *		changes the policy, and the abort of a subtransaction drops it as it
- *		does the identities.
+ * kl_query_id
+ *		Run the lookup of the identity of a relation in the registry: its
+ *		table_id (-1 when it is not registered) and whether its signature
+ *		policy is "required".  The query is fully qualified and uses
+ *		OPERATOR(pg_catalog.=) so that no object of a schema earlier in the
+ *		search_path can capture it.  The policy is read from the row as JSON, so
+ *		that the one statement serves every version of the SQL: the registry of
+ *		0.1 and 0.2 has no such column and its answer is "not required".
+ *
+ *		"latest" reads with the snapshot of now and not the transaction's.  The
+ *		policy is read that way and no other (L21-02): the switch of a policy
+ *		commits while the switching transaction holds a lock on the table that
+ *		every writer of the table waits for, so a writer that has the lock reads
+ *		the policy that is in force until its transaction ends, and only a
+ *		snapshot that is not older than the lock says so; the snapshot of a
+ *		REPEATABLE READ or SERIALIZABLE transaction may be older than the commit
+ *		of the switch.
  */
-int32
-kl_lookup_table_id_policy(Oid relid, bool *required)
+static void
+kl_query_id(Oid relid, bool latest, int32 *table_id, bool *required)
 {
 	Datum		values[1];
 	int32		result = -1;
 	bool		req = false;
+	bool		pushed;
 	int			rc;
-
-	if (OidIsValid(relid) && relid == kl_last_relid)
-	{
-		*required = kl_last_required;
-		return kl_last_table_id;
-	}
-	if (kl_id_hash != NULL)
-	{
-		KlIdEntry  *hit = hash_search(kl_id_hash, &relid, HASH_FIND, NULL);
-
-		if (hit != NULL)
-		{
-			kl_last_relid = relid;
-			kl_last_table_id = hit->table_id;
-			kl_last_required = hit->required;
-			*required = hit->required;
-			return hit->table_id;
-		}
-	}
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
@@ -219,7 +221,10 @@ kl_lookup_table_id_policy(Oid relid, bool *required)
 	}
 
 	values[0] = ObjectIdGetDatum(relid);
+	pushed = latest && kl_push_latest();
 	rc = SPI_execute_plan(kl_lookup_plan, values, NULL, true, 1);
+	if (pushed)
+		PopActiveSnapshot();
 	if (rc != SPI_OK_SELECT)
 		elog(ERROR, "SPI_execute_plan failed: %s", SPI_result_code_string(rc));
 
@@ -236,37 +241,144 @@ kl_lookup_table_id_policy(Oid relid, bool *required)
 			req = DatumGetBool(d);
 	}
 	SPI_finish();
-
-	if (result >= 0)
-	{
-		/*
-		 * A transaction that writes one table keeps one answer and builds no
-		 * hash table (the cost of a table per transaction would show in a
-		 * workload of single-row transactions); the second table makes the
-		 * hash, which then holds the first answer too.
-		 */
-		if (OidIsValid(kl_last_relid) && kl_last_relid != relid)
-		{
-			KlIdEntry  *ent;
-
-			if (kl_id_hash == NULL)
-			{
-				kl_id_hash = kl_cache_create("kingres_ledger table ids",
-											 sizeof(KlIdEntry));
-				ent = hash_search(kl_id_hash, &kl_last_relid, HASH_ENTER, NULL);
-				ent->table_id = kl_last_table_id;
-				ent->required = kl_last_required;
-			}
-			ent = hash_search(kl_id_hash, &relid, HASH_ENTER, NULL);
-			ent->table_id = result;
-			ent->required = req;
-		}
-		kl_last_relid = relid;
-		kl_last_table_id = result;
-		kl_last_required = req;
-	}
+	*table_id = result;
 	*required = req;
+}
+
+/*
+ * kl_store_id
+ *		Keep an answer for the rest of the transaction.  A transaction that
+ *		writes one table keeps one answer and builds no hash table (the cost of a
+ *		table per transaction would show in a workload of single-row
+ *		transactions); the second table makes the hash, which then holds the
+ *		first answer too.  "known" says that the policy in the answer was read
+ *		for a writer, with the latest snapshot (see kl_lookup_table_id).
+ */
+static void
+kl_store_id(Oid relid, int32 table_id, bool required, bool known)
+{
+	if (OidIsValid(kl_last_relid) && kl_last_relid != relid)
+	{
+		KlIdEntry  *ent;
+
+		if (kl_id_hash == NULL)
+			kl_id_hash = kl_cache_create("kingres_ledger table ids",
+										 sizeof(KlIdEntry));
+		ent = hash_search(kl_id_hash, &kl_last_relid, HASH_ENTER, NULL);
+		ent->table_id = kl_last_table_id;
+		ent->required = kl_last_required;
+		ent->policy_known = kl_last_policy_known;
+		ent = hash_search(kl_id_hash, &relid, HASH_ENTER, NULL);
+		ent->table_id = table_id;
+		ent->required = required;
+		ent->policy_known = known;
+	}
+	else if (kl_id_hash != NULL)
+	{
+		KlIdEntry  *ent = hash_search(kl_id_hash, &relid, HASH_ENTER, NULL);
+
+		ent->table_id = table_id;
+		ent->required = required;
+		ent->policy_known = known;
+	}
+	kl_last_relid = relid;
+	kl_last_table_id = table_id;
+	kl_last_required = required;
+	kl_last_policy_known = known;
+}
+
+/*
+ * kl_lookup_id
+ *		The identity of a relation in the registry, from the transaction's cache
+ *		or from the registry.  Returns -1 when the relation is not under ledger
+ *		control (not stored: a registration made later in the same transaction
+ *		is found).
+ *
+ *		With "with_policy" the answer also says whether the table has the
+ *		signature policy "required", and the policy is only taken from an answer
+ *		that was read for it: with the latest snapshot, by a caller that holds a
+ *		lock on the table (the capture trigger holds ROW EXCLUSIVE from the
+ *		statement that wrote the row to the end of the transaction, and
+ *		ledger_set_signature_policy waits for every holder of it, so the policy
+ *		cannot change while the answer is kept; L21-02).  A caller that does not
+ *		hold such a lock (ledger_row_hash, ledger_attest, the readers) asks
+ *		without the policy and never stores one: an answer that it read could be
+ *		out of date by the time the same transaction writes the table.
+ */
+static int32
+kl_lookup_id(Oid relid, bool with_policy, bool *required)
+{
+	int32		result;
+	bool		req;
+
+	*required = false;
+	if (OidIsValid(relid) && relid == kl_last_relid &&
+		(!with_policy || kl_last_policy_known))
+	{
+		*required = kl_last_required;
+		return kl_last_table_id;
+	}
+	if (kl_id_hash != NULL)
+	{
+		KlIdEntry  *hit = hash_search(kl_id_hash, &relid, HASH_FIND, NULL);
+
+		if (hit != NULL && (!with_policy || hit->policy_known))
+		{
+			kl_last_relid = relid;
+			kl_last_table_id = hit->table_id;
+			kl_last_required = hit->required;
+			kl_last_policy_known = hit->policy_known;
+			*required = hit->required;
+			return hit->table_id;
+		}
+	}
+
+	kl_query_id(relid, with_policy, &result, &req);
+	if (result >= 0)
+		kl_store_id(relid, result, with_policy && req, with_policy);
+	*required = with_policy && req;
 	return result;
+}
+
+/*
+ * kl_lookup_table_id
+ *		Find the ledger table_id of a relation through kingres.ledger_table.
+ *		Returns -1 when the relation is not under ledger control.
+ */
+int32
+kl_lookup_table_id(Oid relid)
+{
+	bool		required;
+
+	return kl_lookup_id(relid, false, &required);
+}
+
+/*
+ * kl_lookup_table_id_policy
+ *		The same, and whether the table has the signature policy "required"
+ *		(0.3 part B).  For the capture trigger of the table, which holds a lock on
+ *		it (see kl_lookup_id); the answer is kept for the rest of the
+ *		transaction, ledger_set_signature_policy drops it when it changes the
+ *		policy in the same transaction, and the abort of a subtransaction drops
+ *		it as it does the identities (the lock may have gone with the
+ *		subtransaction).
+ */
+int32
+kl_lookup_table_id_policy(Oid relid, bool *required)
+{
+	return kl_lookup_id(relid, true, required);
+}
+
+/*
+ * kl_read_policy
+ *		The registry's answer for a relation as of now, read with the latest
+ *		snapshot and not stored: for ledger_set_signature_policy, after it has
+ *		the lock on the table.  table_id is -1 when the table is not registered.
+ */
+void
+kl_read_policy(Oid relid, int32 *table_id, bool *required)
+{
+	kl_query_id(relid, true, table_id, required);
 }
 
 /*
@@ -488,36 +600,26 @@ kl_is_history_column(const char *name)
 }
 
 /*
- * kl_lookup_history
- *		The history table of the ledger table "relid" and its table_id.
- *		Returns the OID of the history table, or InvalidOid when the table is
- *		append-only.  Raises an error when the table is not registered.  The
- *		query is fully qualified so that no object of a schema earlier in the
- *		search_path can capture it.
+ * kl_lookup_hist
+ *		The core of kl_lookup_history and kl_lookup_history_policy; the rules of
+ *		the policy are those of kl_lookup_id.
  */
-Oid
-kl_lookup_history(Oid relid, int32 *table_id)
-{
-	bool		required;
-
-	return kl_lookup_history_policy(relid, table_id, &required);
-}
-
-/* The same, and whether the table has the signature policy "required". */
-Oid
-kl_lookup_history_policy(Oid relid, int32 *table_id, bool *required)
+static Oid
+kl_lookup_hist(Oid relid, bool with_policy, int32 *table_id, bool *required)
 {
 	Datum		values[1];
 	Oid			history = InvalidOid;
 	int32		tid = -1;
 	bool		req = false;
+	bool		pushed;
 	int			rc;
 
+	*required = false;
 	if (kl_hist_hash != NULL)
 	{
 		KlHistEntry *hit = hash_search(kl_hist_hash, &relid, HASH_FIND, NULL);
 
-		if (hit != NULL)
+		if (hit != NULL && (!with_policy || hit->policy_known))
 		{
 			*table_id = hit->table_id;
 			*required = hit->required;
@@ -546,7 +648,10 @@ kl_lookup_history_policy(Oid relid, int32 *table_id, bool *required)
 		kl_hist_plan = plan;
 	}
 	values[0] = ObjectIdGetDatum(relid);
+	pushed = with_policy && kl_push_latest();
 	rc = SPI_execute_plan(kl_hist_plan, values, NULL, true, 1);
+	if (pushed)
+		PopActiveSnapshot();
 	if (rc != SPI_OK_SELECT)
 		elog(ERROR, "SPI_execute_plan failed: %s", SPI_result_code_string(rc));
 	if (SPI_processed == 1)
@@ -582,11 +687,38 @@ kl_lookup_history_policy(Oid relid, int32 *table_id, bool *required)
 		ent = hash_search(kl_hist_hash, &relid, HASH_ENTER, NULL);
 		ent->table_id = tid;
 		ent->history = history;
-		ent->required = req;
+		ent->required = with_policy && req;
+		ent->policy_known = with_policy;
 	}
 	*table_id = tid;
-	*required = req;
+	*required = with_policy && req;
 	return history;
+}
+
+/*
+ * kl_lookup_history
+ *		The history table of the ledger table "relid" and its table_id.
+ *		Returns the OID of the history table, or InvalidOid when the table is
+ *		append-only.  Raises an error when the table is not registered.  The
+ *		query is fully qualified so that no object of a schema earlier in the
+ *		search_path can capture it.
+ */
+Oid
+kl_lookup_history(Oid relid, int32 *table_id)
+{
+	bool		required;
+
+	return kl_lookup_hist(relid, false, table_id, &required);
+}
+
+/*
+ * The same, and whether the table has the signature policy "required": for the
+ * capture trigger, which holds a lock on the table (see kl_lookup_id).
+ */
+Oid
+kl_lookup_history_policy(Oid relid, int32 *table_id, bool *required)
+{
+	return kl_lookup_hist(relid, true, table_id, required);
 }
 
 /*

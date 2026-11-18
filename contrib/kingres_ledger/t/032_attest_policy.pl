@@ -468,29 +468,48 @@ db(q{SELECT kingres.ledger_build_block()});
 is(db(q{SELECT count(*) FROM kingres.ledger_verify()}), '0', 'the ledger verifies after all that');
 
 #--------------------------------------------------------------------------
-# The policy is read again when it changes inside the transaction
+# The policy is read again when it changes inside the transaction, and the rows
+# written before the switch in that transaction are owed an attestation (L21-04)
 #--------------------------------------------------------------------------
 {
+	my $hl1 = db(q{SELECT encode(kingres.ledger_row_hash(ROW(1)::late), 'hex')});
 	my $hl2 = db(q{SELECT encode(kingres.ledger_row_hash(ROW(2)::late), 'hex')});
+	# The switch takes a lock that every writer of the table waits for, so a role that is not a
+	# superuser makes it as a statement of its own (L21-02); a superuser may do it inside a block.
+	my $su = $node->background_psql('d', on_error_stop => 0);
+	$su->query_safe(q{\set VERBOSITY sqlstate});
+	$app->query_safe('BEGIN');
+	is(failure_of($app, q{SELECT kingres.ledger_set_signature_policy('late', 'required')}), '25001',
+		'a role that is not a superuser cannot switch the policy inside a transaction block');
+	$app->query_safe('ROLLBACK');
 	my $go = sub {
-		my ($attest) = @_;
-		$app->query_safe('BEGIN');
-		$app->query_safe(q{INSERT INTO late VALUES (1)});	# the policy is optional: not owed
-		$app->query_safe(q{SELECT kingres.ledger_set_signature_policy('late', 'required')});
-		$app->query_safe(q{INSERT INTO late VALUES (2)});	# after the switch: owed
-		$app->query_safe(attest_sql($k2, 'late', 'I', $hl2)) if $attest;
+		my (@attest) = @_;			# the hashes of the rows to attest
+		$su->query_safe('BEGIN');
+		$su->query_safe(q{INSERT INTO late VALUES (1)});	# written before the switch in this transaction
+		$su->query_safe(q{SELECT kingres.ledger_set_signature_policy('late', 'required')});
+		$su->query_safe(q{INSERT INTO late VALUES (2)});	# after the switch
+		if (@attest)
+		{
+			$su->query_safe(q{SET LOCAL ROLE app});		# the key k2 is for the role app
+			$su->query_safe(attest_sql($k2, 'late', 'I', $_)) for @attest;
+		}
 	};
-	$go->(0);
-	is(failure_of($app, 'COMMIT'), 'KL010',
+	$go->();
+	is(failure_of($su, 'COMMIT'), 'KL010',
 		'a row written after the switch, in the transaction that made it, is owed an attestation (the policy that the transaction had read is read again)');
 	is(db(q{SELECT signature_policy FROM kingres.ledger_table WHERE relid = 'late'::regclass}), 'optional',
 		'and the switch went with the transaction');
-	$go->(1);
-	$app->query_safe('COMMIT');
-	is(db(q{SELECT count(*) FROM late}), '2', 'with the attestation of that row the transaction commits (the row before the switch is not owed one)');
+	$go->($hl2);
+	is(failure_of($su, 'COMMIT'), 'KL010',
+		'the row written before the switch in the same transaction is owed an attestation too (L21-04): the one after the switch is not enough');
+	$go->($hl1, $hl2);
+	$su->query_safe('COMMIT');
+	$su->quit;
+	is(db(q{SELECT count(*) FROM late}), '2', 'with the attestations of both rows the transaction commits');
+	is(db(q{SELECT signature_policy FROM kingres.ledger_table WHERE relid = 'late'::regclass}), 'required', 'and the policy is switched');
 	db(q{SELECT kingres.ledger_build_block()});
 	is(db(q{SELECT count(*) FROM kingres.ledger_verify() WHERE check_name = 'unattested_entry'}), '0',
-		'and ledger_verify asks for nothing of the transaction that switched the policy, for the row before the switch');
+		'and ledger_verify has nothing to report of it');
 }
 
 #--------------------------------------------------------------------------

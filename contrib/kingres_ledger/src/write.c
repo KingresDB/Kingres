@@ -59,6 +59,7 @@
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lmgr.h"
+#include "storage/proc.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/array.h"
@@ -253,7 +254,7 @@ kl_require_own_statement(const char *fname)
  * transaction holds, so a lock that is granted later, or earlier in the order,
  * has the limit alone.
  */
-#define KL_HOLD_LOCKS 4
+#define KL_HOLD_LOCKS 5
 
 typedef struct KlHeld
 {
@@ -283,6 +284,8 @@ kl_lock_name(int subid)
 {
 	switch (subid)
 	{
+		case KL_POLICY_HOLD_SUBID:
+			return "lock on the table of a signature policy";
 		case KL_BUILDER_LOCK_SUBID:
 			return "block builders' lock";
 		case KL_REGISTRY_LOCK_SUBID:
@@ -335,7 +338,7 @@ static void
 kl_hold_relist(void)
 {
 	static const int order[KL_HOLD_LOCKS] = {
-		KL_BUILDER_LOCK_SUBID, KL_REGISTRY_LOCK_SUBID,
+		KL_POLICY_HOLD_SUBID, KL_BUILDER_LOCK_SUBID, KL_REGISTRY_LOCK_SUBID,
 		KL_VERIFY_LOCK_SUBID, KL_REMOVED_LOCK_SUBID
 	};
 	int			o;
@@ -705,6 +708,93 @@ kl_lock_extension_object(int subid)
 					   get_extension_oid(KL_EXTENSION_NAME, false),
 					   subid, ExclusiveLock);
 	kl_hold_note(subid);
+}
+
+/*
+ * kl_lock_table_for_policy
+ *		Take SHARE ROW EXCLUSIVE on a ledger table for ledger_set_signature_policy
+ *		(L21-02: it orders the switch with the writers of the table, see sign.c),
+ *		under the rules that every lock of the extension follows:
+ *
+ *		- the caller has made kl_require_own_statement for a role that is not a
+ *		  superuser, so the lock is held for the time of one statement, and the
+ *		  timer of kingres_ledger.lock_hold_limit covers that statement (the lock
+ *		  is entered in the list of held locks as KL_POLICY_HOLD_SUBID);
+ *		- the wait for the writers is bounded for such a role by the same limit
+ *		  (a lock_timeout of that length, or the role's own when it is shorter):
+ *		  a transaction that stays open after its write must not be able to make
+ *		  a switch that is queued for it, and with it every later writer of the
+ *		  table, wait for ever; the error says what to do;
+ *		- a transaction that holds a lock of the extension does not wait for a
+ *		  table: a writer that holds the table and waits for the extension's lock
+ *		  would make a deadlock, so the call is refused with the order error, as
+ *		  ledger_enable's table lock is (a table that the transaction holds
+ *		  already, ledger_enable of the same transaction for one, is not waited
+ *		  for and passes);
+ *		- it takes no lock of the extension, so neither the block builder nor the
+ *		  capture waits for it: the capture of the writes of other tables does not
+ *		  touch this table's lock, and the capture of this table's writers is what
+ *		  waits, as for any lock that its owner takes on it.
+ */
+void
+kl_lock_table_for_policy(Oid relid)
+{
+	bool		limited = kl_lock_hold_limit > 0 && !superuser_arg(GetOuterUserId());
+
+	if (!ConditionalLockRelationOid(relid, ShareRowExclusiveLock))
+	{
+		int			i;
+
+		for (i = 0; i < kl_nheld; i++)
+			if (kl_held[i].subid != KL_POLICY_HOLD_SUBID)
+				ereport(ERROR,
+						(errcode(ERRCODE_KL_LOCK_ORDER),
+						 errmsg("cannot wait for the lock on table \"%s\": this transaction holds the %s of the ledger extension",
+								get_rel_name(relid), kl_lock_name(kl_held[i].subid)),
+						 errdetail("A writer of the table that waits for that lock while this transaction waits for the writer would be a deadlock; the lock on the table comes first in the order of the locks."),
+						 errhint("Call ledger_set_signature_policy before the other calls of the extension, or in a transaction of its own.")));
+
+		if (limited && (LockTimeout == 0 || LockTimeout > kl_lock_hold_limit))
+		{
+			/* The setting goes back with the end of the transaction, or at once below. */
+			int			nest = NewGUCNestLevel();
+			char		buf[32];
+			MemoryContext oldcxt = CurrentMemoryContext;
+
+			snprintf(buf, sizeof(buf), "%d", kl_lock_hold_limit);
+			(void) set_config_option("lock_timeout", buf, PGC_USERSET, PGC_S_SESSION,
+									 GUC_ACTION_SAVE, true, 0, false);
+			PG_TRY();
+			{
+				LockRelationOid(relid, ShareRowExclusiveLock);
+			}
+			PG_CATCH();
+			{
+				ErrorData  *edata;
+
+				MemoryContextSwitchTo(oldcxt);
+				edata = CopyErrorData();
+
+				if (edata->sqlerrcode == ERRCODE_LOCK_NOT_AVAILABLE)
+				{
+					FlushErrorState();
+					ereport(ERROR,
+							(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+							 errmsg("could not switch the signature policy of table \"%s\": its writers did not finish in time",
+									get_rel_name(relid)),
+							 errdetail("The switch waits for every open transaction that has written the table, and a role that is not a superuser waits at most kingres_ledger.lock_hold_limit (%d ms).",
+									   kl_lock_hold_limit),
+							 errhint("Wait for the open transactions of the table to end (pg_stat_activity), or ask a superuser to run the call.")));
+				}
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
+			AtEOXact_GUC(true, nest);
+		}
+		else
+			LockRelationOid(relid, ShareRowExclusiveLock);
+	}
+	kl_hold_note(KL_POLICY_HOLD_SUBID);
 }
 
 /*

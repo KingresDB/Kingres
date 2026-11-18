@@ -26,6 +26,8 @@ extern Oid	kl_lookup_history(Oid relid, int32 *table_id);
 extern Oid	kl_lookup_history_policy(Oid relid, int32 *table_id, bool *required);
 extern int32 kl_lookup_table_id(Oid relid);
 extern int32 kl_lookup_table_id_policy(Oid relid, bool *required);
+extern void kl_read_policy(Oid relid, int32 *table_id, bool *required);
+extern bool kl_push_latest(void);
 extern bool kl_is_history_column(const char *name);
 extern void kl_table_cache_reset(void);
 
