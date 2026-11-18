@@ -7,10 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/internalapi"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pki"
 )
 
 // Keys of the internal calls of the freeze (design ha-phase5-part2.md, 3.1.2).
@@ -66,6 +69,7 @@ func (a *Agent) Freeze(group int32, ttl time.Duration) {
 	}
 	a.mu.Lock()
 	a.frozen[group] = a.Clock.Mono() + ttl
+	a.persistLocked()
 	a.mu.Unlock()
 }
 
@@ -73,6 +77,7 @@ func (a *Agent) Freeze(group int32, ttl time.Duration) {
 func (a *Agent) Unfreeze(group int32) {
 	a.mu.Lock()
 	delete(a.frozen, group)
+	a.persistLocked()
 	a.mu.Unlock()
 }
 
@@ -96,12 +101,14 @@ func (a *Agent) StandbysGone(server string, ttl time.Duration, clear bool) {
 	defer a.mu.Unlock()
 	if clear {
 		delete(a.gone, server)
+		a.persistLocked()
 		return
 	}
 	if ttl <= 0 || ttl > MaxGone {
 		ttl = MaxGone
 	}
 	a.gone[server] = a.Clock.Mono() + ttl
+	a.persistLocked()
 }
 
 // goneServers is the set of servers whose standbys are declared gone and not lapsed.
@@ -196,4 +203,69 @@ func (a *Agent) handleFreezeCall(_ context.Context, key string, body []byte) (an
 // over (a frozen group keeps its list exactly as it is).
 func dropGoneEntry(e Entry, gone map[string]bool, frozen bool) bool {
 	return !frozen && gone[e.Server]
+}
+
+// freezeFileName is the file in the data directory that keeps the freezes and the "gone" servers across a restart of
+// kingresd (FO-12): a restart on the primary's server that forgot a freeze would let the list be emptied after the
+// grace while the failover is still being decided.
+const freezeFileName = "failover-freeze.json"
+
+// freezeFile holds the wall-clock end of each entry in milliseconds (the monotonic clock does not survive a restart).
+// An entry whose end has passed by the wall clock when the file is read is dropped; one that is still in force gets
+// the rest of its time on the monotonic clock. A wall clock that was set forward ends a freeze early: the task
+// that decides a failover renews its freeze and checks the state (/failover/state) before it acts.
+type freezeFile struct {
+	Frozen map[int32]int64  `json:"frozen,omitempty"`
+	Gone   map[string]int64 `json:"gone,omitempty"`
+}
+
+// persistLocked writes the freezes and the gone servers that have not lapsed. The caller holds a.mu.
+func (a *Agent) persistLocked() {
+	if a.DataDir == "" {
+		return
+	}
+	now := a.Clock.Mono()
+	wall := time.Now()
+	f := freezeFile{Frozen: map[int32]int64{}, Gone: map[string]int64{}}
+	for g, until := range a.frozen {
+		if until > now {
+			f.Frozen[g] = wall.Add(until - now).UnixMilli()
+		}
+	}
+	for s, until := range a.gone {
+		if until > now {
+			f.Gone[s] = wall.Add(until - now).UnixMilli()
+		}
+	}
+	b, _ := json.Marshal(f)
+	if err := pki.WriteFile(filepath.Join(a.DataDir, freezeFileName), b, 0o600); err != nil && a.Log != nil {
+		a.Log.Warn("standby: recording the freezes", "error", err)
+	}
+}
+
+// loadFreezes reads the file at the start of the agent.
+func (a *Agent) loadFreezes() {
+	if a.DataDir == "" {
+		return
+	}
+	b, err := os.ReadFile(filepath.Join(a.DataDir, freezeFileName)) //nolint:gosec // fixed name in the data directory
+	if err != nil {
+		return
+	}
+	var f freezeFile
+	if json.Unmarshal(b, &f) != nil {
+		return
+	}
+	now := a.Clock.Mono()
+	wall := time.Now()
+	for g, end := range f.Frozen {
+		if rest := time.UnixMilli(end).Sub(wall); rest > 0 {
+			a.frozen[g] = now + min(rest, MaxFreeze)
+		}
+	}
+	for s, end := range f.Gone {
+		if rest := time.UnixMilli(end).Sub(wall); rest > 0 {
+			a.gone[s] = now + min(rest, MaxGone)
+		}
+	}
 }

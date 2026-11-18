@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/anchor"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/anchor/worm"
@@ -25,14 +26,14 @@ func TestIndependentVerifierOfStoredEvidence(t *testing.T) {
 	root := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32))
 	sig := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 68))
 	note := []byte("kingres.example/agg\n17\n" + root + "\n\n" + string(rune(0x2014)) + " kingres.example/agg " + sig + "\n")
-	p, err := anchor.NewPayload("ab12", note)
+	p, err := anchor.NewPayload("ab12", note, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(note)
 	ev := fmt.Sprintf(`{"endpoint":"https://s3.example.net","bucket":"anchors","key":"kingres-anchors/ab12/00000000000000000017.note",`+
 		`"version_id":"3HL4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY","etag":"\"0123456789abcdef\"","object_sha256":"%s","content_length":%d,`+
-		`"lock_mode":"COMPLIANCE","retain_until":"2036-12-01T10:00:00Z","last_modified":"2026-12-01T10:00:01Z","recorded_by":"cluster"}`,
+		`"lock_mode":"COMPLIANCE","retain_until":"2036-12-01T10:00:00Z","last_modified":"2026-12-01T10:00:01Z","submit_start":"2026-12-01T10:00:00Z","attempt":null,"generation":0,"found":false,"recorded_by":"cluster"}`,
 		hex.EncodeToString(sum[:]), len(note))
 	file := fmt.Sprintf(`{"format":1,"kind":"worm","origin":"kingres.example/agg","size":17,"payload_sha256":"%s","created_at":"2026-12-01T10:00:05Z","evidence":%s}`, p.DigestHex(), ev)
 

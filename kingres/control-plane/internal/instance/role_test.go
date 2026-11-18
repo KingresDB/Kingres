@@ -49,7 +49,7 @@ func TestRoleFileAndDefaults(t *testing.T) {
 	if err != nil || !exists || !r.Writable() || !m.IsCopy(103) || !m.IsWritable(103) || r.Term != 4 {
 		t.Fatalf("after the promotion: %+v %v %v", r, exists, err)
 	}
-	// Garbage is an error and MustRole falls back to the safe side only for a directory from 100 up.
+	// Garbage is an error and MustRole says unknown: neither writable, nor a standby, nor a copy (FO-09).
 	dir, _ := m.Dir(103)
 	if err := os.WriteFile(filepath.Join(dir, RoleFileName), []byte("{not json"), 0o600); err != nil {
 		t.Fatal(err)
@@ -57,8 +57,8 @@ func TestRoleFileAndDefaults(t *testing.T) {
 	if _, _, err := m.RoleOf(103); err == nil {
 		t.Fatal("a broken role file must be an error")
 	}
-	if m.IsWritable(103) {
-		t.Fatal("an unreadable role file of a directory from 100 up must not make it writable")
+	if u := m.MustRole(103); m.IsWritable(103) || u.IsStandby() || m.IsCopy(103) || u.Role != RoleUnknown {
+		t.Fatalf("an unreadable role file must be unknown, not the default of its id: %+v", u)
 	}
 	if err := m.WriteRole(1, Role{Group: 0, Role: "leader", Origin: OriginOwn}); err == nil {
 		t.Fatal("a role other than primary or standby must be refused")

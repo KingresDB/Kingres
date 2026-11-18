@@ -30,7 +30,7 @@ func root32() []byte { return []byte(strings.Repeat("r", 32)) }
 
 func TestNewPayload(t *testing.T) {
 	n := note("17", root32(), sigLine)
-	p, err := NewPayload("ab12", n)
+	p, err := NewPayload("ab12", n, t0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func TestNewPayload(t *testing.T) {
 		t.Fatal("hex")
 	}
 	// two signature lines are fine
-	if _, err := NewPayload("ab", note("1", root32(), sigLine+sigLine)); err != nil {
+	if _, err := NewPayload("ab", note("1", root32(), distinctSigs(2)), t0); err != nil {
 		t.Fatal(err)
 	}
 	// the payload does not alias the input
@@ -65,7 +65,6 @@ func TestNewPayloadRejects(t *testing.T) {
 		"sign":            note("+1", r, sigLine),
 		"huge-size":       note("18446744073709551616", r, sigLine),
 		"short-root":      note("1", r[:31], sigLine),
-		"extension-line":  []byte("o\n1\n" + base64.StdEncoding.EncodeToString(r) + "\nextra\n\n" + sigLine),
 		"two-lines":       []byte("o\n1\n\n" + sigLine),
 		"empty-origin":    []byte("\n1\n" + base64.StdEncoding.EncodeToString(r) + "\n\n" + sigLine),
 		"space-in-origin": []byte("o r\n1\n" + base64.StdEncoding.EncodeToString(r) + "\n\n" + sigLine),
@@ -76,36 +75,24 @@ func TestNewPayloadRejects(t *testing.T) {
 	}
 	bad["long-origin"] = []byte(strings.Repeat("o", MaxOriginLen+1) + "\n1\n" + base64.StdEncoding.EncodeToString(r) + "\n\n" + sigLine)
 	for name, n := range bad {
-		if _, err := NewPayload("ab", n); err == nil {
+		if _, err := NewPayload("ab", n, t0); err == nil {
 			t.Errorf("%s accepted", name)
 		}
 	}
 	for _, id := range []string{"", "AB", "xyz", strings.Repeat("a", 129)} {
-		if _, err := NewPayload(id, note("1", r, sigLine)); err == nil {
+		if _, err := NewPayload(id, note("1", r, sigLine), t0); err == nil {
 			t.Errorf("aggregate id %q accepted", id)
 		}
 	}
 	// boundaries: a note of exactly MaxSignedNote bytes, and one more
-	pad := func(n int) []byte {
-		b := note("1", r, sigLine)
-		for len(b) < n {
-			b = append(b, []byte(sigLine)...)
-		}
-		return b
+	b := sizedNote(MaxSignedNote)
+	if len(b) != MaxSignedNote {
+		t.Fatalf("test setup: %d", len(b))
 	}
-	b := note("1", r, sigLine)
-	line := []byte(sigLine)
-	for len(b)+len(line) <= MaxSignedNote {
-		b = append(b, line...)
-	}
-	_ = pad
-	if len(b) > MaxSignedNote {
-		t.Fatal("test setup")
-	}
-	if _, err := NewPayload("ab", b); err != nil {
+	if _, err := NewPayload("ab", b, t0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewPayload("ab", append(b, line...)); err == nil {
+	if _, err := NewPayload("ab", sizedNote(MaxSignedNote+1), t0); err == nil {
 		t.Fatal("note over the limit accepted")
 	}
 }
@@ -151,19 +138,42 @@ func TestRecordFlow(t *testing.T) {
 func TestExpiryAndRetry(t *testing.T) {
 	r := NewRecord(1, "agg", 5, [32]byte{}, t0)
 	r.State = StateSubmitted
-	if _, did := r.ExpireIfDue(t0.Add(7*24*time.Hour-time.Second), 7*24*time.Hour); did {
+	if _, did := r.ExpireIfDue(t0.Add(7*24*time.Hour-time.Second), 7*24*time.Hour, 28*24*time.Hour); did {
 		t.Fatal("expired early")
 	}
-	e, did := r.ExpireIfDue(t0.Add(7*24*time.Hour), 7*24*time.Hour)
+	e, did := r.ExpireIfDue(t0.Add(7*24*time.Hour), 7*24*time.Hour, 28*24*time.Hour)
 	if !did || e.State != StateExpired {
 		t.Fatal("not expired")
 	}
+	// A2-02: a claimed record has its own, longer timeout: it does not expire
+	// with the submitted one, and it does at its own
+	c := NewRecord(1, "agg", 5, [32]byte{}, t0)
+	c.State = StateClaimed
+	if _, did := c.ExpireIfDue(t0.Add(7*24*time.Hour), 7*24*time.Hour, 28*24*time.Hour); did {
+		t.Fatal("claimed record expired with the submitted timeout")
+	}
+	if _, did := c.ExpireIfDue(t0.Add(28*24*time.Hour-time.Second), 7*24*time.Hour, 28*24*time.Hour); did {
+		t.Fatal("claimed record expired early")
+	}
+	ce, did := c.ExpireIfDue(t0.Add(28*24*time.Hour), 7*24*time.Hour, 28*24*time.Hour)
+	if !did || ce.State != StateExpired || ce.NextAttemptAt != nil {
+		t.Fatalf("claimed record: %+v", ce)
+	}
+	// a claimed record falls back to submitted on a submitted receipt
+	nc := t0.Add(time.Minute)
+	back, err := c.ApplyReceipt(Receipt{State: ReceiptSubmitted, Evidence: json.RawMessage(`{}`), NextCheck: &nc}, t0)
+	if err != nil || back.State != StateSubmitted || !back.Due(nc) {
+		t.Fatalf("%+v %v", back, err)
+	}
 	p := NewRecord(1, "agg", 5, [32]byte{}, t0)
-	if _, did := p.ExpireIfDue(t0.Add(1000*time.Hour), time.Hour); did {
+	if _, did := p.ExpireIfDue(t0.Add(1000*time.Hour), time.Hour, time.Hour); did {
 		t.Fatal("pending expired")
 	}
-	if _, err := e.Retry(t0); err == nil {
-		t.Fatal("expired retried")
+	// an expired record is retried like a failed one (correction 88), and its
+	// waiting period starts again: CreatedAt is the time of the Retry
+	re, err := e.Retry(t0.Add(30 * 24 * time.Hour))
+	if err != nil || re.State != StatePending || !re.CreatedAt.Equal(t0.Add(30*24*time.Hour)) || !re.Due(t0.Add(30*24*time.Hour)) {
+		t.Fatalf("expired retried: %+v %v", re, err)
 	}
 	f := p
 	f.State, f.Attempts, f.LastError = StateFailed, 4, "x"
@@ -380,6 +390,19 @@ func TestSecretAndRedactor(t *testing.T) {
 	if strings.Contains(got, "hunt") {
 		t.Fatalf("%q", got)
 	}
+	// A2-06: a secret that the text ends in the middle of (a message that the
+	// store itself cut) is trimmed for every cut from all but its last byte
+	// down to its first 4 bytes; a cut of 3 bytes cannot be told from text and
+	// stays (documented: the first three bytes may show)
+	const secret = "hunter2-secret-value"
+	for n := len(secret) - 1; n >= 4; n-- {
+		if got = r.Clean("aaaaaaaa "+secret[:n], 0); got != "aaaaaaaa " {
+			t.Errorf("a secret cut after %d bytes leaves %q", n, got)
+		}
+	}
+	if got = r.Clean("aaaaaaaa "+secret[:3], 0); got != "aaaaaaaa hun" {
+		t.Errorf("a cut of 3 bytes: %q", got)
+	}
 	for _, o := range []string{fmt.Sprintf("%v", r), fmt.Sprintf("%+v", r), fmt.Sprintf("%#v", r)} {
 		if strings.Contains(o, "hunter2") {
 			t.Fatalf("redactor leaks: %q", o)
@@ -405,4 +428,14 @@ func TestTestResult(t *testing.T) {
 	if !strings.Contains(string(j), `"status":"failed"`) {
 		t.Fatal(string(j))
 	}
+}
+
+// distinctSigs returns n signature lines that differ in their key id (the
+// verifier refuses two lines with the same name and key id).
+func distinctSigs(n int) string {
+	var sb strings.Builder
+	for i := 0; i < n; i++ {
+		sb.WriteString("\xe2\x80\x94 kingres.example/agg " + base64.StdEncoding.EncodeToString([]byte{0, 0, byte(i >> 8), byte(i)}) + "\n")
+	}
+	return sb.String()
 }

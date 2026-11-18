@@ -124,33 +124,37 @@ func (p primaries) Running(ctx context.Context, _ int) (bool, error) {
 }
 
 func (p primaries) Start(ctx context.Context, _ int) error {
+	// Every primary is tried: one that is held back by its lease does not keep the others from starting (FO-16).
+	var errs []error
 	for _, id := range p.ids() {
 		if up, err := p.inner.Running(ctx, id); err == nil && up {
 			continue
 		}
 		if err := p.inner.Start(ctx, id); err != nil {
-			return err
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (p primaries) Stop(ctx context.Context, _ int) error {
+	var errs []error
 	for _, id := range p.ids() {
 		if err := p.inner.Stop(ctx, id); err != nil {
-			return err
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (p primaries) Restart(ctx context.Context, _ int) error {
+	var errs []error
 	for _, id := range p.ids() {
 		if err := p.inner.Restart(ctx, id); err != nil {
-			return err
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // stateLocked derives the state from the in-memory state and whether the

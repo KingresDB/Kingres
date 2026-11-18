@@ -337,10 +337,22 @@ func TestRevokedCertificateIsRefusedAndTheServerGetsBackIn(t *testing.T) {
 		if st, out := internalCall(t, target, pair, "1", "GET", "/state", nil); st != 401 || out["error"] != "certificate_refused" {
 			t.Errorf("internal API of node %d after the revocation: %d %v", target.Index, st, out)
 		}
-		if err := pgAs(target, victim, t); err == nil {
-			t.Errorf("PostgreSQL of node %d accepts the revoked certificate", target.Index)
-		} else if !strings.Contains(err.Error(), "revoked") && !strings.Contains(err.Error(), "certificate") {
-			t.Errorf("PostgreSQL of node %d refused it with %v", target.Index, err)
+		// With TLS 1.3 the server judges the client certificate after the client has finished its handshake, so
+		// the refusal reaches the client either as the alert (which names the certificate) or, when the server has
+		// closed the connection before the startup message is written, as a reset. Every attempt must be refused;
+		// the reason must show in one of a few.
+		var reason bool
+		var last error
+		for try := 0; try < 6 && !reason; try++ {
+			last = pgAs(target, victim, t)
+			if last == nil {
+				t.Errorf("PostgreSQL of node %d accepts the revoked certificate", target.Index)
+				break
+			}
+			reason = strings.Contains(last.Error(), "revoked") || strings.Contains(last.Error(), "certificate")
+		}
+		if last != nil && !reason {
+			t.Errorf("PostgreSQL of node %d refused it, never naming the certificate; the last error: %v", target.Index, last)
 		}
 	}
 	if st, out := internalCall(t, leader, pair, "1", "POST", "/pki/renew", map[string]any{"csr": string(strangerCSR)}); st != 401 {

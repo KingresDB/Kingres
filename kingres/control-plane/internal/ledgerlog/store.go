@@ -60,7 +60,10 @@ type MemStore struct {
 func NewMemStore() *MemStore { return &MemStore{tiles: map[TileKey][]byte{}} }
 
 // GetTile implements Store.
-func (m *MemStore) GetTile(_ context.Context, k TileKey) ([]byte, error) {
+func (m *MemStore) GetTile(ctx context.Context, k TileKey) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	d, ok := m.tiles[k]
@@ -71,7 +74,10 @@ func (m *MemStore) GetTile(_ context.Context, k TileKey) ([]byte, error) {
 }
 
 // PutTile implements Store.
-func (m *MemStore) PutTile(_ context.Context, k TileKey, data []byte) error {
+func (m *MemStore) PutTile(ctx context.Context, k TileKey, data []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := checkTileData(k, data); err != nil {
 		return err
 	}
@@ -93,7 +99,10 @@ func (m *MemStore) PutTile(_ context.Context, k TileKey, data []byte) error {
 }
 
 // Widths implements Store.
-func (m *MemStore) Widths(_ context.Context, level int, index uint64) ([]int, error) {
+func (m *MemStore) Widths(ctx context.Context, level int, index uint64) ([]int, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var out []int
@@ -107,7 +116,10 @@ func (m *MemStore) Widths(_ context.Context, level int, index uint64) ([]int, er
 }
 
 // GetCheckpoint implements CheckpointStore.
-func (m *MemStore) GetCheckpoint(context.Context) ([]byte, error) {
+func (m *MemStore) GetCheckpoint(ctx context.Context) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.checkpoint == nil {
@@ -117,7 +129,10 @@ func (m *MemStore) GetCheckpoint(context.Context) ([]byte, error) {
 }
 
 // PutCheckpoint implements CheckpointStore.
-func (m *MemStore) PutCheckpoint(_ context.Context, note []byte) error {
+func (m *MemStore) PutCheckpoint(ctx context.Context, note []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if len(note) == 0 || len(note) > MaxNoteSize {
 		return fmt.Errorf("ledgerlog: a checkpoint note has 1 to %d bytes", MaxNoteSize)
 	}

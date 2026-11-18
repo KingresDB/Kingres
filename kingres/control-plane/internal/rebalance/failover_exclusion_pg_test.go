@@ -147,3 +147,58 @@ func TestInstanceStopIsRefusedWhileItsGroupIsBeingFailedOver(t *testing.T) {
 		t.Errorf("a run that ended frees its instances: %v", err)
 	}
 }
+
+// FO-11: the refusal of a stop or restart during a failover covers every instance of a server of the group (a stop
+// acts on every primary the server runs, not on the instance named in the task), and a config restart, which has
+// no instance as its subject, is refused while a failover is unfinished.
+func TestAStopOfAnyInstanceOfTheServerAndAConfigRestartAreRefusedDuringAFailover(t *testing.T) {
+	e := newEnvNoTask(t)
+	ctx := context.Background()
+	st := task.NewPGStore(e.sys)
+	for _, q := range []string{
+		`CREATE SCHEMA IF NOT EXISTS kingres`,
+		`CREATE TABLE kingres.node (node_id int PRIMARY KEY, host text, port int)`,
+		`INSERT INTO kingres.node VALUES (7, 'old', 5432), (12, 'new', 5432), (8, 'other', 5432), (9, 'old', 5433)`,
+	} {
+		if _, err := e.sys.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	record := func(kind, subjectType, subject string) error {
+		_, err := e.sys.Exec(ctx, `INSERT INTO kingres_cp.task (kind, state, subject_type, subject_id, input, progress, created_at, updated_at, created_by)
+			VALUES ($1, 'running', $2, $3, '{}', '{"steps":[]}', now(), now(), 'u')`, kind, subjectType, subject)
+		return err
+	}
+	if err := record("config.restart", "config", "restart"); err != nil {
+		t.Fatalf("with no failover a config restart must be recorded: %v", err)
+	}
+	if _, err := e.sys.Exec(ctx, `UPDATE kingres_cp.task SET state = 'done' WHERE kind = 'config.restart'`); err != nil {
+		t.Fatal(err)
+	}
+	fo, err := e.create(t, st, kindFailover, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`INSERT INTO kingres_cp.failover_run (task_id, kind, trigger) VALUES ($1, 'failover', 'manual')`,
+		`INSERT INTO kingres_cp.failover_group (task_id, group_id, seq, state, old_server, old_node_id, new_server, new_node_id) VALUES ($1, 3, 1, 'frozen', 'old', 7, 'new', 12)`,
+	} {
+		if _, err := e.sys.Exec(ctx, q, fo.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	refused := func(err error) bool {
+		var pe *pgconn.PgError
+		return errors.As(err, &pe) && pe.Code == "KX004"
+	}
+	// node 9 is the second instance of the server "old": not a node of the group, but its server is
+	if err := record("instance.stop", "instance", "9"); !refused(err) {
+		t.Errorf("a stop of another instance of the old server: %v", err)
+	}
+	if err := record("config.restart", "config", "restart"); !refused(err) {
+		t.Errorf("a config restart during a failover: %v", err)
+	}
+	if err := record("instance.stop", "instance", "8"); err != nil {
+		t.Errorf("an instance of another server must not be affected: %v", err)
+	}
+}

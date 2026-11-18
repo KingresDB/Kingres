@@ -89,6 +89,12 @@ tests += {
       't/018_second_invariant.pl',
       't/019_ids_and_hold.pl',
       't/020_not_covered.pl',
+      't/021_drop_database.pl',
+      't/022_hold_bounds.pl',
+      't/023_writers.pl',
+      't/024_hold_renewals.pl',
+      't/025_lock_order.pl',
+      't/026_ids_and_cancel.pl',
     ],
   },
 }

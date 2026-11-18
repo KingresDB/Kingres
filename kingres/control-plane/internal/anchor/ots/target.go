@@ -43,6 +43,17 @@ const (
 	MaxHeaderChecks = 8
 	// FirstCheck is the delay before the first upgrade attempt.
 	FirstCheck = 10 * time.Minute
+	// DefaultUpgradeTimeout is the bound of one Upgrade call (Options.UpgradeTimeout):
+	// the worst round (16 fragments of 4 lookups, 8 in parallel, 20 s each, and 8
+	// header requests of 20 s) would take about 5 minutes.
+	DefaultUpgradeTimeout = 5 * time.Minute
+	// DefaultContradictionConfirmMinutes is how long after the first
+	// contradiction of a claim by a header the header source has to contradict
+	// it again before the claim is dropped for good.
+	DefaultContradictionConfirmMinutes = 60
+	// MaxContradictionConfirmMinutes is the largest Config.ContradictionConfirmMinutes
+	// (7 days).
+	MaxContradictionConfirmMinutes = 7 * 24 * 60
 )
 
 // Config is the non-secret configuration of an OpenTimestamps target (6.5).
@@ -58,6 +69,12 @@ type Config struct {
 	UpgradeTimeoutDays int `json:"upgradeTimeoutDays,omitempty"`
 	// AllowInsecure permits http calendars (tests and private networks only).
 	AllowInsecure bool `json:"allowInsecure,omitempty"`
+	// ContradictionConfirmMinutes is how long after a block header first
+	// contradicted a claim of a calendar the header source has to contradict it
+	// again, in a later round, before the claim is dropped for good (until then
+	// it is kept aside and the calendar is asked again). 0 means 60; the range
+	// is 1 to 10080.
+	ContradictionConfirmMinutes int `json:"contradictionConfirmMinutes,omitempty"`
 }
 
 // ParseConfig parses, validates and normalizes a configuration: unknown
@@ -106,6 +123,13 @@ func (c Config) Normalize() (Config, error) {
 	if out.MinCalendars < 1 || out.MinCalendars > len(out.Calendars) {
 		return Config{}, errors.New("ots: configuration: minCalendars must be between 1 and the number of calendars")
 	}
+	out.ContradictionConfirmMinutes = c.ContradictionConfirmMinutes
+	if out.ContradictionConfirmMinutes == 0 {
+		out.ContradictionConfirmMinutes = DefaultContradictionConfirmMinutes
+	}
+	if out.ContradictionConfirmMinutes < 1 || out.ContradictionConfirmMinutes > MaxContradictionConfirmMinutes {
+		return Config{}, fmt.Errorf("ots: configuration: contradictionConfirmMinutes must be between 1 and %d", MaxContradictionConfirmMinutes)
+	}
 	out.UpgradeTimeoutDays = c.UpgradeTimeoutDays
 	if out.UpgradeTimeoutDays == 0 {
 		out.UpgradeTimeoutDays = DefaultUpgradeTimeoutDays
@@ -131,6 +155,25 @@ type Options struct {
 	// and the record is anchored only when the check passes; without it a
 	// claim stays a claim (receipt state "claimed").
 	Headers HeaderSource
+	// UpgradeTimeout bounds one Upgrade call besides the caller's context (0
+	// means DefaultUpgradeTimeout).
+	UpgradeTimeout time.Duration
+	// WorkSlack is how many times easier than the target of the nearest
+	// earlier checkpoint of the table of real headers the target of an accepted
+	// header may be (0 means DefaultWorkSlack, 16): the minimum-work rule of
+	// header_checked, see CheckHeaderAt. A larger value accepts less work; it
+	// exists for a chain whose difficulty has fallen by more than that. New
+	// refuses a value above MaxWorkSlack (2^20), which can never admit
+	// difficulty 1 for a height at or after the newest checkpoint.
+	WorkSlack uint
+
+	// headerWork replaces the whole proof-of-work check of a header (floor
+	// included), and fragmentLimit the largest stored fragment: only the tests
+	// of this package set them (the limits of the sizes keep a real call from
+	// reaching a fragment past MaxFragment, and a header of the present era
+	// cannot be mined in a test).
+	headerWork    func([]byte) (HeaderResult, error)
+	fragmentLimit int
 }
 
 // Target is the OpenTimestamps target. It implements anchor.Target and is
@@ -141,6 +184,13 @@ type Target struct {
 	now     anchor.Clock
 	rand    io.Reader
 	headers HeaderSource
+	// work is the proof-of-work check of a header for the height of the claim
+	// (CheckHeaderAt), fragLimit the largest stored fragment (MaxFragment);
+	// see Options.
+	work           func([]byte, uint64) (HeaderResult, error)
+	fragLimit      int
+	upgradeTimeout time.Duration
+	confirm        time.Duration
 }
 
 var _ anchor.Target = (*Target)(nil)
@@ -159,7 +209,29 @@ func New(cfg Config, opt Options) (*Target, error) {
 	if rd == nil {
 		rd = rand.Reader
 	}
-	return &Target{cfg: n, cal: NewCalendarClient(opt.Client, opt.UserAgent, now), now: now, rand: rd, headers: opt.Headers}, nil
+	slack := opt.WorkSlack
+	if slack == 0 {
+		slack = DefaultWorkSlack
+	}
+	if slack > MaxWorkSlack {
+		return nil, fmt.Errorf("ots: WorkSlack must be at most %d: a larger value would admit headers of difficulty 1", MaxWorkSlack)
+	}
+	work := func(h []byte, height uint64) (HeaderResult, error) {
+		return CheckHeaderFloor(h, MaxTargetAt(height, slack))
+	}
+	if hw := opt.headerWork; hw != nil {
+		work = func(h []byte, _ uint64) (HeaderResult, error) { return hw(h) }
+	}
+	ut := opt.UpgradeTimeout
+	if ut <= 0 {
+		ut = DefaultUpgradeTimeout
+	}
+	limit := opt.fragmentLimit
+	if limit <= 0 {
+		limit = MaxFragment
+	}
+	return &Target{cfg: n, cal: NewCalendarClient(opt.Client, opt.UserAgent, now), now: now, rand: rd, headers: opt.Headers, work: work, fragLimit: limit,
+		upgradeTimeout: ut, confirm: time.Duration(n.ContradictionConfirmMinutes) * time.Minute}, nil
 }
 
 // Config returns the normalized configuration.
@@ -188,6 +260,47 @@ func (e *PartialError) Error() string { return e.Err.Error() }
 
 // Unwrap returns the *anchor.Error.
 func (e *PartialError) Unwrap() error { return e.Err }
+
+// ContradictedError is returned by Upgrade with Code "claim_contradicted" (class
+// conflict): every claim of the record was dropped for good because the header
+// source contradicted it twice, an hour or more apart, and nothing can deliver
+// any more. Evidence is the evidence as it was BEFORE that call: it still holds
+// the claims. If the operator finds that the header source was wrong (a node on
+// a stale fork, still synchronising, of another network), the caller keeps this
+// evidence with the failed record and passes it to SubmitWithPrior when the
+// record is retried: the calendars are not asked again, the claims are judged
+// again against the corrected source, and the submission time is kept. A Submit
+// without it starts again from the calendars and the old proof is gone (correction
+// 96). PriorEvidence reads it from any error of this package that carries one.
+// It unwraps to an *anchor.Error.
+type ContradictedError struct {
+	Evidence anchor.OTSEvidence
+	Err      *anchor.Error
+}
+
+// Error implements error.
+func (e *ContradictedError) Error() string { return e.Err.Error() }
+
+// Unwrap returns the *anchor.Error.
+func (e *ContradictedError) Unwrap() error { return e.Err }
+
+// PriorEvidence returns the evidence that a caller keeps and passes to
+// SubmitWithPrior when it retries a record whose Submit or Upgrade failed with a
+// *PartialError (what the calendars that did answer gave) or a *ContradictedError
+// (what the record held before the claims were dropped). ok is false for any
+// other error. A caller that retries such a record without it throws away
+// what was paid for.
+func PriorEvidence(err error) (ev anchor.OTSEvidence, ok bool) {
+	var pe *PartialError
+	if errors.As(err, &pe) {
+		return pe.Evidence, true
+	}
+	var ce *ContradictedError
+	if errors.As(err, &ce) {
+		return ce.Evidence, true
+	}
+	return anchor.OTSEvidence{}, false
+}
 
 // Submit implements anchor.Target.
 func (t *Target) Submit(ctx context.Context, p anchor.Payload) (anchor.Receipt, error) {
@@ -304,6 +417,27 @@ func (t *Target) SubmitWithPrior(ctx context.Context, p anchor.Payload, prior *a
 	}
 	next := t.now().Add(FirstCheck)
 	return anchor.Receipt{State: anchor.ReceiptSubmitted, Evidence: raw, NextCheck: &next}, nil
+}
+
+// ClaimedTimeoutFactor is how many times longer than the timeout of a submitted
+// record a claimed one is kept before it expires: it holds a claim that nothing
+// checked, and it keeps asking the other calendars and the header source.
+const ClaimedTimeoutFactor = 4
+
+// Timeout is how long a submitted record waits for a Bitcoin attestation
+// (timeoutDays 0 means the default); it is the timeout argument of
+// anchor.Record.ExpireIfDue.
+func Timeout(timeoutDays int) time.Duration {
+	if timeoutDays <= 0 {
+		timeoutDays = DefaultUpgradeTimeoutDays
+	}
+	return time.Duration(timeoutDays) * 24 * time.Hour
+}
+
+// ClaimedTimeout is how long a claimed record waits (ClaimedTimeoutFactor times
+// Timeout); it is the claimedTimeout argument of anchor.Record.ExpireIfDue.
+func ClaimedTimeout(timeoutDays int) time.Duration {
+	return ClaimedTimeoutFactor * Timeout(timeoutDays)
 }
 
 // Expired reports whether a submitted anchor created at createdAt has waited

@@ -55,12 +55,14 @@ ALTER TABLE upd OWNER TO kl_s_app;
 CREATE TABLE plain (id int PRIMARY KEY);
 GRANT ALL ON plain TO PUBLIC;
 SELECT kingres.ledger_enable('docs');
+WARNING:  database "kl_stops_t" can be dropped, and the ledger with it, by roles that are not superusers: kl_s_inh, kl_s_inh2
  ledger_enable 
 ---------------
  
 (1 row)
 
 SELECT kingres.ledger_enable('upd', 'updatable');
+WARNING:  database "kl_stops_t" can be dropped, and the ledger with it, by roles that are not superusers: kl_s_inh, kl_s_inh2
  ledger_enable 
 ---------------
  
@@ -518,6 +520,7 @@ SELECT count(*) AS findings FROM kingres.ledger_verify();
 
 -- The tables still refuse what they refused.
 SELECT kingres.ledger_enable('plain');
+WARNING:  database "kl_stops_t" can be dropped, and the ledger with it, by roles that are not superusers: kl_s_inh, kl_s_inh2
  ledger_enable 
 ---------------
  
@@ -844,6 +847,7 @@ SELECT public.s_move_seqs('back');
 SET search_path = public;
 CREATE TABLE s_seq_1 (id int);
 SELECT kingres.ledger_enable('s_seq_1') IS NULL AS enabled;
+WARNING:  database "kl_stops_t" can be dropped, and the ledger with it, by roles that are not superusers: kl_s_inh, kl_s_inh2
  enabled 
 ---------
  f
@@ -882,6 +886,7 @@ SELECT public.s_move_seqs('max');
 SET search_path = public;
 CREATE TABLE s_seq_2 (id int);
 SELECT kingres.ledger_enable('s_seq_2') IS NULL AS enabled;
+WARNING:  database "kl_stops_t" can be dropped, and the ledger with it, by roles that are not superusers: kl_s_inh, kl_s_inh2
  enabled 
 ---------
  f
@@ -920,6 +925,7 @@ SELECT public.s_move_seqs('middle');
 SET search_path = public;
 CREATE TABLE s_seq_3 (id int);
 SELECT kingres.ledger_enable('s_seq_3') IS NULL AS enabled;
+WARNING:  database "kl_stops_t" can be dropped, and the ledger with it, by roles that are not superusers: kl_s_inh, kl_s_inh2
  enabled 
 ---------
  f
@@ -958,6 +964,7 @@ SELECT public.s_move_seqs('burn');
 SET search_path = public;
 CREATE TABLE s_seq_4 (id int);
 SELECT kingres.ledger_enable('s_seq_4') IS NULL AS enabled;
+WARNING:  database "kl_stops_t" can be dropped, and the ledger with it, by roles that are not superusers: kl_s_inh, kl_s_inh2
  enabled 
 ---------
  f
@@ -996,6 +1003,7 @@ SELECT public.s_move_seqs('back');
 SET search_path = public;
 CREATE TABLE s_seq_5 (id int);
 SELECT kingres.ledger_enable('s_seq_5') IS NULL AS enabled;
+WARNING:  database "kl_stops_t" can be dropped, and the ledger with it, by roles that are not superusers: kl_s_inh, kl_s_inh2
  enabled 
 ---------
  f
@@ -1034,6 +1042,7 @@ SELECT public.s_move_seqs('max');
 SET search_path = public;
 CREATE TABLE s_seq_6 (id int);
 SELECT kingres.ledger_enable('s_seq_6') IS NULL AS enabled;
+WARNING:  database "kl_stops_t" can be dropped, and the ledger with it, by roles that are not superusers: kl_s_inh, kl_s_inh2
  enabled 
 ---------
  f
@@ -1072,6 +1081,7 @@ SELECT public.s_move_seqs('middle');
 SET search_path = public;
 CREATE TABLE s_seq_7 (id int);
 SELECT kingres.ledger_enable('s_seq_7') IS NULL AS enabled;
+WARNING:  database "kl_stops_t" can be dropped, and the ledger with it, by roles that are not superusers: kl_s_inh, kl_s_inh2
  enabled 
 ---------
  f
@@ -1110,6 +1120,7 @@ SELECT public.s_move_seqs('burn');
 SET search_path = public;
 CREATE TABLE s_seq_8 (id int);
 SELECT kingres.ledger_enable('s_seq_8') IS NULL AS enabled;
+WARNING:  database "kl_stops_t" can be dropped, and the ledger with it, by roles that are not superusers: kl_s_inh, kl_s_inh2
  enabled 
 ---------
  f

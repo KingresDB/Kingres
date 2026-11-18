@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 func FuzzUntrusted(f *testing.F) {
@@ -33,7 +35,7 @@ func FuzzHostileText(f *testing.F) {
 	for _, h := range hostileStrings[:8] {
 		f.Add([]byte(h))
 	}
-	dir := f.TempDir()
+	dir := testdir.New(f)
 	pub := filepath.Join(dir, "p.json")
 	dig := filepath.Join(dir, "d.json")
 	trustP := filepath.Join(dir, "t.json")

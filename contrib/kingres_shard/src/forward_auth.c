@@ -46,6 +46,7 @@
 #include "postgres.h"
 
 #include "access/parallel.h"
+#include "access/xact.h"
 #include "commands/dbcommands.h"
 #include "common/hmac.h"
 #include "fmgr.h"
@@ -197,6 +198,15 @@ session_forwarded_verified(void)
 	/* A parallel worker acts for a leader that has been checked. */
 	if (IsParallelWorker())
 		return true;
+	/*
+	 * An aborted transaction block (the node refused a statement of a session that has not yet
+	 * proved itself, for example a node that gets the extension in add_node and has no secret
+	 * yet): the only statement that gets here is ROLLBACK or COMMIT, and the secret cannot be read
+	 * without a transaction (the lookup of the schema fails an assertion and is unsafe).  The claim
+	 * is not proved, which is the safe answer; nothing else can run.
+	 */
+	if (!IsTransactionState())
+		return false;
 
 	if (!kingres_shard_cluster_secret(secret, sizeof(secret), &secret_len))
 	{
@@ -230,8 +240,13 @@ session_forwarded_verified(void)
 	explicit_bzero(secret, sizeof(secret));
 	explicit_bzero(expected, sizeof(expected));
 	if (!good)
+		/*
+		 * The proof does not match the secret of this node (S12-05): its own SQLSTATE, KS014, tells
+		 * the caller so.  The other refusal of this function, a node that holds no secret at all,
+		 * keeps 28000, so that nobody decides "rebuild the node" from the words of a message.
+		 */
 		ereport(FATAL,
-				(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+				(errcode(ERRCODE_KINGRES_SECRET_UNKNOWN),
 				 errmsg("this session claims to have been opened by another node of the cluster but cannot prove it")));
 	forwarded_verified = true;
 	return true;

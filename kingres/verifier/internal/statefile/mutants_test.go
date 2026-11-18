@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // These tests came from a mutation run of the package. They pin what a failed
@@ -88,7 +90,7 @@ func tmpFiles(t *testing.T, dir string) []string {
 func TestReplaceThatFailsLeavesTheOldStateAndNoTemporaryFile(t *testing.T) {
 	for _, at := range []string{"write", "sync", "close", "rename"} {
 		t.Run(at, func(t *testing.T) {
-			dir := t.TempDir()
+			dir := testdir.New(t)
 			p := filepath.Join(dir, "state")
 			if err := os.WriteFile(p, []byte("old\n"), 0o600); err != nil {
 				t.Fatal(err)
@@ -114,7 +116,7 @@ func TestReplaceThatFailsLeavesTheOldStateAndNoTemporaryFile(t *testing.T) {
 		})
 	}
 	// a failed flush of the directory comes after the rename: the new state is there, and the error is reported
-	dir := t.TempDir()
+	dir := testdir.New(t)
 	p := filepath.Join(dir, "state")
 	var log []string
 	old := ops
@@ -132,7 +134,7 @@ func TestReplaceThatFailsLeavesTheOldStateAndNoTemporaryFile(t *testing.T) {
 // other error removes it.
 func TestReplaceStoppedLikeACrashKeepsTheTemporaryFile(t *testing.T) {
 	defer func() { step = func(string) error { return nil } }()
-	dir := t.TempDir()
+	dir := testdir.New(t)
 	p := filepath.Join(dir, "state")
 	step = func(s string) error {
 		if s == "written" {
@@ -160,9 +162,10 @@ func TestReplaceStoppedLikeACrashKeepsTheTemporaryFile(t *testing.T) {
 	}
 }
 
-// Only the temporary files of this state are removed by the next replace.
+// The next replace removes the temporary files that this program makes, whatever
+// the name they were made under (L16-04), and nothing else.
 func TestReplaceRemovesOnlyItsOwnLeftovers(t *testing.T) {
-	dir := t.TempDir()
+	dir := testdir.New(t)
 	p := filepath.Join(dir, "state")
 	pre := tmpPrefix(p)
 	other := tmpPrefix(filepath.Join(dir, "another"))
@@ -170,8 +173,8 @@ func TestReplaceRemovesOnlyItsOwnLeftovers(t *testing.T) {
 		pre + "123.tmp":                       false, // a leftover of this state: removed
 		pre + "456.tmp":                       false,
 		pre + "123.txt":                       true,  // not a temporary file
-		pre + ".tmp":                          false, // an empty middle is still one of ours
-		other + "123.tmp":                     true,  // the leftover of another state
+		pre + ".tmp":                          true,  // no number: the program never makes this name
+		other + "123.tmp":                     false, // the leftover of an evidence file: removed too
 		"state.tmp":                           true,
 		strings.TrimSuffix(pre, "-") + ".tmp": true,
 	}
@@ -198,7 +201,7 @@ func TestDefaultLockWaitIsTenSeconds(t *testing.T) {
 }
 
 func TestConflictNamesAndTheContentTest(t *testing.T) {
-	dir := t.TempDir()
+	dir := testdir.New(t)
 	state := filepath.Join(dir, "state")
 	root := bytes.Repeat([]byte{7}, 32)
 	note := []byte("the note\n")
@@ -228,7 +231,7 @@ func TestConflictNamesAndTheContentTest(t *testing.T) {
 		t.Fatalf("the same note: %+v %v", again, err)
 	}
 	// a file that starts with the note and has more in it is not the note: the content is compared whole
-	dir2 := t.TempDir()
+	dir2 := testdir.New(t)
 	state2 := filepath.Join(dir2, "state")
 	first := ConflictPath(state2, 5, root)
 	if err := os.WriteFile(first, append(bytes.Clone(note), 'x'), 0o600); err != nil {
@@ -256,7 +259,7 @@ func TestConflictPathShortensLongNamesAtOneHundredBytes(t *testing.T) {
 
 // An unreachable lock is waited for, not given up at once.
 func TestLockWaitsForItsDeadline(t *testing.T) {
-	dir := t.TempDir()
+	dir := testdir.New(t)
 	state := filepath.Join(dir, "state")
 	l, err := Acquire(state, time.Second)
 	if err != nil {

@@ -136,8 +136,14 @@ is($primary->safe_psql('plain', q(SELECT count(*) FROM pg_extension WHERE extnam
 #--------------------------------------------------------------------------
 # block_interval = 0 switches the workers off; a reload switches them on.
 #--------------------------------------------------------------------------
+my $off_offset = -s $primary->logfile;
 $primary->safe_psql('postgres', q(ALTER SYSTEM SET kingres_ledger.block_interval = 0));
 $primary->reload;
+# The positive event first (L15-11): the launcher says it works with 0 now, so
+# nothing can start a worker from here on; then no worker is left; then the
+# negative assertions mean something.
+ok($primary->wait_for_log(qr/the launcher works with block_interval = 0 ms \(the block-building workers are off\)/, $off_offset),
+	'the launcher reports that it works with block_interval = 0');
 ok(wait_no_workers($primary), 'no worker is running');
 my $height = $primary->safe_psql('db1', 'SELECT coalesce(max(height), -1) FROM kingres.ledger_blocks');
 $primary->safe_psql('db1', q(INSERT INTO public.w VALUES (2, 'b')));
@@ -225,6 +231,11 @@ my $standby = PostgreSQL::Test::Cluster->new('standby');
 $standby->init_from_backup($primary, 'b1', has_streaming => 1);
 $standby->start;
 $primary->wait_for_catchup($standby);
+# The positive event first (L15-11): the standby accepts read-only connections, so
+# the postmaster is past the point where it starts the workers that need only a
+# consistent state; the launcher needs a finished recovery and is not among them.
+ok($standby->wait_for_log(qr/database system is ready to accept read-only connections/),
+	'the standby is ready to accept read-only connections');
 is($standby->safe_psql('postgres',
 		q(SELECT count(*) FROM pg_stat_activity WHERE backend_type LIKE 'kingres_ledger%')),
 	'0', 'a standby has no launcher and no worker');

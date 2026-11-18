@@ -9,6 +9,7 @@ import (
 	"maps"
 	"os"
 	"os/user"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -51,7 +52,10 @@ func (a *Agent) createLocked(ctx context.Context, e Entry) (CreateResponse, erro
 			}
 			return a.startExisting(ctx, id, m)
 		}
-		// An unfinished copy: remove it (the slot stays, it is reused below).
+		// An unfinished copy: remove it (the slot stays, it is reused below), unless it is something else (FO-04).
+		if err := a.provedStandby(ctx, id, true); err != nil {
+			return CreateResponse{}, err
+		}
 		if err := a.mgr().Remove(ctx, id); err != nil {
 			return CreateResponse{}, fmt.Errorf("standby: removing an unfinished copy: %w", err)
 		}
@@ -168,8 +172,14 @@ func (a *Agent) Remove(ctx context.Context, e Entry) error {
 func (a *Agent) removeLocked(ctx context.Context, e Entry) error {
 	id := e.dir()
 	if a.mgr().Exists(id) {
-		if m, err := a.metaOf(id); err == nil && m.ID != e.ID {
+		m, merr := a.metaOf(id)
+		if merr == nil && m.ID != e.ID {
 			return ErrConflict // the directory holds another standby: not this one's to remove
+		}
+		// Only an instance proved to be a standby is deleted (FO-04): a promoted standby whose role file is not
+		// written yet, or is broken, is a primary with its data.
+		if err := a.provedStandby(ctx, id, merr != nil); err != nil {
+			return err
 		}
 		if err := a.mgr().Remove(ctx, id); err != nil {
 			return fmt.Errorf("standby: removing the instance: %w", err)
@@ -201,6 +211,11 @@ func (a *Agent) Rebuild(ctx context.Context, e Entry, diverged bool) (CreateResp
 		// rebuilt by the first execution: a second one is a no-op (it only makes sure the instance runs).
 		if m, err := a.metaOf(id); err == nil && m.ID == e.ID && m.Generation >= e.Generation {
 			return a.startExisting(ctx, id, m)
+		}
+	}
+	if a.mgr().Exists(id) {
+		if err := a.provedStandby(ctx, id, false); err != nil {
+			return CreateResponse{}, err
 		}
 	}
 	if diverged && a.mgr().Exists(id) {
@@ -363,4 +378,58 @@ func (a *Agent) readReceiver(ctx context.Context, id int, ls *LocalStatus) {
 		return
 	}
 	ls.Receiving, ls.ReplayLagBytes = status, lag
+}
+
+// ErrNotProvedStandby means that an instance directory is not proved to be a standby, so it is neither deleted nor
+// rebuilt (FO-04): a promoted standby whose role file is not written yet, or is broken, would be deleted with its data.
+var ErrNotProvedStandby = errors.New("standby: the instance is not proved to be a standby")
+
+// provedStandby returns nil only when the instance of directory id is proved to be a standby by more than the
+// default of its id: the role file exists, is valid and says standby, AND the instance is in recovery when it runs
+// (pg_is_in_recovery), or carries standby.signal when it does not. An absent or broken file is never a licence.
+// unfinished is for the directory of a copy that was never completed (it has no standby meta file): a missing role
+// file and a missing standby.signal are then expected, but a role file that says primary or is broken, and a running
+// instance that is not in recovery, still refuse.
+func (a *Agent) provedStandby(ctx context.Context, id int, unfinished bool) error {
+	r, exists, err := a.mgr().RoleOf(id)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrNotProvedStandby, err)
+	}
+	if unfinished && !exists {
+		exists, r = true, instance.Role{Role: instance.RoleStandby} // a half-made copy: no role file yet
+	}
+	if !exists || !r.IsStandby() {
+		return fmt.Errorf("%w: its role file does not say standby", ErrNotProvedStandby)
+	}
+	up, err := a.mgr().Running(ctx, id)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrNotProvedStandby, err)
+	}
+	if !up && unfinished {
+		return nil // a half-made copy that does not run (no standby.signal yet) is thrown away
+	}
+	if !up {
+		data, err := a.mgr().DataDir(id)
+		if err != nil {
+			return fmt.Errorf("%w: %w", ErrNotProvedStandby, err)
+		}
+		if _, err := os.Stat(filepath.Join(data, "standby.signal")); err != nil {
+			return fmt.Errorf("%w: it is stopped and has no standby.signal", ErrNotProvedStandby)
+		}
+		return nil
+	}
+	mk, err := a.mgr().Managed(id)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrNotProvedStandby, err)
+	}
+	c, err := a.Svc.ServiceConnAt(ctx, id, mk.Port, "postgres")
+	if err != nil {
+		return fmt.Errorf("%w: it runs and cannot be asked: %w", ErrNotProvedStandby, err)
+	}
+	defer func() { _ = c.Close(context.WithoutCancel(ctx)) }()
+	var inRecovery bool
+	if err := c.QueryRow(ctx, "SELECT pg_catalog.pg_is_in_recovery()").Scan(&inRecovery); err != nil || !inRecovery {
+		return fmt.Errorf("%w: it is not in recovery", ErrNotProvedStandby)
+	}
+	return nil
 }

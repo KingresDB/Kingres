@@ -42,8 +42,8 @@ func (s State) Valid() bool {
 }
 
 // Terminal reports whether no automatic event moves a record out of s.
-// (failed also leaves by the operator's Retry, claimed by a receipt that
-// carries a checked header.)
+// (failed and expired also leave by the operator's Retry, claimed by a receipt
+// that carries a checked header.)
 func (s State) Terminal() bool {
 	switch s {
 	case StateAnchored, StateFailed, StateSuperseded, StateExpired:
@@ -104,8 +104,8 @@ var Events = []Event{EventReceiptSubmitted, EventReceiptClaimed, EventReceiptAnc
 
 // transitions is the state machine (state, event) -> next state. A pair that
 // is not in the table is refused: the record is returned unchanged with an
-// error. anchored, superseded and expired are final for every event; failed
-// is left only by EventRetry.
+// error. anchored and superseded are final for every event; failed and expired
+// are left only by EventRetry (correction 88).
 var transitions = map[State]map[Event]State{
 	StatePending: {
 		EventReceiptSubmitted: StateSubmitted,
@@ -125,13 +125,23 @@ var transitions = map[State]map[Event]State{
 		EventExpire:           StateExpired,
 	},
 	StateClaimed: {
-		EventReceiptClaimed:  StateClaimed,
-		EventReceiptAnchored: StateAnchored,
-		EventWait:            StateClaimed,
-		EventFail:            StateFailed,
-		EventConflict:        StateFailed,
+		// a header contradicted the claim and no other plausible claim is left:
+		// the record is submitted again, to wait for the other calendars
+		EventReceiptSubmitted: StateSubmitted,
+		EventReceiptClaimed:   StateClaimed,
+		EventReceiptAnchored:  StateAnchored,
+		EventWait:             StateClaimed,
+		EventFail:             StateFailed,
+		EventConflict:         StateFailed,
+		EventExpire:           StateExpired,
 	},
 	StateFailed: {
+		EventRetry: StatePending,
+	},
+	// an expired record is retried like a failed one: it waited for Bitcoin
+	// until its timeout and the operator wants it to wait again (Retry starts
+	// a new waiting period, see Record.Retry)
+	StateExpired: {
 		EventRetry: StatePending,
 	},
 }
@@ -220,14 +230,20 @@ func (r Record) Supersede() (Record, error) {
 	return out, nil
 }
 
-// Retry is the operator's "Retry": a failed record becomes pending again,
-// due at once, with the counters and the error cleared.
+// Retry is the operator's "Retry": a failed or an expired record becomes pending
+// again, due at once, with the counters and the error cleared. An expired
+// record also gets a new CreatedAt (now): its waiting period (ExpireIfDue)
+// starts again, or the next check would expire it at once. A failed record keeps
+// its CreatedAt.
 func (r Record) Retry(now time.Time) (Record, error) {
 	out, err := r.step(EventRetry)
 	if err != nil {
 		return r, err
 	}
 	n := now
+	if r.State == StateExpired {
+		out.CreatedAt = now
+	}
 	out.Attempts, out.Refusals, out.Retryables, out.FailingSince = 0, 0, 0, nil
 	out.NextAttemptAt, out.LastError = &n, ""
 	return out, nil
@@ -235,8 +251,9 @@ func (r Record) Retry(now time.Time) (Record, error) {
 
 // ApplyReceipt applies the successful result of Submit or Upgrade. It
 // refuses (error, record unchanged) a receipt that the table does not allow
-// from the record's state: nothing leaves anchored, and a claimed record is
-// not made submitted again.
+// from the record's state: nothing leaves anchored, and a claimed record
+// becomes submitted again only through a "submitted" receipt (every claim was
+// dropped and other calendars may still deliver).
 func (r Record) ApplyReceipt(rc Receipt, now time.Time) (Record, error) {
 	var ev Event
 	switch rc.State {
@@ -456,11 +473,24 @@ func UpgradeInterval(age time.Duration) time.Duration {
 	return time.Hour
 }
 
-// ExpireIfDue moves a submitted record to expired when it is older than
-// timeout (OpenTimestamps: upgradeTimeoutDays) and reports whether it did.
-// Only a submitted record expires: a claimed one has its claim already.
-func (r Record) ExpireIfDue(now time.Time, timeout time.Duration) (Record, bool) {
-	if r.State != StateSubmitted || now.Sub(r.CreatedAt) < timeout {
+// ExpireIfDue moves a record to expired when it has waited longer than its
+// timeout, counted from CreatedAt, and reports whether it did: a submitted
+// record after timeout (OpenTimestamps: upgradeTimeoutDays), a claimed one
+// after claimedTimeout, which is longer (ots.ClaimedTimeout): a claim is a
+// calendar's word that nothing checked, the record keeps asking the other
+// calendars and the header source, and it must end one day. Records in any
+// other state are not touched.
+func (r Record) ExpireIfDue(now time.Time, timeout, claimedTimeout time.Duration) (Record, bool) {
+	var limit time.Duration
+	switch r.State {
+	case StateSubmitted:
+		limit = timeout
+	case StateClaimed:
+		limit = claimedTimeout
+	default:
+		return r, false
+	}
+	if now.Sub(r.CreatedAt) < limit {
 		return r, false
 	}
 	out, err := r.step(EventExpire)

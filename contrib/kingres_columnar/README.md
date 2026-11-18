@@ -58,8 +58,8 @@ and use `kingres.columnar_compact` afterwards.
 | `kingres.columnar_info(rel)` | Stripes, chunk groups, rows, bytes on disk, uncompressed bytes, ratio. |
 | `kingres.columnar_stripes(rel)` | One row per visible stripe. |
 | `kingres.columnar_compact(rel, min_rows)` | Merge stripes with fewer than `min_rows` rows (default a quarter of the stripe size); returns the number of stripes written. Owner only. It changes nothing logically: for every transaction, the one that calls it and every other, the rows each snapshot sees are the same before and after, and under SERIALIZABLE it creates no dependency (see "Isolation"). |
-| `kingres.columnar_check(fix)` | Superuser. Reports catalog rows of files nobody uses, stripes beyond the end of the file, stripes whose first page is not theirs, stripes with more rows than the developer setting `max_stripe_rows` lets a stripe have today (`stripe_over_row_limit`: readable, a rewrite writes them again), and relations that cannot be read (`unreadable`, with the reason). `fix` deletes the first two kinds. It never waits for a lock: a table that another transaction holds in a conflicting mode (a prepared `TRUNCATE` or rewrite keeps its lock until someone ends it; ordinary DDL, `VACUUM FULL` or a `LOCK TABLE` that is running does the same for its duration) is reported as `not_checked`, with the reason, and the rest is checked. **What a caller must look for: any row at all means "not clean".** `not_checked` is not an error row and not a clean result: it says that this table was not looked at, so a monitor that tests for the names of the error rows (`stripe_beyond_file`, `unreadable`, `page_header_mismatch`, `orphan_catalog_rows`) would pass over a damaged table that happens to be locked.  A monitor tests that the result is empty, or uses `columnar_check_clean()`.  Where PostgreSQL cannot begin a subtransaction (a callback of another module at the end of a transaction, in a critical section: see "Writes while a transaction is ending") the call is refused with a WARNING and returns no rows, which is not a clean result either; no statement of a session is ever in that state. |
-| `kingres.columnar_check_clean()` | Superuser. The strict form of `columnar_check()`: `true` only when every columnar table was checked and nothing was found, `false` for any row `columnar_check()` would return, a `not_checked` table included (and for a refused call, with the warning).  It is never `true` for a table that was not looked at, so a script that tests this function and not the names of rows cannot pass silently; when it is `false`, `columnar_check()` says why. |
+| `kingres.columnar_check(fix)` | Superuser. Reports catalog rows of files nobody uses, stripes beyond the end of the file, stripes whose first page is not theirs, stripes with more rows than the developer setting `max_stripe_rows` lets a stripe have today (`stripe_over_row_limit`: readable, a rewrite writes them again), and relations that cannot be read (`unreadable`, with the reason: damage that the table shows, an unreadable or missing file, a format this server does not read). `fix` deletes the first two kinds. **It reads the stripe catalog as of now whatever the isolation level of the caller** (an older `REPEATABLE READ` or `SERIALIZABLE` snapshot does not see a table made after it, nor stripes committed after it, and would call a damaged table clean): the list of tables and the stripes are read by this call, not through the caller's snapshot. **It never waits for a lock, for every lock it takes**: the stripe catalog, its primary key index, its TOAST table and its index, and `pg_class` are locked without waiting before anything is read, and each table is locked without waiting; whatever cannot be locked (an administrator's `LOCK TABLE`, `REINDEX` or `VACUUM FULL` that is running, a prepared transaction that holds a lock until someone ends it) is reported as `not_checked` with the reason (for a catalog: for no table in particular, and nothing is checked), and the rest is checked.  (What remains is what every statement does: the relation cache reads the system catalogs such as `pg_attribute`, and a short wait for a buffer.)  A table dropped, made another kind of table, or made while the call runs is a `not_checked` row as well, never counted as clean.  **A query cancel, a statement timeout, a lock timeout, an out-of-memory error or any other error that is not about the table being read ends the call with that error**; only damage that the table shows becomes an `unreadable` row. **What a caller must look for: any row at all means "not clean".** `not_checked` is not an error row and not a clean result: it says that this table was not looked at, so a monitor that tests for the names of the error rows (`stripe_beyond_file`, `unreadable`, `page_header_mismatch`, `orphan_catalog_rows`) would pass over a damaged table that happens to be locked.  A monitor tests that the result is empty, or uses `columnar_check_clean()`.  **What "clean" covers**: the stripe catalog against the files, and the first page of each stripe (its place in the file, its header, its identity and size); orphaned catalog rows; **not the other pages of a stripe** (a damaged later page is found when the stripe is read, by the checksums).  **What it leaves behind**: an `ACCESS SHARE` lock on every columnar table (`SHARE UPDATE EXCLUSIVE` with `fix`) until the end of the caller's transaction (the locks of a subtransaction pass to its parent), so in a transaction block it blocks DDL on all of them; no lock on the catalogs.  **What it costs in memory**: the stripe list of one table at a time (a descriptor of about 100 bytes and the stripe's statistics, a few hundred bytes for a table of a few columns, for each stripe; freed after the table), and the list of table oids; nothing grows with the number of rows or the number of tables except the oids.  Where PostgreSQL cannot begin a subtransaction (a callback of another module at the end of a transaction, in a critical section: see "Writes while a transaction is ending") the call is refused with a WARNING and returns no rows, which is not a clean result either; no statement of a session is ever in that state. |
+| `kingres.columnar_check_clean()` | Superuser. The strict form of `columnar_check()`: `true` only when every columnar table was checked and nothing was found, `false` for any row `columnar_check()` would return, a `not_checked` table included (and for a refused call, with the warning).  It is never `true` for a table that was not looked at (a table made or dropped during the call included), so a script that tests this function and not the names of rows cannot pass silently; when it is `false`, `columnar_check()` says why.  It reads, locks and fails exactly as `columnar_check()` does (as of now, never waiting, ending with a cancel or a timeout), and covers what "clean" covers there. |
 | `kingres.columnar_reconcile()` | Superuser. Deletes catalog rows of files no relation uses (it reads the first block of every columnar file of the database). A row that another session is deleting or has deleted is left to it, never an error. |
 | `kingres.columnar_write_paths(reset)` | Superuser (grantable). How often each path of the write side was taken in this session (`late_commit`, `late_window`, `pressure_flush`, `own_flush`, `handover_flush`, `size_flush`, `prepared_skip`, `ceiling_write`, `ceiling_handover`, `refused_ending`, `orphans_cleaned`, `refused_live`, `lost_raised`) and, as `bytes_held` and `orphans_kept`, two numbers that are not counts: the memory the write buffers are charged for now, and the files the backend's last commit noted for its next transaction to clean up after; with `reset` the counts start again. A diagnostic, and what the tests of those paths read. |
 | `kingres.columnar_identity(rel)`, `kingres.columnar_creating_xid(rel)`, `kingres.columnar_table_xid(rel)` | The identity of the stored content, the id of the transaction that created the file (2 once frozen) and the id that stands for the creation of the table (0 when it is not known, 2 once frozen): what the metapage holds (see "On-disk format"). |
@@ -85,10 +85,36 @@ denied for table", tested in `columnar_security`).  `columnar_set_options` and
 | `kingres_columnar.chunk_row_count` | 10000 | Rows of a chunk group (100 to 100000). A group also ends when its raw size reaches 32 MB. |
 | `kingres_columnar.write_buffer_memory` | 128MB | Memory for the rows of stripes being built, per backend, all tables together (1MB to the largest value). A soft limit with a hard ceiling of twice this value, see "Memory and costs": the buffers are written as soon as they are over it and the running subtransaction may write them, and a write that would go on from above the ceiling is refused with an error. A buffer that a running scan reads is never flushed under it. A flush that memory asks for writes whole buffers, the largest first, and a buffer is written alone only when it has `max(chunk_row_count, 1000)` rows or half of this memory, so the stripes of a table do not depend on how its rows were grouped into subtransactions. |
 | `kingres_columnar.orphan_notes_max` | 10000 | Developer setting, superuser only: lowers the most files that a commit keeps for the next transaction to clean up after (those another module dropped after the clean-up had run), so the limit can be tested with a handful of tables.  It cannot raise the compiled limit. |
+| `kingres_columnar.check_gate` | 0 | Developer setting, superuser only: the first integer of an advisory lock `pg_advisory_lock(key, 0)` that `columnar_check` and `columnar_check_clean` wait on at the start of the look at each table (after the list of tables is made) until no other session holds it, so that `t/036` can drop or make a table, or cancel the call, at that moment and not at one it can only hope for.  0 is no gate; the wait is bounded (two minutes) and can be cancelled. |
 | `kingres_columnar.max_stripe_rows` | 10000000 | Developer setting, superuser only: lowers the most rows the writer puts in one stripe (and the size above which `columnar_check` reports a stripe), so the limit can be tested with a few thousand rows. It cannot raise the compiled limit and does not touch the reader, so no value can make a table unreadable. |
 | `kingres_columnar.fault_point`, `kingres_columnar.fault_nth` | off, 0 | Developer settings, superuser only, present only when the server is built with assertions (`USE_ASSERT_CHECKING`): make the nth allocation of the write path (`alloc`), the nth relation of a subtransaction's hand-over to its parent (`merge`) or the nth relation of a flush (`flush`) fail once with "out of memory". Used by `t/016_atomic_handover.pl`; absent from production builds. |
 | `kingres_columnar.enable_custom_scan` | on | Use the Columnar Scan (projection, skipping). |
 | `kingres_columnar.enable_chunk_skipping` | on | Use minimum and maximum to skip. |
+
+### Changes made in place to the 0.1 interface in the tenth round
+
+Version 0.1 is not released, so its interface is changed in place; this round
+changed:
+
+* `columnar_check(fix)` and `columnar_check_clean()` read the stripe catalog as of
+  now, not through the caller's snapshot (C10-01); they report a table dropped,
+  made another kind of table, or made during the call as `not_checked` (a new
+  reason, with a table); they take every lock without waiting, and a catalog they
+  cannot lock is one `not_checked` row with no table (`relation` null) and no
+  further row (C10-02); an error that is not damage to the table (a cancel, a
+  statement timeout, a lock timeout, out of memory, ...) is now raised, where it
+  used to be an `unreadable` row (C10-02).
+* `relation_nontransactional_truncate` raises an error, where an error is allowed,
+  for a table that was not made or given a new file in the transaction (C10-05).
+* A critical section inside a subtransaction begun after the extension's own
+  pre-commit is alive, not decided: the transaction fails at that
+  subtransaction's pre-commit where it used to commit without the call (C10-03).
+* `VACUUM` and autovacuum give back the tail of the file only by heap's rule, so a
+  vacuum with nothing worth cutting takes no `ACCESS EXCLUSIVE` lock (C10-06).
+* `relfrozenxid` of a truncated or rewritten table is not newer than the ids its
+  file holds, and the autovacuum line prints the value `pg_class` holds (C10-04).
+* The developer setting `kingres_columnar.check_gate` (the table above) was added
+  for the tests of the check functions.
 
 ### EXPLAIN
 
@@ -208,7 +234,13 @@ One main fork, no other fork.
   ids itself). VACUUM freezes each once every snapshot can see it (it precedes the
   oldest transaction still running; the change is WAL-logged and cancels
   hot-standby queries that might hold it) and reports the oldest id that is
-  left as the table's `relfrozenxid`. The pages of a stripe hold no
+  left as the table's `relfrozenxid`. A new file (`TRUNCATE`, a rewrite, a new
+  table) is given a `relfrozenxid` that is not newer than any normal id its
+  metapage holds (C10-04): the id of the creating transaction, and the table's
+  own id that a truncate or a rewrite keeps from the old file, which can be
+  older; so `relfrozenxid` never claims more than is true, and `datfrozenxid` and
+  the server's wraparound warnings do not run late by the distance between the
+  table's creation and its truncate.  The pages of a stripe hold no
   transaction id (that field is reserved, zero).
 * WAL: the resource manager `KingresColumnar` logs whole-page images only
   (`STRIPE_PAGES`, `METAPAGE`); redo restores images and has no logic of its
@@ -257,9 +289,35 @@ All with SQLSTATE `0A000`.
 ## VACUUM and space
 
 `VACUUM` records page and row counts, returns the unreferenced tail of the file
-(it takes a conditional `ACCESS EXCLUSIVE` lock, as heap does; on a standby
-that lock cancels conflicting queries), deletes catalog rows of dead files and
-resets the insert counters so autovacuum does not repeat. Space in the middle
+when it is worth it (below), deletes catalog rows of dead files and resets the
+insert counters so autovacuum does not repeat.
+
+The tail is given back by the rule of heap's vacuum (`should_attempt_truncation`
+and `lazy_truncate_heap` in `vacuumlazy.c`, the same in PostgreSQL 18 and 19),
+because the lock that truncation needs is `ACCESS EXCLUSIVE`, which on a logged
+table is written to the WAL and replayed on a hot standby, where it cancels every
+query that holds the table (C10-06; before this every vacuum and every visit of
+autovacuum took it, and ended the long queries on the standby that the table is
+for).  The decision is made under the lock the vacuum already holds
+(`SHARE UPDATE EXCLUSIVE`): the tail is the part of the file after the last stripe
+that anything may still need (a stripe whose catalog row is live, in progress, or
+deleted but not yet invisible to every snapshot).  Only when it is not empty and
+holds at least 1000 pages or a sixteenth of the file, and the wraparound failsafe
+is not on, and neither `VACUUM (TRUNCATE false)` nor the table option
+`vacuum_truncate = false` says no (`VACUUM (TRUNCATE true)` overrides the option),
+is the exclusive lock asked for: without waiting, tried again every 50 ms for 5
+seconds (checking for interrupts; wait event `VacuumTruncate`), after which the
+truncation is given up for this visit without an error.  Under the lock the file
+is measured again: if it has grown since the decision (the new pages belong to a
+writer) nothing is done; else the tail is worked out again, exactly, now that no
+writer can be in the middle of a flush, and cut.  A vacuum with nothing to cut
+(the usual case for append-only data) takes no `ACCESS EXCLUSIVE` lock and writes
+nothing a standby has to replay against its readers.  It differs from heap's in
+two ways: the tail comes from the stripe catalog and the file size, not from a
+scan that notes the last page with data, and heap's loop that goes on while a
+waiting lock request interrupted the scan of the tail has no counterpart (finding
+the tail is one catalog read, and a waiter does not wait behind it).  `t/037`
+tests it with a primary and a hot standby. Space in the middle
 of the file is not reused: pages of rolled-back or crashed loads and of stripes
 replaced by `columnar_compact` stay until they are at the end or the table is
 rewritten with `VACUUM FULL`.
@@ -414,7 +472,19 @@ still holds (the creating transaction of the metapage; see "On-disk format").
 VACUUM, including autovacuum's anti-wraparound vacuum, freezes it and advances
 `relfrozenxid`, so `age(relfrozenxid)` is meaningful and the table takes part
 in the protection against transaction id wraparound as a heap table does. The
-stripe catalog is an ordinary heap table and is frozen as usual.
+stripe catalog is an ordinary heap table and is frozen as usual.  Autovacuum
+acts on the table, as on a heap table, only once `age(relfrozenxid)` is past
+`autovacuum_freeze_max_age` (or an insert or analyze threshold is reached): a
+table at an age just under it is left alone.  With `log_autovacuum_min_duration`
+set, a visit of autovacuum to a columnar table is logged in the words heap
+uses (`automatic [aggressive] vacuum [to prevent wraparound] of table "d.s.t":
+columnar: N rows, B blocks, relfrozenxid X, creation id frozen|kept`, where X is the
+`relfrozenxid` that `pg_class` holds after the visit: `vac_update_relstats` only
+moves it forward, so it can be later than the id the vacuum passed in, which is what
+the line used to print; C10-04), and
+`pg_stat_all_tables` reports `autovacuum_count` and `last_autovacuum` for it.
+Before that line existed the log showed a visit of autovacuum to a columnar table
+only as an `automatic analyze` line, and its absence was no sign of an absent visit.
 
 If the role that creates tables is named `kingres`, the default search path
 (`"$user", public`) puts unqualified tables into the schema `kingres`, which
@@ -632,7 +702,18 @@ Memory and costs worth knowing:
     call", and the transaction commits (or prepares) without it.  With the
     module loaded after the extension (its callbacks run before) the same
     critical section is alive, and the transaction fails at the extension's
-    pre-commit.  A module that must not lose a call writes at
+    pre-commit.  **Inside a subtransaction that such a callback began** (C10-03;
+    a callback of a later module can: a PL/pgSQL exception block does) the
+    critical section is alive again, in both orders: the transaction callbacks of
+    this extension for the top-level transaction do not run again, but its
+    callbacks for the subtransaction do (its start, its pre-commit, its commit),
+    so a refusal there is remembered for that subtransaction and its pre-commit
+    raises the error, as for any subtransaction; the error ends the callback of
+    the other module, and the transaction aborts (`PREPARE TRANSACTION` prepares
+    nothing).  The rule is the nesting level: a critical section at level 1 after
+    the extension's own pre-commit is decided, at a deeper level it is alive.  A
+    call that may be skipped (a vacuum) is not made worse by it: a warning, and
+    the transaction commits.  A module that must not lose a call writes at
     `XACT_EVENT_PRE_COMMIT` or `PRE_PREPARE` outside a critical section, where
     the call is carried out (written at once, see above).
 
@@ -654,7 +735,7 @@ Memory and costs worth knowing:
   | `SUBXACT_EVENT_COMMIT_SUB` | stops (the same assertion) | writes; the row commits with the parent, durable | the subtransaction aborted | warning, and the transaction fails with an error at its next pre-commit (alive) |
   | `SUBXACT_EVENT_ABORT_SUB` | stops (the same assertion) | writes a row of the aborted subtransaction, which nobody sees | PANIC (error stack) | warning (decided; as for an abort) |
   | resource owner release, the three phases | ERROR "ResourceOwnerEnlarge called after release started", escalated to a PANIC | the same | PANIC | warning (decided) |
-  | inside a critical section | stops (`allowInCritSection` assertion in `mcxt.c`) | writes | writes when no allocation is needed, else the same assertion | warning, and the transaction fails with an error at its next pre-commit (alive), if the critical section was entered before the extension's own pre-commit callback ran; decided (warning: "if the transaction commits (or prepares) it does so without this call") if it was entered after it, at `XACT_EVENT_PRE_COMMIT` or `PRE_PREPARE` by a callback that runs later, and if it is entered at one of the moments above |
+  | inside a critical section | stops (`allowInCritSection` assertion in `mcxt.c`) | writes | writes when no allocation is needed, else the same assertion | warning, and the transaction fails with an error at its next pre-commit (alive), if the critical section was entered before the extension's own pre-commit callback ran, or inside a subtransaction that a later module's callback began after it (C10-03: the subtransaction's pre-commit raises); decided (warning: "if the transaction commits (or prepares) it does so without this call") if it was entered after it at the top level, at `XACT_EVENT_PRE_COMMIT` or `PRE_PREPARE` by a callback that runs later, and if it is entered at one of the moments above |
   | `proc_exit` callbacks | no transaction and no relation to write to; nothing of the access method runs there | | | |
 
   The server survives at every moment, which heap does not: with assertions it
@@ -685,7 +766,7 @@ Memory and costs worth knowing:
   | `tuple_insert`, `multi_insert`, `tuple_insert_speculative`, `tuple_complete_speculative` | guarded | warning, nothing written (`insert`, `multi insert`, ...) |
   | `tuple_delete`, `tuple_update`, `tuple_lock` | guarded | warning; `TM_Invisible` is returned |
   | `finish_bulk_insert` | guarded | the flush it would make is left to the pre-commit; no warning (nothing is lost) |
-  | `relation_nontransactional_truncate` (C8-01) | guarded | warning, nothing changed: not the half of a truncate (a file shortened with the stripe rows left, or the other way round).  Where it is allowed it deletes the catalog rows, shortens the file and resets the metapage, in that order: an error in the first step is undone with the transaction and leaves a readable table. |
+  | `relation_nontransactional_truncate` (C8-01, C10-05) | guarded; **only for a relation made, or given a new file, in this transaction** | warning, nothing changed: not the half of a truncate (a file shortened with the stripe rows left, or the other way round).  Where an error is allowed, for a relation that is neither created nor given a new file in the current transaction or subtransaction (`rd_createSubid` and `rd_firstRelfilelocatorSubid` both invalid) it is an error, `cannot truncate columnar table "t" in place: it was not created or given a new file in this transaction`: PostgreSQL itself calls it only for such a relation (`TRUNCATE` of a table of the transaction, and a temporary table, which a columnar table cannot be), and it is the only case where an abort removes the file anyway; for any other table the cut file and the reset metapage are not undone by an abort while the deleted catalog rows come back, and the table cannot be read.  For a relation of the transaction it deletes the catalog rows, shortens the file and resets the metapage, in that order: an error in the first step is undone with the transaction and leaves a readable table (`t/031`, `t/033`, `t/034`). |
   | `relation_set_new_filelocator`, `relation_copy_data`, `relation_copy_for_cluster` | guarded | warning; no file is made, nothing copied, the returned ids name nothing |
   | `relation_vacuum` | guarded | warning, skipped (the next vacuum does the same work; no failure of the transaction) |
   | `index_fetch_begin`, `index_fetch_tuple`, `tuple_fetch_row_version`, `tuple_tid_valid`, `index_delete_tuples`, `index_build_range_scan`, `index_validate_scan`, `scan_sample_next_block`, `scan_sample_next_tuple` | guarded | warning and the answer "nothing" (no index can exist on a columnar table, so PostgreSQL never calls these; where an error is allowed they raise the errors they always did) |
@@ -698,6 +779,34 @@ Memory and costs worth knowing:
   | the other SQL functions (`columnar_options`, `_info`, `_stripes`, `_identity`, `_creating_xid`, `_table_xid`, `_write_paths`, `_handler`) | reads | work wherever PostgreSQL lets a heap table be read, with one rule of their own (C9-03): where an error is forbidden the table's `ACCESS SHARE` lock is asked for without waiting (a wait could end in a deadlock error, a PANIC there); a table locked exclusively by another transaction gets a warning and a null (or empty) answer.  A table the transaction holds a lock on is never refused |
   | the transaction and subtransaction callbacks of the extension | they are the moments | what they do at each (flush, hand-over, clean-up, remembering the refusal) was designed for it; the memory the commit event needs is static (below) |
   | the planner hook and the executor methods of the Columnar Scan, the event trigger functions, the redo of the resource manager | not reachable | they need a transaction in progress (planning, executing, DDL) or recovery, and none of them runs where an error is forbidden |
+
+  **Reads at the moments where an error is forbidden are tested on builds without
+  assertions only** (C10-07).  A server built with assertions cannot run them, and
+  not because of this extension: at `XACT_EVENT_COMMIT`, `PREPARE`, `ABORT`, at the
+  commit and abort of a subtransaction and in the three phases of the release of a
+  resource owner no transaction is in progress, and the first lookup of a relation
+  or a catalog row stops the server (`AssertCouldGetRelation`, `relcache.c` and
+  `catcache.c`, `Assert(IsTransactionState())`, which fails for heap just the same);
+  in a critical section a transaction is in progress, but a read allocates and
+  `palloc` asserts that it is not in one (`mcxt.c`).  So for these cells the
+  assertion makes the run impossible on such a build, with no exception.  They are,
+  for each order of loading the test module (74 cells each, 148 in all): the scan of a
+  table (`scan_begin`, `scan_getnextslot`, `scan_rescan`, `scan_end`) at each of the
+  eleven moments of the table above (11); the seven SQL functions that read
+  (`columnar_options`, `_info`, `_stripes`, `_identity`, `_creating_xid`,
+  `_table_xid`, `_write_paths`) at the eight moments that are not a release phase
+  (7 x 8 = 56); `size` and `estimate` (the length of the file, which allocates in the
+  smgr) in a critical section, three moments (2 x 3 = 6); and `columnar_stripes` with
+  a table that another session holds exclusively, which is called through the
+  function manager (1).  `t/031` skips each of them with its reason and prints how
+  many it skipped, for each order of loading, at the end of its output.  They are run
+  on a server built without assertions, where the function manager and the relation
+  cache accept them: on production builds of PostgreSQL 18.7 and 19rc2 `t/031` ran
+  all of them but three cells for each order of loading (6 in all), the scan of a table
+  in the three phases of the release of a resource owner, which PostgreSQL itself
+  forbids there (the buffer pin needs the resource owner that is being released, for
+  heap as well); those are tested nowhere, and `t/031` says so in its output.  `size`
+  and `estimate` outside a critical section run on both kinds of build.
 
   A caller sees, at a moment where the fate is decided, the warning
   `<what> refused on columnar table "t": the transaction is not in progress`
@@ -811,7 +920,7 @@ make USE_PGXS=1 installcheck       # needs a server with the library preloaded
 
 or `kingres/dev/ext.sh kingres_columnar` and `kingres/dev/ext-majors.sh
 kingres_columnar` for PostgreSQL 18 and 19. The tests are eleven `pg_regress`
-files (`sql/`, `expected/`) and thirty-three TAP files in `t/`: crash recovery,
+files (`sql/`, `expected/`) and thirty-eight TAP files in `t/`: crash recovery,
 standby and `pg_rewind`, backup/restore/dump, concurrent writers, corruption,
 a randomised comparison against heap (`KC_COMPARE_SEED`, `KC_COMPARE_STEPS`),
 older snapshots, array validation, serializable isolation against heap twins,
@@ -843,8 +952,8 @@ the way to find and remove them (`t/028`), `COMMIT AND CHAIN`, a parallel leader
 and a base backup under load, restored (`t/029`), the cost of rows written late
 (`t/030`), every entry point of the access method at every moment where an error
 is forbidden, and the walk that fails for a callback without a decision (`t/031`),
-the way a module that cannot be built is treated (`t/032`), the same write paths on a standby with `wal_consistency_checking = all` and across a promotion, and a late drop under a hot standby's reader (`t/033`), logical decoding of transactions that had a refused call (`t/034`), and two laps of the
-transaction id space.
+the way a module that cannot be built is treated (`t/032`), the same write paths on a standby with `wal_consistency_checking = all` and across a promotion, and a late drop under a hot standby's reader (`t/033`), logical decoding of transactions that had a refused call (`t/034`), the log line of autovacuum (`t/035`), the check functions: the snapshot they read with, the locks they never wait for, the errors they never hide and what they leave behind (`t/036`), the rule for giving the tail of the file back, with a hot standby (`t/037`), the `relfrozenxid` of a truncated or rewritten table and the autovacuum line (`t/038`), and two laps of the
+transaction id space (`t/013`).
 
 Some files do not run everywhere, and say why when they are skipped:
 
@@ -855,9 +964,17 @@ Some files do not run everywhere, and say why when they are skipped:
   hand-over is tested on assertion builds only, which is where the tests are
   run, and a build for packaging skips the file;
 * `t/013_xid_wraparound.pl` needs the `xid_wraparound` module of the
-  PostgreSQL tree and takes minutes; `KC_SKIP_WRAPAROUND=1` skips it.  The
-  freezing of the ids of the metapage is also tested without it, in
-  `t/021_table_creation.pl`;
+  PostgreSQL tree and takes minutes; `KC_SKIP_WRAPAROUND=1` skips it.  Where the
+  module is not installed (an installation made for an out-of-tree build does not
+  have it; the in-tree run does) the file is a counted skip, with the reason and
+  the words "the anti-wraparound path ... was NOT tested by this run", and
+  `KC_REQUIRE_WRAPAROUND=1` turns it into a failure.  The freezing of the ids of
+  the metapage is also tested without it, in `t/021_table_creation.pl`;
+* `t/031_entry_points.pl` skips, on a server built with assertions, the 148 cells
+  of reads at moments where an error is forbidden that PostgreSQL's own assertions
+  forbid (see "Writes while a transaction is ending", which lists them), counted
+  and named at the end of its output; they run on a server built without
+  assertions;
 * `t/022`, `t/024`, `t/026`, `t/028`, `t/029` and `t/030` build the probe module
   `t/kcprobe/kcprobe.c` (callbacks at the end of a subtransaction and at the
   pre-commit and pre-prepare, which run SQL from the setting `kcprobe.sql` or

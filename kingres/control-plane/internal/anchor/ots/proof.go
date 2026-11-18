@@ -8,11 +8,12 @@ import (
 	"sort"
 )
 
-// Attestation tags (8 bytes).
-var (
-	TagPending = [8]byte{0x83, 0xdf, 0xe3, 0x0d, 0x2e, 0xf9, 0x0c, 0x8e}
-	TagBitcoin = [8]byte{0x05, 0x88, 0x96, 0x0d, 0x73, 0xd7, 0x19, 0x01}
-)
+// TagPending returns the 8-byte tag of a pending attestation, and TagBitcoin that
+// of a Bitcoin attestation. They are functions, not variables, so that no
+// caller can assign them (correction 92).
+func TagPending() [8]byte { return [8]byte{0x83, 0xdf, 0xe3, 0x0d, 0x2e, 0xf9, 0x0c, 0x8e} }
+
+func TagBitcoin() [8]byte { return [8]byte{0x05, 0x88, 0x96, 0x0d, 0x73, 0xd7, 0x19, 0x01} }
 
 // AttKind is the kind of an attestation.
 type AttKind int
@@ -40,7 +41,7 @@ func NewPending(uri string) (Attestation, error) {
 	if err := checkURI([]byte(uri)); err != nil {
 		return Attestation{}, err
 	}
-	return Attestation{Kind: AttPending, URI: uri, Tag: TagPending}, nil
+	return Attestation{Kind: AttPending, URI: uri, Tag: TagPending()}, nil
 }
 
 // NewBitcoin returns a Bitcoin block header attestation.
@@ -48,7 +49,7 @@ func NewBitcoin(height uint64) (Attestation, error) {
 	if height > MaxHeight {
 		return Attestation{}, fmt.Errorf("ots: block height %d too large", height)
 	}
-	return Attestation{Kind: AttBitcoin, Height: height, Tag: TagBitcoin}, nil
+	return Attestation{Kind: AttBitcoin, Height: height, Tag: TagBitcoin()}, nil
 }
 
 const uriChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._/:"
@@ -361,7 +362,7 @@ func (r *reader) attestation() (Attestation, error) {
 	}
 	pr := &reader{b: payload}
 	switch tag {
-	case TagPending:
+	case TagPending():
 		u, err := pr.varbytes(MaxURILen, 0)
 		if err != nil {
 			return Attestation{}, err
@@ -373,7 +374,7 @@ func (r *reader) attestation() (Attestation, error) {
 			return Attestation{}, fmt.Errorf("%w: data after the pending attestation uri", ErrMalformed)
 		}
 		return Attestation{Kind: AttPending, URI: string(u), Tag: tag}, nil
-	case TagBitcoin:
+	case TagBitcoin():
 		h, err := pr.varuint()
 		if err != nil {
 			return Attestation{}, err

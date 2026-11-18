@@ -16,6 +16,8 @@ import (
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/checkpoint"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/signednote"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/statefile"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // exitRow says what one exit site of the source ends a run with, and how to
@@ -56,7 +58,7 @@ func (x *exitEnv) co(more ...string) []string {
 
 // stateAt300 makes a state of size 300 in a fresh directory and returns its path.
 func (x *exitEnv) stateAt300() string {
-	st := filepath.Join(x.t.TempDir(), "state")
+	st := filepath.Join(testdir.New(x.t), "state")
 	if code, out, errs := run(x.t, x.cp("--note", x.oldN, "--state", st)...); code != 0 {
 		x.t.Fatalf("seed: %d %s %s", code, out, errs)
 	}
@@ -64,7 +66,7 @@ func (x *exitEnv) stateAt300() string {
 }
 
 func (x *exitEnv) stateAt700() string {
-	st := filepath.Join(x.t.TempDir(), "state")
+	st := filepath.Join(testdir.New(x.t), "state")
 	if code, out, errs := run(x.t, x.cp("--state", st)...); code != 0 {
 		x.t.Fatalf("seed: %d %s %s", code, out, errs)
 	}
@@ -89,7 +91,7 @@ func takeNames(t *testing.T, state string, size int, root h32) {
 
 // forkSource is a publication whose log of size 400 forks the honest one at 5.
 func (x *exitEnv) forkSource() (dir string, root h32) {
-	dir = x.t.TempDir()
+	dir = testdir.New(x.t)
 	all := leavesSalt(400, 5, "evil")
 	publishLog(x.t, dir, x.p.signer, all, 400)
 	return dir, refMTH(all[:400])
@@ -114,8 +116,8 @@ func flagCases(cmd string, argv ...string) []exitRow {
 func exitRows(x *exitEnv) []exitRow {
 	t := x.t
 	d0 := fx("digests/d0.json")
-	tmp := func(name, content string) string { return writeTemp(t, t.TempDir(), name, content) }
-	missing := func() string { return filepath.Join(t.TempDir(), "no-such-file") }
+	tmp := func(name, content string) string { return writeTemp(t, testdir.New(t), name, content) }
+	missing := func() string { return filepath.Join(testdir.New(t), "no-such-file") }
 	zero := strings.Repeat("00", 32)
 	b64 := func(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
 	someRoot := sha([]byte("some root"))
@@ -180,7 +182,7 @@ func exitRows(x *exitEnv) []exitRow {
 		fn("runDigestChain:inputError#2", 2, func(t *testing.T) []string { return []string{"digest-chain", missing()} }),
 		fn("runDigestChain:inputError#3", 2, func(t *testing.T) []string { return []string{"digest-chain", tmp("d.json", "garbage")} }),
 		exitRow{site: "runDigestChain:inputError#4", status: 2, unix: true, args: func(t *testing.T) []string {
-			d := t.TempDir()
+			d := testdir.New(t)
 			dir := filepath.Join(d, "digests")
 			if err := os.Mkdir(dir, 0o755); err != nil {
 				t.Fatal(err)
@@ -196,11 +198,11 @@ func exitRows(x *exitEnv) []exitRow {
 			return []string{"digest-chain", dir}
 		}},
 		fn("runDigestChain:inputError#5", 2, func(t *testing.T) []string {
-			d := t.TempDir()
+			d := testdir.New(t)
 			writeTemp(t, d, "d.json", "garbage")
 			return []string{"digest-chain", d}
 		}),
-		fn("runDigestChain:inputError#6", 2, func(t *testing.T) []string { return []string{"digest-chain", "--digests", t.TempDir()} }),
+		fn("runDigestChain:inputError#6", 2, func(t *testing.T) []string { return []string{"digest-chain", "--digests", testdir.New(t)} }),
 		row("runDigestChain:finishProblems#1", 1, "digest-chain", fx("digests/d8.json"), fx("digests/other_chain.json")),
 	)
 
@@ -229,11 +231,11 @@ func exitRows(x *exitEnv) []exitRow {
 	add(
 		fn("runCheckpoint:finishPub#1", 2, noTrust),
 		fn("runCheckpoint:finishPub#1", 3, func(t *testing.T) []string {
-			dir := t.TempDir()
+			dir := testdir.New(t)
 			return []string{"checkpoint", "--trust", x.p.trust, "--log", "chain:" + testChain, "--source", dir}
 		}),
 		fn("runCheckpoint:finishPub#1", 1, func(t *testing.T) []string {
-			dir := t.TempDir()
+			dir := testdir.New(t)
 			if err := os.MkdirAll(filepath.Join(dir, "c"), 0o755); err != nil {
 				t.Fatal(err)
 			}
@@ -271,30 +273,30 @@ func exitRows(x *exitEnv) []exitRow {
 
 	// ---- checkpoint --state ----
 	add(
-		fn("applyState:inputError#1", 2, func(t *testing.T) []string { return x.cp("--state", filepath.Join(t.TempDir(), "no", "dir", "s")) }),
-		fn("applyState:fail#1", 2, func(t *testing.T) []string { return x.cp("--state", filepath.Join(t.TempDir(), "no", "dir", "s")) }),
+		fn("applyState:inputError#1", 2, func(t *testing.T) []string { return x.cp("--state", filepath.Join(testdir.New(t), "no", "dir", "s")) }),
+		fn("applyState:fail#1", 2, func(t *testing.T) []string { return x.cp("--state", filepath.Join(testdir.New(t), "no", "dir", "s")) }),
 		exitRow{site: "applyState:fail#2", status: 2, unix: true, args: func(t *testing.T) []string {
-			d := t.TempDir()
+			d := testdir.New(t)
 			if err := os.Chmod(d, 0o777); err != nil {
 				t.Fatal(err)
 			}
 			return x.cp("--state", filepath.Join(d, "s"))
 		}},
 		fn("applyState:fail#3", 2, func(t *testing.T) []string {
-			st := filepath.Join(t.TempDir(), "s")
+			st := filepath.Join(testdir.New(t), "s")
 			release := holdLock(t, st)
 			t.Cleanup(release)
 			return x.cp("--state", st)
 		}),
 		fn("applyState:fail#4", 2, func(t *testing.T) []string {
-			d := t.TempDir()
+			d := testdir.New(t)
 			if err := os.Mkdir(filepath.Join(d, ".kingres-state.lock"), 0o700); err != nil {
 				t.Fatal(err)
 			}
 			return x.cp("--state", filepath.Join(d, "s"))
 		}),
 		never("applyState:fail#5", 2, "guard: the origin was checked below the trusted prefix by verifyNote before the state is looked at"),
-		fn("applyState:fail#6", 2, func(t *testing.T) []string { return x.cp("--state", t.TempDir()) }),
+		fn("applyState:fail#6", 2, func(t *testing.T) []string { return x.cp("--state", testdir.New(t)) }),
 		fn("applyState:fail#7", 2, func(t *testing.T) []string { return x.cp("--state", tmp("s", "")) }),
 		fn("applyState:fail#8", 2, func(t *testing.T) []string { return x.cp("--state", tmp("s", "{garbage")) }),
 		fn("applyState:fail#9", 2, func(t *testing.T) []string {
@@ -330,8 +332,21 @@ func exitRows(x *exitEnv) []exitRow {
 			}
 			return x.cp("--state", st)
 		}),
-		exitRow{site: "applyState:fail#14", status: 2, unix: true, args: func(t *testing.T) []string {
-			d := t.TempDir()
+		// the state is replaced and the flush of the directory fails (L16-05)
+		fn("applyState:fail#14", 2, func(t *testing.T) []string {
+			st := x.stateAt300()
+			old := replaceStateFn
+			t.Cleanup(func() { replaceStateFn = old })
+			replaceStateFn = func(p string, data, was []byte, existed bool, limit int64) error {
+				if err := old(p, data, was, existed, limit); err != nil {
+					return err
+				}
+				return &statefile.DirSyncError{Err: errors.New("injected flush failure")}
+			}
+			return x.cp("--state", st)
+		}),
+		exitRow{site: "applyState:fail#15", status: 2, unix: true, args: func(t *testing.T) []string {
+			d := testdir.New(t)
 			st := filepath.Join(d, "s")
 			if err := os.WriteFile(filepath.Join(d, ".kingres-state.lock"), nil, 0o600); err != nil {
 				t.Fatal(err)
@@ -371,7 +386,7 @@ func exitRows(x *exitEnv) []exitRow {
 	sameSize := func(taken bool) func(t *testing.T) []string {
 		return func(t *testing.T) []string {
 			st := x.stateAt700()
-			dir := t.TempDir()
+			dir := testdir.New(t)
 			all := leavesSalt(700, 3, "other")
 			publishLog(t, dir, x.p.signer, all, 700)
 			if taken {
@@ -403,7 +418,7 @@ func exitRows(x *exitEnv) []exitRow {
 			st := x.stateAt700()
 			s2 := newSigner(77)
 			tr := trustOf(t, keySpec{"old", x.p.signer, `,"revoked":true`}, keySpec{"new", s2, ""})
-			dir := t.TempDir()
+			dir := testdir.New(t)
 			publishLog(t, dir, s2, x.p.all, 300)
 			return []string{"checkpoint", "--trust", tr, "--log", x.p.log(), "--source", dir, "--state", st}
 		}),
@@ -432,10 +447,10 @@ func exitRows(x *exitEnv) []exitRow {
 			return []string{"consistency", "--log", x.p.log(), "--source", x.p.dir, "--old", x.oldN}
 		}),
 		fn("runConsistency:finishPub#1", 3, func(t *testing.T) []string {
-			return []string{"consistency", "--trust", x.p.trust, "--log", "chain:" + testChain, "--source", t.TempDir(), "--old", x.oldN}
+			return []string{"consistency", "--trust", x.p.trust, "--log", "chain:" + testChain, "--source", testdir.New(t), "--old", x.oldN}
 		}),
 		fn("runConsistency:finishPub#1", 1, func(t *testing.T) []string {
-			dir := t.TempDir()
+			dir := testdir.New(t)
 			_ = os.MkdirAll(filepath.Join(dir, "c"), 0o755)
 			writeTemp(t, filepath.Join(dir, "c"), testChain, "a file")
 			return []string{"consistency", "--trust", x.p.trust, "--log", "chain:" + testChain, "--source", dir, "--old", x.oldN}
@@ -509,7 +524,7 @@ func exitRows(x *exitEnv) []exitRow {
 		}),
 		fn("runTrustInit:inputError#9", 2, func(t *testing.T) []string {
 			failTrustWrite(t)
-			return init("--public-key", pubB64, "--out", filepath.Join(t.TempDir(), "never.json"))
+			return init("--public-key", pubB64, "--out", filepath.Join(testdir.New(t), "never.json"))
 		}),
 		never("runTrustInit:inputError#10", 2, "the disk fails while the file is closed"),
 		row("runTrustShow:inputError#1", 2, "trust", "show"),

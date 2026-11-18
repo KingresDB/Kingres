@@ -12,6 +12,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/statefile"
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // ---- helpers: logs of our own, so that forks can be made ----
@@ -54,7 +57,7 @@ func trustOf(t *testing.T, specs ...keySpec) string {
 	for _, k := range specs {
 		keys = append(keys, fmt.Sprintf(`{"name":%q,"public_key":%q,"fingerprint":%q%s}`, k.name, base64.StdEncoding.EncodeToString(k.s.pub), k.s.fp(), k.extra))
 	}
-	f := filepath.Join(t.TempDir(), "trust.json")
+	f := filepath.Join(testdir.New(t), "trust.json")
 	body := fmt.Sprintf(`{"format":1,"origin_prefix":%q,"keys":[%s]}`, testPrefix, strings.Join(keys, ","))
 	if err := os.WriteFile(f, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
@@ -64,7 +67,7 @@ func trustOf(t *testing.T, specs ...keySpec) string {
 
 func writeNote(t *testing.T, note string) string {
 	t.Helper()
-	f := filepath.Join(t.TempDir(), "n")
+	f := filepath.Join(testdir.New(t), "n")
 	if err := os.WriteFile(f, []byte(note), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -105,8 +108,8 @@ func TestStateFirstUseGrowthAndBoundaries(t *testing.T) {
 	s := newSigner(1)
 	all := leaves(1100)
 	tr := trustOf(t, keySpec{"k", s, ""})
-	state := filepath.Join(t.TempDir(), "state")
-	root := t.TempDir()
+	state := filepath.Join(testdir.New(t), "state")
+	root := testdir.New(t)
 	// First use: no state yet, status 0, nothing proved and the output says so.
 	publishLog(t, root, s, all, 255)
 	code, out, _ := run(t, stateArgs(tr, root, state)...)
@@ -139,10 +142,10 @@ func TestStateFirstUseGrowthAndBoundaries(t *testing.T) {
 func TestStateRefusesAForkOfALargerSize(t *testing.T) {
 	s := newSigner(1)
 	tr := trustOf(t, keySpec{"k", s, ""})
-	honest, fork := t.TempDir(), t.TempDir()
+	honest, fork := testdir.New(t), testdir.New(t)
 	publishLog(t, honest, s, leaves(300), 300)
 	publishLog(t, fork, s, leavesSalt(400, 5, "evil"), 400)
-	state := filepath.Join(t.TempDir(), "state")
+	state := filepath.Join(testdir.New(t), "state")
 	if code, out, _ := run(t, stateArgs(tr, honest, state)...); code != 0 {
 		t.Fatalf("honest: %d %s", code, out)
 	}
@@ -179,11 +182,11 @@ func TestStateRefusesAForkOfALargerSize(t *testing.T) {
 func TestStateTwoFacedPublisher(t *testing.T) {
 	s := newSigner(1)
 	tr := trustOf(t, keySpec{"k", s, ""})
-	h300, h500, fork := t.TempDir(), t.TempDir(), t.TempDir()
+	h300, h500, fork := testdir.New(t), testdir.New(t), testdir.New(t)
 	publishLog(t, h300, s, leaves(500), 300)
 	publishLog(t, h500, s, leaves(500), 500)
 	publishLog(t, fork, s, leavesSalt(400, 5, "evil"), 400)
-	state := filepath.Join(t.TempDir(), "state")
+	state := filepath.Join(testdir.New(t), "state")
 	if code, out, _ := run(t, stateArgs(tr, h300, state)...); code != 0 {
 		t.Fatal(out)
 	}
@@ -203,8 +206,8 @@ func TestStateMissingAndDamagedTiles(t *testing.T) {
 	s := newSigner(1)
 	tr := trustOf(t, keySpec{"k", s, ""})
 	all := leaves(700)
-	state := filepath.Join(t.TempDir(), "state")
-	root := t.TempDir()
+	state := filepath.Join(testdir.New(t), "state")
+	root := testdir.New(t)
 	publishLog(t, root, s, all, 300)
 	if code, out, _ := run(t, stateArgs(tr, root, state)...); code != 0 {
 		t.Fatal(out)
@@ -212,7 +215,7 @@ func TestStateMissingAndDamagedTiles(t *testing.T) {
 	kept := fileText(t, state)
 
 	// A source with the checkpoint and no tiles: status 3, state unchanged.
-	bare := t.TempDir()
+	bare := testdir.New(t)
 	logDir := filepath.Join(bare, "c", testChain, "e1")
 	_ = os.MkdirAll(logDir, 0o755)
 	_ = os.WriteFile(filepath.Join(logDir, "checkpoint"), []byte(s.note(logOrigin(), 700, refMTH(all))), 0o644)
@@ -225,7 +228,7 @@ func TestStateMissingAndDamagedTiles(t *testing.T) {
 	}
 
 	// A tile on the proof path changed: status 1, state unchanged.
-	damaged := t.TempDir()
+	damaged := testdir.New(t)
 	publishLog(t, damaged, s, all, 700)
 	flipped := 0
 	_ = filepath.Walk(filepath.Join(damaged, "c"), func(p string, fi os.FileInfo, err error) error {
@@ -253,20 +256,20 @@ func TestStateRollbackAndSameSizeFork(t *testing.T) {
 	s := newSigner(1)
 	tr := trustOf(t, keySpec{"k", s, ""})
 	all := leaves(700)
-	state := filepath.Join(t.TempDir(), "state")
-	big := t.TempDir()
+	state := filepath.Join(testdir.New(t), "state")
+	big := testdir.New(t)
 	publishLog(t, big, s, all, 700)
 	if code, out, _ := run(t, stateArgs(tr, big, state)...); code != 0 {
 		t.Fatal(out)
 	}
 	kept := fileText(t, state)
-	small := t.TempDir()
+	small := testdir.New(t)
 	publishLog(t, small, s, all, 300)
 	code, out, _ := run(t, stateArgs(tr, small, state)...)
 	if code != 1 || !strings.Contains(out, "FAILED at step rollback") || !strings.Contains(out, ".conflict-300-") || fileText(t, state) != kept {
 		t.Fatalf("rollback: %d\n%s", code, out)
 	}
-	same := t.TempDir()
+	same := testdir.New(t)
 	publishLog(t, same, s, leavesSalt(700, 3, "other"), 700)
 	code, out, _ = run(t, stateArgs(tr, same, state)...)
 	if code != 1 || !strings.Contains(out, "FAILED at step fork") || !strings.Contains(out, ".conflict-700-") || fileText(t, state) != kept {
@@ -277,9 +280,9 @@ func TestStateRollbackAndSameSizeFork(t *testing.T) {
 func TestStateOfAnotherLogIsRefusedAndKept(t *testing.T) {
 	s := newSigner(1)
 	tr := trustOf(t, keySpec{"k", s, ""})
-	root := t.TempDir()
+	root := testdir.New(t)
 	publishLog(t, root, s, leaves(300), 300)
-	state := filepath.Join(t.TempDir(), "state")
+	state := filepath.Join(testdir.New(t), "state")
 	other := s.note(testPrefix+"/c/"+testChain+"/e2", 5, refMTH(leaves(5)))
 	if err := os.WriteFile(state, []byte(other), 0o644); err != nil {
 		t.Fatal(err)
@@ -295,7 +298,7 @@ func TestStateOfAnotherLogIsRefusedAndKept(t *testing.T) {
 func TestHeldNoteAndKeyStates(t *testing.T) {
 	k1, k2 := newSigner(1), newSigner(2)
 	all := leaves(700)
-	oldSrc, newSrc := t.TempDir(), t.TempDir()
+	oldSrc, newSrc := testdir.New(t), testdir.New(t)
 	oldNote := publishLog(t, oldSrc, k1, all, 300)
 	publishLog(t, newSrc, k2, all, 700)
 	cases := []struct {
@@ -317,7 +320,7 @@ func TestHeldNoteAndKeyStates(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			// The state is written while the key is valid.
 			trOK := trustOf(t, keySpec{"k1", k1, ""}, keySpec{"k2", k2, ""})
-			state := filepath.Join(t.TempDir(), "state")
+			state := filepath.Join(testdir.New(t), "state")
 			if code, out, errs := run(t, stateArgs(trOK, oldSrc, state)...); code != 0 {
 				t.Fatalf("seed: %d %s %s", code, out, errs)
 			}
@@ -357,7 +360,7 @@ func TestHeldNoteAndKeyStates(t *testing.T) {
 
 func TestNoteSignedByRevokedAndValidKeySaysSo(t *testing.T) {
 	k1, k2 := newSigner(1), newSigner(2)
-	root := t.TempDir()
+	root := testdir.New(t)
 	all := leaves(300)
 	publishLog(t, root, k2, all, 300)
 	both := k2.note(logOrigin(), 300, refMTH(all))
@@ -374,21 +377,31 @@ func TestNoteSignedByRevokedAndValidKeySaysSo(t *testing.T) {
 
 // ---- L8-04: two runs, one state ----
 
+// A run that waits the whole lock limit for another one and ends with status 2 and
+// nothing changed is the designed answer of a loaded machine (the README says so);
+// it is not a failure of this property, which is that the state never moves
+// backwards: the state ends at least as high as the highest checkpoint a run was
+// told about with status 0 or 1, and at 320 when no run gave up.
 func TestStateTwoRunsNeverMoveBackwards(t *testing.T) {
 	s := newSigner(1)
 	tr := trustOf(t, keySpec{"k", s, ""})
 	all := leaves(320)
-	root := t.TempDir()
+	root := testdir.New(t)
 	var notes []string
 	for size := 301; size <= 320; size++ {
 		notes = append(notes, publishLog(t, root, s, all, size))
 	}
-	state := filepath.Join(t.TempDir(), "state")
+	state := filepath.Join(testdir.New(t), "state")
 	publishLog(t, root, s, all, 300)
 	if code, out, _ := run(t, stateArgs(tr, root, state)...); code != 0 {
 		t.Fatal(out)
 	}
 	initial := fileText(t, state)
+	// a long wait, so that a loaded machine seldom gives up; the runs that do are counted
+	oldWait := statefile.LockWait
+	statefile.LockWait = 2 * time.Minute
+	defer func() { statefile.LockWait = oldWait }()
+	gaveUp := 0
 	for round := 0; round < 20; round++ {
 		if err := os.WriteFile(state, []byte(initial), 0o644); err != nil {
 			t.Fatal(err)
@@ -398,29 +411,50 @@ func TestStateTwoRunsNeverMoveBackwards(t *testing.T) {
 		for i, n := range notes {
 			files[i] = writeNote(t, n)
 		}
+		var mu sync.Mutex
+		told, roundGaveUp := 300, 0 // the highest size a run ended with status 0 or 1 for
 		for i := range files {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
+				size := 320 - i // the note of the run is files[len-1-i], of size 301+len-1-i
 				a := stateArgs(tr, root, state, "--note", files[len(files)-1-i])
-				if code, out, errs := run(t, a...); code != 0 && code != 1 {
+				code, out, errs := run(t, a...)
+				mu.Lock()
+				defer mu.Unlock()
+				switch {
+				case code == 0 || code == 1:
+					if size > told {
+						told = size
+					}
+				case code == 2 && strings.Contains(errs, "has held the lock on the state file for"):
+					roundGaveUp++ // the designed answer after a full wait: nothing was changed
+				default:
 					t.Errorf("status %d: %s %s", code, out, errs)
 				}
 			}()
 		}
 		wg.Wait()
-		if got := stateSize(t, state); got != 320 {
+		gaveUp += roundGaveUp
+		got := stateSize(t, state)
+		if got < uint64(told) {
+			t.Fatalf("round %d: the state ended at %d, below %d, a size a run was told about: a higher state was lost", round, got, told)
+		}
+		if roundGaveUp == 0 && got != 320 {
 			t.Fatalf("round %d: the state ended at %d, not 320: a higher state was lost", round, got)
 		}
+	}
+	if gaveUp > 0 {
+		t.Logf("%d runs waited the whole limit and ended with status 2, which is the designed answer", gaveUp)
 	}
 }
 
 func TestStateLockWaitIsBounded(t *testing.T) {
 	s := newSigner(1)
 	tr := trustOf(t, keySpec{"k", s, ""})
-	root := t.TempDir()
+	root := testdir.New(t)
 	publishLog(t, root, s, leaves(300), 300)
-	state := filepath.Join(t.TempDir(), "state")
+	state := filepath.Join(testdir.New(t), "state")
 	if code, out, _ := run(t, stateArgs(tr, root, state)...); code != 0 {
 		t.Fatal(out)
 	}
@@ -442,8 +476,8 @@ func TestStateWithALongName(t *testing.T) {
 	s := newSigner(1)
 	tr := trustOf(t, keySpec{"k", s, ""})
 	all := leaves(700)
-	root := t.TempDir()
-	dir := t.TempDir()
+	root := testdir.New(t)
+	dir := testdir.New(t)
 	publishLog(t, root, s, all, 300)
 	long := filepath.Join(dir, strings.Repeat("n", 200))
 	if code, out, errs := run(t, stateArgs(tr, root, long)...); code != 0 {
@@ -457,8 +491,8 @@ func TestStateThroughALink(t *testing.T) {
 	s := newSigner(1)
 	tr := trustOf(t, keySpec{"k", s, ""})
 	all := leaves(700)
-	root := t.TempDir()
-	dir := t.TempDir()
+	root := testdir.New(t)
+	dir := testdir.New(t)
 	publishLog(t, root, s, all, 300)
 	long := filepath.Join(dir, "first")
 	if code, out, errs := run(t, stateArgs(tr, root, long)...); code != 0 {

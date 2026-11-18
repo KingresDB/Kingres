@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // L10-10: a value is no longer clipped before it is escaped (a clip at 100, 60,
@@ -40,7 +42,7 @@ func TestValuesAreNotClippedBeforeTheyAreEscaped(t *testing.T) {
 	long := strings.Repeat("p", 150)
 	var errs []string
 	for _, tail := range []string{"1", "2"} {
-		_, _, e := run(t, x.cp("--state", filepath.Join(t.TempDir(), long+tail, "state"))...)
+		_, _, e := run(t, x.cp("--state", filepath.Join(testdir.New(t), long+tail, "state"))...)
 		errs = append(errs, e)
 	}
 	if errs[0] == errs[1] {

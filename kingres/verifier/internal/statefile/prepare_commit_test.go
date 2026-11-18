@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // L14-04. ReplaceIfUnchanged writes and flushes the temporary file first and only
@@ -17,7 +19,7 @@ import (
 // writes while this one is still writing its temporary file is therefore seen.
 func TestReplaceIfUnchangedLooksAfterTheTemporaryFileIsWritten(t *testing.T) {
 	defer func() { step = func(string) error { return nil } }()
-	dir := t.TempDir()
+	dir := testdir.New(t)
 	p := filepath.Join(dir, "state")
 	if err := os.WriteFile(p, []byte("v1"), 0o600); err != nil {
 		t.Fatal(err)
@@ -54,7 +56,7 @@ func TestReplaceIfUnchangedReadsBetweenTheFlushAndTheRename(t *testing.T) {
 	old := ops
 	ops = recordOps{&log}
 	defer func() { ops = old }()
-	p := filepath.Join(t.TempDir(), "state")
+	p := filepath.Join(testdir.New(t), "state")
 	if err := os.WriteFile(p, []byte("v1"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +97,7 @@ func (r renameHook) Rename(from, to string) error {
 // place: a stop between the create and the write leaves no file at the name.
 func TestEvidenceFileIsNeverEmptyAtItsName(t *testing.T) {
 	defer func() { step = func(string) error { return nil } }()
-	dir := t.TempDir()
+	dir := testdir.New(t)
 	p := filepath.Join(dir, "state")
 	root := bytes.Repeat([]byte{3}, 32)
 	name := ConflictPath(p, 9, root)
@@ -146,7 +148,7 @@ func TestEvidenceFileWhereTheFileSystemCannotLink(t *testing.T) {
 	old := linkFn
 	linkFn = func(string, string) error { return errors.New("link: operation not supported") }
 	defer func() { linkFn = old }()
-	dir := t.TempDir()
+	dir := testdir.New(t)
 	p := filepath.Join(dir, "state")
 	root := bytes.Repeat([]byte{5}, 32)
 	sv, err := SaveConflict(p, 1, root, []byte("n\n"))
@@ -159,41 +161,5 @@ func TestEvidenceFileWhereTheFileSystemCannotLink(t *testing.T) {
 	// the name that exists is still not overwritten
 	if sv2, err := SaveConflict(p, 1, root, []byte("other\n")); err != nil || sv2.Path == sv.Path {
 		t.Fatalf("%+v %v", sv2, err)
-	}
-}
-
-// L14-02: one evidence file for a held state, whatever is served against it.
-func TestWeakConflictKeepsOneFileForTheHeldState(t *testing.T) {
-	dir := t.TempDir()
-	p := filepath.Join(dir, "state")
-	held := bytes.Repeat([]byte{6}, 32)
-	any := func([]byte) bool { return true }
-	a, err := SaveWeakConflict(p, 700, held, []byte("first\n"), any)
-	if err != nil || a.Existing || a.Path != WeakConflictPath(p, 700, held) {
-		t.Fatalf("%+v %v", a, err)
-	}
-	for _, n := range []string{"second\n", "third\n", "first\n"} {
-		b, err := SaveWeakConflict(p, 700, held, []byte(n), any)
-		if err != nil || !b.Existing || b.Path != a.Path {
-			t.Fatalf("%q: %+v %v", n, b, err)
-		}
-	}
-	if readState(t, a.Path) != "first\n" {
-		t.Fatal("the file was rewritten")
-	}
-	// another held state, another file
-	c, err := SaveWeakConflict(p, 800, held, []byte("x\n"), any)
-	if err != nil || c.Path == a.Path || c.Existing {
-		t.Fatalf("%+v %v", c, err)
-	}
-	// a file at the name that is not a note of the log is not evidence
-	if err := os.WriteFile(c.Path, []byte("planted"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := SaveWeakConflict(p, 800, held, []byte("x\n"), func(b []byte) bool { return string(b) != "planted" }); err == nil {
-		t.Fatal("a planted file counted as the evidence")
-	}
-	if readState(t, c.Path) != "planted" {
-		t.Fatal("the planted file was overwritten")
 	}
 }

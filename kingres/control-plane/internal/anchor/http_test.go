@@ -130,7 +130,7 @@ func TestNewHTTPClient(t *testing.T) {
 }
 
 func TestPayloadCheck(t *testing.T) {
-	good, err := NewPayload("ab12", note("17", root32(), sigLine))
+	good, err := NewPayload("ab12", note("17", root32(), sigLine), t0)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -39,14 +39,16 @@
 //
 //	{"tsa_url":"<configured url>","token_der_b64":"<std base64, padded, of the token>",
 //	 "gen_time":"2026-12-01T10:00:00Z","serial":"<decimal>","policy":"<dotted OID>",
-//	 "recorded_by":"cluster"}
+//	 "signer_key_sha256":"<64 hex>","recorded_by":"cluster"}
 //
 // token_der_b64 is the DER of the TimeStampToken, that is the ContentInfo
 // (SEQUENCE { OID 1.2.840.113549.1.7.2, [0] SignedData }), byte for byte as
 // the TSA sent it inside the TimeStampResp, with the certificates it carried
 // (certReq is TRUE in the request). gen_time is genTime truncated to whole
 // seconds, in UTC, format "2006-01-02T15:04:05Z"; serial is the TSTInfo serial
-// in decimal; policy is the TSTInfo policy. Receipt.EvidenceTime is genTime
+// in decimal; policy is the TSTInfo policy; signer_key_sha256 is the lower case hex
+// SHA-256 of the DER SubjectPublicKeyInfo of the signing certificate (what
+// SignerKeyHash computes, correction 97). Receipt.EvidenceTime is genTime
 // (with its sub-seconds); Receipt.State is "anchored" at once; NextCheck is nil.
 // The URL has no query and no user information (the file is public). The token
 // is accepted by Submit only if genTime is within Config.MaxSkewSeconds (default
@@ -74,8 +76,42 @@
 // stored bytes of an intermediate or a root that the token carries are not
 // authenticated, which is why the roots are the verifier's own.
 //
+// # The pin of the signer (corrections 92 and 97)
+//
+// Config.SignerKeySHA256 (JSON "signerKeySha256", 64 lower case hexadecimal
+// digits) optionally pins the signer: the SHA-256 of the DER
+// SubjectPublicKeyInfo of the signing certificate, which SignerKeyHash computes
+// (openssl: x509 -pubkey -noout, pkey -pubin -outform der, dgst -sha256). The
+// public key is pinned and not the certificate, because an authority renews its
+// certificate more often than its key. A token whose signer has another key is
+// refused with Code "signer_not_pinned" (permanent) even when it chains to the
+// roots. Without a pin any authority under the configured roots is accepted and
+// the name in the token is only checked against the token's own certificate:
+// an operator who means one authority says so with the pin. Expect.SignerKeySHA256
+// is the same pin for VerifyToken. VerifyStoredToken and VerifyEvidence take the
+// pin as an argument (nil: no pin), so that an auditor who means one authority
+// applies it to stored evidence; VerifyEvidence also checks that the evidence
+// carries the hash of the key that signed the token. When several certificates of
+// a token match the sid of its SignerInfo (an older certificate of the same key
+// id or issuer and serial listed before the one that signed), every one is tried
+// as the signer and the first that passes all the checks is the signer; when none
+// does, the error is the first one's.
+//
 // # What the caller must do
 //
+//   - Know that the name check can refuse an honest authority, and that the
+//     refusal is permanent (A4-08, correction 97): the TSTInfo "tsa" name is
+//     compared with the names of the signing certificate by the narrow profile
+//     below, so a certificate whose PrintableString holds a character outside
+//     the PrintableString set (some real certificates carry an ampersand or an
+//     at sign), or whose name is the same text in another Unicode normalisation
+//     (composed against decomposed letters), or in another string type than the
+//     "tsa" field, is refused with Code "tsa_name_mismatch" on every attempt: a
+//     Retry gets the same refusal. The operator then asks the
+//     authority to issue tokens whose "tsa" field is byte for byte a name of its
+//     certificate (or to leave the field out, which RFC 3161 allows), or uses
+//     another authority; there is no switch that turns the check off, and the pin
+//     (Config.SignerKeySHA256) does not replace it.
 //   - Load the CA bundle named by Config.CABundlePath itself and hand it to
 //     ParseBundle (self-signed certificates become trust anchors, the rest
 //     intermediates). This package reads no file.
@@ -88,7 +124,12 @@
 //     5, status 0 or 1 without a token, a wrong content type) is permanent.
 //     anchor.CodeOf gives a stable tag (the Code* constants and "tsa_waiting",
 //     "tsa_rejected", "tsa_unavailable", "tsa_revocation", "no_token",
-//     "content_type", "http_status", "transport").
+//     "content_type", "http_status", "transport"). The alert text must come
+//     from the code and the text of the error, not from the class: "time_skew"
+//     and "chain_not_trusted_now" are of class refused (retried 1, 5, 15
+//     minutes, then failed) and are problems of clocks and of the authority's
+//     certificate, not of credentials, and their text says so and says what to
+//     do.
 //   - Raise ledgerAnchorBehind from the age of the newest anchor, not from the
 //     token: a token whose genTime is more than the tolerance from the clock is
 //     not recorded at all (time_skew).
@@ -143,9 +184,23 @@
 //   - SignedData version and SignerInfo version: 1 or 3.
 //   - The policy: when Config.PolicyOID is set the token's policy must equal
 //     it; otherwise any policy is accepted and recorded.
-//   - The TSTInfo "tsa" field, when present, must be the subject, a directoryName,
-//     DNS name, URI or e-mail address of the subject alternative name of the
-//     signer (RFC 3161 2.4.2); a GeneralName of another kind does not match.
+//   - The TSTInfo "tsa" field, when present, must correspond to a name of the
+//     signing certificate (RFC 3161 2.4.2): the subject or a directoryName of
+//     the subject alternative name, compared by the decoded attribute values
+//     and not by the bytes, with a narrow profile (correction 92): a value that
+//     is not valid in its string type (invalid UTF-8, a lone surrogate, an odd
+//     length, a byte outside the type) is compared by its bytes only and never
+//     equals another value; the letters A to Z are folded to lower case and no
+//     other character is (the Kelvin sign is not a k); leading and trailing
+//     ASCII spaces are removed and runs of ASCII spaces made one, and no other
+//     character is white space (a no-break space, a tab and an ideographic space
+//     stay what they are; a value of only spaces is one space, not empty); a
+//     TeletexString is decoded only when every byte is ASCII and is otherwise
+//     compared by its bytes (T.61 is not Latin-1); a DNS name (ASCII case
+//     ignored), URI, e-mail
+//     address or IP address of the alternative names; or an otherName that is
+//     one of them byte for byte. The token is refused (tsa_name_mismatch) only
+//     when no name of the certificate corresponds.
 //     A TSTInfo extension is accepted if it is not critical and ignored.
 //   - The RSA key of the signer must have 2048 bits or more (the floor of the
 //     toolchain would let 1024 pass, and a GODEBUG setting lower still).

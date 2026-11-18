@@ -46,7 +46,9 @@ type Checkpoint struct {
 func ValidOrigin(s string) bool { return len(s) <= MaxOriginSize && ledgerkeys.ValidKeyName(s) }
 
 // Text returns the three lines (and the extension lines), each ended by a
-// newline. It refuses a checkpoint that ParseCheckpoint would refuse.
+// newline. It refuses everything ParseCheckpoint refuses (an extension line
+// holds no newline or other control byte, and there are at most
+// MaxExtensionLines of them), so that ParseCheckpoint(Text(c)) is c.
 func (c Checkpoint) Text() ([]byte, error) {
 	if !ValidOrigin(c.Origin) {
 		return nil, cpErr("the origin %q is not valid, expected 1 to %d bytes without spaces, plus signs or control characters", clipStr(c.Origin), MaxOriginSize)
@@ -65,6 +67,11 @@ func (c Checkpoint) Text() ([]byte, error) {
 	for _, e := range c.Extensions {
 		if e == "" {
 			return nil, cpErr("an extension line is empty")
+		}
+		if strings.Contains(e, "\n") {
+			// One string is one line: a newline inside it would be read back as
+			// two lines, and as more lines than the limit allows.
+			return nil, cpErr("an extension line holds a newline")
 		}
 		b.WriteString(e + "\n")
 	}
@@ -147,10 +154,35 @@ func SignCheckpoint(ctx context.Context, c Checkpoint, signers ...ledgerkeys.Sig
 	return n.Marshal()
 }
 
+// ErrUntrustedLine is returned by ResignCheckpoint for a note that has a
+// signature line under the name of the log (its origin) whose key id belongs to
+// none of the trusted keys and none of the new signers. The verifier ignores a
+// line that matches no key of its trust file, but refuses the whole note when
+// the line matches a key that its trust file lists as usable and does not
+// verify; so such a line is either a forgery, or the sign that trusted does not
+// hold every key of the trust file. ResignCheckpoint cannot tell which and
+// refuses to carry the line along (it would not drop it silently: the caller
+// decides, by completing trusted or by making the checkpoint again).
+var ErrUntrustedLine = errors.New("ledgerlog: the note has a signature line under the key name of the log whose key id is that of no trusted key")
+
 // ResignCheckpoint adds the signatures of more signers to a signed checkpoint
 // (a rotation: the latest checkpoint of a log that no longer grows gets the
-// new key's signature). A signer that signed already is refused.
-func ResignCheckpoint(ctx context.Context, note []byte, more ...ledgerkeys.Signer) ([]byte, error) {
+// new key's signature). trusted must be every public key of the trust file for
+// the log, whatever its state (usable, retired, revoked, and the next keys the
+// trust file lists): the note is verified under them first, as VerifyNote does,
+// and it is refused when none of its lines verifies or a line of a trusted key
+// does not, so a new signature is never attached to a text that nobody
+// verified.
+//
+// The result is never a note that the verifier refuses for a reason this
+// function can see. It is refused (before anything is signed) when: a new
+// signer signed already; the key id of any new signer, or of any trusted key,
+// equals that of a different key among them under the origin, whether or not
+// that key has a line in the note (ledgerkeys.ErrKeyIDCollision, with both
+// fingerprints); or the note holds a line under the origin whose key id is that
+// of no trusted key and no new signer (ErrUntrustedLine). Lines under other
+// names (cosignatures of a witness) are kept as they are.
+func ResignCheckpoint(ctx context.Context, note []byte, trusted []ed25519.PublicKey, more ...ledgerkeys.Signer) ([]byte, error) {
 	n, err := ParseNote(note)
 	if err != nil {
 		return nil, err
@@ -159,8 +191,37 @@ func ResignCheckpoint(ctx context.Context, note []byte, more ...ledgerkeys.Signe
 	if err != nil {
 		return nil, err
 	}
+	keys := make([]NoteKey, 0, len(trusted))
+	for _, p := range trusted {
+		keys = append(keys, NoteKey{Name: c.Origin, Public: p})
+	}
+	if _, err := VerifyNote(n, keys); err != nil {
+		return nil, fmt.Errorf("ledgerlog: the checkpoint to re-sign does not verify under the trusted keys: %w", err)
+	}
+	known := append([]ed25519.PublicKey(nil), trusted...)
 	for _, s := range more {
-		if err := n.AddSignature(ctx, c.Origin, s); err != nil {
+		known = append(known, s.Public())
+	}
+	// Every key that can have a line, trusted or new, against every other: a
+	// collision with a key that has no line in the note counts, because the
+	// verifier lists it too.
+	if err := ledgerkeys.CheckKeyIDs(c.Origin, known...); err != nil {
+		return nil, err
+	}
+	ids := map[uint32]bool{}
+	for _, p := range known {
+		ids[ledgerkeys.KeyID(c.Origin, p)] = true
+	}
+	for _, s := range n.Signatures {
+		if s.Name == c.Origin && !ids[s.ID] {
+			return nil, fmt.Errorf("%w: id %08x; pass every key of the trust file in trusted, or make the checkpoint again", ErrUntrustedLine, s.ID)
+		}
+	}
+	for _, s := range more {
+		// known is nil: every collision among the keys that are named was reported
+		// above with both fingerprints; what addSignature can still meet is a line
+		// of a new signer that is already in the note, or one forged under its id.
+		if err := n.addSignature(ctx, c.Origin, s, nil); err != nil {
 			return nil, err
 		}
 	}

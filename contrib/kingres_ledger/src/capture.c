@@ -544,17 +544,28 @@ kingres_ledger_block_modify(PG_FUNCTION_ARGS)
 	 */
 	if (strcmp(trigdata->tg_trigger->tgname, KL_TRIGGER_GUARD_WRITE) == 0)
 	{
+		HeapTuple	rettup = trigdata->tg_trigtuple;
+
 		if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
 		{
 			if (!kl_insert_allowed())
 				kl_refuse_write_rel(trigdata->tg_relation, true);
-			/* A superuser's write by hand leaves a record (README). */
+			/*
+			 * A superuser's write by hand takes the locks of the writers
+			 * first, so that it cannot interleave with them (L15-05), and
+			 * leaves a record (README).
+			 */
+			if (kl_insert_by_hand())
+			{
+				kl_lock_for_manual_write(trigdata->tg_relation);
+				rettup = kl_manual_write_identifier(trigdata->tg_relation, rettup);
+			}
 			if (kl_insert_is_manual(trigdata->tg_relation))
-				kl_record_manual_insert(trigdata->tg_relation, trigdata->tg_trigtuple);
+				kl_record_manual_insert(trigdata->tg_relation, rettup);
 		}
 		else if (!kl_pending_delete_allowed(trigdata->tg_relation))
 			kl_refuse_write_rel(trigdata->tg_relation, false);
-		return PointerGetDatum(trigdata->tg_trigtuple);
+		return PointerGetDatum(rettup);
 	}
 
 	/*
@@ -564,7 +575,16 @@ kingres_ledger_block_modify(PG_FUNCTION_ARGS)
 	if (TRIGGER_FIRED_BY_DELETE(trigdata->tg_event) &&
 		TRIGGER_FIRED_FOR_ROW(trigdata->tg_event) &&
 		kl_manual_delete_allowed(trigdata->tg_relation))
+	{
+		/*
+		 * A recorded digest that is deleted by hand leaves its identifier in
+		 * ledger_removed, as ledger_remove_stray does, so that the identifier
+		 * does not come back (L17-06).
+		 */
+		kl_record_manual_digest_delete(trigdata->tg_relation,
+									   trigdata->tg_trigtuple);
 		return PointerGetDatum(trigdata->tg_trigtuple);
+	}
 
 	/* INSERT: the only other trigger that fires on an insert is the one of a history table. */
 	if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))

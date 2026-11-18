@@ -37,6 +37,7 @@ SELECT name, setting, unit, vartype, enumvals, context, boot_val,
  ORDER BY name;
                   name                  | setting  | unit | vartype |         enumvals          |  context  | boot_val | min_val | max_val  
 ----------------------------------------+----------+------+---------+---------------------------+-----------+----------+---------+----------
+ kingres_columnar.check_gate            | 0        |      | integer |                           | superuser | 0        | 0       | 1000000
  kingres_columnar.chunk_row_count       | 10000    |      | integer |                           | user      | 10000    | 100     | 100000
  kingres_columnar.compression           | auto     |      | enum    | {auto,none,pglz,lz4,zstd} | user      | auto     |         | 
  kingres_columnar.compression_level     | 3        |      | integer |                           | user      | 3        | 1       | 19
@@ -46,7 +47,7 @@ SELECT name, setting, unit, vartype, enumvals, context, boot_val,
  kingres_columnar.orphan_notes_max      | 10000    |      | integer |                           | superuser | 10000    | 1       | 10000
  kingres_columnar.stripe_row_count      | 150000   |      | integer |                           | user      | 150000   | 1000    | 10000000
  kingres_columnar.write_buffer_memory   | 131072   | kB   | integer |                           | user      | 131072   |         | 
-(9 rows)
+(10 rows)
 
 SHOW kingres_columnar.compression;
  kingres_columnar.compression 

@@ -7,13 +7,15 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // L12-02: a write is made only over the state that the decision was made on. A
 // late writer, which decided on an older state, finds another one and writes
 // nothing.
 func TestReplaceIfUnchangedWritesOnlyOverWhatWasRead(t *testing.T) {
-	dir := t.TempDir()
+	dir := testdir.New(t)
 	p := filepath.Join(dir, "state")
 	if err := os.WriteFile(p, []byte("v1"), 0o600); err != nil {
 		t.Fatal(err)

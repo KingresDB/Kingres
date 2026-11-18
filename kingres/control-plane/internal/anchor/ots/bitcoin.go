@@ -31,6 +31,14 @@ type HeaderResult struct {
 	// Hash is the double SHA-256 of the header in internal byte order (the
 	// block id is this value reversed).
 	Hash [32]byte
+	// Bits is the compact target of the header (bytes 72 to 76).
+	Bits uint32
+	// Work is the expected number of double SHA-256 evaluations that a header
+	// of the header's target costs: 2^256 / (target + 1). Difficulty 1 is about
+	// 2^32; a block of 2025 is about 2^79. It is what the header proves, as
+	// far as it proves anything: that someone spent about that much work on
+	// some header (not that the header is in the chain).
+	Work *big.Int
 }
 
 // MerkleRoot returns the merkle root field of a block header (bytes 36 to 68,
@@ -69,16 +77,22 @@ func CompactToTarget(bits uint32) (*big.Int, error) {
 	return t, nil
 }
 
-// headerWork is the work check that CheckAgainstHeader and the header source
-// of Upgrade use. A test replaces it, because a header that passes the real
-// check cannot be made without mining and a merkle root that is the result of
-// a chain of SHA-256 operations cannot be put in a real header.
-var headerWork = CheckHeader
-
 // CheckHeader checks that the header hashes to a value not above its own
 // target and that the target is not easier than the main chain's limit
-// (0x1d00ffff). It does not and cannot show that the header is on the best chain.
+// (0x1d00ffff, difficulty 1: about 2^32 evaluations). It does not and cannot
+// show that the header is on the best chain, and it proves very little work
+// (a header of difficulty 1 passes): the check that Upgrade and CheckEvidence
+// apply is CheckHeaderAt, which adds a floor tied to the height.
 func CheckHeader(header []byte) (HeaderResult, error) {
+	limit, _ := CompactToTarget(powLimitBits)
+	return checkHeaderWith(header, limit, nil)
+}
+
+// checkHeaderWith is the work check with its two bounds as arguments: limit is
+// the easiest target any header may have (the chain's limit), maxTarget, when not
+// nil, the floor (the easiest target accepted). The tests use it with bounds
+// low enough to mine a header in a second.
+func checkHeaderWith(header []byte, limit, maxTarget *big.Int) (HeaderResult, error) {
 	var res HeaderResult
 	if len(header) != HeaderSize {
 		return res, fmt.Errorf("%w: %d bytes, want %d", ErrBadHeader, len(header), HeaderSize)
@@ -88,9 +102,11 @@ func CheckHeader(header []byte) (HeaderResult, error) {
 	if err != nil {
 		return res, err
 	}
-	limit, _ := CompactToTarget(powLimitBits)
 	if target.Cmp(limit) > 0 {
 		return res, fmt.Errorf("%w: target easier than the proof-of-work limit", ErrBadHeader)
+	}
+	if maxTarget != nil && target.Cmp(maxTarget) > 0 {
+		return res, fmt.Errorf("%w: the work of the header is below the floor for its height", ErrBadHeader)
 	}
 	h1 := sha256.Sum256(header)
 	res.Hash = sha256.Sum256(h1[:])
@@ -102,7 +118,78 @@ func CheckHeader(header []byte) (HeaderResult, error) {
 		return res, fmt.Errorf("%w: hash does not meet the target", ErrBadHeader)
 	}
 	res.Time = time.Unix(int64(binary.LittleEndian.Uint32(header[68:72])), 0).UTC()
+	res.Bits = bits
+	res.Work = new(big.Int).Div(new(big.Int).Lsh(big.NewInt(1), 256), new(big.Int).Add(target, big.NewInt(1)))
 	return res, nil
+}
+
+// DefaultWorkSlack is how many times easier than the target of the nearest
+// earlier checkpoint of the table (the real headers of testdata/headers.txt) a
+// header's target may be: the default minimum-work rule is "the difficulty is at
+// least 1/16 of that of the last known real header at or below the height". The
+// factor leaves room for a fall of the difficulty (the largest fall in the
+// history of the chain, in 2021, was about 28 percent in one step) and is
+// small beside the rise since the checkpoint was taken.
+const DefaultWorkSlack = 16
+
+// MaxWorkSlack is the largest Options.WorkSlack that New accepts (2^20). The
+// target of the newest checkpoint is about 2^177 and the target of difficulty 1
+// about 2^224, so this slack keeps the floor of every height at or after the
+// newest checkpoint more than 2^26 times below difficulty 1: no configuration
+// of the option admits a header of difficulty 1 for a height of the present era
+// (A4-05, correction 96).
+const MaxWorkSlack = 1 << 20
+
+// NewestCheckpoint returns the height and the block time (the time field of the
+// real header) of the newest entry of the table of checkpoints, the one the work
+// floor of every later height is taken from. The floor does not follow the
+// chain: it is the difficulty of that block divided by the slack, whatever the
+// difficulty is when the claim is checked, so a table that is not extended makes
+// the floor weaker every year as difficulty rises. The table is extended at each
+// release (a header of a recent block, with its row in testdata/headers.txt), and
+// a caller can warn when the time returned is old: for instance when it is more
+// than a year behind the clock of the server.
+func NewestCheckpoint() (height uint64, blockTime time.Time) {
+	c := checkpoints[len(checkpoints)-1]
+	return c.height, time.Unix(c.time, 0).UTC()
+}
+
+// MaxTargetAt is the easiest target that CheckHeaderAt accepts for a header
+// of the block at height: slack times the target of the nearest checkpoint
+// at or below height (the table is facts of the public chain, see claims.go).
+// slack below 1 is taken as 1.
+func MaxTargetAt(height uint64, slack uint) *big.Int {
+	if slack < 1 {
+		slack = 1
+	}
+	var bits uint32
+	for _, c := range checkpoints {
+		if c.height <= height {
+			bits = c.bits
+		}
+	}
+	t, _ := CompactToTarget(bits)
+	return t.Mul(t, new(big.Int).SetUint64(uint64(slack)))
+}
+
+// CheckHeaderFloor is CheckHeader plus a minimum of work: the target of the
+// header must not exceed maxTarget (a target above it is an error that wraps
+// ErrBadHeader). It is the work rule with the floor as an argument; the tests
+// use it with a floor low enough to mine a header in a second.
+func CheckHeaderFloor(header []byte, maxTarget *big.Int) (HeaderResult, error) {
+	limit, _ := CompactToTarget(powLimitBits)
+	return checkHeaderWith(header, limit, maxTarget)
+}
+
+// CheckHeaderAt is the work rule of Upgrade and CheckEvidence (correction 91):
+// CheckHeader, and a target no easier than DefaultWorkSlack times that of the
+// nearest checkpoint at or below height. A header of difficulty 1, which costs
+// about 2^32 evaluations, is refused for every height of the chain's present
+// era (its target is more than 2^40 times above the floor); a real header of
+// that era passes. What the check proves and what it does not is in the
+// package documentation ("What header_checked proves").
+func CheckHeaderAt(header []byte, height uint64) (HeaderResult, error) {
+	return CheckHeaderFloor(header, MaxTargetAt(height, DefaultWorkSlack))
 }
 
 // CheckAgainstHeader checks the proof against a block header the caller
@@ -112,7 +199,7 @@ func CheckHeader(header []byte) (HeaderResult, error) {
 // digest lead to, the merkle root the proof commits to) must equal the
 // header's merkle root field. The result carries the header time.
 func CheckAgainstHeader(root *Node, height uint64, header []byte) (HeaderResult, error) {
-	res, err := headerWork(header)
+	res, err := CheckHeader(header)
 	if err != nil {
 		return res, err
 	}

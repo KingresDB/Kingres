@@ -942,7 +942,7 @@ headers is for the operator to learn from the **Test** button, which checks it.
 console needs the type-"compliance" confirmation and shows the retention date), `retentionDays`
 (default 3650, range 1 to 36500), `ifNoneMatch` (`auto` | `on` | `off`; `auto` uses it and falls back
 to a check-before-write when the store rejects it with 501 or 400), `caBundlePath` (PEM, optional).
-**Secret**: access key id and secret access key (and an optional session token), 6.8.
+**Secret**: access key id and secret access key (and an optional session token), 6.8. (Replaced by correction 63 of section 14.)
 
 **Submit (steps, exact):**
 
@@ -959,10 +959,10 @@ to a check-before-write when the store rejects it with 501 or 400), `caBundlePat
    body the earlier attempt succeeded (a crash before the record was written): treat as success, read
    the version as in 3. If the bytes differ: **conflict**: a different aggregate checkpoint of the
    same size exists in the bucket. State `failed`, alert `ledgerAnchorConflict` (critical), no retry,
-   no overwrite. This is exactly what rewriting history looks like to the cluster.
+   no overwrite. This is exactly what rewriting history looks like to the cluster. (Replaced by correction 63 of section 14.)
 5. Evidence: `{"endpoint": "...", "bucket": "...", "key": "...", "version_id": "...", "etag": "...",
    "lock_mode": "COMPLIANCE", "retain_until": "...", "last_modified": "...", "recorded_by": "cluster"}`.
-   `EvidenceTime` = `last_modified`.
+   `EvidenceTime` = `last_modified`. (Replaced by correction 61 of section 14.)
 
 **What the verifier checks later (7.4):** the note bytes in the evidence or fetched equal a
 well-formed signed note whose text hashes to the payload digest and whose signature verifies under
@@ -1000,7 +1000,7 @@ username and password.
    RFC 3161 requires; the certificate chains to `caBundlePath` with the validity checked **at
    `genTime`**; the CMS signature verifies (RSA PKCS#1 v1.5 or ECDSA, SHA-256 or SHA-384; others
    rejected); `genTime` is within 5 minutes of the leader's clock, else the record is accepted but the
-   alert `ledgerAnchorBehind` carries the skew.
+   alert `ledgerAnchorBehind` carries the skew. (Replaced by correction 62 of section 14.)
 5. Evidence: `{"tsa_url": "...", "token_der_b64": "...", "gen_time": "...", "serial": "...",
    "policy": "...", "recorded_by": "cluster"}`. `EvidenceTime` = `genTime`; the record is `anchored`
    at once (no upgrade).
@@ -1045,7 +1045,7 @@ number configured if smaller), `upgradeTimeoutDays` (default 7). No secret.
    not needed (whether the reference client's `stamp` adds one is not verified here).
 2. If at least `minCalendars` answered: the record is `submitted`, evidence `{"digest": d_hex,
    "calendars": [{"uri": "...", "fragment_b64": "..."}], "bitcoin": null}`; with fewer it stays
-   `pending` and is retried (a calendar that answered is not asked again; its fragment is kept).
+   `pending` and is retried (a calendar that answered is not asked again; its fragment is kept). (Replaced by correction 61 of section 14.)
 3. **Upgrade**, a job every 10 minutes for the first 3 hours and then every hour, for each
    `submitted` record: for each pending attestation in each fragment, take the commitment (the
    digest at that point of the operation tree) and `GET <uri>/timestamp/<hex commitment>`.
@@ -1056,7 +1056,7 @@ number configured if smaller), `upgradeTimeoutDays` (default 7). No secret.
    fetch Bitcoin data (no node, no explorer is trusted by the server), so the time is stated as
    "included in Bitcoin block height H" and the verifier computes the block time from a header the
    **auditor** supplies. After `upgradeTimeoutDays` without a Bitcoin attestation the record is
-   `expired` and the alert `ledgerAnchorFailed` fires.
+   `expired` and the alert `ledgerAnchorFailed` fires. (Replaced by correction 60 of section 14.)
 4. Export: the `.ots` detached timestamp file of the record is assembled from the fragments on
    demand (`downloadLedgerAnchor`) as `magic || version || file-hash-op || d || tree`, in the
    serialization of the reference library; it can be checked by the reference client too
@@ -1077,8 +1077,8 @@ that block, with an error of the order of hours (the architecture note says abou
 
 | Case | Behaviour |
 |---|---|
-| Target unreachable, timeout, 5xx, 429 | Record stays `pending`; `attempts + 1`; next attempt after `min(30 s * 2^attempts, 1 h)` with 20 percent jitter; the first success resets. `Retry-After` is honoured if larger |
-| Authentication or authorisation error (401, 403, TSA 2 "rejection" for a policy, bucket missing, lock not enabled) | `failed` after 3 attempts at 1, 5 and 15 minutes (it may be a propagation delay), alert `ledgerAnchorFailed` (critical) with the error text without any secret; needs an edit of the target or "Retry" |
+| Target unreachable, timeout, 5xx, 429 | Record stays `pending`; `attempts + 1`; next attempt after `min(30 s * 2^attempts, 1 h)` with 20 percent jitter; the first success resets. `Retry-After` is honoured if larger (Replaced by correction 64 of section 14.) |
+| Authentication or authorisation error (401, 403, TSA 2 "rejection" for a policy, bucket missing, lock not enabled) | `failed` after 3 attempts at 1, 5 and 15 minutes (it may be a propagation delay), alert `ledgerAnchorFailed` (critical) with the error text without any secret; needs an edit of the target or "Retry" (Replaced by correction 64 of section 14.) |
 | WORM conflict (4) | `failed`, no retry, alert `ledgerAnchorConflict` (critical) |
 | Target accepts but the store did not lock (3) | `failed`, alert `ledgerAnchorFailed` |
 | OpenTimestamps: fewer than `minCalendars` answer | `pending`, retried; anchored only when the minimum answered; one calendar's failure does not block the others |
@@ -2209,7 +2209,7 @@ build to the corrected rule. The verifier's README has the same list with the re
     unknown to them, and a held checkpoint only ever makes a run stricter. One that rests only on revoked
     or over-limit keys stays the anchor, is named so in the output with a line that it was not shown
     genuine now, and is replaced by the first checkpoint that extends it and is signed by a key that
-    counts. A plain note given as `--old FILE` keeps the strict rule. The trust file has no "compromised
+    counts (what a run reports when it replaces or completes such a state: 86). A plain note given as `--old FILE` keeps the strict rule. The trust file has no "compromised
     since": a checkpoint carries no time that can be trusted, and `max_tree_size` is the form of "since"
     that the data proves. Removing from the trust file every key that signed a held checkpoint is the one
     change that makes the state unreadable (status 2, with the rebase named); a key is retired by
@@ -2218,9 +2218,11 @@ build to the corrected rule. The verifier's README has the same list with the re
     form holds the text and every line that verifies under any key of the trust file, written again in
     the order of key name and key id. A served note with the text of the held one is merged into it, and
     the state is rewritten only when it gains a line. The evidence of a fork or rollback is one file per
-    signed text, extended in place with new lines of that text. Which of the genuine lines a party
-    without a key serves changes neither the status, the stored size, the name of an evidence file nor
-    the verdict of a later run; there is no limit on the number of evidence files, since a limit would be
+    signed text, extended in place with new lines of that text (for a state that counts; for a weak
+    state see 85). Which of the genuine lines a party
+    without a key serves changes neither the status, the stored size, the held text nor the verdict of a later run (it can
+    change the wording, the JSON members and the names of the evidence files of a later conflict, see
+    69 and 85); there is no limit on the number of evidence files, since a limit would be
     a lever for status 4.
 57. **The lock file is never replaced, and a write never goes over a state it did not read (7.4;
     replaces "a lock file that is not private is replaced" in 41; adds to 18).** The lock file is locked
@@ -2229,7 +2231,7 @@ build to the corrected rule. The verifier's README has the same list with the re
     again, and a run that finds other bytes than the ones it decided on writes nothing (status 2).
 58. **A closed standard output (adds to 43).** A standard output that is the null device opened for
     reading and writing is what the runtime puts in place of a closed descriptor: status 2 on every
-    command, with a line on the standard error. The null device opened for writing only is the caller's
+    command, with a line on the standard error (unless the caller says it is on purpose, see 70). The null device opened for writing only is the caller's
     request for no output and runs as usual.
 59. **A limit on one element of a proof (4.8, 7.4; adds to 42).** One element of the chain of a proof is
     at most 4,096 bytes and what is outside the chain at most 1 MiB, checked while the document is read;
@@ -2289,8 +2291,9 @@ build to the corrected rule. The verifier's README has the same list with the re
     on revoked or over-limit keys disagrees with the log that is served, the failure line names the keys
     the state rests on and why they no longer count, says that the conflict may come from the state and
     not from the log, and gives the rebase command. "Both are signed by a key of the trust file" is
-    printed only for a state that counts. The evidence of such a conflict is one file per held state,
-    not one per run. The JSON carries the fact in `info.state.anchor_weak` with the keys and the reason.
+    printed only for a state that counts. The evidence of such a conflict is bounded per held state
+    and never one file per run (two files at most, see 85). The JSON carries the fact in
+    `info.state.anchor_weak` with the keys and the reason, on every exit after the state was judged (86).
     The exit status stays 1.
 70. **The null device on purpose (adds to 58).** A caller that gives the null device opened for reading
     and writing as the standard output on purpose (a process library's "discard", a daemon) sets
@@ -2298,16 +2301,315 @@ build to the corrected rule. The verifier's README has the same list with the re
 71. **The order of the replacement of the state (7.4; adds to 57).** The temporary file is written and
     flushed first, and the state is read again only then, just before the rename. The lock is what
     excludes another run; this second reading only narrows the window for a writer that ignores the lock
-    and does not close it. Measured with such writers: 0.08 percent of them overwritten on Linux (22
-    percent with the reading before the write), 6 percent on Windows (45 before), where the rename with
-    write-through is itself the window. The README of the verifier gives the figures.
+    and does not close it. Measured with such writers: 1 of 1,200 overwritten on Linux (265 of 1,200
+    with the reading before the write), 189 of 3,000 on Windows (1,346 of 3,000 before), where the rename
+    with write-through is itself the window. These are counts on one machine, one file system and one
+    model of the other writer, not rates. The README of the verifier gives them.
 72. **A stored signature line is kept as stored (7.4; adds to 56).** When a state or an evidence file is
     rewritten, every line it holds stays, also the line of a key that has left the trust file. Such a
     line makes nothing usable: usability is decided from the trust file of the run, as in 55.
 73. **Files on Windows (7.4).** A rename that another program blocks (a scanner, an indexer) is retried
-    for three seconds before the run fails with status 2. On every platform a new evidence file is
-    written under a temporary name and linked into place, so that a reader never sees half of one and an
+    for three seconds before the run fails with status 2 (a read-only target or a directory at the name
+    is named at once, see 87). On every platform a new evidence file is written under a temporary name,
+    flushed, and linked into place, so that a reader never sees half of one and an
     existing file of that name is never replaced.
+74. **Who can drop the database (9.3; replaces the first two sentences of 68 and amends the second
+    invariant of 49).** A role that is not a superuser cannot remove the ledger or the protection of a
+    ledger table by any statement that runs in the database that holds it. `DROP DATABASE` from another
+    database is open to superusers, to the owner, to every role with the privileges of the owner (a
+    membership with INHERIT, directly or through a chain), and to every role that can `SET ROLE` to one of
+    those or to a superuser; a superuser as the owner is therefore not enough, and the words "in a
+    database that a superuser owns" are withdrawn. What protects a deployment: the owner is a superuser
+    role without members that are not superusers, no role that is not a superuser may `SET ROLE` to a
+    superuser, and the digests are kept outside the database. `ledger_status` reports whether such a role
+    exists and lists them (`database_droppable_by_non_superuser`, `database_droppers`), and `ledger_enable`
+    warns with the same list. It is not a finding of `ledger_verify`: it is a property of the roles that
+    changes with the next GRANT and damages nothing, and a row of `ledger_verify` means damage.
+75. **A lock of the ledger and PREPARE (adds to 67).** A transaction of a role that is not a superuser
+    and that holds a lock of the extension cannot be prepared (`0A000`): a prepared transaction would
+    keep the lock beyond every limit. A superuser may prepare; the limit never covered a superuser. With
+    `kingres_ledger.lock_hold_limit = 0` nothing is tracked.
+76. **What the limit follows (adds to 67).** The limit follows the locks per subtransaction: a lock that
+    went with a rolled back savepoint no longer counts, and the timer is cleared at commit, at abort, at
+    `COMMIT AND CHAIN` and `ROLLBACK AND CHAIN`, and when the subtransaction that took the last lock
+    aborts. The server log names the role, the locks and the limit of a session that the limit ended; the
+    client sees the same FATAL as for a session ended by an administrator.
+77. **What an identifier is (replaces the wording of 66).** An identifier is the key of a row among the
+    rows that exist: the largest identifier committed now plus one, taken under the lock of the writer
+    and read with a snapshot taken after the lock was granted. It is not used once only: after a rollback
+    the next writer takes it again, and it means a row only after the transaction that took it has
+    committed. A caller of `ledger_verify_recorded` in a longer transaction keeps the identifier it
+    returns only after the commit. The builders, `ledger_enable`, `ledger_register_table` and
+    `ledger_remove_stray` require READ COMMITTED; `ledger_verify_recorded` and the record of a write by
+    hand work at every isolation level.
+78. **One order of locks for every writer.** The table lock of `ledger_enable`, then the locks of the
+    builders, the registry, the verifications and the removals. A write by hand (a superuser with
+    `allow_manual_write`) takes all four first, and an identifier made by hand that a writer took in the
+    meantime is replaced by the next free one.
+79. **A wait for a lock of the extension can be ended.** A cancel, a timeout or a termination ends the
+    wait for any lock of the extension at once. Only the run of `ledger_verify` inside
+    `ledger_verify_recorded` is caught, and the record of a run that was cancelled is written only when
+    the lock is free.
+80. **Smaller points of the same round.** An index on `ledger_removed` ends the scan of that table under
+    the lock of the builders. A role that is not a superuser cannot revoke from PUBLIC the EXECUTE of a
+    function of the extension (`KL002`).
+81. **WORM: the time of the store and the first attempt (6.3; replaces the time bound of 63).** A
+    payload carries the time of the first attempt to anchor the checkpoint for the key (the creation of
+    the record, kept by a Retry), and every target refuses a payload without it. The time that the store
+    states for a version is never later than the clock plus the tolerance (300 seconds by default) and
+    never earlier than the first attempt less the tolerance; for a version just written it must also be
+    within the tolerance of the clock. A version of our own bytes that is complete and locked has no
+    other age limit, so a recovery after a crash, or an operator who takes a month to repair a bucket,
+    still completes the key. A store whose clock was refused for a fresh write is refused again on every
+    later attempt, because the object is found again and judged by the same rule. A store ahead of the
+    clock is refused (code `store_time_skew`); a store behind the first attempt is permanent (code
+    `store_time_early`), with a text that says it is a matter of clocks and not of credentials and what
+    to do. An existing version whose retention is earlier than the first attempt asked, less five
+    minutes, gets the retention applied and is verified again. Not closed: a store behind by more than
+    the tolerance and by less than the duration of the first submit can pass on a retry, with a time
+    within the tolerance plus thirty seconds of the first attempt; closing it needs the caller to
+    remember the refusal. The first attempt of a key is the earliest creation time among the records for
+    the same target, log and size, which the wiring must ensure.
+82. **OpenTimestamps: a claim does not end the collection (6.5; replaces the end of 60).** A record in
+    the state `claimed` keeps asking the calendars whose fragments still hold pending attestations, until
+    it is anchored with a checked header, expires, or nothing is pending. A claim that a block header
+    contradicts is dropped from the fragments as an implausible one is; a header that cannot be used, or
+    a block time ahead of the clock, contradicts nothing. When no plausible claim is left the record
+    falls back to `submitted` while another calendar can still deliver, and fails with a conflict only
+    when a claim was contradicted and nothing is left that could deliver. A `claimed` record expires
+    after four times the timeout of a submitted one. A round in which every lookup failed is retryable
+    even when every failure was permanent; only a stored fragment that cannot be read is permanent.
+83. **The limits of a payload (6.8; adds to 65).** They are those of the verifier: an origin of 1 to 255
+    bytes of UTF-8 without white space, plus signs or control characters, a size below 2^62, at most 32
+    signature lines, no line longer than 1,024 bytes. The two modules repeat the numbers, and a test of
+    the library reads them from the source of the verifier.
+84. **RFC 3161 names and the text of an alert (6.4, 6.6; adds to 62 and 64).** The name in a token
+    corresponds to the certificate when it is the subject or a name of the subject alternative name,
+    compared by decoded attribute values (any string type, case and white space folded), or the same DNS
+    name, address or other name; a token is refused only when no name of the certificate corresponds. The
+    alert for a failure is worded from the code and the text of the error and not from its class: the
+    class "refused" covers credentials and also clocks and the validity of a certificate.
+85. **The evidence of a weak state is two files at most (7.4; replaces the evidence sentence of 69).** A
+    conflict with a held checkpoint that rests only on revoked or over-limit keys is kept in at most two
+    files: one for the first conflicting note that is smaller than the held one (a rollback), one for
+    the first with the same size and another root or a larger size that the proof does not connect (a
+    fork). A replay of an old genuine checkpoint, which a party without a key can always serve, takes
+    the first file only and never the place of a fork. A note whose file holds another checkpoint, or
+    whose save failed for any reason, is printed in full by the run (base64 in the text, `note_base64`
+    in the JSON), as for a state that counts; a note whose signed text is already in the file counts as
+    saved and its new lines are added. The bound is fixed and independent of what a party without a
+    key serves; such a party can decide which of two conflicts of one kind is kept and cannot hide
+    either from the auditor.
+86. **What a run reports about the held state (7.4; adds to 55 and 69).** `info.state.anchor_weak`
+    (`info.old_anchor_weak` for `consistency --old`) is present on every exit after the held state was
+    judged; a run that stops before it read the state, for instance at the limit of the wait for the
+    lock, has none. A run that writes a state signed by a key that counts reports the state as it is
+    after the write: weak before, not weak after (`anchor_weak_repaired`), and it does not list as not
+    proved that the held checkpoint was genuine, because it proved it a prefix of a checkpoint under a
+    key that counts or added that key's line to it. A key rotation makes a state weak without any act
+    of the publisher (the state was made while only the old key signed, and the old key is then
+    revoked); an auditor runs once with both keys in the trust file before revoking the old one, so
+    that the state gains the line of the new key.
+87. **Temporary files, a failed flush of the directory, a read-only target (7.4; adds to 71 and 73).**
+    The next run removes, under the lock, every temporary file of the program in the directory of the
+    state: the name must match the pattern of the program exactly, the file must be regular and owned
+    by the user; nothing else in the directory is touched. When a rename or a link succeeded and the
+    flush of the directory failed, the run says that the file was replaced or saved and that a power
+    loss may bring the old state of the directory back; the status is unchanged (2 for the state, 4 for
+    the evidence of a state that counts, 1 for the evidence of a weak state), and the JSON says which
+    of the two happened. On Windows a
+    target with the read-only attribute, or a directory at the name, is named at once without the wait
+    of three seconds; the wait stays for the error codes that an open handle of another program
+    produces, which an access control list that denies the rename shares, so in that one case the
+    message names another program wrongly after the system's own text.
+88. **Retry from expired, and what ends a claimed record (6.6; adds to 64, replaces the last sentence
+    but one of 82).** An anchor record in the state `expired` takes the operator's Retry as a `failed`
+    one does: it becomes `pending`, due at once, with its counters and its error cleared and its creation
+    time set to the time of the Retry, so that its waiting period starts again. A claimed record ends at
+    the first of two limits: its own timeout (four times that of a submitted record, from creation), and
+    the limits on failures when its calendars all fail (200 attempts or 7 days of failure by default);
+    with the defaults the second ends it first.
+89. **WORM: the time of the store and the start of the first submit (6.3; replaces 81 from "A payload
+    carries" to "to do.", and its closing sentences).** The time a payload carries is the start of the
+    first Submit call for the key, which the caller makes durable before that call and never changes; a
+    Retry keeps it, and a new start needs a new key. Every put also writes that call's own start into the
+    user metadata of the object. A version written by the call must be within the tolerance of the
+    clock. A version found by a later call must not be earlier than the start of the first Submit less
+    the tolerance nor later than the clock plus the tolerance; when it carries the start of the call that
+    wrote it, the window is narrowed to that start less the tolerance up to that start plus the timeout
+    of a call plus the tolerance. For a version the library wrote, the time the evidence vouches for is
+    therefore never further from the true time of the write than the tolerance plus the duration of one
+    Submit call, whatever the age of the record, the attempts, the Retries or the crashes. For a version
+    found without that metadata the time is only known to lie between the start of the first Submit less
+    the tolerance and the clock plus the tolerance, and the evidence says so (`submit_start`, `found`).
+    The retention floor of a found version is its own time plus the configured days less the
+    tolerances, never a time the caller states. A found version in COMPLIANCE mode is accepted where
+    GOVERNANCE is configured; GOVERNANCE found where COMPLIANCE is configured is refused. A store ahead
+    of the clock stays refused when the clock has caught up with the object. The cluster should have a
+    bucket that nobody else writes: a party that can write it can make a key end in a conflict.
+90. **A contradicted claim is kept aside (6.5; replaces "A claim that a block header contradicts is
+    dropped" of 82; adds to 60).** A block header that contradicts a claim of a calendar does not drop it
+    on that one answer. The claim stays in its fragment, is recorded in the evidence with the header and
+    the time, is neither plausible nor anchored, and its calendar keeps being asked (a target with a
+    source of headers keeps the pending attestation of a merged answer for that). It is dropped for good
+    only when the source contradicts it again in a round at least `contradictionConfirmMinutes` (60 by
+    default) after the first; a header that confirms it later puts it back. The receipt returns the
+    numbers of contradicted, aside and dropped claims so that the caller can alert. At most 32 claims
+    are kept aside in one evidence. `Upgrade` has a bound of its own (five minutes by default) beside the
+    caller's.
+91. **The work of a header (6.5; replaces the plain check of the proof of work of 60).**
+    `header_checked` means a header whose hash meets its own target, whose target is no easier than a
+    sixteenth of the difficulty of the nearest real header of the embedded table at or below the height
+    of the claim (the factor is an option), whose merkle root is the message of the claim and whose
+    time fits. It shows that this much work was spent on that header; it does not show that the header
+    is in the best chain, which the auditor checks against a node of their own. The work of the accepted
+    header is reported.
+92. **One set of rules for a payload, and a narrow comparison of names (6.8, 6.4; replaces 83 and the
+    name rule of 84).** A payload is parsed by the rules of the verifier for the signed note and the
+    checkpoint (the name rule, at least the four bytes of a key id, strict canonical base64, no two lines
+    with the same name and key id, the root of the empty tree for size 0, up to 16 extension lines); the
+    library is stricter on purpose only for the byte 0x7f and for a note over 16 KiB, and a corpus of
+    notes with the verdict of each side is in its tests. The name of a time-stamp token is compared with
+    a narrow profile: a value that is not valid in its string type matches nothing, only ASCII letters
+    are folded and only ASCII space is collapsed, and a TeletexString that is not ASCII is compared by
+    its bytes. An operator who means one authority pins it by the SHA-256 of the public key of the
+    signer; a token under another key is then refused.
+93. **Keys: what the set refuses (3; adds to 14 and 47).** A maximum tree size of a retired key is 1
+    to 2^62-1, the range the verifier reads; `Retire` takes either such a size or an explicit
+    "unbounded", never a bare zero, and unbounded means that a retired key that leaks can sign any
+    larger tree until it is revoked. `Retire` and `Revoke` need another key that is in force at that
+    moment and leave no stale end of an overlap. Asking for the signers of a set in which nothing may
+    sign is an error, and a set that has been in service and holds no active key is refused when it is
+    loaded (a new set whose keys all wait for their first activation is legal). Two different keys with
+    the same 32-bit key id under one origin cannot both sign a checkpoint: the verifier refuses a note
+    with two such lines, and every checkpoint of the origin while its trust file lists both, so the
+    collision is looked for before a key is activated and reported with both fingerprints. A set that
+    is full (16 keys) needs a new generation of the trust file under a new origin prefix. The plain key
+    file is read and written from memory that is zeroed; the documentation of the package names where a
+    secret cannot be.
+94. **Logs: what the store and the reader guarantee (4.4, 4.5; adds to 48).** A reader checks the
+    length of every tile it is handed, so a store that lies gives an error. A tile is published by a
+    hard link only: where one cannot be made the put fails with an error that says the publication
+    directory needs a file system with hard links, and nothing is ever renamed over a tile. A put
+    flushes the file, its directory, and the parent of every directory it created, up to the root of
+    the store. A checkpoint whose rename another program blocks on Windows is retried for a time the
+    store sets (three seconds by default) and then fails with an error that says a retry may succeed,
+    with the old checkpoint whole. The text of a checkpoint is refused when writing whenever it would be
+    refused when reading. A request for the tiles of a size above 2^28 is refused, and files are read
+    with a limit and with a check that the file opened is the file examined. Signing a stored
+    checkpoint again takes the keys the caller trusts and adds no line to a note none of whose lines
+    verifies.
+95. **WORM: the window that was applied, a generation of the key, later versions (6.3; adds to 89).** A
+    version that a call wrote is accepted only when the read-back returns the metadata of the attempt
+    exactly as it was sent; a store that drops, changes or repeats it is refused (`no_user_metadata`,
+    permanent: the object is written and locked, and the operator uses a store or a gateway that keeps
+    user metadata). The attempt of a found version must be exactly one value in the form the library
+    writes; anything else is an error for that version (`attempt_malformed`), never "absent". The
+    evidence states the window that was applied: `attempt` is the time that was used, or null for a
+    version that had none, whose time is then bounded only by `submit_start`; a caller warns on null.
+    An object that carries its attempt and lies outside its window (a clock fault of the cluster during
+    one call, a put that a proxy carried out late) is refused on every later call, and the text says
+    that neither waiting nor a Retry heals it. The way out for one record is the generation of the key:
+    generation 0 is the key as it was (`<size>.note`), generation n is `<size>.g<n>.note`, the caller
+    keeps it with the record and raises it by one, with a new start, only on an operator's explicit
+    choice after a permanent refusal for time, never by itself, because each generation is one more
+    locked object that claims to be the anchor of that checkpoint; the evidence records it. When the
+    latest version with our bytes fails its checks, the other versions are examined and the first of
+    ours that passes completes the record, so a copy placed after ours by another principal cannot end
+    it. A found version that is older than its own retention period gets its retention extended to now
+    plus the configured days and is verified again.
+96. **OpenTimestamps: what is kept (6.5; adds to 90 and 91).** The pending attestation of a merged
+    claim is kept in every configuration, so that a source of headers that is configured later can
+    still have the calendar asked; without a source no request is made for it. A claim that was dropped
+    for good is remembered in the evidence (calendar, height, root, time; at most 32, the oldest
+    forgotten first), and the same claim answered again is put aside before it enters a fragment. The
+    error of a contradicted claim carries the evidence from before the call; the caller keeps it and
+    passes it on a Retry, which then keeps the proof and the time of the submission. The factor of the
+    work rule is at most 2^20, which never admits difficulty 1 at a height of today; the package
+    reports the height and the block time of the newest entry of its table, the table is extended at
+    each release, and the caller warns when it is old.
+97. **RFC 3161: the pin in stored evidence, and the corpus of notes (6.4, 6.8; adds to 92).** The
+    verifiers of a stored token and of stored evidence take the pin of the signer; the evidence
+    carries the SHA-256 of the signer's public key and is checked against the token; every certificate
+    of a token that matches the signer identifier is tried. The name check can refuse an authority
+    whose certificate has characters outside its declared string type or another normalisation; that
+    refusal is permanent, and the operator uses another authority. The corpus of notes of 92 is held to
+    the real parsers of the verifier by a copy in the verifier module, and a test of the library fails
+    when the two copies differ.
+98. **What `ledger_enable` adds to the limit, and the timer after an error (replaces "gets a new period
+    every thousand rows" of 67; adds to 76).** The time that `ledger_enable` really spent entering a
+    batch of rows is added to the deadline, and nothing else is. It is added only while the lock of
+    the registry is the only lock of the extension that the transaction holds: with the lock of the
+    builders, the verifications or the removals held there is no addition at all. It is kept per entry
+    of the subtransaction stack and taken back when the subtransaction aborts, and the rows of a table
+    are credited once in a transaction, so entering the same rows again after a rollback buys nothing.
+    The deadline is therefore never more than one period ahead, and a lock taken now is held for one
+    period at most. What remains, and is stated as an exception: a role that really enters many rows of
+    many tables holds the lock of the registry while it does, which blocks other calls of
+    `ledger_enable` and a write by hand, and not the block builder. An honest `ledger_enable` whose
+    single batch of a thousand rows takes longer than the period is ended. PostgreSQL disables every
+    timeout of a backend when an error reaches its main loop, before it aborts a subtransaction; the
+    extension starts its timer again at the deadline in the abort of the subtransaction, so an error
+    inside a savepoint does not leave a lock of the parent without a limit. The log line of an ended
+    session lists the locks held at that moment.
+99. **The order of the locks is enforced across calls (replaces 78).** A call that would take a lock
+    of the extension that is earlier in the order (builders, registry, verifications, removals) than
+    one the transaction already holds fails at once with `KL006` and a hint that names the order,
+    instead of waiting into a deadlock; a lock that is already held is never refused. It holds for
+    every role and within one statement, one transaction or one savepoint: a caller runs the writers
+    in that order or in transactions of their own. `ledger_remove_stray` and a write by hand take all
+    four locks first, also a write by hand into the entries. The table lock of `ledger_enable` against
+    ordinary statements on the same table after a write by hand cannot be ordered this way; the
+    deadlock detector ends one of the two.
+100. **Who can drop the database, and identifiers at the edges (adds to 74 and 77).** `ledger_status`
+    also lists the roles that cannot drop the database now and can make themselves able to without a
+    superuser (`database_potential_droppers`): a role with ADMIN OPTION, directly or through a
+    membership, on a role that can, which covers a role with CREATEROLE for the roles it created;
+    `ledger_enable` warns about them in a sentence of its own. A database owned by
+    `pg_database_owner` can be dropped by every role that owns a database of the cluster, and the
+    lists say so. A delete by hand of a recorded digest is recorded as a removal, so its identifier
+    does not come back, and `ledger_verify` reports it. At the largest value of the type the writers
+    raise an error that says no identifier is left, and nothing wraps. A cancel inside the run of
+    `ledger_verify` within `ledger_verify_recorded` is raised when the lock of the verifications is
+    held by another session and recorded as a failed run when it is free.
+101. **Key id collisions are judged as the verifier judges them (3; replaces the sentence about
+    collisions of 93).** The verifier checks a fresh checkpoint against the usable keys of the trust
+    file and a held note (a state file, `--old`) against every key of the file, whatever its standing.
+    Two keys with the same 32-bit key id under one origin therefore stop every auditor's state file for
+    that log also when one of them is revoked or retired, and no later transition cures it: revoking is
+    not a remedy. The keys to check before a key enters the set are all keys of the set under every
+    origin that will be signed (`AddChecked` refuses such a key; `CheckSetKeyIDs` applies the rule to a
+    set, with and without the next keys). When a collision is found after the fact, the log is
+    published under another origin (a new epoch or prefix), or the auditors start a new state file, or
+    a new generation of the trust file is made.
+102. **Times of key transitions, and what the set refuses (3; adds to 93).** Every time of a key is in
+    the years 1 to 9999 and never zero; such a time is refused when it is given and when a stored set
+    is loaded, since the verifier cannot read the trust file otherwise. An activation later than the
+    latest time the set records by more than 366 days is refused, which catches a clock that is wrong
+    by years and nothing smaller. A key that is active and not yet in force can be retired without a
+    revocation, at its own activation time, so that an activation in the future does not wedge the
+    overlap; the rules for who may sign, who may be retired and who is due agree about which keys are
+    in force. A loaded set with two active keys must carry exactly one end of an overlap, equal to the
+    activation of the other key plus whole days; a set whose keys were all turned back to "next"
+    cannot be told from a new one.
+103. **Publication: a repeated put, link errors, re-signing (4.4, 4.5; adds to 94).** A put that finds
+    the tile there and equal flushes the file, its directory and every ancestor up to the root before
+    it returns, so appending the same leaves again after a crash makes them durable. Only the errors
+    that mean a file system without hard links are reported as that; any other failure of the link is
+    returned as it is. A checkpoint target that is a directory, or read-only on Windows, is named at
+    once without the retry. The stores and the audit honour the caller's context. Signing a stored
+    checkpoint again takes every key of the trust file as trusted, refuses a collision between a new
+    signer and any of them, and refuses a line under the name of the log whose key id belongs to none
+    of them, so that the result is never a note the verifier refuses for a reason that could be seen.
+    The tests of both libraries that need the verifier say so when they skip, and fail with
+    `KINGRES_REQUIRE_VERIFY=1`.
+104. **A state must not carry a temporary name of the program (7.4; adds to 87).** `--state FILE` is
+    refused with status 2, before anything is read, written or removed, when the resolved name of FILE
+    has the form of the program's own temporary files. The cleanup of leftovers under the lock removes
+    every regular file of that form, so a state with such a name was removed before it was read, and a
+    rollback served to that run was then reported as verified. Skipping only the run's own file would
+    not be enough: a run of another state in the same directory would still delete it. The cleanup
+    also never removes the file the run was told to use or its lock.
 
 Of section 13: item 2 (test vectors) is settled for signed notes (the example key and note of the
 specification are in the tests; the checkpoint example has no published key), item 3 (entry bundles at

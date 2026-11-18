@@ -1,1 +1,24 @@
 # Tests allowed to skip in the WSL run, one per line: name, then the reason.
+TestAWSSuite the third-party test vectors of the anchoring packages are not in the repository (testdata/third_party)
+TestBadMagicAndVersion the third-party test vectors of the anchoring packages are not in the repository (testdata/third_party)
+TestExportForReferenceClient the third-party test vectors of the anchoring packages are not in the repository (testdata/third_party)
+TestHeaderRejections the third-party test vectors of the anchoring packages are not in the repository (testdata/third_party)
+TestInvalidExamples the third-party test vectors of the anchoring packages are not in the repository (testdata/third_party)
+TestMergeRealVectorHalves the third-party test vectors of the anchoring packages are not in the repository (testdata/third_party)
+TestProofSizeBoundary the third-party test vectors of the anchoring packages are not in the repository (testdata/third_party)
+TestRealProofsAgainstRealHeaders the third-party test vectors of the anchoring packages are not in the repository (testdata/third_party)
+TestReferenceVectorContent the third-party test vectors of the anchoring packages are not in the repository (testdata/third_party)
+TestReferenceVectorsDigest the third-party test vectors of the anchoring packages are not in the repository (testdata/third_party)
+TestReferenceVectorsRoundTrip the third-party test vectors of the anchoring packages are not in the repository (testdata/third_party)
+TestRefusedByName the third-party test vectors of the anchoring packages are not in the repository (testdata/third_party)
+TestSignMatchesSuiteVanilla the third-party test vectors of the anchoring packages are not in the repository (testdata/third_party)
+TestSignSessionToken the third-party test vectors of the anchoring packages are not in the repository (testdata/third_party)
+TestThirdPartyManifest the third-party test vectors of the anchoring packages are not in the repository (testdata/third_party)
+TestTruncationsAndTrailing the third-party test vectors of the anchoring packages are not in the repository (testdata/third_party)
+TestBlockEntryAgainstTheHeadersOfARealServer the fixtures of the verifier module are not beside a test binary that runs outside the source tree
+TestLargerTreeAcrossTileLevels a long test of the log library (KINGRES_LONG_TESTS=1)
+TestMaxBatchBytesBoundary a long test of the log library (KINGRES_LONG_TESTS=1)
+TestPutCheckpointGivesUpAfterTheDefaultRetry a long test of the log library (KINGRES_LONG_TESTS=1)
+TestNoPackageLevelState_SkipsWithoutSources the sources of the anchoring packages are not beside a test binary that runs outside the source tree
+TestPayloadLimitsEqualTheVerifiers_SkipsWithoutVerifierSource the sources of the verifier module are not beside a test binary that runs outside the source tree
+TestCorpusCopiesAreIdentical the verifier module is not beside a test binary that runs outside the source tree

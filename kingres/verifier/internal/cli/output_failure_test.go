@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // shortWriter accepts half of every write and reports no error.
@@ -22,7 +24,7 @@ func (shortWriter) Write(p []byte) (int, error) { return len(p) / 2, nil }
 // text and in JSON, and a verdict that is not 0 keeps its status.
 func TestFailedWriteOfTheVerdictIsNeverStatus0(t *testing.T) {
 	x := newExitEnv(t)
-	d := t.TempDir()
+	d := testdir.New(t)
 	st := filepath.Join(d, "state")
 	s := newSigner(9)
 	pub := base64.StdEncoding.EncodeToString(s.pub)
@@ -95,7 +97,7 @@ func TestVerdictToDevFull(t *testing.T) {
 // behind as an empty file that makes the next run refuse the name.
 func TestTrustInitRemovesAFileItCouldNotWrite(t *testing.T) {
 	s := newSigner(9)
-	out := filepath.Join(t.TempDir(), "trust.json")
+	out := filepath.Join(testdir.New(t), "trust.json")
 	args := []string{"trust", "init", "--origin-prefix", testPrefix, "--public-key", base64.StdEncoding.EncodeToString(s.pub), "--fingerprint", s.fp(), "--out", out}
 	failTrustWrite(t)
 	if code, _, _ := run(t, args...); code != 2 {

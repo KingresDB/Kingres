@@ -85,7 +85,7 @@ func testPayload(t *testing.T) anchor.Payload {
 	t.Helper()
 	root := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32))
 	note := "kingres.example/agg\n17\n" + root + "\n\n" + string(rune(0x2014)) + " kingres.example/agg " + base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 68)) + "\n"
-	p, err := anchor.NewPayload("ab12", []byte(note))
+	p, err := anchor.NewPayload("ab12", []byte(note), time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +109,7 @@ func TestSubmitSuccess(t *testing.T) {
 	if ev.TSAURL != e.srv.URL+"/tsa" || ev.Serial != "4242" || ev.Policy != "1.2.3.4.5" || ev.RecordedBy != "cluster" {
 		t.Fatalf("%+v", ev)
 	}
-	if _, err := VerifyEvidence(ev, p.Digest, e.a.rootPool, e.a.interPool); err != nil {
+	if _, err := VerifyEvidence(ev, p.Digest, nil, e.a.rootPool, e.a.interPool); err != nil {
 		t.Fatal(err)
 	}
 	if anchor.FormatTime(*rc.EvidenceTime) != ev.GenTime {

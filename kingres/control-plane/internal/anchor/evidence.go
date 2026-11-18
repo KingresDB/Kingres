@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -24,6 +25,14 @@ const (
 	MaxEvidenceFile = 4 << 20
 	// MaxOTSCalendars is the most calendar fragments in one OTS evidence.
 	MaxOTSCalendars = 16
+	// MaxOTSContradictions is the most contradicted claims kept aside in one OTS
+	// evidence; one more is dropped for good.
+	MaxOTSContradictions = 32
+	// MaxOTSDropped is the most dropped claims remembered in one OTS evidence;
+	// when it is full the oldest is forgotten.
+	MaxOTSDropped = 32
+	// MaxGeneration is the largest key generation of a payload (correction 95).
+	MaxGeneration = 1000
 	// MaxTokenDER is the largest TSA token (DER) stored in evidence.
 	MaxTokenDER = 256 << 10
 )
@@ -49,7 +58,7 @@ func ParseTime(s string) (time.Time, error) {
 }
 
 // WORMEvidence is the evidence of a WORM anchor (design 6.3 step 5 and
-// correction 70).
+// correction 61).
 type WORMEvidence struct {
 	Endpoint  string `json:"endpoint"` // "" for AWS
 	Bucket    string `json:"bucket"`
@@ -65,7 +74,31 @@ type WORMEvidence struct {
 	LockMode      string `json:"lock_mode"`     // "GOVERNANCE" or "COMPLIANCE"
 	RetainUntil   string `json:"retain_until"`  // TimeLayout
 	LastModified  string `json:"last_modified"` // TimeLayout, the store's clock, bounded against the cluster's clock
-	RecordedBy    string `json:"recorded_by"`   // "cluster"
+	// SubmitStart is the start of the first Submit call for the key that the
+	// caller stated (Payload.SubmitStart) and that was applied to the time of the
+	// store: the earliest time accepted for an existing object was this less the
+	// tolerance. An auditor reads the window the cluster accepted from it and
+	// from last_modified.
+	SubmitStart string `json:"submit_start"` // TimeLayout
+	// Attempt is the attempt time that was used to bound the store's time
+	// (correction 95): the value of the user metadata kingres-attempt of the
+	// version, the start of the Submit call that wrote it (TimeLayout), and null
+	// when the version carried none. With a value, the window that was applied
+	// is [max(submit_start, attempt) less the tolerance, attempt plus the call
+	// timeout plus the tolerance] (for a version this call wrote, the tolerance
+	// around the clock of the call, with the value read back equal to the value
+	// sent); with null it is [submit_start less the tolerance, now plus the
+	// tolerance] and nothing narrower: the version was written by another
+	// principal, or by a writer that kept no metadata.
+	Attempt *string `json:"attempt"`
+	// Generation is the generation of the key (Payload.Generation; 0 is the key
+	// "<prefix>/<aggregate>/<size>.note", n is "<size>.g<n>.note").
+	Generation uint32 `json:"generation"`
+	// Found is false when the version was written by the Submit call that
+	// produced this evidence, and true when that call found it (an earlier call
+	// of this library that did not finish, or another principal wrote it).
+	Found      bool   `json:"found"`
+	RecordedBy string `json:"recorded_by"` // "cluster"
 }
 
 // TSAEvidence is the evidence of an RFC 3161 anchor (design 6.4 step 5).
@@ -75,7 +108,10 @@ type TSAEvidence struct {
 	GenTime     string `json:"gen_time"`      // TimeLayout (sub-seconds of genTime are dropped)
 	Serial      string `json:"serial"`        // decimal
 	Policy      string `json:"policy"`        // dotted OID
-	RecordedBy  string `json:"recorded_by"`   // "cluster"
+	// SignerKeySHA256 is the lower case hex SHA-256 of the DER SubjectPublicKeyInfo
+	// of the signing certificate (the pin; correction 97).
+	SignerKeySHA256 string `json:"signer_key_sha256"`
+	RecordedBy      string `json:"recorded_by"` // "cluster"
 }
 
 // OTSCalendar is one calendar's fragment.
@@ -117,8 +153,44 @@ type OTSBitcoin struct {
 	Header string `json:"header"`
 }
 
+// OTSContradiction is a claim of a calendar that a block header contradicted
+// and that is kept aside (correction 90): it stays in the fragment of its
+// calendar, is neither plausible nor anchored, and the calendar keeps being
+// asked in later rounds while its fragment holds a pending attestation (a
+// target with a header source keeps it after a merge). It is dropped for good
+// only when the header source contradicts it again in a round at least the
+// confirmation interval after "at". The claim is named by calendar, height and
+// merkle root.
+type OTSContradiction struct {
+	CalendarURI string `json:"calendar_uri"` // a calendar of "calendars"
+	Height      uint64 `json:"height"`
+	MerkleRoot  string `json:"merkle_root"` // hex of the message the claim sits on
+	// Header is the 160 hex digits of the block header that contradicted the
+	// claim (the first one).
+	Header string `json:"header"`
+	// At is the cluster's clock at the first contradiction (TimeLayout).
+	At string `json:"at"`
+	// Reason is why the header contradicted the claim (printable ASCII).
+	Reason string `json:"reason"`
+}
+
+// OTSDropped is a claim that was dropped for good (the header source
+// contradicted it again at least the confirmation interval after the first
+// time) and is remembered, so that the same claim answered again by a calendar
+// is put aside at once and not counted as a new one (correction 96). It is named
+// as a contradicted claim is: by calendar, height and merkle root. The calendar
+// need not be in "calendars" any more: the fragment that held the claim may be
+// gone with it.
+type OTSDropped struct {
+	CalendarURI string `json:"calendar_uri"`
+	Height      uint64 `json:"height"`
+	MerkleRoot  string `json:"merkle_root"` // hex of the message the claim sat on
+	// At is the cluster's clock when the claim was dropped (TimeLayout).
+	At string `json:"at"`
+}
+
 // OTSEvidence is the evidence of an OpenTimestamps anchor (design 6.5 step
-// 2 and correction 70).
+// 2 and corrections 60 and 61).
 type OTSEvidence struct {
 	Digest string `json:"digest"` // hex of the 32-byte digest
 	// SubmittedAt is the cluster's clock when the digest was first accepted
@@ -127,6 +199,12 @@ type OTSEvidence struct {
 	SubmittedAt string        `json:"submitted_at"`
 	Calendars   []OTSCalendar `json:"calendars"`
 	Bitcoin     *OTSBitcoin   `json:"bitcoin"` // null until a Bitcoin attestation exists
+	// Contradicted lists the claims kept aside (an empty array when none).
+	Contradicted []OTSContradiction `json:"contradicted"`
+	// Dropped lists the claims dropped for good that are still remembered (an
+	// empty array when none), at most MaxOTSDropped: when it is full the oldest
+	// entry is forgotten.
+	Dropped []OTSDropped `json:"dropped"`
 }
 
 func isLowerHex(s string, n int) bool {
@@ -173,6 +251,17 @@ func (e WORMEvidence) Validate() error {
 	if _, err := ParseTime(e.LastModified); err != nil {
 		return err
 	}
+	if _, err := ParseTime(e.SubmitStart); err != nil {
+		return err
+	}
+	if e.Attempt != nil {
+		if _, err := ParseTime(*e.Attempt); err != nil {
+			return err
+		}
+	}
+	if e.Generation > MaxGeneration {
+		return errors.New("anchor: worm evidence generation is too large")
+	}
 	if e.RecordedBy != RecordedByCluster {
 		return errors.New("anchor: worm evidence recorded_by must be cluster")
 	}
@@ -183,6 +272,9 @@ func (e WORMEvidence) Validate() error {
 func (e TSAEvidence) Validate() error {
 	if !printableASCII(e.TSAURL, 2048) || e.TSAURL == "" || !printableASCII(e.Policy, 256) || e.Policy == "" {
 		return errors.New("anchor: tsa evidence has a missing or malformed text field")
+	}
+	if !isLowerHex(e.SignerKeySHA256, 32) {
+		return errors.New("anchor: tsa evidence signer_key_sha256 must be 64 lower case hex digits")
 	}
 	tok, err := base64.StdEncoding.DecodeString(e.TokenDERB64)
 	if err != nil || len(tok) == 0 || len(tok) > MaxTokenDER || base64.StdEncoding.EncodeToString(tok) != e.TokenDERB64 {
@@ -242,6 +334,41 @@ func (e OTSEvidence) Validate() error {
 			return errors.New("anchor: ots evidence bitcoin status must be claimed or header_checked")
 		}
 	}
+	if len(e.Contradicted) > MaxOTSContradictions {
+		return errors.New("anchor: ots evidence has too many contradicted claims")
+	}
+	seenC := map[string]bool{}
+	for _, c := range e.Contradicted {
+		if !seen[c.CalendarURI] || c.Height > MaxBitcoinHeight || !isLowerHex(c.MerkleRoot, 32) || !isLowerHex(c.Header, 80) ||
+			!printableASCII(c.Reason, 300) {
+			return errors.New("anchor: ots evidence has a malformed contradicted claim")
+		}
+		if _, err := ParseTime(c.At); err != nil {
+			return err
+		}
+		k := c.CalendarURI + "|" + strconv.FormatUint(c.Height, 10) + "|" + c.MerkleRoot
+		if seenC[k] {
+			return errors.New("anchor: ots evidence repeats a contradicted claim")
+		}
+		seenC[k] = true
+	}
+	if len(e.Dropped) > MaxOTSDropped {
+		return errors.New("anchor: ots evidence has too many dropped claims")
+	}
+	seenD := map[string]bool{}
+	for _, d := range e.Dropped {
+		if !printableASCII(d.CalendarURI, 1000) || d.CalendarURI == "" || d.Height > MaxBitcoinHeight || !isLowerHex(d.MerkleRoot, 32) {
+			return errors.New("anchor: ots evidence has a malformed dropped claim")
+		}
+		if _, err := ParseTime(d.At); err != nil {
+			return err
+		}
+		k := d.CalendarURI + "|" + strconv.FormatUint(d.Height, 10) + "|" + d.MerkleRoot
+		if seenD[k] {
+			return errors.New("anchor: ots evidence repeats a dropped claim")
+		}
+		seenD[k] = true
+	}
 	return nil
 }
 
@@ -286,6 +413,12 @@ func EncodeEvidence(v any) (json.RawMessage, error) {
 		}
 		if e.Calendars == nil {
 			e.Calendars = []OTSCalendar{}
+		}
+		if e.Contradicted == nil {
+			e.Contradicted = []OTSContradiction{}
+		}
+		if e.Dropped == nil {
+			e.Dropped = []OTSDropped{}
 		}
 		v = e
 	case *OTSEvidence:
@@ -357,8 +490,8 @@ func parseOTS(raw []byte, strict bool) (OTSEvidence, error) {
 	if err := strictDecode(raw, &e); err != nil {
 		return e, err
 	}
-	if e.Calendars == nil {
-		return e, errors.New("anchor: ots evidence calendars must be an array")
+	if e.Calendars == nil || e.Contradicted == nil || e.Dropped == nil {
+		return e, errors.New("anchor: ots evidence calendars, contradicted and dropped must be arrays")
 	}
 	if err := e.Validate(); err != nil {
 		return e, err
@@ -410,7 +543,7 @@ type evidenceFileJSON struct {
 // compact; no trailing newline). The evidence member is re-encoded from its
 // parsed form, so the bytes are canonical even if f.Evidence was not.
 func EncodeEvidenceFile(f EvidenceFile) ([]byte, error) {
-	if !printableASCII(f.Origin, MaxOriginLen) || f.Origin == "" {
+	if !ValidOrigin(f.Origin) {
 		return nil, errors.New("anchor: evidence file origin is missing or malformed")
 	}
 	if d, err := hex.DecodeString(f.PayloadSHA256); err != nil || len(d) != 32 || strings.ToLower(f.PayloadSHA256) != f.PayloadSHA256 {

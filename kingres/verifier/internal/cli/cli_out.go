@@ -33,6 +33,19 @@ type result struct {
 	notes     []string // things the reader must know about how this run was made
 	notProved []string // what a success does not show
 	problems  []string // digest-chain: the findings of a failure
+	// keepInfo is set once the checkpoint the auditor holds was judged: the exits
+	// that carry no info of their own then carry it (inputInfo), so that
+	// old_anchor_weak is on every one of them (L16-02).
+	keepInfo bool
+}
+
+// inputInfo is the info an input error carries: the info of the run once the held
+// checkpoint was judged, nothing before.
+func (r *result) inputInfo() map[string]any {
+	if r.keepInfo {
+		return r.info
+	}
+	return nil
 }
 
 func (r *result) ok(name, detail string) {
@@ -239,9 +252,21 @@ func (e *env) finishIncomplete(r *result, asJSON bool, missing []string) int {
 
 // inputError reports a usage or input problem (exit status 2).
 func (e *env) inputError(cmd string, asJSON bool, err error) int {
+	return e.inputErrorInfo(cmd, asJSON, err, nil)
+}
+
+// inputErrorInfo is inputError for a run that already judged the checkpoint the
+// auditor holds: the JSON carries info (the member anchor_weak or
+// old_anchor_weak, L16-02) so that a machine reader gets it on this exit as on
+// every other. The text is the same as inputError's.
+func (e *env) inputErrorInfo(cmd string, asJSON bool, err error, info map[string]any) int {
 	traceExit(ExitUsage)
 	if asJSON {
-		e.printJSON(jsonOutput{Command: cmd, InputErr: true, Error: err.Error()})
+		out := jsonOutput{Command: cmd, InputErr: true, Error: err.Error()}
+		if info != nil {
+			out.Info = info
+		}
+		e.printJSON(out)
 	}
 	e.errLine(cmd, err)
 	return ExitUsage

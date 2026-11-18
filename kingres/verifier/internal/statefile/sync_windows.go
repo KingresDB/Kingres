@@ -37,9 +37,47 @@ const (
 	errSharingViolation = syscall.Errno(32)
 )
 
+// What MoveFileEx says (L16-06). Its documentation lists no error codes. What was
+// measured on Windows 11 with the target of the rename (TestRenameErrorCodes):
+//
+//   - the target has the read-only attribute: ERROR_ACCESS_DENIED (5), for ever;
+//   - the target is a directory: ERROR_ACCESS_DENIED (5), for ever;
+//   - the target is open by another program: ERROR_ACCESS_DENIED (5) too, whether
+//     that program shares delete or not (L18-03), and it ends when the program lets go.
+//
+// Code 5 alone therefore cannot tell a handle from a permanent refusal, so what
+// can be recognised without a handle is looked at first: the read-only attribute
+// and a directory at the name are named at once, and only what is left of code 5
+// is tried again for renameWait, together with ERROR_SHARING_VIOLATION (32) and
+// ERROR_LOCK_VIOLATION (33), which ReplaceFile and CreateFile document for a file
+// that another program holds and which a handle of a program can still produce.
+
+// readOnlyOrDir says, for the target of a refused rename, whether the refusal is a
+// property of the target (the read-only attribute, a directory) and not of a
+// program that has it open: that never ends by waiting. It returns the words of the
+// error, each with the advice that fits (a directory has no attribute to clear).
+func readOnlyOrDir(to string) string {
+	name, err := syscall.UTF16PtrFromString(to)
+	if err != nil {
+		return ""
+	}
+	attr, err := syscall.GetFileAttributes(name)
+	if err != nil {
+		return ""
+	}
+	switch {
+	case attr&syscall.FILE_ATTRIBUTE_DIRECTORY != 0:
+		return "the name is a directory, so a file cannot be put there: move or remove the directory, or name another file; nothing was changed"
+	case attr&syscall.FILE_ATTRIBUTE_READONLY != 0:
+		return "the file is read-only (the read-only attribute is set), so it cannot be replaced: clear the attribute or name another file; nothing was changed"
+	}
+	return ""
+}
+
 // rename replaces the target and asks for the move to be written through to
 // disk before it returns: Windows has no way to flush a directory, and this is
-// the flag that gives the same guarantee. A refusal that a program holding the
+// the flag that gives the same guarantee. A refusal that is a property of the
+// target (readOnlyOrDir) is named at once. A refusal that a program holding the
 // target open causes (access denied, a sharing or a lock violation) is tried
 // again every 20 ms for renameWait, and then the error says that another program
 // may hold the file.
@@ -63,8 +101,11 @@ func rename(from, to string) error {
 		if !busy {
 			return &os.LinkError{Op: "rename", Old: from, New: to, Err: e}
 		}
+		if what := readOnlyOrDir(to); what != "" {
+			return &os.LinkError{Op: "rename", Old: from, New: to, Err: fmt.Errorf("%w: %s", e, what)}
+		}
 		if time.Now().After(deadline) {
-			return &os.LinkError{Op: "rename", Old: from, New: to, Err: fmt.Errorf("%w; another program may have the file open without sharing delete (a backup, a virus scanner, an indexer, a viewer), tried for %s: close it and run again, nothing was changed", e, renameWait)}
+			return &os.LinkError{Op: "rename", Old: from, New: to, Err: fmt.Errorf("%w; another program may have the file open (a backup, a virus scanner, an indexer, a viewer), tried for %s: close it and run again, nothing was changed", e, renameWait)}
 		}
 		time.Sleep(20 * time.Millisecond)
 	}

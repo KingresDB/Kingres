@@ -16,6 +16,8 @@ import (
 
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/checkpoint"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/signednote"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // noteText signs text (which starts with the origin) as s, with extra signature
@@ -48,20 +50,20 @@ func TestLongExtensionLineIsRefusedBeforeAnythingIsStored(t *testing.T) {
 	s := newSigner(1)
 	tr := trustOf(t, keySpec{"k", s, ""})
 	all := leaves(300)
-	root := t.TempDir()
+	root := testdir.New(t)
 	publishLog(t, root, s, all, 300)
-	state := filepath.Join(t.TempDir(), "state")
+	state := filepath.Join(testdir.New(t), "state")
 	if code, out, _ := run(t, stateArgs(tr, root, state)...); code != 0 {
 		t.Fatal(out)
 	}
 	kept := fileText(t, state)
-	big := t.TempDir()
+	big := testdir.New(t)
 	publishLog(t, big, s, all, 300)
 	long := s.noteText(textWithExtensions(300, refMTH(all), strings.Repeat("<", 700000)), 0)
 	if err := os.WriteFile(filepath.Join(big, "c", testChain, "e1", "checkpoint"), []byte(long), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	fresh := filepath.Join(t.TempDir(), "fresh")
+	fresh := filepath.Join(testdir.New(t), "fresh")
 	for _, args := range [][]string{stateArgs(tr, big, state), stateArgs(tr, big, fresh)} {
 		code, out, errs := run(t, args...)
 		if code == 0 || strings.Contains(out, "VERIFIED") {
@@ -92,7 +94,7 @@ func TestNoteBoundsAreEnforcedBeforeAnythingIsStored(t *testing.T) {
 	s := newSigner(1)
 	tr := trustOf(t, keySpec{"k", s, ""})
 	all := leaves(300)
-	root := t.TempDir()
+	root := testdir.New(t)
 	publishLog(t, root, s, all, 300)
 	r := refMTH(all)
 	line := func(n int) string { return strings.Repeat("x", n) }
@@ -110,7 +112,7 @@ func TestNoteBoundsAreEnforcedBeforeAnythingIsStored(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			state := filepath.Join(t.TempDir(), "state")
+			state := filepath.Join(testdir.New(t), "state")
 			args := stateArgs(tr, root, state, "--note", writeNote(t, c.note))
 			code, out, errs := run(t, args...)
 			if c.ok != (code == 0) {

@@ -125,7 +125,7 @@ func TestOwnProofParsesAndComputesWhatTheCalendarSays(t *testing.T) {
 		t.Fatal("fragment round trip")
 	}
 	// the own proof is calendar-shaped: it passes the plausibility checks
-	cl := checkFragments([]*Node{n}, []string{"https://a.example"}, ownSubmitted, ownNow)
+	cl := checkFragments([]*Node{n}, []string{"https://a.example"}, ownSubmitted, ownNow, nil)
 	if len(cl) != 1 || cl[0].Problem != "" || cl[0].Conflict != "" || cl[0].Height != 960000 || !bytes.Equal(cl[0].Root[:], root) {
 		t.Fatalf("%+v", cl)
 	}

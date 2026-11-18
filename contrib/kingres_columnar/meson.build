@@ -111,6 +111,10 @@ tests += {
       't/032_module_build.pl',
       't/033_standby_late.pl',
       't/034_decoding.pl',
+      't/035_autovacuum_log.pl',
+      't/036_check_view.pl',
+      't/037_vacuum_truncate.pl',
+      't/038_truncate_frozen_id.pl',
     ],
   },
 }

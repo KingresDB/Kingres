@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/instance"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/pki"
 )
 
@@ -51,11 +52,19 @@ func StandDownPath(dir string, instanceID int) string {
 	return filepath.Join(dir, StandDownFile+"."+strconv.Itoa(instanceID))
 }
 
-// markerExists tells whether the marker of the group is there, or the marker of
+// markerExists tells whether the marker of the group is there (for an unknown group: the marker of any group), or the marker of
 // the version that had one primary per server (which holds for every group).
 func markerExists(dir, base string, group int32) bool {
 	for _, p := range []string{MarkerPath(dir, base, group), filepath.Join(dir, base)} {
 		if _, err := os.Stat(p); err == nil {
+			return true
+		}
+	}
+	if group == instance.GroupUnknown {
+		// An instance whose group is not known yet (no role file: the layout of the earlier version, until the first
+		// look at the catalog) is held back by the marker of any group (FO-03): the legacy marker may have been
+		// migrated to the per group markers already.
+		if m, _ := filepath.Glob(filepath.Join(dir, base+".*")); len(m) > 0 {
 			return true
 		}
 	}

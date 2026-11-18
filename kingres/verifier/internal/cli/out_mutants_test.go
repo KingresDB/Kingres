@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // From a mutation run of cli_out.go and cli.go: the JSON says when a string was
@@ -76,7 +78,7 @@ func TestInputErrorsAreJSONToo(t *testing.T) {
 func TestIncompleteSaysItIsAnAlert(t *testing.T) {
 	p := newPublication(t, 300, 700)
 	_ = p
-	code, out, _ := run(t, "checkpoint", "--trust", p.trust, "--log", "chain:"+testChain, "--source", t.TempDir())
+	code, out, _ := run(t, "checkpoint", "--trust", p.trust, "--log", "chain:"+testChain, "--source", testdir.New(t))
 	if code != 3 || !strings.Contains(out, "INCOMPLETE: a check that was asked for could not be made") || !strings.Contains(out, "a publisher must serve what its signed checkpoint needs, and one that withholds it may be hiding a failure.") {
 		t.Errorf("status 3: %d\n%s", code, out)
 	}

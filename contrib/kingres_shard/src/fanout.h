@@ -43,10 +43,6 @@ extern PlannedStmt *kingres_shard_make_fanout_plan(Query *parse, char *sql,
 													List *relids, List *locknames);
 
 /*
- * True while this backend runs the local part of a fanned-out statement: the
- * planner must then plan the statement for this node only.
- */
-/*
  * The statement that serializes writers of one reference table on a node (see
  * fanout.c); also used by add_node().
  */
@@ -55,7 +51,12 @@ extern char *kingres_shard_refwrite_lock_sql(const char *qualified_name);
 /* Lock every reference table on every node, as their writers do (add_node, S2-07). */
 extern void kingres_shard_lock_all_reference_tables(void);
 
-extern bool kingres_shard_in_fanout_local(const char *query_string);
+/*
+ * True when the statement text is the local part of a fanned-out statement that
+ * this backend is running through SPI (it carries the nonce of that part): the
+ * planner must then plan the statement for this node only.
+ */
+extern bool kingres_shard_local_part_nonce_ok(const char *query_string);
 
 /*
  * Refuse a write that other nodes take part in when the session's

@@ -53,6 +53,11 @@ func TestSubmitBoundsGenTime(t *testing.T) {
 		if err == nil || anchor.CodeOf(err) != CodeTime || !anchor.IsRefused(err) || rc.Evidence != nil {
 			t.Errorf("%s: accepted or wrong error: %v (%v)", name, err, anchor.CodeOf(err))
 		}
+		// A2-11: the text says what it is, so that the alert is not read as a
+		// problem of credentials
+		if err != nil && (!strings.Contains(err.Error(), "clocks") || !strings.Contains(err.Error(), "not of credentials")) {
+			t.Errorf("%s: the text does not name the cause: %v", name, err)
+		}
 	}
 	// the tolerance is configured: 20 minutes allows 10, and 1 second refuses 4 minutes
 	e := newEnv(t, func(o *Options) { o.Config.MaxSkewSeconds = 1200 })
@@ -66,7 +71,7 @@ func TestSubmitBoundsGenTime(t *testing.T) {
 	// the stored-evidence path does not apply the bound: a token stays valid for ever
 	a := newAuthority(t, authOpts{})
 	tok := a.token(testReq(), issueOpts{genTime: now.Add(-3 * 365 * 24 * time.Hour)})
-	if _, err := VerifyStoredToken(tok, testDigest, a.rootPool, a.interPool); err == nil {
+	if _, err := VerifyStoredToken(tok, testDigest, nil, a.rootPool, a.interPool); err == nil {
 		t.Log("an old token verifies as stored evidence, as it must (the certificate was valid then)")
 	}
 }
@@ -90,7 +95,7 @@ func TestSubmitRefusesExpiredAuthority(t *testing.T) {
 	}
 	// the same token is fine as stored evidence: valid at genTime
 	tok := e.a.token(testReq(), issueOpts{genTime: now.Add(-3 * time.Hour)})
-	if _, err := VerifyStoredToken(tok, testDigest, e.a.rootPool, e.a.interPool); err != nil {
+	if _, err := VerifyStoredToken(tok, testDigest, nil, e.a.rootPool, e.a.interPool); err != nil {
 		t.Fatalf("stored evidence of a token from the validity window: %v", err)
 	}
 	// inside the tolerance of the clock, valid at genTime, expired now
@@ -100,6 +105,9 @@ func TestSubmitRefusesExpiredAuthority(t *testing.T) {
 	_, err = submitWith(t, e2, issueOpts{genTime: now.Add(-3 * time.Minute)})
 	if err == nil || anchor.CodeOf(err) != CodeChainNow || !anchor.IsRefused(err) {
 		t.Fatalf("a certificate that is not valid now: %v (%s)", err, anchor.CodeOf(err))
+	}
+	if !strings.Contains(err.Error(), "not a problem of credentials") || !strings.Contains(err.Error(), "CA bundle") {
+		t.Errorf("the text does not name the cause: %v", err)
 	}
 	// not yet valid at the clock
 	e3 := newEnv(t, nil)

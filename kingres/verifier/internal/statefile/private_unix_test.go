@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // The reported case (L10-06): a directory another user can write holds the
@@ -46,7 +48,7 @@ func fakeOwner(t *testing.T, owners map[string]int) {
 }
 
 func TestCheckPrivateLooksAtEveryComponent(t *testing.T) {
-	base, err := filepath.EvalSymlinks(t.TempDir())
+	base, err := filepath.EvalSymlinks(testdir.New(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +82,7 @@ func TestCheckPrivateLooksAtEveryComponent(t *testing.T) {
 }
 
 func TestCheckPrivateFollowsLinks(t *testing.T) {
-	base, err := filepath.EvalSymlinks(t.TempDir())
+	base, err := filepath.EvalSymlinks(testdir.New(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +130,7 @@ func TestCheckPrivateFollowsLinks(t *testing.T) {
 }
 
 func TestCheckPrivateModesOfTheHolderAndTheState(t *testing.T) {
-	base, err := filepath.EvalSymlinks(t.TempDir())
+	base, err := filepath.EvalSymlinks(testdir.New(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +168,7 @@ func TestCheckPrivateModesOfTheHolderAndTheState(t *testing.T) {
 // The path is looked at again after the lock is taken, and refused when the name
 // leads elsewhere.
 func TestAcquireCheckedLooksAgain(t *testing.T) {
-	base, err := filepath.EvalSymlinks(t.TempDir())
+	base, err := filepath.EvalSymlinks(testdir.New(t))
 	if err != nil {
 		t.Fatal(err)
 	}

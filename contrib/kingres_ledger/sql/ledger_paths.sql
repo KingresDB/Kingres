@@ -281,13 +281,16 @@ SELECT kingres.ledger_build_block() IS NOT NULL AS built;
 SELECT public.p_blk() AS after_the_builder;
 SELECT kingres.ledger_generate_digest() IS NOT NULL AS digest;
 SELECT public.p_blk() AS after_the_digest;
-SELECT kingres.ledger_verify_recorded() IS NOT NULL AS recorded;
-SELECT public.p_blk() AS after_the_recorded_verification;
+-- The extension refuses a call that would take a lock that comes earlier in
+-- the order of the locks than one the transaction holds (L17-04): the builders'
+-- lock, the registry's lock, the verifications' lock.
 CREATE TABLE p_new (id int);
 SELECT kingres.ledger_enable('p_new');
 SELECT public.p_blk() AS after_ledger_enable;
 INSERT INTO p_new VALUES (1);
 SELECT public.p_blk() AS after_a_row_of_the_new_table;
+SELECT kingres.ledger_verify_recorded() IS NOT NULL AS recorded;
+SELECT public.p_blk() AS after_the_recorded_verification;
 COMMIT;
 -- After a statement of the extension that failed, in a subtransaction that was
 -- rolled back, and in an exception block of a function: a transaction row that

@@ -11,13 +11,30 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use File::Path ();
 use IPC::Run ();
 use Exporter 'import';
 
 our @EXPORT_OK = qw(make_node make_cluster keys_of_group run_sql group_of_key
   prepared_count wait_prepared_count logical_settings move_state wait_for_fault_file
   make_standby register_standby wait_catchup set_sync promote_standby wait_waiter
-  start_psql finish_psql);
+  start_psql finish_psql release_node);
+
+# Stop a node, remove its data and give its port back to the reservation of the harness (which keeps a port
+# until the test ends): a test that builds a cluster for every case would run out of ports and of disk.
+sub release_node
+{
+	my ($node) = @_;
+	$node->stop('immediate', fail_ok => 1);
+	File::Path::remove_tree($node->basedir);
+	my $dir = $ENV{PG_TEST_PORT_DIR} // (($ENV{top_builddir} // $PostgreSQL::Test::Utils::tmp_check) . '/portlock');
+	if (open(my $h, '+<', $dir . '/' . $node->port . '.rsv'))
+	{
+		print $h sprintf("%10d
+", 0);
+		close $h;
+	}
+}
 
 # A node that preloads the extension.  Two-phase commit needs prepared
 # transactions; recovery_interval is 0 (no background recovery) unless asked.
@@ -25,8 +42,11 @@ sub make_node
 {
 	my ($name, %opt) = @_;
 	# install_path: a node of another PostgreSQL installation (t/046_two_majors.pl).
+	# port: one that the caller took from the harness (get_free_port) and uses again for each cluster of a
+	# loop; the harness itself never gives a port back during a test.
 	my $node = PostgreSQL::Test::Cluster->new($name,
-		(defined $opt{install_path} ? (install_path => $opt{install_path}) : ()));
+		(defined $opt{install_path} ? (install_path => $opt{install_path}) : ()),
+		(defined $opt{port} ? (port => $opt{port}) : ()));
 	if ($opt{logical})
 	{
 		$node->init(allows_streaming => 'logical');
@@ -167,7 +187,7 @@ sub make_standby
 	my ($primary, $name, %opt) = @_;
 	my $backup = "bk_$name";
 	$primary->backup($backup);
-	my $sb = PostgreSQL::Test::Cluster->new($name);
+	my $sb = PostgreSQL::Test::Cluster->new($name, (defined $opt{port} ? (port => $opt{port}) : ()));
 	$sb->init_from_backup($primary, $backup, has_streaming => 1);
 	$sb->start;
 	return $sb;

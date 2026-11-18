@@ -142,7 +142,7 @@ func TestZeroSizeLog(t *testing.T) {
 	if _, err := l.Append(bg, nil); err == nil {
 		t.Fatal("an empty append was accepted")
 	}
-	if len(Required(0)) != 0 {
+	if len(mustRequired(t, 0)) != 0 {
 		t.Fatal("an empty tree needs no tile")
 	}
 	r, _ := NewReader(bg, store, 0)
@@ -211,7 +211,7 @@ func TestBatchingGivesTheSameLog(t *testing.T) {
 			}
 		}
 		req := map[[2]uint64]TileKey{}
-		for _, k := range Required(uint64(n)) {
+		for _, k := range mustRequired(t, uint64(n)) {
 			req[[2]uint64{uint64(k.Level + 1), k.Index}] = k
 		}
 		for _, k := range one.Keys() {
@@ -543,7 +543,7 @@ func TestRequiredAndPaths(t *testing.T) {
 		}
 	}
 	// Required names the tiles of a size.
-	req := Required(65539)
+	req := mustRequired(t, 65539)
 	want := map[string]bool{"tile/0/255": true, "tile/0/256.p/3": true, "tile/1/000": true, "tile/2/000.p/1": true, "tile/entries/000": true, "tile/entries/256.p/3": true}
 	got := map[string]bool{}
 	for _, k := range req {
@@ -640,7 +640,7 @@ func TestAuditFindsDamage(t *testing.T) {
 	l, _ := Create(bg, testOrigin(1), store)
 	mustAppend(t, l, 0, n)
 	root := l.Root()
-	for _, k := range Required(uint64(n)) {
+	for _, k := range mustRequired(t, uint64(n)) {
 		d, _ := store.GetTile(bg, k)
 		for _, pos := range []int{0, len(d) / 2, len(d) - 1} {
 			bad := bytes.Clone(d)

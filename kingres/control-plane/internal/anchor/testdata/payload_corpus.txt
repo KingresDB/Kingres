@@ -1,0 +1,58 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Signed notes with the verdict of two rule sets: this package (ParsePayload)
+# and the verifier (kingres-verify: signednote.Parse, then checkpoint.Parse of
+# the text). One case per line, four fields separated by a tab:
+#
+#   name  anchor  verifier  note
+#
+# anchor and verifier are "accept" or "refuse"; note is a Go double-quoted
+# string. Where the two verdicts differ, the case is one of the two places where
+# this package is stricter on purpose (the byte 0x7f, DEL, anywhere in the note;
+# a note over 16 KiB, which is tested separately) and the name says so.
+# TestPayloadCorpus holds ParsePayload to the anchor column. This file has a
+# byte-identical copy in the verifier module
+# (verifier/internal/checkpoint/testdata/payload_corpus.txt), and a test there
+# holds the verifier's real parsers to the verifier column; a test of this
+# package fails when the two copies differ (correction 92 and 97). Change both
+# together.
+
+good	accept	accept	"kingres.example/agg\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\u2014 kingres.example/agg AAAAAA==\n"
+two-keys-same-name-other-id	accept	accept	"kingres.example/agg\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\u2014 kingres.example/agg AAAAAA==\n\u2014 kingres.example/agg AAAAAQ==\n"
+two-keys-other-name	accept	accept	"kingres.example/agg\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\u2014 kingres.example/agg AAAAAA==\n\u2014 witness.example/w AAAAAA==\n"
+one-extension-line	accept	accept	"kingres.example/agg\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\nsome extension\n\n\u2014 kingres.example/agg AAAAAA==\n"
+sixteen-extension-lines	accept	accept	"o\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\ne1\ne2\ne3\ne4\ne5\ne6\ne7\ne8\ne9\ne10\ne11\ne12\ne13\ne14\ne15\ne16\n\n\u2014 o AAAAAA==\n"
+seventeen-extension-lines	refuse	refuse	"o\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\ne1\ne2\ne3\ne4\ne5\ne6\ne7\ne8\ne9\ne10\ne11\ne12\ne13\ne14\ne15\ne16\ne17\n\n\u2014 o AAAAAA==\n"
+empty-extension-line	refuse	refuse	"o\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\ne1\n\ne2\n\n\u2014 o AAAAAA==\n"
+two-blank-lines-before-signatures	refuse	refuse	"o\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\n\u2014 o AAAAAA==\n"
+two-lines-of-text	refuse	refuse	"o\n17\n\n\u2014 o AAAAAA==\n"
+no-signature	refuse	refuse	"o\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n"
+no-final-newline	refuse	refuse	"o\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\u2014 o AAAAAA=="
+no-blank-line	refuse	refuse	"o\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\u2014 o AAAAAA==\n"
+signature-name-with-a-plus-sign	refuse	refuse	"o\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\u2014 kingres+x AAAAAA==\n"
+signature-name-with-an-ideographic-space	refuse	refuse	"o\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\u2014 a\u3000b AAAAAA==\n"
+signature-name-with-a-next-line-character	refuse	refuse	"o\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\u2014 a\u0085b AAAAAA==\n"
+signature-name-empty	refuse	refuse	"o\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\u2014  AAAAAA==\n"
+signature-of-three-bytes	refuse	refuse	"o\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\u2014 o AAAA\n"
+signature-base64-not-canonical	refuse	refuse	"o\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\u2014 o AAAAAB==\n"
+signature-base64-unpadded	refuse	refuse	"o\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\u2014 o AAAAAA\n"
+signature-with-a-space-in-the-base64	refuse	refuse	"o\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\u2014 o AAAA AA==\n"
+signature-line-without-the-em-dash	refuse	refuse	"o\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n- o AAAAAA==\n"
+two-lines-same-name-and-id	refuse	refuse	"o\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\u2014 o AAAAAA==\n\u2014 o AAAAAA==\n"
+root-base64-not-canonical	refuse	refuse	"o\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJ=\n\n\u2014 o AAAAAA==\n"
+root-of-31-bytes	refuse	refuse	"o\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycg==\n\n\u2014 o AAAAAA==\n"
+size-zero-with-a-root	refuse	refuse	"o\n0\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\u2014 o AAAAAA==\n"
+size-zero-with-the-root-of-the-empty-tree	accept	accept	"o\n0\n47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\n\n\u2014 o AAAAAA==\n"
+size-with-a-leading-zero	refuse	refuse	"o\n017\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\u2014 o AAAAAA==\n"
+size-with-a-sign	refuse	refuse	"o\n+17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\u2014 o AAAAAA==\n"
+size-at-the-limit	refuse	refuse	"o\n4611686018427387904\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\u2014 o AAAAAA==\n"
+size-below-the-limit	accept	accept	"o\n4611686018427387903\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\u2014 o AAAAAA==\n"
+origin-with-a-plus-sign	refuse	refuse	"kingres+x\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\u2014 o AAAAAA==\n"
+origin-with-a-no-break-space	refuse	refuse	"a\u00a0b\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\u2014 o AAAAAA==\n"
+origin-with-letters-outside-ascii	accept	accept	"kingres.\u00e9xample\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\u2014 o AAAAAA==\n"
+origin-with-invalid-utf8	refuse	refuse	"o\xff\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\u2014 o AAAAAA==\n"
+origin-with-a-control-character	refuse	refuse	"o\x01\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\u2014 o AAAAAA==\n"
+origin-with-DEL-stricter-on-purpose	refuse	accept	"o\x7f\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\u2014 o AAAAAA==\n"
+signature-name-with-DEL-stricter-on-purpose	refuse	accept	"o\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\u2014 a\x7fb AAAAAA==\n"
+extension-line-with-DEL-stricter-on-purpose	refuse	accept	"o\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\next\x7f\n\n\u2014 o AAAAAA==\n"
+signature-line-as-extension-line-last-blank-line-splits	accept	accept	"o\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\u2014 o AAAAAA==\n\n\u2014 p AAAAAA==\n"

@@ -33,6 +33,7 @@ type site struct {
 // siteKinds maps the name of a call to the statuses it can give.
 var siteKinds = map[string][]int{
 	"inputError":       {ExitUsage},
+	"inputErrorInfo":   {ExitUsage}, // counted as inputError (see siteAlias)
 	"finishInputWith":  {ExitUsage},
 	"fail":             {ExitUsage},
 	"finishFailed":     {ExitFailed},
@@ -45,6 +46,10 @@ var siteKinds = map[string][]int{
 	"exitUsage":        {ExitUsage},
 	"exitFailed":       {ExitFailed},
 }
+
+// siteAlias names the kinds that are another kind with more arguments: the key of a
+// site of inputErrorInfo is that of an inputError, so that the rows do not change.
+var siteAlias = map[string]string{"inputErrorInfo": "inputError"}
 
 // siteFreeFuncs are the functions that implement the statuses: the calls inside
 // them are not sites of a command.
@@ -86,6 +91,9 @@ func deriveSites(t testing.TB) []site {
 				case *ast.SelectorExpr:
 					if _, ok := siteKinds[fn.Sel.Name]; ok {
 						kind = fn.Sel.Name
+						if a, ok := siteAlias[kind]; ok {
+							kind = a
+						}
 					}
 				case *ast.Ident:
 					switch fn.Name {

@@ -4,6 +4,7 @@ package ledgerlog
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"encoding/base64"
 	"errors"
 	"strings"
@@ -173,11 +174,11 @@ func TestSignedCheckpointWithTwoKeys(t *testing.T) {
 	// Re-signing adds the second key to a note with one signature; the same
 	// key twice is refused.
 	one, _ := SignCheckpoint(bg, c, k1)
-	two, err := ResignCheckpoint(bg, one, k2)
+	two, err := ResignCheckpoint(bg, one, []ed25519.PublicKey{k1.Public()}, k2)
 	if err != nil || !bytes.Equal(two, note) {
 		t.Fatalf("resign: %v", err)
 	}
-	if _, err := ResignCheckpoint(bg, one, k1); err == nil {
+	if _, err := ResignCheckpoint(bg, one, []ed25519.PublicKey{k1.Public()}, k1); err == nil {
 		t.Fatal("the same key twice")
 	}
 	if _, err := SignCheckpoint(bg, c, k1, k1); err == nil {

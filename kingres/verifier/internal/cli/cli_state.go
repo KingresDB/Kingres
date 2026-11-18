@@ -257,10 +257,21 @@ func (in *logInputs) proveExtension(oldCP, newCP *checkpoint.Checkpoint) (tiles,
 // both are merged, so that which of the genuine lines a publisher served on
 // which run changes nothing that is stored, saved or decided.
 func (e *env) applyState(r *result, in *logInputs, cp *checkpoint.Checkpoint, served *signednote.Note, canon []byte, signers []signednote.Key, statePath string, asJSON, allowShared bool) (int, bool) {
+	// judged is true once the held state, or its absence, was looked at: every exit
+	// from then on carries info.state.anchor_weak (L16-02).
+	judged := false
 	fail := func(err error) (int, bool) {
-		return e.inputError(r.cmd, asJSON, err), true
+		var info map[string]any
+		if judged {
+			info = r.info
+		}
+		return e.inputErrorInfo(r.cmd, asJSON, err, info), true
 	}
 	path, err := statefile.Resolve(statePath)
+	if err == nil {
+		// a name the program gives its own temporary files is refused (L18-01)
+		err = statefile.CheckName(path)
+	}
 	if err != nil {
 		return fail(fmt.Errorf("--state %s: %w", statePath, err))
 	}
@@ -278,6 +289,9 @@ func (e *env) applyState(r *result, in *logInputs, cp *checkpoint.Checkpoint, se
 		return fail(fmt.Errorf("--state %s: cannot take the lock: %w", statePath, err))
 	}
 	defer lock.Release()
+	// The lock is one per directory: no run of this program is writing, so every
+	// temporary file of the program that is left in the directory is a crash's (L16-04).
+	statefile.RemoveLeftovers(path)
 	keys, kerr := in.allKeys()
 	if kerr != nil {
 		return fail(kerr)
@@ -313,6 +327,8 @@ func (e *env) applyState(r *result, in *logInputs, cp *checkpoint.Checkpoint, se
 		old = held.cp
 		r.notes = appendNew(r.notes, hnotes)
 	}
+	judged = true
+	r.info["state"] = weakState(map[string]any{}, held)
 
 	type outcome struct {
 		action   string
@@ -399,19 +415,37 @@ func (e *env) applyState(r *result, in *logInputs, cp *checkpoint.Checkpoint, se
 		extends = fmt.Sprintf("extends the checkpoint of size %d in the state file", old.Size)
 	}
 	r.notProved = append(r.notProved, "that the state file is the one you left: it is your record, keep it where the publisher cannot write")
-	if held != nil && held.weak {
-		r.notProved = append(r.notProved, "that the checkpoint the state file held was genuine: it rested only on keys the trust file no longer counts ("+held.weakWhy+"), and what this run proved is that the new checkpoint is consistent with it")
+	// What the state is after this run (L16-03): the state that was written when
+	// the run wrote one, the held one when it did not.
+	final := held
+	stateInfo := func() map[string]any {
+		m := map[string]any{"action": out.action, "new_size": cp.Size, "extension_proved": out.proved, "old_size": out.oldSize}
+		weakState(m, final)
+		if held != nil && held.weak && !final.weak {
+			m["anchor_weak_repaired"] = true
+		}
+		return m
 	}
 	if write {
 		data, err := encodeStateFn(cp, canon, signers, in.now)
 		if err == nil {
-			if err = in.readBack(data, cp, canon); err != nil {
+			var back *heldNote
+			if back, err = in.readBackHeld(data, cp, canon); err != nil {
 				return fail(err)
 			}
-			err = statefile.ReplaceIfUnchanged(path, data, stored, storedExists, maxStateFile)
+			final = back
+			err = replaceStateFn(path, data, stored, storedExists, maxStateFile)
 			if errors.Is(err, statefile.ErrStateChanged) {
 				return fail(fmt.Errorf("--state %s: %w: another run, or a program that does not take the lock, wrote it after this run read it, so this run wrote nothing (a decision made on an older state must not replace a newer one); run it again", statePath, err))
 			}
+		}
+		var dse *statefile.DirSyncError
+		if errors.As(err, &dse) {
+			// The rename happened: the state is the new one (L16-05). The status stays 2.
+			m := stateInfo()
+			m["directory_flushed"] = false
+			r.info["state"] = m
+			return fail(fmt.Errorf("the checkpoint verified and --state %s was replaced (it holds size %d now), but the directory could not be flushed: a power loss may bring the old file back, and the next run then goes on from that one (%w)", statePath, cp.Size, dse.Err))
 		}
 		if err != nil {
 			return fail(fmt.Errorf("the checkpoint verified but --state %s could not be updated, so later runs do not know it: %w", statePath, err))
@@ -421,31 +455,32 @@ func (e *env) applyState(r *result, in *logInputs, cp *checkpoint.Checkpoint, se
 		} else {
 			r.notes = append(r.notes, fmt.Sprintf("the state file was updated to size %d", cp.Size))
 		}
+		if held != nil && held.weak && !final.weak {
+			r.notes = append(r.notes, fmt.Sprintf("the state file rested only on keys that the trust file no longer counts (%s); what was written now carries the signature of a key that counts, so it does not rest only on such keys any more: the output reports the state as it is after this run", held.weakWhy))
+		}
 	}
+	// No non-proof is listed about a held checkpoint that rested only on keys the trust
+	// file no longer counts (L16-03): a run that ends here has verified a checkpoint
+	// signed by a key that counts, and either proved the held one a prefix of it or
+	// merged that key's line into it, so the held checkpoint is shown to be the log's
+	// and the state written rests on a key that counts. A held checkpoint that is not
+	// proved ends the run before this point (a conflict or a failed proof).
 	if extends != "" {
 		r.headline = fmt.Sprintf("the checkpoint of %s at size %d is signed by a trusted key and %s.", cp.Origin, cp.Size, extends)
 	}
-	st := map[string]any{"action": out.action, "new_size": cp.Size, "extension_proved": out.proved, "old_size": out.oldSize}
-	r.info["state"] = weakState(st, held)
+	r.info["state"] = stateInfo()
 	r.info["extends_state"] = out.proved
 	return 0, false
 }
 
-// conflict ends a run that found a fork or a rollback: the state is left as it
-// is, the conflicting checkpoint is saved beside it, and the output says where
-// both are. Two notes signed by the same key for trees that are not one history
-// are the proof of misbehaviour.
-func (e *env) conflict(r *result, asJSON bool, keys []signednote.Key, statePath, step string, cp *checkpoint.Checkpoint, note []byte, held *heldNote, cause error) int {
-	old := held.cp
-	if held.weak {
-		return e.weakConflict(r, asJSON, keys, statePath, step, cp, note, held, cause)
-	}
-	// An evidence file is one per signed text: the same text served with other
-	// genuine lines is the same file, extended (L12-03), never another name. Lines
-	// only accumulate (L14-03): the lines the file holds are kept as they are, also
-	// those of a key that has left the trust file, and only new lines are verified.
-	var extended *signednote.Stored
-	merge := func(have []byte) ([]byte, bool) {
+// evidenceMerge is the merge of the evidence files of one signed text: a file at
+// a name of the evidence is the same checkpoint as note when it parses and has the
+// same signed text; the bytes it should hold are then the union of the lines
+// (signednote.MergeStored). Lines only accumulate (L14-03): the lines the file
+// holds are kept as they are, also those of a key that has left the trust file,
+// and only new lines are verified. extended is set when lines were added.
+func evidenceMerge(keys []signednote.Key, note []byte, extended **signednote.Stored) func(have []byte) ([]byte, bool) {
+	return func(have []byte) ([]byte, bool) {
 		hn, err := signednote.Parse(have)
 		if err != nil {
 			return nil, false
@@ -461,14 +496,49 @@ func (e *env) conflict(r *result, asJSON bool, keys []signednote.Key, statePath,
 		if st.Added == 0 {
 			return have, true // nothing to add: the file stays as it is
 		}
-		extended = st
+		*extended = st
 		return st.Bytes, true
 	}
-	saved, serr := statefile.SaveConflictMerging(statePath, cp.Size, cp.Root[:], note, merge)
+}
+
+// printNote puts a conflicting note that this run did not save in the output, so
+// that it is not lost with the run: base64 of exactly the bytes that should have
+// been saved (the note reduced to what verified), which a person can decode into a
+// file and keep. info gets it as note_base64.
+func printNote(r *result, info map[string]any, note []byte) {
+	enc := base64.StdEncoding.EncodeToString(note)
+	info["note_base64"] = enc
+	r.notes = append(r.notes, "the note to keep, as base64 of its exact bytes (decode it into a file): "+enc)
+}
+
+// conflict ends a run that found a fork or a rollback: the state is left as it
+// is, the conflicting checkpoint is saved beside it, and the output says where
+// both are. Two notes signed by the same key for trees that are not one history
+// are the proof of misbehaviour.
+func (e *env) conflict(r *result, asJSON bool, keys []signednote.Key, statePath, step string, cp *checkpoint.Checkpoint, note []byte, held *heldNote, cause error) int {
+	old := held.cp
+	if held.weak {
+		return e.weakConflict(r, asJSON, keys, statePath, step, cp, note, held, cause)
+	}
+	// An evidence file is one per signed text: the same text served with other
+	// genuine lines is the same file, extended (L12-03), never another name.
+	var extended *signednote.Stored
+	saved, serr := saveConflictFn(statePath, cp.Size, cp.Root[:], note, evidenceMerge(keys, note, &extended))
+	// A failed flush of the directory after the file was put in place is not a
+	// failed save (L16-05): the file is there, a power loss may take it back.
+	var dse *statefile.DirSyncError
+	unflushed := errors.As(serr, &dse)
 	code := ExitFailed
-	info := map[string]any{"action": "kept", "old_size": old.Size, "new_size": cp.Size, "extension_proved": false, "evidence_saved": serr == nil}
+	info := map[string]any{"action": "kept", "old_size": old.Size, "new_size": cp.Size, "extension_proved": false, "evidence_saved": serr == nil || unflushed}
 	weakState(info, held)
 	switch {
+	case unflushed:
+		// The status stays 4: the evidence is not known to be durable.
+		code = ExitEvidenceLost
+		r.notes = append(r.notes, fmt.Sprintf("the conflicting signed checkpoint (size %d) was saved to %s, but the directory could not be flushed: a power loss may take the file back (%v); the state file %s (size %d) was not changed; keep the note printed below yourself, it is the proof of the conflict", cp.Size, saved.Path, dse.Err, statePath, old.Size))
+		info["conflict_file"] = saved.Path
+		info["evidence_flushed"] = false
+		printNote(r, info, note)
 	case serr != nil:
 		// The finding stands, and so does the failure; what is added is that the
 		// evidence is not on disk, which must never be claimed. The status says so
@@ -476,12 +546,7 @@ func (e *env) conflict(r *result, asJSON bool, keys []signednote.Key, statePath,
 		code = ExitEvidenceLost
 		r.notes = append(r.notes, fmt.Sprintf("the conflicting signed checkpoint (size %d) was NOT saved: %v; the state file %s (size %d) was not changed; save the note you were shown yourself, it is the proof of the conflict", cp.Size, serr, statePath, old.Size))
 		info["conflict_file"] = nil
-		// The note itself is printed, so that it is not lost with the run: base64
-		// of exactly the bytes that should have been saved (the note reduced to
-		// what verified), which a person can decode into a file and keep.
-		enc := base64.StdEncoding.EncodeToString(note)
-		info["note_base64"] = enc
-		r.notes = append(r.notes, "the note to keep, as base64 of its exact bytes (decode it into a file): "+enc)
+		printNote(r, info, note)
 	case saved.Existing && saved.Extended:
 		holds := ""
 		if extended != nil {
@@ -512,9 +577,17 @@ func (e *env) conflict(r *result, asJSON bool, keys []signednote.Key, statePath,
 // never stored: the protection against rollback would be stuck on a file no
 // later run accepts.
 func (in *logInputs) readBack(data []byte, cp *checkpoint.Checkpoint, note []byte) error {
+	_, err := in.readBackHeld(data, cp, note)
+	return err
+}
+
+// readBackHeld is readBack that also returns the held note as the next run will
+// judge it, so that the run can say whether the state it writes rests only on keys
+// the trust file no longer counts (L16-03).
+func (in *logInputs) readBackHeld(data []byte, cp *checkpoint.Checkpoint, note []byte) (*heldNote, error) {
 	held, rec, err := decodeHeld(data)
+	var back *heldNote
 	if err == nil {
-		var back *heldNote
 		back, _, err = in.verifyHeld(held, rec, readBackWhat, true)
 		if err == nil && (back.cp.Size != cp.Size || back.cp.Root != cp.Root || !bytes.Equal(held, note)) {
 			err = errors.New("the state file that would be written does not read back as the checkpoint that was verified")
@@ -525,9 +598,9 @@ func (in *logInputs) readBack(data []byte, cp *checkpoint.Checkpoint, note []byt
 		if errors.As(err, &ie) {
 			err = ie.error
 		}
-		return fmt.Errorf("this checkpoint cannot be recorded, because a later run would not accept the state file made from it (%w); the state file was not changed", err)
+		return nil, fmt.Errorf("this checkpoint cannot be recorded, because a later run would not accept the state file made from it (%w); the state file was not changed", err)
 	}
-	return nil
+	return back, nil
 }
 
 // readBackWhat names the file that readBack checks, in the messages.
@@ -606,37 +679,52 @@ func weakState(m map[string]any, held *heldNote) map[string]any {
 // (4 says that a fork, which is a finding about the log, was not saved; here the
 // finding is not established).
 //
-// At most one evidence file is kept for a held state (statefile.SaveWeakConflict),
-// the first note served against it, and never one per run: the evidence of a fork
-// is two checkpoints of the log that a key which counts signed, and here one side
-// is not that; yet a log that really forked after a rotation looks the same, so
-// the first conflict is kept and a log that grows does not make a file at each
-// run.
+// At most two evidence files are kept for a held state (statefile.SaveWeakConflict):
+// the first note of each kind, a rollback and a fork, and never one per run. A
+// party without a key can serve an old genuine checkpoint once, which is a
+// rollback and takes the file of the rollbacks; a fork has a file of its own, so
+// the replay cannot take its place (L16-01). The bound is two whatever is served,
+// and a note that is not saved by this run, for any reason (the file of its kind
+// holds another checkpoint, a file is planted there, the disk refuses), is printed
+// in full, as the evidence of a state that counts is: the auditor does not learn
+// that a note exists only in the run's source.
 func (e *env) weakConflict(r *result, asJSON bool, keys []signednote.Key, statePath, step string, cp *checkpoint.Checkpoint, note []byte, held *heldNote, cause error) int {
 	old := held.cp
-	// What is at the name must be a note of this log that a key of the trust file
-	// signed: a file someone put there is not evidence.
-	valid := func(have []byte) bool {
-		n, err := signednote.Parse(have)
-		if err != nil {
-			return false
-		}
-		_, _, err = signednote.Merge(keys, n)
-		return err == nil
+	kind := statefile.WeakFork
+	if step == "rollback" {
+		kind = statefile.WeakRollback
 	}
-	saved, serr := statefile.SaveWeakConflict(statePath, old.Size, old.Root[:], note, valid)
-	info := map[string]any{"action": "kept", "old_size": old.Size, "new_size": cp.Size, "extension_proved": false, "evidence_saved": serr == nil}
+	var extended *signednote.Stored
+	saved, serr := saveWeakConfFn(statePath, kind, old.Size, old.Root[:], note, evidenceMerge(keys, note, &extended))
+	var dse *statefile.DirSyncError
+	unflushed := errors.As(serr, &dse)
+	info := map[string]any{"action": "kept", "old_size": old.Size, "new_size": cp.Size, "extension_proved": false, "evidence_saved": serr == nil || unflushed}
 	weakState(info, held)
 	switch {
+	case unflushed:
+		// The status stays 1 (never 4 here).
+		r.notes = append(r.notes, fmt.Sprintf("the conflicting checkpoint (size %d) was saved to %s, but the directory could not be flushed: a power loss may take the file back (%v); the state file %s (size %d) was not changed; keep the note printed below yourself", cp.Size, saved.Path, dse.Err, statePath, old.Size))
+		info["conflict_file"] = saved.Path
+		info["evidence_flushed"] = false
+		printNote(r, info, note)
+	case errors.Is(serr, statefile.ErrSlotTaken):
+		r.notes = append(r.notes, fmt.Sprintf("the conflicting checkpoint (size %d) was NOT saved by this run: the one file kept for a %s against this state, %s, holds another checkpoint (or is not a signed note of this log), and at most one file is kept for each kind, never one per run; the state file %s (size %d) was not changed; keep the note printed below yourself, and keep both files", cp.Size, kind, saved.Path, statePath, old.Size))
+		info["conflict_file"] = nil
+		printNote(r, info, note)
 	case serr != nil:
 		// Not status 4: that status is for a fork that is a finding about the log.
-		r.notes = append(r.notes, fmt.Sprintf("the conflicting checkpoint (size %d) was NOT saved: %v; the state file %s (size %d) was not changed; the next run will find the same conflict", cp.Size, serr, statePath, old.Size))
+		r.notes = append(r.notes, fmt.Sprintf("the conflicting checkpoint (size %d) was NOT saved: %v; the state file %s (size %d) was not changed; the next run will find the same conflict; keep the note printed below yourself", cp.Size, serr, statePath, old.Size))
 		info["conflict_file"] = nil
+		printNote(r, info, note)
 	case saved.Existing:
-		r.notes = append(r.notes, fmt.Sprintf("evidence: the state file %s (size %d) was not changed; one conflicting checkpoint is already kept for this state, at %s, by an earlier run, and this run's (size %d) was not saved: one file is kept for a state that rests only on keys the trust file no longer counts, never one per run; keep both files", statePath, old.Size, saved.Path, cp.Size))
+		holds := ""
+		if extended != nil {
+			holds = fmt.Sprintf(" (it now holds %d signature line(s), %s; this run added %d)", len(extended.Verified)+extended.Unverifiable, holdsText(extended), extended.Added)
+		}
+		r.notes = append(r.notes, fmt.Sprintf("evidence: the state file %s (size %d) was not changed, and this very conflicting checkpoint (size %d) is already kept for this state, at %s, by an earlier run%s; keep both files", statePath, old.Size, cp.Size, saved.Path, holds))
 		info["conflict_file"] = saved.Path
 	default:
-		r.notes = append(r.notes, fmt.Sprintf("evidence: the state file %s (size %d) was not changed, and the conflicting checkpoint (size %d) was saved to %s; because the state rests only on keys the trust file no longer counts this is the one file kept for it, and later conflicts with it are not saved (a log that grows would make a file at each run); keep both files", statePath, old.Size, cp.Size, saved.Path))
+		r.notes = append(r.notes, fmt.Sprintf("evidence: the state file %s (size %d) was not changed, and the conflicting checkpoint (size %d) was saved to %s; because the state rests only on keys the trust file no longer counts, one file is kept for the first %s against it and a later one that differs is printed and not saved (a log that grows would make a file at each run); keep both files", statePath, old.Size, cp.Size, saved.Path, kind))
 		info["conflict_file"] = saved.Path
 	}
 	if step == "rollback" {
@@ -677,3 +765,12 @@ func removedKeysText(note []byte, cause error) string {
 	}
 	return fmt.Sprintf(" (the note carries lines of the key id(s) %s, and the trust file holds none of those keys: removing a key from the trust file leaves every state that rests only on it unreadable, which is why a key that is no longer wanted is marked revoked in the file and never deleted)", strings.Join(ids, ", "))
 }
+
+// The calls that write beside the state, as variables so that a test can put a
+// failed flush of the directory after a write that did happen (L16-05), which
+// nothing else can reach. Production code never sets them.
+var (
+	replaceStateFn = statefile.ReplaceIfUnchanged
+	saveConflictFn = statefile.SaveConflictMerging
+	saveWeakConfFn = statefile.SaveWeakConflict
+)

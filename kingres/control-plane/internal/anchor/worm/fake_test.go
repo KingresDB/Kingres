@@ -43,6 +43,7 @@ type fakeVersion struct {
 	retain  string
 	lastMod time.Time
 	sum     string
+	attempt string // the user metadata kingres-attempt, as sent
 }
 
 type fakeReq struct {
@@ -94,8 +95,26 @@ type fakeS3 struct {
 	listPage        int // versions per page of a listing (0: all)
 	listCalls       int
 	retentionCalls  int
-	retentionStatus int           // answer PutObjectRetention with this status
-	skew            time.Duration // added to the Last-Modified of new versions
+	retentionStatus int              // answer PutObjectRetention with this status
+	skew            time.Duration    // added to the Last-Modified of new versions
+	headVersion     string           // answer HEAD of a version with this version id
+	listExact       int              // pad a version listing to exactly this many bytes
+	headFailures    int              // the next HEAD requests of a version answer 500 (counted down)
+	clock           func() time.Time // the store's time source before skew is added (nil: time.Now)
+
+	// a store, gateway or copy tool that does not keep the user metadata of the
+	// attempt, rewrites it, or repeats it (A4-02)
+	dropAttempt    bool
+	attemptRewrite func(string) string
+	attemptExtra   []string
+}
+
+// now is the store's clock: the shared test clock, or the real one, plus skew.
+func (f *fakeS3) now() time.Time {
+	if f.clock != nil {
+		return f.clock().Add(f.skew).UTC().Truncate(time.Second)
+	}
+	return time.Now().Add(f.skew).UTC().Truncate(time.Second)
 }
 
 func newFakeS3() *fakeS3 {
@@ -349,6 +368,9 @@ func (f *fakeS3) listVersions(w http.ResponseWriter, q url.Values) {
 	}
 	sb.WriteString("</ListVersionsResult>")
 	f.listCalls++
+	if n := f.listExact - sb.Len(); n > 0 {
+		sb.WriteString(strings.Repeat(" ", n))
+	}
 	w.Header().Set("Content-Type", "application/xml")
 	_, _ = io.WriteString(w, sb.String())
 }
@@ -360,7 +382,7 @@ func (f *fakeS3) addVersion(key string, body []byte, mode string, retain time.Ti
 	defer f.mu.Unlock()
 	h := sha256.Sum256(body)
 	f.nextID++
-	v := &fakeVersion{body: append([]byte(nil), body...), lastMod: time.Now().UTC().Truncate(time.Second),
+	v := &fakeVersion{body: append([]byte(nil), body...), lastMod: f.now(),
 		sum: base64.StdEncoding.EncodeToString(h[:]), id: "v" + strconv.Itoa(f.nextID) + "-" + hex.EncodeToString(h[:4]), mode: mode}
 	if mode != "" {
 		v.retain = retain.UTC().Format("2006-01-02T15:04:05.000Z")
@@ -457,7 +479,7 @@ func (f *fakeS3) put(w http.ResponseWriter, r *http.Request, key string, body []
 		f.errXML(w, 412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold")
 		return
 	}
-	v := &fakeVersion{body: append([]byte(nil), body...), lastMod: time.Now().Add(f.skew).UTC().Truncate(time.Second)}
+	v := &fakeVersion{body: append([]byte(nil), body...), lastMod: f.now(), attempt: r.Header.Get("X-Amz-Meta-Kingres-Attempt")}
 	h := sha256.Sum256(body)
 	v.sum = base64.StdEncoding.EncodeToString(h[:])
 	f.nextID++
@@ -514,6 +536,21 @@ func (f *fakeS3) read(w http.ResponseWriter, r *http.Request, key string) {
 		w.WriteHeader(f.headStatus)
 		return
 	}
+	if r.Method == "HEAD" && f.headFailures > 0 && r.URL.Query().Get("versionId") != "" {
+		f.headFailures--
+		w.WriteHeader(500)
+		return
+	}
+	if v.attempt != "" && !f.dropAttempt {
+		a := v.attempt
+		if f.attemptRewrite != nil {
+			a = f.attemptRewrite(a)
+		}
+		w.Header().Set("X-Amz-Meta-Kingres-Attempt", a)
+		for _, x := range f.attemptExtra {
+			w.Header().Add("X-Amz-Meta-Kingres-Attempt", x)
+		}
+	}
 	if r.Method == "GET" && f.getStatus != 0 {
 		f.errXML(w, f.getStatus, "InternalError", "we encountered an internal error")
 		return
@@ -527,6 +564,9 @@ func (f *fakeS3) read(w http.ResponseWriter, r *http.Request, key string) {
 	}
 	if !f.noVersionID {
 		w.Header().Set("X-Amz-Version-Id", v.id)
+		if r.Method == "HEAD" && f.headVersion != "" {
+			w.Header().Set("X-Amz-Version-Id", f.headVersion)
+		}
 	}
 	if v.mode != "" {
 		w.Header().Set("X-Amz-Object-Lock-Mode", v.mode)

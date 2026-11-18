@@ -41,6 +41,7 @@
 #include "commands/extension.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
+#include "storage/lmgr.h"
 #include "storage/predicate.h"
 #include "storage/procarray.h"
 #include "storage/smgr.h"
@@ -49,6 +50,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/relcache.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
@@ -227,8 +229,13 @@ kc_catalog_snapshot_report_conflicts(Snapshot snap, bool is_mvcc)
 	((KcCatSnap *) snap)->ssi = is_mvcc;
 }
 
-/* A fresh snapshot of everything committed, plus the running transaction. */
-static Snapshot
+/*
+ * A fresh snapshot of everything committed, plus the running transaction: the
+ * maintenance rule, whatever the isolation level of the caller.  The check
+ * functions (columnar_check, columnar_check_clean) read the stripe catalog with
+ * it (C10-01).
+ */
+Snapshot
 kc_latest_snapshot(void)
 {
 	bool		dummy;
@@ -722,9 +729,15 @@ kc_catalog_delete_uid(uint64 uid)
 	return n;
 }
 
-/* Delete one stripe's row; returns the number of rows deleted. */
+/*
+ * Delete one stripe's row; returns the number of rows deleted.  With wait, a
+ * deletion that another transaction has begun and not finished is waited for
+ * (compaction needs the answer); without it that row is left to the other
+ * transaction and the answer is 0, which is what the check needs, because it
+ * never waits.
+ */
 int
-kc_catalog_delete_stripe(uint64 uid, uint64 stripe_id)
+kc_catalog_delete_stripe(uint64 uid, uint64 stripe_id, bool wait)
 {
 	Relation	cat = table_open(kc_catalog_oid(), RowExclusiveLock);
 	ScanKeyData key[2];
@@ -743,12 +756,117 @@ kc_catalog_delete_stripe(uint64 uid, uint64 stripe_id)
 	{
 		if (!kc_tuple_visible(tup, vsnap, NULL))
 			continue;
-		if (kc_catalog_delete_tuple(cat, &tup->t_self, true))
+		if (kc_catalog_delete_tuple(cat, &tup->t_self, wait))
 			n++;
 	}
 	systable_endscan(scan);
 	table_close(cat, RowExclusiveLock);
 	return n;
+}
+
+/* ------------------------------------------------------------------------
+ * Locks of the check functions, taken without waiting (C10-02)
+ * ------------------------------------------------------------------------
+ */
+
+static bool
+kc_catlocks_add1(KcCatLocks *l, Oid relid, LOCKMODE mode)
+{
+	if (l->n >= lengthof(l->oid))
+		elog(ERROR, "too many relations to lock for the check");
+	if (!ConditionalLockRelationOid(relid, mode))
+		return false;
+	l->oid[l->n] = relid;
+	l->mode[l->n] = mode;
+	l->n++;
+	return true;
+}
+
+/*
+ * The share lock a scan takes, and mode as well when it is stronger: every
+ * mode the work will ask for is held beforehand, so that asking again is
+ * granted at once and never queues behind a waiter.
+ */
+static bool
+kc_catlocks_add(KcCatLocks *l, Oid relid, LOCKMODE mode)
+{
+	if (!kc_catlocks_add1(l, relid, AccessShareLock))
+		return false;
+	return mode == AccessShareLock || kc_catlocks_add1(l, relid, mode);
+}
+
+/*
+ * Release what kc_catalog_lock_nowait took (all of it, also after a failure
+ * part of the way).
+ */
+void
+kc_catalog_unlock(KcCatLocks *l)
+{
+	while (l->n > 0)
+	{
+		l->n--;
+		UnlockRelationOid(l->oid[l->n], l->mode[l->n]);
+	}
+}
+
+/*
+ * Lock, without waiting, every relation the check functions read by themselves
+ * besides the tables they check: pg_class (the list of tables, the files of the
+ * orphan step), the stripe catalog, its primary key index, its TOAST table and
+ * the indexes of that (the stripe rows have bytea columns).  A lock that another
+ * transaction holds in a conflicting mode (LOCK TABLE ... ACCESS EXCLUSIVE, the
+ * REINDEX or VACUUM FULL of an administrator, a prepared transaction that holds
+ * one for ever) makes this return false with nothing held, and the caller says
+ * "not checked" instead of waiting behind it.  mode is the mode the work needs
+ * on the catalog and its TOAST table: AccessShareLock to read, RowExclusiveLock
+ * to delete rows.  Once these are held by this backend, every later open of
+ * the same relations by the same code is granted at once, so the scans need no
+ * conditional variant of their own.  What remains outside, and is read as any
+ * statement reads it, is the relation cache's own reading of the system
+ * catalogs (pg_attribute, pg_index, ...).
+ */
+bool
+kc_catalog_lock_nowait(KcCatLocks *l, LOCKMODE mode)
+{
+	Oid			catoid = kc_catalog_oid();
+	Oid			idxoid = kc_catalog_index_oid();
+	Oid			toastoid;
+	Relation	rel;
+
+	l->n = 0;
+	if (!kc_catlocks_add(l, RelationRelationId, AccessShareLock) ||
+		!kc_catlocks_add(l, catoid, mode) ||
+		!kc_catlocks_add(l, idxoid, AccessShareLock))
+		goto fail;
+
+	rel = table_open(catoid, NoLock);
+	toastoid = rel->rd_rel->reltoastrelid;
+	table_close(rel, NoLock);
+	if (OidIsValid(toastoid))
+	{
+		List	   *idx;
+		ListCell   *lc;
+
+		if (!kc_catlocks_add(l, toastoid, mode))
+			goto fail;
+		rel = table_open(toastoid, NoLock);
+		idx = RelationGetIndexList(rel);
+		table_close(rel, NoLock);
+		foreach(lc, idx)
+		{
+			if (!kc_catlocks_add(l, lfirst_oid(lc), mode))
+			{
+				list_free(idx);
+				goto fail;
+			}
+		}
+		list_free(idx);
+	}
+	return true;
+
+fail:
+	kc_catalog_unlock(l);
+	return false;
 }
 
 /* ------------------------------------------------------------------------
@@ -907,7 +1025,7 @@ kc_reconcile_ex(bool dry)
 	if (nlive > 1)
 		qsort(live, nlive, sizeof(uint64), kc_u64_cmp);
 
-	cat = table_open(kc_catalog_oid(), RowExclusiveLock);
+	cat = table_open(kc_catalog_oid(), dry ? AccessShareLock : RowExclusiveLock);
 	scan = systable_beginscan(cat, kc_catalog_index_oid(), true,
 							  SnapshotAny, 0, &key);
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
@@ -927,7 +1045,7 @@ kc_reconcile_ex(bool dry)
 		}
 	}
 	systable_endscan(scan);
-	table_close(cat, RowExclusiveLock);
+	table_close(cat, dry ? AccessShareLock : RowExclusiveLock);
 	if (live)
 		pfree(live);
 	return ndel;

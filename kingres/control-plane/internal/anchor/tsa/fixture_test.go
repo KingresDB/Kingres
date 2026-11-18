@@ -54,7 +54,7 @@ func TestOpenSSLFixtureTokens(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			info, err := VerifyStoredToken(tok, digest, roots, inter)
+			info, err := VerifyStoredToken(tok, digest, nil, roots, inter)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -67,17 +67,17 @@ func TestOpenSSLFixtureTokens(t *testing.T) {
 			}
 			// the evidence made from it verifies and is bound to the digest
 			ev := EvidenceFromToken("https://tsa.example/tsr", info, tok)
-			if _, err := VerifyEvidence(ev, digest, roots, inter); err != nil {
+			if _, err := VerifyEvidence(ev, digest, nil, roots, inter); err != nil {
 				t.Fatal(err)
 			}
 			other := digest
 			other[7] ^= 1
-			if _, err := VerifyStoredToken(tok, other, roots, inter); err == nil {
+			if _, err := VerifyStoredToken(tok, other, nil, roots, inter); err == nil {
 				t.Fatal("another digest accepted")
 			}
 			bad := append([]byte(nil), tok...)
 			bad[len(bad)-3] ^= 0x40
-			if _, err := VerifyStoredToken(bad, digest, roots, inter); err == nil {
+			if _, err := VerifyStoredToken(bad, digest, nil, roots, inter); err == nil {
 				t.Fatal("a tampered token accepted")
 			}
 			// the other fixture's root is not a root of this token
@@ -86,7 +86,7 @@ func TestOpenSSLFixtureTokens(t *testing.T) {
 				otherRoot = fixtureECRoot
 			}
 			r2, i2, _ := ParseBundle(otherRoot)
-			if _, err := VerifyStoredToken(tok, digest, r2, i2); err == nil {
+			if _, err := VerifyStoredToken(tok, digest, nil, r2, i2); err == nil {
 				t.Fatal("verified under another root")
 			}
 		})

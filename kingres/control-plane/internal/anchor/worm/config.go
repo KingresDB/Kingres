@@ -60,10 +60,12 @@ type Config struct {
 	// AllowInsecure permits an http:// endpoint (a test store on a private
 	// network). Without it every URL must be https.
 	AllowInsecure bool `json:"allowInsecure"`
-	// MaxSkewSeconds is the tolerance between the store's Last-Modified of a
-	// fresh write and the clock of Submit, both ways (0 means 300; the range
-	// is 1 to 86400). A store whose time is further off is refused (code
-	// "store_time_skew").
+	// MaxSkewSeconds is the tolerance of the store's time: a fresh write must
+	// have a Last-Modified within it of the clock of Submit both ways, and an
+	// existing object one not earlier than the start of the first Submit call
+	// less it (see the package documentation; 0 means 300, the range is 1 to
+	// 86400). A store whose time is further off is refused (code
+	// "store_time_skew" or "store_time_early").
 	MaxSkewSeconds int `json:"maxSkewSeconds"`
 }
 
@@ -186,6 +188,17 @@ func (c Config) lockMode() string { return strings.ToUpper(c.Mode) }
 // ObjectKey is the key of the note: "<prefix>/<aggregate id hex>/<size as 20
 // decimal digits, zero padded>.note" (design 6.3 step 1).
 func ObjectKey(prefix, aggregateIDHex string, size uint64) string {
+	return ObjectKeyGen(prefix, aggregateIDHex, size, 0)
+}
+
+// ObjectKeyGen is the key of generation gen of the note (correction 95):
+// generation 0 is exactly ObjectKey, and generation n above 0 is
+// "<prefix>/<aggregate id hex>/<size as 20 decimal digits>.g<n>.note".
+func ObjectKeyGen(prefix, aggregateIDHex string, size uint64, gen uint32) string {
 	s := strconv.FormatUint(size, 10)
-	return strings.Trim(prefix, "/") + "/" + aggregateIDHex + "/" + strings.Repeat("0", 20-len(s)) + s + ".note"
+	g := ""
+	if gen > 0 {
+		g = ".g" + strconv.FormatUint(uint64(gen), 10)
+	}
+	return strings.Trim(prefix, "/") + "/" + aggregateIDHex + "/" + strings.Repeat("0", 20-len(s)) + s + g + ".note"
 }

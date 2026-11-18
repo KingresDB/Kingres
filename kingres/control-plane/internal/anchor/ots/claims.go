@@ -9,12 +9,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/big"
 	"time"
 
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/anchor"
 )
 
-// What "anchored" means for an OpenTimestamps record (correction 70):
+// What "anchored" means for an OpenTimestamps record (correction 60):
 //
 //   - kingresd holds no block headers, so it cannot verify a Bitcoin
 //     attestation by itself. A calendar's Bitcoin attestation is a CLAIM.
@@ -38,16 +39,17 @@ import (
 // attestation without any network access.
 type checkpoint struct {
 	height uint64
-	time   int64 // the header's time field, Unix seconds
+	time   int64  // the header's time field, Unix seconds
+	bits   uint32 // the header's compact target (what the work floor is taken from)
 }
 
 var checkpoints = []checkpoint{
-	{0, 1231006505},
-	{129405, 1307549734},
-	{358391, 1432827678},
-	{465751, 1494420461},
-	{466906, 1495071945},
-	{912095, 1756386670},
+	{0, 1231006505, 0x1d00ffff},
+	{129405, 1307549734, 0x1a1d932f},
+	{358391, 1432827678, 0x181686f5},
+	{465751, 1494420461, 0x1801f6a7},
+	{466906, 1495071945, 0x1801f6a7},
+	{912095, 1756386670, 0x17022b91},
 }
 
 // Bounds of the plausibility checks.
@@ -121,13 +123,25 @@ type ClaimCheck struct {
 	// claim did not match.
 	HeaderChecked bool
 	HeaderProblem string
+	// Quarantined is true when the claim is kept aside (an entry of
+	// OTSEvidence.Contradicted names it): a block header contradicted it in an
+	// earlier round. It is not plausible, and so never anchored, unless a header
+	// checks it now (the source was wrong before).
+	Quarantined bool
+	// Work is the work of the header that checked the claim (HeaderChecked).
+	Work *big.Int
+	// HeaderTransient is true when the header could not judge the claim: it
+	// failed the work check (the source is at fault) or its time is ahead of
+	// the clock (the clock may be). HeaderProblem says why; such a claim is not
+	// called false and is not dropped.
+	HeaderTransient bool
 }
 
 // Plausible reports whether the claim passed the checks without a header, was
 // not contradicted by a header, and is not in conflict with another claim
 // unless a header settled it.
 func (c ClaimCheck) Plausible() bool {
-	return c.Problem == "" && c.HeaderProblem == "" && (c.Conflict == "" || c.HeaderChecked)
+	return c.Problem == "" && c.HeaderProblem == "" && (c.Conflict == "" || c.HeaderChecked) && (!c.Quarantined || c.HeaderChecked)
 }
 
 // HeaderFunc returns the header of the block at a height for a verifier
@@ -185,7 +199,7 @@ func checkLeaf(l leafPath, lo, hi uint64) (root [32]byte, ok bool, problem strin
 // claims that other calendars contradict (the same height, another merkle
 // root: a block has one root, so at least one of them is false and nobody
 // here can tell which).
-func checkFragments(roots []*Node, uris []string, submitted, now time.Time) []ClaimCheck {
+func checkFragments(roots []*Node, uris []string, submitted, now time.Time, aside []anchor.OTSContradiction) []ClaimCheck {
 	lo, hi := HeightBounds(submitted, now)
 	var out []ClaimCheck
 	for i, root := range roots {
@@ -207,18 +221,34 @@ func checkFragments(roots []*Node, uris []string, submitted, now time.Time) []Cl
 		if c.Problem == "" && len(byHeight[c.Height]) > 1 {
 			out[i].Conflict = fmt.Sprintf("claims at height %d name different merkle roots (a block has one)", c.Height)
 		}
+		if c.Problem == "" && findAside(aside, c.CalendarURI, c.Height, c.Root) >= 0 {
+			out[i].Quarantined = true
+		}
 	}
 	return out
+}
+
+// findAside returns the index of the entry of aside that names the claim (by
+// calendar, height and merkle root), or -1.
+func findAside(aside []anchor.OTSContradiction, uri string, height uint64, root [32]byte) int {
+	r := hex.EncodeToString(root[:])
+	for i, a := range aside {
+		if a.CalendarURI == uri && a.Height == height && a.MerkleRoot == r {
+			return i
+		}
+	}
+	return -1
 }
 
 // applyHeader checks one claim against a header: the header's own work
 // check, the merkle root, and a block time that fits the submission and the
 // clock.
-func applyHeader(c *ClaimCheck, header []byte, submitted, now time.Time) {
+func applyHeader(c *ClaimCheck, header []byte, submitted, now time.Time, work func([]byte, uint64) (HeaderResult, error)) {
 	c.Header = append([]byte(nil), header...)
-	res, err := headerWork(header)
+	res, err := work(header, c.Height)
 	if err != nil {
 		c.HeaderProblem = "the header is not valid: " + shortErr(err)
+		c.HeaderTransient = true
 		return
 	}
 	c.HeaderTime = res.Time
@@ -232,9 +262,11 @@ func applyHeader(c *ClaimCheck, header []byte, submitted, now time.Time) {
 	}
 	if res.Time.After(now.Add(FutureSlack)) {
 		c.HeaderProblem = "the block time is in the future"
+		c.HeaderTransient = true
 		return
 	}
 	c.HeaderChecked = true
+	c.Work = res.Work
 }
 
 // EvidenceCheck is what CheckEvidence found.
@@ -290,6 +322,24 @@ func parseEvidenceTrees(ev anchor.OTSEvidence) (digest []byte, roots []*Node, ur
 		roots = append(roots, n)
 		uris = append(uris, c.URI)
 	}
+	// every claim kept aside names a Bitcoin attestation of its calendar's fragment
+	for _, a := range ev.Contradicted {
+		ok := false
+		for i, root := range roots {
+			if uris[i] != a.CalendarURI {
+				continue
+			}
+			for _, l := range bitcoinLeaves(root) {
+				if l.height == a.Height && hex.EncodeToString(l.msg) == a.MerkleRoot {
+					ok = true
+				}
+			}
+		}
+		if !ok {
+			err = fmt.Errorf("ots: a claim kept aside names no attestation of the fragments")
+			return
+		}
+	}
 	return
 }
 
@@ -303,18 +353,24 @@ func parseEvidenceTrees(ev anchor.OTSEvidence) (digest []byte, roots []*Node, ur
 // or its "bitcoin" summary does not match the fragments (or, when the summary
 // says header_checked, the header it carries).
 func CheckEvidence(ev anchor.OTSEvidence, now time.Time, headers HeaderFunc) (*EvidenceCheck, error) {
+	return checkEvidence(ev, now, headers, CheckHeaderAt)
+}
+
+// checkEvidence is CheckEvidence with the work check as an argument (the tests
+// of this package replace it; the package has no variable to set).
+func checkEvidence(ev anchor.OTSEvidence, now time.Time, headers HeaderFunc, work func([]byte, uint64) (HeaderResult, error)) (*EvidenceCheck, error) {
 	_, roots, uris, submitted, err := parseEvidenceTrees(ev)
 	if err != nil {
 		return nil, err
 	}
-	res := &EvidenceCheck{Claims: checkFragments(roots, uris, submitted, now)}
+	res := &EvidenceCheck{Claims: checkFragments(roots, uris, submitted, now, ev.Contradicted)}
 	for i := range res.Claims {
 		c := &res.Claims[i]
 		if c.Problem != "" || headers == nil {
 			continue
 		}
 		if h, ok := headers(c.Height); ok {
-			applyHeader(c, h, submitted, now)
+			applyHeader(c, h, submitted, now, work)
 		}
 	}
 	if b := ev.Bitcoin; b != nil {
@@ -324,14 +380,17 @@ func CheckEvidence(ev anchor.OTSEvidence, now time.Time, headers HeaderFunc) (*E
 			if c.CalendarURI != b.CalendarURI || c.Height != b.Height || hex.EncodeToString(c.Root[:]) != b.MerkleRoot || c.Problem != "" {
 				continue
 			}
-			found = true
 			if b.Status == anchor.BitcoinHeaderChecked {
 				hb, _ := hex.DecodeString(b.Header)
-				applyHeader(c, hb, submitted, now)
+				applyHeader(c, hb, submitted, now, work)
 				if !c.HeaderChecked {
 					return nil, fmt.Errorf("ots: the header in the evidence does not check: %s", c.HeaderProblem)
 				}
+			} else if c.Quarantined {
+				// a claim kept aside is not what a summary may name
+				continue
 			}
+			found = true
 		}
 		if !found {
 			return nil, errors.New("ots: the bitcoin summary of the evidence matches no plausible attestation of the fragments")

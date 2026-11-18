@@ -301,6 +301,9 @@ type issueOpts struct {
 	dupMD               bool
 	badTSTDER           bool
 	extraCerts          int
+	// certsPrefix is put before the certificates of the token (a decoy that the
+	// sid also names)
+	certsPrefix []byte
 }
 
 func (a *authority) token(req *tsReq, o issueOpts) []byte {
@@ -371,7 +374,7 @@ func (a *authority) token(req *tsReq, o issueOpts) []byte {
 	if o.twoSigners {
 		signers = append(signers, build(tst))
 	}
-	certs := cat(a.tsa.Raw, a.inter.Raw)
+	certs := cat(o.certsPrefix, a.tsa.Raw, a.inter.Raw)
 	for i := 0; i < o.extraCerts; i++ {
 		certs = cat(certs, a.root.Raw)
 	}

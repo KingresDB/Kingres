@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 const (
@@ -136,13 +138,13 @@ type publication struct {
 
 func newPublication(t *testing.T, oldSize, newSize int) *publication {
 	t.Helper()
-	p := &publication{dir: t.TempDir(), signer: newSigner(1), all: leaves(newSize)}
+	p := &publication{dir: testdir.New(t), signer: newSigner(1), all: leaves(newSize)}
 	p.origin = testPrefix + "/c/" + testChain + "/e1"
 	p.logDir = filepath.Join(p.dir, "c", testChain, "e1")
 	writeTiles(t, p.logDir, p.all, newSize)
 	p.write(t, "checkpoint", p.signer.note(p.origin, newSize, refMTH(p.all[:newSize])))
 	p.write(t, "old.note", p.signer.note(p.origin, oldSize, refMTH(p.all[:oldSize])))
-	p.trust = filepath.Join(t.TempDir(), "trust.json")
+	p.trust = filepath.Join(testdir.New(t), "trust.json")
 	code, out, errs := run(t, "trust", "init", "--origin-prefix", testPrefix, "--public-key", base64.StdEncoding.EncodeToString(p.signer.pub),
 		"--fingerprint", p.signer.fp(), "--out", p.trust)
 	if code != 0 {
@@ -163,7 +165,7 @@ func (p *publication) log() string { return "chain:" + testChain + ":e1" }
 func TestTrustInit(t *testing.T) {
 	s := newSigner(9)
 	pub := base64.StdEncoding.EncodeToString(s.pub)
-	out := filepath.Join(t.TempDir(), "trust.json")
+	out := filepath.Join(testdir.New(t), "trust.json")
 	base := []string{"trust", "init", "--origin-prefix", testPrefix, "--public-key", pub, "--out", out}
 	if code, _, errs := run(t, base...); code != 2 || !strings.Contains(errs, "--fingerprint") {
 		t.Fatalf("without fingerprint: %d %s", code, errs)
@@ -190,7 +192,7 @@ func TestTrustInit(t *testing.T) {
 		t.Fatalf("show json: %d %s", code, o)
 	}
 	for _, args := range [][]string{
-		{"trust"}, {"trust", "bogus"}, {"trust", "follow"}, {"trust", "show"}, {"trust", "show", "--trust", filepath.Join(t.TempDir(), "missing")},
+		{"trust"}, {"trust", "bogus"}, {"trust", "follow"}, {"trust", "show"}, {"trust", "show", "--trust", filepath.Join(testdir.New(t), "missing")},
 		{"trust", "init"}, {"trust", "init", "--origin-prefix", "https://x", "--public-key", pub, "--fingerprint", s.fp(), "--out", "-"},
 		{"trust", "init", "--origin-prefix", "a", "--public-key", "!!", "--fingerprint", s.fp(), "--out", "-"},
 		{"trust", "init", "--origin-prefix", "a", "--public-key", pub, "--public-key-file", "x", "--fingerprint", s.fp()},
@@ -200,7 +202,7 @@ func TestTrustInit(t *testing.T) {
 		}
 	}
 	// A key file works like the argument, and - writes to standard output.
-	kf := filepath.Join(t.TempDir(), "key.pub")
+	kf := filepath.Join(testdir.New(t), "key.pub")
 	_ = os.WriteFile(kf, []byte(pub+"\n"), 0o644)
 	if code, o, _ := run(t, "trust", "init", "--origin-prefix", testPrefix, "--public-key-file", kf, "--fingerprint", strings.ToUpper(s.fp()), "--out", "-"); code != 0 || !strings.Contains(o, `"format": 1`) {
 		t.Fatalf("key file: %d %s", code, o)
@@ -233,7 +235,7 @@ func TestCheckpointCommand(t *testing.T) {
 
 	good1, _ := os.ReadFile(filepath.Join(p.logDir, "checkpoint"))
 	note := func(s string) []string {
-		f := filepath.Join(t.TempDir(), "n")
+		f := filepath.Join(testdir.New(t), "n")
 		if err := os.WriteFile(f, []byte(s), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -264,7 +266,7 @@ func TestCheckpointCommand(t *testing.T) {
 		}
 	}
 	// A key that is not in the trust file.
-	otherTrust := filepath.Join(t.TempDir(), "trust.json")
+	otherTrust := filepath.Join(testdir.New(t), "trust.json")
 	if code, _, errs := run(t, "trust", "init", "--origin-prefix", testPrefix, "--public-key", base64.StdEncoding.EncodeToString(other.pub),
 		"--fingerprint", other.fp(), "--out", otherTrust); code != 0 {
 		t.Fatal(errs)
@@ -304,7 +306,7 @@ func TestCheckpointKeyWindow(t *testing.T) {
 	p := newPublication(t, 1, 5)
 	data, _ := os.ReadFile(p.trust)
 	future := strings.Replace(string(data), `"not_before": null`, `"not_before": "2030-01-01T00:00:00Z"`, 1)
-	f := filepath.Join(t.TempDir(), "t.json")
+	f := filepath.Join(testdir.New(t), "t.json")
 	_ = os.WriteFile(f, []byte(future), 0o644)
 	args := []string{"checkpoint", "--trust", f, "--log", p.log(), "--source", p.dir}
 	if code, _, errs := run(t, append(args, "--now", "2026-12-01T00:00:00Z")...); code != 2 {
@@ -376,12 +378,12 @@ func TestConsistencyCommand(t *testing.T) {
 	for name, a := range map[string][]string{
 		"no old": args(),
 		"old note forged": func() []string {
-			f := filepath.Join(t.TempDir(), "o")
+			f := filepath.Join(testdir.New(t), "o")
 			_ = os.WriteFile(f, []byte(newSigner(2).note(p.origin, 300, oldRoot)), 0o644)
 			return args("--old", f)
 		}(),
 		"old note other origin": func() []string {
-			f := filepath.Join(t.TempDir(), "o")
+			f := filepath.Join(testdir.New(t), "o")
 			_ = os.WriteFile(f, []byte(p.signer.note(testPrefix+"/c/"+testChain+"/e9", 300, oldRoot)), 0o644)
 			return args("--old", f)
 		}(),

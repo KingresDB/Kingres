@@ -30,7 +30,7 @@ func testPayload(t testing.TB) anchor.Payload {
 	root := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
 	sig := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 68))
 	note := "kingres.example/aggregate\n17\n" + root + "\n\n" + dash + " kingres.example/aggregate " + sig + "\n"
-	p, err := anchor.NewPayload("ab12", []byte(note))
+	p, err := anchor.NewPayload("ab12", []byte(note), time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func TestSubmitUpgradeExport(t *testing.T) {
 	b.mu.Unlock()
 	rc3, err := tg.Upgrade(context.Background(), rc2)
 	// no header source is configured: a calendar's attestation is a claim, not an anchor
-	if err != nil || rc3.State != anchor.ReceiptClaimed || rc3.EvidenceTime != nil || rc3.NextCheck != nil {
+	if err != nil || rc3.State != anchor.ReceiptClaimed || rc3.EvidenceTime != nil || rc3.NextCheck == nil || !rc3.NextCheck.Equal(testNow.Add(FirstCheck)) {
 		t.Fatalf("upgrade: %+v %v", rc3, err)
 	}
 	ev3, _ := anchor.ParseOTSEvidence(rc3.Evidence)
@@ -107,7 +107,7 @@ func TestSubmitUpgradeExport(t *testing.T) {
 	if ev3.SubmittedAt != anchor.FormatTime(testNow) {
 		t.Fatalf("submitted_at %s", ev3.SubmittedAt)
 	}
-	// calendar A keeps its pending attestation, B's was replaced
+	// calendar A keeps its pending attestation, and B keeps its own beside the merged answer (correction 96)
 	for _, c := range ev3.Calendars {
 		raw, _ := base64.StdEncoding.DecodeString(c.FragmentB64)
 		d, _ := hex.DecodeString(ev3.Digest)
@@ -123,20 +123,25 @@ func TestSubmitUpgradeExport(t *testing.T) {
 				btc++
 			}
 		}
-		if c.URI == a.url() && (pend != 1 || btc != 0) || c.URI == b.url() && (pend != 0 || btc != 1) {
+		if c.URI == a.url() && (pend != 1 || btc != 0) || c.URI == b.url() && (pend != 1 || btc != 1) {
 			t.Errorf("%s: %d pending %d bitcoin", c.URI, pend, btc)
 		}
 	}
-	// claimed receipts (no header source) are returned unchanged and no request is made
+	// a claimed receipt whose other fragment still holds a pending attestation
+	// asks that calendar again (A2-02), and not the one that has delivered
 	_, g0 := b.counts()
+	_, a0 := a.counts()
 	rc4, err := tg.Upgrade(context.Background(), rc3)
-	if err != nil || rc4.State != anchor.ReceiptClaimed || !bytes.Equal(rc4.Evidence, rc3.Evidence) {
-		t.Fatal("claimed upgrade changed")
+	if err != nil || rc4.State != anchor.ReceiptClaimed || !bytes.Equal(rc4.Evidence, rc3.Evidence) || rc4.NextCheck == nil {
+		t.Fatalf("claimed upgrade changed: %+v %v", rc4, err)
 	}
 	if _, g1 := b.counts(); g1 != g0 {
-		t.Error("claimed receipt triggered a request")
+		t.Error("the calendar that had delivered was asked again")
 	}
-	// the exported file: parses, re-serialises identically, holds both a pending and a bitcoin leaf
+	if _, a1 := a.counts(); a1 != a0+1 {
+		t.Errorf("the calendar with a pending attestation was asked %d times, want 1", a1-a0)
+	}
+	// the exported file: parses, re-serialises identically, holds the pending leaves of both calendars and the bitcoin leaf
 	file, err := Export(ev3)
 	if err != nil {
 		t.Fatal(err)
@@ -155,7 +160,7 @@ func TestSubmitUpgradeExport(t *testing.T) {
 	for _, l := range f.Root.Leaves() {
 		kinds[l.Att.Kind]++
 	}
-	if kinds[AttPending] != 1 || kinds[AttBitcoin] != 1 {
+	if kinds[AttPending] != 2 || kinds[AttBitcoin] != 1 {
 		t.Errorf("leaves %v", kinds)
 	}
 	if !bytes.HasPrefix(file, Magic()) {

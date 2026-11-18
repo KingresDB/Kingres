@@ -2724,11 +2724,12 @@ Separate from the increments above (own files and tests; see the report of the w
 
 - **ST-01, the watchdog fenced a healthy primary when its group stopped being enforced.** The invariant now: *a watchdog never fences on a
   lease file that kingresd stopped writing on purpose.* The lease file has a field `off` (`lease.WatchdogFile.Off`, read by
-  `cmd/kingres-watchdog`): at every renewal of a group that is not enforced kingresd writes `{"off": true}` to the file of the instance when
-  the file exists (so the change of enforcement is told within one renewal, long before the last `validMs` runs out; a restarted kingresd
-  tells it again; a group that never had a watchdog gets no file), the watchdog suspends its deadline while the last file it read says
-  `off`, and a later file without it arms it again. `Manager.DisarmWatchdog(group)` is the same call for the failover (a demotion makes
-  the instance a standby: its watchdog must not fence it on a lapsed file). Tests: `TestTheWatchdogFileFollowsEnforcementBothWays`
+  `cmd/kingres-watchdog`) now means only "this instance is not a primary" (a demotion, `Manager.DisarmWatchdog(group)`): the watchdog never
+  fences on it, however old. A group that merely has no standby is NOT off (review FO-01): kingresd writes its file again at every renewal pass,
+  whether or not the lease was renewed, with `validMs` of duration minus margin, so the watchdog counts it down like a lease and a dead or
+  hung kingresd leaves a file that runs out (a primary that was told "nothing to protect" for ever would run beside a standby that is added and
+  promoted later). Every file has `validMs` above zero, also `off` (24 hours), so that a watchdog of the version before `off` (FO-05), which
+  ignores the field, never reads zero and fences at once. Tests: `TestTheWatchdogFileFollowsEnforcementBothWays`
   (unit, both directions and the restart), `TestWatchdogDoesNotFenceAfterTheLeaseWasSwitchedOff` (the watchdog itself),
   `TestSwitchingEnforcementOnAndOffNeverFencesAHealthyPrimary` (a cluster: the replica count to 0 and back three times, every instance sampled
   every 100 ms, no fault hook), and `TestRemovingAServerCostsNoOtherGroupItsLease` now runs with real standbys and without `ForceEnforce`.
@@ -2747,3 +2748,33 @@ Separate from the increments above (own files and tests; see the report of the w
 - **ST-12, statements that were not true:** the text of RBR-05 above is corrected.
 - **Not done in this step:** ST-05 (rows left by an earlier holder are still found by comparing the system database's clock with the
   extension's), ST-06 (retried `StartMove` and `AddSkipped` can still duplicate a row), ST-07, ST-08, ST-09 (the mutants), ST-10, ST-11, ST-13.
+
+### Review FO-01 to FO-16 of 2026-11-17 (the failover increments 0 to 2): what was fixed in this step
+
+- **FO-04 and FO-09, nothing deletes what is not proved to be a standby; a broken role file is not the default of its id.** `MustRole` answers
+  `RoleUnknown` for a role file that cannot be read (not writable, not a standby, not a copy; the start gate holds it like a primary). The
+  standby agent deletes, rebuilds or rewinds a directory only when `provedStandby` says so: a valid role file that says standby, and
+  `pg_is_in_recovery` when it runs or `standby.signal` when it does not (an unfinished copy without a meta file is thrown away unless its role file says
+  something else or it runs outside recovery). The refusal is `ErrNotProvedStandby` (409 `not_a_standby`). `Service.PrimaryOf` answers nothing
+  when two directories claim one group. Removing the instances of a server that is removed or reset (`RemoveInstance`) is the server's own removal
+  and is not guarded. Increment 3 writes the role file before `pg_promote`.
+- **FO-02.** `SyncState.Decide` never changes the list of a frozen group, also when no name is planned.
+- **FO-01 and FO-05.** See the paragraph of ST-01 above.
+- **FO-03.** The start gate of an instance whose group is not known (`instance.GroupUnknown`) is held back by the marker of any group.
+- **FO-06, FO-07, FO-10, FO-13.** A transfer is done at a grantor when the holder it names is the target (a repeat after a lost answer is done);
+  a release is done when it names no holder; a grantor of the version before them names the caller and counts for nothing, so a hand-over to
+  old grantors is refused. `Transfer` and `ReleaseGroup` refuse while an instance of the group runs on the server. `Adopt` clears the marker of an earlier
+  hand-over (the failover that adopts decides). `ReleaseGroup` marks the group, waits for the round in flight (`rmu`) and only then asks the grantors.
+- **FO-08.** The read-back of `add_node` and `remove_node` reads the row on every primary of the catalog (`PGRegistrar.Remote`); a primary that cannot
+  be read is a refusal that the next check repeats. `Unregister` compares the port as well as the host.
+- **FO-11.** `Engine.Cancel` is refused when the task cannot be read; a run asks the guard of the kind again at the boundary and ignores a cancel mark
+  past the point of no return. Migration 0013: an instance stop or restart is refused (KX004) while its server is the old or the new server of an
+  unfinished failover group, and a `config.restart` while any failover group is unfinished.
+- **FO-12.** Freezes and "gone" servers are kept in `failover-freeze.json` in the data directory and read again at the start.
+- **FO-14.** `Manager.start` asks the start gate again when pg_ctl is done and stops an instance that came up against it.
+- **FO-16.** `StartInstance`, stop and restart try every primary of the server; a watchdog started for another group than the instance serves now is ended
+  before the right one is started.
+- **Not changed.** FO-15 (a name in the list of a standby that is never registered): increment 3 refuses a failover while a named standby is not in the
+  catalog. FO-16, the removal that deletes the instance before the primary applied the list without it, stays bounded by the grace period.
+- **Fencing under a stall** (`internal/clustertest/fencing_stall_test.go`): two grantors stalled with SIGSTOP for longer than the margin fence the third
+  server's primary within the bound, nothing becomes a primary, and it comes back by itself; a stalled leader fences only its own primary.

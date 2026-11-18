@@ -59,6 +59,8 @@ typedef uint32 KcInsertOptions;
 	table_beginscan((rel), (snap), 0, NULL, SO_NONE)
 #define KC_REPORT_VACUUM(rel, live, dead, start) \
 	pgstat_report_vacuum((rel), (live), (dead), (start))
+/* the threshold of autovacuum's log line (log_autovacuum_min_duration), in ms */
+#define KC_VACUUM_LOG_MIN_DURATION(params) ((params)->log_vacuum_min_duration)
 /* delete a row of a heap relation: wait for a deleter in progress or not */
 #define KC_HEAP_DELETE(rel, tid, wait, tmfd) \
 	heap_delete((rel), (tid), GetCurrentCommandId(true), 0, InvalidSnapshot, \
@@ -91,6 +93,8 @@ typedef int KcInsertOptions;
 #define KC_REPORT_VACUUM(rel, live, dead, start) \
 	pgstat_report_vacuum(RelationGetRelid(rel), (rel)->rd_rel->relisshared, \
 						 (live), (dead), (start))
+/* the threshold of autovacuum's log line (log_autovacuum_min_duration), in ms */
+#define KC_VACUUM_LOG_MIN_DURATION(params) ((params)->log_min_duration)
 
 /* delete a row of a heap relation: wait for a deleter in progress or not */
 #define KC_HEAP_DELETE(rel, tid, wait, tmfd) \

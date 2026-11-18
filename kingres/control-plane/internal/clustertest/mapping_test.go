@@ -203,7 +203,19 @@ func TestInstanceMappingAfterAHandFailover(t *testing.T) {
 	}
 
 	// A fan-out reaches every primary of the server: a role made through the API exists on both instances.
-	if st, body := leader.Do("POST", "/roles", map[string]any{"name": "mapping_probe", "password": "Pr0be-Passw0rd-xyz", "canLogin": true}, nil); st != 201 && st != 202 && st != 200 {
+	postStatus, lastA, lastB := 0, -1, -1
+	var lastErr error
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("role on the home instance: %d, on the promoted instance: %d (error %v)", lastA, lastB, lastErr)
+			t.Logf("POST /roles answered %d; leader is node %d, the server of the promoted instance is node %d, the dead one is node %d", postStatus, leader.Index, nw.Index, old.Index)
+			t.Logf("leader log: %s", leader.LogTail(6000))
+			if nw != leader {
+				t.Logf("promoted server log: %s", nw.LogTail(6000))
+			}
+		}
+	})
+	if st, body := leader.Do("POST", "/roles", map[string]any{"name": "mapping_probe", "password": "Pr0be-Passw0rd-xyz", "canLogin": true}, nil); func() bool { postStatus = st; return true }() && st != 201 && st != 202 && st != 200 {
 		t.Logf("creating a role: %d %v", st, body)
 	}
 	until(t, time.Minute, "the role on both primaries of the server", func() bool {
@@ -211,7 +223,8 @@ func TestInstanceMappingAfterAHandFailover(t *testing.T) {
 		defer func() { _ = home.Close(ctx) }()
 		var a, b int
 		_ = home.QueryRow(ctx, `SELECT count(*) FROM pg_roles WHERE rolname = 'mapping_probe'`).Scan(&a)
-		_ = sc.QueryRow(ctx, `SELECT count(*) FROM pg_roles WHERE rolname = 'mapping_probe'`).Scan(&b)
+		errB := sc.QueryRow(ctx, `SELECT count(*) FROM pg_roles WHERE rolname = 'mapping_probe'`).Scan(&b)
+		lastA, lastB, lastErr = a, b, errB
 		return a == 1 && b == 1
 	})
 

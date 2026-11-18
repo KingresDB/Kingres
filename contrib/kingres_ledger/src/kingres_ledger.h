@@ -24,6 +24,7 @@
 /* The differences between the PostgreSQL majors; see the file. */
 #include "pg_compat.h"
 #include "access/htup.h"
+#include "datatype/timestamp.h"
 #include "utils/relcache.h"
 
 /* Version of the hash formats implemented by this code (see README). */
@@ -73,6 +74,7 @@
 #define ERRCODE_KL_NOT_PRELOADED MAKE_SQLSTATE('K','L','0','0','3')
 #define ERRCODE_KL_CLOCK_SKEW	MAKE_SQLSTATE('K','L','0','0','4')
 #define ERRCODE_KL_SCRIPT_VERSION MAKE_SQLSTATE('K','L','0','0','5')
+#define ERRCODE_KL_LOCK_ORDER	MAKE_SQLSTATE('K','L','0','0','6')
 
 /*
  * Names used to find the extension and the objects it creates.  Functions and
@@ -116,6 +118,14 @@
  * statement uses).  Nothing takes an identifier from a sequence: a role that
  * holds nextval and setval on a sequence (every member of pg_write_all_data
  * does) could stop the writers by moving it, and no hook sees a call of setval.
+ *
+ * The order of the locks, for every writer: a lock on the table of ledger_enable,
+ * then the builders', the registry's, the verifications', the removals' (the
+ * numbers below are in that order).  A transaction that takes more than one takes
+ * the earlier first; a write by hand takes all four (kl_lock_for_manual_write).
+ * The order is enforced across calls: a call that would take a lock that is
+ * earlier in the order than one the transaction holds fails at once, with
+ * ERRCODE_KL_LOCK_ORDER (write.c, kl_check_lock_order).
  */
 #define KL_REGISTRY_LOCK_SUBID	0x4B4D
 #define KL_VERIFY_LOCK_SUBID	0x4B4E
@@ -194,6 +204,7 @@ extern bool kl_manual_delete_allowed(Relation rel);
 extern bool kl_pending_delete_allowed(Relation rel);
 extern bool kl_insert_allowed(void);
 extern bool kl_insert_is_manual(Relation rel);
+extern bool kl_insert_by_hand(void);
 extern void kl_refuse_write_rel(Relation rel, bool is_insert);
 extern bool kl_write_active(void);
 extern bool kl_manual_setting_on(void);
@@ -203,7 +214,10 @@ extern Oid	kl_extension_oid(void);
 /* write.c: the functions that write the ledger, and the record of a manual write */
 extern void kl_record_manual_insert(Relation rel, HeapTuple tuple);
 extern void kl_lock_extension_object(int subid);
-extern void kl_hold_progress(void);
+extern void kl_lock_for_manual_write(Relation rel);
+extern HeapTuple kl_manual_write_identifier(Relation rel, HeapTuple tuple);
+extern void kl_hold_credit(Oid relid, uint64 rows, TimestampTz began);
+extern void kl_record_manual_digest_delete(Relation rel, HeapTuple tuple);
 
 /* capture.c */
 extern void kl_record_existing_row(int32 table_id, HeapTupleHeader header);

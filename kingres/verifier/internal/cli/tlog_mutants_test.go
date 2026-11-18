@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // From a mutation run of cli_tlog.go: what checkpoint and consistency print for
@@ -108,7 +110,7 @@ func TestConsistencyOutputListsWhatItDid(t *testing.T) {
 		t.Errorf("not proved:\n%s", np)
 	}
 	// a state file as the old checkpoint is said to be one
-	state := filepath.Join(t.TempDir(), "state")
+	state := filepath.Join(testdir.New(t), "state")
 	if code, out, errs := run(t, "checkpoint", "--trust", p.trust, "--log", p.log(), "--source", p.dir, "--note", oldNote, "--state", state); code != 0 {
 		t.Fatalf("%d %s %s", code, out, errs)
 	}
@@ -154,7 +156,7 @@ func TestConsistencyOutputListsWhatItDid(t *testing.T) {
 	// when both notes carry a signature of a key that is not counted, the note about it is there once
 	k2 := newSigner(2)
 	two := trustOf(t, keySpec{"k1", p.signer, `,"revoked":true`}, keySpec{"k2", k2, ""})
-	root := t.TempDir()
+	root := testdir.New(t)
 	publishNote(t, root, p.all, 700, signedBy(700, p.all, []signer{p.signer, k2}))
 	oldTwo := writeNote(t, signedBy(300, p.all, []signer{p.signer, k2}))
 	code, o = jsonOf(t, "consistency", "--trust", two, "--log", logSpecArg(), "--source", root, "--old", oldTwo)
@@ -175,7 +177,7 @@ func TestEpochsAboveNine(t *testing.T) {
 	all := leaves(300)
 	tr := trustOf(t, keySpec{"k", k, ""})
 	for _, epoch := range []string{"10", "11", "99", "123456789"} {
-		root := t.TempDir()
+		root := testdir.New(t)
 		origin := testPrefix + "/c/" + testChain + "/e" + epoch
 		logDir := filepath.Join(root, "c", testChain, "e"+epoch)
 		writeTiles(t, logDir, all, 300)
@@ -198,7 +200,7 @@ func TestAggregateLogIsRead(t *testing.T) {
 	all := leaves(300)
 	tr := trustOf(t, keySpec{"k", k, ""})
 	id := strings.Repeat("cd", 32)
-	root := t.TempDir()
+	root := testdir.New(t)
 	origin := testPrefix + "/a/" + id
 	logDir := filepath.Join(root, "a", id)
 	writeTiles(t, logDir, all, 300)

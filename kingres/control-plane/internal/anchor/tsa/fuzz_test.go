@@ -75,3 +75,21 @@ func FuzzDER(f *testing.F) {
 		}
 	})
 }
+
+// FuzzSameName: the name comparison never panics, is symmetric, and a name
+// that parses is the same name as itself.
+func FuzzSameName(f *testing.F) {
+	a := newAuthority(f, authOpts{keyAlg: "p256fixed"})
+	f.Add(a.tsa.RawSubject, a.root.RawSubject)
+	f.Add(a.tsa.RawSubject, a.tsa.RawSubject)
+	f.Add([]byte{0x30, 0x00}, []byte{0x30, 0x00})
+	f.Add([]byte{}, []byte{1})
+	f.Fuzz(func(t *testing.T, x, y []byte) {
+		if sameName(x, y) != sameName(y, x) {
+			t.Fatal("not symmetric")
+		}
+		if _, ok := parseName(x); ok && !sameName(x, x) {
+			t.Fatal("a name that parses is not the same as itself")
+		}
+	})
+}

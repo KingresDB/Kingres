@@ -478,13 +478,17 @@ sub rowcount
 	is( $n1->safe_psql('postgres',
 			"SELECT v.x FROM (VALUES (1), (2)) v(x), public.kv WHERE kv.id = $k ORDER BY v.x"),
 		"1\n2", 'a VALUES list joined with a restricted table');
-	my ($rc, $out, $err) = run_sql($n1,
-		"SELECT * FROM public.kv, public.loc WHERE kv.id = $k");
-	like($err, qr/combine distributed tables of another shard group with local tables/,
-		'a statement mixing a remote distributed table and a local table is refused');
-	($rc, $out, $err) = run_sql($n1,
-		"BEGIN; DECLARE c SCROLL CURSOR FOR SELECT * FROM public.kv WHERE id = $k; ROLLBACK;");
-	like($err, qr/scrollable cursors/, 'a scrollable cursor on a remote statement is refused');
+	# A read that mixes a distributed table of another group with a local table is
+	# answered by the distributed scan (design 6.5): the same rows as the routed read
+	# of the table, joined with the local table (here with one row on every node).
+	$_->safe_psql('postgres', 'DELETE FROM public.loc; INSERT INTO public.loc VALUES (7)') for ($n1, $n2, $n3);
+	my $want = $n1->safe_psql('postgres', "SELECT val FROM public.kv WHERE id = $k");
+	is( $n1->safe_psql('postgres', "SELECT kv.val, loc.i FROM public.kv, public.loc WHERE kv.id = $k"),
+		"$want|7", 'a statement mixing a remote distributed table and a local table is answered');
+	is( $n1->safe_psql('postgres',
+			"BEGIN; DECLARE c SCROLL CURSOR FOR SELECT val FROM public.kv WHERE id = $k; FETCH ALL FROM c; FETCH BACKWARD ALL FROM c; COMMIT;"),
+		"$want\n$want", 'a scrollable cursor on a remote statement is answered, forward and backward');
+	$_->safe_psql('postgres', 'DELETE FROM public.loc') for ($n1, $n2, $n3);
 	is( $n1->safe_psql('postgres',
 			"BEGIN; DECLARE c CURSOR FOR SELECT val FROM public.kv WHERE id = $k; FETCH 1 FROM c; CLOSE c; COMMIT;"),
 		"x-$k", 'a plain cursor on a remote statement works');

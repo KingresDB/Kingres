@@ -186,6 +186,21 @@ kl_reject(const char *action, const char *name, KlKind kind)
 }
 
 /*
+ * kl_reject_public
+ *		The refusal of a REVOKE of the privileges of PUBLIC on a table of the
+ *		catalog: the hint says why (the one of kl_reject is about switching the
+ *		ledger off, which this is not; L15-10).
+ */
+static void
+kl_reject_public(const char *name)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_KL_PROTECTED),
+			 errmsg("cannot revoke the privileges of PUBLIC on table \"%s\": it is part of the ledger", name),
+			 errhint("The read access that PUBLIC has on the catalog tables is withdrawn by a superuser; a role that is not a superuser, a member of the owner role included, cannot.")));
+}
+
+/*
  * kl_reject_object
  *		Raise the protection error for an object that is not a table.
  */
@@ -1144,8 +1159,7 @@ kl_check_catalog_grant(GrantStmt *stmt, const char *relname, Oid extoid,
 			if (spec->roletype == ROLESPEC_PUBLIC)
 			{
 				if (!history && !superuser())
-					kl_reject("revoke the privileges of PUBLIC on table", relname,
-							  KL_CATALOG_LEDGER);
+					kl_reject_public(relname);
 				continue;
 			}
 			roleid = get_rolespec_oid(spec, true);
@@ -1248,6 +1262,28 @@ kl_check_grant(GrantStmt *stmt, Oid extoid)
 
 					if (OidIsValid(funcoid) && kl_is_internal_function(funcoid, extoid))
 						kl_reject_object("cannot grant or revoke privileges on an internal function of the ledger");
+
+					/*
+					 * What PUBLIC may execute (the hash primitives, ledger_row_hash,
+					 * ledger_verify_proof, ledger_block_preimage) is for every role
+					 * to publish and check proofs with; taking it away is the
+					 * administrator's, like the SELECT of PUBLIC on the catalog
+					 * tables (L15-10).  REVOKE from any other role is harmless.
+					 */
+					if (OidIsValid(funcoid) && !stmt->is_grant && !superuser() &&
+						getExtensionOfObject(ProcedureRelationId, funcoid) == extoid)
+					{
+						ListCell   *gc;
+
+						foreach(gc, stmt->grantees)
+						{
+							if (lfirst_node(RoleSpec, gc)->roletype == ROLESPEC_PUBLIC)
+								ereport(ERROR,
+										(errcode(ERRCODE_KL_PROTECTED),
+										 errmsg("cannot revoke the privileges of PUBLIC on a function of the ledger"),
+										 errhint("The right to execute that PUBLIC has on the functions of the ledger is withdrawn by a superuser; a role that is not a superuser, a member of the owner role included, cannot.")));
+						}
+					}
 				}
 			}
 			break;

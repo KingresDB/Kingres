@@ -714,6 +714,7 @@ void
 kingres_ledger_launcher_main(Datum main_arg)
 {
 	int			round = 0;
+	int			last_interval = -1;
 	MemoryContext round_cxt;
 
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
@@ -748,6 +749,21 @@ kingres_ledger_launcher_main(Datum main_arg)
 			ProcessConfigFile(PGC_SIGHUP);
 		}
 		MemoryContextReset(round_cxt);
+
+		/*
+		 * Say which interval the launcher works with, at the start and when a
+		 * reload changed it: the positive event that tells an operator, and a
+		 * test, that the setting has taken effect (0: no worker is started
+		 * from here on).
+		 */
+		if (kl_block_interval != last_interval)
+		{
+			last_interval = kl_block_interval;
+			ereport(LOG,
+					(errmsg("kingres_ledger: the launcher works with block_interval = %d ms%s",
+							kl_block_interval,
+							kl_block_interval == 0 ? " (the block-building workers are off)" : "")));
+		}
 
 		if (kl_block_interval > 0 && !RecoveryInProgress() && kl_shared != NULL)
 		{

@@ -7,6 +7,8 @@ package cli
 import (
 	"strings"
 	"testing"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // L10-07: the memory of a proof does not depend on its size. A proof of 100,000
@@ -20,7 +22,7 @@ func TestPeakResidentSetOfAProofDoesNotGrowWithItsChain(t *testing.T) {
 	_, _, base := childRun(t, "version")
 	var peaks []int64
 	for _, n := range []int{100_000, 400_000} {
-		p, d, size := syntheticProof(t, t.TempDir(), n)
+		p, d, size := syntheticProof(t, testdir.New(t), n)
 		code, out, peak := childRun(t, "proof", "--proof", p, "--digest", d)
 		t.Logf("MEASURE proof of %d headers|%d bytes|%d KiB (a small input: %d KiB)", n, size, peak>>10, base>>10)
 		if code != 0 || !strings.HasPrefix(out, "VERIFIED") {

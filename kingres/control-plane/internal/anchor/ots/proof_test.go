@@ -343,7 +343,7 @@ func TestURIBoundary(t *testing.T) {
 	// parser enforces the same
 	var w writer
 	w.byte(0)
-	w.raw(TagPending[:])
+	w.raw(tagSlice(TagPending()))
 	var p writer
 	p.varbytes([]byte("https://a.example?x"))
 	w.varbytes(p.b)
@@ -369,24 +369,24 @@ func TestPayloadAndHeightBoundary(t *testing.T) {
 	}
 	var h writer
 	h.varuint(MaxHeight)
-	if _, err := ParseFragment(mk(TagBitcoin, h.b), make([]byte, 32)); err != nil {
+	if _, err := ParseFragment(mk(TagBitcoin(), h.b), make([]byte, 32)); err != nil {
 		t.Errorf("height 2^32-1: %v", err)
 	}
 	h = writer{}
 	h.varuint(MaxHeight + 1)
-	if _, err := ParseFragment(mk(TagBitcoin, h.b), make([]byte, 32)); !errors.Is(err, ErrMalformed) {
+	if _, err := ParseFragment(mk(TagBitcoin(), h.b), make([]byte, 32)); !errors.Is(err, ErrMalformed) {
 		t.Errorf("height 2^32: %v", err)
 	}
 	// data after the height
 	h = writer{}
 	h.varuint(5)
 	h.byte(0)
-	if _, err := ParseFragment(mk(TagBitcoin, h.b), make([]byte, 32)); !errors.Is(err, ErrMalformed) {
+	if _, err := ParseFragment(mk(TagBitcoin(), h.b), make([]byte, 32)); !errors.Is(err, ErrMalformed) {
 		t.Errorf("bitcoin payload with extra byte: %v", err)
 	}
 	// varuint of 10 bytes
 	long := append(bytes.Repeat([]byte{0x80}, 9), 0x01)
-	if _, err := ParseFragment(mk(TagBitcoin, long), make([]byte, 32)); !errors.Is(err, ErrMalformed) {
+	if _, err := ParseFragment(mk(TagBitcoin(), long), make([]byte, 32)); !errors.Is(err, ErrMalformed) {
 		t.Errorf("long varuint: %v", err)
 	}
 	if _, err := NewBitcoin(MaxHeight + 1); err == nil {
@@ -545,3 +545,5 @@ func TestOpsKnownAnswers(t *testing.T) {
 		t.Error("hexlify applied")
 	}
 }
+
+func tagSlice(t [8]byte) []byte { return t[:] }

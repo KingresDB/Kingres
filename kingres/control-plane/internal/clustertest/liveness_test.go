@@ -3,6 +3,8 @@
 package clustertest_test
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,10 +19,26 @@ var lvFlags = []string{"-heartbeat-interval", "500ms", "-suspect-timeout", "3s",
 
 const lvWithin = 60 * time.Second
 
+// lvLast keeps what the last failed call of lvStatus answered, so that an assertion that got "" can say why.
+var lvLast struct {
+	sync.Mutex
+	why string
+}
+
+// lvWhy is the answer of the last call of lvStatus that failed.
+func lvWhy() string {
+	lvLast.Lock()
+	defer lvLast.Unlock()
+	return lvLast.why
+}
+
 // lvStatus is the status node n shows for server id ("" when the call fails).
 func lvStatus(n *clustertest.Node, id string) string {
 	st, body := n.Do("GET", "/servers", nil, nil)
 	if st != 200 {
+		lvLast.Lock()
+		lvLast.why = fmt.Sprintf("GET /servers on node %d at %s: status %d %v", n.Index, time.Now().Format("15:04:05.000"), st, body)
+		lvLast.Unlock()
 		return ""
 	}
 	items, _ := body["items"].([]any)
@@ -278,11 +296,11 @@ func TestHeartbeatsAndLiveness(t *testing.T) {
 		for time.Now().Before(end) {
 			for _, o := range []*clustertest.Node{n0, n2} {
 				if s := lvStatus(n1, o.Host); !healthy(s) {
-					t.Fatalf("node 1 shows node %d as %q after its clock stepped", o.Index, s)
+					t.Fatalf("node 1 shows node %d as %q after its clock stepped (%s)", o.Index, s, lvWhy())
 				}
 			}
 			if s := lvStatus(n0, n1.Host); !healthy(s) {
-				t.Fatalf("node 0 shows node 1 as %q after its clock stepped", s)
+				t.Fatalf("node 0 shows node 1 as %q after its clock stepped (%s)", s, lvWhy())
 			}
 			time.Sleep(time.Second)
 		}

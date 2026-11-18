@@ -10,17 +10,20 @@
 # one that is left (relfrozenxid), so that autovacuum's protection against
 # wraparound reaches the table.  This test consumes ids with the
 # xid_wraparound test module (src/test/modules/xid_wraparound of the
-# PostgreSQL tree; skipped where it is not installed), with autovacuum doing
-# the freezing, and at the same point of each lap holds a transaction whose
-# id has the number the table was created with.
+# PostgreSQL tree), with autovacuum doing the freezing, and at the same point of
+# each lap holds a transaction whose id has the number the table was created with.
+# Where the module is not installed the test is a counted skip that names the
+# reason and says the path was not tested (KC_REQUIRE_WRAPAROUND=1 makes it a
+# failure).  Each lap waits for the age of the columnar table, of a converted table
+# and of a heap twin, and shows that autovacuum visited each (C10-07).
 #
 # It takes several minutes; KC_SKIP_WRAPAROUND=1 skips it.
 #
 # The waits for autovacuum are bounded for a busy machine (15 minutes each, not the
 # 3 of poll_query_until), autovacuum logs every run (log_autovacuum_min_duration = 0),
-# and a wait that gives up says what the log shows autovacuum did with the table: it
-# ran and did not advance relfrozenxid (a defect of relation_vacuum), or it did not
-# run in time (a machine too slow), so a failure is never ambiguous.
+# and a wait that gives up prints the state of the server (sessions, locks, what can hold
+# the oldest xmin back, the age and the autovacuum statistics of the tables, the autovacuum
+# lines of the log) and says nothing about the cause.
 #
 # Portions Copyright (c) 2026, RooyeKhat Media Co
 # SPDX-License-Identifier: AGPL-3.0-only
@@ -47,12 +50,26 @@ log_autovacuum_min_duration = 0
 });
 $node->start;
 
+# The test cannot run without the module.  That must show in the result (C10-07): a counted skip with the
+# reason, not a silent pass; KC_REQUIRE_WRAPAROUND=1 makes it a failure, for the runs that must have it (the
+# in-tree run installs the module; an out-of-tree run against an installation that lacks it does not).
 my $avail = $node->safe_psql('postgres',
 	q{SELECT count(*) FROM pg_available_extensions WHERE name = 'xid_wraparound'});
 if ($avail ne '1')
 {
 	$node->stop;
-	plan skip_all => 'the xid_wraparound test module is not installed';
+	my $why = 'the xid_wraparound test module (src/test/modules/xid_wraparound of the PostgreSQL tree) is not installed in this installation: the anti-wraparound path of the extension was NOT tested by this run';
+	plan tests => 1;
+	if ($ENV{KC_REQUIRE_WRAPAROUND})
+	{
+		fail("the xid_wraparound test module is installed (KC_REQUIRE_WRAPAROUND is set): $why");
+	}
+	else
+	{
+		SKIP: { skip $why, 1; }
+		diag("SKIPPED t/013_xid_wraparound.pl: $why");
+	}
+	exit 0;
 }
 
 $node->safe_psql('postgres', q{
@@ -71,7 +88,34 @@ my $has_fn = $node->safe_psql('postgres',
 	q{SELECT count(*) FROM pg_proc WHERE proname = 'columnar_creating_xid'});
 cmp_ok($x, '>', 3, "the table was created by transaction $x");
 
-# wait for a condition, up to 15 minutes; on failure die with what autovacuum did with table c
+# What the server looks like, printed when a wait gives up: every session with its
+# transaction id, xmin and wait event, the locks of the tables and the ungranted ones, what can
+# hold the oldest xmin back (slots, prepared transactions), the age of every table, what the
+# statistics say autovacuum did (the columnar vacuum prints no "automatic vacuum of table"
+# line, the statistics are reported by it) and the autovacuum lines of the server log.
+sub dump_state
+{
+	my @queries = (
+		[ 'sessions', q{SELECT pid, backend_type, state, wait_event_type, wait_event, backend_xid, backend_xmin, left(query, 50) FROM pg_stat_activity ORDER BY pid} ],
+		[ 'locks of the tables, and every lock not granted', q{SELECT l.pid, l.locktype, coalesce(l.relation::regclass::text, '-') rel, l.mode, l.granted FROM pg_locks l WHERE l.locktype <> 'virtualxid' AND (NOT l.granted OR l.relation IN ('c'::regclass, 'h'::regclass, 'c0'::regclass)) ORDER BY 1, 3} ],
+		[ 'replication slots', q{SELECT slot_name, xmin, catalog_xmin FROM pg_replication_slots} ],
+		[ 'prepared transactions', q{SELECT gid, transaction FROM pg_prepared_xacts} ],
+		[ 'the oldest ids', q{SELECT 'txid_current ' || pg_current_xact_id()::text || ', datfrozenxid age ' || (SELECT age(datfrozenxid) FROM pg_database WHERE datname = 'postgres') || ', oldest backend xmin age ' || coalesce((SELECT max(age(backend_xmin))::text FROM pg_stat_activity), 'none')} ],
+		[ 'tables with the age of relfrozenxid and what the statistics say of autovacuum', q{SELECT c.oid::regclass, c.relkind, c.relam, age(c.relfrozenxid) AS age, s.autovacuum_count, s.last_autovacuum, s.vacuum_count FROM pg_class c LEFT JOIN pg_stat_all_tables s ON s.relid = c.oid WHERE c.relkind IN ('r', 't', 'm') AND age(c.relfrozenxid) > 50000000 ORDER BY 4 DESC LIMIT 12} ],
+	);
+	my $out = "load: " . (-r '/proc/loadavg' ? slurp_file('/proc/loadavg') : "unknown\n");
+	foreach my $q (@queries)
+	{
+		my ($ret, $o, $e) = $node->psql('postgres', $q->[1]);
+		$out .= "-- $q->[0]\n" . ($ret == 0 ? $o : "(failed: $e)") . "\n";
+	}
+	my @log = grep { /autovacuum|wraparound|vacuum/i } split /\n/, slurp_file($node->logfile);
+	@log = @log[-25 .. -1] if @log > 25;
+	$out .= "-- the last autovacuum lines of the server log\n" . (@log ? join("\n", @log) : 'none') . "\n";
+	diag($out);
+}
+
+# wait for a condition, up to 15 minutes; on failure print the state (above) and die
 sub wait_for
 {
 	my ($sql, $what) = @_;
@@ -81,18 +125,9 @@ sub wait_for
 		return 1 if $node->safe_psql('postgres', $sql) eq 't';
 		sleep 1;
 	}
-	# The columnar vacuum prints no "automatic vacuum of table" line, so what the statistics say
-	# is what tells whether autovacuum visited the table (the log lines are shown as well)
-	my $stat = $node->safe_psql('postgres',
-		q{SELECT autovacuum_count || ' automatic vacuum(s), last at ' || coalesce(last_autovacuum::text, 'never') || ', age(relfrozenxid) ' || (SELECT age(relfrozenxid) FROM pg_class WHERE relname = 'c') FROM pg_stat_user_tables WHERE relname = 'c'});
-	my $ran = $stat =~ /^[1-9]/;
-	my @lines = grep { /automatic (?:aggressive )?vacuum (?:to prevent wraparound )?of table "[^"]*\.c":/ } split /\n/, slurp_file($node->logfile);
-	diag("log lines about the table: " . (@lines ? join("\n", @lines) : 'none'));
-	my $says = $ran
-	  ? "autovacuum RAN on the table ($stat) and relfrozenxid did not advance: a defect of relation_vacuum"
-	  : "autovacuum did not visit the table in time ($stat): a machine too slow, not a defect of the code";
-	diag("load: " . (-r '/proc/loadavg' ? slurp_file('/proc/loadavg') : 'unknown'));
-	die "$what; $says";
+	dump_state();
+	diag("FAILED: $what (the condition: $sql)");
+	die "$what (see the state printed above)";
 }
 
 sub current_xid
@@ -107,8 +142,21 @@ sub consume_to
 	while ($target - current_xid() > 100_000_000)
 	{
 		$node->safe_psql('postgres', 'SELECT consume_xids(100000000)');
-		wait_for(q{SELECT age(relfrozenxid) < 140000000 FROM pg_class WHERE relname = 'c'},
-			'autovacuum did not advance relfrozenxid of the columnar table');
+		# The table is protected when its age stays at or just above the age at which autovacuum
+		# acts (autovacuum_freeze_max_age, 150 million): the limit is 160 million.  It used to be
+		# 140 million, below the trigger, which left a band (140 to 150 million) in which the
+		# table is not yet due for autovacuum, which therefore does nothing, and in which the
+		# test waited for ever: a vacuum that fires 50 to 60 million ids into a batch leaves the
+		# table 40 to 50 million old, and the next batch ends at 140 to 150 million.  Heap does
+		# the same in that band (checked: both kinds of table stay at 145 million for as long as
+		# one waits and are vacuumed once past 150 million).
+		# every table the test watches: the columnar table, the converted one (a table that came from
+		# heap, with no creation id known) and the heap twin (C10-07: only the first was waited for)
+		foreach my $t ('c', 'c0', 'h')
+		{
+			wait_for(qq{SELECT age(relfrozenxid) < 160000000 FROM pg_class WHERE relname = '$t'},
+				"autovacuum did not advance relfrozenxid of the table $t");
+		}
 		wait_for(q{SELECT age(datfrozenxid) < 400000000 FROM pg_database WHERE datname = 'postgres'},
 			'datfrozenxid did not advance');
 	}
@@ -116,8 +164,17 @@ sub consume_to
 	$node->safe_psql('postgres', "SELECT consume_xids($left)") if $left > 0;
 }
 
+# How many times autovacuum has visited each table, as the statistics say (C10-07: the test must show that a
+# vacuum ran in each lap, not only that no table is too old, which a table that was never due would also pass).
+sub av_count
+{
+	my ($t) = @_;
+	return $node->safe_psql('postgres', qq{SELECT coalesce(max(autovacuum_count), 0) FROM pg_stat_all_tables WHERE relname = '$t'});
+}
+
 foreach my $lap (1, 2)
 {
+	my %av_before = map { $_ => av_count($_) } ('c', 'c0', 'h');
 	my $cur = current_xid();
 	my $target = (int($cur / 4294967296) + 1) * 4294967296 + $x - 40;
 	consume_to($target);
@@ -161,6 +218,17 @@ foreach my $lap (1, 2)
 		is($node->safe_psql('postgres', q{SELECT count(*) FROM c0}), 100,
 			"lap $lap: the converted table reads");
 	}
+	# a vacuum ran in this lap for each table, and relminmxid is a real id, the same as the heap twin's
+	foreach my $t ('c', 'c0', 'h')
+	{
+		wait_for(qq{SELECT autovacuum_count > $av_before{$t} FROM pg_stat_all_tables WHERE relname = '$t'},
+			"autovacuum did not visit the table $t in lap $lap");
+		pass("lap $lap: autovacuum visited $t (" . av_count($t) . " visits, " . $av_before{$t} . " before the lap)");
+	}
+	is($node->safe_psql('postgres', q{SELECT relminmxid::text::bigint > 0 FROM pg_class WHERE relname = 'c'}), 't',
+		"lap $lap: relminmxid of the columnar table is a real id");
+	is($node->safe_psql('postgres', q{SELECT count(DISTINCT relminmxid::text) FROM pg_class WHERE relname IN ('c', 'c0', 'h')}), 1,
+		"lap $lap: the columnar tables and the heap twin have the same relminmxid (no multixact is made here)");
 	$node->safe_psql('postgres', 'VACUUM c');
 	is($node->safe_psql('postgres', 'SELECT count(*) FROM c'), 2000 + $lap,
 		"lap $lap: the table has its rows");

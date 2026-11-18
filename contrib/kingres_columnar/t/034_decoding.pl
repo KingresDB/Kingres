@@ -105,13 +105,26 @@ like($tx[0], qr/table \w+\.hp: INSERT: a\[integer\]:3/, '... with its heap row')
 is(join(',', @st), '1', '... and the one stripe of the user\'s row');
 is($node->safe_psql('postgres', 'SELECT string_agg(a::text, \',\' ORDER BY a) FROM t'), '100,300', '... the table holds the user\'s rows and not the refused one');
 
-# 4. a table emptied in place at the pre-commit by the module (relation_nontransactional_truncate): the catalog rows are deleted
-($o, $e) = run("SET kcevents.at = 'pre_commit'; SET kcevents.op = 'ntrunc'; BEGIN; SELECT kcevents_open('t'); COMMIT;");
+# 4. a table emptied in place at the pre-commit by the module (relation_nontransactional_truncate): the catalog rows are deleted.
+#    Only a table given a new file in the same transaction is emptied in place (C10-05), so the transaction truncates the
+#    table and writes it before the module empties it: the stripe the commit wrote is inserted and deleted again.
+($o, $e) = run("SET kcevents.at = 'pre_commit'; SET kcevents.op = 'ntrunc'; BEGIN; TRUNCATE t; INSERT INTO t SELECT generate_series(1, 5); SELECT kcevents_open('t'); COMMIT;");
+unlike($e, qr/ERROR/, 'a truncate in place at the pre-commit of a table given a new file by the transaction: no error');
 @tx = decoded();
-is(scalar(@tx), 1, 'a truncate in place at the pre-commit decodes');
-like($tx[0], qr/table kingres\.columnar_stripe: DELETE/, '... as the delete of the stripe rows');
-unlike($tx[0], qr/table kingres\.columnar_stripe: INSERT/, '... and nothing else');
+is(scalar(@tx), 1, '... decodes');
+like($tx[0], qr/table kingres\.columnar_stripe: DELETE/, '... with the delete of the stripe rows');
+my @ins = $tx[0] =~ /table kingres\.columnar_stripe: INSERT:.*?row_count\[integer\]:(\d+)/g;
+is(join(',', @ins), '5', '... and the one stripe the commit wrote, which the module then emptied');
 is($node->safe_psql('postgres', 'SELECT count(*) FROM t'), 0, '... and the table is empty');
+# a table that existed before the transaction is not touched (C10-05)
+$node->safe_psql('postgres', 'INSERT INTO t VALUES (9)');
+decoded();
+($o, $e) = run("SET kcevents.at = 'pre_commit'; SET kcevents.op = 'ntrunc'; BEGIN; SELECT kcevents_open('t'); COMMIT;");
+like($e, qr/ERROR:  cannot truncate columnar table "t" in place/, 'a truncate in place of a table that existed before the transaction is an error');
+is(scalar(decoded()), 0, '... which decodes to nothing');
+is($node->safe_psql('postgres', 'SELECT count(*) FROM t'), 1, '... and the table keeps its row');
+$node->safe_psql('postgres', 'TRUNCATE t');
+decoded();
 
 # 5. an ordinary columnar transaction decodes to its stripes, and the stripe's rows are the rows of the table
 ($o, $e) = run("SET kcevents.at = ''; SET kcevents.op = 'insert'; BEGIN; INSERT INTO t SELECT generate_series(1, 1000); INSERT INTO hp VALUES (5); COMMIT;");

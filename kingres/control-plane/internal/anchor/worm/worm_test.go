@@ -30,7 +30,7 @@ func testNote(t testing.TB, size string, rootByte byte) []byte {
 
 func testPayload(t testing.TB, size string, rootByte byte) anchor.Payload {
 	t.Helper()
-	p, err := anchor.NewPayload(aggID, testNote(t, size, rootByte))
+	p, err := anchor.NewPayload(aggID, testNote(t, size, rootByte), clockNow())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +182,13 @@ func TestSubmitIdempotent(t *testing.T) {
 	rc1, ev1 := mustSubmit(t, tg, p)
 	rc2, ev2 := mustSubmit(t, tg, p)
 	noSigErrors(t, f)
-	if ev1 != ev2 || string(rc1.Evidence) != string(rc2.Evidence) {
+	// the second call finds the version: the evidence is the same but for the
+	// member that says so (A3-08)
+	if ev1.Found || !ev2.Found {
+		t.Fatalf("found: %v then %v", ev1.Found, ev2.Found)
+	}
+	ev2.Found = false
+	if !sameEvidence(ev1, ev2) || rc1.State != rc2.State {
 		t.Fatalf("evidence differs:\n%s\n%s", rc1.Evidence, rc2.Evidence)
 	}
 	if n := len(f.stored(ev1.Key)); n != 1 {
@@ -513,14 +519,15 @@ func TestNoteSizeBoundary(t *testing.T) {
 	// the signed note limit is a constant of package anchor; a payload at
 	// the limit is accepted by the put and read back, one over is refused
 	// by NewPayload
-	if _, err := anchor.NewPayload(aggID, append(testNote(t, "1", 1), make([]byte, 0)...)); err != nil {
+	if _, err := anchor.NewPayload(aggID, testNote(t, "1", 1), clockNow()); err != nil {
 		t.Fatal(err)
 	}
 	big := testNote(t, "1", 1)
+	// 16 signature lines of 1,000 bytes: above the limit, within the limits of lines and of their number
 	for len(big) <= anchor.MaxSignedNote {
-		big = append(big, []byte("\xe2\x80\x94 k AAAAAA==\n")...)
+		big = append(big, []byte("\xe2\x80\x94 k "+strings.Repeat("A", 992)+"\n")...)
 	}
-	if _, err := anchor.NewPayload(aggID, big); err == nil {
+	if _, err := anchor.NewPayload(aggID, big, clockNow()); err == nil {
 		t.Fatal("oversized note accepted")
 	}
 }

@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // within fails the test when f takes a second or more: a blocked open is the
@@ -45,7 +47,7 @@ func symlink(t *testing.T, target, link string) {
 }
 
 func TestReadArg(t *testing.T) {
-	dir := t.TempDir()
+	dir := testdir.New(t)
 	write(t, filepath.Join(dir, "ok"), "hello")
 	got, err := ReadArg(filepath.Join(dir, "ok"), 5)
 	if err != nil || string(got) != "hello" {
@@ -63,7 +65,7 @@ func TestReadArg(t *testing.T) {
 }
 
 func TestReadArgFollowsLinkToRegularFile(t *testing.T) {
-	dir := t.TempDir()
+	dir := testdir.New(t)
 	write(t, filepath.Join(dir, "real"), "x")
 	symlink(t, filepath.Join(dir, "real"), filepath.Join(dir, "link"))
 	// The auditor chose the link, so it is read.
@@ -158,7 +160,7 @@ func FuzzCleanRel(f *testing.F) {
 }
 
 func TestDirReadFile(t *testing.T) {
-	root, outside := t.TempDir(), t.TempDir()
+	root, outside := testdir.New(t), testdir.New(t)
 	write(t, filepath.Join(root, "a", "b", "f"), "data")
 	write(t, filepath.Join(outside, "secret"), "secret")
 	d, err := OpenDir(root)
@@ -191,7 +193,7 @@ func TestDirReadFile(t *testing.T) {
 }
 
 func TestDirRefusesLinks(t *testing.T) {
-	root, outside := t.TempDir(), t.TempDir()
+	root, outside := testdir.New(t), testdir.New(t)
 	write(t, filepath.Join(root, "real", "f"), "inside")
 	write(t, filepath.Join(outside, "secret"), "secret")
 	symlink(t, filepath.Join(outside, "secret"), filepath.Join(root, "outfile"))
@@ -217,7 +219,7 @@ func TestDirRefusesLinks(t *testing.T) {
 }
 
 func TestOpenDirOfLinkAndOfFile(t *testing.T) {
-	base := t.TempDir()
+	base := testdir.New(t)
 	write(t, filepath.Join(base, "real", "f"), "x")
 	write(t, filepath.Join(base, "plain"), "x")
 	symlink(t, filepath.Join(base, "real"), filepath.Join(base, "link"))
@@ -239,7 +241,7 @@ func TestOpenDirOfLinkAndOfFile(t *testing.T) {
 }
 
 func TestSubDirs(t *testing.T) {
-	root := t.TempDir()
+	root := testdir.New(t)
 	write(t, filepath.Join(root, "c", "id", "e1", "x"), "x")
 	write(t, filepath.Join(root, "c", "id", "afile"), "x")
 	symlink(t, root, filepath.Join(root, "c", "id", "e2"))

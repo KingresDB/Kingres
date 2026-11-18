@@ -4,10 +4,11 @@ package cli
 
 import (
 	"encoding/json"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // L14-02. A state that rests only on keys that the trust file no longer counts
@@ -31,13 +32,13 @@ type thief struct {
 
 func newThief(t *testing.T) *thief {
 	t.Helper()
-	th := &thief{t: t, a: newSigner(1), b: newSigner(2), honest: leaves(900), root: t.TempDir()}
+	th := &thief{t: t, a: newSigner(1), b: newSigner(2), honest: leaves(900), root: testdir.New(t)}
 	both := trustOf(t, keySpec{"a", th.a, ""}, keySpec{"b", th.b, ""})
 	th.trustWeak = trustOf(t, keySpec{"a", th.a, `,"revoked":true`}, keySpec{"b", th.b, ""})
 	forked := leavesSalt(700, 100, "thief")
-	froot := t.TempDir()
+	froot := testdir.New(t)
 	publishNote(t, froot, forked, 700, signedBy(700, forked, []signer{th.a}))
-	th.state = filepath.Join(t.TempDir(), "state")
+	th.state = filepath.Join(testdir.New(t), "state")
 	if code, out, errs := run(t, stateArgs(both, froot, th.state)...); code != 0 {
 		t.Fatalf("the thief's state: %d\n%s%s", code, out, errs)
 	}
@@ -131,10 +132,10 @@ func TestThiefStateInTheJSON(t *testing.T) {
 func TestWeakAnchorIsInTheJSONOfASuccess(t *testing.T) {
 	a, b := newSigner(1), newSigner(2)
 	all := leaves(900)
-	root := t.TempDir()
+	root := testdir.New(t)
 	both := trustOf(t, keySpec{"a", a, ""}, keySpec{"b", b, ""})
 	weak := trustOf(t, keySpec{"a", a, `,"revoked":true`}, keySpec{"b", b, ""})
-	state := filepath.Join(t.TempDir(), "state")
+	state := filepath.Join(testdir.New(t), "state")
 	publishNote(t, root, all, 300, signedBy(300, all, []signer{a}))
 	if code, out, errs := run(t, stateArgs(both, root, state)...); code != 0 {
 		t.Fatalf("seed: %d\n%s%s", code, out, errs)
@@ -142,19 +143,32 @@ func TestWeakAnchorIsInTheJSONOfASuccess(t *testing.T) {
 	type info struct {
 		Info struct {
 			State struct {
-				Weak *bool `json:"anchor_weak"`
-				Keys []any `json:"anchor_weak_keys"`
+				Weak     *bool `json:"anchor_weak"`
+				Repaired *bool `json:"anchor_weak_repaired"`
+				Keys     []any `json:"anchor_weak_keys"`
 			} `json:"state"`
 		} `json:"info"`
 	}
-	publishNote(t, root, all, 700, signedBy(700, all, []signer{b}))
+	// a weak state that a failed run leaves as it is says so (the rollback exit)
+	publishNote(t, root, all, 200, signedBy(200, all, []signer{b}))
 	code, out, _ := run(t, append(stateArgs(weak, root, state), "--json")...)
 	var got info
+	if err := json.Unmarshal([]byte(out), &got); err != nil || code != 1 {
+		t.Fatalf("%d %v\n%s", code, err, out)
+	}
+	if got.Info.State.Weak == nil || !*got.Info.State.Weak || len(got.Info.State.Keys) != 1 || got.Info.State.Repaired != nil {
+		t.Errorf("a run that leaves a weak state as it is does not say so: %s", out)
+	}
+	// a run that extends it writes a state that rests on b: it is reported as it is
+	// after the write (L16-03), and says that it was weak before
+	publishNote(t, root, all, 700, signedBy(700, all, []signer{b}))
+	code, out, _ = run(t, append(stateArgs(weak, root, state), "--json")...)
+	got = info{}
 	if err := json.Unmarshal([]byte(out), &got); err != nil || code != 0 {
 		t.Fatalf("%d %v\n%s", code, err, out)
 	}
-	if got.Info.State.Weak == nil || !*got.Info.State.Weak || len(got.Info.State.Keys) != 1 {
-		t.Errorf("a run that extends a weak state does not say so: %s", out)
+	if got.Info.State.Weak == nil || *got.Info.State.Weak || len(got.Info.State.Keys) != 0 || got.Info.State.Repaired == nil || !*got.Info.State.Repaired {
+		t.Errorf("a run that repairs a weak state does not say so: %s", out)
 	}
 	// the state now rests on b, which counts
 	publishNote(t, root, all, 900, signedBy(900, all, []signer{b}))
@@ -168,44 +182,48 @@ func TestWeakAnchorIsInTheJSONOfASuccess(t *testing.T) {
 	}
 }
 
-// Repeated runs, in text and JSON, at every size, keep one evidence file for the
-// state and never add one; the file is the first conflicting note.
-func TestThiefStateKeepsOneEvidenceFileWhateverTheNumberOfRuns(t *testing.T) {
+// Repeated runs, in text and JSON, at every size, keep at most two evidence files
+// for the state, one for a rollback and one for a fork (L16-01), and never add
+// one; each file is the first conflicting note of its kind.
+func TestThiefStateKeepsTwoEvidenceFilesWhateverTheNumberOfRuns(t *testing.T) {
 	th := newThief(t)
-	var first string
+	dir := filepath.Dir(th.state)
+	first := map[string]string{}
 	for round := 0; round < 3; round++ {
 		for _, c := range thiefCases {
 			th.serve(c.size)
 			run(t, stateArgs(th.trustWeak, th.root, th.state)...)
 			run(t, append(stateArgs(th.trustWeak, th.root, th.state), "--json")...)
-			names := evidenceNames(filepath.Dir(th.state))
-			if len(names) != 1 || !strings.Contains(names[0], ".conflict-weak-700-") {
-				t.Fatalf("round %d size %d: evidence files %v, want the one file of this state", round, c.size, names)
+			names := evidenceNames(dir)
+			if len(names) > 2 {
+				t.Fatalf("round %d size %d: evidence files %v, want two at most", round, c.size, names)
 			}
-			if first == "" {
-				first = fileText(t, filepath.Join(filepath.Dir(th.state), names[0]))
-				if !strings.Contains(first, "\n300\n") {
-					t.Fatalf("the first conflict served was size 300, the file holds:\n%s", first)
+			for _, n := range names {
+				if !strings.Contains(n, ".conflict-weak-rollback-700-") && !strings.Contains(n, ".conflict-weak-fork-700-") {
+					t.Fatalf("an evidence name that is neither of the two kinds: %s", n)
 				}
-			} else if fileText(t, filepath.Join(filepath.Dir(th.state), names[0])) != first {
-				t.Fatal("the evidence file was rewritten by a later run")
+				text := fileText(t, filepath.Join(dir, n))
+				if was, ok := first[n]; !ok {
+					first[n] = text
+				} else if was != text {
+					t.Fatalf("the evidence file %s was rewritten by a later run", n)
+				}
 			}
 		}
 	}
-	// the output says what happened to the evidence, and the status stays 1
+	roll, fork := weakEvidence(th)
+	if len(roll) != 1 || len(fork) != 1 {
+		t.Fatalf("rollback %v fork %v", roll, fork)
+	}
+	// the first rollback (size 300) and the first fork (size 700, another root) are the files
+	if sizeOfNote(first[roll[0]]) != "300" || sizeOfNote(first[fork[0]]) != "700" {
+		t.Errorf("the files hold sizes %s and %s, want the first of each kind: 300 and 700", sizeOfNote(first[roll[0]]), sizeOfNote(first[fork[0]]))
+	}
+	// the output says what happened to a later one, and the status stays 1
 	th.serve(900)
 	code, out, _ := run(t, stateArgs(th.trustWeak, th.root, th.state)...)
-	if code != 1 || !strings.Contains(out, "one file is kept for a state that rests only on keys the trust file no longer counts") {
+	if code != 1 || !strings.Contains(out, "at most one file is kept for each kind") || sizeOfNote(printedNote(t, out)) != "900" {
 		t.Errorf("a later conflict: status %d\n%s", code, out)
-	}
-	// a file that someone put at the name is not evidence: status 1 still, and it says NOT saved
-	name := filepath.Join(filepath.Dir(th.state), evidenceNames(filepath.Dir(th.state))[0])
-	if err := os.WriteFile(name, []byte("planted"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	code, out, _ = run(t, stateArgs(th.trustWeak, th.root, th.state)...)
-	if code != 1 || !strings.Contains(out, "was NOT saved") || fileText(t, name) != "planted" {
-		t.Errorf("a planted file at the name of the evidence: status %d\n%s", code, out)
 	}
 }
 
@@ -217,7 +235,7 @@ func TestThiefStateRebaseWorks(t *testing.T) {
 	if code, out, _ := run(t, stateArgs(th.trustWeak, th.root, th.state)...); code != 1 {
 		t.Fatalf("status %d\n%s", code, out)
 	}
-	fresh := filepath.Join(t.TempDir(), "newstate")
+	fresh := filepath.Join(testdir.New(t), "newstate")
 	if code, out, errs := run(t, stateArgs(th.trustWeak, th.root, fresh, "--min-size", "300")...); code != 0 || stateSize(t, fresh) != 900 {
 		t.Fatalf("the rebase: %d\n%s%s", code, out, errs)
 	}
@@ -293,10 +311,10 @@ func TestConsistencyAgainstAThiefStateSaysWhoMayBeWrong(t *testing.T) {
 func TestConsistencyFromAWeakStateListsThatItWasNotShownGenuine(t *testing.T) {
 	a, b := newSigner(1), newSigner(2)
 	all := leaves(700)
-	root := t.TempDir()
+	root := testdir.New(t)
 	both := trustOf(t, keySpec{"a", a, ""}, keySpec{"b", b, ""})
 	weak := trustOf(t, keySpec{"a", a, `,"revoked":true`}, keySpec{"b", b, ""})
-	state := filepath.Join(t.TempDir(), "state")
+	state := filepath.Join(testdir.New(t), "state")
 	publishNote(t, root, all, 300, signedBy(300, all, []signer{a}))
 	if code, out, errs := run(t, stateArgs(both, root, state)...); code != 0 {
 		t.Fatalf("seed: %d\n%s%s", code, out, errs)

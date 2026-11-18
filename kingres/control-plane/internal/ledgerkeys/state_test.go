@@ -38,15 +38,15 @@ func TestStateNames(t *testing.T) {
 func TestPlannedRotation(t *testing.T) {
 	var s Set
 	s = okSet(t)(mustAdd(s, 1, "2026", t0))
-	if got := s.Signers(t0); len(got) != 0 {
+	if got, err := s.Signers(t0); !errors.Is(err, ErrNoActiveKey) || len(got) != 0 {
 		t.Fatalf("a next key signs: %v", got)
 	}
 	s = okSet(t)(s.Activate(fp(1), t0, 0))
-	if got := s.Signers(t0); len(got) != 1 {
+	if got, err := s.Signers(t0); err != nil || len(got) != 1 {
 		t.Fatalf("signers %d", len(got))
 	}
 	// The one active key cannot be retired: nothing would sign.
-	if _, err := s.Retire(fp(1), t0, 0); !errors.Is(err, ErrNoOtherSigner) {
+	if _, err := s.Retire(fp(1), t0, Unbounded()); !errors.Is(err, ErrNoOtherSigner) {
 		t.Fatalf("retire of the only signer: %v", err)
 	}
 	// Step 1 of 3.3: K2 is generated, state next. It may prove possession and
@@ -71,7 +71,7 @@ func TestPlannedRotation(t *testing.T) {
 	if want := act.AddDate(0, 0, DefaultOverlapDays); !k1.OverlapEnds.Equal(want) {
 		t.Fatalf("overlap ends %v, want %v", k1.OverlapEnds, want)
 	}
-	if got := s.Signers(act); len(got) != 2 || got[0].Fingerprint() != fp(1) || got[1].Fingerprint() != fp(2) {
+	if got, err := s.Signers(act); err != nil || len(got) != 2 || got[0].Fingerprint() != fp(1) || got[1].Fingerprint() != fp(2) {
 		t.Fatalf("signers during the overlap: %v", got)
 	}
 	if got := s.DueForRetirement(act.AddDate(0, 0, 29)); len(got) != 0 {
@@ -93,12 +93,12 @@ func TestPlannedRotation(t *testing.T) {
 		t.Fatalf("a key signs its own retirement: %v", err)
 	}
 	end := k1.OverlapEnds
-	s = okSet(t)(s.Retire(fp(1), end, 0))
+	s = okSet(t)(s.Retire(fp(1), end, Unbounded()))
 	k1, _ = s.Get(fp(1))
 	if k1.State != StateRetired || !k1.RetiredAt.Equal(end) || !k1.OverlapEnds.IsZero() {
 		t.Fatalf("retired key: %+v", k1)
 	}
-	if got := s.Signers(end); len(got) != 1 || got[0].Fingerprint() != fp(2) {
+	if got, err := s.Signers(end); err != nil || len(got) != 1 || got[0].Fingerprint() != fp(2) {
 		t.Fatalf("signers after the retirement: %v", got)
 	}
 	if err := s.CanSign(fp(1), PurposeCheckpoint, "", end); !errors.Is(err, ErrNotAllowed) {
@@ -125,12 +125,12 @@ func TestTransitionsMatrix(t *testing.T) {
 		switch state {
 		case StateNext:
 		case StateActive:
-			s = okSet(t)(s.Retire(fp(1), t0, 0)) // keep two... fp(9) and then activate 2
+			s = okSet(t)(s.Retire(fp(1), t0, Unbounded())) // keep two... fp(9) and then activate 2
 			s = okSet(t)(s.Activate(fp(2), t0, 0))
 		case StateRetired:
-			s = okSet(t)(s.Retire(fp(1), t0, 0))
+			s = okSet(t)(s.Retire(fp(1), t0, Unbounded()))
 			s = okSet(t)(s.Activate(fp(2), t0, 0))
-			s = okSet(t)(s.Retire(fp(2), t0, 0))
+			s = okSet(t)(s.Retire(fp(2), t0, Unbounded()))
 		case StateRevoked:
 			s = okSet(t)(s.Revoke(fp(2), t0, t0, "leaked"))
 		}
@@ -150,7 +150,7 @@ func TestTransitionsMatrix(t *testing.T) {
 		}
 		f := fp(2)
 		_, errAct := s.Activate(f, t0, 0)
-		_, errRet := s.Retire(f, t0, 0)
+		_, errRet := s.Retire(f, t0, Unbounded())
 		_, errRev := s.Revoke(f, t0, t0, "r")
 		wantAct := from == StateNext
 		wantRet := from == StateActive
@@ -189,7 +189,7 @@ func TestRevokeNeedsAnotherActiveKey(t *testing.T) {
 	if k.State != StateRevoked || !k.CompromisedSince.Equal(since) || k.Reason != "laptop stolen" || !k.OverlapEnds.IsZero() {
 		t.Fatalf("revoked key: %+v", k)
 	}
-	if err := s.CanSign(fp(2), PurposeKeyRevoked, fp(1), t0); err != nil {
+	if err := s.CanSign(fp(2), PurposeKeyRevoked, fp(1), t0.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.CanSign(fp(1), PurposeCheckpoint, "", t0); !errors.Is(err, ErrNotAllowed) {
@@ -201,17 +201,18 @@ func TestRevokeNeedsAnotherActiveKey(t *testing.T) {
 		}
 	}
 	// Compromise after the time of the revocation, or unset: refused.
+	t1 := t0.Add(time.Hour)
 	s2 := okSet(t)(mustAdd(s, 3, "", t0))
-	if _, err := s2.Revoke(fp(3), t0, t0.Add(time.Second), "x"); !errors.Is(err, ErrInvalidArgument) {
+	if _, err := s2.Revoke(fp(3), t1, t1.Add(time.Second), "x"); !errors.Is(err, ErrInvalidArgument) {
 		t.Errorf("compromised-since in the future: %v", err)
 	}
-	if _, err := s2.Revoke(fp(3), t0, time.Time{}, "x"); !errors.Is(err, ErrInvalidArgument) {
+	if _, err := s2.Revoke(fp(3), t1, time.Time{}, "x"); !errors.Is(err, ErrInvalidArgument) {
 		t.Errorf("compromised-since unset: %v", err)
 	}
-	if _, err := s2.Revoke(fp(3), t0, t0, "bad\ttext"); !errors.Is(err, ErrInvalidArgument) {
+	if _, err := s2.Revoke(fp(3), t1, t1, "bad\ttext"); !errors.Is(err, ErrInvalidArgument) {
 		t.Errorf("a control character in the reason: %v", err)
 	}
-	if _, err := s2.Revoke(fp(3), t0, t0, "caf\u00e9"); !errors.Is(err, ErrInvalidArgument) {
+	if _, err := s2.Revoke(fp(3), t1, t1, "caf\u00e9"); !errors.Is(err, ErrInvalidArgument) {
 		t.Errorf("a non-ASCII reason: %v", err)
 	}
 }

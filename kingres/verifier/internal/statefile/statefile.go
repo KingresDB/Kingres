@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/safefile"
@@ -144,24 +145,88 @@ var step = func(string) error { return nil }
 // errStop is what a test hook returns to simulate the end of the process.
 var errStop = errors.New("stopped by the test")
 
-// removeLeftovers deletes temporary files of this state that an earlier
-// crashed run left. The caller holds the lock, so nobody else is writing.
-func removeLeftovers(path string) { removeTemps(filepath.Dir(path), tmpPrefix(path)) }
+// isTempName reports whether a file name is one this program gives a temporary
+// file: ".kingres-state-" or ".kingres-evidence-", the 12 hex characters of
+// tag, a dash, the decimal number os.CreateTemp puts in place of the star, and
+// ".tmp" (L16-04). Nothing else matches.
+func isTempName(n string) bool {
+	rest, ok := strings.CutPrefix(n, ".kingres-state-")
+	if !ok {
+		rest, ok = strings.CutPrefix(n, ".kingres-evidence-")
+	}
+	rest, ok2 := strings.CutSuffix(rest, ".tmp")
+	if !ok || !ok2 || len(rest) < 14 || rest[12] != '-' {
+		return false
+	}
+	for i := 0; i < 12; i++ {
+		if c := rest[i]; !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	for _, c := range rest[13:] {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
 
-// removeTemps deletes the files of dir whose names start with pre and end in
-// ".tmp".
-func removeTemps(dir, pre string) {
+// CheckName refuses a state whose name is one that this program gives to its own
+// temporary files (L18-01). A run of any state in the same directory removes such
+// files as the leftovers of a crash, so a state kept under that name could be
+// deleted by the run of another state beside it; refusing it up front, whatever
+// the directory holds, is the only answer that cannot surprise an auditor.
+func CheckName(path string) error {
+	if base := filepath.Base(path); isTempName(base) {
+		return fmt.Errorf("the name %s is one this program gives to its own temporary files (.kingres-state-<12 hex characters>-<digits>.tmp or .kingres-evidence-<12 hex characters>-<digits>.tmp), and a run removes such files from the directory as the leftovers of a crash, so a state kept under it could be deleted: give the state another name; nothing was changed", base)
+	}
+	return nil
+}
+
+// RemoveLeftovers deletes the temporary files of this program in the directory of
+// the state that an earlier crashed run left: those of the state and of the
+// evidence files, under any name of the program (L16-04: a crash in the extension
+// of an evidence file leaves a file whose name comes from the evidence file's
+// name, which no run of that state would have looked for). The caller holds the
+// lock, which is one per directory, so nobody of this program is writing. What is
+// removed must be a regular file (never a link or a directory) with a name
+// isTempName accepts, and, where the system tells, owned by the user running this
+// command; everything else in the directory is left as it is.
+func RemoveLeftovers(path string) {
+	dir := filepath.Dir(path)
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
+	self := filepath.Base(path)
 	for _, e := range ents {
-		n := e.Name()
-		if len(n) > len(pre) && n[:len(pre)] == pre && filepath.Ext(n) == ".tmp" {
-			_ = os.Remove(filepath.Join(dir, n))
+		// Never the file the run was told to use, whatever its name (L18-01); CheckName
+		// refuses such a state before a run gets here, this is the second line.
+		if !isTempName(e.Name()) || e.Name() == self || e.Name() == filepath.Base(lockName(path)) {
+			continue
 		}
+		full := filepath.Join(dir, e.Name())
+		st, err := os.Lstat(full)
+		if err != nil || !st.Mode().IsRegular() {
+			continue
+		}
+		if uid, known := ownerOf(full, st); known && uid != selfUID() {
+			continue
+		}
+		_ = os.Remove(full)
 	}
 }
+
+// DirSyncError says that a file is in place (renamed or linked, and not undone)
+// and that the flush of its directory failed afterwards: a power loss may bring
+// the old state of the directory back. It is not a failure to write (L16-05).
+type DirSyncError struct{ Err error }
+
+func (e *DirSyncError) Error() string {
+	return "the file is in place, but the directory could not be flushed, so a power loss may bring the old directory entry back: " + e.Err.Error()
+}
+
+func (e *DirSyncError) Unwrap() error { return e.Err }
 
 // Replace stores data as the state file: a temporary file in the same
 // directory, flushed, renamed over the state, and the directory flushed, so
@@ -189,7 +254,7 @@ type Prepared struct {
 // be followed by Commit or by Abort.
 func Prepare(path string, data []byte) (p *Prepared, err error) {
 	dir := filepath.Dir(path)
-	removeLeftovers(path)
+	RemoveLeftovers(path)
 	f, err := ops.CreateTemp(dir, tmpPrefix(path)+"*.tmp")
 	if err != nil {
 		return nil, err
@@ -260,7 +325,9 @@ func (p *Prepared) Commit() (err error) {
 	if err = step("renamed"); err != nil {
 		return fail(err)
 	}
-	if err = ops.SyncDir(filepath.Dir(p.path)); err != nil {
+	if serr := ops.SyncDir(filepath.Dir(p.path)); serr != nil {
+		// The rename happened: the new file is in place and the temporary name is gone.
+		err = &DirSyncError{serr}
 		return err
 	}
 	return fail(step("dirsynced"))
@@ -365,7 +432,7 @@ func SaveConflict(path string, size uint64, root []byte, note []byte) (Saved, er
 // therefore one file, whichever of them were served on which run (L12-03).
 func SaveConflictMerging(path string, size uint64, root []byte, note []byte, merge func(have []byte) (merged []byte, same bool)) (Saved, error) {
 	base := ConflictPath(path, size, root)
-	removeTemps(filepath.Dir(path), evidencePrefix(path))
+	RemoveLeftovers(path)
 	var last error
 	for i := 0; i < maxConflictNames; i++ {
 		p := base
@@ -382,14 +449,8 @@ func SaveConflictMerging(path string, size uint64, root []byte, note []byte, mer
 		if merge != nil {
 			have, rerr := safefile.ReadNoFollow(p, 2*MaxEvidence)
 			if rerr == nil {
-				if merged, same := merge(have); same {
-					if bytes.Equal(merged, have) {
-						return Saved{Path: p, Existing: true}, nil
-					}
-					if rerr := Replace(p, merged); rerr != nil {
-						return Saved{Path: p}, rerr
-					}
-					return Saved{Path: p, Existing: true, Extended: true}, nil
+				if sv, same, merr := mergeInto(p, have, merge); same {
+					return sv, merr
 				}
 			}
 			last = fmt.Errorf("%s exists and is not this checkpoint", p)
@@ -460,7 +521,10 @@ func createEvidence(state, p string, data []byte) error {
 		stopped = errors.Is(err, errStop)
 		return err
 	}
-	return ops.SyncDir(dir)
+	if serr := ops.SyncDir(dir); serr != nil {
+		return &DirSyncError{serr}
+	}
+	return nil
 }
 
 // createEvidenceInPlace is the exclusive create and write, for a file system
@@ -474,31 +538,80 @@ func createEvidenceInPlace(p string, data []byte) error {
 		_ = os.Remove(p)
 		return err
 	}
+	// The file is in place: the directory is flushed and a failure is reported as
+	// the other paths do (L18-07).
+	if serr := ops.SyncDir(filepath.Dir(p)); serr != nil {
+		return &DirSyncError{serr}
+	}
 	return nil
 }
 
-// WeakConflictPath is the one name of the evidence of a conflict with a held
-// checkpoint that rests only on keys the trust file no longer counts: it
-// depends on the held checkpoint and on nothing that the log serves, so that the
-// conflicts of any number of runs, and of any number of sizes of the log, are
-// one file at most.
-func WeakConflictPath(path string, heldSize uint64, heldRoot []byte) string {
+// mergeInto handles a file that is already at a name of the evidence: merge says
+// whether it is the same checkpoint as the note (same) and the bytes the file
+// should hold. The same checkpoint with the same bytes is the evidence already
+// saved; with other bytes (more genuine lines) the file is replaced, in the same
+// directory and atomically. When same is false nothing was done and nothing is
+// returned. An error after the file is in place (a failed flush of the directory)
+// comes with the Saved that says where the file is.
+func mergeInto(p string, have []byte, merge func(have []byte) ([]byte, bool)) (sv Saved, same bool, err error) {
+	merged, same := merge(have)
+	if !same {
+		return Saved{}, false, nil
+	}
+	if bytes.Equal(merged, have) {
+		return Saved{Path: p, Existing: true}, true, nil
+	}
+	if rerr := Replace(p, merged); rerr != nil {
+		var dse *DirSyncError
+		if errors.As(rerr, &dse) {
+			return Saved{Path: p, Existing: true, Extended: true}, true, rerr
+		}
+		return Saved{Path: p}, true, rerr
+	}
+	return Saved{Path: p, Existing: true, Extended: true}, true, nil
+}
+
+// The two kinds of conflict with a held checkpoint that rests only on keys the
+// trust file no longer counts (L16-01). A rollback is a served checkpoint smaller
+// than the held one: a party without a key can always serve an old genuine one. A
+// fork is the same size with another root, or a larger one that the proof does not
+// connect to the held one.
+const (
+	WeakRollback = "rollback"
+	WeakFork     = "fork"
+)
+
+// ErrSlotTaken is returned by SaveWeakConflict when the file for the kind is
+// there and holds another checkpoint: the note is not saved.
+var ErrSlotTaken = errors.New("the file kept for this kind of conflict holds another checkpoint")
+
+// WeakConflictPath is the name of the evidence of a conflict of one kind with a
+// held checkpoint that rests only on keys the trust file no longer counts: it
+// depends on the held checkpoint and on the kind (two values) and on nothing that
+// the log serves, so that the conflicts of any number of runs and sizes are two
+// files at most.
+func WeakConflictPath(path string, kind string, heldSize uint64, heldRoot []byte) string {
 	base := filepath.Base(path)
 	if len(base) > 100 {
 		base = "state-" + tag(path)
 	}
-	return filepath.Join(filepath.Dir(path), fmt.Sprintf("%s.conflict-weak-%d-%x", base, heldSize, heldRoot))
+	return filepath.Join(filepath.Dir(path), fmt.Sprintf("%s.conflict-weak-%s-%d-%x", base, kind, heldSize, heldRoot))
 }
 
-// SaveWeakConflict keeps the first note that conflicted with a held checkpoint
-// that rests only on keys the trust file no longer counts, and no later one: a
-// log that grows would otherwise make a file at each run. The name is
-// WeakConflictPath. When the name is taken, valid says whether what is there is
-// a note of this kind (a file someone put there is not); the note is not added
-// to it, and Saved.Existing is true.
-func SaveWeakConflict(path string, heldSize uint64, heldRoot []byte, note []byte, valid func(have []byte) bool) (Saved, error) {
-	p := WeakConflictPath(path, heldSize, heldRoot)
-	removeTemps(filepath.Dir(path), evidencePrefix(path))
+// SaveWeakConflict keeps the first note of each kind that conflicted with a held
+// checkpoint that rests only on keys the trust file no longer counts, and no
+// later one of that kind: a log that grows would otherwise make a file at each
+// run. The two kinds have a file each so that a replay of an old genuine
+// checkpoint (a rollback) cannot take the place of a fork. A note of the same
+// checkpoint as the one kept (same signed text; merge as in SaveConflictMerging)
+// is the one already saved. A note of another checkpoint is not saved: the error
+// is ErrSlotTaken, and the caller must say so and print the note (L16-01).
+func SaveWeakConflict(path string, kind string, heldSize uint64, heldRoot []byte, note []byte, merge func(have []byte) ([]byte, bool)) (Saved, error) {
+	if kind != WeakRollback && kind != WeakFork {
+		return Saved{}, fmt.Errorf("unknown kind of conflict %q", kind)
+	}
+	p := WeakConflictPath(path, kind, heldSize, heldRoot)
+	RemoveLeftovers(path)
 	err := createEvidence(path, p, note)
 	if err == nil {
 		return Saved{Path: p}, nil
@@ -506,11 +619,12 @@ func SaveWeakConflict(path string, heldSize uint64, heldRoot []byte, note []byte
 	if !errors.Is(err, os.ErrExist) {
 		return Saved{Path: p}, err
 	}
-	have, rerr := safefile.ReadNoFollow(p, 2*MaxEvidence)
-	if rerr != nil || !valid(have) {
-		return Saved{Path: p}, fmt.Errorf("%s exists and is not a signed checkpoint of this log", p)
+	if have, rerr := safefile.ReadNoFollow(p, 2*MaxEvidence); rerr == nil {
+		if sv, same, merr := mergeInto(p, have, merge); same {
+			return sv, merr
+		}
 	}
-	return Saved{Path: p, Existing: true}, nil
+	return Saved{Path: p}, fmt.Errorf("%w: %s", ErrSlotTaken, p)
 }
 
 func writeAndSync(f *os.File, data []byte) error {

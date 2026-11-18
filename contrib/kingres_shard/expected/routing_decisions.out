@@ -292,9 +292,11 @@ ERROR:  could not connect to node 127.0.0.1:1
 DETAIL:  connection to server at "127.0.0.1", port 1 failed: Connection refused
 	Is the server running on that host and accepting TCP/IP connections?
 SELECT * FROM t_by_id(:tl);
-ERROR:  could not connect to node 127.0.0.1:1
-DETAIL:  connection to server at "127.0.0.1", port 1 failed: Connection refused
-	Is the server running on that host and accepting TCP/IP connections?
+ id |   v   
+----+-------
+  1 | row 1
+(1 row)
+
 SELECT * FROM t_by_id(:tr);
 ERROR:  could not connect to node 127.0.0.1:1
 DETAIL:  connection to server at "127.0.0.1", port 1 failed: Connection refused
@@ -343,9 +345,11 @@ ERROR:  could not connect to node 127.0.0.1:1
 DETAIL:  connection to server at "127.0.0.1", port 1 failed: Connection refused
 	Is the server running on that host and accepting TCP/IP connections?
 SELECT * FROM t_view WHERE id = :tl;
-ERROR:  could not connect to node 127.0.0.1:1
-DETAIL:  connection to server at "127.0.0.1", port 1 failed: Connection refused
-	Is the server running on that host and accepting TCP/IP connections?
+ id |   v   
+----+-------
+  1 | row 1
+(1 row)
+
 CREATE RULE plain_to_t AS ON INSERT TO plain DO ALSO INSERT INTO t VALUES (NEW.x, 'rule');
 INSERT INTO plain VALUES (:tn);
 CREATE FUNCTION plain_trg() RETURNS trigger LANGUAGE plpgsql

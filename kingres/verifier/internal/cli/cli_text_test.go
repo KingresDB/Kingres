@@ -13,6 +13,8 @@ import (
 	"testing"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // hostile strings of the kind a publisher or a database server can put into a
@@ -155,31 +157,31 @@ func TestHostileTextInEveryPlace(t *testing.T) {
 	good := fx("digests/d0.json")
 	scenarios := []hostileScenario{
 		{"proof file key", func(t *testing.T, h string) []string {
-			f := writeTemp(t, t.TempDir(), "p.json", `{"format":1,"`+h+`":[1,}`)
+			f := writeTemp(t, testdir.New(t), "p.json", `{"format":1,"`+h+`":[1,}`)
 			return []string{"proof", "--proof", f, "--digest", good}
 		}},
 		{"digest file key", func(t *testing.T, h string) []string {
-			f := writeTemp(t, t.TempDir(), "d.json", `{"`+h+`":[1,}`)
+			f := writeTemp(t, testdir.New(t), "d.json", `{"`+h+`":[1,}`)
 			return []string{"proof", "--proof", fx("proofs/" + firstProof(t)), "--digest", f}
 		}},
 		{"digest-chain digest key", func(t *testing.T, h string) []string {
-			f := writeTemp(t, t.TempDir(), "d.json", `{"`+h+`":1}`)
+			f := writeTemp(t, testdir.New(t), "d.json", `{"`+h+`":1}`)
 			return []string{"digest-chain", f, good}
 		}},
 		{"blocks file", func(t *testing.T, h string) []string {
-			f := writeTemp(t, t.TempDir(), "b.jsonl", `{"`+h+`":1}`+"\n")
+			f := writeTemp(t, testdir.New(t), "b.jsonl", `{"`+h+`":1}`+"\n")
 			return []string{"blocks", "--blocks", f, "--digest", good}
 		}},
 		{"row-hash column name", func(t *testing.T, h string) []string {
-			f := writeTemp(t, t.TempDir(), "c.json", `[{"name":"`+h+`","send_hex":"zz"}]`)
+			f := writeTemp(t, testdir.New(t), "c.json", `[{"name":"`+h+`","send_hex":"zz"}]`)
 			return []string{"row-hash", "--table-id", "1", "--columns", f}
 		}},
 		{"trust member name", func(t *testing.T, h string) []string {
-			f := writeTemp(t, t.TempDir(), "t.json", `{"format":1,"origin_prefix":"x","keys":[],"`+h+`":1}`)
+			f := writeTemp(t, testdir.New(t), "t.json", `{"format":1,"origin_prefix":"x","keys":[],"`+h+`":1}`)
 			return []string{"trust", "show", "--trust", f}
 		}},
 		{"trust label and prefix", func(t *testing.T, h string) []string {
-			f := writeTemp(t, t.TempDir(), "t.json", `{"format":1,"origin_prefix":"`+h+`","keys":[{"name":"`+h+`","public_key":"AA","fingerprint":"00"}]}`)
+			f := writeTemp(t, testdir.New(t), "t.json", `{"format":1,"origin_prefix":"`+h+`","keys":[{"name":"`+h+`","public_key":"AA","fingerprint":"00"}]}`)
 			return []string{"checkpoint", "--trust", f, "--log", p.log(), "--source", p.dir}
 		}},
 		{"--log", func(t *testing.T, h string) []string {
@@ -192,7 +194,7 @@ func TestHostileTextInEveryPlace(t *testing.T) {
 			return []string{"checkpoint", "--trust", h, "--log", p.log(), "--source", p.dir}
 		}},
 		{"--state", func(t *testing.T, h string) []string {
-			return []string{"checkpoint", "--trust", p.trust, "--log", p.log(), "--source", p.dir, "--state", filepath.Join(t.TempDir(), "no", h)}
+			return []string{"checkpoint", "--trust", p.trust, "--log", p.log(), "--source", p.dir, "--state", filepath.Join(testdir.New(t), "no", h)}
 		}},
 		{"--old", func(t *testing.T, h string) []string {
 			return []string{"consistency", "--trust", p.trust, "--log", p.log(), "--source", p.dir, "--old", h}
@@ -212,11 +214,11 @@ func TestHostileTextInEveryPlace(t *testing.T) {
 			s := p.signer
 			text := p.origin + "\n300\n" + b64root(refMTH(p.all[:300])) + "\n" + h
 			note := s.signText(text)
-			f := writeTemp(t, t.TempDir(), "cp", note)
+			f := writeTemp(t, testdir.New(t), "cp", note)
 			return []string{"checkpoint", "--trust", p.trust, "--log", p.log(), "--note", f}
 		}},
 		{"digest directory with a file name", func(t *testing.T, h string) []string {
-			dir := t.TempDir()
+			dir := testdir.New(t)
 			name := strings.NewReplacer("\x00", "", "/", "", "\\", "").Replace(h)
 			if len(name) > 100 {
 				name = name[:100]

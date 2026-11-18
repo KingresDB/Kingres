@@ -16,6 +16,10 @@
 // a primary without a lease) and stops the instance with an immediate shutdown.
 // It exits when the instance is no longer running or after the fence.
 //
+// A file with "off" says that the instance is not a primary now: it is never fenced on it, however old it is, until a
+// file without "off" arrives. A group that merely has no standby is not off: kingresd writes its file again at every
+// pass, so a dead or hung kingresd leaves a file that runs out and the instance is fenced (FO-01).
+//
 // The one exception is an orderly stop: kingresd -stop-instances asks the instance
 // for a fast shutdown and then writes the stand-down file, which names the
 // postmaster it asked (process id and start time, the first and third line of
@@ -54,7 +58,7 @@ func main() {
 		return // another watchdog already watches this instance
 	}
 	var seq uint64
-	var off bool               // kingresd wrote "off": the lease is not enforced for this instance now, nothing to fence on
+	var off bool               // kingresd wrote "off": this instance is not a primary now (a demotion), nothing to fence on; a group without a standby is not "off", its file is refreshed
 	start := time.Now()        // carries the monotonic reading
 	var deadline time.Duration // since start; 0: no lease seen yet, fence at once
 	for {

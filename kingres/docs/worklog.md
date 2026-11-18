@@ -7,6 +7,195 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-18: failover begun in kingresd, the libraries of phase 7 for keys, logs and anchoring, and further fix rounds with their reviews
+
+Covers the work from the afternoon of 2026-11-17 to the early morning of
+2026-11-18.
+
+### What was done
+
+- **Failover in `kingresd`, increments 0 to 2 of ten** (191bba73ee,
+  design [design/ha-phase5-part2.md](design/ha-phase5-part2.md)): a
+  standby is registered in the catalog of `kingres_shard`; an instance has
+  a role file and leases, markers and watchdogs work per group, so that a
+  server can hold the primary of more than one group; a lease can be
+  transferred and released, and there are read calls for the position of
+  a standby and the state of a failover. Failover itself is not in it.
+  The same commit fixes ST-01 to ST-04 of the review of rebalancing, and
+  f895d8fb26 fixes ST-05 to ST-10 (a move is matched with its record by a
+  mark and not by two clocks; a live move is waited for; a server that
+  keeps failing a configuration is retried with a growing pause). The
+  review of the three increments
+  ([reviews/2026-11-17-kingresd-failover-increments-0-2.md](reviews/2026-11-17-kingresd-failover-increments-0-2.md),
+  641098f736) is incomplete by its own statement and has five high
+  findings (FO-01 to FO-16); their fixes are written and are being
+  verified (see "Still open").
+- **`kingres_ledger` 0.3, part A**, three fix rounds and two reviews
+  (7803a5435f, 213fad5c2c, 62b3916dee; reviews
+  [third](reviews/2026-11-17-kingres-ledger-0.3-guard-third-review.md),
+  28af1550c7, and
+  [fourth](reviews/2026-11-17-kingres-ledger-0.3-guard-fourth-review.md),
+  78bf9b3bfd). A second invariant beside the one for writes: a role that
+  is not a superuser cannot stop the builder or the capture for longer
+  than one statement of its own and cannot remove the ledger by a
+  statement in its database. On the way: the refusal of a lock follows
+  the relation that is locked; nothing of the ledger is dropped through a
+  dependency; no writer takes an identifier from a sequence; a role that
+  holds a lock of the extension for longer than
+  `kingres_ledger.lock_hold_limit` has its session ended, cannot prepare
+  the transaction, and the limit follows savepoints. The fourth review
+  found that the README claimed too much about `DROP DATABASE`; the claim
+  is withdrawn and `ledger_status` lists the roles that can drop the
+  database.
+- **The verifier**, two fix rounds and three reviews (ce8993da0e,
+  dc0d74fcbb; reviews
+  [L12](reviews/2026-11-17-kingres-verifier-fourth-fixes.md), 6b1d874503,
+  [L14](reviews/2026-11-17-kingres-verifier-fifth-fixes.md), 9a2ef8200a,
+  [L16](reviews/2026-11-18-kingres-verifier-sixth-fixes.md), 28cab0dae3).
+  The identity of a checkpoint is its signed text and never its signature
+  lines, which only accumulate; a held checkpoint stays the anchor when
+  its keys were revoked, is named weak, and does not accuse the log when
+  it disagrees with it; the lock file is never replaced and a state is
+  never written over bytes the run did not read; limits on a proof
+  element. The last review found no status 0 for something that was not
+  verified and one medium finding about which conflict a weak state
+  keeps.
+- **`kingres_columnar` 0.1**, two fix rounds and one review (f64e8d7aa6,
+  f8c196d043; review
+  [reviews/2026-11-17-kingres-columnar-0.1-eighth-fixes.md](reviews/2026-11-17-kingres-columnar-0.1-eighth-fixes.md),
+  1fed5e7370). Every entry point of the access method has a recorded
+  decision for the moments at which the server forbids an error; a
+  refusal at a moment at which the transaction is still alive makes the
+  transaction fail before it can commit; a critical section entered
+  after the extension's own pre-commit is treated as decided.
+- **Phase 7, libraries** that `kingresd` does not call yet: keys and
+  logs (f16fc5feae: an encrypted key file with rotation, the Merkle tree
+  in tiles, checkpoints as signed notes, proofs, the publication
+  directory); anchoring after two reviews and two fix rounds
+  (5a58604194, 9740c2546a; reviews
+  [first](reviews/2026-11-17-kingresd-anchoring-libraries.md),
+  fd88571cbc, and
+  [second](reviews/2026-11-18-kingresd-anchoring-libraries-second.md),
+  a895b7383a). The first review found that a record was called anchored
+  on the word of an OpenTimestamps calendar; a calendar's attestation is
+  now a claim until a block header from a source the operator configures
+  confirms it.
+- **Designs**: corrections 49 to 84 of
+  [design/ledger-phase7.md](design/ledger-phase7.md) (cf68ae0d42,
+  33bd984e4a, 92834ccce9, ef39325c55, fda76c8296) and the section "Found
+  while building" of the failover design.
+
+### How it was verified
+
+Run by the integrator on the tree that was committed, unless it says
+otherwise.
+
+- `kingresd`: at 191bba73ee, build for both systems, vet, format, unit
+  tests, the contract check, and a complete integration run on each
+  major: 843 passed on 18.7; on 19rc2 842 passed and one failed
+  (`TestInstanceMappingAfterAHandFailover`, see "Still open"). At
+  f895d8fb26: 919 passed, none failed on 18.7; 917 passed and two failed
+  on 19rc2 (the same test and one that passed five of five repeats).
+- `kingres_ledger`: at 213fad5c2c in tree on 18 twice, 24 of 24, and 997
+  tests on 19rc2; at 62b3916dee in tree 27 of 27, then 26 of 27 (a test
+  that waited for a subscription in the wrong database, corrected by the
+  integrator), then eight runs of that test beside a burner and 27 of 27
+  again; on 19rc2 18 regression tests and 23 TAP files with 1138 tests.
+  The tests of `kingresd` that use the ledger were run against each
+  version of the extension from an export of the committed control
+  plane.
+- The verifier at dc0d74fcbb: on Linux three runs of 336 top-level
+  tests, none failing; on Windows four of seven runs clean (297 passing,
+  22 skipped) and three with one test failing on the removal of its
+  temporary directory ("The directory is not empty"). The review of that
+  round reproduced the message with a program that uses no code of the
+  verifier and holds no handle, and found no handle left open by the
+  verifier; which outside program holds the entry is not established.
+- `kingres_columnar`: at f64e8d7aa6 in tree on 18 twice, 37 of 37, and
+  33 TAP files with 7352 tests on 19rc2; at f8c196d043 in tree 37 of 38 and 38 of
+  38, and on 19rc2 34 TAP files with 9783 tests, all passing. The one
+  failure is `t/013_xid_wraparound` (see "Still open").
+- The libraries: keys and logs on Linux with the long tests and a built
+  verifier 87 of 87, twice plain and twice with the race detector by
+  default (85 and 2 skipped), on Windows 83 and 4 skipped; anchoring at
+  9740c2546a on Linux 214 passing and 17 skipped (the third-party
+  vectors, which are not in the repository), twice plain and twice with
+  the race detector, each test binary also in an empty directory, on
+  Windows 212 and 19 skipped.
+- `kingres-19` after each synchronisation: built in the tree without a
+  warning and the suites of the extensions run. At e62a6cd4e0, 170
+  passed, one was skipped and three tests of `kingres_shard` failed on
+  connections between nodes that timed out after 5 seconds while the
+  load average was above 16; alone they passed eight of nine runs, the
+  ninth at a load of 28. The code of `kingres_shard` is the one verified
+  on 18.
+- Shown by the authors and the reviewers only: that each new test fails
+  without its fix, the mutants, the fuzz runs, the measurements.
+
+### Decisions and deviations
+
+- **A held checkpoint outlives its keys** (corrections 55 and 69): a
+  revocation says that a key must not be trusted for new notes, not that
+  a checkpoint the auditor verified is unknown to them.
+- **An OpenTimestamps attestation is a claim** (corrections 60 and 82),
+  and a claim never counts as an anchor.
+- **Identifiers of the ledger do not come from sequences** (corrections
+  66 and 77): a member of `pg_write_all_data` can move a sequence and no
+  hook sees it.
+- **`DROP DATABASE` cannot be prevented from inside the database**
+  (corrections 68 and 74). What protects a deployment is the ownership
+  of the database, which the control plane has to ensure; it does not
+  yet (see "Still open").
+- **Third-party test vectors are not in the repository** (the AWS
+  signature suite and the OpenTimestamps examples): the tests that need
+  them skip, and the same properties are tested with data of our own.
+  Whether they may be added is the project owner's decision.
+- **Parts of phase 2b and phase 7 run beside phase 5** where they depend
+  on nothing unfinished and will not be rewritten: step 1 of phase 2b
+  and the libraries of phase 7.
+
+### Still open
+
+- **Failover**: the fixes for FO-01 to FO-16 are not committed; their
+  complete integration run on 18.7 passed 937 tests and failed two (a
+  test that the fix for FO-04 made wrong, corrected; and the check of a
+  revoked certificate, which took a reset for something other than a
+  refusal, corrected), and the run on 19rc2 has to be repeated: it was
+  made while another suite ran, PostgreSQL did not start within its
+  time, and every later test of the shared cluster failed.
+  `TestInstanceMappingAfterAHandFailover` failed in two of five repeats
+  on 19rc2 on the tree of 191bba73ee on a quiet machine and has passed
+  sixteen of sixteen since; the cause was not found. Increment 3 (a
+  failover started by hand) is written and has not passed a cluster
+  test yet; increments 4 to 9 follow.
+- **`kingres_shard`**: the high finding S12-01 of the fourth review of
+  the call sequences is on both published branches; its fix is written
+  and not integrated. Step 2 of phase 2b waits for it.
+- **`kingres_columnar`**: `t/013_xid_wraparound` gave up once in the
+  tree on each major without the table being frozen; the author found a
+  band in the test (it waited for an age below 140 million while
+  autovacuum acts only above 150 million) that explains the symptom and
+  did not reproduce the failure in 44 runs; the change is being
+  verified.
+- **Reviews owed**: the fixes for L15 (`kingres_ledger`), C9
+  (`kingres_columnar`) and A2 (anchoring), the libraries for keys and
+  logs (running), step 1 of phase 2b, the fixes for ST-05 to ST-10. The
+  fixes for L16 (verifier) are being written.
+- **`kingresd` and the owner of a database**: it creates a database
+  owned by the acting account or the requested owner, a role that is not
+  a superuser, and such an owner can drop the database with its ledger.
+  To be decided with step 6 of phase 7; `ledger_status` shows it.
+- **The machine**: timing-sensitive suites fail when several suites run
+  together (connections that time out, a server that does not start in
+  its time). A complete integration run and a suite in the tree are not
+  run at the same time any more.
+
+### Core patches
+
+None.
+
+---
+
 ## 2026-11-17: kingresd stabilised, a write guard for the ledger, fix rounds and their reviews in four components, phase 2b and the libraries of phase 7 begun
 
 ### What was done

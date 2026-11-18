@@ -233,6 +233,7 @@ type watchdogRunner struct {
 	mu     sync.Mutex
 	exited chan struct{}
 	warned bool
+	proc   *os.Process
 }
 
 func (w *watchdogRunner) binary() string {
@@ -289,6 +290,7 @@ func (w *watchdogRunner) ensure() {
 	}
 	exited := make(chan struct{})
 	w.exited = exited
+	w.proc = cmd.Process
 	go func() { _ = cmd.Wait(); _ = logf.Close(); close(exited) }()
 }
 
@@ -328,10 +330,30 @@ func (w *watchdogs) ensure(group int32) {
 	}
 	w.mu.Lock()
 	r := w.byInstance[li.ID]
+	if r != nil && r.group != group {
+		r.kill()
+	}
 	if r == nil || r.group != group {
 		r = &watchdogRunner{d: w.d, leaseDir: w.leaseDir, instDir: dir, group: group, instance: li.ID}
 		w.byInstance[li.ID] = r
 	}
 	w.mu.Unlock()
 	r.ensure()
+}
+
+// kill ends the watchdog process this runner started, and waits a little for its lock to be released. It is for a
+// watchdog that was started for another group than the instance serves now: its fence marker is the old group's, so
+// it would write the wrong marker (FO-16). The new runner then starts one with the right marker.
+func (w *watchdogRunner) kill() {
+	w.mu.Lock()
+	proc, exited := w.proc, w.exited
+	w.mu.Unlock()
+	if proc == nil || exited == nil {
+		return
+	}
+	_ = proc.Kill()
+	select {
+	case <-exited:
+	case <-time.After(2 * time.Second):
+	}
 }

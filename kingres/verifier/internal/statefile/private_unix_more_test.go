@@ -11,12 +11,14 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // More of the private check, from a mutation run of the package.
 
 func TestOwnerOfReadsTheRealOwner(t *testing.T) {
-	d := t.TempDir()
+	d := testdir.New(t)
 	st, err := os.Stat(d)
 	if err != nil {
 		t.Fatal(err)
@@ -31,7 +33,7 @@ func TestOwnerOfReadsTheRealOwner(t *testing.T) {
 }
 
 func TestCheckPrivateAtLinkLimits(t *testing.T) {
-	base, err := filepath.EvalSymlinks(t.TempDir())
+	base, err := filepath.EvalSymlinks(testdir.New(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +60,7 @@ func TestCheckPrivateAtLinkLimits(t *testing.T) {
 }
 
 func TestCheckPrivateOfARelativePath(t *testing.T) {
-	base, err := filepath.EvalSymlinks(t.TempDir())
+	base, err := filepath.EvalSymlinks(testdir.New(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +93,7 @@ func TestCheckPrivateOfARelativePath(t *testing.T) {
 }
 
 func TestCheckPrivateOwnersOfLinksAndHolders(t *testing.T) {
-	base, err := filepath.EvalSymlinks(t.TempDir())
+	base, err := filepath.EvalSymlinks(testdir.New(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +132,7 @@ func TestCheckPrivateOwnersOfLinksAndHolders(t *testing.T) {
 }
 
 func TestCheckPrivateModesOfTheState(t *testing.T) {
-	d := t.TempDir()
+	d := testdir.New(t)
 	mkdir(t, d, 0o700)
 	st := filepath.Join(d, "state")
 	if err := os.WriteFile(st, nil, 0o600); err != nil {
@@ -151,10 +153,10 @@ func TestCheckPrivateModesOfTheState(t *testing.T) {
 }
 
 func TestSyncDirReportsAMissingDirectory(t *testing.T) {
-	if err := syncDir(filepath.Join(t.TempDir(), "no-such-directory")); err == nil {
+	if err := syncDir(filepath.Join(testdir.New(t), "no-such-directory")); err == nil {
 		t.Fatal("no error for a directory that does not exist")
 	}
-	if err := syncDir(t.TempDir()); err != nil {
+	if err := syncDir(testdir.New(t)); err != nil {
 		t.Fatalf("a directory: %v", err)
 	}
 }

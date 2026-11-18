@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -46,6 +47,13 @@ type Config struct {
 	// token is self-authenticating, the credentials are not). Without it a
 	// target with a username and an http URL is refused.
 	AllowInsecure bool `json:"allowInsecure,omitempty"`
+	// SignerKeySHA256 optionally pins the signer: 64 lower case hexadecimal
+	// digits, the SHA-256 of the DER SubjectPublicKeyInfo of the signing
+	// certificate (SignerKeyHash). With it a token of any other signing key is
+	// refused (code "signer_not_pinned") even when it chains to the roots; without
+	// it any authority under the configured roots is accepted, and the name in
+	// the token is only checked against the token's own certificate.
+	SignerKeySHA256 string `json:"signerKeySha256,omitempty"`
 }
 
 // ParseConfig parses and validates the JSON configuration. Unknown members
@@ -87,6 +95,11 @@ func ParseConfig(cfg json.RawMessage) (Config, error) {
 	}
 	if c.CABundlePath == "" {
 		return c, errors.New("tsa: config: caBundlePath is required")
+	}
+	if c.SignerKeySHA256 != "" {
+		if b, err := hex.DecodeString(c.SignerKeySHA256); err != nil || len(b) != 32 || hex.EncodeToString(b) != c.SignerKeySHA256 {
+			return c, errors.New("tsa: config: signerKeySha256 must be 64 lower case hexadecimal digits")
+		}
 	}
 	if c.TimeoutSeconds < 0 || c.TimeoutSeconds > MaxTimeoutSeconds {
 		return c, fmt.Errorf("tsa: config: timeoutSeconds must be 0 to %d", MaxTimeoutSeconds)
@@ -331,7 +344,11 @@ func (t *Target) exchange(ctx context.Context, digest [32]byte) (*TokenInfo, []b
 	default:
 		return nil, nil, anchor.Errorf(anchor.ClassPermanent, anchor.KindTSA, "post", "tsa_revocation", "the TSA answered with revocation status %d", pr.Status)
 	}
-	info, err := VerifyToken(pr.Token, Expect{Digest: digest, Nonce: nonce, Policy: t.cfg.PolicyOID, Now: t.clock(), MaxSkew: t.maxSkew()}, t.roots, t.inter)
+	var pin []byte
+	if t.cfg.SignerKeySHA256 != "" {
+		pin, _ = hex.DecodeString(t.cfg.SignerKeySHA256)
+	}
+	info, err := VerifyToken(pr.Token, Expect{Digest: digest, Nonce: nonce, Policy: t.cfg.PolicyOID, Now: t.clock(), MaxSkew: t.maxSkew(), SignerKeySHA256: pin}, t.roots, t.inter)
 	if err != nil {
 		return nil, nil, err
 	}

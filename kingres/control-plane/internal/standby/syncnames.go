@@ -73,7 +73,9 @@ func (s *SyncState) Decide(in SyncInput) SyncDecision {
 	want := Names(in.Planned)
 	if len(in.Planned) == 0 {
 		s.noneSince = nil
-		if in.Applied != "" {
+		// A frozen group's list is never changed (invariant I2 of the design): the standby that is not planned
+		// now (a rebuild, a lost slot, a plan that dropped it) may be the one a failover is deciding on.
+		if in.Applied != "" && !in.Frozen {
 			e := ""
 			d.Set = &e
 		}

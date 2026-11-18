@@ -30,7 +30,7 @@ func TestIndependentVerifierOfStoredEvidence(t *testing.T) {
 	root := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32))
 	sig := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 68))
 	note := []byte("kingres.example/agg\n17\n" + root + "\n\n" + string(rune(0x2014)) + " kingres.example/agg " + sig + "\n")
-	p, err := anchor.NewPayload("ab12", note)
+	p, err := anchor.ParsePayload("ab12", note)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func TestIndependentVerifierOfStoredEvidence(t *testing.T) {
 	merkle = sha(sha(cat(s, m1)))
 	ev := fmt.Sprintf(`{"digest":"%s","submitted_at":"2026-12-01T10:00:00Z","calendars":[`+
 		`{"uri":"https://a.example","fragment_b64":"%s"},{"uri":"https://b.example","fragment_b64":"%s"}],`+
-		`"bitcoin":{"height":960000,"calendar_uri":"https://b.example","merkle_root":"%s","status":"claimed","header":""}}`,
+		`"bitcoin":{"height":960000,"calendar_uri":"https://b.example","merkle_root":"%s","status":"claimed","header":""},"contradicted":[],"dropped":[]}`,
 		p.DigestHex(), base64.StdEncoding.EncodeToString(fragA), base64.StdEncoding.EncodeToString(fragB), hex.EncodeToString(merkle))
 	file := fmt.Sprintf(`{"format":1,"kind":"ots","origin":"kingres.example/agg","size":17,"payload_sha256":"%s","created_at":"2026-12-01T10:30:00Z","evidence":%s}`, p.DigestHex(), ev)
 

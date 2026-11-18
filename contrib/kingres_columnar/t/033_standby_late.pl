@@ -69,7 +69,9 @@ run("BEGIN; INSERT INTO win SELECT generate_series(1, 999); SAVEPOINT s; INSERT 
 SET kcprobe.sql = 'COPY win (a) FROM PROGRAM \$\$seq 20001 20007\$\$'; RELEASE s; SET kcprobe.sql = ''; COMMIT;");
 
 # a table emptied in place at the pre-commit by another module
-run("SET kcevents.at = 'pre_commit'; SET kcevents.op = 'ntrunc'; BEGIN; SELECT kcevents_open('trunc'); COMMIT;");
+# (only a table given a new file in the transaction is emptied in place, C10-05: the transaction truncates it, writes
+# it, and the module empties it)
+run("SET kcevents.at = 'pre_commit'; SET kcevents.op = 'ntrunc'; BEGIN; TRUNCATE trunc; INSERT INTO trunc SELECT generate_series(1, 50); SELECT kcevents_open('trunc'); COMMIT;");
 
 # a transaction that lost a call while it was alive fails; one that rolls the loss back commits
 my ($o, $e) = run("SET kcevents.at = 'commit_sub'; BEGIN; SELECT kcevents_open('lost'); SAVEPOINT s; INSERT INTO lost VALUES (1); RELEASE s; COMMIT;");

@@ -211,7 +211,9 @@ func parseSigLine(line string) (NoteSignature, error) {
 
 // SignNote signs text with each signer under the key name name and returns the
 // note. The signature lines are in the order of the signers; the same key
-// twice is refused. For a checkpoint the name is the origin (design 14,
+// twice is refused, and so are two different keys with the same key id under
+// the name (ledgerkeys.ErrKeyIDCollision), because a note holds one line for a
+// name and key id. For a checkpoint the name is the origin (design 14,
 // correction 4).
 func SignNote(ctx context.Context, text []byte, name string, signers ...ledgerkeys.Signer) (*Note, error) {
 	if err := checkText(text); err != nil {
@@ -221,10 +223,12 @@ func SignNote(ctx context.Context, text []byte, name string, signers ...ledgerke
 		return nil, noteErr("no signer")
 	}
 	n := &Note{Text: append([]byte(nil), text...)}
+	var pubs []ed25519.PublicKey
 	for _, s := range signers {
-		if err := n.AddSignature(ctx, name, s); err != nil {
+		if err := n.addSignature(ctx, name, s, pubs); err != nil {
 			return nil, err
 		}
+		pubs = append(pubs, s.Public())
 	}
 	if _, err := n.Marshal(); err != nil {
 		return nil, err
@@ -234,9 +238,18 @@ func SignNote(ctx context.Context, text []byte, name string, signers ...ledgerke
 
 // AddSignature adds the signature of s under the key name to the note (a
 // second key during a rotation, or the re-signing of a checkpoint). A key
-// that has signed under this name already, or a note that has MaxSignatures
-// lines, is refused.
+// that has signed under this name already is refused; so is a key whose key id
+// is that of a line of another key (ledgerkeys.ErrKeyIDCollision, which the
+// verifier would refuse as two lines of one name and id), and so is a note
+// that has MaxSignatures lines. A line with the same name and id is taken for
+// the same key only when its signature verifies under the public key of s.
 func (n *Note) AddSignature(ctx context.Context, name string, s ledgerkeys.Signer) error {
+	return n.addSignature(ctx, name, s, nil)
+}
+
+// addSignature is AddSignature; known are public keys that may own the lines of
+// the note, so that a collision can name both keys.
+func (n *Note) addSignature(ctx context.Context, name string, s ledgerkeys.Signer, known []ed25519.PublicKey) error {
 	if !ledgerkeys.ValidKeyName(name) {
 		return noteErr("the key name %q is not valid", clipStr(name))
 	}
@@ -249,9 +262,22 @@ func (n *Note) AddSignature(ctx context.Context, name string, s ledgerkeys.Signe
 	}
 	id := ledgerkeys.KeyID(name, pub)
 	for _, o := range n.Signatures {
-		if o.Name == name && o.ID == id {
+		if o.Name != name || o.ID != id {
+			continue
+		}
+		if len(o.Sig) == ed25519.SignatureSize && ed25519.Verify(pub, n.Text, o.Sig) {
 			return noteErr("the note is already signed by this key")
 		}
+		// The line has this name and key id but does not verify under this
+		// key: another key with the same id (or a damaged line, which the
+		// verifier refuses as well).
+		c := &ledgerkeys.KeyIDCollision{Name: name, ID: id, A: ledgerkeys.Fingerprint(pub)}
+		for _, p := range known {
+			if len(p) == ed25519.PublicKeySize && !bytes.Equal(p, pub) && ledgerkeys.KeyID(name, p) == id {
+				c.B = ledgerkeys.Fingerprint(p)
+			}
+		}
+		return c
 	}
 	sig, err := s.Sign(ctx, n.Text)
 	if err != nil {
@@ -279,8 +305,26 @@ var (
 // VerifyNote checks the note against the keys as the verifier does: a line
 // whose name and key id match no key is ignored, a line that matches a key
 // must verify (else the note is refused), and at least one line must verify.
-// It returns the keys whose signatures verified.
+// Two different keys with the same name and key id among keys are refused with
+// ledgerkeys.ErrKeyIDCollision, as the verifier refuses them (it cannot tell
+// which of the two a line belongs to). It returns the keys whose signatures
+// verified.
 func VerifyNote(n *Note, keys []NoteKey) ([]NoteKey, error) {
+	type nameID struct {
+		name string
+		id   uint32
+	}
+	seen := map[nameID]ed25519.PublicKey{}
+	for _, k := range keys {
+		if len(k.Public) != ed25519.PublicKeySize {
+			continue
+		}
+		key := nameID{k.Name, ledgerkeys.KeyID(k.Name, k.Public)}
+		if q, dup := seen[key]; dup && !bytes.Equal(q, k.Public) {
+			return nil, &ledgerkeys.KeyIDCollision{Name: k.Name, ID: key.id, A: ledgerkeys.Fingerprint(q), B: ledgerkeys.Fingerprint(k.Public)}
+		}
+		seen[key] = k.Public
+	}
 	var ok []NoteKey
 	for _, s := range n.Signatures {
 		for _, k := range keys {

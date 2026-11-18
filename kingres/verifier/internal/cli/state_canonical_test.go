@@ -17,6 +17,8 @@ import (
 
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/checkpoint"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/signednote"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // The invariant of the state (L10-04, L10-05, L10-09): what is stored in the
@@ -91,9 +93,9 @@ func sigLines(note string) []string {
 func TestStateKeepsOnlyTheLinesThatVerified(t *testing.T) {
 	k1, k2 := newSigner(1), newSigner(2)
 	all := leaves(700)
-	root := t.TempDir()
+	root := testdir.New(t)
 	trust1 := trustOf(t, keySpec{"k1", k1, ""})
-	state := filepath.Join(t.TempDir(), "state")
+	state := filepath.Join(testdir.New(t), "state")
 	publishNote(t, root, all, 300, signedBy(300, all, []signer{k1}, junkLine(logOrigin(), k2)))
 	if code, out, errs := run(t, stateArgs(trust1, root, state)...); code != 0 || !strings.Contains(out, "not counted") {
 		t.Fatalf("first run: %d\n%s%s", code, out, errs)
@@ -117,9 +119,9 @@ func TestStateKeepsOnlyTheLinesThatVerified(t *testing.T) {
 func TestRetiredKeyLineDoesNotStopTheState(t *testing.T) {
 	k1, k3 := newSigner(1), newSigner(3)
 	all := leaves(700)
-	root := t.TempDir()
+	root := testdir.New(t)
 	tr := trustOf(t, keySpec{"k1", k1, ""}, keySpec{"k3", k3, `,"not_after":"2020-01-01T00:00:00Z"`})
-	state := filepath.Join(t.TempDir(), "state")
+	state := filepath.Join(testdir.New(t), "state")
 	publishNote(t, root, all, 300, signedBy(300, all, []signer{k1}))
 	if code, out, errs := run(t, stateArgs(tr, root, state)...); code != 0 {
 		t.Fatalf("seed: %d\n%s%s", code, out, errs)
@@ -147,7 +149,7 @@ func TestRetiredKeyLineDoesNotStopTheState(t *testing.T) {
 func TestStateOfTheEarlierVersionIsStillRead(t *testing.T) {
 	k1, k2 := newSigner(1), newSigner(2)
 	all := leaves(700)
-	root := t.TempDir()
+	root := testdir.New(t)
 	// The earlier version stored the note as sent: one line of key 2 that nobody
 	// signed, with key 2 absent from the trust file at the time.
 	old := signedBy(300, all, []signer{k1}, junkLine(logOrigin(), k2))
@@ -160,7 +162,7 @@ func TestStateOfTheEarlierVersionIsStillRead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	state := filepath.Join(t.TempDir(), "state")
+	state := filepath.Join(testdir.New(t), "state")
 	if err := os.WriteFile(state, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -186,8 +188,8 @@ func TestEvidenceIsOneFileWhateverTheUnverifiedLines(t *testing.T) {
 	k1 := newSigner(1)
 	all := leaves(700)
 	tr := trustOf(t, keySpec{"k1", k1, ""})
-	state := filepath.Join(t.TempDir(), "state")
-	root := t.TempDir()
+	state := filepath.Join(testdir.New(t), "state")
+	root := testdir.New(t)
 	publishNote(t, root, all, 700, signedBy(700, all, []signer{k1}))
 	if code, out, errs := run(t, stateArgs(tr, root, state)...); code != 0 {
 		t.Fatalf("seed: %d\n%s%s", code, out, errs)
@@ -227,8 +229,8 @@ func TestStatus4ShowsTheNoteToKeep(t *testing.T) {
 	k1 := newSigner(1)
 	all := leaves(700)
 	tr := trustOf(t, keySpec{"k1", k1, ""})
-	state := filepath.Join(t.TempDir(), "state")
-	root := t.TempDir()
+	state := filepath.Join(testdir.New(t), "state")
+	root := testdir.New(t)
 	publishNote(t, root, all, 700, signedBy(700, all, []signer{k1}))
 	if code, out, errs := run(t, stateArgs(tr, root, state)...); code != 0 {
 		t.Fatalf("seed: %d\n%s%s", code, out, errs)
@@ -342,8 +344,8 @@ func TestStateSurvivesEveryChangeOfTheTrustFile(t *testing.T) {
 	sizes := []int{255, 256, 300, 400, 513, 700, 900, 1100}
 	for seed := int64(0); seed < 25; seed++ {
 		rng := rand.New(rand.NewSource(seed))
-		state := filepath.Join(t.TempDir(), "state")
-		root := t.TempDir()
+		state := filepath.Join(testdir.New(t), "state")
+		root := testdir.New(t)
 		var counted map[int]bool // keys that signed the note in the state, usable and unrevoked when it was written
 		for step, size := range sizes {
 			// A random trust file: every key present or not, with a random standing.
@@ -550,7 +552,7 @@ func uniqueStrings(in []string) []string {
 func TestReadBackRefusesWhatALaterRunWouldNotRead(t *testing.T) {
 	k1, k2 := newSigner(1), newSigner(2)
 	all := leaves(300)
-	root := t.TempDir()
+	root := testdir.New(t)
 	tr := trustOf(t, keySpec{"k1", k1, ""}, keySpec{"k2", k2, `,"revoked":true`})
 	good := signedBy(300, all, []signer{k1})
 	onlyRevoked := signedBy(300, all, []signer{k2})
@@ -649,8 +651,8 @@ func FuzzStateFromNote(f *testing.F) {
 				st[i] = stUsable
 			}
 		}
-		root := t.TempDir()
-		state := filepath.Join(t.TempDir(), "state")
+		root := testdir.New(t)
+		state := filepath.Join(testdir.New(t), "state")
 		tr := trustWithStandings(t, p, st)
 		for _, size := range []int{300, 700} {
 			publishNote(t, root, all, size, signedBy(size, all, signers, junk...))

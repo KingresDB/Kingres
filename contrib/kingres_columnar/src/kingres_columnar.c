@@ -34,6 +34,9 @@
 #include "access/xlog.h"
 #include "miscadmin.h"
 #include "storage/lmgr.h"
+#include "storage/lock.h"
+#include "storage/latch.h"
+#include "utils/wait_event.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -67,6 +70,7 @@ int			kc_guc_compression_level = 3;
 int			kc_guc_stripe_rows = 150000;
 int			kc_guc_max_stripe_rows = KC_MAX_STRIPE_ROWS;
 int			kc_guc_orphan_notes_max = KC_ORPHAN_NOTES_MAX;
+static int	kc_guc_check_gate = 0;
 int			kc_guc_chunk_rows = 10000;
 int			kc_guc_write_buffer_kb = 131072;
 bool		kc_guc_enable_custom_scan = true;
@@ -160,6 +164,19 @@ _PG_init(void)
 							"Most files kept for the next transaction to clean up after (testing: lowers the compiled limit).",
 							NULL, &kc_guc_orphan_notes_max, KC_ORPHAN_NOTES_MAX,
 							1, KC_ORPHAN_NOTES_MAX,
+							PGC_SUSET, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+	/*
+	 * A developer setting, for tests: a key (the first of the two integers of
+	 * pg_advisory_lock(int, int), the second being 0) that columnar_check and
+	 * columnar_check_clean wait on, at the start of the look at each table (after
+	 * the list of tables is made), until no other session holds that advisory
+	 * lock, so that a test can drop or make a table, or cancel the call, at that
+	 * moment and not at a moment it can only hope for.  0 (the default) is no
+	 * gate.  The wait is bounded (two minutes) and can be cancelled.
+	 */
+	DefineCustomIntVariable("kingres_columnar.check_gate",
+							"Advisory lock key that the check functions wait on after listing the tables (testing).",
+							NULL, &kc_guc_check_gate, 0, 0, 1000000,
 							PGC_SUSET, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 	DefineCustomIntVariable("kingres_columnar.chunk_row_count",
 							"Rows of a chunk group of a new columnar table.",
@@ -645,100 +662,178 @@ kc_check_row(KcCheckSink *sink, const char *name, Oid relid, const char *detail)
 	tuplestore_putvalues(sink->rsinfo->setResult, sink->rsinfo->setDesc, values, nulls);
 }
 
+/*
+ * The test gate (setting kingres_columnar.check_gate): wait while another
+ * session holds the advisory lock (key, 0).  Never taken by anything but a test.  It is called at the start of the look at each table, inside
+ * the per-table guard, so that a test can also cancel or time out the call at that point.
+ */
+static void
+kc_check_gate(void)
+{
+	LOCKTAG		tag;
+	int			i;
+
+	if (kc_guc_check_gate == 0)
+		return;
+	SET_LOCKTAG_ADVISORY(tag, MyDatabaseId, (uint32) kc_guc_check_gate, 0, 2);
+	for (i = 0; i < 12000; i++)
+	{
+		if (LockAcquire(&tag, ShareLock, false, true) != LOCKACQUIRE_NOT_AVAIL)
+		{
+			(void) LockRelease(&tag, ShareLock, false);
+			return;
+		}
+		CHECK_FOR_INTERRUPTS();
+		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 10, WAIT_EVENT_PG_SLEEP);
+		ResetLatch(MyLatch);
+	}
+}
+
 static void
 kc_check_one(Oid relid, bool fix, KcCheckSink *sink)
 {
-		LOCKMODE	lockmode = fix ? ShareUpdateExclusiveLock : AccessShareLock;
-		Relation	rel;
-		bool		mvcc;
-		Snapshot	cs;
-		int			n;
-		int			i;
-		KcStripeInfo *s;
-		BlockNumber nblocks;
+	LOCKMODE	lockmode = fix ? ShareUpdateExclusiveLock : AccessShareLock;
+	Relation	rel;
+	Snapshot	cs;
+	int			n;
+	int			i;
+	KcStripeInfo *s;
+	BlockNumber nblocks;
 
+	kc_check_gate();
+
+	/*
+	 * Never wait for a lock: a prepared transaction that holds a table
+	 * exclusively (a prepared TRUNCATE, a rewrite) keeps it until someone
+	 * ends it, and the check would wait with it, without end.  A table that
+	 * cannot be locked now is reported as not checked, which is a row like
+	 * any other (C9-04: a caller that tests for the absence of rows, or
+	 * asks columnar_check_clean, cannot mistake it for a clean table),
+	 * and the rest goes on.
+	 */
+	if (!ConditionalLockRelationOid(relid, lockmode))
+	{
+		kc_check_row(sink, "not_checked", relid,
+					 "the table is locked by another transaction (a prepared one, or ordinary DDL or VACUUM FULL that is running) and was not checked; this is not a clean result: end or wait for that transaction and run the check again");
+		return;
+	}
+	rel = try_relation_open(relid, NoLock);
+	if (rel == NULL || !kc_rel_is_columnar(rel))
+	{
 		/*
-		 * Never wait for a lock: a prepared transaction that holds a table
-		 * exclusively (a prepared TRUNCATE, a rewrite) keeps it until someone
-		 * ends it, and the check would wait with it, without end.  A table that
-		 * cannot be locked now is reported as not checked, which is a row like
-		 * any other (C9-04: a caller that tests for the absence of rows, or
-		 * asks columnar_check_clean, cannot mistake it for a clean table),
-		 * and the rest goes on.
+		 * Dropped, or made another kind of table, since the list was made
+		 * (C10-01): it is not a table this call looked at, which is not a clean
+		 * result either.
 		 */
-		if (!ConditionalLockRelationOid(relid, lockmode))
+		bool		dropped = (rel == NULL);
+
+		if (rel)
+			relation_close(rel, lockmode);
+		else
+			UnlockRelationOid(relid, lockmode);
+		kc_check_row(sink, "not_checked", relid,
+					 dropped ? "the table was dropped during the call and was not checked"
+					 : "the table is no longer a columnar table (its access method was changed during the call) and was not checked");
+		return;
+	}
+
+	/*
+	 * The stripes as of now, whatever the isolation level of the caller
+	 * (C10-01): the caller's own snapshot, in REPEATABLE READ or SERIALIZABLE,
+	 * does not see a stripe committed after it, nor any stripe of a table made
+	 * after it, and would call a damaged table clean.  The orphan step has
+	 * always read the catalog this way.
+	 */
+	cs = kc_latest_snapshot();
+	s = kc_catalog_load(rel, cs, &n);
+	pfree(cs);
+	nblocks = RelationGetNumberOfBlocks(rel);
+	for (i = 0; i < n; i++)
+	{
+		const char *problem = NULL;
+		char		detail[256];
+
+		CHECK_FOR_INTERRUPTS();
+		if (s[i].first_block + s[i].block_count > nblocks)
 		{
-			kc_check_row(sink, "not_checked", relid,
-						 "the table is locked by another transaction (a prepared one, or ordinary DDL or VACUUM FULL that is running) and was not checked; this is not a clean result: end or wait for that transaction and run the check again");
-			return;
+			problem = "stripe_beyond_file";
+			snprintf(detail, sizeof(detail), "stripe " UINT64_FORMAT " lies at blocks %llu to %llu, the file has %u blocks",
+					 s[i].stripe_id, (unsigned long long) s[i].first_block,
+					 (unsigned long long) (s[i].first_block + s[i].block_count - 1), nblocks);
 		}
-		rel = try_relation_open(relid, NoLock);
-		if (rel == NULL || !kc_rel_is_columnar(rel))
+		else
 		{
-			if (rel)
-				relation_close(rel, lockmode);
+			Buffer		buf = ReadBuffer(rel, (BlockNumber) s[i].first_block);
+			Page		page;
+			KcPageSpecial *sp;
+
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+			page = BufferGetPage(buf);
+			if (PageIsNew(page) || PageGetSpecialSize(page) != sizeof(KcPageSpecial))
+				sp = NULL;
 			else
-				UnlockRelationOid(relid, lockmode);
-			return;
+				sp = (KcPageSpecial *) PageGetSpecialPointer(page);
+			if (sp == NULL || sp->magic != KC_PAGE_MAGIC ||
+				sp->stripe_id != s[i].stripe_id || sp->page_no != 0 ||
+				sp->page_count != s[i].block_count)
+			{
+				problem = "page_header_mismatch";
+				snprintf(detail, sizeof(detail), "the first page of stripe " UINT64_FORMAT " (block %llu) does not belong to it",
+						 s[i].stripe_id, (unsigned long long) s[i].first_block);
+			}
+			UnlockReleaseBuffer(buf);
 		}
-		cs = kc_catalog_snapshot(GetActiveSnapshot(), &mvcc);
-		s = kc_catalog_load(rel, cs, &n);
-		nblocks = RelationGetNumberOfBlocks(rel);
+		/*
+		 * A stripe over the limit the writer keeps to now.  The reader's limit is
+		 * the highest the writer can have (KC_MAX_STRIPE_ROWS) and a stripe over
+		 * that is refused as a corrupt catalog row before it gets here, so what is
+		 * reported is a stripe that is readable but larger than the developer
+		 * setting max_stripe_rows allows today.  A rewrite (VACUUM FULL, SET
+		 * ACCESS METHOD) cuts it into stripes within the limit.
+		 */
+		if (problem == NULL && s[i].row_count > (uint32) kc_max_stripe_rows())
+		{
+			problem = "stripe_over_row_limit";
+			snprintf(detail, sizeof(detail), "stripe " UINT64_FORMAT " has %u rows, more than the %d the setting max_stripe_rows allows; it can be read, and VACUUM FULL or SET ACCESS METHOD writes it again within the limit",
+					 s[i].stripe_id, s[i].row_count, kc_max_stripe_rows());
+		}
+		if (problem == NULL)
+			continue;
+		kc_check_row(sink, problem, RelationGetRelid(rel), detail);
+		if (fix && strcmp(problem, "stripe_beyond_file") == 0)
+			(void) kc_catalog_delete_stripe(kc_rel_ident(rel)->uid, s[i].stripe_id, false);
+	}
+	if (s)
+	{
+		/* the stripe list of this table is not kept for the rest of the call */
 		for (i = 0; i < n; i++)
 		{
-			const char *problem = NULL;
-			char		detail[256];
-
-			if (s[i].first_block + s[i].block_count > nblocks)
-			{
-				problem = "stripe_beyond_file";
-				snprintf(detail, sizeof(detail), "stripe " UINT64_FORMAT " lies at blocks %llu to %llu, the file has %u blocks",
-						 s[i].stripe_id, (unsigned long long) s[i].first_block,
-						 (unsigned long long) (s[i].first_block + s[i].block_count - 1), nblocks);
-			}
-			else
-			{
-				Buffer		buf = ReadBuffer(rel, (BlockNumber) s[i].first_block);
-				Page		page;
-				KcPageSpecial *sp;
-
-				LockBuffer(buf, BUFFER_LOCK_SHARE);
-				page = BufferGetPage(buf);
-				if (PageIsNew(page) || PageGetSpecialSize(page) != sizeof(KcPageSpecial))
-					sp = NULL;
-				else
-					sp = (KcPageSpecial *) PageGetSpecialPointer(page);
-				if (sp == NULL || sp->magic != KC_PAGE_MAGIC ||
-					sp->stripe_id != s[i].stripe_id || sp->page_no != 0 ||
-					sp->page_count != s[i].block_count)
-				{
-					problem = "page_header_mismatch";
-					snprintf(detail, sizeof(detail), "the first page of stripe " UINT64_FORMAT " (block %llu) does not belong to it",
-							 s[i].stripe_id, (unsigned long long) s[i].first_block);
-				}
-				UnlockReleaseBuffer(buf);
-			}
-			/*
-			 * A stripe over the limit the writer keeps to now.  The reader's limit is
-			 * the highest the writer can have (KC_MAX_STRIPE_ROWS) and a stripe over
-			 * that is refused as a corrupt catalog row before it gets here, so what is
-			 * reported is a stripe that is readable but larger than the developer
-			 * setting max_stripe_rows allows today.  A rewrite (VACUUM FULL, SET
-			 * ACCESS METHOD) cuts it into stripes within the limit.
-			 */
-			if (problem == NULL && s[i].row_count > (uint32) kc_max_stripe_rows())
-			{
-				problem = "stripe_over_row_limit";
-				snprintf(detail, sizeof(detail), "stripe " UINT64_FORMAT " has %u rows, more than the %d the setting max_stripe_rows allows; it can be read, and VACUUM FULL or SET ACCESS METHOD writes it again within the limit",
-						 s[i].stripe_id, s[i].row_count, kc_max_stripe_rows());
-			}
-			if (problem == NULL)
-				continue;
-			kc_check_row(sink, problem, RelationGetRelid(rel), detail);
-			if (fix && strcmp(problem, "stripe_beyond_file") == 0)
-				(void) kc_catalog_delete_stripe(kc_rel_ident(rel)->uid, s[i].stripe_id);
+			pfree(s[i].cid_points);
+			pfree(s[i].col_stats);
 		}
-		relation_close(rel, NoLock);
+		pfree(s);
+	}
+	relation_close(rel, NoLock);
+}
+
+/*
+ * Whether an error raised while a table was read is about that table: damage
+ * it shows (corrupt data, an unreadable or missing file, a format this server
+ * does not read, a value that cannot be decoded).  Only those become an
+ * `unreadable` row.  Everything else is not the table's: a query cancel and
+ * statement_timeout (57014), the shutdown of the server (57P01 and its class),
+ * a lock timeout or deadlock, running out of memory, and any error of code
+ * that is not about a table at all.  Those end the call (C10-02).
+ */
+static bool
+kc_check_error_is_about_table(int sqlerrcode)
+{
+	int			cat = ERRCODE_TO_CATEGORY(sqlerrcode);
+
+	return cat == ERRCODE_TO_CATEGORY(ERRCODE_INTERNAL_ERROR) ||	/* XX: corrupt data and index, internal */
+		cat == ERRCODE_TO_CATEGORY(ERRCODE_IO_ERROR) ||	/* 58: I/O error, file missing */
+		cat == ERRCODE_TO_CATEGORY(ERRCODE_DATA_EXCEPTION) ||	/* 22 */
+		sqlerrcode == ERRCODE_FEATURE_NOT_SUPPORTED;
 }
 
 /*
@@ -770,27 +865,26 @@ kc_check_guarded(Oid relid, bool fix, KcCheckSink *sink)
 		RollbackAndReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(oldcxt);
 		CurrentResourceOwner = oldowner;
+		if (!kc_check_error_is_about_table(ed->sqlerrcode))
+			ReThrowError(ed);
 		kc_check_row(sink, "unreadable", relid, ed->message);
+		FreeErrorData(ed);
 	}
 	PG_END_TRY();
 }
 
-/*
- * columnar_check(fix): the stripe catalog against the files.  Reports rows of
- * files no relation uses (fix deletes them), stripes that run past the end of
- * their file (fix deletes the catalog row: the data is unreadable), and
- * stripes whose first page does not belong to them (reported only).
- */
-static void
-kc_check_run(bool fix, KcCheckSink *sink)
+/* The oids of the columnar tables and materialized views, as pg_class lists them now. */
+static List *
+kc_check_list_tables(void)
 {
 	Relation	pgclass;
 	TableScanDesc scan;
 	HeapTuple	tup;
 	List	   *relids = NIL;
-	ListCell   *lc;
 	Oid			amoid = kc_am_oid();
 
+	/* a catalog snapshot of this moment, not one kept from an earlier statement */
+	InvalidateCatalogSnapshot();
 	pgclass = table_open(RelationRelationId, AccessShareLock);
 	scan = table_beginscan_catalog(pgclass, 0, NULL);
 	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
@@ -803,11 +897,52 @@ kc_check_run(bool fix, KcCheckSink *sink)
 	}
 	table_endscan(scan);
 	table_close(pgclass, AccessShareLock);
+	return relids;
+}
 
+/*
+ * columnar_check(fix): the stripe catalog against the files.  Reports rows of
+ * files no relation uses (fix deletes them), stripes that run past the end of
+ * their file (fix deletes the catalog row: the data is unreadable), and
+ * stripes whose first page does not belong to them (reported only).
+ *
+ * Every lock it takes is taken without waiting (kc_catalog_lock_nowait for the
+ * relations it reads itself, ConditionalLockRelationOid for each table), and
+ * what cannot be locked is a not_checked row.  The list of tables is made first
+ * and again at the end: a table that appears in the second list only was made
+ * during the call and was not looked at, which is a not_checked row, never a
+ * clean result (C10-01).
+ */
+static void
+kc_check_run(bool fix, KcCheckSink *sink)
+{
+	KcCatLocks	locks;
+	List	   *relids;
+	List	   *later;
+	ListCell   *lc;
+
+	if (!kc_catalog_lock_nowait(&locks, fix ? RowExclusiveLock : AccessShareLock))
+	{
+		kc_check_row(sink, "not_checked", InvalidOid,
+					 "pg_class or the stripe catalog (its index or its TOAST table) is locked by another transaction (a prepared one, or an administrator's LOCK TABLE, REINDEX or VACUUM FULL); no table was checked, and this is not a clean result: end or wait for that transaction and run the check again");
+		return;
+	}
+
+	relids = kc_check_list_tables();
 	foreach(lc, relids)
 	{
 		kc_check_guarded(lfirst_oid(lc), fix, sink);
 	}
+
+	later = kc_check_list_tables();
+	foreach(lc, later)
+	{
+		if (!list_member_oid(relids, lfirst_oid(lc)))
+			kc_check_row(sink, "not_checked", lfirst_oid(lc),
+						 "the table was made during the call and was not checked; this is not a clean result: run the check again");
+	}
+	list_free(later);
+	list_free(relids);
 
 	{
 		int			d;
@@ -825,6 +960,7 @@ kc_check_run(bool fix, KcCheckSink *sink)
 			kc_check_row(sink, "orphan_catalog_rows", InvalidOid, detail);
 		}
 	}
+	kc_catalog_unlock(&locks);
 }
 
 /*

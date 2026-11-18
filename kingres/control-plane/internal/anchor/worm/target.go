@@ -102,6 +102,9 @@ const (
 	hdrRetain  = "X-Amz-Object-Lock-Retain-Until-Date"
 	hdrVersion = "X-Amz-Version-Id"
 	hdrSum     = "X-Amz-Checksum-Sha256"
+	// hdrAttempt is the user metadata that every put of Submit sets: the clock of
+	// this server at the start of the call that wrote the version (correction 89).
+	hdrAttempt = "X-Amz-Meta-Kingres-Attempt"
 )
 
 func sum64(b []byte) string {
@@ -109,7 +112,7 @@ func sum64(b []byte) string {
 	return base64.StdEncoding.EncodeToString(s[:])
 }
 
-func (t *Target) put(ctx context.Context, key string, body []byte, retain time.Time, ifNoneMatch, lock bool) (*response, error) {
+func (t *Target) put(ctx context.Context, key string, body []byte, retain time.Time, ifNoneMatch, lock bool, attempt time.Time) (*response, error) {
 	req, err := t.s.request(ctx, http.MethodPut, key, "", body)
 	if err != nil {
 		return nil, anchor.Errorf(anchor.ClassPermanent, anchor.KindWORM, "put", "request", "request could not be built")
@@ -122,6 +125,9 @@ func (t *Target) put(ctx context.Context, key string, body []byte, retain time.T
 	if lock {
 		req.Header.Set("X-Amz-Object-Lock-Mode", t.s.cfg.lockMode())
 		req.Header.Set("X-Amz-Object-Lock-Retain-Until-Date", anchor.FormatTime(retain))
+	}
+	if !attempt.IsZero() {
+		req.Header.Set(hdrAttempt, anchor.FormatTime(attempt))
 	}
 	return t.s.do(ctx, "put", req, body, MaxErrorBody)
 }
@@ -213,7 +219,7 @@ func (t *Target) Test(ctx context.Context) anchor.TestResult {
 		return res
 	}
 	key := cfg.KeyPrefix + "/_probe/" + hex.EncodeToString(rb[:])
-	r, err := t.put(ctx, key, []byte{}, time.Time{}, true, false)
+	r, err := t.put(ctx, key, []byte{}, time.Time{}, true, false, time.Time{})
 	switch {
 	case err != nil:
 		res.Add("probe-put", anchor.CheckFailed, "%s", err.Error())
@@ -238,7 +244,7 @@ func (t *Target) Test(ctx context.Context) anchor.TestResult {
 	} else {
 		res.Add("probe-head", anchor.CheckOK, "the probe object can be read back")
 	}
-	r2, err := t.put(ctx, key, []byte{}, time.Time{}, true, false)
+	r2, err := t.put(ctx, key, []byte{}, time.Time{}, true, false, time.Time{})
 	switch {
 	case err != nil:
 		res.Add("if-none-match", anchor.CheckWarning, "second probe write failed: %s", err.Error())

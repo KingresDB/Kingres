@@ -41,7 +41,7 @@ func TestIndependentVerifierOfStoredEvidence(t *testing.T) {
 		t.Fatalf("%+v", file)
 	}
 	// 1. the note: its text hashes to payload_sha256 (the digest the token must stamp)
-	p, err := anchor.NewPayload("ab12", ownNote())
+	p, err := anchor.ParsePayload("ab12", ownNote())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +57,7 @@ func TestIndependentVerifierOfStoredEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	info, err := tsa.VerifyEvidence(ev, p.Digest, roots, inter)
+	info, err := tsa.VerifyEvidence(ev, p.Digest, nil, roots, inter)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,23 +70,23 @@ func TestIndependentVerifierOfStoredEvidence(t *testing.T) {
 		t.Errorf("created_at %s, genTime %s", file.CreatedAt, info.GenTime)
 	}
 	// and it stays valid long after: the certificate is judged at genTime
-	if _, err := tsa.VerifyStoredToken(mustToken(t, ev), p.Digest, roots, inter); err != nil {
+	if _, err := tsa.VerifyStoredToken(mustToken(t, ev), p.Digest, nil, roots, inter); err != nil {
 		t.Fatal(err)
 	}
 	// a different digest is not stamped by this token
 	other := p.Digest
 	other[0] ^= 1
-	if _, err := tsa.VerifyEvidence(ev, other, roots, inter); err == nil {
+	if _, err := tsa.VerifyEvidence(ev, other, nil, roots, inter); err == nil {
 		t.Fatal("the token verified for another digest")
 	}
 	// the auditor's roots decide: an empty pool trusts nothing
-	if _, err := tsa.VerifyEvidence(ev, p.Digest, emptyPool(t), inter); err == nil {
+	if _, err := tsa.VerifyEvidence(ev, p.Digest, nil, emptyPool(t), inter); err == nil {
 		t.Fatal("verified against no roots")
 	}
 	// a copy in the evidence that differs from the token is refused
 	bad := ev
 	bad.Serial = "1"
-	if _, err := tsa.VerifyEvidence(bad, p.Digest, roots, inter); err == nil {
+	if _, err := tsa.VerifyEvidence(bad, p.Digest, nil, roots, inter); err == nil {
 		t.Fatal("a wrong serial in the evidence accepted")
 	}
 }
