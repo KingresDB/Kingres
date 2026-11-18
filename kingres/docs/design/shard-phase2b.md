@@ -2671,3 +2671,68 @@ are compiled on both majors and first used by later steps.
   can reuse. The batch sender of step 3 and the drain of a fragment must
   register with the pending protocol, and a batch that writes must go through
   `kingres_shard_begin_write_xact` and `kingres_shard_note_remote_write`.
+
+### Step 2 (the placement check, pruning, the local part, reads with a local table)
+
+Where the code differs from sections 4, 5.1, 6.5 and 17:
+
+- **Fault points keep the names `scan_*`.** The `frag_*` names belong to the
+  fragment scan of step 6. The 2a scan has no counterpart for
+  `frag_local_open` and `frag_first_fetch`: its local part is a child path of
+  the planner and not an SPI cursor.
+- **Pruning has files of its own**, `prune.c` and `prune.h`, which the file
+  list of step 2 omits; later steps share them. `bucket_move.c` is not
+  touched, `kingres_shard_ensure_fresh_partitions` is only called.
+- **A pruned group needs no probe and no connection.** Two regression
+  expectations changed for it: `bucket_lookup` shows "Remote groups: 0 of 1
+  (pruned by id)", and in `routing_decisions` reads through an SQL function
+  and a view on a local key, against a node that cannot be reached, answer
+  where they failed with "could not connect".
+- **The version in the probe** is compared with the version compiled into the
+  library (`KINGRES_SHARD_EXT_VERSION`), as the error reports already do, and
+  not with a read of `pg_extension` on the origin. A node of another version
+  is an ordinary error (`55000`) that names both versions, not `KS001`.
+- **The origin is recomputed from the catalog** (`placement_hash_now`) after
+  the cursors are declared. The 2a scan compared the cache with itself. The
+  check of the plan number (4.3 step 1) therefore only fails earlier: no test
+  tells it from its absence, and a stale cached plan cannot be made on
+  purpose.
+- **The nonce** is 64 bits from `pg_strong_random`, written as a comment
+  prefix of the SPI text of the local part and held only while that call
+  runs. The planner looks for it after the analysis and after the loop that
+  refreshes the partitions, before the branch of a write to a reference
+  table; the branch of referential-integrity actions stays first with its own
+  loop. A test shows that a forged comment does not make a statement local;
+  nothing can inject a nested statement with the same text while the local
+  part runs, so the ordering against a change of the partition list between
+  the two plannings is argued from the source order and not tested.
+- **The window after the cursors are declared** cannot be played with a real
+  move: the cursors hold the parent in ACCESS SHARE and the detach waits for
+  it (10.2). It stays covered by the fault points of `t/031`; the windows
+  after the first probe are tested with a real move.
+- **`type_ok` already excluded `money`** (the notes of step 1); step 2 added
+  only the tests at the level of the scan.
+- **Test files** are `t/105_fragment_foundation.pl` (the parts B to F that
+  the design calls `055`) and `t/106_scan_failover.pl`, because the numbers 055
+  to 069 were taken.
+
+### What step 3 will find changed
+
+- `placement_check.c` holds the plan number, the probes, the check of the
+  origin, the rule of one node of a group per transaction
+  (`kingres_shard_group_rule`) and `kingres_shard_fragment_error`. The batch
+  sender and the row router call the group rule before they use a connection
+  and send every error of a node through `kingres_shard_fragment_error`. The
+  group rule is skipped inside a control call.
+- A probe takes the relation ids of its tables and sorts them by OID.
+- `kingres_shard_in_fanout_local` is gone. The local part of the router's SPI
+  source is planned as a statement of the top level and needs no nonce; a
+  batch that wants to be recognised as a local part uses the prefix of
+  `fanout.c` (`KS_LOCAL_PART_PREFIX`, private to that file today).
+- `prune.c` gives `kingres_shard_prune_terms` and `kingres_shard_prune_groups`
+  to the fragment scan of step 6.
+- The line of the scan in EXPLAIN has the pruned form when a group was left
+  out.
+- The fix round for the fifth review of the call sequences (S13) changes
+  `node_conn.c` after this step: `RELEASE SAVEPOINT`, `ROLLBACK TO` and the
+  `COMMIT` of a session that carried the work of a control call are bounded.
