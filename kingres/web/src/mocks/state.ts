@@ -110,6 +110,11 @@ export const mockConfig = {
   rebalanceRefuse: null as string | null,
   rebalanceFail: false,
   rebalanceSlow: false,
+  /**
+   * 0.10.0: `?failover=dataloss` makes the plan of every hard failover say that writes may be lost (verdict `possible`):
+   * the request is refused with 409 `failover_needs_decision` until it says `allowDataLoss`.
+   */
+  failoverDataLoss: false,
   /** 0.8.0: the source commit the server reports in GET /setup/state: a hex id, null (the build does not know it) or text that is not a hex id. */
   commit: '0123456789abcdef0123456789abcdef01234567' as string | null,
   /**
@@ -160,7 +165,7 @@ interface ServerRec {
   silentSince?: number | null
 }
 
-interface GroupRec {
+export interface GroupRec {
   id: number
   isMapGroup: boolean
   preferredPrimaryServerId: string
@@ -268,6 +273,8 @@ export interface MockState {
     fractionAtStop: number
     reports: S['RebalanceReport'][]
   }
+  /** 0.10.0: the reports of failover runs, newest first (a report has the identifier of its task). */
+  failover: { reports: S['FailoverReport'][] }
   ledger: {
     digests: LedgerDigest[]
     verifications: LedgerVerification[]
@@ -803,6 +810,7 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
       clock: { maxDifferenceMs: 1000 },
       restart: { required: false, serverIds: [] },
     },
+    failover: { reports: [] },
     rebalance: {
       needed: false,
       reasons: [],

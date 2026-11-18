@@ -23,6 +23,8 @@
 //                                 version_mismatch, failover_in_progress, no_receiving_server, operation_in_progress ...).
 //   ?rebalance=fail               0.9.0: the next run ends failed: one bucket is given up after three attempts.
 //   ?rebalance=slow               0.9.0: moves take about three times as long (time to stop one in the middle).
+//   ?failover=dataloss            0.10.0: the plan of a hard failover says writes may be lost: the request is refused with 409
+//                                 failover_needs_decision until it says allowDataLoss (a dry run shows the plan).
 //   ?clock=off:<server>:<ms>      the clock of that server is that many milliseconds ahead (negative: behind).
 //   ?clock=unreachable:<server>   the clock of that server cannot be read.
 import type { MockState } from './state'
@@ -85,6 +87,7 @@ export function applySwitches(params: URLSearchParams, s: MockState): void {
     if (entry === 'fail') mockConfig.rebalanceFail = true
     if (entry === 'slow') mockConfig.rebalanceSlow = true
   }
+  if (params.get('failover') === 'dataloss') mockConfig.failoverDataLoss = true
   for (const entry of (params.get('clock') ?? '').split(',')) {
     const off = /^off:([^:]+):(-?\d+(?:\.\d+)?)$/.exec(entry)
     if (off) setClockOffset(s, off[1] as string, Number(off[2]))

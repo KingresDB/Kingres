@@ -198,6 +198,13 @@ export const ALERT_KIND_LABEL: Record<AlertKind, string> = {
   groupWithoutSynchronousStandby: 'Commits no longer wait for a standby',
   groupUnderReplicated: 'Shard group has too few standbys',
   clockDifference: 'Server clock differs from the leader',
+  failoverNeedsDecision: 'A failover waits for a decision',
+  failoverBlocked: 'A failover is blocked',
+  failoverDataLoss: 'A failover may have lost data',
+  splitPromotion: 'A shard group was promoted on more than one server',
+  oldPrimaryRunning: 'The old primary is running again',
+  oldPrimaryNotStopped: 'The old primary could not be stopped',
+  oldPrimaryNotRebuilt: 'The old primary was not rebuilt as a standby',
 }
 
 /** The label of an alert kind; a kind from a newer server is shown as sent (through SafeName). */
@@ -333,6 +340,11 @@ export const AUDIT_ACTION_LABEL: Record<AuditAction, string> = {
   applyConfigChange: 'Change PostgreSQL parameters',
   revertConfigChange: 'Revert a configuration change',
   restartPendingInstances: 'Restart instances that wait for a restart',
+  resetAutoFailoverCounter: 'Reset the counter of automatic failovers',
+  failoverGroupStarted: 'Failover of a shard group started',
+  failoverGroupPromoted: 'A standby was promoted to primary',
+  failoverGroupFailed: 'Failover of a shard group failed',
+  oldPrimaryRebuilt: 'Old primary rebuilt as a standby',
 }
 
 /** The words for an audit action; an action from a newer server is shown as sent. */

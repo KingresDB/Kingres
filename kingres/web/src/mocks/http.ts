@@ -36,6 +36,7 @@ export function resetMockState(options: { uninitialized?: boolean } = {}): MockS
   mockConfig.workbenchBusy = false
   mockConfig.leaderLost = false
   mockConfig.leaseAbsent = false
+  mockConfig.failoverDataLoss = false
   mockConfig.clientEntryPoint = false
   mockConfig.suspectMs = 5000
   mockConfig.failureMs = 10000
@@ -91,6 +92,8 @@ const STATUS: Record<ProblemCode, number> = {
   version_mismatch: 409,
   failover_in_progress: 409,
   group_degraded: 409,
+  failover_needs_decision: 409,
+  lease_settings_differ: 409,
   insufficient_disk: 409,
   no_receiving_server: 409,
   unprocessable: 422,
