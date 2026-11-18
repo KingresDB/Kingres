@@ -31,7 +31,9 @@ func fdCount(t *testing.T) int {
 func TestStateRunsLeaveNoDescriptorOpen(t *testing.T) {
 	for _, collect := range []bool{true, false} {
 		x := newExitEnv(t)
+		th := newThief(t)
 		run1 := func() {
+			walkWeakEvidenceRuns(t, th)
 			st := filepath.Join(testdir.New(t), "state")
 			if code, out, errs := run(t, x.cp("--state", st, "--note", x.oldN)...); code != 0 {
 				t.Fatalf("%d %s %s", code, out, errs)

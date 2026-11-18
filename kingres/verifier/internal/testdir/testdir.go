@@ -11,6 +11,13 @@
 // the directory with a retry of at least 10 seconds on Windows and with one plain
 // removal elsewhere, and a directory that cannot be removed is still an error of
 // the test.
+//
+// The cleanup of a test is not a leak detector (L18-05). On Windows a test that
+// opens a file in its directory and drops the reference can still pass its cleanup,
+// because the runtime's finalizer may close the handle before the removal is tried
+// (when other goroutines allocate), and on Linux a removal does not fail for an open
+// file at all. A descriptor or handle that a run leaves open is for the handle tests
+// of the cli package to find: they count them with the collector off.
 package testdir
 
 import (

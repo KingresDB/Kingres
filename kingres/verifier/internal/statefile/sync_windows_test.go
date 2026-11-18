@@ -65,6 +65,9 @@ func TestRenameWaitsForAProgramThatHoldsTheStateAndGivesUp(t *testing.T) {
 			t.Errorf("the error does not say %q: %v", want, err)
 		}
 	}
+	if strings.Contains(err.Error(), "sharing delete") {
+		t.Errorf("the error claims to know how the other program opened the file (L18-03): %v", err)
+	}
 	if readState(t, p) != "old\n" || len(tmpFiles(t, dir)) != 0 {
 		t.Errorf("the state or the directory changed: %q %v", readState(t, p), tmpFiles(t, dir))
 	}
@@ -161,7 +164,7 @@ func TestRenameErrorCodes(t *testing.T) {
 	}
 	err = rename(src, dstDir)
 	t.Logf("target is a directory: %v (code %d)", err, errnoOf(err))
-	if err == nil || errnoOf(err) != errAccessDenied || !strings.Contains(err.Error(), "is a directory") {
+	if err == nil || errnoOf(err) != errAccessDenied || !strings.Contains(err.Error(), "is a directory") || strings.Contains(err.Error(), "attribute") || !strings.Contains(err.Error(), "move or remove the directory") {
 		t.Errorf("directory target: %v", err)
 	}
 	// 3. the target is open in another program without sharing delete: access denied

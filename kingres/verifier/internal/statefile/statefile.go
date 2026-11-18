@@ -171,6 +171,18 @@ func isTempName(n string) bool {
 	return true
 }
 
+// CheckName refuses a state whose name is one that this program gives to its own
+// temporary files (L18-01). A run of any state in the same directory removes such
+// files as the leftovers of a crash, so a state kept under that name could be
+// deleted by the run of another state beside it; refusing it up front, whatever
+// the directory holds, is the only answer that cannot surprise an auditor.
+func CheckName(path string) error {
+	if base := filepath.Base(path); isTempName(base) {
+		return fmt.Errorf("the name %s is one this program gives to its own temporary files (.kingres-state-<12 hex characters>-<digits>.tmp or .kingres-evidence-<12 hex characters>-<digits>.tmp), and a run removes such files from the directory as the leftovers of a crash, so a state kept under it could be deleted: give the state another name; nothing was changed", base)
+	}
+	return nil
+}
+
 // RemoveLeftovers deletes the temporary files of this program in the directory of
 // the state that an earlier crashed run left: those of the state and of the
 // evidence files, under any name of the program (L16-04: a crash in the extension
@@ -186,8 +198,11 @@ func RemoveLeftovers(path string) {
 	if err != nil {
 		return
 	}
+	self := filepath.Base(path)
 	for _, e := range ents {
-		if !isTempName(e.Name()) {
+		// Never the file the run was told to use, whatever its name (L18-01); CheckName
+		// refuses such a state before a run gets here, this is the second line.
+		if !isTempName(e.Name()) || e.Name() == self || e.Name() == filepath.Base(lockName(path)) {
 			continue
 		}
 		full := filepath.Join(dir, e.Name())
@@ -522,6 +537,11 @@ func createEvidenceInPlace(p string, data []byte) error {
 	if err = writeAndSync(f, data); err != nil {
 		_ = os.Remove(p)
 		return err
+	}
+	// The file is in place: the directory is flushed and a failure is reported as
+	// the other paths do (L18-07).
+	if serr := ops.SyncDir(filepath.Dir(p)); serr != nil {
+		return &DirSyncError{serr}
 	}
 	return nil
 }

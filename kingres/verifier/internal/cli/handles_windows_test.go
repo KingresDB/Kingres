@@ -49,7 +49,9 @@ func TestStateRunsLeaveNoHandleOpenWithTheCollectorOff(t *testing.T) {
 
 func stateRunsLeaveNoHandleOpen(t *testing.T, collect bool) {
 	x := newExitEnv(t)
+	th := newThief(t)
 	run1 := func() {
+		walkWeakEvidenceRuns(t, th) // L18-04: the weak path, the evidence merge, a leftover
 		st := filepath.Join(testdir.New(t), "state")
 		if code, out, errs := run(t, x.cp("--state", st, "--note", x.oldN)...); code != 0 {
 			t.Fatalf("%d %s %s", code, out, errs)
@@ -80,7 +82,12 @@ func stateRunsLeaveNoHandleOpen(t *testing.T, collect bool) {
 		}
 		return handleCount(t)
 	}
-	run1() // the first run warms up what the runtime keeps
+	// The first runs warm up what the runtime keeps (its threads, which are handles: the
+	// longer walk of L18-04 makes it start more of them than one run does); a handle that
+	// each run leaves open still grows the count by one for every run of the 60.
+	for i := 0; i < 5; i++ {
+		run1()
+	}
 	before := settled()
 	for i := 0; i < 60; i++ {
 		run1()

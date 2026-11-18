@@ -475,7 +475,11 @@ evidence file leaves a file named after that evidence file, which no run of the 
 (L16-04). What is removed must be a regular file whose name is exactly one this program makes
 (`.kingres-state-` or `.kingres-evidence-`, 12 hex characters, a dash, a decimal number, `.tmp`) and, where the
 system says who owns it, one of the user running the command; a link, a directory or any other file with
-such a name, and everything else in the directory, is left alone (`TestRemoveLeftoversRemovesEveryTemporaryFileOfTheProgramAndNothingElse`,
+such a name, and everything else in the directory, is left alone. A state that is itself named like that is refused at
+the start, with status 2 and `give the state another name; nothing was changed` (L18-01), before anything is read: a
+run of any state in the same directory would remove it as a leftover, and refusing it is the one answer that cannot
+surprise an auditor (`TestStateNamedLikeATemporaryFileIsRefusedAndNeverRead`; the cleanup also never removes the file
+the run was told to use, `TestRemoveLeftoversNeverRemovesTheFileTheRunWasToldToUse`) (`TestRemoveLeftoversRemovesEveryTemporaryFileOfTheProgramAndNothingElse`,
 `TestRunRemovesTheTemporaryFilesOfTheProgramAndNothingElse`, `TestCrashInTheExtensionOfAnEvidenceFileLeavesAFileTheNextRunRemoves`).
 A stop after each step of the replace is tested on both platforms. Old state files that are a plain signed note are still read.
 
@@ -698,17 +702,20 @@ microseconds, and a state that matters must not be written by a program that ign
 What `MoveFileEx` answers was measured on Windows 11 (`TestRenameErrorCodes`; its documentation lists no error
 codes, and the documentation of `ReplaceFile` names others that this call does not return): a target with the
 read-only attribute and a directory at the name both give `ERROR_ACCESS_DENIED` (5) for ever; a target that
-another program holds open without sharing delete gives 5 as well, and ends when the program lets go; a source
+another program holds open gives 5 as well, whether that program shares delete or not (L18-03), and ends when the program lets go; a source
 that is open exclusively gives `ERROR_SHARING_VIOLATION` (32). Code 5 alone cannot tell a handle from a refusal
 that lasts, so what the file itself shows is looked at first (L16-06): a read-only attribute or a directory at the
 name is named at once, with status 2 and no wait (`the file is read-only (the read-only attribute is set), so it
-cannot be replaced: clear the attribute or name another file; nothing was changed`,
+cannot be replaced: clear the attribute or name another file; nothing was changed`, and for a directory `the name is a
+directory, so a file cannot be put there: move or remove the directory, or name another file; nothing was changed`,
 `TestRenameOfAReadOnlyStateIsNamedAtOnce`, which sets a wait of 5 seconds that must not be spent). What is left of
 codes 5, 32 and 33 (`ERROR_LOCK_VIOLATION`), which is what another program's open handle gives (a backup, a
 scanner, a viewer), is tried again every 20 ms for 3 seconds (L14-05), and then ends the run with status 2 and
-the message `another program may have the file open without sharing delete ...: close it and run again, nothing
-was changed`, after the text the system gave. A refusal that the file does not show (an access control list that
-denies the rename) is also code 5 and also waits the 3 seconds, and is then worded as an open file: the one case in
+the message `another program may have the file open (a backup, a virus scanner, an indexer, a viewer) ...: close it
+and run again, nothing was changed`, after the text the system gave. The words claim nothing about how the other
+program opened the file: any open handle of another program gives the same code 5, whether it shares delete or not.
+So code 5 is the same for an open handle of any kind and for a refusal that the file does not show (an access control
+list that denies the rename), which also waits the 3 seconds and is then worded as an open file: the one case in
 which that wording can be wrong, and the system's text comes first in the message. The state is unchanged in every case
 (`TestRenameWaitsForAProgramThatHoldsTheStateAndGivesUp`, `TestRenameSucceedsWhenTheProgramLetsGoInTime`). The earlier statement that the state "is read again under the
 lock" was true and was not enough: the read happened at the start, and the write at the end, with nothing
@@ -730,9 +737,12 @@ without a key cannot use up the names (15 subsets of 4 keys gave 8 files and 7 t
 L12-03). **Another text is never called saved**: a file with other content (another note, a file somebody
 put there, a write that was cut short) takes the next name (`-2`, `-3` and so on, 8 in all), which only a
 text that was really signed with the same size and root can reach (extension lines differ). The number of
-evidence files is bounded by the number of checkpoints that the log ever signed, one for each that is
-replayed as a rollback, and not by anything a party without a key chooses; the program does not count them,
-because a limit would be a way to force status 4. If
+evidence files for a state that counts is bounded by the history of the log: one for each checkpoint that the log ever
+signed and that is served as a rollback. A party without a key chooses which
+of those old checkpoints to replay, and so how many of the files the auditor's runs make, up to that bound; it cannot
+make a file that is not the signed text of a checkpoint of the log. Each file is a note of a few hundred bytes, and
+the runs are the auditor's own. The program does not count them and sets no limit, because a limit would be a way to
+force status 4 (a state that does not count has two files at most, see below). If
 none can be used or the disk refuses, the output says `was NOT saved`, `--json` has
 `info.state.evidence_saved` false and `conflict_file` null, the finding is printed as for a fork,
 and the status is **4**, which is not 0 and is not the 1 of the fork itself: act on the fork and
@@ -805,7 +815,7 @@ the conflicts, a missing or a wrong tile, a read-back that failed, a state that 
 write and a success; a run that stops before it has read the state (the lock was not taken, the file is not a
 state, not a checkpoint of this log) has judged nothing and has no such member. When no state existed it is false.
 `consistency --old STATE` has `info.old_anchor_weak` and `info.old_anchor_weak_keys` on every exit after `--old` was
-judged (a plain note has `old_anchor_weak` false, and a size and root given by hand, which are not a held checkpoint,\nhave none). When the run itself writes the state (it extends it, or adds a
+judged (a plain note has `old_anchor_weak` false, and a size and root given by hand, which are not a held checkpoint, have none). When the run itself writes the state (it extends it, or adds a
 genuine line of a key that counts), the member says what the state is **after** the write (L16-03): `anchor_weak`
 false, `anchor_weak_repaired` true, no `anchor_weak_keys`, a note that says so, and no non-proof about the
 checkpoint the state held, because the run proved it a prefix of a checkpoint signed by a key that counts (or merged
@@ -1681,3 +1691,32 @@ make a run print less, and it cannot move or replace the state. Windows code 5 c
 by an access control list: the second waits 3 seconds and is worded as the first. The figures of the window are
 counts from one machine. The cleanup failure of the tests on Windows was not traced to a process (the Restart Manager
 named none); the tests now wait for it.
+
+## Findings of the review of the seventh fixes (L18) and what was changed
+
+The review (`kingres/docs/reviews/2026-11-18-kingres-verifier-seventh-fixes.md`) found one code defect, wording and test
+gaps. This round changes no verdict and no exit status.
+
+| Finding | What was changed | Where it is described |
+|---|---|---|
+| L18-01 a state named like a temporary file of the program is removed by the cleanup and then read as a state | such a name is refused with status 2 before anything is read, and the cleanup never removes the file the run was told to use | "The state file" |
+| L18-02 a literal backslash-n in a sentence about `consistency --old` | the text | "`checkpoint`, `consistency`, `trust`" |
+| L18-03 (Windows) the message says the other program does not share delete | it says another program may have the file open; a directory at the name has its own words; the stated limit names every open handle | "A write never moves the state over one it did not read" |
+| L18-04 the handle tests do not walk the weak path, the evidence merge or the removal of a leftover | both handle tests walk them, with the collector off | tests |
+| L18-05 the cleanup of a test is not a leak detector | said in the package comment of `internal/testdir` | tests |
+| L18-06 the bound on the strong evidence files is the log's history, chosen by a party without a key | worded as it is | "The evidence of a fork" |
+| L18-07 the fallback for a file system that cannot link does not flush the directory | it flushes and reports a failed flush as the other paths do | "The evidence of a fork" |
+
+**Interface changes a caller can see.**
+
+- `checkpoint --state FILE` where the name of FILE (after links are resolved) is one the program gives to its own
+  temporary files (`.kingres-state-<12 hex>-<digits>.tmp` or `.kingres-evidence-<12 hex>-<digits>.tmp`) ends with
+  status 2 and a message that says to give the state another name; nothing is read, removed or written. Before, such a
+  state was deleted by the cleanup of leftovers before it was read.
+- On Windows the message of a rename that is refused for the whole wait says `another program may have the file open (a
+  backup, a virus scanner, an indexer, a viewer)`, without `without sharing delete`; a directory at the name is
+  refused with `the name is a directory, so a file cannot be put there: move or remove the directory, or name another
+  file`.
+- On a file system that cannot make a hard link, an evidence file created in place is followed by a flush of the
+  directory; a failed flush gives the same notes, statuses and `evidence_flushed` false as on the other paths.
+- No new flag, no new JSON member, no new exit status.

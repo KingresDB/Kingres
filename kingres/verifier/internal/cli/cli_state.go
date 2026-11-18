@@ -268,6 +268,10 @@ func (e *env) applyState(r *result, in *logInputs, cp *checkpoint.Checkpoint, se
 		return e.inputErrorInfo(r.cmd, asJSON, err, info), true
 	}
 	path, err := statefile.Resolve(statePath)
+	if err == nil {
+		// a name the program gives its own temporary files is refused (L18-01)
+		err = statefile.CheckName(path)
+	}
 	if err != nil {
 		return fail(fmt.Errorf("--state %s: %w", statePath, err))
 	}
