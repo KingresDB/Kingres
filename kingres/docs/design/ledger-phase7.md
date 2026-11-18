@@ -2422,6 +2422,83 @@ build to the corrected rule. The verifier's README has the same list with the re
     of three seconds; the wait stays for the error codes that an open handle of another program
     produces, which an access control list that denies the rename shares, so in that one case the
     message names another program wrongly after the system's own text.
+88. **Retry from expired, and what ends a claimed record (6.6; adds to 64, replaces the last sentence
+    but one of 82).** An anchor record in the state `expired` takes the operator's Retry as a `failed`
+    one does: it becomes `pending`, due at once, with its counters and its error cleared and its creation
+    time set to the time of the Retry, so that its waiting period starts again. A claimed record ends at
+    the first of two limits: its own timeout (four times that of a submitted record, from creation), and
+    the limits on failures when its calendars all fail (200 attempts or 7 days of failure by default);
+    with the defaults the second ends it first.
+89. **WORM: the time of the store and the start of the first submit (6.3; replaces 81 from "A payload
+    carries" to "to do.", and its closing sentences).** The time a payload carries is the start of the
+    first Submit call for the key, which the caller makes durable before that call and never changes; a
+    Retry keeps it, and a new start needs a new key. Every put also writes that call's own start into the
+    user metadata of the object. A version written by the call must be within the tolerance of the
+    clock. A version found by a later call must not be earlier than the start of the first Submit less
+    the tolerance nor later than the clock plus the tolerance; when it carries the start of the call that
+    wrote it, the window is narrowed to that start less the tolerance up to that start plus the timeout
+    of a call plus the tolerance. For a version the library wrote, the time the evidence vouches for is
+    therefore never further from the true time of the write than the tolerance plus the duration of one
+    Submit call, whatever the age of the record, the attempts, the Retries or the crashes. For a version
+    found without that metadata the time is only known to lie between the start of the first Submit less
+    the tolerance and the clock plus the tolerance, and the evidence says so (`submit_start`, `found`).
+    The retention floor of a found version is its own time plus the configured days less the
+    tolerances, never a time the caller states. A found version in COMPLIANCE mode is accepted where
+    GOVERNANCE is configured; GOVERNANCE found where COMPLIANCE is configured is refused. A store ahead
+    of the clock stays refused when the clock has caught up with the object. The cluster should have a
+    bucket that nobody else writes: a party that can write it can make a key end in a conflict.
+90. **A contradicted claim is kept aside (6.5; replaces "A claim that a block header contradicts is
+    dropped" of 82; adds to 60).** A block header that contradicts a claim of a calendar does not drop it
+    on that one answer. The claim stays in its fragment, is recorded in the evidence with the header and
+    the time, is neither plausible nor anchored, and its calendar keeps being asked (a target with a
+    source of headers keeps the pending attestation of a merged answer for that). It is dropped for good
+    only when the source contradicts it again in a round at least `contradictionConfirmMinutes` (60 by
+    default) after the first; a header that confirms it later puts it back. The receipt returns the
+    numbers of contradicted, aside and dropped claims so that the caller can alert. At most 32 claims
+    are kept aside in one evidence. `Upgrade` has a bound of its own (five minutes by default) beside the
+    caller's.
+91. **The work of a header (6.5; replaces the plain check of the proof of work of 60).**
+    `header_checked` means a header whose hash meets its own target, whose target is no easier than a
+    sixteenth of the difficulty of the nearest real header of the embedded table at or below the height
+    of the claim (the factor is an option), whose merkle root is the message of the claim and whose
+    time fits. It shows that this much work was spent on that header; it does not show that the header
+    is in the best chain, which the auditor checks against a node of their own. The work of the accepted
+    header is reported.
+92. **One set of rules for a payload, and a narrow comparison of names (6.8, 6.4; replaces 83 and the
+    name rule of 84).** A payload is parsed by the rules of the verifier for the signed note and the
+    checkpoint (the name rule, at least the four bytes of a key id, strict canonical base64, no two lines
+    with the same name and key id, the root of the empty tree for size 0, up to 16 extension lines); the
+    library is stricter on purpose only for the byte 0x7f and for a note over 16 KiB, and a corpus of
+    notes with the verdict of each side is in its tests. The name of a time-stamp token is compared with
+    a narrow profile: a value that is not valid in its string type matches nothing, only ASCII letters
+    are folded and only ASCII space is collapsed, and a TeletexString that is not ASCII is compared by
+    its bytes. An operator who means one authority pins it by the SHA-256 of the public key of the
+    signer; a token under another key is then refused.
+93. **Keys: what the set refuses (3; adds to 14 and 47).** A maximum tree size of a retired key is 1
+    to 2^62-1, the range the verifier reads; `Retire` takes either such a size or an explicit
+    "unbounded", never a bare zero, and unbounded means that a retired key that leaks can sign any
+    larger tree until it is revoked. `Retire` and `Revoke` need another key that is in force at that
+    moment and leave no stale end of an overlap. Asking for the signers of a set in which nothing may
+    sign is an error, and a set that has been in service and holds no active key is refused when it is
+    loaded (a new set whose keys all wait for their first activation is legal). Two different keys with
+    the same 32-bit key id under one origin cannot both sign a checkpoint: the verifier refuses a note
+    with two such lines, and every checkpoint of the origin while its trust file lists both, so the
+    collision is looked for before a key is activated and reported with both fingerprints. A set that
+    is full (16 keys) needs a new generation of the trust file under a new origin prefix. The plain key
+    file is read and written from memory that is zeroed; the documentation of the package names where a
+    secret cannot be.
+94. **Logs: what the store and the reader guarantee (4.4, 4.5; adds to 48).** A reader checks the
+    length of every tile it is handed, so a store that lies gives an error. A tile is published by a
+    hard link only: where one cannot be made the put fails with an error that says the publication
+    directory needs a file system with hard links, and nothing is ever renamed over a tile. A put
+    flushes the file, its directory, and the parent of every directory it created, up to the root of
+    the store. A checkpoint whose rename another program blocks on Windows is retried for a time the
+    store sets (three seconds by default) and then fails with an error that says a retry may succeed,
+    with the old checkpoint whole. The text of a checkpoint is refused when writing whenever it would be
+    refused when reading. A request for the tiles of a size above 2^28 is refused, and files are read
+    with a limit and with a check that the file opened is the file examined. Signing a stored
+    checkpoint again takes the keys the caller trusts and adds no line to a note none of whose lines
+    verifies.
 
 Of section 13: item 2 (test vectors) is settled for signed notes (the example key and note of the
 specification are in the tests; the checkpoint example has no published key), item 3 (entry bundles at
