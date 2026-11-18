@@ -50,9 +50,17 @@ import {
   tickTasks,
   topology,
   activeTask,
-  type GroupRec,
+  failoverRunning,
   type MockState,
 } from './state'
+import {
+  cancelFailover,
+  failoverPlan,
+  failoverStatusView,
+  resumeFailover,
+  restorePlan,
+  startFailoverRun,
+} from './failover'
 
 type S = components['schemas']
 
@@ -331,236 +339,6 @@ function server(s: MockState, id: string) {
   const rec = s.servers.find((x) => x.id === id)
   if (!rec) throw problem('not_found', `Server ${id} does not exist.`)
   return rec
-}
-
-// --- failover (contract 0.10.0) ---------------------------------------------------------------------
-
-const FAILOVER_STEPS = [
-  'Freeze the group',
-  'Stop the old primary',
-  'Wait for the old lease',
-  'Choose the standby',
-  'Hand the lease to the new server',
-  'Promote the standby',
-  'Make the catalog follow',
-  'Lift the freeze',
-]
-
-function candidatesOf(g: GroupRec, chosen: string | null): S['FailoverCandidate'][] {
-  return g.standbyServerIds.map((id) => ({
-    serverId: id,
-    standbyId: g.standbyIds?.[id] ?? 0,
-    readable: true,
-    eligible: true,
-    ineligibleReason: null,
-    receiveLsn: '0/5000000',
-    replayLsn: '0/5000000',
-    lagBytes: 0,
-    syncState: 'sync' as const,
-    chosen: id === chosen,
-  }))
-}
-
-function dataLossOf(mode: string, chosen: string | null): S['DataLossAssessment'] {
-  const possible = mockConfig.failoverDataLoss && mode === 'hard' && chosen !== null
-  return {
-    verdict: possible ? 'possible' : 'none',
-    message: possible
-      ? 'The group streamed asynchronously; the standby may miss the last writes of the old primary.'
-      : 'Every standby was read and the chosen one holds all acknowledged writes.',
-    lastKnownPrimaryLsn: '0/5000000',
-    chosenReceiveLsn: chosen === null ? null : '0/5000000',
-    lastKnownAgeSeconds: 2,
-    groupRanWithoutSynchronousStandby: possible,
-    asyncDatabases: [],
-    unreadableServerIds: [],
-  }
-}
-
-/** What a failover of `serverId` would do, for the groups the request names (default: all it is primary of). */
-function failoverPlan(
-  s: MockState,
-  serverId: string,
-  mode: S['FailoverRequest']['mode'],
-  req: S['FailoverRequest'],
-): S['FailoverPlan'] {
-  const own = s.groups.filter((g) => g.primaryServerId === serverId)
-  const wanted = req.shardGroupIds
-  for (const id of wanted ?? [])
-    if (!own.some((g) => g.id === id))
-      throw problem('unprocessable', `Server ${serverId} is not the primary of shard group ${id}.`)
-  for (const tg of req.targets ?? []) {
-    const g = own.find((x) => x.id === tg.shardGroupId)
-    if (!g || !g.standbyServerIds.includes(tg.serverId))
-      throw problem(
-        'unprocessable',
-        `Server ${tg.serverId} is not a standby of shard group ${tg.shardGroupId}.`,
-      )
-  }
-  const blockers: S['FailoverBlocker'][] = []
-  const groups = own
-    .filter((g) => !wanted || wanted.includes(g.id))
-    .sort((a, b) => Number(b.isMapGroup) - Number(a.isMapGroup) || a.id - b.id)
-    .map((g): S['FailoverGroupPlan'] => {
-      const asked = req.targets?.find((x) => x.shardGroupId === g.id)?.serverId
-      const chosen = asked ?? g.standbyServerIds[0] ?? null
-      const dataLoss = dataLossOf(mode, chosen)
-      if (chosen === null)
-        blockers.push({
-          code: 'no_replica_available',
-          shardGroupId: g.id,
-          message: `Shard group ${g.id} has no standby that is ready.`,
-        })
-      else if (dataLoss.verdict !== 'none')
-        blockers.push({
-          code: 'failoverNeedsDecision',
-          shardGroupId: g.id,
-          message: `Shard group ${g.id}: ${dataLoss.message}`,
-        })
-      return {
-        shardGroupId: g.id,
-        isMapGroup: g.isMapGroup,
-        fromServerId: serverId,
-        toServerId: chosen,
-        candidates: candidatesOf(g, chosen),
-        dataLoss,
-        estimatedSeconds: chosen === null ? null : 20,
-        writesPausedSeconds: mode === 'graceful' ? 2 : null,
-        steps: FAILOVER_STEPS,
-        movesTheManager: g.isMapGroup,
-      }
-    })
-  return {
-    generatedAt: nowIso(),
-    kind: 'failover',
-    mode,
-    serverId,
-    canProceed: blockers.length === 0,
-    blockers,
-    willStopRebalance: false,
-    groups,
-  }
-}
-
-/** What a restore of the preferred primaries would do (the groups that run away from their home server). */
-function restorePlan(s: MockState, ids?: number[]): S['FailoverPlan'] {
-  const groups = s.groups
-    .filter((g) => g.primaryServerId !== g.preferredPrimaryServerId && (!ids || ids.includes(g.id)))
-    .map((g): S['FailoverGroupPlan'] => ({
-      shardGroupId: g.id,
-      isMapGroup: g.isMapGroup,
-      fromServerId: g.primaryServerId ?? g.preferredPrimaryServerId,
-      toServerId: g.preferredPrimaryServerId,
-      candidates: candidatesOf(g, g.preferredPrimaryServerId),
-      dataLoss: dataLossOf('restore', g.preferredPrimaryServerId),
-      estimatedSeconds: 15,
-      writesPausedSeconds: 2,
-      steps: FAILOVER_STEPS,
-      movesTheManager: g.isMapGroup,
-    }))
-  return {
-    generatedAt: nowIso(),
-    kind: 'restorePreferredPrimaries',
-    mode: 'restore',
-    serverId: null,
-    canProceed: true,
-    blockers: [],
-    willStopRebalance: false,
-    groups,
-  }
-}
-
-function failoverReport(
-  id: number,
-  serverId: string,
-  mode: S['FailoverRequest']['mode'],
-  req: S['FailoverRequest'],
-  plan: S['FailoverPlan'],
-  startedAt: string,
-): S['FailoverReport'] {
-  const finishedAt = nowIso()
-  return {
-    id,
-    kind: 'failover',
-    trigger: 'manual',
-    serverId,
-    outcome: 'completed',
-    startedAt,
-    finishedAt,
-    requestedBy: 'admin',
-    totals: {
-      groupsTotal: plan.groups.length,
-      groupsDone: plan.groups.length,
-      groupsFailed: 0,
-      groupsSkipped: 0,
-      durationSeconds: 3,
-    },
-    dataLossPossible: plan.groups.some((g) => g.dataLoss.verdict !== 'none'),
-    error: null,
-    mode,
-    options: req,
-    groups: plan.groups.map((g) => ({
-      shardGroupId: g.shardGroupId,
-      outcome: 'done' as const,
-      skipReason: null,
-      fromServerId: g.fromServerId,
-      toServerId: g.toServerId,
-      termBefore: 4,
-      termAfter: 5,
-      timeline: 2,
-      leaseWaitMs: mode === 'hard' ? 10000 : null,
-      durationSeconds: 3,
-      candidates: g.candidates,
-      dataLoss: g.dataLoss,
-      unreachedServerIds: [],
-      incidents: [],
-      oldPrimary: {
-        state: 'notScheduled' as const,
-        method: null,
-        divergenceBytes: null,
-        rewindBytes: null,
-        message: null,
-      },
-      error: null,
-    })),
-    events: plan.groups.map((g) => ({
-      at: finishedAt,
-      shardGroupId: g.shardGroupId,
-      step: 'Promote the standby',
-      kind: 'promoted',
-      message: `Shard group ${g.shardGroupId} is now served by ${g.toServerId ?? 'no server'}.`,
-    })),
-  }
-}
-
-function failoverStatusView(s: MockState): S['FailoverStatus'] {
-  tickTasks(s)
-  const latest = s.failover.reports[0]
-  const lastReport = latest
-    ? (({ mode: _m, options: _o, groups: _g, events: _e, ...summary }) => summary)(latest)
-    : null
-  const run = s.tasks.find(
-    (t) =>
-      t.task.state === 'running' &&
-      (t.task.kind === 'server.failover' ||
-        t.task.kind === 'replication.restorePreferredPrimaries'),
-  )
-  if (!run) return { state: 'idle', needsDecision: [], groups: [], cancellable: false, lastReport }
-  const restoring = run.task.kind === 'replication.restorePreferredPrimaries'
-  return {
-    state: 'running',
-    phase: 'promoting',
-    kind: restoring ? 'restorePreferredPrimaries' : 'failover',
-    trigger: 'manual',
-    taskId: run.task.id,
-    serverId: restoring ? null : (run.task.subject?.id ?? null),
-    startedAt: run.task.createdAt,
-    pausedReason: null,
-    needsDecision: [],
-    groups: [],
-    cancellable: run.task.cancellable,
-    lastReport,
-  }
 }
 
 const LEADER = '10.0.0.11'
@@ -2007,64 +1785,33 @@ export function createHandlers(): HttpHandler[] {
       const plan = failoverPlan(s, rec.id, mode, req)
       // A dry run answers the plan and changes nothing (200, not a task).
       if (req.dryRun === true) return ok(plan)
+      // A task that waits for a decision is resumed by a repeat of the request that accepts the loss.
+      const waiting = s.tasks.find(
+        (t) =>
+          t.task.kind === 'server.failover' &&
+          t.task.state === 'paused' &&
+          t.task.subject?.id === String(rec.id),
+      )
+      if (waiting) {
+        if (req.allowDataLoss !== true)
+          throw problem(
+            'failover_needs_decision',
+            'The failover waits for a decision: commits that only the old primary holds can be lost.',
+          )
+        return accepted(resumeFailover(s, waiting))
+      }
       if (activeTask(s, 'server.failover', String(rec.id))) throw problem('operation_in_progress')
+      if (failoverRunning(s)) throw problem('failover_in_progress')
+      const hard = plan.blockers.find(
+        (x) => x.code !== 'failoverNeedsDecision' && x.code !== 'no_replica_available',
+      )
+      if (hard) throw problem(hard.code as Parameters<typeof problem>[0], hard.message)
       const stuck = plan.blockers.find((x) => x.code === 'no_replica_available')
       if (stuck) throw problem('no_replica_available', stuck.message)
       const decision = plan.blockers.find((x) => x.code === 'failoverNeedsDecision')
       if (decision && req.allowDataLoss !== true)
         throw problem('failover_needs_decision', decision.message)
-      const affected = s.groups.filter((g) => plan.groups.some((x) => x.shardGroupId === g.id))
-      const reportId = s.nextTaskId
-      const startedAt = nowIso()
-      const task = createTask(s, {
-        kind: 'server.failover',
-        subject: { type: 'server', id: String(rec.id) },
-        steps:
-          mode === 'graceful'
-            ? [
-                'Pause writes',
-                'Wait for standby to catch up',
-                'Promote standby',
-                'Demote old primary',
-              ]
-            : ['Promote standbys', 'Update routing'],
-        durationMs: 3000,
-        apply: () => {
-          for (const g of affected) {
-            const next = plan.groups.find((x) => x.shardGroupId === g.id)?.toServerId ?? null
-            if (next !== null) g.standbyServerIds = g.standbyServerIds.filter((x) => x !== next)
-            if (mode === 'graceful' && next !== null) g.standbyServerIds.push(rec.id)
-            else g.failedServerIds.push(rec.id)
-            g.primaryServerId = next
-          }
-          if (mode === 'hard') {
-            for (const g of s.groups) {
-              if (!affected.includes(g) && g.standbyServerIds.includes(rec.id)) {
-                g.standbyServerIds = g.standbyServerIds.filter((x) => x !== rec.id)
-                g.failedServerIds.push(rec.id)
-              }
-            }
-            rec.status = 'dead'
-            s.settings.autoFailover = {
-              ...s.settings.autoFailover,
-              eventsSinceReset: s.settings.autoFailover.eventsSinceReset + 1,
-            }
-            s.alerts.unshift({
-              id: Math.max(...s.alerts.map((a) => a.id)) + 1,
-              kind: 'serverDown',
-              severity: 'critical',
-              state: 'open',
-              title: `Server ${rec.id} was failed over`,
-              message: `Standbys of ${affected.length} shard group(s) were promoted. Restore preferred primaries after the server returns.`,
-              serverId: rec.id,
-              databaseName: null,
-              raisedAt: nowIso(),
-            })
-          }
-          s.failover.reports.unshift(failoverReport(reportId, rec.id, mode, req, plan, startedAt))
-        },
-      })
-      return accepted(task)
+      return accepted(startFailoverRun(s, { serverId: rec.id, mode, req, plan, trigger: 'manual' }))
     },
     listServerGroups: (c) =>
       ok({
@@ -2631,6 +2378,8 @@ export function createHandlers(): HttpHandler[] {
         r.pausedReason = null
         return ok(rec.task)
       }
+      // A failover stops before the promotion: its freezes are lifted and its report says cancelled (running or paused).
+      if (rec.task.kind === 'server.failover') return ok(cancelFailover(c.s, rec))
       if (rec.task.state !== 'running') throw problem('task_not_cancellable')
       rec.task.state = 'paused'
       rec.task.cancellable = false

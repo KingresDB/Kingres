@@ -15,6 +15,8 @@ import AppDialog from '@/components/AppDialog.vue'
 import TaskProgress from '@/components/TaskProgress.vue'
 import { endpoints } from '@/api/endpoints'
 import { keys, usePagedQuery } from '@/api/queries'
+import FailoverReportDialog from '@/components/FailoverReportDialog.vue'
+import { isFailoverTaskKind } from '@/lib/failover'
 import { taskKindLabel, TASK_STATE } from '@/lib/status'
 import { formatAgo } from '@/lib/format'
 import type { TaskState } from '@/api/types'
@@ -42,6 +44,10 @@ const fetched = useQuery({
   retry: false,
 })
 const open = computed(() => listed.value ?? fetched.data.value ?? null)
+// A failover or a restore of the preferred primaries has a report once it is paused or over (contract 0.10.0).
+const reportId = ref<number | null>(null)
+const hasReport = (t: { kind: string; state: string }): boolean =>
+  isFailoverTaskKind(t.kind) && ['done', 'failed', 'paused'].includes(t.state)
 </script>
 
 <template>
@@ -115,6 +121,15 @@ const open = computed(() => listed.value ?? fetched.data.value ?? null)
             <td>
               <div class="row">
                 <button type="button" class="btn btn-small" @click="openId = t.id">Details</button>
+                <button
+                  v-if="hasReport(t)"
+                  type="button"
+                  class="btn btn-small"
+                  data-testid="task-report"
+                  @click="reportId = t.id"
+                >
+                  Report
+                </button>
                 <GateButton v-if="t.cancellable" op="cancelTask" small @click="cancel.mutate(t.id)"
                   >Cancel</GateButton
                 >
@@ -138,5 +153,16 @@ const open = computed(() => listed.value ?? fetched.data.value ?? null)
     <TaskProgress v-if="open" :task="open" />
     <ProblemNotice v-else-if="fetched.error.value" :error="fetched.error.value" />
     <p v-else role="status">Loading the task ...</p>
+    <p v-if="open && hasReport(open)">
+      <button
+        type="button"
+        class="btn btn-small"
+        data-testid="detail-report"
+        @click="reportId = open.id"
+      >
+        Open the report
+      </button>
+    </p>
   </AppDialog>
+  <FailoverReportDialog v-if="reportId !== null" :report-id="reportId" @close="reportId = null" />
 </template>

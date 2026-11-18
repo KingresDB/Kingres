@@ -80,13 +80,21 @@ describe('typed confirmations for irreversible actions (W-13b, W-13c)', () => {
   })
 
   it('a hard failover needs the address typed; a graceful one does not', async () => {
+    const { mockConfig } = await import('@/mocks/state')
+    // The real server refuses a graceful failover for now; the switch lets the mock accept it.
+    mockConfig.failoverGraceful = true
     const user = userEvent.setup()
     await renderApp('/servers')
     const row = await screen.findByTestId('server-row-10.0.0.12')
     await user.click(within(row).getByRole('button', { name: /failover/i }))
     const dialog = await screen.findByRole('dialog', { name: /fail over server/i })
+    await user.click(within(dialog).getByRole('button', { name: /show the plan/i }))
+    await within(dialog).findByTestId('failover-plan')
     expect(within(dialog).getByRole('button', { name: /graceful failover/i })).toBeEnabled()
+    await user.click(within(dialog).getByRole('button', { name: /change the choice/i }))
     await user.click(within(dialog).getByRole('radio', { name: /hard/i }))
+    await user.click(within(dialog).getByRole('button', { name: /show the plan/i }))
+    await within(dialog).findByTestId('failover-plan')
     const hard = within(dialog).getByRole('button', { name: /hard failover/i })
     expect(hard).toBeDisabled()
     await user.type(within(dialog).getByLabelText(/to confirm/i), '10.0.0.12:8091')

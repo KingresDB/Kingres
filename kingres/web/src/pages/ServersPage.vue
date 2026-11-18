@@ -10,6 +10,8 @@ import QueryBoundary from '@/components/QueryBoundary.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
 import GateButton from '@/components/GateButton.vue'
 import ServerActions from '@/components/ServerActions.vue'
+import FailoverDialog from '@/components/FailoverDialog.vue'
+import FailoverProgress from '@/components/FailoverProgress.vue'
 import ServerGroupsPanel from '@/components/ServerGroupsPanel.vue'
 import NullableValue from '@/components/NullableValue.vue'
 import CertificateExpiry from '@/components/CertificateExpiry.vue'
@@ -46,6 +48,8 @@ const dialog = ref<{ kind: 'add' | 'restore' | 'failover' | 'remove'; server?: S
       >
     </template>
   </PageHeader>
+
+  <FailoverProgress />
 
   <QueryBoundary
     :loading="servers.isPending.value"
@@ -150,8 +154,9 @@ const dialog = ref<{ kind: 'add' | 'restore' | 'failover' | 'remove'; server?: S
                 <GateButton
                   op="failoverServer"
                   small
+                  :variant="s.status === 'dead' ? 'primary' : 'default'"
                   @click="dialog = { kind: 'failover', server: s }"
-                  >Failover</GateButton
+                  >{{ s.status === 'dead' ? 'Fail over' : 'Failover' }}</GateButton
                 >
                 <GateButton
                   op="removeServer"
@@ -176,8 +181,14 @@ const dialog = ref<{ kind: 'add' | 'restore' | 'failover' | 'remove'; server?: S
 
   <div style="margin-top: var(--s-5)"><ServerGroupsPanel /></div>
 
+  <FailoverDialog
+    v-if="dialog?.kind === 'failover' && dialog.server"
+    :server="dialog.server"
+    :invalidate="[keys.servers, keys.topology]"
+    @close="dialog = null"
+  />
   <ServerActions
-    v-if="dialog"
+    v-else-if="dialog && dialog.kind !== 'failover'"
     :kind="dialog.kind"
     :server="dialog.server"
     :invalidate="[keys.servers, keys.topology]"

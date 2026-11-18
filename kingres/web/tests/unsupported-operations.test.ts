@@ -94,18 +94,23 @@ describe('failover and restoring primaries', () => {
     const failover = (await screen.findAllByRole('button', { name: /^failover$/i }))[0]
     await user.click(failover as HTMLElement)
     let dialog = await screen.findByRole('dialog')
-    await user.click(within(dialog).getByRole('button', { name: /^graceful failover$/i }))
+    await user.click(within(dialog).getByRole('button', { name: /^show the plan$/i }))
     const notice = await within(dialog).findByText(/not available on this server version yet/i)
     expect(notice.closest('[data-code]')?.getAttribute('role')).toBe('status')
-    expect(within(dialog).getByRole('button', { name: /^graceful failover$/i })).toBeEnabled()
+    expect(within(dialog).getByRole('button', { name: /^show the plan$/i })).toBeEnabled()
     await user.click(within(dialog).getByRole('button', { name: /^cancel$/i }))
 
     mockConfig.unsupported.delete('failoverServer')
     await user.click(
-      (await screen.findAllByRole('button', { name: /^failover$/i }))[0] as HTMLElement,
+      (await screen.findAllByRole('button', { name: /^failover$/i }))[1] as HTMLElement,
     )
     dialog = await screen.findByRole('dialog')
-    await user.click(within(dialog).getByRole('button', { name: /^graceful failover$/i }))
+    // Graceful is what the real server refuses for now, so the first server's plan comes only with the switch.
+    await user.click(within(dialog).getByRole('radio', { name: /hard/i }))
+    await user.click(within(dialog).getByRole('button', { name: /^show the plan$/i }))
+    await within(dialog).findByTestId('failover-plan')
+    await user.type(within(dialog).getByLabelText(/to confirm/i), '10.0.0.12:8091')
+    await user.click(within(dialog).getByRole('button', { name: /^hard failover$/i }))
     await within(dialog).findByRole('progressbar')
   })
 

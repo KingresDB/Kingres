@@ -37,6 +37,11 @@ const aspectText = computed(() => {
   const a = subject.value.aspect
   return a === null || a === undefined ? null : (ASPECT[a] ?? null)
 })
+// 0.10.0: an alert about a failover links to where its progress and report are shown.
+const isFailoverAlert = computed(() =>
+  ['failoverNeedsDecision', 'failoverBlocked', 'failoverDataLoss'].includes(props.alert.kind),
+)
+const canFailover = computed(() => session.can('getFailoverStatus'))
 const isPending = computed(() => props.alert.kind === 'replicationPending')
 // 0.8.0: a clock that differs is explained and handled on the Time tab of the Configuration page.
 const canTime = computed(
@@ -44,6 +49,7 @@ const canTime = computed(
 )
 const any = computed(
   () =>
+    (isFailoverAlert.value && canFailover.value) ||
     subject.value.serverId !== null ||
     subject.value.behindServerId !== null ||
     subject.value.shardGroupId !== null ||
@@ -88,6 +94,11 @@ const any = computed(
         ><SafeName :value="subject.databaseName" :max="60"
       /></RouterLink>
       <SafeName v-else :value="subject.databaseName" :max="60" />
+    </li>
+    <li v-if="isFailoverAlert && canFailover" data-testid="alert-failover">
+      <RouterLink :to="{ name: 'replication', hash: '#failover-top' }"
+        >Failover progress and report</RouterLink
+      >
     </li>
     <li v-if="canTime" data-testid="alert-clock">
       <RouterLink :to="{ name: 'configuration', query: { tab: 'time' } }"

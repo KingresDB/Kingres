@@ -12,6 +12,7 @@ import QueryBoundary from '@/components/QueryBoundary.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
 import GateButton from '@/components/GateButton.vue'
 import ServerActions from '@/components/ServerActions.vue'
+import FailoverDialog from '@/components/FailoverDialog.vue'
 import NullableValue from '@/components/NullableValue.vue'
 import CertificateExpiry from '@/components/CertificateExpiry.vue'
 import FingerprintValue from '@/components/FingerprintValue.vue'
@@ -129,7 +130,12 @@ function saveGroup(): void {
 <template>
   <PageHeader :title="s ? `Server ${s.address}` : `Server ${id}`" :subtitle="s?.hostname">
     <template #actions>
-      <GateButton op="failoverServer" @click="dialog = 'failover'">Failover</GateButton>
+      <GateButton
+        op="failoverServer"
+        :variant="s?.status === 'dead' ? 'primary' : 'default'"
+        @click="dialog = 'failover'"
+        >{{ s?.status === 'dead' ? 'Fail over' : 'Failover' }}</GateButton
+      >
       <GateButton op="removeServer" variant="danger" @click="dialog = 'remove'">Remove</GateButton>
     </template>
   </PageHeader>
@@ -456,8 +462,14 @@ function saveGroup(): void {
     </div>
   </QueryBoundary>
 
+  <FailoverDialog
+    v-if="dialog === 'failover' && s"
+    :server="s"
+    :invalidate="[keys.servers, keys.server(id), keys.topology, keys.cluster, keys.tasks]"
+    @close="dialog = null"
+  />
   <ServerActions
-    v-if="dialog && s"
+    v-else-if="dialog && dialog !== 'failover' && s"
     :kind="dialog"
     :server="s"
     :invalidate="[keys.servers, keys.server(id), keys.topology, keys.cluster, keys.tasks]"

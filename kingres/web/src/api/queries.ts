@@ -103,6 +103,8 @@ export const keys = {
   topology: ['topology'] as const,
   rebalance: ['rebalance'] as const,
   rebalanceReports: ['rebalanceReports'] as const,
+  failover: ['failover'] as const,
+  failoverReport: (id: number) => ['failoverReport', id] as const,
   tasks: ['tasks'] as const,
   task: (id: number) => ['task', id] as const,
   roles: ['roles'] as const,
@@ -297,6 +299,28 @@ export const useRebalanceReports = () =>
       const page = await endpoints.listRebalanceReports({ limit: 20 })
       return { items: page.items, moreNotShown: !!page.nextCursor }
     },
+  })
+
+/**
+ * The failover status (contract 0.10.0), fast while a run goes on. It is read only when the role may call it
+ * (kingres_stats may not) and not again when the server says it does not know the operation yet.
+ */
+export const useFailoverStatus = (enabled: MaybeRefOrGetter<boolean> = true) =>
+  useQuery({
+    queryKey: keys.failover,
+    queryFn: endpoints.getFailoverStatus,
+    enabled: computed(() => toValue(enabled)),
+    refetchInterval: (q) =>
+      isUnsupported(q.state.error) ? false : q.state.data?.state === 'running' ? 1_500 : POLL.fast,
+  })
+
+/** One failover report (a run that is paused or finished). */
+export const useFailoverReport = (id: MaybeRefOrGetter<number | null>, poll = false) =>
+  useQuery({
+    queryKey: computed(() => keys.failoverReport(toValue(id) ?? -1)),
+    queryFn: () => endpoints.getFailoverReport(toValue(id) as number),
+    enabled: computed(() => toValue(id) !== null),
+    refetchInterval: poll ? POLL.fast : false,
   })
 
 // --- tasks, alerts, logs ----------------------------------------------------------------------

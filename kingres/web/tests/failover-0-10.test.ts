@@ -4,12 +4,9 @@
 // Contract 0.10.0 (failover started by hand): every new alert kind, audit action and problem code has words, the
 // mock answers the four new operations with bodies that satisfy the contract's schemas, a dry run answers a plan, the
 // decision about data loss is asked for, and the two operations that start a failover narrow their answer to a task.
-import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
 import { beforeEach, describe, expect, it } from 'vitest'
 import { createPinia } from 'pinia'
 import { waitFor } from '@testing-library/vue'
-import { parse } from 'yaml'
 import { api } from '@/api/client'
 import { endpoints } from '@/api/endpoints'
 import { ApiError, describeProblem } from '@/api/problem'
@@ -25,77 +22,7 @@ import { auditActions } from '@/api/operations.generated'
 import type { ProblemCode } from '@/api/types'
 import { signInAs } from './helpers'
 
-const specFile = process.env.KINGRES_API_SPEC ?? join(process.cwd(), '../api/openapi.yaml')
-
-type Schema = {
-  $ref?: string
-  type?: string | string[]
-  enum?: unknown[]
-  required?: string[]
-  properties?: Record<string, Schema>
-  items?: Schema
-  allOf?: Schema[]
-  oneOf?: Schema[]
-  minimum?: number
-  minItems?: number
-}
-const spec = parse(readFileSync(specFile, 'utf8')) as {
-  components: { schemas: Record<string, Schema> }
-}
-
-/** Why `value` does not satisfy `schema` (the subset of JSON Schema the contract uses), or null. */
-function violation(value: unknown, schema: Schema, at = '$'): string | null {
-  if (schema.$ref) {
-    const name = schema.$ref.replace('#/components/schemas/', '')
-    return violation(value, spec.components.schemas[name] as Schema, at)
-  }
-  for (const part of schema.allOf ?? []) {
-    const v = violation(value, part, at)
-    if (v) return v
-  }
-  if (schema.oneOf) {
-    const passing = schema.oneOf.filter((s) => violation(value, s, at) === null).length
-    if (passing !== 1) return `${at}: matches ${passing} of the oneOf branches`
-  }
-  const types =
-    schema.type === undefined ? [] : Array.isArray(schema.type) ? schema.type : [schema.type]
-  if (types.length > 0) {
-    const actual =
-      value === null
-        ? 'null'
-        : Array.isArray(value)
-          ? 'array'
-          : Number.isInteger(value)
-            ? 'integer'
-            : typeof value
-    const fits = types.some((t) => t === actual || (t === 'number' && actual === 'integer'))
-    if (!fits) return `${at}: is ${actual}, the contract says ${types.join('|')}`
-  }
-  if (schema.enum && !schema.enum.includes(value))
-    return `${at}: ${String(value)} is not in the enum`
-  if (typeof value === 'number' && schema.minimum !== undefined && value < schema.minimum)
-    return `${at}: below the minimum`
-  if (Array.isArray(value)) {
-    if (schema.minItems !== undefined && value.length < schema.minItems) return `${at}: too short`
-    for (const [i, item] of value.entries()) {
-      const v = schema.items ? violation(item, schema.items, `${at}[${i}]`) : null
-      if (v) return v
-    }
-  }
-  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
-    const o = value as Record<string, unknown>
-    for (const key of schema.required ?? []) if (!(key in o)) return `${at}: missing ${key}`
-    for (const [key, sub] of Object.entries(schema.properties ?? {}))
-      if (key in o) {
-        const v = violation(o[key], sub, `${at}.${key}`)
-        if (v) return v
-      }
-  }
-  return null
-}
-
-const ok = (value: unknown, schema: string) =>
-  expect(violation(value, { $ref: `#/components/schemas/${schema}` })).toBeNull()
+import { ok, spec } from './schema-check'
 
 const NEW_ALERT_KINDS = [
   'failoverNeedsDecision',
@@ -149,14 +76,12 @@ describe('the mock of the failover operations', () => {
     await signInAs(createPinia())
   })
 
-  /** The server that is primary of the most groups, and one of the groups it can lose. */
+  /**
+   * A server that is primary of an ordinary group only: the real server refuses the map group for now (and so does the
+   * mock, unless `?failover=map`), and the server of the map group is the one that has it.
+   */
   function victim() {
-    const s = getState()
-    const counts = new Map<string, number>()
-    for (const g of s.groups)
-      if (g.primaryServerId) counts.set(g.primaryServerId, (counts.get(g.primaryServerId) ?? 0) + 1)
-    const [id] = [...counts.entries()].sort((a, b) => b[1] - a[1])[0] as [string, number]
-    return id
+    return '10.0.0.12'
   }
 
   it('answers an idle status, an empty list and a missing report as the contract says', async () => {
