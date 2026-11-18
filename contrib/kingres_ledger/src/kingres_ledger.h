@@ -157,6 +157,16 @@ extern int	kl_worker_timeout;
  */
 extern int	kl_lock_hold_limit;
 
+/*
+ * GUC: the most time, in ms, that one transaction of a role that is not a
+ * superuser may be credited to kingres_ledger.lock_hold_limit for the entering
+ * of rows by ledger_enable; 0 = no bound.  Only a superuser can change it.
+ */
+extern int	kl_enable_credit_limit;
+
+/* GUC, for the tests: ms that ledger_register_table waits after each batch of rows. */
+extern int	kl_enable_batch_delay;
+
 /* True when the library was loaded through shared_preload_libraries. */
 extern bool kl_preloaded;
 
@@ -216,7 +226,10 @@ extern void kl_record_manual_insert(Relation rel, HeapTuple tuple);
 extern void kl_lock_extension_object(int subid);
 extern void kl_lock_for_manual_write(Relation rel);
 extern HeapTuple kl_manual_write_identifier(Relation rel, HeapTuple tuple);
-extern void kl_hold_credit(Oid relid, uint64 rows, TimestampTz began);
+extern void kl_hold_credit(TimestampTz began);
+extern void kl_enable_batch_pause(void);
+extern void kl_require_own_statement(const char *fname);
+extern void kl_check_lock_order(int subid);
 extern void kl_record_manual_digest_delete(Relation rel, HeapTuple tuple);
 
 /* capture.c */

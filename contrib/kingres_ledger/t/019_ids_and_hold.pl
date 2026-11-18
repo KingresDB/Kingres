@@ -248,8 +248,8 @@ foreach my $guc (qw(statement_timeout transaction_timeout idle_in_transaction_se
 	my $pid = $s->query_safe('SELECT pg_backend_pid()');
 	$pid =~ s/\s+//g;
 	$s->query_until(qr/v_started/,
-		"\\echo v_started\nBEGIN;\nSELECT kingres.ledger_verify_recorded();\nSELECT pg_sleep(100000);\n");
-	ok(holds_lock($pid, $VERIFY), 'ledger_verify_recorded in a transaction: the role holds the lock of its identifiers');
+		"\\echo v_started\nSELECT kingres.ledger_verify_recorded(), pg_sleep(100000);\n");
+	ok(holds_lock($pid, $VERIFY), 'ledger_verify_recorded followed by a long statement: the role holds the lock of its identifiers');
 	ok(backend_gone($pid), 'its session is ended by the limit of the extension');
 	is(lock_count($VERIFY), '0', 'and the lock is gone');
 	is(as_role('aud', q{SELECT kingres.ledger_verify_recorded() > 0}), 't', 'so another verification is recorded');
@@ -260,8 +260,8 @@ foreach my $guc (qw(statement_timeout transaction_timeout idle_in_transaction_se
 	$pid = $s->query_safe('SELECT pg_backend_pid()');
 	$pid =~ s/\s+//g;
 	$s->query_until(qr/e_started/,
-		"\\echo e_started\nBEGIN;\nSELECT kingres.ledger_enable('apptab');\nSELECT pg_sleep(100000);\n");
-	ok(holds_lock($pid, $REGISTRY), 'ledger_enable in a transaction: the owner of the table holds the lock of the registry');
+		"\\echo e_started\nSELECT kingres.ledger_enable('apptab'), pg_sleep(100000);\n");
+	ok(holds_lock($pid, $REGISTRY), 'ledger_enable followed by a long statement: the owner of the table holds the lock of the registry');
 	ok(backend_gone($pid), 'its session is ended by the limit of the extension');
 	is(lock_count($REGISTRY), '0', 'and the lock is gone');
 	is($node->safe_psql('d', q{SELECT count(*) FROM kingres.ledger_table WHERE relid = 'apptab'::regclass}), '0',

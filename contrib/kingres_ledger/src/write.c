@@ -59,6 +59,7 @@
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lmgr.h"
+#include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -138,128 +139,119 @@ kl_first(int col, Datum *value)
 }
 
 /*
- * kl_refuse_open_transaction
- *		The lock that serialises the builders is held until the end of the
- *		transaction of the caller, and it has to be: a builder that started
- *		while another one's block was uncommitted would wait on that block's
- *		rows, or build the same height.  A role that may call a builder (an
- *		auditor, the agent of the README) could therefore stop the worker, and
- *		every other builder, for as long as it keeps a transaction open after
- *		the call (L11-03).  A role that is not a superuser may call the
- *		builders only as a statement of its own, so that the lock is held for
- *		the time of that statement and no longer: not inside BEGIN ... COMMIT,
- *		not in a multi-command string (an implicit block), not in a
- *		subtransaction (a savepoint, and also the EXCEPTION block of a PL/pgSQL
- *		function, which looks the same from here: a function that calls a
- *		builder for a role that is not a superuser keeps the call outside such a
- *		block), and not after the first Execute of a pipeline (the flag of the
- *		pipeline reports the rest).
- *		What remains is a statement that runs long, and the first Execute of an
- *		extended-protocol pipeline that the client does not Sync: the server
- *		cannot see either when the call is made, and the settings that look
+ * kl_require_own_statement
+ *		A role that is not a superuser takes a lock of the extension only in a
+ *		statement of its own (L19-01, and the rule that has been the builders'
+ *		since L11-03).  The locks are held to the end of the transaction of the
+ *		caller, and have to be: a block that is not committed must not be
+ *		invisible to the next builder, and an identifier that is not committed
+ *		must not be taken twice.  A role that held one across statements could
+ *		therefore stop the worker, the capture and every other caller for as long
+ *		as it keeps a transaction open after the call.  So the functions that take
+ *		a lock (ledger_build_block, ledger_generate_digest, ledger_verify_recorded,
+ *		ledger_enable, and ledger_register_table and ledger_remove_stray, which
+ *		only a superuser can call, and every lock that kl_lock_extension_object
+ *		grants) refuse a role that is not a superuser unless the call is a
+ *		statement of an autocommit transaction: not inside BEGIN ... COMMIT, not in
+ *		a multi-command string (an implicit block), not in a subtransaction (a
+ *		savepoint, the EXCEPTION block of a PL/pgSQL function, or any
+ *		subtransaction that a function of the same statement began: they are all
+ *		a nest level above 1 from here), and not after the first Execute of a
+ *		pipeline (the flag of the pipeline reports the rest).  Every error of such
+ *		a statement ends the transaction, and the lock goes with it: nothing can
+ *		be left that holds a lock of the extension with no statement running.
+ *		What remains is the statement itself, which can still hold the lock while
+ *		it sleeps or loops, and a pipeline whose client never sends Sync: the
+ *		server cannot see either when the call is made, and the settings that look
  *		like a remedy (statement_timeout, idle_in_transaction_session_timeout,
- *		transaction_timeout) are the role's own to change, and do not apply to
- *		a pipeline that is waiting for its Sync (the backend is "active").  The
- *		bound is the extension's own: kl_hold_arm (below) ends the session of a
- *		role that is not a superuser when it holds a lock of the extension
- *		for longer than kingres_ledger.lock_hold_limit, which only a superuser
- *		can change.
+ *		transaction_timeout) are the role's own to change, and do not apply to a
+ *		pipeline that is waiting for its Sync (the backend is "active").  The bound
+ *		on that is the extension's own: the timer below ends the session of a role
+ *		that is not a superuser that holds a lock for longer than
+ *		kingres_ledger.lock_hold_limit, which only a superuser can change.
  *		A superuser can stop the server anyway, and the workers are superusers.
+ *
+ *		fname is the name that the message gives; NULL says "a ledger function"
+ *		(the check that kl_lock_extension_object makes for every lock, whoever
+ *		its caller is).
  */
-static void
-kl_refuse_open_transaction(const char *fname)
+void
+kl_require_own_statement(const char *fname)
 {
 	if (superuser_arg(GetOuterUserId()))
 		return;
 	/*
-	 * The second half of this test, XACT_FLAGS_PIPELINING, cannot be reached
-	 * today (L15-14): the flag is set when an Execute of an extended-protocol
-	 * pipeline completes or is suspended without ending the transaction, and
-	 * the next message of that transaction calls start_xact_command, which
-	 * begins an implicit transaction block, so IsTransactionBlock() is already
-	 * true whenever the flag is.  It costs nothing and guards against a change
-	 * of the server that would separate the two; no test claims to cover it.
+	 * The XACT_FLAGS_PIPELINING test cannot be reached today (L15-14): the flag
+	 * is set when an Execute of an extended-protocol pipeline completes or is
+	 * suspended without ending the transaction, and the next message of that
+	 * transaction calls start_xact_command, which begins an implicit
+	 * transaction block, so IsTransactionBlock() is already true whenever the
+	 * flag is.  It costs nothing and guards against a change of the server that
+	 * would separate the two; no test claims to cover it.  The nest level
+	 * says the same as IsTransactionBlock() inside a subtransaction, which is
+	 * the case that must not depend on that function's reading of the block
+	 * state.
 	 */
-	if (IsTransactionBlock() || (MyXactFlags & XACT_FLAGS_PIPELINING) != 0)
+	if (IsTransactionBlock() || GetCurrentTransactionNestLevel() > 1 ||
+		(MyXactFlags & XACT_FLAGS_PIPELINING) != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 				 errmsg("%s cannot run inside a transaction block for a role that is not a superuser",
-						fname),
-				 errdetail("It holds the lock of the block builders until the end of the transaction, and the block builder of the server would wait for it."),
-				 errhint("Call it as a statement of its own, outside BEGIN ... COMMIT, a savepoint and an EXCEPTION block.")));
+						fname != NULL ? fname : "a ledger function"),
+				 errdetail("It takes a lock of the extension, and a role that is not a superuser may hold one only for the time of one statement of an autocommit transaction: the lock is held until the end of the transaction, and the block builder of the server, the capture and every other caller would wait for it."),
+				 errhint("Call it as a statement of its own, outside BEGIN ... COMMIT, a savepoint and an EXCEPTION block (ledger_enable: run it outside the transaction, or as a superuser).")));
 }
 
 /*
  * The bound on how long a role that is not a superuser holds a lock of the
- * extension (L13-02).  The locks are held to the end of the transaction of the
- * caller, and have to be (see kl_refuse_open_transaction): a block that is not
- * committed must not be invisible to the next builder.  What a caller can do
- * with that, without being a superuser: a pipeline whose client never sends
- * Sync keeps the transaction open with the backend "active", where no timeout
- * of PostgreSQL reaches it; a statement that sleeps after the call runs as
- * long as the role lets it, because every timeout of PostgreSQL that bounds a
- * statement or a transaction can be set to 0 by the role for its own session.
- * So the bound is a timer of our own, armed when a role that is not a
- * superuser has the lock, switched off when the transaction ends, and
- * unreachable from SQL (the limit is a superuser setting).  When it fires, the
- * session ends as if an administrator had terminated it: the transaction rolls
- * back and the lock goes with it.
- */
-/*
- * What the timer is bound to (L15-02, L15-07, L17-01).  The timer must run
- * exactly as long as a role that is not a superuser holds one of the locks, so
- * the code keeps a list of the locks that the current transaction holds, one
- * entry per lock and per (sub)transaction that took it, because a lock taken
- * in a subtransaction goes when that subtransaction aborts and the lock that a
- * committed subtransaction took passes to its parent.
+ * extension (L13-02).  Given kl_require_own_statement, such a role holds a
+ * lock for the length of one statement of an autocommit transaction at most,
+ * and every error ends the transaction and releases it, so the timer below has
+ * one job: to bound that one statement (a pg_sleep after the call, a loop, a
+ * pipeline that the client never ends).  It is a timer of our own, armed when
+ * a role that is not a superuser is granted its first lock, switched off when
+ * the transaction ends (commit, abort, a COMMIT inside a procedure), and
+ * unreachable from SQL (the limit is a superuser setting).  When it fires,
+ * the session ends as if an administrator had terminated it: the transaction
+ * rolls back and the lock goes with it.
  *
- *	  - the timer starts with the first entry of a role that is not a
- *		superuser, and stops when the last one is gone: at the end of the
- *		transaction (commit, abort, and COMMIT AND CHAIN, which ends a
- *		transaction and starts another one that holds nothing until it takes a
- *		lock again), or when the subtransaction that took the last lock aborts
- *		(ROLLBACK TO a savepoint, an EXCEPTION block);
- *	  - a transaction that holds such a lock cannot be prepared (PRE_PREPARE
- *		raises an error): a prepared transaction keeps its locks until somebody
- *		ends it, and no timer or session is left to end it.  This is for the
- *		roles the limit is for.  A superuser is not limited, and may prepare a
- *		transaction that holds a lock: it is the one act the limit would
- *		not stop for a superuser anyway (the README says what it holds), and a
- *		refusal would stop the two-phase commit of a DDL transaction of a
- *		superuser service role, which holds the registry's lock like any DDL;
- *	  - nothing else outlives a transaction: the locks are transaction locks
- *		(a WITH HOLD cursor holds none), the code takes no advisory lock, and
- *		the functions are PARALLEL UNSAFE, so a parallel worker never takes one
- *		for the leader.
+ * Why nothing in the statement can switch the timer off while the lock is
+ * still held (the argument is in the README and in correction D of section 14
+ * of the design document, with the lines of the server's source):
+ *	  - the only code of the server that disables every timeout is the error
+ *		handler of PostgresMain (disable_all_timeouts), and it runs when an error
+ *		reaches the main loop, where the transaction is aborted next: an
+ *		autocommit transaction ends with the abort and the lock goes with it,
+ *		and no subtransaction can be open that would let the transaction go on
+ *		(kl_require_own_statement, and the utility hook below for a BEGIN or a
+ *		SAVEPOINT that a pipeline sends after the call);
+ *	  - an error that does not reach the main loop (caught by an EXCEPTION
+ *		block of the same statement, after the call) disables nothing:
+ *		AbortSubTransaction only calls reschedule_timeouts, which keeps the
+ *		timer;
+ *	  - statement_timeout, lock_timeout and a cancel raise an ERROR, so they are
+ *		one of the two cases above; only STATEMENT_TIMEOUT, LOCK_TIMEOUT and the
+ *		other timeouts of the server are disabled by the code that handles them;
+ *	  - a COMMIT inside a procedure ends the transaction: the locks are gone
+ *		(the callback below clears the list and the timer), so a procedure that
+ *		commits cannot keep a lock across its own transactions.
  *
- * The property that the code must keep (L17-01), whatever a role does with
- * savepoints, exception blocks, loops, the other functions of the extension
- * and other locks: a role that is not a superuser never holds a lock of the
- * extension for longer than kingres_ledger.lock_hold_limit plus the time of
- * the real, kept work of ledger_enable on the tables it entered in this
- * transaction.  That is kept by the three rules below, and by nothing else:
+ * What the timer is bound to: the locks of the extension that the current
+ * transaction holds, kept in a list (kl_held), one entry per lock and per
+ * (sub)transaction that took it.  The list is what the order of the locks
+ * (kl_check_lock_order) is checked against, and for a superuser, who may hold
+ * locks inside a transaction block and a savepoint, it follows the
+ * subtransactions: a lock that a subtransaction took goes when it aborts, and
+ * passes to its parent when it commits.  For a role that is not a superuser
+ * every entry belongs to the top-level transaction.
  *
- *	  (a) the deadline of the timer moves later only while the registry's lock
- *		is the only lock of the extension that the transaction holds
- *		(kl_hold_credit); with any other lock held there is no renewal at all;
- *	  (b) what moves it later is the time that ledger_enable really spent
- *		entering rows, batch by batch, and not a new full period (a full period
- *		per small table would be a renewal for nothing): so the deadline is
- *		never more than one period after the moment it was last looked at, and
- *		a lock that is taken now is held for one period at most, whatever was
- *		credited before.  The deadline is
- *		kept per entry of the subtransaction stack: when a subtransaction
- *		aborts, the deadline goes back to what it was before that
- *		subtransaction first changed it, and a subtransaction that is released
- *		hands its changes to its parent;
- *	  (c) within one top-level transaction, the time of the rows of a table is
- *		credited only for rows beyond the highest row count that was credited
- *		for that table in that transaction, which no rollback takes back: the
- *		same rows entered again after a rollback buy nothing.
- *
- * What is left, and is documented as an exception: a role that really enters
- * many rows of many tables holds the registry's lock while it does, for as
- * long as the entering takes.
+ * The property: a role that is not a superuser never holds a lock of the
+ * extension for longer than kingres_ledger.lock_hold_limit plus the credit,
+ * and the credit (kl_hold_credit) is the time that ledger_enable really spent
+ * entering rows, and never more than kingres_ledger.enable_credit_limit in all,
+ * and only while the registry's lock is the only lock of the extension that the
+ * transaction holds, so a lock that is granted later, or earlier in the order,
+ * has the limit alone.
  */
 #define KL_HOLD_LOCKS 4
 
@@ -267,22 +259,7 @@ typedef struct KlHeld
 {
 	int			subid;			/* KL_*_LOCK_SUBID */
 	SubTransactionId subxid;	/* the (sub)transaction that took it */
-	bool		limited;		/* taken by a role that is not a superuser */
 } KlHeld;
-
-/* The deadline as it was before a (sub)transaction first changed it. */
-typedef struct KlFrame
-{
-	SubTransactionId subxid;
-	TimestampTz saved;
-} KlFrame;
-
-/* Rows of a table that were credited in this top-level transaction. */
-typedef struct KlCredited
-{
-	Oid			relid;
-	uint64		rows;
-} KlCredited;
 
 static int	kl_hold_timeout_id = -1;
 static bool kl_hold_armed = false;
@@ -291,12 +268,9 @@ static KlHeld *kl_held = NULL;
 static int	kl_nheld = 0;
 static int	kl_heldmax = 0;
 static TimestampTz kl_deadline = 0;
-static KlFrame *kl_frames = NULL;
-static int	kl_nframes = 0;
-static int	kl_framesmax = 0;
-static KlCredited *kl_credited = NULL;
-static int	kl_ncredited = 0;
-static int	kl_creditedmax = 0;
+static int64 kl_credit_used = 0;	/* microseconds credited in this transaction */
+static ProcessUtility_hook_type kl_hold_prev_utility = NULL;
+static bool kl_hold_utility_installed = false;
 
 /* What the log line of an ended session needs, copied while it is safe to look it up. */
 static char kl_hold_role[NAMEDATALEN];
@@ -334,12 +308,15 @@ kl_hold_timeout_handler(void)
 
 /*
  * The session ends with the usual FATAL message, which the client sees as it
- * does for any terminate request.  This line is for the operator: it says
- * that the limit did it.  It cannot be written in the signal handler, and by
- * the time the transaction is aborted the entries are gone, so it runs as a
- * process exit callback with the list that was current when the timer fired
- * (kl_hold_relist keeps the list as it is, and stops when the timer has
- * fired: L17-05).
+ * does for any terminate request: the core raises that FATAL in
+ * ProcessInterrupts with a fixed text, an extension has no flag of its own
+ * that CHECK_FOR_INTERRUPTS looks at, and emit_log_hook may change the message
+ * only by an unsupported edit of the error data (L19-07).  This line is for the
+ * operator: it says that the limit did it, and what to do about it.  It cannot
+ * be written in the signal handler, and by the time the transaction is aborted
+ * the entries are gone, so it runs as a process exit callback with the list
+ * that was current when the timer fired (kl_hold_relist keeps the list as it
+ * is, and stops when the timer has fired: L17-05).
  */
 static void
 kl_hold_proc_exit(int code, Datum arg)
@@ -348,6 +325,7 @@ kl_hold_proc_exit(int code, Datum arg)
 		ereport(LOG,
 				(errmsg("kingres_ledger: ended the session of role \"%s\": it held the %s of the extension for longer than kingres_ledger.lock_hold_limit (%d ms)",
 						kl_hold_role, kl_hold_locklist, kl_hold_limit_ms),
+				 errhint("A role that is not a superuser may hold a lock of the extension for the time of one statement only. A ledger_enable that enters a very large table is run by a superuser; the time it spends entering rows is credited to the limit only up to kingres_ledger.enable_credit_limit."),
 				 errhidestmt(true),
 				 errhidecontext(true)));
 }
@@ -379,17 +357,6 @@ kl_hold_relist(void)
 	}
 }
 
-static bool
-kl_any_limited(void)
-{
-	int			i;
-
-	for (i = 0; i < kl_nheld; i++)
-		if (kl_held[i].limited)
-			return true;
-	return false;
-}
-
 static void
 kl_hold_disarm(void)
 {
@@ -398,64 +365,20 @@ kl_hold_disarm(void)
 		disable_timeout(kl_hold_timeout_id, false);
 		kl_hold_armed = false;
 	}
-	kl_nframes = 0;
-}
-
-/*
- * Move the deadline, and the timer with it.  The first change by a
- * (sub)transaction keeps the deadline as it was, for the case that the
- * (sub)transaction aborts (rule (b)).
- */
-static void
-kl_deadline_set(TimestampTz newdl)
-{
-	SubTransactionId cur = GetCurrentSubTransactionId();
-
-	if (kl_nframes == 0 || kl_frames[kl_nframes - 1].subxid != cur)
-	{
-		if (kl_frames == NULL)
-		{
-			kl_framesmax = 16;
-			kl_frames = MemoryContextAlloc(TopMemoryContext,
-										   sizeof(KlFrame) * kl_framesmax);
-		}
-		else if (kl_nframes == kl_framesmax)
-		{
-			kl_framesmax *= 2;
-			kl_frames = repalloc(kl_frames, sizeof(KlFrame) * kl_framesmax);
-		}
-		kl_frames[kl_nframes].subxid = cur;
-		kl_frames[kl_nframes].saved = kl_deadline;
-		kl_nframes++;
-	}
-	kl_deadline = newdl;
-	enable_timeout_at(kl_hold_timeout_id, kl_deadline);
+	kl_credit_used = 0;
 }
 
 static void
 kl_hold_xact_callback(XactEvent event, void *arg)
 {
-	int			i;
-
 	switch (event)
 	{
-		case XACT_EVENT_PRE_PREPARE:
-			for (i = 0; i < kl_nheld; i++)
-				if (kl_held[i].limited)
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("cannot PREPARE a transaction that holds the %s of the ledger extension",
-									kl_lock_name(kl_held[i].subid)),
-							 errdetail("A role that is not a superuser may hold a lock of the extension only until the end of its transaction, and for no longer than kingres_ledger.lock_hold_limit; a prepared transaction would keep it until somebody ends it, and every ledger_enable, ledger_verify_recorded or block builder would wait for it."),
-							 errhint("Call ledger_enable, ledger_verify_recorded and the block builders in a transaction that is not prepared, or as a superuser.")));
-			break;
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PREPARE:
 		case XACT_EVENT_PARALLEL_COMMIT:
 		case XACT_EVENT_PARALLEL_ABORT:
 			kl_nheld = 0;
-			kl_ncredited = 0;
 			kl_hold_disarm();
 			break;
 		default:
@@ -463,6 +386,15 @@ kl_hold_xact_callback(XactEvent event, void *arg)
 	}
 }
 
+/*
+ * The locks of a subtransaction.  Only a superuser has any inside one (a
+ * role that is not a superuser takes its locks at the top level: see
+ * kl_require_own_statement), and the list is there for the order check
+ * (kl_check_lock_order), which must neither miss a lock that is held nor name
+ * one that went with a rolled-back savepoint.  The timer is not touched: the
+ * abort of a subtransaction does not disable it (AbortSubTransaction only
+ * calls reschedule_timeouts).
+ */
 static void
 kl_hold_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 						 SubTransactionId parentSubid, void *arg)
@@ -488,27 +420,11 @@ kl_hold_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 				for (k = 0; k < j; k++)
 					if (kl_held[k].subid == kl_held[i].subid &&
 						kl_held[k].subxid == kl_held[i].subxid)
-					{
 						dup = true;
-						kl_held[k].limited |= kl_held[i].limited;
-					}
 				if (!dup)
 					kl_held[j++] = kl_held[i];
 			}
 			kl_nheld = j;
-			/*
-			 * What it did to the deadline passes to its parent: when the
-			 * parent already changed the deadline, the parent's saved value is
-			 * the older one and stays.
-			 */
-			if (kl_nframes > 0 && kl_frames[kl_nframes - 1].subxid == mySubid)
-			{
-				if (kl_nframes > 1 &&
-					kl_frames[kl_nframes - 2].subxid == parentSubid)
-					kl_nframes--;
-				else
-					kl_frames[kl_nframes - 1].subxid = parentSubid;
-			}
 			break;
 		case SUBXACT_EVENT_ABORT_SUB:
 			/* The locks of an aborted subtransaction are released with it. */
@@ -516,35 +432,62 @@ kl_hold_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 				if (kl_held[i].subxid != mySubid)
 					kl_held[j++] = kl_held[i];
 			kl_nheld = j;
-			if (!kl_any_limited())
-			{
-				kl_hold_disarm();
-				break;
-			}
-			/* And so are the renewals it made (L17-01 (b)). */
-			if (kl_hold_armed && kl_nframes > 0 &&
-				kl_frames[kl_nframes - 1].subxid == mySubid)
-			{
-				kl_nframes--;
-				kl_deadline = kl_frames[kl_nframes].saved;
-			}
-			/*
-			 * An error that reaches the main loop of the backend while a
-			 * subtransaction is open (SAVEPOINT s; SELECT 1/0) disables every
-			 * timeout of the process before the transaction is aborted
-			 * (PostgresMain calls disable_all_timeouts first), and the
-			 * transaction, with the locks of its parent, goes on: ROLLBACK TO
-			 * s, and the role holds the lock with no timer.  The abort of the
-			 * subtransaction is called after that, so this is the place to
-			 * start the timer again, at the deadline it had.
-			 */
-			if (kl_hold_armed)
-				enable_timeout_at(kl_hold_timeout_id, kl_deadline);
 			kl_hold_relist();
 			break;
 		default:
 			break;
 	}
+}
+
+/*
+ * While a role that is not a superuser holds a lock (the timer is armed), the
+ * transaction must stay the autocommit transaction of one statement.  A
+ * pipeline can send, after the call, a BEGIN (which turns the implicit block
+ * that every later message of a pipeline is in into a regular one, whatever
+ * was done before) and then a SAVEPOINT: the transaction would then go on
+ * after an error, the error handler of the main loop having disabled the timer,
+ * which is what a lock held with no end needs (L19-01).  The statements that
+ * would open a block, a subtransaction or a prepared transaction are refused
+ * while the timer is armed; COMMIT and ROLLBACK are not, they release the
+ * lock.  The error aborts the transaction, which is implicit, and the lock
+ * goes with it.  The hook is installed by the first lock of a role that is not
+ * a superuser, so it also works in a session where the library was not
+ * preloaded.
+ */
+static void
+kl_hold_utility(PlannedStmt *pstmt, const char *queryString,
+				bool readOnlyTree, ProcessUtilityContext context,
+				ParamListInfo params, QueryEnvironment *queryEnv,
+				DestReceiver *dest, QueryCompletion *qc)
+{
+	if (kl_hold_armed && pstmt->utilityStmt != NULL &&
+		IsA(pstmt->utilityStmt, TransactionStmt))
+	{
+		switch (((TransactionStmt *) pstmt->utilityStmt)->kind)
+		{
+			case TRANS_STMT_BEGIN:
+			case TRANS_STMT_START:
+			case TRANS_STMT_SAVEPOINT:
+			case TRANS_STMT_RELEASE:
+			case TRANS_STMT_ROLLBACK_TO:
+			case TRANS_STMT_PREPARE:
+				ereport(ERROR,
+						(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+						 errmsg("cannot start a transaction block, a savepoint or a prepared transaction while a role that is not a superuser holds the %s of the ledger extension",
+								kl_hold_locklist),
+						 errdetail("A role that is not a superuser may hold a lock of the extension only for the time of one statement of an autocommit transaction."),
+						 errhint("Send the statements that follow the call in a transaction of their own, or run the call as a superuser.")));
+				break;
+			default:
+				break;
+		}
+	}
+	if (kl_hold_prev_utility)
+		kl_hold_prev_utility(pstmt, queryString, readOnlyTree, context, params,
+							 queryEnv, dest, qc);
+	else
+		standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+								params, queryEnv, dest, qc);
 }
 
 /*
@@ -571,6 +514,12 @@ kl_hold_note(int subid)
 	}
 	if (limited && kl_hold_timeout_id < 0)
 		kl_hold_timeout_id = RegisterTimeout(USER_TIMEOUT, kl_hold_timeout_handler);
+	if (limited && !kl_hold_utility_installed)
+	{
+		kl_hold_prev_utility = ProcessUtility_hook;
+		ProcessUtility_hook = kl_hold_utility;
+		kl_hold_utility_installed = true;
+	}
 	if (kl_held == NULL)
 	{
 		kl_heldmax = KL_HOLD_LOCKS * 8;
@@ -578,10 +527,7 @@ kl_hold_note(int subid)
 	}
 	for (i = 0; i < kl_nheld; i++)
 		if (kl_held[i].subid == subid && kl_held[i].subxid == cur)
-		{
 			mine = true;
-			kl_held[i].limited |= limited;
-		}
 	if (!mine)
 	{
 		if (kl_nheld == kl_heldmax)
@@ -591,76 +537,103 @@ kl_hold_note(int subid)
 		}
 		kl_held[kl_nheld].subid = subid;
 		kl_held[kl_nheld].subxid = cur;
-		kl_held[kl_nheld].limited = limited;
 		kl_nheld++;
 	}
-	if (limited)
-	{
-		TimestampTz period = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
-														 kl_lock_hold_limit);
-
-		if (!kl_hold_armed)
-		{
-			strlcpy(kl_hold_role, GetUserNameFromId(GetOuterUserId(), false),
-					sizeof(kl_hold_role));
-			kl_hold_limit_ms = kl_lock_hold_limit;
-			kl_hold_fired = false;
-			kl_nframes = 0;
-			kl_deadline = period;
-			enable_timeout_at(kl_hold_timeout_id, kl_deadline);
-			kl_hold_armed = true;
-		}
-	}
 	kl_hold_relist();
+	if (limited && !kl_hold_armed)
+	{
+		strlcpy(kl_hold_role, GetUserNameFromId(GetOuterUserId(), false),
+				sizeof(kl_hold_role));
+		kl_hold_limit_ms = kl_lock_hold_limit;
+		kl_hold_fired = false;
+		kl_credit_used = 0;
+		kl_deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+												  kl_lock_hold_limit);
+		enable_timeout_at(kl_hold_timeout_id, kl_deadline);
+		kl_hold_armed = true;
+	}
 }
 
 /*
- * ledger_register_table has entered rows of a table, "rows" of them so far in
- * this call, and the last batch took the time since "began".  Honest work that
- * takes long is not ended: the deadline moves later by the time the batch
- * took, and by nothing else.  Only while the registry's lock is the only lock
- * of the extension that the transaction holds (L17-01 (a)), and only for rows
- * beyond those that were credited for this table in this transaction (c).  The
- * change is undone when the subtransaction that made it aborts (b).
+ * ledger_register_table has entered a batch of rows of a table, and the batch
+ * took the time since "began".  Honest work that takes long is not ended: the
+ * deadline moves later by the time the batch took, and by nothing else, so the
+ * deadline is never more than one period after the moment it was last looked
+ * at (L17-01).  Two conditions.  Only while the registry's lock is the only
+ * lock of the extension that the transaction holds (a): with the builders'
+ * lock held a large table would keep the builder and the capture waiting for
+ * as long as it takes.  And the total that one transaction may be credited is
+ * bounded by kingres_ledger.enable_credit_limit, which only a superuser sets
+ * (L19-02): a role could otherwise create table after table in one statement
+ * and have the registry's lock for as long as it likes at a small cost to
+ * itself.  When a batch would pass the bound, the call fails with an error that
+ * says so (a table that needs longer is entered by a superuser), which ends
+ * the transaction and releases the lock, instead of a session that is ended
+ * without a reason the client can see.
+ *
+ * What the credit does not need any more: a record per table of the rows that
+ * were credited (L17-01 (c)) and a record per subtransaction of the deadline
+ * before it changed it ((b)).  Both were there because a role could roll back
+ * work that was credited and do it again; a role that is not a superuser calls
+ * ledger_enable only as a statement of its own, which is never rolled back
+ * piece by piece, and the total is bounded.
  */
 void
-kl_hold_credit(Oid relid, uint64 rows, TimestampTz began)
+kl_hold_credit(TimestampTz began)
 {
 	int			i;
 	int64		spent;
-	KlCredited *slot = NULL;
 
 	if (!kl_hold_armed || kl_lock_hold_limit <= 0)
 		return;
 	for (i = 0; i < kl_nheld; i++)
 		if (kl_held[i].subid != KL_REGISTRY_LOCK_SUBID)
 			return;
-	for (i = 0; i < kl_ncredited; i++)
-		if (kl_credited[i].relid == relid)
-			slot = &kl_credited[i];
-	if (slot != NULL && rows <= slot->rows)
-		return;
-	if (slot == NULL)
-	{
-		if (kl_credited == NULL)
-		{
-			kl_creditedmax = 16;
-			kl_credited = MemoryContextAlloc(TopMemoryContext,
-											 sizeof(KlCredited) * kl_creditedmax);
-		}
-		else if (kl_ncredited == kl_creditedmax)
-		{
-			kl_creditedmax *= 2;
-			kl_credited = repalloc(kl_credited,
-								   sizeof(KlCredited) * kl_creditedmax);
-		}
-		slot = &kl_credited[kl_ncredited++];
-		slot->relid = relid;
-	}
-	slot->rows = rows;
 	spent = GetCurrentTimestamp() - began;
-	if (spent > 0)
-		kl_deadline_set(kl_deadline + spent);
+	if (spent <= 0)
+		return;
+	if (kl_enable_credit_limit > 0 &&
+		kl_credit_used + spent > (int64) kl_enable_credit_limit * 1000)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("entering the rows of the tables of this transaction took longer than kingres_ledger.enable_credit_limit (%d ms) allows a role that is not a superuser",
+						kl_enable_credit_limit),
+				 errdetail("A role that is not a superuser holds the registry's lock while ledger_enable enters rows, and the time that this is credited to kingres_ledger.lock_hold_limit is bounded."),
+				 errhint("A table that needs longer is enabled by a superuser (kingres_ledger.enable_credit_limit is a setting of a superuser; 0 removes the bound).")));
+	kl_credit_used += spent;
+	kl_deadline += spent;
+	enable_timeout_at(kl_hold_timeout_id, kl_deadline);
+}
+
+/*
+ * kl_enable_batch_pause
+ *		A developer setting for the tests (kingres_ledger.enable_batch_delay,
+ *		a superuser's, 0 in every real use): ledger_register_table waits that
+ *		long after each batch of rows, inside the time that the batch is
+ *		credited for.  The wait is at least that long whatever the load of the
+ *		machine, and a cancel or a terminate ends it, so a test can make
+ *		"a large table" of a known least cost, and does not need to measure
+ *		one.
+ */
+void
+kl_enable_batch_pause(void)
+{
+	TimestampTz end;
+
+	if (kl_enable_batch_delay <= 0)
+		return;
+	end = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), kl_enable_batch_delay);
+	for (;;)
+	{
+		long		secs;
+		int			usecs;
+
+		CHECK_FOR_INTERRUPTS();
+		if (GetCurrentTimestamp() >= end)
+			break;
+		TimestampDifference(GetCurrentTimestamp(), end, &secs, &usecs);
+		pg_usleep(Min(secs * 1000000L + usecs, 10000L));
+	}
 }
 
 /*
@@ -672,10 +645,13 @@ kl_hold_credit(Oid relid, uint64 rows, TimestampTz began)
  * with an error of the extension that names the order.  A lock that the
  * transaction holds already is asked for again without a wait, so it passes
  * (a write by hand holds all four, and may call anything after it).  The
- * lock on the table of ledger_enable, which comes first in the order, cannot be
- * checked this way; the README states that case.
+ * check also runs before ledger_enable waits for the lock on its table
+ * (ledger_lock_table, L19-04).  The one wait that cannot be ordered is the
+ * wait for the lock on a table by a transaction that already holds the
+ * registry's lock (a second ledger_enable in one transaction block of a
+ * superuser, or in one statement); the README states that case.
  */
-static void
+void
 kl_check_lock_order(int subid)
 {
 	int			i;
@@ -717,6 +693,13 @@ kl_check_lock_order(int subid)
 void
 kl_lock_extension_object(int subid)
 {
+	/*
+	 * Every function that takes a lock has made this check itself, with its
+	 * own name, before it did anything else; this one is for the lock, and
+	 * leaves no way to a lock of the extension for a role that is not a
+	 * superuser that does not go through it.
+	 */
+	kl_require_own_statement(NULL);
 	kl_check_lock_order(subid);
 	LockDatabaseObject(ExtensionRelationId,
 					   get_extension_oid(KL_EXTENSION_NAME, false),
@@ -1077,7 +1060,7 @@ kingres_ledger_build_block(PG_FUNCTION_ARGS)
 	int64		h = 0;
 	bool		built;
 
-	kl_refuse_open_transaction("ledger_build_block");
+	kl_require_own_statement("ledger_build_block");
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
 	built = kl_build_block_core(&h);
@@ -1103,7 +1086,7 @@ kingres_ledger_generate_digest(PG_FUNCTION_ARGS)
 	Oid			dtypes[1];
 	Datum		dvalues[1];
 
-	kl_refuse_open_transaction("ledger_generate_digest");
+	kl_require_own_statement("ledger_generate_digest");
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
 	(void) kl_build_block_core(&h);
@@ -1202,6 +1185,7 @@ kingres_ledger_verify_recorded(PG_FUNCTION_ARGS)
 	volatile Datum probs = (Datum) 0;
 	volatile bool have_probs = false;
 
+	kl_require_own_statement("ledger_verify_recorded");
 	kl_outer_user_name(&who);
 
 	if (lo < 0 || (!to_null && to_arg < lo))
@@ -1591,9 +1575,11 @@ kingres_ledger_register_table(PG_FUNCTION_ARGS)
 	char	   *sql;
 	Portal		portal;
 	int			i;
-	uint64		entered = 0;
 
+	kl_require_own_statement("ledger_register_table");
 	kl_check_owner(relid);
+	/* Refused before it waits for the lock on the table (L19-04). */
+	kl_check_lock_order(KL_REGISTRY_LOCK_SUBID);
 	if (XactIsoLevel != XACT_READ_COMMITTED)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -1732,14 +1718,14 @@ kingres_ledger_register_table(PG_FUNCTION_ARGS)
 			if (!isnull)
 				kl_record_existing_row((int32) tid, DatumGetHeapTupleHeader(row));
 		}
-		entered += SPI_processed;
 		SPI_freetuptable(SPI_tuptable);
+		kl_enable_batch_pause();
 		/*
 		 * Entering the rows of a large table is work, not a stall: the time
 		 * of this batch is credited to the limit, under the rules of
-		 * kl_hold_credit (L17-01).
+		 * kl_hold_credit (L17-01, L19-02).
 		 */
-		kl_hold_credit(relid, entered, began);
+		kl_hold_credit(began);
 	}
 	SPI_cursor_close(portal);
 	PopActiveSnapshot();

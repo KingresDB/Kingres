@@ -1451,11 +1451,20 @@ BEGIN
     -- drop it now and can make themselves able to without a superuser: a role
     -- with ADMIN OPTION, directly or through a chain, on a role that can (a
     -- CREATEROLE role has it on every role it created), grants itself that role
-    -- with INHERIT and SET.  Only a database whose owner is a superuser role
-    -- without members that are not superusers, and with no role administering
-    -- such a member, is out of reach of every role that is not a superuser
-    -- (README, "What a role that is not a superuser can stop or remove",
-    -- exception 6; L13-03, L15-01, L17-02, L17-03).
+    -- with INHERIT and SET.
+    -- Third, the roles that hold the power of a superuser over the files and
+    -- the programs of the server: a member (directly, through a chain, or by
+    -- SET ROLE) of pg_execute_server_program (COPY ... TO PROGRAM runs any
+    -- command as the operating-system user of the server, dropdb included) or
+    -- of pg_write_server_files (COPY ... TO a file writes any file that user
+    -- can write, the files of the cluster included).  They count as
+    -- superusers for this purpose and are listed with the first, and the roles
+    -- with ADMIN OPTION on those two roles with the second (L19-05).  Only a
+    -- database whose owner is a superuser role without members that are not
+    -- superusers, and with no role administering such a member, and that has
+    -- no member of those two roles, is out of reach of every role that is not
+    -- a superuser (README, "What a role that is not a superuser can stop or
+    -- remove", exception 6; L13-03, L15-01, L17-02, L17-03, L19-05).
     WITH RECURSIVE own(oid) AS (
         SELECT d.datdba FROM pg_catalog.pg_database d
          WHERE d.datname = pg_catalog.current_database()
@@ -1472,9 +1481,17 @@ BEGIN
                         WHERE (x.oid = r.oid OR pg_catalog.pg_has_role(r.oid, x.oid, 'SET'))
                           AND (x.rolsuper
                                OR EXISTS (SELECT 1 FROM own o
-                                           WHERE pg_catalog.pg_has_role(x.oid, o.oid, 'USAGE'))))
+                                           WHERE pg_catalog.pg_has_role(x.oid, o.oid, 'USAGE'))
+                               OR (r.oid >= 16384::pg_catalog.oid
+                                   AND (pg_catalog.pg_has_role(x.oid, 'pg_execute_server_program', 'USAGE')
+                                        OR pg_catalog.pg_has_role(x.oid, 'pg_write_server_files', 'USAGE')))))
     ), can_make(oid) AS (
         SELECT dn.oid FROM drop_now dn
+        UNION
+        SELECT r2.oid FROM pg_catalog.pg_roles r2
+         WHERE NOT r2.rolsuper AND r2.oid >= 16384::pg_catalog.oid
+           AND (pg_catalog.pg_has_role(r2.oid, 'pg_execute_server_program', 'MEMBER WITH ADMIN OPTION')
+                OR pg_catalog.pg_has_role(r2.oid, 'pg_write_server_files', 'MEMBER WITH ADMIN OPTION'))
         UNION
         SELECT r.oid FROM pg_catalog.pg_roles r, can_make c
          WHERE NOT r.rolsuper
@@ -2352,9 +2369,17 @@ SELECT (SELECT pg_catalog.count(*) FROM kingres.ledger_table t WHERE t.mode = 'a
                                   WHERE (x.oid = r.oid OR pg_catalog.pg_has_role(r.oid, x.oid, 'SET'))
                                     AND (x.rolsuper
                                          OR EXISTS (SELECT 1 FROM own o
-                                                     WHERE pg_catalog.pg_has_role(x.oid, o.oid, 'USAGE'))))
+                                                     WHERE pg_catalog.pg_has_role(x.oid, o.oid, 'USAGE'))
+                                         OR (r.oid >= 16384::pg_catalog.oid
+                                             AND (pg_catalog.pg_has_role(x.oid, 'pg_execute_server_program', 'USAGE')
+                                                  OR pg_catalog.pg_has_role(x.oid, 'pg_write_server_files', 'USAGE')))))
               ), can_make(oid) AS (
                   SELECT dn.oid FROM drop_now dn
+                  UNION
+                  SELECT r2.oid FROM pg_catalog.pg_roles r2
+                   WHERE NOT r2.rolsuper AND r2.oid >= 16384::pg_catalog.oid
+                     AND (pg_catalog.pg_has_role(r2.oid, 'pg_execute_server_program', 'MEMBER WITH ADMIN OPTION')
+                          OR pg_catalog.pg_has_role(r2.oid, 'pg_write_server_files', 'MEMBER WITH ADMIN OPTION'))
                   UNION
                   SELECT r.oid FROM pg_catalog.pg_roles r, can_make c
                    WHERE NOT r.rolsuper
@@ -2379,7 +2404,7 @@ SELECT (SELECT pg_catalog.count(*) FROM kingres.ledger_table t WHERE t.mode = 'a
                       WHERE v.finished_at IS NOT NULL
                       ORDER BY v.verification_id DESC LIMIT 1) lv ON true;
 COMMENT ON VIEW kingres.ledger_status IS
-    'One row: the number of append-only and updatable ledger tables, the latest block, the pending transactions and the age of the oldest, the last digest and the last finished verification, and the state of the block-building worker for this database (ok, failed with the delay before the next attempt and the last error, ...), and the owner of the database with whether it is a superuser, and the roles that are not superusers and can drop the database, and the ledger with it (database_droppers: the owner if it is not a superuser, every role with the privileges of the owner, every role that can SET ROLE to one of those or to a superuser; computed as PostgreSQL does; for a database owned by pg_database_owner, every role that owns a database of the cluster is taken as the owner), and the roles that cannot now and can make themselves able to without a superuser (database_potential_droppers: ADMIN OPTION, directly or through a chain, on a role that can drop it; a role with CREATEROLE has it on the roles it created). Not readable by PUBLIC.';
+    'One row: the number of append-only and updatable ledger tables, the latest block, the pending transactions and the age of the oldest, the last digest and the last finished verification, and the state of the block-building worker for this database (ok, failed with the delay before the next attempt and the last error, ...), and the owner of the database with whether it is a superuser, and the roles that are not superusers and can drop the database, and the ledger with it (database_droppers: the owner if it is not a superuser, every role with the privileges of the owner, every role that can SET ROLE to one of those or to a superuser; computed as PostgreSQL does; for a database owned by pg_database_owner, every role that owns a database of the cluster is taken as the owner), and the roles that cannot now and can make themselves able to without a superuser (database_potential_droppers: ADMIN OPTION, directly or through a chain, on a role that can drop it; a role with CREATEROLE has it on the roles it created; the members of pg_execute_server_program and pg_write_server_files count as superusers here, and the roles with ADMIN OPTION on those two as the second kind). Not readable by PUBLIC.';
 
 REVOKE ALL ON FUNCTION kingres.ledger_verify_recorded(bigint, bigint) FROM PUBLIC;
 REVOKE ALL ON kingres.ledger_status FROM PUBLIC;

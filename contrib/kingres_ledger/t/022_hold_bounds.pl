@@ -2,23 +2,20 @@
 #
 # contrib/kingres_ledger/t/022_hold_bounds.pl
 #
-# The edges of the limit on holding a lock (kingres_ledger.lock_hold_limit)
-# that the fourth review of the guard found:
+# The edges of the limit on holding a lock (kingres_ledger.lock_hold_limit),
+# as they are since a role that is not a superuser takes a lock of the extension
+# only in a statement of its own (L19-01, t/027):
 #
-#   L15-02  PREPARE TRANSACTION switched the timer off and the prepared
-#           transaction kept the registry's and the verifications' locks for ever.
-#           A transaction of a role that is not a superuser that holds a lock of
-#           the extension cannot be prepared; a superuser's can, and the lock is
-#           then held like any lock of a prepared transaction.
-#   L15-07  The timer was not switched off when a savepoint that took the last
-#           lock was rolled back, so a session that held nothing was ended.  The
-#           locks are tracked per subtransaction.
+#   L15-02  A prepared transaction keeps its locks until somebody ends it.  A
+#           role that is not a superuser cannot hold a lock in a transaction
+#           block, so it cannot prepare a transaction that holds one: the call
+#           is refused (25001) and nothing is prepared.  A superuser may, and the
+#           lock is then held like any lock of a prepared transaction.
 #   L15-12  The session that the limit ends gets a line in the server log that
 #           names the role, the lock and the limit.
 #   L15-06  The timer is switched off at the end of the transaction (a session
 #           that called a function once and then stays connected is not ended),
-#           also by COMMIT AND CHAIN and ROLLBACK AND CHAIN, and a chained
-#           transaction that takes a lock again is limited again.
+#           and a call that was refused leaves no timer behind.
 #
 # Other ways a lock or the timer could outlive what bounds it, and why they do
 # not: a WITH HOLD cursor holds no lock after the commit (tested); the code takes
@@ -28,7 +25,10 @@
 #
 # The limit is 2 s for the role "app"; the sessions that must survive sleep for
 # 3 s, which is longer than the limit, so a timer that was not switched off ends
-# them whatever the speed of the machine.
+# them whatever the speed of the machine.  The cases of the earlier versions of
+# this file that held a lock across statements (a savepoint that took it and was
+# rolled back, COMMIT AND CHAIN after it, two locks in a transaction block) have
+# no statement left to run: they are refusals, in t/027.
 #
 # Portions Copyright (c) 2026, RooyeKhat Media Co
 
@@ -38,7 +38,6 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
-use Time::HiRes qw(time);
 
 $ENV{PGOPTIONS} = '-c search_path=public';
 
@@ -75,7 +74,7 @@ $node->safe_psql('d', q{
 sub as_app
 {
 	my ($sql) = @_;
-	my ($ret, $out, $err) = $node->psql('d', $sql, extra_params => [ '-U', 'app' ]);
+	my ($ret, $out, $err) = $node->psql('d', $sql, extra_params => [ '-U', 'app' ], on_error_stop => 0);
 	return ($ret, $out, $err);
 }
 
@@ -104,21 +103,20 @@ sub nothing_held
 }
 
 my $ended = qr/FATAL:  terminating connection due to administrator command/;
+my $refused = qr/cannot run inside a transaction block for a role that is not a superuser/;
 
 #--------------------------------------------------------------------------
 # L15-02: PREPARE TRANSACTION
 #--------------------------------------------------------------------------
 {
 	my ($ret, $out, $err) = as_app("BEGIN;\nSELECT kingres.ledger_verify_recorded() > 0;\nPREPARE TRANSACTION 'p_verify';");
-	like($err, qr/cannot PREPARE a transaction that holds the verifications' lock of the ledger extension/,
-		'a role that is not a superuser cannot prepare a transaction that holds the verifications\' lock');
-	like($err, qr/DETAIL:.*lock_hold_limit/, 'the error says why');
+	like($err, qr/ledger_verify_recorded $refused/,
+		'a role that is not a superuser cannot take the verifications\' lock in a transaction it could prepare');
 	is(prepared_count(), '0', 'nothing was prepared');
 	is(nothing_held(), 'nothing held', 'and no lock is left: every other writer is served');
 
 	($ret, $out, $err) = as_app("BEGIN;\nSELECT kingres.ledger_enable('apptab');\nPREPARE TRANSACTION 'p_enable';");
-	like($err, qr/cannot PREPARE a transaction that holds the registry's lock of the ledger extension/,
-		'nor one that holds the registry\'s lock (ledger_enable)');
+	like($err, qr/ledger_enable $refused/, 'nor the registry\'s lock (ledger_enable)');
 	is(prepared_count(), '0', 'nothing was prepared');
 	is($node->safe_psql('d', q{SELECT count(*) FROM kingres.ledger_table WHERE relid = 'apptab'::regclass}), '0',
 		'the registration is gone with the transaction');
@@ -130,9 +128,9 @@ my $ended = qr/FATAL:  terminating connection due to administrator command/;
 	is(prepared_count(), '1', 'it is prepared');
 	$node->safe_psql('d', q{COMMIT PREPARED 'p_plain'});
 
-	# A savepoint rolled back first: the lock went with it, so the PREPARE is allowed.
+	# A refused call in a savepoint, then a PREPARE: nothing was taken, so it is allowed.
 	($ret, $out, $err) = as_app("BEGIN;\nSAVEPOINT s;\nSELECT kingres.ledger_verify_recorded() > 0;\nROLLBACK TO s;\nPREPARE TRANSACTION 'p_after_sp';");
-	is($ret, 0, 'a transaction whose lock was released with a savepoint can be prepared');
+	is($ret, 0, 'a transaction whose call was refused holds nothing and can be prepared');
 	$node->safe_psql('d', q{ROLLBACK PREPARED 'p_after_sp'});
 	is(nothing_held(), 'nothing held', 'and nothing is held when it is rolled back');
 }
@@ -149,7 +147,8 @@ my $ended = qr/FATAL:  terminating connection due to administrator command/;
 }
 
 #--------------------------------------------------------------------------
-# L15-07: subtransactions; and the timer at the end of every kind of transaction
+# L15-06: the timer at the end of every kind of transaction, and after a
+# refusal.  Each session below stays connected for 3 s, longer than the limit.
 #--------------------------------------------------------------------------
 my $log_start = -s $node->logfile;
 {
@@ -158,79 +157,50 @@ my $log_start = -s $node->logfile;
 	like($out, qr/still_here/, 'the session went on');
 
 	($ret, $out, $err) = as_app("BEGIN;\nSAVEPOINT s;\nSELECT kingres.ledger_verify_recorded() > 0;\nROLLBACK TO s;\nSELECT pg_sleep(3);\nSELECT 'still_here';\nCOMMIT;");
-	is($ret, 0, 'L15-07: a savepoint that took the lock is rolled back: the lock is gone, the session is not ended');
-	like($out, qr/still_here/, 'the session went on');
-
-	($ret, $out, $err) = as_app("BEGIN;\nSAVEPOINT a;\nSAVEPOINT b;\nSELECT kingres.ledger_verify_recorded() > 0;\nRELEASE b;\nROLLBACK TO a;\nSELECT pg_sleep(3);\nSELECT 'still_here';\nCOMMIT;");
-	is($ret, 0, 'a lock taken in a released savepoint belongs to its parent and goes with it');
+	like($err, qr/ledger_verify_recorded $refused/, 'a call in a savepoint is refused');
+	is($ret, 0, 'and the refusal leaves no timer behind: the session is not ended');
 	like($out, qr/still_here/, 'the session went on');
 
 	($ret, $out, $err) = as_app("BEGIN;\nDO \$\$ BEGIN BEGIN PERFORM kingres.ledger_verify_recorded(); RAISE EXCEPTION 'x'; EXCEPTION WHEN OTHERS THEN NULL; END; END \$\$;\nSELECT pg_sleep(3);\nSELECT 'still_here';\nCOMMIT;");
-	is($ret, 0, 'an EXCEPTION block that took the lock and failed: the lock is gone, the session is not ended');
+	is($ret, 0, 'a call in an EXCEPTION block is refused, and leaves no timer behind');
 	like($out, qr/still_here/, 'the session went on');
 
-	($ret, $out, $err) = as_app("BEGIN;\nSELECT kingres.ledger_verify_recorded() > 0;\nCOMMIT AND CHAIN;\nSELECT pg_sleep(3);\nSELECT 'still_here';\nCOMMIT;");
-	is($ret, 0, 'COMMIT AND CHAIN: the chained transaction holds nothing, the timer is off');
+	($ret, $out, $err) = as_app("SELECT kingres.ledger_verify_recorded() > 0;\nBEGIN;\nCOMMIT AND CHAIN;\nSELECT pg_sleep(3);\nSELECT 'still_here';\nCOMMIT;");
+	is($ret, 0, 'COMMIT AND CHAIN after a call that committed: nothing is held, the timer is off');
 	like($out, qr/still_here/, 'the session went on');
 
-	($ret, $out, $err) = as_app("BEGIN;\nSELECT kingres.ledger_verify_recorded() > 0;\nROLLBACK AND CHAIN;\nSELECT pg_sleep(3);\nSELECT 'still_here';\nCOMMIT;");
+	($ret, $out, $err) = as_app("SELECT kingres.ledger_verify_recorded() > 0;\nBEGIN;\nROLLBACK AND CHAIN;\nSELECT pg_sleep(3);\nSELECT 'still_here';\nCOMMIT;");
 	is($ret, 0, 'ROLLBACK AND CHAIN: the same');
 	like($out, qr/still_here/, 'the session went on');
 
-	($ret, $out, $err) = as_app("BEGIN;\nDECLARE c CURSOR WITH HOLD FOR SELECT 1;\nSELECT kingres.ledger_verify_recorded() > 0;\nCOMMIT;\nSELECT pg_sleep(3);\nFETCH c;\nSELECT 'still_here';");
+	($ret, $out, $err) = as_app("BEGIN;\nDECLARE c CURSOR WITH HOLD FOR SELECT 1;\nCOMMIT;\nSELECT kingres.ledger_verify_recorded() > 0;\nSELECT pg_sleep(3);\nFETCH c;\nSELECT 'still_here';");
 	is($ret, 0, 'a WITH HOLD cursor that outlives the transaction holds no lock of the extension: not ended');
 	like($out, qr/still_here/, 'the session went on');
 	is(lock_count($VERIFY), '0', 'no lock of the extension is held by it');
 }
 
 #--------------------------------------------------------------------------
-# The cases that must still be ended (controls), and the log line (L15-12)
+# The cases that must still be ended (controls), and the log line (L15-12): a
+# statement that holds a lock for longer than the limit.
 #--------------------------------------------------------------------------
 {
-	my ($ret, $out, $err) = as_app("BEGIN;\nSAVEPOINT a;\nSELECT kingres.ledger_verify_recorded() > 0;\nSAVEPOINT b;\nSELECT kingres.ledger_verify_recorded() > 0;\nROLLBACK TO b;\nSELECT pg_sleep(60);\nSELECT 'not_reached';");
-	like($err, $ended, 'a lock that is still held by the outer savepoint after an inner one is rolled back: the session is ended');
+	my ($ret, $out, $err) = as_app("SELECT kingres.ledger_verify_recorded() > 0, pg_sleep(60);\nSELECT 'not_reached';");
+	like($err, $ended, 'a statement that holds the verifications\' lock past the limit: the session is ended');
 	unlike($out, qr/not_reached/, 'before it went on');
 	ok($node->wait_for_log(qr/kingres_ledger: ended the session of role "app": it held the verifications' lock of the extension for longer than kingres_ledger\.lock_hold_limit \(2000 ms\)/, $log_start),
 		'L15-12: the server log says that the limit did it: the role, the lock and the limit');
+	ok($node->wait_for_log(qr/HINT:  A role that is not a superuser may hold a lock of the extension for the time of one statement only/, $log_start),
+		'L19-07: and what to do about it');
 	is(nothing_held(), 'nothing held', 'the lock went with the session');
 
 	$log_start = -s $node->logfile;
-	($ret, $out, $err) = as_app("BEGIN;\nSELECT kingres.ledger_verify_recorded() > 0;\nCOMMIT AND CHAIN;\nSELECT kingres.ledger_verify_recorded() > 0;\nSELECT pg_sleep(60);\nSELECT 'not_reached';");
-	like($err, $ended, 'a chained transaction that takes a lock again is limited again');
-	unlike($out, qr/not_reached/, 'before it went on');
-	ok($node->wait_for_log(qr/kingres_ledger: ended the session of role "app"/, $log_start), 'and the log says so');
-
-	$log_start = -s $node->logfile;
-	($ret, $out, $err) = as_app("BEGIN;\nSELECT kingres.ledger_enable('apptab2');\nSELECT kingres.ledger_verify_recorded() > 0;\nSELECT pg_sleep(60);");
-	like($err, $ended, 'ledger_enable and a recorded verification together: ended');
+	($ret, $out, $err) = as_app("SELECT kingres.ledger_enable('apptab2'), kingres.ledger_verify_recorded() > 0, pg_sleep(60);\nSELECT 'not_reached';");
+	like($err, $ended, 'ledger_enable and a recorded verification together, held past the limit: ended');
 	ok($node->wait_for_log(qr/it held the registry's lock and the verifications' lock of the extension for longer than/, $log_start),
 		'the log line names both locks');
 	is(nothing_held(), 'nothing held', 'both locks went');
-}
-
-#--------------------------------------------------------------------------
-# Work that makes progress gets a new period (L15-06): a table that takes longer
-# to enter than the whole limit is entered, and the session is not ended.  The
-# precondition is part of the test: the call must have lasted longer than the
-# limit, or nothing was shown.
-#--------------------------------------------------------------------------
-$node->safe_psql('postgres', q{CREATE DATABASE d2});
-$node->safe_psql('d2', q{
-	CREATE EXTENSION kingres_ledger;
-	GRANT USAGE ON SCHEMA kingres TO PUBLIC;
-	GRANT CREATE ON SCHEMA public TO app;
-	GRANT EXECUTE ON FUNCTION kingres.ledger_enable(regclass, text) TO app;
-	CREATE TABLE big AS SELECT g AS id, repeat('x', 20) AS body FROM generate_series(1, 300000) g;
-	ALTER TABLE big OWNER TO app;
-	ALTER ROLE app IN DATABASE d2 SET kingres_ledger.lock_hold_limit = '1s';
-});
-{
-	my $t0 = time();
-	my ($ret, $out, $err) = $node->psql('d2', q{SELECT kingres.ledger_enable('big') IS NULL}, extra_params => [ '-U', 'app' ]);
-	my $took = time() - $t0;
-	cmp_ok($took, '>', 1, "precondition: entering 300000 rows took longer than the limit of 1 s ($took s)");
-	is($ret, 0, 'a ledger_enable that takes longer than the limit but makes progress is not ended') or diag($err);
-	is($node->safe_psql('d2', q{SELECT count(*) FROM kingres.ledger_entry}), '300000', 'and every row was entered');
+	is($node->safe_psql('d', q{SELECT count(*) FROM kingres.ledger_table WHERE relid = 'apptab2'::regclass}), '0',
+		'and the registration that was not committed is gone');
 }
 
 #--------------------------------------------------------------------------
