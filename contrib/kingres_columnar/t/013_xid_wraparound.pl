@@ -10,9 +10,12 @@
 # one that is left (relfrozenxid), so that autovacuum's protection against
 # wraparound reaches the table.  This test consumes ids with the
 # xid_wraparound test module (src/test/modules/xid_wraparound of the
-# PostgreSQL tree; skipped where it is not installed), with autovacuum doing
-# the freezing, and at the same point of each lap holds a transaction whose
-# id has the number the table was created with.
+# PostgreSQL tree), with autovacuum doing the freezing, and at the same point of
+# each lap holds a transaction whose id has the number the table was created with.
+# Where the module is not installed the test is a counted skip that names the
+# reason and says the path was not tested (KC_REQUIRE_WRAPAROUND=1 makes it a
+# failure).  Each lap waits for the age of the columnar table, of a converted table
+# and of a heap twin, and shows that autovacuum visited each (C10-07).
 #
 # It takes several minutes; KC_SKIP_WRAPAROUND=1 skips it.
 #
@@ -47,12 +50,26 @@ log_autovacuum_min_duration = 0
 });
 $node->start;
 
+# The test cannot run without the module.  That must show in the result (C10-07): a counted skip with the
+# reason, not a silent pass; KC_REQUIRE_WRAPAROUND=1 makes it a failure, for the runs that must have it (the
+# in-tree run installs the module; an out-of-tree run against an installation that lacks it does not).
 my $avail = $node->safe_psql('postgres',
 	q{SELECT count(*) FROM pg_available_extensions WHERE name = 'xid_wraparound'});
 if ($avail ne '1')
 {
 	$node->stop;
-	plan skip_all => 'the xid_wraparound test module is not installed';
+	my $why = 'the xid_wraparound test module (src/test/modules/xid_wraparound of the PostgreSQL tree) is not installed in this installation: the anti-wraparound path of the extension was NOT tested by this run';
+	plan tests => 1;
+	if ($ENV{KC_REQUIRE_WRAPAROUND})
+	{
+		fail("the xid_wraparound test module is installed (KC_REQUIRE_WRAPAROUND is set): $why");
+	}
+	else
+	{
+		SKIP: { skip $why, 1; }
+		diag("SKIPPED t/013_xid_wraparound.pl: $why");
+	}
+	exit 0;
 }
 
 $node->safe_psql('postgres', q{
@@ -133,8 +150,13 @@ sub consume_to
 		# table 40 to 50 million old, and the next batch ends at 140 to 150 million.  Heap does
 		# the same in that band (checked: both kinds of table stay at 145 million for as long as
 		# one waits and are vacuumed once past 150 million).
-		wait_for(q{SELECT age(relfrozenxid) < 160000000 FROM pg_class WHERE relname = 'c'},
-			'autovacuum did not advance relfrozenxid of the columnar table');
+		# every table the test watches: the columnar table, the converted one (a table that came from
+		# heap, with no creation id known) and the heap twin (C10-07: only the first was waited for)
+		foreach my $t ('c', 'c0', 'h')
+		{
+			wait_for(qq{SELECT age(relfrozenxid) < 160000000 FROM pg_class WHERE relname = '$t'},
+				"autovacuum did not advance relfrozenxid of the table $t");
+		}
 		wait_for(q{SELECT age(datfrozenxid) < 400000000 FROM pg_database WHERE datname = 'postgres'},
 			'datfrozenxid did not advance');
 	}
@@ -142,8 +164,17 @@ sub consume_to
 	$node->safe_psql('postgres', "SELECT consume_xids($left)") if $left > 0;
 }
 
+# How many times autovacuum has visited each table, as the statistics say (C10-07: the test must show that a
+# vacuum ran in each lap, not only that no table is too old, which a table that was never due would also pass).
+sub av_count
+{
+	my ($t) = @_;
+	return $node->safe_psql('postgres', qq{SELECT coalesce(max(autovacuum_count), 0) FROM pg_stat_all_tables WHERE relname = '$t'});
+}
+
 foreach my $lap (1, 2)
 {
+	my %av_before = map { $_ => av_count($_) } ('c', 'c0', 'h');
 	my $cur = current_xid();
 	my $target = (int($cur / 4294967296) + 1) * 4294967296 + $x - 40;
 	consume_to($target);
@@ -187,6 +218,17 @@ foreach my $lap (1, 2)
 		is($node->safe_psql('postgres', q{SELECT count(*) FROM c0}), 100,
 			"lap $lap: the converted table reads");
 	}
+	# a vacuum ran in this lap for each table, and relminmxid is a real id, the same as the heap twin's
+	foreach my $t ('c', 'c0', 'h')
+	{
+		wait_for(qq{SELECT autovacuum_count > $av_before{$t} FROM pg_stat_all_tables WHERE relname = '$t'},
+			"autovacuum did not visit the table $t in lap $lap");
+		pass("lap $lap: autovacuum visited $t (" . av_count($t) . " visits, " . $av_before{$t} . " before the lap)");
+	}
+	is($node->safe_psql('postgres', q{SELECT relminmxid::text::bigint > 0 FROM pg_class WHERE relname = 'c'}), 't',
+		"lap $lap: relminmxid of the columnar table is a real id");
+	is($node->safe_psql('postgres', q{SELECT count(DISTINCT relminmxid::text) FROM pg_class WHERE relname IN ('c', 'c0', 'h')}), 1,
+		"lap $lap: the columnar tables and the heap twin have the same relminmxid (no multixact is made here)");
 	$node->safe_psql('postgres', 'VACUUM c');
 	is($node->safe_psql('postgres', 'SELECT count(*) FROM c'), 2000 + $lap,
 		"lap $lap: the table has its rows");

@@ -1071,8 +1071,12 @@ kc_write_is_late(void)
  *	   transaction in progress BEFORE this module's own pre-commit or
  *	   pre-prepare callback has run.  A critical section entered after it (a
  *	   callback of another module that runs later) is DECIDED, not LIVE:
- *	   nothing of this module runs again before the commit record, so no error
- *	   can be raised for a remembered refusal, and the warning says so (C9-01).
+ *	   no transaction callback of this module runs again for the top-level
+ *	   transaction before the commit record, so no error can be raised for a
+ *	   remembered refusal, and the warning says so (C9-01).  Inside a
+ *	   subtransaction that such a callback began it is LIVE again (C10-03): the
+ *	   callbacks of this module for the subtransaction do run, and its
+ *	   pre-commit raises.
  *	   The refusal is remembered (statics, so that
  *	   nothing is allocated) and raised as an ERROR at the next moment an error
  *	   is allowed: the pre-commit of the subtransaction that would have owned
@@ -1123,16 +1127,23 @@ static char kc_lost_name[NAMEDATALEN];
  * Whether a critical section is open at a moment at which this module's own
  * pre-commit (or pre-prepare) callback has already run: a callback of another
  * module that runs after it entered the critical section.  Nothing of this
- * extension runs between that moment and the commit record (PostgreSQL's own
- * work after the pre-commit callbacks, CommitTransaction and PrepareTransaction,
- * has no hook that an extension can use, and an error is allowed there only for
- * PostgreSQL's own checks), so a call refused then cannot be remembered and
- * raised later: the refusal is final, like one at XACT_EVENT_COMMIT.
+ * extension's transaction callback runs between that moment and the commit
+ * record (PostgreSQL's own work after the pre-commit callbacks,
+ * CommitTransaction and PrepareTransaction, has no hook that an extension can
+ * use, and an error is allowed there only for PostgreSQL's own checks), so a
+ * call refused then cannot be remembered and raised later: the refusal is
+ * final, like one at XACT_EVENT_COMMIT.  That holds only at the top level
+ * (C10-03): a callback of a later module can begin a subtransaction, and the
+ * callbacks of this module for the subtransaction (its start, its pre-commit,
+ * its commit) do run; a call refused in a critical section inside it is LIVE,
+ * remembered for that subtransaction, and its pre-commit raises the error, as
+ * for any subtransaction.
  */
 static bool
 kc_crit_after_own_precommit(void)
 {
-	return IsTransactionState() && CritSectionCount > 0 && kc_commit_flushed;
+	return IsTransactionState() && CritSectionCount > 0 && kc_commit_flushed &&
+		GetCurrentTransactionNestLevel() == 1;
 }
 
 static KcEnding

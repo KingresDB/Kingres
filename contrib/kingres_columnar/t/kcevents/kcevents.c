@@ -42,6 +42,12 @@
  *	                  makes a build with assertions trap any allocation that the
  *	                  access method makes on the way (the refusal path of the
  *	                  extension allocates nothing)
+ *	  kcevents.sub    on: begin an internal subtransaction around the operation
+ *	                  (and around the critical section, if one is asked for) and
+ *	                  release it afterwards, as a callback of a module that runs
+ *	                  after the access method's own pre-commit can (C10-03); an
+ *	                  error of the release rolls the subtransaction back and is
+ *	                  raised again
  *	  kcevents.once   on: act at the first moment the setting names and not again
  *	                  in the same transaction (a script with several savepoints
  *	                  then makes one call and not one for each of them)
@@ -147,6 +153,7 @@ static int	kce_value = 1;
 static int	kce_count = 1;
 static bool kce_crit = false;
 static bool kce_once = false;
+static bool kce_sub = false;
 static bool kce_fired = false;
 static bool kce_hook_raise = false;
 
@@ -534,6 +541,39 @@ kce_event(const char *name)
 	if (kce_selected(name) && !(kce_once && kce_fired))
 	{
 		kce_fired = true;
+		if (kce_sub)
+		{
+			MemoryContext oldcxt = CurrentMemoryContext;
+			ResourceOwner oldowner = CurrentResourceOwner;
+
+			BeginInternalSubTransaction(NULL);
+			MemoryContextSwitchTo(oldcxt);
+			PG_TRY();
+			{
+				if (kce_crit)
+					START_CRIT_SECTION();
+				kce_write();
+				if (kce_crit)
+					END_CRIT_SECTION();
+				ReleaseCurrentSubTransaction();
+				MemoryContextSwitchTo(oldcxt);
+				CurrentResourceOwner = oldowner;
+			}
+			PG_CATCH();
+			{
+				ErrorData  *ed;
+
+				MemoryContextSwitchTo(oldcxt);
+				ed = CopyErrorData();
+				FlushErrorState();
+				RollbackAndReleaseCurrentSubTransaction();
+				MemoryContextSwitchTo(oldcxt);
+				CurrentResourceOwner = oldowner;
+				ReThrowError(ed);
+			}
+			PG_END_TRY();
+			return;
+		}
 		if (kce_crit)
 			START_CRIT_SECTION();
 		kce_write();
@@ -859,6 +899,10 @@ _PG_init(void)
 	DefineCustomBoolVariable("kcevents.crit",
 							 "Run the operation inside a critical section.",
 							 NULL, &kce_crit, false,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("kcevents.sub",
+							 "Run the operation inside an internal subtransaction.",
+							 NULL, &kce_sub, false,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("kcevents.once",
 							 "Act only once per transaction at the moment named.",

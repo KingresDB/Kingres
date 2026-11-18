@@ -24,6 +24,7 @@
 #include "nodes/execnodes.h"
 #include "fmgr.h"
 #include "storage/bufmgr.h"
+#include "storage/lockdefs.h"
 #include "utils/relcache.h"
 #include "utils/resowner.h"
 #include "utils/snapshot.h"
@@ -357,6 +358,17 @@ extern Oid	kc_catalog_index_oid(void);
 extern Oid	kc_am_oid(void);
 extern bool kc_rel_is_columnar(Relation rel);
 extern Snapshot kc_catalog_snapshot(Snapshot snap, bool *is_mvcc);
+extern Snapshot kc_latest_snapshot(void);
+
+/* the relations the check functions lock without waiting (kc_catalog_lock_nowait) */
+typedef struct KcCatLocks
+{
+	int			n;
+	Oid			oid[12];
+	LOCKMODE	mode[12];
+} KcCatLocks;
+extern bool kc_catalog_lock_nowait(KcCatLocks *l, LOCKMODE mode);
+extern void kc_catalog_unlock(KcCatLocks *l);
 extern void kc_catalog_snapshot_report_conflicts(Snapshot snap, bool is_mvcc);
 extern KcStripeInfo *kc_catalog_load(Relation rel, Snapshot snap, int *nstripes);
 extern void kc_catalog_insert(Relation rel, const KcStripeInfo *si,
@@ -364,7 +376,7 @@ extern void kc_catalog_insert(Relation rel, const KcStripeInfo *si,
 							  const char *col_stats, int stats_len, bool frozen,
 							  bool maintenance);
 extern int	kc_catalog_delete_uid(uint64 uid);
-extern int	kc_catalog_delete_stripe(uint64 uid, uint64 stripe_id);
+extern int	kc_catalog_delete_stripe(uint64 uid, uint64 stripe_id, bool wait);
 extern bool kc_catalog_uid_in_use(uint64 uid);
 extern uint64 kc_catalog_file_uid(Form_pg_class cl);
 extern bool kc_catalog_available(void);

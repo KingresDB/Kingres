@@ -71,6 +71,21 @@
 # for a subtransaction begun there applies (heap's exception blocks end the session
 # the same way).
 #
+# C10-03.  A critical section inside a subtransaction that a callback of a later module began, after
+# the extension's own pre-commit, is alive (the extension's callbacks for the subtransaction run, its
+# pre-commit raises): the cells "in a critical section inside a subtransaction begun at pre_commit /
+# pre_prepare" (module setting kcevents.sub), for insert, truncate and vacuum, in both orders.
+#
+# C10-05.  relation_nontransactional_truncate is carried out only for a table made, or given a new
+# file, in the transaction (the cells with TRUNCATE and with DROP/CREATE in the script); for any other
+# table it is an error where an error is allowed (the loop over the moments, and the review's
+# sequence with 30000 rows), and the usual warning where it is not.
+#
+# C10-07.  What is not run on a build with assertions is counted and named at the end of the output
+# of each order of loading (diag), and the README lists it cell by cell (the reads at the moments where
+# PostgreSQL's own assertions stop the server for heap as well); those cells run on a build without
+# assertions.
+#
 # It needs a compiler and the server's headers (KcProbe.pm).
 #
 # Portions Copyright (c) 2026, RooyeKhat Media Co
@@ -90,6 +105,10 @@ use Test::More;
 $ENV{PGOPTIONS} = '-c statement_timeout=240s';
 
 my $dir = build_module('kcevents');
+
+# the cells that are not run on a build with assertions (C10-07), counted for each order of loading and
+# named at the end of the run
+my %skipped;
 
 # the moments: name (the setting), script, rows afterwards for a call that does not
 # fail the transaction, rows for one that does, kind
@@ -127,7 +146,9 @@ my @moments = (
 #   how many "done" lines, error text where an error is allowed (undef: it works there),
 #   kind: g guarded, r reads, s reads only the file, nothing else ]
 my %ops = (
-	ntrunc => [ 'truncate', 1, 1, undef, 'g' ],
+	# C10-05: on a table that existed before the transaction, where an error is allowed, an error (the
+	# table of this file is always an old one there; the table made in the transaction is below)
+	ntrunc => [ 'truncate', 1, 1, 'cannot truncate columnar table "t" in place: it was not created or given a new file in this transaction', 'g' ],
 	setnew => [ 'new file', 1, 1, undef, 'g', 'noallowed' ],
 	copydata => [ 'file copy', 1, 1, undef, 'g', 'noallowed' ],
 	cluster => [ 'rewrite', 1, 1, undef, 'g', 'noallowed' ],
@@ -285,6 +306,7 @@ CREATE FUNCTION kingres.columnar_note_rewrite(rel regclass) RETURNS void
 			{
 				SKIP:
 				{
+					$skipped{$order}++;
 					skip "$order: $name: a read at a moment where an error is forbidden is PostgreSQL's own rule (assertions in the relation cache, the resource owner)", 1;
 					ok(1);
 				}
@@ -362,12 +384,10 @@ CREATE FUNCTION kingres.columnar_note_rewrite(rel regclass) RETURNS void
 			my ($at, $script) = @$m;
 			my $name = "$op at $at";
 
-			# a truncate between the two phases of the commit of a subtransaction (the module's
-			# callback runs after the access method's first phase) is refused with an error,
-			# which is allowed there: the buffers are prepared for the hand-over and must not change
+			# a truncate of an old table is an error everywhere an error is allowed (C10-05); the
+			# cells of a table made in the transaction, with the error between the two phases of the
+			# hand-over of a subtransaction, are in the block "a truncate that is carried out" below
 			my $err_here = $err_allowed;
-			$err_here = 'columnar table cannot be truncated while a subtransaction is being committed'
-			  if $op eq 'ntrunc' && $at eq 'pre_commit_sub' && $order eq 'after';
 
 			$fresh->();
 			my ($out, $err, $log) = $run->($at, $script{$script}, $op);
@@ -389,17 +409,118 @@ CREATE FUNCTION kingres.columnar_note_rewrite(rel regclass) RETURNS void
 	}
 
 	# ------------------------------------------------------------------
-	# a truncate that is carried out where it may be (C8-01, the allowed side): the table
-	# is empty and readable, and a later write works
+	# a truncate that is carried out where it may be (C8-01, the allowed side): only for a table
+	# that was made, or given a new file, in this transaction (C10-05: the only case PostgreSQL
+	# itself calls it for, and the only one where an abort removes the file anyway).  The table
+	# is empty and readable, and a later write works.
 	# ------------------------------------------------------------------
 	{
+		# a table given a new file by TRUNCATE in this transaction, and one made in it
+		my %mk = (
+			truncate => "TRUNCATE t; INSERT INTO t SELECT generate_series(1, 5);",
+			created => "DROP TABLE t; CREATE TABLE t (a int) USING columnar; INSERT INTO t SELECT generate_series(1, 5);",
+		);
+		foreach my $how ('truncate', 'created')
+		{
+			$fresh->();
+			my ($out, $err, $log) = $run->('pre_commit', "BEGIN; $mk{$how} SELECT kcevents_open('t'); COMMIT;", 'ntrunc');
+			unlike($err, qr/ERROR:|refused on columnar/, "$order: relation_nontransactional_truncate at pre-commit on a table ($how) of this transaction: carried out");
+			is($rows->(), '', "$order: ... the table is empty");
+			is($q->("SELECT count(*) FROM kingres.columnar_check()"), 0, "$order: ... and the file and the stripe rows agree");
+			$q->("INSERT INTO t VALUES (7)");
+			is($rows->(), '7', "$order: ... and it is written again");
+			is($q->("SELECT rows FROM kingres.columnar_info('t')"), 1, "$order: ... the catalog counts the new row only");
+		}
+
+		# the other moments where an error is allowed, on such a table: carried out as before
+		# (between the two phases of the commit of a subtransaction, after the extension's callback,
+		# the error that has always been there)
+		foreach my $m (['pre_prepare', 'prepare'], ['start_sub', 'sub'], ['pre_commit_sub', 'sub'])
+		{
+			my ($at, $script) = @$m;
+			(my $s2 = $script{$script}) =~ s/^BEGIN; /BEGIN; $mk{created} /;
+			$fresh->();
+			my ($out, $err, $log) = $run->($at, $s2, 'ntrunc');
+			$alive->("ntrunc of a table made in the transaction at $at", $log);
+			if ($at eq 'pre_commit_sub' && $order eq 'after')
+			{
+				like($err, qr/ERROR:  columnar table cannot be truncated while a subtransaction is being committed/,
+					"$order: ntrunc of a table made in the transaction at $at: the error of the first phase of the hand-over");
+			}
+			else
+			{
+				unlike($err, qr/ERROR:|refused on columnar/, "$order: ntrunc of a table made in the transaction at $at: carried out");
+				cmp_ok(scalar(() = $log =~ /kcevents: ntrunc done/g), '>=', 1, "$order: ... and returned");
+				is($q->("SELECT count(*) FROM t") =~ /^\d+$/ ? 1 : 0, 1, "$order: ... and the table is readable");
+			}
+			is($q->("SELECT kingres.columnar_check_clean()"), 't', "$order: ntrunc of a table made in the transaction at $at: the check is clean");
+		}
+
+		# C10-05: the review's sequence.  A table that existed (30000 rows, committed earlier), a module
+		# that empties it in place at the pre-commit, and a transaction that then fails (here the
+		# refusal itself is the error; the sequence in the review had another module's error after it).
+		# Before the fix the abort brought the catalog rows back while the file was cut and the table
+		# could not be read.
 		$fresh->();
+		$q->("INSERT INTO t SELECT generate_series(1000, 30999)");
+		my $stripes = $q->("SELECT count(*) FROM kingres.columnar_stripes('t')");
+		my $count = $q->("SELECT count(*) FROM t");
 		my ($out, $err, $log) = $run->('pre_commit', "BEGIN; SELECT kcevents_open('t'); COMMIT;", 'ntrunc');
-		is($rows->(), '', "$order: relation_nontransactional_truncate at pre-commit: the table is empty");
-		is($q->("SELECT count(*) FROM kingres.columnar_check()"), 0, "$order: ... and the file and the stripe rows agree");
-		$q->("INSERT INTO t VALUES (7)");
-		is($rows->(), '7', "$order: ... and it is written again");
-		is($q->("SELECT rows FROM kingres.columnar_info('t')"), 1, "$order: ... the catalog counts the new row only");
+		like($err, qr/ERROR:  cannot truncate columnar table "t" in place: it was not created or given a new file in this transaction/,
+			"$order: ntrunc of a table that existed before the transaction: an error (C10-05)");
+		is($q->("SELECT count(*) FROM t"), $count, "$order: ... the table reads, with all its rows (it is not destroyed outside the transaction)");
+		is($q->("SELECT count(*) FROM kingres.columnar_stripes('t')"), $stripes, "$order: ... and has its stripes");
+		is($q->("SELECT kingres.columnar_check_clean()"), 't', "$order: ... and the check is clean (no stripe row without its data)");
+		# the same where an error is forbidden: refused with a warning, nothing changed
+		($out, $err, $log) = $run->('commit', $script{commit}, 'ntrunc');
+		like($err, qr/WARNING:  truncate refused on columnar table "t"/, "$order: ... where an error is forbidden: the warning of every refusal");
+		is($q->("SELECT count(*) FROM t"), $count + 1, "$order: ... and nothing else changed (the row of the script, committed)");
+	}
+
+	# ------------------------------------------------------------------
+	# C10-03: a critical section after the extension's own pre-commit, inside a subtransaction that
+	# a later module began.  The callbacks of the extension for the subtransaction do run, so the
+	# refusal is alive: remembered for the subtransaction, and its pre-commit raises, as for any
+	# subtransaction (the top-level cell, a critical section at the pre-commit itself, is decided and
+	# commits without the call: moments above).  A call that may be skipped (vacuum) is not made worse
+	# by the subtransaction: warning, and the transaction commits.
+	# ------------------------------------------------------------------
+	foreach my $op ('insert', 'ntrunc', 'vacuum')
+	{
+		foreach my $m (['pre_commit', 'commit'], ['pre_prepare', 'prepare'])
+		{
+			my ($at, $script) = @$m;
+			my $name = "$op in a critical section inside a subtransaction begun at $at";
+			my $what = $op eq 'insert' ? 'insert' : $op eq 'ntrunc' ? 'truncate' : 'vacuum';
+
+			$fresh->();
+			my ($out, $err, $log) = $run->($at, $script{$script}, $op, "SET kcevents.crit = on;\nSET kcevents.sub = on;\n");
+			$alive->($name, $log);
+			like($err, qr/WARNING:  $what refused on columnar table "t": inside a critical section/, "$order: $name: refused with a warning");
+			if ($op eq 'vacuum')
+			{
+				like($err, qr/skipping this call loses nothing of the transaction/, "$order: $name: a call that may be skipped says so");
+				unlike($err, qr/ERROR:/, "$order: $name: no error");
+				is($rows->(), "$base,100", "$order: $name: the transaction commits");
+			}
+			else
+			{
+				like($err, qr/the transaction is still open and fails with an error at its next pre-commit/,
+					"$order: $name: the detail says that the transaction is alive");
+				unlike($err, qr/Nothing of this extension runs again|it does so without this call/, "$order: $name: ... and not that it commits without the call");
+				like($err, qr/ERROR:  a call on columnar table "t" was refused earlier in this transaction, so it cannot commit/,
+					"$order: $name: the pre-commit of the subtransaction raises");
+				is($rows->(), $base, "$order: $name: the transaction failed and the table has what it had");
+			}
+			is($q->("SELECT count(*) FROM pg_prepared_xacts"), 0, "$order: $name: no prepared transaction is left");
+			is($q->("SELECT kingres.columnar_check_clean()"), 't', "$order: $name: the check is clean");
+		}
+	}
+	# the transaction after it is normal (the state of the refusal went with the aborted subtransaction)
+	{
+		$fresh->();
+		$q->("INSERT INTO t VALUES (200)");
+		is($rows->(), "$base,200", "$order: the next transaction of a session that had such a failure writes and commits");
 	}
 
 	# ------------------------------------------------------------------
@@ -508,6 +629,7 @@ CREATE FUNCTION kingres.columnar_note_rewrite(rel regclass) RETURNS void
 				{
 					SKIP:
 					{
+						$skipped{$order}++;
 						skip "$order: $name: a read at a moment where an error is forbidden is PostgreSQL's own rule on a build with assertions", 1;
 						ok(1);
 					}
@@ -543,6 +665,7 @@ CREATE FUNCTION kingres.columnar_note_rewrite(rel regclass) RETURNS void
 				{
 					SKIP:
 					{
+						$skipped{$order}++;
 						skip "$order: $name: a set-returning function is called through the function manager, which a build with assertions refuses here", 1;
 						ok(1);
 					}
@@ -571,6 +694,9 @@ RESET kcevents.at; RESET kcevents.op;", stdout => \$out, stderr => \$err, on_err
 	}
 
 	$node->stop;
+	diag($skipped{$order}
+		? "$order: $skipped{$order} cells were NOT run: this server is built with assertions, and a read of a table at a moment where an error is forbidden stops it there, for heap as for columnar (PostgreSQL's own rule).  They are run on a server built without assertions (README, \"Writes while a transaction is ending\")."
+		: "$order: every cell was run (this server is built without assertions)");
 }
 
 done_testing();

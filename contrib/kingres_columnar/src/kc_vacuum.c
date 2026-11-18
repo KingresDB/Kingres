@@ -25,8 +25,11 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
+#include "access/skey.h"
 #include "access/table.h"
 #include "access/xact.h"
+#include "catalog/indexing.h"
+#include "catalog/pg_class.h"
 #include "catalog/storage.h"
 #include "commands/dbcommands.h"
 #include "commands/vacuum.h"
@@ -34,20 +37,26 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
+#include "storage/latch.h"
 #include "storage/lmgr.h"
 #include "storage/procarray.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
+#include "utils/wait_event.h"
 
 #include "kingres_columnar.h"
 
 /*
  * The first block past the last stripe that anything may still need: a
  * stripe whose catalog row is live, in progress, or deleted but not yet
- * invisible to every snapshot.  The caller holds the relation exclusively,
- * so no writer is in the middle of a flush.
+ * invisible to every snapshot.  With the relation held exclusively no writer is
+ * in the middle of a flush and the answer is exact; with the share-update lock
+ * of the vacuum alone it is an estimate (pages a writer has appended and not yet
+ * entered in the catalog look like a tail), good enough to decide whether the
+ * exclusive lock is worth asking for, and checked again under it.
  */
 static BlockNumber
 kc_needed_blocks(Relation rel)
@@ -88,6 +97,103 @@ kc_needed_blocks(Relation rel)
 	return (BlockNumber) Min(maxend, (uint64) MaxBlockNumber);
 }
 
+/*
+ * The rule of heap's vacuum (should_attempt_truncation and lazy_truncate_heap
+ * in vacuumlazy.c, the same in PostgreSQL 18 and 19), applied to the tail of
+ * unreferenced pages:
+ *
+ *	 - a tail is worth removing when it is not empty and holds at least
+ *	   KC_TRUNCATE_MINIMUM pages or a sixteenth of the file;
+ *	 - not while the wraparound failsafe is active;
+ *	 - the exclusive lock is asked for without waiting, retried every 50 ms for
+ *	   5 seconds (checking for interrupts), after which the truncation is given
+ *	   up for this visit;
+ *	 - under the lock the file is measured again: if it has grown, give up (the
+ *	   new pages belong to a writer); else the tail is worked out again, exactly
+ *	   now that no writer can be in the middle of a flush, and removed.
+ *
+ * Where it differs from heap: the decision is made from the stripe catalog and
+ * the file size, not from a scan that notes the last page with data, and heap's
+ * loop that goes on while a lock waiter interrupted the scan of the tail has no
+ * counterpart (finding the tail is one catalog read, which a waiter does not
+ * wait behind).  The thresholds are heap's.
+ */
+#define KC_TRUNCATE_MINIMUM				1000
+#define KC_TRUNCATE_FRACTION			16
+#define KC_TRUNCATE_LOCK_WAIT_INTERVAL	50	/* ms */
+#define KC_TRUNCATE_LOCK_TIMEOUT		5000	/* ms */
+
+static void
+kc_truncate_tail(Relation rel)
+{
+	BlockNumber orig;
+	BlockNumber need;
+	BlockNumber freeable;
+	int			retry = 0;
+
+	if (VacuumFailsafeActive)
+		return;
+	orig = RelationGetNumberOfBlocks(rel);
+	need = kc_needed_blocks(rel);
+	if (need >= orig)
+		return;
+	freeable = orig - need;
+	if (!(freeable >= KC_TRUNCATE_MINIMUM || freeable >= orig / KC_TRUNCATE_FRACTION))
+		return;
+
+	while (!ConditionalLockRelation(rel, AccessExclusiveLock))
+	{
+		CHECK_FOR_INTERRUPTS();
+		if (++retry > (KC_TRUNCATE_LOCK_TIMEOUT / KC_TRUNCATE_LOCK_WAIT_INTERVAL))
+		{
+			ereport(DEBUG2,
+					(errmsg("\"%s\": stopping truncate due to conflicting lock request",
+							RelationGetRelationName(rel))));
+			return;
+		}
+		(void) WaitLatch(MyLatch,
+						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 KC_TRUNCATE_LOCK_WAIT_INTERVAL,
+						 WAIT_EVENT_VACUUM_TRUNCATE);
+		ResetLatch(MyLatch);
+	}
+
+	/* the file grew while the lock was awaited: those pages are a writer's */
+	if (RelationGetNumberOfBlocks(rel) == orig)
+	{
+		need = kc_needed_blocks(rel);
+		if (need < orig)
+			RelationTruncate(rel, need);
+	}
+	UnlockRelation(rel, AccessExclusiveLock);
+}
+
+/*
+ * The relfrozenxid that pg_class holds for the table now: vac_update_relstats
+ * only moves it forward, so after a visit it can be later than the id the
+ * vacuum passed in, and the log line says what is stored (C10-04).  The change
+ * is made in place on the tuple, so a scan sees it at once.
+ */
+static TransactionId
+kc_stored_relfrozenxid(Relation rel)
+{
+	Relation	pgclass = table_open(RelationRelationId, AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	TransactionId result = InvalidTransactionId;
+
+	ScanKeyInit(&key, Anum_pg_class_oid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(RelationGetRelid(rel)));
+	scan = systable_beginscan(pgclass, ClassOidIndexId, true, NULL, 1, &key);
+	tup = systable_getnext(scan);
+	if (HeapTupleIsValid(tup))
+		result = ((Form_pg_class) GETSTRUCT(tup))->relfrozenxid;
+	systable_endscan(scan);
+	table_close(pgclass, AccessShareLock);
+	return result;
+}
+
 void
 kc_relation_vacuum(KC_VACUUM_PARAMS)
 {
@@ -119,21 +225,14 @@ kc_relation_vacuum(KC_VACUUM_PARAMS)
 	}
 
 	/*
-	 * Give back the unreferenced tail, if no one is using the table.  The
-	 * lock is conditional, as lazy_truncate_heap does, so VACUUM never waits
-	 * behind a query; on a standby the lock is WAL-logged and cancels
-	 * conflicting queries.
+	 * Give back the unreferenced tail, if it is worth it (C10-06): the rule of
+	 * heap's vacuum, which takes the exclusive lock only for a tail worth
+	 * removing, because that lock is WAL-logged and cancels the queries that
+	 * hold the table on a hot standby.  The decision is made under the lock
+	 * the vacuum already holds.
 	 */
-	if (params->truncate != VACOPTVALUE_DISABLED &&
-		ConditionalLockRelation(rel, AccessExclusiveLock))
-	{
-		BlockNumber need = kc_needed_blocks(rel);
-
-		nblocks = RelationGetNumberOfBlocks(rel);
-		if (need < nblocks)
-			RelationTruncate(rel, need);
-		UnlockRelation(rel, AccessExclusiveLock);
-	}
+	if (params->truncate != VACOPTVALUE_DISABLED)
+		kc_truncate_tail(rel);
 
 	(void) kc_catalog_reconcile();
 
@@ -174,7 +273,7 @@ kc_relation_vacuum(KC_VACUUM_PARAMS)
 								 get_namespace_name(RelationGetNamespace(rel)),
 								 RelationGetRelationName(rel),
 								 (unsigned long long) rows, (unsigned int) nblocks,
-								 (unsigned int) (TransactionIdIsValid(remaining) ? remaining : oldest),
+								 (unsigned int) kc_stored_relfrozenxid(rel),
 								 TransactionIdIsValid(remaining) ? "kept" : "frozen")));
 	}
 	if (pushed)
@@ -281,7 +380,7 @@ kc_compact(Relation rel, uint32 min_rows)
 	{
 		/* a source another transaction replaced since: its rows are copied twice, so stop */
 		if (kc_catalog_delete_stripe(kc_rel_ident(rel)->uid,
-									 scan->stripes[i].stripe_id) == 0)
+									 scan->stripes[i].stripe_id, true) == 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 					 errmsg("could not serialize access due to concurrent update"),

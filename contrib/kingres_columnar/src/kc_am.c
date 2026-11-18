@@ -576,25 +576,32 @@ kc_relation_set_new_filelocator(Relation rel, const RelFileLocator *newrlocator,
 		kc_catalog_delete_uid(kc_rel_ident(rel)->uid);
 	}
 
-	/*
-	 * The new file holds one transaction id, in its metapage: that of the
-	 * creating transaction.  relfrozenxid must not pass it (VACUUM freezes it
-	 * and moves relfrozenxid on, kc_vacuum.c).
-	 */
-	*freezeXid = GetCurrentTransactionId();
 	/* a table with a relfrozenxid has a relminmxid; it holds no multixact */
 	*minmulti = GetOldestMultiXactId();
 
 	srel = RelationCreateStorage(*newrlocator, persistence, true);
 	smgrclose(srel);
-	kc_meta_init_storage(rel, newrlocator, &opts, truncating,
-						 truncating ? table_xid : kc_table_creation_xid(rel));
+	if (!truncating)
+		table_xid = kc_table_creation_xid(rel);
+	kc_meta_init_storage(rel, newrlocator, &opts, truncating, table_xid);
+
+	/*
+	 * The new file holds up to two transaction ids in its metapage: that of the
+	 * creating transaction, and the table's own (table_xid, which a truncate or
+	 * a rewrite keeps from the old file, so it can be older).  relfrozenxid must
+	 * not pass either of them, or it would claim more than the file holds (C10-04;
+	 * VACUUM freezes both and moves relfrozenxid on, kc_vacuum.c).
+	 */
+	*freezeXid = GetCurrentTransactionId();
+	if (TransactionIdIsNormal(table_xid) && TransactionIdPrecedes(table_xid, *freezeXid))
+		*freezeXid = table_xid;
 }
 
 /*
- * Empties the table's current file in place (PostgreSQL calls this only for a
- * temporary table, which a columnar table cannot be, so a module is the only
- * caller).  The order of the steps is the one that leaves a readable table when
+ * Empties the table's current file in place (PostgreSQL calls this for a table
+ * created or given a new file in the current transaction, and for a temporary
+ * table, which a columnar table cannot be; it is refused for any other table,
+ * below).  The order of the steps is the one that leaves a readable table when
  * one of them fails: the buffered rows are forgotten, then the stripe catalog
  * rows are deleted (an ordinary catalog write, which an error undoes with the
  * transaction and which is where an error is likely), then the file is
@@ -610,6 +617,26 @@ kc_relation_nontransactional_truncate(Relation rel)
 
 	if (kc_write_refused(rel, "truncate"))
 		return;
+
+	/*
+	 * Only for a relation whose file an abort removes anyway (C10-05): one
+	 * created, or given a new file, in this transaction.  That is the only case
+	 * PostgreSQL itself calls this for (ExecuteTruncateGuts, for a table of the
+	 * current transaction; a columnar table cannot be temporary).  For any other
+	 * table the steps below destroy committed data outside the transaction: the
+	 * file is cut and the metapage reset for good, while an abort brings the
+	 * catalog rows back, and the table is then unreadable.  Where an error is
+	 * allowed that is an error; at the moments where it is not, the refusal
+	 * above has already warned and nothing is changed.
+	 */
+	if (rel->rd_createSubid == InvalidSubTransactionId &&
+		rel->rd_firstRelfilelocatorSubid == InvalidSubTransactionId)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot truncate columnar table \"%s\" in place: it was not created or given a new file in this transaction",
+						RelationGetRelationName(rel)),
+				 errdetail("An in-place truncate cannot be rolled back; the table would lose committed data for good if the transaction aborted."),
+				 errhint("Use TRUNCATE, which gives the table a new file.")));
 	kc_write_discard_relation(RelationGetRelid(rel), &outer);
 
 	/*
@@ -722,6 +749,21 @@ kc_relation_copy_for_cluster(KC_COPY_FOR_CLUSTER_PARAMS)
 	kc_write_flush_relation(NewTable);
 	if (keep_visibility)
 		kc_meta_set_created_xid(NewTable, FrozenTransactionId);
+
+	/*
+	 * The rewritten table's relfrozenxid is the id returned here (the swap of
+	 * the files copies it).  The new metapage keeps the table's own id of the
+	 * old file, which can be older than OldestXmin, so the id handed back is
+	 * not newer than it (C10-04, the same rule as for a new file): relfrozenxid
+	 * must not claim more than the file holds.  The creating id of the new file
+	 * is the id of this transaction, which is not older than OldestXmin.
+	 */
+	{
+		TransactionId tx = kc_rel_ident(NewTable)->table_xid;
+
+		if (TransactionIdIsNormal(tx) && TransactionIdPrecedes(tx, *xid_cutoff))
+			*xid_cutoff = tx;
+	}
 
 	*num_tuples = n;
 	*tups_vacuumed = 0;
