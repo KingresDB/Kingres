@@ -575,7 +575,16 @@ kingres_ledger_block_modify(PG_FUNCTION_ARGS)
 	if (TRIGGER_FIRED_BY_DELETE(trigdata->tg_event) &&
 		TRIGGER_FIRED_FOR_ROW(trigdata->tg_event) &&
 		kl_manual_delete_allowed(trigdata->tg_relation))
+	{
+		/*
+		 * A recorded digest that is deleted by hand leaves its identifier in
+		 * ledger_removed, as ledger_remove_stray does, so that the identifier
+		 * does not come back (L17-06).
+		 */
+		kl_record_manual_digest_delete(trigdata->tg_relation,
+									   trigdata->tg_trigtuple);
 		return PointerGetDatum(trigdata->tg_trigtuple);
+	}
 
 	/* INSERT: the only other trigger that fires on an insert is the one of a history table. */
 	if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))

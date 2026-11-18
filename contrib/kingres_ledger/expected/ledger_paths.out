@@ -523,18 +523,9 @@ SELECT public.p_blk() AS after_the_digest;
  cannot write to table "ledger_blocks": o
 (1 row)
 
-SELECT kingres.ledger_verify_recorded() IS NOT NULL AS recorded;
- recorded 
-----------
- t
-(1 row)
-
-SELECT public.p_blk() AS after_the_recorded_verification;
-     after_the_recorded_verification      
-------------------------------------------
- cannot write to table "ledger_blocks": o
-(1 row)
-
+-- The extension refuses a call that would take a lock that comes earlier in
+-- the order of the locks than one the transaction holds (L17-04): the builders'
+-- lock, the registry's lock, the verifications' lock.
 CREATE TABLE p_new (id int);
 SELECT kingres.ledger_enable('p_new');
 WARNING:  database "kl_paths_t" can be dropped, and the ledger with it, by roles that are not superusers: kl_p_inh
@@ -552,6 +543,18 @@ SELECT public.p_blk() AS after_ledger_enable;
 INSERT INTO p_new VALUES (1);
 SELECT public.p_blk() AS after_a_row_of_the_new_table;
        after_a_row_of_the_new_table       
+------------------------------------------
+ cannot write to table "ledger_blocks": o
+(1 row)
+
+SELECT kingres.ledger_verify_recorded() IS NOT NULL AS recorded;
+ recorded 
+----------
+ t
+(1 row)
+
+SELECT public.p_blk() AS after_the_recorded_verification;
+     after_the_recorded_verification      
 ------------------------------------------
  cannot write to table "ledger_blocks": o
 (1 row)

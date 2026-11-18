@@ -216,4 +216,108 @@ is($node->safe_psql('d4', q{SELECT count(*) FROM kingres.ledger_status
 	WHERE worker_state IS NOT NULL AND database_owner IS NOT NULL}), '1',
 	'the columns that were there are unchanged');
 
+#--------------------------------------------------------------------------
+# L17-02: roles that cannot drop the database now and can make themselves able
+# to without a superuser: ADMIN OPTION on a role that can, directly or through
+# a membership, and CREATEROLE for the roles the role created.  Listed in
+# database_potential_droppers, warned about in a sentence of its own, and
+# proved by real drops: the listing named each of them before it dropped.
+#--------------------------------------------------------------------------
+$node->safe_psql('postgres', q{
+	CREATE ROLE nsown5 NOLOGIN;
+	CREATE ROLE m_adm5 LOGIN;
+	CREATE ROLE plain5 LOGIN;
+	CREATE ROLE crr LOGIN CREATEROLE;
+	CREATE ROLE nsown7 NOLOGIN;
+	CREATE ROLE m_adm7 LOGIN;
+	CREATE ROLE m_far7 LOGIN;
+});
+
+sub status2
+{
+	my ($db) = @_;
+	return $node->safe_psql($db, q{
+		SELECT database_droppers::text || ' ' || database_potential_droppers::text
+		  FROM kingres.ledger_status});
+}
+
+make_db('d5', 'nsown5');
+is(status2('d5'), '{nsown5} {}', 'a database owned by a role that is not a superuser, nobody administers the owner: no potential dropper');
+$node->safe_psql('postgres', q{GRANT nsown5 TO m_adm5 WITH ADMIN TRUE, INHERIT FALSE, SET FALSE});
+is(status2('d5'), '{nsown5} {m_adm5}',
+	'a role with ADMIN OPTION on the owner and neither INHERIT nor SET: not a dropper, listed as one that can make itself');
+{
+	my $e = enable_stderr('d5');
+	like($e, qr/WARNING:  database "d5" can be dropped, and the ledger with it, by roles that are not superusers: nsown5\n/,
+		'ledger_enable warns about the droppers (the first sentence, as it was)');
+	like($e, qr/WARNING:  database "d5" can also be dropped, and the ledger with it, by roles that are not superusers after they grant themselves a role they administer \(ADMIN OPTION[^)]*\): m_adm5\n/,
+		'and, in a sentence of its own, about the roles that can make themselves droppers');
+}
+is(try_drop('m_adm5', 'd5', ''), 'kept (must be owner)', 'before it grants itself, the ADMIN OPTION holder cannot drop the database');
+is(try_drop('m_adm5', 'd5', 'GRANT nsown5 TO m_adm5 WITH INHERIT TRUE, SET TRUE;'), 'dropped',
+	'it grants itself the membership and drops it: the listing named it before');
+
+# A role that administers a role that administers the owner (a membership with
+# INHERIT carries the ADMIN OPTION of the role it is in).
+make_db('d7', 'nsown7');
+$node->safe_psql('postgres', q{
+	GRANT nsown7 TO m_adm7 WITH ADMIN TRUE, INHERIT FALSE, SET FALSE;
+	GRANT m_adm7 TO m_far7 WITH ADMIN FALSE, INHERIT TRUE, SET TRUE;
+});
+is(status2('d7'), '{nsown7} {m_adm7,m_far7}',
+	'a role that has only the membership of a role that has the ADMIN OPTION is listed as well');
+is(try_drop('m_far7', 'd7', 'GRANT nsown7 TO m_far7 WITH INHERIT TRUE, SET TRUE;'), 'dropped',
+	'and it can make itself a dropper (the grant is allowed and the drop works)');
+
+# CREATEROLE: the role that created a role has the ADMIN OPTION on it.
+$node->safe_psql('postgres', q{SET ROLE crr; CREATE ROLE kid6 LOGIN; RESET ROLE});
+make_db('d6', 'sowner');
+$node->safe_psql('postgres', q{GRANT sowner TO kid6 WITH INHERIT TRUE, SET FALSE});
+is(status2('d6'), '{kid6} {crr}',
+	'the creator of a role that can drop the database (CREATEROLE): listed as a potential dropper');
+is(try_drop('crr', 'd6', ''), 'kept (must be owner)', 'the creator cannot drop the database as it is');
+is(try_drop('crr', 'd6', 'GRANT kid6 TO crr WITH INHERIT TRUE, SET TRUE;'), 'dropped',
+	'it grants itself the role it created and drops the database that a superuser owns');
+unlike(status2('d1'), qr/plain5/, 'a role with no ADMIN OPTION on anything is listed nowhere');
+
+#--------------------------------------------------------------------------
+# L17-03: a database owned by pg_database_owner belongs, in the database a
+# session is connected to, to the owner of that database: every role that owns
+# a database of the cluster can drop it.  Listed as droppers, with a warning.
+#--------------------------------------------------------------------------
+$node->safe_psql('postgres', q{
+	CREATE ROLE oo LOGIN;
+	CREATE ROLE oo_member LOGIN;
+	GRANT oo TO oo_member WITH INHERIT TRUE, SET FALSE;
+});
+$node->safe_psql('postgres', q{CREATE DATABASE ddo OWNER oo TEMPLATE template0});
+$node->safe_psql('postgres', q{CREATE DATABASE dbx OWNER pg_database_owner TEMPLATE template0});
+$node->safe_psql('dbx', q{CREATE EXTENSION kingres_ledger; CREATE TABLE first_t (id int PRIMARY KEY)});
+{
+	my $listed = $node->safe_psql('dbx', q{SELECT database_droppers::text FROM kingres.ledger_status});
+	like($listed, qr/\boo\b/, 'L17-03: the owner of another database is listed as a dropper of a database owned by pg_database_owner');
+	like($listed, qr/\boo_member\b/, 'and so is a role with its privileges');
+	unlike($listed, qr/pg_database_owner/, 'the role nobody logs in as is not what is reported');
+	unlike($listed, qr/plain5/, 'a role that owns no database is not');
+	is($node->safe_psql('dbx', q{SELECT database_droppable_by_non_superuser FROM kingres.ledger_status}), 't', 'and the flag is set');
+	my $e = enable_stderr('dbx');
+	like($e, qr/WARNING:  database "dbx" can be dropped, and the ledger with it, by roles that are not superusers: .*\boo\b/, 'ledger_enable warns');
+	like($e, qr/DETAIL:  The database is owned by pg_database_owner/, 'and says what that owner is');
+}
+for my $d ('dpo1', 'dpo2', 'dpo3')
+{
+	$node->safe_psql('postgres', "CREATE DATABASE $d OWNER pg_database_owner TEMPLATE template0");
+}
+{
+	my $drop = sub {
+		my ($role, $from, $db) = @_;
+		my ($ret, $out, $err) = $node->psql($from, "DROP DATABASE $db", extra_params => [ '-U', $role ]);
+		my $gone = $node->safe_psql('postgres', "SELECT count(*) = 0 FROM pg_database WHERE datname = '$db'");
+		return $gone eq 't' ? 'dropped' : 'kept';
+	};
+	is($drop->('oo', 'ddo', 'dpo1'), 'dropped', 'the reproduction of L17-03: the owner of ddo, connected to ddo, drops a database owned by pg_database_owner');
+	is($drop->('plain5', 'postgres', 'dpo2'), 'kept', 'a role that owns no database cannot');
+	is($drop->('oo_member', 'ddo', 'dpo3'), 'dropped', 'a role that has the privileges of the owner of ddo can, connected to ddo');
+}
+
 done_testing();

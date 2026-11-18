@@ -496,10 +496,19 @@ SET search_path = public;
 SET kingres_ledger.allow_manual_write = on;
 -- The digests that the database recorded name the old hashes: ledger_verify
 -- reports them (digest_hash).  An attacker who rewrites the chain has to remove
--- them too (a superuser with the manual-write setting can); only a digest kept
--- outside the database cannot be taken away.
+-- them too; a delete by hand with the setting on is recorded and reported
+-- (operator_removal, L17-06), so the attacker takes them out with the triggers
+-- off, as for the rewrite above.  Only a digest kept outside the database
+-- cannot be taken away.
 SELECT count(*) AS problems_with_stale_recorded_digests FROM kingres.ledger_verify();
+:trig_off;
+\c
+SET search_path = public;
+SET kingres_ledger.allow_manual_write = on;
 DELETE FROM kingres.ledger_digest;
+:trig_on;
+\c
+SET search_path = public;
 SELECT count(*) AS problems_after_consistent_rewrite FROM kingres.ledger_verify();
 SELECT kingres.ledger_verify_digest(:'d1') AS d1_after_rewrite,
        kingres.ledger_verify_digest(:'d2') AS d2_after_rewrite,

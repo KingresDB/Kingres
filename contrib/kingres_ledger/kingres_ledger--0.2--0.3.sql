@@ -451,6 +451,8 @@ DECLARE
     old_mode text;
     owner_name name;
     droppers text;
+    potential text;
+    by_owner boolean;
 BEGIN
     IF NOT kingres.ledger_hook_active() THEN
         RAISE EXCEPTION 'kingres_ledger must be loaded through shared_preload_libraries'
@@ -668,20 +670,67 @@ BEGIN
     -- membership with INHERIT, directly or through a chain), and the current
     -- user is what SET ROLE made it, so a role that can SET ROLE (membership
     -- with SET, directly or through a chain) to such a role, or to a
-    -- superuser, can drop it as well.  Only a database whose owner is a
-    -- superuser role without members that are not superusers is out of reach
-    -- of every role that is not a superuser (README, "What a role that is not
-    -- a superuser can stop or remove", exception 6; L13-03, L15-01).
-    SELECT pg_catalog.string_agg(r.rolname::pg_catalog.text, ', ' ORDER BY r.rolname) INTO droppers
-      FROM pg_catalog.pg_database d, pg_catalog.pg_roles r
-     WHERE d.datname = pg_catalog.current_database() AND NOT r.rolsuper
-       AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles x
-                    WHERE (x.oid = r.oid OR pg_catalog.pg_has_role(r.oid, x.oid, 'SET'))
-                      AND (x.rolsuper OR pg_catalog.pg_has_role(x.oid, d.datdba, 'USAGE')));
-    IF droppers IS NOT NULL THEN
+    -- superuser, can drop it as well.  A database owned by pg_database_owner
+    -- belongs, in each database a session is connected to, to the owner of that
+    -- database: every role that owns a database of the cluster can drop it, so
+    -- the owners of the databases stand in for the owner in the rule
+    -- (pg_database_owner, the role 6171, is never asked about: its membership is
+    -- relative to the database of the session).  Second, the roles that cannot
+    -- drop it now and can make themselves able to without a superuser: a role
+    -- with ADMIN OPTION, directly or through a chain, on a role that can (a
+    -- CREATEROLE role has it on every role it created), grants itself that role
+    -- with INHERIT and SET.  Only a database whose owner is a superuser role
+    -- without members that are not superusers, and with no role administering
+    -- such a member, is out of reach of every role that is not a superuser
+    -- (README, "What a role that is not a superuser can stop or remove",
+    -- exception 6; L13-03, L15-01, L17-02, L17-03).
+    WITH RECURSIVE own(oid) AS (
+        SELECT d.datdba FROM pg_catalog.pg_database d
+         WHERE d.datname = pg_catalog.current_database()
+           AND d.datdba <> 6171::pg_catalog.oid
+        UNION
+        SELECT d2.datdba FROM pg_catalog.pg_database d, pg_catalog.pg_database d2
+         WHERE d.datname = pg_catalog.current_database()
+           AND d.datdba = 6171::pg_catalog.oid
+           AND d2.datdba <> 6171::pg_catalog.oid
+    ), drop_now(oid) AS (
+        SELECT r.oid FROM pg_catalog.pg_roles r
+         WHERE NOT r.rolsuper
+           AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles x
+                        WHERE (x.oid = r.oid OR pg_catalog.pg_has_role(r.oid, x.oid, 'SET'))
+                          AND (x.rolsuper
+                               OR EXISTS (SELECT 1 FROM own o
+                                           WHERE pg_catalog.pg_has_role(x.oid, o.oid, 'USAGE'))))
+    ), can_make(oid) AS (
+        SELECT dn.oid FROM drop_now dn
+        UNION
+        SELECT r.oid FROM pg_catalog.pg_roles r, can_make c
+         WHERE NOT r.rolsuper
+           AND pg_catalog.pg_has_role(r.oid, c.oid, 'MEMBER WITH ADMIN OPTION')
+    )
+    SELECT pg_catalog.string_agg(r.rolname::pg_catalog.text, ', ' ORDER BY r.rolname)
+               FILTER (WHERE r.oid IN (SELECT dn.oid FROM drop_now dn)),
+           pg_catalog.string_agg(r.rolname::pg_catalog.text, ', ' ORDER BY r.rolname)
+               FILTER (WHERE r.oid IN (SELECT cm.oid FROM can_make cm)
+                         AND r.oid NOT IN (SELECT dn.oid FROM drop_now dn)),
+           (SELECT d.datdba = 6171::pg_catalog.oid
+              FROM pg_catalog.pg_database d WHERE d.datname = pg_catalog.current_database())
+      INTO droppers, potential, by_owner
+      FROM pg_catalog.pg_roles r;
+    IF droppers IS NOT NULL AND by_owner THEN
+        RAISE WARNING 'database "%" can be dropped, and the ledger with it, by roles that are not superusers: %',
+            pg_catalog.current_database(), droppers
+            USING DETAIL = 'The database is owned by pg_database_owner, which is whoever owns the database a session is connected to: every role that owns a database of this cluster can drop it.',
+                  HINT = 'Make a superuser role that has no members (or only superusers) the owner of every database that holds a ledger (ALTER DATABASE ... OWNER TO), do not grant it to a role that is not a superuser, and keep the digests outside the database. kingres.ledger_status lists the roles.';
+    ELSIF droppers IS NOT NULL THEN
         RAISE WARNING 'database "%" can be dropped, and the ledger with it, by roles that are not superusers: %',
             pg_catalog.current_database(), droppers
             USING HINT = 'Make a superuser role that has no members (or only superusers) the owner of every database that holds a ledger (ALTER DATABASE ... OWNER TO), do not grant it to a role that is not a superuser, and keep the digests outside the database. kingres.ledger_status lists the roles.';
+    END IF;
+    IF potential IS NOT NULL THEN
+        RAISE WARNING 'database "%" can also be dropped, and the ledger with it, by roles that are not superusers after they grant themselves a role they administer (ADMIN OPTION; a role with CREATEROLE has it on the roles it created): %',
+            pg_catalog.current_database(), potential
+            USING HINT = 'Take the ADMIN OPTION away from them (REVOKE ... FROM), or the roles they administer from the owner of the database. kingres.ledger_status lists the roles in database_potential_droppers.';
     END IF;
 
     -- The registration and the entry of the rows that exist already are
@@ -1437,18 +1486,45 @@ SELECT (SELECT pg_catalog.count(*) FROM kingres.ledger_table t WHERE t.mode = 'a
        dbo.rolname AS database_owner,
        dbo.rolsuper AS database_owner_is_superuser,
        dbd.droppers AS database_droppers,
-       (pg_catalog.cardinality(dbd.droppers) > 0) AS database_droppable_by_non_superuser
+       (pg_catalog.cardinality(dbd.droppers) > 0) AS database_droppable_by_non_superuser,
+       dbd.potential AS database_potential_droppers
   FROM (SELECT 1) one
   CROSS JOIN LATERAL kingres.ledger_worker_state() ws
   CROSS JOIN (SELECT r.rolname, r.rolsuper
                 FROM pg_catalog.pg_database d JOIN pg_catalog.pg_roles r ON r.oid = d.datdba
                WHERE d.datname = pg_catalog.current_database()) dbo
-  CROSS JOIN (SELECT COALESCE(pg_catalog.array_agg(r.rolname ORDER BY r.rolname), '{}'::pg_catalog.name[]) AS droppers
-                FROM pg_catalog.pg_database d, pg_catalog.pg_roles r
-               WHERE d.datname = pg_catalog.current_database() AND NOT r.rolsuper
-                 AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles x
-                              WHERE (x.oid = r.oid OR pg_catalog.pg_has_role(r.oid, x.oid, 'SET'))
-                                AND (x.rolsuper OR pg_catalog.pg_has_role(x.oid, d.datdba, 'USAGE')))) dbd
+  CROSS JOIN (WITH RECURSIVE own(oid) AS (
+                  SELECT d.datdba FROM pg_catalog.pg_database d
+                   WHERE d.datname = pg_catalog.current_database()
+                     AND d.datdba <> 6171::pg_catalog.oid
+                  UNION
+                  SELECT d2.datdba FROM pg_catalog.pg_database d, pg_catalog.pg_database d2
+                   WHERE d.datname = pg_catalog.current_database()
+                     AND d.datdba = 6171::pg_catalog.oid
+                     AND d2.datdba <> 6171::pg_catalog.oid
+              ), drop_now(oid) AS (
+                  SELECT r.oid FROM pg_catalog.pg_roles r
+                   WHERE NOT r.rolsuper
+                     AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles x
+                                  WHERE (x.oid = r.oid OR pg_catalog.pg_has_role(r.oid, x.oid, 'SET'))
+                                    AND (x.rolsuper
+                                         OR EXISTS (SELECT 1 FROM own o
+                                                     WHERE pg_catalog.pg_has_role(x.oid, o.oid, 'USAGE'))))
+              ), can_make(oid) AS (
+                  SELECT dn.oid FROM drop_now dn
+                  UNION
+                  SELECT r.oid FROM pg_catalog.pg_roles r, can_make c
+                   WHERE NOT r.rolsuper
+                     AND pg_catalog.pg_has_role(r.oid, c.oid, 'MEMBER WITH ADMIN OPTION')
+              )
+              SELECT COALESCE(pg_catalog.array_agg(r.rolname ORDER BY r.rolname)
+                                  FILTER (WHERE r.oid IN (SELECT dn.oid FROM drop_now dn)),
+                              '{}'::pg_catalog.name[]) AS droppers,
+                     COALESCE(pg_catalog.array_agg(r.rolname ORDER BY r.rolname)
+                                  FILTER (WHERE r.oid IN (SELECT cm.oid FROM can_make cm)
+                                            AND r.oid NOT IN (SELECT dn.oid FROM drop_now dn)),
+                              '{}'::pg_catalog.name[]) AS potential
+                FROM pg_catalog.pg_roles r) dbd
   LEFT JOIN LATERAL (SELECT b.height, b.block_hash, b.closed_at
                        FROM kingres.ledger_blocks b
                       ORDER BY b.height DESC LIMIT 1) lb ON true
@@ -1460,4 +1536,4 @@ SELECT (SELECT pg_catalog.count(*) FROM kingres.ledger_table t WHERE t.mode = 'a
                       WHERE v.finished_at IS NOT NULL
                       ORDER BY v.verification_id DESC LIMIT 1) lv ON true;
 COMMENT ON VIEW kingres.ledger_status IS
-    'One row: the number of append-only and updatable ledger tables, the latest block, the pending transactions and the age of the oldest, the last digest and the last finished verification, and the state of the block-building worker for this database (ok, failed with the delay before the next attempt and the last error, ...), and the owner of the database with whether it is a superuser, and the roles that are not superusers and can drop the database, and the ledger with it (database_droppers: the owner if it is not a superuser, every role with the privileges of the owner, every role that can SET ROLE to one of those or to a superuser; computed as PostgreSQL does). Not readable by PUBLIC.';
+    'One row: the number of append-only and updatable ledger tables, the latest block, the pending transactions and the age of the oldest, the last digest and the last finished verification, and the state of the block-building worker for this database (ok, failed with the delay before the next attempt and the last error, ...), and the owner of the database with whether it is a superuser, and the roles that are not superusers and can drop the database, and the ledger with it (database_droppers: the owner if it is not a superuser, every role with the privileges of the owner, every role that can SET ROLE to one of those or to a superuser; computed as PostgreSQL does; for a database owned by pg_database_owner, every role that owns a database of the cluster is taken as the owner), and the roles that cannot now and can make themselves able to without a superuser (database_potential_droppers: ADMIN OPTION, directly or through a chain, on a role that can drop it; a role with CREATEROLE has it on the roles it created). Not readable by PUBLIC.';
