@@ -48,7 +48,13 @@ func (s *Store) ledgerStatus(ctx context.Context, h *dbHandle) (api.LedgerStatus
 		return st, err
 	} else if has {
 		var n int
-		if err := h.pool.QueryRow(ctx, "SELECT count(*) FROM kingres.ledger_table").Scan(&n); err != nil {
+		// The extension registers tables of its own in the same registry (the
+		// keys, revocations and attestations of client signatures, from 0.3 on);
+		// they live in its schema and are not ledger tables of a user.
+		if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM kingres.ledger_table lt
+			WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c
+				JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+				WHERE c.oid = lt.relid AND n.nspname = 'kingres')`).Scan(&n); err != nil {
 			return st, s.wrap("reading kingres.ledger_table", err)
 		}
 		st.LedgerTableCount = &n
