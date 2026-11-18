@@ -92,6 +92,12 @@ const (
 	// Added in contract 0.10.0 (failover).
 	FailoverNeedsDecision Code = "failover_needs_decision"
 	LeaseSettingsDiffer   Code = "lease_settings_differ"
+	// Added in contract 0.11.0 (ledger phase 7).
+	LedgerNotPublished Code = "ledger_not_published"
+	OriginPrefixLocked Code = "origin_prefix_locked"
+	SigningKeyMissing  Code = "signing_key_missing"
+	LastSigningKey     Code = "last_signing_key"
+	ChainNotDiverged   Code = "chain_not_diverged"
 )
 
 // FieldError is one entry of the "errors" extension (schema ValidationIssue).
@@ -213,6 +219,11 @@ var specs = map[Code]struct {
 	NoReceivingServer:               {409, "No receiving server", "no-receiving-server"},
 	FailoverNeedsDecision:           {409, "The failover needs a decision", "failover-needs-decision"},
 	LeaseSettingsDiffer:             {409, "Lease settings differ", "lease-settings-differ"},
+	LedgerNotPublished:              {409, "The ledger is not published", "ledger-not-published"},
+	OriginPrefixLocked:              {409, "The origin prefix is locked", "origin-prefix-locked"},
+	SigningKeyMissing:               {409, "No signing key", "signing-key-missing"},
+	LastSigningKey:                  {409, "Last signing key", "last-signing-key"},
+	ChainNotDiverged:                {409, "The chain is not diverged", "chain-not-diverged"},
 }
 
 // New returns a Problem for the code with the standard status, title and

@@ -380,10 +380,11 @@ const MUST_MENTION = {
   '0.7.0': ['cancelStatement', 'workbench_busy', 'AlertSubject', 'GroupLease', 'leaseLost', 'uncoveredShardGroupIds', 'additive'],
   '0.8.0': ['listConfigParameters', 'applyConfigChange', 'restartPendingInstances', 'clockDifference', 'config_parameter_refused', 'config.apply', 'additive'],
   '0.10.0': ['getFailoverStatus', 'listFailoverReports', 'getFailoverReport', 'resetAutoFailoverCounter', 'failover_needs_decision', 'quorum_unavailable', 'lease_settings_differ', 'allowDataLoss', 'shardGroupId', 'additive'],
+  '0.11.0': ['getLedgerSigning', 'createLedgerSigningKey', 'getLedgerTrustFile', 'getLedgerAggregate', 'createLedgerAnchorTarget', 'ledger_not_published', 'origin_prefix_locked', 'signing_key_missing', 'last_signing_key', 'chain_not_diverged', 'ledgerSignerUnavailable', 'ledger.key.create', 'aggregateSize', 'additive'],
   '0.9.0': ['startRebalance', 'previewRebalancePlan', 'nothing_to_rebalance', 'cluster_inconsistent', 'skipped', 'ledgerSummary', 'Prefer', 'additive'],
   '0.5.0': ['renewServerCertificates', 'revokeServerCertificates', 'certificate_authority_unavailable', 'certificate_revoked', 'certificateRenewalFailed', 'partial', 'additive'],
 };
-for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0', '0.10.0']) {
+for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0', '0.10.0', '0.11.0']) {
   const changelog = changelogOf(version);
   if (!changelog) { fail('README.md', `changelog heading for ${version} is missing`); continue; }
   for (const h of ['#### Breaking', '#### Additive', '#### Documentation']) if (!changelog.includes(h)) fail('README.md', `changelog of ${version} lacks "${h}"`);
@@ -395,7 +396,7 @@ for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0', '0.
   if (!m) fail('README.md', `the changelog summary of ${version} must state "N operations added (M operations, P paths)"`);
   else if (version === doc.info?.version && (Number(m[2]) !== operations.length || Number(m[3]) !== Object.keys(doc.paths ?? {}).length)) fail('README.md', `changelog says ${m[2]} operations and ${m[3]} paths, the contract has ${operations.length} and ${Object.keys(doc.paths ?? {}).length}`);
 }
-if (doc.info?.version !== '0.10.0') fail('info.version', 'the contract is revision 0.10.0');
+if (doc.info?.version !== '0.11.0') fail('info.version', 'the contract is revision 0.11.0');
 
 
 // 0.5.0 rules: certificate operations, partial answers, additive changes only.
@@ -517,6 +518,60 @@ for (const [n, prop] of [['SetupTaskSummary', 'detail'], ['NodeStateInfo', 'inte
   if (schemas.ClusterSettings?.properties?.autoFailover?.properties?.timeoutSeconds?.minimum !== 30) fail('ClusterSettings.autoFailover.timeoutSeconds', 'minimum must be 30 since 0.10.0');
   for (const p of ['lastEventAt']) if ((schemas.ClusterSettings?.properties?.autoFailover?.required ?? []).includes(p)) fail('ClusterSettings.autoFailover', p + ' must stay optional');
   if (!opDesc('failoverServer').includes('failover_needs_decision') || !opDesc('failoverServer').includes('cancellable')) fail('failoverServer', 'must name failover_needs_decision and say when the task stops being cancellable');
+}
+// 0.11.0 rules, ledger phase 7 (signing, publication, anchoring): the 28 new operations with their methods, paths
+// and roles, the new codes, kinds and actions, and the rule that no secret has a place in any answer.
+{
+  const need = {
+    getLedgerSettings: ['get', '/ledger/settings', 'kingres_readonly'], updateLedgerSettings: ['put', '/ledger/settings', 'kingres_admin'],
+    getLedgerSigning: ['get', '/ledger/signing', 'kingres_readonly'], createLedgerSigningKey: ['post', '/ledger/signing/keys', 'kingres_admin'],
+    retireLedgerSigningKey: ['post', '/ledger/signing/keys/{fingerprint}/retire', 'kingres_admin'], revokeLedgerSigningKey: ['post', '/ledger/signing/keys/{fingerprint}/revoke', 'kingres_admin'],
+    getLedgerTrustFile: ['get', '/ledger/signing/trust-file', 'kingres_readonly'], getLedgerPublication: ['get', '/ledger/publication', 'kingres_readonly'],
+    listLedgerAnchorTargets: ['get', '/ledger/anchor-targets', 'kingres_readonly'], createLedgerAnchorTarget: ['post', '/ledger/anchor-targets', 'kingres_admin'],
+    getLedgerAnchorTarget: ['get', '/ledger/anchor-targets/{targetId}', 'kingres_readonly'], updateLedgerAnchorTarget: ['patch', '/ledger/anchor-targets/{targetId}', 'kingres_admin'],
+    deleteLedgerAnchorTarget: ['delete', '/ledger/anchor-targets/{targetId}', 'kingres_admin'], testLedgerAnchorTarget: ['post', '/ledger/anchor-targets/{targetId}/test', 'kingres_admin'],
+    getLedgerAggregate: ['get', '/databases/{databaseName}/ledger/aggregate', 'kingres_readonly'], listLedgerAggregates: ['get', '/databases/{databaseName}/ledger/aggregates', 'kingres_readonly'],
+    listLedgerAnchors: ['get', '/databases/{databaseName}/ledger/anchors', 'kingres_readonly'], anchorLedgerNow: ['post', '/databases/{databaseName}/ledger/anchors', 'kingres_ops'],
+    retryLedgerAnchor: ['post', '/databases/{databaseName}/ledger/anchors/{anchorId}/retry', 'kingres_ops'], downloadLedgerAnchor: ['get', '/databases/{databaseName}/ledger/anchors/{anchorId}/evidence', 'kingres_readonly'],
+    createLedgerBundle: ['post', '/databases/{databaseName}/ledger/bundles', 'kingres_ops'], getLedgerBundle: ['get', '/databases/{databaseName}/ledger/bundles/{bundleId}', 'kingres_ops'],
+    listLedgerClientKeys: ['get', '/databases/{databaseName}/ledger/client-keys', 'kingres_readonly'], registerLedgerClientKey: ['post', '/databases/{databaseName}/ledger/client-keys', 'kingres_admin'],
+    revokeLedgerClientKey: ['post', '/databases/{databaseName}/ledger/client-keys/{keyId}/revoke', 'kingres_admin'],
+    setTableSignaturePolicy: ['put', '/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/ledger/signature-policy', 'kingres_admin'],
+    upgradeLedgerExtension: ['post', '/databases/{databaseName}/ledger/upgrade', 'kingres_admin'], acknowledgeLedgerDivergence: ['post', '/databases/{databaseName}/ledger/chains/{shardGroupId}/acknowledge', 'kingres_admin'],
+  };
+  for (const [id, [method, p, role]] of Object.entries(need)) {
+    const o = opById.get(id);
+    if (!o) { fail(id, 'operation of 0.11.0 does not exist'); continue; }
+    if (o.method !== method || o.path !== p || o.op['x-required-role'] !== role) fail(id, `must be ${method.toUpperCase()} ${p} and need ${role}`);
+    if (!o.op.tags?.includes('Ledger')) fail(id, 'must have the tag Ledger');
+  }
+  for (const id of ['createLedgerSigningKey', 'retireLedgerSigningKey', 'revokeLedgerSigningKey', 'createLedgerBundle', 'upgradeLedgerExtension', 'acknowledgeLedgerDivergence']) {
+    if (!respCodes(id).includes('202')) fail(id, 'must answer 202 with a task');
+  }
+  if (!respCodes('anchorLedgerNow').includes('201')) fail('anchorLedgerNow', 'must answer 201 with the records (a 202 would have to be a task)');
+  for (const id of ['retireLedgerSigningKey', 'revokeLedgerSigningKey']) for (const c of ['404', '409']) if (!respCodes(id).includes(c)) fail(id, 'must list ' + c);
+  if (!respCodes('updateLedgerSettings').includes('409')) fail('updateLedgerSettings', 'must list 409 origin_prefix_locked');
+  for (const c of ['ledger_not_published', 'origin_prefix_locked', 'signing_key_missing', 'last_signing_key', 'chain_not_diverged']) if (!problemCodes.has(c)) fail('ProblemCode', 'missing ' + c);
+  for (const k of ['ledgerNotAnchored', 'ledgerAnchorBehind', 'ledgerAnchorFailed', 'ledgerAnchorConflict', 'ledgerChainDiverged', 'ledgerGroupUnread', 'ledgerPublicationBehind', 'ledgerSignerUnavailable', 'ledgerDigestOverdue']) {
+    if (!(schemas.AlertKind?.enum ?? []).includes(k)) fail('AlertKind', 'missing ' + k);
+  }
+  for (const k of ['ledger.key.create', 'ledger.key.rotate', 'ledger.key.retire', 'ledger.key.revoke', 'ledger.key.distribute', 'ledger.bundle.create', 'ledger.epoch.start', 'ledger.upgrade']) {
+    if (!(schemas.TaskKind?.enum ?? []).includes(k)) fail('TaskKind', 'missing ' + k);
+  }
+  if (!(schemas.TaskSubject?.properties?.type?.enum ?? []).includes('ledgerKey')) fail('TaskSubject', 'type must include ledgerKey');
+  // No secret has a place in an answer: no property of these schemas is named like one.
+  const SECRET = /seed|private|passphrase(?!Protected)|secret|password|^credentials$/i;
+  for (const n of ['LedgerSigning', 'LedgerSigningKey', 'LedgerSigningEvent', 'LedgerTrustFile', 'LedgerAnchorTarget', 'LedgerAnchor', 'LedgerPublication', 'LedgerSettingsCluster']) {
+    for (const name of Object.keys(schemas[n]?.properties ?? {})) if (SECRET.test(name)) fail(n, `property ${name} looks like a secret in an answer`);
+  }
+  if (!schemas.LedgerAnchorTarget?.properties?.credentialsSet) fail('LedgerAnchorTarget', 'credentialsSet is missing');
+  if ((schemas.LedgerAnchorTargetCreate?.required ?? []).includes('credentials')) fail('LedgerAnchorTargetCreate', 'credentials must be optional');
+  if (schemas.LedgerBlock?.properties?.signed?.description?.includes('checkpoint') !== true) fail('LedgerBlock.signed', 'must be redefined as covered by a signed checkpoint');
+  for (const p of ['publication', 'anchoring']) if (!schemas.LedgerStatus?.properties?.[p] || (schemas.LedgerStatus?.required ?? []).includes(p)) fail('LedgerStatus', p + ' must exist and stay optional');
+  if (!schemas.LedgerVerifyRequest?.properties?.checks || (schemas.LedgerVerifyRequest?.required ?? []).includes('checks')) fail('LedgerVerifyRequest', 'checks must exist and stay optional');
+  if (!schemas.LedgerDigest?.properties?.aggregateSize || (schemas.LedgerDigest?.required ?? []).includes('aggregateSize')) fail('LedgerDigest', 'aggregateSize must exist and stay optional');
+  if (!opDesc('getLedgerSigning').includes('No private key')) fail('getLedgerSigning', 'must say that no private key is ever part of the answer');
+  if (!opDesc('getLedgerTrustFile').includes('first trust')) fail('getLedgerTrustFile', 'must say that the file is not a source of first trust');
 }
 // ------------------------------------------------------------------ report
 const pathCount = Object.keys(doc.paths ?? {}).length;

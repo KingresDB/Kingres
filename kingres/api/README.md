@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.10.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.11.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and `kingres-cli`. Lint it and run the mechanical rule check with:
 
 ```
@@ -153,6 +153,8 @@ Each task kind has exactly one `subject.type`; `subject.id` is always a string.
 | `rebalance` | `cluster` | `cluster` (0.9.0; one rebalance at a time, cluster-wide; the task id is the report id): steps `Check that the cluster can rebalance`, `Compute the plan`, `Move buckets`, `Write the report`; a stopped run is `paused` |
 | `replication.restorePreferredPrimaries` | `replication` | `preferred-primaries` (0.10.0: answers `unsupported_operation` until the switchover is built) |
 | `ledger.verify` | `ledgerVerification` | the **database name**: the verification id exists only after the run (see `LedgerVerification.taskId`) |
+| `ledger.key.create`, `ledger.key.rotate`, `ledger.key.retire`, `ledger.key.revoke`, `ledger.key.distribute` (0.11.0) | `ledgerKey` | `signing`: the signing keys of the ledger; one key task at a time, cluster-wide. `ledger.key.create` makes the first key (generate, store, distribute, event, activate); `ledger.key.rotate` adds the next key and starts the overlap; `ledger.key.retire` and `ledger.key.revoke` end a key; `ledger.key.distribute` brings the holders of the key up to date (started by `kingresd` when the holders change). No private key, seed or passphrase is ever in a step, a detail, a result or an error |
+| `ledger.bundle.create`, `ledger.epoch.start`, `ledger.upgrade` (0.11.0; answer `unsupported_operation` until built) | `database` | the database name |
 | `replicate.apply` | `replication` | `apply:<operation>:<role or database names>:<unix nanoseconds>`: the task that brings the servers that could not be reached up to date after a role or grant change (one step per server, `TaskStep.detail` names the server it waits for) |
 | `networkAccess.apply` | `networkAccess` | `network-access` |
 | `config.apply` (0.8.0) | `config` | `cluster`: one configuration task at a time; one step per server (`TaskStep.detail` names the server a step waits for) |
@@ -208,7 +210,7 @@ the setup token is consumed by a successful init or join, so the final poll coul
 
 `AuditEvent.action` is the `operationId` of the audited operation (`createDatabase`, `dropDatabase`, `login`,
 `executeQuery`, ...), or one of three events that are not an operation: `loginFailed` (a rejected sign-in, also
-for an unknown user), `setupTokenRejected` and `autoFailover` (actor `system`; 0.10.0 adds the events `failoverGroupStarted`, `failoverGroupPromoted`, `failoverGroupFailed` and `oldPrimaryRebuilt`, resource type `shardGroup`). A denied or failed call of an
+for an unknown user), `setupTokenRejected` and `autoFailover` (actor `system`; 0.11.0 adds the operations `updateLedgerSettings`, `createLedgerSigningKey`, `retireLedgerSigningKey`, `revokeLedgerSigningKey`, `createLedgerAnchorTarget`, `updateLedgerAnchorTarget`, `deleteLedgerAnchorTarget`, `testLedgerAnchorTarget`, `anchorLedgerNow`, `retryLedgerAnchor`, `createLedgerBundle`, `registerLedgerClientKey`, `revokeLedgerClientKey`, `setTableSignaturePolicy`, `upgradeLedgerExtension` and `acknowledgeLedgerDivergence`, whose entries never hold a key, a passphrase or a credential; 0.10.0 adds the events `failoverGroupStarted`, `failoverGroupPromoted`, `failoverGroupFailed` and `oldPrimaryRebuilt`, resource type `shardGroup`). A denied or failed call of an
 operation is recorded under that operation's id with `outcome` `denied` or `failure`. Read-only operations are not
 audited except `executeQuery`. The list is the closed enum `AuditAction`, which is also the type of the `action`
 filter of `GET /audit`.
@@ -315,6 +317,55 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.11.0
+
+Revision written with phase 7 of the ledger, signing, publication and anchoring (steps 3 and 4 of the implementation plan of
+`kingres/docs/design/ledger-phase7.md`; the design called the revision 0.9.0 before the numbers were taken). Summary for the panel:
+28 operations added (132 operations, 108 paths); every operation answers 422 `unsupported_operation` until the version of
+`kingresd` implements it (the signing operations, the settings and the trust file are the first); 5 problem codes, 9 alert kinds,
+16 audit actions, 8 task kinds, 1 task subject type, **no change that is not additive** (the redefinition of `LedgerBlock.signed`
+changes a value that was always false).
+
+#### Breaking
+
+None. `LedgerBlock.signed` keeps its name and type; it was always `false` because no server signature existed, and from 0.11.0 it
+means that a signed checkpoint of the chain log covers the block.
+
+#### Additive
+
+- Operations: `getLedgerSettings`, `updateLedgerSettings`, `getLedgerSigning`, `createLedgerSigningKey`, `retireLedgerSigningKey`,
+  `revokeLedgerSigningKey`, `getLedgerTrustFile`, `getLedgerPublication`, `listLedgerAnchorTargets`, `createLedgerAnchorTarget`,
+  `getLedgerAnchorTarget`, `updateLedgerAnchorTarget`, `deleteLedgerAnchorTarget`, `testLedgerAnchorTarget`, `getLedgerAggregate`,
+  `listLedgerAggregates`, `listLedgerAnchors`, `anchorLedgerNow`, `retryLedgerAnchor`, `downloadLedgerAnchor`, `createLedgerBundle`,
+  `getLedgerBundle`, `listLedgerClientKeys`, `registerLedgerClientKey`, `revokeLedgerClientKey`, `setTableSignaturePolicy`,
+  `upgradeLedgerExtension`, `acknowledgeLedgerDivergence`. `anchorLedgerNow` answers 201 with the records (the design said 202; a 202 of
+  this contract is always a task).
+- Schemas: `LedgerSettingsCluster`, `LedgerSettingsUpdate`, `LedgerSigning`, `LedgerSigningKey`, `LedgerSigningEvent`,
+  `CreateLedgerSigningKeyRequest`, `RevokeLedgerSigningKeyRequest`, `LedgerTrustFile`, `LedgerPublication`, `LedgerAnchorTarget` (with its
+  create, update and test shapes), `LedgerAnchor`, `LedgerAggregate`, `LedgerBundleRequest`, `LedgerClientKey` and the request shapes of the
+  other operations.
+- `LedgerStatus` gains the optional `publication` and `anchoring`; `LedgerVerifyRequest` gains `checks`; `LedgerDigest` gains
+  `aggregateSize`; `TaskSubject.type` gains `ledgerKey`.
+- Alert kinds `ledgerNotAnchored`, `ledgerAnchorBehind`, `ledgerAnchorFailed`, `ledgerAnchorConflict`, `ledgerChainDiverged`,
+  `ledgerGroupUnread`, `ledgerPublicationBehind`, `ledgerSignerUnavailable`, `ledgerDigestOverdue`; problem codes `ledger_not_published`,
+  `origin_prefix_locked`, `signing_key_missing`, `last_signing_key`, `chain_not_diverged`; task kinds `ledger.key.create`, `ledger.key.rotate`,
+  `ledger.key.retire`, `ledger.key.revoke`, `ledger.key.distribute`, `ledger.bundle.create`, `ledger.epoch.start`, `ledger.upgrade`; the audit
+  actions named under "Audit actions".
+
+#### Documentation
+
+Implemented by `kingresd` with this revision: `getLedgerSettings`, `updateLedgerSettings`, `getLedgerSigning`, `createLedgerSigningKey`,
+`retireLedgerSigningKey`, `revokeLedgerSigningKey` and `getLedgerTrustFile` (the signing keys, step 4 of the plan); the other 21 operations answer 422
+`unsupported_operation` until their step is built. `getLedgerTrustFile` through a follower keeps `Content-Disposition`. The key tasks have the
+subject `ledgerKey` with the id `signing`, and their task error codes are not an enum (clients tolerate codes they do not know): `key_set_damaged`,
+`clock`, `term_over`, `not_leader`, `last_signing_key`, `key_files_remain`, `key_file_missing`, `signer_unavailable`, `cannot_sign`, `cannot_activate`,
+`cannot_retire`, `cannot_revoke`, `trust_file`, `key_id_collision`.
+
+What is secret and what is not: a private key, a seed, a passphrase and a credential of an anchor target are never part of an answer, a task,
+an audit entry or an error; the public key, the fingerprint and the trust file are public and the trust file is not a source of first trust
+(an auditor compares the fingerprint with one obtained out of band). The signing keys are one set per cluster and live on the manager
+leader and on its candidates; `getLedgerSigning.holders` names them. A key task is one at a time (409 `operation_in_progress`).
 
 ### 0.10.0
 
