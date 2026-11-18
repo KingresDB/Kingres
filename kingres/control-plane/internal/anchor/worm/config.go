@@ -188,6 +188,17 @@ func (c Config) lockMode() string { return strings.ToUpper(c.Mode) }
 // ObjectKey is the key of the note: "<prefix>/<aggregate id hex>/<size as 20
 // decimal digits, zero padded>.note" (design 6.3 step 1).
 func ObjectKey(prefix, aggregateIDHex string, size uint64) string {
+	return ObjectKeyGen(prefix, aggregateIDHex, size, 0)
+}
+
+// ObjectKeyGen is the key of generation gen of the note (correction 95):
+// generation 0 is exactly ObjectKey, and generation n above 0 is
+// "<prefix>/<aggregate id hex>/<size as 20 decimal digits>.g<n>.note".
+func ObjectKeyGen(prefix, aggregateIDHex string, size uint64, gen uint32) string {
 	s := strconv.FormatUint(size, 10)
-	return strings.Trim(prefix, "/") + "/" + aggregateIDHex + "/" + strings.Repeat("0", 20-len(s)) + s + ".note"
+	g := ""
+	if gen > 0 {
+		g = ".g" + strconv.FormatUint(uint64(gen), 10)
+	}
+	return strings.Trim(prefix, "/") + "/" + aggregateIDHex + "/" + strings.Repeat("0", 20-len(s)) + s + g + ".note"
 }

@@ -162,7 +162,9 @@ type Options struct {
 	// earlier checkpoint of the table of real headers the target of an accepted
 	// header may be (0 means DefaultWorkSlack, 16): the minimum-work rule of
 	// header_checked, see CheckHeaderAt. A larger value accepts less work; it
-	// exists for a chain whose difficulty has fallen by more than that.
+	// exists for a chain whose difficulty has fallen by more than that. New
+	// refuses a value above MaxWorkSlack (2^20), which can never admit
+	// difficulty 1 for a height at or after the newest checkpoint.
 	WorkSlack uint
 
 	// headerWork replaces the whole proof-of-work check of a header (floor
@@ -211,6 +213,9 @@ func New(cfg Config, opt Options) (*Target, error) {
 	if slack == 0 {
 		slack = DefaultWorkSlack
 	}
+	if slack > MaxWorkSlack {
+		return nil, fmt.Errorf("ots: WorkSlack must be at most %d: a larger value would admit headers of difficulty 1", MaxWorkSlack)
+	}
 	work := func(h []byte, height uint64) (HeaderResult, error) {
 		return CheckHeaderFloor(h, MaxTargetAt(height, slack))
 	}
@@ -255,6 +260,47 @@ func (e *PartialError) Error() string { return e.Err.Error() }
 
 // Unwrap returns the *anchor.Error.
 func (e *PartialError) Unwrap() error { return e.Err }
+
+// ContradictedError is returned by Upgrade with Code "claim_contradicted" (class
+// conflict): every claim of the record was dropped for good because the header
+// source contradicted it twice, an hour or more apart, and nothing can deliver
+// any more. Evidence is the evidence as it was BEFORE that call: it still holds
+// the claims. If the operator finds that the header source was wrong (a node on
+// a stale fork, still synchronising, of another network), the caller keeps this
+// evidence with the failed record and passes it to SubmitWithPrior when the
+// record is retried: the calendars are not asked again, the claims are judged
+// again against the corrected source, and the submission time is kept. A Submit
+// without it starts again from the calendars and the old proof is gone (correction
+// 96). PriorEvidence reads it from any error of this package that carries one.
+// It unwraps to an *anchor.Error.
+type ContradictedError struct {
+	Evidence anchor.OTSEvidence
+	Err      *anchor.Error
+}
+
+// Error implements error.
+func (e *ContradictedError) Error() string { return e.Err.Error() }
+
+// Unwrap returns the *anchor.Error.
+func (e *ContradictedError) Unwrap() error { return e.Err }
+
+// PriorEvidence returns the evidence that a caller keeps and passes to
+// SubmitWithPrior when it retries a record whose Submit or Upgrade failed with a
+// *PartialError (what the calendars that did answer gave) or a *ContradictedError
+// (what the record held before the claims were dropped). ok is false for any
+// other error. A caller that retries such a record without it throws away
+// what was paid for.
+func PriorEvidence(err error) (ev anchor.OTSEvidence, ok bool) {
+	var pe *PartialError
+	if errors.As(err, &pe) {
+		return pe.Evidence, true
+	}
+	var ce *ContradictedError
+	if errors.As(err, &ce) {
+		return ce.Evidence, true
+	}
+	return anchor.OTSEvidence{}, false
+}
 
 // Submit implements anchor.Target.
 func (t *Target) Submit(ctx context.Context, p anchor.Payload) (anchor.Receipt, error) {

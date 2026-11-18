@@ -111,8 +111,34 @@ type Payload struct {
 	// evidence states the value that was applied); a value later than the true
 	// start can make an object that the first call wrote fail for good. Whole
 	// seconds, UTC. A caller that wants a new start must use a new key (another
-	// key prefix).
+	// key prefix, or a new Generation).
 	SubmitStart time.Time
+	// Generation is the generation of the key (correction 95), persisted by the
+	// caller with the record: 0 for every record that exists, and the key of
+	// generation 0 is exactly the key that was always used. The WORM target puts
+	// it in the object key ("<size>.g<n>.note" for n above 0); the other targets
+	// ignore it, so that every target sees the same payload. The caller raises it
+	// by one, with a new SubmitStart (WithGeneration), only on an operator's
+	// explicit choice after a permanent refusal of the time of the store, never
+	// automatically: every generation is one more object in the bucket that
+	// claims to be the anchor of this checkpoint.
+	Generation uint32
+}
+
+// WithGeneration returns p with the generation g and the start of the first
+// Submit call for that generation, submitStart (required, as in NewPayload: a
+// new generation is a new key and has a new first call). g is at most
+// MaxGeneration.
+func (p Payload) WithGeneration(g uint32, submitStart time.Time) (Payload, error) {
+	if submitStart.IsZero() {
+		return Payload{}, fmt.Errorf("anchor: the start of the first Submit call is required")
+	}
+	if g > MaxGeneration {
+		return Payload{}, fmt.Errorf("anchor: generation must be at most %d", MaxGeneration)
+	}
+	p.Generation = g
+	p.SubmitStart = submitStart.UTC().Truncate(time.Second)
+	return p, nil
 }
 
 // AggregateID returns the part of ID before the slash.
@@ -325,6 +351,9 @@ func (p Payload) Check() error {
 	if p.SubmitStart.IsZero() {
 		return fmt.Errorf("anchor: payload has no SubmitStart (use anchor.NewPayload)")
 	}
+	if p.Generation > MaxGeneration {
+		return fmt.Errorf("anchor: payload generation must be at most %d", MaxGeneration)
+	}
 	q, err := ParsePayload(p.AggregateID(), p.SignedNote)
 	if err != nil {
 		return err
@@ -374,6 +403,13 @@ type Receipt struct {
 	ContradictedClaims int
 	ClaimsAside        int
 	ClaimsDropped      int
+	// ClaimsRepeated is how many claims that had been dropped for good (they are
+	// remembered in OTSEvidence.Dropped) a calendar answered again in this call
+	// and that were put aside at once, before they entered a fragment: they are
+	// not counted as contradicted, aside or dropped again (correction 96). A
+	// number above zero for round after round is a calendar that insists on a
+	// claim that a header source contradicted; it is an operator matter.
+	ClaimsRepeated int
 }
 
 // Check statuses of a TestResult.

@@ -39,14 +39,16 @@
 //
 //	{"tsa_url":"<configured url>","token_der_b64":"<std base64, padded, of the token>",
 //	 "gen_time":"2026-12-01T10:00:00Z","serial":"<decimal>","policy":"<dotted OID>",
-//	 "recorded_by":"cluster"}
+//	 "signer_key_sha256":"<64 hex>","recorded_by":"cluster"}
 //
 // token_der_b64 is the DER of the TimeStampToken, that is the ContentInfo
 // (SEQUENCE { OID 1.2.840.113549.1.7.2, [0] SignedData }), byte for byte as
 // the TSA sent it inside the TimeStampResp, with the certificates it carried
 // (certReq is TRUE in the request). gen_time is genTime truncated to whole
 // seconds, in UTC, format "2006-01-02T15:04:05Z"; serial is the TSTInfo serial
-// in decimal; policy is the TSTInfo policy. Receipt.EvidenceTime is genTime
+// in decimal; policy is the TSTInfo policy; signer_key_sha256 is the lower case hex
+// SHA-256 of the DER SubjectPublicKeyInfo of the signing certificate (what
+// SignerKeyHash computes, correction 97). Receipt.EvidenceTime is genTime
 // (with its sub-seconds); Receipt.State is "anchored" at once; NextCheck is nil.
 // The URL has no query and no user information (the file is public). The token
 // is accepted by Submit only if genTime is within Config.MaxSkewSeconds (default
@@ -74,7 +76,7 @@
 // stored bytes of an intermediate or a root that the token carries are not
 // authenticated, which is why the roots are the verifier's own.
 //
-// # The pin of the signer (correction 92)
+// # The pin of the signer (corrections 92 and 97)
 //
 // Config.SignerKeySHA256 (JSON "signerKeySha256", 64 lower case hexadecimal
 // digits) optionally pins the signer: the SHA-256 of the DER
@@ -86,10 +88,30 @@
 // roots. Without a pin any authority under the configured roots is accepted and
 // the name in the token is only checked against the token's own certificate:
 // an operator who means one authority says so with the pin. Expect.SignerKeySHA256
-// is the same pin for VerifyToken.
+// is the same pin for VerifyToken. VerifyStoredToken and VerifyEvidence take the
+// pin as an argument (nil: no pin), so that an auditor who means one authority
+// applies it to stored evidence; VerifyEvidence also checks that the evidence
+// carries the hash of the key that signed the token. When several certificates of
+// a token match the sid of its SignerInfo (an older certificate of the same key
+// id or issuer and serial listed before the one that signed), every one is tried
+// as the signer and the first that passes all the checks is the signer; when none
+// does, the error is the first one's.
 //
 // # What the caller must do
 //
+//   - Know that the name check can refuse an honest authority, and that the
+//     refusal is permanent (A4-08, correction 97): the TSTInfo "tsa" name is
+//     compared with the names of the signing certificate by the narrow profile
+//     below, so a certificate whose PrintableString holds a character outside
+//     the PrintableString set (some real certificates carry an ampersand or an
+//     at sign), or whose name is the same text in another Unicode normalisation
+//     (composed against decomposed letters), or in another string type than the
+//     "tsa" field, is refused with Code "tsa_name_mismatch" on every attempt: a
+//     Retry gets the same refusal. The operator then asks the
+//     authority to issue tokens whose "tsa" field is byte for byte a name of its
+//     certificate (or to leave the field out, which RFC 3161 allows), or uses
+//     another authority; there is no switch that turns the check off, and the pin
+//     (Config.SignerKeySHA256) does not replace it.
 //   - Load the CA bundle named by Config.CABundlePath itself and hand it to
 //     ParseBundle (self-signed certificates become trust anchors, the rest
 //     intermediates). This package reads no file.

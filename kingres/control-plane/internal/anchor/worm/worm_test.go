@@ -188,7 +188,7 @@ func TestSubmitIdempotent(t *testing.T) {
 		t.Fatalf("found: %v then %v", ev1.Found, ev2.Found)
 	}
 	ev2.Found = false
-	if ev1 != ev2 || rc1.State != rc2.State {
+	if !sameEvidence(ev1, ev2) || rc1.State != rc2.State {
 		t.Fatalf("evidence differs:\n%s\n%s", rc1.Evidence, rc2.Evidence)
 	}
 	if n := len(f.stored(ev1.Key)); n != 1 {

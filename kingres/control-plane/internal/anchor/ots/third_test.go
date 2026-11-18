@@ -354,13 +354,25 @@ func TestDifficultyOneIsBelowTheFloor(t *testing.T) {
 	if MaxTargetAt(912095, 16).Cmp(want) != 0 || MaxTargetAt(5_000_000, 16).Cmp(want) != 0 || MaxTargetAt(912094, 16).Cmp(want) == 0 {
 		t.Fatal("the floor is not 16 times the target of the nearest earlier checkpoint")
 	}
-	// WorkSlack is the option: a slack of 2^48 admits difficulty 1 again
-	tg, err := New(Config{Calendars: []string{"https://a.example"}}, Options{WorkSlack: 1 << 48})
+	// WorkSlack is the option, and it has an upper bound (A4-05): a slack of 2^48,
+	// or any value above MaxWorkSlack, is refused by New, and the largest slack
+	// admitted keeps the floor of the present era below difficulty 1
+	for _, s := range []uint{1 << 48, MaxWorkSlack + 1, ^uint(0)} {
+		if _, err := New(Config{Calendars: []string{"https://a.example"}}, Options{WorkSlack: s}); err == nil {
+			t.Fatalf("a slack of %d was accepted", s)
+		}
+	}
+	tg, err := New(Config{Calendars: []string{"https://a.example"}}, Options{WorkSlack: MaxWorkSlack})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tg.work(genesis, 950000); err != nil {
-		t.Fatalf("a slack of 2^48: %v", err)
+	for _, height := range []uint64{912095, 912096, 950000, 5_000_000} {
+		if _, err := tg.work(genesis, height); err == nil {
+			t.Fatalf("height %d: the largest slack admits difficulty 1", height)
+		}
+		if MaxTargetAt(height, MaxWorkSlack).Cmp(diff1) >= 0 {
+			t.Fatalf("height %d: the floor of the largest slack is not below difficulty 1", height)
+		}
 	}
 	def, _ := New(Config{Calendars: []string{"https://a.example"}}, Options{})
 	if _, err := def.work(genesis, 950000); err == nil {

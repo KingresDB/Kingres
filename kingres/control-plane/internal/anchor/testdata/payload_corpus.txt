@@ -10,10 +10,12 @@
 # string. Where the two verdicts differ, the case is one of the two places where
 # this package is stricter on purpose (the byte 0x7f, DEL, anywhere in the note;
 # a note over 16 KiB, which is tested separately) and the name says so.
-# TestPayloadCorpus holds ParsePayload to the anchor column; the verifier column
-# was checked against the verifier's own parsers when the corpus was written
-# (the verifier module cannot be imported from here), and is what a future
-# shared corpus in the verifier module must reproduce.
+# TestPayloadCorpus holds ParsePayload to the anchor column. This file has a
+# byte-identical copy in the verifier module
+# (verifier/internal/checkpoint/testdata/payload_corpus.txt), and a test there
+# holds the verifier's real parsers to the verifier column; a test of this
+# package fails when the two copies differ (correction 92 and 97). Change both
+# together.
 
 good	accept	accept	"kingres.example/agg\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\u2014 kingres.example/agg AAAAAA==\n"
 two-keys-same-name-other-id	accept	accept	"kingres.example/agg\n17\ncnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\n\n\u2014 kingres.example/agg AAAAAA==\n\u2014 kingres.example/agg AAAAAQ==\n"

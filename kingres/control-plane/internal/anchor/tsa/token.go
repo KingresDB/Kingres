@@ -14,6 +14,7 @@ import (
 	"crypto/x509"
 	"encoding/asn1"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"math/big"
 	"time"
@@ -147,6 +148,9 @@ type TokenInfo struct {
 	Nonce    *big.Int // nil when the token has none
 	// Signer is the certificate that signed the token.
 	Signer *x509.Certificate
+	// SignerKeySHA256 is SignerKeyHash of Signer: the pin of the signing key,
+	// recorded in the evidence (correction 97).
+	SignerKeySHA256 [32]byte
 	// SignatureAlgorithm names the digest and key type, e.g. "ECDSA-SHA256".
 	SignatureAlgorithm string
 }
@@ -658,20 +662,24 @@ func resolveSigAlg(si signerInfo) (sigAlg, *anchor.Error) {
 	return sigAlg{name: name + dh.String(), hash: dh, rsa: isRSA}, nil
 }
 
-func findSigner(pt *parsedToken) *x509.Certificate {
+// findSigners returns every certificate of the token that the sid of the
+// SignerInfo names (a token may carry an older certificate of the same key id
+// before the one that signed; VerifyToken tries each, correction 97).
+func findSigners(pt *parsedToken) []*x509.Certificate {
+	var out []*x509.Certificate
 	for _, c := range pt.certs {
 		if pt.si.sidSKI != nil {
 			if len(c.SubjectKeyId) > 0 && bytes.Equal(c.SubjectKeyId, pt.si.sidSKI) {
-				return c
+				out = append(out, c)
 			}
 			continue
 		}
 		serial, _ := asn1.Marshal(c.SerialNumber)
 		if bytes.Equal(c.RawIssuer, pt.si.sidIssuer) && bytes.Equal(serial, pt.si.sidSerial) {
-			return c
+			out = append(out, c)
 		}
 	}
-	return nil
+	return out
 }
 
 func checkEKU(c *x509.Certificate) *anchor.Error {
@@ -716,10 +724,26 @@ func VerifyToken(tokenDER []byte, e Expect, roots, intermediates *x509.CertPool)
 	if aerr != nil {
 		return nil, aerr
 	}
-	signer := findSigner(pt)
-	if signer == nil {
+	signers := findSigners(pt)
+	if len(signers) == 0 {
 		return nil, fail(CodeNoSignerCert, "the token carries no certificate named by its SignerInfo")
 	}
+	var first error
+	for _, signer := range signers {
+		info, err := verifyWithSigner(pt, alg, signer, e, roots, intermediates)
+		if err == nil {
+			return info, nil
+		}
+		if first == nil {
+			first = err
+		}
+	}
+	return nil, first
+}
+
+// verifyWithSigner is the rest of VerifyToken for one candidate signing
+// certificate.
+func verifyWithSigner(pt *parsedToken, alg sigAlg, signer *x509.Certificate, e Expect, roots, intermediates *x509.CertPool) (*TokenInfo, error) {
 	if e.SignerKeySHA256 != nil {
 		if h := SignerKeyHash(signer); subtle.ConstantTimeCompare(h[:], e.SignerKeySHA256) != 1 {
 			return nil, fail(CodeSignerPin, "the signing certificate is not the one that the configuration pins (the SHA-256 of its public key differs from signerKeySha256)")
@@ -814,7 +838,7 @@ func VerifyToken(tokenDER []byte, e Expect, roots, intermediates *x509.CertPool)
 		}
 	}
 	return &TokenInfo{GenTime: info.genTime, Accuracy: info.accuracy, Ordering: info.ordering, Policy: info.policy,
-		Serial: info.serial, Nonce: info.nonce, Signer: signer, SignatureAlgorithm: alg.name}, nil
+		Serial: info.serial, Nonce: info.nonce, Signer: signer, SignerKeySHA256: SignerKeyHash(signer), SignatureAlgorithm: alg.name}, nil
 }
 
 func shortErr(err error) string {
@@ -832,25 +856,29 @@ func shortErr(err error) string {
 }
 
 // VerifyStoredToken verifies a token kept as evidence against the digest it
-// must stamp; the nonce is not checked.
-func VerifyStoredToken(tokenDER []byte, digest [32]byte, roots, intermediates *x509.CertPool) (*TokenInfo, error) {
-	return VerifyToken(tokenDER, Expect{Digest: digest}, roots, intermediates)
+// must stamp; the nonce is not checked. pin, when not nil (32 bytes), pins the
+// signer as Expect.SignerKeySHA256 does (an auditor who means one authority
+// passes it; nil accepts any authority under the roots, correction 97).
+func VerifyStoredToken(tokenDER []byte, digest [32]byte, pin []byte, roots, intermediates *x509.CertPool) (*TokenInfo, error) {
+	return VerifyToken(tokenDER, Expect{Digest: digest, SignerKeySHA256: pin}, roots, intermediates)
 }
 
 // VerifyEvidence verifies TSA evidence (anchor.TSAEvidence) against the
-// digest: the token as VerifyStoredToken, then that gen_time, serial and
-// policy of the evidence are those of the token.
-func VerifyEvidence(ev anchor.TSAEvidence, digest [32]byte, roots, intermediates *x509.CertPool) (*TokenInfo, error) {
+// digest: the token as VerifyStoredToken (with the pin, which may be nil), then
+// that gen_time, serial, policy and signer_key_sha256 of the evidence are those
+// of the token.
+func VerifyEvidence(ev anchor.TSAEvidence, digest [32]byte, pin []byte, roots, intermediates *x509.CertPool) (*TokenInfo, error) {
 	if err := ev.Validate(); err != nil {
 		return nil, fail(CodeEvidenceMismatch, "evidence is malformed")
 	}
 	der, _ := base64.StdEncoding.DecodeString(ev.TokenDERB64)
-	info, err := VerifyStoredToken(der, digest, roots, intermediates)
+	info, err := VerifyStoredToken(der, digest, pin, roots, intermediates)
 	if err != nil {
 		return nil, err
 	}
-	if anchor.FormatTime(info.GenTime) != ev.GenTime || info.Serial.String() != ev.Serial || info.Policy != ev.Policy {
-		return nil, fail(CodeEvidenceMismatch, "gen_time, serial or policy of the evidence differ from the token")
+	if anchor.FormatTime(info.GenTime) != ev.GenTime || info.Serial.String() != ev.Serial || info.Policy != ev.Policy ||
+		hex.EncodeToString(info.SignerKeySHA256[:]) != ev.SignerKeySHA256 {
+		return nil, fail(CodeEvidenceMismatch, "gen_time, serial, policy or signer key of the evidence differ from the token")
 	}
 	return info, nil
 }
@@ -859,12 +887,13 @@ func VerifyEvidence(ev anchor.TSAEvidence, digest [32]byte, roots, intermediates
 // address of the TSA (without credentials).
 func EvidenceFromToken(url string, info *TokenInfo, tokenDER []byte) anchor.TSAEvidence {
 	return anchor.TSAEvidence{
-		TSAURL:      url,
-		TokenDERB64: base64.StdEncoding.EncodeToString(tokenDER),
-		GenTime:     anchor.FormatTime(info.GenTime),
-		Serial:      info.Serial.String(),
-		Policy:      info.Policy,
-		RecordedBy:  anchor.RecordedByCluster,
+		TSAURL:          url,
+		TokenDERB64:     base64.StdEncoding.EncodeToString(tokenDER),
+		GenTime:         anchor.FormatTime(info.GenTime),
+		Serial:          info.Serial.String(),
+		Policy:          info.Policy,
+		SignerKeySHA256: hex.EncodeToString(info.SignerKeySHA256[:]),
+		RecordedBy:      anchor.RecordedByCluster,
 	}
 }
 

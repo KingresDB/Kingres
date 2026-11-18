@@ -101,6 +101,12 @@ type fakeS3 struct {
 	listExact       int              // pad a version listing to exactly this many bytes
 	headFailures    int              // the next HEAD requests of a version answer 500 (counted down)
 	clock           func() time.Time // the store's time source before skew is added (nil: time.Now)
+
+	// a store, gateway or copy tool that does not keep the user metadata of the
+	// attempt, rewrites it, or repeats it (A4-02)
+	dropAttempt    bool
+	attemptRewrite func(string) string
+	attemptExtra   []string
 }
 
 // now is the store's clock: the shared test clock, or the real one, plus skew.
@@ -535,8 +541,15 @@ func (f *fakeS3) read(w http.ResponseWriter, r *http.Request, key string) {
 		w.WriteHeader(500)
 		return
 	}
-	if v.attempt != "" {
-		w.Header().Set("X-Amz-Meta-Kingres-Attempt", v.attempt)
+	if v.attempt != "" && !f.dropAttempt {
+		a := v.attempt
+		if f.attemptRewrite != nil {
+			a = f.attemptRewrite(a)
+		}
+		w.Header().Set("X-Amz-Meta-Kingres-Attempt", a)
+		for _, x := range f.attemptExtra {
+			w.Header().Add("X-Amz-Meta-Kingres-Attempt", x)
+		}
 	}
 	if r.Method == "GET" && f.getStatus != 0 {
 		f.errXML(w, f.getStatus, "InternalError", "we encountered an internal error")

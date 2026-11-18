@@ -95,11 +95,13 @@
 // header that contradicted it, the time, the reason), the claim stays in the
 // fragment of its calendar, is neither plausible nor anchored (ClaimCheck.
 // Quarantined; CheckEvidence says so too and refuses a summary that names it),
-// and the calendar is asked about it again in the later rounds: a target with a
-// header source keeps the pending attestation of a calendar whose answer it
-// merged (a target without a source removes it, as nothing can contradict a
-// claim then), so a claim merged before the source was configured cannot be
-// asked again, and its entry waits for the second contradiction. The claim is
+// and the calendar is asked about it again in the later rounds: every target keeps the pending
+// attestation of a calendar whose answer it merged (correction 96; it used to be
+// removed by a target without a source, so a claim merged before a source was
+// configured could not be asked again), and its entry waits for the second
+// contradiction. A target without a source makes no request for such a kept
+// pending attestation (nothing can contradict the claim, and the answer is
+// merged); a source configured later makes the calendars be asked again. The claim is
 // dropped for good, with that pending attestation and with the fragment when
 // nothing else is left of it, only when the header source contradicts it again in
 // a round at least Config.ContradictionConfirmMinutes (default 60, range 1 to
@@ -118,7 +120,13 @@
 // falls back to submitted). Only when claims were dropped for good and nothing
 // is left that could deliver or is kept aside does Upgrade return an error of
 // class conflict (code "claim_contradicted": a calendar lied, or the source is
-// wrong twice), with the receipt untouched.
+// wrong twice), with the receipt untouched. That error is a *ContradictedError:
+// it carries the evidence as it was BEFORE the call, which still holds the
+// claims, and PriorEvidence reads it. A claim dropped for good is remembered in
+// OTSEvidence.Dropped (calendar, height, merkle root, time; bounded), and the
+// same claim answered again by a calendar is put aside at once, before it enters
+// a fragment, and counted only in Receipt.ClaimsRepeated, not as contradicted,
+// aside or dropped again (correction 96).
 //
 // # What header_checked proves, and what the auditor still does (correction 91)
 //
@@ -130,7 +138,8 @@
 // against about 2^32 for difficulty 1, and the work of the accepted header,
 // HeaderResult.Work, is reported); whose merkle root is the message that the
 // claim sits on, recomputed from the digest; and whose time fits the submission
-// and the clock. Options.WorkSlack changes the factor. It does NOT prove that
+// and the clock. Options.WorkSlack changes the factor, up to MaxWorkSlack (2^20; New refuses more, since 2^47 and above would admit
+// difficulty 1 again). It does NOT prove that
 // the header is in the best chain: a real header of an orphaned block, or a header
 // of any chain of that much work, passes, and nothing here counts confirmations.
 // The auditor takes the height and the merkle root of the evidence (or of the
@@ -163,7 +172,10 @@
 // "header_checked", "header": "" or the 160 hex digits of the header},
 // "contradicted": [] or entries {"calendar_uri","height","merkle_root","header":
 // the 160 hex digits of the header that contradicted the claim,"at": time,
-// "reason": text} of the claims kept aside}.
+// "reason": text} of the claims kept aside, "dropped": [] or entries
+// {"calendar_uri","height","merkle_root","at": time} of the claims dropped for
+// good that are remembered (at most anchor.MaxOTSDropped, the oldest forgotten
+// first; correction 96)}.
 // Calendars are in the order of the configuration; each fragment is a tree
 // serialised as above without the magic, the version, the hash operation and
 // the digest. The digest is SHA-256 of the checkpoint text, the payload_sha256
@@ -219,9 +231,9 @@
 // "minCalendars", "upgradeTimeoutDays", "contradictionConfirmMinutes" and
 // "allowInsecure" (http allowed only
 // when true); unknown members are refused. An upgrade merges a calendar's
-// answer only if it holds an acceptable Bitcoin attestation, and then, in a
-// target without a header source, removes the pending attestation it asked
-// about (a target with one keeps it, see "A contradicted claim is kept aside");
+// answer only if it holds an acceptable Bitcoin attestation, and then the
+// pending attestation it asked about is kept (see "A contradicted claim is kept
+// aside");
 // an answer of 404 or one with only pending attestations changes nothing. Every
 // fragment has a budget of PerFragmentLookups requests per call (distinct commitments, in tree order),
 // so every calendar is asked in every round and a calendar that names others
@@ -260,10 +272,29 @@
 // cannot be read; a round in which every lookup failed is retryable even when
 // every failure was permanent (a gateway that answered with HTML once, a 410):
 // the record keeps waiting until it expires or the limits of the retries end
-// it. Implement HeaderSource over a node you trust, or leave it out and present
-// the result as a claim.
+// it. A record that failed with "claim_contradicted" holds the only copy of the
+// claims in the *ContradictedError of that call (anchor.Record keeps no
+// evidence of its own): store PriorEvidence(err) with the failed record, and when
+// the operator retries it after fixing the header source, call SubmitWithPrior
+// with it and not Submit: the proof, the calendars already answered and the first
+// submission time are kept, and the claims are judged again; a Submit starts
+// again from the calendars and the old proof is gone. The same holds for the
+// evidence of a *PartialError. Keep the evidence of a claimed record
+// until it is anchored or expires. Call NewestCheckpoint at start and warn when its
+// block time is old (the floor does not follow the chain; the table is extended
+// at each release). Implement HeaderSource over a node you trust, or leave it
+// out and present the result as a claim.
 //
 // # What it does not do
+//
+// The floor is frozen at the newest checkpoint of the table (NewestCheckpoint
+// returns its height and block time: block 912095 of August 2025 in this
+// release): it is the difficulty of that block divided by the slack whatever the
+// difficulty is when the claim is checked, so it weakens every year as difficulty
+// rises. The table is extended at each release (a recent header and its row in
+// testdata/headers.txt); the caller should warn the operator when the time that
+// NewestCheckpoint returns is more than a year behind the clock, and a release
+// must not be cut with an old table.
 //
 // It does not fetch Bitcoin data itself, does not verify a Bitcoin attestation
 // against anything without a header from the operator's source or the

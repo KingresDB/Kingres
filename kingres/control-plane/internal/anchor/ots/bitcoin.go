@@ -132,6 +132,28 @@ func checkHeaderWith(header []byte, limit, maxTarget *big.Int) (HeaderResult, er
 // small beside the rise since the checkpoint was taken.
 const DefaultWorkSlack = 16
 
+// MaxWorkSlack is the largest Options.WorkSlack that New accepts (2^20). The
+// target of the newest checkpoint is about 2^177 and the target of difficulty 1
+// about 2^224, so this slack keeps the floor of every height at or after the
+// newest checkpoint more than 2^26 times below difficulty 1: no configuration
+// of the option admits a header of difficulty 1 for a height of the present era
+// (A4-05, correction 96).
+const MaxWorkSlack = 1 << 20
+
+// NewestCheckpoint returns the height and the block time (the time field of the
+// real header) of the newest entry of the table of checkpoints, the one the work
+// floor of every later height is taken from. The floor does not follow the
+// chain: it is the difficulty of that block divided by the slack, whatever the
+// difficulty is when the claim is checked, so a table that is not extended makes
+// the floor weaker every year as difficulty rises. The table is extended at each
+// release (a header of a recent block, with its row in testdata/headers.txt), and
+// a caller can warn when the time returned is old: for instance when it is more
+// than a year behind the clock of the server.
+func NewestCheckpoint() (height uint64, blockTime time.Time) {
+	c := checkpoints[len(checkpoints)-1]
+	return c.height, time.Unix(c.time, 0).UTC()
+}
+
 // MaxTargetAt is the easiest target that CheckHeaderAt accepts for a header
 // of the block at height: slack times the target of the nearest checkpoint
 // at or below height (the table is facts of the public chain, see claims.go).

@@ -71,7 +71,7 @@ func TestSubmitBoundsGenTime(t *testing.T) {
 	// the stored-evidence path does not apply the bound: a token stays valid for ever
 	a := newAuthority(t, authOpts{})
 	tok := a.token(testReq(), issueOpts{genTime: now.Add(-3 * 365 * 24 * time.Hour)})
-	if _, err := VerifyStoredToken(tok, testDigest, a.rootPool, a.interPool); err == nil {
+	if _, err := VerifyStoredToken(tok, testDigest, nil, a.rootPool, a.interPool); err == nil {
 		t.Log("an old token verifies as stored evidence, as it must (the certificate was valid then)")
 	}
 }
@@ -95,7 +95,7 @@ func TestSubmitRefusesExpiredAuthority(t *testing.T) {
 	}
 	// the same token is fine as stored evidence: valid at genTime
 	tok := e.a.token(testReq(), issueOpts{genTime: now.Add(-3 * time.Hour)})
-	if _, err := VerifyStoredToken(tok, testDigest, e.a.rootPool, e.a.interPool); err != nil {
+	if _, err := VerifyStoredToken(tok, testDigest, nil, e.a.rootPool, e.a.interPool); err != nil {
 		t.Fatalf("stored evidence of a token from the validity window: %v", err)
 	}
 	// inside the tolerance of the clock, valid at genTime, expired now

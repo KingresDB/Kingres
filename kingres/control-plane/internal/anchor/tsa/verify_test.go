@@ -76,7 +76,7 @@ func TestVerifyAcceptsVariants(t *testing.T) {
 		t.Fatalf("fraction: %v", err)
 	}
 	// stored token: no nonce check
-	if _, err := VerifyStoredToken(a.token(r, issueOpts{}), testDigest, a.rootPool, a.interPool); err != nil {
+	if _, err := VerifyStoredToken(a.token(r, issueOpts{}), testDigest, nil, a.rootPool, a.interPool); err != nil {
 		t.Fatal(err)
 	}
 	// token has no nonce and none expected
@@ -229,16 +229,16 @@ func TestEvidenceRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := VerifyEvidence(back, testDigest, a.rootPool, a.interPool); err != nil {
+	if _, err := VerifyEvidence(back, testDigest, nil, a.rootPool, a.interPool); err != nil {
 		t.Fatal(err)
 	}
 	other := testDigest
 	other[0] ^= 1
-	if _, err := VerifyEvidence(back, other, a.rootPool, a.interPool); anchor.CodeOf(err) != CodeImprint {
+	if _, err := VerifyEvidence(back, other, nil, a.rootPool, a.interPool); anchor.CodeOf(err) != CodeImprint {
 		t.Fatalf("other digest: %v", err)
 	}
 	back.Serial = "1"
-	if _, err := VerifyEvidence(back, testDigest, a.rootPool, a.interPool); anchor.CodeOf(err) != CodeEvidenceMismatch {
+	if _, err := VerifyEvidence(back, testDigest, nil, a.rootPool, a.interPool); anchor.CodeOf(err) != CodeEvidenceMismatch {
 		t.Fatalf("serial: %v", err)
 	}
 	if !strings.Contains(string(raw), `"recorded_by":"cluster"`) {

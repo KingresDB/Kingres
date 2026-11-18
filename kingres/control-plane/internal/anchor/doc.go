@@ -5,7 +5,9 @@
 // section 6 and corrections 60 to 65, 81 to 84 and 88 to 92 of section 14; the
 // code follows 61 to 65, 81 to 84 and 88 to 92: 88 the state table (Retry from
 // expired), 89 the time of the store, 90 claims kept aside, 91 the work of a
-// header, 92 the payload rules, the tags and the names of the TSA). It defines the Target
+// header, 92 the payload rules, the tags and the names of the TSA; and 95 to 97 of the fourth round: the
+// time of the store and the generation of the key, claims dropped and kept, the
+// pin and the corpus). It defines the Target
 // interface, the payload, the receipt, the anchor record with its states and
 // its state machine, the classification of errors, the retry arithmetic, the
 // HTTP client the targets are meant to be given, and the canonical encoding of
@@ -64,6 +66,13 @@
 // start uses a new key. The WORM target bounds the time of the store by it (see
 // package worm); the others do not use it.
 //
+// A Payload also carries Generation (correction 95): 0 for every record that
+// exists, persisted by the caller with the record, and the same for every target;
+// only the WORM target puts it in the object key. Payload.WithGeneration(n,
+// newStart) is how an operator's explicit choice to anchor a checkpoint under a
+// new key, after a permanent refusal of the time of the store, is made: never
+// automatically (package worm says when).
+//
 // The shape rules are the verifier's (correction 92): ParsePayload applies the
 // rules of kingres-verify's signednote.Parse and checkpoint.Parse. The note:
 // valid UTF-8, no control character but newline, no line over MaxNoteLineLen
@@ -76,7 +85,10 @@
 // canonical base64 of 32 bytes (the root of the empty tree when the size is 0);
 // at most 16 non-empty extension lines. The numbers are compared by a test with
 // the verifier's source when it is beside this package, and a corpus in testdata
-// lists accepted and refused notes with the verdict of each rule set. This
+// lists accepted and refused notes with the verdict of each rule set. The corpus has a
+// byte-identical copy in the verifier module, where a test holds the verifier's
+// real parsers to the verifier column, and a test here fails when the two
+// copies differ (correction 97). This
 // package is stricter on purpose in two places only: it refuses the byte 0x7f
 // (DEL) anywhere, and a note over MaxSignedNote (16 KiB; the verifier takes 64
 // KiB). ParsePayload applies the same rules without a SubmitStart, for a reader
@@ -161,16 +173,20 @@
 //	worm: {"endpoint":"","bucket":"","key":"","version_id":"","etag":"",
 //	       "object_sha256":"<64 hex>","content_length":<n>,
 //	       "lock_mode":"GOVERNANCE|COMPLIANCE","retain_until":"<time>",
-//	       "last_modified":"<time>","submit_start":"<time>","found":false,
+//	       "last_modified":"<time>","submit_start":"<time>",
+//	       "attempt":null|"<time>","generation":<n>,"found":false,
 //	       "recorded_by":"cluster"}
 //	tsa:  {"tsa_url":"","token_der_b64":"","gen_time":"<time>","serial":"<decimal>",
-//	       "policy":"<dotted OID>","recorded_by":"cluster"}
+//	       "policy":"<dotted OID>","signer_key_sha256":"<64 hex>",
+//	       "recorded_by":"cluster"}
 //	ots:  {"digest":"<64 hex>","submitted_at":"<time>",
 //	       "calendars":[{"uri":"","fragment_b64":""}],
 //	       "bitcoin":null | {"height":<n>,"calendar_uri":"","merkle_root":"<64 hex>",
 //	                         "status":"claimed|header_checked","header":""|"<160 hex>"},
 //	       "contradicted":[{"calendar_uri":"","height":<n>,"merkle_root":"<64 hex>",
-//	                        "header":"<160 hex>","at":"<time>","reason":""}]}
+//	                        "header":"<160 hex>","at":"<time>","reason":""}],
+//	       "dropped":[{"calendar_uri":"","height":<n>,"merkle_root":"<64 hex>",
+//	                   "at":"<time>"}]}
 //
 // What each member means, and what a verifier checks, is in the documentation
 // of the three subpackages. Choices where the design is silent:

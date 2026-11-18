@@ -24,11 +24,11 @@ func TestIndependentReaderOfEvidenceFiles(t *testing.T) {
 	files := map[string]string{
 		"worm": fileOf("worm", `{"endpoint":"","bucket":"anchors","key":"p/ab12/00000000000000000017.note","version_id":"v1","etag":"\"e\"",`+
 			`"object_sha256":"`+digestHex+`","content_length":123,"lock_mode":"GOVERNANCE","retain_until":"2036-12-01T10:00:00Z",`+
-			`"last_modified":"2026-12-01T10:00:01Z","submit_start":"2026-12-01T10:00:00Z","found":false,"recorded_by":"cluster"}`),
-		"tsa":         fileOf("tsa", `{"tsa_url":"https://tsa.example/tsr","token_der_b64":"MAMCAQE=","gen_time":"2026-12-01T10:00:02Z","serial":"4242","policy":"1.2.3.4.5","recorded_by":"cluster"}`),
-		"ots-pending": fileOf("ots", `{"digest":"`+digestHex+`","submitted_at":"2026-12-01T10:00:00Z","calendars":[{"uri":"https://a.example","fragment_b64":"AQID"}],"bitcoin":null,"contradicted":[]}`),
+			`"last_modified":"2026-12-01T10:00:01Z","submit_start":"2026-12-01T10:00:00Z","attempt":null,"generation":0,"found":false,"recorded_by":"cluster"}`),
+		"tsa":         fileOf("tsa", `{"tsa_url":"https://tsa.example/tsr","token_der_b64":"MAMCAQE=","gen_time":"2026-12-01T10:00:02Z","serial":"4242","policy":"1.2.3.4.5","signer_key_sha256":"`+digestHex+`","recorded_by":"cluster"}`),
+		"ots-pending": fileOf("ots", `{"digest":"`+digestHex+`","submitted_at":"2026-12-01T10:00:00Z","calendars":[{"uri":"https://a.example","fragment_b64":"AQID"}],"bitcoin":null,"contradicted":[],"dropped":[]}`),
 		"ots-claimed": fileOf("ots", `{"digest":"`+digestHex+`","submitted_at":"2026-12-01T10:00:00Z","calendars":[{"uri":"https://a.example","fragment_b64":"AQID"}],`+
-			`"bitcoin":{"height":960000,"calendar_uri":"https://a.example","merkle_root":"`+digestHex+`","status":"claimed","header":""},"contradicted":[]}`),
+			`"bitcoin":{"height":960000,"calendar_uri":"https://a.example","merkle_root":"`+digestHex+`","status":"claimed","header":""},"contradicted":[],"dropped":[]}`),
 	}
 	for name, s := range files {
 		f, err := anchor.ParseEvidenceFile([]byte(s))

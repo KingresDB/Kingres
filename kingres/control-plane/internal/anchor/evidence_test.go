@@ -22,20 +22,20 @@ var (
 	goldenWORMJSON = `{"endpoint":"https://s3.example.net","bucket":"anchors","key":"kingres-anchors/ab12/00000000000000000017.note",` +
 		`"version_id":"3HL4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY","etag":"\"d41d8cd98f00b204e9800998ecf8427e\"",` +
 		`"object_sha256":"` + strings.Repeat("cd", 32) + `","content_length":321,"lock_mode":"COMPLIANCE",` +
-		`"retain_until":"2036-12-01T10:00:00Z","last_modified":"2026-12-01T10:00:01Z","submit_start":"2026-12-01T10:00:00Z","found":false,"recorded_by":"cluster"}`
+		`"retain_until":"2036-12-01T10:00:00Z","last_modified":"2026-12-01T10:00:01Z","submit_start":"2026-12-01T10:00:00Z","attempt":null,"generation":0,"found":false,"recorded_by":"cluster"}`
 
 	goldenTSA = TSAEvidence{
 		TSAURL: "https://tsa.example.net/tsr", TokenDERB64: base64.StdEncoding.EncodeToString([]byte{0x30, 0x03, 0x02, 0x01, 0x01}),
-		GenTime: "2026-12-01T10:00:02Z", Serial: "123456789012345678901234567890", Policy: "1.2.3.4.1", RecordedBy: "cluster",
+		GenTime: "2026-12-01T10:00:02Z", Serial: "123456789012345678901234567890", Policy: "1.2.3.4.1", SignerKeySHA256: strings.Repeat("ab", 32), RecordedBy: "cluster",
 	}
 	goldenTSAJSON = `{"tsa_url":"https://tsa.example.net/tsr","token_der_b64":"MAMCAQE=","gen_time":"2026-12-01T10:00:02Z",` +
-		`"serial":"123456789012345678901234567890","policy":"1.2.3.4.1","recorded_by":"cluster"}`
+		`"serial":"123456789012345678901234567890","policy":"1.2.3.4.1","signer_key_sha256":"` + strings.Repeat("ab", 32) + `","recorded_by":"cluster"}`
 
 	otsDigest  = strings.Repeat("ab", 32)
 	otsRoot    = strings.Repeat("12", 32)
 	goldenOTS  = OTSEvidence{Digest: otsDigest, SubmittedAt: "2026-12-01T10:00:00Z", Calendars: []OTSCalendar{{URI: "https://a.example", FragmentB64: "AQID"}, {URI: "https://b.example", FragmentB64: "BAUG"}}, Bitcoin: &OTSBitcoin{Height: 958391, CalendarURI: "https://b.example", MerkleRoot: otsRoot, Status: BitcoinClaimed}}
 	goldenOTSJ = `{"digest":"` + otsDigest + `","submitted_at":"2026-12-01T10:00:00Z","calendars":[{"uri":"https://a.example","fragment_b64":"AQID"},{"uri":"https://b.example","fragment_b64":"BAUG"}],` +
-		`"bitcoin":{"height":958391,"calendar_uri":"https://b.example","merkle_root":"` + otsRoot + `","status":"claimed","header":""},"contradicted":[]}`
+		`"bitcoin":{"height":958391,"calendar_uri":"https://b.example","merkle_root":"` + otsRoot + `","status":"claimed","header":""},"contradicted":[],"dropped":[]}`
 )
 
 func TestEvidenceGoldenBytes(t *testing.T) {
@@ -53,7 +53,7 @@ func TestEvidenceGoldenBytes(t *testing.T) {
 	// pending OTS: bitcoin is null, calendars is [] and never null
 	p := OTSEvidence{Digest: otsDigest, SubmittedAt: "2026-12-01T10:00:00Z"}
 	got, err := EncodeEvidence(&p)
-	if err != nil || string(got) != `{"digest":"`+otsDigest+`","submitted_at":"2026-12-01T10:00:00Z","calendars":[],"bitcoin":null,"contradicted":[]}` {
+	if err != nil || string(got) != `{"digest":"`+otsDigest+`","submitted_at":"2026-12-01T10:00:00Z","calendars":[],"bitcoin":null,"contradicted":[],"dropped":[]}` {
 		t.Fatalf("%s %v", got, err)
 	}
 	// AWS endpoint is the empty string, not absent

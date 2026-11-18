@@ -107,7 +107,7 @@ func TestSubmitUpgradeExport(t *testing.T) {
 	if ev3.SubmittedAt != anchor.FormatTime(testNow) {
 		t.Fatalf("submitted_at %s", ev3.SubmittedAt)
 	}
-	// calendar A keeps its pending attestation, B's was replaced
+	// calendar A keeps its pending attestation, and B keeps its own beside the merged answer (correction 96)
 	for _, c := range ev3.Calendars {
 		raw, _ := base64.StdEncoding.DecodeString(c.FragmentB64)
 		d, _ := hex.DecodeString(ev3.Digest)
@@ -123,7 +123,7 @@ func TestSubmitUpgradeExport(t *testing.T) {
 				btc++
 			}
 		}
-		if c.URI == a.url() && (pend != 1 || btc != 0) || c.URI == b.url() && (pend != 0 || btc != 1) {
+		if c.URI == a.url() && (pend != 1 || btc != 0) || c.URI == b.url() && (pend != 1 || btc != 1) {
 			t.Errorf("%s: %d pending %d bitcoin", c.URI, pend, btc)
 		}
 	}
@@ -141,7 +141,7 @@ func TestSubmitUpgradeExport(t *testing.T) {
 	if _, a1 := a.counts(); a1 != a0+1 {
 		t.Errorf("the calendar with a pending attestation was asked %d times, want 1", a1-a0)
 	}
-	// the exported file: parses, re-serialises identically, holds both a pending and a bitcoin leaf
+	// the exported file: parses, re-serialises identically, holds the pending leaves of both calendars and the bitcoin leaf
 	file, err := Export(ev3)
 	if err != nil {
 		t.Fatal(err)
@@ -160,7 +160,7 @@ func TestSubmitUpgradeExport(t *testing.T) {
 	for _, l := range f.Root.Leaves() {
 		kinds[l.Att.Kind]++
 	}
-	if kinds[AttPending] != 1 || kinds[AttBitcoin] != 1 {
+	if kinds[AttPending] != 2 || kinds[AttBitcoin] != 1 {
 		t.Errorf("leaves %v", kinds)
 	}
 	if !bytes.HasPrefix(file, Magic()) {

@@ -212,7 +212,7 @@ func TestPayloadLimitsEqualTheVerifiers_SkipsWithoutVerifierSource(t *testing.T)
 // verifier, so the evidence file must carry it (it was once printable ASCII
 // only).
 func TestEvidenceFileCarriesAUTF8Origin(t *testing.T) {
-	ev, err := EncodeEvidence(TSAEvidence{TSAURL: "https://tsa.example/tsr", TokenDERB64: "MAMCAQE=", GenTime: "2026-12-01T10:00:02Z", Serial: "4242", Policy: "1.2.3.4.5", RecordedBy: RecordedByCluster})
+	ev, err := EncodeEvidence(TSAEvidence{TSAURL: "https://tsa.example/tsr", TokenDERB64: "MAMCAQE=", GenTime: "2026-12-01T10:00:02Z", Serial: "4242", Policy: "1.2.3.4.5", SignerKeySHA256: strings.Repeat("ab", 32), RecordedBy: RecordedByCluster})
 	if err != nil {
 		t.Fatal(err)
 	}

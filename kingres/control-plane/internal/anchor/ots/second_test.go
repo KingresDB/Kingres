@@ -284,7 +284,7 @@ func TestFailedMergeSkipsTheRestOfThatFragment(t *testing.T) {
 	} else if b, _ := node.Serialize(); !bytes.Equal(b, frag) {
 		t.Fatal("the test fragment is not canonical")
 	}
-	changed, ok, failures := tg.lookups(context.Background(), roots, uris, submitted, testNow)
+	changed, ok, failures, _ := tg.lookups(context.Background(), roots, uris, submitted, testNow, nil)
 	if len(failures) != 1 || ok != 1 {
 		t.Fatalf("%d failures, %d answers: %v", len(failures), ok, failures)
 	}
