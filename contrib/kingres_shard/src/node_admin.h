@@ -21,5 +21,6 @@ extern bool kingres_shard_is_recognized_map_primary(void);
 extern void kingres_shard_lock_catalog(void);
 extern void kingres_shard_sync_catalog_internal(void);
 extern bool kingres_shard_reload_catalog(void);
+extern void kingres_shard_require_pending_node_id(void);
 
 #endif							/* KINGRES_SHARD_NODE_ADMIN_H */

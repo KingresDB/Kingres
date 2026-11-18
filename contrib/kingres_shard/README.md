@@ -169,6 +169,16 @@ describes what is implemented and how to use it.
   compares the two). Transactions that 0.4 prepared and that are pending at the upgrade
   are resolved in the old identifier format (see "Prepared transactions across a
   failover").
+- **Changes made to the 0.5 scripts in place.** 0.5 is not released, so its install script and its
+  `0.4--0.5` script change as the reviews find things, and the version stays 0.5. A database that
+  installed an earlier build of 0.5 has no update path to the later one (`ALTER EXTENSION ... UPDATE`
+  does nothing for the same version). What changed in place, and what such a database needs:
+  `kingres.pending_node.node_id` (added for `remove_node`, S11-05). Without it `add_node`,
+  `remove_node` and the recovery pass fail with `42703`, "the table kingres.pending_node has no column
+  node_id", and the hint is the statement to run on that node: `ALTER TABLE kingres.pending_node ADD
+  COLUMN node_id pg_catalog.int4;` (`t/104`). Nothing else of 0.5 needs a statement; the library
+  changes (the SQLSTATE that a node gives when it refuses a proof, S12-05) need the library of the
+  new build on every node, which the upgrade order above already requires.
 - **The schema `kingres` is shared** with `kingres_columnar`, `kingres_ledger` and
   `kingres_timepart` (their control files say `schema = kingres`, which makes the schema a
   member of the extension that creates it). The five KingresDB extensions can be created
@@ -321,6 +331,15 @@ PROVE_TESTS=t/013_dist_scan.pl kingres/dev/ext.sh kingres_shard tap
   PostgreSQL; the check is tested on snippets it must refuse; the settings listed for a
   partial fragment exist on the server) and `099_harness_selftest` (every helper of the
   comparison harness is shown to fail when it should).
+  Fix round for the fourth review of the call sequences (S12): `100_sweep_calls` and
+  `101_sweep_promote` (every control call against a node behind a forwarder that goes silent after
+  every chunk of its sessions, from the first to the last; every answer is judged by the standard of
+  a control call; `KsSweep.pm` is the judge), `102_slow_nodes` and `103_slow_promote` (every call
+  against one, two and four nodes that answer every statement at 0.5 and 0.9 x `node_timeout`, with
+  the bound of the README as a formula, and a large table copied), `104_s12_fixes` (the column that
+  was added to 0.5 in place, the two refusals of a proof told apart by their SQLSTATE, `25001`, a
+  lock wait on a node with and without a `lock_timeout` of the role). `KsProxy.pm` is the forwarder
+  (`swallow_after`, `delay_turn`, `chunk_log`, `turn_log`).
   `t/KingresShardTest.pm` builds clusters (and standbys); `t/KingresShardCompare.pm` is the
   comparison harness: it loads the same data into a three-node cluster and a
   single node and compares query results (a NULL is shown as `<NULL>`, so it never equals
@@ -1823,7 +1842,13 @@ that group.
 refusal that a caller reacts to has an SQLSTATE of its own as well (next section): match on the
 SQLSTATE first, on the text when the SQLSTATE is shared. A `WARNING` or a `NOTICE` on the session is
 information (a node that was not reached, a promotion that was already done), never a failure: a
-caller that treats text on stderr as a failure stops a call that went well.
+caller that treats text on stderr as a failure stops a call that went well. **The standard of
+every call: it never returns success for work that was not done on a node without saying so** (a
+`WARNING` that names the node and what was left, as the tables below promise, or an error), and a
+call that fails leaves the state that the table for that answer names. `t/100` and `t/101` hold every
+call to it, with a node that goes silent at every point of the call. A `WARNING` that names a node
+carries the SQLSTATE of the reason when there is one (`KS007` for a node that stopped answering), so
+a program can tell it from a warning that only informs.
 
 #### SQLSTATEs of the answers
 
@@ -1838,15 +1863,16 @@ same thing for each.
 | `KS004` | a bucket move gave up waiting for its switch | the move goes back to catching up by itself | "the copy of bucket B did not replay up to the switch point within N ms" and the like | `t/026`, `t/028` |
 | `KS005` | a participant could not get its own standby to confirm that its part is durable | fix that node's list or standby, repeat; nothing was committed | "did not confirm that its part of the transaction is durable on its synchronous standby" | `t/070`, `t/084` |
 | `KS006` | a planned switchover cannot be proven loss-free | treat the promotion as a failover (sequence 5) | "the switchover cannot be proven loss-free: ..." | `t/085` |
-| `KS007` | a node accepted the session and **did not answer** within `node_timeout` | do not repeat against that node: probe it, fence or restart it (sequence 9) | "node N (H:P) did not answer within T seconds"; for the node to promote: "node N (H:P), which is to become the primary of group G, did not answer within T seconds"; for a node that is slow without being stuck: "node N did not answer within the S seconds that one call gives a node" | `t/086`, `t/096`, `t/095` |
+| `KS007` | a node accepted the session and **one statement of the call was not answered** within `node_timeout`. Nothing else produces it: a node that answers every statement in time (however late, however many statements the call sends) never ends a call with `KS007` (S12-03); a lock wait that lasts `node_timeout` is a statement not answered | do not repeat against that node: probe it (`SELECT 1` over a new session, `pg_stat_activity` and `pg_locks` on it), fence or restart it (sequence 9). A call that sends a thousand statements to a slow node takes a thousand times its answer, which is the bound of the call below, not a stuck node | "node N (H:P) did not answer within T seconds"; for the node to promote: "node N (H:P), which is to become the primary of group G, did not answer within T seconds". As a `WARNING` (the call goes on) it has the same SQLSTATE: `remove_node` of a node that stopped answering, `recover_prepared_transactions()` for a node it skipped | `t/086`, `t/096`, `t/095`, `t/100`, `t/101`, `t/102`, `t/104` |
 | `KS008` | another call that changes the catalog is running on this node and did not end within `node_timeout` | nothing was changed; repeat later (one controller at a time) | "another call that changes the catalog is running on this node, and did not end within T seconds" | `t/086` |
 | `KS009` | the node cannot commit: its synchronous standbys do not confirm | fix the list or the standby, repeat; nothing was changed | "node N (H:P) cannot commit: its synchronous standbys do not confirm" (and the same for "this node") | `t/071`, `t/081`, `t/084`, `t/091` |
 | `KS010` | the call went to the wrong node: not the map group primary, a superseded one, a node that is not the standby of the map group, a node row that names another port than the server listens on, a standby that PostgreSQL promoted and the catalog has not recognised | send it where the message and the hint say (sequences 2 and 3) | "this function can only run on the map group primary", "this node was promoted in PostgreSQL after the catalog named it the map group primary ...", "this node is not a copy of the primary of group 0 ...", "node N is registered on port P, this server listens on port Q", "this node has been superseded as the map group primary" | `t/049`, `t/077`, `t/082`, `t/084`, `t/091` |
 | `KS011` | the node to promote is still in recovery | promote it in PostgreSQL first, wait, repeat | "node N (H:P) is still in recovery", "this node is still in recovery" | `t/071` G, `t/082`, `t/091` |
 | `KS012` | promoting would not be safe: a node holds a newer catalog term, or only a minority of the groups can be reached | not a retry: a decision of the operator (sequence 3) | "node N holds catalog term T, newer than ...", "only k of the n other shard groups can be reached ..." | `t/071` C, `t/077`, `t/084` C |
 | `KS013` | distributed transactions are in doubt | run recovery, wait until `check_cluster()` shows none, repeat | "the cluster secret cannot be rotated while distributed transactions are in doubt" | `t/072` |
-| `KS014` | a node holds a cluster secret that no node of the cluster has (a standby that missed a rotation after the previous secret was no longer kept, asked about or to be promoted), or a rotation was refused because a standby has not confirmed the last one | **not a retry**: for the refused rotation, start the standby and let it replay, run `recover_prepared_transactions()` until it has confirmed, rotate again (or `remove_node` it); for a promotion, rebuild the node from a node that has the current secret (`remove_node`, `add_node`) or promote another standby of the group | "node N does not accept the session of this node: it holds a cluster secret that no node of the cluster has", "the cluster secret cannot be rotated again yet: standby N has not confirmed the last rotation" | `t/095` |
-| `55P03` | the node's own lock wait ended (`lock_timeout` of the node session): another session holds a lock that the call needs | repeat when the lock is gone (look at `pg_locks` on the node named) | "lock not available on node N (H:P): ..." | `t/086` |
+| `KS014` | a node holds a cluster secret that no node of the cluster has (a standby that missed a rotation after the previous secret was no longer kept, asked about or to be promoted), or a rotation was refused because a standby has not confirmed the last one. The first is decided by a fact the node reports (S12-05): the node refuses the proof of the session with **its own SQLSTATE `KS014`**, which it gives only when the proof does not match its secret; a node that belongs to a cluster but holds no secret refuses an ordinary role with `28000` and the detail "holds no cluster secret", which is **not** `KS014` (run `sync_catalog()` on MAP). The words of the message are the same for both and are never matched | **not a retry**: for the refused rotation, start the standby and let it replay, run `recover_prepared_transactions()` until it has confirmed, rotate again (or `remove_node` it); for a promotion, rebuild the node from a node that has the current secret (`remove_node`, `add_node`) or promote another standby of the group | "node N does not accept the session of this node: it holds a cluster secret that no node of the cluster has", "the cluster secret cannot be rotated again yet: standby N has not confirmed the last rotation" | `t/095`, `t/101` (the rotation refused after a failover), `t/104` (the two refusals of a proof told apart) |
+| `55P03` | the node's own lock wait ended: the first statement of a session of a call runs with a `lock_timeout` of three quarters of `T`, and every statement does when the administrator gave the node's database or role a shorter `lock_timeout` (`ALTER ROLE ... SET`, `ALTER DATABASE ... SET`): another session holds a lock that the call needs. **A lock wait on a node without a `lock_timeout` of its own is not this answer**: it lasts `T` and is `KS007` | repeat when the lock is gone (look at `pg_locks` on the node named) | "lock not available on node N (H:P): ..." | `t/086` (the first statement), `t/104` (the role's `lock_timeout`) |
+| `25001` | `recover_prepared_transactions()` and `promote_node()` (which runs a recovery pass first) in a `REPEATABLE READ` or `SERIALIZABLE` transaction: the call reads what other sessions committed meanwhile, which that snapshot does not show. A role whose `default_transaction_isolation` is one of them gets this for every call | run it in a `READ COMMITTED` transaction: `BEGIN ISOLATION LEVEL READ COMMITTED; SELECT kingres.promote_node(N); COMMIT;`, or give the role of the control plane `default_transaction_isolation = 'read committed'`. Nothing was changed | "recover_prepared_transactions() must run in a READ COMMITTED transaction" | `t/104` (recovery), `t/101` (`promote_node`) |
 | `40P01` | distributed deadlock victim | retry the transaction | "distributed deadlock detected" | `t/052`, `t/065` |
 | `55000` | the rest: a mistake of whoever calls (a node that is not a standby, a node of another major or extension version, the library not loaded, "not initialized"); no control plane reacts to them automatically | fix the input | (many) | `t/045`, `t/046`, `t/048`, `t/091` |
 | class `08` | a connection could not be made or broke | repeat; if it keeps, the node is down | "could not connect to node H:P" | `t/084`, `t/091` |
@@ -1871,36 +1897,95 @@ the transaction rolls back; nothing is lost). It **never** applies to the statem
 planner's remote statements, scans and cursors, fan-out, `COPY`, DDL forwarded for a user, a query of
 a user after a control call in the same transaction or in a later one, in a savepoint that was rolled
 back, in a function with a `SET` clause (`t/093`): such a statement waits for a node as long as the
-node takes, and the node session does not carry the `lock_timeout` of a control call into it. **A
-statement that was not carried out is an error that aborts the transaction, never a warning**; and a
-node session that held the writes of the transaction is never closed without the transaction knowing:
-the commit (and `PREPARE TRANSACTION`) then fails with an error that names the node (`t/093`).
+node takes: a call sets no `lock_timeout` in a remote transaction (it did until the round of S12, and
+gave it back with a `RESET` at the end of the call, which could not be answered by a node that had
+stopped, closed the session in the middle of the call's own work, and let the commit skip it: S12-01).
+**A statement that was not carried out is an error that aborts the transaction, never a warning**; and
+a node session that held the writes of the transaction is never closed without the transaction
+knowing: the commit (and `PREPARE TRANSACTION`) then fails with an error that names the node
+(`t/093`). **A call sends nothing to a node after its last piece of work**, and a session that holds
+the call's own work is closed in these places only: the deadline of a statement (an error ends the
+call), `remove_node`'s own decision to let a stuck node go (a `WARNING`), and the end of the
+transaction (commit or abort, where every failure is a `WARNING` that names the node and what
+recovery will do); `t/100` and `t/101` run a call against a node that goes silent after every chunk
+it sends, from the first to the last, and judge each answer by that rule.
 
 Every statement that a call sends to a node waits for its answer at most `kingres_shard.node_timeout`
-(60 s by default), **and a call waits at most `2 x T + 2` seconds in all for the answers of one node**
-(S11-07: a node that answers every statement just before `T` cannot hold a call up for `T` per
-statement; the call ends with `KS007` naming it); on the node the transaction of a call gets a
-`lock_timeout` of three quarters of `T`, so that a lock wait normally ends with the node's own answer
-("lock not available on node N", `55P03`) and not with a cancel from far away; a node that did not
-answer is named in the answer (`KS007`) and is **not asked again in the same call**, and a node that
-could not be connected to is not connected to again in the same call. A node that accepts the session and does
-not answer (a lock on a catalog table held by another session, a stopped backend, a stuck disk) therefore
-costs a call one `node_timeout`, plus the time of the nodes that answer. The connection to a node is
-bounded by `node_connect_timeout` once per call and node; **a name that does not resolve is not
-bounded** (libpq resolves before its timer starts): register nodes by address. `T` below is
+(60 s by default), **and nothing else limits a call that is working** (S12-03). A node whose every
+answer comes within `T` never fails a call, however many statements the call sends it: the budget of
+`2 x T + 2` seconds per node and call (S11-07) ended calls against a node that answered every
+statement at 0.5 x `T` or 0.9 x `T` with `KS007`, which says "do not repeat against that node: fence
+it", and a control plane would have fenced a working node. So the bound of a call is a formula, not
+a budget: **`s x T` for each node, where `s` is the number of statements the call sends to that node**
+(the table below counts them). `KS007` means one statement was not answered within `T`, and nothing
+else: a program tells a slow node from a silent one by that code, and a slow call is a call that
+succeeds late; a control plane sets its own client timeout from the formula (`s x T` for the nodes it
+expects to be slow, plus the work on the nodes that answer) and does not treat a call that is merely
+long as a node that is stuck. If a node does not answer a statement at all, the call ends at that
+statement (an error, or a `WARNING` for a node the call can do without: `remove_node`, recovery,
+`promote_node`'s other nodes) after `T` and the time to cancel the statement on the node (at most
+`min(node_connect_timeout, T / 3)` s, at least 1 s); the node is **not asked again in the same call**,
+and a node that could not be connected to is not connected to again in the same call. The connection
+to a node is bounded by `node_connect_timeout` once per call and node; **a name that does not
+resolve is not bounded** (libpq resolves before its timer starts): register nodes by address. A
+statement that is slow on a healthy node (a trigger, a very large batch of a copy) is a statement
+not answered when it takes more than `T`: raise `kingres_shard.node_timeout` for such a call. A node
+that stops answering **between** two statements is found at the next one. The wait for a statement
+is measured with the monotonic clock (a step of the system clock does not shorten it) and an answer
+that is already in the socket when the time is up counts as an answer (a stalled backend does not
+call a node silent that has answered). `T` below is
 `node_timeout`; **tolerance of the tests: 4 s** for a loaded machine.
 
 | what | bound | test |
 |---|---|---|
-| `add_node`, `remove_node`, `sync_catalog`, `rotate_secret`, `recover_prepared_transactions`, `create_distributed_table`, `create_reference_table` | at most **`2 x T + 2 s` of waiting for each node, however it does not answer** (stuck, silent after some statement, or answering every statement late), **plus `node_connect_timeout` once for connecting to it**, plus the work on the nodes that answer (a fraction of a second); a node that answers but whose standbys do not confirm: `min(T, 5) - 1` s per node, then `KS009`. With `k` such nodes: `k` times that | `t/086` (a lock, a stopped backend), `t/096` (late answers, silence after the 6th message, silence from the start: the bound above with the tolerance of 4 s), `t/091` (`KS009`) |
-| `promote_node` | at most **`3 x T` for each node that does not answer**; a node that does not answer is listed in `"unreached"` with a `WARNING` that names it, unless it is the node to promote, which refuses the call with `KS007` (whether it accepts the session and does not answer its first, its second or its third question: `t/096`), or a node that stops answering after the promotion has begun on it, which ends the call with `KS007` and changes nothing (repeat it after the node answers: `promoted`) | `t/086`, `t/096` |
+| every call below, against a node that answers every statement late but within `T` (0.5 x and 0.9 x `T` are measured, with one, two and four such nodes) | **it succeeds, with no `WARNING` and no `KS007`, nothing prepared, the work done on every node, in at most `s x T` seconds for each slow node** (`s` below) plus the work on the nodes that answer (a fraction of a second) | `t/102` (every call but `promote_node`), `t/103` (`promote_node`) |
+| `add_node`, `remove_node`, `sync_catalog`, `rotate_secret`, `recover_prepared_transactions`, `create_distributed_table`, `create_reference_table`, against a node that **stops answering** (silent after any chunk of any of its sessions, from the first to the last) | at most **`2 x T + 8 s`** from the first statement that is not answered, **plus `node_connect_timeout` once for connecting to it**: `T` and the cancel for a statement; at a `PREPARE TRANSACTION`, `T`, the cancel, and `max(T, min(T, 5) + 2)` more for the answer to its question, then the abort; a node that answers but whose standbys do not confirm: `min(T, 5) - 1` s per node, then `KS009` | `t/100` (every call, every position), `t/096` (the bound with the tolerance), `t/086` (a lock, a stopped backend), `t/091` (`KS009`) |
+| `promote_node` | at most **`3 x T` for each node that does not answer**; a node that does not answer is listed in `"unreached"` with a `WARNING` that names it, unless it is the node to promote, which refuses the call with `KS007` (whether it accepts the session and does not answer its first, its second or its third question: `t/096`), or a node that stops answering after the promotion has begun on it, which ends the call with `KS007` and changes nothing (repeat it after the node answers: `promoted`); a participant that stops answering during the commit: `2 x T + 8 s` as above | `t/086`, `t/096`, `t/101` (every position, for a participant and for the node to promote), `t/103` |
 | `check_cluster()` | at most **`2 x T` for each node that does not answer**; the node gets a row `node_unreachable` and the other nodes are still checked: the call does not fail as a whole | `t/086` |
 | a call behind another call that changes the catalog | `T`, then `KS008` | `t/086` |
-| client timeout of the control plane for any of these calls | the bound above for the number of nodes that may not answer, plus 10 s; its expiry means "did not finish" (sequence 9). With `n` nodes of which `k` may be stuck: `k x 3 x T + 10 s` is always enough | `t/086` (the bounds), `t/082` (a cancelled call) |
+| client timeout of the control plane for any of these calls | the formula above for the nodes that may be slow, plus the bound for a silent node for each node that may be stuck, plus 10 s; its expiry means "did not finish" (sequence 9). With `n` nodes of which `k` may be stuck: `k x (3 x T + 8) + 10 s` is always enough for the silent ones | `t/086` (the bounds), `t/082` (a cancelled call) |
 | the repeat loop of `promote_node` | at most **10 calls**, 2 s apart, ending at `already`. If `"blocked_by"` names the same transaction in two answers in a row, stop repeating: see the table of sequence 2. *Not produced by a test:* the number 10 and the 2 s are a recommendation; the tests loop at most 6 times (`t/078`) and end at `already` within 3 calls (`t/071`, `t/073`) | |
 | a refused call (the node cannot commit) | the probe waits `min(T, 5) - 1` seconds **per node**, so a cluster with several nodes in that state is several waits in a row; then `KS009`, changing nothing. A commit that waits for a standby: `2 x T + 5` seconds, then `KS005` | `t/091`, `t/070`, `t/084` |
 | the second phase of a distributed commit | `T` per participant, then "recovery will commit it" (`t/076` produces the warning; the bound itself is not asserted) | |
 | waiting for the worker | `kingres_shard.recovery_interval` per pass (`t/009`); call `recover_prepared_transactions()` instead of waiting | |
+
+**How many statements `s` a call sends to one node**, as the forwarder of `t/102` and `t/103`
+counts them (the answers it holds back: the first statement of every session, the statements of the
+call, the `PREPARE TRANSACTION` batch, the commit; the cluster of the tests has four nodes besides
+MAP and no table unless the call makes it). `t/102` and `t/103` print the count of every cell and
+assert the bound with it:
+
+| call | `s` for a node | what makes it grow |
+|---|---|---|
+| `sync_catalog` | 12 | |
+| `rotate_secret` | 11 | |
+| `create_distributed_table` | 7 | |
+| `create_reference_table` | 7 + one per batch of the copy (a batch is at most 20000 values: a table of 60000 rows of two columns is six batches, 13 statements) | the rows and columns of the table |
+| `recover_prepared_transactions` | 4 + 2 per prepared transaction of the node (6 for one) | the transactions in doubt |
+| `add_node`, the new node | 15 | one statement per table of the cluster, one per foreign key and per object whose privileges are copied, one per batch of the copy of a reference table |
+| `add_node`, a node already in the cluster | 8 | |
+| `remove_node`, the removed node | 8 | |
+| `promote_node`, the node to promote | 20 | |
+| `promote_node`, a participant | 10 | |
+
+**Which cells are in the default run.** `t/102` and `t/103` together take a few minutes by default: every call
+with **one** slow node at **0.9 x T** (the case of the finding: a healthy slow node never gets `KS007`), and the
+copy of 60000 rows once. The cells with two and four slow nodes and the cells at 0.5 x T run only with
+`KINGRES_LONG_TESTS=1` in the environment (about 22 minutes for `t/102` and 6 for `t/103` per major); a skipped
+cell is announced by a `note` that names the variable. The measured times of the long run (T = 2 s) were, for
+one / two / four slow nodes: `sync_catalog` 13.7 / 24.7 / 46.7 s at 0.5 x T and 23.4 / 43.1 / 84.5 s at 0.9 x T;
+`rotate_secret` 12.7 / 21.1 / 44.4 and 19.9 / 41.2 / 75.5; `create_distributed_table` 9.5 / 13.2 / 27.0 and
+12.8 / 25.2 / 46.9; `create_reference_table` 9.9 / 15.2 / 30.9 and 14.6 / 28.9 / 55.7;
+`recover_prepared_transactions` 6.0 / 13.7 / 24.0 and 12.5 / 21.6 / 46.4; `add_node` 15.1 / 23.8 / 37.8 and
+28.9 / 41.5 / 68.4; `remove_node` 8.1 / 16.8 / 30.8 and 14.5 / 28.8 / 55.8; `promote_node` 21.7 / 30.9 / 50.2
+and 37.6 / 55.4 / 87.8; the copy of 60000 rows 13.8 (0.5) and 25.9 (0.9) with one node. Every one is within
+`s x T` summed over the slow nodes. Only the one-node cells at 0.9 x T are in the default run.
+
+So the time of `create_reference_table` for a node that answers every statement at 0.9 x `T` is
+`(7 + batches) x 0.9 x T`, and a control plane that copies a large table sets its client timeout
+from that, not from a fixed number. A statement that is slow on its own (a batch of the copy that
+takes more than `T` on the node, a trigger) is a statement not answered: raise `node_timeout` for
+that call.
 
 **What a deadline leaves behind.** Every statement that a call sends before its `PREPARE
 TRANSACTION` is sent inside a remote transaction that has not been prepared; the deadline closes the
@@ -1918,7 +2003,8 @@ transactions and the nodes, and repeats each call). Per phase:
 | `promote_node`, the node to promote | nothing: `KS007` | converges |
 | `recover_prepared_transactions()` and the worker | the node is skipped with a `WARNING` that names it (a `LOG` line in the worker); what it holds prepared is resolved by the next pass | converges |
 | `check_cluster()` | a row `node_unreachable` for the node | n/a |
-| `remove_node` of a node that does not answer | the node is removed from the catalog and its own catalog is not cleared (`WARNING` names it) | n/a |
+| `remove_node` of a node that does not answer, or that stops answering at any statement of the removal before its `PREPARE` (S12-04) | the node is removed from the catalog and its own catalog is not cleared (a `WARNING` names it, with `KS007` as its SQLSTATE for a node that stopped); the session to it was closed, so nothing of the call is left on it | n/a (`t/100`) |
+| the end of a call (S12-01) | nothing: a call sends no statement to a node after its last piece of work, so there is nothing at the end that a silent node could fail or lose; the work of the call commits with the transaction, and a node that stops answering between the call and the commit fails the commit at its `PREPARE` (`08006`, nothing changed) or, after the decision, is a `WARNING` "recovery will commit it" | converges (`t/100`, `t/101`) |
 
 #### Preconditions of every failover and switchover
 
@@ -2095,6 +2181,17 @@ Preconditions: 1, 2 and 3 above. NEW has been promoted with `pg_promote()` and a
    it is rebuilt, and `prepared_rolled_back_after_failover` or `participant_lost_committed_transaction`
    rows, each of which names a transaction to look at (guarantee 12) (`t/050`, `t/068`).
 6. OLD: see sequence 6.
+7. **Before the next `rotate_secret`.** After the failover the old primary OLD and the other standbys
+   of its group (OTHERS that were not re-pointed to NEW) are still standbys of the catalog. The
+   previous secret is kept after a rotation until a recovery pass has reached every primary **and every
+   standby of the catalog**, and a second rotation is refused (`KS014`, "standby N has not confirmed the
+   last rotation", naming the standby) while it is kept and a standby cannot be reached with the
+   current secret: OLD is dead, and a standby that still streams from OLD replays nothing. They block
+   the rotation until each is dealt with, one of two ways: re-point it to NEW (step 3), wait until it
+   streams, and run `recover_prepared_transactions()` on MAP until `check_cluster()` is clean; or take it
+   out of the catalog with `remove_node(<its id>)` (sequence 8: a dead node is removed with a
+   `WARNING`; OLD is removed this way when it will not be rebuilt as a standby, sequence 6). Then rotate
+   again (`t/101` runs the refusal and both ways out).
 
 #### 3. Failover of the map group (OLD map primary is dead, fenced; NEW is its standby)
 
@@ -2298,7 +2395,8 @@ stopped NEW (`t/073` A). Then re-add NEW as a standby (sequence 6). For the map 
    | error "node N cannot commit: its synchronous standbys do not confirm" | `KS009` | step 1 was not done. The wrong order is refused after at most `min(node_timeout, 5) - 1` seconds **per node** that cannot commit (not "at once"), and by every call that commits on every primary: `remove_node`, `add_node`, `rotate_secret` and `sync_catalog` (S9-08, `t/081`, `t/091`): do step 1, repeat |
    | error "cannot remove node N: shard group G still has the standby node M" | `55006` | a primary that still has standbys cannot be removed before them (`t/048`) |
    | error "node N does not exist" | `42704` | wrong id or already removed (`t/073` B) |
-   | `WARNING: could not reach node H:P; its catalog was not cleared` | | the node was removed from the catalog; it does not answer (its text says why: `KS007`, `55P03`, or a connection error), so its own copy of the catalog was not cleared (`t/086`) |
+   | `WARNING: could not reach node H:P; its catalog was not cleared`, with the SQLSTATE of the reason (`KS007` for a node that stopped answering, `55P03`, or a connection error) and its text in the detail | | the node was removed from the catalog; it does not answer, or stopped answering after it had accepted the session, at whatever statement of the removal (S12-04), so its own copy of the catalog was not cleared: **a stuck node is removed by calling `remove_node` while it is stuck**, with this warning and nothing else; there is no `force` form. The warning is the whole answer: check afterwards (`SELECT count(*) FROM kingres.node` on the removed node) if the copy matters, or reset it when it is back (`SELECT kingres.internal_reset_node()` as a superuser on that node) (`t/086`, `t/100`: every position of the silence) |
+   | error "could not prepare the transaction on node H:P ..." (`08006`) | | the node answered every statement of the removal and then stopped before its `PREPARE TRANSACTION` was answered: nothing was changed anywhere, the node is still in the catalog (`t/100`). Repeat: a node that is stuck now does not answer the first statement, and the repeat ends with the warning above |
 
    A `remove_node` that was **killed after its commit** can leave the removed node's part of the change
    prepared on it (with its locks on the node's catalog tables). The removal writes the node's address and

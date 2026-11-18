@@ -81,6 +81,7 @@
 #include "forward_auth.h"
 #include "ha.h"
 #include "kingres_shard.h"
+#include "node_admin.h"
 #include "node_conn.h"
 #include "recovery.h"
 #include "term.h"
@@ -792,6 +793,7 @@ recover_prepared_with_body(int extra_id, int extra_group, const char *extra_host
 	 * them: if the origin died, the registration was rolled back with the rest
 	 * and only this table remembers the node.
 	 */
+	kingres_shard_require_pending_node_id();
 	if (SPI_execute("SELECT p.host, p.port, p.node_id FROM " KINGRES_SHARD_SCHEMA ".pending_node p "
 					"WHERE NOT EXISTS (SELECT 1 FROM " KINGRES_SHARD_SCHEMA ".node n "
 					"WHERE n.host OPERATOR(pg_catalog.=) p.host AND n.port OPERATOR(pg_catalog.=) p.port)",

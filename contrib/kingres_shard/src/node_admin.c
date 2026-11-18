@@ -38,6 +38,7 @@
 #include "storage/proc.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 
 #include "catalog.h"
@@ -881,6 +882,9 @@ create_tables_on_node(KsConn *kc)
 	copy_acls_to_node(kc);
 }
 
+/* The SQLSTATE the node gave to the last refused ask_node(), or 0 (S12-05). */
+static int	ask_node_sqlstate = 0;
+
 /*
  * One value of a one-row result from a session on host:port, or NULL when the
  * node cannot be asked.  Used on throwaway sessions, outside the transaction.
@@ -895,15 +899,22 @@ ask_node(const char *host, int port, const char *sql, char **err_out)
 
 	if (err_out == NULL)
 		err_out = &local_err;
+	ask_node_sqlstate = 0;
 	conn = kingres_shard_connect_control(host, port, err_out);
 	if (conn == NULL)
+	{
+		ask_node_sqlstate = kingres_shard_connect_refusal_sqlstate();
 		return NULL;
+	}
 	res = kingres_shard_bounded_exec(conn, sql, true);
 	if (res != NULL && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1 &&
 		!PQgetisnull(res, 0, 0))
 		value = pstrdup(PQgetvalue(res, 0, 0));
 	else
+	{
+		ask_node_sqlstate = kingres_shard_result_sqlstate(res);
 		*err_out = kingres_shard_conn_error_text(conn);
+	}
 	PQclear(res);
 	PQfinish(conn);
 	return value;
@@ -938,8 +949,7 @@ check_standby_node(const char *host, int port, int group_id)
 	if (primary != NULL)
 		kingres_shard_conn_expect_node(host, port, primary->node_id);
 	state = ask_node(host, port, "SELECT pg_catalog.pg_is_in_recovery()::pg_catalog.text", &err);
-	if (state == NULL && err != NULL &&
-		strstr(err, "claims to have been opened by another node of the cluster") != NULL)
+	if (state == NULL && ask_node_sqlstate == ERRCODE_KINGRES_SECRET_UNKNOWN)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("node %s:%d is not a copy of the primary of group %d",
@@ -980,6 +990,32 @@ check_standby_node(const char *host, int port, int group_id)
 }
 
 /*
+ * kingres_shard_require_pending_node_id
+ *
+ * kingres.pending_node.node_id was added to the 0.5 scripts in place (S12-06; 0.5 is not
+ * released).  A database that installed 0.5 before the column existed has no update path to a
+ * version that has it, and every statement that lists the column fails with "column does not
+ * exist": say what to run instead.
+ */
+void
+kingres_shard_require_pending_node_id(void)
+{
+	Oid			relid = kingres_shard_catalog_relid("pending_node");
+
+	if (!OidIsValid(relid))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 errmsg("the table kingres.pending_node does not exist"),
+				 errhint("Run ALTER EXTENSION kingres_shard UPDATE.")));
+	if (get_attnum(relid, "node_id") == InvalidAttrNumber)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_COLUMN),
+				 errmsg("the table kingres.pending_node has no column node_id"),
+				 errdetail("This database installed an earlier build of kingres_shard 0.5, from before the column existed; ALTER EXTENSION UPDATE does nothing for the same version."),
+				 errhint("On this node run: ALTER TABLE kingres.pending_node ADD COLUMN node_id pg_catalog.int4;  then repeat the call.")));
+}
+
+/*
  * record_pending_node
  *
  * Remember, in a transaction of its own that commits at once, that add_node()
@@ -1000,11 +1036,7 @@ record_pending_node(const char *host, int port, int node_id)
 	char		idstr[16];
 	PGresult   *res;
 
-	if (!OidIsValid(kingres_shard_catalog_relid("pending_node")))
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_TABLE),
-				 errmsg("the table kingres.pending_node does not exist"),
-				 errhint("Run ALTER EXTENSION kingres_shard UPDATE.")));
+	kingres_shard_require_pending_node_id();
 
 	if (self == NULL)
 		return;
@@ -1276,6 +1308,53 @@ kingres_add_node(PG_FUNCTION_ARGS)
 }
 
 /*
+ * clear_removed_node
+ *
+ * The removed node's own catalog is cleared in the transaction of the removal.  A node that
+ * accepted the session and then stops answering (or refuses a statement) is let go (S12-04): a
+ * node that is stuck must be removable, as a node that cannot be connected to is.  Its session is
+ * abandoned, so nothing of this call is left open on it, and the call says so with a WARNING that
+ * names the node and carries the SQLSTATE the failure had (KS007 for a node that did not answer).
+ * What can end this function: the statements succeed (the session stays in the transaction and is
+ * prepared and committed with the others, so a node that stops answering later fails the call at
+ * its PREPARE, with nothing changed); a statement fails (a WARNING, the session is closed, the
+ * removal goes on without the node); the user cancels the call or the backend is told to stop
+ * (the error goes on, as for every call).  The errors that are caught are raised by
+ * node_conn.c on its own state only, which abandoning the session resets.
+ */
+static void
+clear_removed_node(KsConn *kc, const char *host, int port)
+{
+	MemoryContext oldcxt = CurrentMemoryContext;
+
+	PG_TRY();
+	{
+		PGresult   *res;
+
+		kingres_shard_begin_write_xact(kc);
+		res = kingres_shard_exec(kc, "SELECT " KINGRES_SHARD_SCHEMA ".internal_reset_node()");
+		PQclear(res);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(oldcxt);
+		edata = CopyErrorData();
+		if (ERRCODE_TO_CATEGORY(edata->sqlerrcode) == ERRCODE_OPERATOR_INTERVENTION)
+			PG_RE_THROW();
+		FlushErrorState();
+		kingres_shard_conn_abandon(kc);
+		ereport(WARNING,
+				(errcode(edata->sqlerrcode),
+				 errmsg("could not reach node %s:%d; its catalog was not cleared", host, port),
+				 errdetail_internal("%s", edata->message)));
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+}
+
+/*
  * kingres.remove_node(node_id int) returns void
  *
  * Unregister a node whose shard group owns no buckets.  The removed node's
@@ -1389,13 +1468,7 @@ kingres_remove_node_body(PG_FUNCTION_ARGS)
 					(errmsg("could not reach node %s:%d; its catalog was not cleared", host, port),
 					 errdetail_internal("%s", err)));
 		else
-		{
-			PGresult   *res;
-
-			kingres_shard_begin_write_xact(kc);
-			res = kingres_shard_exec(kc, "SELECT " KINGRES_SHARD_SCHEMA ".internal_reset_node()");
-			PQclear(res);
-		}
+			clear_removed_node(kc, host, port);
 	}
 
 	argtypes[0] = INT4OID;

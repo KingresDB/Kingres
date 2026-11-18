@@ -66,13 +66,6 @@ typedef struct KsConn
 	/* the participant is a node that is being demoted (S9-05): its standbys are not waited for */
 	bool		sync_exempt;
 	/*
-	 * the remote transaction runs with SET LOCAL lock_timeout of a control-plane call (S10-02): it
-	 * is given back when the call ends (S11-02), and it is gone with the remote transaction anyway
-	 */
-	bool		lock_bound;
-	/* a SET LOCAL lock_timeout was sent in the current remote transaction (a rollback to a savepoint can bring it back) */
-	bool		lock_touched;
-	/*
 	 * a statement of a user (outside of every control call) wrote through this session in the
 	 * current transaction (S11-01): closing the session loses that write, so the transaction must
 	 * not commit afterwards.  The writes of a control call are its own business: it decides per node.
@@ -88,8 +81,9 @@ extern bool kingres_shard_previous_secret_used;
 /*
  * The scope of a control-plane call (promote_node, add_node, ...), S10-02 and S11-01.  Inside the
  * dynamic extent of such a call every statement it sends to a node is bounded by node_timeout, and
- * the node session gets a lock_timeout, so that a node that accepts the session and does not answer
- * ends the call with an answer that names it.  The scope is a value that the call saves on entry and
+ * the first statement of a new session runs with a lock_timeout of its own, so that a node that
+ * accepts the session and does not answer ends the call with an answer that names it.  Nothing is
+ * sent to a node when the call is left (S12-01).  The scope is a value that the call saves on entry and
  * restores on every exit (kingres_shard_control_call, or enter and leave around a PG_TRY), never a
  * flag that somebody must remember to clear: a statement of a user, which runs outside of every such
  * extent (the planner's remote statements, scans, fan-out, COPY, forwarded DDL), never reads it.
@@ -189,6 +183,8 @@ extern void kingres_shard_fault_set_scope(const char *scope);
  * move (bucket_move.c).  NULL and *errmsg_out on failure.
  */
 extern int kingres_shard_connect_failure_code(void);
+extern int kingres_shard_connect_refusal_sqlstate(void);
+extern void kingres_shard_conn_abandon(KsConn *kc);
 extern PGconn *kingres_shard_connect_control(const char *host, int port,
 											  char **errmsg_out);
 

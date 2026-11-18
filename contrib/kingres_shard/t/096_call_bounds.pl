@@ -3,13 +3,14 @@
 #
 # t/096_call_bounds.pl
 #
-# Review S11-07 and S11-10: a control-plane call has a bound for the whole call.  The README says: a
-# call waits at most 2 x T + 2 seconds for the answers of one node (T = kingres_shard.node_timeout),
-# plus node_connect_timeout once for connecting to it, plus the work on the nodes that answer.  The
-# review measured 30 s for sync_catalog with T = 3 and one node that answered every statement 2 s
-# after it was sent, because the wait was started afresh for each of about fifteen statements.
+# Review S11-07 and S11-10, and S12-03: a control-plane call has a bound for a node that stops
+# answering.  The README says: such a node ends the call within 2 x T + 8 seconds (T =
+# kingres_shard.node_timeout), plus node_connect_timeout once for connecting to it.  (The budget of
+# 2 x T + 2 seconds for the whole call, which also ended calls against a node that answered every
+# statement late but in time, is gone: S12-03.  That a node that answers late but in time never fails a
+# call is t/102.)
 #
-# A node is made slow, or silent after its Nth message, or silent from the start, by a forwarder in
+# A node is made silent after its Nth message, or silent from the start, by a forwarder in
 # front of it (t/KsProxy.pm).  Each call is run against it and timed; the bound that is asserted is
 # the one the README states, with the tolerance the README states (4 seconds, for a loaded machine).
 # After the call the node answers again and the same call, repeated, succeeds with nothing left
@@ -30,7 +31,7 @@ use KingresShardTest qw(make_node make_standby run_sql prepared_count);
 my $T = 3;				# node_timeout
 my $C = 2;				# node_connect_timeout
 my $TOLERANCE = 4;		# README: "Bounds": seconds of tolerance for a loaded machine
-my $BUDGET = 2 * $T + 2;	# what one call waits for the answers of one node
+my $BUDGET = 2 * $T + 8;	# what a call waits for a node that stops answering (README)
 my $seq = 0;
 
 sub setup
@@ -56,7 +57,6 @@ sub timed
 }
 
 my @modes = (
-	[ 'every answer is 1.5 s late (no single wait runs out)', { delay => 1.5, skip_chunks => 2 } ],
 	[ 'silent after the 6th message of a session (a later statement)', { swallow_after => 6 } ],
 	[ 'silent from the start of a session (the connection phase)', { swallow_all => 1 } ],
 );

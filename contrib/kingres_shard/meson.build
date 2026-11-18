@@ -181,6 +181,11 @@ tests += {
       't/097_verify_checks.pl',
       't/098_foundation.pl',
       't/099_harness_selftest.pl',
+      't/100_sweep_calls.pl',
+      't/101_sweep_promote.pl',
+      't/102_slow_nodes.pl',
+      't/103_slow_promote.pl',
+      't/104_s12_fixes.pl',
     ],
   },
 }

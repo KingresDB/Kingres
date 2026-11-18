@@ -118,7 +118,8 @@ target_failure(PGconn *conn, PGresult *res, char **why)
 		*why = pchomp(PQresultErrorMessage(res));
 	else
 		*why = kingres_shard_conn_error_text(conn);
-	if (strstr(*why, "claims to have been opened by another node") != NULL)
+	/* the node's own SQLSTATE, not the words of its message (S12-05: two causes share the words) */
+	if (res != NULL && kingres_shard_result_sqlstate(res) == ERRCODE_KINGRES_SECRET_UNKNOWN)
 		return ERRCODE_KINGRES_SECRET_UNKNOWN;
 	if (res == NULL && PQstatus(conn) == CONNECTION_OK)
 		return ERRCODE_KINGRES_NODE_TIMEOUT;
