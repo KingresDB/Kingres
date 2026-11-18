@@ -87,6 +87,10 @@ DROP TABLE ug_plain, ug;
 DROP INDEX ug_pkey;
 DROP SCHEMA ugs CASCADE;
 DROP TYPE ug_color CASCADE;
+-- COPY FROM is routed (step 4 of 2b); with enable_copy_routing off it is refused as before
+SET kingres_shard.enable_copy_routing = off;
+COPY ug (id) FROM '/dev/null';
+RESET kingres_shard.enable_copy_routing;
 COPY ug (id) FROM '/dev/null';
 CREATE TRIGGER ug_trg BEFORE INSERT ON ug FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger();
 CREATE RULE ug_rule AS ON INSERT TO ug DO ALSO NOTIFY ug;

@@ -259,15 +259,30 @@ sub rowcount
 		is($err, '', "runs: $case->[0]");
 		is($out, $case->[2], "the answer for the whole table: $case->[0]");
 	}
+	# A write that goes to several groups is loaded by the row router (phase 2b, step 3): the
+	# rows are the rows a single node gives for the same statement, and with the switch off
+	# the statement is refused as in 2a, word for word.
 	for my $case (
-		[ 'a multi-row INSERT', "INSERT INTO public.kv VALUES (-1, 'a'), (-2, 'b')" ],
-		[ 'INSERT ... SELECT', "INSERT INTO public.kv SELECT g, 'x' FROM generate_series(-10, -5) g" ],
+		[ 'a multi-row INSERT', "INSERT INTO public.kv VALUES (-1, 'a'), (-2, 'b')",
+		  "SELECT string_agg(g || ':' || v, ',' ORDER BY g) FROM (VALUES (-1, 'a'), (-2, 'b')) x(g, v)",
+		  'id IN (-1, -2)', 2 ],
+		[ 'INSERT ... SELECT', "INSERT INTO public.kv SELECT g, 'x' FROM generate_series(-10, -5) g",
+		  "SELECT string_agg(g || ':x', ',' ORDER BY g) FROM generate_series(-10, -5) g",
+		  'id BETWEEN -10 AND -5', 6 ],
 	  )
 	{
-		my ($rc, $out, $err) = run_sql($n3, $case->[1]);
+		my ($rc, $out, $err) = run_sql($n3,
+			"SET kingres_shard.enable_bulk_routing = off; $case->[1]");
 		like($err, qr/statements that span shard groups are not supported yet/,
-			"refused: $case->[0]");
+			"refused with the switch off, as in 2a: $case->[0]");
+		is(rowcount($n3, $case->[1]), $case->[4],
+			"runs through the row router and reports the rows of a single node: $case->[0]");
+		is( $n1->safe_psql('postgres',
+				"SELECT string_agg(id || ':' || val, ',' ORDER BY id) FROM public.kv WHERE $case->[3]"),
+			$n1->safe_psql('postgres', $case->[2]),
+			"the rows are those of a single node: $case->[0]");
 	}
+	$n3->safe_psql('postgres', "DELETE FROM public.kv WHERE id < 0");
 
 	# Two keys that fall in the same bucket are fine.
 	my ($ka, $kb) = @{ $keys{1} }[ 0, 1 ];

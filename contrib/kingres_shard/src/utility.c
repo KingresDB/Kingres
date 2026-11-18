@@ -97,6 +97,7 @@
 #include "kingres_shard.h"
 #include "node_admin.h"
 #include "node_conn.h"
+#include "row_router.h"
 #include "utility.h"
 
 static ProcessUtility_hook_type prev_ProcessUtility = NULL;
@@ -150,6 +151,7 @@ typedef struct UtilDecision
 	Oid			owner_role;
 	List	   *colocations;	/* of int: colocation groups of the hash tables concerned */
 	Node	   *replacement;	/* the statement to run instead of the one that came */
+	bool		copy_route;		/* COPY FROM into a distributed table: the row router loads it */
 } UtilDecision;
 
 /*
@@ -1112,8 +1114,22 @@ decide(Node *parsetree, const KsCatalog *cat, UtilDecision *d)
 				const KsDistTable *any = find_dist(cat, rangevar_relid(stmt->relation));
 
 				if (any != NULL && multi && stmt->query == NULL && stmt->is_from)
-					reject(parsetree, any, false,
-						   "COPY FROM would write the rows to the partitions of this node only.");
+				{
+					const KsDistTable *own = direct_dist(cat, rangevar_relid(stmt->relation));
+
+					/*
+					 * A hash-distributed table (not a reference table, not a bucket
+					 * partition named directly) is loaded through the row router
+					 * (row_router.c, design 11.6); everything else, and every case with
+					 * the switch off, is refused as before.
+					 */
+					if (own != NULL && !own->is_reference && kingres_shard_enable_copy_routing &&
+						!kingres_shard_session_forwarded())
+						d->copy_route = true;
+					else
+						reject(parsetree, any, false,
+							   "COPY FROM would write the rows to the partitions of this node only.");
+				}
 
 				/*
 				 * COPY <distributed table> TO does not go through the planner
@@ -1547,6 +1563,20 @@ kingres_shard_process_utility(PlannedStmt *pstmt, const char *queryString,
 				list_sort(targets, compare_targets);
 			}
 		}
+	}
+
+	/*
+	 * COPY ... FROM into a distributed table of several groups (11.6).  The handler does what
+	 * DoCopy does for COPY FROM but sends the rows to the group that owns each bucket; the
+	 * statement is not handed to the next hook, which would write this node's partitions only.
+	 */
+	if (d.copy_route)
+	{
+		uint64		processed = kingres_shard_copy_from_routed((CopyStmt *) parsetree, queryString);
+
+		if (qc != NULL)
+			SetQueryCompletion(qc, CMDTAG_COPY, processed);
+		return;
 	}
 
 	authorized = d.authorize || OidIsValid(d.rename_relid);

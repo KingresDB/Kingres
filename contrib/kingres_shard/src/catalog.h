@@ -84,6 +84,7 @@ extern bool kingres_shard_previous_secret(unsigned char *buf, int bufsize, int *
 extern bool kingres_shard_cluster_secret_for_names(unsigned char *buf, int bufsize, int *len);
 extern int kingres_shard_local_node_id_raw(void);
 extern void kingres_shard_catalog_invalidate(void);
+extern KsColocation *kingres_shard_coloc_copy(const KsColocation *coloc);
 extern int64 kingres_shard_placement_hash(const KsColocation *coloc);
 extern int64 kingres_shard_placement_hash_now(int colocation_id);
 extern int64 kingres_shard_map_version_now(void);

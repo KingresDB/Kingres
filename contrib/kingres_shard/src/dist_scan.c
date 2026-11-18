@@ -236,7 +236,23 @@ remote_groups_of(const KsDistTable *dt, const KsCatalog *cat, List *terms,
 	if (nall != NULL)
 		*nall = list_length(groups);
 	if (terms != NIL)
-		allowed = kingres_shard_prune_groups(dt, terms, params, &pruned);
+	{
+		/*
+		 * The terms are evaluated in a context of their own, which is deleted at once: a
+		 * rescan starts the scan again and again in the query context, and the arrays of a
+		 * large IN list (detoasted, deconstructed) must not stay until the statement ends
+		 * (review P2B-04).  Only the list of groups is copied out.
+		 */
+		MemoryContext tmp = AllocSetContextCreate(CurrentMemoryContext, "kingres_shard pruning",
+												  ALLOCSET_DEFAULT_SIZES);
+		MemoryContext oldcxt = MemoryContextSwitchTo(tmp);
+		List	   *found = kingres_shard_prune_groups(dt, terms, params, &pruned);
+
+		MemoryContextSwitchTo(oldcxt);
+		foreach(lc, found)
+			allowed = lappend_int(allowed, lfirst_int(lc));
+		MemoryContextDelete(tmp);
+	}
 	if (pruned_out != NULL)
 		*pruned_out = pruned;
 	foreach(lc, groups)
@@ -1142,6 +1158,8 @@ ds_start(KsDistScanState *s)
 		f->kc->in_query = true;
 		if (!PQsendQueryParams(f->kc->conn, decl.data, nparams, types, values, NULL, NULL, 0))
 			frag_send_failed(f, "DECLARE");
+		/* libpq holds its own copy; the statement text of a scan with a large IN list is large (review P2B-04) */
+		pfree(decl.data);
 		f->kc->nstatements++;
 		f->in_flight = true;
 		kingres_shard_conn_set_pending(f->kc, f, ds_finish_pending);
@@ -1265,6 +1283,20 @@ ds_stop(KsDistScanState *s, bool close_cursors)
 		}
 		f->declared = false;
 	}
+	/*
+	 * A rescan starts the scan again in the query context: what the fragments of this run took
+	 * must not stay until the statement ends (review P2B-04).
+	 */
+	foreach(lc, s->frags)
+	{
+		DsFrag	   *f = (DsFrag *) lfirst(lc);
+
+		if (f->kc != NULL && f->kc->pending_owner == (void *) f)
+			continue;
+		pfree(f->host);
+		pfree(f);
+	}
+	list_free(s->frags);
 	s->frags = NIL;
 	s->started = false;
 }

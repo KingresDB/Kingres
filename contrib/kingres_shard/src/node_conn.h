@@ -147,6 +147,8 @@ extern void kingres_shard_note_remote_write(KsConn *kc);
 extern void kingres_shard_begin_write_xact(KsConn *kc);
 
 /* An asynchronous fetch of one scan is in flight on kc. */
+extern bool kingres_shard_conn_send_params(KsConn *kc, const char *sql, int nparams,
+											const char *const *values);
 extern void kingres_shard_conn_set_pending(KsConn *kc, void *owner,
 											KsPendingFinish finish);
 extern void kingres_shard_conn_clear_pending(KsConn *kc, void *owner);
@@ -155,6 +157,8 @@ extern void kingres_shard_conn_quiesce_quiet(KsConn *kc);
 extern void kingres_shard_conn_abandon_pending(KsConn *kc, void *owner);
 extern PGresult *kingres_shard_conn_collect_quiet(KsConn *kc);
 extern void kingres_shard_conn_drop_inflight(KsConn *kc);
+/* The query in flight is a write that is being abandoned: cancel it and read its end for a short time. */
+extern void kingres_shard_conn_cancel_and_drop(KsConn *kc);
 
 /* The node id of the registered node at host:port, or 0. */
 extern int	kingres_shard_conn_node_id(const char *host, int port);

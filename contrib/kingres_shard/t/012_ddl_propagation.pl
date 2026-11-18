@@ -264,7 +264,6 @@ for my $sql (
 	'CREATE RULE r1 AS ON INSERT TO public.d1 DO ALSO NOTIFY d1',
 	'CREATE POLICY p1 ON public.d1 USING (true)',
 	'CLUSTER public.d1 USING d1_pkey',
-	"COPY public.d1 (id) FROM '/dev/null'",
 	'CREATE STATISTICS st1 ON id, b FROM public.d1',
 	'ALTER TABLE public.d1 ATTACH PARTITION public.loc FOR VALUES WITH (MODULUS 4, REMAINDER 0)',
 	'ALTER TABLE public.d1 DETACH PARTITION public.d1_b0000',
@@ -274,6 +273,8 @@ for my $sql (
 {
 	ddl_refused($n1, $sql, qr/is not supported on distributed tables yet/, "refused: $sql");
 }
+# COPY FROM is loaded by the row router since phase 2b (step 4); with its switch off the 2a refusal stays.
+ddl_refused($n1, "SET kingres_shard.enable_copy_routing = off; COPY public.d1 (id) FROM '/dev/null'", qr/is not supported on distributed tables yet/, "refused with the switch off: COPY public.d1 FROM");
 is(same_all("SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.d1'::regclass AND NOT tgisinternal", 'triggers'), '0', 'no trigger was created');
 
 # ---------------------------------------------------------------------------

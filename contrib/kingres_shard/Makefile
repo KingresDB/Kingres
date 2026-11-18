@@ -8,6 +8,7 @@
 MODULE_big = kingres_shard
 OBJS = \
 	$(WIN32RES) \
+	src/batch_sender.o \
 	src/bucket_move.o \
 	src/catalog.o \
 	src/dist_scan.o \
@@ -26,6 +27,7 @@ OBJS = \
 	src/prune.o \
 	src/recovery.o \
 	src/remote_scan.o \
+	src/row_router.o \
 	src/shippable.o \
 	src/term.o \
 	src/utility.o
@@ -42,7 +44,7 @@ DATA = kingres_shard--0.1.sql kingres_shard--0.2.sql kingres_shard--0.3.sql \
 	kingres_shard--0.3--0.4.sql kingres_shard--0.5.sql kingres_shard--0.4--0.5.sql
 
 REGRESS = version catalog bucket_for bucket_lookup distribute routing_single security \
-	utility_guard routing_decisions reference ddl_single rebalance_plan upgrade
+	utility_guard routing_decisions reference ddl_single rebalance_plan bulk_plans upgrade
 # The tests need the extension preloaded (see kingres_shard.conf).
 REGRESS_OPTS = --temp-config $(srcdir)/kingres_shard.conf
 TAP_TESTS = 1

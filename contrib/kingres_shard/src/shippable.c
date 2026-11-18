@@ -502,6 +502,21 @@ ship_walker(Node *node, ShipCtx *ctx)
 				break;
 			}
 
+		case T_CollateExpr:
+			{
+				/*
+				 * The deparser writes the collation of a constant of type name (and of an
+				 * explicit COLLATE) as COLLATE, which the receiving group reads back as this
+				 * node: the origin and the group decide on the same tree (review P2B-02).  Only
+				 * the collations that mean the same on every node pass.
+				 */
+				CollateExpr *ce = (CollateExpr *) node;
+
+				if (!collation_ok(ce->collOid))
+					return fail(ctx, "it uses a collation that is not built in");
+				break;
+			}
+
 		case T_RelabelType:
 			{
 				RelabelType *r = (RelabelType *) node;

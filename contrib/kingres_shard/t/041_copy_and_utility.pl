@@ -125,10 +125,21 @@ is(line_count($out), 60, 'and gets the rows of every group');
 isnt($rc, 0, 'a role without SELECT may not');
 like($err, qr/permission denied/, 'the error is permission denied');
 
-# COPY FROM stays refused on a cluster of several groups.
-($rc, $out, $err) = run_sql($n1, q{COPY public.dtab FROM STDIN}, stdin => "1\tx\n");
-isnt($rc, 0, 'COPY FROM a distributed table is refused');
+# COPY FROM a distributed table of several groups: refused with the row router's switch off, as
+# in 2a; with it on (phase 2b, step 4) the rows are loaded and are those of the single node.
+($rc, $out, $err) = run_sql($n1, q{SET kingres_shard.enable_copy_routing = off; COPY public.dtab FROM STDIN}, stdin => "1\tx\n");
+isnt($rc, 0, 'COPY FROM a distributed table is refused with the switch off');
 like($err, qr/COPY FROM is not supported/, 'COPY FROM: the message');
+{
+	my $data = join('', map { "$_\tn$_\n" } (1001 .. 1030)) . "1031\t\\N\n";
+	($rc, $out, $err) = run_sql($n3, q{COPY public.dtab FROM STDIN}, stdin => $data);
+	is($rc, 0, 'COPY FROM a distributed table is routed') or diag $err;
+	run_sql($plain, q{COPY public.dtab FROM STDIN}, stdin => $data);
+	my $q = q{SELECT id, name, gen FROM public.dtab WHERE id > 1000 ORDER BY id};
+	is($n1->safe_psql('postgres', $q), $plain->safe_psql('postgres', $q), 'and the rows are those of a single node');
+	$n1->safe_psql('postgres', q{DELETE FROM public.dtab WHERE id > 1000});
+	$plain->safe_psql('postgres', q{DELETE FROM public.dtab WHERE id > 1000});
+}
 ($rc, $out, $err) = run_sql($pn, q{COPY public.dtab_b0000 FROM STDIN}, stdin => "1\tx\n");
 isnt($rc, 0, 'COPY FROM a bucket partition is refused');
 like($err, qr/COPY FROM is not supported/, 'COPY FROM a bucket partition: the message');

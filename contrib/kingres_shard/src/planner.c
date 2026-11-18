@@ -61,10 +61,13 @@
 
 #include "access/genam.h"
 #include "access/hash.h"
+#include "access/htup_details.h"
 #include "access/table.h"
 #include "access/xact.h"
 #include "catalog/partition.h"
 #include "catalog/pg_constraint.h"
+#include "catalog/pg_language_d.h"
+#include "catalog/pg_proc.h"
 #include "commands/extension.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -82,8 +85,10 @@
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/ruleutils.h"
+#include "utils/syscache.h"
 #include "utils/typcache.h"
 
+#include "batch_sender.h"
 #include "bucket_move.h"
 #include "catalog.h"
 #include "dist_scan.h"
@@ -94,6 +99,7 @@
 #include "node_conn.h"
 #include "planner.h"
 #include "remote_scan.h"
+#include "row_router.h"
 #include "shippable.h"
 #include "utility.h"
 
@@ -135,6 +141,7 @@ static PlannedStmt *kingres_shard_planner_hook(Query *parse,
 												ParamListInfo boundParams
 												KS_PLANNER_ES_PARAM);
 static bool is_scan_fragment(Query *q, const KsCatalog *cat);
+static bool is_insert_fragment(Query *q, const KsCatalog *cat);
 static PlannedStmt *planner_hook_body(Query *parse, const char *query_string,
 									   int cursorOptions, ParamListInfo boundParams);
 static PlannedStmt *pass_through(Query *parse, const char *query_string,
@@ -792,9 +799,51 @@ error_not_provably_local(const KsDistTable *dt, int local_group,
  * return a wrong answer without an error.  The analysis counted the
  * distributed tables it saw (expected); a plan that has more of them than
  * that came from an expansion the analysis could not see.
+ *
+ * Only a SQL-language function can be expanded, so the count means something only when the
+ * statement calls one (review P2B-03).  The planner also copies range table entries of its own
+ * accord: a UNION, INTERSECT or EXCEPT with an arm that cannot match anything has one more
+ * entry of the table in its plan than the statement has references, and counting that as an
+ * expansion refused such a statement with a message that was not true.
  */
+static bool
+func_is_sql(Oid funcid)
+{
+	HeapTuple	tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
+	bool		result;
+
+	if (!HeapTupleIsValid(tup))
+		return false;
+	result = ((Form_pg_proc) GETSTRUCT(tup))->prolang == SQLlanguageId;
+	ReleaseSysCache(tup);
+	return result;
+}
+
+static bool
+sql_function_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, FuncExpr))
+	{
+		if (func_is_sql(((FuncExpr *) node)->funcid))
+			return true;
+	}
+	else if (IsA(node, OpExpr) || IsA(node, DistinctExpr) || IsA(node, NullIfExpr))
+	{
+		OpExpr	   *o = (OpExpr *) node;
+
+		set_opfuncid(o);
+		if (func_is_sql(o->opfuncid))
+			return true;
+	}
+	else if (IsA(node, Query))
+		return query_tree_walker((Query *) node, sql_function_walker, context, 0);
+	return expression_tree_walker(node, sql_function_walker, context);
+}
+
 static void
-check_plan_dist_rtes(PlannedStmt *pstmt, int expected)
+check_plan_dist_rtes(bool calls_sql_function, PlannedStmt *pstmt, int expected)
 {
 	/* Planning may have run a function that reloaded the catalog cache. */
 	const KsCatalog *cat = kingres_shard_catalog();
@@ -804,6 +853,10 @@ check_plan_dist_rtes(PlannedStmt *pstmt, int expected)
 
 	/* The empty catalog that a nested call sees while the cache loads. */
 	if (!cat->present || cat->dist_tables == NULL)
+		return;
+
+	/* nothing the planner could have expanded */
+	if (!calls_sql_function)
 		return;
 
 	foreach(lc, pstmt->rtable)
@@ -850,10 +903,12 @@ static PlannedStmt *
 plan_locally(Query *parse, const char *query_string, int cursorOptions,
 			 ParamListInfo boundParams, const KsCatalog *cat, int expected)
 {
+	/* looked for before planning: the planner replaces the call of a SQL function by its body */
+	bool		calls_sql_function = sql_function_walker((Node *) parse, NULL);
 	PlannedStmt *pstmt = pass_through(parse, query_string, cursorOptions,
 									  boundParams);
 
-	check_plan_dist_rtes(pstmt, expected);
+	check_plan_dist_rtes(calls_sql_function, pstmt, expected);
 	return pstmt;
 }
 
@@ -897,6 +952,45 @@ plan_forwarded(Query *parse, const char *query_string, int cursorOptions,
 		return plan_locally(parse, query_string, cursorOptions, boundParams, cat,
 							a->ndist_rtes);
 
+	/* A batch of rows that the row router of another node sends here (11.5). */
+	if (list_length(a->refs) == 1 && parse->commandType == CMD_INSERT)
+	{
+		int64		place;
+		int64		ident;
+		bool		has_ident;
+		DistRef    *only = (DistRef *) linitial(a->refs);
+
+		if (kingres_shard_parse_insert_marker(query_string, &place, &has_ident, &ident) &&
+			only->query == parse && only->rti == (Index) parse->resultRelation &&
+			is_insert_fragment(parse, cat))
+		{
+			PlannedStmt *pstmt = plan_locally(parse, query_string, cursorOptions, boundParams,
+											  cat, a->ndist_rtes);
+
+			/*
+			 * The check of 11.5, after planning (the parent is locked ROW EXCLUSIVE since
+			 * parse analysis, which a DETACH of a bucket waits for): the placement number the
+			 * sender decided with, or the identity of the partitions of a table that is not
+			 * in the catalog.  A fast failure for a stale origin or a changed primary; it is
+			 * not what keeps a row out of a wrong bucket, the tuple routing does.
+			 */
+			if (place != 0 &&
+				kingres_shard_placement_hash_now(only->dt->colocation_id) != place)
+				ereport(ERROR,
+						(errcode(ERRCODE_KINGRES_STALE_MAP),
+						 errmsg("the bucket map of this node is not the one the rows were routed with (stale map version " INT64_FORMAT ")",
+								cat->map_version),
+						 errhint("A bucket moved between shard groups, or the primary of a group changed; repeat the statement.")));
+			if (has_ident && kingres_shard_partition_identity_now(only->dt->relid) != ident)
+				ereport(ERROR,
+						(errcode(ERRCODE_KINGRES_STALE_MAP),
+						 errmsg("the partitions of table \"%s\" on this node are not the ones the rows were routed with",
+								get_rel_name(only->dt->relid)),
+						 errhint("Repeat the statement.")));
+			return pstmt;
+		}
+	}
+
 	/* The part of an UPDATE or DELETE that another node runs on every group. */
 	if (list_length(a->refs) == 1 && query_string != NULL &&
 		strncmp(query_string, KS_WRITE_MARKER, strlen(KS_WRITE_MARKER)) == 0 &&
@@ -910,6 +1004,21 @@ plan_forwarded(Query *parse, const char *query_string, int cursorOptions,
 			return plan_locally(parse, query_string, cursorOptions, boundParams, cat,
 								a->ndist_rtes);
 	}
+
+	/*
+	 * A statement that claims to be a fragment and that none of the rules above accepted: the
+	 * node that sent it and this node decide on the same tree, so a retry gives the same
+	 * answer and the retryable error KS001 would be a lie (review P2B-02).
+	 */
+	if (query_string != NULL && list_length(a->refs) == 1 &&
+		(strncmp(query_string, KS_FRAGMENT_MARKER, strlen(KS_FRAGMENT_MARKER)) == 0 ||
+		 strncmp(query_string, KS_WRITE_MARKER, strlen(KS_WRITE_MARKER)) == 0 ||
+		 strncmp(query_string, KS_INSERT_MARKER_PREFIX, strlen(KS_INSERT_MARKER_PREFIX)) == 0))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("this node does not accept the fragment that another node sent it"),
+				 errdetail("The statement does not have the shape of a fragment that this node runs, or uses an expression that is not built in and immutable."),
+				 errhint("This is not a change of the bucket map: repeating the statement does not help.")));
 
 	foreach(lc, a->refs)
 	{
@@ -1221,7 +1330,7 @@ writes_hash_dist_walker(Node *node, void *context)
 }
 
 static bool
-can_distributed_scan(Query *parse, const KsCatalog *cat)
+can_distributed_scan(Query *parse, const KsCatalog *cat, bool spans)
 {
 	if (!kingres_shard_enable_distributed_scan)
 		return false;
@@ -1229,10 +1338,18 @@ can_distributed_scan(Query *parse, const KsCatalog *cat)
 	if (writes_hash_dist_walker((Node *) parse, (void *) cat))
 		return false;
 	if (parse->rowMarks != NIL)
+	{
+		if (spans)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("row-level locking on a statement that spans shard groups is not supported yet"),
+					 errhint("Restrict every distributed table of the statement to one key, or remove FOR UPDATE / FOR SHARE.")));
+		/* review P2B-07: the statement names one key, but a local table cannot be sent to the other group */
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("row-level locking on a statement that spans shard groups is not supported yet"),
-				 errhint("Restrict every distributed table of the statement to one key, or remove FOR UPDATE / FOR SHARE.")));
+				 errmsg("a local table cannot be read in a statement that locks rows of a distributed table of another shard group"),
+				 errhint("Read the local table in a statement of its own, or remove FOR UPDATE / FOR SHARE.")));
+	}
 	return true;
 }
 
@@ -1319,6 +1436,172 @@ is_scan_fragment(Query *q, const KsCatalog *cat)
 		return false;
 	return true;
 }
+
+/*
+ * An expression of the SELECT of an insert fragment: a column of the unnest, read through
+ * the casts from text that the sender writes.
+ */
+static bool
+insert_src_expr_ok(Node *e)
+{
+	if (e == NULL)
+		return false;
+	switch (nodeTag(e))
+	{
+		case T_Var:
+			return ((Var *) e)->varno == 1 && ((Var *) e)->varlevelsup == 0 && ((Var *) e)->varattno > 0;
+		case T_CoerceViaIO:
+			return insert_src_expr_ok((Node *) ((CoerceViaIO *) e)->arg);
+		case T_RelabelType:
+			return insert_src_expr_ok((Node *) ((RelabelType *) e)->arg);
+		case T_CoerceToDomain:
+			return insert_src_expr_ok((Node *) ((CoerceToDomain *) e)->arg);
+		case T_FuncExpr:
+			{
+				/* a cast function of the catalog (text to char(n) is one), on what is allowed */
+				FuncExpr   *fe = (FuncExpr *) e;
+				ListCell   *lc;
+
+				if (fe->funcid >= FirstNormalObjectId)
+					return false;
+				foreach(lc, fe->args)
+				{
+					Node	   *a = (Node *) lfirst(lc);
+
+					if (!IsA(a, Const) && !insert_src_expr_ok(a))
+						return false;
+				}
+				return true;
+			}
+		default:
+			return false;
+	}
+}
+
+/* Does the query contain a Var of the first relation whose RETURNING kind is not the default? */
+static bool
+frag_returning_var_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var) && ((Var *) node)->varreturningtype != VAR_RETURNING_DEFAULT)
+		return true;
+	return expression_tree_walker(node, frag_returning_var_walker, context);
+}
+
+/*
+ * is_insert_fragment
+ *
+ * Is the statement of a forwarded session the batch of the row router of another node (11.3,
+ * 11.5): an INSERT into one distributed table whose only other relation is the multi-argument
+ * unnest of external parameters, with ON CONFLICT DO NOTHING or nothing, and a RETURNING list
+ * that passes the shippability walker?  A statement of this shape means "put these rows in the
+ * buckets of this node", the rows that do not belong fail in the tuple routing, so it is
+ * correct to run it here whatever keys the rows have.  The group computes no default of its
+ * own for it that is not a constant (a volatile one would be computed on the wrong node).
+ */
+static bool
+is_insert_fragment(Query *q, const KsCatalog *cat)
+{
+	RangeTblEntry *trte;
+	RangeTblEntry *srte;
+	KsDistTable *dt;
+	Query	   *sub;
+	RangeTblEntry *frte;
+	ListCell   *lc;
+
+	if (q->commandType != CMD_INSERT || q->resultRelation != 1 || q->cteList != NIL ||
+		q->hasModifyingCTE || q->hasSubLinks || q->rowMarks != NIL ||
+		list_length(q->rtable) != 2)
+		return false;
+	trte = (RangeTblEntry *) linitial(q->rtable);
+	srte = (RangeTblEntry *) lsecond(q->rtable);
+	if (trte->rtekind != RTE_RELATION || srte->rtekind != RTE_SUBQUERY)
+		return false;
+	dt = hash_search(cat->dist_tables, &trte->relid, HASH_FIND, NULL);
+	if (dt == NULL || dt->is_reference)
+		return false;
+
+	sub = srte->subquery;
+	if (sub->commandType != CMD_SELECT || sub->cteList != NIL || sub->setOperations != NULL ||
+		sub->hasSubLinks || sub->hasAggs || sub->hasWindowFuncs || sub->hasTargetSRFs ||
+		sub->groupClause != NIL || sub->havingQual != NULL || sub->distinctClause != NIL ||
+		sub->sortClause != NIL || sub->limitCount != NULL || sub->limitOffset != NULL ||
+		sub->rowMarks != NIL || list_length(sub->rtable) != 1 ||
+		sub->jointree == NULL || sub->jointree->quals != NULL)
+		return false;
+	frte = (RangeTblEntry *) linitial(sub->rtable);
+	if (frte->rtekind != RTE_FUNCTION || frte->funcordinality || frte->functions == NIL)
+		return false;
+	foreach(lc, frte->functions)
+	{
+		RangeTblFunction *rtf = (RangeTblFunction *) lfirst(lc);
+		FuncExpr   *fe = (FuncExpr *) rtf->funcexpr;
+		Node	   *arg;
+
+		if (fe == NULL || !IsA(fe, FuncExpr) || fe->funcid != F_UNNEST_ANYARRAY ||
+			list_length(fe->args) != 1)
+			return false;
+		arg = strip_relabel((Node *) linitial(fe->args));
+		if (arg == NULL || !IsA(arg, Param) || ((Param *) arg)->paramkind != PARAM_EXTERN)
+			return false;
+	}
+	foreach(lc, sub->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (!insert_src_expr_ok((Node *) te->expr))
+			return false;
+	}
+	/* What the INSERT does with them: Vars of the source and constants (the defaults of the group), nothing volatile. */
+	foreach(lc, q->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		List	   *vars = pull_var_clause((Node *) te->expr, 0);
+		ListCell   *lc2;
+
+		if (contain_volatile_functions((Node *) te->expr))
+			return false;
+		foreach(lc2, vars)
+			if (((Var *) lfirst(lc2))->varno != 2 || ((Var *) lfirst(lc2))->varlevelsup != 0)
+				return false;
+	}
+	if (q->onConflict != NULL)
+	{
+		OnConflictExpr *oc = q->onConflict;
+
+		if (oc->action != ONCONFLICT_NOTHING || KS_ONCONFLICT_IS_SELECT(oc))
+			return false;
+		foreach(lc, oc->arbiterElems)
+		{
+			InferenceElem *ie = (InferenceElem *) lfirst(lc);
+			Node	   *e = (Node *) ie->expr;
+
+			if (!(IsA(e, Var) && ((Var *) e)->varno == 1 && ((Var *) e)->varlevelsup == 0) &&
+				!kingres_shard_clause_shippable(e, 1))
+				return false;
+		}
+		if (oc->arbiterWhere != NULL && !kingres_shard_clause_shippable(oc->arbiterWhere, 1))
+			return false;
+	}
+	if (q->returningList != NIL)
+	{
+		if (frag_returning_var_walker((Node *) q->returningList, NULL))
+			return false;
+		foreach(lc, q->returningList)
+		{
+			TargetEntry *te = lfirst_node(TargetEntry, lc);
+			Node	   *e = (Node *) te->expr;
+
+			if (!(IsA(e, Var) && ((Var *) e)->varno == 1 && ((Var *) e)->varlevelsup == 0 &&
+				  ((Var *) e)->varattno > 0) &&
+				!kingres_shard_clause_shippable(e, 1))
+				return false;
+		}
+	}
+	return true;
+}
+
 /*
  * A data-modifying query below (or at) the top that writes a bucket partition
  * itself: the partition of a hash-distributed table, named directly.
@@ -1390,6 +1673,9 @@ refuse_bucket_partition_write(Query *parse, const KsCatalog *cat)
  * folding may plan its own): the distributed scan is switched on only around
  * the standard planner of a statement that needs it.
  */
+/* Is the statement this call of the planner hook plans the local part that the caller armed? */
+static bool this_is_local_part = false;
+
 static PlannedStmt *
 kingres_shard_planner_hook(Query *parse, const char *query_string,
 							int cursorOptions, ParamListInfo boundParams KS_PLANNER_ES_PARAM)
@@ -1397,8 +1683,11 @@ kingres_shard_planner_hook(Query *parse, const char *query_string,
 	PlannedStmt *result;
 	bool		old = kingres_shard_distscan_set_active(false);
 	void	   *old_explain = current_explain;
+	bool		saved_local_part = this_is_local_part;
 
 	current_explain = (void *) KS_PLANNER_ES_VALUE;
+	/* consumed first of all: nothing this hook runs can see the mark (fanout.c, P2B-01) */
+	this_is_local_part = kingres_shard_local_part_take(query_string);
 	PG_TRY();
 	{
 		result = planner_hook_body(parse, query_string, cursorOptions, boundParams);
@@ -1407,6 +1696,7 @@ kingres_shard_planner_hook(Query *parse, const char *query_string,
 	{
 		(void) kingres_shard_distscan_set_active(old);
 		current_explain = old_explain;
+		this_is_local_part = saved_local_part;
 	}
 	PG_END_TRY();
 	return result;
@@ -1505,15 +1795,15 @@ planner_hook_body(Query *parse, const char *query_string,
 											  cat->map_version);
 
 	/*
-	 * The local part of a fanned-out statement, which this backend runs through SPI
-	 * with the nonce of that part in the text of the statement (fanout.c), is
-	 * planned for this node only, without routing and without the scan.  It is
-	 * recognized here and not earlier: the partition lists of its tables are now as
-	 * new as the catalog (above), and a statement of a function that the local part
-	 * calls cannot carry the nonce.  This replaces the comparison of whole statement
-	 * texts of 0.2 to 0.5, which returned before the catalog was read.
+	 * The local part of a fanned-out statement or of a batch, which this backend runs
+	 * through SPI after arming the one-shot mark (fanout.c), is planned for this node
+	 * only, without routing and without the scan.  The mark was consumed at the entry
+	 * of the hook; it is acted on here and not earlier: the partition lists of its
+	 * tables are now as new as the catalog (above).  Nothing in the text of the
+	 * statement says it is a local part, so a function that the local part calls
+	 * cannot make one (review P2B-01).
 	 */
-	if (kingres_shard_local_part_nonce_ok(query_string))
+	if (this_is_local_part)
 		return pass_through(parse, query_string, cursorOptions, boundParams);
 
 	/*
@@ -1577,6 +1867,31 @@ planner_hook_body(Query *parse, const char *query_string,
 		}
 	}
 
+	/*
+	 * An INSERT into a distributed table whose key is not one constant (design 11.1): a
+	 * multi-row VALUES, INSERT ... SELECT, a row whose key is computed.  It is run by the row
+	 * router, which sends each row to the group that owns its bucket.  A single row with a
+	 * constant key (or a parameter whose value the plan does not know yet) stays on the
+	 * paths below, and with enable_bulk_routing off the statement is refused as in 2a.
+	 */
+	if (parse->commandType == CMD_INSERT && parse->resultRelation > 0 &&
+		kingres_shard_enable_bulk_routing)
+	{
+		DistRef    *target = NULL;
+		List	   *rrelids = NIL;
+
+		foreach(lc, a.refs)
+		{
+			DistRef    *ref = (DistRef *) lfirst(lc);
+
+			rrelids = list_append_unique_oid(rrelids, ref->dt->relid);
+			if (ref->query == parse && ref->rti == (Index) parse->resultRelation)
+				target = ref;
+		}
+		if (target != NULL && target->bucket < 0 && !target->param_pending)
+			return kingres_shard_plan_row_router(parse, target->dt, rrelids);
+	}
+
 	first = (DistRef *) linitial(a.refs);
 	colocation_id = first->dt->colocation_id;
 
@@ -1618,7 +1933,7 @@ planner_hook_body(Query *parse, const char *query_string,
 		 * other groups (dist_scan.c); a write cannot be (a multi-row INSERT,
 		 * INSERT ... SELECT) or is handled by the planner of the writes below.
 		 */
-		if (can_distributed_scan(parse, cat))
+		if (can_distributed_scan(parse, cat, true))
 			return plan_with_scan(parse, query_string, cursorOptions, boundParams);
 		if (parse->commandType == CMD_UPDATE || parse->commandType == CMD_DELETE)
 		{
@@ -1665,7 +1980,7 @@ planner_hook_body(Query *parse, const char *query_string,
 	 * distributed table stays refused below.
 	 */
 	if ((a.has_nondist || (cursorOptions & CURSOR_OPT_SCROLL)) &&
-		can_distributed_scan(parse, cat))
+		can_distributed_scan(parse, cat, false))
 		return plan_with_scan(parse, query_string, cursorOptions, boundParams);
 	if (a.has_nondist)
 		ereport(ERROR,
