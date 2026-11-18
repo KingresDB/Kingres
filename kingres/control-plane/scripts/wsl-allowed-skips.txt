@@ -15,3 +15,10 @@ TestSignMatchesSuiteVanilla the third-party test vectors of the anchoring packag
 TestSignSessionToken the third-party test vectors of the anchoring packages are not in the repository (testdata/third_party)
 TestThirdPartyManifest the third-party test vectors of the anchoring packages are not in the repository (testdata/third_party)
 TestTruncationsAndTrailing the third-party test vectors of the anchoring packages are not in the repository (testdata/third_party)
+TestBlockEntryAgainstTheHeadersOfARealServer the fixtures of the verifier module are not beside a test binary that runs outside the source tree
+TestLargerTreeAcrossTileLevels a long test of the log library (KINGRES_LONG_TESTS=1)
+TestMaxBatchBytesBoundary a long test of the log library (KINGRES_LONG_TESTS=1)
+TestPutCheckpointGivesUpAfterTheDefaultRetry a long test of the log library (KINGRES_LONG_TESTS=1)
+TestNoPackageLevelState_SkipsWithoutSources the sources of the anchoring packages are not beside a test binary that runs outside the source tree
+TestPayloadLimitsEqualTheVerifiers_SkipsWithoutVerifierSource the sources of the verifier module are not beside a test binary that runs outside the source tree
+TestCorpusCopiesAreIdentical the verifier module is not beside a test binary that runs outside the source tree
