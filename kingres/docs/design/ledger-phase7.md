@@ -2814,6 +2814,59 @@ build to the corrected rule. The verifier's README has the same list with the re
 136. **A forwarded answer keeps its `Content-Disposition`**, which the download of the trust file
     through a follower needs.
 
+The numbers 137 to 149 are kept for the collector and the publication (steps 5 and 6).
+
+150. **The switch to `required` is ordered with the writers by a table lock (replaces what 113 says
+    about a transaction that was running; adds to 108, 110 and 117).** `ledger_set_signature_policy`
+    takes SHARE ROW EXCLUSIVE on the table before it reads or changes anything and holds it to the
+    end of its transaction, so it waits for every open writer of the table, a prepared one included,
+    and later writers wait for it. After the switch has committed, no transaction commits or
+    prepares an entry of the table without an attestation, whatever its isolation level and
+    whenever it began.
+151. **A writer reads the policy with a snapshot of now and keeps only that answer (adds to 113).**
+    The capture trigger reads the policy at the first write of a table in a transaction with the
+    latest snapshot, not the transaction's own; since the writer then holds its lock on the table,
+    the answer is true until the transaction ends. An answer read by anything that does not hold
+    the lock (`ledger_row_hash`, `ledger_attest`, a check) is never kept for a writer.
+152. **The date of the switch (replaces "the top-level transaction that switched the policy" of
+    113).** `signature_required_from` is the largest transaction id that is not asked for an
+    attestation: the id the next transaction would get, read under the lock, less one. Every
+    transaction that wrote the table before the switch has a lower id, so `ledger_verify` reports no
+    entry that was committed before the switch. A transaction that began before the date and wrote
+    after the switch is held by the check at commit only; `ledger_verify` does not look for its
+    entries. The column, its constraint and the comparison are unchanged.
+153. **The entries of the switching transaction (3.7; replaces the claim of 113).** Its own earlier
+    entries of the table without an attestation are owed one: they are put on the list of the
+    commit check when the switch runs and follow the subtransaction that made it. A switch in the
+    transaction that enabled a table with rows owes an attestation for every row entered; switch in
+    a later transaction.
+154. **`ledger_set_signature_policy` under the rules of 108 (replaces 117 for this function).** A
+    role that is not a superuser calls it as a statement of its own (`25001` otherwise); its table
+    lock is in the list of held locks for the timer; the wait for the writers is bounded by
+    `lock_hold_limit` (`55P03`); a transaction that holds a lock of the extension and would have to
+    wait for the table gets `KL006` before it waits; the lock on a table comes first in the order
+    of the locks. No lock of the extension is taken, so the builder and the capture never wait for
+    it; only the writers of that one table do.
+155. **Which keys the registry accepts (3.7, 3.8; adds to 114).** Only the canonical encoding of a
+    point of the curve that does not have small order: `22023` at registration, and `KL012` at
+    `ledger_attest` for a row that exists already. Plain Ed25519 verification accepts a signature
+    that nobody made under a key of small order, and several encodings give the same point. The
+    check is the extension's own arithmetic (canonical, on the curve, eight times the point is not
+    the identity), with and without OpenSSL. The standalone verifier must apply the same three
+    tests to every public key it reads.
+156. **The default of `enable_credit_limit` (replaces the 30 minutes of 109).** One minute, so that
+    with the defaults a role that is not a superuser holds the lock of the registry for two minutes
+    at most. A table that needs longer is enabled by a superuser or by a role whose settings were
+    raised.
+157. **Copies of a database (3.6).** A restored backup, a promoted standby and a copy made from a
+    template share the chain identity, so an attestation is valid in each copy. No new identity is
+    made for a copy.
+158. **What the policy does not cover (3.7).** `COPY` goes through the capture trigger like every
+    write. A ledger table is never partitioned, so there is no partitioned case. A subscriber of
+    logical replication cannot hold a table whose policy is `required` (the apply fails with
+    `KL010`). A commit callback of another module that was registered before this library's could
+    write after the check.
+
 Of section 13: item 2 (test vectors) is settled for signed notes (the example key and note of the
 specification are in the tests; the checkpoint example has no published key), item 3 (entry bundles at
 the standard path) and item 4 (RFC 9162 sections 2.1.3.2 and 2.1.4.2) were checked against the source.
