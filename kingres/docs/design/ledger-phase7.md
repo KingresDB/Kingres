@@ -2572,6 +2572,37 @@ build to the corrected rule. The verifier's README has the same list with the re
     raise an error that says no identifier is left, and nothing wraps. A cancel inside the run of
     `ledger_verify` within `ledger_verify_recorded` is raised when the lock of the verifications is
     held by another session and recorded as a failed run when it is free.
+101. **Key id collisions are judged as the verifier judges them (3; replaces the sentence about
+    collisions of 93).** The verifier checks a fresh checkpoint against the usable keys of the trust
+    file and a held note (a state file, `--old`) against every key of the file, whatever its standing.
+    Two keys with the same 32-bit key id under one origin therefore stop every auditor's state file for
+    that log also when one of them is revoked or retired, and no later transition cures it: revoking is
+    not a remedy. The keys to check before a key enters the set are all keys of the set under every
+    origin that will be signed (`AddChecked` refuses such a key; `CheckSetKeyIDs` applies the rule to a
+    set, with and without the next keys). When a collision is found after the fact, the log is
+    published under another origin (a new epoch or prefix), or the auditors start a new state file, or
+    a new generation of the trust file is made.
+102. **Times of key transitions, and what the set refuses (3; adds to 93).** Every time of a key is in
+    the years 1 to 9999 and never zero; such a time is refused when it is given and when a stored set
+    is loaded, since the verifier cannot read the trust file otherwise. An activation later than the
+    latest time the set records by more than 366 days is refused, which catches a clock that is wrong
+    by years and nothing smaller. A key that is active and not yet in force can be retired without a
+    revocation, at its own activation time, so that an activation in the future does not wedge the
+    overlap; the rules for who may sign, who may be retired and who is due agree about which keys are
+    in force. A loaded set with two active keys must carry exactly one end of an overlap, equal to the
+    activation of the other key plus whole days; a set whose keys were all turned back to "next"
+    cannot be told from a new one.
+103. **Publication: a repeated put, link errors, re-signing (4.4, 4.5; adds to 94).** A put that finds
+    the tile there and equal flushes the file, its directory and every ancestor up to the root before
+    it returns, so appending the same leaves again after a crash makes them durable. Only the errors
+    that mean a file system without hard links are reported as that; any other failure of the link is
+    returned as it is. A checkpoint target that is a directory, or read-only on Windows, is named at
+    once without the retry. The stores and the audit honour the caller's context. Signing a stored
+    checkpoint again takes every key of the trust file as trusted, refuses a collision between a new
+    signer and any of them, and refuses a line under the name of the log whose key id belongs to none
+    of them, so that the result is never a note the verifier refuses for a reason that could be seen.
+    The tests of both libraries that need the verifier say so when they skip, and fail with
+    `KINGRES_REQUIRE_VERIFY=1`.
 
 Of section 13: item 2 (test vectors) is settled for signed notes (the example key and note of the
 specification are in the tests; the checkpoint example has no published key), item 3 (entry bundles at
