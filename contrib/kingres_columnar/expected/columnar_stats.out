@@ -581,9 +581,9 @@ SELECT t.* FROM (SELECT attname FROM pg_attribute WHERE attrelid = 'st_ty'::regc
 -- what columnar_info and columnar_stripes report
 CREATE TABLE inf (a int, b text) USING columnar;
 SELECT * FROM kingres.columnar_info('inf');
- stripes | chunk_groups | rows | bytes_on_disk | bytes_uncompressed | compression_ratio 
----------+--------------+------+---------------+--------------------+-------------------
-       0 |            0 |    0 |             0 |                  0 |                  
+ stripes | chunk_groups | rows | bytes_on_disk | bytes_uncompressed | compression_ratio | unreferenced_bytes 
+---------+--------------+------+---------------+--------------------+-------------------+--------------------
+       0 |            0 |    0 |             0 |                  0 |                   |                  0
 (1 row)
 
 SELECT * FROM kingres.columnar_stripes('inf');
@@ -664,9 +664,9 @@ SELECT count(*) AS stripes_listed FROM kingres.columnar_stripes('inf');
 -- a table that was emptied
 TRUNCATE inf;
 SELECT * FROM kingres.columnar_info('inf');
- stripes | chunk_groups | rows | bytes_on_disk | bytes_uncompressed | compression_ratio 
----------+--------------+------+---------------+--------------------+-------------------
-       0 |            0 |    0 |             0 |                  0 |                  
+ stripes | chunk_groups | rows | bytes_on_disk | bytes_uncompressed | compression_ratio | unreferenced_bytes 
+---------+--------------+------+---------------+--------------------+-------------------+--------------------
+       0 |            0 |    0 |             0 |                  0 |                   |                  0
 (1 row)
 
 SELECT count(*) FROM kingres.columnar_stripes('inf');

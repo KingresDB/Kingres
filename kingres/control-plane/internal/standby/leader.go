@@ -61,6 +61,9 @@ type Leader struct {
 	// RetryAfter is how long a failed create or rebuild waits before the next try
 	// (default 30 s).
 	RetryAfter time.Duration
+	// Busy returns the groups that a failover has taken over: the reconcile loop does not create, remove,
+	// rebuild or register a standby of such a group (design 3.3 F1: a group in a failover task is the task's). nil: none.
+	Busy func(ctx context.Context) map[int32]bool
 	// UnregisterWait is the pause between two tries of a catalog removal that the
 	// extension refused with KS009 because the primary still names the standby (default 5 s).
 	UnregisterWait time.Duration
@@ -352,6 +355,21 @@ func (l *Leader) round(ctx context.Context) error {
 		return err
 	}
 	statuses := l.poll(ctx, t)
+	l.recordReplicationState(ctx, statuses)
+	inFailover := map[int32]bool{}
+	if l.Busy != nil {
+		inFailover = l.Busy(ctx)
+	}
+	if len(inFailover) > 0 {
+		var kept []groupInfo
+		for _, g := range t.groups {
+			if !inFailover[g.ID] {
+				kept = append(kept, g)
+			}
+		}
+		t.groups = kept
+		recs = withoutGroups(recs, inFailover)
+	}
 	for _, r := range recs {
 		for _, s := range statuses {
 			if ps := s.primaryOf(r.Group); ps != nil {
@@ -370,6 +388,7 @@ func (l *Leader) round(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	recs = withoutGroups(recs, inFailover)
 	w := l.diff(t, recs, replicas)
 	w = l.throttle(w)
 	busy := false
@@ -384,6 +403,7 @@ func (l *Leader) round(ctx context.Context) error {
 			busy = true
 		}
 	}
+	l.ensureEverywhere(ctx, t, recs)
 	l.catchUp(ctx, t, statuses)
 	if !busy {
 		l.underReplicated(ctx, t, replicas, recs, statuses)
@@ -987,4 +1007,75 @@ func (l *Leader) removedMeanwhile(ctx context.Context, id int64) (bool, error) {
 		return false, err
 	}
 	return !found || r.State == stateRemoving, nil
+}
+
+// withoutGroups drops the records of the groups in busy.
+func withoutGroups(recs []Record, busy map[int32]bool) []Record {
+	if len(busy) == 0 {
+		return recs
+	}
+	var out []Record
+	for _, r := range recs {
+		if !busy[r.Group] {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// Publish sends the standby list to every server under a new version (a failover
+// changed the primary of a group and the records of its standbys).
+func (l *Leader) Publish(ctx context.Context) error { return l.publish(ctx) }
+
+// recordReplicationState writes, for each group whose primary answered, what the check
+// found: the primary's flush position, whether a standby streamed and whether the group
+// runs without its synchronous standby. A failover reads it as "the last position of the
+// old primary that the leader knew" (design 2.6); it is the only record of the group
+// once the primary's server is dead.
+func (l *Leader) recordReplicationState(ctx context.Context, statuses map[string]Status) {
+	err := l.Sys(ctx, func(c *pgx.Conn) error {
+		for server, st := range statuses {
+			ps := st.Primaries
+			if len(ps) == 0 && st.Primary != nil {
+				ps = []PrimaryStatus{*st.Primary}
+			}
+			for _, p := range ps {
+				streaming := len(p.Streaming) > 0 && p.SynchronousStandbyNames != "" && !p.Without
+				if _, err := c.Exec(ctx, `INSERT INTO kingres_cp.group_replication_state (group_id, primary_server, flush_lsn, sync_streaming, without_sync, seen_at)
+					VALUES ($1, $2, nullif($3, ''), $4, $5, now())
+					ON CONFLICT (group_id) DO UPDATE SET primary_server = $2, flush_lsn = coalesce(nullif($3, ''), kingres_cp.group_replication_state.flush_lsn),
+						sync_streaming = $4, without_sync = $5, seen_at = now()`, p.Group, server, p.FlushLsn, streaming, p.Without); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		l.Log.Debug("standby: recording the replication state of the groups", "error", err)
+	}
+}
+
+// ensureEverywhere makes sure every ready, registered standby is also in the catalog of every sharded database (a
+// database made after the standby, or a registration that was refused for one database, is repaired here). Errors
+// are logged; the next check repeats. Groups in a failover are left alone.
+func (l *Leader) ensureEverywhere(ctx context.Context, t topology, recs []Record) {
+	ens, ok := l.Registrar.(interface {
+		EnsureEverywhere(ctx context.Context, e Entry) error
+	})
+	if !ok {
+		return
+	}
+	for _, r := range recs {
+		if r.State != stateReady || r.CatalogNode == nil || r.Port == 0 {
+			continue
+		}
+		g, ok := t.group(r.Group)
+		if !ok {
+			continue
+		}
+		if err := ens.EnsureEverywhere(ctx, r.Entry(g.Port)); err != nil {
+			l.Log.Warn("standby: registering a standby in the catalogs of the databases", "standby", r.ID, "group", r.Group, "error", err)
+		}
+	}
 }

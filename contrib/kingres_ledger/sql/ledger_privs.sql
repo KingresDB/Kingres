@@ -30,7 +30,7 @@ INSERT INTO pure_primitives VALUES
     ('ledger_leaf_hash'), ('ledger_node_hash'), ('ledger_merkle_accum'),
     ('ledger_merkle_final'), ('ledger_merkle_path'), ('ledger_tx_leaf'),
     ('ledger_block_tx_leaf'), ('ledger_block_hash'), ('ledger_block_preimage'),
-    ('ledger_genesis_hash'),
+    ('ledger_genesis_hash'), ('ledger_attestation_message'),
     ('ledger_timestamptz_us'), ('ledger_verify_proof'), ('ledger_hook_active'), ('ledger_binary_upgrade'),
     ('ledger_outer_user');
 

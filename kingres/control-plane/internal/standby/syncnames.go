@@ -62,13 +62,25 @@ func Names(planned []string) string {
 //     that reconnects within it never made the group wait), and emptied only after
 //     it, so that the group keeps accepting writes without its standby; that is
 //     reported (WithoutSynchronousStandby) until a standby streams again;
-//   - it is never emptied while a failover of the group is decided (Frozen);
+//   - it is never changed at all while a failover of the group is decided (Frozen);
 //   - a group that has no standby at all has an empty setting, at once.
 //
 // A setting that is empty because the group has not had a streaming standby yet
 // is not set before one streams: a new standby never makes the group wait for it
 // while its base backup catches up.
 func (s *SyncState) Decide(in SyncInput) SyncDecision {
+	d := s.decide(in)
+	// Nothing changes the list of a frozen group, in any branch (invariant I2 of the design, F2-01): not emptied, not
+	// replaced, not widened, and no name is added to an empty one. A failover reads the positions of the standbys the
+	// list names and picks the highest; a list that changed meanwhile could be acknowledged by a standby it did not read.
+	// The time without a streaming standby is still counted, so that the grace has passed when the freeze lapses.
+	if in.Frozen {
+		d.Set = nil
+	}
+	return d
+}
+
+func (s *SyncState) decide(in SyncInput) SyncDecision {
 	var d SyncDecision
 	want := Names(in.Planned)
 	if len(in.Planned) == 0 {

@@ -67,12 +67,11 @@ func (m *Manager) Adopt(group int32, kind string) error {
 	// the failover that asks (FO-10): the marker of the earlier hand-over is cleared, or a second failover of
 	// the same group would be refused for ever. An instance that runs here for the group is not told it may start:
 	// the start gate still waits for the lease.
-	if m.relinq[group] || markerExists(m.c.Dir, RelinquishedMarker, group) {
-		delete(m.relinq, group)
-		if err := os.Remove(MarkerPath(m.c.Dir, RelinquishedMarker, group)); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("lease: clearing the relinquished marker of shard group %d: %w", group, err)
-		}
-	}
+	// The renewal of the group starts again, but the marker file STAYS (F2-04): it is what keeps a directory that
+	// the role files still name primary for the group from being started by this server, which now holds the lease of
+	// the group as the fence holder or as the holder-to-be. Only Attach (the instance of this adoption is the primary)
+	// and Unrelinquish (a cancelled hand-over) remove it.
+	delete(m.relinq, group)
 	if cur := m.adopted[group]; cur != nil {
 		if cur.attached {
 			return nil
@@ -128,8 +127,16 @@ func (m *Manager) Attach(group int32) error {
 		m.mu.Unlock()
 		return fmt.Errorf("lease: shard group %d is not adopted", group)
 	}
+	st := m.groups[group]
+	if st == nil || !st.have || st.lost || m.c.Clock.Mono() >= st.validUntil-m.c.Margin {
+		m.mu.Unlock()
+		return fmt.Errorf("lease: the lease of shard group %d is not held: the instance is not attached", group)
+	}
 	a.attached = true
 	m.mu.Unlock()
+	if err := os.Remove(MarkerPath(m.c.Dir, RelinquishedMarker, group)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("lease: clearing the relinquished marker of shard group %d: %w", group, err)
+	}
 	m.writeWatchdogFile(group)
 	m.ensureWatchdog(group)
 	return nil
@@ -266,6 +273,12 @@ func (m *Manager) ReleaseGroup(ctx context.Context, group int32) (TransferResult
 	}
 	// The group is marked first and the round in flight is waited for: after that no renewal of this group is on
 	// its way to a grantor (FO-13). A release that did not reach a majority puts the mark back.
+	// The marker is on disk before the first release request (as Transfer does at its end), so that a restart of
+	// kingresd in the middle of a release does not renew, or start a primary, for a group that was given away (F2-03).
+	markerBefore := markerExists(m.c.Dir, RelinquishedMarker, group)
+	if err := pki.WriteFile(MarkerPath(m.c.Dir, RelinquishedMarker, group), []byte("released\n"), 0o600); err != nil {
+		return TransferResult{}, fmt.Errorf("lease: writing the relinquished marker: %w", err)
+	}
 	m.mu.Lock()
 	was := m.relinq[group]
 	m.relinq[group] = true
@@ -277,6 +290,9 @@ func (m *Manager) ReleaseGroup(ctx context.Context, group int32) (TransferResult
 		m.mu.Lock()
 		if !was {
 			delete(m.relinq, group)
+		}
+		if !markerBefore {
+			_ = os.Remove(MarkerPath(m.c.Dir, RelinquishedMarker, group))
 		}
 		m.mu.Unlock()
 		return TransferResult{}, errors.New("lease: the members of the cluster are not known")
@@ -312,6 +328,9 @@ func (m *Manager) ReleaseGroup(ctx context.Context, group int32) (TransferResult
 		m.mu.Lock()
 		if !was {
 			delete(m.relinq, group)
+		}
+		if !markerBefore {
+			_ = os.Remove(MarkerPath(m.c.Dir, RelinquishedMarker, group))
 		}
 		m.mu.Unlock()
 		return res, fmt.Errorf("lease: only %d of the %d grantors needed released the lease of shard group %d", granted, need, group)

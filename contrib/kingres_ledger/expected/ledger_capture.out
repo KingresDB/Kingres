@@ -95,7 +95,7 @@ SELECT count(*) AS tables, (SELECT count(*) FROM kingres.ledger_entry) AS entrie
 FROM kingres.ledger_table;
  tables | entries | pending 
 --------+---------+---------
-      1 |       0 |       0
+      4 |       0 |       0
 (1 row)
 
 SELECT tgname FROM pg_trigger WHERE tgrelid = 'accounts'::regclass AND NOT tgisinternal;
@@ -117,11 +117,14 @@ SELECT t.relid::regclass AS relid, t.mode,
        (SELECT count(DISTINCT ledger_txid) FROM kingres.ledger_entry) AS transactions,
        (SELECT count(*) FROM kingres.ledger_pending) AS pending
 FROM kingres.ledger_table t;
-   relid   |    mode     | entries | transactions | pending 
------------+-------------+---------+--------------+---------
- with_enum | append_only |       2 |            1 |       1
- accounts  | append_only |       2 |            1 |       1
-(2 rows)
+                relid                 |    mode     | entries | transactions | pending 
+--------------------------------------+-------------+---------+--------------+---------
+ kingres.ledger_client_key            | append_only |       2 |            1 |       1
+ kingres.ledger_client_key_revocation | append_only |       2 |            1 |       1
+ kingres.ledger_attestation           | append_only |       2 |            1 |       1
+ with_enum                            | append_only |       2 |            1 |       1
+ accounts                             | append_only |       2 |            1 |       1
+(5 rows)
 
 -- The triggers are installed and armed ENABLE ALWAYS.
 SELECT tgname, tgenabled

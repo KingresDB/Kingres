@@ -27,7 +27,7 @@ use Test::More;
 use File::Path ();
 use Time::HiRes qw(time sleep);
 use KsProxy;
-use KsSweep qw(sweep_call chunk_max);
+use KsSweep qw(sweep_call chunk_max sweeps);
 use KingresShardTest qw(make_node make_cluster make_standby register_standby run_sql release_node);
 
 my $T = 2;
@@ -108,6 +108,9 @@ sub repeat_promote
 }
 
 # --- the isolation level, once -----------------------------------------------------------------------------
+my $silent = !$ENV{KS_SWEEP_SCENARIO} || $ENV{KS_SWEEP_SCENARIO} =~ /silent/;	# the fixed sequences run with the default scenario only
+
+if ($silent)
 {
 	my $f = build();
 	my ($rc, $out, $err) = call($f, "SET default_transaction_isolation = 'repeatable read';\nSELECT kingres.promote_node(4)");
@@ -140,9 +143,10 @@ foreach my $which ('participant', 'target')
 		state => sub { return { m => roles($f->{m}), p => roles($f->{p}), sb => roles($f->{sb}) }; },
 		cleanup => sub { },
 		repeat => sub { return repeat_promote($f); },
-		bound => 3 * $T + 12 + $C + 8,
+		bound => 2 * $T + 8 + $C,
+		left_if_left => 1,
 	};
-	$results{$which} = sweep_call($c, undef);
+	$results{$which} = sweeps($c);
 	teardown($f);
 	$f = undef;
 }
@@ -152,6 +156,7 @@ foreach my $which ('participant', 'target')
 # second rotation is refused (KS014) while it is kept and a standby cannot be reached with the current
 # secret.  The dead primary (a standby of the catalog after the promotion) and a standby that still
 # streams from it are such standbys.  The way out of the README: take them out with remove_node().
+if ($silent)
 {
 	my ($map, $g1, $g2) = make_cluster('rf', 3, replication => 1, extra => $conf);
 	my $sb = make_standby($g1, 'rf_s1');

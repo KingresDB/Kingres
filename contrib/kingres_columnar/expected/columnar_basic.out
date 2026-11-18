@@ -13,9 +13,9 @@ SELECT count(*) FROM b1;
 (1 row)
 
 SELECT * FROM kingres.columnar_info('b1');
- stripes | chunk_groups | rows | bytes_on_disk | bytes_uncompressed | compression_ratio 
----------+--------------+------+---------------+--------------------+-------------------
-       0 |            0 |    0 |             0 |                  0 |                  
+ stripes | chunk_groups | rows | bytes_on_disk | bytes_uncompressed | compression_ratio | unreferenced_bytes 
+---------+--------------+------+---------------+--------------------+-------------------+--------------------
+       0 |            0 |    0 |             0 |                  0 |                   |                  0
 (1 row)
 
 INSERT INTO b1 VALUES (1, 'one', 1.5);

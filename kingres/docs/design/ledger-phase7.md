@@ -2693,6 +2693,73 @@ build to the corrected rule. The verifier's README has the same list with the re
     any file of the server and are listed among the roles that can drop the database; roles with ADMIN
     OPTION on those two are listed among those that can make themselves able to. The other predefined
     roles of 18 and 19 are not listed, each for a reason the README gives.
+111. **The identifiers of the three tables of the client signatures (3.7, 8.1; adds to 66 and 77).**
+    The tables of keys, revocations and attestations are registered in `ledger_table` with the next
+    free identifier under the lock of the registry (the maximum plus one, no sequence): 1 to 3 in a
+    new database, after the user's tables in a database that is upgraded. The script cannot name the
+    number, because the capture trigger carries it as its argument, so `ledger_register_internal`
+    arms the trigger itself, and the hook lets through exactly the two statements it issues, for one
+    of the three names, only while the install or upgrade script of the extension runs. Any other
+    statement, and the same text at any other time, is refused as before. No code, test or verifier
+    may assume a number: the tables are found by name.
+112. **What "a table under ledger control" means (adds to 51).** The three tables are in the
+    registry from the start, so an empty registry no longer means "no ledger". The rules that hold
+    "while tables are under ledger control" (a drop through a dependency, `DROP EXTENSION`,
+    `DROP SCHEMA`, `DROP OWNED`) count the three tables only while they hold a row (a key, a
+    revocation, an attestation), because those rows are entries of the chain. A database with no
+    ledger table of a user and no row in the three drops the extension as before; once a key is
+    registered nothing drops it. The tables themselves are catalog tables of the ledger from the
+    moment they exist: `DROP`, `TRUNCATE`, `ALTER`, `LOCK`, a foreign key, a `GRANT` other than
+    `SELECT`, a trigger or an index on them is refused.
+113. **The switch to `required` has a date, and it is the one update of the registry (3.7).**
+    Without a date `ledger_verify` would report every older entry of a table for ever. `ledger_table`
+    has a column `signature_required_from` (the top-level transaction that switched the policy;
+    NULL while it is optional), tied to the policy by a constraint. `unattested_entry` covers the
+    entries of transactions after that one; the switching transaction itself is covered by the check
+    at commit. A transaction that was already running at the switch can be reported once. The switch
+    is the only UPDATE of a catalog table of the ledger that the code of the extension makes: a fixed
+    statement under the marker of the guard, and the blocking trigger lets through exactly "optional
+    to required, with the date set from NULL". Neither value is hashed, so a superuser who edits the
+    catalog can switch it back; the README says so.
+114. **Arguments and errors of the new functions (3.7).** Beside `KL010` to `KL014`: a malformed
+    length, an operation other than I or D, a negative table identifier or an unknown policy is
+    `22023`, and a signature that is not 64 bytes is `KL013`; a NULL argument is `22004` (a call that
+    does nothing must not look done); a relation not under ledger control is `42P01`, a table of the
+    ledger itself `0A000`, a table the caller does not own `42501`; a key registered twice, revoked
+    or not, is `23505`, an unknown role `42704`, a label or reason over 200 characters `22001`;
+    revoking an unknown or an already revoked key is `KL012`. `KL011` also covers "every entry for
+    this row version is attested already". `ledger_attest` attests the entry with the lowest `seq`
+    for that table, operation and hash that has no attestation yet, so two identical rows in one
+    transaction need two calls, and an entry is attested once.
+115. **What the key check reads (3.7, 3.8).** The key and its revocation are read with the latest
+    snapshot, whatever the isolation level of the caller: a key whose revocation is committed is
+    refused to a transaction that began before the revocation. The role of a key is compared with
+    the user the call is made as, so `SET ROLE` counts and membership does not. The check at the
+    call is a convenience; the rule of the verifier by block height decides.
+116. **`ledger_status` (8.1).** `append_only_tables` and `updatable_tables` keep their meaning, the
+    tables of users only. The three columns of 8.1 are appended at the end: `client_keys_active`,
+    `attestations`, `required_tables`. A reader that counts the rows of `ledger_table` counts the
+    three tables of the extension too and must leave them out.
+117. **No lock, and no statement of its own (adds to 108).** `ledger_client_key_register`,
+    `ledger_client_key_revoke`, `ledger_attest` and `ledger_set_signature_policy` take no lock of
+    the extension, since no identifier is allocated, so rule 108 does not apply to them, and
+    `ledger_attest` has to run in the writing transaction: in a block, after a savepoint, in an
+    EXCEPTION block. `ledger_register_internal` takes the lock of the registry like
+    `ledger_register_table`, and only the scripts can call it.
+118. **Cost (9.7; replaces "tens of microseconds").** One Ed25519 verification takes about 90
+    microseconds on the build machine; a call of `ledger_attest` adds about 175 microseconds to the
+    insert it attests (with its statements prepared and kept; run as text they added about 400). A
+    write without an attestation is unchanged, except that the first write of a table in a
+    transaction reads the policy in the same statement as the identifier.
+119. **What `ledger_verify` checks (3.7).** The three tables are compared with their entries like
+    every ledger table, so a deleted, changed or inserted row is found. New checks:
+    `attestation_duplicate`, `client_key_unknown` (also for a revocation of a key that is not
+    registered), `client_key_id` (a key row whose identifier is not the hash of its public key),
+    `attestation_orphan`, `unattested_entry`. `ledger_verify` does not verify signatures; that is
+    the work of the standalone verifier, from the proof of the entry and of the key.
+120. **A server without OpenSSL (3.7).** Only `ledger_attest` needs OpenSSL and raises `0A000`
+    without it; the registry, the message, the policy and every check work. A table whose policy is
+    `required` cannot be written on such a server (`KL010`).
 
 Of section 13: item 2 (test vectors) is settled for signed notes (the example key and note of the
 specification are in the tests; the checkpoint example has no published key), item 3 (entry bundles at

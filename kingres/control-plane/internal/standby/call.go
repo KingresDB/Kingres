@@ -21,7 +21,7 @@ const (
 )
 
 // Calls lists the keys, for registration.
-var Calls = []string{CallPlan, CallCreate, CallRemove, CallRebuild, CallStatus}
+var Calls = []string{CallPlan, CallCreate, CallRemove, CallRebuild, CallStatus, CallRepoint}
 
 // HandleCall answers one internal call with the raw JSON body. The caller (the
 // leader) was authorized by the internal API; the same function serves the leader's
@@ -67,6 +67,8 @@ func (a *Agent) HandleCall(ctx context.Context, key string, body []byte) (res an
 		return res, mapErr(err)
 	case CallStatus:
 		return a.Status(ctx), nil
+	case CallRepoint:
+		return a.handleRepoint(ctx, body)
 	case CallFreeze, CallUnfreeze, CallStandbysGone:
 		return a.handleFreezeCall(ctx, key, body)
 	}

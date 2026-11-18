@@ -157,7 +157,7 @@ CREATE TABLE p_bare (id int);
 -- (it is not named like the triggers of the ledger, so the protection lets it be created).
 CREATE TRIGGER p_dup AFTER INSERT ON docs FOR EACH ROW EXECUTE FUNCTION kingres.ledger_capture('7');
 INSERT INTO docs VALUES (999, 'forged entries');
-ERROR:  ledger trigger of table "docs" has table id 7, the ledger has 1
+ERROR:  ledger trigger of table "docs" has table id 7, the ledger has 4
 DROP TRIGGER p_dup ON docs;
 -- ...or register the table by hand with an identity that was never issued, or
 -- before it has the triggers of a ledger table.

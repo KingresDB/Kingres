@@ -330,7 +330,7 @@ paths; what is not done is in "Not done in this increment"). "Real" means the op
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **98 of 100 operations are real; 2 answer "not yet".**
+authenticated operation lists in 0.2.0. **102 of 104 operations are real; 2 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -349,11 +349,11 @@ authenticated operation lists in 0.2.0. **98 of 100 operations are real; 2 answe
 | Metrics | `queryMetrics` |  |
 | Query | `executeQuery`, `cancelStatement` |  |
 | Rebalance | `getRebalanceStatus`, `startRebalance`, `previewRebalancePlan`, `listRebalanceReports`, `getRebalanceReport`, `stopRebalance` |  |
-| Replication | `getReplicationTopology` | `restorePreferredPrimaries` |
+| Replication | `getReplicationTopology`, `getFailoverStatus`, `listFailoverReports`, `getFailoverReport` | `restorePreferredPrimaries` |
 | Server groups | `listServerGroups`, `createServerGroup`, `deleteServerGroup` |  |
-| Servers | `listServers`, `getServer`, `addServer`, `removeServer`, `updateServer`, `renewServerCertificates`, `revokeServerCertificates` | `failoverServer` |
+| Servers | `listServers`, `getServer`, `addServer`, `removeServer`, `updateServer`, `renewServerCertificates`, `revokeServerCertificates`, `failoverServer` |  |
 | Configuration | `listConfigParameters`, `getConfigParameter`, `previewConfigChange`, `applyConfigChange`, `listConfigChanges`, `revertConfigChange`, `listConfigServers`, `getConfigSummary`, `getClusterTime`, `listTimeZones`, `restartPendingInstances` |  |
-| Settings | `getClusterSettings`, `updateClusterSettings` |  |
+| Settings | `getClusterSettings`, `updateClusterSettings` | `resetAutoFailoverCounter` |
 | Network access | `getNetworkAccess`, `replaceNetworkAccess` |  |
 | Setup | `initCluster`, `joinCluster`, `getNodeState`, `checkSetupToken` |  |
 | Tasks | `listTasks`, `getTask`, `cancelTask` |  |
@@ -2027,7 +2027,7 @@ What exists (design `ha-phase5.md`, "Fencing by lease"; code in `internal/lease`
 - **Watchdog.** `kingres-watchdog` (standard library only, about 90 lines) covers a dead or hung `kingresd` next to a
   live primary. For an enforced group kingresd starts it after the first successful round, detached in its own session
   (a signal to kingresd's process group does not reach it; it takes an exclusive lock so one runs per instance). After every
-  renewal kingresd replaces `<data-dir>/instances/1/lease.json` with `{"seq": N, "validMs": V}`: `seq` changes with every
+  renewal kingresd replaces `<data-dir>/instances/<id>/lease.json` of the instance (one per primary instance; `{"seq": N, "validMs": V}`, or `{"off": true}` for an instance that is not a primary now): `seq` changes with every
   write and `V` is how long the lease still lets the primary run (round start plus duration minus margin, minus the time
   since). The file contains **no time of day**. The watchdog polls it every 250 ms, remembers on its own monotonic clock
   when it last saw `seq` change, and when `V` has passed since then it writes the fence marker and stops the instance
@@ -2055,8 +2055,8 @@ write was acknowledged 3.4 s after the cut and the lease was free 7.4 s after it
 A holder that is paused (SIGSTOP, a stalled virtual machine) and resumed does not trust its past: every judgement uses
 the monotonic clock, which keeps running while the process is stopped, and a lease obtained by a round that started
 before the pause is valid from that start only, so answers that arrive late give a lease that is already over. While it
-is paused the watchdog does its job. A step of the system clock does not matter because no decision reads it
-(`clock.Clock.Mono`); the tests step the wall clock of a server through the fault hook and see nothing change.
+is paused the watchdog does its job. A step of the system clock does not matter for a lease, the watchdog or a session check because no decision of theirs reads it
+(`clock.Clock.Mono`); the freeze file, the task lease in the system database and the proof of a forwarded request do read wall clocks (see the review F2-15); the tests step the wall clock of a server through the fault hook and see nothing change.
 
 #### Settings (flags, environment, file keys)
 
@@ -2746,8 +2746,7 @@ Separate from the increments above (own files and tests; see the report of the w
   `Manager.Fence` does not take `m.op` (a start holds it); a start that was under way when a fence arrived is stopped again when it returns
   (the marker the fence wrote is there). Tests: `TestTheLifecycleLockWaitEndsWithTheContext`, `TestAFenceDoesNotWaitForAStartAndTheStartDoesNotSurviveIt`.
 - **ST-12, statements that were not true:** the text of RBR-05 above is corrected.
-- **Not done in this step:** ST-05 (rows left by an earlier holder are still found by comparing the system database's clock with the
-  extension's), ST-06 (retried `StartMove` and `AddSkipped` can still duplicate a row), ST-07, ST-08, ST-09 (the mutants), ST-10, ST-11, ST-13.
+- **Not done in this step:** ST-11, ST-13. ST-05 to ST-10 were fixed by the next round (see "Rebalancing after the second review" and the review of 2026-11-18).
 
 ### Review FO-01 to FO-16 of 2026-11-17 (the failover increments 0 to 2): what was fixed in this step
 
@@ -2778,3 +2777,79 @@ Separate from the increments above (own files and tests; see the report of the w
   catalog. FO-16, the removal that deletes the instance before the primary applied the list without it, stays bounded by the grace period.
 - **Fencing under a stall** (`internal/clustertest/fencing_stall_test.go`): two grantors stalled with SIGSTOP for longer than the margin fence the third
   server's primary within the bound, nothing becomes a primary, and it comes back by itself; a stalled leader fences only its own primary.
+
+## Failover of an ordinary group (increment 3 of ha-phase5-part2.md, contract 0.10.0)
+
+`POST /servers/{serverId}/failover` with `mode: hard` fails over every shard group whose primary runs on the server (or the groups of
+`shardGroupIds`), one at a time, as the task `server.failover`. Refused with `422 unsupported_operation` in this increment: `mode: graceful`, the map
+group (group 0), `restorePreferredPrimaries`, `resetAutoFailoverCounter`, automatic failover (the setting is accepted and does nothing, as before).
+Code: `internal/failover` (the task, the choice, the repeat loop of `promote_node`, the report), `cmd/kingresd/failover.go` (the ports over the peer client,
+the extension and the records, and the callee side of the calls), `internal/standby/failover.go` (`Repoint`, `EmptySyncNames`), `internal/httpapi/handlers_failover.go`.
+
+### The task, step by step
+
+The steps of a group are named `Group <n>: <step>`; each is a no-op on its second execution (it reads what exists first) and a time-out of a call is
+read as "the call did not finish": the step asks the callee for its state and then decides.
+
+| Step | What it does, and what it does on a repeat |
+|---|---|
+| `Check that the failover can start` | The refusals of the request again (`Preflight`), then the run's records and, for a dead server, `standbys-gone` to the other primaries. A repeat finds the record of the run and does nothing. |
+| `Freeze the group` | Sends the freeze to the old primary's server and reads it back with `GET /failover/state` (it lapses, and a wall clock set forward can end it early); every later step that relies on it sends it again. An unreachable server needs none. |
+| `Stop the old primary` | `POST /failover/demote`: relinquish, immediate stop, confirmed, and only then the hand-over of the lease to the leader. Skipped when the server does not answer (the lease fences it). **Irreversible: the task is not cancellable from here (`Task.cancellable` false); this is earlier than the design's promotion, because from the stop on the group has no primary.** |
+| `Wait for the old lease` | The leader adopts the lease as the fence holder and waits (25 s) for a majority of grantors; `lease_still_held` when the grantors still renew the old holder, `lease_held_elsewhere` otherwise; without a majority it waits a minute and pauses. "Fenced" is the lease, never a timeout of the step. |
+| `Choose the standby` | Reads the positions of every ready standby twice, a second apart, until they stop moving; a standby out of recovery is a promotion already made (pinned; two of them stop the task with `split_promotion`); `Choose` orders by the larger of the received and the replayed position (the received one is empty when no walreceiver has run), then synchronous state, preferred server, ring, id. The verdict (`none`, `asyncOnly`, `possible`, `unknown`) must be accepted by `allowDataLoss`, or the task pauses with the alert `failoverNeedsDecision`. The choice is pinned once in `failover_group` and a repeat never chooses again. |
+| `Hand the lease to the new server` | The new server holds the lease before it is promoted: a transfer from the fence holder, then `holder` adoption on the new server (3 tries of 15 s). A repeat sees that the new server already holds it. |
+| `Promote the standby` | `POST /failover/promote`: empty list, role file (primary) written first, lease checked as the last thing before `pg_promote`, then `Attach` (watchdog). `lease_not_held` goes back to the hand-over once; `not_standby` withdraws the pin. **Irreversible, not `NonIdempotent`.** |
+| `Make the catalog follow` | `kingres.promote_node` repeated by the README rules of the extension (`promote.go`: 10 calls, 15 minutes, the answers by SQLSTATE; `KS007` only after a probe, `KS014` and `KS012` ask the operator, `KS009` for the new primary re-applies the empty list). |
+| `Check the catalog` | Reads the result back (a success of `promote_node` is not proof for a node that went silent at the end): the new node is the primary, the old one is not, the term rose; repeats the call once, then pauses. Stops an old primary that is still running (`oldPrimaryRunning`). |
+| `Point the other standbys at the new primary` | `POST /standby/repoint` per standby (slot on the new primary, `primary_conninfo`, wait for the walreceiver); a standby that does not stream is flagged for a rebuild. |
+| `Update the standby records` | One transaction that proves the lease of the run: the record of the promoted standby is deleted, the others follow the new primary; the plan is sent. The old primary's record is **not** inserted: its return is the next increment. |
+| `Check synchronous_standby_names`, `Resolve prepared transactions`, `Check that clients arrive` | Waits (bounded) that never fail the task; `recover_prepared_transactions()` and `check_cluster()` on the map group primary, incidents into the report, the alert `failoverDataLoss`. |
+| `Lift the freeze`, `Write the report` | Unfreeze, group `done`, the run's outcome. |
+
+The records are `failover_run`, `failover_group` and `failover_event` (migration 0011); every write proves holder, epoch and lease of the task run
+(`PGRows`), so a superseded run records nothing. The standby leader leaves the groups of an unfinished run alone (`Leader.Busy`), and records every 10
+seconds what it saw of each group's primary (`group_replication_state`: flush position, whether a synchronous standby streamed), which is the "last
+known position of the old primary" of the report and the base of the verdict.
+
+### Decisions of this increment
+
+- The control calls (`promote_node`, `recover_prepared_transactions`, `check_cluster`, the reads) each open a session of their own at READ COMMITTED with
+  one statement and a named deadline (`promoteNodeDeadline`, `shortControlDeadline`) derived from `kingres_shard.node_timeout`.
+- The internal API is not versioned for the new calls: an older server answers `404 not_found`, which is "older version" (the request is refused with
+  `version_mismatch` when a member does not report its lease settings), and `no_instance` stays a real answer.
+- The verdict reads the durability of every user database for every group (a sharded database has buckets in all groups; a database that is not
+  sharded lives in the map group).
+- A failover is refused while a rebalance is pending or running (`rebalance_in_progress`): this increment does not stop it for the operator.
+- `recover_prepared_transactions()` runs on the map group primary and on the promoted instance (`POST /failover/prepared`).
+- Not done in this increment: a rollback of a failover that was cancelled after the old primary was stopped (not offered), the
+  rebuild of the old primary (the record is not inserted; its instance stays stopped and fenced).
+
+## Fixes for the independent review F2-01 to F2-17 (2026-11-18)
+
+Done, each with a test that fails without it: **F2-01** (`SyncState.Decide` returns no change at all for a frozen group; `f2_01_test.go`),
+**F2-12** (the freeze carries task and epoch, a lower epoch of the same task is refused with 409 `fenced`, a freeze that cannot be written
+is an error to the caller, the owner survives a restart; `f2_12_test.go`), **F2-03** (the release writes its marker before its first
+request), **F2-04** (`Adopt` keeps the marker file, so the old primary directory stays held back; `Attach` and `Unrelinquish` remove it),
+**F2-11** (`Attach` before the lease is held is an error), **F2-05** (a stop that failed is repeated every `FenceRetry`, `Enforced` is read at
+every check, `Config.OnFenceFailed` is called on every failure; the alert itself is not wired), **F2-07** (the watchdog file of a group that is
+not enforced is refreshed by a loop of its own, the rule being: a group without a standby is stopped for a lapsed lease by nothing, only for a
+kingresd that stopped running), **F2-10** (the read-back also happens in the `42710` branch, and a dead server is skipped instead of blocking),
+**F2-13** (`lease.LockHeld`, `GET /failover/state` reports `watchdog`, the failover refuses an old primary that runs without one, no fork
+while an old watchdog holds the lock), **F2-17** (the cause is not the clock; see below).
+
+Partly: **F2-02** (a round checks `mayRenew` under the round lock; no deterministic test, the race needs a hook in `Renew`).
+
+Not done: **F2-06** (fail closed for a directory that cannot be attributed to a group), **F2-08** (the positive mark of an unfinished copy,
+the two untested legs of `provedStandby`, the promote under the agent's lock), **F2-09** (the exclusion of a failover and an operation in flight
+in both directions, and an operation on an enforced primary that does not run when its record cannot be written), **F2-14** (statements of the
+design), **F2-16** (tests against the real extension, two groups on one server in the lease tests, the surviving mutants).
+
+**The 503 of the clock subtest (F2-17).** The cause found in the logs of a failing run on PostgreSQL 19 is not the restart delay the review
+read: node 1's kingresd lost the lease of its group and fenced the primary (`pg_ctl` immediate shutdown at 06:16:38.751), and in the same
+instant a round won the lease again and started the instance, which was still running, so the start did nothing; the stop then ended it, the
+markers the start had removed left nothing to start it again, and the instance stayed down although the lease was held (the log said "the
+group lease is held: the primary instance was started" and the following reads were refused with connection refused for thirty seconds). The
+clock was not involved. Fix: `Manager.Fence` marks the group as being fenced until its stop has ended and `acquired` does not start the
+instance while it is (the marker stays, the next round starts it); `TestARoundThatWinsTheLeaseDuringAFenceStartsTheInstanceAfterTheStop`. The
+subtest also waits for the lease to be freshly held before it steps the clock.

@@ -105,7 +105,7 @@ SELECT count(*) AS problems_after_restore FROM kingres.ledger_verify();
 -- ledger_status
 --------------------------------------------------------------------------
 SELECT count(*) AS rows FROM kingres.ledger_status;
-SELECT append_only_tables = (SELECT count(*) FROM kingres.ledger_table WHERE mode = 'append_only') AS append_only_count,
+SELECT append_only_tables = (SELECT count(*) FROM kingres.ledger_table t WHERE t.mode = 'append_only' AND NOT kingres.ledger_is_member('pg_class'::regclass, t.relid::oid)) AS append_only_count,
        updatable_tables = (SELECT count(*) FROM kingres.ledger_table WHERE mode = 'updatable') AS updatable_count,
        latest_block_height = (SELECT max(height) FROM kingres.ledger_blocks) AS latest_block,
        latest_block_hash = (SELECT block_hash FROM kingres.ledger_blocks ORDER BY height DESC LIMIT 1) AS latest_hash,

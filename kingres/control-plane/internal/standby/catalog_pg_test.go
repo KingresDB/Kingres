@@ -97,3 +97,28 @@ func TestTheReadBackOfARemovalReadsEveryPrimary(t *testing.T) {
 		t.Fatalf("the row of another port was removed: %d %v", n, err)
 	}
 }
+
+// F2-10: a primary on a dead server cannot be read and must not block the registration or the removal of a standby (a
+// failover removes the standbys of the dead primary); a primary that answers is still read.
+func TestADeadServerIsNotReadBack(t *testing.T) {
+	ctx := context.Background()
+	coord := pgtest.Start(t, nil)
+	other := pgtest.Start(t, nil)
+	stubCatalog(t, coord, true)
+	stubCatalog(t, other, false) // the dead server's copy has not got the row and cannot be asked
+	r := &PGRegistrar{
+		Conn: func(ctx context.Context) (*pgx.Conn, error) { return pgx.Connect(ctx, coord.DSN("postgres")) },
+		Remote: func(ctx context.Context, _ string, _ int) (*pgx.Conn, error) {
+			return pgx.Connect(ctx, other.DSN("postgres"))
+		},
+		Skip: func(host string) bool { return host == "p1" },
+	}
+	e := Entry{ID: 7, Group: 1, Server: "s1", Port: 7101}
+	if id, err := r.Register(ctx, e); err != nil || id != 2 {
+		t.Fatalf("a registration blocked by a dead server: %d %v", id, err)
+	}
+	r.Skip = nil
+	if _, err := r.Register(ctx, e); err == nil {
+		t.Fatal("a primary that is not skipped must still be read")
+	}
+}

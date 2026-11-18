@@ -50,6 +50,7 @@ func startFailoverCalls(d *haDeps) error {
 		}
 		return failoverState(ctx, d, g), nil
 	})
+	registerFailoverCallee(d)
 	if d.Standby != nil {
 		for _, key := range standby.FreezeCalls {
 			d.Calls.Register(key, func(ctx context.Context, _ string, body []byte) (any, error) {
@@ -229,6 +230,9 @@ type StateAnswer struct {
 	CatalogTerm  *int64          `json:"catalogTerm"`
 	Prepared     *int            `json:"preparedTransactions"`
 	Destination  string          `json:"destination,omitempty"`
+	// Watchdog says whether a watchdog of the group's primary instance runs here (nil: this server runs no primary of the
+	// group, or does not know). A failover reads it before it counts the primary as fenceable by a lease alone.
+	Watchdog *bool `json:"watchdog"`
 }
 
 func failoverState(ctx context.Context, d *haDeps, group int32) StateAnswer {
@@ -268,6 +272,10 @@ func failoverState(ctx context.Context, d *haDeps, group int32) StateAnswer {
 				out.Frozen = true
 			}
 		}
+	}
+	if serving != nil && serving.Role.Writable() && d.Watchdogs != nil {
+		w := d.Watchdogs.running(group)
+		out.Watchdog = &w
 	}
 	if serving != nil {
 		out.CatalogTerm = catalogTerm(ctx, d, serving.ID)

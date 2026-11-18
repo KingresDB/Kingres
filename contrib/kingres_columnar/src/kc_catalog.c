@@ -47,6 +47,7 @@
 #include "storage/smgr.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -85,7 +86,6 @@ typedef struct KcCatSnap
 
 static Oid	cached_catalog_oid = InvalidOid;
 static Oid	cached_index_oid = InvalidOid;
-static Oid	cached_am_oid = InvalidOid;
 
 /* ------------------------------------------------------------------------
  * Finding the catalog objects
@@ -134,15 +134,99 @@ kc_catalog_index_oid(void)
 	return cached_index_oid;
 }
 
-Oid
-kc_am_oid(void)
+/*
+ * Whether an access method is this extension's, decided the way the relation
+ * cache decides it for a table (rd_tableam == kc_get_routine()): by what the
+ * handler of the access method returns, not by the name of the access method.
+ * A superuser may create a second access method over the handler
+ * (CREATE ACCESS METHOD columnar2 TYPE TABLE HANDLER kingres.columnar_handler),
+ * and a table of it is a columnar table for every read and write; the name
+ * "columnar" would leave it out of the check, the cleanup of the stripe
+ * catalog and the planner's path (C11-02).
+ *
+ * KC_AM_UNKNOWN: there is no such access method for this transaction's
+ * catalog snapshot (a relation of a transaction that has not committed, the
+ * invalid oid).  A caller that deletes things on the strength of the answer
+ * must treat it as "cannot say" and delete nothing.
+ */
+/*
+ * The answers are kept for the planner's sake (every base relation of every
+ * query asks), a few access methods at most, and dropped whenever the access
+ * method or the function catalog changes (a function can be replaced under
+ * the same oid, an access method dropped and its oid used again).  Only
+ * definite answers are kept: "unknown" depends on what this transaction can
+ * see.
+ */
+#define KC_AM_CACHE_SIZE 8
+static struct
 {
-	if (OidIsValid(cached_am_oid) &&
-		SearchSysCacheExists1(AMOID, ObjectIdGetDatum(cached_am_oid)))
-		return cached_am_oid;
-	cached_am_oid = GetSysCacheOid1(AMNAME, Anum_pg_am_oid,
-									CStringGetDatum(KC_AM_NAME));
-	return cached_am_oid;
+	Oid			amoid;
+	KcAmClass	cls;
+}			kc_am_cache[KC_AM_CACHE_SIZE];
+static int	kc_am_cache_n = 0;
+static int	kc_am_cache_next = 0;
+
+static void
+kc_am_cache_inval(Datum arg, int cacheid, uint32 hashvalue)
+{
+	kc_am_cache_n = 0;
+	kc_am_cache_next = 0;
+}
+
+void
+kc_am_cache_init(void)
+{
+	CacheRegisterSyscacheCallback(AMOID, kc_am_cache_inval, (Datum) 0);
+	CacheRegisterSyscacheCallback(PROCOID, kc_am_cache_inval, (Datum) 0);
+}
+
+KcAmClass
+kc_am_class(Oid amoid)
+{
+	HeapTuple	tup;
+	Form_pg_am	am;
+	KcAmClass	result;
+	int			i;
+
+	if (!OidIsValid(amoid))
+		return KC_AM_UNKNOWN;
+	for (i = 0; i < kc_am_cache_n; i++)
+		if (kc_am_cache[i].amoid == amoid)
+			return kc_am_cache[i].cls;
+	tup = SearchSysCache1(AMOID, ObjectIdGetDatum(amoid));
+	if (!HeapTupleIsValid(tup))
+		return KC_AM_UNKNOWN;
+	am = (Form_pg_am) GETSTRUCT(tup);
+	if (am->amtype != AMTYPE_TABLE || !OidIsValid(am->amhandler))
+		result = KC_AM_OTHER;
+	else
+		result = (GetTableAmRoutine(am->amhandler) == kc_get_routine()) ?
+			KC_AM_COLUMNAR : KC_AM_OTHER;
+	ReleaseSysCache(tup);
+	kc_am_cache[kc_am_cache_next].amoid = amoid;
+	kc_am_cache[kc_am_cache_next].cls = result;
+	kc_am_cache_next = (kc_am_cache_next + 1) % KC_AM_CACHE_SIZE;
+	if (kc_am_cache_n < KC_AM_CACHE_SIZE)
+		kc_am_cache_n++;
+	return result;
+}
+
+/* kc_am_class with the answer for the last access method kept, for a loop over pg_class */
+KcAmClass
+kc_am_class_memo(Oid amoid, KcAmMemo *memo)
+{
+	if (!OidIsValid(memo->amoid) || memo->amoid != amoid)
+	{
+		memo->cls = kc_am_class(amoid);
+		memo->amoid = amoid;
+	}
+	return memo->cls;
+}
+
+bool
+kc_am_is_columnar(Oid amoid)
+{
+	return kc_am_class(amoid) == KC_AM_COLUMNAR;
 }
 
 bool
@@ -166,15 +250,48 @@ kc_rel_is_columnar(Relation rel)
  * stripes of aborted or running writers are never read.  *is_mvcc tells
  * whether the caller's snapshot was an MVCC one.
  */
+/*
+ * A private copy of a snapshot, with its own copy of the lists of running
+ * transactions.  The snapshot GetLatestSnapshot() hands out is a static one
+ * whose arrays the next call overwrites: a shallow copy kept across two calls
+ * (the orphan step takes one before the scan of pg_class and one after it)
+ * would see the second one's running transactions with the first one's
+ * bounds, and call a transaction that committed in between "still running"
+ * for one snapshot and "committed" for the other (C11-01).
+ */
+static KcCatSnap *
+kc_catsnap_copy(const SnapshotData *base)
+{
+	Size		nx = (Size) (base->xip ? base->xcnt : 0) * sizeof(TransactionId);
+	Size		ns = (Size) (base->subxip ? base->subxcnt : 0) * sizeof(TransactionId);
+	KcCatSnap  *cs = palloc0(sizeof(KcCatSnap) + nx + ns);
+	char	   *p = (char *) (cs + 1);
+
+	cs->snap = *base;
+	if (nx > 0)
+	{
+		cs->snap.xip = (TransactionId *) p;
+		memcpy(p, base->xip, nx);
+		p += nx;
+	}
+	if (ns > 0)
+	{
+		cs->snap.subxip = (TransactionId *) p;
+		memcpy(p, base->subxip, ns);
+	}
+	return cs;
+}
+
 Snapshot
 kc_catalog_snapshot(Snapshot snap, bool *is_mvcc)
 {
-	KcCatSnap  *cs = palloc0(sizeof(KcCatSnap));
-	Snapshot	copy = &cs->snap;
+	KcCatSnap  *cs;
+	Snapshot	copy;
 
 	if (snap != NULL && snap->snapshot_type == SNAPSHOT_MVCC)
 	{
-		*copy = *snap;
+		cs = kc_catsnap_copy(snap);
+		copy = &cs->snap;
 		*is_mvcc = true;
 		cs->real_cid = snap->curcid;
 		cs->ssi = false;
@@ -192,7 +309,8 @@ kc_catalog_snapshot(Snapshot snap, bool *is_mvcc)
 			base = GetActiveSnapshot();
 		else
 			base = GetLatestSnapshot();
-		*copy = *base;
+		cs = kc_catsnap_copy(base);
+		copy = &cs->snap;
 		*is_mvcc = false;
 
 		/*
@@ -775,7 +893,11 @@ kc_catlocks_add1(KcCatLocks *l, Oid relid, LOCKMODE mode)
 	if (l->n >= lengthof(l->oid))
 		elog(ERROR, "too many relations to lock for the check");
 	if (!ConditionalLockRelationOid(relid, mode))
+	{
+		l->failed_oid = relid;
+		l->failed_mode = mode;
 		return false;
+	}
 	l->oid[l->n] = relid;
 	l->mode[l->n] = mode;
 	l->n++;
@@ -834,6 +956,8 @@ kc_catalog_lock_nowait(KcCatLocks *l, LOCKMODE mode)
 	Relation	rel;
 
 	l->n = 0;
+	l->failed_oid = InvalidOid;
+	l->failed_mode = NoLock;
 	if (!kc_catlocks_add(l, RelationRelationId, AccessShareLock) ||
 		!kc_catlocks_add(l, catoid, mode) ||
 		!kc_catlocks_add(l, idxoid, AccessShareLock))
@@ -958,22 +1082,56 @@ kc_catalog_available(void)
 	return OidIsValid(get_relname_relid(KC_CATALOG_NAME, nspoid)) &&
 		OidIsValid(get_relname_relid(KC_CATALOG_PKEY, nspoid));
 }
-
 /*
  * A table access method has no callback at DROP, and a rewrite leaves the old
  * file's rows behind, so the rows whose stored content no relation owns any
  * more are removed here: after a drop, at the end of VACUUM, and by
  * columnar_check.
  *
- * The catalog is read first, with a current snapshot; the identities of the
- * live files are then read from pg_class with a dirty snapshot, so the
+ * What owns a row is read from pg_class with a dirty snapshot, so the
  * relations of transactions that have not committed yet (a table being
- * created, or rewritten, by another session) keep their rows, and a table
- * that commits after the catalog snapshot cannot lose rows it was not seen to
- * have.  Returns the number of rows deleted.
+ * created, or rewritten, by another session) keep their rows.  The two reads,
+ * the stripe catalog and pg_class, cannot be made at one instant, and each
+ * order has a race; the steps below close both (C11-01):
+ *
+ *   1. a snapshot of the catalog, then the gate for tests;
+ *   2. the files that are live, from pg_class (the first claim);
+ *   3. a second snapshot, taken after that scan;
+ *   4. the stripe rows: a candidate only if both snapshots see it and no
+ *      live file of step 2 owns it;
+ *   5. the files that are live again (the second claim), and a candidate that
+ *      is claimed now is dropped.
+ *
+ * A table that is dropped, or given a new file (VACUUM FULL, SET ACCESS
+ * METHOD), by a transaction that commits before the scan of step 2 and after
+ * the first snapshot deletes the stripe rows of the old file in that very
+ * transaction: the first snapshot sees them and the scan finds no file for
+ * them, and they were called orphans (a false alarm in 10 to 30 percent of
+ * checks while DDL ran); the second snapshot does not see them.  Rows that
+ * a rewrite inserts frozen (visible to every snapshot as soon as they are
+ * written, even before the transaction ends) are seen by both snapshots
+ * whenever they were written; the file they belong to is claimed by the
+ * second scan (the transient table exists before its first row, and the new
+ * file of the table once the rewrite commits), so they are not orphans
+ * either, and, in a deleting call, are never deleted under a rewrite that has
+ * not finished.
+ *
+ * Which relations are columnar is decided by the access method's handler
+ * (kc_am_class), and a relation of a table-like kind whose access method
+ * cannot be classified makes the whole cleanup stand down: rows are deleted
+ * only when every relation that could own them has been classified (C11-02).
+ *
+ * Returns the number of rows deleted (or, dry, that would be).
  */
-static int
-kc_reconcile_ex(bool dry)
+
+/*
+ * The identities of the live files, sorted, from pg_class with a dirty
+ * snapshot.  False, with nothing returned, when the cleanup must stand down:
+ * a columnar relation whose metapage cannot be read, or one whose access
+ * method cannot be classified.
+ */
+static bool
+kc_live_files(uint64 **live_out, int *nlive_out)
 {
 	Relation	pgclass;
 	SysScanDesc scan;
@@ -982,12 +1140,9 @@ kc_reconcile_ex(bool dry)
 	uint64	   *live = NULL;
 	int			nlive = 0;
 	int			caplive = 0;
-	Oid			amoid = kc_am_oid();
-	Relation	cat;
-	ScanKeyData key;
-	int			ndel = 0;
-	Snapshot	catsnap = kc_latest_snapshot();
 	bool		unknown = false;
+	bool		unclassified = false;
+	KcAmMemo	memo = {InvalidOid, KC_AM_UNKNOWN};
 
 	pgclass = table_open(RelationRelationId, AccessShareLock);
 	InitDirtySnapshot(dirty);
@@ -996,10 +1151,18 @@ kc_reconcile_ex(bool dry)
 	{
 		Form_pg_class cl = (Form_pg_class) GETSTRUCT(tup);
 		uint64		uid;
+		KcAmClass	cls;
 
-		if (!OidIsValid(amoid) || cl->relam != amoid ||
-			!OidIsValid(cl->relfilenode) ||
-			(cl->relkind != RELKIND_RELATION && cl->relkind != RELKIND_MATVIEW))
+		if ((cl->relkind != RELKIND_RELATION && cl->relkind != RELKIND_MATVIEW) ||
+			!OidIsValid(cl->relfilenode))
+			continue;
+		cls = kc_am_class_memo(cl->relam, &memo);
+		if (cls == KC_AM_UNKNOWN)
+		{
+			unclassified = true;
+			continue;
+		}
+		if (cls != KC_AM_COLUMNAR)
 			continue;
 		uid = kc_uid_of_file(cl, &unknown);
 		if (uid == 0)
@@ -1014,16 +1177,63 @@ kc_reconcile_ex(bool dry)
 	}
 	systable_endscan(scan);
 	table_close(pgclass, AccessShareLock);
-	if (unknown)
+	if (unknown || unclassified)
 	{
 		ereport(LOG,
-				(errmsg("columnar stripe catalog cleanup skipped: a columnar relation has an unreadable metapage")));
+				(errmsg(unknown ?
+						"columnar stripe catalog cleanup skipped: a columnar relation has an unreadable metapage" :
+						"columnar stripe catalog cleanup skipped: a relation has an access method that cannot be classified")));
 		if (live)
 			pfree(live);
-		return 0;
+		return false;
 	}
 	if (nlive > 1)
 		qsort(live, nlive, sizeof(uint64), kc_u64_cmp);
+	*live_out = live;
+	*nlive_out = nlive;
+	return true;
+}
+
+static bool
+kc_uid_is_live(uint64 uid, const uint64 *live, int nlive)
+{
+	return nlive > 0 && bsearch(&uid, live, nlive, sizeof(uint64), kc_u64_cmp) != NULL;
+}
+
+typedef struct KcOrphanCand
+{
+	ItemPointerData tid;
+	uint64		uid;
+} KcOrphanCand;
+
+static int
+kc_reconcile_ex(bool dry)
+{
+	SysScanDesc scan;
+	HeapTuple	tup;
+	uint64	   *live = NULL;
+	int			nlive = 0;
+	uint64	   *live2 = NULL;
+	int			nlive2 = 0;
+	Relation	cat;
+	ScanKeyData key;
+	int			ndel = 0;
+	Snapshot	catsnap = kc_latest_snapshot();
+	Snapshot	catsnap2;
+	KcOrphanCand *cand = NULL;
+	int			ncand = 0;
+	int			capcand = 0;
+	int			i;
+
+	/* the test gate (t/036): after the first snapshot, before the scan of pg_class */
+	kc_check_gate(KC_GATE_ORPHANS);
+
+	if (!kc_live_files(&live, &nlive))
+		return 0;
+
+	/* the test gate (t/036): after the first claim, before the second snapshot */
+	kc_check_gate(KC_GATE_CLAIMS);
+	catsnap2 = kc_latest_snapshot();
 
 	cat = table_open(kc_catalog_oid(), dry ? AccessShareLock : RowExclusiveLock);
 	scan = systable_beginscan(cat, kc_catalog_index_oid(), true,
@@ -1035,19 +1245,44 @@ kc_reconcile_ex(bool dry)
 															  RelationGetDescr(cat),
 															  &isnull));
 
-		if (isnull || !kc_tuple_visible(tup, catsnap, NULL))
+		if (isnull || !kc_tuple_visible(tup, catsnap, NULL) ||
+			!kc_tuple_visible(tup, catsnap2, NULL) ||
+			kc_uid_is_live(uid, live, nlive))
 			continue;
-		if (nlive == 0 || bsearch(&uid, live, nlive, sizeof(uint64), kc_u64_cmp) == NULL)
+		if (ncand == capcand)
 		{
-			/* a row that another session is deleting or deleted is not ours to count */
-			if (dry || kc_catalog_delete_tuple(cat, &tup->t_self, false))
-				ndel++;
+			capcand = capcand ? capcand * 2 : 64;
+			cand = cand ? repalloc(cand, sizeof(KcOrphanCand) * capcand)
+				: palloc(sizeof(KcOrphanCand) * capcand);
 		}
+		cand[ncand].tid = tup->t_self;
+		cand[ncand].uid = uid;
+		ncand++;
 	}
 	systable_endscan(scan);
+
+	/*
+	 * The second claim: what is live now.  A candidate that a table owns
+	 * after all (its table was made, or rewritten, since the first scan) is
+	 * not an orphan.  A cleanup that cannot classify now stands down.
+	 */
+	if (ncand > 0 && !kc_live_files(&live2, &nlive2))
+		ncand = 0;
+	for (i = 0; i < ncand; i++)
+	{
+		if (kc_uid_is_live(cand[i].uid, live2, nlive2))
+			continue;
+		/* a row that another session is deleting or deleted is not ours to count */
+		if (dry || kc_catalog_delete_tuple(cat, &cand[i].tid, false))
+			ndel++;
+	}
 	table_close(cat, dry ? AccessShareLock : RowExclusiveLock);
 	if (live)
 		pfree(live);
+	if (live2)
+		pfree(live2);
+	if (cand)
+		pfree(cand);
 	return ndel;
 }
 

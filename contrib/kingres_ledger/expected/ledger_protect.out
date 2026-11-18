@@ -272,7 +272,7 @@ SELECT count(*) AS armed_triggers FROM pg_trigger
 WHERE tgname = 'kingres_ledger_capture' AND tgenabled = 'A';
  armed_triggers 
 ----------------
-              5
+              8
 (1 row)
 
 --------------------------------------------------------------------------

@@ -295,19 +295,29 @@ BEGIN; SELECT kcevents_open('t'); SAVEPOINT s; INSERT INTO t VALUES (2); ROLLBAC
 		{
 			$fresh->();
 			my $off = $log_from->();
+			# The script waits for an advisory lock that the test holds, after the INSERT (and, for
+			# commit_sub, inside the savepoint): the moment is known exactly, from the lock table, and
+			# the wait is as long as the test wants, so no verdict depends on how fast the machine is.
+			# (It used to sleep for 4 seconds after a poll for the text of the statement, which is
+			# there from the first moment of a script sent as one message, whatever has run.)
 			my $script = $at eq 'commit'
-				? "BEGIN; SELECT kcevents_open('t'); INSERT INTO t VALUES (100); SELECT pg_sleep(4); COMMIT;"
-				: "BEGIN; SELECT kcevents_open('t'); INSERT INTO t VALUES (100); SAVEPOINT s; SELECT pg_sleep(4); RELEASE s; COMMIT;";
+				? "BEGIN; SELECT kcevents_open('t'); INSERT INTO t VALUES (100); SELECT pg_advisory_lock(7027, 0); COMMIT;"
+				: "BEGIN; SELECT kcevents_open('t'); INSERT INTO t VALUES (100); SAVEPOINT s; SELECT pg_advisory_lock(7027, 0); RELEASE s; COMMIT;";
+			my $gate = $node->background_psql('postgres', on_error_stop => 1);
+			$gate->query_safe('SELECT pg_advisory_lock(7027, 0)');
 			# one query message with the whole script, so that the server has the COMMIT before the
 			# client goes away (a client that is killed between statements never sends it)
 			my ($o, $e) = ('', '');
 			my $h = IPC::Run::start(['psql', '-XAtq', '-d', $node->connstr('postgres'), '-c', "SET kcevents.at = '$at'; $script"], '>', \$o, '2>', \$e);
-			# wait until the backend is in the transaction, then kill the client: the
-			# socket is closed under the backend that is sleeping
-			$node->poll_query_until('postgres', "SELECT count(*) > 0 FROM pg_stat_activity WHERE query LIKE '%pg_sleep(4)%' AND pid <> pg_backend_pid()");
+			# wait until the backend is waiting for the lock (it has run BEGIN and the INSERT), then kill
+			# the client: the socket is closed under the backend that is waiting
+			$node->poll_query_until('postgres', "SELECT count(*) = 1 FROM pg_locks WHERE locktype = 'advisory' AND classid = 7027 AND NOT granted")
+			  or die 't/027: the script did not reach the advisory lock';
 			$h->signal('KILL');
 			eval { $h->finish; };
-			# the backend ends its transaction, finds the client gone and exits
+			# let the backend go on: it ends its transaction, finds the client gone and exits
+			$gate->query_safe('SELECT pg_advisory_unlock(7027, 0)');
+			$gate->quit;
 			$node->poll_query_until('postgres', "SELECT count(*) = 0 FROM pg_stat_activity WHERE backend_type = 'client backend' AND pid <> pg_backend_pid()");
 			$alive->("a broken client connection at $at", $off);
 			like($q->("SELECT pg_postmaster_start_time()"), qr/./, "$order: the server answers after the client was lost at $at");

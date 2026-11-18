@@ -55,6 +55,8 @@ var leaderBoundReads = map[string]bool{
 	"listServerGroups": true,
 	// The records of a rebalance run are in the leader's system database.
 	"getRebalanceStatus": true, "listRebalanceReports": true, "getRebalanceReport": true,
+	// The records of a failover run are in the leader's system database too.
+	"getFailoverStatus": true, "listFailoverReports": true, "getFailoverReport": true,
 	// The verification records get their identifiers in the system database
 	// the first time they are read (README, "Inclusion proofs and verification records").
 	"listLedgerVerifications": true, "getLedgerVerification": true,

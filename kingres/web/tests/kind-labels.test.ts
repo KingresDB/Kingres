@@ -18,7 +18,9 @@ describe('labels', () => {
     expect(taskKindLabel('replicate.apply')).not.toBe('replicate.apply')
     // 16 in 0.4.0, plus certificateRenewalFailed (0.5.0), replicationPending (0.6.0) and, in 0.7.0, leaseLost,
     // groupWithoutSynchronousStandby and groupUnderReplicated.
-    expect(Object.keys(ALERT_KIND_LABEL)).toHaveLength(22)
+    // 0.10.0 added seven for failover: failoverNeedsDecision, failoverBlocked, failoverDataLoss, splitPromotion,
+    // oldPrimaryRunning, oldPrimaryNotStopped and oldPrimaryNotRebuilt: 29.
+    expect(Object.keys(ALERT_KIND_LABEL)).toHaveLength(29)
     // 18 in 0.4.0, plus the two certificate kinds (0.5.0), standby.reconcile (0.7.0), config.apply and config.restart (0.8.0).
     expect(Object.keys(TASK_KIND_LABEL)).toHaveLength(23)
   })

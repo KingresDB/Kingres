@@ -290,8 +290,17 @@ func TestHeartbeatsAndLiveness(t *testing.T) {
 	})
 
 	t.Run("a step of the wall clock changes nothing", func(t *testing.T) {
+		// The subtest before this one paused kingresd of node 1: its watchdog fenced the primary and the manager starts it
+		// again once a round has won the lease. Reading before that is a read of an instance that is not up (the 503
+		// "the role of this session cannot be checked right now"), not an effect of the clock.
+		lvLeaseJustRenewed(t, n0, n1)
 		n1.SetFaults(fault.Spec{ClockOffsetMs: int64(time.Hour / time.Millisecond)})
 		defer n1.Heal()
+		defer func() {
+			if t.Failed() {
+				t.Logf("log of node 1 (kingresd):\n%s\ninstance logs of node 1:\n%s", n1.LogTail(12000), n1.InstanceLogs())
+			}
+		}()
 		end := time.Now().Add(14 * time.Second)
 		for time.Now().Before(end) {
 			for _, o := range []*clustertest.Node{n0, n2} {

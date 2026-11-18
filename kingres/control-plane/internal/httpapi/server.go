@@ -90,6 +90,8 @@ type Deps struct {
 	Members Members
 	// Rebalance serves the Rebalance operations; nil makes them answer "not supported".
 	Rebalance Rebalancer
+	// Failover serves the Failover operations; nil makes them answer "not supported".
+	Failover Failoverer
 	// Config serves the Configuration operations (phase 13); nil makes them answer "not supported".
 	Config *pgconfig.Leader
 	// LocalSettings serves getThisServerSettings and updateThisServerSettings;

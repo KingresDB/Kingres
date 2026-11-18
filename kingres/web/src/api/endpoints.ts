@@ -38,6 +38,24 @@ import { parseProof, withRawDocuments, type RawDigest, type RawProof } from '@/l
 type S = components['schemas']
 const j = unwrap
 
+/** The counterpart of `startedTask` for a request that says `dryRun`: the task cannot come back. */
+async function plan(answer: Promise<Task | S['FailoverPlan']>): Promise<S['FailoverPlan']> {
+  const result = await answer
+  if (!('generatedAt' in result)) throw new Error('The server answered with a task, not a plan.')
+  return result
+}
+
+/**
+ * Since 0.10.0 a failover request answers 202 with a task, or 200 with a plan when it says `dryRun`.
+ * The panel's requests never say it, so the plan cannot come back; a server that sends one anyway is
+ * a server that broke the contract, and the caller gets an error instead of a plan read as a task.
+ */
+async function startedTask(answer: Promise<Task | S['FailoverPlan']>): Promise<Task> {
+  const result = await answer
+  if ('generatedAt' in result) throw new Error('The server answered with a plan, not a task.')
+  return result
+}
+
 export interface Page {
   limit?: number
   cursor?: string
@@ -98,7 +116,14 @@ export const endpoints = {
   removeServer: (serverId: ServerId) =>
     j(api.DELETE('/servers/{serverId}', { params: { path: { serverId } } })),
   failoverServer: (serverId: ServerId, mode: 'hard' | 'graceful') =>
-    j(api.POST('/servers/{serverId}/failover', { params: { path: { serverId } }, body: { mode } })),
+    startedTask(
+      j(
+        api.POST('/servers/{serverId}/failover', {
+          params: { path: { serverId } },
+          body: { mode },
+        }),
+      ),
+    ),
   /** Gives the server a new certificate now (202 + task `certificate.renew`). */
   renewServerCertificates: (serverId: ServerId) =>
     j(
@@ -186,7 +211,8 @@ export const endpoints = {
 
   // --- replication and rebalance
   getReplicationTopology: () => j(api.GET('/replication/topology')),
-  restorePreferredPrimaries: () => j(api.POST('/replication/restore-preferred-primaries')),
+  restorePreferredPrimaries: () =>
+    startedTask(j(api.POST('/replication/restore-preferred-primaries'))),
   getRebalanceStatus: () => j(api.GET('/rebalance')),
   startRebalance: (body: S['RebalanceOptions']) => j(api.POST('/rebalance', { body })),
   previewRebalancePlan: (body: S['RebalancePlanRequest']) =>
@@ -196,6 +222,23 @@ export const endpoints = {
     j(api.GET('/rebalance/reports', { params: { query: q } })),
   getRebalanceReport: (reportId: number) =>
     j(api.GET('/rebalance/reports/{reportId}', { params: { path: { reportId } } })),
+
+  // --- failover (0.10.0; the pages that use these come with the console increment of the failover design)
+  /** The plan of a failover (200, nothing changes): the request says `dryRun`. */
+  previewFailover: (serverId: ServerId, body: Omit<S['FailoverRequest'], 'dryRun'>) =>
+    plan(
+      j(
+        api.POST('/servers/{serverId}/failover', {
+          params: { path: { serverId } },
+          body: { ...body, dryRun: true },
+        }),
+      ),
+    ),
+  getFailoverStatus: () => j(api.GET('/failover')),
+  listFailoverReports: (q: Page = {}) => j(api.GET('/failover/reports', { params: { query: q } })),
+  getFailoverReport: (reportId: number) =>
+    j(api.GET('/failover/reports/{reportId}', { params: { path: { reportId } } })),
+  resetAutoFailoverCounter: () => j(api.POST('/settings/cluster/auto-failover/reset')),
 
   // --- tasks
   listTasks: (q: Page & { state?: TaskState; kind?: TaskKind } = {}) =>

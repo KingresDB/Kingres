@@ -183,6 +183,7 @@ SELECT name, setting, unit, context
   FROM pg_settings WHERE name LIKE 'kingres_shard.%' ORDER BY name;
                  name                  | setting | unit |  context  
 ---------------------------------------+---------+------+-----------
+ kingres_shard.control_call_timeout    | 0       | s    | user
  kingres_shard.deadlock_check_interval | 0       | s    | sighup
  kingres_shard.deadlock_confirm_delay  | 200     | ms   | sighup
  kingres_shard.decision_retention      | 300     | s    | sighup
@@ -200,7 +201,7 @@ SELECT name, setting, unit, context
  kingres_shard.node_timeout            | 60      | s    | user
  kingres_shard.recovery_interval       | 0       | s    | sighup
  kingres_shard.scan_fetch_size         | 1000    |      | user
-(17 rows)
+(18 rows)
 
 SET kingres_shard.default_bucket_count = 0;
 ERROR:  0 is outside the valid range for parameter "kingres_shard.default_bucket_count" (1 .. 4096)

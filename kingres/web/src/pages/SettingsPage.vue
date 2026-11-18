@@ -207,7 +207,7 @@ function submit(): void {
         <FormField
           v-slot="slot"
           label="Timeout (seconds)"
-          hint="1 to 3600. A server must be silent this long."
+          hint="30 to 3600. A server must be silent this long."
           :error="err('autoFailover.timeoutSeconds')"
         >
           <input
@@ -215,7 +215,7 @@ function submit(): void {
             v-model.number="form.afTimeout"
             class="input num"
             type="number"
-            min="1"
+            min="30"
             max="3600"
           />
         </FormField>

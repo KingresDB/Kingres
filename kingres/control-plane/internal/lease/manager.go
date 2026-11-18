@@ -78,6 +78,9 @@ type Config struct {
 	// Enforced tells whether losing the lease of the group stops the instance (a
 	// group with a standby). It is asked at the moment of the decision.
 	Enforced func(group int32) bool
+	// OnFenceFailed, when set, is called every time a stop of a primary whose lease is lost fails (the alert
+	// oldPrimaryNotStopped of the design, 6.4).
+	OnFenceFailed func(group int32, err error)
 	// Dir holds the fence marker and the cached topology (the lease directory).
 	Dir string
 	// WatchdogFile is the file the watchdog reads (empty: no watchdog).
@@ -103,6 +106,9 @@ type groupState struct {
 	// its outcome: until then the instance is not judged (see Check).
 	roundDone bool
 	lost      bool
+	// lastFence is when a fence of this group was last tried while the lease stayed lost (F2-05).
+	lastFence  time.Duration
+	triedFence bool
 	// rounds counts the finished rounds; refused and waitMs are what the last round that did not
 	// reach a majority learned (AdoptionStatus).
 	rounds  int
@@ -131,7 +137,11 @@ type Manager struct {
 	// the start runs beside the renewal rounds, so that the lease is renewed while
 	// PostgreSQL starts or recovers. wg tracks it (tests wait on it).
 	starting map[int32]bool
-	wg       sync.WaitGroup
+	// fencing is set from the moment a fence of the group begins until its stop has ended. A round that wins the
+	// lease in that time must not start the instance: the start would find it still running (and do nothing),
+	// the stop would then end it, and the markers the start removed would leave nothing to start it again.
+	fencing map[int32]bool
+	wg      sync.WaitGroup
 	// enf is what the lease manager last knew about which groups are enforced
 	// (loaded lazily from the lease directory, see recordEnforced).
 	enf map[int32]bool
@@ -162,7 +172,7 @@ func New(c Config) (*Manager, error) {
 	if err := os.MkdirAll(c.Dir, 0o700); err != nil {
 		return nil, fmt.Errorf("lease: creating %s: %w", c.Dir, err)
 	}
-	m := &Manager{c: c, groups: map[int32]*groupState{}, starting: map[int32]bool{}, adopted: map[int32]*adoption{}, relinq: map[int32]bool{}, base: uint64(time.Now().UnixNano())}
+	m := &Manager{c: c, groups: map[int32]*groupState{}, starting: map[int32]bool{}, fencing: map[int32]bool{}, adopted: map[int32]*adoption{}, relinq: map[int32]bool{}, base: uint64(time.Now().UnixNano())}
 	m.loadRelinquished()
 	if b, err := os.ReadFile(filepath.Join(c.Dir, topologyFile)); err == nil {
 		var t Topology
@@ -233,13 +243,49 @@ func (m *Manager) Renew(ctx context.Context) {
 	}
 	for _, g := range groups {
 		m.rmu.Lock()
-		m.round(ctx, g, t.Members)
+		// The list was taken before the rounds began; a group that was released or handed over meanwhile is not
+		// asked for (F2-02). The check is made with the round lock held, which ReleaseGroup waits for.
+		if m.mayRenew(g, t) {
+			m.round(ctx, g, t.Members)
+		}
 		m.rmu.Unlock()
 		// A group that is not enforced keeps its watchdog file fresh whether or not the round succeeded (FO-01).
 		if wf := m.watchdogFile(g); wf != "" && !m.c.Enforced(g) {
 			m.writeWatchdogIdle(wf)
 		}
 	}
+}
+
+// touchIdle refreshes the watchdog file of every group of this server that is not enforced.
+func (m *Manager) touchIdle() {
+	m.mu.Lock()
+	t := m.topo
+	groups := append([]int32(nil), t.Groups...)
+	for g := range m.adopted {
+		groups = append(groups, g)
+	}
+	m.mu.Unlock()
+	for _, g := range groups {
+		if wf := m.watchdogFile(g); wf != "" && !m.c.Enforced(g) {
+			m.writeWatchdogIdle(wf)
+		}
+	}
+}
+
+// mayRenew says whether a round for the group may be sent now: not for a group that was relinquished, and not for one
+// that is neither in the catalog's list nor adopted any more.
+func (m *Manager) mayRenew(g int32, t Topology) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.relinq[g] {
+		return false
+	}
+	for _, x := range t.Groups {
+		if x == g {
+			return true
+		}
+	}
+	return m.adopted[g] != nil
 }
 
 func sameTopology(a, b Topology) bool {
@@ -346,6 +392,12 @@ func (m *Manager) acquired(ctx context.Context, group int32, wasLost bool) {
 		m.mu.Unlock()
 		return // the start that is under way finishes the work below
 	}
+	if m.fencing[group] {
+		// A fence is stopping the primary right now. Its marker is on disk, so the next round that holds the lease
+		// starts the instance once the stop has ended; starting now would race with the stop.
+		m.mu.Unlock()
+		return
+	}
 	if Waiting(m.c.Dir, group) {
 		// The primary was fenced, or kingresd found it stopped at its start while the
 		// lease is enforced: the lease is held, so it may start. This runs beside the
@@ -427,8 +479,19 @@ func (m *Manager) afterAcquired(ctx context.Context, group int32, wasLost bool) 
 // marker).
 func (m *Manager) Check(ctx context.Context) {
 	m.mu.Lock()
-	var expired []int32
+	var expired, refence []int32
+	now := m.c.Clock.Mono()
 	for g, st := range m.groups {
+		if st.roundDone && st.lost {
+			// The lease is over and was not won again: the stop is repeated until it succeeds, and whether the group is
+			// enforced is asked every time (a group that became enforced after its lease ran out must not keep a primary
+			// that runs with no lease, F2-05).
+			if !st.triedFence || now-st.lastFence >= FenceRetry {
+				st.triedFence, st.lastFence = true, now
+				refence = append(refence, g)
+			}
+			continue
+		}
 		if !st.roundDone || st.lost {
 			continue
 		}
@@ -441,12 +504,45 @@ func (m *Manager) Check(ctx context.Context) {
 		}
 		if !st.have || m.c.Clock.Mono() >= st.validUntil-m.c.Margin {
 			st.lost = true
+			st.triedFence, st.lastFence = true, now
 			expired = append(expired, g)
 		}
 	}
 	m.mu.Unlock()
 	for _, g := range expired {
 		m.lose(ctx, g)
+	}
+	for _, g := range refence {
+		m.refence(ctx, g)
+	}
+}
+
+// FenceRetry is how often the stop of a primary whose lease is lost is tried again while it still runs.
+const FenceRetry = 5 * time.Second
+
+// refence stops the primary of a group whose lease is still lost, when it runs and the group is enforced now.
+func (m *Manager) refence(ctx context.Context, group int32) {
+	if a := m.adoptionOf(group); a != nil && !a.attached {
+		return
+	}
+	m.mu.Lock()
+	busy := m.fencing[group]
+	m.mu.Unlock()
+	if busy || !m.c.Enforced(group) {
+		return
+	}
+	inst, have := m.instance(group)
+	if !have {
+		return
+	}
+	if up, err := inst.Running(ctx); err == nil && !up {
+		return
+	}
+	if err := m.Fence(ctx, group); err != nil {
+		m.c.Log.Error("fencing the primary again", "group", group, "error", err)
+		if m.c.OnFenceFailed != nil {
+			m.c.OnFenceFailed(group, err)
+		}
 	}
 }
 
@@ -471,6 +567,10 @@ func (m *Manager) lose(ctx context.Context, group int32) {
 // Fence stops the primary instance with an immediate shutdown after writing the
 // marker that keeps it from starting without a lease.
 func (m *Manager) Fence(ctx context.Context, group int32) error {
+	m.mu.Lock()
+	m.fencing[group] = true
+	m.mu.Unlock()
+	defer func() { m.mu.Lock(); delete(m.fencing, group); m.mu.Unlock() }()
 	// A fence never waits behind anything (ST-04): not behind m.op, which a start of the primary holds
 	// across its Start, and StopImmediate takes no lifecycle lock. A start that is under way is stopped
 	// again by the check at its end (startPrimary).
@@ -520,6 +620,24 @@ func (m *Manager) Run(ctx context.Context) {
 			}
 		}
 	}()
+	// The file of a group that is not enforced is refreshed by a loop of its own (F2-07), never behind a round: a pass
+	// of rounds that get no answer lasts one round time per group, and a file written only after each round would
+	// run out meanwhile and make the watchdog stop a healthy single-copy primary. The rule: a group without a standby
+	// is stopped for a lapsed lease by nothing, only for a kingresd that stopped running.
+	idleDone := make(chan struct{})
+	go func() {
+		defer close(idleDone)
+		it := time.NewTicker(min(m.c.Renew, time.Second))
+		defer it.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-it.C:
+				m.touchIdle()
+			}
+		}
+	}()
 	t := time.NewTicker(m.c.Renew)
 	defer t.Stop()
 	for {
@@ -527,6 +645,7 @@ func (m *Manager) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			<-done
+			<-idleDone
 			m.wg.Wait()
 			return
 		case <-t.C:

@@ -37,6 +37,8 @@ export const operations = {
   getConfigSummary: { role: 'kingres_readonly', method: 'GET', path: '/config/summary' },
   getDatabase: { role: 'kingres_readonly', method: 'GET', path: '/databases/{databaseName}' },
   getDatabaseCreateOptions: { role: 'kingres_readonly', method: 'GET', path: '/database-create-options' },
+  getFailoverReport: { role: 'kingres_readonly', method: 'GET', path: '/failover/reports/{reportId}' },
+  getFailoverStatus: { role: 'kingres_readonly', method: 'GET', path: '/failover' },
   getHealth: { role: 'none', method: 'GET', path: '/healthz' },
   getLedgerStatus: { role: 'kingres_readonly', method: 'GET', path: '/databases/{databaseName}/ledger' },
   getLedgerVerification: { role: 'kingres_readonly', method: 'GET', path: '/databases/{databaseName}/ledger/verifications/{verificationId}' },
@@ -67,6 +69,7 @@ export const operations = {
   listConfigParameters: { role: 'kingres_readonly', method: 'GET', path: '/config/parameters' },
   listConfigServers: { role: 'kingres_readonly', method: 'GET', path: '/config/servers' },
   listDatabases: { role: 'kingres_readonly', method: 'GET', path: '/databases' },
+  listFailoverReports: { role: 'kingres_readonly', method: 'GET', path: '/failover/reports' },
   listGrants: { role: 'kingres_admin', method: 'GET', path: '/grants' },
   listLedgerBlocks: { role: 'kingres_readonly', method: 'GET', path: '/databases/{databaseName}/ledger/blocks' },
   listLedgerDigests: { role: 'kingres_readonly', method: 'GET', path: '/databases/{databaseName}/ledger/digests' },
@@ -90,6 +93,7 @@ export const operations = {
   removeServer: { role: 'kingres_ops', method: 'DELETE', path: '/servers/{serverId}' },
   renewServerCertificates: { role: 'kingres_admin', method: 'POST', path: '/servers/{serverId}/certificates/renewals' },
   replaceNetworkAccess: { role: 'kingres_admin', method: 'PUT', path: '/settings/network-access' },
+  resetAutoFailoverCounter: { role: 'kingres_admin', method: 'POST', path: '/settings/cluster/auto-failover/reset' },
   restartPendingInstances: { role: 'kingres_admin', method: 'POST', path: '/config/restarts' },
   restartThisServerInstance: { role: 'kingres_ops', method: 'POST', path: '/this-server/instances/{instanceId}/restart' },
   restorePreferredPrimaries: { role: 'kingres_ops', method: 'POST', path: '/replication/restore-preferred-primaries' },
@@ -116,4 +120,4 @@ export const operations = {
 export type OperationId = keyof typeof operations
 
 /** The closed list of audit actions (components/schemas/AuditAction). */
-export const auditActions = ['login', 'logout', 'loginFailed', 'setupTokenRejected', 'initCluster', 'joinCluster', 'updateThisServerSettings', 'restartThisServerInstance', 'stopThisServerInstance', 'startThisServerInstance', 'leaveCluster', 'addServer', 'updateServer', 'removeServer', 'failoverServer', 'autoFailover', 'createServerGroup', 'deleteServerGroup', 'createDatabase', 'updateDatabase', 'dropDatabase', 'distributeTable', 'enableTableLedger', 'restorePreferredPrimaries', 'startRebalance', 'stopRebalance', 'cancelTask', 'createRole', 'updateRole', 'deleteRole', 'setRoleMemberships', 'setRoleClusterRoles', 'createGrant', 'revokeGrants', 'applyGrantTemplate', 'replaceNetworkAccess', 'updateClusterSettings', 'generateLedgerDigest', 'startLedgerVerification', 'executeQuery', 'acknowledgeAlert', 'renewServerCertificates', 'revokeServerCertificates', 'certificateRenewed', 'certificateRenewalFailed', 'cancelStatement', 'leaseLost', 'leaseFenced', 'leaseAcquired', 'standbyCreated', 'standbyRemoved', 'standbyRebuilt', 'standbyInstanceStarted', 'standbyInstanceRemoved', 'standbyInstanceRebuilt', 'synchronousStandbyNamesChanged', 'replicationSlotDropped', 'applyConfigChange', 'revertConfigChange', 'restartPendingInstances'] as const
+export const auditActions = ['login', 'logout', 'loginFailed', 'setupTokenRejected', 'initCluster', 'joinCluster', 'updateThisServerSettings', 'restartThisServerInstance', 'stopThisServerInstance', 'startThisServerInstance', 'leaveCluster', 'addServer', 'updateServer', 'removeServer', 'failoverServer', 'autoFailover', 'createServerGroup', 'deleteServerGroup', 'createDatabase', 'updateDatabase', 'dropDatabase', 'distributeTable', 'enableTableLedger', 'restorePreferredPrimaries', 'startRebalance', 'stopRebalance', 'cancelTask', 'createRole', 'updateRole', 'deleteRole', 'setRoleMemberships', 'setRoleClusterRoles', 'createGrant', 'revokeGrants', 'applyGrantTemplate', 'replaceNetworkAccess', 'updateClusterSettings', 'generateLedgerDigest', 'startLedgerVerification', 'executeQuery', 'acknowledgeAlert', 'renewServerCertificates', 'revokeServerCertificates', 'certificateRenewed', 'certificateRenewalFailed', 'cancelStatement', 'leaseLost', 'leaseFenced', 'leaseAcquired', 'standbyCreated', 'standbyRemoved', 'standbyRebuilt', 'standbyInstanceStarted', 'standbyInstanceRemoved', 'standbyInstanceRebuilt', 'synchronousStandbyNamesChanged', 'replicationSlotDropped', 'applyConfigChange', 'revertConfigChange', 'restartPendingInstances', 'resetAutoFailoverCounter', 'failoverGroupStarted', 'failoverGroupPromoted', 'failoverGroupFailed', 'oldPrimaryRebuilt'] as const

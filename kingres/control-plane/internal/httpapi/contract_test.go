@@ -37,8 +37,8 @@ func TestRoutingMatchesContract(t *testing.T) {
 	for _, op := range doc.Operations {
 		want[op.Method+" /api/v1"+op.Path] = op.ID
 	}
-	if len(want) != 100 {
-		t.Errorf("contract has %d operations, this test was written for 100", len(want))
+	if len(want) != 104 {
+		t.Errorf("contract has %d operations, this test was written for 104", len(want))
 	}
 	got := map[string]string{}
 	for _, r := range e.srv.Routes() {
@@ -289,6 +289,9 @@ func TestResponsesValidateAgainstContract(t *testing.T) {
 	}
 	for id := range e.srv.rebalanceHandlers() {
 		mutating[id] = true // validated in rebalance_http_test.go with a fake service
+	}
+	for id := range e.srv.failoverHandlers() {
+		mutating[id] = true // validated by the unit tests of internal/failover and the cluster tests of package clustertest
 	}
 	for id := range e.srv.serverGroupHandlers() {
 		mutating[id] = true // need the system database; validated in cmd/kingresd/servergroups_e2e_test.go

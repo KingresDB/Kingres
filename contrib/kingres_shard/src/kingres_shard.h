@@ -103,11 +103,22 @@
 #define ERRCODE_KINGRES_UNSAFE_PROMOTION MAKE_SQLSTATE('K','S','0','1','2')
 #define ERRCODE_KINGRES_IN_DOUBT MAKE_SQLSTATE('K','S','0','1','3')
 /*
- *   KS014  a node holds a cluster secret that the node that asks does not accept or hold (S11-04): a
- *          standby that missed a rotation, and was promoted or is asked about.  Not a transient
- *          refusal: do not repeat; rebuild the node from a node that has the current secret.
+ *   KS014  two nodes hold cluster secrets that do not match (S11-04, S13-04): a standby that missed a
+ *          rotation, and was promoted or is asked about.  It does not say which of the two is behind:
+ *          the node that refused, or the node that asked (a map standby that missed a rotation and
+ *          runs promote_node itself).  Not a transient refusal: do not repeat; ask a third node
+ *          (the node that every other node refuses is the stale one), and rebuild that one from a
+ *          node that has the current secret.
  */
 #define ERRCODE_KINGRES_SECRET_UNKNOWN MAKE_SQLSTATE('K','S','0','1','4')
+
+/*
+ * SQLSTATE of "the call took longer than kingres_shard.control_call_timeout as a whole" (node_conn.c,
+ * S13-02).  It says nothing about any node: every node that was asked answered within node_timeout,
+ * or the wait that was cut off was cut off by what was left of the call's time.  Not a reason to
+ * fence a node.  The setting is 0 (no limit) unless the caller sets it.
+ */
+#define ERRCODE_KINGRES_CALL_TIMEOUT MAKE_SQLSTATE('K','S','0','1','5')
 
 /*
  * The text that starts the statement of every fragment of a distributed scan
@@ -142,6 +153,7 @@ extern PGDLLIMPORT bool kingres_shard_enable_routing;
 extern PGDLLIMPORT bool kingres_shard_forwarded;
 extern PGDLLIMPORT int kingres_shard_node_connect_timeout;
 extern PGDLLIMPORT int kingres_shard_node_timeout;
+extern PGDLLIMPORT int kingres_shard_control_call_timeout;
 extern PGDLLIMPORT char *kingres_shard_node_conninfo;
 extern PGDLLIMPORT int kingres_shard_recovery_interval;
 extern PGDLLIMPORT bool kingres_shard_enable_distributed_scan;

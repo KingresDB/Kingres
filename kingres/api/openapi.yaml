@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: KingresDB Management API
-  version: 0.9.0
+  version: 0.10.0
   summary: REST API of the KingresDB management panel, CLI and manager.
   description: |
     The single REST API served by `kingresd` on every KingresDB server. The web panel
@@ -1029,11 +1029,34 @@ paths:
       operationId: failoverServer
       summary: Fail over a server
       description: |
-        Promotes the standbys of all primaries on this server to primary on their own servers.
-        `graceful` waits for the standbys to catch up and requires a `live` server (no data loss).
-        `hard` is for a dead or unresponsive server and can lose asynchronously replicated writes.
-        The promoted servers then carry extra load until `POST /replication/restore-preferred-primaries`.
-        Refused with 409 when a bucket would lose its last copy (no replica) or quorum is not available.
+        Promotes, for every shard group whose primary runs on this server (or for the groups named in
+        `shardGroupIds`), one standby to primary on its own server, one group at a time, the map group first.
+        `graceful` is the planned switchover: it waits for the standbys to catch up and requires a `live`
+        server (no data loss). `hard` is for a dead or unresponsive server and can lose asynchronously
+        replicated writes. The promoted servers then carry extra load until
+        `POST /replication/restore-preferred-primaries`.
+
+        **0.10.0.** The request can name the groups (`shardGroupIds`), the standby to promote per group
+        (`targets`), accept a possible loss of data (`allowDataLoss`), ask for the plan only (`dryRun`: 200
+        `FailoverPlan`, nothing changes) and carry a `comment` for the audit event. A failover that could lose
+        data is refused with 409 `failover_needs_decision` until the request says `allowDataLoss`; the
+        `detail` names the groups and the loss, and `dryRun` answers the whole plan. Refused with 409 `no_replica_available` when a group has no
+        standby that is ready, `cluster_inconsistent` when a standby is not registered in the sharding catalog (or the
+        primary names one in `synchronous_standby_names` that the catalog does not have), 503 `quorum_unavailable` when the server that answers cannot hear a majority of the
+        servers, `lease_settings_differ` when the servers do not use the same lease duration and margin,
+        `version_mismatch`, `failover_in_progress` (one failover or restore at a time, cluster-wide),
+        `rebalance_in_progress` (a rebalance that did not stop within a minute) and `operation_in_progress`.
+        422 `node_state_invalid` for `graceful` on a server that is not `live`, 422 `unprocessable` for a group
+        the server is not primary of or a target that is not a standby of the group. While `kingresd` lacks a
+        part of the design, the request answers 422 `unsupported_operation`: this revision's server implements
+        `hard` for ordinary groups only.
+
+        The task is `server.failover`, one block of steps per group (`TaskStep.shardGroupId`). A task that
+        waits for an operator is `paused`; a repeat of this request for the same server resumes it. From the moment
+        the task starts to stop the old primary of a group the task can only go forward (`Task.cancellable` is false:
+        the group has no primary until a standby is promoted, so a rollback is not offered in this revision; a cancel
+        before it lifts the freezes). The report id is
+        the task id (`getFailoverReport`). Needs `kingres_ops`.
       tags: [Servers]
       x-required-role: kingres_ops
       requestBody:
@@ -1043,7 +1066,14 @@ paths:
             schema: { $ref: '#/components/schemas/FailoverRequest' }
             examples:
               hard: { value: { mode: hard } }
+              oneGroup: { value: { mode: hard, shardGroupIds: [2], targets: [{ shardGroupId: 2, serverId: db3 }], comment: disk failure } }
+              plan: { value: { mode: hard, dryRun: true } }
       responses:
+        '200':
+          description: The plan of a request with `dryRun` true; nothing was changed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FailoverPlan' }
         '202': { $ref: '#/components/responses/AcceptedTask' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
@@ -1727,14 +1757,122 @@ paths:
         After a failed server has returned, switches every shard group whose primary is not on its home
         server back to the home server (graceful switchover, one group at a time). Groups already on their
         preferred server are skipped. Long-running: returns a task.
+
+        **0.10.0.** The body is optional: `shardGroupIds` limits the groups, `dryRun` answers 200
+        `FailoverPlan` and changes nothing. Refused with the same 409 codes as `failoverServer`. This revision's
+        `kingresd` answers 422 `unsupported_operation` (the switchover is a later increment).
       tags: [Replication]
       x-required-role: kingres_ops
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RestorePreferredPrimariesRequest' }
       responses:
+        '200':
+          description: The plan of a request with `dryRun` true; nothing was changed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FailoverPlan' }
         '202': { $ref: '#/components/responses/AcceptedTask' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '405': { $ref: '#/components/responses/MethodNotAllowed' }
         '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /failover:
+    get:
+      operationId: getFailoverStatus
+      summary: Get the current failover status
+      description: |
+        Added in 0.10.0. Whether a failover (or a restore of the preferred primaries) is running, paused for an
+        operator, failed or absent, with the progress of each group. Modelled on `getRebalanceStatus`. `taskId` is
+        null only while the map group is promoted before the system database is writable again. `needsDecision`
+        lists the groups that wait for the operator (data loss possible, a standby that cannot be read, a prepared
+        transaction in the way); a repeat of `failoverServer` with `allowDataLoss` goes on. `lastReport` is the
+        summary of the most recent finished run.
+      tags: [Replication]
+      x-required-role: kingres_readonly
+      responses:
+        '200':
+          description: Failover status.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FailoverStatus' }
+              examples:
+                idle:
+                  value: { state: idle, needsDecision: [], groups: [], cancellable: false, lastReport: null }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /failover/reports:
+    get:
+      operationId: listFailoverReports
+      summary: List failover reports
+      description: Added in 0.10.0. One report summary per finished, paused or failed failover run, newest first.
+      tags: [Replication]
+      x-required-role: kingres_readonly
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of report summaries.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FailoverReportPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /failover/reports/{reportId}:
+    parameters:
+      - name: reportId
+        in: path
+        required: true
+        description: Failover report identifier (equals the failover task identifier).
+        schema: { type: integer, format: int64 }
+    get:
+      operationId: getFailoverReport
+      summary: Get a failover report
+      description: 'Added in 0.10.0. The full report of one failover run: for each group the decision (candidates, positions, verdict), the terms before and after, the lease wait, the nodes that were not reached, the incidents the sharding extension reported, the state of the old primary, and the events. 404 for a run that has no report.'
+      tags: [Replication]
+      x-required-role: kingres_readonly
+      responses:
+        '200':
+          description: The report.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FailoverReport' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /settings/cluster/auto-failover/reset:
+    post:
+      operationId: resetAutoFailoverCounter
+      summary: Reset the counter of automatic failovers
+      description: Added in 0.10.0. Sets `ClusterSettings.autoFailover.eventsSinceReset` to 0 (a rebalance does it too) and answers the settings after the reset. Immediate; no task. Needs `kingres_admin`.
+      tags: [Settings]
+      x-required-role: kingres_admin
+      responses:
+        '200':
+          description: The cluster settings after the reset.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ClusterSettings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
         '422': { $ref: '#/components/responses/UnprocessableEntity' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
@@ -3993,6 +4131,8 @@ components:
         - group_degraded
         - insufficient_disk
         - no_receiving_server
+        - failover_needs_decision
+        - lease_settings_differ
     ValidationIssue:
       type: object
       description: One invalid field of a request.
@@ -5044,6 +5184,26 @@ components:
                 - 'null'
               format: int64
               description: Task of the running rebalance.
+        failover:
+          type: object
+          description: Added in 0.10.0, optional. Whether a failover is running, as `rebalance` does for a rebalance.
+          required: [running]
+          properties:
+            running:
+              type: boolean
+            taskId:
+              type:
+                - integer
+                - 'null'
+              format: int64
+            serverId:
+              type:
+                - string
+                - 'null'
+            phase:
+              type:
+                - string
+                - 'null'
         autoFailover:
           type: object
           description: Auto-failover summary.
@@ -5060,6 +5220,15 @@ components:
               type: integer
               minimum: 1
               description: Maximum automatic failovers before manual intervention is required.
+            limitReached:
+              type: boolean
+              description: Added in 0.10.0, optional. True when `eventsSinceReset` has reached `maxCount`.
+            lastEventAt:
+              type:
+                - string
+                - 'null'
+              format: date-time
+              description: Added in 0.10.0, optional. When the last automatic failover was made.
         openAlerts:
           type: object
           description: Number of open alerts per severity.
@@ -5346,13 +5515,310 @@ components:
           description: False excludes the server from bucket placement at the next rebalance.
     FailoverRequest:
       type: object
-      description: Failover options.
+      description: Failover options. Members after `mode` were added in 0.10.0 and are optional.
       required: [mode]
       properties:
         mode:
           type: string
           enum: [hard, graceful]
-          description: '`graceful` waits for standbys to catch up (server must be live); `hard` promotes immediately and can lose async writes.'
+          description: '`graceful` is the planned switchover: it waits for standbys to catch up (server must be live); `hard` promotes immediately and can lose async writes.'
+        shardGroupIds:
+          type: array
+          minItems: 1
+          description: The groups whose primary runs on the server that are failed over. Default all of them.
+          items: { type: integer, format: int32, minimum: 0 }
+        targets:
+          type: array
+          description: The standby to promote, per group. Default the standby that holds the most WAL.
+          items: { $ref: '#/components/schemas/FailoverTarget' }
+        allowDataLoss:
+          type: boolean
+          default: false
+          description: The operator accepts the loss the plan states. A failover whose verdict is not `none` is refused with 409 `failover_needs_decision` without it. Ignored by a switchover.
+        dryRun:
+          type: boolean
+          default: false
+          description: Compute and answer the plan (200 `FailoverPlan`); change nothing.
+        comment:
+          type: string
+          minLength: 0
+          maxLength: 500
+          description: Recorded in the audit event.
+    FailoverTarget:
+      type: object
+      description: The standby to promote for one group.
+      required: [shardGroupId, serverId]
+      properties:
+        shardGroupId:
+          type: integer
+          format: int32
+          minimum: 0
+        serverId:
+          $ref: '#/components/schemas/ServerId'
+    RestorePreferredPrimariesRequest:
+      type: object
+      description: Added in 0.10.0. Options of `restorePreferredPrimaries`; every member is optional.
+      properties:
+        shardGroupIds:
+          type: array
+          minItems: 1
+          items: { type: integer, format: int32, minimum: 0 }
+          description: Restore only these groups.
+        dryRun:
+          type: boolean
+          default: false
+          description: Answer the plan and change nothing.
+    FailoverPlan:
+      type: object
+      description: Added in 0.10.0. What a failover or restore would do, answered for `dryRun` and carried by the 409 `failover_needs_decision`.
+      required: [generatedAt, kind, mode, serverId, canProceed, blockers, willStopRebalance, groups]
+      properties:
+        generatedAt: { type: string, format: date-time }
+        kind: { type: string, enum: [failover, restorePreferredPrimaries] }
+        mode: { type: string, enum: [hard, graceful, restore] }
+        serverId:
+          oneOf:
+            - $ref: '#/components/schemas/ServerId'
+            - type: 'null'
+          description: The server that is failed over; null for a restore.
+        canProceed:
+          type: boolean
+          description: Whether the request would be accepted as it is (blockers that `allowDataLoss` lifts are listed and make this false).
+        blockers:
+          type: array
+          items: { $ref: '#/components/schemas/FailoverBlocker' }
+        willStopRebalance:
+          type: boolean
+        groups:
+          type: array
+          items: { $ref: '#/components/schemas/FailoverGroupPlan' }
+    FailoverBlocker:
+      type: object
+      description: Why a failover cannot proceed as asked.
+      required: [code, shardGroupId, message]
+      properties:
+        code:
+          type: string
+          description: The problem code the request would get, or `failoverNeedsDecision`.
+        shardGroupId:
+          type: [integer, 'null']
+          format: int32
+        message: { type: string }
+    FailoverGroupPlan:
+      type: object
+      description: The plan for one group.
+      required: [shardGroupId, isMapGroup, fromServerId, toServerId, candidates, dataLoss, estimatedSeconds, writesPausedSeconds, steps, movesTheManager]
+      properties:
+        shardGroupId: { type: integer, format: int32, minimum: 0 }
+        isMapGroup: { type: boolean }
+        fromServerId: { $ref: '#/components/schemas/ServerId' }
+        toServerId:
+          oneOf:
+            - $ref: '#/components/schemas/ServerId'
+            - type: 'null'
+          description: Null when no candidate qualifies.
+        candidates:
+          type: array
+          items: { $ref: '#/components/schemas/FailoverCandidate' }
+        dataLoss: { $ref: '#/components/schemas/DataLossAssessment' }
+        estimatedSeconds: { type: [integer, 'null'] }
+        writesPausedSeconds:
+          type: [integer, 'null']
+          description: Only for a switchover.
+        steps:
+          type: array
+          description: The step names, English.
+          items: { type: string }
+        movesTheManager:
+          type: boolean
+          description: True for the map group.
+    FailoverCandidate:
+      type: object
+      description: A standby that could be promoted.
+      required: [serverId, standbyId, readable, eligible, ineligibleReason, receiveLsn, replayLsn, lagBytes, syncState, chosen]
+      properties:
+        serverId: { $ref: '#/components/schemas/ServerId' }
+        standbyId: { type: integer, format: int64 }
+        readable: { type: boolean, description: Whether its position could be read. }
+        eligible: { type: boolean }
+        ineligibleReason: { type: [string, 'null'] }
+        receiveLsn: { type: [string, 'null'], description: 'Flushed WAL position, PostgreSQL X/Y form.' }
+        replayLsn: { type: [string, 'null'] }
+        lagBytes: { type: [integer, 'null'], format: int64, description: Against the last position of the primary the leader knew. }
+        syncState:
+          oneOf:
+            - $ref: '#/components/schemas/ReplicationSyncState'
+            - type: 'null'
+        chosen: { type: boolean }
+    DataLossAssessment:
+      type: object
+      description: What a failover of one group can lose.
+      required: [verdict, message, lastKnownPrimaryLsn, chosenReceiveLsn, lastKnownAgeSeconds, groupRanWithoutSynchronousStandby, asyncDatabases, unreadableServerIds]
+      properties:
+        verdict:
+          type: string
+          enum: [none, asyncOnly, possible, unknown]
+          description: '`none`: every ready standby was read, the best is the one chosen and the group streamed a synchronous standby (or every database is `async`). `asyncOnly`: only commits acknowledged under `async` can be lost. `possible`: the group ran without its synchronous standby, or the target is behind the best. `unknown`: a ready standby could not be read.'
+        message: { type: string }
+        lastKnownPrimaryLsn: { type: [string, 'null'] }
+        chosenReceiveLsn: { type: [string, 'null'] }
+        lastKnownAgeSeconds: { type: [integer, 'null'] }
+        groupRanWithoutSynchronousStandby: { type: boolean }
+        asyncDatabases:
+          type: array
+          items: { type: string }
+        unreadableServerIds:
+          type: array
+          items: { $ref: '#/components/schemas/ServerId' }
+    FailoverStatus:
+      type: object
+      description: Added in 0.10.0. Current failover state.
+      required: [state, needsDecision, groups, cancellable, lastReport]
+      properties:
+        state: { type: string, enum: [idle, running, paused, failed] }
+        phase:
+          type: [string, 'null']
+          description: 'One of `checking`, `waitingForLease`, `choosing`, `promoting`, `followingCatalog`, `repointing`, `finishing`, and for a switchover `quiescing`, `waitingForTransactions`, `stopping`, `verifying`; `bootstrap` for the map group. Clients must tolerate other values.'
+        kind: { type: [string, 'null'], enum: [failover, restorePreferredPrimaries, null] }
+        trigger: { type: [string, 'null'], enum: [manual, automatic, null] }
+        taskId: { type: [integer, 'null'], format: int64 }
+        serverId: { type: [string, 'null'] }
+        startedAt: { type: [string, 'null'], format: date-time }
+        pausedReason: { type: [string, 'null'] }
+        needsDecision:
+          type: array
+          items: { $ref: '#/components/schemas/FailoverBlocker' }
+        groups:
+          type: array
+          items: { $ref: '#/components/schemas/FailoverGroupProgress' }
+        cancellable: { type: boolean }
+        lastReport:
+          oneOf:
+            - $ref: '#/components/schemas/FailoverReportSummary'
+            - type: 'null'
+    FailoverGroupProgress:
+      type: object
+      required: [shardGroupId, state, fromServerId]
+      properties:
+        shardGroupId: { type: integer, format: int32, minimum: 0 }
+        state: { type: string, enum: [pending, frozen, fenced, pinned, promoted, done, failed, skipped] }
+        phase: { type: [string, 'null'] }
+        fromServerId: { $ref: '#/components/schemas/ServerId' }
+        toServerId: { type: [string, 'null'] }
+        writesPausedSince: { type: [string, 'null'], format: date-time }
+        message: { type: [string, 'null'] }
+    FailoverReportSummary:
+      type: object
+      required: [id, kind, trigger, serverId, outcome, startedAt, finishedAt, requestedBy, totals, dataLossPossible, error]
+      properties:
+        id: { type: integer, format: int64 }
+        kind: { type: string, enum: [failover, restorePreferredPrimaries] }
+        trigger: { type: string, enum: [manual, automatic] }
+        serverId: { type: [string, 'null'] }
+        outcome: { type: string, enum: [completed, partial, failed, cancelled, paused] }
+        startedAt: { type: string, format: date-time }
+        finishedAt: { type: [string, 'null'], format: date-time }
+        requestedBy: { type: string }
+        totals:
+          type: object
+          required: [groupsTotal, groupsDone, groupsFailed, groupsSkipped, durationSeconds]
+          properties:
+            groupsTotal: { type: integer, minimum: 0 }
+            groupsDone: { type: integer, minimum: 0 }
+            groupsFailed: { type: integer, minimum: 0 }
+            groupsSkipped: { type: integer, minimum: 0 }
+            durationSeconds: { type: integer, minimum: 0 }
+        dataLossPossible: { type: boolean }
+        error: { type: [string, 'null'] }
+    FailoverReportPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          description: Summaries, newest first.
+          items: { $ref: '#/components/schemas/FailoverReportSummary' }
+        nextCursor:
+          $ref: '#/components/schemas/NextCursor'
+    FailoverReport:
+      description: The full report of one run.
+      allOf:
+        - $ref: '#/components/schemas/FailoverReportSummary'
+        - type: object
+          required: [mode, options, groups, events]
+          properties:
+            mode: { type: string, enum: [hard, graceful, restore] }
+            options: { $ref: '#/components/schemas/FailoverRequest' }
+            groups:
+              type: array
+              items: { $ref: '#/components/schemas/FailoverGroupReport' }
+            events:
+              type: array
+              items: { $ref: '#/components/schemas/FailoverEvent' }
+    FailoverGroupReport:
+      type: object
+      required: [shardGroupId, outcome, skipReason, fromServerId, toServerId, termBefore, termAfter, timeline, leaseWaitMs, durationSeconds, candidates, dataLoss, unreachedServerIds, incidents, oldPrimary, error]
+      properties:
+        shardGroupId: { type: integer, format: int32, minimum: 0 }
+        outcome: { type: string, enum: [done, failed, skipped, pending] }
+        skipReason: { type: [string, 'null'] }
+        fromServerId: { $ref: '#/components/schemas/ServerId' }
+        toServerId: { type: [string, 'null'] }
+        termBefore: { type: [integer, 'null'], format: int64 }
+        termAfter: { type: [integer, 'null'], format: int64 }
+        timeline: { type: [integer, 'null'], format: int64 }
+        leaseWaitMs: { type: [integer, 'null'] }
+        durationSeconds: { type: integer, minimum: 0 }
+        candidates:
+          type: array
+          items: { $ref: '#/components/schemas/FailoverCandidate' }
+        dataLoss: { $ref: '#/components/schemas/DataLossAssessment' }
+        unreachedServerIds:
+          type: array
+          items: { $ref: '#/components/schemas/ServerId' }
+        incidents:
+          type: array
+          items: { $ref: '#/components/schemas/FailoverIncident' }
+        oldPrimary: { $ref: '#/components/schemas/OldPrimaryReport' }
+        error: { type: [string, 'null'] }
+    FailoverIncident:
+      type: object
+      required: [kind, message]
+      properties:
+        kind:
+          type: string
+          description: The extension's names, for example `prepared_rolled_back_after_failover`, `participant_lost_committed_transaction`, `foreign_prepared_transaction`.
+        message: { type: string }
+    OldPrimaryReport:
+      type: object
+      required: [state, method, divergenceBytes, rewindBytes, message]
+      properties:
+        state: { type: string, enum: [notScheduled, rebuildScheduled, rebuilding, standby, waitingForServer, removed, failed], description: '`notScheduled`: this revision of kingresd does not turn the old primary into a standby again (a later increment does); it stays stopped and fenced.' }
+        method: { type: [string, 'null'], enum: [clean, pgRewind, baseBackup, null] }
+        divergenceBytes: { type: [integer, 'null'], format: int64 }
+        rewindBytes: { type: [integer, 'null'], format: int64 }
+        message: { type: [string, 'null'] }
+    FailoverEvent:
+      type: object
+      required: [at, shardGroupId, step, kind, message]
+      properties:
+        at: { type: string, format: date-time }
+        shardGroupId: { type: [integer, 'null'], format: int32 }
+        step: { type: string }
+        kind: { type: string }
+        message: { type: string }
+    FailoverReadiness:
+      type: object
+      description: Added in 0.10.0. Whether a failover of the group would be possible now, computed by the leader from its last standby check and the liveness view without a network call per request; never `possible` while a failover runs.
+      required: [possible, candidateServerId, dataLossVerdict, blockers, checkedAt]
+      properties:
+        possible: { type: boolean }
+        candidateServerId: { type: [string, 'null'] }
+        dataLossVerdict: { type: [string, 'null'], enum: [none, asyncOnly, possible, unknown, null] }
+        blockers:
+          type: array
+          items: { $ref: '#/components/schemas/FailoverBlocker' }
+        checkedAt: { type: string, format: date-time }
     ServerGroup:
       type: object
       description: A rack or zone.
@@ -6242,6 +6708,8 @@ components:
           items: { $ref: '#/components/schemas/ReplicationSlot' }
         lease:
           $ref: '#/components/schemas/GroupLease'
+        failover:
+          $ref: '#/components/schemas/FailoverReadiness'
     GroupLease:
       type: object
       description: |
@@ -6767,6 +7235,12 @@ components:
             - string
             - 'null'
           description: 'Extra information about the step, for example `Waiting for server db3, which cannot be reached`. Set while the step runs, and for a step that was `skipped` (the reason, for example `skipped: needs kingres_shard 0.5`); null otherwise.'
+        shardGroupId:
+          type:
+            - integer
+            - 'null'
+          format: int32
+          description: Added in 0.10.0, optional. The shard group a step of a multi-group task (`server.failover`) belongs to; null for a step of the whole task.
         itemsDone:
           type:
             - integer
@@ -7331,6 +7805,11 @@ components:
         - applyConfigChange
         - revertConfigChange
         - restartPendingInstances
+        - resetAutoFailoverCounter
+        - failoverGroupStarted
+        - failoverGroupPromoted
+        - failoverGroupFailed
+        - oldPrimaryRebuilt
     AuditEvent:
       type: object
       description: One audit log entry.
@@ -7426,19 +7905,26 @@ components:
               description: Whether failed servers are failed over automatically.
             timeoutSeconds:
               type: integer
-              minimum: 1
+              minimum: 30
               maximum: 3600
-              description: Seconds without heartbeat before auto-failover.
+              description: 'Seconds without heartbeat before auto-failover. The minimum is 30 since 0.10.0 (it was 1: a shorter time cannot tell a failure from a pause).'
             maxCount:
               type: integer
               minimum: 1
               maximum: 100
-              description: Maximum automatic failovers before an operator must intervene; reset by a rebalance.
+              description: Maximum automatic failovers before an operator must intervene; reset by a rebalance and by `resetAutoFailoverCounter`.
             eventsSinceReset:
               type: integer
               minimum: 0
               readOnly: true
               description: Automatic failovers since the last reset.
+            lastEventAt:
+              type:
+                - string
+                - 'null'
+              format: date-time
+              readOnly: true
+              description: Added in 0.10.0, optional. When the last automatic failover was made; null when none was.
         rebalance:
           $ref: '#/components/schemas/RebalanceSettings'
         features:
@@ -7499,9 +7985,9 @@ components:
               description: Enable or disable auto-failover.
             timeoutSeconds:
               type: integer
-              minimum: 1
+              minimum: 30
               maximum: 3600
-              description: Seconds without heartbeat before auto-failover.
+              description: 'Seconds without heartbeat before auto-failover. The minimum is 30 since 0.10.0 (it was 1: a shorter time cannot tell a failure from a pause).'
             maxCount:
               type: integer
               minimum: 1
@@ -8790,6 +9276,13 @@ components:
         - groupWithoutSynchronousStandby
         - groupUnderReplicated
         - clockDifference
+        - failoverNeedsDecision
+        - failoverBlocked
+        - failoverDataLoss
+        - splitPromotion
+        - oldPrimaryRunning
+        - oldPrimaryNotStopped
+        - oldPrimaryNotRebuilt
     Alert:
       type: object
       description: An alert.

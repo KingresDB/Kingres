@@ -42,6 +42,11 @@
  *		 in postgresql.conf, not with ALTER SYSTEM, ALTER ROLE or ALTER
  *		 DATABASE, not as a start-up option of the connection.
  *
+ * One row of a ledger catalog table is updated by the code of the extension:
+ * ledger_set_signature_policy switches the policy of a table in
+ * kingres.ledger_table (kl_policy_update_allowed, asked by the blocking trigger,
+ * which stays the rule for every other UPDATE).
+ *
  * What the hook does not see.  TRUNCATE and ALTER TABLE are utility
  * statements (TRUNCATE is stopped by its trigger, ALTER TABLE by the
  * ProcessUtility hook), large objects are not rows of these tables, the
@@ -80,6 +85,7 @@
 #include "nodes/parsenodes.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/datum.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
@@ -493,4 +499,68 @@ kl_refuse_write_rel(Relation rel, bool is_insert)
 {
 	kl_refuse_write(RelationGetRelid(rel), kl_extension_oid(),
 					is_insert ? ACL_INSERT : ACL_DELETE);
+}
+
+/*
+ * kl_policy_update_allowed
+ *		Whether an UPDATE of a row of kingres.ledger_table is the one that the
+ *		code of the extension makes: ledger_set_signature_policy changes
+ *		signature_policy from 'optional' to 'required' and sets
+ *		signature_required_from, and nothing else of the row.  The blocking
+ *		trigger asks.  The marker must be raised (the code of the extension is
+ *		running one of its fixed statements) and the table must be the
+ *		extension's own; a superuser who turned allow_manual_write on gets no
+ *		update through this: it is the code's alone, and the catalog stays
+ *		append-only for everybody else (the policy is not covered by a hash, so a
+ *		superuser who edits the catalog by other means can still switch it,
+ *		which the README says).
+ */
+bool
+kl_policy_update_allowed(Relation rel, HeapTuple oldtup, HeapTuple newtup)
+{
+	TupleDesc	td = RelationGetDescr(rel);
+	Oid			extoid;
+	int			i;
+	bool		saw_policy = false;
+
+	if (kl_write_depth <= 0 || strcmp(RelationGetRelationName(rel), "ledger_table") != 0)
+		return false;
+	extoid = kl_extension_oid();
+	if (!OidIsValid(extoid) || !kl_is_catalog_table(RelationGetRelid(rel), extoid))
+		return false;
+
+	for (i = 0; i < td->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(td, i);
+		Datum		ov;
+		Datum		nv;
+		bool		onull;
+		bool		nnull;
+
+		if (att->attisdropped)
+			continue;
+		ov = heap_getattr(oldtup, i + 1, td, &onull);
+		nv = heap_getattr(newtup, i + 1, td, &nnull);
+		if (strcmp(NameStr(att->attname), "signature_policy") == 0)
+		{
+			if (onull || nnull ||
+				strcmp(TextDatumGetCString(ov), "optional") != 0 ||
+				strcmp(TextDatumGetCString(nv), "required") != 0)
+				return false;
+			saw_policy = true;
+			continue;
+		}
+		if (strcmp(NameStr(att->attname), "signature_required_from") == 0)
+		{
+			/* From NULL to a value, nothing else. */
+			if (!onull || nnull)
+				return false;
+			continue;
+		}
+		if (onull != nnull)
+			return false;
+		if (!onull && !datumIsEqual(ov, nv, att->attbyval, att->attlen))
+			return false;
+	}
+	return saw_policy;
 }

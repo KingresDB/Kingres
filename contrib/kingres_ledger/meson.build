@@ -9,6 +9,7 @@ kingres_ledger_sources = files(
   'src/proof.c',
   'src/protect.c',
   'src/row_hash.c',
+  'src/sign.c',
   'src/worker.c',
   'src/write.c',
 )
@@ -19,10 +20,14 @@ if host_system == 'windows'
     '--FILEDESC', 'kingres_ledger - tamper-evident ledger tables for KingresDB',])
 endif
 
+kingres_ledger_args = contrib_mod_args + {
+  'dependencies': [ssl, contrib_mod_args['dependencies']],
+}
+
 kingres_ledger = shared_module('kingres_ledger',
   kingres_ledger_sources,
   include_directories: include_directories('src'),
-  kwargs: contrib_mod_args,
+  kwargs: kingres_ledger_args,
 )
 contrib_targets += kingres_ledger
 
@@ -61,6 +66,7 @@ tests += {
       'ledger_manual',
       'ledger_paths',
       'ledger_stops',
+      'ledger_sign',
     ],
     'regress_args': ['--temp-config', files('kingres_ledger.conf')],
     # The tests need shared_preload_libraries = 'kingres_ledger', which a
@@ -99,6 +105,10 @@ tests += {
       't/029_enable_credit.pl',
       't/030_hold_property.pl',
       't/031_server_file_roles.pl',
+      't/032_attest_policy.pl',
+      't/033_attest_concurrency.pl',
+      't/034_internal_tables.pl',
+      't/035_no_openssl.pl',
     ],
   },
 }

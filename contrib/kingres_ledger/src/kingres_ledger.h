@@ -76,6 +76,13 @@
 #define ERRCODE_KL_SCRIPT_VERSION MAKE_SQLSTATE('K','L','0','0','5')
 #define ERRCODE_KL_LOCK_ORDER	MAKE_SQLSTATE('K','L','0','0','6')
 
+/* Client signatures (sign.c, capture.c); KL007 to KL009 are free. */
+#define ERRCODE_KL_UNATTESTED	MAKE_SQLSTATE('K','L','0','1','0')
+#define ERRCODE_KL_NO_ENTRY		MAKE_SQLSTATE('K','L','0','1','1')
+#define ERRCODE_KL_KEY			MAKE_SQLSTATE('K','L','0','1','2')
+#define ERRCODE_KL_SIGNATURE	MAKE_SQLSTATE('K','L','0','1','3')
+#define ERRCODE_KL_NONCE		MAKE_SQLSTATE('K','L','0','1','4')
+
 /*
  * Names used to find the extension and the objects it creates.  Functions and
  * triggers of the extension are never recognised by these names alone: the
@@ -98,6 +105,7 @@
 #define KL_SYM_LOCK_TABLE		"kingres_ledger_lock_table"
 #define KL_SYM_HISTORY_SYNC		"kingres_ledger_history_sync"
 #define KL_SYM_HISTORY_ACL_SYNC	"kingres_ledger_history_acl_sync"
+#define KL_SYM_REGISTER_INTERNAL "kingres_ledger_register_internal"
 
 /*
  * The subid of the lock that serialises the block builders and
@@ -136,6 +144,24 @@
 
 /* Attribute number of history_relid in kingres.ledger_table (version 0.2). */
 #define KL_LEDGER_TABLE_HISTORY_ATTNO 5
+
+/*
+ * The tables of the extension that are ledger tables themselves (part B of
+ * 0.3, client signatures): registered in kingres.ledger_table by the script of
+ * the extension, written by the code of the extension only.
+ */
+#define KL_TABLE_CLIENT_KEY		"ledger_client_key"
+#define KL_TABLE_CLIENT_REVOKE	"ledger_client_key_revocation"
+#define KL_TABLE_ATTESTATION	"ledger_attestation"
+
+/* Length of a client key identifier, nonce, signature and public key, in bytes. */
+#define KL_CLIENT_KEY_ID_LEN	16
+#define KL_CLIENT_NONCE_LEN		16
+#define KL_CLIENT_SIG_LEN		64
+#define KL_CLIENT_PUBKEY_LEN	32
+
+/* Longest label and revocation reason, in characters. */
+#define KL_CLIENT_TEXT_MAX		200
 
 /* GUC, see kingres_ledger.c. */
 extern int	kl_max_block_transactions;
@@ -204,8 +230,13 @@ extern void kl_mark_dirty(Oid dboid);
 /* protect.c */
 extern void kl_protect_init(void);
 
+/* sign.c */
+extern bool kl_is_internal_table_name(const char *name);
+extern bool kl_internal_stmt_active(const char *queryString);
+
 /* guard.c */
 extern void kl_guard_init(void);
+extern bool kl_policy_update_allowed(Relation rel, HeapTuple oldtup, HeapTuple newtup);
 extern void kl_guard_install(void);
 extern void kl_write_enter(void);
 extern void kl_write_leave(void);
@@ -231,9 +262,14 @@ extern void kl_enable_batch_pause(void);
 extern void kl_require_own_statement(const char *fname);
 extern void kl_check_lock_order(int subid);
 extern void kl_record_manual_digest_delete(Relation rel, HeapTuple tuple);
+extern int	kl_run(const char *sql, int nargs, const Oid *argtypes, Datum *values,
+				   const char *nulls, bool guarded);
+extern bool kl_first(int col, Datum *value);
+extern void kl_follow_sequence(const char *table, const char *column, int64 id);
 
 /* capture.c */
 extern void kl_record_existing_row(int32 table_id, HeapTupleHeader header);
+extern void kl_attest_mark(int32 seq);
 
 /* kingres_ledger.c */
 extern void kl_check_owner(Oid relid);

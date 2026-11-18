@@ -139,6 +139,14 @@ var Calls = map[string]Policy{
 	"POST /failover/unfreeze":      LeaderOnly,
 	"POST /failover/standbys-gone": LeaderOnly,
 
+	// The calls of the failover task (internal-api.md, "Failover"): all from the leader, each acting on the
+	// callee's own instances only.
+	"POST /failover/lease":    LeaderOnly,
+	"POST /failover/demote":   LeaderOnly,
+	"POST /failover/promote":  LeaderOnly,
+	"POST /failover/prepared": LeaderOnly,
+	"POST /standby/repoint":   LeaderOnly,
+
 	// Configuration from the console (phase 13): the leader reads and sets the parameters of every
 	// server; any server answers the clock probe.
 	"POST /config/state":   LeaderOnly,
@@ -161,6 +169,7 @@ var handled = map[string]bool{
 	"POST /standby/create": true, "POST /standby/remove": true, "POST /standby/rebuild": true, "GET /standby/status": true,
 	"GET /failover/position": true, "GET /liveness": true, "GET /failover/state": true, "POST /failover/freeze": true,
 	"POST /failover/unfreeze": true, "POST /failover/standbys-gone": true,
+	"POST /failover/lease": true, "POST /failover/demote": true, "POST /failover/promote": true, "POST /failover/prepared": true, "POST /standby/repoint": true,
 	"POST /config/state": true, "POST /config/apply": true, "POST /config/check": true, "POST /config/restart": true, "GET /time": true,
 }
 

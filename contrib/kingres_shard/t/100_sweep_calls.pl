@@ -17,6 +17,14 @@
 # error and no mixture of old and new, or success with everything done on every node, or success
 # with the WARNING the README names and everything done after the documented repeat (one recovery
 # pass).  The last position (nothing is swallowed) is the clean run.
+#
+# S13-01 and S13-05: the same sweep runs in scenarios, chosen by the environment variable KS_SWEEP_SCENARIO (t/108 and
+# t/109 set it and run this file): silent (the default: the forwarder goes silent, in autocommit, every position),
+# modes (the connection is closed after chunk n, the node's answer to chunk n is lost, the node answers chunk n with an
+# error: a sample of the positions, every one with KINGRES_LONG_TESTS=1) and variants (the call inside SAVEPOINT /
+# RELEASE, inside a PL/pgSQL block with an EXCEPTION clause, inside a transaction block that the caller commits: the
+# sessions of the call end their work with the statements of a user's transaction).  The bound that every position
+# is held to is the README's: 2 x node_timeout + 8 s plus node_connect_timeout.
 
 use strict;
 use warnings FATAL => 'all';
@@ -27,7 +35,7 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 use Time::HiRes qw(time sleep);
 use KsProxy;
-use KsSweep qw(sweep_call chunk_max);
+use KsSweep qw(sweep_call chunk_max sweeps);
 use KingresShardTest qw(make_node run_sql);
 
 my $T = 2;						# node_timeout
@@ -35,6 +43,7 @@ my $C = 2;						# node_connect_timeout
 my $conf = "kingres_shard.node_timeout = $T\nkingres_shard.node_connect_timeout = $C\n";
 my $seq = 0;
 my $tmp = $PostgreSQL::Test::Utils::tmp_check;
+my $BOUND = 2 * $T + 8 + $C;		# the README's bound for a node that stops answering
 
 # --- the cluster: MAP, a plain node, and a node behind the forwarder --------------------------------
 my $n1 = make_node('sw_1', extra => $conf);
@@ -89,10 +98,10 @@ if (want('rotate'))
 			return $s->{n1} eq $old_hash ? 'old' : 'new';
 		},
 		cleanup => sub { $n1->safe_psql('postgres', 'SELECT kingres.recover_prepared_transactions()'); },
-		bound => 2 * $T + 12 + $C + 8,
+		bound => $BOUND,
 	};
 	$c->{prepare}->();
-	$results{rotate_secret} = sweep_call($c, undef);
+	$results{rotate_secret} = sweeps($c);
 }
 
 # --- sync_catalog: the catalog of every node ----------------------------------------------------------
@@ -102,23 +111,28 @@ if (want('sync'))
 		CREATE TABLE public.sw_kv (id int PRIMARY KEY, val text);
 		SELECT kingres.create_distributed_table('public.sw_kv', 'id', bucket_count => 6);
 	});
-	my $rows = sub { return qn($_[0], 'SELECT count(*) FROM kingres.dist_table'); };
+	# every catalog table that sync_catalog writes (node, colocation, dist_table, bucket_map) and the map version
+	my $rows = sub {
+		return qn($_[0], q{SELECT (SELECT count(*) FROM kingres.node) || '/' || (SELECT count(*) FROM kingres.colocation) || '/'
+			|| (SELECT count(*) FROM kingres.dist_table) || '/' || (SELECT count(*) FROM kingres.bucket_map) || '/'
+			|| (SELECT CASE WHEN version = 0 THEN 'stale' ELSE 'current' END FROM kingres.map_version)});
+	};
 	my $c = {
 		name => 'sync_catalog', n1 => $n1, proxy => $proxy, nodes => [ $n1, $n2, $n3 ],
 		call => \&call, run => 'SELECT kingres.sync_catalog()',
 		prepare => sub {
-			# the catalog of the two other nodes is made to miss a row that sync_catalog restores
+			# the catalog of the two other nodes is made to miss rows of every table that sync_catalog writes
 			$n1->safe_psql('postgres', 'SELECT kingres.recover_prepared_transactions()');
 			foreach my $n ($n2, $n3)
 			{
-				$n->safe_psql('postgres', 'SET session_replication_role = replica; DELETE FROM kingres.dist_table');
+				$n->safe_psql('postgres', 'SET session_replication_role = replica; DELETE FROM kingres.bucket_map; DELETE FROM kingres.dist_table; DELETE FROM kingres.colocation; UPDATE kingres.map_version SET version = 0');
 			}
 		},
 		state => sub { return { n1 => $rows->($n1), n2 => $rows->($n2), n3 => $rows->($n3) }; },
 		cleanup => sub { $n1->safe_psql('postgres', 'SELECT kingres.recover_prepared_transactions()'); },
-		bound => 2 * $T + 12 + $C + 8,
+		bound => $BOUND,
 	};
-	$results{sync_catalog} = sweep_call($c, undef);
+	$results{sync_catalog} = sweeps($c);
 }
 
 # --- create_distributed_table and create_reference_table: a table with rows, on every node -------------
@@ -157,9 +171,9 @@ foreach my $kind (want('create') ? ('distributed', 'reference') : ())
 			return { n1 => $cat->($n1), n2 => $present->($n2) . '/' . $cat->($n2), n3 => $present->($n3) . '/' . $cat->($n3) };
 		},
 		cleanup => sub { $drop->(); },
-		bound => 2 * $T + 12 + $C + 8,
+		bound => $BOUND,
 	};
-	$results{ $c->{name} } = sweep_call($c, undef);
+	$results{ $c->{name} } = sweeps($c);
 	$drop->();
 }
 
@@ -191,9 +205,9 @@ if (want('recover'))
 				$n3->safe_psql('postgres', "ROLLBACK PREPARED '$g'");
 			}
 		},
-		bound => 2 * $T + 12 + $C + 8,
+		bound => $BOUND,
 	};
-	$results{recover_prepared_transactions} = sweep_call($c, undef);
+	$results{recover_prepared_transactions} = sweeps($c);
 }
 
 # --- add_node and remove_node: a node that registers (or leaves) behind a forwarder -------------------
@@ -235,9 +249,9 @@ if (want('node'))
 		prepare => $clear,
 		state => $state,
 		cleanup => $clear,
-		bound => 2 * $T + 12 + $C + 8,
+		bound => $BOUND,
 	};
-	$results{add_node} = sweep_call($add, undef);
+	$results{add_node} = sweeps($add);
 
 	my $remove = {
 		name => 'remove_node', n1 => $n1, proxy => $proxy4, nodes => [ $n1, $n2, $n3, $n4 ],
@@ -262,9 +276,9 @@ if (want('node'))
 		partial => 1,
 		no_error_like => qr/KS007/,
 		cleanup => $clear,
-		bound => 2 * $T + 12 + $C + 8,
+		bound => $BOUND,
 	};
-	$results{remove_node} = sweep_call($remove, undef);
+	$results{remove_node} = sweeps($remove);
 	$clear->();
 }
 

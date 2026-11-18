@@ -1,0 +1,582 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+package failover
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/task"
+)
+
+// world is a small model of a cluster of three servers for the steps: s1 ran the
+// primary of group 1 (node 1), s2 (the leader, the map group's server) and s3 host the
+// standbys 10 and 11 (nodes 4 and 5). Every call of the ports is recorded in order.
+type world struct {
+	mu    sync.Mutex
+	log   []string
+	nodes []Node
+	// shop is the catalog of a second sharded database: its own node ids (nil: no such database).
+	shop       []Node
+	noFollow   string
+	noWatchdog bool
+	term       int64
+	// the old primary's server
+	oldAlive      bool
+	oldWritable   bool // its instance still runs
+	oldRefusesDem error
+	// standbys
+	standbys       []StandbyRec
+	pos            map[string]Position // by server
+	posErr         map[string]error
+	facts          GroupFacts
+	live           map[string]string
+	lease          map[string]bool // server holds the lease of group 1
+	leaseHeldByOld bool            // the grantors still renew the old holder
+	frozen         bool
+	promoted       map[string]bool
+	promoteErr     map[string]error // scripted errors for the first calls, by server
+	promoteN       map[string]int
+	catScript      []any
+	catCalls       int
+	catalogFollows bool
+	primaryNames   []int64
+	rebalance      bool
+	settings       map[string]LeaseSettings
+	settingsErr    map[string]error
+	records        int
+	flagged        []int64
+	alerts         []string
+	rows           *memRows
+	prepared       int
+}
+
+func newWorld() *world {
+	w := &world{
+		oldAlive: false,
+		term:     5,
+		nodes: []Node{
+			{ID: 0, Group: 0, Host: "s2", Port: 5400, Role: "primary"},
+			{ID: 1, Group: 1, Host: "s1", Port: 5401, Role: "primary"},
+			{ID: 4, Group: 1, Host: "s2", Port: 5500, Role: "standby"},
+			{ID: 5, Group: 1, Host: "s3", Port: 5501, Role: "standby"},
+			{ID: 2, Group: 2, Host: "s3", Port: 5402, Role: "primary"},
+		},
+		standbys: []StandbyRec{
+			{ID: 10, Group: 1, Server: "s2", InstanceID: 101, Port: 5500, State: "ready", CatalogNode: 4},
+			{ID: 11, Group: 1, Server: "s3", InstanceID: 101, Port: 5501, State: "ready", CatalogNode: 5},
+		},
+		pos: map[string]Position{
+			"s2": {Server: "s2", Group: 1, InRecovery: true, Timeline: 1, ReceiveLsn: "0/5000000", ReplayLsn: "0/5000000", SystemIdentifier: "9"},
+			"s3": {Server: "s3", Group: 1, InRecovery: true, Timeline: 1, ReceiveLsn: "0/4000000", ReplayLsn: "0/4000000", SystemIdentifier: "9"},
+		},
+		posErr:         map[string]error{},
+		facts:          GroupFacts{SyncStreaming: true, LastKnownAge: time.Second},
+		live:           map[string]string{"s1": "dead", "s2": "live", "s3": "live"},
+		lease:          map[string]bool{},
+		promoted:       map[string]bool{},
+		promoteErr:     map[string]error{},
+		promoteN:       map[string]int{},
+		settings:       map[string]LeaseSettings{"s1": {10000, 3000}, "s2": {10000, 3000}, "s3": {10000, 3000}},
+		settingsErr:    map[string]error{},
+		catalogFollows: true,
+	}
+	w.rows = newMemRows()
+	return w
+}
+
+func (w *world) rec(format string, a ...any) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.log = append(w.log, fmt.Sprintf(format, a...))
+}
+
+func (w *world) index(prefix string) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for i, l := range w.log {
+		if len(l) >= len(prefix) && l[:len(prefix)] == prefix {
+			return i
+		}
+	}
+	return -1
+}
+
+func (w *world) count(prefix string) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n := 0
+	for _, l := range w.log {
+		if len(l) >= len(prefix) && l[:len(prefix)] == prefix {
+			n++
+		}
+	}
+	return n
+}
+
+// ---- Peers
+
+type fpeers struct{ w *world }
+
+func (p fpeers) unreach(server string) error {
+	if server == "s1" && !p.w.oldAlive {
+		return ErrUnreachable
+	}
+	return nil
+}
+
+func (p fpeers) Position(_ context.Context, server string, g int32) (Position, error) {
+	p.w.rec("position %s", server)
+	if err := p.w.posErr[server]; err != nil {
+		return Position{}, err
+	}
+	pos := p.w.pos[server]
+	if p.w.promoted[server] {
+		pos.InRecovery = false
+	}
+	return pos, nil
+}
+
+func (p fpeers) State(_ context.Context, server string, g int32) (State, error) {
+	if err := p.unreach(server); err != nil {
+		return State{}, err
+	}
+	p.w.rec("state %s", server)
+	st := State{Server: server, Group: g, Holds: p.w.lease[server], Frozen: p.w.frozen}
+	if server == "s1" {
+		f := false
+		st.Instances = []StateInstance{{ID: 1, Group: g, Running: p.w.oldWritable, InRecovery: &f, Role: "primary"}}
+		if !p.w.oldWritable {
+			st.Instances[0].Running = false
+		}
+		st.Holds = false
+		if p.w.oldWritable {
+			yes := !p.w.noWatchdog
+			st.Watchdog = &yes
+		}
+	} else if p.w.promoted[server] {
+		f := false
+		st.Instances = []StateInstance{{ID: 101, Group: g, Running: true, InRecovery: &f, Role: "primary"}}
+		st.Attached = true
+		z := p.w.prepared
+		st.Prepared = &z
+	} else {
+		t := true
+		st.Instances = []StateInstance{{ID: 101, Group: g, Running: true, InRecovery: &t, Role: "standby"}}
+	}
+	if p.w.lease[server] {
+		st.Adopted = "holder"
+	}
+	return st, nil
+}
+
+func (p fpeers) LeaseSettings(_ context.Context, server string) (LeaseSettings, error) {
+	if err := p.w.settingsErr[server]; err != nil {
+		return LeaseSettings{}, err
+	}
+	if err := p.unreach(server); err != nil {
+		return LeaseSettings{}, err
+	}
+	return p.w.settings[server], nil
+}
+
+func (p fpeers) Freeze(_ context.Context, server string, g int32, ttl time.Duration) error {
+	if err := p.unreach(server); err != nil {
+		return err
+	}
+	p.w.rec("freeze %s", server)
+	p.w.frozen = true
+	return nil
+}
+
+func (p fpeers) Unfreeze(_ context.Context, server string, g int32) error {
+	if err := p.unreach(server); err != nil {
+		return err
+	}
+	p.w.rec("unfreeze %s", server)
+	p.w.frozen = false
+	return nil
+}
+
+func (p fpeers) StandbysGone(_ context.Context, server, gone string, ttl time.Duration) error {
+	p.w.rec("gone %s %s", server, gone)
+	return nil
+}
+
+func (p fpeers) Demote(_ context.Context, server string, r DemoteRequest) (DemoteAnswer, error) {
+	if err := p.unreach(server); err != nil {
+		return DemoteAnswer{}, err
+	}
+	if p.w.oldRefusesDem != nil {
+		return DemoteAnswer{}, p.w.oldRefusesDem
+	}
+	p.w.rec("demote %s to=%s", server, r.TransferTo)
+	p.w.oldWritable = false
+	if r.TransferTo != "" {
+		p.w.lease[r.TransferTo] = true
+		p.w.leaseHeldByOld = false
+	}
+	return DemoteAnswer{Stopped: true, Transferred: r.TransferTo != ""}, nil
+}
+
+func (p fpeers) Lease(_ context.Context, server string, r LeaseRequest) (LeaseAnswer, error) {
+	switch {
+	case r.Role == LeaseRelease:
+		p.w.rec("lease-release %s", server)
+		return LeaseAnswer{}, nil
+	case r.TransferTo != "":
+		p.w.rec("lease-transfer %s to %s", server, r.TransferTo)
+		if !p.w.lease[server] {
+			return LeaseAnswer{Transferred: false}, nil
+		}
+		p.w.lease[server] = false
+		p.w.lease[r.TransferTo] = true
+		return LeaseAnswer{Transferred: true, Holder: r.TransferTo}, nil
+	}
+	p.w.rec("lease-%s %s", r.Role, server)
+	if p.w.leaseHeldByOld {
+		return LeaseAnswer{Held: false, WaitMs: 9000, RefusedBy: map[string]string{"s2": "s1", "s3": "s1"}}, nil
+	}
+	p.w.lease[server] = true
+	return LeaseAnswer{Held: true}, nil
+}
+
+func (p fpeers) Promote(_ context.Context, server string, r PromoteRequest) (PromoteAnswer, error) {
+	p.w.mu.Lock()
+	n := p.w.promoteN[server]
+	p.w.promoteN[server]++
+	p.w.mu.Unlock()
+	if err := p.w.promoteErr[fmt.Sprintf("%s#%d", server, n)]; err != nil {
+		p.w.rec("promote-error %s", server)
+		return PromoteAnswer{}, err
+	}
+	lostAnswer := p.w.promoteErr[fmt.Sprintf("%s#%d:after", server, n)]
+	if lostAnswer != nil && p.w.lease[server] && !p.w.promoted[server] {
+		// The callee did the work and its answer was lost.
+		p.w.rec("promote %s", server)
+		p.w.promoted[server] = true
+		return PromoteAnswer{}, lostAnswer
+	}
+	if r.ReapplyList {
+		p.w.rec("promote-reapply %s", server)
+		return PromoteAnswer{Status: "already"}, nil
+	}
+	if !p.w.lease[server] {
+		p.w.rec("promote-refused-lease %s", server)
+		return PromoteAnswer{}, &CallError{Status: 409, Code: "lease_not_held"}
+	}
+	if p.w.promoted[server] {
+		p.w.rec("promote-already %s", server)
+		return PromoteAnswer{Status: "already", Timeline: 2}, nil
+	}
+	p.w.rec("promote %s", server)
+	p.w.promoted[server] = true
+	return PromoteAnswer{Status: "promoted", Timeline: 2, Lsn: "0/5000100"}, nil
+}
+
+func (p fpeers) RecoverPrepared(_ context.Context, server string, g int32) error {
+	p.w.rec("recover-prepared-on %s", server)
+	return nil
+}
+
+func (p fpeers) Repoint(_ context.Context, server string, r RepointRequest) (RepointAnswer, error) {
+	p.w.rec("repoint %s to %s:%d", server, r.PrimaryHost, r.PrimaryPort)
+	return RepointAnswer{Streaming: true, State: "streaming"}, nil
+}
+
+// ---- Catalog
+
+type fcat struct{ w *world }
+
+func (c fcat) Databases(context.Context) ([]string, error) {
+	if c.w.shop != nil {
+		return []string{SystemDB, "shop"}, nil
+	}
+	return []string{SystemDB}, nil
+}
+
+func (c fcat) list(db string) *[]Node {
+	if db == "shop" {
+		return &c.w.shop
+	}
+	return &c.w.nodes
+}
+
+func (c fcat) Nodes(_ context.Context, db string) ([]Node, error) {
+	c.w.mu.Lock()
+	defer c.w.mu.Unlock()
+	return append([]Node(nil), (*c.list(db))...), nil
+}
+func (c fcat) Status(_ context.Context, db string) (int64, bool, error) {
+	return c.w.term, false, nil
+}
+func (c fcat) RecoverPrepared(context.Context) error { c.w.rec("recover-prepared"); return nil }
+func (c fcat) CheckCluster(context.Context) ([]Incident, error) {
+	return nil, nil
+}
+func (c fcat) PromoteNode(_ context.Context, db string, id int32) (PromoteResult, error) {
+	c.w.rec("promote_node %s %d", db, id)
+	c.w.mu.Lock()
+	defer c.w.mu.Unlock()
+	i := c.w.catCalls
+	c.w.catCalls++
+	if i < len(c.w.catScript) {
+		switch a := c.w.catScript[i].(type) {
+		case PromoteResult:
+			return a, nil
+		case error:
+			return PromoteResult{}, a
+		}
+	}
+	if c.w.catalogFollows && db != c.w.noFollow {
+		nodes := *c.list(db)
+		var oldID int32
+		for k := range nodes {
+			if nodes[k].Group == 1 && nodes[k].Role == "primary" {
+				oldID = nodes[k].ID
+			}
+		}
+		for k := range nodes {
+			switch nodes[k].ID {
+			case id:
+				nodes[k].Role = "primary"
+			case oldID:
+				nodes[k].Role = "standby"
+			}
+		}
+		if db == SystemDB {
+			c.w.term++
+		}
+	}
+	return PromoteResult{Status: "already", Term: c.w.term, Final: true, Unreached: []int32{1}}, nil
+}
+
+// ---- Planner
+
+type fplan struct{ w *world }
+
+func (p fplan) Self() string { return "s2" }
+func (p fplan) Members(context.Context) ([]string, error) {
+	return []string{"s1", "s2", "s3"}, nil
+}
+func (p fplan) Live(_ context.Context, s string) string { return p.w.live[s] }
+func (p fplan) Standbys(_ context.Context, g int32) ([]StandbyRec, error) {
+	var out []StandbyRec
+	for _, s := range p.w.standbys {
+		if s.Group == g {
+			out = append(out, s)
+		}
+	}
+	return out, nil
+}
+func (p fplan) Facts(context.Context, int32) (GroupFacts, error) { return p.w.facts, nil }
+func (p fplan) PrimaryNames(context.Context, string, int32) ([]int64, bool) {
+	if p.w.oldAlive && p.w.primaryNames != nil {
+		return p.w.primaryNames, true
+	}
+	return nil, false
+}
+func (p fplan) Preferred(_ context.Context, g int32, s string) bool { return s == "s3" }
+func (p fplan) Ring(from, to string) int                            { return 0 }
+func (p fplan) AfterPromotion(_ context.Context, g int32, s StandbyRec, srv string, port int) error {
+	p.w.rec("after-promotion %d %s:%d", s.ID, srv, port)
+	p.w.records++
+	var keep []StandbyRec
+	for _, x := range p.w.standbys {
+		if x.ID != s.ID {
+			keep = append(keep, x)
+		}
+	}
+	p.w.standbys = keep
+	return nil
+}
+func (p fplan) FlagRebuild(_ context.Context, id int64) error {
+	p.w.flagged = append(p.w.flagged, id)
+	return nil
+}
+func (p fplan) RebalanceRunning(context.Context) (bool, error) { return p.w.rebalance, nil }
+func (p fplan) SyncNamesOf(context.Context, string, int32) (string, int, bool) {
+	return "ANY 1 (kingres_standby_10)", 1, true
+}
+func (p fplan) Alert(_ context.Context, kind, sev, subject, msg string, raise bool) {
+	p.w.mu.Lock()
+	defer p.w.mu.Unlock()
+	if raise {
+		p.w.alerts = append(p.w.alerts, kind)
+	}
+}
+func (p fplan) Audit(_ context.Context, action string, g int32, d map[string]any) {
+	p.w.rec("audit %s", action)
+}
+
+// ---- Rows
+
+type memRows struct {
+	mu      sync.Mutex
+	run     RunRow
+	have    bool
+	groups  map[int32]*GroupRow
+	events  []string
+	outcome string
+	lost    bool
+}
+
+func newMemRows() *memRows { return &memRows{groups: map[int32]*GroupRow{}} }
+
+func (m *memRows) check() error {
+	if m.lost {
+		return ErrLeaseLost
+	}
+	return nil
+}
+
+func (m *memRows) Begin(_ context.Context, in Input, term int64, groups []GroupRow) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.check(); err != nil {
+		return err
+	}
+	if !m.have {
+		m.run, m.have = RunRow{TaskID: 1, ExpectedTerm: term}, true
+	}
+	for _, g := range groups {
+		g := g
+		if _, ok := m.groups[g.Group]; !ok {
+			m.groups[g.Group] = &g
+		}
+	}
+	return nil
+}
+func (m *memRows) Run(context.Context) (RunRow, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.run, m.have, nil
+}
+func (m *memRows) Group(_ context.Context, g int32) (GroupRow, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.groups[g]
+	if !ok {
+		return GroupRow{}, false, nil
+	}
+	return *r, true, nil
+}
+func (m *memRows) Set(_ context.Context, g int32, u GroupSet) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.check(); err != nil {
+		return err
+	}
+	r := m.groups[g]
+	if u.State != nil {
+		r.State = *u.State
+	}
+	if u.NewServer != nil {
+		r.NewServer = *u.NewServer
+	}
+	if u.NewNode != nil {
+		r.NewNode = *u.NewNode
+	}
+	if u.ChosenStandby != nil {
+		r.ChosenStandby = *u.ChosenStandby
+	}
+	if u.TermAfter != nil {
+		r.TermAfter = u.TermAfter
+	}
+	if u.Unreached != nil {
+		r.Unreached = u.Unreached
+	}
+	if u.ClearPin {
+		r.ChosenStandby = 0
+	}
+	if u.LeaseWaitMs != nil {
+		r.LeaseWaitMs = u.LeaseWaitMs
+	}
+	return nil
+}
+func (m *memRows) Pin(_ context.Context, g int32, s StandbyRec, d, l []byte) (StandbyRec, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.check(); err != nil {
+		return s, false, err
+	}
+	r := m.groups[g]
+	if r.ChosenStandby != 0 {
+		return StandbyRec{ID: r.ChosenStandby, Group: g, Server: r.NewServer, CatalogNode: r.NewNode, InstanceID: s.InstanceID}, false, nil
+	}
+	r.ChosenStandby, r.NewServer, r.NewNode = s.ID, s.Server, s.CatalogNode
+	return s, true, nil
+}
+func (m *memRows) Event(_ context.Context, g *int32, step, kind string, d map[string]any) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.events = append(m.events, step+"/"+kind)
+	return m.check()
+}
+func (m *memRows) Finish(_ context.Context, outcome, text string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.check(); err != nil {
+		return err
+	}
+	m.outcome = outcome
+	return nil
+}
+func (m *memRows) Abandon(_ context.Context, outcome, text string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.outcome = outcome
+	return nil
+}
+
+// ---- driving the steps
+
+func (w *world) runner() *Runner {
+	return &Runner{
+		Peers: fpeers{w}, Cat: fcat{w}, Plan: fplan{w},
+		NewRows:   func(int64) Rows { return w.rows },
+		Sleep:     func(ctx context.Context, d time.Duration) error { return ctx.Err() },
+		LeaseWait: 3 * time.Second, LeasePoll: 10 * time.Millisecond, ReadBound: 3 * time.Second,
+		PromoteNode: PromoteOptions{Pause: time.Millisecond},
+		SyncWait:    time.Millisecond, PreparedWait: time.Millisecond, ClientsWait: time.Millisecond,
+	}
+}
+
+// clockSleep makes Sleep advance a fake clock so that the bounds end.
+func (w *world) fakeClock(r *Runner) {
+	now := time.Unix(1_000_000, 0)
+	r.Now = func() time.Time { return now }
+	r.Sleep = func(ctx context.Context, d time.Duration) error { now = now.Add(d); return ctx.Err() }
+}
+
+func hardInput() Input {
+	return Input{Mode: ModeHard, ServerID: "s1", Groups: []int32{1}, Trigger: "manual", RequestedBy: "tester"}
+}
+
+// runAll runs every step of the task once, in order. It returns the error of the
+// first step that fails and its name.
+func runAll(t *testing.T, r *Runner, in Input) (string, error) {
+	t.Helper()
+	raw, _ := json.Marshal(in)
+	steps, err := r.steps(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range steps {
+		env := &task.Env{Task: task.Task{ID: 1, Input: raw}}
+		err := s.Run(context.Background(), env)
+		var sk *task.SkipError
+		if errors.As(err, &sk) {
+			continue
+		}
+		if err != nil {
+			return s.Name, err
+		}
+	}
+	return "", nil
+}

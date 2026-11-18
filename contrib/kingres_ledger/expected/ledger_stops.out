@@ -509,7 +509,7 @@ SELECT (SELECT count(*) FROM pg_extension WHERE extname = 'kingres_ledger') AS e
        (SELECT count(*) FROM pg_event_trigger) AS event_triggers;
  extensions | catalog_tables | capture_triggers | event_triggers 
 ------------+----------------+------------------+----------------
-          1 |              9 |                2 |              3
+          1 |             12 |                5 |              3
 (1 row)
 
 SELECT count(*) AS findings FROM kingres.ledger_verify();

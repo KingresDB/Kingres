@@ -130,6 +130,9 @@ static void conn_xact_callback(XactEvent event, void *arg);
 static void conn_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 								  SubTransactionId parentSubid, void *arg);
 static void exec_internal(KsConn *kc, const char *sql);
+static void exec_internal_ext(KsConn *kc, const char *sql, bool force_bound);
+static char *abbreviate_sql(const char *sql);
+static char *conn_label(KsConn *kc);
 static void append_timezone_setting(StringInfo buf);
 static void append_dtx_label(StringInfo buf);
 static void remember_timezone(KsConn *kc);
@@ -455,6 +458,19 @@ node_label(const char *host, int port)
 }
 
 /*
+ * How a node is named in an error (N1 of S13): its id and the address as registered, which an
+ * operator can look up, also for a node registered by a socket directory.  The id is the one
+ * found when the session was got, so no catalog is read here (the callers include the callback
+ * of a subtransaction that commits, where the catalog is not safe to read).
+ */
+static char *
+conn_label(KsConn *kc)
+{
+	return kc->node_id > 0 ? psprintf("%d (%s:%d)", kc->node_id, kc->host, kc->port) :
+		psprintf("%s:%d", kc->host, kc->port);
+}
+
+/*
  * S11-01: a session that carried the writes of the user's transaction was closed.  Its writes
  * are rolled back by the node, the other nodes of the transaction would commit: the transaction
  * must not.  The note lives until the transaction ends (a savepoint that is rolled back does not
@@ -479,6 +495,26 @@ note_session_lost(KsConn *kc)
 	MemoryContextSwitchTo(old);
 }
 
+/*
+ * S13-01: a statement that ends the work of a node session (RELEASE SAVEPOINT, ROLLBACK TO SAVEPOINT) did not
+ * complete within node_timeout, or failed.  The session is closed and the transaction must not commit: other
+ * sessions may have released the work of the same subtransaction already, and the closed one took with it
+ * what it held.  Said once, at the commit or the prepare of the transaction (an abort callback cannot raise
+ * an error), with an error that names the node.  The note lives as long as the one of a lost session.
+ */
+static void
+note_session_failed(KsConn *kc, const char *what)
+{
+	MemoryContext old;
+
+	if (session_lost_msg != NULL)
+		return;
+	old = MemoryContextSwitchTo(TopMemoryContext);
+	session_lost_msg = psprintf("node %s did not complete %s, and its session was closed",
+								conn_label(kc), what);
+	MemoryContextSwitchTo(old);
+}
+
 static void
 check_session_lost(void)
 {
@@ -486,7 +522,7 @@ check_session_lost(void)
 		ereport(ERROR,
 				(errcode(ERRCODE_CONNECTION_FAILURE),
 				 errmsg("%s", session_lost_msg),
-				 errdetail("What the transaction wrote on that node was rolled back with the session, so committing the rest would apply the transaction on some nodes only."),
+				 errdetail("What the transaction did on that node is rolled back with the session, or no longer follows the statement that failed, so committing the rest could apply the transaction on some nodes only."),
 				 errhint("Roll the transaction back and repeat it.")));
 }
 
@@ -948,10 +984,12 @@ kingres_shard_get_conn(const char *host, int port, bool missing_ok,
 		kc->sync_exempt = false;
 
 		kc->wrote_user = false;
+		kc->control_work = false;
 		kc->gid[0] = '\0';
 		kc->pending_owner = NULL;
 		kc->pending_finish = NULL;
 	}
+	kc->node_id = kingres_shard_conn_node_id(host, port);
 
 	/* An asynchronous fetch of a scan must finish before the connection is used. */
 	kingres_shard_conn_quiesce(kc);
@@ -1087,6 +1125,7 @@ discard_connection(KsConn *kc)
 	kc->have_error = false;
 	kc->wrote = false;
 	kc->wrote_user = false;
+	kc->control_work = false;
 	kc->prepared = false;
 	kc->sync_forced = false;
 	kc->sync_exempt = false;
@@ -1123,6 +1162,7 @@ kingres_shard_forget_xact(KsConn *kc)
 	kc->tz_applied[0] = '\0';
 	kc->wrote = false;
 	kc->wrote_user = false;
+	kc->control_work = false;
 
 }
 
@@ -1349,8 +1389,8 @@ kingres_shard_begin_xact(KsConn *kc)
 	if (kc->have_error || kc->conn == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_CONNECTION_FAILURE),
-				 errmsg("connection to node %s:%d is in an unknown state",
-						kc->host, kc->port),
+				 errmsg("connection to node %s is in an unknown state",
+						conn_label(kc)),
 				 errhint("Roll back the transaction and try again.")));
 
 	if (kc->xact_depth <= 0)
@@ -1769,11 +1809,77 @@ kingres_shard_control_active(void)
 	return control_depth > 0;
 }
 
+/*
+ * The time of the call as a whole (S13-02).  kingres_shard.control_call_timeout is read when the
+ * outermost call starts (a change inside the call does not count), 0 means no limit, and the
+ * clock is the monotonic one.  The statements of the call are bounded by it only while the call
+ * runs (control_depth > 0): the commit of the transaction that follows is not part of the call.
+ */
+static instr_time control_started;
+static int64 control_budget_ms = 0;
+
+/* What is left of the time of the call in milliseconds (never negative), or -1 when it has no limit. */
+static int64
+control_time_left_ms(void)
+{
+	instr_time	now;
+
+	if (control_depth == 0 || control_budget_ms <= 0)
+		return -1;
+	INSTR_TIME_SET_CURRENT(now);
+	INSTR_TIME_SUBTRACT(now, control_started);
+	return Max(control_budget_ms - (int64) INSTR_TIME_GET_MILLISEC(now), 0);
+}
+
+/*
+ * The call took longer than control_call_timeout as a whole (S13-02): its own SQLSTATE, and words
+ * that do not say a node is dead.  waiting says which node the call was waiting for when the time
+ * ran out (NULL: it ran out between two statements).
+ */
+static void
+call_timeout_error(const char *waiting, const char *sql)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_KINGRES_CALL_TIMEOUT),
+			 errmsg("the call took longer than kingres_shard.control_call_timeout (%d seconds) as a whole",
+					kingres_shard_control_call_timeout),
+			 waiting != NULL ?
+			 errdetail("The time ran out while it waited for node %s to answer: %s.  That wait was cut short by what was left of the call's time: nothing says the node is dead or slow.",
+					   waiting, abbreviate_sql(sql)) :
+			 errdetail("The time ran out between two statements that it sends to nodes.  Nothing says that a node is dead or slow."),
+			 errhint("The state is the one of any call that failed: nothing of it was kept.  Do not fence a node because of this error.  Repeat the call, with a longer control_call_timeout or none.")));
+}
+
+/* Called before a statement of a call is sent: the time of the call may be used up already. */
+static void
+check_call_budget(void)
+{
+	if (control_time_left_ms() == 0)
+		call_timeout_error(NULL, "");
+}
+
 void
 kingres_shard_control_enter(KsControlScope *scope)
 {
 	scope->saved_depth = control_depth;
+	if (control_depth == 0)
+	{
+		INSTR_TIME_SET_CURRENT(control_started);
+		control_budget_ms = (int64) kingres_shard_control_call_timeout * 1000;
+	}
 	control_depth++;
+}
+
+/* The nodes a call found stuck are forgotten with the call, with the text each one carries (S13 by reading). */
+static void
+free_stuck_nodes(void)
+{
+	ListCell   *lc;
+
+	foreach(lc, stuck_nodes)
+		pfree(((StuckNode *) lfirst(lc))->msg);
+	list_free_deep(stuck_nodes);
+	stuck_nodes = NIL;
 }
 
 void
@@ -1781,10 +1887,7 @@ kingres_shard_control_leave(KsControlScope *scope)
 {
 	control_depth = scope->saved_depth;
 	if (control_depth == 0)
-	{
-		list_free_deep(stuck_nodes);
-		stuck_nodes = NIL;
-	}
+		free_stuck_nodes();
 }
 
 /* A function of the SQL interface that is a control-plane call: its body runs in the scope. */
@@ -1832,38 +1935,59 @@ abbreviate_sql(const char *sql)
  * With elevel WARNING it returns, and the caller gets no result.
  */
 static void
-control_deadline(KsConn *kc, const char *sql, int elevel)
+control_deadline(KsConn *kc, const char *sql, int elevel, bool cut_by_call)
 {
 	char	   *what = abbreviate_sql(sql);
-	char	   *who = node_label(kc->host, kc->port);
+	char	   *who = conn_label(kc);
 	char	   *msg = psprintf("node %s did not answer within %d seconds", who, kingres_shard_node_timeout);
 
 	kc->in_query = false;
-	note_stuck(kc->host, kc->port, ERRCODE_KINGRES_NODE_TIMEOUT, msg);
+	/*
+	 * A statement that the end of a call sends (RELEASE, COMMIT) after the call has been left is
+	 * not remembered: stuck_nodes belongs to the call, and the next call in the same transaction
+	 * (a retry in a PL/pgSQL loop) must ask the node again.
+	 */
+	if (!cut_by_call && control_depth > 0)
+		note_stuck(kc->host, kc->port, ERRCODE_KINGRES_NODE_TIMEOUT, msg);
 	discard_connection(kc);
+	if (cut_by_call)
+		call_timeout_error(who, sql);
 	ereport(elevel,
 			(errcode(ERRCODE_KINGRES_NODE_TIMEOUT),
 			 errmsg_internal("%s", msg),
-			 errdetail("It accepted the session and was waiting for its answer to: %s", what),
+			 errdetail("It accepted the session and was waiting for its answer to: %s%s", what,
+					   strncmp(sql, "COMMIT TRANSACTION", 18) == 0 ?
+					   ".  Whether it committed is not known: the session was closed" : ""),
 			 errhint("The node is up but does not answer: look at its locks (pg_locks) and its backends (pg_stat_activity), or fence it.  Repeating the call does not help while it stays so.")));
 }
 
 /*
  * The answer of the statement in flight on kc.  In a control-plane call the wait is bounded by
- * node_timeout and *timed_out says that the node did not answer (the caller reports it, after
- * kc is closed); otherwise it waits for ever, as the statements of a user do (they can be
- * cancelled by the user).
+ * node_timeout (and by what is left of control_call_timeout, S13-02) and *timed_out says that the
+ * wait ran out (the caller reports it, after kc is closed; *cut_by_call says that it was the time
+ * of the call that ran out and not node_timeout); otherwise it waits for ever, as the statements of
+ * a user do (they can be cancelled by the user).  force_bound is the statements that the end of a
+ * node session needs (S13-01): RELEASE, ROLLBACK TO, and the COMMIT of a session that carried the
+ * work of a call; they wait at most node_timeout whatever the control depth is.
  */
 static PGresult *
-control_get_result(KsConn *kc, bool *timed_out)
+control_get_result(KsConn *kc, bool *timed_out, bool *cut_by_call, bool force_bound)
 {
 	bool		failed;
 	PGresult   *res;
+	int64		limit = (int64) kingres_shard_node_timeout * 1000;
+	int64		left = control_time_left_ms();
 
 	*timed_out = false;
-	if (control_depth == 0)
+	*cut_by_call = false;
+	if (control_depth == 0 && !force_bound)
 		return libpqsrv_get_result_last(kc->conn, PG_WAIT_EXTENSION);
-	res = bounded_get_last(kc->conn, true, &failed);
+	if (left >= 0 && left < limit)
+	{
+		limit = left;
+		*cut_by_call = true;
+	}
+	res = bounded_get_last_limit(kc->conn, true, limit, &failed);
 	if (failed)
 	{
 		*timed_out = (PQstatus(kc->conn) == CONNECTION_OK);
@@ -1881,8 +2005,7 @@ static void
 end_of_xact(void)
 {
 	control_depth = 0;
-	list_free_deep(stuck_nodes);
-	stuck_nodes = NIL;
+	free_stuck_nodes();
 	forget_session_lost();
 }
 
@@ -1894,10 +2017,22 @@ end_of_xact(void)
 static void
 exec_internal(KsConn *kc, const char *sql)
 {
+	exec_internal_ext(kc, sql, false);
+}
+
+static void
+exec_internal_ext(KsConn *kc, const char *sql, bool force_bound)
+{
 	PGresult   *res;
 	bool		timed_out;
+	bool		cut_by_call;
 
 	kingres_shard_conn_quiesce(kc);
+	if (control_depth > 0)
+	{
+		check_call_budget();
+		kc->control_work = true;
+	}
 	kc->in_query = true;
 	if (!PQsendQuery(kc->conn, sql))
 	{
@@ -1905,13 +2040,13 @@ exec_internal(KsConn *kc, const char *sql)
 		kc->in_query = false;
 		ereport(ERROR,
 				(errcode(ERRCODE_CONNECTION_FAILURE),
-				 errmsg("could not send a command to node %s:%d",
-						kc->host, kc->port),
+				 errmsg("could not send a command to node %s",
+						conn_label(kc)),
 				 errdetail_internal("%s", kingres_shard_conn_error_text(kc->conn))));
 	}
-	res = control_get_result(kc, &timed_out);
+	res = control_get_result(kc, &timed_out, &cut_by_call, force_bound);
 	if (timed_out)
-		control_deadline(kc, sql, ERROR);
+		control_deadline(kc, sql, ERROR, cut_by_call);
 	kc->in_query = false;
 	if (res == NULL || (PQresultStatus(res) != PGRES_COMMAND_OK &&
 						PQresultStatus(res) != PGRES_TUPLES_OK))
@@ -1931,8 +2066,14 @@ kingres_shard_exec(KsConn *kc, const char *sql)
 {
 	PGresult   *res;
 	bool		timed_out;
+	bool		cut_by_call;
 
 	kingres_shard_conn_quiesce(kc);
+	if (control_depth > 0)
+	{
+		check_call_budget();
+		kc->control_work = true;
+	}
 	kc->in_query = true;
 	if (!PQsendQuery(kc->conn, sql))
 	{
@@ -1940,13 +2081,13 @@ kingres_shard_exec(KsConn *kc, const char *sql)
 		kc->in_query = false;
 		ereport(ERROR,
 				(errcode(ERRCODE_CONNECTION_FAILURE),
-				 errmsg("could not send a command to node %s:%d",
-						kc->host, kc->port),
+				 errmsg("could not send a command to node %s",
+						conn_label(kc)),
 				 errdetail_internal("%s", kingres_shard_conn_error_text(kc->conn))));
 	}
-	res = control_get_result(kc, &timed_out);
+	res = control_get_result(kc, &timed_out, &cut_by_call, false);
 	if (timed_out)
-		control_deadline(kc, sql, ERROR);
+		control_deadline(kc, sql, ERROR, cut_by_call);
 	kc->in_query = false;
 	kc->nstatements++;
 	if (res == NULL || (PQresultStatus(res) != PGRES_COMMAND_OK &&
@@ -1969,6 +2110,7 @@ kingres_shard_exec_params(KsConn *kc, const char *sql, int nparams,
 {
 	PGresult   *res;
 	bool		timed_out;
+	bool		cut_by_call;
 
 	/*
 	 * A session that a deadline closed earlier in this call (S10-02): a caller that tolerates
@@ -1977,6 +2119,11 @@ kingres_shard_exec_params(KsConn *kc, const char *sql, int nparams,
 	if (kc->conn == NULL && !throw_on_error && control_depth > 0)
 		return NULL;
 	kingres_shard_conn_quiesce(kc);
+	if (control_depth > 0)
+	{
+		check_call_budget();
+		kc->control_work = true;
+	}
 	kc->in_query = true;
 	if (!PQsendQueryParams(kc->conn, sql, nparams, types, values, NULL, NULL, 0))
 	{
@@ -1987,14 +2134,14 @@ kingres_shard_exec_params(KsConn *kc, const char *sql, int nparams,
 			return NULL;
 		ereport(ERROR,
 				(errcode(ERRCODE_CONNECTION_FAILURE),
-				 errmsg("could not send a command to node %s:%d",
-						kc->host, kc->port),
+				 errmsg("could not send a command to node %s",
+						conn_label(kc)),
 				 errdetail_internal("%s", kingres_shard_conn_error_text(kc->conn))));
 	}
-	res = control_get_result(kc, &timed_out);
+	res = control_get_result(kc, &timed_out, &cut_by_call, false);
 	if (timed_out)
 	{
-		control_deadline(kc, sql, throw_on_error ? ERROR : WARNING);
+		control_deadline(kc, sql, throw_on_error ? ERROR : WARNING, cut_by_call);
 		return NULL;
 	}
 	kc->in_query = false;
@@ -2367,6 +2514,7 @@ reset_xact_state(KsConn *kc)
 	kc->tz_applied[0] = '\0';
 	kc->wrote = false;
 	kc->wrote_user = false;
+	kc->control_work = false;
 
 	kc->prepared = false;
 	kc->commit_sent = false;
@@ -2606,8 +2754,8 @@ prepare_one(KsConn *kc)
 		kc->in_query = false;
 		ereport(ERROR,
 				(errcode(ERRCODE_CONNECTION_FAILURE),
-				 errmsg("could not send PREPARE TRANSACTION to node %s:%d",
-						kc->host, kc->port),
+				 errmsg("could not send PREPARE TRANSACTION to node %s",
+						conn_label(kc)),
 				 errdetail_internal("%s", kingres_shard_conn_error_text(kc->conn))));
 	}
 	res = prepare_collect(kc, &prepared, &confirmed, &timed_out);
@@ -2646,21 +2794,21 @@ prepare_one(KsConn *kc)
 		if (said_no)
 			ereport(ERROR,
 					(errcode(ERRCODE_KINGRES_NOT_DURABLE),
-					 errmsg("node %s:%d did not confirm that its part of the transaction is durable on its synchronous standby",
-							kc->host, kc->port),
+					 errmsg("node %s did not confirm that its part of the transaction is durable on its synchronous standby",
+							conn_label(kc)),
 					 errdetail("The PREPARE TRANSACTION of the node was acknowledged, but its synchronous standby has not confirmed the record: the wait was cancelled or ended early, or the standby is down or too slow%s.",
 							   timed_out ? " (the node did not answer within kingres_shard.node_timeout)" : ""),
 					 errhint("The transaction was not committed anywhere.  Repeat it when the standby of the node is back, or remove the standby from synchronous_standby_names of the node.")));
 		if (prepared)
 			ereport(ERROR,
 					(errcode(sqlstate != 0 ? sqlstate : ERRCODE_CONNECTION_FAILURE),
-					 errmsg("could not confirm the prepared transaction on node %s:%d: %s",
-							kc->host, kc->port, remote),
+					 errmsg("could not confirm the prepared transaction on node %s: %s",
+							conn_label(kc), remote),
 					 errdetail("The transaction was prepared there, but the node did not say that the record is durable on its synchronous standby; nothing was committed.")));
 		ereport(ERROR,
 				(errcode(sqlstate != 0 ? sqlstate : ERRCODE_CONNECTION_FAILURE),
-				 errmsg("could not prepare the transaction on node %s:%d: %s",
-						kc->host, kc->port, remote),
+				 errmsg("could not prepare the transaction on node %s: %s",
+						conn_label(kc), remote),
 				 (sqlstate == ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE ||
 				  sqlstate == ERRCODE_OUT_OF_MEMORY) ?
 				 errhint("Two-phase commit needs max_prepared_transactions greater than zero on every node of the cluster, and enough of them for the transactions in flight.") : 0));
@@ -2781,7 +2929,7 @@ precommit(bool parallel)
 			elog(ERROR, "unexpected nested remote transaction at commit");
 		if (kc->wrote)
 			continue;
-		exec_internal(kc, "COMMIT TRANSACTION");
+		exec_internal_ext(kc, "COMMIT TRANSACTION", kc->control_work);
 		reset_xact_state(kc);
 	}
 	if (!use_2pc)
@@ -2795,7 +2943,7 @@ precommit(bool parallel)
 		{
 			if (kc->xact_depth <= 0 || !kc->wrote)
 				continue;
-			exec_internal(kc, "COMMIT TRANSACTION");
+			exec_internal_ext(kc, "COMMIT TRANSACTION", kc->control_work);
 			reset_xact_state(kc);
 		}
 		return;
@@ -3138,6 +3286,28 @@ conn_xact_callback(XactEvent event, void *arg)
 }
 
 /*
+ * A statement that undoes a savepoint in the abort of a subtransaction (ROLLBACK TO SAVEPOINT, then
+ * RELEASE SAVEPOINT) got no answer within node_timeout, or an error (S13-01).  An abort callback cannot
+ * raise an error, so: a WARNING that names the node, the session is closed as every abandoned session
+ * is (the node rolls the transaction back with it), and the transaction can no longer commit: the
+ * commit or prepare of it raises an error that names the node (note_session_failed).
+ */
+static void
+abort_savepoint_failed(KsConn *kc, const char *what, bool no_answer)
+{
+	bool		timed_out = no_answer && kc->conn != NULL && PQstatus(kc->conn) == CONNECTION_OK;
+
+	ereport(WARNING,
+			(errcode(timed_out ? ERRCODE_KINGRES_NODE_TIMEOUT : ERRCODE_CONNECTION_FAILURE),
+			 errmsg("node %s did not complete %s%s; its session was closed",
+					conn_label(kc), what,
+					timed_out ? psprintf(" within %d seconds", kingres_shard_node_timeout) : ""),
+			 errdetail("What this transaction did on that node is rolled back with the session; the transaction cannot be committed.")));
+	note_session_failed(kc, what);
+	discard_connection(kc);
+}
+
+/*
  * conn_subxact_callback
  *
  * Mirror the end of a local subtransaction on every connection that has a
@@ -3170,7 +3340,24 @@ conn_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 		if (event == SUBXACT_EVENT_COMMIT_SUB)
 		{
 			snprintf(sql, sizeof(sql), "RELEASE SAVEPOINT s%d", curlevel);
-			exec_internal(kc, sql);
+
+			/*
+			 * S13-01: bounded by node_timeout whatever the control depth is (a call has been left
+			 * when its subtransaction commits), and an error that names the node, not a wait that
+			 * nobody can end.  A failure also keeps this transaction from committing: the sessions
+			 * that were released before this one keep the work of a subtransaction that the error
+			 * is about to roll back.
+			 */
+			PG_TRY();
+			{
+				exec_internal_ext(kc, sql, true);
+			}
+			PG_CATCH();
+			{
+				note_session_failed(kc, "RELEASE SAVEPOINT");
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
 		}
 		else
 		{
@@ -3205,16 +3392,25 @@ conn_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 			snprintf(sql, sizeof(sql), "ROLLBACK TO SAVEPOINT s%d", curlevel);
 			res = kingres_shard_bounded_exec(kc->conn, sql, false);
 			if (res == NULL || PQresultStatus(res) != PGRES_COMMAND_OK)
-				kc->have_error = true;
-			PQclear(res);
-			if (!kc->have_error)
 			{
-				snprintf(sql, sizeof(sql), "RELEASE SAVEPOINT s%d", curlevel);
-				res = kingres_shard_bounded_exec(kc->conn, sql, false);
-				if (res == NULL || PQresultStatus(res) != PGRES_COMMAND_OK)
-					kc->have_error = true;
+				bool		no_answer = (res == NULL);
+
 				PQclear(res);
+				abort_savepoint_failed(kc, "ROLLBACK TO SAVEPOINT", no_answer);
+				continue;
 			}
+			PQclear(res);
+			snprintf(sql, sizeof(sql), "RELEASE SAVEPOINT s%d", curlevel);
+			res = kingres_shard_bounded_exec(kc->conn, sql, false);
+			if (res == NULL || PQresultStatus(res) != PGRES_COMMAND_OK)
+			{
+				bool		no_answer = (res == NULL);
+
+				PQclear(res);
+				abort_savepoint_failed(kc, "RELEASE SAVEPOINT", no_answer);
+				continue;
+			}
+			PQclear(res);
 		}
 		kc->xact_depth--;
 	}

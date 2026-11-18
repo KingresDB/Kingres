@@ -408,7 +408,7 @@ SET search_path = public;
 SET kingres_ledger.allow_manual_write = on;
 DELETE FROM kingres.ledger_pending;
 INSERT INTO kingres.ledger_entry
-SELECT 1000000000, 0, table_id, 'I', sha256('ghost') FROM kingres.ledger_table LIMIT 1;
+SELECT 1000000000, 0, table_id, 'I', sha256('ghost') FROM kingres.ledger_table WHERE relid = 'with_enum'::regclass;
 :trig_on;
 \c
 SET search_path = public;

@@ -468,8 +468,8 @@ JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdroppe
 WHERE c.relkind IN ('r', 'v')
   AND (has_column_privilege('public', c.oid, a.attnum, 'select'))
 ORDER BY 1, a.attnum;
-    relname    |    attname     
----------------+----------------
+    relname    |         attname         
+---------------+-------------------------
  ledger_blocks | height
  ledger_blocks | hash_version
  ledger_blocks | prev_hash
@@ -490,7 +490,9 @@ ORDER BY 1, a.attnum;
  ledger_table  | mode
  ledger_table  | enabled_at
  ledger_table  | history_relid
-(20 rows)
+ ledger_table  | signature_policy
+ ledger_table  | signature_required_from
+(22 rows)
 
 -- the functions of the extension that PUBLIC can execute and that read or
 -- write anything outside their arguments

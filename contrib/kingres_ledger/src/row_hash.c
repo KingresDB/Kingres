@@ -68,9 +68,10 @@ static bool kl_utf8_prepared = false;
  * alternation cost an SPI lookup (about 7 microseconds) on every row.
  *
  * Why it cannot serve a stale identity: only a positive answer is stored; a
- * row of the registry is never updated or deleted (the ledger tables are
- * append-only, and a ledger table cannot be dropped, so a relation id is not
- * reused), so an answer that was true once is true for as long as the row
+ * row of the registry is never deleted, and its table_id and relid are never
+ * updated (the ledger tables are append-only, except that ledger_set_signature_policy
+ * may switch the policy of a table from optional to required, which drops this cache;
+ * a ledger table cannot be dropped, so a relation id is not reused), so an answer that was true once is true for as long as the row
  * can be seen; and everything that could make a stored answer wrong is
  * dropped by the callbacks of capture.c: the end of the transaction, in
  * every way (commit, abort, prepare), and the abort of a subtransaction (a
@@ -82,6 +83,7 @@ typedef struct KlIdEntry
 {
 	Oid			relid;			/* hash key */
 	int32		table_id;
+	bool		required;		/* signature_policy is required */
 } KlIdEntry;
 
 typedef struct KlHistEntry
@@ -89,6 +91,7 @@ typedef struct KlHistEntry
 	Oid			relid;			/* hash key */
 	int32		table_id;
 	Oid			history;
+	bool		required;
 } KlHistEntry;
 
 static MemoryContext kl_cache_cxt = NULL;
@@ -98,6 +101,7 @@ static HTAB *kl_hist_hash = NULL;
 /* The last answer of kl_lookup_table_id, in front of the hash: a run of rows of one table. */
 static Oid	kl_last_relid = InvalidOid;
 static int32 kl_last_table_id = 0;
+static bool kl_last_required = false;
 
 /* Saved plan of the table_id lookup. */
 static SPIPlanPtr kl_lookup_plan = NULL;
@@ -149,12 +153,35 @@ kl_table_cache_reset(void)
 int32
 kl_lookup_table_id(Oid relid)
 {
+	bool		required;
+
+	return kl_lookup_table_id_policy(relid, &required);
+}
+
+/*
+ * kl_lookup_table_id_policy
+ *		The same, and whether the table has the signature policy "required"
+ *		(0.3 part B).  The policy is read by the statement that reads the
+ *		identity, from the row as JSON, so that the one statement serves every
+ *		version of the SQL: the registry of 0.1 and 0.2 has no such column and
+ *		its answer is "not required".  It is kept with the identity for the rest
+ *		of the transaction; ledger_set_signature_policy drops the cache when it
+ *		changes the policy, and the abort of a subtransaction drops it as it
+ *		does the identities.
+ */
+int32
+kl_lookup_table_id_policy(Oid relid, bool *required)
+{
 	Datum		values[1];
 	int32		result = -1;
+	bool		req = false;
 	int			rc;
 
 	if (OidIsValid(relid) && relid == kl_last_relid)
+	{
+		*required = kl_last_required;
 		return kl_last_table_id;
+	}
 	if (kl_id_hash != NULL)
 	{
 		KlIdEntry  *hit = hash_search(kl_id_hash, &relid, HASH_FIND, NULL);
@@ -163,6 +190,8 @@ kl_lookup_table_id(Oid relid)
 		{
 			kl_last_relid = relid;
 			kl_last_table_id = hit->table_id;
+			kl_last_required = hit->required;
+			*required = hit->required;
 			return hit->table_id;
 		}
 	}
@@ -175,8 +204,11 @@ kl_lookup_table_id(Oid relid)
 		Oid			argtypes[1] = {REGCLASSOID};
 		SPIPlanPtr	plan;
 
-		plan = SPI_prepare("SELECT table_id FROM kingres.ledger_table "
-						   "WHERE relid OPERATOR(pg_catalog.=) $1",
+		plan = SPI_prepare("SELECT kl_t.table_id, "
+						   "COALESCE((pg_catalog.to_jsonb(kl_t) OPERATOR(pg_catalog.->>) 'signature_policy') "
+						   "OPERATOR(pg_catalog.=) 'required', false) "
+						   "FROM kingres.ledger_table kl_t "
+						   "WHERE kl_t.relid OPERATOR(pg_catalog.=) $1",
 						   1, argtypes);
 		if (plan == NULL)
 			elog(ERROR, "SPI_prepare failed: %s",
@@ -199,6 +231,9 @@ kl_lookup_table_id(Oid relid)
 
 		if (!isnull)
 			result = DatumGetInt32(d);
+		d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull);
+		if (!isnull)
+			req = DatumGetBool(d);
 	}
 	SPI_finish();
 
@@ -220,13 +255,17 @@ kl_lookup_table_id(Oid relid)
 											 sizeof(KlIdEntry));
 				ent = hash_search(kl_id_hash, &kl_last_relid, HASH_ENTER, NULL);
 				ent->table_id = kl_last_table_id;
+				ent->required = kl_last_required;
 			}
 			ent = hash_search(kl_id_hash, &relid, HASH_ENTER, NULL);
 			ent->table_id = result;
+			ent->required = req;
 		}
 		kl_last_relid = relid;
 		kl_last_table_id = result;
+		kl_last_required = req;
 	}
+	*required = req;
 	return result;
 }
 
@@ -459,9 +498,19 @@ kl_is_history_column(const char *name)
 Oid
 kl_lookup_history(Oid relid, int32 *table_id)
 {
+	bool		required;
+
+	return kl_lookup_history_policy(relid, table_id, &required);
+}
+
+/* The same, and whether the table has the signature policy "required". */
+Oid
+kl_lookup_history_policy(Oid relid, int32 *table_id, bool *required)
+{
 	Datum		values[1];
 	Oid			history = InvalidOid;
 	int32		tid = -1;
+	bool		req = false;
 	int			rc;
 
 	if (kl_hist_hash != NULL)
@@ -471,6 +520,7 @@ kl_lookup_history(Oid relid, int32 *table_id)
 		if (hit != NULL)
 		{
 			*table_id = hit->table_id;
+			*required = hit->required;
 			return hit->history;
 		}
 	}
@@ -482,9 +532,11 @@ kl_lookup_history(Oid relid, int32 *table_id)
 		Oid			argtypes[1] = {REGCLASSOID};
 		SPIPlanPtr	plan;
 
-		plan = SPI_prepare("SELECT table_id, history_relid::pg_catalog.oid "
-						   "FROM kingres.ledger_table "
-						   "WHERE relid OPERATOR(pg_catalog.=) $1",
+		plan = SPI_prepare("SELECT kl_t.table_id, kl_t.history_relid::pg_catalog.oid, "
+						   "COALESCE((pg_catalog.to_jsonb(kl_t) OPERATOR(pg_catalog.->>) 'signature_policy') "
+						   "OPERATOR(pg_catalog.=) 'required', false) "
+						   "FROM kingres.ledger_table kl_t "
+						   "WHERE kl_t.relid OPERATOR(pg_catalog.=) $1",
 						   1, argtypes);
 		if (plan == NULL)
 			elog(ERROR, "SPI_prepare failed: %s",
@@ -509,6 +561,10 @@ kl_lookup_history(Oid relid, int32 *table_id)
 						  &isnull);
 		if (!isnull)
 			history = DatumGetObjectId(d);
+		d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3,
+						  &isnull);
+		if (!isnull)
+			req = DatumGetBool(d);
 	}
 	SPI_finish();
 
@@ -526,8 +582,10 @@ kl_lookup_history(Oid relid, int32 *table_id)
 		ent = hash_search(kl_hist_hash, &relid, HASH_ENTER, NULL);
 		ent->table_id = tid;
 		ent->history = history;
+		ent->required = req;
 	}
 	*table_id = tid;
+	*required = req;
 	return history;
 }
 

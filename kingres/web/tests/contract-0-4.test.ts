@@ -32,16 +32,21 @@ describe('contract 0.4.0', () => {
   // problem codes) while this panel was adapted; 0.4.0 has 86 operations, the draft 88.
   // 0.7.0 added one operation (cancelStatement): 89.
   it('is revision 0.4.0 (86 operations) or a later one (88, from 0.7.0 89)', () => {
-    expect(['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0']).toContain(spec.info.version)
-    // 0.8.0 added the eleven operations of the Configuration tag: 100.
+    expect(['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0', '0.10.0']).toContain(
+      spec.info.version,
+    )
+    // 0.8.0 added the eleven operations of the Configuration tag: 100. 0.10.0 added four (getFailoverStatus,
+    // listFailoverReports, getFailoverReport, resetAutoFailoverCounter): 104.
     expect(Object.keys(operations)).toHaveLength(
       spec.info.version === '0.4.0'
         ? 86
-        : spec.info.version === '0.8.0' || spec.info.version === '0.9.0'
-          ? 100
-          : spec.info.version === '0.7.0'
-            ? 89
-            : 88,
+        : spec.info.version === '0.10.0'
+          ? 104
+          : spec.info.version === '0.8.0' || spec.info.version === '0.9.0'
+            ? 100
+            : spec.info.version === '0.7.0'
+              ? 89
+              : 88,
     )
   })
 
@@ -70,6 +75,8 @@ describe('contract 0.4.0', () => {
       no_replica_available: 409,
       system_database_stopped: 503,
       unsupported_operation: 422,
+      failover_needs_decision: 409,
+      lease_settings_differ: 409,
     }
     for (const [code, status] of Object.entries(want))
       expect(new MockProblem(code as ProblemCode).toProblem('r').status, code).toBe(status)

@@ -356,6 +356,20 @@ const entries: Record<ProblemCode, Entry> = {
     withDetail: true,
     retryable: true,
   },
+  failover_needs_decision: {
+    tone: 'warning',
+    heading: 'The failover needs your decision',
+    message:
+      'Promoting a standby could lose writes that it has not received. Read the plan, and repeat the request with data loss accepted if you want to go on.',
+    withDetail: true,
+  },
+  lease_settings_differ: {
+    tone: 'warning',
+    heading: 'The servers use different lease settings',
+    message:
+      'A failover needs every server to use the same lease duration and margin. Make the settings equal, then try again.',
+    withDetail: true,
+  },
   group_degraded: {
     tone: 'warning',
     heading: 'A shard group is degraded',

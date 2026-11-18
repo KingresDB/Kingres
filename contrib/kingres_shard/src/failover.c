@@ -132,10 +132,14 @@ target_refuse(const KsNode *tgt, int code, const char *what, const char *why)
 	if (code == ERRCODE_KINGRES_SECRET_UNKNOWN)
 		ereport(ERROR,
 				(errcode(code),
-				 errmsg("node %d (%s:%d) does not accept the session of this node: it holds a cluster secret that no node of the cluster has",
+				 errmsg("node %d (%s:%d) does not accept the session of this node: the two hold cluster secrets that do not match, and either may be the one that is behind",
 						tgt->node_id, tgt->host, tgt->port),
 				 errdetail("The node said: %s", why),
-				 errhint("The node missed a rotation of the cluster secret and the previous secret is no longer kept (or it missed two).  Repeating does not help: build the node again from a base backup of a node that has the current secret (kingres.remove_node(), then kingres.add_node()), or promote another standby of the group.")));
+				 errhint("Either that node missed a rotation of the cluster secret and the previous secret is no longer kept (or it missed two), or this node did.  "
+						 "Tell them apart before rebuilding anything: ask a third node of the cluster for a session to each of the two; the one that every other node refuses is the stale one.  "
+						 "If the node that refused is behind, build it again from a base backup of a node that has the current secret (kingres.remove_node(), then kingres.add_node()), or promote another standby of the group.  "
+						 "If every other node refuses this node, it is the stale one: do not rebuild the others, and run the call on a node that has the current secret.  Repeating does not help.")));
+
 	if (code == ERRCODE_KINGRES_NODE_TIMEOUT)
 		ereport(ERROR,
 				(errcode(code),

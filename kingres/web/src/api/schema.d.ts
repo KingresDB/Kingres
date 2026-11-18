@@ -694,11 +694,34 @@ export interface paths {
         put?: never;
         /**
          * Fail over a server
-         * @description Promotes the standbys of all primaries on this server to primary on their own servers.
-         *     `graceful` waits for the standbys to catch up and requires a `live` server (no data loss).
-         *     `hard` is for a dead or unresponsive server and can lose asynchronously replicated writes.
-         *     The promoted servers then carry extra load until `POST /replication/restore-preferred-primaries`.
-         *     Refused with 409 when a bucket would lose its last copy (no replica) or quorum is not available.
+         * @description Promotes, for every shard group whose primary runs on this server (or for the groups named in
+         *     `shardGroupIds`), one standby to primary on its own server, one group at a time, the map group first.
+         *     `graceful` is the planned switchover: it waits for the standbys to catch up and requires a `live`
+         *     server (no data loss). `hard` is for a dead or unresponsive server and can lose asynchronously
+         *     replicated writes. The promoted servers then carry extra load until
+         *     `POST /replication/restore-preferred-primaries`.
+         *
+         *     **0.10.0.** The request can name the groups (`shardGroupIds`), the standby to promote per group
+         *     (`targets`), accept a possible loss of data (`allowDataLoss`), ask for the plan only (`dryRun`: 200
+         *     `FailoverPlan`, nothing changes) and carry a `comment` for the audit event. A failover that could lose
+         *     data is refused with 409 `failover_needs_decision` until the request says `allowDataLoss`; the
+         *     `detail` names the groups and the loss, and `dryRun` answers the whole plan. Refused with 409 `no_replica_available` when a group has no
+         *     standby that is ready, `cluster_inconsistent` when a standby is not registered in the sharding catalog (or the
+         *     primary names one in `synchronous_standby_names` that the catalog does not have), 503 `quorum_unavailable` when the server that answers cannot hear a majority of the
+         *     servers, `lease_settings_differ` when the servers do not use the same lease duration and margin,
+         *     `version_mismatch`, `failover_in_progress` (one failover or restore at a time, cluster-wide),
+         *     `rebalance_in_progress` (a rebalance that did not stop within a minute) and `operation_in_progress`.
+         *     422 `node_state_invalid` for `graceful` on a server that is not `live`, 422 `unprocessable` for a group
+         *     the server is not primary of or a target that is not a standby of the group. While `kingresd` lacks a
+         *     part of the design, the request answers 422 `unsupported_operation`: this revision's server implements
+         *     `hard` for ordinary groups only.
+         *
+         *     The task is `server.failover`, one block of steps per group (`TaskStep.shardGroupId`). A task that
+         *     waits for an operator is `paused`; a repeat of this request for the same server resumes it. From the moment
+         *     the task starts to stop the old primary of a group the task can only go forward (`Task.cancellable` is false:
+         *     the group has no primary until a standby is promoted, so a rollback is not offered in this revision; a cancel
+         *     before it lifts the freezes). The report id is
+         *     the task id (`getFailoverReport`). Needs `kingres_ops`.
          */
         post: operations["failoverServer"];
         delete?: never;
@@ -1162,8 +1185,100 @@ export interface paths {
          * @description After a failed server has returned, switches every shard group whose primary is not on its home
          *     server back to the home server (graceful switchover, one group at a time). Groups already on their
          *     preferred server are skipped. Long-running: returns a task.
+         *
+         *     **0.10.0.** The body is optional: `shardGroupIds` limits the groups, `dryRun` answers 200
+         *     `FailoverPlan` and changes nothing. Refused with the same 409 codes as `failoverServer`. This revision's
+         *     `kingresd` answers 422 `unsupported_operation` (the switchover is a later increment).
          */
         post: operations["restorePreferredPrimaries"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/failover": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the current failover status
+         * @description Added in 0.10.0. Whether a failover (or a restore of the preferred primaries) is running, paused for an
+         *     operator, failed or absent, with the progress of each group. Modelled on `getRebalanceStatus`. `taskId` is
+         *     null only while the map group is promoted before the system database is writable again. `needsDecision`
+         *     lists the groups that wait for the operator (data loss possible, a standby that cannot be read, a prepared
+         *     transaction in the way); a repeat of `failoverServer` with `allowDataLoss` goes on. `lastReport` is the
+         *     summary of the most recent finished run.
+         */
+        get: operations["getFailoverStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/failover/reports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List failover reports
+         * @description Added in 0.10.0. One report summary per finished, paused or failed failover run, newest first.
+         */
+        get: operations["listFailoverReports"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/failover/reports/{reportId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Failover report identifier (equals the failover task identifier). */
+                reportId: number;
+            };
+            cookie?: never;
+        };
+        /**
+         * Get a failover report
+         * @description Added in 0.10.0. The full report of one failover run: for each group the decision (candidates, positions, verdict), the terms before and after, the lease wait, the nodes that were not reached, the incidents the sharding extension reported, the state of the old primary, and the events. 404 for a run that has no report.
+         */
+        get: operations["getFailoverReport"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/settings/cluster/auto-failover/reset": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reset the counter of automatic failovers
+         * @description Added in 0.10.0. Sets `ClusterSettings.autoFailover.eventsSinceReset` to 0 (a rebalance does it too) and answers the settings after the reset. Immediate; no task. Needs `kingres_admin`.
+         */
+        post: operations["resetAutoFailoverCounter"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2388,7 +2503,7 @@ export interface components {
          *     system database was stopped on purpose; start it with `startThisServerInstance`).
          * @enum {string}
          */
-        ProblemCode: "bad_request" | "validation_failed" | "unauthenticated" | "invalid_credentials" | "session_expired" | "csrf_token_invalid" | "forbidden" | "setup_token_invalid" | "not_found" | "method_not_allowed" | "conflict" | "already_exists" | "immutable_field" | "rebalance_in_progress" | "operation_in_progress" | "task_not_cancellable" | "last_admin" | "role_in_use" | "optimistic_lock_failed" | "no_replica_available" | "instance_already_running" | "instance_already_stopped" | "server_owns_buckets" | "server_hosts_map_group" | "last_server" | "server_group_not_empty" | "ledger_entry_pending" | "quorum_unavailable" | "system_database_stopped" | "unprocessable" | "sql_error" | "unsupported_operation" | "node_state_invalid" | "node_uninitialized" | "map_group_unavailable" | "leader_unavailable" | "rate_limited" | "service_unavailable" | "internal_error" | "certificate_revoked" | "certificate_authority_unavailable" | "internal_api_disabled" | "workbench_busy" | "config_parameter_unknown" | "config_parameter_managed" | "config_parameter_refused" | "config_level_not_allowed" | "config_value_below_floor" | "config_change_superseded" | "config_restart_order_conflict" | "nothing_pending" | "nothing_to_rebalance" | "rebalance_not_running" | "cluster_inconsistent" | "version_mismatch" | "failover_in_progress" | "group_degraded" | "insufficient_disk" | "no_receiving_server";
+        ProblemCode: "bad_request" | "validation_failed" | "unauthenticated" | "invalid_credentials" | "session_expired" | "csrf_token_invalid" | "forbidden" | "setup_token_invalid" | "not_found" | "method_not_allowed" | "conflict" | "already_exists" | "immutable_field" | "rebalance_in_progress" | "operation_in_progress" | "task_not_cancellable" | "last_admin" | "role_in_use" | "optimistic_lock_failed" | "no_replica_available" | "instance_already_running" | "instance_already_stopped" | "server_owns_buckets" | "server_hosts_map_group" | "last_server" | "server_group_not_empty" | "ledger_entry_pending" | "quorum_unavailable" | "system_database_stopped" | "unprocessable" | "sql_error" | "unsupported_operation" | "node_state_invalid" | "node_uninitialized" | "map_group_unavailable" | "leader_unavailable" | "rate_limited" | "service_unavailable" | "internal_error" | "certificate_revoked" | "certificate_authority_unavailable" | "internal_api_disabled" | "workbench_busy" | "config_parameter_unknown" | "config_parameter_managed" | "config_parameter_refused" | "config_level_not_allowed" | "config_value_below_floor" | "config_change_superseded" | "config_restart_order_conflict" | "nothing_pending" | "nothing_to_rebalance" | "rebalance_not_running" | "cluster_inconsistent" | "version_mismatch" | "failover_in_progress" | "group_degraded" | "insufficient_disk" | "no_receiving_server" | "failover_needs_decision" | "lease_settings_differ";
         /** @description One invalid field of a request. */
         ValidationIssue: {
             /** @description JSON Pointer (RFC 6901) to the invalid property of the request body, or the name of the invalid query or path parameter. */
@@ -3117,6 +3232,14 @@ export interface components {
                  */
                 taskId: number | null;
             };
+            /** @description Added in 0.10.0, optional. Whether a failover is running, as `rebalance` does for a rebalance. */
+            failover?: {
+                running: boolean;
+                /** Format: int64 */
+                taskId?: number | null;
+                serverId?: string | null;
+                phase?: string | null;
+            };
             /** @description Auto-failover summary. */
             autoFailover: {
                 /** @description Whether auto-failover is enabled. */
@@ -3125,6 +3248,13 @@ export interface components {
                 eventsSinceReset: number;
                 /** @description Maximum automatic failovers before manual intervention is required. */
                 maxCount: number;
+                /** @description Added in 0.10.0, optional. True when `eventsSinceReset` has reached `maxCount`. */
+                limitReached?: boolean;
+                /**
+                 * Format: date-time
+                 * @description Added in 0.10.0, optional. When the last automatic failover was made.
+                 */
+                lastEventAt?: string | null;
             };
             /** @description Number of open alerts per severity. */
             openAlerts: {
@@ -3309,13 +3439,254 @@ export interface components {
             /** @description False excludes the server from bucket placement at the next rebalance. */
             shouldHaveShards?: boolean;
         };
-        /** @description Failover options. */
+        /** @description Failover options. Members after `mode` were added in 0.10.0 and are optional. */
         FailoverRequest: {
             /**
-             * @description `graceful` waits for standbys to catch up (server must be live); `hard` promotes immediately and can lose async writes.
+             * @description `graceful` is the planned switchover: it waits for standbys to catch up (server must be live); `hard` promotes immediately and can lose async writes.
              * @enum {string}
              */
             mode: "hard" | "graceful";
+            /** @description The groups whose primary runs on the server that are failed over. Default all of them. */
+            shardGroupIds?: number[];
+            /** @description The standby to promote, per group. Default the standby that holds the most WAL. */
+            targets?: components["schemas"]["FailoverTarget"][];
+            /**
+             * @description The operator accepts the loss the plan states. A failover whose verdict is not `none` is refused with 409 `failover_needs_decision` without it. Ignored by a switchover.
+             * @default false
+             */
+            allowDataLoss?: boolean;
+            /**
+             * @description Compute and answer the plan (200 `FailoverPlan`); change nothing.
+             * @default false
+             */
+            dryRun?: boolean;
+            /** @description Recorded in the audit event. */
+            comment?: string;
+        };
+        /** @description The standby to promote for one group. */
+        FailoverTarget: {
+            /** Format: int32 */
+            shardGroupId: number;
+            serverId: components["schemas"]["ServerId"];
+        };
+        /** @description Added in 0.10.0. Options of `restorePreferredPrimaries`; every member is optional. */
+        RestorePreferredPrimariesRequest: {
+            /** @description Restore only these groups. */
+            shardGroupIds?: number[];
+            /**
+             * @description Answer the plan and change nothing.
+             * @default false
+             */
+            dryRun?: boolean;
+        };
+        /** @description Added in 0.10.0. What a failover or restore would do, answered for `dryRun` and carried by the 409 `failover_needs_decision`. */
+        FailoverPlan: {
+            /** Format: date-time */
+            generatedAt: string;
+            /** @enum {string} */
+            kind: "failover" | "restorePreferredPrimaries";
+            /** @enum {string} */
+            mode: "hard" | "graceful" | "restore";
+            /** @description The server that is failed over; null for a restore. */
+            serverId: components["schemas"]["ServerId"] | null;
+            /** @description Whether the request would be accepted as it is (blockers that `allowDataLoss` lifts are listed and make this false). */
+            canProceed: boolean;
+            blockers: components["schemas"]["FailoverBlocker"][];
+            willStopRebalance: boolean;
+            groups: components["schemas"]["FailoverGroupPlan"][];
+        };
+        /** @description Why a failover cannot proceed as asked. */
+        FailoverBlocker: {
+            /** @description The problem code the request would get, or `failoverNeedsDecision`. */
+            code: string;
+            /** Format: int32 */
+            shardGroupId: number | null;
+            message: string;
+        };
+        /** @description The plan for one group. */
+        FailoverGroupPlan: {
+            /** Format: int32 */
+            shardGroupId: number;
+            isMapGroup: boolean;
+            fromServerId: components["schemas"]["ServerId"];
+            /** @description Null when no candidate qualifies. */
+            toServerId: components["schemas"]["ServerId"] | null;
+            candidates: components["schemas"]["FailoverCandidate"][];
+            dataLoss: components["schemas"]["DataLossAssessment"];
+            estimatedSeconds: number | null;
+            /** @description Only for a switchover. */
+            writesPausedSeconds: number | null;
+            /** @description The step names, English. */
+            steps: string[];
+            /** @description True for the map group. */
+            movesTheManager: boolean;
+        };
+        /** @description A standby that could be promoted. */
+        FailoverCandidate: {
+            serverId: components["schemas"]["ServerId"];
+            /** Format: int64 */
+            standbyId: number;
+            /** @description Whether its position could be read. */
+            readable: boolean;
+            eligible: boolean;
+            ineligibleReason: string | null;
+            /** @description Flushed WAL position, PostgreSQL X/Y form. */
+            receiveLsn: string | null;
+            replayLsn: string | null;
+            /**
+             * Format: int64
+             * @description Against the last position of the primary the leader knew.
+             */
+            lagBytes: number | null;
+            syncState: components["schemas"]["ReplicationSyncState"] | null;
+            chosen: boolean;
+        };
+        /** @description What a failover of one group can lose. */
+        DataLossAssessment: {
+            /**
+             * @description `none`: every ready standby was read, the best is the one chosen and the group streamed a synchronous standby (or every database is `async`). `asyncOnly`: only commits acknowledged under `async` can be lost. `possible`: the group ran without its synchronous standby, or the target is behind the best. `unknown`: a ready standby could not be read.
+             * @enum {string}
+             */
+            verdict: "none" | "asyncOnly" | "possible" | "unknown";
+            message: string;
+            lastKnownPrimaryLsn: string | null;
+            chosenReceiveLsn: string | null;
+            lastKnownAgeSeconds: number | null;
+            groupRanWithoutSynchronousStandby: boolean;
+            asyncDatabases: string[];
+            unreadableServerIds: components["schemas"]["ServerId"][];
+        };
+        /** @description Added in 0.10.0. Current failover state. */
+        FailoverStatus: {
+            /** @enum {string} */
+            state: "idle" | "running" | "paused" | "failed";
+            /** @description One of `checking`, `waitingForLease`, `choosing`, `promoting`, `followingCatalog`, `repointing`, `finishing`, and for a switchover `quiescing`, `waitingForTransactions`, `stopping`, `verifying`; `bootstrap` for the map group. Clients must tolerate other values. */
+            phase?: string | null;
+            /** @enum {string|null} */
+            kind?: "failover" | "restorePreferredPrimaries" | null;
+            /** @enum {string|null} */
+            trigger?: "manual" | "automatic" | null;
+            /** Format: int64 */
+            taskId?: number | null;
+            serverId?: string | null;
+            /** Format: date-time */
+            startedAt?: string | null;
+            pausedReason?: string | null;
+            needsDecision: components["schemas"]["FailoverBlocker"][];
+            groups: components["schemas"]["FailoverGroupProgress"][];
+            cancellable: boolean;
+            lastReport: components["schemas"]["FailoverReportSummary"] | null;
+        };
+        FailoverGroupProgress: {
+            /** Format: int32 */
+            shardGroupId: number;
+            /** @enum {string} */
+            state: "pending" | "frozen" | "fenced" | "pinned" | "promoted" | "done" | "failed" | "skipped";
+            phase?: string | null;
+            fromServerId: components["schemas"]["ServerId"];
+            toServerId?: string | null;
+            /** Format: date-time */
+            writesPausedSince?: string | null;
+            message?: string | null;
+        };
+        FailoverReportSummary: {
+            /** Format: int64 */
+            id: number;
+            /** @enum {string} */
+            kind: "failover" | "restorePreferredPrimaries";
+            /** @enum {string} */
+            trigger: "manual" | "automatic";
+            serverId: string | null;
+            /** @enum {string} */
+            outcome: "completed" | "partial" | "failed" | "cancelled" | "paused";
+            /** Format: date-time */
+            startedAt: string;
+            /** Format: date-time */
+            finishedAt: string | null;
+            requestedBy: string;
+            totals: {
+                groupsTotal: number;
+                groupsDone: number;
+                groupsFailed: number;
+                groupsSkipped: number;
+                durationSeconds: number;
+            };
+            dataLossPossible: boolean;
+            error: string | null;
+        };
+        FailoverReportPage: {
+            /** @description Summaries, newest first. */
+            items: components["schemas"]["FailoverReportSummary"][];
+            nextCursor: components["schemas"]["NextCursor"];
+        };
+        /** @description The full report of one run. */
+        FailoverReport: components["schemas"]["FailoverReportSummary"] & {
+            /** @enum {string} */
+            mode: "hard" | "graceful" | "restore";
+            options: components["schemas"]["FailoverRequest"];
+            groups: components["schemas"]["FailoverGroupReport"][];
+            events: components["schemas"]["FailoverEvent"][];
+        };
+        FailoverGroupReport: {
+            /** Format: int32 */
+            shardGroupId: number;
+            /** @enum {string} */
+            outcome: "done" | "failed" | "skipped" | "pending";
+            skipReason: string | null;
+            fromServerId: components["schemas"]["ServerId"];
+            toServerId: string | null;
+            /** Format: int64 */
+            termBefore: number | null;
+            /** Format: int64 */
+            termAfter: number | null;
+            /** Format: int64 */
+            timeline: number | null;
+            leaseWaitMs: number | null;
+            durationSeconds: number;
+            candidates: components["schemas"]["FailoverCandidate"][];
+            dataLoss: components["schemas"]["DataLossAssessment"];
+            unreachedServerIds: components["schemas"]["ServerId"][];
+            incidents: components["schemas"]["FailoverIncident"][];
+            oldPrimary: components["schemas"]["OldPrimaryReport"];
+            error: string | null;
+        };
+        FailoverIncident: {
+            /** @description The extension's names, for example `prepared_rolled_back_after_failover`, `participant_lost_committed_transaction`, `foreign_prepared_transaction`. */
+            kind: string;
+            message: string;
+        };
+        OldPrimaryReport: {
+            /**
+             * @description `notScheduled`: this revision of kingresd does not turn the old primary into a standby again (a later increment does); it stays stopped and fenced.
+             * @enum {string}
+             */
+            state: "notScheduled" | "rebuildScheduled" | "rebuilding" | "standby" | "waitingForServer" | "removed" | "failed";
+            /** @enum {string|null} */
+            method: "clean" | "pgRewind" | "baseBackup" | null;
+            /** Format: int64 */
+            divergenceBytes: number | null;
+            /** Format: int64 */
+            rewindBytes: number | null;
+            message: string | null;
+        };
+        FailoverEvent: {
+            /** Format: date-time */
+            at: string;
+            /** Format: int32 */
+            shardGroupId: number | null;
+            step: string;
+            kind: string;
+            message: string;
+        };
+        /** @description Added in 0.10.0. Whether a failover of the group would be possible now, computed by the leader from its last standby check and the liveness view without a network call per request; never `possible` while a failover runs. */
+        FailoverReadiness: {
+            possible: boolean;
+            candidateServerId: string | null;
+            /** @enum {string|null} */
+            dataLossVerdict: "none" | "asyncOnly" | "possible" | "unknown" | null;
+            blockers: components["schemas"]["FailoverBlocker"][];
+            /** Format: date-time */
+            checkedAt: string;
         };
         /** @description A rack or zone. */
         ServerGroup: {
@@ -3878,6 +4249,7 @@ export interface components {
             /** @description Replication slots on the primary. */
             slots: components["schemas"]["ReplicationSlot"][];
             lease?: components["schemas"]["GroupLease"];
+            failover?: components["schemas"]["FailoverReadiness"];
         };
         /**
          * @description Added in 0.7.0, optional (absent when the answering server knows nothing about the group's lease). The lease
@@ -4219,6 +4591,11 @@ export interface components {
             state: "pending" | "running" | "done" | "failed" | "skipped";
             /** @description Extra information about the step, for example `Waiting for server db3, which cannot be reached`. Set while the step runs, and for a step that was `skipped` (the reason, for example `skipped: needs kingres_shard 0.5`); null otherwise. */
             detail?: string | null;
+            /**
+             * Format: int32
+             * @description Added in 0.10.0, optional. The shard group a step of a multi-group task (`server.failover`) belongs to; null for a step of the whole task.
+             */
+            shardGroupId?: number | null;
             /** @description Items completed, for example buckets moved. */
             itemsDone?: number | null;
             /** @description Items in total. */
@@ -4558,7 +4935,7 @@ export interface components {
          *     `failure`. Read-only operations are not audited except `executeQuery`.
          * @enum {string}
          */
-        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "enableTableLedger" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert" | "renewServerCertificates" | "revokeServerCertificates" | "certificateRenewed" | "certificateRenewalFailed" | "cancelStatement" | "leaseLost" | "leaseFenced" | "leaseAcquired" | "standbyCreated" | "standbyRemoved" | "standbyRebuilt" | "standbyInstanceStarted" | "standbyInstanceRemoved" | "standbyInstanceRebuilt" | "synchronousStandbyNamesChanged" | "replicationSlotDropped" | "applyConfigChange" | "revertConfigChange" | "restartPendingInstances";
+        AuditAction: "login" | "logout" | "loginFailed" | "setupTokenRejected" | "initCluster" | "joinCluster" | "updateThisServerSettings" | "restartThisServerInstance" | "stopThisServerInstance" | "startThisServerInstance" | "leaveCluster" | "addServer" | "updateServer" | "removeServer" | "failoverServer" | "autoFailover" | "createServerGroup" | "deleteServerGroup" | "createDatabase" | "updateDatabase" | "dropDatabase" | "distributeTable" | "enableTableLedger" | "restorePreferredPrimaries" | "startRebalance" | "stopRebalance" | "cancelTask" | "createRole" | "updateRole" | "deleteRole" | "setRoleMemberships" | "setRoleClusterRoles" | "createGrant" | "revokeGrants" | "applyGrantTemplate" | "replaceNetworkAccess" | "updateClusterSettings" | "generateLedgerDigest" | "startLedgerVerification" | "executeQuery" | "acknowledgeAlert" | "renewServerCertificates" | "revokeServerCertificates" | "certificateRenewed" | "certificateRenewalFailed" | "cancelStatement" | "leaseLost" | "leaseFenced" | "leaseAcquired" | "standbyCreated" | "standbyRemoved" | "standbyRebuilt" | "standbyInstanceStarted" | "standbyInstanceRemoved" | "standbyInstanceRebuilt" | "synchronousStandbyNamesChanged" | "replicationSlotDropped" | "applyConfigChange" | "revertConfigChange" | "restartPendingInstances" | "resetAutoFailoverCounter" | "failoverGroupStarted" | "failoverGroupPromoted" | "failoverGroupFailed" | "oldPrimaryRebuilt";
         /** @description One audit log entry. */
         AuditEvent: {
             /**
@@ -4622,12 +4999,17 @@ export interface components {
             autoFailover: {
                 /** @description Whether failed servers are failed over automatically. */
                 enabled: boolean;
-                /** @description Seconds without heartbeat before auto-failover. */
+                /** @description Seconds without heartbeat before auto-failover. The minimum is 30 since 0.10.0 (it was 1: a shorter time cannot tell a failure from a pause). */
                 timeoutSeconds: number;
-                /** @description Maximum automatic failovers before an operator must intervene; reset by a rebalance. */
+                /** @description Maximum automatic failovers before an operator must intervene; reset by a rebalance and by `resetAutoFailoverCounter`. */
                 maxCount: number;
                 /** @description Automatic failovers since the last reset. */
                 readonly eventsSinceReset: number;
+                /**
+                 * Format: date-time
+                 * @description Added in 0.10.0, optional. When the last automatic failover was made; null when none was.
+                 */
+                readonly lastEventAt?: string | null;
             };
             rebalance: components["schemas"]["RebalanceSettings"];
             features: components["schemas"]["FeatureFlags"];
@@ -4664,7 +5046,7 @@ export interface components {
             autoFailover?: {
                 /** @description Enable or disable auto-failover. */
                 enabled?: boolean;
-                /** @description Seconds without heartbeat before auto-failover. */
+                /** @description Seconds without heartbeat before auto-failover. The minimum is 30 since 0.10.0 (it was 1: a shorter time cannot tell a failure from a pause). */
                 timeoutSeconds?: number;
                 /** @description Maximum automatic failovers. */
                 maxCount?: number;
@@ -5585,7 +5967,7 @@ export interface components {
          *     `server:<leader>|behind:<server>`, `warning` after a minute, `critical` after ten).
          * @enum {string}
          */
-        AlertKind: "serverDown" | "serverSuspect" | "underReplicatedBuckets" | "unavailableBuckets" | "replicationLagHigh" | "diskSpaceLow" | "memoryPressure" | "rebalanceNeeded" | "autoFailoverTriggered" | "autoFailoverLimitReached" | "mapGroupUnavailable" | "ledgerVerificationFailed" | "ledgerPendingTooOld" | "versionMismatch" | "certificateExpiring" | "certificateRenewalFailed" | "replicationPending" | "taskFailed" | "leaseLost" | "groupWithoutSynchronousStandby" | "groupUnderReplicated" | "clockDifference";
+        AlertKind: "serverDown" | "serverSuspect" | "underReplicatedBuckets" | "unavailableBuckets" | "replicationLagHigh" | "diskSpaceLow" | "memoryPressure" | "rebalanceNeeded" | "autoFailoverTriggered" | "autoFailoverLimitReached" | "mapGroupUnavailable" | "ledgerVerificationFailed" | "ledgerPendingTooOld" | "versionMismatch" | "certificateExpiring" | "certificateRenewalFailed" | "replicationPending" | "taskFailed" | "leaseLost" | "groupWithoutSynchronousStandby" | "groupUnderReplicated" | "clockDifference" | "failoverNeedsDecision" | "failoverBlocked" | "failoverDataLoss" | "splitPromotion" | "oldPrimaryRunning" | "oldPrimaryNotStopped" | "oldPrimaryNotRebuilt";
         /** @description An alert. */
         Alert: {
             /**
@@ -6642,6 +7024,15 @@ export interface operations {
             };
         };
         responses: {
+            /** @description The plan of a request with `dryRun` true; nothing was changed. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FailoverPlan"];
+                };
+            };
             202: components["responses"]["AcceptedTask"];
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
@@ -7224,13 +7615,137 @@ export interface operations {
             path?: never;
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["RestorePreferredPrimariesRequest"];
+            };
+        };
         responses: {
+            /** @description The plan of a request with `dryRun` true; nothing was changed. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FailoverPlan"];
+                };
+            };
             202: components["responses"]["AcceptedTask"];
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             405: components["responses"]["MethodNotAllowed"];
             409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getFailoverStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Failover status. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FailoverStatus"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    listFailoverReports: {
+        parameters: {
+            query?: {
+                /** @description Maximum number of items to return. */
+                limit?: components["parameters"]["Limit"];
+                /** @description Opaque cursor taken from `nextCursor` of the previous page. Omit for the first page. */
+                cursor?: components["parameters"]["Cursor"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A page of report summaries. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FailoverReportPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getFailoverReport: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Failover report identifier (equals the failover task identifier). */
+                reportId: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The report. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FailoverReport"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            422: components["responses"]["UnprocessableEntity"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    resetAutoFailoverCounter: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The cluster settings after the reset. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClusterSettings"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            405: components["responses"]["MethodNotAllowed"];
             422: components["responses"]["UnprocessableEntity"];
             503: components["responses"]["ServiceUnavailable"];
         };

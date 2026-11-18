@@ -38,7 +38,6 @@
  * part of the WAL format for ever (README, "Resource manager id").
  */
 #define KC_RMGR_ID			RM_EXPERIMENTAL_ID
-#define KC_AM_NAME			"columnar"
 #define KC_EXTENSION_NAME	"kingres_columnar"
 #define KC_CATALOG_NAME		"columnar_stripe"
 #define KC_CATALOG_PKEY		"columnar_stripe_pkey"
@@ -285,6 +284,10 @@ extern int	kc_guc_chunk_rows;
 extern int	kc_guc_write_buffer_kb;
 extern int	kc_guc_max_stripe_rows;
 extern int	kc_guc_orphan_notes_max;
+extern int	kc_guc_truncate_lock_timeout;
+
+/* how long a vacuum asks for the exclusive lock of its truncation, as heap does (ms) */
+#define KC_TRUNCATE_LOCK_TIMEOUT	5000
 extern int	kc_max_stripe_rows(void);
 extern bool kc_guc_enable_custom_scan;
 extern bool kc_guc_enable_chunk_skipping;
@@ -355,8 +358,35 @@ extern uint64 kc_crc32c(const char *data, uint64 len);
  */
 extern Oid	kc_catalog_oid(void);
 extern Oid	kc_catalog_index_oid(void);
-extern Oid	kc_am_oid(void);
+
+/*
+ * Is an access method this extension's: decided by its handler, never by its
+ * name (C11-02).
+ */
+typedef enum KcAmClass
+{
+	KC_AM_COLUMNAR,				/* its handler is ours */
+	KC_AM_OTHER,				/* another table access method */
+	KC_AM_UNKNOWN				/* cannot be told: no such access method is visible */
+} KcAmClass;
+
+typedef struct KcAmMemo
+{
+	Oid			amoid;
+	KcAmClass	cls;
+} KcAmMemo;
+
+extern KcAmClass kc_am_class(Oid amoid);
+extern KcAmClass kc_am_class_memo(Oid amoid, KcAmMemo *memo);
+extern bool kc_am_is_columnar(Oid amoid);
+extern void kc_am_cache_init(void);
 extern bool kc_rel_is_columnar(Relation rel);
+
+/* the test gates of the check (kingres_columnar.c) */
+#define KC_GATE_TABLES		1
+#define KC_GATE_ORPHANS		2
+#define KC_GATE_CLAIMS		3
+extern void kc_check_gate(int which);
 extern Snapshot kc_catalog_snapshot(Snapshot snap, bool *is_mvcc);
 extern Snapshot kc_latest_snapshot(void);
 
@@ -366,6 +396,8 @@ typedef struct KcCatLocks
 	int			n;
 	Oid			oid[12];
 	LOCKMODE	mode[12];
+	Oid			failed_oid;		/* the relation that could not be locked, and in what mode */
+	LOCKMODE	failed_mode;
 } KcCatLocks;
 extern bool kc_catalog_lock_nowait(KcCatLocks *l, LOCKMODE mode);
 extern void kc_catalog_unlock(KcCatLocks *l);

@@ -163,7 +163,7 @@ func (e *ExcludedError) Error() string {
 // excluded maps the database error of the exclusion trigger, nil for any other error.
 func excluded(kind string, err error) error {
 	var pe *pgconn.PgError
-	if errors.As(err, &pe) && (pe.Code == "KX001" || pe.Code == "KX002" || pe.Code == "KX003" || pe.Code == "KX004") {
+	if errors.As(err, &pe) && (pe.Code == "KX001" || pe.Code == "KX002" || pe.Code == "KX003" || pe.Code == "KX004" || pe.Code == "KX005") {
 		return &ExcludedError{Kind: kind, Other: pe.Detail}
 	}
 	return nil
@@ -244,6 +244,15 @@ func (e *Env) Fence() int64 { return e.lease.Epoch }
 func (e *Env) Secret(name string) (string, bool) {
 	v, ok := e.secrets[name]
 	return v, ok
+}
+
+// Coded is implemented by an error of a step that carries the code and the retry
+// hint the task is recorded with (a task of a kind that documents its own codes,
+// such as the failover); any other error is recorded as CodeStepFailed.
+type Coded interface {
+	error
+	TaskCode() string
+	TaskRetryable() bool
 }
 
 // Step is one idempotent unit of work. Run may be called again after an
@@ -646,6 +655,10 @@ func (e *Engine) run(ctx context.Context, t Task, started time.Time, secrets map
 			}
 			if ctx.Err() != nil {
 				return ctx.Err() // interrupted, not failed: resumes later
+			}
+			var coded Coded
+			if errors.As(err, &coded) {
+				return e.fail(ctx, t, i, st, &Error{Code: coded.TaskCode(), Step: st.Name, Retryable: coded.TaskRetryable(), Message: clip(err.Error())})
 			}
 			return e.fail(ctx, t, i, st, &Error{Code: CodeStepFailed, Step: st.Name, Retryable: true, Message: clip(err.Error())})
 		}
