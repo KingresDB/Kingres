@@ -61,6 +61,12 @@ int			kl_max_clock_skew = 3600000;
 /* GUC: how long a role that is not a superuser may hold a lock of the extension, in ms; 0 = no limit. */
 int			kl_lock_hold_limit = 60000;
 
+/* GUC: most time one transaction may add to the hold limit for ledger_enable, in ms; 0 = no bound. */
+int			kl_enable_credit_limit = 1800000;
+
+/* GUC (developer, for the tests): ms that ledger_register_table waits after each batch. */
+int			kl_enable_batch_delay = 0;
+
 /* Set in _PG_init when loaded through shared_preload_libraries. */
 bool		kl_preloaded = false;
 
@@ -126,13 +132,39 @@ _PG_init(void)
 
 	DefineCustomIntVariable("kingres_ledger.lock_hold_limit",
 							"How long a role that is not a superuser may hold a lock of the ledger.",
-							"The block builders, ledger_enable and ledger_verify_recorded hold a lock of the extension until the end of the transaction of the caller. A session of a role that is not a superuser that is still in that transaction this long after it got the lock is ended, so that no such role can stop the builders, or the capture that depends on them, for longer than the administrator allows. The setting cannot be changed by the role it limits. 0 means no limit.",
+							"The block builders, ledger_enable and ledger_verify_recorded hold a lock of the extension until the end of the transaction of the caller, and a role that is not a superuser may call them only as a statement of its own. A session of such a role that is still in that statement this long after it got the lock is ended, so that no such role can stop the builders, or the capture that depends on them, for longer than the administrator allows (ledger_enable may add the time it spends entering rows, up to kingres_ledger.enable_credit_limit). The setting cannot be changed by the role it limits. 0 means no limit.",
 							&kl_lock_hold_limit,
 							60000,
 							0,
 							2147483647,
 							PGC_SUSET,
 							GUC_UNIT_MS,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("kingres_ledger.enable_credit_limit",
+							"The most time that ledger_enable may add to the hold limit of a role that is not a superuser in one transaction.",
+							"While ledger_enable enters the rows that a table holds, the time it spends is added to kingres_ledger.lock_hold_limit, so that a table of honest size is not ended by the limit; this is the most that one transaction may add, for all the tables it enters. A table that needs longer is enabled by a superuser. 0 means no bound. The setting cannot be changed by the role it limits.",
+							&kl_enable_credit_limit,
+							1800000,
+							0,
+							2147483647,
+							PGC_SUSET,
+							GUC_UNIT_MS,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("kingres_ledger.enable_batch_delay",
+							"Developer setting for the tests: how long ledger_register_table waits after each batch of rows.",
+							"The wait counts as time spent entering rows. It is 0 in every real use.",
+							&kl_enable_batch_delay,
+							0,
+							0,
+							60000,
+							PGC_SUSET,
+							GUC_UNIT_MS | GUC_NOT_IN_SAMPLE,
 							NULL,
 							NULL,
 							NULL);
@@ -226,7 +258,15 @@ kingres_ledger_lock_table(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
 
+	kl_require_own_statement("ledger_enable");
 	kl_check_owner(relid);
+	/*
+	 * The order of the locks is checked before the wait for the table (L19-04):
+	 * a caller that holds a later lock of the extension and then waits for a
+	 * table that another session holds, while that session waits for the later
+	 * lock, would be a deadlock; the call is refused instead.
+	 */
+	kl_check_lock_order(KL_REGISTRY_LOCK_SUBID);
 	LockRelationOid(relid, ShareRowExclusiveLock);
 	kl_check_owner(relid);
 

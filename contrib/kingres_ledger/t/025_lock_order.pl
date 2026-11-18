@@ -172,8 +172,8 @@ for my $r (1 .. 3)
 		PERFORM kingres.ledger_verify_recorded();
 		PERFORM kingres.ledger_enable('a10');
 		EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'sqlstate=%', SQLSTATE;
-		END $$}, extra_params => [ '-U', 'app' ]);
-	like($err, qr/NOTICE:  sqlstate=KL006/, 'the error has an SQLSTATE of its own, KL006');
+		END $$});
+	like($err, qr/NOTICE:  sqlstate=KL006/, 'the error has an SQLSTATE of its own, KL006 (a superuser: a role that is not one cannot call a writer inside an EXCEPTION block, L19-01)');
 
 	my @pairs = (
 		[ 'verifications then registry', q{kingres.ledger_verify_recorded(), kingres.ledger_enable('a11')} ],
@@ -188,20 +188,21 @@ for my $r (1 .. 3)
 		like($err, qr/ERROR:  cannot take the .* of the ledger extension/, "$p->[0]: refused, with no other session involved");
 		cmp_ok($took, '<', 5, 'and at once (no wait, no deadlock timeout)');
 	}
-	# The lock is asked for in the order across calls of one transaction too.
+	# The lock is asked for in the order across calls of one transaction too (a superuser: a role that
+	# is not one cannot hold a lock across statements, L19-01).
 	($ret, $out, $err) = $node->psql('d', qq{BEGIN;\nSELECT kingres.ledger_verify_recorded() > 0;\nSELECT kingres.ledger_enable('a13') IS NULL;\nSELECT kingres.ledger_enable('a14') IS NULL;\nCOMMIT;},
-		extra_params => [ '-U', 'app' ]);
+		extra_params => []);
 	unlike($err, qr/ERROR:  cannot take the registry's lock.*\n.*ERROR:  cannot take/s, 'one error only');
 	like($err, qr/ERROR:  cannot take the registry's lock of the ledger extension: this transaction already holds the verifications' lock/,
 		'a registry call after the verifications\' lock, in a transaction block, is refused');
 	# Asking again for a lock that is held is not out of order.
 	($ret, $out, $err) = $node->psql('d', qq{BEGIN;\nSELECT kingres.ledger_enable('a15') IS NULL;\nSELECT kingres.ledger_enable('a16') IS NULL;\nSELECT kingres.ledger_verify_recorded() > 0;\nSELECT kingres.ledger_verify_recorded() > 0;\nCOMMIT;},
-		extra_params => [ '-U', 'app' ]);
+		extra_params => []);
 	is($ret, 0, 'the registry\'s lock asked for again, and the verifications\' lock asked for again, are not refused') or diag($err);
 	unlike($err, qr/cannot take/, 'no error');
 	# A subtransaction that took a later lock and was rolled back leaves no trace.
 	($ret, $out, $err) = $node->psql('d', qq{BEGIN;\nSAVEPOINT s;\nSELECT kingres.ledger_verify_recorded() > 0;\nROLLBACK TO s;\nSELECT kingres.ledger_enable('a17') IS NULL;\nCOMMIT;},
-		extra_params => [ '-U', 'app' ]);
+		extra_params => []);
 	is($ret, 0, 'a lock that was taken in a savepoint that was rolled back is not held: the order is not violated') or diag($err);
 	unlike($err, qr/cannot take/, 'no error');
 }

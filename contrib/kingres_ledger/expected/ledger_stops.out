@@ -1239,6 +1239,10 @@ ALTER TABLE s_hand ENABLE ALWAYS TRIGGER kingres_ledger_block_modify;
 ALTER TABLE s_hand ENABLE ALWAYS TRIGGER kingres_ledger_block_truncate;
 ALTER TABLE s_hand ENABLE ALWAYS TRIGGER kingres_ledger_capture;
 -- An unlogged table, made the same way: the check of the persistence gives its own answer.
+-- (by the owner role, a superuser: a role that is not one cannot call the function inside a
+-- transaction block, which keeps this table from being left behind, L19-01)
+\c - :owner_name
+SET search_path = public;
 BEGIN;
 CREATE UNLOGGED TABLE s_unl (id int);
 CREATE TRIGGER kingres_ledger_capture AFTER INSERT ON s_unl FOR EACH ROW EXECUTE FUNCTION kingres.ledger_capture(:'gap_id');

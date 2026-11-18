@@ -183,7 +183,8 @@ sub fresh_stderr
 for my $iso ('READ COMMITTED', 'REPEATABLE READ', 'SERIALIZABLE')
 {
 	# ledger_verify_recorded: the second call takes the id after the first one's.
-	my $s1 = session_as('aud');
+	# a superuser: a role that is not one cannot call it in a transaction block (L19-01)
+	my $s1 = session_as($super);
 	$s1->query_safe("BEGIN ISOLATION LEVEL $iso; SELECT count(*) FROM kingres.ledger_blocks");
 	my $id2 = as_role('aud', q{SELECT kingres.ledger_verify_recorded()});
 	fresh_stderr($s1);
@@ -313,7 +314,8 @@ is($node->safe_psql('d', q{SELECT count(*) = count(DISTINCT removal_id) FROM kin
 # L15-08: what an identifier is
 #--------------------------------------------------------------------------
 {
-	my $s = session_as('aud');
+	# a superuser: a role that is not one cannot call it in a transaction block (L19-01)
+	my $s = session_as($super);
 	my $in = $s->query_safe('BEGIN; SELECT kingres.ledger_verify_recorded()');
 	$in =~ s/\s+//g;
 	$s->query_safe('ROLLBACK');

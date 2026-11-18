@@ -7,6 +7,176 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-18 (second entry): step 2 of phase 2b, the fixes for the first failover increments, the libraries of phase 7 closed, and fix rounds with their reviews
+
+Covers the work from the early morning to noon of 2026-11-18.
+
+### What was done
+
+- **Phase 2b, step 2 of thirteen** (f7872a2065, notes in
+  [design/shard-phase2b.md](design/shard-phase2b.md) under "Step 2" and
+  "What step 3 will find changed", 1fd06a4e06): the check that the tables
+  of a query are placed together, pruning of the shard groups from the
+  conditions on the distribution column, a nonce for the part that runs
+  on the coordinator itself, and reads that join a local table, which
+  are answered by the scan that moves rows. No query is pushed down as a
+  whole yet; that begins with step 3.
+- **`kingres_shard` 0.5, the fixes for the fourth review of the call
+  sequences** (d98a42b7ee, S12-01 to S12-06): a remote transaction no
+  longer sets `lock_timeout`, each statement of a control call has its
+  own bound, and a refusal of a node is classed by the node's SQLSTATE.
+  The fifth review
+  ([reviews/2026-11-18-kingres-shard-0.5-fifth-sequences.md](reviews/2026-11-18-kingres-shard-0.5-fifth-sequences.md))
+  found one high defect in what is published (S13-01, see "Still open").
+- **Failover in `kingresd`**: the fixes for FO-01 to FO-16 and for the
+  rest of ST-05 to ST-10 (3f48af6945, f47960a975, design notes
+  57533db902). Their review
+  ([reviews/2026-11-18-kingresd-failover-fixes.md](reviews/2026-11-18-kingresd-failover-fixes.md))
+  has seventeen findings, one of them high (F2-01: the list of a frozen
+  group changes when a standby is added). They are being fixed together
+  with increment 3 (a failover started by hand).
+- **`kingres_ledger` 0.3, the guard**, two more fix rounds and two
+  reviews (04f4963266 for L17, 1c412b7317 for L19; reviews
+  [fifth](reviews/2026-11-18-kingres-ledger-0.3-guard-fifth-review.md)
+  and
+  [sixth](reviews/2026-11-18-kingres-ledger-0.3-guard-sixth-review.md)).
+  The sixth review showed that the timer which bounds a hold could still
+  be lost inside an aborted subtransaction. The rule was made simpler
+  instead of the tracking more exact (see "Decisions").
+- **The verifier**, two fix rounds (aa9c9b7b51 for L16, 62ec7dd648 for
+  L18) and the review between them
+  ([reviews/2026-11-18-kingres-verifier-seventh-fixes.md](reviews/2026-11-18-kingres-verifier-seventh-fixes.md),
+  the eighth of this component), whose reviewer advised to stop
+  reviewing it. The track is closed.
+- **`kingres_columnar` 0.1**: the band in the wraparound test and a log
+  line for autovacuum on a columnar table (017df7e72e), the fixes for
+  the tenth review (8f06094292, C10-01 to C10-08), the review of the
+  ninth round
+  ([reviews/2026-11-18-kingres-columnar-0.1-ninth-fixes.md](reviews/2026-11-18-kingres-columnar-0.1-ninth-fixes.md)).
+  The eleventh review is running.
+- **Phase 7, the anchoring libraries**: fix rounds three to five
+  (4eaa526cc2, 7730bbbf56, 11c06466ba) with the
+  [third](reviews/2026-11-18-kingresd-anchoring-libraries-third.md),
+  [fourth](reviews/2026-11-18-kingresd-anchoring-libraries-fourth.md) and
+  [fifth](reviews/2026-11-18-kingresd-anchoring-libraries-fifth.md)
+  reviews. The track is closed; what a caller must do is in the section
+  "Duties of the caller" of the package documentation.
+- **Phase 7, the libraries for keys and logs**: three reviews
+  ([first](reviews/2026-11-18-kingresd-key-and-log-libraries.md),
+  [second](reviews/2026-11-18-kingresd-key-and-log-libraries-second.md),
+  [third](reviews/2026-11-18-kingresd-key-and-log-libraries-third.md))
+  and three fix rounds (67026e0b53, c5c07c43e6, 316bf4ea7e). The third
+  review judged them fit to be wired into the daemon; the last round is
+  small and is covered by the review of the wiring.
+- **Designs**: corrections 85 to 110 of
+  [design/ledger-phase7.md](design/ledger-phase7.md).
+- **The integration run** allows the skips of the library tests that
+  need third-party vectors or run long (5771c52700, b9d4347549).
+
+### How it was verified
+
+Run by the integrator on the tree that was committed, unless it says
+otherwise.
+
+- `kingres_shard` at f7872a2065: on 18.7 13 regression tests and 106 TAP
+  files with 10064 tests; on 19rc2 106 TAP files with 10723 tests; in
+  the tree of `kingres-19` 190 passed, none failed, one skipped. The
+  cluster tests of `kingresd` that use distributed tables, routing,
+  rebalancing and standbys, from an export of the committed control
+  plane against the new extension: 19 of 19 on each major.
+- `kingresd` at 3f48af6945 and f47960a975: complete integration runs,
+  938 passed and one failed on 19rc2; 1112 passed and one failed on 18.7
+  (`TestClientEntryPoint`, ten of ten alone afterwards, see "Still
+  open").
+- `kingres_ledger` at 1c412b7317: in tree on 18.7 34 of 34 twice; out of
+  tree on 19rc2 18 regression tests and 30 TAP files with 1521 tests; no
+  warning on either major. The tests of `kingresd` that use the ledger
+  are being run against it; it is not published before they pass.
+- The verifier at 62ec7dd648: on Linux and on Windows (328 passing and
+  22 skipped, twice).
+- `kingres_columnar` at 8f06094292: in tree 42 of 42 twice after a race
+  in a test helper was removed (the session now reports its own process
+  id).
+- The anchoring libraries at 11c06466ba: on Linux 294 passing and 17
+  skipped, four runs (two with the race detector); on Windows 292 and
+  19.
+- The libraries for keys and logs at 316bf4ea7e, with a built verifier
+  required: on Linux 162 passing and 3 skipped, twice plain and twice
+  with the race detector, the long run 165, without a verifier 155 and
+  10 skipped; on Windows 151 and 14 skipped in four runs of five, the
+  fifth failing on the removal of a test's temporary directory.
+- Shown by the authors and the reviewers only: that each new test fails
+  without its fix, the mutants, the fuzz runs.
+
+### Decisions and deviations
+
+- **A role that is not a superuser calls a lock-taking function of the
+  ledger only as a statement of its own** (correction 108). The timer
+  that bounds the hold is then never armed inside a subtransaction, the
+  tracking per subtransaction is removed, and while the timer is armed
+  the transaction control statements are refused. A procedure or a
+  `DO` block of such a role that calls these functions gets `25001`.
+- **The time `ledger_enable` adds to the limit is bounded**
+  (`kingres_ledger.enable_credit_limit`, 30 minutes; correction 109).
+- **A note is signed again only when a key that counts vouches for it**
+  (correction 107), and every time a key set records is bounded against
+  its own latest record, not against a clock the package does not have.
+- **No further library review** for the verifier, the anchoring
+  libraries and the libraries for keys and logs. The next review of
+  them is the review of their wiring into `kingresd`.
+
+### Incidents on the build machine
+
+- The system drive fell to 10 GB free: a recursive listing left running
+  in the background had grown the page file to 47 GB. Stopped; the page
+  file shrank by itself.
+- WSL ran out of memory at 06:50: a reviewer's mutant removed an
+  allocation bound and a test then allocated 31 GB. The WSL service
+  failed afterwards and was restarted; every run of that window was
+  repeated. Since then every brief bounds a test or probe to 2 GB.
+- The system drive fell to 13 GB free again at noon (the page file and
+  the virtual disk of WSL); the Go build cache on Windows, the page
+  cache of WSL and the work areas of finished rounds were cleared.
+- A load average above about 16 makes the timing-sensitive suites fail
+  (connections between nodes that time out, a server that does not
+  start in its time); such runs were repeated alone before they were
+  judged.
+
+### Still open
+
+- **`kingres_shard`, S13-01 (high, published)**: `RELEASE SAVEPOINT`
+  after a control call inside a subtransaction has no bound. The fix,
+  with S13-02 to S13-06, is being written; step 3 of phase 2b (the batch
+  sender and the row router) starts when it is integrated, since both
+  change the connection code.
+- **Failover, F2-01 (high, published) and F2-02 to F2-17**, then
+  increments 3 to 9.
+- **`kingres_ledger`**: the fix for L19 is committed and not published
+  until the tests of `kingresd` pass against it; its review (the
+  seventh of the guard) is owed.
+- **Reviews owed**, one at a time: the eleventh of `kingres_columnar`
+  (running), the fix for L19, steps 1 and 2 of phase 2b, the fix for
+  S13, the fixes for F2 with increment 3.
+- **Two tests that depend on timing**: `TestClientEntryPoint` reads the
+  entry point right after the cluster is formed (failed once in a
+  complete run); the liveness subtest "a step of the wall clock changes
+  nothing" failed in a part of the repeats on 19rc2 before and after the
+  failover fixes (the reading of the review: the primary that the
+  watchdog fenced during the previous subtest is still restarting).
+- **The table of Bitcoin block headers** in the OpenTimestamps package
+  is older than a year; it must be extended before a release, which
+  needs a source the project owner chooses.
+- **`kingresd` and the owner of a database**: unchanged from the first
+  entry of this day.
+- **Phase 7 in `kingresd`** (steps 3 to 25) has not begun; it starts
+  from the duties of the caller that the three libraries state.
+
+### Core patches
+
+None.
+
+---
+
 ## 2026-11-18: failover begun in kingresd, the libraries of phase 7 for keys, logs and anchoring, and further fix rounds with their reviews
 
 Covers the work from the afternoon of 2026-11-17 to the early morning of

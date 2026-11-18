@@ -2637,6 +2637,62 @@ build to the corrected rule. The verifier's README has the same list with the re
     entry of its table of real headers against a time the caller states; the daemon warns when it is
     older than a year, and extending the table is a duty of every release (it is older than a year at
     the time of this correction).
+107. **Keys and the log: who vouches for a note, and the times a set records (5.3, 5.4; adds to 93,
+    94 and 101 to 103).** Signing a stored checkpoint again takes the entries of the trust file with
+    the standing of each key, and is refused when no line of the note that verifies is of a key the
+    verifier counts for a fresh checkpoint of that size: a line of a revoked key, or of a retired key
+    whose bound is below the size, vouches for nothing, and the signature of a good key beside it
+    would make the note genuine. A line of such a key beside a line of a key that counts is kept; the
+    window of a key is not applied, since the package has no clock. The checked form of adding a key
+    checks the new key against every origin and no longer refuses it for a collision between two
+    older keys; building the trust file refuses such a collision. Every operation that records a
+    time (add, activate, retire, revoke) refuses a time later than the latest time the set records
+    plus 366 days, so that no operation can record a far time that moves the limit of the next one;
+    a set that was idle for longer is brought forward in steps with that limit as the time, and a
+    revocation is never delayed for it. The times of a key are in the order a key can have
+    (creation, activation, retirement or revocation). A key that is active in the record but whose
+    activation has not come gives an error of its own, which is not the alarm of a damaged set, and
+    a caller that signs treats both as "do not sign". A next key that waited longer than 366 days is
+    replaced in a fixed order: add a fresh key, activate it, then revoke the stale one. A link that
+    is refused with EPERM is reported as a directory that takes no new links, which is wider than a
+    file system without hard links. Both packages state the duties of the caller in one place.
+108. **A role that is not a superuser takes a lock of the ledger only in a statement of its own
+    (replaces 52, the remedy of 67, 75, 76 and the timer part of 98).** Three rounds patched the limit
+    on holding a lock across statements (a prepared transaction kept the lock, a renewal outlived
+    rolled-back work, the timer was lost on a second error in an aborted subtransaction), so the cause
+    is removed. Every function that takes a lock of the extension (the builders, `ledger_enable`,
+    `ledger_register_table`, `ledger_verify_recorded`) is refused with `25001` for such a role in a
+    transaction block, a multi-command string, a savepoint, an EXCEPTION block or any other
+    subtransaction, and after the first statement of a pipeline; the check is made again for every
+    lock that is granted. A superuser and the worker are not restricted. The lock therefore lives for
+    one statement of an autocommit transaction, and every error that reaches the main loop ends that
+    transaction and releases it. `lock_hold_limit` bounds that one statement. The only code of
+    PostgreSQL that disables every timeout of a backend is the error handler of the main loop; the
+    abort of a subtransaction only reschedules, and a statement timeout, a lock timeout and a cancel
+    are errors of one of those two kinds, so no path loses the timer while the lock is held. A client
+    in pipeline mode could open a transaction block after the call; while the timer is armed BEGIN,
+    SAVEPOINT, RELEASE, ROLLBACK TO and PREPARE are refused. The tracking of the timer per
+    subtransaction and the refusal of PREPARE for a holder are removed; the list of held locks stays
+    for the order check of 99. An application that enabled a table inside the transaction of a
+    migration runs `ledger_enable` as a statement of its own after that transaction, or as a superuser.
+109. **What `ledger_enable` adds to the limit (replaces the credit rules of 98).** The time really spent
+    entering a batch of rows is added to the deadline while the lock of the registry is the only lock
+    held, and the total for one transaction is bounded by `kingres_ledger.enable_credit_limit`, a
+    setting of a superuser (30 minutes; 0 for no bound). The call that would pass it fails with
+    `54000` and the hint that a table which needs longer is enabled by a superuser. The exception that
+    remains: a role with a very large table holds the lock of the registry for up to the limit plus
+    that bound, which blocks other calls of `ledger_enable` and a write by hand, and neither the block
+    builder nor the capture.
+110. **The order of the locks in both directions, and who can drop the database (adds to 99 and
+    100).** Allowed in one transaction of a superuser: the lock of the builders, then the registry's,
+    then the verifications'; a write by hand or `ledger_remove_stray` first. Refused with `KL006`: a
+    builder after `ledger_enable` or after a recorded verification; `ledger_enable` after a recorded
+    verification; a write by hand or `ledger_remove_stray` after either. The check runs before
+    `ledger_enable` waits for the lock of its table. Members of `pg_execute_server_program` and of
+    `pg_write_server_files` (directly, through a chain, or by `SET ROLE`) can run any command or write
+    any file of the server and are listed among the roles that can drop the database; roles with ADMIN
+    OPTION on those two are listed among those that can make themselves able to. The other predefined
+    roles of 18 and 19 are not listed, each for a reason the README gives.
 
 Of section 13: item 2 (test vectors) is settled for signed notes (the example key and note of the
 specification are in the tests; the checkpoint example has no published key), item 3 (entry bundles at

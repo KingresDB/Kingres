@@ -193,7 +193,7 @@ SELECT who, form, outcome FROM p_results WHERE who = 'inheriting member' ORDER B
  inheriting member | ledger_build_block (documented)    | refused (transaction block)
  inheriting member | ledger_remove_stray                | permission denied: only a superuser can remove rows of the ledger tables
  inheriting member | ledger_verify (documented)         | ran
- inheriting member | register a table it does not own   | 42710 table "docs" is already under ledger control
+ inheriting member | register a table it does not own   | refused (transaction block)
  inheriting member | the setting                        | ran
 (25 rows)
 
