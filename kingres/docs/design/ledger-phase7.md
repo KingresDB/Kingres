@@ -2209,7 +2209,7 @@ build to the corrected rule. The verifier's README has the same list with the re
     unknown to them, and a held checkpoint only ever makes a run stricter. One that rests only on revoked
     or over-limit keys stays the anchor, is named so in the output with a line that it was not shown
     genuine now, and is replaced by the first checkpoint that extends it and is signed by a key that
-    counts. A plain note given as `--old FILE` keeps the strict rule. The trust file has no "compromised
+    counts (what a run reports when it replaces or completes such a state: 86). A plain note given as `--old FILE` keeps the strict rule. The trust file has no "compromised
     since": a checkpoint carries no time that can be trusted, and `max_tree_size` is the form of "since"
     that the data proves. Removing from the trust file every key that signed a held checkpoint is the one
     change that makes the state unreadable (status 2, with the rebase named); a key is retired by
@@ -2218,9 +2218,11 @@ build to the corrected rule. The verifier's README has the same list with the re
     form holds the text and every line that verifies under any key of the trust file, written again in
     the order of key name and key id. A served note with the text of the held one is merged into it, and
     the state is rewritten only when it gains a line. The evidence of a fork or rollback is one file per
-    signed text, extended in place with new lines of that text. Which of the genuine lines a party
-    without a key serves changes neither the status, the stored size, the name of an evidence file nor
-    the verdict of a later run; there is no limit on the number of evidence files, since a limit would be
+    signed text, extended in place with new lines of that text (for a state that counts; for a weak
+    state see 85). Which of the genuine lines a party
+    without a key serves changes neither the status, the stored size, the held text nor the verdict of a later run (it can
+    change the wording, the JSON members and the names of the evidence files of a later conflict, see
+    69 and 85); there is no limit on the number of evidence files, since a limit would be
     a lever for status 4.
 57. **The lock file is never replaced, and a write never goes over a state it did not read (7.4;
     replaces "a lock file that is not private is replaced" in 41; adds to 18).** The lock file is locked
@@ -2229,7 +2231,7 @@ build to the corrected rule. The verifier's README has the same list with the re
     again, and a run that finds other bytes than the ones it decided on writes nothing (status 2).
 58. **A closed standard output (adds to 43).** A standard output that is the null device opened for
     reading and writing is what the runtime puts in place of a closed descriptor: status 2 on every
-    command, with a line on the standard error. The null device opened for writing only is the caller's
+    command, with a line on the standard error (unless the caller says it is on purpose, see 70). The null device opened for writing only is the caller's
     request for no output and runs as usual.
 59. **A limit on one element of a proof (4.8, 7.4; adds to 42).** One element of the chain of a proof is
     at most 4,096 bytes and what is outside the chain at most 1 MiB, checked while the document is read;
@@ -2289,8 +2291,9 @@ build to the corrected rule. The verifier's README has the same list with the re
     on revoked or over-limit keys disagrees with the log that is served, the failure line names the keys
     the state rests on and why they no longer count, says that the conflict may come from the state and
     not from the log, and gives the rebase command. "Both are signed by a key of the trust file" is
-    printed only for a state that counts. The evidence of such a conflict is one file per held state,
-    not one per run. The JSON carries the fact in `info.state.anchor_weak` with the keys and the reason.
+    printed only for a state that counts. The evidence of such a conflict is bounded per held state
+    and never one file per run (two files at most, see 85). The JSON carries the fact in
+    `info.state.anchor_weak` with the keys and the reason, on every exit after the state was judged (86).
     The exit status stays 1.
 70. **The null device on purpose (adds to 58).** A caller that gives the null device opened for reading
     and writing as the standard output on purpose (a process library's "discard", a daemon) sets
@@ -2298,15 +2301,17 @@ build to the corrected rule. The verifier's README has the same list with the re
 71. **The order of the replacement of the state (7.4; adds to 57).** The temporary file is written and
     flushed first, and the state is read again only then, just before the rename. The lock is what
     excludes another run; this second reading only narrows the window for a writer that ignores the lock
-    and does not close it. Measured with such writers: 0.08 percent of them overwritten on Linux (22
-    percent with the reading before the write), 6 percent on Windows (45 before), where the rename with
-    write-through is itself the window. The README of the verifier gives the figures.
+    and does not close it. Measured with such writers: 1 of 1,200 overwritten on Linux (265 of 1,200
+    with the reading before the write), 189 of 3,000 on Windows (1,346 of 3,000 before), where the rename
+    with write-through is itself the window. These are counts on one machine, one file system and one
+    model of the other writer, not rates. The README of the verifier gives them.
 72. **A stored signature line is kept as stored (7.4; adds to 56).** When a state or an evidence file is
     rewritten, every line it holds stays, also the line of a key that has left the trust file. Such a
     line makes nothing usable: usability is decided from the trust file of the run, as in 55.
 73. **Files on Windows (7.4).** A rename that another program blocks (a scanner, an indexer) is retried
-    for three seconds before the run fails with status 2. On every platform a new evidence file is
-    written under a temporary name and linked into place, so that a reader never sees half of one and an
+    for three seconds before the run fails with status 2 (a read-only target or a directory at the name
+    is named at once, see 87). On every platform a new evidence file is written under a temporary name,
+    flushed, and linked into place, so that a reader never sees half of one and an
     existing file of that name is never replaced.
 74. **Who can drop the database (9.3; replaces the first two sentences of 68 and amends the second
     invariant of 49).** A role that is not a superuser cannot remove the ledger or the protection of a
@@ -2384,6 +2389,39 @@ build to the corrected rule. The verifier's README has the same list with the re
     name, address or other name; a token is refused only when no name of the certificate corresponds. The
     alert for a failure is worded from the code and the text of the error and not from its class: the
     class "refused" covers credentials and also clocks and the validity of a certificate.
+85. **The evidence of a weak state is two files at most (7.4; replaces the evidence sentence of 69).** A
+    conflict with a held checkpoint that rests only on revoked or over-limit keys is kept in at most two
+    files: one for the first conflicting note that is smaller than the held one (a rollback), one for
+    the first with the same size and another root or a larger size that the proof does not connect (a
+    fork). A replay of an old genuine checkpoint, which a party without a key can always serve, takes
+    the first file only and never the place of a fork. A note whose file holds another checkpoint, or
+    whose save failed for any reason, is printed in full by the run (base64 in the text, `note_base64`
+    in the JSON), as for a state that counts; a note whose signed text is already in the file counts as
+    saved and its new lines are added. The bound is fixed and independent of what a party without a
+    key serves; such a party can decide which of two conflicts of one kind is kept and cannot hide
+    either from the auditor.
+86. **What a run reports about the held state (7.4; adds to 55 and 69).** `info.state.anchor_weak`
+    (`info.old_anchor_weak` for `consistency --old`) is present on every exit after the held state was
+    judged; a run that stops before it read the state, for instance at the limit of the wait for the
+    lock, has none. A run that writes a state signed by a key that counts reports the state as it is
+    after the write: weak before, not weak after (`anchor_weak_repaired`), and it does not list as not
+    proved that the held checkpoint was genuine, because it proved it a prefix of a checkpoint under a
+    key that counts or added that key's line to it. A key rotation makes a state weak without any act
+    of the publisher (the state was made while only the old key signed, and the old key is then
+    revoked); an auditor runs once with both keys in the trust file before revoking the old one, so
+    that the state gains the line of the new key.
+87. **Temporary files, a failed flush of the directory, a read-only target (7.4; adds to 71 and 73).**
+    The next run removes, under the lock, every temporary file of the program in the directory of the
+    state: the name must match the pattern of the program exactly, the file must be regular and owned
+    by the user; nothing else in the directory is touched. When a rename or a link succeeded and the
+    flush of the directory failed, the run says that the file was replaced or saved and that a power
+    loss may bring the old state of the directory back; the status is unchanged (2 for the state, 4 for
+    the evidence of a state that counts, 1 for the evidence of a weak state), and the JSON says which
+    of the two happened. On Windows a
+    target with the read-only attribute, or a directory at the name, is named at once without the wait
+    of three seconds; the wait stays for the error codes that an open handle of another program
+    produces, which an access control list that denies the rename shares, so in that one case the
+    message names another program wrongly after the system's own text.
 
 Of section 13: item 2 (test vectors) is settled for signed notes (the example key and note of the
 specification are in the tests; the checkpoint example has no published key), item 3 (entry bundles at
