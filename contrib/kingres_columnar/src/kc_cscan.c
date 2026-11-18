@@ -178,7 +178,6 @@ kc_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 					RangeTblEntry *rte)
 {
 	ListCell   *lc;
-	Oid			amoid;
 
 	if (prev_set_rel_pathlist)
 		prev_set_rel_pathlist(root, rel, rti, rte);
@@ -187,8 +186,8 @@ kc_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		 rel->reloptkind != RELOPT_OTHER_MEMBER_REL) ||
 		(rte->relkind != RELKIND_RELATION && rte->relkind != RELKIND_MATVIEW))
 		return;
-	amoid = kc_am_oid();
-	if (!OidIsValid(amoid) || get_rel_relam(rte->relid) != amoid)
+	/* by the handler of the access method, not by its name (C11-02) */
+	if (!kc_am_is_columnar(get_rel_relam(rte->relid)))
 		return;
 
 	/*

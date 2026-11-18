@@ -15,8 +15,11 @@
 # be locked gives a not_checked row (and columnar_check_clean() false) instead of a wait behind an
 # administrator's LOCK TABLE, REINDEX or a prepared transaction that never ends.
 #
-# C10-08.  The locks the check leaves: an ACCESS SHARE lock on every columnar table until the end
-# of the caller's transaction, and none on the catalog.
+# C11-03.  The locks the check leaves: none.  Each table's lock is let go when the table has been looked
+# at (unless the caller's transaction held it before), and the catalog's at the end of the call.
+#
+# C11-01.  The orphan step does not report rows of a table that was dropped or rewritten while the
+# call ran: a second gate between its two reads (check_gate_orphans), and DDL in a loop.
 #
 # The setting kingres_columnar.check_gate (a developer setting: the key of an advisory lock the
 # check waits on at the start of the look at each table) makes the moments "while the call runs"
@@ -30,6 +33,7 @@
 use strict;
 use warnings FATAL => 'all';
 
+use IPC::Run;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -187,6 +191,117 @@ foreach my $level ('REPEATABLE READ', 'SERIALIZABLE')
 }
 
 # ------------------------------------------------------------------------
+# C11-01: the orphan step reads the stripe catalog, then pg_class, and a DROP TABLE or a rewrite that
+# commits between the two reads used to turn the stripe rows of the old file into "orphans" (a false
+# alarm of a healthy database; a monitor would page).  The second gate
+# (kingres_columnar.check_gate_orphans) holds the call between the two reads, so that the commit is
+# at exactly that moment.  The rows are orphans only if they are still visible, and their file
+# still unclaimed, after the scan of pg_class (a second snapshot).
+# ------------------------------------------------------------------------
+{
+	q1("CREATE TABLE ok1 (a int) USING columnar; INSERT INTO ok1 VALUES (1);");
+	# [ what, setting of the gate, key, setup, the DDL that commits at the gate ]
+	my $mk_col = 'CREATE TABLE gd (a int, b text) USING columnar; INSERT INTO gd SELECT g, repeat(\'x\', 30) FROM generate_series(1, 5000) g;';
+	my $mk_heap = 'CREATE TABLE gd (a int, b text); INSERT INTO gd SELECT g, repeat(\'x\', 30) FROM generate_series(1, 5000) g;';
+	my @ddl = (
+		# before the read of pg_class: the rows of the old file are seen by the first snapshot, and no file claims them
+		[ 'DROP TABLE', 'check_gate_orphans', 7772, $mk_col, 'DROP TABLE gd' ],
+		[ 'VACUUM FULL', 'check_gate_orphans', 7772, $mk_col, 'VACUUM FULL gd' ],
+		[ 'SET ACCESS METHOD heap', 'check_gate_orphans', 7772, $mk_col, 'ALTER TABLE gd SET ACCESS METHOD heap' ],
+		# after the read of pg_class, before the second snapshot: the new file of a rewrite is not claimed by the first
+		# read, and its rows (written frozen, so every snapshot sees them) are claimed only by the second
+		[ 'VACUUM FULL (the new file)', 'check_gate_claims', 7775, $mk_col, 'VACUUM FULL gd' ],
+		[ 'SET ACCESS METHOD columnar (the new file)', 'check_gate_claims', 7775, $mk_heap, 'ALTER TABLE gd SET ACCESS METHOD columnar' ],
+		[ 'DROP TABLE (claimed by the first read)', 'check_gate_claims', 7775, $mk_col, 'DROP TABLE gd' ],
+	);
+	foreach my $d (@ddl)
+	{
+		my ($what, $setting, $key, $setup, $ddl) = @$d;
+		foreach my $fn ('SELECT kingres.columnar_check_clean()', "SELECT coalesce(string_agg(check_name || '/' || detail, ' ;; ' ORDER BY check_name, detail), 'no rows') FROM kingres.columnar_check()")
+		{
+			q1($setup);
+			my $gate = $node->background_psql('postgres', on_error_stop => 1);
+			bgq($gate, "SELECT pg_advisory_lock($key, 0)");
+			my $call = $node->background_psql('postgres', on_error_stop => 1);
+			bgq($call, "SET kingres_columnar.$setting = $key");
+			my $cpid = bg_value($call, 'SELECT pg_backend_pid()');
+			$call->query_until(qr/^started$/m, "\\echo started\n$fn;\n");
+			at_gate($cpid, "in the orphan step ($setting), $what");
+			q1($ddl);
+			bgq($gate, "SELECT pg_advisory_unlock($key, 0)");
+			my $res = $call->query_until(qr/^finished$/m, "\\echo finished\n");
+			$call->quit;
+			$gate->quit;
+			if ($fn =~ /clean/)
+			{
+				like($res, qr/^t$/m, "$what committed in the middle of the orphan step: columnar_check_clean() is true (no false orphans)");
+			}
+			else
+			{
+				like($res, qr/^no rows$/m, "$what committed in the middle of the orphan step: columnar_check() reports nothing");
+			}
+			q1('DROP TABLE IF EXISTS gd');
+		}
+	}
+	# the rows of a table that is still there are never taken for orphans by the second read
+	is(q1('SELECT kingres.columnar_check_clean()'), 't', 'afterwards, with nothing going on, the check is clean');
+
+	# the same DDL in a loop against the check, no gate: every answer free of orphans.  The verdict does
+	# not depend on how fast anything is: the DDL ends by making a table, the checker loops until it sees
+	# that table (at least once), and what is tested is that no answer ever says "orphan_catalog_rows".
+	q1("CREATE TABLE rw (a int, b text) USING columnar; INSERT INTO rw SELECT g, 'r' FROM generate_series(1, 3000) g;");
+	my $file = PostgreSQL::Test::Utils::tempdir() . '/ddl.sql';
+	open(my $fh, '>', $file) or die "$file: $!";
+	foreach my $i (1 .. 40)
+	{
+		print $fh "CREATE TABLE ld (a int) USING columnar;\nINSERT INTO ld VALUES (1);\nDROP TABLE ld;\n";
+		print $fh "ALTER TABLE rw SET ACCESS METHOD heap;\nALTER TABLE rw SET ACCESS METHOD columnar;\nVACUUM FULL rw;\n";
+	}
+	print $fh "CREATE TABLE ddl_done (a int);\n";
+	close($fh);
+	my ($o, $e) = ('', '');
+	my $h = IPC::Run::start([ 'psql', '-XAtq', '-d', $node->connstr('postgres'), '-f', $file ], '>', \$o, '2>', \$e);
+	my ($answers, $orphans, $done) = (0, 0, 0);
+	while (!$done)
+	{
+		my $r = q1("SELECT (SELECT count(*) FROM kingres.columnar_check() WHERE check_name = 'orphan_catalog_rows') || ',' || (to_regclass('ddl_done') IS NOT NULL)::text");
+		my ($n, $d2) = split /,/, $r;
+		$answers++;
+		$orphans += $n;
+		$done = ($d2 eq 'true');
+		die "t/036: the DDL script did not end after $answers checks" if $answers > 5000;
+	}
+	$h->finish;
+	is($e, '', 'the DDL loop ran without an error');
+	cmp_ok($answers, '>=', 1, "the check ran $answers times against the DDL loop");
+	is($orphans, 0, 'no answer of the check, while tables were dropped and rewritten, said orphan_catalog_rows');
+	q1('DROP TABLE ddl_done, rw, ok1');
+	is(q1('SELECT kingres.columnar_check_clean()'), 't', 'afterwards the check is clean');
+}
+
+# ------------------------------------------------------------------------
+# C11-07: the gates exist in every build, and an ordinary role can take any advisory lock, so a gate waits
+# only for a lock that a session of a superuser holds: a check run with a gate set is not held up by an
+# ordinary role's lock (it used to wait for two minutes for each table).  The call has a statement timeout
+# of 30 seconds, so that a failure is a failure of the test and not a hang.
+# ------------------------------------------------------------------------
+{
+	q1("CREATE TABLE gu1 (a int) USING columnar; INSERT INTO gu1 VALUES (1); CREATE ROLE gate_user LOGIN");
+	my $ord = $node->background_psql('postgres', connstr => $node->connstr('postgres') . ' user=gate_user', on_error_stop => 1);
+	bgq($ord, 'SELECT pg_advisory_lock(7773, 0), pg_advisory_lock(7774, 0)');
+	foreach my $gate ('check_gate', 'check_gate_orphans')
+	{
+		my $key = $gate eq 'check_gate' ? 7773 : 7774;
+		my ($ret, $out, $err) = $node->psql('postgres', "SET statement_timeout = '30s'; SET kingres_columnar.$gate = $key; SELECT kingres.columnar_check_clean()");
+		is($err, '', "an ordinary role holds the advisory lock of $gate: the check is not held up (no timeout)");
+		like($out, qr/^t$/m, '... and it is clean');
+	}
+	bgq($ord, 'SELECT pg_advisory_unlock_all()');
+	$ord->quit;
+	q1('DROP TABLE gu1; DROP ROLE gate_user');
+}
+
+# ------------------------------------------------------------------------
 # C10-02: a cancel, a statement timeout or any other error that is not about the table ends the call.
 # The call is held at the gate, inside the look at a table (the place where the old code turned any
 # error into an "unreadable" row and went on to the next table, which waited again).
@@ -268,6 +383,9 @@ foreach my $level ('REPEATABLE READ', 'SERIALIZABLE')
 			like($out, qr/ROW=not_checked:null/, "$what: ... it reports not_checked, for no table in particular");
 			unlike($out, qr/ROW=(?:stripe_beyond_file|unreadable|page_header_mismatch|orphan_catalog_rows)/, "$what: ... and nothing else");
 		}
+		# C11-09: the row says what holds the lock (a prepared transaction has no process)
+		like(q1("SELECT detail FROM kingres.columnar_check() WHERE check_name = 'not_checked'"), qr/held by a prepared transaction/,
+			"$what: the not_checked row names the holder: a prepared transaction");
 		my ($out, $err) = ('', '');
 		my $to = 0;
 		$node->psql('postgres', "SET statement_timeout = '60s'; SELECT kingres.columnar_check_clean()", stdout => \$out, stderr => \$err, on_error_stop => 0, timeout => 120, timed_out => \$to);
@@ -279,24 +397,58 @@ foreach my $level ('REPEATABLE READ', 'SERIALIZABLE')
 }
 
 # ------------------------------------------------------------------------
-# C10-08: what the check leaves behind: ACCESS SHARE on every columnar table until the caller's
-# transaction ends, nothing on the catalog
+# C11-09: the not_checked rows say which process holds the lock (catalog or table)
+# ------------------------------------------------------------------------
+{
+	my $s = $node->background_psql('postgres', on_error_stop => 1);
+	bgq($s, 'BEGIN; LOCK TABLE kingres.columnar_stripe IN ACCESS EXCLUSIVE MODE;');
+	my $pid = bg_value($s, 'SELECT pg_backend_pid()');
+	like(q1("SELECT detail FROM kingres.columnar_check() WHERE check_name = 'not_checked' AND relation IS NULL"),
+		qr/held by process $pid\b/, 'a catalog locked by a session: the not_checked row names its process id');
+	bgq($s, 'COMMIT');
+	bgq($s, 'BEGIN; LOCK TABLE lk IN ACCESS EXCLUSIVE MODE;');
+	like(q1("SELECT detail FROM kingres.columnar_check() WHERE check_name = 'not_checked' AND relation = 'lk'::regclass"),
+		qr/held by process $pid\b/, 'a table locked by a session: the not_checked row names its process id');
+	bgq($s, 'COMMIT');
+	$s->quit;
+	is(q1('SELECT kingres.columnar_check_clean()'), 't', 'and when it is over the check is clean');
+}
+
+# ------------------------------------------------------------------------
+# C11-03 (it was C10-08: the locks were kept until the end of the transaction, one lock-table entry
+# for every table at once): the check lets go of each table's lock when it has looked at it, and of
+# the catalog's at the end of the call; a lock the caller's transaction held before is the caller's
+# and stays (t/040 has the small lock table that the old behaviour ran out of)
 # ------------------------------------------------------------------------
 {
 	my $s = $node->background_psql('postgres', on_error_stop => 1);
 	bgq($s, 'BEGIN; SELECT kingres.columnar_check_clean();');
-	is(bg_value($s, "SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid() AND relation = 'lk'::regclass AND mode = 'AccessShareLock'"), '1',
-		'the check keeps an ACCESS SHARE lock on the columnar table until the end of the transaction');
+	is(bg_value($s, "SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid() AND relation = 'lk'::regclass"), '0',
+		'the check leaves no lock on a columnar table it looked at, inside the caller\'s transaction');
 	is(bg_value($s, "SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid() AND relation IN ('kingres.columnar_stripe'::regclass, 'kingres.columnar_stripe_pkey'::regclass, 'pg_class'::regclass)"), '0',
-		'... and no lock on the stripe catalog, its index or pg_class');
+		'... and none on the stripe catalog, its index or pg_class');
 	my ($out, $err) = ('', '');
 	$node->psql('postgres', "SET lock_timeout = '300ms'; ALTER TABLE lk ADD COLUMN c int", stdout => \$out, stderr => \$err, on_error_stop => 0);
-	like($err, qr/canceling statement due to lock timeout/, '... so DDL on the table waits for the transaction that ran the check');
+	is($err, '', '... so DDL on the table does not wait for the transaction that ran the check');
+	bgq($s, 'COMMIT');
+
+	# a lock the caller already held on the table is not released by the check
+	bgq($s, 'BEGIN; LOCK TABLE lk IN ACCESS SHARE MODE; SELECT kingres.columnar_check_clean();');
+	is(bg_value($s, "SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid() AND relation = 'lk'::regclass AND mode = 'AccessShareLock' AND granted"), '1',
+		'a lock that the caller held on the table before the check is still held after it');
+	($out, $err) = ('', '');
+	$node->psql('postgres', "SET lock_timeout = '300ms'; ALTER TABLE lk ADD COLUMN c2 int", stdout => \$out, stderr => \$err, on_error_stop => 0);
+	like($err, qr/canceling statement due to lock timeout/, '... and keeps DDL on it waiting, as the caller\'s own lock does');
 	bgq($s, 'COMMIT');
 	$s->quit;
-	($out, $err) = ('', '');
-	$node->psql('postgres', "SET lock_timeout = '5s'; ALTER TABLE lk ADD COLUMN c int", stdout => \$out, stderr => \$err, on_error_stop => 0);
-	is($err, '', '... and goes through when it is over');
+
+	# with fix: the share update exclusive lock is let go too
+	$s = $node->background_psql('postgres', on_error_stop => 1);
+	bgq($s, 'BEGIN; SELECT count(*) FROM kingres.columnar_check(true);');
+	is(bg_value($s, "SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid() AND relation = 'lk'::regclass"), '0',
+		'columnar_check(true) lets go of the table\'s lock too');
+	bgq($s, 'COMMIT');
+	$s->quit;
 }
 
 $node->stop;

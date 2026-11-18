@@ -121,35 +121,33 @@ kc_needed_blocks(Relation rel)
 #define KC_TRUNCATE_MINIMUM				1000
 #define KC_TRUNCATE_FRACTION			16
 #define KC_TRUNCATE_LOCK_WAIT_INTERVAL	50	/* ms */
-#define KC_TRUNCATE_LOCK_TIMEOUT		5000	/* ms */
 
-static void
+static bool
 kc_truncate_tail(Relation rel)
 {
 	BlockNumber orig;
 	BlockNumber need;
 	BlockNumber freeable;
 	int			retry = 0;
+	bool		cut = false;
 
-	if (VacuumFailsafeActive)
-		return;
 	orig = RelationGetNumberOfBlocks(rel);
 	need = kc_needed_blocks(rel);
 	if (need >= orig)
-		return;
+		return false;
 	freeable = orig - need;
 	if (!(freeable >= KC_TRUNCATE_MINIMUM || freeable >= orig / KC_TRUNCATE_FRACTION))
-		return;
+		return false;
 
 	while (!ConditionalLockRelation(rel, AccessExclusiveLock))
 	{
 		CHECK_FOR_INTERRUPTS();
-		if (++retry > (KC_TRUNCATE_LOCK_TIMEOUT / KC_TRUNCATE_LOCK_WAIT_INTERVAL))
+		if (++retry > (kc_guc_truncate_lock_timeout / KC_TRUNCATE_LOCK_WAIT_INTERVAL))
 		{
 			ereport(DEBUG2,
 					(errmsg("\"%s\": stopping truncate due to conflicting lock request",
 							RelationGetRelationName(rel))));
-			return;
+			return false;
 		}
 		(void) WaitLatch(MyLatch,
 						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
@@ -163,9 +161,47 @@ kc_truncate_tail(Relation rel)
 	{
 		need = kc_needed_blocks(rel);
 		if (need < orig)
+		{
 			RelationTruncate(rel, need);
+			cut = true;
+		}
 	}
 	UnlockRelation(rel, AccessExclusiveLock);
+	return cut;
+}
+
+/*
+ * The wraparound failsafe, decided for this table's own age the way heap does
+ * (vacuum_xid_failsafe_check, which the core also uses for heap: the age of
+ * relfrozenxid and relminmxid against vacuum_failsafe_age and
+ * vacuum_multixact_failsafe_age, with the floor of 105 percent of the freeze
+ * ages) (C11-05).  Nothing but a heap table of the same command set the flag
+ * before, so a columnar table past the failsafe age was cut under an exclusive
+ * lock, which is WAL-logged and so needs a transaction id, exactly where
+ * the server may refuse to assign one.
+ */
+static bool
+kc_failsafe_active(Relation rel)
+{
+	struct VacuumCutoffs cutoffs;
+
+	memset(&cutoffs, 0, sizeof(cutoffs));
+	cutoffs.relfrozenxid = rel->rd_rel->relfrozenxid;
+	cutoffs.relminmxid = rel->rd_rel->relminmxid;
+	/* a table with no ages yet (nothing recorded) is not in danger */
+	if (!TransactionIdIsNormal(cutoffs.relfrozenxid) ||
+		!MultiXactIdIsValid(cutoffs.relminmxid))
+		return false;
+	if (!vacuum_xid_failsafe_check(&cutoffs))
+		return false;
+	VacuumFailsafeActive = true;
+	ereport(WARNING,
+			(errmsg("bypassing nonessential maintenance of table \"%s.%s.%s\" as a failsafe",
+					get_database_name(MyDatabaseId),
+					get_namespace_name(RelationGetNamespace(rel)),
+					RelationGetRelationName(rel)),
+			 errdetail("The table's relfrozenxid or relminmxid is too far in the past.")));
+	return true;
 }
 
 /*
@@ -203,6 +239,9 @@ kc_relation_vacuum(KC_VACUUM_PARAMS)
 	bool		pushed = false;
 	TransactionId oldest;
 	TransactionId remaining;
+	TransactionId frozenxid;
+	MultiXactId minmxid;
+	bool		failsafe;
 
 	if (!kc_rel_is_columnar(rel))
 		return;
@@ -224,15 +263,7 @@ kc_relation_vacuum(KC_VACUUM_PARAMS)
 		pushed = true;
 	}
 
-	/*
-	 * Give back the unreferenced tail, if it is worth it (C10-06): the rule of
-	 * heap's vacuum, which takes the exclusive lock only for a tail worth
-	 * removing, because that lock is WAL-logged and cancels the queries that
-	 * hold the table on a hot standby.  The decision is made under the lock
-	 * the vacuum already holds.
-	 */
-	if (params->truncate != VACOPTVALUE_DISABLED)
-		kc_truncate_tail(rel);
+	failsafe = kc_failsafe_active(rel);
 
 	(void) kc_catalog_reconcile();
 
@@ -249,9 +280,28 @@ kc_relation_vacuum(KC_VACUUM_PARAMS)
 	 */
 	oldest = GetOldestNonRemovableTransactionId(rel);
 	remaining = kc_meta_freeze(rel, oldest);
+	frozenxid = TransactionIdIsValid(remaining) ? remaining : oldest;
+	minmxid = GetOldestMultiXactId();
 	vac_update_relstats(rel, nblocks, (double) rows, 0, 0, false,
-						TransactionIdIsValid(remaining) ? remaining : oldest,
-						GetOldestMultiXactId(), NULL, NULL, false);
+						frozenxid, minmxid, NULL, NULL, false);
+
+	/*
+	 * Give back the unreferenced tail, if it is worth it (C10-06): the rule of
+	 * heap's vacuum, which takes the exclusive lock only for a tail worth
+	 * removing, because that lock is WAL-logged and cancels the queries that
+	 * hold the table on a hot standby; and not past the failsafe age (C11-05).
+	 * It comes after the frozen id is recorded, so that a truncation that fails
+	 * (a cancel while the lock is awaited) or is given up does not leave the
+	 * table's age where it was: the id is what the failsafe is about.  The
+	 * decision is made under the lock the vacuum already holds.
+	 */
+	if (!failsafe && params->truncate != VACOPTVALUE_DISABLED &&
+		kc_truncate_tail(rel))
+	{
+		nblocks = RelationGetNumberOfBlocks(rel);
+		vac_update_relstats(rel, nblocks, (double) rows, 0, 0, false,
+							frozenxid, minmxid, NULL, NULL, false);
+	}
 	KC_REPORT_VACUUM(rel, (PgStat_Counter) rows, 0, starttime);
 
 	/*

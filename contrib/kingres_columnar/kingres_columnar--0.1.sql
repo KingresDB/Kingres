@@ -59,7 +59,7 @@ CREATE FUNCTION columnar_options(rel regclass)
 CREATE FUNCTION columnar_info(rel regclass)
     RETURNS TABLE (stripes bigint, chunk_groups bigint, rows bigint,
                    bytes_on_disk bigint, bytes_uncompressed bigint,
-                   compression_ratio float8)
+                   compression_ratio float8, unreferenced_bytes bigint)
     AS 'MODULE_PATHNAME', 'kingres_columnar_info'
     LANGUAGE C STRICT SECURITY INVOKER
     SET search_path = pg_catalog, kingres, pg_temp;
@@ -215,7 +215,7 @@ BEGIN
         cols := ARRAY(SELECT DISTINCT c.oid
                         FROM pg_catalog.pg_class c
                         JOIN pg_catalog.pg_am a ON a.oid = c.relam
-                       WHERE c.oid = ANY (rels) AND a.amname = 'columnar'
+                       WHERE c.oid = ANY (rels) AND a.amhandler = 'kingres.columnar_handler(internal)'::pg_catalog.regprocedure
                          AND c.relkind IN ('r', 'm'));
     ELSE
         cols := '{}';
@@ -270,7 +270,7 @@ BEGIN
                       AND x.relid IN (SELECT c.oid
                                         FROM pg_catalog.pg_class c
                                         JOIN pg_catalog.pg_am a ON a.oid = c.relam
-                                       WHERE a.amname = 'columnar')) THEN
+                                       WHERE a.amhandler = 'kingres.columnar_handler(internal)'::pg_catalog.regprocedure)) THEN
             RAISE EXCEPTION 'columnar tables are not replicated logically yet: the publication would include a columnar table'
                 USING ERRCODE = '0A000',
                       HINT = 'Leave columnar tables out of publications.';

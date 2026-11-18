@@ -36,6 +36,8 @@
 #include "storage/lmgr.h"
 #include "storage/lock.h"
 #include "storage/latch.h"
+#include "storage/proc.h"
+#include "storage/procarray.h"
 #include "utils/wait_event.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -70,7 +72,10 @@ int			kc_guc_compression_level = 3;
 int			kc_guc_stripe_rows = 150000;
 int			kc_guc_max_stripe_rows = KC_MAX_STRIPE_ROWS;
 int			kc_guc_orphan_notes_max = KC_ORPHAN_NOTES_MAX;
+int			kc_guc_truncate_lock_timeout = KC_TRUNCATE_LOCK_TIMEOUT;
 static int	kc_guc_check_gate = 0;
+static int	kc_guc_check_gate_orphans = 0;
+static int	kc_guc_check_gate_claims = 0;
 int			kc_guc_chunk_rows = 10000;
 int			kc_guc_write_buffer_kb = 131072;
 bool		kc_guc_enable_custom_scan = true;
@@ -166,18 +171,43 @@ _PG_init(void)
 							1, KC_ORPHAN_NOTES_MAX,
 							PGC_SUSET, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 	/*
-	 * A developer setting, for tests: a key (the first of the two integers of
+	 * Developer settings, for tests: a key (the first of the two integers of
 	 * pg_advisory_lock(int, int), the second being 0) that columnar_check and
 	 * columnar_check_clean wait on, at the start of the look at each table (after
 	 * the list of tables is made), until no other session holds that advisory
 	 * lock, so that a test can drop or make a table, or cancel the call, at that
-	 * moment and not at a moment it can only hope for.  0 (the default) is no
-	 * gate.  The wait is bounded (two minutes) and can be cancelled.
+	 * moment and not at a moment it can only hope for; and a second key for the
+	 * moment of the orphan step between its first snapshot and its read of pg_class.  0 (the default) is no
+	 * gate.  They exist in every build, because the tests that use them must run
+	 * on production builds; so that they cannot be used to hold up a check, the
+	 * wait is only for an advisory lock that a session of a superuser holds (an
+	 * ordinary role can take any advisory lock), and it is bounded (two
+	 * minutes) and can be cancelled (C11-07).
 	 */
 	DefineCustomIntVariable("kingres_columnar.check_gate",
 							"Advisory lock key that the check functions wait on after listing the tables (testing).",
 							NULL, &kc_guc_check_gate, 0, 0, 1000000,
 							PGC_SUSET, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+	DefineCustomIntVariable("kingres_columnar.check_gate_orphans",
+							"Advisory lock key that the orphan step waits on after its first snapshot, before it reads pg_class (testing).",
+							NULL, &kc_guc_check_gate_orphans, 0, 0, 1000000,
+							PGC_SUSET, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+	DefineCustomIntVariable("kingres_columnar.check_gate_claims",
+							"Advisory lock key that the orphan step waits on after its first read of pg_class, before its second snapshot (testing).",
+							NULL, &kc_guc_check_gate_claims, 0, 0, 1000000,
+							PGC_SUSET, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+	/*
+	 * A developer setting, for tests: how long the truncation of a VACUUM asks
+	 * for its exclusive lock before it gives up for this visit.  The default
+	 * is heap's 5 seconds; a test raises it so that a verdict does not depend
+	 * on how fast the machine is (a reader that goes away "while the vacuum
+	 * waits"), or lowers it to see the give-up without a long wait.
+	 */
+	DefineCustomIntVariable("kingres_columnar.vacuum_truncate_lock_timeout",
+							"How long VACUUM waits for the lock to truncate a table before giving up (testing; heap uses 5 seconds).",
+							NULL, &kc_guc_truncate_lock_timeout, KC_TRUNCATE_LOCK_TIMEOUT,
+							50, 600000, PGC_SUSET, GUC_NOT_IN_SAMPLE | GUC_UNIT_MS,
+							NULL, NULL, NULL);
 	DefineCustomIntVariable("kingres_columnar.chunk_row_count",
 							"Rows of a chunk group of a new columnar table.",
 							NULL, &kc_guc_chunk_rows, 10000,
@@ -205,6 +235,7 @@ _PG_init(void)
 	}
 	kc_slot_ops_init();
 	kc_write_init();
+	kc_am_cache_init();
 	kc_cscan_init();
 	kc_prev_object_access_hook = object_access_hook;
 	object_access_hook = kc_object_access;
@@ -413,8 +444,8 @@ kingres_columnar_info(PG_FUNCTION_ARGS)
 	Oid			relid = PG_GETARG_OID(0);
 	Relation	rel = kc_open_columnar_read(relid, "columnar_info");
 	TupleDesc	tupdesc;
-	Datum		values[6];
-	bool		nulls[6] = {false, false, false, false, false, false};
+	Datum		values[7];
+	bool		nulls[7] = {false, false, false, false, false, false, false};
 	bool		mvcc;
 	Snapshot	cs;
 	int			n;
@@ -449,6 +480,30 @@ kingres_columnar_info(PG_FUNCTION_ARGS)
 		values[5] = Float8GetDatum((double) raw / (double) disk);
 	else
 		nulls[5] = true;
+
+	/*
+	 * unreferenced_bytes (C11-06): what the file holds that no stripe visible
+	 * now uses: the pages of loads that were rolled back, of stripes that
+	 * compaction replaced, and of a load that is still in progress (an
+	 * estimate at any moment).  VACUUM gives back such pages at the end of the
+	 * file when they are at least 1000 pages or a sixteenth of it (heap's rule),
+	 * and nothing reuses them in the middle of the file, so a file whose number
+	 * stays high after a VACUUM is waiting for VACUUM FULL.  Read with a
+	 * snapshot of this moment, whatever the caller's snapshot is.
+	 */
+	{
+		Snapshot	ls = kc_latest_snapshot();
+		int			ln;
+		KcStripeInfo *lsi = kc_catalog_load(rel, ls, &ln);
+		int64		used = BLCKSZ;	/* the metapage */
+		int64		filebytes = (int64) RelationGetNumberOfBlocks(rel) * BLCKSZ;
+		int			k;
+
+		for (k = 0; k < ln; k++)
+			used += (int64) lsi[k].block_count * BLCKSZ;
+		values[6] = Int64GetDatum(filebytes > used ? filebytes - used : 0);
+		pfree(ls);
+	}
 	relation_close(rel, AccessShareLock);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
@@ -663,19 +718,61 @@ kc_check_row(KcCheckSink *sink, const char *name, Oid relid, const char *detail)
 }
 
 /*
- * The test gate (setting kingres_columnar.check_gate): wait while another
- * session holds the advisory lock (key, 0).  Never taken by anything but a test.  It is called at the start of the look at each table, inside
- * the per-table guard, so that a test can also cancel or time out the call at that point.
+ * Is the advisory lock held by a session of a superuser (another session than
+ * this one)?  The gate waits only for such a holder (C11-07): the settings
+ * that name the lock are administrator settings, but an ordinary role can
+ * take any advisory lock, and must not be able to hold up a check that an
+ * administrator's session runs.  A holder that is a prepared transaction (no
+ * process) does not count either.
  */
-static void
-kc_check_gate(void)
+static bool
+kc_gate_held_by_superuser(const LOCKTAG *tag)
+{
+	LockData   *ld = GetLockStatusData();
+	int			i;
+
+	for (i = 0; i < ld->nelements; i++)
+	{
+		LockInstanceData *l = &ld->locks[i];
+		PGPROC	   *proc;
+
+		if (l->holdMask == 0 || l->pid == 0 || l->pid == MyProcPid ||
+			l->locktag.locktag_lockmethodid != tag->locktag_lockmethodid ||
+			l->locktag.locktag_type != tag->locktag_type ||
+			l->locktag.locktag_field1 != tag->locktag_field1 ||
+			l->locktag.locktag_field2 != tag->locktag_field2 ||
+			l->locktag.locktag_field3 != tag->locktag_field3 ||
+			l->locktag.locktag_field4 != tag->locktag_field4)
+			continue;
+		proc = BackendPidGetProc(l->pid);
+		if (proc != NULL && superuser_arg(proc->roleId))
+			return true;
+	}
+	return false;
+}
+
+/*
+ * The test gates (settings kingres_columnar.check_gate and
+ * kingres_columnar.check_gate_orphans and kingres_columnar.check_gate_claims): wait while another session of a
+ * superuser holds the advisory lock (key, 0).  Never taken by anything but a
+ * test.  KC_GATE_TABLES is called at the start of the look at each table,
+ * inside the per-table guard, so that a test can also cancel or time out the
+ * call at that point; KC_GATE_ORPHANS in the orphan step (kc_catalog.c), after
+ * its first snapshot and before its read of pg_class, KC_GATE_CLAIMS between
+ * that read and the second snapshot.  The waits are bounded
+ * (two minutes) and can be cancelled.
+ */
+void
+kc_check_gate(int which)
 {
 	LOCKTAG		tag;
 	int			i;
+	int			key = (which == KC_GATE_ORPHANS) ? kc_guc_check_gate_orphans :
+		(which == KC_GATE_CLAIMS) ? kc_guc_check_gate_claims : kc_guc_check_gate;
 
-	if (kc_guc_check_gate == 0)
+	if (key == 0)
 		return;
-	SET_LOCKTAG_ADVISORY(tag, MyDatabaseId, (uint32) kc_guc_check_gate, 0, 2);
+	SET_LOCKTAG_ADVISORY(tag, MyDatabaseId, (uint32) key, 0, 2);
 	for (i = 0; i < 12000; i++)
 	{
 		if (LockAcquire(&tag, ShareLock, false, true) != LOCKACQUIRE_NOT_AVAIL)
@@ -683,10 +780,65 @@ kc_check_gate(void)
 			(void) LockRelease(&tag, ShareLock, false);
 			return;
 		}
+		if (!kc_gate_held_by_superuser(&tag))
+			return;
 		CHECK_FOR_INTERRUPTS();
 		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 10, WAIT_EVENT_PG_SLEEP);
 		ResetLatch(MyLatch);
 	}
+}
+
+/*
+ * Who holds a lock that conflicts with mode on a relation, for the
+ * not_checked rows (C11-09): the process ids of the sessions, and whether a
+ * prepared transaction (no process) holds one, so that an operator is told what
+ * to end.  Read from the lock manager's own tables without taking any lock
+ * of the relation, so it cannot wait; the answer is a moment's view.  The text
+ * starts with a space and is empty when nobody was found (the holder let go
+ * in the meantime).
+ */
+static void
+kc_lock_blockers(Oid relid, LOCKMODE mode, char *out, size_t len)
+{
+	LOCKTAG		tag;
+	LockData   *ld;
+	LockMethod	lm;
+	int			i;
+	int			npids = 0;
+	bool		prepared = false;
+	char		pids[160] = "";
+	size_t		used = 0;
+
+	out[0] = '\0';
+	if (!OidIsValid(relid) || mode == NoLock)
+		return;
+	SET_LOCKTAG_RELATION(tag, MyDatabaseId, relid);
+	lm = GetLockTagsMethodTable(&tag);
+	ld = GetLockStatusData();
+	for (i = 0; i < ld->nelements; i++)
+	{
+		LockInstanceData *l = &ld->locks[i];
+
+		if (l->holdMask == 0 || l->pid == MyProcPid ||
+			l->locktag.locktag_type != LOCKTAG_RELATION ||
+			l->locktag.locktag_field1 != tag.locktag_field1 ||
+			l->locktag.locktag_field2 != tag.locktag_field2 ||
+			(l->holdMask & lm->conflictTab[mode]) == 0)
+			continue;
+		if (l->pid == 0)
+			prepared = true;
+		else if (npids < 5 && used < sizeof(pids) - 16)
+		{
+			used += snprintf(pids + used, sizeof(pids) - used, "%s%d", npids ? ", " : "", l->pid);
+			npids++;
+		}
+	}
+	if (npids > 0 && prepared)
+		snprintf(out, len, " It is held by process %s and by a prepared transaction.", pids);
+	else if (npids > 0)
+		snprintf(out, len, " It is held by process %s.", pids);
+	else if (prepared)
+		snprintf(out, len, " It is held by a prepared transaction (see pg_prepared_xacts).");
 }
 
 static void
@@ -700,7 +852,7 @@ kc_check_one(Oid relid, bool fix, KcCheckSink *sink)
 	KcStripeInfo *s;
 	BlockNumber nblocks;
 
-	kc_check_gate();
+	kc_check_gate(KC_GATE_TABLES);
 
 	/*
 	 * Never wait for a lock: a prepared transaction that holds a table
@@ -713,8 +865,14 @@ kc_check_one(Oid relid, bool fix, KcCheckSink *sink)
 	 */
 	if (!ConditionalLockRelationOid(relid, lockmode))
 	{
-		kc_check_row(sink, "not_checked", relid,
-					 "the table is locked by another transaction (a prepared one, or ordinary DDL or VACUUM FULL that is running) and was not checked; this is not a clean result: end or wait for that transaction and run the check again");
+		char		who[240];
+		char		detail[640];
+
+		kc_lock_blockers(relid, lockmode, who, sizeof(who));
+		snprintf(detail, sizeof(detail), "%s%s",
+				 "the table is locked by another transaction (a prepared one, or ordinary DDL or VACUUM FULL that is running) and was not checked; this is not a clean result: end or wait for that transaction and run the check again.",
+				 who);
+		kc_check_row(sink, "not_checked", relid, detail);
 		return;
 	}
 	rel = try_relation_open(relid, NoLock);
@@ -813,7 +971,17 @@ kc_check_one(Oid relid, bool fix, KcCheckSink *sink)
 		}
 		pfree(s);
 	}
-	relation_close(rel, NoLock);
+
+	/*
+	 * Let go of the table's lock now (C11-03).  A read leaves nothing that has
+	 * to be protected until the end of the transaction, and a lock kept for
+	 * every table would need an entry in the shared lock table for each of
+	 * them at once ("out of shared memory" with more tables than it has room
+	 * for, and entries taken from the other sessions meanwhile).  The lock
+	 * was taken by this subtransaction, so what the caller's transaction held
+	 * on the table before is not touched.
+	 */
+	relation_close(rel, lockmode);
 }
 
 /*
@@ -881,7 +1049,7 @@ kc_check_list_tables(void)
 	TableScanDesc scan;
 	HeapTuple	tup;
 	List	   *relids = NIL;
-	Oid			amoid = kc_am_oid();
+	KcAmMemo	memo = {InvalidOid, KC_AM_UNKNOWN};
 
 	/* a catalog snapshot of this moment, not one kept from an earlier statement */
 	InvalidateCatalogSnapshot();
@@ -891,8 +1059,9 @@ kc_check_list_tables(void)
 	{
 		Form_pg_class cl = (Form_pg_class) GETSTRUCT(tup);
 
-		if (OidIsValid(amoid) && cl->relam == amoid &&
-			(cl->relkind == RELKIND_RELATION || cl->relkind == RELKIND_MATVIEW))
+		/* by the handler of the access method, as everywhere (C11-02) */
+		if ((cl->relkind == RELKIND_RELATION || cl->relkind == RELKIND_MATVIEW) &&
+			kc_am_class_memo(cl->relam, &memo) == KC_AM_COLUMNAR)
 			relids = lappend_oid(relids, cl->oid);
 	}
 	table_endscan(scan);
@@ -923,8 +1092,19 @@ kc_check_run(bool fix, KcCheckSink *sink)
 
 	if (!kc_catalog_lock_nowait(&locks, fix ? RowExclusiveLock : AccessShareLock))
 	{
-		kc_check_row(sink, "not_checked", InvalidOid,
-					 "pg_class or the stripe catalog (its index or its TOAST table) is locked by another transaction (a prepared one, or an administrator's LOCK TABLE, REINDEX or VACUUM FULL); no table was checked, and this is not a clean result: end or wait for that transaction and run the check again");
+		char		who[240];
+		char		detail[800];
+
+		char	   *rn = OidIsValid(locks.failed_oid) ? get_rel_name(locks.failed_oid) : NULL;
+
+		kc_lock_blockers(locks.failed_oid, locks.failed_mode, who, sizeof(who));
+		snprintf(detail, sizeof(detail), "%s%s%s%s%s",
+				 "pg_class or the stripe catalog (its index or its TOAST table) is locked by another transaction (a prepared one, or an administrator's LOCK TABLE, REINDEX or VACUUM FULL); no table was checked, and this is not a clean result: end or wait for that transaction and run the check again.",
+				 rn ? " The lock that could not be had is on \"" : "",
+				 rn ? rn : "",
+				 rn ? "\"." : "",
+				 who);
+		kc_check_row(sink, "not_checked", InvalidOid, detail);
 		return;
 	}
 

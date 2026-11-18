@@ -115,6 +115,9 @@ tests += {
       't/036_check_view.pl',
       't/037_vacuum_truncate.pl',
       't/038_truncate_frozen_id.pl',
+      't/039_alias_am.pl',
+      't/040_check_lock_table.pl',
+      't/041_vacuum_failsafe.pl',
     ],
   },
 }

@@ -159,17 +159,21 @@ is(q1('SELECT kingres.columnar_check_clean()'), 't', 'the table is clean after t
 	q1('VACUUM c');
 	is(blocks('c'), $live, 'with the option reset the tail goes again');
 }
-
 # ------------------------------------------------------------------------
-# 5. the retries
+# 5. the retries.  The wait for the lock is 5 seconds by default (heap's); the two cells below set it
+# (a developer setting), so that no verdict depends on how fast the machine is: a reader that goes away
+# "while the vacuum waits" is waited for as long as it takes (2 minutes at most), and a reader that stays
+# makes the vacuum give up after a short wait that the cell chooses.
 # ------------------------------------------------------------------------
 {
+	is(q1('SHOW kingres_columnar.vacuum_truncate_lock_timeout'), '5s', 'the wait for the truncation lock is heap\'s 5 seconds by default');
 	q1('BEGIN; ' . load_sql('c', 700001, 780000) . '; ROLLBACK');
 	my $tail = blocks('c');
 	cmp_ok($tail, '>', $live, 'a long tail again');
 	my $reader = $primary->background_psql('postgres', on_error_stop => 1);
 	bgq($reader, 'BEGIN; SELECT count(*) FROM c;');
 	my $vac = $primary->background_psql('postgres', on_error_stop => 1);
+	bgq($vac, "SET kingres_columnar.vacuum_truncate_lock_timeout = '2min'");
 	$vac->query_until(qr/^go$/m, "\\echo go\nVACUUM c;\n");
 	$primary->poll_query_until('postgres', "SELECT count(*) = 1 FROM pg_stat_activity WHERE wait_event = 'VacuumTruncate'")
 	  or die 't/037: the vacuum did not wait for the lock (wait event VacuumTruncate)';
@@ -180,13 +184,13 @@ is(q1('SELECT kingres.columnar_check_clean()'), 't', 'the table is clean after t
 	is(blocks('c'), $live, 'the reader went away while the vacuum waited: the tail was given back');
 	$vac->quit;
 
-	# a reader that stays: the vacuum gives up after about five seconds, without an error
+	# a reader that stays: the vacuum gives up after its wait, without an error
 	q1('BEGIN; ' . load_sql('c', 800001, 880000) . '; ROLLBACK');
 	$tail = blocks('c');
 	$reader = $primary->background_psql('postgres', on_error_stop => 1);
 	bgq($reader, 'BEGIN; SELECT count(*) FROM c;');
 	my ($out, $err) = ('', '');
-	$primary->psql('postgres', 'VACUUM c', stdout => \$out, stderr => \$err, on_error_stop => 0, timeout => 120);
+	$primary->psql('postgres', "SET kingres_columnar.vacuum_truncate_lock_timeout = '300ms'; VACUUM c", stdout => \$out, stderr => \$err, on_error_stop => 0, timeout => 120);
 	is($err, '', 'a vacuum that cannot get the lock gives up without an error');
 	is(blocks('c'), $tail, '... and the tail stays for the next vacuum');
 	bgq($reader, 'ROLLBACK');
@@ -203,5 +207,75 @@ unlike(slurp_file($primary->logfile), qr/PANIC|TRAP:/, 'the primary logged no PA
 unlike(slurp_file($standby->logfile), qr/PANIC|TRAP:|inconsistent page/, 'the standby logged no PANIC');
 
 $standby->stop;
+
+
+# ------------------------------------------------------------------------
+# 6. the 1000-page limb of the threshold (C11-08).  Every table above is under 16000 pages, so only "a
+# sixteenth of the file" decided there; in a file over 16000 pages a sixteenth is more than 1000 pages, and
+# a tail of at least 1000 pages that is under a sixteenth is cut by the first limb alone (a mutant that
+# removed it survived).  Rows of half a kilobyte, stored as they are, make a file of that size in a few
+# seconds.  A rolled-back load leaves whole stripes (rows still in the buffer are never written), so the
+# tails are made of a counted number of stripes, the size of one measured on the table.  The standby has
+# been stopped.  Also: columnar_info shows the pages that no stripe uses, for a tail below the threshold
+# that is left in place (C11-06).
+# ------------------------------------------------------------------------
+{
+	my $wide = sub
+	{
+		my ($t, $lo, $hi) = @_;
+		return "INSERT INTO $t SELECT g, repeat(md5(g::text), 15) FROM generate_series($lo, $hi) g";
+	};
+	q1("CREATE TABLE big (id int, t text) USING columnar;
+		SELECT kingres.columnar_set_options('big', compression => 'none', stripe_row_count => 1000, chunk_row_count => 100);
+		" . $wide->('big', 1, 320000));
+	q1('VACUUM big');
+	my $base = blocks('big');
+	cmp_ok($base, '>', 17500, "the file has $base pages: a sixteenth of it is more than 1100 pages");
+	is(q1("SELECT unreferenced_bytes FROM kingres.columnar_info('big')"), 0, 'nothing in the file is unreferenced');
+
+	# a rolled-back load of $k stripes and a half: $k stripes are written, the rest is thrown away unwritten
+	my $seed = 400001;
+	my $stripes = sub
+	{
+		my ($k) = @_;
+		q1('BEGIN; ' . $wide->('big', $seed, $seed + $k * 1000 + 499) . '; ROLLBACK');
+		$seed += $k * 1000 + 500;
+	};
+	$stripes->(1);
+	my $pps = blocks('big') - $base;
+	cmp_ok($pps, '>', 20, "one stripe is $pps pages");
+	cmp_ok($pps, '<', 150, '... small enough for a tail to be placed between 1000 pages and a sixteenth of the file');
+	my $k1 = int(985 / $pps);
+	$stripes->($k1 - 1);
+
+	# a tail just under 1000 pages: under both limbs, left; the garbage is visible
+	my $tail = blocks('big') - $base;
+	cmp_ok($tail, '<', 1000, "a tail of $tail pages: under 1000");
+	cmp_ok($tail, '>', 900, '... and not far under');
+	cmp_ok($tail * 16, '<', blocks('big'), '... and under a sixteenth of the file');
+	q1('VACUUM big');
+	is(blocks('big') - $base, $tail, 'a tail under 1000 pages in a file over 16000 is left');
+	is(q1("SELECT unreferenced_bytes FROM kingres.columnar_info('big')"), $tail * $BLCKSZ,
+		'columnar_info shows the garbage: unreferenced_bytes is the pages no stripe uses');
+
+	# a load that commits after it makes the pages permanent (nothing reuses them): the figure keeps saying so
+	q1('INSERT INTO big SELECT g, \'later\' FROM generate_series(1, 10) g');
+	q1('VACUUM big');
+	is(q1("SELECT unreferenced_bytes FROM kingres.columnar_info('big')"), $tail * $BLCKSZ, 'the pages in the middle of the file are still counted after a later load and a VACUUM');
+	q1('VACUUM FULL big');
+	is(q1("SELECT unreferenced_bytes FROM kingres.columnar_info('big')"), 0, 'VACUUM FULL gives all of it back');
+
+	# a tail of at least 1000 pages, still under a sixteenth of the file: cut, by the first limb
+	$base = blocks('big');
+	my $k2 = int(1000 / $pps) + 1;
+	$stripes->($k2);
+	$tail = blocks('big') - $base;
+	cmp_ok($tail, '>=', 1000, "a tail of $tail pages: at least 1000");
+	cmp_ok($tail * 16, '<', blocks('big'), '... and under a sixteenth of the file');
+	q1('VACUUM big');
+	is(blocks('big'), $base, 'a tail of at least 1000 pages is given back although it is under a sixteenth of the file');
+	is(q1('SELECT kingres.columnar_check_clean()'), 't', 'the table is clean');
+	q1('DROP TABLE big');
+}
 $primary->stop;
 done_testing();

@@ -163,17 +163,28 @@ $r_tar->stop;
 # A backup taken while a columnar transaction loads: the node restored from it
 # has the whole transaction or none of it.
 {
+	# The load waits, before its COMMIT, for an advisory lock that this test holds, so that the backup is
+	# taken exactly while the transaction is open (it used to sleep for 3 seconds and hope: a verdict of
+	# "a whole transaction or none" that no timing could fail).  The backup ends before the COMMIT, so the
+	# restored node has none of the transaction: exactly the rows committed before it.
+	my $gate = $src->background_psql('postgres', on_error_stop => 1);
+	$gate->query_safe('SELECT pg_advisory_lock(7003, 0)');
 	my $bg = $src->background_psql('postgres', on_error_stop => 1);
 	$bg->query_until(qr/started/,
 		"\\echo started\nBEGIN;\n" . gen('ct', 200001, 330000)
-		  . ";\nSELECT pg_sleep(3);\nCOMMIT;\n");
+		  . ";\nSELECT pg_advisory_lock(7003, 0);\nCOMMIT;\n");
+	$src->poll_query_until('postgres', "SELECT count(*) = 1 FROM pg_locks WHERE locktype = 'advisory' AND classid = 7003 AND NOT granted")
+	  or die 't/003: the load did not reach the advisory lock';
 	$src->backup('during', backup_options => [ '-X', 'stream' ]);
+	$gate->query_safe('SELECT pg_advisory_unlock(7003, 0)');
+	$gate->quit;
 	$bg->query_safe('SELECT 1');
 	$bg->quit;
+	is($src->safe_psql('postgres', 'SELECT count(*) FROM ct'), 47000 + 130000, 'the load committed on the source after the backup');
 	my $with_lib = restored_node('with_lib', $src, 'during');
 	$with_lib->start;
 	my $c = $with_lib->safe_psql('postgres', 'SELECT count(*) FROM ct');
-	ok($c == 47000 || $c == 47000 + 130000, "restored a whole transaction or none ($c rows)");
+	is($c, 47000, "restored from a backup taken while the load was open: none of its rows ($c rows)");
 	is(check_rows($with_lib), '', 'columnar_check clean after a backup taken during a load');
 	$with_lib->stop;
 }

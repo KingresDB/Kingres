@@ -140,7 +140,15 @@ RESET enable_seqscan;
 CREATE TABLE co_c (t text COLLATE "C") USING columnar;
 SELECT kingres.columnar_set_options('co_c', stripe_row_count => 1000, chunk_row_count => 100);
 INSERT INTO co_c SELECT chr(65 + (g % 26)) || g FROM generate_series(1, 3000) g;
-ALTER TABLE co_c ALTER COLUMN t TYPE text COLLATE "en-x-icu";
+-- (the ICU collation where the server has one; on a server built without ICU the same change to another collation, so that this file needs no ICU)
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_collation WHERE collname = 'en-x-icu' AND collprovider = 'i') THEN
+        EXECUTE 'ALTER TABLE co_c ALTER COLUMN t TYPE text COLLATE "en-x-icu"';
+    ELSE
+        EXECUTE 'ALTER TABLE co_c ALTER COLUMN t TYPE text COLLATE "POSIX"';
+    END IF;
+END $$;
 SELECT count(*) FROM co_c WHERE t > 'Z';
 ALTER TABLE co_c ALTER COLUMN t TYPE text COLLATE "C";
 SELECT count(*) FROM co_c WHERE t > 'Z';

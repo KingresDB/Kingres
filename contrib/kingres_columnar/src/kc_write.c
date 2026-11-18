@@ -2287,16 +2287,14 @@ void
 kc_write_note_dropped(Oid relid)
 {
 	HeapTuple	tup;
-	Oid			amoid = kc_am_oid();
 
-	if (!OidIsValid(amoid))
-		return;
 	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
 	if (HeapTupleIsValid(tup))
 	{
 		Form_pg_class cl = (Form_pg_class) GETSTRUCT(tup);
 
-		if (cl->relam == amoid && OidIsValid(cl->relfilenode) &&
+		/* by the handler of the access method, not by its name (C11-02) */
+		if (kc_am_is_columnar(cl->relam) && OidIsValid(cl->relfilenode) &&
 			(cl->relkind == RELKIND_RELATION || cl->relkind == RELKIND_MATVIEW))
 		{
 			uint64		uid = kc_catalog_file_uid(cl);

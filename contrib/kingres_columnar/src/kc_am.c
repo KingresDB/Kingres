@@ -498,7 +498,7 @@ kc_table_creation_xid(Relation rel)
 		ReleaseSysCache(tup);
 		return GetCurrentTransactionId();
 	}
-	if (((Form_pg_class) GETSTRUCT(tup))->relam == kc_am_oid())
+	if (kc_am_is_columnar(((Form_pg_class) GETSTRUCT(tup))->relam))
 	{
 		Relation	old = relation_open((Oid) oid, NoLock);
 
@@ -599,7 +599,7 @@ kc_relation_set_new_filelocator(Relation rel, const RelFileLocator *newrlocator,
 
 /*
  * Empties the table's current file in place (PostgreSQL calls this for a table
- * created or given a new file in the current transaction, and for a temporary
+ * created or given a new file in the current subtransaction, and for a temporary
  * table, which a columnar table cannot be; it is refused for any other table,
  * below).  The order of the steps is the one that leaves a readable table when
  * one of them fails: the buffered rows are forgotten, then the stripe catalog
@@ -620,20 +620,22 @@ kc_relation_nontransactional_truncate(Relation rel)
 
 	/*
 	 * Only for a relation whose file an abort removes anyway (C10-05): one
-	 * created, or given a new file, in this transaction.  That is the only case
-	 * PostgreSQL itself calls this for (ExecuteTruncateGuts, for a table of the
-	 * current transaction; a columnar table cannot be temporary).  For any other
+	 * created, or given a new file, in the CURRENT SUBTRANSACTION (C11-04: a table
+	 * of an outer subtransaction is not enough, an abort of this one would not
+	 * remove its file).  That is the only case PostgreSQL itself calls this for
+	 * (ExecuteTruncateGuts compares rd_createSubid and rd_newRelfilelocatorSubid
+	 * with the current subtransaction id; a columnar table cannot be temporary).  For any other
 	 * table the steps below destroy committed data outside the transaction: the
 	 * file is cut and the metapage reset for good, while an abort brings the
 	 * catalog rows back, and the table is then unreadable.  Where an error is
 	 * allowed that is an error; at the moments where it is not, the refusal
 	 * above has already warned and nothing is changed.
 	 */
-	if (rel->rd_createSubid == InvalidSubTransactionId &&
-		rel->rd_firstRelfilelocatorSubid == InvalidSubTransactionId)
+	if (rel->rd_createSubid != GetCurrentSubTransactionId() &&
+		rel->rd_newRelfilelocatorSubid != GetCurrentSubTransactionId())
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot truncate columnar table \"%s\" in place: it was not created or given a new file in this transaction",
+				 errmsg("cannot truncate columnar table \"%s\" in place: it was not created or given a new file in the current (sub)transaction",
 						RelationGetRelationName(rel)),
 				 errdetail("An in-place truncate cannot be rolled back; the table would lose committed data for good if the transaction aborted."),
 				 errhint("Use TRUNCATE, which gives the table a new file.")));
