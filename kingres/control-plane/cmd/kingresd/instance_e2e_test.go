@@ -88,6 +88,17 @@ func TestInstanceStopStartEndToEnd(t *testing.T) {
 	} else {
 		valid(t, "getSession", "200", out)
 	}
+	// The postmaster is gone before the stop records its end, so the list may
+	// say "stopping" for a moment more.
+	e.waitUntil(t, "the instance list to say stopped", 30*time.Second, func() bool {
+		st, out, _ := e.call("GET", "/this-server/instances", nil, nil)
+		items, _ := out["items"].([]any)
+		if st != 200 || len(items) != 1 {
+			return false
+		}
+		item, _ := items[0].(map[string]any)
+		return item["state"] == "stopped"
+	})
 	if st, out, _ := e.call("GET", "/this-server/instances", nil, nil); st != 200 {
 		t.Errorf("listThisServerInstances while stopped: %d %v", st, out)
 	} else if items, _ := out["items"].([]any); len(items) != 1 || items[0].(map[string]any)["state"] != "stopped" {
