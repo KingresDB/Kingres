@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 func mkfifo(t *testing.T, path string) {
@@ -23,7 +25,7 @@ func mkfifo(t *testing.T, path string) {
 }
 
 func TestReadArgNamedPipe(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "pipe")
+	p := filepath.Join(testdir.New(t), "pipe")
 	mkfifo(t, p)
 	within(t, func() {
 		if _, err := ReadArg(p, 100); !errors.Is(err, ErrNotRegular) {
@@ -33,7 +35,7 @@ func TestReadArgNamedPipe(t *testing.T) {
 }
 
 func TestDirNamedPipe(t *testing.T) {
-	root := t.TempDir()
+	root := testdir.New(t)
 	mkfifo(t, filepath.Join(root, "c", "id", "e1", "checkpoint"))
 	mkfifo(t, filepath.Join(root, "tile"))
 	d, err := OpenDir(root)
@@ -51,7 +53,7 @@ func TestDirNamedPipe(t *testing.T) {
 }
 
 func TestNamedPipeAsSourceDirectory(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "pipe")
+	p := filepath.Join(testdir.New(t), "pipe")
 	mkfifo(t, p)
 	within(t, func() {
 		if d, err := OpenDir(p); err == nil {

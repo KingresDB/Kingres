@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // L10-06: the reported case. The state is in a private directory below a
@@ -19,7 +21,7 @@ import (
 // Now the first use is refused, and so is every form of the redirect.
 func TestRedirectedStateIsRefused(t *testing.T) {
 	x := newExitEnv(t)
-	base, err := filepath.EvalSymlinks(t.TempDir())
+	base, err := filepath.EvalSymlinks(testdir.New(t))
 	if err != nil {
 		t.Fatal(err)
 	}

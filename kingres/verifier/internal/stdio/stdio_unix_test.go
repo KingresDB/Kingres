@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 func TestSubstitutedIsTheNullDeviceOpenedForReadingAndWriting(t *testing.T) {
@@ -31,7 +33,7 @@ func TestSubstitutedIsTheNullDeviceOpenedForReadingAndWriting(t *testing.T) {
 	if Substituted(open(os.O_RDONLY)) {
 		t.Error("a descriptor opened for reading only is not a standard output the runtime made")
 	}
-	f, err := os.OpenFile(filepath.Join(t.TempDir(), "out"), os.O_RDWR|os.O_CREATE, 0o600)
+	f, err := os.OpenFile(filepath.Join(testdir.New(t), "out"), os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}

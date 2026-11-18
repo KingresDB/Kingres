@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 func copyTo(t *testing.T, from, to string) {
@@ -29,7 +31,7 @@ func TestDigestChainDirectoryCaps(t *testing.T) {
 		n    int
 		want int
 	}{{1024, 0}, {1025, 2}} {
-		dir := t.TempDir()
+		dir := testdir.New(t)
 		for i := 0; i < c.n; i++ {
 			copyTo(t, d0, filepath.Join(dir, fmt.Sprintf("d%04d.json", i)))
 		}
@@ -53,7 +55,7 @@ func TestDigestChainDirectoryCaps(t *testing.T) {
 
 func TestDigestChainTotalSizeCap(t *testing.T) {
 	d0, _ := os.ReadFile(fx("digests/d0.json"))
-	dir := t.TempDir()
+	dir := testdir.New(t)
 	// 257 files of 64 KiB each: every file is within its own limit, together they
 	// are more than 16 MiB.
 	pad := make([]byte, maxDigestFile-len(d0))
@@ -72,7 +74,7 @@ func TestDigestChainTotalSizeCap(t *testing.T) {
 }
 
 func TestDigestChainGlobCharactersAreNames(t *testing.T) {
-	root := t.TempDir()
+	root := testdir.New(t)
 	mk := func(name string, digests ...string) {
 		if err := os.Mkdir(filepath.Join(root, name), 0o755); err != nil {
 			t.Fatal(err)
@@ -146,7 +148,7 @@ func TestSourceThatIsAFileSaysSo(t *testing.T) {
 }
 
 func TestRowHashJSONDoesNotClaimVerification(t *testing.T) {
-	f := writeTemp(t, t.TempDir(), "c.json", `[{"name":"id","send_hex":"00000001"}]`)
+	f := writeTemp(t, testdir.New(t), "c.json", `[{"name":"id","send_hex":"00000001"}]`)
 	_, out, _ := run(t, "row-hash", "--table-id", "1", "--columns", f, "--json")
 	if !strings.Contains(out, `"verified": false`) {
 		t.Errorf("%s", out)
@@ -157,7 +159,7 @@ func TestRowHashJSONDoesNotClaimVerification(t *testing.T) {
 // before it is parsed, by every command that reads a digest.
 func TestDigestFileLimit(t *testing.T) {
 	d0, _ := os.ReadFile(fx("digests/d0.json"))
-	big := filepath.Join(t.TempDir(), "big.json")
+	big := filepath.Join(testdir.New(t), "big.json")
 	if err := os.WriteFile(big, append(d0, make([]byte, 64<<10)...), 0o644); err != nil {
 		t.Fatal(err)
 	}

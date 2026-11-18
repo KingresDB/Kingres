@@ -469,8 +469,15 @@ name that does not depend on the length of the state's name. The state file is l
 check, proof and replace; another run waits up to 10 seconds and then ends with status 2 (nothing
 changed), so two runs never move the state backwards. A reader that does not take the lock (`consistency --old STATE`) can on
 Windows meet a sharing error while the file is replaced; run it again. A crash leaves the old state or the new
-one, whole, and at worst a temporary file that the next run removes (tested by stopping after each
-step, on both platforms). Old state files that are a plain signed note are still read.
+one, whole, and at worst a temporary file. The next run removes it under the lock, together with every other
+temporary file of this program in the directory, whatever name it was made under: a crash in the extension of an
+evidence file leaves a file named after that evidence file, which no run of the state would look for otherwise
+(L16-04). What is removed must be a regular file whose name is exactly one this program makes
+(`.kingres-state-` or `.kingres-evidence-`, 12 hex characters, a dash, a decimal number, `.tmp`) and, where the
+system says who owns it, one of the user running the command; a link, a directory or any other file with
+such a name, and everything else in the directory, is left alone (`TestRemoveLeftoversRemovesEveryTemporaryFileOfTheProgramAndNothingElse`,
+`TestRunRemovesTheTemporaryFilesOfTheProgramAndNothingElse`, `TestCrashInTheExtensionOfAnEvidenceFileLeavesAFileTheNextRunRemoves`).
+A stop after each step of the replace is tested on both platforms. Old state files that are a plain signed note are still read.
 
 **What the state holds (the canonical form).** The invariant, in one sentence: **the identity of a
 checkpoint is its signed text (origin, size, root, extension lines) and never its signature lines; the
@@ -675,18 +682,34 @@ first (`statefile.Prepare`) and the state is read again only then, immediately b
 README called "a few microseconds". The window is measured, not argued: a second writer that ignores the lock
 (temporary file and rename, no flush) starts at a random time between 0 and twice the duration of the call, and a
 run is lost when the call returned nil and the rival's bytes are gone. Linux (WSL2, ext4, a call takes about
-40 ms), 1,200 attempts for each version: before 265 lost (22.1 percent), after 1 lost (0.08 percent), 169 refused
-because the rival was seen. Windows 11 (NTFS, a call takes about 9 ms), 3,000 attempts: before 1,346 lost (44.9
-percent), after 189 lost (6.3 percent), 1,084 refused. The Windows figure is high because the rename asks for a
+40 ms), 1,200 attempts for each version: before 265 of 1,200 lost, after 1 of 1,200 lost, 169 of 1,200 refused
+because the rival was seen. Windows 11 (NTFS, a call takes about 9 ms), 3,000 attempts: before 1,346 of 3,000
+lost, after 189 of 3,000 lost, 1,084 of 3,000 refused. These are counts, from one machine, one file system for
+each system (WSL2 ext4, NTFS) and one model of the rival (the writer described above, which does not flush and
+starts uniformly in 0 to twice the call); they are not rates of anything and no rate is claimed. One of 1,200 is
+one event: it shows that the window is not closed, and an interval for it is wide (about 0.002 to 0.5 percent at 95
+percent, by the usual interval for one event in 1,200), so "after 1 of 1,200" must not be read as "0.08 percent"
+of what a real second writer does. The Windows count is high because the rename asks for a
 write through to disk (`MOVEFILE_WRITE_THROUGH`, the only way to ask for the flush of the directory there) and
 the rename call takes about as long as the window: on Windows the window is the rename, milliseconds and not
 microseconds, and a state that matters must not be written by a program that ignores the lock.
 `TestMeasureTheWindowOfAWriterThatIgnoresTheLock` repeats it
 (`KINGRES_WINDOW_ATTEMPTS=N go test -run Measure -v ./internal/statefile`, a few minutes for a few thousand).
-A rename that Windows refuses because another program has the state open without sharing delete (a backup, a
-scanner, a viewer: access denied, a sharing or a lock violation) is tried again every 20 ms for 3 seconds
-(L14-05), and then ends the run with status 2 and the message `another program may have the file open
-without sharing delete ...: close it and run again, nothing was changed`; the state is unchanged
+What `MoveFileEx` answers was measured on Windows 11 (`TestRenameErrorCodes`; its documentation lists no error
+codes, and the documentation of `ReplaceFile` names others that this call does not return): a target with the
+read-only attribute and a directory at the name both give `ERROR_ACCESS_DENIED` (5) for ever; a target that
+another program holds open without sharing delete gives 5 as well, and ends when the program lets go; a source
+that is open exclusively gives `ERROR_SHARING_VIOLATION` (32). Code 5 alone cannot tell a handle from a refusal
+that lasts, so what the file itself shows is looked at first (L16-06): a read-only attribute or a directory at the
+name is named at once, with status 2 and no wait (`the file is read-only (the read-only attribute is set), so it
+cannot be replaced: clear the attribute or name another file; nothing was changed`,
+`TestRenameOfAReadOnlyStateIsNamedAtOnce`, which sets a wait of 5 seconds that must not be spent). What is left of
+codes 5, 32 and 33 (`ERROR_LOCK_VIOLATION`), which is what another program's open handle gives (a backup, a
+scanner, a viewer), is tried again every 20 ms for 3 seconds (L14-05), and then ends the run with status 2 and
+the message `another program may have the file open without sharing delete ...: close it and run again, nothing
+was changed`, after the text the system gave. A refusal that the file does not show (an access control list that
+denies the rename) is also code 5 and also waits the 3 seconds, and is then worded as an open file: the one case in
+which that wording can be wrong, and the system's text comes first in the message. The state is unchanged in every case
 (`TestRenameWaitsForAProgramThatHoldsTheStateAndGivesUp`, `TestRenameSucceedsWhenTheProgramLetsGoInTime`). The earlier statement that the state "is read again under the
 lock" was true and was not enough: the read happened at the start, and the write at the end, with nothing
 between them to see another writer. `TestStateAcrossRealProcessesNeverMovesBackwards` runs eight processes at
@@ -714,12 +737,24 @@ none can be used or the disk refuses, the output says `was NOT saved`, `--json` 
 `info.state.evidence_saved` false and `conflict_file` null, the finding is printed as for a fork,
 and the status is **4**, which is not 0 and is not the 1 of the fork itself: act on the fork and
 save the note you were shown yourself. **The note is in the output** (L10-09): a note line with the
-base64 of its exact bytes (decode it into a file), and `info.state.note_base64` in `--json`.
+base64 of its exact bytes (decode it into a file), and `info.state.note_base64` in `--json`. A failed flush of the
+directory after the file was linked is not a failed save (L16-05): the file is in place, and the output says `was
+saved to ..., but the directory could not be flushed: a power loss may take the file back`, with `evidence_saved`
+true, `evidence_flushed` false, the file and the note (printed, since the file is not known to be durable); the
+status stays 4. The state is the same: when the rename went through and the flush of the directory then failed,
+the run says `was replaced (it holds size N now), but the directory could not be flushed: a power loss may bring
+the old file back, and the next run then goes on from that one`, with status 2 as before and `directory_flushed`
+false in `info.state`, and not `could not be updated, so later runs do not know it`, which would be false
+(`TestFailedDirectoryFlushAfterTheStateWasReplacedIsReportedAsThat`, `TestFailedDirectoryFlushAfterTheEvidenceWasLinkedIsReportedAsThat`,
+`TestFailedDirectoryFlushAfterAWeakEvidenceFileIsReportedAsThat`, `TestFailedFlushOfTheDirectoryAfterTheRenameIsNotAFailedWrite`,
+`TestFailedFlushOfTheDirectoryAfterTheLinkIsNotAFailedSave`).
 
 A new evidence file is written and flushed to a temporary file in the same directory and then **linked** to its
 name (`link`, which fails when the name exists and never follows a link at the name), so that a stop between
 the create and the write cannot leave an empty file that takes one of the eight names (L14-09,
-`TestEvidenceFileIsNeverEmptyAtItsName`); a stop leaves a temporary file, which the next run removes. On a file
+`TestEvidenceFileIsNeverEmptyAtItsName`); a stop leaves a temporary file, which the next run removes. The flush of
+the temporary file before the link is held by `TestEvidenceTemporaryFileIsFlushedBeforeItIsLinked` (the order of
+the calls) and `TestEvidenceIsNotLinkedWhenItCannotBeFlushed` (a flush that fails ends the save before the link). On a file
 system that cannot link the older exclusive create is used (`TestEvidenceFileWhereTheFileSystemCannotLink`).
 
 **Lines of one text only accumulate** (L14-03). When an evidence file or a state is rewritten with more lines
@@ -746,22 +781,64 @@ the trust file" is printed only for a state that counts. `consistency --old STAT
 The status is **1**: a verification failed (the held checkpoint is used as the anchor, as decided, and what is
 served does not agree with it). It is not 2, which says that the held checkpoint cannot serve as the anchor and
 is not the case, and not 4, which is a finding about the log whose evidence was lost, which this is not
-established to be. The evidence is **one file for the held state**,
-`<state>.conflict-weak-<held size>-<held root in hex>`: the first conflicting note served against it, and never
-one per run or per size (before, a log that grew made a file at every run). Its name depends on the held
-state and on nothing the log serves, and a later conflict says that one is already kept. It is kept and not
-dropped because a log that really forked after a key was rotated looks the same. A file at that name that is
-not a signed note of the log is not taken for evidence (`was NOT saved`, status still 1). In the JSON,
-`info.state.anchor_weak` is true or false for every run that read a state, and when true
-`info.state.anchor_weak_keys` is a list of `{name, fingerprint, reason}`; `consistency --old STATE` has
-`info.old_anchor_weak` and `info.old_anchor_weak_keys`. Which lines a state holds is what the publisher served on the
-run that made it, so a publisher without a key decides whether a state is of this kind; what it changes is the
-wording and the number of evidence files of a later conflict (one, not one per size), and neither the status nor
-the size nor the held text (`TestKeylessAdversaryNeverChangesTheOutcome` compares those at every step, and the names of the
-files only while no state of a run has been of this kind). Tests: `TestThiefStateMeetsTheHonestLogAndTheOutputSaysWhoMayBeWrong`,
-`TestThiefStateInTheJSON`, `TestThiefStateKeepsOneEvidenceFileWhateverTheNumberOfRuns`, `TestThiefStateRebaseWorks`,
+established to be. The evidence is **two files at most for the held state**, one for a rollback and one for a
+fork (L16-01): `<state>.conflict-weak-rollback-<held size>-<held root in hex>` holds the first conflicting note
+served that is smaller than the held one, and `<state>.conflict-weak-fork-<held size>-<held root in hex>` the first
+one with the same size and another root, or a larger size that the proof does not connect. (Before, one file
+served both, and a replay of an old genuine checkpoint, which a party without a key can always serve once, took
+its place and kept a later fork out.) The names depend on the held state and on the kind and on nothing the log
+serves, so any number of runs, sizes and notes make two files at most, never one per run or per size. A later
+conflict of a kind that has its file is either the same checkpoint (the same signed text: the file is extended
+with its new genuine lines, as for a state that counts) or another one. Another one is **not saved and is printed
+in full**: a note line with the base64 of its exact bytes and `info.state.note_base64` in `--json`, with
+`evidence_saved` false and `conflict_file` null, as the evidence of a state that counts is when it could not be
+saved. That holds whatever the reason a note is not saved by this run (the file of its kind holds another
+checkpoint, a file or a directory was put at the name, the disk refuses), so the auditor never learns that a
+note exists only in the source of the run; the status stays 1. A file at a name that is not a signed note of the
+same text is never taken for evidence and never overwritten. Both kinds are kept and not dropped because a log
+that really forked after a key was rotated looks the same. What a party without a key can still do is decide
+which conflicting checkpoint of a kind is the one saved (the first it serves); it cannot hide another one, which
+is in the output of the run that met it (that output is lost only when the caller discards it on purpose with
+`KINGRES_VERIFY_NO_OUTPUT=1`, as documented).
+In the JSON, `info.state.anchor_weak` is true or false on every exit after the held state was judged (L16-02):
+the conflicts, a missing or a wrong tile, a read-back that failed, a state that changed under the run, a failed
+write and a success; a run that stops before it has read the state (the lock was not taken, the file is not a
+state, not a checkpoint of this log) has judged nothing and has no such member. When no state existed it is false.
+`consistency --old STATE` has `info.old_anchor_weak` and `info.old_anchor_weak_keys` on every exit after `--old` was
+judged (a plain note has `old_anchor_weak` false, and a size and root given by hand, which are not a held checkpoint,\nhave none). When the run itself writes the state (it extends it, or adds a
+genuine line of a key that counts), the member says what the state is **after** the write (L16-03): `anchor_weak`
+false, `anchor_weak_repaired` true, no `anchor_weak_keys`, a note that says so, and no non-proof about the
+checkpoint the state held, because the run proved it a prefix of a checkpoint signed by a key that counts (or merged
+that key's line into it). `anchor_weak_keys` and the non-proof are for a state that is left as it was.
+Which lines a state holds is what the publisher served on the run that made it, so a publisher without a key
+decides whether a state is of this kind; what it changes is the wording, the JSON members above and the evidence
+files of a later conflict (two at most, one for each kind, and not one for each signed text), and neither the status
+nor the size nor the held text. `TestKeylessAdversaryNeverChangesTheOutcome` compares those at every step (its
+random worlds meet the case in few steps and the test counts them), and
+`TestKeylessAdversaryDecidesOnlyTheWordingWhenTheWorldsDifferInWhetherTheStateIsWeak` makes it happen every time:
+in world A the state holds the lines of two keys, in world B the adversary served the line of one, and that key is
+revoked. Tests: `TestThiefStateMeetsTheHonestLogAndTheOutputSaysWhoMayBeWrong`,
+`TestThiefStateInTheJSON`, `TestThiefStateKeepsTwoEvidenceFilesWhateverTheNumberOfRuns`, `TestThiefStateRebaseWorks`,
 `TestStateThatCountsKeepsTheOldWordsAndEvidence`, `TestConsistencyAgainstAThiefStateSaysWhoMayBeWrong`,
-`TestWeakAnchorIsInTheJSONOfASuccess`, `TestWeakConflictKeepsOneFileForTheHeldState`.
+`TestWeakAnchorIsInTheJSONOfASuccess`, `TestWeakConflictKeepsOneFileForEachKindOfConflict`,
+`TestWeakReplayOfAnOldCheckpointDoesNotTakeThePlaceOfAFork`, `TestWeakConflictThatIsNotSavedIsPrintedInFull`,
+`TestWeakEvidenceStaysAtTwoFilesWhateverIsServed`, `TestAnchorWeakIsOnEveryExitAfterTheStateWasJudged`,
+`TestWeakStateRepairedByTheRunIsReportedAsItIsAfterTheWrite`.
+
+**A key rotation makes a state weak without anyone's act** (L16-10). A publisher without a key decides which
+genuine lines a state holds, but a rotation does the same with no publisher at all: the state was made while only
+the old key signed (the note had that one line); the auditor then adds the new key to the trust file and marks
+the old one revoked. From then on that state rests only on a key that is revoked, so it is weak, and every
+conflict against it is worded as for a thief's state ("may come from your state and not from the log", with the
+rebase, which adopts the log as served) and its evidence is the two files above, with the note printed when it is not
+saved. That is the cost of the decision that a held checkpoint is judged by its text and stays the anchor, and
+not a defect; the wording is the soft one on purpose, because the same state would be a thief's. **Before
+revoking the old key, run once** `checkpoint --state STATE` with a trust file that holds both keys, while the
+publisher serves a checkpoint signed by the new key: the state then gains the new key's line (same checkpoint,
+`signatures_added`) or advances to a checkpoint it signed (`advanced`), rests on a key that counts, and the
+revocation of the old key does not weaken it. A state that is already weak is repaired the same way by the first
+run that meets its checkpoint, or one that extends it, signed by the new key (`anchor_weak_repaired`); a conflict
+met before that is the weak conflict above.
 
 **Checkpoints you hold** (`--state`, `--old FILE`; design corrections 17 and 60). A checkpoint you kept is
 a statement about the past, so it is judged differently from a checkpoint under test, and the same
@@ -773,7 +850,9 @@ way in both commands for a state file:
 - the text decides, not the lines that were served with it. A state whose verifying keys are **all revoked
   or beyond their `max_tree_size`** is still your anchor, in `checkpoint --state` and in
   `consistency --old STATE`: the output says `rests only on keys that the trust file no longer counts`, names
-  each key and why, and lists as not proved that the checkpoint it held was genuine; a smaller size is a
+  each key and why, and `consistency --old STATE` lists as not proved that the checkpoint it held was genuine
+  (`checkpoint --state` does not when it succeeds: it has proved the held checkpoint a prefix of one signed by a key
+  that counts, or merged that key's line into it, and reports the state as it is after the write); a smaller size is a
   rollback and a root that does not extend it is a fork as ever, and the first checkpoint that extends it and
   is signed by a key that counts replaces it. This is the answer to the question of what a revocation does to a
   state you already hold: it does not make it unknown. (Before this round it was refused, which let a
@@ -1039,6 +1118,7 @@ Run one with `go test ./internal/proof -run '^$' -fuzz '^FuzzVerify$' -fuzztime 
 | `internal/safefile` | the one way every file is opened: never blocking, regular files only, bounded size, no link below a source directory |
 | `internal/statefile` | the state file: lock, atomic replace with a crash test, link resolution, the place for conflicting evidence |
 | `internal/stdio` | tells the null device that the runtime puts in place of a closed standard output from the one the user asked for, and reads `KINGRES_VERIFY_NO_OUTPUT` with which a caller says it gave the null device on purpose |
+| `internal/testdir` | the temporary directories of the tests: a removal with a retry of 10 seconds on Windows, where a scanner can keep an entry for a moment (a test helper, never built into the program) |
 | `internal/cli` | the command line (`cmd/kingres-verify` is a thin `main`) |
 
 ## Decisions where the documentation is silent
@@ -1524,7 +1604,7 @@ The round is small and changes no verdict.
 - A fork, a rollback or a failed extension against a state that rests only on keys the trust file no longer
   counts: the status is still 1 and the step is still `fork` or `rollback`; the failure line and the notes are
   longer and say what is said above; the evidence file is `<state>.conflict-weak-<held size>-<held root>` (one
-  for the state) and not `<state>.conflict-<size>-<root>` for each size served.
+  for the state; two files since L16, see below) and not `<state>.conflict-<size>-<root>` for each size served.
 - New JSON members: `info.state.anchor_weak` (every run with `--state` that does not end before the state is read),
   `info.state.anchor_weak_keys`, `info.old_anchor_weak`, `info.old_anchor_weak_keys` (`consistency --old`).
 - The note of an evidence file or a state that gained a line says how many lines it holds and of what kind; a
@@ -1538,7 +1618,66 @@ The round is small and changes no verdict.
 
 **States and evidence written by earlier versions** are read as they were.
 
-**What is left.** The window of a writer that ignores the lock is the rename call, measured above (0.08 percent
-on Linux, 6.3 percent on Windows with 3,000 attempts). Whether a state counts as "weak" depends on the lines the
-publisher served on the run that made it: it is not a choice of the verdict, only of the wording and of the
-number of evidence files of a later conflict. `systemd` was not run.
+**What is left.** The window of a writer that ignores the lock is the rename call, measured above (1 of 1,200
+attempts on Linux, 189 of 3,000 on Windows: counts for one machine and one rival, not rates). Whether a state counts
+as "weak" depends on the lines the publisher served on the run that made it: it is not a choice of the verdict,
+only of the wording and of the evidence files of a later conflict. `systemd` was not run.
+
+## Findings of the review of the sixth fixes (L16) and what was changed
+
+The review (`kingres/docs/reviews/2026-11-18-kingres-verifier-sixth-fixes.md`) found no wrong verdict, no accepted
+rollback or fork, no way for a party without a key to move or replace a held state or to flood the auditor, and no
+torn state in 700 kills. It found one finding that mattered (L16-01) and a set of statements that the code did not
+keep. This round changes no verdict and no exit status.
+
+| Finding | What was changed | Where it is described |
+|---|---|---|
+| L16-01 a replay of an old genuine checkpoint takes the one evidence file of a weak state, and the next conflict is neither saved nor printed | two files at most for a weak state, one for a rollback and one for a fork (`<state>.conflict-weak-rollback-...`, `<state>.conflict-weak-fork-...`); whatever note is not saved by the run is printed in full (text and `note_base64`), for any reason | "A conflict with a state that rests on keys that no longer count" |
+| L16-02 `anchor_weak` and `old_anchor_weak` are missing on some exits | the member is on every exit after the held state was judged: tile failures, input errors after the state was read, read-back, changed state, failed write, the size failure of `consistency`, and the other exits of `consistency` after `--old` | the same |
+| L16-03 a weak state that the run repaired is still called weak and its non-proof is listed | the JSON and the text report the state as it is after the write (`anchor_weak` false, `anchor_weak_repaired` true); the non-proof is not listed | the same |
+| L16-04 a temporary file left by a crash in the extension of an evidence file is not removed | every temporary file of this program in the directory is removed under the lock, with a strict name, regular-file and owner check | "The state file" |
+| L16-05 a failed flush of the directory after a successful rename or link is reported as a failed write | it is reported as what it is, with the same status; `directory_flushed` and `evidence_flushed` in the JSON | "The evidence of a fork" |
+| L16-06 (Windows) a read-only target waits 3 seconds and is blamed on another program | a read-only attribute and a directory at the name are named at once; the wait stays for codes 5, 32 and 33; the codes were measured | "A write never moves the state over one it did not read" |
+| L16-07 the flush of the evidence file before the link is not tested; two tests fail under load; the adversary test rarely meets a weak state | a test of the order and of a failing flush; `TestStateTwoRunsNeverMoveBackwards` counts the designed status 2 and keeps its assertion; the two load-sensitive tests repeat a measurement and wait longer without losing what they check; a deterministic test makes the two worlds differ in whether the state is weak | tests |
+| the cleanup failure of the tests on Windows | one helper for the temporary directories of the tests (`internal/testdir`) with a retry of 10 seconds on Windows; the handle test is repeated with the collector off, on Windows and on Linux | tests |
+| L16-09 the percentages | the figures are stated as counts, for one machine, one file system and one rival, and no rate is claimed | "A write never moves the state over one it did not read" |
+| L16-10 a rotation makes a state weak | stated, with the wording and what to do before revoking | "A key rotation makes a state weak without anyone's act" |
+
+**Interface changes a caller can see.**
+
+- A fork, a rollback or a failed extension against a state that rests only on keys the trust file no longer counts:
+  the evidence files are `<state>.conflict-weak-rollback-<held size>-<held root>` and
+  `<state>.conflict-weak-fork-<held size>-<held root>` (at most one of each), not
+  `<state>.conflict-weak-<held size>-<held root>`. A file of the old name that an earlier version made is not read and
+  not removed. A conflict that is not saved by the run says `was NOT saved by this run` and prints the note
+  (`the note to keep, as base64 ...`, `info.state.note_base64`), with `evidence_saved` false and `conflict_file` null;
+  the status is still 1.
+- New JSON members: `info.state.anchor_weak_repaired` (true, only when the run wrote a state that no longer rests only
+  on keys the trust file does not count), `info.state.directory_flushed` (false, only when the directory could not be
+  flushed after the state was replaced) and `info.state.evidence_flushed` (false, only when the directory could not be
+  flushed after an evidence file was linked). `info.state.anchor_weak` is now on every exit after the held state was
+  judged (it was on some), and `info.old_anchor_weak` on every exit of `consistency` after `--old` was judged, a plain
+  note included (`false`).
+- After a run that replaced a weak state with one that counts, `anchor_weak` is false and the weak keys are not
+  listed; the text note `the state file rested only on keys ... it does not rest only on such keys any more` says so,
+  and the not-proved line about the held checkpoint is not printed. `consistency --old STATE` still prints it.
+- The message after a failed flush of the directory (status 2 for the state, 4 or 1 for the evidence, as before) says
+  `was replaced ... but the directory could not be flushed: a power loss may bring the old file back` or `was saved to
+  ..., but the directory could not be flushed`, and not that the state could not be updated or the evidence was not
+  saved.
+- A temporary file of this program that an earlier crash left, under any name of the program, is removed by the next
+  `checkpoint --state` under the lock (it was removed only when the same name was written again).
+- On Windows a state or an evidence file with the read-only attribute, or a directory at the name, is refused at once
+  with `the file is read-only (the read-only attribute is set), so it cannot be replaced` (status 2) and not after 3
+  seconds with the wording about another program.
+- No new flag, no new exit status. The table of exit statuses is unchanged and is still derived from the source (the
+  new exit of the state replaced with a failed flush is a site of its own, status 2).
+
+**States and evidence written by earlier versions** are read as they were. A state that rests on a revoked key is
+still judged the same way.
+
+**What is left.** A party without a key decides which of two conflicting checkpoints of one kind is saved; it cannot
+make a run print less, and it cannot move or replace the state. Windows code 5 cannot tell an open handle from a denial
+by an access control list: the second waits 3 seconds and is worded as the first. The figures of the window are
+counts from one machine. The cleanup failure of the tests on Windows was not traced to a process (the Restart Manager
+named none); the tests now wait for it.

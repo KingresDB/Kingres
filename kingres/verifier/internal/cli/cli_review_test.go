@@ -12,10 +12,18 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
-// runWithin runs a command and fails the test when it takes a second or more:
-// a blocked open is a bug that must show as a failure and not as a hang.
+// runWithinLimit is how long a command may take before it counts as hung. A command
+// that opens a named pipe nobody writes to never returns, whatever the limit; a
+// machine under load can take more than a second to start and finish a run that
+// is not hung, so the limit is ten seconds.
+const runWithinLimit = 10 * time.Second
+
+// runWithin runs a command and fails the test when it takes runWithinLimit or
+// more: a blocked open is a bug that must show as a failure and not as a hang.
 func runWithin(t *testing.T, args ...string) (code int, stdout, stderr string) {
 	t.Helper()
 	type res struct {
@@ -30,8 +38,8 @@ func runWithin(t *testing.T, args ...string) (code int, stdout, stderr string) {
 	select {
 	case r := <-ch:
 		return r.code, r.out, r.err
-	case <-time.After(time.Second):
-		t.Fatalf("%v did not return within a second", args)
+	case <-time.After(runWithinLimit):
+		t.Fatalf("%v did not return within %v", args, runWithinLimit)
 		return 0, "", ""
 	}
 }
@@ -40,7 +48,7 @@ func runWithin(t *testing.T, args ...string) (code int, stdout, stderr string) {
 // members in the key object.
 func trustWith(t *testing.T, p *publication, extra string) string {
 	t.Helper()
-	f := filepath.Join(t.TempDir(), "trust.json")
+	f := filepath.Join(testdir.New(t), "trust.json")
 	body := fmt.Sprintf(`{"format":1,"origin_prefix":%q,"keys":[{"name":"k","public_key":%q,"fingerprint":%q%s}]}`,
 		testPrefix, base64.StdEncoding.EncodeToString(p.signer.pub), p.signer.fp(), extra)
 	if err := os.WriteFile(f, []byte(body), 0o644); err != nil {
@@ -154,7 +162,7 @@ func TestTextAndJSONCarryTheSameLines(t *testing.T) {
 	checkParity(t, "checkpoint fixed time", 0, append([]string{"checkpoint", "--now", "2026-12-01T00:00:00Z"}, src...)...)
 	checkParity(t, "checkpoint key notes", 0, "checkpoint", "--trust", limited, "--log", p.log(), "--source", p.dir, "--now", "2026-12-01T00:00:00Z")
 	checkParity(t, "checkpoint window", 0, "checkpoint", "--trust", retiring, "--log", p.log(), "--source", p.dir, "--now", "2026-12-01T00:00:00Z")
-	state := filepath.Join(t.TempDir(), "state")
+	state := filepath.Join(testdir.New(t), "state")
 	checkParityReset(t, "checkpoint state created", 0, func() { _ = os.Remove(state) }, append([]string{"checkpoint", "--state", state}, src...)...)
 	_ = os.Remove(state)
 	_, _, _ = run(t, append([]string{"checkpoint", "--state", state}, src...)...)
@@ -193,7 +201,7 @@ func TestRevokedKeyIsNeverUsed(t *testing.T) {
 	// A second, live key lets the note be checked; the note signed by the
 	// revoked key does not count.
 	other := newSigner(2)
-	two := filepath.Join(t.TempDir(), "two.json")
+	two := filepath.Join(testdir.New(t), "two.json")
 	body := fmt.Sprintf(`{"format":1,"origin_prefix":%q,"keys":[{"name":"old","public_key":%q,"fingerprint":%q,"revoked":true},{"name":"new","public_key":%q,"fingerprint":%q}]}`,
 		testPrefix, base64.StdEncoding.EncodeToString(p.signer.pub), p.signer.fp(), base64.StdEncoding.EncodeToString(other.pub), other.fp())
 	_ = os.WriteFile(two, []byte(body), 0o644)
@@ -244,7 +252,7 @@ func TestTrustShowSaysWhatIsEnforced(t *testing.T) {
 		t.Errorf("expired: %d %s", code, errs)
 	}
 	// A file without keys is not called valid: every command refuses it.
-	empty := filepath.Join(t.TempDir(), "e.json")
+	empty := filepath.Join(testdir.New(t), "e.json")
 	_ = os.WriteFile(empty, []byte(`{"format":1,"origin_prefix":"a.com/x","keys":[]}`), 0o644)
 	if code, out, _ := run(t, "trust", "show", "--trust", empty); code != 2 || strings.Contains(out, "valid") {
 		t.Errorf("no keys: %d %s", code, out)
@@ -298,7 +306,7 @@ func TestConsistencyOutputSaysWhatWasRead(t *testing.T) {
 
 func TestAbsentPublicationObjectIsStatus3(t *testing.T) {
 	p := newPublication(t, 300, 700)
-	empty := t.TempDir()
+	empty := testdir.New(t)
 	for name, args := range map[string][]string{
 		"checkpoint, no checkpoint":    {"checkpoint", "--trust", p.trust, "--log", p.log(), "--source", empty},
 		"checkpoint, no epoch dir":     {"checkpoint", "--trust", p.trust, "--log", "chain:" + testChain, "--source", empty},
@@ -365,7 +373,7 @@ func TestSpecialFilesInASource(t *testing.T) {
 
 func TestLinksInASource(t *testing.T) {
 	p := newPublication(t, 300, 700)
-	outside := filepath.Join(t.TempDir(), "outside")
+	outside := filepath.Join(testdir.New(t), "outside")
 	if err := os.WriteFile(outside, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -409,7 +417,7 @@ func TestLinksInASource(t *testing.T) {
 	// A link given by the auditor on the command line is read.
 	_ = os.Remove(p.logDir)
 	_ = os.Rename(moved, p.logDir)
-	lnk := filepath.Join(t.TempDir(), "note-link")
+	lnk := filepath.Join(testdir.New(t), "note-link")
 	if err := os.Symlink(cp, lnk); err != nil {
 		t.Skip(err)
 	}
@@ -420,7 +428,7 @@ func TestLinksInASource(t *testing.T) {
 
 func TestDirectoryAsNamedFile(t *testing.T) {
 	p := newPublication(t, 300, 700)
-	dir := t.TempDir()
+	dir := testdir.New(t)
 	for name, args := range map[string][]string{
 		"--note":  {"checkpoint", "--trust", p.trust, "--log", p.log(), "--note", dir},
 		"--trust": {"checkpoint", "--trust", dir, "--log", p.log(), "--source", p.dir},
@@ -442,7 +450,7 @@ func emptyRoot() []byte {
 // A file that is too big is refused before it is read, wherever it is named.
 func TestOversizedNamedFiles(t *testing.T) {
 	p := newPublication(t, 300, 700)
-	big := filepath.Join(t.TempDir(), "big")
+	big := filepath.Join(testdir.New(t), "big")
 	if err := os.WriteFile(big, make([]byte, (1<<20)+1), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -460,7 +468,7 @@ func TestOversizedNamedFiles(t *testing.T) {
 // ---- the older commands ----
 
 func TestDigestChainWithNothingToCompare(t *testing.T) {
-	empty := t.TempDir()
+	empty := testdir.New(t)
 	code, _, errs := run(t, "digest-chain", "--digests", empty)
 	if code != 2 || !strings.Contains(errs, "no digest file") {
 		t.Errorf("an empty directory: %d %s", code, errs)

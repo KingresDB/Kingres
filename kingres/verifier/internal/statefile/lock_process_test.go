@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // Real concurrent processes (L12-02). Goroutines share one process and one
@@ -96,7 +98,7 @@ func TestLockExcludesRealProcesses(t *testing.T) {
 		t.Skip("starts processes")
 	}
 	const procs, rounds = 4, 25
-	dir := t.TempDir()
+	dir := testdir.New(t)
 	runHelpers(t, dir, procs, rounds)
 	checkHelperResult(t, dir, procs, rounds)
 }
@@ -113,7 +115,7 @@ func TestLockExcludesRealProcessesOnALooseLockFile(t *testing.T) {
 	}
 	const procs, rounds = 4, 15
 	for rep := 0; rep < 6; rep++ {
-		dir := t.TempDir()
+		dir := testdir.New(t)
 		lock := lockName(filepath.Join(dir, "state"))
 		if err := os.WriteFile(lock, nil, 0o600); err != nil {
 			t.Fatal(err)

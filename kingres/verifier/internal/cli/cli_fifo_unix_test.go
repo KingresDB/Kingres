@@ -11,6 +11,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 func fifo(t *testing.T, path string) {
@@ -30,7 +32,7 @@ func fifo(t *testing.T, path string) {
 func TestNamedPipesNeverHang(t *testing.T) {
 	p := newPublication(t, 300, 700)
 	old := filepath.Join(p.logDir, "old.note")
-	pipe := filepath.Join(t.TempDir(), "pipe")
+	pipe := filepath.Join(testdir.New(t), "pipe")
 	fifo(t, pipe)
 	dir := []string{"--trust", p.trust, "--log", p.log(), "--source", p.dir}
 
@@ -68,7 +70,7 @@ func TestNamedPipesNeverHang(t *testing.T) {
 		"--state":             {"checkpoint", "--trust", p.trust, "--log", p.log(), "--source", p.dir, "--state", pipe},
 		"--source":            {"checkpoint", "--trust", p.trust, "--log", p.log(), "--source", pipe},
 		"trust show":          {"trust", "show", "--trust", pipe},
-		"trust init key file": {"trust", "init", "--origin-prefix", testPrefix, "--public-key-file", pipe, "--fingerprint", p.signer.fp(), "--out", filepath.Join(t.TempDir(), "t.json")},
+		"trust init key file": {"trust", "init", "--origin-prefix", testPrefix, "--public-key-file", pipe, "--fingerprint", p.signer.fp(), "--out", filepath.Join(testdir.New(t), "t.json")},
 		"proof":               {"proof", "--proof", pipe, "--digest", fx("digests/d8.json")},
 		"proof digest":        {"proof", "--proof", fx("proofs/itm1_v1_d.json"), "--digest", pipe},
 		"row-hash":            {"row-hash", "--table-id", "1", "--columns", pipe},
@@ -85,7 +87,7 @@ func TestNamedPipesNeverHang(t *testing.T) {
 		t.Errorf("trust init --out a pipe: %d %s", code, errs)
 	}
 	// A pipe inside a directory of digests, named like a digest file.
-	digests := t.TempDir()
+	digests := testdir.New(t)
 	fifo(t, filepath.Join(digests, "x.json"))
 	if code, _, errs := runWithin(t, "digest-chain", "--digests", digests); code != 2 || !strings.Contains(errs, "regular file") {
 		t.Errorf("pipe in a digest directory: %d %s", code, errs)

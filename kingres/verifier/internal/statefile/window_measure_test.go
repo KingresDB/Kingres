@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/safefile"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // L14-04. The measurement of the window in which a writer that ignores the lock
@@ -52,7 +54,7 @@ type windowResult struct {
 }
 
 func measureWindow(t *testing.T, attempts int, call func(path string, data, was []byte) error) windowResult {
-	dir := t.TempDir()
+	dir := testdir.New(t)
 	p := filepath.Join(dir, "state")
 	was := []byte("the state that was read\n")
 	data := bytes.Repeat([]byte("n"), 700)

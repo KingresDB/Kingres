@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // L12-04. The README's rule for the standard output, in the program that is
@@ -31,7 +33,7 @@ func runWith(t *testing.T, redirect string, args ...string) (int, string, string
 // runWithEnv is runWith with more variables in the environment of the program.
 func runWithEnv(t *testing.T, env []string, redirect string, args ...string) (int, string, string) {
 	t.Helper()
-	dir := t.TempDir()
+	dir := testdir.New(t)
 	script := `exec "$0" "$@" ` + redirect
 	cmd := exec.Command("sh", append([]string{"-c", script, os.Args[0]}, args...)...)
 	cmd.Dir = dir
@@ -69,7 +71,7 @@ func TestClosedStandardOutputIsStatus2(t *testing.T) {
 }
 
 func TestStandardOutputThatTheUserChoseRuns(t *testing.T) {
-	dir := t.TempDir()
+	dir := testdir.New(t)
 	for _, redirect := range []string{">/dev/null", ">>/dev/null", ">" + filepath.Join(dir, "out.txt"), "| cat"} {
 		code, out, errs := runWith(t, redirect, "version")
 		if code != 0 {

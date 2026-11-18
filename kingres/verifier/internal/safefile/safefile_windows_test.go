@@ -10,12 +10,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // A junction needs no privilege, unlike a symbolic link, so this is the link
 // test that runs on every Windows machine.
 func TestJunctionInASourceIsRefused(t *testing.T) {
-	root, outside := t.TempDir(), t.TempDir()
+	root, outside := testdir.New(t), testdir.New(t)
 	write(t, filepath.Join(outside, "secret"), "secret")
 	if out, err := exec.Command("cmd", "/c", "mklink", "/J", filepath.Join(root, "jct"), outside).CombinedOutput(); err != nil {
 		t.Skipf("cannot make a junction: %v %s", err, out)
@@ -41,7 +43,7 @@ func TestReservedNamesAreNotOpened(t *testing.T) {
 		}
 	})
 	// A normal path still works.
-	f := filepath.Join(t.TempDir(), "ok.txt")
+	f := filepath.Join(testdir.New(t), "ok.txt")
 	if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}

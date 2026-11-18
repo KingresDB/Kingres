@@ -17,6 +17,8 @@ import (
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/chain"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/format"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/proof"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // L10-07: an honest proof of an old row is never refused for its size. A proof
@@ -108,7 +110,7 @@ func TestHonestProofOfAnOldRowIsNotRefusedForItsSize(t *testing.T) {
 	if testing.Short() {
 		n = 1000
 	}
-	p, d, size := syntheticProof(t, t.TempDir(), n)
+	p, d, size := syntheticProof(t, testdir.New(t), n)
 	if !testing.Short() && size <= 16<<20 {
 		t.Fatalf("the proof is %d bytes, not over the old cap", size)
 	}
@@ -127,7 +129,7 @@ func TestHonestProofOfAnOldRowIsNotRefusedForItsSize(t *testing.T) {
 	} else {
 		data[cut] = '0'
 	} // another hex digit: a header with a hash that is not its own
-	bad := filepath.Join(t.TempDir(), "bad.json")
+	bad := filepath.Join(testdir.New(t), "bad.json")
 	if err := os.WriteFile(bad, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +142,7 @@ func TestHonestProofOfAnOldRowIsNotRefusedForItsSize(t *testing.T) {
 // The chain is read again from the file, so a file that is not the same on the
 // second reading is refused: the verdict is about the bytes that were parsed.
 func TestProofThatChangesBetweenTheTwoReadingsIsRefused(t *testing.T) {
-	p, d, _ := syntheticProof(t, t.TempDir(), 50)
+	p, d, _ := syntheticProof(t, testdir.New(t), 50)
 	good, err := os.ReadFile(p)
 	if err != nil {
 		t.Fatal(err)

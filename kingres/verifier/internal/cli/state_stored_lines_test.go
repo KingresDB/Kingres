@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // L14-03. The lines of one text only accumulate: a line that is stored (it was
@@ -29,9 +31,9 @@ func reversedLines(t *testing.T, note string) string {
 func TestEvidenceKeepsTheLineOfAKeyThatLeftTheTrustFile(t *testing.T) {
 	k0, k1, k2, k3 := newSigner(10), newSigner(11), newSigner(12), newSigner(13)
 	all := leaves(700)
-	root := t.TempDir()
+	root := testdir.New(t)
 	full := trustOf(t, keySpec{"k0", k0, ""}, keySpec{"k1", k1, ""}, keySpec{"k2", k2, ""}, keySpec{"k3", k3, ""})
-	state := filepath.Join(t.TempDir(), "state")
+	state := filepath.Join(testdir.New(t), "state")
 	publishNote(t, root, all, 700, signedBy(700, all, []signer{k0}))
 	if code, out, errs := run(t, stateArgs(full, root, state)...); code != 0 {
 		t.Fatalf("seed: %d\n%s%s", code, out, errs)
@@ -77,9 +79,9 @@ func TestEvidenceKeepsTheLineOfAKeyThatLeftTheTrustFile(t *testing.T) {
 func TestStateKeepsTheLineOfAKeyThatLeftTheTrustFile(t *testing.T) {
 	k0, k1, k2 := newSigner(10), newSigner(11), newSigner(12)
 	all := leaves(700)
-	root := t.TempDir()
+	root := testdir.New(t)
 	full := trustOf(t, keySpec{"k0", k0, ""}, keySpec{"k1", k1, ""}, keySpec{"k2", k2, ""})
-	state := filepath.Join(t.TempDir(), "state")
+	state := filepath.Join(testdir.New(t), "state")
 	publishNote(t, root, all, 300, signedBy(300, all, []signer{k0, k1}))
 	if code, out, errs := run(t, stateArgs(full, root, state)...); code != 0 {
 		t.Fatalf("seed: %d\n%s%s", code, out, errs)
@@ -114,9 +116,9 @@ func TestStateKeepsTheLineOfAKeyThatLeftTheTrustFile(t *testing.T) {
 func TestLineOfAKeyThatLeftTheFileMakesNothingUsable(t *testing.T) {
 	k0, k1, k2 := newSigner(10), newSigner(11), newSigner(12)
 	all := leaves(700)
-	root := t.TempDir()
+	root := testdir.New(t)
 	full := trustOf(t, keySpec{"k0", k0, ""}, keySpec{"k1", k1, ""}, keySpec{"k2", k2, ""})
-	state := filepath.Join(t.TempDir(), "state")
+	state := filepath.Join(testdir.New(t), "state")
 	publishNote(t, root, all, 300, signedBy(300, all, []signer{k0, k1}))
 	if code, out, errs := run(t, stateArgs(full, root, state)...); code != 0 {
 		t.Fatalf("seed: %d\n%s%s", code, out, errs)
@@ -145,9 +147,9 @@ func TestLineOfAKeyThatLeftTheFileMakesNothingUsable(t *testing.T) {
 func TestEvidenceIsNotRewrittenWhenNothingIsAdded(t *testing.T) {
 	k0, k1, k2 := newSigner(10), newSigner(11), newSigner(12)
 	all := leaves(700)
-	root := t.TempDir()
+	root := testdir.New(t)
 	tr := trustOf(t, keySpec{"k0", k0, ""}, keySpec{"k1", k1, ""}, keySpec{"k2", k2, ""})
-	state := filepath.Join(t.TempDir(), "state")
+	state := filepath.Join(testdir.New(t), "state")
 	publishNote(t, root, all, 700, signedBy(700, all, []signer{k0}))
 	if code, out, errs := run(t, stateArgs(tr, root, state)...); code != 0 {
 		t.Fatalf("seed: %d\n%s%s", code, out, errs)
@@ -181,9 +183,9 @@ func TestEvidenceIsNotRewrittenWhenNothingIsAdded(t *testing.T) {
 func TestSameSizeAndRootWithAnotherTextMergesNothing(t *testing.T) {
 	k0, k1 := newSigner(10), newSigner(11)
 	all := leaves(300)
-	root := t.TempDir()
+	root := testdir.New(t)
 	tr := trustOf(t, keySpec{"k0", k0, ""}, keySpec{"k1", k1, ""})
-	state := filepath.Join(t.TempDir(), "state")
+	state := filepath.Join(testdir.New(t), "state")
 	publishNote(t, root, all, 300, signedBy(300, all, []signer{k0}))
 	if code, out, errs := run(t, stateArgs(tr, root, state)...); code != 0 {
 		t.Fatalf("seed: %d\n%s%s", code, out, errs)

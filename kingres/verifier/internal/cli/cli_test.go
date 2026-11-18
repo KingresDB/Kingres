@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 const fixtureDir = "../../testdata/fixtures"
@@ -126,7 +128,7 @@ func TestProofCommandMutatedFile(t *testing.T) {
 	}
 	i := bytes.Index(b, []byte(`"row_hash": "`)) + len(`"row_hash": "`)
 	b[i] = 'f' // the first hex character of the row hash was '5'
-	p := filepath.Join(t.TempDir(), "mutated.json")
+	p := filepath.Join(testdir.New(t), "mutated.json")
 	if err := os.WriteFile(p, b, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +223,7 @@ func TestBlocksCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	b[bytes.Index(b, []byte(`"tx_count" : 2`))+len(`"tx_count" : `)] = '3'
-	p := filepath.Join(t.TempDir(), "blocks.jsonl")
+	p := filepath.Join(testdir.New(t), "blocks.jsonl")
 	if err := os.WriteFile(p, b, 0o600); err != nil {
 		t.Fatal(err)
 	}

@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // L12-02: a lock file is never removed and never replaced while it can be held.
@@ -24,7 +26,7 @@ import (
 func TestLockFileWithALooseModeIsLockedInPlaceAndTightened(t *testing.T) {
 	for _, mode := range []os.FileMode{0o644, 0o640, 0o660, 0o666, 0o604, 0o602} {
 		t.Run(mode.String(), func(t *testing.T) {
-			state := filepath.Join(t.TempDir(), "state")
+			state := filepath.Join(testdir.New(t), "state")
 			lock := lockName(state)
 			if err := os.WriteFile(lock, nil, 0o600); err != nil {
 				t.Fatal(err)
@@ -59,7 +61,7 @@ func TestLockFileWithALooseModeIsLockedInPlaceAndTightened(t *testing.T) {
 // Whoever keeps the old file open holds the lock on the file the auditor locks:
 // the auditor waits for them, and does not walk around them.
 func TestLockHeldByAnotherDescriptorBlocksARunWhateverTheMode(t *testing.T) {
-	state := filepath.Join(t.TempDir(), "state")
+	state := filepath.Join(testdir.New(t), "state")
 	lock := lockName(state)
 	if err := os.WriteFile(lock, nil, 0o600); err != nil {
 		t.Fatal(err)
@@ -86,7 +88,7 @@ func TestLockHeldByAnotherDescriptorBlocksARunWhateverTheMode(t *testing.T) {
 }
 
 func TestLockFileOfAnotherOwnerIsRefusedAndKept(t *testing.T) {
-	state := filepath.Join(t.TempDir(), "state")
+	state := filepath.Join(testdir.New(t), "state")
 	lock := lockName(state)
 	if err := os.WriteFile(lock, nil, 0o600); err != nil {
 		t.Fatal(err)
@@ -113,7 +115,7 @@ func TestLockFileOfAnotherOwnerIsRefusedAndKept(t *testing.T) {
 // A lock file removed by hand between the open and the lock: the name leads to
 // another file, and the lock is the one on the file the name leads to now.
 func TestLockIsOnTheFileTheNameLeadsToAfterTheLock(t *testing.T) {
-	state := filepath.Join(t.TempDir(), "state")
+	state := filepath.Join(testdir.New(t), "state")
 	lock := lockName(state)
 	first := true
 	beforeLock = func() {

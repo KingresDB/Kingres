@@ -17,6 +17,8 @@ import (
 
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/signednote"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/trust"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // L9-05. The verifier runs on an auditor's machine over files a hostile server
@@ -99,7 +101,7 @@ func memCommands(t testing.TB) []struct {
 } {
 	zeroHash := strings.Repeat("00", 32)
 	d0 := fx("digests/d0.json")
-	trustFile := filepath.Join(t.TempDir(), "trust.json")
+	trustFile := filepath.Join(testdir.New(t), "trust.json")
 	// a trust file of the right shape is only needed for the flags that precede
 	// the hostile file: the hostile file is read first or the run ends at the
 	// missing trust file, either way the memory is measured.
@@ -122,7 +124,7 @@ func memCommands(t testing.TB) []struct {
 		{"consistency old", []string{"consistency", "--trust", trustFile, "--log", log, "--old", "@"}, maxStateFile},
 		{"trust show", []string{"trust", "show", "--trust", "@"}, trust.MaxFileSize},
 		{"consistency new", []string{"consistency", "--trust", trustFile, "--log", log, "--old", "1:" + base64.StdEncoding.EncodeToString(make([]byte, 32)), "--new", "@"}, signednote.MaxNoteSize},
-		{"trust init key file", []string{"trust", "init", "--origin-prefix", "x.example", "--public-key-file", "@", "--fingerprint", zeroHash, "--out", filepath.Join(t.TempDir(), "out.json")}, 4096},
+		{"trust init key file", []string{"trust", "init", "--origin-prefix", "x.example", "--public-key-file", "@", "--fingerprint", zeroHash, "--out", filepath.Join(testdir.New(t), "out.json")}, 4096},
 		{"checkpoint note", []string{"checkpoint", "--trust", trustFile, "--log", log, "--note", "@"}, signednote.MaxNoteSize},
 	}
 }
@@ -144,7 +146,7 @@ func onThisSystem(size int) int {
 }
 
 func forEachHostileFile(t *testing.T, fn func(t *testing.T, name string, args []string, size int)) {
-	dir := t.TempDir()
+	dir := testdir.New(t)
 	bySize := map[int]map[string]string{}
 	for _, c := range memCommands(t) {
 		for _, sz := range []int{c.size, 16 << 20} {
@@ -240,7 +242,7 @@ func TestAllocationOfAProofWithALongChain(t *testing.T) {
 		t.Skip("reads a file of 16 MiB")
 	}
 	size := onThisSystem(15 << 20)
-	path, n := longChainProof(t, t.TempDir(), size)
+	path, n := longChainProof(t, testdir.New(t), size)
 	var code int
 	var out, errs string
 	got := peakHeap(func() { code, out, errs = run(t, "proof", "--proof", path, "--digest", fx("digests/d0.json")) })

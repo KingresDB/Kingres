@@ -15,6 +15,8 @@ import (
 
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/chain"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/statefile"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // jsonOf runs a command with --json and returns the object.
@@ -42,7 +44,7 @@ func stateInfo(t *testing.T, o map[string]any) map[string]any {
 // a proof, an advance does, a fork does not.
 func TestJSONSaysWhatWasProved(t *testing.T) {
 	x := newExitEnv(t)
-	st := filepath.Join(t.TempDir(), "state")
+	st := filepath.Join(testdir.New(t), "state")
 	// first use: nothing was proved, the state was created
 	code, o := jsonOf(t, x.cp("--note", x.oldN, "--state", st)...)
 	info := stateInfo(t, o)
@@ -80,22 +82,22 @@ func TestStateOfSizeOneMovesOnlyWithAProof(t *testing.T) {
 	s := newSigner(1)
 	tr := trustOf(t, keySpec{"k", s, ""})
 	honest := leaves(300)
-	state := filepath.Join(t.TempDir(), "state")
-	one := t.TempDir()
+	state := filepath.Join(testdir.New(t), "state")
+	one := testdir.New(t)
 	publishLog(t, one, s, honest, 1)
 	if code, out, errs := run(t, stateArgs(tr, one, state)...); code != 0 {
 		t.Fatalf("size 1: %d %s %s", code, out, errs)
 	}
 	kept := fileText(t, state)
 	// a history whose first leaf is another: the stored size 1 is not its prefix
-	fork := t.TempDir()
+	fork := testdir.New(t)
 	publishLog(t, fork, s, leavesSalt(300, 0, "other"), 300)
 	code, out, _ := run(t, stateArgs(tr, fork, state)...)
 	if code != 1 || strings.Contains(out, "VERIFIED") || !strings.Contains(out, "FAILED at step") || fileText(t, state) != kept {
 		t.Fatalf("a fork of a tree of one leaf moved the state: %d\n%s", code, out)
 	}
 	// the honest growth reads tiles and proves it
-	real := t.TempDir()
+	real := testdir.New(t)
 	publishLog(t, real, s, honest, 300)
 	code, out, _ = run(t, stateArgs(tr, real, state)...)
 	if code != 0 || !strings.Contains(out, "tile(s)") || strings.Contains(out, "the empty tree") || stateSize(t, state) != 300 {
@@ -136,7 +138,7 @@ func TestStateRecordStrictness(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			f := writeTemp(t, t.TempDir(), "state", c.content)
+			f := writeTemp(t, testdir.New(t), "state", c.content)
 			for _, args := range [][]string{x.cp("--state", f), x.co("--old", f)} {
 				code, out, errs := run(t, args...)
 				if code != 2 || strings.Contains(out, "VERIFIED") || strings.Contains(out, "CONSISTENT") {
@@ -156,7 +158,7 @@ func TestStateRecordStrictness(t *testing.T) {
 	}
 	// A record with only the layout changed is the same record.
 	spaced := strings.TrimSuffix(record, "\n") + "\n\n  \n"
-	f := writeTemp(t, t.TempDir(), "state", spaced)
+	f := writeTemp(t, testdir.New(t), "state", spaced)
 	if code, out, errs := run(t, x.cp("--state", f)...); code != 0 {
 		t.Errorf("white space after the record: %d %s %s", code, out, errs)
 	}
@@ -165,7 +167,7 @@ func TestStateRecordStrictness(t *testing.T) {
 // L9-15: an empty state file is refused, and the advice keeps the protection.
 func TestEmptyStateFileIsNotNoState(t *testing.T) {
 	x := newExitEnv(t)
-	f := writeTemp(t, t.TempDir(), "state", "")
+	f := writeTemp(t, testdir.New(t), "state", "")
 	code, out, errs := run(t, x.cp("--state", f)...)
 	if code != 2 || strings.Contains(out, "VERIFIED") {
 		t.Fatalf("%d %s %s", code, out, errs)
@@ -193,7 +195,7 @@ func TestBlocksExportThatEndsEarly(t *testing.T) {
 		t.Fatal(err)
 	}
 	cid := fmt.Sprintf("%x", dg.ChainID)
-	cut := writeTemp(t, t.TempDir(), "cut.jsonl", strings.Join(lines[:4], ""))
+	cut := writeTemp(t, testdir.New(t), "cut.jsonl", strings.Join(lines[:4], ""))
 	// without a digest the prefix is a valid chain, and the output says exactly
 	// that: how far it goes, and that nothing shows it is the whole chain
 	code, out, _ := run(t, "blocks", "--blocks", cut, "--chain-id", cid)
@@ -232,13 +234,13 @@ func TestBlocksExportThatEndsEarly(t *testing.T) {
 	}
 	// a valid prefix followed by a line too long to read is not verified up to the
 	// cut: it is a failure at the step parse
-	long := writeTemp(t, t.TempDir(), "long.jsonl", strings.Join(lines[:4], "")+strings.Repeat("x", 2<<20)+"\n")
+	long := writeTemp(t, testdir.New(t), "long.jsonl", strings.Join(lines[:4], "")+strings.Repeat("x", 2<<20)+"\n")
 	code, out, _ = run(t, "blocks", "--blocks", long, "--chain-id", cid)
 	if code != 1 || strings.Contains(out, "VERIFIED") || !strings.Contains(out, "FAILED at step parse") {
 		t.Errorf("a long line after a prefix: %d %.300s", code, out)
 	}
 	// ...and a prefix followed by a line that is cut in the middle
-	half := writeTemp(t, t.TempDir(), "half.jsonl", strings.Join(lines[:4], "")+lines[4][:60])
+	half := writeTemp(t, testdir.New(t), "half.jsonl", strings.Join(lines[:4], "")+lines[4][:60])
 	code, out, _ = run(t, "blocks", "--blocks", half, "--chain-id", cid)
 	if code != 1 || strings.Contains(out, "VERIFIED") {
 		t.Errorf("a half line after a prefix: %d %.300s", code, out)
@@ -326,7 +328,7 @@ func TestSharedStateDirectoryIsRefusedUnlessAccepted(t *testing.T) {
 		t.Skip("the permissions of a Windows folder are not read")
 	}
 	x := newExitEnv(t)
-	d := t.TempDir()
+	d := testdir.New(t)
 	if err := os.Chmod(d, 0o775); err != nil {
 		t.Fatal(err)
 	}
@@ -350,8 +352,8 @@ func TestSharedStateDirectoryIsRefusedUnlessAccepted(t *testing.T) {
 // L9-08: a link at the name of the lock is not followed.
 func TestLockThroughALinkIsRefusedAndNothingIsCreated(t *testing.T) {
 	x := newExitEnv(t)
-	d := t.TempDir()
-	target := filepath.Join(t.TempDir(), "created")
+	d := testdir.New(t)
+	target := filepath.Join(testdir.New(t), "created")
 	if err := os.Symlink(target, filepath.Join(d, ".kingres-state.lock")); err != nil {
 		t.Skipf("no link here: %v", err)
 	}
@@ -367,7 +369,7 @@ func TestLockThroughALinkIsRefusedAndNothingIsCreated(t *testing.T) {
 // L9-06: a digest directory is read by the names the listing gives, and the
 // export command of the README makes names that every system accepts.
 func TestDigestDirectoryNames(t *testing.T) {
-	d := t.TempDir()
+	d := testdir.New(t)
 	names := []string{"digest-2026-11-14T17-21-53Z.json", "with space.json", "-leading-dash.json"}
 	if runtime.GOOS != "windows" {
 		names = append(names, "digest-2026-11-14T17:21:54Z.json", `back\slash.json`)
@@ -402,7 +404,7 @@ func TestReadmeExportCommandMakesAReadableDirectory(t *testing.T) {
 	// The part before the redirect needs a database; what a digest looks like is
 	// the fixture. The redirect and the name are the command's own text.
 	redirect := cmdline[strings.Index(cmdline, " > ")+3:]
-	d := t.TempDir()
+	d := testdir.New(t)
 	for i := 0; i < 2; i++ {
 		abs, _ := filepath.Abs(fx(fmt.Sprintf("digests/d%d.json", i)))
 		script := fmt.Sprintf("cat %q > %s", filepath.ToSlash(abs), redirect)

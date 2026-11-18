@@ -18,6 +18,8 @@ import (
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/checkpoint"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/signednote"
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/trust"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // L12-01 and L12-03. The invariant of the signature lines of a note: the identity
@@ -90,8 +92,8 @@ func TestPublisherCannotChooseWhichKeyTheStateRestsOn(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			var statuses [2]int
 			for i, serveOnlyK2 := range []bool{false, true} {
-				root := t.TempDir()
-				state := filepath.Join(t.TempDir(), "state")
+				root := testdir.New(t)
+				state := filepath.Join(testdir.New(t), "state")
 				note := signedBy(300, all, []signer{k1, k2})
 				if serveOnlyK2 {
 					text, _ := splitNote(note)
@@ -123,10 +125,10 @@ func TestPublisherCannotChooseWhichKeyTheStateRestsOn(t *testing.T) {
 func TestStateOnARevokedKeyOnlyIsUsedAndSaysSo(t *testing.T) {
 	k1, k2 := newSigner(1), newSigner(2)
 	all := leaves(700)
-	root := t.TempDir()
+	root := testdir.New(t)
 	both := trustOf(t, keySpec{"k1", k1, ""}, keySpec{"k2", k2, ""})
 	revoked := trustOf(t, keySpec{"k1", k1, ""}, keySpec{"k2", k2, `,"revoked":true`})
-	state := filepath.Join(t.TempDir(), "state")
+	state := filepath.Join(testdir.New(t), "state")
 	text, _ := splitNote(signedBy(300, all, nil))
 	publishNote(t, root, all, 300, joinNote(text, []string{sigLine(logOrigin(), text, k2)}))
 	if code, out, errs := run(t, stateArgs(both, root, state)...); code != 0 {
@@ -139,7 +141,7 @@ func TestStateOnARevokedKeyOnlyIsUsedAndSaysSo(t *testing.T) {
 	}
 	// a larger one that does not extend it is a fork, as ever
 	forked := leavesSalt(700, 100, "other")
-	froot := t.TempDir()
+	froot := testdir.New(t)
 	publishNote(t, froot, forked, 700, signedBy(700, forked, []signer{k1}))
 	if code, out, _ := run(t, stateArgs(revoked, froot, state)...); code != 1 || !strings.Contains(out, "FAILED at step fork") {
 		t.Fatalf("a fork against a state that rests on a revoked key: %d\n%s", code, out)
@@ -147,7 +149,9 @@ func TestStateOnARevokedKeyOnlyIsUsedAndSaysSo(t *testing.T) {
 	// the genuine one extends it, and the state now rests on a key that counts
 	publishNote(t, root, all, 700, signedBy(700, all, []signer{k1}))
 	code, out, _ := run(t, stateArgs(revoked, root, state)...)
-	if code != 0 || !strings.Contains(out, "that the checkpoint the state file held was genuine") {
+	// the run proved that the held checkpoint is a prefix of one signed by a key that
+	// counts, and the state it wrote rests on that key: nothing is left to list (L16-03)
+	if code != 0 || strings.Contains(out, "that the checkpoint the state file held was genuine") || !strings.Contains(out, "does not rest only on such keys any more") {
 		t.Fatalf("the genuine extension: %d\n%s", code, out)
 	}
 	code, out, _ = run(t, stateArgs(revoked, root, state)...)
@@ -161,9 +165,9 @@ func TestStateOnARevokedKeyOnlyIsUsedAndSaysSo(t *testing.T) {
 func TestLinesOfOneCheckpointAccumulate(t *testing.T) {
 	k1, k2, k3 := newSigner(1), newSigner(2), newSigner(3)
 	all := leaves(300)
-	root := t.TempDir()
+	root := testdir.New(t)
 	tr := trustOf(t, keySpec{"k1", k1, ""}, keySpec{"k2", k2, ""}, keySpec{"k3", k3, ""})
-	state := filepath.Join(t.TempDir(), "state")
+	state := filepath.Join(testdir.New(t), "state")
 	text, _ := splitNote(signedBy(300, all, nil))
 	serve := func(keys ...signer) {
 		var ls []string
@@ -226,8 +230,8 @@ func TestEveryChoiceOfLinesIsOneEvidenceFile(t *testing.T) {
 	}
 	tr := trustOf(t, specs...)
 	all := leaves(700)
-	root := t.TempDir()
-	state := filepath.Join(t.TempDir(), "state")
+	root := testdir.New(t)
+	state := filepath.Join(testdir.New(t), "state")
 	publishNote(t, root, all, 700, signedBy(700, all, ks))
 	if code, out, errs := run(t, stateArgs(tr, root, state)...); code != 0 {
 		t.Fatalf("seed: %d\n%s%s", code, out, errs)
@@ -258,7 +262,7 @@ func TestEveryChoiceOfLinesIsOneEvidenceFile(t *testing.T) {
 		t.Fatalf("the evidence holds %d lines, want the union of all 4", len(got))
 	}
 	// the other order: fewest lines last
-	root2, state2 := t.TempDir(), filepath.Join(t.TempDir(), "state")
+	root2, state2 := testdir.New(t), filepath.Join(testdir.New(t), "state")
 	publishNote(t, root2, all, 700, signedBy(700, all, ks))
 	if code, out, _ := run(t, stateArgs(tr, root2, state2)...); code != 0 {
 		t.Fatal(out)
@@ -286,10 +290,10 @@ func TestEveryChoiceOfLinesIsOneEvidenceFile(t *testing.T) {
 func TestRefusedStateNamesTheRebaseAndTheRebaseWorks(t *testing.T) {
 	k1, k2 := newSigner(1), newSigner(2)
 	all := leaves(700)
-	root := t.TempDir()
+	root := testdir.New(t)
 	both := trustOf(t, keySpec{"k1", k1, ""}, keySpec{"k2", k2, ""})
 	onlyK1 := trustOf(t, keySpec{"k1", k1, ""})
-	state := filepath.Join(t.TempDir(), "state")
+	state := filepath.Join(testdir.New(t), "state")
 	text, _ := splitNote(signedBy(300, all, nil))
 	publishNote(t, root, all, 300, joinNote(text, []string{sigLine(logOrigin(), text, k2)}))
 	if code, out, errs := run(t, stateArgs(both, root, state)...); code != 0 {
@@ -307,7 +311,7 @@ func TestRefusedStateNamesTheRebaseAndTheRebaseWorks(t *testing.T) {
 		}
 	}
 	// the advice, followed: a new state at the size believed, then it works
-	fresh := filepath.Join(t.TempDir(), "newstate")
+	fresh := filepath.Join(testdir.New(t), "newstate")
 	if code, out, errs := run(t, stateArgs(onlyK1, root, fresh, "--min-size", "300")...); code != 0 {
 		t.Fatalf("the rebase: %d\n%s%s", code, out, errs)
 	}
@@ -329,9 +333,9 @@ func TestRefusedStateNamesTheRebaseAndTheRebaseWorks(t *testing.T) {
 func TestReadBackGuardStopsAStateThatWouldNotBeRead(t *testing.T) {
 	s := newSigner(1)
 	all := leaves(700)
-	root := t.TempDir()
+	root := testdir.New(t)
 	tr := trustOf(t, keySpec{"k", s, ""})
-	state := filepath.Join(t.TempDir(), "state")
+	state := filepath.Join(testdir.New(t), "state")
 	publishNote(t, root, all, 300, signedBy(300, all, []signer{s}))
 	if code, out, errs := run(t, stateArgs(tr, root, state)...); code != 0 {
 		t.Fatalf("seed: %d\n%s%s", code, out, errs)
@@ -352,9 +356,9 @@ func TestReadBackGuardStopsAStateThatWouldNotBeRead(t *testing.T) {
 func TestLateWriterWritesNothingOverANewerState(t *testing.T) {
 	s := newSigner(1)
 	all := leaves(700)
-	root := t.TempDir()
+	root := testdir.New(t)
 	tr := trustOf(t, keySpec{"k", s, ""})
-	state := filepath.Join(t.TempDir(), "state")
+	state := filepath.Join(testdir.New(t), "state")
 	publishNote(t, root, all, 300, signedBy(300, all, []signer{s}))
 	if code, out, errs := run(t, stateArgs(tr, root, state)...); code != 0 {
 		t.Fatalf("seed: %d\n%s%s", code, out, errs)
@@ -418,9 +422,9 @@ func runAdversaryWorld(t *testing.T, ch chooser, steps int, seedName string, nke
 	p := newPool(nkeys)
 	all := leaves(700)
 	sizes := []int{255, 300, 400, 513, 700}
-	root := t.TempDir()
-	stA := filepath.Join(t.TempDir(), "state")
-	stB := filepath.Join(t.TempDir(), "state")
+	root := testdir.New(t)
+	stA := filepath.Join(testdir.New(t), "state")
+	stB := filepath.Join(testdir.New(t), "state")
 	mk := func(size int, note string) string {
 		publishNote(t, root, all, size, note)
 		return writeNote(t, note)
@@ -536,6 +540,11 @@ func runAdversaryWorld(t *testing.T, ch chooser, steps int, seedName string, nke
 		if !refusal && counted {
 			advStats["adversary neutral"]++
 		}
+		weakA := strings.Contains(outA, "rests only on keys that the trust file no longer counts")
+		weakB := strings.Contains(outB, "rests only on keys that the trust file no longer counts")
+		if weakA != weakB {
+			advStats["worlds differ in whether the state is weak"]++
+		}
 		if codeA != codeB || firstLine(outA) != firstLine(outB) {
 			t.Fatalf("%s: the adversary changed the outcome: honest %d %q, adversary %d %q\n%s%s", desc, codeA, firstLine(outA), codeB, firstLine(outB), outB, errB)
 		}
@@ -628,7 +637,7 @@ func FuzzKeylessAdversary(f *testing.F) {
 func TestTwoEpochsKeepTheirOwnState(t *testing.T) {
 	k := newSigner(1)
 	all := leaves(700)
-	root := t.TempDir()
+	root := testdir.New(t)
 	tr := trustOf(t, keySpec{"k", k, ""})
 	e2origin := testPrefix + "/c/" + testChain + "/e2"
 	e2 := func(size int) string {
@@ -641,7 +650,7 @@ func TestTwoEpochsKeepTheirOwnState(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir2, "checkpoint"), []byte(e2(400)), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	s1, s2 := filepath.Join(t.TempDir(), "s1"), filepath.Join(t.TempDir(), "s2")
+	s1, s2 := filepath.Join(testdir.New(t), "s1"), filepath.Join(testdir.New(t), "s2")
 	if code, out, errs := run(t, stateArgs(tr, root, s1)...); code != 0 {
 		t.Fatalf("e1: %d\n%s%s", code, out, errs)
 	}

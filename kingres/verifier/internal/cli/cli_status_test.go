@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // TestExitStatusFollowsTheRule walks the error paths of checkpoint and
@@ -45,16 +47,19 @@ func TestExitStatusFollowsTheRule(t *testing.T) {
 			return []string{"checkpoint", "--trust", p.trust, "--source", p.dir}
 		}},
 		{"bad --log", 2, func(t *testing.T) []string { p := pub(t); return cp(p, "--log", "x") }},
-		{"trust missing", 2, func(t *testing.T) []string { p := pub(t); return cp(p, "--trust", filepath.Join(t.TempDir(), "no")) }},
+		{"trust missing", 2, func(t *testing.T) []string { p := pub(t); return cp(p, "--trust", filepath.Join(testdir.New(t), "no")) }},
 		{"trust garbage", 2, func(t *testing.T) []string {
 			p := pub(t)
-			return cp(p, "--trust", writeTemp(t, t.TempDir(), "t", "garbage"))
+			return cp(p, "--trust", writeTemp(t, testdir.New(t), "t", "garbage"))
 		}},
-		{"trust is a directory", 2, func(t *testing.T) []string { p := pub(t); return cp(p, "--trust", t.TempDir()) }},
-		{"source missing", 2, func(t *testing.T) []string { p := pub(t); return cp(p, "--source", filepath.Join(t.TempDir(), "no")) }},
+		{"trust is a directory", 2, func(t *testing.T) []string { p := pub(t); return cp(p, "--trust", testdir.New(t)) }},
+		{"source missing", 2, func(t *testing.T) []string {
+			p := pub(t)
+			return cp(p, "--source", filepath.Join(testdir.New(t), "no"))
+		}},
 		{"source is a file", 2, func(t *testing.T) []string { p := pub(t); return cp(p, "--source", p.trust) }},
-		{"--note missing", 2, func(t *testing.T) []string { p := pub(t); return cp(p, "--note", filepath.Join(t.TempDir(), "no")) }},
-		{"--old missing", 2, func(t *testing.T) []string { p := pub(t); return co(p, "--old", filepath.Join(t.TempDir(), "no")) }},
+		{"--note missing", 2, func(t *testing.T) []string { p := pub(t); return cp(p, "--note", filepath.Join(testdir.New(t), "no")) }},
+		{"--old missing", 2, func(t *testing.T) []string { p := pub(t); return co(p, "--old", filepath.Join(testdir.New(t), "no")) }},
 		{"--old not a note", 2, func(t *testing.T) []string { p := pub(t); return co(p, "--old", p.trust) }},
 		{"--old signed by an unknown key", 2, func(t *testing.T) []string {
 			p := pub(t)
@@ -70,11 +75,11 @@ func TestExitStatusFollowsTheRule(t *testing.T) {
 			return []string{"consistency", "--trust", trustWith(t, p, `,"max_tree_size":299`), "--log", p.log(), "--source", p.dir, "--old", oldNote(p)}
 		}},
 		{"--state garbage", 2, func(t *testing.T) []string {
-			return cp(pub(t), "--state", writeTemp(t, t.TempDir(), "s", "garbage"))
+			return cp(pub(t), "--state", writeTemp(t, testdir.New(t), "s", "garbage"))
 		}},
-		{"--state is a directory", 2, func(t *testing.T) []string { return cp(pub(t), "--state", t.TempDir()) }},
+		{"--state is a directory", 2, func(t *testing.T) []string { return cp(pub(t), "--state", testdir.New(t)) }},
 		{"--state in a missing directory", 2, func(t *testing.T) []string {
-			return cp(pub(t), "--state", filepath.Join(t.TempDir(), "no", "dir", "s"))
+			return cp(pub(t), "--state", filepath.Join(testdir.New(t), "no", "dir", "s"))
 		}},
 		{"--now bad", 2, func(t *testing.T) []string { return cp(pub(t), "--now", "yesterday") }},
 		{"--now empty", 2, func(t *testing.T) []string { return cp(pub(t), "--now", "") }},
@@ -119,7 +124,7 @@ func TestExitStatusFollowsTheRule(t *testing.T) {
 		}},
 		{"state advance without tiles", 3, func(t *testing.T) []string {
 			p := pub(t)
-			st := filepath.Join(t.TempDir(), "s")
+			st := filepath.Join(testdir.New(t), "s")
 			if code, out, _ := run(t, cp(p, "--note", oldNote(p), "--state", st)...); code != 0 {
 				t.Fatal(out)
 			}
@@ -148,10 +153,12 @@ func TestExitStatusFollowsTheRule(t *testing.T) {
 			p.write(t, "checkpoint", "garbage\n")
 			return cp(p)
 		}},
-		{"--note garbage", 1, func(t *testing.T) []string { return cp(pub(t), "--note", writeTemp(t, t.TempDir(), "n", "garbage\n")) }},
+		{"--note garbage", 1, func(t *testing.T) []string {
+			return cp(pub(t), "--note", writeTemp(t, testdir.New(t), "n", "garbage\n"))
+		}},
 		{"--new garbage", 1, func(t *testing.T) []string {
 			p := pub(t)
-			return co(p, "--old", oldNote(p), "--new", writeTemp(t, t.TempDir(), "n", "garbage\n"))
+			return co(p, "--old", oldNote(p), "--new", writeTemp(t, testdir.New(t), "n", "garbage\n"))
 		}},
 		{"tile of the wrong size", 1, func(t *testing.T) []string {
 			p := pub(t)

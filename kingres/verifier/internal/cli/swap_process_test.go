@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // Races against a second process that changes a file or a path under a run, as
@@ -64,7 +66,7 @@ func TestSwapperProcess(t *testing.T) {
 
 func startSwapper(t *testing.T, kind, name, a, b string) (stop func()) {
 	t.Helper()
-	stopFile := filepath.Join(t.TempDir(), "stop")
+	stopFile := filepath.Join(testdir.New(t), "stop")
 	spec, _ := json.Marshal(map[string]string{"kind": kind, "name": name, "a": a, "b": b, "stop": stopFile})
 	cmd := exec.Command(os.Args[0], "-test.run=^TestSwapperProcess$", "-test.count=1")
 	cmd.Env = append(os.Environ(), swapperEnv+"="+string(spec))
@@ -99,7 +101,7 @@ func TestProofFileSwappedBetweenTheTwoReadingsIsNeverVerified(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dir := t.TempDir()
+	dir := testdir.New(t)
 	mk := func(name, v string) string {
 		body := `{"zz": "` + v + `", ` + strings.TrimPrefix(string(orig), "{")
 		p := filepath.Join(dir, name)
@@ -138,8 +140,12 @@ func TestProofFileSwappedBetweenTheTwoReadingsIsNeverVerified(t *testing.T) {
 			if strings.Contains(out, "VERIFIED") {
 				t.Fatalf("VERIFIED printed for a file that changed between the readings:\n%s", out)
 			}
-		case (code == 2 || code == 1 && strings.Contains(out, "another process")) && runtime.GOOS == "windows":
-			other++ // the swapper held the file at the moment of the open
+		case (code == 2 || code == 1 && (strings.Contains(out, "another process") || strings.Contains(out, "Access is denied"))) && runtime.GOOS == "windows":
+			// The swapper held the file at the moment of the open: Windows answers an
+			// open that meets a rename over the file with a sharing violation or with
+			// "Access is denied" (seen in a run of the whole module).
+			// It is a refusal, never VERIFIED, which is what this test is about.
+			other++
 		default:
 			t.Fatalf("status %d for a file that is one of two verifying files:\n%s%s", code, out, errs)
 		}
@@ -175,8 +181,8 @@ func TestStateDirectorySwappedBetweenPrivateDirectoriesStaysCoherent(t *testing.
 	s := newSigner(1)
 	tr := trustOf(t, keySpec{"k", s, ""})
 	all := leaves(700)
-	root := t.TempDir()
-	base, _ := filepath.EvalSymlinks(t.TempDir())
+	root := testdir.New(t)
+	base, _ := filepath.EvalSymlinks(testdir.New(t))
 	big, small := filepath.Join(base, "big"), filepath.Join(base, "small")
 	for _, d := range []string{big, small} {
 		if err := os.Mkdir(d, 0o700); err != nil {
@@ -245,8 +251,8 @@ func TestStateDirectorySwappedTowardsAnOpenDirectoryIsRefusedOrWhole(t *testing.
 	s := newSigner(1)
 	tr := trustOf(t, keySpec{"k", s, ""})
 	all := leaves(700)
-	root := t.TempDir()
-	base, _ := filepath.EvalSymlinks(t.TempDir())
+	root := testdir.New(t)
+	base, _ := filepath.EvalSymlinks(testdir.New(t))
 	priv, open := filepath.Join(base, "priv"), filepath.Join(base, "open")
 	if err := os.Mkdir(priv, 0o700); err != nil {
 		t.Fatal(err)

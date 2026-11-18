@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // L12-02 with the real command and real processes, on every system. The test
@@ -46,7 +48,7 @@ func TestStateAcrossRealProcessesNeverMovesBackwards(t *testing.T) {
 	s := newSigner(1)
 	tr := trustOf(t, keySpec{"k", s, ""})
 	all := leaves(320)
-	root := t.TempDir()
+	root := testdir.New(t)
 	var notes []string
 	for size := 301; size <= 320; size++ {
 		notes = append(notes, publishLog(t, root, s, all, size))
@@ -55,7 +57,7 @@ func TestStateAcrossRealProcessesNeverMovesBackwards(t *testing.T) {
 	for i, n := range notes {
 		files[i] = writeNote(t, n)
 	}
-	dir := t.TempDir()
+	dir := testdir.New(t)
 	state := filepath.Join(dir, "state")
 	publishLog(t, root, s, all, 300)
 	if code, out, errs := run(t, stateArgs(tr, root, state)...); code != 0 {

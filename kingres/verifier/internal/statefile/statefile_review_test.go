@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/safefile"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // recordOps wraps the real file operations and records the order in which
@@ -67,7 +69,7 @@ func TestStateFileReplaceFlushesInTheOrderThatSurvivesAPowerLoss(t *testing.T) {
 	old := ops
 	ops = recordOps{&log}
 	defer func() { ops = old }()
-	p := filepath.Join(t.TempDir(), "state")
+	p := filepath.Join(testdir.New(t), "state")
 	if err := Replace(p, []byte("data\n")); err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +85,7 @@ func TestStateFileNewStateIsPrivateAndAnOldModeIsKept(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("file modes are not permissions on Windows")
 	}
-	dir := t.TempDir()
+	dir := testdir.New(t)
 	fresh := filepath.Join(dir, "fresh")
 	if err := Replace(fresh, []byte("x")); err != nil {
 		t.Fatal(err)
@@ -108,7 +110,7 @@ func TestStateFileNewStateIsPrivateAndAnOldModeIsKept(t *testing.T) {
 
 // L9-07: the evidence of a fork is never claimed saved when it is not.
 func TestStateFileConflictEvidenceIsSavedOnlyWhenItIsThere(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "state")
+	p := filepath.Join(testdir.New(t), "state")
 	root := make([]byte, 32)
 	for i := range root {
 		root[i] = byte(i + 1)
@@ -146,14 +148,14 @@ func TestStateFileConflictEvidenceIsSavedOnlyWhenItIsThere(t *testing.T) {
 		t.Error("the planted file was overwritten")
 	}
 	// A long name for the state still gets a name that fits.
-	long := filepath.Join(t.TempDir(), strings.Repeat("n", 240))
+	long := filepath.Join(testdir.New(t), strings.Repeat("n", 240))
 	if e, err := SaveConflict(long, 7, root, []byte("x")); err != nil || len(filepath.Base(e.Path)) > 255 {
 		t.Fatalf("long state name: %+v %v", e, err)
 	}
 }
 
 func TestStateFileConflictGivesUpAfterTheNamesAreTaken(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "state")
+	p := filepath.Join(testdir.New(t), "state")
 	root := make([]byte, 32)
 	for i := 0; i < maxConflictNames; i++ {
 		if _, err := SaveConflict(p, 1, root, []byte(fmt.Sprint("note ", i))); err != nil {
@@ -170,10 +172,10 @@ func TestStateFileConflictGivesUpAfterTheNamesAreTaken(t *testing.T) {
 }
 
 func TestStateFileConflictThroughALinkIsNotFollowed(t *testing.T) {
-	dir := t.TempDir()
+	dir := testdir.New(t)
 	p := filepath.Join(dir, "state")
 	root := make([]byte, 32)
-	target := filepath.Join(t.TempDir(), "elsewhere")
+	target := filepath.Join(testdir.New(t), "elsewhere")
 	if err := os.Symlink(target, ConflictPath(p, 3, root)); err != nil {
 		t.Skipf("no link here: %v", err)
 	}
@@ -191,9 +193,9 @@ func TestStateFileConflictThroughALinkIsNotFollowed(t *testing.T) {
 
 // L9-08: the lock is not opened through a link.
 func TestStateFileLockIsNotOpenedThroughALink(t *testing.T) {
-	dir := t.TempDir()
+	dir := testdir.New(t)
 	p := filepath.Join(dir, "state")
-	target := filepath.Join(t.TempDir(), "created-by-the-lock")
+	target := filepath.Join(testdir.New(t), "created-by-the-lock")
 	if err := os.Symlink(target, lockName(p)); err != nil {
 		t.Skipf("no link here: %v", err)
 	}
@@ -211,7 +213,7 @@ func TestStateFileLockIsNotOpenedThroughALink(t *testing.T) {
 }
 
 func TestStateFileLockIsNotOpenedOnADirectory(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "state")
+	p := filepath.Join(testdir.New(t), "state")
 	if err := os.Mkdir(lockName(p), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +225,7 @@ func TestStateFileLockIsNotOpenedOnADirectory(t *testing.T) {
 
 // L9-12: two names of one file in one directory take one lock.
 func TestStateFileTwoNamesInOneDirectoryTakeOneLock(t *testing.T) {
-	dir := t.TempDir()
+	dir := testdir.New(t)
 	a, b := filepath.Join(dir, "state"), filepath.Join(dir, "other-name")
 	l, err := Acquire(a, time.Second)
 	if err != nil {
@@ -237,12 +239,12 @@ func TestStateFileTwoNamesInOneDirectoryTakeOneLock(t *testing.T) {
 
 func TestStateFileCheckPrivate(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		if err := CheckPrivate(filepath.Join(t.TempDir(), "state")); err != nil {
+		if err := CheckPrivate(filepath.Join(testdir.New(t), "state")); err != nil {
 			t.Fatal(err)
 		}
 		t.Skip("permissions of a Windows folder are not read")
 	}
-	dir := t.TempDir()
+	dir := testdir.New(t)
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}

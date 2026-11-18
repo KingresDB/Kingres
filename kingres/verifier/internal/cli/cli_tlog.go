@@ -119,7 +119,7 @@ func (e *env) finishPub(r *result, asJSON bool, err error) int {
 		}
 		return e.finishFailed(r, asJSON, "publication", pe.err)
 	}
-	return e.inputError(r.cmd, asJSON, err)
+	return e.inputErrorInfo(r.cmd, asJSON, err, r.inputInfo())
 }
 
 // nowArg is the value of --now and whether the flag was given at all: an empty
@@ -539,6 +539,9 @@ func (e *env) runConsistency(args []string) int {
 		}
 		oldCP = held.cp
 		oldHeld = held
+		r.keepInfo = true
+		r.info = map[string]any{}
+		oldWeakInfo(r.info, oldHeld)
 	}
 	var newData []byte
 	if *newFlag != "" {
@@ -554,7 +557,7 @@ func (e *env) runConsistency(args []string) int {
 	if err != nil {
 		var ie *inputErr
 		if errors.As(err, &ie) {
-			return e.inputError(cmd, *asJSON, ie.error)
+			return e.inputErrorInfo(cmd, *asJSON, ie.error, r.inputInfo())
 		}
 		return e.finishFailed(r, *asJSON, "new-checkpoint", err)
 	}
@@ -574,9 +577,8 @@ func (e *env) runConsistency(args []string) int {
 		return err
 	}
 	if oldCP.Size > newCP.Size {
-		if oldHeld != nil && oldHeld.weak {
-			r.info = map[string]any{"old_size": oldCP.Size, "new_size": newCP.Size}
-			oldWeakInfo(r.info, oldHeld)
+		if r.info != nil { // the member of the held checkpoint is there since it was judged
+			r.info["old_size"], r.info["new_size"] = oldCP.Size, newCP.Size
 		}
 		return e.finishFailed(r, *asJSON, "sizes", weakWrap(fmt.Errorf("the new checkpoint has size %d, smaller than the old size %d: the log went back", newCP.Size, oldCP.Size)))
 	}
@@ -611,11 +613,11 @@ func (e *env) runConsistency(args []string) int {
 	}
 	d, err := in.openSource()
 	if err != nil {
-		return e.inputError(cmd, *asJSON, err)
+		return e.inputErrorInfo(cmd, *asJSON, err, r.inputInfo())
 	}
 	reader, err := tlog.NewReader(tlog.FSSource{Files: logFiles{d, in.spec.rel()}}, newCP.Size)
 	if err != nil {
-		return e.inputError(cmd, *asJSON, err)
+		return e.inputErrorInfo(cmd, *asJSON, err, r.inputInfo())
 	}
 	path, err := reader.ConsistencyProof(oldCP.Size)
 	if err != nil {
@@ -625,7 +627,7 @@ func (e *env) runConsistency(args []string) int {
 		case errors.Is(err, tlog.ErrBadTile):
 			return e.finishFailed(r, *asJSON, "tiles", err)
 		}
-		return e.inputError(cmd, *asJSON, err)
+		return e.inputErrorInfo(cmd, *asJSON, err, r.inputInfo())
 	}
 	r.ok("tiles", fmt.Sprintf("read %d tile(s) on the proof path of the tree of size %d: %d proof hash(es); no other tile was read", reader.TilesRead(), newCP.Size, len(path)))
 	if err := merkle.VerifyConsistency(oldCP.Size, newCP.Size, oldCP.Root, newCP.Root, path); err != nil {

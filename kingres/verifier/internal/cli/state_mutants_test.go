@@ -11,6 +11,8 @@ import (
 	"testing"
 
 	"github.com/KingresDB/Kingres/kingres/verifier/internal/merkle"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // These tests came from a mutation run of cli_state.go: what a run of
@@ -48,8 +50,8 @@ func TestStateRunsSayWhatTheyDid(t *testing.T) {
 	k := newSigner(1)
 	all := leaves(700)
 	tr := trustOf(t, keySpec{"k", k, ""})
-	root := t.TempDir()
-	state := filepath.Join(t.TempDir(), "state")
+	root := testdir.New(t)
+	state := filepath.Join(testdir.New(t), "state")
 
 	// first use
 	publishNote(t, root, all, 300, signedBy(300, all, []signer{k}))
@@ -92,8 +94,8 @@ func TestStateRunsSayWhatTheyDid(t *testing.T) {
 	}
 
 	// from the empty tree: a prefix of every tree, nothing to prove
-	st0 := filepath.Join(t.TempDir(), "state0")
-	z := t.TempDir()
+	st0 := filepath.Join(testdir.New(t), "state0")
+	z := testdir.New(t)
 	publishNote(t, z, all, 300, emptyTreeNote(k))
 	if code, out, errs := run(t, stateArgs(tr, z, st0)...); code != 0 || stateSize(t, st0) != 0 {
 		t.Fatalf("a state of size 0: %d\n%s%s", code, out, errs)
@@ -107,7 +109,7 @@ func TestStateRunsSayWhatTheyDid(t *testing.T) {
 	if !strings.Contains(stepsOf(o)["state"], "the empty tree, a prefix of every tree") {
 		t.Errorf("no step says that the empty tree was the start: %v", stepsOf(o))
 	}
-	st1 := filepath.Join(t.TempDir(), "state1")
+	st1 := filepath.Join(testdir.New(t), "state1")
 	if code, out, errs := run(t, stateArgs(tr, z, st1, "--note", writeNote(t, emptyTreeNote(k)))...); code != 0 {
 		t.Fatalf("%d %s %s", code, out, errs)
 	}
@@ -128,14 +130,14 @@ func TestStateRunsThatDoNotMoveSayWhere(t *testing.T) {
 	k := newSigner(1)
 	all := leaves(700)
 	tr := trustOf(t, keySpec{"k", k, ""})
-	root := t.TempDir()
-	state := filepath.Join(t.TempDir(), "state")
+	root := testdir.New(t)
+	state := filepath.Join(testdir.New(t), "state")
 	publishNote(t, root, all, 300, signedBy(300, all, []signer{k}))
 	if code, out, _ := run(t, stateArgs(tr, root, state)...); code != 0 {
 		t.Fatal(out)
 	}
 	// no tile: status 3, the state stays at 300
-	bare := t.TempDir()
+	bare := testdir.New(t)
 	logDir := filepath.Join(bare, "c", testChain, "e1")
 	_ = os.MkdirAll(logDir, 0o755)
 	_ = os.WriteFile(filepath.Join(logDir, "checkpoint"), []byte(signedBy(700, all, []signer{k})), 0o644)
@@ -144,7 +146,7 @@ func TestStateRunsThatDoNotMoveSayWhere(t *testing.T) {
 		t.Errorf("no tiles: %d\n%v", code, o["notes"])
 	}
 	// damaged tiles: status 1, the state stays at 300
-	damaged := t.TempDir()
+	damaged := testdir.New(t)
 	publishNote(t, damaged, all, 700, signedBy(700, all, []signer{k}))
 	_ = filepath.Walk(filepath.Join(damaged, "c"), func(p string, fi os.FileInfo, err error) error {
 		if err == nil && !fi.IsDir() && strings.Contains(filepath.ToSlash(p), "/tile/") {
@@ -180,7 +182,7 @@ func TestStateRunsThatDoNotMoveSayWhere(t *testing.T) {
 	}
 	// a fork of the same size: the evidence is saved, and the rollback sentence is not there
 	forked := leavesSalt(700, 400, "other")
-	froot := t.TempDir()
+	froot := testdir.New(t)
 	publishNote(t, froot, forked, 700, signedBy(700, forked, []signer{k}))
 	code, o = jsonOf(t, stateArgs(tr, froot, state)...)
 	s := stateMember(t, o)
@@ -194,8 +196,8 @@ func TestStateRunsThatDoNotMoveSayWhere(t *testing.T) {
 func TestHeldNoteMessagesNameTheCause(t *testing.T) {
 	k1, k2, k3 := newSigner(1), newSigner(2), newSigner(3)
 	all := leaves(700)
-	root := t.TempDir()
-	state := filepath.Join(t.TempDir(), "state")
+	root := testdir.New(t)
+	state := filepath.Join(testdir.New(t), "state")
 	good := trustOf(t, keySpec{"k1", k1, ""})
 	publishNote(t, root, all, 300, signedBy(300, all, []signer{k1}))
 	if code, out, _ := run(t, stateArgs(good, root, state)...); code != 0 {
@@ -208,12 +210,12 @@ func TestHeldNoteMessagesNameTheCause(t *testing.T) {
 	// (L12-01), and the output names the cause, the fingerprint, and what it does
 	// not show
 	revoked := trustOf(t, keySpec{"k1", k1, `,"revoked":true`}, keySpec{"k2", k2, ""})
-	state2 := filepath.Join(t.TempDir(), "state")
+	state2 := filepath.Join(testdir.New(t), "state")
 	if err := os.WriteFile(state2, []byte(fileText(t, state)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	code, out, errs := run(t, stateArgs(revoked, root, state2)...)
-	for _, want := range []string{"is revoked in the trust file, so its signatures are not evidence", "(" + fp16(k1) + ")", "rests only on keys that the trust file no longer counts", "that the checkpoint the state file held was genuine"} {
+	for _, want := range []string{"is revoked in the trust file, so its signatures are not evidence", "(" + fp16(k1) + ")", "rests only on keys that the trust file no longer counts", "does not rest only on such keys any more"} {
 		if code != 0 || !strings.Contains(out, want) {
 			t.Errorf("a revoked signer, want %q: %d\n%s%s", want, code, out, errs)
 		}
@@ -242,7 +244,7 @@ func TestHeldNoteMessagesNameTheCause(t *testing.T) {
 	}
 	// what was dropped is counted: two lines that were not counted, one that verified
 	publishNote(t, root, all, 700, signedBy(700, all, []signer{k2}, third, junkLine(logOrigin(), newSigner(78))))
-	code, o = jsonOf(t, stateArgs(three, root, filepath.Join(t.TempDir(), "s"))...)
+	code, o = jsonOf(t, stateArgs(three, root, filepath.Join(testdir.New(t), "s"))...)
 	if code != 0 || !strings.Contains(listOf(o, "notes"), "the note as served has 2 signature line(s) that were not counted (they verify under no key of the trust file): the state and any saved evidence keep only the 1 that verify (counted or not)") {
 		t.Errorf("the count of lines that were not stored: %d\n%s", code, listOf(o, "notes"))
 	}

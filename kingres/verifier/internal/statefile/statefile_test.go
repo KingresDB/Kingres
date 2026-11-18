@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 func readState(t *testing.T, p string) string {
@@ -28,7 +30,7 @@ func TestStateFileCrashAtEveryStep(t *testing.T) {
 	oldData, newData := strings.Repeat("old\n", 500), strings.Repeat("new\n", 700)
 	for _, stop := range []string{"written", "synced", "renamed", "dirsynced"} {
 		t.Run(stop, func(t *testing.T) {
-			dir := t.TempDir()
+			dir := testdir.New(t)
 			p := filepath.Join(dir, "state")
 			if err := os.WriteFile(p, []byte(oldData), 0o644); err != nil {
 				t.Fatal(err)
@@ -67,7 +69,7 @@ func TestStateFileCrashAtEveryStep(t *testing.T) {
 }
 
 func TestStateFileReplaceFirstUseAndLongName(t *testing.T) {
-	dir := t.TempDir()
+	dir := testdir.New(t)
 	p := filepath.Join(dir, strings.Repeat("n", 240))
 	if err := Replace(p, []byte("x\n")); err != nil {
 		t.Fatalf("a 240 byte name: %v", err)
@@ -80,7 +82,7 @@ func TestStateFileReplaceFirstUseAndLongName(t *testing.T) {
 }
 
 func TestStateFileLockIsExclusiveAndBounded(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "state")
+	p := filepath.Join(testdir.New(t), "state")
 	l, err := Acquire(p, time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -101,7 +103,7 @@ func TestStateFileLockIsExclusiveAndBounded(t *testing.T) {
 }
 
 func TestStateFileResolveFollowsLinkAndKeepsIt(t *testing.T) {
-	dir := t.TempDir()
+	dir := testdir.New(t)
 	target := filepath.Join(dir, "real")
 	if err := os.WriteFile(target, []byte("old"), 0o644); err != nil {
 		t.Fatal(err)

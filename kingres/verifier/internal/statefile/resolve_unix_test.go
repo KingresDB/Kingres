@@ -8,12 +8,14 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/KingresDB/Kingres/kingres/verifier/internal/testdir"
 )
 
 // L12-06: ".." after a link is the parent of the link's target, in the check and
 // in the name the state is stored at, for a relative name and an absolute one.
 func TestDotDotAfterALinkMeansTheParentOfTheTarget(t *testing.T) {
-	base, err := filepath.EvalSymlinks(t.TempDir())
+	base, err := filepath.EvalSymlinks(testdir.New(t))
 	if err != nil {
 		t.Fatal(err)
 	}
