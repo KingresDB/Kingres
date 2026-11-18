@@ -1489,7 +1489,7 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM p_int4 WHERE id IN (1, 2);
  Aggregate
    ->  Custom Scan (Kingres Distributed Scan)
          Filter: (id = ANY ('{1,2}'::integer[]))
-         Remote groups: 1
+         Remote groups: 0 of 1 (pruned by id)
          Remote SQL: SELECT id FROM public.p_int4 AS ks_t WHERE ((id = ANY ('{1,2}'::integer[])))
          ->  Append
                ->  Bitmap Heap Scan on p_int4_b0000 p_int4_1
@@ -1508,14 +1508,14 @@ EXPLAIN (COSTS OFF) SELECT a.v FROM p_int4 a JOIN p_int8 b ON a.id = b.id WHERE 
  Nested Loop
    ->  Custom Scan (Kingres Distributed Scan)
          Filter: (id = 1)
-         Remote groups: 1
+         Remote groups: 0 of 1 (pruned by id)
          Remote SQL: SELECT v, id FROM public.p_int4 AS ks_t WHERE ((id = 1))
          ->  Index Scan using p_int4_b0000_pkey on p_int4_b0000 a_1
                Index Cond: (id = 1)
    ->  Materialize
          ->  Custom Scan (Kingres Distributed Scan)
                Filter: (id = 1)
-               Remote groups: 1
+               Remote groups: 0 of 1 (pruned by id)
                Remote SQL: SELECT id FROM public.p_int8 AS ks_t WHERE ((id = 1))
                ->  Index Only Scan using p_int8_b0000_pkey on p_int8_b0000 b_1
                      Index Cond: (id = 1)
@@ -1539,7 +1539,7 @@ EXPLAIN (COSTS OFF) SELECT a.v FROM p_int4 a JOIN p_int4 b ON a.v = b.v WHERE a.
    Join Filter: (a.v = b.v)
    ->  Custom Scan (Kingres Distributed Scan)
          Filter: (id = 1)
-         Remote groups: 1
+         Remote groups: 0 of 1 (pruned by id)
          Remote SQL: SELECT v, id FROM public.p_int4 AS ks_t WHERE ((id = 1))
          ->  Index Scan using p_int4_b0000_pkey on p_int4_b0000 a_1
                Index Cond: (id = 1)

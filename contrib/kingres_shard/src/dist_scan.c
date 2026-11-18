@@ -80,6 +80,8 @@
 #include "kingres_shard.h"
 #include "planner.h"
 #include "node_conn.h"
+#include "placement_check.h"
+#include "prune.h"
 #include "shippable.h"
 
 /* Layout of CustomScan.custom_private. */
@@ -89,6 +91,7 @@
 #define DS_PRIV_PARAMS		3	/* List of Integer: external parameter ids of the fragment, in order */
 #define DS_PRIV_PLACEMENT	4	/* String: placement of the colocation group the statement was planned with */
 #define DS_PRIV_PARTITIONS	5	/* String: identity of the partitions of the table on this node, in the plan; "" when it is not partitioned */
+#define DS_PRIV_PRUNE		6	/* List: the pruning terms of the restrictions (prune.c); NIL: every group is asked */
 
 /* Rows requested from a remote group at a time. */
 int			kingres_shard_scan_fetch_size = 1000;
@@ -125,6 +128,7 @@ typedef struct KsDistScanState
 	int64		plan_placement;	/* placement of the colocation group in the plan (the local partitions are those of it) */
 	bool		plan_has_parts;	/* the table is partitioned on this node */
 	int64		plan_partitions;	/* identity of its partitions in the plan (catalog.c) */
+	List	   *prune_terms;	/* pruning terms of the plan (prune.c) */
 	int			ncols;			/* scan columns in all */
 	List	   *param_ids;
 	PlanState  *child;
@@ -202,14 +206,22 @@ kingres_shard_distscan_set_active(bool active)
 }
 
 /*
- * The shard groups other than this one that own buckets of a table: their
- * primaries, copied into the current memory context.
+ * The shard groups other than this one that own buckets of a table and can hold
+ * rows the statement wants: their primaries, copied into the current memory
+ * context.  The groups that the restrictions rule out are left out (pruning,
+ * design 4.5): terms are the pruning terms of the plan and params the values of
+ * its parameters (NULL: a parameter without a value prunes nothing).  *nall, when
+ * given, is the number of remote groups before pruning, and *pruned whether a term
+ * applied.
  */
 static List *
-remote_groups_of(const KsDistTable *dt, const KsCatalog *cat)
+remote_groups_of(const KsDistTable *dt, const KsCatalog *cat, List *terms,
+				 ParamListInfo params, int *nall, bool *pruned_out)
 {
 	List	   *groups = NIL;
 	List	   *result = NIL;
+	List	   *allowed = NIL;
+	bool		pruned = false;
 	int			b;
 	ListCell   *lc;
 
@@ -221,11 +233,21 @@ remote_groups_of(const KsDistTable *dt, const KsCatalog *cat)
 		if (g >= 0 && g != cat->local_group_id && !list_member_int(groups, g))
 			groups = lappend_int(groups, g);
 	}
+	if (nall != NULL)
+		*nall = list_length(groups);
+	if (terms != NIL)
+		allowed = kingres_shard_prune_groups(dt, terms, params, &pruned);
+	if (pruned_out != NULL)
+		*pruned_out = pruned;
 	foreach(lc, groups)
 	{
 		int			g = lfirst_int(lc);
-		const KsNode *n = kingres_shard_group_primary(g);
+		const KsNode *n;
 		DsFrag	   *f;
+
+		if (pruned && !list_member_int(allowed, g))
+			continue;
+		n = kingres_shard_group_primary(g);
 
 		if (n == NULL)
 			ereport(ERROR,
@@ -281,6 +303,7 @@ ds_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	int			b;
 	double		remote_rows;
 	double		nremote;
+	List	   *prune_terms;
 
 	if (prev_set_rel_pathlist_hook)
 		prev_set_rel_pathlist_hook(root, rel, rti, rte);
@@ -299,9 +322,19 @@ ds_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	/* A constant false restriction: no row anywhere. */
 	if (has_constant_false(rel->baserestrictinfo))
 		return;
-	remote = remote_groups_of(dt, cat);
+	remote = remote_groups_of(dt, cat, NIL, NULL, NULL, NULL);
 	if (remote == NIL)
 		return;					/* every bucket is here: the local paths are right */
+
+	/*
+	 * The groups the restrictions leave (design 4.5).  The plan keeps the terms
+	 * and the groups are chosen again when the scan starts, with the values of
+	 * the parameters; the count here only prices the scan, and a plan that prunes
+	 * every remote group keeps its scan node, whose plan number check protects it.
+	 */
+	prune_terms = kingres_shard_prune_terms(dt, rel->relid, rel->baserestrictinfo);
+	if (prune_terms != NIL)
+		remote = remote_groups_of(dt, cat, prune_terms, root->glob->boundParams, NULL, NULL);
 
 	/*
 	 * From here on the relation is read through connections of this backend
@@ -389,7 +422,8 @@ ds_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 			table_close(prel, NoLock);
 		}
 
-		cpath->custom_private = list_make2(makeInteger((int) rte->relid), makeString(identity));
+		cpath->custom_private = list_make3(makeInteger((int) rte->relid), makeString(identity),
+										   prune_terms);
 	}
 	cpath->methods = &ds_path_methods;
 
@@ -667,6 +701,7 @@ ds_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 									   makeString(psprintf(INT64_FORMAT,
 													   plan_placement(relid))));
 	cscan->custom_private = lappend(cscan->custom_private, lsecond(best_path->custom_private));
+	cscan->custom_private = lappend(cscan->custom_private, lthird(best_path->custom_private));
 	cscan->methods = &ds_scan_methods;
 	return &cscan->scan.plan;
 }
@@ -691,6 +726,7 @@ ds_create_scan_state(CustomScan *cscan)
 		s->plan_has_parts = (ident[0] != '\0');
 		s->plan_partitions = s->plan_has_parts ? pg_strtoint64(ident) : 0;
 	}
+	s->prune_terms = (List *) list_nth(p, DS_PRIV_PRUNE);
 	foreach(lc, (List *) list_nth(p, DS_PRIV_PARAMS))
 		s->param_ids = lappend_int(s->param_ids, intVal(lfirst(lc)));
 	return (Node *) s;
@@ -915,10 +951,7 @@ frag_collect(DsFrag *f, bool quiet)
 			f->failed = true;
 			return;
 		}
-		ereport(ERROR,
-				(errcode(ERRCODE_CONNECTION_FAILURE),
-				 errmsg("lost the connection to node %s:%d during a distributed scan",
-						f->host, f->port)));
+		kingres_shard_fragment_error(f->kc, NULL, "FETCH");
 	}
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
@@ -928,7 +961,7 @@ frag_collect(DsFrag *f, bool quiet)
 			f->failed = true;
 			return;
 		}
-		kingres_shard_report_error(f->kc, res, "FETCH");
+		kingres_shard_fragment_error(f->kc, res, "FETCH");
 	}
 	f->res = res;
 	f->nrows = PQntuples(res);
@@ -949,12 +982,7 @@ frag_check_failed(DsFrag *f)
 	res = f->res;
 	f->res = NULL;
 	f->nrows = f->next_row = 0;
-	if (res == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_CONNECTION_FAILURE),
-				 errmsg("lost the connection to node %s:%d during a distributed scan",
-						f->host, f->port)));
-	kingres_shard_report_error(f->kc, res, "FETCH");
+	kingres_shard_fragment_error(f->kc, res, "FETCH");
 }
 
 /* Called when something else wants the connection while a FETCH is in flight. */
@@ -990,22 +1018,23 @@ frag_send_fetch(DsFrag *f)
 }
 
 /*
- * The partitions this node has now must be the ones the plan of the local part
- * of the scan was made with (see ds_start).
+ * The statement fails the way a failed group does (placement_check.c, 4.6) when
+ * a command cannot be sent: the connection is gone.
  */
 static void
-check_local_partitions(KsDistScanState *s)
+frag_send_failed(DsFrag *f, const char *what)
 {
-	if (s->plan_has_parts &&
-		kingres_shard_partition_identity_now(s->relid) != s->plan_partitions)
-		ereport(ERROR,
-				(errcode(ERRCODE_KINGRES_STALE_MAP),
-				 errmsg("the partitions of table \"%s\" on this node changed after the statement was planned",
-						get_rel_name(s->relid)),
-				 errhint("A bucket moved between shard groups; repeat the statement.")));
+	f->kc->have_error = true;
+	f->kc->in_query = false;
+	kingres_shard_fragment_error(f->kc, NULL, what);
 }
 
-/* Open the cursors on every group, then ask each for its first batch. */
+/*
+ * Open the cursors on every group, then ask each for its first batch.  The
+ * procedure is the placement check of design 4.3 (placement_check.c): the plan
+ * number, the probe before, the DECLAREs, the probe after, and no FETCH before
+ * every node has passed.
+ */
 static void
 ds_start(KsDistScanState *s)
 {
@@ -1017,115 +1046,87 @@ ds_start(KsDistScanState *s)
 	Oid		   *types;
 	int			nparams;
 	ListCell   *lc;
-	int64		origin_placement;
 	int			colocation_id;
-	char	   *recheck;		/* the question asked again after the DECLAREs */
+	char	   *ask;			/* the probe before */
+	char	   *recheck;		/* the probe after the DECLAREs */
 
 	if (dt == NULL || dt->is_reference)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("table %u is no longer a distributed table", s->relid)));
 	colocation_id = dt->colocation_id;
-	origin_placement = kingres_shard_placement_hash(dt->coloc);
 
 	/*
-	 * The partitions the local part of this scan reads are those of the placement
-	 * the statement was planned with (their locks are held since the executor
-	 * started); the groups asked below are those of the placement as it is now.
-	 * They must be one placement.
+	 * Step 1.  The partitions the local part of this scan reads are those of the
+	 * placement the statement was planned with (their locks are held since the
+	 * executor started); the groups asked below are those of the placement as it is
+	 * now.  They must be one placement.
 	 */
-	if (origin_placement != s->plan_placement)
-		ereport(ERROR,
-				(errcode(ERRCODE_KINGRES_STALE_MAP),
-				 errmsg("the bucket map changed after the statement was planned"),
-				 errhint("A bucket moved between shard groups; repeat the statement.")));
+	kingres_shard_placement_check_plan(colocation_id, s->plan_placement);
 
 	/*
 	 * The partition list the plan was made with must be the one this node has
 	 * now: a switch can commit here between the parse analysis of the statement
 	 * (which locked the parent, and does not stop an ATTACH) and now, and the list
-	 * in the relcache of this backend can be behind it.  A node that changed after
-	 * the plan has other partitions than the local child of this scan reads.  The
-	 * identity names the partitions themselves, so a bucket that left and came
-	 * back (another table with the same name) is a change too.
+	 * in the relcache of this backend can be behind it.
 	 */
-	check_local_partitions(s);
+	kingres_shard_check_origin_partitions(s->relid, s->plan_has_parts, s->plan_partitions);
 
 	kingres_shard_fault_point("scan_started");
 
 	old = MemoryContextSwitchTo(estate->es_query_cxt);
-	s->frags = remote_groups_of(dt, cat);
+	s->frags = remote_groups_of(dt, cat, s->prune_terms, estate->es_param_list_info, NULL, NULL);
 	MemoryContextSwitchTo(old);
 	s->cur = 0;
 	values = fragment_params(s, &types, &nparams);
 
 	/*
-	 * First every group is asked for its placement (the question also makes the
-	 * node's partition list of the table current, see
-	 * kingres.internal_placement_hash), then the cursors are opened, then every
-	 * group is asked again (below).  A node whose answers differ, or differ from
-	 * this node's, had a switch commit in between.
+	 * A transaction uses one node of a group (4.4): checked for every node of the
+	 * statement before anything is sent to any.
 	 */
+	foreach(lc, s->frags)
 	{
-		char	   *qualified = quote_qualified_identifier(get_namespace_name(get_rel_namespace(s->relid)),
-														   get_rel_name(s->relid));
-		char	   *ask = psprintf("SELECT " KINGRES_SHARD_SCHEMA ".internal_placement_hash(%d, %s::pg_catalog.regclass), "
-								   KINGRES_SHARD_SCHEMA ".internal_partition_identity(%s::pg_catalog.regclass)",
-								   colocation_id, quote_literal_cstr(qualified), quote_literal_cstr(qualified));
+		DsFrag	   *f = (DsFrag *) lfirst(lc);
 
-		recheck = psprintf("SELECT " KINGRES_SHARD_SCHEMA ".internal_placement_hash(%d), "
-						   KINGRES_SHARD_SCHEMA ".internal_partition_identity(%s::pg_catalog.regclass)",
-						   colocation_id, quote_literal_cstr(qualified));
+		kingres_shard_group_rule(f->host, f->port);
+	}
 
-		foreach(lc, s->frags)
-		{
-			DsFrag	   *f = (DsFrag *) lfirst(lc);
+	/*
+	 * Step 2.  First every group is asked for its placement, the identity of its
+	 * partitions of the table and its version of the extension (the question also
+	 * makes the node's partition list of the table current, see
+	 * kingres.internal_placement_hash), then the cursors are opened, then every
+	 * group is asked again (step 4).  A node whose answers differ, or differ from
+	 * the plan's, had a switch commit in between.
+	 */
+	ask = kingres_shard_probe_before_sql(colocation_id, 1, &s->relid);
+	recheck = kingres_shard_probe_after_sql(colocation_id, 1, &s->relid);
+	foreach(lc, s->frags)
+	{
+		DsFrag	   *f = (DsFrag *) lfirst(lc);
 
-			f->scan = s;
-			f->kc = kingres_shard_get_conn(f->host, f->port, false, NULL);
-			kingres_shard_begin_xact(f->kc);
-			f->kc->in_query = true;
-			if (!PQsendQuery(f->kc->conn, ask))
-			{
-				f->kc->have_error = true;
-				f->kc->in_query = false;
-				ereport(ERROR,
-						(errcode(ERRCODE_CONNECTION_FAILURE),
-						 errmsg("could not send a command to node %s:%d", f->host, f->port),
-						 errdetail_internal("%s", kingres_shard_conn_error_text(f->kc->conn))));
-			}
-			f->kc->nstatements++;
-			f->in_flight = true;
-			kingres_shard_conn_set_pending(f->kc, f, ds_finish_pending);
-		}
-		foreach(lc, s->frags)
-		{
-			DsFrag	   *f = (DsFrag *) lfirst(lc);
-			PGresult   *res;
-			bool		same;
+		f->scan = s;
+		f->kc = kingres_shard_get_conn(f->host, f->port, false, NULL);
+		kingres_shard_begin_xact(f->kc);
+		f->kc->in_query = true;
+		if (!PQsendQuery(f->kc->conn, ask))
+			frag_send_failed(f, "placement");
+		f->kc->nstatements++;
+		f->in_flight = true;
+		kingres_shard_conn_set_pending(f->kc, f, ds_finish_pending);
+	}
+	foreach(lc, s->frags)
+	{
+		DsFrag	   *f = (DsFrag *) lfirst(lc);
+		PGresult   *res;
 
-			res = libpqsrv_get_result_last(f->kc->conn, PG_WAIT_EXTENSION);
-			kingres_shard_conn_clear_pending(f->kc, f);
-			f->kc->in_query = false;
-			f->in_flight = false;
-			if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK)
-			{
-				if (res == NULL)
-					f->kc->have_error = true;
-				kingres_shard_report_error(f->kc, res, "placement");
-			}
-			same = !PQgetisnull(res, 0, 0) && !PQgetisnull(res, 0, 1) &&
-				pg_strtoint64(PQgetvalue(res, 0, 0)) == origin_placement;
-			if (same)
-				f->identity = pg_strtoint64(PQgetvalue(res, 0, 1));
-			PQclear(res);
-			if (!same)
-				ereport(ERROR,
-						(errcode(ERRCODE_KINGRES_STALE_MAP),
-						 errmsg("the bucket map changed while the statement was starting (node %s:%d has another placement of the buckets)",
-								f->host, f->port),
-						 errhint("A bucket moved between shard groups; repeat the statement.")));
-		}
+		res = libpqsrv_get_result_last(f->kc->conn, PG_WAIT_EXTENSION);
+		kingres_shard_conn_clear_pending(f->kc, f);
+		f->kc->in_query = false;
+		f->in_flight = false;
+		if (res == NULL)
+			f->kc->have_error = true;
+		kingres_shard_probe_read_before(f->kc, res, 1, s->plan_placement, &f->identity);
 	}
 	kingres_shard_fault_point("scan_after_placement");
 
@@ -1140,14 +1141,7 @@ ds_start(KsDistScanState *s)
 		appendStringInfo(&decl, KS_FRAGMENT_MARKER "DECLARE %s NO SCROLL CURSOR FOR %s", f->cursor, s->sql);
 		f->kc->in_query = true;
 		if (!PQsendQueryParams(f->kc->conn, decl.data, nparams, types, values, NULL, NULL, 0))
-		{
-			f->kc->have_error = true;
-			f->kc->in_query = false;
-			ereport(ERROR,
-					(errcode(ERRCODE_CONNECTION_FAILURE),
-					 errmsg("could not send a command to node %s:%d", f->host, f->port),
-					 errdetail_internal("%s", kingres_shard_conn_error_text(f->kc->conn))));
-		}
+			frag_send_failed(f, "DECLARE");
 		f->kc->nstatements++;
 		f->in_flight = true;
 		kingres_shard_conn_set_pending(f->kc, f, ds_finish_pending);
@@ -1166,7 +1160,7 @@ ds_start(KsDistScanState *s)
 		{
 			if (res == NULL)
 				f->kc->have_error = true;
-			kingres_shard_report_error(f->kc, res, "DECLARE");
+			kingres_shard_fragment_error(f->kc, res, "DECLARE");
 		}
 		PQclear(res);
 		f->declared = true;
@@ -1176,65 +1170,34 @@ ds_start(KsDistScanState *s)
 	kingres_shard_fault_point("scan_after_declare");
 
 	/*
-	 * The map version rule (design/shard-phase4.md, "The map version rule").  A
-	 * node's bucket partitions of a table and its placement of the colocation
-	 * group change only in the transaction of a switch, which commits on every
-	 * participant (the one on the map group primary included: its own part is done
-	 * in the coordinator's transaction).  The placement and the identity of the
-	 * node's partitions of the table (the set of the partitions' OIDs) were read
-	 * before the cursor was opened and are read again now, from the catalog tables
-	 * and not from a cache.  The placement of every node must be the one the groups
-	 * were chosen with; the identity of a node must be what it was before: a
-	 * switch that committed in between changes it, whatever it did to the
-	 * placement (a bucket that left and came back leaves the placement as it was,
-	 * but its partition on the node is a new table).  When both are unchanged, no
-	 * switch committed on the node between the two reads, so the cursor was planned
-	 * with the partitions of that placement.  What happens on the node later cannot
-	 * change what the cursor reads: it holds the parent in ACCESS SHARE, which a
-	 * detach (the source) waits for, and a partition attached later (the target) is
-	 * not in its plan, which is what the placement says (the bucket is read from
-	 * the source).  A node whose answers differ has other partitions than this scan
-	 * assumes: a bucket that moved between the reads of two groups would be
-	 * returned twice or not at all.  The statement fails with the retryable KS001;
-	 * nothing has been returned yet.
+	 * Step 4, the map version rule (design/shard-phase4.md, "The map version
+	 * rule"; design/shard-phase2b.md, 4.3 and 10.2).  A node's bucket partitions of a
+	 * table and its placement of the colocation group change only in the
+	 * transaction of a switch, which commits on every participant.  The placement
+	 * and the identity of the node's partitions of the table were read before the
+	 * cursor was opened and are read again now, from the catalog tables and not
+	 * from a cache.  The placement of every node must be the plan's; the identity
+	 * of a node must be what it was before: a switch that committed in between
+	 * changes it, whatever it did to the placement (a bucket that left and came
+	 * back leaves the placement as it was, but its partition on the node is a new
+	 * table).  When both are unchanged, no switch committed on the node between
+	 * the two reads, so the cursor was planned with the partitions of that
+	 * placement.  What happens on the node later cannot change what the cursor
+	 * reads: it holds the parent in ACCESS SHARE, which a detach (the source) waits
+	 * for, and a partition attached later (the target) is not in its plan, which is
+	 * what the placement says (the bucket is read from the source).  The statement
+	 * fails with the retryable KS001; nothing has been returned yet.
 	 */
 	foreach(lc, s->frags)
 	{
 		DsFrag	   *f = (DsFrag *) lfirst(lc);
-		PGresult   *res = kingres_shard_exec(f->kc, recheck);
-		int64		theirs = 0;
-		int64		identity = 0;
-		bool		known = false;
+		PGresult   *res = kingres_shard_exec_params(f->kc, recheck, 0, NULL, NULL, false);
 
-		if (!PQgetisnull(res, 0, 0) && !PQgetisnull(res, 0, 1))
-		{
-			theirs = pg_strtoint64(PQgetvalue(res, 0, 0));
-			identity = pg_strtoint64(PQgetvalue(res, 0, 1));
-			known = true;
-		}
-		PQclear(res);
-		if (!known || theirs != origin_placement || identity != f->identity)
-		{
-			/*
-			 * No reload of the catalog here: it would run in this transaction,
-			 * which the error below ends, and the writes of the reload would
-			 * wait for, and deadlock with, the very switch that made the
-			 * placements differ.
-			 */
-			ereport(ERROR,
-					(errcode(ERRCODE_KINGRES_STALE_MAP),
-					 errmsg("the bucket map changed while the statement was reading it (node %s:%d has another placement of the buckets)",
-							f->host, f->port),
-					 errhint("A bucket moved between shard groups; repeat the statement.")));
-		}
+		kingres_shard_probe_read_after(f->kc, res, 1, s->plan_placement, &f->identity);
 	}
-	if (kingres_shard_placement_hash(kingres_shard_lookup_colocation(colocation_id)) != origin_placement)
-		ereport(ERROR,
-				(errcode(ERRCODE_KINGRES_STALE_MAP),
-				 errmsg("the bucket map changed while the statement was reading it"),
-				 errhint("A bucket moved between shard groups; repeat the statement.")));
-	/* This node's own partitions can have come and gone in the same window. */
-	check_local_partitions(s);
+	/* This node's own placement and partitions can have changed in the same window. */
+	kingres_shard_check_origin_placement(colocation_id, s->plan_placement, "reading it");
+	kingres_shard_check_origin_partitions(s->relid, s->plan_has_parts, s->plan_partitions);
 	kingres_shard_fault_point("scan_after_check");
 	foreach(lc, s->frags)
 		frag_send_fetch((DsFrag *) lfirst(lc));
@@ -1535,10 +1498,18 @@ ds_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 	const char *p;
 	bool		pending_space = false;
 	List	   *remote = NIL;
+	int			nall = 0;
+	bool		pruned = false;
 
 	if (dt != NULL && !dt->is_reference)
-		remote = remote_groups_of(dt, cat);
-	ExplainPropertyInteger("Remote groups", NULL, list_length(remote), es);
+		remote = remote_groups_of(dt, cat, s->prune_terms,
+								  node->ss.ps.state->es_param_list_info, &nall, &pruned);
+	if (pruned && list_length(remote) < nall)
+		ExplainPropertyText("Remote groups",
+							psprintf("%d of %d (pruned by %s)", list_length(remote), nall,
+									 NameStr(dt->dist_column)), es);
+	else
+		ExplainPropertyInteger("Remote groups", NULL, list_length(remote), es);
 
 	initStringInfo(&flat);
 	for (p = s->sql; *p; p++)

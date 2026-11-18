@@ -1172,6 +1172,46 @@ kingres_shard_conn_drop_stale(List *nodes)
 }
 
 /*
+ * kingres_shard_conn_open_in_group
+ *
+ * A cached session of this backend that has a remote transaction open on a node of
+ * shard group group_id other than host:port (the catalog says which nodes belong to
+ * the group: the primary, the old primary after promote_node(), the standbys); NULL
+ * when there is none.  A statement reads and writes a group through one node only
+ * (design/shard-phase2b.md, 4.4; placement_check.c makes the rule).
+ */
+KsConn *
+kingres_shard_conn_open_in_group(int group_id, const char *host, int port)
+{
+	const KsCatalog *cat = kingres_shard_catalog();
+	HASH_SEQ_STATUS scan;
+	KsConn	   *kc;
+
+	if (conn_hash == NULL)
+		return NULL;
+	hash_seq_init(&scan, conn_hash);
+	while ((kc = (KsConn *) hash_seq_search(&scan)) != NULL)
+	{
+		ListCell   *lc;
+
+		if (kc->conn == NULL || kc->xact_depth <= 0 ||
+			(kc->port == port && strcmp(kc->host, host) == 0))
+			continue;
+		foreach(lc, cat->nodes)
+		{
+			KsNode	   *n = (KsNode *) lfirst(lc);
+
+			if (n->group_id == group_id && n->port == kc->port && strcmp(n->host, kc->host) == 0)
+			{
+				hash_seq_term(&scan);
+				return kc;
+			}
+		}
+	}
+	return NULL;
+}
+
+/*
  * Asynchronous fetches.  A scan that has sent a FETCH and has not read the
  * answer registers itself on the connection; anything else that wants to use
  * the connection first asks the owner to read the answer (it keeps the result

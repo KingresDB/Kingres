@@ -1440,12 +1440,13 @@ planner_hook_body(Query *parse, const char *query_string,
 	(void) kingres_shard_session_forwarded();
 
 	/*
-	 * The local part of a fanned-out statement, and a statement of a trigger of a
-	 * foreign key (S6-01), are planned for this node only.
+	 * A statement of a trigger of a foreign key (S6-01) is planned for this node
+	 * only.  (The local part of a fanned-out statement is too, but it is
+	 * recognized further down, after the analysis and after the partition lists
+	 * were made as new as the catalog: design 4.4.)
 	 */
-	if (kingres_shard_in_fanout_local(query_string) ||
-		(kingres_shard_enable_routing && !creating_extension &&
-		 kingres_shard_in_ri_action(parse)))
+	if (kingres_shard_enable_routing && !creating_extension &&
+		kingres_shard_in_ri_action(parse))
 	{
 		/*
 		 * The partition list of the relcache must be as new as the catalog before the
@@ -1502,6 +1503,18 @@ planner_hook_body(Query *parse, const char *query_string,
 	foreach(lc, a.refs)
 		kingres_shard_ensure_fresh_partitions(((DistRef *) lfirst(lc))->dt->relid,
 											  cat->map_version);
+
+	/*
+	 * The local part of a fanned-out statement, which this backend runs through SPI
+	 * with the nonce of that part in the text of the statement (fanout.c), is
+	 * planned for this node only, without routing and without the scan.  It is
+	 * recognized here and not earlier: the partition lists of its tables are now as
+	 * new as the catalog (above), and a statement of a function that the local part
+	 * calls cannot carry the nonce.  This replaces the comparison of whole statement
+	 * texts of 0.2 to 0.5, which returned before the catalog was read.
+	 */
+	if (kingres_shard_local_part_nonce_ok(query_string))
+		return pass_through(parse, query_string, cursorOptions, boundParams);
 
 	/*
 	 * A write to a reference table runs on every node; it takes no part in the
@@ -1639,6 +1652,21 @@ planner_hook_body(Query *parse, const char *query_string,
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("MERGE on distributed tables of another shard group is not supported yet")));
+
+	/*
+	 * A read that mixes a distributed table of another group with a local table,
+	 * and a scrollable cursor on a statement of another group, are answered by the
+	 * distributed scan (design 6.5, ADR 0022): the local table does not exist on
+	 * the other node, so the statement cannot be forwarded whole, but the scan
+	 * reads the distributed table (asking only the group the restriction names,
+	 * 4.5) and PostgreSQL joins it with the local table here.  Every restriction is
+	 * applied again at the origin.  A scrollable cursor gets a Material node above
+	 * the scan, which cannot be read backwards.  A statement that writes a
+	 * distributed table stays refused below.
+	 */
+	if ((a.has_nondist || (cursorOptions & CURSOR_OPT_SCROLL)) &&
+		can_distributed_scan(parse, cat))
+		return plan_with_scan(parse, query_string, cursorOptions, boundParams);
 	if (a.has_nondist)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

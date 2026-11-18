@@ -912,6 +912,45 @@ statement is planned. `EXPLAIN` shows the number of remote groups and the
 remote SQL. Not supported yet: row locking (`FOR UPDATE`) on a statement that
 spans groups, system columns of a distributed table (`ctid`, `tableoid`).
 
+Since step 2 of phase 2b the scan has these properties as well (design:
+`kingres/docs/design/shard-phase2b.md`, sections 4.3 to 4.6 and 6.5):
+
+- **Pruning.** A group that cannot own a key the statement names is not asked:
+  `dist_col = <constant or parameter>`, `dist_col IN (...)`, `dist_col = ANY
+  (<array or parameter>)` and an `OR` of such clauses, with an equality operator
+  of the column's hash family under the collation the table was distributed with.
+  The groups are chosen when the scan starts, so a generic plan prunes by the
+  values of its parameters. `EXPLAIN` shows `Remote groups: 1 of 2 (pruned by
+  id)` when a group was left out; any other clause prunes nothing, which is
+  always correct.
+- **One placement check for every statement** (`src/placement_check.c`): the
+  placement number of the plan against the cache, the probe of every node before
+  and after the cursors are declared (placement, identity of the node's
+  partitions, version of the extension), and the origin's own placement and
+  partitions. A node that runs another version of `kingres_shard` is refused
+  with an error that says so (not `KS001`: repeating does not help until the
+  upgrade is finished). The 2a fan-out write uses the same functions.
+- **One node of a group per transaction.** A transaction that has read or
+  written a group through one node and then needs another node of the same
+  group (the old primary after `promote_node`, then the new one) fails with
+  `KS001`; it never combines two states of a group.
+- **A failed group.** A node that fails with a connection error, a shutdown or a
+  read-only refusal is reported as `KS001` ("a failover of its shard group may be
+  in progress") when its group has a registered standby, or the node is no longer
+  its group's primary in the cache; otherwise it is the plain connection error,
+  which a repeat would only meet again.
+- **Reads that mix a distributed table with a local table**, and `SCROLL`
+  cursors, are answered by the scan also when every distributed table is
+  restricted to a key of another group (they were refused). A statement that
+  writes a distributed table and reads a local one is still refused. With
+  `kingres_shard.enable_distributed_scan = off` the refusal is back; that switch
+  is the fallback of this step.
+- **The local part of a fan-out write** (an `UPDATE`, `DELETE` or reference-table
+  write run on every group) is planned for this node only when its text carries
+  a random number that exists only while that part runs (it is no longer
+  recognized by comparing statement texts), and only after the partition lists
+  are as new as the catalog.
+
 ## UPDATE and DELETE that span shard groups
 
 An `UPDATE` or `DELETE` that is not restricted to one bucket runs on every group
@@ -1858,7 +1897,7 @@ same thing for each.
 
 | SQLSTATE | Meaning | What the caller does | Texts (unchanged) | Test |
 |---|---|---|---|---|
-| `KS001` | stale bucket map | retry (the statement was routed on an old map) | "the bucket map changed after the statement was planned" and the like | `t/002`, `t/026` |
+| `KS001` | stale bucket map | retry (the statement was routed on an old map; a failover of a group of a read is reported the same way) | "the bucket map changed after the statement was planned", "this transaction already uses node ... of shard group ...", "node ... failed while a distributed statement was running" and the like | `t/002`, `t/026`, `t/105`, `t/106` |
 | `KS002` | the sender's catalog is superseded (a newer catalog term exists) | stop sending from that node; `sync_catalog()` brings it up to date | "the catalog of the sending node (term T) has been superseded by term U" (the text is produced by `t/063`; its SQLSTATE is not asserted there) | `t/063` |
 | `KS004` | a bucket move gave up waiting for its switch | the move goes back to catching up by itself | "the copy of bucket B did not replay up to the switch point within N ms" and the like | `t/026`, `t/028` |
 | `KS005` | a participant could not get its own standby to confirm that its part is durable | fix that node's list or standby, repeat; nothing was committed | "did not confirm that its part of the transaction is durable on its synchronous standby" | `t/070`, `t/084` |

@@ -21,7 +21,9 @@ OBJS = \
 	src/kingres_shard.o \
 	src/node_admin.o \
 	src/node_conn.o \
+	src/placement_check.o \
 	src/planner.o \
+	src/prune.o \
 	src/recovery.o \
 	src/remote_scan.o \
 	src/shippable.o \

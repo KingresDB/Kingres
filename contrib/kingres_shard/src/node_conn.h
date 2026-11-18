@@ -114,6 +114,7 @@ extern void kingres_shard_report_error(KsConn *kc, PGresult *res,
 extern int	kingres_shard_result_sqlstate(PGresult *res);
 extern void kingres_shard_forget_xact(KsConn *kc);
 extern void kingres_shard_conn_drop_stale(List *nodes);
+extern KsConn *kingres_shard_conn_open_in_group(int group_id, const char *host, int port);
 
 /*
  * Two-phase commit (design/shard-phase2a.md, section 1).  A connection that

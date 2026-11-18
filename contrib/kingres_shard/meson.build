@@ -15,7 +15,9 @@ kingres_shard_sources = files(
   'src/kingres_shard.c',
   'src/node_admin.c',
   'src/node_conn.c',
+  'src/placement_check.c',
   'src/planner.c',
+  'src/prune.c',
   'src/recovery.c',
   'src/remote_scan.c',
   'src/shippable.c',
@@ -186,6 +188,8 @@ tests += {
       't/102_slow_nodes.pl',
       't/103_slow_promote.pl',
       't/104_s12_fixes.pl',
+      't/105_fragment_foundation.pl',
+      't/106_scan_failover.pl',
     ],
   },
 }

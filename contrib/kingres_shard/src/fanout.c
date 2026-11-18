@@ -20,9 +20,10 @@
  * other across nodes (a deadlock of several statements in several transactions
  * is for the distributed deadlock detection of phase 5).
  *
- * While the local part runs through SPI the planner is told to plan the
- * statement for this node only (kingres_shard_in_fanout_local()); a remote
- * node runs it in a forwarded session, where the same holds.
+ * While the local part runs through SPI its text carries a nonce that the planner
+ * hook recognizes (kingres_shard_local_part_nonce_ok()) and plans the statement
+ * for this node only; a remote node runs it in a forwarded session, where the same
+ * holds.
  *
  * SPDX-License-Identifier: AGPL-3.0-only
  * Portions Copyright (c) 2026, RooyeKhat Media Co
@@ -68,6 +69,7 @@
 #include "forward_auth.h"
 #include "kingres_shard.h"
 #include "node_conn.h"
+#include "placement_check.h"
 #include "remote_scan.h"
 
 /* Layout of CustomScan.custom_private: three fields, then (host, port, local) per target. */
@@ -79,8 +81,19 @@
 #define FO_PRIV_NLOCKS		5
 /* then the lock names, then (host, port, local) per target */
 
-/* The statement text whose local execution is in progress, or NULL. */
-static const char *fanout_local_sql = NULL;
+/*
+ * The nonce of the local part that is running through SPI (design 4.4), or 0.  A
+ * 64-bit random number made when the local part starts and held only while that
+ * SPI call is active; the statement text of the call starts with a comment that
+ * carries it, and the planner hook plans a statement with that comment as the
+ * local part, for this node only.  A statement of a function that the local part
+ * calls cannot know it, which the comparison of whole statement texts that 0.2 to
+ * 0.5 made could not promise.
+ */
+static uint64 local_nonce = 0;
+
+/* The comment that starts the text of the local part; one nonce in hexadecimal. */
+#define KS_LOCAL_PART_PREFIX "/* kingres:local %016llx */ "
 
 /*
  * How many local parts of a fanned-out reference-table write are running in
@@ -144,11 +157,21 @@ kingres_shard_fanout_init(void)
 	ExecutorStart_hook = fo_executor_start;
 }
 
+/*
+ * True when query_string is the text of the local part that this backend is
+ * running through SPI: it starts with the comment that carries the nonce of the
+ * part that is active.  The planner hook calls it after its analysis and after
+ * the partition lists were made as new as the catalog (planner.c).
+ */
 bool
-kingres_shard_in_fanout_local(const char *query_string)
+kingres_shard_local_part_nonce_ok(const char *query_string)
 {
-	return fanout_local_sql != NULL && query_string != NULL &&
-		strcmp(fanout_local_sql, query_string) == 0;
+	char		prefix[64];
+
+	if (local_nonce == 0 || query_string == NULL)
+		return false;
+	snprintf(prefix, sizeof(prefix), KS_LOCAL_PART_PREFIX, (unsigned long long) local_nonce);
+	return strncmp(query_string, prefix, strlen(prefix)) == 0;
 }
 
 /*
@@ -521,7 +544,9 @@ run_local(KsFanoutState *s, ParamListInfo params, bool keep_rows)
 	int			ret;
 	int			nest;
 	uint64		processed;
-	const char *saved = fanout_local_sql;
+	uint64		saved = local_nonce;
+	uint64		nonce = 0;
+	char	   *text;
 
 	for (i = 0; i < n; i++)
 	{
@@ -537,19 +562,27 @@ run_local(KsFanoutState *s, ParamListInfo params, bool keep_rows)
 		nulls[i] = (prm->isnull || !OidIsValid(prm->ptype)) ? 'n' : ' ';
 	}
 
+	while (nonce == 0)
+	{
+		if (!pg_strong_random(&nonce, sizeof(nonce)))
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("could not generate a random number for the local part of a statement")));
+	}
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
 	nest = kingres_shard_set_transmission_modes();
-	fanout_local_sql = s->sql;
+	text = psprintf(KS_LOCAL_PART_PREFIX "%s", (unsigned long long) nonce, s->sql);
+	local_nonce = nonce;
 	if (!s->all_rows)
 		refwrite_local_depth++;
 	PG_TRY();
 	{
-		ret = SPI_execute_with_args(s->sql, n, argtypes, values, nulls, false, 0);
+		ret = SPI_execute_with_args(text, n, argtypes, values, nulls, false, 0);
 	}
 	PG_FINALLY();
 	{
-		fanout_local_sql = saved;
+		local_nonce = saved;
 		if (!s->all_rows)
 			refwrite_local_depth--;
 	}
@@ -877,12 +910,17 @@ run_all(KsFanoutState *s)
 	 */
 	if (s->all_rows)
 	{
-		origin_placement = kingres_shard_placement_hash(kingres_shard_lookup_colocation(s->colocation_id));
-		if (origin_placement != s->plan_placement)
-			ereport(ERROR,
-					(errcode(ERRCODE_KINGRES_STALE_MAP),
-					 errmsg("the bucket map changed after the statement was planned"),
-					 errhint("A bucket moved between shard groups; nothing was changed.  Repeat the statement.")));
+		kingres_shard_placement_check_plan(s->colocation_id, s->plan_placement);
+		origin_placement = s->plan_placement;
+	}
+
+	/* A transaction uses one node of a group (design 4.4); nothing has been sent yet. */
+	foreach(lc, s->targets)
+	{
+		KsFanTarget *t = (KsFanTarget *) lfirst(lc);
+
+		if (!t->is_local)
+			kingres_shard_group_rule(t->host, t->port);
 	}
 
 	if (s->locknames != NIL)
@@ -960,12 +998,7 @@ run_all(KsFanoutState *s)
 			else
 			{
 				KsConn	   *kc = kingres_shard_get_conn(t->host, t->port, false, NULL);
-				PGresult   *res = kingres_shard_exec(kc,
-													 psprintf("SELECT " KINGRES_SHARD_SCHEMA ".internal_placement_hash(%d)",
-															  s->colocation_id));
-
-				theirs = PQgetisnull(res, 0, 0) ? 0 : pg_strtoint64(PQgetvalue(res, 0, 0));
-				PQclear(res);
+				theirs = kingres_shard_probe_placement(kc, s->colocation_id);
 			}
 			if (theirs != origin_placement)
 				ereport(ERROR,
