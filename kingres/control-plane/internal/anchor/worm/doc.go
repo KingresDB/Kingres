@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 // Package worm anchors a signed checkpoint by writing it to an S3 compatible
-// store under Object Lock (design 6.3). It implements anchor.Target with kind
-// "worm".
+// store under Object Lock (design 6.3, with corrections 60 to 65, 81 to 84 and
+// 88 to 92 of section 14; the ones that describe this code are 81, 82 and
+// 89). It implements anchor.Target with kind "worm".
 //
 // # What Submit does
 //
@@ -11,61 +12,119 @@
 //  2. PutObject, signed with SigV4 (package sigv4), with Content-Type
 //     "text/plain; charset=utf-8", x-amz-checksum-sha256 (base64 SHA-256 of
 //     the body), If-None-Match: *, x-amz-object-lock-mode (GOVERNANCE or
-//     COMPLIANCE) and x-amz-object-lock-retain-until-date (the clock plus
-//     retentionDays, RFC 3339 UTC, whole seconds).
+//     COMPLIANCE), x-amz-object-lock-retain-until-date (the clock plus
+//     retentionDays, RFC 3339 UTC, whole seconds) and the user metadata
+//     x-amz-meta-kingres-attempt: the clock of this server at the start of
+//     this call (TimeLayout).
 //  3. On 200 the version is read back: HEAD with versionId and
 //     x-amz-checksum-mode ENABLED, then GET of that version. The object must
-//     carry the configured lock mode and a retain-until date not earlier than
-//     requested less RetentionTolerance (5 minutes) and in the future;
-//     Content-Length, the version id (which must exist: no version id is no
-//     anchor, Code "no_version_id") and, when the store returns it, the
-//     sha256 checksum must match; the bytes of THAT version must equal the
-//     note; Last-Modified must be present and bounded against two clocks of
-//     ours. It is never later than the clock plus the tolerance
-//     (Config.MaxSkewSeconds, default 300): else Code "store_time_skew",
-//     class refused (the store is ahead; it passes when the clocks agree).
-//     It is never earlier than the time of the first attempt of the record
-//     (Payload.FirstAttempt, required) less the tolerance: else Code
-//     "store_time_early", class permanent (the store is behind, or the
-//     object belongs to an earlier record; the object is locked and keeps its
-//     time, so a retry would find the same object). For an object that this
-//     call has just written the time must also be within the tolerance of
-//     the clock. The time the evidence states is the store's clock, and a
-//     store with a wrong clock is refused rather than believed, now and on
-//     every later attempt for that object (the second attempt does not judge
-//     the object by a wider rule than the first). An existing, complete,
-//     locked version of our own bytes has no other age limit, so a crash
-//     recovery or an operator who takes a month to fix a bucket still
-//     completes the key. The text of both errors says that it is a problem
-//     of clocks, not of credentials. A store that accepts the put without
-//     locking is reported as a permanent error with Code "not_locked". A
-//     failed read-back is retryable for a transport failure or a 5xx and
-//     refused (a few tries, then failed) for any other answer. A first
-//     attempt later than the clock plus the tolerance is Code
-//     "first_attempt_ahead", retryable, and nothing is sent.
+//     carry the configured lock mode (or COMPLIANCE when GOVERNANCE is
+//     configured, the stronger lock) and a retain-until date not earlier than
+//     required (below) and in the future; Content-Length, the version id
+//     (which must exist: no version id is no anchor, Code "no_version_id")
+//     and, when the store returns it, the sha256 checksum must match; the
+//     bytes of THAT version must equal the note; Last-Modified must be
+//     present and inside the window of the store's time (next section). A
+//     store that accepts the put without locking is reported as a permanent
+//     error with Code "not_locked". A failed read-back is retryable for a
+//     transport failure or a 5xx and refused (a few tries, then failed) for
+//     any other answer. A start of the first Submit call later than the clock
+//     plus the tolerance is Code "submit_start_ahead", retryable, and nothing
+//     is sent.
 //  4. On 412, or 409 ConditionalRequestConflict, the key is read: the latest
 //     version when its bytes equal the note, otherwise the versions of the key
 //     are listed (newest first, at most MaxVersionsChecked read) and every
-//     version with the bytes of the note is verified as in 3. A foreign later
-//     version over the key is therefore not a conflict as long as our version is
-//     there. Only when no version of the key holds the note is it an error of
-//     class conflict (Code "worm_conflict"); nothing is ever overwritten.
-//     A version of ours that has no lock, or a retention earlier than the
-//     first attempt asked (the first attempt's time plus retentionDays) less
-//     RetentionTolerance, in the configured mode, gets the retention applied
-//     (PutObjectRetention on that version, with Content-MD5, until the
-//     retention asked now) and is verified again: an object that an earlier
-//     Submit left unlocked or locked too short is completed by the next one.
-//     When the store refuses, the error (Code "not_locked") names the key, the
-//     version, the mode and the date, and says to apply them with the store's
-//     tools and to Retry (which works after any delay); a version locked in
-//     another mode is never touched. Nothing is repaired on an object whose
-//     time is refused.
+//     version with the bytes of the note is verified as in 3, as a version that
+//     was found (an existing one). A foreign later version over the key is
+//     therefore not a conflict as long as our version is there. Only when no
+//     version of the key holds the note is it an error of class conflict (Code
+//     "worm_conflict"); nothing is ever overwritten. A version of ours that has
+//     no lock, or a retention shorter than the floor below, gets the retention
+//     applied (PutObjectRetention on that version, with Content-MD5, in the mode
+//     the version has, until the retention asked now) and is verified again: an
+//     object that an earlier Submit left unlocked or locked too short, or whose
+//     lock has expired, is completed by the next one. When the store refuses,
+//     the error (Code "not_locked") names the key, the version, the mode and the
+//     date, says that the lock is missing, too short or expired, and says to
+//     apply them with the store's tools and to Retry (which works after any
+//     delay). Nothing is repaired on an object whose time is refused.
 //  5. With ifNoneMatch "auto" a store that answers the put with 501, or 400
 //     that does not mention the lock, is handled by a check before the write
 //     (HEAD of the key, put without the header when absent). "on" refuses such
 //     a store (class refused); "off" always checks first. The check is not
 //     atomic: object lock is what protects an existing version.
+//
+// # The time of the store (correction 89)
+//
+// The time the evidence states, and the cluster vouches for, is the store's
+// Last-Modified. The property this package keeps: for a version that this
+// package wrote, the time stated is never further from the true time of the
+// write than the tolerance (Config.MaxSkewSeconds, default 300 s) plus the
+// duration of the call that wrote it (at most CallTimeout, 30 s), whatever the
+// age of the record, the number of attempts, the Retries and the crashes; and
+// for any version it is never earlier than SubmitStart less the tolerance. The
+// rules:
+//
+//   - SubmitStart (Payload.SubmitStart) is the start of the FIRST Submit call
+//     that the checkpoint had for this key. The caller persists it before that
+//     call and never changes it; a Retry keeps it; a caller that wants a new
+//     start uses a new key (another keyPrefix). It is not the creation of the
+//     record.
+//   - A version that this call has just written must have a time within the
+//     tolerance of now (not earlier than now less it, not later than now plus
+//     it). A store whose clock is wrong by more is refused at once.
+//   - A version that is found (a later call, a crash recovery, a Retry, a
+//     version that another principal wrote) must have a time not earlier than
+//     SubmitStart less the tolerance and not later than now plus the tolerance.
+//     This is a wider rule than the fresh one, on purpose: a version found after
+//     a crash is old by any amount. When the version carries the user metadata
+//     kingres-attempt (every put of this package sets it, and the store keeps
+//     it with the version), the window is narrowed to that start less the
+//     tolerance up to that start plus CallTimeout plus the tolerance, so that a
+//     Retry or a crash recovery days after SubmitStart does not widen it: the
+//     object is judged by the call that wrote it, as the fresh rule judged it.
+//   - So the three cases of the third review are refused: a read-back that fails
+//     after the put (the next call finds an object whose store is behind or
+//     ahead), a refusal followed by a Retry, and a record that sat failed for
+//     days. Refused for a store behind: Code "store_time_early", class
+//     permanent (the object is locked and keeps its time; a Retry finds the same
+//     object). Refused for a store ahead: Code "store_time_skew", class refused,
+//     and it stays refused when the clock catches up, for an object that carries
+//     the start of its call (for a found object without it, the clock catching
+//     up can make a time that is ahead acceptable: it is then later than the
+//     truth, which only weakens the bound the evidence gives). The text of both
+//     says that it is a problem of clocks, not of credentials.
+//
+// What is left, stated so that it can be tested: a version found WITHOUT the
+// metadata (written by another principal, or by a writer that is not this
+// package) may have a time as early as SubmitStart less the tolerance, so for
+// such a version the window is the time since SubmitStart; the evidence says
+// "found": true and states the SubmitStart that was applied, so an auditor sees
+// it. For a version this package wrote, the residual window is the tolerance
+// plus the duration of one Submit call. What a wrong SubmitStart does: later
+// than the true start by more than the tolerance, the object that the first call
+// wrote is refused for good ("store_time_early", change the keyPrefix); a start
+// later than the clock plus the tolerance is retryable and sends nothing; earlier
+// than the true start (the creation of the record, 1970), it widens the window of
+// a version found without the metadata only, to the stated start, and the
+// evidence says which start was applied; different between calls, the verdict
+// follows the start of the call.
+//
+// # The retention floor
+//
+// The floor of the retain-until date comes from the store's own timeline and not
+// from a time the caller states: for a version this call wrote, the date asked
+// now less RetentionTolerance; for a found version, its own Last-Modified plus
+// the configured days, less the tolerance of the time and RetentionTolerance, and
+// never in the past. A found version with a date below the floor is repaired, as
+// in step 4. A version that is found in the other mode: COMPLIANCE where
+// GOVERNANCE is configured is accepted (the stronger lock; the evidence names
+// the mode the version has, and a short lock is repaired in that mode, never
+// weakened); GOVERNANCE where COMPLIANCE is configured is refused (Code
+// "not_locked", permanent, nothing touched), because a principal with the bypass
+// permission could delete it and the configuration promised that nobody can; a
+// changed configuration then needs a lock applied with the store's tools or
+// another keyPrefix.
 //
 // # Evidence
 //
@@ -74,7 +133,8 @@
 //	{"endpoint":"","bucket":"","key":"","version_id":"","etag":"",
 //	 "object_sha256":"<64 hex>","content_length":<n>,
 //	 "lock_mode":"GOVERNANCE|COMPLIANCE","retain_until":"<time>",
-//	 "last_modified":"<time>","recorded_by":"cluster"}
+//	 "last_modified":"<time>","submit_start":"<time>","found":false,
+//	 "recorded_by":"cluster"}
 //
 // endpoint is the configured endpoint ("" for AWS), key the object key,
 // version_id the version read back (never empty), etag the ETag of the
@@ -82,16 +142,18 @@
 // SHA-256 (lower case hex) and the length of the object's bytes that were
 // written and read back from that version (the signed note), lock_mode,
 // retain_until and last_modified the values the store returned (whole
-// seconds, UTC), recorded_by always "cluster". Receipt.State is "anchored"
-// and Receipt.EvidenceTime is last_modified, the store's clock, which was
-// bounded against the cluster's clock and against the first attempt of the record. What a verifier does: VerifyNote (the
-// note in hand, from the publication or fetched, is exactly the object that
-// the evidence describes by SHA-256 and length, is a well-formed signed note
-// whose text hashes to payload_sha256 of the file, and sits at the key of the
-// evidence), then, if it can reach the store, VerifyHead on the headers of its
-// own HEAD of the version (version id, lock mode, retention date, length),
-// then the signature under its pinned key. The lock, the retention date and
-// the time are claims of the cluster ("recorded_by") until the verifier's own
+// seconds, UTC), submit_start the SubmitStart that was applied, found false
+// when this call wrote the version and true when it found it (an earlier call
+// of this package that did not finish, or another principal), recorded_by
+// always "cluster". Receipt.State is "anchored" and Receipt.EvidenceTime is
+// last_modified, the store's clock, bounded as above. What a verifier does:
+// VerifyNote (the note in hand, from the publication or fetched, is exactly the
+// object that the evidence describes by SHA-256 and length, is a well-formed
+// signed note whose text hashes to payload_sha256 of the file, and sits at the
+// key of the evidence), then, if it can reach the store, VerifyHead on the
+// headers of its own HEAD of the version (version id, lock mode, retention date,
+// length), then the signature under its pinned key. The lock, the retention date
+// and the time are claims of the cluster ("recorded_by") until the verifier's own
 // fetch returns them; an evidence that cannot be re-fetched is "not
 // independently checked". In governance mode a principal with
 // s3:BypassGovernanceRetention can still delete the version; the evidence says
@@ -131,20 +193,36 @@
 // earlier deadline. Store messages are reduced to printable ASCII, cut to
 // MaxMessage bytes, and stripped of the credentials.
 //
-// # What the caller must do
+// # What the caller must do (the notes for the wiring)
 //
 // Load the credentials and the CA bundle, build the *http.Client with
 // anchor.NewHTTPClient (no proxy from the environment, the roots of the bundle,
-// timeouts; whatever client is passed, this package uses no proxy), build every
-// Payload with anchor.NewPayload and the time of the first attempt for this key
-// (the creation time of the first record of the checkpoint for this target is
-// never later; a Retry of a failed record keeps it), call Submit for due
-// records and keep the first evidence for a key, raise the alerts that
-// anchor.Record.AfterError names, and warn when retain_until approaches. The
-// text of an alert must come from the code and the text of the error
-// (anchor.CodeOf, Error()), not from its class: "store_time_skew" and
-// "store_time_early" are about clocks, "first_attempt_ahead" about the clock of
-// this server, and none of them is about credentials although the first is of
-// class refused. This package does not store anything, retry, or delete
-// objects.
+// timeouts; whatever client is passed, this package uses no proxy).
+//
+// Persist, BEFORE the first Submit call for a key, the time at which that call
+// starts (the clock of the server that makes it), as one durable value per (target,
+// aggregate, size) and key prefix; pass exactly that value to anchor.NewPayload
+// on every later call for that key, after a crash, a restart, a leader change
+// and every Retry, and never replace it. If the process dies between persisting
+// it and making the call, keep the value: it is then earlier than the true
+// start, which is safe (the objects this package writes carry the start of their
+// own call). Do not pass the creation time of the record, and do not pass the
+// time of the current attempt. Call Submit for due records and keep the first
+// evidence for a key, raise the alerts that anchor.Record.AfterError names, and
+// warn when retain_until approaches. The text of an alert must come from the
+// code and the text of the error (anchor.CodeOf, Error()), not from its class:
+// "store_time_skew" and "store_time_early" are about clocks, "submit_start_ahead"
+// about the clock of this server or of the value persisted, and none of them is
+// about credentials although the first is of class refused. The clocks of the
+// servers that make calls must agree within the tolerance.
+//
+// Give the cluster a bucket that nobody else writes, with versioning and Object
+// Lock, used for nothing else. Another principal that can write the bucket can
+// write our key with our bytes (the note is public once published) and be
+// adopted (the evidence says found), can write versions of other bytes after
+// ours until the newest MaxVersionsChecked hide ours and the record ends in
+// class conflict with the critical alert, and can write junk under the key of a
+// future size; none of this can be told from the cluster's own writes except by
+// the "found" member and the metadata. This package does not store anything,
+// retry, or delete objects.
 package worm

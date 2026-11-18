@@ -74,6 +74,20 @@
 // stored bytes of an intermediate or a root that the token carries are not
 // authenticated, which is why the roots are the verifier's own.
 //
+// # The pin of the signer (correction 92)
+//
+// Config.SignerKeySHA256 (JSON "signerKeySha256", 64 lower case hexadecimal
+// digits) optionally pins the signer: the SHA-256 of the DER
+// SubjectPublicKeyInfo of the signing certificate, which SignerKeyHash computes
+// (openssl: x509 -pubkey -noout, pkey -pubin -outform der, dgst -sha256). The
+// public key is pinned and not the certificate, because an authority renews its
+// certificate more often than its key. A token whose signer has another key is
+// refused with Code "signer_not_pinned" (permanent) even when it chains to the
+// roots. Without a pin any authority under the configured roots is accepted and
+// the name in the token is only checked against the token's own certificate:
+// an operator who means one authority says so with the pin. Expect.SignerKeySHA256
+// is the same pin for VerifyToken.
+//
 // # What the caller must do
 //
 //   - Load the CA bundle named by Config.CABundlePath itself and hand it to
@@ -151,8 +165,17 @@
 //   - The TSTInfo "tsa" field, when present, must correspond to a name of the
 //     signing certificate (RFC 3161 2.4.2): the subject or a directoryName of
 //     the subject alternative name, compared by the decoded attribute values
-//     (any string type, case ignored, white space folded, as RFC 5280 7.1
-//     describes) and not by the bytes; a DNS name (case ignored), URI, e-mail
+//     and not by the bytes, with a narrow profile (correction 92): a value that
+//     is not valid in its string type (invalid UTF-8, a lone surrogate, an odd
+//     length, a byte outside the type) is compared by its bytes only and never
+//     equals another value; the letters A to Z are folded to lower case and no
+//     other character is (the Kelvin sign is not a k); leading and trailing
+//     ASCII spaces are removed and runs of ASCII spaces made one, and no other
+//     character is white space (a no-break space, a tab and an ideographic space
+//     stay what they are; a value of only spaces is one space, not empty); a
+//     TeletexString is decoded only when every byte is ASCII and is otherwise
+//     compared by its bytes (T.61 is not Latin-1); a DNS name (ASCII case
+//     ignored), URI, e-mail
 //     address or IP address of the alternative names; or an otherName that is
 //     one of them byte for byte. The token is refused (tsa_name_mismatch) only
 //     when no name of the certificate corresponds.

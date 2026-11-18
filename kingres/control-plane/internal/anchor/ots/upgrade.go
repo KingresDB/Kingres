@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -147,14 +148,16 @@ func (t *Target) headerPass(ctx context.Context, claims []ClaimCheck, submitted,
 }
 
 // dropClaims returns the fragments without the Bitcoin attestations that the
-// claims name (by calendar, height and the message they sit on), and without
-// the fragments that nothing is left of. The pending attestation that the
-// claim replaced is gone: that calendar has said what it had to say.
+// claims name (by calendar, height and the message they sit on), without the
+// pending attestations that sit on the way to them (the one that a target with a
+// header source kept when it merged the answer: that calendar has said what it
+// had to say, and is not asked for the same claim again), and without the
+// fragments that nothing is left of.
 func dropClaims(roots []*Node, uris []string, claims []ClaimCheck) ([]*Node, []string) {
 	var outRoots []*Node
 	var outURIs []string
 	for i, root := range roots {
-		kept := dropLeaves(root, func(_ []Op, msg []byte, a Attestation) bool {
+		isDropped := func(msg []byte, a Attestation) bool {
 			if a.Kind != AttBitcoin {
 				return false
 			}
@@ -164,6 +167,33 @@ func dropClaims(roots []*Node, uris []string, claims []ClaimCheck) ([]*Node, []s
 				}
 			}
 			return false
+		}
+		// the messages of the nodes above a dropped claim
+		above := map[string]bool{}
+		var walk func(n *Node, path []string) bool
+		walk = func(n *Node, path []string) bool {
+			hit := false
+			for _, a := range n.Attestations {
+				if isDropped(n.Msg, a) {
+					hit = true
+				}
+			}
+			for _, e := range n.Edges {
+				if walk(e.Next, append(path, string(n.Msg))) {
+					hit = true
+				}
+			}
+			if hit {
+				above[string(n.Msg)] = true
+			}
+			return hit
+		}
+		walk(root, nil)
+		kept := dropLeaves(root, func(_ []Op, msg []byte, a Attestation) bool {
+			if a.Kind == AttPending && above[string(msg)] {
+				return true
+			}
+			return isDropped(msg, a)
 		})
 		if kept != nil {
 			outRoots, outURIs = append(outRoots, kept), append(outURIs, uris[i])
@@ -188,20 +218,45 @@ func dropClaims(roots []*Node, uris []string, claims []ClaimCheck) ([]*Node, []s
 // 404 means "not yet" and is not an error. An error is returned when every
 // lookup failed and nothing changed; its class is the most hopeful one among
 // the failures, and a round of permanent failures is retryable (see
-// allFailed); only a stored fragment that cannot be read is permanent.
+// allFailed); only a stored fragment that cannot be read is permanent. The
+// whole call is bounded by Options.UpgradeTimeout (default
+// DefaultUpgradeTimeout) besides the caller's context.
 //
 // What a Bitcoin attestation makes of the receipt (see claims.go): a claim
 // that passed the checks that need no header makes it "claimed"; a claim that
 // matched the header of the configured HeaderSource makes it "anchored" and
-// EvidenceTime the header's time. A claim that a header contradicts is dropped
-// from the fragments like an implausible one (a header that is unusable, or a
-// block time ahead of the clock, contradicts nothing). When no plausible claim
-// is left the receipt is "submitted" again (and says so: the record falls
-// back to submitted) as long as a calendar can still deliver; when nothing
-// can, and a header contradicted a claim, the error is of class conflict
+// EvidenceTime the header's time.
+//
+// A claim that a header contradicts is NOT dropped on that one answer
+// (correction 90): the source may have been wrong once (a header of an
+// orphaned block, a node that is still synchronising, another network). The
+// claim is kept aside in the evidence (OTSEvidence.Contradicted, with the
+// header that contradicted it and the time), stays in the fragment of its
+// calendar, is neither plausible nor anchored, and the calendar is asked about
+// its commitment again in later rounds. It is dropped for good only when the
+// header source contradicts it again in a round at least the confirmation
+// interval (Config.ContradictionConfirmMinutes, default 60) after the first
+// contradiction; a header that checks it in a later round puts it back among
+// the claims. To be able to ask again, a target with a header source keeps the
+// pending attestation of a calendar whose answer it merged (the target without
+// one removes it, as nothing can contradict a claim then); dropping a claim for
+// good removes that pending attestation too, so that the calendar is not asked
+// for the same claim again. A header that is unusable (it fails the work check, with its
+// floor) or a block time ahead of the clock contradicts nothing. The receipt
+// carries the counts (ContradictedClaims, ClaimsAside, ClaimsDropped) so that
+// the caller can alert: a calendar that lied and a source that is wrong are
+// both operator matters. A hostile calendar still cannot keep a record alive
+// beyond its expiry (the record's own timeout counts from its creation), and
+// what is kept aside is bounded (anchor.MaxOTSContradictions entries; one more
+// is dropped for good).
+//
+// When no plausible claim is left the receipt is "submitted" again (and says
+// so: the record falls back to submitted) as long as a calendar can still
+// deliver or a claim is kept aside; when claims were dropped for good and
+// nothing can deliver and nothing is kept aside, the error is of class conflict
 // (code "claim_contradicted": a calendar lied) and the receipt is unchanged.
-// A "claimed" receipt with nothing pending and no HeaderSource is returned as
-// it is. An "anchored" receipt is returned as it is.
+// A "claimed" receipt with nothing pending, nothing kept aside and no
+// HeaderSource is returned as it is. An "anchored" receipt is returned as it is.
 func (t *Target) Upgrade(ctx context.Context, r anchor.Receipt) (anchor.Receipt, error) {
 	if r.State == anchor.ReceiptAnchored {
 		return r, nil
@@ -217,9 +272,12 @@ func (t *Target) Upgrade(ctx context.Context, r anchor.Receipt) (anchor.Receipt,
 	if err != nil {
 		return r, anchor.Errorf(anchor.ClassPermanent, anchor.KindOTS, "upgrade", "evidence", "a stored fragment is not readable")
 	}
+	aside := append([]anchor.OTSContradiction(nil), ev.Contradicted...)
 	if r.State == anchor.ReceiptClaimed && t.headers == nil && !t.hasLookups(roots) {
 		return r, nil
 	}
+	ctx, cancel := context.WithTimeout(ctx, t.upgradeTimeout)
+	defer cancel()
 	now := t.now()
 
 	changed := false
@@ -236,54 +294,97 @@ func (t *Target) Upgrade(ctx context.Context, r anchor.Receipt) (anchor.Receipt,
 		}
 	}
 
-	// the claims of the (possibly grown) fragments, and the headers; a claim
-	// that a header contradicts is dropped, and the rest is judged again
+	// the claims of the (possibly grown) fragments, and the headers. A claim
+	// that a header contradicts is kept aside, not dropped; one that was kept
+	// aside and is contradicted again after the confirmation interval is
+	// dropped, and the rest is judged again
 	hc := &headerCache{hdrs: map[uint64][]byte{}, failed: map[uint64]bool{}}
 	var check *EvidenceCheck
-	unavailable, dropped := false, false
+	unavailable := false
+	contradicted, dropped := 0, 0
+	counted := map[string]bool{}
 	var contradiction string
 	for {
-		check = &EvidenceCheck{Claims: checkFragments(roots, uris, submitted, now)}
+		check = &EvidenceCheck{Claims: checkFragments(roots, uris, submitted, now, aside)}
 		unavailable = false
 		if t.headers != nil {
 			unavailable = t.headerPass(ctx, check.Claims, submitted, now, hc)
 		}
-		var bad []ClaimCheck
+		var drop []ClaimCheck
+		modified := false
 		for _, c := range check.Claims {
-			if c.HeaderProblem != "" {
-				bad = append(bad, c)
+			idx := findAside(aside, c.CalendarURI, c.Height, c.Root)
+			switch {
+			case c.HeaderChecked && idx >= 0:
+				// the header source is right now: the claim stands again
+				aside = removeAside(aside, idx)
+				modified, changed = true, true
+			case c.HeaderProblem != "":
+				if k := asideKey(c.CalendarURI, c.Height, c.Root); !counted[k] {
+					counted[k] = true
+					contradicted++
+				}
+				if contradiction == "" {
+					contradiction = fmt.Sprintf("the block header at height %d contradicts the claim of a calendar: %s", c.Height, c.HeaderProblem)
+				}
+				switch {
+				case idx >= 0:
+					if at, err := anchor.ParseTime(aside[idx].At); err != nil || !now.Before(at.Add(t.confirm)) {
+						drop = append(drop, c)
+					}
+				case len(aside) >= anchor.MaxOTSContradictions:
+					drop = append(drop, c)
+				default:
+					aside = append(aside, anchor.OTSContradiction{
+						CalendarURI: c.CalendarURI, Height: c.Height,
+						MerkleRoot: hex.EncodeToString(c.Root[:]), Header: hex.EncodeToString(c.Header),
+						At: anchor.FormatTime(now), Reason: c.HeaderProblem,
+					})
+					modified, changed = true, true
+				}
 			}
 		}
-		if len(bad) == 0 {
+		if len(drop) > 0 {
+			roots, uris = dropClaims(roots, uris, drop)
+			for _, c := range drop {
+				if i := findAside(aside, c.CalendarURI, c.Height, c.Root); i >= 0 {
+					aside = removeAside(aside, i)
+				}
+			}
+			dropped += len(drop)
+			changed = true
+			continue
+		}
+		if !modified {
 			break
 		}
-		if contradiction == "" {
-			contradiction = fmt.Sprintf("the block header at height %d contradicts the claim of a calendar: %s", bad[0].Height, bad[0].HeaderProblem)
-		}
-		roots, uris = dropClaims(roots, uris, bad)
-		dropped, changed = true, true
 	}
 	check.summarise()
 	pendingLeft := t.hasLookups(roots)
 	next := now.Add(FirstCheck)
+	counts := func(rc anchor.Receipt) anchor.Receipt {
+		rc.ContradictedClaims, rc.ClaimsAside, rc.ClaimsDropped = contradicted, len(aside), dropped
+		return rc
+	}
 
 	if check.Status == "" {
-		if dropped && !pendingLeft {
-			return r, anchor.Errorf(anchor.ClassConflict, anchor.KindOTS, "upgrade", "claim_contradicted", "%s", contradiction)
+		if dropped > 0 && !pendingLeft && len(aside) == 0 {
+			return r, anchor.Errorf(anchor.ClassConflict, anchor.KindOTS, "upgrade", "claim_contradicted",
+				"%s (%d claims dropped for good after the header source contradicted them again at least %s later)", contradiction, dropped, t.confirm)
 		}
 		if !changed && r.State == anchor.ReceiptSubmitted {
 			out := r
 			if out.NextCheck == nil {
 				out.NextCheck = &next
 			}
-			return out, nil
+			return counts(out), nil
 		}
 		// a claimed receipt with no plausible claim left is submitted again
-		raw, err := t.encode(ev, roots, uris, nil)
+		raw, err := t.encode(ev, roots, uris, nil, aside)
 		if err != nil {
 			return r, err
 		}
-		return anchor.Receipt{State: anchor.ReceiptSubmitted, Evidence: raw, NextCheck: &next}, nil
+		return counts(anchor.Receipt{State: anchor.ReceiptSubmitted, Evidence: raw, NextCheck: &next}), nil
 	}
 
 	best := check.Claims[check.Best]
@@ -292,13 +393,13 @@ func (t *Target) Upgrade(ctx context.Context, r anchor.Receipt) (anchor.Receipt,
 	if check.Status == anchor.BitcoinHeaderChecked {
 		sum.Header = hex.EncodeToString(best.Header)
 	}
-	raw, err := t.encode(ev, roots, uris, sum)
+	raw, err := t.encode(ev, roots, uris, sum, aside)
 	if err != nil {
 		return r, err
 	}
 	if check.Status == anchor.BitcoinHeaderChecked {
 		et := best.HeaderTime.UTC()
-		return anchor.Receipt{State: anchor.ReceiptAnchored, Evidence: raw, EvidenceTime: &et}, nil
+		return counts(anchor.Receipt{State: anchor.ReceiptAnchored, Evidence: raw, EvidenceTime: &et}), nil
 	}
 	if r.State == anchor.ReceiptClaimed && lookupErr != nil && !changed {
 		// nothing could be asked and nothing changed: the claim stands, the
@@ -309,11 +410,21 @@ func (t *Target) Upgrade(ctx context.Context, r anchor.Receipt) (anchor.Receipt,
 	if (t.headers != nil && unavailable) || pendingLeft {
 		rc.NextCheck = &next
 	}
-	return rc, nil
+	return counts(rc), nil
+}
+
+// asideKey names a claim for the counts of one call.
+func asideKey(uri string, height uint64, root [32]byte) string {
+	return uri + "|" + strconv.FormatUint(height, 10) + "|" + hex.EncodeToString(root[:])
+}
+
+func removeAside(aside []anchor.OTSContradiction, i int) []anchor.OTSContradiction {
+	out := append([]anchor.OTSContradiction(nil), aside[:i]...)
+	return append(out, aside[i+1:]...)
 }
 
 // encode serialises the fragments and the summary into evidence.
-func (t *Target) encode(ev anchor.OTSEvidence, roots []*Node, uris []string, sum *anchor.OTSBitcoin) (json.RawMessage, error) {
+func (t *Target) encode(ev anchor.OTSEvidence, roots []*Node, uris []string, sum *anchor.OTSBitcoin, aside []anchor.OTSContradiction) (json.RawMessage, error) {
 	cals := make([]anchor.OTSCalendar, 0, len(roots))
 	for i, root := range roots {
 		b, err := root.Serialize()
@@ -324,6 +435,7 @@ func (t *Target) encode(ev anchor.OTSEvidence, roots []*Node, uris []string, sum
 	}
 	ev.Calendars = cals
 	ev.Bitcoin = sum
+	ev.Contradicted = append([]anchor.OTSContradiction{}, aside...)
 	raw, err := anchor.EncodeEvidence(ev)
 	if err != nil {
 		return nil, anchor.Errorf(anchor.ClassPermanent, anchor.KindOTS, "upgrade", "evidence", "cannot encode the evidence")
@@ -419,19 +531,29 @@ func (t *Target) lookups(ctx context.Context, roots []*Node, uris []string, subm
 			continue
 		}
 		before := roots[l.owner].Clone()
+		beforeBytes, _ := before.Serialize()
 		if err := l.ref.node.Merge(pruned); err != nil {
 			roots[l.owner], badOwner[l.owner] = before, true
 			failures = append(failures, anchor.Errorf(anchor.ClassPermanent, anchor.KindOTS, "upgrade", "merge", "cannot merge the answer of calendar %s: %s", hostOf(l.base), shortErr(err)))
 			continue
 		}
-		removePending(l.ref.node, l.ref.att)
-		if b, err := roots[l.owner].Serialize(); err != nil || len(b) > t.fragLimit {
+		if t.headers == nil {
+			// without a header source nothing can contradict the claim: the
+			// calendar has answered; with one, the pending attestation stays, so
+			// that the calendar can be asked again if a header contradicts the
+			// claim (see Upgrade)
+			removePending(l.ref.node, l.ref.att)
+		}
+		b, err := roots[l.owner].Serialize()
+		if err != nil || len(b) > t.fragLimit {
 			roots[l.owner], badOwner[l.owner] = before, true
 			failures = append(failures, anchor.Errorf(anchor.ClassPermanent, anchor.KindOTS, "upgrade", "fragment",
 				"the fragment of calendar %s would be larger than %d bytes: its answer is dropped", hostOf(l.base), MaxFragment))
 			continue
 		}
-		changed = true
+		if !bytes.Equal(b, beforeBytes) {
+			changed = true
+		}
 	}
 	return changed, ok, failures
 }

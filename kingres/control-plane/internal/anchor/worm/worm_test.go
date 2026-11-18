@@ -182,7 +182,13 @@ func TestSubmitIdempotent(t *testing.T) {
 	rc1, ev1 := mustSubmit(t, tg, p)
 	rc2, ev2 := mustSubmit(t, tg, p)
 	noSigErrors(t, f)
-	if ev1 != ev2 || string(rc1.Evidence) != string(rc2.Evidence) {
+	// the second call finds the version: the evidence is the same but for the
+	// member that says so (A3-08)
+	if ev1.Found || !ev2.Found {
+		t.Fatalf("found: %v then %v", ev1.Found, ev2.Found)
+	}
+	ev2.Found = false
+	if ev1 != ev2 || rc1.State != rc2.State {
 		t.Fatalf("evidence differs:\n%s\n%s", rc1.Evidence, rc2.Evidence)
 	}
 	if n := len(f.stored(ev1.Key)); n != 1 {

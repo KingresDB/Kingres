@@ -17,25 +17,25 @@ import (
 )
 
 // sizedNote returns a well-formed signed note of exactly total bytes (total
-// at least 100): the head, then signature lines of at most 999 bytes.
+// at least 100): the head, then signature lines of at most 999 bytes. The
+// lines differ in their key id (the verifier refuses two lines with the same
+// name and key id), and every one decodes to at least the 4 bytes of a key id.
 func sizedNote(total int) []byte {
 	b := note("1", root32(), "")
-	b = append(b, []byte("\xe2\x80\x94 n " + strings.Repeat("A", 992) + "\n")[:0]...)
-	for rest := total - len(b); rest > 0; {
-		var l int
-		switch {
-		case rest >= 999+11:
+	for i, rest := 0, total-len(b); rest > 0; i++ {
+		l := rest
+		if rest >= 999+15 {
 			l = 999
-		default:
-			l = rest
 		}
-		// line = em dash (3) + space + name + space + base64 (4k) + newline
-		k := 1
+		// line = em dash (3) + space + name + space + base64 (4k) + newline;
+		// k = 248 for the long line, else 2 (8 digits: 6 bytes)
+		k := 2
 		if l == 999 {
 			k = 248
 		}
 		nameLen := l - 3 - 1 - 1 - 4*k - 1
-		b = append(b, []byte("\xe2\x80\x94 "+strings.Repeat("n", nameLen)+" "+strings.Repeat("A", 4*k)+"\n")...)
+		id := base64.StdEncoding.EncodeToString([]byte{0, 0, 0, byte(i), 0, 0})
+		b = append(b, []byte("\xe2\x80\x94 "+strings.Repeat("n", nameLen)+" "+id+strings.Repeat("A", 4*k-len(id))+"\n")...)
 		rest -= l
 	}
 	return b
@@ -76,8 +76,8 @@ func TestPayloadLimitsOfTheVerifier(t *testing.T) {
 	ok("size 2^62-1", sized("4611686018427387903"))
 	refused("size 2^62", sized("4611686018427387904"))
 	// signature lines: 32 pass, 33 do not
-	ok("32 signature lines", note("1", root32(), strings.Repeat(sigLine, 32)))
-	refused("33 signature lines", note("1", root32(), strings.Repeat(sigLine, 33)))
+	ok("32 signature lines", note("1", root32(), distinctSigs(32)))
+	refused("33 signature lines", note("1", root32(), distinctSigs(33)))
 	// line length: 1024 bytes pass, 1025 do not (a signature line)
 	line := func(n int) string { // a signature line of n bytes without the newline
 		k := (n - 8) / 4 // base64 digits come in fours; the name takes up the rest
@@ -97,13 +97,13 @@ func TestPayloadLimitsOfTheVerifier(t *testing.T) {
 		t.Error("a zero first attempt accepted")
 	}
 	p, err := NewPayload("ab", note("1", root32(), sigLine), time.Date(2026, 12, 1, 10, 0, 0, 999, time.FixedZone("x", 3600)))
-	if err != nil || !p.FirstAttempt.Equal(time.Date(2026, 12, 1, 9, 0, 0, 0, time.UTC)) {
-		t.Errorf("first attempt not normalised: %v %v", p.FirstAttempt, err)
+	if err != nil || !p.SubmitStart.Equal(time.Date(2026, 12, 1, 9, 0, 0, 0, time.UTC)) {
+		t.Errorf("first attempt not normalised: %v %v", p.SubmitStart, err)
 	}
 	// Check refuses a payload without it, ParsePayload gives none
 	q, err := ParsePayload("ab", note("1", root32(), sigLine))
-	if err != nil || !q.FirstAttempt.IsZero() || q.Check() == nil {
-		t.Errorf("ParsePayload: %v %v", q.FirstAttempt, err)
+	if err != nil || !q.SubmitStart.IsZero() || q.Check() == nil {
+		t.Errorf("ParsePayload: %v %v", q.SubmitStart, err)
 	}
 }
 
@@ -173,7 +173,7 @@ func constIn(t *testing.T, file, name string) uint64 {
 // A2-04: the constants of this package are those of the verifier, read from
 // its source in the sibling module. The test is skipped when that directory
 // is not there (a test binary run elsewhere).
-func TestPayloadLimitsEqualTheVerifiers(t *testing.T) {
+func TestPayloadLimitsEqualTheVerifiers_SkipsWithoutVerifierSource(t *testing.T) {
 	dir := filepath.Join("..", "..", "..", "verifier", "internal")
 	sn := filepath.Join(dir, "signednote", "signednote.go")
 	cp := filepath.Join(dir, "checkpoint", "checkpoint.go")

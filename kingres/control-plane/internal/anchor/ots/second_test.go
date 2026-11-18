@@ -113,9 +113,10 @@ func TestClaimedRecordKeepsAskingTheOtherCalendars(t *testing.T) {
 	}
 }
 
-// A2-02, with a header source from the start: the false claim is dropped (with
-// the fragment that nothing is left of), the record falls back to submitted
-// while the honest calendar can still deliver, and the honest proof anchors it.
+// A2-02 and A3-03, with a header source from the start: the false claim is kept
+// aside (it stays in its fragment, is not plausible), the record falls back to
+// submitted while the honest calendar can still deliver, and the honest proof
+// anchors it.
 func TestHostileFirstClaimIsDroppedByAHeader(t *testing.T) {
 	s := newTwoCalendars(t)
 	src := s.headers()
@@ -124,11 +125,11 @@ func TestHostileFirstClaimIsDroppedByAHeader(t *testing.T) {
 	if err != nil || r1.State != anchor.ReceiptSubmitted || r1.NextCheck == nil {
 		t.Fatalf("round 1: %+v %v (the record must fall back to submitted, not fail)", r1, err)
 	}
-	if got := calendarsOf(t, r1); len(got) != 1 || got[0] != s.a.url() {
-		t.Fatalf("calendars after the claim was dropped: %v", got)
+	if got := calendarsOf(t, r1); len(got) != 2 {
+		t.Fatalf("calendars after the claim was put aside: %v", got)
 	}
-	if ev, _ := anchor.ParseOTSEvidence(r1.Evidence); ev.Bitcoin != nil {
-		t.Fatalf("the dropped claim is still named: %+v", ev.Bitcoin)
+	if ev, _ := anchor.ParseOTSEvidence(r1.Evidence); ev.Bitcoin != nil || len(ev.Contradicted) != 1 || ev.Contradicted[0].CalendarURI != s.h.url() {
+		t.Fatalf("the claim kept aside is named as the summary, or not listed: %+v", ev)
 	}
 	// the record that held the claim takes the receipt
 	rec := anchor.NewRecord(1, "agg", 1, [32]byte{}, testNow)
@@ -159,7 +160,7 @@ func TestClaimedRecordWithALateHeaderSource(t *testing.T) {
 	}
 	late := upgradeTarget(t, Options{Headers: s.headers(), headerWork: noWorkFn}, s.h.url(), s.a.url())
 	back, err := late.Upgrade(context.Background(), claimed)
-	if err != nil || back.State != anchor.ReceiptSubmitted || len(calendarsOf(t, back)) != 1 {
+	if err != nil || back.State != anchor.ReceiptSubmitted || len(calendarsOf(t, back)) != 2 || back.ClaimsAside != 1 {
 		t.Fatalf("fall back: %+v %v", back, err)
 	}
 	s.honestAnswers()
@@ -168,11 +169,11 @@ func TestClaimedRecordWithALateHeaderSource(t *testing.T) {
 		t.Fatalf("one call: %+v %v", out, err)
 	}
 	ev, _ := anchor.ParseOTSEvidence(out.Evidence)
-	if ev.Bitcoin.CalendarURI != s.a.url() || len(ev.Calendars) != 1 {
+	if ev.Bitcoin.CalendarURI != s.a.url() || len(ev.Calendars) != 2 || len(ev.Contradicted) != 1 {
 		t.Fatalf("%+v %v", ev.Bitcoin, calendarsOf(t, out))
 	}
 	// and a real check of the result by a verifier that has the headers
-	chk, err := checkEvidence(ev, testNow.Add(time.Hour), nil, noWorkFn)
+	chk, err := checkEvidence(ev, testNow.Add(time.Hour), nil, noWorkAt)
 	if err != nil || chk.Status != anchor.BitcoinHeaderChecked {
 		t.Fatalf("%+v %v", chk, err)
 	}

@@ -33,7 +33,7 @@ func TestIndependentVerifierOfStoredEvidence(t *testing.T) {
 	sum := sha256.Sum256(note)
 	ev := fmt.Sprintf(`{"endpoint":"https://s3.example.net","bucket":"anchors","key":"kingres-anchors/ab12/00000000000000000017.note",`+
 		`"version_id":"3HL4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY","etag":"\"0123456789abcdef\"","object_sha256":"%s","content_length":%d,`+
-		`"lock_mode":"COMPLIANCE","retain_until":"2036-12-01T10:00:00Z","last_modified":"2026-12-01T10:00:01Z","recorded_by":"cluster"}`,
+		`"lock_mode":"COMPLIANCE","retain_until":"2036-12-01T10:00:00Z","last_modified":"2026-12-01T10:00:01Z","submit_start":"2026-12-01T10:00:00Z","found":false,"recorded_by":"cluster"}`,
 		hex.EncodeToString(sum[:]), len(note))
 	file := fmt.Sprintf(`{"format":1,"kind":"worm","origin":"kingres.example/agg","size":17,"payload_sha256":"%s","created_at":"2026-12-01T10:00:05Z","evidence":%s}`, p.DigestHex(), ev)
 

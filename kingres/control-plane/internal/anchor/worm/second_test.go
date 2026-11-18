@@ -150,7 +150,7 @@ func TestFirstAttemptInTheFutureIsRetryable(t *testing.T) {
 	defer f.close()
 	tg := newTarget(t, f)
 	_, err := tg.Submit(context.Background(), payloadAt(t, "25", time.Now().Add(time.Hour)))
-	ae := expectErr(t, err, anchor.ClassRetryable, "first_attempt_ahead")
+	ae := expectErr(t, err, anchor.ClassRetryable, "submit_start_ahead")
 	if !strings.Contains(ae.Error(), "clock") || len(f.requests()) != 0 {
 		t.Fatalf("%v, %d requests", ae, len(f.requests()))
 	}
@@ -187,9 +187,12 @@ func TestExistingShortRetentionIsRepaired(t *testing.T) {
 	}{
 		"23-days-of-30":       {30, 23 * 24 * time.Hour, 1},
 		"1-day-asked-1h-left": {1, time.Hour, 1},
-		"just-inside":         {30, 30*24*time.Hour - 4*time.Minute, 0},
-		"just-outside":        {30, 30*24*time.Hour - 6*time.Minute, 1},
-		"longer":              {30, 40 * 24 * time.Hour, 0},
+		// the floor is taken from the store's own time: the Last-Modified plus the
+		// days, less the tolerance of the time (5 minutes) and the retention
+		// tolerance (5 minutes)
+		"just-inside":  {30, 30*24*time.Hour - 9*time.Minute, 0},
+		"just-outside": {30, 30*24*time.Hour - 11*time.Minute, 1},
+		"longer":       {30, 40 * 24 * time.Hour, 0},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newFakeS3()

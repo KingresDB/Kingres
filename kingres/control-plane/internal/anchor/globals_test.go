@@ -31,8 +31,6 @@ var allowedGlobals = map[string]string{
 	"tsa.errDER":                "sentinel error",
 	"tsa.hashByOID":             "table, read only",
 	"worm.errRepairable":        "sentinel error",
-	"ots.TagPending":            "table, read only (an exported array that this code never writes)",
-	"ots.TagBitcoin":            "table, read only (an exported array that this code never writes)",
 	"ots.rmdLeftK":              "table, read only",
 	"ots.rmdLeftR":              "table, read only",
 	"ots.rmdLeftS":              "table, read only",
@@ -46,7 +44,7 @@ var allowedGlobals = map[string]string{
 	"worm._":                    "interface check",
 }
 
-func TestNoPackageLevelState(t *testing.T) {
+func TestNoPackageLevelState_SkipsWithoutSources(t *testing.T) {
 	var found []string
 	for _, pkg := range []string{".", "worm", "tsa", "ots", "sigv4"} {
 		files, err := filepath.Glob(filepath.Join(pkg, "*.go"))

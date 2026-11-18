@@ -60,10 +60,12 @@ type Config struct {
 	// AllowInsecure permits an http:// endpoint (a test store on a private
 	// network). Without it every URL must be https.
 	AllowInsecure bool `json:"allowInsecure"`
-	// MaxSkewSeconds is the tolerance between the store's Last-Modified of a
-	// fresh write and the clock of Submit, both ways (0 means 300; the range
-	// is 1 to 86400). A store whose time is further off is refused (code
-	// "store_time_skew").
+	// MaxSkewSeconds is the tolerance of the store's time: a fresh write must
+	// have a Last-Modified within it of the clock of Submit both ways, and an
+	// existing object one not earlier than the start of the first Submit call
+	// less it (see the package documentation; 0 means 300, the range is 1 to
+	// 86400). A store whose time is further off is refused (code
+	// "store_time_skew" or "store_time_early").
 	MaxSkewSeconds int `json:"maxSkewSeconds"`
 }
 

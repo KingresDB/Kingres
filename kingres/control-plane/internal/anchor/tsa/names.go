@@ -43,7 +43,7 @@ func tsaNameMatches(b []byte, c *x509.Certificate) bool {
 		}
 	case 0x82:
 		for _, n := range c.DNSNames {
-			if strings.EqualFold(n, string(g.content)) {
+			if asciiEqualFold(n, string(g.content)) {
 				return true
 			}
 		}
@@ -143,51 +143,131 @@ func parseName(b []byte) ([][]attr, bool) {
 	return out, true
 }
 
-// decodeString decodes the string types a name attribute may use: UTF8String,
-// PrintableString, IA5String, NumericString, VisibleString, TeletexString
-// (read as Latin-1, as it is used in practice), BMPString and UniversalString.
+// decodeString decodes the string types a name attribute may use, and refuses
+// (false) a value that is not valid in its type, so that a malformed value is
+// compared by its bytes and never by what a lenient reader makes of it:
+// UTF8String (valid UTF-8), PrintableString, IA5String (ASCII), NumericString
+// (digits and space), VisibleString (printable ASCII), TeletexString (only when
+// every byte is ASCII: T.61 is not Latin-1, so a Teletex value with a byte above
+// 0x7f is not decoded and is compared by its bytes), BMPString (UTF-16 big
+// endian, even length, no lone surrogate) and UniversalString (UTF-32 big
+// endian, length a multiple of four, every value a Unicode scalar value).
 func decodeString(t tlv) (string, bool) {
+	c := t.content
+	allBytes := func(ok func(b byte) bool) bool {
+		for _, b := range c {
+			if !ok(b) {
+				return false
+			}
+		}
+		return true
+	}
 	switch t.tag {
 	case 0x0c: // UTF8String
-		if !utf8.Valid(t.content) {
+		if !utf8.Valid(c) {
 			return "", false
 		}
-		return string(t.content), true
-	case 0x13, 0x16, 0x12, 0x1a: // Printable, IA5, Numeric, Visible
-		return string(t.content), true
-	case 0x14: // Teletex as Latin-1
-		r := make([]rune, len(t.content))
-		for i, c := range t.content {
-			r[i] = rune(c)
+		return string(c), true
+	case 0x13: // PrintableString
+		if !allBytes(func(b byte) bool {
+			return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || strings.IndexByte(" '()+,-./:=?", b) >= 0
+		}) {
+			return "", false
 		}
-		return string(r), true
+		return string(c), true
+	case 0x16: // IA5String
+		if !allBytes(func(b byte) bool { return b < 0x80 }) {
+			return "", false
+		}
+		return string(c), true
+	case 0x12: // NumericString
+		if !allBytes(func(b byte) bool { return b >= '0' && b <= '9' || b == ' ' }) {
+			return "", false
+		}
+		return string(c), true
+	case 0x1a: // VisibleString
+		if !allBytes(func(b byte) bool { return b >= 0x20 && b <= 0x7e }) {
+			return "", false
+		}
+		return string(c), true
+	case 0x14: // TeletexString: ASCII only
+		if !allBytes(func(b byte) bool { return b < 0x80 }) {
+			return "", false
+		}
+		return string(c), true
 	case 0x1e: // BMPString, UTF-16 big endian
-		if len(t.content)%2 != 0 {
+		if len(c)%2 != 0 {
 			return "", false
 		}
-		u := make([]uint16, len(t.content)/2)
+		u := make([]uint16, len(c)/2)
 		for i := range u {
-			u[i] = uint16(t.content[2*i])<<8 | uint16(t.content[2*i+1])
+			u[i] = uint16(c[2*i])<<8 | uint16(c[2*i+1])
+		}
+		for i := 0; i < len(u); i++ {
+			switch {
+			case u[i] >= 0xd800 && u[i] < 0xdc00:
+				if i+1 >= len(u) || u[i+1] < 0xdc00 || u[i+1] > 0xdfff {
+					return "", false
+				}
+				i++
+			case u[i] >= 0xdc00 && u[i] <= 0xdfff:
+				return "", false
+			}
 		}
 		return string(utf16.Decode(u)), true
 	case 0x1c: // UniversalString, UTF-32 big endian
-		if len(t.content)%4 != 0 {
+		if len(c)%4 != 0 {
 			return "", false
 		}
-		r := make([]rune, len(t.content)/4)
+		r := make([]rune, len(c)/4)
 		for i := range r {
-			r[i] = rune(uint32(t.content[4*i])<<24 | uint32(t.content[4*i+1])<<16 | uint32(t.content[4*i+2])<<8 | uint32(t.content[4*i+3]))
+			v := uint32(c[4*i])<<24 | uint32(c[4*i+1])<<16 | uint32(c[4*i+2])<<8 | uint32(c[4*i+3])
+			if v > 0x10ffff || (v >= 0xd800 && v <= 0xdfff) {
+				return "", false
+			}
+			r[i] = rune(v)
 		}
 		return string(r), true
 	}
 	return "", false
 }
 
+// foldAttrValue is the comparison form of a string attribute value: ASCII
+// letters in lower case (no other case folding: the Kelvin sign is not a k and
+// the long s is not an s), leading and trailing ASCII spaces removed and inner
+// runs of ASCII spaces made one (no other character is white space here: a
+// no-break space, a tab and an ideographic space stay what they are). A value
+// of only spaces is one space, so that it is not an empty value.
+func foldAttrValue(s string) string {
+	var b strings.Builder
+	space := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == ' ' {
+			space = true
+			continue
+		}
+		if space && b.Len() > 0 {
+			b.WriteByte(' ')
+		}
+		space = false
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		b.WriteByte(c)
+	}
+	if b.Len() == 0 && len(s) > 0 {
+		return " "
+	}
+	return b.String()
+}
+
 // sameAttr compares two attributes the way RFC 5280 section 7.1 describes for
-// names: the same attribute type, and for strings the same decoded value
-// whatever the string type, ignoring case and with white space folded (leading
-// and trailing white space removed, inner runs made one space). Other values
-// are compared as they are encoded.
+// names, with the narrow profile of foldAttrValue: the same attribute type, and
+// for strings valid in their type the same decoded value whatever the string
+// type, ignoring ASCII case and with ASCII white space folded. Every other
+// value (another type of value, or a string that is not valid in its type, or a
+// TeletexString that is not ASCII) is compared as it is encoded.
 func sameAttr(a, b attr) bool {
 	if a.oid != b.oid {
 		return false
@@ -198,8 +278,7 @@ func sameAttr(a, b attr) bool {
 	if !a.isStr {
 		return bytes.Equal(a.raw, b.raw)
 	}
-	fold := func(s string) string { return strings.Join(strings.Fields(s), " ") }
-	return strings.EqualFold(fold(a.text), fold(b.text))
+	return foldAttrValue(a.text) == foldAttrValue(b.text)
 }
 
 // sameName reports whether two encoded distinguished names are the same name:
@@ -230,6 +309,27 @@ func sameName(a, b []byte) bool {
 			if !found {
 				return false
 			}
+		}
+	}
+	return true
+}
+
+// asciiEqualFold reports whether a and b are equal when the ASCII letters are
+// folded (a DNS name is ASCII; no Unicode folding applies).
+func asciiEqualFold(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		x, y := a[i], b[i]
+		if x >= 'A' && x <= 'Z' {
+			x += 'a' - 'A'
+		}
+		if y >= 'A' && y <= 'Z' {
+			y += 'a' - 'A'
+		}
+		if x != y {
+			return false
 		}
 	}
 	return true

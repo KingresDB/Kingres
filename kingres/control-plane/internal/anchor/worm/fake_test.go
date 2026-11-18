@@ -43,6 +43,7 @@ type fakeVersion struct {
 	retain  string
 	lastMod time.Time
 	sum     string
+	attempt string // the user metadata kingres-attempt, as sent
 }
 
 type fakeReq struct {
@@ -94,10 +95,20 @@ type fakeS3 struct {
 	listPage        int // versions per page of a listing (0: all)
 	listCalls       int
 	retentionCalls  int
-	retentionStatus int           // answer PutObjectRetention with this status
-	skew            time.Duration // added to the Last-Modified of new versions
-	headVersion     string        // answer HEAD of a version with this version id
-	listExact       int           // pad a version listing to exactly this many bytes
+	retentionStatus int              // answer PutObjectRetention with this status
+	skew            time.Duration    // added to the Last-Modified of new versions
+	headVersion     string           // answer HEAD of a version with this version id
+	listExact       int              // pad a version listing to exactly this many bytes
+	headFailures    int              // the next HEAD requests of a version answer 500 (counted down)
+	clock           func() time.Time // the store's time source before skew is added (nil: time.Now)
+}
+
+// now is the store's clock: the shared test clock, or the real one, plus skew.
+func (f *fakeS3) now() time.Time {
+	if f.clock != nil {
+		return f.clock().Add(f.skew).UTC().Truncate(time.Second)
+	}
+	return time.Now().Add(f.skew).UTC().Truncate(time.Second)
 }
 
 func newFakeS3() *fakeS3 {
@@ -365,7 +376,7 @@ func (f *fakeS3) addVersion(key string, body []byte, mode string, retain time.Ti
 	defer f.mu.Unlock()
 	h := sha256.Sum256(body)
 	f.nextID++
-	v := &fakeVersion{body: append([]byte(nil), body...), lastMod: time.Now().UTC().Truncate(time.Second),
+	v := &fakeVersion{body: append([]byte(nil), body...), lastMod: f.now(),
 		sum: base64.StdEncoding.EncodeToString(h[:]), id: "v" + strconv.Itoa(f.nextID) + "-" + hex.EncodeToString(h[:4]), mode: mode}
 	if mode != "" {
 		v.retain = retain.UTC().Format("2006-01-02T15:04:05.000Z")
@@ -462,7 +473,7 @@ func (f *fakeS3) put(w http.ResponseWriter, r *http.Request, key string, body []
 		f.errXML(w, 412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold")
 		return
 	}
-	v := &fakeVersion{body: append([]byte(nil), body...), lastMod: time.Now().Add(f.skew).UTC().Truncate(time.Second)}
+	v := &fakeVersion{body: append([]byte(nil), body...), lastMod: f.now(), attempt: r.Header.Get("X-Amz-Meta-Kingres-Attempt")}
 	h := sha256.Sum256(body)
 	v.sum = base64.StdEncoding.EncodeToString(h[:])
 	f.nextID++
@@ -518,6 +529,14 @@ func (f *fakeS3) read(w http.ResponseWriter, r *http.Request, key string) {
 	if r.Method == "HEAD" && f.headStatus != 0 {
 		w.WriteHeader(f.headStatus)
 		return
+	}
+	if r.Method == "HEAD" && f.headFailures > 0 && r.URL.Query().Get("versionId") != "" {
+		f.headFailures--
+		w.WriteHeader(500)
+		return
+	}
+	if v.attempt != "" {
+		w.Header().Set("X-Amz-Meta-Kingres-Attempt", v.attempt)
 	}
 	if r.Method == "GET" && f.getStatus != 0 {
 		f.errXML(w, f.getStatus, "InternalError", "we encountered an internal error")

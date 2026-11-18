@@ -51,7 +51,7 @@ func TestIndependentVerifierOfStoredEvidence(t *testing.T) {
 	merkle = sha(sha(cat(s, m1)))
 	ev := fmt.Sprintf(`{"digest":"%s","submitted_at":"2026-12-01T10:00:00Z","calendars":[`+
 		`{"uri":"https://a.example","fragment_b64":"%s"},{"uri":"https://b.example","fragment_b64":"%s"}],`+
-		`"bitcoin":{"height":960000,"calendar_uri":"https://b.example","merkle_root":"%s","status":"claimed","header":""}}`,
+		`"bitcoin":{"height":960000,"calendar_uri":"https://b.example","merkle_root":"%s","status":"claimed","header":""},"contradicted":[]}`,
 		p.DigestHex(), base64.StdEncoding.EncodeToString(fragA), base64.StdEncoding.EncodeToString(fragB), hex.EncodeToString(merkle))
 	file := fmt.Sprintf(`{"format":1,"kind":"ots","origin":"kingres.example/agg","size":17,"payload_sha256":"%s","created_at":"2026-12-01T10:30:00Z","evidence":%s}`, p.DigestHex(), ev)
 

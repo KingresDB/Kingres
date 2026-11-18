@@ -81,6 +81,7 @@ const (
 	CodeChainNow         = "chain_not_trusted_now"
 	CodeTSAName          = "tsa_name_mismatch"
 	CodeKeyUsage         = "bad_key_usage"
+	CodeSignerPin        = "signer_not_pinned"
 	CodeEvidenceMismatch = "evidence_mismatch"
 )
 
@@ -114,7 +115,23 @@ type Expect struct {
 	Now time.Time
 	// MaxSkew is the tolerance for Now; zero means DefaultMaxSkew.
 	MaxSkew time.Duration
+	// SignerKeySHA256, when not nil (32 bytes), pins the signer: the SHA-256 of
+	// the DER SubjectPublicKeyInfo of the signing certificate (see
+	// SignerKeyHash) must equal it, else the token is refused (code
+	// "signer_not_pinned"). It is what an operator who means one authority says;
+	// without it any authority that chains to the configured roots passes.
+	SignerKeySHA256 []byte
 }
+
+// SignerKeyHash is the pin of a signing certificate: the SHA-256 of the DER
+// encoding of its SubjectPublicKeyInfo (the same value as the "sha256//" pin of
+// HTTP public key pinning, and as
+// `openssl x509 -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256`).
+// The public key is pinned and not the certificate because a time-stamp
+// authority renews its certificate more often than its key; the pin of the
+// certificate itself would have to be changed at every renewal, and a pin that
+// is changed carelessly is no pin.
+func SignerKeyHash(c *x509.Certificate) [32]byte { return sha256.Sum256(c.RawSubjectPublicKeyInfo) }
 
 // TokenInfo is what a verified token says.
 type TokenInfo struct {
@@ -702,6 +719,11 @@ func VerifyToken(tokenDER []byte, e Expect, roots, intermediates *x509.CertPool)
 	signer := findSigner(pt)
 	if signer == nil {
 		return nil, fail(CodeNoSignerCert, "the token carries no certificate named by its SignerInfo")
+	}
+	if e.SignerKeySHA256 != nil {
+		if h := SignerKeyHash(signer); subtle.ConstantTimeCompare(h[:], e.SignerKeySHA256) != 1 {
+			return nil, fail(CodeSignerPin, "the signing certificate is not the one that the configuration pins (the SHA-256 of its public key differs from signerKeySha256)")
+		}
 	}
 	at, aerr := parseSignedAttrs(pt.si.attrsRaw)
 	if aerr != nil {

@@ -25,7 +25,7 @@ claimed    receipt_submitted=submitted receipt_claimed=claimed receipt_anchored=
 anchored   receipt_submitted=- receipt_claimed=- receipt_anchored=- error_wait=- error_fail=- error_conflict=- supersede=- expire=- operator_retry=-
 failed     receipt_submitted=- receipt_claimed=- receipt_anchored=- error_wait=- error_fail=- error_conflict=- supersede=- expire=- operator_retry=pending
 superseded receipt_submitted=- receipt_claimed=- receipt_anchored=- error_wait=- error_fail=- error_conflict=- supersede=- expire=- operator_retry=-
-expired    receipt_submitted=- receipt_claimed=- receipt_anchored=- error_wait=- error_fail=- error_conflict=- supersede=- expire=- operator_retry=-
+expired    receipt_submitted=- receipt_claimed=- receipt_anchored=- error_wait=- error_fail=- error_conflict=- supersede=- expire=- operator_retry=pending
 `
 
 func tableText() string {

@@ -356,18 +356,18 @@ func TestHeaderSourceAnchors(t *testing.T) {
 		t.Fatalf("%+v", ev.Bitcoin)
 	}
 	// the verifier needs nothing else: the header is in the evidence
-	chk, err := checkEvidence(ev, testNow.Add(time.Hour), nil, noWorkFn)
+	chk, err := checkEvidence(ev, testNow.Add(time.Hour), nil, noWorkAt)
 	if err != nil || chk.Status != anchor.BitcoinHeaderChecked || !chk.Claims[chk.Best].HeaderTime.Equal(bt) {
 		t.Fatalf("%+v %v", chk, err)
 	}
 	// and when the verifier supplies its own header, the same result
-	chk, err = checkEvidence(ev, testNow.Add(time.Hour), func(h uint64) ([]byte, bool) { return hdr, h == goodHeight }, noWorkFn)
+	chk, err = checkEvidence(ev, testNow.Add(time.Hour), func(h uint64) ([]byte, bool) { return hdr, h == goodHeight }, noWorkAt)
 	if err != nil || chk.Status != anchor.BitcoinHeaderChecked {
 		t.Fatalf("%+v %v", chk, err)
 	}
 	// a header of the verifier that has another root makes the claim false
 	other := syntheticHeader(sha([]byte("another root")), bt)
-	chk, err = checkEvidence(ev, testNow.Add(time.Hour), func(h uint64) ([]byte, bool) { return other, h == goodHeight }, noWorkFn)
+	chk, err = checkEvidence(ev, testNow.Add(time.Hour), func(h uint64) ([]byte, bool) { return other, h == goodHeight }, noWorkAt)
 	if err == nil && chk.Status == anchor.BitcoinHeaderChecked && chk.Claims[0].HeaderProblem == "" {
 		t.Fatal("a header with another merkle root passed")
 	}
@@ -376,7 +376,7 @@ func TestHeaderSourceAnchors(t *testing.T) {
 	b := *ev.Bitcoin
 	b.Header = hex.EncodeToString(other)
 	bad.Bitcoin = &b
-	if _, err := checkEvidence(bad, testNow.Add(time.Hour), nil, noWorkFn); err == nil {
+	if _, err := checkEvidence(bad, testNow.Add(time.Hour), nil, noWorkAt); err == nil {
 		t.Fatal("evidence with a header that does not hold the root accepted")
 	}
 }
@@ -391,26 +391,36 @@ func TestHeaderSourceRootNotReversed(t *testing.T) {
 	}
 	src := &fakeHeaders{m: map[uint64][]byte{goodHeight: syntheticHeader(rev, testNow.Add(time.Minute))}}
 	out, err := upgradeTarget(t, Options{Headers: src, headerWork: noWorkFn}, cal.url()).Upgrade(context.Background(), rc)
-	if err == nil || !anchor.IsConflict(err) || out.State == anchor.ReceiptAnchored {
-		t.Fatalf("%s %v", out.State, err)
+	// the contradiction is kept aside (correction 90), not final: never anchored,
+	// and not a conflict on one answer
+	if err != nil || out.State != anchor.ReceiptSubmitted || out.ContradictedClaims != 1 || out.ClaimsAside != 1 || out.ClaimsDropped != 0 {
+		t.Fatalf("%+v %v", out, err)
 	}
 }
 
 func TestHeaderSourceFailures(t *testing.T) {
 	cal, rc, root := headerSetup(t)
-	// a header with another root: the claim is false and is dropped; nothing is
-	// left that could deliver, so a calendar lied: an error of class conflict
-	// and the receipt as it was
-	src := &fakeHeaders{m: map[uint64][]byte{goodHeight: syntheticHeader(sha([]byte("x")), testNow.Add(time.Minute))}}
-	_, err := upgradeTarget(t, Options{Headers: src, headerWork: noWorkFn}, cal.url()).Upgrade(context.Background(), rc)
-	if err == nil || !anchor.IsConflict(err) || anchor.CodeOf(err) != "claim_contradicted" {
-		t.Fatalf("false claim: %v", err)
-	}
-	// a block that is older than the digest contradicts the claim too
-	src = &fakeHeaders{m: map[uint64][]byte{goodHeight: syntheticHeader(root, testNow.Add(-BlockTimeSlack-time.Minute))}}
-	_, err = upgradeTarget(t, Options{Headers: src, headerWork: noWorkFn}, cal.url()).Upgrade(context.Background(), rc)
-	if err == nil || !anchor.IsConflict(err) {
-		t.Fatalf("older block: %v", err)
+	// a header with another root contradicts the claim: it is kept aside, the
+	// record falls back to submitted; when the source contradicts it again an
+	// hour later nothing is left that could deliver, so a calendar lied: an error
+	// of class conflict and the receipt as it was
+	for name, hdr := range map[string][]byte{
+		"false claim": syntheticHeader(sha([]byte("x")), testNow.Add(time.Minute)),
+		// a block that is older than the digest contradicts the claim too
+		"older block": syntheticHeader(root, testNow.Add(-BlockTimeSlack-time.Minute)),
+	} {
+		src := &fakeHeaders{m: map[uint64][]byte{goodHeight: hdr}}
+		clk := newTestClock()
+		tg := upgradeTargetClock(t, clk, Options{Headers: src, headerWork: noWorkFn}, nil, cal.url())
+		aside, err := tg.Upgrade(context.Background(), rc)
+		if err != nil || aside.State != anchor.ReceiptSubmitted || aside.ClaimsAside != 1 {
+			t.Fatalf("%s: %+v %v", name, aside, err)
+		}
+		clk.advance(time.Hour)
+		_, err = tg.Upgrade(context.Background(), aside)
+		if err == nil || !anchor.IsConflict(err) || anchor.CodeOf(err) != "claim_contradicted" {
+			t.Fatalf("%s: %v", name, err)
+		}
 	}
 	// a block time in the future (our clock may be wrong) and a header that
 	// fails the work check (the source may be wrong) contradict nothing: the
@@ -449,16 +459,26 @@ func TestHeaderSourceUnavailableThenAvailable(t *testing.T) {
 	src.mu.Lock()
 	src.err, src.m = nil, map[uint64][]byte{goodHeight: syntheticHeader(root, testNow.Add(time.Minute))}
 	src.mu.Unlock()
+	// a target with a header source keeps the pending attestation of a merged
+	// answer, so that a calendar can be asked again: it is asked once more
 	gets := len(cal.asked())
 	out2, err := tg.Upgrade(context.Background(), out)
-	if err != nil || out2.State != anchor.ReceiptAnchored || len(cal.asked()) != gets {
-		t.Fatalf("%+v %v (calendar asked again: %v)", out2, err, len(cal.asked()) != gets)
+	if err != nil || out2.State != anchor.ReceiptAnchored || len(cal.asked()) != gets+1 {
+		t.Fatalf("%+v %v (calendar asked %d more times)", out2, err, len(cal.asked())-gets)
 	}
-	// contradicted
+	// contradicted: kept aside on the first answer, a conflict when the source
+	// contradicts it again an hour later
 	src.mu.Lock()
 	src.m = map[uint64][]byte{goodHeight: syntheticHeader(sha([]byte("x")), testNow.Add(time.Minute))}
 	src.mu.Unlock()
-	_, err = tg.Upgrade(context.Background(), out)
+	clk := newTestClock()
+	tg = upgradeTargetClock(t, clk, Options{Headers: src, headerWork: noWorkFn}, nil, cal.url())
+	aside, err := tg.Upgrade(context.Background(), out)
+	if err != nil || aside.State != anchor.ReceiptSubmitted || aside.ClaimsAside != 1 {
+		t.Fatalf("%+v %v", aside, err)
+	}
+	clk.advance(time.Hour)
+	_, err = tg.Upgrade(context.Background(), aside)
 	if err == nil || !anchor.IsConflict(err) || anchor.CodeOf(err) != "claim_contradicted" {
 		t.Fatalf("%v", err)
 	}
@@ -830,3 +850,7 @@ func TestMagicIsACopy(t *testing.T) {
 		t.Fatal("Magic can be changed by a caller")
 	}
 }
+
+// noWorkAt is noWorkFn for the work check of the internal functions, which also
+// gets the height of the claim.
+func noWorkAt(h []byte, _ uint64) (HeaderResult, error) { return noWorkFn(h) }

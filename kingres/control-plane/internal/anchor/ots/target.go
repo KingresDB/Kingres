@@ -43,6 +43,17 @@ const (
 	MaxHeaderChecks = 8
 	// FirstCheck is the delay before the first upgrade attempt.
 	FirstCheck = 10 * time.Minute
+	// DefaultUpgradeTimeout is the bound of one Upgrade call (Options.UpgradeTimeout):
+	// the worst round (16 fragments of 4 lookups, 8 in parallel, 20 s each, and 8
+	// header requests of 20 s) would take about 5 minutes.
+	DefaultUpgradeTimeout = 5 * time.Minute
+	// DefaultContradictionConfirmMinutes is how long after the first
+	// contradiction of a claim by a header the header source has to contradict
+	// it again before the claim is dropped for good.
+	DefaultContradictionConfirmMinutes = 60
+	// MaxContradictionConfirmMinutes is the largest Config.ContradictionConfirmMinutes
+	// (7 days).
+	MaxContradictionConfirmMinutes = 7 * 24 * 60
 )
 
 // Config is the non-secret configuration of an OpenTimestamps target (6.5).
@@ -58,6 +69,12 @@ type Config struct {
 	UpgradeTimeoutDays int `json:"upgradeTimeoutDays,omitempty"`
 	// AllowInsecure permits http calendars (tests and private networks only).
 	AllowInsecure bool `json:"allowInsecure,omitempty"`
+	// ContradictionConfirmMinutes is how long after a block header first
+	// contradicted a claim of a calendar the header source has to contradict it
+	// again, in a later round, before the claim is dropped for good (until then
+	// it is kept aside and the calendar is asked again). 0 means 60; the range
+	// is 1 to 10080.
+	ContradictionConfirmMinutes int `json:"contradictionConfirmMinutes,omitempty"`
 }
 
 // ParseConfig parses, validates and normalizes a configuration: unknown
@@ -106,6 +123,13 @@ func (c Config) Normalize() (Config, error) {
 	if out.MinCalendars < 1 || out.MinCalendars > len(out.Calendars) {
 		return Config{}, errors.New("ots: configuration: minCalendars must be between 1 and the number of calendars")
 	}
+	out.ContradictionConfirmMinutes = c.ContradictionConfirmMinutes
+	if out.ContradictionConfirmMinutes == 0 {
+		out.ContradictionConfirmMinutes = DefaultContradictionConfirmMinutes
+	}
+	if out.ContradictionConfirmMinutes < 1 || out.ContradictionConfirmMinutes > MaxContradictionConfirmMinutes {
+		return Config{}, fmt.Errorf("ots: configuration: contradictionConfirmMinutes must be between 1 and %d", MaxContradictionConfirmMinutes)
+	}
 	out.UpgradeTimeoutDays = c.UpgradeTimeoutDays
 	if out.UpgradeTimeoutDays == 0 {
 		out.UpgradeTimeoutDays = DefaultUpgradeTimeoutDays
@@ -131,12 +155,21 @@ type Options struct {
 	// and the record is anchored only when the check passes; without it a
 	// claim stays a claim (receipt state "claimed").
 	Headers HeaderSource
+	// UpgradeTimeout bounds one Upgrade call besides the caller's context (0
+	// means DefaultUpgradeTimeout).
+	UpgradeTimeout time.Duration
+	// WorkSlack is how many times easier than the target of the nearest
+	// earlier checkpoint of the table of real headers the target of an accepted
+	// header may be (0 means DefaultWorkSlack, 16): the minimum-work rule of
+	// header_checked, see CheckHeaderAt. A larger value accepts less work; it
+	// exists for a chain whose difficulty has fallen by more than that.
+	WorkSlack uint
 
-	// headerWork replaces the proof-of-work check of a header, and fragmentLimit
-	// the largest stored fragment: only the tests of this package set them (a
-	// header that holds a merkle root made of SHA-256 operations cannot be mined
-	// in a test, and the limits of the other sizes keep a real call from
-	// reaching a fragment past MaxFragment).
+	// headerWork replaces the whole proof-of-work check of a header (floor
+	// included), and fragmentLimit the largest stored fragment: only the tests
+	// of this package set them (the limits of the sizes keep a real call from
+	// reaching a fragment past MaxFragment, and a header of the present era
+	// cannot be mined in a test).
 	headerWork    func([]byte) (HeaderResult, error)
 	fragmentLimit int
 }
@@ -149,10 +182,13 @@ type Target struct {
 	now     anchor.Clock
 	rand    io.Reader
 	headers HeaderSource
-	// work is the proof-of-work check of a header (CheckHeader), fragLimit the
-	// largest stored fragment (MaxFragment); see Options.
-	work      func([]byte) (HeaderResult, error)
-	fragLimit int
+	// work is the proof-of-work check of a header for the height of the claim
+	// (CheckHeaderAt), fragLimit the largest stored fragment (MaxFragment);
+	// see Options.
+	work           func([]byte, uint64) (HeaderResult, error)
+	fragLimit      int
+	upgradeTimeout time.Duration
+	confirm        time.Duration
 }
 
 var _ anchor.Target = (*Target)(nil)
@@ -171,15 +207,26 @@ func New(cfg Config, opt Options) (*Target, error) {
 	if rd == nil {
 		rd = rand.Reader
 	}
-	work := opt.headerWork
-	if work == nil {
-		work = CheckHeader
+	slack := opt.WorkSlack
+	if slack == 0 {
+		slack = DefaultWorkSlack
+	}
+	work := func(h []byte, height uint64) (HeaderResult, error) {
+		return CheckHeaderFloor(h, MaxTargetAt(height, slack))
+	}
+	if hw := opt.headerWork; hw != nil {
+		work = func(h []byte, _ uint64) (HeaderResult, error) { return hw(h) }
+	}
+	ut := opt.UpgradeTimeout
+	if ut <= 0 {
+		ut = DefaultUpgradeTimeout
 	}
 	limit := opt.fragmentLimit
 	if limit <= 0 {
 		limit = MaxFragment
 	}
-	return &Target{cfg: n, cal: NewCalendarClient(opt.Client, opt.UserAgent, now), now: now, rand: rd, headers: opt.Headers, work: work, fragLimit: limit}, nil
+	return &Target{cfg: n, cal: NewCalendarClient(opt.Client, opt.UserAgent, now), now: now, rand: rd, headers: opt.Headers, work: work, fragLimit: limit,
+		upgradeTimeout: ut, confirm: time.Duration(n.ContradictionConfirmMinutes) * time.Minute}, nil
 }
 
 // Config returns the normalized configuration.

@@ -43,7 +43,7 @@ func TestNewPayload(t *testing.T) {
 		t.Fatal("hex")
 	}
 	// two signature lines are fine
-	if _, err := NewPayload("ab", note("1", root32(), sigLine+sigLine), t0); err != nil {
+	if _, err := NewPayload("ab", note("1", root32(), distinctSigs(2)), t0); err != nil {
 		t.Fatal(err)
 	}
 	// the payload does not alias the input
@@ -65,7 +65,6 @@ func TestNewPayloadRejects(t *testing.T) {
 		"sign":            note("+1", r, sigLine),
 		"huge-size":       note("18446744073709551616", r, sigLine),
 		"short-root":      note("1", r[:31], sigLine),
-		"extension-line":  []byte("o\n1\n" + base64.StdEncoding.EncodeToString(r) + "\nextra\n\n" + sigLine),
 		"two-lines":       []byte("o\n1\n\n" + sigLine),
 		"empty-origin":    []byte("\n1\n" + base64.StdEncoding.EncodeToString(r) + "\n\n" + sigLine),
 		"space-in-origin": []byte("o r\n1\n" + base64.StdEncoding.EncodeToString(r) + "\n\n" + sigLine),
@@ -170,8 +169,11 @@ func TestExpiryAndRetry(t *testing.T) {
 	if _, did := p.ExpireIfDue(t0.Add(1000*time.Hour), time.Hour, time.Hour); did {
 		t.Fatal("pending expired")
 	}
-	if _, err := e.Retry(t0); err == nil {
-		t.Fatal("expired retried")
+	// an expired record is retried like a failed one (correction 88), and its
+	// waiting period starts again: CreatedAt is the time of the Retry
+	re, err := e.Retry(t0.Add(30 * 24 * time.Hour))
+	if err != nil || re.State != StatePending || !re.CreatedAt.Equal(t0.Add(30*24*time.Hour)) || !re.Due(t0.Add(30*24*time.Hour)) {
+		t.Fatalf("expired retried: %+v %v", re, err)
 	}
 	f := p
 	f.State, f.Attempts, f.LastError = StateFailed, 4, "x"
@@ -426,4 +428,14 @@ func TestTestResult(t *testing.T) {
 	if !strings.Contains(string(j), `"status":"failed"`) {
 		t.Fatal(string(j))
 	}
+}
+
+// distinctSigs returns n signature lines that differ in their key id (the
+// verifier refuses two lines with the same name and key id).
+func distinctSigs(n int) string {
+	var sb strings.Builder
+	for i := 0; i < n; i++ {
+		sb.WriteString("\xe2\x80\x94 kingres.example/agg " + base64.StdEncoding.EncodeToString([]byte{0, 0, byte(i >> 8), byte(i)}) + "\n")
+	}
+	return sb.String()
 }
