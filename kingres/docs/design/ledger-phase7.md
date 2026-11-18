@@ -2499,6 +2499,43 @@ build to the corrected rule. The verifier's README has the same list with the re
     with a limit and with a check that the file opened is the file examined. Signing a stored
     checkpoint again takes the keys the caller trusts and adds no line to a note none of whose lines
     verifies.
+95. **WORM: the window that was applied, a generation of the key, later versions (6.3; adds to 89).** A
+    version that a call wrote is accepted only when the read-back returns the metadata of the attempt
+    exactly as it was sent; a store that drops, changes or repeats it is refused (`no_user_metadata`,
+    permanent: the object is written and locked, and the operator uses a store or a gateway that keeps
+    user metadata). The attempt of a found version must be exactly one value in the form the library
+    writes; anything else is an error for that version (`attempt_malformed`), never "absent". The
+    evidence states the window that was applied: `attempt` is the time that was used, or null for a
+    version that had none, whose time is then bounded only by `submit_start`; a caller warns on null.
+    An object that carries its attempt and lies outside its window (a clock fault of the cluster during
+    one call, a put that a proxy carried out late) is refused on every later call, and the text says
+    that neither waiting nor a Retry heals it. The way out for one record is the generation of the key:
+    generation 0 is the key as it was (`<size>.note`), generation n is `<size>.g<n>.note`, the caller
+    keeps it with the record and raises it by one, with a new start, only on an operator's explicit
+    choice after a permanent refusal for time, never by itself, because each generation is one more
+    locked object that claims to be the anchor of that checkpoint; the evidence records it. When the
+    latest version with our bytes fails its checks, the other versions are examined and the first of
+    ours that passes completes the record, so a copy placed after ours by another principal cannot end
+    it. A found version that is older than its own retention period gets its retention extended to now
+    plus the configured days and is verified again.
+96. **OpenTimestamps: what is kept (6.5; adds to 90 and 91).** The pending attestation of a merged
+    claim is kept in every configuration, so that a source of headers that is configured later can
+    still have the calendar asked; without a source no request is made for it. A claim that was dropped
+    for good is remembered in the evidence (calendar, height, root, time; at most 32, the oldest
+    forgotten first), and the same claim answered again is put aside before it enters a fragment. The
+    error of a contradicted claim carries the evidence from before the call; the caller keeps it and
+    passes it on a Retry, which then keeps the proof and the time of the submission. The factor of the
+    work rule is at most 2^20, which never admits difficulty 1 at a height of today; the package
+    reports the height and the block time of the newest entry of its table, the table is extended at
+    each release, and the caller warns when it is old.
+97. **RFC 3161: the pin in stored evidence, and the corpus of notes (6.4, 6.8; adds to 92).** The
+    verifiers of a stored token and of stored evidence take the pin of the signer; the evidence
+    carries the SHA-256 of the signer's public key and is checked against the token; every certificate
+    of a token that matches the signer identifier is tried. The name check can refuse an authority
+    whose certificate has characters outside its declared string type or another normalisation; that
+    refusal is permanent, and the operator uses another authority. The corpus of notes of 92 is held to
+    the real parsers of the verifier by a copy in the verifier module, and a test of the library fails
+    when the two copies differ.
 
 Of section 13: item 2 (test vectors) is settled for signed notes (the example key and note of the
 specification are in the tests; the checkpoint example has no published key), item 3 (entry bundles at
