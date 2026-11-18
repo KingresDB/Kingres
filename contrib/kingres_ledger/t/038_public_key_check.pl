@@ -8,7 +8,10 @@
 # has several encodings, so one point could have several key identifiers.  The
 # registry now accepts only the canonical encoding of a point of the curve that
 # does not have small order (src/ed25519_check.c, 22023 at registration), and
-# ledger_attest refuses such a key again if a row of one exists (KL012).
+# ledger_attest refuses such a key again if a row of one exists (KL012), on every
+# call of a session (L22-03).  The cache of judged keys (L22-02) judges each key
+# once per session for more keys than it used to hold, and holds nothing about
+# a refused key or about revocation.
 #
 # The vectors are the eight points of order 1, 2, 4 and 8 in their canonical
 # encodings, the encodings that name the same points in other ways (y not below
@@ -117,39 +120,145 @@ my $good = new_key($dir, 'good');
 }
 
 #--------------------------------------------------------------------------
-# ledger_attest refuses such a key again: a row that exists already
+# ledger_attest refuses such a key again: a row that exists already.  The
+# refusal is repeated on every call of the session (L22-03): a refused key is
+# never remembered as acceptable, or the forgery would work from the second
+# call on.
 #--------------------------------------------------------------------------
+my $chain = unhex_of(db(q{SELECT encode(chain_id, 'hex') FROM kingres.ledger_chain}));
+my $table_id = db(q{SELECT table_id FROM kingres.ledger_table WHERE relid = 'docs'::regclass});
+my $forged_hash = db(q{SELECT encode(kingres.ledger_row_hash(ROW(1, 'forged')::docs), 'hex')});
+
+# A row that the registry would not have written is put there by hand, by a superuser with the setting.
+sub hand_key
 {
-	# A row that the registry would not have written is put there by hand, by a superuser with the setting.
-	my $pub = '01' . $z31;
+	my ($pub) = @_;
 	my $kid = db(qq{SELECT encode(substr(sha256(decode('$pub', 'hex')), 1, 16), 'hex')});
 	my ($ret, $out, $err) = $node->psql('d', qq{SET kingres_ledger.allow_manual_write = on;
 		INSERT INTO kingres.ledger_client_key (key_id, algorithm, public_key, role_name, label, registered_by, registered_at)
 		VALUES (decode('$kid', 'hex'), 'ed25519', decode('$pub', 'hex'), NULL, 'by hand', current_user, now())});
-	is($ret, 0, 'a row for the identity key is put in by hand') or diag($err);
+	is($ret, 0, "a row for the key $pub is put in by hand") or diag($err);
+	return $kid;
+}
 
-	my $chain = unhex_of(db(q{SELECT encode(chain_id, 'hex') FROM kingres.ledger_chain}));
-	my $table_id = db(q{SELECT table_id FROM kingres.ledger_table WHERE relid = 'docs'::regclass});
-	my $hash = db(q{SELECT encode(kingres.ledger_row_hash(ROW(1, 'forged')::docs), 'hex')});
-	my $nonce = random_nonce();
-	# R = the identity point, S = 0: valid for every message under the identity key
-	my $sig = '01' . ('00' x 63);
-	my $app;
+sub attest_stmt
+{
+	my ($hash, $kid, $sig_hex) = @_;
+	return sprintf(q{SELECT kingres.ledger_attest('docs'::regclass, decode('%s', 'hex'), 'I', decode('%s', 'hex'), decode('%s', 'hex'), decode('%s', 'hex'))},
+		$hash, $kid, hex_of(random_nonce()), $sig_hex);
+}
+
+sub app_session
+{
+	my ($verbosity) = @_;
+	local $ENV{PGUSER} = 'app';
+	my $s = $node->background_psql('d', on_error_stop => 0);
+	$s->query_safe("\\set VERBOSITY $verbosity");
+	return $s;
+}
+
+# The state of the error of one statement.
+sub state_of
+{
+	my ($s, $sql) = @_;
+	$s->{stderr} = '';
+	$s->query($sql);
+	my ($state) = $s->{stderr} =~ /ERROR:\s+(\S+)/;
+	$s->{stderr} = '';
+	return $state // '';
+}
+
+foreach my $case (
+	[ 'the identity key', '01' . $z31, '01' . ('00' x 63) ],	# R = the identity point, S = 0: valid for every message under that key
+	[ 'the all-zero key', '00' x 32, '00' x 64 ])
+{
+	my ($label, $pub, $sig) = @$case;
+	my $kid = hand_key($pub);
+	my $app = app_session('sqlstate');
+
+	# two transactions
+	foreach my $n (1, 2)
 	{
-		local $ENV{PGUSER} = 'app';
-		$app = $node->background_psql('d', on_error_stop => 0);
+		$app->query_safe('BEGIN');
+		$app->query_safe(q{INSERT INTO docs VALUES (1, 'forged')});
+		is(state_of($app, attest_stmt($forged_hash, $kid, $sig)), 'KL012',
+			"$label: ledger_attest is refused (KL012) in transaction $n of the session, not KL013 and not an acceptance");
+		$app->query_safe('ROLLBACK');
 	}
-	$app->query_safe(q{\set VERBOSITY sqlstate});
+	# two savepoints of one transaction
 	$app->query_safe('BEGIN');
 	$app->query_safe(q{INSERT INTO docs VALUES (1, 'forged')});
-	$app->{stderr} = '';
-	$app->query(sprintf(q{SELECT kingres.ledger_attest('docs'::regclass, decode('%s', 'hex'), 'I', decode('%s', 'hex'), decode('%s', 'hex'), decode('%s', 'hex'))},
-			$hash, $kid, hex_of($nonce), $sig));
-	like($app->{stderr}, qr/ERROR:\s+KL012/, 'ledger_attest refuses the forged attestation under the identity key (KL012), not KL013 and not an acceptance');
-	$app->{stderr} = '';
+	foreach my $n (1, 2, 3)
+	{
+		$app->query_safe("SAVEPOINT s$n");
+		is(state_of($app, attest_stmt($forged_hash, $kid, $sig)), 'KL012',
+			"$label: and in savepoint $n of one transaction");
+		$app->query_safe("ROLLBACK TO s$n");
+	}
 	$app->query_safe('ROLLBACK');
 	$app->quit;
-	is(db(q{SELECT count(*) FROM kingres.ledger_attestation}), '0', 'no attestation was written');
+}
+is(db(q{SELECT count(*) FROM kingres.ledger_attestation}), '0', 'no attestation was written by any of the calls');
+
+#--------------------------------------------------------------------------
+# The judgment of a key is paid once per key and session (L22-02): twelve keys,
+# more than the eight that an earlier cache held, are used in rotation by one
+# session.  The server writes a DEBUG1 message for each judgment that the cache
+# does not answer, with the count of the session; the test counts them, so the
+# verdict does not depend on the speed of the machine.
+#--------------------------------------------------------------------------
+{
+	my @keys = map { new_key($dir, "rot$_") } (1 .. 12);
+	foreach my $k (@keys)
+	{
+		db(sprintf(q{SELECT kingres.ledger_client_key_register(decode('%s', 'hex'), NULL, 'rotation')}, hex_of($k->{pub})));
+	}
+	my $bad_sig = '00' x 64;		# ends in KL013 after the key check: no entry is made
+	my $app = app_session('verbose');
+	$app->query('SET client_min_messages = debug1');
+	$app->query('BEGIN');
+	$app->query(q{INSERT INTO docs VALUES (1, 'forged')});
+	$app->{stderr} = '';
+	my $calls = 0;
+	foreach my $round (1 .. 3)
+	{
+		foreach my $k (@keys)
+		{
+			$app->query('SAVEPOINT r');
+			$app->query(attest_stmt($forged_hash, hex_of($k->{key_id}), $bad_sig));
+			$app->query('ROLLBACK TO r');
+			$calls++;
+		}
+	}
+	my @judged = $app->{stderr} =~ /public key judged \(judgment (\d+) of this session\)/g;
+	my $errors = () = $app->{stderr} =~ /ERROR:\s+KL013/g;
+	is($errors, $calls, "ledger_attest ran the key check and the signature check $calls times (KL013 each time)");
+	is(scalar(@judged), 12, 'twelve keys in rotation, three rounds: twelve judgments in the session, not one per call');
+	is(join(',', @judged), join(',', 1 .. 12), 'and they are the first twelve of the session');
+
+	# a refused key is judged again on every call
+	my $kid = db(q{SELECT encode(key_id, 'hex') FROM kingres.ledger_client_key WHERE label = 'by hand' ORDER BY registered_at LIMIT 1});
+	$app->{stderr} = '';
+	foreach my $n (1, 2)
+	{
+		$app->query('SAVEPOINT r');
+		$app->query(attest_stmt($forged_hash, $kid, '01' . ('00' x 63)));
+		$app->query('ROLLBACK TO r');
+	}
+	@judged = $app->{stderr} =~ /public key judged \(judgment (\d+) of this session\)/g;
+	is(join(',', @judged), '13,14', 'a refused key is judged on every call of the session');
+	like($app->{stderr}, qr/KL012/, 'and refused each time');
+
+	# the cache holds nothing about revocation: a key that is revoked is refused at once
+	db(sprintf(q{SELECT kingres.ledger_client_key_revoke(decode('%s', 'hex'), 'lost')}, hex_of($keys[0]->{key_id})));
+	$app->{stderr} = '';
+	$app->query('SAVEPOINT r');
+	$app->query(attest_stmt($forged_hash, hex_of($keys[0]->{key_id}), $bad_sig));
+	$app->query('ROLLBACK TO r');
+	like($app->{stderr}, qr/this client key is revoked/, 'a key that was judged acceptable and is revoked afterwards is refused by the table, not by the cache');
+	unlike($app->{stderr}, qr/public key judged/, '  without a new judgment (the cache answered the judgment of the key, not its revocation)');
+	$app->query('ROLLBACK');
+	$app->quit;
 }
 
 done_testing();

@@ -182,9 +182,9 @@ Tests: nineteen pg_regress tests and thirty-four TAP tests under `t/`.
 | `033_attest_concurrency` | the same key and nonce in two overlapping transactions (the second waits, then `KL014` or success), a key revoked while a `REPEATABLE READ` transaction with an older snapshot is open, the same key registered by two sessions, four writers attesting every row of a table with the policy `required` while the builder runs |
 | `034_internal_tables` | the three tables as ledger tables (the first step of part B): a database that holds none in use drops the extension as before and one with a registered key does not, directly or through a dependency; 15 statements of every kind against each table by a member of the owner role, of `pg_write_all_data`, of `pg_maintain` and a plain role, and by the superuser; the statement the script runs for `ledger_register_internal` refused outside it; a write by hand and its record; the script of another extension, the table synchronisation worker and the apply worker of logical replication refused |
 | `035_no_openssl` | the extension built with `-DKL_NO_OPENSSL` by PGXS and loaded in place of the real one: `ledger_attest` raises `0A000`, the registry, the message, the policy and `ledger_verify` work (skipped without PGXS or make) |
-| `036_policy_switch` | L21-02, L21-03, L21-04: the switch to `required` ordered with the writers of the table, each sequence in `READ COMMITTED`, `REPEATABLE READ` and `SERIALIZABLE` and ending in `KL010` or in an attested commit: a writer that wrote before the switch (the switch waits, a later writer waits behind it), a snapshot older than the switch, a writer that begins while the switch is open, a reader that cached the identity of the table, a deferred trigger at `COMMIT`, a writer with an old transaction id; a transaction with a higher id that committed before the switch (no finding of `ledger_verify`); the switching transaction's own earlier writes, in savepoints too; a prepared writer and a prepared switch; the wait and the hold of a role that is not a superuser (bounded, own statement); the order of the locks. Waits are known by `pg_stat_activity`, never by a sleep |
+| `036_policy_switch` | L21-02, L21-03, L21-04: the switch to `required` ordered with the writers of the table, each sequence in `READ COMMITTED`, `REPEATABLE READ` and `SERIALIZABLE` and ending in `KL010` or in an attested commit: a writer that wrote before the switch (the switch waits, a later writer waits behind it), a snapshot older than the switch, a writer that begins while the switch is open, a reader that cached the identity of the table, a deferred trigger at `COMMIT`, a writer with an old transaction id; a transaction with a higher id that committed before the switch (no finding of `ledger_verify`); the switching transaction's own earlier writes, in savepoints too; a prepared writer and a prepared switch; the wait and the hold of a role that is not a superuser (bounded, own statement); the order of the locks; L22-01: a first write in a subtransaction that was rolled back (savepoint, nested savepoints, an `EXCEPTION` block, an `UPDATE` of an updatable table) before the switch, and a second write after it (`KL010`, in the three isolation levels); L22-04: the date the switch wrote itself, seen by the real `ledger_verify()` (one finding for a later unattested entry, none for the transaction at the date); L22-05: the error and hint of a switch ended by `lock_timeout`. Waits are known by `pg_stat_activity`, never by a sleep |
 | `037_attest_savepoints` | L21-05: every placement of one entry and its attestation over two nested subtransactions and every way of closing them, as savepoints and as `EXCEPTION` blocks, against a model written in the test (the reviewer's mutant that does not pass the attestation to the parent at a subtransaction commit dies here) |
-| `038_public_key_check` | L21-01: the eight small-order points, their other encodings, values that are not on the curve (`22023` at registration), a good key accepted with one identifier, and `ledger_attest` refusing a small-order key that a row holds already (`KL012`) |
+| `038_public_key_check` | L21-01: the eight small-order points, their other encodings, values that are not on the curve (`22023` at registration), a good key accepted with one identifier, and `ledger_attest` refusing a small-order key that a row holds already (`KL012`), on every call of the session (two transactions, three savepoints, the identity key and the all-zero key; L22-03); L22-02: twelve keys in rotation in one session are judged twelve times (the server writes a `DEBUG1` message per judgment, the test counts them), a refused key on every call, and a revoked key is refused by the table though the cache has judged it |
 | `039_signature_paths` | `COPY` into a `required` table (`KL010` unattested, committed attested), partitioned tables (a ledger table cannot be one), and logical replication apply into a `required` table (the subscriber cannot hold it: `KL010`, no row, no entry) next to one with the policy optional that is fed |
 
 The regress tests need `shared_preload_libraries = 'kingres_ledger'` (the
@@ -1226,7 +1226,25 @@ entries when the switch runs, and follow the subtransaction that made the switch
 (rolled back with it, passed to the parent with it). A transaction that enables a
 table that already has rows and switches it in the same transaction owes an
 attestation for every row it entered (`ledger_enable` enters them as entries): switch
-in a later transaction.
+in a later transaction. The function does not refuse that case early: it cannot tell
+the entries of `ledger_enable` from the entries of ordinary writes of the same
+transaction, which are owed an attestation by design, so a refusal could only be
+approximate, and the failure that remains is safe (the transaction fails at `COMMIT` with
+`KL010`, nothing is committed, and the next attempt, in a transaction of its own, works).
+The cost of that failure is the work of `ledger_enable` for the rows, done and rolled
+back; for a table with many rows enable it in one transaction and switch it in the next.
+
+**The date is a transaction id of this cluster (L22-06).** `signature_required_from`,
+like `ledger_txid` of the entries, is a full transaction id of the cluster that made
+it. After `pg_upgrade` (the ids are kept) nothing changes. After a dump and restore
+into a new cluster the ids start low again while the restored registry keeps the old
+date, so the check of `ledger_verify` for entries above the date finds nothing until
+the new cluster's ids pass the date; the check at commit does not use the date and is
+not affected, so the writers of the new cluster are held to the policy from the first
+transaction. An operator who restores a table with the policy `required` into a new
+cluster should treat the unattested-entry check of `ledger_verify` as blind to the
+restored entries and to the first ones written after the restore, and keep the
+attestations with the entries they belong to (they are restored with them).
 
 **The lock and the rules of the guard.** A role that is not a superuser calls the
 function as a statement of its own (`25001` in a transaction block, a savepoint or an
@@ -1245,6 +1263,25 @@ table that the transaction holds already (a superuser that enabled it in the sam
 transaction) is not waited for. Two switches of one table wait for each other, and the
 second finds the policy set. A role that owns many tables switches them one statement
 at a time.
+
+**A switch that waits (L22-05).** The call by a superuser waits with no bound for every
+open writer of the table (a batch of an hour is an hour), and every later writer of the
+table queues behind the call, so one call can stop all writes to the table until the
+batch ends or the call is cancelled. The recipe for the operator:
+
+1. Set a `lock_timeout` for the call, in the session that makes it
+   (`SET lock_timeout = '10s'; SELECT kingres.ledger_set_signature_policy('t', 'required');`).
+   When it ends the wait, the call fails with `55P03` ("its writers did not finish in
+   time"), switches nothing, and the hint names the next step; the same error, with the
+   same hint, ends the wait of a role that is not a superuser whose own `lock_timeout` is
+   shorter than the limit.
+2. Find the transactions that hold the table: while the call waits, run
+   `SELECT pid, pg_blocking_pids(pid) FROM pg_stat_activity WHERE query LIKE '%ledger_set_signature_policy%'`
+   (the pids that it lists are the open writers; `pg_locks` shows the table).
+3. Wait for those transactions, or end them (`pg_cancel_backend`, `pg_terminate_backend`),
+   and call again. A call that is still waiting can be cancelled by its own session or
+   with `pg_cancel_backend(pid)` for the pid of the call: it switches nothing, and the
+   writers that queued behind it go on.
 
 **Parallel workers, callbacks.** A parallel worker cannot write a table. The check at
 commit is a transaction callback that runs after the deferred triggers; a callback of
@@ -1364,8 +1401,12 @@ off`, and from about 3.1 to about 3.9 milliseconds with `synchronous_commit = on
 first write of a table in a transaction reads the policy together with the
 identifier with a snapshot of now (one statement, as before, and one call of
 `GetLatestSnapshot` more) and the check of the key at `ledger_attest` is remembered
-per session (the judgment of a key costs about three milliseconds, once per key and
-session). Measured against the version before the switch was ordered with the writers
+per session (the judgment of a key costs about three milliseconds, and a session pays
+it once for each key it uses, for up to 4096 keys: a pooled service session that signs
+for many clients does not pay it again; the memory of the cache is fixed, about 270
+kilobytes, and it holds nothing about revocation, which is read from the table on every
+call; a refused key is judged again every time; `client_min_messages = debug1` shows each
+judgment as a message with the count of the session). Measured against the version before the switch was ordered with the writers
 (`L21-02`), same server build with assertions, `synchronous_commit = off`, `fsync = off`,
 one client, 20000 single-row transactions a run, three runs of each, two rounds: a
 ledger table with the policy optional, 5420 to 5820 transactions a second before and 5470

@@ -30,6 +30,12 @@
 #   G  (L21-03) a transaction with an id above the switching transaction's
 #      commits before the switch: ledger_verify does not report it;
 #   H  (L21-04) the switching transaction's own earlier writes, in savepoints too;
+#   I  (L22-01) the first write was made in a subtransaction that was rolled back
+#      (savepoints, nested savepoints, an EXCEPTION block, an UPDATE of an updatable
+#      table): the cache of the policy must go with the subtransaction;
+#   J  (L22-04) the date the switch wrote itself, seen by the real ledger_verify():
+#      one finding for a later unattested entry, none for the transaction at the date;
+#   and (L22-05) the error and the hint of a switch whose wait ended by lock_timeout;
 #   and: a prepared writer that holds the lock, a prepared switch, the bound on
 #   the wait and on the hold of a role that is not a superuser, the order of the
 #   locks.
@@ -86,11 +92,12 @@ db(sprintf(q{SELECT kingres.ledger_client_key_register(decode('%s', 'hex'), NULL
 my %tid;
 sub new_table
 {
-	my ($name, $owner) = @_;
+	my ($name, $owner, $mode) = @_;
 	$owner //= 'app';
+	my $modearg = $mode ? ", '$mode'" : '';
 	db("CREATE TABLE $name (id int PRIMARY KEY, body text);
 		ALTER TABLE $name OWNER TO $owner;
-		SELECT kingres.ledger_enable('$name')");
+		SELECT kingres.ledger_enable('$name'$modearg)");
 	$tid{$name} = db("SELECT table_id FROM kingres.ledger_table WHERE relid = '$name'::regclass");
 	return $name;
 }
@@ -100,13 +107,23 @@ sub policy_of
 	return db("SELECT signature_policy FROM kingres.ledger_table WHERE relid = '$_[0]'::regclass");
 }
 
-# Entries of the table that ledger_verify asks an attestation of (after the date of the switch) and that have none.
+# A change of the registry that only someone with the catalog can make (as in t/032): the blocking
+# trigger is switched off (pg_trigger), the statement runs under the setting of a superuser, the
+# trigger is on again.
+sub registry_by_hand
+{
+	my ($sql) = @_;
+	db(q{UPDATE pg_trigger SET tgenabled = 'D' WHERE tgrelid = 'kingres.ledger_table'::regclass AND tgname = 'kingres_ledger_block_modify'});
+	db("SET kingres_ledger.allow_manual_write = on; $sql");
+	db(q{UPDATE pg_trigger SET tgenabled = 'A' WHERE tgrelid = 'kingres.ledger_table'::regclass AND tgname = 'kingres_ledger_block_modify'});
+}
+
+# The findings 'unattested_entry' of the real ledger_verify() for the table: the entries after the
+# date of the switch that have no attestation.
 sub unattested
 {
-	return db(qq{SELECT count(*) FROM kingres.ledger_entry e JOIN kingres.ledger_table t USING (table_id)
-		WHERE t.relid = '$_[0]'::regclass AND t.signature_policy = 'required'
-		AND e.ledger_txid > t.signature_required_from
-		AND NOT EXISTS (SELECT 1 FROM kingres.ledger_attestation a WHERE a.ledger_txid = e.ledger_txid AND a.seq = e.seq)});
+	return db(qq{SELECT count(*) FROM kingres.ledger_verify()
+		WHERE check_name = 'unattested_entry' AND detail LIKE 'the entry of ledger table_id $tid{$_[0]} %'});
 }
 
 sub session_as
@@ -318,6 +335,54 @@ foreach my $iso (@levels)
 		is(failure_of($w, 'COMMIT'), 'KL010', "[$iso F] a writer with an old transaction id is asked for an attestation at COMMIT");
 		$w->quit;
 	}
+
+	#----------------------------------------------------------------------
+	# I (L22-01): the first write was made in a subtransaction that was rolled back
+	#
+	# The lock that the write took went with the subtransaction, so the switch does not wait
+	# for the writer; what the writer cached of the table (the policy "optional") must go
+	# with the subtransaction too (capture.c, SUBXACT_EVENT_ABORT_SUB).
+	#----------------------------------------------------------------------
+	{
+		my $n = 0;
+		my $sql = sub { my $s = shift; return sub { my $t = shift; (my $x = $s) =~ s/\@T/$t/g; return $x; }; };
+		my $case = sub {
+			my ($label, $before, $after, $mode) = @_;
+			my $t = new_table("i" . ++$n . "_$tag", 'app', $mode);
+			db("INSERT INTO $t VALUES (1, 'seed')") if $mode;
+			my $w = session_as('app');
+			$w->query_safe("BEGIN ISOLATION LEVEL $iso");
+			$w->query_safe($_->($t)) for @$before;
+			db(switch_sql($t));
+			is(policy_of($t), 'required', "[$iso I] $label: the switch committed without waiting for the writer");
+			$w->query_safe($_->($t)) for @$after;
+			is(failure_of($w, 'COMMIT'), 'KL010', "[$iso I] $label: the second write is not attested: KL010 at COMMIT");
+			is(db("SELECT count(*) FROM $t"), $mode ? '1' : '0', "[$iso I] $label: nothing of the writer was committed");
+			is(unattested($t), '0', "[$iso I] $label: no unattested entry");
+			$w->quit;
+		};
+		my $ins1 = $sql->(q{INSERT INTO @T VALUES (1, 'a')});
+		my $ins2 = $sql->(q{INSERT INTO @T VALUES (2, 'b')});
+		my $upd1 = $sql->(q{UPDATE @T SET body = 'a' WHERE id = 1});
+		my $upd2 = $sql->(q{UPDATE @T SET body = 'b' WHERE id = 1});
+
+		$case->('a write in a savepoint that is rolled back',
+			[ $sql->('SAVEPOINT s'), $ins1, $sql->('ROLLBACK TO s') ], [ $ins2 ]);
+		$case->('nested savepoints rolled back to the outer one',
+			[ $sql->('SAVEPOINT s'), $sql->('SAVEPOINT t'), $ins1, $sql->('ROLLBACK TO s') ], [ $ins2 ]);
+		$case->('the inner savepoint released and the outer one rolled back',
+			[ $sql->('SAVEPOINT s'), $sql->('SAVEPOINT t'), $ins1, $sql->('RELEASE t'), $sql->('ROLLBACK TO s') ], [ $ins2 ]);
+		$case->('an EXCEPTION block that caught an error after the write',
+			[ $sql->(q{DO $do$ BEGIN BEGIN INSERT INTO @T VALUES (1, 'a'); RAISE EXCEPTION 'undo'; EXCEPTION WHEN OTHERS THEN NULL; END; END $do$}) ],
+			[ $ins2 ]);
+		$case->('an UPDATE of an updatable table in a savepoint that is rolled back (the history path)',
+			[ $sql->('SAVEPOINT s'), $upd1, $sql->('ROLLBACK TO s') ], [ $upd2 ], 'updatable');
+		$case->('an UPDATE of an updatable table in nested savepoints rolled back to the outer one',
+			[ $sql->('SAVEPOINT s'), $sql->('SAVEPOINT t'), $upd1, $sql->('ROLLBACK TO s') ], [ $upd2 ], 'updatable');
+		$case->('an UPDATE of an updatable table in an EXCEPTION block that caught an error after it',
+			[ $sql->(q{DO $do$ BEGIN BEGIN UPDATE @T SET body = 'a' WHERE id = 1; RAISE EXCEPTION 'undo'; EXCEPTION WHEN OTHERS THEN NULL; END; END $do$}) ],
+			[ $upd2 ], 'updatable');
+	}
 }
 
 #--------------------------------------------------------------------------
@@ -339,6 +404,40 @@ foreach my $iso (@levels)
 		'[G] ledger_verify does not report an entry that was committed before the switch committed');
 	is(db(q{SELECT count(*) FROM kingres.ledger_verify()}), '0', '[G] and the ledger verifies');
 	$_->quit for ($sw, $w);
+}
+
+#--------------------------------------------------------------------------
+# J (L22-04): the date that the switch itself wrote, seen from above and at the date
+#--------------------------------------------------------------------------
+{
+	# Above: an unattested entry of a later transaction (a superuser bypasses the commit check the
+	# way t/032 does: the policy off for the write, back on with the date that the switch wrote).
+	my $t = new_table('j1');
+	db(switch_sql($t));
+	my $date = db("SELECT signature_required_from FROM kingres.ledger_table WHERE relid = 'j1'::regclass");
+	cmp_ok($date, '>', 0, '[J] the switch wrote a date');
+	registry_by_hand(q{UPDATE kingres.ledger_table SET signature_policy = 'optional', signature_required_from = NULL WHERE relid = 'j1'::regclass});
+	db(q{INSERT INTO j1 VALUES (1, 'unsigned')});
+	registry_by_hand("UPDATE kingres.ledger_table SET signature_policy = 'required', signature_required_from = $date WHERE relid = 'j1'::regclass");
+	cmp_ok(db(q{SELECT max(ledger_txid) FROM kingres.ledger_entry e JOIN kingres.ledger_table t USING (table_id) WHERE t.relid = 'j1'::regclass}),
+		'>', $date, '[J] the entry of the later transaction has an identifier above the date that the switch wrote');
+	db('SELECT kingres.ledger_build_block()');
+	is(unattested($t), '1', '[J] ledger_verify() reports exactly one unattested_entry for it: the date is not later than the first entry that is owed an attestation');
+
+	# At the date: the transaction that committed just before the switch, with an entry that has no
+	# attestation (the policy was not in force), is not asked for one.  Another transaction may
+	# take an identifier between the two statements, so the pair is tried until the entry is at the date.
+	my $hit = 0;
+	foreach my $try (1 .. 6)
+	{
+		my $u = new_table("j2_$try");
+		db("INSERT INTO $u VALUES (1, 'before'); " . switch_sql($u));
+		is(unattested($u), '0', "[J] try $try: the entry that committed before the switch is not reported");
+		$hit++ if db("SELECT count(*) FROM kingres.ledger_entry e JOIN kingres.ledger_table t USING (table_id)
+			WHERE t.relid = '$u'::regclass AND e.ledger_txid = t.signature_required_from") eq '1';
+		last if $hit;
+	}
+	ok($hit, '[J] and the entry of the transaction whose identifier is the date itself was among them (not reported)');
 }
 
 #--------------------------------------------------------------------------
@@ -398,6 +497,14 @@ foreach my $iso (@levels)
 	is(failure_of($sw, q{SET lock_timeout = '1s'; } . switch_sql($t)), '55P03',
 		'[P] the switch waits for a prepared writer (a lock timeout of the caller ends the wait)');
 	is(policy_of($t), 'optional', '[P] and has switched nothing');
+	{
+		# a superuser's own lock_timeout ends the wait: the error says what to do (L22-05)
+		my ($ret, $out, $err) = $node->psql('d', q{SET lock_timeout = '500ms'; } . switch_sql($t), on_error_stop => 0);
+		like($err, qr/could not switch the signature policy of table "p1": its writers did not finish in time/,
+			'[P] the error of a superuser whose lock_timeout ended the wait says that the writers did not finish');
+		like($err, qr/DETAIL:.*lock_timeout of this session \(500 ms\)/s, '[P] the detail names the lock_timeout');
+		like($err, qr/HINT:.*pg_blocking_pids\(pid\)/s, '[P] and the hint says how to find the blocker');
+	}
 	db(q{COMMIT PREPARED 'pw'});
 	$sw->query_safe(switch_sql($t));
 	is(policy_of($t), 'required', '[P] it succeeds when the prepared writer is committed');
@@ -434,6 +541,13 @@ foreach my $iso (@levels)
 	like($o->{stderr}, qr/ERROR:\s+55P03/, '[Q] the wait of a role that is not a superuser for the writers of the table ends at the limit');
 	$o->{stderr} = '';
 	is(policy_of($t), 'optional', '[Q] the table is not switched');
+	{
+		# the role's own lock_timeout, shorter than the limit, ends the wait: the same hint (L22-05)
+		my ($ret, $out, $err) = $node->psql('d', q{SET lock_timeout = '300ms'; } . switch_sql($t),
+			extra_params => [ '-U', 'other' ], on_error_stop => 0);
+		like($err, qr/could not switch the signature policy of table "q1"/, '[Q] a lock_timeout of the role that is shorter than the limit ends the wait');
+		like($err, qr/HINT:.*pg_blocking_pids/s, '[Q] and the hint says how to find what the call waits for (L22-05)');
+	}
 	$w->query_safe('ROLLBACK');
 
 	# after the lock is granted the hold is bounded: the session is ended at the limit
@@ -479,8 +593,10 @@ foreach my $iso (@levels)
 }
 
 db('SELECT kingres.ledger_build_block()');
-is(db(q{SELECT count(*) FROM kingres.ledger_verify() WHERE check_name = 'unattested_entry'}), '0',
-	'at the end ledger_verify has no unattested entry to report');
-is(db(q{SELECT count(*) FROM kingres.ledger_verify()}), '0', 'and the ledger verifies');
+# The one finding that is left is the entry that test J planted on purpose (table j1).
+is(db(q{SELECT string_agg(detail, '|') FROM kingres.ledger_verify() WHERE check_name = 'unattested_entry'
+	AND detail NOT LIKE 'the entry of ledger table_id } . $tid{j1} . q{ %'}), '',
+	'at the end ledger_verify has no unattested entry to report, except the one that test J planted');
+is(db(q{SELECT count(*) FROM kingres.ledger_verify()}), '1', 'and nothing else: the planted entry is the only finding');
 
 done_testing();

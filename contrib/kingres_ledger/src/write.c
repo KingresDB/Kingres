@@ -754,16 +754,28 @@ kl_lock_table_for_policy(Oid relid)
 						 errdetail("A writer of the table that waits for that lock while this transaction waits for the writer would be a deadlock; the lock on the table comes first in the order of the locks."),
 						 errhint("Call ledger_set_signature_policy before the other calls of the extension, or in a transaction of its own.")));
 
-		if (limited && (LockTimeout == 0 || LockTimeout > kl_lock_hold_limit))
 		{
-			/* The setting goes back with the end of the transaction, or at once below. */
-			int			nest = NewGUCNestLevel();
-			char		buf[32];
+			/*
+			 * A role that is not a superuser waits at most for the limit: the
+			 * setting goes back with the end of the transaction, or at once
+			 * below.  Every other wait is the caller's own: the error that
+			 * ends it (lock_timeout of the session, L22-05) says how to find
+			 * what it waits for.
+			 */
+			bool		bounded = limited &&
+				(LockTimeout == 0 || LockTimeout > kl_lock_hold_limit);
+			int			nest = 0;
 			MemoryContext oldcxt = CurrentMemoryContext;
 
-			snprintf(buf, sizeof(buf), "%d", kl_lock_hold_limit);
-			(void) set_config_option("lock_timeout", buf, PGC_USERSET, PGC_S_SESSION,
-									 GUC_ACTION_SAVE, true, 0, false);
+			if (bounded)
+			{
+				char		buf[32];
+
+				nest = NewGUCNestLevel();
+				snprintf(buf, sizeof(buf), "%d", kl_lock_hold_limit);
+				(void) set_config_option("lock_timeout", buf, PGC_USERSET, PGC_S_SESSION,
+										 GUC_ACTION_SAVE, true, 0, false);
+			}
 			PG_TRY();
 			{
 				LockRelationOid(relid, ShareRowExclusiveLock);
@@ -777,22 +789,31 @@ kl_lock_table_for_policy(Oid relid)
 
 				if (edata->sqlerrcode == ERRCODE_LOCK_NOT_AVAILABLE)
 				{
+					int			timeout = LockTimeout;
+
 					FlushErrorState();
+					if (bounded)
+						ereport(ERROR,
+								(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+								 errmsg("could not switch the signature policy of table \"%s\": its writers did not finish in time",
+										get_rel_name(relid)),
+								 errdetail("The switch waits for every open transaction that has written the table, and a role that is not a superuser waits at most kingres_ledger.lock_hold_limit (%d ms).",
+										   kl_lock_hold_limit),
+								 errhint("Wait for the open transactions of the table to end (pg_stat_activity), or ask a superuser to run the call.")));
 					ereport(ERROR,
 							(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
 							 errmsg("could not switch the signature policy of table \"%s\": its writers did not finish in time",
 									get_rel_name(relid)),
-							 errdetail("The switch waits for every open transaction that has written the table, and a role that is not a superuser waits at most kingres_ledger.lock_hold_limit (%d ms).",
-									   kl_lock_hold_limit),
-							 errhint("Wait for the open transactions of the table to end (pg_stat_activity), or ask a superuser to run the call.")));
+							 errdetail("The switch waits for every open transaction that has written the table, and lock_timeout of this session (%d ms) ended the wait.",
+									   timeout),
+							 errhint("Find what the call waits for with pg_blocking_pids(pid) for the pid of this session (see pg_stat_activity), wait for those transactions or end them, and call again.")));
 				}
 				PG_RE_THROW();
 			}
 			PG_END_TRY();
-			AtEOXact_GUC(true, nest);
+			if (bounded)
+				AtEOXact_GUC(true, nest);
 		}
-		else
-			LockRelationOid(relid, ShareRowExclusiveLock);
 	}
 	kl_hold_note(KL_POLICY_HOLD_SUBID);
 }

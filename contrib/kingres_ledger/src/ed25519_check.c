@@ -63,6 +63,8 @@
  */
 #include "postgres.h"
 
+#include "common/hashfn.h"
+
 #include "ed25519_check.h"
 
 #define FE_LIMBS 32
@@ -364,31 +366,57 @@ kl_ed25519_key_defect_text(KlKeyDefect defect)
  *		milliseconds (ten exponentiations in the field, written for clarity), which
  *		would be most of the cost of an attested write.  The judgment is a function
  *		of the 32 bytes and nothing else, so a remembered answer cannot be out of
- *		date; the last few keys of the session are kept, and a key that is refused
- *		is judged again every time (it ends the call).
+ *		date.  The cache holds nothing about revocation (ledger_attest reads that
+ *		from the table on every call), and a key that is refused is never
+ *		remembered: it is judged again every time (it ends the call).
+ *
+ *		A service role that signs for many clients through one pooled session
+ *		uses many keys, so the cache is a hash table (open addressing, linear
+ *		probing) of KL_KEY_CACHE_MAX keys at most: a session pays the judgment
+ *		once per key for as many keys as that.  The memory is bounded and fixed:
+ *		KL_KEY_CACHE_SLOTS slots of 33 bytes, about 270 kilobytes of static
+ *		memory that a process touches only as far as it uses it.  When the table
+ *		holds KL_KEY_CACHE_MAX keys it is emptied and filled again, so a session
+ *		that uses more keys than that pays the judgment again, never more memory.
+ *
+ *		Each judgment that the cache does not answer writes a DEBUG1 message with
+ *		the number of judgments of the session (the tests count them).
  */
-#define KL_KEY_CACHE 8
+#define KL_KEY_CACHE_MAX	4096
+#define KL_KEY_CACHE_SLOTS	8192	/* a power of two, twice the maximum */
 
-static uint8 kl_key_cache[KL_KEY_CACHE][32];
+static uint8 kl_key_cache_key[KL_KEY_CACHE_SLOTS][32];
+static bool kl_key_cache_used[KL_KEY_CACHE_SLOTS];
 static int	kl_key_cache_n = 0;
-static int	kl_key_cache_next = 0;
+static uint64 kl_key_judgments = 0;
 
 KlKeyDefect
 kl_ed25519_key_defect_cached(const uint8 *key)
 {
 	KlKeyDefect defect;
-	int			i;
+	uint32		slot = hash_bytes(key, 32) & (KL_KEY_CACHE_SLOTS - 1);
 
-	for (i = 0; i < kl_key_cache_n; i++)
-		if (memcmp(kl_key_cache[i], key, 32) == 0)
+	while (kl_key_cache_used[slot])
+	{
+		if (memcmp(kl_key_cache_key[slot], key, 32) == 0)
 			return KL_KEY_OK;
+		slot = (slot + 1) & (KL_KEY_CACHE_SLOTS - 1);
+	}
 	defect = kl_ed25519_key_defect(key);
+	kl_key_judgments++;
+	elog(DEBUG1, "kingres_ledger: public key judged (judgment %llu of this session)",
+		 (unsigned long long) kl_key_judgments);
 	if (defect == KL_KEY_OK)
 	{
-		memcpy(kl_key_cache[kl_key_cache_next], key, 32);
-		kl_key_cache_next = (kl_key_cache_next + 1) % KL_KEY_CACHE;
-		if (kl_key_cache_n < KL_KEY_CACHE)
-			kl_key_cache_n++;
+		if (kl_key_cache_n >= KL_KEY_CACHE_MAX)
+		{
+			memset(kl_key_cache_used, 0, sizeof(kl_key_cache_used));
+			kl_key_cache_n = 0;
+			slot = hash_bytes(key, 32) & (KL_KEY_CACHE_SLOTS - 1);
+		}
+		memcpy(kl_key_cache_key[slot], key, 32);
+		kl_key_cache_used[slot] = true;
+		kl_key_cache_n++;
 	}
 	return defect;
 }
