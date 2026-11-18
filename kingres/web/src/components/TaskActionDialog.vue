@@ -72,7 +72,12 @@ async function confirm(): Promise<void> {
     <template v-if="!started">
       <slot :field-errors="fieldErrors" :error="action.error.value" />
       <TypeToConfirm v-if="typeToConfirm !== undefined" v-model="typed" :expected="typeToConfirm" />
-      <ProblemNotice v-if="action.error.value" :error="action.error.value" />
+      <template v-if="action.error.value">
+        <!-- A dialog can say a refusal in words of its own (the failover dialog does); the general notice is the default. -->
+        <slot name="error" :error="action.error.value">
+          <ProblemNotice :error="action.error.value" />
+        </slot>
+      </template>
     </template>
     <template v-else>
       <TaskProgress :task="action.task.value" :poll-error="action.pollError.value" />
@@ -80,6 +85,8 @@ async function confirm(): Promise<void> {
         <span aria-hidden="true">&#10003;</span> Finished.
       </p>
       <slot v-if="action.state.value === 'done'" name="result" :task="action.task.value" />
+      <!-- A task that waits for a person (a failover that needs a decision) says what to do. -->
+      <slot v-if="action.state.value === 'paused'" name="paused" :task="action.task.value" />
     </template>
 
     <template #footer>

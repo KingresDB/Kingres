@@ -216,7 +216,7 @@ describe('the production build under the content security policy', () => {
   })
 
   it('shows the 0.4.0 and 0.5.0 states (certificate dialogs, proof and digests, add server, leave cluster, stopped system database) without a violation', async () => {
-    for (const state of STATES) {
+    for (const state of STATES.filter((s) => !s.needsMock)) {
       await page.goto(`${server.url}${state.route}`, { waitUntil: 'networkidle0' })
       await settled(page)
       await state.open(page)

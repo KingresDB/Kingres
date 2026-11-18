@@ -72,7 +72,9 @@ describe('Servers page', () => {
     await user.click(within(dialog).getByRole('radio', { name: /hard/i }))
     expect(within(dialog).getByRole('alert')).toHaveTextContent(/marks .* as dead/i)
 
-    // Marking a server dead needs its address typed.
+    // The plan comes first; marking a server dead then needs its address typed.
+    await user.click(within(dialog).getByRole('button', { name: /show the plan/i }))
+    await within(dialog).findByTestId('failover-plan')
     expect(within(dialog).getByRole('button', { name: /hard failover/i })).toBeDisabled()
     await user.type(within(dialog).getByLabelText(/to confirm/i), '10.0.0.12:8091')
     await user.click(within(dialog).getByRole('button', { name: /hard failover/i }))

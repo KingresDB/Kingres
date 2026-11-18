@@ -15,6 +15,9 @@ import StatusBadge from '@/components/StatusBadge.vue'
 import GateButton from '@/components/GateButton.vue'
 import GroupLeaseInfo from '@/components/GroupLeaseInfo.vue'
 import ReplicaCountDialog from '@/components/ReplicaCountDialog.vue'
+import FailoverProgress from '@/components/FailoverProgress.vue'
+import FailoverReadiness from '@/components/FailoverReadiness.vue'
+import FailoverReportDialog from '@/components/FailoverReportDialog.vue'
 import TaskActionDialog from '@/components/TaskActionDialog.vue'
 import TaskProgress from '@/components/TaskProgress.vue'
 import { endpoints } from '@/api/endpoints'
@@ -22,14 +25,16 @@ import {
   keys,
   useAlerts,
   useClusterSettings,
+  useFailoverStatus,
   useServers,
   useStandbyTask,
   useTopology,
 } from '@/api/queries'
 import { GROUP_HEALTH, INSTANCE_STATE, SYNC_STATE } from '@/lib/status'
+import { KIND_LABEL, outcomeMeta } from '@/lib/failover'
 import { groupLabel } from '@/lib/cluster'
 import { commitRule, managedStandbyId } from '@/lib/standby'
-import { formatBytes, formatLag } from '@/lib/format'
+import { formatAgo, formatBytes, formatLag } from '@/lib/format'
 import { useSessionStore } from '@/stores/session'
 
 const session = useSessionStore()
@@ -45,6 +50,10 @@ const lastTask = computed(() => standbyTask.data.value?.items[0] ?? null)
 const displaced = computed(() =>
   groups.value.filter((g) => g.primary && !g.primary.isOnPreferredServer),
 )
+// The last failover (contract 0.10.0): the summary of the newest finished run, with its report.
+const failover = useFailoverStatus(() => session.can('getFailoverStatus'))
+const lastFailover = computed(() => failover.data.value?.lastReport ?? null)
+const reportId = ref<number | null>(null)
 const restoring = ref(false)
 const changingCount = ref(false)
 
@@ -91,6 +100,36 @@ watch(
       </GateButton>
     </template>
   </PageHeader>
+
+  <div id="failover-top">
+    <FailoverProgress />
+    <section
+      v-if="lastFailover"
+      class="card stack"
+      style="margin-bottom: var(--s-4)"
+      aria-labelledby="lf-h"
+      data-testid="last-failover"
+    >
+      <h2 id="lf-h">Last failover</h2>
+      <p class="row">
+        <StatusBadge :meta="outcomeMeta(lastFailover.outcome)" />
+        <span>
+          {{ KIND_LABEL[lastFailover.kind] ?? lastFailover.kind
+          }}<template v-if="lastFailover.serverId">
+            of server <SafeName :value="lastFailover.serverId" kind="text" :max="60" /></template
+          >, {{ formatAgo(lastFailover.finishedAt ?? lastFailover.startedAt) }}.
+        </span>
+        <button
+          type="button"
+          class="btn btn-small"
+          data-testid="last-failover-report"
+          @click="reportId = lastFailover.id"
+        >
+          Open the report
+        </button>
+      </p>
+    </section>
+  </div>
 
   <section class="card stack" style="margin-bottom: var(--s-4)" aria-labelledby="rc-h">
     <h2 id="rc-h">Standbys per shard group</h2>
@@ -176,6 +215,7 @@ watch(
             <GroupLeaseInfo :lease="g.lease" />
           </div>
         </div>
+        <FailoverReadiness :readiness="g.failover" />
         <TableWrap>
           <table class="table">
             <caption class="sr-only">
@@ -288,6 +328,7 @@ watch(
       primaries are interrupted for a moment.
     </p>
   </TaskActionDialog>
+  <FailoverReportDialog v-if="reportId !== null" :report-id="reportId" @close="reportId = null" />
   <ReplicaCountDialog
     v-if="changingCount && replicaCount !== null"
     :current="replicaCount"

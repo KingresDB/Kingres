@@ -115,6 +115,23 @@ export const mockConfig = {
    * the request is refused with 409 `failover_needs_decision` until it says `allowDataLoss`.
    */
   failoverDataLoss: false,
+  /**
+   * 0.10.0, the console of the failover (every one has a URL switch, see switches.ts): `needs-decision` pauses the task at
+   * "Choose the standby" (the verdict turned "possible" while it ran, as after a restart of the leader); `blocked` makes a
+   * request refuse for that reason; `failStep` ends the task failed at that step; `slow` makes steps take three times as
+   * long; `map` and `graceful` switch on what the real server refuses for now (the map group, the switchover); `old` sets
+   * the state of the old primary in the report; `limit` puts the counter at its maximum; `readiness` overrides what a group's
+   * card says about failover (`window.__kingresMock.setReadiness`).
+   */
+  failoverNeedsDecision: false,
+  failoverBlock: null as null | 'rebalance' | 'lease' | 'quorum' | 'noreplica',
+  failoverFailStep: null as null | { step: string; group: number | null },
+  failoverSlow: false,
+  failoverMap: false,
+  failoverGraceful: false,
+  failoverOld: null as null | 'rebuilding' | 'waiting' | 'running' | 'failed',
+  failoverSwitchoverBehind: false,
+  failoverReadiness: {} as Record<number, FailoverReadinessState>,
   /** 0.8.0: the source commit the server reports in GET /setup/state: a hex id, null (the build does not know it) or text that is not a hex id. */
   commit: '0123456789abcdef0123456789abcdef01234567' as string | null,
   /**
@@ -202,6 +219,38 @@ interface DbRec {
   extraColumns?: Record<string, S['TableColumn'][]>
 }
 
+/** What a group's card says about failover (the mock's override, `setReadiness`). */
+export type FailoverReadinessState =
+  | 'possible'
+  | 'possibleLoss'
+  | 'unknownLoss'
+  | 'noStandby'
+  | 'noneReady'
+  | 'noMajority'
+  | 'versionsDiffer'
+
+/** A failover run the mock drives: what the status and the report are drawn from (the task carries the steps). */
+export interface FailoverRun {
+  taskId: number
+  trigger: 'manual' | 'automatic'
+  serverId: string
+  mode: 'hard' | 'graceful'
+  req: S['FailoverRequest']
+  plan: S['FailoverPlan']
+  /** The names of the steps of one group, and of the whole task (check, every group's block, the report). */
+  groupSteps: string[]
+  stepNames: string[]
+  /** The index of the step the task fails at, and what it says. */
+  failAt: { index: number; code: string; message: string } | null
+  /** The task is paused at "Choose the standby" until a repeat of the request accepts the loss. */
+  needsDecision: boolean
+  accepted: boolean
+  mapBootstrap: boolean
+  startedAtIso: string
+  /** The verdict of the groups turned "possible" while the task ran (the leader restarted). */
+  lossForced: boolean
+}
+
 export interface TaskRec {
   task: Task
   startedAt: number
@@ -220,6 +269,13 @@ export interface TaskRec {
   holdDetail?: string
   /** The task does all its work and then ends failed, naming the step that failed (`config.apply`: a server failed). */
   failAtEnd?: { code: string; message: string; step: string; detail: string }
+  /** 0.10.0: the task pauses (state `paused`) when it reaches this fraction, until the owner clears it and resumes it. */
+  pauseAt?: number
+  /** 0.10.0: the task fails with this code and message when it reaches this fraction (a step of a failover). */
+  failAt?: { fraction: number; code: string; message: string }
+  /** Called once when the task fails (`failAt` or `failWith`) or pauses. */
+  onFail?: () => void
+  onPause?: () => void
   /** 0.9.0: the step that skips itself on purpose; the task records it as `skipped` (the reason is the task detail). */
   skippedStep?: string
   applied: boolean
@@ -274,7 +330,7 @@ export interface MockState {
     reports: S['RebalanceReport'][]
   }
   /** 0.10.0: the reports of failover runs, newest first (a report has the identifier of its task). */
-  failover: { reports: S['FailoverReport'][] }
+  failover: { reports: S['FailoverReport'][]; runs: FailoverRun[] }
   ledger: {
     digests: LedgerDigest[]
     verifications: LedgerVerification[]
@@ -810,7 +866,7 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
       clock: { maxDifferenceMs: 1000 },
       restart: { required: false, serverIds: [] },
     },
-    failover: { reports: [] },
+    failover: { reports: [], runs: [] },
     rebalance: {
       needed: false,
       reasons: [],
@@ -1452,6 +1508,82 @@ export function leaseView(s: MockState, g: GroupRec): S['GroupLease'] | undefine
   return { holder, state: 'granted', remainingMillis: left, enforced }
 }
 
+/** Whether a failover or a restore is running or waits for a person. */
+export function failoverRunning(s: MockState): boolean {
+  return s.tasks.some(
+    (t) =>
+      (t.task.kind === 'server.failover' ||
+        t.task.kind === 'replication.restorePreferredPrimaries') &&
+      (t.task.state === 'running' || t.task.state === 'paused'),
+  )
+}
+
+/**
+ * 0.10.0: what the leader would say about a failover of the group (`ShardGroup.failover`), from the standbys the mock
+ * knows, the switches and `window.__kingresMock.setReadiness`. Never possible while a failover runs.
+ */
+export function readinessOf(s: MockState, g: GroupRec): S['FailoverReadiness'] {
+  const checkedAt = new Date(Date.now() - 4000).toISOString()
+  const blocked = (code: string, message: string): S['FailoverReadiness'] => ({
+    possible: false,
+    candidateServerId: null,
+    dataLossVerdict: null,
+    blockers: [{ code, shardGroupId: g.id, message }],
+    checkedAt,
+  })
+  const forced = mockConfig.failoverReadiness[g.id]
+  const candidate = g.standbyServerIds.find((id) => standbyStreams(s, g, id)) ?? null
+  const possible = (
+    verdict: 'none' | 'asyncOnly' | 'possible' | 'unknown',
+  ): S['FailoverReadiness'] => ({
+    possible: true,
+    candidateServerId: candidate ?? g.standbyServerIds[0] ?? null,
+    dataLossVerdict: verdict,
+    blockers: [],
+    checkedAt,
+  })
+  if (failoverRunning(s))
+    return blocked('failover_in_progress', 'A failover is running; another one starts after it.')
+  switch (forced) {
+    case 'possible':
+      return possible('none')
+    case 'possibleLoss':
+      return possible('possible')
+    case 'unknownLoss':
+      return possible('unknown')
+    case 'noStandby':
+      return blocked('no_replica_available', `Shard group ${g.id} has no standby.`)
+    case 'noneReady':
+      return blocked('no_replica_available', `No standby of shard group ${g.id} is ready.`)
+    case 'noMajority':
+      return blocked('quorum_unavailable', 'This server cannot hear a majority of the servers.')
+    case 'versionsDiffer':
+      return blocked('version_mismatch', 'The servers do not run the same extension version.')
+    default:
+      break
+  }
+  if (mockConfig.failoverBlock === 'quorum')
+    return blocked('quorum_unavailable', 'This server cannot hear a majority of the servers.')
+  if (mockConfig.failoverBlock === 'lease')
+    return blocked(
+      'lease_settings_differ',
+      'The servers do not use the same lease duration and margin.',
+    )
+  if (mockConfig.failoverBlock === 'rebalance')
+    return blocked(
+      'rebalance_in_progress',
+      'A rebalance is running and did not stop within a minute.',
+    )
+  if (g.standbyServerIds.length === 0 || mockConfig.failoverBlock === 'noreplica')
+    return blocked('no_replica_available', `Shard group ${g.id} has no standby that is ready.`)
+  if (candidate === null)
+    return blocked(
+      'no_replica_available',
+      `No standby of shard group ${g.id} is ready: none streams.`,
+    )
+  return possible(mockConfig.failoverDataLoss || syncRuleEmptied(s, g) ? 'possible' : 'none')
+}
+
 export function groupView(s: MockState, g: GroupRec): ShardGroup {
   const emptied = syncRuleEmptied(s, g)
   const member = (serverId: string, role: 'primary' | 'standby'): S['ReplicationMember'] => {
@@ -1517,6 +1649,7 @@ export function groupView(s: MockState, g: GroupRec): ShardGroup {
       retainedWalBytes: standbyStreams(s, g, m.serverId) ? 16 * MiB : 480 * MiB,
     })),
     ...(lease ? { lease } : {}),
+    failover: readinessOf(s, g),
   }
 }
 
@@ -1585,6 +1718,8 @@ export function overview(s: MockState): ClusterOverview {
       enabled: s.settings.autoFailover.enabled,
       eventsSinceReset: s.settings.autoFailover.eventsSinceReset,
       maxCount: s.settings.autoFailover.maxCount,
+      limitReached: s.settings.autoFailover.eventsSinceReset >= s.settings.autoFailover.maxCount,
+      lastEventAt: s.settings.autoFailover.lastEventAt ?? null,
     },
     openAlerts: { critical, warning, info },
     features: s.settings.features,
@@ -1692,6 +1827,14 @@ export interface TaskInit {
   onProgress?: (fraction: number) => void
   setup?: boolean
   cancellable?: boolean
+  /** 0.10.0: the shard group of each step (null: a step of the whole task); the steps of a failover come in blocks. */
+  stepGroups?: (number | null)[]
+  /** Keeps the duration as given (a slow run), where the default caps it at 2.5 times the usual one. */
+  uncapped?: boolean
+  pauseAt?: number
+  failAt?: TaskRec['failAt']
+  onFail?: () => void
+  onPause?: () => void
 }
 
 /** Creates a task. It starts running at once and is advanced by `tickTasks`. */
@@ -1709,6 +1852,7 @@ export function createTask(s: MockState, init: TaskInit): Task {
         name,
         state: i === 0 ? 'running' : 'pending',
         ...(i === 0 && init.detail ? { detail: init.detail } : {}),
+        ...(init.stepGroups ? { shardGroupId: init.stepGroups[i] ?? null } : {}),
       })),
     },
     error: null,
@@ -1723,10 +1867,13 @@ export function createTask(s: MockState, init: TaskInit): Task {
     task,
     startedAt: Date.now(),
     // Tasks that are slower than the default stay proportionally slower, but never more than 2.5x.
-    durationMs: Math.min(
-      init.durationMs ?? mockConfig.taskDurationMs,
-      mockConfig.taskDurationMs * 2.5,
-    ),
+    durationMs: init.uncapped
+      ? (init.durationMs ?? mockConfig.taskDurationMs)
+      : Math.min(init.durationMs ?? mockConfig.taskDurationMs, mockConfig.taskDurationMs * 2.5),
+    pauseAt: init.pauseAt,
+    failAt: init.failAt,
+    onFail: init.onFail,
+    onPause: init.onPause,
     apply: init.apply,
     onProgress: init.onProgress,
     failWith: init.failWith,
@@ -1755,22 +1902,41 @@ export function tickTasks(s: MockState): void {
     else if (rec.holdDetail && t.detail === rec.holdDetail) t.detail = null
     const stepCount = t.progress.steps.length
     const current = Math.min(stepCount - 1, Math.floor(fraction * stepCount))
-    // A failing task stops half way through its work.
-    if (rec.failWith && fraction >= 0.5) {
+    // A failing task stops half way through its work (a failover stops at the step it was told to).
+    const failFraction = rec.failAt?.fraction ?? (rec.failWith ? 0.5 : undefined)
+    if (failFraction !== undefined && fraction >= failFraction) {
+      const failedAt = Math.min(stepCount - 1, Math.floor(failFraction * stepCount))
+      const at = rec.failAt ? failedAt : current
       t.state = 'failed'
       t.error = {
-        code: 'unprocessable',
-        message: rec.failWith,
-        step: t.progress.steps[current]?.name ?? null,
+        code: rec.failAt?.code ?? 'unprocessable',
+        message: rec.failAt?.message ?? (rec.failWith as string),
+        step: t.progress.steps[at]?.name ?? null,
         retryable: false,
       }
-      t.progress.percent = 50
+      t.progress.percent = Math.round(failFraction * 1000) / 10
+      t.progress.currentStep = null
       t.progress.steps = t.progress.steps.map((st, i) => ({
         ...st,
-        state: i < current ? 'done' : i === current ? 'failed' : 'skipped',
+        state: i < at ? 'done' : i === at ? 'failed' : 'skipped',
       }))
       t.cancellable = false
       t.updatedAt = nowIso()
+      rec.onFail?.()
+      continue
+    }
+    // A task that waits for a person stops at its step and is paused; its step is shown as the one it goes on with.
+    if (rec.pauseAt !== undefined && fraction >= rec.pauseAt) {
+      const at = Math.min(stepCount - 1, Math.floor(rec.pauseAt * stepCount))
+      t.state = 'paused'
+      t.progress.percent = Math.round(rec.pauseAt * 1000) / 10
+      t.progress.currentStep = t.progress.steps[at]?.name ?? null
+      t.progress.steps = t.progress.steps.map((st, i) => ({
+        ...st,
+        state: i < at ? 'done' : 'pending',
+      }))
+      t.updatedAt = nowIso()
+      rec.onPause?.()
       continue
     }
     rec.onProgress?.(fraction)

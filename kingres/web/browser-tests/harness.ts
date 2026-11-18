@@ -242,6 +242,8 @@ export interface PageState {
   open: (page: Page) => Promise<void>
   /** Gets out again (closes the dialog); the next state starts from its own route anyway. */
   close?: (page: Page) => Promise<void>
+  /** The state needs the mock's switches and its `__kingresMock`, which the production build of the content security policy run lacks. */
+  needsMock?: boolean
 }
 
 /** A value for the configuration dialogs that differs from the one before it, so that Apply is never a no-op. */
@@ -273,6 +275,89 @@ async function dialogOpen(page: Page): Promise<void> {
 const cancel = async (page: Page): Promise<void> => {
   await clickText(page, 'Cancel')
   await sleep(150)
+}
+
+/** Sets members of the mock's configuration in the page (see src/mocks/browser.ts); no code is built from text, the pages run under a CSP. */
+const setMock = (page: Page, settings: Record<string, unknown>) =>
+  page.evaluate((values) => {
+    const mock = (window as unknown as { __kingresMock: { config: Record<string, unknown> } })
+      .__kingresMock
+    Object.assign(mock.config, values)
+  }, settings)
+
+/** Opens the failover dialog of a server on the Servers page. */
+async function openFailoverDialog(page: Page, server: string): Promise<void> {
+  const ok = await page.evaluate((id) => {
+    const row = document.querySelector(`[data-testid="server-row-${id}"]`)
+    const button = [...(row?.querySelectorAll('button') ?? [])].find((b) =>
+      /^fail ?over$/i.test(b.textContent?.trim() ?? ''),
+    )
+    button?.click()
+    return !!button
+  }, server)
+  if (!ok) throw new Error(`No failover button for ${server}`)
+  await dialogOpen(page)
+}
+
+async function chooseHard(page: Page, mode = 'Hard:'): Promise<void> {
+  await page.evaluate((start) => {
+    const label = [...document.querySelectorAll('[role="dialog"] label')].find((l) =>
+      l.textContent?.trim().startsWith(start),
+    )
+    ;(label?.querySelector('input') as HTMLInputElement | null)?.click()
+  }, mode)
+  await sleep(150)
+}
+
+/** From the choice to the plan, and (when asked) through the decision, the typed address and the start; the dialog is closed after. */
+async function startFailover(page: Page, server: string, accept = false): Promise<void> {
+  await openFailoverDialog(page, server)
+  await chooseHard(page)
+  await clickText(page, 'Show the plan', '[role="dialog"] button')
+  await page.waitForSelector('[role="dialog"] [data-testid="failover-plan"]', { timeout: 20_000 })
+  if (accept) await page.click('[role="dialog"] [data-testid="accept-loss"] input')
+  await page.type('[role="dialog"] input.mono', `${server}:8091`)
+  await clickText(page, 'Hard failover', '[role="dialog"] button')
+  await page.waitForSelector('[role="dialog"] [role="progressbar"]', { timeout: 20_000 })
+}
+
+const closeDialogs = async (page: Page): Promise<void> => {
+  await page.evaluate(() => {
+    for (const b of document.querySelectorAll<HTMLElement>('[role="dialog"] .dlg-foot button'))
+      if (/^(close|hide \(keeps running\)|cancel)$/i.test(b.textContent?.trim() ?? '')) {
+        b.click()
+        break
+      }
+  })
+  await sleep(200)
+}
+
+/** Leaves nothing of a run behind: the cluster as it was, and no notice of a finished task (a notice has a Dismiss button). */
+const leaveFailover = async (page: Page): Promise<void> => {
+  await freshFailover(page)
+  await setMock(page, { taskDurationMs: 4000 })
+  await page.evaluate(() => {
+    for (const b of document.querySelectorAll<HTMLElement>('button'))
+      if (b.textContent?.trim() === 'Dismiss') b.click()
+  })
+  await sleep(200)
+}
+
+/** Puts the cluster back as it was, and the switches of the failover off, so that each state starts from the same place. */
+const freshFailover = async (page: Page): Promise<void> => {
+  await page.evaluate(() =>
+    (
+      window as unknown as { __kingresMock: { resetFailover: () => void } }
+    ).__kingresMock.resetFailover(),
+  )
+  await setMock(page, {
+    failoverDataLoss: false,
+    failoverNeedsDecision: false,
+    failoverOld: null,
+    failoverFailStep: null,
+    failoverBlock: null,
+    taskDurationMs: 800,
+  })
 }
 
 /**
@@ -530,6 +615,114 @@ export const STATES: PageState[] = [
       await sleep(900)
     },
     close: cancel,
+  },
+  {
+    // 0.10.0: the failover dialog (design 8.2), step 1: the mode, the groups (the server that is down), the standby.
+    name: 'failover dialog: the choice (0.10.0)',
+    needsMock: true,
+    route: '/servers',
+    open: async (page) => {
+      await freshFailover(page)
+      await openFailoverDialog(page, '10.0.0.11')
+      await page.waitForSelector('[role="dialog"] [data-testid="failover-groups"]', {
+        timeout: 20_000,
+      })
+      await sleep(250)
+    },
+    close: cancel,
+  },
+  {
+    name: 'failover dialog: a refusal in words (0.10.0)',
+    needsMock: true,
+    route: '/servers',
+    open: async (page) => {
+      await freshFailover(page)
+      await openFailoverDialog(page, '10.0.0.12')
+      // The server list may still show the status it had before the reset, so the mode is chosen, not left to its default.
+      await chooseHard(page, 'Graceful:')
+      await clickText(page, 'Show the plan', '[role="dialog"] button')
+      await page.waitForSelector('[role="dialog"] [data-testid="failover-refusal"]', {
+        timeout: 20_000,
+      })
+      await sleep(250)
+    },
+    close: cancel,
+  },
+  {
+    name: 'failover dialog: the plan, with a decision about lost data (0.10.0)',
+    needsMock: true,
+    route: '/servers',
+    open: async (page) => {
+      await freshFailover(page)
+      await setMock(page, { failoverDataLoss: true })
+      await openFailoverDialog(page, '10.0.0.12')
+      await chooseHard(page)
+      await clickText(page, 'Show the plan', '[role="dialog"] button')
+      await page.waitForSelector('[role="dialog"] [data-testid="accept-loss"]', { timeout: 20_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await cancel(page)
+      await setMock(page, { failoverDataLoss: false })
+    },
+  },
+  {
+    name: 'failover progress: waiting for a decision (0.10.0)',
+    needsMock: true,
+    route: '/servers',
+    open: async (page) => {
+      await freshFailover(page)
+      await setMock(page, { failoverNeedsDecision: true })
+      await startFailover(page, '10.0.0.12')
+      await closeDialogs(page)
+      await page.waitForSelector('[data-testid="waiting-for-you"]', { timeout: 30_000 })
+      await page.waitForSelector('[data-testid="decision-loss-2"]', { timeout: 30_000 })
+      await sleep(400)
+    },
+    close: async (page) => {
+      await setMock(page, { failoverNeedsDecision: false })
+      await page.evaluate(() =>
+        (
+          document.querySelector(
+            '[data-testid="waiting-for-you"] [data-testid="cancel-failover"]',
+          ) as HTMLElement | null
+        )?.click(),
+      )
+      await page.waitForFunction(
+        () => !document.querySelector('[data-testid="failover-progress"]'),
+        {
+          timeout: 30_000,
+        },
+      )
+      await sleep(150)
+      await leaveFailover(page)
+    },
+  },
+  {
+    name: 'failover report with the numbers, the incidents and the old primary (0.10.0)',
+    needsMock: true,
+    route: '/servers',
+    open: async (page) => {
+      await freshFailover(page)
+      await setMock(page, { failoverDataLoss: true, failoverOld: 'rebuilding' })
+      await startFailover(page, '10.0.0.12', true)
+      await page.waitForFunction(
+        () => document.querySelector('[role="dialog"]')?.textContent?.includes('Finished.'),
+        { timeout: 30_000 },
+      )
+      await closeDialogs(page)
+      await go(page, '/replication')
+      await clickWhenThere(page, '[data-testid="last-failover-report"]')
+      await page.waitForSelector('[role="dialog"] [data-testid="report-old-primary"]', {
+        timeout: 20_000,
+      })
+      await sleep(300)
+    },
+    close: async (page) => {
+      await page.click('[role="dialog"] [data-dialog-close]')
+      await sleep(150)
+      await leaveFailover(page)
+    },
   },
   {
     name: 'system database stopped',

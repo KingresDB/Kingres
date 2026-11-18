@@ -10,6 +10,7 @@
 //   ?cursors=reject              every request with a cursor answers 400 (a 0.4.0 cursor on a 0.5.0 server)
 //   ?latency=0                   no artificial delay
 //   ?config=, ?clock=            states of contract 0.8.0 (configuration and clocks; see switches.ts and the README)
+//   ?failover=                   0.10.0: the console of the failover (see switches.ts and the README)
 //   ?silent=, ?lease=, ?standby=, ?workbench=busy, ?leader=lost, ?client=on, ?ledger=   states of contract 0.7.0
 //                                (see switches.ts and the README)
 import { setupWorker } from 'msw/browser'
@@ -18,7 +19,15 @@ import { operations } from '@/api/operations.generated'
 import { createHandlers } from './handlers'
 import { getState, resetMockState } from './http'
 import { HOSTILE_MISSING, seedHostile } from './hostile'
-import { loseLease, mockConfig, regainLease, reviveServer, silenceServer } from './state'
+import {
+  loseLease,
+  mockConfig,
+  regainLease,
+  reviveServer,
+  silenceServer,
+  type FailoverReadinessState,
+} from './state'
+import { resetFailoverState } from './failover'
 import { applySwitches } from './switches'
 import {
   bringConfigServerBack,
@@ -52,6 +61,21 @@ export async function startBrowserMocks(): Promise<void> {
     state: getState,
     silence: (id: string) => silenceServer(getState(), id),
     revive: (id: string) => reviveServer(getState(), id),
+    // 0.10.0 (failover): a server stops answering for longer than the failure timeout / answers again; what a group's
+    // card says about failover (possible, possibleLoss, unknownLoss, noStandby, noneReady, noMajority, versionsDiffer;
+    // null clears it); the counter of automatic failovers back to zero.
+    failServer: (id: string) =>
+      silenceServer(getState(), id, Date.now() - mockConfig.failureMs - 1000),
+    reviveServer: (id: string) => reviveServer(getState(), id),
+    setReadiness: (group: number, state: FailoverReadinessState | null) => {
+      if (state === null) delete mockConfig.failoverReadiness[group]
+      else mockConfig.failoverReadiness[group] = state
+    },
+    resetFailover: () => resetFailoverState(getState()),
+    resetCounter: () => {
+      const s = getState()
+      s.settings.autoFailover = { ...s.settings.autoFailover, eventsSinceReset: 0 }
+    },
     loseLease: (group: number) => loseLease(getState(), group),
     regainLease: (group: number) => regainLease(getState(), group),
     // 0.8.0 (configuration): the next change fails on a server; a server cannot be reached / is back; a clock is off.

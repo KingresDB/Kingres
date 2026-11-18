@@ -2,8 +2,8 @@
 <!-- Copyright (c) 2026, RooyeKhat Media Co -->
 <script setup lang="ts">
 // The server operations, each with a confirmation that states the consequence: add server, remove
-// server, failover (hard or graceful), restore preferred primaries, and (0.5.0) renew and revoke the
-// certificates of a server.
+// server, restore preferred primaries, and (0.5.0) renew and revoke the certificates of a server. The failover has a
+// dialog of its own (`FailoverDialog.vue`): it needs a plan, and its refusals have words of their own.
 import { computed, reactive, ref } from 'vue'
 import { safeText } from '@/lib/safe-text'
 import SafeName from './SafeName.vue'
@@ -20,7 +20,7 @@ import { firstError, nodeAddress, required, compact } from '@/lib/validators'
 import type { Server } from '@/api/types'
 
 const props = defineProps<{
-  kind: 'add' | 'remove' | 'failover' | 'restore' | 'renew' | 'revoke'
+  kind: 'add' | 'remove' | 'restore' | 'renew' | 'revoke'
   server?: Server
   invalidate?: QueryKey[]
 }>()
@@ -28,7 +28,6 @@ const emit = defineEmits<{ close: [] }>()
 
 const form = reactive({ address: '', setupToken: '', serverGroup: '', expectedFingerprint: '' })
 const unpinned = ref(false)
-const mode = ref<'hard' | 'graceful'>('graceful')
 const submitted = ref(false)
 const groups = useServerGroups()
 const servers = useServers()
@@ -53,8 +52,6 @@ function validate(): boolean {
   submitted.value = true
   return props.kind !== 'add' || Object.keys(errors.value).length === 0
 }
-
-const primaries = computed(() => props.server?.instances.filter((i) => i.role === 'primary') ?? [])
 
 const config = computed(() => {
   const id = props.server?.id ?? ''
@@ -83,15 +80,6 @@ const config = computed(() => {
         danger: true,
         typeToConfirm: props.server?.address,
         start: () => endpoints.removeServer(id),
-      }
-    case 'failover':
-      return {
-        title: `Fail over server ${props.server?.address ?? ''}`,
-        confirmLabel: mode.value === 'hard' ? 'Hard failover' : 'Graceful failover',
-        danger: mode.value === 'hard',
-        // Marking a server dead is not undone by a click: the address has to be typed.
-        typeToConfirm: mode.value === 'hard' ? props.server?.address : undefined,
-        start: () => endpoints.failoverServer(id, mode.value),
       }
     case 'renew':
       return {
@@ -279,35 +267,6 @@ const config = computed(() => {
           The certificates of the manager leader cannot be revoked (the server refuses with
           <em>Server hosts the cluster metadata</em>). If the manager leader does not hold the key
           of the certificate authority, nothing is revoked and nothing is changed.
-        </p>
-      </template>
-
-      <template v-else-if="kind === 'failover'">
-        <fieldset>
-          <legend>Failover mode</legend>
-          <label class="check"
-            ><input v-model="mode" type="radio" value="graceful" /> Graceful: wait for standbys to
-            catch up, then switch roles. No data loss.</label
-          >
-          <label class="check"
-            ><input v-model="mode" type="radio" value="hard" /> Hard: promote standbys now. Writes
-            not yet replicated can be lost.</label
-          >
-        </fieldset>
-        <p v-if="mode === 'hard'" class="notice tone-danger" role="alert">
-          <span aria-hidden="true">&#10006;</span>
-          <span>
-            Hard failover marks
-            <strong><SafeName :value="server?.address ?? ''" kind="text" :max="80" /></strong> as
-            dead. Its {{ primaries.length }} primary instance(s) are replaced by their standbys, and
-            their former neighbours carry double write load until you restore the preferred
-            primaries.
-          </span>
-        </p>
-        <p v-else>
-          The {{ primaries.length }} primary instance(s) on
-          <strong><SafeName :value="server?.address ?? ''" kind="text" :max="80" /></strong> hand
-          over to their standbys. The server stays in the cluster as a standby.
         </p>
       </template>
 

@@ -115,12 +115,19 @@ export const endpoints = {
     j(api.PATCH('/servers/{serverId}', { params: { path: { serverId } }, body })),
   removeServer: (serverId: ServerId) =>
     j(api.DELETE('/servers/{serverId}', { params: { path: { serverId } } })),
-  failoverServer: (serverId: ServerId, mode: 'hard' | 'graceful') =>
+  /**
+   * Starts a failover (202 + task). The second argument is a mode, or the whole request: the groups, the standby per
+   * group and `allowDataLoss` (a repeat of the request for a paused task resumes it). It never asks for a plan.
+   */
+  failoverServer: (
+    serverId: ServerId,
+    request: 'hard' | 'graceful' | Omit<S['FailoverRequest'], 'dryRun'>,
+  ) =>
     startedTask(
       j(
         api.POST('/servers/{serverId}/failover', {
           params: { path: { serverId } },
-          body: { mode },
+          body: typeof request === 'string' ? { mode: request } : { ...request },
         }),
       ),
     ),
@@ -223,7 +230,7 @@ export const endpoints = {
   getRebalanceReport: (reportId: number) =>
     j(api.GET('/rebalance/reports/{reportId}', { params: { path: { reportId } } })),
 
-  // --- failover (0.10.0; the pages that use these come with the console increment of the failover design)
+  // --- failover (0.10.0)
   /** The plan of a failover (200, nothing changes): the request says `dryRun`. */
   previewFailover: (serverId: ServerId, body: Omit<S['FailoverRequest'], 'dryRun'>) =>
     plan(

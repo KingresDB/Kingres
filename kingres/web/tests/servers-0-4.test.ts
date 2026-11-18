@@ -356,7 +356,7 @@ describe('operations the server does not implement yet', () => {
     const row = await screen.findByTestId('server-row-10.0.0.12')
     await user.click(within(row).getByRole('button', { name: /failover/i }))
     const dialog = await screen.findByRole('dialog', { name: /fail over server/i })
-    await user.click(within(dialog).getByRole('button', { name: /graceful failover/i }))
+    await user.click(within(dialog).getByRole('button', { name: /show the plan/i }))
     expect(
       await within(dialog).findByText(/not available on this server version yet/i),
     ).toBeInTheDocument()

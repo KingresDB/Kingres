@@ -25,10 +25,23 @@
 //   ?rebalance=slow               0.9.0: moves take about three times as long (time to stop one in the middle).
 //   ?failover=dataloss            0.10.0: the plan of a hard failover says writes may be lost: the request is refused with 409
 //                                 failover_needs_decision until it says allowDataLoss (a dry run shows the plan).
+//   ?failover=<a>,<b>,...         0.10.0 (the console of the failover; the values can be combined with a comma):
+//                                 needs-decision   the task pauses at "Choose the standby" until a repeat of the request says allowDataLoss
+//                                 blocked:rebalance | blocked:lease | blocked:quorum | blocked:noreplica   the refusal (and the readiness blocker)
+//                                 fail:<step>[:<group>]   the task ends failed at that step (check, freeze, stop, lease, choose, handover,
+//                                                         promote, catalog, repoint, lift, verify, pause, report)
+//                                 slow             steps take about three times as long (time to cancel and to see the phases)
+//                                 map              the map group can be failed over (the real server refuses it for now): the bootstrap, no task id at first
+//                                 graceful         the planned switchover is accepted (the real server refuses it for now)
+//                                 old:rebuilding | old:waiting | old:running | old:failed   the state of the old primary in the report
+//                                 auto:<server>    an automatic failover of that server is under way (trigger automatic)
+//                                 limit            the counter of automatic failovers is at its maximum
+//                                 switchover:behind  the verification of a switchover fails: rolled back, standby_behind
 //   ?clock=off:<server>:<ms>      the clock of that server is that many milliseconds ahead (negative: behind).
 //   ?clock=unreachable:<server>   the clock of that server cannot be read.
 import type { MockState } from './state'
 import { loseLease, mockConfig, silenceServer, stallStandby } from './state'
+import { FAIL_STEPS, seedAutomaticFailover } from './failover'
 import {
   failNextApply,
   seedRestartConflict,
@@ -36,6 +49,37 @@ import {
   setClockReachable,
   takeConfigServerDown,
 } from './config'
+
+/** One value of `?failover=` (several: comma). Unknown values are ignored. */
+function applyFailoverSwitch(entry: string, s: MockState): void {
+  if (entry === 'dataloss') mockConfig.failoverDataLoss = true
+  if (entry === 'needs-decision') mockConfig.failoverNeedsDecision = true
+  if (entry === 'slow') mockConfig.failoverSlow = true
+  if (entry === 'map') mockConfig.failoverMap = true
+  if (entry === 'graceful') mockConfig.failoverGraceful = true
+  const blocked = /^blocked:(rebalance|lease|quorum|noreplica)$/.exec(entry)
+  if (blocked) mockConfig.failoverBlock = blocked[1] as NonNullable<typeof mockConfig.failoverBlock>
+  const fail = /^fail:([a-z]+)(?::(\d+))?$/.exec(entry)
+  if (fail && FAIL_STEPS.includes(fail[1] as string))
+    mockConfig.failoverFailStep = {
+      step: fail[1] as string,
+      group: fail[2] ? Number(fail[2]) : null,
+    }
+  const old = /^old:(rebuilding|waiting|running|failed)$/.exec(entry)
+  if (old) mockConfig.failoverOld = old[1] as NonNullable<typeof mockConfig.failoverOld>
+  if (entry === 'switchover:behind') {
+    mockConfig.failoverGraceful = true
+    mockConfig.failoverSwitchoverBehind = true
+  }
+  if (entry === 'limit')
+    s.settings.autoFailover = {
+      ...s.settings.autoFailover,
+      eventsSinceReset: s.settings.autoFailover.maxCount,
+      lastEventAt: new Date(Date.now() - 600_000).toISOString(),
+    }
+  const auto = /^auto:(.+)$/.exec(entry)
+  if (auto) seedAutomaticFailover(s, auto[1] as string)
+}
 
 /** Applies the 0.7.0 switches of a query string to the mock. Unknown values are ignored. */
 export function applySwitches(params: URLSearchParams, s: MockState): void {
@@ -87,7 +131,7 @@ export function applySwitches(params: URLSearchParams, s: MockState): void {
     if (entry === 'fail') mockConfig.rebalanceFail = true
     if (entry === 'slow') mockConfig.rebalanceSlow = true
   }
-  if (params.get('failover') === 'dataloss') mockConfig.failoverDataLoss = true
+  for (const entry of (params.get('failover') ?? '').split(',')) applyFailoverSwitch(entry, s)
   for (const entry of (params.get('clock') ?? '').split(',')) {
     const off = /^off:([^:]+):(-?\d+(?:\.\d+)?)$/.exec(entry)
     if (off) setClockOffset(s, off[1] as string, Number(off[2]))

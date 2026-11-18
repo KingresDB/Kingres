@@ -8,6 +8,7 @@ import SafeName from './SafeName.vue'
 import { useAnnounce } from '@/composables/useAnnounce'
 import { TASK_STATE } from '@/lib/status'
 import { skippedReason } from '@/lib/standby'
+import { hasGroupSteps, stepBlocks, stepName } from '@/lib/failover'
 import type { Task, TaskStep } from '@/api/types'
 
 const props = defineProps<{ task: Task | null; pollError?: unknown }>()
@@ -56,6 +57,12 @@ function stepIcon(step: TaskStep): string {
         ? '◐'
         : '○'
 }
+/** The steps of a task with several groups (a failover) come in one block per group (contract 0.10.0), else in one list. */
+const blocks = computed(() => {
+  const steps = props.task?.progress.steps ?? []
+  return hasGroupSteps(steps) ? stepBlocks(steps) : [{ groupId: null, steps }]
+})
+const grouped = computed(() => hasGroupSteps(props.task?.progress.steps ?? []))
 const taskSkip = computed(() => skippedReason(props.task?.detail))
 watch(announcementKey, (key) => {
   if (key) announce(summary.value, props.task?.state === 'failed' ? 'assertive' : 'polite')
@@ -87,21 +94,36 @@ watch(
     >
       <span :style="{ width: `${task.progress.percent}%` }" />
     </div>
-    <ol v-if="task.progress.steps.length" class="steps">
-      <li v-for="step in task.progress.steps" :key="step.name" :data-state="stepState(step)">
-        <span aria-hidden="true">{{ stepIcon(step) }}</span>
-        <SafeName :value="step.name" kind="text" :max="120" />
-        <span class="muted">({{ stepState(step) }})</span>
-        <span v-if="step.detail && step.detail !== task.detail" class="muted step-detail"
-          ><SafeName :value="step.detail" kind="text" :max="200"
-        /></span>
-        <span v-if="stepSkip(step) !== null" class="muted step-detail" data-testid="step-skipped">
-          Skipped on purpose, not a failure<template v-if="stepSkip(step)"
-            >: <SafeName :value="stepSkip(step) ?? ''" kind="text" :max="200" /></template
-          >.
-        </span>
-      </li>
-    </ol>
+    <template v-if="task.progress.steps.length">
+      <template v-for="(block, b) in blocks" :key="`${b}-${block.groupId}`">
+        <h3 v-if="block.groupId !== null" class="step-group" data-testid="step-group">
+          Group {{ block.groupId }}
+        </h3>
+        <ol class="steps">
+          <li
+            v-for="(step, i) in block.steps"
+            :key="`${i}-${step.name}`"
+            :data-state="stepState(step)"
+          >
+            <span aria-hidden="true">{{ stepIcon(step) }}</span>
+            <SafeName :value="grouped ? stepName(step) : step.name" kind="text" :max="120" />
+            <span class="muted">({{ stepState(step) }})</span>
+            <span v-if="step.detail && step.detail !== task.detail" class="muted step-detail"
+              ><SafeName :value="step.detail" kind="text" :max="200"
+            /></span>
+            <span
+              v-if="stepSkip(step) !== null"
+              class="muted step-detail"
+              data-testid="step-skipped"
+            >
+              Skipped on purpose, not a failure<template v-if="stepSkip(step)"
+                >: <SafeName :value="stepSkip(step) ?? ''" kind="text" :max="200" /></template
+              >.
+            </span>
+          </li>
+        </ol>
+      </template>
+    </template>
     <p v-if="task.detail" class="muted task-detail">
       <SafeName :value="task.detail" kind="text" :max="300" multiline />
     </p>
@@ -131,6 +153,10 @@ watch(
 </template>
 
 <style scoped>
+.step-group {
+  font-size: var(--fs-sm);
+  margin: var(--s-2) 0 0;
+}
 .steps {
   margin: 0;
   padding-left: var(--s-4);
