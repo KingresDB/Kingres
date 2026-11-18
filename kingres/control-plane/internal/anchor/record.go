@@ -184,6 +184,68 @@ type Record struct {
 	AnchoredAt    *time.Time
 	LastError     string
 	CreatedAt     time.Time
+	// SubmitStart is the start of the first Submit call for this record's key
+	// (zero until it is set): the caller sets it with WithSubmitStart and makes it
+	// durable BEFORE that call, and it never changes afterwards, not on a Retry
+	// and not on a restart (correction 105; Payload.SubmitStart says what the WORM
+	// target does with it). Generation is the generation of the key (0 for a new
+	// record). Both are columns of the row beside the evidence; PayloadFor builds
+	// the payload of a call from them, and NextGeneration is the only step that
+	// changes them.
+	SubmitStart time.Time
+	Generation  uint32
+}
+
+// WithSubmitStart sets the start of the first Submit call for the record's key
+// (whole seconds, UTC) when it is not set, and returns the record: persist it
+// before the call. A record that has a start keeps it: the same value (to the
+// second) returns the record as it is, a different one is refused with an error
+// (a start that changes is the fault the field exists to prevent; a new start
+// belongs to a new generation, NextGeneration).
+func (r Record) WithSubmitStart(start time.Time) (Record, error) {
+	if start.IsZero() {
+		return r, errors.New("anchor: the start of the first Submit call is required")
+	}
+	s := start.UTC().Truncate(time.Second)
+	if !r.SubmitStart.IsZero() {
+		if r.SubmitStart.Equal(s) {
+			return r, nil
+		}
+		return r, fmt.Errorf("anchor: the record already has its SubmitStart (%s) and it never changes (a new start belongs to a new generation)", FormatTime(r.SubmitStart))
+	}
+	r.SubmitStart = s
+	return r, nil
+}
+
+// NextGeneration is the operator's step to a new key generation (correction 105)
+// for a failed record: the record becomes pending again, due at once, with the
+// counters and the error cleared (as Retry does), Generation is exactly the old
+// one plus one, and SubmitStart is newStart, which must be later than the old
+// start and comes from a clock that is right. Both values and the state change in
+// one returned record, so that one write persists them together (a new start with
+// the old generation makes the old object older than the start, a new generation
+// with the old start only widens a foreign window). It is refused for a record
+// that is not failed, that has no start, or at the last generation. It is never
+// automatic: every generation is one more object in the bucket that claims to be
+// the anchor of the checkpoint. It does not apply to the store's refusal
+// no_user_metadata, which a new generation meets again (package worm).
+func (r Record) NextGeneration(newStart, now time.Time) (Record, error) {
+	if r.State != StateFailed {
+		return r, fmt.Errorf("%w: only a failed record takes a new key generation (state %q)", ErrNotAllowed, r.State)
+	}
+	if r.SubmitStart.IsZero() {
+		return r, errors.New("anchor: the record has no SubmitStart")
+	}
+	if err := checkNextGeneration(r.Generation, r.SubmitStart, r.Generation+1, newStart); err != nil {
+		return r, err
+	}
+	out, err := r.Retry(now)
+	if err != nil {
+		return r, err
+	}
+	out.Generation = r.Generation + 1
+	out.SubmitStart = newStart.UTC().Truncate(time.Second)
+	return out, nil
 }
 
 // NewRecord returns a pending record due at once.
@@ -404,7 +466,10 @@ var ErrNotAllowed = errors.New("anchor: transition not allowed")
 //     (AlertFailed) instead.
 //   - refused: Attempts and Refusals +1, Retryables 0; the 1st, 2nd and 3rd
 //     refusal in a row retry after RefusedRetryDelay; the 4th fails the
-//     record (AlertFailed). Any other failure or success resets Refusals.
+//     record (AlertFailed). A refusal whose verdict is final (Error.Final: an
+//     object that carries its attempt and lies outside its window, correction
+//     105) fails the record at once with the same alert. Any other failure or
+//     success resets Refusals.
 //   - permanent: failed (AlertFailed).
 //   - conflict: failed (AlertConflict), no retry.
 //
@@ -435,7 +500,7 @@ func (r Record) AfterError(err error, now time.Time, u float64, lim Limits) (Rec
 	case ClassRefused:
 		out.Refusals++
 		out.Retryables = 0
-		if out.Refusals > MaxRefusals {
+		if out.Refusals > MaxRefusals || IsFinal(err) {
 			ev, alert = EventFail, AlertFailed
 		} else {
 			wait = RefusedRetryDelay(out.Refusals)

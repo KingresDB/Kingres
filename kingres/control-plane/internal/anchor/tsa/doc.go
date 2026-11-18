@@ -95,7 +95,16 @@
 // a token match the sid of its SignerInfo (an older certificate of the same key
 // id or issuer and serial listed before the one that signed), every one is tried
 // as the signer and the first that passes all the checks is the signer; when none
-// does, the error is the first one's.
+// does, the error is the first one's (which may be that of a decoy certificate, not
+// of the right one).
+//
+// The hash that the evidence carries (signer_key_sha256) is NOT a pin: it is
+// checked against the signer key of the token inside the same evidence, so it adds
+// no fixed point from outside. With no pin, anyone who holds a token from any
+// authority under the roots can write evidence that passes VerifyEvidence, with
+// the matching hash. Only the pin argument is a value from outside; the field is
+// useful to an indexer that does not parse the token, and as the value an operator
+// copies into the configuration (correction 106).
 //
 // # What the caller must do
 //

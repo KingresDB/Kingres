@@ -63,6 +63,12 @@ type Error struct {
 	Status int
 	// RetryAfter is the delay the server asked for (0 when none).
 	RetryAfter time.Duration
+	// Final marks a verdict that is the same on every later call (correction 105):
+	// an object that carries the start of the call that wrote it and lies outside
+	// its window. Record.AfterError fails a record at once on a final error of
+	// class refused (the same alert as the fourth refusal) instead of spending
+	// three waits on requests that cannot change the answer.
+	Final bool
 	// Err is the underlying error, for errors.Is and errors.As. It is never
 	// printed by Error(); only Text is.
 	Err error
@@ -111,6 +117,12 @@ func IsPermanent(err error) bool { return err != nil && ClassOf(err) == ClassPer
 
 // IsRefused reports ClassOf(err) == ClassRefused (credentials or access refused).
 func IsRefused(err error) bool { return err != nil && ClassOf(err) == ClassRefused }
+
+// IsFinal reports that err is an *Error whose verdict is final (Error.Final).
+func IsFinal(err error) bool {
+	var e *Error
+	return errors.As(err, &e) && e.Final
+}
 
 // IsConflict reports ClassOf(err) == ClassConflict ("already there with other content").
 func IsConflict(err error) bool { return err != nil && ClassOf(err) == ClassConflict }

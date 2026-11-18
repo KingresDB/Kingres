@@ -39,6 +39,13 @@ const (
 	PerFragmentLookups = 4
 	// MaxUpgradeLookups bounds the GET requests of one Upgrade call.
 	MaxUpgradeLookups = MaxCalendars * PerFragmentLookups
+	// MaxAnswerClaims is the most Bitcoin attestations that one calendar answer
+	// may carry: an answer with more is refused as a whole (Code
+	// "implausible_answer", a failure of that calendar only), correction 106.
+	// It equals the share of one calendar in the claims kept aside
+	// (anchor.MaxOTSContradictionsPerCalendar), so that one answer cannot exceed
+	// it, and a quarter of the memory of dropped claims of one calendar.
+	MaxAnswerClaims = anchor.MaxOTSContradictionsPerCalendar
 	// MaxHeaderChecks bounds the headers asked of a HeaderSource in one call.
 	MaxHeaderChecks = 8
 	// FirstCheck is the delay before the first upgrade attempt.
@@ -266,9 +273,11 @@ func (e *PartialError) Unwrap() error { return e.Err }
 // source contradicted it twice, an hour or more apart, and nothing can deliver
 // any more. Evidence is the evidence as it was BEFORE that call: it still holds
 // the claims. If the operator finds that the header source was wrong (a node on
-// a stale fork, still synchronising, of another network), the caller keeps this
-// evidence with the failed record and passes it to SubmitWithPrior when the
-// record is retried: the calendars are not asked again, the claims are judged
+// a stale fork, still synchronising, of another network), the failed record
+// already holds this evidence (AfterError leaves Record.Evidence, and so does
+// Retry: a caller must not clear it) and a Retry passes it to Resume
+// (anchor.Resumer) or SubmitWithPrior when the record is retried: the calendars
+// are not asked again, the claims are judged
 // again against the corrected source, and the submission time is kept. A Submit
 // without it starts again from the calendars and the old proof is gone (correction
 // 96). PriorEvidence reads it from any error of this package that carries one.
@@ -284,12 +293,14 @@ func (e *ContradictedError) Error() string { return e.Err.Error() }
 // Unwrap returns the *anchor.Error.
 func (e *ContradictedError) Unwrap() error { return e.Err }
 
-// PriorEvidence returns the evidence that a caller keeps and passes to
-// SubmitWithPrior when it retries a record whose Submit or Upgrade failed with a
+// PriorEvidence returns the evidence that a caller passes to SubmitWithPrior (or
+// Resume) when it retries a record whose Submit or Upgrade failed with a
 // *PartialError (what the calendars that did answer gave) or a *ContradictedError
 // (what the record held before the claims were dropped). ok is false for any
-// other error. A caller that retries such a record without it throws away
-// what was paid for.
+// other error. For a *PartialError the record has no evidence, so the caller must
+// store this (PriorEvidenceRaw gives the encoding of the evidence column); for a
+// *ContradictedError the failed record already holds it. A caller that retries
+// such a record without it throws away what was paid for.
 func PriorEvidence(err error) (ev anchor.OTSEvidence, ok bool) {
 	var pe *PartialError
 	if errors.As(err, &pe) {
@@ -313,11 +324,90 @@ type calResult struct {
 	err  error
 }
 
+var _ anchor.Resumer = (*Target)(nil)
+
+// Resume implements anchor.Resumer: a scheduler that holds the anchor.Target
+// interface passes the evidence that was kept (the Evidence of the failed record
+// for a claim_contradicted failure, or PriorEvidenceRaw(err) of a partial Submit)
+// and gets SubmitWithPrior. An empty prior is a plain Submit. A Retry of an
+// OpenTimestamps record that holds evidence goes through Resume and not through
+// Submit, which starts again from the calendars and loses the proof (correction
+// 106).
+func (t *Target) Resume(ctx context.Context, p anchor.Payload, prior json.RawMessage) (anchor.Receipt, error) {
+	if len(prior) == 0 {
+		return t.SubmitWithPrior(ctx, p, nil)
+	}
+	ev, err := anchor.ParseOTSEvidence(prior)
+	if err != nil {
+		return anchor.Receipt{}, anchor.Errorf(anchor.ClassPermanent, anchor.KindOTS, "submit", "prior_evidence", "the prior evidence is not readable")
+	}
+	return t.SubmitWithPrior(ctx, p, &ev)
+}
+
+// PriorEvidenceRaw is PriorEvidence in the canonical encoding of the evidence
+// column, for Resume and for storing with the failed record (a *PartialError
+// leaves the record without evidence: store this).
+func PriorEvidenceRaw(err error) (json.RawMessage, bool) {
+	ev, ok := PriorEvidence(err)
+	if !ok {
+		return nil, false
+	}
+	raw, eerr := anchor.EncodeEvidence(ev)
+	if eerr != nil {
+		return nil, false
+	}
+	return raw, true
+}
+
+// carryMemory puts what the prior evidence remembers into the evidence of a new
+// submission (correction 106): the claims kept aside (only those that name an
+// attestation of a fragment that is kept; they are judged again by the rules of
+// Upgrade, so a source that is right now restores them at once) and the claims
+// dropped for good. The memory of a failed record is thereby not lost on a
+// Retry; when the prior lists cannot be carried as they are (they do not pass the
+// checks of the evidence) none of them is.
+func carryMemory(ev *anchor.OTSEvidence, prior *anchor.OTSEvidence) {
+	if len(prior.Contradicted) == 0 && len(prior.Dropped) == 0 {
+		return
+	}
+	_, roots, uris, _, err := parseEvidenceTrees(*ev)
+	if err != nil {
+		return
+	}
+	cand := *ev
+	cand.Contradicted = nil
+	for _, a := range prior.Contradicted {
+		for i, root := range roots {
+			if uris[i] != a.CalendarURI {
+				continue
+			}
+			found := false
+			for _, l := range bitcoinLeaves(root) {
+				if l.height == a.Height && hex.EncodeToString(l.msg) == a.MerkleRoot {
+					found = true
+				}
+			}
+			if found {
+				cand.Contradicted = append(cand.Contradicted, a)
+				break
+			}
+		}
+	}
+	cand.Dropped = append([]anchor.OTSDropped(nil), prior.Dropped...)
+	if cand.Validate() != nil {
+		return
+	}
+	ev.Contradicted, ev.Dropped = cand.Contradicted, cand.Dropped
+}
+
 // SubmitWithPrior submits p.Digest to every configured calendar that is not
-// already in prior (evidence kept from an earlier, partial attempt; its
-// digest must equal p.Digest). The receipt is "submitted" when at least
-// MinCalendars calendars have a fragment. Otherwise the error is a
-// *PartialError.
+// already in prior (evidence kept from an earlier, partial attempt, or from a
+// record whose claims were contradicted; its digest must equal p.Digest). The
+// receipt is "submitted" when at least MinCalendars calendars have a fragment.
+// Otherwise the error is a *PartialError. The new evidence carries the claims
+// kept aside and the claims dropped for good that the prior evidence holds
+// (carryMemory; correction 106): the claims are judged again by the rules of
+// Upgrade, and what was remembered is not lost.
 func (t *Target) SubmitWithPrior(ctx context.Context, p anchor.Payload, prior *anchor.OTSEvidence) (anchor.Receipt, error) {
 	if err := anchor.CheckPayload(anchor.KindOTS, p); err != nil {
 		return anchor.Receipt{}, err
@@ -392,6 +482,9 @@ func (t *Target) SubmitWithPrior(ctx context.Context, p anchor.Payload, prior *a
 		case anchor.IsRefused(r.err):
 			refused++
 		}
+	}
+	if prior != nil {
+		carryMemory(&ev, prior)
 	}
 	if answered < t.cfg.MinCalendars {
 		// A calendar that was only unreachable, slow or refused (401, 403) may

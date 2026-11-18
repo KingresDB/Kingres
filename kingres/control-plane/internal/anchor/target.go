@@ -125,19 +125,73 @@ type Payload struct {
 	Generation uint32
 }
 
+// Resumer is implemented by a target that can resume from the evidence of an
+// earlier attempt, so that a scheduler that holds the Target interface can ask
+// for it without knowing the concrete type (correction 106). ots.Target
+// implements it: a Retry of an OpenTimestamps record that failed with
+// claim_contradicted, or that stopped after a partial Submit, goes through Resume
+// with the evidence that was kept, and not through Submit (which starts again
+// from the calendars and loses the proof). prior is the evidence object in its
+// canonical encoding (Receipt.Evidence, or what the target's own helper encodes
+// from an error). A target that is not a Resumer has nothing to resume from: its
+// Submit is idempotent by itself.
+type Resumer interface {
+	Resume(ctx context.Context, p Payload, prior json.RawMessage) (Receipt, error)
+}
+
+// checkNextGeneration is the rule of the step to a new key generation
+// (correction 105): exactly the next generation, below the limit, with a start
+// (whole seconds) later than the start of the generation before.
+func checkNextGeneration(oldGen uint32, oldStart time.Time, g uint32, newStart time.Time) error {
+	if newStart.IsZero() {
+		return fmt.Errorf("anchor: the start of the first Submit call is required")
+	}
+	if oldGen >= MaxGeneration || g != oldGen+1 {
+		return fmt.Errorf("anchor: the next generation after %d is %d, not %d (one step at a time, at most %d)", oldGen, oldGen+1, g, MaxGeneration)
+	}
+	if !newStart.UTC().Truncate(time.Second).After(oldStart.UTC().Truncate(time.Second)) {
+		return fmt.Errorf("anchor: the start of generation %d must be later than the start of generation %d (%s)", g, oldGen, FormatTime(oldStart))
+	}
+	return nil
+}
+
 // WithGeneration returns p with the generation g and the start of the first
 // Submit call for that generation, submitStart (required, as in NewPayload: a
-// new generation is a new key and has a new first call). g is at most
-// MaxGeneration.
+// new generation is a new key and has a new first call). g must be exactly
+// p.Generation plus one, at most MaxGeneration, and submitStart (whole seconds)
+// later than p.SubmitStart: a lowered, repeated or skipped generation is
+// refused (correction 105). The caller that keeps a Record uses
+// Record.NextGeneration, which moves both values in one step.
 func (p Payload) WithGeneration(g uint32, submitStart time.Time) (Payload, error) {
-	if submitStart.IsZero() {
-		return Payload{}, fmt.Errorf("anchor: the start of the first Submit call is required")
-	}
-	if g > MaxGeneration {
-		return Payload{}, fmt.Errorf("anchor: generation must be at most %d", MaxGeneration)
+	if err := checkNextGeneration(p.Generation, p.SubmitStart, g, submitStart); err != nil {
+		return Payload{}, err
 	}
 	p.Generation = g
 	p.SubmitStart = submitStart.UTC().Truncate(time.Second)
+	return p, nil
+}
+
+// PayloadFor builds the payload of a record from the record and the signed note
+// of its checkpoint (correction 105): the SubmitStart and the Generation come from
+// the record, so that a caller cannot forget them or pass the time of the current
+// attempt. The record must have its start (Record.WithSubmitStart, persisted
+// before the first Submit call), and the note must be the one the record stands
+// for (its size and the SHA-256 of its text).
+func PayloadFor(r Record, aggregateIDHex string, signedNote []byte) (Payload, error) {
+	if r.SubmitStart.IsZero() {
+		return Payload{}, fmt.Errorf("anchor: the record has no SubmitStart: set and persist it (Record.WithSubmitStart) before the first Submit call")
+	}
+	p, err := NewPayload(aggregateIDHex, signedNote, r.SubmitStart)
+	if err != nil {
+		return Payload{}, err
+	}
+	if p.Size != r.Size || p.Digest != r.PayloadSHA256 {
+		return Payload{}, fmt.Errorf("anchor: the note is not the checkpoint of the record (size or digest differ)")
+	}
+	if r.Generation > MaxGeneration {
+		return Payload{}, fmt.Errorf("anchor: record generation must be at most %d", MaxGeneration)
+	}
+	p.Generation = r.Generation
 	return p, nil
 }
 

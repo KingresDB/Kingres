@@ -160,7 +160,22 @@ func (t *Target) get(ctx context.Context, op, key, version string) (*response, e
 func sanitize(s string) string { return (anchor.Redactor{}).Clean(s, 40) }
 
 // Test implements anchor.Target (design 6.8): reachability, versioning,
-// object lock and its default retention, and a probe object.
+// object lock and its default retention, and a probe object that exercises what
+// the first Submit will meet (correction 105): the probe is written with the
+// attempt header, and the read-back must return it as sent (check
+// "user-metadata", failed when the store drops, changes or repeats it); the
+// store's Last-Modified of the probe must be within the tolerance of the clock
+// (check "store-time", failed when outside); and PutObjectRetention is tried on
+// the probe version in the configured mode (check "retention", a warning when
+// refused, with the text that the repair path needs it).
+//
+// What the probe leaves in the bucket: one empty object under
+// <keyPrefix>/_probe/<16 hex digits> (a second version of the same key when the
+// store ignores If-None-Match). It is not locked by this call, except for ten
+// minutes (ProbeRetention) by the retention check, and for the default retention
+// of the bucket when there is one (the "default-retention" check says so for
+// COMPLIANCE). Nothing in this package deletes it; an operator may delete the
+// versions by hand when their lock has ended.
 func (t *Target) Test(ctx context.Context) anchor.TestResult {
 	var res anchor.TestResult
 	ctx, cancel := withTimeout(ctx)
@@ -219,13 +234,15 @@ func (t *Target) Test(ctx context.Context) anchor.TestResult {
 		return res
 	}
 	key := cfg.KeyPrefix + "/_probe/" + hex.EncodeToString(rb[:])
-	r, err := t.put(ctx, key, []byte{}, time.Time{}, true, false, time.Time{})
+	// the probe is written as the first Submit will write: with the attempt header
+	attempt := t.s.clock().UTC().Truncate(time.Second)
+	r, err := t.put(ctx, key, []byte{}, time.Time{}, true, false, attempt)
 	switch {
 	case err != nil:
 		res.Add("probe-put", anchor.CheckFailed, "%s", err.Error())
 		return res
 	case r.status == 200:
-		res.Add("probe-put", anchor.CheckOK, "a probe object was written with If-None-Match and the checksum header")
+		res.Add("probe-put", anchor.CheckOK, "a probe object was written with If-None-Match, the checksum header and the user metadata of the attempt")
 	case r.status == 501 || r.status == 400:
 		st := anchor.CheckWarning
 		if cfg.IfNoneMatch == IfNoneMatchOn {
@@ -237,12 +254,19 @@ func (t *Target) Test(ctx context.Context) anchor.TestResult {
 		res.Add("probe-put", anchor.CheckFailed, "%s", t.s.statusError("put", r).Error())
 		return res
 	}
-	if h, err := t.head(ctx, "probe-head", key, r.header.Get(hdrVersion)); err != nil {
+	version := r.header.Get(hdrVersion)
+	if h, err := t.head(ctx, "probe-head", key, version); err != nil {
 		res.Add("probe-head", anchor.CheckFailed, "%s", err.Error())
 	} else if h.status != 200 {
 		res.Add("probe-head", anchor.CheckFailed, "%s", t.s.statusError("probe-head", h).Error())
 	} else {
 		res.Add("probe-head", anchor.CheckOK, "the probe object can be read back")
+		t.probeMetadata(&res, h, attempt)
+		t.probeStoreTime(&res, h)
+		if version == "" {
+			version = h.header.Get(hdrVersion)
+		}
+		t.probeRetention(ctx, &res, key, version)
 	}
 	r2, err := t.put(ctx, key, []byte{}, time.Time{}, true, false, time.Time{})
 	switch {
@@ -268,6 +292,67 @@ func (t *Target) Test(ctx context.Context) anchor.TestResult {
 		}
 	}
 	return res
+}
+
+// ProbeRetention is how long the probe version of Test is locked by the check of
+// PutObjectRetention, in the configured mode (correction 105).
+const ProbeRetention = 10 * time.Minute
+
+// probeMetadata is the check "user-metadata": the read-back of the probe must
+// carry the attempt exactly as sent, as the read-back of a first Submit must (a
+// store that drops, changes or repeats it refuses every first Submit with
+// "no_user_metadata").
+func (t *Target) probeMetadata(res *anchor.TestResult, h *response, sent time.Time) {
+	want := anchor.FormatTime(sent)
+	switch vals := h.header.Values(hdrAttempt); {
+	case len(vals) == 1 && vals[0] == want:
+		res.Add("user-metadata", anchor.CheckOK, "the store returns the user metadata x-amz-meta-kingres-attempt exactly as it was sent")
+	case len(vals) == 0:
+		res.Add("user-metadata", anchor.CheckFailed, "the store, or a gateway in front of it, drops the user metadata x-amz-meta-kingres-attempt: every first Submit would end in no_user_metadata (correction 105); use a store that keeps user metadata")
+	default:
+		res.Add("user-metadata", anchor.CheckFailed, "the store, or a gateway in front of it, changes or repeats the user metadata x-amz-meta-kingres-attempt (%d values, not the one sent): every first Submit would end in no_user_metadata, and a Retry would be refused for good; use a store or gateway that returns it exactly", len(vals))
+	}
+}
+
+// probeStoreTime is the check "store-time": the store's Last-Modified of the
+// probe must be within the tolerance of the clock of this server, as the first
+// Submit requires of a fresh write (otherwise store_time_skew or
+// store_time_early).
+func (t *Target) probeStoreTime(res *anchor.TestResult, h *response) {
+	lm, err := http.ParseTime(h.header.Get("Last-Modified"))
+	if err != nil {
+		res.Add("store-time", anchor.CheckFailed, "the store returned no usable Last-Modified for the probe: every first Submit would be refused (no_last_modified)")
+		return
+	}
+	skew := t.maxSkew()
+	d := lm.UTC().Truncate(time.Second).Sub(t.s.clock())
+	if d > skew || d < -skew {
+		res.Add("store-time", anchor.CheckFailed, "the store's Last-Modified of the probe is %s from the clock of this server, more than the tolerance of %s: every first Submit would be refused (store_time_skew when the store is ahead, store_time_early when it is behind); correct the clock of the store or of this server", d.Round(time.Second), skew)
+		return
+	}
+	res.Add("store-time", anchor.CheckOK, "the store's Last-Modified of the probe is %s from the clock of this server (tolerance %s)", d.Round(time.Second), skew)
+}
+
+// probeRetention is the check "retention": PutObjectRetention on the probe
+// version in the configured mode (until ProbeRetention from now). A refusal is a
+// warning only: the repair path of Submit needs the call (an object found without
+// a lock, with a lock that is too short, or older than its own retention), the
+// first write does not.
+func (t *Target) probeRetention(ctx context.Context, res *anchor.TestResult, key, version string) {
+	if version == "" {
+		res.Add("retention", anchor.CheckWarning, "the store returned no version id for the probe: PutObjectRetention was not tried")
+		return
+	}
+	mode := t.s.cfg.lockMode()
+	r, err := t.putRetention(ctx, key, version, mode, t.s.clock().Add(ProbeRetention))
+	switch {
+	case err != nil:
+		res.Add("retention", anchor.CheckWarning, "PutObjectRetention on the probe version could not be tried: %s", err.Error())
+	case r.status == 200 || r.status == 204:
+		res.Add("retention", anchor.CheckOK, "PutObjectRetention is accepted in %s mode: the repair of a found object that has no lock, or too short a lock, can work (the probe version is locked for %s)", mode, ProbeRetention)
+	default:
+		res.Add("retention", anchor.CheckWarning, "the store refused PutObjectRetention on the probe version (http %d): the repair path of Submit needs it, and without it an object found without a lock, with a lock that is too short or older than its own retention ends in not_locked for good; grant the credential s3:PutObjectRetention (a bucket default retention longer than the probe's date refuses it too)", r.status)
+	}
 }
 
 func (t *Target) bucketGet(ctx context.Context, sub string) (*response, error) {

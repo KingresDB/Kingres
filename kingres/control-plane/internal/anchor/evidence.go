@@ -25,12 +25,22 @@ const (
 	MaxEvidenceFile = 4 << 20
 	// MaxOTSCalendars is the most calendar fragments in one OTS evidence.
 	MaxOTSCalendars = 16
+	// MaxOTSContradictionsPerCalendar is the share of one calendar in the claims
+	// kept aside (correction 106): a calendar over its share loses its own surplus
+	// claims, never another calendar's claim, and a claim that a header contradicts
+	// for the first time is never dropped because other calendars fill the list.
+	MaxOTSContradictionsPerCalendar = 8
 	// MaxOTSContradictions is the most contradicted claims kept aside in one OTS
-	// evidence; one more is dropped for good.
-	MaxOTSContradictions = 32
-	// MaxOTSDropped is the most dropped claims remembered in one OTS evidence;
-	// when it is full the oldest is forgotten.
-	MaxOTSDropped = 32
+	// evidence: the shares of all calendars together, so that the evidence stays
+	// within its size limit.
+	MaxOTSContradictions = MaxOTSCalendars * MaxOTSContradictionsPerCalendar
+	// MaxOTSDroppedPerCalendar is the most dropped claims remembered for one
+	// calendar (correction 106); when it is full the oldest of that calendar is
+	// forgotten, and no other calendar's memory is touched.
+	MaxOTSDroppedPerCalendar = 32
+	// MaxOTSDropped is the most dropped claims remembered in one OTS evidence (16
+	// calendars with their full share); when it is full the oldest is forgotten.
+	MaxOTSDropped = MaxOTSCalendars * MaxOTSDroppedPerCalendar
 	// MaxGeneration is the largest key generation of a payload (correction 95).
 	MaxGeneration = 1000
 	// MaxTokenDER is the largest TSA token (DER) stored in evidence.
@@ -202,8 +212,9 @@ type OTSEvidence struct {
 	// Contradicted lists the claims kept aside (an empty array when none).
 	Contradicted []OTSContradiction `json:"contradicted"`
 	// Dropped lists the claims dropped for good that are still remembered (an
-	// empty array when none), at most MaxOTSDropped: when it is full the oldest
-	// entry is forgotten.
+	// empty array when none), at most MaxOTSDroppedPerCalendar per calendar and
+	// MaxOTSDropped in all: when a calendar's share is full the oldest entry of
+	// that calendar is forgotten (correction 106).
 	Dropped []OTSDropped `json:"dropped"`
 }
 
@@ -338,7 +349,11 @@ func (e OTSEvidence) Validate() error {
 		return errors.New("anchor: ots evidence has too many contradicted claims")
 	}
 	seenC := map[string]bool{}
+	perCal := map[string]int{}
 	for _, c := range e.Contradicted {
+		if perCal[c.CalendarURI]++; perCal[c.CalendarURI] > MaxOTSContradictionsPerCalendar {
+			return errors.New("anchor: ots evidence has too many contradicted claims of one calendar")
+		}
 		if !seen[c.CalendarURI] || c.Height > MaxBitcoinHeight || !isLowerHex(c.MerkleRoot, 32) || !isLowerHex(c.Header, 80) ||
 			!printableASCII(c.Reason, 300) {
 			return errors.New("anchor: ots evidence has a malformed contradicted claim")
@@ -356,7 +371,11 @@ func (e OTSEvidence) Validate() error {
 		return errors.New("anchor: ots evidence has too many dropped claims")
 	}
 	seenD := map[string]bool{}
+	perDrop := map[string]int{}
 	for _, d := range e.Dropped {
+		if perDrop[d.CalendarURI]++; perDrop[d.CalendarURI] > MaxOTSDroppedPerCalendar {
+			return errors.New("anchor: ots evidence remembers too many dropped claims of one calendar")
+		}
 		if !printableASCII(d.CalendarURI, 1000) || d.CalendarURI == "" || d.Height > MaxBitcoinHeight || !isLowerHex(d.MerkleRoot, 32) {
 			return errors.New("anchor: ots evidence has a malformed dropped claim")
 		}

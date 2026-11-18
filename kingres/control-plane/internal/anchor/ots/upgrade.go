@@ -253,8 +253,10 @@ func dropClaims(roots []*Node, uris []string, claims []ClaimCheck) ([]*Node, []s
 // the caller can alert: a calendar that lied and a source that is wrong are
 // both operator matters. A hostile calendar still cannot keep a record alive
 // beyond its expiry (the record's own timeout counts from its creation), and
-// what is kept aside is bounded (anchor.MaxOTSContradictions entries; one more
-// is dropped for good).
+// what is kept aside is bounded per calendar (anchor.MaxOTSContradictionsPerCalendar
+// entries each; a calendar over its share loses its own surplus claims, never
+// another calendar's claim, and an answer with more than MaxAnswerClaims Bitcoin
+// attestations is refused as a whole; correction 106).
 //
 // When no plausible claim is left the receipt is "submitted" again (and says
 // so: the record falls back to submitted) as long as a calendar can still
@@ -340,7 +342,10 @@ func (t *Target) Upgrade(ctx context.Context, r anchor.Receipt) (anchor.Receipt,
 					if at, err := anchor.ParseTime(aside[idx].At); err != nil || !now.Before(at.Add(t.confirm)) {
 						drop = append(drop, c)
 					}
-				case len(aside) >= anchor.MaxOTSContradictions:
+				case asideOf(aside, c.CalendarURI) >= anchor.MaxOTSContradictionsPerCalendar:
+					// the calendar is over ITS share: it loses its own surplus claim; a
+					// claim of another calendar is never dropped because this one fills
+					// its share (correction 106)
 					drop = append(drop, c)
 				default:
 					aside = append(aside, anchor.OTSContradiction{
@@ -425,15 +430,46 @@ func (t *Target) Upgrade(ctx context.Context, r anchor.Receipt) (anchor.Receipt,
 	return counts(rc), nil
 }
 
+// asideOf counts the claims kept aside that belong to a calendar.
+func asideOf(aside []anchor.OTSContradiction, uri string) int {
+	n := 0
+	for _, a := range aside {
+		if a.CalendarURI == uri {
+			n++
+		}
+	}
+	return n
+}
+
 // rememberDropped adds a claim dropped for good to the list of those remembered
-// (bounded by anchor.MaxOTSDropped: when it is full the oldest is forgotten; a
-// claim already in it is not added twice).
+// (a claim already in it is not added twice). The memory is bounded per calendar
+// (anchor.MaxOTSDroppedPerCalendar: when a calendar's share is full the oldest
+// entry of that calendar is forgotten, and no other calendar's memory is touched)
+// and in all (anchor.MaxOTSDropped: the oldest of all is forgotten), correction
+// 106: one calendar's answers cannot evict what is remembered of another, and
+// one answer (at most MaxAnswerClaims claims) cannot evict what is remembered of
+// its own calendar while the share has room for it.
 func rememberDropped(list []anchor.OTSDropped, c ClaimCheck, now time.Time) []anchor.OTSDropped {
 	if isRemembered(list, c.CalendarURI, c.Height, c.Root[:]) {
 		return list
 	}
 	list = append(list, anchor.OTSDropped{CalendarURI: c.CalendarURI, Height: c.Height,
 		MerkleRoot: hex.EncodeToString(c.Root[:]), At: anchor.FormatTime(now)})
+	own := 0
+	for _, d := range list {
+		if d.CalendarURI == c.CalendarURI {
+			own++
+		}
+	}
+	if own > anchor.MaxOTSDroppedPerCalendar {
+		// the new entry is the last: the first entry of the same calendar is its oldest
+		for i, d := range list {
+			if d.CalendarURI == c.CalendarURI {
+				list = append(append([]anchor.OTSDropped(nil), list[:i]...), list[i+1:]...)
+				break
+			}
+		}
+	}
 	if n := len(list) - anchor.MaxOTSDropped; n > 0 {
 		list = append([]anchor.OTSDropped(nil), list[n:]...)
 	}
@@ -556,6 +592,15 @@ func (t *Target) lookups(ctx context.Context, roots []*Node, uris []string, subm
 		}
 		ok++
 		if !l.found {
+			continue
+		}
+		// an answer that carries more Bitcoin attestations than MaxAnswerClaims is
+		// refused as a whole, as an implausible answer of that calendar (correction
+		// 106): an honest answer holds a few, and 10,000 bytes hold about 400 false
+		// ones, with which one calendar could fill the claims kept aside
+		if n := len(BitcoinClaims(l.got)); n > MaxAnswerClaims {
+			failures = append(failures, anchor.Errorf(anchor.ClassPermanent, anchor.KindOTS, "upgrade", "implausible_answer",
+				"calendar %s answered with %d Bitcoin attestations, more than the %d an answer may carry: the whole answer is refused", hostOf(l.base), n, MaxAnswerClaims))
 			continue
 		}
 		// a claim that was dropped for good and is answered again is put aside at
