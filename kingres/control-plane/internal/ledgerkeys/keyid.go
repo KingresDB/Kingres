@@ -34,6 +34,12 @@ type KeyIDCollision struct {
 	// are also usable for a fresh checkpoint (neither is revoked, and neither is
 	// a next key left out of the trust file).
 	Fresh, Held bool
+	// Also lists the other colliding pairs CheckSetKeyIDs or AddChecked found, in
+	// the order of the set (empty for one pair). The pair in the error itself is
+	// the first one that affects fresh checkpoints (Fresh) when there is one, so
+	// that a pair that matters for fresh checkpoints is never hidden behind one
+	// that matters only for held notes (K3-02).
+	Also []KeyIDCollision
 }
 
 // Error says what happened and what the operator does.
@@ -47,7 +53,18 @@ func (e *KeyIDCollision) Error() string {
 		"and the verifier refuses the checkpoints of this name while its trust file lists both as usable, and every note of this name that it holds while its trust file lists both at all (a revoked key too). "+
 		"A key that has not signed anything yet (state next) must be dropped and another generated; "+
 		"check a new key with Set.AddChecked or CheckSetKeyIDs for the origins of the logs before it is added",
-		ErrKeyIDCollision.Error(), clip(e.Name), shortFP(e.A), shortFP(other), e.ID)
+		ErrKeyIDCollision.Error(), clip(e.Name), shortFP(e.A), shortFP(other), e.ID) + e.alsoText()
+}
+
+func (e *KeyIDCollision) alsoText() string {
+	if len(e.Also) == 0 {
+		return ""
+	}
+	s := fmt.Sprintf(" (%d other colliding pair(s) under this name:", len(e.Also))
+	for _, o := range e.Also {
+		s += fmt.Sprintf(" %s and %s;", shortFP(o.A), shortFP(o.B))
+	}
+	return s + ")"
 }
 
 // Is reports whether target is ErrKeyIDCollision.
@@ -101,28 +118,68 @@ func CheckKeyIDs(name string, pubs ...ed25519.PublicKey) error {
 // and true for what it lists once the next keys are pinned (the stricter
 // reading; Set.AddChecked uses it), once per log origin. The same key twice is
 // not a collision.
+//
+// It reports EVERY colliding pair, not only the first: the returned
+// *KeyIDCollision is the first pair that affects fresh checkpoints (Fresh)
+// when there is one, else the first pair, and Also lists the others, so a pair
+// that stops fresh checkpoints is never hidden behind one that only affects
+// notes already held (K3-02, correction 107).
 func CheckSetKeyIDs(set Set, opt TrustOptions, origin string) error {
+	all, err := setCollisions(set, opt, origin)
+	if err != nil {
+		return err
+	}
+	return collisionError(all)
+}
+
+// setCollisions finds every colliding pair of the keys the trust file would
+// list, in the order of the set (the pair of the keys i < j is reported in the
+// order i, j).
+func setCollisions(set Set, opt TrustOptions, origin string) ([]KeyIDCollision, error) {
 	if !ValidKeyName(origin) {
-		return fmt.Errorf("%w: %q is not a valid key name", ErrInvalidArgument, clip(origin))
+		return nil, fmt.Errorf("%w: %q is not a valid key name", ErrInvalidArgument, clip(origin))
 	}
-	type listed struct {
-		pub    ed25519.PublicKey
-		usable bool
-	}
-	seen := map[uint32]listed{}
+	var listed []Key
 	for _, k := range set {
 		if len(k.Public) != ed25519.PublicKeySize {
-			return fmt.Errorf("%w: a public key has %d bytes, expected %d", ErrInvalidArgument, len(k.Public), ed25519.PublicKeySize)
+			return nil, fmt.Errorf("%w: a public key has %d bytes, expected %d", ErrInvalidArgument, len(k.Public), ed25519.PublicKeySize)
 		}
 		if k.State == StateNext && !opt.IncludeNext {
 			continue
 		}
-		usable := k.State != StateRevoked
-		id := KeyID(origin, k.Public)
-		if q, ok := seen[id]; ok && !bytes.Equal(k.Public, q.pub) {
-			return &KeyIDCollision{Name: origin, ID: id, A: Fingerprint(q.pub), B: Fingerprint(k.Public), Fresh: usable && q.usable, Held: true}
-		}
-		seen[id] = listed{k.Public, usable}
+		listed = append(listed, k)
 	}
-	return nil
+	var out []KeyIDCollision
+	for i, a := range listed {
+		for _, b := range listed[i+1:] {
+			if bytes.Equal(a.Public, b.Public) || KeyID(origin, a.Public) != KeyID(origin, b.Public) {
+				continue
+			}
+			out = append(out, KeyIDCollision{Name: origin, ID: KeyID(origin, a.Public), A: Fingerprint(a.Public), B: Fingerprint(b.Public),
+				Fresh: a.State != StateRevoked && b.State != StateRevoked, Held: true})
+		}
+	}
+	return out, nil
+}
+
+// collisionError turns the pairs found into one error: the first Fresh pair, or
+// the first pair, with the others in Also. nil for no pair.
+func collisionError(all []KeyIDCollision) error {
+	if len(all) == 0 {
+		return nil
+	}
+	main := 0
+	for i, c := range all {
+		if c.Fresh {
+			main = i
+			break
+		}
+	}
+	e := all[main]
+	for i, c := range all {
+		if i != main {
+			e.Also = append(e.Also, c)
+		}
+	}
+	return &e
 }

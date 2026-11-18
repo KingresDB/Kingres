@@ -108,8 +108,11 @@ var (
 	// made because the file system has no hard links (the errors that mean
 	// that, and only those: see platformNoHardLinks; any other failure is
 	// returned as it is, with its cause): the publication directory needs a
-	// file system with hard links. Nothing was published.
-	ErrHardLinksRequired = errors.New("ledgerlog: the publication directory needs a file system with hard links")
+	// file system with hard links. Nothing was published. The error that
+	// means "no hard links" on Unix (EPERM) is also what link(2) gives for a
+	// directory that is immutable or append-only, so the text names both
+	// (K3-09); nothing is published in either case.
+	ErrHardLinksRequired = errors.New("ledgerlog: the publication directory needs a file system with hard links (the same error also means that the directory is immutable or append-only, or that the system refuses new links there)")
 	// ErrCheckpointBusy is returned by PutCheckpoint when the checkpoint file is
 	// held open by another program (Windows) for the whole of CheckpointRetry.
 	// The old checkpoint is whole, no temporary file is left, and trying again

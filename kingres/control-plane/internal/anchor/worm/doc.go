@@ -2,7 +2,8 @@
 
 // Package worm anchors a signed checkpoint by writing it to an S3 compatible
 // store under Object Lock (design 6.3, with corrections 60 to 65, 81 to 84 and
-// 88 to 92 of section 14; the ones that describe this code are 81, 82, 89 and 95).
+// 88 to 92 and 95 and 105 of section 14; the ones that describe this code are 81,
+// 82, 89, 95 and 105).
 // It implements anchor.Target with kind "worm".
 //
 // # What Submit does
@@ -30,8 +31,17 @@
 //     of the attempt must come back on the read-back of a version this call wrote
 //     exactly as it was sent (one value, the same text); a store that drops it,
 //     changes it or repeats it is refused with Code "no_user_metadata" (permanent:
-//     the object is written and locked and stays, the record does not spin; the
-//     text says what the operator does; correction 95). A
+//     the object is written and locked and stays, the record does not spin;
+//     corrections 95 and 105). What a Retry does depends on what came back: when
+//     the header was dropped, a Retry finds the object and accepts it under the
+//     wide window (the evidence then states "attempt": null); when it came back
+//     changed or repeated, the object carries that value, so a Retry is refused
+//     for good with "attempt_malformed", and a new key generation does not help (it
+//     writes another object that meets the same refusal): only another store, or
+//     a gateway that returns the header exactly, helps. The two texts say so, and
+//     the text of "attempt_malformed" names both possible causes (another
+//     principal wrote the version: a new generation or key prefix; this package
+//     wrote it and the store changed the header: another store). A
 //     store that accepts the put without locking is reported as a permanent
 //     error with Code "not_locked". A failed read-back is retryable for a
 //     transport failure or a 5xx and refused (a few tries, then failed) for
@@ -48,7 +58,15 @@
 //     (a copy another principal placed after ours, unlocked, in a weaker mode or
 //     with a forged attempt), the other versions are looked at, bounded as above,
 //     and the first of ours that passes completes the record; when none passes,
-//     the error is that of the latest (correction 95). Only when no
+//     the error is that of the latest (correction 95), unless the walk stopped at
+//     its bound (MaxVersionsChecked versions read, or MaxListPages pages): then it
+//     is Code "versions_bound_reached", which says that the bound was reached and
+//     that our own version may be hidden behind later copies of our bytes, and
+//     that a new key generation does not help (correction 105). The limit is
+//     real: a principal who can write the bucket and writes MaxVersionsChecked or
+//     more copies of our bytes after ours ends the record, whether the copies are
+//     malformed, unlocked or foreign in any other way; the answer is a bucket that
+//     nobody else writes, not a larger bound. Only when no
 //     version of the key holds the note is it an error of class conflict (Code
 //     "worm_conflict"); nothing is ever overwritten. A version of ours that has
 //     no lock, or a retention shorter than the floor below, gets the retention
@@ -115,7 +133,13 @@
 //     also says that waiting and a Retry find the same object and are refused in
 //     the same way, and what the operator can do: a new key generation (below) or
 //     another keyPrefix; for a found object without the attempt it says Retry,
-//     since a clock that has caught up can make its time acceptable.
+//     since a clock that has caught up can make its time acceptable. A refusal
+//     whose verdict is final (the object carries its attempt, or this call wrote it)
+//     is marked (anchor.Error.Final, anchor.IsFinal): anchor.Record.AfterError
+//     fails the record at once with the alert of a failed record, instead of
+//     spending the waits of 1, 5 and 15 minutes on requests that find the same
+//     object (correction 105); the refusal of an object without the attempt keeps
+//     its waits.
 //
 // What is left, stated so that it can be tested: a version found WITHOUT the
 // metadata (written by another principal, or by a writer that is not this
@@ -145,19 +169,57 @@
 // the key is dead for that checkpoint. The way out that does not change the
 // configuration of the target is the generation of the key: anchor.Payload
 // carries Generation (0 for every record that exists; the key of generation 0 is
-// exactly the key of ObjectKey), the caller persists it with the record, and
-// Payload.WithGeneration(n, newStart) gives the payload of generation n, which is
-// a new key, so it has a new first Submit call and a new start. The evidence
+// exactly the key of ObjectKey), the shape of the row is in the library
+// (anchor.Record has SubmitStart and Generation; anchor.PayloadFor builds the
+// payload from the record), and the step is anchor.Record.NextGeneration(newStart,
+// now): exactly the next generation, with a start later than the old one, in one
+// returned record, so that one write persists both (Payload.WithGeneration applies
+// the same rule to a payload alone; a lowered, repeated or skipped generation is
+// refused; correction 105). The new generation is a new key, so it has a new first
+// Submit call and a new start. The evidence
 // records the generation (member "generation") and VerifyNote checks it against
 // the key. Every target receives the same payload; only this one uses the value.
-// The caller raises it only on an operator.s explicit choice, after a permanent
+// The caller raises it only on an operator's explicit choice, after a permanent
 // refusal of the time of the store (store_time_early, store_time_skew of an
-// object that carries its attempt, attempt_malformed), once the clocks are
-// right, and never automatically: each generation is one more object in the
-// bucket that claims to be the anchor of that checkpoint, locked until its
-// retention ends, and a loop that raised it would fill the bucket. The earlier
-// generations stay as they are; nothing is deleted. At most anchor.MaxGeneration.
-
+// object that carries its attempt, attempt_malformed of a version that another
+// principal wrote), once the clocks are right, and never automatically: each
+// generation is one more object in the bucket that claims to be the anchor of
+// that checkpoint, locked until its retention ends, and a loop that raised it
+// would fill the bucket. It does NOT help after "no_user_metadata", or after the
+// "attempt_malformed" that follows it (the store changed the header): the new
+// object meets the same refusal, so each press leaves one more locked object and
+// the checkpoint is still not anchored; only another store or gateway helps. The
+// earlier generations stay as they are; nothing is deleted. At most
+// anchor.MaxGeneration.
+//
+// # The Test button (correction 105)
+//
+// Test exercises what the first Submit will meet. Besides the bucket, versioning,
+// Object Lock and default retention it writes a probe with the attempt header, as
+// Submit does, and checks: "user-metadata" (the read-back must return the header
+// exactly as sent; failed when the store drops, changes or repeats it, since every
+// first Submit would end in no_user_metadata), "store-time" (the store's
+// Last-Modified of the probe must be within the tolerance of the clock; failed
+// when outside), and "retention" (PutObjectRetention on the probe version in the
+// configured mode until ProbeRetention from now; a warning when refused, with the
+// text that the repair path needs it). The probe leaves one empty object under
+// <keyPrefix>/_probe/<16 hex digits> in the bucket (two versions when the store
+// ignores If-None-Match), unlocked except for ProbeRetention and for the default
+// retention of the bucket; nothing in this package deletes it.
+//
+// # The credential
+//
+// The credential needs: s3:PutObject (the write), s3:PutObjectRetention (a put
+// with the Object Lock headers needs it on AWS, and the repair of a found object
+// is a PutObjectRetention of its own), s3:GetObject and s3:GetObjectVersion (the
+// read-back and the search of the versions), s3:ListBucketVersions (the listing
+// that finds our version behind a later one), and, for Test,
+// s3:GetBucketVersioning and s3:GetBucketObjectLockConfiguration. It needs no
+// permission to delete, and none should be given. Without PutObjectRetention an
+// object found without a lock, with a lock that is too short or older than its
+// own retention ends in "not_locked" for good although this package wrote it;
+// Test warns when the call is refused.
+//
 // # The retention floor
 //
 // The floor of the retain-until date comes from the store's own timeline and not
@@ -271,17 +333,22 @@
 // about credentials although the first is of class refused. The clocks of the
 // servers that make calls must agree within the tolerance.
 //
-// Persist the generation of the key (Payload.Generation, 0 for a new record) with
-// the record and pass it on every call. Raise it with Payload.WithGeneration(n,
-// newStart), by one and with a new start taken from a clock that is right, only
-// when an operator chooses to anchor the checkpoint under a new key after a
+// Keep SubmitStart and Generation in the row of the record (anchor.Record has both)
+// and build every payload with anchor.PayloadFor(record, aggregate id, note): the
+// payload then carries them, and they cannot be forgotten at a call. Set the start
+// with Record.WithSubmitStart and persist it before the first call. Raise the
+// generation only with Record.NextGeneration(newStart, now), by one and with a new
+// start taken from a clock that is right, persisted in one write with the state,
+// only when an operator chooses to anchor the checkpoint under a new key after a
 // permanent refusal of the time of the store (the codes store_time_early,
-// store_time_skew of an object that carries its attempt, attempt_malformed; the
-// text of the error says so); never automatically, and never because a Retry
-// failed: each generation is one more object that claims to be the anchor of that
-// checkpoint. A store that does not keep user metadata ("no_user_metadata") needs
-// another store, or a gateway that keeps it; a Retry of that refusal accepts the
-// object under the wide window and the evidence states "attempt": null. Warn when
+// store_time_skew of an object that carries its attempt, attempt_malformed of a
+// version that another principal wrote; the text of the error says so); never
+// automatically, and never because a Retry failed: each generation is one more
+// object that claims to be the anchor of that checkpoint. A store that does not
+// keep user metadata ("no_user_metadata") needs another store, or a gateway that
+// keeps it exactly; when the header was dropped a Retry accepts the object under
+// the wide window and the evidence states "attempt": null; when it was changed or
+// repeated a Retry is refused for good, and a new generation does not help. Warn when
 // the evidence of a found object states "attempt": null: its time is bounded by
 // SubmitStart only.
 //
@@ -289,8 +356,9 @@
 // Lock, used for nothing else. Another principal that can write the bucket can
 // write our key with our bytes (the note is public once published) and be
 // adopted (the evidence says found), can write versions of other bytes after
-// ours until the newest MaxVersionsChecked hide ours and the record ends in
-// class conflict with the critical alert, and can write junk under the key of a
+// ours until the newest MaxVersionsChecked hide ours and the record ends (with
+// the code versions_bound_reached when copies of our bytes hide it, or in class
+// conflict with the critical alert when other bytes do), and can write junk under the key of a
 // future size; none of this can be told from the cluster's own writes except by
 // the "found" member and the metadata. This package does not store anything,
 // retry, or delete objects.

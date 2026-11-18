@@ -194,29 +194,26 @@ func TestContradictionConfirmIntervalIsConfigurable(t *testing.T) {
 	}
 }
 
-// What is kept aside is bounded: the 33rd contradicted claim of one evidence is
-// dropped for good at once, and the evidence stays within its limit.
+// What is kept aside is bounded per calendar (correction 106): the claims of one
+// calendar over its share (anchor.MaxOTSContradictionsPerCalendar) are dropped
+// for good at once, and the evidence stays within its limit.
 func TestClaimsAsideAreBounded(t *testing.T) {
 	digest := sha([]byte("digest under test"))
 	cal := newScriptCal(t)
-	frag, commit := submittedFragment(digest, cal.url(), 1)
-	var parts [][]byte
-	const n = anchor.MaxOTSContradictions + 1
-	for i := 0; i < n; i++ {
-		if i < n-1 { // every item but the last is introduced by 0xff
-			parts = append(parts, []byte{0xff})
-		}
-		parts = append(parts, cat(opAppend([]byte{byte(i), 7, 7, 7}), opSHA256B, opSHA256B, attBitcoinB(goodHeight)))
+	const per = anchor.MaxOTSContradictionsPerCalendar
+	const n = 2 * per
+	frag, commits := multiFragment(digest, cal.url(), 2)
+	for i, c := range commits {
+		cal.answer(c, claimsAnswer(byte(i+1), per, goodHeight))
 	}
-	cal.answer(commit, cat(parts...))
 	rc := receiptOf(t, evidenceFor(t, digest, map[string][]byte{cal.url(): frag}, []string{cal.url()}))
 	src := &fakeHeaders{m: map[uint64][]byte{goodHeight: wrongHeader()}}
 	tg := upgradeTarget(t, Options{Headers: src, headerWork: noWorkFn}, cal.url())
 	out, err := tg.Upgrade(context.Background(), rc)
-	if err != nil || out.ContradictedClaims != n || out.ClaimsAside != anchor.MaxOTSContradictions || out.ClaimsDropped != 1 {
+	if err != nil || out.ContradictedClaims != n || out.ClaimsAside != per || out.ClaimsDropped != per {
 		t.Fatalf("%+v %v", out, err)
 	}
-	if ev, err := anchor.ParseOTSEvidence(out.Evidence); err != nil || len(ev.Contradicted) != anchor.MaxOTSContradictions {
+	if ev, err := anchor.ParseOTSEvidence(out.Evidence); err != nil || len(ev.Contradicted) != per {
 		t.Fatalf("%v", err)
 	}
 }

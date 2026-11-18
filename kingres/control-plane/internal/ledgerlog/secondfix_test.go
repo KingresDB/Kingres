@@ -205,25 +205,25 @@ func TestResignCheckpointChecksEveryTrustedKey(t *testing.T) {
 	}
 	// a is a trusted key with no line in the note (it is in the trust file);
 	// b, the new signer, has a's key id. The verifier would refuse the result.
-	trusted := []ed25519.PublicKey{signer.Public(), a.Public()}
+	trusted := usable(signer.Public(), a.Public())
 	out, err := ResignCheckpoint(bg, note, trusted, b)
 	wantCollision(t, "a silent trusted key", err, a, b, true)
 	if out != nil {
 		t.Error("a note came back with the error")
 	}
 	// Two new signers that collide with each other, neither of them trusted.
-	_, err = ResignCheckpoint(bg, note, []ed25519.PublicKey{signer.Public()}, a, b)
+	_, err = ResignCheckpoint(bg, note, usable(signer.Public()), a, b)
 	wantCollision(t, "two new signers", err, a, b, true)
 	// Two trusted keys that collide.
-	_, err = ResignCheckpoint(bg, note, []ed25519.PublicKey{signer.Public(), a.Public(), b.Public()}, testKey(t, 2))
+	_, err = ResignCheckpoint(bg, note, usable(signer.Public(), a.Public(), b.Public()), testKey(t, 2))
 	wantCollision(t, "two trusted keys", err, a, b, true)
 	// Without the silent key in trusted nothing is wrong that the function can
 	// see: this is why trusted must hold every key of the trust file.
-	if _, err := ResignCheckpoint(bg, note, []ed25519.PublicKey{signer.Public()}, b); err != nil {
+	if _, err := ResignCheckpoint(bg, note, usable(signer.Public()), b); err != nil {
 		t.Errorf("a new signer that collides with nothing the caller named: %v", err)
 	}
 	// A new signer that is a trusted key without a line is fine.
-	two, err := ResignCheckpoint(bg, note, []ed25519.PublicKey{signer.Public(), b.Public()}, b)
+	two, err := ResignCheckpoint(bg, note, usable(signer.Public(), b.Public()), b)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,13 +247,13 @@ func TestResignCheckpointRefusesALineOfNoTrustedKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := ResignCheckpoint(bg, forged, []ed25519.PublicKey{k1.Public()}, k2)
+	out, err := ResignCheckpoint(bg, forged, usable(k1.Public()), k2)
 	if !errors.Is(err, ErrUntrustedLine) || out != nil {
 		t.Fatalf("a forged line under an untrusted key id: %v", err)
 	}
 	// With that key in trusted the line is a line of a trusted key that does not
 	// verify, and the note is refused as before.
-	if _, err := ResignCheckpoint(bg, forged, []ed25519.PublicKey{k1.Public(), testKey(t, 80).Public()}, k2); !errors.Is(err, ErrBadSignature) {
+	if _, err := ResignCheckpoint(bg, forged, usable(k1.Public(), testKey(t, 80).Public()), k2); !errors.Is(err, ErrBadSignature) {
 		t.Errorf("a forged line of a trusted key: %v", err)
 	}
 	// A line under another name (the cosignature of a witness) is not under
@@ -264,7 +264,7 @@ func TestResignCheckpointRefusesALineOfNoTrustedKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err = ResignCheckpoint(bg, withWitness, []ed25519.PublicKey{k1.Public()}, k2)
+	out, err = ResignCheckpoint(bg, withWitness, usable(k1.Public()), k2)
 	if err != nil {
 		t.Fatal(err)
 	}

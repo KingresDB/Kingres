@@ -154,6 +154,20 @@ func NewestCheckpoint() (height uint64, blockTime time.Time) {
 	return c.height, time.Unix(c.time, 0).UTC()
 }
 
+// CheckpointWarnAge is the age of the newest entry of the table beyond which the
+// daemon warns (a year, correction 106). Extending the table before a release is
+// the release duty, stated once in the documentation of the package.
+const CheckpointWarnAge = 365 * 24 * time.Hour
+
+// NewestCheckpointAge is how old the newest entry of the table is against the
+// time now that the caller gives (it does not read the clock, so a test of it
+// does not start to fail as time passes). The caller warns when it exceeds
+// CheckpointWarnAge; a negative value means a table newer than now.
+func NewestCheckpointAge(now time.Time) time.Duration {
+	_, bt := NewestCheckpoint()
+	return now.Sub(bt)
+}
+
 // MaxTargetAt is the easiest target that CheckHeaderAt accepts for a header
 // of the block at height: slack times the target of the nearest checkpoint
 // at or below height (the table is facts of the public chain, see claims.go).

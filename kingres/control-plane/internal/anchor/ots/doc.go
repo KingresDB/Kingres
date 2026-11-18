@@ -110,9 +110,20 @@
 // carries ContradictedClaims (contradicted in this call), ClaimsAside (entries
 // after it) and ClaimsDropped (dropped in this call), so that the caller can
 // alert: a calendar that lied and a source that is wrong are both operator
-// matters. What is kept aside is bounded (anchor.MaxOTSContradictions entries; one
-// more is dropped at once), every round ends (the budgets of lookups and header
-// requests hold, and each loop of a round adds, removes or drops a claim), and a
+// matters. What is kept aside is bounded PER CALENDAR (correction 106): each
+// calendar has a share of anchor.MaxOTSContradictionsPerCalendar entries, and the
+// whole list is the shares together (anchor.MaxOTSContradictions, so that the
+// evidence stays within its size limit). A calendar over its own share loses its
+// own surplus claims (they are dropped at once and remembered); a claim of
+// another calendar that a header contradicts for the first time is never dropped
+// because the list is full, so one hostile calendar cannot use another's share and
+// switch off the confirmation interval for the honest claims. An answer of one
+// calendar that carries more than MaxAnswerClaims Bitcoin attestations is refused
+// as a whole, as an implausible answer of that calendar (Code "implausible_answer",
+// permanent; the other calendars' answers are kept): an honest answer holds a few,
+// and 10,000 bytes hold about 400 false ones. Every round ends (the budgets of
+// lookups and header requests hold, and each loop of a round adds, removes or
+// drops a claim), and a
 // hostile calendar cannot keep a record alive beyond its expiry, which counts
 // from the creation of the record. The record is not failed for a contradiction
 // while another calendar or a claim kept aside can still deliver: when no
@@ -123,10 +134,19 @@
 // wrong twice), with the receipt untouched. That error is a *ContradictedError:
 // it carries the evidence as it was BEFORE the call, which still holds the
 // claims, and PriorEvidence reads it. A claim dropped for good is remembered in
-// OTSEvidence.Dropped (calendar, height, merkle root, time; bounded), and the
-// same claim answered again by a calendar is put aside at once, before it enters
-// a fragment, and counted only in Receipt.ClaimsRepeated, not as contradicted,
-// aside or dropped again (correction 96).
+// OTSEvidence.Dropped (calendar, height, merkle root, time; bounded per calendar:
+// anchor.MaxOTSDroppedPerCalendar entries for each, the oldest of a calendar
+// forgotten when its share is full, and anchor.MaxOTSDropped in all, so that one
+// calendar's answers cannot evict what is remembered of another, and one answer of
+// at most MaxAnswerClaims claims cannot evict what is remembered of its own
+// calendar while its share has room), and the same claim answered again by a
+// calendar is put aside at once, before it enters a fragment, and counted only in
+// Receipt.ClaimsRepeated, not as contradicted, aside or dropped again (correction
+// 96). A SubmitWithPrior (a Retry) carries the claims kept aside and the claims
+// dropped of the prior evidence into the new evidence (the claims kept aside only
+// when they name an attestation of a fragment that is kept; they are judged again
+// by the rules above, so a source that is right now restores them at once), so
+// that the memory is not lost (correction 106).
 //
 // # What header_checked proves, and what the auditor still does (correction 91)
 //
@@ -174,8 +194,10 @@
 // the 160 hex digits of the header that contradicted the claim,"at": time,
 // "reason": text} of the claims kept aside, "dropped": [] or entries
 // {"calendar_uri","height","merkle_root","at": time} of the claims dropped for
-// good that are remembered (at most anchor.MaxOTSDropped, the oldest forgotten
-// first; correction 96)}.
+// good that are remembered (at most anchor.MaxOTSDroppedPerCalendar for one
+// calendar and anchor.MaxOTSDropped in all, the oldest of a calendar forgotten
+// first; corrections 96 and 106)}. At most anchor.MaxOTSContradictionsPerCalendar
+// entries of "contradicted" name one calendar.
 // Calendars are in the order of the configuration; each fragment is a tree
 // serialised as above without the magic, the version, the hash operation and
 // the digest. The digest is SHA-256 of the checkpoint text, the payload_sha256
@@ -272,18 +294,24 @@
 // cannot be read; a round in which every lookup failed is retryable even when
 // every failure was permanent (a gateway that answered with HTML once, a 410):
 // the record keeps waiting until it expires or the limits of the retries end
-// it. A record that failed with "claim_contradicted" holds the only copy of the
-// claims in the *ContradictedError of that call (anchor.Record keeps no
-// evidence of its own): store PriorEvidence(err) with the failed record, and when
-// the operator retries it after fixing the header source, call SubmitWithPrior
-// with it and not Submit: the proof, the calendars already answered and the first
-// submission time are kept, and the claims are judged again; a Submit starts
-// again from the calendars and the old proof is gone. The same holds for the
-// evidence of a *PartialError. Keep the evidence of a claimed record
-// until it is anchored or expires. Call NewestCheckpoint at start and warn when its
-// block time is old (the floor does not follow the chain; the table is extended
-// at each release). Implement HeaderSource over a node you trust, or leave it
-// out and present the result as a claim.
+// it. A record that failed with "claim_contradicted" keeps its own Evidence:
+// AfterError and Retry leave Record.Evidence as it was, and the evidence of the
+// call's input is the evidence that the *ContradictedError carries (a caller that
+// clears Evidence when a record fails creates the loss that the text warns of; do
+// not). A *PartialError is different: Submit gave no receipt, so the record has no
+// evidence, and the evidence of the calendars that did answer is only in the error:
+// store PriorEvidenceRaw(err) (the canonical encoding, as the evidence column
+// holds it) with the failed record. When the operator retries a record that holds
+// evidence, the Retry goes through anchor.Resumer (Target.Resume, or
+// SubmitWithPrior on a *Target): the scheduler holds anchor.Target and asks for
+// the interface, it needs no type assertion to *ots.Target. The proof, the
+// calendars already answered, the first submission time and the claims kept aside
+// and dropped are kept, and the claims are judged again; a Submit starts again
+// from the calendars and the old proof is gone (corrections 96 and 106). Keep the
+// evidence of a claimed record until it is anchored or expires. At start, warn
+// when NewestCheckpointAge(now) exceeds CheckpointWarnAge (a year: see "What it
+// does not do"). Implement HeaderSource over a node you trust, or leave it out and
+// present the result as a claim.
 //
 // # What it does not do
 //
@@ -291,10 +319,16 @@
 // returns its height and block time: block 912095 of August 2025 in this
 // release): it is the difficulty of that block divided by the slack whatever the
 // difficulty is when the claim is checked, so it weakens every year as difficulty
-// rises. The table is extended at each release (a recent header and its row in
-// testdata/headers.txt); the caller should warn the operator when the time that
-// NewestCheckpoint returns is more than a year behind the clock, and a release
-// must not be cut with an old table.
+// rises.
+//
+// Release duty (correction 106; stated here once): the table must be extended
+// before a release (a recent header and its row in testdata/headers.txt), and a
+// release must not be cut with an old table. The table of this tree was not
+// extended in the round that added NewestCheckpointAge (no chain data is invented
+// and nothing is fetched here), and it is older than a year at the date of that
+// round; it is a task of the release. The daemon warns when
+// NewestCheckpointAge(now) is above CheckpointWarnAge (a year); no test of this
+// package fails because time passes.
 //
 // It does not fetch Bitcoin data itself, does not verify a Bitcoin attestation
 // against anything without a header from the operator's source or the

@@ -253,10 +253,10 @@ func TestRememberDroppedIsBoundedAndDeduplicated(t *testing.T) {
 		c.Root[0] = byte(i)
 		return c
 	}
-	for i := 0; i < anchor.MaxOTSDropped+8; i++ {
+	for i := 0; i < anchor.MaxOTSDroppedPerCalendar+8; i++ {
 		list = rememberDropped(list, mk(i), testNow)
 	}
-	if len(list) != anchor.MaxOTSDropped {
+	if len(list) != anchor.MaxOTSDroppedPerCalendar {
 		t.Fatalf("%d entries", len(list))
 	}
 	if isRemembered(list, "https://a.example", 1000, rootOf(mk(0))) || !isRemembered(list, "https://a.example", 1008, rootOf(mk(8))) {

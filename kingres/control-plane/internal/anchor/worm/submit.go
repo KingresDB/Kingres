@@ -211,7 +211,7 @@ func (t *Target) existing(ctx context.Context, key string, body []byte, w want, 
 			return anchor.Receipt{}, t.s.statusError("get", g)
 		}
 	}
-	vers, err := t.ourVersions(ctx, key, body)
+	vers, bounded, err := t.ourVersions(ctx, key, body)
 	if err != nil {
 		if firstErr != nil {
 			return anchor.Receipt{}, firstErr
@@ -228,7 +228,7 @@ func (t *Target) existing(ctx context.Context, key string, body []byte, w want, 
 		vers = kept
 	}
 	if len(vers) == 0 && firstErr != nil {
-		return anchor.Receipt{}, firstErr
+		return anchor.Receipt{}, boundReached(firstErr, bounded)
 	}
 	if len(vers) == 0 {
 		switch {
@@ -251,7 +251,7 @@ func (t *Target) existing(ctx context.Context, key string, body []byte, w want, 
 			break
 		}
 	}
-	return anchor.Receipt{}, firstErr
+	return anchor.Receipt{}, boundReached(firstErr, bounded)
 }
 
 // complete verifies an existing version and, when it has no lock (or a
@@ -276,22 +276,28 @@ type retentionXML struct {
 	RetainUntilDate string   `xml:"RetainUntilDate"`
 }
 
-// applyRetention is PutObjectRetention on one version. A store that refuses
-// gives a permanent error that says what the operator must do; a transport
-// failure is retryable.
-func (t *Target) applyRetention(ctx context.Context, key, version, mode string, retain time.Time) error {
+// putRetention sends PutObjectRetention for one version and returns the
+// response (any status), or the error of the exchange.
+func (t *Target) putRetention(ctx context.Context, key, version, mode string, retain time.Time) (*response, error) {
 	body, err := xml.Marshal(retentionXML{Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/", Mode: mode, RetainUntilDate: anchor.FormatTime(retain)})
 	if err != nil {
-		return anchor.Errorf(anchor.ClassPermanent, anchor.KindWORM, "retention", "request", "request could not be built")
+		return nil, anchor.Errorf(anchor.ClassPermanent, anchor.KindWORM, "retention", "request", "request could not be built")
 	}
 	req, err := t.s.request(ctx, http.MethodPut, key, "retention&versionId="+sigv4.Escape(version, false), body)
 	if err != nil {
-		return anchor.Errorf(anchor.ClassPermanent, anchor.KindWORM, "retention", "request", "request could not be built")
+		return nil, anchor.Errorf(anchor.ClassPermanent, anchor.KindWORM, "retention", "request", "request could not be built")
 	}
 	sum := md5.Sum(body) //nolint:gosec
 	req.Header.Set("Content-MD5", base64.StdEncoding.EncodeToString(sum[:]))
 	req.Header.Set("Content-Type", "application/xml")
-	r, err := t.s.do(ctx, "retention", req, body, MaxErrorBody)
+	return t.s.do(ctx, "retention", req, body, MaxErrorBody)
+}
+
+// applyRetention is PutObjectRetention on one version. A store that refuses
+// gives a permanent error that says what the operator must do; a transport
+// failure is retryable.
+func (t *Target) applyRetention(ctx context.Context, key, version, mode string, retain time.Time) error {
+	r, err := t.putRetention(ctx, key, version, mode, retain)
 	if err != nil {
 		return err
 	}
@@ -320,8 +326,7 @@ type listResult struct {
 
 // ourVersions lists the versions of key (newest first) and returns the ids of
 // those whose bytes are the note, at most MaxVersionsChecked read.
-func (t *Target) ourVersions(ctx context.Context, key string, body []byte) ([]string, error) {
-	var ids []string
+func (t *Target) ourVersions(ctx context.Context, key string, body []byte) (ids []string, bounded bool, err error) {
 	read := 0
 	keyMarker, verMarker := "", ""
 	for page := 0; page < MaxListPages; page++ {
@@ -334,28 +339,28 @@ func (t *Target) ourVersions(ctx context.Context, key string, body []byte) ([]st
 		}
 		req, err := t.s.request(ctx, http.MethodGet, "", q, nil)
 		if err != nil {
-			return nil, anchor.Errorf(anchor.ClassPermanent, anchor.KindWORM, "list", "request", "request could not be built")
+			return nil, false, anchor.Errorf(anchor.ClassPermanent, anchor.KindWORM, "list", "request", "request could not be built")
 		}
 		r, err := t.s.do(ctx, "list", req, nil, MaxListBody)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if r.status != 200 {
-			return nil, t.s.statusError("list", r)
+			return nil, false, t.s.statusError("list", r)
 		}
 		var lr listResult
 		dec := xml.NewDecoder(bytes.NewReader(r.body))
 		dec.Strict = false
 		dec.Entity = nil
 		if err := dec.Decode(&lr); err != nil {
-			return nil, anchor.Errorf(anchor.ClassPermanent, anchor.KindWORM, "list", "bad_listing", "the version listing is not readable")
+			return nil, false, anchor.Errorf(anchor.ClassPermanent, anchor.KindWORM, "list", "bad_listing", "the version listing is not readable")
 		}
 		for _, v := range lr.Versions {
 			if v.Key != key || v.VersionID == "" || v.VersionID == "null" {
 				continue
 			}
 			if read >= MaxVersionsChecked {
-				return ids, nil
+				return ids, true, nil
 			}
 			read++
 			g, err := t.get(ctx, "get", key, v.VersionID)
@@ -364,7 +369,7 @@ func (t *Target) ourVersions(ctx context.Context, key string, body []byte) ([]st
 				if errors.As(err, &ae) && errors.Is(ae.Err, anchor.ErrTooLarge) {
 					continue
 				}
-				return nil, err
+				return nil, false, err
 			}
 			if g.status == 200 && bytes.Equal(g.body, body) {
 				ids = append(ids, v.VersionID)
@@ -374,8 +379,29 @@ func (t *Target) ourVersions(ctx context.Context, key string, body []byte) ([]st
 			break
 		}
 		keyMarker, verMarker = lr.NextKey, lr.NextVersion
+		if page == MaxListPages-1 {
+			bounded = true
+		}
 	}
-	return ids, nil
+	return ids, bounded, nil
+}
+
+// boundReached is the error returned when no version with our bytes passed its
+// checks and the walk over the versions of the key stopped at its bound
+// (MaxVersionsChecked versions read, or MaxListPages pages): our own version may
+// be hidden behind later copies of our bytes, so the error of the latest copy,
+// which says that another principal wrote it, is not a verdict on our object and
+// must not send the operator to a new key generation (correction 105). It keeps
+// the class of that error (a retryable one is returned as it is: it is a
+// transport fault, not a verdict) and names the bound.
+func boundReached(err error, bounded bool) error {
+	var ae *anchor.Error
+	if !bounded || !errors.As(err, &ae) || ae.Class == anchor.ClassRetryable {
+		return err
+	}
+	return &anchor.Error{Class: ae.Class, Target: anchor.KindWORM, Op: "verify", Code: "versions_bound_reached", Err: err,
+		Text: fmt.Sprintf("the search of the versions of this key reached its bound (at most %d versions read, %d list pages) and none of the versions with this note that were read passed its checks: our own version may be hidden behind later copies of the same bytes that another principal wrote, so this is not a verdict on our object; a new key generation does not help (it writes one more object that can be hidden in the same way): find who can write this bucket and stop it (the bucket must be written by nobody else), then Retry, or change the keyPrefix of the target; the latest copy failed with the code %s",
+			MaxVersionsChecked, MaxListPages, sanitize(ae.Code))}
 }
 
 func conflict() *anchor.Error {
@@ -452,9 +478,13 @@ func attemptOf(h http.Header) (a time.Time, present bool, err error) {
 // can make the time acceptable.
 func timeAhead(what string, d time.Duration, max time.Duration, ref string, final bool) *anchor.Error {
 	if final {
-		return anchor.Errorf(anchor.ClassRefused, anchor.KindWORM, "verify", "store_time_skew",
+		e := anchor.Errorf(anchor.ClassRefused, anchor.KindWORM, "verify", "store_time_skew",
 			"%s is %s ahead of %s, more than the tolerance of %s: the time the store states is not accepted; this is a problem of clocks, not of credentials; the object is locked, keeps its time and carries the start of the call that wrote it, so waiting and a Retry find the same object and are refused in the same way: correct the clock of the store or of this server, then either anchor this checkpoint under a new key generation (the caller raises the generation of the payload by one, with a new start; an operator's explicit choice, since every generation is one more object in the bucket that claims to be this anchor) or change the keyPrefix of the target",
 			what, d.Round(time.Second), ref, max)
+		// the verdict is the same on every later call: the record fails at once
+		// (anchor.Record.AfterError), with the alert of a failed record
+		e.Final = true
+		return e
 	}
 	return anchor.Errorf(anchor.ClassRefused, anchor.KindWORM, "verify", "store_time_skew",
 		"%s is %s ahead of %s, more than the tolerance of %s: the time the store states is not accepted; this is a problem of clocks, not of credentials: correct the clock of the store or of this server, then Retry (the object carries no start of its call, so a clock that has caught up can make its time acceptable)",
@@ -477,17 +507,20 @@ func timeEarly(what string, lmt, ref time.Time, refName string, max time.Duratio
 // noMetadata is the error for a fresh write whose read-back does not carry the
 // attempt exactly as it was sent (n values came back: 0 none, otherwise a
 // changed or repeated value). The object is written, locked and read back, so it
-// stays; the class is permanent so that the record does not spin (a Retry would
-// find the same object). A Retry does find it and accept it, without the narrow
-// window (the evidence then states attempt null); an operator who wants the
-// narrow window needs a store, or a gateway, that keeps user metadata.
+// stays; the class is permanent so that the record does not spin. What a Retry
+// does depends on n (correction 105): with n = 0 it finds the object, which has
+// no such header, and accepts it under the wide window (the evidence then states
+// attempt null); with n above 0 the object carries the changed or repeated value,
+// so the Retry meets attempt_malformed, which is refused for good, and a new key
+// generation writes another object that meets this refusal again: only another
+// store, or a gateway that keeps the header exactly, helps. The two texts say so.
 func noMetadata(n int) *anchor.Error {
-	what := "returned no such header"
-	if n > 0 {
-		what = "returned a value that is not the one sent"
+	if n == 0 {
+		return anchor.Errorf(anchor.ClassPermanent, anchor.KindWORM, "verify", "no_user_metadata",
+			"this store does not keep user metadata: the object was written and locked with the user metadata x-amz-meta-kingres-attempt, and the read-back returned no such header (it was dropped), so the time of the store cannot be bounded by the call that wrote it; the object stays in the bucket until its retention ends; use a store (and a gateway in front of it) that keeps user metadata; a Retry finds this object and accepts it under the wider window of the start of the first Submit call only, and the evidence then states attempt null")
 	}
 	return anchor.Errorf(anchor.ClassPermanent, anchor.KindWORM, "verify", "no_user_metadata",
-		"this store does not keep user metadata: the object was written and locked with the user metadata x-amz-meta-kingres-attempt, and the read-back %s, so the time of the store cannot be bounded by the call that wrote it; the object stays in the bucket until its retention ends; use a store (and a gateway in front of it) that keeps user metadata; a Retry finds this object and accepts it under the wider window of the start of the first Submit call only, and the evidence then states attempt null", what)
+		"this store, or a gateway in front of it, changes or repeats user metadata: the object was written and locked with the user metadata x-amz-meta-kingres-attempt, and the read-back returned a value that is not the one sent (changed or repeated), so the time of the store cannot be bounded by the call that wrote it; the object stays in the bucket until its retention ends and carries the changed value; a Retry is refused for good (attempt_malformed), and a new key generation does not help: it writes another object that meets the same refusal and leaves one more locked object; only another store, or a gateway that returns the header exactly as it was sent, helps")
 }
 
 // verify reads one version back (design 6.3 step 3): HEAD of the version for
@@ -568,7 +601,7 @@ func (t *Target) verify(ctx context.Context, key string, body []byte, version, e
 		a, present, aerr := attemptOf(h.header)
 		if aerr != nil {
 			return anchor.Receipt{}, anchor.Errorf(anchor.ClassPermanent, anchor.KindWORM, "verify", "attempt_malformed",
-				"the version %s carries the user metadata %s, but it is not the value this package writes (%s): it is not judged as a version without the metadata; the object is locked and keeps the value, so a Retry finds the same version; another principal wrote it, or a store or proxy changed the header: anchor this checkpoint under a new key generation (the caller raises the generation of the payload by one, with a new start; an operator's explicit choice) or change the keyPrefix of the target",
+				"the version %s carries the user metadata %s, but it is not the value this package writes (%s): it is not judged as a version without the metadata; the object is locked and keeps the value, so a Retry finds the same version; there are two causes. If another principal wrote it, anchor this checkpoint under a new key generation (the caller raises the generation of the payload by one, with a new start; an operator's explicit choice) or change the keyPrefix of the target. If this package wrote it and the store or a gateway changed or repeated the header (an earlier attempt of this key ended in no_user_metadata: the last error of the record says so), a new key generation does not help, because it writes another object that meets the same refusal and leaves one more locked object: only another store, or a gateway that returns the header exactly as it was sent, helps",
 				(anchor.Redactor{}).Clean(version, 200), "x-amz-meta-kingres-attempt", aerr.Error())
 		}
 		if present {

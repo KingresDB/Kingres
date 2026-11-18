@@ -5,9 +5,10 @@
 // section 6 and corrections 60 to 65, 81 to 84 and 88 to 92 of section 14; the
 // code follows 61 to 65, 81 to 84 and 88 to 92: 88 the state table (Retry from
 // expired), 89 the time of the store, 90 claims kept aside, 91 the work of a
-// header, 92 the payload rules, the tags and the names of the TSA; and 95 to 97 of the fourth round: the
-// time of the store and the generation of the key, claims dropped and kept, the
-// pin and the corpus). It defines the Target
+// header, 92 the payload rules, the tags and the names of the TSA; 95 to 97 of
+// the fourth round: the time of the store and the generation of the key, claims
+// dropped and kept, the pin and the corpus; and 105 and 106 of the fifth round:
+// WORM and the record, OpenTimestamps). It defines the Target
 // interface, the payload, the receipt, the anchor record with its states and
 // its state machine, the classification of errors, the retry arithmetic, the
 // HTTP client the targets are meant to be given, and the canonical encoding of
@@ -68,10 +69,14 @@
 //
 // A Payload also carries Generation (correction 95): 0 for every record that
 // exists, persisted by the caller with the record, and the same for every target;
-// only the WORM target puts it in the object key. Payload.WithGeneration(n,
-// newStart) is how an operator's explicit choice to anchor a checkpoint under a
-// new key, after a permanent refusal of the time of the store, is made: never
-// automatically (package worm says when).
+// only the WORM target puts it in the object key. The shape of the row is in the
+// library (correction 105): Record has SubmitStart and Generation, PayloadFor(record,
+// aggregate id, note) builds the payload from them, and Record.NextGeneration(newStart,
+// now) is how an operator's explicit choice to anchor a checkpoint under a new key,
+// after a permanent refusal of the time of the store, is made: exactly the next
+// generation, with a start later than the old one, in one record; never
+// automatically (package worm says when). Payload.WithGeneration applies the same
+// rule to a payload alone: a lowered, repeated or skipped generation is refused.
 //
 // The shape rules are the verifier's (correction 92): ParsePayload applies the
 // rules of kingres-verify's signednote.Parse and checkpoint.Parse. The note:
@@ -241,21 +246,30 @@
 // (Record.Refusals), the failures since the last success (Record.Attempts) and
 // the consecutive retryable ones (Record.Retryables, the exponent of the
 // backoff); a retryable failure past Limits.MaxAttempts or Limits.MaxAge
-// (from Record.FailingSince) fails the record with ledgerAnchorFailed.
+// (from Record.FailingSince) fails the record with ledgerAnchorFailed. A refusal
+// whose verdict is final (Error.Final, IsFinal: an object that carries the start of
+// the call that wrote it and lies outside its window, correction 105) fails the
+// record at once with the same alert, instead of spending the three waits.
+//
+// A target that can resume from the evidence of an earlier attempt implements
+// Resumer (ots.Target does), so that a scheduler that holds the Target interface
+// asks for it without knowing the concrete type (correction 106).
 //
 // # What the caller must do
 //
-// Persist the start of the first Submit call for a key before that call, build
-// every payload with it (and never with the creation of the record or the time
-// of the current attempt), keep it across retries, and use the code and the
-// text of an error for the alert.
+// Keep the row of a record with the start of the first Submit call and the
+// generation (Record.SubmitStart and Record.Generation, correction 105), build
+// every payload from the record with PayloadFor (never from the creation of the
+// record or the time of the current attempt), and use the code and the text of an
+// error for the alert. The section "Duties of the caller" below lists what is left
+// to the wiring, with what goes wrong when it is forgotten.
 //
 // Store the records (kingres_cp.ledger_anchor, with the columns refusals,
-// retryables and failing_since besides attempts; the evidence as text, or as
-// jsonb read back through CanonicalEvidence, because the strict parsers accept
-// the canonical bytes only and jsonb reorders members), run the jobs (enqueue,
-// submit, upgrade) on the leader with the term check, call Submit when a
-// record is due and apply the result with Record.ApplyReceipt or
+// retryables and failing_since besides attempts, and submit_start and generation;
+// the evidence as text, or as jsonb read back through CanonicalEvidence, because
+// the strict parsers accept the canonical bytes only and jsonb reorders members),
+// run the jobs (enqueue, submit, upgrade) on the leader with the term check, call
+// Submit when a record is due and apply the result with Record.ApplyReceipt or
 // Record.AfterError (check the error: a refused event means the job is stale),
 // keep the first stored evidence per (target, log, size), write the evidence
 // file with EncodeEvidenceFile when a record is anchored (and, for ots, when
@@ -265,4 +279,126 @@
 // and run ExpireIfDue (with ots.Timeout and ots.ClaimedTimeout) and
 // UpgradeInterval for OpenTimestamps, for submitted and claimed records
 // alike. This package does none of these.
+//
+// # Duties of the caller
+//
+// This is the list that the wiring of the daemon works from (corrections 105 and
+// 106 turned some duties into something the API holds; those say so). "Easy to
+// forget" means that the API gives no sign.
+//
+//  1. The start of the first Submit call. Set it with Record.WithSubmitStart and
+//     write the row BEFORE the first call for the key (target, aggregate, size,
+//     key prefix, generation); never change it. Now in the API: the record has the
+//     field, WithSubmitStart refuses a different value, PayloadFor refuses a
+//     record without one and uses the record's value on every later call, restart,
+//     leader change and Retry. Still the caller's: the write before the call. A
+//     start recomputed later makes the object that the first call wrote refuse for
+//     good (store_time_early); an earlier one only widens the window for a foreign
+//     version.
+//  2. The generation. Keep it in the row (Record.Generation, 0 for a new record);
+//     PayloadFor passes it, so it cannot be forgotten at a call. Still the
+//     caller's: that the column is written. Forgotten, the record returns to the
+//     dead key after a restart, with a text that says to raise the generation.
+//  3. Raising the generation. Only on an operator's explicit choice, once, after a
+//     permanent refusal of the time (store_time_early, store_time_skew of an
+//     object that carries its attempt, attempt_malformed of a version that
+//     another principal wrote), with a start from a clock that is right, and never
+//     after no_user_metadata or the attempt_malformed that follows it (the store
+//     changed the header: a new generation meets the same refusal). Now in the
+//     API: Record.NextGeneration is the one step, to exactly the next generation,
+//     with a start later than the old one, in one returned record (state, start
+//     and generation are written together), refused for a record that is not
+//     failed. Still the caller's: never to call it automatically. Automatic, it
+//     leaves one more locked object per loop (3650 days by default) and fills the
+//     bucket.
+//  4. Retry and the jobs. Never call Record.Retry automatically (failed and
+//     expired records are the operator's); apply every result with ApplyReceipt
+//     or AfterError and treat a refused transition as a stale job; run the jobs on
+//     the leader with the term check; one Upgrade at a time per record. The library
+//     has no lock and no term: forgotten, stale jobs overwrite state, Upgrade runs
+//     twice, and two leaders on a worm key with different notes make a fork that
+//     nobody reports. Easy to forget.
+//  5. Alerts from the code and the text of the error (CodeOf, Error()), never from
+//     the class. Refused covers credentials and also clocks (store_time_skew,
+//     time_skew, chain_not_trusted_now); submit_start_ahead is a clock or the
+//     persisted value; class conflict is used by claim_contradicted (a calendar
+//     lied or the source is wrong) and by worm_conflict (other bytes under the
+//     key), and AfterError names the same alert for both. A final refusal
+//     (IsFinal) now fails the record at once with ledgerAnchorFailed. From the
+//     class, the operator is sent to the credentials for a clock. Easy to forget.
+//  6. Evidence as canonical bytes: text, or jsonb read back through
+//     CanonicalEvidence (jsonb reorders members and the strict parsers refuse
+//     that). Forgotten, every later Upgrade, VerifyNote and CheckEvidence fails
+//     with "evidence is not readable", permanently. Easy with a jsonb column.
+//  7. The HTTP client: NewHTTPClient from the CA bundle, and the credentials as
+//     Secret; any other client is used as given except for the proxy, which is
+//     removed (a custom RoundTripper that is not an HTTP transport keeps its own
+//     proxy rules). Hard to get wrong silently.
+//  8. The WORM bucket and its credential: versioning and Object Lock on, used for
+//     nothing else, written by nobody else; the credential may put, put retention
+//     (the repair), get, get a version and list versions (package worm lists the
+//     permissions); the store must keep user metadata. The Test button now tries
+//     the metadata echo, the clock and PutObjectRetention (correction 105), so a
+//     store that drops the header, a clock that is off and a credential without
+//     the repair are seen before the first checkpoint. Still the caller's: the
+//     bucket that nobody else writes. A foreign writer can end a record with 25
+//     versions, be adopted when it copies our public bytes, or place junk under a
+//     future key.
+//  9. WORM clocks: every server that calls Submit agrees with the store within the
+//     tolerance (300 s by default); an NTP step or a resumed virtual machine during
+//     one call costs that checkpoint its key on that prefix (duty 3). Monitor the
+//     offsets and alert on store_time_*. A final refusal now alerts at once and no
+//     longer after 21 minutes.
+//  10. WORM evidence hygiene: warn when retain_until approaches (nothing renews it;
+//     3650 days by default, then the anchor is unprotected), warn when the evidence
+//     says attempt null or found true, never delete versions. Forgotten: a silent
+//     loss of protection years later, or a foreign copy adopted unnoticed. Easy to
+//     forget.
+//  11. TSA: set signerKeySha256 when one authority is meant, and pass the same pin
+//     to VerifyStoredToken and VerifyEvidence in any exporter or auditor tool (nil
+//     means any authority under the roots; the hash in the evidence is not a pin);
+//     load the roots yourself with ParseBundle; a name or DER refusal is permanent;
+//     raise ledgerAnchorBehind from the age of the newest anchor; make Submit
+//     idempotent per record (every call gets a new token, the first stored wins).
+//     Forgotten: any authority under the roots is accepted, or an honest authority
+//     is refused for good. Easy to forget.
+//  12. OpenTimestamps retry. A Retry of a record that holds evidence goes through
+//     Resumer (ots.Target implements it; the scheduler tests for the interface, it
+//     needs no concrete type) with the evidence that was kept: the failed record's
+//     own Evidence for claim_contradicted, and ots.PriorEvidenceRaw(err) for a
+//     PartialError, which leaves the record without evidence and so MUST be
+//     stored by the caller. A failed record keeps its Evidence (AfterError and Retry
+//     leave it; a caller that clears it creates the loss). Submit instead of Resume
+//     starts again from the calendars and loses the proof and the first
+//     submission time. What is remembered of the claims (kept aside, dropped) is now
+//     carried across the Retry. Easy to forget.
+//  13. OpenTimestamps scheduling: Upgrade at NextCheck for submitted and claimed
+//     records (UpgradeInterval stretches it); a claimed record without a NextCheck
+//     is never due (Record.Due), so enqueue an explicit Upgrade for every claimed
+//     record when a header source is first configured and at each start; decide
+//     expiry with ExpireIfDue (ots.Timeout, ots.ClaimedTimeout) for submitted and
+//     claimed records alike; give Upgrade a deadline of a few minutes of its own;
+//     never concurrent for one record. Forgotten: claims stay claims for ever, and
+//     records never expire.
+//  14. OpenTimestamps alerts and presentation: alert on ContradictedClaims,
+//     ClaimsAside, ClaimsDropped and ClaimsRepeated above zero round after round
+//     (a lying calendar or a wrong source); show a claimed record as claimed and
+//     never count it toward the minimum of anchors (State.ContractStatus maps it
+//     to "pending"); write the evidence file of a claimed record with status
+//     "claimed"; implement HeaderSource over a node you trust or leave it out; at
+//     start, warn when ots.NewestCheckpointAge(now) exceeds ots.CheckpointWarnAge
+//     (the table must be extended before a release: package ots says so once).
+//     Forgotten: a false claim shown as an anchor (when the caller maps states
+//     itself), or a hostile calendar unseen.
+//  15. Build payloads only from notes this cluster signed: ParsePayload and
+//     PayloadFor check the shape, not a signature. Forgotten, an outside note is
+//     anchored and the evidence looks like ours. Easy to forget.
+//  16. The counters: store Attempts, Refusals, Retryables and FailingSince with the
+//     record and pass Limits from the settings; change them only through the
+//     methods of Record. Forgotten, refusals never reach the fourth and a record
+//     retries for ever.
+//
+// Never automatic: the raise of the generation, Retry, a change of SubmitStart
+// (WithSubmitStart refuses one), the deletion of anything in the bucket, and the
+// Submit (instead of Resume) of an OpenTimestamps record that holds evidence.
 package anchor

@@ -4,6 +4,7 @@ package worm
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -51,7 +52,7 @@ func TestFreshWriteRequiresTheAttemptEchoedAsSent(t *testing.T) {
 		"offset-time-zone": func(f *fakeS3) {
 			f.attemptRewrite = func(a string) string { return strings.TrimSuffix(a, "Z") + "+00:00" }
 		},
-		"leading-space":     func(f *fakeS3) { f.attemptRewrite = func(a string) string { return a + " x" } },
+		"trailing-value":    func(f *fakeS3) { f.attemptRewrite = func(a string) string { return a + " x" } },
 		"empty-after-write": func(f *fakeS3) { f.attemptRewrite = func(string) string { return "" } },
 	}
 	for name, setup := range cases {
@@ -62,7 +63,13 @@ func TestFreshWriteRequiresTheAttemptEchoedAsSent(t *testing.T) {
 			tg := newTarget(t, f)
 			_, err := tg.Submit(context.Background(), testPayload(t, "41", 1))
 			ae := expectErr(t, err, anchor.ClassPermanent, "no_user_metadata")
-			for _, s := range []string{"does not keep user metadata", "stays", "Retry"} {
+			needs := []string{"stays", "Retry"}
+			if name == "dropped" {
+				needs = append(needs, "does not keep user metadata", "accepts it under the wider window")
+			} else {
+				needs = append(needs, "changes or repeats user metadata", "refused for good", "a new key generation does not help")
+			}
+			for _, s := range needs {
 				if !strings.Contains(ae.Error(), s) {
 					t.Fatalf("text lacks %q: %v", s, ae)
 				}
@@ -312,6 +319,12 @@ func TestClockFaultOfOneCallRetryThenNewGeneration(t *testing.T) {
 		if !strings.Contains(ae.Error(), "new key generation") {
 			t.Fatal(ae)
 		}
+		// the new start must be later than the old one, which was ahead of the
+		// true clock (correction 105): the clock has not passed it yet
+		if _, err := p.WithGeneration(1, clk.now()); err == nil {
+			t.Fatal("a start that is not later than the old one was accepted")
+		}
+		clk.advance(5 * time.Minute)
 		p1, err := p.WithGeneration(1, clk.now())
 		if err != nil {
 			t.Fatal(err)
@@ -321,6 +334,7 @@ func TestClockFaultOfOneCallRetryThenNewGeneration(t *testing.T) {
 			t.Fatalf("%+v", ev)
 		}
 		// generation 2 after a further fault is its own key again
+		clk.advance(time.Minute)
 		p2, err := p1.WithGeneration(2, clk.now())
 		if err != nil {
 			t.Fatal(err)
@@ -455,7 +469,10 @@ func TestForeignLaterCopyOfOurBytesDoesNotEndTheRecord(t *testing.T) {
 	before := len(g.reqs)
 	g.mu.Unlock()
 	err = submitStore(t, g, tg2, q)
-	expectErr(t, err, anchor.ClassPermanent, "not_locked")
+	ae := expectErr(t, err, anchor.ClassPermanent, "versions_bound_reached")
+	if inner := anchor.CodeOf(errors.Unwrap(ae)); inner != "not_locked" {
+		t.Fatalf("the cause is not kept: %q", inner)
+	}
 	gets := 0
 	for _, r := range g.requests()[before:] {
 		if r.method == "GET" {

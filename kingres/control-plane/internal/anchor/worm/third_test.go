@@ -219,8 +219,8 @@ func TestOperatorRepairThenRetryAfterAnyDelay(t *testing.T) {
 }
 
 // A3-01: every put carries the start of the call that wrote it as user metadata
-// (and the probe objects of Test do not), and the evidence says what start was
-// applied.
+// (and so does the first probe object of Test, which is written as a first Submit
+// writes: correction 105), and the evidence says what start was applied.
 func TestPutCarriesTheStartOfTheCall(t *testing.T) {
 	clk := newVclock()
 	f := vstore(clk, 0)
@@ -244,10 +244,14 @@ func TestPutCarriesTheStartOfTheCall(t *testing.T) {
 	if !res.OK() {
 		t.Fatalf("%+v", res)
 	}
+	with := 0
 	for _, r := range g.requests() {
-		if r.header.Get("X-Amz-Meta-Kingres-Attempt") != "" {
-			t.Fatal("a probe put carries the metadata")
+		if r.method == "PUT" && r.header.Get("X-Amz-Meta-Kingres-Attempt") != "" {
+			with++
 		}
+	}
+	if with != 1 {
+		t.Fatalf("%d probe puts carry the metadata, want the first only", with)
 	}
 }
 

@@ -272,7 +272,8 @@ func TestNoActiveKey(t *testing.T) {
 	}
 	// A key that is active in the record but not yet in force does not sign.
 	future := okSet(t)(okSet(t)(mustAdd(nil, 1, "", t0)).Activate(fp(1), t0.Add(time.Hour), 0))
-	if _, err := future.Signers(t0); !errors.Is(err, ErrNoActiveKey) {
+	// It is not the error of a damaged set (K3-06).
+	if _, err := future.Signers(t0); !errors.Is(err, ErrNotInForce) || errors.Is(err, ErrNoActiveKey) {
 		t.Errorf("a key signs before its time: %v", err)
 	}
 	if err := future.Validate(); err != nil {

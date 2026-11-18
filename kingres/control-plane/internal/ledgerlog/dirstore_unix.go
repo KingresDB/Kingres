@@ -17,7 +17,11 @@ import (
 //   - EPERM: "the file system containing oldpath and newpath does not support
 //     the creation of hard links" (link(2)); it is also the answer of the
 //     protected_hardlinks rule, which cannot apply to a temporary file the
-//     process has just made.
+//     process has just made, and what link(2) gives when the directory that
+//     would hold the new name is immutable or append-only (chattr +i or +a).
+//     EPERM alone cannot tell these apart, so the error text of
+//     ErrHardLinksRequired names both and the operator looks at the directory
+//     (lsattr -d); nothing is published in either case.
 //   - EOPNOTSUPP and ENOTSUP: not in the list of link(2), but returned by file
 //     systems that have no link operation (some FUSE, network and container
 //     file systems). They are one value on Linux and two on the BSDs.

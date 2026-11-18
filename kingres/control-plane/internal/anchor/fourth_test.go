@@ -3,6 +3,7 @@
 package anchor
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -30,10 +31,13 @@ func TestPayloadGeneration(t *testing.T) {
 	if _, err := p.WithGeneration(1, time.Time{}); err == nil {
 		t.Fatal("a new generation needs a new start")
 	}
-	if _, err := p.WithGeneration(MaxGeneration, t1); err != nil {
+	pm := p
+	pm.Generation = MaxGeneration - 1
+	if _, err := pm.WithGeneration(MaxGeneration, t1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := p.WithGeneration(MaxGeneration+1, t1); err == nil {
+	pm.Generation = MaxGeneration
+	if _, err := pm.WithGeneration(MaxGeneration+1, t1); err == nil {
 		t.Fatal("generation over the limit accepted")
 	}
 	bad := p
@@ -135,7 +139,7 @@ func TestOTSEvidenceDropped(t *testing.T) {
 	full := ev
 	full.Dropped = nil
 	for i := 0; i < MaxOTSDropped; i++ {
-		full.Dropped = append(full.Dropped, OTSDropped{CalendarURI: "https://gone.example", Height: uint64(i), MerkleRoot: otsRoot, At: "2026-12-01T11:00:00Z"})
+		full.Dropped = append(full.Dropped, OTSDropped{CalendarURI: "https://gone" + strconv.Itoa(i/MaxOTSDroppedPerCalendar) + ".example", Height: uint64(i), MerkleRoot: otsRoot, At: "2026-12-01T11:00:00Z"})
 	}
 	if _, err := EncodeEvidence(full); err != nil {
 		t.Fatalf("exactly MaxOTSDropped refused: %v", err)

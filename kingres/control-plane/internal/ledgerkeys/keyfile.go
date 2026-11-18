@@ -221,6 +221,11 @@ func marshalPlain(seed []byte) []byte {
 	return append(out, `"}`+"\n"...)
 }
 
+// parsePlainDone is a seam for the tests: when set, parsePlain calls it with its
+// two working buffers (the decoded seed and its base64 text) once they have been
+// cleared, so that a test sees whether they were. It is nil in the program.
+var parsePlainDone func(seed, again []byte)
+
 // parsePlain reads the rest of a plain file after plainHead: exactly 44 base64
 // characters, the closing quote, brace and newline. It works on byte slices
 // that it zeroes, so no string holds the seed.
@@ -229,17 +234,22 @@ func parsePlain(rest []byte) (*secretBytes, error) {
 	if len(rest) != enc.EncodedLen(SeedSize)+3 || string(rest[len(rest)-3:]) != `"}`+"\n" {
 		return nil, malformed("it is not in the canonical form (spaces, line endings or text after the object)")
 	}
+	var seed, again []byte
+	if hook := parsePlainDone; hook != nil {
+		// Registered first, so it runs after the buffers are cleared.
+		defer func() { hook(seed, again) }()
+	}
 	// n is taken from the length so that the buffers below are made on the
 	// heap, where they are zeroed once, and not on a stack, whose old copies
 	// the runtime leaves behind when it grows or shrinks the stack.
 	n := len(rest) - 3
-	seed := make([]byte, enc.DecodedLen(n))
+	seed = make([]byte, enc.DecodedLen(n))
 	defer clear(seed)
 	m, err := enc.Strict().Decode(seed, rest[:n])
 	if err != nil || m != SeedSize {
 		return nil, malformed(fmt.Sprintf("seed is not canonical base64 of %d bytes", SeedSize))
 	}
-	again := make([]byte, n)
+	again = make([]byte, n)
 	defer clear(again)
 	enc.Encode(again, seed[:m])
 	if !bytes.Equal(again, rest[:n]) {

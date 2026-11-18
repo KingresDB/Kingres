@@ -3,6 +3,7 @@
 package ledgerlog
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
@@ -165,14 +166,44 @@ func SignCheckpoint(ctx context.Context, c Checkpoint, signers ...ledgerkeys.Sig
 // decides, by completing trusted or by making the checkpoint again).
 var ErrUntrustedLine = errors.New("ledgerlog: the note has a signature line under the key name of the log whose key id is that of no trusted key")
 
+// ErrNoVouchingSignature is returned by ResignCheckpoint for a note that
+// verifies under the keys of the trust file but that no key which counts for a
+// fresh checkpoint of its size has signed: every line that verifies is of a
+// revoked key, or of a retired key whose max_tree_size is below the size of the
+// checkpoint (correction 107). The verifier refuses such a note as a fresh
+// checkpoint, so the signature of a good key is not lent to it.
+var ErrNoVouchingSignature = errors.New("ledgerlog: no key that counts for a checkpoint of this size has signed the note (every line that verifies is of a revoked key or of a retired key whose bound is below the size)")
+
+// vouches reports whether the trust file entry counts for a fresh checkpoint of
+// the size, as the verifier counts it (its StandingAt and LimitFor): not
+// revoked, and not limited to a smaller tree. The window (not_before,
+// not_after) needs a clock, which this package does not have; the keys of
+// ledgerkeys carry no not_after, and a not_before is the activation of a key
+// that signs, so it is not applied here (correction 107).
+func vouches(k ledgerkeys.TrustKey, size uint64) bool {
+	if k.Revoked {
+		return false
+	}
+	return k.MaxTreeSize == nil || size <= *k.MaxTreeSize
+}
+
 // ResignCheckpoint adds the signatures of more signers to a signed checkpoint
 // (a rotation: the latest checkpoint of a log that no longer grows gets the
-// new key's signature). trusted must be every public key of the trust file for
-// the log, whatever its state (usable, retired, revoked, and the next keys the
-// trust file lists): the note is verified under them first, as VerifyNote does,
-// and it is refused when none of its lines verifies or a line of a trusted key
-// does not, so a new signature is never attached to a text that nobody
-// verified.
+// new key's signature). trusted is every entry of the trust file for the log,
+// as ledgerkeys.TrustEntries lists them (with IncludeNext when the file lists
+// the next keys), so that each key comes with its standing: the note is
+// verified under all of them first, as VerifyNote does, and is refused when
+// none of its lines verifies or a line of a listed key does not, so a new
+// signature is never attached to a text that nobody verified.
+//
+// The note must also rest on a key that counts: at least one line that verifies
+// must be of a key that the verifier counts for a fresh checkpoint of this size
+// (not revoked, and not a retired key whose max_tree_size is below the size).
+// A note that rests only on a revoked key, or on a retired key beyond its bound,
+// is refused with ErrNoVouchingSignature, because the verifier refuses it as a
+// fresh checkpoint and the new signature would make it genuine (K3-01,
+// correction 107). A line of a key that does not count, beside a line of a
+// key that does, is kept.
 //
 // The result is never a note that the verifier refuses for a reason this
 // function can see. It is refused (before anything is signed) when: a new
@@ -182,7 +213,7 @@ var ErrUntrustedLine = errors.New("ledgerlog: the note has a signature line unde
 // fingerprints); or the note holds a line under the origin whose key id is that
 // of no trusted key and no new signer (ErrUntrustedLine). Lines under other
 // names (cosignatures of a witness) are kept as they are.
-func ResignCheckpoint(ctx context.Context, note []byte, trusted []ed25519.PublicKey, more ...ledgerkeys.Signer) ([]byte, error) {
+func ResignCheckpoint(ctx context.Context, note []byte, trusted []ledgerkeys.TrustKey, more ...ledgerkeys.Signer) ([]byte, error) {
 	n, err := ParseNote(note)
 	if err != nil {
 		return nil, err
@@ -192,13 +223,28 @@ func ResignCheckpoint(ctx context.Context, note []byte, trusted []ed25519.Public
 		return nil, err
 	}
 	keys := make([]NoteKey, 0, len(trusted))
-	for _, p := range trusted {
-		keys = append(keys, NoteKey{Name: c.Origin, Public: p})
+	for _, k := range trusted {
+		keys = append(keys, NoteKey{Name: c.Origin, Public: k.Public})
 	}
-	if _, err := VerifyNote(n, keys); err != nil {
+	verified, err := VerifyNote(n, keys)
+	if err != nil {
 		return nil, fmt.Errorf("ledgerlog: the checkpoint to re-sign does not verify under the trusted keys: %w", err)
 	}
-	known := append([]ed25519.PublicKey(nil), trusted...)
+	counts := false
+	for _, v := range verified {
+		for _, k := range trusted {
+			if bytes.Equal(k.Public, v.Public) && vouches(k, c.Size) {
+				counts = true
+			}
+		}
+	}
+	if !counts {
+		return nil, fmt.Errorf("%w (size %d): re-sign only a note that a usable key signed, or make the checkpoint again", ErrNoVouchingSignature, c.Size)
+	}
+	known := make([]ed25519.PublicKey, 0, len(trusted)+len(more))
+	for _, k := range trusted {
+		known = append(known, k.Public)
+	}
 	for _, s := range more {
 		known = append(known, s.Public())
 	}
