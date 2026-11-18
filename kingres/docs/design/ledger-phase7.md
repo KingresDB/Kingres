@@ -2603,6 +2603,13 @@ build to the corrected rule. The verifier's README has the same list with the re
     of them, so that the result is never a note the verifier refuses for a reason that could be seen.
     The tests of both libraries that need the verifier say so when they skip, and fail with
     `KINGRES_REQUIRE_VERIFY=1`.
+104. **A state must not carry a temporary name of the program (7.4; adds to 87).** `--state FILE` is
+    refused with status 2, before anything is read, written or removed, when the resolved name of FILE
+    has the form of the program's own temporary files. The cleanup of leftovers under the lock removes
+    every regular file of that form, so a state with such a name was removed before it was read, and a
+    rollback served to that run was then reported as verified. Skipping only the run's own file would
+    not be enough: a run of another state in the same directory would still delete it. The cleanup
+    also never removes the file the run was told to use or its lock.
 
 Of section 13: item 2 (test vectors) is settled for signed notes (the example key and note of the
 specification are in the tests; the checkpoint example has no published key), item 3 (entry bundles at
