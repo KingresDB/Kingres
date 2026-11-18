@@ -202,11 +202,15 @@ $c->compare('a plain-SQL function expanded into the statement',
 	like($err, qr/row-level locking on a statement that spans shard groups is not supported yet/, 'row locking on a statement that spans groups is refused');
 	($rc, $out, $err) = run_sql($nodes[0], 'SELECT ctid FROM public.t1');
 	like($err, qr/system columns of distributed table .* are not supported/, 'system columns are refused');
-	($rc, $out, $err) = run_sql($nodes[0], 'INSERT INTO public.t3 SELECT id + 5000, 1, v FROM public.t1');
-	like($err, qr/statements that span shard groups are not supported yet/, 'INSERT ... SELECT that spans groups is still refused');
-	($rc, $out, $err) = run_sql($nodes[0], "INSERT INTO public.t3 VALUES (5001, 1, 'a'), (5002, 1, 'b')");
-	like($err, qr/statements that span shard groups are not supported yet/, 'a multi-row INSERT that spans groups is still refused');
+	# With the row router switched off (phase 2b, step 3) the writes that span groups are refused as in 2a.
+	($rc, $out, $err) = run_sql($nodes[0], 'SET kingres_shard.enable_bulk_routing = off; INSERT INTO public.t3 SELECT id + 5000, 1, v FROM public.t1');
+	like($err, qr/statements that span shard groups are not supported yet/, 'INSERT ... SELECT that spans groups is refused with the row router off');
+	($rc, $out, $err) = run_sql($nodes[0], "SET kingres_shard.enable_bulk_routing = off; INSERT INTO public.t3 VALUES (5001, 1, 'a'), (5002, 1, 'b')");
+	like($err, qr/statements that span shard groups are not supported yet/, 'a multi-row INSERT that spans groups is refused with the row router off');
 	is($c->on_cluster("SELECT count(*) FROM public.t3 WHERE k > 5000"), '0', 'nothing was inserted by the refused statements');
+	# With it on they run, and the rows are those of the single node.
+	$c->compare('INSERT ... SELECT and a multi-row INSERT that span groups',
+		"BEGIN;\nINSERT INTO public.t3 SELECT id + 5000, 1, v FROM public.t1;\nINSERT INTO public.t3 VALUES (9001, 1, 'a'), (9002, 1, 'b');\nSELECT count(*), sum(k) FROM public.t3 WHERE k > 5000;\nSELECT k, grp, w FROM public.t3 WHERE k > 5000 ORDER BY k;\nROLLBACK;\nSELECT count(*) FROM public.t3 WHERE k > 5000;", ordered => 1);
 }
 
 # ---------------------------------------------------------------------------

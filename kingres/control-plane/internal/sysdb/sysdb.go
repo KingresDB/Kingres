@@ -6,9 +6,12 @@
 //
 // Rules: every migration runs in one transaction together with its record in
 // kingres_cp.schema_migration, so a failed migration leaves nothing behind;
-// migrations are applied in version order exactly once; a binary that knows
-// fewer migrations than the database has applied refuses to run (it would
-// not understand the schema).
+// every migration the database has not recorded is applied, in version order,
+// exactly once (version numbers are unique and increasing but may have gaps,
+// so that two lines of work can reserve their own ranges: a migration whose
+// number lies below one that is already applied is still applied when it is
+// missing); a binary that does not know a migration the database has applied
+// refuses to run (it would not understand the schema).
 package sysdb
 
 import (
@@ -75,9 +78,9 @@ func load(fsys fs.FS, dir string) ([]Migration, error) {
 		out = append(out, Migration{Version: v, Name: name, SQL: string(b)})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Version < out[j].Version })
-	for i, m := range out {
-		if m.Version != i+1 {
-			return nil, fmt.Errorf("sysdb: migration versions must be 1..n without gaps (found %d at position %d)", m.Version, i+1)
+	for i := 1; i < len(out); i++ {
+		if out[i].Version == out[i-1].Version {
+			return nil, fmt.Errorf("sysdb: two migration files have the version %d (%s and %s)", out[i].Version, out[i-1].Name, out[i].Name)
 		}
 	}
 	return out, nil
@@ -94,7 +97,8 @@ func Migrate(ctx context.Context, conn *pgx.Conn) (int, error) {
 	return Run(ctx, conn, ms)
 }
 
-// Run applies migrations (a list that starts at version 1 without gaps).
+// Run applies the migrations the database has not recorded, in version order (a list of unique,
+// increasing versions; gaps are allowed). It returns the highest version applied.
 func Run(ctx context.Context, conn *pgx.Conn, ms []Migration) (int, error) {
 	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", advisoryLockKey); err != nil {
 		return 0, fmt.Errorf("sysdb: taking the migration lock: %w", err)
@@ -109,18 +113,24 @@ func Run(ctx context.Context, conn *pgx.Conn, ms []Migration) (int, error) {
 		version int PRIMARY KEY, name text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())`); err != nil {
 		return 0, fmt.Errorf("sysdb: creating schema_migration: %w", err)
 	}
-	cur, err := currentVersion(ctx, conn)
+	applied, err := appliedVersions(ctx, conn)
 	if err != nil {
 		return 0, err
 	}
-	if cur > len(ms) {
-		return cur, fmt.Errorf("%w (database at version %d, binary knows %d)", ErrSchemaTooNew, cur, len(ms))
+	cur := maxVersion(applied)
+	if unknown := unknownVersion(applied, ms); unknown != 0 {
+		return cur, fmt.Errorf("%w (database has applied version %d, binary does not know it)", ErrSchemaTooNew, unknown)
 	}
-	for _, m := range ms[cur:] {
+	for _, m := range ms {
+		if applied[m.Version] {
+			continue
+		}
 		if err := apply(ctx, conn, m); err != nil {
 			return cur, fmt.Errorf("sysdb: migration %s failed: %w", m.Name, err)
 		}
-		cur = m.Version
+		if m.Version > cur {
+			cur = m.Version
+		}
 	}
 	return cur, nil
 }
@@ -131,22 +141,60 @@ func CheckVersion(ctx context.Context, conn *pgx.Conn) error {
 	if err != nil {
 		return err
 	}
-	cur, err := currentVersion(ctx, conn)
+	applied, err := appliedVersions(ctx, conn)
 	if err != nil {
 		return err
 	}
-	if cur > len(ms) {
-		return fmt.Errorf("%w (database at version %d, binary knows %d)", ErrSchemaTooNew, cur, len(ms))
+	if unknown := unknownVersion(applied, ms); unknown != 0 {
+		return fmt.Errorf("%w (database has applied version %d, binary does not know it)", ErrSchemaTooNew, unknown)
 	}
 	return nil
 }
 
-func currentVersion(ctx context.Context, conn *pgx.Conn) (int, error) {
-	var v int
-	if err := conn.QueryRow(ctx, `SELECT coalesce(max(version), 0) FROM `+Schema+`.schema_migration`).Scan(&v); err != nil {
-		return 0, fmt.Errorf("sysdb: reading the schema version: %w", err)
+// appliedVersions is the set of versions recorded in schema_migration.
+func appliedVersions(ctx context.Context, conn *pgx.Conn) (map[int]bool, error) {
+	rows, err := conn.Query(ctx, `SELECT version FROM `+Schema+`.schema_migration`)
+	if err != nil {
+		return nil, fmt.Errorf("sysdb: reading the schema version: %w", err)
 	}
-	return v, nil
+	defer rows.Close()
+	out := map[int]bool{}
+	for rows.Next() {
+		var v int
+		if err := rows.Scan(&v); err != nil {
+			return nil, fmt.Errorf("sysdb: reading the schema version: %w", err)
+		}
+		out[v] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sysdb: reading the schema version: %w", err)
+	}
+	return out, nil
+}
+
+func maxVersion(applied map[int]bool) int {
+	m := 0
+	for v := range applied {
+		if v > m {
+			m = v
+		}
+	}
+	return m
+}
+
+// unknownVersion returns the highest applied version that no embedded migration has, 0 when none.
+func unknownVersion(applied map[int]bool, ms []Migration) int {
+	known := map[int]bool{}
+	for _, m := range ms {
+		known[m.Version] = true
+	}
+	u := 0
+	for v := range applied {
+		if !known[v] && v > u {
+			u = v
+		}
+	}
+	return u
 }
 
 func apply(ctx context.Context, conn *pgx.Conn, m Migration) error {

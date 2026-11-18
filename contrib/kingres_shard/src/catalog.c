@@ -814,21 +814,39 @@ kingres_shard_placement_hash_now(int colocation_id)
 		}
 		catscan_end(&cs);
 	}
-	catscan_begin(&cs, relid);
-	while ((tup = catscan_next(&cs)) != NULL)
+	/*
+	 * Only the buckets of this colocation group are read: through the primary key
+	 * (colocation_id, bucket) when it is there, so that the cost of a check does not grow
+	 * with the number of buckets of the other groups (review P2B-06); a scan of the whole
+	 * table with the same key otherwise.
+	 */
 	{
-		TupleDesc	desc = RelationGetDescr(cs.rel);
-		bool		isnull;
-		int			bucket;
-		int			group;
+		Relation	maprel = table_open(relid, AccessShareLock);
+		Snapshot	snap = RegisterSnapshot(IsInParallelMode() ? GetActiveSnapshot() :
+											GetLatestSnapshot());
+		Oid			pkey = get_relname_relid("bucket_map_pkey", RelationGetNamespace(maprel));
+		ScanKeyData key;
+		SysScanDesc mscan;
 
-		if (DatumGetInt32(heap_getattr(tup, 1, desc, &isnull)) != colocation_id)
-			continue;
-		bucket = DatumGetInt32(heap_getattr(tup, 2, desc, &isnull));
-		group = DatumGetInt32(heap_getattr(tup, 3, desc, &isnull));
-		h += bucket_term(bucket, group, primary_of(gp, ngp, group));
+		ScanKeyInit(&key, 1, BTEqualStrategyNumber, F_INT4EQ, Int32GetDatum(colocation_id));
+		mscan = systable_beginscan(maprel, pkey, OidIsValid(pkey), snap, 1, &key);
+		while ((tup = systable_getnext(mscan)) != NULL)
+		{
+			TupleDesc	desc = RelationGetDescr(maprel);
+			bool		isnull;
+			int			bucket;
+			int			group;
+
+			if (DatumGetInt32(heap_getattr(tup, 1, desc, &isnull)) != colocation_id)
+				continue;
+			bucket = DatumGetInt32(heap_getattr(tup, 2, desc, &isnull));
+			group = DatumGetInt32(heap_getattr(tup, 3, desc, &isnull));
+			h += bucket_term(bucket, group, primary_of(gp, ngp, group));
+		}
+		systable_endscan(mscan);
+		UnregisterSnapshot(snap);
+		table_close(maprel, AccessShareLock);
 	}
-	catscan_end(&cs);
 	if (gp != NULL)
 		pfree(gp);
 	return (int64) h;
@@ -888,6 +906,22 @@ kingres_shard_coloc_bucket(const KsColocation *coloc, int i)
 {
 	Assert(i >= 0 && i < coloc->bucket_count);
 	return i;
+}
+
+/*
+ * A copy of a colocation group's bucket layout that stays valid when the catalog
+ * cache is reloaded (the batch sender keeps one for the whole of a statement,
+ * which plans other statements while it runs).  Made in the current memory context.
+ */
+KsColocation *
+kingres_shard_coloc_copy(const KsColocation *coloc)
+{
+	KsColocation *c = palloc(sizeof(KsColocation));
+
+	*c = *coloc;
+	c->bucket_group = palloc(sizeof(int) * Max(coloc->bucket_count, 1));
+	memcpy(c->bucket_group, coloc->bucket_group, sizeof(int) * coloc->bucket_count);
+	return c;
 }
 
 int

@@ -52,11 +52,18 @@ extern char *kingres_shard_refwrite_lock_sql(const char *qualified_name);
 extern void kingres_shard_lock_all_reference_tables(void);
 
 /*
- * True when the statement text is the local part of a fanned-out statement that
- * this backend is running through SPI (it carries the nonce of that part): the
- * planner must then plan the statement for this node only.
+ * Consume the one-shot mark of a local part: true when the statement being planned is
+ * the one that this backend has just handed to SPI as a local part, which the planner must
+ * then plan for this node only.  Called once at the entry of the planner hook.
  */
-extern bool kingres_shard_local_part_nonce_ok(const char *query_string);
+extern bool kingres_shard_local_part_take(const char *query_string);
+
+/*
+ * Run a statement through SPI (already connected) as a local part: it is marked
+ * by the one-shot flag and planned for this node only.  Used by the batch sender for the origin's own group.
+ */
+extern int	kingres_shard_spi_local_part(const char *sql, int nargs, Oid *argtypes,
+										  Datum *values, const char *nulls);
 
 /*
  * Refuse a write that other nodes take part in when the session's

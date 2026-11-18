@@ -225,19 +225,21 @@ describe('security', () => {
 describe('ledger', () => {
   it('generates a digest, verifies and looks up an inclusion proof', async () => {
     const user = userEvent.setup()
-    await renderApp('/ledger')
-    await screen.findByText(/status of shop/i)
+    await renderApp('/ledger?tab=digests')
+    await screen.findByRole('heading', { name: 'Digests' })
     const before = getState().ledger.digests.length
     await user.click(screen.getByRole('button', { name: /generate digest/i }))
     await waitFor(() => expect(getState().ledger.digests.length).toBe(before + 1))
-
-    await user.click(screen.getByRole('button', { name: /start verification/i }))
+    // The verification is on the Overview tab.
+    await user.click(screen.getByRole('tab', { name: 'Overview' }))
+    await user.click(await screen.findByRole('button', { name: /start verification/i }))
     expect(await screen.findByRole('progressbar', { name: /task progress/i })).toBeInTheDocument()
     await waitFor(() => expect(getState().ledger.verifications[0]?.state).toBe('passed'), {
       timeout: 4000,
     })
 
-    await user.click(screen.getByRole('button', { name: /look up proof/i }))
+    await user.click(screen.getByRole('tab', { name: 'Digests' }))
+    await user.click(await screen.findByRole('button', { name: /look up proof/i }))
     const proof = await screen.findByTestId('proof')
     expect(within(proof).getByText('Row hash')).toBeInTheDocument()
   })
@@ -245,8 +247,8 @@ describe('ledger', () => {
   it('explains an unimplemented operation calmly', async () => {
     mockConfig.unsupported.add('createInclusionProof')
     const user = userEvent.setup()
-    await renderApp('/ledger')
-    await screen.findByText(/status of shop/i)
+    await renderApp('/ledger?tab=digests')
+    await screen.findByRole('heading', { name: 'Digests' })
     await user.click(screen.getByRole('button', { name: /look up proof/i }))
     expect(await screen.findByText(/not available on this server version yet/i)).toBeInTheDocument()
   })

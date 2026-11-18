@@ -63,6 +63,7 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+#include "ed25519_check.h"
 #include "kingres_ledger.h"
 #include "merkle.h"
 #include "row_hash.h"
@@ -343,6 +344,7 @@ kingres_ledger_client_key_register(PG_FUNCTION_ARGS)
 	Oid			types[5];
 	char		nulls[5];
 	text	   *label;
+	KlKeyDefect defect;
 
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(2))
 		ereport(ERROR,
@@ -356,6 +358,17 @@ kingres_ledger_client_key_register(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("role \"%s\" does not exist", NameStr(*PG_GETARG_NAME(1)))));
+
+	/*
+	 * A key under which a signature proves nothing, or that has a second
+	 * encoding for the same point, is not registered (L21-01, ed25519_check.c).
+	 */
+	defect = kl_ed25519_key_defect(pub);
+	if (defect != KL_KEY_OK)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("public_key is not an acceptable Ed25519 public key"),
+				 errdetail("%s.", kl_ed25519_key_defect_text(defect))));
 
 	kl_sha256(digest, pub, KL_CLIENT_PUBKEY_LEN);
 	key_id = (bytea *) palloc(VARHDRSZ + KL_CLIENT_KEY_ID_LEN);
@@ -490,7 +503,6 @@ kingres_ledger_attest(PG_FUNCTION_ARGS)
 	bytea	   *b_nonce;
 	bytea	   *b_sig;
 	int32		table_id;
-	bool		required;
 	FullTransactionId fxid;
 	int64		txid;
 	Datum		values[5];
@@ -504,6 +516,7 @@ kingres_ledger_attest(PG_FUNCTION_ARGS)
 	char	   *keyrole = NULL;
 	bool		revoked;
 	bool		isnull;
+	KlKeyDefect defect;
 
 	kl_not_null(fcinfo, 6);
 	relid = PG_GETARG_OID(0);
@@ -525,7 +538,7 @@ kingres_ledger_attest(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_TABLE),
 				 errmsg("relation with OID %u does not exist", relid)));
-	table_id = kl_lookup_table_id_policy(relid, &required);
+	table_id = kl_lookup_table_id(relid);
 	if (table_id < 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_TABLE),
@@ -618,6 +631,17 @@ kingres_ledger_attest(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("the registered public key is missing or malformed")));
 	memcpy(pub, VARDATA_ANY(DatumGetByteaPP(d)), KL_CLIENT_PUBKEY_LEN);
+	/*
+	 * The registration refuses such a key; a row that exists already (a key
+	 * put there by hand, or by a script that did not check) is refused here
+	 * (L21-01).
+	 */
+	defect = kl_ed25519_key_defect_cached(pub);
+	if (defect != KL_KEY_OK)
+		ereport(ERROR,
+				(errcode(ERRCODE_KL_KEY),
+				 errmsg("the registered public key of this client key is not acceptable"),
+				 errdetail("%s.", kl_ed25519_key_defect_text(defect))));
 	d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull);
 	if (!isnull)
 		keyrole = TextDatumGetCString(d);
@@ -684,10 +708,46 @@ kingres_ledger_attest(PG_FUNCTION_ARGS)
  *		there is none for the mode of a table.  The caller owns the table (or is
  *		a member of its owner).  The row of the registry that carries the policy
  *		is the one row of a ledger catalog table that the code of the extension
- *		updates (guard.c, kl_policy_update_allowed), and the transaction that
- *		switches it is recorded in the row, so that ledger_verify asks for an
- *		attestation only of the entries from then on.  The tables of the ledger
- *		itself have no policy.
+ *		updates (guard.c, kl_policy_update_allowed).
+ *
+ *		The switch is ordered with the writers of the table by a lock (L21-02).
+ *		It takes SHARE ROW EXCLUSIVE on the table before it reads or changes
+ *		anything, and holds it to the end of its transaction.  Every writer of
+ *		the table holds ROW EXCLUSIVE from the statement that wrote to the end
+ *		of its own transaction, and the two modes conflict, so
+ *
+ *		  - the switch waits for every transaction that has written the table
+ *			(and for a prepared one until it is committed or rolled back): none
+ *			of them can see the policy change, and none of them commits
+ *			after the switch with entries that the policy did not ask about;
+ *		  - a transaction that begins to write the table later waits for the
+ *			switch, and when the switch has committed reads the policy that is
+ *			in force with a snapshot of now (row_hash.c, kl_lookup_id), whatever
+ *			its isolation level or the age of its snapshot.
+ *
+ *		So a writer's answer, taken when it first writes the table, is true when
+ *		it commits, and no transaction can commit an entry of the table without
+ *		an attestation after the switch has committed.
+ *
+ *		The date of the switch is the transaction identifier that the next
+ *		transaction to start will have, read under the lock, less one (the
+ *		largest identifier that is not asked for).  Every transaction that wrote
+ *		the table before the switch has an identifier below it, because it had
+ *		one when it wrote; a transaction that writes the table after the switch
+ *		committed, and has an identifier above it, is asked for an attestation
+ *		by the check at commit and by ledger_verify.  One that began earlier
+ *		(its identifier is below) is asked by the check at commit only.  The
+ *		date is therefore never later than the first entry that is owed one, and
+ *		never earlier than the last that is not.
+ *
+ *		The entries that the switching transaction wrote itself before the
+ *		switch are owed an attestation too (they are entries of a transaction
+ *		that commits with the policy in force): the ones that have none are
+ *		added to the list that the commit check keeps.  A role that is not a
+ *		superuser calls the function as a statement of its own (it takes a lock
+ *		that others wait for, like the locks of the extension: write.c,
+ *		kl_lock_table_for_policy), and the wait for the writers is bounded.
+ *		The tables of the ledger itself have no policy.
  */
 Datum
 kingres_ledger_set_signature_policy(PG_FUNCTION_ARGS)
@@ -699,6 +759,11 @@ kingres_ledger_set_signature_policy(PG_FUNCTION_ARGS)
 	bool		required;
 	Datum		values[2];
 	Oid			types[2];
+	FullTransactionId fxid;
+	int64		from;
+	int32	   *seqs = NULL;
+	int			nseqs = 0;
+	int			i;
 
 	kl_not_null(fcinfo, 2);
 	relid = PG_GETARG_OID(0);
@@ -710,7 +775,7 @@ kingres_ledger_set_signature_policy(PG_FUNCTION_ARGS)
 				 errhint("The policies are \"optional\" and \"required\".")));
 	kl_check_owner(relid);
 	relname = get_rel_name(relid);
-	table_id = kl_lookup_table_id_policy(relid, &required);
+	table_id = kl_lookup_table_id(relid);
 	if (table_id < 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_TABLE),
@@ -723,6 +788,7 @@ kingres_ledger_set_signature_policy(PG_FUNCTION_ARGS)
 						relname)));
 	if (strcmp(policy, "optional") == 0)
 	{
+		kl_read_policy(relid, &table_id, &required);
 		if (required)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -731,21 +797,84 @@ kingres_ledger_set_signature_policy(PG_FUNCTION_ARGS)
 					 errhint("Like the mode of a ledger table, the policy is permanent.")));
 		PG_RETURN_VOID();
 	}
+
+	/*
+	 * The lock, and then everything is read as of now.  The ownership is
+	 * checked before the wait (a role that does not own the table cannot make
+	 * a writer wait) and again after it (the owner may have changed while
+	 * waiting).
+	 */
+	kl_require_own_statement("ledger_set_signature_policy");
+	kl_lock_table_for_policy(relid);
+	kl_check_owner(relid);
+	kl_read_policy(relid, &table_id, &required);
+	if (table_id < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 errmsg("table \"%s\" is not under ledger control", relname)));
 	if (required)
 		PG_RETURN_VOID();
+
+	/* The date: the largest identifier that is not asked for (see above). */
+	from = (int64) (U64FromFullTransactionId(ReadNextFullTransactionId()) - 1);
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+
+	/* The entries of this transaction that are not attested yet (L21-04). */
+	fxid = GetTopFullTransactionIdIfAny();
+	if (FullTransactionIdIsValid(fxid))
+	{
+		types[0] = INT8OID;
+		values[0] = Int64GetDatum((int64) U64FromFullTransactionId(fxid));
+		types[1] = INT4OID;
+		values[1] = Int32GetDatum(table_id);
+		kl_run("SELECT e.seq FROM kingres.ledger_entry e "
+			   "WHERE e.ledger_txid OPERATOR(pg_catalog.=) $1 "
+			   "AND e.table_id OPERATOR(pg_catalog.=) $2 "
+			   "AND NOT EXISTS (SELECT 1 FROM kingres.ledger_attestation a "
+			   "WHERE a.ledger_txid OPERATOR(pg_catalog.=) e.ledger_txid "
+			   "AND a.seq OPERATOR(pg_catalog.=) e.seq) "
+			   "ORDER BY e.seq",
+			   2, types, values, NULL, false);
+		nseqs = (int) SPI_processed;
+		if (nseqs > 0)
+		{
+			seqs = (int32 *) palloc(sizeof(int32) * nseqs);
+			for (i = 0; i < nseqs; i++)
+			{
+				bool		isnull;
+
+				seqs[i] = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i],
+													  SPI_tuptable->tupdesc, 1,
+													  &isnull));
+			}
+		}
+	}
 
 	types[0] = INT4OID;
 	values[0] = Int32GetDatum(table_id);
 	types[1] = INT8OID;
-	values[1] = Int64GetDatum((int64) U64FromFullTransactionId(GetTopFullTransactionId()));
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "SPI_connect failed");
+	values[1] = Int64GetDatum(from);
 	kl_run("UPDATE kingres.ledger_table "
 		   "SET signature_policy = 'required', signature_required_from = $2 "
 		   "WHERE table_id OPERATOR(pg_catalog.=) $1 AND signature_policy OPERATOR(pg_catalog.=) 'optional'",
 		   2, types, values, NULL, true);
+	/*
+	 * The row is read with the snapshot of the transaction, which in
+	 * REPEATABLE READ may be older than the registration of the table; the
+	 * switch that did not happen must not look done.
+	 */
+	if (SPI_processed != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not serialize access: the registry row of table \"%s\" is not visible to the snapshot of this transaction", relname),
+				 errhint("Retry the call in a new transaction.")));
+	if (nseqs > 0)
+		kl_seed_required(table_id, seqs, nseqs);
 	SPI_finish();
-	/* The answer that this transaction cached for the table is out of date. */
+	/* What this transaction cached for the table is out of date. */
+	CommandCounterIncrement();
 	kl_table_cache_reset();
 	PG_RETURN_VOID();
 }

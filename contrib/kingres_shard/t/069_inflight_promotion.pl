@@ -84,12 +84,18 @@ is($n1->safe_psql('postgres', 'SELECT count(*) FROM public.kv'), $before, 'a new
 # COPY out, after the promotion: complete.
 my $out = $n1->safe_psql('postgres', "COPY (SELECT id FROM public.kv ORDER BY id) TO STDOUT");
 is(scalar(split /\n/, $out), $before, 'COPY TO reads every row');
-# COPY into a distributed table is refused by the extension (it would write one node only): the
-# refusal is the same after the promotion, and says so; nothing is written.
-my ($rc, $o, $e) = run_sql($n1, "COPY public.kv FROM STDIN;\n999999\tx\n\\.\n");
-isnt($rc, 0, 'COPY FROM into a distributed table is refused after the promotion, as before it');
+# COPY into a distributed table with the row router off is refused by the extension (it would
+# write one node only): the refusal is the same after the promotion, and says so; nothing is written.
+my ($rc, $o, $e) = run_sql($n1, "SET kingres_shard.enable_copy_routing = off;\nCOPY public.kv FROM STDIN;\n999999\tx\n\\.\n");
+isnt($rc, 0, 'COPY FROM into a distributed table is refused after the promotion with the router off, as before it');
 like($e, qr/COPY FROM is not supported on distributed tables/, 'with the extension\'s message');
 is($n1->safe_psql('postgres', "SELECT count(*) FROM public.kv WHERE id = 999999"), '0', 'and nothing was written');
+# With the row router on (phase 2b, step 4) the COPY goes to the group that owns the bucket, whose
+# primary after the promotion is the promoted node, and the row is there exactly once.
+($rc, $o, $e) = run_sql($n1, "COPY public.kv FROM STDIN;\n999999\tx\n\\.\n");
+is($rc, 0, 'COPY FROM after the promotion is routed') or diag $e;
+is($n1->safe_psql('postgres', "SELECT count(*) FROM public.kv WHERE id = 999999"), '1', 'and the row is there once');
+$n1->safe_psql('postgres', "DELETE FROM public.kv WHERE id = 999999");
 
 # A transaction of ordinary INSERTs after the promotion reaches the new primary, and commits on it.
 my @new = @k1[40 .. 59];

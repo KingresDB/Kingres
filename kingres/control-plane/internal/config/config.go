@@ -111,6 +111,12 @@ type Config struct {
 	// before it tries a bucket move that failed again (default 30s).
 	RebalanceRetryBackoff time.Duration
 	GatherTimeout         time.Duration
+	// LedgerKeysDir is the directory of the private signing keys of the ledger (design ledger-phase7.md, 3.2.2); empty
+	// means <DataDir>/ledger/keys. LedgerKeyPassphraseFile names the file with the passphrase that seals the key
+	// files; empty keeps them in clear text, like ca.key. The passphrase is read from the file, never from the
+	// environment or the command line.
+	LedgerKeysDir           string
+	LedgerKeyPassphraseFile string
 	// HA are the settings of high availability (see ha.go).
 	HA HAConfig
 }
@@ -217,6 +223,10 @@ var settings = []setting{
 		apply: str(func(c *Config) *string { return &c.TLSKeyFile })},
 	{key: "pg-bin-dir", env: "KINGRES_PG_BIN_DIR", usage: "directory with the PostgreSQL binaries; enables managing the local instance",
 		apply: str(func(c *Config) *string { return &c.PGBinDir })},
+	{key: "ledger-keys-dir", env: "KINGRES_LEDGER_KEYS_DIR", usage: "directory of the private signing keys of the ledger (default <data-dir>/ledger/keys); it may be on another volume, and is to be backed up off the cluster",
+		apply: str(func(c *Config) *string { return &c.LedgerKeysDir })},
+	{key: "ledger-key-passphrase-file", env: "KINGRES_LEDGER_KEY_PASSPHRASE_FILE", usage: "file (mode 0600) with the passphrase that seals the signing key files of the ledger; without it the key files are in clear text",
+		apply: str(func(c *Config) *string { return &c.LedgerKeyPassphraseFile })},
 	{key: "pg-port", env: "KINGRES_PG_PORT", usage: "TCP port of the managed instance",
 		apply: func(c *Config, v string) error {
 			n := int64(0)

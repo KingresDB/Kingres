@@ -196,7 +196,7 @@ my $ended = qr/FATAL:  terminating connection due to administrator command/;
 		my ($ret, $out, $err) = as_role('app', "SET $guc = 0");
 		like($err, qr/permission denied to set parameter "\Q$guc\E"/, "the role that is bounded cannot set $guc");
 	}
-	is($node->safe_psql('d', q{SHOW kingres_ledger.enable_credit_limit}), '30min', 'the default of the credit limit is 30 minutes');
+	is($node->safe_psql('d', q{SHOW kingres_ledger.enable_credit_limit}), '1min', 'the default of the credit limit is one minute (L21-06)');
 
 	# A superuser is not bounded by the credit limit, and is not delayed
 	# (the delay is the role's setting).

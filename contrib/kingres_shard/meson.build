@@ -2,6 +2,7 @@
 # Portions Copyright (c) 2026, RooyeKhat Media Co
 
 kingres_shard_sources = files(
+  'src/batch_sender.c',
   'src/bucket_move.c',
   'src/catalog.c',
   'src/dist_scan.c',
@@ -20,6 +21,7 @@ kingres_shard_sources = files(
   'src/prune.c',
   'src/recovery.c',
   'src/remote_scan.c',
+  'src/row_router.c',
   'src/shippable.c',
   'src/term.c',
   'src/utility.c',
@@ -75,6 +77,7 @@ tests += {
       'reference',
       'ddl_single',
       'rebalance_plan',
+      'bulk_plans',
       'upgrade',
     ],
     'regress_args': ['--temp-config', files('kingres_shard.conf')],
@@ -195,6 +198,14 @@ tests += {
       't/109_sweep_variants.pl',
       't/110_sweep_promote_scenarios.pl',
       't/111_two_nodes.pl',
+      't/112_row_router.pl',
+      't/113_router_faults.pl',
+      't/114_router_security.pl',
+      't/115_copy_routing.pl',
+      't/116_router_moves.pl',
+      't/117_bulk_memory.pl',
+      't/118_review_steps_1_2.pl',
+      't/119_nested_subxacts.pl',
     ],
   },
 }

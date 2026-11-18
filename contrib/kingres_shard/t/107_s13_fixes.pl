@@ -201,7 +201,8 @@ sub silent_at
 	like($err, qr/took longer than kingres_shard.control_call_timeout \(\Q$limit\E seconds\) as a whole/, 'whose text says that the call took too long as a whole');
 	unlike($err, qr/KS007|did not answer within/, 'and does not say that a node did not answer');
 	like($err, qr/Do not fence a node/, 'and says not to fence one');
-	cmp_ok($t, '<=', $limit + $T3 + 3, sprintf('it ended close to the limit (%.1f s, limit %d s)', $t, $limit));
+	# the README: the limit plus the cancel of one statement (min(node_connect_timeout, T / 3), at least 1 s)
+	cmp_ok($t, '<=', $limit + 1 + 2, sprintf('it ended within the limit plus one cancel (%.1f s, limit %d s)', $t, $limit));
 	$proxy->set(delay_turn => 0, turn_log => '');
 	settle({ nodes => \@nodes });
 	is($secret->($n1), $before, 'the state is the one of a failed call: the secret of MAP is unchanged');
@@ -216,7 +217,8 @@ sub silent_at
 
 	# the limit is checked between statements as well: a limit that is used up before the first statement
 	($t, $rc, $out, $err) = call("SET kingres_shard.control_call_timeout = 1;\nSELECT pg_sleep(1.2), kingres.sync_catalog()");
-	ok($rc == 0 || $err =~ /KS015/, 'a call that has used its time before it starts is not ended by the limit of a call that did not start yet');
+	is($rc, 0, "a call that has used its time before it starts is not ended by the limit of a call that did not start yet ($err)");
+	unlike($err, qr/KS015/, 'and says nothing of the limit');
 	my ($t4, $rc4, $out4, $err4) = call('SELECT kingres.sync_catalog()');
 	is($rc4, 0, "and the next call without the setting works ($err4)");
 }

@@ -180,19 +180,31 @@ kc_am_cache_init(void)
 	CacheRegisterSyscacheCallback(PROCOID, kc_am_cache_inval, (Datum) 0);
 }
 
+static bool
+kc_am_class_cached(Oid amoid, KcAmClass *cls)
+{
+	int			i;
+
+	for (i = 0; i < kc_am_cache_n; i++)
+		if (kc_am_cache[i].amoid == amoid)
+		{
+			*cls = kc_am_cache[i].cls;
+			return true;
+		}
+	return false;
+}
+
 KcAmClass
 kc_am_class(Oid amoid)
 {
 	HeapTuple	tup;
 	Form_pg_am	am;
 	KcAmClass	result;
-	int			i;
 
 	if (!OidIsValid(amoid))
 		return KC_AM_UNKNOWN;
-	for (i = 0; i < kc_am_cache_n; i++)
-		if (kc_am_cache[i].amoid == amoid)
-			return kc_am_cache[i].cls;
+	if (kc_am_class_cached(amoid, &result))
+		return result;
 	tup = SearchSysCache1(AMOID, ObjectIdGetDatum(amoid));
 	if (!HeapTupleIsValid(tup))
 		return KC_AM_UNKNOWN;
@@ -211,13 +223,76 @@ kc_am_class(Oid amoid)
 	return result;
 }
 
-/* kc_am_class with the answer for the last access method kept, for a loop over pg_class */
+/*
+ * kc_am_class for the loops over pg_class of the orphan step and the check:
+ * the handler of an access method that is not ours is code of somebody else,
+ * and an error it raises must not end the call.  The handler is called in a
+ * subtransaction (only when the answer is not cached, and where the server
+ * lets code begin one); an error other than a cancel, a shutdown or running
+ * out of memory leaves the access method "unknown", which makes the orphan
+ * step stand down and say so (C12-01) and leaves the relation out of the list
+ * of tables.
+ */
+static KcAmClass
+kc_am_class_guarded(Oid amoid)
+{
+	KcAmClass	cls;
+	MemoryContext oldcxt = CurrentMemoryContext;
+	ResourceOwner oldowner = CurrentResourceOwner;
+
+	if (!OidIsValid(amoid))
+		return KC_AM_UNKNOWN;
+	if (kc_am_class_cached(amoid, &cls))
+		return cls;
+	if (!kc_subxact_possible())
+		return kc_am_class(amoid);
+
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(oldcxt);
+	PG_TRY();
+	{
+		cls = kc_am_class(amoid);
+		ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcxt);
+		CurrentResourceOwner = oldowner;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *ed;
+
+		MemoryContextSwitchTo(oldcxt);
+		ed = CopyErrorData();
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcxt);
+		CurrentResourceOwner = oldowner;
+		if (ERRCODE_TO_CATEGORY(ed->sqlerrcode) == ERRCODE_TO_CATEGORY(ERRCODE_OPERATOR_INTERVENTION) ||
+			ed->sqlerrcode == ERRCODE_OUT_OF_MEMORY)
+			ReThrowError(ed);
+		ereport(LOG,
+				(errmsg("columnar: the handler of access method %u raised an error and the access method cannot be classified: %s",
+						amoid, ed->message)));
+		FreeErrorData(ed);
+		cls = KC_AM_UNKNOWN;
+	}
+	PG_END_TRY();
+	return cls;
+}
+
+/*
+ * The answer for the last access method kept, for a loop over pg_class.  With
+ * memo->guard a handler that is not cached is called in a subtransaction
+ * (kc_am_class_guarded); a caller says so only where a subtransaction may be
+ * begun: the check (which refuses where it cannot), a statement at the top
+ * level.  A function called at the start of a subtransaction, which this module
+ * cannot see, must not begin one.
+ */
 KcAmClass
 kc_am_class_memo(Oid amoid, KcAmMemo *memo)
 {
 	if (!OidIsValid(memo->amoid) || memo->amoid != amoid)
 	{
-		memo->cls = kc_am_class(amoid);
+		memo->cls = memo->guard ? kc_am_class_guarded(amoid) : kc_am_class(amoid);
 		memo->amoid = amoid;
 	}
 	return memo->cls;
@@ -1121,7 +1196,10 @@ kc_catalog_available(void)
  * cannot be classified makes the whole cleanup stand down: rows are deleted
  * only when every relation that could own them has been classified (C11-02).
  *
- * Returns the number of rows deleted (or, dry, that would be).
+ * Returns the number of rows deleted (or, dry, that would be), or -1 when the
+ * cleanup stood down and did nothing (C12-01): the answer "0" of a step that did
+ * not run must not be the answer "0" of a step that ran and found nothing.  *why
+ * (when the caller gives one) is then the reason, a string that lives on.
  */
 
 /*
@@ -1131,7 +1209,7 @@ kc_catalog_available(void)
  * method cannot be classified.
  */
 static bool
-kc_live_files(uint64 **live_out, int *nlive_out)
+kc_live_files(uint64 **live_out, int *nlive_out, const char **why, bool guard)
 {
 	Relation	pgclass;
 	SysScanDesc scan;
@@ -1142,8 +1220,9 @@ kc_live_files(uint64 **live_out, int *nlive_out)
 	int			caplive = 0;
 	bool		unknown = false;
 	bool		unclassified = false;
-	KcAmMemo	memo = {InvalidOid, KC_AM_UNKNOWN};
+	KcAmMemo	memo = {InvalidOid, KC_AM_UNKNOWN, false};
 
+	memo.guard = guard;
 	pgclass = table_open(RelationRelationId, AccessShareLock);
 	InitDirtySnapshot(dirty);
 	scan = systable_beginscan(pgclass, InvalidOid, false, &dirty, 0, NULL);
@@ -1179,6 +1258,9 @@ kc_live_files(uint64 **live_out, int *nlive_out)
 	table_close(pgclass, AccessShareLock);
 	if (unknown || unclassified)
 	{
+		*why = unknown ?
+			"a columnar relation has an unreadable metapage" :
+			"a relation has an access method that cannot be classified (one that a transaction has made and not committed, or whose handler raises an error)";
 		ereport(LOG,
 				(errmsg(unknown ?
 						"columnar stripe catalog cleanup skipped: a columnar relation has an unreadable metapage" :
@@ -1207,8 +1289,9 @@ typedef struct KcOrphanCand
 } KcOrphanCand;
 
 static int
-kc_reconcile_ex(bool dry)
+kc_reconcile_ex(bool dry, bool guard, const char **why_out)
 {
+	const char *why = NULL;
 	SysScanDesc scan;
 	HeapTuple	tup;
 	uint64	   *live = NULL;
@@ -1224,12 +1307,17 @@ kc_reconcile_ex(bool dry)
 	int			ncand = 0;
 	int			capcand = 0;
 	int			i;
+	bool		stood_down = false;
 
 	/* the test gate (t/036): after the first snapshot, before the scan of pg_class */
 	kc_check_gate(KC_GATE_ORPHANS);
 
-	if (!kc_live_files(&live, &nlive))
-		return 0;
+	if (!kc_live_files(&live, &nlive, &why, guard))
+	{
+		if (why_out)
+			*why_out = why;
+		return -1;
+	}
 
 	/* the test gate (t/036): after the first claim, before the second snapshot */
 	kc_check_gate(KC_GATE_CLAIMS);
@@ -1266,8 +1354,11 @@ kc_reconcile_ex(bool dry)
 	 * after all (its table was made, or rewritten, since the first scan) is
 	 * not an orphan.  A cleanup that cannot classify now stands down.
 	 */
-	if (ncand > 0 && !kc_live_files(&live2, &nlive2))
+	if (ncand > 0 && !kc_live_files(&live2, &nlive2, &why, guard))
+	{
 		ncand = 0;
+		stood_down = true;
+	}
 	for (i = 0; i < ncand; i++)
 	{
 		if (kc_uid_is_live(cand[i].uid, live2, nlive2))
@@ -1283,20 +1374,27 @@ kc_reconcile_ex(bool dry)
 		pfree(live2);
 	if (cand)
 		pfree(cand);
+	if (stood_down)
+	{
+		if (why_out)
+			*why_out = why;
+		return -1;
+	}
 	return ndel;
 }
 
 
 int
-kc_catalog_reconcile(void)
+kc_catalog_reconcile(const char **why, bool guard)
 {
-	return kc_reconcile_ex(false);
+	return kc_reconcile_ex(false, guard, why);
 }
 
+/* only the check calls it, and the check begins subtransactions anyway */
 int
-kc_catalog_count_orphans(void)
+kc_catalog_count_orphans(const char **why)
 {
-	return kc_reconcile_ex(true);
+	return kc_reconcile_ex(true, true, why);
 }
 
 /* ------------------------------------------------------------------------

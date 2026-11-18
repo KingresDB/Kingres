@@ -92,6 +92,8 @@ type Deps struct {
 	Rebalance Rebalancer
 	// Failover serves the Failover operations; nil makes them answer "not supported".
 	Failover Failoverer
+	// LedgerSigning serves the signing keys and the settings of the ledger (phase 7); nil makes them answer "not supported".
+	LedgerSigning LedgerSigner
 	// Config serves the Configuration operations (phase 13); nil makes them answer "not supported".
 	Config *pgconfig.Leader
 	// LocalSettings serves getThisServerSettings and updateThisServerSettings;

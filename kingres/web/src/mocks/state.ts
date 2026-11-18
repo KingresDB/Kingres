@@ -38,6 +38,7 @@ import type {
   ClusterRoleName,
 } from '@/api/types'
 import { createConfigState, type ConfigState } from './config-data'
+import { createLedger7State, type Ledger7State } from './ledger-data'
 
 type S = components['schemas']
 
@@ -210,7 +211,7 @@ interface BucketRec {
   size: number | null
 }
 
-interface DbRec {
+export interface DbRec {
   info: Database
   tables: Table[]
   colocations: ColocationGroup[]
@@ -352,6 +353,8 @@ export interface MockState {
   session: SessionRec | null
   /** 0.8.0: the configuration of the servers (parameters, overrides, history, what each server runs, the clocks). */
   config: ConfigState
+  /** 0.11.0: the ledger of phase 7 (the settings, the signing keys, the anchor targets, the divergence of chains). */
+  ledger7: Ledger7State
   /** Result sets the workbench can select from, by table name (hostile-data tests). */
   extraQueryTables?: Record<string, { columns: S['QueryColumn'][]; rows: unknown[][] }>
 }
@@ -975,6 +978,7 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
             document: digestDocument(g, 1800 + g * 10),
           })),
           aggregateHash: fakeHash('agg-3'),
+          aggregateSize: 41,
           anchors: [],
           complete: true,
           uncoveredShardGroupIds: [],
@@ -1058,6 +1062,7 @@ export function createMockState(options: { uninitialized?: boolean } = {}): Mock
     nextStandbyId: 5,
     session: null,
     config: createConfigState(servers.map((x) => ({ id: x.id, serverGroup: x.serverGroup }))),
+    ledger7: createLedger7State(),
   }
 }
 

@@ -60,6 +60,8 @@ var leaderBoundReads = map[string]bool{
 	// The verification records get their identifiers in the system database
 	// the first time they are read (README, "Inclusion proofs and verification records").
 	"listLedgerVerifications": true, "getLedgerVerification": true,
+	// The signing keys, the events and the trust file are in the leader's system database (phase 7).
+	"getLedgerSettings": true, "getLedgerSigning": true, "getLedgerTrustFile": true,
 }
 
 // forwardsToLeader tells whether an operation is run by the leader. Mutating
@@ -173,7 +175,7 @@ func (s *Server) tryForward(c *call, w http.ResponseWriter, r *http.Request) (bo
 // relayedHeaders are the response headers passed through in both directions.
 var relayedHeaders = map[string]bool{
 	"Content-Type": true, "Location": true, "Retry-After": true, "Allow": true, "Content-Language": true,
-	"Preference-Applied": true,
+	"Preference-Applied": true, "Content-Disposition": true,
 }
 
 // ServeForwarded runs a forwarded operation on this server, which must be the

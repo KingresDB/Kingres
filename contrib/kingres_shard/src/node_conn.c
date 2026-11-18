@@ -139,6 +139,9 @@ static void remember_timezone(KsConn *kc);
 static void sync_timezone(KsConn *kc);
 static void discard_connection(KsConn *kc);
 static void end_of_xact(void);
+static int64 control_time_left_ms(void);
+static PGresult *bounded_get_last_limit(PGconn *conn, bool interruptible, int64 limit_ms, bool *failed);
+static void call_timeout_error(const char *waiting, const char *sql);
 
 /*
  * kingres_shard_conn_init
@@ -484,15 +487,21 @@ static void
 note_session_lost(KsConn *kc)
 {
 	MemoryContext old;
+	char	   *label;
 
 	if (session_lost_msg != NULL)
 		return;
+	/*
+	 * The label is made in the current (short-lived) context, and only the final text in the long-lived
+	 * one: a temporary made in TopMemoryContext would stay for ever (review S14-03).
+	 * The catalog is not read in an aborting transaction.
+	 */
+	label = IsTransactionState() ? node_label(kc->host, kc->port) : psprintf("%s:%d", kc->host, kc->port);
 	old = MemoryContextSwitchTo(TopMemoryContext);
-	/* the catalog is not read in an aborting transaction */
 	session_lost_msg = psprintf("the session to node %s was closed while this transaction had written through it",
-								IsTransactionState() ? node_label(kc->host, kc->port) :
-								psprintf("%s:%d", kc->host, kc->port));
+								label);
 	MemoryContextSwitchTo(old);
+	pfree(label);
 }
 
 /*
@@ -506,13 +515,16 @@ static void
 note_session_failed(KsConn *kc, const char *what)
 {
 	MemoryContext old;
+	char	   *label;
 
 	if (session_lost_msg != NULL)
 		return;
+	label = conn_label(kc);		/* not in the long-lived context (review S14-03) */
 	old = MemoryContextSwitchTo(TopMemoryContext);
 	session_lost_msg = psprintf("node %s did not complete %s, and its session was closed",
-								conn_label(kc), what);
+								label, what);
 	MemoryContextSwitchTo(old);
+	pfree(label);
 }
 
 static void
@@ -560,8 +572,15 @@ connect_to_node_as(const char *host, int port, const char *user, int claim_id,
 	char	   *options;
 
 	snprintf(portstr, sizeof(portstr), "%d", port);
-	snprintf(timeoutstr, sizeof(timeoutstr), "%d",
-			 kingres_shard_node_connect_timeout);
+	{
+		/* in a control call the connect is cut to what is left of the time of the call (review S14-02) */
+		int64		left = control_time_left_ms();
+		int			ct = kingres_shard_node_connect_timeout;
+
+		if (left >= 0 && left < (int64) ct * 1000)
+			ct = (int) Max(1, (left + 999) / 1000);
+		snprintf(timeoutstr, sizeof(timeoutstr), "%d", ct);
+	}
 
 	/*
 	 * A node that stops answering without closing the connection (a partition,
@@ -691,9 +710,34 @@ probe_session(PGconn *conn, const char *host, int port, char **errmsg_out)
 	{
 		char		sql[160];
 
+		int64		left = control_time_left_ms();
+
 		snprintf(sql, sizeof(sql), "SET lock_timeout = %d; SELECT 1; RESET lock_timeout",
 				 control_lock_timeout_ms());
-		res = kingres_shard_bounded_exec(conn, sql, false);
+		if (left >= 0 && left < (int64) kingres_shard_node_timeout * 1000)
+		{
+			/* the probe waits for what is left of the call's time, and no longer (review S14-02) */
+			bool		failed = false;
+
+			res = NULL;
+			if (PQstatus(conn) == CONNECTION_OK && PQsendQuery(conn, sql))
+			{
+				res = bounded_get_last_limit(conn, false, Max(left, 1), &failed);
+				if (failed)
+				{
+					bool		still_up = (PQstatus(conn) == CONNECTION_OK);
+
+					res = NULL;
+					if (still_up)
+					{
+						PQfinish(conn);
+						call_timeout_error(node_label(host, port), "the first command of a new session");
+					}
+				}
+			}
+		}
+		else
+			res = kingres_shard_bounded_exec(conn, sql, false);
 	}
 	else
 		res = kingres_shard_bounded_exec(conn, "SELECT 1", false);
@@ -1785,6 +1829,47 @@ kingres_shard_conn_collect_quiet(KsConn *kc)
 }
 
 /*
+ * kingres_shard_conn_cancel_and_drop
+ *
+ * The query in flight on kc is a write whose statement is ending in an error, a cancel or the
+ * abort of a subtransaction (the batch of the batch sender): nobody wants its answer, so the node
+ * is asked to stop it, and what it answers is read for at most the time a cancel request gets
+ * (a third of node_timeout, at most node_connect_timeout).  Reading the answer for node_timeout
+ * instead (kingres_shard_conn_collect_quiet) would make a cancel of the statement take that long
+ * when the node is frozen or slow.  A node that does not answer in that time loses the session
+ * (have_error): the remote transaction ends with it, and the transaction cannot commit
+ * (precommit), which is what a lost write must mean.  Nothing is thrown.
+ */
+void
+kingres_shard_conn_cancel_and_drop(KsConn *kc)
+{
+	bool		failed = false;
+	MemoryContext oldcxt;
+
+	if (kc->conn == NULL || kc->have_error || PQstatus(kc->conn) != CONNECTION_OK)
+	{
+		kc->have_error = true;
+		kc->in_query = false;
+		kc->pending_owner = NULL;
+		kc->pending_finish = NULL;
+		return;
+	}
+	kingres_shard_cancel_with_deadline(kc->conn);
+	/* the result wrapper of PostgreSQL 19 needs a context that outlives a context being reset */
+	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+	PQclear(bounded_get_last_limit(kc->conn, false,
+								   (int64) 1000 * Max(1, Min(kingres_shard_node_connect_timeout,
+															 kingres_shard_node_timeout / 3)),
+								   &failed));
+	MemoryContextSwitchTo(oldcxt);
+	if (failed)
+		kc->have_error = true;
+	kc->in_query = false;
+	kc->pending_owner = NULL;
+	kc->pending_finish = NULL;
+}
+
+/*
  * The dynamic extent of the control-plane calls that are running (S11-01).  A control call is a
  * function of the SQL interface that runs inside kingres_shard_control_call() (or between
  * kingres_shard_control_enter() and kingres_shard_control_leave() in a PG_TRY): the depth is
@@ -2151,6 +2236,90 @@ kingres_shard_exec_params(KsConn *kc, const char *sql, int nparams,
 							PQresultStatus(res) != PGRES_TUPLES_OK)))
 		kingres_shard_report_error(kc, res, sql);
 	return res;
+}
+
+/*
+ * kingres_shard_conn_send_params
+ *
+ * Send one statement with text-format parameters (the types come from the casts in the
+ * statement) and return without waiting for the answer, which the caller reads with
+ * libpqsrv_get_result_last() after registering as the owner of the query in flight
+ * (kingres_shard_conn_set_pending).  This is the send of the batch sender (design 11.4,
+ * 11.9): the batch can be a megabyte, and a node that does not read (stuck, or slow) must
+ * not leave this backend in a write that nothing can end, so the connection is made
+ * non-blocking for the send and the wait for room in the socket is a latch wait that a
+ * cancel, a statement timeout and the death of the postmaster end (S13: every wait on a node
+ * has a bound or is a statement of the user that a cancel ends).  The statement is in
+ * flight (kc->in_query) from the first byte on, so every path that leaves it half sent
+ * finds the session marked: the error path of this function closes the session (it cannot
+ * be used for another statement after a half-sent message), which rolls back what the
+ * transaction did there; the commit then fails (note_session_lost).
+ *
+ * Returns false when the statement could not be sent (the connection is gone); the caller
+ * raises the error of the group (kingres_shard_fragment_error).
+ */
+bool
+kingres_shard_conn_send_params(KsConn *kc, const char *sql, int nparams,
+							   const char *const *values)
+{
+	bool		ok = true;
+
+	kingres_shard_conn_quiesce(kc);
+	if (kc->conn == NULL || PQstatus(kc->conn) != CONNECTION_OK)
+	{
+		kc->have_error = true;
+		return false;
+	}
+	if (control_depth > 0)
+	{
+		check_call_budget();
+		kc->control_work = true;
+	}
+	kc->in_query = true;
+	PG_TRY();
+	{
+		if (PQsetnonblocking(kc->conn, 1) != 0 ||
+			!PQsendQueryParams(kc->conn, sql, nparams, NULL, values, NULL, NULL, 0))
+			ok = false;
+		while (ok)
+		{
+			int			rc = PQflush(kc->conn);
+
+			if (rc < 0)
+			{
+				ok = false;
+				break;
+			}
+			if (rc == 0)
+				break;
+			(void) WaitLatchOrSocket(MyLatch,
+									 WL_LATCH_SET | WL_SOCKET_READABLE | WL_SOCKET_WRITEABLE |
+									 WL_EXIT_ON_PM_DEATH,
+									 PQsocket(kc->conn), -1L, PG_WAIT_EXTENSION);
+			ResetLatch(MyLatch);
+			CHECK_FOR_INTERRUPTS();
+			/* the node may be sending its answer or a notice: read it so that it can go on reading ours */
+			if (!PQconsumeInput(kc->conn))
+				ok = false;
+		}
+		if (ok && PQsetnonblocking(kc->conn, 0) != 0)
+			ok = false;
+	}
+	PG_CATCH();
+	{
+		kc->in_query = false;
+		kc->have_error = true;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!ok)
+	{
+		kc->in_query = false;
+		kc->have_error = true;
+		return false;
+	}
+	kc->nstatements++;
+	return true;
 }
 
 /*
@@ -3296,6 +3465,8 @@ static void
 abort_savepoint_failed(KsConn *kc, const char *what, bool no_answer)
 {
 	bool		timed_out = no_answer && kc->conn != NULL && PQstatus(kc->conn) == CONNECTION_OK;
+	/* what the session held that closing it loses (review S14-04); read before discard_connection clears it */
+	bool		lost_work = kc->wrote || kc->wrote_user || kc->control_work || IsolationUsesXactSnapshot();
 
 	ereport(WARNING,
 			(errcode(timed_out ? ERRCODE_KINGRES_NODE_TIMEOUT : ERRCODE_CONNECTION_FAILURE),
@@ -3303,7 +3474,8 @@ abort_savepoint_failed(KsConn *kc, const char *what, bool no_answer)
 					conn_label(kc), what,
 					timed_out ? psprintf(" within %d seconds", kingres_shard_node_timeout) : ""),
 			 errdetail("What this transaction did on that node is rolled back with the session; the transaction cannot be committed.")));
-	note_session_failed(kc, what);
+	if (lost_work)
+		note_session_failed(kc, what);
 	discard_connection(kc);
 }
 
@@ -3323,7 +3495,8 @@ conn_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 
 	if (conn_hash == NULL)
 		return;
-	if (event != SUBXACT_EVENT_COMMIT_SUB && event != SUBXACT_EVENT_ABORT_SUB)
+	if (event != SUBXACT_EVENT_PRE_COMMIT_SUB && event != SUBXACT_EVENT_COMMIT_SUB &&
+		event != SUBXACT_EVENT_ABORT_SUB)
 		return;
 
 	curlevel = GetCurrentTransactionNestLevel();
@@ -3334,19 +3507,48 @@ conn_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 
 		if (kc->xact_depth < curlevel)
 			continue;
+
+		/*
+		 * Review S14-01: the callback of the abort or the commit of a subtransaction must never raise
+		 * an error where PostgreSQL cannot take one (an error in the abort of a subtransaction is
+		 * aborted again, until the error stack overflows).  A session whose depth is deeper than the
+		 * level that ends was left there by a level that could not undo it (the connection broke, or
+		 * its statement was cut short): it is repaired here, closed, and the transaction is marked so
+		 * that it cannot commit when the session held work; every level above skips it.
+		 */
 		if (kc->xact_depth > curlevel)
-			elog(ERROR, "unexpected remote savepoint depth");
+		{
+			if (event != SUBXACT_EVENT_PRE_COMMIT_SUB)
+			{
+				if (kc->wrote || kc->wrote_user || kc->control_work || IsolationUsesXactSnapshot())
+					note_session_failed(kc, "ROLLBACK TO SAVEPOINT");
+				discard_connection(kc);
+				continue;
+			}
+		}
 
 		if (event == SUBXACT_EVENT_COMMIT_SUB)
 		{
+			/* the RELEASE was sent at PRE_COMMIT_SUB, where an error is legal: nothing can fail here */
+			kc->xact_depth = curlevel - 1;
+			continue;
+		}
+
+		if (event == SUBXACT_EVENT_PRE_COMMIT_SUB)
+		{
+			if (kc->xact_depth > curlevel)
+				continue;			/* released by the level above; repaired at the commit or the abort */
 			snprintf(sql, sizeof(sql), "RELEASE SAVEPOINT s%d", curlevel);
 
 			/*
 			 * S13-01: bounded by node_timeout whatever the control depth is (a call has been left
 			 * when its subtransaction commits), and an error that names the node, not a wait that
-			 * nobody can end.  A failure also keeps this transaction from committing: the sessions
-			 * that were released before this one keep the work of a subtransaction that the error
-			 * is about to roll back.
+			 * nobody can end.  Review S14-05: sent at PRE_COMMIT_SUB, as postgres_fdw does, so that
+			 * an error aborts a subtransaction that is still in progress and nothing of a rolled-back
+			 * subtransaction is merged into its parent.  A failure also keeps this transaction from
+			 * committing: the sessions that were released before this one keep the work of a
+			 * subtransaction that the error is about to roll back (the doomed note, which is the
+			 * second protection: the abort then finds the savepoint released and says so).
 			 */
 			PG_TRY();
 			{
@@ -3354,10 +3556,13 @@ conn_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 			}
 			PG_CATCH();
 			{
-				note_session_failed(kc, "RELEASE SAVEPOINT");
+				/* a session that is still up and was only interrupted is rolled back normally */
+				if (kc->conn == NULL || kc->have_error || PQstatus(kc->conn) != CONNECTION_OK)
+					note_session_failed(kc, "RELEASE SAVEPOINT");
 				PG_RE_THROW();
 			}
 			PG_END_TRY();
+			continue;
 		}
 		else
 		{
@@ -3375,7 +3580,8 @@ conn_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 			 * connection if that comes first): it reads the answer, and an
 			 * error in it is kept for the owner, not raised.  What is left in
 			 * flight after that has no owner (a command that an interrupt cut
-			 * short): read and dropped.
+			 * short): read and dropped.  A batch of the batch sender in flight is
+			 * cancelled there, not waited for.
 			 */
 			if (kc->in_query)
 			{
@@ -3386,7 +3592,13 @@ conn_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 			if (kc->have_error || kc->conn == NULL ||
 				PQstatus(kc->conn) != CONNECTION_OK)
 			{
+				/*
+				 * A broken session at this level: every level above skips it (review S14-01).
+				 * What it held is lost with it; a session that wrote for the user is noted when
+				 * the connection is closed (discard_connection).
+				 */
 				kc->have_error = true;
+				kc->xact_depth = curlevel - 1;
 				continue;
 			}
 			snprintf(sql, sizeof(sql), "ROLLBACK TO SAVEPOINT s%d", curlevel);

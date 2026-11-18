@@ -81,6 +81,9 @@ version 1, the caller \"2\"."}` when the number is missing or different.
 | `GET /internal/v1/liveness` | any peer | this server's heartbeat view of every other server (state and silence) |
 | `GET /internal/v1/failover/state?group=<g>` | leader | this server's knowledge of one group: its instances and their roles, the lease, an adoption or a hand-over, the freeze, the catalog term |
 | `POST /internal/v1/failover/freeze`, `/unfreeze`, `/standbys-gone` | leader | hold the synchronous list of a group while its failover is decided (it lapses by itself); take the standbys of a failed server out of the lists at once |
+| `POST /internal/v1/ledger/key/install` | leader | give this server the key file of a signing key of the ledger: `{fingerprint, file}`, `file` the standard base64 of the key file as the leader holds it (plain or sealed, never a passphrase); the callee opens it with its own passphrase file and writes it again under its own sealing (`409 passphrase_mismatch` when it cannot open it, `422 key_invalid` for a file that is not a key or whose key has another fingerprint); installing a key that is there is a no-op; the answer is `{}` |
+| `POST /internal/v1/ledger/key/remove` | leader | delete the key file of a key (`{fingerprint}`; the content is overwritten before the file is removed; a key that is not there is not an error); the answer is `{}` |
+| `POST /internal/v1/ledger/key/list` | leader | `{}` -> `{fingerprints: [...]}`: the key files this server has, nothing else |
 | `POST /internal/v1/config/state` | leader | the effective values, sources, pending restarts and file errors of the settings of this server's instances (the metadata of every parameter with `meta`), the parameters PostgreSQL hides from ordinary users, the revision and hash of the override file; see "Configuration" |
 | `POST /internal/v1/config/apply` | leader | the override values of this server at a revision and the database-level values: the server re-validates, writes `kingres-config.conf` of each instance, has PostgreSQL check it before the reload, reloads and answers per parameter (applied, pendingRestart, failed) |
 | `POST /internal/v1/config/check` | leader | PostgreSQL's verdict on one value (layers 2 and 3 of the validation) |
@@ -395,6 +398,17 @@ refuses the failover with `version_mismatch` at the request), never as `no_insta
 
 `GET /lease/state` already carries `durationMs` and `marginMs` of the answering server; the request is refused (`lease_settings_differ`) when two servers
 differ.
+
+### The ledger keys (ledger phase 7, step 4)
+
+Types: `internal/ledgersign/agent.go`. The three calls are `LeaderOnly` and carry the fence of the task run like every leader-only call. The leader
+calls them from the steps of `ledger.key.create`, `ledger.key.rotate`, `ledger.key.distribute`, `ledger.key.retire` and `ledger.key.revoke` and from the job
+`ledger.key.sync`. A server that is not a holder never has a key file: the leader sends one to the servers that run an instance of shard group 0 (the candidates
+of the manager leader) and takes it away from a server that stops running one and from every server when the key is retired or revoked. The body of an install
+holds the seed in clear when the leader's key files are plain: it crosses only the mutually authenticated listener and is never logged (the internal API logs
+no body), and neither the callee nor the leader puts the file in an error, a task detail or an audit entry. A call made inside a task step is repeated by the peer client
+after a failure of the connection that left the effect unknown (the rule of every step); an install is a no-op when the key is already there, and a remove when it is not, so
+the repeat and the step that runs again are safe.
 
 ### A server that waits for its lease
 

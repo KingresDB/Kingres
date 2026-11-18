@@ -6,6 +6,7 @@ MODULE_big = kingres_ledger
 OBJS = \
 	$(WIN32RES) \
 	src/capture.o \
+	src/ed25519_check.o \
 	src/guard.o \
 	src/history.o \
 	src/kingres_ledger.o \

@@ -374,6 +374,7 @@ typedef struct KcAmMemo
 {
 	Oid			amoid;
 	KcAmClass	cls;
+	bool		guard;			/* call a handler that is not cached in a subtransaction (kc_am_class_guarded) */
 } KcAmMemo;
 
 extern KcAmClass kc_am_class(Oid amoid);
@@ -415,8 +416,8 @@ extern bool kc_catalog_available(void);
 extern bool kc_catalog_all_visible(Relation rel, TransactionId oldest_xmin);
 extern uint64 kc_catalog_row_total(Relation rel, Snapshot snap, uint64 *stripes,
 								   uint64 *groups, uint64 *raw_bytes);
-extern int	kc_catalog_reconcile(void);
-extern int	kc_catalog_count_orphans(void);
+extern int	kc_catalog_reconcile(const char **why, bool guard);
+extern int	kc_catalog_count_orphans(const char **why);
 extern void kc_stripe_stats_parse(const KcStripeInfo *si, int ncols,
 								  const KcTypeInfo *ti, KcColStat *out);
 extern void kc_footer_load(Relation rel, const KcStripeInfo *si, KcFooter *f);
@@ -436,6 +437,7 @@ extern bool kc_entry_refused(const char *what, const char *name, bool fails_txn)
 extern bool kc_write_refused(Relation rel, const char *what);
 extern bool kc_error_forbidden(void);
 extern bool kc_subxact_refused(const char *what);
+extern bool kc_subxact_possible(void);
 extern int	kc_write_path_count(void);
 extern const char *kc_write_path_get(int i, uint64 *hits);
 extern void kc_write_paths_reset(void);

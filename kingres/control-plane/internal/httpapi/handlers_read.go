@@ -312,7 +312,9 @@ func (s *Server) listTasks(_ *call, w http.ResponseWriter, r *http.Request) erro
 			"server.leave", "instance.start", "instance.stop", "instance.restart", "database.create",
 			"database.update", "database.drop", "table.distribute", "rebalance",
 			"replication.restorePreferredPrimaries", "ledger.verify", "networkAccess.apply", "replicate.apply",
-			"certificate.renew", "certificate.revoke", "standby.reconcile", "config.apply", "config.restart"),
+			"certificate.renew", "certificate.revoke", "standby.reconcile", "config.apply", "config.restart",
+			"ledger.key.create", "ledger.key.rotate", "ledger.key.retire", "ledger.key.revoke", "ledger.key.distribute",
+			"ledger.bundle.create", "ledger.epoch.start", "ledger.upgrade"),
 	}
 	page := pp.page()
 	if p := pp.err(); p != nil {

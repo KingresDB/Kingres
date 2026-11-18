@@ -308,6 +308,7 @@ export function seedHostile(s: MockState): void {
   })
 
   seedHostileConfig(s)
+  seedHostileLedger(s)
 
   s.extraQueryTables = {
     hostile: {
@@ -407,4 +408,23 @@ function seedHostileConfig(s: MockState): void {
       `invalid value for parameter "${HOSTILE.markup}": "${HOSTILE.reversed}"
 ${HOSTILE.long}`
   }
+}
+
+/**
+ * The ledger of phase 7 as a hostile server could report it: the origin prefix, the public URL, the listener, the servers that
+ * hold the key, the text of an alarm, the type of an event, a flag of an aggregate and its statement are all text with
+ * markup, bidirectional controls and very long lines (contract 0.11.0). Fingerprints and public keys stay what the contract
+ * says they are, but the identifier of the cluster is not trusted to be hexadecimal either.
+ */
+function seedHostileLedger(s: MockState): void {
+  const l = s.ledger7
+  l.hostileText = HOSTILE.markup
+  l.settings.publication.originPrefix = `${HOSTILE.reversed}/x`
+  l.settings.publication.publicUrl = `https://example.com/${HOSTILE.breakout}`
+  l.publication.listener.address = HOSTILE.markup
+  l.signing.holders = [HOSTILE.reversed, HOSTILE.markup, '10.0.0.12']
+  l.signing.clusterId = HOSTILE.breakout
+  l.signing.signerAlarm = HOSTILE.newline
+  l.signing.events.push({ seq: l.signing.events.length, type: HOSTILE.markup, time: nowIso() })
+  l.signing.events.push({ seq: l.signing.events.length, type: HOSTILE.reversed, time: nowIso() })
 }

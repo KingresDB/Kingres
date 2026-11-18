@@ -37,11 +37,29 @@
 //                                 auto:<server>    an automatic failover of that server is under way (trigger automatic)
 //                                 limit            the counter of automatic failovers is at its maximum
 //                                 switchover:behind  the verification of a switchover fails: rolled back, standby_behind
+//   ?phase7=today                 0.11.0: the 21 ledger operations that kingresd does not build yet answer 422 unsupported_operation, as it
+//                                 does today (only settings, signing and the trust file work). Without it the mock answers all 28.
+//   ?signing=<a>,<b>,...          0.11.0 (the signing keys; combinable with a comma):
+//                                 none            no key exists: the origin prefix is not locked and publication is off
+//                                 rotating        two keys are active (the overlap of a rotation)
+//                                 revoked         a key was revoked (compromised since a time) and a third one signs
+//                                 plain           the key files are not sealed with a passphrase
+//                                 backup          a backup of the key files is advised
+//                                 alarm           this server cannot sign (a damaged key set): alert ledgerSignerUnavailable
+//                                 discontinuity   the key ring was replaced after the loss of every key
+//                                 command         the signing mode is an external signer (command)
+//                                 fail:<code>     the next key task ends failed with that code (key_files_remain, passphrase_mismatch, ...)
+//   ?publication=<a>,<b>,...      0.11.0: off | plain (the listener has no TLS) | nolistener | behind (the newest checkpoint is old)
+//                                 | unread (a group could not be read: a stale member) | diverged (the chain of group 2 of shop diverged)
+//   ?anchors=<a>,<b>,...          0.11.0: none (alert ledgerNotAnchored) | required (the same, a warning) | ok | behind | failed
+//                                 (a WORM target "archive-worm" exists, with the newest aggregate anchored in time, late or not)
 //   ?clock=off:<server>:<ms>      the clock of that server is that many milliseconds ahead (negative: behind).
 //   ?clock=unreachable:<server>   the clock of that server cannot be read.
 import type { MockState } from './state'
 import { loseLease, mockConfig, silenceServer, stallStandby } from './state'
 import { FAIL_STEPS, seedAutomaticFailover } from './failover'
+import { answerAsTheServerDoesToday, seedAnchors } from './ledger'
+import { signingKey, withoutKeys } from './ledger-data'
 import {
   failNextApply,
   seedRestartConflict,
@@ -79,6 +97,56 @@ function applyFailoverSwitch(entry: string, s: MockState): void {
     }
   const auto = /^auto:(.+)$/.exec(entry)
   if (auto) seedAutomaticFailover(s, auto[1] as string)
+}
+
+/** The messages of the task errors that a key task can end with (design 14, 127 and 131). */
+const KEY_FAILURE: Record<string, string> = {
+  key_files_remain:
+    'The key file could not be removed from server 10.0.0.12. Nothing is lost; try again when the server answers.',
+  passphrase_mismatch: 'Server 10.0.0.12 cannot open the key file with its passphrase.',
+  signer_unavailable: 'The signer does not answer.',
+  term_over: 'Another manager leader took over; try again.',
+}
+
+/** One value of `?signing=`. Unknown values are ignored. */
+function applySigningSwitch(entry: string, s: MockState): void {
+  const l = s.ledger7
+  if (entry === 'none') withoutKeys(l)
+  if (entry === 'rotating') l.signing.keys.push(signingKey('rotated', 'active', 2 * 86_400_000))
+  if (entry === 'revoked') {
+    const stolen = l.signing.keys.find((k) => k.state === 'active')
+    if (stolen) {
+      stolen.state = 'revoked'
+      stolen.revokedAt = new Date(Date.now() - 86_400_000).toISOString()
+      stolen.compromisedSince = new Date(Date.now() - 9 * 86_400_000).toISOString()
+    }
+    l.signing.keys.push(signingKey('third', 'active', 86_400_000))
+    l.signing.events.push(
+      {
+        seq: 3,
+        type: 'key-added',
+        time: `${new Date(Date.now() - 86_400_000).toISOString().slice(0, 19)}Z`,
+      },
+      {
+        seq: 4,
+        type: 'key-revoked',
+        time: `${new Date(Date.now() - 86_000_000).toISOString().slice(0, 19)}Z`,
+      },
+    )
+    l.signing.backupAdvised = true
+  }
+  if (entry === 'plain') l.signing.passphraseProtected = false
+  if (entry === 'backup') l.signing.backupAdvised = true
+  if (entry === 'alarm')
+    l.signing.signerAlarm = 'The key file of the active key is missing on this server.'
+  if (entry === 'discontinuity') l.signing.discontinuity = true
+  if (entry === 'command') l.signing.mode = 'command'
+  const fail = /^fail:([a-z_]+)$/.exec(entry)
+  if (fail)
+    l.keyFailure = {
+      code: fail[1] as string,
+      message: KEY_FAILURE[fail[1] as string] ?? 'The task failed.',
+    }
 }
 
 /** Applies the 0.7.0 switches of a query string to the mock. Unknown values are ignored. */
@@ -132,6 +200,24 @@ export function applySwitches(params: URLSearchParams, s: MockState): void {
     if (entry === 'slow') mockConfig.rebalanceSlow = true
   }
   for (const entry of (params.get('failover') ?? '').split(',')) applyFailoverSwitch(entry, s)
+  if (params.get('phase7') === 'today') answerAsTheServerDoesToday(s)
+  for (const entry of (params.get('signing') ?? '').split(',')) applySigningSwitch(entry, s)
+  for (const entry of (params.get('publication') ?? '').split(',')) {
+    const l = s.ledger7
+    if (entry === 'off') l.settings.publication.enabled = false
+    if (entry === 'plain') l.publication.listener.tls = false
+    if (entry === 'nolistener')
+      l.publication.listener = { address: null, tls: false, running: false }
+    if (entry === 'behind') l.publication.health = 'behind'
+    if (entry === 'unread') l.publication.health = 'unread'
+    if (entry === 'diverged') l.diverged.push('shop:2')
+  }
+  for (const entry of (params.get('anchors') ?? '').split(',')) {
+    const l = s.ledger7
+    if (entry === 'none' || entry === 'required') l.alertNotAnchored = true
+    if (entry === 'required') l.settings.anchor.required = true
+    if (entry === 'ok' || entry === 'behind' || entry === 'failed') seedAnchors(s, entry)
+  }
   for (const entry of (params.get('clock') ?? '').split(',')) {
     const off = /^off:([^:]+):(-?\d+(?:\.\d+)?)$/.exec(entry)
     if (off) setClockOffset(s, off[1] as string, Number(off[2]))

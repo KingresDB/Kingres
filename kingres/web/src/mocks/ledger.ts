@@ -1,0 +1,688 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026, RooyeKhat Media Co
+//
+// The 28 operations that contract 0.11.0 added to the tag `Ledger` (signing, publication, anchoring, aggregates, bundles,
+// client keys, divergence) for the mock API. They follow the design of phase 7 and never answer with more than the
+// contract allows. The answers validate against the schemas of the contract (tests/ledger-mock-0-11.test.ts checks each
+// one). `?phase7=today` makes the 21 operations that the real `kingresd` does not build yet answer 422
+// `unsupported_operation`, as it does. A private key, a seed or a passphrase is never part of anything here.
+import type { components } from '@/api/schema'
+import type { OperationId } from '@/api/operations.generated'
+import { accepted, created, noContent, ok, paginate, problem, validationFailed } from './http'
+import type { Ctx, Handler } from './http'
+import { createTask, mockConfig, nowIso } from './state'
+import type { DbRec, MockState } from './state'
+import { hex64, NOT_BUILT_YET, prefixLocked, signingKey, type Ledger7State } from './ledger-data'
+import {
+  aggregateMembers,
+  aggregateSummary,
+  AGGREGATE_SIZE,
+  groupsOf,
+  hasLedger,
+  isDiverged,
+  l7,
+  published,
+  publicationLogs,
+  STATEMENT,
+} from './ledger-view'
+
+type S = components['schemas']
+
+const body = <T>(ctx: Ctx): T => (ctx.body ?? {}) as T
+
+function db(s: MockState, name: string): DbRec {
+  const rec = s.databases.find((d) => d.info.name === name)
+  if (!rec) throw problem('not_found', `Database "${name}" does not exist.`)
+  return rec
+}
+
+// --- signing -------------------------------------------------------------------------------------
+
+function signingView(s: MockState): S['LedgerSigning'] {
+  const g = l7(s).signing
+  return {
+    clusterId: g.clusterId,
+    mode: g.mode,
+    passphraseProtected: g.passphraseProtected,
+    holders: [...g.holders],
+    keys: structuredClone(g.keys),
+    events: structuredClone(g.events),
+    backupAdvised: g.backupAdvised,
+    discontinuity: g.discontinuity,
+    signerAlarm: g.signerAlarm,
+  }
+}
+
+/** A key task is running: one at a time, cluster-wide (the subject `ledgerKey` with the id `signing`). */
+function keyTaskRunning(s: MockState): boolean {
+  return s.tasks.some((t) => t.task.state === 'running' && t.task.subject?.type === 'ledgerKey')
+}
+
+const KEY_SUBJECT = { type: 'ledgerKey', id: 'signing' } as const
+
+function keyTask(c: Ctx, kind: S['TaskKind'], steps: string[], apply: () => void): S['Task'] {
+  const l = l7(c.s)
+  const failure = l.keyFailure
+  l.keyFailure = null
+  return createTask(c.s, {
+    kind,
+    subject: { ...KEY_SUBJECT },
+    steps,
+    apply,
+    durationMs: 3000,
+    ...(failure ? { failAt: { fraction: 0.6, code: failure.code, message: failure.message } } : {}),
+  })
+}
+
+function addEvent(l: Ledger7State, type: string): void {
+  l.signing.events.push({
+    seq: l.signing.events.length,
+    type,
+    time: `${new Date().toISOString().slice(0, 19)}Z`,
+  })
+}
+
+function keyOf(s: MockState, c: Ctx): S['LedgerSigningKey'] {
+  const k = l7(s).signing.keys.find((x) => x.fingerprint === c.params.fingerprint)
+  if (!k) throw problem('not_found', 'The key set has no key with this fingerprint.')
+  return k
+}
+
+const PRINTABLE_ASCII = /^[\x20-\x7e]*$/
+
+function createKey(c: Ctx) {
+  const s = c.s
+  const l = l7(s)
+  const b = body<S['CreateLedgerSigningKeyRequest']>(c)
+  if (
+    b.overlapDays !== undefined &&
+    (!Number.isInteger(b.overlapDays) || b.overlapDays < 1 || b.overlapDays > 365)
+  )
+    throw validationFailed([
+      { field: 'overlapDays', message: 'Enter a whole number of days from 1 to 365.' },
+    ])
+  if (b.publicKey !== undefined)
+    throw problem(
+      'unsupported_operation',
+      'A public key is accepted for the signing mode command only.',
+    )
+  if (keyTaskRunning(s)) throw problem('operation_in_progress', 'A key task is running.')
+  const first = l.signing.keys.length === 0
+  const hasActive = l.signing.keys.some((k) => k.state === 'active')
+  if (!first && !hasActive)
+    throw problem('signing_key_missing', 'No signing key is active, so there is nothing to rotate.')
+  const seed = `k${l.signing.keys.length + 1}-${Date.now()}`
+  const apply = () => {
+    const key = signingKey(seed, 'active', 1000)
+    l.signing.keys.push(key)
+    if (first) l.signing.clusterId = hex64(`cluster-${seed}`)
+    addEvent(l, 'key-added')
+    l.signing.backupAdvised = b.backupMade !== true
+    l.signing.signerAlarm = null
+    l.settings.publication.originPrefixLocked = true
+  }
+  return accepted(
+    keyTask(
+      c,
+      first ? 'ledger.key.create' : 'ledger.key.rotate',
+      first
+        ? ['generate', 'store', 'distribute', 'event', 'activate']
+        : ['generate', 'store', 'distribute', 'event', 'overlap'],
+      apply,
+    ),
+  )
+}
+
+function retireKey(c: Ctx) {
+  const s = c.s
+  const l = l7(s)
+  const key = keyOf(s, c)
+  if (key.state !== 'active') throw problem('conflict', 'Only an active key can be retired.')
+  if (keyTaskRunning(s)) throw problem('operation_in_progress', 'A key task is running.')
+  if (!l.signing.keys.some((k) => k.fingerprint !== key.fingerprint && k.state === 'active'))
+    throw problem('last_signing_key', 'No other key is active and in force.')
+  return accepted(
+    keyTask(c, 'ledger.key.retire', ['bound', 'event', 'retire', 'remove files'], () => {
+      key.state = 'retired'
+      key.retiredAt = nowIso()
+      key.maxTreeSize = 1800
+      addEvent(l, 'key-retired')
+    }),
+  )
+}
+
+function revokeKey(c: Ctx) {
+  const s = c.s
+  const l = l7(s)
+  const key = keyOf(s, c)
+  const b = body<S['RevokeLedgerSigningKeyRequest']>(c)
+  const errors: { field: string; message: string }[] = []
+  if (b.confirm !== key.fingerprint)
+    errors.push({ field: 'confirm', message: 'This is not the fingerprint of the key.' })
+  if (typeof b.reason !== 'string' || b.reason.length > 200 || !PRINTABLE_ASCII.test(b.reason))
+    errors.push({ field: 'reason', message: 'Use at most 200 printable ASCII characters.' })
+  const since = Date.parse(b.compromisedSince ?? '')
+  if (Number.isNaN(since))
+    errors.push({ field: 'compromisedSince', message: 'Give the time as a date and time.' })
+  if (errors.length > 0) throw validationFailed(errors)
+  if (key.state === 'revoked') throw problem('conflict', 'The key is already revoked.')
+  if (keyTaskRunning(s)) throw problem('operation_in_progress', 'A key task is running.')
+  if (!l.signing.keys.some((k) => k.fingerprint !== key.fingerprint && k.state === 'active'))
+    throw problem('last_signing_key', 'No other key is active and in force. Create a key first.')
+  // The time is clamped: never later than the revocation, never before the creation of the key (design, 14.125).
+  const clamped = Math.min(Date.now(), Math.max(since, Date.parse(key.createdAt)))
+  return accepted(
+    keyTask(c, 'ledger.key.revoke', ['event', 'revoke', 'remove files'], () => {
+      key.state = 'revoked'
+      key.revokedAt = nowIso()
+      key.compromisedSince = new Date(clamped).toISOString()
+      addEvent(l, 'key-revoked')
+      l.signing.backupAdvised = true
+    }),
+  )
+}
+
+function trustFile(c: Ctx) {
+  const l = l7(c.s)
+  if (l.signing.keys.length === 0)
+    throw problem('signing_key_missing', 'No signing key exists, so there is no trust file.')
+  const file: S['LedgerTrustFile'] = {
+    format: 1,
+    origin_prefix: l.settings.publication.originPrefix,
+    keys: l.signing.keys
+      .filter((k) => k.state !== 'next')
+      .map((k, i) => ({
+        name: `key-${i + 1}`,
+        public_key: k.publicKey,
+        fingerprint: k.fingerprint,
+        not_before: k.activatedAt,
+        not_after: null,
+        revoked: k.state === 'revoked',
+        max_tree_size: k.state === 'retired' ? (k.maxTreeSize ?? null) : null,
+      })),
+    tsa_roots: [],
+    client_keys: [],
+    witnesses: [],
+  }
+  return {
+    status: 200,
+    rawJson: `${JSON.stringify(file, null, 2)}\n`,
+    headers: { 'Content-Disposition': 'attachment; filename="trust.json"' },
+  }
+}
+
+// --- settings ------------------------------------------------------------------------------------
+
+function updateSettings(c: Ctx) {
+  const l = l7(c.s)
+  const b = body<S['LedgerSettingsUpdate']>(c)
+  const errors: { field: string; message: string }[] = []
+  const range = (v: number | undefined, field: string, lo: number, hi: number) => {
+    if (v !== undefined && (!Number.isInteger(v) || v < lo || v > hi))
+      errors.push({ field, message: `Enter a whole number from ${lo} to ${hi}.` })
+  }
+  range(b.publication?.intervalSeconds, 'publication.intervalSeconds', 10, 3600)
+  range(b.anchor?.intervalSeconds, 'anchor.intervalSeconds', 60, 86400)
+  range(b.anchor?.minimumAnchored, 'anchor.minimumAnchored', 1, 8)
+  const prefix = b.publication?.originPrefix
+  if (
+    prefix !== undefined &&
+    (prefix.length < 1 ||
+      prefix.length > 160 ||
+      /:\/\/|\/$|\s/.test(prefix) ||
+      !PRINTABLE_ASCII.test(prefix))
+  )
+    errors.push({
+      field: 'publication.originPrefix',
+      message:
+        'Use a name without a scheme, without a trailing slash and without spaces (at most 160 characters).',
+    })
+  const url = b.publication?.publicUrl
+  if (url !== undefined && url !== null && !/^https?:\/\/[^\s/]+/.test(url))
+    errors.push({
+      field: 'publication.publicUrl',
+      message: 'Give an address that starts with http:// or https://.',
+    })
+  if (errors.length > 0) throw validationFailed(errors)
+  if (prefix !== undefined && prefix !== l.settings.publication.originPrefix && prefixLocked(l))
+    throw problem(
+      'origin_prefix_locked',
+      'A signing key exists, and every signature is made under the origin prefix.',
+    )
+  const p = l.settings.publication
+  if (b.publication?.enabled !== undefined) p.enabled = b.publication.enabled
+  if (prefix !== undefined) p.originPrefix = prefix
+  if (url !== undefined) p.publicUrl = url
+  if (b.publication?.intervalSeconds !== undefined)
+    p.intervalSeconds = b.publication.intervalSeconds
+  Object.assign(l.settings.anchor, b.anchor ?? {})
+  p.originPrefixLocked = prefixLocked(l)
+  return ok(structuredClone(l.settings))
+}
+
+// --- anchoring -----------------------------------------------------------------------------------
+
+function target(s: MockState, c: Ctx): S['LedgerAnchorTarget'] {
+  const t = l7(s).targets.find((x) => String(x.id) === c.params.targetId)
+  if (!t) throw problem('not_found', 'The anchor target does not exist.')
+  return t
+}
+
+function checkTarget(kind: S['LedgerAnchorKind'], name: unknown, config: unknown): void {
+  const errors: { field: string; message: string }[] = []
+  if (!['worm', 'tsa', 'ots'].includes(kind))
+    errors.push({ field: 'kind', message: 'Choose worm, tsa or ots.' })
+  if (typeof name !== 'string' || name.length < 1 || name.length > 63)
+    errors.push({ field: 'name', message: 'Give a name of 1 to 63 characters.' })
+  if (typeof config !== 'object' || config === null || Array.isArray(config))
+    errors.push({ field: 'config', message: 'Give the configuration as an object.' })
+  if (errors.length > 0) throw validationFailed(errors)
+}
+
+function testResult(t: S['LedgerAnchorTarget']): S['LedgerAnchorTest'] {
+  const checks: S['LedgerAnchorTest']['checks'] =
+    t.kind === 'worm'
+      ? [
+          {
+            name: 'credentials',
+            status: t.credentialsSet ? 'ok' : 'failed',
+            detail: t.credentialsSet
+              ? 'The store accepted the credentials.'
+              : 'No credentials are stored.',
+          },
+          { name: 'bucket', status: 'ok', detail: 'The bucket exists.' },
+          { name: 'object lock', status: 'ok', detail: 'Object Lock is enabled on the bucket.' },
+        ]
+      : t.kind === 'tsa'
+        ? [
+            { name: 'reachable', status: 'ok', detail: 'The authority answered.' },
+            {
+              name: 'certificate',
+              status: 'warning',
+              detail: 'The certificate of the authority expires in 41 days.',
+            },
+          ]
+        : [{ name: 'calendars', status: 'ok', detail: 'Two of three calendars answered.' }]
+  return { checks, ok: !checks.some((x) => x.status === 'failed'), testedAt: nowIso() }
+}
+
+function anchorRecords(s: MockState, c: Ctx) {
+  const rec = db(s, c.params.databaseName ?? '')
+  const tid = c.url.searchParams.get('targetId')
+  const st = c.url.searchParams.get('state')
+  const items = l7(s)
+    .anchors.filter(
+      (a) =>
+        a.databaseName === rec.info.name &&
+        (!tid || String(a.targetId) === tid) &&
+        (!st || a.state === st),
+    )
+    .sort((a, b) => b.id - a.id)
+    .map(({ databaseName: _d, ...a }) => {
+      void _d
+      return a
+    })
+  return ok(paginate(items, c.url))
+}
+
+/** The anchor records a switch seeds: one WORM target with the newest aggregate anchored, late or failed. */
+export function seedAnchors(s: MockState, how: 'ok' | 'behind' | 'failed'): void {
+  const l = l7(s)
+  const id = l.nextTargetId++
+  l.targets.push({
+    id,
+    kind: 'worm',
+    name: 'archive-worm',
+    enabled: true,
+    config: {
+      endpoint: 'https://s3.archive.example.com',
+      bucket: 'kingres-ledger',
+      mode: 'compliance',
+    },
+    credentialsSet: true,
+    lastTest: testResult({ kind: 'worm', credentialsSet: true } as S['LedgerAnchorTarget']),
+    newestAnchoredAt: new Date(
+      Date.now() - (how === 'ok' ? 40 * 60_000 : 7 * 3600_000),
+    ).toISOString(),
+    state: how,
+  })
+  for (const rec of s.databases.filter(hasLedger)) {
+    for (let i = 0; i < 3; i++) {
+      const size = AGGREGATE_SIZE - i * 6
+      const failed = how === 'failed' && i === 0
+      const anchoredAt = new Date(
+        Date.now() - (i * 3600_000 + (how === 'ok' ? 40 * 60_000 : 7 * 3600_000)),
+      ).toISOString()
+      l.anchors.push({
+        databaseName: rec.info.name,
+        id: l.nextAnchorId++,
+        targetId: id,
+        targetName: 'archive-worm',
+        kind: 'worm',
+        aggregateSize: size,
+        state: failed ? 'failed' : 'anchored',
+        attempts: failed ? 5 : 1,
+        nextAttemptAt: null,
+        anchoredAt: failed ? null : anchoredAt,
+        evidenceTime: failed ? null : anchoredAt,
+        lastError: failed ? 'The store refused the credentials (403).' : null,
+      })
+    }
+  }
+}
+
+// --- client keys ---------------------------------------------------------------------------------
+
+function isKey32(text: unknown): boolean {
+  if (typeof text !== 'string' || !/^[A-Za-z0-9+/]{43}=$/.test(text)) return false
+  try {
+    return atob(text).length === 32
+  } catch {
+    return false
+  }
+}
+
+// --- the handlers --------------------------------------------------------------------------------
+
+export function ledgerHandlers(): Partial<Record<OperationId, Handler>> {
+  return {
+    getLedgerSettings: (c) => ok(structuredClone(l7(c.s).settings)),
+    updateLedgerSettings: updateSettings,
+    getLedgerSigning: (c) => ok(signingView(c.s)),
+    createLedgerSigningKey: createKey,
+    retireLedgerSigningKey: retireKey,
+    revokeLedgerSigningKey: revokeKey,
+    getLedgerTrustFile: trustFile,
+    getLedgerPublication: (c) => {
+      const l = l7(c.s)
+      const p = l.settings.publication
+      return ok({
+        enabled: p.enabled,
+        listener: structuredClone(l.publication.listener),
+        logs: p.enabled ? publicationLogs(c.s) : [],
+        lastCheckpointAt: p.enabled
+          ? new Date(
+              Date.now() - (l.publication.health === 'behind' ? 12 * 60_000 : 20_000),
+            ).toISOString()
+          : null,
+        checks: {},
+      } satisfies S['LedgerPublication'])
+    },
+    listLedgerAnchorTargets: (c) => ok({ items: structuredClone(l7(c.s).targets) }),
+    createLedgerAnchorTarget: (c) => {
+      const l = l7(c.s)
+      const b = body<S['LedgerAnchorTargetCreate']>(c)
+      checkTarget(b.kind, b.name, b.config)
+      if (l.targets.some((t) => t.name === b.name))
+        throw problem('already_exists', 'A target with this name exists.')
+      const t: S['LedgerAnchorTarget'] = {
+        id: l.nextTargetId++,
+        kind: b.kind,
+        name: b.name,
+        enabled: b.enabled ?? false,
+        config: b.config,
+        credentialsSet: b.credentials !== undefined,
+        lastTest: null,
+        newestAnchoredAt: null,
+        state: 'none',
+      }
+      l.targets.push(t)
+      return created(structuredClone(t))
+    },
+    getLedgerAnchorTarget: (c) => ok(structuredClone(target(c.s, c))),
+    updateLedgerAnchorTarget: (c) => {
+      const t = target(c.s, c)
+      const b = body<S['LedgerAnchorTargetUpdate']>(c)
+      if (b.kind !== undefined && b.kind !== t.kind)
+        throw problem('immutable_field', 'The kind of a target cannot change.')
+      if (b.name !== undefined) checkTarget(t.kind, b.name, b.config ?? t.config)
+      if (b.name !== undefined && l7(c.s).targets.some((x) => x.name === b.name && x.id !== t.id))
+        throw problem('already_exists', 'A target with this name exists.')
+      if (b.name !== undefined) t.name = b.name
+      if (b.enabled !== undefined) t.enabled = b.enabled
+      if (b.config !== undefined) t.config = b.config
+      if (b.credentials !== undefined) t.credentialsSet = true
+      return ok(structuredClone(t))
+    },
+    deleteLedgerAnchorTarget: (c) => {
+      const l = l7(c.s)
+      const t = target(c.s, c)
+      l.targets = l.targets.filter((x) => x.id !== t.id)
+      for (const a of l.anchors) if (a.targetId === t.id) a.targetId = null
+      return noContent()
+    },
+    testLedgerAnchorTarget: (c) => {
+      const t = target(c.s, c)
+      t.lastTest = testResult(t)
+      return ok(structuredClone(t.lastTest))
+    },
+    getLedgerAggregate: (c) => {
+      const rec = db(c.s, c.params.databaseName ?? '')
+      if (!published(c.s, rec))
+        throw problem('ledger_not_published', 'This database has no published aggregate.')
+      const raw = c.url.searchParams.get('size')
+      const size = raw === null ? AGGREGATE_SIZE : Number(raw)
+      if (!Number.isInteger(size) || size < 1 || size > AGGREGATE_SIZE)
+        throw problem('not_found', 'No aggregate of this size was published.')
+      return ok({
+        ...aggregateSummary(c.s, rec, size),
+        members: aggregateMembers(c.s, rec, size),
+        anchors: l7(c.s)
+          .anchors.filter((a) => a.databaseName === rec.info.name && a.aggregateSize === size)
+          .map(({ databaseName: _d, ...a }) => {
+            void _d
+            return a
+          }),
+        statement: l7(c.s).hostileText ?? STATEMENT,
+      } satisfies S['LedgerAggregate'])
+    },
+    listLedgerAggregates: (c) => {
+      const rec = db(c.s, c.params.databaseName ?? '')
+      const items = published(c.s, rec)
+        ? Array.from({ length: AGGREGATE_SIZE }, (_, i) =>
+            aggregateSummary(c.s, rec, AGGREGATE_SIZE - i),
+          )
+        : []
+      return ok(paginate(items, c.url))
+    },
+    listLedgerAnchors: (c) => anchorRecords(c.s, c),
+    anchorLedgerNow: (c) => {
+      const l = l7(c.s)
+      const rec = db(c.s, c.params.databaseName ?? '')
+      if (!published(c.s, rec))
+        throw problem('ledger_not_published', 'This database has no published aggregate.')
+      const enabled = l.targets.filter((t) => t.enabled)
+      if (enabled.length === 0) throw problem('conflict', 'No anchor target is enabled.')
+      const items = enabled.map((t) => {
+        const a = {
+          databaseName: rec.info.name,
+          id: l.nextAnchorId++,
+          targetId: t.id,
+          targetName: t.name,
+          kind: t.kind,
+          aggregateSize: AGGREGATE_SIZE,
+          state: 'pending' as const,
+          attempts: 0,
+          nextAttemptAt: nowIso(),
+          anchoredAt: null,
+          evidenceTime: null,
+          lastError: null,
+        }
+        l.anchors.push(a)
+        return a
+      })
+      return created({
+        items: items.map(({ databaseName: _d, ...a }) => {
+          void _d
+          return a
+        }),
+      } satisfies S['LedgerAnchorList'])
+    },
+    retryLedgerAnchor: (c) => {
+      const a = l7(c.s).anchors.find(
+        (x) => String(x.id) === c.params.anchorId && x.databaseName === c.params.databaseName,
+      )
+      if (!a) throw problem('not_found', 'The anchor record does not exist.')
+      if (a.state !== 'failed' && a.state !== 'expired')
+        throw problem('conflict', 'Only a failed or expired record can be retried.')
+      a.state = 'pending'
+      a.nextAttemptAt = nowIso()
+      const { databaseName: _d, ...rest } = a
+      void _d
+      return ok(rest)
+    },
+    downloadLedgerAnchor: (c) => {
+      const a = l7(c.s).anchors.find(
+        (x) => String(x.id) === c.params.anchorId && x.databaseName === c.params.databaseName,
+      )
+      if (!a || a.state !== 'anchored') throw problem('not_found', 'The record has no evidence.')
+      const format = c.url.searchParams.get('format') ?? 'json'
+      if (format === 'json')
+        return ok({ kind: a.kind, aggregateSize: a.aggregateSize, evidenceTime: a.evidenceTime })
+      if (!['ots', 'tsr'].includes(format) || (format === 'ots' ? 'ots' : 'tsa') !== a.kind)
+        throw problem('unprocessable', 'This kind of target has no evidence in this format.')
+      return {
+        status: 200,
+        rawBody: new Uint8Array([1, 2, 3, 4]),
+        headers: { 'Content-Type': 'application/octet-stream' },
+      }
+    },
+    createLedgerBundle: (c) => {
+      const l = l7(c.s)
+      const rec = db(c.s, c.params.databaseName ?? '')
+      if (!published(c.s, rec))
+        throw problem('ledger_not_published', 'This database has no published aggregate.')
+      const b = body<S['LedgerBundleRequest']>(c)
+      if (typeof b.includeAnchors !== 'boolean')
+        throw validationFailed([
+          { field: 'includeAnchors', message: 'Say whether to include the anchors.' },
+        ])
+      const id = l.nextBundleId++
+      return accepted(
+        createTask(c.s, {
+          kind: 'ledger.bundle.create',
+          subject: { type: 'database', id: rec.info.name },
+          steps: ['collect', 'pack'],
+          detail: `bundle ${id}`,
+          apply: () => l.bundles.push({ id, databaseName: rec.info.name, createdAt: nowIso() }),
+        }),
+      )
+    },
+    getLedgerBundle: (c) => {
+      const b = l7(c.s).bundles.find(
+        (x) => String(x.id) === c.params.bundleId && x.databaseName === c.params.databaseName,
+      )
+      if (!b) throw problem('not_found', 'The bundle does not exist.')
+      return {
+        status: 200,
+        rawBody: new Uint8Array([0x1f, 0x8b, 8, 0]),
+        headers: { 'Content-Type': 'application/gzip' },
+      }
+    },
+    listLedgerClientKeys: (c) => {
+      const rec = db(c.s, c.params.databaseName ?? '')
+      return ok({ items: structuredClone(l7(c.s).clientKeys[rec.info.name] ?? []) })
+    },
+    registerLedgerClientKey: (c) => {
+      const l = l7(c.s)
+      const rec = db(c.s, c.params.databaseName ?? '')
+      const b = body<S['RegisterLedgerClientKeyRequest']>(c)
+      const errors: { field: string; message: string }[] = []
+      if (!isKey32(b.publicKey))
+        errors.push({ field: 'publicKey', message: 'Give 32 bytes as standard base64.' })
+      if (typeof b.label !== 'string' || b.label.length < 1 || b.label.length > 100)
+        errors.push({ field: 'label', message: 'Give a label of 1 to 100 characters.' })
+      if (errors.length > 0) throw validationFailed(errors)
+      const keys = (l.clientKeys[rec.info.name] ??= [])
+      if (keys.some((k) => k.publicKey === b.publicKey))
+        throw problem('already_exists', 'This key is registered.')
+      const key: S['LedgerClientKey'] = {
+        keyId: hex64(b.publicKey).slice(0, 8),
+        publicKey: b.publicKey,
+        roleName: b.roleName ?? null,
+        label: b.label,
+        registeredBy: c.s.session?.username ?? 'admin',
+        registeredAt: nowIso(),
+        revokedAt: null,
+        revocationReason: null,
+      }
+      keys.push(key)
+      return created(structuredClone(key))
+    },
+    revokeLedgerClientKey: (c) => {
+      const rec = db(c.s, c.params.databaseName ?? '')
+      const key = (l7(c.s).clientKeys[rec.info.name] ?? []).find((k) => k.keyId === c.params.keyId)
+      if (!key) throw problem('not_found', 'The key does not exist.')
+      if (key.revokedAt !== null) throw problem('conflict', 'The key is already revoked.')
+      const b = body<S['RevokeLedgerClientKeyRequest']>(c)
+      if (typeof b.reason !== 'string' || b.reason.length < 1 || b.reason.length > 200)
+        throw validationFailed([
+          { field: 'reason', message: 'Give a reason of 1 to 200 characters.' },
+        ])
+      key.revokedAt = nowIso()
+      key.revocationReason = b.reason
+      return ok(structuredClone(key))
+    },
+    setTableSignaturePolicy: (c) => {
+      const l = l7(c.s)
+      const rec = db(c.s, c.params.databaseName ?? '')
+      const t = rec.tables.find(
+        (x) => x.schema === c.params.schemaName && x.name === c.params.tableName,
+      )
+      if (!t) throw problem('not_found', 'Table does not exist.')
+      if (!t.ledger)
+        throw problem('unprocessable', `Table ${t.schema}.${t.name} is not a ledger table.`)
+      const id = `${rec.info.name}:${t.schema}.${t.name}`
+      if (l.policies.includes(id)) throw problem('conflict', 'The policy is already required.')
+      l.policies.push(id)
+      return ok(structuredClone(t))
+    },
+    upgradeLedgerExtension: (c) => {
+      const rec = db(c.s, c.params.databaseName ?? '')
+      if (c.s.tasks.some((t) => t.task.state === 'running' && t.task.kind === 'ledger.upgrade'))
+        throw problem('operation_in_progress', 'An upgrade is running.')
+      return accepted(
+        createTask(c.s, {
+          kind: 'ledger.upgrade',
+          subject: { type: 'database', id: rec.info.name },
+          steps: groupsOf(c.s, rec).map((g) => `upgrade group ${g}`),
+          apply: () => undefined,
+        }),
+      )
+    },
+    acknowledgeLedgerDivergence: (c) => {
+      const l = l7(c.s)
+      const rec = db(c.s, c.params.databaseName ?? '')
+      const g = Number(c.params.shardGroupId)
+      const b = body<S['AcknowledgeLedgerDivergenceRequest']>(c)
+      const errors: { field: string; message: string }[] = []
+      if (b.confirm !== rec.info.name)
+        errors.push({ field: 'confirm', message: 'This is not the name of the database.' })
+      if (!['restore', 'failoverLoss', 'other'].includes(b.kind))
+        errors.push({ field: 'kind', message: 'Choose what happened.' })
+      if (typeof b.reason !== 'string' || b.reason.length < 1 || b.reason.length > 200)
+        errors.push({ field: 'reason', message: 'Give a reason of 1 to 200 characters.' })
+      if (errors.length > 0) throw validationFailed(errors)
+      if (!isDiverged(c.s, rec.info.name, g))
+        throw problem('chain_not_diverged', 'This chain has not diverged.')
+      return accepted(
+        createTask(c.s, {
+          kind: 'ledger.epoch.start',
+          subject: { type: 'database', id: rec.info.name },
+          steps: ['close the old epoch', 'open the new epoch'],
+          apply: () => {
+            const k = `${rec.info.name}:${g}`
+            l.diverged = l.diverged.filter((x) => x !== k)
+            l.epochs[k] = (l.epochs[k] ?? 1) + 1
+          },
+        }),
+      )
+    },
+  }
+}
+
+/** `?phase7=today`: the 21 operations the real server does not build yet answer 422, as it does. */
+export function answerAsTheServerDoesToday(s: MockState): void {
+  l7(s).today = true
+  for (const op of NOT_BUILT_YET) mockConfig.unsupported.add(op)
+}

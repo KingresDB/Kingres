@@ -123,8 +123,8 @@ describe('inclusion proofs have an entry type', () => {
       ?.tables.find((t) => t.name === 'orders')
     if (orders) orders.ledger = { mode: 'updatable', historyTable: 'orders_history' }
     const user = userEvent.setup()
-    await renderApp('/ledger')
-    await screen.findByText(/status of shop/i)
+    await renderApp('/ledger?tab=digests')
+    await screen.findByRole('heading', { name: 'Digests' })
     await user.selectOptions(screen.getByLabelText('Entry'), 'D')
     await user.type(screen.getByLabelText(/transaction id of the removed version/i), '48000123')
     await user.click(screen.getByRole('button', { name: /look up proof/i }))

@@ -152,6 +152,25 @@ probe_nidentities(int ntables)
  * The answer must be a row of the expected number of columns; anything else is a
  * node that does not run this protocol.
  */
+/*
+ * A number of a probe answer, read without raising: a node that answers text that is not a number
+ * (a node that is not a kingres node) gives false, which the callers treat as a different
+ * placement; nothing is parsed while a result is held that an error would lose (review P2B-08).
+ */
+static bool
+probe_number(PGresult *res, int row, int col, int64 *out)
+{
+	char	   *end;
+	const char *s;
+
+	if (PQgetisnull(res, row, col))
+		return false;
+	s = PQgetvalue(res, row, col);
+	errno = 0;
+	*out = strtoll(s, &end, 10);
+	return errno == 0 && end != s && *end == 0;
+}
+
 static void
 probe_shape(KsConn *kc, PGresult *res, int ncols)
 {
@@ -204,14 +223,20 @@ kingres_shard_probe_read_before(KsConn *kc, PGresult *res, int ntables,
 	}
 
 	for (i = 0; i < ntables; i++)
-		if (PQgetisnull(res, 0, i) || pg_strtoint64(PQgetvalue(res, 0, i)) != plan_placement)
+	{
+		int64		v;
+
+		if (!probe_number(res, 0, i, &v) || v != plan_placement)
 			same = false;
+	}
 	for (i = 0; i < nid; i++)
 	{
-		if (PQgetisnull(res, 0, ntables + i))
+		int64		v;
+
+		if (!probe_number(res, 0, ntables + i, &v))
 			same = false;
 		else if (same)
-			identities[i] = pg_strtoint64(PQgetvalue(res, 0, ntables + i));
+			identities[i] = v;
 	}
 	if (!same)
 	{
@@ -240,11 +265,15 @@ kingres_shard_probe_read_after(KsConn *kc, PGresult *res, int ntables,
 	if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK)
 		kingres_shard_fragment_error(kc, res, "placement");
 	probe_shape(kc, res, ncols);
-	if (PQgetisnull(res, 0, 0) || pg_strtoint64(PQgetvalue(res, 0, 0)) != plan_placement)
-		same = false;
-	for (i = 0; i < nid; i++)
-		if (PQgetisnull(res, 0, 1 + i) || pg_strtoint64(PQgetvalue(res, 0, 1 + i)) != identities[i])
+	{
+		int64		v;
+
+		if (!probe_number(res, 0, 0, &v) || v != plan_placement)
 			same = false;
+		for (i = 0; i < nid; i++)
+			if (!probe_number(res, 0, 1 + i, &v) || v != identities[i])
+				same = false;
+	}
 	if (!same)
 	{
 		/*
@@ -305,7 +334,9 @@ kingres_shard_probe_placement(KsConn *kc, int colocation_id)
 
 	if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK)
 		kingres_shard_fragment_error(kc, res, "placement");
-	theirs = (PQntuples(res) != 1 || PQgetisnull(res, 0, 0)) ? 0 : pg_strtoint64(PQgetvalue(res, 0, 0));
+	theirs = 0;
+	if (PQntuples(res) == 1)
+		(void) probe_number(res, 0, 0, &theirs);
 	PQclear(res);
 	return theirs;
 }

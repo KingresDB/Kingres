@@ -96,6 +96,7 @@ export type FailoverGroupReport = S['FailoverGroupReport']
 export type DataLossAssessment = S['DataLossAssessment']
 export type OldPrimaryReport = S['OldPrimaryReport']
 export type LedgerStatus = S['LedgerStatus']
+export type LedgerSettingsUpdate = S['LedgerSettingsUpdate']
 
 // Configuration (contract 0.8.0)
 export type ConfigLevel = S['ConfigLevel']

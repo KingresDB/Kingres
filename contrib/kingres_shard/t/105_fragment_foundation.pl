@@ -16,7 +16,7 @@
 #      the first probe and the end of the start (review finding S4-01), on a pair of
 #      groups that does not include the origin and on one that does; a node that
 #      runs another version of the extension;
-#   D. the local part of a fan-out write is recognized by a nonce, after the
+#   D. the local part of a fan-out write is recognized by a one-shot mark (review P2B-01), after the
 #      partition lists are as new as the catalog, and nothing else is;
 #   E. a read that mixes a distributed table with a local table, a scrollable
 #      cursor, and a money value are answered like a single node answers them;
@@ -227,7 +227,7 @@ sub slurp
 	is(eval { my $s = 0; $s += $_ for split /,/, $per; $s }, 60, 'a write that spans groups reaches every group (the local part and two remote parts)');
 	cmp_ok(scalar(grep { $_ > 0 } split /,/, $per), q{==}, 3, "and every node holds some of the rows ($per)");
 
-	# A statement that carries a comment of the local part but not the nonce of a running one is an
+	# A statement that carries a comment that looks like the mark of an old design is an
 	# ordinary statement: it is routed to every group, not planned for this node only.
 	$n1->safe_psql('postgres', 'UPDATE public.kv SET v = 1');
 	$n1->safe_psql('postgres', '/* kingres:local 0000000000000000 */ UPDATE public.kv SET v = 2');
@@ -236,14 +236,14 @@ sub slurp
 	$n1->safe_psql('postgres', '/* kingres:local 1 */ UPDATE public.kv SET v = 3');
 	is($n1->safe_psql('postgres', 'SELECT count(*) FROM public.kv WHERE v = 3'), 60, 'whatever its number');
 
-	# The order of the planner hook: the nonce is recognized after the analysis and after the partition
+	# The order of the planner hook: the mark is acted on after the analysis and after the partition
 	# lists are made as new as the catalog (design 4.4).
 	my $planner = slurp("$src/planner.c");
 	my $i_fresh = index($planner, 'kingres_shard_ensure_fresh_partitions(((DistRef *)');
-	my $i_nonce = index($planner, 'kingres_shard_local_part_nonce_ok(query_string)');
+	my $i_nonce = index($planner, 'if (this_is_local_part)');
 	cmp_ok($i_fresh, '>', 0, 'planner.c makes the partition lists as new as the catalog after its analysis');
 	cmp_ok($i_nonce, '>', $i_fresh, 'and recognizes the local part after that');
-	unlike(substr($planner, 0, $i_fresh), qr/kingres_shard_local_part_nonce_ok/, 'and nowhere before');
+	unlike(substr($planner, 0, $i_fresh), qr/if \(this_is_local_part\)/, 'and nowhere before');
 	unlike($planner . slurp("$src/fanout.c"), qr/kingres_shard_in_fanout_local|fanout_local_sql/,
 		'the comparison of whole statement texts is gone');
 }

@@ -81,6 +81,12 @@ static KlTxState kl_state = {0, 0, false, InvalidSubTransactionId};
  * that went with a rolled back savepoint is not there at commit.  At pre-commit
  * and pre-prepare an entry that has no attestation fails the transaction
  * (KL010).
+ *
+ * Which tables are "required" for a writer is decided when it first writes the
+ * table, with the table locked against the switch of the policy (sign.c,
+ * ledger_set_signature_policy, and row_hash.c, kl_lookup_id), so the answer
+ * holds until the transaction ends.  The entries that the transaction wrote
+ * itself before it switched a table are added by kl_seed_required.
  */
 typedef struct KlRequired
 {
@@ -837,4 +843,64 @@ kl_attest_mark(int32 seq)
 		else
 			hi = mid - 1;
 	}
+}
+
+static int
+kl_req_cmp(const void *a, const void *b)
+{
+	int32		sa = ((const KlRequired *) a)->seq;
+	int32		sb = ((const KlRequired *) b)->seq;
+
+	return (sa > sb) - (sa < sb);
+}
+
+/*
+ * kl_seed_required
+ *		ledger_set_signature_policy switched the table to "required" in this
+ *		transaction, and the transaction has entries of the table with the
+ *		sequence numbers "seqs" that have no attestation yet: they were written
+ *		while the policy was optional, and are owed one now (L21-04: the
+ *		transaction commits with the policy in force).  They join the list of
+ *		owed entries, in the order of the sequence numbers.
+ *
+ *		Which (sub)transaction wrote them is not known, and need not be: the
+ *		entries are owed because of the switch, which is a row of the current
+ *		subtransaction, so they follow the fate of the subtransaction that is
+ *		current now.  If it is rolled back the switch is gone, and so is the
+ *		debt; if it commits they pass to its parent with the switch; an entry
+ *		that an ancestor wrote disappears only with an ancestor, and then the
+ *		subtransaction (and the switch) disappears first.  An attestation that
+ *		exists already was made by this transaction or one of its ancestors by
+ *		the same argument, and stands as long as the switch does.
+ */
+void
+kl_seed_required(int32 table_id, const int32 *seqs, int nseqs)
+{
+	SubTransactionId cur = GetCurrentSubTransactionId();
+	int			i;
+
+	if (nseqs <= 0)
+		return;
+	if (kl_req == NULL)
+	{
+		kl_reqmax = 64;
+		while (kl_reqmax < nseqs)
+			kl_reqmax *= 2;
+		kl_req = MemoryContextAlloc(TopMemoryContext, sizeof(KlRequired) * kl_reqmax);
+	}
+	else if (kl_nreq + nseqs > kl_reqmax)
+	{
+		while (kl_reqmax < kl_nreq + nseqs)
+			kl_reqmax *= 2;
+		kl_req = repalloc(kl_req, sizeof(KlRequired) * kl_reqmax);
+	}
+	for (i = 0; i < nseqs; i++)
+	{
+		kl_req[kl_nreq].seq = seqs[i];
+		kl_req[kl_nreq].table_id = table_id;
+		kl_req[kl_nreq].created = cur;
+		kl_req[kl_nreq].attested = InvalidSubTransactionId;
+		kl_nreq++;
+	}
+	qsort(kl_req, kl_nreq, sizeof(KlRequired), kl_req_cmp);
 }

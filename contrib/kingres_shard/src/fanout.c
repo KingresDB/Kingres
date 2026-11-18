@@ -20,8 +20,8 @@
  * other across nodes (a deadlock of several statements in several transactions
  * is for the distributed deadlock detection of phase 5).
  *
- * While the local part runs through SPI its text carries a nonce that the planner
- * hook recognizes (kingres_shard_local_part_nonce_ok()) and plans the statement
+ * While the local part runs through SPI the planner hook finds the one-shot mark that
+ * the caller armed (kingres_shard_local_part_take()) and plans the statement
  * for this node only; a remote node runs it in a forwarded session, where the same
  * holds.
  *
@@ -82,18 +82,18 @@
 /* then the lock names, then (host, port, local) per target */
 
 /*
- * The nonce of the local part that is running through SPI (design 4.4), or 0.  A
- * 64-bit random number made when the local part starts and held only while that
- * SPI call is active; the statement text of the call starts with a comment that
- * carries it, and the planner hook plans a statement with that comment as the
- * local part, for this node only.  A statement of a function that the local part
- * calls cannot know it, which the comparison of whole statement texts that 0.2 to
- * 0.5 made could not promise.
+ * The mark of the local part that is about to run through SPI (design 4.4, review P2B-01).
+ * It is a one-shot flag held in this backend's memory, set by the caller right before
+ * SPI_execute_with_args and cleared when that call ends, and consumed by the first call of
+ * the planner hook that follows (kingres_shard_local_part_take, called at the entry of the
+ * hook: SPI plans the statement before it runs anything, so no statement of a function that
+ * the local part calls can be planned first).  Nothing about it is in the text of the
+ * statement, so no error context, no current_query, no log line carries it, and SQL code
+ * cannot hand it to a statement of its own.  The text is compared as a second condition: the
+ * statement that consumes the flag must be the one that was armed.
  */
-static uint64 local_nonce = 0;
-
-/* The comment that starts the text of the local part; one nonce in hexadecimal. */
-#define KS_LOCAL_PART_PREFIX "/* kingres:local %016llx */ "
+static bool local_part_armed = false;
+static const char *local_part_text = NULL;
 
 /*
  * How many local parts of a fanned-out reference-table write are running in
@@ -158,20 +158,64 @@ kingres_shard_fanout_init(void)
 }
 
 /*
- * True when query_string is the text of the local part that this backend is
- * running through SPI: it starts with the comment that carries the nonce of the
- * part that is active.  The planner hook calls it after its analysis and after
- * the partition lists were made as new as the catalog (planner.c).
+ * Consume the mark of a local part: true when this call of the planner hook is the
+ * one that plans the statement that the caller armed.  The flag is cleared by the first
+ * call whatever the answer is, so a statement planned while the hook runs (a function
+ * called during constant folding, a catalog load) never sees it.  The planner hook calls it
+ * at its entry and acts on the answer after its analysis and after the partition lists were
+ * made as new as the catalog (planner.c).
  */
 bool
-kingres_shard_local_part_nonce_ok(const char *query_string)
+kingres_shard_local_part_take(const char *query_string)
 {
-	char		prefix[64];
+	bool		ok = local_part_armed && query_string != NULL && local_part_text != NULL &&
+		strcmp(query_string, local_part_text) == 0;
 
-	if (local_nonce == 0 || query_string == NULL)
-		return false;
-	snprintf(prefix, sizeof(prefix), KS_LOCAL_PART_PREFIX, (unsigned long long) local_nonce);
-	return strncmp(query_string, prefix, strlen(prefix)) == 0;
+	local_part_armed = false;
+	return ok;
+}
+
+/* Arm the mark for the statement text that SPI is about to plan; disarm it when the call ends. */
+static void
+local_part_arm(const char *sql)
+{
+	local_part_text = sql;
+	local_part_armed = true;
+}
+
+static void
+local_part_disarm(void)
+{
+	local_part_armed = false;
+	local_part_text = NULL;
+}
+
+/*
+ * kingres_shard_spi_local_part
+ *
+ * Run a statement through SPI (the caller has connected) as the local part of a statement
+ * that another code path of this node has already routed: the planner hook plans it for
+ * this node only (the one-shot mark above).  The batch sender uses
+ * it for the batch of the origin's own group (batch_sender.c).  Returns what
+ * SPI_execute_with_args returns.
+ */
+int
+kingres_shard_spi_local_part(const char *sql, int nargs, Oid *argtypes, Datum *values,
+							 const char *nulls)
+{
+	int			ret;
+
+	PG_TRY();
+	{
+		local_part_arm(sql);
+		ret = SPI_execute_with_args(sql, nargs, argtypes, values, nulls, false, 0);
+	}
+	PG_FINALLY();
+	{
+		local_part_disarm();
+	}
+	PG_END_TRY();
+	return ret;
 }
 
 /*
@@ -544,9 +588,6 @@ run_local(KsFanoutState *s, ParamListInfo params, bool keep_rows)
 	int			ret;
 	int			nest;
 	uint64		processed;
-	uint64		saved = local_nonce;
-	uint64		nonce = 0;
-	char	   *text;
 
 	for (i = 0; i < n; i++)
 	{
@@ -562,27 +603,19 @@ run_local(KsFanoutState *s, ParamListInfo params, bool keep_rows)
 		nulls[i] = (prm->isnull || !OidIsValid(prm->ptype)) ? 'n' : ' ';
 	}
 
-	while (nonce == 0)
-	{
-		if (!pg_strong_random(&nonce, sizeof(nonce)))
-			ereport(ERROR,
-					(errcode(ERRCODE_INTERNAL_ERROR),
-					 errmsg("could not generate a random number for the local part of a statement")));
-	}
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
 	nest = kingres_shard_set_transmission_modes();
-	text = psprintf(KS_LOCAL_PART_PREFIX "%s", (unsigned long long) nonce, s->sql);
-	local_nonce = nonce;
 	if (!s->all_rows)
 		refwrite_local_depth++;
 	PG_TRY();
 	{
-		ret = SPI_execute_with_args(text, n, argtypes, values, nulls, false, 0);
+		local_part_arm(s->sql);
+		ret = SPI_execute_with_args(s->sql, n, argtypes, values, nulls, false, 0);
 	}
 	PG_FINALLY();
 	{
-		local_nonce = saved;
+		local_part_disarm();
 		if (!s->all_rows)
 			refwrite_local_depth--;
 	}

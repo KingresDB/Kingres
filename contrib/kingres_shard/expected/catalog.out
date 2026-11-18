@@ -188,10 +188,14 @@ SELECT name, setting, unit, context
  kingres_shard.deadlock_confirm_delay  | 200     | ms   | sighup
  kingres_shard.decision_retention      | 300     | s    | sighup
  kingres_shard.default_bucket_count    | 128     |      | user
+ kingres_shard.enable_bulk_routing     | on      |      | user
+ kingres_shard.enable_copy_routing     | on      |      | user
  kingres_shard.enable_distributed_scan | on      |      | user
  kingres_shard.enable_routing          | on      |      | superuser
  kingres_shard.fault_injection         |         |      | superuser
  kingres_shard.forwarded               | off     |      | backend
+ kingres_shard.insert_batch_bytes      | 1048576 | B    | user
+ kingres_shard.insert_batch_rows       | 1000    |      | user
  kingres_shard.move_catchup_threshold  | 1024    | kB   | user
  kingres_shard.move_cleanup_delay      | 600     | s    | user
  kingres_shard.move_switch_attempts    | 20      |      | user
@@ -201,7 +205,7 @@ SELECT name, setting, unit, context
  kingres_shard.node_timeout            | 60      | s    | user
  kingres_shard.recovery_interval       | 0       | s    | sighup
  kingres_shard.scan_fetch_size         | 1000    |      | user
-(18 rows)
+(22 rows)
 
 SET kingres_shard.default_bucket_count = 0;
 ERROR:  0 is outside the valid range for parameter "kingres_shard.default_bucket_count" (1 .. 4096)

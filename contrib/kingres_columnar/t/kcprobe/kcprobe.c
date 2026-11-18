@@ -23,8 +23,18 @@
  * with "cursor:" is opened as a cursor named kcc that outlives the callback,
  * and one row is fetched.  The setting kcprobe.commit_sql is run at
  * XACT_EVENT_PRE_COMMIT and XACT_EVENT_PRE_PREPARE, and its first result
- * value is reported as a NOTICE too.  Not installed, never part of a
- * release.
+ * value is reported as a NOTICE too.
+ *
+ * It also has two table access method handlers, for the cases that a
+ * superuser can make with compiled code (C12-04, C12-06):
+ *
+ *	 - kcprobe_am_copy returns a copy of the routine of kingres_columnar, so
+ *	   that a table of the access method has the extension's callbacks and
+ *	   is not recognised by it;
+ *	 - kcprobe_am_error raises an error while the setting kcprobe.am_error is
+ *	   on, as a broken handler of another extension would.
+ *
+ * Not installed, never part of a release.
  *
  * Portions Copyright (c) 2026, RooyeKhat Media Co
  * SPDX-License-Identifier: AGPL-3.0-only
@@ -33,10 +43,16 @@
  */
 #include "postgres.h"
 
+#include "access/heapam.h"
+#include "access/tableam.h"
 #include "access/xact.h"
+#include "catalog/pg_type.h"
 #include "executor/spi.h"
 #include "fmgr.h"
+#include "nodes/makefuncs.h"
+#include "parser/parse_func.h"
 #include "utils/guc.h"
+#include "utils/memutils.h"
 #include "utils/portal.h"
 #include "utils/snapmgr.h"
 
@@ -117,4 +133,39 @@ _PG_init(void)
 							   PGC_USERSET, 0, NULL, NULL, NULL);
 	RegisterSubXactCallback(probe_callback, NULL);
 	RegisterXactCallback(probe_xact_callback, NULL);
+}
+
+PG_FUNCTION_INFO_V1(kcprobe_am_copy);
+PG_FUNCTION_INFO_V1(kcprobe_am_error);
+
+/* a copy of the routine that kingres.columnar_handler returns, kept for the life of the backend */
+Datum
+kcprobe_am_copy(PG_FUNCTION_ARGS)
+{
+	static TableAmRoutine *copy = NULL;
+
+	if (copy == NULL)
+	{
+		Oid			argtypes[1] = {INTERNALOID};
+		Oid			fn = LookupFuncName(list_make2(makeString("kingres"), makeString("columnar_handler")),
+										1, argtypes, false);
+		const TableAmRoutine *orig = GetTableAmRoutine(fn);
+
+		copy = MemoryContextAlloc(TopMemoryContext, sizeof(TableAmRoutine));
+		memcpy(copy, orig, sizeof(TableAmRoutine));
+	}
+	PG_RETURN_POINTER(copy);
+}
+
+/* a handler that raises an error while kcprobe.am_error is on; otherwise it returns the heap's routine */
+Datum
+kcprobe_am_error(PG_FUNCTION_ARGS)
+{
+	const char *v = GetConfigOption("kcprobe.am_error", true, false);
+
+	if (v != NULL && strcmp(v, "on") == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("kcprobe: the handler of this access method is broken")));
+	PG_RETURN_POINTER(GetHeapamTableAmRoutine());
 }

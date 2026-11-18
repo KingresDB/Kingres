@@ -55,6 +55,10 @@ internal/
   wire/                   request and answer types of those internal calls (no behavior)
   clustertest/            starts N kingresd processes on one machine; the multi-server tests
   leader/                 the manager leader read from the catalog, cached
+  scheduler/              the recurring jobs of the manager leader, the term and its guard (ledger phase 7)
+  ledgersign/             the signing keys of the ledger: key files, key tasks, events, trust file, jobs (ledger phase 7)
+  ledgerkeys/, ledgerlog/, anchor/  libraries of ledger phase 7 (keys and their state machine; logs, tiles, checkpoints; anchoring); ledgerkeys and
+                          ledgerlog are wired by ledgersign, anchor by a later step
   ops/                    operations that change the cluster (roles, grants, databases, tables, network, workbench)
   sdnotify/               systemd readiness notification
   pgtest/, contracttest/  test helpers (real instances; contract response validation)
@@ -152,6 +156,8 @@ server at start. The DSN is never logged.
 | `login-rate-limit` | `KINGRES_LOGIN_RATE_LIMIT` | `10` | login attempts per client address and per user name per window |
 | `login-rate-window` | `KINGRES_LOGIN_RATE_WINDOW` | `1m` | |
 | `pg-bin-dir` | `KINGRES_PG_BIN_DIR` | none | directory of `postgres`, `initdb`, `pg_ctl`, `pg_config` (the package sets `/opt/kingres/bin`). Unset: the directory of the kingresd binary, then `PATH`; none found: instance management is off and `initCluster` answers 422. A directory that is not a KingresDB build of a supported PostgreSQL major (18 or 19, pre-releases such as `19rc2` included; all programs of one major) stops the server |
+| `ledger-keys-dir` | `KINGRES_LEDGER_KEYS_DIR` | `<data-dir>/ledger/keys` | directory of the private signing keys of the ledger (`signing/<fingerprint>.key`, mode 0600, directory 0700). It may be on another volume; back it up off the cluster, separately from the passphrase file (design 9.2) |
+| `ledger-key-passphrase-file` | `KINGRES_LEDGER_KEY_PASSPHRASE_FILE` | none | file (mode 0600, one line) with the passphrase that seals the signing key files (PBKDF2-HMAC-SHA256, AES-256-GCM). Read at the start and whenever a key file is read or written, never from the environment or the command line. Without it the key files are in clear text, like `ca.key`; every server that holds keys needs the same passphrase |
 | `socket-dir` | `KINGRES_SOCKET_DIR` | `<data-dir>/run` | base directory of the instances' unix sockets (the package sets `/run/kingres`); never `/tmp` |
 | `pg-port`, `pg-listen` | `KINGRES_PG_PORT`, `KINGRES_PG_LISTEN` | `5432`, `127.0.0.1` | port and `listen_addresses` of the managed instance. In a cluster of several servers `pg-listen` must include the address the other servers reach this one at (the `server-host`), and `127.0.0.1` for kingresd itself, for example `127.0.0.1,10.0.0.12` |
 | `internal-listen` | `KINGRES_INTERNAL_LISTEN` | empty (off) | host:port of the mutual-TLS listener of the internal server-to-server API. **Required to join, add or remove servers and for forwarding.** By convention it is the port above the REST API (`listen` 8091, `internal-listen` 8092): the contract names only the REST address of a server, and the internal API of that server is found at the next port (kingresd warns when it is not) |
@@ -325,12 +331,12 @@ handlers in `internal/httpapi/handlers_config.go`, wiring in `cmd/kingresd/confi
 
 ## What is implemented
 
-The server implements revision **0.9.0** of the contract (100 operations, 82
+The server implements revision **0.11.0** of the contract (132 operations, 108
 paths; what is not done is in "Not done in this increment"). "Real" means the operation works against PostgreSQL or the local node
 state. "Not yet" means: after authentication, CSRF and role checks have passed
 the server answers **HTTP 422 with `code: unsupported_operation`**
 (`Operation <id> is not supported by this server version yet.`), which every
-authenticated operation lists in 0.2.0. **102 of 104 operations are real; 2 answer "not yet".**
+authenticated operation lists in 0.2.0. **109 of 132 operations are real; 23 answer "not yet".**
 
 | Tag | Real | Not yet |
 |---|---|---|
@@ -341,7 +347,7 @@ authenticated operation lists in 0.2.0. **102 of 104 operations are real; 2 answ
 | Roles | `listClusterRoles`, `listRoles`, `createRole`, `getRole`, `deleteRole`, `updateRole`, `setRoleClusterRoles`, `setRoleMemberships` |  |
 | Databases | `getDatabaseCreateOptions`, `listDatabases`, `createDatabase`, `getDatabase`, `dropDatabase`, `updateDatabase` |  |
 | Shards | `getBucketDistribution`, `listColocationGroups`, `listBuckets` |  |
-| Ledger | `getLedgerStatus`, `listLedgerBlocks`, `listLedgerDigests`, `generateLedgerDigest`, `startLedgerVerification`, `listLedgerStatus`, `createInclusionProof`, `listLedgerVerifications`, `getLedgerVerification` |  |
+| Ledger | `getLedgerStatus`, `listLedgerBlocks`, `listLedgerDigests`, `generateLedgerDigest`, `startLedgerVerification`, `listLedgerStatus`, `createInclusionProof`, `listLedgerVerifications`, `getLedgerVerification`, `getLedgerSettings`, `updateLedgerSettings`, `getLedgerSigning`, `createLedgerSigningKey`, `retireLedgerSigningKey`, `revokeLedgerSigningKey`, `getLedgerTrustFile` | `getLedgerPublication`, `listLedgerAnchorTargets`, `createLedgerAnchorTarget`, `getLedgerAnchorTarget`, `updateLedgerAnchorTarget`, `deleteLedgerAnchorTarget`, `testLedgerAnchorTarget`, `getLedgerAggregate`, `listLedgerAggregates`, `listLedgerAnchors`, `anchorLedgerNow`, `retryLedgerAnchor`, `downloadLedgerAnchor`, `createLedgerBundle`, `getLedgerBundle`, `listLedgerClientKeys`, `registerLedgerClientKey`, `revokeLedgerClientKey`, `setTableSignaturePolicy`, `upgradeLedgerExtension`, `acknowledgeLedgerDivergence` |
 | Tables | `getTable`, `distributeTable`, `enableTableLedger`, `listTables` |  |
 | Grants | `listGrants`, `createGrant`, `revokeGrants`, `applyGrantTemplate` |  |
 | Health | `getHealth`, `getReadiness` |  |
@@ -457,6 +463,8 @@ Everything else is read from PostgreSQL:
   setup-task.json          the setup task (it must exist before the system database does)
   service-credentials      password of the role "kingresd" of the managed instance (mode 0600)
   audit.jsonl              audit log
+  ledger/keys/signing/     the private signing keys of the ledger, <fingerprint>.key, mode 0600 (setting ledger-keys-dir moves it); only on the
+                           manager leader and on the servers that run an instance of shard group 0
   instances/<id>/          one directory per managed instance (id 1 on a one-server cluster)
     kingresd-instance.json   marker: kingresd created this directory; every operation checks it
     pgdata/                  PostgreSQL data directory
@@ -2853,3 +2861,134 @@ group lease is held: the primary instance was started" and the following reads w
 clock was not involved. Fix: `Manager.Fence` marks the group as being fenced until its stop has ended and `acquired` does not start the
 instance while it is (the marker stays, the next round starts it); `TestARoundThatWinsTheLeaseDuringAFenceStartsTheInstanceAfterTheStop`. The
 subtest also waits for the lease to be freshly held before it steps the clock.
+
+## The signing keys of the ledger (phase 7, steps 3 and 4, contract 0.11.0)
+
+Design: `kingres/docs/design/ledger-phase7.md` (3.2 to 3.4, 6.7, 8.2 to 8.4, 9.1 to 9.3 and the corrections of section 14). This
+increment is the control plane's foundation of phase 7: the contract (every operation of 8.4 is in `openapi.yaml`; the ones that
+are not built answer 422 `unsupported_operation`), the migration, the scheduler with its term guard, and everything about the
+**server signing keys**. Nothing is signed or published yet: the collector, the chain logs and the aggregate are the next steps (5 and 6).
+
+### What exists
+
+| Package or file | What it is |
+|---|---|
+| `internal/sysdb/migrations/0030_ledger_phase7.sql` | `kingres_cp.ledger_cluster` (singleton: cluster id, **term**, settings, key revision, published trust file, holders), `ledger_signing_key`, `ledger_event`, and `ledger_log` and `ledger_checkpoint` (written by step 5; read now to bound a retired key). The number 30 is a range of its own; the migration runner now applies every migration it has not recorded and allows gaps (see "Decisions") |
+| `internal/scheduler` | the recurring jobs of the manager leader. On becoming leader it waits one `lease-margin`, increments the term in one statement and starts its jobs with a context that ends when leadership is lost. `Term.Guard` is the first statement of every write made under a term |
+| `internal/ledgersign` | the daemon side of the keys: `Store` (PostgreSQL and memory), `Keyring` (the private key files), `Agent` (the internal calls), the tasks, the events, the trust file, the checks after every load, the jobs, and the operations of the REST API |
+| `internal/api/ledgersigning.go`, `internal/httpapi/handlers_ledger_signing.go` | the seven operations that are real: `getLedgerSettings`, `updateLedgerSettings`, `getLedgerSigning`, `createLedgerSigningKey`, `retireLedgerSigningKey`, `revokeLedgerSigningKey`, `getLedgerTrustFile` |
+| `cmd/kingresd/ledger_signing.go` | the wiring: flags, the scheduler, the calls, the alert |
+| `internal/task/envfor.go` | `task.EnvFor`, an `Env` for calling one step in a test |
+
+Settings (the pair `--x` / `KINGRES_X`, as the table above): `--ledger-keys-dir` / `KINGRES_LEDGER_KEYS_DIR` (default `<data-dir>/ledger/keys`;
+the private keys are `signing/<fingerprint>.key`, mode 0600, written atomically by `internal/ledgerkeys`) and `--ledger-key-passphrase-file` /
+`KINGRES_LEDGER_KEY_PASSPHRASE_FILE` (a file of mode 0600; without it the key files are in clear text, like `ca.key`, and `kingresd` logs one
+warning at the start and `getLedgerSigning` says `passphraseProtected: false`). The passphrase file is read at the start (a wrong path or a
+file others can read stops `kingresd`) and again whenever a key file is read or written; the passphrase is not kept in memory. Every holder
+needs the same passphrase: a sealed file is opened with the holder's own passphrase and written again under its own sealing, and a holder that
+cannot open it answers 409 `passphrase_mismatch` to the leader (the task says which server).
+
+### The scheduler and the term (6.7)
+
+`scheduler.Scheduler` follows the leader view of `internal/leader`. A server that becomes the leader waits `lease-margin`, looks again whether
+it is still the leader, and runs `UPDATE kingres_cp.ledger_cluster SET term = term + 1 RETURNING term`. Its jobs get that term; `Term()` returns it
+(and false for a follower, or while the margin runs, so a follower **never signs** and a key operation answers 503 `service_unavailable` with
+`Retry-After`). **Every write of the key set is one transaction that begins with `SELECT 1 FROM kingres_cp.ledger_cluster WHERE term = $mine FOR
+SHARE`** (`PGStore.Commit`): a deposed leader that wakes up finds another term, its write fails with `scheduler.ErrDeposed`, and a task step
+that meets it ends with the task error code `term_over` (retryable). The share lock makes the next leader's increment wait for a write in
+flight. The revision of the key set (`keys_revision`) is a compare and swap on the same statement, so two changes that read the same stored set
+cannot both be written: the first wins, the other reads again (`ErrConflict`, tried five times). The task engine's own lease epoch guards the task
+row; the term guards the key tables. The jobs of this step:
+
+| Job | Every | Does |
+|---|---|---|
+| `ledger.key.due` | 1 min | `DueForRetirement`: starts the task `ledger.key.retire` (actor `system`, one audit entry) for an active key whose overlap ended |
+| `ledger.signer.check` | 10 s | raises or clears the alert `ledgerSignerUnavailable` (critical, subject `cluster`): the key set is damaged, differs from the published trust file, or the file of an active or next key is missing on this server |
+| `ledger.key.sync` | 1 min | compares what every holder has with what it should have and starts `ledger.key.distribute` only when there is something to do (an unreachable server is tried again at the next pass and never makes a task) |
+
+### Tasks (all of subject `ledgerKey` / `signing`: one key task at a time, cluster-wide)
+
+Every step reads the stored state again and does only what is not done; a repeated step writes nothing (a test runs every step of every kind
+again and counts the commits). A step that must not go on says so with a task error code: `key_set_damaged`, `clock` (retryable), `term_over`
+(retryable), `not_leader` (retryable), `last_signing_key`, `key_files_remain` (retryable), `key_file_missing`, `signer_unavailable`.
+
+| Task | Steps |
+|---|---|
+| `ledger.key.create` (the first key) | Generate the key; Give the key to the servers that may become the leader; Publish the key-added event; Activate the key |
+| `ledger.key.rotate` | the same, then Sign the latest checkpoint of every log again (recorded as `skipped` until step 5 provides the collector) |
+| `ledger.key.retire` | Publish the key-retired event; Retire the key; Sign again; Delete the key files that no server needs |
+| `ledger.key.revoke` | Publish the key-revoked event; Revoke the key; Sign again; Delete the key files that no server needs |
+| `ledger.key.distribute` | Give the keys to the holders; Delete the key files that no server needs |
+
+* **Generate.** The key is made with `ledgerkeys.GenerateKey`, checked with `Set.AddChecked` under the cluster origin and the origin of every
+  log (a key with the key id of another is dropped before anything is written and another is made, up to eight times), its file is written, and
+  then its row (state `next`, the id of the task, `mode` `file`). The first key also creates the cluster id (32 random bytes) and stores the
+  origin prefix in force. A crash between the file and the row leaves a file with no row; the step that runs again **adopts** it (a file with no
+  row, modified after the task was created less the allowed clock difference), and a key a cancelled task left in state `next` with its file here and
+  no event is adopted too. A file older than the task is never taken: it may be the only copy of a key of a restored system database.
+* **Distribute (3.2.2).** The holders are this server (the leader) and the servers that run an instance of shard group 0 (`kingres.node`,
+  `group_id = 0`, `is_active`). The leader reads the key file as it holds it and sends it with the internal call `ledger/key/install` to a holder
+  that lacks it (`ledger/key/list` says what a server has). A holder that cannot be reached does not fail the creation: the task detail names it, and
+  the job `ledger.key.sync` gives it the key later. The recorded holders are the servers known to have every key, and a server stays on record until its
+  files were removed.
+* **Events (3.2.4).** Signed notes, key name = the origin prefix, numbered from 0 without gaps, one event of a type per key (a unique index), text
+  as in `events.go`. `key-added` is signed by the active key (it authorises) and by the new key (it proves possession); the first key signs alone.
+  `key-retired` and `key-revoked` are signed by another active key that is in force. Every signer is checked with `Set.CanSign` for the purpose.
+  The `not-before` of `key-added` is the activation time the next step records, so the trust file says what the event says.
+* **Retire.** The bound of the retired key (`max_tree_size`) is the largest size of any stored checkpoint and at least 1, written into the event and
+  read back by the step that retires, so both agree after a crash. A key that signed nothing is bound to 1: the verifier then takes nothing of it
+  that a thief could sign. **Revoke** needs another active key; the daemon never makes one inside a revocation. `compromised-since` is clamped
+  to the time of the revocation and to the creation of the key (the library refuses both).
+* **Times.** Every time given to the library is read by `Service.clock`, which compares the clock of this server with the database's and refuses
+  (error `clock`, retryable) when they differ by more than two minutes; the time handed to Add, Activate, Retire and Revoke is the earlier of the clock and
+  `Set.RecordLimit()`, so an idle set is brought forward in steps (a test rotates after two years of idleness). A user-given time (the
+  `compromisedSince` of a revocation) is only ever the date written into the revoked key, never the time of a transition.
+* **After every load** (`Service.load`): `Set.Validate()` (an error is the alarm of a damaged set, nothing is signed and no key task starts), and the
+  trust file built from the set is compared with the one stored at the last change (`ledgerkeys.TrustFile` against `ledger_cluster.trust_file`); a
+  changed bound, activation time, label or prefix is an alarm. `Service.Signers` returns `ErrNotLeader` without a term, `ErrNoKeys`, `ErrAlarm` for
+  a damaged set (also for `ErrNoActiveKey`) or an unreadable key file, `ErrDoNotSign` for `ErrNotInForce` (a clock behind an activation: not an alarm),
+  and `ErrClockSkew`.
+
+### The internal calls (`ledger/key/*`)
+
+Three calls, all `LeaderOnly` (internal-api.md, "The ledger keys"): `POST /ledger/key/install`, `/remove` and `/list`. The install body carries
+the key file as the leader holds it (plain or sealed), never a passphrase; the answers carry fingerprints only. The task step's fencing epoch travels
+with the call as for every leader-only call.
+
+### Decisions where the design was silent or had to change (proposed corrections 121 onwards)
+
+See the report of this step; the code carries them: the origin prefix is locked by the first key and not only by the first checkpoint (121);
+the migration runner accepts gaps and applies every migration it has not recorded (122); `anchorLedgerNow` answers 201 (123); the subject
+of the key tasks is `ledgerKey` / `signing` (124); `compromised-since` is clamped (125); a revocation never creates a key (126); holders are the
+servers of group 0 (127); a retired key that signed nothing is bound to 1 (128); the signer for a rotation and the retirement must exclude each
+other in step 5 (129); a key file is never taken from before the task (130); the passphrases of the holders must agree (131); the
+trust file is built without the `next` keys (132); `Content-Disposition` passes a forwarded answer (133); the tables carry columns the design's list lacks and
+the operations need the term (134); the alert `ledgerSignerUnavailable` is also raised for a damaged set, a trust file that differs and a missing key file (135);
+a key that waited 300 days as `next` is not taken again (136).
+
+### What steps 5 and 6 will find
+
+* `Service.Signers(ctx)` gives the opened signers (all of them during an overlap: sign every checkpoint with every one) and refuses with the
+  errors above; `Service.Set(ctx)` gives the validated set for `ledgerkeys.TrustEntries` and `ledgerlog.ResignCheckpoint`.
+* `Config.Resign` is the hook the rotation, retirement and revocation tasks call (steps "Sign the latest checkpoint of every log again"): step 5 sets it.
+* `Store.LogOrigins` and `Store.MaxCheckpointSize` read `ledger_log` and `ledger_checkpoint`, which step 5 fills; **the collector must write a checkpoint in
+  a transaction that begins with `Term.Guard`**, and it must **not sign with a key the retirement is retiring**: a checkpoint signed by a key after the size
+  was chosen for its bound is refused by the verifier. The retirement reads `MaxCheckpointSize` in its first step; step 5 has to make signing and that
+  read exclude each other (for example by taking the same revision check, or an advisory lock) or to sign only with the keys of the set it read in the same transaction.
+* The scheduler is built to take more jobs: `Scheduler.Add(Job{Name, Every, Jitter, Run})`; `ledger.round`, `ledger.digest` and the others are added in `newLedgerParts`.
+* `ledger_event` holds the notes the publication serves as `events/<seq>`; `ledger_cluster.trust_file` is the file the keyring will serve.
+
+### Tests
+
+`internal/scheduler` (leader, margin, term, loss of leadership, deposition, panics), `internal/ledgersign` (state machine as the daemon drives it, events,
+idempotence of every step, alarms for every kind of damage, clock, idle set, term guard, follower, distribution and its failures, passphrases, secrets
+searched in every output, crash points of every task kind at every engine fault point, a kill inside a step), the same on the database store with
+`PGStore` (`TestTheKeyLifecycleOnTheDatabaseStore`, `TestADeposedWriterCannotWriteOnTheDatabaseStore`, `TestTwoChangesFromOneStoredStateCannotBothBeWritten`,
+`TestTheDatabaseStoreKeepsWhatItIsGiven`), `internal/httpapi` (`TestLedgerSigningOperationsMatchTheContractAndTheRoles`), `internal/sysdb` (gaps), and the
+cluster test `TestLedgerSigningKeysAreMadeDistributedRotatedAndRevokedAcrossTwoServers` (two servers, standbys, forwarding, files on both, events,
+trust file read by the verifier, no seed in any log, row, task or audit entry, a killed and restarted leader, a deposed leader).
+**(HA)**: a leader change needs the failover of the map group, which answers `unsupported_operation` in this revision (`internal/failover/steps.go`); the
+test of a key available after a leader change is therefore not written. What stands in for it: the second server holds a key file that opens and has
+the public key the API shows (the cluster test), the scheduler restarts its loop and takes a new term after a kill and a restart of the leader (the
+cluster test), and a new service over the same store and key files signs (`Signers` after `rebuild` in `TestTheKeyLifecycleOnTheDatabaseStore`): nothing but the
+store, the key files and the clock is needed. The test of a real leader change is to be written with the failover of the map group.

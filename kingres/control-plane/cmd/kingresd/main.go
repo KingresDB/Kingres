@@ -359,6 +359,15 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		fos = newFailover(svc, opsSvc, members, stby, haReg, haCalls, serverHost, log, auditFn(sink, log), foDeps)
 		deps.Failover = fos
 	}
+	// The signing keys of the ledger and the scheduler that runs their jobs on the manager leader.
+	var lgs *ledgerParts
+	if opsSvc != nil && svc.Enabled() {
+		lgs, err = newLedgerParts(cfg, svc, serverHost, log, members, opsSvc, leaders, auditFn(sink, log), haCalls)
+		if err != nil {
+			return fmt.Errorf("preparing the signing keys of the ledger: %w", err)
+		}
+		deps.LedgerSigning = lgs.svc
+	}
 	deps.LeaderTrusted = leaderTrusted(haReg, lastLeader, serverHost, cfg.HA.LeaderLossBound)
 	api, err := httpapi.New(deps)
 	if err != nil {
@@ -418,6 +427,9 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 			if fos != nil {
 				defs = append(defs, fos.Definitions()...)
 			}
+			if lgs != nil {
+				defs = append(defs, lgs.svc.Definitions()...)
+			}
 			eng, err = task.NewEngine(task.NewPGStore(pool), defs, task.Options{
 				Holder: fmt.Sprintf("%s-%d", hostname, os.Getpid()), Logger: log, Fault: faultHook.TaskPoint})
 			if err != nil {
@@ -442,6 +454,10 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 				runEngineOnLeader(bgCtx, eng, leaders, serverHost, members, log)
 				pool.Close()
 			}()
+			if lgs != nil {
+				wg.Add(1)
+				go func() { defer wg.Done(); lgs.run(bgCtx) }()
+			}
 		})
 		return err
 	}

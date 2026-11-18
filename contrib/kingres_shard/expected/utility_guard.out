@@ -170,10 +170,14 @@ drop cascades to column c of table ug_c_b0003
 ERROR:  DROP is not supported on distributed tables yet
 DETAIL:  The statement would drop distributed table public.ug_c, or one of its columns, on this node only.
 HINT:  Drop it on every node with kingres_shard.enable_routing = off, as a superuser, if you can keep the nodes consistent yourself.
+-- COPY FROM is routed (step 4 of 2b); with enable_copy_routing off it is refused as before
+SET kingres_shard.enable_copy_routing = off;
 COPY ug (id) FROM '/dev/null';
 ERROR:  COPY FROM is not supported on distributed tables yet
 DETAIL:  COPY FROM would write the rows to the partitions of this node only.
 HINT:  A superuser can run the statement on every node by hand with kingres_shard.enable_routing = off.
+RESET kingres_shard.enable_copy_routing;
+COPY ug (id) FROM '/dev/null';
 CREATE TRIGGER ug_trg BEFORE INSERT ON ug FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger();
 ERROR:  CREATE TRIGGER is not supported on distributed tables yet
 DETAIL:  The statement would change distributed table "ug" on this node only, and phase 2a propagates only a fixed set of statements to every node.

@@ -47,9 +47,13 @@ describes what is implemented and how to use it.
   - an `UPDATE` or `DELETE` of one distributed table that spans groups and can be
     shipped whole is run on every group that owns buckets of the table;
   - a write to a reference table is run on every node;
-  - anything else (a multi-row `INSERT` or `INSERT ... SELECT` whose rows belong
-    to several groups, an `UPDATE` or `DELETE` that cannot be shipped) is
-    refused with a "not supported yet" error that says what to change.
+  - an `INSERT` whose rows belong to several groups (a multi-row `VALUES`,
+    `INSERT ... SELECT`, a single row whose key is computed) and `COPY ... FROM`
+    are run by the row router, which sends each row to the group that owns its
+    bucket in batches ("Bulk writes through the row router" below);
+  - anything else (an `UPDATE` or `DELETE` that cannot be shipped, an insert that the
+    router does not take) is refused with a "not supported yet" error that says what
+    to change.
 - A forwarded statement runs in a session that the origin opened with
   `kingres_shard.forwarded = on`. Such a session never forwards again and does
   not take the origin's word for the placement either: it runs a statement
@@ -340,6 +344,26 @@ PROVE_TESTS=t/013_dist_scan.pl kingres/dev/ext.sh kingres_shard tap
   was added to 0.5 in place, the two refusals of a proof told apart by their SQLSTATE, `25001`, a
   lock wait on a node with and without a `lock_timeout` of the role). `KsProxy.pm` is the forwarder
   (`swallow_after`, `delay_turn`, `chunk_log`, `turn_log`).
+  Bulk writes of phase 2b (steps 3 and 4; the design's `056`, `057`, `058`, `064`, `066` and `067`
+  are taken by tests of 0.5, so the parts are named here): the regression test `bulk_plans` (the plans,
+  the switches, the settings, every refusal, the privilege matrix of `INSERT` and `COPY FROM`),
+  `112_row_router` (the router part of 056 and the insert part of 058: every form of `INSERT`, compared
+  with a single node and with the same rows inserted one statement at a time; `RETURNING`, `ON
+  CONFLICT DO NOTHING`, defaults, identity and generated columns, constraints, every type under every
+  session profile, savepoints), `113_router_faults` (the router part of 064: an error and a cancel at every
+  point and wait of the sender, a node that does not read and one that does not answer, a group that dies,
+  an origin that dies before and after its commit), `114_router_security` (the router part of 066 and the
+  batch and log part of 067: the privileges of the caller on every node, a marker is a comment, no value
+  in a statement text or an error, the number of batches, hostile names), `115_copy_routing` (057 and the
+  copy part of 058: every format and option of `COPY FROM`), `116_router_moves` (a bucket that moves,
+  and a group that changes its primary, during a bulk write) and `117_bulk_memory` (the memory of a load
+  of millions of rows is a constant: peak private memory of the origin and of the groups' sessions).
+  `118_review_steps_1_2` (the fixes of the review of steps 1 and 2: the one-shot mark of a local part cannot be
+  read by SQL code, the memory of thousands of rescans, restrictions that deparse with `COLLATE`, set operations with
+  an arm that contradicts itself, inequalities never prune, forged fragments are refused with `0A000`) and
+  `119_nested_subxacts` (the fixes of the sixth review of the call sequences: two nested subtransactions with the
+  connection closed or answered with an error at every chunk, a failed `RELEASE` that PL/pgSQL catches, a read-only
+  session that does not answer `ROLLBACK TO`, the memory of thousands of failed `RELEASE`s).
   `t/KingresShardTest.pm` builds clusters (and standbys); `t/KingresShardCompare.pm` is the
   comparison harness: it loads the same data into a three-node cluster and a
   single node and compares query results (a NULL is shown as `<NULL>`, so it never equals
@@ -486,6 +510,10 @@ the files of the extension, because the dump creates the extension.
 | `kingres_shard.enable_routing` | on | When off, the planner and utility hooks do nothing. Superusers only (`PGC_SUSET`): with routing off a `SELECT` reads the local partitions only and a `TRUNCATE` clears this node only, which an administrator who repeats a statement on every node by hand wants and an ordinary session must not be able to switch on. |
 | `kingres_shard.enable_distributed_scan` | on | When off, a `SELECT` that spans shard groups raises the phase 1 error instead of reading the other groups (to forbid slow cross-group queries). |
 | `kingres_shard.scan_fetch_size` | 1000 | Rows requested from another group at a time by the distributed scan. |
+| `kingres_shard.enable_bulk_routing` | on | Off: an `INSERT` that goes to several shard groups is refused as in 0.5 (a multi-row `VALUES`, `INSERT ... SELECT`, a single row whose key is not a constant). A single row with a constant key never needed the router and is not affected. `USERSET`; it grants nothing. |
+| `kingres_shard.enable_copy_routing` | on | Off: `COPY ... FROM` into a distributed table of a cluster with several groups is refused as in 0.5. `USERSET`. |
+| `kingres_shard.insert_batch_rows` | 1000 | Rows per batch that the row router sends to one group (1 to 100000). |
+| `kingres_shard.insert_batch_bytes` | 1MB | Text bytes per batch per group, the sum of the lengths of the values (16kB to 64MB). The memory of a bulk write is about two batches per group, whatever the number of rows. |
 | `kingres_shard.recovery_interval` | 30s | Seconds between runs of the recovery worker; 0 disables it. `sighup`. |
 | `kingres_shard.deadlock_check_interval` | 2s | Seconds between passes of the distributed deadlock detector; 0 disables it. `sighup`. |
 | `kingres_shard.deadlock_confirm_delay` | 200ms | Time between the two readings of the wait-for graph that confirm a cycle. `sighup`. |
@@ -677,7 +705,7 @@ distributed or reference table is handled by the ProcessUtility hook:
 - **Refused** with `<statement> is not supported on distributed tables yet`:
   everything else, among them `ALTER COLUMN ... TYPE`, `SET SCHEMA`, `ATTACH`
   and `DETACH PARTITION`, triggers, rules, policies, statistics objects,
-  `CLUSTER`, `CREATE INDEX CONCURRENTLY`, `COPY ... FROM`, row-level security,
+  `CLUSTER`, `CREATE INDEX CONCURRENTLY`, `COPY ... FROM` into a reference table or a bucket partition (into a distributed table it is routed, see "Bulk writes through the row router"), row-level security,
   storage parameters, `ALTER INDEX`.
 - A statement that mixes distributed and other tables (`DROP TABLE a, b`,
   `TRUNCATE a, b`), a query string with several statements, and a `GRANT ... ON
@@ -743,7 +771,7 @@ cluster with several groups.
   `COPY` of a partitioned table with a hint to use the query form; a core that
   accepted it would return this node's buckets only). A reference table is local and
   whole; a bucket partition named directly is read as it is, the rows of that bucket
-  on this node. `COPY ... FROM` stays refused.
+  on this node.  `COPY ... FROM` into a distributed table is run by the row router (section "Bulk writes through the row router"); into a reference table or a bucket partition it stays refused.
 
 **The rule for every statement that is run on several nodes** (a reference-table
 write, and the `UPDATE` and `DELETE` that span shard groups; one place in the
@@ -947,10 +975,33 @@ Since step 2 of phase 2b the scan has these properties as well (design:
   `kingres_shard.enable_distributed_scan = off` the refusal is back; that switch
   is the fallback of this step.
 - **The local part of a fan-out write** (an `UPDATE`, `DELETE` or reference-table
-  write run on every group) is planned for this node only when its text carries
-  a random number that exists only while that part runs (it is no longer
-  recognized by comparing statement texts), and only after the partition lists
-  are as new as the catalog.
+  write run on every group) and the local batch of the row router are planned for
+  this node only when the code that runs them has armed a one-shot flag of this
+  backend right before the SPI call (it is consumed by the first call of the
+  planner hook that follows, and cleared when the call ends), and only after the
+  partition lists are as new as the catalog. Nothing in the statement text says
+  that it is a local part, so no error context, `current_query` or log line carries
+  it, and a function that the local part calls (a `CHECK`, a default, a trigger of
+  a local table) cannot plan a statement of its own without routing: such a
+  statement is routed like any other.
+- **What a peer is compared with.** The version of the extension that a node
+  answers in the placement probe is compared with the version compiled into this
+  node's library, not with the version installed in its catalog: a node whose
+  library is new and whose `ALTER EXTENSION UPDATE` has not run, and a node updated
+  in SQL that has not been restarted, are refused by their peers with "node X runs
+  kingres_shard A, this node runs B" (A and B are library versions).
+- **The subtransactions of the node sessions** (review S14-01, S14-05).  The `RELEASE SAVEPOINT` of a
+  committing subtransaction is sent at `SUBXACT_EVENT_PRE_COMMIT_SUB`, where an error is legal (as
+  `postgres_fdw` does), so a failure aborts a subtransaction that is still in progress; the callbacks of the
+  commit and of the abort of a subtransaction raise no error: a session that broke at a deeper level is repaired
+  (its depth is lowered, or it is closed) and the transaction is refused at its commit or prepare when the
+  session held work that is lost (`wrote`, a snapshot isolation level, work of a control call).  A session
+  that only read in READ COMMITTED and did not answer `ROLLBACK TO SAVEPOINT` is closed without refusing the
+  transaction.
+- **A fragment that a group does not accept** (a statement that carries the marker of
+  a scan, write or insert fragment and has no shape that the group runs) is refused
+  with `0A000`, not with `KS001`: the origin and the group decide on the same tree,
+  so repeating cannot help.
 
 ## UPDATE and DELETE that span shard groups
 
@@ -963,6 +1014,93 @@ allowed, only built-in immutable functions and operators. An `UPDATE` that
 assigns the distribution column is refused. Otherwise it fails with `this
 UPDATE/DELETE spans shard groups and cannot be shipped`.
 
+## Bulk writes through the row router (phase 2b, steps 3 and 4)
+
+An `INSERT` into a hash-distributed table whose rows can belong to several groups, and `COPY ...
+FROM` into one, are run by the **row router**, the "Kingres Row Router" custom scan (no
+`ModifyTable` is in the plan). Switches: `kingres_shard.enable_bulk_routing` (`INSERT`) and
+`kingres_shard.enable_copy_routing` (`COPY`); with a switch off the statement is refused exactly as
+before.
+
+**What is routed.** A multi-row `VALUES`, `INSERT ... SELECT` (the source is any `SELECT`: it is read
+through the distributed scan like any query, and may read the table itself or a local table), and a single
+row whose key is not a constant (a function that is not immutable, a default). A single row with a
+constant key is forwarded to its group or run locally, as before; a reference table, a table with one
+group and a local target are not touched.
+
+**How.** The rewritten statement is turned into a `SELECT` that has one column for every column the
+statement gives a value to; the router runs it as a read-only SPI cursor, fetching
+`insert_batch_rows` rows at a time. A default, a `serial` and an identity value are computed once per
+row, **at the node that runs the statement**, by its functions and sequences, and are sent as values
+(sequences are node-local as before: a row inserted from another node draws from that node's
+sequence). A column that the statement does not name and whose default is a constant is left out of
+the column list, so the group applies its own default, and a role with the privilege on some columns only
+can insert (a documented difference: the privilege on a column whose default is computed at the origin is
+needed). Generated columns are never sent. A `GENERATED ALWAYS` identity column is sent with
+`OVERRIDING SYSTEM VALUE`. The rows go to the group that owns their bucket in **batches of one statement**,
+`INSERT ... SELECT u.c::type, ... FROM unnest($1::text[], ...) AS u(...)`, with the text of every value in
+an array parameter (nothing a row holds is ever part of the statement text; the text is built from quoted
+identifiers). The batch of the origin's own group runs through SPI.
+
+**Atomicity.** The transaction is the one of 2a: every node written is a writer, two or more writers commit
+with two-phase commit, a failure of any group at any point (a constraint, a unique violation, a lost
+connection, a cancel) fails the statement and leaves nothing, after recovery too. The context of an error
+names the batch (`bulk insert of <table>, batch <n> to group <g>`); the position of the row in the batch is not
+known. There is no partial result.
+
+**Memory.** At most one batch is in flight per remote group, and the previous answer is read before the
+next batch is sent, so the memory is about two batches (`insert_batch_bytes`) per group plus the batch of
+the source cursor and the `RETURNING` rows not yet handed out (a tuplestore: `work_mem`, then disk),
+whatever the number of rows (`t/117_bulk_memory.pl`).
+
+**Waits.** The send is non-blocking and a wait for room in the socket is a latch wait, the answer is read
+interruptibly: a cancel or a statement timeout ends the statement at once, also while a node does not read or
+does not answer. The session of a batch in flight that the error leaves behind is cancelled and its end read
+for at most the time of a cancel request (a third of `node_timeout`, at most `node_connect_timeout`); a node
+that does not answer even then loses the session and the transaction cannot commit.
+
+**Buckets that move and groups that change their primary.** Every batch statement carries the placement
+number the router decided with and the group compares it with its own; before its first batch the router asks
+each group for its placement and the identity of its partitions, and after the last batch asks again (the
+rule of 10.2): a bucket that moved between the plan and the end fails the statement with the retryable
+`KS001`, nothing stored; a statement that has rows in a group holds `ROW EXCLUSIVE` on its table there, which
+the switch of a move waits for, so the moved bucket carries them. A row can never be stored in a wrong bucket
+whatever the router believes: the tuple routing of the group refuses a row whose bucket is not attached
+there. A group that is no longer a primary answers `KS001`. `PREPARE`d statements and generic plans work
+(the router's routing is decided per row).
+
+**`RETURNING`.** Evaluated by the group that inserted the row, arrives with each batch; the order is by group,
+then arrival, not the input order (single-row inserts if the order matters). The list must be built from
+columns of the table and built-in immutable expressions (`OLD` and `NEW` are refused).
+
+**`ON CONFLICT DO NOTHING`** (also with an inference clause or `ON CONSTRAINT`) is supported; the count skips
+the conflicts as on one node. `DO UPDATE` and, on 19, `DO SELECT` are refused (a second row for one key could
+touch the row of an earlier batch). An inference clause with an explicit collation or operator class is refused.
+
+**`COPY FROM`.** Does what `DoCopy` does (the privileges of the role, `pg_read_server_files` and
+`pg_execute_server_program`, the read-only transaction, row-level security refused) and parses every format
+and option itself (`FORMAT text|csv|binary`, `DELIMITER`, `NULL`, `HEADER`, `QUOTE`, `ESCAPE`, `ENCODING`,
+`FORCE_NOT_NULL`, `FORCE_NULL`, `DEFAULT`, column lists, files and programs of the node that runs the
+statement) with `BeginCopyFrom` and `NextCopyFrom`. **Refused**: `FREEZE`, `WHERE`, `ON_ERROR`,
+`REJECT_LIMIT` and `LOG_VERBOSITY` (the core carries them out in `CopyFrom`), a reference table and a
+bucket partition named directly. The error context names the line and the column. `pg_stat_progress_copy`
+is not updated.
+
+**Still refused for `INSERT`**: `ON CONFLICT DO UPDATE`, a `WITH` clause on the statement (put it inside the
+`SELECT`), `RETURNING` with `OLD`/`NEW` or an expression that is not shippable, an insert that reads a
+security barrier view or a view of another owner, an insert through a view `WITH CHECK OPTION` (the check
+would be lost), `session_replication_role` other than `origin`, a parallel
+worker; with a reference table as the target the fan-out of 2a is used.
+
+**Privileges.** Those of the caller on every node: the executor checks `INSERT` (and the columns) at the
+origin before the router starts, and the groups check them again as the same role (nothing is run as a
+superuser or as the extension). The statement of a batch is accepted by a group as such only in a session that
+another node of the cluster opened (the forwarded flag of the README section "The forwarded flag"); in any
+other session the same text is an ordinary statement and is routed like one.
+
+**New SQLSTATEs and messages.** None. `KS001` is raised for the changes of placement named above; the
+refusals use `0A000`. The messages of the refused forms are listed in `sql/bulk_plans.sql`.
+
 ## Limitations in phase 2a
 
 Read these first; each is a reviewed boundary, not an accident.
@@ -970,10 +1108,11 @@ Read these first; each is a reviewed boundary, not an accident.
 - **No global snapshot** (see Guarantees). The distributed scan is slow for
   large tables by design: it moves rows, it pushes down restrictions only
   (aggregates, sorts, limits and colocated joins are phase 2b).
-- **Writes that span groups.** A multi-row `INSERT` or `INSERT ... SELECT` whose
-  rows belong to several groups, `COPY ... FROM`, `MERGE` and an `UPDATE` or
-  `DELETE` that cannot be shipped are refused. A write that uses a function
-  that is not built in cannot be shipped.
+- **Writes that span groups.** `MERGE` and an `UPDATE` or `DELETE` that cannot be
+  shipped are refused. A write that uses a function that is not built in cannot be
+  shipped. (A multi-row `INSERT`, `INSERT ... SELECT` and `COPY ... FROM` into a
+  distributed table are no longer refused: see "Bulk writes through the row router",
+  which lists what is still refused for them.)
 - **UPDATE ... FROM, DELETE ... USING and MERGE that read a distributed table
   and write another table** are refused ("UPDATE, DELETE and MERGE that read
   distributed table ... are not supported"): PostgreSQL asks for the row
@@ -1381,7 +1520,7 @@ needs `cleanup_moved_buckets(true)` after the move (review finding S4-10).
   after its snapshot): it fails with a serialization failure ("a bucket of table ...
   moved to this node after the snapshot of the transaction was taken") and can be
   retried. `COPY (SELECT ...) TO` reads like any `SELECT`; `COPY ... FROM` into a
-  distributed table is refused, during a move as always.
+  distributed table is routed by the row router, which fails with the retryable `KS001` when a bucket moved between its plan and its first batch and otherwise makes the switch of a move wait for it (section "Bulk writes through the row router").
 
 ## High availability (version 0.5, phase 5)
 
@@ -1420,7 +1559,7 @@ grace period) gets the weaker guarantees of 12.
 | 5 | A node that the catalog does not call the primary of its group is in no group for routing: it forwards its clients' statements, refuses forwarded fragments with `KS001`, reads every group | - | `t/049`, `t/063` |
 | 6 | It does not stop an application that writes ordinary tables on a demoted node: the control plane must fence it | fencing | `t/049` |
 | 7 | `promote_node` runs on every node that can be reached, in one two-phase transaction, **resumably**, and says what it did (below) | - | `t/049`, `t/063`, `t/064` |
-| 8 | A statement in flight across a promotion answers completely and correctly, or fails with an error that can be retried; it never answers with a part. A scan or fan-out planned against the old primary fails with `KS001`; a cursor and its rescan behave the same; `COPY (SELECT ...) TO` reads every row; `COPY FROM` into a distributed table is refused, as without a promotion | - | `t/049`, `t/054`, `t/069` |
+| 8 | A statement in flight across a promotion answers completely and correctly, or fails with an error that can be retried; it never answers with a part. A scan or fan-out planned against the old primary fails with `KS001`; a cursor and its rescan behave the same; `COPY (SELECT ...) TO` reads every row; `COPY FROM` into a distributed table is routed (a primary that changed between its plan and its first batch fails it with `KS001`) | - | `t/049`, `t/054`, `t/069` |
 | 9 | The map group is promoted from the promoted node only when it reaches the primary of a **strict majority of the groups other than the map group** (a cluster with no other group has no electorate; a tie is not a majority), so two sides of a partition cannot both promote it; **no catalog change of any kind is accepted from a node that is not the map primary by such a claim** (S9-02): a standby of the map group that was promoted in PostgreSQL still holds the old primary's catalog and node id, and until `promote_node` has run on it with the majority it refuses `promote_node` of an ordinary group, `add_node`, `remove_node`, `sync_catalog`, `rotate_secret`, `set_node_property`, `move_bucket`, `create_distributed_table` and DDL on distributed tables ("this node was promoted in PostgreSQL after the catalog named it the map group primary"); a group counts as reached only when its primary answers now and proves it is one (out of recovery, knowing itself by its id); a node that missed a promotion cannot override the new catalog (catalog term, below) and learns it from the first node it talks to. The rule does not stop the old primary from taking writes: that is fencing | fencing | `t/063`, `t/064`, `t/071`, `t/077` |
 | 10 | The identifier of a two-phase transaction names the origin group, the timeline and a keyed tag; recovery touches only the identifiers whose tag verifies; the older forms are resolved if prepared before the node came to 0.5; `rotate_secret()` refuses while a transaction with a valid tag is prepared on any node; **a node that holds a rotation prepared can always be reached by the node that can finish it** (S9-03) | cluster secret | `t/050`, `t/051`, `t/067`, `t/072`, `t/076` |
 | 11 | **With a synchronous standby the outcome of a distributed transaction is atomic across a failover of the origin's group or of a participant's group.** The second phase is sent only after the origin's commit record is known to be acknowledged as the configuration requires. A participant's `PREPARE` counts as done only when the participant **confirms** that its record is durable by its own rule (`internal_sync_confirm`, a result of the same batch, not a warning): otherwise the origin aborts and the client gets `KS005`, nothing committed. A participant's `COMMIT PREPARED` is asked the same; an unconfirmed one leaves the transaction committed everywhere, the client gets a `WARNING`, and **the decision is kept until the participant's standbys have confirmed everything the participant flushed, with no time limit** (S9-01; `decision_retention` counts only from then on) so that recovery commits the part again whenever the participant fails over to a standby that lacks it. Recovery asks the same of the `COMMIT PREPARED` it sends. All of it is acknowledged by the participant's own synchronous standby whatever its `synchronous_commit` is. The weaker case that PostgreSQL itself has: a list of standbys that is emptied during a wait releases the wait, and then nothing is required | synchronous standby | `t/050`, `t/061`, `t/062`, `t/070` |
@@ -1599,7 +1738,7 @@ repeats the statement. A statement routed to one group that reaches the old prim
 finds it demoted and gets `KS001`, and the node that sent it reloads its catalog and
 repeats it. A **cursor** that is open keeps the sessions it opened and answers from the
 snapshot it started with (completely) or fails with an error that can be retried; a
-rescan after the promotion likewise; `COPY (SELECT ...) TO` after it reads every row from the new primary (`COPY FROM` into a distributed table is refused by the extension, with or without a promotion); a transaction
+rescan after the promotion likewise; `COPY (SELECT ...) TO` after it reads every row from the new primary (`COPY FROM` into a distributed table is run by the row router: a group that changed its primary in the middle of it fails it with `KS001`, nothing stored); a transaction
 that had already done work on the old primary is not rescued: it fails, or, if the old
 primary is gone, its prepared transaction is resolved by recovery as below (`t/049`,
 `t/054`, `t/069`).
@@ -2013,7 +2152,7 @@ call a node silent that has answered). **What a call that is working costs while
 | `check_cluster()` | at most **`2 x T` for each node that does not answer**; the node gets a row `node_unreachable` and the other nodes are still checked: the call does not fail as a whole | `t/086` |
 | a call behind another call that changes the catalog | `T`, then `KS008` | `t/086` |
 | client timeout of the control plane for any of these calls | **without `control_call_timeout` there is no bound for a call that is working**: the formula above (`s x T` for each slow node) plus the bound for a silent node for each node that may be stuck, plus 10 s; its expiry means "did not finish" and is **not** proof of a local reason: a call that works through a slow node can run that long with the catalog lock held, so cancel it from another session (`pg_cancel_backend`) before starting another. With `n` nodes of which `k` may be stuck: `k x (3 x T + 8) + 10 s` is always enough for the silent ones. With `control_call_timeout = L` the call ends in at most `L` plus the time to cancel one statement | `t/086` (the bounds), `t/082` (a cancelled call), `t/107` (`control_call_timeout`) |
-| a call, with `kingres_shard.control_call_timeout` set | at most that many seconds plus the cancel of one statement, then `KS015` (S13-02) | `t/107` |
+| a call, with `kingres_shard.control_call_timeout` set | at most that many seconds plus the cancel of one statement, then `KS015` (S13-02). **Cut to what is left (review S14-02):** every statement of the call's sessions, the connect of a new session (its `connect_timeout`) and the first command of a new session. **Outside it, each with its own bound:** the raw sessions of `require_primaries_can_commit` (the start of `add_node`, `remove_node`, `rotate_secret`, `sync_catalog`), `ask_node` and the sessions of `promote_node` (`failover.c`), each bounded by `node_timeout` or `node_connect_timeout` per node, one after the other: with `k` silent nodes the worst case is `L + k x node_timeout` for these, not `L`. When the time runs out while a node is being waited for, `KS015` names that node (and says nothing is known against it) | `t/107` |
 | the repeat loop of `promote_node` | at most **10 calls**, 2 s apart, ending at `already`. If `"blocked_by"` names the same transaction in two answers in a row, stop repeating: see the table of sequence 2. *Not produced by a test:* the number 10 and the 2 s are a recommendation; the tests loop at most 6 times (`t/078`) and end at `already` within 3 calls (`t/071`, `t/073`) | |
 | a refused call (the node cannot commit) | the probe waits `min(T, 5) - 1` seconds **per node**, so a cluster with several nodes in that state is several waits in a row; then `KS009`, changing nothing. A commit that waits for a standby: `2 x T + 5` seconds, then `KS005` | `t/091`, `t/070`, `t/084` |
 | the second phase of a distributed commit | `T` per participant, then "recovery will commit it" (`t/076` produces the warning; the bound itself is not asserted) | |

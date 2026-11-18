@@ -205,6 +205,15 @@ export const ALERT_KIND_LABEL: Record<AlertKind, string> = {
   oldPrimaryRunning: 'The old primary is running again',
   oldPrimaryNotStopped: 'The old primary could not be stopped',
   oldPrimaryNotRebuilt: 'The old primary was not rebuilt as a standby',
+  ledgerNotAnchored: 'Ledger not anchored',
+  ledgerAnchorBehind: 'Ledger anchoring is behind',
+  ledgerAnchorFailed: 'Ledger anchoring failed',
+  ledgerAnchorConflict: 'An anchor store holds a different object',
+  ledgerChainDiverged: 'A ledger chain no longer matches its published log',
+  ledgerGroupUnread: 'A ledger chain could not be read',
+  ledgerPublicationBehind: 'Ledger publication is behind',
+  ledgerSignerUnavailable: 'Ledger checkpoints cannot be signed',
+  ledgerDigestOverdue: 'No ledger digest for too long',
 }
 
 /** The label of an alert kind; a kind from a newer server is shown as sent (through SafeName). */
@@ -237,6 +246,24 @@ export const TASK_KIND_LABEL: Record<TaskKind, string> = {
   'standby.reconcile': 'Add or remove standbys',
   'config.apply': 'Apply a configuration change',
   'config.restart': 'Restart instances for a configuration change',
+  'ledger.key.create': 'Create the first ledger signing key',
+  'ledger.key.rotate': 'Rotate the ledger signing key',
+  'ledger.key.retire': 'Retire a ledger signing key',
+  'ledger.key.revoke': 'Revoke a ledger signing key',
+  'ledger.key.distribute': 'Bring the holders of the ledger signing key up to date',
+  'ledger.bundle.create': 'Create a ledger bundle',
+  'ledger.epoch.start': 'Start a new ledger epoch',
+  'ledger.upgrade': 'Upgrade the ledger extension',
+}
+
+/**
+ * What a task is about, in words, for the subjects the panel can explain (contract 0.11.0: `ledgerKey` with the id
+ * `signing`: the signing keys of the ledger, one key task at a time in the cluster). Any other subject is shown as
+ * sent: its type and id.
+ */
+export function taskSubjectText(subject: { type: string; id: string }): string {
+  if (subject.type === 'ledgerKey' && subject.id === 'signing') return 'Signing keys of the ledger'
+  return `${subject.type} ${subject.id}`
 }
 
 /** The label of a task kind; a kind from a newer server is shown as sent (through SafeName). */
@@ -263,6 +290,23 @@ const ALERT_KIND_HINT: Partial<Record<AlertKind, string>> = {
     'The clock of this server differs from the clock of the manager leader by more than the cluster threshold, less the uncertainty of the measurement. KingresDB does not set the system clock: run time synchronization (NTP or chrony) on every server.',
   replicationPending:
     'The leader is still waiting to hand a change of roles, grants or settings to a server it could not reach. Until it arrives, a role that was disabled, changed or dropped may still work on that server.',
+  ledgerNotAnchored:
+    'This database has ledger tables and no anchor target is enabled, so the ledger can be rewritten undetected by anyone who controls this cluster and its backups. Nothing is blocked. Add a target on the Anchoring tab of the Ledger page.',
+  ledgerAnchorBehind:
+    'The newest checkpoint of the ledger has not reached this anchor target for longer than the anchoring interval allows. Records are retried by the server.',
+  ledgerAnchorFailed:
+    'An anchor record at this target failed or expired. Look at the last error of the record, fix the target, then retry the record.',
+  ledgerAnchorConflict:
+    'The store holds a different object under the name of an anchor. Do not overwrite it: someone else wrote it, or the cluster was restored from an older state.',
+  ledgerChainDiverged:
+    'The chain of this shard group no longer extends the log that was published for it (a restore, a lost tail of blocks, or a changed block). The server stopped publishing this log and never overwrites what it published. The way out is the explicit procedure for a restore, not a repair.',
+  ledgerGroupUnread:
+    'The chain of this shard group could not be read in the last rounds, so the aggregate repeats its last good state for it.',
+  ledgerPublicationBehind:
+    'The newest signed checkpoint of this chain is older than five publication intervals although its head has advanced.',
+  ledgerSignerUnavailable:
+    'No checkpoint could be signed: the key set is damaged, a key file is missing on the leader, or the signer does not answer. Published history is not harmed, but nothing new is signed until this is fixed. See the Signing tab of the Ledger page.',
+  ledgerDigestOverdue: 'No digest was made within twice the digest interval of this database.',
 }
 
 /** The extra sentence for an alert kind, or null. */
@@ -345,6 +389,22 @@ export const AUDIT_ACTION_LABEL: Record<AuditAction, string> = {
   failoverGroupPromoted: 'A standby was promoted to primary',
   failoverGroupFailed: 'Failover of a shard group failed',
   oldPrimaryRebuilt: 'Old primary rebuilt as a standby',
+  updateLedgerSettings: 'Change the ledger publication and anchoring settings',
+  createLedgerSigningKey: 'Create or rotate a ledger signing key',
+  retireLedgerSigningKey: 'Retire a ledger signing key',
+  revokeLedgerSigningKey: 'Revoke a ledger signing key',
+  createLedgerAnchorTarget: 'Add a ledger anchor target',
+  updateLedgerAnchorTarget: 'Change a ledger anchor target',
+  deleteLedgerAnchorTarget: 'Delete a ledger anchor target',
+  testLedgerAnchorTarget: 'Test a ledger anchor target',
+  anchorLedgerNow: 'Anchor the ledger now',
+  retryLedgerAnchor: 'Retry a ledger anchor',
+  createLedgerBundle: 'Create a ledger bundle',
+  registerLedgerClientKey: 'Register a ledger client key',
+  revokeLedgerClientKey: 'Revoke a ledger client key',
+  setTableSignaturePolicy: 'Set the signature policy of a ledger table',
+  upgradeLedgerExtension: 'Upgrade the ledger extension',
+  acknowledgeLedgerDivergence: 'Acknowledge a diverged ledger chain',
 }
 
 /** The words for an audit action; an action from a newer server is shown as sent. */

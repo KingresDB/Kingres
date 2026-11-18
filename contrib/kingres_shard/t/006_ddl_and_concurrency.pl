@@ -172,7 +172,8 @@ is(rows_everywhere(), 'row-0,row-1,row-2', 'one row per node before the DDL test
 # Since phase 2a the DDL statements of the list are propagated to every node
 # when they run on the map group primary (t/012_ddl_propagation.pl), and refused
 # on any other node, where they would change the table there only.  COPY FROM
-# is refused everywhere: its rows would land on the partitions of one node.
+# was refused everywhere (its rows would land on the partitions of one node); since phase 2b
+# step 4 the row router loads it, and it is refused as before with the switch off.
 for my $case (
 	[ 'TRUNCATE', 'TRUNCATE public.kv' ],
 	[ 'ALTER TABLE', 'ALTER TABLE public.kv ADD COLUMN extra int' ],
@@ -187,9 +188,12 @@ for my $case (
 }
 for my $n ($n1, $n3)
 {
-	my ($rc, $out, $err) = run_sql($n, "COPY public.kv FROM '/dev/null'");
+	my ($rc, $out, $err) = run_sql($n,
+		"SET kingres_shard.enable_copy_routing = off; COPY public.kv FROM '/dev/null'");
 	like($err, qr/COPY FROM is not supported on distributed tables yet/,
-		"finding 3: COPY FROM on " . $n->name . ' is refused');
+		"finding 3: COPY FROM on " . $n->name . ' is refused with the switch off');
+	($rc, $out, $err) = run_sql($n, "COPY public.kv FROM '/dev/null'");
+	is($err, '', "finding 3: COPY FROM on " . $n->name . ' runs through the row router (no rows)');
 }
 is(rows_everywhere(), 'row-0,row-1,row-2',
 	'finding 3: no row was removed from any node by the refused statements');

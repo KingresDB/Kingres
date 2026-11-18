@@ -212,6 +212,9 @@ export const ROUTES = [
   '/rebalance',
   '/security',
   '/ledger',
+  '/ledger?tab=digests',
+  '/ledger?tab=signing',
+  '/ledger?tab=publication',
   '/workbench',
   '/tasks',
   '/alerts',
@@ -443,13 +446,70 @@ export const STATES: PageState[] = [
   },
   {
     name: 'ledger inclusion proof with the digests compared',
-    route: '/ledger',
+    route: '/ledger?tab=digests',
     open: async (page) => {
       await clickText(page, 'Look up proof')
       await page.waitForSelector('[data-testid="proof"]', { timeout: 20_000 })
       await page.waitForSelector('[data-testid="digest-proof-summary"]', { timeout: 20_000 })
       await sleep(250)
     },
+  },
+  {
+    // 0.11.0 (Console A): an aggregate checkpoint with its members, the statement and the signed note.
+    name: 'ledger aggregate dialog',
+    route: '/ledger?tab=digests',
+    open: async (page) => {
+      await clickText(page, 'Open aggregate')
+      await dialogOpen(page)
+      await page.waitForSelector('[role="dialog"] [data-testid="aggregate"]', { timeout: 20_000 })
+      await sleep(250)
+    },
+    close: async (page) => {
+      await clickText(page, 'Close', '[role="dialog"] button')
+      await sleep(150)
+    },
+  },
+  {
+    name: 'ledger rotate-the-key dialog',
+    route: '/ledger?tab=signing',
+    open: async (page) => {
+      await clickText(page, 'Rotate the key')
+      await dialogOpen(page)
+    },
+    close: cancel,
+  },
+  {
+    // The only key in force cannot be revoked, so the state rotates first (once: two keys stay active afterwards).
+    name: 'ledger revoke-the-key dialog',
+    route: '/ledger?tab=signing',
+    open: async (page) => {
+      await page.waitForSelector('[data-testid="key-active"]', { timeout: 20_000 })
+      const active = () =>
+        page.evaluate(() => document.querySelectorAll('[data-testid="key-active"]').length)
+      if ((await active()) < 2) {
+        await clickText(page, 'Rotate the key')
+        await dialogOpen(page)
+        await clickText(page, 'Rotate the key', '[role="dialog"] button')
+        await page.waitForFunction(
+          () => document.querySelector('[role="dialog"]')?.textContent?.includes('Finished'),
+          { timeout: 30_000 },
+        )
+        await clickText(page, 'Close', '[role="dialog"] button')
+        await page.waitForFunction(
+          () => document.querySelectorAll('[data-testid="key-active"]').length >= 2,
+          { timeout: 30_000 },
+        )
+      }
+      await page.evaluate(() => {
+        const row = document.querySelector('[data-testid="key-active"]')
+        const button = [...(row?.querySelectorAll('button') ?? [])].find((b) =>
+          /^revoke/i.test(b.textContent?.trim() ?? ''),
+        )
+        button?.click()
+      })
+      await dialogOpen(page)
+    },
+    close: cancel,
   },
   {
     name: 'restart instance dialog',

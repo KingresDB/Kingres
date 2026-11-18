@@ -54,6 +54,7 @@
 #include "planner.h"
 #include "recovery.h"
 #include "remote_scan.h"
+#include "row_router.h"
 #include "utility.h"
 
 PG_MODULE_MAGIC_EXT(
@@ -73,6 +74,10 @@ int			kingres_shard_control_call_timeout = 0;
 char	   *kingres_shard_node_conninfo = NULL;
 int			kingres_shard_recovery_interval = 30;
 bool		kingres_shard_enable_distributed_scan = true;
+bool		kingres_shard_enable_bulk_routing = true;
+bool		kingres_shard_enable_copy_routing = true;
+int			kingres_shard_insert_batch_rows = 1000;
+int			kingres_shard_insert_batch_bytes = 1048576;
 int			kingres_shard_move_catchup_threshold = 1024;	/* kB */
 int			kingres_shard_move_switch_timeout = 10000;	/* ms */
 int			kingres_shard_move_switch_attempts = 20;
@@ -206,6 +211,39 @@ _PG_init(void)
 							 PGC_USERSET, 0,
 							 NULL, NULL, NULL);
 
+	/* Bulk writes through the row router (design/shard-phase2b.md, sections 11 and 13). */
+	DefineCustomBoolVariable("kingres_shard.enable_bulk_routing",
+							 "Route an INSERT that goes to several shard groups through the row router.",
+							 "When off, such an INSERT is refused as in 2a: a multi-row INSERT, INSERT ... SELECT, and a single row whose key is not a constant.",
+							 &kingres_shard_enable_bulk_routing,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("kingres_shard.enable_copy_routing",
+							 "Route COPY ... FROM into a distributed table of several shard groups through the row router.",
+							 "When off, such a COPY is refused as in 2a.",
+							 &kingres_shard_enable_copy_routing,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomIntVariable("kingres_shard.insert_batch_rows",
+							"Rows per batch that the row router sends to one shard group.",
+							"A batch is sent when a group's buffer holds this many rows, or insert_batch_bytes bytes of text.",
+							&kingres_shard_insert_batch_rows,
+							1000, 1, 100000,
+							PGC_USERSET, 0,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("kingres_shard.insert_batch_bytes",
+							"Bytes of text per batch that the row router sends to one shard group.",
+							"The sum of the lengths of the values of the rows of a batch.  The memory of a bulk write is bounded by about two batches per group.",
+							&kingres_shard_insert_batch_bytes,
+							1048576, 16384, 67108864,
+							PGC_USERSET, GUC_UNIT_BYTE,
+							NULL, NULL, NULL);
+
 	/* Moving a bucket (design/shard-phase4.md, "Settings added"). */
 	DefineCustomIntVariable("kingres_shard.move_catchup_threshold",
 							"How close the copy of a bucket move must be to the source before the switch is attempted.",
@@ -284,6 +322,7 @@ _PG_init(void)
 	kingres_shard_planner_init();
 	kingres_shard_utility_init();
 	kingres_shard_remote_scan_init();
+	kingres_shard_row_router_init();
 }
 
 /*

@@ -16,7 +16,7 @@ SELECT name, setting, context FROM pg_settings WHERE name LIKE 'kingres_ledger.%
  kingres_ledger.allow_manual_write     | off     | superuser
  kingres_ledger.block_interval         | 0       | sighup
  kingres_ledger.enable_batch_delay     | 0       | superuser
- kingres_ledger.enable_credit_limit    | 1800000 | superuser
+ kingres_ledger.enable_credit_limit    | 60000   | superuser
  kingres_ledger.lock_hold_limit        | 60000   | superuser
  kingres_ledger.max_block_transactions | 100000  | superuser
  kingres_ledger.max_clock_skew         | 3600000 | superuser

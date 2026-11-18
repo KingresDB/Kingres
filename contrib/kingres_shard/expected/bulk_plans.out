@@ -1,0 +1,401 @@
+-- sql/bulk_plans.sql
+--   Step 3 and step 4 of phase 2b (design/shard-phase2b.md, 11.1, 11.3, 11.6, 13 and 16.1): which
+--   statements are planned as the row router, which stay on the paths of 2a, what the switches do,
+--   the settings, and the privilege matrix of INSERT and COPY FROM at the origin.
+--
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Portions Copyright (c) 2026, RooyeKhat Media Co
+--
+-- The cluster has a second shard group that does not exist as a server: the odd buckets belong to
+-- it (as in routing_decisions).  Nothing here is executed against it: the plans are shown, and every
+-- statement that would send a row is refused before it does (the checks of the origin).
+\set SHOW_CONTEXT never
+SET search_path = public;
+CREATE EXTENSION kingres_shard;
+SELECT kingres.init_cluster('localhost', current_setting('port')::int);
+ init_cluster 
+--------------
+ 
+(1 row)
+
+CREATE TABLE t (id int PRIMARY KEY, v text, n int DEFAULT 7, g int GENERATED ALWAYS AS (n * 2) STORED);
+CREATE TABLE r (k int PRIMARY KEY);
+CREATE TABLE plain (x int, y text);
+CREATE TABLE secret (id int, v text);
+CREATE FUNCTION bp_imm(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+SELECT kingres.create_distributed_table('t', 'id', bucket_count => 8);
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+SELECT kingres.create_reference_table('r');
+ create_reference_table 
+------------------------
+ 
+(1 row)
+
+-- the roles of the privilege matrix; grants are propagated, so they are made before the second group exists
+CREATE ROLE bp_writer;
+CREATE ROLE bp_cols;
+CREATE ROLE bp_reader;
+CREATE ROLE bp_none;
+GRANT USAGE ON SCHEMA public TO bp_writer, bp_cols, bp_reader, bp_none;
+GRANT INSERT, SELECT ON t TO bp_writer;
+GRANT INSERT (id, v) ON t TO bp_cols;
+GRANT SELECT ON t TO bp_reader;
+GRANT SELECT ON plain TO bp_writer, bp_cols, bp_reader, bp_none;
+INSERT INTO kingres.node (node_id, group_id, host, port, role)
+  VALUES (2, 1, '127.0.0.1', 1, 'primary');
+UPDATE kingres.bucket_map SET group_id = 1 WHERE bucket % 2 = 1;
+-- a key of a local bucket and of a remote bucket
+SELECT min(g) AS lk FROM generate_series(1, 100) g
+  WHERE kingres.bucket_for('t'::regclass, g) % 2 = 0 \gset
+SELECT min(g) AS rk FROM generate_series(1, 100) g
+  WHERE kingres.bucket_for('t'::regclass, g) % 2 = 1 \gset
+-- ---------------------------------------------------------------------------
+-- The plans
+-- ---------------------------------------------------------------------------
+\echo -- a multi-row VALUES, INSERT ... SELECT and a computed key are the row router
+-- a multi-row VALUES, INSERT ... SELECT and a computed key are the row router
+EXPLAIN (COSTS OFF) INSERT INTO t (id, v) VALUES (1, 'a'), (2, 'b');
+                                                    QUERY PLAN                                                     
+-------------------------------------------------------------------------------------------------------------------
+ Custom Scan (Kingres Row Router)
+   Target: public.t
+   Batch rows: 1000
+   Source: SELECT (column1)::integer AS id, (column2)::text AS v FROM (VALUES (1,'a'::text), (2,'b'::text)) ks_src
+(4 rows)
+
+EXPLAIN (COSTS OFF) INSERT INTO t (id, v) SELECT x, y FROM plain;
+                                                  QUERY PLAN                                                  
+--------------------------------------------------------------------------------------------------------------
+ Custom Scan (Kingres Row Router)
+   Target: public.t
+   Batch rows: 1000
+   Source: SELECT (x)::integer AS id, (y)::text AS v FROM ( SELECT plain.x, plain.y FROM public.plain) ks_src
+(4 rows)
+
+EXPLAIN (COSTS OFF) INSERT INTO t (id, v) SELECT g, 'x' FROM generate_series(1, 3) g;
+                                                            QUERY PLAN                                                            
+----------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (Kingres Row Router)
+   Target: public.t
+   Batch rows: 1000
+   Source: SELECT (g)::integer AS id, 'x'::text AS v FROM ( SELECT g.g, 'x' AS "?column?" FROM generate_series(1, 3) g(g)) ks_src
+(4 rows)
+
+EXPLAIN (COSTS OFF) INSERT INTO t (id, v) VALUES ((random() * 0)::int + 1, 'x');
+                                              QUERY PLAN                                               
+-------------------------------------------------------------------------------------------------------
+ Custom Scan (Kingres Row Router)
+   Target: public.t
+   Batch rows: 1000
+   Source: SELECT ((((random() * (0)::double precision))::integer + 1))::integer AS id, 'x'::text AS v
+(4 rows)
+
+EXPLAIN (COSTS OFF) INSERT INTO t (id, v) VALUES (1, 'a'), (2, 'b') ON CONFLICT DO NOTHING;
+                                                    QUERY PLAN                                                     
+-------------------------------------------------------------------------------------------------------------------
+ Custom Scan (Kingres Row Router)
+   Target: public.t
+   Batch rows: 1000
+   Conflict: ON CONFLICT DO NOTHING
+   Source: SELECT (column1)::integer AS id, (column2)::text AS v FROM (VALUES (1,'a'::text), (2,'b'::text)) ks_src
+(5 rows)
+
+EXPLAIN (COSTS OFF) INSERT INTO t (id, v) VALUES (1, 'a'), (2, 'b') ON CONFLICT (id) DO NOTHING RETURNING id, v;
+                                                    QUERY PLAN                                                     
+-------------------------------------------------------------------------------------------------------------------
+ Custom Scan (Kingres Row Router)
+   Target: public.t
+   Batch rows: 1000
+   Conflict: ON CONFLICT (id) DO NOTHING
+   Source: SELECT (column1)::integer AS id, (column2)::text AS v FROM (VALUES (1,'a'::text), (2,'b'::text)) ks_src
+(5 rows)
+
+\echo -- a single row with a constant key is not routed: the remote key is forwarded, the local one is local
+-- a single row with a constant key is not routed: the remote key is forwarded, the local one is local
+EXPLAIN (COSTS OFF) INSERT INTO t (id, v) VALUES (:rk, 'a');
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Custom Scan (Kingres Remote Statement)
+   Node: 127.0.0.1:1 (group 1, bucket 1)
+   Remote SQL: INSERT INTO public.t (id, v, n) VALUES (3, 'a'::text, 7)
+(3 rows)
+
+EXPLAIN (COSTS OFF) INSERT INTO t (id, v) VALUES (:lk, 'a');
+  QUERY PLAN  
+--------------
+ Insert on t
+   ->  Result
+(2 rows)
+
+\echo -- a statement that touches no distributed table is not changed
+-- a statement that touches no distributed table is not changed
+EXPLAIN (COSTS OFF) INSERT INTO plain VALUES (1, 'a'), (2, 'b');
+           QUERY PLAN            
+---------------------------------
+ Insert on plain
+   ->  Values Scan on "*VALUES*"
+(2 rows)
+
+\echo -- a write to a reference table is the fan-out of 2a
+-- a write to a reference table is the fan-out of 2a
+EXPLAIN (COSTS OFF) INSERT INTO r VALUES (1), (2);
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Custom Scan (Kingres Fan-out Write)
+   Nodes: 2
+   Result: reference table: copies must agree
+   Remote SQL: /* kingres:reference-write */ INSERT INTO public.r (k) VALUES (1), (2)
+(4 rows)
+
+\echo -- what the router does not take, each with its reason
+-- what the router does not take, each with its reason
+INSERT INTO t (id, v) VALUES (1, 'a'), (2, 'b') ON CONFLICT (id) DO UPDATE SET v = excluded.v;
+ERROR:  ON CONFLICT DO UPDATE is not supported yet for an INSERT that goes to several shard groups
+DETAIL:  The rows are sent to the groups in batches, and a second row for the same key could update the row of an earlier batch, where one statement raises "ON CONFLICT DO UPDATE command cannot affect row a second time".
+HINT:  A colocated INSERT ... SELECT is shipped whole and allows it; or use DO NOTHING.
+WITH x AS (SELECT 1 AS id) INSERT INTO t (id, v) SELECT id, 'a' FROM x;
+ERROR:  a WITH clause on an INSERT into a distributed table of several shard groups is not supported yet
+HINT:  Write the WITH clause inside the SELECT: INSERT INTO t WITH ... SELECT ...
+INSERT INTO t (id, v) VALUES (1, 'a'), (2, 'b') RETURNING id, (SELECT 1);
+ERROR:  the RETURNING list of this INSERT into a distributed table of several shard groups cannot be run by the shard groups
+DETAIL:  It uses a function, operator, type or collation that is not built in and immutable, or something that is not a plain expression.
+HINT:  Use only columns of the table and built-in immutable expressions in RETURNING list, or insert the rows one statement at a time.
+INSERT INTO t (id, v) VALUES (1, 'a'), (2, 'b') RETURNING old.id, new.id;
+ERROR:  RETURNING with OLD or NEW is not supported yet for an INSERT that goes to several shard groups
+INSERT INTO t (id, v) VALUES (1, 'a'), (2, 'b') ON CONFLICT (id) WHERE bp_imm(id) > 0 DO NOTHING;
+ERROR:  the inference clause of ON CONFLICT of this INSERT into a distributed table of several shard groups cannot be run by the shard groups
+DETAIL:  It uses a function, operator, type or collation that is not built in and immutable, or something that is not a plain expression.
+HINT:  Use only columns of the table and built-in immutable expressions in inference clause of ON CONFLICT, or insert the rows one statement at a time.
+INSERT INTO t (id, v) VALUES (1, 'a'), (2, 'b') ON CONFLICT (id) WHERE id > 0 DO NOTHING RETURNING bp_imm(id);
+ERROR:  the RETURNING list of this INSERT into a distributed table of several shard groups cannot be run by the shard groups
+DETAIL:  It uses a function, operator, type or collation that is not built in and immutable, or something that is not a plain expression.
+HINT:  Use only columns of the table and built-in immutable expressions in RETURNING list, or insert the rows one statement at a time.
+INSERT INTO t (id, g) VALUES (1, 1), (2, 2);
+ERROR:  cannot insert a non-DEFAULT value into column "g"
+DETAIL:  Column "g" is a generated column.
+\echo -- the switches: with enable_bulk_routing off the statements are refused as in 2a
+-- the switches: with enable_bulk_routing off the statements are refused as in 2a
+SET kingres_shard.enable_bulk_routing = off;
+EXPLAIN (COSTS OFF) INSERT INTO t (id, v) VALUES (1, 'a'), (2, 'b');
+ERROR:  statements that span shard groups are not supported yet
+HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
+INSERT INTO t (id, v) VALUES (1, 'a'), (2, 'b');
+ERROR:  statements that span shard groups are not supported yet
+HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
+INSERT INTO t (id, v) SELECT g, 'x' FROM generate_series(1, 3) g;
+ERROR:  statements that span shard groups are not supported yet
+HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
+INSERT INTO t (id, v) VALUES ((random() * 0)::int + 1, 'x');
+ERROR:  statements that span shard groups are not supported yet
+HINT:  Restrict every distributed table of the statement to one key, for example with WHERE id = <value> on table "t".
+-- statements that were never refused are not affected by the switch
+EXPLAIN (COSTS OFF) INSERT INTO t (id, v) VALUES (:rk, 'a');
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Custom Scan (Kingres Remote Statement)
+   Node: 127.0.0.1:1 (group 1, bucket 1)
+   Remote SQL: INSERT INTO public.t (id, v, n) VALUES (3, 'a'::text, 7)
+(3 rows)
+
+EXPLAIN (COSTS OFF) INSERT INTO t (id, v) VALUES (:lk, 'a');
+  QUERY PLAN  
+--------------
+ Insert on t
+   ->  Result
+(2 rows)
+
+RESET kingres_shard.enable_bulk_routing;
+-- ---------------------------------------------------------------------------
+-- The settings
+-- ---------------------------------------------------------------------------
+SELECT name, setting, unit, min_val, max_val, context
+  FROM pg_settings
+ WHERE name IN ('kingres_shard.enable_bulk_routing', 'kingres_shard.enable_copy_routing',
+                'kingres_shard.insert_batch_rows', 'kingres_shard.insert_batch_bytes')
+ ORDER BY name;
+               name                | setting | unit | min_val | max_val  | context 
+-----------------------------------+---------+------+---------+----------+---------
+ kingres_shard.enable_bulk_routing | on      |      |         |          | user
+ kingres_shard.enable_copy_routing | on      |      |         |          | user
+ kingres_shard.insert_batch_bytes  | 1048576 | B    | 16384   | 67108864 | user
+ kingres_shard.insert_batch_rows   | 1000    |      | 1       | 100000   | user
+(4 rows)
+
+SET kingres_shard.insert_batch_rows = 0;
+ERROR:  0 is outside the valid range for parameter "kingres_shard.insert_batch_rows" (1 .. 100000)
+SET kingres_shard.insert_batch_rows = 100001;
+ERROR:  100001 is outside the valid range for parameter "kingres_shard.insert_batch_rows" (1 .. 100000)
+SET kingres_shard.insert_batch_bytes = '8kB';
+ERROR:  8192 B is outside the valid range for parameter "kingres_shard.insert_batch_bytes" (16384 B .. 67108864 B)
+SET kingres_shard.insert_batch_bytes = '65MB';
+ERROR:  68157440 B is outside the valid range for parameter "kingres_shard.insert_batch_bytes" (16384 B .. 67108864 B)
+SET kingres_shard.insert_batch_rows = 100000;
+SET kingres_shard.insert_batch_bytes = '16kB';
+RESET kingres_shard.insert_batch_rows;
+RESET kingres_shard.insert_batch_bytes;
+-- ---------------------------------------------------------------------------
+-- COPY FROM: what is refused (before the data is read) and why
+-- ---------------------------------------------------------------------------
+COPY t (id, v) FROM STDIN (FREEZE);
+ERROR:  COPY FROM with FREEZE is not supported yet for a distributed table of several shard groups
+DETAIL:  Rows of a distributed table are written by the shard groups, which cannot freeze a table that this transaction did not create.
+HINT:  Load the rows with a plain COPY, or into a staging table first and move them with INSERT ... SELECT.
+COPY t (id, v) FROM STDIN WHERE id > 1;
+ERROR:  COPY FROM with WHERE is not supported yet for a distributed table of several shard groups
+DETAIL:  The filter is applied by CopyFrom, which the router does not call.
+HINT:  Load the rows with a plain COPY, or into a staging table first and move them with INSERT ... SELECT.
+COPY t (id, v) FROM STDIN (ON_ERROR ignore);
+ERROR:  COPY FROM with ON_ERROR is not supported yet for a distributed table of several shard groups
+DETAIL:  The handling of rows with errors is done by CopyFrom, which the router does not call.
+HINT:  Load the rows with a plain COPY, or into a staging table first and move them with INSERT ... SELECT.
+COPY t (id, v) FROM STDIN (ON_ERROR stop);
+ERROR:  COPY FROM with ON_ERROR is not supported yet for a distributed table of several shard groups
+DETAIL:  The handling of rows with errors is done by CopyFrom, which the router does not call.
+HINT:  Load the rows with a plain COPY, or into a staging table first and move them with INSERT ... SELECT.
+COPY t (id, v) FROM STDIN (REJECT_LIMIT 5, ON_ERROR ignore);
+ERROR:  COPY FROM with REJECT_LIMIT is not supported yet for a distributed table of several shard groups
+DETAIL:  The handling of rows with errors is done by CopyFrom, which the router does not call.
+HINT:  Load the rows with a plain COPY, or into a staging table first and move them with INSERT ... SELECT.
+COPY t (id, v) FROM STDIN (LOG_VERBOSITY verbose);
+ERROR:  COPY FROM with LOG_VERBOSITY is not supported yet for a distributed table of several shard groups
+DETAIL:  The handling of rows with errors is done by CopyFrom, which the router does not call.
+HINT:  Load the rows with a plain COPY, or into a staging table first and move them with INSERT ... SELECT.
+COPY t FROM STDIN (FORMAT csv, QUOTE 'ab');
+ERROR:  COPY quote must be a single one-byte character
+COPY t (id, g) FROM STDIN;
+ERROR:  column "g" is a generated column
+DETAIL:  Generated columns cannot be used in COPY.
+COPY r FROM STDIN;
+ERROR:  COPY FROM is not supported on reference tables yet
+DETAIL:  COPY FROM would write the rows to the partitions of this node only.
+HINT:  A superuser can run the statement on every node by hand with kingres_shard.enable_routing = off.
+COPY t_b0001 FROM STDIN;
+ERROR:  COPY FROM is not supported on distributed tables yet
+DETAIL:  COPY FROM would write the rows to the partitions of this node only.
+HINT:  A superuser can run the statement on every node by hand with kingres_shard.enable_routing = off.
+SET kingres_shard.enable_copy_routing = off;
+COPY t (id, v) FROM STDIN;
+ERROR:  COPY FROM is not supported on distributed tables yet
+DETAIL:  COPY FROM would write the rows to the partitions of this node only.
+HINT:  A superuser can run the statement on every node by hand with kingres_shard.enable_routing = off.
+RESET kingres_shard.enable_copy_routing;
+\echo -- COPY TO is not changed
+-- COPY TO is not changed
+COPY (SELECT 1) TO STDOUT;
+1
+-- ---------------------------------------------------------------------------
+-- The privilege matrix: the executor checks INSERT (and the columns) at the origin before the
+-- router sends anything, for INSERT and for COPY FROM
+-- ---------------------------------------------------------------------------
+\echo -- INSERT
+-- INSERT
+SET ROLE bp_writer;
+EXPLAIN (COSTS OFF) INSERT INTO t (id, v) VALUES (1, 'a'), (2, 'b');
+                                                    QUERY PLAN                                                     
+-------------------------------------------------------------------------------------------------------------------
+ Custom Scan (Kingres Row Router)
+   Target: public.t
+   Batch rows: 1000
+   Source: SELECT (column1)::integer AS id, (column2)::text AS v FROM (VALUES (1,'a'::text), (2,'b'::text)) ks_src
+(4 rows)
+
+EXPLAIN (COSTS OFF) INSERT INTO t (id, v) SELECT x, y FROM plain;
+                                                  QUERY PLAN                                                  
+--------------------------------------------------------------------------------------------------------------
+ Custom Scan (Kingres Row Router)
+   Target: public.t
+   Batch rows: 1000
+   Source: SELECT (x)::integer AS id, (y)::text AS v FROM ( SELECT plain.x, plain.y FROM public.plain) ks_src
+(4 rows)
+
+RESET ROLE;
+SET ROLE bp_cols;
+EXPLAIN (COSTS OFF) INSERT INTO t (id, v) VALUES (1, 'a'), (2, 'b');
+                                                    QUERY PLAN                                                     
+-------------------------------------------------------------------------------------------------------------------
+ Custom Scan (Kingres Row Router)
+   Target: public.t
+   Batch rows: 1000
+   Source: SELECT (column1)::integer AS id, (column2)::text AS v FROM (VALUES (1,'a'::text), (2,'b'::text)) ks_src
+(4 rows)
+
+EXPLAIN (COSTS OFF) INSERT INTO t (id, v, n) VALUES (1, 'a', 1), (2, 'b', 2);
+ERROR:  permission denied for table t
+EXPLAIN (COSTS OFF) INSERT INTO t (id, v) VALUES (1, 'a'), (2, 'b') RETURNING id;
+ERROR:  permission denied for table t
+RESET ROLE;
+SET ROLE bp_reader;
+EXPLAIN (COSTS OFF) INSERT INTO t (id, v) VALUES (1, 'a'), (2, 'b');
+ERROR:  permission denied for table t
+INSERT INTO t (id, v) VALUES (1, 'a'), (2, 'b');
+ERROR:  permission denied for table t
+INSERT INTO t (id, v) SELECT x, y FROM plain;
+ERROR:  permission denied for table t
+RESET ROLE;
+SET ROLE bp_none;
+INSERT INTO t (id, v) VALUES (1, 'a'), (2, 'b');
+ERROR:  permission denied for table t
+INSERT INTO t (id, v) SELECT x, y FROM plain;
+ERROR:  permission denied for table t
+RESET ROLE;
+-- a reader of the source who may not read it
+SET ROLE bp_writer;
+INSERT INTO t (id, v) SELECT id, v FROM secret;
+ERROR:  permission denied for table secret
+RESET ROLE;
+\echo -- COPY FROM
+-- COPY FROM
+SET ROLE bp_reader;
+COPY t (id, v) FROM STDIN;
+ERROR:  permission denied for table t
+RESET ROLE;
+SET ROLE bp_none;
+COPY t (id, v) FROM STDIN;
+ERROR:  permission denied for table t
+RESET ROLE;
+SET ROLE bp_cols;
+COPY t (id, v, n) FROM STDIN;
+ERROR:  permission denied for table t
+RESET ROLE;
+SET ROLE bp_writer;
+COPY t (id, v) FROM '/nonexistent/file';
+ERROR:  permission denied to COPY from a file
+DETAIL:  Only roles with privileges of the "pg_read_server_files" role may COPY from a file.
+HINT:  Anyone can COPY to stdout or from stdin. psql's \copy command also works for anyone.
+COPY t (id, v) FROM PROGRAM 'true';
+ERROR:  permission denied to COPY to or from an external program
+DETAIL:  Only roles with privileges of the "pg_execute_server_program" role may COPY to or from an external program.
+HINT:  Anyone can COPY to stdout or from stdin. psql's \copy command also works for anyone.
+RESET ROLE;
+-- read-only transactions
+BEGIN READ ONLY;
+INSERT INTO t (id, v) VALUES (1, 'a'), (2, 'b');
+ERROR:  cannot execute INSERT in a read-only transaction
+ROLLBACK;
+BEGIN READ ONLY;
+COPY t (id, v) FROM STDIN;
+ERROR:  cannot execute COPY FROM in a read-only transaction
+ROLLBACK;
+-- ---------------------------------------------------------------------------
+-- Clean up
+-- ---------------------------------------------------------------------------
+-- nothing that was refused left a row in the partitions of this node
+SET kingres_shard.enable_routing = off;
+SELECT count(*) AS rows_left FROM t;
+ rows_left 
+-----------
+         0
+(1 row)
+
+RESET kingres_shard.enable_routing;
+UPDATE kingres.bucket_map SET group_id = 0;
+DELETE FROM kingres.node WHERE node_id = 2;
+DROP TABLE t, r, plain, secret;
+DROP FUNCTION bp_imm(int);
+DROP OWNED BY bp_writer, bp_cols, bp_reader, bp_none;
+DROP ROLE bp_writer, bp_cols, bp_reader, bp_none;
+DROP EXTENSION kingres_shard;

@@ -595,9 +595,12 @@ COMMENT ON FUNCTION kingres.ledger_table_defects(oid, int) IS
 -- The signature policy of a table (0.3, part B)
 --------------------------------------------------------------------------
 -- The sixth and seventh columns of the registry (protect.c reads the fifth by
--- position).  The policy only goes from optional to required, and the
--- transaction that switched it is kept, so that ledger_verify asks for an
--- attestation only of the entries from then on.  Not covered by a hash.
+-- position).  The policy only goes from optional to required.
+-- signature_required_from is the largest transaction identifier that is not
+-- asked for an attestation (ledger_set_signature_policy reads it under the lock
+-- that orders the switch with the writers of the table: the identifier that the
+-- next transaction gets, less one), and ledger_verify asks for an attestation
+-- of the entries of the transactions above it.  Not covered by a hash.
 ALTER TABLE kingres.ledger_table ADD COLUMN signature_policy text NOT NULL DEFAULT 'optional';
 ALTER TABLE kingres.ledger_table ADD COLUMN signature_required_from bigint;
 ALTER TABLE kingres.ledger_table ADD CONSTRAINT ledger_table_signature_policy_check
@@ -2655,13 +2658,16 @@ BEGIN
      WHERE NOT EXISTS (SELECT 1 FROM kingres.ledger_entry e
                         WHERE e.ledger_txid = a.ledger_txid AND e.seq = a.seq);
     -- An entry of a table with the signature policy required that has no
-    -- attestation, for the transactions after the one that switched the policy
-    -- on: the entries before were written when attestations were not asked for
-    -- (and the ones of the switching transaction itself are tracked from the
-    -- switch on, by the commit check).  A
-    -- transaction that was already running when the policy was switched can
-    -- show up here once; the policy is not covered by a hash, so a superuser
-    -- who switched it off by editing the catalog is not seen (README).
+    -- attestation, for the transactions with an identifier above the date of the
+    -- switch (signature_required_from).  The switch waits for every open writer
+    -- of the table and the date is taken under the lock that it holds, so a
+    -- transaction that wrote the table and committed before the switch has a
+    -- lower identifier and is not asked for one.  A transaction that began
+    -- before the date and wrote the table after the switch has a lower
+    -- identifier too; it cannot commit without attestations (the check at
+    -- commit), and is not looked for here.  The policy is not covered by a
+    -- hash, so a superuser who switched it off by editing the catalog is not
+    -- seen (README).
     RETURN QUERY
     SELECT 'unattested_entry'::text,
            'tx ' || e.ledger_txid || ' seq ' || e.seq,

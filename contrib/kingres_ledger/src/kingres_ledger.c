@@ -61,8 +61,13 @@ int			kl_max_clock_skew = 3600000;
 /* GUC: how long a role that is not a superuser may hold a lock of the extension, in ms; 0 = no limit. */
 int			kl_lock_hold_limit = 60000;
 
-/* GUC: most time one transaction may add to the hold limit for ledger_enable, in ms; 0 = no bound. */
-int			kl_enable_credit_limit = 1800000;
+/*
+ * GUC: most time one transaction may add to the hold limit for ledger_enable, in ms;
+ * 0 = no bound.  The default is one more period of the hold limit (L21-06): a role
+ * that is not a superuser holds the registry's lock for two minutes at most with the
+ * defaults; a table that needs longer is entered by a superuser.
+ */
+int			kl_enable_credit_limit = 60000;
 
 /* GUC (developer, for the tests): ms that ledger_register_table waits after each batch. */
 int			kl_enable_batch_delay = 0;
@@ -145,9 +150,9 @@ _PG_init(void)
 
 	DefineCustomIntVariable("kingres_ledger.enable_credit_limit",
 							"The most time that ledger_enable may add to the hold limit of a role that is not a superuser in one transaction.",
-							"While ledger_enable enters the rows that a table holds, the time it spends is added to kingres_ledger.lock_hold_limit, so that a table of honest size is not ended by the limit; this is the most that one transaction may add, for all the tables it enters. A table that needs longer is enabled by a superuser. 0 means no bound. The setting cannot be changed by the role it limits.",
+							"While ledger_enable enters the rows that a table holds, the time it spends is added to kingres_ledger.lock_hold_limit, so that a table of honest size is not ended by the limit; this is the most that one transaction may add, for all the tables it enters (the default is one minute, so that the registry's lock is held for two minutes at most). A table that needs longer is enabled by a superuser. 0 means no bound. The setting cannot be changed by the role it limits.",
 							&kl_enable_credit_limit,
-							1800000,
+							60000,
 							0,
 							2147483647,
 							PGC_SUSET,

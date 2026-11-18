@@ -149,6 +149,12 @@ var Calls = map[string]Policy{
 
 	// Configuration from the console (phase 13): the leader reads and sets the parameters of every
 	// server; any server answers the clock probe.
+	// The signing keys of the ledger (internal-api.md, "The ledger keys"): the leader gives a holder the key file, takes
+	// it away, and asks which files a server has. The body of an install carries the file as the leader holds it.
+	"POST /ledger/key/install": LeaderOnly,
+	"POST /ledger/key/remove":  LeaderOnly,
+	"POST /ledger/key/list":    LeaderOnly,
+
 	"POST /config/state":   LeaderOnly,
 	"POST /config/apply":   LeaderOnly,
 	"POST /config/check":   LeaderOnly,
@@ -170,6 +176,7 @@ var handled = map[string]bool{
 	"GET /failover/position": true, "GET /liveness": true, "GET /failover/state": true, "POST /failover/freeze": true,
 	"POST /failover/unfreeze": true, "POST /failover/standbys-gone": true,
 	"POST /failover/lease": true, "POST /failover/demote": true, "POST /failover/promote": true, "POST /failover/prepared": true, "POST /standby/repoint": true,
+	"POST /ledger/key/install": true, "POST /ledger/key/remove": true, "POST /ledger/key/list": true,
 	"POST /config/state": true, "POST /config/apply": true, "POST /config/check": true, "POST /config/restart": true, "GET /time": true,
 }
 

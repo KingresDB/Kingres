@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: KingresDB Management API
-  version: 0.10.0
+  version: 0.11.0
   summary: REST API of the KingresDB management panel, CLI and manager.
   description: |
     The single REST API served by `kingresd` on every KingresDB server. The web panel
@@ -3469,6 +3469,773 @@ paths:
         '422': { $ref: '#/components/responses/UnprocessableEntity' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
+  /ledger/settings:
+    get:
+      operationId: getLedgerSettings
+      summary: Get the cluster settings of ledger publication and anchoring
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        The cluster-wide settings of the ledger that the console changes: publication (enabled, origin prefix, public URL, interval) and anchoring (interval, how many anchored targets are the minimum, whether anchoring is required). `publication.originPrefixLocked` is true once a checkpoint exists: the prefix is part of every signed origin and cannot change then.
+      tags: [Ledger]
+      x-required-role: kingres_readonly
+      responses:
+        '200':
+          description: The settings.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LedgerSettingsCluster' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+    put:
+      operationId: updateLedgerSettings
+      summary: Change the cluster settings of ledger publication and anchoring
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        Every member is optional; a member that is absent is left as it is. Ranges: `publication.intervalSeconds` 10 to 3600, `anchor.intervalSeconds` 60 to 86400, `anchor.minimumAnchored` 1 to 8; a value outside its range is 400 `validation_failed`. 409 `origin_prefix_locked` when `originPrefix` is given a different value after a checkpoint exists. The answer is the settings after the change.
+      tags: [Ledger]
+      x-required-role: kingres_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LedgerSettingsUpdate' }
+      responses:
+        '200':
+          description: The settings after the change.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LedgerSettingsCluster' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /ledger/signing:
+    get:
+      operationId: getLedgerSigning
+      summary: Get the signing keys of the ledger
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        The cluster identifier, the signing mode, whether the key files are sealed with a passphrase, the servers that hold a copy of the private key (the manager leader and the candidates of the leader), every key with its state and dates, and the signed events of the key history (key added, retired, revoked). **No private key, seed or passphrase is ever part of the answer.** `backupAdvised` is true from the creation, rotation or revocation of a key until an operator says a backup was made. Before the first key exists `keys` is empty and `clusterId` is null.
+      tags: [Ledger]
+      x-required-role: kingres_readonly
+      responses:
+        '200':
+          description: The signing state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LedgerSigning' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /ledger/signing/keys:
+    post:
+      operationId: createLedgerSigningKey
+      summary: Create the first signing key, or rotate to a new one
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        The first key: `kingresd` generates it, stores it, distributes it to the holders and activates it (task `ledger.key.create`). Any later call is a planned rotation (task `ledger.key.rotate`): a new key is generated and distributed, the `key-added` event is signed by both keys, both keys sign for `overlapDays` (default 30), and then the old key is retired. `publicKey` is for the signing mode `command` only and is refused with 422 `unsupported_operation` in mode `file`. 409 `operation_in_progress` when a key task is running; 409 `signing_key_missing` for a rotation when no key is active. The task's subject is `ledgerKey` with the id `signing` (one key task at a time, cluster-wide).
+      tags: [Ledger]
+      x-required-role: kingres_admin
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateLedgerSigningKeyRequest' }
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedTask' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /ledger/signing/keys/{fingerprint}/retire:
+    parameters:
+      - name: fingerprint
+        in: path
+        required: true
+        description: Fingerprint of a signing key, 64 lower-case hexadecimal characters (the SHA-256 of the public key).
+        schema: { type: string, pattern: '^[0-9a-f]{64}$' }
+    post:
+      operationId: retireLedgerSigningKey
+      summary: Retire a signing key now
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        Ends the overlap of a rotation at once (task `ledger.key.retire`): the key stops signing, a `key-retired` event signed by another key records it, and its private file is deleted from every holder. A retired key's old checkpoints stay valid. 409 `last_signing_key` when no other key is active and in force; 404 for an unknown fingerprint; 409 `conflict` for a key that is not active; 409 `operation_in_progress` when another key task is running.
+      tags: [Ledger]
+      x-required-role: kingres_admin
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LedgerEmptyRequest' }
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedTask' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /ledger/signing/keys/{fingerprint}/revoke:
+    parameters:
+      - name: fingerprint
+        in: path
+        required: true
+        description: Fingerprint of a signing key, 64 lower-case hexadecimal characters (the SHA-256 of the public key).
+        schema: { type: string, pattern: '^[0-9a-f]{64}$' }
+    post:
+      operationId: revokeLedgerSigningKey
+      summary: Revoke a signing key (compromise)
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        For a key that was or may have been stolen (task `ledger.key.revoke`). `kingresd` publishes a `key-revoked` event signed by a different active key and deletes the private file from every holder. A signature of a revoked key is rejected by the verifier unless an anchor proves the statement older than `compromisedSince`. `confirm` must equal the fingerprint, otherwise 400 `validation_failed`. 404 for an unknown fingerprint; 409 `last_signing_key` when no other key is active and in force (create a key first); 409 `operation_in_progress`. An auditor whose only pinned key is revoked needs a new trust file out of band.
+      tags: [Ledger]
+      x-required-role: kingres_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RevokeLedgerSigningKeyRequest' }
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedTask' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /ledger/signing/trust-file:
+    get:
+      operationId: getLedgerTrustFile
+      summary: Download the trust file for kingres-verify
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        The public parts of the trust file of `kingres-verify` (origin prefix and the public keys with their standing), served as `application/json` with `Content-Disposition: attachment; filename="trust.json"`. It holds no secret. An auditor must compare the fingerprint with one obtained out of band: the file is not a source of first trust. 409 `signing_key_missing` when no key exists.
+      tags: [Ledger]
+      x-required-role: kingres_readonly
+      responses:
+        '200':
+          description: The trust file.
+          headers:
+            Content-Disposition:
+              description: attachment; filename="trust.json"
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LedgerTrustFile' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /ledger/publication:
+    get:
+      operationId: getLedgerPublication
+      summary: Get the state of the ledger publication
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        Whether publication is enabled, the listener (address, TLS, running), every published log with its size, state and last checkpoint time, and the last checks. Nothing is published before the collector exists; until then `logs` is empty.
+      tags: [Ledger]
+      x-required-role: kingres_readonly
+      responses:
+        '200':
+          description: The publication.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LedgerPublication' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /ledger/anchor-targets:
+    get:
+      operationId: listLedgerAnchorTargets
+      summary: List anchor targets
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        Every configured anchor target (WORM store, RFC 3161 authority, OpenTimestamps) with its non-secret configuration, whether credentials are set (never their value), its last test and the time of its newest anchor. Not paginated.
+      tags: [Ledger]
+      x-required-role: kingres_readonly
+      responses:
+        '200':
+          description: The targets.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LedgerAnchorTargetList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+    post:
+      operationId: createLedgerAnchorTarget
+      summary: Add an anchor target
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        Credentials are write-only: they are stored in a sealed file on the servers and never returned. 400 `validation_failed` for a configuration of the wrong shape; 409 `already_exists` for a name in use.
+      tags: [Ledger]
+      x-required-role: kingres_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LedgerAnchorTargetCreate' }
+      responses:
+        '201':
+          description: The target.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LedgerAnchorTarget' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /ledger/anchor-targets/{targetId}:
+    parameters:
+      - name: targetId
+        in: path
+        required: true
+        description: Identifier of an anchor target.
+        schema: { type: integer, format: int64, minimum: 1 }
+    get:
+      operationId: getLedgerAnchorTarget
+      summary: Get an anchor target
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        One target, as listed by `listLedgerAnchorTargets`. 404 for an unknown id.
+      tags: [Ledger]
+      x-required-role: kingres_readonly
+      responses:
+        '200':
+          description: The target.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LedgerAnchorTarget' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+    patch:
+      operationId: updateLedgerAnchorTarget
+      summary: Change an anchor target
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        Any of `name`, `enabled`, `config` and `credentials` (which replaces the stored credentials). The `kind` cannot change: 409 `immutable_field`. 400 `validation_failed`; 404; 409 `already_exists` for a name in use.
+      tags: [Ledger]
+      x-required-role: kingres_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LedgerAnchorTargetUpdate' }
+      responses:
+        '200':
+          description: The target after the change.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LedgerAnchorTarget' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+    delete:
+      operationId: deleteLedgerAnchorTarget
+      summary: Delete an anchor target
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        The anchor records of the target stay and name the target by its name. 404 for an unknown id.
+      tags: [Ledger]
+      x-required-role: kingres_admin
+      responses:
+        '204':
+          description: The target was deleted.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /ledger/anchor-targets/{targetId}/test:
+    parameters:
+      - name: targetId
+        in: path
+        required: true
+        description: Identifier of an anchor target.
+        schema: { type: integer, format: int64, minimum: 1 }
+    post:
+      operationId: testLedgerAnchorTarget
+      summary: Test an anchor target
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        Runs the named checks of the target now and synchronously. A failure of the remote side is a failed check in the result, not an HTTP error. 404 for an unknown id.
+      tags: [Ledger]
+      x-required-role: kingres_admin
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LedgerEmptyRequest' }
+      responses:
+        '200':
+          description: The result of the test.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LedgerAnchorTest' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /databases/{databaseName}/ledger/aggregate:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+    get:
+      operationId: getLedgerAggregate
+      summary: Get an aggregate checkpoint of a database
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        The aggregate of the chains of every shard group of the database at one size (the newest when `size` is absent): its signed checkpoint, the members with their heights and hashes, the anchors and the statement of what the aggregate proves. 404 for an unknown database or a size that was not published; 409 `ledger_not_published` when the database has no published aggregate.
+      tags: [Ledger]
+      x-required-role: kingres_readonly
+      parameters:
+        - name: size
+          in: query
+          required: false
+          description: Size of the aggregate log; the newest when absent.
+          schema: { type: integer, format: int64, minimum: 1 }
+      responses:
+        '200':
+          description: The aggregate.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LedgerAggregate' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /databases/{databaseName}/ledger/aggregates:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+    get:
+      operationId: listLedgerAggregates
+      summary: List the aggregate checkpoints of a database
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        A page of aggregates, newest first, without members. Cursor paging as for every large list. 404 for an unknown database.
+      tags: [Ledger]
+      x-required-role: kingres_readonly
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of aggregates.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LedgerAggregatePage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /databases/{databaseName}/ledger/anchors:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+    get:
+      operationId: listLedgerAnchors
+      summary: List the anchor records of a database
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        A page of anchor records, newest first, optionally of one target or one state. Cursor paging as for every large list. 404 for an unknown database.
+      tags: [Ledger]
+      x-required-role: kingres_readonly
+      parameters:
+        - name: targetId
+          in: query
+          required: false
+          description: Only the records of this target.
+          schema: { type: integer, format: int64, minimum: 1 }
+        - name: state
+          in: query
+          required: false
+          description: Only the records in this state.
+          schema: { $ref: '#/components/schemas/LedgerAnchorState' }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of anchor records.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LedgerAnchorPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+    post:
+      operationId: anchorLedgerNow
+      summary: Anchor the newest aggregate now
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        Creates the anchor records of the newest aggregate checkpoint for every enabled target without waiting for the interval, and answers 201 with the records (the submission itself is done by the anchoring job, so there is no task). 404 for an unknown database; 409 `ledger_not_published`; 409 `conflict` when no target is enabled.
+      tags: [Ledger]
+      x-required-role: kingres_ops
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LedgerEmptyRequest' }
+      responses:
+        '201':
+          description: The records that were created, one per enabled target.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LedgerAnchorList' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /databases/{databaseName}/ledger/anchors/{anchorId}/retry:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - name: anchorId
+        in: path
+        required: true
+        description: Identifier of an anchor record.
+        schema: { type: integer, format: int64, minimum: 1 }
+    post:
+      operationId: retryLedgerAnchor
+      summary: Retry a failed anchor record
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        Puts a record in state `failed` or `expired` back to `pending`. 404 for an unknown record; 409 `conflict` for a record in another state.
+      tags: [Ledger]
+      x-required-role: kingres_ops
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LedgerEmptyRequest' }
+      responses:
+        '200':
+          description: The record.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LedgerAnchor' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /databases/{databaseName}/ledger/anchors/{anchorId}/evidence:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - name: anchorId
+        in: path
+        required: true
+        description: Identifier of an anchor record.
+        schema: { type: integer, format: int64, minimum: 1 }
+    get:
+      operationId: downloadLedgerAnchor
+      summary: Download the evidence of an anchor
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        The evidence file of an anchored record in `json` (all kinds), `ots` (OpenTimestamps) or `tsr` (RFC 3161). 404 for an unknown record or one without evidence; 422 `unprocessable` for a format the kind does not have.
+      tags: [Ledger]
+      x-required-role: kingres_readonly
+      parameters:
+        - name: format
+          in: query
+          required: false
+          description: Format of the evidence file.
+          schema: { type: string, enum: [json, ots, tsr], default: json }
+      responses:
+        '200':
+          description: The evidence file.
+          content:
+            application/json:
+              schema: { type: object, description: The evidence document, additionalProperties: true }
+            application/octet-stream:
+              schema: { type: string, format: binary, description: The `.ots` or `.tsr` file. }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /databases/{databaseName}/ledger/bundles:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+    post:
+      operationId: createLedgerBundle
+      summary: Create a bundle for offline verification
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        Starts a task (`ledger.bundle.create`) that packs the tiles, checkpoints, anchors and, when asked, inclusion proofs into one archive for `kingres-verify`; the task's result names the bundle. 404 for an unknown database; 409 `ledger_not_published`.
+      tags: [Ledger]
+      x-required-role: kingres_ops
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LedgerBundleRequest' }
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedTask' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /databases/{databaseName}/ledger/bundles/{bundleId}:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - name: bundleId
+        in: path
+        required: true
+        description: Identifier of a bundle.
+        schema: { type: integer, format: int64, minimum: 1 }
+    get:
+      operationId: getLedgerBundle
+      summary: Download a bundle
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        The archive, kept for 24 hours. 404 for an unknown bundle; 410 for one whose time has passed.
+      tags: [Ledger]
+      x-required-role: kingres_ops
+      responses:
+        '200':
+          description: The bundle.
+          content:
+            application/gzip:
+              schema: { type: string, format: binary, description: The bundle archive. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /databases/{databaseName}/ledger/client-keys:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+    get:
+      operationId: listLedgerClientKeys
+      summary: List the registered client keys of a database
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        The keys clients registered to sign ledger entries. 404 for an unknown database; 422 `unsupported_operation` when `kingres_ledger` is older than 0.3.
+      tags: [Ledger]
+      x-required-role: kingres_readonly
+      responses:
+        '200':
+          description: The keys.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LedgerClientKeyList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+    post:
+      operationId: registerLedgerClientKey
+      summary: Register a client key
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        Registers a public Ed25519 key. 400 `validation_failed`; 404; 409 `already_exists`; 422 `unsupported_operation` for `kingres_ledger` older than 0.3 or a server without OpenSSL.
+      tags: [Ledger]
+      x-required-role: kingres_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterLedgerClientKeyRequest' }
+      responses:
+        '201':
+          description: The key.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LedgerClientKey' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /databases/{databaseName}/ledger/client-keys/{keyId}/revoke:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - name: keyId
+        in: path
+        required: true
+        description: Key id of a client key, 8 lower-case hexadecimal characters.
+        schema: { type: string, pattern: '^[0-9a-f]{8}$' }
+    post:
+      operationId: revokeLedgerClientKey
+      summary: Revoke a client key
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        A revoked key signs no further entry; entries it signed before stay valid. 404; 409 `conflict` when the key is already revoked.
+      tags: [Ledger]
+      x-required-role: kingres_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RevokeLedgerClientKeyRequest' }
+      responses:
+        '200':
+          description: The key.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LedgerClientKey' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/ledger/signature-policy:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - $ref: '#/components/parameters/SchemaName'
+      - $ref: '#/components/parameters/TableName'
+    put:
+      operationId: setTableSignaturePolicy
+      summary: Require client signatures for a ledger table
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        Sets the signature policy of a ledger table to `required`. It cannot go back. 404; 409 `conflict` when the policy is already `required`; 422 `unprocessable` when the table is not a ledger table; 422 `unsupported_operation` for `kingres_ledger` older than 0.3.
+      tags: [Ledger]
+      x-required-role: kingres_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SignaturePolicyRequest' }
+      responses:
+        '200':
+          description: The table.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Table' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /databases/{databaseName}/ledger/upgrade:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+    post:
+      operationId: upgradeLedgerExtension
+      summary: Upgrade the kingres_ledger extension of a database
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        Runs `ALTER EXTENSION kingres_ledger UPDATE` on every shard group of the database (task `ledger.upgrade`). A group that cannot be upgraded fails the task, whose error names the server. 404; 409 `operation_in_progress`.
+      tags: [Ledger]
+      x-required-role: kingres_admin
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LedgerEmptyRequest' }
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedTask' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /databases/{databaseName}/ledger/chains/{shardGroupId}/acknowledge:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - name: shardGroupId
+        in: path
+        required: true
+        description: Shard group whose chain is meant.
+        schema: { type: integer, format: int32, minimum: 0 }
+    post:
+      operationId: acknowledgeLedgerDivergence
+      summary: Acknowledge a diverged chain and start a new epoch
+      description: |
+        Added in 0.11.0 (ledger phase 7). Until the server version implements it, the answer is 422 `unsupported_operation`.
+        After a restore or a loss at failover the chain of a shard group no longer extends its published log. The operator states what happened and the task `ledger.epoch.start` closes the old epoch and opens a new log. `confirm` must equal the database name (400 `validation_failed` otherwise). 404; 409 `chain_not_diverged` when the chain is not diverged.
+      tags: [Ledger]
+      x-required-role: kingres_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AcknowledgeLedgerDivergenceRequest' }
+      responses:
+        '202': { $ref: '#/components/responses/AcceptedTask' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
   /alerts:
     get:
       operationId: listAlerts
@@ -4042,6 +4809,8 @@ components:
         `server_hosts_map_group`, `last_server` (`removeServer`, `leaveCluster`), `server_group_not_empty`
         (`deleteServerGroup`), `ledger_entry_pending` (`createInclusionProof`).
 
+        Added in 0.11.0 (409, ledger phase 7): `ledger_not_published` (the database has no published aggregate: `getLedgerAggregate`, `anchorLedgerNow`, `createLedgerBundle`), `origin_prefix_locked` (`updateLedgerSettings`: a checkpoint exists, the prefix cannot change), `signing_key_missing` (`createLedgerSigningKey` for a rotation when no key is active; `getLedgerTrustFile` when no key exists), `last_signing_key` (`retireLedgerSigningKey`, `revokeLedgerSigningKey`: no other key is active and in force) and `chain_not_diverged` (`acknowledgeLedgerDivergence`). Clients must tolerate codes they do not know.
+
         Added in 0.9.0 (409, rebalancing): `nothing_to_rebalance` (`startRebalance`: the plan is empty),
         `rebalance_not_running` (`stopRebalance`), `cluster_inconsistent` (`kingres.check_cluster()` reports something that
         makes moving buckets unsafe), `version_mismatch` (the servers do not run the same version of the sharding
@@ -4133,6 +4902,11 @@ components:
         - no_receiving_server
         - failover_needs_decision
         - lease_settings_differ
+        - ledger_not_published
+        - origin_prefix_locked
+        - signing_key_missing
+        - last_signing_key
+        - chain_not_diverged
     ValidationIssue:
       type: object
       description: One invalid field of a request.
@@ -7193,7 +7967,7 @@ components:
       type: string
       description: |
         Kind of task. Each kind has one fixed `subject.type`; the table is in the README
-        (section "Task kinds and subjects"). `standby.reconcile` is added in 0.7.0.
+        (section "Task kinds and subjects"). `standby.reconcile` is added in 0.7.0; the `ledger.key.*`, `ledger.bundle.create`, `ledger.epoch.start` and `ledger.upgrade` kinds in 0.11.0.
       enum:
         - cluster.init
         - cluster.join
@@ -7218,6 +7992,14 @@ components:
         - standby.reconcile
         - config.apply
         - config.restart
+        - ledger.key.create
+        - ledger.key.rotate
+        - ledger.key.retire
+        - ledger.key.revoke
+        - ledger.key.distribute
+        - ledger.bundle.create
+        - ledger.epoch.start
+        - ledger.upgrade
     TaskStep:
       type: object
       description: One step of a task.
@@ -7310,14 +8092,14 @@ components:
       properties:
         type:
           type: string
-          enum: [cluster, server, instance, database, table, rebalance, replication, ledgerVerification, networkAccess, config]
+          enum: [cluster, server, instance, database, table, rebalance, replication, ledgerVerification, networkAccess, config, ledgerKey]
           description: Resource type.
         id:
           type: string
           description: |
             Resource identifier: database name; server id (`ServerId`); instance id (`node_id`) as a decimal
             string; `database/schema.table` for a table; the verification id; the task id for a rebalance;
-            the literal `cluster`, `preferred-primaries` or `network-access` for the singleton subjects.
+            the literal `cluster`, `preferred-primaries`, `network-access` or (0.11.0, type `ledgerKey`) `signing` for the singleton subjects.
             See the README table "Task kinds and subjects".
     Task:
       type: object
@@ -7810,6 +8592,22 @@ components:
         - failoverGroupPromoted
         - failoverGroupFailed
         - oldPrimaryRebuilt
+        - updateLedgerSettings
+        - createLedgerSigningKey
+        - retireLedgerSigningKey
+        - revokeLedgerSigningKey
+        - createLedgerAnchorTarget
+        - updateLedgerAnchorTarget
+        - deleteLedgerAnchorTarget
+        - testLedgerAnchorTarget
+        - anchorLedgerNow
+        - retryLedgerAnchor
+        - createLedgerBundle
+        - registerLedgerClientKey
+        - revokeLedgerClientKey
+        - setTableSignaturePolicy
+        - upgradeLedgerExtension
+        - acknowledgeLedgerDivergence
     AuditEvent:
       type: object
       description: One audit log entry.
@@ -8636,6 +9434,22 @@ components:
           type: array
           description: Added in 0.7.0, optional. The shard groups whose chains are not in `chains`; empty when `complete`.
           items: { type: integer, format: int32, minimum: 0 }
+        publication:
+          type: object
+          description: Added in 0.11.0, optional. Publication of this database's logs.
+          required: [enabled, lastCheckpointAt, state]
+          properties:
+            enabled: { type: boolean, description: Whether publication is enabled. }
+            lastCheckpointAt: { type: [string, 'null'], format: date-time, description: When the newest checkpoint was signed. }
+            state: { type: string, description: 'One of `off`, `ok`, `behind`, `diverged`. Clients must tolerate values they do not know.' }
+        anchoring:
+          type: object
+          description: Added in 0.11.0, optional. Anchoring of this database's aggregate.
+          required: [targets, newestAnchoredAt, state]
+          properties:
+            targets: { type: integer, minimum: 0, description: Enabled targets. }
+            newestAnchoredAt: { type: [string, 'null'], format: date-time, description: Evidence time of the newest anchored aggregate. }
+            state: { type: string, enum: [none, ok, behind, failed], description: State of the anchoring. }
     LedgerStatusList:
       type: object
       description: Ledger status of all ledger-enabled databases.
@@ -8682,7 +9496,7 @@ components:
           description: Transactions in the block.
         signed:
           type: boolean
-          description: Whether the block carries a server signature.
+          description: Redefined in 0.11.0. True when the block is covered by a signed checkpoint of its chain log, that is when the size of the newest signed checkpoint is greater than the height. Before 0.11.0 it was always false (no server signature existed). A block is not signed by itself; a checkpoint signs a size and a root.
     LedgerBlockPage:
       type: object
       description: A page of blocks.
@@ -8788,6 +9602,12 @@ components:
             - $ref: '#/components/schemas/Sha256Hex'
             - type: 'null'
           description: Merkle root over the chain heads for a sharded database; null otherwise.
+        aggregateSize:
+          type:
+            - integer
+            - 'null'
+          format: int64
+          description: Added in 0.11.0, optional. The size of the aggregate log this digest belongs to; null until the aggregate exists.
         anchors:
           type: array
           description: Anchoring destinations; empty until anchoring is configured.
@@ -8828,6 +9648,11 @@ components:
             - 'null'
           format: int64
           description: Digest to verify against; null uses the latest digest.
+        checks:
+          type: array
+          description: 'Added in 0.11.0, optional. What to check: `chain` (the chain itself, the default), `publication` (re-read the chains from block 0, compare with the published leaves and verify the stored checkpoints) and `anchors`. A server that does not implement a check answers 422 `unsupported_operation` for it.'
+          items: { type: string, enum: [chain, publication, anchors], description: A check. }
+          uniqueItems: true
     LedgerInconsistency:
       type: object
       description: A discrepancy found by a verification.
@@ -9238,10 +10063,551 @@ components:
       type: string
       description: Alert state.
       enum: [open, acknowledged, resolved]
+    # ------------------------------------------------------------------ ledger phase 7 (0.11.0)
+    LedgerEmptyRequest:
+      type: object
+      description: Added in 0.11.0. The body of an operation that takes no input. An empty object or no body at all is accepted.
+      additionalProperties: false
+      properties: {}
+    LedgerSettingsCluster:
+      type: object
+      description: Added in 0.11.0. The cluster settings of ledger publication and anchoring (design of phase 7, section 8.4).
+      required: [publication, anchor]
+      properties:
+        publication:
+          type: object
+          description: Publication of the signed logs.
+          required: [enabled, originPrefix, publicUrl, intervalSeconds, originPrefixLocked]
+          properties:
+            enabled:
+              type: boolean
+              description: Whether the logs are published. Off by default.
+            originPrefix:
+              type: string
+              description: The name under which every signature of the cluster is made (no scheme, no trailing slash, at most 160 bytes). The default is chosen by `kingresd` and should be confirmed by the operator.
+            publicUrl:
+              type:
+                - string
+                - 'null'
+              description: Where the publication is reachable from outside, for the links the console shows; null when not set.
+            intervalSeconds:
+              type: integer
+              minimum: 10
+              maximum: 3600
+              description: How often the logs are extended and checkpoints are signed.
+            originPrefixLocked:
+              type: boolean
+              description: True once a checkpoint was signed; the prefix cannot change then.
+        anchor:
+          type: object
+          description: Anchoring of aggregate checkpoints.
+          required: [intervalSeconds, minimumAnchored, required]
+          properties:
+            intervalSeconds:
+              type: integer
+              minimum: 60
+              maximum: 86400
+              description: How often the newest aggregate checkpoint is submitted to the targets.
+            minimumAnchored:
+              type: integer
+              minimum: 1
+              maximum: 8
+              description: How many targets must have anchored a checkpoint before it counts as anchored.
+            required:
+              type: boolean
+              description: When true, the absence of anchors raises the alert `ledgerNotAnchored` as a warning instead of info. Nothing is blocked either way.
+    LedgerSettingsUpdate:
+      type: object
+      description: Added in 0.11.0. The same shape as `LedgerSettingsCluster`; every member is optional and a member that is absent is left as it is. `originPrefixLocked` is read-only and ignored.
+      properties:
+        publication:
+          type: object
+          description: Publication settings to change.
+          properties:
+            enabled: { type: boolean, description: Whether the logs are published. }
+            originPrefix: { type: string, minLength: 1, maxLength: 160, description: The origin prefix; refused with 409 `origin_prefix_locked` once a checkpoint exists. }
+            publicUrl:
+              type:
+                - string
+                - 'null'
+              maxLength: 1024
+              description: The public URL; null clears it.
+            intervalSeconds: { type: integer, minimum: 10, maximum: 3600, description: Publication interval in seconds. }
+        anchor:
+          type: object
+          description: Anchoring settings to change.
+          properties:
+            intervalSeconds: { type: integer, minimum: 60, maximum: 86400, description: Anchoring interval in seconds. }
+            minimumAnchored: { type: integer, minimum: 1, maximum: 8, description: Minimum number of anchored targets. }
+            required: { type: boolean, description: Whether the absence of anchors is a warning. }
+    LedgerSigningKeyState:
+      type: string
+      description: Added in 0.11.0. State of a signing key. `next` was generated and does not sign yet, `active` signs (two keys are active during the overlap of a rotation), `retired` signs nothing more and its old signatures stay valid, `revoked` is compromised.
+      enum: [next, active, retired, revoked]
+    LedgerSigningKey:
+      type: object
+      description: Added in 0.11.0. A signing key. Only public information; the private key never leaves the servers that hold it.
+      required: [fingerprint, publicKey, state, createdAt, activatedAt, retiredAt, revokedAt, compromisedSince]
+      properties:
+        fingerprint:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: SHA-256 of the public key, lower-case hexadecimal. The console shows it in groups of four characters; an auditor compares it with the value obtained out of band.
+        publicKey:
+          type: string
+          description: The 32-byte Ed25519 public key, standard base64 with padding.
+        state:
+          $ref: '#/components/schemas/LedgerSigningKeyState'
+        createdAt:
+          type: string
+          format: date-time
+          description: When the key was created.
+        activatedAt:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: When the key came (or comes) into force; null while `next`.
+        retiredAt:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: When the key was retired; null otherwise.
+        revokedAt:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: When the key was revoked; null otherwise.
+        compromisedSince:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: The time since which a revoked key is considered compromised, as the operator stated it; null otherwise.
+        maxTreeSize:
+          type:
+            - integer
+            - 'null'
+          format: int64
+          description: Optional. For a retired key, the largest tree size it may still sign (the `max_tree_size` of the trust file); null when unbounded or not retired.
+    LedgerSigningEvent:
+      type: object
+      description: Added in 0.11.0. One signed event of the key history, in the order of `seq` (numbered from 0 without gaps).
+      required: [seq, type, time]
+      properties:
+        seq:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Sequence number of the event.
+        type:
+          type: string
+          description: '`key-added`, `key-retired` or `key-revoked` (later steps add `epoch-closed`, `chain-retired` and `group-removed`). Clients must tolerate values they do not know.'
+        time:
+          type: string
+          format: date-time
+          description: When the event was made, whole seconds.
+    LedgerSigning:
+      type: object
+      description: |
+        Added in 0.11.0. The signing state of the ledger. It holds no secret: no seed, no private key and no
+        passphrase is ever part of it.
+      required: [clusterId, mode, passphraseProtected, holders, keys, events]
+      properties:
+        clusterId:
+          type:
+            - string
+            - 'null'
+          pattern: '^[0-9a-f]{64}$'
+          description: The public cluster identifier (32 random bytes, hexadecimal), created with the first key; null before.
+        mode:
+          type: string
+          enum: [file, command]
+          description: Where the private key lives. `file` is the key file on the holders; `command` is an external signer (a later step).
+        passphraseProtected:
+          type: boolean
+          description: Whether this server's key files are sealed with a passphrase. When false the key is clear text on disk, as `ca.key` is, and the console says so.
+        holders:
+          type: array
+          description: The servers that hold a copy of the private key (the manager leader and the candidates of the leader). A server that is not a holder never has the file.
+          items: { $ref: '#/components/schemas/ServerId' }
+        keys:
+          type: array
+          description: Every key of the set, oldest first.
+          items: { $ref: '#/components/schemas/LedgerSigningKey' }
+        events:
+          type: array
+          description: The signed events of the key history, oldest first.
+          items: { $ref: '#/components/schemas/LedgerSigningEvent' }
+        backupAdvised:
+          type: boolean
+          description: Optional. True from the creation, rotation or revocation of a key until the operator confirms that a backup of the key directory was made. A reminder, not a proof.
+        discontinuity:
+          type: boolean
+          description: Optional. True when the key ring was replaced after the loss of every key (auditors then need a new trust file out of band).
+        signerAlarm:
+          type:
+            - string
+            - 'null'
+          description: Optional. Why this server does not sign, in words, when the stored key set is damaged or not in force; null when it can sign. Never contains a secret.
+    CreateLedgerSigningKeyRequest:
+      type: object
+      description: Added in 0.11.0. Options of the creation or rotation of a signing key.
+      additionalProperties: false
+      properties:
+        overlapDays:
+          type: integer
+          minimum: 1
+          maximum: 365
+          default: 30
+          description: For a rotation, how many days both keys sign.
+        publicKey:
+          type: string
+          description: The public key of an external signer, standard base64 of 32 bytes. Only for the signing mode `command`; refused with 422 `unsupported_operation` in mode `file`.
+        backupMade:
+          type: boolean
+          description: Optional. The operator states that a backup of the key directory was made; clears `backupAdvised`. Not a proof.
+    RevokeLedgerSigningKeyRequest:
+      type: object
+      description: Added in 0.11.0. What the operator states when a signing key is revoked.
+      required: [compromisedSince, reason, confirm]
+      additionalProperties: false
+      properties:
+        compromisedSince:
+          type: string
+          format: date-time
+          description: The time since which the key is considered compromised. An earlier time is the safe direction. Never later than now.
+        reason:
+          type: string
+          maxLength: 200
+          description: Free text of at most 200 bytes of printable ASCII, published in the event.
+        confirm:
+          type: string
+          description: Must equal the fingerprint of the key; any other value is 400 `validation_failed`.
+    LedgerTrustFile:
+      type: object
+      description: |
+        Added in 0.11.0. The public parts of the trust file of `kingres-verify` (design of phase 7, section 7.2), the
+        same bytes the verifier reads. The file is not a source of first trust: an auditor compares the fingerprint
+        with one obtained out of band.
+      required: [format, origin_prefix, keys, tsa_roots, client_keys, witnesses]
+      properties:
+        format: { type: integer, description: Format of the file; 1. }
+        origin_prefix: { type: string, description: The origin prefix of the cluster. }
+        keys:
+          type: array
+          description: The public keys with their standing.
+          items:
+            type: object
+            description: One key of the trust file.
+            required: [name, public_key, fingerprint, not_before, not_after, revoked, max_tree_size]
+            properties:
+              name: { type: string, description: A label only. }
+              public_key: { type: string, description: Standard base64 of the 32-byte key. }
+              fingerprint: { type: string, description: SHA-256 of the key, hexadecimal. }
+              not_before: { type: [string, 'null'], format: date-time, description: When the key may start to sign. }
+              not_after: { type: [string, 'null'], format: date-time, description: Never set by `kingresd` (a retired key's old checkpoints stay valid). }
+              revoked: { type: boolean, description: True for a revoked key. }
+              max_tree_size: { type: [integer, 'null'], format: int64, description: The largest tree size a retired key may sign; null when unbounded. }
+        tsa_roots:
+          type: array
+          description: Roots of time-stamp authorities (a later step).
+          items: { type: string, description: A PEM certificate. }
+        client_keys:
+          type: array
+          description: Client keys (a later step).
+          items: { type: object, description: A client key entry., additionalProperties: true }
+        witnesses:
+          type: array
+          description: Witnesses (none yet).
+          items: { type: object, description: A witness entry., additionalProperties: true }
+    LedgerPublicationLog:
+      type: object
+      description: Added in 0.11.0. One published log.
+      required: [kind, origin, size, lastCheckpointAt, state]
+      properties:
+        kind: { type: string, enum: [chain, aggregate], description: A chain log (one per shard group and epoch) or an aggregate log (one per database). }
+        origin: { type: string, description: The origin of the log. }
+        size: { type: integer, format: int64, minimum: 0, description: Size of the log. }
+        lastCheckpointAt:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: When the newest checkpoint was signed; null when none was.
+        state: { type: string, enum: [active, diverged, closed], description: State of the log. }
+    LedgerPublication:
+      type: object
+      description: Added in 0.11.0. The state of the ledger publication.
+      required: [enabled, listener, logs, lastCheckpointAt, checks]
+      properties:
+        enabled: { type: boolean, description: Whether publication is enabled. }
+        listener:
+          type: object
+          description: The HTTP listener that serves the publication.
+          required: [address, tls, running]
+          properties:
+            address: { type: [string, 'null'], description: Listen address; null when no listener is configured. }
+            tls: { type: boolean, description: Whether the listener uses TLS (plain HTTP is a warning). }
+            running: { type: boolean, description: Whether it runs. }
+        logs:
+          type: array
+          description: The published logs.
+          items: { $ref: '#/components/schemas/LedgerPublicationLog' }
+        lastCheckpointAt:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: When the newest checkpoint of any log was signed.
+        checks:
+          type: object
+          description: The last checks of the publication (what the audit job found); members are added by later steps.
+          additionalProperties: true
+    LedgerAnchorKind:
+      type: string
+      description: Added in 0.11.0. Kind of an anchor target. `worm` is an S3 Object Lock store, `tsa` an RFC 3161 time-stamp authority, `ots` OpenTimestamps.
+      enum: [worm, tsa, ots]
+    LedgerAnchorState:
+      type: string
+      description: Added in 0.11.0. State of an anchor record. `pending` waits to be submitted, `submitted` was accepted and is not final, `anchored` is final, `failed` needs a person, `superseded` was replaced by a newer checkpoint, `expired` was never confirmed in time.
+      enum: [pending, submitted, anchored, failed, superseded, expired]
+    LedgerAnchorTarget:
+      type: object
+      description: Added in 0.11.0. An anchor target. Credentials are write-only and never part of it.
+      required: [id, kind, name, enabled, config, credentialsSet, lastTest, newestAnchoredAt, state]
+      properties:
+        id: { type: integer, format: int64, minimum: 1, description: Identifier. }
+        kind: { $ref: '#/components/schemas/LedgerAnchorKind' }
+        name: { type: string, minLength: 1, maxLength: 63, description: A unique name. }
+        enabled: { type: boolean, description: Whether the target is used. }
+        config: { type: object, additionalProperties: true, description: The non-secret configuration; its shape depends on `kind`. }
+        credentialsSet: { type: boolean, description: Whether credentials are stored. Their value is never returned. }
+        lastTest:
+          oneOf:
+            - $ref: '#/components/schemas/LedgerAnchorTest'
+            - type: 'null'
+          description: The result of the last test; null when never tested.
+        newestAnchoredAt:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: Evidence time of the newest anchor of this target; null when none.
+        state: { type: string, enum: [none, ok, behind, failed], description: The state of the target as the alerts see it. }
+    LedgerAnchorTargetList:
+      type: object
+      description: Added in 0.11.0. The anchor targets.
+      required: [items]
+      properties:
+        items:
+          type: array
+          description: The targets.
+          items: { $ref: '#/components/schemas/LedgerAnchorTarget' }
+    LedgerAnchorTargetCreate:
+      type: object
+      description: Added in 0.11.0. A new anchor target.
+      required: [kind, name, config]
+      additionalProperties: false
+      properties:
+        kind: { $ref: '#/components/schemas/LedgerAnchorKind' }
+        name: { type: string, minLength: 1, maxLength: 63, description: A unique name. }
+        enabled: { type: boolean, default: false, description: Whether the target is used. }
+        config: { type: object, additionalProperties: true, description: The non-secret configuration; its shape depends on `kind`. }
+        credentials: { type: object, additionalProperties: true, description: Write-only credentials; stored in a sealed file and never returned or logged. }
+    LedgerAnchorTargetUpdate:
+      type: object
+      description: Added in 0.11.0. Changes to an anchor target; every member is optional. `kind` cannot change (409 `immutable_field`).
+      additionalProperties: false
+      properties:
+        kind: { $ref: '#/components/schemas/LedgerAnchorKind' }
+        name: { type: string, minLength: 1, maxLength: 63, description: The new name. }
+        enabled: { type: boolean, description: Whether the target is used. }
+        config: { type: object, additionalProperties: true, description: The new non-secret configuration. }
+        credentials: { type: object, additionalProperties: true, description: New credentials, which replace the stored ones. Write-only. }
+    LedgerAnchorTest:
+      type: object
+      description: Added in 0.11.0. The result of the test of an anchor target.
+      required: [checks, ok]
+      properties:
+        checks:
+          type: array
+          description: The named checks.
+          items:
+            type: object
+            description: One check.
+            required: [name, status, detail]
+            properties:
+              name: { type: string, description: Name of the check. }
+              status: { type: string, enum: [ok, warning, failed], description: Result. }
+              detail: { type: string, description: What was found; never contains a credential. }
+        ok: { type: boolean, description: True when no check failed. }
+        testedAt:
+          type: string
+          format: date-time
+          description: Optional. When the test ran.
+    LedgerAggregateMember:
+      type: object
+      description: Added in 0.11.0. One chain in an aggregate.
+      required: [shardGroupId, chainId, epoch, height, blockHash, logRoot, flags]
+      properties:
+        shardGroupId: { type: integer, format: int32, minimum: 0, description: Shard group. }
+        chainId: { type: string, description: Public chain identifier, 64 hexadecimal characters. }
+        epoch: { type: integer, minimum: 1, description: Epoch of the chain log. }
+        height: { type: integer, format: int64, minimum: 0, description: Head block height. }
+        blockHash: { $ref: '#/components/schemas/Sha256Hex' }
+        logRoot: { type: string, description: Root of the chain log, hexadecimal. }
+        flags: { type: array, items: { type: string, description: 'stale, diverged or retired.' }, description: Flags of the member. }
+    LedgerAggregateSummary:
+      type: object
+      description: Added in 0.11.0. An aggregate checkpoint without its members.
+      required: [size, root, checkpoint, generatedAt, complete, uncoveredShardGroupIds]
+      properties:
+        size: { type: integer, format: int64, minimum: 1, description: Size of the aggregate log. }
+        root: { type: string, description: Root of the aggregate log, hexadecimal. }
+        checkpoint: { type: string, description: The signed checkpoint (a signed note). }
+        generatedAt: { type: string, format: date-time, description: When the aggregate entry was made. }
+        complete: { type: boolean, description: True when every shard group of the database is covered. }
+        uncoveredShardGroupIds: { type: array, items: { type: integer, format: int32, minimum: 0 }, description: Shard groups that are not covered. }
+    LedgerAggregate:
+      description: Added in 0.11.0. An aggregate checkpoint with its members, its anchors and the statement of what it proves.
+      allOf:
+        - $ref: '#/components/schemas/LedgerAggregateSummary'
+        - type: object
+          description: The members and the anchors.
+          required: [members, anchors, statement]
+          properties:
+            members:
+              type: array
+              description: The chains covered.
+              items: { $ref: '#/components/schemas/LedgerAggregateMember' }
+            anchors:
+              type: array
+              description: The anchor records of this checkpoint.
+              items: { $ref: '#/components/schemas/LedgerAnchor' }
+            statement: { type: string, description: The text of what the aggregate proves and does not prove. }
+    LedgerAggregatePage:
+      type: object
+      description: Added in 0.11.0. A page of aggregates, newest first.
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          description: The aggregates without members.
+          items: { $ref: '#/components/schemas/LedgerAggregateSummary' }
+        nextCursor:
+          $ref: '#/components/schemas/NextCursor'
+    LedgerAnchor:
+      type: object
+      description: Added in 0.11.0. An anchor record of an aggregate checkpoint at one target.
+      required: [id, targetId, targetName, kind, aggregateSize, state, attempts, nextAttemptAt, anchoredAt, evidenceTime, lastError]
+      properties:
+        id: { type: integer, format: int64, minimum: 1, description: Identifier. }
+        targetId:
+          type:
+            - integer
+            - 'null'
+          format: int64
+          description: The target; null after the target was deleted.
+        targetName: { type: string, description: Name of the target (kept after it is deleted). }
+        kind: { $ref: '#/components/schemas/LedgerAnchorKind' }
+        aggregateSize: { type: integer, format: int64, minimum: 1, description: Size of the anchored aggregate checkpoint. }
+        state: { $ref: '#/components/schemas/LedgerAnchorState' }
+        attempts: { type: integer, minimum: 0, description: Attempts so far. }
+        nextAttemptAt: { type: [string, 'null'], format: date-time, description: When the next attempt is due. }
+        anchoredAt: { type: [string, 'null'], format: date-time, description: When the record became anchored. }
+        evidenceTime: { type: [string, 'null'], format: date-time, description: The time the target vouches for, when known. }
+        lastError: { type: [string, 'null'], description: The last error in words; never contains a credential. }
+    LedgerAnchorPage:
+      type: object
+      description: Added in 0.11.0. A page of anchor records.
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          description: Records, newest first.
+          items: { $ref: '#/components/schemas/LedgerAnchor' }
+        nextCursor:
+          $ref: '#/components/schemas/NextCursor'
+    LedgerAnchorList:
+      type: object
+      description: Added in 0.11.0. Anchor records.
+      required: [items]
+      properties:
+        items:
+          type: array
+          description: The records.
+          items: { $ref: '#/components/schemas/LedgerAnchor' }
+    LedgerBundleRequest:
+      type: object
+      description: Added in 0.11.0. What a bundle holds.
+      required: [includeAnchors]
+      additionalProperties: false
+      properties:
+        logs: { type: array, items: { type: string, description: An origin. }, description: The logs to include; all when absent. }
+        sinceSize: { type: integer, format: int64, minimum: 0, description: Only the part of each log after this size. }
+        includeAnchors: { type: boolean, description: Whether to include the anchor evidence. }
+        proofs: { type: array, items: { $ref: '#/components/schemas/InclusionProofRequest' }, description: Inclusion proofs to include (the bundle then reveals those rows' hashes to whoever holds it). }
+    LedgerClientKey:
+      type: object
+      description: Added in 0.11.0. A registered client key.
+      required: [keyId, publicKey, roleName, label, registeredBy, registeredAt, revokedAt, revocationReason]
+      properties:
+        keyId: { type: string, description: Key id, 8 hexadecimal characters. }
+        publicKey: { type: string, description: The 32-byte public key, standard base64. }
+        roleName: { type: [string, 'null'], description: The role the key is bound to; null when unbound. }
+        label: { type: string, description: Label. }
+        registeredBy: { type: string, description: Who registered it. }
+        registeredAt: { type: string, format: date-time, description: When. }
+        revokedAt: { type: [string, 'null'], format: date-time, description: When it was revoked. }
+        revocationReason: { type: [string, 'null'], description: Why it was revoked. }
+    LedgerClientKeyList:
+      type: object
+      description: Added in 0.11.0. Registered client keys.
+      required: [items]
+      properties:
+        items:
+          type: array
+          description: The keys.
+          items: { $ref: '#/components/schemas/LedgerClientKey' }
+    RegisterLedgerClientKeyRequest:
+      type: object
+      description: Added in 0.11.0. A client key to register.
+      required: [publicKey, label]
+      additionalProperties: false
+      properties:
+        publicKey: { type: string, description: The 32-byte Ed25519 public key, standard base64. }
+        roleName: { type: string, description: Optional role the key is bound to. }
+        label: { type: string, minLength: 1, maxLength: 100, description: Label. }
+    RevokeLedgerClientKeyRequest:
+      type: object
+      description: Added in 0.11.0. Why a client key is revoked.
+      required: [reason]
+      additionalProperties: false
+      properties:
+        reason: { type: string, minLength: 1, maxLength: 200, description: Reason. }
+    SignaturePolicyRequest:
+      type: object
+      description: Added in 0.11.0. The signature policy of a ledger table.
+      required: [policy]
+      additionalProperties: false
+      properties:
+        policy: { type: string, enum: [required], description: The only value; the policy cannot go back. }
+    AcknowledgeLedgerDivergenceRequest:
+      type: object
+      description: Added in 0.11.0. What the operator states about a diverged chain.
+      required: [kind, reason, confirm]
+      additionalProperties: false
+      properties:
+        kind: { type: string, enum: [restore, failoverLoss, other], description: What happened. }
+        reason: { type: string, minLength: 1, maxLength: 200, description: Free text. }
+        confirm: { type: string, description: Must equal the database name. }
     AlertKind:
       type: string
       description: |
-        Alert type. Clients must tolerate kinds they do not know. Added in 0.8.0: `clockDifference` (a server's clock differs from the manager leader's by more than `ClusterSettings.clock.maxDifferenceMs`, less the uncertainty of the measurement; `warning`, `critical` at ten times the threshold; `kingresd` does not set the system clock, run NTP or chrony). Added in 0.7.0: `leaseLost` (the `kingresd` that
+        Alert type. Clients must tolerate kinds they do not know. Added in 0.11.0 (ledger phase 7; subjects at `AlertSubject`): `ledgerNotAnchored` (a database has ledger tables and no anchor target is enabled; `info`, `warning` when the setting `anchor.required` is on), `ledgerAnchorBehind` (`warning`, `critical`), `ledgerAnchorFailed` (an anchor record is `failed` or `expired`; `critical`), `ledgerAnchorConflict` (the store holds a different object under the name of an anchor; `critical`), `ledgerChainDiverged` (a chain no longer extends its published log; `critical`), `ledgerGroupUnread` (a shard group's chain could not be read; `warning`, `critical`), `ledgerPublicationBehind` (the newest signed checkpoint of a chain is older than five publication intervals while its head advanced; `warning`), `ledgerSignerUnavailable` (no checkpoint could be signed for two rounds, or the key set is damaged, or the key file is missing on the leader; `critical`) and `ledgerDigestOverdue` (no digest within twice `digestIntervalSeconds`; `warning`). Added in 0.8.0: `clockDifference` (a server's clock differs from the manager leader's by more than `ClusterSettings.clock.maxDifferenceMs`, less the uncertainty of the measurement; `warning`, `critical` at ten times the threshold; `kingresd` does not set the system clock, run NTP or chrony). Added in 0.7.0: `leaseLost` (the `kingresd` that
         runs the primary of a shard group could not renew the group's lease in time; for a group with a standby the
         instance was stopped (fenced), for a group without one it keeps running and this alert is the only effect;
         `critical`), `groupWithoutSynchronousStandby` (the group's standby has been unreachable for longer than the
@@ -9283,6 +10649,15 @@ components:
         - oldPrimaryRunning
         - oldPrimaryNotStopped
         - oldPrimaryNotRebuilt
+        - ledgerNotAnchored
+        - ledgerAnchorBehind
+        - ledgerAnchorFailed
+        - ledgerAnchorConflict
+        - ledgerChainDiverged
+        - ledgerGroupUnread
+        - ledgerPublicationBehind
+        - ledgerSignerUnavailable
+        - ledgerDigestOverdue
     Alert:
       type: object
       description: An alert.
@@ -9349,6 +10724,7 @@ components:
         `behindServerId` the server that is behind (the one the panel must name). `leaseLost`,
         `groupWithoutSynchronousStandby`, `groupUnderReplicated`: `shardGroupId`, and `serverId` the server that
         runs the group's primary. `clockDifference` (0.8.0): `serverId` is the server whose clock differs. `versionMismatch`: all null.
+        Added in 0.11.0: `ledgerNotAnchored`, `ledgerDigestOverdue`: `databaseName`. `ledgerAnchorBehind`, `ledgerAnchorFailed`: `aspect` is `target:<id>`. `ledgerAnchorConflict`: `databaseName` and `aspect` `target:<id>`. `ledgerChainDiverged`, `ledgerGroupUnread`, `ledgerPublicationBehind`: `databaseName` and `shardGroupId`. `ledgerSignerUnavailable`: all null.
         `taskId` (0.9.0, optional) names a task the alert is about, so that a client can link to it; `kingresd` sets it for
         `taskFailed` alerts (the only kind about a task; `kingresd` raises it for a rebalance that ended failed, subject `task:<id>`), and no other kind sets it.
       required: [serverId, behindServerId, shardGroupId, databaseName, aspect]

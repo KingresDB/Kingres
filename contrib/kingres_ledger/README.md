@@ -182,11 +182,15 @@ Tests: nineteen pg_regress tests and thirty-four TAP tests under `t/`.
 | `033_attest_concurrency` | the same key and nonce in two overlapping transactions (the second waits, then `KL014` or success), a key revoked while a `REPEATABLE READ` transaction with an older snapshot is open, the same key registered by two sessions, four writers attesting every row of a table with the policy `required` while the builder runs |
 | `034_internal_tables` | the three tables as ledger tables (the first step of part B): a database that holds none in use drops the extension as before and one with a registered key does not, directly or through a dependency; 15 statements of every kind against each table by a member of the owner role, of `pg_write_all_data`, of `pg_maintain` and a plain role, and by the superuser; the statement the script runs for `ledger_register_internal` refused outside it; a write by hand and its record; the script of another extension, the table synchronisation worker and the apply worker of logical replication refused |
 | `035_no_openssl` | the extension built with `-DKL_NO_OPENSSL` by PGXS and loaded in place of the real one: `ledger_attest` raises `0A000`, the registry, the message, the policy and `ledger_verify` work (skipped without PGXS or make) |
+| `036_policy_switch` | L21-02, L21-03, L21-04: the switch to `required` ordered with the writers of the table, each sequence in `READ COMMITTED`, `REPEATABLE READ` and `SERIALIZABLE` and ending in `KL010` or in an attested commit: a writer that wrote before the switch (the switch waits, a later writer waits behind it), a snapshot older than the switch, a writer that begins while the switch is open, a reader that cached the identity of the table, a deferred trigger at `COMMIT`, a writer with an old transaction id; a transaction with a higher id that committed before the switch (no finding of `ledger_verify`); the switching transaction's own earlier writes, in savepoints too; a prepared writer and a prepared switch; the wait and the hold of a role that is not a superuser (bounded, own statement); the order of the locks; L22-01: a first write in a subtransaction that was rolled back (savepoint, nested savepoints, an `EXCEPTION` block, an `UPDATE` of an updatable table) before the switch, and a second write after it (`KL010`, in the three isolation levels); L22-04: the date the switch wrote itself, seen by the real `ledger_verify()` (one finding for a later unattested entry, none for the transaction at the date); L22-05: the error and hint of a switch ended by `lock_timeout`. Waits are known by `pg_stat_activity`, never by a sleep |
+| `037_attest_savepoints` | L21-05: every placement of one entry and its attestation over two nested subtransactions and every way of closing them, as savepoints and as `EXCEPTION` blocks, against a model written in the test (the reviewer's mutant that does not pass the attestation to the parent at a subtransaction commit dies here) |
+| `038_public_key_check` | L21-01: the eight small-order points, their other encodings, values that are not on the curve (`22023` at registration), a good key accepted with one identifier, and `ledger_attest` refusing a small-order key that a row holds already (`KL012`), on every call of the session (two transactions, three savepoints, the identity key and the all-zero key; L22-03); L22-02: twelve keys in rotation in one session are judged twelve times (the server writes a `DEBUG1` message per judgment, the test counts them), a refused key on every call, and a revoked key is refused by the table though the cache has judged it |
+| `039_signature_paths` | `COPY` into a `required` table (`KL010` unattested, committed attested), partitioned tables (a ledger table cannot be one), and logical replication apply into a `required` table (the subscriber cannot hold it: `KL010`, no row, no entry) next to one with the policy optional that is fed |
 
 The regress tests need `shared_preload_libraries = 'kingres_ledger'` (the
 in-tree `check` target and `kingres/dev/ext.sh` set it).
 
-The TAP tests `032_attest_policy` and `033_attest_concurrency` make Ed25519
+The TAP tests `032_attest_policy`, `033_attest_concurrency` and `036` to `039` make Ed25519
 signatures with the `openssl` command (3.0 or later; `t/KlSign.pm` has the helpers,
 including an encoding of the signed message that does not use the server's) and
 are skipped, with the reason, without it; `035_no_openssl` builds the extension a
@@ -292,8 +296,8 @@ ones that change what a program of a role that is not a superuser does.
    extension cannot be prepared by such a role (it cannot hold one in a block:
    the `0A000` refusal of an earlier round is gone with the code that held locks
    across statements).
-3. **`kingres_ledger.enable_credit_limit`**, a new superuser setting (30
-   minutes; `0` removes the bound): the most that one transaction of a role that
+3. **`kingres_ledger.enable_credit_limit`**, a new superuser setting (one
+   minute; `0` removes the bound; see "The default of `enable_credit_limit`" below): the most that one transaction of a role that
    is not a superuser may add to `kingres_ledger.lock_hold_limit` for the time
    `ledger_enable` spends entering rows. A call that would pass it fails with
    `54000` and a hint that a table that needs longer is enabled by a superuser.
@@ -535,9 +539,34 @@ Settings:
 | `kingres_ledger.worker_timeout` | 60s | The longest one block-building worker may work on one database; it cancels itself after this time (an error, recorded as a failure, with a growing delay before the next attempt) and the launcher terminates it five seconds later if it does not react. A round of the launcher also stops starting workers when it has used this much time, and continues with the other databases in the next round. `0` means no limit. Server setting (`PGC_SIGHUP`). |
 | `kingres_ledger.max_clock_skew` | 1h | How far the previous block may be ahead of the clock of the server before `ledger_build_block` refuses to build (error `KL004`); `0` means no limit. Superuser setting (see "Who can write the ledger tables", "The time of a block") |
 | `kingres_ledger.lock_hold_limit` | 60s | How long a role that is not a superuser may hold a lock of the extension (the builders', the registry's, the verifications'; each is held to the end of the transaction of the caller, which for such a role is one statement: it may call the functions that take a lock only as a statement of its own, `25001` otherwise) counted from the moment it got the first one; the session of a role that is still holding it when the time is up is ended, as if an administrator had terminated it ("terminating connection due to administrator command"), with a line in the server log that names the role, the lock and the limit, and the lock goes with it. The time that `ledger_enable` really spends entering the rows of a large table is added to the period, up to `enable_credit_limit` (exception 1 says when and how much). Superusers, the block-building workers included, are not limited. Superuser setting (`PGC_SUSET`): the role it limits cannot change it, which is why it is used and not `statement_timeout`, `transaction_timeout` or `idle_in_transaction_session_timeout` (the role can switch each of them off for its own session, and the last does not reach a pipeline that is waiting for its `Sync`). `0` means no limit. |
-| `kingres_ledger.enable_credit_limit` | 30min | The most time that one transaction of a role that is not a superuser may add to `lock_hold_limit` for the time `ledger_enable` really spends entering the rows of the tables it enables (only while the registry's lock is the only lock of the extension held); the call that would pass it fails with `54000` and a hint that a table that needs longer is enabled by a superuser. `0` removes the bound. Superuser setting (`PGC_SUSET`). |
+| `kingres_ledger.enable_credit_limit` | 1min | The most time that one transaction of a role that is not a superuser may add to `lock_hold_limit` for the time `ledger_enable` really spends entering the rows of the tables it enables (only while the registry's lock is the only lock of the extension held); the call that would pass it fails with `54000` and a hint that a table that needs longer is enabled by a superuser. `0` removes the bound. Superuser setting (`PGC_SUSET`). |
 | `kingres_ledger.enable_batch_delay` | 0 | Developer setting for the tests: `ledger_register_table` waits this long after each batch of a thousand rows, inside the time that is credited. Superuser setting; not for use. |
 | `kingres_ledger.allow_manual_write` | off | A superuser may write the ledger tables by hand in this session. Superuser setting that can be turned on only with `SET` in a session (see "Who can write the ledger tables") |
+
+**The default of `enable_credit_limit` (L21-06).** It is one minute, the same as
+`lock_hold_limit`, and it used to be 30 minutes. The promise of the limit is "a
+bounded time" for a role that is not a superuser, and 30 minutes of the registry's
+lock for each transaction, restarted at once by the next, was not what an operator
+means by it: with the defaults a role now holds the registry's lock for two minutes at
+most (the limit and one more period of credit), which stops other calls of
+`ledger_enable`, `ledger_remove_stray` and a write by hand for that long, and neither
+the block builder nor the capture. **What an operator with a large table does:**
+`ledger_enable` of that table is run by a superuser (the control plane's role, or the
+operator's own), which is not limited; or, for a role the operator trusts with it, the
+two settings are raised for that role (`ALTER ROLE ... SET kingres_ledger.lock_hold_limit
+= '10min'` and `... enable_credit_limit = '30min'`, by a superuser; a role cannot set
+them). The time of entering rows is in proportion to the rows of the table; the call
+that is stopped at the bound fails with `54000` and a hint that says what to do, and the
+whole transaction is rolled back, so nothing is half done.
+
+**The developer setting `kingres_ledger.enable_batch_delay` (L21-08)** is a hook for
+the tests (`t/029` makes "a large table" of a known least cost with it, whatever the
+speed of the machine): a superuser's setting, 0 in every use, in no sample
+configuration (`GUC_NOT_IN_SAMPLE`), documented here and not removed from the
+production build, because the tests that need it run against production builds and a
+build that left it out would lose that coverage. It can only be set by a superuser,
+who can stop the server anyway; it makes `ledger_register_table` wait, inside the time
+that it credits, and a cancel or a terminate ends the wait.
 
 Errors raised by the extension: SQLSTATE `KL001` (modification of an
 append-only table), `KL002` (statement rejected by the protection hook or by
@@ -545,7 +574,7 @@ the event trigger), `KL003` (library not preloaded), `KL004` (the previous block
 is closed ahead of the clock), `KL005` (the SQL of the extension is older than the
 library: `cannot write to table "...": the SQL of extension "kingres_ledger" is
 version X, and this library writes the ledger only through the functions of
-version Y`, with the hint `Run ALTER EXTENSION kingres_ledger UPDATE.`), `KL006` (a call that would take a lock of the extension that is earlier in the order of the locks than one the transaction holds, with a hint that names the order; see "The order of the locks"), and, for client signatures, `KL010` (a transaction leaves an entry of a table with the signature policy `required` without an attestation: at `COMMIT` and at `PREPARE TRANSACTION`), `KL011` (`ledger_attest` finds no such entry in this transaction, or every one is attested), `KL012` (the key is unknown, revoked or not allowed for the role), `KL013` (the signature does not verify) and `KL014` (the nonce was used with the key before); `ledger_attest` raises `0A000` on a server built without OpenSSL. Any other
+version Y`, with the hint `Run ALTER EXTENSION kingres_ledger UPDATE.`), `KL006` (a call that would take a lock of the extension that is earlier in the order of the locks than one the transaction holds, with a hint that names the order; see "The order of the locks"; `ledger_set_signature_policy` raises it too when it would have to wait for a table while the transaction holds a lock of the extension), and, for client signatures, `KL010` (a transaction leaves an entry of a table with the signature policy `required` without an attestation: at `COMMIT` and at `PREPARE TRANSACTION`), `KL011` (`ledger_attest` finds no such entry in this transaction, or every one is attested), `KL012` (the key is unknown, revoked or not allowed for the role), `KL013` (the signature does not verify) and `KL014` (the nonce was used with the key before); `ledger_attest` raises `0A000` on a server built without OpenSSL. Any other
 write that the guard refuses is `42501`.
 
 ## Privileges
@@ -1081,27 +1110,32 @@ the order inside a block is by transaction id, not by commit order).
 
 `kingres.ledger_table` gets two columns after `history_relid` (the fifth, which
 `protect.c` reads by position): `signature_policy text NOT NULL DEFAULT 'optional'`
-(`optional` or `required`) and `signature_required_from bigint` (the transaction
-that switched the policy to `required`; NULL while it is `optional`). The policy is
-not covered by a hash: a superuser can switch it back by editing the catalog, and
-what was written meanwhile is not found by `ledger_verify`.
+(`optional` or `required`) and `signature_required_from bigint` (NULL while the
+policy is `optional`; otherwise the largest transaction identifier that is **not**
+asked for an attestation: the identifier that the next transaction was going to get
+when the switch held its lock, less one; see the policy section below). The
+policy is not covered by a hash: a superuser can switch it back by editing the
+catalog, and what was written meanwhile is not found by `ledger_verify`.
 
 | Function | Does |
 |---|---|
-| `ledger_client_key_register(public_key bytea, role_name name, label text) returns bytea` | checks the lengths (32 bytes), that the role exists and the label, inserts the key and returns its `key_id`; the same key cannot be registered twice (`23505`), a revoked key is never registered again |
+| `ledger_client_key_register(public_key bytea, role_name name, label text) returns bytea` | checks the lengths (32 bytes), that the role exists, the label and the key itself ("Keys that are refused", below: `22023`), inserts the key and returns its `key_id`; the same key cannot be registered twice (`23505`), a revoked key is never registered again |
 | `ledger_client_key_revoke(key_id bytea, reason text) returns void` | inserts the revocation; an unknown key and a key that is revoked already are `KL012` |
-| `ledger_attest(relation regclass, row_hash bytea, op "char", key_id bytea, nonce bytea, signature bytea) returns void` | in the current transaction: finds the entry (the table, the hash and the operation `I` or `D`; the first one of this transaction that has no attestation yet), checks the key (registered, not revoked as of now, `role_name` NULL or the role that called), verifies the signature over the message below, inserts the attestation row (its own entry is written by the capture trigger) and tells the capture code that the entry is attested |
+| `ledger_attest(relation regclass, row_hash bytea, op "char", key_id bytea, nonce bytea, signature bytea) returns void` | in the current transaction: finds the entry (the table, the hash and the operation `I` or `D`; the first one of this transaction that has no attestation yet), checks the key (registered, not revoked as of now, `role_name` NULL or the role that called), refuses a key that the registration would refuse (`KL012`: a row that exists already), verifies the signature over the message below, inserts the attestation row (its own entry is written by the capture trigger) and tells the capture code that the entry is attested |
 | `ledger_attestation_message(chain_id bytea, table_id int, op "char", row_hash bytea, key_id bytea, nonce bytea) returns bytea` | PUBLIC; the message below, for a client that wants to compare its own encoding |
-| `ledger_set_signature_policy(relation regclass, policy text) returns void` | the owner of the table (and a role granted `EXECUTE`): `optional` to `required`, never back; the tables of the ledger itself have no policy |
+| `ledger_set_signature_policy(relation regclass, policy text) returns void` | the owner of the table (and a role granted `EXECUTE`): `optional` to `required`, never back; the tables of the ledger itself have no policy. It takes `SHARE ROW EXCLUSIVE` on the table (the policy section below), so a role that is not a superuser calls it as a statement of its own, like the functions that take a lock of the extension |
 
 All of them are `SECURITY DEFINER` with a fixed `search_path` and are not
 executable by PUBLIC except the message function; an administrator grants `EXECUTE`
 on `ledger_attest` to the roles that write ledger tables, and on the registry
 functions to the service role. None takes a lock of the extension (the rows have no
-identifier to allocate), so none is subject to the rule that a role that is not a
-superuser calls a lock-taking function only as a statement of its own, and
-`ledger_attest` runs inside the transaction that wrote the entry, as it must: in a
-transaction block, after a savepoint, in an `EXCEPTION` block.
+identifier to allocate), and `ledger_attest` runs inside the transaction that wrote
+the entry, as it must: in a transaction block, after a savepoint, in an `EXCEPTION`
+block. `ledger_set_signature_policy` takes a lock on the table that every writer of
+it waits for, so it follows the rule of the locks of the extension for a role that is
+not a superuser: a statement of its own (`25001` in a block), a wait for the writers
+that is bounded by `kingres_ledger.lock_hold_limit`, and a hold that the timer of
+that limit covers.
 
 ### The message
 
@@ -1141,18 +1175,171 @@ and at `PRE_PREPARE` any entry left raises **`KL010`**, "ledger entry without
 client signature": at `COMMIT`, and at `PREPARE TRANSACTION`, where nobody could add
 the attestation later. The records follow the subtransactions: an entry written in
 a savepoint that is rolled back is gone with its attestation, and an attestation
-made in a savepoint that is rolled back leaves its entry owed again. Every entry
-counts, `I` and `D`. A trigger that changes a row again produces entries the
-client did not foresee, so `required` is for tables written by statements the client
-controls. A server without OpenSSL cannot attest, so no write to a table with the
-policy can commit there.
+made in a savepoint that is rolled back leaves its entry owed again (`t/037` runs
+every nesting of two subtransactions against a model). Every entry counts, `I` and
+`D`. A trigger that changes a row again produces entries the client did not
+foresee, so `required` is for tables written by statements the client controls. A
+server without OpenSSL cannot attest, so no write to a table with the policy can
+commit there.
+
+**The switch is ordered with the writers (L21-02).** A transaction that wrote the
+table before the switch must not be able to commit unattested entries after it,
+whatever its isolation level, whatever it cached and however old its snapshot is.
+`ledger_set_signature_policy` therefore takes `SHARE ROW EXCLUSIVE` on the table
+before it reads or changes anything, and holds it to the end of its transaction.
+Every writer holds `ROW EXCLUSIVE` from the statement that wrote to the end of its
+own transaction, and the two modes conflict:
+
+- the switch waits for every open transaction that has written the table (and for a
+  prepared one until `COMMIT PREPARED` or `ROLLBACK PREPARED`): none of them can see
+  the policy change under it, and each commits, with whatever it wrote, before the
+  switch does;
+- a transaction that begins to write the table later waits for the switch (the
+  switch is queued, and later writers queue behind it), and when the switch has
+  committed it reads the policy that is in force **with a snapshot of now**, not
+  its own (a `REPEATABLE READ` or `SERIALIZABLE` transaction's snapshot may be older
+  than the switch), the first time it writes the table. Because the switch cannot
+  commit while any writer holds the lock, that answer is true until the transaction
+  ends. An answer that a reader got (`ledger_row_hash`, `ledger_attest`, a check) is
+  never kept for the writer;
+- a write made at `COMMIT` by a deferred trigger takes the lock then, so it waits for a
+  switch that is open and reads the policy after it; the entry it makes is checked,
+  because the check at commit runs after the deferred triggers.
+
+So after the switch has committed no transaction commits or prepares an entry of the
+table without an attestation. What can still be unattested is exactly what committed
+before the switch did: the writers that the switch waited for. The date in
+`signature_required_from` is taken under the lock (the identifier that the next
+transaction will get, less one): every transaction that wrote the table before the
+switch has an identifier below it, so `ledger_verify` never reports an entry that was
+committed before the switch (L21-03: a transaction whose id is above the switching
+transaction's, and that committed first, is not a finding). A transaction that began
+before the date and wrote the table only after the switch has an identifier below it
+too: the check at commit enforces its attestations, and `ledger_verify` does not look
+for them (a superuser who bypasses the check could hide an entry of such a
+transaction; the entries of every transaction above the date are looked for).
+
+**What the switching transaction owes (L21-04).** The entries that the switching
+transaction wrote itself before the switch are owed an attestation too, since it
+commits with the policy in force; the ones that have none are put on the list of owed
+entries when the switch runs, and follow the subtransaction that made the switch
+(rolled back with it, passed to the parent with it). A transaction that enables a
+table that already has rows and switches it in the same transaction owes an
+attestation for every row it entered (`ledger_enable` enters them as entries): switch
+in a later transaction. The function does not refuse that case early: it cannot tell
+the entries of `ledger_enable` from the entries of ordinary writes of the same
+transaction, which are owed an attestation by design, so a refusal could only be
+approximate, and the failure that remains is safe (the transaction fails at `COMMIT` with
+`KL010`, nothing is committed, and the next attempt, in a transaction of its own, works).
+The cost of that failure is the work of `ledger_enable` for the rows, done and rolled
+back; for a table with many rows enable it in one transaction and switch it in the next.
+
+**The date is a transaction id of this cluster (L22-06).** `signature_required_from`,
+like `ledger_txid` of the entries, is a full transaction id of the cluster that made
+it. After `pg_upgrade` (the ids are kept) nothing changes. After a dump and restore
+into a new cluster the ids start low again while the restored registry keeps the old
+date, so the check of `ledger_verify` for entries above the date finds nothing until
+the new cluster's ids pass the date; the check at commit does not use the date and is
+not affected, so the writers of the new cluster are held to the policy from the first
+transaction. An operator who restores a table with the policy `required` into a new
+cluster should treat the unattested-entry check of `ledger_verify` as blind to the
+restored entries and to the first ones written after the restore, and keep the
+attestations with the entries they belong to (they are restored with them).
+
+**The lock and the rules of the guard.** A role that is not a superuser calls the
+function as a statement of its own (`25001` in a transaction block, a savepoint or an
+`EXCEPTION` block); the lock is entered in the list of held locks, so the timer of
+`kingres_ledger.lock_hold_limit` covers the statement (a statement that holds the lock
+for longer ends the session, with the usual log line, which names "the lock on the
+table of a signature policy"), and the wait for the writers is bounded by the same
+limit (a `lock_timeout` of that length unless the role's own is shorter; `55P03`, with
+a hint). The function takes no lock of the extension, so the block builder and the
+capture never wait for it: what waits is the capture of the writers of that table, as
+for a `LOCK TABLE` of its owner. A transaction that holds a lock of the extension and
+would have to wait for the table (a writer holds it) is refused with `KL006` before
+the wait, since the writer could be waiting for the extension's lock: the lock on a
+table comes first in the order of the locks, with the table lock of `ledger_enable`. A
+table that the transaction holds already (a superuser that enabled it in the same
+transaction) is not waited for. Two switches of one table wait for each other, and the
+second finds the policy set. A role that owns many tables switches them one statement
+at a time.
+
+**A switch that waits (L22-05).** The call by a superuser waits with no bound for every
+open writer of the table (a batch of an hour is an hour), and every later writer of the
+table queues behind the call, so one call can stop all writes to the table until the
+batch ends or the call is cancelled. The recipe for the operator:
+
+1. Set a `lock_timeout` for the call, in the session that makes it
+   (`SET lock_timeout = '10s'; SELECT kingres.ledger_set_signature_policy('t', 'required');`).
+   When it ends the wait, the call fails with `55P03` ("its writers did not finish in
+   time"), switches nothing, and the hint names the next step; the same error, with the
+   same hint, ends the wait of a role that is not a superuser whose own `lock_timeout` is
+   shorter than the limit.
+2. Find the transactions that hold the table: while the call waits, run
+   `SELECT pid, pg_blocking_pids(pid) FROM pg_stat_activity WHERE query LIKE '%ledger_set_signature_policy%'`
+   (the pids that it lists are the open writers; `pg_locks` shows the table).
+3. Wait for those transactions, or end them (`pg_cancel_backend`, `pg_terminate_backend`),
+   and call again. A call that is still waiting can be cancelled by its own session or
+   with `pg_cancel_backend(pid)` for the pid of the call: it switches nothing, and the
+   writers that queued behind it go on.
+
+**Parallel workers, callbacks.** A parallel worker cannot write a table. The check at
+commit is a transaction callback that runs after the deferred triggers; a callback of
+another module that is registered before this library's (it runs after ours) and writes
+a ledger table with the policy could write after the check. Nothing in the extension
+can see it; it is a module that the administrator installed.
+
+**Copies of the database.** A restored backup, a promoted standby and a template copy
+have the same chain identity (`chain_id`), so an attestation is valid in each of them:
+a committed attestation of one copy can be replayed in another copy for an entry with
+the same table, operation and row hash, and the set of used nonces of each copy starts
+at the point of the copy. The extension does not build a new identity for a clone (a
+clone is made by whatever tool the operator uses). An operator who keeps copies that
+are written to separately registers the keys again in each, and revokes the keys of a
+copy that is retired.
+
+**What the policy does not cover.** `COPY` goes through the capture trigger like any
+insert (`t/039`). A ledger table cannot be a partitioned table, a partition or a
+parent (`ledger_enable` refuses it), so the policy has no partitioned case. A
+subscriber cannot hold a table with the policy `required` that a logical replication
+subscription feeds: the apply worker's commit reaches the same check, fails with
+`KL010`, applies nothing and keeps failing (`t/039`); a table of the subscription with
+the policy `optional` is fed and its entries are made.
 
 `ledger_verify` gains the check `unattested_entry`: an entry of a table with the
-policy that has no attestation row, for the entries of the transactions after the
-one that switched the policy on (`signature_required_from`) and not before (the
-switching transaction itself is covered by the check at commit). A
-transaction that was already running when the policy was switched can appear once.
+policy that has no attestation row, for the entries of the transactions with an
+identifier above the date of the switch (`signature_required_from`) and not before.
 The standalone verifier checks one entry at a time.
+
+### Keys that are refused (L21-01)
+
+Plain Ed25519 verification accepts a signature that nobody made under a public key of
+small order: for the identity point `01 00 ... 00` the signature `R = 01 00 ... 00`,
+`S = 0` verifies for every message, and for the other points of order 2, 4 and 8 a
+signature verifies for some messages, which the caller reaches by choosing the nonce.
+One point has several encodings too, so one point could have several key identifiers,
+and the revocation of one would leave the others alive. The registry therefore accepts
+only **the canonical encoding of a point of the curve that does not have small order**
+(`src/ed25519_check.c`; `22023` at registration; `ledger_attest` refuses such a key again
+with `KL012`, for a row that exists already). The check is integer arithmetic in
+GF(2^255 - 19) written for this extension; it needs no OpenSSL. It makes three tests:
+the 255-bit `y` is below `2^255 - 19` and a zero `x` has the sign bit clear (canonical);
+`x^2 = (y^2 - 1) / (d y^2 + 1)` is a square (Euler's criterion: on the curve); and three
+doublings of `y`, with `y(2P) = (y^2 + x^2) / (2 - y^2 + x^2)`, do not reach `y = 1`
+(the points of order dividing 8 are exactly the points with `[8]P` the identity, the
+group has order `8l` with `l` an odd prime, so they are the eight small-order points
+whatever their encoding). The eight points and their aliases are in `t/038`; the C code
+was also compared with a model in Python integers on 446 vectors (the eight points, the
+aliases, off-curve values and random keys) with no difference.
+
+**What the standalone verifier must check for the same reason** (`kingres-verify`): for
+every public key it reads from a proof or a trust file, the same three tests (canonical
+encoding, on the curve, not of small order), and it must not accept an attestation
+under a key that fails them even when the signature verifies. A verifier that decodes
+the key with a library that accepts any 32 bytes, or that reduces `y` modulo `p`
+silently, accepts the forgery that the registry now refuses. Keys that a development
+database registered with an older script of 0.3 are refused by `ledger_attest` and must
+be refused by the verifier.
 
 ### What `ledger_verify` adds
 
@@ -1162,7 +1349,7 @@ The standalone verifier checks one entry at a time.
 | `client_key_unknown` | an attestation, or a revocation, that names a key with no registration |
 | `client_key_id` | a key whose `key_id` is not the first 16 bytes of the SHA-256 of its public key |
 | `attestation_orphan` | an attestation of an entry that does not exist |
-| `unattested_entry` | see above |
+| `unattested_entry` | see the policy section above |
 
 The three tables are compared with their entries like every ledger table
 (`table_rows`), so a deleted, changed or inserted key, revocation or attestation is
@@ -1212,9 +1399,24 @@ transaction goes from about 315 to about 790 microseconds with `synchronous_comm
 off`, and from about 3.1 to about 3.9 milliseconds with `synchronous_commit = on`
 (the flush dominates). Writes without an attestation are unchanged, except that the
 first write of a table in a transaction reads the policy together with the
-identifier (one statement, as before). The statements of `ledger_attest` are
-prepared once per session; the first version ran them as text and took about 400
-microseconds.
+identifier with a snapshot of now (one statement, as before, and one call of
+`GetLatestSnapshot` more) and the check of the key at `ledger_attest` is remembered
+per session (the judgment of a key costs about three milliseconds, and a session pays
+it once for each key it uses, for up to 4096 keys: a pooled service session that signs
+for many clients does not pay it again; the memory of the cache is fixed, about 270
+kilobytes, and it holds nothing about revocation, which is read from the table on every
+call; a refused key is judged again every time; `client_min_messages = debug1` shows each
+judgment as a message with the count of the session). Measured against the version before the switch was ordered with the writers
+(`L21-02`), same server build with assertions, `synchronous_commit = off`, `fsync = off`,
+one client, 20000 single-row transactions a run, three runs of each, two rounds: a
+ledger table with the policy optional, 5420 to 5820 transactions a second before and 5470
+to 5770 after (the rounds vary by more than the difference); a ledger table with the
+policy `required` and an attestation in every transaction (`BEGIN; INSERT; SELECT
+ledger_attest(...); COMMIT` from `psql`, 3000 rows a run), 757 to 784 microseconds a
+transaction before and 772 to 849 after (about 30 microseconds, 4 percent, which is
+the second snapshot of the first write of each of the two tables). The switch takes
+its lock once, at the switch. The statements of `ledger_attest` are prepared once per
+session; the first version ran them as text and took about 400 microseconds.
 
 ## Hash format version 1
 
@@ -1978,7 +2180,7 @@ application table.
    the statement holds (with the builders', the verifications' or the removals'
    lock held there is no addition at all: a large table would keep the block
    builder and the capture waiting); *(b)* **the total that one transaction may
-   add is bounded by `kingres_ledger.enable_credit_limit`** (30 minutes unless the
+   add is bounded by `kingres_ledger.enable_credit_limit`** (one minute unless the
    administrator says otherwise; `0` removes the bound; a superuser setting like
    the limit): a role that creates a table and enables it, in a loop in one
    statement, is then bounded by `lock_hold_limit` plus that setting. The call
@@ -2373,7 +2575,7 @@ transaction to a superuser service role (the control plane's own calls are made
 that way, in transactions, and are not touched). A statement of such a role that
 holds a lock for longer than `kingres_ledger.lock_hold_limit` (60 seconds) is
 ended, and `ledger_enable` of a table that needs more than
-`kingres_ledger.enable_credit_limit` (30 minutes) of entering fails: a superuser
+`kingres_ledger.enable_credit_limit` (one minute) of entering fails: a superuser
 enables that table (both settings can be set per role with `ALTER ROLE ... SET`,
 by a superuser only). Create every
 database that holds a ledger with a superuser role as owner that has no members

@@ -448,8 +448,8 @@ describe('W2-09 places that used to bypass SafeName', () => {
     getState().ledger.digests[0]!.anchors = [
       { target: HOSTILE.reversed, status: HOSTILE.zeroWidth } as never,
     ]
-    await renderApp('/ledger')
-    await screen.findByText(/status of shop/i)
+    await renderApp('/ledger?tab=digests')
+    await screen.findByRole('heading', { name: 'Digests' })
     await waitFor(() => expect(document.body.textContent).toContain('U+202E'))
     expectNoRawHidden()
   })

@@ -19,9 +19,9 @@ func TestEmbeddedMigrationsAreOrdered(t *testing.T) {
 	if err != nil || len(ms) == 0 {
 		t.Fatalf("embedded migrations: %v %d", err, len(ms))
 	}
-	for i, m := range ms {
-		if m.Version != i+1 {
-			t.Errorf("migration %d has version %d", i, m.Version)
+	for i := 1; i < len(ms); i++ {
+		if ms[i].Version <= ms[i-1].Version {
+			t.Errorf("migration %d has version %d after %d", i, ms[i].Version, ms[i-1].Version)
 		}
 	}
 }
@@ -48,8 +48,13 @@ func newDB(t *testing.T) *pgx.Conn {
 func TestMigrateIdempotent(t *testing.T) {
 	c := newDB(t)
 	ctx := context.Background()
+	ms, err := sysdb.Embedded()
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := ms[len(ms)-1].Version
 	v, err := sysdb.Migrate(ctx, c)
-	if err != nil || v != 14 {
+	if err != nil || v != last {
 		t.Fatalf("first run: %d %v", v, err)
 	}
 	for _, tbl := range []string{"task", "ledger_digest_actor", "database_setting", "cluster_setting", "server", "certificate", "server_group", "alert", "network_rule", "schema_migration"} {
@@ -58,10 +63,10 @@ func TestMigrateIdempotent(t *testing.T) {
 		}
 	}
 	v, err = sysdb.Migrate(ctx, c)
-	if err != nil || v != 14 {
+	if err != nil || v != last {
 		t.Fatalf("second run: %d %v", v, err)
 	}
-	if n := scalar[int](t, c, "SELECT count(*) FROM kingres_cp.schema_migration"); n != 14 {
+	if n := scalar[int](t, c, "SELECT count(*) FROM kingres_cp.schema_migration"); n != len(ms) {
 		t.Errorf("%d migration rows after two runs", n)
 	}
 	// The unique index enforces one unfinished task per subject.
@@ -110,14 +115,45 @@ func TestMigrationsApplyInOrderAndFailureLeavesNothing(t *testing.T) {
 	}
 }
 
+// A migration whose number lies below one that is already applied (a gap that a later change fills) is
+// applied when it is missing, and nothing is applied twice.
+func TestAMigrationInAGapIsAppliedLater(t *testing.T) {
+	c := newDB(t)
+	ctx := context.Background()
+	first := []sysdb.Migration{
+		{Version: 1, Name: "0001_a.sql", SQL: "CREATE TABLE kingres_cp.a (id int)"},
+		{Version: 30, Name: "0030_c.sql", SQL: "ALTER TABLE kingres_cp.a ADD COLUMN c int"},
+	}
+	if v, err := sysdb.Run(ctx, c, first); err != nil || v != 30 {
+		t.Fatalf("first run: %d %v", v, err)
+	}
+	both := []sysdb.Migration{first[0], {Version: 15, Name: "0015_b.sql", SQL: "ALTER TABLE kingres_cp.a ADD COLUMN b int"}, first[1]}
+	if v, err := sysdb.Run(ctx, c, both); err != nil || v != 30 {
+		t.Fatalf("second run: %d %v", v, err)
+	}
+	if !scalar[bool](t, c, "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'kingres_cp' AND table_name = 'a' AND column_name = 'b')") {
+		t.Error("the migration in the gap was not applied")
+	}
+	if n := scalar[int](t, c, "SELECT count(*) FROM kingres_cp.schema_migration"); n != 3 {
+		t.Errorf("%d migration rows", n)
+	}
+	if v, err := sysdb.Run(ctx, c, both); err != nil || v != 30 {
+		t.Fatalf("third run: %d %v", v, err)
+	}
+	// A binary that lacks an applied migration refuses.
+	if _, err := sysdb.Run(ctx, c, first); !errors.Is(err, sysdb.ErrSchemaTooNew) {
+		t.Errorf("a binary without migration 15: %v", err)
+	}
+}
+
 func TestBinaryOlderThanSchemaRefuses(t *testing.T) {
 	c := newDB(t)
 	ctx := context.Background()
 	if _, err := sysdb.Migrate(ctx, c); err != nil {
 		t.Fatal(err)
 	}
-	// Pretend a newer binary applied migration 15.
-	if _, err := c.Exec(ctx, "INSERT INTO kingres_cp.schema_migration (version, name) VALUES (15, '0015_future.sql')"); err != nil {
+	// Pretend a newer binary applied a migration this one does not have.
+	if _, err := c.Exec(ctx, "INSERT INTO kingres_cp.schema_migration (version, name) VALUES (9999, '9999_future.sql')"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := sysdb.Migrate(ctx, c); !errors.Is(err, sysdb.ErrSchemaTooNew) {
@@ -131,15 +167,18 @@ func TestBinaryOlderThanSchemaRefuses(t *testing.T) {
 func TestLoadRejectsBadFiles(t *testing.T) {
 	// Exercised through the exported helper in export_test.go.
 	cases := map[string]fstest.MapFS{
-		"gap":      {"m/0001_a.sql": {Data: []byte("x")}, "m/0003_c.sql": {Data: []byte("x")}},
-		"badname":  {"m/a.sql": {Data: []byte("x")}},
-		"zero":     {"m/0000_a.sql": {Data: []byte("x")}},
-		"notstart": {"m/0002_a.sql": {Data: []byte("x")}},
+		"badname":   {"m/a.sql": {Data: []byte("x")}},
+		"zero":      {"m/0000_a.sql": {Data: []byte("x")}},
+		"duplicate": {"m/0002_a.sql": {Data: []byte("x")}, "m/0002_b.sql": {Data: []byte("x")}},
 	}
 	for name, fsys := range cases {
 		if _, err := sysdb.LoadForTest(fsys, "m"); err == nil {
 			t.Errorf("%s accepted", name)
 		}
+	}
+	// A gap and a first version above 1 are allowed (two lines of work reserve their own ranges).
+	if ms, err := sysdb.LoadForTest(fstest.MapFS{"m/0001_a.sql": {Data: []byte("x")}, "m/0030_c.sql": {Data: []byte("x")}}, "m"); err != nil || len(ms) != 2 || ms[1].Version != 30 {
+		t.Errorf("gap: %v %v", ms, err)
 	}
 	if ms, err := sysdb.LoadForTest(fstest.MapFS{"m/0002_b.sql": {Data: []byte("x")}, "m/0001_a.sql": {Data: []byte("y")}}, "m"); err != nil || len(ms) != 2 || ms[0].Name != "0001_a.sql" {
 		t.Errorf("ordering: %v %v", ms, err)

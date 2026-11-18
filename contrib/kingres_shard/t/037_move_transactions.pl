@@ -113,10 +113,18 @@ my $want = "60,$sum";
 		my ($rc, $out) = run_sql($node, 'COPY (SELECT id FROM public.orders ORDER BY id) TO STDOUT');
 		is(scalar(() = $out =~ /^\d+$/mg), 60, 'COPY (SELECT ...) TO returns every row from ' . $node->name . ' during the move');
 	}
-	my ($rc, $out, $err) = run_sql($n1, "COPY public.orders FROM STDIN;\n2001\t1\n\\.\n");
-	isnt($rc, 0, 'COPY FROM into a distributed table is refused during a move');
+	# COPY FROM is loaded by the row router since phase 2b (step 4), also while a move waits to
+	# switch: twelve rows (the moving bucket's too) are there once, and then removed again.
+	my ($rc, $out, $err) = run_sql($n1, "SET kingres_shard.enable_copy_routing = off; COPY public.orders FROM STDIN;\n2001\t1\n\\.\n");
+	isnt($rc, 0, 'COPY FROM into a distributed table is refused with the switch off');
 	like($err, qr/COPY FROM/, '... with its own message');
 	is(total($n1), $want, 'and nothing was written');
+	my $copy = join('', map { ($_ + 2000) . "\t1\n" } 1 .. 12);
+	($rc, $out, $err) = run_sql($n1, "COPY public.orders FROM STDIN;\n$copy\\.\n");
+	is($rc, 0, 'COPY FROM into a distributed table is routed during a move') or diag $err;
+	is(total($n1), '72,' . ($sum + 12 * 2000 + 78), 'and its rows are there exactly once');
+	$n1->safe_psql('postgres', 'DELETE FROM public.orders WHERE id > 2000');
+	is(total($n1), $want, 'and are removed again');
 	$n1->safe_psql('postgres', 'TRUNCATE public.archive');
 	$n1->safe_psql('postgres', 'INSERT INTO public.archive SELECT id, customer FROM public.orders');
 	is($n1->safe_psql('postgres', 'SELECT count(*) FROM public.archive'), '60', 'INSERT ... SELECT from the distributed table into a local one: every row once');
