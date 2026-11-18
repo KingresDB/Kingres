@@ -414,7 +414,16 @@ still holds (the creating transaction of the metapage; see "On-disk format").
 VACUUM, including autovacuum's anti-wraparound vacuum, freezes it and advances
 `relfrozenxid`, so `age(relfrozenxid)` is meaningful and the table takes part
 in the protection against transaction id wraparound as a heap table does. The
-stripe catalog is an ordinary heap table and is frozen as usual.
+stripe catalog is an ordinary heap table and is frozen as usual.  Autovacuum
+acts on the table, as on a heap table, only once `age(relfrozenxid)` is past
+`autovacuum_freeze_max_age` (or an insert or analyze threshold is reached): a
+table at an age just under it is left alone.  With `log_autovacuum_min_duration`
+set, a visit of autovacuum to a columnar table is logged in the words heap
+uses (`automatic [aggressive] vacuum [to prevent wraparound] of table "d.s.t":
+columnar: N rows, B blocks, relfrozenxid X, creation id frozen|kept`), and
+`pg_stat_all_tables` reports `autovacuum_count` and `last_autovacuum` for it.
+Before that line existed the log showed a visit of autovacuum to a columnar table
+only as an `automatic analyze` line, and its absence was no sign of an absent visit.
 
 If the role that creates tables is named `kingres`, the default search path
 (`"$user", public`) puts unqualified tables into the schema `kingres`, which

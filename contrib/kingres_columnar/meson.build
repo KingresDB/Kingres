@@ -111,6 +111,7 @@ tests += {
       't/032_module_build.pl',
       't/033_standby_late.pl',
       't/034_decoding.pl',
+      't/035_autovacuum_log.pl',
     ],
   },
 }

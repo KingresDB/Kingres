@@ -18,9 +18,9 @@
 #
 # The waits for autovacuum are bounded for a busy machine (15 minutes each, not the
 # 3 of poll_query_until), autovacuum logs every run (log_autovacuum_min_duration = 0),
-# and a wait that gives up says what the log shows autovacuum did with the table: it
-# ran and did not advance relfrozenxid (a defect of relation_vacuum), or it did not
-# run in time (a machine too slow), so a failure is never ambiguous.
+# and a wait that gives up prints the state of the server (sessions, locks, what can hold
+# the oldest xmin back, the age and the autovacuum statistics of the tables, the autovacuum
+# lines of the log) and says nothing about the cause.
 #
 # Portions Copyright (c) 2026, RooyeKhat Media Co
 # SPDX-License-Identifier: AGPL-3.0-only
@@ -71,7 +71,34 @@ my $has_fn = $node->safe_psql('postgres',
 	q{SELECT count(*) FROM pg_proc WHERE proname = 'columnar_creating_xid'});
 cmp_ok($x, '>', 3, "the table was created by transaction $x");
 
-# wait for a condition, up to 15 minutes; on failure die with what autovacuum did with table c
+# What the server looks like, printed when a wait gives up: every session with its
+# transaction id, xmin and wait event, the locks of the tables and the ungranted ones, what can
+# hold the oldest xmin back (slots, prepared transactions), the age of every table, what the
+# statistics say autovacuum did (the columnar vacuum prints no "automatic vacuum of table"
+# line, the statistics are reported by it) and the autovacuum lines of the server log.
+sub dump_state
+{
+	my @queries = (
+		[ 'sessions', q{SELECT pid, backend_type, state, wait_event_type, wait_event, backend_xid, backend_xmin, left(query, 50) FROM pg_stat_activity ORDER BY pid} ],
+		[ 'locks of the tables, and every lock not granted', q{SELECT l.pid, l.locktype, coalesce(l.relation::regclass::text, '-') rel, l.mode, l.granted FROM pg_locks l WHERE l.locktype <> 'virtualxid' AND (NOT l.granted OR l.relation IN ('c'::regclass, 'h'::regclass, 'c0'::regclass)) ORDER BY 1, 3} ],
+		[ 'replication slots', q{SELECT slot_name, xmin, catalog_xmin FROM pg_replication_slots} ],
+		[ 'prepared transactions', q{SELECT gid, transaction FROM pg_prepared_xacts} ],
+		[ 'the oldest ids', q{SELECT 'txid_current ' || pg_current_xact_id()::text || ', datfrozenxid age ' || (SELECT age(datfrozenxid) FROM pg_database WHERE datname = 'postgres') || ', oldest backend xmin age ' || coalesce((SELECT max(age(backend_xmin))::text FROM pg_stat_activity), 'none')} ],
+		[ 'tables with the age of relfrozenxid and what the statistics say of autovacuum', q{SELECT c.oid::regclass, c.relkind, c.relam, age(c.relfrozenxid) AS age, s.autovacuum_count, s.last_autovacuum, s.vacuum_count FROM pg_class c LEFT JOIN pg_stat_all_tables s ON s.relid = c.oid WHERE c.relkind IN ('r', 't', 'm') AND age(c.relfrozenxid) > 50000000 ORDER BY 4 DESC LIMIT 12} ],
+	);
+	my $out = "load: " . (-r '/proc/loadavg' ? slurp_file('/proc/loadavg') : "unknown\n");
+	foreach my $q (@queries)
+	{
+		my ($ret, $o, $e) = $node->psql('postgres', $q->[1]);
+		$out .= "-- $q->[0]\n" . ($ret == 0 ? $o : "(failed: $e)") . "\n";
+	}
+	my @log = grep { /autovacuum|wraparound|vacuum/i } split /\n/, slurp_file($node->logfile);
+	@log = @log[-25 .. -1] if @log > 25;
+	$out .= "-- the last autovacuum lines of the server log\n" . (@log ? join("\n", @log) : 'none') . "\n";
+	diag($out);
+}
+
+# wait for a condition, up to 15 minutes; on failure print the state (above) and die
 sub wait_for
 {
 	my ($sql, $what) = @_;
@@ -81,18 +108,9 @@ sub wait_for
 		return 1 if $node->safe_psql('postgres', $sql) eq 't';
 		sleep 1;
 	}
-	# The columnar vacuum prints no "automatic vacuum of table" line, so what the statistics say
-	# is what tells whether autovacuum visited the table (the log lines are shown as well)
-	my $stat = $node->safe_psql('postgres',
-		q{SELECT autovacuum_count || ' automatic vacuum(s), last at ' || coalesce(last_autovacuum::text, 'never') || ', age(relfrozenxid) ' || (SELECT age(relfrozenxid) FROM pg_class WHERE relname = 'c') FROM pg_stat_user_tables WHERE relname = 'c'});
-	my $ran = $stat =~ /^[1-9]/;
-	my @lines = grep { /automatic (?:aggressive )?vacuum (?:to prevent wraparound )?of table "[^"]*\.c":/ } split /\n/, slurp_file($node->logfile);
-	diag("log lines about the table: " . (@lines ? join("\n", @lines) : 'none'));
-	my $says = $ran
-	  ? "autovacuum RAN on the table ($stat) and relfrozenxid did not advance: a defect of relation_vacuum"
-	  : "autovacuum did not visit the table in time ($stat): a machine too slow, not a defect of the code";
-	diag("load: " . (-r '/proc/loadavg' ? slurp_file('/proc/loadavg') : 'unknown'));
-	die "$what; $says";
+	dump_state();
+	diag("FAILED: $what (the condition: $sql)");
+	die "$what (see the state printed above)";
 }
 
 sub current_xid
@@ -107,7 +125,15 @@ sub consume_to
 	while ($target - current_xid() > 100_000_000)
 	{
 		$node->safe_psql('postgres', 'SELECT consume_xids(100000000)');
-		wait_for(q{SELECT age(relfrozenxid) < 140000000 FROM pg_class WHERE relname = 'c'},
+		# The table is protected when its age stays at or just above the age at which autovacuum
+		# acts (autovacuum_freeze_max_age, 150 million): the limit is 160 million.  It used to be
+		# 140 million, below the trigger, which left a band (140 to 150 million) in which the
+		# table is not yet due for autovacuum, which therefore does nothing, and in which the
+		# test waited for ever: a vacuum that fires 50 to 60 million ids into a batch leaves the
+		# table 40 to 50 million old, and the next batch ends at 140 to 150 million.  Heap does
+		# the same in that band (checked: both kinds of table stay at 145 million for as long as
+		# one waits and are vacuumed once past 150 million).
+		wait_for(q{SELECT age(relfrozenxid) < 160000000 FROM pg_class WHERE relname = 'c'},
 			'autovacuum did not advance relfrozenxid of the columnar table');
 		wait_for(q{SELECT age(datfrozenxid) < 400000000 FROM pg_database WHERE datname = 'postgres'},
 			'datfrozenxid did not advance');

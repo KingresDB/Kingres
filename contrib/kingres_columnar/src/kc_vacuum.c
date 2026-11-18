@@ -28,6 +28,7 @@
 #include "access/table.h"
 #include "access/xact.h"
 #include "catalog/storage.h"
+#include "commands/dbcommands.h"
 #include "commands/vacuum.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
@@ -35,6 +36,7 @@
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "storage/procarray.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
@@ -152,6 +154,29 @@ kc_relation_vacuum(KC_VACUUM_PARAMS)
 						TransactionIdIsValid(remaining) ? remaining : oldest,
 						GetOldestMultiXactId(), NULL, NULL, false);
 	KC_REPORT_VACUUM(rel, (PgStat_Counter) rows, 0, starttime);
+
+	/*
+	 * What heap's vacuum does for autovacuum (vacuumlazy.c): one LOG line when
+	 * log_autovacuum_min_duration says so, in the same words, so that a visit
+	 * of autovacuum to a columnar table can be seen in the server log (C9 follow-up:
+	 * the log showed nothing for a columnar table, and the absence of a line
+	 * was taken for the absence of a visit).
+	 */
+	if (AmAutoVacuumWorkerProcess() && KC_VACUUM_LOG_MIN_DURATION(params) >= 0 &&
+		TimestampDifferenceExceeds(starttime, GetCurrentTimestamp(),
+								   KC_VACUUM_LOG_MIN_DURATION(params)))
+	{
+		ereport(LOG,
+				(errmsg_internal("automatic %svacuum%s of table \"%s.%s.%s\": columnar: %llu rows, %u blocks, relfrozenxid %u, creation id %s",
+								 params->is_wraparound ? "aggressive " : "",
+								 params->is_wraparound ? " to prevent wraparound" : "",
+								 get_database_name(MyDatabaseId),
+								 get_namespace_name(RelationGetNamespace(rel)),
+								 RelationGetRelationName(rel),
+								 (unsigned long long) rows, (unsigned int) nblocks,
+								 (unsigned int) (TransactionIdIsValid(remaining) ? remaining : oldest),
+								 TransactionIdIsValid(remaining) ? "kept" : "frozen")));
+	}
 	if (pushed)
 		PopActiveSnapshot();
 }
