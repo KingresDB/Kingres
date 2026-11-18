@@ -163,6 +163,10 @@ func (Passphrase) MarshalText() ([]byte, error) { return []byte(redacted), nil }
 // LogValue implements slog.LogValuer.
 func (Passphrase) LogValue() slog.Value { return slog.StringValue(redacted) }
 
+// afterLstat, when set, is called between the Lstat and the open of
+// readPrivateFile (a hook for tests of a file that is swapped in between).
+var afterLstat func(path string)
+
 // readPrivateFile reads a regular file that is not a link, at most limit
 // bytes, and (where the system has modes) that no group or other user can
 // access. The error never holds file content.
@@ -173,6 +177,9 @@ func readPrivateFile(path string, limit int64) ([]byte, error) {
 	}
 	if !li.Mode().IsRegular() {
 		return nil, fmt.Errorf("ledgerkeys: %s is not a regular file (a link, directory or special file is refused)", path)
+	}
+	if afterLstat != nil {
+		afterLstat(path)
 	}
 	f, err := os.Open(path) // #nosec G304 -- the caller names the file
 	if err != nil {

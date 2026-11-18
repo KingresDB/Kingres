@@ -206,10 +206,46 @@ func Encode(s FileSigner, pass Passphrase, r io.Reader) ([]byte, error) {
 	return f.marshal(), nil
 }
 
+// plainHead starts the second line of a plain file.
+const plainHead = `{"seed":"`
+
+// marshalPlain writes the plain file into a byte slice, so that no string holds
+// the base64 text of the seed. The caller zeroes the result.
 func marshalPlain(seed []byte) []byte {
-	b64 := base64.StdEncoding.EncodeToString(seed)
-	out := []byte(FileMagic + "\n" + `{"seed":"` + b64 + `"}` + "\n")
-	return out
+	enc := base64.StdEncoding
+	out := make([]byte, 0, len(FileMagic)+1+len(plainHead)+enc.EncodedLen(len(seed))+3)
+	out = append(out, FileMagic+"\n"+plainHead...)
+	n := len(out)
+	out = out[:n+enc.EncodedLen(len(seed))]
+	enc.Encode(out[n:], seed)
+	return append(out, `"}`+"\n"...)
+}
+
+// parsePlain reads the rest of a plain file after plainHead: exactly 44 base64
+// characters, the closing quote, brace and newline. It works on byte slices
+// that it zeroes, so no string holds the seed.
+func parsePlain(rest []byte) (*secretBytes, error) {
+	enc := base64.StdEncoding
+	if len(rest) != enc.EncodedLen(SeedSize)+3 || string(rest[len(rest)-3:]) != `"}`+"\n" {
+		return nil, malformed("it is not in the canonical form (spaces, line endings or text after the object)")
+	}
+	// n is taken from the length so that the buffers below are made on the
+	// heap, where they are zeroed once, and not on a stack, whose old copies
+	// the runtime leaves behind when it grows or shrinks the stack.
+	n := len(rest) - 3
+	seed := make([]byte, enc.DecodedLen(n))
+	defer clear(seed)
+	m, err := enc.Strict().Decode(seed, rest[:n])
+	if err != nil || m != SeedSize {
+		return nil, malformed(fmt.Sprintf("seed is not canonical base64 of %d bytes", SeedSize))
+	}
+	again := make([]byte, n)
+	defer clear(again)
+	enc.Encode(again, seed[:m])
+	if !bytes.Equal(again, rest[:n]) {
+		return nil, malformed(fmt.Sprintf("seed is not canonical base64 of %d bytes", SeedSize))
+	}
+	return newSecretBytes(seed[:m]), nil
 }
 
 func (f File) marshal() []byte {
@@ -243,21 +279,26 @@ func Parse(data []byte) (File, error) {
 	if !ok {
 		return f, malformed("the first line is not " + FileMagic)
 	}
+	if plain, ok := bytes.CutPrefix(rest, []byte(plainHead)); ok {
+		seed, err := parsePlain(plain)
+		if err != nil {
+			return f, err
+		}
+		f.seed = seed
+		return f, nil
+	}
+	// Only an encrypted file is left, and it holds no secret, so its members
+	// may be read with encoding/json. A file that starts any other way is not
+	// in the canonical form and is refused before a decoder could copy a seed
+	// into a string.
+	if !bytes.HasPrefix(rest, []byte(`{"kdf":`)) {
+		return f, malformed("the second line is not the object of a plain or of an encrypted file")
+	}
 	members, err := parseObject(rest)
 	if err != nil {
 		return f, err
 	}
 	switch len(members) {
-	case 1:
-		if members[0].key != "seed" || !members[0].isString {
-			return f, malformed(`expected the member "seed"`)
-		}
-		seed, err := b64Exact(members[0].str, SeedSize, "seed")
-		if err != nil {
-			return f, err
-		}
-		f.seed = newSecretBytes(seed)
-		clear(seed)
 	case 5:
 		want := [...]string{"kdf", "iterations", "salt", "nonce", "ciphertext"}
 		for i, m := range members {

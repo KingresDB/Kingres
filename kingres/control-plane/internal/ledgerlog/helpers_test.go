@@ -184,7 +184,7 @@ func refTiles(t testing.TB, n int) map[TileKey][]byte {
 func requiredOf(t testing.TB, s Store, size uint64) map[TileKey][]byte {
 	t.Helper()
 	out := map[TileKey][]byte{}
-	for _, k := range Required(size) {
+	for _, k := range mustRequired(t, size) {
 		d, err := s.GetTile(bg, k)
 		if err != nil {
 			t.Fatalf("size %d: tile %s: %v", size, k.Path(), err)
@@ -237,3 +237,13 @@ func mustAppend(t testing.TB, l *Log, from, to int) Appended {
 }
 
 func fmtHash(h Hash) string { return fmt.Sprintf("%x", h[:6]) }
+
+// mustRequired is Required for a size the test knows is allowed.
+func mustRequired(t testing.TB, size uint64) []TileKey {
+	t.Helper()
+	keys, err := Required(size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return keys
+}

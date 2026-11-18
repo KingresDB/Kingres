@@ -65,7 +65,7 @@ func TestTrustFileContent(t *testing.T) {
 	}
 	// Retired and revoked.
 	s = okSet(t)(s.Activate(fp(2), t0.Add(2*time.Hour), 0))
-	s = okSet(t)(s.Retire(fp(1), t0.Add(3*time.Hour), 77))
+	s = okSet(t)(s.Retire(fp(1), t0.Add(3*time.Hour), AtMost(77)))
 	s = okSet(t)(mustAdd(s, 3, "", t0.Add(90*time.Minute)))
 	s = okSet(t)(s.Revoke(fp(3), t0.Add(4*time.Hour), t0, "x"))
 	es, err := TrustEntries(s, TrustOptions{})
@@ -182,7 +182,7 @@ func TestTrustFileAgainstTheVerifier(t *testing.T) {
 	set = okSet(t)(set.Activate(k1.Fingerprint(), t0, 0))
 	set = okSet(t)(set.Add(k2.Public(), "2027", t0))
 	set = okSet(t)(set.Activate(k2.Fingerprint(), t0.Add(time.Hour), 0))
-	set = okSet(t)(set.Retire(k1.Fingerprint(), t0.Add(2*time.Hour), 1000))
+	set = okSet(t)(set.Retire(k1.Fingerprint(), t0.Add(2*time.Hour), AtMost(1000)))
 	set = okSet(t)(set.Add(k3.Public(), "leaked", t0))
 	set = okSet(t)(set.Revoke(k3.Fingerprint(), t0.Add(3*time.Hour), t0, "test"))
 	b, err := TrustFile(prefix, set, TrustOptions{})

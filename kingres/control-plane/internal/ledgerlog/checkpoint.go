@@ -46,7 +46,9 @@ type Checkpoint struct {
 func ValidOrigin(s string) bool { return len(s) <= MaxOriginSize && ledgerkeys.ValidKeyName(s) }
 
 // Text returns the three lines (and the extension lines), each ended by a
-// newline. It refuses a checkpoint that ParseCheckpoint would refuse.
+// newline. It refuses everything ParseCheckpoint refuses (an extension line
+// holds no newline or other control byte, and there are at most
+// MaxExtensionLines of them), so that ParseCheckpoint(Text(c)) is c.
 func (c Checkpoint) Text() ([]byte, error) {
 	if !ValidOrigin(c.Origin) {
 		return nil, cpErr("the origin %q is not valid, expected 1 to %d bytes without spaces, plus signs or control characters", clipStr(c.Origin), MaxOriginSize)
@@ -65,6 +67,11 @@ func (c Checkpoint) Text() ([]byte, error) {
 	for _, e := range c.Extensions {
 		if e == "" {
 			return nil, cpErr("an extension line is empty")
+		}
+		if strings.Contains(e, "\n") {
+			// One string is one line: a newline inside it would be read back as
+			// two lines, and as more lines than the limit allows.
+			return nil, cpErr("an extension line holds a newline")
 		}
 		b.WriteString(e + "\n")
 	}
@@ -149,8 +156,14 @@ func SignCheckpoint(ctx context.Context, c Checkpoint, signers ...ledgerkeys.Sig
 
 // ResignCheckpoint adds the signatures of more signers to a signed checkpoint
 // (a rotation: the latest checkpoint of a log that no longer grows gets the
-// new key's signature). A signer that signed already is refused.
-func ResignCheckpoint(ctx context.Context, note []byte, more ...ledgerkeys.Signer) ([]byte, error) {
+// new key's signature). trusted are the public keys the caller trusts for the
+// log (every key the trust file lists as usable for it): the note is verified
+// under them first, as VerifyNote does, and it is refused when none of its
+// lines verifies or a line of a trusted key does not, so a new signature is
+// never attached to a text that nobody verified. A signer that signed already
+// is refused, and so is one whose key id collides with another key's
+// (ledgerkeys.ErrKeyIDCollision).
+func ResignCheckpoint(ctx context.Context, note []byte, trusted []ed25519.PublicKey, more ...ledgerkeys.Signer) ([]byte, error) {
 	n, err := ParseNote(note)
 	if err != nil {
 		return nil, err
@@ -159,10 +172,19 @@ func ResignCheckpoint(ctx context.Context, note []byte, more ...ledgerkeys.Signe
 	if err != nil {
 		return nil, err
 	}
+	keys := make([]NoteKey, 0, len(trusted))
+	for _, p := range trusted {
+		keys = append(keys, NoteKey{Name: c.Origin, Public: p})
+	}
+	if _, err := VerifyNote(n, keys); err != nil {
+		return nil, fmt.Errorf("ledgerlog: the checkpoint to re-sign does not verify under the trusted keys: %w", err)
+	}
+	known := append([]ed25519.PublicKey(nil), trusted...)
 	for _, s := range more {
-		if err := n.AddSignature(ctx, c.Origin, s); err != nil {
+		if err := n.addSignature(ctx, c.Origin, s, known); err != nil {
 			return nil, err
 		}
+		known = append(known, s.Public())
 	}
 	return n.Marshal()
 }

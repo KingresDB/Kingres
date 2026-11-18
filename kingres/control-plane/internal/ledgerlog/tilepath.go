@@ -148,10 +148,20 @@ func canonicalDecimal(s string, max uint64) (uint64, bool) {
 	return v, v <= max
 }
 
+// MaxRequiredSize is the largest tree size Required accepts: 2^28 leaves, for
+// which it lists about two million keys (some 50 MB). A larger size is refused
+// with ErrTooLarge instead of allocating in proportion to a number that a caller
+// may have read from a file.
+const MaxRequiredSize = uint64(1) << 28
+
 // Required returns the keys of every tile and entry bundle that a reader of the
 // tree of the given size may ask for: the full tiles and the partial tile of
-// each level, and the entry bundles. Level 0 and EntryLevel come first.
-func Required(size uint64) []TileKey {
+// each level, and the entry bundles. Level 0 and EntryLevel come first. A size
+// above MaxRequiredSize is refused with ErrTooLarge.
+func Required(size uint64) ([]TileKey, error) {
+	if size > MaxRequiredSize {
+		return nil, fmt.Errorf("%w: size %d, Required lists at most %d", ErrTooLarge, size, MaxRequiredSize)
+	}
 	var out []TileKey
 	add := func(level int, count uint64) {
 		for n := uint64(0); n < count/TileWidth; n++ {
@@ -169,5 +179,5 @@ func Required(size uint64) []TileKey {
 		}
 		add(l, c)
 	}
-	return out
+	return out, nil
 }

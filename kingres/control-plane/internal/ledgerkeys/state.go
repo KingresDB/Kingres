@@ -64,6 +64,10 @@ const (
 	// MaxReasonSize and MaxLabelSize bound the free text of a key.
 	MaxReasonSize = 200
 	MaxLabelSize  = 200
+	// MaxTrustTreeSize is the largest max_tree_size the trust file may hold:
+	// the verifier reads that member as an integer from 1 to 2^62-1 and
+	// refuses the whole file for any other value.
+	MaxTrustTreeSize uint64 = 1<<62 - 1
 )
 
 // Errors of transitions. A caller tests them with errors.Is.
@@ -76,7 +80,50 @@ var (
 	ErrNoOtherSigner   = errors.New("ledgerkeys: the change needs another active key to sign it")
 	ErrInvalidArgument = errors.New("ledgerkeys: invalid argument")
 	ErrNotAllowed      = errors.New("ledgerkeys: the key may not sign this")
+	// ErrNoActiveKey: no key of the set may sign checkpoints. Signers returns
+	// it when no key is active at the time asked. Validate returns it for a
+	// set that has been in service (some key has left the state next) and
+	// holds no active key. An empty set, and a set whose keys are all next
+	// (before its first activation), are legal and do not return it.
+	ErrNoActiveKey = errors.New("ledgerkeys: no key of the set is active")
 )
+
+// TreeBound is the decision about the largest tree a retired key may still
+// sign, which Retire needs: either a size (AtMost) or an explicit Unbounded.
+// The zero TreeBound is no decision and Retire refuses it, so a bound is never
+// left out by passing a bare 0.
+type TreeBound struct {
+	kind uint8 // 0: no decision, 1: bounded, 2: unbounded
+	size uint64
+}
+
+// AtMost bounds a retired key to checkpoints of at most size leaves: the trust
+// file gets max_tree_size = size, which the verifier enforces. size must be 1 to
+// MaxTrustTreeSize; Retire refuses another value. A key signs many logs, so
+// size must be at least the size of the largest log the key ever signed.
+func AtMost(size uint64) TreeBound { return TreeBound{kind: 1, size: size} }
+
+// Unbounded leaves a retired key without max_tree_size. The verifier then
+// accepts a checkpoint of any size signed by that key for ever (a retired key
+// has no not_after, correction 14), so if the key leaks, whoever holds it can
+// sign a larger tree that every verifier accepts as genuine. The only remedy
+// is Revoke, which makes the checkpoints that rest only on the key unreadable.
+// Choose it only when no bound can be stated.
+func Unbounded() TreeBound { return TreeBound{kind: 2} }
+
+// check returns the value that goes into Key.MaxTreeSize (0 for unbounded).
+func (b TreeBound) check() (uint64, error) {
+	switch b.kind {
+	case 1:
+		if b.size < 1 || b.size > MaxTrustTreeSize {
+			return 0, fmt.Errorf("%w: max tree size %d, the trust file allows 1 to %d", ErrInvalidArgument, b.size, MaxTrustTreeSize)
+		}
+		return b.size, nil
+	case 2:
+		return 0, nil
+	}
+	return 0, fmt.Errorf("%w: Retire needs a decision about the largest tree size: AtMost(size) or Unbounded()", ErrInvalidArgument)
+}
 
 // Key is the public record of a signing key and its state. It holds no
 // secret. Times are UTC whole seconds; the zero time means not set. The
@@ -94,8 +141,9 @@ type Key struct {
 	RevokedAt        time.Time
 	CompromisedSince time.Time
 	// MaxTreeSize, when not zero on a retired key, becomes max_tree_size of
-	// the trust file. A key signs many logs, so one size is meaningful only
-	// when the caller knows it bounds all of them.
+	// the trust file (1 to MaxTrustTreeSize; zero is unbounded, see
+	// Unbounded). A key signs many logs, so one size is meaningful only when
+	// the caller knows it bounds all of them.
 	MaxTreeSize uint64
 	Reason      string
 }
@@ -240,11 +288,39 @@ func (s Set) Validate() error {
 		if k.State != StateRetired && k.MaxTreeSize != 0 {
 			return fmt.Errorf("%w: MaxTreeSize is only for a retired key", ErrInvalidArgument)
 		}
+		if k.MaxTreeSize > MaxTrustTreeSize {
+			return fmt.Errorf("%w: key %s has MaxTreeSize %d, the trust file allows 1 to %d", ErrInvalidArgument, fp[:16], k.MaxTreeSize, MaxTrustTreeSize)
+		}
+		if !k.OverlapEnds.IsZero() && k.State != StateActive {
+			return fmt.Errorf("%w: key %s in state %s has an OverlapEnds", ErrInvalidArgument, fp[:16], k.State)
+		}
 	}
-	if s.countState(StateActive) > MaxActive {
+	active := s.countState(StateActive)
+	if active > MaxActive {
 		return ErrTooManyActive
 	}
+	for _, k := range s {
+		if !k.OverlapEnds.IsZero() && active < 2 {
+			return fmt.Errorf("%w: key %s has an OverlapEnds and is the only active key", ErrInvalidArgument, k.Fingerprint()[:16])
+		}
+	}
+	if active == 0 && s.inService() {
+		return fmt.Errorf("%w: the set holds %d keys, some have left the state next, and none is active", ErrNoActiveKey, len(s))
+	}
 	return nil
+}
+
+// inService reports whether some key has left the state next: the set is not a
+// new one waiting for its first activation. Every sequence of transitions keeps
+// an active key once one was active (Retire and Revoke need another active
+// key), so a set in service without one was damaged in storage.
+func (s Set) inService() bool {
+	for _, k := range s {
+		if k.State != StateNext {
+			return true
+		}
+	}
+	return false
 }
 
 func firstError(errs ...error) error {
@@ -315,21 +391,52 @@ func (s Set) Activate(fp string, now time.Time, overlapDays int) (Set, error) {
 	return out, nil
 }
 
-// otherActive reports whether an active key other than fp exists.
-func (s Set) otherActive(fp string) bool {
+// otherActive reports whether an active key other than fp exists whose
+// activation time is not later than now: a key that is active in the record
+// but not yet in force cannot sign the event, so it does not count.
+func (s Set) otherActive(fp string, now time.Time) bool {
 	for _, k := range s {
-		if k.State == StateActive && k.Fingerprint() != fp {
+		if k.State == StateActive && k.Fingerprint() != fp && !now.Before(k.ActivatedAt) {
 			return true
 		}
 	}
 	return false
 }
 
+// noOtherSigner is ErrNoOtherSigner with the reason.
+func (s Set) noOtherSigner(fp string) error {
+	for _, k := range s {
+		if k.State == StateActive && k.Fingerprint() != fp {
+			return fmt.Errorf("%w: key %s is active only from its activation time, which is later than now", ErrNoOtherSigner, k.Fingerprint()[:16])
+		}
+	}
+	return ErrNoOtherSigner
+}
+
+// settle makes the overlap of the set consistent after a key left the active
+// state: with fewer than two active keys no overlap is running, so no key keeps
+// an OverlapEnds.
+func (s Set) settle() {
+	if s.countState(StateActive) >= MaxActive {
+		return
+	}
+	for i := range s {
+		s[i].OverlapEnds = time.Time{}
+	}
+}
+
 // Retire makes an active key retired (end of an overlap, or "retire now"). It
-// needs another active key, which signs the key-retired event and keeps the
-// cluster able to sign. maxTreeSize is 0 or the size that becomes
-// max_tree_size in the trust file.
-func (s Set) Retire(fp string, now time.Time, maxTreeSize uint64) (Set, error) {
+// needs another active key whose activation time is not later than now, which
+// signs the key-retired event and keeps the cluster able to sign. bound is the
+// decision about the largest tree the retired key may still sign: AtMost(size)
+// writes max_tree_size to the trust file (1 to MaxTrustTreeSize), Unbounded()
+// writes none, and the zero TreeBound is refused. After it no key keeps an
+// OverlapEnds that belongs to an overlap that is over.
+func (s Set) Retire(fp string, now time.Time, bound TreeBound) (Set, error) {
+	maxTreeSize, err := bound.check()
+	if err != nil {
+		return nil, err
+	}
 	i := s.find(fp)
 	if i < 0 {
 		return nil, ErrUnknownKey
@@ -337,22 +444,24 @@ func (s Set) Retire(fp string, now time.Time, maxTreeSize uint64) (Set, error) {
 	if s[i].State != StateActive {
 		return nil, fmt.Errorf("%w: %s to retired", ErrTransition, s[i].State)
 	}
-	if !s.otherActive(fp) {
-		return nil, ErrNoOtherSigner
-	}
 	now = norm(now)
+	if !s.otherActive(fp, now) {
+		return nil, s.noOtherSigner(fp)
+	}
 	if now.Before(s[i].ActivatedAt) {
 		return nil, fmt.Errorf("%w: the key is retired before it was activated", ErrInvalidArgument)
 	}
 	out := s.clone()
 	out[i].State, out[i].RetiredAt, out[i].OverlapEnds, out[i].MaxTreeSize = StateRetired, now, time.Time{}, maxTreeSize
+	out.settle()
 	return out, nil
 }
 
 // Revoke marks a key as compromised since compromisedSince (not after now;
 // pass now for "now"). A key in any state but revoked can be revoked, and the
-// event is signed by a different active key, so one must exist. reason is at
-// most MaxReasonSize bytes of printable ASCII.
+// event is signed by a different active key whose activation time is not later
+// than now, so one must exist. reason is at most MaxReasonSize bytes of
+// printable ASCII.
 func (s Set) Revoke(fp string, now, compromisedSince time.Time, reason string) (Set, error) {
 	i := s.find(fp)
 	if i < 0 {
@@ -361,13 +470,13 @@ func (s Set) Revoke(fp string, now, compromisedSince time.Time, reason string) (
 	if s[i].State == StateRevoked {
 		return nil, fmt.Errorf("%w: revoked to revoked", ErrTransition)
 	}
-	if !s.otherActive(fp) {
-		return nil, ErrNoOtherSigner
+	now, compromisedSince = norm(now), norm(compromisedSince)
+	if !s.otherActive(fp, now) {
+		return nil, s.noOtherSigner(fp)
 	}
 	if err := printableASCII(reason, MaxReasonSize); err != nil {
 		return nil, err
 	}
-	now, compromisedSince = norm(now), norm(compromisedSince)
 	if compromisedSince.IsZero() || compromisedSince.After(now) {
 		return nil, fmt.Errorf("%w: compromised-since must be set and not after the time of the revocation", ErrInvalidArgument)
 	}
@@ -375,20 +484,26 @@ func (s Set) Revoke(fp string, now, compromisedSince time.Time, reason string) (
 	k := &out[i]
 	k.State, k.RevokedAt, k.CompromisedSince, k.Reason = StateRevoked, now, compromisedSince, reason
 	k.OverlapEnds, k.MaxTreeSize = time.Time{}, 0
+	out.settle()
 	return out, nil
 }
 
 // Signers returns the keys that sign checkpoints at now: the active keys
-// whose activation is not later than now, the older first. At most two.
-func (s Set) Signers(now time.Time) []Key {
+// whose activation is not later than now, the older first. At most two. It
+// returns ErrNoActiveKey (and no keys) when none may sign, so a caller cannot
+// sign with an empty list by forgetting to check its length.
+func (s Set) Signers(now time.Time) ([]Key, error) {
 	var out []Key
 	for _, k := range s {
 		if k.MaySign(PurposeCheckpoint, "", now) == nil {
 			out = append(out, k)
 		}
 	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%w at %s (%d keys in the set)", ErrNoActiveKey, norm(now).Format(time.RFC3339), len(s))
+	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].ActivatedAt.Before(out[j].ActivatedAt) })
-	return out
+	return out, nil
 }
 
 // DueForRetirement returns the fingerprints of active keys whose overlap has
@@ -396,7 +511,7 @@ func (s Set) Signers(now time.Time) []Key {
 func (s Set) DueForRetirement(now time.Time) []string {
 	var out []string
 	for _, k := range s {
-		if k.State == StateActive && !k.OverlapEnds.IsZero() && !now.Before(k.OverlapEnds) && s.otherActive(k.Fingerprint()) {
+		if k.State == StateActive && !k.OverlapEnds.IsZero() && !now.Before(k.OverlapEnds) && s.otherActive(k.Fingerprint(), now) {
 			out = append(out, k.Fingerprint())
 		}
 	}

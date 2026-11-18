@@ -83,7 +83,7 @@ func newPublication(t *testing.T) *publication {
 	// The trust file of the end of the story, written from the state machine
 	// as the control plane will write it: k1 retired, k2 active.
 	end := ok(p.set.Activate(k2.Fingerprint(), epoch0.Add(2*time.Hour), 0))
-	end = ok(end.Retire(k1.Fingerprint(), epoch0.Add(3*time.Hour), 0))
+	end = ok(end.Retire(k1.Fingerprint(), epoch0.Add(3*time.Hour), ledgerkeys.Unbounded()))
 	tf, err := ledgerkeys.TrustFile(testPrefix, end, ledgerkeys.TrustOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -115,7 +115,7 @@ func (p *publication) setPhase(stage int) {
 			t.Fatal(err)
 		}
 	case 2:
-		if s, err := p.set.Retire(p.set[0].Fingerprint(), epoch0.Add(3*time.Hour), 0); err == nil {
+		if s, err := p.set.Retire(p.set[0].Fingerprint(), epoch0.Add(3*time.Hour), ledgerkeys.Unbounded()); err == nil {
 			p.set = s
 			p.phase = epoch0.Add(3 * time.Hour)
 		} else if !errors.Is(err, ledgerkeys.ErrTransition) {
@@ -128,11 +128,12 @@ func (p *publication) setPhase(stage int) {
 
 func (p *publication) currentSigners() []ledgerkeys.Signer {
 	var out []ledgerkeys.Signer
-	for _, k := range p.set.Signers(p.phase.Add(time.Minute)) {
-		out = append(out, p.signers[k.Fingerprint()])
+	ks, err := p.set.Signers(p.phase.Add(time.Minute))
+	if err != nil {
+		p.t.Fatal(err)
 	}
-	if len(out) == 0 {
-		p.t.Fatal("no key signs")
+	for _, k := range ks {
+		out = append(out, p.signers[k.Fingerprint()])
 	}
 	return out
 }
@@ -544,7 +545,7 @@ func (p *publication) flipChecks(t *testing.T, lc logCase, rng interface{ Intn(i
 	}
 	// An entry bundle is not read by the verifier of step 1 (it checks the
 	// hashes of tiles): the damage is found by Audit instead.
-	bk := Required(uint64(lc.n))[0] // the first key is an entry bundle
+	bk := mustRequired(t, uint64(lc.n))[0] // the first key is an entry bundle
 	if bk.Level != EntryLevel {
 		t.Fatalf("%s: the first required key is %v", lc.rel, bk)
 	}

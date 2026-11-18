@@ -61,6 +61,11 @@ func (r *Reader) get(k TileKey) ([]byte, error) {
 		}
 		return nil, ferr
 	}
+	// A getter is not trusted: the full tile must have exactly its length
+	// before the first hashes are cut from it.
+	if len(fdata) != TileWidth*HashSize {
+		return nil, fmt.Errorf("%w: %s has %d bytes, expected %d", ErrTileMalformed, full.Path(), len(fdata), TileWidth*HashSize)
+	}
 	return fdata[:k.Width*HashSize], nil
 }
 
