@@ -68,6 +68,10 @@ const (
 	// the verifier reads that member as an integer from 1 to 2^62-1 and
 	// refuses the whole file for any other value.
 	MaxTrustTreeSize uint64 = 1<<62 - 1
+	// MaxActivationLeadDays is how far after the latest time the set records
+	// (a creation, activation, retirement or revocation of any key) Activate
+	// accepts an activation time: 366 days. See Activate.
+	MaxActivationLeadDays = 366
 )
 
 // Errors of transitions. A caller tests them with errors.Is.
@@ -80,6 +84,11 @@ var (
 	ErrNoOtherSigner   = errors.New("ledgerkeys: the change needs another active key to sign it")
 	ErrInvalidArgument = errors.New("ledgerkeys: invalid argument")
 	ErrNotAllowed      = errors.New("ledgerkeys: the key may not sign this")
+	// ErrInvalidTime marks a time that a transition refuses: zero, outside the
+	// years 1 to 9999 (the trust file cannot write others), or an activation
+	// too far after everything the set records. It is also an
+	// ErrInvalidArgument.
+	ErrInvalidTime = errors.New("ledgerkeys: invalid time")
 	// ErrNoActiveKey: no key of the set may sign checkpoints. Signers returns
 	// it when no key is active at the time asked. Validate returns it for a
 	// set that has been in service (some key has left the state next) and
@@ -164,6 +173,27 @@ func norm(t time.Time) time.Time {
 		return t
 	}
 	return t.UTC().Truncate(time.Second)
+}
+
+// timeInRange reports whether t is a time the trust file can write: year 1 to
+// 9999 (the verifier reads RFC 3339 times, whose year has four digits).
+func timeInRange(t time.Time) bool {
+	y := t.UTC().Year()
+	return y >= 1 && y <= 9999
+}
+
+// checkTime refuses the zero time and a time outside the years 1 to 9999,
+// which no later call can repair: the zero time makes Validate refuse the set
+// for ever, and a year of five digits makes the verifier refuse the trust
+// file.
+func checkTime(what string, t time.Time) error {
+	if t.IsZero() {
+		return fmt.Errorf("%w: %w: %s is the zero time", ErrInvalidArgument, ErrInvalidTime, what)
+	}
+	if !timeInRange(t) {
+		return fmt.Errorf("%w: %w: %s is in the year %d, expected 1 to 9999", ErrInvalidArgument, ErrInvalidTime, what, t.UTC().Year())
+	}
+	return nil
 }
 
 // Set is the set of signing keys of a cluster. Its methods do not change the
@@ -257,6 +287,17 @@ func (s Set) Validate() error {
 		if k.CreatedAt.IsZero() {
 			return fmt.Errorf("%w: key %s has no creation time", ErrInvalidArgument, fp[:16])
 		}
+		for _, tt := range []struct {
+			name string
+			t    time.Time
+		}{{"CreatedAt", k.CreatedAt}, {"ActivatedAt", k.ActivatedAt}, {"OverlapEnds", k.OverlapEnds}, {"RetiredAt", k.RetiredAt}, {"RevokedAt", k.RevokedAt}, {"CompromisedSince", k.CompromisedSince}} {
+			if !tt.t.IsZero() && !timeInRange(tt.t) {
+				return fmt.Errorf("%w: %w: key %s: %s is in the year %d, expected 1 to 9999", ErrInvalidArgument, ErrInvalidTime, fp[:16], tt.name, tt.t.UTC().Year())
+			}
+		}
+		if k.State != StateRevoked && (!k.CompromisedSince.IsZero() || k.Reason != "") {
+			return fmt.Errorf("%w: key %s in state %s has a CompromisedSince or a Reason, which only a revoked key has", ErrInvalidArgument, fp[:16], k.State)
+		}
 		need := func(name string, t time.Time, want bool) error {
 			if t.IsZero() == want {
 				return fmt.Errorf("%w: key %s in state %s: %s must be %s", ErrInvalidArgument, fp[:16], k.State, name, map[bool]string{true: "set", false: "unset"}[want])
@@ -279,6 +320,12 @@ func (s Set) Validate() error {
 			if err == nil && k.CompromisedSince.After(k.RevokedAt) {
 				err = fmt.Errorf("%w: key %s is compromised since a time after the revocation", ErrInvalidArgument, fp[:16])
 			}
+			if err == nil && k.RevokedAt.Before(k.CreatedAt) {
+				err = fmt.Errorf("%w: key %s was revoked before it was created", ErrInvalidArgument, fp[:16])
+			}
+			if err == nil && !k.RetiredAt.IsZero() && k.RetiredAt.Before(k.ActivatedAt) {
+				err = fmt.Errorf("%w: key %s was retired before it was activated", ErrInvalidArgument, fp[:16])
+			}
 		default:
 			err = fmt.Errorf("%w: key %s has no valid state", ErrInvalidArgument, fp[:16])
 		}
@@ -299,9 +346,37 @@ func (s Set) Validate() error {
 	if active > MaxActive {
 		return ErrTooManyActive
 	}
+	var act []Key
+	marked := 0
+	for _, k := range s {
+		if k.State == StateActive {
+			act = append(act, k)
+		}
+		if !k.OverlapEnds.IsZero() {
+			marked++
+		}
+	}
 	for _, k := range s {
 		if !k.OverlapEnds.IsZero() && active < 2 {
 			return fmt.Errorf("%w: key %s has an OverlapEnds and is the only active key", ErrInvalidArgument, k.Fingerprint()[:16])
+		}
+	}
+	if active == 2 {
+		// Two active keys are a rotation: exactly one of them, the one that is
+		// due to retire, holds the end of the overlap, and Activate set it to
+		// the activation of the other key (the one activated last) plus a whole
+		// number of days, MinOverlapDays to MaxOverlapDays.
+		if marked != 1 {
+			return fmt.Errorf("%w: two keys are active and %d of them have an OverlapEnds, expected exactly one", ErrInvalidArgument, marked)
+		}
+		for i, k := range act {
+			if k.OverlapEnds.IsZero() {
+				continue
+			}
+			d := k.OverlapEnds.Sub(act[1-i].ActivatedAt)
+			if d < MinOverlapDays*24*time.Hour || d > MaxOverlapDays*24*time.Hour || d%(24*time.Hour) != 0 {
+				return fmt.Errorf("%w: key %s has an OverlapEnds that is not the activation of the other active key plus %d to %d whole days", ErrInvalidArgument, k.Fingerprint()[:16], MinOverlapDays, MaxOverlapDays)
+			}
 		}
 	}
 	if active == 0 && s.inService() {
@@ -332,8 +407,38 @@ func firstError(errs ...error) error {
 	return nil
 }
 
-// Add enters a new key in state next.
+// Add enters a new key in state next, without looking at key id collisions
+// (see AddChecked, which a caller that publishes logs uses instead). now must
+// be a time of the years 1 to 9999 (ErrInvalidTime otherwise).
 func (s Set) Add(pub ed25519.PublicKey, label string, now time.Time) (Set, error) {
+	return s.add(pub, label, now, nil)
+}
+
+// AddChecked is Add that also refuses (with the *KeyIDCollision, which is
+// ErrKeyIDCollision) a new key whose key id under one of the origins equals
+// that of ANY key of the set, whatever its state: next, retired and revoked
+// keys count too. The verifier reads every key of the trust file, whatever its
+// standing, when it checks a note it already holds, and no key ever leaves the
+// trust file, so a collision with a revoked key cannot be cured by a later
+// transition; this is the one place where it can be refused. origins are the
+// key names of every log the key will sign (the origins of all the logs of the
+// cluster, one per log and epoch); at least one is needed.
+func (s Set) AddChecked(pub ed25519.PublicKey, label string, now time.Time, origins ...string) (Set, error) {
+	if len(origins) == 0 {
+		return nil, fmt.Errorf("%w: AddChecked needs at least one origin to check the key id under", ErrInvalidArgument)
+	}
+	for _, o := range origins {
+		if !ValidKeyName(o) {
+			return nil, fmt.Errorf("%w: %q is not a valid key name", ErrInvalidArgument, clip(o))
+		}
+	}
+	return s.add(pub, label, now, origins)
+}
+
+func (s Set) add(pub ed25519.PublicKey, label string, now time.Time, origins []string) (Set, error) {
+	if err := checkTime("the creation time", norm(now)); err != nil {
+		return nil, err
+	}
 	if len(pub) != ed25519.PublicKeySize {
 		return nil, fmt.Errorf("%w: a public key has %d bytes, expected %d", ErrInvalidArgument, len(pub), ed25519.PublicKeySize)
 	}
@@ -353,13 +458,47 @@ func (s Set) Add(pub ed25519.PublicKey, label string, now time.Time) (Set, error
 		}
 	}
 	out := append(s.clone(), k)
+	for _, o := range origins {
+		if err := CheckSetKeyIDs(out, TrustOptions{IncludeNext: true}, o); err != nil {
+			return nil, err
+		}
+	}
 	return out, nil
+}
+
+// latest is the latest time the set records: the creation, activation,
+// retirement or revocation of any key (the overlap ends are plans, not events).
+func (s Set) latest() time.Time {
+	var t time.Time
+	for _, k := range s {
+		for _, u := range []time.Time{k.CreatedAt, k.ActivatedAt, k.RetiredAt, k.RevokedAt} {
+			if u.After(t) {
+				t = u
+			}
+		}
+	}
+	return t
 }
 
 // Activate makes a next key active. When another key is active it is the
 // older key of a rotation: it gets OverlapEnds = now + overlapDays (1 to 365;
 // the default is DefaultOverlapDays when overlapDays is 0), after which it is
 // due to retire. A third active key is refused.
+//
+// now must be a time of the years 1 to 9999, and not later than the latest
+// time the set records (creations, activations, retirements and revocations of
+// any key) plus MaxActivationLeadDays. The package has no clock, so this is
+// all it can say about a clock error: it catches an activation time that is
+// far beyond everything the set holds (the year 2099 for a set that was last
+// changed in 2026, which would make the key "not in force" for decades), at
+// the moment it happens. It cannot catch a wrong time within
+// MaxActivationLeadDays of the last record, a time that is wrong but earlier
+// than the records, or a set that is simply old; a key that waited more than
+// MaxActivationLeadDays as next is refused too (add a fresh key, whose creation
+// time is recent, and revoke the stale one if it must go). A key that is
+// active but not yet in force (activation later than the time of the call)
+// does not sign, does not count as the other key of Retire or Revoke, and can
+// itself be retired (see Retire).
 func (s Set) Activate(fp string, now time.Time, overlapDays int) (Set, error) {
 	i := s.find(fp)
 	if i < 0 {
@@ -380,10 +519,21 @@ func (s Set) Activate(fp string, now time.Time, overlapDays int) (Set, error) {
 	}
 	out := s.clone()
 	now = norm(now)
+	if err := checkTime("the activation time", now); err != nil {
+		return nil, err
+	}
+	if limit := s.latest().AddDate(0, 0, MaxActivationLeadDays); now.After(limit) {
+		return nil, fmt.Errorf("%w: %w: the activation time %s is more than %d days after the latest time the set records (%s): a clock error? An activation that far ahead would leave the key not in force for a long time",
+			ErrInvalidArgument, ErrInvalidTime, now.Format(time.RFC3339), MaxActivationLeadDays, s.latest().Format(time.RFC3339))
+	}
 	if active == 1 {
+		end := now.AddDate(0, 0, overlapDays)
+		if !timeInRange(end) {
+			return nil, fmt.Errorf("%w: %w: the overlap would end in the year %d, expected at most 9999", ErrInvalidArgument, ErrInvalidTime, end.Year())
+		}
 		for j := range out {
 			if out[j].State == StateActive {
-				out[j].OverlapEnds = now.AddDate(0, 0, overlapDays)
+				out[j].OverlapEnds = end
 			}
 		}
 	}
@@ -445,14 +595,23 @@ func (s Set) Retire(fp string, now time.Time, bound TreeBound) (Set, error) {
 		return nil, fmt.Errorf("%w: %s to retired", ErrTransition, s[i].State)
 	}
 	now = norm(now)
+	if err := checkTime("the time of the retirement", now); err != nil {
+		return nil, err
+	}
 	if !s.otherActive(fp, now) {
 		return nil, s.noOtherSigner(fp)
 	}
+	// A key that is active but not yet in force (its activation is later than
+	// now: a clock error at its activation, or a clock that stepped back) never
+	// signed anything, and retiring it is the way out that needs no revocation.
+	// It is retired at the time it would have come into force, so that the
+	// record stays in order (RetiredAt is not before ActivatedAt).
+	retiredAt := now
 	if now.Before(s[i].ActivatedAt) {
-		return nil, fmt.Errorf("%w: the key is retired before it was activated", ErrInvalidArgument)
+		retiredAt = s[i].ActivatedAt
 	}
 	out := s.clone()
-	out[i].State, out[i].RetiredAt, out[i].OverlapEnds, out[i].MaxTreeSize = StateRetired, now, time.Time{}, maxTreeSize
+	out[i].State, out[i].RetiredAt, out[i].OverlapEnds, out[i].MaxTreeSize = StateRetired, retiredAt, time.Time{}, maxTreeSize
 	out.settle()
 	return out, nil
 }
@@ -471,18 +630,31 @@ func (s Set) Revoke(fp string, now, compromisedSince time.Time, reason string) (
 		return nil, fmt.Errorf("%w: revoked to revoked", ErrTransition)
 	}
 	now, compromisedSince = norm(now), norm(compromisedSince)
+	if err := checkTime("the time of the revocation", now); err != nil {
+		return nil, err
+	}
+	if err := checkTime("compromised-since", compromisedSince); err != nil {
+		return nil, err
+	}
 	if !s.otherActive(fp, now) {
 		return nil, s.noOtherSigner(fp)
 	}
 	if err := printableASCII(reason, MaxReasonSize); err != nil {
 		return nil, err
 	}
-	if compromisedSince.IsZero() || compromisedSince.After(now) {
-		return nil, fmt.Errorf("%w: compromised-since must be set and not after the time of the revocation", ErrInvalidArgument)
+	if compromisedSince.After(now) {
+		return nil, fmt.Errorf("%w: compromised-since must not be after the time of the revocation", ErrInvalidArgument)
 	}
 	out := s.clone()
 	k := &out[i]
-	k.State, k.RevokedAt, k.CompromisedSince, k.Reason = StateRevoked, now, compromisedSince, reason
+	// A revocation must not fail because the clock is behind the creation of
+	// the key: RevokedAt is never before CreatedAt (Validate), so a time before
+	// it is recorded as the creation time.
+	revokedAt := now
+	if revokedAt.Before(k.CreatedAt) {
+		revokedAt = k.CreatedAt
+	}
+	k.State, k.RevokedAt, k.CompromisedSince, k.Reason = StateRevoked, revokedAt, compromisedSince, reason
 	k.OverlapEnds, k.MaxTreeSize = time.Time{}, 0
 	out.settle()
 	return out, nil
@@ -565,6 +737,9 @@ func (k Key) MaySign(p Purpose, subject string, now time.Time) error {
 		if k.State != StateActive {
 			return no("only an active key authorises a new key")
 		}
+		if now.Before(k.ActivatedAt) {
+			return no("it is not in force yet")
+		}
 		return nil
 	case PurposeKeyRetired, PurposeKeyRevoked:
 		if subject == k.Fingerprint() {
@@ -572,6 +747,9 @@ func (k Key) MaySign(p Purpose, subject string, now time.Time) error {
 		}
 		if k.State != StateActive {
 			return no("only an active key signs this event")
+		}
+		if now.Before(k.ActivatedAt) {
+			return no("it is not in force yet")
 		}
 		return nil
 	}

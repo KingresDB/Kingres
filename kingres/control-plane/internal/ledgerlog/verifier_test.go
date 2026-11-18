@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,7 +21,10 @@ import (
 
 // These tests need a built kingres-verify. KINGRES_VERIFY names it (the older
 // name KINGRES_VERIFY_BIN of the cluster tests is read too); without it they
-// are skipped.
+// are skipped, and TestVerifierTestsRan says so in the output of every run.
+// With KINGRES_REQUIRE_VERIFY=1 a missing verifier is a failure, in each of
+// them and in TestVerifierTestsRan: that is the setting of a run that must
+// not pass without them.
 
 func verifierBin(t testing.TB) string {
 	t.Helper()
@@ -29,12 +33,37 @@ func verifierBin(t testing.TB) string {
 		p = os.Getenv("KINGRES_VERIFY_BIN")
 	}
 	if p == "" {
+		if os.Getenv("KINGRES_REQUIRE_VERIFY") == "1" {
+			t.Fatal("KINGRES_REQUIRE_VERIFY=1 and KINGRES_VERIFY does not name a built kingres-verify")
+		}
 		t.Skip("KINGRES_VERIFY does not name a built kingres-verify")
 	}
 	return p
 }
 
+// TestVerifierTestsRan always runs. When no verifier is named, the tests that
+// run kingres-verify are skipped, and a skip is invisible in a plain go test:
+// this test writes a plain notice to the standard error (which go test shows
+// when it is run in the package directory or with -v) and logs it, and passes,
+// so that an ordinary developer run does not fail. With KINGRES_REQUIRE_VERIFY=1
+// (the setting for the integrator's runs) it fails instead.
+func TestVerifierTestsRan(t *testing.T) {
+	if os.Getenv("KINGRES_VERIFY") != "" || os.Getenv("KINGRES_VERIFY_BIN") != "" {
+		return
+	}
+	msg := "NOTE: KINGRES_VERIFY is not set, so the tests that run kingres-verify were SKIPPED (TestPublicationAgainstTheVerifier, TestKeyIDCollisionMatrixAgainstTheVerifier, TestVerifierAndKeyIDCollision and others): the files this package writes were not checked against the verifier in this run. Set KINGRES_VERIFY to a built kingres-verify, and KINGRES_REQUIRE_VERIFY=1 to make this a failure."
+	if os.Getenv("KINGRES_REQUIRE_VERIFY") == "1" {
+		t.Fatal(msg)
+	}
+	fmt.Fprintln(os.Stderr, msg)
+	t.Log(msg)
+}
+
+// verifierRuns counts the verifier processes the tests start.
+var verifierRuns atomic.Int64
+
 func runVerifier(t testing.TB, args ...string) (int, string) {
+	verifierRuns.Add(1)
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -204,6 +233,13 @@ type logCase struct {
 	old     string
 	store   *DirStore
 	origin  string
+	// deep marks the cases that get every check (size and root, a wrong root, a
+	// state file, damaged files). The others get the checkpoint and the
+	// consistency check, so that every size is accepted by the verifier but a run
+	// does not start dozens of verifier processes for each log (on a slow Windows
+	// machine a process costs half a second). KINGRES_LONG_TESTS=1 makes every
+	// case deep.
+	deep bool
 }
 
 func chainID(i int) (id [32]byte) {
@@ -216,6 +252,8 @@ func chainID(i int) (id [32]byte) {
 func TestPublicationAgainstTheVerifier(t *testing.T) {
 	verifierBin(t)
 	rng := newRand(t)
+	runs0 := verifierRuns.Load()
+	defer func() { t.Logf("%d verifier processes were started", verifierRuns.Load()-runs0) }()
 	p := newPublication(t)
 	sizes := []int{0, 1, 2, 3, 255, 256, 257, 300 + rng.Intn(400)}
 	if longTests() {
@@ -241,7 +279,7 @@ func TestPublicationAgainstTheVerifier(t *testing.T) {
 				a = n // an old checkpoint of the same size
 			}
 		}
-		lc := logCase{rel: rel, logFlag: fmt.Sprintf("chain:%x:e1", id[:]), n: n, a: a, origin: origin}
+		lc := logCase{rel: rel, logFlag: fmt.Sprintf("chain:%x:e1", id[:]), n: n, a: a, origin: origin, deep: longTests() || i == len(sizes)-1}
 		if n == 0 {
 			store, err := NewDirStore(p.logDir(rel))
 			if err != nil {
@@ -278,7 +316,7 @@ func TestPublicationAgainstTheVerifier(t *testing.T) {
 			return d
 		}
 		old, store := p.buildLog(rng, rel, origin, entry, 300, 120, 1)
-		cases = append(cases, logCase{rel: rel, logFlag: fmt.Sprintf("aggregate:%x", id[:]), n: 300, a: 120, old: old, store: store, origin: origin})
+		cases = append(cases, logCase{rel: rel, logFlag: fmt.Sprintf("aggregate:%x", id[:]), n: 300, a: 120, old: old, store: store, origin: origin, deep: true})
 	}
 	// Reopening the first log from its frontier, to be sure the tiles that the
 	// verifier reads are the ones the log would continue from.
@@ -296,7 +334,8 @@ func TestPublicationAgainstTheVerifier(t *testing.T) {
 			if st, out := p.verify("checkpoint", "--log", lc.logFlag); st != 0 {
 				t.Errorf("%s (n=%d): checkpoint status %d\n%s", lc.rel, lc.n, st, out)
 			}
-			if st, out := p.verify("checkpoint", "--log", lc.logFlag, "--min-size", strconv.Itoa(lc.n)); st != 0 {
+			if !lc.deep {
+			} else if st, out := p.verify("checkpoint", "--log", lc.logFlag, "--min-size", strconv.Itoa(lc.n)); st != 0 {
 				t.Errorf("%s: checkpoint --min-size: status %d\n%s", lc.rel, st, out)
 			}
 			if lc.n == 0 {
@@ -308,6 +347,9 @@ func TestPublicationAgainstTheVerifier(t *testing.T) {
 			}
 			if st, out := p.verify("consistency", "--log", lc.logFlag, "--old", lc.old); st != 0 {
 				t.Errorf("%s (a=%d n=%d): consistency status %d\n%s", lc.rel, lc.a, lc.n, st, out)
+			}
+			if !lc.deep {
+				continue
 			}
 			// The old checkpoint given as size and root.
 			l := mustOpenFromTilesAt(t, lc, lc.a)
@@ -327,7 +369,7 @@ func TestPublicationAgainstTheVerifier(t *testing.T) {
 
 	t.Run("a state file follows the log", func(t *testing.T) {
 		for _, lc := range cases {
-			if lc.n == 0 || lc.a >= lc.n {
+			if !lc.deep || lc.n == 0 || lc.a >= lc.n {
 				continue
 			}
 			state := filepath.Join(t.TempDir(), "state.json")
@@ -354,7 +396,7 @@ func TestPublicationAgainstTheVerifier(t *testing.T) {
 
 	t.Run("a changed byte is found", func(t *testing.T) {
 		for _, lc := range cases {
-			if lc.n == 0 {
+			if lc.n == 0 || !lc.deep {
 				continue
 			}
 			p.flipChecks(t, lc, rng)

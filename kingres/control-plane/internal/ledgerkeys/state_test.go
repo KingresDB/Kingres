@@ -189,7 +189,7 @@ func TestRevokeNeedsAnotherActiveKey(t *testing.T) {
 	if k.State != StateRevoked || !k.CompromisedSince.Equal(since) || k.Reason != "laptop stolen" || !k.OverlapEnds.IsZero() {
 		t.Fatalf("revoked key: %+v", k)
 	}
-	if err := s.CanSign(fp(2), PurposeKeyRevoked, fp(1), t0); err != nil {
+	if err := s.CanSign(fp(2), PurposeKeyRevoked, fp(1), t0.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.CanSign(fp(1), PurposeCheckpoint, "", t0); !errors.Is(err, ErrNotAllowed) {

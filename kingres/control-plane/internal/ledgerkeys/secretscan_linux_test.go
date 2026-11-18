@@ -183,3 +183,40 @@ func plainFlowLeavesCopies(t *testing.T) (copies int, ok bool) {
 	}()
 	return scanSelf(mask)
 }
+
+// TestParsePlainLeavesNoRawSeed (K2-12): parsePlain decodes the seed into a
+// buffer of its own and copies it into the secret it returns; once the secret
+// is destroyed the raw 32 bytes are nowhere in the memory of the process, so
+// the buffer was cleared. No crypto/ed25519 call is made on this path, so the
+// count is exactly zero (a run that removes the clearing leaves the buffer in
+// freed memory, and the scan finds it). A whole flow does call the library, and
+// the copies that it leaves are the ones the package doc names.
+func TestParsePlainLeavesNoRawSeed(t *testing.T) {
+	seed := make([]byte, SeedSize)
+	if _, err := rand.Read(seed); err != nil {
+		t.Fatal(err)
+	}
+	mask := make([]byte, SeedSize)
+	for i := range mask {
+		mask[i] = seed[i] ^ scanMask
+	}
+	rest := marshalPlain(seed)[len(FileMagic)+1+len(plainHead):]
+	clear(seed)
+	s, err := parsePlain(rest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Control: while the secret is alive the scan sees the one copy it holds.
+	n, ok := scanSelf(mask)
+	if !ok {
+		t.Skip("the memory of the process cannot be read here")
+	}
+	if n < 1 {
+		t.Fatalf("the scan does not see the copy that the secret holds (%d)", n)
+	}
+	s.destroy()
+	clear(rest)
+	if n, _ := scanSelf(mask); n != 0 {
+		t.Errorf("the raw seed is in memory %d times after the secret was destroyed: parsePlain left a copy", n)
+	}
+}

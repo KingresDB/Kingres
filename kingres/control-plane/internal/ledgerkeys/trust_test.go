@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -109,7 +110,8 @@ func TestTrustFileRefusals(t *testing.T) {
 }
 
 // verifierBin returns the kingres-verify binary named by KINGRES_VERIFY (or
-// KINGRES_VERIFY_BIN), or skips the test.
+// KINGRES_VERIFY_BIN), or skips the test. With KINGRES_REQUIRE_VERIFY=1 a
+// missing verifier is a failure, not a skip.
 func verifierBin(t testing.TB) string {
 	t.Helper()
 	p := os.Getenv("KINGRES_VERIFY")
@@ -117,9 +119,30 @@ func verifierBin(t testing.TB) string {
 		p = os.Getenv("KINGRES_VERIFY_BIN")
 	}
 	if p == "" {
+		if os.Getenv("KINGRES_REQUIRE_VERIFY") == "1" {
+			t.Fatal("KINGRES_REQUIRE_VERIFY=1 and KINGRES_VERIFY does not name a built kingres-verify")
+		}
 		t.Skip("KINGRES_VERIFY does not name a built kingres-verify")
 	}
 	return p
+}
+
+// TestVerifierTestsRan always runs. Without a named verifier the tests that run
+// kingres-verify are skipped, and a skip is invisible in a plain go test: this
+// test writes a plain notice to the standard error (which go test shows when
+// it is run in the package directory or with -v), logs it, and passes, so that
+// an ordinary developer run does not fail. With KINGRES_REQUIRE_VERIFY=1 (the
+// setting for the integrator's runs) it fails instead.
+func TestVerifierTestsRan(t *testing.T) {
+	if os.Getenv("KINGRES_VERIFY") != "" || os.Getenv("KINGRES_VERIFY_BIN") != "" {
+		return
+	}
+	msg := "NOTE: KINGRES_VERIFY is not set, so the tests that run kingres-verify were SKIPPED (TestTrustFileAgainstTheVerifier, TestRetireBoundAgainstTheVerifier, TestTrustFileExtremeTimesAgainstTheVerifier and others): the trust files this package writes were not read by the verifier in this run. Set KINGRES_VERIFY to a built kingres-verify, and KINGRES_REQUIRE_VERIFY=1 to make this a failure."
+	if os.Getenv("KINGRES_REQUIRE_VERIFY") == "1" {
+		t.Fatal(msg)
+	}
+	fmt.Fprintln(os.Stderr, msg)
+	t.Log(msg)
 }
 
 func runVerifier(t testing.TB, args ...string) (int, string) {

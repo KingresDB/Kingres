@@ -18,7 +18,8 @@ type TileGetter interface {
 // tiles. Like a reader of the publication it asks for the partial tile of the
 // width the size needs and, when that is not stored (a partial tile may be
 // deleted once the full tile exists), takes the first hashes of the full tile.
-// It does not trust a tile: the caller compares the root and every proof with a
+// It keeps every tile it parses for as long as it lives (no eviction): use one
+// for a request or a batch and drop it. It does not trust a tile: the caller compares the root and every proof with a
 // signed checkpoint, or uses Audit.
 type Reader struct {
 	ctx   context.Context
@@ -304,10 +305,14 @@ func (r *Reader) subproof(m, lo, hi uint64, b bool) ([]Hash, error) {
 // hashes below it, and the root of the whole tree is wantRoot. It uses memory
 // for one tile per level and time linear in the size. It is the check that the
 // verifier's consistency command does not make (it reads the tiles of a proof
-// path only, and no entry bundle).
+// path only, and no entry bundle). It looks at ctx at the start and at least once
+// per tile (see the package documentation).
 func Audit(ctx context.Context, src TileGetter, size uint64, wantRoot Hash) error {
 	if size >= MaxTreeSize {
 		return fmt.Errorf("%w: size %d", ErrTooLarge, size)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	r := &Reader{ctx: ctx, src: src, size: size}
 	var fr Frontier
@@ -316,6 +321,9 @@ func Audit(ctx context.Context, src TileGetter, size uint64, wantRoot Hash) erro
 	var bundle [][]byte
 	var bad error
 	load := func(level int, n uint64) ([]Hash, error) {
+		if err := ctx.Err(); err != nil { // once per tile, whatever the getter does
+			return nil, err
+		}
 		w, err := r.widthAt(level, n)
 		if err != nil {
 			return nil, err
@@ -348,6 +356,9 @@ func Audit(ctx context.Context, src TileGetter, size uint64, wantRoot Hash) erro
 	for i := uint64(0); i < size; i++ {
 		n := i / TileWidth
 		if leafTile == nil || leafTileN != n {
+			if err := ctx.Err(); err != nil { // once per tile of leaves, which also covers its bundle
+				return err
+			}
 			hs, err := load(0, n)
 			if err != nil {
 				return err

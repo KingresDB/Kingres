@@ -17,13 +17,16 @@
 //     which checks every signature an external signer returns, so that a
 //     program, an HSM or a KMS can be added later behind the same interface.
 //     KeyID, Fingerprint, ValidKeyName and SignatureLineName give the
-//     signed-note key id and key name rules. CheckKeyIDs and KeyIDCollision
-//     find two different keys with the same key id under one name.
+//     signed-note key id and key name rules. CheckKeyIDs, CheckSetKeyIDs and
+//     KeyIDCollision find two different keys with the same key id under one
+//     name; CheckSetKeyIDs applies the verifier's rule to a key set.
 //   - Set, Key, State: the key state machine of design 3.3 (next, active,
 //     retired, revoked; at most two active keys; overlap of a rotation;
 //     what a key in each state may sign) as pure logic. It has no storage.
-//     Add, Activate, Retire (with a TreeBound: AtMost or Unbounded), Revoke,
-//     Signers, DueForRetirement, CanSign, MaySign, Validate, Summary.
+//     Add, AddChecked, Activate, Retire (with a TreeBound: AtMost or
+//     Unbounded), Revoke, Signers, DueForRetirement, CanSign, MaySign,
+//     Validate, Summary, and the constants MaxKeys, MaxActive,
+//     MaxActivationLeadDays and ErrInvalidTime.
 //   - TrustFile and TrustEntries: the keys member of trust.json, in the bytes
 //     that kingres-verify trust writes and reads. ValidPrefix checks an origin
 //     prefix.
@@ -49,7 +52,18 @@
 //
 //   - the expanded private key and the scalars that crypto/ed25519 makes inside
 //     NewKeyFromSeed and Sign, which live in the library's own variables and on
-//     the stack;
+//     the stack, and the raw 32 byte seed itself, which the library copies:
+//     NewKeyFromSeed copies it into the key it builds, and Sign builds a signing
+//     key out of the private key and copies the seed again. The package clears
+//     the private key that NewKeyFromSeed returns, the seed buffers of Parse,
+//     Open, Encode and GenerateKey, and the secret it holds (Close and
+//     Destroy), so the copies that remain after a key is closed are the
+//     library's. How many there are depends on the Go version and on whether
+//     the stack and heap memory has been reused: a scan of the memory of the
+//     process for the 32 raw bytes after a key was made, used for up to four
+//     signatures and closed found none to three in the runs made for this
+//     package (a test scans the one path that is the package's own, parsePlain,
+//     and finds none);
 //   - the key schedule of AES and the state of GCM that crypto/aes and
 //     crypto/cipher build from the key derived from the passphrase, and the
 //     inner and outer pads and hash states that crypto/hmac and crypto/sha256
@@ -71,7 +85,8 @@
 // Persist the Set after every transition (kingres_cp.ledger_signing_key): the
 // package returns the new Set and keeps nothing. Serialise transitions (one
 // task at a time). Re-sign the latest checkpoint of every log with the new key
-// set at a rotation (ledgerlog.ResignCheckpoint): a log that grows no more keeps
+// set at a rotation (ledgerlog.ResignCheckpoint, which takes every key of the
+// trust file as the trusted keys): a log that grows no more keeps
 // the signatures it has, and a retired key's signature alone is fine for the
 // verifier only while the trust file still lists that key. Publish the trust
 // file entries to the operator; the verifier never takes first trust from the
@@ -86,24 +101,72 @@
 // legal and do not give ErrNoActiveKey. A set where a key is active in the
 // record but its activation time has not come is legal too; Signers(now) then
 // returns ErrNoActiveKey until that time, and a caller that signs must treat
-// that error as "do not sign", never as an empty list.
+// that error as "do not sign", never as an empty list. Validate also refuses
+// the damage it can see: a time that is zero or outside the years 1 to 9999
+// (ErrInvalidTime), fields that do not belong to the state (a Reason or
+// CompromisedSince on a key that is not revoked, a MaxTreeSize or an
+// OverlapEnds where none belongs), times in the wrong order (retired before
+// activated, revoked before created), and two active keys that do not have
+// exactly one OverlapEnds, equal to the activation of the other key plus a whole
+// number of days from 1 to 365. What it cannot tell apart: a set in which every
+// key was flipped back to next with its times cleared looks like a new set that
+// was never used; and a marker moved to the key that was activated last looks
+// like the set that Activate makes after a future or backward activation time
+// (see Activate), so only the whole-day rule catches it, and only when the move
+// does not happen to keep it.
+//
+// Times. The package has no clock; the caller passes the time of each call. Add,
+// Activate, Retire and Revoke refuse the zero time and a time outside the years
+// 1 to 9999 (ErrInvalidTime), which no later call could repair: the zero time
+// makes Validate refuse the whole set for ever, and a year of five digits makes
+// the verifier refuse the trust file. Activate also refuses a time more than
+// MaxActivationLeadDays (366) after the latest time the set records, which
+// catches a clock that is wrong by years at the moment it is wrong and nothing
+// else (it cannot see a time that is wrong within that tolerance, or one that is
+// earlier than the records; a next key that waited longer than the tolerance
+// cannot be activated either: add a fresh key and revoke the stale one). A key
+// that is active but not yet in force does not sign and is not the "other key"
+// of Retire or Revoke; DueForRetirement, Retire, Revoke and CanSign agree about
+// which keys are in force, and such a key can be retired without a revocation
+// (it is recorded as retired at the time it would have come into force). A
+// clock that steps back is tolerated: Retire and Revoke record the later of
+// the time given and the activation (or creation) of the key, so a revocation
+// is never refused for its time.
 //
 // Key id collisions: the key id of a signature line is 32 bits of a hash of the
 // key name (the origin of a log) and the key. Two keys of a set can have the
 // same id under the origin of some log. A signed note holds one line for a
-// name and key id, and the verifier refuses a note with two such lines, and
-// refuses every checkpoint of that name while its trust file lists both keys as
-// usable, so such a pair can never sign together or be trusted together for
-// that log. Verified with the built verifier (see ledgerlog). The chance is
-// about 10^-4 for a set of 16 keys and 10^4 logs. ledgerlog reports it as
-// ErrKeyIDCollision with both fingerprints. CheckKeyIDs finds it before it
-// matters: call it, per log origin, with the keys that may sign at once and
-// the retired keys the trust file lists, before a next key is activated. A key
-// that has not signed anything (state next) is then dropped and another
-// generated. A collision between an active key and a retired one cannot be
-// cured by this package: the verifier refuses that log until the trust file no
-// longer lists both as usable, which is a decision of the operator (revoking
-// the retired key makes every checkpoint that rests only on it unreadable).
+// name and key id, and the verifier refuses a note with two such lines. It also
+// refuses by two rules, which the tests run against the built verifier (see
+// ledgerlog): a fresh checkpoint is checked against the usable keys of the
+// trust file (revoked keys, and next keys that the file does not list, are left
+// out), so two usable keys with one id make it refuse every checkpoint of that
+// name; a note the auditor already holds (a state file, --old) is checked
+// against every key of the file, whatever its standing, so one revoked key with
+// the id of another listed key makes it refuse that log for every auditor who
+// keeps a note of it, with status 2, for ever. A key is never removed from the
+// trust file, so revoking a key or retiring it is NO cure: no later transition
+// removes the collision. The only place to stop it is where a key enters the
+// set: Set.AddChecked refuses a new key whose id under any of the origins the
+// caller names equals that of ANY key of the set, whatever its state, and
+// CheckSetKeyIDs applies the same rule to a key set as the trust file would list
+// it (with and without the next keys, as TrustOptions.IncludeNext says) and an
+// origin, and says which of the two paths refuse (KeyIDCollision.Fresh and
+// Held). The caller names every origin the key will sign: one per log and
+// epoch, so that is every log of the cluster that exists or will. The chance is
+// about 10^-4 for a set of 16 keys and 10^4 logs. ledgerlog reports a collision
+// of a note as ErrKeyIDCollision with both fingerprints. A key that has not
+// signed anything (state next) that collides is dropped and another generated
+// (AddChecked does not add it, so there is nothing to drop). When a collision
+// is found after the fact (a key added with Add, or an origin that did not
+// exist at the time, such as a new epoch or a new chain), this package cannot
+// cure it: the colliding pair stays in the trust file. If the colliding key
+// never signed (next), revoking it removes it from the fresh path only; for the
+// held path the operator's options are to publish that log under another origin
+// (another epoch or prefix, whose key ids differ), to tell the auditors of the
+// log to start a new state file without a held note, or to start a new trust
+// generation (see "When the set is full"). The choice belongs to the operator,
+// and it is why the check must run before the key is added.
 //
 // # Retiring, revoking and bounds
 //

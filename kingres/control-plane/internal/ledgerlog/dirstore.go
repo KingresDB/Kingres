@@ -43,7 +43,8 @@ const (
 //
 // A tile is never published by a rename, which would replace a tile that
 // another writer published in the meantime. When a hard link cannot be made
-// for a reason other than "the name exists", PutTile fails with
+// because the file system has none (a failure of another kind is returned as it
+// is, with its cause), PutTile fails with
 // ErrHardLinksRequired: the publication directory must be on a file system
 // with hard links (ext4, XFS, btrfs, NTFS; not FAT or exFAT, and not every
 // network or container file system).
@@ -52,7 +53,9 @@ const (
 // system and the disk honour a flush: a put that returned nil has its file
 // whole, and every directory that the put created has its entry in its parent,
 // up to the root of the store (the parent of each new directory is flushed,
-// deepest first, after the directory that holds the file). A put that returned
+// deepest first, after the directory that holds the file; a put that finds the
+// tile there and equal flushes the file, its directory and every ancestor up to
+// the root, so that the repeat after a crash makes the tile durable). A put that returned
 // an error, or that was cut by the loss, left the tile absent or whole, never
 // part of one, and at worst a temporary file. A checkpoint is the old note or
 // the new one. Not guaranteed: the order in which two different puts reach the
@@ -91,6 +94,8 @@ type DirStore struct {
 	rename     func(oldname, newname string) error
 	renameBusy func(err error) bool
 	afterStat  func(path string)
+	now        func() time.Time                                 // the clock of the retry, for tests
+	pause      func(ctx context.Context, d time.Duration) error // the wait of the retry, for tests
 }
 
 // DefaultCheckpointRetry is the time PutCheckpoint retries a blocked rename
@@ -100,8 +105,10 @@ const DefaultCheckpointRetry = 3 * time.Second
 // Errors of DirStore, tested with errors.Is.
 var (
 	// ErrHardLinksRequired is returned by PutTile when a hard link cannot be
-	// made for a reason other than that the name exists: the publication
-	// directory needs a file system with hard links. Nothing was published.
+	// made because the file system has no hard links (the errors that mean
+	// that, and only those: see platformNoHardLinks; any other failure is
+	// returned as it is, with its cause): the publication directory needs a
+	// file system with hard links. Nothing was published.
 	ErrHardLinksRequired = errors.New("ledgerlog: the publication directory needs a file system with hard links")
 	// ErrCheckpointBusy is returned by PutCheckpoint when the checkpoint file is
 	// held open by another program (Windows) for the whole of CheckpointRetry.
@@ -129,7 +136,7 @@ func NewDirStore(dir string) (*DirStore, error) {
 			return nil, err
 		}
 	}
-	return &DirStore{root: dir}, nil
+	return &DirStore{root: filepath.Clean(dir)}, nil
 }
 
 // missingDirs returns the directories on the way to dir that do not exist yet,
@@ -225,12 +232,26 @@ func (d *DirStore) readRegular(path string, limit int64) ([]byte, error) {
 	if of, err := f.Stat(); err != nil || !of.Mode().IsRegular() || !os.SameFile(fi, of) {
 		return nil, fmt.Errorf("ledgerlog: %s changed while it was opened", path)
 	}
-	data, err := io.ReadAll(io.LimitReader(f, limit+1))
+	return readAtMost(f, path, limit)
+}
+
+// readHook, when set, is called by readAtMost with the number of bytes it read
+// (a hook for tests that see how much a file that grows was read).
+var readHook func(n int64)
+
+// readAtMost reads r to its end but never more than limit+1 bytes, and refuses
+// what is longer than limit: a file that grows between the Lstat that checked
+// its size and the read is read only up to the limit, whatever it grows to.
+func readAtMost(r io.Reader, name string, limit int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if readHook != nil {
+		readHook(int64(len(data)))
+	}
 	if err != nil {
 		return nil, fmt.Errorf("ledgerlog: %w", err)
 	}
 	if int64(len(data)) > limit {
-		return nil, fmt.Errorf("ledgerlog: %s has more than %d bytes", path, limit)
+		return nil, fmt.Errorf("ledgerlog: %s has more than %d bytes", name, limit)
 	}
 	return data, nil
 }
@@ -243,7 +264,10 @@ func tileLimit(k TileKey) int64 {
 }
 
 // GetTile implements Store.
-func (d *DirStore) GetTile(_ context.Context, k TileKey) ([]byte, error) {
+func (d *DirStore) GetTile(ctx context.Context, k TileKey) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if !k.Valid() {
 		return nil, fmt.Errorf("%w: the key %+v is not valid", ErrTileMalformed, k)
 	}
@@ -259,11 +283,17 @@ func (d *DirStore) GetTile(_ context.Context, k TileKey) ([]byte, error) {
 
 // PutTile implements Store. A hard link publishes the file, which fails when
 // the name exists, so a tile is never replaced. When the link cannot be made
-// for another reason (a file system without hard links, a refused permission)
-// PutTile returns ErrHardLinksRequired and publishes nothing: there is no
-// fallback to a rename, which would replace a tile that another writer
-// published in the meantime.
+// because the file system has no hard links PutTile returns
+// ErrHardLinksRequired and publishes nothing: there is no fallback to a
+// rename, which would replace a tile that another writer published in the
+// meantime. Any other link failure (a full disk, a quota, a refused
+// permission) is returned as it is, wrapping its cause. A tile that is there
+// and equal is not written again but is flushed, with its directories (see
+// DirStore). The context is checked before the work.
 func (d *DirStore) PutTile(ctx context.Context, k TileKey, data []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := checkTileData(k, data); err != nil {
 		return err
 	}
@@ -281,8 +311,13 @@ func (d *DirStore) PutTile(ctx context.Context, k TileKey, data []byte) error {
 		}
 		return true, nil
 	}
-	if done, err := same(); done || err != nil {
+	if done, err := same(); err != nil {
 		return err
+	} else if done {
+		// The tile is there and equal, and a put that returns nil is durable:
+		// this may be the repeat after a crash between the link and the
+		// flushes, whose page cache the first put never flushed.
+		return d.flushExisting(target, nil)
 	}
 	created, err := d.mkdirs(filepath.Dir(target))
 	if err != nil {
@@ -315,9 +350,14 @@ func (d *DirStore) PutTile(ctx context.Context, k TileKey, data []byte) error {
 			if !done {
 				return fmt.Errorf("ledgerlog: %s disappeared while it was being published", k.Path())
 			}
-			return nil
+			return d.flushExisting(target, created)
 		}
-		return fmt.Errorf("%w: %s was not published (%v)", ErrHardLinksRequired, k.Path(), err)
+		if platformNoHardLinks(err) {
+			return fmt.Errorf("%w: %s was not published: %w", ErrHardLinksRequired, k.Path(), err)
+		}
+		// Anything else (a full disk, a quota, an I/O error, a refused
+		// permission) is not a property of the file system: say what it is.
+		return fmt.Errorf("ledgerlog: %s was not published: %w", k.Path(), err)
 	}
 	if err := d.hook("after-publish"); err != nil {
 		crashed = true
@@ -368,6 +408,66 @@ func (d *DirStore) flush(dir string, created []string) error {
 	return nil
 }
 
+// flushExisting makes durable a tile that was found there and equal (it was
+// published by an earlier put, possibly one that crashed before its flushes):
+// the file, then the directory that holds it and every ancestor up to the root
+// (the depth is at most five), plus the parent of the root when this put had to
+// create it. created are the directories this put made (nil when it made
+// none).
+func (d *DirStore) flushExisting(target string, created []string) error {
+	if d.NoSync {
+		return nil
+	}
+	if err := syncFile(target); err != nil {
+		return err
+	}
+	for p := filepath.Dir(target); ; p = filepath.Dir(p) {
+		if err := d.syncStep(p); err != nil {
+			return err
+		}
+		if p == d.root || filepath.Dir(p) == p {
+			break
+		}
+	}
+	if len(created) > 0 && created[0] == d.root {
+		return d.syncStep(filepath.Dir(d.root))
+	}
+	return nil
+}
+
+// syncStep flushes the directory p after the hook has seen it.
+func (d *DirStore) syncStep(p string) error {
+	rel, err := filepath.Rel(d.root, p)
+	if err != nil {
+		return fmt.Errorf("ledgerlog: %w", err)
+	}
+	if err := d.hook("sync-dir " + filepath.ToSlash(rel)); err != nil {
+		return err
+	}
+	return syncDir(p)
+}
+
+// syncFile flushes a file that already exists (on Windows only a handle that
+// is open for writing can be flushed, and the file was flushed when it was
+// written, so nothing is done there).
+func syncFile(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	f, err := os.Open(path) // #nosec G304 -- a tile of the store
+	if err != nil {
+		return fmt.Errorf("ledgerlog: %w", err)
+	}
+	err = f.Sync()
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return fmt.Errorf("ledgerlog: flushing %s: %w", path, err)
+	}
+	return nil
+}
+
 // writeTemp writes data to a new temporary file in dir and flushes it.
 func (d *DirStore) writeTemp(dir string, data []byte) (string, error) {
 	f, err := os.CreateTemp(dir, tempPrefix+"*")
@@ -402,7 +502,14 @@ func (d *DirStore) writeTemp(dir string, data []byte) (string, error) {
 	return name, nil
 }
 
+// syncDirHook, when set, is called with every directory syncDir is asked to
+// flush, before anything else (a hook for tests).
+var syncDirHook func(dir string)
+
 func syncDir(dir string) error {
+	if syncDirHook != nil {
+		syncDirHook(dir)
+	}
 	if runtime.GOOS == "windows" {
 		return nil // a directory cannot be opened to flush it
 	}
@@ -421,7 +528,10 @@ func syncDir(dir string) error {
 }
 
 // Widths implements Store.
-func (d *DirStore) Widths(_ context.Context, level int, index uint64) ([]int, error) {
+func (d *DirStore) Widths(ctx context.Context, level int, index uint64) ([]int, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if level < EntryLevel || level > MaxLevel {
 		return nil, fmt.Errorf("%w: level %d", ErrBadPath, level)
 	}
@@ -450,7 +560,10 @@ func (d *DirStore) Widths(_ context.Context, level int, index uint64) ([]int, er
 }
 
 // GetCheckpoint implements CheckpointStore.
-func (d *DirStore) GetCheckpoint(context.Context) ([]byte, error) {
+func (d *DirStore) GetCheckpoint(ctx context.Context) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return d.readRegular(d.path("checkpoint"), MaxNoteSize)
 }
 
@@ -462,8 +575,17 @@ func (d *DirStore) GetCheckpoint(context.Context) ([]byte, error) {
 // retries the rename for CheckpointRetry (DefaultCheckpointRetry when zero);
 // if the file is still held it returns an error that is ErrCheckpointBusy, the
 // old checkpoint is whole and no temporary file is left, and the caller may
-// try again later. Any other failure is returned as it is.
-func (d *DirStore) PutCheckpoint(_ context.Context, note []byte) error {
+// try again later. The same access-denied failure is also what a directory in
+// the place of the checkpoint, or a checkpoint with the read-only attribute,
+// gives: those do not go away by waiting, so they are named as what they are at
+// once, without the wait and without ErrCheckpointBusy. The context is checked
+// before the work and in the wait between two tries (the wait ends with its
+// error, the old checkpoint whole and no temporary file left). Any other
+// failure is returned as it is.
+func (d *DirStore) PutCheckpoint(ctx context.Context, note []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if len(note) == 0 || len(note) > MaxNoteSize {
 		return fmt.Errorf("ledgerlog: a checkpoint note has 1 to %d bytes", MaxNoteSize)
 	}
@@ -489,25 +611,42 @@ func (d *DirStore) PutCheckpoint(_ context.Context, note []byte) error {
 	if d.renameBusy != nil {
 		busy = d.renameBusy
 	}
-	budget := d.CheckpointRetry
-	if budget == 0 {
-		budget = DefaultCheckpointRetry
+	budget := d.retryBudget()
+	now, pause := time.Now, sleepContext
+	if d.now != nil {
+		now = d.now
 	}
-	deadline := time.Now().Add(budget)
+	if d.pause != nil {
+		pause = d.pause
+	}
+	deadline := now().Add(budget)
 	wait := 5 * time.Millisecond
-	var rerr error
+	var rerr, stop error
 	for {
 		if rerr = rename(tmp, target); rerr == nil {
 			break
 		}
-		if !busy(rerr) || !time.Now().Before(deadline) {
+		if !busy(rerr) {
 			break
 		}
-		time.Sleep(min(wait, time.Until(deadline))) // a reader holds the old file open
+		if stop = checkpointTargetProblem(target); stop != nil {
+			break // waiting does not cure it
+		}
+		if !now().Before(deadline) {
+			break
+		}
+		// a reader holds the old file open
+		if err := pause(ctx, min(wait, deadline.Sub(now()))); err != nil {
+			_ = os.Remove(tmp)
+			return err
+		}
 		wait = min(wait*2, 100*time.Millisecond)
 	}
 	if rerr != nil {
 		_ = os.Remove(tmp)
+		if stop != nil {
+			return fmt.Errorf("ledgerlog: the checkpoint was not replaced: %w (%v)", stop, rerr)
+		}
 		if busy(rerr) {
 			return fmt.Errorf("%w (%v)", ErrCheckpointBusy, rerr)
 		}
@@ -599,12 +738,50 @@ func LoadFrontierFile(path string, wantSize uint64, wantRoot Hash) (Frontier, er
 	if of, err := f.Stat(); err != nil || !of.Mode().IsRegular() || !os.SameFile(fi, of) {
 		return Frontier{}, fmt.Errorf("ledgerlog: %s changed while it was opened", path)
 	}
-	data, err := io.ReadAll(io.LimitReader(f, MaxFrontierSize+1))
+	data, err := readAtMost(f, path, MaxFrontierSize)
 	if err != nil {
-		return Frontier{}, fmt.Errorf("ledgerlog: %w", err)
-	}
-	if len(data) > MaxFrontierSize {
-		return Frontier{}, fmt.Errorf("ledgerlog: %s has more than %d bytes", path, MaxFrontierSize)
+		return Frontier{}, err
 	}
 	return LoadFrontier(data, wantSize, wantRoot)
+}
+
+// checkpointTargetProblem says why a failed rename onto target will not
+// succeed by waiting: the target is a directory, or (on Windows, where the
+// attribute blocks a replacement) a file with the read-only attribute. It
+// returns nil when the target is a file that another program may be holding.
+func checkpointTargetProblem(target string) error {
+	fi, err := os.Lstat(target)
+	if err != nil {
+		return nil
+	}
+	if fi.IsDir() {
+		return errors.New("a directory is in the place of the checkpoint file")
+	}
+	if runtime.GOOS == "windows" && fi.Mode().Perm()&0o200 == 0 {
+		return errors.New("the checkpoint file has the read-only attribute")
+	}
+	return nil
+}
+
+// retryBudget is how long PutCheckpoint keeps retrying a blocked rename:
+// CheckpointRetry, DefaultCheckpointRetry when it is zero. A negative value
+// leaves no time, so the rename is tried once.
+func (d *DirStore) retryBudget() time.Duration {
+	if d.CheckpointRetry == 0 {
+		return DefaultCheckpointRetry
+	}
+	return d.CheckpointRetry
+}
+
+// sleepContext waits for d or until ctx is done, and returns the error of ctx in
+// that case.
+func sleepContext(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }

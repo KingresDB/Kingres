@@ -140,7 +140,10 @@ func TestRetireAndRevokeNeedAnotherKeyInForce(t *testing.T) {
 	}
 }
 
-// K1-12: Retire before the activation time of the key itself is refused.
+// K1-12 and K2-04: a key that is active but not in force at the time of the
+// call (its activation is later) never signed, so it can be retired without a
+// revocation; it is retired at the time it would have come into force, so the
+// record stays in order.
 func TestRetireBeforeActivation(t *testing.T) {
 	// fp(2) is in force from t0; fp(1) is the one activated later, at t0+2h.
 	var s Set
@@ -148,8 +151,15 @@ func TestRetireBeforeActivation(t *testing.T) {
 	s = okSet(t)(s.Activate(fp(2), t0, 0))
 	s = okSet(t)(mustAdd(s, 1, "", t0))
 	s = okSet(t)(s.Activate(fp(1), t0.Add(2*time.Hour), 0))
-	if _, err := s.Retire(fp(1), t0.Add(time.Hour), Unbounded()); !errors.Is(err, ErrInvalidArgument) {
+	early, err := s.Retire(fp(1), t0.Add(time.Hour), Unbounded())
+	if err != nil {
 		t.Fatalf("a retirement before the activation: %v", err)
+	}
+	if k, _ := early.Get(fp(1)); k.State != StateRetired || !k.RetiredAt.Equal(t0.Add(2*time.Hour)) {
+		t.Errorf("the key retired before it was in force: %+v", k)
+	}
+	if err := early.Validate(); err != nil {
+		t.Errorf("the set after it: %v", err)
 	}
 	if _, err := s.Retire(fp(1), t0.Add(2*time.Hour), Unbounded()); err != nil {
 		t.Fatalf("a retirement at the activation time: %v", err)
@@ -357,7 +367,7 @@ func TestCheckKeyIDs(t *testing.T) {
 		t.Errorf("the collision names %+v", c)
 	}
 	msg := err.Error()
-	for _, want := range []string{Fingerprint(a)[:16], Fingerprint(b)[:16], fmt.Sprintf("%08x", c.ID), "another generated", "CheckKeyIDs"} {
+	for _, want := range []string{Fingerprint(a)[:16], Fingerprint(b)[:16], fmt.Sprintf("%08x", c.ID), "another generated", "AddChecked", "CheckSetKeyIDs"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("the message lacks %q: %s", want, msg)
 		}

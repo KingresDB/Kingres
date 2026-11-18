@@ -518,7 +518,7 @@ func TestPutTileFailsClosedWithoutHardLinks(t *testing.T) {
 	k := TileKey{0, 0, 2}
 	data, _ := EncodeTile([]Hash{{1}, {2}})
 	d.link = func(oldname, newname string) error {
-		return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: errors.New("operation not supported")}
+		return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: noLinkErrnos[0]}
 	}
 	d.rename = func(string, string) error {
 		t.Error("a tile was published with a rename")
@@ -537,8 +537,10 @@ func TestPutTileFailsClosedWithoutHardLinks(t *testing.T) {
 	if tmp := tempFilesBelow(t, d.Root()); len(tmp) != 0 {
 		t.Errorf("temporary files are left: %v", tmp)
 	}
-	// A permission error on the link is the same failure, not a fallback.
-	d.link = func(string, string) error { return fs.ErrPermission }
+	// Every other error that means the same, also one that is not wrapped, is
+	// the same failure, not a fallback (the classification itself is tested in
+	// TestPutTileLinkErrorsAreClassified).
+	d.link = func(string, string) error { return noLinkErrnos[len(noLinkErrnos)-1] }
 	if err := d.PutTile(bg, k, data); !errors.Is(err, ErrHardLinksRequired) {
 		t.Errorf("a refused link: %v", err)
 	}
@@ -576,8 +578,26 @@ func TestPutTileExistsAtTheLink(t *testing.T) {
 			return fs.ErrExist
 		}
 		d.rename = func(string, string) error { t.Error("rename was called"); return nil }
+		// With the flushes on, a tile found at the link (another writer published
+		// it, or this is the repeat of a crashed put) is made durable like any
+		// other put that returns nil (K2-01).
+		d.NoSync = false
+		var steps []string
+		d.Hook = func(step string) error {
+			if strings.HasPrefix(step, "sync-dir ") {
+				steps = append(steps, strings.TrimPrefix(step, "sync-dir "))
+			}
+			return nil
+		}
 		if err := d.PutTile(bg, k, data); !tc.want(err) {
 			t.Errorf("%s: %v", name, err)
+		}
+		if name == "same content" {
+			if want := []string{"tile/0/000.p", "tile/0", "tile", "."}; !reflect.DeepEqual(steps, want) {
+				t.Errorf("%s: flushed %v, expected %v", name, steps, want)
+			}
+		} else if len(steps) != 0 {
+			t.Errorf("%s: flushed %v although it failed", name, steps)
 		}
 		if tmp := tempFilesBelow(t, d.Root()); len(tmp) != 0 {
 			t.Errorf("%s: temporary files are left: %v", name, tmp)
@@ -656,15 +676,47 @@ func TestPutCheckpointRetriesABlockedRename(t *testing.T) {
 }
 
 // With CheckpointRetry zero the time is DefaultCheckpointRetry, 3 seconds.
+// It runs on a virtual clock (the retry's own seams), so the default run does
+// not wait: the total of the waits is the time the store is willing to wait.
 func TestPutCheckpointDefaultRetryIsThreeSeconds(t *testing.T) {
-	if DefaultCheckpointRetry != 3*time.Second {
-		t.Fatalf("the default is %v", DefaultCheckpointRetry)
+	for _, tc := range []struct {
+		name  string
+		retry time.Duration
+		want  time.Duration // the most the waits add up to
+	}{
+		{"zero is the default of 3 seconds, the documented value", 0, 3 * time.Second},
+		{"a given time is used", 700 * time.Millisecond, 700 * time.Millisecond},
+		{"a negative time is no wait", -1, 0},
+	} {
+		d := newDirStore(t)
+		d.CheckpointRetry = tc.retry
+		d.renameBusy = func(err error) bool { return errors.Is(err, errBusy) }
+		d.rename = func(string, string) error { return errBusy }
+		clock := time.Unix(1_000_000, 0)
+		var slept time.Duration
+		d.now = func() time.Time { return clock }
+		d.pause = func(_ context.Context, w time.Duration) error {
+			slept += w
+			clock = clock.Add(w)
+			return nil
+		}
+		err := d.PutCheckpoint(bg, []byte("a\n"))
+		if !errors.Is(err, ErrCheckpointBusy) {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if slept != tc.want {
+			t.Errorf("%s: it waited %v in all, expected %v", tc.name, slept, tc.want)
+		}
 	}
+	// And a rename that becomes free inside the default time succeeds.
 	d := newDirStore(t)
 	d.renameBusy = func(err error) bool { return errors.Is(err, errBusy) }
-	start := time.Now()
+	clock := time.Unix(1_000_000, 0)
+	start := clock
+	d.now = func() time.Time { return clock }
+	d.pause = func(_ context.Context, w time.Duration) error { clock = clock.Add(w); return nil }
 	d.rename = func(o, n string) error {
-		if time.Since(start) < 2200*time.Millisecond {
+		if clock.Sub(start) < 2200*time.Millisecond {
 			return errBusy
 		}
 		return os.Rename(o, n)
@@ -756,9 +808,15 @@ func TestPutFlushesNewDirectoriesUpToTheRoot(t *testing.T) {
 	if got := put(TileKey{EntryLevel, 0, TileWidth}); !reflect.DeepEqual(got, []string{"tile/entries", "tile"}) {
 		t.Errorf("a full bundle flushes %v", got)
 	}
-	// A repeated put writes nothing and flushes nothing.
-	if got := put(TileKey{0, 1, 5}); len(got) != 0 {
+	// A repeated put writes nothing, but a put that returns nil is durable (the
+	// repeat after a crash between the link and the flushes is exactly the
+	// crash procedure): it flushes the directory of the tile and every ancestor
+	// up to the root (K2-01).
+	if got := put(TileKey{0, 1, 5}); !reflect.DeepEqual(got, []string{"tile/0/001.p", "tile/0", "tile", "."}) {
 		t.Errorf("a repeated put flushes %v", got)
+	}
+	if got := put(TileKey{0, 1234, 3}); !reflect.DeepEqual(got, []string{"tile/0/x001/234.p", "tile/0/x001", "tile/0", "tile", "."}) {
+		t.Errorf("a repeated put of a deep tile flushes %v", got)
 	}
 	// The checkpoint: the root.
 	steps = nil
@@ -811,10 +869,23 @@ func TestCrashAtEachFlushOfAPut(t *testing.T) {
 		if err := d.PutTile(bg, k, data); !errors.Is(err, errCrash) {
 			t.Fatalf("crash at flush %d: %v", crashAt, err)
 		}
-		d.Hook = nil
+		// The repeat after the crash is what makes the tile durable: it flushes
+		// every directory up to the root again, not only the ones the crashed
+		// put had left (K2-01).
+		var steps []string
+		d.Hook = func(step string) error {
+			if strings.HasPrefix(step, "sync-dir ") {
+				steps = append(steps, strings.TrimPrefix(step, "sync-dir "))
+			}
+			return nil
+		}
 		if err := d.PutTile(bg, k, data); err != nil {
 			t.Fatalf("the put after the crash at flush %d: %v", crashAt, err)
 		}
+		if want := []string{"tile/0/x001/234.p", "tile/0/x001", "tile/0", "tile", "."}; !reflect.DeepEqual(steps, want) {
+			t.Fatalf("the put after the crash at flush %d flushed %v, expected %v", crashAt, steps, want)
+		}
+		d.Hook = nil
 		if got, err := d.GetTile(bg, k); err != nil || !bytes.Equal(got, data) {
 			t.Fatalf("the tile after the crash at flush %d: %v", crashAt, err)
 		}
@@ -824,21 +895,40 @@ func TestCrashAtEachFlushOfAPut(t *testing.T) {
 // ---- K1-10: bounds ----
 
 func TestRequiredIsBounded(t *testing.T) {
+	// The refusal is tested through the inner function with a small bound, and
+	// only with sizes that stay small when the check is removed: a mutant that
+	// deletes the check must fail this test, not allocate (size/256 keys of 24
+	// bytes: the first version of this test gave 2^40 and 2^62 to the public
+	// function, and a removed bound took the machine down). The huge sizes are
+	// refused by the same single comparison; they are not given to code that
+	// could allocate for them.
+	const small = 1 << 12
+	for _, size := range []uint64{small + 1, small + 256, 1 << 16} {
+		keys, err := required(size, small)
+		if !errors.Is(err, ErrTooLarge) || keys != nil {
+			t.Errorf("size %d, bound %d: %d keys, %v", size, small, len(keys), err)
+		}
+	}
+	// At the bound: 16 full bundles, 16 full tiles of level 0, and one partial
+	// tile of level 1 with 16 hashes.
+	keys, err := required(small, small)
+	if err != nil || len(keys) != 16+16+1 {
+		t.Errorf("a size at the bound: %d keys, %v", len(keys), err)
+	}
+	// The public function: the documented bound, and the first size above it
+	// (with the check removed that is a list of 50 MB, no more).
+	if MaxRequiredSize != 1<<28 {
+		t.Errorf("the documented bound is 2^28, not %d", MaxRequiredSize)
+	}
 	if _, err := Required(MaxRequiredSize + 1); !errors.Is(err, ErrTooLarge) {
 		t.Errorf("a size above the bound: %v", err)
 	}
-	for _, size := range []uint64{1 << 62, 1<<62 - 1, ^uint64(0), 1 << 40} {
-		keys, err := Required(size)
-		if !errors.Is(err, ErrTooLarge) || keys != nil {
-			t.Errorf("size %d: %d keys, %v", size, len(keys), err)
-		}
-	}
-	keys, err := Required(MaxRequiredSize)
+	keys, err = Required(MaxRequiredSize)
 	if err != nil {
 		t.Fatalf("the largest size: %v", err)
 	}
-	if len(keys) < 1<<20 || len(keys) > 1<<22 {
-		t.Errorf("the largest size lists %d keys", len(keys))
+	if len(keys) != 2101265 || cap(keys) != len(keys) { // counted first: one allocation of 50 MB, not a doubling slice
+		t.Errorf("the largest size lists %d keys in a slice of capacity %d", len(keys), cap(keys))
 	}
 	if _, err := Required(0); err != nil {
 		t.Error(err)
