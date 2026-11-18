@@ -2536,6 +2536,42 @@ build to the corrected rule. The verifier's README has the same list with the re
     refusal is permanent, and the operator uses another authority. The corpus of notes of 92 is held to
     the real parsers of the verifier by a copy in the verifier module, and a test of the library fails
     when the two copies differ.
+98. **What `ledger_enable` adds to the limit, and the timer after an error (replaces "gets a new period
+    every thousand rows" of 67; adds to 76).** The time that `ledger_enable` really spent entering a
+    batch of rows is added to the deadline, and nothing else is. It is added only while the lock of
+    the registry is the only lock of the extension that the transaction holds: with the lock of the
+    builders, the verifications or the removals held there is no addition at all. It is kept per entry
+    of the subtransaction stack and taken back when the subtransaction aborts, and the rows of a table
+    are credited once in a transaction, so entering the same rows again after a rollback buys nothing.
+    The deadline is therefore never more than one period ahead, and a lock taken now is held for one
+    period at most. What remains, and is stated as an exception: a role that really enters many rows of
+    many tables holds the lock of the registry while it does, which blocks other calls of
+    `ledger_enable` and a write by hand, and not the block builder. An honest `ledger_enable` whose
+    single batch of a thousand rows takes longer than the period is ended. PostgreSQL disables every
+    timeout of a backend when an error reaches its main loop, before it aborts a subtransaction; the
+    extension starts its timer again at the deadline in the abort of the subtransaction, so an error
+    inside a savepoint does not leave a lock of the parent without a limit. The log line of an ended
+    session lists the locks held at that moment.
+99. **The order of the locks is enforced across calls (replaces 78).** A call that would take a lock
+    of the extension that is earlier in the order (builders, registry, verifications, removals) than
+    one the transaction already holds fails at once with `KL006` and a hint that names the order,
+    instead of waiting into a deadlock; a lock that is already held is never refused. It holds for
+    every role and within one statement, one transaction or one savepoint: a caller runs the writers
+    in that order or in transactions of their own. `ledger_remove_stray` and a write by hand take all
+    four locks first, also a write by hand into the entries. The table lock of `ledger_enable` against
+    ordinary statements on the same table after a write by hand cannot be ordered this way; the
+    deadlock detector ends one of the two.
+100. **Who can drop the database, and identifiers at the edges (adds to 74 and 77).** `ledger_status`
+    also lists the roles that cannot drop the database now and can make themselves able to without a
+    superuser (`database_potential_droppers`): a role with ADMIN OPTION, directly or through a
+    membership, on a role that can, which covers a role with CREATEROLE for the roles it created;
+    `ledger_enable` warns about them in a sentence of its own. A database owned by
+    `pg_database_owner` can be dropped by every role that owns a database of the cluster, and the
+    lists say so. A delete by hand of a recorded digest is recorded as a removal, so its identifier
+    does not come back, and `ledger_verify` reports it. At the largest value of the type the writers
+    raise an error that says no identifier is left, and nothing wraps. A cancel inside the run of
+    `ledger_verify` within `ledger_verify_recorded` is raised when the lock of the verifications is
+    held by another session and recorded as a failed run when it is free.
 
 Of section 13: item 2 (test vectors) is settled for signed notes (the example key and note of the
 specification are in the tests; the checkpoint example has no published key), item 3 (entry bundles at
