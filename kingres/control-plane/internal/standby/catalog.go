@@ -92,6 +92,11 @@ type PGRegistrar struct {
 	// of 5 minutes covers two stuck nodes at the default node_timeout of 60 s.
 	Timeout time.Duration
 	Log     *slog.Logger
+	// Remote opens a service connection to another primary of the sharding catalog (host and port as the
+	// catalog names them). The read-back of a registration or a removal reads the row on every primary, not
+	// on the coordinator only (FO-08): the coordinator is the first to commit, so its row proves nothing about a
+	// node that went silent at the very end. nil: only the coordinator is read.
+	Remote func(ctx context.Context, host string, port int) (*pgx.Conn, error)
 }
 
 func (r *PGRegistrar) timeout() time.Duration {
@@ -140,6 +145,10 @@ func (r *PGRegistrar) Register(ctx context.Context, e Entry) (int32, error) {
 		if role != "standby" || group != e.Group {
 			return 0, fmt.Errorf("the catalog has %s:%d as a %s of group %d, not as a standby of group %d", e.Server, e.Port, role, group, e.Group)
 		}
+		// Found on the coordinator is not proof for the other primaries: the repeat of a step that did not finish reads them too.
+		if err := r.readBackEverywhere(ctx, c, e, id, e.Port, true); err != nil {
+			return 0, err
+		}
 		return id, nil
 	}
 	err = c.QueryRow(ctx, `SELECT kingres.add_node($1, $2, $3, 'standby')`, e.Server, e.Port, e.Group).Scan(&id)
@@ -156,6 +165,9 @@ func (r *PGRegistrar) Register(ctx context.Context, e Entry) (int32, error) {
 	// A success of add_node is not proof that the row is there (review S12-01): read it back, in the same session.
 	if bid, brole, bgroup, bfound, berr := find(ctx, c, e.Server, e.Port); berr != nil || !bfound || bid != id || brole != "standby" || bgroup != e.Group {
 		return 0, fmt.Errorf("add_node answered node %d, and the catalog does not show it as the standby of group %d (found %v, err %v): repeated by the next check", id, e.Group, bfound, berr)
+	}
+	if err := r.readBackEverywhere(ctx, c, e, id, e.Port, true); err != nil {
+		return 0, err
 	}
 	// Step 3, in a session of its own (the third review of the extension: a control call gets a session
 	// that is not reused for anything else): the row must show the standby streaming.
@@ -208,7 +220,7 @@ func (r *PGRegistrar) Unregister(ctx context.Context, e Entry) error {
 		}
 		return err
 	}
-	if role != "standby" || host != e.Server {
+	if role != "standby" || host != e.Server || (e.Port != 0 && port != e.Port) {
 		return nil
 	}
 	if _, err := c.Exec(ctx, `SELECT kingres.remove_node($1)`, id); err != nil {
@@ -222,7 +234,7 @@ func (r *PGRegistrar) Unregister(ctx context.Context, e Entry) error {
 	if _, _, _, still, ferr := find(ctx, c, e.Server, portOf(e, port)); ferr == nil && still {
 		return fmt.Errorf("remove_node answered, and the catalog still has node %d", id)
 	}
-	return nil
+	return r.readBackEverywhere(ctx, c, e, id, portOf(e, port), false)
 }
 
 // portOf is the port of the row that was removed.
@@ -243,3 +255,52 @@ func readCommitted(ctx context.Context, c *pgx.Conn) error {
 // ErrCatalogUnsupported is the detail of the step when a leader has no registrar
 // (a unit test without a catalog): the step ends as skipped.
 var ErrCatalogUnsupported = errors.New("skipped: no catalog registrar")
+
+// readBackEverywhere reads the row of the standby (host:port) on every primary of the catalog and checks it is
+// there as the standby of the group with node id id (present) or gone (not present). The extension answers success
+// for add_node and remove_node although a node that went silent at the very end did not get its part, so the result
+// is read on the nodes that the call should have changed (FO-08). A primary that cannot be read is a refusal that
+// repeats on the next check: the catalog is not known to be right.
+func (r *PGRegistrar) readBackEverywhere(ctx context.Context, c *pgx.Conn, e Entry, id int32, port int, present bool) error {
+	if r.Remote == nil {
+		return nil
+	}
+	rows, err := c.Query(ctx, `SELECT host, port FROM kingres.node WHERE role = 'primary' ORDER BY node_id`)
+	if err != nil {
+		return err
+	}
+	type hp struct {
+		host string
+		port int
+	}
+	var nodes []hp
+	for rows.Next() {
+		var n hp
+		if err := rows.Scan(&n.host, &n.port); err != nil {
+			rows.Close()
+			return err
+		}
+		nodes = append(nodes, n)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, n := range nodes {
+		nc, err := r.Remote(ctx, n.host, n.port)
+		if err != nil {
+			return &CatalogError{Call: "read back", Code: "unread", Msg: fmt.Sprintf("the catalog of %s:%d cannot be read to check the result: %v", n.host, n.port, err), Retry: true}
+		}
+		bid, brole, bgroup, found, ferr := find(ctx, nc, e.Server, port)
+		_ = nc.Close(context.WithoutCancel(ctx))
+		switch {
+		case ferr != nil:
+			return &CatalogError{Call: "read back", Code: "unread", Msg: fmt.Sprintf("reading the catalog of %s:%d: %v", n.host, n.port, ferr), Retry: true}
+		case present && (!found || bid != id || brole != "standby" || bgroup != e.Group):
+			return fmt.Errorf("node %d is not in the catalog of %s:%d as the standby of group %d (found %v): repeated by the next check", id, n.host, n.port, e.Group, found)
+		case !present && found:
+			return fmt.Errorf("the catalog of %s:%d still has %s:%d: repeated by the next check", n.host, n.port, e.Server, port)
+		}
+	}
+	return nil
+}

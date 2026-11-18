@@ -80,6 +80,8 @@ func mapErr(err error) error {
 	switch {
 	case err == nil:
 		return nil
+	case errors.Is(err, ErrNotProvedStandby):
+		return &internalapi.CallError{Status: http.StatusConflict, Code: "not_a_standby", Message: "The instance is not proved to be a standby, so it is neither deleted nor rebuilt."}
 	case errors.Is(err, ErrConflict):
 		return &internalapi.CallError{Status: http.StatusConflict, Code: "conflict", Message: "This server already runs another standby of the group."}
 	default:

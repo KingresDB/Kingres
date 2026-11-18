@@ -56,15 +56,22 @@ type AdoptionStatus struct {
 // Adopt makes this manager renew the lease of a group that the catalog does not
 // name this server as the primary of (yet). It never changes the lease of a group
 // the server runs the primary of. kind is AdoptFence or AdoptHolder. Adopting a
-// relinquished group is refused: the server gave it up on purpose.
+// relinquished group clears the marker of the earlier hand-over: the failover that adopts it again decides (FO-10).
 func (m *Manager) Adopt(group int32, kind string) error {
 	if kind != AdoptFence && kind != AdoptHolder {
 		return fmt.Errorf("lease: unknown adoption kind %q", kind)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// A server that gave the group up (a transfer, a release, a switchover) adopts it again only by a decision of
+	// the failover that asks (FO-10): the marker of the earlier hand-over is cleared, or a second failover of
+	// the same group would be refused for ever. An instance that runs here for the group is not told it may start:
+	// the start gate still waits for the lease.
 	if m.relinq[group] || markerExists(m.c.Dir, RelinquishedMarker, group) {
-		return fmt.Errorf("lease: shard group %d was relinquished by this server", group)
+		delete(m.relinq, group)
+		if err := os.Remove(MarkerPath(m.c.Dir, RelinquishedMarker, group)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("lease: clearing the relinquished marker of shard group %d: %w", group, err)
+		}
 	}
 	if cur := m.adopted[group]; cur != nil {
 		if cur.attached {
@@ -199,6 +206,9 @@ type TransferResult struct {
 // moment a majority answered, and this manager then stops renewing the group, drops
 // an adoption and does not hold the lease any more.
 func (m *Manager) Transfer(ctx context.Context, group int32, to string) (TransferResult, error) {
+	if err := m.primaryRunning(ctx, group); err != nil {
+		return TransferResult{}, err
+	}
 	t, ok := m.topologyNow()
 	if !ok {
 		return TransferResult{}, errors.New("lease: the members of the cluster are not known")
@@ -213,11 +223,11 @@ func (m *Manager) Transfer(ctx context.Context, group int32, to string) (Transfe
 		go func() {
 			if s == m.c.Self {
 				r, err := m.c.Grantor.Transfer(group, m.c.Self, to, m.c.Duration)
-				results <- err == nil && r.Granted
+				results <- err == nil && transferDone(r, to)
 				return
 			}
 			r, err := m.c.Voter.Grant(rctx, s, req)
-			results <- err == nil && r.Granted
+			results <- err == nil && transferDone(r, to)
 		}()
 	}
 	granted := 0
@@ -231,7 +241,7 @@ func (m *Manager) Transfer(ctx context.Context, group int32, to string) (Transfe
 	}
 	res := TransferResult{Granted: granted, Need: need}
 	if granted < need {
-		return res, fmt.Errorf("lease: only %d of the %d grantors needed moved the lease of shard group %d to %s", granted, need, group, to)
+		return res, fmt.Errorf("lease: only %d of the %d grantors needed moved the lease of shard group %d to %s (a grantor of an older version does not know the call)", granted, need, group, to)
 	}
 	// The lease is `to`'s. This server does not hold it and does not renew it any more. The
 	// marker makes that survive a restart of kingresd.
@@ -251,8 +261,24 @@ func (m *Manager) Transfer(ctx context.Context, group int32, to string) (Transfe
 // under the lease and that the fence marker is on disk: it is how a switchover does
 // not wait for the old lease to run out. It succeeds when a majority did.
 func (m *Manager) ReleaseGroup(ctx context.Context, group int32) (TransferResult, error) {
+	if err := m.primaryRunning(ctx, group); err != nil {
+		return TransferResult{}, err
+	}
+	// The group is marked first and the round in flight is waited for: after that no renewal of this group is on
+	// its way to a grantor (FO-13). A release that did not reach a majority puts the mark back.
+	m.mu.Lock()
+	was := m.relinq[group]
+	m.relinq[group] = true
+	m.mu.Unlock()
+	m.rmu.Lock()
+	m.rmu.Unlock() //nolint:staticcheck // waiting for the round in flight is the point
 	t, ok := m.topologyNow()
 	if !ok {
+		m.mu.Lock()
+		if !was {
+			delete(m.relinq, group)
+		}
+		m.mu.Unlock()
 		return TransferResult{}, errors.New("lease: the members of the cluster are not known")
 	}
 	members := t.Members
@@ -265,11 +291,11 @@ func (m *Manager) ReleaseGroup(ctx context.Context, group int32) (TransferResult
 		go func() {
 			if s == m.c.Self {
 				r, err := m.c.Grantor.Release(group, m.c.Self)
-				results <- err == nil && r.Granted
+				results <- err == nil && releaseDone(r)
 				return
 			}
 			r, err := m.c.Voter.Grant(rctx, s, req)
-			results <- err == nil && r.Granted
+			results <- err == nil && releaseDone(r)
 		}()
 	}
 	granted := 0
@@ -283,6 +309,11 @@ func (m *Manager) ReleaseGroup(ctx context.Context, group int32) (TransferResult
 	}
 	res := TransferResult{Granted: granted, Need: need}
 	if granted < need {
+		m.mu.Lock()
+		if !was {
+			delete(m.relinq, group)
+		}
+		m.mu.Unlock()
 		return res, fmt.Errorf("lease: only %d of the %d grantors needed released the lease of shard group %d", granted, need, group)
 	}
 	m.mu.Lock()
@@ -319,4 +350,33 @@ func (m *Manager) groupsToRenewLocked(t Topology) []int32 {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out
+}
+
+// transferDone reads the answer of a grantor to a transfer: the lease is `to`'s there when the holder it names is
+// `to`, whether this call moved it or an earlier one did (a repeat after a lost answer, FO-06). A grantor of the
+// version before the transfer treats the request as a plain grant for the caller and names the caller: that is
+// not a transfer, whatever it says in Granted.
+func transferDone(r Reply, to string) bool { return r.Holder == to }
+
+// releaseDone reads the answer of a grantor to a release: the lease is free there, so no holder is named. A
+// grantor of the version before the release answers a plain grant for the caller and names it (FO-06).
+func releaseDone(r Reply) bool { return r.Granted && r.Holder == "" }
+
+// primaryRunning refuses a hand-over of the lease while an instance of the group runs on this server (FO-07): the
+// primary would go on acting with a lease that is another server's now, until the watchdog stopped it. The caller
+// stops it first and confirms the stop. A group with no instance here (the fence holder of a failover) has
+// nothing that runs.
+func (m *Manager) primaryRunning(ctx context.Context, group int32) error {
+	inst, have := m.instance(group)
+	if !have {
+		return nil
+	}
+	up, err := inst.Running(ctx)
+	if err != nil {
+		return fmt.Errorf("lease: the instance of shard group %d cannot be asked whether it runs: %w", group, err)
+	}
+	if up {
+		return fmt.Errorf("lease: the instance of shard group %d runs on this server: stop it before its lease is handed over", group)
+	}
+	return nil
 }

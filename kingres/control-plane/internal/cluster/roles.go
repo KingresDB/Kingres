@@ -87,10 +87,19 @@ func (s *Service) WritableIDs() []int {
 // group when it is the only writable instance.
 func (s *Service) PrimaryOf(group int32) (LocalInstance, bool) {
 	w := s.WritableInstances()
+	var found []LocalInstance
 	for _, li := range w {
 		if li.Role.Group == group {
-			return li, true
+			found = append(found, li)
 		}
+	}
+	// Two directories that claim one group are a state nobody may act on (FO-09): neither is the primary here.
+	if len(found) > 1 {
+		s.log.Error("two instances of this server claim to be the primary of one group", "group", group, "instances", len(found))
+		return LocalInstance{}, false
+	}
+	if len(found) == 1 {
+		return found[0], true
 	}
 	if len(w) == 1 && w[0].Role.Group == instance.GroupUnknown {
 		return w[0], true
@@ -304,8 +313,9 @@ func (s *Service) SystemInstance() LocalInstance {
 }
 
 // GateInfo tells the start gate of the instance manager which group a directory
-// is the primary of: ok is false for a standby, which the lease never holds back.
+// is the primary of: primary is false for a standby, which the lease never holds back. An instance whose role file
+// cannot be read is held back like a primary (it may be one).
 func (s *Service) GateInfo(id int) (group int32, primary bool) {
 	r := s.mgr.MustRole(id)
-	return r.Group, r.Writable()
+	return r.Group, !r.IsStandby()
 }

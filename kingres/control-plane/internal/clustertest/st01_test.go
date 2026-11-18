@@ -92,18 +92,25 @@ func readTail(p string) string {
 
 // watchdogOff reports whether the lease file of the primary instance of a node says that nothing is enforced.
 func watchdogFile(n *clustertest.Node) (off, ok bool) {
+	off, _, ok = watchdogFileSeq(n)
+	return
+}
+
+// watchdogFileSeq is watchdogFile with the sequence number of the file.
+func watchdogFileSeq(n *clustertest.Node) (off bool, seq uint64, ok bool) {
 	b, err := os.ReadFile(filepath.Join(n.DataDir, "instances", "1", "lease.json"))
 	if err != nil {
-		return false, false
+		return false, 0, false
 	}
 	var f struct {
-		Off     bool  `json:"off"`
-		ValidMs int64 `json:"validMs"`
+		Off     bool   `json:"off"`
+		Seq     uint64 `json:"seq"`
+		ValidMs int64  `json:"validMs"`
 	}
-	if json.Unmarshal(b, &f) != nil {
-		return false, false
+	if json.Unmarshal(b, &f) != nil || f.ValidMs <= 0 {
+		return false, 0, false
 	}
-	return f.Off, true
+	return f.Off, f.Seq, true
 }
 
 func setReplicas(t *testing.T, leader *clustertest.Node, n int) {
@@ -128,12 +135,21 @@ func TestSwitchingEnforcementOnAndOffNeverFencesAHealthyPrimary(t *testing.T) {
 	s := sampleInstances(t, c.Nodes)
 	for round := 0; round < 3; round++ {
 		setReplicas(t, leader, 0)
+		// A group that is not enforced is not "off" (review FO-01): its file is written again at every pass, with a
+		// validity, so that a watchdog never fences a healthy primary and always fences a dead kingresd. The negative
+		// observation: with the stale file of the bug the watchdog fences within one lease; look for two, and see that
+		// the file keeps changing.
+		seqs := map[int]uint64{}
 		for _, n := range c.Nodes {
-			until(t, 3*time.Minute, fmt.Sprintf("round %d: the watchdog of node %d told that nothing is enforced", round, n.Index), func() bool { off, ok := watchdogFile(n); return ok && off })
+			_, seqs[n.Index], _ = watchdogFileSeq(n)
 		}
-		// The negative observation: with the stale file of the bug the watchdog fences within one lease (6 s);
-		// look for two.
 		time.Sleep(12 * time.Second)
+		for _, n := range c.Nodes {
+			off, seq, ok := watchdogFileSeq(n)
+			if !ok || off || seq == seqs[n.Index] {
+				t.Fatalf("round %d: the file of node %d was not refreshed while its group is not enforced (off %v, seq %d after %d, ok %v)", round, n.Index, off, seq, seqs[n.Index], ok)
+			}
+		}
 		setReplicas(t, leader, 1)
 		waitStandbys(t, c, 1)
 		for _, n := range c.Nodes {

@@ -374,6 +374,16 @@ func (m *Manager) start(ctx context.Context, id int) error {
 	if err != nil {
 		return fmt.Errorf("instance: pg_ctl start: %w: %s", err, out)
 	}
+	// A fence that arrived while the start ran wrote its marker and found nothing to stop (FO-14): the gate is asked
+	// again, and an instance that came up against it is stopped at once, whoever started it.
+	if m.gate != nil {
+		if gerr := m.gate(id); gerr != nil {
+			sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.stopTO)
+			defer cancel()
+			_ = m.StopImmediate(sctx, id)
+			return gerr
+		}
+	}
 	return nil
 }
 

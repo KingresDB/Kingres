@@ -210,6 +210,7 @@ func TestTransferStopsRenewingAndSurvivesARestart(t *testing.T) {
 	if !r.m.Holds(1) {
 		t.Fatal("setup: the lease is not held")
 	}
+	_ = r.inst.StopImmediate(ctx) // a transfer needs the stop confirmed (FO-07)
 	res, err := r.m.Transfer(ctx, 1, "b")
 	if err != nil || res.Granted < res.Need {
 		t.Fatalf("transfer: %+v %v", res, err)
@@ -246,8 +247,16 @@ func TestTransferStopsRenewingAndSurvivesARestart(t *testing.T) {
 	if m2.Holds(1) || m2.AdoptionStatus(1).Rounds != 0 {
 		t.Fatal("a restarted manager renewed a group that was transferred")
 	}
-	if err := m2.Adopt(1, AdoptFence); err == nil {
-		t.Fatal("adopting a relinquished group must be refused")
+	// A second failover of the same group adopts it again by decision of the task (FO-10): the old marker goes.
+	if err := m2.Adopt(1, AdoptFence); err != nil {
+		t.Fatalf("an explicit adoption of a group this server handed over earlier: %v", err)
+	}
+	if m2.Relinquished(1) || markerExists(filepath.Join(r.dir, "lease"), RelinquishedMarker, 1) {
+		t.Fatal("the relinquished marker survived an adoption")
+	}
+	m2.Unadopt(1)
+	if err := m2.Relinquish(1); err != nil {
+		t.Fatal(err)
 	}
 	if err := m2.Unrelinquish(1); err != nil {
 		t.Fatal(err)
@@ -264,6 +273,7 @@ func TestTransferWithoutAMajorityKeepsTheLease(t *testing.T) {
 	r := newRig(t, []string{"a", "b", "c"}, false)
 	r.m.Renew(ctx)
 	r.voter.down["b"], r.voter.down["c"] = true, true
+	_ = r.inst.StopImmediate(ctx)
 	if res, err := r.m.Transfer(ctx, 1, "b"); err == nil || res.Granted >= res.Need {
 		t.Fatalf("a transfer reached %+v without a majority: %v", res, err)
 	}

@@ -18,6 +18,9 @@ import (
 func TestTaskWaitsForAServerThatWaitsForItsLease(t *testing.T) {
 	c := clustertest.FormWithExtra(t, 3, leaseFlags, nil)
 	leader, victim := c.Leader(), c.Nodes[2]
+	// The standby is made some time after the cluster is formed (a base backup), and only a group with one has a
+	// watchdog: wait for it, or the test fails on a loaded machine for a reason that has nothing to do with it.
+	waitStandbys(t, c, 1)
 	waitWatchdog(t, victim) // the group has a standby: the watchdog runs
 	victim.Kill()
 	waitInstance(t, victim, false, time.Minute) // fenced by the watchdog

@@ -123,6 +123,10 @@ type Manager struct {
 
 	op sync.Mutex // serializes fencing and starting the instance
 
+	// rmu is held by a renewal round of a group while it runs; a release takes it after the group is marked as
+	// given up, so that a renewal sent before the release cannot be received by a grantor after it (FO-13).
+	rmu sync.Mutex
+
 	// starting is set while the instance is being started after the lease was won;
 	// the start runs beside the renewal rounds, so that the lease is renewed while
 	// PostgreSQL starts or recovers. wg tracks it (tests wait on it).
@@ -228,7 +232,13 @@ func (m *Manager) Renew(ctx context.Context) {
 		return
 	}
 	for _, g := range groups {
+		m.rmu.Lock()
 		m.round(ctx, g, t.Members)
+		m.rmu.Unlock()
+		// A group that is not enforced keeps its watchdog file fresh whether or not the round succeeded (FO-01).
+		if wf := m.watchdogFile(g); wf != "" && !m.c.Enforced(g) {
+			m.writeWatchdogIdle(wf)
+		}
 	}
 }
 

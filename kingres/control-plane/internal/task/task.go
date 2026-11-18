@@ -500,7 +500,11 @@ func (e *Engine) Run(ctx context.Context) {
 // paused") and its cleanup hook runs here, with the task as recorded.
 func (e *Engine) Cancel(ctx context.Context, id int64) error {
 	t, gerr := e.store.Get(ctx, id)
-	if gerr == nil && recordedKinds[t.Kind] {
+	if gerr != nil {
+		// Without the task its guard cannot be asked: a cancel is never recorded blind (FO-11).
+		return gerr
+	}
+	if recordedKinds[t.Kind] {
 		return ErrNotCancellable // written by its owner, not run by the engine
 	}
 	if gerr == nil {
@@ -599,7 +603,7 @@ func (e *Engine) run(ctx context.Context, t Task, started time.Time, secrets map
 		}
 		if cancelReq, err := e.setStep(runCtx, t, i, StepRunning, percent(i, len(def.Steps))); err != nil {
 			return err
-		} else if cancelReq {
+		} else if cancelReq && e.honourCancel(ctx, t, def) {
 			return e.cancelTask(ctx, t, def, i)
 		}
 		e.fault(FaultStepStarted, t.ID, i)
@@ -616,7 +620,7 @@ func (e *Engine) run(ctx context.Context, t Task, started time.Time, secrets map
 				if perr != nil {
 					return perr
 				}
-				if cancelReq {
+				if cancelReq && e.honourCancel(ctx, t, def) {
 					return e.cancelTask(ctx, t, def, i)
 				}
 				return nil
@@ -632,7 +636,7 @@ func (e *Engine) run(ctx context.Context, t Task, started time.Time, secrets map
 				if serr != nil {
 					return serr
 				}
-				if cancelReq && i+1 < len(def.Steps) {
+				if cancelReq && i+1 < len(def.Steps) && e.honourCancel(ctx, t, def) {
 					return e.cancelTask(ctx, t, def, i+1)
 				}
 				continue
@@ -652,7 +656,7 @@ func (e *Engine) run(ctx context.Context, t Task, started time.Time, secrets map
 			return err
 		}
 		e.fault(FaultStepRecorded, t.ID, i)
-		if cancelReq && i+1 < len(def.Steps) {
+		if cancelReq && i+1 < len(def.Steps) && e.honourCancel(ctx, t, def) {
 			return e.cancelTask(ctx, t, def, i+1)
 		}
 	}
@@ -960,3 +964,18 @@ func (e *ExcludedError) Problem() *problem.Problem {
 var guards sync.Map // kind -> func(Task) bool
 
 func (e *Engine) gateClosed() bool { return e.gate != nil && !e.gate() }
+
+// honourCancel decides, at a step boundary, whether the mark of a cancel request is followed. A kind with a guard
+// (Definition.Cancellable) is asked again with the task as it is now: the request was accepted by the guard and then
+// recorded in a second step, and the run may have passed the point of no return in between (FO-11). A mark that the
+// guard would refuse now is ignored, and the task goes on. A task that cannot be read is not cancelled.
+func (e *Engine) honourCancel(ctx context.Context, t Task, def Definition) bool {
+	if def.Cancellable == nil {
+		return true
+	}
+	now, err := e.store.Get(context.WithoutCancel(ctx), t.ID)
+	if err != nil {
+		return false
+	}
+	return def.Cancellable(now)
+}

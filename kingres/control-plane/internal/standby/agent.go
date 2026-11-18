@@ -101,6 +101,7 @@ func NewAgent(a *Agent) (*Agent, error) {
 	a.primaries = map[int32]*PrimaryStatus{}
 	a.frozen = map[int32]time.Duration{}
 	a.gone = map[string]time.Duration{}
+	a.loadFreezes()
 	a.access = map[string]fileStamp{}
 	a.kick = make(chan struct{}, 1)
 	return a, nil
@@ -233,7 +234,7 @@ type localStandby struct {
 func (a *Agent) localStandbys() []localStandby {
 	var out []localStandby
 	for _, id := range a.mgr().IDs() {
-		if a.mgr().IsWritable(id) {
+		if !a.mgr().MustRole(id).IsStandby() { // a primary, and an instance whose role file is broken (FO-09)
 			continue
 		}
 		if e, err := a.metaOf(id); err == nil {

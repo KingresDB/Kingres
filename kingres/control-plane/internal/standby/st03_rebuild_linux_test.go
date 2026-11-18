@@ -84,7 +84,18 @@ exit 0
 		}
 	}
 
-	// An older generation is rebuilt: the instance is removed (the standby is made again from the primary).
+	// An older generation is rebuilt: the instance is removed (the standby is made again from the primary). A
+	// directory is rebuilt only when it is proved to be a standby (FO-04): its role file says standby and, since
+	// the fake instance cannot be asked whether it is in recovery, it is stopped and carries standby.signal.
+	if err := m.WriteRole(id, instance.Role{Group: 1, Role: instance.RoleStandby, Origin: instance.OriginCopy}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(data, "standby.signal"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Stop(ctx, id); err != nil {
+		t.Fatal(err)
+	}
 	next := have
 	next.Generation = 4
 	_, _ = a.Rebuild(ctx, next, false)

@@ -27,6 +27,9 @@ const RoleFileName = "kingres-role.json"
 const (
 	RolePrimary = "primary"
 	RoleStandby = "standby"
+	// RoleUnknown is what MustRole answers for a role file that is broken or cannot be read: neither a primary nor
+	// a standby, so nothing is sent to it as a primary and nothing deletes it as a standby (FO-09).
+	RoleUnknown = "unknown"
 )
 
 // Origins: where the data of an instance came from.
@@ -38,6 +41,8 @@ const (
 	// old primary rebuilt from one): its service role has the other server's
 	// password, so kingresd reaches it by peer authentication on the private socket.
 	OriginCopy = "copy"
+	// OriginUnknown goes with RoleUnknown.
+	OriginUnknown = "unknown"
 )
 
 // GroupUnknown is the group of an instance that was initialised before the
@@ -60,6 +65,9 @@ type Role struct {
 // Writable reports whether the instance is a primary: the only kind a statement
 // that changes data or settings is sent to.
 func (r Role) Writable() bool { return r.Role == RolePrimary }
+
+// IsStandby reports whether the role file says standby (an unknown role is not one).
+func (r Role) IsStandby() bool { return r.Role == RoleStandby }
 
 // Valid checks the fields.
 func (r Role) Valid() error {
@@ -111,15 +119,15 @@ func (m *Manager) RoleOf(id int) (r Role, exists bool, err error) {
 	return r, true, nil
 }
 
-// MustRole is RoleOf for the places that cannot do anything with an error: a
-// directory whose file cannot be read is treated as the default of its id, which
-// for a directory from 100 up is a standby (never writable) and for directory 1
-// the primary it always was.
+// MustRole is RoleOf for the places that cannot do anything with an error. A role file that cannot be read or is
+// broken is never replaced by the default of the directory id (FO-09): a promoted primary in a directory from 100
+// up would become a standby (no lease, no watchdog, deletable), a demoted instance of directory 1 a primary. The
+// answer is RoleUnknown: not writable, not a standby, not a copy.
 func (m *Manager) MustRole(id int) Role {
 	r, _, err := m.RoleOf(id)
 	if err != nil {
 		m.log.Warn("reading the role file of an instance", "instance", id, "error", err)
-		return DefaultRole(id)
+		return Role{Group: GroupUnknown, Role: RoleUnknown, Origin: OriginUnknown}
 	}
 	return r
 }

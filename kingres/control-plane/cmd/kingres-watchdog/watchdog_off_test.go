@@ -10,8 +10,8 @@ import (
 	"time"
 )
 
-// ST-01: kingresd tells the watchdog that it stopped enforcing the lease on purpose (the group has no
-// standby any more): the watchdog must not fence on a file that is not written any more, and it fences
+// ST-01 and FO-01: kingresd tells the watchdog that the instance is not a primary now (a demotion that keeps it running; a group with no
+// standby is not that, its file is refreshed): the watchdog must not fence on a file that is not written any more, and it fences
 // again when a later file arms it.
 func TestWatchdogDoesNotFenceAfterTheLeaseWasSwitchedOff(t *testing.T) {
 	r := newWDRig(t) // its lease file runs out after 300 ms
