@@ -2760,6 +2760,59 @@ build to the corrected rule. The verifier's README has the same list with the re
 120. **A server without OpenSSL (3.7).** Only `ledger_attest` needs OpenSSL and raises `0A000`
     without it; the registry, the message, the policy and every check work. A table whose policy is
     `required` cannot be written on such a server (`KL010`).
+121. **The origin prefix is locked by the first key (3.2, 4.2, 8.4).** The event of a new key is
+    signed under the prefix, and an event cannot be signed again under another name, so the prefix is
+    locked once a key or a checkpoint exists, not only after the first checkpoint (409
+    `origin_prefix_locked`). Before the first key it is free; the console shows the default
+    (`<server address>/kingres-ledger`) for confirmation before the first key is created.
+122. **The migration and its runner (8.2, 10).** The migration is 0030 (0008 was taken long ago, and
+    0015 to 0029 are left to failover). The runner applies every migration it has not recorded, in
+    the order of the versions, allows gaps, and refuses a database that holds a version the binary
+    does not know.
+123. **`anchorLedgerNow` answers 201 with the records (8.4).** A 202 of the contract is always a task,
+    and the submission is made by the job.
+124. **Subjects of the key tasks (6.7, 8.4).** The kinds `ledger.key.*` have the subject
+    `ledgerKey`/`signing`, so one key task runs at a time in the cluster; retiring and revoking are
+    kinds of their own. `ledger.bundle.create`, `ledger.epoch.start` and `ledger.upgrade` have a
+    database as their subject.
+125. **`compromised-since` is clamped (3.3).** It is never later than the time of the revocation and
+    never before the creation of the key; the event and the record carry the clamped value.
+126. **A revocation never creates a key (3.3; replaces "the dialog generates one in the same
+    task").** With no other active key in force the answer is 409 `last_signing_key`: a key made by
+    the revocation would be a key that no key authorises, which is the discontinuity of 9.2 and is
+    not built yet.
+127. **Holders (3.2.2).** The leader and the servers that hold an active node of group 0 in the
+    catalog of the system database. A server stays on record until its files were removed. A holder
+    that cannot be reached does not fail a creation (it is named in the detail of the task and the
+    distribution job retries); for a retirement and a revocation it fails the task with
+    `key_files_remain`, which can be retried.
+128. **The bound of a retired key (3.3; adds to 93).** At most the largest size of a stored
+    checkpoint, and at least 1; it is written in the event of the retirement and read back by the
+    step that retires. A key that signed nothing is bound to 1.
+129. **Signing and retiring exclude each other (a duty of step 5).** The retirement reads the
+    largest checkpoint size in its first step; a checkpoint signed afterwards by the retiring key
+    beyond that size would be refused by the verifier.
+130. **Adoption after a crash.** A key file with no row is adopted by a repeated step only if it was
+    modified after the task was created, less the allowed clock difference. A next key with its file
+    and no event is adopted unless it is older than 300 days.
+131. **Passphrases.** A sealed key file is opened with the passphrase of the holder that has it and
+    written again under the sealing of the holder that receives it; a plain file is accepted by a
+    holder that seals. A holder that cannot open a file answers 409 `passphrase_mismatch`, and the
+    task names the server.
+132. **The trust file.** It is built without next keys. `getLedgerTrustFile` answers 503 when the
+    stored trust file differs from the one built from the set.
+133. **Columns beyond the list of 8.2.** `ledger_cluster`: `keys_revision`, `trust_file`, `holders`,
+    `backup_advised`, `discontinuity`; `ledger_signing_key`: `label`, `overlap_ends`,
+    `max_tree_size`, `task_id`; `ledger_event`: `type`, `subject`, unique together. The request that
+    creates a key can say that a backup was made, which clears the reminder. A key operation on a
+    server without a term answers 503 with `Retry-After`; a task step that meets another term ends
+    with the task error `term_over`, which can be retried.
+134. **`ledgerSignerUnavailable` (6.9).** It is also raised for a damaged key set, a trust file that
+    differs, and a missing key file of an active or next key. Step 5 adds "no checkpoint signed for
+    two rounds".
+135. **A stale next key** stays in the set and takes one of the 16 places until it is revoked.
+136. **A forwarded answer keeps its `Content-Disposition`**, which the download of the trust file
+    through a follower needs.
 
 Of section 13: item 2 (test vectors) is settled for signed notes (the example key and note of the
 specification are in the tests; the checkpoint example has no published key), item 3 (entry bundles at
