@@ -2066,3 +2066,60 @@ server or its enforcement changes; a node is not fenced or marked failed on
 the dead primary are removed from the catalog before the secret is rotated;
 nothing sets the gate of the task engine yet: the bootstrap of the map group
 (increment 5) must.
+
+### The fixes for the review of increments 0 to 2 (2026-11-18)
+
+What the review (`reviews/2026-11-17-kingresd-failover-increments-0-2.md`,
+FO-01 to FO-16) changed against sections 3 to 6, stated as the rules the
+later increments rely on.
+
+**A directory is a standby only when it is proved to be one.** The standby
+agent deletes, rebuilds or rewinds an instance directory only when its role
+file is valid and says standby, and the instance is in recovery when it runs
+or carries `standby.signal` when it does not; the refusal is `not_a_standby`
+(409). A role file that cannot be read means "unknown": such an instance is
+not writable, is not a standby and is not copied, and the start gate holds it
+like a primary. Increment 3 therefore writes the role file before it calls
+`pg_promote`, so that a crash between the two leaves a directory that no
+agent removes. Removing the instances of a server that is itself removed or
+reset is that server's own act and is not guarded.
+
+**The watchdog file.** `off` means only "this instance is not a primary" and
+never fences, however old the file. A primary of a group without a standby
+gets a counting file at every renewal pass, whether or not the lease was
+renewed, so that a dead or hung `kingresd` leaves a file that runs out; this
+closes the case of a primary that was told for ever that nothing needs
+protection and later runs beside a standby that was added and promoted. Every
+file carries a validity above zero (24 hours for `off`), because a watchdog of
+the version before ignores the state and would fence at once on zero.
+
+**Leases.** A transfer is done at a grantor when the holder it names is the
+target, and a release when it names no holder, so a call repeated after a lost
+answer succeeds. Neither is carried out while an instance of the group runs on
+the server that gives the lease up. A grantor of the version before these
+calls counts for nothing, so a hand-over in a cluster that is not upgraded
+everywhere is refused. An adoption clears the marker of an earlier hand-over,
+and a release waits for the renewal round in flight before it asks the
+grantors.
+
+**Freezes survive a restart.** The frozen groups and the servers that are
+gone are kept in `failover-freeze.json` in the data directory. The list of a
+frozen group is never changed, also when no name is planned for it.
+
+**The catalog.** The row is read back on every primary of the catalog after
+`add_node` and `remove_node`; a primary that cannot be read is a refusal that
+the next check repeats.
+
+**Tasks.** A cancel is refused when the task cannot be read, the guard of the
+kind is asked again at each step boundary, and a cancel mark is ignored past
+the point of no return. Migration 0013 refuses (`KX004`) a stop or a restart
+of an instance of a server that an unfinished failover names as its old or
+new server, and a restart for settings while any failover is unfinished.
+
+**Open after this round.** A name in the synchronous list of a standby that
+is never registered (FO-15) is left to increment 3, which refuses a failover
+while a named standby is not in the catalog. On PostgreSQL 19rc2 the server
+whose wall clock steps by an hour answers 503 for a read of the panel API
+("the role of this session cannot be checked right now") in about one run of
+five of the liveness test; it is in the tree of increments 0 to 2 as well, so
+it does not come from these fixes, and its cause is not known.
