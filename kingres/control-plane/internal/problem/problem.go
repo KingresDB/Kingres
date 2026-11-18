@@ -89,6 +89,9 @@ const (
 	GroupDegraded       Code = "group_degraded"
 	InsufficientDisk    Code = "insufficient_disk"
 	NoReceivingServer   Code = "no_receiving_server"
+	// Added in contract 0.10.0 (failover).
+	FailoverNeedsDecision Code = "failover_needs_decision"
+	LeaseSettingsDiffer   Code = "lease_settings_differ"
 )
 
 // FieldError is one entry of the "errors" extension (schema ValidationIssue).
@@ -208,6 +211,8 @@ var specs = map[Code]struct {
 	GroupDegraded:                   {409, "Shard group degraded", "group-degraded"},
 	InsufficientDisk:                {409, "Insufficient disk space", "insufficient-disk"},
 	NoReceivingServer:               {409, "No receiving server", "no-receiving-server"},
+	FailoverNeedsDecision:           {409, "The failover needs a decision", "failover-needs-decision"},
+	LeaseSettingsDiffer:             {409, "Lease settings differ", "lease-settings-differ"},
 }
 
 // New returns a Problem for the code with the standard status, title and

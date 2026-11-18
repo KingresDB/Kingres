@@ -247,12 +247,16 @@ func TestTransferStopsRenewingAndSurvivesARestart(t *testing.T) {
 	if m2.Holds(1) || m2.AdoptionStatus(1).Rounds != 0 {
 		t.Fatal("a restarted manager renewed a group that was transferred")
 	}
-	// A second failover of the same group adopts it again by decision of the task (FO-10): the old marker goes.
+	// A second failover of the same group adopts it again by decision of the task (FO-10): the renewal starts again,
+	// but the marker file stays, because it is what holds the old primary directory back (F2-04).
 	if err := m2.Adopt(1, AdoptFence); err != nil {
 		t.Fatalf("an explicit adoption of a group this server handed over earlier: %v", err)
 	}
-	if m2.Relinquished(1) || markerExists(filepath.Join(r.dir, "lease"), RelinquishedMarker, 1) {
-		t.Fatal("the relinquished marker survived an adoption")
+	if m2.Relinquished(1) {
+		t.Fatal("an adopted group is still marked relinquished in memory")
+	}
+	if !markerExists(filepath.Join(r.dir, "lease"), RelinquishedMarker, 1) {
+		t.Fatal("the adoption removed the mark that holds the old primary directory back (F2-04)")
 	}
 	m2.Unadopt(1)
 	if err := m2.Relinquish(1); err != nil {

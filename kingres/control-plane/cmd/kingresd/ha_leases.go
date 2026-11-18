@@ -52,6 +52,7 @@ func startLeases(d *haDeps) error {
 		Timeout: d.Cfg.HA.LeaseDuration - d.Cfg.HA.LeaseMargin, Fault: d.Fault})
 	d.OnCertificateInstalled(pc.ForgetAll)
 	wd := &watchdogs{d: d, leaseDir: leaseDir, byInstance: map[int]*watchdogRunner{}}
+	d.Watchdogs = wd
 	mgr, err := lease.New(lease.Config{
 		Self: d.ServerHost, Clock: clk, Duration: d.Cfg.HA.LeaseDuration, Renew: d.Cfg.HA.LeaseRenew, Margin: d.Cfg.HA.LeaseMargin,
 		Grantor: grantor, Voter: peerVoter{pc: pc, fault: d.Fault}, Source: catalogTopology{d: d},
@@ -256,6 +257,9 @@ func (w *watchdogRunner) binary() string {
 func (w *watchdogRunner) ensure() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.exited == nil && lease.LockHeld(filepath.Join(w.leaseDir, "watchdog."+strconv.Itoa(w.instance)+".lock")) {
+		return // a watchdog of an earlier kingresd still runs: another one would only start and end at once (F2-13)
+	}
 	if w.exited != nil {
 		select {
 		case <-w.exited:
@@ -317,6 +321,16 @@ func (w *watchdogs) leaseFile(group int32) string {
 		return ""
 	}
 	return filepath.Join(dir, "lease.json")
+}
+
+// running says whether a watchdog of the primary instance of the group runs on this server, whoever started it: its lock
+// is held (F2-13).
+func (w *watchdogs) running(group int32) bool {
+	li, ok := w.d.Svc.PrimaryOf(group)
+	if !ok {
+		return false
+	}
+	return lease.LockHeld(filepath.Join(w.leaseDir, "watchdog."+strconv.Itoa(li.ID)+".lock"))
 }
 
 func (w *watchdogs) ensure(group int32) {

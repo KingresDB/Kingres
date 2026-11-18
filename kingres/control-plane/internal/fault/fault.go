@@ -50,6 +50,11 @@ type Spec struct {
 	// FinishDelayMs holds a joining server between preparing its system database and
 	// declaring itself a member.
 	FinishDelayMs int64 `json:"finishDelayMs,omitempty"`
+	// TaskExitPoint ends this process (as a kill does) when the task engine reaches that crash point
+	// (task.Fault* names) of step TaskExitStep of a task of kind TaskExitKind; the tests of the failover use it
+	// to end the leader at a step boundary. TaskExitStep -1 means any step.
+	TaskExitPoint string `json:"taskExitPoint,omitempty"`
+	TaskExitStep  int    `json:"taskExitStep,omitempty"`
 }
 
 // Hook reads the fault file. A nil *Hook means "no faults" and is valid.
@@ -139,4 +144,20 @@ func (h *Hook) GrantDelay() time.Duration {
 		return 0
 	}
 	return time.Duration(h.load().GrantDelayMs) * time.Millisecond
+}
+
+// TaskPoint is the crash hook of the task engine: it ends the process when the fault file asks for this point
+// and step. Only tests write such a file.
+func (h *Hook) TaskPoint(point string, _ int64, step int) {
+	if h == nil {
+		return
+	}
+	sp := h.load()
+	if sp.TaskExitPoint == "" || sp.TaskExitPoint != point {
+		return
+	}
+	if sp.TaskExitStep >= 0 && sp.TaskExitStep != step {
+		return
+	}
+	os.Exit(137)
 }

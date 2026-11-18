@@ -97,6 +97,53 @@ type PGRegistrar struct {
 	// on the coordinator only (FO-08): the coordinator is the first to commit, so its row proves nothing about a
 	// node that went silent at the very end. nil: only the coordinator is read.
 	Remote func(ctx context.Context, host string, port int) (*pgx.Conn, error)
+	// Every sharded database has a catalog of its own (kingres.node in that database, with its own node ids): a
+	// standby that is registered only in the system database is unknown to the databases of the clients, and a
+	// failover could not move their catalogs. Databases lists the databases that have a catalog besides the
+	// system database; DBConn and DBRemote open a connection to one of them (the coordinator, and another primary).
+	// Skip says that a server is dead and is not read back (nil: every primary is read).
+	Skip      func(host string) bool
+	Databases func(ctx context.Context) ([]string, error)
+	DBConn    func(ctx context.Context, db string) (*pgx.Conn, error)
+	DBRemote  func(ctx context.Context, host string, port int, db string) (*pgx.Conn, error)
+}
+
+// in is the registrar of one other database: the same calls on its catalog.
+func (r *PGRegistrar) in(db string) *PGRegistrar {
+	c := *r
+	c.Databases, c.DBConn, c.DBRemote = nil, nil, nil
+	c.Conn = func(ctx context.Context) (*pgx.Conn, error) { return r.DBConn(ctx, db) }
+	if r.DBRemote != nil {
+		c.Remote = func(ctx context.Context, host string, port int) (*pgx.Conn, error) {
+			return r.DBRemote(ctx, host, port, db)
+		}
+	}
+	return &c
+}
+
+// others lists the other databases that have a catalog (none when the registrar was not given the means).
+func (r *PGRegistrar) others(ctx context.Context) ([]string, error) {
+	if r.Databases == nil || r.DBConn == nil {
+		return nil, nil
+	}
+	return r.Databases(ctx)
+}
+
+// EnsureEverywhere registers the standby in the catalog of every other database where it is not (idempotent: a
+// standby that is there is found by its host and port and left alone). The system database's node id is the
+// one the records keep; the other databases have ids of their own, found again by host and port.
+func (r *PGRegistrar) EnsureEverywhere(ctx context.Context, e Entry) error {
+	dbs, err := r.others(ctx)
+	if err != nil {
+		return err
+	}
+	e.CatalogNode = 0
+	for _, db := range dbs {
+		if _, err := r.in(db).register(ctx, e); err != nil {
+			return fmt.Errorf("registering in the catalog of database %s: %w", db, err)
+		}
+	}
+	return nil
 }
 
 func (r *PGRegistrar) timeout() time.Duration {
@@ -124,6 +171,18 @@ func find(ctx context.Context, c *pgx.Conn, host string, port int) (id int32, ro
 
 // Register implements CatalogRegistrar (sequence 1, steps 1 and 3).
 func (r *PGRegistrar) Register(ctx context.Context, e Entry) (int32, error) {
+	id, err := r.register(ctx, e)
+	if err != nil {
+		return 0, err
+	}
+	if err := r.EnsureEverywhere(ctx, e); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// register is Register for the catalog this registrar's Conn opens.
+func (r *PGRegistrar) register(ctx context.Context, e Entry) (int32, error) {
 	if e.Port == 0 {
 		return 0, errors.New("the standby has no port yet")
 	}
@@ -157,6 +216,11 @@ func (r *PGRegistrar) Register(ctx context.Context, e Entry) (int32, error) {
 		if errors.As(err, &pe) && pe.Code == sqlstateAlreadyThere {
 			// registered meanwhile (a call that did not finish, sequence 9): use its id
 			if id, role, group, found, ferr := find(ctx, c, e.Server, e.Port); ferr == nil && found && role == "standby" && group == e.Group {
+				// Found on the coordinator is not proof for the other primaries, and this branch is the repeat after a call that
+				// did not finish, the case the read-back is for (F2-10).
+				if berr := r.readBackEverywhere(ctx, c, e, id, e.Port, true); berr != nil {
+					return 0, berr
+				}
 				return id, nil
 			}
 		}
@@ -185,6 +249,24 @@ func (r *PGRegistrar) Register(ctx context.Context, e Entry) (int32, error) {
 
 // Unregister implements CatalogRegistrar (sequence 8, step 2 and 3).
 func (r *PGRegistrar) Unregister(ctx context.Context, e Entry) error {
+	// The other databases first (their node ids are found by host and port), the system database last: its row is
+	// the record that the removal is not done yet.
+	if dbs, err := r.others(ctx); err != nil {
+		return err
+	} else {
+		o := e
+		o.CatalogNode = 0
+		for _, db := range dbs {
+			if err := r.in(db).unregister(ctx, o); err != nil {
+				return fmt.Errorf("removing from the catalog of database %s: %w", db, err)
+			}
+		}
+	}
+	return r.unregister(ctx, e)
+}
+
+// unregister is Unregister for the catalog this registrar's Conn opens.
+func (r *PGRegistrar) unregister(ctx context.Context, e Entry) error {
 	ctx, cancel := context.WithTimeout(ctx, r.timeout())
 	defer cancel()
 	c, err := r.Conn(ctx)
@@ -287,6 +369,12 @@ func (r *PGRegistrar) readBackEverywhere(ctx context.Context, c *pgx.Conn, e Ent
 		return err
 	}
 	for _, n := range nodes {
+		if r.Skip != nil && r.Skip(n.host) {
+			// A server that is dead (declared gone, a failover under way) cannot be read and must not block the
+			// removal of its standbys; it is brought up to date by sync_catalog() when it returns.
+			r.logger().Warn("standby: a dead server is not read back", "server", n.host)
+			continue
+		}
 		nc, err := r.Remote(ctx, n.host, n.port)
 		if err != nil {
 			return &CatalogError{Call: "read back", Code: "unread", Msg: fmt.Sprintf("the catalog of %s:%d cannot be read to check the result: %v", n.host, n.port, err), Retry: true}

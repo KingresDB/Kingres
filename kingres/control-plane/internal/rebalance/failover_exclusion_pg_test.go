@@ -202,3 +202,25 @@ func TestAStopOfAnyInstanceOfTheServerAndAConfigRestartAreRefusedDuringAFailover
 		t.Errorf("an instance of another server must not be affected: %v", err)
 	}
 }
+
+// KX005 (migration 0014, F2-09): a failover cannot start while an instance stop, an instance restart or a config restart
+// is running; the exclusion works both ways, and a task that ended frees the way.
+func TestAFailoverIsRefusedWhileAnInstanceOperationRuns(t *testing.T) {
+	e := newEnvNoTask(t)
+	st := task.NewPGStore(e.sys)
+	var x *task.ExcludedError
+	for _, op := range []struct{ kind, subject, typ string }{{"instance.stop", "1", "instance"}, {"instance.restart", "2", "instance"}, {"config.restart", "restart", "config"}} {
+		var id int64
+		if err := e.sys.QueryRow(context.Background(), `INSERT INTO kingres_cp.task (kind, state, subject_type, subject_id, created_by) VALUES ($1, 'running', $2, $3, 'test') RETURNING id`,
+			op.kind, op.typ, op.subject).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.create(t, st, kindFailover, "s1"); !errors.As(err, &x) {
+			t.Fatalf("a failover while a %s runs was accepted: %v", op.kind, err)
+		}
+		e.setState(t, id, "done")
+	}
+	if _, err := e.create(t, st, kindFailover, "s1"); err != nil {
+		t.Fatalf("after the operations ended: %v", err)
+	}
+}

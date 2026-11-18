@@ -59,7 +59,9 @@ type haDeps struct {
 	Standby *standbyParts
 	// LeaseMgr is the lease manager (nil until startLeases ran); EntryDestination says where the
 	// client entry point sends a new connection now (nil without an entry point).
-	LeaseMgr         *lease.Manager
+	LeaseMgr *lease.Manager
+	// Watchdogs are the watchdogs of the primary instances of this server (nil until startLeases ran).
+	Watchdogs        *watchdogs
 	EntryDestination func(ctx context.Context) string
 	// BG is the context of background work; background goroutines are added to WG
 	// and must end when BG ends.

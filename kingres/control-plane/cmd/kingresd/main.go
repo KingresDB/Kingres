@@ -29,6 +29,7 @@ import (
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/auth"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/cluster"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/config"
+	"github.com/KingresDB/Kingres/kingres/control-plane/internal/failover"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fault"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fence"
 	"github.com/KingresDB/Kingres/kingres/control-plane/internal/fwdproof"
@@ -352,6 +353,12 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 		rbs.Backoff = cfg.RebalanceRetryBackoff
 		deps.Rebalance = rbs
 	}
+	foDeps := &failoverDeps{}
+	var fos *failover.Service
+	if opsSvc != nil && svc.Enabled() && members != nil && stby != nil {
+		fos = newFailover(svc, opsSvc, members, stby, haReg, haCalls, serverHost, log, auditFn(sink, log), foDeps)
+		deps.Failover = fos
+	}
 	deps.LeaderTrusted = leaderTrusted(haReg, lastLeader, serverHost, cfg.HA.LeaderLossBound)
 	api, err := httpapi.New(deps)
 	if err != nil {
@@ -408,8 +415,11 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 			if rbs != nil {
 				defs = append(defs, rbs.Definitions()...)
 			}
+			if fos != nil {
+				defs = append(defs, fos.Definitions()...)
+			}
 			eng, err = task.NewEngine(task.NewPGStore(pool), defs, task.Options{
-				Holder: fmt.Sprintf("%s-%d", hostname, os.Getpid()), Logger: log})
+				Holder: fmt.Sprintf("%s-%d", hostname, os.Getpid()), Logger: log, Fault: faultHook.TaskPoint})
 			if err != nil {
 				return
 			}
@@ -480,6 +490,7 @@ func run(ctx context.Context, args []string, env config.Env, stderr io.Writer, r
 	if members != nil {
 		hd.PC = members.Client
 	}
+	foDeps.d = hd
 	if cfgp != nil {
 		cfgp.start(hd, haCalls)
 	}

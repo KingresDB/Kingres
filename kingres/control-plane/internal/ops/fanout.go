@@ -197,10 +197,67 @@ func ids(s []OtherServer) []string {
 	return out
 }
 
+// otherErrorBudget is how long onServer keeps trying a server that answers with an error that is not
+// "unreachable". A server whose set of primaries has just changed (a failover promoted an instance on it, or its
+// home instance became a standby) can refuse for a moment, because the instance it must reach is in recovery or
+// not yet reachable with the credentials of its role file, and the next try finds it settled. Such an error is
+// retried for this long and then fails the task with the last error (never silence); an unreachable server is
+// waited for without a limit.
+var otherErrorBudget = 10 * time.Minute
+
+// otherErrorPause is the wait between two tries after an error that is not "unreachable".
+var otherErrorPause = 2 * time.Second
+
+// healable says whether an error of an apply on another server can go away by itself, so that the
+// step waits and tries again, or is final, so that the step fails at once.
+//
+// Healable: a server that is unreachable or not ready (503), a server that is not the leader or has no
+// leader yet, any other 5xx, an answer that carries no SQLSTATE (a lost connection, "the statement
+// failed"), and a PostgreSQL refusal of the kind that a moment fixes: class 08 (connection), 25 (a
+// read-only transaction: the instance is still in recovery), 3D (the database is about to arrive),
+// 40 (serialization, deadlock), 53 (resources), 55 (an object in use, a lock), 57 (the instance is
+// starting or stopping) and 58 (system error).
+//
+// Final: a refusal of the contract or of the callee (any other 4xx), and a PostgreSQL refusal of the
+// input or the state that waiting does not change: class 22 (data), 23 (integrity), 28 (authorization), 2B,
+// 42 (syntax, a role or object that cannot exist) and 0A (not supported).
+func healable(err error) bool {
+	var ae *peerclient.APIError
+	if errors.As(err, &ae) {
+		switch {
+		case errors.Is(err, peerclient.ErrNotReady), ae.Status >= 500:
+			return true
+		case ae.Code == "not_leader" || ae.Code == "leader_unavailable" || ae.Code == "service_unavailable":
+			return true
+		case ae.Code == "apply_failed":
+			return sqlstateHealable(ae.Message)
+		}
+		return false
+	}
+	return true
+}
+
+// sqlstateHealable reads "SQLSTATE xxxxx: text" (cluster.pgReason) and classifies the code; text without a
+// code is a statement that failed without an answer of PostgreSQL (a lost connection), which can heal.
+func sqlstateHealable(msg string) bool {
+	rest, ok := strings.CutPrefix(msg, "SQLSTATE ")
+	if !ok || len(rest) < 5 {
+		return true
+	}
+	switch rest[:2] {
+	case "22", "23", "28", "2B", "42", "0A":
+		return false
+	}
+	return true
+}
+
 // onServer runs f for a server, waiting while the server cannot be reached
-// and saying which server the task waits for.
+// and saying which server the task waits for. An error that is not an unreachable
+// server is tried again for otherErrorBudget and logged each time it changes.
 func (o *Ops) onServer(ctx context.Context, env *task.Env, server, doing string, f func() error) error {
 	announced := false
+	var firstOther time.Time
+	lastText := ""
 	for {
 		err := f()
 		if err == nil {
@@ -210,8 +267,28 @@ func (o *Ops) onServer(ctx context.Context, env *task.Env, server, doing string,
 			return nil
 		}
 		if !errors.Is(err, peerclient.ErrUnreachable) {
-			return fmt.Errorf("on server %s: %w", server, err)
+			if !healable(err) {
+				return fmt.Errorf("on server %s: %w", server, err)
+			}
+			if firstOther.IsZero() {
+				firstOther = time.Now()
+			}
+			if time.Since(firstOther) >= otherErrorBudget {
+				return fmt.Errorf("on server %s: %w", server, err)
+			}
+			if err.Error() != lastText {
+				lastText = err.Error()
+				o.Log.Warn("a server refused a change that is repeated", "server", server, "doing", doing, "error", err)
+			}
+			_ = env.SetDetail(ctx, fmt.Sprintf("Server %s refused (%s); trying again.", server, doing))
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(otherErrorPause):
+			}
+			continue
 		}
+		firstOther = time.Time{}
 		if !announced {
 			o.Log.Warn("task waits for a server", "server", server, "doing", doing, "error", err)
 			announced = true
@@ -288,14 +365,20 @@ func (o *Ops) replicaParams(ctx context.Context, in replicateInput) (any, error)
 }
 
 func (o *Ops) replicate(ctx context.Context, in replicateInput) {
-	servers := o.others(ctx)
-	if len(servers) == 0 || o.Local == nil {
+	if o.Local == nil {
 		return
 	}
 	ctx = context.WithoutCancel(ctx)
+	servers := o.others(ctx)
 	params, err := o.replicaParams(ctx, in)
 	if err != nil {
-		o.Log.Error("reading the state to replicate failed", "kind", in.Kind, "error", err)
+		if len(servers) > 0 {
+			o.Log.Error("reading the state to replicate failed", "kind", in.Kind, "error", err)
+		}
+		return
+	}
+	o.applyToOwnPrimaries(ctx, in.Kind, params)
+	if len(servers) == 0 {
 		return
 	}
 	var failed []string
@@ -315,6 +398,35 @@ func (o *Ops) replicate(ctx context.Context, in replicateInput) {
 	subject := fmt.Sprintf("apply:%s:%s:%d", in.Kind, strings.Join(in.Names, ","), time.Now().UnixNano())
 	if _, err := o.StartTask(ctx, KindReplicate, "replication", subject, in, "system"); err != nil {
 		o.Log.Error("starting the task that brings servers up to date failed", "error", err)
+	}
+}
+
+// applyToOwnPrimaries brings every primary this server runs up to date with a change that was made through one
+// instance: the operation of the request runs against the home instance, and after a failover this server can run
+// the primary of another group as well (a promoted standby), which is a PostgreSQL cluster with roles of its own. The
+// apply is the one the other servers get, and is idempotent. It is tried for a minute, because a promoted instance
+// can be reached a moment after the promotion; what cannot be applied is logged (the next change of the role
+// repeats it).
+func (o *Ops) applyToOwnPrimaries(ctx context.Context, kind string, params any) {
+	raw, err := json.Marshal(params)
+	if err != nil {
+		o.Log.Error("encoding the change for this server's other primaries", "kind", kind, "error", err)
+		return
+	}
+	deadline := time.Now().Add(time.Minute)
+	for {
+		err := o.ApplyLocal(ctx, kind, raw)
+		if err == nil || !localHealable(err) || time.Now().After(deadline) {
+			if err != nil {
+				o.Log.Warn("a change could not be applied to every primary of this server", "kind", kind, "error", err)
+			}
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
 	}
 }
 
@@ -369,4 +481,14 @@ func (o *Ops) roleChanged(ctx context.Context, role string) {
 			o.Log.Warn("telling a server that a role changed failed; its sessions end when the replication task reaches it", "server", s.ID, "error", err)
 		}
 	}
+}
+
+// localHealable classifies an error of ApplyLocal: a PostgreSQL refusal by its SQLSTATE, anything else (a lost
+// connection, an instance that is not reachable yet) can heal.
+func localHealable(err error) bool {
+	msg := err.Error()
+	if i := strings.Index(msg, "SQLSTATE "); i >= 0 {
+		return sqlstateHealable(msg[i:])
+	}
+	return true
 }

@@ -2123,3 +2123,88 @@ whose wall clock steps by an hour answers 503 for a read of the panel API
 ("the role of this session cannot be checked right now") in about one run of
 five of the liveness test; it is in the tree of increments 0 to 2 as well, so
 it does not come from these fixes, and its cause is not known.
+
+### Increment 3 and the fixes for the second review (2026-11-18)
+
+What the first failovers on a real cluster, and the review of the fixes
+(`reviews/2026-11-18-kingresd-failover-fixes.md`, F2-01 to F2-17), changed
+against sections 3 to 6.
+
+**Every database with the extension has a catalog of its own.** The table of
+nodes exists in each database in which `kingres_shard` is created, with node
+identifiers of its own. A standby is therefore registered and removed in
+every such database, not in the system database only; the leader repairs a
+missing registration at every check; a failover resolves the old and the new
+node by host and port in each database and runs `promote_node` and the read
+back in each; and the preflight refuses (`cluster_inconsistent`) while a
+database lacks a ready standby of the group. Section 4 spoke of "the
+catalog"; it is one catalog per database.
+
+**Term 0 is a term.** A cluster that never failed over is at term 0, and the
+check of a stale term was skipped for a value that is not positive, so the
+first failover had no protection. A negative value now means "not checked";
+0 is compared like every other term.
+
+**Roles and grants on the leader's own server.** A change of roles made
+through the API was applied to the other servers and to one primary of the
+leader's server. It is now applied to every writable instance of the local
+server, so an instance promoted on the leader's server has the roles made
+after the failover.
+
+**An internal read may carry a query.** The client for calls between servers
+refused every path with a query, so the reads of a position and of a state
+(`?group=`) failed. The query is split off and checked against a narrow
+pattern of its own.
+
+**A promoted instance whose `kingresd` restarted.** Such an instance is held
+back until the lease is held. The call that promotes answers
+`409 lease_not_held` while a writable instance lacks the lease, and the step
+then hands the lease over again; an instance that is starting (503) is waited
+for.
+
+**A fence and a lease that comes back.** The 503 of the liveness test on
+PostgreSQL 19 (open in the section before) was not the clock: a server lost
+its lease, the fence began to stop the primary, a renewal round won the lease
+again in the same moment and "started" the instance that was still running,
+the stop then ended it, and nothing started it again while the lease was
+held. A fence now marks its group for the whole stop, and a round that wins
+the lease meanwhile leaves the marker in place so that the next round starts
+the instance. The same code runs on 18.
+
+**The age of a verdict.** The verdict about lost data used the age of the
+last check at the time of the decision, so every failover that took longer
+than 30 seconds read "possible". It is the age of the last check less the
+silence of the primary's server. After a restart of the leader's `kingresd`
+the silence is not known; the verdict then reads "possible" and the task
+pauses for a decision.
+
+**Prepared transactions.** `recover_prepared_transactions()` is also run on
+the promoted instance.
+
+**From the review.** The list of a frozen group is changed in no branch of
+the decision (F2-01). A freeze belongs to a task and an epoch: only its owner
+lifts it, another caller gets `409 fenced`, the owners are kept in the freeze
+file and a file that cannot be written is an error (F2-12). A release writes
+its marker before it asks the grantors; an adoption keeps the marker file of
+the directory it adopts, and only an attach or the withdrawal of a hand-over
+removes it; an attach is refused when the lease is not held (F2-03, F2-04,
+F2-11). A stop that failed in a fence is repeated every five seconds, and
+whether a group is enforced is read at every check (F2-05). The idle watchdog
+file is written by a loop of its own, and the rule for a group without a
+standby is: its primary is never stopped for a lapsed lease, only for a
+`kingresd` that stopped running (F2-07). The read back after `add_node` also
+runs when the node exists already, and a server known to be dead does not
+block it (F2-10). The state of a failover says whether a watchdog holds the
+old primary's lock; the preflight refuses an old primary that runs without
+one (F2-13). Migration 0014 refuses a failover or a restore while a stop or
+restart of an instance, or a restart for settings, is pending or running
+(`KX005`, 409); the other direction was migration 0013 (F2-09).
+
+**Open after this round.** F2-06, F2-08, F2-16; the design text that F2-14
+names; F2-02 has its check but no test that fails without it; an operation on
+an enforced primary still runs when its record cannot be written (the rest of
+F2-09). Not tested yet: a standby that lags at the failover, a second
+failover while one is paused, and a lost answer of each internal call (the
+fault hook cannot drop only an answer). The takeover points and the four
+refusal tests were run once or three times each, not repeated as the
+dead-server test was.

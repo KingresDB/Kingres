@@ -377,6 +377,25 @@ Types: `cmd/kingresd/ha_failover.go`, `internal/standby/freeze.go`. A `GET` carr
 
 All of these only change what the standby agent reads from memory: nothing is written to an instance.
 
+### The calls of the failover task (increment 3)
+
+Types: `internal/failover/types.go`, handlers in `cmd/kingresd/failover.go` and `internal/standby/failover.go`. Every one is `LeaderOnly`; the
+leader calls its own handler directly for itself. Each carries `expectedTerm`, the catalog term the run read when it started, and the callee refuses
+it with `409 stale_term` when its own catalog has a newer one (somebody promoted meanwhile). The calls are **not** versioned: the internal API
+version stays "1". A server of an older version answers `404 not_found` to a call it does not know, which a step reads as "older version" (and
+refuses the failover with `version_mismatch` at the request), never as `no_instance`, which is a real answer ("this server runs no instance of the group").
+
+| Call | Does |
+|---|---|
+| `POST /failover/lease` `{group, role: fence|holder|release, transferTo, expectedTerm}` | `fence`, `holder`: adopt the lease of the group (renewed like a holder's) and answer `{held, rounds, waitMs, refusedBy}` from the last round; with `transferTo`: hand the lease to that server (`{transferred}`); `release`: stop renewing it. |
+| `POST /failover/demote` `{group, mode: immediate, expectedTerm, transferTo}` | on the old primary's server: relinquish the lease (marker), stop the instance with an immediate shutdown, confirm it does not run, only then hand the lease to `transferTo`; `{stopped, transferred}`. `409 not_primary` when the server runs no primary of the group. |
+| `POST /failover/promote` `{group, standbyId, instanceId, expectedTerm, reapplyList}` | on the standby's server: empty `synchronous_standby_names` and reload, write the role file (primary, origin copy), check that the server holds the group lease as the last thing before `pg_promote(true, 60)`, then `Attach` the lease to the instance (watchdog); `{status: promoted|already, timeline, lsn}`. `409 lease_not_held`, `409 not_standby`, `409 stale_term`; `503 unavailable` when `pg_promote` did not finish (repeat). |
+| `POST /failover/prepared` `{group}` | on the promoted instance's server: `kingres.recover_prepared_transactions()` on the instance that is the group's primary, READ COMMITTED (the extension asks for it on the promoted node and on the map group primary). `409 not_primary`; `503 unavailable` (repeat). Repeating it is harmless. |
+| `POST /standby/repoint` `{group, standbyId, instanceId, primaryHost, primaryPort, expectedTerm}` | on another standby's server: create the standby's slot on the new primary, rewrite `primary_conninfo` and `primary_slot_name`, reload, wait up to 60 s for the walreceiver; `{streaming, state}`. |
+
+`GET /lease/state` already carries `durationMs` and `marginMs` of the answering server; the request is refused (`lease_settings_differ`) when two servers
+differ.
+
 ### A server that waits for its lease
 
 A server whose instance is held back until its group lease is won (the fence marker `<data-dir>/lease/fenced.<group>` or the wait marker `<data-dir>/lease/waitlease.<group>` of the group of the instance exists (a marker without the suffix, left by an earlier version, holds for every group until the first lease round renames it), or its instance is not running) cannot read the catalog and knows no leader. Every call that needs the leader (`LeaderOnly`, `LeaderOrJoining`, `ToLeader`) is then answered `503` with the code `service_unavailable` and `Retry-After: 2`, never `403 not_leader` (which means "the caller is not the leader"). The caller treats it as transient: a task step retries with a pause growing from 1 s to 8 s for up to 5 minutes and then fails naming the server; other callers get the 503. The REST sign-in on that server answers `503 service_unavailable` with `Retry-After: 5` in the same window.
@@ -412,9 +431,14 @@ fence token; a client time limit that ended after the connection was made is not
 | `POST /standby/rebuild` | **no-op for a standby that is of the generation asked for** (changed in this step) |
 | `POST /config/restart` | **no-op with `ifPending` when nothing waits for a restart** (changed in this step; a call without it restarts) |
 | `POST /failover/freeze`, `/unfreeze`, `/standbys-gone` | set the same state in memory |
+| `POST /failover/lease` | adopt again (no-op), a transfer from a server that is no longer the holder is refused (`transferred: false`; the step then reads `/failover/state`), `release` of an adoption that is gone is a no-op |
+| `POST /failover/demote` | no-op for a stopped instance (the marker exists, the stop is confirmed, the transfer is refused from a non-holder); `409 not_primary` once the instance is not the primary of the group |
+| `POST /failover/promote` | `already` for an instance that is out of recovery (it re-applies the empty list and attaches the lease); a promotion that did not finish is asked again |
+| `POST /standby/repoint` | no-op when `primary_conninfo` and the slot are the ones asked for; only waits for the walreceiver |
 | `POST /lease/grant` | a renewal; `transferTo` by the caller that is no longer the holder is refused (`granted: false`); `release` of a free group answers `granted: true` |
 | `POST /task/record`, `/settle`, `/reserve`, `/leave-cluster`, `/leave-status`, `/add-server`, `/forward`, `/pki/renew`, `/exec`, `/heartbeat` | made by servers outside a step, or repeated by design; not repeated by the client |
 | `GET` calls | reads |
 
-The failover steps of the next increment (promote, repoint, rebuild) must be no-ops on a second execution in the same way: check what exists
-before acting, or carry a state that makes the second execution see the first.
+The failover steps (increment 3) are no-ops on a second execution in the same way: each checks what exists before it acts (the pinned standby in
+`failover_group`, the state of the callee from `GET /failover/state`, the catalog from `kingres.node`), and a client time-out is read as "the call did not
+finish": the step asks the callee what it did and then decides, it does not repeat blindly.

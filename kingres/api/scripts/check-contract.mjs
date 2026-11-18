@@ -189,7 +189,7 @@ for (const o of operations) {
 
 // Audit actions: operationIds plus a small closed list of non-operation events.
 // certificateRenewed and certificateRenewalFailed are the events of the certificate renewal job (0.5.0).
-const NON_OPERATION_EVENTS = ['loginFailed', 'setupTokenRejected', 'autoFailover', 'certificateRenewed', 'certificateRenewalFailed', 'leaseLost', 'leaseFenced', 'leaseAcquired', 'standbyCreated', 'standbyRemoved', 'standbyRebuilt', 'standbyInstanceStarted', 'standbyInstanceRemoved', 'standbyInstanceRebuilt', 'synchronousStandbyNamesChanged', 'replicationSlotDropped'];
+const NON_OPERATION_EVENTS = ['loginFailed', 'setupTokenRejected', 'autoFailover', 'certificateRenewed', 'certificateRenewalFailed', 'leaseLost', 'leaseFenced', 'leaseAcquired', 'standbyCreated', 'standbyRemoved', 'standbyRebuilt', 'standbyInstanceStarted', 'standbyInstanceRemoved', 'standbyInstanceRebuilt', 'synchronousStandbyNamesChanged', 'replicationSlotDropped', 'failoverGroupStarted', 'failoverGroupPromoted', 'failoverGroupFailed', 'oldPrimaryRebuilt'];
 const NOT_AUDITED_MUTATIONS = ['previewRebalancePlan', 'createInclusionProof', 'checkSetupToken', 'previewConfigChange'];
 const auditEnum = schemas.AuditAction?.enum;
 if (!Array.isArray(auditEnum)) fail('components.schemas.AuditAction', 'must be an enum');
@@ -379,10 +379,11 @@ const MUST_MENTION = {
   '0.6.0': ['addServer', 'allowUnpinned', 'internal_api_disabled', 'replicationPending', 'LedgerProofBlock', 'dryRun', 'degraded', 'additive'],
   '0.7.0': ['cancelStatement', 'workbench_busy', 'AlertSubject', 'GroupLease', 'leaseLost', 'uncoveredShardGroupIds', 'additive'],
   '0.8.0': ['listConfigParameters', 'applyConfigChange', 'restartPendingInstances', 'clockDifference', 'config_parameter_refused', 'config.apply', 'additive'],
+  '0.10.0': ['getFailoverStatus', 'listFailoverReports', 'getFailoverReport', 'resetAutoFailoverCounter', 'failover_needs_decision', 'quorum_unavailable', 'lease_settings_differ', 'allowDataLoss', 'shardGroupId', 'additive'],
   '0.9.0': ['startRebalance', 'previewRebalancePlan', 'nothing_to_rebalance', 'cluster_inconsistent', 'skipped', 'ledgerSummary', 'Prefer', 'additive'],
   '0.5.0': ['renewServerCertificates', 'revokeServerCertificates', 'certificate_authority_unavailable', 'certificate_revoked', 'certificateRenewalFailed', 'partial', 'additive'],
 };
-for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0']) {
+for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0', '0.10.0']) {
   const changelog = changelogOf(version);
   if (!changelog) { fail('README.md', `changelog heading for ${version} is missing`); continue; }
   for (const h of ['#### Breaking', '#### Additive', '#### Documentation']) if (!changelog.includes(h)) fail('README.md', `changelog of ${version} lacks "${h}"`);
@@ -394,7 +395,7 @@ for (const version of ['0.4.0', '0.5.0', '0.6.0', '0.7.0', '0.8.0', '0.9.0']) {
   if (!m) fail('README.md', `the changelog summary of ${version} must state "N operations added (M operations, P paths)"`);
   else if (version === doc.info?.version && (Number(m[2]) !== operations.length || Number(m[3]) !== Object.keys(doc.paths ?? {}).length)) fail('README.md', `changelog says ${m[2]} operations and ${m[3]} paths, the contract has ${operations.length} and ${Object.keys(doc.paths ?? {}).length}`);
 }
-if (doc.info?.version !== '0.9.0') fail('info.version', 'the contract is revision 0.9.0');
+if (doc.info?.version !== '0.10.0') fail('info.version', 'the contract is revision 0.10.0');
 
 
 // 0.5.0 rules: certificate operations, partial answers, additive changes only.
@@ -490,6 +491,32 @@ for (const [n, prop] of [['SetupTaskSummary', 'detail'], ['NodeStateInfo', 'inte
   if (!opDesc('restartPendingInstances').includes('downtime')) fail('restartPendingInstances', 'must say that restarting a primary is downtime');
   if (!opDesc('getClusterTime').includes('does not') ) fail('getClusterTime', 'must say that kingresd does not set the system clock');
   for (const n of ['listConfigParameters']) if (!opDesc(n).includes('never returned')) fail(n, 'must say that a hidden value is never returned');
+}
+// 0.10.0 rules, high availability part 2 (failover): the four new operations, the extended request, the
+// new codes, kinds and actions, the point of no return, the lower floor of the automatic timeout.
+{
+  const need = { getFailoverStatus: ['get', 'kingres_readonly'], listFailoverReports: ['get', 'kingres_readonly'], getFailoverReport: ['get', 'kingres_readonly'], resetAutoFailoverCounter: ['post', 'kingres_admin'] };
+  for (const [id, [method, role]] of Object.entries(need)) {
+    const o = opById.get(id);
+    if (!o) { fail(id, 'operation of 0.10.0 does not exist'); continue; }
+    if (o.method !== method || o.op['x-required-role'] !== role) fail(id, `must be a ${method.toUpperCase()} that needs ${role}`);
+  }
+  if (!respCodes('getFailoverReport').includes('404')) fail('getFailoverReport', 'must list 404');
+  for (const id of ['failoverServer', 'restorePreferredPrimaries']) {
+    if (!respCodes(id).includes('200') || !respCodes(id).includes('202')) fail(id, 'must answer 200 (dryRun plan) and 202 (task)');
+  }
+  for (const p of ['shardGroupIds', 'targets', 'allowDataLoss', 'dryRun', 'comment']) {
+    if (!schemas.FailoverRequest?.properties?.[p]) fail('FailoverRequest', p + ' is missing');
+    if ((schemas.FailoverRequest?.required ?? []).includes(p)) fail('FailoverRequest', p + ' must stay optional (additive change)');
+  }
+  if (JSON.stringify(schemas.FailoverRequest?.required) !== '["mode"]') fail('FailoverRequest', 'only mode is required');
+  for (const c of ['failover_needs_decision', 'quorum_unavailable', 'lease_settings_differ']) if (!problemCodes.has(c)) fail('ProblemCode', 'missing ' + c);
+  for (const k of ['failoverNeedsDecision', 'failoverBlocked', 'failoverDataLoss', 'splitPromotion', 'oldPrimaryRunning', 'oldPrimaryNotStopped', 'oldPrimaryNotRebuilt']) if (!(schemas.AlertKind?.enum ?? []).includes(k)) fail('AlertKind', 'missing ' + k);
+  if (!schemas.TaskStep?.properties?.shardGroupId || (schemas.TaskStep?.required ?? []).includes('shardGroupId')) fail('TaskStep', 'shardGroupId must exist and stay optional');
+  if (schemas.ShardGroup?.properties?.failover?.$ref !== '#/components/schemas/FailoverReadiness' || (schemas.ShardGroup?.required ?? []).includes('failover')) fail('ShardGroup', 'failover must be an optional FailoverReadiness');
+  if (schemas.ClusterSettings?.properties?.autoFailover?.properties?.timeoutSeconds?.minimum !== 30) fail('ClusterSettings.autoFailover.timeoutSeconds', 'minimum must be 30 since 0.10.0');
+  for (const p of ['lastEventAt']) if ((schemas.ClusterSettings?.properties?.autoFailover?.required ?? []).includes(p)) fail('ClusterSettings.autoFailover', p + ' must stay optional');
+  if (!opDesc('failoverServer').includes('failover_needs_decision') || !opDesc('failoverServer').includes('cancellable')) fail('failoverServer', 'must name failover_needs_decision and say when the task stops being cancellable');
 }
 // ------------------------------------------------------------------ report
 const pathCount = Object.keys(doc.paths ?? {}).length;

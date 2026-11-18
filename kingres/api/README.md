@@ -1,6 +1,6 @@
 # KingresDB management REST API
 
-`openapi.yaml` (OpenAPI 3.1, version 0.9.0) is the contract between the Go backend (`kingresd`) and the
+`openapi.yaml` (OpenAPI 3.1, version 0.10.0) is the contract between the Go backend (`kingresd`) and the
 Vue/TypeScript panel and `kingres-cli`. Lint it and run the mechanical rule check with:
 
 ```
@@ -145,12 +145,13 @@ Each task kind has exactly one `subject.type`; `subject.id` is always a string.
 |---|---|---|
 | `cluster.init`, `cluster.join` | `cluster` | `cluster` |
 | `server.add`, `server.remove`, `server.failover`, `server.leave` | `server` | the `ServerId` (for `server.add` and `server.remove` the id the server registers under, which is the host of its address; for `server.leave` this server) |
+| `server.failover` (0.10.0 text) | `server` | the `ServerId` that is failed over; the report id is the task id. Steps: `Check that the failover can start`, then per group (`TaskStep.shardGroupId`) `Group <n>: Freeze the group`, `Stop the old primary`, `Wait for the old lease`, `Choose the standby`, `Hand the lease to the new server`, `Promote the standby`, `Make the catalog follow`, `Check the catalog`, `Point the other standbys at the new primary`, `Update the standby records`, `Check synchronous_standby_names`, `Resolve prepared transactions`, `Check that clients arrive`, `Lift the freeze`, then `Write the report`. A task that waits for an operator is `paused` and a repeat of the request resumes it; `Task.cancellable` is false once a standby has been promoted (the point of no return) |
 | `certificate.renew`, `certificate.revoke` (0.5.0) | `server` | the `ServerId` whose certificates are renewed or revoked |
 | `instance.start`, `instance.stop`, `instance.restart` | `instance` | the instance id (`node_id`) as a decimal string |
 | `database.create`, `database.update`, `database.drop` | `database` | the database name |
 | `table.distribute` | `table` | `database/schema.table` |
 | `rebalance` | `cluster` | `cluster` (0.9.0; one rebalance at a time, cluster-wide; the task id is the report id): steps `Check that the cluster can rebalance`, `Compute the plan`, `Move buckets`, `Write the report`; a stopped run is `paused` |
-| `replication.restorePreferredPrimaries` | `replication` | `preferred-primaries` |
+| `replication.restorePreferredPrimaries` | `replication` | `preferred-primaries` (0.10.0: answers `unsupported_operation` until the switchover is built) |
 | `ledger.verify` | `ledgerVerification` | the **database name**: the verification id exists only after the run (see `LedgerVerification.taskId`) |
 | `replicate.apply` | `replication` | `apply:<operation>:<role or database names>:<unix nanoseconds>`: the task that brings the servers that could not be reached up to date after a role or grant change (one step per server, `TaskStep.detail` names the server it waits for) |
 | `networkAccess.apply` | `networkAccess` | `network-access` |
@@ -207,7 +208,7 @@ the setup token is consumed by a successful init or join, so the final poll coul
 
 `AuditEvent.action` is the `operationId` of the audited operation (`createDatabase`, `dropDatabase`, `login`,
 `executeQuery`, ...), or one of three events that are not an operation: `loginFailed` (a rejected sign-in, also
-for an unknown user), `setupTokenRejected` and `autoFailover` (actor `system`). A denied or failed call of an
+for an unknown user), `setupTokenRejected` and `autoFailover` (actor `system`; 0.10.0 adds the events `failoverGroupStarted`, `failoverGroupPromoted`, `failoverGroupFailed` and `oldPrimaryRebuilt`, resource type `shardGroup`). A denied or failed call of an
 operation is recorded under that operation's id with `outcome` `denied` or `failure`. Read-only operations are not
 audited except `executeQuery`. The list is the closed enum `AuditAction`, which is also the type of the `action`
 filter of `GET /audit`.
@@ -290,7 +291,7 @@ Where the architecture document leaves something open, the simplest option was c
    `POST /rebalance` first. `GET /rebalance` reports `progress` only while a run is active and
    always `lastReport`, the nullable summary of the most recent finished, stopped or failed run.
 9. **Auto-failover** settings live in `/settings/cluster` (`enabled`, `timeoutSeconds` 1 to 3600 default 120,
-   `maxCount` default 1, read-only `eventsSinceReset`). The counter is reset by a rebalance.
+   `maxCount` default 1, read-only `eventsSinceReset`). The counter is reset by a rebalance and by `resetAutoFailoverCounter` (0.10.0).
 10. **Network access** is replaced as a whole list with optimistic concurrency (`revision`); applying it on all
     servers is a task. TLS-required mode rejects plain `host` rules. Client certificates are expressed as
     method `cert`.
@@ -314,6 +315,41 @@ Where the architecture document leaves something open, the simplest option was c
     range and the cluster's replica count.
 
 ## Changelog
+
+### 0.10.0
+
+Revision written with high availability, part 2, the failover of an ordinary group driven by `kingresd` (increment 3 of
+`kingres/docs/design/ha-phase5-part2.md`; the switchover, the map group, automatic failover and the old primary's return are
+later increments and answer `unsupported_operation`). Summary for the panel: 4 operations added (104 operations, 86 paths):
+`getFailoverStatus`, `listFailoverReports`, `getFailoverReport`, `resetAutoFailoverCounter`; `failoverServer` is implemented
+for `hard` on ordinary groups; 2 problem codes, 7 alert kinds, 5 audit actions, **1 change that is not additive**.
+
+#### Breaking
+
+1. **`ClusterSettings.autoFailover.timeoutSeconds` has the minimum 30** (it was 1; the design always said 30, and a shorter value
+   cannot tell a failure from a pause). Nothing was released.
+
+#### Additive
+
+- `FailoverRequest` gains `shardGroupIds`, `targets` (`FailoverTarget`), `allowDataLoss`, `dryRun` and `comment`; `failoverServer`
+  and `restorePreferredPrimaries` answer 200 with a `FailoverPlan` for `dryRun`; `restorePreferredPrimaries` accepts an optional body.
+- The schemas of the status and the report: `FailoverStatus`, `FailoverReport`, `FailoverReportSummary`, `FailoverGroupReport`,
+  `DataLossAssessment`, `FailoverCandidate`, `FailoverIncident`, `OldPrimaryReport`, `FailoverEvent`.
+- `ShardGroup.failover` (`FailoverReadiness`), `TaskStep.shardGroupId`, `ClusterSettings.autoFailover.lastEventAt`,
+  `ClusterOverview.autoFailover.limitReached` and `lastEventAt`, `ClusterOverview.failover`.
+- Alert kinds `failoverNeedsDecision`, `failoverBlocked`, `failoverDataLoss`, `splitPromotion`, `oldPrimaryRunning`,
+  `oldPrimaryNotStopped`, `oldPrimaryNotRebuilt`; problem codes `failover_needs_decision` and
+  `lease_settings_differ` (the existing `quorum_unavailable`, 503, is used too); audit actions `resetAutoFailoverCounter`, `failoverGroupStarted`, `failoverGroupPromoted`,
+  `failoverGroupFailed`, `oldPrimaryRebuilt`.
+
+#### Documentation
+
+The meaning of `graceful` (the planned switchover), of `Task.cancellable` (false from the moment the task starts to stop the old primary of a group), of the counter's reset and
+of the task steps of `server.failover` (one block per group, `TaskStep.shardGroupId`). The task error codes of the failover are
+not an enum of the contract (clients tolerate codes they do not know): `superseded`, `lease_still_held`, `lease_held_elsewhere`,
+`lease_lost`, `quorum_unavailable`, `no_candidate`, `target_not_available`, `split_promotion`, `promote_timeout`,
+`promote_incomplete`, `bad_promote_target`, `standby_behind`, `prepared_transactions_pending`, `cancelled`. The failover
+statuses in `FailoverReportSummary.outcome` add `paused` (a run that waits for an operator).
 
 ### 0.9.0
 

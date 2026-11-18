@@ -59,3 +59,55 @@ func TestAFenceDoesNotWaitForAStartAndTheStartDoesNotSurviveIt(t *testing.T) {
 		t.Fatal("the instance that came up after the fence is still running")
 	}
 }
+
+// slowStop is a fake instance whose immediate stop takes as long as the test wants.
+type slowStop struct {
+	*fakeInstance
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b *slowStop) StopImmediate(ctx context.Context) error {
+	close(b.entered)
+	<-b.release
+	return b.fakeInstance.StopImmediate(ctx)
+}
+
+// A round that wins the lease while a fence is stopping the primary must not start the instance (it would find it still
+// running and start nothing, the stop would end it, and the markers it removed would leave nothing to start it again:
+// a primary that holds its lease and stays down). The next round, after the stop, starts it. This was the cause of a
+// server whose instance stayed stopped after a lease that was lost and won again in the same moment.
+func TestARoundThatWinsTheLeaseDuringAFenceStartsTheInstanceAfterTheStop(t *testing.T) {
+	ctx := context.Background()
+	r := newRig(t, []string{"a"}, true)
+	si := &slowStop{fakeInstance: &fakeInstance{running: true}, entered: make(chan struct{}), release: make(chan struct{})}
+	r.m.c.Instance = si
+	dir := filepath.Join(r.dir, "lease")
+	done := make(chan error, 1)
+	go func() { done <- r.m.Fence(ctx, 1) }()
+	select {
+	case <-si.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the fence did not reach the stop")
+	}
+	r.m.Renew(ctx) // wins the lease while the stop is under way
+	r.m.wg.Wait()
+	if _, _, starts := si.state(); starts != 0 {
+		t.Fatal("the instance was started while a fence was stopping it")
+	}
+	if !markerExists(dir, FencedMarker, 1) {
+		t.Fatal("the fence marker was removed while the stop was under way")
+	}
+	close(si.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	r.m.Renew(ctx)
+	r.m.wg.Wait()
+	if up, _, _ := si.state(); !up {
+		t.Fatal("the primary stayed down although the lease is held")
+	}
+	if markerExists(dir, FencedMarker, 1) {
+		t.Fatal("the fence marker is still there after the start")
+	}
+}

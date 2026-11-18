@@ -65,6 +65,7 @@ type Agent struct {
 	// frozen and gone are the freeze of a group and the servers whose standbys are declared
 	// gone, each with the monotonic time it lapses at (freeze.go).
 	frozen   map[int32]time.Duration
+	frozenBy map[int32]freezeOwner
 	gone     map[string]time.Duration
 	rounds   int64
 	slotWarn map[int32]map[int64]int64
@@ -100,6 +101,7 @@ func NewAgent(a *Agent) (*Agent, error) {
 	a.slotWarn = map[int32]map[int64]int64{}
 	a.primaries = map[int32]*PrimaryStatus{}
 	a.frozen = map[int32]time.Duration{}
+	a.frozenBy = map[int32]freezeOwner{}
 	a.gone = map[string]time.Duration{}
 	a.loadFreezes()
 	a.access = map[string]fileStamp{}

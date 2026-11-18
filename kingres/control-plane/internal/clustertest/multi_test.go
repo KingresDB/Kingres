@@ -127,14 +127,17 @@ func TestObjectsBeforeAndAfterExistOnAllServers(t *testing.T) {
 			if got := count(t, n, "SELECT count(*) FROM pg_database WHERE datname = $1", db); got != 1 {
 				t.Errorf("node %d: database %s: %d", n.Index, db, got)
 			}
-			// A sharded database knows all three servers.
+			// A sharded database knows the primary of all three servers. The
+			// standbys of the shared cluster are registered in every database
+			// too, and how many exist at this point depends on the tests that
+			// ran before, so only the primaries are counted.
 			c2, err := n.PG(context.Background(), "kingresd", servicePassword(t, n), db)
 			if err != nil {
 				t.Fatal(err)
 			}
 			var nodes int
-			if err := c2.QueryRow(context.Background(), "SELECT count(*) FROM kingres.node").Scan(&nodes); err != nil || nodes != 3 {
-				t.Errorf("node %d: database %s lists %d nodes (%v)", n.Index, db, nodes, err)
+			if err := c2.QueryRow(context.Background(), "SELECT count(*) FROM kingres.node WHERE role = 'primary'").Scan(&nodes); err != nil || nodes != 3 {
+				t.Errorf("node %d: database %s lists %d primary nodes (%v)", n.Index, db, nodes, err)
 			}
 			_ = c2.Close(context.Background())
 		}

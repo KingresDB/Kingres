@@ -113,7 +113,10 @@ type PrimaryStatus struct {
 	// SynchronousStandbyNames is the setting now; Without says that the group runs
 	// without a synchronous standby (the grace period has passed).
 	SynchronousStandbyNames string `json:"synchronousStandbyNames"`
-	Without                 bool   `json:"without"`
+	// FlushLsn is the WAL position the primary had flushed when the agent looked (X/Y form): the last position of
+	// the old primary that a failover knows.
+	FlushLsn string `json:"flushLsn,omitempty"`
+	Without  bool   `json:"without"`
 	// Streaming are the ids of the standbys that stream.
 	Streaming []int64      `json:"streaming"`
 	Slots     []SlotStatus `json:"slots"`

@@ -58,6 +58,12 @@ func newStandbyParts(cfg config.Config, svc *cluster.Service, self string, log *
 		Registrar: &standby.PGRegistrar{Log: log, Conn: func(ctx context.Context) (*pgx.Conn, error) { return svc.ServiceConn(ctx, sysdb.Database) },
 			Remote: func(ctx context.Context, host string, port int) (*pgx.Conn, error) {
 				return svc.RemoteConn(ctx, host, port, sysdb.Database)
+			},
+			Skip:      func(host string) bool { return host != self && reg.Liveness().State(host) == ha.PeerDead },
+			Databases: func(ctx context.Context) ([]string, error) { return catalogDatabases(ctx, svc, false) },
+			DBConn:    func(ctx context.Context, db string) (*pgx.Conn, error) { return svc.ServiceConn(ctx, db) },
+			DBRemote: func(ctx context.Context, host string, port int, db string) (*pgx.Conn, error) {
+				return svc.RemoteConn(ctx, host, port, db)
 			}},
 		// The leader is read from the catalog with a query of its own, not through the shared
 		// resolver: its cache must only ever be filled by the code that is meant to use it (a

@@ -20,6 +20,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -284,6 +286,9 @@ func (c *Client) do(ctx context.Context, serverID string, checkRevoked bool, met
 	}
 }
 
+// queryRE is the form of the query of an internal GET: key=value pairs of simple characters.
+var queryRE = regexp.MustCompile(`^[A-Za-z0-9_.-]+=[A-Za-z0-9_.:-]*(&[A-Za-z0-9_.-]+=[A-Za-z0-9_.:-]*)*$`)
+
 func (c *Client) doOnce(ctx context.Context, serverID string, checkRevoked bool, method, path string, in, out any) error {
 	if c.cfg.Fault.OutboundBlocked(serverID) {
 		return fmt.Errorf("%w: %w: %s: blocked by the fault hook", ErrUnreachable, errBlocked, serverID)
@@ -304,9 +309,18 @@ func (c *Client) doOnce(ctx context.Context, serverID string, checkRevoked bool,
 		}
 		body = bytes.NewReader(b)
 	}
+	// A read carries its parameters in a query (GET /failover/position?group=1); the path itself may hold none, and
+	// the query is only letters, digits and the characters of key=value pairs.
+	path, query, _ := strings.Cut(path, "?")
+	if query != "" && !queryRE.MatchString(query) {
+		return errors.New("the internal query is not valid")
+	}
 	target, err := internalapi.URL(p.InternalAddr, path)
 	if err != nil {
 		return err
+	}
+	if query != "" {
+		target += "?" + query
 	}
 	req, err := http.NewRequestWithContext(ctx, method, target, body)
 	if err != nil {
