@@ -7,6 +7,125 @@ in [dev/documentation.md](dev/documentation.md).
 
 ---
 
+## 2026-11-18 (third entry): a failover started by hand, client signatures in the ledger, and the fixes for three reviews
+
+Covers the afternoon of 2026-11-18.
+
+### What was done
+
+- **Failover in `kingresd`, increment 3 of ten, with most fixes for the
+  second review** (2de4b63734; contract 0.10.0; notes in
+  [design/ha-phase5-part2.md](design/ha-phase5-part2.md) under
+  "Increment 3 and the fixes for the second review"). An operator starts
+  a failover of a server by hand; a dry run answers the plan; a plan that
+  may lose writes needs an explicit decision; a leader that ends at a
+  step boundary is taken over. The first failovers on a real cluster
+  showed eight defects of the product, the largest of them that each
+  database with the extension has a catalog of nodes of its own, so a
+  standby must be registered, and `promote_node` run, in every one.
+- **The panel follows contract 0.10.0** (fec869816a): words, the mock of
+  the new operations, the narrowed answers. The failover pages are a
+  later increment and are being built.
+- **`kingres_ledger` 0.3, part B: client signatures** (5e53dcd8a0, step 8
+  of phase 7; corrections 111 to 120 of
+  [design/ledger-phase7.md](design/ledger-phase7.md), 6391678a95). A
+  client registers a public key and signs what it writes; a table can
+  require it, and then a transaction that leaves an entry without an
+  attestation cannot commit or be prepared.
+- **`kingres_shard` 0.5, the fixes for the fifth review of the call
+  sequences** (4b5a771932, S13-01 to S13-06): `RELEASE SAVEPOINT` and
+  `ROLLBACK TO` are bounded for every session, and a control call can be
+  bounded as a whole (`kingres_shard.control_call_timeout`, `KS015`).
+- **`kingres_columnar` 0.1, the fixes for the eleventh review**
+  (3f3caad6de, C11-01 to C11-09; report
+  [reviews/2026-11-18-kingres-columnar-0.1-tenth-fixes.md](reviews/2026-11-18-kingres-columnar-0.1-tenth-fixes.md)):
+  a columnar relation is recognised by the handler of its access method
+  everywhere, the check gives no false alarm while tables are dropped or
+  rewritten and keeps no lock per table.
+- **The review of steps 1 and 2 of phase 2b**
+  ([reviews/2026-11-18-kingres-shard-phase2b-steps-1-2.md](reviews/2026-11-18-kingres-shard-phase2b-steps-1-2.md)):
+  about 22 000 generated statements compared with a single node on both
+  majors, no wrong answer; one high finding (P2B-01, the mark of the
+  local part can be read by SQL code the statement runs), three medium.
+- **Steps 3 and 4 of phase 2b** (the row router for `INSERT` and
+  `COPY FROM`) are written and not finished: see "Still open".
+
+### How it was verified
+
+Run by the integrator on the tree that was committed, unless it says
+otherwise.
+
+- `kingresd` at 2de4b63734: build for both systems, vet, format, 49
+  packages on Windows, the contract check; a complete integration run on
+  18.7 and on 19rc2 from the tree before the commit: 1255 tests passed
+  and 24 were skipped on each, and one failed
+  (`TestObjectsBeforeAndAfterExistOnAllServers`, which counted every node
+  of a database's catalog; it counts the primaries now). That test and
+  the failover tests again on both majors against `kingres_shard` with
+  the S13 fixes: 9 of 9.
+- The panel at fec869816a: type check, lint, the contract and brand
+  checks, the build, 74 test files with 1023 tests, the browser tests 3
+  files with 43.
+- `kingres_ledger` at 5e53dcd8a0: in tree on 18.7 with assertions 38 of
+  38 twice; out of tree on 19rc2 19 regression tests and 34 TAP files
+  with 1929 tests; no warning. The tests of `kingresd` that use the
+  ledger against it: all passing on both majors; one test that has
+  nothing to do with the ledger failed once on 19 (it read the state of
+  an instance in the moment between the end of the postmaster and the
+  record of the stop; corrected in fc0ff6ff2f, three of three on 19
+  afterwards).
+- `kingres_shard` at 4b5a771932: on 18.7 13 regression tests and 111 TAP
+  files with 12464 tests; on 19rc2 13 and 111 files with 13123 tests; in
+  tree on 18 with assertions 146 of 146; the cluster tests of `kingresd`
+  that use distributed tables and standbys, 19 of 19 on each major.
+- `kingres_columnar` at 3f3caad6de: in tree on 18.7 with assertions 45 of
+  45 twice; out of tree on 19rc2 11 regression tests and 41 TAP files
+  with 10216 tests.
+- Shown by the authors only: the mutants of each round, the measured
+  cost of an attestation, a production build of 18 for the columnar
+  suite.
+
+### Decisions and deviations
+
+- **The increment and the review fixes of failover are one commit.**
+  The author could not separate them by file, and a commit made of
+  hunks would have been a tree nobody built or tested.
+- **`kingresd` counts the ledger tables of users only** (102c6e81cf):
+  the extension registers its own three tables in the same registry.
+- **The seventh review of the guard of the ledger is merged with the
+  review of part B**, since both rounds changed the same files.
+- **Two writers in the control plane**: failover continues in the main
+  tree; the first steps of phase 7 in `kingresd` are written in a
+  worktree on a private branch that merges the product branch before it
+  is delivered. Migrations of phase 7 start at 0030.
+- **Contract numbers**: the design of phase 7 names its revision 0.9.0
+  as a placeholder; it is 0.11.0.
+
+### Still open
+
+- **Failover**: F2-06, F2-08, F2-16, the design statements of F2-14,
+  the other direction of F2-09, a test for F2-02; increments 4 to 9
+  (increment 4 is being written); the review of increment 3 is owed.
+- **Phase 2b, steps 3 and 4**: the code and its own tests exist; the
+  full suites, the assertion build and the mutants are owed, the older
+  tests that assert a refusal the steps remove are being changed, and
+  the fixes for P2B-01 to P2B-09 go into the same round.
+- **Reviews owed**, one at a time: the fixes for S13 (running), failover
+  increment 3 with the F2 fixes, the guard of the ledger with part B,
+  the fixes for C11.
+- **`kingres_ledger`**: `ledger_verify` does not verify signatures, and
+  the standalone verifier does not check attestations yet (step 18 of
+  phase 7); `kingresd` reports the new check names of `ledger_verify`
+  as "other".
+- **The contract**: the answer `failover_needs_decision` is documented
+  as carrying the plan, and the problem schema has no member for it.
+
+### Core patches
+
+None.
+
+---
+
 ## 2026-11-18 (second entry): step 2 of phase 2b, the fixes for the first failover increments, the libraries of phase 7 closed, and fix rounds with their reviews
 
 Covers the work from the early morning to noon of 2026-11-18.
