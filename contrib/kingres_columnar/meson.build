@@ -118,6 +118,7 @@ tests += {
       't/039_alias_am.pl',
       't/040_check_lock_table.pl',
       't/041_vacuum_failsafe.pl',
+      't/042_not_checked_memory.pl',
     ],
   },
 }

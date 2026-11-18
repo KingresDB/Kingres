@@ -141,6 +141,17 @@ CREATE FUNCTION columnar_finish_rewrites()
     LANGUAGE C STRICT SECURITY DEFINER
     SET search_path = pg_catalog, kingres, pg_temp;
 
+-- Whether an access method is the extension's, decided in C by what its
+-- handler returns, the way every C path decides it.  The guard below asks it,
+-- so that an access method over another SQL function with the extension's C
+-- entry point (a second CREATE FUNCTION over the same symbol) is guarded like
+-- the one over columnar_handler.
+CREATE FUNCTION columnar_is_columnar_am(amoid oid)
+    RETURNS boolean
+    AS 'MODULE_PATHNAME', 'kingres_columnar_is_columnar_am'
+    LANGUAGE C STRICT STABLE SECURITY INVOKER
+    SET search_path = pg_catalog, kingres, pg_temp;
+
 -- Remove the stripe rows of the files a DROP took away, at the end of the
 -- command: only the files the command dropped are looked at (the access method
 -- noted them when the relations were dropped), so the cost does not depend on
@@ -214,9 +225,9 @@ BEGIN
         -- only the columnar ones matter
         cols := ARRAY(SELECT DISTINCT c.oid
                         FROM pg_catalog.pg_class c
-                        JOIN pg_catalog.pg_am a ON a.oid = c.relam
-                       WHERE c.oid = ANY (rels) AND a.amhandler = 'kingres.columnar_handler(internal)'::pg_catalog.regprocedure
-                         AND c.relkind IN ('r', 'm'));
+                       WHERE c.oid = ANY (rels)
+                         AND c.relkind IN ('r', 'm')
+                         AND kingres.columnar_is_columnar_am(c.relam));
     ELSE
         cols := '{}';
     END IF;
@@ -267,10 +278,10 @@ BEGIN
                                    SELECT t.relid
                                      FROM pg_catalog.pg_partition_tree(pt.relid) t) x(relid)
                     WHERE p.oid = ANY (pubs)
-                      AND x.relid IN (SELECT c.oid
-                                        FROM pg_catalog.pg_class c
-                                        JOIN pg_catalog.pg_am a ON a.oid = c.relam
-                                       WHERE a.amhandler = 'kingres.columnar_handler(internal)'::pg_catalog.regprocedure)) THEN
+                      AND EXISTS (SELECT 1
+                                    FROM pg_catalog.pg_class c
+                                   WHERE c.oid = x.relid
+                                     AND kingres.columnar_is_columnar_am(c.relam))) THEN
             RAISE EXCEPTION 'columnar tables are not replicated logically yet: the publication would include a columnar table'
                 USING ERRCODE = '0A000',
                       HINT = 'Leave columnar tables out of publications.';
@@ -312,6 +323,7 @@ REVOKE ALL ON FUNCTION columnar_check_clean() FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_reconcile() FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_write_paths(boolean) FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_finish_rewrites() FROM PUBLIC;
+REVOKE ALL ON FUNCTION columnar_is_columnar_am(oid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_on_drop() FROM PUBLIC;
 REVOKE ALL ON FUNCTION columnar_check_ddl() FROM PUBLIC;
 -- The functions that act on one table check ownership themselves.

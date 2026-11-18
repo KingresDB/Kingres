@@ -1317,19 +1317,32 @@ kc_error_forbidden(void)
  * Nothing is raised and nothing is allocated; the caller answers "nothing was
  * checked".
  */
+static const char *
+kc_subxact_blocked(void)
+{
+	if (CritSectionCount > 0)
+		return "inside a critical section";
+	if (!IsTransactionState())
+		return "the transaction is not in progress";
+	if (GetCurrentTransactionNestLevel() > 1 &&
+		kc_sub_precommitted == GetCurrentSubTransactionId())
+		return "the subtransaction is committing";
+	return NULL;
+}
+
+/* the same decision, quietly, for code that has another way out (kc_am_class_guarded) */
+bool
+kc_subxact_possible(void)
+{
+	return kc_subxact_blocked() == NULL && !IsInParallelMode() && !kc_error_forbidden();
+}
+
 bool
 kc_subxact_refused(const char *what)
 {
-	const char *why;
+	const char *why = kc_subxact_blocked();
 
-	if (CritSectionCount > 0)
-		why = "inside a critical section";
-	else if (!IsTransactionState())
-		why = "the transaction is not in progress";
-	else if (GetCurrentTransactionNestLevel() > 1 &&
-			 kc_sub_precommitted == GetCurrentSubTransactionId())
-		why = "the subtransaction is committing";
-	else
+	if (why == NULL)
 		return false;
 	KC_PATH(KC_PATH_REFUSED_ENDING);
 	ereport(WARNING,
@@ -1347,6 +1360,19 @@ kc_subxact_refused(const char *what)
 static void
 kc_write_check_state(Relation rel)
 {
+	/*
+	 * A relation that has the callbacks of this access method but is not
+	 * recognised by it (the handler of its access method returns a copy of the
+	 * routine, C12-04) cannot keep what is written: the flush at commit takes
+	 * it for another kind of table and discards the buffer.  A table that
+	 * cannot keep its rows does not take them.
+	 */
+	if (!kc_rel_is_columnar(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot insert into table \"%s\": its access method uses the columnar callbacks but its handler does not return the routine of kingres_columnar itself",
+						RelationGetRelationName(rel)),
+				 errhint("Create the access method over kingres.columnar_handler, or over a handler that returns the pointer that function returns.")));
 	if (IsParallelWorker())
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),

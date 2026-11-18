@@ -62,6 +62,7 @@ DELETE FROM kingres.columnar_stripe;
 SELECT * FROM kingres.columnar_check();
 SELECT kingres.columnar_reconcile();
 SELECT * FROM kingres.columnar_write_paths();
+SELECT kingres.columnar_is_columnar_am(1);
 SELECT kingres.columnar_on_drop();
 SELECT kingres.columnar_check_ddl();
 RESET ROLE;

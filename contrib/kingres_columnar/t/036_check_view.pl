@@ -451,5 +451,50 @@ foreach my $level ('REPEATABLE READ', 'SERIALIZABLE')
 	$s->quit;
 }
 
+# ------------------------------------------------------------------------
+# C12-05 (a shallow copy of the snapshot survived): the two snapshots of the orphan step are separate
+# copies, with lists of running transactions of their own.  A transaction X that is running at the first
+# snapshot (a later transaction has completed before it, so X is in its list) and commits before the second, while another
+# transaction Y begins and a later one completes in the same window (so that the second list holds Y), shows it:
+# the stripe row that X inserted is invisible to the first snapshot (X was running) and must not be
+# counted as an orphan by this call.  With the two snapshots sharing the one array of running transactions,
+# the second call to the snapshot manager replaces X by Y in the first snapshot's list, the first snapshot
+# calls X committed, and the row is reported although the call began before X committed.  The row is
+# reported by the next call, as it should be.
+# ------------------------------------------------------------------------
+{
+	q1("CREATE TABLE sh (a int) USING columnar; INSERT INTO sh VALUES (1);");
+	my $x = $node->background_psql('postgres', on_error_stop => 1);
+	bgq($x, "BEGIN; INSERT INTO kingres.columnar_stripe SELECT 515151515151, stripe_id, first_row, row_count, chunk_groups, natts, first_block, block_count, blob_len, raw_bytes, footer_offset, cid_points, col_stats, maintenance FROM kingres.columnar_stripe WHERE rel_uid = kingres.columnar_identity('sh') LIMIT 1");
+	# a later transaction completes, so that the first snapshot's bound is above X and X is in its list of running transactions
+	# (an id at or above the bound is running whatever the list says, and the list would not be tested)
+	q1('SELECT pg_current_xact_id()');
+	my $gate = $node->background_psql('postgres', on_error_stop => 1);
+	bgq($gate, 'SELECT pg_advisory_lock(7776, 0)');
+	my $call = $node->background_psql('postgres', on_error_stop => 1);
+	bgq($call, 'SET kingres_columnar.check_gate_claims = 7776');
+	my $cpid = bg_value($call, 'SELECT pg_backend_pid()');
+	$call->query_until(qr/^started$/m, "\\echo started\nSELECT 'ORPHANS=' || count(*) FROM kingres.columnar_check() WHERE check_name = 'orphan_catalog_rows';\n");
+	at_gate($cpid, 'between the two snapshots of the orphan step');
+	bgq($x, 'COMMIT');
+	$x->quit;
+	my $y = $node->background_psql('postgres', on_error_stop => 1);
+	bgq($y, 'BEGIN; SELECT pg_current_xact_id()');
+	# a transaction with a later id completes: the second snapshot's list holds only the ids below the newest completed one,
+	# so Y is listed, and the list is not empty, only when something newer than Y has completed
+	q1('SELECT pg_current_xact_id()');
+	bgq($gate, 'SELECT pg_advisory_unlock(7776, 0)');
+	my $res = $call->query_until(qr/^finished$/m, "\\echo finished\n");
+	$call->quit;
+	$gate->quit;
+	like($res, qr/ORPHANS=0/, 'a transaction that committed between the two snapshots, and a new one that began: the row it inserted is not counted by the call that began before it committed');
+	bgq($y, 'COMMIT');
+	$y->quit;
+	is(q1("SELECT count(*) FROM kingres.columnar_check() WHERE check_name = 'orphan_catalog_rows'"), '1', 'the next call reports it (it is an orphan: no table has its file)');
+	is(q1('SELECT kingres.columnar_reconcile()'), '1', 'and the reconciliation deletes it');
+	q1('DROP TABLE sh');
+	is(q1('SELECT kingres.columnar_check_clean()'), 't', 'afterwards the check is clean');
+}
+
 $node->stop;
 done_testing();

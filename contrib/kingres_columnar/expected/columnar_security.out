@@ -23,6 +23,7 @@ SELECT p.proname, pg_get_function_identity_arguments(p.oid) AS args, l.lanname A
  columnar_handler         | internal                                                                                                     | c       | f                |                                              | f
  columnar_identity        | rel regclass                                                                                                 | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | t
  columnar_info            | rel regclass                                                                                                 | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | t
+ columnar_is_columnar_am  | amoid oid                                                                                                    | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | f
  columnar_on_drop         |                                                                                                              | plpgsql | t                | {"search_path=pg_catalog, kingres, pg_temp"} | f
  columnar_options         | rel regclass                                                                                                 | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | t
  columnar_reconcile       |                                                                                                              | c       | t                | {"search_path=pg_catalog, kingres, pg_temp"} | f
@@ -30,7 +31,7 @@ SELECT p.proname, pg_get_function_identity_arguments(p.oid) AS args, l.lanname A
  columnar_stripes         | rel regclass                                                                                                 | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | t
  columnar_table_xid       | rel regclass                                                                                                 | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | t
  columnar_write_paths     | reset boolean                                                                                                | c       | f                | {"search_path=pg_catalog, kingres, pg_temp"} | f
-(16 rows)
+(17 rows)
 
 -- every function that runs with the rights of its owner or without a pinned search_path is listed above;
 -- none may be missing the pin
@@ -53,7 +54,7 @@ SELECT classid::regclass AS catalog, count(*) AS objects
      catalog      | objects 
 ------------------+---------
  pg_type          |       2
- pg_proc          |      16
+ pg_proc          |      17
  pg_class         |       1
  pg_am            |       1
  pg_event_trigger |       2
@@ -137,6 +138,8 @@ SELECT kingres.columnar_reconcile();
 ERROR:  permission denied for function columnar_reconcile
 SELECT * FROM kingres.columnar_write_paths();
 ERROR:  permission denied for function columnar_write_paths
+SELECT kingres.columnar_is_columnar_am(1);
+ERROR:  permission denied for function columnar_is_columnar_am
 SELECT kingres.columnar_on_drop();
 ERROR:  permission denied for function columnar_on_drop
 SELECT kingres.columnar_check_ddl();

@@ -64,6 +64,7 @@ PG_FUNCTION_INFO_V1(kingres_columnar_write_paths);
 PG_FUNCTION_INFO_V1(kingres_columnar_note_rewrite);
 PG_FUNCTION_INFO_V1(kingres_columnar_finish_rewrites);
 PG_FUNCTION_INFO_V1(kingres_columnar_identity);
+PG_FUNCTION_INFO_V1(kingres_columnar_is_columnar_am);
 
 bool		kc_rmgr_registered = false;
 
@@ -590,13 +591,46 @@ kingres_columnar_compact(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(n);
 }
 
+/*
+ * columnar_reconcile(): the number of stripe catalog rows deleted, or NULL (with
+ * a WARNING that says why) when the clean-up stood down and looked at nothing
+ * (C12-01): a relation whose access method cannot be classified, or a columnar
+ * relation with an unreadable metapage.  Zero is "looked, found nothing".
+ */
 Datum
 kingres_columnar_reconcile(PG_FUNCTION_ARGS)
 {
+	const char *why = NULL;
+	int			n;
+
 	/* deletes catalog rows; skipping it loses nothing, the next call does it */
 	if (kc_entry_refused("columnar_reconcile", NULL, false))
 		PG_RETURN_INT32(0);
-	PG_RETURN_INT32(kc_catalog_reconcile());
+	/* at the start of a subtransaction (not visible from here) none may be begun: only at the top level */
+	n = kc_catalog_reconcile(&why, GetCurrentTransactionNestLevel() == 1);
+	if (n < 0)
+	{
+		ereport(WARNING,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("columnar_reconcile did nothing: %s", why ? why : "it could not run"),
+				 errdetail("Nothing was deleted and no orphan row was looked for; the answer is NULL, which is not \"nothing to delete\"."),
+				 errhint("End or wait for the transaction that made the access method, or repair the relation, and call it again.")));
+		PG_RETURN_NULL();
+	}
+	PG_RETURN_INT32(n);
+}
+
+/*
+ * columnar_is_columnar_am(amoid): whether the access method is this
+ * extension's, by what its handler returns (kc_am_class), the one definition
+ * that every C path uses.  The DDL guard of the extension asks it, so that an
+ * access method over any SQL function with the extension's C entry point is
+ * guarded like the one over kingres.columnar_handler (C12-03).
+ */
+Datum
+kingres_columnar_is_columnar_am(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(kc_am_class(PG_GETARG_OID(0)) == KC_AM_COLUMNAR);
 }
 
 /*
@@ -694,6 +728,8 @@ typedef struct KcCheckSink
 {
 	ReturnSetInfo *rsinfo;		/* NULL: count only */
 	int64		rows;
+	LockData   *ld;				/* the lock data the not_checked rows read, see kc_lock_blockers */
+	int			ld_uses;
 } KcCheckSink;
 
 static void
@@ -715,6 +751,16 @@ kc_check_row(KcCheckSink *sink, const char *name, Oid relid, const char *detail)
 	}
 	values[2] = CStringGetTextDatum(detail);
 	tuplestore_putvalues(sink->rsinfo->setResult, sink->rsinfo->setDesc, values, nulls);
+	pfree(DatumGetPointer(values[0]));
+	pfree(DatumGetPointer(values[2]));
+}
+
+/* a copy of the server's lock data, freed (GetLockStatusData has no function of its own for it) */
+static void
+kc_free_lockdata(LockData *ld)
+{
+	pfree(ld->locks);
+	pfree(ld);
 }
 
 /*
@@ -730,6 +776,7 @@ kc_gate_held_by_superuser(const LOCKTAG *tag)
 {
 	LockData   *ld = GetLockStatusData();
 	int			i;
+	bool		found = false;
 
 	for (i = 0; i < ld->nelements; i++)
 	{
@@ -746,9 +793,13 @@ kc_gate_held_by_superuser(const LOCKTAG *tag)
 			continue;
 		proc = BackendPidGetProc(l->pid);
 		if (proc != NULL && superuser_arg(proc->roleId))
-			return true;
+		{
+			found = true;
+			break;
+		}
 	}
-	return false;
+	kc_free_lockdata(ld);
+	return found;
 }
 
 /*
@@ -796,9 +847,17 @@ kc_check_gate(int which)
  * of the relation, so it cannot wait; the answer is a moment's view.  The text
  * starts with a space and is empty when nobody was found (the holder let go
  * in the meantime).
+ *
+ * The lock data of the whole server is copied once for up to KC_LOCKDATA_USES
+ * rows of a call (and freed at the end of it): a copy for every row costs the
+ * size of the lock table times the number of rows, in memory and in time with
+ * every lock partition held, which grew with the square of the number of
+ * tables that a large DDL locks (C12-02).  The view is a moment's view anyway.
  */
+#define KC_LOCKDATA_USES 64
+
 static void
-kc_lock_blockers(Oid relid, LOCKMODE mode, char *out, size_t len)
+kc_lock_blockers(KcCheckSink *sink, Oid relid, LOCKMODE mode, char *out, size_t len)
 {
 	LOCKTAG		tag;
 	LockData   *ld;
@@ -814,7 +873,18 @@ kc_lock_blockers(Oid relid, LOCKMODE mode, char *out, size_t len)
 		return;
 	SET_LOCKTAG_RELATION(tag, MyDatabaseId, relid);
 	lm = GetLockTagsMethodTable(&tag);
-	ld = GetLockStatusData();
+	if (sink->ld != NULL && sink->ld_uses >= KC_LOCKDATA_USES)
+	{
+		kc_free_lockdata(sink->ld);
+		sink->ld = NULL;
+	}
+	if (sink->ld == NULL)
+	{
+		sink->ld = GetLockStatusData();
+		sink->ld_uses = 0;
+	}
+	sink->ld_uses++;
+	ld = sink->ld;
 	for (i = 0; i < ld->nelements; i++)
 	{
 		LockInstanceData *l = &ld->locks[i];
@@ -868,7 +938,7 @@ kc_check_one(Oid relid, bool fix, KcCheckSink *sink)
 		char		who[240];
 		char		detail[640];
 
-		kc_lock_blockers(relid, lockmode, who, sizeof(who));
+		kc_lock_blockers(sink, relid, lockmode, who, sizeof(who));
 		snprintf(detail, sizeof(detail), "%s%s",
 				 "the table is locked by another transaction (a prepared one, or ordinary DDL or VACUUM FULL that is running) and was not checked; this is not a clean result: end or wait for that transaction and run the check again.",
 				 who);
@@ -1049,7 +1119,7 @@ kc_check_list_tables(void)
 	TableScanDesc scan;
 	HeapTuple	tup;
 	List	   *relids = NIL;
-	KcAmMemo	memo = {InvalidOid, KC_AM_UNKNOWN};
+	KcAmMemo	memo = {InvalidOid, KC_AM_UNKNOWN, true};
 
 	/* a catalog snapshot of this moment, not one kept from an earlier statement */
 	InvalidateCatalogSnapshot();
@@ -1097,7 +1167,7 @@ kc_check_run(bool fix, KcCheckSink *sink)
 
 		char	   *rn = OidIsValid(locks.failed_oid) ? get_rel_name(locks.failed_oid) : NULL;
 
-		kc_lock_blockers(locks.failed_oid, locks.failed_mode, who, sizeof(who));
+		kc_lock_blockers(sink, locks.failed_oid, locks.failed_mode, who, sizeof(who));
 		snprintf(detail, sizeof(detail), "%s%s%s%s%s",
 				 "pg_class or the stripe catalog (its index or its TOAST table) is locked by another transaction (a prepared one, or an administrator's LOCK TABLE, REINDEX or VACUUM FULL); no table was checked, and this is not a clean result: end or wait for that transaction and run the check again.",
 				 rn ? " The lock that could not be had is on \"" : "",
@@ -1105,6 +1175,11 @@ kc_check_run(bool fix, KcCheckSink *sink)
 				 rn ? "\"." : "",
 				 who);
 		kc_check_row(sink, "not_checked", InvalidOid, detail);
+		if (sink->ld != NULL)
+		{
+			kc_free_lockdata(sink->ld);
+			sink->ld = NULL;
+		}
 		return;
 	}
 
@@ -1126,12 +1201,22 @@ kc_check_run(bool fix, KcCheckSink *sink)
 
 	{
 		int			d;
+		const char *why = NULL;
 
 		if (fix)
-			d = kc_catalog_reconcile();
+			d = kc_catalog_reconcile(&why, true);
 		else
-			d = kc_catalog_count_orphans();
-		if (d > 0)
+			d = kc_catalog_count_orphans(&why);
+		if (d < 0)
+		{
+			/* the step did not run: never the same answer as a step that ran and found nothing (C12-01) */
+			char		detail[400];
+
+			snprintf(detail, sizeof(detail), "the orphan step could not be done: %s; stripe catalog rows of files no relation uses were not looked for, and this is not a clean result: end or wait for the cause and run the check again.",
+					 why ? why : "it stood down");
+			kc_check_row(sink, "not_checked", InvalidOid, detail);
+		}
+		else if (d > 0)
 		{
 			char		detail[100];
 
@@ -1141,6 +1226,11 @@ kc_check_run(bool fix, KcCheckSink *sink)
 		}
 	}
 	kc_catalog_unlock(&locks);
+	if (sink->ld != NULL)
+	{
+		kc_free_lockdata(sink->ld);
+		sink->ld = NULL;
+	}
 }
 
 /*
@@ -1171,6 +1261,8 @@ kingres_columnar_check(PG_FUNCTION_ARGS)
 	InitMaterializedSRF(fcinfo, 0);
 	sink.rsinfo = rsinfo;
 	sink.rows = 0;
+	sink.ld = NULL;
+	sink.ld_uses = 0;
 	kc_check_run(fix, &sink);
 	return (Datum) 0;
 }
@@ -1196,6 +1288,8 @@ kingres_columnar_check_clean(PG_FUNCTION_ARGS)
 				 errmsg("must be superuser to run columnar_check_clean")));
 	sink.rsinfo = NULL;
 	sink.rows = 0;
+	sink.ld = NULL;
+	sink.ld_uses = 0;
 	kc_check_run(false, &sink);
 	PG_RETURN_BOOL(sink.rows == 0);
 }
